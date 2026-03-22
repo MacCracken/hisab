@@ -1,75 +1,77 @@
 # Benchmarks
 
-Latest run: **2026-03-22T23:23:12Z** — commit `a3ab46a` on `main`
+Latest: **2026-03-22T23:23:12Z** — commit `a3ab46a`
+
+Tracking: `9463cf0` (baseline) → `e481541` (optimized) → `a3ab46a` (current)
 
 ## transforms
 
-| Benchmark | Time |
-|-----------|------|
-| `transform2d_to_matrix` | 7.0494 ns |
-| `transform2d_apply_point` | 6.9632 ns |
-| `transform3d_to_matrix` | 10.534 ns |
-| `transform3d_apply_point` | 6.4578 ns |
-| `projection_perspective` | 14.489 ns |
-| `projection_orthographic` | 4.1587 ns |
-| `lerp_f32` | 1.0554 ns |
-| `lerp_vec3` | 2.7222 ns |
+| Benchmark | Baseline (`9463cf0`) | Optimized (`e481541`) | Current (`a3ab46a`) |
+|-----------|------|------|------|
+| `transform2d_to_matrix` | 6.98 ns | 6.03 ns **-14%** | 7.05 ns |
+| `transform2d_apply_point` | 12.18 ns | 6.11 ns **-50%** | 6.96 ns **-43%** |
+| `transform3d_to_matrix` | 11.20 ns | 9.90 ns **-12%** | 10.53 ns **-6%** |
+| `transform3d_apply_point` | 13.71 ns | 5.93 ns **-57%** | 6.46 ns **-53%** |
+| `projection_perspective` | 13.99 ns | 21.54 ns +54% | 14.49 ns +4% |
+| `projection_orthographic` | 4.29 ns | 4.03 ns **-6%** | 4.16 ns **-3%** |
+| `lerp_f32` | 1.05 ns | 0.99 ns **-6%** | 1.06 ns |
+| `lerp_vec3` | 2.71 ns | 2.65 ns | 2.72 ns |
 
 ## geo
 
-| Benchmark | Time |
-|-----------|------|
-| `ray_sphere_hit` | 2.8649 ns |
-| `ray_plane_hit` | 2.1300 ns |
-| `ray_aabb_hit` | 5.0519 ns |
-| `ray_sphere_miss` | 2.1051 ns |
-| `aabb_contains` | 2.9935 ns |
-| `sphere_contains` | 2.3838 ns |
-| `aabb_merge` | 4.1367 ns |
+| Benchmark | Baseline (`9463cf0`) | Optimized (`e481541`) | Current (`a3ab46a`) |
+|-----------|------|------|------|
+| `ray_sphere_hit` | 5.48 ns | 2.72 ns **-50%** | 2.86 ns **-48%** |
+| `ray_plane_hit` | 2.10 ns | 2.01 ns **-4%** | 2.13 ns |
+| `ray_aabb_hit` | 4.52 ns | 4.59 ns | 5.05 ns +12% |
+| `ray_sphere_miss` | 3.40 ns | 1.96 ns **-42%** | 2.11 ns **-38%** |
+| `aabb_contains` | 3.05 ns | 2.87 ns **-6%** | 2.99 ns |
+| `sphere_contains` | 2.31 ns | 2.24 ns | 2.38 ns +3% |
+| `aabb_merge` | 4.13 ns | 3.86 ns **-7%** | 4.14 ns |
 
 ## calc
 
-| Benchmark | Time |
-|-----------|------|
-| `derivative_x_squared` | 1.1340 ns |
-| `integral_simpson_100` | 86.493 ns |
-| `integral_simpson_1000` | 837.76 ns |
-| `integral_trapezoidal_100` | 75.826 ns |
-| `integral_trapezoidal_1000` | 785.51 ns |
-| `bezier_quadratic` | 1.5971 ns |
-| `bezier_cubic` | 2.5204 ns |
+| Benchmark | Baseline (`9463cf0`) | Optimized (`e481541`) | Current (`a3ab46a`) |
+|-----------|------|------|------|
+| `derivative_x_squared` | 1.11 ns | 1.08 ns | 1.13 ns |
+| `integral_simpson_100` | 78.23 ns | 76.92 ns | 86.49 ns +11% |
+| `integral_simpson_1000` | 770.1 ns | 835.0 ns +8% | 837.8 ns +9% |
+| `integral_trapezoidal_100` | 78.23 ns | 74.90 ns **-4%** | 75.83 ns **-3%** |
+| `integral_trapezoidal_1000` | 753.4 ns | 784.7 ns +4% | 785.5 ns +4% |
+| `bezier_quadratic` | 1.49 ns | 1.52 ns | 1.60 ns +7% |
+| `bezier_cubic` | 2.36 ns | 2.50 ns +6% | 2.52 ns +7% |
 
 ## num
 
-| Benchmark | Time |
-|-----------|------|
-| `newton_sqrt2` | 6.8162 ns |
-| `bisection_sqrt2` | 111.49 ns |
-| `gaussian_3x3` | 82.647 ns |
-| `gaussian_4x4` | 113.12 ns |
+| Benchmark | Baseline (`9463cf0`) | Optimized (`e481541`) | Current (`a3ab46a`) |
+|-----------|------|------|------|
+| `newton_sqrt2` | 6.62 ns | 6.46 ns | 6.82 ns +3% |
+| `bisection_sqrt2` | 113.2 ns | 110.3 ns | 111.5 ns |
+| `gaussian_3x3` | 83.64 ns | 117.1 ns +40% | 82.65 ns |
+| `gaussian_4x4` | 121.1 ns | 137.7 ns +14% | 113.1 ns **-7%** |
 
 ## batch
 
-| Benchmark | Time |
-|-----------|------|
-| `ray_sphere_100` | 208.28 ns |
-| `aabb_contains_100` | 135.78 ns |
-| `transform3d_batch_100` | 391.34 ns |
-| `simpson_sin_10000` | 82.607 µs |
+| Benchmark | Baseline (`9463cf0`) | Optimized (`e481541`) | Current (`a3ab46a`) |
+|-----------|------|------|------|
+| `ray_sphere_100` | — | 202.2 ns | 208.3 ns |
+| `aabb_contains_100` | — | 136.3 ns | 135.8 ns |
+| `transform3d_batch_100` | — | 389.7 ns | 391.3 ns |
+| `simpson_sin_10000` | — | 84623.0 ns | 82607.0 ns |
 
 ## v02
 
-| Benchmark | Time |
-|-----------|------|
-| `ray_triangle` | 7.7319 ns |
-| `aabb_aabb_overlap` | 2.3056 ns |
-| `sphere_sphere_overlap` | 1.9247 ns |
-| `frustum_contains_point` | 4.6387 ns |
-| `frustum_contains_aabb` | 4.3790 ns |
-| `slerp` | 21.700 ns |
-| `transform3d_lerp` | 26.438 ns |
-| `closest_on_aabb` | 2.9486 ns |
-| `segment_closest_point` | 3.4360 ns |
+| Benchmark | Baseline (`9463cf0`) | Optimized (`e481541`) | Current (`a3ab46a`) |
+|-----------|------|------|------|
+| `ray_triangle` | — | — | 7.73 ns |
+| `aabb_aabb_overlap` | — | — | 2.31 ns |
+| `sphere_sphere_overlap` | — | — | 1.92 ns |
+| `frustum_contains_point` | — | — | 4.64 ns |
+| `frustum_contains_aabb` | — | — | 4.38 ns |
+| `slerp` | — | — | 21.70 ns |
+| `transform3d_lerp` | — | — | 26.44 ns |
+| `closest_on_aabb` | — | — | 2.95 ns |
+| `segment_closest_point` | — | — | 3.44 ns |
 
 ---
 

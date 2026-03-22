@@ -16,6 +16,7 @@ pub struct Ray {
 
 impl Ray {
     /// Create a new ray. Direction is normalized automatically.
+    #[inline]
     pub fn new(origin: Vec3, direction: Vec3) -> Self {
         Self {
             origin,
@@ -200,7 +201,7 @@ pub fn ray_aabb(ray: &Ray, aabb: &Aabb) -> Option<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// V0.2 types
+// Primitives
 // ---------------------------------------------------------------------------
 
 /// A triangle defined by three vertices.
@@ -215,11 +216,20 @@ impl Triangle {
     }
 
     /// Face normal (not normalized). Returns the cross product of two edges.
+    ///
+    /// The magnitude equals twice the triangle's area. Use [`unit_normal`](Self::unit_normal)
+    /// for a normalized version.
     #[inline]
     pub fn normal(&self) -> Vec3 {
         let edge1 = self.vertices[1] - self.vertices[0];
         let edge2 = self.vertices[2] - self.vertices[0];
         edge1.cross(edge2)
+    }
+
+    /// Normalized face normal.
+    #[inline]
+    pub fn unit_normal(&self) -> Vec3 {
+        self.normal().normalize()
     }
 
     /// Area of the triangle.
@@ -320,7 +330,7 @@ impl Segment {
 ///
 /// The planes' normals point **inward** — a point is inside the frustum if it is
 /// on the positive side of all six planes.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Frustum {
     pub planes: [Plane; 6],
 }
@@ -393,7 +403,7 @@ impl Frustum {
 }
 
 // ---------------------------------------------------------------------------
-// V0.2 intersection / overlap functions
+// Intersection / overlap functions
 // ---------------------------------------------------------------------------
 
 /// Ray-triangle intersection using the Möller–Trumbore algorithm.
@@ -458,7 +468,7 @@ pub fn plane_plane(a: &Plane, b: &Plane) -> Option<Line> {
 }
 
 // ---------------------------------------------------------------------------
-// V0.2 closest-point functions
+// Closest-point functions
 // ---------------------------------------------------------------------------
 
 /// Closest point on a ray to a given point (clamped to `t >= 0`).
@@ -1164,5 +1174,122 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let s2: Segment = serde_json::from_str(&json).unwrap();
         assert_eq!(s, s2);
+    }
+
+    // --- Audit tests ---
+
+    #[test]
+    fn triangle_unit_normal() {
+        let tri = Triangle::new(Vec3::ZERO, Vec3::X, Vec3::Y);
+        let n = tri.unit_normal();
+        assert!(approx_eq(n.length(), 1.0));
+        assert!(approx_eq(n.z, 1.0));
+    }
+
+    #[test]
+    fn triangle_unit_normal_3d() {
+        // Tilted triangle in 3D space
+        let tri = Triangle::new(Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 1.0));
+        let n = tri.unit_normal();
+        assert!(approx_eq(n.length(), 1.0));
+    }
+
+    #[test]
+    fn segment_degenerate_zero_length() {
+        let s = Segment::new(Vec3::ONE, Vec3::ONE);
+        assert!(approx_eq(s.length(), 0.0));
+        // Closest point should return the segment point itself
+        assert!(vec3_approx_eq(s.closest_point(Vec3::new(5.0, 5.0, 5.0)), Vec3::ONE));
+    }
+
+    #[test]
+    fn plane_plane_intersection_point_on_both() {
+        let a = Plane::from_point_normal(Vec3::ZERO, Vec3::Y);
+        let b = Plane::from_point_normal(Vec3::ZERO, Vec3::X);
+        let line = plane_plane(&a, &b).unwrap();
+        // The origin should be close to the intersection line
+        let cp = line.closest_point(Vec3::ZERO);
+        assert!(approx_eq(cp.length(), 0.0));
+    }
+
+    #[test]
+    fn closest_on_sphere_direction_consistent() {
+        let s = Sphere::new(Vec3::ZERO, 5.0);
+        // Point along +Y axis -> closest should be along +Y
+        let cp = closest_point_on_sphere(&s, Vec3::new(0.0, 100.0, 0.0));
+        assert!(vec3_approx_eq(cp, Vec3::new(0.0, 5.0, 0.0)));
+        // Point along -Z axis -> closest should be along -Z
+        let cp2 = closest_point_on_sphere(&s, Vec3::new(0.0, 0.0, -100.0));
+        assert!(vec3_approx_eq(cp2, Vec3::new(0.0, 0.0, -5.0)));
+    }
+
+    #[test]
+    fn frustum_serde_roundtrip() {
+        use crate::transforms::projection_perspective;
+        let proj = projection_perspective(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0);
+        let f = Frustum::from_view_projection(proj);
+        let json = serde_json::to_string(&f).unwrap();
+        let f2: Frustum = serde_json::from_str(&json).unwrap();
+        assert_eq!(f, f2);
+    }
+
+    #[test]
+    fn frustum_left_right_rejection() {
+        use crate::transforms::projection_perspective;
+        let proj = projection_perspective(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0);
+        let frustum = Frustum::from_view_projection(proj);
+        // Points far to the left/right should be outside
+        assert!(!frustum.contains_point(Vec3::new(1000.0, 0.0, -10.0)));
+        assert!(!frustum.contains_point(Vec3::new(-1000.0, 0.0, -10.0)));
+    }
+
+    #[test]
+    fn ray_triangle_edge_hit() {
+        // Ray hitting exactly on the edge of the triangle
+        let tri = Triangle::new(
+            Vec3::new(-1.0, 0.0, 5.0),
+            Vec3::new(1.0, 0.0, 5.0),
+            Vec3::new(0.0, 2.0, 5.0),
+        );
+        let r = Ray::new(Vec3::new(0.0, 0.0, 0.0), Vec3::Z);
+        // Should hit at the bottom edge (y=0)
+        let t = ray_triangle(&r, &tri).unwrap();
+        assert!(approx_eq(t, 5.0));
+    }
+
+    #[test]
+    fn aabb_aabb_single_axis_separation() {
+        // Separated only on Z axis
+        let a = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        let b = Aabb::new(Vec3::new(0.0, 0.0, 2.0), Vec3::new(1.0, 1.0, 3.0));
+        assert!(!aabb_aabb(&a, &b));
+    }
+
+    #[test]
+    fn line_distance_at_origin() {
+        let l = Line::new(Vec3::new(0.0, 5.0, 0.0), Vec3::X);
+        assert!(approx_eq(l.distance_to_point(Vec3::ZERO), 5.0));
+    }
+
+    #[test]
+    fn closest_on_plane_already_on_plane() {
+        let p = Plane::from_point_normal(Vec3::ZERO, Vec3::Y);
+        let point = Vec3::new(3.0, 0.0, -7.0);
+        let cp = closest_point_on_plane(&p, point);
+        assert!(vec3_approx_eq(cp, point));
+    }
+
+    #[test]
+    fn closest_on_ray_along_direction() {
+        let r = Ray::new(Vec3::ZERO, Vec3::X);
+        let cp = closest_point_on_ray(&r, Vec3::new(5.0, 0.0, 0.0));
+        assert!(vec3_approx_eq(cp, Vec3::new(5.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn sphere_sphere_concentric() {
+        let a = Sphere::new(Vec3::ZERO, 1.0);
+        let b = Sphere::new(Vec3::ZERO, 0.5);
+        assert!(sphere_sphere(&a, &b));
     }
 }

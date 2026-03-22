@@ -125,16 +125,12 @@ pub fn gaussian_elimination(matrix: &mut [Vec<f64>]) -> Result<Vec<f64>, GanitEr
             matrix.swap(col, max_row);
         }
 
-        // Eliminate below — copy pivot row to avoid repeated indexing
-        // Eliminate below pivot row.
-        // Using index-based access for performance (avoids split_at_mut overhead
-        // on small matrices where the allocation cost dominates).
+        // Eliminate below pivot row
         let pivot = matrix[col][col];
         #[allow(clippy::needless_range_loop)]
         for row in (col + 1)..n {
             let factor = matrix[row][col] / pivot;
             for j in col..=n {
-                // SAFETY: col != row, so matrix[col] and matrix[row] don't alias
                 let val = matrix[col][j];
                 matrix[row][j] -= factor * val;
             }

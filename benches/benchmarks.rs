@@ -368,6 +368,38 @@ fn bench_v02(c: &mut Criterion) {
         b.iter(|| seg.closest_point(black_box(point)))
     });
 
+    group.bench_function("plane_plane_intersection", |b| {
+        let a = ganit::Plane::from_point_normal(Vec3::ZERO, Vec3::Y);
+        let bb = ganit::Plane::from_point_normal(Vec3::ZERO, Vec3::X);
+        b.iter(|| ganit::geo::plane_plane(black_box(&a), black_box(&bb)))
+    });
+
+    group.bench_function("triangle_unit_normal", |b| {
+        let tri = ganit::Triangle::new(Vec3::ZERO, Vec3::X, Vec3::Y);
+        b.iter(|| black_box(tri).unit_normal())
+    });
+
+    group.bench_function("line_closest_point", |b| {
+        let l = ganit::Line::new(Vec3::ZERO, Vec3::X);
+        let point = Vec3::new(5.0, 3.0, 4.0);
+        b.iter(|| l.closest_point(black_box(point)))
+    });
+
+    group.bench_function("closest_on_sphere", |b| {
+        let s = ganit::Sphere::new(Vec3::ZERO, 5.0);
+        let point = Vec3::new(10.0, 0.0, 0.0);
+        b.iter(|| ganit::geo::closest_point_on_sphere(black_box(&s), black_box(point)))
+    });
+
+    group.bench_function("inverse_matrix", |b| {
+        let t = Transform3D::new(
+            Vec3::new(1.0, 2.0, 3.0),
+            Quat::from_rotation_y(0.5),
+            Vec3::splat(2.0),
+        );
+        b.iter(|| black_box(t).inverse_matrix())
+    });
+
     group.finish();
 }
 

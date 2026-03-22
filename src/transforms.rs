@@ -37,6 +37,7 @@ impl Transform2D {
     }
 
     /// Convert to a 3x3 affine matrix (scale * rotate * translate).
+    #[inline]
     pub fn to_matrix(&self) -> Mat3 {
         let (sin, cos) = self.rotation.sin_cos();
         // Column-major: each column is a basis vector
@@ -89,6 +90,7 @@ impl Transform3D {
     }
 
     /// Convert to a 4x4 affine matrix (scale * rotate * translate).
+    #[inline]
     pub fn to_matrix(&self) -> Mat4 {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.position)
     }
@@ -99,7 +101,6 @@ impl Transform3D {
         self.rotation * (self.scale * point) + self.position
     }
 
-    /// Compute the inverse of this transform.
     /// Compute the inverse 4x4 matrix of this transform.
     ///
     /// Use this to undo the transform: `t.inverse_matrix() * point4 ≈ original`.

@@ -10,6 +10,7 @@ use glam::Vec2;
 /// `f`: the function to differentiate.
 /// `x`: the point at which to evaluate the derivative.
 /// `h`: the step size (smaller = more accurate but risk of cancellation).
+#[inline]
 pub fn derivative(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
     (f(x + h) - f(x - h)) / (2.0 * h)
 }
@@ -17,6 +18,7 @@ pub fn derivative(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
 /// Numerical integration using the trapezoidal rule.
 ///
 /// Divides [a, b] into `n` sub-intervals.
+#[inline]
 pub fn integral_trapezoidal(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
     assert!(n > 0, "n must be positive");
     let h = (b - a) / n as f64;
@@ -30,6 +32,7 @@ pub fn integral_trapezoidal(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) ->
 /// Numerical integration using Simpson's rule.
 ///
 /// `n` must be even. If odd, it is rounded up.
+#[inline]
 pub fn integral_simpson(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
     let n = if n % 2 == 1 { n + 1 } else { n };
     assert!(n > 0, "n must be positive");
@@ -59,6 +62,7 @@ pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// Evaluate a quadratic Bezier curve at parameter `t` in [0, 1].
 ///
 /// B(t) = (1-t)^2 * p0 + 2(1-t)t * p1 + t^2 * p2
+#[inline]
 pub fn bezier_quadratic(p0: Vec2, p1: Vec2, p2: Vec2, t: f32) -> Vec2 {
     let u = 1.0 - t;
     p0 * (u * u) + p1 * (2.0 * u * t) + p2 * (t * t)
@@ -67,6 +71,7 @@ pub fn bezier_quadratic(p0: Vec2, p1: Vec2, p2: Vec2, t: f32) -> Vec2 {
 /// Evaluate a cubic Bezier curve at parameter `t` in [0, 1].
 ///
 /// B(t) = (1-t)^3 * p0 + 3(1-t)^2*t * p1 + 3(1-t)*t^2 * p2 + t^3 * p3
+#[inline]
 pub fn bezier_cubic(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
     let u = 1.0 - t;
     let u2 = u * u;

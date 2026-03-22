@@ -1,0 +1,337 @@
+//! ganit-geo — Geometric primitives and intersection tests.
+//!
+//! Provides rays, planes, AABBs, spheres, and ray-intersection routines.
+
+use glam::Vec3;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub use ganit_core;
+
+/// Errors from geometric operations.
+#[derive(Error, Debug)]
+pub enum GeoError {
+    #[error("degenerate geometry: {0}")]
+    Degenerate(String),
+}
+
+/// A ray defined by an origin and a direction.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Ray {
+    pub origin: Vec3,
+    /// Should be normalized for correct distance results.
+    pub direction: Vec3,
+}
+
+impl Ray {
+    /// Create a new ray. Direction is normalized automatically.
+    pub fn new(origin: Vec3, direction: Vec3) -> Self {
+        Self {
+            origin,
+            direction: direction.normalize(),
+        }
+    }
+
+    /// Point along the ray at parameter `t`.
+    pub fn at(&self, t: f32) -> Vec3 {
+        self.origin + self.direction * t
+    }
+}
+
+/// An infinite plane defined by a normal and a signed distance from the origin.
+///
+/// Points **on** the plane satisfy `dot(normal, point) - distance == 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Plane {
+    pub normal: Vec3,
+    pub distance: f32,
+}
+
+impl Plane {
+    /// Create a plane from a point on the plane and a normal.
+    pub fn from_point_normal(point: Vec3, normal: Vec3) -> Self {
+        let n = normal.normalize();
+        Self {
+            normal: n,
+            distance: n.dot(point),
+        }
+    }
+
+    /// Signed distance from a point to the plane.
+    /// Positive = same side as normal, negative = opposite side.
+    pub fn signed_distance(&self, point: Vec3) -> f32 {
+        self.normal.dot(point) - self.distance
+    }
+}
+
+/// An axis-aligned bounding box.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Aabb {
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+impl Aabb {
+    /// Create a new AABB. Min/max are corrected if swapped.
+    pub fn new(a: Vec3, b: Vec3) -> Self {
+        Self {
+            min: a.min(b),
+            max: a.max(b),
+        }
+    }
+
+    /// Check whether a point is inside (or on the boundary of) this AABB.
+    pub fn contains(&self, point: Vec3) -> bool {
+        point.x >= self.min.x
+            && point.x <= self.max.x
+            && point.y >= self.min.y
+            && point.y <= self.max.y
+            && point.z >= self.min.z
+            && point.z <= self.max.z
+    }
+
+    /// Center point of the AABB.
+    pub fn center(&self) -> Vec3 {
+        (self.min + self.max) * 0.5
+    }
+
+    /// Size (extents) of the AABB.
+    pub fn size(&self) -> Vec3 {
+        self.max - self.min
+    }
+
+    /// Merge two AABBs into one that encloses both.
+    pub fn merge(&self, other: &Aabb) -> Aabb {
+        Aabb {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
+    }
+}
+
+/// A sphere defined by a center and radius.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Sphere {
+    pub center: Vec3,
+    pub radius: f32,
+}
+
+impl Sphere {
+    pub fn new(center: Vec3, radius: f32) -> Self {
+        Self { center, radius }
+    }
+
+    /// Check whether a point is inside (or on the surface of) this sphere.
+    pub fn contains_point(&self, point: Vec3) -> bool {
+        (point - self.center).length_squared() <= self.radius * self.radius
+    }
+}
+
+/// Ray-plane intersection. Returns the `t` parameter if the ray hits the plane
+/// (only `t >= 0`, i.e. forward hits).
+pub fn ray_plane(ray: &Ray, plane: &Plane) -> Option<f32> {
+    let denom = plane.normal.dot(ray.direction);
+    if denom.abs() < 1e-8 {
+        return None; // Ray parallel to plane
+    }
+    let t = (plane.distance - plane.normal.dot(ray.origin)) / denom;
+    if t >= 0.0 { Some(t) } else { None }
+}
+
+/// Ray-sphere intersection using the quadratic formula.
+/// Returns the nearest `t >= 0` if the ray hits the sphere.
+pub fn ray_sphere(ray: &Ray, sphere: &Sphere) -> Option<f32> {
+    let oc = ray.origin - sphere.center;
+    let a = ray.direction.dot(ray.direction);
+    let b = 2.0 * oc.dot(ray.direction);
+    let c = oc.dot(oc) - sphere.radius * sphere.radius;
+    let discriminant = b * b - 4.0 * a * c;
+
+    if discriminant < 0.0 {
+        return None;
+    }
+
+    let sqrt_d = discriminant.sqrt();
+    let t1 = (-b - sqrt_d) / (2.0 * a);
+    let t2 = (-b + sqrt_d) / (2.0 * a);
+
+    if t1 >= 0.0 {
+        Some(t1)
+    } else if t2 >= 0.0 {
+        Some(t2)
+    } else {
+        None
+    }
+}
+
+/// Ray-AABB intersection using the slab method.
+/// Returns the nearest `t >= 0` if the ray hits the AABB.
+pub fn ray_aabb(ray: &Ray, aabb: &Aabb) -> Option<f32> {
+    let mut t_min = f32::NEG_INFINITY;
+    let mut t_max = f32::INFINITY;
+
+    for i in 0..3 {
+        let origin = [ray.origin.x, ray.origin.y, ray.origin.z][i];
+        let dir = [ray.direction.x, ray.direction.y, ray.direction.z][i];
+        let min_val = [aabb.min.x, aabb.min.y, aabb.min.z][i];
+        let max_val = [aabb.max.x, aabb.max.y, aabb.max.z][i];
+
+        if dir.abs() < 1e-8 {
+            // Ray parallel to slab — check if origin is within slab
+            if origin < min_val || origin > max_val {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / dir;
+            let mut t1 = (min_val - origin) * inv_d;
+            let mut t2 = (max_val - origin) * inv_d;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            t_min = t_min.max(t1);
+            t_max = t_max.min(t2);
+            if t_min > t_max {
+                return None;
+            }
+        }
+    }
+
+    if t_min >= 0.0 {
+        Some(t_min)
+    } else if t_max >= 0.0 {
+        Some(t_max)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPSILON: f32 = 1e-4;
+
+    fn approx_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() < EPSILON
+    }
+
+    #[test]
+    fn ray_at_parameter() {
+        let r = Ray::new(Vec3::ZERO, Vec3::X);
+        assert_eq!(r.at(0.0), Vec3::ZERO);
+        assert!(approx_eq(r.at(5.0).x, 5.0));
+    }
+
+    #[test]
+    fn plane_from_point_normal() {
+        let p = Plane::from_point_normal(Vec3::new(0.0, 1.0, 0.0), Vec3::Y);
+        assert!(approx_eq(p.distance, 1.0));
+        assert!(approx_eq(p.signed_distance(Vec3::new(0.0, 2.0, 0.0)), 1.0));
+        assert!(approx_eq(
+            p.signed_distance(Vec3::new(0.0, 0.0, 0.0)),
+            -1.0
+        ));
+    }
+
+    #[test]
+    fn aabb_contains() {
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        assert!(bb.contains(Vec3::splat(0.5)));
+        assert!(!bb.contains(Vec3::splat(2.0)));
+        assert!(bb.contains(Vec3::ZERO)); // boundary
+    }
+
+    #[test]
+    fn aabb_center_and_size() {
+        let bb = Aabb::new(Vec3::new(-1.0, -2.0, -3.0), Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(bb.center(), Vec3::ZERO);
+        assert_eq!(bb.size(), Vec3::new(2.0, 4.0, 6.0));
+    }
+
+    #[test]
+    fn aabb_merge() {
+        let a = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        let b = Aabb::new(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(0.5, 0.5, 0.5));
+        let merged = a.merge(&b);
+        assert_eq!(merged.min, Vec3::new(-1.0, -1.0, -1.0));
+        assert_eq!(merged.max, Vec3::ONE);
+    }
+
+    #[test]
+    fn sphere_contains() {
+        let s = Sphere::new(Vec3::ZERO, 1.0);
+        assert!(s.contains_point(Vec3::ZERO));
+        assert!(s.contains_point(Vec3::new(1.0, 0.0, 0.0)));
+        assert!(!s.contains_point(Vec3::new(1.1, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn ray_plane_intersection() {
+        let r = Ray::new(Vec3::ZERO, Vec3::Y);
+        let p = Plane::from_point_normal(Vec3::new(0.0, 5.0, 0.0), Vec3::Y);
+        let t = ray_plane(&r, &p).unwrap();
+        assert!(approx_eq(t, 5.0));
+    }
+
+    #[test]
+    fn ray_plane_parallel_no_hit() {
+        let r = Ray::new(Vec3::ZERO, Vec3::X);
+        let p = Plane::from_point_normal(Vec3::new(0.0, 5.0, 0.0), Vec3::Y);
+        assert!(ray_plane(&r, &p).is_none());
+    }
+
+    #[test]
+    fn ray_sphere_hit() {
+        let r = Ray::new(Vec3::new(0.0, 0.0, -5.0), Vec3::Z);
+        let s = Sphere::new(Vec3::ZERO, 1.0);
+        let t = ray_sphere(&r, &s).unwrap();
+        assert!(approx_eq(t, 4.0)); // hits at z = -1
+    }
+
+    #[test]
+    fn ray_sphere_miss() {
+        let r = Ray::new(Vec3::new(0.0, 5.0, -5.0), Vec3::Z);
+        let s = Sphere::new(Vec3::ZERO, 1.0);
+        assert!(ray_sphere(&r, &s).is_none());
+    }
+
+    #[test]
+    fn ray_aabb_hit() {
+        let r = Ray::new(Vec3::new(0.5, 0.5, -5.0), Vec3::Z);
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        let t = ray_aabb(&r, &bb).unwrap();
+        assert!(approx_eq(t, 5.0)); // hits front face at z = 0
+    }
+
+    #[test]
+    fn ray_aabb_miss() {
+        let r = Ray::new(Vec3::new(5.0, 5.0, -5.0), Vec3::Z);
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        assert!(ray_aabb(&r, &bb).is_none());
+    }
+
+    #[test]
+    fn ray_inside_sphere() {
+        let r = Ray::new(Vec3::ZERO, Vec3::X);
+        let s = Sphere::new(Vec3::ZERO, 10.0);
+        let t = ray_sphere(&r, &s).unwrap();
+        // t1 is negative (behind), t2 is positive
+        assert!(t > 0.0);
+        assert!(approx_eq(t, 10.0));
+    }
+
+    #[test]
+    fn ray_inside_aabb() {
+        let r = Ray::new(Vec3::splat(0.5), Vec3::X);
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        let t = ray_aabb(&r, &bb).unwrap();
+        assert!(t >= 0.0);
+    }
+
+    #[test]
+    fn aabb_auto_corrects_min_max() {
+        let bb = Aabb::new(Vec3::ONE, Vec3::ZERO);
+        assert_eq!(bb.min, Vec3::ZERO);
+        assert_eq!(bb.max, Vec3::ONE);
+    }
+}

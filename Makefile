@@ -1,22 +1,46 @@
-.PHONY: check fmt clippy test build doc clean
+.PHONY: check fmt clippy test audit deny bench coverage build doc clean
 
-check:
-	cargo check --workspace
+# Run all CI checks locally
+check: fmt clippy test audit
 
+# Format check
 fmt:
-	cargo fmt --all
+	cargo fmt --all -- --check
 
+# Lint (zero warnings)
 clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --all-features --all-targets -- -D warnings
 
+# Run test suite
 test:
-	cargo test --workspace
+	cargo test --all-features
 
+# Security audit
+audit:
+	cargo audit
+
+# Supply-chain checks (cargo-deny)
+deny:
+	cargo deny check
+
+# Run benchmarks with history
+bench:
+	./scripts/bench-history.sh
+
+# Generate coverage report
+coverage:
+	cargo llvm-cov --all-features --html --output-dir coverage/
+	@echo "Coverage report: coverage/html/index.html"
+
+# Build release
 build:
-	cargo build --workspace --release
+	cargo build --release --all-features
 
+# Generate documentation
 doc:
-	cargo doc --workspace --no-deps --open
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
+# Clean build artifacts
 clean:
 	cargo clean
+	rm -rf coverage/

@@ -1,25 +1,21 @@
-//! Daimon (agent-runtime) client for ganit.
+//! AI integration: daimon client, hoosh inference.
 //!
-//! Handles agent registration, heartbeats, and hoosh (LLM gateway) queries.
+//! Provides the standard AGNOS daimon/hoosh client pattern for the ganit agent.
+//! Requires the `ai` feature.
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::{AGENT_NAME, DEFAULT_DAIMON_URL, DEFAULT_HOOSH_URL};
+use crate::error::DaimonError;
 
-/// Errors from daimon/hoosh interaction.
-#[derive(Error, Debug)]
-pub enum DaimonError {
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("registration failed: {0}")]
-    Registration(String),
-    #[error("heartbeat failed: {0}")]
-    Heartbeat(String),
-    #[error("hoosh query failed: {0}")]
-    HooshQuery(String),
-}
+/// Agent name used when registering with daimon.
+pub const AGENT_NAME: &str = "ganit";
+
+/// Default daimon API URL.
+pub const DEFAULT_DAIMON_URL: &str = "http://localhost:8090";
+
+/// Default hoosh (LLM gateway) API URL.
+pub const DEFAULT_HOOSH_URL: &str = "http://localhost:8088";
 
 /// Registration request sent to daimon.
 #[derive(Debug, Serialize)]
@@ -173,5 +169,47 @@ mod tests {
         let client = DaimonClient::with_urls("http://daimon:9090", "http://hoosh:9088");
         assert_eq!(client.daimon_url, "http://daimon:9090");
         assert_eq!(client.hoosh_url, "http://hoosh:9088");
+    }
+
+    #[test]
+    fn client_default_trait() {
+        let client = DaimonClient::default();
+        assert_eq!(client.daimon_url, DEFAULT_DAIMON_URL);
+        assert_eq!(client.hoosh_url, DEFAULT_HOOSH_URL);
+        assert!(client.agent_id().is_none());
+    }
+
+    #[test]
+    fn error_display_variants() {
+        let e = DaimonError::Registration("bad token".to_string());
+        assert_eq!(e.to_string(), "registration failed: bad token");
+
+        let e = DaimonError::Heartbeat("timeout".to_string());
+        assert_eq!(e.to_string(), "heartbeat failed: timeout");
+
+        let e = DaimonError::HooshQuery("model not found".to_string());
+        assert_eq!(e.to_string(), "hoosh query failed: model not found");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_without_registration_fails() {
+        let client = DaimonClient::new();
+        let result = client.heartbeat().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, DaimonError::Heartbeat(_)));
+    }
+
+    #[test]
+    fn agent_id_none_before_registration() {
+        let client = DaimonClient::new();
+        assert!(client.agent_id().is_none());
+    }
+
+    #[test]
+    fn constants_are_correct() {
+        assert_eq!(AGENT_NAME, "ganit");
+        assert!(DEFAULT_DAIMON_URL.starts_with("http://"));
+        assert!(DEFAULT_HOOSH_URL.starts_with("http://"));
     }
 }

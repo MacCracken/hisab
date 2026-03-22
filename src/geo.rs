@@ -1,19 +1,10 @@
-//! ganit-geo — Geometric primitives and intersection tests.
+//! Geometric primitives and intersection tests.
 //!
-//! Provides rays, planes, AABBs, spheres, and ray-intersection routines.
+//! Provides rays, planes, axis-aligned bounding boxes, spheres, and
+//! ray-intersection routines.
 
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-pub use ganit_core;
-
-/// Errors from geometric operations.
-#[derive(Error, Debug)]
-pub enum GeoError {
-    #[error("degenerate geometry: {0}")]
-    Degenerate(String),
-}
 
 /// A ray defined by an origin and a direction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -177,7 +168,6 @@ pub fn ray_aabb(ray: &Ray, aabb: &Aabb) -> Option<f32> {
         let max_val = [aabb.max.x, aabb.max.y, aabb.max.z][i];
 
         if dir.abs() < 1e-8 {
-            // Ray parallel to slab — check if origin is within slab
             if origin < min_val || origin > max_val {
                 return None;
             }
@@ -238,7 +228,7 @@ mod tests {
         let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
         assert!(bb.contains(Vec3::splat(0.5)));
         assert!(!bb.contains(Vec3::splat(2.0)));
-        assert!(bb.contains(Vec3::ZERO)); // boundary
+        assert!(bb.contains(Vec3::ZERO));
     }
 
     #[test]
@@ -285,7 +275,7 @@ mod tests {
         let r = Ray::new(Vec3::new(0.0, 0.0, -5.0), Vec3::Z);
         let s = Sphere::new(Vec3::ZERO, 1.0);
         let t = ray_sphere(&r, &s).unwrap();
-        assert!(approx_eq(t, 4.0)); // hits at z = -1
+        assert!(approx_eq(t, 4.0));
     }
 
     #[test]
@@ -300,7 +290,7 @@ mod tests {
         let r = Ray::new(Vec3::new(0.5, 0.5, -5.0), Vec3::Z);
         let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
         let t = ray_aabb(&r, &bb).unwrap();
-        assert!(approx_eq(t, 5.0)); // hits front face at z = 0
+        assert!(approx_eq(t, 5.0));
     }
 
     #[test]
@@ -315,7 +305,6 @@ mod tests {
         let r = Ray::new(Vec3::ZERO, Vec3::X);
         let s = Sphere::new(Vec3::ZERO, 10.0);
         let t = ray_sphere(&r, &s).unwrap();
-        // t1 is negative (behind), t2 is positive
         assert!(t > 0.0);
         assert!(approx_eq(t, 10.0));
     }
@@ -333,5 +322,164 @@ mod tests {
         let bb = Aabb::new(Vec3::ONE, Vec3::ZERO);
         assert_eq!(bb.min, Vec3::ZERO);
         assert_eq!(bb.max, Vec3::ONE);
+    }
+
+    #[test]
+    fn ray_normalizes_direction() {
+        let r = Ray::new(Vec3::ZERO, Vec3::new(0.0, 0.0, 10.0));
+        let len = r.direction.length();
+        assert!(approx_eq(len, 1.0));
+        assert!(approx_eq(r.direction.z, 1.0));
+    }
+
+    #[test]
+    fn ray_at_negative_parameter() {
+        let r = Ray::new(Vec3::new(1.0, 0.0, 0.0), Vec3::X);
+        let p = r.at(-2.0);
+        assert!(approx_eq(p.x, -1.0));
+    }
+
+    #[test]
+    fn plane_signed_distance_on_plane() {
+        let p = Plane::from_point_normal(Vec3::ZERO, Vec3::Y);
+        assert!(approx_eq(p.signed_distance(Vec3::new(5.0, 0.0, -3.0)), 0.0));
+    }
+
+    #[test]
+    fn plane_non_axis_normal() {
+        let normal = Vec3::new(1.0, 1.0, 0.0);
+        let p = Plane::from_point_normal(Vec3::ZERO, normal);
+        assert!(approx_eq(p.normal.length(), 1.0));
+        assert!(approx_eq(p.distance, 0.0));
+    }
+
+    #[test]
+    fn aabb_contains_boundary_max() {
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        assert!(bb.contains(Vec3::ONE));
+    }
+
+    #[test]
+    fn aabb_merge_identical() {
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        let merged = bb.merge(&bb);
+        assert_eq!(merged.min, Vec3::ZERO);
+        assert_eq!(merged.max, Vec3::ONE);
+    }
+
+    #[test]
+    fn aabb_merge_disjoint() {
+        let a = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        let b = Aabb::new(Vec3::splat(5.0), Vec3::splat(6.0));
+        let merged = a.merge(&b);
+        assert_eq!(merged.min, Vec3::ZERO);
+        assert_eq!(merged.max, Vec3::splat(6.0));
+    }
+
+    #[test]
+    fn sphere_surface_point() {
+        let s = Sphere::new(Vec3::ZERO, 5.0);
+        assert!(s.contains_point(Vec3::new(5.0, 0.0, 0.0)));
+        assert!(s.contains_point(Vec3::new(0.0, -5.0, 0.0)));
+    }
+
+    #[test]
+    fn sphere_offset_center() {
+        let s = Sphere::new(Vec3::new(10.0, 0.0, 0.0), 1.0);
+        assert!(s.contains_point(Vec3::new(10.5, 0.0, 0.0)));
+        assert!(!s.contains_point(Vec3::ZERO));
+    }
+
+    #[test]
+    fn ray_plane_behind_origin() {
+        let r = Ray::new(Vec3::new(0.0, 0.0, 5.0), Vec3::Z);
+        let p = Plane::from_point_normal(Vec3::ZERO, Vec3::Z);
+        assert!(ray_plane(&r, &p).is_none());
+    }
+
+    #[test]
+    fn ray_sphere_tangent() {
+        let s = Sphere::new(Vec3::ZERO, 1.0);
+        let r = Ray::new(Vec3::new(0.0, 1.0, -5.0), Vec3::Z);
+        let t = ray_sphere(&r, &s);
+        assert!(t.is_some());
+        assert!(approx_eq(t.unwrap(), 5.0));
+    }
+
+    #[test]
+    fn ray_sphere_behind_ray() {
+        let r = Ray::new(Vec3::new(0.0, 0.0, 5.0), Vec3::Z);
+        let s = Sphere::new(Vec3::ZERO, 1.0);
+        assert!(ray_sphere(&r, &s).is_none());
+    }
+
+    #[test]
+    fn ray_aabb_axis_aligned_hit() {
+        let r = Ray::new(Vec3::new(-5.0, 0.5, 0.5), Vec3::X);
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        let t = ray_aabb(&r, &bb).unwrap();
+        assert!(approx_eq(t, 5.0));
+    }
+
+    #[test]
+    fn ray_aabb_parallel_to_slab_inside() {
+        let r = Ray::new(Vec3::new(-5.0, 0.5, 0.5), Vec3::X);
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        assert!(ray_aabb(&r, &bb).is_some());
+    }
+
+    #[test]
+    fn ray_aabb_parallel_to_slab_outside() {
+        let r = Ray::new(Vec3::new(-5.0, 5.0, 0.5), Vec3::X);
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        assert!(ray_aabb(&r, &bb).is_none());
+    }
+
+    #[test]
+    fn geo_error_display() {
+        use crate::GanitError;
+        let e = GanitError::Degenerate("zero-length edge".to_string());
+        assert_eq!(e.to_string(), "degenerate geometry: zero-length edge");
+    }
+
+    #[test]
+    fn ray_serde_roundtrip() {
+        let r = Ray::new(Vec3::new(1.0, 2.0, 3.0), Vec3::Y);
+        let json = serde_json::to_string(&r).unwrap();
+        let r2: Ray = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, r2);
+    }
+
+    #[test]
+    fn aabb_serde_roundtrip() {
+        let bb = Aabb::new(Vec3::new(-1.0, -2.0, -3.0), Vec3::new(4.0, 5.0, 6.0));
+        let json = serde_json::to_string(&bb).unwrap();
+        let bb2: Aabb = serde_json::from_str(&json).unwrap();
+        assert_eq!(bb, bb2);
+    }
+
+    #[test]
+    fn sphere_serde_roundtrip() {
+        let s = Sphere::new(Vec3::new(1.0, 2.0, 3.0), 5.0);
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: Sphere = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn aabb_zero_size() {
+        let bb = Aabb::new(Vec3::splat(3.0), Vec3::splat(3.0));
+        assert_eq!(bb.size(), Vec3::ZERO);
+        assert_eq!(bb.center(), Vec3::splat(3.0));
+        assert!(bb.contains(Vec3::splat(3.0)));
+    }
+
+    #[test]
+    fn ray_plane_intersection_at_angle() {
+        let r = Ray::new(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.0, -1.0, 1.0));
+        let p = Plane::from_point_normal(Vec3::ZERO, Vec3::Y);
+        let t = ray_plane(&r, &p).unwrap();
+        let hit = r.at(t);
+        assert!(approx_eq(hit.y, 0.0));
     }
 }

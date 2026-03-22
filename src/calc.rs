@@ -1,21 +1,9 @@
-//! ganit-calc — Calculus: differentiation, integration, interpolation, curves.
+//! Calculus: differentiation, integration, interpolation, curves.
 //!
 //! Provides numerical differentiation, integration (trapezoidal and Simpson's),
 //! linear interpolation, and Bezier curve evaluation.
 
 use glam::Vec2;
-use thiserror::Error;
-
-pub use ganit_core;
-
-/// Errors from calculus operations.
-#[derive(Error, Debug)]
-pub enum CalcError {
-    #[error("invalid interval: a must be less than b")]
-    InvalidInterval,
-    #[error("step count must be positive")]
-    ZeroSteps,
-}
 
 /// Numerical derivative using the central difference method.
 ///
@@ -83,6 +71,7 @@ pub fn bezier_cubic(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GanitError;
 
     const EPSILON_F64: f64 = 1e-6;
     const EPSILON_F32: f32 = 1e-4;
@@ -97,64 +86,54 @@ mod tests {
 
     #[test]
     fn derivative_of_x_squared() {
-        // d/dx(x^2) = 2x, at x=3 should be 6
         let d = derivative(|x| x * x, 3.0, 1e-7);
         assert!(approx_eq_f64(d, 6.0));
     }
 
     #[test]
     fn derivative_of_sin() {
-        // d/dx(sin(x)) = cos(x), at x=0 should be 1
         let d = derivative(f64::sin, 0.0, 1e-7);
         assert!(approx_eq_f64(d, 1.0));
     }
 
     #[test]
     fn derivative_of_exp() {
-        // d/dx(e^x) = e^x, at x=1 should be e
         let d = derivative(f64::exp, 1.0, 1e-7);
         assert!((d - std::f64::consts::E).abs() < 1e-5);
     }
 
     #[test]
     fn integral_trapezoidal_constant() {
-        // Integral of f(x) = 5 from 0 to 2 = 10
         let result = integral_trapezoidal(|_| 5.0, 0.0, 2.0, 100);
         assert!(approx_eq_f64(result, 10.0));
     }
 
     #[test]
     fn integral_trapezoidal_linear() {
-        // Integral of f(x) = x from 0 to 4 = 8
         let result = integral_trapezoidal(|x| x, 0.0, 4.0, 1000);
         assert!((result - 8.0).abs() < 1e-4);
     }
 
     #[test]
     fn integral_trapezoidal_quadratic() {
-        // Integral of f(x) = x^2 from 0 to 3 = 9
         let result = integral_trapezoidal(|x| x * x, 0.0, 3.0, 10000);
         assert!((result - 9.0).abs() < 1e-3);
     }
 
     #[test]
     fn integral_simpson_quadratic() {
-        // Simpson's is exact for polynomials up to degree 3.
-        // Integral of x^2 from 0 to 3 = 9
         let result = integral_simpson(|x| x * x, 0.0, 3.0, 4);
         assert!(approx_eq_f64(result, 9.0));
     }
 
     #[test]
     fn integral_simpson_cubic() {
-        // Integral of x^3 from 0 to 2 = 4
         let result = integral_simpson(|x| x * x * x, 0.0, 2.0, 4);
         assert!(approx_eq_f64(result, 4.0));
     }
 
     #[test]
     fn integral_simpson_sin() {
-        // Integral of sin(x) from 0 to pi = 2
         let result = integral_simpson(f64::sin, 0.0, std::f64::consts::PI, 100);
         assert!((result - 2.0).abs() < 1e-6);
     }
@@ -195,7 +174,6 @@ mod tests {
 
     #[test]
     fn bezier_quadratic_midpoint() {
-        // Straight line: p0=(0,0), p1=(0.5,0.5), p2=(1,1) -> midpoint = (0.5, 0.5)
         let mid = bezier_quadratic(Vec2::ZERO, Vec2::new(0.5, 0.5), Vec2::ONE, 0.5);
         assert!(approx_eq_f32(mid.x, 0.5));
         assert!(approx_eq_f32(mid.y, 0.5));
@@ -203,8 +181,117 @@ mod tests {
 
     #[test]
     fn integral_simpson_odd_n_rounds_up() {
-        // n=3 should round to n=4, and still give correct result
         let result = integral_simpson(|x| x * x, 0.0, 3.0, 3);
         assert!(approx_eq_f64(result, 9.0));
+    }
+
+    #[test]
+    fn derivative_of_constant() {
+        let d = derivative(|_| 5.0, 3.0, 1e-7);
+        assert!(approx_eq_f64(d, 0.0));
+    }
+
+    #[test]
+    fn derivative_of_cubic() {
+        let d = derivative(|x| x * x * x, 2.0, 1e-7);
+        assert!((d - 12.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn derivative_of_cos() {
+        let d = derivative(f64::cos, std::f64::consts::FRAC_PI_2, 1e-7);
+        assert!((d - (-1.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn integral_trapezoidal_sin() {
+        let result = integral_trapezoidal(f64::sin, 0.0, std::f64::consts::PI, 10000);
+        assert!((result - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn integral_simpson_constant() {
+        let result = integral_simpson(|_| 7.0, 1.0, 4.0, 4);
+        assert!(approx_eq_f64(result, 21.0));
+    }
+
+    #[test]
+    fn integral_simpson_linear() {
+        let result = integral_simpson(|x| 2.0 * x, 0.0, 3.0, 2);
+        assert!(approx_eq_f64(result, 9.0));
+    }
+
+    #[test]
+    fn lerp_at_quarter() {
+        assert!(approx_eq_f64(lerp(0.0, 100.0, 0.25), 25.0));
+        assert!(approx_eq_f64(lerp(0.0, 100.0, 0.75), 75.0));
+    }
+
+    #[test]
+    fn lerp_negative_range() {
+        assert!(approx_eq_f64(lerp(-10.0, -20.0, 0.5), -15.0));
+    }
+
+    #[test]
+    fn lerp_extrapolation() {
+        assert!(approx_eq_f64(lerp(0.0, 10.0, 2.0), 20.0));
+        assert!(approx_eq_f64(lerp(0.0, 10.0, -1.0), -10.0));
+    }
+
+    #[test]
+    fn bezier_quadratic_straight_line() {
+        let p0 = Vec2::ZERO;
+        let p1 = Vec2::new(0.5, 0.5);
+        let p2 = Vec2::ONE;
+        let quarter = bezier_quadratic(p0, p1, p2, 0.25);
+        assert!(approx_eq_f32(quarter.x, 0.25));
+        assert!(approx_eq_f32(quarter.y, 0.25));
+    }
+
+    #[test]
+    fn bezier_cubic_midpoint() {
+        let p0 = Vec2::ZERO;
+        let p1 = Vec2::new(0.0, 1.0);
+        let p2 = Vec2::new(1.0, 0.0);
+        let p3 = Vec2::ONE;
+        let mid = bezier_cubic(p0, p1, p2, p3, 0.5);
+        assert!(approx_eq_f32(mid.x, 0.5));
+        assert!(approx_eq_f32(mid.y, 0.5));
+    }
+
+    #[test]
+    fn bezier_cubic_straight_line() {
+        let p0 = Vec2::ZERO;
+        let p1 = Vec2::new(1.0, 1.0);
+        let p2 = Vec2::new(2.0, 2.0);
+        let p3 = Vec2::new(3.0, 3.0);
+        let mid = bezier_cubic(p0, p1, p2, p3, 0.5);
+        assert!(approx_eq_f32(mid.x, 1.5));
+        assert!(approx_eq_f32(mid.y, 1.5));
+    }
+
+    #[test]
+    fn integral_trapezoidal_single_step() {
+        let result = integral_trapezoidal(|x| x, 0.0, 2.0, 1);
+        assert!(approx_eq_f64(result, 2.0));
+    }
+
+    #[test]
+    fn integral_simpson_exp() {
+        let expected = std::f64::consts::E - 1.0;
+        let result = integral_simpson(f64::exp, 0.0, 1.0, 100);
+        assert!((result - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn calc_error_display() {
+        assert_eq!(
+            GanitError::InvalidInterval.to_string(),
+            "invalid interval: a must be less than b"
+        );
+        assert_eq!(
+            GanitError::ZeroSteps.to_string(),
+            "step count must be positive"
+        );
     }
 }

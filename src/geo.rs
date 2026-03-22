@@ -72,13 +72,9 @@ impl Aabb {
     }
 
     /// Check whether a point is inside (or on the boundary of) this AABB.
+    #[inline]
     pub fn contains(&self, point: Vec3) -> bool {
-        point.x >= self.min.x
-            && point.x <= self.max.x
-            && point.y >= self.min.y
-            && point.y <= self.max.y
-            && point.z >= self.min.z
-            && point.z <= self.max.z
+        point.cmpge(self.min).all() && point.cmple(self.max).all()
     }
 
     /// Center point of the AABB.
@@ -113,6 +109,7 @@ impl Sphere {
     }
 
     /// Check whether a point is inside (or on the surface of) this sphere.
+    #[inline]
     pub fn contains_point(&self, point: Vec3) -> bool {
         (point - self.center).length_squared() <= self.radius * self.radius
     }
@@ -120,6 +117,7 @@ impl Sphere {
 
 /// Ray-plane intersection. Returns the `t` parameter if the ray hits the plane
 /// (only `t >= 0`, i.e. forward hits).
+#[inline]
 pub fn ray_plane(ray: &Ray, plane: &Plane) -> Option<f32> {
     let denom = plane.normal.dot(ray.direction);
     if denom.abs() < 1e-8 {
@@ -131,20 +129,25 @@ pub fn ray_plane(ray: &Ray, plane: &Plane) -> Option<f32> {
 
 /// Ray-sphere intersection using the quadratic formula.
 /// Returns the nearest `t >= 0` if the ray hits the sphere.
+///
+/// Assumes `ray.direction` is normalized (guaranteed by `Ray::new`),
+/// so the quadratic coefficient `a = 1` and is eliminated.
+#[inline]
 pub fn ray_sphere(ray: &Ray, sphere: &Sphere) -> Option<f32> {
     let oc = ray.origin - sphere.center;
-    let a = ray.direction.dot(ray.direction);
-    let b = 2.0 * oc.dot(ray.direction);
+    // With normalized direction: a=1, so b=2*dot(oc,d), c=dot(oc,oc)-r²
+    // Use half-b form: half_b = dot(oc, d), discriminant = half_b² - c
+    let half_b = oc.dot(ray.direction);
     let c = oc.dot(oc) - sphere.radius * sphere.radius;
-    let discriminant = b * b - 4.0 * a * c;
+    let discriminant = half_b * half_b - c;
 
     if discriminant < 0.0 {
         return None;
     }
 
     let sqrt_d = discriminant.sqrt();
-    let t1 = (-b - sqrt_d) / (2.0 * a);
-    let t2 = (-b + sqrt_d) / (2.0 * a);
+    let t1 = -half_b - sqrt_d;
+    let t2 = -half_b + sqrt_d;
 
     if t1 >= 0.0 {
         Some(t1)
@@ -157,24 +160,25 @@ pub fn ray_sphere(ray: &Ray, sphere: &Sphere) -> Option<f32> {
 
 /// Ray-AABB intersection using the slab method.
 /// Returns the nearest `t >= 0` if the ray hits the AABB.
+#[inline]
 pub fn ray_aabb(ray: &Ray, aabb: &Aabb) -> Option<f32> {
+    let origin = ray.origin.to_array();
+    let dir = ray.direction.to_array();
+    let bb_min = aabb.min.to_array();
+    let bb_max = aabb.max.to_array();
+
     let mut t_min = f32::NEG_INFINITY;
     let mut t_max = f32::INFINITY;
 
     for i in 0..3 {
-        let origin = [ray.origin.x, ray.origin.y, ray.origin.z][i];
-        let dir = [ray.direction.x, ray.direction.y, ray.direction.z][i];
-        let min_val = [aabb.min.x, aabb.min.y, aabb.min.z][i];
-        let max_val = [aabb.max.x, aabb.max.y, aabb.max.z][i];
-
-        if dir.abs() < 1e-8 {
-            if origin < min_val || origin > max_val {
+        if dir[i].abs() < 1e-8 {
+            if origin[i] < bb_min[i] || origin[i] > bb_max[i] {
                 return None;
             }
         } else {
-            let inv_d = 1.0 / dir;
-            let mut t1 = (min_val - origin) * inv_d;
-            let mut t2 = (max_val - origin) * inv_d;
+            let inv_d = 1.0 / dir[i];
+            let mut t1 = (bb_min[i] - origin[i]) * inv_d;
+            let mut t2 = (bb_max[i] - origin[i]) * inv_d;
             if t1 > t2 {
                 std::mem::swap(&mut t1, &mut t2);
             }
@@ -481,5 +485,61 @@ mod tests {
         let t = ray_plane(&r, &p).unwrap();
         let hit = r.at(t);
         assert!(approx_eq(hit.y, 0.0));
+    }
+
+    #[test]
+    fn ray_sphere_optimized_matches_distance() {
+        // Verify half-b optimization gives correct hit distance
+        let r = Ray::new(Vec3::new(0.0, 0.0, -10.0), Vec3::Z);
+        let s = Sphere::new(Vec3::ZERO, 2.0);
+        let t = ray_sphere(&r, &s).unwrap();
+        assert!(approx_eq(t, 8.0)); // 10 - 2
+        let hit = r.at(t);
+        assert!(approx_eq(hit.z, -2.0));
+    }
+
+    #[test]
+    fn ray_sphere_large_radius() {
+        let r = Ray::new(Vec3::new(0.0, 0.0, -1000.0), Vec3::Z);
+        let s = Sphere::new(Vec3::ZERO, 500.0);
+        let t = ray_sphere(&r, &s).unwrap();
+        assert!(approx_eq(t, 500.0));
+    }
+
+    #[test]
+    fn aabb_contains_just_outside() {
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        assert!(!bb.contains(Vec3::new(1.001, 0.5, 0.5)));
+        assert!(!bb.contains(Vec3::new(0.5, -0.001, 0.5)));
+        assert!(!bb.contains(Vec3::new(0.5, 0.5, 1.001)));
+    }
+
+    #[test]
+    fn aabb_contains_all_corners() {
+        let bb = Aabb::new(Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+        // All 8 corners should be contained
+        for x in [-1.0, 1.0] {
+            for y in [-1.0, 1.0] {
+                for z in [-1.0, 1.0] {
+                    assert!(bb.contains(Vec3::new(x, y, z)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ray_aabb_diagonal_ray() {
+        // Diagonal ray through AABB
+        let r = Ray::new(Vec3::new(-5.0, -5.0, -5.0), Vec3::new(1.0, 1.0, 1.0));
+        let bb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        assert!(ray_aabb(&r, &bb).is_some());
+    }
+
+    #[test]
+    fn plane_signed_distance_both_sides() {
+        let p = Plane::from_point_normal(Vec3::new(0.0, 5.0, 0.0), Vec3::Y);
+        assert!(p.signed_distance(Vec3::new(0.0, 10.0, 0.0)) > 0.0);
+        assert!(p.signed_distance(Vec3::new(0.0, 0.0, 0.0)) < 0.0);
+        assert!(approx_eq(p.signed_distance(Vec3::new(0.0, 5.0, 0.0)), 0.0));
     }
 }

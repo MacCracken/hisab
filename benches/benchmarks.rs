@@ -222,5 +222,83 @@ fn bench_num(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_transforms, bench_geo, bench_calc, bench_num,);
+// ---------------------------------------------------------------------------
+// Batch operations (realistic workloads)
+// ---------------------------------------------------------------------------
+
+fn bench_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch");
+
+    group.bench_function("ray_sphere_100", |b| {
+        let ray = ganit::Ray::new(Vec3::new(0.0, 0.0, -20.0), Vec3::Z);
+        let spheres: Vec<ganit::Sphere> = (0..100)
+            .map(|i| ganit::Sphere::new(Vec3::new(i as f32 * 0.1 - 5.0, 0.0, 0.0), 0.5))
+            .collect();
+        b.iter(|| {
+            let mut count = 0u32;
+            for s in &spheres {
+                if ray_sphere(black_box(&ray), s).is_some() {
+                    count += 1;
+                }
+            }
+            count
+        })
+    });
+
+    group.bench_function("aabb_contains_100", |b| {
+        let bb = ganit::Aabb::new(Vec3::ZERO, Vec3::splat(10.0));
+        let points: Vec<Vec3> = (0..100)
+            .map(|i| Vec3::new(i as f32 * 0.2 - 5.0, i as f32 * 0.1, 5.0))
+            .collect();
+        b.iter(|| {
+            let mut count = 0u32;
+            for p in &points {
+                if bb.contains(black_box(*p)) {
+                    count += 1;
+                }
+            }
+            count
+        })
+    });
+
+    group.bench_function("transform3d_batch_100", |b| {
+        let t = Transform3D::new(
+            Vec3::new(1.0, 2.0, 3.0),
+            Quat::from_rotation_y(0.5),
+            Vec3::splat(2.0),
+        );
+        let points: Vec<Vec3> = (0..100)
+            .map(|i| Vec3::new(i as f32, i as f32 * 0.5, i as f32 * 0.1))
+            .collect();
+        b.iter(|| {
+            let mut sum = Vec3::ZERO;
+            for p in &points {
+                sum += t.apply_to_point(black_box(*p));
+            }
+            sum
+        })
+    });
+
+    group.bench_function("simpson_sin_10000", |b| {
+        b.iter(|| {
+            ganit::calc::integral_simpson(
+                f64::sin,
+                black_box(0.0),
+                black_box(std::f64::consts::PI),
+                10000,
+            )
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_transforms,
+    bench_geo,
+    bench_calc,
+    bench_num,
+    bench_batch,
+);
 criterion_main!(benches);

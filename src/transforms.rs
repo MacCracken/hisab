@@ -48,9 +48,12 @@ impl Transform2D {
     }
 
     /// Apply this transform to a 2D point.
+    #[inline]
     pub fn apply_to_point(&self, point: Vec2) -> Vec3 {
-        let m = self.to_matrix();
-        m * Vec3::new(point.x, point.y, 1.0)
+        let (sin, cos) = self.rotation.sin_cos();
+        let x = cos * self.scale.x * point.x - sin * self.scale.y * point.y + self.position.x;
+        let y = sin * self.scale.x * point.x + cos * self.scale.y * point.y + self.position.y;
+        Vec3::new(x, y, 1.0)
     }
 }
 
@@ -91,10 +94,9 @@ impl Transform3D {
     }
 
     /// Apply this transform to a 3D point.
+    #[inline]
     pub fn apply_to_point(&self, point: Vec3) -> Vec3 {
-        let m = self.to_matrix();
-        let v = m * glam::Vec4::new(point.x, point.y, point.z, 1.0);
-        Vec3::new(v.x, v.y, v.z)
+        self.rotation * (self.scale * point) + self.position
     }
 }
 
@@ -406,5 +408,43 @@ mod tests {
         let result = t.apply_to_point(Vec2::new(1.0, 0.0));
         assert!(approx_eq(result.x, 1.0));
         assert!(approx_eq(result.y, 0.0));
+    }
+
+    #[test]
+    fn transform2d_apply_matches_matrix() {
+        // Verify optimized apply_to_point matches matrix multiplication
+        let t = Transform2D::new(Vec2::new(5.0, -3.0), 1.2, Vec2::new(0.5, 2.0));
+        let point = Vec2::new(7.0, -2.0);
+        let via_apply = t.apply_to_point(point);
+        let via_matrix = t.to_matrix() * Vec3::new(point.x, point.y, 1.0);
+        assert!(approx_eq(via_apply.x, via_matrix.x));
+        assert!(approx_eq(via_apply.y, via_matrix.y));
+        assert!(approx_eq(via_apply.z, 1.0));
+    }
+
+    #[test]
+    fn transform3d_apply_matches_matrix() {
+        // Verify optimized apply_to_point matches matrix multiplication
+        let t = Transform3D::new(
+            Vec3::new(5.0, -3.0, 1.0),
+            Quat::from_rotation_y(0.7),
+            Vec3::new(2.0, 0.5, 3.0),
+        );
+        let point = Vec3::new(1.0, -2.0, 3.0);
+        let via_apply = t.apply_to_point(point);
+        let m = t.to_matrix();
+        let v = m * glam::Vec4::new(point.x, point.y, point.z, 1.0);
+        let via_matrix = Vec3::new(v.x, v.y, v.z);
+        assert!(vec3_approx_eq(via_apply, via_matrix));
+    }
+
+    #[test]
+    fn transform3d_apply_combined_rotation_scale_translate() {
+        // Combined with all three components active
+        let rot = Quat::from_rotation_z(FRAC_PI_2);
+        let t = Transform3D::new(Vec3::new(10.0, 20.0, 30.0), rot, Vec3::new(2.0, 3.0, 4.0));
+        let result = t.apply_to_point(Vec3::new(1.0, 0.0, 0.0));
+        // scale(1,0,0) by (2,3,4) => (2,0,0), rotate 90 around Z => (0,2,0), translate => (10,22,30)
+        assert!(vec3_approx_eq(result, Vec3::new(10.0, 22.0, 30.0)));
     }
 }

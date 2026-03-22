@@ -36,10 +36,16 @@ pub fn integral_simpson(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64
     let h = (b - a) / n as f64;
     let mut sum = f(a) + f(b);
 
-    for i in 1..n {
-        let coeff = if i % 2 == 0 { 2.0 } else { 4.0 };
-        sum += coeff * f(a + i as f64 * h);
+    // Process pairs: odd indices get coefficient 4, even get 2.
+    // Unrolled to avoid branch per iteration.
+    let mut i = 1;
+    while i < n {
+        sum += 4.0 * f(a + i as f64 * h);
+        sum += 2.0 * f(a + (i + 1) as f64 * h);
+        i += 2;
     }
+    // Correct the last even-index term (we added 2*f(b) but f(b) is already counted)
+    sum -= 2.0 * f(b);
 
     sum * h / 3.0
 }

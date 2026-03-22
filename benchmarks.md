@@ -1,52 +1,61 @@
 # Benchmarks
 
-Latest run: **2026-03-22T22:29:38Z** — commit `9463cf0` on `main`
+Latest run: **2026-03-22T22:58:10Z** — commit `e481541` on `main`
 
 ## transforms
 
 | Benchmark | Time |
 |-----------|------|
-| `transform2d_to_matrix` | 7.1441 ns |
-| `transform2d_apply_point` | 12.081 ns |
-| `transform3d_to_matrix` | 10.470 ns |
-| `transform3d_apply_point` | 13.186 ns |
-| `projection_perspective` | 14.513 ns |
-| `projection_orthographic` | 4.4670 ns |
-| `lerp_f32` | 1.1244 ns |
-| `lerp_vec3` | 2.7785 ns |
+| `transform2d_to_matrix` | 7.0349 ns |
+| `transform2d_apply_point` | 6.4926 ns |
+| `transform3d_to_matrix` | 10.443 ns |
+| `transform3d_apply_point` | 6.3699 ns |
+| `projection_perspective` | 23.535 ns |
+| `projection_orthographic` | 4.3109 ns |
+| `lerp_f32` | 1.1039 ns |
+| `lerp_vec3` | 3.0687 ns |
 
 ## geo
 
 | Benchmark | Time |
 |-----------|------|
-| `ray_sphere_hit` | 5.5442 ns |
-| `ray_plane_hit` | 2.3235 ns |
-| `ray_aabb_hit` | 4.6659 ns |
-| `ray_sphere_miss` | 3.6062 ns |
-| `aabb_contains` | 3.2781 ns |
-| `sphere_contains` | 2.4210 ns |
-| `aabb_merge` | 4.3941 ns |
+| `ray_sphere_hit` | 3.2482 ns |
+| `ray_plane_hit` | 2.2704 ns |
+| `ray_aabb_hit` | 4.9479 ns |
+| `ray_sphere_miss` | 2.2235 ns |
+| `aabb_contains` | 3.2495 ns |
+| `sphere_contains` | 4.1771 ns |
+| `aabb_merge` | 4.1493 ns |
 
 ## calc
 
 | Benchmark | Time |
 |-----------|------|
-| `derivative_x_squared` | 1.2089 ns |
-| `integral_simpson_100` | 87.405 ns |
-| `integral_simpson_1000` | 865.95 ns |
-| `integral_trapezoidal_100` | 78.338 ns |
-| `integral_trapezoidal_1000` | 785.30 ns |
-| `bezier_quadratic` | 1.6387 ns |
-| `bezier_cubic` | 2.6480 ns |
+| `derivative_x_squared` | 1.2342 ns |
+| `integral_simpson_100` | 85.096 ns |
+| `integral_simpson_1000` | 837.90 ns |
+| `integral_trapezoidal_100` | 75.919 ns |
+| `integral_trapezoidal_1000` | 782.05 ns |
+| `bezier_quadratic` | 1.4814 ns |
+| `bezier_cubic` | 2.5909 ns |
 
 ## num
 
 | Benchmark | Time |
 |-----------|------|
-| `newton_sqrt2` | 6.8925 ns |
-| `bisection_sqrt2` | 113.36 ns |
-| `gaussian_3x3` | 84.466 ns |
-| `gaussian_4x4` | 113.08 ns |
+| `newton_sqrt2` | 6.1855 ns |
+| `bisection_sqrt2` | 104.18 ns |
+| `gaussian_3x3` | 75.593 ns |
+| `gaussian_4x4` | 103.16 ns |
+
+## batch
+
+| Benchmark | Time |
+|-----------|------|
+| `ray_sphere_100` | 188.84 ns |
+| `aabb_contains_100` | 126.12 ns |
+| `transform3d_batch_100` | 356.04 ns |
+| `simpson_sin_10000` | 78.605 µs |
 
 ---
 

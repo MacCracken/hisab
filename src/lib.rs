@@ -9,10 +9,10 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `transforms` | yes | 2D/3D transforms, projections, lerp, glam re-exports |
-//! | `geo` | yes | Geometric primitives and ray intersection tests |
-//! | `calc` | yes | Differentiation, integration, Bezier curves |
-//! | `num` | yes | Newton-Raphson, bisection, Gaussian elimination |
+//! | `transforms` | yes | 2D/3D transforms, projections, slerp, lerp, glam re-exports |
+//! | `geo` | yes | Primitives, intersections, BVH, k-d tree, quadtree, octree, spatial hash, GJK/EPA |
+//! | `calc` | yes | Differentiation, integration, Bezier 2D/3D, splines, easing, Gauss-Legendre |
+//! | `num` | yes | Root finding, LU/Cholesky/QR, eigenvalues, FFT, RK4 ODE solver |
 //! | `ai` | no | Daimon/hoosh AI client (requires network deps) |
 //! | `logging` | no | Structured logging via tracing-subscriber |
 //! | `full` | — | Enables all features |

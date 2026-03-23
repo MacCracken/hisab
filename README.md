@@ -10,10 +10,10 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `transforms` | yes | 2D/3D affine transforms, projections, lerp, glam re-exports |
-| `geo` | yes | Rays, planes, AABBs, spheres, ray intersection tests |
-| `calc` | yes | Differentiation, integration (trapezoidal/Simpson), Bezier curves |
-| `num` | yes | Newton-Raphson, bisection, Gaussian elimination |
+| `transforms` | yes | 2D/3D affine transforms, projections, slerp, lerp, glam re-exports |
+| `geo` | yes | Primitives, intersections, BVH, k-d tree, quadtree, octree, spatial hash, GJK/EPA |
+| `calc` | yes | Differentiation, integration, Bezier 2D/3D, splines, easing, Gauss-Legendre |
+| `num` | yes | Root finding, LU/Cholesky/QR, eigenvalues, FFT, RK4 ODE solver |
 | `ai` | no | Daimon/hoosh AI client (network deps) |
 | `logging` | no | Structured logging via `GANIT_LOG` env var |
 | `full` | — | Enables all features |
@@ -22,24 +22,24 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 
 | Module | Description |
 |--------|-------------|
-| `transforms` | `Transform2D`, `Transform3D`, orthographic/perspective projections, lerp |
-| `geo` | `Ray`, `Plane`, `Aabb`, `Sphere`, `ray_plane`, `ray_sphere`, `ray_aabb` |
-| `calc` | `derivative`, `integral_trapezoidal`, `integral_simpson`, `bezier_quadratic`, `bezier_cubic` |
-| `num` | `newton_raphson`, `bisection`, `gaussian_elimination` |
+| `transforms` | `Transform2D`, `Transform3D`, projections, slerp, lerp, handedness conversion |
+| `geo` | `Ray`, `Plane`, `Aabb`, `Sphere`, `Triangle`, `Line`, `Segment`, `Frustum`, `Bvh`, `KdTree`, `Quadtree`, `Octree`, `SpatialHash`, `ConvexPolygon`, GJK/EPA collision |
+| `calc` | `derivative`, integration (trapezoidal, Simpson, Gauss-Legendre), Bezier 2D/3D, Catmull-Rom, B-spline, de Casteljau, arc-length, easing functions |
+| `num` | `newton_raphson`, `bisection`, `gaussian_elimination`, LU/Cholesky/QR, `least_squares_poly`, `eigenvalue_power`, `Complex`, FFT/IFFT, `rk4` ODE solver |
 | `ai` | `DaimonClient` for AGNOS daimon/hoosh integration |
 
 ## Quick Start
 
 ```toml
 [dependencies]
-ganit = "0.1"
+ganit = "0.22"
 ```
 
 ```rust
 use ganit::{Vec3, Quat, Transform3D, Ray, Sphere};
-use ganit::geo::ray_sphere;
+use ganit::geo::{ray_sphere, gjk_intersect};
 use ganit::calc::integral_simpson;
-use ganit::num::newton_raphson;
+use ganit::num::{newton_raphson, fft, Complex};
 
 // 3D transform
 let t = Transform3D::new(Vec3::new(1.0, 2.0, 3.0), Quat::IDENTITY, Vec3::ONE);
@@ -61,8 +61,13 @@ let sqrt2 = newton_raphson(|x| x * x - 2.0, |x| 2.0 * x, 1.0, 1e-10, 100).unwrap
 
 ```sh
 cargo build
-cargo test --all-features   # 130+ tests
+cargo test --all-features   # 360 tests
+make bench                  # 82 criterion benchmarks with history tracking
 ```
+
+## Roadmap
+
+See [docs/development/roadmap.md](docs/development/roadmap.md) for the full plan through V2.0.
 
 ## License
 

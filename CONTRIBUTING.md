@@ -26,6 +26,7 @@ Thank you for your interest in contributing to Ganit.
 | `make test` | Run test suite |
 | `make audit` | Security audit |
 | `make deny` | Supply chain checks |
+| `make bench` | Run benchmarks with history tracking |
 | `make coverage` | Generate coverage report |
 | `make doc` | Build documentation |
 

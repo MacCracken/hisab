@@ -1285,7 +1285,8 @@ impl SpatialHash {
 /// Returns the hull vertices in counter-clockwise order using Andrew's
 /// monotone chain algorithm. O(n log n).
 ///
-/// Returns an empty vec if fewer than 3 non-collinear points are given.
+/// For fewer than 2 points, returns the input as-is. For collinear points,
+/// returns only the two endpoints.
 pub fn convex_hull_2d(points: &[glam::Vec2]) -> Vec<glam::Vec2> {
     let mut pts: Vec<glam::Vec2> = points.to_vec();
     let n = pts.len();
@@ -1341,6 +1342,9 @@ pub trait ConvexSupport {
 }
 
 /// A convex polygon for GJK/EPA (2D).
+///
+/// Vertices should be in counter-clockwise order. Use [`convex_hull_2d`]
+/// to construct from an arbitrary point set.
 #[derive(Debug, Clone)]
 pub struct ConvexPolygon {
     pub vertices: Vec<glam::Vec2>,
@@ -1355,6 +1359,7 @@ impl ConvexPolygon {
 }
 
 impl ConvexSupport for ConvexPolygon {
+    #[inline]
     fn support(&self, direction: glam::Vec2) -> glam::Vec2 {
         let mut best = self.vertices[0];
         let mut best_dot = best.dot(direction);
@@ -1370,6 +1375,7 @@ impl ConvexSupport for ConvexPolygon {
 }
 
 /// Result of a Minkowski difference support query.
+#[inline]
 fn minkowski_support(
     a: &dyn ConvexSupport,
     b: &dyn ConvexSupport,
@@ -1380,6 +1386,7 @@ fn minkowski_support(
 
 /// Triple product: (A × B) × C — returns the vector perpendicular to C
 /// in the direction away from A, used for simplex evolution.
+#[inline]
 fn triple_cross_2d(a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> glam::Vec2 {
     // In 2D: (A × B) × C = B * (C·A) - A * (C·B)
     let ca = c.dot(a);
@@ -1458,7 +1465,7 @@ pub fn gjk_intersect(a: &dyn ConvexSupport, b: &dyn ConvexSupport) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Penetration result from EPA.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Penetration {
     /// Penetration normal (direction to separate).
     pub normal: glam::Vec2,
@@ -1509,10 +1516,10 @@ pub fn epa_penetration(
         let d = support.dot(closest_normal);
 
         if (d - closest_dist).abs() < 1e-6 {
-            // Converged
+            // Converged — depth is always positive
             return Some(Penetration {
                 normal: closest_normal,
-                depth: closest_dist,
+                depth: closest_dist.abs(),
             });
         }
 
@@ -1535,7 +1542,7 @@ pub fn epa_penetration(
     }
     Some(Penetration {
         normal: closest_normal,
-        depth: closest_dist,
+        depth: closest_dist.abs(),
     })
 }
 
@@ -3012,11 +3019,68 @@ mod tests {
     #[test]
     fn convex_support_polygon() {
         let poly = make_square(0.0, 0.0, 1.0);
-        // Support in +X should be (1, ?)
         let s = poly.support(glam::Vec2::X);
         assert!(approx_eq(s.x, 1.0));
-        // Support in -Y should be (?, -1)
         let s = poly.support(-glam::Vec2::Y);
         assert!(approx_eq(s.y, -1.0));
+    }
+
+    // --- V0.5c audit tests ---
+
+    #[test]
+    fn epa_depth_always_positive() {
+        let a = make_square(0.0, 0.0, 1.0);
+        let b = make_square(0.5, 0.0, 1.0);
+        let pen = gjk_epa(&a, &b).unwrap();
+        assert!(pen.depth > 0.0);
+        assert!(pen.depth <= 2.0); // Can't exceed full overlap
+    }
+
+    #[test]
+    fn convex_hull_empty() {
+        let hull = convex_hull_2d(&[]);
+        assert!(hull.is_empty());
+    }
+
+    #[test]
+    fn convex_hull_two_points() {
+        let pts = vec![glam::Vec2::ZERO, glam::Vec2::new(5.0, 0.0)];
+        let hull = convex_hull_2d(&pts);
+        assert_eq!(hull.len(), 2);
+    }
+
+    #[test]
+    fn gjk_triangles() {
+        let a = ConvexPolygon::new(vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(2.0, 0.0),
+            glam::Vec2::new(1.0, 2.0),
+        ]);
+        let b = ConvexPolygon::new(vec![
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(3.0, 0.0),
+            glam::Vec2::new(2.0, 2.0),
+        ]);
+        assert!(gjk_intersect(&a, &b)); // Overlapping triangles
+    }
+
+    #[test]
+    fn penetration_serde_roundtrip() {
+        let p = Penetration {
+            normal: glam::Vec2::new(1.0, 0.0),
+            depth: 0.5,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let p2: Penetration = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn gjk_epa_symmetric() {
+        // gjk_epa(a, b) and gjk_epa(b, a) should both detect collision
+        let a = make_square(0.0, 0.0, 1.0);
+        let b = make_square(0.5, 0.5, 1.0);
+        assert!(gjk_epa(&a, &b).is_some());
+        assert!(gjk_epa(&b, &a).is_some());
     }
 }

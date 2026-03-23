@@ -461,15 +461,26 @@ pub fn eigenvalue_power(
     if n == 0 {
         return Err(GanitError::InvalidInput("empty matrix".to_string()));
     }
+    for row in a {
+        if row.len() != n {
+            return Err(GanitError::InvalidInput(format!(
+                "expected square {}x{}, got row length {}",
+                n, n, row.len()
+            )));
+        }
+    }
 
     // Initial guess: unit vector
     let mut v = vec![0.0; n];
     v[0] = 1.0;
+    let mut w = vec![0.0; n];
     let mut eigenvalue = 0.0;
 
     for _ in 0..max_iter {
-        // w = A * v
-        let mut w = vec![0.0; n];
+        // w = A * v (reuse allocation)
+        for wi in w.iter_mut() {
+            *wi = 0.0;
+        }
         for i in 0..n {
             for j in 0..n {
                 w[i] += a[i][j] * v[j];
@@ -500,7 +511,7 @@ pub fn eigenvalue_power(
         }
 
         eigenvalue = new_eigenvalue;
-        v = w;
+        std::mem::swap(&mut v, &mut w);
     }
 
     Err(GanitError::NoConvergence(max_iter))
@@ -543,6 +554,22 @@ impl Complex {
     }
 }
 
+impl Default for Complex {
+    fn default() -> Self {
+        Self::new(0.0, 0.0)
+    }
+}
+
+impl std::fmt::Display for Complex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.im >= 0.0 {
+            write!(f, "{}+{}i", self.re, self.im)
+        } else {
+            write!(f, "{}{}i", self.re, self.im)
+        }
+    }
+}
+
 impl std::ops::Add for Complex {
     type Output = Self;
     #[inline]
@@ -581,6 +608,10 @@ impl std::ops::Mul<f64> for Complex {
 /// In-place Cooley-Tukey radix-2 FFT.
 ///
 /// `data` must have a power-of-2 length. Computes the DFT in-place.
+///
+/// # Panics
+///
+/// Panics if `data.len()` is not a power of two.
 pub fn fft(data: &mut [Complex]) {
     let n = data.len();
     if n <= 1 {
@@ -1277,5 +1308,96 @@ mod tests {
         fft(&mut data);
         assert!(approx_eq(data[0].re, 42.0));
         assert!(approx_eq(data[0].im, -7.0));
+    }
+
+    // --- V0.4b audit tests ---
+
+    #[test]
+    fn eigenvalue_non_square() {
+        let a = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        assert!(eigenvalue_power(&a, 1e-10, 100).is_err());
+    }
+
+    #[test]
+    fn eigenvalue_negative_dominant() {
+        // [[-3, 0], [0, 1]] — dominant eigenvalue is -3
+        let a = vec![vec![-3.0, 0.0], vec![0.0, 1.0]];
+        let (eval, _) = eigenvalue_power(&a, 1e-10, 100).unwrap();
+        assert!(approx_eq(eval, -3.0));
+    }
+
+    #[test]
+    fn eigenvalue_1x1() {
+        let a = vec![vec![7.0]];
+        let (eval, evec) = eigenvalue_power(&a, 1e-10, 10).unwrap();
+        assert!(approx_eq(eval, 7.0));
+        assert!(approx_eq(evec[0], 1.0));
+    }
+
+    #[test]
+    fn complex_default() {
+        let c = Complex::default();
+        assert!(approx_eq(c.re, 0.0));
+        assert!(approx_eq(c.im, 0.0));
+    }
+
+    #[test]
+    fn complex_display() {
+        assert_eq!(Complex::new(3.0, 4.0).to_string(), "3+4i");
+        assert_eq!(Complex::new(3.0, -4.0).to_string(), "3-4i");
+        assert_eq!(Complex::new(0.0, 0.0).to_string(), "0+0i");
+    }
+
+    #[test]
+    fn complex_from_real() {
+        let c = Complex::from_real(5.0);
+        assert!(approx_eq(c.re, 5.0));
+        assert!(approx_eq(c.im, 0.0));
+    }
+
+    #[test]
+    fn complex_scalar_mul() {
+        let c = Complex::new(3.0, 4.0) * 2.0;
+        assert!(approx_eq(c.re, 6.0));
+        assert!(approx_eq(c.im, 8.0));
+    }
+
+    #[test]
+    fn fft_linearity() {
+        // FFT(a*x + b*y) = a*FFT(x) + b*FFT(y)
+        let x: Vec<Complex> = (0..4).map(|i| Complex::from_real(i as f64)).collect();
+        let y: Vec<Complex> = (0..4).map(|i| Complex::from_real((i as f64).sin())).collect();
+
+        let mut fx = x.clone();
+        fft(&mut fx);
+        let mut fy = y.clone();
+        fft(&mut fy);
+
+        // 2*x + 3*y
+        let mut combined: Vec<Complex> = (0..4)
+            .map(|i| x[i] * 2.0 + y[i] * 3.0)
+            .collect();
+        fft(&mut combined);
+
+        for i in 0..4 {
+            let expected = fx[i] * 2.0 + fy[i] * 3.0;
+            assert!((combined[i].re - expected.re).abs() < 1e-10);
+            assert!((combined[i].im - expected.im).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn ifft_single_element() {
+        let mut data = [Complex::new(42.0, -7.0)];
+        ifft(&mut data);
+        assert!(approx_eq(data[0].re, 42.0));
+        assert!(approx_eq(data[0].im, -7.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "power-of-2")]
+    fn fft_non_power_of_two_panics() {
+        let mut data = vec![Complex::default(); 3];
+        fft(&mut data);
     }
 }

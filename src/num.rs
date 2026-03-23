@@ -3,10 +3,6 @@
 //! Provides Newton-Raphson, bisection, Gaussian elimination, LU/Cholesky/QR
 //! decompositions, and least-squares fitting.
 
-// Matrix algorithms use index-based loops for clarity and to avoid double-borrow
-// issues with simultaneous read/write access to different rows/columns.
-#![allow(clippy::needless_range_loop)]
-
 use crate::GanitError;
 
 /// Newton-Raphson root finding.
@@ -168,6 +164,7 @@ pub fn gaussian_elimination(matrix: &mut [Vec<f64>]) -> Result<Vec<f64>, GanitEr
 ///
 /// Returns `(lu, pivot)` where `lu` stores both L (below diagonal) and U
 /// (on and above diagonal) in a single matrix.
+#[allow(clippy::needless_range_loop)]
 pub fn lu_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<usize>), GanitError> {
     let n = a.len();
     if n == 0 {
@@ -219,6 +216,8 @@ pub fn lu_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<usize>), Ganit
 }
 
 /// Solve `A * x = b` using a pre-computed LU decomposition.
+#[inline]
+#[allow(clippy::needless_range_loop)]
 pub fn lu_solve(lu: &[Vec<f64>], pivot: &[usize], b: &[f64]) -> Result<Vec<f64>, GanitError> {
     let n = lu.len();
     if b.len() != n {
@@ -260,10 +259,21 @@ pub fn lu_solve(lu: &[Vec<f64>], pivot: &[usize], b: &[f64]) -> Result<Vec<f64>,
 ///
 /// Decomposes `A = L * L^T` where `L` is lower-triangular.
 /// Returns `L`. Fails if `A` is not positive-definite.
+///
+/// Only the lower triangle of `A` is read. The caller must ensure `A` is symmetric.
+#[allow(clippy::needless_range_loop)]
 pub fn cholesky(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, GanitError> {
     let n = a.len();
     if n == 0 {
         return Err(GanitError::InvalidInput("empty matrix".to_string()));
+    }
+    for row in a {
+        if row.len() != n {
+            return Err(GanitError::InvalidInput(format!(
+                "expected square {}x{}, got row length {}",
+                n, n, row.len()
+            )));
+        }
     }
 
     let mut l = vec![vec![0.0; n]; n];
@@ -291,6 +301,8 @@ pub fn cholesky(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, GanitError> {
 }
 
 /// Solve `A * x = b` using a pre-computed Cholesky factor `L` (where `A = L * L^T`).
+#[inline]
+#[allow(clippy::needless_range_loop)]
 pub fn cholesky_solve(l: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>, GanitError> {
     let n = l.len();
     if b.len() != n {
@@ -333,8 +345,9 @@ pub fn cholesky_solve(l: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>, GanitError>
 /// - `Q` is `m x n` with orthonormal columns
 /// - `R` is `n x n` upper-triangular
 ///
-/// Input is column-major: `a[col][row]` (each inner Vec is a column).
-#[allow(clippy::type_complexity)]
+/// Input is column-major: `a[j]` is the j-th column vector.
+/// Output `r` uses the same layout: `R[i][j]` is stored as `r[j][i]`.
+#[allow(clippy::type_complexity, clippy::needless_range_loop)]
 pub fn qr_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), GanitError> {
     let n = a.len(); // number of columns
     if n == 0 {
@@ -348,7 +361,7 @@ pub fn qr_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), Ga
     }
 
     let mut q: Vec<Vec<f64>> = a.to_vec();
-    let mut r = vec![vec![0.0; n]; n]; // r[col][row] but it's square n x n
+    let mut r = vec![vec![0.0; n]; n];
 
     for j in 0..n {
         // Modified Gram-Schmidt: orthogonalize q[j] against all previous q[i]
@@ -383,6 +396,7 @@ pub fn qr_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), Ga
 /// using least squares (via QR decomposition).
 ///
 /// Returns coefficients `[a0, a1, a2, ...]` where `y ≈ a0 + a1*x + a2*x^2 + ...`.
+#[allow(clippy::needless_range_loop)]
 pub fn least_squares_poly(x: &[f64], y: &[f64], degree: usize) -> Result<Vec<f64>, GanitError> {
     let m = x.len();
     if m != y.len() || m == 0 {
@@ -696,9 +710,13 @@ mod tests {
     fn cholesky_3x3_identity() {
         let a = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
         let l = cholesky(&a).unwrap();
-        for i in 0..3 {
-            assert!(approx_eq(l[i][i], 1.0));
-        }
+        // L of identity is identity
+        assert!(approx_eq(l[0][0], 1.0));
+        assert!(approx_eq(l[1][1], 1.0));
+        assert!(approx_eq(l[2][2], 1.0));
+        assert!(approx_eq(l[1][0], 0.0));
+        assert!(approx_eq(l[2][0], 0.0));
+        assert!(approx_eq(l[2][1], 0.0));
     }
 
     #[test]
@@ -796,5 +814,101 @@ mod tests {
         let x = [1.0];
         let y = [5.0];
         assert!(least_squares_poly(&x, &y, 2).is_err());
+    }
+
+    // --- Audit tests ---
+
+    #[test]
+    fn lu_solve_wrong_b_length() {
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let (lu, pivot) = lu_decompose(&a).unwrap();
+        assert!(lu_solve(&lu, &pivot, &[1.0]).is_err());
+    }
+
+    #[test]
+    fn lu_non_square() {
+        let a = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        assert!(lu_decompose(&a).is_err());
+    }
+
+    #[test]
+    fn cholesky_solve_wrong_b_length() {
+        let a = vec![vec![4.0, 2.0], vec![2.0, 3.0]];
+        let l = cholesky(&a).unwrap();
+        assert!(cholesky_solve(&l, &[1.0, 2.0, 3.0]).is_err());
+    }
+
+    #[test]
+    fn cholesky_non_square() {
+        let a = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        assert!(cholesky(&a).is_err());
+    }
+
+    #[test]
+    fn cholesky_solve_3x3_verify() {
+        // 3x3 SPD system: solve and verify A*x = b
+        let a = vec![
+            vec![4.0, 2.0, 1.0],
+            vec![2.0, 5.0, 2.0],
+            vec![1.0, 2.0, 6.0],
+        ];
+        let b = [1.0, 2.0, 3.0];
+        let l = cholesky(&a).unwrap();
+        let x = cholesky_solve(&l, &b).unwrap();
+        // Verify: A * x ≈ b
+        for i in 0..3 {
+            let mut row_sum = 0.0;
+            for j in 0..3 {
+                row_sum += a[i][j] * x[j];
+            }
+            assert!(approx_eq(row_sum, b[i]));
+        }
+    }
+
+    #[test]
+    fn qr_square_matrix() {
+        // 3x3 square matrix
+        let a = vec![
+            vec![1.0, 4.0, 7.0],
+            vec![2.0, 5.0, 8.0],
+            vec![3.0, 6.0, 10.0], // not 9, to avoid singular
+        ];
+        let (q, _r) = qr_decompose(&a).unwrap();
+        // Verify Q^T * Q = I (columns orthonormal)
+        for i in 0..3 {
+            for j in 0..3 {
+                let dot: f64 = (0..3).map(|k| q[i][k] * q[j][k]).sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!((dot - expected).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn least_squares_mismatched_lengths() {
+        let x = [1.0, 2.0, 3.0];
+        let y = [1.0, 2.0];
+        assert!(least_squares_poly(&x, &y, 1).is_err());
+    }
+
+    #[test]
+    fn least_squares_empty() {
+        let x: [f64; 0] = [];
+        let y: [f64; 0] = [];
+        assert!(least_squares_poly(&x, &y, 0).is_err());
+    }
+
+    #[test]
+    fn lu_multiple_rhs() {
+        // Solve same system with two different RHS vectors
+        let a = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        let (lu, pivot) = lu_decompose(&a).unwrap();
+        let x1 = lu_solve(&lu, &pivot, &[5.0, 10.0]).unwrap();
+        let x2 = lu_solve(&lu, &pivot, &[3.0, 7.0]).unwrap();
+        assert!(approx_eq(x1[0], 1.0));
+        assert!(approx_eq(x1[1], 3.0));
+        // 2x+y=3, x+3y=7 => x=0.4, y=2.2
+        assert!(approx_eq(x2[0], 0.4));
+        assert!(approx_eq(x2[1], 2.2));
     }
 }

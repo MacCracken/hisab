@@ -84,9 +84,7 @@ impl DaimonClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(DaimonError::Registration(format!(
-                "HTTP {status}: {text}"
-            )));
+            return Err(DaimonError::Registration(format!("HTTP {status}: {text}")));
         }
 
         let reg: RegisterResponse = resp.json().await?;
@@ -106,10 +104,7 @@ impl DaimonClient {
 
         if !resp.status().is_success() {
             warn!(agent_id = %id, status = %resp.status(), "heartbeat failed");
-            return Err(DaimonError::Heartbeat(format!(
-                "HTTP {}",
-                resp.status()
-            )));
+            return Err(DaimonError::Heartbeat(format!("HTTP {}", resp.status())));
         }
 
         Ok(())
@@ -130,10 +125,7 @@ impl DaimonClient {
         let resp = self.client.post(&url).json(&body).send().await?;
 
         if !resp.status().is_success() {
-            return Err(DaimonError::HooshQuery(format!(
-                "HTTP {}",
-                resp.status()
-            )));
+            return Err(DaimonError::HooshQuery(format!("HTTP {}", resp.status())));
         }
 
         let json: serde_json::Value = resp.json().await?;

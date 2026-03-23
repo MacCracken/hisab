@@ -869,8 +869,14 @@ mod tests {
         let p1 = Vec3::new(10.0 / 3.0, 0.0, 0.0);
         let p2 = Vec3::new(20.0 / 3.0, 0.0, 0.0);
         let p3 = Vec3::new(10.0, 0.0, 0.0);
-        assert!(approx_eq_f32(bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 0.0, 100), 0.0));
-        assert!(approx_eq_f32(bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 1.0, 100), 1.0));
+        assert!(approx_eq_f32(
+            bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 0.0, 100),
+            0.0
+        ));
+        assert!(approx_eq_f32(
+            bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 1.0, 100),
+            1.0
+        ));
     }
 
     #[test]
@@ -895,7 +901,11 @@ mod tests {
     #[test]
     fn bspline_quadratic() {
         // Degree 2, 3 control points
-        let pts = [Vec3::ZERO, Vec3::new(1.0, 2.0, 0.0), Vec3::new(2.0, 0.0, 0.0)];
+        let pts = [
+            Vec3::ZERO,
+            Vec3::new(1.0, 2.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+        ];
         let knots = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let start = bspline_eval(2, &pts, &knots, 0.0).unwrap();
         let end = bspline_eval(2, &pts, &knots, 1.0).unwrap();

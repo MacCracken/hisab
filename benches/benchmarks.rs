@@ -148,9 +148,7 @@ fn bench_calc(c: &mut Criterion) {
     });
 
     group.bench_function("integral_trapezoidal_100", |b| {
-        b.iter(|| {
-            ganit::calc::integral_trapezoidal(|x| x * x, black_box(0.0), black_box(1.0), 100)
-        })
+        b.iter(|| ganit::calc::integral_trapezoidal(|x| x * x, black_box(0.0), black_box(1.0), 100))
     });
 
     group.bench_function("integral_trapezoidal_1000", |b| {
@@ -323,18 +321,16 @@ fn bench_v02(c: &mut Criterion) {
     });
 
     group.bench_function("frustum_contains_point", |b| {
-        let proj = ganit::transforms::projection_perspective(
-            std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0,
-        );
+        let proj =
+            ganit::transforms::projection_perspective(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0);
         let frustum = ganit::Frustum::from_view_projection(proj);
         let point = Vec3::new(0.0, 0.0, -10.0);
         b.iter(|| frustum.contains_point(black_box(point)))
     });
 
     group.bench_function("frustum_contains_aabb", |b| {
-        let proj = ganit::transforms::projection_perspective(
-            std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0,
-        );
+        let proj =
+            ganit::transforms::projection_perspective(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0);
         let frustum = ganit::Frustum::from_view_projection(proj);
         let bb = ganit::Aabb::new(Vec3::new(-1.0, -1.0, -5.0), Vec3::new(1.0, 1.0, -3.0));
         b.iter(|| frustum.contains_aabb(black_box(&bb)))
@@ -353,7 +349,9 @@ fn bench_v02(c: &mut Criterion) {
             Quat::from_rotation_y(1.0),
             Vec3::splat(2.0),
         );
-        b.iter(|| ganit::transforms::transform3d_lerp(black_box(&a), black_box(&bb), black_box(0.5)))
+        b.iter(|| {
+            ganit::transforms::transform3d_lerp(black_box(&a), black_box(&bb), black_box(0.5))
+        })
     });
 
     group.bench_function("closest_on_aabb", |b| {
@@ -450,7 +448,14 @@ fn bench_v03(c: &mut Criterion) {
     });
 
     group.bench_function("gauss_legendre_10_panels", |b| {
-        b.iter(|| ganit::calc::integral_gauss_legendre(f64::sin, black_box(0.0), black_box(std::f64::consts::PI), 10))
+        b.iter(|| {
+            ganit::calc::integral_gauss_legendre(
+                f64::sin,
+                black_box(0.0),
+                black_box(std::f64::consts::PI),
+                10,
+            )
+        })
     });
 
     group.bench_function("arc_length_100", |b| {
@@ -633,7 +638,10 @@ fn bench_v05a(c: &mut Criterion) {
                 .map(|i| {
                     let x = (i % 10) as f32;
                     let y = (i / 10) as f32;
-                    (ganit::Aabb::new(Vec3::new(x, y, 0.0), Vec3::new(x + 0.5, y + 0.5, 0.5)), i)
+                    (
+                        ganit::Aabb::new(Vec3::new(x, y, 0.0), Vec3::new(x + 0.5, y + 0.5, 0.5)),
+                        i,
+                    )
                 })
                 .collect();
             ganit::Bvh::build(black_box(&mut items))
@@ -645,7 +653,10 @@ fn bench_v05a(c: &mut Criterion) {
             .map(|i| {
                 let x = (i % 10) as f32;
                 let y = (i / 10) as f32;
-                (ganit::Aabb::new(Vec3::new(x, y, 0.0), Vec3::new(x + 0.5, y + 0.5, 0.5)), i)
+                (
+                    ganit::Aabb::new(Vec3::new(x, y, 0.0), Vec3::new(x + 0.5, y + 0.5, 0.5)),
+                    i,
+                )
             })
             .collect();
         let bvh = ganit::Bvh::build(&mut items);
@@ -660,7 +671,10 @@ fn bench_v05a(c: &mut Criterion) {
                     let x = (i % 10) as f32 * 2.0;
                     let y = ((i / 10) % 10) as f32 * 2.0;
                     let z = (i / 100) as f32 * 2.0;
-                    (ganit::Aabb::new(Vec3::new(x, y, z), Vec3::new(x + 1.0, y + 1.0, z + 1.0)), i)
+                    (
+                        ganit::Aabb::new(Vec3::new(x, y, z), Vec3::new(x + 1.0, y + 1.0, z + 1.0)),
+                        i,
+                    )
                 })
                 .collect();
             ganit::Bvh::build(black_box(&mut items))
@@ -734,7 +748,10 @@ fn bench_v05b(c: &mut Criterion) {
         let bounds = ganit::Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(100.0));
         let mut qt = ganit::Quadtree::new(bounds, 8, 8);
         for i in 0..1000 {
-            qt.insert(glam::Vec2::new((i % 100) as f32, (i / 100) as f32 * 10.0), i);
+            qt.insert(
+                glam::Vec2::new((i % 100) as f32, (i / 100) as f32 * 10.0),
+                i,
+            );
         }
         let query = ganit::Rect::new(glam::Vec2::new(40.0, 40.0), glam::Vec2::new(60.0, 60.0));
         b.iter(|| qt.query_rect(black_box(&query)))

@@ -301,11 +301,7 @@ mod tests {
 
     #[test]
     fn transform3d_combined() {
-        let t = Transform3D::new(
-            Vec3::new(10.0, 0.0, 0.0),
-            Quat::IDENTITY,
-            Vec3::splat(2.0),
-        );
+        let t = Transform3D::new(Vec3::new(10.0, 0.0, 0.0), Quat::IDENTITY, Vec3::splat(2.0));
         let result = t.apply_to_point(Vec3::ONE);
         assert!(vec3_approx_eq(result, Vec3::new(12.0, 2.0, 2.0)));
     }
@@ -412,10 +408,7 @@ mod tests {
             GanitError::OutOfRange("too big".to_string()).to_string(),
             "value out of range: too big"
         );
-        assert_eq!(
-            GanitError::DivisionByZero.to_string(),
-            "division by zero"
-        );
+        assert_eq!(GanitError::DivisionByZero.to_string(), "division by zero");
         assert_eq!(
             GanitError::SingularMatrix.to_string(),
             "singular matrix — cannot invert"
@@ -551,7 +544,11 @@ mod tests {
     #[test]
     fn transform3d_lerp_endpoints() {
         let a = Transform3D::new(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE);
-        let b = Transform3D::new(Vec3::new(10.0, 0.0, 0.0), Quat::from_rotation_y(FRAC_PI_2), Vec3::splat(2.0));
+        let b = Transform3D::new(
+            Vec3::new(10.0, 0.0, 0.0),
+            Quat::from_rotation_y(FRAC_PI_2),
+            Vec3::splat(2.0),
+        );
         let at_0 = transform3d_lerp(&a, &b, 0.0);
         let at_1 = transform3d_lerp(&a, &b, 1.0);
         assert!(vec3_approx_eq(at_0.position, a.position));

@@ -1,6 +1,6 @@
 //! Basic usage of ganit math operations.
 
-use ganit::transforms::{lerp_f32, projection_perspective, Transform3D};
+use ganit::transforms::{Transform3D, lerp_f32, projection_perspective};
 use ganit::{Quat, Ray, Sphere, Vec3};
 
 fn main() {

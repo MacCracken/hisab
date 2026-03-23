@@ -3,7 +3,7 @@
 use ganit::geo::{
     aabb_aabb, closest_point_on_aabb, ray_aabb, ray_plane, ray_sphere, ray_triangle, sphere_sphere,
 };
-use ganit::transforms::{lerp_vec3, transform3d_lerp, Transform3D};
+use ganit::transforms::{Transform3D, lerp_vec3, transform3d_lerp};
 use ganit::{Aabb, Frustum, GanitError, Plane, Quat, Ray, Segment, Sphere, Triangle, Vec3};
 
 const EPSILON: f32 = 1e-4;
@@ -101,9 +101,8 @@ fn ray_triangle_through_transformed_mesh() {
 #[test]
 fn frustum_culling_with_aabb() {
     // Build a frustum and test AABBs at various positions
-    let proj = ganit::transforms::projection_perspective(
-        std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0,
-    );
+    let proj =
+        ganit::transforms::projection_perspective(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0);
     let frustum = Frustum::from_view_projection(proj);
 
     // AABB in front of camera — should be visible

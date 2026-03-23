@@ -212,7 +212,9 @@ pub struct Triangle {
 
 impl Triangle {
     pub fn new(a: Vec3, b: Vec3, c: Vec3) -> Self {
-        Self { vertices: [a, b, c] }
+        Self {
+            vertices: [a, b, c],
+        }
     }
 
     /// Face normal (not normalized). Returns the cross product of two edges.
@@ -342,9 +344,7 @@ impl Frustum {
     pub fn from_view_projection(vp: glam::Mat4) -> Self {
         let r = vp.to_cols_array_2d();
         // Row-based extraction (transposed column-major)
-        let row = |i: usize| -> [f32; 4] {
-            [r[0][i], r[1][i], r[2][i], r[3][i]]
-        };
+        let row = |i: usize| -> [f32; 4] { [r[0][i], r[1][i], r[2][i], r[3][i]] };
         let r0 = row(0);
         let r1 = row(1);
         let r2 = row(2);
@@ -390,9 +390,21 @@ impl Frustum {
         for plane in &self.planes {
             // Find the corner most aligned with the plane normal (P-vertex)
             let p = Vec3::new(
-                if plane.normal.x >= 0.0 { aabb.max.x } else { aabb.min.x },
-                if plane.normal.y >= 0.0 { aabb.max.y } else { aabb.min.y },
-                if plane.normal.z >= 0.0 { aabb.max.z } else { aabb.min.z },
+                if plane.normal.x >= 0.0 {
+                    aabb.max.x
+                } else {
+                    aabb.min.x
+                },
+                if plane.normal.y >= 0.0 {
+                    aabb.max.y
+                } else {
+                    aabb.min.y
+                },
+                if plane.normal.z >= 0.0 {
+                    aabb.max.z
+                } else {
+                    aabb.min.z
+                },
             );
             if plane.signed_distance(p) < 0.0 {
                 return false;
@@ -540,7 +552,10 @@ impl Bvh {
             return Self { root: None, len: 0 };
         }
         let root = Self::build_recursive(items);
-        Self { root: Some(root), len }
+        Self {
+            root: Some(root),
+            len,
+        }
     }
 
     fn build_recursive(items: &mut [(Aabb, usize)]) -> BvhNode {
@@ -634,7 +649,11 @@ impl Bvh {
                     results.push(*index);
                 }
             }
-            BvhNode::Internal { bounds, left, right } => {
+            BvhNode::Internal {
+                bounds,
+                left,
+                right,
+            } => {
                 if ray_aabb(ray, bounds).is_some() {
                     Self::query_ray_recursive(left, ray, results);
                     Self::query_ray_recursive(right, ray, results);
@@ -659,7 +678,11 @@ impl Bvh {
                     results.push(*index);
                 }
             }
-            BvhNode::Internal { bounds, left, right } => {
+            BvhNode::Internal {
+                bounds,
+                left,
+                right,
+            } => {
                 if aabb_aabb(bounds, query) {
                     Self::query_aabb_recursive(left, query, results);
                     Self::query_aabb_recursive(right, query, results);
@@ -704,7 +727,10 @@ impl KdTree {
             return Self { root: None, len: 0 };
         }
         let root = Self::build_recursive(items, 0);
-        Self { root: Some(root), len }
+        Self {
+            root: Some(root),
+            len,
+        }
     }
 
     fn build_recursive(items: &mut [(Vec3, usize)], depth: usize) -> KdNode {
@@ -764,12 +790,7 @@ impl KdTree {
         }
     }
 
-    fn nearest_recursive(
-        node: &KdNode,
-        query: Vec3,
-        best_idx: &mut usize,
-        best_dist_sq: &mut f32,
-    ) {
+    fn nearest_recursive(node: &KdNode, query: Vec3, best_idx: &mut usize, best_dist_sq: &mut f32) {
         match node {
             KdNode::Leaf { point, index } => {
                 let dist_sq = (*point - query).length_squared();
@@ -778,7 +799,12 @@ impl KdTree {
                     *best_idx = *index;
                 }
             }
-            KdNode::Split { axis, split_val, left, right } => {
+            KdNode::Split {
+                axis,
+                split_val,
+                left,
+                right,
+            } => {
                 let query_val = query.to_array()[*axis];
                 let diff = query_val - split_val;
 
@@ -824,7 +850,12 @@ impl KdTree {
                     results.push((*index, dist_sq));
                 }
             }
-            KdNode::Split { axis, split_val, left, right } => {
+            KdNode::Split {
+                axis,
+                split_val,
+                left,
+                right,
+            } => {
                 let query_val = query.to_array()[*axis];
                 let diff = query_val - split_val;
 
@@ -944,7 +975,15 @@ impl Quadtree {
         if !self.bounds.contains_point(point) {
             return; // Out of bounds, ignore
         }
-        Self::insert_recursive(&mut self.root, point, index, &self.bounds, self.max_per_leaf, self.max_depth, 0);
+        Self::insert_recursive(
+            &mut self.root,
+            point,
+            index,
+            &self.bounds,
+            self.max_per_leaf,
+            self.max_depth,
+            0,
+        );
         self.len += 1;
     }
 
@@ -975,16 +1014,38 @@ impl Quadtree {
                     for &(p, idx) in items.iter() {
                         let quadrant = Self::quadrant(p, center);
                         let child_bounds = Self::child_bounds(bounds, quadrant);
-                        Self::insert_recursive(&mut children[quadrant], p, idx, &child_bounds, max_per_leaf, max_depth, depth + 1);
+                        Self::insert_recursive(
+                            &mut children[quadrant],
+                            p,
+                            idx,
+                            &child_bounds,
+                            max_per_leaf,
+                            max_depth,
+                            depth + 1,
+                        );
                     }
-                    *node = QuadNode::Split { children, bounds: *bounds };
+                    *node = QuadNode::Split {
+                        children,
+                        bounds: *bounds,
+                    };
                 }
             }
-            QuadNode::Split { children, bounds: node_bounds } => {
+            QuadNode::Split {
+                children,
+                bounds: node_bounds,
+            } => {
                 let center = node_bounds.center();
                 let quadrant = Self::quadrant(point, center);
                 let child_bounds = Self::child_bounds(node_bounds, quadrant);
-                Self::insert_recursive(&mut children[quadrant], point, index, &child_bounds, max_per_leaf, max_depth, depth + 1);
+                Self::insert_recursive(
+                    &mut children[quadrant],
+                    point,
+                    index,
+                    &child_bounds,
+                    max_per_leaf,
+                    max_depth,
+                    depth + 1,
+                );
             }
         }
     }
@@ -998,10 +1059,16 @@ impl Quadtree {
     fn child_bounds(bounds: &Rect, quadrant: usize) -> Rect {
         let center = bounds.center();
         match quadrant {
-            0 => Rect::new(glam::Vec2::new(bounds.min.x, center.y), glam::Vec2::new(center.x, bounds.max.y)), // NW
-            1 => Rect::new(center, bounds.max),                                                                 // NE
-            2 => Rect::new(bounds.min, center),                                                                 // SW
-            _ => Rect::new(glam::Vec2::new(center.x, bounds.min.y), glam::Vec2::new(bounds.max.x, center.y)), // SE
+            0 => Rect::new(
+                glam::Vec2::new(bounds.min.x, center.y),
+                glam::Vec2::new(center.x, bounds.max.y),
+            ), // NW
+            1 => Rect::new(center, bounds.max), // NE
+            2 => Rect::new(bounds.min, center), // SW
+            _ => Rect::new(
+                glam::Vec2::new(center.x, bounds.min.y),
+                glam::Vec2::new(bounds.max.x, center.y),
+            ), // SE
         }
     }
 
@@ -1025,7 +1092,10 @@ impl Quadtree {
                     }
                 }
             }
-            QuadNode::Split { children, bounds: node_bounds } => {
+            QuadNode::Split {
+                children,
+                bounds: node_bounds,
+            } => {
                 for q in 0..4 {
                     let child_bounds = Self::child_bounds(node_bounds, q);
                     Self::query_recursive(&children[q], &child_bounds, query, results);
@@ -1089,7 +1159,15 @@ impl Octree {
         if !self.bounds.contains(point) {
             return;
         }
-        Self::insert_recursive(&mut self.root, point, index, &self.bounds, self.max_per_leaf, self.max_depth, 0);
+        Self::insert_recursive(
+            &mut self.root,
+            point,
+            index,
+            &self.bounds,
+            self.max_per_leaf,
+            self.max_depth,
+            0,
+        );
         self.len += 1;
     }
 
@@ -1111,22 +1189,50 @@ impl Octree {
                 if items.len() > max_per_leaf && depth < max_depth {
                     let center = bounds.center();
                     let mut children = Box::new([
-                        OctNode::Empty, OctNode::Empty, OctNode::Empty, OctNode::Empty,
-                        OctNode::Empty, OctNode::Empty, OctNode::Empty, OctNode::Empty,
+                        OctNode::Empty,
+                        OctNode::Empty,
+                        OctNode::Empty,
+                        OctNode::Empty,
+                        OctNode::Empty,
+                        OctNode::Empty,
+                        OctNode::Empty,
+                        OctNode::Empty,
                     ]);
                     for &(p, idx) in items.iter() {
                         let octant = Self::octant(p, center);
                         let child_bounds = Self::child_bounds(bounds, octant);
-                        Self::insert_recursive(&mut children[octant], p, idx, &child_bounds, max_per_leaf, max_depth, depth + 1);
+                        Self::insert_recursive(
+                            &mut children[octant],
+                            p,
+                            idx,
+                            &child_bounds,
+                            max_per_leaf,
+                            max_depth,
+                            depth + 1,
+                        );
                     }
-                    *node = OctNode::Split { children, bounds: *bounds };
+                    *node = OctNode::Split {
+                        children,
+                        bounds: *bounds,
+                    };
                 }
             }
-            OctNode::Split { children, bounds: node_bounds } => {
+            OctNode::Split {
+                children,
+                bounds: node_bounds,
+            } => {
                 let center = node_bounds.center();
                 let octant = Self::octant(point, center);
                 let child_bounds = Self::child_bounds(node_bounds, octant);
-                Self::insert_recursive(&mut children[octant], point, index, &child_bounds, max_per_leaf, max_depth, depth + 1);
+                Self::insert_recursive(
+                    &mut children[octant],
+                    point,
+                    index,
+                    &child_bounds,
+                    max_per_leaf,
+                    max_depth,
+                    depth + 1,
+                );
             }
         }
     }
@@ -1141,14 +1247,38 @@ impl Octree {
     fn child_bounds(bounds: &Aabb, octant: usize) -> Aabb {
         let center = bounds.center();
         let min = Vec3::new(
-            if octant & 1 != 0 { center.x } else { bounds.min.x },
-            if octant & 2 != 0 { center.y } else { bounds.min.y },
-            if octant & 4 != 0 { center.z } else { bounds.min.z },
+            if octant & 1 != 0 {
+                center.x
+            } else {
+                bounds.min.x
+            },
+            if octant & 2 != 0 {
+                center.y
+            } else {
+                bounds.min.y
+            },
+            if octant & 4 != 0 {
+                center.z
+            } else {
+                bounds.min.z
+            },
         );
         let max = Vec3::new(
-            if octant & 1 != 0 { bounds.max.x } else { center.x },
-            if octant & 2 != 0 { bounds.max.y } else { center.y },
-            if octant & 4 != 0 { bounds.max.z } else { center.z },
+            if octant & 1 != 0 {
+                bounds.max.x
+            } else {
+                center.x
+            },
+            if octant & 2 != 0 {
+                bounds.max.y
+            } else {
+                center.y
+            },
+            if octant & 4 != 0 {
+                bounds.max.z
+            } else {
+                center.z
+            },
         );
         Aabb::new(min, max)
     }
@@ -1173,7 +1303,10 @@ impl Octree {
                     }
                 }
             }
-            OctNode::Split { children, bounds: node_bounds } => {
+            OctNode::Split {
+                children,
+                bounds: node_bounds,
+            } => {
                 for oct in 0..8 {
                     let child_bounds = Self::child_bounds(node_bounds, oct);
                     Self::query_recursive(&children[oct], &child_bounds, query, results);
@@ -1318,7 +1451,8 @@ pub fn convex_hull_2d(points: &[glam::Vec2]) -> Vec<glam::Vec2> {
     // Upper hull
     let lower_len = hull.len() + 1;
     for &p in pts.iter().rev() {
-        while hull.len() >= lower_len && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+        while hull.len() >= lower_len && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
+        {
             hull.pop();
         }
         hull.push(p);
@@ -1632,10 +1766,7 @@ mod tests {
         let p = Plane::from_point_normal(Vec3::new(0.0, 1.0, 0.0), Vec3::Y);
         assert!(approx_eq(p.distance, 1.0));
         assert!(approx_eq(p.signed_distance(Vec3::new(0.0, 2.0, 0.0)), 1.0));
-        assert!(approx_eq(
-            p.signed_distance(Vec3::new(0.0, 0.0, 0.0)),
-            -1.0
-        ));
+        assert!(approx_eq(p.signed_distance(Vec3::new(0.0, 0.0, 0.0)), -1.0));
     }
 
     #[test]
@@ -1968,13 +2099,21 @@ mod tests {
 
     #[test]
     fn triangle_area() {
-        let tri = Triangle::new(Vec3::ZERO, Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 2.0, 0.0));
+        let tri = Triangle::new(
+            Vec3::ZERO,
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+        );
         assert!(approx_eq(tri.area(), 2.0));
     }
 
     #[test]
     fn triangle_centroid() {
-        let tri = Triangle::new(Vec3::ZERO, Vec3::new(3.0, 0.0, 0.0), Vec3::new(0.0, 3.0, 0.0));
+        let tri = Triangle::new(
+            Vec3::ZERO,
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(0.0, 3.0, 0.0),
+        );
         assert!(vec3_approx_eq(tri.centroid(), Vec3::new(1.0, 1.0, 0.0)));
     }
 
@@ -2021,17 +2160,29 @@ mod tests {
     fn segment_closest_point_clamped() {
         let s = Segment::new(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0));
         // Point past the end
-        assert!(vec3_approx_eq(s.closest_point(Vec3::new(20.0, 0.0, 0.0)), Vec3::new(10.0, 0.0, 0.0)));
+        assert!(vec3_approx_eq(
+            s.closest_point(Vec3::new(20.0, 0.0, 0.0)),
+            Vec3::new(10.0, 0.0, 0.0)
+        ));
         // Point before the start
-        assert!(vec3_approx_eq(s.closest_point(Vec3::new(-5.0, 0.0, 0.0)), Vec3::ZERO));
+        assert!(vec3_approx_eq(
+            s.closest_point(Vec3::new(-5.0, 0.0, 0.0)),
+            Vec3::ZERO
+        ));
         // Point alongside
-        assert!(vec3_approx_eq(s.closest_point(Vec3::new(5.0, 3.0, 0.0)), Vec3::new(5.0, 0.0, 0.0)));
+        assert!(vec3_approx_eq(
+            s.closest_point(Vec3::new(5.0, 3.0, 0.0)),
+            Vec3::new(5.0, 0.0, 0.0)
+        ));
     }
 
     #[test]
     fn segment_distance() {
         let s = Segment::new(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0));
-        assert!(approx_eq(s.distance_to_point(Vec3::new(5.0, 3.0, 0.0)), 3.0));
+        assert!(approx_eq(
+            s.distance_to_point(Vec3::new(5.0, 3.0, 0.0)),
+            3.0
+        ));
     }
 
     #[test]
@@ -2292,7 +2443,11 @@ mod tests {
     #[test]
     fn triangle_unit_normal_3d() {
         // Tilted triangle in 3D space
-        let tri = Triangle::new(Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 1.0));
+        let tri = Triangle::new(
+            Vec3::ZERO,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 1.0),
+        );
         let n = tri.unit_normal();
         assert!(approx_eq(n.length(), 1.0));
     }
@@ -2302,7 +2457,10 @@ mod tests {
         let s = Segment::new(Vec3::ONE, Vec3::ONE);
         assert!(approx_eq(s.length(), 0.0));
         // Closest point should return the segment point itself
-        assert!(vec3_approx_eq(s.closest_point(Vec3::new(5.0, 5.0, 5.0)), Vec3::ONE));
+        assert!(vec3_approx_eq(
+            s.closest_point(Vec3::new(5.0, 5.0, 5.0)),
+            Vec3::ONE
+        ));
     }
 
     #[test]
@@ -2424,7 +2582,10 @@ mod tests {
         let mut items: Vec<(Aabb, usize)> = (0..10)
             .map(|i| {
                 let x = i as f32 * 3.0;
-                (Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 1.0)), i)
+                (
+                    Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 1.0)),
+                    i,
+                )
             })
             .collect();
         let bvh = Bvh::build(&mut items);
@@ -2446,7 +2607,10 @@ mod tests {
         let mut items: Vec<(Aabb, usize)> = (0..5)
             .map(|i| {
                 let x = i as f32 * 2.0;
-                (Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 1.0)), i)
+                (
+                    Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 1.0)),
+                    i,
+                )
             })
             .collect();
         let bvh = Bvh::build(&mut items);
@@ -2464,7 +2628,10 @@ mod tests {
             .map(|i| {
                 let x = (i % 10) as f32;
                 let y = (i / 10) as f32;
-                (Aabb::new(Vec3::new(x, y, 0.0), Vec3::new(x + 0.5, y + 0.5, 0.5)), i)
+                (
+                    Aabb::new(Vec3::new(x, y, 0.0), Vec3::new(x + 0.5, y + 0.5, 0.5)),
+                    i,
+                )
             })
             .collect();
         let bvh = Bvh::build(&mut items);
@@ -2557,10 +2724,8 @@ mod tests {
 
     #[test]
     fn kdtree_nearest_exact_match() {
-        let mut items: Vec<(Vec3, usize)> = vec![
-            (Vec3::new(1.0, 2.0, 3.0), 7),
-            (Vec3::new(4.0, 5.0, 6.0), 8),
-        ];
+        let mut items: Vec<(Vec3, usize)> =
+            vec![(Vec3::new(1.0, 2.0, 3.0), 7), (Vec3::new(4.0, 5.0, 6.0), 8)];
         let tree = KdTree::build(&mut items);
         let (idx, dist_sq) = tree.nearest(Vec3::new(1.0, 2.0, 3.0)).unwrap();
         assert_eq!(idx, 7);
@@ -2587,7 +2752,10 @@ mod tests {
         let mut items: Vec<(Aabb, usize)> = (0..5)
             .map(|i| {
                 let x = i as f32 * 10.0;
-                (Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 1.0)), i)
+                (
+                    Aabb::new(Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 1.0, 1.0)),
+                    i,
+                )
             })
             .collect();
         let bvh = Bvh::build(&mut items);
@@ -2598,9 +2766,7 @@ mod tests {
     #[test]
     fn kdtree_duplicate_points() {
         // Multiple points at the same location
-        let mut items: Vec<(Vec3, usize)> = (0..5)
-            .map(|i| (Vec3::ZERO, i))
-            .collect();
+        let mut items: Vec<(Vec3, usize)> = (0..5).map(|i| (Vec3::ZERO, i)).collect();
         let tree = KdTree::build(&mut items);
         let (_, dist_sq) = tree.nearest(Vec3::ZERO).unwrap();
         assert!(approx_eq(dist_sq, 0.0));
@@ -2623,7 +2789,10 @@ mod tests {
     fn bvh_two_items() {
         let mut items = [
             (Aabb::new(Vec3::ZERO, Vec3::ONE), 0),
-            (Aabb::new(Vec3::new(5.0, 0.0, 0.0), Vec3::new(6.0, 1.0, 1.0)), 1),
+            (
+                Aabb::new(Vec3::new(5.0, 0.0, 0.0), Vec3::new(6.0, 1.0, 1.0)),
+                1,
+            ),
         ];
         let bvh = Bvh::build(&mut items);
         let r = Ray::new(Vec3::new(5.5, 0.5, -5.0), Vec3::Z);
@@ -2672,7 +2841,10 @@ mod tests {
         let bounds = Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(100.0));
         let mut qt = Quadtree::new(bounds, 2, 8); // Split after 2 items
         for i in 0..10 {
-            qt.insert(glam::Vec2::new(i as f32 * 10.0 + 1.0, i as f32 * 10.0 + 1.0), i);
+            qt.insert(
+                glam::Vec2::new(i as f32 * 10.0 + 1.0, i as f32 * 10.0 + 1.0),
+                i,
+            );
         }
         assert_eq!(qt.len(), 10);
         // Query everything

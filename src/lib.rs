@@ -56,8 +56,8 @@ pub use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
 
 #[cfg(feature = "geo")]
 pub use geo::{
-    Aabb, Bvh, ConvexPolygon, ConvexSupport, Frustum, KdTree, Line, Octree, Plane, Quadtree,
-    Ray, Rect, Segment, Sphere, SpatialHash, Triangle,
+    Aabb, Bvh, ConvexPolygon, ConvexSupport, Frustum, KdTree, Line, Octree, Plane, Quadtree, Ray,
+    Rect, Segment, SpatialHash, Sphere, Triangle,
 };
 
 #[cfg(feature = "num")]

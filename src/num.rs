@@ -30,9 +30,7 @@ pub fn newton_raphson(
         }
         let dfx = df(x);
         if dfx.abs() < 1e-15 {
-            return Err(GanitError::InvalidInput(
-                "derivative is zero".to_string(),
-            ));
+            return Err(GanitError::InvalidInput("derivative is zero".to_string()));
         }
         x -= fx / dfx;
     }
@@ -175,7 +173,9 @@ pub fn lu_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<usize>), Ganit
         if row.len() != n {
             return Err(GanitError::InvalidInput(format!(
                 "expected square {}x{}, got row length {}",
-                n, n, row.len()
+                n,
+                n,
+                row.len()
             )));
         }
     }
@@ -224,7 +224,8 @@ pub fn lu_solve(lu: &[Vec<f64>], pivot: &[usize], b: &[f64]) -> Result<Vec<f64>,
     if b.len() != n {
         return Err(GanitError::InvalidInput(format!(
             "b length {} != matrix size {}",
-            b.len(), n
+            b.len(),
+            n
         )));
     }
 
@@ -272,7 +273,9 @@ pub fn cholesky(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, GanitError> {
         if row.len() != n {
             return Err(GanitError::InvalidInput(format!(
                 "expected square {}x{}, got row length {}",
-                n, n, row.len()
+                n,
+                n,
+                row.len()
             )));
         }
     }
@@ -309,7 +312,8 @@ pub fn cholesky_solve(l: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>, GanitError>
     if b.len() != n {
         return Err(GanitError::InvalidInput(format!(
             "b length {} != matrix size {}",
-            b.len(), n
+            b.len(),
+            n
         )));
     }
 
@@ -401,7 +405,9 @@ pub fn qr_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), Ga
 pub fn least_squares_poly(x: &[f64], y: &[f64], degree: usize) -> Result<Vec<f64>, GanitError> {
     let m = x.len();
     if m != y.len() || m == 0 {
-        return Err(GanitError::InvalidInput("x and y must have equal non-zero length".to_string()));
+        return Err(GanitError::InvalidInput(
+            "x and y must have equal non-zero length".to_string(),
+        ));
     }
     let n = degree + 1;
     if m < n {
@@ -466,7 +472,9 @@ pub fn eigenvalue_power(
         if row.len() != n {
             return Err(GanitError::InvalidInput(format!(
                 "expected square {}x{}, got row length {}",
-                n, n, row.len()
+                n,
+                n,
+                row.len()
             )));
         }
     }
@@ -551,7 +559,10 @@ impl Complex {
     /// Complex conjugate.
     #[inline]
     pub const fn conj(self) -> Self {
-        Self { re: self.re, im: -self.im }
+        Self {
+            re: self.re,
+            im: -self.im,
+        }
     }
 }
 
@@ -575,7 +586,10 @@ impl std::ops::Add for Complex {
     type Output = Self;
     #[inline]
     fn add(self, rhs: Self) -> Self {
-        Self { re: self.re + rhs.re, im: self.im + rhs.im }
+        Self {
+            re: self.re + rhs.re,
+            im: self.im + rhs.im,
+        }
     }
 }
 
@@ -583,7 +597,10 @@ impl std::ops::Sub for Complex {
     type Output = Self;
     #[inline]
     fn sub(self, rhs: Self) -> Self {
-        Self { re: self.re - rhs.re, im: self.im - rhs.im }
+        Self {
+            re: self.re - rhs.re,
+            im: self.im - rhs.im,
+        }
     }
 }
 
@@ -602,7 +619,10 @@ impl std::ops::Mul<f64> for Complex {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: f64) -> Self {
-        Self { re: self.re * rhs, im: self.im * rhs }
+        Self {
+            re: self.re * rhs,
+            im: self.im * rhs,
+        }
     }
 }
 
@@ -789,8 +809,7 @@ mod tests {
 
     #[test]
     fn newton_cube_root_27() {
-        let root =
-            newton_raphson(|x| x * x * x - 27.0, |x| 3.0 * x * x, 2.0, 1e-10, 100).unwrap();
+        let root = newton_raphson(|x| x * x * x - 27.0, |x| 3.0 * x * x, 2.0, 1e-10, 100).unwrap();
         assert!(approx_eq(root, 3.0));
     }
 
@@ -1040,7 +1059,11 @@ mod tests {
 
     #[test]
     fn cholesky_3x3_identity() {
-        let a = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
+        let a = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
         let l = cholesky(&a).unwrap();
         // L of identity is identity
         assert!(approx_eq(l[0][0], 1.0));
@@ -1338,7 +1361,7 @@ mod tests {
         ];
         fft(&mut data);
         assert!(approx_eq(data[0].abs(), 0.0)); // DC = 0
-        assert!(approx_eq(data[2].re, 4.0));     // Nyquist bin
+        assert!(approx_eq(data[2].re, 4.0)); // Nyquist bin
     }
 
     #[test]
@@ -1361,9 +1384,7 @@ mod tests {
     #[test]
     fn fft_8_point() {
         // 8-point FFT of real signal
-        let mut data: Vec<Complex> = (0..8)
-            .map(|i| Complex::from_real(i as f64))
-            .collect();
+        let mut data: Vec<Complex> = (0..8).map(|i| Complex::from_real(i as f64)).collect();
         fft(&mut data);
         // DC should be sum of all values = 0+1+2+3+4+5+6+7 = 28
         assert!(approx_eq(data[0].re, 28.0));
@@ -1465,7 +1486,9 @@ mod tests {
     fn fft_linearity() {
         // FFT(a*x + b*y) = a*FFT(x) + b*FFT(y)
         let x: Vec<Complex> = (0..4).map(|i| Complex::from_real(i as f64)).collect();
-        let y: Vec<Complex> = (0..4).map(|i| Complex::from_real((i as f64).sin())).collect();
+        let y: Vec<Complex> = (0..4)
+            .map(|i| Complex::from_real((i as f64).sin()))
+            .collect();
 
         let mut fx = x.clone();
         fft(&mut fx);
@@ -1473,9 +1496,7 @@ mod tests {
         fft(&mut fy);
 
         // 2*x + 3*y
-        let mut combined: Vec<Complex> = (0..4)
-            .map(|i| x[i] * 2.0 + y[i] * 3.0)
-            .collect();
+        let mut combined: Vec<Complex> = (0..4).map(|i| x[i] * 2.0 + y[i] * 3.0).collect();
         fft(&mut combined);
 
         for i in 0..4 {
@@ -1531,7 +1552,7 @@ mod tests {
             10000,
         );
         assert!((y[0] - (-1.0)).abs() < 1e-6); // x(pi) = cos(pi) = -1
-        assert!(y[1].abs() < 1e-6);              // v(pi) = -sin(pi) = 0
+        assert!(y[1].abs() < 1e-6); // v(pi) = -sin(pi) = 0
     }
 
     #[test]

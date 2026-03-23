@@ -97,16 +97,24 @@ Ganit owns **typed mathematical operations** — the programmatic math that engi
 - `ease_in_cubic()`, `ease_out_cubic()` — cubic easing
 - `ease_in_out_smooth()` — C2 quintic smootherstep
 
-## V0.4 — Numerical Methods Expansion
+## V0.4a — Linear Algebra (done, 2026-03-22)
+
+### num (~17 tests)
+- `lu_decompose()`, `lu_solve()` — LU decomposition with partial pivoting + forward/back substitution
+- `cholesky()`, `cholesky_solve()` — Cholesky decomposition (A = L*L^T) for SPD matrices
+- `qr_decompose()` — modified Gram-Schmidt QR decomposition (column-major)
+- `least_squares_poly()` — polynomial least-squares fitting via QR
+
+## V0.4b — Spectral & Dynamics
 
 ### num
-- LU decomposition with forward/back substitution
-- Cholesky decomposition (symmetric positive-definite)
-- QR decomposition (Gram-Schmidt)
 - Eigenvalue computation (power iteration)
 - Basic FFT (Cooley-Tukey radix-2)
 - Inverse FFT
-- Least squares fitting (linear, polynomial)
+
+## V0.4c — ODE Solvers
+
+### num
 - Runge-Kutta ODE solver (RK4)
 
 ## V0.5 — Spatial Structures

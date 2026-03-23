@@ -472,6 +472,71 @@ fn bench_v03(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// V0.4a linear algebra
+// ---------------------------------------------------------------------------
+
+fn bench_v04a(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v04a");
+
+    group.bench_function("lu_decompose_3x3", |b| {
+        let a = vec![
+            vec![1.0, 1.0, 1.0],
+            vec![2.0, 1.0, -1.0],
+            vec![1.0, -1.0, 1.0],
+        ];
+        b.iter(|| ganit::num::lu_decompose(black_box(&a)))
+    });
+
+    group.bench_function("lu_solve_3x3", |b| {
+        let a = vec![
+            vec![1.0, 1.0, 1.0],
+            vec![2.0, 1.0, -1.0],
+            vec![1.0, -1.0, 1.0],
+        ];
+        let (lu, pivot) = ganit::num::lu_decompose(&a).unwrap();
+        let rhs = [6.0, 1.0, 2.0];
+        b.iter(|| ganit::num::lu_solve(black_box(&lu), black_box(&pivot), black_box(&rhs)))
+    });
+
+    group.bench_function("cholesky_3x3", |b| {
+        let a = vec![
+            vec![4.0, 2.0, 1.0],
+            vec![2.0, 5.0, 2.0],
+            vec![1.0, 2.0, 6.0],
+        ];
+        b.iter(|| ganit::num::cholesky(black_box(&a)))
+    });
+
+    group.bench_function("cholesky_solve_3x3", |b| {
+        let a = vec![
+            vec![4.0, 2.0, 1.0],
+            vec![2.0, 5.0, 2.0],
+            vec![1.0, 2.0, 6.0],
+        ];
+        let l = ganit::num::cholesky(&a).unwrap();
+        let rhs = [1.0, 2.0, 3.0];
+        b.iter(|| ganit::num::cholesky_solve(black_box(&l), black_box(&rhs)))
+    });
+
+    group.bench_function("qr_decompose_3col", |b| {
+        let a = vec![
+            vec![1.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+            vec![0.0, 1.0, 1.0],
+        ];
+        b.iter(|| ganit::num::qr_decompose(black_box(&a)))
+    });
+
+    group.bench_function("least_squares_linear_6pt", |b| {
+        let x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = [2.1, 4.9, 8.1, 10.9, 14.1, 16.9];
+        b.iter(|| ganit::num::least_squares_poly(black_box(&x), black_box(&y), 1))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_transforms,
@@ -481,5 +546,6 @@ criterion_group!(
     bench_batch,
     bench_v02,
     bench_v03,
+    bench_v04a,
 );
 criterion_main!(benches);

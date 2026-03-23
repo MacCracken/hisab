@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 // Re-export glam types for consumers
 pub use glam;
-pub use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
 pub use glam::{DMat3, DMat4, DQuat, DVec2, DVec3, DVec4};
+pub use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
 
 /// A 2D affine transform (position, rotation in radians, non-uniform scale).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

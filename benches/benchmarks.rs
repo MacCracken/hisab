@@ -710,6 +710,84 @@ fn bench_v05a(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// V0.5b spatial grids
+// ---------------------------------------------------------------------------
+
+fn bench_v05b(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v05b");
+
+    group.bench_function("quadtree_insert_1000", |b| {
+        let bounds = ganit::Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(100.0));
+        b.iter(|| {
+            let mut qt = ganit::Quadtree::new(bounds, 8, 8);
+            for i in 0..1000 {
+                let x = (i % 100) as f32;
+                let y = (i / 100) as f32 * 10.0;
+                qt.insert(glam::Vec2::new(x, y), i);
+            }
+            qt
+        })
+    });
+
+    group.bench_function("quadtree_query_1000", |b| {
+        let bounds = ganit::Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(100.0));
+        let mut qt = ganit::Quadtree::new(bounds, 8, 8);
+        for i in 0..1000 {
+            qt.insert(glam::Vec2::new((i % 100) as f32, (i / 100) as f32 * 10.0), i);
+        }
+        let query = ganit::Rect::new(glam::Vec2::new(40.0, 40.0), glam::Vec2::new(60.0, 60.0));
+        b.iter(|| qt.query_rect(black_box(&query)))
+    });
+
+    group.bench_function("octree_insert_1000", |b| {
+        let bounds = ganit::Aabb::new(Vec3::ZERO, Vec3::splat(100.0));
+        b.iter(|| {
+            let mut ot = ganit::Octree::new(bounds, 8, 8);
+            for i in 0..1000 {
+                let x = (i % 10) as f32 * 10.0;
+                let y = ((i / 10) % 10) as f32 * 10.0;
+                let z = (i / 100) as f32 * 10.0;
+                ot.insert(Vec3::new(x + 1.0, y + 1.0, z + 1.0), i);
+            }
+            ot
+        })
+    });
+
+    group.bench_function("octree_query_1000", |b| {
+        let bounds = ganit::Aabb::new(Vec3::ZERO, Vec3::splat(100.0));
+        let mut ot = ganit::Octree::new(bounds, 8, 8);
+        for i in 0..1000 {
+            let x = (i % 10) as f32 * 10.0;
+            let y = ((i / 10) % 10) as f32 * 10.0;
+            let z = (i / 100) as f32 * 10.0;
+            ot.insert(Vec3::new(x + 1.0, y + 1.0, z + 1.0), i);
+        }
+        let query = ganit::Aabb::new(Vec3::new(40.0, 40.0, 40.0), Vec3::new(60.0, 60.0, 60.0));
+        b.iter(|| ot.query_aabb(black_box(&query)))
+    });
+
+    group.bench_function("spatial_hash_insert_1000", |b| {
+        b.iter(|| {
+            let mut sh = ganit::SpatialHash::new(10.0);
+            for i in 0..1000 {
+                sh.insert(Vec3::new(i as f32, 0.0, 0.0), i);
+            }
+            sh
+        })
+    });
+
+    group.bench_function("spatial_hash_query_cell", |b| {
+        let mut sh = ganit::SpatialHash::new(10.0);
+        for i in 0..1000 {
+            sh.insert(Vec3::new(i as f32, 0.0, 0.0), i);
+        }
+        b.iter(|| sh.query_cell(black_box(Vec3::new(50.0, 0.0, 0.0))))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_transforms,
@@ -723,5 +801,6 @@ criterion_group!(
     bench_v04b,
     bench_v04c,
     bench_v05a,
+    bench_v05b,
 );
 criterion_main!(benches);

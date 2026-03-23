@@ -125,11 +125,13 @@ Ganit owns **typed mathematical operations** — the programmatic math that engi
 - `Bvh` — Bounding Volume Hierarchy with midpoint splitting, `query_ray()`, `query_aabb()`
 - `KdTree` — 3D k-d tree with `nearest()`, `within_radius()`
 
-## V0.5b — Spatial Grids
+## V0.5b — Spatial Grids (done, 2026-03-23)
 
-### geo
-- Octree (3D) / Quadtree (2D)
-- Grid-based spatial hashing
+### geo (~16 tests)
+- `Rect` — 2D AABB with `contains_point()`, `overlaps()`
+- `Quadtree` — 2D spatial index with insert, `query_rect()`
+- `Octree` — 3D spatial index with insert, `query_aabb()`
+- `SpatialHash` — uniform grid with `insert()`, `query_cell()`, `query_radius()`, `clear()`
 
 ## V0.5c — Collision
 

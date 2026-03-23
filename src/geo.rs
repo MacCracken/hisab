@@ -844,6 +844,429 @@ impl KdTree {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Quadtree (2D spatial index)
+// ---------------------------------------------------------------------------
+
+/// A 2D axis-aligned bounding rectangle for quadtree operations.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Rect {
+    pub min: glam::Vec2,
+    pub max: glam::Vec2,
+}
+
+impl Rect {
+    /// Create a new rectangle. Min/max are corrected if swapped.
+    #[inline]
+    pub fn new(a: glam::Vec2, b: glam::Vec2) -> Self {
+        Self {
+            min: a.min(b),
+            max: a.max(b),
+        }
+    }
+
+    /// Check whether a 2D point is inside this rectangle.
+    #[inline]
+    pub fn contains_point(&self, p: glam::Vec2) -> bool {
+        p.cmpge(self.min).all() && p.cmple(self.max).all()
+    }
+
+    /// Check whether two rectangles overlap.
+    #[inline]
+    pub fn overlaps(&self, other: &Rect) -> bool {
+        self.min.cmple(other.max).all() && other.min.cmple(self.max).all()
+    }
+
+    /// Center of the rectangle.
+    #[inline]
+    pub fn center(&self) -> glam::Vec2 {
+        (self.min + self.max) * 0.5
+    }
+}
+
+/// A quadtree node.
+#[derive(Debug, Clone)]
+enum QuadNode {
+    Empty,
+    Leaf(Vec<(glam::Vec2, usize)>),
+    Split {
+        children: Box<[QuadNode; 4]>, // NW, NE, SW, SE
+        bounds: Rect,
+    },
+}
+
+/// A 2D quadtree for spatial point queries.
+///
+/// Points are inserted into a fixed-bounds region. The tree subdivides
+/// when a leaf exceeds `max_per_leaf` items, up to `max_depth` levels.
+#[derive(Debug, Clone)]
+pub struct Quadtree {
+    root: QuadNode,
+    bounds: Rect,
+    len: usize,
+    max_per_leaf: usize,
+    max_depth: usize,
+}
+
+impl Quadtree {
+    /// Create a new empty quadtree covering the given bounds.
+    ///
+    /// `max_per_leaf`: max items before a leaf splits (default 8).
+    /// `max_depth`: max subdivision depth (default 8).
+    pub fn new(bounds: Rect, max_per_leaf: usize, max_depth: usize) -> Self {
+        Self {
+            root: QuadNode::Empty,
+            bounds,
+            len: 0,
+            max_per_leaf,
+            max_depth,
+        }
+    }
+
+    /// Number of items in the quadtree.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the quadtree is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Insert a point with an associated index.
+    pub fn insert(&mut self, point: glam::Vec2, index: usize) {
+        if !self.bounds.contains_point(point) {
+            return; // Out of bounds, ignore
+        }
+        Self::insert_recursive(&mut self.root, point, index, &self.bounds, self.max_per_leaf, self.max_depth, 0);
+        self.len += 1;
+    }
+
+    fn insert_recursive(
+        node: &mut QuadNode,
+        point: glam::Vec2,
+        index: usize,
+        bounds: &Rect,
+        max_per_leaf: usize,
+        max_depth: usize,
+        depth: usize,
+    ) {
+        match node {
+            QuadNode::Empty => {
+                *node = QuadNode::Leaf(vec![(point, index)]);
+            }
+            QuadNode::Leaf(items) => {
+                items.push((point, index));
+                if items.len() > max_per_leaf && depth < max_depth {
+                    // Split
+                    let center = bounds.center();
+                    let mut children = Box::new([
+                        QuadNode::Empty,
+                        QuadNode::Empty,
+                        QuadNode::Empty,
+                        QuadNode::Empty,
+                    ]);
+                    for &(p, idx) in items.iter() {
+                        let quadrant = Self::quadrant(p, center);
+                        let child_bounds = Self::child_bounds(bounds, quadrant);
+                        Self::insert_recursive(&mut children[quadrant], p, idx, &child_bounds, max_per_leaf, max_depth, depth + 1);
+                    }
+                    *node = QuadNode::Split { children, bounds: *bounds };
+                }
+            }
+            QuadNode::Split { children, bounds: node_bounds } => {
+                let center = node_bounds.center();
+                let quadrant = Self::quadrant(point, center);
+                let child_bounds = Self::child_bounds(node_bounds, quadrant);
+                Self::insert_recursive(&mut children[quadrant], point, index, &child_bounds, max_per_leaf, max_depth, depth + 1);
+            }
+        }
+    }
+
+    fn quadrant(point: glam::Vec2, center: glam::Vec2) -> usize {
+        let x = if point.x >= center.x { 1 } else { 0 };
+        let y = if point.y >= center.y { 0 } else { 2 }; // NW=0, NE=1, SW=2, SE=3
+        x + y
+    }
+
+    fn child_bounds(bounds: &Rect, quadrant: usize) -> Rect {
+        let center = bounds.center();
+        match quadrant {
+            0 => Rect::new(glam::Vec2::new(bounds.min.x, center.y), glam::Vec2::new(center.x, bounds.max.y)), // NW
+            1 => Rect::new(center, bounds.max),                                                                 // NE
+            2 => Rect::new(bounds.min, center),                                                                 // SW
+            _ => Rect::new(glam::Vec2::new(center.x, bounds.min.y), glam::Vec2::new(bounds.max.x, center.y)), // SE
+        }
+    }
+
+    /// Query all indices of points within the given rectangle.
+    pub fn query_rect(&self, query: &Rect) -> Vec<usize> {
+        let mut results = Vec::new();
+        Self::query_recursive(&self.root, &self.bounds, query, &mut results);
+        results
+    }
+
+    fn query_recursive(node: &QuadNode, bounds: &Rect, query: &Rect, results: &mut Vec<usize>) {
+        if !bounds.overlaps(query) {
+            return;
+        }
+        match node {
+            QuadNode::Empty => {}
+            QuadNode::Leaf(items) => {
+                for &(p, idx) in items {
+                    if query.contains_point(p) {
+                        results.push(idx);
+                    }
+                }
+            }
+            QuadNode::Split { children, bounds: node_bounds } => {
+                for q in 0..4 {
+                    let child_bounds = Self::child_bounds(node_bounds, q);
+                    Self::query_recursive(&children[q], &child_bounds, query, results);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Octree (3D spatial index)
+// ---------------------------------------------------------------------------
+
+/// An octree node.
+#[derive(Debug, Clone)]
+enum OctNode {
+    Empty,
+    Leaf(Vec<(Vec3, usize)>),
+    Split {
+        children: Box<[OctNode; 8]>,
+        bounds: Aabb,
+    },
+}
+
+/// A 3D octree for spatial point queries.
+///
+/// Same design as [`Quadtree`] but in 3D with 8 children per split.
+#[derive(Debug, Clone)]
+pub struct Octree {
+    root: OctNode,
+    bounds: Aabb,
+    len: usize,
+    max_per_leaf: usize,
+    max_depth: usize,
+}
+
+impl Octree {
+    /// Create a new empty octree covering the given bounds.
+    pub fn new(bounds: Aabb, max_per_leaf: usize, max_depth: usize) -> Self {
+        Self {
+            root: OctNode::Empty,
+            bounds,
+            len: 0,
+            max_per_leaf,
+            max_depth,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Insert a point with an associated index.
+    pub fn insert(&mut self, point: Vec3, index: usize) {
+        if !self.bounds.contains(point) {
+            return;
+        }
+        Self::insert_recursive(&mut self.root, point, index, &self.bounds, self.max_per_leaf, self.max_depth, 0);
+        self.len += 1;
+    }
+
+    fn insert_recursive(
+        node: &mut OctNode,
+        point: Vec3,
+        index: usize,
+        bounds: &Aabb,
+        max_per_leaf: usize,
+        max_depth: usize,
+        depth: usize,
+    ) {
+        match node {
+            OctNode::Empty => {
+                *node = OctNode::Leaf(vec![(point, index)]);
+            }
+            OctNode::Leaf(items) => {
+                items.push((point, index));
+                if items.len() > max_per_leaf && depth < max_depth {
+                    let center = bounds.center();
+                    let mut children = Box::new([
+                        OctNode::Empty, OctNode::Empty, OctNode::Empty, OctNode::Empty,
+                        OctNode::Empty, OctNode::Empty, OctNode::Empty, OctNode::Empty,
+                    ]);
+                    for &(p, idx) in items.iter() {
+                        let octant = Self::octant(p, center);
+                        let child_bounds = Self::child_bounds(bounds, octant);
+                        Self::insert_recursive(&mut children[octant], p, idx, &child_bounds, max_per_leaf, max_depth, depth + 1);
+                    }
+                    *node = OctNode::Split { children, bounds: *bounds };
+                }
+            }
+            OctNode::Split { children, bounds: node_bounds } => {
+                let center = node_bounds.center();
+                let octant = Self::octant(point, center);
+                let child_bounds = Self::child_bounds(node_bounds, octant);
+                Self::insert_recursive(&mut children[octant], point, index, &child_bounds, max_per_leaf, max_depth, depth + 1);
+            }
+        }
+    }
+
+    fn octant(point: Vec3, center: Vec3) -> usize {
+        let x = if point.x >= center.x { 1 } else { 0 };
+        let y = if point.y >= center.y { 2 } else { 0 };
+        let z = if point.z >= center.z { 4 } else { 0 };
+        x | y | z
+    }
+
+    fn child_bounds(bounds: &Aabb, octant: usize) -> Aabb {
+        let center = bounds.center();
+        let min = Vec3::new(
+            if octant & 1 != 0 { center.x } else { bounds.min.x },
+            if octant & 2 != 0 { center.y } else { bounds.min.y },
+            if octant & 4 != 0 { center.z } else { bounds.min.z },
+        );
+        let max = Vec3::new(
+            if octant & 1 != 0 { bounds.max.x } else { center.x },
+            if octant & 2 != 0 { bounds.max.y } else { center.y },
+            if octant & 4 != 0 { bounds.max.z } else { center.z },
+        );
+        Aabb::new(min, max)
+    }
+
+    /// Query all indices of points within the given AABB.
+    pub fn query_aabb(&self, query: &Aabb) -> Vec<usize> {
+        let mut results = Vec::new();
+        Self::query_recursive(&self.root, &self.bounds, query, &mut results);
+        results
+    }
+
+    fn query_recursive(node: &OctNode, bounds: &Aabb, query: &Aabb, results: &mut Vec<usize>) {
+        if !aabb_aabb(bounds, query) {
+            return;
+        }
+        match node {
+            OctNode::Empty => {}
+            OctNode::Leaf(items) => {
+                for &(p, idx) in items {
+                    if query.contains(p) {
+                        results.push(idx);
+                    }
+                }
+            }
+            OctNode::Split { children, bounds: node_bounds } => {
+                for oct in 0..8 {
+                    let child_bounds = Self::child_bounds(node_bounds, oct);
+                    Self::query_recursive(&children[oct], &child_bounds, query, results);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spatial hash grid
+// ---------------------------------------------------------------------------
+
+/// A spatial hash grid for fast broadphase queries.
+///
+/// Divides space into a uniform grid of cells. Each cell stores indices
+/// of items whose positions fall within it. O(1) insert and query for
+/// localized spatial lookups.
+#[derive(Debug, Clone)]
+pub struct SpatialHash {
+    inv_cell_size: f32,
+    cells: std::collections::HashMap<(i32, i32, i32), Vec<usize>>,
+    len: usize,
+}
+
+impl SpatialHash {
+    /// Create a new spatial hash grid with the given cell size.
+    pub fn new(cell_size: f32) -> Self {
+        assert!(cell_size > 0.0, "cell_size must be positive");
+        Self {
+            inv_cell_size: 1.0 / cell_size,
+            cells: std::collections::HashMap::new(),
+            len: 0,
+        }
+    }
+
+    /// Number of items inserted.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the grid is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Number of occupied cells.
+    pub fn cell_count(&self) -> usize {
+        self.cells.len()
+    }
+
+    fn cell_key(&self, point: Vec3) -> (i32, i32, i32) {
+        (
+            (point.x * self.inv_cell_size).floor() as i32,
+            (point.y * self.inv_cell_size).floor() as i32,
+            (point.z * self.inv_cell_size).floor() as i32,
+        )
+    }
+
+    /// Insert a point with an associated index.
+    pub fn insert(&mut self, point: Vec3, index: usize) {
+        let key = self.cell_key(point);
+        self.cells.entry(key).or_default().push(index);
+        self.len += 1;
+    }
+
+    /// Clear all items.
+    pub fn clear(&mut self) {
+        self.cells.clear();
+        self.len = 0;
+    }
+
+    /// Query all indices in the same cell as the given point.
+    pub fn query_cell(&self, point: Vec3) -> &[usize] {
+        let key = self.cell_key(point);
+        self.cells.get(&key).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Query all indices within a radius of the given point.
+    ///
+    /// Checks all cells that could contain points within `radius`.
+    /// The caller should perform exact distance checks on the returned indices.
+    pub fn query_radius(&self, point: Vec3, radius: f32) -> Vec<usize> {
+        let mut results = Vec::new();
+        let cells_r = (radius * self.inv_cell_size).ceil() as i32;
+        let center = self.cell_key(point);
+
+        for dx in -cells_r..=cells_r {
+            for dy in -cells_r..=cells_r {
+                for dz in -cells_r..=cells_r {
+                    let key = (center.0 + dx, center.1 + dy, center.2 + dz);
+                    if let Some(items) = self.cells.get(&key) {
+                        results.extend_from_slice(items);
+                    }
+                }
+            }
+        }
+        results
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1868,5 +2291,181 @@ mod tests {
         let hits = bvh.query_ray(&r);
         assert!(hits.contains(&1));
         assert!(!hits.contains(&0));
+    }
+
+    // --- V0.5b: Quadtree ---
+
+    #[test]
+    fn quadtree_empty() {
+        let bounds = Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(100.0));
+        let qt = Quadtree::new(bounds, 4, 8);
+        assert!(qt.is_empty());
+        assert_eq!(qt.len(), 0);
+    }
+
+    #[test]
+    fn quadtree_insert_and_query() {
+        let bounds = Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(100.0));
+        let mut qt = Quadtree::new(bounds, 4, 8);
+        for i in 0..10 {
+            qt.insert(glam::Vec2::new(i as f32 * 10.0 + 1.0, 50.0), i);
+        }
+        assert_eq!(qt.len(), 10);
+
+        let query = Rect::new(glam::Vec2::new(0.0, 40.0), glam::Vec2::new(25.0, 60.0));
+        let results = qt.query_rect(&query);
+        assert!(results.contains(&0)); // x=1
+        assert!(results.contains(&1)); // x=11
+        assert!(results.contains(&2)); // x=21
+        assert!(!results.contains(&5)); // x=51
+    }
+
+    #[test]
+    fn quadtree_out_of_bounds_ignored() {
+        let bounds = Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(10.0));
+        let mut qt = Quadtree::new(bounds, 4, 8);
+        qt.insert(glam::Vec2::new(100.0, 100.0), 0); // Out of bounds
+        assert_eq!(qt.len(), 0);
+    }
+
+    #[test]
+    fn quadtree_subdivision() {
+        let bounds = Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(100.0));
+        let mut qt = Quadtree::new(bounds, 2, 8); // Split after 2 items
+        for i in 0..10 {
+            qt.insert(glam::Vec2::new(i as f32 * 10.0 + 1.0, i as f32 * 10.0 + 1.0), i);
+        }
+        assert_eq!(qt.len(), 10);
+        // Query everything
+        let all = qt.query_rect(&bounds);
+        assert_eq!(all.len(), 10);
+    }
+
+    #[test]
+    fn rect_contains_and_overlaps() {
+        let r = Rect::new(glam::Vec2::ZERO, glam::Vec2::splat(10.0));
+        assert!(r.contains_point(glam::Vec2::splat(5.0)));
+        assert!(!r.contains_point(glam::Vec2::splat(11.0)));
+
+        let r2 = Rect::new(glam::Vec2::splat(5.0), glam::Vec2::splat(15.0));
+        assert!(r.overlaps(&r2));
+
+        let r3 = Rect::new(glam::Vec2::splat(20.0), glam::Vec2::splat(30.0));
+        assert!(!r.overlaps(&r3));
+    }
+
+    // --- V0.5b: Octree ---
+
+    #[test]
+    fn octree_empty() {
+        let bounds = Aabb::new(Vec3::ZERO, Vec3::splat(100.0));
+        let ot = Octree::new(bounds, 4, 8);
+        assert!(ot.is_empty());
+    }
+
+    #[test]
+    fn octree_insert_and_query() {
+        let bounds = Aabb::new(Vec3::ZERO, Vec3::splat(100.0));
+        let mut ot = Octree::new(bounds, 4, 8);
+        for i in 0..20 {
+            ot.insert(Vec3::new(i as f32 * 5.0 + 1.0, 50.0, 50.0), i);
+        }
+        assert_eq!(ot.len(), 20);
+
+        let query = Aabb::new(Vec3::new(0.0, 40.0, 40.0), Vec3::new(20.0, 60.0, 60.0));
+        let results = ot.query_aabb(&query);
+        assert!(results.contains(&0)); // x=1
+        assert!(results.contains(&1)); // x=6
+        assert!(results.contains(&2)); // x=11
+        assert!(results.contains(&3)); // x=16
+        assert!(!results.contains(&10)); // x=51
+    }
+
+    #[test]
+    fn octree_out_of_bounds() {
+        let bounds = Aabb::new(Vec3::ZERO, Vec3::splat(10.0));
+        let mut ot = Octree::new(bounds, 4, 8);
+        ot.insert(Vec3::splat(100.0), 0);
+        assert_eq!(ot.len(), 0);
+    }
+
+    #[test]
+    fn octree_all_octants() {
+        let bounds = Aabb::new(Vec3::splat(-10.0), Vec3::splat(10.0));
+        let mut ot = Octree::new(bounds, 2, 4);
+        // Insert one point per octant
+        for octant in 0..8u32 {
+            let x = if octant & 1 != 0 { 5.0 } else { -5.0 };
+            let y = if octant & 2 != 0 { 5.0 } else { -5.0 };
+            let z = if octant & 4 != 0 { 5.0 } else { -5.0 };
+            ot.insert(Vec3::new(x, y, z), octant as usize);
+        }
+        assert_eq!(ot.len(), 8);
+        // Query the entire space
+        let all = ot.query_aabb(&bounds);
+        assert_eq!(all.len(), 8);
+    }
+
+    // --- V0.5b: Spatial hash ---
+
+    #[test]
+    fn spatial_hash_empty() {
+        let sh = SpatialHash::new(1.0);
+        assert!(sh.is_empty());
+        assert_eq!(sh.cell_count(), 0);
+    }
+
+    #[test]
+    fn spatial_hash_insert_and_query_cell() {
+        let mut sh = SpatialHash::new(10.0);
+        sh.insert(Vec3::new(5.0, 5.0, 5.0), 0);
+        sh.insert(Vec3::new(7.0, 3.0, 1.0), 1);
+        sh.insert(Vec3::new(15.0, 5.0, 5.0), 2); // Different cell
+        assert_eq!(sh.len(), 3);
+
+        let cell = sh.query_cell(Vec3::new(5.0, 5.0, 5.0));
+        assert!(cell.contains(&0));
+        assert!(cell.contains(&1));
+        assert!(!cell.contains(&2));
+    }
+
+    #[test]
+    fn spatial_hash_query_radius() {
+        let mut sh = SpatialHash::new(5.0);
+        for i in 0..20 {
+            sh.insert(Vec3::new(i as f32, 0.0, 0.0), i);
+        }
+        // Query around x=10 with radius 3 => cells [1] and [2] (covering 5..15)
+        let results = sh.query_radius(Vec3::new(10.0, 0.0, 0.0), 3.0);
+        assert!(results.contains(&10));
+        // Items in the same cell range should be candidates
+        assert!(results.contains(&11));
+    }
+
+    #[test]
+    fn spatial_hash_clear() {
+        let mut sh = SpatialHash::new(1.0);
+        sh.insert(Vec3::ZERO, 0);
+        sh.insert(Vec3::ONE, 1);
+        assert_eq!(sh.len(), 2);
+        sh.clear();
+        assert!(sh.is_empty());
+        assert_eq!(sh.cell_count(), 0);
+    }
+
+    #[test]
+    fn spatial_hash_negative_coords() {
+        let mut sh = SpatialHash::new(1.0);
+        sh.insert(Vec3::new(-5.0, -5.0, -5.0), 0);
+        let cell = sh.query_cell(Vec3::new(-5.0, -5.0, -5.0));
+        assert!(cell.contains(&0));
+    }
+
+    #[test]
+    fn rect_serde_roundtrip() {
+        let r = Rect::new(glam::Vec2::new(1.0, 2.0), glam::Vec2::new(3.0, 4.0));
+        let json = serde_json::to_string(&r).unwrap();
+        let r2: Rect = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, r2);
     }
 }

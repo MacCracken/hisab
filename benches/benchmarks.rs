@@ -403,6 +403,75 @@ fn bench_v02(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// V0.3 curves & splines
+// ---------------------------------------------------------------------------
+
+fn bench_v03(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v03");
+
+    group.bench_function("bezier_cubic_3d", |b| {
+        let p0 = Vec3::ZERO;
+        let p1 = Vec3::new(1.0, 2.0, 0.0);
+        let p2 = Vec3::new(3.0, 2.0, 1.0);
+        let p3 = Vec3::new(4.0, 0.0, 1.0);
+        b.iter(|| ganit::calc::bezier_cubic_3d(p0, p1, p2, p3, black_box(0.5)))
+    });
+
+    group.bench_function("de_casteljau_split", |b| {
+        let p0 = Vec2::ZERO;
+        let p1 = Vec2::new(1.0, 2.0);
+        let p2 = Vec2::new(3.0, 2.0);
+        let p3 = Vec2::new(4.0, 0.0);
+        b.iter(|| ganit::calc::de_casteljau_split(p0, p1, p2, p3, black_box(0.5)))
+    });
+
+    group.bench_function("catmull_rom", |b| {
+        let p0 = Vec3::new(-1.0, 0.0, 0.0);
+        let p1 = Vec3::ZERO;
+        let p2 = Vec3::new(1.0, 1.0, 0.0);
+        let p3 = Vec3::new(2.0, 1.0, 0.0);
+        b.iter(|| ganit::calc::catmull_rom(p0, p1, p2, p3, black_box(0.5)))
+    });
+
+    group.bench_function("bspline_cubic", |b| {
+        let pts = [
+            Vec3::ZERO,
+            Vec3::new(1.0, 2.0, 0.0),
+            Vec3::new(3.0, 2.0, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+        ];
+        let knots = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        b.iter(|| ganit::calc::bspline_eval(3, &pts, &knots, black_box(0.5)))
+    });
+
+    group.bench_function("gauss_legendre_5", |b| {
+        b.iter(|| ganit::calc::integral_gauss_legendre_5(|x| x * x, black_box(0.0), black_box(3.0)))
+    });
+
+    group.bench_function("gauss_legendre_10_panels", |b| {
+        b.iter(|| ganit::calc::integral_gauss_legendre(f64::sin, black_box(0.0), black_box(std::f64::consts::PI), 10))
+    });
+
+    group.bench_function("arc_length_100", |b| {
+        let p0 = Vec3::ZERO;
+        let p1 = Vec3::new(1.0, 2.0, 0.0);
+        let p2 = Vec3::new(3.0, 2.0, 1.0);
+        let p3 = Vec3::new(4.0, 0.0, 1.0);
+        b.iter(|| ganit::calc::bezier_cubic_3d_arc_length(p0, p1, p2, p3, 100))
+    });
+
+    group.bench_function("ease_in_out", |b| {
+        b.iter(|| ganit::calc::ease_in_out(black_box(0.5)))
+    });
+
+    group.bench_function("ease_in_out_smooth", |b| {
+        b.iter(|| ganit::calc::ease_in_out_smooth(black_box(0.5)))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_transforms,
@@ -411,5 +480,6 @@ criterion_group!(
     bench_num,
     bench_batch,
     bench_v02,
+    bench_v03,
 );
 criterion_main!(benches);

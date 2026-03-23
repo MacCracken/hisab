@@ -83,18 +83,19 @@ Ganit owns **typed mathematical operations** — the programmatic math that engi
 - Oriented Bounding Box (OBB)
 - Dual quaternion support
 
-## V0.3 — Curves & Splines
+## V0.3 — Curves & Splines (done, 2026-03-22)
 
-### calc
-- Cubic Bezier curves in 3D
-- B-spline evaluation (arbitrary degree)
-- Catmull-Rom splines
-- Arc-length parameterization
-- Curve subdivision (de Casteljau)
-- Numerical integration: Gauss-Legendre quadrature
-
-### transforms
-- Easing functions (ease-in, ease-out, ease-in-out for common curves)
+### calc (~25 tests)
+- `bezier_quadratic_3d()`, `bezier_cubic_3d()` — 3D Bezier evaluation
+- `de_casteljau_split()` — curve subdivision with left/right sub-curves
+- `catmull_rom()` — Catmull-Rom spline segment evaluation
+- `bspline_eval()` — arbitrary-degree B-spline via de Boor's algorithm
+- `bezier_cubic_3d_arc_length()` — approximate arc length
+- `bezier_cubic_3d_param_at_length()` — arc-length re-parameterization
+- `integral_gauss_legendre_5()`, `integral_gauss_legendre()` — 5-point Gauss-Legendre quadrature (single + composite)
+- `ease_in()`, `ease_out()`, `ease_in_out()` — quadratic easing
+- `ease_in_cubic()`, `ease_out_cubic()` — cubic easing
+- `ease_in_out_smooth()` — C2 quintic smootherstep
 
 ## V0.4 — Numerical Methods Expansion
 

@@ -57,6 +57,14 @@ impl Transform2D {
         let y = sin * self.scale.x * point.x + cos * self.scale.y * point.y + self.position.y;
         Vec3::new(x, y, 1.0)
     }
+
+    /// Compute the inverse 3x3 matrix of this transform.
+    ///
+    /// Use this to undo the transform: `t.inverse_matrix() * point3 ≈ original`.
+    #[inline]
+    pub fn inverse_matrix(&self) -> Mat3 {
+        self.to_matrix().inverse()
+    }
 }
 
 impl Default for Transform2D {
@@ -588,5 +596,42 @@ mod tests {
         assert!(approx_eq(cols[2][2], -1.0));
         assert!(approx_eq(cols[0][0], 1.0)); // X unchanged
         assert!(approx_eq(cols[1][1], 1.0)); // Y unchanged
+    }
+
+    // --- V1.0b: Transform2D::inverse_matrix ---
+
+    #[test]
+    fn transform2d_inverse_matrix_identity() {
+        let t = Transform2D::IDENTITY;
+        let inv = t.inverse_matrix();
+        let cols = inv.to_cols_array_2d();
+        assert!(approx_eq(cols[0][0], 1.0));
+        assert!(approx_eq(cols[1][1], 1.0));
+        assert!(approx_eq(cols[2][2], 1.0));
+    }
+
+    #[test]
+    fn transform2d_inverse_matrix_roundtrip() {
+        let t = Transform2D::new(Vec2::new(3.0, -7.0), 0.8, Vec2::new(2.0, 0.5));
+        let m = t.to_matrix();
+        let inv = t.inverse_matrix();
+        let product = m * inv;
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(approx_eq(product.to_cols_array_2d()[i][j], expected));
+            }
+        }
+    }
+
+    #[test]
+    fn transform2d_inverse_matrix_undo_point() {
+        let t = Transform2D::new(Vec2::new(5.0, 3.0), 1.2, Vec2::new(1.5, 2.0));
+        let original = Vec2::new(4.0, -2.0);
+        let transformed = t.apply_to_point(original);
+        let inv = t.inverse_matrix();
+        let recovered = inv * transformed;
+        assert!(approx_eq(recovered.x, original.x));
+        assert!(approx_eq(recovered.y, original.y));
     }
 }

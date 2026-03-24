@@ -81,9 +81,6 @@ The codebase has feature completeness for V1.0. This milestone focuses on safety
 
 - [ ] `Complex`: add `Div`, `Div<f64>`, `Neg`, `From<f64>`, `From<(f64, f64)>`
 - [ ] `Complex`: add `Serialize`/`Deserialize`
-- [ ] Add `Display` impl for `Ray`, `Plane`, `Aabb`, `Sphere`, `Triangle`
-- [ ] Add `Rect::merge()`, `Rect::area()` for parity with `Aabb`
-- [ ] Add `Transform2D::inverse_matrix()` (3D already has it)
 - [ ] Add `matrix_determinant()`, `matrix_trace()` helpers
 - [ ] Add `matrix_multiply()` for `Vec<Vec<f64>>` (currently only decomposition-based)
 

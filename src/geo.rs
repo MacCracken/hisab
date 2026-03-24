@@ -5,6 +5,7 @@
 
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// A ray defined by an origin and a direction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -27,6 +28,26 @@ impl Ray {
     /// Point along the ray at parameter `t`.
     pub fn at(&self, t: f32) -> Vec3 {
         self.origin + self.direction * t
+    }
+}
+
+impl fmt::Display for Ray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let p = f.precision();
+        let o = self.origin;
+        let d = self.direction;
+        match p {
+            Some(p) => write!(
+                f,
+                "Ray({:.p$}, {:.p$}, {:.p$} -> {:.p$}, {:.p$}, {:.p$})",
+                o.x, o.y, o.z, d.x, d.y, d.z
+            ),
+            None => write!(
+                f,
+                "Ray({}, {}, {} -> {}, {}, {})",
+                o.x, o.y, o.z, d.x, d.y, d.z
+            ),
+        }
     }
 }
 
@@ -53,6 +74,25 @@ impl Plane {
     /// Positive = same side as normal, negative = opposite side.
     pub fn signed_distance(&self, point: Vec3) -> f32 {
         self.normal.dot(point) - self.distance
+    }
+}
+
+impl fmt::Display for Plane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let p = f.precision();
+        let n = self.normal;
+        match p {
+            Some(p) => write!(
+                f,
+                "Plane(n=({:.p$}, {:.p$}, {:.p$}), d={:.p$})",
+                n.x, n.y, n.z, self.distance
+            ),
+            None => write!(
+                f,
+                "Plane(n=({}, {}, {}), d={})",
+                n.x, n.y, n.z, self.distance
+            ),
+        }
     }
 }
 
@@ -97,6 +137,24 @@ impl Aabb {
     }
 }
 
+impl fmt::Display for Aabb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let p = f.precision();
+        match p {
+            Some(p) => write!(
+                f,
+                "Aabb(({:.p$}, {:.p$}, {:.p$})..({:.p$}, {:.p$}, {:.p$}))",
+                self.min.x, self.min.y, self.min.z, self.max.x, self.max.y, self.max.z
+            ),
+            None => write!(
+                f,
+                "Aabb(({}, {}, {})..({}, {}, {}))",
+                self.min.x, self.min.y, self.min.z, self.max.x, self.max.y, self.max.z
+            ),
+        }
+    }
+}
+
 /// A sphere defined by a center and radius.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Sphere {
@@ -113,6 +171,21 @@ impl Sphere {
     #[inline]
     pub fn contains_point(&self, point: Vec3) -> bool {
         (point - self.center).length_squared() <= self.radius * self.radius
+    }
+}
+
+impl fmt::Display for Sphere {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let p = f.precision();
+        let c = self.center;
+        match p {
+            Some(p) => write!(
+                f,
+                "Sphere(({:.p$}, {:.p$}, {:.p$}), r={:.p$})",
+                c.x, c.y, c.z, self.radius
+            ),
+            None => write!(f, "Sphere(({}, {}, {}), r={})", c.x, c.y, c.z, self.radius),
+        }
     }
 }
 
@@ -244,6 +317,25 @@ impl Triangle {
     #[inline]
     pub fn centroid(&self) -> Vec3 {
         (self.vertices[0] + self.vertices[1] + self.vertices[2]) / 3.0
+    }
+}
+
+impl fmt::Display for Triangle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let p = f.precision();
+        let [a, b, c] = self.vertices;
+        match p {
+            Some(p) => write!(
+                f,
+                "Triangle(({:.p$}, {:.p$}, {:.p$}), ({:.p$}, {:.p$}, {:.p$}), ({:.p$}, {:.p$}, {:.p$}))",
+                a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z
+            ),
+            None => write!(
+                f,
+                "Triangle(({}, {}, {}), ({}, {}, {}), ({}, {}, {}))",
+                a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z
+            ),
+        }
     }
 }
 
@@ -918,6 +1010,22 @@ impl Rect {
     #[inline]
     pub fn size(&self) -> glam::Vec2 {
         self.max - self.min
+    }
+
+    /// Merge two rectangles into one that encloses both.
+    #[inline]
+    pub fn merge(&self, other: &Rect) -> Rect {
+        Rect {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
+    }
+
+    /// Area of the rectangle.
+    #[inline]
+    pub fn area(&self) -> f32 {
+        let s = self.size();
+        s.x * s.y
     }
 }
 
@@ -3254,5 +3362,87 @@ mod tests {
         let b = make_square(0.5, 0.5, 1.0);
         assert!(gjk_epa(&a, &b).is_some());
         assert!(gjk_epa(&b, &a).is_some());
+    }
+
+    // --- V1.0b: Display impls ---
+
+    #[test]
+    fn ray_display() {
+        let r = Ray::new(Vec3::new(1.0, 0.0, 0.0), Vec3::X);
+        assert_eq!(r.to_string(), "Ray(1, 0, 0 -> 1, 0, 0)");
+    }
+
+    #[test]
+    fn ray_display_precision() {
+        let r = Ray::new(Vec3::new(1.0, 2.0, 3.0), Vec3::X);
+        assert_eq!(format!("{r:.1}"), "Ray(1.0, 2.0, 3.0 -> 1.0, 0.0, 0.0)");
+    }
+
+    #[test]
+    fn plane_display() {
+        let p = Plane::from_point_normal(Vec3::ZERO, Vec3::Y);
+        assert_eq!(p.to_string(), "Plane(n=(0, 1, 0), d=0)");
+    }
+
+    #[test]
+    fn plane_display_precision() {
+        let p = Plane::from_point_normal(Vec3::ZERO, Vec3::Y);
+        assert_eq!(format!("{p:.2}"), "Plane(n=(0.00, 1.00, 0.00), d=0.00)");
+    }
+
+    #[test]
+    fn aabb_display() {
+        let a = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        assert_eq!(a.to_string(), "Aabb((0, 0, 0)..(1, 1, 1))");
+    }
+
+    #[test]
+    fn sphere_display() {
+        let sp = Sphere::new(Vec3::new(1.0, 2.0, 3.0), 5.0);
+        assert_eq!(sp.to_string(), "Sphere((1, 2, 3), r=5)");
+    }
+
+    #[test]
+    fn sphere_display_precision() {
+        let sp = Sphere::new(Vec3::ZERO, 2.5);
+        assert_eq!(format!("{sp:.1}"), "Sphere((0.0, 0.0, 0.0), r=2.5)");
+    }
+
+    #[test]
+    fn triangle_display() {
+        let t = Triangle::new(Vec3::ZERO, Vec3::X, Vec3::Y);
+        assert_eq!(t.to_string(), "Triangle((0, 0, 0), (1, 0, 0), (0, 1, 0))");
+    }
+
+    // --- V1.0b: Rect::merge / Rect::area ---
+
+    #[test]
+    fn rect_merge() {
+        let a = Rect::new(glam::Vec2::ZERO, glam::Vec2::ONE);
+        let b = Rect::new(glam::Vec2::new(2.0, 2.0), glam::Vec2::new(3.0, 3.0));
+        let m = a.merge(&b);
+        assert_eq!(m.min, glam::Vec2::ZERO);
+        assert_eq!(m.max, glam::Vec2::new(3.0, 3.0));
+    }
+
+    #[test]
+    fn rect_merge_overlapping() {
+        let a = Rect::new(glam::Vec2::ZERO, glam::Vec2::new(2.0, 2.0));
+        let b = Rect::new(glam::Vec2::ONE, glam::Vec2::new(3.0, 3.0));
+        let m = a.merge(&b);
+        assert_eq!(m.min, glam::Vec2::ZERO);
+        assert_eq!(m.max, glam::Vec2::new(3.0, 3.0));
+    }
+
+    #[test]
+    fn rect_area() {
+        let r = Rect::new(glam::Vec2::ZERO, glam::Vec2::new(3.0, 4.0));
+        assert!((r.area() - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rect_area_zero() {
+        let r = Rect::new(glam::Vec2::ZERO, glam::Vec2::new(5.0, 0.0));
+        assert!((r.area()).abs() < 1e-6);
     }
 }

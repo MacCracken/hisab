@@ -11,6 +11,16 @@
 - 12 tests: roundtrips, known values, single-element, empty-input errors, large-N
 - 4 benchmarks: `dst_64`, `dct_64`, `dst_idst_256`, `dct_idct_256`
 
+### geo — Display impls
+- `Display` for `Ray`, `Plane`, `Aabb`, `Sphere`, `Triangle`
+
+### geo — Rect parity
+- `Rect::merge()` — merge two rectangles into enclosing rect
+- `Rect::area()` — rectangle area
+
+### transforms
+- `Transform2D::inverse_matrix()` — inverse 3x3 matrix (parity with Transform3D)
+
 ## 0.22.3 (2026-03-23)
 
 Initial release — 360 tests, 82 benchmarks.

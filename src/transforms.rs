@@ -29,6 +29,7 @@ impl Transform2D {
     };
 
     /// Create a new 2D transform.
+    #[must_use]
     pub fn new(position: Vec2, rotation: f32, scale: Vec2) -> Self {
         Self {
             position,
@@ -38,6 +39,7 @@ impl Transform2D {
     }
 
     /// Convert to a 3x3 affine matrix (scale * rotate * translate).
+    #[must_use]
     #[inline]
     pub fn to_matrix(&self) -> Mat3 {
         let (sin, cos) = self.rotation.sin_cos();
@@ -50,6 +52,7 @@ impl Transform2D {
     }
 
     /// Apply this transform to a 2D point.
+    #[must_use]
     #[inline]
     pub fn apply_to_point(&self, point: Vec2) -> Vec3 {
         let (sin, cos) = self.rotation.sin_cos();
@@ -61,6 +64,7 @@ impl Transform2D {
     /// Compute the inverse 3x3 matrix of this transform.
     ///
     /// Use this to undo the transform: `t.inverse_matrix() * point3 ≈ original`.
+    #[must_use]
     #[inline]
     pub fn inverse_matrix(&self) -> Mat3 {
         self.to_matrix().inverse()
@@ -90,6 +94,7 @@ impl Transform3D {
     };
 
     /// Create a new 3D transform.
+    #[must_use]
     pub fn new(position: Vec3, rotation: Quat, scale: Vec3) -> Self {
         Self {
             position,
@@ -99,12 +104,14 @@ impl Transform3D {
     }
 
     /// Convert to a 4x4 affine matrix (scale * rotate * translate).
+    #[must_use]
     #[inline]
     pub fn to_matrix(&self) -> Mat4 {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.position)
     }
 
     /// Apply this transform to a 3D point.
+    #[must_use]
     #[inline]
     pub fn apply_to_point(&self, point: Vec3) -> Vec3 {
         self.rotation * (self.scale * point) + self.position
@@ -115,6 +122,7 @@ impl Transform3D {
     /// Use this to undo the transform: `t.inverse_matrix() * point4 ≈ original`.
     /// For non-uniform scale with rotation, the SRT decomposition doesn't
     /// round-trip cleanly, so we provide the inverse as a matrix directly.
+    #[must_use]
     #[inline]
     pub fn inverse_matrix(&self) -> Mat4 {
         self.to_matrix().inverse()
@@ -128,6 +136,7 @@ impl Default for Transform3D {
 }
 
 /// Spherical linear interpolation between two quaternions.
+#[must_use]
 #[inline]
 pub fn slerp(a: Quat, b: Quat, t: f32) -> Quat {
     a.slerp(b, t)
@@ -136,6 +145,7 @@ pub fn slerp(a: Quat, b: Quat, t: f32) -> Quat {
 /// Interpolate between two 3D transforms.
 ///
 /// Position and scale are linearly interpolated; rotation uses slerp.
+#[must_use]
 #[inline]
 pub fn transform3d_lerp(a: &Transform3D, b: &Transform3D, t: f32) -> Transform3D {
     Transform3D {
@@ -148,6 +158,7 @@ pub fn transform3d_lerp(a: &Transform3D, b: &Transform3D, t: f32) -> Transform3D
 /// Flip the handedness of a matrix by negating the Z column.
 ///
 /// Converts between left-handed and right-handed coordinate systems.
+#[must_use]
 #[inline]
 pub fn flip_handedness_z(mat: Mat4) -> Mat4 {
     let cols = mat.to_cols_array_2d();
@@ -160,6 +171,8 @@ pub fn flip_handedness_z(mat: Mat4) -> Mat4 {
 }
 
 /// Create an orthographic projection matrix (OpenGL convention, right-handed).
+#[must_use]
+#[inline]
 pub fn projection_orthographic(
     left: f32,
     right: f32,
@@ -176,17 +189,21 @@ pub fn projection_orthographic(
 /// `fov_y_radians`: vertical field of view in radians.
 /// `aspect`: width / height.
 /// `near`, `far`: near and far clipping planes (must be positive).
+#[must_use]
+#[inline]
 pub fn projection_perspective(fov_y_radians: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     Mat4::perspective_rh_gl(fov_y_radians, aspect, near, far)
 }
 
 /// Linearly interpolate between two f32 values.
+#[must_use]
 #[inline]
 pub fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
 /// Linearly interpolate between two Vec3 values.
+#[must_use]
 #[inline]
 pub fn lerp_vec3(a: Vec3, b: Vec3, t: f32) -> Vec3 {
     a + (b - a) * t

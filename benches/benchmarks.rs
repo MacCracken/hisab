@@ -564,7 +564,7 @@ fn bench_v04b(c: &mut Criterion) {
             .collect();
         b.iter(|| {
             let mut d = data.clone();
-            hisab::num::fft(black_box(&mut d));
+            hisab::num::fft(black_box(&mut d)).unwrap();
             d
         })
     });
@@ -575,7 +575,7 @@ fn bench_v04b(c: &mut Criterion) {
             .collect();
         b.iter(|| {
             let mut d = data.clone();
-            hisab::num::fft(black_box(&mut d));
+            hisab::num::fft(black_box(&mut d)).unwrap();
             d
         })
     });
@@ -586,8 +586,8 @@ fn bench_v04b(c: &mut Criterion) {
             .collect();
         b.iter(|| {
             let mut d = data.clone();
-            hisab::num::fft(&mut d);
-            hisab::num::ifft(&mut d);
+            hisab::num::fft(&mut d).unwrap();
+            hisab::num::ifft(&mut d).unwrap();
             d
         })
     });
@@ -812,7 +812,7 @@ fn bench_v05b(c: &mut Criterion) {
 
     group.bench_function("spatial_hash_insert_1000", |b| {
         b.iter(|| {
-            let mut sh = hisab::SpatialHash::new(10.0);
+            let mut sh = hisab::SpatialHash::new(10.0).unwrap();
             for i in 0..1000 {
                 sh.insert(Vec3::new(i as f32, 0.0, 0.0), i);
             }
@@ -821,7 +821,7 @@ fn bench_v05b(c: &mut Criterion) {
     });
 
     group.bench_function("spatial_hash_query_cell", |b| {
-        let mut sh = hisab::SpatialHash::new(10.0);
+        let mut sh = hisab::SpatialHash::new(10.0).unwrap();
         for i in 0..1000 {
             sh.insert(Vec3::new(i as f32, 0.0, 0.0), i);
         }
@@ -854,13 +854,15 @@ fn bench_v05c(c: &mut Criterion) {
             glam::Vec2::new(1.0, -1.0),
             glam::Vec2::new(1.0, 1.0),
             glam::Vec2::new(-1.0, 1.0),
-        ]);
+        ])
+        .unwrap();
         let bb = hisab::ConvexPolygon::new(vec![
             glam::Vec2::new(0.5, -1.0),
             glam::Vec2::new(2.5, -1.0),
             glam::Vec2::new(2.5, 1.0),
             glam::Vec2::new(0.5, 1.0),
-        ]);
+        ])
+        .unwrap();
         b.iter(|| hisab::geo::gjk_intersect(black_box(&a), black_box(&bb)))
     });
 
@@ -870,13 +872,15 @@ fn bench_v05c(c: &mut Criterion) {
             glam::Vec2::new(1.0, -1.0),
             glam::Vec2::new(1.0, 1.0),
             glam::Vec2::new(-1.0, 1.0),
-        ]);
+        ])
+        .unwrap();
         let bb = hisab::ConvexPolygon::new(vec![
             glam::Vec2::new(5.0, -1.0),
             glam::Vec2::new(7.0, -1.0),
             glam::Vec2::new(7.0, 1.0),
             glam::Vec2::new(5.0, 1.0),
-        ]);
+        ])
+        .unwrap();
         b.iter(|| hisab::geo::gjk_intersect(black_box(&a), black_box(&bb)))
     });
 
@@ -886,13 +890,15 @@ fn bench_v05c(c: &mut Criterion) {
             glam::Vec2::new(1.0, -1.0),
             glam::Vec2::new(1.0, 1.0),
             glam::Vec2::new(-1.0, 1.0),
-        ]);
+        ])
+        .unwrap();
         let bb = hisab::ConvexPolygon::new(vec![
             glam::Vec2::new(0.5, -1.0),
             glam::Vec2::new(2.5, -1.0),
             glam::Vec2::new(2.5, 1.0),
             glam::Vec2::new(0.5, 1.0),
-        ]);
+        ])
+        .unwrap();
         b.iter(|| hisab::geo::gjk_epa(black_box(&a), black_box(&bb)))
     });
 

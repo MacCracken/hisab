@@ -17,6 +17,7 @@ pub struct Ray {
 
 impl Ray {
     /// Create a new ray. Direction is normalized automatically.
+    #[must_use]
     #[inline]
     pub fn new(origin: Vec3, direction: Vec3) -> Self {
         Self {
@@ -26,6 +27,8 @@ impl Ray {
     }
 
     /// Point along the ray at parameter `t`.
+    #[must_use]
+    #[inline]
     pub fn at(&self, t: f32) -> Vec3 {
         self.origin + self.direction * t
     }
@@ -62,6 +65,8 @@ pub struct Plane {
 
 impl Plane {
     /// Create a plane from a point on the plane and a normal.
+    #[must_use]
+    #[inline]
     pub fn from_point_normal(point: Vec3, normal: Vec3) -> Self {
         let n = normal.normalize();
         Self {
@@ -72,6 +77,8 @@ impl Plane {
 
     /// Signed distance from a point to the plane.
     /// Positive = same side as normal, negative = opposite side.
+    #[must_use]
+    #[inline]
     pub fn signed_distance(&self, point: Vec3) -> f32 {
         self.normal.dot(point) - self.distance
     }
@@ -105,6 +112,8 @@ pub struct Aabb {
 
 impl Aabb {
     /// Create a new AABB. Min/max are corrected if swapped.
+    #[must_use]
+    #[inline]
     pub fn new(a: Vec3, b: Vec3) -> Self {
         Self {
             min: a.min(b),
@@ -113,22 +122,29 @@ impl Aabb {
     }
 
     /// Check whether a point is inside (or on the boundary of) this AABB.
+    #[must_use]
     #[inline]
     pub fn contains(&self, point: Vec3) -> bool {
         point.cmpge(self.min).all() && point.cmple(self.max).all()
     }
 
     /// Center point of the AABB.
+    #[must_use]
+    #[inline]
     pub fn center(&self) -> Vec3 {
         (self.min + self.max) * 0.5
     }
 
     /// Size (extents) of the AABB.
+    #[must_use]
+    #[inline]
     pub fn size(&self) -> Vec3 {
         self.max - self.min
     }
 
     /// Merge two AABBs into one that encloses both.
+    #[must_use]
+    #[inline]
     pub fn merge(&self, other: &Aabb) -> Aabb {
         Aabb {
             min: self.min.min(other.min),
@@ -163,11 +179,14 @@ pub struct Sphere {
 }
 
 impl Sphere {
+    #[must_use]
+    #[inline]
     pub fn new(center: Vec3, radius: f32) -> Self {
         Self { center, radius }
     }
 
     /// Check whether a point is inside (or on the surface of) this sphere.
+    #[must_use]
     #[inline]
     pub fn contains_point(&self, point: Vec3) -> bool {
         (point - self.center).length_squared() <= self.radius * self.radius
@@ -191,6 +210,7 @@ impl fmt::Display for Sphere {
 
 /// Ray-plane intersection. Returns the `t` parameter if the ray hits the plane
 /// (only `t >= 0`, i.e. forward hits).
+#[must_use]
 #[inline]
 pub fn ray_plane(ray: &Ray, plane: &Plane) -> Option<f32> {
     let denom = plane.normal.dot(ray.direction);
@@ -206,6 +226,7 @@ pub fn ray_plane(ray: &Ray, plane: &Plane) -> Option<f32> {
 ///
 /// Assumes `ray.direction` is normalized (guaranteed by `Ray::new`),
 /// so the quadratic coefficient `a = 1` and is eliminated.
+#[must_use]
 #[inline]
 pub fn ray_sphere(ray: &Ray, sphere: &Sphere) -> Option<f32> {
     let oc = ray.origin - sphere.center;
@@ -234,6 +255,7 @@ pub fn ray_sphere(ray: &Ray, sphere: &Sphere) -> Option<f32> {
 
 /// Ray-AABB intersection using the slab method.
 /// Returns the nearest `t >= 0` if the ray hits the AABB.
+#[must_use]
 #[inline]
 pub fn ray_aabb(ray: &Ray, aabb: &Aabb) -> Option<f32> {
     let origin = ray.origin.to_array();
@@ -284,6 +306,8 @@ pub struct Triangle {
 }
 
 impl Triangle {
+    #[must_use]
+    #[inline]
     pub fn new(a: Vec3, b: Vec3, c: Vec3) -> Self {
         Self {
             vertices: [a, b, c],
@@ -294,6 +318,7 @@ impl Triangle {
     ///
     /// The magnitude equals twice the triangle's area. Use [`unit_normal`](Self::unit_normal)
     /// for a normalized version.
+    #[must_use]
     #[inline]
     pub fn normal(&self) -> Vec3 {
         let edge1 = self.vertices[1] - self.vertices[0];
@@ -302,18 +327,21 @@ impl Triangle {
     }
 
     /// Normalized face normal.
+    #[must_use]
     #[inline]
     pub fn unit_normal(&self) -> Vec3 {
         self.normal().normalize()
     }
 
     /// Area of the triangle.
+    #[must_use]
     #[inline]
     pub fn area(&self) -> f32 {
         self.normal().length() * 0.5
     }
 
     /// Centroid (average of the three vertices).
+    #[must_use]
     #[inline]
     pub fn centroid(&self) -> Vec3 {
         (self.vertices[0] + self.vertices[1] + self.vertices[2]) / 3.0
@@ -349,6 +377,8 @@ pub struct Line {
 
 impl Line {
     /// Create a new line. Direction is normalized automatically.
+    #[must_use]
+    #[inline]
     pub fn new(origin: Vec3, direction: Vec3) -> Self {
         Self {
             origin,
@@ -357,6 +387,7 @@ impl Line {
     }
 
     /// Closest point on this infinite line to the given point.
+    #[must_use]
     #[inline]
     pub fn closest_point(&self, point: Vec3) -> Vec3 {
         let v = point - self.origin;
@@ -365,6 +396,7 @@ impl Line {
     }
 
     /// Distance from a point to this line.
+    #[must_use]
     #[inline]
     pub fn distance_to_point(&self, point: Vec3) -> f32 {
         (point - self.closest_point(point)).length()
@@ -379,29 +411,35 @@ pub struct Segment {
 }
 
 impl Segment {
+    #[must_use]
+    #[inline]
     pub fn new(start: Vec3, end: Vec3) -> Self {
         Self { start, end }
     }
 
     /// Length of the segment.
+    #[must_use]
     #[inline]
     pub fn length(&self) -> f32 {
         (self.end - self.start).length()
     }
 
     /// Midpoint of the segment.
+    #[must_use]
     #[inline]
     pub fn midpoint(&self) -> Vec3 {
         (self.start + self.end) * 0.5
     }
 
     /// Normalized direction from start to end.
+    #[must_use]
     #[inline]
     pub fn direction(&self) -> Vec3 {
         (self.end - self.start).normalize()
     }
 
     /// Closest point on this segment to the given point.
+    #[must_use]
     #[inline]
     pub fn closest_point(&self, point: Vec3) -> Vec3 {
         let ab = self.end - self.start;
@@ -414,6 +452,7 @@ impl Segment {
     }
 
     /// Distance from a point to this segment.
+    #[must_use]
     #[inline]
     pub fn distance_to_point(&self, point: Vec3) -> f32 {
         (point - self.closest_point(point)).length()
@@ -433,6 +472,7 @@ impl Frustum {
     /// Extract frustum planes from a view-projection matrix.
     ///
     /// Uses the Gribb/Hartmann method. Planes are normalized.
+    #[must_use]
     pub fn from_view_projection(vp: glam::Mat4) -> Self {
         let r = vp.to_cols_array_2d();
         // Row-based extraction (transposed column-major)
@@ -469,6 +509,7 @@ impl Frustum {
     }
 
     /// Check whether a point is inside the frustum.
+    #[must_use]
     #[inline]
     pub fn contains_point(&self, point: Vec3) -> bool {
         self.planes.iter().all(|p| p.signed_distance(point) >= 0.0)
@@ -477,6 +518,7 @@ impl Frustum {
     /// Conservative check whether an AABB intersects the frustum.
     ///
     /// Returns `false` only if the AABB is fully outside at least one plane.
+    #[must_use]
     #[inline]
     pub fn contains_aabb(&self, aabb: &Aabb) -> bool {
         for plane in &self.planes {
@@ -513,6 +555,7 @@ impl Frustum {
 /// Ray-triangle intersection using the Möller–Trumbore algorithm.
 ///
 /// Returns the `t` parameter if the ray hits the triangle (only `t >= 0`).
+#[must_use]
 #[inline]
 pub fn ray_triangle(ray: &Ray, tri: &Triangle) -> Option<f32> {
     let edge1 = tri.vertices[1] - tri.vertices[0];
@@ -544,12 +587,14 @@ pub fn ray_triangle(ray: &Ray, tri: &Triangle) -> Option<f32> {
 }
 
 /// Check whether two AABBs overlap.
+#[must_use]
 #[inline]
 pub fn aabb_aabb(a: &Aabb, b: &Aabb) -> bool {
     a.min.cmple(b.max).all() && b.min.cmple(a.max).all()
 }
 
 /// Check whether two spheres overlap.
+#[must_use]
 #[inline]
 pub fn sphere_sphere(a: &Sphere, b: &Sphere) -> bool {
     let r = a.radius + b.radius;
@@ -557,6 +602,7 @@ pub fn sphere_sphere(a: &Sphere, b: &Sphere) -> bool {
 }
 
 /// Intersection of two planes. Returns the line of intersection, or `None` if parallel.
+#[must_use]
 pub fn plane_plane(a: &Plane, b: &Plane) -> Option<Line> {
     let dir = a.normal.cross(b.normal);
     let len_sq = dir.dot(dir);
@@ -576,6 +622,7 @@ pub fn plane_plane(a: &Plane, b: &Plane) -> Option<Line> {
 // ---------------------------------------------------------------------------
 
 /// Closest point on a ray to a given point (clamped to `t >= 0`).
+#[must_use]
 #[inline]
 pub fn closest_point_on_ray(ray: &Ray, point: Vec3) -> Vec3 {
     let t = (point - ray.origin).dot(ray.direction).max(0.0);
@@ -583,6 +630,7 @@ pub fn closest_point_on_ray(ray: &Ray, point: Vec3) -> Vec3 {
 }
 
 /// Closest point on a plane to a given point.
+#[must_use]
 #[inline]
 pub fn closest_point_on_plane(plane: &Plane, point: Vec3) -> Vec3 {
     point - plane.normal * plane.signed_distance(point)
@@ -591,6 +639,7 @@ pub fn closest_point_on_plane(plane: &Plane, point: Vec3) -> Vec3 {
 /// Closest point on a sphere's surface to a given point.
 ///
 /// If the point is at the sphere's center, returns the point offset by the radius along +X.
+#[must_use]
 #[inline]
 pub fn closest_point_on_sphere(sphere: &Sphere, point: Vec3) -> Vec3 {
     let dir = point - sphere.center;
@@ -602,6 +651,7 @@ pub fn closest_point_on_sphere(sphere: &Sphere, point: Vec3) -> Vec3 {
 }
 
 /// Closest point on an AABB's surface or interior to a given point.
+#[must_use]
 #[inline]
 pub fn closest_point_on_aabb(aabb: &Aabb, point: Vec3) -> Vec3 {
     point.clamp(aabb.min, aabb.max)
@@ -713,11 +763,13 @@ impl Bvh {
     }
 
     /// Number of primitives in the BVH.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the BVH is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -726,6 +778,7 @@ impl Bvh {
     ///
     /// Returns indices in no particular order. Use the indices to test
     /// against the actual primitives for exact intersection.
+    #[must_use]
     pub fn query_ray(&self, ray: &Ray) -> Vec<usize> {
         let mut results = Vec::new();
         if let Some(ref root) = self.root {
@@ -755,6 +808,7 @@ impl Bvh {
     }
 
     /// Query all primitive indices whose AABBs overlap the given AABB.
+    #[must_use]
     pub fn query_aabb(&self, query: &Aabb) -> Vec<usize> {
         let mut results = Vec::new();
         if let Some(ref root) = self.root {
@@ -856,11 +910,13 @@ impl KdTree {
     }
 
     /// Number of points in the tree.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the tree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -869,6 +925,7 @@ impl KdTree {
     ///
     /// Returns `(index, distance_squared)` of the closest point,
     /// or `None` if the tree is empty.
+    #[must_use]
     pub fn nearest(&self, query: Vec3) -> Option<(usize, f32)> {
         let mut best_idx = 0;
         let mut best_dist_sq = f32::INFINITY;
@@ -920,6 +977,7 @@ impl KdTree {
     /// Find all points within `radius` of `query`.
     ///
     /// Returns a list of `(index, distance_squared)`.
+    #[must_use]
     pub fn within_radius(&self, query: Vec3, radius: f32) -> Vec<(usize, f32)> {
         let mut results = Vec::new();
         let radius_sq = radius * radius;
@@ -980,6 +1038,7 @@ pub struct Rect {
 
 impl Rect {
     /// Create a new rectangle. Min/max are corrected if swapped.
+    #[must_use]
     #[inline]
     pub fn new(a: glam::Vec2, b: glam::Vec2) -> Self {
         Self {
@@ -989,30 +1048,35 @@ impl Rect {
     }
 
     /// Check whether a 2D point is inside this rectangle.
+    #[must_use]
     #[inline]
     pub fn contains_point(&self, p: glam::Vec2) -> bool {
         p.cmpge(self.min).all() && p.cmple(self.max).all()
     }
 
     /// Check whether two rectangles overlap.
+    #[must_use]
     #[inline]
     pub fn overlaps(&self, other: &Rect) -> bool {
         self.min.cmple(other.max).all() && other.min.cmple(self.max).all()
     }
 
     /// Center of the rectangle.
+    #[must_use]
     #[inline]
     pub fn center(&self) -> glam::Vec2 {
         (self.min + self.max) * 0.5
     }
 
     /// Size (extents) of the rectangle.
+    #[must_use]
     #[inline]
     pub fn size(&self) -> glam::Vec2 {
         self.max - self.min
     }
 
     /// Merge two rectangles into one that encloses both.
+    #[must_use]
     #[inline]
     pub fn merge(&self, other: &Rect) -> Rect {
         Rect {
@@ -1022,6 +1086,7 @@ impl Rect {
     }
 
     /// Area of the rectangle.
+    #[must_use]
     #[inline]
     pub fn area(&self) -> f32 {
         let s = self.size();
@@ -1058,6 +1123,7 @@ impl Quadtree {
     ///
     /// `max_per_leaf`: max items before a leaf splits (default 8).
     /// `max_depth`: max subdivision depth (default 8).
+    #[must_use]
     pub fn new(bounds: Rect, max_per_leaf: usize, max_depth: usize) -> Self {
         Self {
             root: QuadNode::Empty,
@@ -1069,11 +1135,13 @@ impl Quadtree {
     }
 
     /// Number of items in the quadtree.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the quadtree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -1181,6 +1249,7 @@ impl Quadtree {
     }
 
     /// Query all indices of points within the given rectangle.
+    #[must_use]
     pub fn query_rect(&self, query: &Rect) -> Vec<usize> {
         let mut results = Vec::new();
         Self::query_recursive(&self.root, &self.bounds, query, &mut results);
@@ -1242,6 +1311,7 @@ pub struct Octree {
 
 impl Octree {
     /// Create a new empty octree covering the given bounds.
+    #[must_use]
     pub fn new(bounds: Aabb, max_per_leaf: usize, max_depth: usize) -> Self {
         Self {
             root: OctNode::Empty,
@@ -1253,11 +1323,13 @@ impl Octree {
     }
 
     /// Number of items in the octree.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the octree is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -1392,6 +1464,7 @@ impl Octree {
     }
 
     /// Query all indices of points within the given AABB.
+    #[must_use]
     pub fn query_aabb(&self, query: &Aabb) -> Vec<usize> {
         let mut results = Vec::new();
         Self::query_recursive(&self.root, &self.bounds, query, &mut results);
@@ -1442,26 +1515,37 @@ pub struct SpatialHash {
 
 impl SpatialHash {
     /// Create a new spatial hash grid with the given cell size.
-    pub fn new(cell_size: f32) -> Self {
-        assert!(cell_size > 0.0, "cell_size must be positive");
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::HisabError::InvalidInput`] if `cell_size` is not positive.
+    pub fn new(cell_size: f32) -> Result<Self, crate::HisabError> {
+        if cell_size <= 0.0 {
+            return Err(crate::HisabError::InvalidInput(
+                "cell_size must be positive".into(),
+            ));
+        }
+        Ok(Self {
             inv_cell_size: 1.0 / cell_size,
             cells: std::collections::HashMap::new(),
             len: 0,
-        }
+        })
     }
 
     /// Number of items inserted.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the grid is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Number of occupied cells.
+    #[must_use]
     pub fn cell_count(&self) -> usize {
         self.cells.len()
     }
@@ -1488,6 +1572,7 @@ impl SpatialHash {
     }
 
     /// Query all indices in the same cell as the given point.
+    #[must_use]
     pub fn query_cell(&self, point: Vec3) -> &[usize] {
         let key = self.cell_key(point);
         self.cells.get(&key).map_or(&[], |v| v.as_slice())
@@ -1498,6 +1583,7 @@ impl SpatialHash {
     /// Checks all cells that could contain points within `radius`.
     /// Returns candidate indices — the caller should perform exact distance
     /// checks. Cost is O((2*ceil(r/cell_size)+1)^3) in cell lookups.
+    #[must_use]
     pub fn query_radius(&self, point: Vec3, radius: f32) -> Vec<usize> {
         let mut results = Vec::new();
         let cells_r = (radius * self.inv_cell_size).ceil() as i32;
@@ -1528,6 +1614,7 @@ impl SpatialHash {
 ///
 /// For fewer than 2 points, returns the input as-is. For collinear points,
 /// returns only the two endpoints.
+#[must_use]
 pub fn convex_hull_2d(points: &[glam::Vec2]) -> Vec<glam::Vec2> {
     let mut pts: Vec<glam::Vec2> = points.to_vec();
     let n = pts.len();
@@ -1595,8 +1682,17 @@ pub struct ConvexPolygon {
 impl ConvexPolygon {
     /// Create a convex polygon. Vertices should be in CCW order.
     /// Use [`convex_hull_2d`] to ensure convexity.
-    pub fn new(vertices: Vec<glam::Vec2>) -> Self {
-        Self { vertices }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::HisabError::InvalidInput`] if `vertices` is empty.
+    pub fn new(vertices: Vec<glam::Vec2>) -> Result<Self, crate::HisabError> {
+        if vertices.is_empty() {
+            return Err(crate::HisabError::InvalidInput(
+                "convex polygon requires at least one vertex".into(),
+            ));
+        }
+        Ok(Self { vertices })
     }
 }
 
@@ -1639,6 +1735,7 @@ fn triple_cross_2d(a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> glam::Vec2 {
 /// GJK collision test between two convex shapes (2D).
 ///
 /// Returns `true` if the shapes overlap. Uses the simplex-based GJK algorithm.
+#[must_use]
 pub fn gjk_intersect(a: &dyn ConvexSupport, b: &dyn ConvexSupport) -> bool {
     // Initial direction: from center of A to center of B (approximated)
     let mut direction = glam::Vec2::new(1.0, 0.0);
@@ -1722,6 +1819,7 @@ pub struct Penetration {
 /// should be the final 3-point simplex from GJK that contains the origin.
 ///
 /// Returns `None` if the shapes are not actually overlapping or if EPA fails.
+#[must_use]
 pub fn epa_penetration(
     a: &dyn ConvexSupport,
     b: &dyn ConvexSupport,
@@ -1792,6 +1890,7 @@ pub fn epa_penetration(
 ///
 /// Returns `None` if shapes don't overlap, or `Some(Penetration)` with
 /// the separation normal and depth.
+#[must_use]
 pub fn gjk_epa(a: &dyn ConvexSupport, b: &dyn ConvexSupport) -> Option<Penetration> {
     let mut direction = glam::Vec2::new(1.0, 0.0);
     let mut simplex: Vec<glam::Vec2> = Vec::with_capacity(3);
@@ -3029,14 +3128,14 @@ mod tests {
 
     #[test]
     fn spatial_hash_empty() {
-        let sh = SpatialHash::new(1.0);
+        let sh = SpatialHash::new(1.0).unwrap();
         assert!(sh.is_empty());
         assert_eq!(sh.cell_count(), 0);
     }
 
     #[test]
     fn spatial_hash_insert_and_query_cell() {
-        let mut sh = SpatialHash::new(10.0);
+        let mut sh = SpatialHash::new(10.0).unwrap();
         sh.insert(Vec3::new(5.0, 5.0, 5.0), 0);
         sh.insert(Vec3::new(7.0, 3.0, 1.0), 1);
         sh.insert(Vec3::new(15.0, 5.0, 5.0), 2); // Different cell
@@ -3050,7 +3149,7 @@ mod tests {
 
     #[test]
     fn spatial_hash_query_radius() {
-        let mut sh = SpatialHash::new(5.0);
+        let mut sh = SpatialHash::new(5.0).unwrap();
         for i in 0..20 {
             sh.insert(Vec3::new(i as f32, 0.0, 0.0), i);
         }
@@ -3063,7 +3162,7 @@ mod tests {
 
     #[test]
     fn spatial_hash_clear() {
-        let mut sh = SpatialHash::new(1.0);
+        let mut sh = SpatialHash::new(1.0).unwrap();
         sh.insert(Vec3::ZERO, 0);
         sh.insert(Vec3::ONE, 1);
         assert_eq!(sh.len(), 2);
@@ -3074,7 +3173,7 @@ mod tests {
 
     #[test]
     fn spatial_hash_negative_coords() {
-        let mut sh = SpatialHash::new(1.0);
+        let mut sh = SpatialHash::new(1.0).unwrap();
         sh.insert(Vec3::new(-5.0, -5.0, -5.0), 0);
         let cell = sh.query_cell(Vec3::new(-5.0, -5.0, -5.0));
         assert!(cell.contains(&0));
@@ -3123,7 +3222,7 @@ mod tests {
 
     #[test]
     fn spatial_hash_many_in_one_cell() {
-        let mut sh = SpatialHash::new(100.0); // Huge cell
+        let mut sh = SpatialHash::new(100.0).unwrap(); // Huge cell
         for i in 0..50 {
             sh.insert(Vec3::new(i as f32, 0.0, 0.0), i); // All in one cell
         }
@@ -3229,6 +3328,7 @@ mod tests {
             glam::Vec2::new(cx + half, cy + half),
             glam::Vec2::new(cx - half, cy + half),
         ])
+        .unwrap()
     }
 
     #[test]
@@ -3335,12 +3435,14 @@ mod tests {
             glam::Vec2::new(0.0, 0.0),
             glam::Vec2::new(2.0, 0.0),
             glam::Vec2::new(1.0, 2.0),
-        ]);
+        ])
+        .unwrap();
         let b = ConvexPolygon::new(vec![
             glam::Vec2::new(1.0, 0.0),
             glam::Vec2::new(3.0, 0.0),
             glam::Vec2::new(2.0, 2.0),
-        ]);
+        ])
+        .unwrap();
         assert!(gjk_intersect(&a, &b)); // Overlapping triangles
     }
 

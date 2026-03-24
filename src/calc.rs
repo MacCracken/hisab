@@ -3,6 +3,7 @@
 //! Provides numerical differentiation, integration (trapezoidal and Simpson's),
 //! linear interpolation, and Bezier curve evaluation.
 
+use crate::HisabError;
 use glam::{Vec2, Vec3};
 
 /// Numerical derivative using the central difference method.
@@ -10,6 +11,7 @@ use glam::{Vec2, Vec3};
 /// `f`: the function to differentiate.
 /// `x`: the point at which to evaluate the derivative.
 /// `h`: the step size (smaller = more accurate but risk of cancellation).
+#[must_use]
 #[inline]
 pub fn derivative(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
     (f(x + h) - f(x - h)) / (2.0 * h)
@@ -18,24 +20,40 @@ pub fn derivative(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {
 /// Numerical integration using the trapezoidal rule.
 ///
 /// Divides [a, b] into `n` sub-intervals.
+#[must_use = "returns the computed integral"]
 #[inline]
-pub fn integral_trapezoidal(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
-    assert!(n > 0, "n must be positive");
+pub fn integral_trapezoidal(
+    f: impl Fn(f64) -> f64,
+    a: f64,
+    b: f64,
+    n: usize,
+) -> Result<f64, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
     let h = (b - a) / n as f64;
     let mut sum = 0.5 * (f(a) + f(b));
     for i in 1..n {
         sum += f(a + i as f64 * h);
     }
-    sum * h
+    Ok(sum * h)
 }
 
 /// Numerical integration using Simpson's rule.
 ///
 /// `n` must be even. If odd, it is rounded up.
+#[must_use = "returns the computed integral"]
 #[inline]
-pub fn integral_simpson(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
+pub fn integral_simpson(
+    f: impl Fn(f64) -> f64,
+    a: f64,
+    b: f64,
+    n: usize,
+) -> Result<f64, HisabError> {
     let n = if n % 2 == 1 { n + 1 } else { n };
-    assert!(n > 0, "n must be positive");
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
     let h = (b - a) / n as f64;
     let mut sum = f(a) + f(b);
 
@@ -50,10 +68,11 @@ pub fn integral_simpson(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64
     // Correct the last even-index term (we added 2*f(b) but f(b) is already counted)
     sum -= 2.0 * f(b);
 
-    sum * h / 3.0
+    Ok(sum * h / 3.0)
 }
 
 /// Linear interpolation between two f64 values.
+#[must_use]
 #[inline]
 pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
@@ -62,6 +81,7 @@ pub fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// Evaluate a quadratic Bezier curve at parameter `t` in [0, 1].
 ///
 /// B(t) = (1-t)^2 * p0 + 2(1-t)t * p1 + t^2 * p2
+#[must_use]
 #[inline]
 pub fn bezier_quadratic(p0: Vec2, p1: Vec2, p2: Vec2, t: f32) -> Vec2 {
     let u = 1.0 - t;
@@ -71,6 +91,7 @@ pub fn bezier_quadratic(p0: Vec2, p1: Vec2, p2: Vec2, t: f32) -> Vec2 {
 /// Evaluate a cubic Bezier curve at parameter `t` in [0, 1].
 ///
 /// B(t) = (1-t)^3 * p0 + 3(1-t)^2*t * p1 + 3(1-t)*t^2 * p2 + t^3 * p3
+#[must_use]
 #[inline]
 pub fn bezier_cubic(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
     let u = 1.0 - t;
@@ -84,6 +105,7 @@ pub fn bezier_cubic(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
 // ---------------------------------------------------------------------------
 
 /// Evaluate a quadratic Bezier curve in 3D at parameter `t` in [0, 1].
+#[must_use]
 #[inline]
 pub fn bezier_quadratic_3d(p0: Vec3, p1: Vec3, p2: Vec3, t: f32) -> Vec3 {
     let u = 1.0 - t;
@@ -91,6 +113,7 @@ pub fn bezier_quadratic_3d(p0: Vec3, p1: Vec3, p2: Vec3, t: f32) -> Vec3 {
 }
 
 /// Evaluate a cubic Bezier curve in 3D at parameter `t` in [0, 1].
+#[must_use]
 #[inline]
 pub fn bezier_cubic_3d(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
     let u = 1.0 - t;
@@ -107,6 +130,7 @@ pub fn bezier_cubic_3d(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
 ///
 /// Also returns the subdivision — the two sets of control points for the
 /// left `[0, t]` and right `[t, 1]` sub-curves.
+#[must_use]
 #[inline]
 pub fn de_casteljau_split(
     p0: Vec2,
@@ -140,6 +164,7 @@ pub fn de_casteljau_split(
 /// Takes four control points: `p0` and `p3` are the tangent-influencing
 /// neighbors, `p1` and `p2` are the interpolated segment endpoints.
 /// The curve passes through `p1` at `t=0` and `p2` at `t=1`.
+#[must_use]
 #[inline]
 pub fn catmull_rom(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
     let t2 = t * t;
@@ -163,6 +188,8 @@ pub fn catmull_rom(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
 /// - `t`: parameter value (must be within the valid knot range).
 ///
 /// Returns `None` if inputs are invalid or `t` is out of range.
+#[must_use = "returns the evaluated spline point"]
+#[inline]
 pub fn bspline_eval(degree: usize, control_points: &[Vec3], knots: &[f64], t: f64) -> Option<Vec3> {
     let n = control_points.len();
     if n == 0 || knots.len() != n + degree + 1 {
@@ -229,9 +256,18 @@ pub fn bspline_eval(degree: usize, control_points: &[Vec3], knots: &[f64], t: f6
 /// Approximate the arc length of a cubic Bezier curve in 3D.
 ///
 /// Uses `n` linear segments to approximate. Higher `n` = more accurate.
+#[must_use = "returns the computed arc length"]
 #[inline]
-pub fn bezier_cubic_3d_arc_length(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, n: usize) -> f32 {
-    assert!(n > 0, "n must be positive");
+pub fn bezier_cubic_3d_arc_length(
+    p0: Vec3,
+    p1: Vec3,
+    p2: Vec3,
+    p3: Vec3,
+    n: usize,
+) -> Result<f32, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
     let mut length = 0.0f32;
     let mut prev = p0;
     for i in 1..=n {
@@ -240,7 +276,7 @@ pub fn bezier_cubic_3d_arc_length(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, n: usi
         length += (curr - prev).length();
         prev = curr;
     }
-    length
+    Ok(length)
 }
 
 /// Re-parameterize a cubic Bezier by arc length.
@@ -248,6 +284,8 @@ pub fn bezier_cubic_3d_arc_length(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, n: usi
 /// Given a normalized distance `s` in [0, 1] (where 0 = start, 1 = end),
 /// returns the corresponding `t` parameter.
 /// `n` controls the accuracy (number of linear segments for the lookup table).
+#[must_use = "returns the parameter at the given arc length"]
+#[inline]
 pub fn bezier_cubic_3d_param_at_length(
     p0: Vec3,
     p1: Vec3,
@@ -255,14 +293,16 @@ pub fn bezier_cubic_3d_param_at_length(
     p3: Vec3,
     s: f32,
     n: usize,
-) -> f32 {
+) -> Result<f32, HisabError> {
     if s <= 0.0 {
-        return 0.0;
+        return Ok(0.0);
     }
     if s >= 1.0 {
-        return 1.0;
+        return Ok(1.0);
     }
-    assert!(n > 0, "n must be positive");
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
 
     // Build cumulative arc-length table (O(n))
     let mut table = Vec::with_capacity(n + 1);
@@ -276,7 +316,7 @@ pub fn bezier_cubic_3d_param_at_length(
         prev = curr;
     }
 
-    let total = *table.last().unwrap();
+    let total = table.last().copied().unwrap_or(0.0);
     let target = s * total;
 
     // Binary search the table for the segment containing the target length
@@ -293,7 +333,7 @@ pub fn bezier_cubic_3d_param_at_length(
 
     // Linearly interpolate within the segment
     if lo == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     let seg_start = table[lo - 1];
     let seg_end = table[lo];
@@ -304,7 +344,7 @@ pub fn bezier_cubic_3d_param_at_length(
         0.0
     };
 
-    ((lo - 1) as f32 + frac) / n as f32
+    Ok(((lo - 1) as f32 + frac) / n as f32)
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +355,7 @@ pub fn bezier_cubic_3d_param_at_length(
 ///
 /// More accurate than Simpson's for smooth functions with fewer evaluations.
 /// Integrates `f` over `[a, b]`.
+#[must_use]
 #[inline]
 pub fn integral_gauss_legendre_5(f: impl Fn(f64) -> f64, a: f64, b: f64) -> f64 {
     // 5-point GL nodes and weights on [-1, 1]
@@ -346,9 +387,17 @@ pub fn integral_gauss_legendre_5(f: impl Fn(f64) -> f64, a: f64, b: f64) -> f64 
 /// Composite Gauss-Legendre quadrature (5-point) over `n` sub-intervals.
 ///
 /// Divides `[a, b]` into `n` panels and applies 5-point GL to each.
+#[must_use = "returns the computed integral"]
 #[inline]
-pub fn integral_gauss_legendre(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
-    assert!(n > 0, "n must be positive");
+pub fn integral_gauss_legendre(
+    f: impl Fn(f64) -> f64,
+    a: f64,
+    b: f64,
+    n: usize,
+) -> Result<f64, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
     let h = (b - a) / n as f64;
     let mut total = 0.0;
     for i in 0..n {
@@ -356,7 +405,7 @@ pub fn integral_gauss_legendre(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize)
         let hi = lo + h;
         total += integral_gauss_legendre_5(&f, lo, hi);
     }
-    total
+    Ok(total)
 }
 
 // ---------------------------------------------------------------------------
@@ -364,30 +413,35 @@ pub fn integral_gauss_legendre(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize)
 // ---------------------------------------------------------------------------
 
 /// Ease-in (quadratic): slow start, fast end.
+#[must_use]
 #[inline]
 pub fn ease_in(t: f32) -> f32 {
     t * t
 }
 
 /// Ease-out (quadratic): fast start, slow end.
+#[must_use]
 #[inline]
 pub fn ease_out(t: f32) -> f32 {
     t * (2.0 - t)
 }
 
 /// Ease-in-out (cubic smoothstep): slow start, fast middle, slow end.
+#[must_use]
 #[inline]
 pub fn ease_in_out(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
 /// Ease-in (cubic): slower start than quadratic.
+#[must_use]
 #[inline]
 pub fn ease_in_cubic(t: f32) -> f32 {
     t * t * t
 }
 
 /// Ease-out (cubic): slower end than quadratic.
+#[must_use]
 #[inline]
 pub fn ease_out_cubic(t: f32) -> f32 {
     let u = 1.0 - t;
@@ -395,6 +449,7 @@ pub fn ease_out_cubic(t: f32) -> f32 {
 }
 
 /// Ease-in-out (quintic smootherstep): C2 continuous, zero first and second derivatives at endpoints.
+#[must_use]
 #[inline]
 pub fn ease_in_out_smooth(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
@@ -436,37 +491,37 @@ mod tests {
 
     #[test]
     fn integral_trapezoidal_constant() {
-        let result = integral_trapezoidal(|_| 5.0, 0.0, 2.0, 100);
+        let result = integral_trapezoidal(|_| 5.0, 0.0, 2.0, 100).unwrap();
         assert!(approx_eq_f64(result, 10.0));
     }
 
     #[test]
     fn integral_trapezoidal_linear() {
-        let result = integral_trapezoidal(|x| x, 0.0, 4.0, 1000);
+        let result = integral_trapezoidal(|x| x, 0.0, 4.0, 1000).unwrap();
         assert!((result - 8.0).abs() < 1e-4);
     }
 
     #[test]
     fn integral_trapezoidal_quadratic() {
-        let result = integral_trapezoidal(|x| x * x, 0.0, 3.0, 10000);
+        let result = integral_trapezoidal(|x| x * x, 0.0, 3.0, 10000).unwrap();
         assert!((result - 9.0).abs() < 1e-3);
     }
 
     #[test]
     fn integral_simpson_quadratic() {
-        let result = integral_simpson(|x| x * x, 0.0, 3.0, 4);
+        let result = integral_simpson(|x| x * x, 0.0, 3.0, 4).unwrap();
         assert!(approx_eq_f64(result, 9.0));
     }
 
     #[test]
     fn integral_simpson_cubic() {
-        let result = integral_simpson(|x| x * x * x, 0.0, 2.0, 4);
+        let result = integral_simpson(|x| x * x * x, 0.0, 2.0, 4).unwrap();
         assert!(approx_eq_f64(result, 4.0));
     }
 
     #[test]
     fn integral_simpson_sin() {
-        let result = integral_simpson(f64::sin, 0.0, std::f64::consts::PI, 100);
+        let result = integral_simpson(f64::sin, 0.0, std::f64::consts::PI, 100).unwrap();
         assert!((result - 2.0).abs() < 1e-6);
     }
 
@@ -513,7 +568,7 @@ mod tests {
 
     #[test]
     fn integral_simpson_odd_n_rounds_up() {
-        let result = integral_simpson(|x| x * x, 0.0, 3.0, 3);
+        let result = integral_simpson(|x| x * x, 0.0, 3.0, 3).unwrap();
         assert!(approx_eq_f64(result, 9.0));
     }
 
@@ -537,19 +592,19 @@ mod tests {
 
     #[test]
     fn integral_trapezoidal_sin() {
-        let result = integral_trapezoidal(f64::sin, 0.0, std::f64::consts::PI, 10000);
+        let result = integral_trapezoidal(f64::sin, 0.0, std::f64::consts::PI, 10000).unwrap();
         assert!((result - 2.0).abs() < 1e-4);
     }
 
     #[test]
     fn integral_simpson_constant() {
-        let result = integral_simpson(|_| 7.0, 1.0, 4.0, 4);
+        let result = integral_simpson(|_| 7.0, 1.0, 4.0, 4).unwrap();
         assert!(approx_eq_f64(result, 21.0));
     }
 
     #[test]
     fn integral_simpson_linear() {
-        let result = integral_simpson(|x| 2.0 * x, 0.0, 3.0, 2);
+        let result = integral_simpson(|x| 2.0 * x, 0.0, 3.0, 2).unwrap();
         assert!(approx_eq_f64(result, 9.0));
     }
 
@@ -604,14 +659,14 @@ mod tests {
 
     #[test]
     fn integral_trapezoidal_single_step() {
-        let result = integral_trapezoidal(|x| x, 0.0, 2.0, 1);
+        let result = integral_trapezoidal(|x| x, 0.0, 2.0, 1).unwrap();
         assert!(approx_eq_f64(result, 2.0));
     }
 
     #[test]
     fn integral_simpson_exp() {
         let expected = std::f64::consts::E - 1.0;
-        let result = integral_simpson(f64::exp, 0.0, 1.0, 100);
+        let result = integral_simpson(f64::exp, 0.0, 1.0, 100).unwrap();
         assert!((result - expected).abs() < 1e-6);
     }
 
@@ -767,7 +822,7 @@ mod tests {
         let p1 = Vec3::new(10.0 / 3.0, 0.0, 0.0);
         let p2 = Vec3::new(20.0 / 3.0, 0.0, 0.0);
         let p3 = Vec3::new(10.0, 0.0, 0.0);
-        let len = bezier_cubic_3d_arc_length(p0, p1, p2, p3, 100);
+        let len = bezier_cubic_3d_arc_length(p0, p1, p2, p3, 100).unwrap();
         assert!((len - 10.0).abs() < 0.01);
     }
 
@@ -787,15 +842,15 @@ mod tests {
 
     #[test]
     fn gauss_legendre_composite_sin() {
-        let result = integral_gauss_legendre(f64::sin, 0.0, std::f64::consts::PI, 10);
+        let result = integral_gauss_legendre(f64::sin, 0.0, std::f64::consts::PI, 10).unwrap();
         assert!((result - 2.0).abs() < 1e-10);
     }
 
     #[test]
     fn gauss_legendre_vs_simpson() {
         // GL with 2 panels should beat Simpson with 100 panels for smooth functions
-        let gl = integral_gauss_legendre(f64::exp, 0.0, 1.0, 2);
-        let simp = integral_simpson(f64::exp, 0.0, 1.0, 100);
+        let gl = integral_gauss_legendre(f64::exp, 0.0, 1.0, 2).unwrap();
+        let simp = integral_simpson(f64::exp, 0.0, 1.0, 100).unwrap();
         let exact = std::f64::consts::E - 1.0;
         assert!((gl - exact).abs() <= (simp - exact).abs());
     }
@@ -870,11 +925,11 @@ mod tests {
         let p2 = Vec3::new(20.0 / 3.0, 0.0, 0.0);
         let p3 = Vec3::new(10.0, 0.0, 0.0);
         assert!(approx_eq_f32(
-            bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 0.0, 100),
+            bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 0.0, 100).unwrap(),
             0.0
         ));
         assert!(approx_eq_f32(
-            bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 1.0, 100),
+            bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 1.0, 100).unwrap(),
             1.0
         ));
     }
@@ -886,7 +941,7 @@ mod tests {
         let p1 = Vec3::new(10.0 / 3.0, 0.0, 0.0);
         let p2 = Vec3::new(20.0 / 3.0, 0.0, 0.0);
         let p3 = Vec3::new(10.0, 0.0, 0.0);
-        let t = bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 0.5, 100);
+        let t = bezier_cubic_3d_param_at_length(p0, p1, p2, p3, 0.5, 100).unwrap();
         assert!((t - 0.5).abs() < 0.02);
     }
 

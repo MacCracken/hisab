@@ -40,6 +40,7 @@ pub struct DaimonClient {
 
 impl DaimonClient {
     /// Create a new client with default URLs.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -50,6 +51,7 @@ impl DaimonClient {
     }
 
     /// Create a new client with custom URLs.
+    #[must_use]
     pub fn with_urls(daimon_url: &str, hoosh_url: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -60,6 +62,7 @@ impl DaimonClient {
     }
 
     /// The agent ID assigned by daimon after registration.
+    #[must_use]
     pub fn agent_id(&self) -> Option<&str> {
         self.agent_id.as_deref()
     }

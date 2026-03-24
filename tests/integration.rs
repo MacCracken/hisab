@@ -60,7 +60,7 @@ fn calculus_and_numerical_consistency() {
     // f(x) = x^3, F(x) = x^4/4
     // ∫₁² 3x² dx = F(2) - F(1) = 4 - 0.25 = 3.75
     // But actually d/dx(x^3) = 3x^2, and ∫₁² 3x² dx = [x³]₁² = 8 - 1 = 7
-    let integral = hisab::calc::integral_simpson(|x| 3.0 * x * x, 1.0, 2.0, 100);
+    let integral = hisab::calc::integral_simpson(|x| 3.0 * x * x, 1.0, 2.0, 100).unwrap();
     assert!((integral - 7.0).abs() < 1e-6);
 
     // Verify the derivative at x=2: d/dx(x^3)|₂ = 3*4 = 12

@@ -15,6 +15,7 @@ use crate::HisabError;
 /// - `x0`: initial guess.
 /// - `tol`: convergence tolerance (stops when `|f(x)| < tol`).
 /// - `max_iter`: maximum iterations.
+#[must_use = "contains the computed root or an error"]
 pub fn newton_raphson(
     f: impl Fn(f64) -> f64,
     df: impl Fn(f64) -> f64,
@@ -41,6 +42,7 @@ pub fn newton_raphson(
 ///
 /// Finds `x` in `[a, b]` such that `f(x) ≈ 0`. Requires `f(a)` and `f(b)`
 /// to have opposite signs (intermediate value theorem).
+#[must_use = "contains the computed root or an error"]
 pub fn bisection(
     f: impl Fn(f64) -> f64,
     a: f64,
@@ -88,6 +90,7 @@ pub fn bisection(
 /// with dimensions `n x (n+1)`.
 ///
 /// The matrix is modified in place. Returns the solution vector `x`.
+#[must_use = "contains the solution vector or an error"]
 pub fn gaussian_elimination(matrix: &mut [Vec<f64>]) -> Result<Vec<f64>, HisabError> {
     let n = matrix.len();
     if n == 0 {
@@ -163,6 +166,7 @@ pub fn gaussian_elimination(matrix: &mut [Vec<f64>]) -> Result<Vec<f64>, HisabEr
 ///
 /// Returns `(lu, pivot)` where `lu` stores both L (below diagonal) and U
 /// (on and above diagonal) in a single matrix.
+#[must_use = "contains the LU factors or an error"]
 #[allow(clippy::needless_range_loop)]
 pub fn lu_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<usize>), HisabError> {
     let n = a.len();
@@ -217,6 +221,7 @@ pub fn lu_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<usize>), Hisab
 }
 
 /// Solve `A * x = b` using a pre-computed LU decomposition.
+#[must_use = "contains the solution vector or an error"]
 #[inline]
 #[allow(clippy::needless_range_loop)]
 pub fn lu_solve(lu: &[Vec<f64>], pivot: &[usize], b: &[f64]) -> Result<Vec<f64>, HisabError> {
@@ -263,6 +268,7 @@ pub fn lu_solve(lu: &[Vec<f64>], pivot: &[usize], b: &[f64]) -> Result<Vec<f64>,
 /// Returns `L`. Fails if `A` is not positive-definite.
 ///
 /// Only the lower triangle of `A` is read. The caller must ensure `A` is symmetric.
+#[must_use = "contains the Cholesky factor or an error"]
 #[allow(clippy::needless_range_loop)]
 pub fn cholesky(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, HisabError> {
     let n = a.len();
@@ -305,6 +311,7 @@ pub fn cholesky(a: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, HisabError> {
 }
 
 /// Solve `A * x = b` using a pre-computed Cholesky factor `L` (where `A = L * L^T`).
+#[must_use = "contains the solution vector or an error"]
 #[inline]
 #[allow(clippy::needless_range_loop)]
 pub fn cholesky_solve(l: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>, HisabError> {
@@ -352,6 +359,7 @@ pub fn cholesky_solve(l: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>, HisabError>
 ///
 /// Input is column-major: `a[j]` is the j-th column vector.
 /// Output `r` uses the same layout: `R[i][j]` is stored as `r[j][i]`.
+#[must_use = "contains the QR factors or an error"]
 #[allow(clippy::type_complexity, clippy::needless_range_loop)]
 pub fn qr_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), HisabError> {
     let n = a.len(); // number of columns
@@ -401,6 +409,7 @@ pub fn qr_decompose(a: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), Hi
 /// using least squares (via QR decomposition).
 ///
 /// Returns coefficients `[a0, a1, a2, ...]` where `y ≈ a0 + a1*x + a2*x^2 + ...`.
+#[must_use = "contains the polynomial coefficients or an error"]
 #[allow(clippy::needless_range_loop)]
 pub fn least_squares_poly(x: &[f64], y: &[f64], degree: usize) -> Result<Vec<f64>, HisabError> {
     let m = x.len();
@@ -458,6 +467,7 @@ pub fn least_squares_poly(x: &[f64], y: &[f64], degree: usize) -> Result<Vec<f64
 /// - `max_iter`: maximum iterations.
 ///
 /// Returns `(eigenvalue, eigenvector)`.
+#[must_use = "contains the dominant eigenvalue/eigenvector or an error"]
 #[allow(clippy::needless_range_loop)]
 pub fn eigenvalue_power(
     a: &[Vec<f64>],
@@ -539,24 +549,28 @@ pub struct Complex {
 
 impl Complex {
     /// Create a new complex number.
+    #[must_use]
     #[inline]
     pub const fn new(re: f64, im: f64) -> Self {
         Self { re, im }
     }
 
     /// Complex number from a real value.
+    #[must_use]
     #[inline]
     pub const fn from_real(re: f64) -> Self {
         Self { re, im: 0.0 }
     }
 
     /// Magnitude (absolute value).
+    #[must_use]
     #[inline]
     pub fn abs(self) -> f64 {
         (self.re * self.re + self.im * self.im).sqrt()
     }
 
     /// Complex conjugate.
+    #[must_use]
     #[inline]
     pub const fn conj(self) -> Self {
         Self {
@@ -630,15 +644,20 @@ impl std::ops::Mul<f64> for Complex {
 ///
 /// `data` must have a power-of-2 length. Computes the DFT in-place.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `data.len()` is not a power of two.
-pub fn fft(data: &mut [Complex]) {
+/// Returns [`HisabError::InvalidInput`] if `data.len()` is not a power of two.
+#[must_use = "returns an error if input length is not a power of two"]
+pub fn fft(data: &mut [Complex]) -> Result<(), HisabError> {
     let n = data.len();
     if n <= 1 {
-        return;
+        return Ok(());
     }
-    assert!(n.is_power_of_two(), "FFT requires power-of-2 length");
+    if !n.is_power_of_two() {
+        return Err(HisabError::InvalidInput(
+            "FFT requires power-of-2 length".into(),
+        ));
+    }
 
     // Bit-reversal permutation
     let mut j = 0usize;
@@ -675,22 +694,29 @@ pub fn fft(data: &mut [Complex]) {
         }
         len <<= 1;
     }
+    Ok(())
 }
 
 /// In-place inverse FFT.
 ///
 /// `data` must have a power-of-2 length.
-pub fn ifft(data: &mut [Complex]) {
+///
+/// # Errors
+///
+/// Returns [`HisabError::InvalidInput`] if `data.len()` is not a power of two.
+#[must_use = "returns an error if input length is not a power of two"]
+pub fn ifft(data: &mut [Complex]) -> Result<(), HisabError> {
     let n = data.len();
     // Conjugate, FFT, conjugate, scale
     for d in data.iter_mut() {
         *d = d.conj();
     }
-    fft(data);
+    fft(data)?;
     let scale = 1.0 / n as f64;
     for d in data.iter_mut() {
         *d = d.conj() * scale;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -707,6 +733,7 @@ pub fn ifft(data: &mut [Complex]) {
 /// # Errors
 ///
 /// Returns [`HisabError::InvalidInput`] if `data` is empty.
+#[must_use = "contains the DST coefficients or an error"]
 pub fn dst(data: &[f64]) -> Result<Vec<f64>, HisabError> {
     let n = data.len();
     if n == 0 {
@@ -733,6 +760,7 @@ pub fn dst(data: &[f64]) -> Result<Vec<f64>, HisabError> {
 /// # Errors
 ///
 /// Returns [`HisabError::InvalidInput`] if `data` is empty.
+#[must_use = "contains the inverse DST result or an error"]
 pub fn idst(data: &[f64]) -> Result<Vec<f64>, HisabError> {
     let n = data.len();
     let mut out = dst(data)?;
@@ -753,6 +781,7 @@ pub fn idst(data: &[f64]) -> Result<Vec<f64>, HisabError> {
 /// # Errors
 ///
 /// Returns [`HisabError::InvalidInput`] if `data` is empty.
+#[must_use = "contains the DCT coefficients or an error"]
 pub fn dct(data: &[f64]) -> Result<Vec<f64>, HisabError> {
     let n = data.len();
     if n == 0 {
@@ -779,6 +808,7 @@ pub fn dct(data: &[f64]) -> Result<Vec<f64>, HisabError> {
 /// # Errors
 ///
 /// Returns [`HisabError::InvalidInput`] if `data` is empty.
+#[must_use = "contains the inverse DCT result or an error"]
 pub fn idct(data: &[f64]) -> Result<Vec<f64>, HisabError> {
     let n = data.len();
     if n == 0 {
@@ -851,14 +881,17 @@ fn rk4_step(
 /// - `n`: number of integration steps.
 ///
 /// Returns the final state vector `y(t_end)`.
+#[must_use = "contains the final state vector or an error"]
 pub fn rk4(
     f: impl Fn(f64, &[f64]) -> Vec<f64>,
     t0: f64,
     y0: &[f64],
     t_end: f64,
     n: usize,
-) -> Vec<f64> {
-    assert!(n > 0, "n must be positive");
+) -> Result<Vec<f64>, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
     let dim = y0.len();
     let h = (t_end - t0) / n as f64;
     let mut t = t0;
@@ -870,20 +903,23 @@ pub fn rk4(
         t += h;
     }
 
-    y
+    Ok(y)
 }
 
 /// Fourth-order Runge-Kutta with full trajectory output.
 ///
 /// Same as [`rk4`] but returns all intermediate states as `Vec<(t, y)>`.
+#[must_use = "contains the full trajectory or an error"]
 pub fn rk4_trajectory(
     f: impl Fn(f64, &[f64]) -> Vec<f64>,
     t0: f64,
     y0: &[f64],
     t_end: f64,
     n: usize,
-) -> Vec<(f64, Vec<f64>)> {
-    assert!(n > 0, "n must be positive");
+) -> Result<Vec<(f64, Vec<f64>)>, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
     let dim = y0.len();
     let h = (t_end - t0) / n as f64;
     let mut t = t0;
@@ -898,7 +934,7 @@ pub fn rk4_trajectory(
         trajectory.push((t, y.clone()));
     }
 
-    trajectory
+    Ok(trajectory)
 }
 
 #[cfg(test)]
@@ -1452,7 +1488,7 @@ mod tests {
             Complex::from_real(1.0),
             Complex::from_real(1.0),
         ];
-        fft(&mut data);
+        fft(&mut data).unwrap();
         assert!(approx_eq(data[0].re, 4.0));
         assert!(approx_eq(data[0].im, 0.0));
         assert!(approx_eq(data[1].abs(), 0.0));
@@ -1469,7 +1505,7 @@ mod tests {
             Complex::from_real(1.0),
             Complex::from_real(-1.0),
         ];
-        fft(&mut data);
+        fft(&mut data).unwrap();
         assert!(approx_eq(data[0].abs(), 0.0)); // DC = 0
         assert!(approx_eq(data[2].re, 4.0)); // Nyquist bin
     }
@@ -1483,8 +1519,8 @@ mod tests {
             Complex::new(-1.0, 2.0),
         ];
         let mut data = original;
-        fft(&mut data);
-        ifft(&mut data);
+        fft(&mut data).unwrap();
+        ifft(&mut data).unwrap();
         for i in 0..4 {
             assert!((data[i].re - original[i].re).abs() < 1e-10);
             assert!((data[i].im - original[i].im).abs() < 1e-10);
@@ -1495,7 +1531,7 @@ mod tests {
     fn fft_8_point() {
         // 8-point FFT of real signal
         let mut data: Vec<Complex> = (0..8).map(|i| Complex::from_real(i as f64)).collect();
-        fft(&mut data);
+        fft(&mut data).unwrap();
         // DC should be sum of all values = 0+1+2+3+4+5+6+7 = 28
         assert!(approx_eq(data[0].re, 28.0));
         assert!(approx_eq(data[0].im, 0.0));
@@ -1507,8 +1543,8 @@ mod tests {
             .map(|i| Complex::new(i as f64, (i as f64 * 0.5).sin()))
             .collect();
         let mut data = original.clone();
-        fft(&mut data);
-        ifft(&mut data);
+        fft(&mut data).unwrap();
+        ifft(&mut data).unwrap();
         for i in 0..8 {
             assert!((data[i].re - original[i].re).abs() < 1e-10);
             assert!((data[i].im - original[i].im).abs() < 1e-10);
@@ -1526,7 +1562,7 @@ mod tests {
         ];
         let time_energy: f64 = original.iter().map(|c| c.re * c.re + c.im * c.im).sum();
         let mut freq = original;
-        fft(&mut freq);
+        fft(&mut freq).unwrap();
         let freq_energy: f64 = freq.iter().map(|c| c.re * c.re + c.im * c.im).sum();
         // N * time_energy = freq_energy
         assert!((4.0 * time_energy - freq_energy).abs() < 1e-10);
@@ -1535,7 +1571,7 @@ mod tests {
     #[test]
     fn fft_single_element() {
         let mut data = [Complex::new(42.0, -7.0)];
-        fft(&mut data);
+        fft(&mut data).unwrap();
         assert!(approx_eq(data[0].re, 42.0));
         assert!(approx_eq(data[0].im, -7.0));
     }
@@ -1601,13 +1637,13 @@ mod tests {
             .collect();
 
         let mut fx = x.clone();
-        fft(&mut fx);
+        fft(&mut fx).unwrap();
         let mut fy = y.clone();
-        fft(&mut fy);
+        fft(&mut fy).unwrap();
 
         // 2*x + 3*y
         let mut combined: Vec<Complex> = (0..4).map(|i| x[i] * 2.0 + y[i] * 3.0).collect();
-        fft(&mut combined);
+        fft(&mut combined).unwrap();
 
         for i in 0..4 {
             let expected = fx[i] * 2.0 + fy[i] * 3.0;
@@ -1619,16 +1655,15 @@ mod tests {
     #[test]
     fn ifft_single_element() {
         let mut data = [Complex::new(42.0, -7.0)];
-        ifft(&mut data);
+        ifft(&mut data).unwrap();
         assert!(approx_eq(data[0].re, 42.0));
         assert!(approx_eq(data[0].im, -7.0));
     }
 
     #[test]
-    #[should_panic(expected = "power-of-2")]
     fn fft_non_power_of_two_panics() {
         let mut data = vec![Complex::default(); 3];
-        fft(&mut data);
+        assert!(fft(&mut data).is_err());
     }
 
     // --- V1.0b: DST / DCT ---
@@ -1731,7 +1766,7 @@ mod tests {
     fn rk4_exponential_growth() {
         // dy/dt = y, y(0) = 1 => y(t) = e^t
         // At t=1, y should be e ≈ 2.71828
-        let y = rk4(|_t, y| vec![y[0]], 0.0, &[1.0], 1.0, 1000);
+        let y = rk4(|_t, y| vec![y[0]], 0.0, &[1.0], 1.0, 1000).unwrap();
         assert!((y[0] - std::f64::consts::E).abs() < 1e-8);
     }
 
@@ -1739,7 +1774,7 @@ mod tests {
     fn rk4_linear_ode() {
         // dy/dt = 2, y(0) = 0 => y(t) = 2t
         // At t=5, y = 10
-        let y = rk4(|_t, _y| vec![2.0], 0.0, &[0.0], 5.0, 100);
+        let y = rk4(|_t, _y| vec![2.0], 0.0, &[0.0], 5.0, 100).unwrap();
         assert!(approx_eq(y[0], 10.0));
     }
 
@@ -1754,7 +1789,8 @@ mod tests {
             &[1.0, 0.0],
             std::f64::consts::PI,
             10000,
-        );
+        )
+        .unwrap();
         assert!((y[0] - (-1.0)).abs() < 1e-6); // x(pi) = cos(pi) = -1
         assert!(y[1].abs() < 1e-6); // v(pi) = -sin(pi) = 0
     }
@@ -1763,7 +1799,7 @@ mod tests {
     fn rk4_quadratic_exact() {
         // dy/dt = 2t, y(0) = 0 => y(t) = t^2
         // RK4 is exact for polynomials up to degree 4
-        let y = rk4(|t, _y| vec![2.0 * t], 0.0, &[0.0], 3.0, 10);
+        let y = rk4(|t, _y| vec![2.0 * t], 0.0, &[0.0], 3.0, 10).unwrap();
         assert!((y[0] - 9.0).abs() < 1e-10);
     }
 
@@ -1778,14 +1814,15 @@ mod tests {
             &[1.0, 0.0],
             std::f64::consts::FRAC_PI_2,
             1000,
-        );
+        )
+        .unwrap();
         assert!(y[0].abs() < 1e-6);
         assert!((y[1] - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn rk4_trajectory_length() {
-        let traj = rk4_trajectory(|_t, y| vec![y[0]], 0.0, &[1.0], 1.0, 100);
+        let traj = rk4_trajectory(|_t, y| vec![y[0]], 0.0, &[1.0], 1.0, 100).unwrap();
         assert_eq!(traj.len(), 101); // n+1 points
         assert!(approx_eq(traj[0].0, 0.0));
         assert!((traj[100].0 - 1.0).abs() < 1e-10);
@@ -1794,8 +1831,8 @@ mod tests {
     #[test]
     fn rk4_trajectory_matches_final() {
         // Trajectory endpoint should match rk4 result
-        let final_state = rk4(|_t, y| vec![y[0]], 0.0, &[1.0], 1.0, 100);
-        let traj = rk4_trajectory(|_t, y| vec![y[0]], 0.0, &[1.0], 1.0, 100);
+        let final_state = rk4(|_t, y| vec![y[0]], 0.0, &[1.0], 1.0, 100).unwrap();
+        let traj = rk4_trajectory(|_t, y| vec![y[0]], 0.0, &[1.0], 1.0, 100).unwrap();
         let traj_final = &traj[100].1;
         assert!((final_state[0] - traj_final[0]).abs() < 1e-12);
     }
@@ -1811,7 +1848,8 @@ mod tests {
             &[1.0, 0.0],
             20.0,
             10000,
-        );
+        )
+        .unwrap();
         // After 20 seconds of damping, amplitude should be small
         assert!(y[0].abs() < 0.5);
     }

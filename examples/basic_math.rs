@@ -26,7 +26,7 @@ fn main() {
     }
 
     // Numerical integration (area under x^2 from 0 to 1)
-    let area = hisab::calc::integral_simpson(|x| x * x, 0.0, 1.0, 100);
+    let area = hisab::calc::integral_simpson(|x| x * x, 0.0, 1.0, 100).expect("should converge");
     println!("∫₀¹ x² dx ≈ {area:.6}");
 
     // Root finding (sqrt of 2)

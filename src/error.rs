@@ -73,6 +73,3 @@ pub enum DaimonError {
     #[error("hoosh query failed: {0}")]
     HooshQuery(String),
 }
-
-/// Convenience alias for `Result<T, HisabError>`.
-pub type Result<T> = std::result::Result<T, HisabError>;

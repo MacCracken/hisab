@@ -2132,7 +2132,6 @@ impl Capsule {
 #[must_use]
 pub fn ray_capsule(ray: &Ray, capsule: &Capsule) -> Option<f32> {
     // Test against the infinite cylinder, then clamp to segment + check hemispheres
-    let seg = Segment::new(capsule.start, capsule.end);
     let ab = capsule.end - capsule.start;
     let ab_len_sq = ab.dot(ab);
 
@@ -2217,7 +2216,6 @@ pub fn ray_capsule(ray: &Ray, capsule: &Capsule) -> Option<f32> {
         }
     }
 
-    let _ = seg;
     best
 }
 
@@ -2272,6 +2270,7 @@ impl ConvexSupport3D for Capsule {
 
 /// A convex polyhedron for 3D GJK/EPA.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct ConvexHull3D {
     /// Vertices of the convex hull.
     pub vertices: Vec<Vec3>,
@@ -2327,7 +2326,7 @@ fn minkowski_support_3d(a: &dyn ConvexSupport3D, b: &dyn ConvexSupport3D, direct
 }
 
 /// Penetration result from 3D EPA.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Penetration3D {
     /// Penetration normal (direction to separate).
     pub normal: Vec3,
@@ -2491,9 +2490,8 @@ fn epa_penetration_3d(
         // Find closest face to origin
         let mut closest_dist = f32::INFINITY;
         let mut closest_normal = Vec3::ZERO;
-        let mut closest_face = 0;
 
-        for (fi, face) in faces.iter().enumerate() {
+        for face in &faces {
             let va = vertices[face[0]];
             let vb = vertices[face[1]];
             let vc = vertices[face[2]];
@@ -2510,7 +2508,6 @@ fn epa_penetration_3d(
             if dist < closest_dist {
                 closest_dist = dist;
                 closest_normal = normal;
-                closest_face = fi;
             }
         }
 
@@ -2567,7 +2564,6 @@ fn epa_penetration_3d(
         }
 
         faces = new_faces;
-        let _ = closest_face;
     }
 
     // Return best estimate

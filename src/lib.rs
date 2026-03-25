@@ -104,6 +104,9 @@ mod assert_traits {
             _assert_send_sync::<super::Line>();
             _assert_send_sync::<super::Segment>();
             _assert_send_sync::<super::Frustum>();
+            _assert_send_sync::<super::Obb>();
+            _assert_send_sync::<super::Capsule>();
+            _assert_send_sync::<super::Penetration3D>();
         }
 
         #[cfg(feature = "num")]

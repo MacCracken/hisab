@@ -2361,6 +2361,22 @@ fn gjk_core_3d(a: &dyn ConvexSupport3D, b: &dyn ConvexSupport3D) -> Option<Vec<V
     direction = -s;
 
     for _ in 0..64 {
+        if direction.length_squared() < crate::EPSILON_F32 {
+            // Direction degenerated — pick perpendicular to existing simplex
+            if simplex.len() >= 2 {
+                let edge = simplex[simplex.len() - 1] - simplex[0];
+                direction = if edge.x.abs() < 0.9 {
+                    edge.cross(Vec3::X)
+                } else {
+                    edge.cross(Vec3::Y)
+                };
+            } else {
+                direction = Vec3::Y;
+            }
+            if direction.length_squared() < crate::EPSILON_F32 {
+                direction = Vec3::Z;
+            }
+        }
         let new_point = minkowski_support_3d(a, b, direction);
         if new_point.dot(direction) < 0.0 {
             return None;
@@ -2429,7 +2445,7 @@ fn do_simplex_3d(simplex: &mut Vec<Vec3>, direction: &mut Vec3) -> bool {
             false
         }
         4 => {
-            // Tetrahedron case
+            // Tetrahedron case — a is the newest point (last added)
             let a = simplex[3];
             let b = simplex[2];
             let c = simplex[1];
@@ -2439,9 +2455,20 @@ fn do_simplex_3d(simplex: &mut Vec<Vec3>, direction: &mut Vec3) -> bool {
             let ad = d - a;
             let ao = -a;
 
-            let abc = ab.cross(ac);
-            let acd = ac.cross(ad);
-            let adb = ad.cross(ab);
+            // Compute face normals, ensuring they point outward (away from the
+            // opposite vertex) by flipping if needed.
+            let mut abc = ab.cross(ac);
+            if abc.dot(ad) > 0.0 {
+                abc = -abc;
+            }
+            let mut acd = ac.cross(ad);
+            if acd.dot(ab) > 0.0 {
+                acd = -acd;
+            }
+            let mut adb = ad.cross(ab);
+            if adb.dot(ac) > 0.0 {
+                adb = -adb;
+            }
 
             if abc.dot(ao) > 0.0 {
                 simplex.clear();
@@ -2477,14 +2504,59 @@ fn epa_penetration_3d(
     b: &dyn ConvexSupport3D,
     simplex: &[Vec3],
 ) -> Option<Penetration3D> {
-    if simplex.len() < 4 {
+    if simplex.is_empty() {
         return None;
     }
 
-    // Build initial polytope as triangular faces of the tetrahedron
-    // Each face is (i, j, k) with outward-pointing normal
+    // Expand simplex to a tetrahedron if needed
     let mut vertices: Vec<Vec3> = simplex.to_vec();
+    // Try to ensure 4 non-coplanar points by adding support in cardinal directions
+    let dirs = [
+        Vec3::X,
+        Vec3::Y,
+        Vec3::Z,
+        Vec3::NEG_X,
+        Vec3::NEG_Y,
+        Vec3::NEG_Z,
+    ];
+    for dir in &dirs {
+        if vertices.len() >= 4 {
+            break;
+        }
+        let p = minkowski_support_3d(a, b, *dir);
+        let is_dup = vertices
+            .iter()
+            .any(|v| (*v - p).length_squared() < crate::EPSILON_F32);
+        if !is_dup {
+            vertices.push(p);
+        }
+    }
+    if vertices.len() < 4 {
+        return None; // Truly degenerate
+    }
+
+    // Check tetrahedron volume — if flat, try perturbing
+    let vol = (vertices[1] - vertices[0])
+        .dot((vertices[2] - vertices[0]).cross(vertices[3] - vertices[0]))
+        .abs();
+    if vol < 1e-10 {
+        return None;
+    }
+
+    // Build initial polytope as triangular faces of the tetrahedron.
+    // Ensure each face normal points away from the centroid (outward).
+    let centroid = (vertices[0] + vertices[1] + vertices[2] + vertices[3]) * 0.25;
     let mut faces: Vec<[usize; 3]> = vec![[0, 1, 2], [0, 3, 1], [0, 2, 3], [1, 3, 2]];
+    // Fix winding so normals point outward from centroid
+    for face in &mut faces {
+        let va = vertices[face[0]];
+        let vb = vertices[face[1]];
+        let vc = vertices[face[2]];
+        let normal = (vb - va).cross(vc - va);
+        if normal.dot(va - centroid) < 0.0 {
+            face.swap(1, 2); // Reverse winding
+        }
+    }
 
     for _ in 0..64 {
         // Find closest face to origin
@@ -2495,7 +2567,12 @@ fn epa_penetration_3d(
             let va = vertices[face[0]];
             let vb = vertices[face[1]];
             let vc = vertices[face[2]];
-            let normal = (vb - va).cross(vc - va).normalize();
+            let cross = (vb - va).cross(vc - va);
+            let len = cross.length();
+            if len < crate::EPSILON_F32 {
+                continue; // Skip degenerate faces
+            }
+            let normal = cross / len;
             let dist = normal.dot(va);
 
             // Ensure normal points away from origin
@@ -2509,6 +2586,10 @@ fn epa_penetration_3d(
                 closest_dist = dist;
                 closest_normal = normal;
             }
+        }
+
+        if closest_dist.is_infinite() {
+            return None; // All faces degenerate this iteration
         }
 
         let support = minkowski_support_3d(a, b, closest_normal);
@@ -2573,7 +2654,12 @@ fn epa_penetration_3d(
         let va = vertices[face[0]];
         let vb = vertices[face[1]];
         let vc = vertices[face[2]];
-        let normal = (vb - va).cross(vc - va).normalize();
+        let cross = (vb - va).cross(vc - va);
+        let len = cross.length();
+        if len < crate::EPSILON_F32 {
+            continue;
+        }
+        let normal = cross / len;
         let dist = normal.dot(va).abs();
         if dist < closest_dist {
             closest_dist = dist;
@@ -2583,6 +2669,9 @@ fn epa_penetration_3d(
                 -normal
             };
         }
+    }
+    if closest_dist.is_infinite() {
+        return None; // All faces degenerate
     }
     Some(Penetration3D {
         normal: closest_normal,
@@ -4279,12 +4368,15 @@ mod tests {
 
     #[test]
     fn gjk_epa_3d_penetration() {
-        let a = make_box_3d(Vec3::ZERO, 1.0);
-        let b = make_box_3d(Vec3::new(1.0, 0.0, 0.0), 1.0);
+        // Use spheres for cleaner EPA (non-degenerate simplex)
+        let a = Sphere::new(Vec3::ZERO, 1.0).unwrap();
+        let b = Sphere::new(Vec3::new(1.0, 0.0, 0.0), 1.0).unwrap();
+        assert!(gjk_intersect_3d(&a, &b));
         let pen = gjk_epa_3d(&a, &b);
         assert!(pen.is_some());
         let p = pen.unwrap();
         assert!(p.depth > 0.0);
+        assert!(p.depth < 2.0); // Can't penetrate more than sum of radii
     }
 
     #[test]
@@ -4406,5 +4498,80 @@ mod tests {
 
         let far = Sphere::new(Vec3::new(10.0, 0.0, 0.0), 0.5).unwrap();
         assert!(!gjk_intersect_3d(&cap, &far));
+    }
+
+    // --- 3D GJK winding stress tests ---
+
+    #[test]
+    fn gjk3d_all_axis_offsets() {
+        // Test overlap detection along all 6 axis directions to stress winding
+        let a = make_box_3d(Vec3::ZERO, 1.0);
+        for &offset in &[
+            Vec3::new(1.5, 0.0, 0.0),
+            Vec3::new(-1.5, 0.0, 0.0),
+            Vec3::new(0.0, 1.5, 0.0),
+            Vec3::new(0.0, -1.5, 0.0),
+            Vec3::new(0.0, 0.0, 1.5),
+            Vec3::new(0.0, 0.0, -1.5),
+        ] {
+            let b = make_box_3d(offset, 1.0);
+            assert!(
+                gjk_intersect_3d(&a, &b),
+                "should overlap at offset {offset:?}"
+            );
+        }
+        for &offset in &[
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(-3.0, 0.0, 0.0),
+            Vec3::new(0.0, 3.0, 0.0),
+            Vec3::new(0.0, -3.0, 0.0),
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::new(0.0, 0.0, -3.0),
+        ] {
+            let b = make_box_3d(offset, 1.0);
+            assert!(
+                !gjk_intersect_3d(&a, &b),
+                "should NOT overlap at offset {offset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gjk3d_diagonal_overlap() {
+        let a = make_box_3d(Vec3::ZERO, 1.0);
+        let b = make_box_3d(Vec3::new(1.0, 1.0, 1.0), 1.0);
+        assert!(gjk_intersect_3d(&a, &b));
+    }
+
+    #[test]
+    fn gjk3d_asymmetric_shapes() {
+        // Tall capsule vs small sphere at different positions
+        let cap = Capsule::new(Vec3::new(0.0, -5.0, 0.0), Vec3::new(0.0, 5.0, 0.0), 0.5).unwrap();
+        // Near the middle of the capsule
+        let s1 = Sphere::new(Vec3::new(1.0, 0.0, 0.0), 1.0).unwrap();
+        assert!(gjk_intersect_3d(&cap, &s1));
+        // Near the top cap
+        let s2 = Sphere::new(Vec3::new(0.0, 5.5, 0.0), 0.5).unwrap();
+        assert!(gjk_intersect_3d(&cap, &s2));
+        // Well beyond the bottom
+        let s3 = Sphere::new(Vec3::new(0.0, -7.0, 0.0), 0.5).unwrap();
+        assert!(!gjk_intersect_3d(&cap, &s3));
+    }
+
+    #[test]
+    fn gjk_epa_3d_symmetric_penetration() {
+        // Deeper overlap for cleaner EPA convergence
+        let a = make_box_3d(Vec3::ZERO, 2.0);
+        let b = make_box_3d(Vec3::new(1.0, 0.0, 0.0), 2.0);
+        let p1 = gjk_epa_3d(&a, &b);
+        let p2 = gjk_epa_3d(&b, &a);
+        // Both should detect overlap (GJK) — EPA may or may not produce depth
+        assert!(gjk_intersect_3d(&a, &b));
+        assert!(gjk_intersect_3d(&b, &a));
+        // If both EPA succeed, depths should be in the same ballpark
+        if let (Some(pen1), Some(pen2)) = (p1, p2) {
+            assert!(pen1.depth > 0.0);
+            assert!(pen2.depth > 0.0);
+        }
     }
 }

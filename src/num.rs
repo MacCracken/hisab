@@ -1830,6 +1830,13 @@ pub fn bfgs(
         h_inv[i][i] = 1.0;
     }
 
+    // Pre-allocate scratch buffers reused every iteration
+    let mut d = vec![0.0; n];
+    let mut x_new = vec![0.0; n];
+    let mut s = vec![0.0; n];
+    let mut y_vec = vec![0.0; n];
+    let mut hy = vec![0.0; n];
+
     for iter in 0..max_iter {
         let grad_norm: f64 = g.iter().map(|gi| gi * gi).sum::<f64>().sqrt();
         if grad_norm < tol {
@@ -1841,7 +1848,7 @@ pub fn bfgs(
         }
 
         // Search direction: d = -H_inv * g
-        let mut d = vec![0.0; n];
+        d.fill(0.0);
         for i in 0..n {
             for j in 0..n {
                 d[i] -= h_inv[i][j] * g[j];
@@ -1854,7 +1861,6 @@ pub fn bfgs(
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
         let c1 = 1e-4;
 
-        let mut x_new = vec![0.0; n];
         for _ in 0..40 {
             for i in 0..n {
                 x_new[i] = x[i] + alpha * d[i];
@@ -1867,29 +1873,26 @@ pub fn bfgs(
 
         // Compute s = x_new - x, y = g_new - g
         let g_new = grad_f(&x_new);
-        let mut s = vec![0.0; n];
-        let mut y = vec![0.0; n];
         for i in 0..n {
             s[i] = x_new[i] - x[i];
-            y[i] = g_new[i] - g[i];
+            y_vec[i] = g_new[i] - g[i];
         }
 
-        let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
+        let sy: f64 = s.iter().zip(y_vec.iter()).map(|(si, yi)| si * yi).sum();
 
         // Update H_inv using BFGS formula (skip if curvature condition fails)
         if sy > crate::EPSILON_F64 {
             let rho = 1.0 / sy;
 
-            // H_inv = (I - ρ·s·yᵀ) · H_inv · (I - ρ·y·sᵀ) + ρ·s·sᵀ
             // Compute H_inv · y
-            let mut hy = vec![0.0; n];
+            hy.fill(0.0);
             for i in 0..n {
                 for j in 0..n {
-                    hy[i] += h_inv[i][j] * y[j];
+                    hy[i] += h_inv[i][j] * y_vec[j];
                 }
             }
 
-            let yhy: f64 = y.iter().zip(hy.iter()).map(|(yi, hyi)| yi * hyi).sum();
+            let yhy: f64 = y_vec.iter().zip(hy.iter()).map(|(yi, hyi)| yi * hyi).sum();
 
             for i in 0..n {
                 for j in 0..n {
@@ -1899,7 +1902,151 @@ pub fn bfgs(
             }
         }
 
-        x = x_new;
+        std::mem::swap(&mut x, &mut x_new);
+        g = g_new;
+    }
+
+    Err(HisabError::NoConvergence(max_iter))
+}
+
+/// L-BFGS (Limited-memory BFGS) optimization.
+///
+/// Like [`bfgs`] but stores only the last `m` correction pairs instead of
+/// the full `n × n` inverse Hessian. Memory usage is `O(m·n)` instead of
+/// `O(n²)`, making it suitable for large-scale problems.
+///
+/// - `f`: objective function.
+/// - `grad_f`: gradient function.
+/// - `x0`: initial guess.
+/// - `m`: number of correction pairs to store (typically 5–20).
+/// - `tol`: convergence tolerance on gradient norm.
+/// - `max_iter`: maximum iterations.
+///
+/// # Errors
+///
+/// Returns [`HisabError::InvalidInput`] if `x0` is empty or `m` is zero.
+/// Returns [`HisabError::NoConvergence`] if `max_iter` is exhausted.
+#[must_use = "contains the optimization result or an error"]
+#[allow(clippy::needless_range_loop)]
+pub fn lbfgs(
+    f: impl Fn(&[f64]) -> f64,
+    grad_f: impl Fn(&[f64]) -> Vec<f64>,
+    x0: &[f64],
+    m: usize,
+    tol: f64,
+    max_iter: usize,
+) -> Result<OptResult, HisabError> {
+    let n = x0.len();
+    if n == 0 {
+        return Err(HisabError::InvalidInput("empty initial guess".into()));
+    }
+    if m == 0 {
+        return Err(HisabError::InvalidInput("m must be positive".into()));
+    }
+
+    let mut x = x0.to_vec();
+    let mut g = grad_f(&x);
+
+    // Circular buffer for s, y pairs and ρ values
+    let mut s_hist: Vec<Vec<f64>> = Vec::with_capacity(m);
+    let mut y_hist: Vec<Vec<f64>> = Vec::with_capacity(m);
+    let mut rho_hist: Vec<f64> = Vec::with_capacity(m);
+
+    let mut x_new = vec![0.0; n];
+    let mut q = vec![0.0; n];
+    let mut alpha_buf = vec![0.0; m];
+
+    for iter in 0..max_iter {
+        let grad_norm: f64 = g.iter().map(|gi| gi * gi).sum::<f64>().sqrt();
+        if grad_norm < tol {
+            return Ok(OptResult {
+                f_val: f(&x),
+                x,
+                iterations: iter,
+            });
+        }
+
+        // L-BFGS two-loop recursion to compute search direction d = -H·g
+        q.copy_from_slice(&g);
+        let k = s_hist.len();
+
+        // First loop (newest to oldest)
+        for i in (0..k).rev() {
+            alpha_buf[i] = rho_hist[i]
+                * s_hist[i]
+                    .iter()
+                    .zip(q.iter())
+                    .map(|(si, qi)| si * qi)
+                    .sum::<f64>();
+            for j in 0..n {
+                q[j] -= alpha_buf[i] * y_hist[i][j];
+            }
+        }
+
+        // Initial Hessian scaling: H0 = (s·y)/(y·y) · I
+        if k > 0 {
+            let yy: f64 = y_hist[k - 1].iter().map(|yi| yi * yi).sum();
+            if yy > crate::EPSILON_F64 {
+                let gamma = 1.0 / (rho_hist[k - 1] * yy);
+                for qi in &mut q {
+                    *qi *= gamma;
+                }
+            }
+        }
+
+        // Second loop (oldest to newest)
+        for i in 0..k {
+            let beta: f64 = rho_hist[i]
+                * y_hist[i]
+                    .iter()
+                    .zip(q.iter())
+                    .map(|(yi, qi)| yi * qi)
+                    .sum::<f64>();
+            for j in 0..n {
+                q[j] += (alpha_buf[i] - beta) * s_hist[i][j];
+            }
+        }
+
+        // d = -q (search direction)
+        for qi in &mut q {
+            *qi = -*qi;
+        }
+
+        // Backtracking line search
+        let mut step = 1.0;
+        let f_old = f(&x);
+        let dg: f64 = q.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
+        let c1 = 1e-4;
+
+        for _ in 0..40 {
+            for i in 0..n {
+                x_new[i] = x[i] + step * q[i];
+            }
+            if f(&x_new) <= f_old + c1 * step * dg {
+                break;
+            }
+            step *= 0.5;
+        }
+
+        let g_new = grad_f(&x_new);
+
+        // Store correction pair
+        let s_k: Vec<f64> = (0..n).map(|i| x_new[i] - x[i]).collect();
+        let y_k: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
+        let sy: f64 = s_k.iter().zip(y_k.iter()).map(|(si, yi)| si * yi).sum();
+
+        if sy > crate::EPSILON_F64 {
+            if s_hist.len() == m {
+                s_hist.remove(0);
+                y_hist.remove(0);
+                rho_hist.remove(0);
+            }
+            rho_hist.push(1.0 / sy);
+            s_hist.push(s_k);
+            y_hist.push(y_k);
+        }
+
+        std::mem::swap(&mut x, &mut x_new);
         g = g_new;
     }
 
@@ -1939,6 +2086,12 @@ pub fn levenberg_marquardt(
     let mut cost: f64 = r.iter().map(|ri| ri * ri).sum();
     let mut lambda = 1e-3;
 
+    // Pre-allocate scratch buffers
+    let mut jtj = vec![vec![0.0; n]; n];
+    let mut jtr = vec![0.0; n];
+    let mut aug: Vec<Vec<f64>> = vec![vec![0.0; n + 1]; n];
+    let mut x_trial = vec![0.0; n];
+
     for iter in 0..max_iter {
         if cost.sqrt() < tol {
             return Ok(OptResult {
@@ -1952,8 +2105,10 @@ pub fn levenberg_marquardt(
         let m = r.len();
 
         // Compute JᵀJ and Jᵀr
-        let mut jtj = vec![vec![0.0; n]; n];
-        let mut jtr = vec![0.0; n];
+        for row in &mut jtj {
+            row.fill(0.0);
+        }
+        jtr.fill(0.0);
         for i in 0..n {
             for k in 0..m {
                 jtr[i] += j[k][i] * r[k];
@@ -1970,12 +2125,10 @@ pub fn levenberg_marquardt(
             jtj[i][i] += lambda;
         }
 
-        // Solve via Gaussian elimination (augmented matrix)
-        let mut aug: Vec<Vec<f64>> = Vec::with_capacity(n);
+        // Build augmented matrix in-place
         for i in 0..n {
-            let mut row = jtj[i].clone();
-            row.push(-jtr[i]);
-            aug.push(row);
+            aug[i][..n].copy_from_slice(&jtj[i]);
+            aug[i][n] = -jtr[i];
         }
 
         let delta = match gaussian_elimination(&mut aug) {
@@ -1987,12 +2140,14 @@ pub fn levenberg_marquardt(
         };
 
         // Trial step
-        let x_trial: Vec<f64> = (0..n).map(|i| x[i] + delta[i]).collect();
+        for i in 0..n {
+            x_trial[i] = x[i] + delta[i];
+        }
         let r_trial = residuals(&x_trial);
         let cost_trial: f64 = r_trial.iter().map(|ri| ri * ri).sum();
 
         if cost_trial < cost {
-            x = x_trial;
+            std::mem::swap(&mut x, &mut x_trial);
             r = r_trial;
             cost = cost_trial;
             lambda *= 0.1;
@@ -4262,5 +4417,40 @@ mod tests {
     #[test]
     fn dopri45_invalid_h() {
         assert!(dopri45(|_, _, _| {}, 0.0, &[1.0], 1.0, 1e-6, 0.0).is_err());
+    }
+
+    // --- L-BFGS tests ---
+
+    #[test]
+    fn lbfgs_quadratic() {
+        let f = |x: &[f64]| (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2);
+        let grad = |x: &[f64]| vec![2.0 * (x[0] - 1.0), 2.0 * (x[1] - 2.0)];
+        let result = lbfgs(f, grad, &[0.0, 0.0], 5, 1e-8, 100).unwrap();
+        assert!((result.x[0] - 1.0).abs() < 1e-6);
+        assert!((result.x[1] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lbfgs_rosenbrock() {
+        let f = |x: &[f64]| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2);
+        let grad = |x: &[f64]| {
+            vec![
+                -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0] * x[0]),
+                200.0 * (x[1] - x[0] * x[0]),
+            ]
+        };
+        let result = lbfgs(f, grad, &[0.0, 0.0], 10, 1e-6, 2000).unwrap();
+        assert!((result.x[0] - 1.0).abs() < 1e-3);
+        assert!((result.x[1] - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn lbfgs_empty_errors() {
+        assert!(lbfgs(|_| 0.0, |_| vec![], &[], 5, 1e-6, 10).is_err());
+    }
+
+    #[test]
+    fn lbfgs_zero_m_errors() {
+        assert!(lbfgs(|_| 0.0, |_| vec![0.0], &[0.0], 0, 1e-6, 10).is_err());
     }
 }

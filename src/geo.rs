@@ -7,6 +7,12 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Maximum iterations for GJK collision detection (2D and 3D).
+pub const GJK_MAX_ITERATIONS: usize = 64;
+
+/// Maximum iterations for EPA penetration depth (2D and 3D).
+pub const EPA_MAX_ITERATIONS: usize = 64;
+
 /// A ray defined by an origin and a direction.
 ///
 /// # Examples
@@ -1821,7 +1827,7 @@ fn gjk_core(
     simplex_len += 1;
     direction = -s;
 
-    for _ in 0..64 {
+    for _ in 0..GJK_MAX_ITERATIONS {
         let new_point = minkowski_support(a, b, direction);
         if new_point.dot(direction) < 0.0 {
             return GjkResult::NoIntersection;
@@ -1913,11 +1919,11 @@ pub fn epa_penetration(
         return None;
     }
 
-    // Pre-allocate for typical EPA expansion (bounded by 64 iterations + initial 3).
+    // Pre-allocate for typical EPA expansion.
     let mut polytope: Vec<glam::Vec2> = Vec::with_capacity(32);
     polytope.extend_from_slice(simplex);
 
-    for _ in 0..64 {
+    for _ in 0..EPA_MAX_ITERATIONS {
         // Find the closest edge to the origin
         let mut closest_dist = f32::INFINITY;
         let mut closest_normal = glam::Vec2::ZERO;
@@ -2372,7 +2378,7 @@ fn gjk_core_3d(a: &dyn ConvexSupport3D, b: &dyn ConvexSupport3D) -> Option<Vec<V
     simplex.push(s);
     direction = -s;
 
-    for _ in 0..64 {
+    for _ in 0..GJK_MAX_ITERATIONS {
         if direction.length_squared() < crate::EPSILON_F32 {
             // Direction degenerated — pick perpendicular to existing simplex
             if simplex.len() >= 2 {
@@ -2570,7 +2576,7 @@ fn epa_penetration_3d(
         }
     }
 
-    for _ in 0..64 {
+    for _ in 0..EPA_MAX_ITERATIONS {
         // Find closest face to origin
         let mut closest_dist = f32::INFINITY;
         let mut closest_normal = Vec3::ZERO;

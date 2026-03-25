@@ -2415,9 +2415,11 @@ impl CsrMatrix {
         }
 
         let mut new_offsets = Vec::with_capacity(self.ncols + 1);
+        let mut cumulative = 0usize;
         new_offsets.push(0);
         for &count in &row_counts {
-            new_offsets.push(new_offsets.last().unwrap() + count);
+            cumulative += count;
+            new_offsets.push(cumulative);
         }
 
         let mut new_values = vec![0.0; self.nnz()];

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.0 (2026-03-31)
+
+Stable release. All pre-1.0 milestones complete.
+
+### Final changes
+- GJK/EPA iteration limits now configurable via `GJK_MAX_ITERATIONS` and `EPA_MAX_ITERATIONS` constants
+- Resolved all known technical debt
+- 617 tests (574 unit + 34 integration + 9 doc), zero clippy warnings
+
 ## 0.28.3 (2026-03-28)
 
 ### parallel — Rayon batch operations (new module)
@@ -22,8 +31,15 @@
 - interval: Made fields private, added `lo()`/`hi()` accessors (invariant protection)
 - symbolic: Epsilon-based simplification (handles `-0.0`, near-zero/one correctly)
 
+### Consumer smoke tests (integration)
+- impetus: broadphase→narrowphase pipeline, raycast scene query
+- kiran: camera frustum culling, transform hierarchy composition
+- joshua: ODE deterministic replay, multibody conservation laws
+- aethersafha: compositor projection chain, keyframe animation interpolation
+- abaco: symbolic differentiation→evaluation pipeline
+
 ### Stats
-- 593 tests (574 unit + 10 integration + 9 doc), zero clippy warnings
+- 617 tests (574 unit + 34 integration + 9 doc), zero clippy warnings
 
 ## 0.27.3 (2026-03-27)
 

@@ -53,53 +53,20 @@ Post-1.0: standard semver.
 - Zero clippy warnings, cargo audit clean, cargo deny clean
 - Consumer smoke tests for impetus, kiran, joshua, aethersafha, abaco
 
+### 1.1.0 — All critical + important items shipped (2026-03-25)
+- Symplectic integrators, quaternion utils, frustum-sphere, spring dynamics, bezier easing
+- Screen projection, sRGB, noise (Perlin/fBm), PCG32, 2D FFT, truncated SVD
+- SDFs + CSG, polygon triangulation, ray-quadric, Fresnel, SAP broadphase
+- DualQuat, CSS decompose, color matrices, Oklab, spherical harmonics
+- Inertia tensors, GMRES, PGS, eigendecomposition, stiff ODE (backward Euler, BDF-2)
+- Euler-Maruyama, Milstein SDE, Lyapunov exponents, CCD/TOI, sequential impulse
+- Convex decomposition, reverse-mode AD (tape-based)
+- Refactored num.rs → 13 submodules, geo.rs → 7 submodules
+- 714 tests
+
 ---
 
-## 1.0.1 — Low-Hanging Critical + Important (patch)
-
-- [ ] Symplectic integrators: Verlet, leapfrog, symplectic Euler (joshua, impetus)
-- [ ] Quaternion utilities: look_at, from_euler, to_euler with rotation order (kiran)
-- [ ] `Frustum::contains_sphere()` (kiran)
-- [ ] Spring dynamics: critically damped spring solver for UI animation (aethersafha)
-- [ ] `cubic_bezier_ease()` — CSS cubic-bezier timing function (aethersafha)
-- [ ] `world_to_screen()`, `screen_to_world_ray()` screen-space projection (kiran)
-- [ ] sRGB/linear color space conversions (kiran, aethersafha)
-- [ ] Noise functions: Perlin, simplex (OpenSimplex2), fBm (kiran)
-- [ ] PCG random number generator (joshua deterministic replay)
-- [ ] Expr::substitute() for symbolic module (abaco)
-- [ ] 2D FFT/IFFT (prakash)
-- [ ] Truncated SVD convenience function (num)
-
-## 1.1.0 — Medium Critical + Important (minor)
-
-- [ ] Contact manifold generation: SAT, Sutherland-Hodgman clipping (impetus)
-- [ ] Inertia tensor computation from triangle mesh + primitive shapes (impetus)
-- [ ] CSS transform decomposition: decompose_mat4/recompose_mat4 (aethersafha)
-- [ ] Polygon triangulation: ear clipping (kiran)
-- [ ] Dual quaternions for skinning: DualQuat type (kiran)
-- [ ] Signed distance fields: analytical SDFs + CSG operations (impetus, kiran)
-- [ ] Sort-and-sweep (SAP) broadphase (impetus)
-- [ ] MPR / XenoCollide collision alternative (impetus)
-- [ ] NURBS evaluation (kiran)
-- [ ] Color matrix operations: saturation, hue rotation, Oklab/Oklch (aethersafha)
-- [ ] Delaunay triangulation + Voronoi diagrams 2D (kiran)
-- [ ] Ray-quadric intersection (prakash)
-- [ ] Fresnel equations + refraction vector (prakash)
-- [ ] Sparse LU/Cholesky factorization (joshua)
-- [ ] GMRES, BiCGSTAB iterative sparse solvers (joshua)
-- [ ] Spherical harmonics L0-L2 evaluation + projection (kiran)
-
-## 1.2.0 — Heavy Critical (minor)
-
-- [ ] Stiff ODE solvers: backward Euler, BDF-2 through BDF-5, TR-BDF2 (joshua)
-- [ ] Full eigendecomposition: QR algorithm (Francis double-shift), symmetric tridiag+QR (num)
-- [ ] Continuous collision detection: TOI via conservative advancement (impetus)
-- [ ] Constraint solvers: sequential impulse, projected Gauss-Seidel (impetus)
-- [ ] Stochastic differential equations: Euler-Maruyama, Milstein (joshua)
-- [ ] Convex decomposition: V-HACD or Hertel-Mehlhorn (impetus)
-- [ ] Stability analysis: Lyapunov exponents, eigenvalue-based (joshua)
-- [ ] Reverse-mode automatic differentiation (tape-based) (num/autodiff)
-- [ ] GPU compute kernels via wgpu (shared with ranga)
+## Future
 
 ## Watch List
 

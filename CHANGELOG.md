@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.0 (2026-03-25)
+## 1.1.0 (2026-03-25)
 
 ### num — Full eigendecomposition
 - `eigen_symmetric()` — Jacobi rotation algorithm for all eigenvalues + orthonormal eigenvectors
@@ -39,10 +39,7 @@
 - `reverse_gradient()` — convenience API for gradient computation
 - Operations: add, sub, mul, div, neg, sin, cos, exp, ln, powf
 
-### Stats
-- 714 tests (671 unit + 34 integration + 9 doc), zero clippy warnings
-
-## 1.1.0 (2026-03-25)
+### geo — Signed distance fields
 
 ### geo — Signed distance fields
 - `sdf_sphere()`, `sdf_box()`, `sdf_capsule()` — analytical SDFs
@@ -83,11 +80,6 @@
 ### num — GMRES iterative solver
 - `gmres()` — GMRES(m) for non-symmetric linear systems
 
-### Stats
-- 683 tests (640 unit + 34 integration + 9 doc), zero clippy warnings
-
-## 1.0.1 (2026-03-25)
-
 ### num — Symplectic integrators
 - `symplectic_euler()`, `symplectic_euler_step()` — semi-implicit Euler
 - `verlet()`, `verlet_step()` — velocity Störmer-Verlet
@@ -123,8 +115,13 @@
 ### symbolic — Substitution
 - `Expr::substitute()` — replace variables with sub-expressions
 
+### Refactoring
+- Split `num.rs` (6097 lines) into 13 submodules: roots, linalg, eigen, complex, fft, ode, inertia, solvers, stability, optimize, rng, sparse, svd
+- Split `geo.rs` (5466 lines) into 7 submodules: primitives, intersection, closest, spatial, collision, sdf, decompose
+- Zero API changes — all re-exports preserved
+
 ### Stats
-- 654 tests (611 unit + 34 integration + 9 doc), zero clippy warnings
+- 714 tests (671 unit + 34 integration + 9 doc), zero clippy warnings
 
 ## 1.0.0 (2026-03-31)
 

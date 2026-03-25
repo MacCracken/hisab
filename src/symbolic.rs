@@ -17,6 +17,24 @@ fn is_one(x: f64) -> bool {
 }
 
 /// A symbolic mathematical expression.
+///
+/// # Examples
+///
+/// ```
+/// use hisab::symbolic::Expr;
+/// use std::collections::HashMap;
+///
+/// // Build x² + 1, differentiate, evaluate
+/// let x = Expr::Var("x".into());
+/// let expr = Expr::Add(
+///     Box::new(Expr::Pow(Box::new(x.clone()), Box::new(Expr::Const(2.0)))),
+///     Box::new(Expr::Const(1.0)),
+/// );
+/// let d = expr.differentiate("x").simplify();
+/// let mut vars = HashMap::new();
+/// vars.insert("x".into(), 3.0);
+/// assert!((d.evaluate(&vars).unwrap() - 6.0).abs() < 1e-10);
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Expr {
@@ -48,6 +66,7 @@ impl Expr {
     /// # Errors
     ///
     /// Returns [`crate::HisabError::InvalidInput`] if a variable is not in `vars`.
+    #[must_use = "returns the evaluated result or an error"]
     pub fn evaluate(&self, vars: &HashMap<String, f64>) -> Result<f64, crate::HisabError> {
         match self {
             Expr::Const(c) => Ok(*c),

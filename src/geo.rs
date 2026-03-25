@@ -8,6 +8,18 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A ray defined by an origin and a direction.
+///
+/// # Examples
+///
+/// ```
+/// use hisab::geo::{Ray, Sphere, ray_sphere};
+/// use glam::Vec3;
+///
+/// let ray = Ray::new(Vec3::new(0.0, 0.0, -5.0), Vec3::Z).unwrap();
+/// let sphere = Sphere::new(Vec3::ZERO, 1.0).unwrap();
+/// let t = ray_sphere(&ray, &sphere).unwrap();
+/// assert!((t - 4.0).abs() < 1e-5);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Ray {
     pub origin: Vec3,

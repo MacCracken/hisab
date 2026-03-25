@@ -88,19 +88,13 @@ Post-1.0 releases follow standard semver.
 - tensor: N-D Tensor, zeros/ones, get/set, reshape, add/sub/scale, matmul, transpose
 - 578 tests
 
----
-
-## Upcoming Milestones
-
-### 0.28.3 — GPU, Parallelism, Pre-publish Polish (2026-03-28)
-**Focus:** Acceleration + final quality pass.
-
-- [ ] Compute kernels via wgpu (shared with ranga) — `gpu`
-- [ ] Rayon integration for batch spatial queries, large FFTs — `parallel`
-- [ ] Complete doctests across all modules
-- [ ] Final API review — naming consistency, argument order
-- [ ] `cargo semver-checks`, update CHANGELOG + README
-- [ ] Full benchmark sweep and history baseline
+### 0.28.3 — Parallelism, Doctests, Pre-publish Polish (2026-03-28)
+- parallel: par_transform_points, par_ray_aabb_batch, par_ray_sphere_batch, par_matrix_vector_multiply, par_map (rayon)
+- Doctests on all key entry points (9 doc tests)
+- API review: naming consistency verified, missing #[must_use] added
+- Audit: autodiff scalar ops, interval invariant protection, symbolic epsilon simplification
+- 593 tests (574 unit + 10 integration + 9 doc)
+- GPU deferred to post-1.0
 
 ---
 

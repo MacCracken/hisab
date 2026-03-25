@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.28.3 (2026-03-28)
+
+### parallel — Rayon batch operations (new module)
+- `par_transform_points()` — batch 3D transform application
+- `par_ray_aabb_batch()`, `par_ray_sphere_batch()` — parallel intersection tests
+- `par_matrix_vector_multiply()` — parallel dense matvec
+- `par_map()` — parallel element-wise operation
+- Feature-gated: `parallel` (requires rayon)
+
+### Doctests
+- Added doc examples on key entry points: `Transform2D`, `Ray`, `derivative`, `newton_raphson`, `Dual`, `Interval`, `Expr`, `Tensor`
+- 9 doctests passing
+
+### API review
+- Added missing `#[must_use]` on `Expr::evaluate()`
+- Verified naming consistency, argument order, `#[non_exhaustive]` coverage across all modules
+
+### Audit hardening (0.26.3 code)
+- autodiff: Added `Sub<f64>`, `Div<f64>`, `f64 + Dual`, `f64 * Dual` ops
+- interval: Made fields private, added `lo()`/`hi()` accessors (invariant protection)
+- symbolic: Epsilon-based simplification (handles `-0.0`, near-zero/one correctly)
+
+### Stats
+- 593 tests (574 unit + 10 integration + 9 doc), zero clippy warnings
+
 ## 0.27.3 (2026-03-27)
 
 ### autodiff — Forward-mode automatic differentiation (new module)

@@ -9,6 +9,18 @@ use std::ops;
 /// A closed interval `[lo, hi]`.
 ///
 /// All operations maintain the invariant `lo <= hi`.
+///
+/// # Examples
+///
+/// ```
+/// use hisab::interval::Interval;
+///
+/// let a = Interval::new(1.0, 3.0);
+/// let b = Interval::new(2.0, 4.0);
+/// let sum = a + b;
+/// assert!((sum.lo() - 3.0).abs() < 1e-12);
+/// assert!((sum.hi() - 7.0).abs() < 1e-12);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Interval {
     lo: f64,

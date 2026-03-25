@@ -17,6 +17,7 @@
 //! | `interval` | no | Interval arithmetic for verified numerics |
 //! | `symbolic` | no | Symbolic expression tree with differentiation and simplification |
 //! | `tensor` | no | N-dimensional dense tensor type |
+//! | `parallel` | no | Rayon-powered parallel batch operations |
 //! | `ai` | no | Daimon/hoosh AI client (requires network deps) |
 //! | `logging` | no | Structured logging via tracing-subscriber |
 //! | `full` | — | Enables all features |
@@ -59,6 +60,9 @@ pub mod symbolic;
 
 #[cfg(feature = "tensor")]
 pub mod tensor;
+
+#[cfg(feature = "parallel")]
+pub mod parallel;
 
 #[cfg(feature = "ai")]
 pub mod ai;

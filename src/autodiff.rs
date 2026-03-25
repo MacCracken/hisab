@@ -10,6 +10,19 @@ use std::ops;
 ///
 /// - `val`: the function value.
 /// - `deriv`: the derivative with respect to the seeded variable.
+///
+/// # Examples
+///
+/// ```
+/// use hisab::autodiff::Dual;
+///
+/// // Compute f(x) = x² + 2x and f'(x) at x=3
+/// let x = Dual::var(3.0);
+/// let c = Dual::constant(2.0);
+/// let result = x * x + c * x;
+/// assert!((result.val - 15.0).abs() < 1e-10); // f(3) = 9 + 6
+/// assert!((result.deriv - 8.0).abs() < 1e-10); // f'(3) = 6 + 2
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Dual {
     /// Function value.

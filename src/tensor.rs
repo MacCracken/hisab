@@ -6,6 +6,17 @@
 use crate::HisabError;
 
 /// An N-dimensional dense tensor.
+///
+/// # Examples
+///
+/// ```
+/// use hisab::tensor::Tensor;
+///
+/// let a = Tensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+/// let b = Tensor::ones(vec![2, 2]);
+/// let c = a.add(&b).unwrap();
+/// assert!((c.get(&[0, 0]).unwrap() - 2.0).abs() < 1e-12);
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tensor {
     /// Shape of the tensor (e.g. `[2, 3]` for a 2×3 matrix).

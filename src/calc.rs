@@ -11,6 +11,16 @@ use glam::{Vec2, Vec3};
 /// `f`: the function to differentiate.
 /// `x`: the point at which to evaluate the derivative.
 /// `h`: the step size (smaller = more accurate but risk of cancellation).
+///
+/// # Examples
+///
+/// ```
+/// use hisab::calc::derivative;
+///
+/// // d/dx(x²) at x=3 ≈ 6
+/// let d = derivative(|x| x * x, 3.0, 1e-7);
+/// assert!((d - 6.0).abs() < 1e-5);
+/// ```
 #[must_use]
 #[inline]
 pub fn derivative(f: impl Fn(f64) -> f64, x: f64, h: f64) -> f64 {

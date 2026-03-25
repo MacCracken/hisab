@@ -12,6 +12,16 @@ pub use glam::{DMat3, DMat4, DQuat, DVec2, DVec3, DVec4};
 pub use glam::{Mat3, Mat4, Quat, Vec2, Vec3, Vec4};
 
 /// A 2D affine transform (position, rotation in radians, non-uniform scale).
+///
+/// # Examples
+///
+/// ```
+/// use hisab::transforms::{Transform2D, Vec2};
+///
+/// let t = Transform2D::new(Vec2::new(1.0, 2.0), 0.0, Vec2::ONE);
+/// let p = t.apply_to_point(Vec2::ZERO);
+/// assert!((p.x - 1.0).abs() < 1e-5);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Transform2D {
     pub position: Vec2,

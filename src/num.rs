@@ -15,6 +15,16 @@ use serde::{Deserialize, Serialize};
 /// - `df`: the derivative of `f`.
 /// - `x0`: initial guess.
 /// - `tol`: convergence tolerance (stops when `|f(x)| < tol`).
+///
+/// # Examples
+///
+/// ```
+/// use hisab::num::newton_raphson;
+///
+/// // Find √2: solve x² - 2 = 0
+/// let root = newton_raphson(|x| x * x - 2.0, |x| 2.0 * x, 1.5, 1e-10, 100).unwrap();
+/// assert!((root - std::f64::consts::SQRT_2).abs() < 1e-9);
+/// ```
 /// - `max_iter`: maximum iterations.
 ///
 /// # Errors

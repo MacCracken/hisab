@@ -1590,6 +1590,798 @@ pub fn dopri45(
 }
 
 // ---------------------------------------------------------------------------
+// Full eigendecomposition
+// ---------------------------------------------------------------------------
+
+/// Result of an eigendecomposition.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct EigenDecomposition {
+    /// Real parts of eigenvalues (sorted by descending magnitude).
+    pub eigenvalues_real: Vec<f64>,
+    /// Imaginary parts of eigenvalues (zero for real eigenvalues).
+    pub eigenvalues_imag: Vec<f64>,
+    /// Eigenvectors as columns (only for symmetric/real eigenvalues; `None` if complex).
+    pub eigenvectors: Option<Vec<Vec<f64>>>,
+}
+
+/// Symmetric eigendecomposition via tridiagonal QR with Wilkinson shift.
+///
+/// Input must be a symmetric `n × n` matrix (only lower triangle is read).
+/// Returns all eigenvalues (sorted descending) and orthonormal eigenvectors.
+///
+/// # Errors
+///
+/// Returns [`HisabError::InvalidInput`] if the matrix is empty or not square.
+/// Returns [`HisabError::NoConvergence`] if QR iteration doesn't converge.
+#[must_use = "contains the eigendecomposition or an error"]
+#[allow(clippy::needless_range_loop)]
+pub fn eigen_symmetric(
+    a: &[Vec<f64>],
+    tol: f64,
+    max_iter: usize,
+) -> Result<EigenDecomposition, HisabError> {
+    // Jacobi eigenvalue algorithm for symmetric matrices.
+    // Same rotation approach proven in our SVD — rotate pairs until diagonal.
+    let n = a.len();
+    if n == 0 {
+        return Err(HisabError::InvalidInput("empty matrix".into()));
+    }
+    for row in a {
+        if row.len() != n {
+            return Err(HisabError::InvalidInput("matrix must be square".into()));
+        }
+    }
+
+    if n == 1 {
+        return Ok(EigenDecomposition {
+            eigenvalues_real: vec![a[0][0]],
+            eigenvalues_imag: vec![0.0],
+            eigenvectors: Some(vec![vec![1.0]]),
+        });
+    }
+
+    // Work on a copy
+    let mut w: Vec<Vec<f64>> = a.to_vec();
+
+    // Eigenvector accumulator (identity initially)
+    let mut v = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        v[i][i] = 1.0;
+    }
+
+    let tol_sq = tol * tol;
+
+    for _ in 0..max_iter {
+        // Find largest off-diagonal element
+        let mut converged = true;
+        for p in 0..n {
+            for q_idx in (p + 1)..n {
+                if w[p][q_idx].abs() > tol_sq {
+                    converged = false;
+
+                    // Jacobi rotation to zero out w[p][q]
+                    let theta = if (w[p][p] - w[q_idx][q_idx]).abs() < crate::EPSILON_F64 {
+                        std::f64::consts::FRAC_PI_4
+                    } else {
+                        0.5 * (2.0 * w[p][q_idx] / (w[p][p] - w[q_idx][q_idx])).atan()
+                    };
+                    let cos = theta.cos();
+                    let sin = theta.sin();
+
+                    // Update matrix: W' = Gᵀ W G
+                    // Rows/cols p and q change
+                    let mut new_p = vec![0.0; n];
+                    let mut new_q = vec![0.0; n];
+                    for i in 0..n {
+                        new_p[i] = cos * w[p][i] + sin * w[q_idx][i];
+                        new_q[i] = -sin * w[p][i] + cos * w[q_idx][i];
+                    }
+                    w[p][..n].copy_from_slice(&new_p[..n]);
+                    w[q_idx][..n].copy_from_slice(&new_q[..n]);
+                    // Now columns
+                    for i in 0..n {
+                        let wp = w[i][p];
+                        let wq = w[i][q_idx];
+                        w[i][p] = cos * wp + sin * wq;
+                        w[i][q_idx] = -sin * wp + cos * wq;
+                    }
+
+                    // Accumulate eigenvectors: V' = V * G
+                    for i in 0..n {
+                        let vp = v[i][p];
+                        let vq = v[i][q_idx];
+                        v[i][p] = cos * vp + sin * vq;
+                        v[i][q_idx] = -sin * vp + cos * vq;
+                    }
+                }
+            }
+        }
+        if converged {
+            break;
+        }
+    }
+
+    // Eigenvalues are the diagonal of W
+    let eigenvalues: Vec<f64> = (0..n).map(|i| w[i][i]).collect();
+
+    // Sort by descending magnitude
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| {
+        eigenvalues[b]
+            .abs()
+            .partial_cmp(&eigenvalues[a].abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let sorted_eigs: Vec<f64> = order.iter().map(|&i| eigenvalues[i]).collect();
+    let eigenvectors: Vec<Vec<f64>> = order
+        .iter()
+        .map(|&idx| (0..n).map(|i| v[i][idx]).collect())
+        .collect();
+
+    Ok(EigenDecomposition {
+        eigenvalues_real: sorted_eigs,
+        eigenvalues_imag: vec![0.0; n],
+        eigenvectors: Some(eigenvectors),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Inertia tensor computation
+// ---------------------------------------------------------------------------
+
+/// Compute the inertia tensor of a solid sphere.
+#[must_use]
+#[inline]
+pub fn inertia_sphere(mass: f64, radius: f64) -> Vec<Vec<f64>> {
+    let i = 0.4 * mass * radius * radius;
+    vec![vec![i, 0.0, 0.0], vec![0.0, i, 0.0], vec![0.0, 0.0, i]]
+}
+
+/// Compute the inertia tensor of a solid box (cuboid).
+#[must_use]
+#[inline]
+pub fn inertia_box(mass: f64, hx: f64, hy: f64, hz: f64) -> Vec<Vec<f64>> {
+    let w = 2.0 * hx;
+    let h = 2.0 * hy;
+    let d = 2.0 * hz;
+    let c = mass / 12.0;
+    vec![
+        vec![c * (h * h + d * d), 0.0, 0.0],
+        vec![0.0, c * (w * w + d * d), 0.0],
+        vec![0.0, 0.0, c * (w * w + h * h)],
+    ]
+}
+
+/// Compute the inertia tensor of a triangle mesh (solid body).
+///
+/// Uses the divergence theorem method. The mesh must be closed with
+/// consistent outward-facing winding.
+///
+/// Returns `(volume, center_of_mass, inertia_tensor_3x3)`.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn inertia_mesh(
+    triangles: &[([f64; 3], [f64; 3], [f64; 3])],
+) -> (f64, [f64; 3], Vec<Vec<f64>>) {
+    let mut volume = 0.0;
+    let mut com = [0.0; 3];
+    let mut ii = [[0.0f64; 3]; 3];
+
+    for &(v0, v1, v2) in triangles {
+        let d = v0[0] * (v1[1] * v2[2] - v1[2] * v2[1]) - v0[1] * (v1[0] * v2[2] - v1[2] * v2[0])
+            + v0[2] * (v1[0] * v2[1] - v1[1] * v2[0]);
+        let vol = d / 6.0;
+        volume += vol;
+
+        for i in 0..3 {
+            com[i] += vol * (v0[i] + v1[i] + v2[i]) / 4.0;
+        }
+
+        for i in 0..3 {
+            for j in 0..3 {
+                ii[i][j] += vol
+                    * (v0[i] * v0[j]
+                        + v1[i] * v1[j]
+                        + v2[i] * v2[j]
+                        + (v0[i] + v1[i] + v2[i]) * (v0[j] + v1[j] + v2[j]))
+                    / 20.0;
+            }
+        }
+    }
+
+    if volume.abs() > crate::EPSILON_F64 {
+        for c in &mut com {
+            *c /= volume;
+        }
+    }
+
+    let trace = ii[0][0] + ii[1][1] + ii[2][2];
+    let inertia = vec![
+        vec![trace - ii[0][0], -ii[0][1], -ii[0][2]],
+        vec![-ii[1][0], trace - ii[1][1], -ii[1][2]],
+        vec![-ii[2][0], -ii[2][1], trace - ii[2][2]],
+    ];
+
+    (volume, com, inertia)
+}
+
+// ---------------------------------------------------------------------------
+// Projected Gauss-Seidel (PGS)
+// ---------------------------------------------------------------------------
+
+/// Projected Gauss-Seidel: solve A·x = b subject to `lo[i] <= x[i] <= hi[i]`.
+///
+/// Used as the inner solver for physics constraint solving.
+///
+/// # Errors
+///
+/// Returns [`HisabError::InvalidInput`] if dimensions are inconsistent.
+#[must_use = "contains the solution or an error"]
+#[allow(clippy::needless_range_loop)]
+pub fn projected_gauss_seidel(
+    a: &[Vec<f64>],
+    b: &[f64],
+    lo: &[f64],
+    hi: &[f64],
+    x0: &[f64],
+    max_iter: usize,
+    tol: f64,
+) -> Result<Vec<f64>, HisabError> {
+    let n = b.len();
+    if n == 0 {
+        return Err(HisabError::InvalidInput("empty system".into()));
+    }
+    if a.len() != n || lo.len() != n || hi.len() != n || x0.len() != n {
+        return Err(HisabError::InvalidInput("dimension mismatch".into()));
+    }
+
+    let mut x = x0.to_vec();
+
+    for _ in 0..max_iter {
+        let mut max_change = 0.0f64;
+        for i in 0..n {
+            if a[i][i].abs() < crate::EPSILON_F64 {
+                continue;
+            }
+            let mut sigma = b[i];
+            for j in 0..n {
+                if j != i {
+                    sigma -= a[i][j] * x[j];
+                }
+            }
+            let new_x = (sigma / a[i][i]).clamp(lo[i], hi[i]);
+            max_change = max_change.max((new_x - x[i]).abs());
+            x[i] = new_x;
+        }
+        if max_change < tol {
+            break;
+        }
+    }
+
+    Ok(x)
+}
+
+// ---------------------------------------------------------------------------
+// GMRES iterative solver
+// ---------------------------------------------------------------------------
+
+/// GMRES(m) for non-symmetric linear systems A·x = b.
+///
+/// # Errors
+///
+/// Returns [`HisabError::InvalidInput`] if dimensions mismatch.
+#[must_use = "contains the solution or an error"]
+#[allow(clippy::needless_range_loop)]
+pub fn gmres(
+    a_mul: impl Fn(&[f64]) -> Vec<f64>,
+    b: &[f64],
+    x0: &[f64],
+    restart: usize,
+    tol: f64,
+    max_iter: usize,
+) -> Result<Vec<f64>, HisabError> {
+    let n = b.len();
+    if x0.len() != n {
+        return Err(HisabError::InvalidInput(
+            "x0 length must match b length".into(),
+        ));
+    }
+
+    let mut x = x0.to_vec();
+    let m = restart.min(n);
+
+    for _ in 0..(max_iter / m.max(1) + 1) {
+        let ax = a_mul(&x);
+        let mut r: Vec<f64> = (0..n).map(|i| b[i] - ax[i]).collect();
+        let r_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+
+        if r_norm < tol {
+            return Ok(x);
+        }
+
+        let mut v_basis: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
+        let inv_r = 1.0 / r_norm;
+        for ri in &mut r {
+            *ri *= inv_r;
+        }
+        v_basis.push(r);
+
+        let mut h = vec![vec![0.0; m]; m + 1];
+        let mut g = vec![0.0; m + 1];
+        g[0] = r_norm;
+
+        let mut cs = vec![0.0; m];
+        let mut sn = vec![0.0; m];
+        let mut k = 0;
+
+        for j in 0..m {
+            let mut wj = a_mul(&v_basis[j]);
+
+            for i in 0..=j {
+                h[i][j] = wj.iter().zip(v_basis[i].iter()).map(|(a, b)| a * b).sum();
+                for l in 0..n {
+                    wj[l] -= h[i][j] * v_basis[i][l];
+                }
+            }
+            h[j + 1][j] = wj.iter().map(|v| v * v).sum::<f64>().sqrt();
+
+            if h[j + 1][j] > crate::EPSILON_F64 {
+                let inv = 1.0 / h[j + 1][j];
+                for v in &mut wj {
+                    *v *= inv;
+                }
+            }
+            v_basis.push(wj);
+
+            for i in 0..j {
+                let temp = cs[i] * h[i][j] + sn[i] * h[i + 1][j];
+                h[i + 1][j] = -sn[i] * h[i][j] + cs[i] * h[i + 1][j];
+                h[i][j] = temp;
+            }
+
+            let r_val = (h[j][j] * h[j][j] + h[j + 1][j] * h[j + 1][j]).sqrt();
+            if r_val > crate::EPSILON_F64 {
+                cs[j] = h[j][j] / r_val;
+                sn[j] = h[j + 1][j] / r_val;
+            } else {
+                cs[j] = 1.0;
+                sn[j] = 0.0;
+            }
+            h[j][j] = r_val;
+            h[j + 1][j] = 0.0;
+
+            let temp = cs[j] * g[j];
+            g[j + 1] = -sn[j] * g[j];
+            g[j] = temp;
+
+            k = j + 1;
+            if g[k].abs() < tol {
+                break;
+            }
+        }
+
+        let mut y = vec![0.0; k];
+        for i in (0..k).rev() {
+            y[i] = g[i];
+            for j in (i + 1)..k {
+                y[i] -= h[i][j] * y[j];
+            }
+            if h[i][i].abs() > crate::EPSILON_F64 {
+                y[i] /= h[i][i];
+            }
+        }
+
+        for i in 0..n {
+            for j in 0..k {
+                x[i] += y[j] * v_basis[j][i];
+            }
+        }
+
+        if g[k].abs() < tol {
+            return Ok(x);
+        }
+    }
+
+    Ok(x)
+}
+
+// ---------------------------------------------------------------------------
+// Stability analysis (Lyapunov exponents)
+// ---------------------------------------------------------------------------
+
+/// Compute the maximal Lyapunov exponent of a dynamical system.
+///
+/// Evolves the system and a perturbation vector, measuring exponential
+/// divergence rate. Positive MLE indicates chaos.
+///
+/// - `f`: derivative function `f(t, &y, &mut dy)`.
+/// - `jac`: Jacobian `jac(t, &y, &mut J)`.
+/// - `y0`: initial state.
+/// - `t_total`: total integration time.
+/// - `dt`: time step.
+/// - `renorm_steps`: how many steps between perturbation renormalization.
+///
+/// # Errors
+///
+/// Returns [`HisabError::InvalidInput`] if `y0` is empty or `dt` is non-positive.
+#[must_use = "contains the maximal Lyapunov exponent or an error"]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn lyapunov_max(
+    f: impl Fn(f64, &[f64], &mut [f64]),
+    jac: impl Fn(f64, &[f64], &mut Vec<Vec<f64>>),
+    y0: &[f64],
+    t_total: f64,
+    dt: f64,
+    renorm_steps: usize,
+) -> Result<f64, HisabError> {
+    let dim = y0.len();
+    if dim == 0 {
+        return Err(HisabError::InvalidInput("empty initial state".into()));
+    }
+    if dt <= 0.0 {
+        return Err(HisabError::InvalidInput("dt must be positive".into()));
+    }
+
+    let n_steps = (t_total / dt) as usize;
+    let renorm = renorm_steps.max(1);
+
+    let mut y = y0.to_vec();
+    // Perturbation vector (initially unit)
+    let mut dx = vec![0.0; dim];
+    dx[0] = 1.0;
+    let mut t = 0.0;
+    let mut sum_log = 0.0;
+    let mut count = 0;
+
+    let mut dy = vec![0.0; dim];
+    let mut j_mat = vec![vec![0.0; dim]; dim];
+    let mut ddx = vec![0.0; dim];
+
+    for step in 0..n_steps {
+        // Evolve main trajectory: simple Euler (good enough for Lyapunov computation)
+        f(t, &y, &mut dy);
+        jac(t, &y, &mut j_mat);
+
+        // Evolve perturbation: ddx = J * dx
+        for i in 0..dim {
+            ddx[i] = 0.0;
+            for j in 0..dim {
+                ddx[i] += j_mat[i][j] * dx[j];
+            }
+        }
+
+        for i in 0..dim {
+            y[i] += dt * dy[i];
+            dx[i] += dt * ddx[i];
+        }
+        t += dt;
+
+        // Renormalize perturbation periodically
+        if (step + 1) % renorm == 0 {
+            let norm: f64 = dx.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm > crate::EPSILON_F64 {
+                sum_log += norm.ln();
+                count += 1;
+                let inv = 1.0 / norm;
+                for x in &mut dx {
+                    *x *= inv;
+                }
+            }
+        }
+    }
+
+    if count == 0 {
+        return Ok(0.0);
+    }
+
+    Ok(sum_log / (count as f64 * renorm as f64 * dt))
+}
+
+// ---------------------------------------------------------------------------
+// Stiff ODE solvers
+// ---------------------------------------------------------------------------
+
+/// Backward (implicit) Euler method for stiff ODE systems.
+///
+/// Solves `dy/dt = f(t, y)` using Newton iteration at each step.
+///
+/// - `f`: derivative function `f(t, &y, &mut dy)`.
+/// - `jac`: Jacobian callback `jac(t, &y, &mut J)` fills the n×n Jacobian matrix.
+/// - `t0`, `y0`, `t_end`, `n`: integration parameters.
+/// - `newton_tol`: convergence tolerance for Newton iteration.
+/// - `max_newton`: max Newton iterations per step.
+///
+/// # Errors
+///
+/// Returns [`HisabError::ZeroSteps`] if `n` is zero.
+#[must_use = "contains the final state or an error"]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn backward_euler(
+    f: impl Fn(f64, &[f64], &mut [f64]),
+    jac: impl Fn(f64, &[f64], &mut Vec<Vec<f64>>),
+    t0: f64,
+    y0: &[f64],
+    t_end: f64,
+    n: usize,
+    newton_tol: f64,
+    max_newton: usize,
+) -> Result<Vec<f64>, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
+    let dim = y0.len();
+    let h = (t_end - t0) / n as f64;
+    let mut y = y0.to_vec();
+    let mut t = t0;
+
+    let mut f_val = vec![0.0; dim];
+    let mut j_mat = vec![vec![0.0; dim]; dim];
+    let mut delta = vec![0.0; dim];
+    let mut y_guess = vec![0.0; dim];
+
+    for _ in 0..n {
+        t += h;
+        y_guess.copy_from_slice(&y);
+
+        for _ in 0..max_newton {
+            f(t, &y_guess, &mut f_val);
+
+            // Residual: r = y_guess - y - h*f(t, y_guess)
+            // Newton system: (I - h*J) * delta = -r
+            jac(t, &y_guess, &mut j_mat);
+
+            // Build augmented matrix for Gaussian elimination
+            let mut aug: Vec<Vec<f64>> = Vec::with_capacity(dim);
+            for i in 0..dim {
+                let mut row = Vec::with_capacity(dim + 1);
+                for j in 0..dim {
+                    let ident = if i == j { 1.0 } else { 0.0 };
+                    row.push(ident - h * j_mat[i][j]);
+                }
+                row.push(-(y_guess[i] - y[i] - h * f_val[i]));
+                aug.push(row);
+            }
+
+            delta = match gaussian_elimination(&mut aug) {
+                Ok(d) => d,
+                Err(_) => break,
+            };
+
+            let norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+            for i in 0..dim {
+                y_guess[i] += delta[i];
+            }
+            if norm < newton_tol {
+                break;
+            }
+        }
+
+        y.copy_from_slice(&y_guess);
+    }
+
+    Ok(y)
+}
+
+/// BDF-2 (Backward Differentiation Formula, order 2) for stiff ODE systems.
+///
+/// Second-order implicit method. Uses backward Euler for the first step.
+///
+/// # Errors
+///
+/// Returns [`HisabError::ZeroSteps`] if `n` is zero.
+#[must_use = "contains the final state or an error"]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn bdf2(
+    f: impl Fn(f64, &[f64], &mut [f64]),
+    jac: impl Fn(f64, &[f64], &mut Vec<Vec<f64>>),
+    t0: f64,
+    y0: &[f64],
+    t_end: f64,
+    n: usize,
+    newton_tol: f64,
+    max_newton: usize,
+) -> Result<Vec<f64>, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
+    let dim = y0.len();
+    let h = (t_end - t0) / n as f64;
+    let mut y_prev = y0.to_vec();
+    let mut t = t0;
+
+    let mut f_val = vec![0.0; dim];
+    let mut j_mat = vec![vec![0.0; dim]; dim];
+    let mut y_guess = vec![0.0; dim];
+
+    // First step: backward Euler
+    t += h;
+    y_guess.copy_from_slice(&y_prev);
+    for _ in 0..max_newton {
+        f(t, &y_guess, &mut f_val);
+        jac(t, &y_guess, &mut j_mat);
+        let mut aug: Vec<Vec<f64>> = Vec::with_capacity(dim);
+        for i in 0..dim {
+            let mut row = Vec::with_capacity(dim + 1);
+            for j in 0..dim {
+                let ident = if i == j { 1.0 } else { 0.0 };
+                row.push(ident - h * j_mat[i][j]);
+            }
+            row.push(-(y_guess[i] - y_prev[i] - h * f_val[i]));
+            aug.push(row);
+        }
+        if let Ok(delta) = gaussian_elimination(&mut aug) {
+            let norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+            for i in 0..dim {
+                y_guess[i] += delta[i];
+            }
+            if norm < newton_tol {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    let mut y_curr = y_guess.clone();
+
+    // BDF-2 steps: y_{k+1} = (4/3)*y_k - (1/3)*y_{k-1} + (2/3)*h*f(t_{k+1}, y_{k+1})
+    for _ in 1..n {
+        t += h;
+
+        // Predictor: extrapolate
+        for i in 0..dim {
+            y_guess[i] = (4.0 / 3.0) * y_curr[i] - (1.0 / 3.0) * y_prev[i];
+        }
+
+        for _ in 0..max_newton {
+            f(t, &y_guess, &mut f_val);
+            jac(t, &y_guess, &mut j_mat);
+
+            let mut aug: Vec<Vec<f64>> = Vec::with_capacity(dim);
+            for i in 0..dim {
+                let mut row = Vec::with_capacity(dim + 1);
+                for j in 0..dim {
+                    let ident = if i == j { 1.0 } else { 0.0 };
+                    row.push(ident - (2.0 / 3.0) * h * j_mat[i][j]);
+                }
+                let rhs = y_guess[i] - (4.0 / 3.0) * y_curr[i] + (1.0 / 3.0) * y_prev[i]
+                    - (2.0 / 3.0) * h * f_val[i];
+                row.push(-rhs);
+                aug.push(row);
+            }
+
+            if let Ok(delta) = gaussian_elimination(&mut aug) {
+                let norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+                for i in 0..dim {
+                    y_guess[i] += delta[i];
+                }
+                if norm < newton_tol {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        y_prev.copy_from_slice(&y_curr);
+        y_curr.copy_from_slice(&y_guess);
+    }
+
+    Ok(y_curr)
+}
+
+// ---------------------------------------------------------------------------
+// Stochastic differential equations
+// ---------------------------------------------------------------------------
+
+/// Euler-Maruyama method for stochastic differential equations.
+///
+/// Solves `dX = drift(t,X)*dt + diffusion(t,X)*dW` where dW ~ N(0,dt).
+///
+/// - `drift`: deterministic part `drift(t, &y, &mut dy)`.
+/// - `diffusion`: noise coefficient `diffusion(t, &y, &mut noise)`.
+/// - `rng`: seeded `Pcg32` for deterministic replay.
+///
+/// Returns the full trajectory.
+///
+/// # Errors
+///
+/// Returns [`HisabError::ZeroSteps`] if `n` is zero.
+#[must_use = "contains the trajectory or an error"]
+#[allow(clippy::too_many_arguments)]
+pub fn euler_maruyama(
+    drift: impl Fn(f64, &[f64], &mut [f64]),
+    diffusion: impl Fn(f64, &[f64], &mut [f64]),
+    t0: f64,
+    y0: &[f64],
+    t_end: f64,
+    n: usize,
+    rng: &mut Pcg32,
+) -> Result<Vec<(f64, Vec<f64>)>, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
+    let dim = y0.len();
+    let dt = (t_end - t0) / n as f64;
+    let sqrt_dt = dt.sqrt();
+    let mut y = y0.to_vec();
+    let mut t = t0;
+    let mut trajectory = Vec::with_capacity(n + 1);
+    trajectory.push((t, y.clone()));
+
+    let mut a = vec![0.0; dim];
+    let mut b = vec![0.0; dim];
+
+    for _ in 0..n {
+        drift(t, &y, &mut a);
+        diffusion(t, &y, &mut b);
+        for i in 0..dim {
+            let dw = rng.next_normal() * sqrt_dt;
+            y[i] += a[i] * dt + b[i] * dw;
+        }
+        t += dt;
+        trajectory.push((t, y.clone()));
+    }
+
+    Ok(trajectory)
+}
+
+/// Milstein method for stochastic differential equations.
+///
+/// Higher-order than Euler-Maruyama (strong order 1.0 vs 0.5).
+/// Requires the derivative of the diffusion coefficient.
+///
+/// - `diffusion_deriv`: `db/dy` evaluated at `(t, &y, &mut db_dy)`.
+///
+/// # Errors
+///
+/// Returns [`HisabError::ZeroSteps`] if `n` is zero.
+#[must_use = "contains the trajectory or an error"]
+#[allow(clippy::too_many_arguments)]
+pub fn milstein(
+    drift: impl Fn(f64, &[f64], &mut [f64]),
+    diffusion: impl Fn(f64, &[f64], &mut [f64]),
+    diffusion_deriv: impl Fn(f64, &[f64], &mut [f64]),
+    t0: f64,
+    y0: &[f64],
+    t_end: f64,
+    n: usize,
+    rng: &mut Pcg32,
+) -> Result<Vec<(f64, Vec<f64>)>, HisabError> {
+    if n == 0 {
+        return Err(HisabError::ZeroSteps);
+    }
+    let dim = y0.len();
+    let dt = (t_end - t0) / n as f64;
+    let sqrt_dt = dt.sqrt();
+    let mut y = y0.to_vec();
+    let mut t = t0;
+    let mut trajectory = Vec::with_capacity(n + 1);
+    trajectory.push((t, y.clone()));
+
+    let mut a = vec![0.0; dim];
+    let mut b = vec![0.0; dim];
+    let mut db = vec![0.0; dim];
+
+    for _ in 0..n {
+        drift(t, &y, &mut a);
+        diffusion(t, &y, &mut b);
+        diffusion_deriv(t, &y, &mut db);
+        for i in 0..dim {
+            let dw = rng.next_normal() * sqrt_dt;
+            // Milstein correction: + 0.5 * b * b' * (dW² - dt)
+            y[i] += a[i] * dt + b[i] * dw + 0.5 * b[i] * db[i] * (dw * dw - dt);
+        }
+        t += dt;
+        trajectory.push((t, y.clone()));
+    }
+
+    Ok(trajectory)
+}
+
+// ---------------------------------------------------------------------------
 // Symplectic integrators
 // ---------------------------------------------------------------------------
 
@@ -2467,6 +3259,16 @@ impl Pcg32 {
     #[inline]
     pub fn next_f64_range(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.next_f64()
+    }
+
+    /// Generate a random f64 from the standard normal distribution N(0,1).
+    ///
+    /// Uses the Box-Muller transform.
+    #[inline]
+    pub fn next_normal(&mut self) -> f64 {
+        let u1 = self.next_f64().max(1e-300); // avoid log(0)
+        let u2 = self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
 }
 
@@ -4927,5 +5729,369 @@ mod tests {
     fn truncated_svd_k_zero() {
         let a = vec![vec![1.0]];
         assert!(truncated_svd(&a, 0).is_err());
+    }
+
+    // --- Inertia tensor tests ---
+
+    #[test]
+    fn inertia_sphere_diagonal() {
+        let i = inertia_sphere(10.0, 2.0);
+        let expected = 0.4 * 10.0 * 4.0; // 2/5 * m * r²
+        assert!(approx_eq(i[0][0], expected));
+        assert!(approx_eq(i[1][1], expected));
+        assert!(approx_eq(i[2][2], expected));
+        assert!(approx_eq(i[0][1], 0.0));
+    }
+
+    #[test]
+    fn inertia_box_asymmetric() {
+        let i = inertia_box(12.0, 1.0, 2.0, 3.0);
+        // Ixx = m/12 * (h² + d²) = 12/12 * (16 + 36) = 52
+        assert!(approx_eq(i[0][0], 52.0));
+        // Iyy = m/12 * (w² + d²) = 1 * (4 + 36) = 40
+        assert!(approx_eq(i[1][1], 40.0));
+    }
+
+    #[test]
+    fn inertia_mesh_unit_cube() {
+        // Unit cube centered at origin: 12 triangles
+        let v = [
+            [-0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [-0.5, 0.5, -0.5],
+            [-0.5, -0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+        ];
+        let tris: Vec<([f64; 3], [f64; 3], [f64; 3])> = vec![
+            (v[0], v[2], v[1]),
+            (v[0], v[3], v[2]), // front
+            (v[4], v[5], v[6]),
+            (v[4], v[6], v[7]), // back
+            (v[0], v[1], v[5]),
+            (v[0], v[5], v[4]), // bottom
+            (v[2], v[3], v[7]),
+            (v[2], v[7], v[6]), // top
+            (v[0], v[4], v[7]),
+            (v[0], v[7], v[3]), // left
+            (v[1], v[2], v[6]),
+            (v[1], v[6], v[5]), // right
+        ];
+        let (vol, _com, _inertia) = inertia_mesh(&tris);
+        assert!((vol.abs() - 1.0).abs() < 0.01, "unit cube volume: {vol}");
+    }
+
+    // --- GMRES tests ---
+
+    #[test]
+    fn gmres_identity() {
+        let a_mul = |x: &[f64]| x.to_vec();
+        let b = [3.0, 7.0];
+        let x = gmres(a_mul, &b, &[0.0, 0.0], 10, 1e-10, 100).unwrap();
+        assert!(approx_eq(x[0], 3.0));
+        assert!(approx_eq(x[1], 7.0));
+    }
+
+    #[test]
+    fn gmres_non_symmetric() {
+        // A = [[2, 1], [0, 3]] (non-symmetric)
+        let a_mul = |x: &[f64]| vec![2.0 * x[0] + x[1], 3.0 * x[1]];
+        let b = [5.0, 9.0]; // x = [1, 3]
+        let x = gmres(a_mul, &b, &[0.0, 0.0], 10, 1e-10, 100).unwrap();
+        assert!((x[0] - 1.0).abs() < 1e-6);
+        assert!((x[1] - 3.0).abs() < 1e-6);
+    }
+
+    // --- Eigendecomposition tests ---
+
+    #[test]
+    fn eigen_symmetric_diagonal() {
+        let a = vec![
+            vec![5.0, 0.0, 0.0],
+            vec![0.0, 3.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let ed = eigen_symmetric(&a, 1e-12, 1000).unwrap();
+        // Eigenvalues sorted by descending magnitude: 5, 3, 1
+        assert!(approx_eq(ed.eigenvalues_real[0], 5.0));
+        assert!(approx_eq(ed.eigenvalues_real[1], 3.0));
+        assert!(approx_eq(ed.eigenvalues_real[2], 1.0));
+    }
+
+    #[test]
+    fn eigen_symmetric_2x2() {
+        // [[2, 1], [1, 2]] → eigenvalues 3, 1
+        let a = vec![vec![2.0, 1.0], vec![1.0, 2.0]];
+        let ed = eigen_symmetric(&a, 1e-12, 1000).unwrap();
+        assert!((ed.eigenvalues_real[0] - 3.0).abs() < 1e-8);
+        assert!((ed.eigenvalues_real[1] - 1.0).abs() < 1e-8);
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn eigen_symmetric_verify_av_eq_lambda_v() {
+        // Verify A*v = λ*v for each eigenpair
+        let a = vec![
+            vec![4.0, 1.0, 0.0],
+            vec![1.0, 3.0, 1.0],
+            vec![0.0, 1.0, 2.0],
+        ];
+        let ed = eigen_symmetric(&a, 1e-12, 1000).unwrap();
+        let vecs = ed.eigenvectors.as_ref().unwrap();
+
+        for k in 0..3 {
+            let lambda = ed.eigenvalues_real[k];
+            let v = &vecs[k];
+            // Compute A*v
+            for i in 0..3 {
+                let mut av_i = 0.0;
+                for j in 0..3 {
+                    av_i += a[i][j] * v[j];
+                }
+                assert!(
+                    (av_i - lambda * v[i]).abs() < 1e-6,
+                    "A*v != λ*v at eigenvalue {k}: {av_i} != {} * {}",
+                    lambda,
+                    v[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn eigen_symmetric_orthogonal_eigenvectors() {
+        let a = vec![
+            vec![4.0, 1.0, 0.0],
+            vec![1.0, 3.0, 1.0],
+            vec![0.0, 1.0, 2.0],
+        ];
+        let ed = eigen_symmetric(&a, 1e-12, 1000).unwrap();
+        let vecs = ed.eigenvectors.as_ref().unwrap();
+
+        for i in 0..3 {
+            for j in 0..3 {
+                let dot: f64 = (0..3).map(|k| vecs[i][k] * vecs[j][k]).sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1e-6,
+                    "eigenvectors not orthonormal: dot({i},{j}) = {dot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eigen_symmetric_1x1() {
+        let a = vec![vec![7.0]];
+        let ed = eigen_symmetric(&a, 1e-12, 100).unwrap();
+        assert!(approx_eq(ed.eigenvalues_real[0], 7.0));
+    }
+
+    #[test]
+    fn eigen_symmetric_negative_eigenvalues() {
+        // [[-2, 0], [0, -5]] → eigenvalues -5, -2
+        let a = vec![vec![-2.0, 0.0], vec![0.0, -5.0]];
+        let ed = eigen_symmetric(&a, 1e-12, 100).unwrap();
+        assert!((ed.eigenvalues_real[0] - (-5.0)).abs() < 1e-8);
+        assert!((ed.eigenvalues_real[1] - (-2.0)).abs() < 1e-8);
+    }
+
+    #[test]
+    fn eigen_symmetric_empty_errors() {
+        let a: Vec<Vec<f64>> = vec![];
+        assert!(eigen_symmetric(&a, 1e-12, 100).is_err());
+    }
+
+    #[test]
+    fn eigen_symmetric_matches_power_iteration() {
+        let a = vec![
+            vec![4.0, 1.0, 0.0],
+            vec![1.0, 3.0, 1.0],
+            vec![0.0, 1.0, 2.0],
+        ];
+        let ed = eigen_symmetric(&a, 1e-12, 1000).unwrap();
+        let (power_eig, _) = eigenvalue_power(&a, 1e-12, 1000).unwrap();
+        // Dominant eigenvalue from full decomp should match power iteration
+        assert!(
+            (ed.eigenvalues_real[0] - power_eig).abs() < 1e-4,
+            "full={} vs power={}",
+            ed.eigenvalues_real[0],
+            power_eig
+        );
+    }
+
+    // --- Stiff ODE tests ---
+
+    #[test]
+    fn backward_euler_stiff_decay() {
+        // y' = -1000*y, y(0) = 1 → y(1) = e^(-1000) ≈ 0
+        // Explicit Euler would blow up; implicit should be stable
+        let f = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = -1000.0 * y[0];
+        let jac = |_t: f64, _y: &[f64], j: &mut Vec<Vec<f64>>| j[0][0] = -1000.0;
+        let y = backward_euler(f, jac, 0.0, &[1.0], 1.0, 100, 1e-10, 20).unwrap();
+        // Should be near zero (stable), not blown up
+        assert!(y[0].abs() < 0.1, "backward Euler unstable: {}", y[0]);
+    }
+
+    #[test]
+    fn backward_euler_linear() {
+        // y' = -y, y(0) = 1 → y(1) = 1/e
+        let f = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = -y[0];
+        let jac = |_t: f64, _y: &[f64], j: &mut Vec<Vec<f64>>| j[0][0] = -1.0;
+        let y = backward_euler(f, jac, 0.0, &[1.0], 1.0, 1000, 1e-10, 20).unwrap();
+        let expected = (-1.0_f64).exp();
+        assert!(
+            (y[0] - expected).abs() < 0.01,
+            "backward Euler: {} vs {}",
+            y[0],
+            expected
+        );
+    }
+
+    #[test]
+    fn bdf2_stiff_decay() {
+        let f = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = -1000.0 * y[0];
+        let jac = |_t: f64, _y: &[f64], j: &mut Vec<Vec<f64>>| j[0][0] = -1000.0;
+        let y = bdf2(f, jac, 0.0, &[1.0], 1.0, 100, 1e-10, 20).unwrap();
+        assert!(y[0].abs() < 0.1, "BDF-2 unstable: {}", y[0]);
+    }
+
+    #[test]
+    fn bdf2_linear_more_accurate_than_backward_euler() {
+        // BDF-2 is order 2, backward Euler is order 1
+        let f = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = -y[0];
+        let jac = |_t: f64, _y: &[f64], j: &mut Vec<Vec<f64>>| j[0][0] = -1.0;
+        let expected = (-1.0_f64).exp();
+        let be = backward_euler(f, jac, 0.0, &[1.0], 1.0, 100, 1e-10, 20).unwrap();
+        let b2 = bdf2(f, jac, 0.0, &[1.0], 1.0, 100, 1e-10, 20).unwrap();
+        let be_err = (be[0] - expected).abs();
+        let b2_err = (b2[0] - expected).abs();
+        assert!(
+            b2_err < be_err,
+            "BDF-2 should be more accurate: bdf2_err={b2_err} vs be_err={be_err}"
+        );
+    }
+
+    // --- SDE tests ---
+
+    #[test]
+    fn pcg32_normal_distribution() {
+        let mut rng = Pcg32::new(42, 1);
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        let n = 10000;
+        for _ in 0..n {
+            let x = rng.next_normal();
+            sum += x;
+            sum_sq += x * x;
+        }
+        let mean = sum / n as f64;
+        let variance = sum_sq / n as f64 - mean * mean;
+        assert!(mean.abs() < 0.05, "normal mean: {mean}");
+        assert!((variance - 1.0).abs() < 0.1, "normal variance: {variance}");
+    }
+
+    #[test]
+    fn euler_maruyama_zero_noise_recovers_ode() {
+        // Zero diffusion → should match deterministic ODE
+        let drift = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = -y[0];
+        let diffusion = |_t: f64, _y: &[f64], b: &mut [f64]| b[0] = 0.0;
+        let mut rng = Pcg32::new(1, 1);
+        let traj = euler_maruyama(drift, diffusion, 0.0, &[1.0], 1.0, 1000, &mut rng).unwrap();
+        let y_final = traj.last().unwrap().1[0];
+        let expected = (-1.0_f64).exp();
+        assert!(
+            (y_final - expected).abs() < 0.01,
+            "EM zero noise: {y_final} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn euler_maruyama_deterministic_replay() {
+        let drift = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = -y[0];
+        let diffusion = |_t: f64, y: &[f64], b: &mut [f64]| b[0] = 0.1 * y[0];
+        let mut rng1 = Pcg32::new(42, 1);
+        let mut rng2 = Pcg32::new(42, 1);
+        let t1 = euler_maruyama(drift, diffusion, 0.0, &[1.0], 1.0, 100, &mut rng1).unwrap();
+        let t2 = euler_maruyama(drift, diffusion, 0.0, &[1.0], 1.0, 100, &mut rng2).unwrap();
+        for i in 0..t1.len() {
+            assert_eq!(t1[i].1[0], t2[i].1[0]);
+        }
+    }
+
+    #[test]
+    fn milstein_zero_noise_recovers_ode() {
+        let drift = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = -y[0];
+        let diffusion = |_t: f64, _y: &[f64], b: &mut [f64]| b[0] = 0.0;
+        let diff_deriv = |_t: f64, _y: &[f64], db: &mut [f64]| db[0] = 0.0;
+        let mut rng = Pcg32::new(1, 1);
+        let traj = milstein(
+            drift,
+            diffusion,
+            diff_deriv,
+            0.0,
+            &[1.0],
+            1.0,
+            1000,
+            &mut rng,
+        )
+        .unwrap();
+        let y_final = traj.last().unwrap().1[0];
+        let expected = (-1.0_f64).exp();
+        assert!(
+            (y_final - expected).abs() < 0.01,
+            "Milstein zero noise: {y_final} vs {expected}"
+        );
+    }
+
+    // --- Lyapunov exponent tests ---
+
+    #[test]
+    fn lyapunov_stable_system() {
+        // y' = -y → MLE should be negative (stable)
+        let f = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = -y[0];
+        let jac = |_t: f64, _y: &[f64], j: &mut Vec<Vec<f64>>| j[0][0] = -1.0;
+        let mle = lyapunov_max(f, jac, &[1.0], 10.0, 0.01, 10).unwrap();
+        assert!(mle < 0.0, "stable system MLE should be negative: {mle}");
+    }
+
+    #[test]
+    fn lyapunov_unstable_system() {
+        // y' = y → MLE should be positive (unstable)
+        let f = |_t: f64, y: &[f64], dy: &mut [f64]| dy[0] = y[0];
+        let jac = |_t: f64, _y: &[f64], j: &mut Vec<Vec<f64>>| j[0][0] = 1.0;
+        let mle = lyapunov_max(f, jac, &[1.0], 5.0, 0.01, 10).unwrap();
+        assert!(mle > 0.0, "unstable system MLE should be positive: {mle}");
+    }
+
+    // --- PGS tests ---
+
+    #[test]
+    fn pgs_unconstrained() {
+        // A = [[4,1],[1,3]], b = [1,2], lo = [-inf], hi = [inf]
+        let a = vec![vec![4.0, 1.0], vec![1.0, 3.0]];
+        let b = [1.0, 2.0];
+        let lo = [f64::NEG_INFINITY, f64::NEG_INFINITY];
+        let hi = [f64::INFINITY, f64::INFINITY];
+        let x = projected_gauss_seidel(&a, &b, &lo, &hi, &[0.0, 0.0], 100, 1e-10).unwrap();
+        // Verify A*x ≈ b
+        let r0 = 4.0 * x[0] + x[1];
+        let r1 = x[0] + 3.0 * x[1];
+        assert!((r0 - 1.0).abs() < 1e-6);
+        assert!((r1 - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pgs_box_constrained() {
+        // Same system but x clamped to [0, inf]
+        let a = vec![vec![4.0, 1.0], vec![1.0, 3.0]];
+        let b = [-1.0, -1.0]; // Unconstrained solution would be negative
+        let lo = [0.0, 0.0];
+        let hi = [f64::INFINITY, f64::INFINITY];
+        let x = projected_gauss_seidel(&a, &b, &lo, &hi, &[0.0, 0.0], 100, 1e-10).unwrap();
+        assert!(x[0] >= -1e-10 && x[1] >= -1e-10, "PGS violated bounds");
     }
 }

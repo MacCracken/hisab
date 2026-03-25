@@ -410,6 +410,338 @@ pub fn linear_to_srgb_vec3(color: Vec3) -> Vec3 {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Dual quaternions
+// ---------------------------------------------------------------------------
+
+/// A dual quaternion for rigid body transforms (rotation + translation).
+///
+/// Avoids the "candy wrapper" artifact of linear blend skinning.
+/// Stored as `real + dual * ε` where both are quaternions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualQuat {
+    /// Real part (rotation).
+    pub real: Quat,
+    /// Dual part (encodes translation).
+    pub dual: Quat,
+}
+
+impl DualQuat {
+    /// Identity dual quaternion (no rotation, no translation).
+    pub const IDENTITY: Self = Self {
+        real: Quat::IDENTITY,
+        dual: Quat::from_xyzw(0.0, 0.0, 0.0, 0.0),
+    };
+
+    /// Create from rotation and translation.
+    #[must_use]
+    #[inline]
+    pub fn from_rotation_translation(rotation: Quat, translation: Vec3) -> Self {
+        let t = Quat::from_xyzw(
+            translation.x * 0.5,
+            translation.y * 0.5,
+            translation.z * 0.5,
+            0.0,
+        );
+        Self {
+            real: rotation,
+            dual: t * rotation,
+        }
+    }
+
+    /// Extract translation.
+    #[must_use]
+    #[inline]
+    pub fn translation(&self) -> Vec3 {
+        let t = self.dual * self.real.conjugate();
+        Vec3::new(t.x * 2.0, t.y * 2.0, t.z * 2.0)
+    }
+
+    /// Extract rotation.
+    #[must_use]
+    #[inline]
+    pub fn rotation(&self) -> Quat {
+        self.real
+    }
+
+    /// Convert to a 4×4 matrix.
+    #[must_use]
+    #[inline]
+    pub fn to_matrix(&self) -> Mat4 {
+        let t = self.translation();
+        Mat4::from_rotation_translation(self.real, t)
+    }
+
+    /// Transform a point.
+    #[must_use]
+    #[inline]
+    pub fn transform_point(&self, point: Vec3) -> Vec3 {
+        self.real * point + self.translation()
+    }
+
+    /// Normalize the dual quaternion.
+    #[must_use]
+    #[inline]
+    pub fn normalize(self) -> Self {
+        let norm = self.real.length();
+        if norm < crate::EPSILON_F32 {
+            return Self::IDENTITY;
+        }
+        let inv = 1.0 / norm;
+        Self {
+            real: self.real * inv,
+            dual: self.dual * inv,
+        }
+    }
+
+    /// Dual quaternion linear blend (DLB) — blend two transforms.
+    #[must_use]
+    #[inline]
+    pub fn blend(a: &DualQuat, b: &DualQuat, t: f32) -> DualQuat {
+        // Ensure shortest path
+        let dot = a.real.dot(b.real);
+        let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+        let u = 1.0 - t;
+        DualQuat {
+            real: Quat::from_xyzw(
+                u * a.real.x + t * sign * b.real.x,
+                u * a.real.y + t * sign * b.real.y,
+                u * a.real.z + t * sign * b.real.z,
+                u * a.real.w + t * sign * b.real.w,
+            ),
+            dual: Quat::from_xyzw(
+                u * a.dual.x + t * sign * b.dual.x,
+                u * a.dual.y + t * sign * b.dual.y,
+                u * a.dual.z + t * sign * b.dual.z,
+                u * a.dual.w + t * sign * b.dual.w,
+            ),
+        }
+        .normalize()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CSS transform decomposition
+// ---------------------------------------------------------------------------
+
+/// Decomposed transform components (CSS Transforms spec).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecomposedTransform {
+    /// Translation (x, y, z).
+    pub translation: Vec3,
+    /// Rotation as quaternion.
+    pub rotation: Quat,
+    /// Scale (x, y, z).
+    pub scale: Vec3,
+}
+
+/// Decompose a 4×4 matrix into translation, rotation, and scale.
+///
+/// Based on the W3C CSS Transforms decomposition algorithm.
+/// Returns `None` if the matrix is degenerate (zero determinant).
+#[must_use]
+pub fn decompose_mat4(m: Mat4) -> Option<DecomposedTransform> {
+    let cols = m.to_cols_array_2d();
+
+    // Extract translation
+    let translation = Vec3::new(cols[3][0], cols[3][1], cols[3][2]);
+
+    // Extract upper 3×3
+    let mut row0 = Vec3::new(cols[0][0], cols[0][1], cols[0][2]);
+    let mut row1 = Vec3::new(cols[1][0], cols[1][1], cols[1][2]);
+    let mut row2 = Vec3::new(cols[2][0], cols[2][1], cols[2][2]);
+
+    // Scale
+    let sx = row0.length();
+    let sy = row1.length();
+    let sz = row2.length();
+
+    if sx < crate::EPSILON_F32 || sy < crate::EPSILON_F32 || sz < crate::EPSILON_F32 {
+        return None;
+    }
+
+    // Normalize
+    row0 /= sx;
+    row1 /= sy;
+    row2 /= sz;
+
+    // Fix handedness
+    let det = row0.cross(row1).dot(row2);
+    let (scale, row0, row1, row2) = if det < 0.0 {
+        (Vec3::new(-sx, sy, sz), -row0, row1, row2)
+    } else {
+        (Vec3::new(sx, sy, sz), row0, row1, row2)
+    };
+
+    // Extract rotation from the normalized 3×3
+    let rot_mat = Mat3::from_cols(row0, row1, row2);
+    let rotation = Quat::from_mat3(&rot_mat);
+
+    Some(DecomposedTransform {
+        translation,
+        rotation,
+        scale,
+    })
+}
+
+/// Recompose a 4×4 matrix from decomposed components.
+#[must_use]
+#[inline]
+pub fn recompose_mat4(d: &DecomposedTransform) -> Mat4 {
+    Mat4::from_scale_rotation_translation(d.scale, d.rotation, d.translation)
+}
+
+// ---------------------------------------------------------------------------
+// Color matrix operations
+// ---------------------------------------------------------------------------
+
+/// Build a 4×4 saturation matrix.
+///
+/// `s = 0` is grayscale, `s = 1` is identity, `s > 1` is oversaturated.
+#[must_use]
+#[inline]
+pub fn color_matrix_saturation(s: f32) -> Mat4 {
+    let lr = 0.2126 * (1.0 - s);
+    let lg = 0.7152 * (1.0 - s);
+    let lb = 0.0722 * (1.0 - s);
+    Mat4::from_cols_array_2d(&[
+        [lr + s, lr, lr, 0.0],
+        [lg, lg + s, lg, 0.0],
+        [lb, lb, lb + s, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+}
+
+/// Build a 4×4 hue rotation matrix (angle in radians).
+#[must_use]
+#[inline]
+pub fn color_matrix_hue_rotate(angle: f32) -> Mat4 {
+    let cos = angle.cos();
+    let sin = angle.sin();
+    // ITU-R BT.709 luma weights
+    let r = Vec3::new(0.2126, 0.7152, 0.0722);
+    Mat4::from_cols_array_2d(&[
+        [
+            r.x + cos * (1.0 - r.x) + sin * (-r.x),
+            r.x + cos * (-r.x) + sin * 0.143,
+            r.x + cos * (-r.x) + sin * (-(1.0 - r.x)),
+            0.0,
+        ],
+        [
+            r.y + cos * (-r.y) + sin * (-r.y),
+            r.y + cos * (1.0 - r.y) + sin * 0.140,
+            r.y + cos * (-r.y) + sin * r.y,
+            0.0,
+        ],
+        [
+            r.z + cos * (-r.z) + sin * (1.0 - r.z),
+            r.z + cos * (-r.z) + sin * (-0.283),
+            r.z + cos * (1.0 - r.z) + sin * r.z,
+            0.0,
+        ],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+}
+
+/// Convert linear RGB to Oklab perceptual color space.
+///
+/// These coefficients are from Bjorn Ottosson's Oklab specification.
+/// Returns `(L, a, b)` where L is lightness in [0, 1].
+#[must_use]
+#[inline]
+#[allow(clippy::excessive_precision)]
+pub fn linear_to_oklab(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;
+    let m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;
+    let s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;
+
+    let l_ = l.cbrt();
+    let m_ = m.cbrt();
+    let s_ = s.cbrt();
+
+    let lab_l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+    let lab_a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+    let lab_b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+
+    (lab_l, lab_a, lab_b)
+}
+
+/// Convert Oklab to linear RGB.
+#[must_use]
+#[inline]
+#[allow(clippy::excessive_precision)]
+pub fn oklab_to_linear(lab_l: f32, lab_a: f32, lab_b: f32) -> (f32, f32, f32) {
+    let l_ = lab_l + 0.3963377774 * lab_a + 0.2158037573 * lab_b;
+    let m_ = lab_l - 0.1055613458 * lab_a - 0.0638541728 * lab_b;
+    let s_ = lab_l - 0.0894841775 * lab_a - 1.2914855480 * lab_b;
+
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+
+    let r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+    let g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+    let b = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+
+    (r, g, b)
+}
+
+// ---------------------------------------------------------------------------
+// Spherical harmonics (L0-L2)
+// ---------------------------------------------------------------------------
+
+/// Evaluate real spherical harmonics basis functions up to L2 (9 coefficients).
+///
+/// `dir` must be normalized. Returns `[Y00, Y1-1, Y10, Y11, Y2-2, Y2-1, Y20, Y21, Y22]`.
+#[must_use]
+#[inline]
+#[allow(clippy::excessive_precision)]
+pub fn sh_eval_l2(dir: Vec3) -> [f32; 9] {
+    let x = dir.x;
+    let y = dir.y;
+    let z = dir.z;
+    [
+        0.282094792,                       // Y00
+        0.488602512 * y,                   // Y1-1
+        0.488602512 * z,                   // Y10
+        0.488602512 * x,                   // Y11
+        1.092548431 * x * y,               // Y2-2
+        1.092548431 * y * z,               // Y2-1
+        0.315391565 * (3.0 * z * z - 1.0), // Y20
+        1.092548431 * x * z,               // Y21
+        0.546274215 * (x * x - y * y),     // Y22
+    ]
+}
+
+/// Project a function (sampled as directional values) onto L2 spherical harmonics.
+///
+/// `samples` is a list of `(direction, value)` pairs.
+/// Returns 9 SH coefficients.
+#[must_use]
+pub fn sh_project_l2(samples: &[(Vec3, f32)]) -> [f32; 9] {
+    let mut coeffs = [0.0f32; 9];
+    let weight = 4.0 * std::f32::consts::PI / samples.len() as f32;
+    for &(dir, val) in samples {
+        let basis = sh_eval_l2(dir);
+        for i in 0..9 {
+            coeffs[i] += val * basis[i] * weight;
+        }
+    }
+    coeffs
+}
+
+/// Evaluate SH lighting at a direction given L2 coefficients.
+#[must_use]
+#[inline]
+pub fn sh_evaluate_l2(coeffs: &[f32; 9], dir: Vec3) -> f32 {
+    let basis = sh_eval_l2(dir);
+    let mut sum = 0.0;
+    for i in 0..9 {
+        sum += coeffs[i] * basis[i];
+    }
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,8 +1267,130 @@ mod tests {
 
     #[test]
     fn srgb_midpoint_gamma() {
-        // sRGB 0.5 → linear should be ~0.214
         let l = srgb_to_linear(0.5);
         assert!(l > 0.2 && l < 0.23);
+    }
+
+    // --- Dual quaternion tests ---
+
+    #[test]
+    fn dualquat_identity() {
+        let dq = DualQuat::IDENTITY;
+        let p = dq.transform_point(Vec3::new(1.0, 2.0, 3.0));
+        assert!(vec3_approx_eq(p, Vec3::new(1.0, 2.0, 3.0)));
+    }
+
+    #[test]
+    fn dualquat_translation() {
+        let dq = DualQuat::from_rotation_translation(Quat::IDENTITY, Vec3::new(5.0, 0.0, 0.0));
+        let p = dq.transform_point(Vec3::ZERO);
+        assert!(vec3_approx_eq(p, Vec3::new(5.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn dualquat_roundtrip() {
+        let rot = Quat::from_rotation_y(0.5);
+        let trans = Vec3::new(1.0, 2.0, 3.0);
+        let dq = DualQuat::from_rotation_translation(rot, trans);
+        let t_back = dq.translation();
+        assert!(vec3_approx_eq(t_back, trans));
+    }
+
+    #[test]
+    fn dualquat_blend_endpoints() {
+        let a = DualQuat::from_rotation_translation(Quat::IDENTITY, Vec3::ZERO);
+        let b = DualQuat::from_rotation_translation(Quat::IDENTITY, Vec3::new(10.0, 0.0, 0.0));
+        let mid = DualQuat::blend(&a, &b, 0.5);
+        let t = mid.translation();
+        assert!(approx_eq(t.x, 5.0));
+    }
+
+    // --- CSS decompose tests ---
+
+    #[test]
+    fn decompose_identity() {
+        let d = decompose_mat4(Mat4::IDENTITY).unwrap();
+        assert!(vec3_approx_eq(d.translation, Vec3::ZERO));
+        assert!(vec3_approx_eq(d.scale, Vec3::ONE));
+    }
+
+    #[test]
+    fn decompose_recompose_roundtrip() {
+        let m = Mat4::from_scale_rotation_translation(
+            Vec3::new(2.0, 3.0, 4.0),
+            Quat::from_rotation_y(0.5),
+            Vec3::new(10.0, 20.0, 30.0),
+        );
+        let d = decompose_mat4(m).unwrap();
+        let r = recompose_mat4(&d);
+        let cols_a = m.to_cols_array();
+        let cols_b = r.to_cols_array();
+        for i in 0..16 {
+            assert!(approx_eq(cols_a[i], cols_b[i]));
+        }
+    }
+
+    // --- Oklab tests ---
+
+    #[test]
+    fn oklab_roundtrip() {
+        let (r, g, b) = (0.5, 0.3, 0.1);
+        let (l, a, ob) = linear_to_oklab(r, g, b);
+        let (rr, gg, bb) = oklab_to_linear(l, a, ob);
+        assert!((rr - r).abs() < 0.01);
+        assert!((gg - g).abs() < 0.01);
+        assert!((bb - b).abs() < 0.01);
+    }
+
+    // --- Spherical harmonics tests ---
+
+    #[test]
+    fn sh_eval_l2_normalization() {
+        // Y00 at any direction should be constant
+        let a = sh_eval_l2(Vec3::X);
+        let b = sh_eval_l2(Vec3::Y);
+        assert!(approx_eq(a[0], b[0])); // Y00 is constant
+    }
+
+    #[test]
+    fn sh_project_evaluate_constant() {
+        // Project a constant function → only Y00 should be nonzero
+        let samples: Vec<(Vec3, f32)> = [
+            Vec3::X,
+            Vec3::Y,
+            Vec3::Z,
+            Vec3::NEG_X,
+            Vec3::NEG_Y,
+            Vec3::NEG_Z,
+        ]
+        .iter()
+        .map(|&d| (d, 1.0))
+        .collect();
+        let coeffs = sh_project_l2(&samples);
+        // Y00 coefficient should be ~√(4π) ≈ 3.545 * 0.282 ≈ 1.0
+        assert!(coeffs[0] > 0.5);
+        // Evaluate at any direction should give ~1.0
+        let val = sh_evaluate_l2(&coeffs, Vec3::new(1.0, 1.0, 1.0).normalize());
+        assert!((val - 1.0).abs() < 0.5); // Approximate with few samples
+    }
+
+    // --- Color matrix tests ---
+
+    #[test]
+    fn saturation_zero_is_grayscale() {
+        let m = color_matrix_saturation(0.0);
+        let color = m * glam::Vec4::new(1.0, 0.0, 0.0, 1.0);
+        // Pure red → grayscale, all channels should be equal
+        assert!((color.x - color.y).abs() < 0.01);
+        assert!((color.y - color.z).abs() < 0.01);
+    }
+
+    #[test]
+    fn saturation_one_is_identity() {
+        let m = color_matrix_saturation(1.0);
+        let color = m * glam::Vec4::new(0.5, 0.3, 0.1, 1.0);
+        assert!(approx_eq(color.x, 0.5));
+        assert!(approx_eq(color.y, 0.3));
+        assert!(approx_eq(color.z, 0.1));
     }
 }

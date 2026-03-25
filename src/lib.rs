@@ -87,16 +87,16 @@ pub use glam::{DMat3, DMat4, DQuat, DVec2, DVec3, DVec4};
 
 #[cfg(feature = "geo")]
 pub use geo::{
-    Aabb, Bvh, Capsule, ConvexHull3D, ConvexPolygon, ConvexSupport, ConvexSupport3D, Frustum,
-    KdTree, Line, Obb, Octree, Penetration3D, Plane, Quadtree, Ray, Rect, Segment, SpatialHash,
-    Sphere, Triangle,
+    Aabb, Bvh, Capsule, ContactConstraint, ConvexDecomposition, ConvexHull3D, ConvexPolygon,
+    ConvexSupport, ConvexSupport3D, Frustum, KdTree, Line, Obb, Octree, Penetration3D, Plane,
+    Quadtree, Ray, Rect, Segment, SpatialHash, Sphere, TriMesh, Triangle,
 };
 
 #[cfg(feature = "num")]
-pub use num::{Complex, CsrMatrix, OptResult, Pcg32, Svd};
+pub use num::{Complex, CsrMatrix, EigenDecomposition, OptResult, Pcg32, Svd};
 
 #[cfg(feature = "autodiff")]
-pub use autodiff::Dual;
+pub use autodiff::{Dual, Tape, Var};
 
 #[cfg(feature = "interval")]
 pub use interval::Interval;

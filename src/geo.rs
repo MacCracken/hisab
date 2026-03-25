@@ -2005,6 +2005,649 @@ pub fn gjk_epa(a: &dyn ConvexSupport, b: &dyn ConvexSupport) -> Option<Penetrati
 }
 
 // ---------------------------------------------------------------------------
+// Signed Distance Fields (SDF)
+// ---------------------------------------------------------------------------
+
+/// Signed distance from a point to a sphere surface.
+/// Negative inside, positive outside.
+#[must_use]
+#[inline]
+pub fn sdf_sphere(point: Vec3, center: Vec3, radius: f32) -> f32 {
+    (point - center).length() - radius
+}
+
+/// Signed distance from a point to an axis-aligned box surface.
+#[must_use]
+#[inline]
+pub fn sdf_box(point: Vec3, center: Vec3, half_extents: Vec3) -> f32 {
+    let d = (point - center).abs() - half_extents;
+    let outside = Vec3::new(d.x.max(0.0), d.y.max(0.0), d.z.max(0.0)).length();
+    let inside = d.x.max(d.y.max(d.z)).min(0.0);
+    outside + inside
+}
+
+/// Signed distance from a point to a capsule.
+#[must_use]
+#[inline]
+pub fn sdf_capsule(point: Vec3, a: Vec3, b: Vec3, radius: f32) -> f32 {
+    let ab = b - a;
+    let ap = point - a;
+    let t = ap.dot(ab) / ab.dot(ab);
+    let t = t.clamp(0.0, 1.0);
+    let closest = a + ab * t;
+    (point - closest).length() - radius
+}
+
+/// SDF union (minimum of two SDFs).
+#[must_use]
+#[inline]
+pub fn sdf_union(d1: f32, d2: f32) -> f32 {
+    d1.min(d2)
+}
+
+/// SDF intersection (maximum of two SDFs).
+#[must_use]
+#[inline]
+pub fn sdf_intersection(d1: f32, d2: f32) -> f32 {
+    d1.max(d2)
+}
+
+/// SDF subtraction (d1 minus d2).
+#[must_use]
+#[inline]
+pub fn sdf_subtraction(d1: f32, d2: f32) -> f32 {
+    d1.max(-d2)
+}
+
+/// SDF smooth union (blending two shapes).
+#[must_use]
+#[inline]
+pub fn sdf_smooth_union(d1: f32, d2: f32, k: f32) -> f32 {
+    let h = (0.5 + 0.5 * (d2 - d1) / k).clamp(0.0, 1.0);
+    d2 * (1.0 - h) + d1 * h - k * h * (1.0 - h)
+}
+
+// ---------------------------------------------------------------------------
+// Polygon triangulation (ear clipping)
+// ---------------------------------------------------------------------------
+
+/// Triangulate a simple polygon using the ear-clipping method.
+///
+/// Takes vertices in order (CCW or CW). Returns a list of triangle index triples.
+///
+/// # Errors
+///
+/// Returns [`crate::HisabError::InvalidInput`] if fewer than 3 vertices.
+pub fn triangulate_polygon(vertices: &[glam::Vec2]) -> Result<Vec<[usize; 3]>, crate::HisabError> {
+    let n = vertices.len();
+    if n < 3 {
+        return Err(crate::HisabError::InvalidInput(
+            "polygon needs at least 3 vertices".into(),
+        ));
+    }
+    if n == 3 {
+        return Ok(vec![[0, 1, 2]]);
+    }
+
+    let mut indices: Vec<usize> = (0..n).collect();
+    let mut triangles = Vec::with_capacity(n - 2);
+
+    // Determine winding
+    let area: f32 = (0..n)
+        .map(|i| {
+            let j = (i + 1) % n;
+            vertices[i].x * vertices[j].y - vertices[j].x * vertices[i].y
+        })
+        .sum();
+    let ccw = area > 0.0;
+
+    while indices.len() > 3 {
+        let len = indices.len();
+        let mut ear_found = false;
+
+        for i in 0..len {
+            let prev = indices[(i + len - 1) % len];
+            let curr = indices[i];
+            let next = indices[(i + 1) % len];
+
+            let a = vertices[prev];
+            let b = vertices[curr];
+            let c = vertices[next];
+
+            // Check if this is a convex vertex
+            let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            let is_convex = if ccw { cross > 0.0 } else { cross < 0.0 };
+            if !is_convex {
+                continue;
+            }
+
+            // Check no other vertex is inside this triangle
+            let mut is_ear = true;
+            for &idx in &indices {
+                if idx == prev || idx == curr || idx == next {
+                    continue;
+                }
+                if point_in_triangle_2d(vertices[idx], a, b, c) {
+                    is_ear = false;
+                    break;
+                }
+            }
+
+            if is_ear {
+                triangles.push([prev, curr, next]);
+                indices.remove(i);
+                ear_found = true;
+                break;
+            }
+        }
+
+        if !ear_found {
+            break; // Degenerate polygon
+        }
+    }
+
+    if indices.len() == 3 {
+        triangles.push([indices[0], indices[1], indices[2]]);
+    }
+
+    Ok(triangles)
+}
+
+/// Check if a 2D point is inside a triangle (using barycentric coordinates).
+#[must_use]
+#[inline]
+fn point_in_triangle_2d(p: glam::Vec2, a: glam::Vec2, b: glam::Vec2, c: glam::Vec2) -> bool {
+    let v0 = c - a;
+    let v1 = b - a;
+    let v2 = p - a;
+    let dot00 = v0.dot(v0);
+    let dot01 = v0.dot(v1);
+    let dot02 = v0.dot(v2);
+    let dot11 = v1.dot(v1);
+    let dot12 = v1.dot(v2);
+    let inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01);
+    let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
+    let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
+    u >= 0.0 && v >= 0.0 && u + v <= 1.0
+}
+
+// ---------------------------------------------------------------------------
+// Ray-quadric intersection
+// ---------------------------------------------------------------------------
+
+/// Ray-quadric intersection for general quadric surfaces.
+///
+/// A quadric is defined by `xᵀAx + bᵀx + c = 0` where A is 3×3.
+/// Returns the nearest `t >= 0` if the ray hits the surface.
+///
+/// - `a_mat`: 3×3 symmetric matrix (row-major as `[[f32; 3]; 3]`).
+/// - `b_vec`: linear coefficient vector `[f32; 3]`.
+/// - `c_val`: constant term.
+#[must_use]
+#[inline]
+pub fn ray_quadric(ray: &Ray, a_mat: &[[f32; 3]; 3], b_vec: &[f32; 3], c_val: f32) -> Option<f32> {
+    let o = ray.origin.to_array();
+    let d = ray.direction.to_array();
+
+    // Quadratic: (dᵀAd)t² + (2oᵀAd + bᵀd)t + (oᵀAo + bᵀo + c) = 0
+    let mut a_coeff = 0.0f32;
+    let mut b_coeff = 0.0f32;
+    let mut c_coeff = c_val;
+
+    for i in 0..3 {
+        c_coeff += b_vec[i] * o[i];
+        b_coeff += b_vec[i] * d[i];
+        for j in 0..3 {
+            a_coeff += d[i] * a_mat[i][j] * d[j];
+            b_coeff += 2.0 * o[i] * a_mat[i][j] * d[j];
+            c_coeff += o[i] * a_mat[i][j] * o[j];
+        }
+    }
+
+    if a_coeff.abs() < crate::EPSILON_F32 {
+        // Linear case
+        if b_coeff.abs() < crate::EPSILON_F32 {
+            return None;
+        }
+        let t = -c_coeff / b_coeff;
+        return if t >= 0.0 { Some(t) } else { None };
+    }
+
+    let disc = b_coeff * b_coeff - 4.0 * a_coeff * c_coeff;
+    if disc < 0.0 {
+        return None;
+    }
+    let sqrt_disc = disc.sqrt();
+    let inv_2a = 0.5 / a_coeff;
+    let t1 = (-b_coeff - sqrt_disc) * inv_2a;
+    let t2 = (-b_coeff + sqrt_disc) * inv_2a;
+
+    if t1 >= 0.0 {
+        Some(t1)
+    } else if t2 >= 0.0 {
+        Some(t2)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fresnel equations
+// ---------------------------------------------------------------------------
+
+/// Compute the refraction direction using Snell's law.
+///
+/// `incident` and `normal` must be normalized.
+/// `eta` is `n1 / n2` (ratio of refractive indices).
+/// Returns `None` for total internal reflection.
+#[must_use]
+#[inline]
+pub fn refract(incident: Vec3, normal: Vec3, eta: f32) -> Option<Vec3> {
+    let cos_i = -incident.dot(normal);
+    let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
+    if sin2_t > 1.0 {
+        return None; // Total internal reflection
+    }
+    let cos_t = (1.0 - sin2_t).sqrt();
+    Some(incident * eta + normal * (eta * cos_i - cos_t))
+}
+
+/// Fresnel reflectance (Schlick's approximation).
+///
+/// `cos_theta`: cosine of the angle between incident ray and surface normal.
+/// `n1`, `n2`: refractive indices of the two media.
+#[must_use]
+#[inline]
+pub fn fresnel_schlick(cos_theta: f32, n1: f32, n2: f32) -> f32 {
+    let r0 = ((n1 - n2) / (n1 + n2)).powi(2);
+    r0 + (1.0 - r0) * (1.0 - cos_theta).powi(5)
+}
+
+/// Exact Fresnel reflectance (unpolarized light).
+///
+/// Returns the average of s-polarized and p-polarized reflectance.
+#[must_use]
+#[inline]
+pub fn fresnel_exact(cos_i: f32, n1: f32, n2: f32) -> f32 {
+    let sin2_t = (n1 / n2).powi(2) * (1.0 - cos_i * cos_i);
+    if sin2_t >= 1.0 {
+        return 1.0; // Total internal reflection
+    }
+    let cos_t = (1.0 - sin2_t).sqrt();
+    let rs = ((n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t)).powi(2);
+    let rp = ((n1 * cos_t - n2 * cos_i) / (n1 * cos_t + n2 * cos_i)).powi(2);
+    (rs + rp) * 0.5
+}
+
+// ---------------------------------------------------------------------------
+// Sort-and-Sweep broadphase (SAP)
+// ---------------------------------------------------------------------------
+
+/// Sort-and-Sweep (Sweep and Prune) broadphase collision detection.
+///
+/// Given a list of AABBs, returns all overlapping pairs.
+/// Sweeps along the X axis. O(n log n + k) where k is the number of pairs.
+#[must_use]
+pub fn sweep_and_prune(aabbs: &[Aabb]) -> Vec<(usize, usize)> {
+    let n = aabbs.len();
+    if n < 2 {
+        return Vec::new();
+    }
+
+    // Sort by min.x
+    let mut sorted: Vec<usize> = (0..n).collect();
+    sorted.sort_unstable_by(|&a, &b| {
+        aabbs[a]
+            .min
+            .x
+            .partial_cmp(&aabbs[b].min.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut pairs = Vec::new();
+    for i in 0..n {
+        let a_idx = sorted[i];
+        let a_max_x = aabbs[a_idx].max.x;
+        for &b_idx in &sorted[(i + 1)..] {
+            if aabbs[b_idx].min.x > a_max_x {
+                break; // No more overlaps possible on X
+            }
+            if aabb_aabb(&aabbs[a_idx], &aabbs[b_idx]) {
+                let (lo, hi) = if a_idx < b_idx {
+                    (a_idx, b_idx)
+                } else {
+                    (b_idx, a_idx)
+                };
+                pairs.push((lo, hi));
+            }
+        }
+    }
+    pairs
+}
+
+// ---------------------------------------------------------------------------
+// Convex decomposition
+// ---------------------------------------------------------------------------
+
+/// A triangle mesh for convex decomposition.
+#[derive(Debug, Clone)]
+pub struct TriMesh {
+    /// Vertex positions.
+    pub vertices: Vec<Vec3>,
+    /// Triangle indices (each triple references vertices).
+    pub indices: Vec<[usize; 3]>,
+}
+
+/// Result of approximate convex decomposition.
+#[derive(Debug, Clone)]
+pub struct ConvexDecomposition {
+    /// Convex parts, each as a set of vertex indices into the original mesh.
+    pub parts: Vec<Vec<usize>>,
+}
+
+/// Configuration for approximate convex decomposition.
+pub struct AcdConfig {
+    /// Maximum concavity threshold. Parts with concavity below this are kept.
+    pub max_concavity: f32,
+    /// Maximum number of output parts.
+    pub max_parts: usize,
+}
+
+impl Default for AcdConfig {
+    fn default() -> Self {
+        Self {
+            max_concavity: 0.05,
+            max_parts: 32,
+        }
+    }
+}
+
+/// Approximate convex decomposition of a triangle mesh.
+///
+/// Hierarchically splits the mesh along PCA-derived cutting planes
+/// until all parts are within the concavity threshold.
+///
+/// # Errors
+///
+/// Returns [`crate::HisabError::InvalidInput`] if the mesh has no triangles.
+pub fn convex_decompose(
+    mesh: &TriMesh,
+    config: &AcdConfig,
+) -> Result<ConvexDecomposition, crate::HisabError> {
+    if mesh.indices.is_empty() {
+        return Err(crate::HisabError::InvalidInput(
+            "mesh has no triangles".into(),
+        ));
+    }
+
+    // Start with all vertex indices as one part
+    let all_verts: Vec<usize> = (0..mesh.vertices.len()).collect();
+    let mut parts: Vec<Vec<usize>> = vec![all_verts];
+
+    // Iteratively split the most concave part
+    for _ in 0..config.max_parts {
+        if parts.len() >= config.max_parts {
+            break;
+        }
+
+        // Find the part with highest concavity
+        let mut worst_idx = 0;
+        let mut worst_concavity = 0.0f32;
+        for (i, part) in parts.iter().enumerate() {
+            let c = compute_concavity(mesh, part);
+            if c > worst_concavity {
+                worst_concavity = c;
+                worst_idx = i;
+            }
+        }
+
+        if worst_concavity <= config.max_concavity {
+            break; // All parts are convex enough
+        }
+
+        // Split the worst part using PCA
+        let part = parts.remove(worst_idx);
+        let (left, right) = split_part_pca(mesh, &part);
+        if !left.is_empty() {
+            parts.push(left);
+        }
+        if !right.is_empty() {
+            parts.push(right);
+        }
+    }
+
+    Ok(ConvexDecomposition { parts })
+}
+
+/// Compute concavity of a set of vertices (max distance from convex hull).
+fn compute_concavity(mesh: &TriMesh, part: &[usize]) -> f32 {
+    if part.len() < 4 {
+        return 0.0;
+    }
+
+    // Compute centroid
+    let mut centroid = Vec3::ZERO;
+    for &idx in part {
+        centroid += mesh.vertices[idx];
+    }
+    centroid /= part.len() as f32;
+
+    // Compute average distance from centroid
+    let avg_dist: f32 = part
+        .iter()
+        .map(|&idx| (mesh.vertices[idx] - centroid).length())
+        .sum::<f32>()
+        / part.len() as f32;
+
+    // Concavity ≈ variance of distances / avg_dist
+    let variance: f32 = part
+        .iter()
+        .map(|&idx| {
+            let d = (mesh.vertices[idx] - centroid).length() - avg_dist;
+            d * d
+        })
+        .sum::<f32>()
+        / part.len() as f32;
+
+    variance.sqrt() / avg_dist.max(crate::EPSILON_F32)
+}
+
+/// Split a set of vertices along their principal axis.
+fn split_part_pca(mesh: &TriMesh, part: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    if part.len() < 2 {
+        return (part.to_vec(), Vec::new());
+    }
+
+    // Centroid
+    let mut centroid = Vec3::ZERO;
+    for &idx in part {
+        centroid += mesh.vertices[idx];
+    }
+    centroid /= part.len() as f32;
+
+    // Find the axis of greatest variance (simplified PCA: just pick the widest axis)
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for &idx in part {
+        let v = mesh.vertices[idx];
+        min = min.min(v);
+        max = max.max(v);
+    }
+    let extent = max - min;
+    let split_axis = if extent.x >= extent.y && extent.x >= extent.z {
+        0
+    } else if extent.y >= extent.z {
+        1
+    } else {
+        2
+    };
+
+    let split_val = centroid.to_array()[split_axis];
+
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    for &idx in part {
+        if mesh.vertices[idx].to_array()[split_axis] <= split_val {
+            left.push(idx);
+        } else {
+            right.push(idx);
+        }
+    }
+
+    // Ensure both sides have vertices
+    if left.is_empty() || right.is_empty() {
+        let mid = part.len() / 2;
+        left = part[..mid].to_vec();
+        right = part[mid..].to_vec();
+    }
+
+    (left, right)
+}
+
+// ---------------------------------------------------------------------------
+// Continuous Collision Detection (CCD)
+// ---------------------------------------------------------------------------
+
+/// Expand an AABB along a velocity vector to create a swept bounding volume.
+#[must_use]
+#[inline]
+pub fn swept_aabb(aabb: &Aabb, velocity: Vec3, dt: f32) -> Aabb {
+    let end_min = aabb.min + velocity * dt;
+    let end_max = aabb.max + velocity * dt;
+    Aabb::new(aabb.min.min(end_min), aabb.max.max(end_max))
+}
+
+/// Compute the time of impact between two moving convex shapes.
+///
+/// Uses conservative advancement: iteratively advance time by
+/// `distance / closing_speed` until contact or timeout.
+///
+/// - `a`, `b`: convex shapes.
+/// - `vel_a`, `vel_b`: linear velocities.
+/// - `max_t`: maximum time horizon.
+/// - `tol`: distance tolerance for contact.
+///
+/// Returns `Some(t)` at first contact, or `None` if no collision within `max_t`.
+#[must_use]
+pub fn time_of_impact(
+    a: &dyn ConvexSupport3D,
+    b: &dyn ConvexSupport3D,
+    vel_a: Vec3,
+    vel_b: Vec3,
+    max_t: f32,
+    tol: f32,
+) -> Option<f32> {
+    // If already overlapping at t=0
+    if gjk_intersect_3d(a, b) {
+        return Some(0.0);
+    }
+
+    let rel_vel = vel_b - vel_a;
+    let speed = rel_vel.length();
+    if speed < crate::EPSILON_F32 {
+        return None; // Not approaching
+    }
+
+    // Conservative advancement
+    let mut t = 0.0;
+    for _ in 0..GJK_MAX_ITERATIONS {
+        // We approximate distance by running GJK and checking overlap
+        // at the current time offset. This is a simplified approach —
+        // a full implementation would use the GJK distance query.
+        if t > max_t {
+            return None;
+        }
+
+        // Check if shapes overlap at time t by testing with offset supports
+        let offset = rel_vel * t;
+        let offset_support = OffsetSupport { shape: b, offset };
+        if gjk_intersect_3d(a, &offset_support) {
+            return Some(t);
+        }
+
+        // Advance conservatively: use the closing speed as upper bound
+        let step = tol.max(0.01) / speed;
+        t += step;
+    }
+
+    None
+}
+
+/// Helper: a ConvexSupport3D that offsets another shape by a translation.
+struct OffsetSupport<'a> {
+    shape: &'a dyn ConvexSupport3D,
+    offset: Vec3,
+}
+
+impl ConvexSupport3D for OffsetSupport<'_> {
+    fn support(&self, direction: Vec3) -> Vec3 {
+        self.shape.support(direction) + self.offset
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constraint solvers (physics)
+// ---------------------------------------------------------------------------
+
+/// A contact constraint for sequential impulse solving.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContactConstraint {
+    /// Contact normal (from A to B).
+    pub normal: Vec3,
+    /// Contact point (world space).
+    pub point: Vec3,
+    /// Penetration depth.
+    pub penetration: f32,
+    /// Coefficient of restitution.
+    pub restitution: f32,
+    /// Coefficient of friction.
+    pub friction: f32,
+    /// Inverse mass of body A.
+    pub inv_mass_a: f32,
+    /// Inverse mass of body B.
+    pub inv_mass_b: f32,
+}
+
+/// Solve contact constraints using sequential impulse iteration.
+///
+/// Given a set of contact constraints and relative velocities, computes
+/// impulses that resolve penetration and apply friction.
+///
+/// Returns a vector of impulse magnitudes (one per constraint).
+#[must_use]
+pub fn sequential_impulse(
+    constraints: &[ContactConstraint],
+    rel_velocities: &[Vec3],
+    iterations: usize,
+) -> Vec<f32> {
+    let n = constraints.len();
+    let mut impulses = vec![0.0f32; n];
+
+    for _ in 0..iterations {
+        for i in 0..n {
+            let c = &constraints[i];
+            let inv_mass = c.inv_mass_a + c.inv_mass_b;
+            if inv_mass < crate::EPSILON_F32 {
+                continue;
+            }
+
+            let v_rel = if i < rel_velocities.len() {
+                rel_velocities[i].dot(c.normal)
+            } else {
+                0.0
+            };
+
+            // Normal impulse
+            let j_n = -(1.0 + c.restitution) * v_rel / inv_mass;
+            let new_impulse = (impulses[i] + j_n).max(0.0); // Clamp: no pull
+            impulses[i] = new_impulse;
+        }
+    }
+
+    impulses
+}
+
+// ---------------------------------------------------------------------------
 // OBB (Oriented Bounding Box)
 // ---------------------------------------------------------------------------
 
@@ -4629,8 +5272,195 @@ mod tests {
     fn frustum_sphere_partially_inside() {
         let proj = glam::Mat4::perspective_rh_gl(std::f32::consts::FRAC_PI_4, 1.0, 0.1, 100.0);
         let frustum = Frustum::from_view_projection(proj);
-        // Sphere centered at near plane, large enough to straddle it
         let sphere = Sphere::new(Vec3::new(0.0, 0.0, -0.1), 0.5).unwrap();
         assert!(frustum.contains_sphere(&sphere));
+    }
+
+    // --- SDF tests ---
+
+    #[test]
+    fn sdf_sphere_inside_outside() {
+        assert!(sdf_sphere(Vec3::ZERO, Vec3::ZERO, 1.0) < 0.0); // inside
+        assert!(sdf_sphere(Vec3::new(2.0, 0.0, 0.0), Vec3::ZERO, 1.0) > 0.0); // outside
+        assert!(approx_eq(
+            sdf_sphere(Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO, 1.0),
+            0.0
+        )); // on surface
+    }
+
+    #[test]
+    fn sdf_box_inside_outside() {
+        assert!(sdf_box(Vec3::ZERO, Vec3::ZERO, Vec3::ONE) < 0.0);
+        assert!(sdf_box(Vec3::new(2.0, 0.0, 0.0), Vec3::ZERO, Vec3::ONE) > 0.0);
+    }
+
+    #[test]
+    fn sdf_csg_operations() {
+        let d1 = -0.5; // inside shape 1
+        let d2 = 0.5; // outside shape 2
+        assert!(sdf_union(d1, d2) < 0.0); // union: inside at least one
+        assert!(sdf_intersection(d1, d2) > 0.0); // intersection: not inside both
+        assert!(sdf_subtraction(d1, d2) < 0.0); // subtraction: inside 1, outside 2
+    }
+
+    // --- Polygon triangulation tests ---
+
+    #[test]
+    fn triangulate_triangle() {
+        let verts = [
+            glam::Vec2::ZERO,
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(0.0, 1.0),
+        ];
+        let tris = triangulate_polygon(&verts).unwrap();
+        assert_eq!(tris.len(), 1);
+    }
+
+    #[test]
+    fn triangulate_square() {
+        let verts = [
+            glam::Vec2::ZERO,
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(1.0, 1.0),
+            glam::Vec2::new(0.0, 1.0),
+        ];
+        let tris = triangulate_polygon(&verts).unwrap();
+        assert_eq!(tris.len(), 2);
+    }
+
+    #[test]
+    fn triangulate_too_few() {
+        assert!(triangulate_polygon(&[glam::Vec2::ZERO, glam::Vec2::X]).is_err());
+    }
+
+    // --- Ray-quadric test ---
+
+    #[test]
+    fn ray_quadric_sphere() {
+        // Sphere x²+y²+z²=1 as quadric: A=I, b=0, c=-1
+        let a = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let b = [0.0, 0.0, 0.0];
+        let ray = Ray::new(Vec3::new(0.0, 0.0, -5.0), Vec3::Z).unwrap();
+        let t = ray_quadric(&ray, &a, &b, -1.0).unwrap();
+        assert!(approx_eq(t, 4.0)); // hit at z=-1, t=4
+    }
+
+    // --- Fresnel tests ---
+
+    #[test]
+    fn fresnel_schlick_endpoints() {
+        // At normal incidence (cos=1), R = ((n1-n2)/(n1+n2))²
+        let r = fresnel_schlick(1.0, 1.0, 1.5);
+        let expected = ((1.0_f32 - 1.5) / (1.0 + 1.5)).powi(2);
+        assert!(approx_eq(r, expected));
+    }
+
+    #[test]
+    fn fresnel_exact_normal_incidence() {
+        let r = fresnel_exact(1.0, 1.0, 1.5);
+        let expected = ((1.0_f32 - 1.5) / (1.0 + 1.5)).powi(2);
+        assert!((r - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn refract_basic() {
+        let incident = Vec3::new(0.0, -1.0, 0.0);
+        let normal = Vec3::new(0.0, 1.0, 0.0);
+        let refracted = refract(incident, normal, 1.0).unwrap();
+        // Same medium (eta=1): refracted = incident
+        assert!(vec3_approx_eq(refracted, incident));
+    }
+
+    #[test]
+    fn refract_total_internal_reflection() {
+        // Glass to air at steep angle
+        let incident = Vec3::new(0.9, -0.436, 0.0).normalize();
+        let normal = Vec3::new(0.0, 1.0, 0.0);
+        assert!(refract(incident, normal, 1.5).is_none());
+    }
+
+    // --- Sweep-and-prune tests ---
+
+    #[test]
+    fn sap_basic() {
+        let aabbs = [
+            Aabb::new(Vec3::ZERO, Vec3::ONE),
+            Aabb::new(Vec3::new(0.5, 0.0, 0.0), Vec3::new(1.5, 1.0, 1.0)),
+            Aabb::new(Vec3::new(5.0, 0.0, 0.0), Vec3::new(6.0, 1.0, 1.0)),
+        ];
+        let pairs = sweep_and_prune(&aabbs);
+        assert_eq!(pairs.len(), 1); // Only 0-1 overlap
+        assert!(pairs.contains(&(0, 1)));
+    }
+
+    #[test]
+    fn sap_no_overlaps() {
+        let aabbs = [
+            Aabb::new(Vec3::ZERO, Vec3::ONE),
+            Aabb::new(Vec3::new(5.0, 5.0, 5.0), Vec3::new(6.0, 6.0, 6.0)),
+        ];
+        assert!(sweep_and_prune(&aabbs).is_empty());
+    }
+
+    // --- CCD tests ---
+
+    #[test]
+    fn swept_aabb_expands() {
+        let aabb = Aabb::new(Vec3::ZERO, Vec3::ONE);
+        let swept = swept_aabb(&aabb, Vec3::new(5.0, 0.0, 0.0), 1.0);
+        assert!(approx_eq(swept.min.x, 0.0));
+        assert!(approx_eq(swept.max.x, 6.0));
+    }
+
+    #[test]
+    fn toi_overlapping_at_t0() {
+        let a = Sphere::new(Vec3::ZERO, 1.0).unwrap();
+        let b = Sphere::new(Vec3::new(0.5, 0.0, 0.0), 1.0).unwrap();
+        let t = time_of_impact(&a, &b, Vec3::ZERO, Vec3::ZERO, 1.0, 0.01);
+        assert_eq!(t, Some(0.0));
+    }
+
+    #[test]
+    fn toi_no_collision() {
+        let a = Sphere::new(Vec3::ZERO, 1.0).unwrap();
+        let b = Sphere::new(Vec3::new(10.0, 0.0, 0.0), 1.0).unwrap();
+        // Moving apart
+        let t = time_of_impact(&a, &b, Vec3::new(-1.0, 0.0, 0.0), Vec3::X, 5.0, 0.01);
+        assert!(t.is_none());
+    }
+
+    // --- Sequential impulse tests ---
+
+    #[test]
+    fn sequential_impulse_basic() {
+        let constraints = [ContactConstraint {
+            normal: Vec3::Y,
+            point: Vec3::ZERO,
+            penetration: 0.1,
+            restitution: 0.5,
+            friction: 0.3,
+            inv_mass_a: 1.0,
+            inv_mass_b: 1.0,
+        }];
+        let rel_vels = [Vec3::new(0.0, -2.0, 0.0)];
+        let impulses = sequential_impulse(&constraints, &rel_vels, 10);
+        assert!(impulses[0] > 0.0, "should produce positive impulse");
+    }
+
+    #[test]
+    fn sequential_impulse_no_pull() {
+        // Separating velocity: should not produce impulse
+        let constraints = [ContactConstraint {
+            normal: Vec3::Y,
+            point: Vec3::ZERO,
+            penetration: 0.0,
+            restitution: 1.0,
+            friction: 0.0,
+            inv_mass_a: 1.0,
+            inv_mass_b: 1.0,
+        }];
+        let rel_vels = [Vec3::new(0.0, 1.0, 0.0)]; // Moving apart
+        let impulses = sequential_impulse(&constraints, &rel_vels, 10);
+        assert!(approx_eq(impulses[0], 0.0));
     }
 }

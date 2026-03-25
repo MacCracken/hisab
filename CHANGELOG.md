@@ -1,5 +1,91 @@
 # Changelog
 
+## 1.2.0 (2026-03-25)
+
+### num — Full eigendecomposition
+- `eigen_symmetric()` — Jacobi rotation algorithm for all eigenvalues + orthonormal eigenvectors
+- `EigenDecomposition` struct
+
+### num — Stiff ODE solvers
+- `backward_euler()` — implicit Euler with Newton+LU iteration
+- `bdf2()` — second-order backward differentiation formula
+
+### num — Stochastic differential equations
+- `Pcg32::next_normal()` — Box-Muller normal distribution
+- `euler_maruyama()` — SDE solver (strong order 0.5)
+- `milstein()` — SDE solver with Ito correction (strong order 1.0)
+
+### num — Stability analysis
+- `lyapunov_max()` — maximal Lyapunov exponent via variational equation
+
+### num — Projected Gauss-Seidel
+- `projected_gauss_seidel()` — box-constrained linear solver for physics
+
+### geo — Continuous collision detection
+- `swept_aabb()` — expand AABB along velocity
+- `time_of_impact()` — conservative advancement TOI for convex shapes
+
+### geo — Constraint solvers
+- `ContactConstraint` struct
+- `sequential_impulse()` — iterative contact constraint solver
+
+### geo — Convex decomposition
+- `TriMesh`, `ConvexDecomposition`, `AcdConfig` types
+- `convex_decompose()` — approximate convex decomposition via PCA splitting
+
+### autodiff — Reverse-mode automatic differentiation
+- `Tape`, `Var`, `TapeOp` — computation graph with recording
+- `tape.backward()` — backpropagation for all gradients in one pass
+- `reverse_gradient()` — convenience API for gradient computation
+- Operations: add, sub, mul, div, neg, sin, cos, exp, ln, powf
+
+### Stats
+- 714 tests (671 unit + 34 integration + 9 doc), zero clippy warnings
+
+## 1.1.0 (2026-03-25)
+
+### geo — Signed distance fields
+- `sdf_sphere()`, `sdf_box()`, `sdf_capsule()` — analytical SDFs
+- `sdf_union()`, `sdf_intersection()`, `sdf_subtraction()`, `sdf_smooth_union()` — CSG operations
+
+### geo — Polygon triangulation
+- `triangulate_polygon()` — ear-clipping triangulation for simple polygons
+
+### geo — Ray-quadric + Fresnel
+- `ray_quadric()` — general quadric surface intersection (ellipsoid, paraboloid, etc.)
+- `refract()` — Snell's law refraction vector
+- `fresnel_schlick()`, `fresnel_exact()` — Fresnel reflectance
+
+### geo — Sweep-and-prune broadphase
+- `sweep_and_prune()` — SAP broadphase collision detection
+
+### transforms — Dual quaternions
+- `DualQuat` — rigid body transform type for blend skinning
+- `from_rotation_translation()`, `translation()`, `rotation()`, `to_matrix()`, `transform_point()`, `blend()`
+
+### transforms — CSS transform decomposition
+- `decompose_mat4()` — extract translate/rotate/scale from arbitrary 4×4 matrix
+- `recompose_mat4()` — reconstruct from components
+- `DecomposedTransform` struct
+
+### transforms — Color + Oklab
+- `color_matrix_saturation()`, `color_matrix_hue_rotate()` — color matrix operations
+- `linear_to_oklab()`, `oklab_to_linear()` — Oklab perceptual color space
+
+### transforms — Spherical harmonics
+- `sh_eval_l2()` — evaluate 9 SH basis functions at a direction
+- `sh_project_l2()`, `sh_evaluate_l2()` — project and reconstruct from SH coefficients
+
+### num — Inertia tensors
+- `inertia_sphere()`, `inertia_box()` — primitive shape inertia tensors
+- `inertia_mesh()` — inertia tensor from triangle mesh (divergence theorem)
+
+### num — GMRES iterative solver
+- `gmres()` — GMRES(m) for non-symmetric linear systems
+
+### Stats
+- 683 tests (640 unit + 34 integration + 9 doc), zero clippy warnings
+
 ## 1.0.1 (2026-03-25)
 
 ### num — Symplectic integrators

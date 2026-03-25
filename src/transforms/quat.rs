@@ -90,4 +90,3 @@ pub fn look_at_rh(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
 
 // ---------------------------------------------------------------------------
 // Screen-space projection
-

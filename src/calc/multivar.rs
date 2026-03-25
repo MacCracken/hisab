@@ -160,5 +160,3 @@ pub fn hessian(f: impl Fn(&[f64]) -> f64, x: &[f64], h: f64) -> Result<Vec<Vec<f
 
     Ok(hess)
 }
-
-

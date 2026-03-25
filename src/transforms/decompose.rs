@@ -71,4 +71,3 @@ pub fn recompose_mat4(d: &DecomposedTransform) -> Mat4 {
 
 // ---------------------------------------------------------------------------
 // Color matrix operations
-

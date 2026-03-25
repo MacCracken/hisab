@@ -1,3 +1,6 @@
+use crate::HisabError;
+use glam::{Vec2, Vec3};
+
 mod core;
 pub use core::*;
 

@@ -233,4 +233,3 @@ pub fn bezier_cubic_3d_param_at_length(
 
 // ---------------------------------------------------------------------------
 // Gauss-Legendre quadrature
-

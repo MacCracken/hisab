@@ -53,5 +53,3 @@ pub fn sh_evaluate_l2(coeffs: &[f32; 9], dir: Vec3) -> f32 {
     }
     sum
 }
-
-

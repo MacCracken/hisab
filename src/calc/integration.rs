@@ -209,4 +209,3 @@ pub fn integral_monte_carlo(
 
 // ---------------------------------------------------------------------------
 // Multivariable calculus
-

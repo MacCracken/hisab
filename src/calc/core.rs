@@ -142,4 +142,3 @@ pub fn bezier_cubic_3d(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
 
 // ---------------------------------------------------------------------------
 // De Casteljau subdivision
-

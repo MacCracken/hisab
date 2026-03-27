@@ -10,6 +10,7 @@ pub struct Triangle {
 }
 
 impl Triangle {
+    /// Create a triangle from three vertices.
     #[must_use]
     #[inline]
     pub fn new(a: Vec3, b: Vec3, c: Vec3) -> Self {
@@ -130,6 +131,7 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Create a segment from start and end points.
     #[must_use]
     #[inline]
     pub fn new(start: Vec3, end: Vec3) -> Self {

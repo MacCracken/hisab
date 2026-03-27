@@ -126,6 +126,85 @@ pub fn bspline_eval(degree: usize, control_points: &[Vec3], knots: &[f64], t: f6
 }
 
 // ---------------------------------------------------------------------------
+// NURBS (Non-Uniform Rational B-Splines)
+// ---------------------------------------------------------------------------
+
+/// Evaluate a NURBS (Non-Uniform Rational B-Spline) curve at parameter `t`.
+///
+/// A NURBS curve is a rational generalization of a B-spline, where each
+/// control point has an associated weight. This allows exact representation
+/// of conic sections (circles, ellipses) and other curves that B-splines
+/// cannot represent exactly.
+///
+/// - `degree`: spline degree (1 = linear, 2 = quadratic, 3 = cubic).
+/// - `control_points`: the control polygon (in 3D).
+/// - `weights`: per-control-point weights (must be positive; uniform = all 1.0).
+/// - `knots`: the knot vector (length = control_points.len() + degree + 1).
+/// - `t`: parameter value (within valid knot range).
+///
+/// Returns `None` if inputs are invalid.
+#[must_use = "returns the evaluated NURBS point"]
+#[allow(clippy::needless_range_loop)]
+pub fn nurbs_eval(
+    degree: usize,
+    control_points: &[Vec3],
+    weights: &[f64],
+    knots: &[f64],
+    t: f64,
+) -> Option<Vec3> {
+    let n = control_points.len();
+    if n == 0 || weights.len() != n || knots.len() != n + degree + 1 {
+        return None;
+    }
+    if t < knots[degree] || t > knots[n] {
+        return None;
+    }
+
+    // Find the knot span
+    let mut k = degree;
+    while k < n - 1 && knots[k + 1] <= t {
+        k += 1;
+    }
+
+    // De Boor's algorithm on weighted (homogeneous) control points
+    // P_w[i] = (w[i]*x[i], w[i]*y[i], w[i]*z[i], w[i])
+    let mut pw: Vec<[f64; 4]> = (0..=degree)
+        .map(|j| {
+            let idx = k - degree + j;
+            let w = weights[idx];
+            let p = control_points[idx];
+            [p.x as f64 * w, p.y as f64 * w, p.z as f64 * w, w]
+        })
+        .collect();
+
+    for r in 1..=degree {
+        for j in (r..=degree).rev() {
+            let i = k - degree + j;
+            let denom = knots[i + degree + 1 - r] - knots[i];
+            if denom.abs() < crate::EPSILON_F64 {
+                continue;
+            }
+            let alpha = (t - knots[i]) / denom;
+            let one_minus = 1.0 - alpha;
+            for c in 0..4 {
+                pw[j][c] = one_minus * pw[j - 1][c] + alpha * pw[j][c];
+            }
+        }
+    }
+
+    // Perspective divide
+    let w = pw[degree][3];
+    if w.abs() < crate::EPSILON_F64 {
+        return None;
+    }
+    Some(Vec3::new(
+        (pw[degree][0] / w) as f32,
+        (pw[degree][1] / w) as f32,
+        (pw[degree][2] / w) as f32,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Hermite spline with TCB (tension, continuity, bias)
 // ---------------------------------------------------------------------------
 

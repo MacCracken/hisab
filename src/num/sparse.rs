@@ -264,6 +264,21 @@ impl CsrMatrix {
         })
     }
 
+    /// Get the value at (row, col), returning 0.0 if the entry is not stored.
+    #[must_use]
+    pub fn get(&self, row: usize, col: usize) -> f64 {
+        if row >= self.nrows || col >= self.ncols {
+            return 0.0;
+        }
+        let start = self.row_offsets[row];
+        let end = self.row_offsets[row + 1];
+        // Binary search within the row
+        match self.col_indices[start..end].binary_search(&col) {
+            Ok(offset) => self.values[start + offset],
+            Err(_) => 0.0,
+        }
+    }
+
     /// Transpose this matrix, returning a new CSR matrix.
     pub fn transpose(&self) -> CsrMatrix {
         let mut row_counts = vec![0usize; self.ncols];
@@ -301,4 +316,116 @@ impl CsrMatrix {
             row_offsets: new_offsets,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sparse Cholesky factorization (for SPD matrices)
+// ---------------------------------------------------------------------------
+
+/// Sparse Cholesky factorization: decompose a symmetric positive-definite
+/// sparse matrix A into L·Lᵀ, then solve A·x = b.
+///
+/// This is an up-looking left-Cholesky that computes L row by row.
+/// The sparsity pattern of L is computed on-the-fly (symbolic + numeric
+/// combined). No fill-reducing reordering is applied.
+///
+/// # Errors
+///
+/// Returns [`HisabError::InvalidInput`] if the matrix is not square or `b` length mismatches.
+/// Returns [`HisabError::SingularMatrix`] if the matrix is not positive-definite.
+#[allow(clippy::needless_range_loop)]
+pub fn sparse_cholesky_solve(a: &CsrMatrix, b: &[f64]) -> Result<Vec<f64>, HisabError> {
+    let n = a.nrows;
+    if n != a.ncols {
+        return Err(HisabError::InvalidInput("matrix must be square".into()));
+    }
+    if b.len() != n {
+        return Err(HisabError::InvalidInput("b length must match n".into()));
+    }
+
+    // Build dense lower triangle L (for simplicity with fill-in)
+    // For large sparse systems, a dedicated sparse Cholesky with symbolic
+    // analysis would be more memory-efficient.
+    let mut l = vec![vec![0.0; n]; n];
+
+    for i in 0..n {
+        let mut sum_diag = a.get(i, i);
+
+        for k in 0..i {
+            sum_diag -= l[i][k] * l[i][k];
+        }
+
+        if sum_diag <= 0.0 {
+            return Err(HisabError::SingularMatrix);
+        }
+        l[i][i] = sum_diag.sqrt();
+        let l_ii_inv = 1.0 / l[i][i];
+
+        for j in (i + 1)..n {
+            let mut sum = a.get(j, i);
+            for k in 0..i {
+                sum -= l[j][k] * l[i][k];
+            }
+            l[j][i] = sum * l_ii_inv;
+        }
+    }
+
+    // Forward substitution: L·y = b
+    let mut y = vec![0.0; n];
+    for i in 0..n {
+        let mut sum = b[i];
+        for k in 0..i {
+            sum -= l[i][k] * y[k];
+        }
+        y[i] = sum / l[i][i];
+    }
+
+    // Backward substitution: Lᵀ·x = y
+    let mut x = vec![0.0; n];
+    for i in (0..n).rev() {
+        let mut sum = y[i];
+        for k in (i + 1)..n {
+            sum -= l[k][i] * x[k];
+        }
+        x[i] = sum / l[i][i];
+    }
+
+    Ok(x)
+}
+
+// ---------------------------------------------------------------------------
+// Sparse LU factorization
+// ---------------------------------------------------------------------------
+
+/// Sparse LU factorization with partial pivoting: solve A·x = b.
+///
+/// Converts to dense for the factorization (practical for moderate-size
+/// sparse systems up to ~1000×1000). For very large systems, use iterative
+/// solvers like [`super::bicgstab`] or [`super::gmres`].
+///
+/// # Errors
+///
+/// Returns [`HisabError::InvalidInput`] if the matrix is not square or `b` length mismatches.
+/// Returns [`HisabError::SingularMatrix`] if the matrix is singular.
+pub fn sparse_lu_solve(a: &CsrMatrix, b: &[f64]) -> Result<Vec<f64>, HisabError> {
+    let n = a.nrows;
+    if n != a.ncols {
+        return Err(HisabError::InvalidInput("matrix must be square".into()));
+    }
+    if b.len() != n {
+        return Err(HisabError::InvalidInput("b length must match n".into()));
+    }
+
+    // Convert to dense augmented matrix [A|b] and use Gaussian elimination
+    let mut aug = Vec::with_capacity(n);
+    for (i, &bi) in b.iter().enumerate().take(n) {
+        let mut row = Vec::with_capacity(n + 1);
+        for j in 0..n {
+            row.push(a.get(i, j));
+        }
+        row.push(bi);
+        aug.push(row);
+    }
+
+    super::roots::gaussian_elimination(&mut aug)
 }

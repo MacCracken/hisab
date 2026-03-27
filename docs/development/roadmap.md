@@ -68,19 +68,7 @@ Post-1.0: standard semver.
 
 ---
 
-## 1.2.0 — Consumer essentials + remaining gaps
-
-### Deferred (large effort)
-- [ ] MPR / XenoCollide collision alternative (impetus)
-- [ ] NURBS evaluation — rational B-splines (kiran)
-- [ ] Delaunay triangulation + Voronoi diagrams 2D (kiran)
-- [ ] Sparse LU/Cholesky factorization (joshua)
-
-### Quality
-- [ ] Complete doctests on all public functions
-- [ ] GPU compute kernels via wgpu (shared with ranga)
-
-## 1.3.0 — Structural depth
+## 1.3.0 — Structural depth + quality
 
 ### Physics solver completeness
 - [ ] Constraint warm-starting for sequential impulse — cache impulses across frames (geo, impetus)
@@ -99,6 +87,10 @@ Post-1.0: standard semver.
 ### Compositor / rendering
 - [ ] Gamma-aware interpolation — decode→lerp→encode combined (transforms, aethersafha)
 - [ ] Exposure / EV ↔ luminance conversion for HDR pipelines (transforms, kiran, aethersafha)
+
+### Quality
+- [ ] Complete doctests on all public functions
+- [ ] GPU compute kernels via wgpu (shared with ranga)
 
 ## Watch List
 

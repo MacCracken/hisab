@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 1.2.0 (2026-03-27)
 
 ### transforms — Interpolation utilities
 - `inverse_lerp()` — compute parameter `t` from a value in a range
@@ -78,6 +78,23 @@
 ### geo — Tangent space computation
 - `compute_tangent()` — per-triangle tangent/bitangent from UV coordinates (Mikktspace-compatible)
 
+### geo — MPR / XenoCollide collision
+- `mpr_intersect()` — Minkowski Portal Refinement overlap test (3D)
+- `mpr_penetration()` — MPR with penetration normal and depth
+
+### geo — Delaunay triangulation + Voronoi diagrams
+- `delaunay_2d()` — Bowyer-Watson incremental Delaunay triangulation
+- `voronoi_2d()` — Voronoi diagram as dual of Delaunay (finite edges)
+- `DelaunayTriangle`, `Triangulation`, `VoronoiEdge`, `VoronoiDiagram` types
+
+### calc — NURBS evaluation
+- `nurbs_eval()` — Non-Uniform Rational B-Spline evaluation via weighted de Boor's algorithm
+
+### num — Sparse factorization
+- `sparse_cholesky_solve()` — Cholesky factorization + solve for sparse SPD matrices
+- `sparse_lu_solve()` — LU factorization + solve for sparse systems via Gaussian elimination
+- `CsrMatrix::get()` — random access to sparse matrix elements via binary search
+
 ### Fixed
 - EPA 2D winding: enforce CCW polytope orientation before expansion (prevents inverted normals)
 - `backward_euler()`, `bdf2()`: emit `tracing::warn!` on Newton non-convergence instead of silent acceptance
@@ -85,7 +102,7 @@
 - Rustdoc: escaped `[0,1]` bracket in color.rs, wrapped `Vec<f64>` in backticks in optimize.rs
 
 ### Stats
-- 774 tests (731 unit + 34 integration + 9 doc), zero clippy warnings
+- 786 tests (743 unit + 34 integration + 9 doc), zero clippy warnings
 
 ## 1.1.0 (2026-03-25)
 

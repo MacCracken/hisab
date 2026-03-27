@@ -966,3 +966,139 @@ fn epa_penetration_3d(
         depth: closest_dist,
     })
 }
+
+// ---------------------------------------------------------------------------
+// MPR (Minkowski Portal Refinement) / XenoCollide
+// ---------------------------------------------------------------------------
+
+/// MPR (Minkowski Portal Refinement) collision test for 3D convex shapes.
+///
+/// An alternative to GJK that finds a "portal" — a triangle on the Minkowski
+/// difference surface that separates the origin. Simpler to implement than GJK
+/// and often faster for overlap-only queries.
+///
+/// Returns `true` if the shapes overlap.
+#[must_use]
+pub fn mpr_intersect(a: &dyn ConvexSupport3D, b: &dyn ConvexSupport3D) -> bool {
+    mpr_penetration(a, b).is_some()
+}
+
+/// MPR collision with penetration info.
+///
+/// Returns `None` if shapes don't overlap, or `Some(Penetration3D)` with
+/// the separation normal and approximate depth.
+#[must_use]
+pub fn mpr_penetration(a: &dyn ConvexSupport3D, b: &dyn ConvexSupport3D) -> Option<Penetration3D> {
+    // Phase 1: Find the portal (origin ray)
+    // v0 = interior point of Minkowski difference (center of A - center of B approximation)
+    let v0 =
+        minkowski_support_3d(a, b, Vec3::X) * 0.5 + minkowski_support_3d(a, b, Vec3::NEG_X) * 0.5;
+
+    if v0.length_squared() < crate::EPSILON_F32 {
+        // Centers coincide — shapes definitely overlap
+        // Use a support direction to get penetration info
+        let n = Vec3::X;
+        let s = minkowski_support_3d(a, b, n);
+        return Some(Penetration3D {
+            normal: n,
+            depth: s.dot(n).abs(),
+        });
+    }
+
+    // v1 = support in direction from origin toward v0
+    let dir1 = -v0.normalize_or_zero();
+    let v1 = minkowski_support_3d(a, b, dir1);
+
+    // If v1 doesn't cross the origin ray, no intersection
+    if v1.dot(dir1) < 0.0 {
+        return None;
+    }
+
+    // v2 = support perpendicular to the v0-v1 line
+    let dir2 = (v1 - v0).cross(-v0);
+    if dir2.length_squared() < crate::EPSILON_F32 {
+        // v0 and v1 are on the same line through origin — overlap
+        let n = dir1;
+        return Some(Penetration3D {
+            normal: n,
+            depth: v1.dot(n).abs(),
+        });
+    }
+    let dir2 = dir2.normalize();
+    let v2 = minkowski_support_3d(a, b, dir2);
+
+    if v2.dot(dir2) < 0.0 {
+        return None;
+    }
+
+    // v3 = support in the direction of the portal normal
+    let mut portal = [v1, v2, Vec3::ZERO];
+    let portal_normal = (v2 - v1).cross(v0 - v1);
+    let dir3 = if portal_normal.dot(-v0) > 0.0 {
+        portal_normal.normalize()
+    } else {
+        // Flip winding
+        portal.swap(0, 1);
+        -portal_normal.normalize()
+    };
+    let v3 = minkowski_support_3d(a, b, dir3);
+
+    if v3.dot(dir3) < 0.0 {
+        return None;
+    }
+    portal[2] = v3;
+
+    // Phase 2: Portal refinement — refine until the portal contains the
+    // origin ray or we find the closest feature
+    for _ in 0..GJK_MAX_ITERATIONS {
+        let normal = (portal[1] - portal[0]).cross(portal[2] - portal[0]);
+        let len = normal.length();
+        if len < crate::EPSILON_F32 {
+            break;
+        }
+        let n = normal / len;
+
+        // Check if origin is on the correct side of the portal
+        let dist = n.dot(portal[0]);
+        if dist < 0.0 {
+            // Origin is behind the portal — no intersection
+            return None;
+        }
+
+        // Find new support point beyond the portal
+        let v_new = minkowski_support_3d(a, b, n);
+        let new_dist = v_new.dot(n);
+
+        // Convergence check
+        if (new_dist - dist).abs() < crate::EPSILON_F32 {
+            return Some(Penetration3D {
+                normal: n,
+                depth: dist,
+            });
+        }
+
+        // Determine which edge of the portal to replace
+        // Replace the vertex whose removal keeps the origin on the same side
+        let c0 = (portal[1] - v_new).cross(portal[0] - v_new);
+        let c1 = (portal[2] - v_new).cross(portal[1] - v_new);
+
+        if c0.dot(-v0) > 0.0 {
+            portal[2] = v_new;
+        } else if c1.dot(-v0) > 0.0 {
+            portal[0] = v_new;
+        } else {
+            portal[1] = v_new;
+        }
+    }
+
+    // Return best estimate from final portal
+    let normal = (portal[1] - portal[0]).cross(portal[2] - portal[0]);
+    let len = normal.length();
+    if len < crate::EPSILON_F32 {
+        return None;
+    }
+    let n = normal / len;
+    let depth = n.dot(portal[0]).abs();
+
+    Some(Penetration3D { normal: n, depth })
+}

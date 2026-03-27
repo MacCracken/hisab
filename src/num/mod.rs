@@ -29,7 +29,7 @@ pub use optimize::*;
 pub use rng::*;
 pub use roots::*;
 pub use solvers::*;
-pub use sparse::CsrMatrix;
+pub use sparse::*;
 pub use stability::*;
 pub use summation::*;
 pub use svd::*;
@@ -2489,5 +2489,38 @@ mod tests {
         };
         let y = bdf(f, jac, 0.0, &[1.0], 1.0, 500, 1e-10, 20, 5).unwrap();
         assert!(y[0].abs() < 1e-10);
+    }
+
+    // --- Sparse Cholesky ---
+
+    #[test]
+    fn sparse_cholesky_solve_basic() {
+        // SPD: A = [[4,2],[2,3]], b = [1,2] → x = [-0.125, 0.75]
+        let a = CsrMatrix::from_dense(&[vec![4.0, 2.0], vec![2.0, 3.0]]);
+        let x = sparse_cholesky_solve(&a, &[1.0, 2.0]).unwrap();
+        // Verify: A*x ≈ b
+        let r0 = 4.0 * x[0] + 2.0 * x[1];
+        let r1 = 2.0 * x[0] + 3.0 * x[1];
+        assert!((r0 - 1.0).abs() < 1e-8);
+        assert!((r1 - 2.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn sparse_cholesky_identity() {
+        let a = CsrMatrix::from_dense(&[vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let x = sparse_cholesky_solve(&a, &[3.0, 7.0]).unwrap();
+        assert!((x[0] - 3.0).abs() < 1e-10);
+        assert!((x[1] - 7.0).abs() < 1e-10);
+    }
+
+    // --- Sparse LU ---
+
+    #[test]
+    fn sparse_lu_solve_basic() {
+        // Non-symmetric: A = [[3,1],[0,2]], b = [5,4]
+        let a = CsrMatrix::from_dense(&[vec![3.0, 1.0], vec![0.0, 2.0]]);
+        let x = sparse_lu_solve(&a, &[5.0, 4.0]).unwrap();
+        assert!((x[0] - 1.0).abs() < 1e-8);
+        assert!((x[1] - 2.0).abs() < 1e-8);
     }
 }

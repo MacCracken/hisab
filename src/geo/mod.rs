@@ -10,6 +10,7 @@ use std::fmt;
 mod closest;
 mod collision;
 mod decompose;
+mod delaunay;
 mod intersection;
 mod primitives;
 mod sdf;
@@ -18,6 +19,7 @@ mod spatial;
 pub use closest::*;
 pub use collision::*;
 pub use decompose::*;
+pub use delaunay::*;
 pub use intersection::*;
 pub use primitives::*;
 pub use sdf::*;
@@ -2321,5 +2323,129 @@ mod tests {
         // Should produce a valid frame, not NaN
         assert!(tangent.length() > 0.5);
         assert!(bitangent.length() > 0.5);
+    }
+
+    // --- MPR collision ---
+
+    #[test]
+    fn mpr_overlapping_spheres() {
+        let a = Sphere::new(Vec3::ZERO, 1.0).unwrap();
+        let b = Sphere::new(Vec3::new(1.0, 0.0, 0.0), 1.0).unwrap();
+        assert!(mpr_intersect(&a, &b));
+        let pen = mpr_penetration(&a, &b);
+        assert!(pen.is_some());
+        assert!(pen.unwrap().depth > 0.0);
+    }
+
+    #[test]
+    fn mpr_separated_spheres() {
+        let a = Sphere::new(Vec3::ZERO, 0.5).unwrap();
+        let b = Sphere::new(Vec3::new(3.0, 0.0, 0.0), 0.5).unwrap();
+        assert!(!mpr_intersect(&a, &b));
+    }
+
+    #[test]
+    fn mpr_agrees_with_gjk() {
+        // Overlapping OBBs — both GJK and MPR should detect
+        let a = Obb {
+            center: Vec3::ZERO,
+            half_extents: Vec3::ONE,
+            rotation: glam::Quat::IDENTITY,
+        };
+        let b = Obb {
+            center: Vec3::new(1.5, 0.0, 0.0),
+            half_extents: Vec3::ONE,
+            rotation: glam::Quat::IDENTITY,
+        };
+        assert!(gjk_intersect_3d(&a, &b));
+        assert!(mpr_intersect(&a, &b));
+    }
+
+    // --- Delaunay triangulation ---
+
+    #[test]
+    fn delaunay_square() {
+        let pts = [
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(1.0, 1.0),
+            glam::Vec2::new(0.0, 1.0),
+        ];
+        let tri = delaunay_2d(&pts).unwrap();
+        assert_eq!(tri.triangles.len(), 2); // Square → 2 triangles
+    }
+
+    #[test]
+    fn delaunay_many_points() {
+        // Grid of points
+        let mut pts = Vec::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                pts.push(glam::Vec2::new(i as f32, j as f32));
+            }
+        }
+        let tri = delaunay_2d(&pts).unwrap();
+        assert!(!tri.triangles.is_empty());
+        // For n points in general position: ~2n triangles
+        assert!(tri.triangles.len() >= 20);
+    }
+
+    #[test]
+    fn delaunay_too_few_points() {
+        assert!(delaunay_2d(&[glam::Vec2::ZERO, glam::Vec2::X]).is_none());
+    }
+
+    // --- Voronoi ---
+
+    #[test]
+    fn voronoi_basic() {
+        let pts = [
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(2.0, 0.0),
+            glam::Vec2::new(1.0, 2.0),
+            glam::Vec2::new(1.0, -2.0),
+        ];
+        let vor = voronoi_2d(&pts).unwrap();
+        assert!(!vor.edges.is_empty());
+        assert_eq!(vor.sites.len(), 4);
+    }
+
+    // --- NURBS ---
+
+    #[test]
+    fn nurbs_uniform_equals_bspline() {
+        // With all weights = 1.0, NURBS should equal B-spline
+        let degree = 2;
+        let cp = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 2.0, 0.0),
+            Vec3::new(3.0, 1.0, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+        ];
+        let weights = [1.0, 1.0, 1.0, 1.0];
+        let knots = [0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0];
+        let t = 0.5;
+        let nurbs_pt = crate::calc::nurbs_eval(degree, &cp, &weights, &knots, t).unwrap();
+        let bspline_pt = crate::calc::bspline_eval(degree, &cp, &knots, t).unwrap();
+        assert!((nurbs_pt - bspline_pt).length() < 1e-4);
+    }
+
+    #[test]
+    fn nurbs_circle_arc() {
+        // A rational quadratic Bézier with w=cos(45°) at the middle point
+        // should produce a circular arc
+        let degree = 2;
+        let cp = [
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let w = std::f64::consts::FRAC_1_SQRT_2; // cos(45°)
+        let weights = [1.0, w, 1.0];
+        let knots = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        // Midpoint should be on the unit circle
+        let mid = crate::calc::nurbs_eval(degree, &cp, &weights, &knots, 0.5).unwrap();
+        let radius = (mid.x * mid.x + mid.y * mid.y).sqrt();
+        assert!((radius - 1.0).abs() < 1e-4, "radius = {radius}");
     }
 }

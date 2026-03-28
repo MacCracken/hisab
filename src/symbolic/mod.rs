@@ -1,7 +1,24 @@
 //! Symbolic algebra primitives.
 //!
 //! Provides an expression tree ([`Expr`]) supporting evaluation, symbolic
-//! differentiation, and basic algebraic simplification.
+//! differentiation, basic algebraic simplification, advanced simplification
+//! rules, symbolic integration, LaTeX rendering, and pattern matching.
+
+mod bridge;
+mod integrate;
+mod latex;
+mod pattern;
+mod simplify_rules;
+
+pub use bridge::{
+    ExprValue, SolveOptions, eval_verified, expr_to_value, solve_expr, value_to_expr,
+};
+pub use integrate::symbolic_integrate;
+pub use latex::to_latex;
+pub use pattern::{
+    Pattern, RewriteRule, apply_rule, instantiate, match_expr, rewrite, rewrite_fixpoint,
+};
+pub use simplify_rules::simplify_advanced;
 
 use std::collections::HashMap;
 use std::fmt;

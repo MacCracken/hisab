@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.3.0 (2026-03-27)
+
+### num — Number theory
+- `sieve_eratosthenes()`, `sieve_atkin()`, `sieve_segmented()` — prime sieves (Eratosthenes, Atkin, O(√n)-memory segmented)
+- `is_prime_u64()` — deterministic Miller-Rabin for all u64 (Jim Sinclair witnesses)
+- `is_prime_miller_rabin()` — probabilistic Miller-Rabin with configurable witness count
+- `is_prime_baillie_psw()` — Baillie-PSW primality test (no known counterexample)
+- `factor_trial_division()`, `pollard_rho()`, `factorize()` — integer factorization (trial division, Pollard's rho, hybrid)
+- `modpow()`, `modinv()`, `extended_gcd()` — modular arithmetic with 128-bit intermediates
+- `gcd()` — binary GCD algorithm
+- `euler_totient()`, `mobius()`, `mertens()`, `divisor_sigma()` — number-theoretic functions
+- `continued_fraction_rational()`, `continued_fraction_f64()`, `convergents()` — continued fraction expansion + rational approximants
+- `chinese_remainder_theorem()` — CRT solver for pairwise coprime moduli
+
+### symbolic — Advanced simplification
+- `simplify_advanced()` — trig identities (sin²+cos²=1, sin(-x)=-sin(x), cos(-x)=cos(x)), log rules (ln(e^x)=x, ln(x^n)=n·ln(x)), power rules ((x^a)^b=x^(a·b), x·x=x²)
+
+### symbolic — Symbolic integration
+- `symbolic_integrate()` — indefinite integration for polynomial, trig, exponential, sums, constant multiples, negation, and reciprocal forms
+
+### symbolic — LaTeX rendering
+- `to_latex()` — render expressions as LaTeX strings with smart formatting (\\frac, \\sqrt, \\cdot, subtraction, multi-char variable wrapping)
+
+### symbolic — Pattern matching engine
+- `Pattern` enum with `Wildcard`, `AnyConst`, structural matching
+- `match_expr()`, `instantiate()` — pattern matching and template instantiation
+- `apply_rule()`, `rewrite()`, `rewrite_fixpoint()` — single/recursive/fixpoint rewrite rule application
+- `RewriteRule` struct for composable expression transformations
+
+### symbolic — abaco bridge API
+- `ExprValue` — serializable flat representation for cross-crate transport (serde-enabled)
+- `expr_to_value()`, `value_to_expr()` — bidirectional Expr ↔ ExprValue conversion
+- `solve_expr()` — equation solver dispatch (Newton-Raphson + bisection fallback with symbolic differentiation)
+- `SolveOptions` — configurable initial guess, bracket, tolerance, max iterations
+- `eval_verified()` — interval arithmetic evaluation for verified error bounds (requires `interval` feature)
+
+### Stats
+- 887 tests (843 unit + 34 integration + 10 doc), zero clippy warnings
+
 ## 1.2.0 (2026-03-27)
 
 ### transforms — Interpolation utilities

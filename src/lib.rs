@@ -102,7 +102,7 @@ pub use autodiff::{Dual, Tape, Var};
 pub use interval::Interval;
 
 #[cfg(feature = "symbolic")]
-pub use symbolic::Expr;
+pub use symbolic::{Expr, ExprValue, Pattern, RewriteRule, SolveOptions};
 
 #[cfg(feature = "tensor")]
 pub use tensor::Tensor;

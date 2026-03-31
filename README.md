@@ -29,7 +29,7 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 
 ```toml
 [dependencies]
-hisab = "1.3"
+hisab = "1.4"
 ```
 
 ```rust

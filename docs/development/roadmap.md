@@ -32,125 +32,93 @@ Post-1.0: standard semver.
 
 ---
 
-## V1.0.0 — Stable Release
+## Current — v1.4.0 (2026-03-30)
 
-### Modules
-
-| Module | Feature | Description |
-|--------|---------|-------------|
-| **transforms** | `transforms` (default) | Transform2D/3D, projections, lerp, slerp, glam re-exports |
-| **geo** | `geo` (default) | Primitives, intersections, BVH, KdTree, Quadtree, Octree, SpatialHash, 2D+3D GJK/EPA, OBB, Capsule |
-| **calc** | `calc` (default) | Differentiation, integration (Simpson, Gauss-Legendre, adaptive, Monte Carlo), Bezier, splines, easing, gradient/jacobian/hessian |
-| **num** | `num` (default) | Root finding, LU/Cholesky/QR/SVD, FFT/DST/DCT, optimization (GD, CG, BFGS, L-BFGS, LM), ODE (RK4, DOPRI45), sparse matrices |
-| **autodiff** | `autodiff` | Forward-mode automatic differentiation (dual numbers) |
-| **interval** | `interval` | Interval arithmetic for verified numerics |
-| **symbolic** | `symbolic` | Expression tree with evaluation, differentiation, simplification |
-| **tensor** | `tensor` | N-dimensional dense tensor type |
-| **parallel** | `parallel` | Rayon-powered parallel batch operations |
-| **ai** | `ai` | Daimon/hoosh AI client |
-| **logging** | `logging` | Structured logging via tracing-subscriber |
-
-### Stats
-
-- 617 tests (574 unit + 34 integration + 9 doc)
-- 12 modules, 13 feature flags
+- 1155 tests (1099 unit + 34 integration + 22 doc)
+- 15 modules, 13 feature flags
 - Zero clippy warnings, cargo audit clean, cargo deny clean
-- Consumer smoke tests for impetus, kiran, joshua, aethersafha, abaco
-
-### 1.1.0 — All critical + important items shipped (2026-03-25)
-- Symplectic integrators, quaternion utils, frustum-sphere, spring dynamics, bezier easing
-- Screen projection, sRGB, noise (Perlin/fBm), PCG32, 2D FFT, truncated SVD
-- SDFs + CSG, polygon triangulation, ray-quadric, Fresnel, SAP broadphase
-- DualQuat, CSS decompose, color matrices, Oklab, spherical harmonics
-- Inertia tensors, GMRES, PGS, eigendecomposition, stiff ODE (backward Euler, BDF-2)
-- Euler-Maruyama, Milstein SDE, Lyapunov exponents, CCD/TOI, sequential impulse
-- Convex decomposition, reverse-mode AD (tape-based)
-- Refactored num.rs → 13 submodules, geo.rs → 7 submodules
-- 714 tests
-
-### 1.3.0 — Number theory + abaco integration (2026-03-27)
-- Prime sieves (Eratosthenes, Atkin, segmented), primality (Miller-Rabin, Baillie-PSW, deterministic u64)
-- Integer factorization (trial division, Pollard's rho, hybrid), modular arithmetic (modpow, modinv, extended GCD)
-- Number-theoretic functions (totient, Möbius, Mertens, divisor sigma), continued fractions, CRT
-- Advanced symbolic simplification (trig, log, power identities)
-- Symbolic integration (polynomial, trig, exponential)
-- LaTeX rendering, pattern matching/substitution engine
-- abaco bridge: ExprValue transport, solver dispatch, verified interval evaluation
-- 887 tests
 
 ---
 
-## 1.4.0 — Structural depth + quality (shipped in 1.3.0)
+## Projected Work
 
-### Physics solver completeness
-- [x] Constraint warm-starting for sequential impulse — cache impulses across frames (geo, impetus)
-- [x] Island detection / contact graph connectivity — union-find for sleeping + parallel solving (geo, impetus)
+### 1.5.0 — Numerical & tensor depth
 
-### Numerical robustness
-- [x] Apply compensated summation to ODE solvers and integration routines internally
-- [x] Flat `Vec<f64>` matrix layout option for dense linear algebra (cache-friendly alternative to `Vec<Vec<f64>>`)
+#### Numerical extensions (num)
+- [ ] Complex QR decomposition — completes complex LA alongside Hermitian eigen + SVD
+- [ ] Complex matrix inverse — needed by mimamsa for propagator calculations
+- [ ] Randomized SVD (Halko-Martinsson-Tropp) — large-scale low-rank approximation
+- [ ] Low-rank approximations (CUR, Nyström) — matrix compression
 
-### Geometry extensions
-- [x] Frustum-OBB culling test (geo, kiran)
-- [x] Point-in-convex-polygon 2D (geo, kiran)
-- [x] AABB-from-transformed-AABB fast path (geo, kiran)
-- [x] Triangle mesh adjacency / half-edge structure (geo, kiran)
+#### Tensor algebra depth (tensor)
+- [ ] Einsum string notation parser — `"ij,jk->ik"` style contraction specification
+- [ ] Tensor trace (contract all paired indices)
+- [ ] Symmetric/antisymmetric decomposition of arbitrary tensors
+- [ ] Strided views — zero-copy slicing and transposition
 
-### Compositor / rendering
-- [x] Gamma-aware interpolation — decode→lerp→encode combined (transforms, aethersafha)
-- [x] Exposure / EV ↔ luminance conversion for HDR pipelines (transforms, kiran, aethersafha)
+### 1.6.0 — Geometry & group extensions
 
-### Quality
-- [ ] Complete doctests on all public functions
+#### Lie group extensions (transforms)
+- [ ] SE(3) — rigid body motions (rotation + translation as single group)
+- [ ] SO(3) explicit — rotation group without SU(2) double cover overhead
+- [ ] Adjoint representation for all implemented groups
+- [ ] Baker-Campbell-Hausdorff formula for Lie algebra composition
+
+#### Conformal geometric algebra extensions (geo)
+- [ ] Left/right contraction operators
+- [ ] Dual operation (pseudoscalar complement)
+- [ ] Blade projection and rejection
+- [ ] Circle and line pair representations
+- [ ] Conformal point pair and flat point extraction
+- [ ] Intersection of geometric objects via outer product null space
+
+### 1.7.0 — Differential geometry & curvature
+
+#### Differential geometry extensions (calc)
+- [ ] Parallel transport of vector fields along curves
+- [ ] Sectional curvature computation
+- [ ] Geodesic deviation equation
+- [ ] Weyl tensor (conformal curvature)
+- [ ] Higher-order differential forms (3-forms, 4-forms, general p-form wedge)
+
+### 1.8.0 — Rendering & GPU
+
+#### Rendering & graphics (geo/autodiff)
+- [ ] Differentiable rendering math — autodiff through ray-surface intersections
+- [ ] Neural implicit representation primitives — SDF network evaluation helpers
+
+#### GPU compute
 - [ ] GPU compute kernels via soorat (feature-gated compute pipeline)
 
-## 1.5.0 — Theoretical physics foundation (P0 — mimamsa + kana)
+### Ongoing — quality & consumer-driven
 
-### Indexed tensor algebra (tensor)
-- [x] Covariant / contravariant index tracking (upper/lower indices)
-- [x] Einstein summation convention (automatic contraction)
-- [x] Tensor contraction, outer product, index raising/lowering
-- [x] Symmetric & antisymmetric tensor storage (exploit symmetries — Riemann 256→20)
-- [x] Sparse tensor support for high-rank objects
+- [ ] Complete doctests on all public functions
+- Items added here when consumers (mimamsa, kana, impetus, kiran, etc.) request them
 
-### Lie groups & algebras (transforms)
-- [x] Lorentz group SO(3,1) — boosts, rotations, Lorentz transformations
-- [x] SU(2) — spinor representations, Pauli matrices
-- [x] SU(3) — Gell-Mann matrices, color charge algebra
-- [x] U(1) — phase transformations
-- [x] Lie algebra exponential map, commutators, structure constants
-- [x] Casimir operators
+---
 
-### Differential geometry (calc/geo)
-- [x] Covariant derivative (connection-aware differentiation)
-- [x] Christoffel symbols (from metric tensor)
-- [x] Levi-Civita connection
-- [x] Riemann curvature tensor, Ricci tensor, Ricci scalar
-- [x] Geodesic equation solver (integrates with existing ODE solvers)
-- [x] Killing vectors, isometry detection
-- [x] Exterior algebra — wedge product, Hodge star, differential forms
+## Release History
 
-### Complex linear algebra (num)
-- [x] Hermitian matrix eigendecomposition
-- [x] Unitary matrix operations
-- [x] Pauli & Dirac gamma matrix algebra
-- [x] Spinor transformations
-- [x] Complex SVD
+### 1.4.0 (2026-03-30) — Theoretical physics foundation
+- Complex linear algebra: ComplexMatrix, Hermitian eigen, complex SVD, Pauli/Dirac matrices, spinor transforms, matrix exponential
+- Indexed tensor algebra: covariant/contravariant indices, Einstein summation, contraction, outer product, raising/lowering, Minkowski metric, Levi-Civita symbol
+- Symmetric & antisymmetric tensor storage, sparse tensors (COO format)
+- Lie groups: U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz, exponential maps, Casimir operators
+- Differential geometry: Christoffel symbols, Riemann/Ricci/Einstein tensors, geodesic RK4, Killing vectors, exterior algebra
+- Conformal geometric algebra: 5D multivectors, geometric/outer/inner products, versors (translator, rotor, dilator)
 
-### Conformal geometric algebra (geo)
-- [x] Conformal model (point, sphere, plane representations)
-- [x] Conformal transformations (Möbius maps)
-- [x] Versors, rotors, translators in conformal space
-- 1155 tests (1099 unit + 34 integration + 22 doc)
+### 1.3.0 (2026-03-27) — Number theory + abaco integration
+- Prime sieves, primality tests, factorization, modular arithmetic, number-theoretic functions
+- Symbolic integration, LaTeX rendering, pattern matching engine, abaco bridge
 
-## Watch List
+### 1.1.0 (2026-03-25) — Feature completion
+- Symplectic integrators, SDFs+CSG, DualQuat, color spaces, spherical harmonics
+- Stiff ODE (BDF), SDE solvers, eigendecomposition, convex decomposition, reverse-mode AD
 
-| Item | Area |
-|------|------|
-| Randomized SVD (Halko-Martinsson-Tropp) | num |
-| Differentiable rendering math | geo/autodiff |
-| Neural implicit representation primitives | tensor |
-| Low-rank approximations (CUR, Nystrom) | num |
+### 1.0.0 — Stable release
+- Core modules: transforms, geo, calc, num, autodiff, interval, symbolic, tensor, parallel, ai, logging
+
+---
 
 ## Boundary with Abaco
 

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 1.4.0 (2026-03-30)
+
 ### Added — Theoretical physics foundation (P0 — mimamsa + kana)
 
 #### num — Complex linear algebra

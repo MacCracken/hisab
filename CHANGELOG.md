@@ -1,5 +1,70 @@
 # Changelog
 
+## [Unreleased]
+
+### Added — Theoretical physics foundation (P0 — mimamsa + kana)
+
+#### num — Complex linear algebra
+- **`ComplexMatrix`** — row-major dense complex matrix with adjoint, trace, Frobenius norm, Hermitian/unitary checks
+- `eigen_hermitian()` — Hermitian eigendecomposition via complex Jacobi rotations (real eigenvalues, unitary eigenvectors)
+- `complex_svd()` — complex singular value decomposition (A = UΣV†)
+- `pauli_x()`, `pauli_y()`, `pauli_z()`, `pauli_matrices()` — Pauli spin matrices with verified anticommutation and SU(2) algebra
+- `gamma_0()`, `gamma_spatial()`, `gamma_matrices()`, `gamma_5()` — Dirac gamma matrices (4×4, Dirac representation) satisfying Clifford algebra {γᵘ, γᵛ} = 2ηᵘᵛI
+- `spinor_rotation()` — SU(2) rotation of 2-component spinors by axis + angle
+- `dirac_boost()` — Lorentz boost of 4-component Dirac spinors
+- `commutator()`, `anticommutator()` — [A,B] and {A,B} for complex matrices
+- `kronecker()` — Kronecker (tensor) product
+- `matrix_exp()` — complex matrix exponential (Taylor series with scaling and squaring)
+- Extended `Complex` with `norm_sq`, `arg`, `from_polar`, `exp`, `ln`, `sqrt`, `powf`, `sin`, `cos`, `inv`, `is_zero`, `AddAssign`, `SubAssign`, `MulAssign`
+
+#### tensor — Indexed tensor algebra
+- **`IndexedTensor`** — tensor with named covariant/contravariant indices (`TensorIndex`, `IndexVariance`)
+- `contract()` — trace over two indices by position
+- `contract_with()` — Einstein summation: automatic contraction on matching upper/lower label pairs
+- `outer()` — tensor (outer) product with concatenated indices
+- `raise_index()`, `lower_index()` — index raising/lowering via metric tensor
+- `permute()` — reorder indices with arbitrary permutation
+- `kronecker_delta()`, `minkowski()`, `minkowski_inverse()`, `levi_civita()` — standard physics tensors
+- **`SymmetricTensor`** — storage-efficient fully symmetric tensor (C(n+k-1,k) independent components)
+- **`AntisymmetricTensor`** — storage-efficient fully antisymmetric tensor (C(n,k) components, automatic sign on permuted access)
+- **`SparseTensor`** — COO-format sparse tensor for high-rank objects with many zeros
+- Refactored `tensor.rs` → `tensor/` module directory (dense, indexed, symmetric, sparse)
+
+#### transforms — Lie groups and algebras
+- **`U1`** — U(1) phase group (compose, inverse, exp/log, unitary matrix)
+- **`Su2`** — SU(2) spin group as unit quaternion (compose, inverse, exp/log, 2×2 unitary matrix, 3×3 rotation matrix, axis/angle extraction)
+- **`Lorentz`** — SO(3,1) Lorentz group (boosts along x/y/z/arbitrary, rotations, compose, inverse, 4-vector transform, Minkowski interval preservation, validity check Λᵀ η Λ = η)
+- `gell_mann()`, `gell_mann_matrices()` — SU(3) Gell-Mann matrices λ₁–λ₈ (Hermitian, traceless)
+- `su3_structure_constant()` — totally antisymmetric SU(3) structure constants f_{abc}
+- `lorentz_generator()` — six generators of so(3,1): J₁,J₂,J₃ (rotations), K₁,K₂,K₃ (boosts)
+- `lorentz_exp()` — exponential map from so(3,1) Lie algebra to SO(3,1) group
+- `casimir_quadratic()` — quadratic Casimir operator C₂ = Σ Tₐ² for any set of generators
+
+#### calc — Differential geometry
+- `christoffel_symbols()` — Christoffel symbols Γᵅ_μν from metric and its derivatives
+- `riemann_tensor()` — Riemann curvature tensor R^ρ_σμν from Christoffel symbols
+- `ricci_tensor()` — Ricci tensor R_μν by contracting Riemann tensor
+- `ricci_scalar()` — Ricci scalar R = g^{μν} R_μν
+- `einstein_tensor()` — Einstein tensor G_μν = R_μν − ½Rg_μν
+- `geodesic_rk4()` — geodesic equation integrator via RK4 (position + velocity trajectory)
+- `killing_residual()` — check Killing's equation ∇_μ ξ_ν + ∇_ν ξ_μ = 0
+- `wedge_1_1()`, `wedge_1_2()` — wedge products of differential forms
+- `hodge_star_2form_4d()` — Hodge dual of 2-forms in 4D Minkowski spacetime
+
+#### geo — Conformal geometric algebra
+- **`Multivector`** — 5D CGA multivector (32 components, grades 0–5)
+- Geometric, outer (wedge), and inner products with full 5D metric (e₁²=e₂²=e₃²=e₊²=+1, e₋²=−1)
+- Reverse, grade involution, grade extraction, norm
+- `point()`, `extract_point()` — conformal point embedding/extraction
+- `sphere()`, `plane()` — conformal sphere and plane representations
+- `translator()` — translation versor (sandwich product application)
+- `rotor()` — rotation versor from axis + angle
+- `dilator()` — uniform scaling versor about origin
+
+### Stats
+- 1089 tests (1033 unit + 34 integration + 22 doc) — up from 887
+- Zero clippy warnings, cargo audit clean, cargo deny clean
+
 ## 1.3.0 (2026-03-27)
 
 ### num — Number theory

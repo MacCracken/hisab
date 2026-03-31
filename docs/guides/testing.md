@@ -23,16 +23,16 @@ cargo test --all-features num::
 
 | Category | Count | Location |
 |----------|-------|----------|
-| Unit tests (transforms) | 44 | `src/transforms.rs` |
-| Unit tests (geo) | 153 | `src/geo.rs` |
-| Unit tests (calc) | 60 | `src/calc.rs` |
-| Unit tests (num) | 82 | `src/num.rs` |
-| Unit tests (ai) | 6 | `src/ai.rs` |
-| Unit tests (logging) | 2 | `src/logging.rs` |
-| Send+Sync assertions | 1 | `src/lib.rs` |
-| Integration tests | 10 | `tests/integration.rs` |
-| Doc tests | 1 | `src/logging.rs` |
-| **Total** | **360** | |
+| Unit tests (transforms) | 67 | `src/transforms/` (incl. Lie groups) |
+| Unit tests (geo) | 166 | `src/geo/` (incl. CGA) |
+| Unit tests (calc) | 71 | `src/calc/` (incl. differential geometry) |
+| Unit tests (num) | 109 | `src/num/` (incl. complex LA) |
+| Unit tests (tensor) | 38 | `src/tensor/` (dense, indexed, symmetric, sparse) |
+| Unit tests (autodiff) | ~40 | `src/autodiff.rs` |
+| Unit tests (other) | ~20 | symbolic, interval, ai, logging, lib |
+| Integration tests | 34 | `tests/` |
+| Doc tests | 22 | various |
+| **Total** | **1089** | |
 
 ## Coverage
 

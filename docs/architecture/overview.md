@@ -13,7 +13,9 @@ hisab
 │   │                     saturation/hue matrices, tone mapping (Reinhard, ACES), depth linearization
 │   ├── dualquat        — DualQuat rigid body transforms, blend skinning
 │   ├── decompose       — CSS mat4 decompose/recompose (DecomposedTransform)
-│   └── sh              — spherical harmonics L0–L2 (eval, project, evaluate)
+│   ├── sh              — spherical harmonics L0–L2 (eval, project, evaluate)
+│   └── lie             — Lie groups: U(1), SU(2), SU(3) (Gell-Mann), SO(3,1) (Lorentz),
+│                         exponential/logarithmic maps, structure constants, Casimir operators
 │
 ├── geo                 — Primitives, intersections, spatial structures, collision  [default]
 │   ├── primitives      — Ray, Plane, Aabb, Sphere, OBB, Capsule, Frustum, Rect
@@ -27,7 +29,9 @@ hisab
 │   ├── sdf             — sdf_sphere/box/capsule, CSG (union/intersection/subtraction/smooth),
 │   │                     triangulate_polygon (ear-clipping)
 │   ├── decompose       — convex_decompose (PCA splitting), TriMesh
-│   └── delaunay        — delaunay_2d (Bowyer-Watson), voronoi_2d (dual)
+│   ├── delaunay        — delaunay_2d (Bowyer-Watson), voronoi_2d (dual)
+│   └── cga             — conformal geometric algebra: 5D multivectors, geometric/outer/inner
+│                         products, conformal point/sphere/plane, translator/rotor/dilator versors
 │
 ├── calc                — Differentiation, integration, curves, splines, easing  [default]
 │   ├── core            — derivative, integral_{trapezoidal,simpson}, bezier 2D/3D
@@ -36,14 +40,21 @@ hisab
 │   │                     monotone_cubic, de_casteljau_split, arc-length parameterization
 │   ├── easing          — ease_{in,out,in_out}{,_cubic,_smooth}, spring_step, cubic_bezier_ease
 │   ├── noise           — perlin_2d, perlin_3d, fbm_2d
-│   └── multivar        — partial_derivative, gradient, jacobian, hessian
+│   ├── multivar        — partial_derivative, gradient, jacobian, hessian
+│   └── diffgeo         — Christoffel symbols, Riemann/Ricci curvature tensor, Ricci scalar,
+│                         Einstein tensor, geodesic RK4 integrator, Killing vector detection,
+│                         exterior algebra (wedge product, Hodge star, differential forms)
 │
 ├── num                 — Root finding, decompositions, spectral, ODE, optimization  [default]
 │   ├── roots           — newton_raphson, bisection, gaussian_elimination
 │   ├── linalg          — lu, cholesky, qr (in-place variants), matrix ops, rank, condition
 │   ├── eigen           — eigen_symmetric (Jacobi), EigenDecomposition
 │   ├── svd             — svd (one-sided Jacobi), truncated_svd, pseudo_inverse
-│   ├── complex         — Complex arithmetic, serde
+│   ├── complex         — Complex arithmetic (exp, ln, sqrt, sin, cos, polar), serde
+│   ├── complex_linalg  — ComplexMatrix, Hermitian eigendecomposition, complex SVD,
+│   │                     Pauli matrices (σ₁σ₂σ₃), Dirac gamma matrices (γ⁰γ¹γ²γ³γ⁵),
+│   │                     spinor rotations, Dirac boosts, commutators, anticommutators,
+│   │                     Kronecker product, matrix exponential
 │   ├── fft             — fft, ifft, fft_2d, ifft_2d, dst, idst, dct, idct
 │   ├── ode             — rk4, dopri45, backward_euler, bdf2, bdf(3-5),
 │   │                     euler_maruyama, milstein (SDE),
@@ -68,8 +79,13 @@ hisab
 │                         Expr enum (Const/Var/Add/Mul/Pow/Neg/Sin/Cos/Exp/Ln),
 │                         evaluate, differentiate, simplify, substitute
 │
-├── tensor              — N-dimensional tensor                                   [feature: tensor]
-│                         Tensor (zeros, ones, get/set, reshape, add/sub/scale, matmul, transpose)
+├── tensor              — Tensor algebra                                         [feature: tensor]
+│   ├── dense           — Tensor (zeros, ones, get/set, reshape, add/sub/scale, matmul, transpose)
+│   ├── indexed         — IndexedTensor with covariant/contravariant index tracking,
+│   │                     Einstein summation (contract_with), outer product, index raising/lowering,
+│   │                     Kronecker delta, Minkowski metric, Levi-Civita symbol, permutation
+│   ├── symmetric       — SymmetricTensor (C(n+k-1,k) storage), AntisymmetricTensor (C(n,k) storage)
+│   └── sparse          — SparseTensor (COO format for high-rank objects with many zeros)
 │
 ├── parallel            — Parallel batch operations                              [feature: parallel]
 │                         par_transform_points, par_ray_aabb_batch, par_matrix_vector_multiply
@@ -183,3 +199,5 @@ dy/dt = f(t, y)
 | **abaco** | Symbolic algebra (Expr), interval arithmetic for verified evaluation |
 | **svara** | Complex, FFT, easing functions (vocal synthesis) |
 | **prani** | Easing functions (creature vocal synthesis, via svara) |
+| **hisab-mimamsa** | Indexed tensors, Lie groups, differential geometry, complex LA, CGA (theoretical physics: GR, QFT, cosmology) |
+| **kana** | Indexed tensors, Lie groups, complex LA, spinors (quantum science) |

@@ -9,14 +9,14 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `transforms` | yes | 2D/3D transforms, projections, slerp, lerp, glam re-exports |
-//! | `geo` | yes | Primitives, intersections, BVH, k-d tree, quadtree, octree, spatial hash, GJK/EPA |
-//! | `calc` | yes | Differentiation, integration, Bezier 2D/3D, splines, easing, Gauss-Legendre |
-//! | `num` | yes | Root finding, LU/Cholesky/QR/SVD, FFT, optimization, ODE solvers |
+//! | `transforms` | yes | 2D/3D transforms, projections, slerp, lerp, glam re-exports, Lie groups (U(1), SU(2), SU(3), SO(3,1)) |
+//! | `geo` | yes | Primitives, intersections, BVH, k-d tree, quadtree, octree, spatial hash, GJK/EPA, conformal geometric algebra |
+//! | `calc` | yes | Differentiation, integration, Bezier 2D/3D, splines, easing, Gauss-Legendre, differential geometry |
+//! | `num` | yes | Root finding, LU/Cholesky/QR/SVD, FFT, optimization, ODE solvers, complex linear algebra |
 //! | `autodiff` | no | Forward-mode automatic differentiation (dual numbers) |
 //! | `interval` | no | Interval arithmetic for verified numerics |
 //! | `symbolic` | no | Symbolic expression tree with differentiation and simplification |
-//! | `tensor` | no | N-dimensional dense tensor type |
+//! | `tensor` | no | Indexed tensor algebra, symmetric/antisymmetric tensors, sparse tensors |
 //! | `parallel` | no | Rayon-powered parallel batch operations |
 //! | `ai` | no | Daimon/hoosh AI client (requires network deps) |
 //! | `logging` | no | Structured logging via tracing-subscriber |

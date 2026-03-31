@@ -9,6 +9,7 @@
 
 use crate::HisabError;
 use crate::num::{Complex, ComplexMatrix};
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // U(1) — Phase group
@@ -18,7 +19,7 @@ use crate::num::{Complex, ComplexMatrix};
 ///
 /// Represents a point on the unit circle in the complex plane.
 /// Used for electromagnetic gauge transformations.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct U1 {
     /// Phase angle in radians.
     pub theta: f64,
@@ -85,6 +86,12 @@ impl U1 {
     }
 }
 
+impl std::fmt::Display for U1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "U1(\u{03b8}={:.3})", self.theta)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SU(2) — Spin group
 // ---------------------------------------------------------------------------
@@ -93,7 +100,7 @@ impl U1 {
 ///
 /// `U = a·I + i(b·σ₁ + c·σ₂ + d·σ₃)` where σᵢ are Pauli matrices.
 /// Double cover of SO(3): SU(2) → SO(3) is 2:1.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Su2 {
     /// Scalar part (cos(θ/2)).
     pub w: f64,
@@ -163,6 +170,7 @@ impl Su2 {
     #[must_use]
     pub fn exp(omega: [f64; 3]) -> Self {
         let norm = (omega[0] * omega[0] + omega[1] * omega[1] + omega[2] * omega[2]).sqrt();
+        tracing::trace!(axis_norm = norm, "Su2::exp");
         if norm < crate::EPSILON_F64 {
             return Self::identity();
         }
@@ -246,6 +254,16 @@ impl Su2 {
     }
 }
 
+impl std::fmt::Display for Su2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Su2(w={:.2}, x={:.2}, y={:.2}, z={:.2})",
+            self.w, self.x, self.y, self.z
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SU(3) — Color group
 // ---------------------------------------------------------------------------
@@ -321,7 +339,11 @@ pub fn gell_mann(index: usize) -> Result<ComplexMatrix, HisabError> {
 /// All eight Gell-Mann matrices.
 #[must_use]
 pub fn gell_mann_matrices() -> [ComplexMatrix; 8] {
-    std::array::from_fn(|i| gell_mann(i + 1).expect("valid index"))
+    // Indices 1–8 are always valid; match avoids expect() in library code.
+    std::array::from_fn(|i| match gell_mann(i + 1) {
+        Ok(m) => m,
+        Err(_) => unreachable!(),
+    })
 }
 
 /// SU(3) structure constants f_{abc}.
@@ -396,7 +418,7 @@ fn su3_structure_antisymmetric(a: usize, b: usize, c: usize) -> Result<f64, Hisa
 ///
 /// Stored as a 4×4 real matrix satisfying `Λᵀ η Λ = η` where η is the
 /// Minkowski metric.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lorentz {
     /// 4×4 transformation matrix (row-major flat storage).
     data: [f64; 16],
@@ -617,6 +639,12 @@ impl Lorentz {
     }
 }
 
+impl std::fmt::Display for Lorentz {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lorentz(4\u{00d7}4)")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lorentz Lie algebra generators
 // ---------------------------------------------------------------------------
@@ -683,6 +711,8 @@ pub fn lorentz_generator(index: usize) -> Result<[[f64; 4]; 4], HisabError> {
 /// Returns error on internal computation failure.
 #[allow(clippy::needless_range_loop)]
 pub fn lorentz_exp(params: [f64; 6]) -> Result<Lorentz, HisabError> {
+    let param_norm: f64 = params.iter().map(|p| p * p).sum::<f64>().sqrt();
+    tracing::debug!(param_norm, "lorentz_exp");
     // Build the 4×4 generator matrix
     let mut generator = [[0.0; 4]; 4];
     for (i, &p) in params.iter().enumerate() {
@@ -1002,6 +1032,42 @@ mod tests {
         // Should be (3/4)I₂
         let expected = ComplexMatrix::identity(2).scale_real(0.75);
         assert!(c2.sub(&expected).unwrap().frobenius_norm() < 1e-10);
+    }
+
+    // -- Error paths --
+
+    #[test]
+    fn gell_mann_zero_err() {
+        assert!(gell_mann(0).is_err());
+    }
+
+    #[test]
+    fn gell_mann_nine_err() {
+        assert!(gell_mann(9).is_err());
+    }
+
+    #[test]
+    fn lorentz_boost_zero_direction() {
+        assert!(Lorentz::boost([0.0, 0.0, 0.0], 0.5).is_err());
+    }
+
+    #[test]
+    fn lorentz_rotation_zero_axis() {
+        assert!(Lorentz::rotation([0.0, 0.0, 0.0], 1.0).is_err());
+    }
+
+    // -- Property: Lorentz composition is associative --
+
+    #[test]
+    fn lorentz_compose_associative() {
+        let a = Lorentz::boost_x(0.3);
+        let b = Lorentz::rotation([0.0, 0.0, 1.0], 0.5).unwrap();
+        let c = Lorentz::boost_y(0.4);
+        let ab_c = a.compose(&b).compose(&c);
+        let a_bc = a.compose(&b.compose(&c));
+        for i in 0..16 {
+            assert!(approx(ab_c.as_matrix()[i], a_bc.as_matrix()[i]));
+        }
     }
 
     #[test]

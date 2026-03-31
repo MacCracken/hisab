@@ -131,6 +131,9 @@ mod assert_traits {
         {
             _assert_send_sync::<super::Transform2D>();
             _assert_send_sync::<super::Transform3D>();
+            _assert_send_sync::<super::U1>();
+            _assert_send_sync::<super::Su2>();
+            _assert_send_sync::<super::Lorentz>();
         }
 
         #[cfg(feature = "geo")]
@@ -146,11 +149,24 @@ mod assert_traits {
             _assert_send_sync::<super::Obb>();
             _assert_send_sync::<super::Capsule>();
             _assert_send_sync::<super::Penetration3D>();
+            _assert_send_sync::<super::geo::cga::Multivector>();
         }
 
         #[cfg(feature = "num")]
         {
             _assert_send_sync::<super::Complex>();
+            _assert_send_sync::<super::ComplexMatrix>();
+            _assert_send_sync::<super::ComplexSvd>();
+            _assert_send_sync::<super::HermitianEigen>();
+        }
+
+        #[cfg(feature = "tensor")]
+        {
+            _assert_send_sync::<super::IndexedTensor>();
+            _assert_send_sync::<super::TensorIndex>();
+            _assert_send_sync::<super::SymmetricTensor>();
+            _assert_send_sync::<super::AntisymmetricTensor>();
+            _assert_send_sync::<super::SparseTensor>();
         }
     }
 }

@@ -64,7 +64,7 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 ```sh
 cargo build
-cargo test --all-features   # 1089 tests
+cargo test --all-features   # 1155 tests
 make bench                  # criterion benchmarks with history tracking
 ```
 

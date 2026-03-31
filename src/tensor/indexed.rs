@@ -96,7 +96,7 @@ impl TensorIndex {
 /// let t = IndexedTensor::new(indices, data).unwrap();
 /// assert_eq!(t.rank(), 2);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexedTensor {
     /// The indices with variance and dimension metadata.
     indices: Vec<TensorIndex>,
@@ -171,7 +171,7 @@ impl IndexedTensor {
         data[15] = -1.0; // η₃₃ = -1
         Self {
             indices,
-            data: Tensor::new(vec![4, 4], data).expect("valid 4x4"),
+            data: Tensor::from_raw(vec![4, 4], data),
         }
     }
 
@@ -189,7 +189,7 @@ impl IndexedTensor {
         data[15] = -1.0;
         Self {
             indices,
-            data: Tensor::new(vec![4, 4], data).expect("valid 4x4"),
+            data: Tensor::from_raw(vec![4, 4], data),
         }
     }
 
@@ -266,7 +266,7 @@ impl IndexedTensor {
 
         Ok(Self {
             indices,
-            data: Tensor::new(shape, data).expect("valid levi-civita"),
+            data: Tensor::from_raw(shape, data),
         })
     }
 
@@ -407,7 +407,7 @@ impl IndexedTensor {
         let shape: Vec<usize> = new_indices.iter().map(|i| i.dim).collect();
         Self {
             indices: new_indices,
-            data: Tensor::new(shape, data).expect("outer product shape is valid"),
+            data: Tensor::from_raw(shape, data),
         }
     }
 
@@ -434,6 +434,13 @@ impl IndexedTensor {
                 dim, self.indices[pos_b].dim
             )));
         }
+        tracing::trace!(
+            pos_a,
+            pos_b,
+            label_a = %self.indices[pos_a].label,
+            label_b = %self.indices[pos_b].label,
+            "contracting indices"
+        );
 
         // Build new index list (remove pos_a and pos_b)
         let (lo, hi) = if pos_a < pos_b {
@@ -535,6 +542,8 @@ impl IndexedTensor {
             }
         }
 
+        tracing::trace!(matched_pairs = pairs.len(), "contract_with");
+
         if pairs.is_empty() {
             // No matching indices — return outer product
             return Ok(self.outer(other));
@@ -575,6 +584,7 @@ impl IndexedTensor {
                 "index is already contravariant (upper)".into(),
             ));
         }
+        tracing::trace!(pos, label = %self.indices[pos].label, "raising index");
 
         // The metric inverse should have two upper indices
         if metric_inverse.rank() != 2 {
@@ -661,6 +671,7 @@ impl IndexedTensor {
                 "index is already covariant (lower)".into(),
             ));
         }
+        tracing::trace!(pos, label = %self.indices[pos].label, "lowering index");
 
         if metric.rank() != 2 {
             return Err(HisabError::InvalidInput("metric must be rank-2".into()));
@@ -979,5 +990,55 @@ mod tests {
         let a = IndexedTensor::new(vec![TensorIndex::upper("μ", 4)], vec![1.0; 4]).unwrap();
         let b = IndexedTensor::new(vec![TensorIndex::lower("μ", 4)], vec![1.0; 4]).unwrap();
         assert!(a.add(&b).is_err());
+    }
+
+    #[test]
+    fn new_size_mismatch() {
+        assert!(IndexedTensor::new(vec![TensorIndex::upper("μ", 4)], vec![1.0; 3]).is_err());
+    }
+
+    #[test]
+    fn contract_invalid_positions() {
+        let t = IndexedTensor::zeros(vec![TensorIndex::upper("μ", 4), TensorIndex::lower("ν", 4)]);
+        assert!(t.contract(0, 5).is_err());
+    }
+
+    #[test]
+    fn contract_same_position() {
+        let t = IndexedTensor::zeros(vec![TensorIndex::upper("μ", 4), TensorIndex::lower("ν", 4)]);
+        assert!(t.contract(1, 1).is_err());
+    }
+
+    #[test]
+    fn raise_index_already_contravariant() {
+        let t = IndexedTensor::zeros(vec![TensorIndex::upper("μ", 4)]);
+        let metric = IndexedTensor::minkowski_inverse("α", "β");
+        assert!(t.raise_index(0, &metric).is_err());
+    }
+
+    #[test]
+    fn lower_index_already_covariant() {
+        let t = IndexedTensor::zeros(vec![TensorIndex::lower("μ", 4)]);
+        let metric = IndexedTensor::minkowski("α", "β");
+        assert!(t.lower_index(0, &metric).is_err());
+    }
+
+    #[test]
+    fn permute_invalid() {
+        let t = IndexedTensor::zeros(vec![TensorIndex::upper("μ", 3), TensorIndex::lower("ν", 3)]);
+        assert!(t.permute(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn permute_wrong_length() {
+        let t = IndexedTensor::zeros(vec![TensorIndex::upper("μ", 3), TensorIndex::lower("ν", 3)]);
+        assert!(t.permute(&[0]).is_err());
+    }
+
+    #[test]
+    fn sub_index_mismatch() {
+        let a = IndexedTensor::new(vec![TensorIndex::upper("μ", 4)], vec![1.0; 4]).unwrap();
+        let b = IndexedTensor::new(vec![TensorIndex::lower("μ", 4)], vec![1.0; 4]).unwrap();
+        assert!(a.sub(&b).is_err());
     }
 }

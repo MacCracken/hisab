@@ -141,7 +141,7 @@ Post-1.0: standard semver.
 - [x] Conformal model (point, sphere, plane representations)
 - [x] Conformal transformations (Möbius maps)
 - [x] Versors, rotors, translators in conformal space
-- 1089 tests (1033 unit + 34 integration + 22 doc)
+- 1155 tests (1099 unit + 34 integration + 22 doc)
 
 ## Watch List
 

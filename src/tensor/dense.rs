@@ -19,7 +19,7 @@ use crate::HisabError;
 /// let c = a.add(&b).unwrap();
 /// assert!((c.get(&[0, 0]).unwrap() - 2.0).abs() < 1e-12);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Tensor {
     /// Shape of the tensor (e.g. `[2, 3]` for a 2×3 matrix).
     shape: Vec<usize>,
@@ -42,6 +42,17 @@ impl Tensor {
             )));
         }
         Ok(Self { shape, data })
+    }
+
+    /// Create a tensor from shape and data without validation.
+    ///
+    /// # Safety (logical)
+    ///
+    /// Caller must guarantee `data.len() == shape.iter().product()`.
+    #[must_use]
+    pub(crate) fn from_raw(shape: Vec<usize>, data: Vec<f64>) -> Self {
+        debug_assert_eq!(data.len(), shape.iter().product::<usize>());
+        Self { shape, data }
     }
 
     /// Create a tensor of zeros.

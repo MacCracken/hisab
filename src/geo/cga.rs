@@ -50,7 +50,7 @@ const NUM_BLADES: usize = 32;
 /// // Inner product gives distance information
 /// let ip = p.inner(&q);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Multivector {
     /// Components in canonical blade order.
     pub data: [f64; NUM_BLADES],
@@ -713,5 +713,70 @@ mod tests {
         let pi = plane(0.0, 1.0, 0.0, 5.0);
         // Should have e₂ component and e∞ components
         assert!(pi.data[2].abs() > 0.1); // e₂
+    }
+
+    #[test]
+    fn grade_involution_involution() {
+        let p = point(1.0, 2.0, 3.0);
+        let double = p.grade_involution().grade_involution();
+        for i in 0..32 {
+            assert!(approx(double.data[i], p.data[i]));
+        }
+    }
+
+    #[test]
+    fn norm_known_vector() {
+        let e1 = Multivector::e1();
+        assert!(approx(e1.norm(), 1.0));
+    }
+
+    #[test]
+    fn grade_extraction() {
+        let e1 = Multivector::e1();
+        let e2 = Multivector::e2();
+        let e12 = e1.outer(&e2);
+        let mv = e1.add(&e2).add(&e12);
+        let g1 = mv.grade(1);
+        assert!(approx(g1.data[1], 1.0));
+        assert!(approx(g1.data[2], 1.0));
+        assert!(approx(g1.data[6], 0.0));
+        let g2 = mv.grade(2);
+        assert!(approx(g2.data[1], 0.0));
+        assert!(approx(g2.data[6], 1.0));
+    }
+
+    #[test]
+    fn geo_product_associativity() {
+        let a = Multivector::e1();
+        let b = Multivector::e2();
+        let c = Multivector::e3();
+        let ab_c = a.geo(&b).geo(&c);
+        let a_bc = a.geo(&b.geo(&c));
+        for i in 0..32 {
+            assert!(approx(ab_c.data[i], a_bc.data[i]));
+        }
+    }
+
+    #[test]
+    fn outer_product_anticommutativity() {
+        let a = Multivector::e1();
+        let b = Multivector::e2();
+        let ab = a.outer(&b);
+        let ba = b.outer(&a);
+        for i in 0..32 {
+            assert!(approx(ab.data[i], -ba.data[i]));
+        }
+    }
+
+    #[test]
+    fn sphere_creation_nonzero() {
+        let s = sphere(0.0, 0.0, 0.0, 1.0);
+        assert!(s.magnitude_sq() > 1e-12);
+    }
+
+    #[test]
+    fn extract_point_on_non_point() {
+        let einf = Multivector::infinity();
+        assert!(extract_point(&einf).is_err());
     }
 }

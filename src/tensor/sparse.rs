@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 /// assert!((t.get(&[0, 0, 0, 0]).unwrap() - 0.0).abs() < 1e-12);
 /// assert_eq!(t.nnz(), 1);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SparseTensor {
     /// Shape of each dimension.
     shape: Vec<usize>,
@@ -348,5 +348,10 @@ mod tests {
     fn sparse_index_out_of_range() {
         let t = SparseTensor::new(vec![3, 3]);
         assert!(t.get(&[5, 0]).is_err());
+    }
+
+    #[test]
+    fn sparse_from_dense_size_mismatch() {
+        assert!(SparseTensor::from_dense(vec![3, 3], &[1.0; 5]).is_err());
     }
 }

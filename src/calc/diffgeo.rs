@@ -39,6 +39,7 @@ pub fn christoffel_symbols(
             "dimension must be positive".into(),
         ));
     }
+    tracing::debug!(dim, "computing Christoffel symbols");
 
     let n3 = dim * dim * dim;
     let mut gamma = vec![0.0; n3];
@@ -97,6 +98,7 @@ pub fn riemann_tensor(
             "dimension must be positive".into(),
         ));
     }
+    tracing::debug!(dim, "computing Riemann tensor");
 
     let d4 = dim * dim * dim * dim;
     let mut riemann = vec![0.0; d4];
@@ -208,12 +210,32 @@ pub fn einstein_tensor(
 // ---------------------------------------------------------------------------
 
 /// State for geodesic integration: position x^μ and velocity dx^μ/dτ.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GeodesicState {
     /// Position coordinates x^μ.
     pub x: Vec<f64>,
     /// Velocity (tangent vector) dx^μ/dτ.
     pub u: Vec<f64>,
+}
+
+impl std::fmt::Display for GeodesicState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GeodesicState(dim={}, x=[", self.x.len())?;
+        for (i, v) in self.x.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{v:.3}")?;
+        }
+        write!(f, "], u=[")?;
+        for (i, v) in self.u.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{v:.3}")?;
+        }
+        write!(f, "])")
+    }
 }
 
 /// Integrate the geodesic equation using RK4.
@@ -242,6 +264,7 @@ pub fn geodesic_rk4(
             "initial state dimensions don't match".into(),
         ));
     }
+    tracing::debug!(dim, steps, "geodesic RK4 integration");
 
     let mut trajectory = Vec::with_capacity(steps + 1);
     trajectory.push(initial.clone());
@@ -696,6 +719,66 @@ mod tests {
         // **F = -F in Lorentzian signature
         for i in 0..6 {
             assert!(approx(star_star_f[i], -f[i]), "**F ≠ -F at component {i}");
+        }
+    }
+
+    // -- Error paths --
+
+    #[test]
+    fn christoffel_dim_zero() {
+        assert!(christoffel_symbols(0, &|_, _| 0.0, &|_, _, _| 0.0).is_err());
+    }
+
+    #[test]
+    fn riemann_dim_zero() {
+        assert!(riemann_tensor(0, &[], &|_, _, _, _| 0.0).is_err());
+    }
+
+    #[test]
+    fn geodesic_dim_mismatch() {
+        let state = GeodesicState {
+            x: vec![0.0, 0.0],
+            u: vec![1.0, 0.0],
+        };
+        assert!(geodesic_rk4(3, &|_| vec![0.0; 27], &state, 0.01, 10).is_err());
+    }
+
+    #[test]
+    fn wedge_1_1_dim_mismatch() {
+        assert!(wedge_1_1(&[1.0, 0.0], &[1.0, 0.0, 0.0], 3).is_err());
+    }
+
+    // -- Property: Christoffel symmetry Gamma^a_{mu nu} = Gamma^a_{nu mu} --
+
+    #[test]
+    fn sphere_christoffel_symmetry() {
+        let theta = std::f64::consts::FRAC_PI_4;
+        let sin_t = theta.sin();
+        let cos_t = theta.cos();
+        let g_inv = |i: usize, j: usize| -> f64 {
+            if i == j {
+                if i == 0 { 1.0 } else { 1.0 / (sin_t * sin_t) }
+            } else {
+                0.0
+            }
+        };
+        let dg = |i: usize, j: usize, k: usize| -> f64 {
+            if i == 1 && j == 1 && k == 0 {
+                2.0 * sin_t * cos_t
+            } else {
+                0.0
+            }
+        };
+        let gamma = christoffel_symbols(2, &g_inv, &dg).unwrap();
+        for alpha in 0..2 {
+            for mu in 0..2 {
+                for nu in 0..2 {
+                    assert!(approx(
+                        christoffel_get(&gamma, 2, alpha, mu, nu),
+                        christoffel_get(&gamma, 2, alpha, nu, mu),
+                    ));
+                }
+            }
         }
     }
 

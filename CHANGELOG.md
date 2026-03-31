@@ -62,7 +62,7 @@
 - `dilator()` — uniform scaling versor about origin
 
 ### Stats
-- 1089 tests (1033 unit + 34 integration + 22 doc) — up from 887
+- 1155 tests (1099 unit + 34 integration + 22 doc) — up from 887
 - Zero clippy warnings, cargo audit clean, cargo deny clean
 
 ## 1.3.0 (2026-03-27)

@@ -12,6 +12,7 @@
 
 use super::complex::Complex;
 use crate::HisabError;
+use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
 // ---------------------------------------------------------------------------
@@ -30,7 +31,7 @@ use std::f64::consts::PI;
 /// let result = id.mul_vec(&v).unwrap();
 /// assert!((result[0] - v[0]).norm_sq() < 1e-12);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComplexMatrix {
     data: Vec<Complex>,
     rows: usize,
@@ -353,6 +354,12 @@ impl ComplexMatrix {
     }
 }
 
+impl std::fmt::Display for ComplexMatrix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ComplexMatrix({}\u{00d7}{})", self.rows, self.cols)
+    }
+}
+
 // Index operators
 impl std::ops::Index<(usize, usize)> for ComplexMatrix {
     type Output = Complex;
@@ -379,7 +386,7 @@ impl std::ops::IndexMut<(usize, usize)> for ComplexMatrix {
 ///
 /// For a Hermitian matrix **A**, `A = U Λ U†` where Λ is real diagonal
 /// and U is unitary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[must_use]
 pub struct HermitianEigen {
     /// Real eigenvalues sorted by descending magnitude.
@@ -409,6 +416,7 @@ pub fn eigen_hermitian(
     if n == 0 {
         return Err(HisabError::InvalidInput("empty matrix".into()));
     }
+    tracing::debug!(size = n, "eigen_hermitian starting");
     if n == 1 {
         return Ok(HermitianEigen {
             eigenvalues: vec![a.get(0, 0).re],
@@ -423,7 +431,7 @@ pub fn eigen_hermitian(
 
     let tol_sq = tol * tol;
 
-    for _ in 0..max_iter {
+    for iter_count in 0..max_iter {
         let mut converged = true;
 
         for p in 0..n {
@@ -489,6 +497,7 @@ pub fn eigen_hermitian(
             }
         }
         if converged {
+            tracing::trace!(iterations = iter_count, "eigen_hermitian converged");
             // Extract eigenvalues and sort by descending magnitude
             let eigenvalues: Vec<f64> = (0..n).map(|i| w.get(i, i).re).collect();
             let mut order: Vec<usize> = (0..n).collect();
@@ -524,7 +533,7 @@ pub fn eigen_hermitian(
 /// Result of a complex singular value decomposition.
 ///
 /// `A = U Σ V†` where U, V are unitary and Σ is real diagonal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[must_use]
 pub struct ComplexSvd {
     /// Left singular vectors (m × m unitary).
@@ -562,6 +571,7 @@ pub fn complex_svd(a: &ComplexMatrix, tol: f64, max_iter: usize) -> Result<Compl
         .filter(|&&e| e.abs() > tol)
         .count()
         .max(1);
+    tracing::debug!(rows = m, cols = n, rank, "complex_svd");
 
     // σᵢ = √λᵢ, V from eigenvectors
     let sigma: Vec<f64> = eig
@@ -727,6 +737,20 @@ pub fn gamma_spatial(i: usize) -> Result<ComplexMatrix, HisabError> {
     Ok(m)
 }
 
+/// Build a 4×4 Dirac gamma matrix from a 2×2 Pauli matrix.
+///
+/// `γⁱ = [[0, σ], [-σ, 0]]`
+fn gamma_from_pauli(sigma: &ComplexMatrix) -> ComplexMatrix {
+    let mut m = ComplexMatrix::zeros(4, 4);
+    for r in 0..2 {
+        for c in 0..2 {
+            m.set(r, c + 2, sigma.get(r, c));
+            m.set(r + 2, c, Complex::default() - sigma.get(r, c));
+        }
+    }
+    m
+}
+
 /// All four Dirac gamma matrices `[γ⁰, γ¹, γ², γ³]`.
 ///
 /// Satisfies the Clifford algebra: `{γᵘ, γᵛ} = 2ηᵘᵛ I₄`.
@@ -734,9 +758,9 @@ pub fn gamma_spatial(i: usize) -> Result<ComplexMatrix, HisabError> {
 pub fn gamma_matrices() -> [ComplexMatrix; 4] {
     [
         gamma_0(),
-        gamma_spatial(1).expect("valid index"),
-        gamma_spatial(2).expect("valid index"),
-        gamma_spatial(3).expect("valid index"),
+        gamma_from_pauli(&pauli_x()),
+        gamma_from_pauli(&pauli_y()),
+        gamma_from_pauli(&pauli_z()),
     ]
 }
 
@@ -744,10 +768,27 @@ pub fn gamma_matrices() -> [ComplexMatrix; 4] {
 #[must_use]
 pub fn gamma_5() -> ComplexMatrix {
     let g = gamma_matrices();
-    let mut result = g[0].mul_mat(&g[1]).expect("4x4 * 4x4");
-    result = result.mul_mat(&g[2]).expect("4x4 * 4x4");
-    result = result.mul_mat(&g[3]).expect("4x4 * 4x4");
-    result.scale(Complex::new(0.0, 1.0))
+    // All are 4×4 so mul_mat cannot fail — use inner helper
+    let g01 = mat4_mul(&g[0], &g[1]);
+    let g012 = mat4_mul(&g01, &g[2]);
+    let g0123 = mat4_mul(&g012, &g[3]);
+    g0123.scale(Complex::new(0.0, 1.0))
+}
+
+/// Infallible 4×4 complex matrix multiply (avoids expect in library code).
+fn mat4_mul(a: &ComplexMatrix, b: &ComplexMatrix) -> ComplexMatrix {
+    debug_assert!(a.cols() == 4 && b.rows() == 4);
+    let mut out = ComplexMatrix::zeros(4, 4);
+    for r in 0..4 {
+        for c in 0..4 {
+            let mut sum = Complex::default();
+            for k in 0..4 {
+                sum += a.get(r, k) * b.get(k, c);
+            }
+            out.set(r, c, sum);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +954,7 @@ pub fn matrix_exp(a: &ComplexMatrix) -> Result<ComplexMatrix, HisabError> {
         (norm / theta13).log2().ceil() as u32
     };
     let scale = 0.5_f64.powi(s as i32);
+    tracing::debug!(scaling_factor = s, norm, "matrix_exp");
     let a_scaled = a.scale_real(scale);
 
     // Taylor series: sum A^k / k! up to order 20 for good accuracy
@@ -1300,6 +1342,66 @@ mod tests {
         assert!(approx_eq(result.get(0, 0).im, -1.0));
         assert!(approx_eq(result.get(1, 1).re, 0.0));
         assert!(approx_eq(result.get(1, 1).im, 1.0));
+    }
+
+    // -- Error paths --
+
+    #[test]
+    fn from_rows_size_mismatch() {
+        assert!(ComplexMatrix::from_rows(2, 2, vec![Complex::default(); 3]).is_err());
+    }
+
+    #[test]
+    fn add_dim_mismatch() {
+        let a = ComplexMatrix::zeros(2, 3);
+        let b = ComplexMatrix::zeros(3, 2);
+        assert!(a.add(&b).is_err());
+    }
+
+    #[test]
+    fn sub_dim_mismatch() {
+        let a = ComplexMatrix::zeros(2, 3);
+        let b = ComplexMatrix::zeros(3, 2);
+        assert!(a.sub(&b).is_err());
+    }
+
+    #[test]
+    fn mul_mat_inner_dim_mismatch() {
+        let a = ComplexMatrix::zeros(2, 3);
+        let b = ComplexMatrix::zeros(4, 2);
+        assert!(a.mul_mat(&b).is_err());
+    }
+
+    #[test]
+    fn mul_vec_length_mismatch() {
+        let a = ComplexMatrix::zeros(2, 3);
+        assert!(a.mul_vec(&[Complex::default(); 2]).is_err());
+    }
+
+    #[test]
+    fn det_2x2_non_2x2() {
+        assert!(ComplexMatrix::zeros(3, 3).det_2x2().is_err());
+    }
+
+    #[test]
+    fn trace_non_square() {
+        assert!(ComplexMatrix::zeros(2, 3).trace().is_err());
+    }
+
+    #[test]
+    fn eigen_hermitian_empty() {
+        assert!(eigen_hermitian(&ComplexMatrix::zeros(0, 0), 1e-12, 100).is_err());
+    }
+
+    #[test]
+    fn eigen_hermitian_non_square() {
+        assert!(eigen_hermitian(&ComplexMatrix::zeros(2, 3), 1e-12, 100).is_err());
+    }
+
+    #[test]
+    fn spinor_rotation_zero_axis() {
+        let s = [Complex::from_real(1.0), Complex::default()];
+        assert!(spinor_rotation(&s, [0.0, 0.0, 0.0], 1.0).is_err());
     }
 
     // -- Dirac boost --

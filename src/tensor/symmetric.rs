@@ -30,7 +30,7 @@ use crate::HisabError;
 /// assert_eq!(g.num_independent(), 10);
 /// assert!((g.get(&[0, 0]).unwrap() - 1.0).abs() < 1e-12);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SymmetricTensor {
     /// Dimension of each index.
     dim: usize,
@@ -152,6 +152,18 @@ impl SymmetricTensor {
     }
 }
 
+impl std::fmt::Display for SymmetricTensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SymmetricTensor(dim={}, rank={}, {} independent)",
+            self.dim,
+            self.rank,
+            self.data.len()
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AntisymmetricTensor
 // ---------------------------------------------------------------------------
@@ -172,7 +184,7 @@ impl SymmetricTensor {
 /// assert!((f.get(&[1, 0]).unwrap() + 1.0).abs() < 1e-12); // antisymmetric
 /// assert_eq!(f.num_independent(), 6);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AntisymmetricTensor {
     dim: usize,
     rank: usize,
@@ -290,6 +302,18 @@ impl AntisymmetricTensor {
     #[inline]
     pub fn data(&self) -> &[f64] {
         &self.data
+    }
+}
+
+impl std::fmt::Display for AntisymmetricTensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AntisymmetricTensor(dim={}, rank={}, {} independent)",
+            self.dim,
+            self.rank,
+            self.data.len()
+        )
     }
 }
 
@@ -508,5 +532,55 @@ mod tests {
         assert_eq!(multiset_coeff(4, 2), 10); // C(5,2)
         assert_eq!(multiset_coeff(3, 3), 10); // C(5,3)
         assert_eq!(multiset_coeff(4, 0), 1);
+    }
+
+    // -- Error paths --
+
+    #[test]
+    fn symmetric_get_wrong_index_count() {
+        let t = SymmetricTensor::zeros(3, 2);
+        assert!(t.get(&[0, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn symmetric_set_wrong_index_count() {
+        let mut t = SymmetricTensor::zeros(3, 2);
+        assert!(t.set(&[0], 1.0).is_err());
+    }
+
+    #[test]
+    fn symmetric_get_out_of_range() {
+        let t = SymmetricTensor::zeros(3, 2);
+        assert!(t.get(&[0, 5]).is_err());
+    }
+
+    #[test]
+    fn symmetric_set_out_of_range() {
+        let mut t = SymmetricTensor::zeros(3, 2);
+        assert!(t.set(&[3, 0], 1.0).is_err());
+    }
+
+    #[test]
+    fn antisymmetric_get_wrong_index_count() {
+        let t = AntisymmetricTensor::zeros(4, 2);
+        assert!(t.get(&[0]).is_err());
+    }
+
+    #[test]
+    fn antisymmetric_set_wrong_index_count() {
+        let mut t = AntisymmetricTensor::zeros(4, 2);
+        assert!(t.set(&[0, 1, 2], 1.0).is_err());
+    }
+
+    #[test]
+    fn antisymmetric_get_out_of_range() {
+        let t = AntisymmetricTensor::zeros(4, 2);
+        assert!(t.get(&[0, 7]).is_err());
+    }
+
+    #[test]
+    fn antisymmetric_set_out_of_range() {
+        let mut t = AntisymmetricTensor::zeros(4, 2);
+        assert!(t.set(&[5, 0], 1.0).is_err());
     }
 }

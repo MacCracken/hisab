@@ -75,7 +75,7 @@ pub mod logging;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "transforms")]
-pub use transforms::{EulerOrder, Transform2D, Transform3D};
+pub use transforms::{EulerOrder, Lorentz, Su2, Transform2D, Transform3D, U1};
 
 // f32 types
 #[cfg(feature = "transforms")]
@@ -94,7 +94,10 @@ pub use geo::{
 };
 
 #[cfg(feature = "num")]
-pub use num::{Complex, CsrMatrix, DenseMatrix, EigenDecomposition, OptResult, Pcg32, Svd};
+pub use num::{
+    Complex, ComplexMatrix, ComplexSvd, CsrMatrix, DenseMatrix, EigenDecomposition, HermitianEigen,
+    OptResult, Pcg32, Svd,
+};
 
 #[cfg(feature = "autodiff")]
 pub use autodiff::{Dual, Tape, Var};
@@ -106,7 +109,10 @@ pub use interval::Interval;
 pub use symbolic::{Expr, ExprValue, Pattern, RewriteRule, SolveOptions};
 
 #[cfg(feature = "tensor")]
-pub use tensor::Tensor;
+pub use tensor::{
+    AntisymmetricTensor, IndexVariance, IndexedTensor, SparseTensor, SymmetricTensor, Tensor,
+    TensorIndex,
+};
 
 #[cfg(feature = "ai")]
 pub use ai::DaimonClient;

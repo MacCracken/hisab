@@ -49,7 +49,7 @@ pub fn fft(data: &mut [Complex]) -> Result<(), HisabError> {
                 let t = w * data[start + k + half];
                 data[start + k] = u + t;
                 data[start + k + half] = u - t;
-                w = w * wn;
+                w *= wn;
             }
             start += len;
         }

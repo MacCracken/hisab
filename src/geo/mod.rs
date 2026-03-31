@@ -7,6 +7,7 @@ use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod cga;
 mod closest;
 mod collision;
 mod decompose;

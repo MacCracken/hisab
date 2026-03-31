@@ -14,6 +14,8 @@ mod integration;
 pub use integration::*;
 mod multivar;
 pub use multivar::*;
+mod diffgeo;
+pub use diffgeo::*;
 
 #[cfg(test)]
 mod tests {

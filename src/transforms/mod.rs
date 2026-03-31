@@ -13,6 +13,8 @@ mod decompose;
 pub use decompose::*;
 mod sh;
 pub use sh::*;
+mod lie;
+pub use lie::*;
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,9 @@
-//! N-dimensional tensor type for numerical computation.
+//! N-dimensional dense tensor type for numerical computation.
 //!
 //! Provides a dense [`Tensor`] with arbitrary shape, supporting element access,
 //! arithmetic, reshape, transpose (2D), and matrix multiplication.
+//!
+//! For index-aware operations (Einstein summation, contraction) see [`super::IndexedTensor`].
 
 use crate::HisabError;
 

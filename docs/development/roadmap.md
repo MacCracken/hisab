@@ -23,6 +23,8 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 | **abaco** | Symbolic algebra (Expr), interval arithmetic for verified evaluation |
 | **svara** | Complex, FFT, easing functions (vocal synthesis) |
 | **prani** | Easing functions (creature vocal synthesis, via svara) |
+| **hisab-mimamsa** | Indexed tensors, Lie groups, differential geometry, complex LA, CGA (theoretical physics) |
+| **kana** | Indexed tensors, Lie groups, complex LA, spinors (quantum science) |
 
 ## Versioning
 
@@ -102,6 +104,45 @@ Post-1.0: standard semver.
 - [ ] Complete doctests on all public functions
 - [ ] GPU compute kernels via soorat (feature-gated compute pipeline)
 
+## 1.5.0 — Theoretical physics foundation (P0 — mimamsa + kana)
+
+### Indexed tensor algebra (tensor)
+- [x] Covariant / contravariant index tracking (upper/lower indices)
+- [x] Einstein summation convention (automatic contraction)
+- [x] Tensor contraction, outer product, index raising/lowering
+- [x] Symmetric & antisymmetric tensor storage (exploit symmetries — Riemann 256→20)
+- [x] Sparse tensor support for high-rank objects
+
+### Lie groups & algebras (transforms)
+- [x] Lorentz group SO(3,1) — boosts, rotations, Lorentz transformations
+- [x] SU(2) — spinor representations, Pauli matrices
+- [x] SU(3) — Gell-Mann matrices, color charge algebra
+- [x] U(1) — phase transformations
+- [x] Lie algebra exponential map, commutators, structure constants
+- [x] Casimir operators
+
+### Differential geometry (calc/geo)
+- [x] Covariant derivative (connection-aware differentiation)
+- [x] Christoffel symbols (from metric tensor)
+- [x] Levi-Civita connection
+- [x] Riemann curvature tensor, Ricci tensor, Ricci scalar
+- [x] Geodesic equation solver (integrates with existing ODE solvers)
+- [x] Killing vectors, isometry detection
+- [x] Exterior algebra — wedge product, Hodge star, differential forms
+
+### Complex linear algebra (num)
+- [x] Hermitian matrix eigendecomposition
+- [x] Unitary matrix operations
+- [x] Pauli & Dirac gamma matrix algebra
+- [x] Spinor transformations
+- [x] Complex SVD
+
+### Conformal geometric algebra (geo)
+- [x] Conformal model (point, sphere, plane representations)
+- [x] Conformal transformations (Möbius maps)
+- [x] Versors, rotors, translators in conformal space
+- 1089 tests (1033 unit + 34 integration + 22 doc)
+
 ## Watch List
 
 | Item | Area |
@@ -109,7 +150,6 @@ Post-1.0: standard semver.
 | Randomized SVD (Halko-Martinsson-Tropp) | num |
 | Differentiable rendering math | geo/autodiff |
 | Neural implicit representation primitives | tensor |
-| Conformal geometric algebra | geo |
 | Low-rank approximations (CUR, Nystrom) | num |
 
 ## Boundary with Abaco

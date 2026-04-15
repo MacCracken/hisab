@@ -1,0 +1,192 @@
+# transforms.cyr — 2D/3D transforms, interpolation, projections
+# Usage: include "lib/transforms.cyr"
+# Requires: alloc.cyr, math.cyr, f64_util.cyr, error.cyr, vec2.cyr, vec3.cyr, vec4.cyr, quat.cyr, mat4.cyr
+
+# ================================================================
+# Transform2D: position (Vec2), rotation (f64 radians), scale (Vec2)
+# Layout: { pos_x, pos_y, rotation, scale_x, scale_y } = 40 bytes
+# ================================================================
+
+fn t2d_new(pos, rotation, scale) {
+    var t = alloc(40);
+    store64(t, HVec2_x(pos));
+    store64(t + 8, HVec2_y(pos));
+    store64(t + 16, rotation);
+    store64(t + 24, HVec2_x(scale));
+    store64(t + 32, HVec2_y(scale));
+    return t;
+}
+
+fn t2d_identity() {
+    return t2d_new(hvec2_zero(), 0, hvec2_one());
+}
+
+fn t2d_pos_x(t) { return load64(t); }
+fn t2d_pos_y(t) { return load64(t + 8); }
+fn t2d_rotation(t) { return load64(t + 16); }
+fn t2d_scale_x(t) { return load64(t + 24); }
+fn t2d_scale_y(t) { return load64(t + 32); }
+
+fn t2d_apply(t, point) {
+    var s = f64_sin(t2d_rotation(t));
+    var c = f64_cos(t2d_rotation(t));
+    var sx = t2d_scale_x(t); var sy = t2d_scale_y(t);
+    var px = HVec2_x(point); var py = HVec2_y(point);
+    return hvec3_new(
+        f64_add(f64_sub(f64_mul(c, f64_mul(sx, px)), f64_mul(s, f64_mul(sy, py))), t2d_pos_x(t)),
+        f64_add(f64_add(f64_mul(s, f64_mul(sx, px)), f64_mul(c, f64_mul(sy, py))), t2d_pos_y(t)),
+        F64_ONE
+    );
+}
+
+fn t2d_compose(a, b) {
+    var s = f64_sin(t2d_rotation(b));
+    var c = f64_cos(t2d_rotation(b));
+    var bsx = t2d_scale_x(b); var bsy = t2d_scale_y(b);
+    var ax = t2d_pos_x(a); var ay = t2d_pos_y(a);
+    var rx = f64_add(f64_sub(f64_mul(c, f64_mul(ax, bsx)), f64_mul(s, f64_mul(ay, bsy))), t2d_pos_x(b));
+    var ry = f64_add(f64_add(f64_mul(s, f64_mul(ax, bsx)), f64_mul(c, f64_mul(ay, bsy))), t2d_pos_y(b));
+    return t2d_new(
+        hvec2_new(rx, ry),
+        f64_add(t2d_rotation(a), t2d_rotation(b)),
+        hvec2_new(f64_mul(t2d_scale_x(a), bsx), f64_mul(t2d_scale_y(a), bsy))
+    );
+}
+
+# ================================================================
+# Transform3D: position (Vec3), rotation (Quat), scale (Vec3)
+# Stored via pointers to existing heap objects
+# Layout: { pos_ptr, rot_ptr, scale_ptr } = 24 bytes
+# ================================================================
+
+fn t3d_new(pos, rotation, scale) {
+    var t = alloc(24);
+    store64(t, pos);
+    store64(t + 8, rotation);
+    store64(t + 16, scale);
+    return t;
+}
+
+fn t3d_identity() {
+    return t3d_new(hvec3_zero(), hquat_identity(), hvec3_one());
+}
+
+fn t3d_pos(t) { return load64(t); }
+fn t3d_rot(t) { return load64(t + 8); }
+fn t3d_scale(t) { return load64(t + 16); }
+
+fn t3d_to_matrix(t) {
+    return m4_from_srt(t3d_scale(t), t3d_rot(t), t3d_pos(t));
+}
+
+fn t3d_apply(t, point) {
+    var scaled = hvec3_mul(t3d_scale(t), point);
+    var rotated = hquat_rotate_vec3(t3d_rot(t), scaled);
+    return hvec3_add(rotated, t3d_pos(t));
+}
+
+fn t3d_inverse_matrix(t) {
+    return m4_inverse(t3d_to_matrix(t));
+}
+
+fn t3d_compose(a, b) {
+    var scaled_pos = hvec3_mul(t3d_scale(b), t3d_pos(a));
+    var rotated_pos = hquat_rotate_vec3(t3d_rot(b), scaled_pos);
+    return t3d_new(
+        hvec3_add(rotated_pos, t3d_pos(b)),
+        hquat_mul(t3d_rot(b), t3d_rot(a)),
+        hvec3_mul(t3d_scale(b), t3d_scale(a))
+    );
+}
+
+# Interpolate between two 3D transforms
+fn t3d_lerp(a, b, t) {
+    return t3d_new(
+        hvec3_lerp(t3d_pos(a), t3d_pos(b), t),
+        hquat_slerp(t3d_rot(a), t3d_rot(b), t),
+        hvec3_lerp(t3d_scale(a), t3d_scale(b), t)
+    );
+}
+
+# ================================================================
+# Interpolation helpers
+# ================================================================
+
+fn hisab_lerp(a, b, t) {
+    return f64_add(a, f64_mul(f64_sub(b, a), t));
+}
+
+fn hisab_inverse_lerp(a, b, value) {
+    var denom = f64_sub(b, a);
+    if (f64_lt(f64_abs(denom), EPSILON_F64) == 1) { return 0; }
+    return f64_div(f64_sub(value, a), denom);
+}
+
+fn hisab_remap(value, in_lo, in_hi, out_lo, out_hi) {
+    return hisab_lerp(out_lo, out_hi, hisab_inverse_lerp(in_lo, in_hi, value));
+}
+
+# ================================================================
+# Euler angles
+# ================================================================
+
+enum EulerOrder { EULER_XYZ = 0; EULER_XZY = 1; EULER_YXZ = 2; EULER_YZX = 3; EULER_ZXY = 4; EULER_ZYX = 5; }
+
+fn hquat_from_euler(x, y, z, order) {
+    var qx = hquat_from_rotation_x(x);
+    var qy = hquat_from_rotation_y(y);
+    var qz = hquat_from_rotation_z(z);
+    if (order == EULER_XYZ) { return hquat_mul(hquat_mul(qx, qy), qz); }
+    if (order == EULER_XZY) { return hquat_mul(hquat_mul(qx, qz), qy); }
+    if (order == EULER_YXZ) { return hquat_mul(hquat_mul(qy, qx), qz); }
+    if (order == EULER_YZX) { return hquat_mul(hquat_mul(qy, qz), qx); }
+    if (order == EULER_ZXY) { return hquat_mul(hquat_mul(qz, qx), qy); }
+    return hquat_mul(hquat_mul(qz, qy), qx);
+}
+
+# ================================================================
+# Flip handedness
+# ================================================================
+
+fn m4_flip_handedness_z(m) {
+    var r = m4_copy(m);
+    # Negate column 2
+    m4_set(r, 2, 0, f64_neg(m4_get(m, 2, 0)));
+    m4_set(r, 2, 1, f64_neg(m4_get(m, 2, 1)));
+    m4_set(r, 2, 2, f64_neg(m4_get(m, 2, 2)));
+    m4_set(r, 2, 3, f64_neg(m4_get(m, 2, 3)));
+    return r;
+}
+
+# ================================================================
+# Screen/world projection
+# ================================================================
+
+# Returns Vec3: (screen_x, screen_y, depth)
+fn world_to_screen(point, mvp, vw, vh) {
+    var clip = m4_mul_vec4(mvp, hvec4_from_vec3(point, F64_ONE));
+    var inv_w = f64_div(F64_ONE, HVec4_w(clip));
+    var nx = f64_mul(HVec4_x(clip), inv_w);
+    var ny = f64_mul(HVec4_y(clip), inv_w);
+    var nz = f64_mul(HVec4_z(clip), inv_w);
+    return hvec3_new(
+        f64_mul(f64_add(f64_mul(nx, F64_HALF), F64_HALF), vw),
+        f64_mul(f64_sub(F64_ONE, f64_add(f64_mul(ny, F64_HALF), F64_HALF)), vh),
+        f64_add(f64_mul(nz, F64_HALF), F64_HALF)
+    );
+}
+
+# Returns two Vec3: origin and direction (via out params)
+fn screen_to_world_ray(sx, sy, inv_vp, vw, vh, out_origin, out_dir) {
+    var nx = f64_sub(f64_mul(f64_div(sx, vw), F64_TWO), F64_ONE);
+    var ny = f64_sub(F64_ONE, f64_mul(f64_div(sy, vh), F64_TWO));
+    var near = m4_mul_vec4(inv_vp, hvec4_new(nx, ny, f64_neg(F64_ONE), F64_ONE));
+    var far = m4_mul_vec4(inv_vp, hvec4_new(nx, ny, F64_ONE, F64_ONE));
+    var nw = f64_div(F64_ONE, HVec4_w(near));
+    var fw = f64_div(F64_ONE, HVec4_w(far));
+    var np = hvec3_new(f64_mul(HVec4_x(near), nw), f64_mul(HVec4_y(near), nw), f64_mul(HVec4_z(near), nw));
+    var fp = hvec3_new(f64_mul(HVec4_x(far), fw), f64_mul(HVec4_y(far), fw), f64_mul(HVec4_z(far), fw));
+    store64(out_origin, np);
+    store64(out_dir, hvec3_normalize(hvec3_sub(fp, np)));
+    return 0;
+}

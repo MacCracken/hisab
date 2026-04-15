@@ -1,0 +1,689 @@
+# geo.cyr — geometric primitives, intersection tests, and closest-point queries
+# Usage: include "lib/geo.cyr"
+# Requires: alloc.cyr, math.cyr, vec3.cyr, quat.cyr, error.cyr, f64_util.cyr
+#
+# Convention: intersection functions return 0 on miss, positive f64 t on hit.
+# Overlap tests return 1 (true) or 0 (false).
+# Closest-point functions return an HVec3 pointer.
+
+# ================================================================
+# Local constants
+# ================================================================
+
+var _GEO_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
+var _GEO_F64_POS_INF = 0x7FF0_0000_0000_0000;  # +Infinity
+var _GEO_F64_FOUR    = 0x4010_0000_0000_0000;  # 4.0
+var _GEO_F64_THREE   = 0x4008_0000_0000_0000;  # 3.0
+var _GEO_F64_THIRD   = 0x3FD5_5555_5555_5555;  # 1.0/3.0
+
+# ================================================================
+# Primitives
+# ================================================================
+
+# Ray: origin (HVec3), direction (HVec3) — 16 bytes (two pointers)
+#derive(accessors)
+struct GeoRay { origin; direction; }
+
+fn geo_ray_new(origin, direction) {
+    var dir = hvec3_normalize(direction);
+    var r = alloc(16);
+    store64(r, origin);
+    store64(r + 8, dir);
+    return r;
+}
+
+# Point along the ray at parameter t
+fn geo_ray_at(ray, t) {
+    return hvec3_add(GeoRay_origin(ray), hvec3_scale(GeoRay_direction(ray), t));
+}
+
+# Plane: normal (HVec3), distance (f64) — 16 bytes
+#derive(accessors)
+struct GeoPlane { normal; distance; }
+
+fn geo_plane_from_point_normal(point, normal) {
+    var n = hvec3_normalize(normal);
+    var d = hvec3_dot(n, point);
+    var p = alloc(16);
+    store64(p, n);
+    store64(p + 8, d);
+    return p;
+}
+
+fn geo_plane_signed_distance(plane, point) {
+    return f64_sub(hvec3_dot(GeoPlane_normal(plane), point), GeoPlane_distance(plane));
+}
+
+# AABB: min (HVec3), max (HVec3) — 16 bytes
+#derive(accessors)
+struct GeoAabb { min; max; }
+
+fn geo_aabb_new(a, b) {
+    var box = alloc(16);
+    store64(box, hvec3_min(a, b));
+    store64(box + 8, hvec3_max(a, b));
+    return box;
+}
+
+fn geo_aabb_center(aabb) {
+    return hvec3_scale(hvec3_add(GeoAabb_min(aabb), GeoAabb_max(aabb)), F64_HALF);
+}
+
+fn geo_aabb_size(aabb) {
+    return hvec3_sub(GeoAabb_max(aabb), GeoAabb_min(aabb));
+}
+
+# Sphere: center (HVec3), radius (f64) — 16 bytes
+#derive(accessors)
+struct GeoSphere { center; radius; }
+
+fn geo_sphere_new(center, radius) {
+    var s = alloc(16);
+    store64(s, center);
+    store64(s + 8, radius);
+    return s;
+}
+
+# OBB: center (HVec3), half_extents (HVec3), rotation (HQuat) — 24 bytes
+#derive(accessors)
+struct GeoObb { center; half_extents; rotation; }
+
+fn geo_obb_new(center, half_extents, rotation) {
+    var o = alloc(24);
+    store64(o, center);
+    store64(o + 8, half_extents);
+    store64(o + 16, rotation);
+    return o;
+}
+
+# Returns three axis vectors as an array of 3 HVec3 pointers (alloc 24 bytes)
+fn geo_obb_axes(obb) {
+    var q = GeoObb_rotation(obb);
+    var ax = hquat_rotate_vec3(q, hvec3_unit_x());
+    var ay = hquat_rotate_vec3(q, hvec3_unit_y());
+    var az = hquat_rotate_vec3(q, hvec3_unit_z());
+    var arr = alloc(24);
+    store64(arr, ax);
+    store64(arr + 8, ay);
+    store64(arr + 16, az);
+    return arr;
+}
+
+# Capsule: start (HVec3), end (HVec3), radius (f64) — 24 bytes
+#derive(accessors)
+struct GeoCapsule { start; end; radius; }
+
+fn geo_capsule_new(start, end, radius) {
+    var c = alloc(24);
+    store64(c, start);
+    store64(c + 8, end);
+    store64(c + 16, radius);
+    return c;
+}
+
+# Triangle: v0, v1, v2 (three HVec3 pointers) — 24 bytes
+#derive(accessors)
+struct GeoTriangle { v0; v1; v2; }
+
+fn geo_triangle_new(a, b, c) {
+    var t = alloc(24);
+    store64(t, a);
+    store64(t + 8, b);
+    store64(t + 16, c);
+    return t;
+}
+
+fn geo_triangle_normal(tri) {
+    var edge1 = hvec3_sub(GeoTriangle_v1(tri), GeoTriangle_v0(tri));
+    var edge2 = hvec3_sub(GeoTriangle_v2(tri), GeoTriangle_v0(tri));
+    return hvec3_cross(edge1, edge2);
+}
+
+fn geo_triangle_unit_normal(tri) {
+    var n = geo_triangle_normal(tri);
+    var len_sq = hvec3_length_sq(n);
+    if (f64_lt(len_sq, EPSILON_F64) == 1) { return hvec3_unit_y(); }
+    return hvec3_scale(n, f64_div(F64_ONE, f64_sqrt(len_sq)));
+}
+
+fn geo_triangle_area(tri) {
+    return f64_mul(hvec3_length(geo_triangle_normal(tri)), F64_HALF);
+}
+
+fn geo_triangle_centroid(tri) {
+    var sum = hvec3_add(hvec3_add(GeoTriangle_v0(tri), GeoTriangle_v1(tri)), GeoTriangle_v2(tri));
+    return hvec3_scale(sum, _GEO_F64_THIRD);
+}
+
+# Line: origin (HVec3), direction (HVec3) — 16 bytes
+#derive(accessors)
+struct GeoLine { origin; direction; }
+
+fn geo_line_new(origin, direction) {
+    var dir = hvec3_normalize(direction);
+    var l = alloc(16);
+    store64(l, origin);
+    store64(l + 8, dir);
+    return l;
+}
+
+fn geo_line_closest_point(line, point) {
+    var v = hvec3_sub(point, GeoLine_origin(line));
+    var t = hvec3_dot(v, GeoLine_direction(line));
+    return hvec3_add(GeoLine_origin(line), hvec3_scale(GeoLine_direction(line), t));
+}
+
+# Segment: start (HVec3), end (HVec3) — 16 bytes
+#derive(accessors)
+struct GeoSegment { start; end; }
+
+fn geo_segment_new(start, end) {
+    var s = alloc(16);
+    store64(s, start);
+    store64(s + 8, end);
+    return s;
+}
+
+fn geo_segment_length(seg) {
+    return hvec3_length(hvec3_sub(GeoSegment_end(seg), GeoSegment_start(seg)));
+}
+
+fn geo_segment_midpoint(seg) {
+    return hvec3_scale(hvec3_add(GeoSegment_start(seg), GeoSegment_end(seg)), F64_HALF);
+}
+
+fn geo_segment_direction(seg) {
+    var d = hvec3_sub(GeoSegment_end(seg), GeoSegment_start(seg));
+    var len_sq = hvec3_length_sq(d);
+    if (f64_lt(len_sq, EPSILON_F64) == 1) { return hvec3_unit_x(); }
+    return hvec3_scale(d, f64_div(F64_ONE, f64_sqrt(len_sq)));
+}
+
+fn geo_segment_closest_point(seg, point) {
+    var ab = hvec3_sub(GeoSegment_end(seg), GeoSegment_start(seg));
+    var len_sq = hvec3_dot(ab, ab);
+    if (f64_lt(len_sq, EPSILON_F64) == 1) { return GeoSegment_start(seg); }
+    var t = f64_clamp(f64_div(hvec3_dot(hvec3_sub(point, GeoSegment_start(seg)), ab), len_sq), 0, F64_ONE);
+    return hvec3_add(GeoSegment_start(seg), hvec3_scale(ab, t));
+}
+
+fn geo_segment_distance_to_point(seg, point) {
+    return hvec3_length(hvec3_sub(point, geo_segment_closest_point(seg, point)));
+}
+
+# ================================================================
+# Ray intersection tests
+# ================================================================
+# All return 0 on miss, positive f64 t parameter on hit.
+
+# Ray-plane intersection
+fn geo_ray_plane(ray, plane) {
+    var denom = hvec3_dot(GeoPlane_normal(plane), GeoRay_direction(ray));
+    if (f64_lt(f64_abs(denom), EPSILON_F64) == 1) { return 0; }
+    var t = f64_div(f64_sub(GeoPlane_distance(plane), hvec3_dot(GeoPlane_normal(plane), GeoRay_origin(ray))), denom);
+    if (f64_lt(t, 0) == 1) { return 0; }
+    return t;
+}
+
+# Ray-sphere intersection (quadratic, half-b form for normalized direction)
+fn geo_ray_sphere(ray, sphere) {
+    var oc = hvec3_sub(GeoRay_origin(ray), GeoSphere_center(sphere));
+    var half_b = hvec3_dot(oc, GeoRay_direction(ray));
+    var r = GeoSphere_radius(sphere);
+    var c = f64_sub(hvec3_dot(oc, oc), f64_mul(r, r));
+    var discriminant = f64_sub(f64_mul(half_b, half_b), c);
+
+    if (f64_lt(discriminant, 0) == 1) { return 0; }
+
+    var sqrt_d = f64_sqrt(discriminant);
+    var t1 = f64_sub(f64_neg(half_b), sqrt_d);
+    var t2 = f64_add(f64_neg(half_b), sqrt_d);
+
+    if (f64_lt(t1, 0) != 1) { return t1; }
+    if (f64_lt(t2, 0) != 1) { return t2; }
+    return 0;
+}
+
+# Ray-AABB intersection (slab method)
+fn geo_ray_aabb(ray, aabb) {
+    var ox = HVec3_x(GeoRay_origin(ray));
+    var oy = HVec3_y(GeoRay_origin(ray));
+    var oz = HVec3_z(GeoRay_origin(ray));
+    var dx = HVec3_x(GeoRay_direction(ray));
+    var dy = HVec3_y(GeoRay_direction(ray));
+    var dz = HVec3_z(GeoRay_direction(ray));
+    var bmin_x = HVec3_x(GeoAabb_min(aabb));
+    var bmin_y = HVec3_y(GeoAabb_min(aabb));
+    var bmin_z = HVec3_z(GeoAabb_min(aabb));
+    var bmax_x = HVec3_x(GeoAabb_max(aabb));
+    var bmax_y = HVec3_y(GeoAabb_max(aabb));
+    var bmax_z = HVec3_z(GeoAabb_max(aabb));
+
+    var t_min = _GEO_F64_NEG_INF;
+    var t_max = _GEO_F64_POS_INF;
+
+    # X slab
+    if (f64_lt(f64_abs(dx), EPSILON_F64) == 1) {
+        if (f64_lt(ox, bmin_x) == 1) { return 0; }
+        if (f64_gt(ox, bmax_x) == 1) { return 0; }
+    } else {
+        var inv_d = f64_div(F64_ONE, dx);
+        var t1 = f64_mul(f64_sub(bmin_x, ox), inv_d);
+        var t2 = f64_mul(f64_sub(bmax_x, ox), inv_d);
+        if (f64_gt(t1, t2) == 1) {
+            var tmp = t1; t1 = t2; t2 = tmp;
+        }
+        t_min = f64_max(t_min, t1);
+        t_max = f64_min(t_max, t2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    }
+
+    # Y slab
+    if (f64_lt(f64_abs(dy), EPSILON_F64) == 1) {
+        if (f64_lt(oy, bmin_y) == 1) { return 0; }
+        if (f64_gt(oy, bmax_y) == 1) { return 0; }
+    } else {
+        var inv_d = f64_div(F64_ONE, dy);
+        var t1 = f64_mul(f64_sub(bmin_y, oy), inv_d);
+        var t2 = f64_mul(f64_sub(bmax_y, oy), inv_d);
+        if (f64_gt(t1, t2) == 1) {
+            var tmp = t1; t1 = t2; t2 = tmp;
+        }
+        t_min = f64_max(t_min, t1);
+        t_max = f64_min(t_max, t2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    }
+
+    # Z slab
+    if (f64_lt(f64_abs(dz), EPSILON_F64) == 1) {
+        if (f64_lt(oz, bmin_z) == 1) { return 0; }
+        if (f64_gt(oz, bmax_z) == 1) { return 0; }
+    } else {
+        var inv_d = f64_div(F64_ONE, dz);
+        var t1 = f64_mul(f64_sub(bmin_z, oz), inv_d);
+        var t2 = f64_mul(f64_sub(bmax_z, oz), inv_d);
+        if (f64_gt(t1, t2) == 1) {
+            var tmp = t1; t1 = t2; t2 = tmp;
+        }
+        t_min = f64_max(t_min, t1);
+        t_max = f64_min(t_max, t2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    }
+
+    if (f64_lt(t_min, 0) != 1) { return t_min; }
+    if (f64_lt(t_max, 0) != 1) { return t_max; }
+    return 0;
+}
+
+# Ray-triangle intersection (Moller-Trumbore algorithm)
+fn geo_ray_triangle(ray, tri) {
+    var edge1 = hvec3_sub(GeoTriangle_v1(tri), GeoTriangle_v0(tri));
+    var edge2 = hvec3_sub(GeoTriangle_v2(tri), GeoTriangle_v0(tri));
+    var h = hvec3_cross(GeoRay_direction(ray), edge2);
+    var a = hvec3_dot(edge1, h);
+
+    if (f64_lt(f64_abs(a), EPSILON_F64) == 1) { return 0; }
+
+    var f = f64_div(F64_ONE, a);
+    var s = hvec3_sub(GeoRay_origin(ray), GeoTriangle_v0(tri));
+    var u = f64_mul(f, hvec3_dot(s, h));
+
+    if (f64_lt(u, 0) == 1) { return 0; }
+    if (f64_gt(u, F64_ONE) == 1) { return 0; }
+
+    var q = hvec3_cross(s, edge1);
+    var v = f64_mul(f, hvec3_dot(GeoRay_direction(ray), q));
+
+    if (f64_lt(v, 0) == 1) { return 0; }
+    if (f64_gt(f64_add(u, v), F64_ONE) == 1) { return 0; }
+
+    var t = f64_mul(f, hvec3_dot(edge2, q));
+    if (f64_lt(t, 0) == 1) { return 0; }
+    return t;
+}
+
+# Ray-OBB intersection (slab test in OBB local space)
+fn geo_ray_obb(ray, obb) {
+    var d = hvec3_sub(GeoObb_center(obb), GeoRay_origin(ray));
+    var axes = geo_obb_axes(obb);
+    var he = GeoObb_half_extents(obb);
+
+    var t_min = _GEO_F64_NEG_INF;
+    var t_max = _GEO_F64_POS_INF;
+
+    # Axis 0
+    var ax0 = load64(axes);
+    var he0 = HVec3_x(he);
+    var e0 = hvec3_dot(ax0, d);
+    var f0 = hvec3_dot(ax0, GeoRay_direction(ray));
+    if (f64_gt(f64_abs(f0), EPSILON_F64) == 1) {
+        var inv_f = f64_div(F64_ONE, f0);
+        var t1 = f64_mul(f64_sub(e0, he0), inv_f);
+        var t2 = f64_mul(f64_add(e0, he0), inv_f);
+        if (f64_gt(t1, t2) == 1) { var tmp = t1; t1 = t2; t2 = tmp; }
+        t_min = f64_max(t_min, t1);
+        t_max = f64_min(t_max, t2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    } else {
+        # Ray parallel to slab — check if origin is outside
+        # Rust: (-e - he) > 0 || (-e + he) < 0
+        var neg_e0 = f64_neg(e0);
+        if (f64_gt(f64_sub(neg_e0, he0), 0) == 1) { return 0; }
+        if (f64_lt(f64_add(neg_e0, he0), 0) == 1) { return 0; }
+    }
+
+    # Axis 1
+    var ax1 = load64(axes + 8);
+    var he1 = HVec3_y(he);
+    var e1 = hvec3_dot(ax1, d);
+    var f1 = hvec3_dot(ax1, GeoRay_direction(ray));
+    if (f64_gt(f64_abs(f1), EPSILON_F64) == 1) {
+        var inv_f = f64_div(F64_ONE, f1);
+        var t1 = f64_mul(f64_sub(e1, he1), inv_f);
+        var t2 = f64_mul(f64_add(e1, he1), inv_f);
+        if (f64_gt(t1, t2) == 1) { var tmp = t1; t1 = t2; t2 = tmp; }
+        t_min = f64_max(t_min, t1);
+        t_max = f64_min(t_max, t2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    } else {
+        var neg_e1 = f64_neg(e1);
+        if (f64_gt(f64_sub(neg_e1, he1), 0) == 1) { return 0; }
+        if (f64_lt(f64_add(neg_e1, he1), 0) == 1) { return 0; }
+    }
+
+    # Axis 2
+    var ax2 = load64(axes + 16);
+    var he2 = HVec3_z(he);
+    var e2 = hvec3_dot(ax2, d);
+    var f2 = hvec3_dot(ax2, GeoRay_direction(ray));
+    if (f64_gt(f64_abs(f2), EPSILON_F64) == 1) {
+        var inv_f = f64_div(F64_ONE, f2);
+        var t1 = f64_mul(f64_sub(e2, he2), inv_f);
+        var t2 = f64_mul(f64_add(e2, he2), inv_f);
+        if (f64_gt(t1, t2) == 1) { var tmp = t1; t1 = t2; t2 = tmp; }
+        t_min = f64_max(t_min, t1);
+        t_max = f64_min(t_max, t2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    } else {
+        var neg_e2 = f64_neg(e2);
+        if (f64_gt(f64_sub(neg_e2, he2), 0) == 1) { return 0; }
+        if (f64_lt(f64_add(neg_e2, he2), 0) == 1) { return 0; }
+    }
+
+    if (f64_lt(t_min, 0) != 1) { return t_min; }
+    if (f64_lt(t_max, 0) != 1) { return t_max; }
+    return 0;
+}
+
+# Ray-capsule intersection
+fn geo_ray_capsule(ray, capsule) {
+    var ab = hvec3_sub(GeoCapsule_end(capsule), GeoCapsule_start(capsule));
+    var ab_len_sq = hvec3_dot(ab, ab);
+
+    # Degenerate capsule: just a sphere
+    if (f64_lt(ab_len_sq, EPSILON_F64) == 1) {
+        var sph = geo_sphere_new(GeoCapsule_start(capsule), GeoCapsule_radius(capsule));
+        return geo_ray_sphere(ray, sph);
+    }
+
+    # Closest approach of ray to segment axis (infinite cylinder test)
+    var ao = hvec3_sub(GeoRay_origin(ray), GeoCapsule_start(capsule));
+    var d_par = f64_div(hvec3_dot(GeoRay_direction(ray), ab), ab_len_sq);
+    var o_par = f64_div(hvec3_dot(ao, ab), ab_len_sq);
+
+    var d_perp = hvec3_sub(GeoRay_direction(ray), hvec3_scale(ab, d_par));
+    var o_perp = hvec3_sub(ao, hvec3_scale(ab, o_par));
+
+    var a = hvec3_dot(d_perp, d_perp);
+    var b = f64_mul(F64_TWO, hvec3_dot(d_perp, o_perp));
+    var r = GeoCapsule_radius(capsule);
+    var c = f64_sub(hvec3_dot(o_perp, o_perp), f64_mul(r, r));
+
+    var disc = f64_sub(f64_mul(b, b), f64_mul(_GEO_F64_FOUR, f64_mul(a, c)));
+
+    # If cylinder misses, try sphere caps
+    if (f64_lt(disc, 0) == 1) {
+        var s1 = geo_sphere_new(GeoCapsule_start(capsule), r);
+        var s2 = geo_sphere_new(GeoCapsule_end(capsule), r);
+        var t1 = geo_ray_sphere(ray, s1);
+        var t2 = geo_ray_sphere(ray, s2);
+        if (t1 == 0) { return t2; }
+        if (t2 == 0) { return t1; }
+        return f64_min(t1, t2);
+    }
+
+    var inv_2a = f64_div(F64_HALF, a);
+    var sqrt_disc = f64_sqrt(disc);
+    var cyl_t1 = f64_mul(f64_sub(f64_neg(b), sqrt_disc), inv_2a);
+    var cyl_t2 = f64_mul(f64_add(f64_neg(b), sqrt_disc), inv_2a);
+
+    var best = 0;
+
+    # Check cylinder hit at cyl_t1
+    if (f64_lt(cyl_t1, 0) != 1) {
+        var p = geo_ray_at(ray, cyl_t1);
+        var proj = f64_div(hvec3_dot(hvec3_sub(p, GeoCapsule_start(capsule)), ab), ab_len_sq);
+        if (f64_lt(proj, 0) != 1) {
+            if (f64_gt(proj, F64_ONE) != 1) {
+                best = cyl_t1;
+            }
+        }
+    }
+
+    # Check cylinder hit at cyl_t2
+    if (f64_lt(cyl_t2, 0) != 1) {
+        var p = geo_ray_at(ray, cyl_t2);
+        var proj = f64_div(hvec3_dot(hvec3_sub(p, GeoCapsule_start(capsule)), ab), ab_len_sq);
+        if (f64_lt(proj, 0) != 1) {
+            if (f64_gt(proj, F64_ONE) != 1) {
+                if (best == 0) {
+                    best = cyl_t2;
+                } else {
+                    best = f64_min(best, cyl_t2);
+                }
+            }
+        }
+    }
+
+    # Check hemisphere caps
+    var s1 = geo_sphere_new(GeoCapsule_start(capsule), r);
+    var s2 = geo_sphere_new(GeoCapsule_end(capsule), r);
+
+    var cap_t1 = geo_ray_sphere(ray, s1);
+    if (cap_t1 != 0) {
+        var p = geo_ray_at(ray, cap_t1);
+        var dot_ab = hvec3_dot(hvec3_sub(p, GeoCapsule_start(capsule)), ab);
+        # Start cap: accept if projection <= 0 (behind start)
+        if (f64_gt(dot_ab, 0) != 1) {
+            if (best == 0) {
+                best = cap_t1;
+            } else {
+                best = f64_min(best, cap_t1);
+            }
+        }
+    }
+
+    var cap_t2 = geo_ray_sphere(ray, s2);
+    if (cap_t2 != 0) {
+        var p = geo_ray_at(ray, cap_t2);
+        var dot_ab = hvec3_dot(hvec3_sub(p, GeoCapsule_end(capsule)), ab);
+        # End cap: accept if projection >= 0 (beyond end)
+        if (f64_lt(dot_ab, 0) != 1) {
+            if (best == 0) {
+                best = cap_t2;
+            } else {
+                best = f64_min(best, cap_t2);
+            }
+        }
+    }
+
+    return best;
+}
+
+# ================================================================
+# Primitive overlap tests
+# ================================================================
+
+# AABB-AABB overlap test. Returns 1 if overlapping, 0 otherwise.
+fn geo_aabb_aabb(a, b) {
+    var a_min = GeoAabb_min(a);
+    var a_max = GeoAabb_max(a);
+    var b_min = GeoAabb_min(b);
+    var b_max = GeoAabb_max(b);
+
+    # a.min <= b.max && b.min <= a.max on all 3 axes
+    if (f64_gt(HVec3_x(a_min), HVec3_x(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_y(a_min), HVec3_y(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_z(a_min), HVec3_z(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_x(b_min), HVec3_x(a_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_y(b_min), HVec3_y(a_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_z(b_min), HVec3_z(a_max)) == 1) { return 0; }
+    return 1;
+}
+
+# Sphere-sphere overlap test. Returns 1 if overlapping, 0 otherwise.
+fn geo_sphere_sphere(a, b) {
+    var r_sum = f64_add(GeoSphere_radius(a), GeoSphere_radius(b));
+    var dist_sq = hvec3_length_sq(hvec3_sub(GeoSphere_center(a), GeoSphere_center(b)));
+    if (f64_gt(dist_sq, f64_mul(r_sum, r_sum)) == 1) { return 0; }
+    return 1;
+}
+
+# ================================================================
+# Closest point queries
+# ================================================================
+
+# Closest point on a plane to a given point. Returns HVec3.
+fn geo_closest_point_on_plane(plane, point) {
+    var sd = geo_plane_signed_distance(plane, point);
+    return hvec3_sub(point, hvec3_scale(GeoPlane_normal(plane), sd));
+}
+
+# Closest point on a sphere surface to a given point. Returns HVec3.
+# If point is at sphere center, returns center + (radius, 0, 0).
+fn geo_closest_point_on_sphere(sphere, point) {
+    var dir = hvec3_sub(point, GeoSphere_center(sphere));
+    var len = hvec3_length(dir);
+    if (f64_lt(len, EPSILON_F64) == 1) {
+        return hvec3_add(GeoSphere_center(sphere),
+                         hvec3_new(GeoSphere_radius(sphere), 0, 0));
+    }
+    return hvec3_add(GeoSphere_center(sphere),
+                     hvec3_scale(dir, f64_div(GeoSphere_radius(sphere), len)));
+}
+
+# Closest point on an AABB to a given point (clamp to box). Returns HVec3.
+fn geo_closest_point_on_aabb(aabb, point) {
+    var mn = GeoAabb_min(aabb);
+    var mx = GeoAabb_max(aabb);
+    return hvec3_new(
+        f64_clamp(HVec3_x(point), HVec3_x(mn), HVec3_x(mx)),
+        f64_clamp(HVec3_y(point), HVec3_y(mn), HVec3_y(mx)),
+        f64_clamp(HVec3_z(point), HVec3_z(mn), HVec3_z(mx))
+    );
+}
+
+# Closest point on a triangle to a given point (Voronoi region test). Returns HVec3.
+fn geo_closest_point_on_triangle(tri, point) {
+    var a = GeoTriangle_v0(tri);
+    var b = GeoTriangle_v1(tri);
+    var c = GeoTriangle_v2(tri);
+    var ab = hvec3_sub(b, a);
+    var ac = hvec3_sub(c, a);
+    var ap = hvec3_sub(point, a);
+
+    var d1 = hvec3_dot(ab, ap);
+    var d2 = hvec3_dot(ac, ap);
+    # Vertex A region
+    if (f64_gt(d1, 0) != 1) {
+        if (f64_gt(d2, 0) != 1) {
+            return a;
+        }
+    }
+
+    var bp = hvec3_sub(point, b);
+    var d3 = hvec3_dot(ab, bp);
+    var d4 = hvec3_dot(ac, bp);
+    # Vertex B region
+    if (f64_lt(d3, 0) != 1) {
+        if (f64_gt(d4, d3) != 1) {
+            return b;
+        }
+    }
+
+    # Edge AB
+    var vc = f64_sub(f64_mul(d1, d4), f64_mul(d3, d2));
+    if (f64_gt(vc, 0) != 1) {
+        if (f64_lt(d1, 0) != 1) {
+            if (f64_gt(d3, 0) != 1) {
+                var v = f64_div(d1, f64_sub(d1, d3));
+                return hvec3_add(a, hvec3_scale(ab, v));
+            }
+        }
+    }
+
+    var cp = hvec3_sub(point, c);
+    var d5 = hvec3_dot(ab, cp);
+    var d6 = hvec3_dot(ac, cp);
+    # Vertex C region
+    if (f64_lt(d6, 0) != 1) {
+        if (f64_gt(d5, d6) != 1) {
+            return c;
+        }
+    }
+
+    # Edge AC
+    var vb = f64_sub(f64_mul(d5, d2), f64_mul(d1, d6));
+    if (f64_gt(vb, 0) != 1) {
+        if (f64_lt(d2, 0) != 1) {
+            if (f64_gt(d6, 0) != 1) {
+                var w = f64_div(d2, f64_sub(d2, d6));
+                return hvec3_add(a, hvec3_scale(ac, w));
+            }
+        }
+    }
+
+    # Edge BC
+    var va = f64_sub(f64_mul(d3, d6), f64_mul(d5, d4));
+    if (f64_gt(va, 0) != 1) {
+        var d4_d3 = f64_sub(d4, d3);
+        var d5_d6 = f64_sub(d5, d6);
+        if (f64_lt(d4_d3, 0) != 1) {
+            if (f64_lt(d5_d6, 0) != 1) {
+                var w = f64_div(d4_d3, f64_add(d4_d3, d5_d6));
+                return hvec3_add(b, hvec3_scale(hvec3_sub(c, b), w));
+            }
+        }
+    }
+
+    # Interior
+    var denom = f64_div(F64_ONE, f64_add(f64_add(va, vb), vc));
+    var v = f64_mul(vb, denom);
+    var w = f64_mul(vc, denom);
+    return hvec3_add(a, hvec3_add(hvec3_scale(ab, v), hvec3_scale(ac, w)));
+}
+
+# Barycentric coordinates of a point projected onto a triangle.
+# Returns an HVec3 where x=u, y=v, z=w such that point ~ u*v0 + v*v1 + w*v2.
+fn geo_barycentric_coords(tri, point) {
+    var v0 = hvec3_sub(GeoTriangle_v1(tri), GeoTriangle_v0(tri));
+    var v1 = hvec3_sub(GeoTriangle_v2(tri), GeoTriangle_v0(tri));
+    var v2 = hvec3_sub(point, GeoTriangle_v0(tri));
+
+    var d00 = hvec3_dot(v0, v0);
+    var d01 = hvec3_dot(v0, v1);
+    var d11 = hvec3_dot(v1, v1);
+    var d20 = hvec3_dot(v2, v0);
+    var d21 = hvec3_dot(v2, v1);
+
+    var denom = f64_sub(f64_mul(d00, d11), f64_mul(d01, d01));
+    if (f64_lt(f64_abs(denom), EPSILON_F64) == 1) {
+        # Degenerate triangle — return centroid weights
+        return hvec3_new(_GEO_F64_THIRD, _GEO_F64_THIRD, _GEO_F64_THIRD);
+    }
+    var inv_denom = f64_div(F64_ONE, denom);
+    var v = f64_mul(f64_sub(f64_mul(d11, d20), f64_mul(d01, d21)), inv_denom);
+    var w = f64_mul(f64_sub(f64_mul(d00, d21), f64_mul(d01, d20)), inv_denom);
+    var u = f64_sub(F64_ONE, f64_add(v, w));
+    return hvec3_new(u, v, w);
+}

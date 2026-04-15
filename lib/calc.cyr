@@ -1,0 +1,442 @@
+# calc.cyr — calculus, interpolation, easing, noise
+# Usage: include "lib/calc.cyr"
+# Requires: math.cyr, f64_util.cyr, fnptr.cyr, vec2.cyr, vec3.cyr, error.cyr
+
+# ================================================================
+# CONSTANTS (f64 bit patterns)
+# ================================================================
+
+var F64_THREE  = 0x4008_0000_0000_0000;  # 3.0
+var F64_FOUR   = 0x4010_0000_0000_0000;  # 4.0
+var F64_FIVE   = 0x4014_0000_0000_0000;  # 5.0
+var F64_SIX    = 0x4018_0000_0000_0000;  # 6.0
+var F64_TEN    = 0x4024_0000_0000_0000;  # 10.0
+var F64_FIFTEEN = 0x402E_0000_0000_0000; # 15.0
+
+# ================================================================
+# 1. BASIC CALCULUS
+# ================================================================
+
+# Numerical derivative via central difference: (f(x+h) - f(x-h)) / (2h)
+# f: function pointer (f64 -> f64), x: f64, h: f64
+fn calc_derivative(f, x, h) {
+    var xph = f64_add(x, h);
+    var xmh = f64_sub(x, h);
+    var fph = fncall1(f, xph);
+    var fmh = fncall1(f, xmh);
+    return f64_div(f64_sub(fph, fmh), f64_mul(F64_TWO, h));
+}
+
+# Trapezoidal rule integration.
+# f: function pointer (f64 -> f64), a/b: interval bounds (f64),
+# steps: integer count, out: pointer to store f64 result.
+# Returns 0 on success, ERR_ZERO_STEPS if steps == 0.
+fn calc_integral_trapez(f, a, b, steps, out) {
+    if (steps == 0) { return ERR_ZERO_STEPS; }
+    var h = f64_div(f64_sub(b, a), f64_from(steps));
+    var fa = fncall1(f, a);
+    var fb = fncall1(f, b);
+    var sum = f64_mul(F64_HALF, f64_add(fa, fb));
+    var i = 1;
+    while (i < steps) {
+        var xi = f64_add(a, f64_mul(f64_from(i), h));
+        sum = f64_add(sum, fncall1(f, xi));
+        i = i + 1;
+    }
+    store64(out, f64_mul(sum, h));
+    return ERR_NONE;
+}
+
+# Simpson's rule integration. steps is rounded up to even if odd.
+# f: function pointer (f64 -> f64), a/b: interval bounds (f64),
+# steps: integer count, out: pointer to store f64 result.
+# Returns 0 on success, ERR_ZERO_STEPS if steps == 0.
+fn calc_integral_simpson(f, a, b, steps, out) {
+    # Round up to even
+    if (steps % 2 == 1) { steps = steps + 1; }
+    if (steps == 0) { return ERR_ZERO_STEPS; }
+    var h = f64_div(f64_sub(b, a), f64_from(steps));
+    var fa = fncall1(f, a);
+    var fb = fncall1(f, b);
+    var sum = f64_add(fa, fb);
+    var comp = 0;  # Neumaier compensation (stored as f64 bits)
+
+    var i = 1;
+    while (i < steps) {
+        var xi = f64_add(a, f64_mul(f64_from(i), h));
+        var fxi = fncall1(f, xi);
+
+        # Odd indices get coefficient 4, even indices get 2
+        var coeff = F64_TWO;
+        if (i % 2 == 1) { coeff = F64_FOUR; }
+        var val = f64_mul(coeff, fxi);
+
+        # Neumaier compensated add
+        var t = f64_add(sum, val);
+        if (f64_lt(f64_abs(sum), f64_abs(val)) == 0) {
+            comp = f64_add(comp, f64_add(f64_sub(sum, t), val));
+        } else {
+            comp = f64_add(comp, f64_add(f64_sub(val, t), sum));
+        }
+        sum = t;
+
+        i = i + 1;
+    }
+
+    var total = f64_add(sum, comp);
+    store64(out, f64_div(f64_mul(total, h), F64_THREE));
+    return ERR_NONE;
+}
+
+# 5-point Gauss-Legendre quadrature over [a, b].
+# f: function pointer (f64 -> f64), a/b: interval bounds (f64).
+# Returns f64 result directly (cannot fail).
+fn calc_integral_gauss5(f, a, b) {
+    # Nodes on [-1, 1]
+    var n0 = 0xBFECFFF9D5E42E44;  # -0.906179845938664
+    var n1 = 0xBFE13F2B2EEBC6A3;  # -0.538469310105683
+    var n2 = 0;                     #  0.0
+    var n3 = 0x3FE13F2B2EEBC6A3;  #  0.538469310105683
+    var n4 = 0x3FECFFF9D5E42E44;  #  0.906179845938664
+
+    # Weights
+    var w0 = 0x3FCE537C5DFCDDEB;  # 0.236926885056189
+    var w1 = 0x3FDEA23F0E10AF15;  # 0.478628670499366
+    var w2 = 0x3FE2380B3B553DE3;  # 0.568888888888889
+    var w3 = 0x3FDEA23F0E10AF15;  # 0.478628670499366
+    var w4 = 0x3FCE537C5DFCDDEB;  # 0.236926885056189
+
+    var half = f64_mul(f64_sub(b, a), F64_HALF);
+    var mid = f64_mul(f64_add(a, b), F64_HALF);
+
+    var s0 = f64_mul(w0, fncall1(f, f64_add(mid, f64_mul(half, n0))));
+    var s1 = f64_mul(w1, fncall1(f, f64_add(mid, f64_mul(half, n1))));
+    var s2 = f64_mul(w2, fncall1(f, f64_add(mid, f64_mul(half, n2))));
+    var s3 = f64_mul(w3, fncall1(f, f64_add(mid, f64_mul(half, n3))));
+    var s4 = f64_mul(w4, fncall1(f, f64_add(mid, f64_mul(half, n4))));
+
+    var sum = f64_add(f64_add(f64_add(f64_add(s0, s1), s2), s3), s4);
+    return f64_mul(sum, half);
+}
+
+# ================================================================
+# 2. INTERPOLATION
+# ================================================================
+
+# Linear interpolation between two f64 values: a + (b - a) * t
+fn calc_lerp(a, b, t) {
+    return f64_add(a, f64_mul(f64_sub(b, a), t));
+}
+
+# Quadratic Bezier 2D: B(t) = (1-t)^2*p0 + 2(1-t)t*p1 + t^2*p2
+# p0, p1, p2: HVec2 pointers, t: f64
+# Returns: HVec2 pointer
+fn calc_bezier_quad_2d(p0, p1, p2, t) {
+    var u = f64_sub(F64_ONE, t);
+    var uu = f64_mul(u, u);
+    var tt = f64_mul(t, t);
+    var ut2 = f64_mul(F64_TWO, f64_mul(u, t));
+
+    # x = uu*p0.x + ut2*p1.x + tt*p2.x
+    var rx = f64_add(f64_add(
+        f64_mul(uu, HVec2_x(p0)),
+        f64_mul(ut2, HVec2_x(p1))),
+        f64_mul(tt, HVec2_x(p2)));
+
+    var ry = f64_add(f64_add(
+        f64_mul(uu, HVec2_y(p0)),
+        f64_mul(ut2, HVec2_y(p1))),
+        f64_mul(tt, HVec2_y(p2)));
+
+    return hvec2_new(rx, ry);
+}
+
+# Cubic Bezier 2D: B(t) = (1-t)^3*p0 + 3(1-t)^2*t*p1 + 3(1-t)*t^2*p2 + t^3*p3
+# p0..p3: HVec2 pointers, t: f64
+# Returns: HVec2 pointer
+fn calc_bezier_cubic_2d(p0, p1, p2, p3, t) {
+    var u = f64_sub(F64_ONE, t);
+    var uu = f64_mul(u, u);
+    var tt = f64_mul(t, t);
+    var uuu = f64_mul(uu, u);
+    var ttt = f64_mul(tt, t);
+    var uut3 = f64_mul(F64_THREE, f64_mul(uu, t));
+    var utt3 = f64_mul(F64_THREE, f64_mul(u, tt));
+
+    var rx = f64_add(f64_add(f64_add(
+        f64_mul(uuu, HVec2_x(p0)),
+        f64_mul(uut3, HVec2_x(p1))),
+        f64_mul(utt3, HVec2_x(p2))),
+        f64_mul(ttt, HVec2_x(p3)));
+
+    var ry = f64_add(f64_add(f64_add(
+        f64_mul(uuu, HVec2_y(p0)),
+        f64_mul(uut3, HVec2_y(p1))),
+        f64_mul(utt3, HVec2_y(p2))),
+        f64_mul(ttt, HVec2_y(p3)));
+
+    return hvec2_new(rx, ry);
+}
+
+# Cubic Bezier 3D: B(t) = (1-t)^3*p0 + 3(1-t)^2*t*p1 + 3(1-t)*t^2*p2 + t^3*p3
+# p0..p3: HVec3 pointers, t: f64
+# Returns: HVec3 pointer
+fn calc_bezier_cubic_3d(p0, p1, p2, p3, t) {
+    var u = f64_sub(F64_ONE, t);
+    var uu = f64_mul(u, u);
+    var tt = f64_mul(t, t);
+    var uuu = f64_mul(uu, u);
+    var ttt = f64_mul(tt, t);
+    var uut3 = f64_mul(F64_THREE, f64_mul(uu, t));
+    var utt3 = f64_mul(F64_THREE, f64_mul(u, tt));
+
+    var rx = f64_add(f64_add(f64_add(
+        f64_mul(uuu, HVec3_x(p0)),
+        f64_mul(uut3, HVec3_x(p1))),
+        f64_mul(utt3, HVec3_x(p2))),
+        f64_mul(ttt, HVec3_x(p3)));
+
+    var ry = f64_add(f64_add(f64_add(
+        f64_mul(uuu, HVec3_y(p0)),
+        f64_mul(uut3, HVec3_y(p1))),
+        f64_mul(utt3, HVec3_y(p2))),
+        f64_mul(ttt, HVec3_y(p3)));
+
+    var rz = f64_add(f64_add(f64_add(
+        f64_mul(uuu, HVec3_z(p0)),
+        f64_mul(uut3, HVec3_z(p1))),
+        f64_mul(utt3, HVec3_z(p2))),
+        f64_mul(ttt, HVec3_z(p3)));
+
+    return hvec3_new(rx, ry, rz);
+}
+
+# Catmull-Rom spline segment at parameter t in [0, 1].
+# p0..p3: HVec3 pointers (curve interpolates p1 to p2).
+# t: f64. Returns: HVec3 pointer.
+# Uses standard matrix form with alpha = 0.5:
+#   q(t) = 0.5 * [(2*p1) + (-p0+p2)*t + (2*p0 - 5*p1 + 4*p2 - p3)*t^2 + (-p0 + 3*p1 - 3*p2 + p3)*t^3]
+fn calc_catmull_rom(p0, p1, p2, p3, t) {
+    var t2 = f64_mul(t, t);
+    var t3 = f64_mul(t2, t);
+
+    # Compute per-component: x, y, z
+    var p0x = HVec3_x(p0); var p1x = HVec3_x(p1);
+    var p2x = HVec3_x(p2); var p3x = HVec3_x(p3);
+
+    var p0y = HVec3_y(p0); var p1y = HVec3_y(p1);
+    var p2y = HVec3_y(p2); var p3y = HVec3_y(p3);
+
+    var p0z = HVec3_z(p0); var p1z = HVec3_z(p1);
+    var p2z = HVec3_z(p2); var p3z = HVec3_z(p3);
+
+    # Helper: catmull_rom_component(a, b, c, d, t, t2, t3)
+    # 0.5 * [2b + (-a+c)*t + (2a - 5b + 4c - d)*t2 + (-a + 3b - 3c + d)*t3]
+    var rx = _cmr_comp(p0x, p1x, p2x, p3x, t, t2, t3);
+    var ry = _cmr_comp(p0y, p1y, p2y, p3y, t, t2, t3);
+    var rz = _cmr_comp(p0z, p1z, p2z, p3z, t, t2, t3);
+
+    return hvec3_new(rx, ry, rz);
+}
+
+# Internal: Catmull-Rom per-component
+fn _cmr_comp(a, b, c, d, t, t2, t3) {
+    # term0 = 2*b
+    var term0 = f64_mul(F64_TWO, b);
+    # term1 = (-a + c) * t
+    var term1 = f64_mul(f64_add(f64_neg(a), c), t);
+    # term2 = (2a - 5b + 4c - d) * t2
+    var coeff2 = f64_sub(f64_add(f64_sub(f64_mul(F64_TWO, a), f64_mul(F64_FIVE, b)),
+                                  f64_mul(F64_FOUR, c)), d);
+    var term2 = f64_mul(coeff2, t2);
+    # term3 = (-a + 3b - 3c + d) * t3
+    var coeff3 = f64_add(f64_sub(f64_add(f64_neg(a), f64_mul(F64_THREE, b)),
+                                  f64_mul(F64_THREE, c)), d);
+    var term3 = f64_mul(coeff3, t3);
+
+    return f64_mul(F64_HALF, f64_add(f64_add(f64_add(term0, term1), term2), term3));
+}
+
+# ================================================================
+# 3. EASING FUNCTIONS
+# ================================================================
+
+# Quadratic ease-in: t^2
+fn ease_in(t) {
+    return f64_mul(t, t);
+}
+
+# Quadratic ease-out: t*(2 - t)
+fn ease_out(t) {
+    return f64_mul(t, f64_sub(F64_TWO, t));
+}
+
+# Quadratic ease-in-out (smoothstep): t^2 * (3 - 2t)
+fn ease_in_out(t) {
+    return f64_mul(f64_mul(t, t), f64_sub(F64_THREE, f64_mul(F64_TWO, t)));
+}
+
+# Cubic ease-in: t^3
+fn ease_in_cubic(t) {
+    return f64_mul(f64_mul(t, t), t);
+}
+
+# Cubic ease-out: 1 - (1-t)^3
+fn ease_out_cubic(t) {
+    var u = f64_sub(F64_ONE, t);
+    return f64_sub(F64_ONE, f64_mul(f64_mul(u, u), u));
+}
+
+# Smootherstep (quintic): t^3 * (t*(6t - 15) + 10)
+# C2 continuous, zero 1st and 2nd derivatives at endpoints.
+fn ease_in_out_smooth(t) {
+    var t3 = f64_mul(f64_mul(t, t), t);
+    var inner = f64_add(f64_mul(t, f64_sub(f64_mul(F64_SIX, t), F64_FIFTEEN)), F64_TEN);
+    return f64_mul(t3, inner);
+}
+
+# ================================================================
+# 4. NOISE
+# ================================================================
+
+# Perlin permutation table (256 entries, doubled for wrapping).
+# Stored as a flat allocation of 512 bytes (u8 values).
+var _PERM_TABLE = 0;
+
+fn _perm_init() {
+    if (_PERM_TABLE != 0) { return 0; }
+    _PERM_TABLE = alloc(512);
+
+    # The standard Perlin permutation (Ken Perlin's reference table)
+    var base = alloc(256);
+    _perm_store_block(base, 0,
+        151, 160, 137, 91, 90, 15, 131, 13, 201, 95, 96, 53, 194, 233, 7, 225);
+    _perm_store_block(base, 16,
+        140, 36, 103, 30, 69, 142, 8, 99, 37, 240, 21, 10, 23, 190, 6, 148);
+    _perm_store_block(base, 32,
+        247, 120, 234, 75, 0, 26, 197, 62, 94, 252, 219, 203, 117, 35, 11, 32);
+    _perm_store_block(base, 48,
+        57, 177, 33, 88, 237, 149, 56, 87, 174, 20, 125, 136, 171, 168, 68, 175);
+    _perm_store_block(base, 64,
+        74, 165, 71, 134, 139, 48, 27, 166, 77, 146, 158, 231, 83, 111, 229, 122);
+    _perm_store_block(base, 80,
+        60, 211, 133, 230, 220, 105, 92, 41, 55, 46, 245, 40, 244, 102, 143, 54);
+    _perm_store_block(base, 96,
+        65, 25, 63, 161, 1, 216, 80, 73, 209, 76, 132, 187, 208, 89, 18, 169);
+    _perm_store_block(base, 112,
+        200, 196, 135, 130, 116, 188, 159, 86, 164, 100, 109, 198, 173, 186, 3, 64);
+    _perm_store_block(base, 128,
+        52, 217, 226, 250, 124, 123, 5, 202, 38, 147, 118, 126, 255, 82, 85, 212);
+    _perm_store_block(base, 144,
+        207, 206, 59, 227, 47, 16, 58, 17, 182, 189, 28, 42, 223, 183, 170, 213);
+    _perm_store_block(base, 160,
+        119, 248, 152, 2, 44, 154, 163, 70, 221, 153, 101, 155, 167, 43, 172, 9);
+    _perm_store_block(base, 176,
+        129, 22, 39, 253, 19, 98, 108, 110, 79, 113, 224, 232, 178, 185, 112, 104);
+    _perm_store_block(base, 192,
+        218, 246, 97, 228, 251, 34, 242, 193, 238, 210, 144, 12, 191, 179, 162, 241);
+    _perm_store_block(base, 208,
+        81, 51, 145, 235, 249, 14, 239, 107, 49, 192, 214, 31, 181, 199, 106, 157);
+    _perm_store_block(base, 224,
+        184, 84, 204, 176, 115, 121, 50, 45, 127, 4, 150, 254, 138, 236, 205, 93);
+    _perm_store_block(base, 240,
+        222, 114, 67, 29, 24, 72, 243, 141, 128, 195, 78, 66, 215, 61, 156, 180);
+
+    # Double the table for wrapping: perm[i] = base[i & 255]
+    var i = 0;
+    while (i < 512) {
+        store8(_PERM_TABLE + i, load8(base + (i & 255)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Store 16 bytes into base+offset
+fn _perm_store_block(base, off, a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p) {
+    store8(base + off, a);      store8(base + off + 1, b);
+    store8(base + off + 2, c);  store8(base + off + 3, d);
+    store8(base + off + 4, e);  store8(base + off + 5, f);
+    store8(base + off + 6, g);  store8(base + off + 7, h);
+    store8(base + off + 8, i);  store8(base + off + 9, j);
+    store8(base + off + 10, k); store8(base + off + 11, l);
+    store8(base + off + 12, m); store8(base + off + 13, n);
+    store8(base + off + 14, o); store8(base + off + 15, p);
+    return 0;
+}
+
+# Perm table lookup (returns integer 0-255)
+fn _perm(idx) {
+    return load8(_PERM_TABLE + (idx & 511));
+}
+
+# Fade curve: 6t^5 - 15t^4 + 10t^3
+fn _noise_fade(t) {
+    return f64_mul(f64_mul(f64_mul(t, t), t),
+        f64_add(f64_mul(t, f64_sub(f64_mul(F64_SIX, t), F64_FIFTEEN)), F64_TEN));
+}
+
+# 2D gradient: select one of 4 gradient directions based on hash & 3
+fn _grad2(hash, x, y) {
+    var h = hash & 3;
+    if (h == 0) { return f64_add(x, y); }
+    if (h == 1) { return f64_add(f64_neg(x), y); }
+    if (h == 2) { return f64_sub(x, y); }
+    return f64_sub(f64_neg(x), y);
+}
+
+# 2D Perlin noise. Returns f64 in approximately [-1, 1].
+fn perlin_2d(x, y) {
+    _perm_init();
+
+    # Grid cell coordinates (integer, masked to 0-255)
+    var xf = f64_floor(x);
+    var yf = f64_floor(y);
+    var xi = f64_to(xf) & 255;
+    var yi = f64_to(yf) & 255;
+
+    # Fractional position within cell
+    var xfr = f64_sub(x, xf);
+    var yfr = f64_sub(y, yf);
+
+    # Fade curves
+    var u = _noise_fade(xfr);
+    var v = _noise_fade(yfr);
+
+    # Hash the four corners
+    var aa = _perm(_perm(xi) + yi);
+    var ab = _perm(_perm(xi) + yi + 1);
+    var ba = _perm(_perm(xi + 1) + yi);
+    var bb = _perm(_perm(xi + 1) + yi + 1);
+
+    # Gradient dot products and bilinear interpolation
+    var x1 = calc_lerp(_grad2(aa, xfr, yfr),
+                       _grad2(ba, f64_sub(xfr, F64_ONE), yfr), u);
+    var x2 = calc_lerp(_grad2(ab, xfr, f64_sub(yfr, F64_ONE)),
+                       _grad2(bb, f64_sub(xfr, F64_ONE), f64_sub(yfr, F64_ONE)), u);
+    return calc_lerp(x1, x2, v);
+}
+
+# Fractional Brownian Motion (fBm) using 2D Perlin noise.
+# x, y: coordinates (f64), octaves: integer count,
+# freq: initial frequency (f64), amp: initial amplitude (f64),
+# persistence: amplitude multiplier per octave (f64, typically 0.5).
+# Returns: f64 noise value normalized to approximately [-1, 1].
+fn fbm_2d(x, y, octaves, freq, amp, persistence) {
+    var sum = 0;          # f64 accumulator (starts at 0.0)
+    var max_amp = 0;      # f64 normalization
+    var cur_freq = freq;
+    var cur_amp = amp;
+
+    var i = 0;
+    while (i < octaves) {
+        var nx = f64_mul(x, cur_freq);
+        var ny = f64_mul(y, cur_freq);
+        sum = f64_add(sum, f64_mul(cur_amp, perlin_2d(nx, ny)));
+        max_amp = f64_add(max_amp, cur_amp);
+        cur_amp = f64_mul(cur_amp, persistence);
+        cur_freq = f64_mul(cur_freq, F64_TWO);
+        i = i + 1;
+    }
+
+    return f64_div(sum, max_amp);
+}

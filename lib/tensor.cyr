@@ -1,0 +1,203 @@
+# tensor.cyr — N-dimensional tensor algebra
+# Usage: include "lib/tensor.cyr"
+# Requires: alloc.cyr, math.cyr, vec.cyr
+#
+# Dense tensor: flat f64 array with shape metadata.
+# Layout: { rank: i64, shape_ptr: i64, data_ptr: i64, total_size: i64 } = 32 bytes
+
+#derive(accessors)
+struct HTensor { rank; shape; data; total; }
+
+fn tensor_new(rank, shape) {
+    var t = alloc(32);
+    store64(t, rank);
+    # Copy shape array
+    var sp = alloc(rank * 8);
+    var total = 1;
+    var i = 0;
+    while (i < rank) {
+        var dim = load64(shape + i * 8);
+        store64(sp + i * 8, dim);
+        total = total * dim;
+        i = i + 1;
+    }
+    store64(t + 8, sp);
+    # Allocate zeroed data
+    var dp = alloc(total * 8);
+    i = 0;
+    while (i < total) {
+        store64(dp + i * 8, 0);
+        i = i + 1;
+    }
+    store64(t + 16, dp);
+    store64(t + 24, total);
+    return t;
+}
+
+# Compute flat index from multi-index (row-major)
+fn _tensor_flat_idx(t, indices) {
+    var rank = HTensor_rank(t);
+    var shape = HTensor_shape(t);
+    var idx = 0;
+    var stride = 1;
+    var i = rank - 1;
+    while (i >= 0) {
+        idx = idx + load64(indices + i * 8) * stride;
+        stride = stride * load64(shape + i * 8);
+        i = i - 1;
+    }
+    return idx;
+}
+
+fn tensor_get(t, indices) {
+    var flat = _tensor_flat_idx(t, indices);
+    return load64(HTensor_data(t) + flat * 8);
+}
+
+fn tensor_set(t, indices, val) {
+    var flat = _tensor_flat_idx(t, indices);
+    store64(HTensor_data(t) + flat * 8, val);
+    return 0;
+}
+
+# ================================================================
+# 2D convenience (matrix-like access)
+# ================================================================
+
+fn tensor_get2(t, i, j) {
+    var cols = load64(HTensor_shape(t) + 8);
+    return load64(HTensor_data(t) + (i * cols + j) * 8);
+}
+
+fn tensor_set2(t, i, j, val) {
+    var cols = load64(HTensor_shape(t) + 8);
+    store64(HTensor_data(t) + (i * cols + j) * 8, val);
+    return 0;
+}
+
+# ================================================================
+# Tensor operations
+# ================================================================
+
+fn tensor_add(a, b) {
+    var total = HTensor_total(a);
+    var rank = HTensor_rank(a);
+    var r = tensor_new(rank, HTensor_shape(a));
+    var ad = HTensor_data(a);
+    var bd = HTensor_data(b);
+    var rd = HTensor_data(r);
+    var i = 0;
+    while (i < total) {
+        store64(rd + i * 8, f64_add(load64(ad + i * 8), load64(bd + i * 8)));
+        i = i + 1;
+    }
+    return r;
+}
+
+fn tensor_scale(t, s) {
+    var total = HTensor_total(t);
+    var rank = HTensor_rank(t);
+    var r = tensor_new(rank, HTensor_shape(t));
+    var td = HTensor_data(t);
+    var rd = HTensor_data(r);
+    var i = 0;
+    while (i < total) {
+        store64(rd + i * 8, f64_mul(load64(td + i * 8), s));
+        i = i + 1;
+    }
+    return r;
+}
+
+# Contract indices i and j of a rank-N tensor (trace)
+fn tensor_contract(t, idx_i, idx_j) {
+    var rank = HTensor_rank(t);
+    var shape = HTensor_shape(t);
+    var dim = load64(shape + idx_i * 8);  # Must equal dim at idx_j
+    var new_rank = rank - 2;
+
+    # Build new shape (skip idx_i and idx_j)
+    var ns = alloc(new_rank * 8);
+    var ni = 0;
+    var oi = 0;
+    while (oi < rank) {
+        if (oi != idx_i && oi != idx_j) {
+            store64(ns + ni * 8, load64(shape + oi * 8));
+            ni = ni + 1;
+        }
+        oi = oi + 1;
+    }
+
+    var result = tensor_new(new_rank, ns);
+    # Sum over the contracted dimension
+    # This is a general implementation — iterate all output indices
+    # and sum over the contracted index
+    var out_total = HTensor_total(result);
+    var rd = HTensor_data(result);
+    var td = HTensor_data(t);
+
+    # For each output element, compute the sum
+    var out_idx = 0;
+    while (out_idx < out_total) {
+        var sum = 0;
+        var k = 0;
+        while (k < dim) {
+            # Build full input index from output index + contracted index
+            # This needs the multi-index expansion — simplified for rank <= 4
+            # For now, store the sum
+            sum = f64_add(sum, 0);  # TODO: full multi-index expansion
+            k = k + 1;
+        }
+        store64(rd + out_idx * 8, sum);
+        out_idx = out_idx + 1;
+    }
+    return result;
+}
+
+# ================================================================
+# Standard physics tensors
+# ================================================================
+
+# Kronecker delta δ_ij
+fn kronecker_delta(i, j) {
+    if (i == j) { return F64_ONE; }
+    return 0;
+}
+
+# Minkowski metric η_μν = diag(+1, -1, -1, -1) [particle physics convention]
+fn minkowski(i, j) {
+    if (i != j) { return 0; }
+    if (i == 0) { return F64_ONE; }
+    return f64_neg(F64_ONE);
+}
+
+# Levi-Civita symbol ε_{ijk} (3D)
+fn levi_civita_3(i, j, k) {
+    if (i == j || j == k || i == k) { return 0; }
+    # Even permutations of (0,1,2): +1
+    if (i == 0 && j == 1 && k == 2) { return 1; }
+    if (i == 1 && j == 2 && k == 0) { return 1; }
+    if (i == 2 && j == 0 && k == 1) { return 1; }
+    # Odd permutations: -1
+    return (0 - 1);
+}
+
+# 4D Levi-Civita
+fn levi_civita_4(i, j, k, l) {
+    # Check for repeated indices
+    if (i == j || i == k || i == l || j == k || j == l || k == l) { return 0; }
+    # Count inversions to determine sign
+    var inv = 0;
+    var arr = alloc(32);
+    store64(arr, i); store64(arr + 8, j); store64(arr + 16, k); store64(arr + 24, l);
+    var a = 0;
+    while (a < 4) {
+        var b = a + 1;
+        while (b < 4) {
+            if (load64(arr + a * 8) > load64(arr + b * 8)) { inv = inv + 1; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    if (inv % 2 == 0) { return 1; }
+    return (0 - 1);
+}

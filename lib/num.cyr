@@ -1,0 +1,566 @@
+# num.cyr — numerical methods for hisab
+# Usage: include "lib/num.cyr"
+# Requires: alloc.cyr, vec.cyr, fnptr.cyr, math.cyr, f64_util.cyr, error.cyr
+#
+# Provides:
+#   Root finding:   num_newton, num_bisection
+#   FFT:            num_fft, num_ifft
+#   ODE:            num_rk4
+#   RNG:            pcg32_new, pcg32_next, pcg32_next_f64
+#   Number theory:  num_gcd, num_modpow, num_is_prime, num_sieve
+#   Summation:      num_kahan_sum, num_neumaier_sum
+#
+# All f64 values are bit patterns (IEEE 754). Integer arguments are raw i64.
+# Functions return 0 (ERR_NONE) on success, negative ERR_* on failure.
+# Results are written through out-param pointers.
+
+# ================================================================
+# Constants (f64 bit patterns)
+# ================================================================
+var _NUM_F64_ZERO     = 0;                           # 0.0
+var _NUM_F64_ONE      = 0x3FF0000000000000;          # 1.0
+var _NUM_F64_TWO      = 0x4000000000000000;          # 2.0
+var _NUM_F64_HALF     = 0x3FE0000000000000;          # 0.5
+var _NUM_F64_NEG_TWO_PI = 0xC01921FB54442D18;        # -2*pi
+var _NUM_F64_SIX      = 0x4018000000000000;          # 6.0
+var _NUM_F64_INV_2P32 = 0x3DF0000000000000;          # 2^-32 = 2.3283064365386963e-10
+
+# ================================================================
+# ROOT FINDING
+# ================================================================
+
+# Newton-Raphson root finding.
+# f, df: function pointers (f64) -> f64
+# x0, tol: f64 bit patterns
+# max_iter: integer
+# out: pointer, result f64 written here on success
+# Returns: 0 on success, ERR_NO_CONVERGENCE or ERR_DIVISION_BY_ZERO on failure
+fn num_newton(f, df, x0, tol, max_iter, out) {
+    var x = x0;
+    var i = 0;
+    while (i < max_iter) {
+        var fx = fncall1(f, x);
+        # Check |f(x)| < tol
+        if (f64_lt(f64_abs(fx), tol) == 1) {
+            store64(out, x);
+            return ERR_NONE;
+        }
+        var dfx = fncall1(df, x);
+        # Check derivative not zero
+        if (f64_lt(f64_abs(dfx), EPSILON_F64) == 1) {
+            return ERR_DIVISION_BY_ZERO;
+        }
+        # x = x - f(x)/f'(x)
+        x = f64_sub(x, f64_div(fx, dfx));
+        i = i + 1;
+    }
+    return ERR_NO_CONVERGENCE;
+}
+
+# Bisection root finding.
+# f: function pointer (f64) -> f64
+# a, b, tol: f64 bit patterns
+# max_iter: integer
+# out: pointer, result f64 written here on success
+# Returns: 0 on success, ERR_INVALID_INPUT if same sign
+fn num_bisection(f, a, b, tol, max_iter, out) {
+    var lo = a;
+    var hi = b;
+    var f_lo = fncall1(f, lo);
+    var f_hi = fncall1(f, hi);
+
+    # Check opposite signs: f_lo * f_hi > 0 means same sign
+    var product = f64_mul(f_lo, f_hi);
+    if (f64_gt(product, _NUM_F64_ZERO) == 1) {
+        return ERR_INVALID_INPUT;
+    }
+
+    # Ensure f(lo) < 0
+    if (f64_gt(f_lo, _NUM_F64_ZERO) == 1) {
+        var tmp = lo;
+        lo = hi;
+        hi = tmp;
+    }
+
+    var i = 0;
+    while (i < max_iter) {
+        var mid = f64_mul(f64_add(lo, hi), _NUM_F64_HALF);
+        var f_mid = fncall1(f, mid);
+
+        # Converged if |f(mid)| < tol or |hi - lo| < tol
+        if (f64_lt(f64_abs(f_mid), tol) == 1) {
+            store64(out, mid);
+            return ERR_NONE;
+        }
+        if (f64_lt(f64_abs(f64_sub(hi, lo)), tol) == 1) {
+            store64(out, mid);
+            return ERR_NONE;
+        }
+
+        if (f64_lt(f_mid, _NUM_F64_ZERO) == 1) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        i = i + 1;
+    }
+
+    # Return best estimate
+    store64(out, f64_mul(f64_add(lo, hi), _NUM_F64_HALF));
+    return ERR_NONE;
+}
+
+# ================================================================
+# FFT — Cooley-Tukey radix-2, in-place
+# ================================================================
+# Complex numbers stored as consecutive f64 pairs: [re0, im0, re1, im1, ...]
+# data: pointer to 2*n f64 values (each 8 bytes, so 16*n bytes total)
+# n: number of complex elements (must be power of 2)
+
+# Internal: check power of two
+fn _num_is_pow2(n) {
+    if (n <= 0) { return 0; }
+    if ((n & (n - 1)) == 0) { return 1; }
+    return 0;
+}
+
+# Internal: get real part of complex element i
+fn _num_cget_re(data, i) {
+    return load64(data + i * 16);
+}
+
+# Internal: get imag part of complex element i
+fn _num_cget_im(data, i) {
+    return load64(data + i * 16 + 8);
+}
+
+# Internal: set complex element i
+fn _num_cset(data, i, re, im) {
+    store64(data + i * 16, re);
+    store64(data + i * 16 + 8, im);
+    return 0;
+}
+
+# Internal: swap complex elements i and j
+fn _num_cswap(data, i, j) {
+    var re_i = _num_cget_re(data, i);
+    var im_i = _num_cget_im(data, i);
+    var re_j = _num_cget_re(data, j);
+    var im_j = _num_cget_im(data, j);
+    _num_cset(data, i, re_j, im_j);
+    _num_cset(data, j, re_i, im_i);
+    return 0;
+}
+
+# In-place Cooley-Tukey radix-2 FFT.
+# data: pointer to n complex numbers (2n f64 values, 16n bytes)
+# n: number of complex elements (must be power of 2)
+# Returns: 0 on success, ERR_INVALID_INPUT if n is not power of 2
+fn num_fft(data, n) {
+    if (n <= 1) { return ERR_NONE; }
+    if (_num_is_pow2(n) == 0) { return ERR_INVALID_INPUT; }
+
+    # Bit-reversal permutation
+    var j = 0;
+    var i = 1;
+    while (i < n) {
+        var bit = n >> 1;
+        while ((j & bit) != 0) {
+            j = j ^ bit;
+            bit = bit >> 1;
+        }
+        j = j ^ bit;
+        if (i < j) {
+            _num_cswap(data, i, j);
+        }
+        i = i + 1;
+    }
+
+    # Butterfly stages
+    var len = 2;
+    while (len <= n) {
+        var half = len >> 1;
+        # angle = -2*pi / len
+        var angle = f64_div(_NUM_F64_NEG_TWO_PI, f64_from(len));
+        var wn_re = f64_cos(angle);
+        var wn_im = f64_sin(angle);
+
+        var start = 0;
+        while (start < n) {
+            var w_re = _NUM_F64_ONE;
+            var w_im = _NUM_F64_ZERO;
+            var k = 0;
+            while (k < half) {
+                var idx_u = start + k;
+                var idx_t = start + k + half;
+
+                var u_re = _num_cget_re(data, idx_u);
+                var u_im = _num_cget_im(data, idx_u);
+                var d_re = _num_cget_re(data, idx_t);
+                var d_im = _num_cget_im(data, idx_t);
+
+                # t = w * data[start + k + half]
+                # (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+                var t_re = f64_sub(f64_mul(w_re, d_re), f64_mul(w_im, d_im));
+                var t_im = f64_add(f64_mul(w_re, d_im), f64_mul(w_im, d_re));
+
+                # data[start + k] = u + t
+                _num_cset(data, idx_u,
+                    f64_add(u_re, t_re),
+                    f64_add(u_im, t_im));
+
+                # data[start + k + half] = u - t
+                _num_cset(data, idx_t,
+                    f64_sub(u_re, t_re),
+                    f64_sub(u_im, t_im));
+
+                # w *= wn: (w_re + w_im*i) * (wn_re + wn_im*i)
+                var new_w_re = f64_sub(f64_mul(w_re, wn_re), f64_mul(w_im, wn_im));
+                var new_w_im = f64_add(f64_mul(w_re, wn_im), f64_mul(w_im, wn_re));
+                w_re = new_w_re;
+                w_im = new_w_im;
+
+                k = k + 1;
+            }
+            start = start + len;
+        }
+        len = len << 1;
+    }
+    return ERR_NONE;
+}
+
+# In-place inverse FFT.
+# data: pointer to n complex numbers (2n f64 values)
+# n: number of complex elements (must be power of 2)
+# Returns: 0 on success, ERR_INVALID_INPUT if n is not power of 2
+fn num_ifft(data, n) {
+    # Conjugate all elements
+    var i = 0;
+    while (i < n) {
+        var im = _num_cget_im(data, i);
+        store64(data + i * 16 + 8, f64_neg(im));
+        i = i + 1;
+    }
+
+    # Forward FFT
+    var err = num_fft(data, n);
+    if (err != 0) { return err; }
+
+    # Conjugate and scale by 1/n
+    var scale = f64_div(_NUM_F64_ONE, f64_from(n));
+    i = 0;
+    while (i < n) {
+        var re = _num_cget_re(data, i);
+        var im2 = _num_cget_im(data, i);
+        _num_cset(data, i,
+            f64_mul(re, scale),
+            f64_mul(f64_neg(im2), scale));
+        i = i + 1;
+    }
+    return ERR_NONE;
+}
+
+# ================================================================
+# ODE SOLVERS
+# ================================================================
+
+# Single RK4 step.
+# f: function pointer (t: f64, y: f64) -> f64 (dy/dt)
+# t: current time (f64)
+# y: current state (f64)
+# dt: time step (f64)
+# Returns: new y value (f64)
+fn num_rk4(f, t, y, dt) {
+    var half_dt = f64_mul(dt, _NUM_F64_HALF);
+    var t_half = f64_add(t, half_dt);
+    var t_full = f64_add(t, dt);
+
+    var k1 = fncall2(f, t, y);
+    var k2 = fncall2(f, t_half, f64_add(y, f64_mul(half_dt, k1)));
+    var k3 = fncall2(f, t_half, f64_add(y, f64_mul(half_dt, k2)));
+    var k4 = fncall2(f, t_full, f64_add(y, f64_mul(dt, k3)));
+
+    # y_new = y + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+    var two = _NUM_F64_TWO;
+    var sum = f64_add(k1, f64_add(f64_mul(two, k2), f64_add(f64_mul(two, k3), k4)));
+    var dt_over_6 = f64_div(dt, _NUM_F64_SIX);
+    return f64_add(y, f64_mul(dt_over_6, sum));
+}
+
+# ================================================================
+# RANDOM NUMBER GENERATION — PCG32
+# ================================================================
+# PCG32 state layout: { state: i64, inc: i64 } = 16 bytes
+# PCG multiplier: 6364136223846793005
+
+var _PCG32_MULT = 6364136223846793005;
+
+# Create a new PCG32 RNG with given seed.
+# Uses stream=1 (inc = (1 << 1) | 1 = 3).
+# Returns: pointer to PCG32 state (16 bytes)
+fn pcg32_new(seed) {
+    var rng = alloc(16);
+    # state = 0, inc = 3
+    store64(rng, 0);
+    store64(rng + 8, 3);
+
+    # Advance once
+    pcg32_next(rng);
+
+    # state += seed
+    var st = load64(rng);
+    store64(rng, st + seed);
+
+    # Advance again
+    pcg32_next(rng);
+
+    return rng;
+}
+
+# Generate next u32 from PCG32 state.
+# Returns: u32 value (in lower 32 bits of i64)
+fn pcg32_next(rng) {
+    var old_state = load64(rng);
+    var inc = load64(rng + 8);
+
+    # state = old_state * 6364136223846793005 + inc
+    var new_state = old_state * _PCG32_MULT + inc;
+    store64(rng, new_state);
+
+    # xor_shifted = (((old_state >> 18) ^ old_state) >> 27) as u32
+    var xor_shifted = ((old_state >> 18) ^ old_state) >> 27;
+    xor_shifted = xor_shifted & 0xFFFFFFFF;
+
+    # rot = (old_state >> 59) as u32
+    # For unsigned right shift of old_state >> 59, we need the top 5 bits
+    # old_state is 64 bits; >> 59 gives top 5 bits
+    var rot = (old_state >> 59) & 0x1F;
+
+    # PCG output permutation: (xor_shifted >> rot) | (xor_shifted << ((-rot) & 31))
+    var neg_rot = (0 - rot) & 31;
+    var result = ((xor_shifted >> rot) | (xor_shifted << neg_rot)) & 0xFFFFFFFF;
+
+    return result;
+}
+
+# Generate next f64 in [0, 1).
+# Returns: f64 bit pattern
+fn pcg32_next_f64(rng) {
+    var u = pcg32_next(rng);
+    # f64 = u32_val / (2^32)
+    # We convert to f64 then divide
+    var f_val = f64_from(u & 0xFFFFFFFF);
+    # 2^32 = 4294967296
+    var divisor = f64_from(4294967296);
+    return f64_div(f_val, divisor);
+}
+
+# ================================================================
+# NUMBER THEORY
+# ================================================================
+
+# Binary GCD (Stein's algorithm). Operates on non-negative integers.
+# Returns: gcd of a and b
+fn num_gcd(a, b) {
+    if (a < 0) { a = 0 - a; }
+    if (b < 0) { b = 0 - b; }
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+
+    # Find common factor of 2
+    var shift = 0;
+    while (((a | b) & 1) == 0) {
+        a = a >> 1;
+        b = b >> 1;
+        shift = shift + 1;
+    }
+
+    # Remove remaining factors of 2 from a
+    while ((a & 1) == 0) {
+        a = a >> 1;
+    }
+
+    while (b != 0) {
+        # Remove factors of 2 from b
+        while ((b & 1) == 0) {
+            b = b >> 1;
+        }
+        # Ensure a <= b, then b = b - a
+        if (a > b) {
+            var tmp = a;
+            a = b;
+            b = tmp;
+        }
+        b = b - a;
+    }
+
+    return a << shift;
+}
+
+# Fast modular exponentiation: (base^exp) mod modulus
+# All arguments are non-negative integers.
+# Returns: (base^exp) % modulus
+fn num_modpow(base, exp, modulus) {
+    if (modulus == 1) { return 0; }
+    var result = 1;
+    base = base % modulus;
+    while (exp > 0) {
+        if ((exp & 1) == 1) {
+            result = (result * base) % modulus;
+        }
+        exp = exp >> 1;
+        base = (base * base) % modulus;
+    }
+    return result;
+}
+
+# Internal: Miller-Rabin test with a single witness a.
+# n must be odd and > 3. d and r satisfy n-1 = 2^r * d.
+# Returns: 1 if n passes for this witness, 0 if composite
+fn _num_miller_rabin_test(n, d, r, a) {
+    a = a % n;
+    if (a == 0 || a == 1 || a == n - 1) { return 1; }
+
+    var x = num_modpow(a, d, n);
+    if (x == 1 || x == n - 1) { return 1; }
+
+    var i = 0;
+    while (i < r - 1) {
+        x = (x * x) % n;
+        if (x == n - 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Deterministic Miller-Rabin primality test.
+# For n < 2^64, the witness set {2,3,5,7,11,13,17,19,23,29,31,37}
+# is proven sufficient for a deterministic result.
+# Returns: 1 if prime, 0 if composite
+fn num_is_prime(n) {
+    if (n < 2) { return 0; }
+    if (n == 2 || n == 3) { return 1; }
+    if (n % 2 == 0) { return 0; }
+    if (n == 5 || n == 7 || n == 11 || n == 13) { return 1; }
+    if (n % 3 == 0 || n % 5 == 0 || n % 7 == 0) { return 0; }
+    if (n == 17 || n == 19 || n == 23 || n == 29 || n == 31 || n == 37) { return 1; }
+    if (n % 11 == 0 || n % 13 == 0) { return 0; }
+
+    # Write n-1 = 2^r * d with d odd
+    var d = n - 1;
+    var r = 0;
+    while ((d & 1) == 0) {
+        d = d >> 1;
+        r = r + 1;
+    }
+
+    # Test with each witness
+    if (_num_miller_rabin_test(n, d, r, 2) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 3) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 5) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 7) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 11) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 13) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 17) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 19) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 23) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 29) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 31) == 0) { return 0; }
+    if (_num_miller_rabin_test(n, d, r, 37) == 0) { return 0; }
+
+    return 1;
+}
+
+# Sieve of Eratosthenes: returns a vec of all primes up to and including limit.
+# Returns: vec (dynamic array) of prime integers
+fn num_sieve(limit) {
+    var primes = vec_new();
+    if (limit < 2) { return primes; }
+
+    # Allocate boolean sieve: 1 byte per number
+    var sieve_size = limit + 1;
+    var sieve = alloc(sieve_size);
+
+    # Initialize: 0 = not prime, 1 = prime candidate
+    # Set all to 1 first
+    var idx = 0;
+    while (idx < sieve_size) {
+        store8(sieve + idx, 1);
+        idx = idx + 1;
+    }
+    store8(sieve, 0);        # 0 is not prime
+    store8(sieve + 1, 0);    # 1 is not prime
+
+    # Sieve
+    var p = 2;
+    while (p * p <= limit) {
+        if (load8(sieve + p) == 1) {
+            var j = p * p;
+            while (j <= limit) {
+                store8(sieve + j, 0);
+                j = j + p;
+            }
+        }
+        p = p + 1;
+    }
+
+    # Collect primes into vec
+    var k = 2;
+    while (k <= limit) {
+        if (load8(sieve + k) == 1) {
+            vec_push(primes, k);
+        }
+        k = k + 1;
+    }
+
+    return primes;
+}
+
+# ================================================================
+# COMPENSATED SUMMATION
+# ================================================================
+
+# Kahan compensated summation.
+# data: pointer to n consecutive f64 values (each 8 bytes)
+# n: number of f64 values
+# Returns: f64 bit pattern of the sum
+fn num_kahan_sum(data, n) {
+    var sum = _NUM_F64_ZERO;
+    var c = _NUM_F64_ZERO;    # compensation
+    var i = 0;
+    while (i < n) {
+        var v = load64(data + i * 8);
+        var y = f64_sub(v, c);
+        var t = f64_add(sum, y);
+        c = f64_sub(f64_sub(t, sum), y);
+        sum = t;
+        i = i + 1;
+    }
+    return sum;
+}
+
+# Neumaier compensated summation — improved Kahan.
+# Handles the case where the addend is larger than the running sum.
+# data: pointer to n consecutive f64 values (each 8 bytes)
+# n: number of f64 values
+# Returns: f64 bit pattern of the sum
+fn num_neumaier_sum(data, n) {
+    if (n == 0) { return _NUM_F64_ZERO; }
+    var sum = load64(data);
+    var c = _NUM_F64_ZERO;    # compensation
+    var i = 1;
+    while (i < n) {
+        var v = load64(data + i * 8);
+        var t = f64_add(sum, v);
+        if (f64_lt(f64_abs(v), f64_abs(sum)) == 1) {
+            # |sum| >= |v|: error is (sum - t) + v
+            c = f64_add(c, f64_add(f64_sub(sum, t), v));
+        } else {
+            # |v| > |sum|: error is (v - t) + sum
+            c = f64_add(c, f64_add(f64_sub(v, t), sum));
+        }
+        sum = t;
+        i = i + 1;
+    }
+    return f64_add(sum, c);
+}

@@ -1,0 +1,1096 @@
+# collision.cyr -- collision detection, mesh, and triangulation algorithms
+# Usage: include "lib/collision.cyr"
+# Requires: alloc.cyr, math.cyr, vec2.cyr, vec3.cyr, vec.cyr, fnptr.cyr,
+#           error.cyr, f64_util.cyr
+#
+# Provides:
+#   MPR/XenoCollide (Minkowski Portal Refinement)
+#   Sequential impulse solver
+#   Convex hull 2D (Andrew's monotone chain)
+#   Polygon triangulation (ear clipping)
+#   Delaunay triangulation (Bowyer-Watson)
+#   Half-edge mesh
+#   Island detection (union-find)
+
+# ================================================================
+# Constants
+# ================================================================
+
+var _COL_MAX_ITER     = 64;
+var _COL_F64_ZERO     = 0;
+var _COL_F64_ONE      = 0x3FF0_0000_0000_0000;  # 1.0
+var _COL_F64_TWO      = 0x4000_0000_0000_0000;  # 2.0
+var _COL_F64_HALF     = 0x3FE0_0000_0000_0000;  # 0.5
+var _COL_F64_QUARTER  = 0x3FD0_0000_0000_0000;  # 0.25
+var _COL_F64_TEN      = 0x4024_0000_0000_0000;  # 10.0
+var _COL_F64_NEG_ONE  = 0xBFF0_0000_0000_0000;  # -1.0
+var _COL_F64_POS_INF  = 0x7FF0_0000_0000_0000;  # +Infinity
+var _COL_F64_NEG_INF  = 0xFFF0_0000_0000_0000;  # -Infinity
+var _COL_F64_THREE    = 0x4008_0000_0000_0000;  # 3.0
+var _COL_F64_THIRD    = 0x3FD5_5555_5555_5555;  # 1/3
+var _COL_SENTINEL     = 0x7FFF_FFFF_FFFF_FFFF;  # usize::MAX sentinel
+
+# ================================================================
+# 1. MPR / XenoCollide (Minkowski Portal Refinement) -- 3D
+# ================================================================
+# Support function interface: fncall2(support_fn, shape, direction) -> HVec3
+#
+# The MPR algorithm finds whether two convex shapes overlap and, if
+# so, computes the penetration normal and depth.  It works in the
+# Minkowski difference space: support_A(d) - support_B(-d).
+
+# Minkowski difference support point
+fn _mpr_support(support_a, shape_a, support_b, shape_b, dir) {
+    var sa = fncall2(support_a, shape_a, dir);
+    var sb = fncall2(support_b, shape_b, hvec3_neg(dir));
+    return hvec3_sub(sa, sb);
+}
+
+# Center of Minkowski difference (approximate -- any interior point)
+fn _mpr_center(support_a, shape_a, support_b, shape_b) {
+    # Use center of shape_a - center of shape_b.
+    # For general shapes, support(0,0,0) is a rough interior point.
+    # We average support in +/- x, y, z for each shape.
+    var ca = hvec3_scale(
+        hvec3_add(fncall2(support_a, shape_a, hvec3_unit_x()),
+                  fncall2(support_a, shape_a, hvec3_neg(hvec3_unit_x()))),
+        _COL_F64_HALF);
+    var cb = hvec3_scale(
+        hvec3_add(fncall2(support_b, shape_b, hvec3_unit_x()),
+                  fncall2(support_b, shape_b, hvec3_neg(hvec3_unit_x()))),
+        _COL_F64_HALF);
+    return hvec3_sub(ca, cb);
+}
+
+# mpr_intersect -- returns 1 if shapes overlap, 0 otherwise
+fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
+    # Phase 1: Find initial portal
+    var v0 = _mpr_center(support_a, shape_a, support_b, shape_b);
+
+    # Direction from origin toward v0
+    var dir = hvec3_neg(v0);
+    if (f64_lt(hvec3_length_sq(dir), EPSILON_F64) == 1) {
+        # Center is at origin -- shapes overlap
+        return 1;
+    }
+    dir = hvec3_normalize(dir);
+
+    var v1 = _mpr_support(support_a, shape_a, support_b, shape_b, dir);
+
+    # Direction perpendicular to v1-v0 toward origin
+    var v1v0 = hvec3_sub(v1, v0);
+    dir = hvec3_cross(v1v0, hvec3_neg(v0));
+    if (f64_lt(hvec3_length_sq(dir), EPSILON_F64) == 1) {
+        # Origin is on the line v0-v1 -- check if between them
+        return 1;
+    }
+    dir = hvec3_normalize(dir);
+
+    var v2 = _mpr_support(support_a, shape_a, support_b, shape_b, dir);
+
+    # Orient portal so normal faces origin
+    var portal_normal = hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v2, v0));
+    if (f64_lt(hvec3_dot(portal_normal, v0), _COL_F64_ZERO) == 1) {
+        # Swap v1 and v2 to flip normal
+        var tmp = v1;
+        v1 = v2;
+        v2 = tmp;
+        portal_normal = hvec3_neg(portal_normal);
+    }
+
+    # Phase 2: Refine portal
+    for (var iter = 0; iter < _COL_MAX_ITER; iter = iter + 1) {
+        portal_normal = hvec3_normalize(hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v2, v0)));
+
+        # Support in portal normal direction
+        var v3 = _mpr_support(support_a, shape_a, support_b, shape_b, portal_normal);
+
+        # Check if origin is on the inside of the support plane
+        if (f64_lt(hvec3_dot(v3, portal_normal), _COL_F64_ZERO) == 1) {
+            return 0;  # No intersection
+        }
+
+        # Check convergence: if new support is close to portal
+        var dist = f64_abs(f64_sub(hvec3_dot(v3, portal_normal),
+                                    hvec3_dot(v1, portal_normal)));
+        if (f64_lt(dist, EPSILON_F64) == 1) {
+            return 1;  # Converged -- intersection
+        }
+
+        # Update portal: replace the vertex that keeps origin inside
+        var cross01 = hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v3, v0));
+        if (f64_gt(hvec3_dot(cross01, v0), _COL_F64_ZERO) == 1) {
+            v2 = v3;
+        } else {
+            var cross02 = hvec3_cross(hvec3_sub(v3, v0), hvec3_sub(v2, v0));
+            if (f64_gt(hvec3_dot(cross02, v0), _COL_F64_ZERO) == 1) {
+                v1 = v3;
+            } else {
+                v2 = v3;
+            }
+        }
+    }
+    return 1;  # Assume intersection if max iterations reached
+}
+
+# mpr_penetration -- returns 1 on success, writes normal/depth to out pointers
+# out_normal: pointer to HVec3 (overwritten)
+# out_depth: pointer where f64 depth is stored
+fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    var v0 = _mpr_center(support_a, shape_a, support_b, shape_b);
+
+    var dir = hvec3_neg(v0);
+    if (f64_lt(hvec3_length_sq(dir), EPSILON_F64) == 1) {
+        store64(out_normal, hvec3_unit_x());
+        store64(out_depth, _COL_F64_ZERO);
+        return 1;
+    }
+    dir = hvec3_normalize(dir);
+
+    var v1 = _mpr_support(support_a, shape_a, support_b, shape_b, dir);
+
+    var v1v0 = hvec3_sub(v1, v0);
+    dir = hvec3_cross(v1v0, hvec3_neg(v0));
+    if (f64_lt(hvec3_length_sq(dir), EPSILON_F64) == 1) {
+        dir = hvec3_normalize(v1v0);
+        store64(out_normal, dir);
+        store64(out_depth, hvec3_dot(v1, dir));
+        return 1;
+    }
+    dir = hvec3_normalize(dir);
+
+    var v2 = _mpr_support(support_a, shape_a, support_b, shape_b, dir);
+
+    var portal_normal = hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v2, v0));
+    if (f64_lt(hvec3_dot(portal_normal, v0), _COL_F64_ZERO) == 1) {
+        var tmp = v1;
+        v1 = v2;
+        v2 = tmp;
+        portal_normal = hvec3_neg(portal_normal);
+    }
+
+    # Refine portal and compute penetration
+    for (var iter = 0; iter < _COL_MAX_ITER; iter = iter + 1) {
+        portal_normal = hvec3_normalize(hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v2, v0)));
+
+        var v3 = _mpr_support(support_a, shape_a, support_b, shape_b, portal_normal);
+
+        if (f64_lt(hvec3_dot(v3, portal_normal), _COL_F64_ZERO) == 1) {
+            return 0;  # No intersection
+        }
+
+        var dist = f64_abs(f64_sub(hvec3_dot(v3, portal_normal),
+                                    hvec3_dot(v1, portal_normal)));
+        if (f64_lt(dist, EPSILON_F64) == 1) {
+            # Converged -- compute depth as projection of v1 onto normal
+            store64(out_normal, portal_normal);
+            store64(out_depth, hvec3_dot(v1, portal_normal));
+            return 1;
+        }
+
+        var cross01 = hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v3, v0));
+        if (f64_gt(hvec3_dot(cross01, v0), _COL_F64_ZERO) == 1) {
+            v2 = v3;
+        } else {
+            var cross02 = hvec3_cross(hvec3_sub(v3, v0), hvec3_sub(v2, v0));
+            if (f64_gt(hvec3_dot(cross02, v0), _COL_F64_ZERO) == 1) {
+                v1 = v3;
+            } else {
+                v2 = v3;
+            }
+        }
+    }
+    # Return best estimate
+    portal_normal = hvec3_normalize(hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v2, v0)));
+    store64(out_normal, portal_normal);
+    store64(out_depth, hvec3_dot(v1, portal_normal));
+    return 1;
+}
+
+# ================================================================
+# 2. Sequential Impulse Solver
+# ================================================================
+# Contact constraint: 64 bytes (8 fields x 8 bytes)
+#   offset 0:  body_a       (index)
+#   offset 8:  body_b       (index)
+#   offset 16: normal       (HVec3 pointer)
+#   offset 24: penetration  (f64)
+#   offset 32: friction     (f64)
+#   offset 40: restitution  (f64)
+#   offset 48: inv_mass_a   (f64)
+#   offset 56: inv_mass_b   (f64)
+
+#derive(accessors)
+struct ColContact { body_a; body_b; normal; penetration; friction; restitution; inv_mass_a; inv_mass_b; }
+
+fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_mass_a, inv_mass_b) {
+    var c = alloc(64);
+    store64(c,      body_a);
+    store64(c + 8,  body_b);
+    store64(c + 16, normal);
+    store64(c + 24, penetration);
+    store64(c + 32, friction);
+    store64(c + 40, restitution);
+    store64(c + 48, inv_mass_a);
+    store64(c + 56, inv_mass_b);
+    return c;
+}
+
+# sequential_impulse -- solve normal + friction impulses
+# contacts: vec of ColContact pointers
+# n: number of contacts
+# iterations: solver iterations
+# out_impulses: pre-allocated flat array, 2 f64 per contact (normal, friction magnitude)
+#   Layout: [n0, f0, n1, f1, ...] -- total 16*n bytes
+fn sequential_impulse(contacts, n, iterations, out_impulses) {
+    # Zero out impulses
+    for (var zi = 0; zi < n; zi = zi + 1) {
+        store64(out_impulses + zi * 16,     _COL_F64_ZERO);
+        store64(out_impulses + zi * 16 + 8, _COL_F64_ZERO);
+    }
+
+    for (var it = 0; it < iterations; it = it + 1) {
+        for (var ci = 0; ci < n; ci = ci + 1) {
+            var c = vec_get(contacts, ci);
+            var inv_mass = f64_add(ColContact_inv_mass_a(c), ColContact_inv_mass_b(c));
+
+            if (f64_lt(inv_mass, EPSILON_F64) == 1) {
+                # Both bodies are static -- skip
+            } else {
+                var normal = ColContact_normal(c);
+                var rest = ColContact_restitution(c);
+                var fric = ColContact_friction(c);
+                var pen = ColContact_penetration(c);
+
+                # Relative velocity along normal (simplified -- use penetration as proxy)
+                # In a full solver the caller supplies rel_velocities; here we use
+                # penetration-based bias to push bodies apart.
+                var v_n = f64_neg(pen);
+
+                # Normal impulse: j_n = -(1 + e) * v_n / inv_mass
+                var j_n = f64_div(f64_mul(f64_add(_COL_F64_ONE, rest), v_n), inv_mass);
+
+                # Accumulate and clamp >= 0
+                var old_impulse = load64(out_impulses + ci * 16);
+                var new_impulse = f64_add(old_impulse, j_n);
+                if (f64_lt(new_impulse, _COL_F64_ZERO) == 1) {
+                    new_impulse = _COL_F64_ZERO;
+                }
+                store64(out_impulses + ci * 16, new_impulse);
+
+                # Friction impulse (Coulomb cone)
+                if (f64_gt(fric, EPSILON_F64) == 1) {
+                    # Simplified friction: magnitude = friction * normal_impulse
+                    var max_fric = f64_mul(fric, new_impulse);
+                    var old_fric = load64(out_impulses + ci * 16 + 8);
+                    # Clamp friction to cone
+                    if (f64_gt(f64_abs(old_fric), max_fric) == 1) {
+                        if (f64_lt(old_fric, _COL_F64_ZERO) == 1) {
+                            old_fric = f64_neg(max_fric);
+                        } else {
+                            old_fric = max_fric;
+                        }
+                    }
+                    store64(out_impulses + ci * 16 + 8, old_fric);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ================================================================
+# 3. Convex Hull 2D -- Andrew's Monotone Chain
+# ================================================================
+# Input: points = vec of HVec2 pointers, n = vec_len(points)
+# Returns: vec of indices into the original points array (CCW order)
+
+# 2D cross product of vectors OA and OB: (A-O) x (B-O)
+fn _col_cross2d(ox, oy, ax, ay, bx, by) {
+    return f64_sub(f64_mul(f64_sub(ax, ox), f64_sub(by, oy)),
+                   f64_mul(f64_sub(ay, oy), f64_sub(bx, ox)));
+}
+
+# Simple insertion sort for small arrays of indices by (x, then y)
+fn _col_sort_indices_by_xy(indices, points, n) {
+    for (var si = 1; si < n; si = si + 1) {
+        var key = vec_get(indices, si);
+        var kp = vec_get(points, key);
+        var kx = HVec2_x(kp);
+        var ky = HVec2_y(kp);
+        var sj = si - 1;
+        var done = 0;
+        for (; sj >= 0; sj = sj - 1) {
+            if (done == 1) { sj = 0 - 1; } else {
+                var oj = vec_get(indices, sj);
+                var op = vec_get(points, oj);
+                var ojx = HVec2_x(op);
+                var ojy = HVec2_y(op);
+                # Compare: ojx > kx, or (ojx == kx and ojy > ky)
+                var swap = 0;
+                if (f64_gt(ojx, kx) == 1) { swap = 1; }
+                if (swap == 0) {
+                    if (f64_lt(f64_abs(f64_sub(ojx, kx)), EPSILON_F64) == 1) {
+                        if (f64_gt(ojy, ky) == 1) { swap = 1; }
+                    }
+                }
+                if (swap == 1) {
+                    vec_set(indices, sj + 1, oj);
+                } else {
+                    done = 1;
+                    sj = sj + 1; # will decrement to sj, then exit
+                }
+            }
+        }
+        if (done == 0) { sj = 0; } else { sj = sj + 1; }
+        vec_set(indices, sj, key);
+    }
+    return 0;
+}
+
+fn convex_hull_2d(points, n) {
+    var result = vec_new();
+    if (n < 2) {
+        for (var i = 0; i < n; i = i + 1) {
+            vec_push(result, i);
+        }
+        return result;
+    }
+
+    # Build sorted index array
+    var sorted = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(sorted, i);
+    }
+    _col_sort_indices_by_xy(sorted, points, n);
+
+    # Lower hull
+    var hull = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var pi = vec_get(sorted, i);
+        var pp = vec_get(points, pi);
+        var px = HVec2_x(pp);
+        var py = HVec2_y(pp);
+        var hlen = vec_len(hull);
+        var cont = 1;
+        for (; cont == 1;) {
+            hlen = vec_len(hull);
+            if (hlen < 2) { cont = 0; } else {
+                var h1i = vec_get(hull, hlen - 1);
+                var h2i = vec_get(hull, hlen - 2);
+                var h1p = vec_get(points, h1i);
+                var h2p = vec_get(points, h2i);
+                var c = _col_cross2d(HVec2_x(h2p), HVec2_y(h2p),
+                                     HVec2_x(h1p), HVec2_y(h1p),
+                                     px, py);
+                if (f64_le(c, _COL_F64_ZERO) == 1) {
+                    vec_pop(hull);
+                } else {
+                    cont = 0;
+                }
+            }
+        }
+        vec_push(hull, pi);
+    }
+
+    # Upper hull
+    var lower_len = vec_len(hull) + 1;
+    for (var i = n - 1; i >= 0; i = i - 1) {
+        var pi = vec_get(sorted, i);
+        var pp = vec_get(points, pi);
+        var px = HVec2_x(pp);
+        var py = HVec2_y(pp);
+        var cont = 1;
+        for (; cont == 1;) {
+            var hlen = vec_len(hull);
+            if (hlen < lower_len) { cont = 0; } else {
+                var h1i = vec_get(hull, hlen - 1);
+                var h2i = vec_get(hull, hlen - 2);
+                var h1p = vec_get(points, h1i);
+                var h2p = vec_get(points, h2i);
+                var c = _col_cross2d(HVec2_x(h2p), HVec2_y(h2p),
+                                     HVec2_x(h1p), HVec2_y(h1p),
+                                     px, py);
+                if (f64_le(c, _COL_F64_ZERO) == 1) {
+                    vec_pop(hull);
+                } else {
+                    cont = 0;
+                }
+            }
+        }
+        vec_push(hull, pi);
+    }
+
+    # Remove last (duplicate of first)
+    vec_pop(hull);
+
+    # Copy to result
+    var hull_len = vec_len(hull);
+    for (var i = 0; i < hull_len; i = i + 1) {
+        vec_push(result, vec_get(hull, i));
+    }
+    return result;
+}
+
+# ================================================================
+# 4. Polygon Triangulation -- Ear Clipping
+# ================================================================
+# Input: vertices = vec of HVec2 pointers, n = number of vertices
+# Returns: vec of index triples [i0, i1, i2, ...] (flat, length = 3*(n-2))
+
+# Sign of 2D cross product for winding test
+fn _col_triangle_area_2x(ax, ay, bx, by, cx, cy) {
+    return f64_sub(f64_mul(f64_sub(bx, ax), f64_sub(cy, ay)),
+                   f64_mul(f64_sub(cx, ax), f64_sub(by, ay)));
+}
+
+# Point-in-triangle test (2D, strict interior)
+fn _col_point_in_tri(px, py, ax, ay, bx, by, cx, cy) {
+    var d1 = _col_triangle_area_2x(px, py, ax, ay, bx, by);
+    var d2 = _col_triangle_area_2x(px, py, bx, by, cx, cy);
+    var d3 = _col_triangle_area_2x(px, py, cx, cy, ax, ay);
+
+    var has_neg = 0;
+    var has_pos = 0;
+    if (f64_lt(d1, _COL_F64_ZERO) == 1) { has_neg = 1; }
+    if (f64_gt(d1, _COL_F64_ZERO) == 1) { has_pos = 1; }
+    if (f64_lt(d2, _COL_F64_ZERO) == 1) { has_neg = 1; }
+    if (f64_gt(d2, _COL_F64_ZERO) == 1) { has_pos = 1; }
+    if (f64_lt(d3, _COL_F64_ZERO) == 1) { has_neg = 1; }
+    if (f64_gt(d3, _COL_F64_ZERO) == 1) { has_pos = 1; }
+
+    # Point is inside if all signs are the same
+    if (has_neg == 1) {
+        if (has_pos == 1) { return 0; }
+    }
+    return 1;
+}
+
+fn triangulate_polygon(vertices, n) {
+    var result = vec_new();
+    if (n < 3) { return result; }
+
+    # Build index list (will shrink as ears are clipped)
+    var idx = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(idx, i);
+    }
+
+    # Determine winding: sum of signed areas
+    var total_area = _COL_F64_ZERO;
+    for (var i = 0; i < n; i = i + 1) {
+        var ni = i + 1;
+        if (ni >= n) { ni = 0; }
+        var pi = vec_get(vertices, i);
+        var pn = vec_get(vertices, ni);
+        total_area = f64_add(total_area,
+            f64_sub(f64_mul(HVec2_x(pi), HVec2_y(pn)),
+                    f64_mul(HVec2_x(pn), HVec2_y(pi))));
+    }
+    # ccw = 1 if total_area > 0 (standard CCW winding)
+    var ccw = 1;
+    if (f64_lt(total_area, _COL_F64_ZERO) == 1) { ccw = 0; }
+
+    var remaining = n;
+    var max_iters = n * n;  # Safety bound
+    var iter_count = 0;
+
+    for (; remaining > 2;) {
+        iter_count = iter_count + 1;
+        if (iter_count > max_iters) { return result; }  # Degenerate -- bail
+
+        var ear_found = 0;
+        for (var i = 0; i < remaining; i = i + 1) {
+            if (ear_found == 0) {
+                var prev = i - 1;
+                if (prev < 0) { prev = remaining - 1; }
+                var next = i + 1;
+                if (next >= remaining) { next = 0; }
+
+                var ai = vec_get(idx, prev);
+                var bi = vec_get(idx, i);
+                var ci = vec_get(idx, next);
+
+                var ap = vec_get(vertices, ai);
+                var bp = vec_get(vertices, bi);
+                var cp = vec_get(vertices, ci);
+
+                var ax = HVec2_x(ap);
+                var ay = HVec2_y(ap);
+                var bx = HVec2_x(bp);
+                var by = HVec2_y(bp);
+                var cx = HVec2_x(cp);
+                var cy = HVec2_y(cp);
+
+                var cross = _col_triangle_area_2x(ax, ay, bx, by, cx, cy);
+
+                # Check convexity: for CCW polygon, ear has positive cross
+                var convex = 0;
+                if (ccw == 1) {
+                    if (f64_gt(cross, EPSILON_F64) == 1) { convex = 1; }
+                } else {
+                    if (f64_lt(cross, f64_neg(EPSILON_F64)) == 1) { convex = 1; }
+                }
+
+                if (convex == 1) {
+                    # Check no other vertex inside this triangle
+                    var has_point = 0;
+                    for (var j = 0; j < remaining; j = j + 1) {
+                        if (has_point == 0) {
+                            if (j != prev) {
+                                if (j != i) {
+                                    if (j != next) {
+                                        var ji = vec_get(idx, j);
+                                        var jp = vec_get(vertices, ji);
+                                        var inside = _col_point_in_tri(
+                                            HVec2_x(jp), HVec2_y(jp),
+                                            ax, ay, bx, by, cx, cy);
+                                        if (inside == 1) { has_point = 1; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (has_point == 0) {
+                        # Clip this ear
+                        vec_push(result, ai);
+                        vec_push(result, bi);
+                        vec_push(result, ci);
+                        vec_remove(idx, i);
+                        remaining = remaining - 1;
+                        ear_found = 1;
+                    }
+                }
+            }
+        }
+
+        # If no ear found this pass, polygon may be degenerate
+        if (ear_found == 0) { return result; }
+    }
+    return result;
+}
+
+# ================================================================
+# 5. Delaunay Triangulation -- Bowyer-Watson
+# ================================================================
+# Input: points = vec of HVec2 pointers, n = number of points
+# Returns: vec of index triples [i0, i1, i2, ...] (flat)
+
+# Check if point p is inside circumcircle of triangle (a, b, c)
+fn _col_in_circumcircle(points, ai, bi, ci, px, py) {
+    var ap = vec_get(points, ai);
+    var bp = vec_get(points, bi);
+    var cp = vec_get(points, ci);
+
+    var ax = f64_sub(HVec2_x(ap), px);
+    var ay = f64_sub(HVec2_y(ap), py);
+    var bx = f64_sub(HVec2_x(bp), px);
+    var by = f64_sub(HVec2_y(bp), py);
+    var cx = f64_sub(HVec2_x(cp), px);
+    var cy = f64_sub(HVec2_y(cp), py);
+
+    var a_sq = f64_add(f64_mul(ax, ax), f64_mul(ay, ay));
+    var b_sq = f64_add(f64_mul(bx, bx), f64_mul(by, by));
+    var c_sq = f64_add(f64_mul(cx, cx), f64_mul(cy, cy));
+
+    var det = f64_sub(
+        f64_add(
+            f64_mul(ax, f64_sub(f64_mul(by, c_sq), f64_mul(cy, b_sq))),
+            f64_mul(a_sq, f64_sub(f64_mul(bx, cy), f64_mul(by, cx)))
+        ),
+        f64_mul(ay, f64_sub(f64_mul(bx, c_sq), f64_mul(cx, b_sq)))
+    );
+
+    # Sign depends on winding of triangle
+    var cross = f64_sub(
+        f64_mul(f64_sub(HVec2_x(bp), HVec2_x(ap)), f64_sub(HVec2_y(cp), HVec2_y(ap))),
+        f64_mul(f64_sub(HVec2_x(cp), HVec2_x(ap)), f64_sub(HVec2_y(bp), HVec2_y(ap)))
+    );
+
+    if (f64_gt(cross, _COL_F64_ZERO) == 1) {
+        if (f64_gt(det, _COL_F64_ZERO) == 1) { return 1; }
+        return 0;
+    }
+    if (f64_lt(det, _COL_F64_ZERO) == 1) { return 1; }
+    return 0;
+}
+
+# Check if triangle has edge (e0, e1) in either direction
+fn _col_tri_has_edge(tris, ti, e0, e1) {
+    var base = ti * 3;
+    var t0 = vec_get(tris, base);
+    var t1 = vec_get(tris, base + 1);
+    var t2 = vec_get(tris, base + 2);
+
+    # Edge 0-1
+    if (t0 == e0) { if (t1 == e1) { return 1; } }
+    if (t0 == e1) { if (t1 == e0) { return 1; } }
+    # Edge 1-2
+    if (t1 == e0) { if (t2 == e1) { return 1; } }
+    if (t1 == e1) { if (t2 == e0) { return 1; } }
+    # Edge 2-0
+    if (t2 == e0) { if (t0 == e1) { return 1; } }
+    if (t2 == e1) { if (t0 == e0) { return 1; } }
+    return 0;
+}
+
+fn delaunay_2d(points, n) {
+    var result = vec_new();
+    if (n < 3) { return result; }
+
+    # Find bounding box
+    var min_x = _COL_F64_POS_INF;
+    var max_x = _COL_F64_NEG_INF;
+    var min_y = _COL_F64_POS_INF;
+    var max_y = _COL_F64_NEG_INF;
+    for (var i = 0; i < n; i = i + 1) {
+        var p = vec_get(points, i);
+        var px = HVec2_x(p);
+        var py = HVec2_y(p);
+        min_x = f64_min(min_x, px);
+        max_x = f64_max(max_x, px);
+        min_y = f64_min(min_y, py);
+        max_y = f64_max(max_y, py);
+    }
+
+    var dx = f64_max(f64_sub(max_x, min_x), _COL_F64_ONE);
+    var dy = f64_max(f64_sub(max_y, min_y), _COL_F64_ONE);
+    var mid_x = f64_mul(f64_add(min_x, max_x), _COL_F64_HALF);
+    var mid_y = f64_mul(f64_add(min_y, max_y), _COL_F64_HALF);
+    var d_max = f64_mul(f64_max(dx, dy), _COL_F64_TEN);
+
+    # Super-triangle vertices: indices n, n+1, n+2 in extended points vec
+    var st0 = hvec2_new(f64_sub(mid_x, d_max), f64_sub(mid_y, d_max));
+    var st1 = hvec2_new(f64_add(mid_x, d_max), f64_sub(mid_y, d_max));
+    var st2 = hvec2_new(mid_x, f64_add(mid_y, d_max));
+
+    var all_points = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        vec_push(all_points, vec_get(points, i));
+    }
+    vec_push(all_points, st0);
+    vec_push(all_points, st1);
+    vec_push(all_points, st2);
+
+    var st_a = n;
+    var st_b = n + 1;
+    var st_c = n + 2;
+
+    # Triangles stored as flat array of index triples in a vec
+    var tris = vec_new();
+    vec_push(tris, st_a);
+    vec_push(tris, st_b);
+    vec_push(tris, st_c);
+    var n_tris = 1;
+
+    # Incrementally insert each point
+    for (var i = 0; i < n; i = i + 1) {
+        var p = vec_get(all_points, i);
+        var px = HVec2_x(p);
+        var py = HVec2_y(p);
+
+        # Find bad triangles
+        var bad = vec_new();
+        for (var ti = 0; ti < n_tris; ti = ti + 1) {
+            var t0 = vec_get(tris, ti * 3);
+            var t1 = vec_get(tris, ti * 3 + 1);
+            var t2 = vec_get(tris, ti * 3 + 2);
+            if (_col_in_circumcircle(all_points, t0, t1, t2, px, py) == 1) {
+                vec_push(bad, ti);
+            }
+        }
+
+        # Find boundary polygon (non-shared edges of bad triangles)
+        var poly_edges = vec_new();  # pairs: [e0, e1, e0, e1, ...]
+        var n_bad = vec_len(bad);
+        for (var bi = 0; bi < n_bad; bi = bi + 1) {
+            var ti = vec_get(bad, bi);
+            var t0 = vec_get(tris, ti * 3);
+            var t1 = vec_get(tris, ti * 3 + 1);
+            var t2 = vec_get(tris, ti * 3 + 2);
+            var edges_v = vec_new();
+            vec_push(edges_v, t0); vec_push(edges_v, t1);
+            vec_push(edges_v, t1); vec_push(edges_v, t2);
+            vec_push(edges_v, t2); vec_push(edges_v, t0);
+
+            for (var ei = 0; ei < 3; ei = ei + 1) {
+                var e0 = vec_get(edges_v, ei * 2);
+                var e1 = vec_get(edges_v, ei * 2 + 1);
+                var shared = 0;
+                for (var bj = 0; bj < n_bad; bj = bj + 1) {
+                    if (shared == 0) {
+                        var otj = vec_get(bad, bj);
+                        if (otj != ti) {
+                            if (_col_tri_has_edge(tris, otj, e0, e1) == 1) {
+                                shared = 1;
+                            }
+                        }
+                    }
+                }
+                if (shared == 0) {
+                    vec_push(poly_edges, e0);
+                    vec_push(poly_edges, e1);
+                }
+            }
+        }
+
+        # Remove bad triangles (mark as deleted by sorting indices descending)
+        # Sort bad indices descending
+        for (var si = 0; si < n_bad; si = si + 1) {
+            for (var sj = si + 1; sj < n_bad; sj = sj + 1) {
+                if (vec_get(bad, sj) > vec_get(bad, si)) {
+                    var tmp = vec_get(bad, si);
+                    vec_set(bad, si, vec_get(bad, sj));
+                    vec_set(bad, sj, tmp);
+                }
+            }
+        }
+        # Swap-remove in descending order
+        for (var bi = 0; bi < n_bad; bi = bi + 1) {
+            var ti = vec_get(bad, bi);
+            var last = n_tris - 1;
+            if (ti != last) {
+                vec_set(tris, ti * 3,     vec_get(tris, last * 3));
+                vec_set(tris, ti * 3 + 1, vec_get(tris, last * 3 + 1));
+                vec_set(tris, ti * 3 + 2, vec_get(tris, last * 3 + 2));
+            }
+            # Pop last 3 entries
+            vec_pop(tris);
+            vec_pop(tris);
+            vec_pop(tris);
+            n_tris = n_tris - 1;
+        }
+
+        # Create new triangles from polygon edges to point i
+        var n_poly = vec_len(poly_edges) / 2;
+        for (var ei = 0; ei < n_poly; ei = ei + 1) {
+            var e0 = vec_get(poly_edges, ei * 2);
+            var e1 = vec_get(poly_edges, ei * 2 + 1);
+            vec_push(tris, e0);
+            vec_push(tris, e1);
+            vec_push(tris, i);
+            n_tris = n_tris + 1;
+        }
+    }
+
+    # Filter out triangles referencing super-triangle vertices
+    for (var ti = 0; ti < n_tris;) {
+        var t0 = vec_get(tris, ti * 3);
+        var t1 = vec_get(tris, ti * 3 + 1);
+        var t2 = vec_get(tris, ti * 3 + 2);
+        var remove = 0;
+        if (t0 >= n) { remove = 1; }
+        if (t1 >= n) { remove = 1; }
+        if (t2 >= n) { remove = 1; }
+
+        if (remove == 1) {
+            var last = n_tris - 1;
+            if (ti != last) {
+                vec_set(tris, ti * 3,     vec_get(tris, last * 3));
+                vec_set(tris, ti * 3 + 1, vec_get(tris, last * 3 + 1));
+                vec_set(tris, ti * 3 + 2, vec_get(tris, last * 3 + 2));
+            }
+            vec_pop(tris);
+            vec_pop(tris);
+            vec_pop(tris);
+            n_tris = n_tris - 1;
+        } else {
+            ti = ti + 1;
+        }
+    }
+
+    # Ensure CCW winding and copy to result
+    for (var ti = 0; ti < n_tris; ti = ti + 1) {
+        var t0 = vec_get(tris, ti * 3);
+        var t1 = vec_get(tris, ti * 3 + 1);
+        var t2 = vec_get(tris, ti * 3 + 2);
+
+        var ap = vec_get(all_points, t0);
+        var bp = vec_get(all_points, t1);
+        var cp = vec_get(all_points, t2);
+
+        var cross = f64_sub(
+            f64_mul(f64_sub(HVec2_x(bp), HVec2_x(ap)), f64_sub(HVec2_y(cp), HVec2_y(ap))),
+            f64_mul(f64_sub(HVec2_x(cp), HVec2_x(ap)), f64_sub(HVec2_y(bp), HVec2_y(ap)))
+        );
+
+        if (f64_lt(cross, _COL_F64_ZERO) == 1) {
+            # Swap t0 and t1 for CCW
+            vec_push(result, t1);
+            vec_push(result, t0);
+            vec_push(result, t2);
+        } else {
+            vec_push(result, t0);
+            vec_push(result, t1);
+            vec_push(result, t2);
+        }
+    }
+
+    return result;
+}
+
+# ================================================================
+# 6. Half-Edge Mesh
+# ================================================================
+# HalfEdge: { vertex, face, next, twin } = 32 bytes
+#   offset 0:  vertex (index this half-edge points TO)
+#   offset 8:  face   (face index)
+#   offset 16: next   (index of next half-edge in face, CCW)
+#   offset 24: twin   (index of twin half-edge, or _COL_SENTINEL)
+#
+# Mesh handle: { half_edges (vec), vertex_edge (vec), face_edge (vec) } = 24 bytes
+
+#derive(accessors)
+struct HalfEdge { vertex; face; next; twin; }
+
+#derive(accessors)
+struct HalfEdgeMesh { half_edges; vertex_edge; face_edge; }
+
+fn _col_he_new(vertex, face, next, twin) {
+    var he = alloc(32);
+    store64(he, vertex);
+    store64(he + 8, face);
+    store64(he + 16, next);
+    store64(he + 24, twin);
+    return he;
+}
+
+# Build half-edge mesh from triangle index triples
+# triangles: flat vec of index triples [i0, i1, i2, ...]
+# n_tris: number of triangles (vec_len(triangles) / 3)
+# n_verts: total number of vertices
+# Returns: HalfEdgeMesh pointer, or 0 on error
+fn halfedge_from_triangles(triangles, n_tris, n_verts) {
+    if (n_tris < 1) { return 0; }
+
+    var n_he = n_tris * 3;
+    var half_edges = vec_new();
+    var vertex_edge = vec_new();
+    var face_edge = vec_new();
+
+    # Initialize vertex_edge to sentinel
+    for (var vi = 0; vi < n_verts; vi = vi + 1) {
+        vec_push(vertex_edge, _COL_SENTINEL);
+    }
+
+    # Create half-edges: for face f, half-edges at indices 3f, 3f+1, 3f+2
+    for (var f = 0; f < n_tris; f = f + 1) {
+        var base = f * 3;
+        vec_push(face_edge, base);
+
+        for (var k = 0; k < 3; k = k + 1) {
+            var src_idx = vec_get(triangles, base + k);
+            var dst_k = k + 1;
+            if (dst_k >= 3) { dst_k = 0; }
+            var dst_idx = vec_get(triangles, base + dst_k);
+
+            var next_k = k + 1;
+            if (next_k >= 3) { next_k = 0; }
+            var next_he = base + next_k;
+
+            var he = _col_he_new(dst_idx, f, next_he, _COL_SENTINEL);
+            vec_push(half_edges, he);
+
+            # Record one outgoing half-edge per vertex
+            if (vec_get(vertex_edge, src_idx) == _COL_SENTINEL) {
+                vec_set(vertex_edge, src_idx, base + k);
+            }
+        }
+    }
+
+    # Assign twins: for each half-edge (src->dst), find (dst->src)
+    # O(n^2) scan -- acceptable for moderate meshes
+    for (var i = 0; i < n_he; i = i + 1) {
+        var he_i = vec_get(half_edges, i);
+        if (HalfEdge_twin(he_i) == _COL_SENTINEL) {
+            var dst_i = HalfEdge_vertex(he_i);
+            # Find src of he_i: src is triangles[face*3 + local_k]
+            var face_i = HalfEdge_face(he_i);
+            var local_i = i - face_i * 3;
+            var src_i = vec_get(triangles, face_i * 3 + local_i);
+
+            for (var j = i + 1; j < n_he; j = j + 1) {
+                var he_j = vec_get(half_edges, j);
+                if (HalfEdge_twin(he_j) == _COL_SENTINEL) {
+                    var dst_j = HalfEdge_vertex(he_j);
+                    var face_j = HalfEdge_face(he_j);
+                    var local_j = j - face_j * 3;
+                    var src_j = vec_get(triangles, face_j * 3 + local_j);
+
+                    # Check if (src_i->dst_i) matches (dst_j->src_j)
+                    if (src_i == dst_j) {
+                        if (dst_i == src_j) {
+                            # Found twin pair
+                            # Update twin fields in the heap structs
+                            store64(he_i + 24, j);
+                            store64(he_j + 24, i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # Build mesh handle
+    var mesh = alloc(24);
+    store64(mesh, half_edges);
+    store64(mesh + 8, vertex_edge);
+    store64(mesh + 16, face_edge);
+    return mesh;
+}
+
+# Get faces adjacent to a given face (sharing an edge)
+# Returns: vec of face indices
+fn halfedge_adjacent_faces(mesh, face) {
+    var result = vec_new();
+    var half_edges = HalfEdgeMesh_half_edges(mesh);
+    var face_edge_vec = HalfEdgeMesh_face_edge(mesh);
+    var base = vec_get(face_edge_vec, face);
+
+    for (var k = 0; k < 3; k = k + 1) {
+        var he = vec_get(half_edges, base + k);
+        var twin = HalfEdge_twin(he);
+        if (twin != _COL_SENTINEL) {
+            var twin_he = vec_get(half_edges, twin);
+            vec_push(result, HalfEdge_face(twin_he));
+        }
+    }
+    return result;
+}
+
+# Check if a vertex is on the mesh boundary
+# Returns: 1 if boundary, 0 if interior
+fn halfedge_is_boundary(mesh, vertex) {
+    var half_edges = HalfEdgeMesh_half_edges(mesh);
+    var vertex_edge_vec = HalfEdgeMesh_vertex_edge(mesh);
+    var face_edge_vec = HalfEdgeMesh_face_edge(mesh);
+    var start = vec_get(vertex_edge_vec, vertex);
+
+    if (start == _COL_SENTINEL) { return 0; }
+
+    var he_idx = start;
+    var first = 1;
+    for (var guard = 0; guard < 1000; guard = guard + 1) {
+        var he = vec_get(half_edges, he_idx);
+        if (HalfEdge_twin(he) == _COL_SENTINEL) { return 1; }
+
+        # Walk: next -> next -> twin to get next outgoing half-edge
+        var n1 = HalfEdge_next(he);
+        var he_n1 = vec_get(half_edges, n1);
+        var n2 = HalfEdge_next(he_n1);
+        var he_n2 = vec_get(half_edges, n2);
+        var incoming_twin = HalfEdge_twin(he_n2);
+
+        if (incoming_twin == _COL_SENTINEL) { return 1; }
+
+        he_idx = incoming_twin;
+        if (he_idx == start) { return 0; }  # Full loop -- interior
+    }
+    return 0;
+}
+
+# ================================================================
+# 7. Island Detection -- Union-Find
+# ================================================================
+# Detects connected components in a contact graph using union-find
+# with path compression and union-by-rank.
+#
+# contacts: vec of ColContact pointers (uses body_a, body_b fields)
+# n_contacts: number of contacts
+# n_bodies: total number of bodies
+# Returns: vec of vecs, each sub-vec is a list of body indices in one island
+
+# Union-find structure: two flat arrays (parent, rank) of size n_bodies
+# parent: alloc(n_bodies * 8), rank: alloc(n_bodies * 8)
+
+fn _col_uf_new(n) {
+    var uf = alloc(16);
+    var parent = alloc(n * 8);
+    var rank = alloc(n * 8);
+    for (var i = 0; i < n; i = i + 1) {
+        store64(parent + i * 8, i);
+        store64(rank + i * 8, 0);
+    }
+    store64(uf, parent);
+    store64(uf + 8, rank);
+    return uf;
+}
+
+fn _col_uf_find(uf, x) {
+    var parent = load64(uf);
+    var px = load64(parent + x * 8);
+    for (; px != x;) {
+        # Path halving
+        var ppx = load64(parent + px * 8);
+        store64(parent + x * 8, ppx);
+        x = ppx;
+        px = load64(parent + x * 8);
+    }
+    return x;
+}
+
+fn _col_uf_union(uf, a, b) {
+    var ra = _col_uf_find(uf, a);
+    var rb = _col_uf_find(uf, b);
+    if (ra == rb) { return 0; }
+
+    var rank_arr = load64(uf + 8);
+    var rank_a = load64(rank_arr + ra * 8);
+    var rank_b = load64(rank_arr + rb * 8);
+
+    var parent = load64(uf);
+    if (rank_a < rank_b) {
+        store64(parent + ra * 8, rb);
+    } else {
+        if (rank_a > rank_b) {
+            store64(parent + rb * 8, ra);
+        } else {
+            store64(parent + rb * 8, ra);
+            store64(rank_arr + ra * 8, rank_a + 1);
+        }
+    }
+    return 1;
+}
+
+fn detect_islands(contacts, n_contacts, n_bodies) {
+    var result = vec_new();  # vec of vecs
+    if (n_bodies == 0) { return result; }
+
+    var uf = _col_uf_new(n_bodies);
+
+    # Build forest from contact edges
+    for (var ci = 0; ci < n_contacts; ci = ci + 1) {
+        var c = vec_get(contacts, ci);
+        var ba = ColContact_body_a(c);
+        var bb = ColContact_body_b(c);
+        if (ba < n_bodies) {
+            if (bb < n_bodies) {
+                _col_uf_union(uf, ba, bb);
+            }
+        }
+    }
+
+    # Collect components: map root -> component index
+    # Use a flat array of size n_bodies for the mapping
+    var comp_index = alloc(n_bodies * 8);
+    for (var i = 0; i < n_bodies; i = i + 1) {
+        store64(comp_index + i * 8, _COL_SENTINEL);
+    }
+    var n_comp = 0;
+
+    for (var body = 0; body < n_bodies; body = body + 1) {
+        var root = _col_uf_find(uf, body);
+        var idx = load64(comp_index + root * 8);
+        if (idx == _COL_SENTINEL) {
+            idx = n_comp;
+            store64(comp_index + root * 8, idx);
+            vec_push(result, vec_new());
+            n_comp = n_comp + 1;
+        }
+        var island = vec_get(result, idx);
+        vec_push(island, body);
+    }
+
+    return result;
+}

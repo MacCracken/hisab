@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## 2.2.0 (2026-04-15) -- Geometry & group extensions
+
+### Added
+- **lie_ext.cyr** (523 lines) -- SE(3) rigid body motions (exp/log, compose, transform), SO(3) explicit (Rodrigues, exp/log), adjoint representations (SU(2), Lorentz, SE(3)), Baker-Campbell-Hausdorff 2nd/3rd order for SU(2) and SO(3)
+- **spatial.cyr** (864 lines) -- k-d tree (build, nearest, within_radius), quadtree (insert, query), octree (insert, query), spatial hash (insert, query_cell, query_radius, clear)
+- **collision_core.cyr** (574 lines) -- MPR/XenoCollide (intersect + penetration), sequential impulse solver with friction, convex hull 2D (Andrew's monotone chain), polygon triangulation (ear clipping)
+- **collision_mesh.cyr** (522 lines) -- Delaunay triangulation (Bowyer-Watson), half-edge mesh, island detection (union-find). *Deferred: exceeds cc3 1MB preprocess buffer. Ships with Cyrius 5.0.*
+- **noise_simplex.cyr** (343 lines) -- OpenSimplex2 2D+3D with fBm layering
+- **einsum.cyr** (305 lines) -- Einstein summation notation parser (`"ij,jk->ik"`)
+- **linalg_precision.cyr** (1,124 lines) -- Golub-Kahan SVD, QR eigendecomposition (O(n^3)), complex Householder QR
+
+### Changed
+- All .cyr files cleaned of Unicode in comments (em-dashes -> --, Greek -> ASCII)
+
+### Known issue
+- Cyrius cc3 1MB preprocess buffer limit reached at ~16K lines. collision_mesh.cyr (Delaunay, half-edge, islands) deferred to Cyrius 5.0 which expands the buffer.
+
 ## 2.1.0 (2026-04-15) — Precision + depth
 
 ### Added

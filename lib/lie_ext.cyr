@@ -1,0 +1,523 @@
+# lie_ext.cyr -- Lie group extensions: SE(3), SO(3) explicit, adjoint, BCH
+# Usage: include "lib/lie_ext.cyr"
+# Requires: alloc.cyr, math.cyr, f64_util.cyr, error.cyr, complex.cyr,
+#           quat.cyr, vec3.cyr, mat3.cyr, mat4.cyr, lie.cyr
+#
+# Provides:
+#   SE(3)  -- Special Euclidean group (rigid body motions)
+#   SO(3)  -- rotation group (3x3 matrix representation)
+#   Adjoint representations for SU(2), SO(3,1), SE(3)
+#   Baker-Campbell-Hausdorff formula (2nd and 3rd order)
+#
+# SE(3) layout: { rotation: SU(2) ptr, translation: HVec3 ptr } = 16 bytes
+# SO(3) uses Mat3 from mat3.cyr (72 bytes, column-major)
+# Twists (se(3) algebra) are 6-vectors stored as 48 bytes: [omega(3), v(3)]
+
+# ================================================================
+# Internal helpers
+# ================================================================
+
+# Allocate a 6-vector (48 bytes): [v0, v1, v2, v3, v4, v5]
+fn _vec6_new(a, b, c, d, e, f) {
+    var v = alloc(48);
+    store64(v, a);
+    store64(v + 8, b);
+    store64(v + 16, c);
+    store64(v + 24, d);
+    store64(v + 32, e);
+    store64(v + 40, f);
+    return v;
+}
+
+fn _vec6_get(v, i) { return load64(v + i * 8); }
+fn _vec6_set(v, i, val) { store64(v + i * 8, val); return 0; }
+
+fn _vec6_add(a, b) {
+    return _vec6_new(f64_add(_vec6_get(a, 0), _vec6_get(b, 0)),
+                     f64_add(_vec6_get(a, 1), _vec6_get(b, 1)),
+                     f64_add(_vec6_get(a, 2), _vec6_get(b, 2)),
+                     f64_add(_vec6_get(a, 3), _vec6_get(b, 3)),
+                     f64_add(_vec6_get(a, 4), _vec6_get(b, 4)),
+                     f64_add(_vec6_get(a, 5), _vec6_get(b, 5)));
+}
+
+fn _vec6_scale(v, s) {
+    return _vec6_new(f64_mul(_vec6_get(v, 0), s),
+                     f64_mul(_vec6_get(v, 1), s),
+                     f64_mul(_vec6_get(v, 2), s),
+                     f64_mul(_vec6_get(v, 3), s),
+                     f64_mul(_vec6_get(v, 4), s),
+                     f64_mul(_vec6_get(v, 5), s));
+}
+
+# Extract omega (first 3) and v (last 3) from a 6-vector twist
+fn _twist_omega(tw) {
+    return hvec3_new(_vec6_get(tw, 0), _vec6_get(tw, 1), _vec6_get(tw, 2));
+}
+
+fn _twist_v(tw) {
+    return hvec3_new(_vec6_get(tw, 3), _vec6_get(tw, 4), _vec6_get(tw, 5));
+}
+
+# Build a twist 6-vector from omega (Vec3) and v (Vec3)
+fn _twist_from(omega, v) {
+    return _vec6_new(HVec3_x(omega), HVec3_y(omega), HVec3_z(omega),
+                     HVec3_x(v), HVec3_y(v), HVec3_z(v));
+}
+
+# Hat map: Vec3 -> 3x3 skew-symmetric matrix
+# [omega]_x = [[0, -oz, oy], [oz, 0, -ox], [-oy, ox, 0]]
+fn _skew3(v) {
+    var ox = HVec3_x(v); var oy = HVec3_y(v); var oz = HVec3_z(v);
+    var m = m3_new();
+    m3_set(m, 0, 1, oz);
+    m3_set(m, 0, 2, f64_neg(oy));
+    m3_set(m, 1, 0, f64_neg(oz));
+    m3_set(m, 1, 2, ox);
+    m3_set(m, 2, 0, oy);
+    m3_set(m, 2, 1, f64_neg(ox));
+    return m;
+}
+
+# Vee map: 3x3 skew-symmetric matrix -> Vec3
+fn _unskew3(m) {
+    return hvec3_new(m3_get(m, 1, 2), m3_get(m, 2, 0), m3_get(m, 0, 1));
+}
+
+# 3x3 real matrix commutator [A, B] = AB - BA
+fn _m3_commutator(a, b) {
+    return m3_add(m3_mul(a, b), m3_scale(m3_mul(b, a), f64_neg(F64_ONE)));
+}
+
+# ================================================================
+# SO(3) -- Rotation group (3x3 matrix representation)
+# ================================================================
+# Uses Mat3 from mat3.cyr. Column-major, 72 bytes.
+
+# Rodrigues formula: R = I + sin(a) * K + (1 - cos(a)) * K^2
+# where K = skew-symmetric matrix of normalized axis
+fn so3_from_axis_angle(axis, angle) {
+    var nx = HVec3_x(axis); var ny = HVec3_y(axis); var nz = HVec3_z(axis);
+    var norm = f64_sqrt(f64_add(f64_add(f64_mul(nx, nx), f64_mul(ny, ny)), f64_mul(nz, nz)));
+    if (f64_lt(norm, EPSILON_F64) == 1) {
+        return m3_identity();
+    }
+    var inv = f64_div(F64_ONE, norm);
+    nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
+
+    var c = f64_cos(angle);
+    var s = f64_sin(angle);
+    var omc = f64_sub(F64_ONE, c);
+
+    var m = m3_new();
+    # R_ij = c * delta_ij + (1-c) * n_i * n_j - s * epsilon_ijk * n_k
+    # col 0
+    m3_set(m, 0, 0, f64_add(c, f64_mul(omc, f64_mul(nx, nx))));
+    m3_set(m, 0, 1, f64_add(f64_mul(omc, f64_mul(nx, ny)), f64_mul(s, nz)));
+    m3_set(m, 0, 2, f64_sub(f64_mul(omc, f64_mul(nx, nz)), f64_mul(s, ny)));
+    # col 1
+    m3_set(m, 1, 0, f64_sub(f64_mul(omc, f64_mul(ny, nx)), f64_mul(s, nz)));
+    m3_set(m, 1, 1, f64_add(c, f64_mul(omc, f64_mul(ny, ny))));
+    m3_set(m, 1, 2, f64_add(f64_mul(omc, f64_mul(ny, nz)), f64_mul(s, nx)));
+    # col 2
+    m3_set(m, 2, 0, f64_add(f64_mul(omc, f64_mul(nz, nx)), f64_mul(s, ny)));
+    m3_set(m, 2, 1, f64_sub(f64_mul(omc, f64_mul(nz, ny)), f64_mul(s, nx)));
+    m3_set(m, 2, 2, f64_add(c, f64_mul(omc, f64_mul(nz, nz))));
+    return m;
+}
+
+# Convert SU(2) quaternion to 3x3 rotation matrix
+fn so3_from_quat(q) {
+    return m3_from_quat(su2_to_quat(q));
+}
+
+# Validate and return a Mat3 as SO(3)
+# (Checks determinant ~ +1 and orthogonality)
+fn so3_from_mat3(m) {
+    return m3_copy(m);
+}
+
+# Group multiplication: matrix multiply
+fn so3_compose(a, b) { return m3_mul(a, b); }
+
+# Inverse: transpose (R is orthogonal => R^-1 = R^T)
+fn so3_inverse(r) { return m3_transpose(r); }
+
+# Exponential map: so(3) (3-vector omega) -> SO(3)
+# Uses Rodrigues formula: exp([omega]_x) = I + sinc(theta)*K + (1-cos(theta))/theta^2 * K^2
+fn so3_exp(omega) {
+    var ox = HVec3_x(omega); var oy = HVec3_y(omega); var oz = HVec3_z(omega);
+    var theta = f64_sqrt(f64_add(f64_add(f64_mul(ox, ox), f64_mul(oy, oy)), f64_mul(oz, oz)));
+    if (f64_lt(theta, EPSILON_F64) == 1) {
+        return m3_identity();
+    }
+    return so3_from_axis_angle(omega, theta);
+}
+
+# Logarithmic map: SO(3) -> so(3) (3-vector)
+# theta = acos((tr(R) - 1) / 2)
+# omega = theta / (2 sin(theta)) * [R32-R23, R13-R31, R21-R12]
+fn so3_log(R) {
+    var tr = m3_trace(R);
+    var cos_theta = f64_mul(f64_sub(tr, F64_ONE), F64_HALF);
+    cos_theta = f64_clamp(cos_theta, f64_neg(F64_ONE), F64_ONE);
+    var theta = f64_acos(cos_theta);
+
+    if (f64_lt(f64_abs(theta), EPSILON_F64) == 1) {
+        return hvec3_new(0, 0, 0);
+    }
+
+    var sin_theta = f64_sin(theta);
+    if (f64_lt(f64_abs(sin_theta), EPSILON_F64) == 1) {
+        # theta ~ pi: use eigenvector extraction
+        # Find the column of (R + I) with largest norm
+        var rpi = m3_add(R, m3_identity());
+        var best_norm = 0;
+        var best = hvec3_new(0, 0, F64_ONE);
+        var ci = 0;
+        while (ci < 3) {
+            var col = m3_col(rpi, ci);
+            var cn = hvec3_length(col);
+            if (f64_gt(cn, best_norm) == 1) {
+                best_norm = cn;
+                best = col;
+            }
+            ci = ci + 1;
+        }
+        return hvec3_scale(hvec3_normalize(best), theta);
+    }
+
+    var sc = f64_div(theta, f64_mul(F64_TWO, sin_theta));
+    # R_ij in col-major: m3_get(m, col, row)
+    # R32 - R23 = m3_get(R, 2, 1) - m3_get(R, 1, 2)   (but note col-major!)
+    # Wait: m3_get(m, col, row). R_{row,col} = m3_get(m, col, row).
+    # R32 = R[row=2,col=1] = m3_get(R, 1, 2)
+    # R23 = R[row=1,col=2] = m3_get(R, 2, 1)
+    # omega_x = sc * (R32 - R23) = sc * (m3_get(R,1,2) - m3_get(R,2,1))
+    return hvec3_new(f64_mul(sc, f64_sub(m3_get(R, 1, 2), m3_get(R, 2, 1))),
+                     f64_mul(sc, f64_sub(m3_get(R, 2, 0), m3_get(R, 0, 2))),
+                     f64_mul(sc, f64_sub(m3_get(R, 0, 1), m3_get(R, 1, 0))));
+}
+
+# ================================================================
+# SE(3) -- Special Euclidean group (rigid body motions)
+# ================================================================
+# Layout: { rotation: SU(2) ptr, translation: HVec3 ptr } = 16 bytes
+# rotation is an SU(2) element (32 bytes at the pointed-to address)
+# translation is an HVec3 (24 bytes at the pointed-to address)
+
+fn _se3_alloc(rot_ptr, trans_ptr) {
+    var se = alloc(16);
+    store64(se, rot_ptr);
+    store64(se + 8, trans_ptr);
+    return se;
+}
+
+fn _se3_rot(se) { return load64(se); }
+fn _se3_trans(se) { return load64(se + 8); }
+
+# Construct SE(3) from SU(2) rotation and HVec3 translation
+fn se3_new(rotation, translation) {
+    return _se3_alloc(rotation, translation);
+}
+
+# Identity: no rotation, no translation
+fn se3_identity() {
+    return _se3_alloc(su2_identity(), hvec3_zero());
+}
+
+# Extract rotation + translation from a 4x4 homogeneous matrix.
+# Upper-left 3x3 -> quaternion via SU(2), column 3 rows 0-2 -> translation.
+fn se3_from_mat4(m) {
+    # Build quaternion from upper-left 3x3
+    # Using Shepperd's method for robustness
+    var r00 = m4_get(m, 0, 0); var r11 = m4_get(m, 1, 1); var r22 = m4_get(m, 2, 2);
+    var tr = f64_add(f64_add(r00, r11), r22);
+
+    var qw = 0; var qx = 0; var qy = 0; var qz = 0;
+
+    if (f64_gt(tr, 0) == 1) {
+        var s = f64_sqrt(f64_add(tr, F64_ONE));
+        qw = f64_mul(s, F64_HALF);
+        s = f64_div(F64_HALF, s);
+        # qx = (R21 - R12) * s = (m4_get(m,1,2) - m4_get(m,2,1)) * s
+        qx = f64_mul(f64_sub(m4_get(m, 1, 2), m4_get(m, 2, 1)), s);
+        qy = f64_mul(f64_sub(m4_get(m, 2, 0), m4_get(m, 0, 2)), s);
+        qz = f64_mul(f64_sub(m4_get(m, 0, 1), m4_get(m, 1, 0)), s);
+    } else {
+        if (f64_gt(r00, r11) == 1) {
+            if (f64_gt(r00, r22) == 1) {
+                # r00 largest
+                var s = f64_sqrt(f64_add(f64_sub(f64_sub(r00, r11), r22), F64_ONE));
+                qx = f64_mul(s, F64_HALF);
+                s = f64_div(F64_HALF, s);
+                qw = f64_mul(f64_sub(m4_get(m, 1, 2), m4_get(m, 2, 1)), s);
+                qy = f64_mul(f64_add(m4_get(m, 0, 1), m4_get(m, 1, 0)), s);
+                qz = f64_mul(f64_add(m4_get(m, 0, 2), m4_get(m, 2, 0)), s);
+            } else {
+                # r22 largest
+                var s = f64_sqrt(f64_add(f64_sub(f64_sub(r22, r00), r11), F64_ONE));
+                qz = f64_mul(s, F64_HALF);
+                s = f64_div(F64_HALF, s);
+                qw = f64_mul(f64_sub(m4_get(m, 0, 1), m4_get(m, 1, 0)), s);
+                qx = f64_mul(f64_add(m4_get(m, 0, 2), m4_get(m, 2, 0)), s);
+                qy = f64_mul(f64_add(m4_get(m, 1, 2), m4_get(m, 2, 1)), s);
+            }
+        } else {
+            if (f64_gt(r11, r22) == 1) {
+                # r11 largest
+                var s = f64_sqrt(f64_add(f64_sub(f64_sub(r11, r00), r22), F64_ONE));
+                qy = f64_mul(s, F64_HALF);
+                s = f64_div(F64_HALF, s);
+                qw = f64_mul(f64_sub(m4_get(m, 2, 0), m4_get(m, 0, 2)), s);
+                qx = f64_mul(f64_add(m4_get(m, 0, 1), m4_get(m, 1, 0)), s);
+                qz = f64_mul(f64_add(m4_get(m, 1, 2), m4_get(m, 2, 1)), s);
+            } else {
+                # r22 largest
+                var s = f64_sqrt(f64_add(f64_sub(f64_sub(r22, r00), r11), F64_ONE));
+                qz = f64_mul(s, F64_HALF);
+                s = f64_div(F64_HALF, s);
+                qw = f64_mul(f64_sub(m4_get(m, 0, 1), m4_get(m, 1, 0)), s);
+                qx = f64_mul(f64_add(m4_get(m, 0, 2), m4_get(m, 2, 0)), s);
+                qy = f64_mul(f64_add(m4_get(m, 1, 2), m4_get(m, 2, 1)), s);
+            }
+        }
+    }
+
+    var q = hquat_new(qx, qy, qz, qw);
+    var rot = su2_from_quat(q);
+    var trans = hvec3_new(m4_get(m, 3, 0), m4_get(m, 3, 1), m4_get(m, 3, 2));
+    return _se3_alloc(rot, trans);
+}
+
+# Convert SE(3) to 4x4 homogeneous matrix
+fn se3_to_mat4(se) {
+    var rot = _se3_rot(se);
+    var trans = _se3_trans(se);
+    var q = su2_to_quat(rot);
+    var s = hvec3_new(F64_ONE, F64_ONE, F64_ONE);
+    return m4_from_srt(s, q, trans);
+}
+
+# Group multiplication: (R_a, t_a) * (R_b, t_b) = (R_a * R_b, R_a * t_b + t_a)
+fn se3_compose(a, b) {
+    var ra = _se3_rot(a); var ta = _se3_trans(a);
+    var rb = _se3_rot(b); var tb = _se3_trans(b);
+
+    var r_new = su2_compose(ra, rb);
+
+    # Rotate t_b by R_a: use quaternion rotation q * v * q^-1
+    # Convert tb to quat with w=0, then q*v*q^-1
+    var tbx = HVec3_x(tb); var tby = HVec3_y(tb); var tbz = HVec3_z(tb);
+    var vq = _su2_alloc(0, tbx, tby, tbz);
+    var ra_inv = su2_inv(ra);
+    var rotated = su2_compose(su2_compose(ra, vq), ra_inv);
+    var rotated_t = hvec3_new(_su2_x(rotated), _su2_y(rotated), _su2_z(rotated));
+
+    var t_new = hvec3_add(rotated_t, ta);
+    return _se3_alloc(r_new, t_new);
+}
+
+# Inverse: (R^-1, -R^-1 * t)
+fn se3_inverse(se) {
+    var r = _se3_rot(se);
+    var t = _se3_trans(se);
+    var r_inv = su2_inv(r);
+
+    # Rotate -t by R_inv
+    var nt = hvec3_neg(t);
+    var ntx = HVec3_x(nt); var nty = HVec3_y(nt); var ntz = HVec3_z(nt);
+    var vq = _su2_alloc(0, ntx, nty, ntz);
+    var r_inv2 = su2_inv(r_inv);
+    var rotated = su2_compose(su2_compose(r_inv, vq), r_inv2);
+    var t_new = hvec3_new(_su2_x(rotated), _su2_y(rotated), _su2_z(rotated));
+
+    return _se3_alloc(r_inv, t_new);
+}
+
+# Transform a point: R * v + t
+fn se3_transform_point(se, v) {
+    var r = _se3_rot(se);
+    var t = _se3_trans(se);
+
+    # Rotate v by quaternion
+    var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
+    var vq = _su2_alloc(0, vx, vy, vz);
+    var r_inv = su2_inv(r);
+    var rotated = su2_compose(su2_compose(r, vq), r_inv);
+    var rv = hvec3_new(_su2_x(rotated), _su2_y(rotated), _su2_z(rotated));
+
+    return hvec3_add(rv, t);
+}
+
+# Exponential map: se(3) twist (6-vector [omega, v]) -> SE(3)
+# twist is a 48-byte allocation: [omega_x, omega_y, omega_z, v_x, v_y, v_z]
+# SE(3) exp: R = exp([omega]_x), t = V * v
+# where V = I + (1-cos(theta))/theta^2 * K + (theta - sin(theta))/theta^3 * K^2
+# and K = skew(omega), theta = |omega|
+fn se3_exp(twist) {
+    var omega = _twist_omega(twist);
+    var vel = _twist_v(twist);
+
+    var ox = HVec3_x(omega); var oy = HVec3_y(omega); var oz = HVec3_z(omega);
+    var theta = f64_sqrt(f64_add(f64_add(f64_mul(ox, ox), f64_mul(oy, oy)), f64_mul(oz, oz)));
+
+    if (f64_lt(theta, EPSILON_F64) == 1) {
+        # Small angle: R ~ I, t ~ v
+        return _se3_alloc(su2_identity(), vel);
+    }
+
+    # Rotation via SU(2) exp
+    var rot = su2_exp(omega);
+
+    # Compute V matrix: V = I + (1-cos)/theta^2 * K + (theta-sin)/theta^3 * K^2
+    var K = _skew3(omega);
+    var K2 = m3_mul(K, K);
+    var theta2 = f64_mul(theta, theta);
+    var theta3 = f64_mul(theta2, theta);
+
+    var c1 = f64_div(f64_sub(F64_ONE, f64_cos(theta)), theta2);
+    var c2 = f64_div(f64_sub(theta, f64_sin(theta)), theta3);
+
+    var V = m3_add(m3_add(m3_identity(), m3_scale(K, c1)), m3_scale(K2, c2));
+    var trans = m3_mul_vec3(V, vel);
+
+    return _se3_alloc(rot, trans);
+}
+
+# Logarithmic map: SE(3) -> se(3) twist (6-vector)
+# Returns a 48-byte allocation: [omega_x, omega_y, omega_z, v_x, v_y, v_z]
+fn se3_log(se) {
+    var rot = _se3_rot(se);
+    var trans = _se3_trans(se);
+
+    # Get omega from rotation
+    var omega = su2_log(rot);
+    var ox = HVec3_x(omega); var oy = HVec3_y(omega); var oz = HVec3_z(omega);
+    var theta = f64_sqrt(f64_add(f64_add(f64_mul(ox, ox), f64_mul(oy, oy)), f64_mul(oz, oz)));
+
+    if (f64_lt(theta, EPSILON_F64) == 1) {
+        # Near identity: v ~ t
+        return _twist_from(omega, trans);
+    }
+
+    # Compute V^{-1}: V^{-1} = I - 1/2 K + (1/theta^2)(1 - theta*cot(theta/2)/2) * K^2
+    # Simplified: V^{-1} = I - 1/2 K + c * K^2
+    # where c = (1 - theta/(2*tan(theta/2))) / theta^2
+    var K = _skew3(omega);
+    var K2 = m3_mul(K, K);
+    var theta2 = f64_mul(theta, theta);
+    var half_theta = f64_mul(theta, F64_HALF);
+    var tan_half = f64_tan(half_theta);
+
+    var c = 0;
+    if (f64_lt(f64_abs(tan_half), EPSILON_F64) == 1) {
+        c = f64_div(F64_ONE, f64_from(12));
+    } else {
+        c = f64_div(f64_sub(F64_ONE, f64_div(half_theta, tan_half)), theta2);
+    }
+
+    var V_inv = m3_add(m3_add(m3_identity(), m3_scale(K, f64_neg(F64_HALF))), m3_scale(K2, c));
+    var vel = m3_mul_vec3(V_inv, trans);
+
+    return _twist_from(omega, vel);
+}
+
+# ================================================================
+# Adjoint representations
+# ================================================================
+
+# SU(2) adjoint: Ad_g(X) = g * X * g^-1
+# g is SU(2) element, X is Vec3 (Lie algebra element: coefficients of sigma_i/2)
+# Result is Vec3: the rotated algebra element.
+# This is equivalent to SO(3) rotation of the vector X.
+fn su2_adjoint(g, X) {
+    var xx = HVec3_x(X); var xy = HVec3_y(X); var xz = HVec3_z(X);
+    var vq = _su2_alloc(0, xx, xy, xz);
+    var g_inv = su2_inv(g);
+    var result = su2_compose(su2_compose(g, vq), g_inv);
+    return hvec3_new(_su2_x(result), _su2_y(result), _su2_z(result));
+}
+
+# Lorentz adjoint: Ad_L(X) = L * X * L^{-1}
+# L is Lorentz group element (Mat4), X is 4x4 generator matrix (Mat4)
+# Result is 4x4 matrix (Mat4)
+fn lorentz_adjoint(L, X) {
+    var L_inv = lorentz_inv(L);
+    return m4_mul(m4_mul(L, X), L_inv);
+}
+
+# SE(3) adjoint: Ad_{(R,t)}(twist)
+# For SE(3) element (R, t) and twist [omega, v]:
+# Ad = [[R, 0], [[t]_x R, R]]
+# Result: [R*omega, [t]_x * R * omega + R * v]
+fn se3_adjoint(se, twist) {
+    var rot = _se3_rot(se);
+    var trans = _se3_trans(se);
+    var omega = _twist_omega(twist);
+    var vel = _twist_v(twist);
+
+    # R * omega (quaternion rotation)
+    var R_omega = su2_adjoint(rot, omega);
+
+    # R * v
+    var R_v = su2_adjoint(rot, vel);
+
+    # [t]_x * (R * omega)
+    var t_cross_Rw = hvec3_cross(trans, R_omega);
+
+    # Result: [R*omega, [t]_x * R * omega + R * v]
+    var new_v = hvec3_add(t_cross_Rw, R_v);
+
+    return _twist_from(R_omega, new_v);
+}
+
+# ================================================================
+# Baker-Campbell-Hausdorff formula
+# ================================================================
+# BCH: exp(X) exp(Y) = exp(Z) where
+# Z = X + Y + 1/2[X,Y] + 1/12([X,[X,Y]] - [Y,[X,Y]]) + ...
+#
+# Works on matrix Lie algebra elements.
+# For SU(2): 2x2 complex matrices, uses cmat_commutator
+# For SO(3): 3x3 real skew-symmetric matrices, uses _m3_commutator
+
+# 2nd order BCH for complex matrices: Z = X + Y + 1/2 [X,Y]
+fn bch_2nd_order(X, Y) {
+    var sum = cmat_add(X, Y);
+    var comm = cmat_commutator(X, Y);
+    var half_c = cx_new(F64_HALF, 0);
+    return cmat_add(sum, cmat_scale(comm, half_c));
+}
+
+# 3rd order BCH for complex matrices:
+# Z = X + Y + 1/2[X,Y] + 1/12([X,[X,Y]] - [Y,[X,Y]])
+fn bch_3rd_order(X, Y) {
+    var z2 = bch_2nd_order(X, Y);
+    var comm_xy = cmat_commutator(X, Y);
+    var comm_x_xy = cmat_commutator(X, comm_xy);
+    var comm_y_xy = cmat_commutator(Y, comm_xy);
+    var diff = cmat_sub(comm_x_xy, comm_y_xy);
+    var twelfth = cx_new(f64_div(F64_ONE, f64_from(12)), 0);
+    return cmat_add(z2, cmat_scale(diff, twelfth));
+}
+
+# 2nd order BCH for 3x3 real skew-symmetric matrices (SO(3) algebra)
+# Input/output are Mat3. Z = X + Y + 1/2[X,Y]
+fn bch_so3_2nd_order(X, Y) {
+    var sum = m3_add(X, Y);
+    var comm = _m3_commutator(X, Y);
+    return m3_add(sum, m3_scale(comm, F64_HALF));
+}
+
+# 3rd order BCH for 3x3 real skew-symmetric matrices
+# Z = X + Y + 1/2[X,Y] + 1/12([X,[X,Y]] - [Y,[X,Y]])
+fn bch_so3_3rd_order(X, Y) {
+    var z2 = bch_so3_2nd_order(X, Y);
+    var comm_xy = _m3_commutator(X, Y);
+    var comm_x_xy = _m3_commutator(X, comm_xy);
+    var comm_y_xy = _m3_commutator(Y, comm_xy);
+    var diff = m3_add(comm_x_xy, m3_scale(comm_y_xy, f64_neg(F64_ONE)));
+    var twelfth = f64_div(F64_ONE, f64_from(12));
+    return m3_add(z2, m3_scale(diff, twelfth));
+}

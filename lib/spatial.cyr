@@ -1,0 +1,864 @@
+# spatial.cyr -- spatial data structures: KdTree, Quadtree, Octree, SpatialHash
+# Usage: include "lib/spatial.cyr"
+# Requires: alloc.cyr, math.cyr, vec3.cyr, vec.cyr, geo.cyr, error.cyr
+#
+# Ported from hisab rust-old/src/geo/spatial.rs
+#
+# Conventions:
+#   - All f64 values are IEEE 754 bit patterns (same as rest of hisab)
+#   - Functions returning 1/0 indicate true/false
+#   - Pointers to nodes are heap-allocated via alloc/store64/load64
+#   - Results returned as vec (dynamic array from vec.cyr)
+
+# ================================================================
+# Local constants
+# ================================================================
+
+var _SP_F64_POS_INF = 0x7FF0_0000_0000_0000;  # +Infinity
+var _SP_QUADTREE_MAX_PER_NODE = 8;             # items before split
+
+# ================================================================
+# 1. KdTree -- k-d tree for 3D point queries
+# ================================================================
+#
+# Node layout (40 bytes):
+#   offset  0: point_idx  (i64) -- index into caller's point array (-1 for split)
+#   offset  8: split_axis (i64) -- 0=x, 1=y, 2=z
+#   offset 16: split_val  (f64) -- split plane value
+#   offset 24: left       (ptr) -- left child (or 0 for leaf)
+#   offset 32: right      (ptr) -- right child (or 0 for leaf)
+#
+# Leaf nodes: point_idx >= 0, left = 0, right = 0
+# Split nodes: point_idx = -1, left/right point to children
+
+fn _kd_node_alloc(point_idx, split_axis, split_val, left, right) {
+    var n = alloc(40);
+    store64(n, point_idx);
+    store64(n + 8, split_axis);
+    store64(n + 16, split_val);
+    store64(n + 24, left);
+    store64(n + 32, right);
+    return n;
+}
+
+fn _kd_node_point_idx(n) { return load64(n); }
+fn _kd_node_split_axis(n) { return load64(n + 8); }
+fn _kd_node_split_val(n) { return load64(n + 16); }
+fn _kd_node_left(n) { return load64(n + 24); }
+fn _kd_node_right(n) { return load64(n + 32); }
+
+# Get component of HVec3 by axis index (0=x, 1=y, 2=z)
+fn _kd_axis_val(point, axis) {
+    if (axis == 0) { return HVec3_x(point); }
+    if (axis == 1) { return HVec3_y(point); }
+    return HVec3_z(point);
+}
+
+# --- Median-of-three partitioning ---
+# Partition items[start..end) around median on given axis.
+# items_vec: vec of interleaved [point_ptr, index, point_ptr, index, ...]
+# Returns the median position (pair index).
+fn _kd_partition(items, points, start, end, axis) {
+    # Simple selection: find item closest to midpoint on axis
+    # First pass: find min/max on axis
+    var lo = _SP_F64_POS_INF;
+    var hi = f64_neg(_SP_F64_POS_INF);
+    for (var pi = start; pi < end; pi = pi + 1) {
+        var idx = vec_get(items, pi);
+        var pt = load64(points + idx * 8);
+        var v = _kd_axis_val(pt, axis);
+        if (f64_lt(v, lo) == 1) { lo = v; }
+        if (f64_gt(v, hi) == 1) { hi = v; }
+    }
+    var mid_val = f64_mul(f64_add(lo, hi), F64_HALF);
+
+    # Partition: items with val < mid_val go to front
+    var split = start;
+    for (var qi = start; qi < end; qi = qi + 1) {
+        var idx2 = vec_get(items, qi);
+        var pt2 = load64(points + idx2 * 8);
+        var v2 = _kd_axis_val(pt2, axis);
+        if (f64_lt(v2, mid_val) == 1) {
+            # Swap items[qi] and items[split]
+            var tmp = vec_get(items, split);
+            vec_set(items, split, vec_get(items, qi));
+            vec_set(items, qi, tmp);
+            split = split + 1;
+        }
+    }
+    # Ensure at least one item on each side
+    if (split == start) { split = start + 1; }
+    if (split == end) { split = end - 1; }
+    return split;
+}
+
+# Build k-d tree recursively.
+# items: vec of point indices, points: array of HVec3 pointers
+fn _kd_build_rec(items, points, start, end, depth) {
+    var count = end - start;
+    if (count == 1) {
+        var idx = vec_get(items, start);
+        return _kd_node_alloc(idx, 0, 0, 0, 0);
+    }
+
+    var axis = depth % 3;
+    var split = _kd_partition(items, points, start, end, axis);
+
+    # Split value: axis value of first item in right partition
+    var split_idx = vec_get(items, split);
+    var split_pt = load64(points + split_idx * 8);
+    var split_val = _kd_axis_val(split_pt, axis);
+
+    var left = _kd_build_rec(items, points, start, split, depth + 1);
+    var right = _kd_build_rec(items, points, split, end, depth + 1);
+
+    return _kd_node_alloc(0 - 1, axis, split_val, left, right);
+}
+
+# Build a k-d tree from an array of HVec3 pointers.
+# points: pointer to array of HVec3 ptrs (points[i] = load64(points + i*8))
+# count: number of points
+# Returns: root node pointer
+fn kdtree_build(points, count) {
+    if (count == 0) { return 0; }
+
+    # Build index list
+    var items = vec_new();
+    for (var i = 0; i < count; i = i + 1) {
+        vec_push(items, i);
+    }
+
+    return _kd_build_rec(items, points, 0, count, 0);
+}
+
+# --- Nearest neighbor search ---
+# best_out: pointer to 16-byte block { best_idx (i64), best_dist_sq (f64) }
+
+fn _kd_nearest_rec(node, points, query, best_out) {
+    if (node == 0) { return 0; }
+
+    var pidx = _kd_node_point_idx(node);
+
+    if (pidx >= 0) {
+        # Leaf node
+        var pt = load64(points + pidx * 8);
+        var diff = hvec3_sub(pt, query);
+        var dist_sq = hvec3_dot(diff, diff);
+        if (f64_lt(dist_sq, load64(best_out + 8)) == 1) {
+            store64(best_out, pidx);
+            store64(best_out + 8, dist_sq);
+        }
+        return 0;
+    }
+
+    # Split node
+    var axis = _kd_node_split_axis(node);
+    var split_val = _kd_node_split_val(node);
+    var query_val = _kd_axis_val(query, axis);
+    var d = f64_sub(query_val, split_val);
+
+    # Visit closer side first
+    var near = 0;
+    var far = 0;
+    if (f64_lt(d, 0) == 1) {
+        near = _kd_node_left(node);
+        far = _kd_node_right(node);
+    } else {
+        near = _kd_node_right(node);
+        far = _kd_node_left(node);
+    }
+
+    _kd_nearest_rec(near, points, query, best_out);
+
+    # Only visit far side if splitting plane is closer than current best
+    var d_sq = f64_mul(d, d);
+    if (f64_lt(d_sq, load64(best_out + 8)) == 1) {
+        _kd_nearest_rec(far, points, query, best_out);
+    }
+
+    return 0;
+}
+
+# Find nearest neighbor to query point.
+# Returns index of nearest point, or -1 if tree is empty.
+fn kdtree_nearest(root, points, query) {
+    if (root == 0) { return 0 - 1; }
+
+    var best_out = alloc(16);
+    store64(best_out, 0 - 1);          # best_idx
+    store64(best_out + 8, _SP_F64_POS_INF);  # best_dist_sq
+
+    _kd_nearest_rec(root, points, query, best_out);
+
+    return load64(best_out);
+}
+
+# --- Radius search ---
+
+fn _kd_radius_rec(node, points, query, radius_sq, results) {
+    if (node == 0) { return 0; }
+
+    var pidx = _kd_node_point_idx(node);
+
+    if (pidx >= 0) {
+        # Leaf node
+        var pt = load64(points + pidx * 8);
+        var diff = hvec3_sub(pt, query);
+        var dist_sq = hvec3_dot(diff, diff);
+        if (f64_le(dist_sq, radius_sq) == 1) {
+            vec_push(results, pidx);
+        }
+        return 0;
+    }
+
+    # Split node
+    var axis = _kd_node_split_axis(node);
+    var split_val = _kd_node_split_val(node);
+    var query_val = _kd_axis_val(query, axis);
+    var d = f64_sub(query_val, split_val);
+
+    var near = 0;
+    var far = 0;
+    if (f64_lt(d, 0) == 1) {
+        near = _kd_node_left(node);
+        far = _kd_node_right(node);
+    } else {
+        near = _kd_node_right(node);
+        far = _kd_node_left(node);
+    }
+
+    _kd_radius_rec(near, points, query, radius_sq, results);
+
+    var d_sq = f64_mul(d, d);
+    if (f64_le(d_sq, radius_sq) == 1) {
+        _kd_radius_rec(far, points, query, radius_sq, results);
+    }
+
+    return 0;
+}
+
+# Find all points within radius of query.
+# Returns vec of point indices.
+fn kdtree_within_radius(root, points, query, radius) {
+    var results = vec_new();
+    if (root == 0) { return results; }
+
+    var radius_sq = f64_mul(radius, radius);
+    _kd_radius_rec(root, points, query, radius_sq, results);
+
+    return results;
+}
+
+
+# ================================================================
+# 2. Quadtree -- 2D spatial subdivision
+# ================================================================
+#
+# Bounds layout (32 bytes):
+#   offset  0: x_min (f64)
+#   offset  8: y_min (f64)
+#   offset 16: x_max (f64)
+#   offset 24: y_max (f64)
+#
+# Node layout (56 bytes):
+#   offset  0: bounds   (ptr) -- pointer to bounds
+#   offset  8: points   (ptr) -- vec of interleaved [x, y, data, x, y, data, ...]
+#   offset 16: child_0  (ptr) -- NW child (0 if not split)
+#   offset 24: child_1  (ptr) -- NE child
+#   offset 32: child_2  (ptr) -- SW child
+#   offset 40: child_3  (ptr) -- SE child
+#   offset 48: depth    (i64)
+
+fn _qt_bounds_new(x_min, y_min, x_max, y_max) {
+    var b = alloc(32);
+    store64(b, x_min);
+    store64(b + 8, y_min);
+    store64(b + 16, x_max);
+    store64(b + 24, y_max);
+    return b;
+}
+
+fn _qt_bounds_xmin(b) { return load64(b); }
+fn _qt_bounds_ymin(b) { return load64(b + 8); }
+fn _qt_bounds_xmax(b) { return load64(b + 16); }
+fn _qt_bounds_ymax(b) { return load64(b + 24); }
+
+fn _qt_bounds_cx(b) { return f64_mul(f64_add(load64(b), load64(b + 16)), F64_HALF); }
+fn _qt_bounds_cy(b) { return f64_mul(f64_add(load64(b + 8), load64(b + 24)), F64_HALF); }
+
+fn _qt_bounds_contains(b, x, y) {
+    if (f64_lt(x, load64(b)) == 1) { return 0; }
+    if (f64_gt(x, load64(b + 16)) == 1) { return 0; }
+    if (f64_lt(y, load64(b + 8)) == 1) { return 0; }
+    if (f64_gt(y, load64(b + 24)) == 1) { return 0; }
+    return 1;
+}
+
+fn _qt_bounds_overlaps(a, b) {
+    if (f64_gt(load64(a), load64(b + 16)) == 1) { return 0; }       # a.xmin > b.xmax
+    if (f64_gt(load64(b), load64(a + 16)) == 1) { return 0; }       # b.xmin > a.xmax
+    if (f64_gt(load64(a + 8), load64(b + 24)) == 1) { return 0; }   # a.ymin > b.ymax
+    if (f64_gt(load64(b + 8), load64(a + 24)) == 1) { return 0; }   # b.ymin > a.ymax
+    return 1;
+}
+
+fn _qt_node_new(bounds, depth) {
+    var n = alloc(56);
+    store64(n, bounds);
+    store64(n + 8, vec_new());   # points vec (interleaved x, y, data)
+    store64(n + 16, 0);          # child_0 NW
+    store64(n + 24, 0);          # child_1 NE
+    store64(n + 32, 0);          # child_2 SW
+    store64(n + 40, 0);          # child_3 SE
+    store64(n + 48, depth);
+    return n;
+}
+
+fn _qt_node_bounds(n) { return load64(n); }
+fn _qt_node_points(n) { return load64(n + 8); }
+fn _qt_node_child(n, i) { return load64(n + 16 + i * 8); }
+fn _qt_node_depth(n) { return load64(n + 48); }
+fn _qt_node_set_child(n, i, c) { store64(n + 16 + i * 8, c); return 0; }
+fn _qt_node_is_split(n) { if (load64(n + 16) != 0) { return 1; } return 0; }
+
+# Determine quadrant: NW=0, NE=1, SW=2, SE=3
+fn _qt_quadrant(x, y, cx, cy) {
+    var qx = 0;
+    if (f64_ge(x, cx) == 1) { qx = 1; }
+    var qy = 0;
+    if (f64_lt(y, cy) == 1) { qy = 2; }
+    return qx + qy;
+}
+
+# Get child bounds for a quadrant
+fn _qt_child_bounds(parent_bounds, quadrant) {
+    var xmin = _qt_bounds_xmin(parent_bounds);
+    var ymin = _qt_bounds_ymin(parent_bounds);
+    var xmax = _qt_bounds_xmax(parent_bounds);
+    var ymax = _qt_bounds_ymax(parent_bounds);
+    var cx = _qt_bounds_cx(parent_bounds);
+    var cy = _qt_bounds_cy(parent_bounds);
+
+    # NW=0: (xmin,cy) to (cx,ymax)
+    if (quadrant == 0) { return _qt_bounds_new(xmin, cy, cx, ymax); }
+    # NE=1: (cx,cy) to (xmax,ymax)
+    if (quadrant == 1) { return _qt_bounds_new(cx, cy, xmax, ymax); }
+    # SW=2: (xmin,ymin) to (cx,cy)
+    if (quadrant == 2) { return _qt_bounds_new(xmin, ymin, cx, cy); }
+    # SE=3: (cx,ymin) to (xmax,cy)
+    return _qt_bounds_new(cx, ymin, xmax, cy);
+}
+
+# Split a leaf node into 4 children, redistributing existing points
+fn _qt_split(node, max_depth) {
+    var bounds = _qt_node_bounds(node);
+    var pts = _qt_node_points(node);
+    var depth = _qt_node_depth(node);
+
+    # Create children
+    for (var ci = 0; ci < 4; ci = ci + 1) {
+        var cb = _qt_child_bounds(bounds, ci);
+        _qt_node_set_child(node, ci, _qt_node_new(cb, depth + 1));
+    }
+
+    # Redistribute existing points
+    var cx = _qt_bounds_cx(bounds);
+    var cy = _qt_bounds_cy(bounds);
+    var count = vec_len(pts) / 3;  # 3 entries per point: x, y, data
+    for (var pi = 0; pi < count; pi = pi + 1) {
+        var px = vec_get(pts, pi * 3);
+        var py = vec_get(pts, pi * 3 + 1);
+        var pd = vec_get(pts, pi * 3 + 2);
+        var q = _qt_quadrant(px, py, cx, cy);
+        var child = _qt_node_child(node, q);
+        _qt_insert_rec(child, px, py, pd, max_depth);
+    }
+
+    # Clear the points vec (node is now a split node, points live in children)
+    # We leave the vec allocated but reset its length
+    store64(pts + 8, 0);
+
+    return 0;
+}
+
+fn _qt_insert_rec(node, x, y, data, max_depth) {
+    if (_qt_node_is_split(node) == 1) {
+        # Route to correct child
+        var bounds = _qt_node_bounds(node);
+        var cx = _qt_bounds_cx(bounds);
+        var cy = _qt_bounds_cy(bounds);
+        var q = _qt_quadrant(x, y, cx, cy);
+        var child = _qt_node_child(node, q);
+        return _qt_insert_rec(child, x, y, data, max_depth);
+    }
+
+    # Leaf node: add point
+    var pts = _qt_node_points(node);
+    vec_push(pts, x);
+    vec_push(pts, y);
+    vec_push(pts, data);
+
+    var count = vec_len(pts) / 3;
+    var depth = _qt_node_depth(node);
+
+    # Split if over capacity and below max depth
+    if (count > _SP_QUADTREE_MAX_PER_NODE) {
+        if (depth < max_depth) {
+            _qt_split(node, max_depth);
+        }
+    }
+
+    return 0;
+}
+
+# Create an empty quadtree.
+# x_min, y_min, x_max, y_max: bounds (f64)
+# max_depth: maximum subdivision depth (integer)
+# Returns: root node pointer
+fn quadtree_new(x_min, y_min, x_max, y_max, max_depth) {
+    # Wrap in a handle: { root_node, max_depth, count }
+    var qt = alloc(24);
+    var bounds = _qt_bounds_new(x_min, y_min, x_max, y_max);
+    store64(qt, _qt_node_new(bounds, 0));
+    store64(qt + 8, max_depth);
+    store64(qt + 16, 0);  # count
+    return qt;
+}
+
+# Insert a point with associated data (i64) into the quadtree.
+fn quadtree_insert(qt, x, y, data) {
+    var root = load64(qt);
+    var max_depth = load64(qt + 8);
+    var bounds = _qt_node_bounds(root);
+
+    # Ignore out-of-bounds points
+    if (_qt_bounds_contains(bounds, x, y) == 0) { return 0; }
+
+    _qt_insert_rec(root, x, y, data, max_depth);
+    store64(qt + 16, load64(qt + 16) + 1);
+    return 1;
+}
+
+# --- Quadtree range query ---
+
+fn _qt_query_rec(node, query_bounds, results) {
+    if (node == 0) { return 0; }
+
+    var bounds = _qt_node_bounds(node);
+    if (_qt_bounds_overlaps(bounds, query_bounds) == 0) { return 0; }
+
+    if (_qt_node_is_split(node) == 1) {
+        for (var ci = 0; ci < 4; ci = ci + 1) {
+            _qt_query_rec(_qt_node_child(node, ci), query_bounds, results);
+        }
+        return 0;
+    }
+
+    # Leaf node: check each point
+    var pts = _qt_node_points(node);
+    var count = vec_len(pts) / 3;
+    for (var pi = 0; pi < count; pi = pi + 1) {
+        var px = vec_get(pts, pi * 3);
+        var py = vec_get(pts, pi * 3 + 1);
+        var pd = vec_get(pts, pi * 3 + 2);
+        if (_qt_bounds_contains(query_bounds, px, py) == 1) {
+            vec_push(results, pd);
+        }
+    }
+    return 0;
+}
+
+# Query all data values within the given rectangle.
+# Returns vec of data (i64) values.
+fn quadtree_query(qt, qx_min, qy_min, qx_max, qy_max) {
+    var results = vec_new();
+    var root = load64(qt);
+    var query_bounds = _qt_bounds_new(qx_min, qy_min, qx_max, qy_max);
+    _qt_query_rec(root, query_bounds, results);
+    return results;
+}
+
+
+# ================================================================
+# 3. Octree -- 3D spatial subdivision
+# ================================================================
+#
+# Node layout (88 bytes):
+#   offset  0: bounds   (ptr) -- GeoAabb pointer (min, max HVec3)
+#   offset  8: points   (ptr) -- vec of interleaved [point_ptr, data, ...]
+#   offset 16: child_0..child_7 (8 ptrs, 64 bytes)
+#   offset 80: depth    (i64)
+#
+# Max items per leaf before split: 8 (same as quadtree)
+
+var _OT_MAX_PER_NODE = 8;
+
+fn _ot_node_new(bounds, depth) {
+    var n = alloc(88);
+    store64(n, bounds);
+    store64(n + 8, vec_new());   # points vec (interleaved point_ptr, data)
+    for (var ci = 0; ci < 8; ci = ci + 1) {
+        store64(n + 16 + ci * 8, 0);
+    }
+    store64(n + 80, depth);
+    return n;
+}
+
+fn _ot_node_bounds(n) { return load64(n); }
+fn _ot_node_points(n) { return load64(n + 8); }
+fn _ot_node_child(n, i) { return load64(n + 16 + i * 8); }
+fn _ot_node_depth(n) { return load64(n + 80); }
+fn _ot_node_set_child(n, i, c) { store64(n + 16 + i * 8, c); return 0; }
+fn _ot_node_is_split(n) { if (load64(n + 16) != 0) { return 1; } return 0; }
+
+# AABB contains point check
+fn _ot_aabb_contains(aabb, point) {
+    var mn = GeoAabb_min(aabb);
+    var mx = GeoAabb_max(aabb);
+    if (f64_lt(HVec3_x(point), HVec3_x(mn)) == 1) { return 0; }
+    if (f64_gt(HVec3_x(point), HVec3_x(mx)) == 1) { return 0; }
+    if (f64_lt(HVec3_y(point), HVec3_y(mn)) == 1) { return 0; }
+    if (f64_gt(HVec3_y(point), HVec3_y(mx)) == 1) { return 0; }
+    if (f64_lt(HVec3_z(point), HVec3_z(mn)) == 1) { return 0; }
+    if (f64_gt(HVec3_z(point), HVec3_z(mx)) == 1) { return 0; }
+    return 1;
+}
+
+# Determine octant: x bit=1, y bit=2, z bit=4
+fn _ot_octant(point, center) {
+    var ox = 0;
+    if (f64_ge(HVec3_x(point), HVec3_x(center)) == 1) { ox = 1; }
+    var oy = 0;
+    if (f64_ge(HVec3_y(point), HVec3_y(center)) == 1) { oy = 2; }
+    var oz = 0;
+    if (f64_ge(HVec3_z(point), HVec3_z(center)) == 1) { oz = 4; }
+    return ox + oy + oz;
+}
+
+# Get child bounds for an octant
+fn _ot_child_bounds(parent_aabb, octant) {
+    var mn = GeoAabb_min(parent_aabb);
+    var mx = GeoAabb_max(parent_aabb);
+    var center = geo_aabb_center(parent_aabb);
+
+    var cx = HVec3_x(center);
+    var cy = HVec3_y(center);
+    var cz = HVec3_z(center);
+    var mnx = HVec3_x(mn);
+    var mny = HVec3_y(mn);
+    var mnz = HVec3_z(mn);
+    var mxx = HVec3_x(mx);
+    var mxy = HVec3_y(mx);
+    var mxz = HVec3_z(mx);
+
+    # Select min/max for each axis based on octant bits
+    var new_mnx = mnx;
+    var new_mxx = cx;
+    if ((octant & 1) != 0) { new_mnx = cx; new_mxx = mxx; }
+
+    var new_mny = mny;
+    var new_mxy = cy;
+    if ((octant & 2) != 0) { new_mny = cy; new_mxy = mxy; }
+
+    var new_mnz = mnz;
+    var new_mxz = cz;
+    if ((octant & 4) != 0) { new_mnz = cz; new_mxz = mxz; }
+
+    return geo_aabb_new(hvec3_new(new_mnx, new_mny, new_mnz),
+                        hvec3_new(new_mxx, new_mxy, new_mxz));
+}
+
+# Split an octree leaf node into 8 children
+fn _ot_split(node, max_depth) {
+    var bounds = _ot_node_bounds(node);
+    var pts = _ot_node_points(node);
+    var depth = _ot_node_depth(node);
+    var center = geo_aabb_center(bounds);
+
+    # Create children
+    for (var ci = 0; ci < 8; ci = ci + 1) {
+        var cb = _ot_child_bounds(bounds, ci);
+        _ot_node_set_child(node, ci, _ot_node_new(cb, depth + 1));
+    }
+
+    # Redistribute existing points (interleaved: point_ptr, data)
+    var count = vec_len(pts) / 2;
+    for (var pi = 0; pi < count; pi = pi + 1) {
+        var pt = vec_get(pts, pi * 2);
+        var pd = vec_get(pts, pi * 2 + 1);
+        var oct = _ot_octant(pt, center);
+        var child = _ot_node_child(node, oct);
+        _ot_insert_rec(child, pt, pd, max_depth);
+    }
+
+    # Clear points (they now live in children)
+    store64(pts + 8, 0);
+
+    return 0;
+}
+
+fn _ot_insert_rec(node, point, data, max_depth) {
+    if (_ot_node_is_split(node) == 1) {
+        var bounds = _ot_node_bounds(node);
+        var center = geo_aabb_center(bounds);
+        var oct = _ot_octant(point, center);
+        var child = _ot_node_child(node, oct);
+        return _ot_insert_rec(child, point, data, max_depth);
+    }
+
+    # Leaf node: add point
+    var pts = _ot_node_points(node);
+    vec_push(pts, point);
+    vec_push(pts, data);
+
+    var count = vec_len(pts) / 2;
+    var depth = _ot_node_depth(node);
+
+    if (count > _OT_MAX_PER_NODE) {
+        if (depth < max_depth) {
+            _ot_split(node, max_depth);
+        }
+    }
+
+    return 0;
+}
+
+# Create an empty octree.
+# min_vec3, max_vec3: bounding box corners (HVec3 pointers)
+# max_depth: maximum subdivision depth (integer)
+# Returns: octree handle pointer
+fn octree_new(min_vec3, max_vec3, max_depth) {
+    var ot = alloc(24);
+    var bounds = geo_aabb_new(min_vec3, max_vec3);
+    store64(ot, _ot_node_new(bounds, 0));
+    store64(ot + 8, max_depth);
+    store64(ot + 16, 0);  # count
+    return ot;
+}
+
+# Insert a point with associated data (i64) into the octree.
+# point: HVec3 pointer
+fn octree_insert(ot, point, data) {
+    var root = load64(ot);
+    var max_depth = load64(ot + 8);
+    var bounds = _ot_node_bounds(root);
+
+    if (_ot_aabb_contains(bounds, point) == 0) { return 0; }
+
+    _ot_insert_rec(root, point, data, max_depth);
+    store64(ot + 16, load64(ot + 16) + 1);
+    return 1;
+}
+
+# --- Octree range query ---
+
+fn _ot_query_rec(node, query_aabb, results) {
+    if (node == 0) { return 0; }
+
+    var bounds = _ot_node_bounds(node);
+    if (geo_aabb_aabb(bounds, query_aabb) == 0) { return 0; }
+
+    if (_ot_node_is_split(node) == 1) {
+        for (var ci = 0; ci < 8; ci = ci + 1) {
+            _ot_query_rec(_ot_node_child(node, ci), query_aabb, results);
+        }
+        return 0;
+    }
+
+    # Leaf node: check each point
+    var pts = _ot_node_points(node);
+    var count = vec_len(pts) / 2;
+    for (var pi = 0; pi < count; pi = pi + 1) {
+        var pt = vec_get(pts, pi * 2);
+        var pd = vec_get(pts, pi * 2 + 1);
+        if (_ot_aabb_contains(query_aabb, pt) == 1) {
+            vec_push(results, pd);
+        }
+    }
+    return 0;
+}
+
+# Query all data values within the given AABB.
+# min_vec3, max_vec3: query box corners (HVec3 pointers)
+# Returns vec of data (i64) values.
+fn octree_query(ot, min_vec3, max_vec3) {
+    var results = vec_new();
+    var root = load64(ot);
+    var query_aabb = geo_aabb_new(min_vec3, max_vec3);
+    _ot_query_rec(root, query_aabb, results);
+    return results;
+}
+
+
+# ================================================================
+# 4. SpatialHash -- uniform grid for fast neighbor queries
+# ================================================================
+#
+# Handle layout (24 bytes):
+#   offset  0: cell_size     (f64)
+#   offset  8: inv_cell_size (f64) -- 1.0 / cell_size
+#   offset 16: buckets       (ptr) -- pointer to array of 1024 vec ptrs
+#
+# Hashing: cell coords (ix, iy, iz) are hashed to a bucket index [0..1023].
+# Each bucket is a vec of data values. Collisions are handled by the vec
+# (multiple cells can map to the same bucket -- query checks all entries).
+#
+# Bucket entry: interleaved [ix, iy, iz, data, ix, iy, iz, data, ...]
+# This allows distinguishing entries from different cells sharing a bucket.
+
+var _SH_BUCKET_COUNT = 1024;
+var _SH_ENTRY_SIZE = 4;  # 4 slots per entry: ix, iy, iz, data
+
+fn _sh_hash(ix, iy, iz) {
+    # Simple hash combining cell coordinates
+    # Uses prime multipliers and XOR for distribution
+    var h = ix * 73856093;
+    h = h ^ (iy * 19349663);
+    h = h ^ (iz * 83492791);
+    # Ensure positive and mask to bucket count
+    if (h < 0) { h = 0 - h; }
+    return h & 1023;  # _SH_BUCKET_COUNT - 1 (power of 2)
+}
+
+fn _sh_cell_coord(val, inv_cell_size) {
+    return f64_to(f64_floor(f64_mul(val, inv_cell_size)));
+}
+
+# Create a new spatial hash grid.
+# cell_size: size of each grid cell (f64)
+# Returns: spatial hash handle pointer
+fn spatial_hash_new(cell_size) {
+    var sh = alloc(24);
+    store64(sh, cell_size);
+    store64(sh + 8, f64_div(F64_ONE, cell_size));
+
+    # Allocate bucket array: 1024 pointers, each initially a new empty vec
+    var buckets = alloc(_SH_BUCKET_COUNT * 8);
+    for (var bi = 0; bi < _SH_BUCKET_COUNT; bi = bi + 1) {
+        store64(buckets + bi * 8, vec_new());
+    }
+    store64(sh + 16, buckets);
+
+    return sh;
+}
+
+fn _sh_cell_size(sh) { return load64(sh); }
+fn _sh_inv_cell_size(sh) { return load64(sh + 8); }
+fn _sh_buckets(sh) { return load64(sh + 16); }
+
+fn _sh_get_bucket(sh, ix, iy, iz) {
+    var buckets = _sh_buckets(sh);
+    var idx = _sh_hash(ix, iy, iz);
+    return load64(buckets + idx * 8);
+}
+
+# Insert a point with associated data into the spatial hash.
+# point: HVec3 pointer
+# data: i64 value
+fn spatial_hash_insert(sh, point, data) {
+    var inv = _sh_inv_cell_size(sh);
+    var ix = _sh_cell_coord(HVec3_x(point), inv);
+    var iy = _sh_cell_coord(HVec3_y(point), inv);
+    var iz = _sh_cell_coord(HVec3_z(point), inv);
+
+    var bucket = _sh_get_bucket(sh, ix, iy, iz);
+    vec_push(bucket, ix);
+    vec_push(bucket, iy);
+    vec_push(bucket, iz);
+    vec_push(bucket, data);
+
+    return 0;
+}
+
+# Query all data values in the same cell as the given point.
+# Returns vec of data (i64) values.
+fn spatial_hash_query_cell(sh, point) {
+    var results = vec_new();
+    var inv = _sh_inv_cell_size(sh);
+    var ix = _sh_cell_coord(HVec3_x(point), inv);
+    var iy = _sh_cell_coord(HVec3_y(point), inv);
+    var iz = _sh_cell_coord(HVec3_z(point), inv);
+
+    var bucket = _sh_get_bucket(sh, ix, iy, iz);
+    var blen = vec_len(bucket);
+    var ei = 0;
+    while (ei < blen) {
+        var eix = vec_get(bucket, ei);
+        var eiy = vec_get(bucket, ei + 1);
+        var eiz = vec_get(bucket, ei + 2);
+        var ed = vec_get(bucket, ei + 3);
+        # Only include entries from the exact cell (not hash collisions)
+        if (eix == ix) {
+            if (eiy == iy) {
+                if (eiz == iz) {
+                    vec_push(results, ed);
+                }
+            }
+        }
+        ei = ei + _SH_ENTRY_SIZE;
+    }
+
+    return results;
+}
+
+# Query all data values within radius of the given point.
+# Checks all cells that could contain points within radius.
+# Returns vec of candidate data (i64) values (broadphase -- caller should
+# perform exact distance checks).
+fn spatial_hash_query_radius(sh, point, radius) {
+    var results = vec_new();
+    var inv = _sh_inv_cell_size(sh);
+    var cx = _sh_cell_coord(HVec3_x(point), inv);
+    var cy = _sh_cell_coord(HVec3_y(point), inv);
+    var cz = _sh_cell_coord(HVec3_z(point), inv);
+
+    # Number of cells to search in each direction
+    var cells_r = f64_to(f64_ceil(f64_mul(radius, inv)));
+
+    var dx = 0 - cells_r;
+    while (dx <= cells_r) {
+        var dy = 0 - cells_r;
+        while (dy <= cells_r) {
+            var dz = 0 - cells_r;
+            while (dz <= cells_r) {
+                var tx = cx + dx;
+                var ty = cy + dy;
+                var tz = cz + dz;
+                var bucket = _sh_get_bucket(sh, tx, ty, tz);
+                var blen = vec_len(bucket);
+                var ei = 0;
+                while (ei < blen) {
+                    var eix = vec_get(bucket, ei);
+                    var eiy = vec_get(bucket, ei + 1);
+                    var eiz = vec_get(bucket, ei + 2);
+                    var ed = vec_get(bucket, ei + 3);
+                    # Only include entries from the exact target cell
+                    if (eix == tx) {
+                        if (eiy == ty) {
+                            if (eiz == tz) {
+                                vec_push(results, ed);
+                            }
+                        }
+                    }
+                    ei = ei + _SH_ENTRY_SIZE;
+                }
+                dz = dz + 1;
+            }
+            dy = dy + 1;
+        }
+        dx = dx + 1;
+    }
+
+    return results;
+}
+
+# Remove all entries from the spatial hash.
+fn spatial_hash_clear(sh) {
+    var buckets = _sh_buckets(sh);
+    for (var bi = 0; bi < _SH_BUCKET_COUNT; bi = bi + 1) {
+        var bucket = load64(buckets + bi * 8);
+        # Reset vec length to 0 (keeps allocation)
+        store64(bucket + 8, 0);
+    }
+    return 0;
+}

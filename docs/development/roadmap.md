@@ -1,113 +1,77 @@
 # Roadmap
 
-> **Hisab** (Arabic: حساب — calculation, reckoning) — higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius (ported from Rust). Cyrius stdlib linalg.cyr (4.10.3) provides dense decompositions.
+> **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
+> Written in Cyrius. Toolchain: 4.10.3. Stdlib linalg.cyr provides dense decompositions.
 
 ## Scope
 
-Hisab owns **typed mathematical operations** — the programmatic math that engines, physics, rendering, and simulation need. It does NOT own:
+Hisab owns **typed mathematical operations**. It does NOT own:
+- **Expression parsing** -- abaco
+- **Unit conversion** -- abaco
+- **Physics simulation** -- impetus
+- **Game engine** -- kiran
 
-- **Expression parsing, user-typed math** → abaco (eval engine)
-- **Unit conversion** → abaco (unit registry)
-- **Physics simulation** → impetus (uses hisab types)
-- **Game engine** → kiran (uses hisab for transforms/projections)
+## Current -- v2.2.0
 
-## Consumers
-
-| Consumer | What it uses from hisab | Status |
-|----------|----------------------|--------|
-| **impetus** | Vectors, transforms, GJK/EPA, PGS solver, inertia | Usable |
-| **kiran** | Projections, transforms, frustum, BVH, ray tests | Usable |
-| **joshua** | ODE (DOPRI45, BDF, symplectic), optimization | Usable |
-| **aethersafha** | Projections, transform interpolation, color | Usable |
-| **abaco** | Symbolic algebra (integrate, LaTeX, patterns), interval arithmetic | Usable |
-| **svara** | Complex, FFT, easing | Usable |
-| **hisab-mimamsa** | Tensors, Lie groups, diffgeo, complex LA, CGA | Usable |
-| **kana** | Tensors, Lie groups, complex LA, spinors | Usable |
+- **33 lib files, 15,676 lines**
+- **821 test assertions**, 22 benchmarks, 5 fuzz targets
+- **511KB static binary**
+- P(-1) audit: 26/31 fixed. C3 awaiting cyrius 5.0.1.
 
 ---
 
-## Current — v2.1.0 (2026-04-15)
+## 2.3.0 -- Mesh + buffer expansion (blocked on Cyrius 5.0)
 
-- **30 lib files, 13,715 lines**
-- **821 test assertions** across 4 test suites
-- **22 benchmarks**, 5 fuzz targets
-- **472KB static binary**
-- Toolchain: Cyrius 4.10.3
-- P(-1) audit: 31 issues found, 26 fixed (C3 upstream only remaining non-cosmetic)
+Cyrius 5.0 expands the 1MB preprocess buffer. These are written and ready to ship.
 
----
-
-## 2.1.0 — Precision + depth
-
-### Audit carry-forward
-- [x] M8: SVD via Golub-Kahan bidiagonalization (linalg_precision.cyr — preserves full precision)
-- [ ] C3: upstream matrix.cyr alloc overflow → cyrius 5.0.1
-
-### Numerical
-- [x] Complex QR decomposition (cqr_decompose in linalg_precision.cyr)
-- [x] Complex matrix inverse (cmat_inverse in linalg_ext.cyr — shipped 2.0.0)
-- [x] Condition number estimation (matrix_condition_number in linalg_ext.cyr — shipped 2.0.0)
-- [x] QR iteration for large symmetric eigenproblems (eigen_qr in linalg_precision.cyr — O(n^3))
-- [x] Simplex noise — OpenSimplex2 2D+3D + fBm (noise_simplex.cyr)
-- [x] Einsum string notation parser — `"ij,jk->ik"` style (einsum.cyr)
+- [ ] collision_mesh.cyr -- Delaunay triangulation (Bowyer-Watson), half-edge mesh, island detection (union-find). 522 lines, ready.
+- [ ] C3 upstream fix -- matrix.cyr alloc overflow (cyrius 5.0.1)
+- [ ] CGA left/right contraction operators
+- [ ] CGA dual operation, blade projection/rejection
 
 ---
 
-## 2.2.0 — Geometry & group extensions
+## 2.4.0 -- Differential geometry depth
 
-### Lie group extensions
-- [ ] SE(3) — rigid body motions (rotation + translation as single group)
-- [ ] SO(3) explicit — rotation group without SU(2) double cover
-- [ ] Adjoint representation for all groups
-- [ ] Baker-Campbell-Hausdorff formula
-
-### Geometry extensions
-- [ ] k-d tree, quadtree, octree, spatial hash
-- [ ] Delaunay/Voronoi triangulation
-- [ ] Half-edge mesh
-- [ ] Convex hull 2D, polygon triangulation
-- [ ] MPR/XenoCollide
-- [ ] Sequential impulse solver with friction
-- [ ] Island detection
-
-### CGA extensions
-- [ ] Left/right contraction operators
-- [ ] Dual operation, blade projection/rejection
-
----
-
-## 2.3.0 — Differential geometry & curvature
-
-- [ ] Parallel transport of vector fields
-- [ ] Sectional curvature
+- [ ] Parallel transport of vector fields along curves
+- [ ] Sectional curvature computation
 - [ ] Geodesic deviation equation
 - [ ] Weyl tensor (conformal curvature)
 - [ ] Higher-order differential forms (3-forms, 4-forms)
 
 ---
 
-## 2.4.0 — Rendering & GPU
+## 2.5.0 -- Rendering, GPU, reverse-mode AD
 
-- [ ] Differentiable rendering math
+- [ ] Differentiable rendering math (autodiff through ray-surface intersections)
+- [ ] Reverse-mode autodiff (Tape-based)
 - [ ] GPU compute via soorat (feature-gated)
-- [ ] Reverse-mode autodiff (Tape)
+
+---
+
+## Consumers
+
+| Consumer | Status |
+|----------|--------|
+| **impetus** (physics) | Usable -- GJK/EPA, PGS, inertia, spatial |
+| **kiran** (engine) | Usable -- projections, BVH, k-d tree, frustum |
+| **joshua** (simulation) | Usable -- DOPRI45, BDF, symplectic, optimize |
+| **aethersafha** (compositor) | Usable -- projections, compositing, color |
+| **abaco** (expression eval) | Usable -- symbolic integrate/LaTeX/patterns, interval |
+| **svara** (vocal synthesis) | Usable -- complex, FFT, easing |
+| **hisab-mimamsa** (physics) | Usable -- tensors, Lie groups, diffgeo, CGA |
+| **kana** (quantum) | Usable -- tensors, Lie groups, complex LA, spinors |
 
 ---
 
 ## Release History
 
-### 2.0.0 (2026-04-15) — Cyrius port
-Complete rewrite from Rust to Cyrius. 27 lib files, 11,769 lines. 821 test assertions,
-22 benchmarks, 5 fuzz targets. P(-1) audit: 31 issues found, 25 fixed. 420KB static binary.
-See CHANGELOG.md for full details.
-
-### 2.1.0 (2026-04-15) — Precision + depth
-Golub-Kahan SVD, QR eigendecomposition (O(n^3)), complex QR, OpenSimplex2 noise,
-einsum notation. 30 files, 13,715 lines, 472KB.
-
-### Rust 1.4.0 (2026-03-30) — Final Rust release
-Archived in `rust-old/`.
+| Version | Date | Lines | Files | Highlights |
+|---------|------|-------|-------|-----------|
+| 2.2.0 | 2026-04-15 | 15,676 | 33 | SE(3), SO(3), adjoint, BCH, spatial structures, MPR, impulse solver, simplex noise, einsum, Golub-Kahan SVD |
+| 2.1.0 | 2026-04-15 | 13,715 | 30 | Golub-Kahan SVD, QR eigen, complex QR, simplex noise, einsum |
+| 2.0.0 | 2026-04-15 | 11,943 | 27 | Cyrius port from Rust. P(-1) audit. |
+| Rust 1.4.0 | 2026-03-30 | 33,612 | 65 | Final Rust release. Archived in rust-old/. |
 
 ---
 
@@ -115,12 +79,12 @@ Archived in `rust-old/`.
 
 | Feature | abaco | hisab |
 |---------|-------|-------|
-| `eval("sin(pi/4)")` | parses and evaluates | — |
-| `hvec3_cross(a, b)` | — | vec3.cyr |
-| `geo_ray_sphere(ray, sphere)` | — | geo.cyr |
-| `calc_integral_simpson(&f, a, b, n, out)` | — | calc.cyr |
-| `num_newton(&f, &df, x0, tol, max, out)` | — | num.cyr |
-| `sym_integrate(expr, var)` | — | symbolic_ext.cyr |
-| `sym_to_latex(expr)` | — | symbolic_ext.cyr |
+| `eval("sin(pi/4)")` | parses and evaluates | -- |
+| `hvec3_cross(a, b)` | -- | vec3.cyr |
+| `geo_ray_sphere(ray, sphere)` | -- | geo.cyr |
+| `calc_integral_simpson(&f, a, b, n, out)` | -- | calc.cyr |
+| `num_newton(&f, &df, x0, tol, max, out)` | -- | num.cyr |
+| `sym_integrate(expr, var)` | -- | symbolic_ext.cyr |
+| `sym_to_latex(expr)` | -- | symbolic_ext.cyr |
 
-Hisab should never depend on abaco. Abaco may optionally depend on hisab (num, symbolic) for solver/algebra features.
+Hisab should never depend on abaco. Abaco may optionally depend on hisab.

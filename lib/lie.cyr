@@ -1,0 +1,545 @@
+# lie.cyr — Lie groups for physics transformations
+# Usage: include "lib/lie.cyr"
+# Requires: alloc.cyr, math.cyr, f64_util.cyr, error.cyr, complex.cyr, quat.cyr, vec3.cyr, mat4.cyr
+#
+# Provides:
+#   U(1)    — phase group e^{i theta}
+#   SU(2)   — spin group (unit quaternion representation)
+#   SU(3)   — Gell-Mann matrices, structure constants
+#   SO(3,1) — Lorentz group: boosts + rotations in Minkowski spacetime
+#
+# Lorentz layout: 4x4 f64, column-major (128 bytes), reuses mat4 infrastructure.
+# SU(2) layout: { w, x, y, z } = 32 bytes (same as HQuat but w-first).
+
+# ================================================================
+# U(1) — Phase group
+# ================================================================
+# Representation: a single f64 theta stored on the heap (8 bytes).
+# e^{i theta} lives on the unit circle in the complex plane.
+
+fn u1_new(theta) {
+    var u = alloc(8);
+    store64(u, theta);
+    return u;
+}
+
+fn _u1_theta(u) { return load64(u); }
+
+fn u1_identity() { return u1_new(0); }
+
+# Group multiplication: e^{i a} * e^{i b} = e^{i(a+b)}
+fn u1_compose(a, b) {
+    return u1_new(f64_add(_u1_theta(a), _u1_theta(b)));
+}
+
+# Inverse: e^{-i theta}
+fn u1_inv(a) {
+    return u1_new(f64_neg(_u1_theta(a)));
+}
+
+# Convert to complex number: cos(theta) + i sin(theta)
+fn u1_to_complex(a) {
+    var t = _u1_theta(a);
+    return cx_new(f64_cos(t), f64_sin(t));
+}
+
+# Exponential map: Lie algebra (scalar) -> group
+fn u1_exp(x) { return u1_new(x); }
+
+# Logarithmic map: group -> Lie algebra
+fn u1_log(a) { return _u1_theta(a); }
+
+# ================================================================
+# SU(2) — Spin group (unit quaternion)
+# ================================================================
+# Layout: { w, x, y, z } = 32 bytes, heap-allocated.
+# w = scalar part = cos(theta/2), (x,y,z) = sin(theta/2) * axis.
+# Automatically normalizes on construction.
+
+fn _su2_alloc(w, x, y, z) {
+    var s = alloc(32);
+    store64(s, w);
+    store64(s + 8, x);
+    store64(s + 16, y);
+    store64(s + 24, z);
+    return s;
+}
+
+fn _su2_w(s) { return load64(s); }
+fn _su2_x(s) { return load64(s + 8); }
+fn _su2_y(s) { return load64(s + 16); }
+fn _su2_z(s) { return load64(s + 24); }
+
+# Construct from raw quaternion components (w, x, y, z). Normalizes.
+fn su2_from_quat(q) {
+    var qx = HQuat_x(q); var qy = HQuat_y(q);
+    var qz = HQuat_z(q); var qw = HQuat_w(q);
+    var norm = f64_sqrt(f64_add(f64_add(f64_mul(qw, qw), f64_mul(qx, qx)),
+                                f64_add(f64_mul(qy, qy), f64_mul(qz, qz))));
+    if (f64_lt(norm, EPSILON_F64) == 1) {
+        return _su2_alloc(F64_ONE, 0, 0, 0);
+    }
+    var inv = f64_div(F64_ONE, norm);
+    return _su2_alloc(f64_mul(qw, inv), f64_mul(qx, inv),
+                      f64_mul(qy, inv), f64_mul(qz, inv));
+}
+
+# Convert SU(2) element back to HQuat
+fn su2_to_quat(s) {
+    return hquat_new(_su2_x(s), _su2_y(s), _su2_z(s), _su2_w(s));
+}
+
+# Construct from axis-angle: axis is Vec3, angle is f64
+fn su2_from_axis_angle(axis, angle) {
+    var half = f64_mul(angle, F64_HALF);
+    var s_half = f64_sin(half);
+    var c_half = f64_cos(half);
+    # Normalize axis
+    var ax = HVec3_x(axis); var ay = HVec3_y(axis); var az = HVec3_z(axis);
+    var len = f64_sqrt(f64_add(f64_add(f64_mul(ax, ax), f64_mul(ay, ay)), f64_mul(az, az)));
+    if (f64_lt(len, EPSILON_F64) == 1) {
+        return _su2_alloc(F64_ONE, 0, 0, 0);
+    }
+    var inv = f64_div(F64_ONE, len);
+    return _su2_alloc(c_half,
+                      f64_mul(f64_mul(ax, inv), s_half),
+                      f64_mul(f64_mul(ay, inv), s_half),
+                      f64_mul(f64_mul(az, inv), s_half));
+}
+
+# SU(2) identity
+fn su2_identity() { return _su2_alloc(F64_ONE, 0, 0, 0); }
+
+# Group multiplication (quaternion product)
+fn su2_compose(a, b) {
+    var aw = _su2_w(a); var ax = _su2_x(a); var ay = _su2_y(a); var az = _su2_z(a);
+    var bw = _su2_w(b); var bx = _su2_x(b); var by = _su2_y(b); var bz = _su2_z(b);
+    var w = f64_sub(f64_mul(aw, bw), f64_add(f64_add(f64_mul(ax, bx), f64_mul(ay, by)), f64_mul(az, bz)));
+    var x = f64_add(f64_add(f64_mul(aw, bx), f64_mul(ax, bw)), f64_sub(f64_mul(ay, bz), f64_mul(az, by)));
+    var y = f64_add(f64_add(f64_mul(aw, by), f64_mul(ay, bw)), f64_sub(f64_mul(az, bx), f64_mul(ax, bz)));
+    var z = f64_add(f64_add(f64_mul(aw, bz), f64_mul(az, bw)), f64_sub(f64_mul(ax, by), f64_mul(ay, bx)));
+    return _su2_alloc(w, x, y, z);
+}
+
+# Inverse (conjugate for unit quaternion)
+fn su2_inv(s) {
+    return _su2_alloc(_su2_w(s), f64_neg(_su2_x(s)),
+                      f64_neg(_su2_y(s)), f64_neg(_su2_z(s)));
+}
+
+# Exponential map: su(2) Lie algebra -> SU(2)
+# Input: 3 f64s packed as a Vec3 (omega_1, omega_2, omega_3)
+# exp(omega) = cos(|omega|) + sin(|omega|)/|omega| * (omega_i sigma_i)
+fn su2_exp(v) {
+    var ox = HVec3_x(v); var oy = HVec3_y(v); var oz = HVec3_z(v);
+    var norm = f64_sqrt(f64_add(f64_add(f64_mul(ox, ox), f64_mul(oy, oy)), f64_mul(oz, oz)));
+    if (f64_lt(norm, EPSILON_F64) == 1) {
+        return su2_identity();
+    }
+    var c = f64_cos(norm);
+    var sinc = f64_div(f64_sin(norm), norm);
+    return _su2_alloc(c, f64_mul(sinc, ox), f64_mul(sinc, oy), f64_mul(sinc, oz));
+}
+
+# Logarithmic map: SU(2) -> su(2) Lie algebra
+# Returns Vec3 (omega_1, omega_2, omega_3)
+fn su2_log(s) {
+    var w = f64_clamp(_su2_w(s), f64_neg(F64_ONE), F64_ONE);
+    var theta = f64_acos(w);
+    var sin_t = f64_sin(theta);
+    if (f64_lt(f64_abs(sin_t), EPSILON_F64) == 1) {
+        return hvec3_new(0, 0, 0);
+    }
+    var sc = f64_div(theta, sin_t);
+    return hvec3_new(f64_mul(sc, _su2_x(s)),
+                     f64_mul(sc, _su2_y(s)),
+                     f64_mul(sc, _su2_z(s)));
+}
+
+# Convert SU(2) to 3x3 rotation matrix (SO(3) representation)
+# Returns flat 9-f64 array in column-major order
+fn su2_to_rotation_matrix(s) {
+    var w = _su2_w(s); var x = _su2_x(s); var y = _su2_y(s); var z = _su2_z(s);
+    var xx = f64_mul(x, x); var yy = f64_mul(y, y); var zz = f64_mul(z, z);
+    var xy = f64_mul(x, y); var xz = f64_mul(x, z); var yz = f64_mul(y, z);
+    var wx = f64_mul(w, x); var wy = f64_mul(w, y); var wz = f64_mul(w, z);
+
+    var r = alloc(72);  # 9 * 8 bytes
+
+    # Column 0: rows 0,1,2
+    store64(r,      f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(yy, zz))));
+    store64(r + 8,  f64_mul(F64_TWO, f64_add(xy, wz)));
+    store64(r + 16, f64_mul(F64_TWO, f64_sub(xz, wy)));
+
+    # Column 1: rows 0,1,2
+    store64(r + 24, f64_mul(F64_TWO, f64_sub(xy, wz)));
+    store64(r + 32, f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(xx, zz))));
+    store64(r + 40, f64_mul(F64_TWO, f64_add(yz, wx)));
+
+    # Column 2: rows 0,1,2
+    store64(r + 48, f64_mul(F64_TWO, f64_add(xz, wy)));
+    store64(r + 56, f64_mul(F64_TWO, f64_sub(yz, wx)));
+    store64(r + 64, f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(xx, yy))));
+
+    return r;
+}
+
+# ================================================================
+# SU(3) — Gell-Mann matrices
+# ================================================================
+# Returns 3x3 ComplexMatrix for Gell-Mann matrix lambda_idx (idx 0..7).
+# Corresponds to lambda_{idx+1} in physics convention.
+
+fn gell_mann(idx) {
+    var one = cx_one();
+    var neg_one = cx_new(f64_neg(F64_ONE), 0);
+    var i_pos = cx_i();
+    var i_neg = cx_new(0, f64_neg(F64_ONE));
+    # 1/sqrt(3) and -2/sqrt(3) for lambda_8
+    var inv_sqrt3 = cx_new(f64_div(F64_ONE, f64_sqrt(f64_from(3))), 0);
+    var neg2_inv_sqrt3 = cx_new(f64_neg(f64_div(F64_TWO, f64_sqrt(f64_from(3)))), 0);
+
+    var m = cmat_new(3, 3);
+
+    # lambda_1: off-diagonal (0,1)/(1,0)
+    if (idx == 0) {
+        cmat_set(m, 0, 1, one);
+        cmat_set(m, 1, 0, one);
+        return m;
+    }
+    # lambda_2: off-diagonal (0,1)/(1,0) with i
+    if (idx == 1) {
+        cmat_set(m, 0, 1, i_neg);
+        cmat_set(m, 1, 0, i_pos);
+        return m;
+    }
+    # lambda_3: diagonal (1, -1, 0)
+    if (idx == 2) {
+        cmat_set(m, 0, 0, one);
+        cmat_set(m, 1, 1, neg_one);
+        return m;
+    }
+    # lambda_4: off-diagonal (0,2)/(2,0)
+    if (idx == 3) {
+        cmat_set(m, 0, 2, one);
+        cmat_set(m, 2, 0, one);
+        return m;
+    }
+    # lambda_5: off-diagonal (0,2)/(2,0) with i
+    if (idx == 4) {
+        cmat_set(m, 0, 2, i_neg);
+        cmat_set(m, 2, 0, i_pos);
+        return m;
+    }
+    # lambda_6: off-diagonal (1,2)/(2,1)
+    if (idx == 5) {
+        cmat_set(m, 1, 2, one);
+        cmat_set(m, 2, 1, one);
+        return m;
+    }
+    # lambda_7: off-diagonal (1,2)/(2,1) with i
+    if (idx == 6) {
+        cmat_set(m, 1, 2, i_neg);
+        cmat_set(m, 2, 1, i_pos);
+        return m;
+    }
+    # lambda_8: diagonal (1, 1, -2)/sqrt(3)
+    if (idx == 7) {
+        cmat_set(m, 0, 0, inv_sqrt3);
+        cmat_set(m, 1, 1, inv_sqrt3);
+        cmat_set(m, 2, 2, neg2_inv_sqrt3);
+        return m;
+    }
+    # Invalid index: return zero matrix
+    return m;
+}
+
+# SU(3) structure constants f_{abc}
+# [lambda_a, lambda_b] = 2i * sum_c f_{abc} lambda_c
+# a, b, c are 1-indexed (1..8) per physics convention.
+# Returns f64. Returns 0 for invalid or zero entries.
+
+fn _su3_canonical(a, b, c) {
+    # Non-zero canonical (sorted) structure constants
+    if (a == 1) {
+        if (b == 2) { if (c == 3) { return F64_ONE; } }
+        if (b == 4) { if (c == 7) { return F64_HALF; } }
+        if (b == 5) { if (c == 6) { return f64_neg(F64_HALF); } }
+    }
+    if (a == 2) {
+        if (b == 4) { if (c == 6) { return F64_HALF; } }
+        if (b == 5) { if (c == 7) { return F64_HALF; } }
+    }
+    if (a == 3) {
+        if (b == 4) { if (c == 5) { return F64_HALF; } }
+        if (b == 6) { if (c == 7) { return f64_neg(F64_HALF); } }
+    }
+    var sqrt3_half = f64_div(f64_sqrt(f64_from(3)), F64_TWO);
+    if (a == 4) {
+        if (b == 5) { if (c == 8) { return sqrt3_half; } }
+    }
+    if (a == 6) {
+        if (b == 7) { if (c == 8) { return sqrt3_half; } }
+    }
+    return 0;
+}
+
+fn su3_structure_constant(a, b, c) {
+    # Try all 6 permutations with antisymmetry signs
+    # Even permutations: (a,b,c), (b,c,a), (c,a,b) -> +1
+    # Odd permutations:  (b,a,c), (a,c,b), (c,b,a) -> -1
+    var v = _su3_canonical(a, b, c);
+    if (f64_lt(f64_abs(v), EPSILON_F64) == 0) { return v; }
+    v = _su3_canonical(b, c, a);
+    if (f64_lt(f64_abs(v), EPSILON_F64) == 0) { return v; }
+    v = _su3_canonical(c, a, b);
+    if (f64_lt(f64_abs(v), EPSILON_F64) == 0) { return v; }
+    v = _su3_canonical(b, a, c);
+    if (f64_lt(f64_abs(v), EPSILON_F64) == 0) { return f64_neg(v); }
+    v = _su3_canonical(a, c, b);
+    if (f64_lt(f64_abs(v), EPSILON_F64) == 0) { return f64_neg(v); }
+    v = _su3_canonical(c, b, a);
+    if (f64_lt(f64_abs(v), EPSILON_F64) == 0) { return f64_neg(v); }
+    return 0;
+}
+
+# ================================================================
+# SO(3,1) — Lorentz group
+# ================================================================
+# Layout: 4x4 f64 matrix, column-major, 128 bytes.
+# Uses the mat4 infrastructure (m4_new, m4_get, m4_set, m4_mul, etc.).
+# Metric signature: eta = diag(+1, -1, -1, -1)
+#
+# Convention: m4_get(m, col, row) with col-major storage.
+# For Lorentz matrix Lambda^mu_nu:
+#   m4_get(L, nu, mu) gives Lambda^mu_nu
+#   (column = second index, row = first index)
+
+# Construct from an existing Mat4 pointer (just aliases it)
+fn lorentz_from_matrix(m) { return m4_copy(m); }
+
+# Identity Lorentz transformation
+fn lorentz_identity() { return m4_identity(); }
+
+# Pure boost along x-axis with rapidity eta
+# Lambda = [[cosh, sinh, 0, 0], [sinh, cosh, 0, 0], [0,0,1,0], [0,0,0,1]]
+fn lorentz_boost_x(beta) {
+    var ch = f64_cosh(beta);
+    var sh = f64_sinh(beta);
+    var m = m4_new();
+    m4_set(m, 0, 0, ch);   # Lambda^0_0
+    m4_set(m, 1, 0, sh);   # Lambda^0_1
+    m4_set(m, 0, 1, sh);   # Lambda^1_0
+    m4_set(m, 1, 1, ch);   # Lambda^1_1
+    m4_set(m, 2, 2, F64_ONE);
+    m4_set(m, 3, 3, F64_ONE);
+    return m;
+}
+
+# Pure boost along y-axis with rapidity eta
+fn lorentz_boost_y(beta) {
+    var ch = f64_cosh(beta);
+    var sh = f64_sinh(beta);
+    var m = m4_new();
+    m4_set(m, 0, 0, ch);
+    m4_set(m, 2, 0, sh);   # Lambda^0_2
+    m4_set(m, 0, 2, sh);   # Lambda^2_0
+    m4_set(m, 2, 2, ch);
+    m4_set(m, 1, 1, F64_ONE);
+    m4_set(m, 3, 3, F64_ONE);
+    return m;
+}
+
+# Pure boost along z-axis with rapidity eta
+fn lorentz_boost_z(beta) {
+    var ch = f64_cosh(beta);
+    var sh = f64_sinh(beta);
+    var m = m4_new();
+    m4_set(m, 0, 0, ch);
+    m4_set(m, 3, 0, sh);   # Lambda^0_3
+    m4_set(m, 0, 3, sh);   # Lambda^3_0
+    m4_set(m, 3, 3, ch);
+    m4_set(m, 1, 1, F64_ONE);
+    m4_set(m, 2, 2, F64_ONE);
+    return m;
+}
+
+# Boost along arbitrary unit direction with rapidity eta.
+# dir is a Vec3 (will be normalized).
+fn lorentz_boost(dir, beta) {
+    var nx = HVec3_x(dir); var ny = HVec3_y(dir); var nz = HVec3_z(dir);
+    var norm = f64_sqrt(f64_add(f64_add(f64_mul(nx, nx), f64_mul(ny, ny)), f64_mul(nz, nz)));
+    if (f64_lt(norm, EPSILON_F64) == 1) {
+        return lorentz_identity();
+    }
+    var inv = f64_div(F64_ONE, norm);
+    nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
+
+    var ch = f64_cosh(beta);
+    var sh = f64_sinh(beta);
+    var gm1 = f64_sub(ch, F64_ONE);  # cosh(eta) - 1
+
+    var m = m4_new();
+    # Lambda^0_0 = cosh(eta)
+    m4_set(m, 0, 0, ch);
+    # Lambda^0_i = Lambda^i_0 = n_i * sinh(eta)
+    m4_set(m, 1, 0, f64_mul(sh, nx));
+    m4_set(m, 2, 0, f64_mul(sh, ny));
+    m4_set(m, 3, 0, f64_mul(sh, nz));
+    m4_set(m, 0, 1, f64_mul(sh, nx));
+    m4_set(m, 0, 2, f64_mul(sh, ny));
+    m4_set(m, 0, 3, f64_mul(sh, nz));
+    # Lambda^i_j = delta_ij + (cosh(eta)-1)*n_i*n_j
+    # Store n components in array-like access for the 3x3 spatial block
+    # (i+1, j+1) in 4x4 matrix, col = j+1, row = i+1
+    m4_set(m, 1, 1, f64_add(F64_ONE, f64_mul(gm1, f64_mul(nx, nx))));
+    m4_set(m, 2, 1, f64_mul(gm1, f64_mul(nx, ny)));
+    m4_set(m, 3, 1, f64_mul(gm1, f64_mul(nx, nz)));
+    m4_set(m, 1, 2, f64_mul(gm1, f64_mul(ny, nx)));
+    m4_set(m, 2, 2, f64_add(F64_ONE, f64_mul(gm1, f64_mul(ny, ny))));
+    m4_set(m, 3, 2, f64_mul(gm1, f64_mul(ny, nz)));
+    m4_set(m, 1, 3, f64_mul(gm1, f64_mul(nz, nx)));
+    m4_set(m, 2, 3, f64_mul(gm1, f64_mul(nz, ny)));
+    m4_set(m, 3, 3, f64_add(F64_ONE, f64_mul(gm1, f64_mul(nz, nz))));
+    return m;
+}
+
+# Spatial rotation embedded in Lorentz group.
+# axis is Vec3 (normalized internally), angle is f64.
+# Time component unchanged; spatial block uses Rodrigues' formula.
+fn lorentz_rotate(axis, angle) {
+    var nx = HVec3_x(axis); var ny = HVec3_y(axis); var nz = HVec3_z(axis);
+    var norm = f64_sqrt(f64_add(f64_add(f64_mul(nx, nx), f64_mul(ny, ny)), f64_mul(nz, nz)));
+    if (f64_lt(norm, EPSILON_F64) == 1) {
+        return lorentz_identity();
+    }
+    var inv = f64_div(F64_ONE, norm);
+    nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
+
+    var c = f64_cos(angle);
+    var s = f64_sin(angle);
+    var omc = f64_sub(F64_ONE, c);  # 1 - cos(angle)
+
+    var m = m4_new();
+    m4_set(m, 0, 0, F64_ONE);  # time unchanged
+
+    # Rodrigues: R_ij = c*delta_ij + (1-c)*n_i*n_j + s*epsilon_ijk*n_k
+    # Row 1 (i=0, spatial x): col 1,2,3 -> j=0,1,2
+    m4_set(m, 1, 1, f64_add(f64_mul(c, F64_ONE), f64_mul(omc, f64_mul(nx, nx))));
+    m4_set(m, 2, 1, f64_sub(f64_mul(omc, f64_mul(nx, ny)), f64_mul(s, nz)));
+    m4_set(m, 3, 1, f64_add(f64_mul(omc, f64_mul(nx, nz)), f64_mul(s, ny)));
+
+    # Row 2 (i=1, spatial y)
+    m4_set(m, 1, 2, f64_add(f64_mul(omc, f64_mul(ny, nx)), f64_mul(s, nz)));
+    m4_set(m, 2, 2, f64_add(f64_mul(c, F64_ONE), f64_mul(omc, f64_mul(ny, ny))));
+    m4_set(m, 3, 2, f64_sub(f64_mul(omc, f64_mul(ny, nz)), f64_mul(s, nx)));
+
+    # Row 3 (i=2, spatial z)
+    m4_set(m, 1, 3, f64_sub(f64_mul(omc, f64_mul(nz, nx)), f64_mul(s, ny)));
+    m4_set(m, 2, 3, f64_add(f64_mul(omc, f64_mul(nz, ny)), f64_mul(s, nx)));
+    m4_set(m, 3, 3, f64_add(f64_mul(c, F64_ONE), f64_mul(omc, f64_mul(nz, nz))));
+    return m;
+}
+
+# Group multiplication: Lambda_1 * Lambda_2
+fn lorentz_compose(a, b) { return m4_mul(a, b); }
+
+# Inverse: Lambda^{-1} = eta * Lambda^T * eta
+# where eta = diag(+1, -1, -1, -1)
+fn lorentz_inv(L) {
+    var r = m4_new();
+    # eta[mu] signs: 0 -> +1, 1..3 -> -1
+    # (Lambda^{-1})^mu_nu = eta[mu] * Lambda^nu_mu * eta[nu]
+    # In col-major: m4_get(L, col=mu, row=nu) = Lambda^nu_mu (transposed access)
+    var mu = 0;
+    while (mu < 4) {
+        var nu = 0;
+        while (nu < 4) {
+            # eta[i]: +1 if i==0, -1 otherwise
+            var eta_mu = F64_ONE;
+            if (mu > 0) { eta_mu = f64_neg(F64_ONE); }
+            var eta_nu = F64_ONE;
+            if (nu > 0) { eta_nu = f64_neg(F64_ONE); }
+            # Lambda^nu_mu from original = m4_get(L, mu, nu) in col-major
+            # Transposed element Lambda^T_mu_nu = Lambda^nu_mu = m4_get(L, mu, nu)
+            # Wait: m4_get(L, col, row) so m4_get(L, nu, mu) = L[col=nu][row=mu]
+            # In our convention L stored as Lambda^row_col, so m4_get(L, nu, mu) = Lambda^mu_nu
+            # We need Lambda^T which is Lambda^nu_mu = m4_get(L, mu, nu)
+            var lt_val = m4_get(L, mu, nu);  # Lambda^nu_mu = Lambda^T ^mu_nu
+            var val = f64_mul(eta_mu, f64_mul(lt_val, eta_nu));
+            m4_set(r, nu, mu, val);
+            nu = nu + 1;
+        }
+        mu = mu + 1;
+    }
+    return r;
+}
+
+# Transform a 4-vector: x'^mu = Lambda^mu_nu x^nu
+# v is a pointer to 4 consecutive f64 values (t, x, y, z)
+# Returns pointer to 4 f64 values
+fn lorentz_transform_4vec(L, v) {
+    var out = alloc(32);
+    var mu = 0;
+    while (mu < 4) {
+        var sum = 0;
+        var nu = 0;
+        while (nu < 4) {
+            # Lambda^mu_nu = m4_get(L, nu, mu) in col-major
+            sum = f64_add(sum, f64_mul(m4_get(L, nu, mu), load64(v + nu * 8)));
+            nu = nu + 1;
+        }
+        store64(out + mu * 8, sum);
+        mu = mu + 1;
+    }
+    return out;
+}
+
+# Validate Lorentz transformation: Lambda^T eta Lambda = eta
+# Returns 1 if valid within tolerance, 0 otherwise
+fn lorentz_is_valid(L) {
+    var eta_vals = alloc(32);
+    store64(eta_vals, F64_ONE);
+    store64(eta_vals + 8, f64_neg(F64_ONE));
+    store64(eta_vals + 16, f64_neg(F64_ONE));
+    store64(eta_vals + 24, f64_neg(F64_ONE));
+
+    var tol = EPSILON_F64;
+    var mu = 0;
+    while (mu < 4) {
+        var nu = 0;
+        while (nu < 4) {
+            # Compute (Lambda^T eta Lambda)^mu_nu = sum_rho Lambda^rho_mu * eta[rho] * Lambda^rho_nu
+            var sum = 0;
+            var rho = 0;
+            while (rho < 4) {
+                var eta_rho = load64(eta_vals + rho * 8);
+                # Lambda^rho_mu = m4_get(L, mu, rho)
+                # Lambda^rho_nu = m4_get(L, nu, rho)
+                sum = f64_add(sum, f64_mul(f64_mul(m4_get(L, mu, rho), eta_rho),
+                                           m4_get(L, nu, rho)));
+                rho = rho + 1;
+            }
+            # Expected: eta[mu] if mu==nu, else 0
+            var expected = 0;
+            if (mu == nu) { expected = load64(eta_vals + mu * 8); }
+            if (f64_gt(f64_abs(f64_sub(sum, expected)), tol) == 1) {
+                return 0;
+            }
+            nu = nu + 1;
+        }
+        mu = mu + 1;
+    }
+    return 1;
+}
+
+# Minkowski interval: eta^{mu nu} v_mu v_nu = t^2 - x^2 - y^2 - z^2
+# v is a pointer to 4 f64 values (t, x, y, z)
+fn minkowski_interval(v) {
+    var t = load64(v);
+    var x = load64(v + 8);
+    var y = load64(v + 16);
+    var z = load64(v + 24);
+    return f64_sub(f64_mul(t, t),
+                   f64_add(f64_add(f64_mul(x, x), f64_mul(y, y)), f64_mul(z, z)));
+}

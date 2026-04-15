@@ -1,0 +1,592 @@
+# diffgeo.cyr — differential geometry for curved spacetimes and manifolds
+# Usage: include "lib/diffgeo.cyr"
+# Requires: alloc.cyr, math.cyr
+#
+# Provides:
+#   Christoffel symbols, Riemann curvature tensor, Ricci tensor/scalar,
+#   Einstein tensor, geodesic RK4 integration, Killing vector residual,
+#   exterior algebra (wedge product, Hodge star).
+#
+# All tensors are stored as flat f64 arrays in heap memory:
+#   metric[i*dim+j]
+#   christoffel[(a*dim+mu)*dim+nu]
+#   riemann[((rho*dim+sigma)*dim+mu)*dim+nu]
+# Each element is 8 bytes (f64 bit pattern), accessed via load64/store64.
+
+# ================================================================
+# CONSTANTS
+# ================================================================
+
+var F64_SIX_DG = 0x4018_0000_0000_0000;  # 6.0
+
+# ================================================================
+# INTERNAL HELPERS
+# ================================================================
+
+# Flat-index helpers for tensors stored in heap memory.
+# All return byte offsets suitable for load64/store64.
+
+# Index into a dim*dim matrix: offset = (i*dim + j) * 8
+fn _dg_idx2(i, j, dim) {
+    return (i * dim + j) * 8;
+}
+
+# Index into a dim*dim*dim rank-3 tensor: offset = ((a*dim + b)*dim + c) * 8
+fn _dg_idx3(a, b, c, dim) {
+    return ((a * dim + b) * dim + c) * 8;
+}
+
+# Index into a dim^4 rank-4 tensor: offset = (((a*dim + b)*dim + c)*dim + d) * 8
+fn _dg_idx4(a, b, c, d, dim) {
+    return (((a * dim + b) * dim + c) * dim + d) * 8;
+}
+
+# ================================================================
+# 1. CHRISTOFFEL SYMBOLS  Gamma^a_{mu nu}
+# ================================================================
+# Gamma^a_{mu nu} = 1/2 g^{a lambda} (d_mu g_{nu lambda}
+#                                     + d_nu g_{mu lambda}
+#                                     - d_lambda g_{mu nu})
+#
+# metric_inv: flat f64 array (dim*dim) — g^{ij}
+# metric_deriv: flat f64 array (dim*dim*dim) — d_k g_{ij}
+#   indexed as metric_deriv[(i*dim + j)*dim + k] = partial_k g_{ij}
+# Returns: pointer to allocated flat f64 array of dim^3 elements.
+
+fn christoffel_symbols(metric_inv, metric_deriv, dim) {
+    var n3 = dim * dim * dim;
+    var out = alloc(n3 * 8);
+
+    var alpha = 0;
+    while (alpha < dim) {
+        var mu = 0;
+        while (mu < dim) {
+            var nu = 0;
+            while (nu < dim) {
+                var sum = 0;  # f64 0.0
+                var lambda = 0;
+                while (lambda < dim) {
+                    # g^{alpha, lambda}
+                    var g_al = load64(metric_inv + _dg_idx2(alpha, lambda, dim));
+
+                    # d_mu g_{nu lambda}
+                    var d1 = load64(metric_deriv + _dg_idx3(nu, lambda, mu, dim));
+                    # d_nu g_{mu lambda}
+                    var d2 = load64(metric_deriv + _dg_idx3(mu, lambda, nu, dim));
+                    # d_lambda g_{mu nu}
+                    var d3 = load64(metric_deriv + _dg_idx3(mu, nu, lambda, dim));
+
+                    # bracket = d1 + d2 - d3
+                    var bracket = f64_sub(f64_add(d1, d2), d3);
+                    sum = f64_add(sum, f64_mul(g_al, bracket));
+
+                    lambda = lambda + 1;
+                }
+                # Gamma^a_{mu nu} = 0.5 * sum
+                store64(out + _dg_idx3(alpha, mu, nu, dim), f64_mul(F64_HALF, sum));
+
+                nu = nu + 1;
+            }
+            mu = mu + 1;
+        }
+        alpha = alpha + 1;
+    }
+    return out;
+}
+
+# Get Gamma^a_{mu nu} from a Christoffel array
+fn christoffel_get(christoffel, dim, a, mu, nu) {
+    return load64(christoffel + _dg_idx3(a, mu, nu, dim));
+}
+
+# ================================================================
+# 2. RIEMANN CURVATURE TENSOR  R^rho_{sigma mu nu}
+# ================================================================
+# R^rho_{sigma mu nu} = d_mu Gamma^rho_{nu sigma}
+#                      - d_nu Gamma^rho_{mu sigma}
+#                      + Gamma^rho_{mu lambda} Gamma^lambda_{nu sigma}
+#                      - Gamma^rho_{nu lambda} Gamma^lambda_{mu sigma}
+#
+# christoffel: flat f64 array (dim^3) — Gamma^a_{mu nu}
+# christoffel_deriv: flat f64 array (dim^4) — d_k Gamma^a_{mu nu}
+#   indexed as christoffel_deriv[(((a*dim + mu)*dim + nu)*dim + k)] = d_k Gamma^a_{mu nu}
+# Returns: pointer to allocated flat f64 array of dim^4 elements.
+
+fn riemann_tensor(christoffel, christoffel_deriv, dim) {
+    var n4 = dim * dim * dim * dim;
+    var out = alloc(n4 * 8);
+    var d2 = dim * dim;
+
+    var rho = 0;
+    while (rho < dim) {
+        var sigma = 0;
+        while (sigma < dim) {
+            var mu = 0;
+            while (mu < dim) {
+                var nu = 0;
+                while (nu < dim) {
+                    # d_mu Gamma^rho_{nu sigma}
+                    var dg1 = load64(christoffel_deriv + _dg_idx4(rho, nu, sigma, mu, dim));
+                    # d_nu Gamma^rho_{mu sigma}
+                    var dg2 = load64(christoffel_deriv + _dg_idx4(rho, mu, sigma, nu, dim));
+
+                    var val = f64_sub(dg1, dg2);
+
+                    # Sum over lambda:
+                    # + Gamma^rho_{mu lambda} * Gamma^lambda_{nu sigma}
+                    # - Gamma^rho_{nu lambda} * Gamma^lambda_{mu sigma}
+                    var lambda = 0;
+                    while (lambda < dim) {
+                        var g_rml = load64(christoffel + _dg_idx3(rho, mu, lambda, dim));
+                        var g_lns = load64(christoffel + _dg_idx3(lambda, nu, sigma, dim));
+                        var g_rnl = load64(christoffel + _dg_idx3(rho, nu, lambda, dim));
+                        var g_lms = load64(christoffel + _dg_idx3(lambda, mu, sigma, dim));
+
+                        val = f64_add(val, f64_sub(f64_mul(g_rml, g_lns),
+                                                    f64_mul(g_rnl, g_lms)));
+                        lambda = lambda + 1;
+                    }
+
+                    store64(out + _dg_idx4(rho, sigma, mu, nu, dim), val);
+
+                    nu = nu + 1;
+                }
+                mu = mu + 1;
+            }
+            sigma = sigma + 1;
+        }
+        rho = rho + 1;
+    }
+    return out;
+}
+
+# Get R^rho_{sigma mu nu} from a Riemann array
+fn riemann_get(riemann, dim, rho, sigma, mu, nu) {
+    return load64(riemann + _dg_idx4(rho, sigma, mu, nu, dim));
+}
+
+# ================================================================
+# 3. RICCI TENSOR  R_{mu nu}
+# ================================================================
+# R_{mu nu} = R^lambda_{mu lambda nu}   (contract 1st and 3rd indices)
+#
+# riemann: flat f64 array (dim^4)
+# Returns: pointer to allocated flat f64 array of dim^2 elements.
+
+fn ricci_tensor(riemann, dim) {
+    var n2 = dim * dim;
+    var out = alloc(n2 * 8);
+
+    var mu = 0;
+    while (mu < dim) {
+        var nu = 0;
+        while (nu < dim) {
+            var sum = 0;  # f64 0.0
+            var lambda = 0;
+            while (lambda < dim) {
+                # R^lambda_{mu lambda nu}
+                sum = f64_add(sum, load64(riemann + _dg_idx4(lambda, mu, lambda, nu, dim)));
+                lambda = lambda + 1;
+            }
+            store64(out + _dg_idx2(mu, nu, dim), sum);
+            nu = nu + 1;
+        }
+        mu = mu + 1;
+    }
+    return out;
+}
+
+# Get R_{mu nu} from a Ricci tensor array
+fn ricci_get(ricci, dim, mu, nu) {
+    return load64(ricci + _dg_idx2(mu, nu, dim));
+}
+
+# ================================================================
+# 4. RICCI SCALAR  R = g^{mu nu} R_{mu nu}
+# ================================================================
+
+fn ricci_scalar(ricci, metric_inv, dim) {
+    var scalar = 0;  # f64 0.0
+    var mu = 0;
+    while (mu < dim) {
+        var nu = 0;
+        while (nu < dim) {
+            var g_mn = load64(metric_inv + _dg_idx2(mu, nu, dim));
+            var r_mn = load64(ricci + _dg_idx2(mu, nu, dim));
+            scalar = f64_add(scalar, f64_mul(g_mn, r_mn));
+            nu = nu + 1;
+        }
+        mu = mu + 1;
+    }
+    return scalar;
+}
+
+# ================================================================
+# 5. EINSTEIN TENSOR  G_{mu nu} = R_{mu nu} - 1/2 R g_{mu nu}
+# ================================================================
+
+fn einstein_tensor(ricci, metric, metric_inv, dim) {
+    var r = ricci_scalar(ricci, metric_inv, dim);
+    var half_r = f64_mul(F64_HALF, r);
+
+    var n2 = dim * dim;
+    var out = alloc(n2 * 8);
+
+    var mu = 0;
+    while (mu < dim) {
+        var nu = 0;
+        while (nu < dim) {
+            var r_mn = load64(ricci + _dg_idx2(mu, nu, dim));
+            var g_mn = load64(metric + _dg_idx2(mu, nu, dim));
+            # G_{mu nu} = R_{mu nu} - (R/2) * g_{mu nu}
+            store64(out + _dg_idx2(mu, nu, dim),
+                    f64_sub(r_mn, f64_mul(half_r, g_mn)));
+            nu = nu + 1;
+        }
+        mu = mu + 1;
+    }
+    return out;
+}
+
+# ================================================================
+# 6. GEODESIC SOLVER — RK4 integration
+# ================================================================
+# Geodesic equation:
+#   d^2 x^a / dtau^2 + Gamma^a_{mu nu} (dx^mu/dtau)(dx^nu/dtau) = 0
+#
+# State: flat f64 array of 2*dim elements.
+#   [0..dim-1] = position x^mu
+#   [dim..2*dim-1] = velocity dx^mu/dtau
+
+# Create a new geodesic state from position and velocity arrays
+# pos, vel: pointers to f64 arrays of length dim
+# Returns: pointer to allocated flat f64 array of 2*dim elements
+fn geodesic_state_new(pos, vel, dim) {
+    var state = alloc(dim * 2 * 8);
+    var i = 0;
+    while (i < dim) {
+        store64(state + i * 8, load64(pos + i * 8));
+        store64(state + (dim + i) * 8, load64(vel + i * 8));
+        i = i + 1;
+    }
+    return state;
+}
+
+# Compute geodesic acceleration: a^alpha = -Gamma^alpha_{mu nu} u^mu u^nu
+# pos_ptr, vel_ptr: pointers into the state arrays
+# christoffel: flat f64 Christoffel array (dim^3)
+# out_acc: pointer to write dim f64 acceleration values
+fn _geodesic_accel(pos_ptr, vel_ptr, christoffel, dim, out_acc) {
+    var alpha = 0;
+    while (alpha < dim) {
+        var sum = 0;  # f64 0.0
+        var mu = 0;
+        while (mu < dim) {
+            var u_mu = load64(vel_ptr + mu * 8);
+            var nu = 0;
+            while (nu < dim) {
+                var u_nu = load64(vel_ptr + nu * 8);
+                var gamma_val = load64(christoffel + _dg_idx3(alpha, mu, nu, dim));
+                sum = f64_add(sum, f64_mul(gamma_val, f64_mul(u_mu, u_nu)));
+                nu = nu + 1;
+            }
+            mu = mu + 1;
+        }
+        store64(out_acc + alpha * 8, f64_neg(sum));
+        alpha = alpha + 1;
+    }
+    return 0;
+}
+
+# RK4 integration of the geodesic equation.
+# state: pointer to geodesic state (2*dim f64 values)
+# christoffel: flat f64 Christoffel array (dim^3)
+# dt: f64 proper time step
+# steps: integer number of steps
+# Returns: pointer to new state after integration (2*dim f64 values)
+fn geodesic_rk4(state, christoffel, dim, dt, steps) {
+    # Working arrays: current position and velocity
+    var x = alloc(dim * 8);
+    var u = alloc(dim * 8);
+    var i = 0;
+    while (i < dim) {
+        store64(x + i * 8, load64(state + i * 8));
+        store64(u + i * 8, load64(state + (dim + i) * 8));
+        i = i + 1;
+    }
+
+    # Temporary arrays for RK4 stages
+    var k1x = alloc(dim * 8);
+    var k1u = alloc(dim * 8);
+    var k2x = alloc(dim * 8);
+    var k2u = alloc(dim * 8);
+    var k3x = alloc(dim * 8);
+    var k3u = alloc(dim * 8);
+    var k4x = alloc(dim * 8);
+    var k4u = alloc(dim * 8);
+    var tmp_x = alloc(dim * 8);
+    var tmp_u = alloc(dim * 8);
+    var tmp_acc = alloc(dim * 8);
+
+    var step = 0;
+    while (step < steps) {
+        # ---- k1 ----
+        # k1x = dt * u
+        # k1u = dt * accel(x, u)
+        _geodesic_accel(x, u, christoffel, dim, tmp_acc);
+        i = 0;
+        while (i < dim) {
+            store64(k1x + i * 8, f64_mul(dt, load64(u + i * 8)));
+            store64(k1u + i * 8, f64_mul(dt, load64(tmp_acc + i * 8)));
+            i = i + 1;
+        }
+
+        # ---- k2 ----
+        # tmp_x = x + 0.5 * k1x, tmp_u = u + 0.5 * k1u
+        i = 0;
+        while (i < dim) {
+            store64(tmp_x + i * 8, f64_add(load64(x + i * 8),
+                    f64_mul(F64_HALF, load64(k1x + i * 8))));
+            store64(tmp_u + i * 8, f64_add(load64(u + i * 8),
+                    f64_mul(F64_HALF, load64(k1u + i * 8))));
+            i = i + 1;
+        }
+        _geodesic_accel(tmp_x, tmp_u, christoffel, dim, tmp_acc);
+        i = 0;
+        while (i < dim) {
+            store64(k2x + i * 8, f64_mul(dt, load64(tmp_u + i * 8)));
+            store64(k2u + i * 8, f64_mul(dt, load64(tmp_acc + i * 8)));
+            i = i + 1;
+        }
+
+        # ---- k3 ----
+        # tmp_x = x + 0.5 * k2x, tmp_u = u + 0.5 * k2u
+        i = 0;
+        while (i < dim) {
+            store64(tmp_x + i * 8, f64_add(load64(x + i * 8),
+                    f64_mul(F64_HALF, load64(k2x + i * 8))));
+            store64(tmp_u + i * 8, f64_add(load64(u + i * 8),
+                    f64_mul(F64_HALF, load64(k2u + i * 8))));
+            i = i + 1;
+        }
+        _geodesic_accel(tmp_x, tmp_u, christoffel, dim, tmp_acc);
+        i = 0;
+        while (i < dim) {
+            store64(k3x + i * 8, f64_mul(dt, load64(tmp_u + i * 8)));
+            store64(k3u + i * 8, f64_mul(dt, load64(tmp_acc + i * 8)));
+            i = i + 1;
+        }
+
+        # ---- k4 ----
+        # tmp_x = x + k3x, tmp_u = u + k3u
+        i = 0;
+        while (i < dim) {
+            store64(tmp_x + i * 8, f64_add(load64(x + i * 8), load64(k3x + i * 8)));
+            store64(tmp_u + i * 8, f64_add(load64(u + i * 8), load64(k3u + i * 8)));
+            i = i + 1;
+        }
+        _geodesic_accel(tmp_x, tmp_u, christoffel, dim, tmp_acc);
+        i = 0;
+        while (i < dim) {
+            store64(k4x + i * 8, f64_mul(dt, load64(tmp_u + i * 8)));
+            store64(k4u + i * 8, f64_mul(dt, load64(tmp_acc + i * 8)));
+            i = i + 1;
+        }
+
+        # ---- Update: x += (k1 + 2*k2 + 2*k3 + k4) / 6 ----
+        i = 0;
+        while (i < dim) {
+            var dx = f64_div(
+                f64_add(f64_add(load64(k1x + i * 8),
+                                f64_mul(F64_TWO, load64(k2x + i * 8))),
+                        f64_add(f64_mul(F64_TWO, load64(k3x + i * 8)),
+                                load64(k4x + i * 8))),
+                F64_SIX_DG);
+            var du = f64_div(
+                f64_add(f64_add(load64(k1u + i * 8),
+                                f64_mul(F64_TWO, load64(k2u + i * 8))),
+                        f64_add(f64_mul(F64_TWO, load64(k3u + i * 8)),
+                                load64(k4u + i * 8))),
+                F64_SIX_DG);
+            store64(x + i * 8, f64_add(load64(x + i * 8), dx));
+            store64(u + i * 8, f64_add(load64(u + i * 8), du));
+            i = i + 1;
+        }
+
+        step = step + 1;
+    }
+
+    # Pack result into a new state
+    var result = alloc(dim * 2 * 8);
+    i = 0;
+    while (i < dim) {
+        store64(result + i * 8, load64(x + i * 8));
+        store64(result + (dim + i) * 8, load64(u + i * 8));
+        i = i + 1;
+    }
+    return result;
+}
+
+# ================================================================
+# 7. KILLING VECTOR RESIDUAL
+# ================================================================
+# Killing's equation: nabla_mu xi_nu + nabla_nu xi_mu = 0
+#
+# nabla_mu xi_nu = g_{nu lambda} (d_mu xi^lambda + Gamma^lambda_{mu rho} xi^rho)
+#
+# field: pointer to f64 array of dim*dim+dim values, laid out as:
+#   [0..dim-1] = xi^mu (contravariant Killing field)
+#   [dim..dim+dim*dim-1] = d_nu xi^mu as flat dim*dim array
+#     indexed as field[dim + mu*dim + nu] = partial_nu xi^mu
+# metric: flat f64 array (dim*dim) — g_{ij}
+# metric_deriv: not used directly; Christoffel symbols encode the
+#   connection. We compute via the metric and the field derivatives.
+#
+# To keep the interface simple and match the spec, we take:
+#   field: pointer to flat f64 array laid out as:
+#     [0 .. dim-1]              = xi^mu  (the vector field)
+#     [dim .. dim + dim*dim - 1] = partial derivatives dxi[mu*dim + nu] = d_nu xi^mu
+#   metric: flat f64 array (dim*dim) — g_{ij}
+#   christoffel: flat f64 array (dim^3) — Gamma^a_{mu nu}
+#
+# Returns: f64 — maximum absolute residual of nabla_mu xi_nu + nabla_nu xi_mu
+
+fn killing_residual(field, metric, christoffel, dim) {
+    # Extract xi pointer and dxi pointer from field layout
+    var xi = field;
+    var dxi = field + dim * 8;
+
+    var max_res = 0;  # f64 0.0
+
+    var mu = 0;
+    while (mu < dim) {
+        var nu = mu;
+        while (nu < dim) {
+            # nabla_mu xi_nu = g_{nu lambda} (d_mu xi^lambda + Gamma^lambda_{mu rho} xi^rho)
+            var nabla_mu_xi_nu = 0;  # f64 0.0
+            var lambda = 0;
+            while (lambda < dim) {
+                var g_nl = load64(metric + _dg_idx2(nu, lambda, dim));
+
+                # d_mu xi^lambda = dxi[lambda * dim + mu]
+                var d_mu_xi_l = load64(dxi + (lambda * dim + mu) * 8);
+
+                # Gamma^lambda_{mu rho} xi^rho summed over rho
+                var gamma_sum = 0;  # f64 0.0
+                var rho = 0;
+                while (rho < dim) {
+                    var g_val = load64(christoffel + _dg_idx3(lambda, mu, rho, dim));
+                    var xi_rho = load64(xi + rho * 8);
+                    gamma_sum = f64_add(gamma_sum, f64_mul(g_val, xi_rho));
+                    rho = rho + 1;
+                }
+
+                nabla_mu_xi_nu = f64_add(nabla_mu_xi_nu,
+                    f64_mul(g_nl, f64_add(d_mu_xi_l, gamma_sum)));
+
+                lambda = lambda + 1;
+            }
+
+            # nabla_nu xi_mu = g_{mu lambda} (d_nu xi^lambda + Gamma^lambda_{nu rho} xi^rho)
+            var nabla_nu_xi_mu = 0;  # f64 0.0
+            lambda = 0;
+            while (lambda < dim) {
+                var g_ml = load64(metric + _dg_idx2(mu, lambda, dim));
+
+                # d_nu xi^lambda = dxi[lambda * dim + nu]
+                var d_nu_xi_l = load64(dxi + (lambda * dim + nu) * 8);
+
+                var gamma_sum2 = 0;  # f64 0.0
+                var rho2 = 0;
+                while (rho2 < dim) {
+                    var g_val2 = load64(christoffel + _dg_idx3(lambda, nu, rho2, dim));
+                    var xi_rho2 = load64(xi + rho2 * 8);
+                    gamma_sum2 = f64_add(gamma_sum2, f64_mul(g_val2, xi_rho2));
+                    rho2 = rho2 + 1;
+                }
+
+                nabla_nu_xi_mu = f64_add(nabla_nu_xi_mu,
+                    f64_mul(g_ml, f64_add(d_nu_xi_l, gamma_sum2)));
+
+                lambda = lambda + 1;
+            }
+
+            var residual = f64_abs(f64_add(nabla_mu_xi_nu, nabla_nu_xi_mu));
+            if (f64_gt(residual, max_res) == 1) {
+                max_res = residual;
+            }
+
+            nu = nu + 1;
+        }
+        mu = mu + 1;
+    }
+
+    return max_res;
+}
+
+# ================================================================
+# 8. EXTERIOR ALGEBRA
+# ================================================================
+
+# Wedge product of two 1-forms: (alpha ^ beta)_{ij} = alpha_i * beta_j - alpha_j * beta_i
+# alpha, beta: pointers to f64 arrays of length dim
+# Returns: pointer to allocated f64 array of C(dim, 2) = dim*(dim-1)/2 elements
+# Stored in strictly-increasing index order: (0,1), (0,2), ..., (0,dim-1), (1,2), ...
+
+fn wedge_1_1(alpha, beta, dim) {
+    var n2 = dim * (dim - 1) / 2;
+    var out = alloc(n2 * 8);
+
+    var pos = 0;
+    var i = 0;
+    while (i < dim) {
+        var j = i + 1;
+        while (j < dim) {
+            var ai = load64(alpha + i * 8);
+            var bj = load64(beta + j * 8);
+            var aj = load64(alpha + j * 8);
+            var bi = load64(beta + i * 8);
+            # (alpha ^ beta)_{ij} = alpha_i * beta_j - alpha_j * beta_i
+            store64(out + pos * 8, f64_sub(f64_mul(ai, bj), f64_mul(aj, bi)));
+            pos = pos + 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+# Hodge star operator for a 2-form in 4D Minkowski spacetime.
+# (*F)_{mu nu} = 1/2 epsilon_{mu nu rho sigma} F^{rho sigma}
+#
+# form: pointer to 6 f64 values (2-form components in order:
+#   (01), (02), (03), (12), (13), (23))
+# sign: f64 metric determinant sign (+1 Euclidean, -1 Lorentzian)
+#   (baked into the Minkowski mapping; parameter kept for API consistency)
+#
+# Returns: pointer to allocated 6-element f64 array (the dual 2-form)
+#
+# With eta = diag(+1,-1,-1,-1):
+#   *(01) =  F_{23},  *(02) = -F_{13}, *(03) =  F_{12}
+#   *(12) = -F_{03},  *(13) =  F_{02}, *(23) = -F_{01}
+
+fn hodge_star_2form_4d(form, sign) {
+    var out = alloc(48);  # 6 * 8 bytes
+
+    # Components: 0=(01), 1=(02), 2=(03), 3=(12), 4=(13), 5=(23)
+    var f01 = load64(form);
+    var f02 = load64(form + 8);
+    var f03 = load64(form + 16);
+    var f12 = load64(form + 24);
+    var f13 = load64(form + 32);
+    var f23 = load64(form + 40);
+
+    store64(out,      f23);           # *(01) =  F_{23}
+    store64(out + 8,  f64_neg(f13));  # *(02) = -F_{13}
+    store64(out + 16, f12);           # *(03) =  F_{12}
+    store64(out + 24, f64_neg(f03));  # *(12) = -F_{03}
+    store64(out + 32, f02);           # *(13) =  F_{02}
+    store64(out + 40, f64_neg(f01));  # *(23) = -F_{01}
+
+    return out;
+}

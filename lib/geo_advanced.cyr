@@ -1,0 +1,1158 @@
+# geo_advanced.cyr — advanced geometry: GJK/EPA 3D, BVH, SDF, swept AABB/TOI, CGA
+# Usage: include "lib/geo_advanced.cyr"
+# Requires: alloc.cyr, math.cyr, vec3.cyr, vec.cyr, fnptr.cyr, geo.cyr, error.cyr, f64_util.cyr
+#
+# Ported from hisab rust-old/src/geo/{collision,spatial,sdf,cga}.rs
+#
+# Conventions:
+#   - All f64 values are IEEE 754 bit patterns (same as rest of hisab)
+#   - Functions returning 1/0 indicate success/failure or true/false
+#   - Pointers to output params (out_normal, out_depth, out_t) are written via store64
+#   - Support functions are passed as function pointers: fncall2(support_fp, shape, dir)
+#   - Multivectors are 256-byte (32 * 8) heap blocks accessed via load64/store64
+
+# ================================================================
+# Local f64 constants
+# ================================================================
+
+var _GA_F64_QUARTER     = 0x3FD0_0000_0000_0000;  # 0.25
+var _GA_F64_NEG_HALF    = 0xBFE0_0000_0000_0000;  # -0.5
+var _GA_F64_NEG_ONE     = 0xBFF0_0000_0000_0000;  # -1.0
+var _GA_F64_POS_INF     = 0x7FF0_0000_0000_0000;  # +Infinity
+var _GA_F64_NEG_INF     = 0xFFF0_0000_0000_0000;  # -Infinity
+var _GA_F64_001         = 0x3F847AE147AE147B;     # 0.01
+
+# GJK/EPA iteration limits
+var GJK_MAX_ITER = 64;
+var EPA_MAX_ITER = 64;
+
+# ================================================================
+# 1. GJK / EPA 3D collision detection
+# ================================================================
+#
+# The caller provides a support function pointer:
+#   support_fp(shape_ptr, direction_hvec3) -> HVec3
+#
+# This returns the farthest point on the shape in the given direction.
+# GJK works on the Minkowski difference: support_A(d) - support_B(-d).
+
+# Minkowski difference support: A(dir) - B(-dir)
+fn _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir) {
+    var pa = fncall2(sup_a, shape_a, dir);
+    var neg_dir = hvec3_neg(dir);
+    var pb = fncall2(sup_b, shape_b, neg_dir);
+    return hvec3_sub(pa, pb);
+}
+
+# --- Simplex helpers (tetrahedron-based GJK in 3D) ---
+# Simplex stored as flat array: up to 4 HVec3 pointers + count
+# Layout: [v0, v1, v2, v3, count] = 40 bytes
+
+fn _gjk_simplex_new() {
+    var s = alloc(40);
+    store64(s, 0);
+    store64(s + 8, 0);
+    store64(s + 16, 0);
+    store64(s + 24, 0);
+    store64(s + 32, 0);  # count = 0
+    return s;
+}
+
+fn _gjk_simplex_count(s) { return load64(s + 32); }
+
+fn _gjk_simplex_set_count(s, n) { store64(s + 32, n); return 0; }
+
+fn _gjk_simplex_get(s, i) { return load64(s + i * 8); }
+
+fn _gjk_simplex_set(s, i, v) { store64(s + i * 8, v); return 0; }
+
+fn _gjk_simplex_push(s, v) {
+    var n = load64(s + 32);
+    store64(s + n * 8, v);
+    store64(s + 32, n + 1);
+    return 0;
+}
+
+fn _gjk_simplex_clear(s) {
+    store64(s + 32, 0);
+    return 0;
+}
+
+# Do-simplex for line case (2 points). Returns 1 if origin enclosed, 0 otherwise.
+# Updates simplex and direction (dir_ptr is pointer to HVec3 slot).
+fn _gjk_do_line(simplex, dir_ptr) {
+    var a = _gjk_simplex_get(simplex, 1);  # newest
+    var b = _gjk_simplex_get(simplex, 0);
+    var ab = hvec3_sub(b, a);
+    var ao = hvec3_neg(a);
+
+    if (f64_gt(hvec3_dot(ab, ao), 0) == 1) {
+        # Direction perpendicular to AB toward origin: AB x AO x AB
+        var tmp = hvec3_cross(ab, ao);
+        store64(dir_ptr, hvec3_cross(tmp, ab));
+    } else {
+        _gjk_simplex_clear(simplex);
+        _gjk_simplex_push(simplex, a);
+        store64(dir_ptr, ao);
+    }
+    return 0;
+}
+
+# Do-simplex for triangle case (3 points). Returns 1 if origin enclosed in volume sense.
+fn _gjk_do_triangle(simplex, dir_ptr) {
+    var a = _gjk_simplex_get(simplex, 2);  # newest
+    var b = _gjk_simplex_get(simplex, 1);
+    var c = _gjk_simplex_get(simplex, 0);
+    var ab = hvec3_sub(b, a);
+    var ac = hvec3_sub(c, a);
+    var ao = hvec3_neg(a);
+    var abc = hvec3_cross(ab, ac);
+
+    # Check if origin is outside edge AC (on the side of ABC x AC)
+    var abc_x_ac = hvec3_cross(abc, ac);
+    if (f64_gt(hvec3_dot(abc_x_ac, ao), 0) == 1) {
+        if (f64_gt(hvec3_dot(ac, ao), 0) == 1) {
+            # Region AC
+            _gjk_simplex_clear(simplex);
+            _gjk_simplex_push(simplex, c);
+            _gjk_simplex_push(simplex, a);
+            var tmp = hvec3_cross(ac, ao);
+            store64(dir_ptr, hvec3_cross(tmp, ac));
+        } else {
+            # Reduce to line AB
+            _gjk_simplex_clear(simplex);
+            _gjk_simplex_push(simplex, b);
+            _gjk_simplex_push(simplex, a);
+            _gjk_do_line(simplex, dir_ptr);
+        }
+        return 0;
+    }
+
+    # Check if origin is outside edge AB (on the side of AB x ABC)
+    var ab_x_abc = hvec3_cross(ab, abc);
+    if (f64_gt(hvec3_dot(ab_x_abc, ao), 0) == 1) {
+        _gjk_simplex_clear(simplex);
+        _gjk_simplex_push(simplex, b);
+        _gjk_simplex_push(simplex, a);
+        _gjk_do_line(simplex, dir_ptr);
+        return 0;
+    }
+
+    # Origin is above or below the triangle
+    if (f64_gt(hvec3_dot(abc, ao), 0) == 1) {
+        store64(dir_ptr, abc);
+    } else {
+        # Flip winding
+        _gjk_simplex_clear(simplex);
+        _gjk_simplex_push(simplex, b);
+        _gjk_simplex_push(simplex, c);
+        _gjk_simplex_push(simplex, a);
+        store64(dir_ptr, hvec3_neg(abc));
+    }
+    return 0;
+}
+
+# Do-simplex for tetrahedron case (4 points). Returns 1 if origin is inside.
+fn _gjk_do_tetra(simplex, dir_ptr) {
+    var a = _gjk_simplex_get(simplex, 3);  # newest
+    var b = _gjk_simplex_get(simplex, 2);
+    var c = _gjk_simplex_get(simplex, 1);
+    var d = _gjk_simplex_get(simplex, 0);
+    var ab = hvec3_sub(b, a);
+    var ac = hvec3_sub(c, a);
+    var ad = hvec3_sub(d, a);
+    var ao = hvec3_neg(a);
+
+    # Face normals, oriented outward (away from opposite vertex)
+    var abc = hvec3_cross(ab, ac);
+    if (f64_gt(hvec3_dot(abc, ad), 0) == 1) { abc = hvec3_neg(abc); }
+
+    var acd = hvec3_cross(ac, ad);
+    if (f64_gt(hvec3_dot(acd, ab), 0) == 1) { acd = hvec3_neg(acd); }
+
+    var adb = hvec3_cross(ad, ab);
+    if (f64_gt(hvec3_dot(adb, ac), 0) == 1) { adb = hvec3_neg(adb); }
+
+    # Check each face
+    if (f64_gt(hvec3_dot(abc, ao), 0) == 1) {
+        _gjk_simplex_clear(simplex);
+        _gjk_simplex_push(simplex, c);
+        _gjk_simplex_push(simplex, b);
+        _gjk_simplex_push(simplex, a);
+        return _gjk_do_triangle(simplex, dir_ptr);
+    }
+    if (f64_gt(hvec3_dot(acd, ao), 0) == 1) {
+        _gjk_simplex_clear(simplex);
+        _gjk_simplex_push(simplex, d);
+        _gjk_simplex_push(simplex, c);
+        _gjk_simplex_push(simplex, a);
+        return _gjk_do_triangle(simplex, dir_ptr);
+    }
+    if (f64_gt(hvec3_dot(adb, ao), 0) == 1) {
+        _gjk_simplex_clear(simplex);
+        _gjk_simplex_push(simplex, b);
+        _gjk_simplex_push(simplex, d);
+        _gjk_simplex_push(simplex, a);
+        return _gjk_do_triangle(simplex, dir_ptr);
+    }
+
+    # Origin is inside the tetrahedron
+    return 1;
+}
+
+# Process the simplex. Returns 1 if origin is enclosed.
+fn _gjk_do_simplex(simplex, dir_ptr) {
+    var n = _gjk_simplex_count(simplex);
+    if (n == 2) { return _gjk_do_line(simplex, dir_ptr); }
+    if (n == 3) { return _gjk_do_triangle(simplex, dir_ptr); }
+    if (n == 4) { return _gjk_do_tetra(simplex, dir_ptr); }
+    return 0;
+}
+
+# Core GJK 3D. Returns the simplex pointer if intersecting, 0 if not.
+fn _gjk_core_3d(sup_a, shape_a, sup_b, shape_b) {
+    var simplex = _gjk_simplex_new();
+    var dir = hvec3_unit_x();
+    var dir_slot = alloc(8);
+    store64(dir_slot, dir);
+
+    var s = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir);
+    _gjk_simplex_push(simplex, s);
+    store64(dir_slot, hvec3_neg(s));
+
+    for (var gi = 0; gi < GJK_MAX_ITER; gi = gi + 1) {
+        dir = load64(dir_slot);
+        var dir_len_sq = hvec3_length_sq(dir);
+        if (f64_lt(dir_len_sq, EPSILON_F64) == 1) {
+            # Degenerate direction, pick perpendicular
+            if (_gjk_simplex_count(simplex) >= 2) {
+                var edge = hvec3_sub(_gjk_simplex_get(simplex, _gjk_simplex_count(simplex) - 1),
+                                     _gjk_simplex_get(simplex, 0));
+                dir = hvec3_cross(edge, hvec3_unit_x());
+                if (f64_lt(hvec3_length_sq(dir), EPSILON_F64) == 1) {
+                    dir = hvec3_cross(edge, hvec3_unit_y());
+                }
+            } else {
+                dir = hvec3_unit_y();
+            }
+            if (f64_lt(hvec3_length_sq(dir), EPSILON_F64) == 1) {
+                dir = hvec3_unit_z();
+            }
+        }
+
+        var new_pt = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir);
+        if (f64_lt(hvec3_dot(new_pt, dir), 0) == 1) {
+            return 0;  # No intersection
+        }
+        _gjk_simplex_push(simplex, new_pt);
+
+        if (_gjk_do_simplex(simplex, dir_slot) == 1) {
+            return simplex;  # Intersection found
+        }
+    }
+    return 0;
+}
+
+# GJK intersection test (3D). Returns 1 if shapes overlap, 0 otherwise.
+# support_a/support_b: function pointers  fn(shape, dir) -> HVec3
+fn gjk_intersect_3d(support_a, shape_a, support_b, shape_b) {
+    var result = _gjk_core_3d(support_a, shape_a, support_b, shape_b);
+    if (result != 0) { return 1; }
+    return 0;
+}
+
+# --- EPA 3D (Expanding Polytope Algorithm) ---
+# Operates on the GJK simplex (tetrahedron containing origin).
+# Expands the polytope to find the minimum penetration depth/normal.
+#
+# Face list: vec of face structs.
+# Each face: [v0_idx, v1_idx, v2_idx] stored as 3 consecutive i64 in a vec.
+# Vertex list: vec of HVec3 pointers.
+
+fn _epa_face_normal_dist(verts, fi_base, faces) {
+    # fi_base is index into faces vec (3 consecutive entries per face)
+    var i0 = vec_get(faces, fi_base);
+    var i1 = vec_get(faces, fi_base + 1);
+    var i2 = vec_get(faces, fi_base + 2);
+    var va = vec_get(verts, i0);
+    var vb = vec_get(verts, i1);
+    var vc = vec_get(verts, i2);
+    var cross = hvec3_cross(hvec3_sub(vb, va), hvec3_sub(vc, va));
+    var len = hvec3_length(cross);
+    if (f64_lt(len, EPSILON_F64) == 1) {
+        # Degenerate face
+        return 0;
+    }
+    var normal = hvec3_scale(cross, f64_div(F64_ONE, len));
+    var dist = hvec3_dot(normal, va);
+    # Ensure outward (dist >= 0)
+    if (f64_lt(dist, 0) == 1) {
+        normal = hvec3_neg(normal);
+        dist = f64_neg(dist);
+    }
+    # Return packed: alloc {normal, dist}
+    var result = alloc(16);
+    store64(result, normal);
+    store64(result + 8, dist);
+    return result;
+}
+
+# GJK + EPA 3D: returns 1 if penetrating, writes normal and depth.
+# out_normal: pointer where HVec3 normal will be stored
+# out_depth: pointer where f64 depth will be stored
+fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    var simplex = _gjk_core_3d(support_a, shape_a, support_b, shape_b);
+    if (simplex == 0) { return 0; }
+
+    var n_pts = _gjk_simplex_count(simplex);
+
+    # Build vertex list from simplex
+    var verts = vec_new();
+    for (var vi = 0; vi < n_pts; vi = vi + 1) {
+        vec_push(verts, _gjk_simplex_get(simplex, vi));
+    }
+
+    # Pad to 4 vertices if needed (try cardinal directions)
+    var card_dirs = alloc(48);  # 6 HVec3 pointers
+    store64(card_dirs,      hvec3_unit_x());
+    store64(card_dirs + 8,  hvec3_unit_y());
+    store64(card_dirs + 16, hvec3_unit_z());
+    store64(card_dirs + 24, hvec3_neg(hvec3_unit_x()));
+    store64(card_dirs + 32, hvec3_neg(hvec3_unit_y()));
+    store64(card_dirs + 40, hvec3_neg(hvec3_unit_z()));
+    for (var ci = 0; ci < 6; ci = ci + 1) {
+        if (vec_len(verts) >= 4) { ci = 6; } else {
+            var cd = load64(card_dirs + ci * 8);
+            var p = _gjk_mink_support(support_a, shape_a, support_b, shape_b, cd);
+            var is_dup = 0;
+            for (var di = 0; di < vec_len(verts); di = di + 1) {
+                if (f64_lt(hvec3_length_sq(hvec3_sub(vec_get(verts, di), p)), EPSILON_F64) == 1) {
+                    is_dup = 1;
+                }
+            }
+            if (is_dup == 0) { vec_push(verts, p); }
+        }
+    }
+    if (vec_len(verts) < 4) { return 0; }  # degenerate
+
+    # Check tetrahedron volume
+    var v01 = hvec3_sub(vec_get(verts, 1), vec_get(verts, 0));
+    var v02 = hvec3_sub(vec_get(verts, 2), vec_get(verts, 0));
+    var v03 = hvec3_sub(vec_get(verts, 3), vec_get(verts, 0));
+    var vol = f64_abs(hvec3_dot(v01, hvec3_cross(v02, v03)));
+    if (f64_lt(vol, EPSILON_F64) == 1) { return 0; }
+
+    # Build initial 4 triangular faces
+    # faces vec stores triples: [i0, i1, i2, i0, i1, i2, ...]
+    var faces = vec_new();
+
+    # Compute centroid to orient normals outward
+    var centroid = hvec3_scale(hvec3_add(hvec3_add(vec_get(verts, 0), vec_get(verts, 1)),
+                                         hvec3_add(vec_get(verts, 2), vec_get(verts, 3))),
+                              _GA_F64_QUARTER);
+
+    # 4 faces of tetrahedron: [0,1,2], [0,3,1], [0,2,3], [1,3,2]
+    var _init_faces = alloc(96);  # 4 * 3 * 8
+    store64(_init_faces,      0); store64(_init_faces + 8,  1); store64(_init_faces + 16, 2);
+    store64(_init_faces + 24, 0); store64(_init_faces + 32, 3); store64(_init_faces + 40, 1);
+    store64(_init_faces + 48, 0); store64(_init_faces + 56, 2); store64(_init_faces + 64, 3);
+    store64(_init_faces + 72, 1); store64(_init_faces + 80, 3); store64(_init_faces + 88, 2);
+
+    for (var fi = 0; fi < 4; fi = fi + 1) {
+        var base = fi * 24;
+        var i0 = load64(_init_faces + base);
+        var i1 = load64(_init_faces + base + 8);
+        var i2 = load64(_init_faces + base + 16);
+        # Fix winding: normal should point away from centroid
+        var va = vec_get(verts, i0);
+        var vb = vec_get(verts, i1);
+        var vc = vec_get(verts, i2);
+        var normal = hvec3_cross(hvec3_sub(vb, va), hvec3_sub(vc, va));
+        if (f64_lt(hvec3_dot(normal, hvec3_sub(va, centroid)), 0) == 1) {
+            # Swap winding
+            vec_push(faces, i0); vec_push(faces, i2); vec_push(faces, i1);
+        } else {
+            vec_push(faces, i0); vec_push(faces, i1); vec_push(faces, i2);
+        }
+    }
+
+    # EPA iteration loop
+    var best_normal = hvec3_unit_x();
+    var best_depth = _GA_F64_POS_INF;
+
+    for (var ei = 0; ei < EPA_MAX_ITER; ei = ei + 1) {
+        var num_faces = vec_len(faces) / 3;
+        var closest_dist = _GA_F64_POS_INF;
+        var closest_normal = hvec3_zero();
+        var closest_face = 0;
+
+        for (var fj = 0; fj < num_faces; fj = fj + 1) {
+            var fb = fj * 3;
+            var nd = _epa_face_normal_dist(verts, fb, faces);
+            if (nd != 0) {
+                var fn_normal = load64(nd);
+                var fn_dist = load64(nd + 8);
+                if (f64_lt(fn_dist, closest_dist) == 1) {
+                    closest_dist = fn_dist;
+                    closest_normal = fn_normal;
+                    closest_face = fj;
+                }
+            }
+        }
+
+        if (closest_dist == _GA_F64_POS_INF) {
+            # All faces degenerate
+            ei = EPA_MAX_ITER;
+        } else {
+            var support = _gjk_mink_support(support_a, shape_a, support_b, shape_b, closest_normal);
+            var d = hvec3_dot(support, closest_normal);
+
+            if (f64_lt(f64_abs(f64_sub(d, closest_dist)), EPSILON_F64) == 1) {
+                # Converged
+                store64(out_normal, closest_normal);
+                store64(out_depth, f64_abs(closest_dist));
+                return 1;
+            }
+
+            # Add new vertex
+            var new_idx = vec_len(verts);
+            vec_push(verts, support);
+
+            # Find visible faces and collect horizon edges
+            var edges = vec_new();  # pairs: [e0, e1, e0, e1, ...]
+            var new_faces = vec_new();
+
+            for (var fk = 0; fk < num_faces; fk = fk + 1) {
+                var fb = fk * 3;
+                var fi0 = vec_get(faces, fb);
+                var fi1 = vec_get(faces, fb + 1);
+                var fi2 = vec_get(faces, fb + 2);
+                var fva = vec_get(verts, fi0);
+                var fvb = vec_get(verts, fi1);
+                var fvc = vec_get(verts, fi2);
+                var fnorm = hvec3_cross(hvec3_sub(fvb, fva), hvec3_sub(fvc, fva));
+
+                if (f64_gt(hvec3_dot(fnorm, hvec3_sub(support, fva)), 0) == 1) {
+                    # Visible face — collect edges
+                    # Edge fi0-fi1
+                    var _edge_pairs = alloc(48);
+                    store64(_edge_pairs,      fi0); store64(_edge_pairs + 8,  fi1);
+                    store64(_edge_pairs + 16, fi1); store64(_edge_pairs + 24, fi2);
+                    store64(_edge_pairs + 32, fi2); store64(_edge_pairs + 40, fi0);
+
+                    for (var ek = 0; ek < 3; ek = ek + 1) {
+                        var ea = load64(_edge_pairs + ek * 16);
+                        var eb = load64(_edge_pairs + ek * 16 + 8);
+                        # Check if reverse edge already in list
+                        var found = 0 - 1;
+                        var ne = vec_len(edges) / 2;
+                        for (var el = 0; el < ne; el = el + 1) {
+                            if (vec_get(edges, el * 2) == eb) {
+                                if (vec_get(edges, el * 2 + 1) == ea) {
+                                    found = el;
+                                }
+                            }
+                        }
+                        if (found >= 0) {
+                            # Remove the matched edge (shift left by 2)
+                            vec_remove(edges, found * 2 + 1);
+                            vec_remove(edges, found * 2);
+                        } else {
+                            vec_push(edges, ea);
+                            vec_push(edges, eb);
+                        }
+                    }
+                } else {
+                    # Keep this face
+                    vec_push(new_faces, fi0);
+                    vec_push(new_faces, fi1);
+                    vec_push(new_faces, fi2);
+                }
+            }
+
+            # Create new faces from horizon edges to new vertex
+            var ne = vec_len(edges) / 2;
+            for (var el = 0; el < ne; el = el + 1) {
+                vec_push(new_faces, vec_get(edges, el * 2));
+                vec_push(new_faces, vec_get(edges, el * 2 + 1));
+                vec_push(new_faces, new_idx);
+            }
+
+            faces = new_faces;
+            best_normal = closest_normal;
+            best_depth = closest_dist;
+        }
+    }
+
+    # Return best estimate
+    store64(out_normal, best_normal);
+    store64(out_depth, f64_abs(best_depth));
+    return 1;
+}
+
+
+# ================================================================
+# 2. BVH (Bounding Volume Hierarchy)
+# ================================================================
+#
+# A flattened BVH tree stored in a vec-of-nodes arena.
+# Each node: 40 bytes
+#   [0]  aabb (GeoAabb ptr)
+#   [8]  left child index (-1 = leaf)
+#   [16] right child index
+#   [24] leaf primitive index (-1 = internal)
+#   [32] unused/padding
+#
+# BVH handle: { nodes_ptr, count }
+
+var _BVH_NODE_SIZE = 32;  # 4 slots * 8 bytes
+
+fn _bvh_node_alloc(aabb, left, right, leaf_idx) {
+    var n = alloc(_BVH_NODE_SIZE);
+    store64(n, aabb);
+    store64(n + 8, left);
+    store64(n + 16, right);
+    store64(n + 24, leaf_idx);
+    return n;
+}
+
+fn _bvh_node_aabb(n) { return load64(n); }
+fn _bvh_node_left(n) { return load64(n + 8); }
+fn _bvh_node_right(n) { return load64(n + 16); }
+fn _bvh_node_leaf_idx(n) { return load64(n + 24); }
+
+# Merge two AABBs
+fn _bvh_aabb_merge(a, b) {
+    return geo_aabb_new(hvec3_min(GeoAabb_min(a), GeoAabb_min(b)),
+                        hvec3_max(GeoAabb_max(a), GeoAabb_max(b)));
+}
+
+# Build BVH recursively from a vec of {aabb, index} pairs.
+# items_vec: vec of interleaved [aabb_ptr, index, aabb_ptr, index, ...]
+# start, end: range in items_vec (in pairs, so item i is at items[i*2], items[i*2+1])
+fn _bvh_build_rec(items, start, end) {
+    var count = end - start;
+    if (count == 1) {
+        var aabb = vec_get(items, start * 2);
+        var idx = vec_get(items, start * 2 + 1);
+        return _bvh_node_alloc(aabb, 0 - 1, 0 - 1, idx);
+    }
+
+    # Compute bounding box of all items
+    var bounds = vec_get(items, start * 2);
+    for (var bi = start + 1; bi < end; bi = bi + 1) {
+        bounds = _bvh_aabb_merge(bounds, vec_get(items, bi * 2));
+    }
+
+    # Find longest axis
+    var size = geo_aabb_size(bounds);
+    var sx = f64_abs(HVec3_x(size));
+    var sy = f64_abs(HVec3_y(size));
+    var sz = f64_abs(HVec3_z(size));
+    var axis = 0;
+    if (f64_gt(sy, sx) == 1) {
+        if (f64_gt(sy, sz) == 1) { axis = 1; } else { axis = 2; }
+    } else {
+        if (f64_gt(sz, sx) == 1) { axis = 2; }
+    }
+
+    # Midpoint of bounding box on chosen axis
+    var bmin = GeoAabb_min(bounds);
+    var bmax = GeoAabb_max(bounds);
+    var mid_val = 0;
+    if (axis == 0) { mid_val = f64_mul(f64_add(HVec3_x(bmin), HVec3_x(bmax)), F64_HALF); }
+    if (axis == 1) { mid_val = f64_mul(f64_add(HVec3_y(bmin), HVec3_y(bmax)), F64_HALF); }
+    if (axis == 2) { mid_val = f64_mul(f64_add(HVec3_z(bmin), HVec3_z(bmax)), F64_HALF); }
+
+    # Partition: items with center < mid go to left
+    # Simple in-place partition by swapping pairs
+    var lo = start;
+    var hi = end - 1;
+    for (var pi = start; pi <= hi; pi = pi + 1) {
+        var item_aabb = vec_get(items, pi * 2);
+        var center = geo_aabb_center(item_aabb);
+        var cv = 0;
+        if (axis == 0) { cv = HVec3_x(center); }
+        if (axis == 1) { cv = HVec3_y(center); }
+        if (axis == 2) { cv = HVec3_z(center); }
+
+        if (f64_lt(cv, mid_val) == 1) {
+            # Swap pair at pi with pair at lo
+            if (pi != lo) {
+                var tmp_a = vec_get(items, lo * 2);
+                var tmp_i = vec_get(items, lo * 2 + 1);
+                vec_set(items, lo * 2, vec_get(items, pi * 2));
+                vec_set(items, lo * 2 + 1, vec_get(items, pi * 2 + 1));
+                vec_set(items, pi * 2, tmp_a);
+                vec_set(items, pi * 2 + 1, tmp_i);
+            }
+            lo = lo + 1;
+        }
+    }
+
+    # Ensure at least one item on each side
+    var split = lo;
+    if (split <= start) { split = start + 1; }
+    if (split >= end) { split = end - 1; }
+
+    var left = _bvh_build_rec(items, start, split);
+    var right = _bvh_build_rec(items, split, end);
+    return _bvh_node_alloc(bounds, left, right, 0 - 1);
+}
+
+# Build a BVH from arrays of AABBs.
+# aabbs: pointer to array of GeoAabb pointers (contiguous, 8 bytes each)
+# count: number of AABBs
+# Returns BVH root node pointer, or 0 if count == 0.
+fn bvh_build(aabbs, count) {
+    if (count == 0) { return 0; }
+    var items = vec_new();
+    for (var bi = 0; bi < count; bi = bi + 1) {
+        vec_push(items, load64(aabbs + bi * 8));
+        vec_push(items, bi);
+    }
+    return _bvh_build_rec(items, 0, count);
+}
+
+# Query BVH for ray hits. Returns a vec of hit primitive indices.
+fn _bvh_query_ray_rec(node, ray, results) {
+    if (node == 0) { return 0; }
+    var aabb = _bvh_node_aabb(node);
+    if (geo_ray_aabb(ray, aabb) == 0) { return 0; }
+
+    var leaf_idx = _bvh_node_leaf_idx(node);
+    if (leaf_idx != 0 - 1) {
+        # Leaf node
+        vec_push(results, leaf_idx);
+    } else {
+        _bvh_query_ray_rec(_bvh_node_left(node), ray, results);
+        _bvh_query_ray_rec(_bvh_node_right(node), ray, results);
+    }
+    return 0;
+}
+
+fn bvh_query_ray(bvh, ray) {
+    var results = vec_new();
+    _bvh_query_ray_rec(bvh, ray, results);
+    return results;
+}
+
+# Query BVH for AABB overlaps. Returns a vec of overlapping primitive indices.
+fn _bvh_query_aabb_rec(node, query, results) {
+    if (node == 0) { return 0; }
+    var aabb = _bvh_node_aabb(node);
+    if (geo_aabb_aabb(aabb, query) == 0) { return 0; }
+
+    var leaf_idx = _bvh_node_leaf_idx(node);
+    if (leaf_idx != 0 - 1) {
+        vec_push(results, leaf_idx);
+    } else {
+        _bvh_query_aabb_rec(_bvh_node_left(node), query, results);
+        _bvh_query_aabb_rec(_bvh_node_right(node), query, results);
+    }
+    return 0;
+}
+
+fn bvh_query_aabb(bvh, aabb) {
+    var results = vec_new();
+    _bvh_query_aabb_rec(bvh, aabb, results);
+    return results;
+}
+
+
+# ================================================================
+# 3. SDF primitives (Signed Distance Fields)
+# ================================================================
+# All operate on f64 values. Negative = inside, positive = outside.
+
+# Signed distance from point to sphere surface.
+fn sdf_sphere(point, center, radius) {
+    return f64_sub(hvec3_length(hvec3_sub(point, center)), radius);
+}
+
+# Signed distance from point to axis-aligned box.
+fn sdf_box(point, center, half_extents) {
+    var d = hvec3_sub(hvec3_abs(hvec3_sub(point, center)), half_extents);
+    var dx = HVec3_x(d);
+    var dy = HVec3_y(d);
+    var dz = HVec3_z(d);
+    var outside = hvec3_length(hvec3_new(f64_max(dx, 0), f64_max(dy, 0), f64_max(dz, 0)));
+    var inside = f64_min(f64_max(dx, f64_max(dy, dz)), 0);
+    return f64_add(outside, inside);
+}
+
+# Signed distance from point to capsule (segment + radius).
+fn sdf_capsule(point, a, b, radius) {
+    var ab = hvec3_sub(b, a);
+    var ap = hvec3_sub(point, a);
+    var t = f64_clamp(f64_div(hvec3_dot(ap, ab), hvec3_dot(ab, ab)), 0, F64_ONE);
+    var closest = hvec3_add(a, hvec3_scale(ab, t));
+    return f64_sub(hvec3_length(hvec3_sub(point, closest)), radius);
+}
+
+# SDF boolean operations
+fn sdf_union(d1, d2) { return f64_min(d1, d2); }
+
+fn sdf_intersection(d1, d2) { return f64_max(d1, d2); }
+
+fn sdf_subtraction(d1, d2) { return f64_max(d1, f64_neg(d2)); }
+
+# Smooth union (smooth minimum blending). k controls blend radius.
+fn sdf_smooth_union(d1, d2, k) {
+    var h = f64_clamp(f64_add(F64_HALF, f64_mul(F64_HALF, f64_div(f64_sub(d2, d1), k))),
+                      0, F64_ONE);
+    var blend = f64_sub(f64_mul(d2, f64_sub(F64_ONE, h)),
+                        f64_sub(f64_mul(d1, h),
+                                f64_mul(k, f64_mul(h, f64_sub(F64_ONE, h)))));
+    # Correction: d2*(1-h) + d1*h - k*h*(1-h)
+    var one_minus_h = f64_sub(F64_ONE, h);
+    var r = f64_add(f64_mul(d2, one_minus_h), f64_mul(d1, h));
+    r = f64_sub(r, f64_mul(k, f64_mul(h, one_minus_h)));
+    return r;
+}
+
+
+# ================================================================
+# 4. Swept AABB / Time-of-Impact
+# ================================================================
+
+# Expand an AABB along a velocity vector by dt to create a swept volume.
+# Returns a new GeoAabb that encloses the original and the displaced AABB.
+fn swept_aabb(aabb, velocity, dt) {
+    var displacement = hvec3_scale(velocity, dt);
+    var end_min = hvec3_add(GeoAabb_min(aabb), displacement);
+    var end_max = hvec3_add(GeoAabb_max(aabb), displacement);
+    return geo_aabb_new(hvec3_min(GeoAabb_min(aabb), end_min),
+                        hvec3_max(GeoAabb_max(aabb), end_max));
+}
+
+# Compute time of impact between two moving convex shapes.
+# Uses conservative advancement with GJK overlap tests.
+# support_a/b, shape_a/b: support function pointers and shape data
+# vel_a, vel_b: HVec3 velocities
+# Offset support function for TOI: wraps another support and adds translation.
+# shape_desc: {original_support_fp, original_shape, offset_hvec3}
+fn _toi_offset_support(shape_desc, dir) {
+    var orig_fp = load64(shape_desc);
+    var orig_shape = load64(shape_desc + 8);
+    var offset = load64(shape_desc + 16);
+    var pt = fncall2(orig_fp, orig_shape, dir);
+    return hvec3_add(pt, offset);
+}
+
+# max_t: f64 maximum time horizon
+# out_t: pointer where f64 time of impact will be stored
+# out_normal: pointer where HVec3 contact normal will be stored (from EPA)
+# Returns 1 if collision found within max_t, 0 otherwise.
+fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, out_normal) {
+    # Check overlap at t=0
+    if (gjk_intersect_3d(support_a, shape_a, support_b, shape_b) == 1) {
+        store64(out_t, 0);
+        # Get normal from EPA
+        var n_slot = alloc(8);
+        var d_slot = alloc(8);
+        gjk_epa_3d(support_a, shape_a, support_b, shape_b, n_slot, d_slot);
+        store64(out_normal, load64(n_slot));
+        return 1;
+    }
+
+    var rel_vel = hvec3_sub(vel_b, vel_a);
+    var speed = hvec3_length(rel_vel);
+    if (f64_lt(speed, EPSILON_F64) == 1) { return 0; }
+
+    # Conservative advancement: step by tol / speed
+    var tol = _GA_F64_001;
+    var step = f64_max(tol, _GA_F64_001);
+    step = f64_div(step, speed);
+
+    var t = 0;
+    for (var ti = 0; ti < GJK_MAX_ITER; ti = ti + 1) {
+        if (f64_gt(t, max_t) == 1) { return 0; }
+
+        # Test overlap with B offset by relative velocity * t
+        # We create offset support: support_b(shape, dir) + rel_vel * t
+        # For simplicity, adjust shape_b's position by moving vel*t
+        # Use the _toi_offset_support wrapper
+        var offset = hvec3_scale(rel_vel, t);
+
+        # Build an offset shape descriptor: {original_support, original_shape, offset}
+        var offset_desc = alloc(24);
+        store64(offset_desc, support_b);
+        store64(offset_desc + 8, shape_b);
+        store64(offset_desc + 16, offset);
+
+        if (gjk_intersect_3d(support_a, shape_a, &_toi_offset_support, offset_desc) == 1) {
+            store64(out_t, t);
+            # Get penetration normal
+            var n_slot = alloc(8);
+            var d_slot = alloc(8);
+            gjk_epa_3d(support_a, shape_a, &_toi_offset_support, offset_desc, n_slot, d_slot);
+            store64(out_normal, load64(n_slot));
+            return 1;
+        }
+
+        t = f64_add(t, step);
+    }
+    return 0;
+}
+
+# ================================================================
+# 5. CGA (Conformal Geometric Algebra)
+# ================================================================
+#
+# 5D multivector: 32 f64 components = 256 bytes.
+# Metric: e1^2 = e2^2 = e3^2 = ep^2 = +1, em^2 = -1
+#
+# Blade index layout (lexicographic):
+#   Grade 0: [0]   = scalar
+#   Grade 1: [1]=e1, [2]=e2, [3]=e3, [4]=ep, [5]=em
+#   Grade 2: [6]=e12, [7]=e13, [8]=e1p, [9]=e1m, [10]=e23, [11]=e2p, [12]=e2m,
+#            [13]=e3p, [14]=e3m, [15]=epm
+#   Grade 3: [16]=e123, [17]=e12p, [18]=e12m, [19]=e13p, [20]=e13m, [21]=e1pm,
+#            [22]=e23p, [23]=e23m, [24]=e2pm, [25]=e3pm
+#   Grade 4: [26]=e123p, [27]=e123m, [28]=e12pm, [29]=e13pm, [30]=e23pm
+#   Grade 5: [31] = e123pm (pseudoscalar)
+#
+# Access: load64(mv + idx * 8), store64(mv + idx * 8, val)
+
+var CGA_NUM_BLADES = 32;
+var CGA_MV_SIZE = 256;  # 32 * 8 bytes
+
+# Blade-to-bitmask table (e1=bit0, e2=bit1, e3=bit2, ep=bit3, em=bit4)
+# Stored as a flat array of 32 bytes (one u8 per blade, packed in i64 words)
+fn _cga_blade_bits(idx) {
+    # Inlined lookup table (each value is the bitmask for that blade index)
+    if (idx == 0)  { return 0; }     # scalar
+    if (idx == 1)  { return 1; }     # e1
+    if (idx == 2)  { return 2; }     # e2
+    if (idx == 3)  { return 4; }     # e3
+    if (idx == 4)  { return 8; }     # ep
+    if (idx == 5)  { return 16; }    # em
+    if (idx == 6)  { return 3; }     # e12
+    if (idx == 7)  { return 5; }     # e13
+    if (idx == 8)  { return 9; }     # e1p
+    if (idx == 9)  { return 17; }    # e1m
+    if (idx == 10) { return 6; }     # e23
+    if (idx == 11) { return 10; }    # e2p
+    if (idx == 12) { return 18; }    # e2m
+    if (idx == 13) { return 12; }    # e3p
+    if (idx == 14) { return 20; }    # e3m
+    if (idx == 15) { return 24; }    # epm
+    if (idx == 16) { return 7; }     # e123
+    if (idx == 17) { return 11; }    # e12p
+    if (idx == 18) { return 19; }    # e12m
+    if (idx == 19) { return 13; }    # e13p
+    if (idx == 20) { return 21; }    # e13m
+    if (idx == 21) { return 25; }    # e1pm
+    if (idx == 22) { return 14; }    # e23p
+    if (idx == 23) { return 22; }    # e23m
+    if (idx == 24) { return 26; }    # e2pm
+    if (idx == 25) { return 28; }    # e3pm
+    if (idx == 26) { return 15; }    # e123p
+    if (idx == 27) { return 23; }    # e123m
+    if (idx == 28) { return 27; }    # e12pm
+    if (idx == 29) { return 29; }    # e13pm
+    if (idx == 30) { return 30; }    # e23pm
+    if (idx == 31) { return 31; }    # e123pm
+    return 0;
+}
+
+# Reverse lookup: bitmask -> blade index
+fn _cga_bits_blade(bits) {
+    for (var bi = 0; bi < 32; bi = bi + 1) {
+        if (_cga_blade_bits(bi) == bits) { return bi; }
+    }
+    return 0;
+}
+
+# Grade of a blade
+fn _cga_blade_grade(idx) {
+    if (idx == 0) { return 0; }
+    if (idx <= 5) { return 1; }
+    if (idx <= 15) { return 2; }
+    if (idx <= 25) { return 3; }
+    if (idx <= 30) { return 4; }
+    return 5;
+}
+
+# Count set bits in a 5-bit mask
+fn _cga_popcount5(x) {
+    var c = 0;
+    if ((x & 1) != 0) { c = c + 1; }
+    if ((x & 2) != 0) { c = c + 1; }
+    if ((x & 4) != 0) { c = c + 1; }
+    if ((x & 8) != 0) { c = c + 1; }
+    if ((x & 16) != 0) { c = c + 1; }
+    return c;
+}
+
+# Geometric product of two basis blades.
+# Returns sign * 256 + result_blade_index (packed).
+# Sign: 0 = zero, 1 = positive, 2 = negative (sign = 1 - (packed >> 8) * 2... etc)
+# Actually, let's return two values via a 16-byte struct: {sign_i32, blade_idx}
+fn _cga_geo_blades(a, b) {
+    var bits_a = _cga_blade_bits(a);
+    var bits_b = _cga_blade_bits(b);
+
+    var sign = 1;
+    var bb = bits_b;
+
+    # Count sign from reordering: for each bit in a (high to low),
+    # count how many lower bits in b need to swap past it
+    for (var bi = 4; bi >= 0; bi = bi - 1) {
+        if ((bits_a & (1 << bi)) != 0) {
+            var mask = (1 << bi) - 1;
+            var count = _cga_popcount5(bb & mask);
+            if ((count & 1) != 0) { sign = 0 - sign; }
+
+            # If both have this basis vector, apply metric and remove
+            if ((bb & (1 << bi)) != 0) {
+                # em (bit 4) squares to -1, all others to +1
+                if (bi == 4) { sign = 0 - sign; }
+                bb = bb ^ (1 << bi);
+            }
+        }
+    }
+
+    var result_bits = (bits_a ^ bits_b) & 31;
+    var result_blade = _cga_bits_blade(result_bits);
+
+    # Pack: sign in high word, blade in low
+    var packed = alloc(16);
+    store64(packed, sign);
+    store64(packed + 8, result_blade);
+    return packed;
+}
+
+# Allocate a zero multivector
+fn cga_mv_zero() {
+    var mv = alloc(CGA_MV_SIZE);
+    for (var zi = 0; zi < 32; zi = zi + 1) {
+        store64(mv + zi * 8, 0);
+    }
+    return mv;
+}
+
+# Get component at blade index
+fn cga_mv_get(mv, idx) { return load64(mv + idx * 8); }
+
+# Set component at blade index
+fn cga_mv_set(mv, idx, val) { store64(mv + idx * 8, val); return 0; }
+
+# Clone a multivector
+fn cga_mv_clone(mv) {
+    var r = alloc(CGA_MV_SIZE);
+    for (var ci = 0; ci < 32; ci = ci + 1) {
+        store64(r + ci * 8, load64(mv + ci * 8));
+    }
+    return r;
+}
+
+# Add two multivectors
+fn cga_mv_add(a, b) {
+    var r = alloc(CGA_MV_SIZE);
+    for (var ai = 0; ai < 32; ai = ai + 1) {
+        store64(r + ai * 8, f64_add(load64(a + ai * 8), load64(b + ai * 8)));
+    }
+    return r;
+}
+
+# Subtract two multivectors
+fn cga_mv_sub(a, b) {
+    var r = alloc(CGA_MV_SIZE);
+    for (var si = 0; si < 32; si = si + 1) {
+        store64(r + si * 8, f64_sub(load64(a + si * 8), load64(b + si * 8)));
+    }
+    return r;
+}
+
+# Scale a multivector
+fn cga_mv_scale(mv, s) {
+    var r = alloc(CGA_MV_SIZE);
+    for (var si = 0; si < 32; si = si + 1) {
+        store64(r + si * 8, f64_mul(load64(mv + si * 8), s));
+    }
+    return r;
+}
+
+# Reverse: negate grades 2 and 3 (sign = (-1)^{k(k-1)/2})
+fn cga_mv_reverse(mv) {
+    var r = alloc(CGA_MV_SIZE);
+    for (var ri = 0; ri < 32; ri = ri + 1) {
+        var g = _cga_blade_grade(ri);
+        var val = load64(mv + ri * 8);
+        # Grades 2,3 get negated; 0,1,4,5 keep sign
+        if (g == 2) { val = f64_neg(val); }
+        if (g == 3) { val = f64_neg(val); }
+        store64(r + ri * 8, val);
+    }
+    return r;
+}
+
+# Geometric product of two multivectors
+fn cga_geometric_product(a, b) {
+    var r = cga_mv_zero();
+    for (var gi = 0; gi < 32; gi = gi + 1) {
+        var ai = load64(a + gi * 8);
+        if (f64_lt(f64_abs(ai), EPSILON_F64) != 1) {
+            for (var gj = 0; gj < 32; gj = gj + 1) {
+                var bj = load64(b + gj * 8);
+                if (f64_lt(f64_abs(bj), EPSILON_F64) != 1) {
+                    var packed = _cga_geo_blades(gi, gj);
+                    var sign = load64(packed);
+                    var blade = load64(packed + 8);
+                    if (sign != 0) {
+                        var contrib = f64_mul(ai, bj);
+                        if (sign < 0) { contrib = f64_neg(contrib); }
+                        var cur = load64(r + blade * 8);
+                        store64(r + blade * 8, f64_add(cur, contrib));
+                    }
+                }
+            }
+        }
+    }
+    return r;
+}
+
+# Outer (wedge) product: keep only terms where result grade = grade(a) + grade(b)
+fn cga_outer_product(a, b) {
+    var r = cga_mv_zero();
+    for (var gi = 0; gi < 32; gi = gi + 1) {
+        var ai = load64(a + gi * 8);
+        if (f64_lt(f64_abs(ai), EPSILON_F64) != 1) {
+            for (var gj = 0; gj < 32; gj = gj + 1) {
+                var bj = load64(b + gj * 8);
+                if (f64_lt(f64_abs(bj), EPSILON_F64) != 1) {
+                    var grade_sum = _cga_blade_grade(gi) + _cga_blade_grade(gj);
+                    var packed = _cga_geo_blades(gi, gj);
+                    var sign = load64(packed);
+                    var blade = load64(packed + 8);
+                    if (sign != 0) {
+                        if (_cga_blade_grade(blade) == grade_sum) {
+                            var contrib = f64_mul(ai, bj);
+                            if (sign < 0) { contrib = f64_neg(contrib); }
+                            var cur = load64(r + blade * 8);
+                            store64(r + blade * 8, f64_add(cur, contrib));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return r;
+}
+
+# Sandwich product: versor * x * versor_reverse
+fn cga_sandwich(x, versor) {
+    var rev = cga_mv_reverse(versor);
+    return cga_geometric_product(versor, cga_geometric_product(x, rev));
+}
+
+# Scalar part (grade 0)
+fn cga_scalar_part(mv) { return load64(mv); }
+
+# Norm squared: scalar part of mv * reverse(mv)
+fn cga_norm_sq(mv) {
+    return cga_scalar_part(cga_geometric_product(mv, cga_mv_reverse(mv)));
+}
+
+# Norm: sqrt(|norm_sq|)
+fn cga_norm(mv) {
+    return f64_sqrt(f64_abs(cga_norm_sq(mv)));
+}
+
+# --- Conformal model constructors ---
+
+# Embed a 3D point into the conformal model.
+# P = x*e1 + y*e2 + z*e3 + (x^2/2 - 1/2)*ep + (x^2/2 + 1/2)*em
+fn cga_point(x, y, z) {
+    var mv = cga_mv_zero();
+    var x2 = f64_add(f64_add(f64_mul(x, x), f64_mul(y, y)), f64_mul(z, z));
+    cga_mv_set(mv, 1, x);   # e1
+    cga_mv_set(mv, 2, y);   # e2
+    cga_mv_set(mv, 3, z);   # e3
+    cga_mv_set(mv, 4, f64_sub(f64_mul(F64_HALF, x2), F64_HALF));  # ep: (x^2-1)/2
+    cga_mv_set(mv, 5, f64_add(f64_mul(F64_HALF, x2), F64_HALF));  # em: (x^2+1)/2
+    return mv;
+}
+
+# Create a conformal sphere: S = P - (r^2/2)*e_inf
+# e_inf = ep + em
+fn cga_sphere(cx, cy, cz, r) {
+    var p = cga_point(cx, cy, cz);
+    var half_r2 = f64_mul(F64_HALF, f64_mul(r, r));
+    # Subtract half_r2 from both ep and em components (e_inf = ep + em)
+    cga_mv_set(p, 4, f64_sub(cga_mv_get(p, 4), half_r2));
+    cga_mv_set(p, 5, f64_sub(cga_mv_get(p, 5), half_r2));
+    return p;
+}
+
+# Create a conformal plane: pi = nx*e1 + ny*e2 + nz*e3 + d*(ep + em)
+# Normal is normalized.
+fn cga_plane(nx, ny, nz, d) {
+    var mv = cga_mv_zero();
+    var norm = f64_sqrt(f64_add(f64_add(f64_mul(nx, nx), f64_mul(ny, ny)), f64_mul(nz, nz)));
+    var inv = F64_ONE;
+    if (f64_gt(norm, EPSILON_F64) == 1) {
+        inv = f64_div(F64_ONE, norm);
+    }
+    cga_mv_set(mv, 1, f64_mul(nx, inv));
+    cga_mv_set(mv, 2, f64_mul(ny, inv));
+    cga_mv_set(mv, 3, f64_mul(nz, inv));
+    var d_scaled = f64_mul(d, inv);
+    cga_mv_set(mv, 4, d_scaled);  # ep component
+    cga_mv_set(mv, 5, d_scaled);  # em component
+    return mv;
+}
+
+# --- Versors (geometric transformations) ---
+
+# Translator: T = 1 - (1/2) * t * e_inf
+# where t = tx*e1 + ty*e2 + tz*e3 and e_inf = ep + em
+# T = scalar(1) - 0.5*(tx*(e1p + e1m) + ty*(e2p + e2m) + tz*(e3p + e3m))
+fn cga_translator(tx, ty, tz) {
+    var mv = cga_mv_zero();
+    cga_mv_set(mv, 0, F64_ONE);  # scalar = 1
+
+    var htx = f64_mul(_GA_F64_NEG_HALF, tx);
+    var hty = f64_mul(_GA_F64_NEG_HALF, ty);
+    var htz = f64_mul(_GA_F64_NEG_HALF, tz);
+
+    cga_mv_set(mv, 8,  htx);  # e1p
+    cga_mv_set(mv, 9,  htx);  # e1m
+    cga_mv_set(mv, 11, hty);  # e2p
+    cga_mv_set(mv, 12, hty);  # e2m
+    cga_mv_set(mv, 13, htz);  # e3p
+    cga_mv_set(mv, 14, htz);  # e3m
+    return mv;
+}
+
+# Rotor: R = cos(theta/2) - sin(theta/2) * (nz*e12 - ny*e13 + nx*e23)
+# Axis (ax, ay, az) is normalized internally.
+fn cga_rotor(ax, ay, az, angle) {
+    var norm = f64_sqrt(f64_add(f64_add(f64_mul(ax, ax), f64_mul(ay, ay)), f64_mul(az, az)));
+    if (f64_lt(norm, EPSILON_F64) == 1) {
+        # Degenerate axis: return identity
+        var mv = cga_mv_zero();
+        cga_mv_set(mv, 0, F64_ONE);
+        return mv;
+    }
+    var inv = f64_div(F64_ONE, norm);
+    var nx = f64_mul(ax, inv);
+    var ny = f64_mul(ay, inv);
+    var nz = f64_mul(az, inv);
+
+    var half = f64_mul(angle, F64_HALF);
+    var c = f64_cos(half);
+    var s = f64_sin(half);
+
+    var mv = cga_mv_zero();
+    cga_mv_set(mv, 0,  c);                       # scalar
+    cga_mv_set(mv, 6,  f64_neg(f64_mul(s, nz))); # e12
+    cga_mv_set(mv, 7,  f64_mul(s, ny));           # e13
+    cga_mv_set(mv, 10, f64_neg(f64_mul(s, nx))); # e23
+    return mv;
+}
+
+
+# Note: hvec3_abs is provided by vec3.cyr (must be included before this file)

@@ -1,0 +1,600 @@
+# symbolic.cyr — symbolic math expression tree
+# Usage: include "lib/symbolic.cyr"
+# Requires: alloc.cyr, str.cyr, string.cyr, fmt.cyr, math.cyr, vec.cyr, f64_util.cyr
+#
+# Provides: expression tree (tagged union), evaluate, differentiate,
+#           simplify, and to-string for symbolic math expressions.
+#
+# Ported from rust-old/src/symbolic/ (Expr enum, evaluate, differentiate,
+# simplify, to_str).
+#
+# Expression node layout (heap-allocated):
+#   CONST:  { tag: i64, value: f64 }           = 16 bytes
+#   VAR:    { tag: i64, name: Str }             = 16 bytes
+#   Binary: { tag: i64, left: ptr, right: ptr } = 24 bytes
+#   Unary:  { tag: i64, child: ptr }            = 16 bytes
+
+# ================================================================
+# Expression tags
+# ================================================================
+
+enum ExprTag {
+    EXPR_CONST = 0;
+    EXPR_VAR   = 1;
+    EXPR_ADD   = 2;
+    EXPR_MUL   = 3;
+    EXPR_POW   = 4;
+    EXPR_NEG   = 5;
+    EXPR_SIN   = 6;
+    EXPR_COS   = 7;
+    EXPR_EXP   = 8;
+    EXPR_LN    = 9;
+}
+
+# ================================================================
+# Internal helpers
+# ================================================================
+
+# Tolerance for float comparison
+var _SYM_EPS = 0x3CD0_0000_0000_0000;   # 1e-15
+
+fn _sym_is_zero(x) {
+    if (f64_lt(f64_abs(x), _SYM_EPS) == 1) { return 1; }
+    return 0;
+}
+
+fn _sym_is_one(x) {
+    if (f64_lt(f64_abs(f64_sub(x, F64_ONE)), _SYM_EPS) == 1) { return 1; }
+    return 0;
+}
+
+# Get the tag of an expression node
+fn expr_tag(e) {
+    return load64(e);
+}
+
+# ================================================================
+# Constructors
+# ================================================================
+
+# Create a constant expression node
+fn expr_const(val) {
+    var e = alloc(16);
+    store64(e, EXPR_CONST);
+    store64(e + 8, val);
+    return e;
+}
+
+# Create a variable expression node (name is a Str)
+fn expr_var(name) {
+    var e = alloc(16);
+    store64(e, EXPR_VAR);
+    store64(e + 8, name);
+    return e;
+}
+
+# Create an addition node: left + right
+fn expr_add(a, b) {
+    var e = alloc(24);
+    store64(e, EXPR_ADD);
+    store64(e + 8, a);
+    store64(e + 16, b);
+    return e;
+}
+
+# Create a multiplication node: left * right
+fn expr_mul(a, b) {
+    var e = alloc(24);
+    store64(e, EXPR_MUL);
+    store64(e + 8, a);
+    store64(e + 16, b);
+    return e;
+}
+
+# Create a power node: base ^ exponent
+fn expr_pow(a, b) {
+    var e = alloc(24);
+    store64(e, EXPR_POW);
+    store64(e + 8, a);
+    store64(e + 16, b);
+    return e;
+}
+
+# Create a negation node: -child
+fn expr_neg(a) {
+    var e = alloc(16);
+    store64(e, EXPR_NEG);
+    store64(e + 8, a);
+    return e;
+}
+
+# Create a sin node: sin(child)
+fn expr_sin(a) {
+    var e = alloc(16);
+    store64(e, EXPR_SIN);
+    store64(e + 8, a);
+    return e;
+}
+
+# Create a cos node: cos(child)
+fn expr_cos(a) {
+    var e = alloc(16);
+    store64(e, EXPR_COS);
+    store64(e + 8, a);
+    return e;
+}
+
+# Create an exp node: e^child
+fn expr_exp(a) {
+    var e = alloc(16);
+    store64(e, EXPR_EXP);
+    store64(e + 8, a);
+    return e;
+}
+
+# Create a ln node: ln(child)
+fn expr_ln(a) {
+    var e = alloc(16);
+    store64(e, EXPR_LN);
+    store64(e + 8, a);
+    return e;
+}
+
+# ================================================================
+# Accessor helpers
+# ================================================================
+
+# Get the f64 value from a CONST node
+fn expr_const_val(e) {
+    return load64(e + 8);
+}
+
+# Get the Str name from a VAR node
+fn expr_var_name(e) {
+    return load64(e + 8);
+}
+
+# Get the left child from a binary node (ADD, MUL, POW)
+fn expr_left(e) {
+    return load64(e + 8);
+}
+
+# Get the right child from a binary node (ADD, MUL, POW)
+fn expr_right(e) {
+    return load64(e + 16);
+}
+
+# Get the child from a unary node (NEG, SIN, COS, EXP, LN)
+fn expr_child(e) {
+    return load64(e + 8);
+}
+
+# ================================================================
+# Evaluate
+# ================================================================
+
+# Evaluate an expression tree given a vec of (Str, f64) variable bindings.
+# vars is a vec where each element is a pointer to a 16-byte pair: { name: Str, value: f64 }.
+# Returns an f64 value. Aborts if a variable is not found.
+fn expr_eval(e, vars) {
+    var t = expr_tag(e);
+
+    if (t == EXPR_CONST) {
+        return expr_const_val(e);
+    }
+
+    if (t == EXPR_VAR) {
+        var name = expr_var_name(e);
+        var vi = 0;
+        var vlen = vec_len(vars);
+        while (vi < vlen) {
+            var pair = vec_get(vars, vi);
+            var pname = load64(pair);
+            if (str_eq(name, pname) == 1) {
+                return load64(pair + 8);
+            }
+            vi = vi + 1;
+        }
+        # Variable not found — abort
+        syscall(1, 2, "expr_eval: undefined variable: ", 31);
+        str_print(name);
+        syscall(1, 2, "\n", 1);
+        syscall(60, 1);
+    }
+
+    if (t == EXPR_ADD) {
+        return f64_add(expr_eval(expr_left(e), vars),
+                       expr_eval(expr_right(e), vars));
+    }
+
+    if (t == EXPR_MUL) {
+        return f64_mul(expr_eval(expr_left(e), vars),
+                       expr_eval(expr_right(e), vars));
+    }
+
+    if (t == EXPR_POW) {
+        return f64_pow(expr_eval(expr_left(e), vars),
+                       expr_eval(expr_right(e), vars));
+    }
+
+    if (t == EXPR_NEG) {
+        return f64_neg(expr_eval(expr_child(e), vars));
+    }
+
+    if (t == EXPR_SIN) {
+        return f64_sin(expr_eval(expr_child(e), vars));
+    }
+
+    if (t == EXPR_COS) {
+        return f64_cos(expr_eval(expr_child(e), vars));
+    }
+
+    if (t == EXPR_EXP) {
+        return f64_exp(expr_eval(expr_child(e), vars));
+    }
+
+    if (t == EXPR_LN) {
+        return f64_ln(expr_eval(expr_child(e), vars));
+    }
+
+    # Unknown tag — abort
+    syscall(1, 2, "expr_eval: unknown tag\n", 23);
+    syscall(60, 1);
+    return 0;
+}
+
+# Helper: create a variable binding pair (for use with expr_eval)
+fn expr_bind(name, value) {
+    var pair = alloc(16);
+    store64(pair, name);
+    store64(pair + 8, value);
+    return pair;
+}
+
+# ================================================================
+# Differentiate
+# ================================================================
+
+# Symbolic differentiation of expr with respect to var_name (a Str).
+# Returns a new expression tree representing the derivative.
+fn expr_diff(e, var_name) {
+    var t = expr_tag(e);
+
+    # d/dx(c) = 0
+    if (t == EXPR_CONST) {
+        return expr_const(0);
+    }
+
+    # d/dx(x) = 1, d/dx(y) = 0
+    if (t == EXPR_VAR) {
+        if (str_eq(expr_var_name(e), var_name) == 1) {
+            return expr_const(F64_ONE);
+        }
+        return expr_const(0);
+    }
+
+    # d/dx(a + b) = a' + b'
+    if (t == EXPR_ADD) {
+        return expr_add(expr_diff(expr_left(e), var_name),
+                        expr_diff(expr_right(e), var_name));
+    }
+
+    # d/dx(a * b) = a'*b + a*b'  (product rule)
+    if (t == EXPR_MUL) {
+        var a = expr_left(e);
+        var b = expr_right(e);
+        return expr_add(
+            expr_mul(expr_diff(a, var_name), b),
+            expr_mul(a, expr_diff(b, var_name))
+        );
+    }
+
+    # d/dx(base ^ exp)
+    if (t == EXPR_POW) {
+        var base = expr_left(e);
+        var exp = expr_right(e);
+        # If exponent is a constant: d/dx(f^n) = n * f^(n-1) * f'
+        if (expr_tag(exp) == EXPR_CONST) {
+            var n = expr_const_val(exp);
+            return expr_mul(
+                expr_mul(
+                    expr_const(n),
+                    expr_pow(base, expr_const(f64_sub(n, F64_ONE)))
+                ),
+                expr_diff(base, var_name)
+            );
+        }
+        # General case: d/dx(f^g) = f^g * (g'*ln(f) + g*f'/f)
+        var ln_f = expr_ln(base);
+        var f_prime = expr_diff(base, var_name);
+        var g_prime = expr_diff(exp, var_name);
+        return expr_mul(
+            expr_pow(base, exp),
+            expr_add(
+                expr_mul(g_prime, ln_f),
+                expr_mul(
+                    exp,
+                    expr_mul(f_prime, expr_pow(base, expr_const(f64_neg(F64_ONE))))
+                )
+            )
+        );
+    }
+
+    # d/dx(-f) = -f'
+    if (t == EXPR_NEG) {
+        return expr_neg(expr_diff(expr_child(e), var_name));
+    }
+
+    # d/dx(sin(f)) = cos(f) * f'
+    if (t == EXPR_SIN) {
+        var a = expr_child(e);
+        return expr_mul(expr_cos(a), expr_diff(a, var_name));
+    }
+
+    # d/dx(cos(f)) = -sin(f) * f'
+    if (t == EXPR_COS) {
+        var a = expr_child(e);
+        return expr_neg(expr_mul(expr_sin(a), expr_diff(a, var_name)));
+    }
+
+    # d/dx(exp(f)) = exp(f) * f'
+    if (t == EXPR_EXP) {
+        var a = expr_child(e);
+        return expr_mul(expr_exp(a), expr_diff(a, var_name));
+    }
+
+    # d/dx(ln(f)) = f' / f  (represented as f' * f^(-1))
+    if (t == EXPR_LN) {
+        var a = expr_child(e);
+        return expr_mul(
+            expr_diff(a, var_name),
+            expr_pow(a, expr_const(f64_neg(F64_ONE)))
+        );
+    }
+
+    # Unknown tag — return 0
+    return expr_const(0);
+}
+
+# ================================================================
+# Simplify
+# ================================================================
+
+# Simplify an expression using basic algebraic rules.
+# Rules: 0+x=x, x+0=x, 0*x=0, 1*x=x, x*1=x, x^0=1, x^1=x,
+#        const folding, double negation, neg(0)=0.
+# Returns a new (simplified) expression tree.
+fn expr_simplify(e) {
+    var t = expr_tag(e);
+
+    # Leaves: constants and variables are already simplified
+    if (t == EXPR_CONST) { return e; }
+    if (t == EXPR_VAR) { return e; }
+
+    # ADD
+    if (t == EXPR_ADD) {
+        var a = expr_simplify(expr_left(e));
+        var b = expr_simplify(expr_right(e));
+        var ta = expr_tag(a);
+        var tb = expr_tag(b);
+        # 0 + b = b
+        if (ta == EXPR_CONST) {
+            if (_sym_is_zero(expr_const_val(a)) == 1) { return b; }
+        }
+        # a + 0 = a
+        if (tb == EXPR_CONST) {
+            if (_sym_is_zero(expr_const_val(b)) == 1) { return a; }
+        }
+        # const + const = const
+        if (ta == EXPR_CONST) {
+            if (tb == EXPR_CONST) {
+                return expr_const(f64_add(expr_const_val(a), expr_const_val(b)));
+            }
+        }
+        return expr_add(a, b);
+    }
+
+    # MUL
+    if (t == EXPR_MUL) {
+        var a = expr_simplify(expr_left(e));
+        var b = expr_simplify(expr_right(e));
+        var ta = expr_tag(a);
+        var tb = expr_tag(b);
+        # 0 * b = 0
+        if (ta == EXPR_CONST) {
+            if (_sym_is_zero(expr_const_val(a)) == 1) { return expr_const(0); }
+        }
+        # a * 0 = 0
+        if (tb == EXPR_CONST) {
+            if (_sym_is_zero(expr_const_val(b)) == 1) { return expr_const(0); }
+        }
+        # 1 * b = b
+        if (ta == EXPR_CONST) {
+            if (_sym_is_one(expr_const_val(a)) == 1) { return b; }
+        }
+        # a * 1 = a
+        if (tb == EXPR_CONST) {
+            if (_sym_is_one(expr_const_val(b)) == 1) { return a; }
+        }
+        # const * const = const
+        if (ta == EXPR_CONST) {
+            if (tb == EXPR_CONST) {
+                return expr_const(f64_mul(expr_const_val(a), expr_const_val(b)));
+            }
+        }
+        return expr_mul(a, b);
+    }
+
+    # POW
+    if (t == EXPR_POW) {
+        var base = expr_simplify(expr_left(e));
+        var exp = expr_simplify(expr_right(e));
+        var tb = expr_tag(base);
+        var te = expr_tag(exp);
+        # x^0 = 1
+        if (te == EXPR_CONST) {
+            if (_sym_is_zero(expr_const_val(exp)) == 1) { return expr_const(F64_ONE); }
+        }
+        # x^1 = x
+        if (te == EXPR_CONST) {
+            if (_sym_is_one(expr_const_val(exp)) == 1) { return base; }
+        }
+        # const ^ const = const
+        if (tb == EXPR_CONST) {
+            if (te == EXPR_CONST) {
+                return expr_const(f64_pow(expr_const_val(base), expr_const_val(exp)));
+            }
+        }
+        return expr_pow(base, exp);
+    }
+
+    # NEG
+    if (t == EXPR_NEG) {
+        var a = expr_simplify(expr_child(e));
+        var ta = expr_tag(a);
+        # -0 = 0
+        if (ta == EXPR_CONST) {
+            if (_sym_is_zero(expr_const_val(a)) == 1) { return expr_const(0); }
+        }
+        # -c = const(-c)
+        if (ta == EXPR_CONST) {
+            return expr_const(f64_neg(expr_const_val(a)));
+        }
+        # --x = x
+        if (ta == EXPR_NEG) {
+            return expr_simplify(expr_child(a));
+        }
+        return expr_neg(a);
+    }
+
+    # SIN
+    if (t == EXPR_SIN) {
+        return expr_sin(expr_simplify(expr_child(e)));
+    }
+
+    # COS
+    if (t == EXPR_COS) {
+        return expr_cos(expr_simplify(expr_child(e)));
+    }
+
+    # EXP — fold exp(const)
+    if (t == EXPR_EXP) {
+        var a = expr_simplify(expr_child(e));
+        if (expr_tag(a) == EXPR_CONST) {
+            return expr_const(f64_exp(expr_const_val(a)));
+        }
+        return expr_exp(a);
+    }
+
+    # LN — fold ln(const)
+    if (t == EXPR_LN) {
+        var a = expr_simplify(expr_child(e));
+        if (expr_tag(a) == EXPR_CONST) {
+            return expr_const(f64_ln(expr_const_val(a)));
+        }
+        return expr_ln(a);
+    }
+
+    return e;
+}
+
+# ================================================================
+# To string
+# ================================================================
+
+# Convert an expression tree to a human-readable Str.
+# Returns a Str (fat pointer).
+fn expr_to_str(e) {
+    var t = expr_tag(e);
+
+    if (t == EXPR_CONST) {
+        var val = expr_const_val(e);
+        # Check if it is an integer value
+        var floored = f64_floor(val);
+        var diff = f64_abs(f64_sub(val, floored));
+        if (f64_lt(diff, _SYM_EPS) == 1) {
+            # Render as integer
+            var ival = f64_to(val);
+            return str_from_int(ival);
+        }
+        # Render as float with up to 6 decimal places
+        var buf[32];
+        var len = fmt_float_buf(val, &buf, 6);
+        return str_from_buf(&buf, len);
+    }
+
+    if (t == EXPR_VAR) {
+        return expr_var_name(e);
+    }
+
+    if (t == EXPR_ADD) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "(");
+        str_builder_add(sb, expr_to_str(expr_left(e)));
+        str_builder_add_cstr(sb, " + ");
+        str_builder_add(sb, expr_to_str(expr_right(e)));
+        str_builder_add_cstr(sb, ")");
+        return str_builder_build(sb);
+    }
+
+    if (t == EXPR_MUL) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "(");
+        str_builder_add(sb, expr_to_str(expr_left(e)));
+        str_builder_add_cstr(sb, " * ");
+        str_builder_add(sb, expr_to_str(expr_right(e)));
+        str_builder_add_cstr(sb, ")");
+        return str_builder_build(sb);
+    }
+
+    if (t == EXPR_POW) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "(");
+        str_builder_add(sb, expr_to_str(expr_left(e)));
+        str_builder_add_cstr(sb, "^");
+        str_builder_add(sb, expr_to_str(expr_right(e)));
+        str_builder_add_cstr(sb, ")");
+        return str_builder_build(sb);
+    }
+
+    if (t == EXPR_NEG) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "-");
+        str_builder_add(sb, expr_to_str(expr_child(e)));
+        return str_builder_build(sb);
+    }
+
+    if (t == EXPR_SIN) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "sin(");
+        str_builder_add(sb, expr_to_str(expr_child(e)));
+        str_builder_add_cstr(sb, ")");
+        return str_builder_build(sb);
+    }
+
+    if (t == EXPR_COS) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "cos(");
+        str_builder_add(sb, expr_to_str(expr_child(e)));
+        str_builder_add_cstr(sb, ")");
+        return str_builder_build(sb);
+    }
+
+    if (t == EXPR_EXP) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "exp(");
+        str_builder_add(sb, expr_to_str(expr_child(e)));
+        str_builder_add_cstr(sb, ")");
+        return str_builder_build(sb);
+    }
+
+    if (t == EXPR_LN) {
+        var sb = str_builder_new();
+        str_builder_add_cstr(sb, "ln(");
+        str_builder_add(sb, expr_to_str(expr_child(e)));
+        str_builder_add_cstr(sb, ")");
+        return str_builder_build(sb);
+    }
+
+    return str_from("?");
+}

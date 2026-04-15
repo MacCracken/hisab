@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب — calculation, reckoning) — higher mathematics library for the AGNOS ecosystem.
-> Basic expression evaluation and unit conversion lives in [abaco](https://github.com/MacCracken/abaco).
+> Ported to Cyrius from Rust. Cyrius stdlib linalg.cyr (4.10.3) provides dense decompositions.
 
 ## Scope
 
@@ -14,109 +14,158 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 
 ## Consumers
 
-| Consumer | What it uses from hisab |
-|----------|----------------------|
-| **impetus** | Vectors, quaternions, transforms, spatial geometry, 3D GJK/EPA broadphase+narrowphase |
-| **kiran** | Projections, transforms, frustum culling, camera math, OBB/Capsule ray tests |
-| **joshua** | ODE solvers (RK4, DOPRI45), simulation math, deterministic replay |
-| **aethersafha** | Projection matrices, transform composition/interpolation for compositor |
-| **abaco** | Symbolic algebra (Expr), interval arithmetic for verified evaluation |
-| **svara** | Complex, FFT, easing functions (vocal synthesis) |
-| **prani** | Easing functions (creature vocal synthesis, via svara) |
-| **hisab-mimamsa** | Indexed tensors, Lie groups, differential geometry, complex LA, CGA (theoretical physics) |
-| **kana** | Indexed tensors, Lie groups, complex LA, spinors (quantum science) |
-
-## Versioning
-
-Post-1.0: standard semver.
+| Consumer | What it uses from hisab | Cyrius port status |
+|----------|----------------------|-------------------|
+| **impetus** | Vectors, transforms, GJK/EPA, PGS solver, inertia | Usable |
+| **kiran** | Projections, transforms, frustum, BVH, ray tests | Usable |
+| **joshua** | ODE (DOPRI45, BDF, symplectic), optimization | Usable |
+| **aethersafha** | Projections, transform interpolation, color | Usable |
+| **abaco** | Symbolic algebra, interval arithmetic | Partial (no LaTeX/patterns) |
+| **svara** | Complex, FFT, easing | Usable |
+| **hisab-mimamsa** | Tensors, Lie groups, diffgeo, complex LA, CGA | Usable |
+| **kana** | Tensors, Lie groups, complex LA, spinors | Usable |
 
 ---
 
-## Current — v1.4.0 (2026-03-30)
+## Current — Cyrius v1.4.0 (2026-04-15)
 
-- 1155 tests (1099 unit + 34 integration + 22 doc)
-- 15 modules, 13 feature flags
-- Zero clippy warnings, cargo audit clean, cargo deny clean
+- **23 lib files, 8,945 lines** (ported from 33,612 lines Rust)
+- **821 test assertions** across 4 test suites
+- **22 benchmarks**, 5 fuzz targets
+- **349KB static binary** (vs ~800KB Rust dynamic)
+- Toolchain: Cyrius 4.10.3, linalg.cyr Tier 1+2
+- P(-1) audit: 31 issues found, 15 critical/high fixed
 
 ---
 
-## Projected Work
+## Audit Fixes — In Progress
 
-### 1.5.0 — Numerical & tensor depth
+> From docs/audit/2026-04-15.md. Items checked off are fixed and tested.
 
-#### Numerical extensions (num)
-- [ ] Complex QR decomposition — completes complex LA alongside Hermitian eigen + SVD
-- [ ] Complex matrix inverse — needed by mimamsa for propagator calculations
-- [ ] Randomized SVD (Halko-Martinsson-Tropp) — large-scale low-rank approximation
-- [ ] Low-rank approximations (CUR, Nyström) — matrix compression
+### Fixed (this session)
+- [x] C1: Integer overflow guard in tensor_new
+- [x] C2: Integer overflow guard in cmat_new
+- [x] C4: Dim cap (16) in christoffel_symbols/riemann_tensor
+- [x] C5: Sieve limit cap (10M)
+- [x] H2: m4_determinant rewritten with correct s0-s5/c0-c5 formula
+- [x] H3: cx_div/cx_inv zero guards
+- [x] H5: world_to_screen w==0 guard
+- [x] H7: f64_fmod zero guard
+- [x] H10: ivl_sin fixed (no longer always [-1,1])
+- [x] External: Bisection midpoint overflow fix
+- [x] External: CG upgraded from Fletcher-Reeves to Polak-Ribiere+
 
-#### Tensor algebra depth (tensor)
-- [ ] Einsum string notation parser — `"ij,jk->ik"` style contraction specification
-- [ ] Tensor trace (contract all paired indices)
-- [ ] Symmetric/antisymmetric decomposition of arbitrary tensors
-- [ ] Strided views — zero-copy slicing and transposition
+### Remaining audit items
+- [ ] H1: tensor_contract — implement proper multi-index contraction (stub)
+- [ ] H4: dual_div/dual_sqrt/dual_ln zero guards
+- [ ] H6: linearize_depth_reverse_z zero guard
+- [ ] H8: m4_get/m4_set bounds documentation
+- [ ] H9: BDF-5 coefficient verification
+- [ ] M1: num_modpow overflow for moduli > 2^31
+- [ ] M2: PCG32 signed shift verification
+- [ ] M3: geo_ray_plane ambiguous 0 return
+- [ ] M7: expr_eval return error instead of abort
+- [ ] M8: SVD via Golub-Kahan (future — replaces A^T*A approach)
+- [ ] L1-L7: Low-priority quality items
 
-### 1.6.0 — Geometry & group extensions
+---
 
-#### Lie group extensions (transforms)
-- [ ] SE(3) — rigid body motions (rotation + translation as single group)
-- [ ] SO(3) explicit — rotation group without SU(2) double cover overhead
-- [ ] Adjoint representation for all implemented groups
-- [ ] Baker-Campbell-Hausdorff formula for Lie algebra composition
+## 1.5.0 — Numerical depth + remaining audit
 
-#### Conformal geometric algebra extensions (geo)
+### Audit completion
+- [ ] All remaining H/M items from 2026-04-15 audit
+- [ ] tensor_contract full implementation
+- [ ] modpow mul-mod for large moduli
+
+### Numerical extensions
+- [ ] Mat3 type (3x3 matrix — needed for normals, inertia, 2D physics)
+- [ ] Tridiagonal solver (Thomas algorithm — O(n) for splines, implicit ODE)
+- [ ] Complex QR decomposition
+- [ ] Complex matrix inverse
+- [ ] Condition number estimation (||A|| * ||A^-1||)
+- [ ] QR iteration for large symmetric eigenproblems (n > 50)
+- [ ] Golub-Kahan SVD (replaces A^T*A for precision)
+
+### Calculus extensions
+- [ ] B-spline eval, NURBS eval
+- [ ] Hermite TCB, monotone cubic
+- [ ] Adaptive Simpson integration
+- [ ] Partial derivative, gradient, Jacobian, Hessian
+- [ ] 3D Perlin noise, Simplex noise
+
+### Symbolic extensions
+- [ ] Symbolic integration
+- [ ] LaTeX rendering
+- [ ] Pattern matching + rewrite rules
+
+### Tensor extensions
+- [ ] Einsum string notation
+- [ ] Full tensor_contract (multi-index expansion)
+
+---
+
+## 1.6.0 — Geometry & group extensions
+
+### Lie group extensions
+- [ ] SE(3) — rigid body motions
+- [ ] SO(3) explicit
+- [ ] Adjoint representation
+- [ ] Baker-Campbell-Hausdorff formula
+
+### Geometry extensions
+- [ ] k-d tree, quadtree, octree, spatial hash
+- [ ] Delaunay/Voronoi triangulation
+- [ ] Half-edge mesh
+- [ ] Convex hull 2D, polygon triangulation
+- [ ] MPR/XenoCollide
+- [ ] Sequential impulse solver with friction
+- [ ] Island detection
+
+### CGA extensions
 - [ ] Left/right contraction operators
-- [ ] Dual operation (pseudoscalar complement)
-- [ ] Blade projection and rejection
-- [ ] Circle and line pair representations
-- [ ] Conformal point pair and flat point extraction
-- [ ] Intersection of geometric objects via outer product null space
+- [ ] Dual operation, blade projection/rejection
 
-### 1.7.0 — Differential geometry & curvature
+---
 
-#### Differential geometry extensions (calc)
-- [ ] Parallel transport of vector fields along curves
-- [ ] Sectional curvature computation
+## 1.7.0 — Differential geometry & curvature
+
+- [ ] Parallel transport
+- [ ] Sectional curvature
 - [ ] Geodesic deviation equation
-- [ ] Weyl tensor (conformal curvature)
-- [ ] Higher-order differential forms (3-forms, 4-forms, general p-form wedge)
+- [ ] Weyl tensor
+- [ ] Higher-order differential forms
 
-### 1.8.0 — Rendering & GPU
+---
 
-#### Rendering & graphics (geo/autodiff)
-- [ ] Differentiable rendering math — autodiff through ray-surface intersections
-- [ ] Neural implicit representation primitives — SDF network evaluation helpers
+## 1.8.0 — Rendering & GPU
 
-#### GPU compute
-- [ ] GPU compute kernels via soorat (feature-gated compute pipeline)
-
-### Ongoing — quality & consumer-driven
-
-- [ ] Complete doctests on all public functions
-- Items added here when consumers (mimamsa, kana, impetus, kiran, etc.) request them
+- [ ] Differentiable rendering math
+- [ ] GPU compute via soorat (feature-gated)
+- [ ] Reverse-mode autodiff (Tape)
 
 ---
 
 ## Release History
 
-### 1.4.0 (2026-03-30) — Theoretical physics foundation
-- Complex linear algebra: ComplexMatrix, Hermitian eigen, complex SVD, Pauli/Dirac matrices, spinor transforms, matrix exponential
-- Indexed tensor algebra: covariant/contravariant indices, Einstein summation, contraction, outer product, raising/lowering, Minkowski metric, Levi-Civita symbol
-- Symmetric & antisymmetric tensor storage, sparse tensors (COO format)
-- Lie groups: U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz, exponential maps, Casimir operators
-- Differential geometry: Christoffel symbols, Riemann/Ricci/Einstein tensors, geodesic RK4, Killing vectors, exterior algebra
-- Conformal geometric algebra: 5D multivectors, geometric/outer/inner products, versors (translator, rotor, dilator)
+### Cyrius 1.4.0 (2026-04-15) — Port from Rust
 
-### 1.3.0 (2026-03-27) — Number theory + abaco integration
-- Prime sieves, primality tests, factorization, modular arithmetic, number-theoretic functions
-- Symbolic integration, LaTeX rendering, pattern matching engine, abaco bridge
+**Ported from 33,612 lines of Rust to 8,945 lines of Cyrius.**
 
-### 1.1.0 (2026-03-25) — Feature completion
-- Symplectic integrators, SDFs+CSG, DualQuat, color spaces, spherical harmonics
-- Stiff ODE (BDF), SDE solvers, eigendecomposition, convex decomposition, reverse-mode AD
+Modules ported (23 lib files):
+- Foundation: error, f64_util, vec2, vec3, vec4, quat, mat4
+- Transforms: transforms, color (sRGB, Porter-Duff, tone mapping, SH, EV)
+- Geometry: geo (9 primitives, 6 ray tests), geo_advanced (GJK/EPA, BVH, SDF, CGA)
+- Calculus: calc (integration, Bezier, easing, Perlin)
+- Numerical: num (roots, FFT, RK4, PCG32, primes), ode (DOPRI45, BDF, symplectic), optimize (GD, CG, BFGS, L-BFGS, LM), linalg_ext (CSR, GMRES, BiCGSTAB, PGS, SVD, eigen)
+- Physics: complex (numbers + matrices, Pauli, Dirac), lie (U(1), SU(2), SU(3), SO(3,1)), diffgeo (Christoffel→Einstein, geodesics, exterior algebra)
+- Symbolic: symbolic (expr tree, eval, diff, simplify)
+- Other: autodiff (dual numbers), interval (arithmetic), tensor (N-D dense, physics tensors)
 
-### 1.0.0 — Stable release
-- Core modules: transforms, geo, calc, num, autodiff, interval, symbolic, tensor, parallel, ai, logging
+Testing: 821 assertions, 22 benchmarks, 5 fuzz targets.
+Security: P(-1) audit completed, 15 critical/high fixes applied.
+
+### Rust 1.4.0 (2026-03-30) — Theoretical physics foundation
+(See CHANGELOG.md for full Rust history)
 
 ---
 

@@ -1,13 +1,453 @@
-# hisab fuzz harness
+# hisab fuzz harness — exercises core math operations with arbitrary inputs
+# Verifies no crash on arbitrary data and checks key invariants.
 
-fn fuzz_main(data, len) {
-    if (len == 0) { return 0; }
+include "lib/f64_util.cyr"
+include "lib/error.cyr"
+include "lib/vec2.cyr"
+include "lib/vec3.cyr"
+include "lib/vec4.cyr"
+include "lib/quat.cyr"
+include "lib/mat4.cyr"
+include "lib/geo.cyr"
+include "lib/num.cyr"
+
+# ================================================================
+# Helpers
+# ================================================================
+
+# Read an f64 from data at byte offset
+fn fuzz_read_f64(data, offset) {
+    return load64(data + offset);
+}
+
+# Read a positive integer from data (absolute value, clamped to avoid extremes)
+fn fuzz_read_int(data, offset) {
+    var v = load64(data + offset);
+    if (v < 0) { v = 0 - v; }
+    if (v == 0) { v = 1; }
+    return v;
+}
+
+# Check if f64 is NaN: a != a in IEEE 754
+fn fuzz_is_nan(x) {
+    # NaN: exponent all 1s, mantissa nonzero
+    var bits = x;
+    var exp = (bits >> 52) & 0x7FF;
+    var mant = bits & 0x000FFFFFFFFFFFFF;
+    if (exp == 0x7FF) {
+        if (mant != 0) { return 1; }
+    }
     return 0;
 }
 
+# Check if f64 is finite (not NaN, not Inf)
+fn fuzz_is_finite(x) {
+    var exp = (x >> 52) & 0x7FF;
+    if (exp == 0x7FF) { return 0; }
+    return 1;
+}
+
+# Approximate f64 equality within tolerance
+fn fuzz_approx_eq(a, b, tol) {
+    var diff = f64_sub(a, b);
+    var adiff = f64_abs(diff);
+    if (f64_lt(adiff, tol) == 1) { return 1; }
+    return 0;
+}
+
+# ================================================================
+# Fuzz target 1: vec3 operations (needs 48 bytes = 6 f64s)
+# ================================================================
+
+fn fuzz_vec3_ops(data) {
+    var ax = fuzz_read_f64(data, 0);
+    var ay = fuzz_read_f64(data, 8);
+    var az = fuzz_read_f64(data, 16);
+    var bx = fuzz_read_f64(data, 24);
+    var by = fuzz_read_f64(data, 32);
+    var bz = fuzz_read_f64(data, 40);
+
+    var a = hvec3_new(ax, ay, az);
+    var b = hvec3_new(bx, by, bz);
+
+    # add — should not crash
+    var sum = hvec3_add(a, b);
+
+    # cross — should not crash
+    var cross = hvec3_cross(a, b);
+
+    # normalize — should not crash (handles zero-length)
+    var n = hvec3_normalize(a);
+
+    # NaN propagation: if input has NaN, output may have NaN (acceptable)
+    # If input is finite, length of normalized vector should be ~1 or 0
+    if (fuzz_is_finite(ax) == 1) {
+        if (fuzz_is_finite(ay) == 1) {
+            if (fuzz_is_finite(az) == 1) {
+                var nlen = hvec3_length(n);
+                # Should be ~1.0 or 0.0 (for zero vector)
+                if (fuzz_is_finite(nlen) == 0) {
+                    println("fuzz: FAIL vec3_normalize produced non-finite length");
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ================================================================
+# Fuzz target 2: quat_normalize + quat_rotate_vec3 invariant
+# (needs 56 bytes = 7 f64s: 4 for quat, 3 for vec)
+# ================================================================
+
+fn fuzz_quat_rotate(data) {
+    var qx = fuzz_read_f64(data, 0);
+    var qy = fuzz_read_f64(data, 8);
+    var qz = fuzz_read_f64(data, 16);
+    var qw = fuzz_read_f64(data, 24);
+    var vx = fuzz_read_f64(data, 32);
+    var vy = fuzz_read_f64(data, 40);
+    var vz = fuzz_read_f64(data, 48);
+
+    var q = hquat_new(qx, qy, qz, qw);
+    var v = hvec3_new(vx, vy, vz);
+
+    # Normalize quaternion — should not crash
+    var qn = hquat_normalize(q);
+
+    # Rotate vector — should not crash
+    var rotated = hquat_rotate_vec3(qn, v);
+
+    # Invariant: rotation by unit quaternion preserves vector length
+    # Only check when all inputs are finite
+    if (fuzz_is_finite(qx) == 1) {
+        if (fuzz_is_finite(qy) == 1) {
+            if (fuzz_is_finite(qz) == 1) {
+                if (fuzz_is_finite(qw) == 1) {
+                    if (fuzz_is_finite(vx) == 1) {
+                        if (fuzz_is_finite(vy) == 1) {
+                            if (fuzz_is_finite(vz) == 1) {
+                                var input_len = hvec3_length(v);
+                                var output_len = hvec3_length(rotated);
+                                if (fuzz_is_finite(input_len) == 1) {
+                                    if (fuzz_is_finite(output_len) == 1) {
+                                        # Tolerance: 1e-6 = 0x3EB0C6F7A0B5ED8D
+                                        var tol = 0x3EB0C6F7A0B5ED8D;
+                                        # Relative check: |output - input| / max(input, 1) < tol
+                                        var diff = f64_abs(f64_sub(output_len, input_len));
+                                        var denom = f64_max(input_len, F64_ONE);
+                                        var rel = f64_div(diff, denom);
+                                        if (f64_gt(rel, tol) == 1) {
+                                            println("fuzz: FAIL quat rotation changed vector length");
+                                            return 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ================================================================
+# Fuzz target 3: ray_sphere / ray_aabb with arbitrary inputs
+# (needs 72 bytes = 9 f64s: 3 origin, 3 dir, 3 for sphere center/radius/aabb)
+# ================================================================
+
+fn fuzz_ray_intersections(data) {
+    var ox = fuzz_read_f64(data, 0);
+    var oy = fuzz_read_f64(data, 8);
+    var oz = fuzz_read_f64(data, 16);
+    var dx = fuzz_read_f64(data, 24);
+    var dy = fuzz_read_f64(data, 32);
+    var dz = fuzz_read_f64(data, 40);
+    var sx = fuzz_read_f64(data, 48);
+    var sy = fuzz_read_f64(data, 56);
+    var sz = fuzz_read_f64(data, 64);
+
+    var origin = hvec3_new(ox, oy, oz);
+    var dir = hvec3_new(dx, dy, dz);
+
+    # geo_ray_new normalizes direction — should handle zero vectors gracefully
+    var ray = geo_ray_new(origin, dir);
+
+    # Sphere intersection — should not crash
+    var sphere_center = hvec3_new(sx, sy, sz);
+    var sphere = geo_sphere_new(sphere_center, F64_ONE);
+    var t1 = geo_ray_sphere(ray, sphere);
+
+    # AABB intersection — should not crash
+    var aabb_min = hvec3_new(f64_neg(F64_ONE), f64_neg(F64_ONE), f64_neg(F64_ONE));
+    var aabb_max = hvec3_new(F64_ONE, F64_ONE, F64_ONE);
+    var aabb = geo_aabb_new(aabb_min, aabb_max);
+    var t2 = geo_ray_aabb(ray, aabb);
+
+    return 0;
+}
+
+# ================================================================
+# Fuzz target 4: num_gcd with arbitrary integers
+# (needs 16 bytes = 2 i64s)
+# ================================================================
+
+fn fuzz_num_gcd(data) {
+    var a = load64(data);
+    var b = load64(data + 8);
+
+    # Clamp to reasonable range to avoid extremely long GCD on huge numbers
+    if (a < 0) { a = 0 - a; }
+    if (b < 0) { b = 0 - b; }
+    # Mask to 32-bit range for performance
+    a = a & 0x7FFFFFFF;
+    b = b & 0x7FFFFFFF;
+
+    var g = num_gcd(a, b);
+
+    # Invariant: gcd divides both inputs (when both > 0 and gcd > 0)
+    if (a > 0) {
+        if (b > 0) {
+            if (g > 0) {
+                var rem_a = a % g;
+                var rem_b = b % g;
+                if (rem_a != 0) {
+                    println("fuzz: FAIL gcd does not divide a");
+                    return 1;
+                }
+                if (rem_b != 0) {
+                    println("fuzz: FAIL gcd does not divide b");
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ================================================================
+# Fuzz target 5: m4_inverse — check M * M^-1 ~ I when det != 0
+# (needs 128 bytes = 16 f64s for a full 4x4 matrix)
+# ================================================================
+
+fn fuzz_m4_inverse(data) {
+    # Build matrix from raw bytes
+    var m = alloc(128);
+    var i = 0;
+    while (i < 128) {
+        store64(m + i, load64(data + i));
+        i = i + 8;
+    }
+
+    # Compute inverse — should not crash
+    var inv = m4_inverse(m);
+
+    # Check M * M^-1 ~ I only if all elements are finite
+    var all_finite = 1;
+    i = 0;
+    while (i < 16) {
+        if (fuzz_is_finite(load64(m + i * 8)) == 0) { all_finite = 0; }
+        i = i + 1;
+    }
+
+    if (all_finite == 1) {
+        # Check determinant is not too small
+        var det = m4_determinant(m);
+        if (fuzz_is_finite(det) == 1) {
+            # 1e-8 = 0x3E7AD7F29ABCAF48
+            var det_tol = 0x3E7AD7F29ABCAF48;
+            if (f64_gt(f64_abs(det), det_tol) == 1) {
+                var product = m4_mul(m, inv);
+                # Check diagonal elements ~ 1.0, off-diagonal ~ 0.0
+                # Use tolerance 1e-3 = 0x3F50624DD2F1A9FC
+                var tol = 0x3F50624DD2F1A9FC;
+                var col = 0;
+                while (col < 4) {
+                    var row = 0;
+                    while (row < 4) {
+                        var expected = 0;
+                        if (col == row) { expected = F64_ONE; }
+                        var actual = m4_get(product, col, row);
+                        if (fuzz_is_finite(actual) == 1) {
+                            var diff = f64_abs(f64_sub(actual, expected));
+                            if (f64_gt(diff, tol) == 1) {
+                                println("fuzz: FAIL m4_inverse M*M^-1 != I");
+                                return 1;
+                            }
+                        }
+                        row = row + 1;
+                    }
+                    col = col + 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# ================================================================
+# Main fuzz entry point
+# ================================================================
+
+fn fuzz_main(data, len) {
+    # Target 1: vec3 ops (48 bytes)
+    if (len >= 48) {
+        var rc = fuzz_vec3_ops(data);
+        if (rc != 0) { return rc; }
+    }
+
+    # Target 2: quat rotate (56 bytes)
+    if (len >= 56) {
+        var rc = fuzz_quat_rotate(data);
+        if (rc != 0) { return rc; }
+    }
+
+    # Target 3: ray intersections (72 bytes)
+    if (len >= 72) {
+        var rc = fuzz_ray_intersections(data);
+        if (rc != 0) { return rc; }
+    }
+
+    # Target 4: num_gcd (16 bytes)
+    if (len >= 16) {
+        var rc = fuzz_num_gcd(data);
+        if (rc != 0) { return rc; }
+    }
+
+    # Target 5: m4_inverse (128 bytes)
+    if (len >= 128) {
+        var rc = fuzz_m4_inverse(data);
+        if (rc != 0) { return rc; }
+    }
+
+    return 0;
+}
+
+# ================================================================
+# Self-test with known inputs
+# ================================================================
+
 fn main() {
     alloc_init();
-    fuzz_main("test", 4);
+
+    # Allocate 128 bytes for test data (enough for all targets)
+    var test_data = alloc(128);
+
+    # Fill with known good f64 values
+    # v3a = (1.0, 2.0, 3.0), v3b = (4.0, 5.0, 6.0) -> 48 bytes for vec3 ops
+    store64(test_data,      F64_ONE);
+    store64(test_data + 8,  F64_TWO);
+    store64(test_data + 16, 0x4008000000000000);   # 3.0
+    store64(test_data + 24, 0x4010000000000000);   # 4.0
+    store64(test_data + 32, 0x4014000000000000);   # 5.0
+    store64(test_data + 40, 0x4018000000000000);   # 6.0
+
+    # quat (0, 0, sin(0.25), cos(0.25)) + vec (1, 0, 0) for quat target
+    store64(test_data,      0);                     # qx
+    store64(test_data + 8,  0);                     # qy
+    store64(test_data + 16, 0x3FD0000000000000);   # qz ~ 0.25 (sin)
+    store64(test_data + 24, F64_ONE);               # qw ~ 1.0 (approx)
+    store64(test_data + 32, F64_ONE);               # vx
+    store64(test_data + 40, 0);                     # vy
+    store64(test_data + 48, 0);                     # vz
+
+    var rc = fuzz_main(test_data, 56);
+    if (rc != 0) {
+        println("fuzz: FAIL on quat test");
+        return 1;
+    }
+
+    # Test vec3 ops with simple values
+    store64(test_data,      F64_ONE);
+    store64(test_data + 8,  F64_TWO);
+    store64(test_data + 16, 0x4008000000000000);   # 3.0
+    store64(test_data + 24, 0x4010000000000000);   # 4.0
+    store64(test_data + 32, 0x4014000000000000);   # 5.0
+    store64(test_data + 40, 0x4018000000000000);   # 6.0
+
+    rc = fuzz_main(test_data, 48);
+    if (rc != 0) {
+        println("fuzz: FAIL on vec3 test");
+        return 1;
+    }
+
+    # Test ray intersections: ray at (0,0,-10) dir (0,0,1), sphere center (0,0,0)
+    store64(test_data,      0);                     # ox
+    store64(test_data + 8,  0);                     # oy
+    store64(test_data + 16, 0xC024000000000000);   # oz = -10.0
+    store64(test_data + 24, 0);                     # dx
+    store64(test_data + 32, 0);                     # dy
+    store64(test_data + 40, F64_ONE);               # dz = 1.0
+    store64(test_data + 48, 0);                     # sx
+    store64(test_data + 56, 0);                     # sy
+    store64(test_data + 64, 0);                     # sz
+
+    rc = fuzz_main(test_data, 72);
+    if (rc != 0) {
+        println("fuzz: FAIL on ray test");
+        return 1;
+    }
+
+    # Test gcd: gcd(12, 8) = 4
+    store64(test_data,     12);
+    store64(test_data + 8, 8);
+
+    rc = fuzz_main(test_data, 16);
+    if (rc != 0) {
+        println("fuzz: FAIL on gcd test");
+        return 1;
+    }
+
+    # Test m4_inverse with identity matrix (128 bytes)
+    var i = 0;
+    while (i < 128) {
+        store64(test_data + i, 0);
+        i = i + 8;
+    }
+    # Set diagonal to 1.0 (col-major: [0][0]=0, [1][1]=40, [2][2]=80, [3][3]=120)
+    store64(test_data,       F64_ONE);
+    store64(test_data + 40,  F64_ONE);
+    store64(test_data + 80,  F64_ONE);
+    store64(test_data + 120, F64_ONE);
+
+    rc = fuzz_main(test_data, 128);
+    if (rc != 0) {
+        println("fuzz: FAIL on m4_inverse test");
+        return 1;
+    }
+
+    # Test with a non-trivial invertible matrix (rotation around Y by 0.5 + translation)
+    var q = hquat_from_rotation_y(F64_HALF);
+    var m = m4_from_srt(hvec3_one(), q, hvec3_new(F64_ONE, F64_TWO, 0x4008000000000000));
+    i = 0;
+    while (i < 128) {
+        store64(test_data + i, load64(m + i));
+        i = i + 8;
+    }
+
+    rc = fuzz_main(test_data, 128);
+    if (rc != 0) {
+        println("fuzz: FAIL on m4_inverse non-trivial test");
+        return 1;
+    }
+
+    # Test with zero vector (edge case for normalize)
+    store64(test_data,      0);
+    store64(test_data + 8,  0);
+    store64(test_data + 16, 0);
+    store64(test_data + 24, 0);
+    store64(test_data + 32, 0);
+    store64(test_data + 40, 0);
+
+    rc = fuzz_main(test_data, 48);
+    if (rc != 0) {
+        println("fuzz: FAIL on zero vector test");
+        return 1;
+    }
+
     println("fuzz: ok");
     return 0;
 }

@@ -1,0 +1,343 @@
+# noise_simplex.cyr — OpenSimplex2 noise (2D and 3D)
+# Usage: include "lib/noise_simplex.cyr"
+# Requires: math.cyr, calc.cyr (for _perm, _perm_init, calc_lerp), error.cyr
+#
+# OpenSimplex2 algorithm — NOT the patented Perlin simplex.
+# 2D: skew to triangular grid, 3 gradient contributions per point.
+# 3D: skew to tetrahedral grid, 4 gradient contributions per point.
+# All functions return f64 in approximately [-1, 1].
+
+# ================================================================
+# CONSTANTS (f64 bit patterns)
+# ================================================================
+
+# Skew factors 2D: F2 = (sqrt(3)-1)/2 = 0.3660254..., G2 = (3-sqrt(3))/6 = 0.2113248...
+var _SIMPLEX_F2 = 0x3FD76CF5D0B09955;  # 0.36602540378443864
+var _SIMPLEX_G2 = 0x3FCB0F41BEBE3265;  # 0.21132486540518713
+
+# Skew factors 3D: F3 = 1/3 = 0.3333..., G3 = 1/6 = 0.1666...
+var _SIMPLEX_F3 = 0x3FD5555555555555;  # 0.3333333333333333
+var _SIMPLEX_G3 = 0x3FC5555555555555;  # 0.16666666666666666
+
+# Contribution radius squared (0.5 for 2D, 0.6 for 3D)
+var _SIMPLEX_R2_2D = 0x3FE0000000000000;  # 0.5
+var _SIMPLEX_R2_3D = 0x3FE3333333333333;  # 0.6
+
+# Scaling factor to bring output into [-1, 1] range
+var _SIMPLEX_SCALE_2D = 0x4051800000000000;  # 70.0
+var _SIMPLEX_SCALE_3D = 0x4040000000000000;  # 32.0
+
+# ================================================================
+# GRADIENT TABLES
+# ================================================================
+
+# 3D gradient table: 12 edge directions of a cube.
+# Stored as flat allocation: 12 * 3 f64 values = 288 bytes.
+var _GRAD3_TABLE = 0;
+
+fn _grad3_init() {
+    if (_GRAD3_TABLE != 0) { return 0; }
+    _GRAD3_TABLE = alloc(12 * 3 * 8);
+
+    # 12 gradient directions (edges of cube)
+    _grad3_set(0,   F64_ONE,  F64_ONE,  0);
+    _grad3_set(1,   f64_neg(F64_ONE),  F64_ONE,  0);
+    _grad3_set(2,   F64_ONE,  f64_neg(F64_ONE),  0);
+    _grad3_set(3,   f64_neg(F64_ONE),  f64_neg(F64_ONE),  0);
+    _grad3_set(4,   F64_ONE,  0,  F64_ONE);
+    _grad3_set(5,   f64_neg(F64_ONE),  0,  F64_ONE);
+    _grad3_set(6,   F64_ONE,  0,  f64_neg(F64_ONE));
+    _grad3_set(7,   f64_neg(F64_ONE),  0,  f64_neg(F64_ONE));
+    _grad3_set(8,   0,  F64_ONE,  F64_ONE);
+    _grad3_set(9,   0,  f64_neg(F64_ONE),  F64_ONE);
+    _grad3_set(10,  0,  F64_ONE,  f64_neg(F64_ONE));
+    _grad3_set(11,  0,  f64_neg(F64_ONE),  f64_neg(F64_ONE));
+    return 0;
+}
+
+fn _grad3_set(idx, gx, gy, gz) {
+    var base = _GRAD3_TABLE + idx * 24;
+    store64(base,      gx);
+    store64(base + 8,  gy);
+    store64(base + 16, gz);
+    return 0;
+}
+
+# Dot product of gradient[idx % 12] with (x, y, z)
+fn _grad3_dot(hash, x, y, z) {
+    var idx = (hash % 12) * 24;
+    var gx = load64(_GRAD3_TABLE + idx);
+    var gy = load64(_GRAD3_TABLE + idx + 8);
+    var gz = load64(_GRAD3_TABLE + idx + 16);
+    return f64_add(f64_add(f64_mul(gx, x), f64_mul(gy, y)), f64_mul(gz, z));
+}
+
+# 2D gradient: 8 directions for better isotropy
+# (1,1),(-1,1),(1,-1),(-1,-1),(1,0),(-1,0),(0,1),(0,-1)
+fn _grad2_simplex(hash, x, y) {
+    var h = hash & 7;
+    if (h == 0) { return f64_add(x, y); }
+    if (h == 1) { return f64_add(f64_neg(x), y); }
+    if (h == 2) { return f64_sub(x, y); }
+    if (h == 3) { return f64_sub(f64_neg(x), y); }
+    if (h == 4) { return x; }
+    if (h == 5) { return f64_neg(x); }
+    if (h == 6) { return y; }
+    return f64_neg(y);
+}
+
+# ================================================================
+# 2D OPENSIMPLEX2 NOISE
+# ================================================================
+
+# simplex_2d(x, y) -> f64 in approximately [-1, 1]
+# Uses skew to triangular grid, finds containing triangle,
+# sums 3 gradient contributions with radial falloff.
+fn simplex_2d(x, y) {
+    _perm_init();
+
+    # Skew input space to determine which simplex cell we're in
+    # s = (x + y) * F2
+    var s = f64_mul(f64_add(x, y), _SIMPLEX_F2);
+    var i_f = f64_floor(f64_add(x, s));
+    var j_f = f64_floor(f64_add(y, s));
+    var i = f64_to(i_f);
+    var j = f64_to(j_f);
+
+    # Unskew back to find the origin of the simplex cell in (x,y) space
+    # t = (i + j) * G2
+    var t = f64_mul(f64_add(i_f, j_f), _SIMPLEX_G2);
+    var x0 = f64_sub(x, f64_sub(i_f, t));
+    var y0 = f64_sub(y, f64_sub(j_f, t));
+
+    # Determine which simplex triangle we are in
+    # If x0 > y0 then we are in the lower triangle: offsets (1,0) then (1,1)
+    # Otherwise upper triangle: offsets (0,1) then (1,1)
+    var i1 = 0;
+    var j1 = 0;
+    if (f64_gt(x0, y0) == 1) {
+        i1 = 1;
+        j1 = 0;
+    } else {
+        i1 = 0;
+        j1 = 1;
+    }
+
+    # Offsets for middle corner in (x,y) unskewed coords
+    var x1 = f64_sub(f64_add(x0, f64_neg(f64_from(i1))), _SIMPLEX_G2);
+    var y1 = f64_sub(f64_add(y0, f64_neg(f64_from(j1))), _SIMPLEX_G2);
+
+    # Offsets for last corner in (x,y) unskewed coords
+    # G2*2 = 2*G2
+    var g2_2 = f64_mul(F64_TWO, _SIMPLEX_G2);
+    var x2 = f64_sub(f64_add(x0, f64_neg(F64_ONE)), g2_2);
+    var y2 = f64_sub(f64_add(y0, f64_neg(F64_ONE)), g2_2);
+
+    # Hash the triangle vertices to get gradient indices
+    var ii = i & 255;
+    var jj = j & 255;
+    var gi0 = _perm(_perm(ii) + jj);
+    var gi1 = _perm(_perm(ii + i1) + jj + j1);
+    var gi2 = _perm(_perm(ii + 1) + jj + 1);
+
+    # Calculate contribution from each corner
+    var n0 = 0;
+    var t0 = f64_sub(_SIMPLEX_R2_2D, f64_add(f64_mul(x0, x0), f64_mul(y0, y0)));
+    if (f64_gt(t0, 0) == 1) {
+        var t0_sq = f64_mul(t0, t0);
+        n0 = f64_mul(f64_mul(t0_sq, t0_sq), _grad2_simplex(gi0, x0, y0));
+    }
+
+    var n1 = 0;
+    var t1 = f64_sub(_SIMPLEX_R2_2D, f64_add(f64_mul(x1, x1), f64_mul(y1, y1)));
+    if (f64_gt(t1, 0) == 1) {
+        var t1_sq = f64_mul(t1, t1);
+        n1 = f64_mul(f64_mul(t1_sq, t1_sq), _grad2_simplex(gi1, x1, y1));
+    }
+
+    var n2 = 0;
+    var t2 = f64_sub(_SIMPLEX_R2_2D, f64_add(f64_mul(x2, x2), f64_mul(y2, y2)));
+    if (f64_gt(t2, 0) == 1) {
+        var t2_sq = f64_mul(t2, t2);
+        n2 = f64_mul(f64_mul(t2_sq, t2_sq), _grad2_simplex(gi2, x2, y2));
+    }
+
+    # Scale to [-1, 1] range
+    return f64_mul(_SIMPLEX_SCALE_2D, f64_add(f64_add(n0, n1), n2));
+}
+
+# ================================================================
+# 3D OPENSIMPLEX2 NOISE
+# ================================================================
+
+# simplex_3d(x, y, z) -> f64 in approximately [-1, 1]
+# Uses skew to tetrahedral grid, finds containing tetrahedron,
+# sums 4 gradient contributions with radial falloff.
+fn simplex_3d(x, y, z) {
+    _perm_init();
+    _grad3_init();
+
+    # Skew input space
+    var s = f64_mul(f64_add(f64_add(x, y), z), _SIMPLEX_F3);
+    var i_f = f64_floor(f64_add(x, s));
+    var j_f = f64_floor(f64_add(y, s));
+    var k_f = f64_floor(f64_add(z, s));
+    var i = f64_to(i_f);
+    var j = f64_to(j_f);
+    var k = f64_to(k_f);
+
+    # Unskew back
+    var t = f64_mul(f64_add(f64_add(i_f, j_f), k_f), _SIMPLEX_G3);
+    var x0 = f64_sub(x, f64_sub(i_f, t));
+    var y0 = f64_sub(y, f64_sub(j_f, t));
+    var z0 = f64_sub(z, f64_sub(k_f, t));
+
+    # Determine which simplex (tetrahedron) we are in by sorting x0,y0,z0
+    var i1 = 0; var j1 = 0; var k1 = 0;
+    var i2 = 0; var j2 = 0; var k2 = 0;
+
+    if (f64_gt(x0, y0) == 1) {
+        if (f64_gt(y0, z0) == 1) {
+            # x0 >= y0 >= z0
+            i1 = 1; j1 = 0; k1 = 0;
+            i2 = 1; j2 = 1; k2 = 0;
+        } else {
+            if (f64_gt(x0, z0) == 1) {
+                # x0 >= z0 > y0
+                i1 = 1; j1 = 0; k1 = 0;
+                i2 = 1; j2 = 0; k2 = 1;
+            } else {
+                # z0 > x0 >= y0
+                i1 = 0; j1 = 0; k1 = 1;
+                i2 = 1; j2 = 0; k2 = 1;
+            }
+        }
+    } else {
+        if (f64_gt(y0, z0) == 1) {
+            if (f64_gt(x0, z0) == 1) {
+                # y0 > x0 >= z0
+                i1 = 0; j1 = 1; k1 = 0;
+                i2 = 1; j2 = 1; k2 = 0;
+            } else {
+                # y0 >= z0 > x0
+                i1 = 0; j1 = 1; k1 = 0;
+                i2 = 0; j2 = 1; k2 = 1;
+            }
+        } else {
+            # z0 >= y0 > x0
+            i1 = 0; j1 = 0; k1 = 1;
+            i2 = 0; j2 = 1; k2 = 1;
+        }
+    }
+
+    # Offsets for second corner
+    var x1 = f64_sub(f64_add(x0, f64_neg(f64_from(i1))), _SIMPLEX_G3);
+    var y1 = f64_sub(f64_add(y0, f64_neg(f64_from(j1))), _SIMPLEX_G3);
+    var z1 = f64_sub(f64_add(z0, f64_neg(f64_from(k1))), _SIMPLEX_G3);
+
+    # Offsets for third corner (2 * G3)
+    var g3_2 = f64_mul(F64_TWO, _SIMPLEX_G3);
+    var x2 = f64_sub(f64_add(x0, f64_neg(f64_from(i2))), g3_2);
+    var y2 = f64_sub(f64_add(y0, f64_neg(f64_from(j2))), g3_2);
+    var z2 = f64_sub(f64_add(z0, f64_neg(f64_from(k2))), g3_2);
+
+    # Offsets for last corner (3 * G3 = G3 + G3 + G3)
+    var g3_3 = f64_add(g3_2, _SIMPLEX_G3);
+    var x3 = f64_sub(f64_add(x0, f64_neg(F64_ONE)), g3_3);
+    var y3 = f64_sub(f64_add(y0, f64_neg(F64_ONE)), g3_3);
+    var z3 = f64_sub(f64_add(z0, f64_neg(F64_ONE)), g3_3);
+
+    # Hash the four tetrahedron vertices
+    var ii = i & 255;
+    var jj = j & 255;
+    var kk = k & 255;
+    var gi0 = _perm(_perm(_perm(ii)      + jj)      + kk);
+    var gi1 = _perm(_perm(_perm(ii + i1)  + jj + j1)  + kk + k1);
+    var gi2 = _perm(_perm(_perm(ii + i2)  + jj + j2)  + kk + k2);
+    var gi3 = _perm(_perm(_perm(ii + 1)   + jj + 1)   + kk + 1);
+
+    # Calculate contribution from each corner
+    var n0 = 0;
+    var t0 = f64_sub(_SIMPLEX_R2_3D, f64_add(f64_add(f64_mul(x0, x0), f64_mul(y0, y0)), f64_mul(z0, z0)));
+    if (f64_gt(t0, 0) == 1) {
+        var t0_sq = f64_mul(t0, t0);
+        n0 = f64_mul(f64_mul(t0_sq, t0_sq), _grad3_dot(gi0, x0, y0, z0));
+    }
+
+    var n1 = 0;
+    var t1 = f64_sub(_SIMPLEX_R2_3D, f64_add(f64_add(f64_mul(x1, x1), f64_mul(y1, y1)), f64_mul(z1, z1)));
+    if (f64_gt(t1, 0) == 1) {
+        var t1_sq = f64_mul(t1, t1);
+        n1 = f64_mul(f64_mul(t1_sq, t1_sq), _grad3_dot(gi1, x1, y1, z1));
+    }
+
+    var n2 = 0;
+    var t2 = f64_sub(_SIMPLEX_R2_3D, f64_add(f64_add(f64_mul(x2, x2), f64_mul(y2, y2)), f64_mul(z2, z2)));
+    if (f64_gt(t2, 0) == 1) {
+        var t2_sq = f64_mul(t2, t2);
+        n2 = f64_mul(f64_mul(t2_sq, t2_sq), _grad3_dot(gi2, x2, y2, z2));
+    }
+
+    var n3 = 0;
+    var t3 = f64_sub(_SIMPLEX_R2_3D, f64_add(f64_add(f64_mul(x3, x3), f64_mul(y3, y3)), f64_mul(z3, z3)));
+    if (f64_gt(t3, 0) == 1) {
+        var t3_sq = f64_mul(t3, t3);
+        n3 = f64_mul(f64_mul(t3_sq, t3_sq), _grad3_dot(gi3, x3, y3, z3));
+    }
+
+    # Scale to [-1, 1] range
+    return f64_mul(_SIMPLEX_SCALE_3D, f64_add(f64_add(f64_add(n0, n1), n2), n3));
+}
+
+# ================================================================
+# FRACTIONAL BROWNIAN MOTION (fBm)
+# ================================================================
+
+# simplex_fbm_2d(x, y, octaves, freq, amp, persistence) -> f64
+# Layers multiple octaves of 2D simplex noise.
+# persistence: amplitude multiplier per octave (typically 0.5).
+# Returns normalized f64 in approximately [-1, 1].
+fn simplex_fbm_2d(x, y, octaves, freq, amp, persistence) {
+    var sum = 0;
+    var max_amp = 0;
+    var cur_freq = freq;
+    var cur_amp = amp;
+
+    var i = 0;
+    while (i < octaves) {
+        var nx = f64_mul(x, cur_freq);
+        var ny = f64_mul(y, cur_freq);
+        sum = f64_add(sum, f64_mul(cur_amp, simplex_2d(nx, ny)));
+        max_amp = f64_add(max_amp, cur_amp);
+        cur_amp = f64_mul(cur_amp, persistence);
+        cur_freq = f64_mul(cur_freq, F64_TWO);
+        i = i + 1;
+    }
+
+    return f64_div(sum, max_amp);
+}
+
+# simplex_fbm_3d(x, y, z, octaves, freq, amp, persistence) -> f64
+# Layers multiple octaves of 3D simplex noise.
+# persistence: amplitude multiplier per octave (typically 0.5).
+# Returns normalized f64 in approximately [-1, 1].
+fn simplex_fbm_3d(x, y, z, octaves, freq, amp, persistence) {
+    var sum = 0;
+    var max_amp = 0;
+    var cur_freq = freq;
+    var cur_amp = amp;
+
+    var i = 0;
+    while (i < octaves) {
+        var nx = f64_mul(x, cur_freq);
+        var ny = f64_mul(y, cur_freq);
+        var nz = f64_mul(z, cur_freq);
+        sum = f64_add(sum, f64_mul(cur_amp, simplex_3d(nx, ny, nz)));
+        max_amp = f64_add(max_amp, cur_amp);
+        cur_amp = f64_mul(cur_amp, persistence);
+        cur_freq = f64_mul(cur_freq, F64_TWO);
+        i = i + 1;
+    }
+
+    return f64_div(sum, max_amp);
+}

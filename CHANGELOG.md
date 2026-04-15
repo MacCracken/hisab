@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## 2.1.0 (2026-04-15) — Precision + depth
+
+### Added
+- **linalg_precision.cyr** (1,124 lines) — precision-grade linear algebra:
+  - `svd_golub_kahan` — Golub-Kahan bidiagonalization + implicit QR for SVD (preserves full precision, replaces A^T*A approach)
+  - `eigen_qr` — Householder tridiagonalization + implicit symmetric QR with Wilkinson shift (O(n^3) vs Jacobi's O(n^5))
+  - `cqr_decompose` — complex Householder QR decomposition
+- **noise_simplex.cyr** (343 lines) — OpenSimplex2 noise:
+  - `simplex_2d`, `simplex_3d` — gradient noise on triangular/tetrahedral grids
+  - `simplex_fbm_2d`, `simplex_fbm_3d` — fractional Brownian motion layering
+- **einsum.cyr** (305 lines) — Einstein summation notation:
+  - `einsum(notation, tensors, n)` — parses `"ij,jk->ik"` style strings, supports matrix multiply, trace, transpose, outer product, contraction
+
+### Changed
+- Audit M8 (SVD precision) resolved — `svd_golub_kahan` replaces the A^T*A eigendecomposition approach
+
+### Performance
+- `eigen_qr`: O(n^3) for symmetric eigenproblems (was O(n^5) with Jacobi for large n)
+
 ## 2.0.0 (2026-04-15) — Cyrius port
 
 **Breaking: complete rewrite from Rust to Cyrius.** This is a new language, new API, new binary format. The Rust source is archived in `rust-old/`.

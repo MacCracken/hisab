@@ -27,34 +27,30 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 
 ---
 
-## Current — v2.0.0 (2026-04-15)
+## Current — v2.1.0 (2026-04-15)
 
-- **27 lib files, 11,769 lines** (ported from 33,612 lines Rust)
+- **30 lib files, 13,715 lines**
 - **821 test assertions** across 4 test suites
 - **22 benchmarks**, 5 fuzz targets
-- **420KB static binary** (vs ~800KB Rust dynamic)
+- **472KB static binary**
 - Toolchain: Cyrius 4.10.3
-- P(-1) audit: 31 issues found, 25 fixed
-
-### Shipped
-27 lib files — see CHANGELOG.md for full inventory. P(-1) audit: 25 of 31 issues fixed.
-Remaining: C3 (upstream cyrius 5.0.1), M8 (Golub-Kahan SVD), L1-L7 (cosmetic).
+- P(-1) audit: 31 issues found, 26 fixed (C3 upstream only remaining non-cosmetic)
 
 ---
 
 ## 2.1.0 — Precision + depth
 
 ### Audit carry-forward
-- [ ] M8: SVD via Golub-Kahan bidiagonalization (replaces A^T*A approach)
+- [x] M8: SVD via Golub-Kahan bidiagonalization (linalg_precision.cyr — preserves full precision)
 - [ ] C3: upstream matrix.cyr alloc overflow → cyrius 5.0.1
 
 ### Numerical
-- [ ] Complex QR decomposition
-- [ ] Complex matrix inverse
-- [ ] Condition number estimation
-- [ ] QR iteration for large symmetric eigenproblems (n > 50)
-- [ ] Simplex noise (OpenSimplex2)
-- [ ] Einsum string notation parser (`"ij,jk->ik"`)
+- [x] Complex QR decomposition (cqr_decompose in linalg_precision.cyr)
+- [x] Complex matrix inverse (cmat_inverse in linalg_ext.cyr — shipped 2.0.0)
+- [x] Condition number estimation (matrix_condition_number in linalg_ext.cyr — shipped 2.0.0)
+- [x] QR iteration for large symmetric eigenproblems (eigen_qr in linalg_precision.cyr — O(n^3))
+- [x] Simplex noise — OpenSimplex2 2D+3D + fBm (noise_simplex.cyr)
+- [x] Einsum string notation parser — `"ij,jk->ik"` style (einsum.cyr)
 
 ---
 
@@ -106,8 +102,12 @@ Complete rewrite from Rust to Cyrius. 27 lib files, 11,769 lines. 821 test asser
 22 benchmarks, 5 fuzz targets. P(-1) audit: 31 issues found, 25 fixed. 420KB static binary.
 See CHANGELOG.md for full details.
 
+### 2.1.0 (2026-04-15) — Precision + depth
+Golub-Kahan SVD, QR eigendecomposition (O(n^3)), complex QR, OpenSimplex2 noise,
+einsum notation. 30 files, 13,715 lines, 472KB.
+
 ### Rust 1.4.0 (2026-03-30) — Final Rust release
-Theoretical physics foundation. Archived in `rust-old/`. See CHANGELOG.md for history.
+Archived in `rust-old/`.
 
 ---
 

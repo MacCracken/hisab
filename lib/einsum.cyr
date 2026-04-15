@@ -1,0 +1,305 @@
+# einsum.cyr — Einstein summation notation for tensors
+# Usage: include "lib/einsum.cyr"
+# Requires: tensor.cyr, str.cyr, vec.cyr, alloc.cyr, math.cyr
+#
+# Parses notation strings like "ij,jk->ik" (matrix multiply),
+# "ii->" (trace), "ij->ji" (transpose), "i,j->ij" (outer product).
+# Supports up to rank-4 tensors and up to 8 index labels (a-h).
+#
+# Characters: 'a'=97 .. 'h'=104, ','=44, '-'=45, '>'=62
+
+# ================================================================
+# CONSTANTS
+# ================================================================
+
+var _EINSUM_MAX_LABELS = 8;    # a through h
+var _EINSUM_MAX_RANK   = 4;    # max tensor rank
+
+# ================================================================
+# INTERNAL: NOTATION PARSER
+# ================================================================
+
+# Check if character is a valid index label (a-h, i.e. 97-104)
+fn _einsum_is_label(ch) {
+    if (ch >= 97 && ch <= 104) { return 1; }
+    return 0;
+}
+
+# Convert label character to index (a=0, b=1, ..., h=7)
+fn _einsum_label_idx(ch) {
+    return ch - 97;
+}
+
+# Parse a single operand spec string (e.g. "ij" or "ijk") into
+# label indices. Returns count of labels found.
+# labels_out: pointer to store label indices (up to _EINSUM_MAX_RANK).
+fn _einsum_parse_operand(notation_data, start, end, labels_out) {
+    var count = 0;
+    var pos = start;
+    while (pos < end) {
+        var ch = load8(notation_data + pos);
+        if (_einsum_is_label(ch) == 1) {
+            if (count < _EINSUM_MAX_RANK) {
+                store64(labels_out + count * 8, _einsum_label_idx(ch));
+            }
+            count = count + 1;
+        }
+        pos = pos + 1;
+    }
+    return count;
+}
+
+# ================================================================
+# EINSUM MAIN FUNCTION
+# ================================================================
+
+# einsum(notation, tensors, n_tensors) -> HTensor
+#
+# notation: Str (e.g. "ij,jk->ik")
+# tensors:  pointer to array of HTensor pointers
+# n_tensors: number of input tensors
+#
+# Returns a new HTensor with the result, or 0 on error.
+fn einsum(notation, tensors, n_tensors) {
+    var ndata = str_data(notation);
+    var nlen = str_len(notation);
+
+    # --- Step 1: Find "->" separator ---
+    var arrow_pos = 0 - 1;
+    var pos = 0;
+    while (pos < nlen - 1) {
+        if (load8(ndata + pos) == 45 && load8(ndata + pos + 1) == 62) {
+            arrow_pos = pos;
+            pos = nlen;  # break
+        }
+        pos = pos + 1;
+    }
+    if (arrow_pos < 0) { return 0; }  # No "->" found
+
+    var input_end = arrow_pos;
+    var output_start = arrow_pos + 2;
+
+    # --- Step 2: Split input spec on "," to get per-tensor specs ---
+    # Find comma positions to delineate operands
+    # operand_starts[i], operand_ends[i] for up to 8 operands
+    var op_starts = alloc(8 * 8);
+    var op_ends   = alloc(8 * 8);
+    var n_ops = 0;
+    var seg_start = 0;
+
+    pos = 0;
+    while (pos <= input_end) {
+        if (pos == input_end || load8(ndata + pos) == 44) {
+            if (n_ops < 8) {
+                store64(op_starts + n_ops * 8, seg_start);
+                store64(op_ends + n_ops * 8, pos);
+                n_ops = n_ops + 1;
+            }
+            seg_start = pos + 1;
+        }
+        pos = pos + 1;
+    }
+
+    if (n_ops != n_tensors) { return 0; }  # Mismatch
+
+    # --- Step 3: Parse each operand's label indices ---
+    # op_labels[op][rank_pos] = label_index (0-7)
+    # op_ranks[op] = number of indices for this operand
+    var op_labels = alloc(8 * _EINSUM_MAX_RANK * 8);  # 8 operands * 4 indices
+    var op_ranks  = alloc(8 * 8);
+
+    var oi = 0;
+    while (oi < n_ops) {
+        var lbuf = op_labels + oi * _EINSUM_MAX_RANK * 8;
+        var ostart = load64(op_starts + oi * 8);
+        var oend   = load64(op_ends + oi * 8);
+        var rank = _einsum_parse_operand(ndata, ostart, oend, lbuf);
+        store64(op_ranks + oi * 8, rank);
+        oi = oi + 1;
+    }
+
+    # --- Step 4: Parse output labels ---
+    var out_labels = alloc(_EINSUM_MAX_RANK * 8);
+    var out_rank = _einsum_parse_operand(ndata, output_start, nlen, out_labels);
+
+    # --- Step 5: Determine dimension for each label ---
+    # label_dims[label_idx] = dimension size (0 = unused)
+    var label_dims = alloc(_EINSUM_MAX_LABELS * 8);
+    var li = 0;
+    while (li < _EINSUM_MAX_LABELS) {
+        store64(label_dims + li * 8, 0);
+        li = li + 1;
+    }
+
+    oi = 0;
+    while (oi < n_ops) {
+        var t = load64(tensors + oi * 8);
+        var t_rank = load64(op_ranks + oi * 8);
+        var t_shape = HTensor_shape(t);
+        var ri = 0;
+        while (ri < t_rank) {
+            var label = load64(op_labels + (oi * _EINSUM_MAX_RANK + ri) * 8);
+            var dim = load64(t_shape + ri * 8);
+            var existing = load64(label_dims + label * 8);
+            if (existing == 0) {
+                store64(label_dims + label * 8, dim);
+            } else {
+                # Dimension mismatch check
+                if (existing != dim) { return 0; }
+            }
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+
+    # --- Step 6: Identify which labels are contracted (summed over) ---
+    # A label is contracted if it appears in inputs but NOT in output.
+    # contracted_labels: list of label indices to sum over
+    var contracted = alloc(_EINSUM_MAX_LABELS * 8);
+    var n_contracted = 0;
+
+    # Track which labels appear in output
+    var in_output = alloc(_EINSUM_MAX_LABELS * 8);
+    li = 0;
+    while (li < _EINSUM_MAX_LABELS) {
+        store64(in_output + li * 8, 0);
+        li = li + 1;
+    }
+    li = 0;
+    while (li < out_rank) {
+        var lbl = load64(out_labels + li * 8);
+        store64(in_output + lbl * 8, 1);
+        li = li + 1;
+    }
+
+    # Find labels that appear in input but not in output
+    li = 0;
+    while (li < _EINSUM_MAX_LABELS) {
+        if (load64(label_dims + li * 8) > 0 && load64(in_output + li * 8) == 0) {
+            store64(contracted + n_contracted * 8, li);
+            n_contracted = n_contracted + 1;
+        }
+        li = li + 1;
+    }
+
+    # --- Step 7: Build output tensor ---
+    var out_shape = alloc((_EINSUM_MAX_RANK + 1) * 8);  # +1 for scalar case
+    if (out_rank == 0) {
+        # Scalar result — use rank 1, shape [1]
+        store64(out_shape, 1);
+        var result = tensor_new(1, out_shape);
+        # Compute the single scalar value
+        var val = _einsum_compute_element(result, 0, out_labels, out_rank,
+            label_dims, contracted, n_contracted,
+            op_labels, op_ranks, n_ops, tensors);
+        store64(HTensor_data(result), val);
+        return result;
+    }
+
+    li = 0;
+    while (li < out_rank) {
+        var lbl = load64(out_labels + li * 8);
+        store64(out_shape + li * 8, load64(label_dims + lbl * 8));
+        li = li + 1;
+    }
+
+    var result = tensor_new(out_rank, out_shape);
+    var total = HTensor_total(result);
+    var rd = HTensor_data(result);
+
+    # --- Step 8: Iterate over all output elements ---
+    # For each flat output index, expand to multi-index, assign labels,
+    # then iterate over contracted labels and accumulate.
+    var out_idx = 0;
+    while (out_idx < total) {
+        var val = _einsum_compute_element(result, out_idx, out_labels, out_rank,
+            label_dims, contracted, n_contracted,
+            op_labels, op_ranks, n_ops, tensors);
+        store64(rd + out_idx * 8, val);
+        out_idx = out_idx + 1;
+    }
+
+    return result;
+}
+
+# ================================================================
+# INTERNAL: COMPUTE A SINGLE OUTPUT ELEMENT
+# ================================================================
+
+# Compute one element of the einsum result.
+# out_idx: flat index into output tensor.
+# Expands to multi-index, assigns label values, iterates contracted dims.
+fn _einsum_compute_element(result, out_idx, out_labels, out_rank,
+    label_dims, contracted, n_contracted,
+    op_labels, op_ranks, n_ops, tensors) {
+
+    # label_vals[label_idx] = current value for that label
+    var label_vals = alloc(_EINSUM_MAX_LABELS * 8);
+
+    # Expand out_idx to output multi-index and assign to label_vals
+    var remaining = out_idx;
+    var oi = out_rank - 1;
+    while (oi >= 0) {
+        var lbl = load64(out_labels + oi * 8);
+        var dim = load64(label_dims + lbl * 8);
+        var idx_val = remaining % dim;
+        remaining = remaining / dim;
+        store64(label_vals + lbl * 8, idx_val);
+        oi = oi - 1;
+    }
+
+    # Sum over all combinations of contracted indices
+    return _einsum_sum_contracted(label_vals, label_dims,
+        contracted, n_contracted, 0,
+        op_labels, op_ranks, n_ops, tensors);
+}
+
+# Recursively iterate over contracted dimensions and accumulate product.
+fn _einsum_sum_contracted(label_vals, label_dims,
+    contracted, n_contracted, depth,
+    op_labels, op_ranks, n_ops, tensors) {
+
+    if (depth >= n_contracted) {
+        # All contracted indices assigned — compute the product of tensor elements
+        return _einsum_product(label_vals, op_labels, op_ranks, n_ops, tensors);
+    }
+
+    var lbl = load64(contracted + depth * 8);
+    var dim = load64(label_dims + lbl * 8);
+    var sum = 0;
+    var ci = 0;
+    while (ci < dim) {
+        store64(label_vals + lbl * 8, ci);
+        var term = _einsum_sum_contracted(label_vals, label_dims,
+            contracted, n_contracted, depth + 1,
+            op_labels, op_ranks, n_ops, tensors);
+        sum = f64_add(sum, term);
+        ci = ci + 1;
+    }
+    return sum;
+}
+
+# Compute the product of all input tensor elements for current label assignment.
+fn _einsum_product(label_vals, op_labels, op_ranks, n_ops, tensors) {
+    var product = F64_ONE;
+    var indices = alloc(_EINSUM_MAX_RANK * 8);
+
+    var oi = 0;
+    while (oi < n_ops) {
+        var t = load64(tensors + oi * 8);
+        var t_rank = load64(op_ranks + oi * 8);
+
+        # Build index array for this tensor from label assignments
+        var ri = 0;
+        while (ri < t_rank) {
+            var lbl = load64(op_labels + (oi * _EINSUM_MAX_RANK + ri) * 8);
+            store64(indices + ri * 8, load64(label_vals + lbl * 8));
+            ri = ri + 1;
+        }
+
+        var elem = tensor_get(t, indices);
+        product = f64_mul(product, elem);
+        oi = oi + 1;
+    }
+    return product;
+}

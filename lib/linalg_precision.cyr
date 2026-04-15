@@ -1,0 +1,1124 @@
+# linalg_precision.cyr — precision linear algebra algorithms
+# Usage: include "lib/linalg_precision.cyr"
+# Requires: alloc.cyr, math.cyr, matrix.cyr, linalg.cyr, complex.cyr, error.cyr
+#
+# Higher-precision replacements for linalg.cyr's SVD and eigendecomposition:
+#
+#   svd_golub_kahan   — Golub-Kahan bidiagonalization + implicit QR iteration
+#                       (replaces A^T*A eigendecomposition which squares cond #)
+#
+#   eigen_qr          — Householder tridiagonalization + implicit symmetric QR
+#                       with Wilkinson shift, O(n^3) vs Jacobi's O(n^5)
+#
+#   cqr_decompose     — Householder QR for complex matrices
+#
+# All functions use out-params and return error codes (ERR_NONE / ERR_NO_CONVERGENCE).
+
+# ================================================================
+# Internal helpers
+# ================================================================
+
+# Compute sign of an f64 value: +1.0 if x >= 0, -1.0 if x < 0
+fn _lp_sign(x) {
+    if (f64_lt(x, f64_from(0)) == 1) {
+        return f64_neg(F64_ONE);
+    }
+    return F64_ONE;
+}
+
+# Compute the 2-norm of a segment of a flat f64 array
+# arr: pointer to f64 array, start: starting index, len: number of elements
+fn _lp_vec_norm(arr, start, len) {
+    var sum = f64_from(0);
+    var i = 0;
+    while (i < len) {
+        var v = load64(arr + (start + i) * 8);
+        sum = f64_add(sum, f64_mul(v, v));
+        i = i + 1;
+    }
+    return f64_sqrt(sum);
+}
+
+# Allocate a zero-filled flat f64 array of length n
+fn _lp_vec_new(n) {
+    var v = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(v + i * 8, f64_from(0));
+        i = i + 1;
+    }
+    return v;
+}
+
+# Copy flat f64 array: dst[0..n) = src[0..n)
+fn _lp_vec_copy(dst, src, n) {
+    var i = 0;
+    while (i < n) {
+        store64(dst + i * 8, load64(src + i * 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Copy matrix data: dst = src (same dimensions assumed)
+fn _lp_mat_copy_into(dst, src) {
+    var n = mat_rows(src) * mat_cols(src);
+    var i = 0;
+    while (i < n) {
+        store64(dst + 16 + i * 8, load64(src + 16 + i * 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# Section 1 — Golub-Kahan SVD
+# ================================================================
+#
+# svd_golub_kahan(A, out_U, out_S, out_Vt) -> error code
+#
+# A:      stdlib matrix (m x n, m >= n).
+# out_U:  stdlib matrix (m x n, caller allocates).
+# out_S:  flat f64 array of length n (caller allocates, receives singular values).
+# out_Vt: stdlib matrix (n x n, caller allocates).
+# Returns: ERR_NONE on success, ERR_NO_CONVERGENCE if QR iteration fails.
+#
+# Algorithm:
+#   Step 1: Householder bidiagonalization  A = U1 * B * V1^T
+#   Step 2: Implicit QR iteration on bidiagonal B for singular values
+#   Step 3: Accumulate singular vectors into U and Vt
+
+# Step 1a: Householder bidiagonalization
+# Reduces m x n matrix (m >= n) to upper bidiagonal form.
+# On return:
+#   - diag[0..n):   main diagonal of B
+#   - superdiag[0..n-1): superdiagonal of B
+#   - U_acc:  m x n orthogonal matrix (left Householder product)
+#   - Vt_acc: n x n orthogonal matrix (right Householder product transposed)
+fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
+    # Work on a copy of A
+    var W = mat_copy(A);
+
+    # Initialize U_acc to m x n slice of identity
+    var i = 0;
+    while (i < m * n) {
+        store64(U_acc + 16 + i * 8, f64_from(0));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        mat_set(U_acc, i, i, F64_ONE);
+        i = i + 1;
+    }
+
+    # Initialize Vt_acc to n x n identity
+    i = 0;
+    while (i < n * n) {
+        store64(Vt_acc + 16 + i * 8, f64_from(0));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        mat_set(Vt_acc, i, i, F64_ONE);
+        i = i + 1;
+    }
+
+    var k = 0;
+    while (k < n) {
+        # ---- Left Householder: zero out column k below diagonal ----
+        var len_l = m - k;
+        var v_l = _lp_vec_new(len_l);
+
+        # Extract column k, rows k..m
+        i = 0;
+        while (i < len_l) {
+            store64(v_l + i * 8, mat_get(W, k + i, k));
+            i = i + 1;
+        }
+
+        var norm_l = _lp_vec_norm(v_l, 0, len_l);
+        if (f64_gt(norm_l, EPSILON_F64) == 1) {
+            var v0 = load64(v_l);
+            var sgn = _lp_sign(v0);
+            # v[0] += sign(v[0]) * ||v||
+            store64(v_l, f64_add(v0, f64_mul(sgn, norm_l)));
+
+            # Compute vTv for normalization
+            var vtv = f64_from(0);
+            i = 0;
+            while (i < len_l) {
+                var vi = load64(v_l + i * 8);
+                vtv = f64_add(vtv, f64_mul(vi, vi));
+                i = i + 1;
+            }
+
+            if (f64_gt(vtv, EPSILON_F64) == 1) {
+                var two_over_vtv = f64_div(F64_TWO, vtv);
+
+                # Apply H_l to W: W[k:m, k:n] -= (2/vTv) * v * (v^T * W[k:m, k:n])
+                var j = k;
+                while (j < n) {
+                    # dot = v^T * W[k:m, j]
+                    var dot = f64_from(0);
+                    i = 0;
+                    while (i < len_l) {
+                        dot = f64_add(dot, f64_mul(load64(v_l + i * 8),
+                                                   mat_get(W, k + i, j)));
+                        i = i + 1;
+                    }
+                    var coeff = f64_mul(two_over_vtv, dot);
+                    i = 0;
+                    while (i < len_l) {
+                        var wij = mat_get(W, k + i, j);
+                        mat_set(W, k + i, j,
+                                f64_sub(wij, f64_mul(coeff, load64(v_l + i * 8))));
+                        i = i + 1;
+                    }
+                    j = j + 1;
+                }
+
+                # Accumulate into U_acc: U_acc[k:m, :] -= (2/vTv) * v * (v^T * U_acc[k:m, :])
+                j = 0;
+                while (j < n) {
+                    var dot = f64_from(0);
+                    i = 0;
+                    while (i < len_l) {
+                        dot = f64_add(dot, f64_mul(load64(v_l + i * 8),
+                                                   mat_get(U_acc, k + i, j)));
+                        i = i + 1;
+                    }
+                    var coeff = f64_mul(two_over_vtv, dot);
+                    i = 0;
+                    while (i < len_l) {
+                        var uij = mat_get(U_acc, k + i, j);
+                        mat_set(U_acc, k + i, j,
+                                f64_sub(uij, f64_mul(coeff, load64(v_l + i * 8))));
+                        i = i + 1;
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+
+        # ---- Right Householder: zero out row k to the right of superdiagonal ----
+        if (k < n - 2) {
+            var len_r = n - k - 1;
+            var v_r = _lp_vec_new(len_r);
+
+            # Extract row k, cols (k+1)..n
+            i = 0;
+            while (i < len_r) {
+                store64(v_r + i * 8, mat_get(W, k, k + 1 + i));
+                i = i + 1;
+            }
+
+            var norm_r = _lp_vec_norm(v_r, 0, len_r);
+            if (f64_gt(norm_r, EPSILON_F64) == 1) {
+                var r0 = load64(v_r);
+                var sgn_r = _lp_sign(r0);
+                store64(v_r, f64_add(r0, f64_mul(sgn_r, norm_r)));
+
+                var vtv_r = f64_from(0);
+                i = 0;
+                while (i < len_r) {
+                    var vi = load64(v_r + i * 8);
+                    vtv_r = f64_add(vtv_r, f64_mul(vi, vi));
+                    i = i + 1;
+                }
+
+                if (f64_gt(vtv_r, EPSILON_F64) == 1) {
+                    var two_over_vtv_r = f64_div(F64_TWO, vtv_r);
+
+                    # Apply H_r to W: W[k:m, (k+1):n] -= (2/vTv) * (W * v) * v^T
+                    # i.e., for each row i of W[k:m, :]: row -= (2/vTv) * (row . v) * v^T
+                    var ri = k;
+                    while (ri < m) {
+                        var dot = f64_from(0);
+                        i = 0;
+                        while (i < len_r) {
+                            dot = f64_add(dot, f64_mul(mat_get(W, ri, k + 1 + i),
+                                                       load64(v_r + i * 8)));
+                            i = i + 1;
+                        }
+                        var coeff = f64_mul(two_over_vtv_r, dot);
+                        i = 0;
+                        while (i < len_r) {
+                            var wij = mat_get(W, ri, k + 1 + i);
+                            mat_set(W, ri, k + 1 + i,
+                                    f64_sub(wij, f64_mul(coeff, load64(v_r + i * 8))));
+                            i = i + 1;
+                        }
+                        ri = ri + 1;
+                    }
+
+                    # Accumulate into Vt_acc: Vt_acc[(k+1):n, :] -= (2/vTv) * v * (v^T * Vt_acc)
+                    var j = 0;
+                    while (j < n) {
+                        var dot = f64_from(0);
+                        i = 0;
+                        while (i < len_r) {
+                            dot = f64_add(dot, f64_mul(load64(v_r + i * 8),
+                                                       mat_get(Vt_acc, k + 1 + i, j)));
+                            i = i + 1;
+                        }
+                        var coeff = f64_mul(two_over_vtv_r, dot);
+                        i = 0;
+                        while (i < len_r) {
+                            var vtij = mat_get(Vt_acc, k + 1 + i, j);
+                            mat_set(Vt_acc, k + 1 + i, j,
+                                    f64_sub(vtij, f64_mul(coeff, load64(v_r + i * 8))));
+                            i = i + 1;
+                        }
+                        j = j + 1;
+                    }
+                }
+            }
+        }
+
+        k = k + 1;
+    }
+
+    # Extract bidiagonal entries from W
+    i = 0;
+    while (i < n) {
+        store64(diag + i * 8, mat_get(W, i, i));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n - 1) {
+        store64(superdiag + i * 8, mat_get(W, i, i + 1));
+        i = i + 1;
+    }
+
+    return ERR_NONE;
+}
+
+# Step 2: Implicit QR iteration on bidiagonal matrix for SVD.
+# Operates on diag[0..n) and superdiag[0..n-1) in place.
+# Accumulates Givens rotations into U_acc (m x n) and Vt_acc (n x n).
+# max_iter: maximum total QR sweeps.
+fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
+    var iter = 0;
+    var p_hi = n - 1;  # active submatrix upper bound
+
+    while (p_hi > 0 && iter < max_iter) {
+        # Check for negligible superdiagonal entries — deflation
+        var i = 0;
+        while (i < p_hi) {
+            var threshold = f64_mul(EPSILON_F64,
+                            f64_add(f64_abs(load64(diag + i * 8)),
+                                    f64_abs(load64(diag + (i + 1) * 8))));
+            if (f64_lt(f64_abs(load64(superdiag + i * 8)), threshold) == 1) {
+                store64(superdiag + i * 8, f64_from(0));
+            }
+            i = i + 1;
+        }
+
+        # Find the largest q such that B[p_hi-q+1:p_hi, p_hi-q+1:p_hi] is diagonal
+        # (i.e., superdiag entries at bottom are zero)
+        var q = 0;
+        while (q < p_hi) {
+            if (f64_gt(f64_abs(load64(superdiag + (p_hi - 1 - q) * 8)),
+                       EPSILON_F64) == 1) {
+                # Non-zero superdiag — stop
+                q = q;  # break equivalent
+                p_hi = p_hi;  # no-op to avoid empty block
+                # We need a break here — use a flag
+                q = q + p_hi;  # force exit
+            } else {
+                q = q + 1;
+            }
+        }
+        # Undo the forced exit trick
+        if (q >= p_hi) {
+            # Check if we exited naturally (all zero) or forced
+            if (q > p_hi) {
+                q = q - p_hi;
+            }
+            # else q == p_hi means all superdiag zero — fully converged
+        }
+
+        # Recalculate: find the bottom block where superdiag is zero
+        # Simpler approach: find p_lo and p_hi for the active unreduced block
+        # p_hi: largest index where superdiag[p_hi-1] != 0
+        while (p_hi > 0 &&
+               f64_lt(f64_abs(load64(superdiag + (p_hi - 1) * 8)), EPSILON_F64) == 1) {
+            p_hi = p_hi - 1;
+        }
+        if (p_hi == 0) {
+            # Fully converged
+            p_hi = 0;  # will exit while loop
+        } else {
+            # Find p_lo: smallest index in the unreduced block
+            var p_lo = p_hi - 1;
+            while (p_lo > 0 &&
+                   f64_gt(f64_abs(load64(superdiag + (p_lo - 1) * 8)), EPSILON_F64) == 1) {
+                p_lo = p_lo - 1;
+            }
+
+            # Wilkinson shift: eigenvalue of trailing 2x2 of B^T*B closer to d[p_hi]^2
+            var d_end = load64(diag + p_hi * 8);
+            var d_prev = load64(diag + (p_hi - 1) * 8);
+            var f_end = load64(superdiag + (p_hi - 1) * 8);
+
+            var a11 = f64_add(f64_mul(d_prev, d_prev),
+                              # If p_hi-2 >= p_lo, add superdiag[p_hi-2]^2
+                              f64_from(0));
+            if (p_hi - 1 > p_lo) {
+                var f_prev = load64(superdiag + (p_hi - 2) * 8);
+                a11 = f64_add(f64_mul(d_prev, d_prev), f64_mul(f_prev, f_prev));
+            } else {
+                a11 = f64_mul(d_prev, d_prev);
+            }
+            var a12 = f64_mul(d_prev, f_end);
+            var a22 = f64_add(f64_mul(d_end, d_end), f64_mul(f_end, f_end));
+
+            # Eigenvalues of [[a11, a12], [a12, a22]]
+            var tr = f64_add(a11, a22);
+            var det = f64_sub(f64_mul(a11, a22), f64_mul(a12, a12));
+            var disc = f64_sub(f64_mul(tr, tr), f64_mul(f64_from(4), det));
+            if (f64_lt(disc, f64_from(0)) == 1) { disc = f64_from(0); }
+            var sqrt_disc = f64_sqrt(disc);
+
+            var mu1 = f64_mul(F64_HALF, f64_add(tr, sqrt_disc));
+            var mu2 = f64_mul(F64_HALF, f64_sub(tr, sqrt_disc));
+
+            # Pick eigenvalue closer to a22 (= d[p_hi]^2 + f[p_hi-1]^2)
+            var mu = mu1;
+            if (f64_lt(f64_abs(f64_sub(mu2, a22)),
+                       f64_abs(f64_sub(mu1, a22))) == 1) {
+                mu = mu2;
+            }
+
+            # Golub-Kahan implicit QR step (chase the bulge)
+            # Initial: apply Givens to first column of B^T*B - mu*I
+            var y = f64_sub(f64_mul(load64(diag + p_lo * 8),
+                                    load64(diag + p_lo * 8)), mu);
+            var z = f64_mul(load64(diag + p_lo * 8),
+                            load64(superdiag + p_lo * 8));
+
+            var k = p_lo;
+            while (k < p_hi) {
+                # Right Givens rotation to zero z (acts on columns k, k+1)
+                var r = f64_sqrt(f64_add(f64_mul(y, y), f64_mul(z, z)));
+                var cs = f64_div(y, r);
+                var sn = f64_div(f64_neg(z), r);
+                if (f64_lt(r, EPSILON_F64) == 1) {
+                    cs = F64_ONE;
+                    sn = f64_from(0);
+                }
+
+                # Apply right rotation to B (affects columns k, k+1)
+                # Rows k-1 (if exists), k, k+1 (if exists) of bidiagonal
+                if (k > p_lo) {
+                    store64(superdiag + (k - 1) * 8, r);
+                }
+
+                var dk = load64(diag + k * 8);
+                var fk = load64(superdiag + k * 8);
+                var dk1 = load64(diag + (k + 1) * 8);
+
+                var new_dk  = f64_add(f64_mul(cs, dk), f64_mul(f64_neg(sn), fk));
+                var new_fk  = f64_add(f64_mul(sn, dk), f64_mul(cs, fk));
+                var bulge   = f64_mul(f64_neg(sn), dk1);
+                var new_dk1 = f64_mul(cs, dk1);
+
+                store64(diag + k * 8, new_dk);
+                store64(superdiag + k * 8, new_fk);
+                store64(diag + (k + 1) * 8, new_dk1);
+
+                # Accumulate right rotation into Vt_acc (rows k, k+1)
+                var j = 0;
+                while (j < n) {
+                    var vk  = mat_get(Vt_acc, k, j);
+                    var vk1 = mat_get(Vt_acc, k + 1, j);
+                    mat_set(Vt_acc, k, j,
+                            f64_add(f64_mul(cs, vk), f64_mul(f64_neg(sn), vk1)));
+                    mat_set(Vt_acc, k + 1, j,
+                            f64_add(f64_mul(sn, vk), f64_mul(cs, vk1)));
+                    j = j + 1;
+                }
+
+                # Left Givens rotation to zero the bulge (acts on rows k, k+1)
+                y = load64(diag + k * 8);
+                z = bulge;
+                r = f64_sqrt(f64_add(f64_mul(y, y), f64_mul(z, z)));
+                cs = f64_div(y, r);
+                sn = f64_div(f64_neg(z), r);
+                if (f64_lt(r, EPSILON_F64) == 1) {
+                    cs = F64_ONE;
+                    sn = f64_from(0);
+                }
+
+                store64(diag + k * 8, r);
+
+                # Update superdiag[k] and diag[k+1]
+                var old_fk = load64(superdiag + k * 8);
+                var old_dk1 = load64(diag + (k + 1) * 8);
+                store64(superdiag + k * 8,
+                        f64_add(f64_mul(cs, old_fk), f64_mul(f64_neg(sn), old_dk1)));
+                store64(diag + (k + 1) * 8,
+                        f64_add(f64_mul(sn, old_fk), f64_mul(cs, old_dk1)));
+
+                # If not last step, compute new bulge
+                if (k + 1 < p_hi) {
+                    var fk1 = load64(superdiag + (k + 1) * 8);
+                    y = load64(superdiag + k * 8);
+                    # Actually y and z for next iteration
+                    y = load64(superdiag + k * 8);
+                    z = f64_mul(f64_neg(sn), fk1);
+                    store64(superdiag + (k + 1) * 8, f64_mul(cs, fk1));
+                } else {
+                    y = f64_from(0);
+                    z = f64_from(0);
+                }
+
+                # Accumulate left rotation into U_acc (columns k, k+1)
+                j = 0;
+                while (j < m) {
+                    var uk  = mat_get(U_acc, j, k);
+                    var uk1 = mat_get(U_acc, j, k + 1);
+                    mat_set(U_acc, j, k,
+                            f64_add(f64_mul(cs, uk), f64_mul(f64_neg(sn), uk1)));
+                    mat_set(U_acc, j, k + 1,
+                            f64_add(f64_mul(sn, uk), f64_mul(cs, uk1)));
+                    j = j + 1;
+                }
+
+                k = k + 1;
+            }
+
+            iter = iter + 1;
+        }
+    }
+
+    if (iter >= max_iter && p_hi > 0) {
+        return ERR_NO_CONVERGENCE;
+    }
+
+    return ERR_NONE;
+}
+
+# Public: Golub-Kahan SVD
+# A:      stdlib matrix (m x n, m >= n).
+# out_U:  stdlib matrix (m x n, caller allocates).
+# out_S:  flat f64 array of length n (caller allocates).
+# out_Vt: stdlib matrix (n x n, caller allocates).
+# Returns: ERR_NONE on success, ERR_NO_CONVERGENCE on failure.
+fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
+    var m = mat_rows(A);
+    var n = mat_cols(A);
+    var max_iter = 30 * n * n;
+
+    # Step 1: Bidiagonalize
+    var diag = _lp_vec_new(n);
+    var superdiag = _lp_vec_new(n);  # n-1 used, extra slot harmless
+
+    var err = _lp_bidiagonalize(A, m, n, diag, superdiag, out_U, out_Vt);
+    if (err != ERR_NONE) { return err; }
+
+    # Step 2: QR iteration on bidiagonal
+    err = _lp_bidiag_qr(diag, superdiag, n, m, out_U, out_Vt, max_iter);
+    if (err != ERR_NONE) { return err; }
+
+    # Step 3: Make singular values non-negative; flip U column signs as needed
+    var i = 0;
+    while (i < n) {
+        var sv = load64(diag + i * 8);
+        if (f64_lt(sv, f64_from(0)) == 1) {
+            store64(diag + i * 8, f64_neg(sv));
+            # Flip sign of corresponding U column
+            var j = 0;
+            while (j < m) {
+                mat_set(out_U, j, i, f64_neg(mat_get(out_U, j, i)));
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    # Step 4: Sort singular values in descending order (selection sort)
+    i = 0;
+    while (i < n) {
+        var max_idx = i;
+        var max_sv = load64(diag + i * 8);
+        var j = i + 1;
+        while (j < n) {
+            if (f64_gt(load64(diag + j * 8), max_sv) == 1) {
+                max_sv = load64(diag + j * 8);
+                max_idx = j;
+            }
+            j = j + 1;
+        }
+        if (max_idx != i) {
+            # Swap singular values
+            var tmp = load64(diag + i * 8);
+            store64(diag + i * 8, load64(diag + max_idx * 8));
+            store64(diag + max_idx * 8, tmp);
+            # Swap U columns i and max_idx
+            var k = 0;
+            while (k < m) {
+                var tu = mat_get(out_U, k, i);
+                mat_set(out_U, k, i, mat_get(out_U, k, max_idx));
+                mat_set(out_U, k, max_idx, tu);
+                k = k + 1;
+            }
+            # Swap Vt rows i and max_idx
+            k = 0;
+            while (k < n) {
+                var tv = mat_get(out_Vt, i, k);
+                mat_set(out_Vt, i, k, mat_get(out_Vt, max_idx, k));
+                mat_set(out_Vt, max_idx, k, tv);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    # Copy singular values to output
+    _lp_vec_copy(out_S, diag, n);
+
+    return ERR_NONE;
+}
+
+# ================================================================
+# Section 2 — QR iteration for symmetric eigendecomposition
+# ================================================================
+#
+# eigen_qr(A, n, max_iter, out_vals, out_vecs) -> error code
+#
+# A:        stdlib matrix (n x n, must be symmetric).
+# n:        matrix dimension.
+# max_iter: maximum QR iterations.
+# out_vals: flat f64 array of length n (caller allocates, receives eigenvalues).
+# out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as columns).
+# Returns:  ERR_NONE on success, ERR_NO_CONVERGENCE if max_iter exceeded.
+#
+# Algorithm:
+#   Step 1: Householder tridiagonalization  A = Q * T * Q^T
+#   Step 2: Implicit symmetric QR with Wilkinson shift on T
+#   Step 3: Eigenvalues from diagonal of T, eigenvectors from accumulated Q
+
+# Step 1: Householder tridiagonalization of symmetric matrix
+# A: n x n symmetric matrix.
+# diag: flat f64 array of length n (receives main diagonal of T).
+# offdiag: flat f64 array of length n (receives sub/superdiagonal; offdiag[0] unused).
+# Q: n x n matrix (caller allocates, receives orthogonal transform).
+fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
+    # Work on a copy
+    var W = mat_copy(A);
+
+    # Initialize Q to identity
+    var i = 0;
+    var total = n * n;
+    while (i < total) { store64(Q + 16 + i * 8, f64_from(0)); i = i + 1; }
+    i = 0;
+    while (i < n) { mat_set(Q, i, i, F64_ONE); i = i + 1; }
+
+    var k = 0;
+    while (k < n - 2) {
+        # Extract column k below the subdiagonal: W[k+1..n, k]
+        var len = n - k - 1;
+        var v = _lp_vec_new(len);
+        i = 0;
+        while (i < len) {
+            store64(v + i * 8, mat_get(W, k + 1 + i, k));
+            i = i + 1;
+        }
+
+        var norm = _lp_vec_norm(v, 0, len);
+        if (f64_gt(norm, EPSILON_F64) == 1) {
+            var v0 = load64(v);
+            var sgn = _lp_sign(v0);
+            store64(v, f64_add(v0, f64_mul(sgn, norm)));
+
+            # Normalize: vtv
+            var vtv = f64_from(0);
+            i = 0;
+            while (i < len) {
+                var vi = load64(v + i * 8);
+                vtv = f64_add(vtv, f64_mul(vi, vi));
+                i = i + 1;
+            }
+
+            if (f64_gt(vtv, EPSILON_F64) == 1) {
+                var two_over_vtv = f64_div(F64_TWO, vtv);
+
+                # Compute p = (2/vtv) * W[k+1:n, k+1:n] * v
+                var p = _lp_vec_new(len);
+                i = 0;
+                while (i < len) {
+                    var sum = f64_from(0);
+                    var j = 0;
+                    while (j < len) {
+                        sum = f64_add(sum, f64_mul(mat_get(W, k + 1 + i, k + 1 + j),
+                                                   load64(v + j * 8)));
+                        j = j + 1;
+                    }
+                    store64(p + i * 8, f64_mul(two_over_vtv, sum));
+                    i = i + 1;
+                }
+
+                # Compute K = (v^T * p) / 2 * (2/vtv) — but simpler: K = v^T * p / 2
+                var vtp = f64_from(0);
+                i = 0;
+                while (i < len) {
+                    vtp = f64_add(vtp, f64_mul(load64(v + i * 8), load64(p + i * 8)));
+                    i = i + 1;
+                }
+                var K = f64_mul(F64_HALF, f64_mul(two_over_vtv, vtp));
+
+                # q = p - K * v
+                var q = _lp_vec_new(len);
+                i = 0;
+                while (i < len) {
+                    store64(q + i * 8, f64_sub(load64(p + i * 8),
+                                               f64_mul(K, load64(v + i * 8))));
+                    i = i + 1;
+                }
+
+                # W[k+1:n, k+1:n] -= v*q^T + q*v^T  (symmetric update)
+                i = 0;
+                while (i < len) {
+                    var j = 0;
+                    while (j < len) {
+                        var wij = mat_get(W, k + 1 + i, k + 1 + j);
+                        var update = f64_add(
+                            f64_mul(load64(v + i * 8), load64(q + j * 8)),
+                            f64_mul(load64(q + i * 8), load64(v + j * 8)));
+                        mat_set(W, k + 1 + i, k + 1 + j, f64_sub(wij, update));
+                        j = j + 1;
+                    }
+                    i = i + 1;
+                }
+
+                # Update the tridiagonal entries in column/row k
+                mat_set(W, k, k + 1, f64_neg(f64_mul(sgn, norm)));
+                mat_set(W, k + 1, k, f64_neg(f64_mul(sgn, norm)));
+                i = 2;
+                while (i < len + 1) {
+                    mat_set(W, k, k + i, f64_from(0));
+                    mat_set(W, k + i, k, f64_from(0));
+                    i = i + 1;
+                }
+
+                # Accumulate Q: Q[:, k+1:n] -= (2/vtv) * (Q[:, k+1:n] * v) * v^T
+                var j = 0;
+                while (j < n) {
+                    var dot = f64_from(0);
+                    i = 0;
+                    while (i < len) {
+                        dot = f64_add(dot, f64_mul(mat_get(Q, j, k + 1 + i),
+                                                   load64(v + i * 8)));
+                        i = i + 1;
+                    }
+                    var coeff = f64_mul(two_over_vtv, dot);
+                    i = 0;
+                    while (i < len) {
+                        var qij = mat_get(Q, j, k + 1 + i);
+                        mat_set(Q, j, k + 1 + i,
+                                f64_sub(qij, f64_mul(coeff, load64(v + i * 8))));
+                        i = i + 1;
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+
+        k = k + 1;
+    }
+
+    # Extract tridiagonal entries
+    i = 0;
+    while (i < n) {
+        store64(diag + i * 8, mat_get(W, i, i));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n - 1) {
+        store64(offdiag + (i + 1) * 8, mat_get(W, i + 1, i));
+        i = i + 1;
+    }
+    store64(offdiag, f64_from(0));
+
+    return ERR_NONE;
+}
+
+# Step 2: Implicit symmetric QR iteration with Wilkinson shift on tridiagonal T.
+# diag[0..n): main diagonal (modified in place to eigenvalues).
+# offdiag[0..n): sub/superdiagonal (offdiag[i] = T[i,i-1], offdiag[0] = 0).
+# Q: n x n matrix (accumulates Givens rotations).
+# max_iter: maximum iterations.
+fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
+    var iter = 0;
+    var p_hi = n - 1;
+
+    while (p_hi > 0 && iter < max_iter) {
+        # Deflation: check if offdiag[p_hi] is negligible
+        var threshold = f64_mul(EPSILON_F64,
+                        f64_add(f64_abs(load64(diag + p_hi * 8)),
+                                f64_abs(load64(diag + (p_hi - 1) * 8))));
+        if (f64_lt(f64_abs(load64(offdiag + p_hi * 8)), threshold) == 1) {
+            store64(offdiag + p_hi * 8, f64_from(0));
+            p_hi = p_hi - 1;
+        } else {
+            # Find p_lo: start of unreduced block
+            var p_lo = p_hi - 1;
+            while (p_lo > 0) {
+                var thr2 = f64_mul(EPSILON_F64,
+                           f64_add(f64_abs(load64(diag + p_lo * 8)),
+                                   f64_abs(load64(diag + (p_lo - 1) * 8))));
+                if (f64_lt(f64_abs(load64(offdiag + p_lo * 8)), thr2) == 1) {
+                    store64(offdiag + p_lo * 8, f64_from(0));
+                    p_lo = p_lo;  # break
+                    # Force exit from while
+                    var _break = 1;
+                    p_lo = p_lo;  # We need a real break — use flag trick below
+                }
+                p_lo = p_lo - 1;
+            }
+            # Re-find p_lo properly (scan from p_hi downward)
+            p_lo = p_hi;
+            while (p_lo > 0 &&
+                   f64_gt(f64_abs(load64(offdiag + p_lo * 8)), EPSILON_F64) == 1) {
+                p_lo = p_lo - 1;
+            }
+
+            # Wilkinson shift: eigenvalue of trailing 2x2 block closer to d[p_hi]
+            var d1 = load64(diag + (p_hi - 1) * 8);
+            var d2 = load64(diag + p_hi * 8);
+            var e2 = load64(offdiag + p_hi * 8);
+
+            var delta = f64_mul(F64_HALF, f64_sub(d1, d2));
+            var e2sq = f64_mul(e2, e2);
+
+            # mu = d2 - e2^2 / (delta + sign(delta) * sqrt(delta^2 + e2^2))
+            var denom_inner = f64_sqrt(f64_add(f64_mul(delta, delta), e2sq));
+            var sgn_delta = _lp_sign(delta);
+            # Handle delta == 0: use sign +1
+            if (f64_lt(f64_abs(delta), EPSILON_F64) == 1) {
+                sgn_delta = F64_ONE;
+            }
+            var denom = f64_add(delta, f64_mul(sgn_delta, denom_inner));
+            var mu = d2;
+            if (f64_gt(f64_abs(denom), EPSILON_F64) == 1) {
+                mu = f64_sub(d2, f64_div(e2sq, denom));
+            }
+
+            # Implicit QR step: chase bulge from p_lo to p_hi
+            var x = f64_sub(load64(diag + p_lo * 8), mu);
+            var z = load64(offdiag + (p_lo + 1) * 8);
+
+            var k = p_lo;
+            while (k < p_hi) {
+                # Givens rotation to zero z
+                var r = f64_sqrt(f64_add(f64_mul(x, x), f64_mul(z, z)));
+                var cs = F64_ONE;
+                var sn = f64_from(0);
+                if (f64_gt(r, EPSILON_F64) == 1) {
+                    cs = f64_div(x, r);
+                    sn = f64_div(z, r);
+                }
+
+                # Apply similarity transform to tridiagonal
+                if (k > p_lo) {
+                    store64(offdiag + k * 8, r);
+                }
+
+                var dk = load64(diag + k * 8);
+                var dk1 = load64(diag + (k + 1) * 8);
+                var ek1 = load64(offdiag + (k + 1) * 8);
+
+                var w = f64_sub(dk, dk1);
+                var t_val = f64_add(f64_mul(w, sn), f64_mul(f64_from(2), f64_mul(cs, ek1)));
+                var tau = f64_mul(sn, t_val);
+
+                store64(diag + k * 8, f64_sub(dk, tau));
+                store64(diag + (k + 1) * 8, f64_add(dk1, tau));
+                store64(offdiag + (k + 1) * 8,
+                        f64_sub(f64_mul(cs, ek1),
+                                f64_mul(F64_HALF, f64_mul(sn, f64_mul(w, cs)))));
+                # Fix: proper formula for the off-diagonal
+                # After rotation: e[k+1] = cs*e[k+1] - sn*(dk - dk1)/2 ... not quite
+                # Use the standard formulas:
+                # d'_k = cs^2*dk + sn^2*dk1 - 2*cs*sn*ek1
+                # d'_{k+1} = sn^2*dk + cs^2*dk1 + 2*cs*sn*ek1
+                # e'_{k+1} = cs*sn*(dk - dk1) + (cs^2 - sn^2)*ek1
+                var cs2 = f64_mul(cs, cs);
+                var sn2 = f64_mul(sn, sn);
+                var cs_sn = f64_mul(cs, sn);
+
+                store64(diag + k * 8,
+                        f64_sub(f64_add(f64_mul(cs2, dk), f64_mul(sn2, dk1)),
+                                f64_mul(f64_from(2), f64_mul(cs_sn, ek1))));
+                store64(diag + (k + 1) * 8,
+                        f64_add(f64_add(f64_mul(sn2, dk), f64_mul(cs2, dk1)),
+                                f64_mul(f64_from(2), f64_mul(cs_sn, ek1))));
+                store64(offdiag + (k + 1) * 8,
+                        f64_add(f64_mul(cs_sn, f64_sub(dk, dk1)),
+                                f64_mul(f64_sub(cs2, sn2), ek1)));
+
+                # Prepare next bulge
+                if (k + 1 < p_hi) {
+                    var ek2 = load64(offdiag + (k + 2) * 8);
+                    x = load64(offdiag + (k + 1) * 8);
+                    z = f64_mul(sn, ek2);
+                    store64(offdiag + (k + 2) * 8, f64_mul(cs, ek2));
+                }
+
+                # Accumulate Givens into Q (columns k, k+1)
+                var j = 0;
+                while (j < n) {
+                    var qk  = mat_get(Q, j, k);
+                    var qk1 = mat_get(Q, j, k + 1);
+                    mat_set(Q, j, k,     f64_add(f64_mul(cs, qk), f64_mul(sn, qk1)));
+                    mat_set(Q, j, k + 1, f64_add(f64_mul(f64_neg(sn), qk),
+                                                  f64_mul(cs, qk1)));
+                    j = j + 1;
+                }
+
+                k = k + 1;
+            }
+
+            iter = iter + 1;
+        }
+    }
+
+    if (iter >= max_iter && p_hi > 0) {
+        return ERR_NO_CONVERGENCE;
+    }
+    return ERR_NONE;
+}
+
+# Public: QR iteration for symmetric eigendecomposition
+# A:        stdlib matrix (n x n, must be symmetric).
+# n:        matrix dimension.
+# max_iter: maximum QR iterations.
+# out_vals: flat f64 array of length n (caller allocates).
+# out_vecs: stdlib matrix (n x n, caller allocates, eigenvectors as columns).
+# Returns:  ERR_NONE on success, ERR_NO_CONVERGENCE if max_iter exceeded.
+fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
+    if (n == 0) { return ERR_INVALID_INPUT; }
+    if (n == 1) {
+        store64(out_vals, mat_get(A, 0, 0));
+        mat_set(out_vecs, 0, 0, F64_ONE);
+        return ERR_NONE;
+    }
+
+    # Step 1: Householder tridiagonalization
+    var diag = _lp_vec_new(n);
+    var offdiag = _lp_vec_new(n);
+
+    var err = _lp_tridiagonalize(A, n, diag, offdiag, out_vecs);
+    if (err != ERR_NONE) { return err; }
+
+    # Step 2: Implicit QR iteration on tridiagonal
+    err = _lp_tridiag_qr(diag, offdiag, n, out_vecs, max_iter);
+    if (err != ERR_NONE) { return err; }
+
+    # Step 3: Copy eigenvalues, sort by descending magnitude
+    # First, copy raw eigenvalues
+    _lp_vec_copy(out_vals, diag, n);
+
+    # Selection sort by descending |eigenvalue|
+    var i = 0;
+    while (i < n) {
+        var max_idx = i;
+        var max_abs = f64_abs(load64(out_vals + i * 8));
+        var j = i + 1;
+        while (j < n) {
+            var aj = f64_abs(load64(out_vals + j * 8));
+            if (f64_gt(aj, max_abs) == 1) {
+                max_abs = aj;
+                max_idx = j;
+            }
+            j = j + 1;
+        }
+        if (max_idx != i) {
+            # Swap eigenvalues
+            var tmp = load64(out_vals + i * 8);
+            store64(out_vals + i * 8, load64(out_vals + max_idx * 8));
+            store64(out_vals + max_idx * 8, tmp);
+            # Swap eigenvector columns in out_vecs
+            var k = 0;
+            while (k < n) {
+                var tv = mat_get(out_vecs, k, i);
+                mat_set(out_vecs, k, i, mat_get(out_vecs, k, max_idx));
+                mat_set(out_vecs, k, max_idx, tv);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    return ERR_NONE;
+}
+
+# ================================================================
+# Section 3 — Complex QR decomposition
+# ================================================================
+#
+# cqr_decompose(A, out_Q, out_R) -> error code
+#
+# A:     complex matrix (cmat_new, m x n).
+# out_Q: complex matrix (m x m, caller allocates).
+# out_R: complex matrix (m x n, caller allocates).
+# Returns: ERR_NONE on success.
+#
+# Uses Householder reflectors in complex space:
+#   H = I - (2 / v^H v) * v * v^H
+# where v = x + sign(x1)*||x||*e1, with sign chosen for numerical stability.
+
+fn cqr_decompose(A, out_Q, out_R) {
+    var m = cmat_rows(A);
+    var n = cmat_cols(A);
+
+    # Copy A into out_R
+    var i = 0;
+    while (i < m) {
+        var j = 0;
+        while (j < n) {
+            cmat_set(out_R, i, j, cmat_get(A, i, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    # Initialize out_Q to m x m identity
+    i = 0;
+    while (i < m) {
+        var j = 0;
+        while (j < m) {
+            if (i == j) {
+                cmat_set(out_Q, i, j, cx_one());
+            } else {
+                cmat_set(out_Q, i, j, cx_zero());
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var min_mn = m;
+    if (n < min_mn) { min_mn = n; }
+
+    var k = 0;
+    while (k < min_mn) {
+        var len = m - k;
+
+        # Extract column k below diagonal as complex vector (flat: len * 16 bytes)
+        var v = alloc(len * 16);
+        i = 0;
+        while (i < len) {
+            var elem = cmat_get(out_R, k + i, k);
+            store64(v + i * 16, HComplex_re(elem));
+            store64(v + i * 16 + 8, HComplex_im(elem));
+            i = i + 1;
+        }
+
+        # Compute ||v|| (real-valued 2-norm)
+        var norm_sq = f64_from(0);
+        i = 0;
+        while (i < len) {
+            var re = load64(v + i * 16);
+            var im = load64(v + i * 16 + 8);
+            norm_sq = f64_add(norm_sq, f64_add(f64_mul(re, re), f64_mul(im, im)));
+            i = i + 1;
+        }
+        var norm = f64_sqrt(norm_sq);
+
+        if (f64_gt(norm, EPSILON_F64) == 1) {
+            # Complex sign: sign(x1) = x1 / |x1| if x1 != 0, else 1
+            var x1 = cx_new(load64(v), load64(v + 8));
+            var abs_x1 = cx_abs(x1);
+            var phase = cx_one();
+            if (f64_gt(abs_x1, EPSILON_F64) == 1) {
+                phase = cx_div(x1, cx_real(abs_x1));
+            }
+
+            # v[0] += phase * ||v||
+            var shift = cx_scale(phase, norm);
+            var new_v0 = cx_add(x1, shift);
+            store64(v, HComplex_re(new_v0));
+            store64(v + 8, HComplex_im(new_v0));
+
+            # Compute v^H * v (real, since it's a norm squared)
+            var vhv = f64_from(0);
+            i = 0;
+            while (i < len) {
+                var re = load64(v + i * 16);
+                var im = load64(v + i * 16 + 8);
+                vhv = f64_add(vhv, f64_add(f64_mul(re, re), f64_mul(im, im)));
+                i = i + 1;
+            }
+
+            if (f64_gt(vhv, EPSILON_F64) == 1) {
+                var two_over_vhv = f64_div(F64_TWO, vhv);
+
+                # Apply H to out_R: R[k:m, k:n] -= (2/vHv) * v * (v^H * R[k:m, k:n])
+                var j = k;
+                while (j < n) {
+                    # dot = v^H * R[:, j] (complex dot product with conjugate of v)
+                    var dot = cx_zero();
+                    i = 0;
+                    while (i < len) {
+                        var vi_conj = cx_conj(cx_new(load64(v + i * 16),
+                                                     load64(v + i * 16 + 8)));
+                        var rij = cmat_get(out_R, k + i, j);
+                        dot = cx_add(dot, cx_mul(vi_conj, rij));
+                        i = i + 1;
+                    }
+                    var coeff = cx_scale(dot, two_over_vhv);
+                    i = 0;
+                    while (i < len) {
+                        var vi = cx_new(load64(v + i * 16), load64(v + i * 16 + 8));
+                        var rij = cmat_get(out_R, k + i, j);
+                        cmat_set(out_R, k + i, j, cx_sub(rij, cx_mul(coeff, vi)));
+                        i = i + 1;
+                    }
+                    j = j + 1;
+                }
+
+                # Apply H to out_Q: Q[k:m, :] -= (2/vHv) * v * (v^H * Q[k:m, :])
+                # We accumulate Q^H, then transpose at the end.
+                j = 0;
+                while (j < m) {
+                    var dot = cx_zero();
+                    i = 0;
+                    while (i < len) {
+                        var vi_conj = cx_conj(cx_new(load64(v + i * 16),
+                                                     load64(v + i * 16 + 8)));
+                        var qij = cmat_get(out_Q, k + i, j);
+                        dot = cx_add(dot, cx_mul(vi_conj, qij));
+                        i = i + 1;
+                    }
+                    var coeff = cx_scale(dot, two_over_vhv);
+                    i = 0;
+                    while (i < len) {
+                        var vi = cx_new(load64(v + i * 16), load64(v + i * 16 + 8));
+                        var qij = cmat_get(out_Q, k + i, j);
+                        cmat_set(out_Q, k + i, j, cx_sub(qij, cx_mul(coeff, vi)));
+                        i = i + 1;
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+
+        k = k + 1;
+    }
+
+    # Q has accumulated H_k ... H_1. Take conjugate transpose to get Q where A = QR.
+    var Qt = cmat_adjoint(out_Q);
+    i = 0;
+    while (i < m) {
+        var j = 0;
+        while (j < m) {
+            cmat_set(out_Q, i, j, cmat_get(Qt, i, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return ERR_NONE;
+}

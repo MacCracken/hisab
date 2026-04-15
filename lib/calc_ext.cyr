@@ -1,0 +1,799 @@
+# calc_ext.cyr — multivariate calculus, adaptive integration, advanced splines, 3D Perlin noise
+# Usage: include "lib/calc_ext.cyr"
+# Requires: math.cyr, f64_util.cyr, fnptr.cyr, vec3.cyr, vec.cyr, alloc.cyr, error.cyr, calc.cyr
+
+# ================================================================
+# CONSTANTS
+# ================================================================
+
+var F64_THREE  = 0x4008_0000_0000_0000;  # 3.0
+var F64_FOUR   = 0x4010_0000_0000_0000;  # 4.0
+var F64_NINE   = 0x4022_0000_0000_0000;  # 9.0
+var F64_FIFTEEN = 0x402E_0000_0000_0000; # 15.0
+var F64_SIX    = 0x4018_0000_0000_0000;  # 6.0
+
+# 1e-30 as f64 (for zero-secant detection in monotone cubic)
+var F64_1E_NEG30 = 0x39B4_484B_FEE9_F7CF;
+
+# ================================================================
+# HELPERS: flat f64 array manipulation
+# ================================================================
+
+# Allocate a flat f64 array of n elements (zeroed by bump allocator)
+fn _f64arr_alloc(n) {
+    return alloc(n * 8);
+}
+
+# Copy n f64 values from src to dst
+fn _f64arr_copy(dst, src, n) {
+    var i = 0;
+    while (i < n) {
+        store64(dst + i * 8, load64(src + i * 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Get the i-th f64 from a flat array
+fn _f64arr_get(arr, i) {
+    return load64(arr + i * 8);
+}
+
+# Set the i-th f64 in a flat array
+fn _f64arr_set(arr, i, val) {
+    store64(arr + i * 8, val);
+    return 0;
+}
+
+# ================================================================
+# 1. MULTIVARIATE CALCULUS
+# ================================================================
+
+# Partial derivative of f:R^n -> R with respect to variable at index.
+# f: function pointer, fncall1(f, x_ptr) -> f64 (scalar).
+# x: pointer to flat f64 array of n values.
+# n: dimension count, index: variable index, h: step size (f64).
+# Returns f64 (the partial derivative), or 0 on error.
+fn calc_partial_derivative(f, x, n, index, h) {
+    if (index >= n) { return 0; }
+
+    # Allocate x_plus and x_minus buffers
+    var x_plus = _f64arr_alloc(n);
+    var x_minus = _f64arr_alloc(n);
+    _f64arr_copy(x_plus, x, n);
+    _f64arr_copy(x_minus, x, n);
+
+    # Perturb the index-th component
+    var xi = _f64arr_get(x, index);
+    _f64arr_set(x_plus, index, f64_add(xi, h));
+    _f64arr_set(x_minus, index, f64_sub(xi, h));
+
+    var f_plus = fncall1(f, x_plus);
+    var f_minus = fncall1(f, x_minus);
+
+    # Central difference: (f(x+h*e_i) - f(x-h*e_i)) / (2h)
+    return f64_div(f64_sub(f_plus, f_minus), f64_mul(F64_TWO, h));
+}
+
+# Gradient of f:R^n -> R at x.
+# f: function pointer, fncall1(f, x_ptr) -> f64.
+# x: pointer to flat f64[n], n: dimension, h: step size (f64).
+# out: pointer to flat f64[n] to receive gradient components.
+# Returns ERR_NONE on success, ERR_INVALID_INPUT if n == 0.
+fn calc_gradient(f, x, n, h, out) {
+    if (n == 0) { return ERR_INVALID_INPUT; }
+
+    var x_buf = _f64arr_alloc(n);
+    _f64arr_copy(x_buf, x, n);
+
+    var inv_2h = f64_div(F64_ONE, f64_mul(F64_TWO, h));
+    var i = 0;
+    while (i < n) {
+        var xi = _f64arr_get(x, i);
+
+        # f(x + h*e_i)
+        _f64arr_set(x_buf, i, f64_add(xi, h));
+        var f_plus = fncall1(f, x_buf);
+
+        # f(x - h*e_i)
+        _f64arr_set(x_buf, i, f64_sub(xi, h));
+        var f_minus = fncall1(f, x_buf);
+
+        # Restore
+        _f64arr_set(x_buf, i, xi);
+
+        _f64arr_set(out, i, f64_mul(f64_sub(f_plus, f_minus), inv_2h));
+        i = i + 1;
+    }
+    return ERR_NONE;
+}
+
+# Jacobian matrix of f:R^n_in -> R^n_out at x.
+# f: function pointer, fncall2(f, x_ptr, out_ptr) — f writes n_out f64 values to out_ptr.
+# x: pointer to flat f64[n_in], n_in: input dim, n_out: output dim.
+# h: step size (f64).
+# out: pointer to flat f64[n_out * n_in] (row-major: J[i][j] = out[i*n_in + j]).
+# Returns ERR_NONE on success, ERR_INVALID_INPUT if n_in or n_out == 0.
+fn calc_jacobian(f, x, n_in, n_out, h, out) {
+    if (n_in == 0) { return ERR_INVALID_INPUT; }
+    if (n_out == 0) { return ERR_INVALID_INPUT; }
+
+    var x_buf = _f64arr_alloc(n_in);
+    _f64arr_copy(x_buf, x, n_in);
+
+    var f_plus = _f64arr_alloc(n_out);
+    var f_minus = _f64arr_alloc(n_out);
+
+    var inv_2h = f64_div(F64_ONE, f64_mul(F64_TWO, h));
+
+    var j = 0;
+    while (j < n_in) {
+        var xj = _f64arr_get(x, j);
+
+        # f(x + h*e_j)
+        _f64arr_set(x_buf, j, f64_add(xj, h));
+        fncall2(f, x_buf, f_plus);
+
+        # f(x - h*e_j)
+        _f64arr_set(x_buf, j, f64_sub(xj, h));
+        fncall2(f, x_buf, f_minus);
+
+        # Restore
+        _f64arr_set(x_buf, j, xj);
+
+        # Fill column j of the Jacobian
+        var i = 0;
+        while (i < n_out) {
+            var fp_i = _f64arr_get(f_plus, i);
+            var fm_i = _f64arr_get(f_minus, i);
+            # J[i][j] = (f_plus[i] - f_minus[i]) / (2h)
+            _f64arr_set(out, i * n_in + j, f64_mul(f64_sub(fp_i, fm_i), inv_2h));
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+    return ERR_NONE;
+}
+
+# Hessian matrix of f:R^n -> R at x.
+# f: function pointer, fncall1(f, x_ptr) -> f64.
+# x: pointer to flat f64[n], n: dimension, h: step size (f64).
+# out: pointer to flat f64[n*n] (row-major: H[i][j] = out[i*n + j]).
+# Returns ERR_NONE on success, ERR_INVALID_INPUT if n == 0.
+fn calc_hessian(f, x, n, h, out) {
+    if (n == 0) { return ERR_INVALID_INPUT; }
+
+    var x_buf = _f64arr_alloc(n);
+    _f64arr_copy(x_buf, x, n);
+
+    var f0 = fncall1(f, x);
+    var h2 = f64_mul(h, h);
+
+    # Diagonal: d^2f/dx_i^2 = (f(x+h*e_i) - 2*f(x) + f(x-h*e_i)) / h^2
+    var i = 0;
+    while (i < n) {
+        var xi = _f64arr_get(x, i);
+
+        _f64arr_set(x_buf, i, f64_add(xi, h));
+        var fp = fncall1(f, x_buf);
+
+        _f64arr_set(x_buf, i, f64_sub(xi, h));
+        var fm = fncall1(f, x_buf);
+
+        _f64arr_set(x_buf, i, xi);
+
+        # (fp - 2*f0 + fm) / h^2
+        var diag = f64_div(f64_add(f64_sub(fp, f64_mul(F64_TWO, f0)), fm), h2);
+        _f64arr_set(out, i * n + i, diag);
+        i = i + 1;
+    }
+
+    # Off-diagonal: d^2f/dx_i dx_j (symmetric)
+    # = (f(x+h*e_i+h*e_j) - f(x+h*e_i-h*e_j) - f(x-h*e_i+h*e_j) + f(x-h*e_i-h*e_j)) / (4h^2)
+    var inv_4h2 = f64_div(F64_ONE, f64_mul(F64_FOUR, h2));
+
+    i = 0;
+    while (i < n) {
+        var j = i + 1;
+        while (j < n) {
+            var xi = _f64arr_get(x, i);
+            var xj = _f64arr_get(x, j);
+
+            # f(x + h*e_i + h*e_j)
+            _f64arr_set(x_buf, i, f64_add(xi, h));
+            _f64arr_set(x_buf, j, f64_add(xj, h));
+            var fpp = fncall1(f, x_buf);
+
+            # f(x + h*e_i - h*e_j)
+            _f64arr_set(x_buf, j, f64_sub(xj, h));
+            var fpm = fncall1(f, x_buf);
+
+            # f(x - h*e_i - h*e_j)
+            _f64arr_set(x_buf, i, f64_sub(xi, h));
+            var fmm = fncall1(f, x_buf);
+
+            # f(x - h*e_i + h*e_j)
+            _f64arr_set(x_buf, j, f64_add(xj, h));
+            var fmp = fncall1(f, x_buf);
+
+            # Restore
+            _f64arr_set(x_buf, i, xi);
+            _f64arr_set(x_buf, j, xj);
+
+            var val = f64_mul(f64_add(f64_sub(fpp, fpm), f64_sub(fmm, fmp)), inv_4h2);
+            _f64arr_set(out, i * n + j, val);
+            _f64arr_set(out, j * n + i, val);
+
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return ERR_NONE;
+}
+
+# ================================================================
+# 2. ADAPTIVE SIMPSON INTEGRATION
+# ================================================================
+
+# Recursive helper for adaptive Simpson's rule.
+# f: function pointer, a/b: interval (f64), fa/fb/fmid: endpoint+midpoint values,
+# whole: Simpson estimate over [a,b], tol: tolerance (f64), depth: max recursion.
+# Returns f64 result. On max-depth exhaustion returns best estimate.
+fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
+    if (depth == 0) {
+        # Return best estimate at max depth (cannot error in Cyrius — no Result type)
+        return whole;
+    }
+
+    var mid = f64_mul(f64_add(a, b), F64_HALF);
+    var left_mid = f64_mul(f64_add(a, mid), F64_HALF);
+    var right_mid = f64_mul(f64_add(mid, b), F64_HALF);
+    var flm = fncall1(f, left_mid);
+    var frm = fncall1(f, right_mid);
+
+    var h = f64_mul(f64_sub(b, a), F64_HALF);
+    var h_over_6 = f64_div(h, F64_SIX);
+
+    # Left Simpson: h/6 * (fa + 4*flm + fmid)
+    var left_val = f64_mul(h_over_6,
+        f64_add(f64_add(fa, f64_mul(F64_FOUR, flm)), fmid));
+
+    # Right Simpson: h/6 * (fmid + 4*frm + fb)
+    var right_val = f64_mul(h_over_6,
+        f64_add(f64_add(fmid, f64_mul(F64_FOUR, frm)), fb));
+
+    var refined = f64_add(left_val, right_val);
+
+    # Richardson extrapolation error estimate
+    var error = f64_div(f64_sub(refined, whole), F64_FIFTEEN);
+
+    if (f64_lt(f64_abs(error), tol) == 1) {
+        return f64_add(refined, error);
+    }
+
+    var half_tol = f64_mul(tol, F64_HALF);
+    var left_result = _adaptive_simpson_rec(f, a, mid, fa, fmid, flm,
+        left_val, half_tol, depth - 1);
+    var right_result = _adaptive_simpson_rec(f, mid, b, fmid, fb, frm,
+        right_val, half_tol, depth - 1);
+    return f64_add(left_result, right_result);
+}
+
+# Adaptive Simpson's rule for numerical integration.
+# f: function pointer (f64 -> f64), a/b: interval bounds (f64), tol: tolerance (f64).
+# Returns f64 result. Recursively bisects until error < tol (max depth 50).
+fn calc_adaptive_simpson(f, a, b, tol) {
+    var fa = fncall1(f, a);
+    var fb = fncall1(f, b);
+    var mid = f64_mul(f64_add(a, b), F64_HALF);
+    var fmid = fncall1(f, mid);
+
+    # Initial Simpson estimate: (b-a)/6 * (fa + 4*fmid + fb)
+    var whole = f64_mul(f64_div(f64_sub(b, a), F64_SIX),
+        f64_add(f64_add(fa, f64_mul(F64_FOUR, fmid)), fb));
+
+    return _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, 50);
+}
+
+# ================================================================
+# 3. B-SPLINE EVALUATION (de Boor's algorithm)
+# ================================================================
+
+# Evaluate a B-spline of arbitrary degree using de Boor's algorithm.
+# degree: spline degree (integer), ctrl_pts: array of HVec3 pointers (flat, 8 bytes each),
+# n_pts: number of control points, knots: flat f64 array, n_knots: knot count,
+# t: parameter value (f64).
+# Returns HVec3 pointer, or 0 if inputs are invalid / t out of range.
+fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
+    if (n_pts == 0) { return 0; }
+    if (n_knots != n_pts + degree + 1) { return 0; }
+
+    # Check t in valid range [knots[degree], knots[n_pts]]
+    var t_min = _f64arr_get(knots, degree);
+    var t_max = _f64arr_get(knots, n_pts);
+    if (f64_lt(t, t_min) == 1) { return 0; }
+    if (f64_lt(t_max, t) == 1) { return 0; }
+
+    # Find knot span: largest k such that knots[k] <= t, k in [degree, n_pts-1]
+    var k = degree;
+    while (k < n_pts - 1) {
+        var knext = _f64arr_get(knots, k + 1);
+        if (f64_lt(t, knext) == 1) {
+            # knots[k+1] > t, so knots[k] <= t < knots[k+1]
+            # but we need <= so break here
+            # Actually we need: while knots[k+1] <= t, advance
+            # So if t < knots[k+1], stop
+            k = k;  # no-op, break
+            # break out of loop
+            k = k + n_pts;  # sentinel to exit
+        }
+        if (k < n_pts) {
+            k = k + 1;
+        }
+    }
+    # Undo sentinel if triggered
+    if (k >= n_pts) {
+        k = k - n_pts;
+    }
+
+    # De Boor's algorithm: work with (degree+1) points
+    # Allocate temporary arrays for x, y, z components
+    var dp1 = degree + 1;
+    var dx = _f64arr_alloc(dp1);
+    var dy = _f64arr_alloc(dp1);
+    var dz = _f64arr_alloc(dp1);
+
+    # Initialize with control points [k-degree .. k]
+    var j = 0;
+    while (j <= degree) {
+        var idx = k - degree + j;
+        var cp = load64(ctrl_pts + idx * 8);  # HVec3 pointer
+        _f64arr_set(dx, j, HVec3_x(cp));
+        _f64arr_set(dy, j, HVec3_y(cp));
+        _f64arr_set(dz, j, HVec3_z(cp));
+        j = j + 1;
+    }
+
+    # De Boor triangular computation
+    var r = 1;
+    while (r <= degree) {
+        j = degree;
+        while (j >= r) {
+            var idx = k - degree + j;
+            var ki = _f64arr_get(knots, idx);
+            var ki_dr = _f64arr_get(knots, idx + degree + 1 - r);
+            var denom = f64_sub(ki_dr, ki);
+
+            if (f64_lt(f64_abs(denom), EPSILON_F64) == 0) {
+                var alpha = f64_div(f64_sub(t, ki), denom);
+                var one_minus = f64_sub(F64_ONE, alpha);
+
+                var prev_x = _f64arr_get(dx, j - 1);
+                var cur_x = _f64arr_get(dx, j);
+                _f64arr_set(dx, j, f64_add(f64_mul(one_minus, prev_x), f64_mul(alpha, cur_x)));
+
+                var prev_y = _f64arr_get(dy, j - 1);
+                var cur_y = _f64arr_get(dy, j);
+                _f64arr_set(dy, j, f64_add(f64_mul(one_minus, prev_y), f64_mul(alpha, cur_y)));
+
+                var prev_z = _f64arr_get(dz, j - 1);
+                var cur_z = _f64arr_get(dz, j);
+                _f64arr_set(dz, j, f64_add(f64_mul(one_minus, prev_z), f64_mul(alpha, cur_z)));
+            }
+
+            j = j - 1;
+        }
+        r = r + 1;
+    }
+
+    return hvec3_new(_f64arr_get(dx, degree), _f64arr_get(dy, degree), _f64arr_get(dz, degree));
+}
+
+# ================================================================
+# 4. NURBS EVALUATION
+# ================================================================
+
+# Evaluate a NURBS (Non-Uniform Rational B-Spline) curve at parameter t.
+# degree: spline degree, ctrl_pts: array of HVec3 pointers (flat, 8 bytes each),
+# weights: flat f64 array of per-point weights, n_pts: number of control points,
+# knots: flat f64 array, n_knots: knot count, t: parameter value (f64).
+# Returns HVec3 pointer, or 0 if invalid.
+fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
+    if (n_pts == 0) { return 0; }
+    if (n_knots != n_pts + degree + 1) { return 0; }
+
+    var t_min = _f64arr_get(knots, degree);
+    var t_max = _f64arr_get(knots, n_pts);
+    if (f64_lt(t, t_min) == 1) { return 0; }
+    if (f64_lt(t_max, t) == 1) { return 0; }
+
+    # Find knot span
+    var k = degree;
+    while (k < n_pts - 1) {
+        var knext = _f64arr_get(knots, k + 1);
+        if (f64_lt(t, knext) == 1) {
+            k = k + n_pts;
+        }
+        if (k < n_pts) {
+            k = k + 1;
+        }
+    }
+    if (k >= n_pts) {
+        k = k - n_pts;
+    }
+
+    # De Boor on homogeneous coordinates (wx, wy, wz, w)
+    var dp1 = degree + 1;
+    var pw_x = _f64arr_alloc(dp1);
+    var pw_y = _f64arr_alloc(dp1);
+    var pw_z = _f64arr_alloc(dp1);
+    var pw_w = _f64arr_alloc(dp1);
+
+    var j = 0;
+    while (j <= degree) {
+        var idx = k - degree + j;
+        var cp = load64(ctrl_pts + idx * 8);
+        var w = _f64arr_get(weights, idx);
+        _f64arr_set(pw_x, j, f64_mul(HVec3_x(cp), w));
+        _f64arr_set(pw_y, j, f64_mul(HVec3_y(cp), w));
+        _f64arr_set(pw_z, j, f64_mul(HVec3_z(cp), w));
+        _f64arr_set(pw_w, j, w);
+        j = j + 1;
+    }
+
+    # De Boor triangular computation on 4-component homogeneous coords
+    var r = 1;
+    while (r <= degree) {
+        j = degree;
+        while (j >= r) {
+            var idx = k - degree + j;
+            var ki = _f64arr_get(knots, idx);
+            var ki_dr = _f64arr_get(knots, idx + degree + 1 - r);
+            var denom = f64_sub(ki_dr, ki);
+
+            if (f64_lt(f64_abs(denom), EPSILON_F64) == 0) {
+                var alpha = f64_div(f64_sub(t, ki), denom);
+                var one_minus = f64_sub(F64_ONE, alpha);
+
+                var px = f64_add(f64_mul(one_minus, _f64arr_get(pw_x, j - 1)),
+                                 f64_mul(alpha, _f64arr_get(pw_x, j)));
+                var py = f64_add(f64_mul(one_minus, _f64arr_get(pw_y, j - 1)),
+                                 f64_mul(alpha, _f64arr_get(pw_y, j)));
+                var pz = f64_add(f64_mul(one_minus, _f64arr_get(pw_z, j - 1)),
+                                 f64_mul(alpha, _f64arr_get(pw_z, j)));
+                var pw = f64_add(f64_mul(one_minus, _f64arr_get(pw_w, j - 1)),
+                                 f64_mul(alpha, _f64arr_get(pw_w, j)));
+
+                _f64arr_set(pw_x, j, px);
+                _f64arr_set(pw_y, j, py);
+                _f64arr_set(pw_z, j, pz);
+                _f64arr_set(pw_w, j, pw);
+            }
+
+            j = j - 1;
+        }
+        r = r + 1;
+    }
+
+    # Perspective divide
+    var final_w = _f64arr_get(pw_w, degree);
+    if (f64_lt(f64_abs(final_w), EPSILON_F64) == 1) { return 0; }
+
+    return hvec3_new(
+        f64_div(_f64arr_get(pw_x, degree), final_w),
+        f64_div(_f64arr_get(pw_y, degree), final_w),
+        f64_div(_f64arr_get(pw_z, degree), final_w));
+}
+
+# ================================================================
+# 5. HERMITE TCB SPLINE (Kochanek-Bartels)
+# ================================================================
+
+# Evaluate a Kochanek-Bartels (TCB) Hermite spline at parameter t.
+# times: flat f64 array of n key times (sorted), values: flat f64 array of n key values,
+# n: number of keys, tension/continuity/bias: f64 TCB parameters, t: f64 parameter.
+# Returns f64 interpolated value. If t <= times[0] returns values[0],
+# if t >= times[n-1] returns values[n-1]. Requires n >= 2.
+fn calc_hermite_tcb(times, values, n, tension, continuity, bias, t) {
+    if (n < 2) { return 0; }
+
+    # Clamp to range
+    var t0 = _f64arr_get(times, 0);
+    var tn = _f64arr_get(times, n - 1);
+    if (f64_lt(t, t0) == 1) { return _f64arr_get(values, 0); }
+    if (f64_lt(tn, t) == 1) { return _f64arr_get(values, n - 1); }
+    if (f64_lt(f64_abs(f64_sub(t, tn)), EPSILON_F64) == 1) { return _f64arr_get(values, n - 1); }
+
+    # Find segment: largest k such that times[k] <= t and k < n-1
+    var seg = 0;
+    while (seg < n - 2) {
+        var tnext = _f64arr_get(times, seg + 1);
+        if (f64_lt(t, tnext) == 1) {
+            seg = seg + n;  # sentinel break
+        }
+        if (seg < n - 1) {
+            seg = seg + 1;
+        }
+    }
+    if (seg >= n) { seg = seg - n; }
+
+    # Local parameter u in [0, 1] within the segment
+    var t_seg_start = _f64arr_get(times, seg);
+    var t_seg_end = _f64arr_get(times, seg + 1);
+    var seg_len = f64_sub(t_seg_end, t_seg_start);
+    var u = 0;
+    if (f64_lt(f64_abs(seg_len), EPSILON_F64) == 0) {
+        u = f64_div(f64_sub(t, t_seg_start), seg_len);
+    }
+
+    # Get the 4 values: p0, p1, p2, p3
+    # p1 = values[seg], p2 = values[seg+1]
+    # p0 = values[seg-1] if seg > 0, else p1
+    # p3 = values[seg+2] if seg+2 < n, else p2
+    var p1 = _f64arr_get(values, seg);
+    var p2 = _f64arr_get(values, seg + 1);
+    var p0 = p1;
+    if (seg > 0) { p0 = _f64arr_get(values, seg - 1); }
+    var p3 = p2;
+    if (seg + 2 < n) { p3 = _f64arr_get(values, seg + 2); }
+
+    # TCB tangent computation
+    return _hermite_tcb_segment(p0, p1, p2, p3, u, tension, continuity, bias);
+}
+
+# Internal: evaluate a single TCB Hermite segment for scalar values.
+# p0..p3: f64 values (p1/p2 are interpolated endpoints), u: local param [0,1].
+fn _hermite_tcb_segment(p0, p1, p2, p3, u, tension, continuity, bias) {
+    # Outgoing tangent at p1
+    # a = (1-T)(1+C)(1+B) / 2
+    # b = (1-T)(1-C)(1-B) / 2
+    var one_minus_t = f64_sub(F64_ONE, tension);
+    var one_plus_c = f64_add(F64_ONE, continuity);
+    var one_minus_c = f64_sub(F64_ONE, continuity);
+    var one_plus_b = f64_add(F64_ONE, bias);
+    var one_minus_b = f64_sub(F64_ONE, bias);
+
+    var a = f64_mul(F64_HALF, f64_mul(one_minus_t, f64_mul(one_plus_c, one_plus_b)));
+    var b = f64_mul(F64_HALF, f64_mul(one_minus_t, f64_mul(one_minus_c, one_minus_b)));
+    var m0 = f64_add(f64_mul(a, f64_sub(p1, p0)), f64_mul(b, f64_sub(p2, p1)));
+
+    # Incoming tangent at p2
+    # c = (1-T)(1-C)(1+B) / 2
+    # d = (1-T)(1+C)(1-B) / 2
+    var c = f64_mul(F64_HALF, f64_mul(one_minus_t, f64_mul(one_minus_c, one_plus_b)));
+    var d = f64_mul(F64_HALF, f64_mul(one_minus_t, f64_mul(one_plus_c, one_minus_b)));
+    var m1 = f64_add(f64_mul(c, f64_sub(p2, p1)), f64_mul(d, f64_sub(p3, p2)));
+
+    # Cubic Hermite basis
+    var u2 = f64_mul(u, u);
+    var u3 = f64_mul(u2, u);
+
+    # h00 =  2u^3 - 3u^2 + 1
+    var h00 = f64_add(f64_sub(f64_mul(F64_TWO, u3), f64_mul(F64_THREE, u2)), F64_ONE);
+    # h10 =  u^3 - 2u^2 + u
+    var h10 = f64_add(f64_sub(u3, f64_mul(F64_TWO, u2)), u);
+    # h01 = -2u^3 + 3u^2
+    var h01 = f64_add(f64_mul(f64_neg(F64_TWO), u3), f64_mul(F64_THREE, u2));
+    # h11 =  u^3 - u^2
+    var h11 = f64_sub(u3, u2);
+
+    return f64_add(f64_add(f64_add(
+        f64_mul(h00, p1),
+        f64_mul(h10, m0)),
+        f64_mul(h01, p2)),
+        f64_mul(h11, m1));
+}
+
+# ================================================================
+# 6. MONOTONE CUBIC INTERPOLATION (Fritsch-Carlson)
+# ================================================================
+
+# Monotone cubic interpolation using the Fritsch-Carlson method.
+# xs: flat f64 array of n sorted x-values, ys: flat f64 array of n y-values,
+# n: number of points (>= 2), x: query point (f64).
+# Returns f64 interpolated value. Returns 0 if n < 2 or x out of range.
+fn calc_monotone_cubic(xs, ys, n, x) {
+    if (n < 2) { return 0; }
+
+    var x0 = _f64arr_get(xs, 0);
+    var xn = _f64arr_get(xs, n - 1);
+    if (f64_lt(x, x0) == 1) { return 0; }
+    if (f64_lt(xn, x) == 1) { return 0; }
+
+    var nm1 = n - 1;
+
+    # Compute secants (deltas) and interval widths (hs)
+    var deltas = _f64arr_alloc(nm1);
+    var hs = _f64arr_alloc(nm1);
+    var i = 0;
+    while (i < nm1) {
+        var hi = f64_sub(_f64arr_get(xs, i + 1), _f64arr_get(xs, i));
+        if (f64_lt(hi, EPSILON_F64) == 1) { return 0; }  # Not sorted
+        _f64arr_set(hs, i, hi);
+        _f64arr_set(deltas, i, f64_div(f64_sub(_f64arr_get(ys, i + 1), _f64arr_get(ys, i)), hi));
+        i = i + 1;
+    }
+
+    # Initial tangents: average of adjacent secants
+    var ms = _f64arr_alloc(n);
+    _f64arr_set(ms, 0, _f64arr_get(deltas, 0));
+    _f64arr_set(ms, nm1, _f64arr_get(deltas, nm1 - 1));
+    i = 1;
+    while (i < nm1) {
+        var avg = f64_mul(F64_HALF, f64_add(_f64arr_get(deltas, i - 1), _f64arr_get(deltas, i)));
+        _f64arr_set(ms, i, avg);
+        i = i + 1;
+    }
+
+    # Fritsch-Carlson monotonicity constraint
+    i = 0;
+    while (i < nm1) {
+        var di = _f64arr_get(deltas, i);
+        if (f64_lt(f64_abs(di), F64_1E_NEG30) == 1) {
+            # Flat segment: zero tangents
+            _f64arr_set(ms, i, 0);
+            _f64arr_set(ms, i + 1, 0);
+        } else {
+            var alpha = f64_div(_f64arr_get(ms, i), di);
+            var beta = f64_div(_f64arr_get(ms, i + 1), di);
+            var s = f64_add(f64_mul(alpha, alpha), f64_mul(beta, beta));
+            if (f64_lt(F64_NINE, s) == 1) {
+                # s > 9: constrain
+                var tau = f64_div(F64_THREE, f64_sqrt(s));
+                _f64arr_set(ms, i, f64_mul(f64_mul(tau, alpha), di));
+                _f64arr_set(ms, i + 1, f64_mul(f64_mul(tau, beta), di));
+            }
+        }
+        i = i + 1;
+    }
+
+    # Find interval: largest k such that xs[k] <= x and k < n-1
+    var k = 0;
+    while (k < nm1 - 1) {
+        var xk1 = _f64arr_get(xs, k + 1);
+        if (f64_lt(x, xk1) == 1) {
+            k = k + n;  # sentinel break
+        }
+        if (k < nm1) {
+            k = k + 1;
+        }
+    }
+    if (k >= n) { k = k - n; }
+
+    # Evaluate cubic Hermite on interval [xs[k], xs[k+1]]
+    var h_k = _f64arr_get(hs, k);
+    var t_param = f64_div(f64_sub(x, _f64arr_get(xs, k)), h_k);
+    var t2 = f64_mul(t_param, t_param);
+    var t3 = f64_mul(t2, t_param);
+
+    # h00 =  2t^3 - 3t^2 + 1
+    var h00 = f64_add(f64_sub(f64_mul(F64_TWO, t3), f64_mul(F64_THREE, t2)), F64_ONE);
+    # h10 = (t^3 - 2t^2 + t) * h
+    var h10 = f64_mul(f64_add(f64_sub(t3, f64_mul(F64_TWO, t2)), t_param), h_k);
+    # h01 = -2t^3 + 3t^2
+    var h01 = f64_add(f64_mul(f64_neg(F64_TWO), t3), f64_mul(F64_THREE, t2));
+    # h11 = (t^3 - t^2) * h
+    var h11 = f64_mul(f64_sub(t3, t2), h_k);
+
+    var yk = _f64arr_get(ys, k);
+    var yk1 = _f64arr_get(ys, k + 1);
+    var mk = _f64arr_get(ms, k);
+    var mk1 = _f64arr_get(ms, k + 1);
+
+    return f64_add(f64_add(f64_add(
+        f64_mul(h00, yk),
+        f64_mul(h10, mk)),
+        f64_mul(h01, yk1)),
+        f64_mul(h11, mk1));
+}
+
+# ================================================================
+# 7. 3D PERLIN NOISE (Improved, 12 gradients)
+# ================================================================
+
+# 3D gradient: 12 gradient vectors from improved Perlin noise.
+# hash: integer, x/y/z: f64 offsets.
+# Gradients: (1,1,0),(-1,1,0),(1,-1,0),(-1,-1,0),
+#            (1,0,1),(-1,0,1),(1,0,-1),(-1,0,-1),
+#            (0,1,1),(0,-1,1),(0,1,-1),(0,-1,-1)
+fn _grad3(hash, x, y, z) {
+    var h = hash % 12;
+    if (h == 0) { return f64_add(x, y); }
+    if (h == 1) { return f64_add(f64_neg(x), y); }
+    if (h == 2) { return f64_sub(x, y); }
+    if (h == 3) { return f64_sub(f64_neg(x), y); }
+    if (h == 4) { return f64_add(x, z); }
+    if (h == 5) { return f64_add(f64_neg(x), z); }
+    if (h == 6) { return f64_sub(x, z); }
+    if (h == 7) { return f64_sub(f64_neg(x), z); }
+    if (h == 8) { return f64_add(y, z); }
+    if (h == 9) { return f64_add(f64_neg(y), z); }
+    if (h == 10) { return f64_sub(y, z); }
+    # h == 11
+    return f64_sub(f64_neg(y), z);
+}
+
+# 3D improved Perlin noise. Returns f64 in approximately [-1, 1].
+# x, y, z: f64 coordinates.
+fn perlin_3d(x, y, z) {
+    _perm_init();  # Ensure permutation table is initialized (from calc.cyr)
+
+    # Grid cell coordinates (integer, masked to 0-255)
+    var xf = f64_floor(x);
+    var yf = f64_floor(y);
+    var zf = f64_floor(z);
+    var xi = f64_to(xf) & 255;
+    var yi = f64_to(yf) & 255;
+    var zi = f64_to(zf) & 255;
+
+    # Fractional position within cell
+    var xfr = f64_sub(x, xf);
+    var yfr = f64_sub(y, yf);
+    var zfr = f64_sub(z, zf);
+
+    # Fade curves (smootherstep: 6t^5 - 15t^4 + 10t^3)
+    var u = _noise_fade(xfr);
+    var v = _noise_fade(yfr);
+    var w = _noise_fade(zfr);
+
+    # Hash the 8 cube corners
+    var aaa = _perm(_perm(_perm(xi) + yi) + zi);
+    var aba = _perm(_perm(_perm(xi) + yi + 1) + zi);
+    var aab = _perm(_perm(_perm(xi) + yi) + zi + 1);
+    var abb = _perm(_perm(_perm(xi) + yi + 1) + zi + 1);
+    var baa = _perm(_perm(_perm(xi + 1) + yi) + zi);
+    var bba = _perm(_perm(_perm(xi + 1) + yi + 1) + zi);
+    var bab = _perm(_perm(_perm(xi + 1) + yi) + zi + 1);
+    var bbb = _perm(_perm(_perm(xi + 1) + yi + 1) + zi + 1);
+
+    # Gradient dot products at 8 corners
+    var xfr1 = f64_sub(xfr, F64_ONE);
+    var yfr1 = f64_sub(yfr, F64_ONE);
+    var zfr1 = f64_sub(zfr, F64_ONE);
+
+    var g000 = _grad3(aaa, xfr, yfr, zfr);
+    var g100 = _grad3(baa, xfr1, yfr, zfr);
+    var g010 = _grad3(aba, xfr, yfr1, zfr);
+    var g110 = _grad3(bba, xfr1, yfr1, zfr);
+    var g001 = _grad3(aab, xfr, yfr, zfr1);
+    var g101 = _grad3(bab, xfr1, yfr, zfr1);
+    var g011 = _grad3(abb, xfr, yfr1, zfr1);
+    var g111 = _grad3(bbb, xfr1, yfr1, zfr1);
+
+    # Trilinear interpolation
+    var x00 = calc_lerp(g000, g100, u);
+    var x10 = calc_lerp(g010, g110, u);
+    var x01 = calc_lerp(g001, g101, u);
+    var x11 = calc_lerp(g011, g111, u);
+
+    var y0 = calc_lerp(x00, x10, v);
+    var y1 = calc_lerp(x01, x11, v);
+
+    return calc_lerp(y0, y1, w);
+}
+
+# Fractional Brownian Motion (fBm) using 3D Perlin noise.
+# x, y, z: coordinates (f64), octaves: integer count,
+# freq: initial frequency (f64), amp: initial amplitude (f64),
+# persistence: amplitude multiplier per octave (f64, typically 0.5).
+# Returns: f64 noise value normalized to approximately [-1, 1].
+fn fbm_3d(x, y, z, octaves, freq, amp, persistence) {
+    var sum = 0;
+    var max_amp = 0;
+    var cur_freq = freq;
+    var cur_amp = amp;
+
+    var i = 0;
+    while (i < octaves) {
+        var nx = f64_mul(x, cur_freq);
+        var ny = f64_mul(y, cur_freq);
+        var nz = f64_mul(z, cur_freq);
+        sum = f64_add(sum, f64_mul(cur_amp, perlin_3d(nx, ny, nz)));
+        max_amp = f64_add(max_amp, cur_amp);
+        cur_amp = f64_mul(cur_amp, persistence);
+        cur_freq = f64_mul(cur_freq, F64_TWO);
+        i = i + 1;
+    }
+
+    return f64_div(sum, max_amp);
+}

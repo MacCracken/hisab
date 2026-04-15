@@ -1,0 +1,769 @@
+# num_ext.cyr — extended numerical methods for hisab
+# Usage: include "lib/num_ext.cyr"
+# Requires: alloc.cyr, vec.cyr, math.cyr, f64_util.cyr, error.cyr, num.cyr
+#
+# Provides:
+#   Number theory:   num_extended_gcd, num_euler_totient, num_mobius,
+#                    num_divisor_sigma, num_pollard_rho, num_factorize,
+#                    num_crt, num_continued_fraction_rational, num_modinv
+#   DST/DCT:         num_dst, num_idst, num_dct, num_idct
+#   2D FFT:          num_fft_2d, num_ifft_2d
+#   Quasi-random:    num_halton, num_halton_2d, num_sobol
+#   Tridiagonal:     num_tridiag_solve
+#
+# All f64 values are bit patterns (IEEE 754). Integer arguments are raw i64.
+# Functions return 0 (ERR_NONE) on success, negative ERR_* on failure.
+# Results are written through out-param pointers where noted.
+
+# ================================================================
+# Constants (f64 bit patterns)
+# ================================================================
+var _NUMX_F64_ZERO  = 0;                           # 0.0
+var _NUMX_F64_ONE   = 0x3FF0000000000000;          # 1.0
+var _NUMX_F64_TWO   = 0x4000000000000000;          # 2.0
+var _NUMX_F64_NEG1  = 0xBFF0000000000000;          # -1.0
+var _NUMX_F64_HALF  = 0x3FE0000000000000;          # 0.5
+var _NUMX_F64_INV_2P32 = 0x3DF0000000000000;       # 2^-32
+
+# ================================================================
+# EXTENDED NUMBER THEORY
+# ================================================================
+
+# Extended Euclidean algorithm.
+# Returns gcd(a, b) and writes x, y to out_x, out_y such that ax + by = gcd.
+# a, b: integers (may be negative)
+# out_x, out_y: pointers where x and y are stored
+# Returns: gcd (non-negative)
+fn num_extended_gcd(a, b, out_x, out_y) {
+    # Iterative extended GCD to avoid stack overflow on deep recursion
+    var old_r = a;
+    var r = b;
+    var old_s = 1;
+    var s = 0;
+    var old_t = 0;
+    var t = 1;
+
+    # Handle negative inputs
+    var sign_a = 1;
+    var sign_b = 1;
+    if (old_r < 0) {
+        old_r = 0 - old_r;
+        sign_a = 0 - 1;
+    }
+    if (r < 0) {
+        r = 0 - r;
+        sign_b = 0 - 1;
+    }
+
+    while (r != 0) {
+        var q = old_r / r;
+
+        var tmp = r;
+        r = old_r - q * r;
+        old_r = tmp;
+
+        tmp = s;
+        s = old_s - q * s;
+        old_s = tmp;
+
+        tmp = t;
+        t = old_t - q * t;
+        old_t = tmp;
+    }
+
+    # Adjust signs back
+    store64(out_x, old_s * sign_a);
+    store64(out_y, old_t * sign_b);
+    return old_r;
+}
+
+# Modular inverse: returns a^(-1) mod m, or -1 if gcd(a, m) != 1.
+# a, m: positive integers
+# Returns: modular inverse, or -1 if not invertible
+fn num_modinv(a, m) {
+    if (m <= 0) { return 0 - 1; }
+    if (a < 0) { a = a % m + m; }
+
+    var out_x = alloc(8);
+    var out_y = alloc(8);
+    var g = num_extended_gcd(a, m, out_x, out_y);
+    if (g != 1) {
+        return 0 - 1;
+    }
+    var x = load64(out_x);
+    # Normalize to [0, m)
+    var result = ((x % m) + m) % m;
+    return result;
+}
+
+# Euler's totient function phi(n): count of integers in [1, n] coprime to n.
+# n: positive integer
+# Returns: phi(n)
+fn num_euler_totient(n) {
+    if (n == 0) { return 0; }
+    if (n == 1) { return 1; }
+
+    var factors = num_factorize(n);
+    var flen = vec_len(factors);
+    var result = n;
+    var prev = 0;
+    var i = 0;
+    while (i < flen) {
+        var p = vec_get(factors, i);
+        if (p != prev) {
+            result = result - result / p;
+            prev = p;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+# Mobius function mu(n).
+# Returns 1 if n is squarefree with even number of prime factors,
+# -1 if squarefree with odd number of prime factors,
+# 0 if n has a squared prime factor.
+fn num_mobius(n) {
+    if (n == 0) { return 0; }
+    if (n == 1) { return 1; }
+
+    var factors = num_factorize(n);
+    var flen = vec_len(factors);
+
+    # Check for repeated factors
+    var i = 0;
+    while (i < flen - 1) {
+        if (vec_get(factors, i) == vec_get(factors, i + 1)) {
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    if ((flen % 2) == 0) {
+        return 1;
+    }
+    return 0 - 1;
+}
+
+# Divisor sigma function sigma_k(n) = sum of d^k for all divisors d of n.
+# k = 0: number of divisors. k = 1: sum of divisors.
+# n: positive integer, k: non-negative integer
+# Returns: sigma_k(n)
+fn num_divisor_sigma(n, k) {
+    if (n == 0) { return 0; }
+    if (n == 1) { return 1; }
+
+    var sum = 0;
+    var d = 1;
+    while (d * d <= n) {
+        if (n % d == 0) {
+            # d^k via integer exponentiation
+            var dk = _numx_int_pow(d, k);
+            sum = sum + dk;
+            var other = n / d;
+            if (other != d) {
+                sum = sum + _numx_int_pow(other, k);
+            }
+        }
+        d = d + 1;
+    }
+    return sum;
+}
+
+# Internal: integer exponentiation base^exp (non-negative exp)
+fn _numx_int_pow(base, exp) {
+    if (exp == 0) { return 1; }
+    var result = 1;
+    var b = base;
+    var e = exp;
+    while (e > 0) {
+        if ((e & 1) == 1) {
+            result = result * b;
+        }
+        b = b * b;
+        e = e >> 1;
+    }
+    return result;
+}
+
+# Pollard's rho algorithm: finds a non-trivial factor of n.
+# Returns a factor of n, or n itself if n is prime.
+# n: integer > 1
+fn num_pollard_rho(n) {
+    if (n <= 1) { return n; }
+    if (n % 2 == 0) { return 2; }
+    if (num_is_prime(n) == 1) { return n; }
+
+    # Brent's improvement
+    var c = 1;
+    while (c < n) {
+        var x = 2;
+        var y = 2;
+        var d = 1;
+
+        while (d == 1) {
+            # x = (x*x + c) % n
+            x = (_num_mulmod(x, x, n) + c) % n;
+            # y = f(f(y))
+            y = (_num_mulmod(y, y, n) + c) % n;
+            y = (_num_mulmod(y, y, n) + c) % n;
+
+            var diff = x - y;
+            if (diff < 0) { diff = 0 - diff; }
+            d = num_gcd(diff, n);
+        }
+
+        if (d != n) {
+            return d;
+        }
+        c = c + 1;
+    }
+
+    # Fallback: return n (could not find factor)
+    return n;
+}
+
+# Full integer factorization using Pollard's rho with trial division.
+# Returns a vec of prime factors with multiplicity, sorted ascending.
+# n: integer > 0
+fn num_factorize(n) {
+    var factors = vec_new();
+    if (n <= 1) { return factors; }
+
+    # Trial division for small primes
+    var small = 2;
+    while (small <= 37) {
+        while (n > 1 && n % small == 0) {
+            vec_push(factors, small);
+            n = n / small;
+        }
+        # Next candidate: 2 -> 3, then odd numbers
+        if (small == 2) { small = 3; }
+        elif (small == 3) { small = 5; }
+        elif (small == 5) { small = 7; }
+        elif (small == 7) { small = 11; }
+        elif (small == 11) { small = 13; }
+        elif (small == 13) { small = 17; }
+        elif (small == 17) { small = 19; }
+        elif (small == 19) { small = 23; }
+        elif (small == 23) { small = 29; }
+        elif (small == 29) { small = 31; }
+        elif (small == 31) { small = 37; }
+        else { small = 38; }   # exit
+    }
+
+    if (n <= 1) { return factors; }
+
+    # Use a stack (vec) for recursive rho factorization
+    var stack = vec_new();
+    vec_push(stack, n);
+
+    while (vec_len(stack) > 0) {
+        var slen = vec_len(stack);
+        var m = vec_get(stack, slen - 1);
+        # Pop by creating new stack without last element
+        # (simple approach: rebuild, or use a top-index)
+        # We'll use a manual index approach
+        vec_set(stack, slen - 1, 0);
+        # Shrink: we reuse the vec but track length manually
+        # Since vec doesn't have pop, we'll use an index-based stack
+        # Re-approach: use separate index tracking
+        break;
+    }
+
+    # Simpler approach: iterative rho decomposition
+    var work = vec_new();
+    vec_push(work, n);
+    var wi = 0;
+    while (wi < vec_len(work)) {
+        var m = vec_get(work, wi);
+        wi = wi + 1;
+
+        if (m <= 1) { continue; }
+        if (num_is_prime(m) == 1) {
+            vec_push(factors, m);
+            continue;
+        }
+
+        var d = num_pollard_rho(m);
+        if (d == m) {
+            # Could not split further; use trial division fallback
+            var td = 2;
+            var mm = m;
+            while (td * td <= mm) {
+                while (mm % td == 0) {
+                    vec_push(factors, td);
+                    mm = mm / td;
+                }
+                td = td + 1;
+            }
+            if (mm > 1) {
+                vec_push(factors, mm);
+            }
+        } else {
+            vec_push(work, d);
+            vec_push(work, m / d);
+        }
+    }
+
+    # Sort factors ascending (insertion sort — factor lists are small)
+    var flen = vec_len(factors);
+    var si = 1;
+    while (si < flen) {
+        var key = vec_get(factors, si);
+        var sj = si - 1;
+        while (sj >= 0 && vec_get(factors, sj) > key) {
+            vec_set(factors, sj + 1, vec_get(factors, sj));
+            sj = sj - 1;
+        }
+        vec_set(factors, sj + 1, key);
+        si = si + 1;
+    }
+
+    return factors;
+}
+
+# Chinese Remainder Theorem: solves x = r_i (mod m_i) for coprime moduli.
+# remainders: vec of remainder values
+# moduli: vec of modulus values (pairwise coprime)
+# count: number of congruences
+# out_x: pointer — solution x written here
+# out_m: pointer — combined modulus M written here
+# Returns: 0 on success, ERR_INVALID_INPUT on failure
+fn num_crt(remainders, moduli, count, out_x, out_m) {
+    if (count <= 0) { return ERR_INVALID_INPUT; }
+
+    # Compute product of all moduli
+    var big_m = 1;
+    var i = 0;
+    while (i < count) {
+        var mi = vec_get(moduli, i);
+        if (mi == 0) { return ERR_INVALID_INPUT; }
+        big_m = big_m * mi;
+        i = i + 1;
+    }
+
+    var x = 0;
+    i = 0;
+    while (i < count) {
+        var ri = vec_get(remainders, i);
+        var mi = vec_get(moduli, i);
+        var Mi = big_m / mi;
+        var Mi_mod_mi = Mi % mi;
+        var yi = num_modinv(Mi_mod_mi, mi);
+        if (yi == 0 - 1) { return ERR_INVALID_INPUT; }
+
+        # x = (x + ri * Mi * yi) % big_m
+        # Use _num_mulmod to avoid overflow in intermediate products
+        var term = _num_mulmod(ri, _num_mulmod(Mi, yi, big_m), big_m);
+        x = (x + term) % big_m;
+        i = i + 1;
+    }
+
+    store64(out_x, x);
+    store64(out_m, big_m);
+    return ERR_NONE;
+}
+
+# Continued fraction expansion of a rational number p/q.
+# p, q: positive integers
+# Returns: vec of coefficients [a0, a1, a2, ...]
+fn num_continued_fraction_rational(p, q) {
+    var cf = vec_new();
+    while (q != 0) {
+        vec_push(cf, p / q);
+        var r = p % q;
+        p = q;
+        q = r;
+    }
+    return cf;
+}
+
+# ================================================================
+# DST / DCT
+# ================================================================
+
+# Discrete Sine Transform Type II, in-place.
+# data: pointer to n consecutive f64 values (each 8 bytes)
+# n: number of values (must be > 0)
+# Returns: 0 on success, ERR_INVALID_INPUT if n <= 0
+fn num_dst(data, n) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+
+    # Allocate output buffer
+    var out = alloc(n * 8);
+    var np1 = f64_from(n + 1);
+    var k = 0;
+    while (k < n) {
+        var sum = _NUMX_F64_ZERO;
+        var i = 0;
+        while (i < n) {
+            var x = load64(data + i * 8);
+            # angle = PI * (i+1) * (k+1) / (n+1)
+            var angle = f64_div(
+                f64_mul(F64_PI, f64_mul(f64_from(i + 1), f64_from(k + 1))),
+                np1);
+            sum = f64_add(sum, f64_mul(x, f64_sin(angle)));
+            i = i + 1;
+        }
+        store64(out + k * 8, sum);
+        k = k + 1;
+    }
+
+    # Copy back to data (in-place)
+    var j = 0;
+    while (j < n) {
+        store64(data + j * 8, load64(out + j * 8));
+        j = j + 1;
+    }
+    return ERR_NONE;
+}
+
+# Inverse Discrete Sine Transform (Type II inverse).
+# DST-I is its own inverse up to scale factor 2/(n+1).
+# data: pointer to n consecutive f64 values
+# n: number of values
+# Returns: 0 on success
+fn num_idst(data, n) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+
+    # Apply forward DST then scale by 2/(n+1)
+    var err = num_dst(data, n);
+    if (err != 0) { return err; }
+
+    var scale = f64_div(_NUMX_F64_TWO, f64_from(n + 1));
+    var i = 0;
+    while (i < n) {
+        var v = load64(data + i * 8);
+        store64(data + i * 8, f64_mul(v, scale));
+        i = i + 1;
+    }
+    return ERR_NONE;
+}
+
+# Discrete Cosine Transform Type II, in-place.
+# X[k] = sum_{i=0}^{n-1} x[i] * cos(PI * (2i+1) * k / (2n))
+# data: pointer to n consecutive f64 values
+# n: number of values (must be > 0)
+# Returns: 0 on success
+fn num_dct(data, n) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+
+    var out = alloc(n * 8);
+    var two_n = f64_from(2 * n);
+    var k = 0;
+    while (k < n) {
+        var sum = _NUMX_F64_ZERO;
+        var i = 0;
+        while (i < n) {
+            var x = load64(data + i * 8);
+            # angle = PI * (2*i + 1) * k / (2*n)
+            var angle = f64_div(
+                f64_mul(F64_PI, f64_mul(f64_from(2 * i + 1), f64_from(k))),
+                two_n);
+            sum = f64_add(sum, f64_mul(x, f64_cos(angle)));
+            i = i + 1;
+        }
+        store64(out + k * 8, sum);
+        k = k + 1;
+    }
+
+    # Copy back
+    var j = 0;
+    while (j < n) {
+        store64(data + j * 8, load64(out + j * 8));
+        j = j + 1;
+    }
+    return ERR_NONE;
+}
+
+# Inverse Discrete Cosine Transform (DCT-III), in-place.
+# x[i] = X[0]/n + (2/n) * sum_{k=1}^{n-1} X[k] * cos(PI * k * (2i+1) / (2n))
+# data: pointer to n consecutive f64 values
+# n: number of values
+# Returns: 0 on success
+fn num_idct(data, n) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+
+    var out = alloc(n * 8);
+    var two_n = f64_from(2 * n);
+    var inv_n = f64_div(_NUMX_F64_ONE, f64_from(n));
+    var dc = f64_mul(load64(data), inv_n);      # X[0] / n
+    var scale = f64_mul(_NUMX_F64_TWO, inv_n);  # 2/n
+
+    var i = 0;
+    while (i < n) {
+        var sum = dc;
+        var k = 1;
+        while (k < n) {
+            var xk = load64(data + k * 8);
+            # angle = PI * k * (2*i + 1) / (2*n)
+            var angle = f64_div(
+                f64_mul(F64_PI, f64_mul(f64_from(k), f64_from(2 * i + 1))),
+                two_n);
+            sum = f64_add(sum, f64_mul(scale, f64_mul(xk, f64_cos(angle))));
+            k = k + 1;
+        }
+        store64(out + i * 8, sum);
+        i = i + 1;
+    }
+
+    # Copy back
+    var j = 0;
+    while (j < n) {
+        store64(data + j * 8, load64(out + j * 8));
+        j = j + 1;
+    }
+    return ERR_NONE;
+}
+
+# ================================================================
+# 2D FFT — row-then-column approach
+# ================================================================
+# data: pointer to rows*cols complex numbers (2*rows*cols f64 values)
+# Complex layout: [re0, im0, re1, im1, ...] — 16 bytes per element
+
+# In-place 2D FFT.
+# data: pointer to rows*cols complex numbers
+# rows: number of rows (must be power of 2)
+# cols: number of columns (must be power of 2)
+# Returns: 0 on success, ERR_INVALID_INPUT if dimensions not power of 2
+fn num_fft_2d(data, rows, cols) {
+    if (_num_is_pow2(rows) == 0) { return ERR_INVALID_INPUT; }
+    if (_num_is_pow2(cols) == 0) { return ERR_INVALID_INPUT; }
+
+    # FFT each row
+    var r = 0;
+    while (r < rows) {
+        var row_ptr = data + r * cols * 16;
+        var err = num_fft(row_ptr, cols);
+        if (err != 0) { return err; }
+        r = r + 1;
+    }
+
+    # FFT each column: extract column into temp buffer, FFT, put back
+    var col_buf = alloc(rows * 16);
+    var c = 0;
+    while (c < cols) {
+        # Extract column c
+        var ri = 0;
+        while (ri < rows) {
+            var src = data + (ri * cols + c) * 16;
+            var dst = col_buf + ri * 16;
+            store64(dst, load64(src));          # re
+            store64(dst + 8, load64(src + 8));  # im
+            ri = ri + 1;
+        }
+
+        # FFT the column buffer
+        var err = num_fft(col_buf, rows);
+        if (err != 0) { return err; }
+
+        # Write back
+        ri = 0;
+        while (ri < rows) {
+            var dst2 = data + (ri * cols + c) * 16;
+            var src2 = col_buf + ri * 16;
+            store64(dst2, load64(src2));
+            store64(dst2 + 8, load64(src2 + 8));
+            ri = ri + 1;
+        }
+
+        c = c + 1;
+    }
+
+    return ERR_NONE;
+}
+
+# In-place 2D inverse FFT.
+# data: pointer to rows*cols complex numbers
+# rows, cols: must be powers of 2
+# Returns: 0 on success
+fn num_ifft_2d(data, rows, cols) {
+    if (_num_is_pow2(rows) == 0) { return ERR_INVALID_INPUT; }
+    if (_num_is_pow2(cols) == 0) { return ERR_INVALID_INPUT; }
+
+    # IFFT each row
+    var r = 0;
+    while (r < rows) {
+        var row_ptr = data + r * cols * 16;
+        var err = num_ifft(row_ptr, cols);
+        if (err != 0) { return err; }
+        r = r + 1;
+    }
+
+    # IFFT each column
+    var col_buf = alloc(rows * 16);
+    var c = 0;
+    while (c < cols) {
+        var ri = 0;
+        while (ri < rows) {
+            var src = data + (ri * cols + c) * 16;
+            var dst = col_buf + ri * 16;
+            store64(dst, load64(src));
+            store64(dst + 8, load64(src + 8));
+            ri = ri + 1;
+        }
+
+        var err = num_ifft(col_buf, rows);
+        if (err != 0) { return err; }
+
+        ri = 0;
+        while (ri < rows) {
+            var dst2 = data + (ri * cols + c) * 16;
+            var src2 = col_buf + ri * 16;
+            store64(dst2, load64(src2));
+            store64(dst2 + 8, load64(src2 + 8));
+            ri = ri + 1;
+        }
+
+        c = c + 1;
+    }
+
+    return ERR_NONE;
+}
+
+# ================================================================
+# QUASI-RANDOM SEQUENCES
+# ================================================================
+
+# Halton sequence value for a given index and base.
+# Returns f64 bit pattern in [0, 1).
+# index: positive integer (1-based for non-zero result)
+# base: prime number (2, 3, 5, 7, ...)
+fn num_halton(index, base) {
+    var result = _NUMX_F64_ZERO;
+    var f = f64_div(_NUMX_F64_ONE, f64_from(base));
+    var i = index;
+    var f_base = f64_from(base);
+    while (i > 0) {
+        result = f64_add(result, f64_mul(f, f64_from(i % base)));
+        i = i / base;
+        f = f64_div(f, f_base);
+    }
+    return result;
+}
+
+# 2D Halton point at given index (bases 2 and 3).
+# Writes two f64 values to out_x and out_y.
+# index: positive integer
+# out_x, out_y: pointers for the two coordinates
+# Returns: 0
+fn num_halton_2d(index, out_x, out_y) {
+    store64(out_x, num_halton(index, 2));
+    store64(out_y, num_halton(index, 3));
+    return ERR_NONE;
+}
+
+# Sobol sequence (dimension 0) — Van der Corput in base 2.
+# Uses Gray code then bit-reversal.
+# index: non-negative integer
+# Returns: f64 bit pattern in [0, 1)
+fn num_sobol(index) {
+    var n = index;
+
+    # Gray code: n ^= n >> 1
+    n = n ^ (n >> 1);
+
+    # Bit-reverse (32-bit)
+    n = ((n & 0xAAAAAAAA) >> 1) | ((n & 0x55555555) << 1);
+    n = ((n & 0xCCCCCCCC) >> 2) | ((n & 0x33333333) << 2);
+    n = ((n & 0xF0F0F0F0) >> 4) | ((n & 0x0F0F0F0F) << 4);
+    n = ((n & 0xFF00FF00) >> 8) | ((n & 0x00FF00FF) << 8);
+    # Rotate left by 16 = swap upper and lower 16 bits
+    var lo16 = n & 0xFFFF;
+    var hi16 = (n >> 16) & 0xFFFF;
+    n = (lo16 << 16) | hi16;
+
+    # Mask to 32 bits
+    n = n & 0xFFFFFFFF;
+
+    # n / 2^32
+    return f64_div(f64_from(n), f64_from(4294967296));
+}
+
+# ================================================================
+# TRIDIAGONAL SOLVER — Thomas algorithm
+# ================================================================
+
+# Solves a tridiagonal system Ax = d in O(n).
+#   a: sub-diagonal coefficients (n-1 values, pointer to f64 array)
+#   b: diagonal coefficients (n values, pointer to f64 array)
+#   c: super-diagonal coefficients (n-1 values, pointer to f64 array)
+#   d: right-hand side (n values, pointer to f64 array)
+#   n: system size
+#   out: pointer to n f64 values where solution is written
+#
+# Note: a, b, c, d are NOT modified. Temporary workspace is allocated.
+# Returns: 0 on success, ERR_DIVISION_BY_ZERO if pivot is zero
+fn num_tridiag_solve(a, b, c, d, n, out) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+
+    if (n == 1) {
+        var b0 = load64(b);
+        if (f64_lt(f64_abs(b0), EPSILON_F64) == 1) {
+            return ERR_DIVISION_BY_ZERO;
+        }
+        store64(out, f64_div(load64(d), b0));
+        return ERR_NONE;
+    }
+
+    # Allocate workspace for modified c' and d'
+    var cp = alloc(n * 8);    # c' (n-1 used, but allocate n for simplicity)
+    var dp = alloc(n * 8);    # d'
+
+    # Forward sweep
+    var b0 = load64(b);
+    if (f64_lt(f64_abs(b0), EPSILON_F64) == 1) {
+        return ERR_DIVISION_BY_ZERO;
+    }
+
+    # c'[0] = c[0] / b[0]
+    store64(cp, f64_div(load64(c), b0));
+    # d'[0] = d[0] / b[0]
+    store64(dp, f64_div(load64(d), b0));
+
+    var i = 1;
+    while (i < n) {
+        # a_i = a[i-1] (sub-diagonal)
+        var ai = load64(a + (i - 1) * 8);
+        var bi = load64(b + i * 8);
+        var di = load64(d + i * 8);
+        var cpm1 = load64(cp + (i - 1) * 8);
+
+        # m = a_i / (b_i - a_i * c'[i-1])  ... wait, standard Thomas:
+        # denom = b[i] - a[i] * c'[i-1]
+        var denom = f64_sub(bi, f64_mul(ai, cpm1));
+        if (f64_lt(f64_abs(denom), EPSILON_F64) == 1) {
+            return ERR_DIVISION_BY_ZERO;
+        }
+
+        # c'[i] = c[i] / denom  (only for i < n-1)
+        if (i < n - 1) {
+            var ci = load64(c + i * 8);
+            store64(cp + i * 8, f64_div(ci, denom));
+        }
+
+        # d'[i] = (d[i] - a[i] * d'[i-1]) / denom
+        var dpm1 = load64(dp + (i - 1) * 8);
+        store64(dp + i * 8, f64_div(f64_sub(di, f64_mul(ai, dpm1)), denom));
+
+        i = i + 1;
+    }
+
+    # Back substitution
+    # x[n-1] = d'[n-1]
+    store64(out + (n - 1) * 8, load64(dp + (n - 1) * 8));
+
+    var j = n - 2;
+    while (j >= 0) {
+        # x[j] = d'[j] - c'[j] * x[j+1]
+        var dpj = load64(dp + j * 8);
+        var cpj = load64(cp + j * 8);
+        var xjp1 = load64(out + (j + 1) * 8);
+        store64(out + j * 8, f64_sub(dpj, f64_mul(cpj, xjp1)));
+        j = j - 1;
+    }
+
+    return ERR_NONE;
+}

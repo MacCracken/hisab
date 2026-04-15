@@ -1,0 +1,974 @@
+# symbolic_ext.cyr — symbolic integration, LaTeX rendering, pattern matching
+# Usage: include "lib/symbolic_ext.cyr"
+# Requires: alloc.cyr, str.cyr, math.cyr, vec.cyr, f64_util.cyr, fmt.cyr, symbolic.cyr
+#
+# Provides:
+#   - sym_integrate(expr, var_name)  -> Expr or 0 (null) if unsupported
+#   - sym_to_latex(expr)             -> Str (LaTeX rendering)
+#   - sym_match(pattern, expr)       -> 1 if matches, 0 if not
+#   - sym_rewrite(expr, rules)       -> Expr (apply rules bottom-up)
+#   - sym_default_rules()            -> vec of rewrite rules
+#
+# Ported from rust-old/src/symbolic/{integrate.rs, latex.rs, pattern.rs}.
+
+# ================================================================
+# Internal helpers
+# ================================================================
+
+# Check if an expression is exactly the given variable (Str).
+fn _sym_is_var(e, var_name) {
+    if (expr_tag(e) == EXPR_VAR) {
+        if (str_eq(expr_var_name(e), var_name) == 1) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# Check if an expression contains the given variable.
+fn _sym_contains_var(e, var_name) {
+    var t = expr_tag(e);
+
+    if (t == EXPR_CONST) { return 0; }
+
+    if (t == EXPR_VAR) {
+        if (str_eq(expr_var_name(e), var_name) == 1) { return 1; }
+        return 0;
+    }
+
+    if (t == EXPR_ADD) {
+        if (_sym_contains_var(expr_left(e), var_name) == 1) { return 1; }
+        return _sym_contains_var(expr_right(e), var_name);
+    }
+    if (t == EXPR_MUL) {
+        if (_sym_contains_var(expr_left(e), var_name) == 1) { return 1; }
+        return _sym_contains_var(expr_right(e), var_name);
+    }
+    if (t == EXPR_POW) {
+        if (_sym_contains_var(expr_left(e), var_name) == 1) { return 1; }
+        return _sym_contains_var(expr_right(e), var_name);
+    }
+
+    if (t == EXPR_NEG) { return _sym_contains_var(expr_child(e), var_name); }
+    if (t == EXPR_SIN) { return _sym_contains_var(expr_child(e), var_name); }
+    if (t == EXPR_COS) { return _sym_contains_var(expr_child(e), var_name); }
+    if (t == EXPR_EXP) { return _sym_contains_var(expr_child(e), var_name); }
+    if (t == EXPR_LN)  { return _sym_contains_var(expr_child(e), var_name); }
+
+    # Unknown — conservatively assume yes
+    return 1;
+}
+
+# ================================================================
+# Symbolic Integration
+# ================================================================
+
+# Attempt symbolic integration of expr with respect to var_name (a Str).
+# Returns a new expression tree (antiderivative) or 0 (null) if unsupported.
+# The constant of integration is omitted (indefinite integral).
+#
+# Supported forms:
+#   constant       -> c * x
+#   variable (x)   -> x^2 / 2
+#   variable (y)   -> y * x  (other var treated as constant)
+#   x^n            -> x^(n+1) / (n+1) for n != -1
+#   x^(-1)         -> ln(x)
+#   sin(x)         -> -cos(x)
+#   cos(x)         -> sin(x)
+#   exp(x)         -> exp(x)
+#   f + g          -> integral(f) + integral(g)
+#   c * f          -> c * integral(f)  (c constant w.r.t. var)
+#   -f             -> -integral(f)
+fn sym_integrate(e, var_name) {
+    var t = expr_tag(e);
+
+    # Constant: integral c dx = c * x
+    if (t == EXPR_CONST) {
+        return expr_mul(
+            expr_const(expr_const_val(e)),
+            expr_var(var_name)
+        );
+    }
+
+    # Variable
+    if (t == EXPR_VAR) {
+        if (str_eq(expr_var_name(e), var_name) == 1) {
+            # integral x dx = x^2 / 2 = 0.5 * x^2
+            return expr_mul(
+                expr_const(F64_HALF),
+                expr_pow(expr_var(var_name), expr_const(F64_TWO))
+            );
+        }
+        # Other variable treated as constant: integral y dx = y * x
+        return expr_mul(e, expr_var(var_name));
+    }
+
+    # Addition: integral (a + b) dx = integral(a) + integral(b)
+    if (t == EXPR_ADD) {
+        var ia = sym_integrate(expr_left(e), var_name);
+        if (ia == 0) { return 0; }
+        var ib = sym_integrate(expr_right(e), var_name);
+        if (ib == 0) { return 0; }
+        return expr_add(ia, ib);
+    }
+
+    # Negation: integral (-f) dx = -integral(f)
+    if (t == EXPR_NEG) {
+        var ia = sym_integrate(expr_child(e), var_name);
+        if (ia == 0) { return 0; }
+        return expr_neg(ia);
+    }
+
+    # Multiplication: constant multiple rule
+    if (t == EXPR_MUL) {
+        var a = expr_left(e);
+        var b = expr_right(e);
+        # If left side is constant w.r.t. var, integrate right
+        if (_sym_contains_var(a, var_name) == 0) {
+            var ib = sym_integrate(b, var_name);
+            if (ib == 0) { return 0; }
+            return expr_mul(a, ib);
+        }
+        # If right side is constant w.r.t. var, integrate left
+        if (_sym_contains_var(b, var_name) == 0) {
+            var ia = sym_integrate(a, var_name);
+            if (ia == 0) { return 0; }
+            return expr_mul(ia, b);
+        }
+        # Product of two var-dependent expressions — unsupported
+        return 0;
+    }
+
+    # Power: x^n
+    if (t == EXPR_POW) {
+        var base = expr_left(e);
+        var exp = expr_right(e);
+        # Only handle base=var and exp=constant
+        if (_sym_is_var(base, var_name) == 1) {
+            if (_sym_contains_var(exp, var_name) == 0) {
+                if (expr_tag(exp) == EXPR_CONST) {
+                    var n = expr_const_val(exp);
+                    var np1 = f64_add(n, F64_ONE);
+                    # Check if n == -1 (i.e. n+1 ~ 0)
+                    if (_sym_is_zero(np1) == 1) {
+                        # integral x^(-1) dx = ln(x)
+                        return expr_ln(expr_var(var_name));
+                    }
+                    # integral x^n dx = x^(n+1) / (n+1) = (1/(n+1)) * x^(n+1)
+                    return expr_mul(
+                        expr_const(f64_div(F64_ONE, np1)),
+                        expr_pow(expr_var(var_name), expr_const(np1))
+                    );
+                }
+            }
+        }
+        return 0;
+    }
+
+    # sin(x): integral sin(x) dx = -cos(x)
+    if (t == EXPR_SIN) {
+        if (_sym_is_var(expr_child(e), var_name) == 1) {
+            return expr_neg(expr_cos(expr_var(var_name)));
+        }
+        return 0;
+    }
+
+    # cos(x): integral cos(x) dx = sin(x)
+    if (t == EXPR_COS) {
+        if (_sym_is_var(expr_child(e), var_name) == 1) {
+            return expr_sin(expr_var(var_name));
+        }
+        return 0;
+    }
+
+    # exp(x): integral exp(x) dx = exp(x)
+    if (t == EXPR_EXP) {
+        if (_sym_is_var(expr_child(e), var_name) == 1) {
+            return expr_exp(expr_var(var_name));
+        }
+        return 0;
+    }
+
+    # ln(x): x*ln(x) - x is complex, unsupported
+    if (t == EXPR_LN) {
+        return 0;
+    }
+
+    # Unknown — unsupported
+    return 0;
+}
+
+# ================================================================
+# LaTeX Rendering
+# ================================================================
+
+# Internal: format a constant value for LaTeX.
+# Integer values render without decimals; floats render with up to 6 places.
+fn _latex_fmt_const(sb, val) {
+    var floored = f64_floor(val);
+    var diff = f64_abs(f64_sub(val, floored));
+    if (f64_lt(diff, _SYM_EPS) == 1) {
+        # Check for large-magnitude threshold (1e15)
+        var abs_val = f64_abs(val);
+        var limit = 0x4341_C379_3740_0000;   # 1e15
+        if (f64_lt(abs_val, limit) == 1) {
+            var ival = f64_to(val);
+            str_builder_add_int(sb, ival);
+            return 0;
+        }
+    }
+    # Float rendering
+    var buf[32];
+    var len = fmt_float_buf(val, &buf, 6);
+    str_builder_add(sb, str_from_buf(&buf, len));
+    return 0;
+}
+
+# Internal: check if explicit \cdot is needed between two factors.
+# Number * Number needs \cdot; otherwise juxtaposition suffices.
+fn _latex_needs_cdot(a, b) {
+    if (expr_tag(a) == EXPR_CONST) {
+        if (expr_tag(b) == EXPR_CONST) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+# Internal: recursive LaTeX writer.
+# sb: str_builder, e: expression, paren: 1 if caller wants parens around binary ops.
+fn _latex_write(sb, e, paren) {
+    var t = expr_tag(e);
+
+    # CONST
+    if (t == EXPR_CONST) {
+        var val = expr_const_val(e);
+        # Negative constant without parent parens: wrap in braces
+        if (f64_lt(val, 0) == 1) {
+            if (paren == 0) {
+                str_builder_add_cstr(sb, "{");
+                _latex_fmt_const(sb, val);
+                str_builder_add_cstr(sb, "}");
+                return 0;
+            }
+        }
+        _latex_fmt_const(sb, val);
+        return 0;
+    }
+
+    # VAR
+    if (t == EXPR_VAR) {
+        var name = expr_var_name(e);
+        var nlen = str_len(name);
+        if (nlen > 1) {
+            str_builder_add_cstr(sb, "\\mathrm{");
+            str_builder_add(sb, name);
+            str_builder_add_cstr(sb, "}");
+        } else {
+            str_builder_add(sb, name);
+        }
+        return 0;
+    }
+
+    # ADD
+    if (t == EXPR_ADD) {
+        if (paren == 1) { str_builder_add_cstr(sb, "\\left("); }
+        _latex_write(sb, expr_left(e), 0);
+        # Detect subtraction: a + neg(b) -> a - b
+        var rhs = expr_right(e);
+        if (expr_tag(rhs) == EXPR_NEG) {
+            str_builder_add_cstr(sb, " - ");
+            _latex_write(sb, expr_child(rhs), 1);
+        } else {
+            str_builder_add_cstr(sb, " + ");
+            _latex_write(sb, rhs, 0);
+        }
+        if (paren == 1) { str_builder_add_cstr(sb, "\\right)"); }
+        return 0;
+    }
+
+    # MUL
+    if (t == EXPR_MUL) {
+        if (paren == 1) { str_builder_add_cstr(sb, "\\left("); }
+        var a = expr_left(e);
+        var b = expr_right(e);
+        var needs_cdot = _latex_needs_cdot(a, b);
+        _latex_write(sb, a, 1);
+        if (needs_cdot == 1) {
+            str_builder_add_cstr(sb, " \\cdot ");
+        } else {
+            str_builder_add_cstr(sb, " ");
+        }
+        _latex_write(sb, b, 1);
+        if (paren == 1) { str_builder_add_cstr(sb, "\\right)"); }
+        return 0;
+    }
+
+    # POW
+    if (t == EXPR_POW) {
+        var base = expr_left(e);
+        var exp = expr_right(e);
+        # Special case: x^(-1) -> \frac{1}{base}
+        if (expr_tag(exp) == EXPR_CONST) {
+            var nval = expr_const_val(exp);
+            var neg_one = f64_neg(F64_ONE);
+            if (_sym_is_zero(f64_sub(nval, neg_one)) == 1) {
+                str_builder_add_cstr(sb, "\\frac{1}{");
+                _latex_write(sb, base, 0);
+                str_builder_add_cstr(sb, "}");
+                return 0;
+            }
+            # Special case: x^(0.5) -> \sqrt{x}
+            if (_sym_is_zero(f64_sub(nval, F64_HALF)) == 1) {
+                str_builder_add_cstr(sb, "\\sqrt{");
+                _latex_write(sb, base, 0);
+                str_builder_add_cstr(sb, "}");
+                return 0;
+            }
+        }
+        _latex_write(sb, base, 1);
+        str_builder_add_cstr(sb, "^{");
+        _latex_write(sb, exp, 0);
+        str_builder_add_cstr(sb, "}");
+        return 0;
+    }
+
+    # NEG
+    if (t == EXPR_NEG) {
+        str_builder_add_cstr(sb, "-");
+        _latex_write(sb, expr_child(e), 1);
+        return 0;
+    }
+
+    # SIN
+    if (t == EXPR_SIN) {
+        str_builder_add_cstr(sb, "\\sin\\left(");
+        _latex_write(sb, expr_child(e), 0);
+        str_builder_add_cstr(sb, "\\right)");
+        return 0;
+    }
+
+    # COS
+    if (t == EXPR_COS) {
+        str_builder_add_cstr(sb, "\\cos\\left(");
+        _latex_write(sb, expr_child(e), 0);
+        str_builder_add_cstr(sb, "\\right)");
+        return 0;
+    }
+
+    # EXP
+    if (t == EXPR_EXP) {
+        str_builder_add_cstr(sb, "e^{");
+        _latex_write(sb, expr_child(e), 0);
+        str_builder_add_cstr(sb, "}");
+        return 0;
+    }
+
+    # LN
+    if (t == EXPR_LN) {
+        str_builder_add_cstr(sb, "\\ln\\left(");
+        _latex_write(sb, expr_child(e), 0);
+        str_builder_add_cstr(sb, "\\right)");
+        return 0;
+    }
+
+    # Unknown
+    str_builder_add_cstr(sb, "\\text{?}");
+    return 0;
+}
+
+# Render an expression as a LaTeX string.
+# Returns a Str (fat pointer).
+fn sym_to_latex(e) {
+    var sb = str_builder_new();
+    _latex_write(sb, e, 0);
+    return str_builder_build(sb);
+}
+
+# ================================================================
+# Pattern Matching
+# ================================================================
+
+# Pattern tags (distinct from ExprTag to avoid collision)
+enum PatternTag {
+    PAT_WILDCARD  = 100;
+    PAT_CONST     = 101;
+    PAT_VAR       = 102;
+    PAT_ADD       = 103;
+    PAT_MUL       = 104;
+    PAT_POW       = 105;
+    PAT_NEG       = 106;
+    PAT_SIN       = 107;
+    PAT_COS       = 108;
+    PAT_EXP       = 109;
+    PAT_LN        = 110;
+    PAT_ANY_CONST = 111;
+}
+
+# ----------------------------------------------------------------
+# Pattern constructors
+# ----------------------------------------------------------------
+
+# Wildcard pattern: matches any expression and binds to name (Str).
+fn pat_wildcard(name) {
+    var p = alloc(16);
+    store64(p, PAT_WILDCARD);
+    store64(p + 8, name);
+    return p;
+}
+
+# Exact constant pattern
+fn pat_const(val) {
+    var p = alloc(16);
+    store64(p, PAT_CONST);
+    store64(p + 8, val);
+    return p;
+}
+
+# Exact variable pattern
+fn pat_var(name) {
+    var p = alloc(16);
+    store64(p, PAT_VAR);
+    store64(p + 8, name);
+    return p;
+}
+
+# Binary pattern constructors
+fn pat_add(a, b) {
+    var p = alloc(24);
+    store64(p, PAT_ADD);
+    store64(p + 8, a);
+    store64(p + 16, b);
+    return p;
+}
+
+fn pat_mul(a, b) {
+    var p = alloc(24);
+    store64(p, PAT_MUL);
+    store64(p + 8, a);
+    store64(p + 16, b);
+    return p;
+}
+
+fn pat_pow(a, b) {
+    var p = alloc(24);
+    store64(p, PAT_POW);
+    store64(p + 8, a);
+    store64(p + 16, b);
+    return p;
+}
+
+# Unary pattern constructors
+fn pat_neg(a) {
+    var p = alloc(16);
+    store64(p, PAT_NEG);
+    store64(p + 8, a);
+    return p;
+}
+
+fn pat_sin(a) {
+    var p = alloc(16);
+    store64(p, PAT_SIN);
+    store64(p + 8, a);
+    return p;
+}
+
+fn pat_cos(a) {
+    var p = alloc(16);
+    store64(p, PAT_COS);
+    store64(p + 8, a);
+    return p;
+}
+
+fn pat_exp(a) {
+    var p = alloc(16);
+    store64(p, PAT_EXP);
+    store64(p + 8, a);
+    return p;
+}
+
+fn pat_ln(a) {
+    var p = alloc(16);
+    store64(p, PAT_LN);
+    store64(p + 8, a);
+    return p;
+}
+
+# AnyConst pattern: matches any constant and binds to name
+fn pat_any_const(name) {
+    var p = alloc(16);
+    store64(p, PAT_ANY_CONST);
+    store64(p + 8, name);
+    return p;
+}
+
+# Pattern accessors
+fn pat_tag(p)   { return load64(p); }
+fn pat_name(p)  { return load64(p + 8); }   # for WILDCARD, VAR, ANY_CONST
+fn pat_val(p)   { return load64(p + 8); }   # for CONST (f64)
+fn pat_left(p)  { return load64(p + 8); }   # for binary patterns
+fn pat_right(p) { return load64(p + 16); }  # for binary patterns
+fn pat_child(p) { return load64(p + 8); }   # for unary patterns
+
+# ----------------------------------------------------------------
+# Bindings: a vec of { name: Str, expr: ptr } pairs
+# ----------------------------------------------------------------
+
+fn _bind_new() {
+    return vec_new();
+}
+
+# Look up a binding by name. Returns the expr ptr or 0 if not found.
+fn _bind_get(bindings, name) {
+    var i = 0;
+    var len = vec_len(bindings);
+    while (i < len) {
+        var pair = vec_get(bindings, i);
+        var pname = load64(pair);
+        if (str_eq(pname, name) == 1) {
+            return load64(pair + 8);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Set a binding. Returns 1 on success, 0 if name already bound to different expr.
+fn _bind_set(bindings, name, e) {
+    var existing = _bind_get(bindings, name);
+    if (existing != 0) {
+        # Check structural equality
+        if (_sym_expr_equal(existing, e) == 1) { return 1; }
+        return 0;
+    }
+    var pair = alloc(16);
+    store64(pair, name);
+    store64(pair + 8, e);
+    vec_push(bindings, pair);
+    return 1;
+}
+
+# ----------------------------------------------------------------
+# Structural equality for expressions
+# ----------------------------------------------------------------
+
+fn _sym_expr_equal(a, b) {
+    var ta = expr_tag(a);
+    var tb = expr_tag(b);
+    if (ta != tb) { return 0; }
+
+    if (ta == EXPR_CONST) {
+        if (_sym_is_zero(f64_sub(expr_const_val(a), expr_const_val(b))) == 1) {
+            return 1;
+        }
+        return 0;
+    }
+
+    if (ta == EXPR_VAR) {
+        return str_eq(expr_var_name(a), expr_var_name(b));
+    }
+
+    if (ta == EXPR_ADD) {
+        if (_sym_expr_equal(expr_left(a), expr_left(b)) == 1) {
+            return _sym_expr_equal(expr_right(a), expr_right(b));
+        }
+        return 0;
+    }
+    if (ta == EXPR_MUL) {
+        if (_sym_expr_equal(expr_left(a), expr_left(b)) == 1) {
+            return _sym_expr_equal(expr_right(a), expr_right(b));
+        }
+        return 0;
+    }
+    if (ta == EXPR_POW) {
+        if (_sym_expr_equal(expr_left(a), expr_left(b)) == 1) {
+            return _sym_expr_equal(expr_right(a), expr_right(b));
+        }
+        return 0;
+    }
+
+    if (ta == EXPR_NEG) { return _sym_expr_equal(expr_child(a), expr_child(b)); }
+    if (ta == EXPR_SIN) { return _sym_expr_equal(expr_child(a), expr_child(b)); }
+    if (ta == EXPR_COS) { return _sym_expr_equal(expr_child(a), expr_child(b)); }
+    if (ta == EXPR_EXP) { return _sym_expr_equal(expr_child(a), expr_child(b)); }
+    if (ta == EXPR_LN)  { return _sym_expr_equal(expr_child(a), expr_child(b)); }
+
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Match: recursive pattern matching
+# ----------------------------------------------------------------
+
+# Internal recursive match. Returns 1 if pattern matches expr, 0 otherwise.
+# Populates bindings vec with { name, expr } pairs.
+fn _pat_match(pat, e, bindings) {
+    var pt = pat_tag(pat);
+
+    # Wildcard: match anything, bind by name
+    if (pt == PAT_WILDCARD) {
+        return _bind_set(bindings, pat_name(pat), e);
+    }
+
+    # AnyConst: match only constants, bind by name
+    if (pt == PAT_ANY_CONST) {
+        if (expr_tag(e) == EXPR_CONST) {
+            return _bind_set(bindings, pat_name(pat), e);
+        }
+        return 0;
+    }
+
+    # Exact constant
+    if (pt == PAT_CONST) {
+        if (expr_tag(e) == EXPR_CONST) {
+            if (_sym_is_zero(f64_sub(pat_val(pat), expr_const_val(e))) == 1) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    # Exact variable
+    if (pt == PAT_VAR) {
+        if (expr_tag(e) == EXPR_VAR) {
+            return str_eq(pat_name(pat), expr_var_name(e));
+        }
+        return 0;
+    }
+
+    # Binary patterns: ADD, MUL, POW
+    if (pt == PAT_ADD) {
+        if (expr_tag(e) == EXPR_ADD) {
+            if (_pat_match(pat_left(pat), expr_left(e), bindings) == 1) {
+                return _pat_match(pat_right(pat), expr_right(e), bindings);
+            }
+        }
+        return 0;
+    }
+    if (pt == PAT_MUL) {
+        if (expr_tag(e) == EXPR_MUL) {
+            if (_pat_match(pat_left(pat), expr_left(e), bindings) == 1) {
+                return _pat_match(pat_right(pat), expr_right(e), bindings);
+            }
+        }
+        return 0;
+    }
+    if (pt == PAT_POW) {
+        if (expr_tag(e) == EXPR_POW) {
+            if (_pat_match(pat_left(pat), expr_left(e), bindings) == 1) {
+                return _pat_match(pat_right(pat), expr_right(e), bindings);
+            }
+        }
+        return 0;
+    }
+
+    # Unary patterns: NEG, SIN, COS, EXP, LN
+    if (pt == PAT_NEG) {
+        if (expr_tag(e) == EXPR_NEG) {
+            return _pat_match(pat_child(pat), expr_child(e), bindings);
+        }
+        return 0;
+    }
+    if (pt == PAT_SIN) {
+        if (expr_tag(e) == EXPR_SIN) {
+            return _pat_match(pat_child(pat), expr_child(e), bindings);
+        }
+        return 0;
+    }
+    if (pt == PAT_COS) {
+        if (expr_tag(e) == EXPR_COS) {
+            return _pat_match(pat_child(pat), expr_child(e), bindings);
+        }
+        return 0;
+    }
+    if (pt == PAT_EXP) {
+        if (expr_tag(e) == EXPR_EXP) {
+            return _pat_match(pat_child(pat), expr_child(e), bindings);
+        }
+        return 0;
+    }
+    if (pt == PAT_LN) {
+        if (expr_tag(e) == EXPR_LN) {
+            return _pat_match(pat_child(pat), expr_child(e), bindings);
+        }
+        return 0;
+    }
+
+    return 0;
+}
+
+# Public: match a pattern against an expression.
+# Returns 1 if matches, 0 if not.
+fn sym_match(pat, e) {
+    var bindings = _bind_new();
+    return _pat_match(pat, e, bindings);
+}
+
+# Match with bindings: returns the bindings vec (or 0 if no match).
+# Each element is a 16-byte pair { name: Str, expr: ptr }.
+fn sym_match_bindings(pat, e) {
+    var bindings = _bind_new();
+    if (_pat_match(pat, e, bindings) == 1) {
+        return bindings;
+    }
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Instantiate: build expression from pattern template + bindings
+# ----------------------------------------------------------------
+
+# Build an expression from a pattern template using bindings.
+# Returns an Expr or 0 if a binding is missing.
+fn _pat_instantiate(tmpl, bindings) {
+    var pt = pat_tag(tmpl);
+
+    if (pt == PAT_WILDCARD) {
+        return _bind_get(bindings, pat_name(tmpl));
+    }
+    if (pt == PAT_ANY_CONST) {
+        return _bind_get(bindings, pat_name(tmpl));
+    }
+
+    if (pt == PAT_CONST) {
+        return expr_const(pat_val(tmpl));
+    }
+    if (pt == PAT_VAR) {
+        return expr_var(pat_name(tmpl));
+    }
+
+    if (pt == PAT_ADD) {
+        var a = _pat_instantiate(pat_left(tmpl), bindings);
+        if (a == 0) { return 0; }
+        var b = _pat_instantiate(pat_right(tmpl), bindings);
+        if (b == 0) { return 0; }
+        return expr_add(a, b);
+    }
+    if (pt == PAT_MUL) {
+        var a = _pat_instantiate(pat_left(tmpl), bindings);
+        if (a == 0) { return 0; }
+        var b = _pat_instantiate(pat_right(tmpl), bindings);
+        if (b == 0) { return 0; }
+        return expr_mul(a, b);
+    }
+    if (pt == PAT_POW) {
+        var a = _pat_instantiate(pat_left(tmpl), bindings);
+        if (a == 0) { return 0; }
+        var b = _pat_instantiate(pat_right(tmpl), bindings);
+        if (b == 0) { return 0; }
+        return expr_pow(a, b);
+    }
+
+    if (pt == PAT_NEG) {
+        var a = _pat_instantiate(pat_child(tmpl), bindings);
+        if (a == 0) { return 0; }
+        return expr_neg(a);
+    }
+    if (pt == PAT_SIN) {
+        var a = _pat_instantiate(pat_child(tmpl), bindings);
+        if (a == 0) { return 0; }
+        return expr_sin(a);
+    }
+    if (pt == PAT_COS) {
+        var a = _pat_instantiate(pat_child(tmpl), bindings);
+        if (a == 0) { return 0; }
+        return expr_cos(a);
+    }
+    if (pt == PAT_EXP) {
+        var a = _pat_instantiate(pat_child(tmpl), bindings);
+        if (a == 0) { return 0; }
+        return expr_exp(a);
+    }
+    if (pt == PAT_LN) {
+        var a = _pat_instantiate(pat_child(tmpl), bindings);
+        if (a == 0) { return 0; }
+        return expr_ln(a);
+    }
+
+    return 0;
+}
+
+# ----------------------------------------------------------------
+# Rewrite rule structure
+# ----------------------------------------------------------------
+
+# A rewrite rule: { pattern: ptr, template: ptr }
+fn sym_rule(pattern, template) {
+    var r = alloc(16);
+    store64(r, pattern);
+    store64(r + 8, template);
+    return r;
+}
+
+fn _rule_pattern(r)  { return load64(r); }
+fn _rule_template(r) { return load64(r + 8); }
+
+# Apply a single rule at the root of an expression.
+# Returns the rewritten Expr or 0 if no match.
+fn _sym_apply_rule(rule, e) {
+    var bindings = _bind_new();
+    if (_pat_match(_rule_pattern(rule), e, bindings) == 1) {
+        return _pat_instantiate(_rule_template(rule), bindings);
+    }
+    return 0;
+}
+
+# Rewrite an expression bottom-up using a single rule.
+# Returns the rewritten expression (unchanged nodes are preserved).
+fn _sym_rewrite_single(rule, e) {
+    var t = expr_tag(e);
+
+    # First, rewrite children
+    var rewritten = e;
+
+    if (t == EXPR_CONST) { rewritten = e; }
+    elif (t == EXPR_VAR) { rewritten = e; }
+    elif (t == EXPR_ADD) {
+        rewritten = expr_add(
+            _sym_rewrite_single(rule, expr_left(e)),
+            _sym_rewrite_single(rule, expr_right(e))
+        );
+    }
+    elif (t == EXPR_MUL) {
+        rewritten = expr_mul(
+            _sym_rewrite_single(rule, expr_left(e)),
+            _sym_rewrite_single(rule, expr_right(e))
+        );
+    }
+    elif (t == EXPR_POW) {
+        rewritten = expr_pow(
+            _sym_rewrite_single(rule, expr_left(e)),
+            _sym_rewrite_single(rule, expr_right(e))
+        );
+    }
+    elif (t == EXPR_NEG) {
+        rewritten = expr_neg(_sym_rewrite_single(rule, expr_child(e)));
+    }
+    elif (t == EXPR_SIN) {
+        rewritten = expr_sin(_sym_rewrite_single(rule, expr_child(e)));
+    }
+    elif (t == EXPR_COS) {
+        rewritten = expr_cos(_sym_rewrite_single(rule, expr_child(e)));
+    }
+    elif (t == EXPR_EXP) {
+        rewritten = expr_exp(_sym_rewrite_single(rule, expr_child(e)));
+    }
+    elif (t == EXPR_LN) {
+        rewritten = expr_ln(_sym_rewrite_single(rule, expr_child(e)));
+    }
+
+    # Then try to apply the rule at this node
+    var result = _sym_apply_rule(rule, rewritten);
+    if (result != 0) { return result; }
+    return rewritten;
+}
+
+# ----------------------------------------------------------------
+# Public: sym_rewrite
+# ----------------------------------------------------------------
+
+# Apply a vec of rewrite rules to an expression (bottom-up, fixpoint).
+# Iterates until no rule fires or max_iter is reached.
+# rules: vec of rule ptrs (from sym_rule)
+# Returns the rewritten expression.
+fn sym_rewrite(e, rules) {
+    var max_iter = 50;
+    var current = e;
+    var iter = 0;
+
+    while (iter < max_iter) {
+        var changed = 0;
+        var ri = 0;
+        var rlen = vec_len(rules);
+        while (ri < rlen) {
+            var rule = vec_get(rules, ri);
+            var next = _sym_rewrite_single(rule, current);
+            if (_sym_expr_equal(next, current) == 0) {
+                current = next;
+                changed = 1;
+                ri = rlen;  # break — restart from first rule
+            }
+            ri = ri + 1;
+        }
+        if (changed == 0) {
+            return current;
+        }
+        iter = iter + 1;
+    }
+
+    return current;
+}
+
+# ----------------------------------------------------------------
+# Built-in simplification rules
+# ----------------------------------------------------------------
+
+# Create the default set of algebraic rewrite rules.
+# Returns a vec of rule ptrs.
+#
+# Rules:
+#   1. sin^2(x) + cos^2(x) = 1
+#   2. x + (-x) = 0
+#   3. x * x = x^2
+#   4. ln(exp(x)) = x
+#   5. exp(ln(x)) = x
+fn sym_default_rules() {
+    var rules = vec_new();
+
+    # Rule 1: sin(a)^2 + cos(a)^2 -> 1
+    # Pattern: Add(Pow(Sin(a), 2), Pow(Cos(a), 2))
+    var r1_pat = pat_add(
+        pat_pow(pat_sin(pat_wildcard(str_from("a"))), pat_const(F64_TWO)),
+        pat_pow(pat_cos(pat_wildcard(str_from("a"))), pat_const(F64_TWO))
+    );
+    var r1_tmpl = pat_const(F64_ONE);
+    vec_push(rules, sym_rule(r1_pat, r1_tmpl));
+
+    # Rule 1b: cos(a)^2 + sin(a)^2 -> 1 (reversed order)
+    var r1b_pat = pat_add(
+        pat_pow(pat_cos(pat_wildcard(str_from("a"))), pat_const(F64_TWO)),
+        pat_pow(pat_sin(pat_wildcard(str_from("a"))), pat_const(F64_TWO))
+    );
+    var r1b_tmpl = pat_const(F64_ONE);
+    vec_push(rules, sym_rule(r1b_pat, r1b_tmpl));
+
+    # Rule 2: a + neg(a) -> 0
+    # Pattern: Add(a, Neg(a))
+    var r2_pat = pat_add(
+        pat_wildcard(str_from("a")),
+        pat_neg(pat_wildcard(str_from("a")))
+    );
+    var r2_tmpl = pat_const(0);
+    vec_push(rules, sym_rule(r2_pat, r2_tmpl));
+
+    # Rule 2b: neg(a) + a -> 0 (reversed order)
+    var r2b_pat = pat_add(
+        pat_neg(pat_wildcard(str_from("a"))),
+        pat_wildcard(str_from("a"))
+    );
+    var r2b_tmpl = pat_const(0);
+    vec_push(rules, sym_rule(r2b_pat, r2b_tmpl));
+
+    # Rule 3: a * a -> a^2
+    # Pattern: Mul(a, a)
+    var r3_pat = pat_mul(
+        pat_wildcard(str_from("a")),
+        pat_wildcard(str_from("a"))
+    );
+    var r3_tmpl = pat_pow(pat_wildcard(str_from("a")), pat_const(F64_TWO));
+    vec_push(rules, sym_rule(r3_pat, r3_tmpl));
+
+    # Rule 4: ln(exp(a)) -> a
+    # Pattern: Ln(Exp(a))
+    var r4_pat = pat_ln(pat_exp(pat_wildcard(str_from("a"))));
+    var r4_tmpl = pat_wildcard(str_from("a"));
+    vec_push(rules, sym_rule(r4_pat, r4_tmpl));
+
+    # Rule 5: exp(ln(a)) -> a
+    # Pattern: Exp(Ln(a))
+    var r5_pat = pat_exp(pat_ln(pat_wildcard(str_from("a"))));
+    var r5_tmpl = pat_wildcard(str_from("a"));
+    vec_push(rules, sym_rule(r5_pat, r5_tmpl));
+
+    return rules;
+}

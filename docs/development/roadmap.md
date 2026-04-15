@@ -60,10 +60,10 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 - [x] H1: tensor_contract — full multi-index contraction implemented
 - [x] H4: dual_div/dual_sqrt/dual_ln zero guards added
 - [x] H6: linearize_depth_reverse_z zero guard added
-- [ ] H8: m4_get/m4_set bounds documentation
+- [x] H8: m4_get/m4_set bounds documented (contract comment)
 - [x] H9: BDF-5 coefficients recomputed exact (verified via IEEE 754)
 - [x] M1: num_modpow overflow-safe via Russian peasant _num_mulmod
-- [ ] M2: PCG32 signed shift verification
+- [x] M2: PCG32 signed shift verified safe (masks discard sign extension)
 - [x] M3: geo_ray_plane returns -1 for miss (not 0)
 - [x] M7: expr_eval returns 0 with warning instead of aborting
 - [ ] M8: SVD via Golub-Kahan (future — replaces A^T*A approach)
@@ -79,8 +79,11 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 - [ ] modpow mul-mod for large moduli
 
 ### Numerical extensions
-- [ ] Mat3 type (3x3 matrix — needed for normals, inertia, 2D physics)
-- [ ] Tridiagonal solver (Thomas algorithm — O(n) for splines, implicit ODE)
+- [x] Mat3 type (mat3.cyr — 178 lines)
+- [x] Tridiagonal solver (Thomas algorithm — num_ext.cyr)
+- [x] Extended number theory: extended_gcd, euler_totient, mobius, divisor_sigma, pollard_rho, factorize, CRT, modinv, continued fractions
+- [x] DST, DCT, 2D-FFT (num_ext.cyr)
+- [x] Halton, Sobol quasi-random sequences (num_ext.cyr)
 - [ ] Complex QR decomposition
 - [ ] Complex matrix inverse
 - [ ] Condition number estimation (||A|| * ||A^-1||)
@@ -88,16 +91,17 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 - [ ] Golub-Kahan SVD (replaces A^T*A for precision)
 
 ### Calculus extensions
-- [ ] B-spline eval, NURBS eval
-- [ ] Hermite TCB, monotone cubic
-- [ ] Adaptive Simpson integration
-- [ ] Partial derivative, gradient, Jacobian, Hessian
-- [ ] 3D Perlin noise, Simplex noise
+- [x] B-spline eval, NURBS eval (calc_ext.cyr)
+- [x] Hermite TCB, monotone cubic (calc_ext.cyr)
+- [x] Adaptive Simpson integration (calc_ext.cyr)
+- [x] Partial derivative, gradient, Jacobian, Hessian (calc_ext.cyr)
+- [x] 3D Perlin noise + fbm_3d (calc_ext.cyr)
+- [ ] Simplex noise
 
 ### Symbolic extensions
-- [ ] Symbolic integration
-- [ ] LaTeX rendering
-- [ ] Pattern matching + rewrite rules
+- [x] Symbolic integration (symbolic_ext.cyr)
+- [x] LaTeX rendering (symbolic_ext.cyr)
+- [x] Pattern matching + rewrite rules with built-in identities (symbolic_ext.cyr)
 
 ### Tensor extensions
 - [ ] Einsum string notation

@@ -2,71 +2,100 @@
 
 > **Hisab** (Arabic: حساب — calculation) — higher mathematics library for AGNOS
 
-Higher math for the AGNOS ecosystem. Provides typed mathematical operations — linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, and more — built on [glam](https://crates.io/crates/glam).
+Higher math for the AGNOS ecosystem — linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, and more. Written in [Cyrius](https://github.com/MacCracken/cyrius), ported from Rust.
 
-Used by [impetus](https://github.com/MacCracken/impetus) (physics), [kiran](https://github.com/MacCracken/kiran) (engine), [joshua](https://github.com/MacCracken/joshua) (simulation), [aethersafha](https://github.com/MacCracken/aethersafha) (compositor), [svara](https://github.com/MacCracken/svara) (vocal synthesis), [prani](https://github.com/MacCracken/prani) (creature vocal synthesis), [hisab-mimamsa](https://github.com/MacCracken/hisab-mimamsa) (theoretical physics), and [kana](https://github.com/MacCracken/kana) (quantum science).
+Used by [impetus](https://github.com/MacCracken/impetus) (physics), [kiran](https://github.com/MacCracken/kiran) (engine), [joshua](https://github.com/MacCracken/joshua) (simulation), [aethersafha](https://github.com/MacCracken/aethersafha) (compositor), [svara](https://github.com/MacCracken/svara) (vocal synthesis), [hisab-mimamsa](https://github.com/MacCracken/hisab-mimamsa) (theoretical physics), and [kana](https://github.com/MacCracken/kana) (quantum science).
 
 For expression evaluation and unit conversion, see [abaco](https://github.com/MacCracken/abaco).
 
-## Features
+## Modules
 
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `transforms` | yes | 2D/3D affine transforms, projections, slerp/lerp, reverse-Z, glam re-exports, HSV/HSL/Oklab color, premultiplied alpha, Porter-Duff compositing, HDR tone mapping (Reinhard, ACES), depth linearization, dual quaternions, CSS decompose, spherical harmonics, **Lie groups** (U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz, exponential map, Casimir operators) |
-| `geo` | yes | Primitives (Ray, Plane, AABB, Sphere, OBB, Capsule, Triangle), intersections, closest-point queries, BVH, k-d tree, quadtree, octree, spatial hash, 2D+3D GJK/EPA, MPR/XenoCollide, SAP broadphase, CCD/TOI, sequential impulse, SDFs + CSG, convex decomposition, Delaunay triangulation, **conformal geometric algebra** (5D CGA multivectors, versors, rotors, translators, dilators) |
-| `calc` | yes | Differentiation, integration (trapezoidal, Simpson, Gauss-Legendre, adaptive, Monte Carlo), Bezier 2D/3D, Catmull-Rom, B-splines, NURBS, Hermite TCB, monotone cubic, easing, spring dynamics, gradient/Jacobian/Hessian, Perlin/fBm noise, **differential geometry** (Christoffel symbols, Riemann/Ricci curvature, geodesic solver, Killing vectors, exterior algebra) |
-| `num` | yes | Root finding (Newton-Raphson, bisection), LU/Cholesky/QR/SVD, FFT/DST/DCT/2D-FFT, optimization (GD, CG, BFGS, LM), ODE (RK4, DOPRI45, backward Euler, BDF-2/3/4/5), SDE (Euler-Maruyama, Milstein), symplectic integrators (Euler, Verlet, leapfrog, Yoshida 4th-order), sparse CSR, GMRES, PGS+SOR, BiCGSTAB, eigendecomposition, inertia tensors, Lyapunov exponents, compensated summation, PCG32 RNG, **complex linear algebra** (ComplexMatrix, Hermitian eigen, complex SVD, Pauli/Dirac matrices, spinor transforms, matrix exponential) |
-| `autodiff` | no | Forward-mode (dual numbers) and reverse-mode (tape-based) automatic differentiation |
-| `interval` | no | Interval arithmetic for verified numerics |
-| `symbolic` | no | Symbolic expression tree with evaluation, differentiation, simplification, substitution |
-| `tensor` | no | N-dimensional dense tensor, **indexed tensor algebra** (covariant/contravariant indices, Einstein summation, contraction, outer product, index raising/lowering), symmetric/antisymmetric tensors, sparse tensors, Minkowski metric, Levi-Civita symbol |
-| `parallel` | no | Rayon-powered parallel batch operations (transform, intersection, matvec) |
-| `ai` | no | Daimon/hoosh AI client (network deps) |
-| `logging` | no | Structured logging via `HISAB_LOG` env var |
-| `full` | — | Enables all features |
+| Module | Files | Description |
+|--------|-------|-------------|
+| **Foundation** | vec2, vec3, vec4, quat, mat3, mat4 | Vector/matrix/quaternion types (f64, heap-allocated) |
+| **Transforms** | transforms, color | 2D/3D affine transforms, projections, slerp/lerp, Euler angles, sRGB/HSV/HSL/Oklab, Porter-Duff compositing (8 ops), tone mapping (Reinhard, ACES), SH L2, EV/exposure |
+| **Geometry** | geo, geo_advanced | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, BVH, SDF+CSG, TOI, conformal geometric algebra (5D CGA) |
+| **Calculus** | calc, calc_ext | Differentiation, integration (Simpson, Gauss-Legendre, adaptive), Bezier/Catmull-Rom/B-spline/NURBS/Hermite TCB/monotone cubic, easing, Perlin 2D+3D, gradient/Jacobian/Hessian |
+| **Numerical** | num, ode, optimize, linalg_ext, num_ext | Root finding, FFT/DST/DCT/2D-FFT, ODE (RK4, DOPRI45, BDF, symplectic, SDE), optimization (GD, CG, BFGS, L-BFGS, LM), sparse CSR, GMRES, PGS, SVD, eigendecomposition, number theory (primes, factorize, CRT, totient, Mobius), PCG32, Halton/Sobol, tridiagonal solver |
+| **Complex** | complex | Complex numbers + matrices, Pauli/Dirac gamma matrices, matrix exponential |
+| **Lie groups** | lie | U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz, exponential maps |
+| **Diff geometry** | diffgeo | Christoffel symbols, Riemann/Ricci/Einstein tensors, geodesic solver, Killing vectors, exterior algebra |
+| **Symbolic** | symbolic, symbolic_ext | Expression tree, evaluate, differentiate, simplify, symbolic integration, LaTeX rendering, pattern matching + rewrite rules |
+| **Autodiff** | autodiff | Forward-mode automatic differentiation (dual numbers) |
+| **Interval** | interval | Interval arithmetic for verified numerics |
+| **Tensor** | tensor | N-dimensional dense tensor, Kronecker delta, Minkowski metric, Levi-Civita |
 
 ## Quick Start
 
 ```toml
-[dependencies]
-hisab = "1.4"
+# cyrius.toml
+[deps]
+stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "matrix", "linalg", "tagged", "fnptr"]
 ```
 
-```rust
-use hisab::{Vec3, Quat, Transform3D, Ray, Sphere};
-use hisab::geo::ray_sphere;
-use hisab::calc::integral_simpson;
-use hisab::num::newton_raphson;
+```cyrius
+include "lib/f64_util.cyr"
+include "lib/error.cyr"
+include "lib/vec3.cyr"
+include "lib/quat.cyr"
+include "lib/mat4.cyr"
+include "lib/transforms.cyr"
+include "lib/geo.cyr"
+include "lib/calc.cyr"
+include "lib/num.cyr"
 
-// 3D transform with composition
-let a = Transform3D::new(Vec3::new(1.0, 2.0, 3.0), Quat::IDENTITY, Vec3::ONE);
-let b = Transform3D::new(Vec3::ZERO, Quat::from_rotation_y(0.5), Vec3::splat(2.0));
-let combined = a.compose(&b);
-let world_pos = combined.apply_to_point(Vec3::ZERO);
+alloc_init();
 
-// Ray-sphere intersection
-let ray = Ray::new(Vec3::ZERO, Vec3::Z).unwrap();
-let sphere = Sphere::new(Vec3::new(0.0, 0.0, 5.0), 1.0).unwrap();
-let hit = ray_sphere(&ray, &sphere); // Some(4.0)
+# 3D transform with composition
+var pos = hvec3_new(f64_from(1), f64_from(2), f64_from(3));
+var t = t3d_new(pos, hquat_identity(), hvec3_one());
+var world = t3d_apply(t, hvec3_zero());
 
-// Numerical integration
-let area = integral_simpson(|x| x * x, 0.0, 1.0, 100).unwrap(); // ~0.3333
+# Ray-sphere intersection
+var ray = geo_ray_new(hvec3_zero(), hvec3_unit_z());
+var sphere = geo_sphere_new(hvec3_new(0, 0, f64_from(5)), f64_from(1));
+var t_hit = geo_ray_sphere(ray, sphere);  # 4.0
 
-// Root finding
-let sqrt2 = newton_raphson(|x| x * x - 2.0, |x| 2.0 * x, 1.0, 1e-10, 100).unwrap();
+# Numerical integration (Simpson's rule)
+fn x_squared(x) { return f64_mul(x, x); }
+var result = alloc(8);
+calc_integral_simpson(&x_squared, 0, F64_ONE, 100, result);
+# load64(result) ≈ 0.3333
+
+# Root finding (Newton-Raphson for sqrt(2))
+fn f(x) { return f64_sub(f64_mul(x, x), F64_TWO); }
+fn df(x) { return f64_mul(F64_TWO, x); }
+var root = alloc(8);
+num_newton(&f, &df, F64_ONE, EPSILON_F64, 100, root);
+# load64(root) ≈ 1.41421356...
+```
+
+## Building
+
+```sh
+cyrius build src/main.cyr build/hisab
+cyrius test tests/hisab.tcyr        # 116 smoke tests
+cyrius test tests/foundation.tcyr   # 307 foundation tests
+cyrius test tests/modules.tcyr      # 249 module tests
+cyrius test tests/edge_cases.tcyr   # 149 edge case tests
+cyrius bench tests/hisab.bcyr       # 22 benchmarks
 ```
 
 ## Architecture
 
 See [docs/architecture/overview.md](docs/architecture/overview.md) for the full module map, data flow, and design principles.
 
-## Building
+## Stats
 
-```sh
-cargo build
-cargo test --all-features   # 1155 tests
-make bench                  # criterion benchmarks with history tracking
-```
+| Metric | Value |
+|--------|-------|
+| Library | 27 files, 11,769 lines |
+| Tests | 821 assertions (4 suites) |
+| Benchmarks | 22 |
+| Fuzz targets | 5 |
+| Binary | 420KB static ELF |
+| Toolchain | Cyrius 4.10.3 |
+| Dependencies | 1 (sakshi) |
 
 ## License
 

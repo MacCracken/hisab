@@ -1,135 +1,78 @@
 # Architecture Overview
 
+> Cyrius port of hisab v1.4.0 — 27 lib files, 11,769 lines
+
 ## Module Map
 
 ```
-hisab
-├── transforms          — Transform2D/3D, projections, slerp, lerp, handedness  [default]
-│   ├── core            — Transform2D/3D, projections (ortho, perspective, reverse-Z),
-│   │                     lerp, inverse_lerp, remap, flip_handedness_z, compose
-│   ├── quat            — quat_from_euler, quat_to_euler, quat_look_at, look_at_rh
-│   ├── screen          — world_to_screen, screen_to_world_ray
-│   ├── color           — sRGB, HSV, HSL, Oklab, premultiplied alpha, Porter-Duff (10 ops),
-│   │                     saturation/hue matrices, tone mapping (Reinhard, ACES), depth linearization
-│   ├── dualquat        — DualQuat rigid body transforms, blend skinning
-│   ├── decompose       — CSS mat4 decompose/recompose (DecomposedTransform)
-│   ├── sh              — spherical harmonics L0–L2 (eval, project, evaluate)
-│   └── lie             — Lie groups: U(1), SU(2), SU(3) (Gell-Mann), SO(3,1) (Lorentz),
-│                         exponential/logarithmic maps, structure constants, Casimir operators
+hisab (Cyrius)
+├── Foundation types
+│   ├── error.cyr          — Error codes (ERR_*), epsilon constants
+│   ├── f64_util.cyr       — f64_tan, f64_fmod, f64_copysign, f64_approx_eq
+│   ├── vec2.cyr           — HVec2: 2D f64 vector (heap-allocated)
+│   ├── vec3.cyr           — HVec3: 3D f64 vector with cross, reflect, min/max
+│   ├── vec4.cyr           — HVec4: 4D f64 vector, Vec3 conversion
+│   ├── quat.cyr           — HQuat: quaternion with slerp, rotation, axis-angle
+│   ├── mat3.cyr           — 3x3 matrix: mul, inverse, determinant, from_quat
+│   └── mat4.cyr           — 4x4 matrix: inverse, SRT, projections, look-at
 │
-├── geo                 — Primitives, intersections, spatial structures, collision  [default]
-│   ├── primitives      — Ray, Plane, Aabb, Sphere, OBB, Capsule, Frustum, Rect
-│   ├── intersection    — Triangle, Line, Segment, ray-*, plane-plane, AABB-AABB, sphere-sphere
-│   ├── closest         — closest_point_on_{ray,plane,sphere,aabb,triangle},
-│   │                     barycentric_coords, segment_segment_closest, compute_tangent
-│   ├── spatial         — Bvh, KdTree, Quadtree, Octree, SpatialHash
-│   ├── collision       — convex_hull_2d, GJK/EPA 2D+3D, MPR/XenoCollide,
-│   │                     swept_aabb, time_of_impact, sequential_impulse (with friction),
-│   │                     sweep_and_prune broadphase
-│   ├── sdf             — sdf_sphere/box/capsule, CSG (union/intersection/subtraction/smooth),
-│   │                     triangulate_polygon (ear-clipping)
-│   ├── decompose       — convex_decompose (PCA splitting), TriMesh
-│   ├── delaunay        — delaunay_2d (Bowyer-Watson), voronoi_2d (dual)
-│   └── cga             — conformal geometric algebra: 5D multivectors, geometric/outer/inner
-│                         products, conformal point/sphere/plane, translator/rotor/dilator versors
+├── Transforms
+│   ├── transforms.cyr     — Transform2D/3D, compose, Euler, screen projection, lerp
+│   └── color.cyr          — sRGB/HSV/HSL, Porter-Duff (8 ops), tone mapping, SH L2, EV
 │
-├── calc                — Differentiation, integration, curves, splines, easing  [default]
-│   ├── core            — derivative, integral_{trapezoidal,simpson}, bezier 2D/3D
-│   ├── integration     — gauss_legendre, adaptive_simpson, monte_carlo
-│   ├── splines         — catmull_rom, bspline_eval, nurbs_eval, hermite_tcb,
-│   │                     monotone_cubic, de_casteljau_split, arc-length parameterization
-│   ├── easing          — ease_{in,out,in_out}{,_cubic,_smooth}, spring_step, cubic_bezier_ease
-│   ├── noise           — perlin_2d, perlin_3d, fbm_2d
-│   ├── multivar        — partial_derivative, gradient, jacobian, hessian
-│   └── diffgeo         — Christoffel symbols, Riemann/Ricci curvature tensor, Ricci scalar,
-│                         Einstein tensor, geodesic RK4 integrator, Killing vector detection,
-│                         exterior algebra (wedge product, Hodge star, differential forms)
+├── Geometry
+│   ├── geo.cyr            — 9 primitives, 6 ray tests, closest-point queries
+│   └── geo_advanced.cyr   — GJK/EPA 3D, BVH, SDF+CSG, swept AABB, TOI, CGA 5D
 │
-├── num                 — Root finding, decompositions, spectral, ODE, optimization  [default]
-│   ├── roots           — newton_raphson, bisection, gaussian_elimination
-│   ├── linalg          — lu, cholesky, qr (in-place variants), matrix ops, rank, condition
-│   ├── eigen           — eigen_symmetric (Jacobi), EigenDecomposition
-│   ├── svd             — svd (one-sided Jacobi), truncated_svd, pseudo_inverse
-│   ├── complex         — Complex arithmetic (exp, ln, sqrt, sin, cos, polar), serde
-│   ├── complex_linalg  — ComplexMatrix, Hermitian eigendecomposition, complex SVD,
-│   │                     Pauli matrices (σ₁σ₂σ₃), Dirac gamma matrices (γ⁰γ¹γ²γ³γ⁵),
-│   │                     spinor rotations, Dirac boosts, commutators, anticommutators,
-│   │                     Kronecker product, matrix exponential
-│   ├── fft             — fft, ifft, fft_2d, ifft_2d, dst, idst, dct, idct
-│   ├── ode             — rk4, dopri45, backward_euler, bdf2, bdf(3-5),
-│   │                     euler_maruyama, milstein (SDE),
-│   │                     symplectic_euler, verlet, leapfrog, yoshida4
-│   ├── optimize        — gradient_descent, conjugate_gradient, bfgs, levenberg_marquardt
-│   ├── solvers         — projected_gauss_seidel (+SOR), gmres, bicgstab
-│   ├── sparse          — CsrMatrix (spmv, spmvt, add, transpose, get),
-│   │                     sparse_cholesky_solve, sparse_lu_solve
-│   ├── rng             — Pcg32, halton, halton_2d, sobol
-│   ├── summation       — kahan_sum, neumaier_sum
-│   ├── inertia         — inertia_sphere, inertia_box, inertia_mesh
-│   └── stability       — lyapunov_max
+├── Calculus
+│   ├── calc.cyr           — Derivative, Simpson/Gauss-Legendre, Bezier, easing, Perlin 2D
+│   └── calc_ext.cyr       — Gradient/Jacobian/Hessian, adaptive Simpson, B-spline, NURBS,
+│                             Hermite TCB, monotone cubic, 3D Perlin noise
 │
-├── autodiff            — Automatic differentiation                              [feature: autodiff]
-│   ├── forward         — Dual (val/deriv), var(), constant(), transcendentals
-│   └── reverse         — Tape, Var, tape.backward(), reverse_gradient()
+├── Numerical
+│   ├── num.cyr            — Newton/bisection, FFT/IFFT, RK4, PCG32, primes, sieve, Kahan sum
+│   ├── ode.cyr            — DOPRI45, backward Euler, BDF-2..5, SDE, symplectic, Verlet, Yoshida
+│   ├── optimize.cyr       — Gradient descent, CG (Polak-Ribiere+), BFGS, L-BFGS, LM
+│   ├── linalg_ext.cyr     — CSR sparse, GMRES, BiCGSTAB, PGS, SVD, eigen, Lyapunov, inertia
+│   └── num_ext.cyr        — Extended GCD, totient, Mobius, factorize, CRT, DST/DCT, 2D-FFT,
+│                             Halton/Sobol, tridiagonal solver
 │
-├── interval            — Interval arithmetic                                    [feature: interval]
-│                         Interval type, arithmetic ops, contains, overlaps, hull, sqr, sqrt
+├── Physics
+│   ├── complex.cyr        — Complex numbers + matrices, Pauli, Dirac gamma, matrix exp
+│   ├── lie.cyr            — U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz
+│   └── diffgeo.cyr        — Christoffel→Einstein, geodesic RK4, Killing, exterior algebra
 │
-├── symbolic            — Symbolic algebra                                       [feature: symbolic]
-│                         Expr enum (Const/Var/Add/Mul/Pow/Neg/Sin/Cos/Exp/Ln),
-│                         evaluate, differentiate, simplify, substitute
+├── Symbolic
+│   ├── symbolic.cyr       — Expr tree, evaluate, differentiate, simplify, to_str
+│   └── symbolic_ext.cyr   — Symbolic integration, LaTeX rendering, pattern matching + rewrite
 │
-├── tensor              — Tensor algebra                                         [feature: tensor]
-│   ├── dense           — Tensor (zeros, ones, get/set, reshape, add/sub/scale, matmul, transpose)
-│   ├── indexed         — IndexedTensor with covariant/contravariant index tracking,
-│   │                     Einstein summation (contract_with), outer product, index raising/lowering,
-│   │                     Kronecker delta, Minkowski metric, Levi-Civita symbol, permutation
-│   ├── symmetric       — SymmetricTensor (C(n+k-1,k) storage), AntisymmetricTensor (C(n,k) storage)
-│   └── sparse          — SparseTensor (COO format for high-rank objects with many zeros)
-│
-├── parallel            — Parallel batch operations                              [feature: parallel]
-│                         par_transform_points, par_ray_aabb_batch, par_matrix_vector_multiply
-│
-├── ai                  — AGNOS AI client                                        [feature: ai]
-│                         DaimonClient (register, heartbeat, hoosh_query)
-│
-├── logging             — Structured logging                                     [feature: logging]
-│                         init_logging() via tracing-subscriber + HISAB_LOG env
-│
-└── error               — HisabError, DaimonError
+└── Other
+    ├── autodiff.cyr       — Dual numbers (forward-mode AD)
+    ├── interval.cyr       — Interval arithmetic
+    └── tensor.cyr         — N-D dense tensor, Kronecker/Minkowski/Levi-Civita, contraction
 ```
 
-## Feature Flags
+## Dependencies
 
-| Flag | Dependencies | Description |
-|------|-------------|-------------|
-| `transforms` | (default) | Core transforms, projections, color, interpolation |
-| `geo` | (default) | All geometry: primitives, spatial, collision, Delaunay/Voronoi |
-| `calc` | (default) | Calculus, curves, splines (including NURBS), easing, noise |
-| `num` | (default) | Numerical methods, decompositions, FFT, ODE/SDE, optimization, sparse |
-| `autodiff` | — | Forward-mode (dual numbers) + reverse-mode (tape) AD |
-| `interval` | — | Interval arithmetic with bound propagation |
-| `symbolic` | — | Expression tree algebra (evaluate, differentiate, simplify) |
-| `tensor` | — | N-dimensional dense tensor operations |
-| `parallel` | `rayon` | Parallel batch operations for transform/intersection/matvec |
-| `ai` | `reqwest`, `tokio`, `serde_json` | AGNOS daimon/hoosh AI client |
-| `logging` | `tracing-subscriber` | Structured logging via `HISAB_LOG` env |
-| `full` | all above | Everything |
-
-All default features are pure computation — no I/O, no async, no network.
+| Dependency | Source | Purpose |
+|-----------|--------|---------|
+| sakshi | External (git) | Structured logging |
+| alloc, string, fmt, vec, str | Cyrius stdlib | Core data structures |
+| math, matrix, linalg | Cyrius stdlib | f64 ops, dense matrix, decompositions |
+| tagged, fnptr | Cyrius stdlib | Option/Result types, function pointers |
+| syscalls, io, args | Cyrius stdlib | System interface |
+| assert, bench | Cyrius stdlib | Testing, benchmarking |
 
 ## Design Principles
 
-- **Pure math** — no I/O in default features; AI client is opt-in
-- **Zero unsafe** — no `unsafe` blocks anywhere
-- **Thread-safe** — all public types are `Send + Sync` (compile-time verified)
-- **Built on glam** — leverages glam's SIMD-optimized Vec3/Mat4/Quat
-- **Feature-gated** — heavy deps (reqwest, tokio, rayon) only compiled when needed
-- **`#[non_exhaustive]`** — on all public enums for forward compatibility
-- **`#[must_use]`** — on all pure functions
-- **`#[inline]`** — on hot-path functions (intersection tests, transforms, easing)
-- **`write!` over `format!`** — avoid temporary allocations
-- **Result over panic** — no `unwrap()`, `panic!()`, or `assert!()` in library code
+- **Pure math** — no I/O in library code
+- **f64 everywhere** — all math is IEEE 754 double precision (1e-12 tolerance)
+- **Heap-allocated types** — multi-field structs via `alloc()` + `#derive(accessors)`
+- **Error codes** — functions return `ERR_NONE` (0) on success, negative `ERR_*` on failure
+- **Out-parameters** — results written via `store64(out, value)` pointers
+- **No abort** — library code never calls `syscall(60, ...)` (warnings only)
+- **Overflow guards** — allocation sizes checked against caps for user-controlled dimensions
+- **Function pointers** — callbacks via `fncall1`/`fncall2` from fnptr.cyr
 
 ## Data Flow — Collision Pipeline
 
@@ -137,31 +80,23 @@ All default features are pure computation — no I/O, no async, no network.
 Scene objects
       │
       ▼
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  SpatialHash │ or  │     BVH      │ or  │   Octree    │
-│  (broadphase)│     │  (broadphase)│     │ (broadphase)│
-└──────┬──────┘     └──────┬───────┘     └──────┬──────┘
-       │                   │                    │
-       └───────────────────┼────────────────────┘
-                           ▼
-                  Candidate pairs (indices)
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-     ┌────────────┐ ┌────────────┐ ┌────────────┐
-     │ gjk_*()    │ │  mpr_*()   │ │ sphere/aabb│
-     │ (GJK/EPA)  │ │  (MPR)     │ │ (fast path)│
-     └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
-           │               │              │
-           └───────────────┼──────────────┘
-                           ▼
-              Penetration { normal, depth }
-                           │
-                           ▼
-              ┌──────────────────────┐
-              │ sequential_impulse() │
-              │ (normal + friction)  │
-              └──────────────────────┘
+┌─────────┐
+│   BVH   │  (bvh_build, bvh_query_ray/aabb)
+└────┬────┘
+     ▼
+Candidate pairs
+     │
+     ▼
+┌──────────┐
+│ GJK/EPA  │  (gjk_intersect_3d, gjk_epa_3d)
+└────┬─────┘
+     ▼
+Penetration { normal, depth }
+     │
+     ▼
+┌─────────────────┐
+│ solve_pgs()     │  (projected Gauss-Seidel)
+└─────────────────┘
 ```
 
 ## Data Flow — ODE Solving
@@ -169,35 +104,21 @@ Scene objects
 ```
 dy/dt = f(t, y)
       │
-      ├── Explicit ──────────────────────────┐
-      │   rk4()         — 4th-order, fixed   │
-      │   dopri45()     — 4(5) adaptive      │
-      │                                      │
-      ├── Implicit (stiff) ──────────────────┤
-      │   backward_euler() — 1st-order       │
-      │   bdf2()           — 2nd-order       │
-      │   bdf(order=3..5)  — higher-order    │
-      │                                      │
-      ├── Symplectic (Hamiltonian) ──────────┤
-      │   symplectic_euler() — 1st-order     │
-      │   verlet()           — 2nd-order     │
-      │   yoshida4()         — 4th-order     │
-      │                                      │
-      └── Stochastic ───────────────────────┘
-          euler_maruyama() — strong order 0.5
-          milstein()       — strong order 1.0
+      ├── Explicit ─── num_rk4, ode_dopri45
+      ├── Implicit ─── ode_backward_euler, ode_bdf2..5
+      ├── Symplectic ─ ode_symplectic_euler, ode_verlet, ode_yoshida4
+      └── Stochastic ─ ode_euler_maruyama, ode_milstein
 ```
 
 ## Consumers
 
 | Project | What it uses |
 |---------|-------------|
-| **impetus** | Transforms, spatial structures (BVH broadphase), GJK/EPA/MPR collision, sequential impulse, inertia tensors |
-| **kiran** | Projections (incl. reverse-Z), frustum culling, camera transforms, OBB/Capsule rays, easing, Delaunay, tangent space |
-| **joshua** | ODE solvers (RK4, DOPRI45, BDF), symplectic integrators (Yoshida), SDE, Lyapunov, deterministic replay (PCG32, monotone cubic) |
-| **aethersafha** | Projection matrices, transform composition, Porter-Duff compositing, tone mapping, color spaces, depth linearization |
-| **abaco** | Symbolic algebra (Expr), interval arithmetic for verified evaluation |
-| **svara** | Complex, FFT, easing functions (vocal synthesis) |
-| **prani** | Easing functions (creature vocal synthesis, via svara) |
-| **hisab-mimamsa** | Indexed tensors, Lie groups, differential geometry, complex LA, CGA (theoretical physics: GR, QFT, cosmology) |
-| **kana** | Indexed tensors, Lie groups, complex LA, spinors (quantum science) |
+| **impetus** | Transforms, GJK/EPA, PGS solver, inertia tensors, BVH |
+| **kiran** | Projections, frustum, BVH, ray tests, easing |
+| **joshua** | DOPRI45, BDF, symplectic, optimization, PCG32 |
+| **aethersafha** | Projections, compositing, tone mapping, color |
+| **abaco** | Symbolic algebra, interval arithmetic |
+| **svara** | Complex, FFT, easing |
+| **hisab-mimamsa** | Tensors, Lie groups, diffgeo, complex LA, CGA |
+| **kana** | Tensors, Lie groups, complex LA, spinors |

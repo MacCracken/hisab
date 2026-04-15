@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+## 1.4.0-cyrius (2026-04-15)
+
+### Changed — Ported from Rust to Cyrius
+- **Complete rewrite** from 33,612 lines of Rust to 11,769 lines of Cyrius (27 lib files)
+- Replaced glam dependency with native HVec2/3/4, HQuat, Mat3, Mat4 types (f64, heap-allocated)
+- Replaced Rust error types with integer error codes (ERR_* constants)
+- Replaced serde serialization with manual storage patterns
+- Replaced tracing with sakshi structured logging
+- Single external dependency (sakshi) vs 9 Rust crates
+- Static 420KB binary vs ~800KB dynamic
+
+### Added
+- **mat3.cyr** — 3x3 matrix type (determinant, inverse, from_quat, normal_matrix)
+- **ode.cyr** — DOPRI45, backward Euler, BDF-2..5, Euler-Maruyama, Milstein, symplectic Euler/Verlet/leapfrog/Yoshida4
+- **optimize.cyr** — gradient descent, conjugate gradient (Polak-Ribiere+), BFGS, L-BFGS, Levenberg-Marquardt
+- **linalg_ext.cyr** — CSR sparse matrix, GMRES, BiCGSTAB, PGS, SVD wrappers, eigendecomposition, Lyapunov, inertia tensors
+- **calc_ext.cyr** — gradient/Jacobian/Hessian, adaptive Simpson, B-spline, NURBS, Hermite TCB, monotone cubic, 3D Perlin noise
+- **symbolic_ext.cyr** — symbolic integration, LaTeX rendering, pattern matching + 7 rewrite rules
+- **num_ext.cyr** — extended GCD, Euler totient, Mobius, factorize, CRT, DST/DCT, 2D-FFT, Halton/Sobol, tridiagonal solver
+- 821 test assertions (4 suites), 22 benchmarks, 5 fuzz targets
+- P(-1) security audit: 31 issues found, 25 fixed
+
+### Security
+- Allocation overflow guards on tensor, complex matrix, diffgeo (C1, C2, C4)
+- Sieve limit cap at 10M to prevent OOM (C5)
+- Division-by-zero guards on cx_div, cx_inv, dual_div/ln/sqrt, f64_fmod, world_to_screen, linearize_depth_reverse_z
+- Modpow overflow-safe via Russian peasant multiplication
+- Bisection midpoint overflow fix: `lo + (hi-lo)/2`
+- BDF-5 coefficients recomputed exact (IEEE 754 verified)
+- expr_eval no longer aborts process on undefined variables
+
+### Performance
+- Benchmark comparison: see docs/benchmarks-rust-v-cyrius.md
+- Sub-microsecond for vec3_add (454ns), quat_mul (475ns), ray_sphere (512ns)
+- Cyrius is 30-100x slower per-operation vs Rust/glam (f64 heap vs f32 SIMD) but 2.3x smaller binary
+
 ## 1.4.0 (2026-03-30)
 
 ### Added — Theoretical physics foundation (P0 — mimamsa + kana)

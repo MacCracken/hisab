@@ -3,143 +3,92 @@
 ## Running Tests
 
 ```bash
-# Default features (transforms, geo, calc, num)
-cargo test
+# All test suites
+cyrius test tests/hisab.tcyr        # 116 smoke/integration tests
+cyrius test tests/foundation.tcyr   # 307 exhaustive foundation type tests
+cyrius test tests/modules.tcyr      # 249 per-module tests
+cyrius test tests/edge_cases.tcyr   # 149 edge case + boundary tests
 
-# All features including AI client
-cargo test --all-features
+# Benchmarks (22 operations)
+cyrius bench tests/hisab.bcyr
 
-# No default features (only error module)
-cargo test --no-default-features
-
-# Specific module
-cargo test --all-features transforms::
-cargo test --all-features geo::
-cargo test --all-features calc::
-cargo test --all-features num::
+# Fuzz self-test
+cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 ```
 
-## Test Categories
+## Test Suites
 
-| Category | Count | Location |
-|----------|-------|----------|
-| Unit tests (transforms) | 67 | `src/transforms/` (incl. Lie groups) |
-| Unit tests (geo) | 166 | `src/geo/` (incl. CGA) |
-| Unit tests (calc) | 71 | `src/calc/` (incl. differential geometry) |
-| Unit tests (num) | 109 | `src/num/` (incl. complex LA) |
-| Unit tests (tensor) | 38 | `src/tensor/` (dense, indexed, symmetric, sparse) |
-| Unit tests (autodiff) | ~40 | `src/autodiff.rs` |
-| Unit tests (other) | ~20 | symbolic, interval, ai, logging, lib |
-| Integration tests | 34 | `tests/` |
-| Doc tests | 22 | various |
-| **Total** | **1089** | |
+| Suite | Assertions | Covers |
+|-------|-----------|--------|
+| `foundation.tcyr` | 307 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
+| `modules.tcyr` | 249 | All 10+ modules — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff, interval, tensor |
+| `hisab.tcyr` | 116 | Cross-module integration — ODE, optimization, sparse, ray-sphere, Newton, Euler identity |
+| `edge_cases.tcyr` | 149 | Zero-length normalize, degenerate cross, singular inverse, parallel ray, division by zero, empty sums, undefined variables |
+| **Total** | **821** | |
 
-## Coverage
+## Benchmarks (22 operations)
 
-Target: 80%+ line coverage.
+| Category | Benchmarks |
+|----------|-----------|
+| Vec/Quat/Mat | vec3_add, vec3_cross, vec3_normalize, quat_mul, quat_slerp, quat_rotate_vec3, m4_mul, m4_inverse, m4_transform_point, t3d_compose |
+| Geometry | ray_sphere, ray_aabb, ray_triangle |
+| Color | srgb_to_linear, tonemap_reinhard |
+| Calculus | calc_derivative, calc_integral_simpson |
+| Numerical | num_gcd, num_is_prime, cx_mul |
+| Other | ease_in_out, perlin_2d |
 
-```bash
-# Generate coverage report (requires cargo-llvm-cov)
-make coverage
+## Fuzz Targets (5)
 
-# Or directly
-cargo llvm-cov --all-features --html --output-dir coverage/
-```
-
-Coverage configuration is in `codecov.yml` (80% project target, 75% patch target).
-
-## Benchmarks
-
-```bash
-# Run benchmarks with auto-appending CSV history + markdown report
-make bench
-
-# Or directly
-./scripts/bench-history.sh
-
-# Just criterion (no history tracking)
-cargo bench --bench benchmarks
-```
-
-Results:
-- `bench-history.csv` — all runs with timestamp, commit, branch, benchmark name, nanoseconds
-- `benchmarks.md` — 3-point trend table (baseline → optimized → current)
-
-### Benchmark groups (82 total)
-
-| Group | Count | What it measures |
-|-------|-------|-----------------|
-| transforms | 8 | to_matrix, apply_point, projections, lerp |
-| geo | 7 | ray-sphere/plane/aabb, contains, merge |
-| calc | 7 | derivative, integration, bezier |
-| num | 4 | newton, bisection, gaussian |
-| batch | 4 | 100-item ray/aabb/transform, 10k simpson |
-| v02 | 15 | triangle, frustum, overlaps, closest-point, slerp |
-| v03 | 9 | 3D bezier, splines, GL quadrature, easing |
-| v04a | 6 | LU, cholesky, QR, least squares |
-| v04b | 4 | eigenvalue, FFT 64/1024, FFT+IFFT |
-| v04c | 3 | RK4 100/1000 steps, oscillator |
-| v05a | 6 | BVH build/query, k-d tree build/nearest/radius |
-| v05b | 6 | quadtree/octree insert/query, spatial hash |
-| v05c | 4 | convex hull, GJK intersect/miss, GJK+EPA |
+| Target | Input bytes | Invariant checked |
+|--------|------------|-------------------|
+| vec3 ops | 48 | normalize length finite |
+| quat rotation | 56 | rotation preserves length |
+| ray intersections | 72 | no crash |
+| num_gcd | 16 | gcd divides both inputs |
+| m4_inverse | 128 | M * M^-1 ≈ I when det > 0 |
 
 ## Testing Patterns
 
 ### Approximate equality
 
-All modules define local helpers:
+```cyrius
+# Check f64 values within tolerance
+var diff = f64_abs(f64_sub(actual, expected));
+assert(f64_lt(diff, tolerance) == 1, "message");
 
-```rust
-const EPSILON: f32 = 1e-4;  // or f64 = 1e-6
-
-fn approx_eq(a: f32, b: f32) -> bool {
-    (a - b).abs() < EPSILON
-}
-
-fn vec3_approx_eq(a: Vec3, b: Vec3) -> bool {
-    approx_eq(a.x, b.x) && approx_eq(a.y, b.y) && approx_eq(a.z, b.z)
-}
+# Or multiply by 1000 and round for integer comparison
+var result_1000 = f64_to(f64_round(f64_mul(value, f64_from(1000))));
+assert_eq(result_1000, 1414, "sqrt2 * 1000");
 ```
 
-### Serde roundtrip
+### Function pointer tests
 
-All serializable types have roundtrip tests:
+```cyrius
+# Define helpers BEFORE alloc_init() to avoid compiler issues
+fn _test_x2(x) { return f64_mul(x, x); }
+fn _test_df(x) { return f64_mul(F64_TWO, x); }
 
-```rust
-let json = serde_json::to_string(&value).unwrap();
-let restored = serde_json::from_str(&json).unwrap();
-assert_eq!(value, restored);
-```
+alloc_init();
 
-### Optimization verification
-
-When optimizing a function, add a test that compares the optimized path against the reference (matrix) path:
-
-```rust
-#[test]
-fn transform3d_apply_matches_matrix() {
-    let t = Transform3D::new(pos, rot, scale);
-    let via_apply = t.apply_to_point(point);
-    let via_matrix = t.to_matrix() * Vec4::new(point.x, point.y, point.z, 1.0);
-    assert!(vec3_approx_eq(via_apply, Vec3::new(via_matrix.x, ...)));
-}
+var out = alloc(8);
+num_newton(&_test_x2, &_test_df, F64_ONE, EPSILON_F64, 100, out);
 ```
 
 ### Mathematical property tests
 
-Verify known mathematical properties:
+```cyrius
+# Euler's identity: |e^(iπ) + 1| ≈ 0
+var eipi = cx_exp(cx_new(0, F64_PI));
+var euler = cx_add(eipi, cx_one());
+assert(f64_lt(cx_abs(euler), f64_from(1)) == 1, "euler identity");
 
-```rust
-// FFT linearity: FFT(ax+by) = a*FFT(x) + b*FFT(y)
-// Parseval's theorem: N * Σ|x[n]|² = Σ|X[k]|²
-// Smootherstep symmetry: f(t) + f(1-t) = 1
-// Inverse roundtrip: inv(T) * T * p ≈ p
+# Quaternion rotation preserves length
+var len_before = hvec3_length(v);
+var rotated = hquat_rotate_vec3(q, v);
+var len_after = hvec3_length(rotated);
+# |len_before - len_after| < epsilon
 ```
 
-## Local CI
+## Performance Comparison
 
-```bash
-make check   # fmt + clippy + test + audit
-```
-
-This matches what CI runs, minus platform matrix and coverage upload.
+See [docs/benchmarks-rust-v-cyrius.md](../benchmarks-rust-v-cyrius.md) for Rust vs Cyrius benchmark comparison with 85 Rust + 22 Cyrius data points.

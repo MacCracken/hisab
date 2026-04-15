@@ -4,64 +4,57 @@
 
 Hisab operates at the **library boundary**. It trusts the calling application to:
 - Provide valid numeric inputs (not NaN/Infinity unless documented)
-- Respect feature-gate contracts (AI module requires network access)
-- Handle `Result` errors appropriately
+- Provide valid pointers from `alloc()` (not arbitrary addresses)
+- Respect dimension constraints (matrix sizes, tensor ranks)
 
 Hisab does NOT trust:
-- Input sizes (validates dimensions for matrix operations)
-- Input magnitudes (uses epsilon thresholds for near-zero detection)
+- Input sizes — validates/caps dimensions for matrix, tensor, diffgeo operations
+- Input magnitudes — uses EPSILON_F64 thresholds for near-zero detection
+- Convergence — all iterative algorithms have max_iter bounds
 
 ## Attack Surface
 
 | Module | Risk | Mitigation |
 |--------|------|------------|
-| `num` (gaussian/LU) | Division by near-zero pivot | Partial pivoting with 1e-12 threshold; returns `Err(SingularPivot)` |
-| `num` (newton/bisection) | Non-convergence / infinite loop | `max_iter` parameter; returns `Err(NoConvergence)` |
-| `num` (eigenvalue) | Non-convergence for repeated eigenvalues | `max_iter` + tolerance; returns `Err(NoConvergence)` |
-| `num` (cholesky) | Non-positive-definite matrix | Returns `Err(InvalidInput)` on non-positive diagonal |
-| `num` (fft) | Non-power-of-2 input | Returns `Err(InvalidInput)` |
-| `calc` (integration) | Zero step count | Returns `Err(ZeroSteps)` |
-| `geo` (ConvexPolygon) | Empty vertex list | Validated in constructor; returns `Err(InvalidInput)` |
-| `geo` (Sphere) | Negative radius | Validated in constructor; returns `Err(InvalidInput)` |
-| `geo` (Ray/Line) | Zero-length direction | Validated in constructor; returns `Err(InvalidInput)` |
-| `geo` (SpatialHash) | Non-positive cell size | Validated in constructor; returns `Err(InvalidInput)` |
-| `geo` (GJK/EPA) | Non-convergence on degenerate shapes | 64-iteration hard limit; returns false/None |
-| `geo` (Quadtree/Octree) | Unbounded tree depth with coincident points | Configurable `max_depth` prevents stack overflow |
-| `geo` (SpatialHash) | Memory growth with many cells | Caller controls cell_size; `clear()` available |
-| `geo` (BVH/KdTree) | Stack overflow on deep recursion | Balanced construction limits depth to O(log n) |
-| `ai` (DaimonClient) | Network I/O, untrusted responses | Feature-gated; not compiled by default |
-| All | NaN/Infinity propagation | IEEE 754 semantics; no special handling (caller's responsibility) |
+| tensor_new | Integer overflow in `total * 8` | Overflow guard, max 1M elements, rank cap 8 |
+| cmat_new | Integer overflow in `rows * cols * 16` | Overflow guard, max 64K elements |
+| christoffel/riemann | `dim^3` / `dim^4` overflow | Dim capped at 16 |
+| num_sieve | Unbounded allocation | Capped at 10M |
+| mat_new (stdlib) | Integer overflow in `rows * cols * 8` | **Upstream bug** — tracked for cyrius 5.0.1 |
+| num_newton/bisection | Non-convergence | max_iter bound; returns ERR_NO_CONVERGENCE |
+| num_modpow | Intermediate multiplication overflow | _num_mulmod (Russian peasant) avoids overflow |
+| cx_div, cx_inv | Division by zero | Zero guard returns cx_zero() |
+| dual_div/ln/sqrt | Division by zero | Zero guard returns dual_new(0,0) |
+| world_to_screen | Perspective divide by w=0 | Returns hvec3_zero() |
+| linearize_depth_reverse_z | Division by ndc=0 | Returns 0 |
+| f64_fmod | Division by y=0 | Returns 0 |
+| f64_tan | cos(x)=0 at PI/2 | Returns IEEE 754 Inf (documented) |
+| expr_eval | Undefined variable | Returns 0 with stderr warning (no longer aborts) |
+| geo_ray_plane | Ambiguous t=0 hit vs miss | Returns -1 for miss (not 0) |
+| GJK/EPA | Non-convergence on degenerate shapes | 64-iteration hard limit |
+| Perlin noise | Global mutable permutation table | Single-threaded only |
+| PCG32 | Signed arithmetic for unsigned ops | Verified safe: & masks discard sign extension |
+| m4_get/m4_set | No bounds check | Contract: col/row in [0,3], caller must validate |
+| Jacobi eigensolver | O(n^5) for large matrices | Documented: not for n > 50 |
+| SVD via A^T*A | Squares condition number | Documented: Golub-Kahan planned |
 
-## Known Panic Sites
+## Known Non-Cryptographic Functions
 
-All previously identified panic sites have been resolved (0.24.3-audit). The library contains **zero `assert!`/`unwrap`/`panic!`** in non-test code.
-
-## Unsafe Code
-
-None. The crate contains zero `unsafe` blocks.
-
-## Supply Chain
-
-- `cargo-deny` enforces license allowlist, bans wildcards, denies unknown registries
-- `cargo-audit` checks for known vulnerabilities in CI
-- Minimal direct dependencies:
-  - **Core:** glam, serde, thiserror, tracing (4 deps)
-  - **AI (opt-in):** reqwest, tokio, serde_json (+3 deps)
-  - **Logging (opt-in):** tracing-subscriber (+1 dep)
-- No transitive dependency on `openssl` (reqwest uses rustls by default)
+- `num_modpow` — NOT constant-time. Do not use for cryptographic key operations.
+- `pcg32` — fast PRNG, not cryptographically secure. Use for simulation/testing only.
 
 ## Numerical Precision
 
-Hisab uses inconsistent epsilon values across modules:
+All math uses f64 (IEEE 754 double precision, ~15 significant digits).
 
-| Context | Current value | Location |
-|---------|--------------|----------|
-| Ray parallel to plane | `1e-8` | `geo::ray_plane` |
-| Plane parallel check | `1e-12` | `geo::plane_plane` |
-| Singular pivot | `1e-12` | `num::gaussian_elimination`, `num::lu_decompose` |
-| Zero derivative | `1e-15` | `num::newton_raphson` |
-| Zero eigenvector | `1e-15` | `num::eigenvalue_power` |
-| Degenerate segment | `1e-12` | `geo::Segment::closest_point` |
-| GJK degenerate | `1e-12` | `geo::gjk_intersect` |
+| Constant | Value | Hex | Verified |
+|----------|-------|-----|----------|
+| EPSILON_F64 | 1e-12 | 0x3D719799812DEA11 | Yes |
+| F64_PI | π | 0x400921FB54442D18 | Yes (stdlib) |
+| F64_E | e | 0x4005BF0A8B145769 | Yes (stdlib) |
 
-**0.25.3 action:** Define `EPSILON_F32` and `EPSILON_F64` constants and normalize all checks.
+BDF-5 coefficients (300/137, etc.) were recomputed exact and verified via IEEE 754 encoding during the 2026-04-15 audit.
+
+## Audit History
+
+- **2026-04-15**: P(-1) audit — 31 issues found, 25 fixed. See [docs/audit/2026-04-15.md](../audit/2026-04-15.md).

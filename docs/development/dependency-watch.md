@@ -1,35 +1,47 @@
 # Dependency Watch
 
-Tracked dependency version constraints, known incompatibilities, and upgrade paths.
+Tracked dependency version constraints and upgrade paths.
 
-## glam
+## Cyrius Toolchain
 
-**Status:** Pinned to `glam` 0.29
+**Status:** Pinned to 4.10.3 via `.cyrius-toolchain`
 
-**Note:** Hisab re-exports glam types (`Vec2`, `Vec3`, `Mat4`, `Quat`, etc.) as public API. A major glam version bump is a breaking change for hisab consumers. Coordinate glam upgrades with impetus, kiran, and joshua.
+**Note:** Cyrius 4.10.3 provides `lib/linalg.cyr` (957 lines) with LU, Cholesky, QR, SVD, eigendecomposition. This is a critical dependency — hisab's `linalg_ext.cyr` wraps these functions.
 
-**SIMD:** glam 0.29 uses SIMD by default on x86_64 and aarch64. No special feature flags needed — hisab benefits automatically.
+**Upstream issue:** `lib/matrix.cyr` has integer overflow in `mat_new(rows, cols)` allocation size calculation. Tracked for cyrius 5.0.1.
 
-## reqwest (AI feature)
+## Cyrius stdlib modules (23 used)
 
-**Status:** `reqwest` 0.12 with `json` feature, optional behind `ai`
+| Module | Purpose | Risk |
+|--------|---------|------|
+| alloc | Bump allocator | Foundation — cannot change |
+| string, str | C strings, fat strings | Stable |
+| fmt | Formatting | Stable |
+| vec | Dynamic array | Stable |
+| math | f64 extended ops (sinh, pow, atan2) | Stable |
+| matrix | Dense matrix storage | **Overflow bug** (C3) |
+| linalg | Decompositions (LU, QR, SVD, eigen) | New in 4.10.2 |
+| tagged | Option/Result types | Stable |
+| fnptr | Function pointer calls | Stable |
+| syscalls, io, args | System interface | Stable |
+| assert, bench | Test/benchmark framework | Stable |
+| callback | Higher-order functions | Stable |
 
-**Note:** reqwest brings in tokio, hyper, and rustls as transitive deps. These are only compiled when `ai` feature is enabled. No impact on core library size.
+## sakshi (external dependency)
 
-## thiserror
+**Status:** `sakshi` 0.9.0 via git
 
-**Status:** `thiserror` 2
+**Purpose:** Structured logging (timestamps, levels, categories)
 
-**Note:** thiserror v2 dropped the `#[error(transparent)]` attribute requirement for `#[from]` variants. Our `DaimonError::Http(#[from] reqwest::Error)` relies on this. Compatible with MSRV 1.89.
+**Risk:** Low. Logging is write-only — no data flows back. If sakshi breaks, hisab still compiles (just without logging).
 
-## tracing / tracing-subscriber
+## Rust-era dependencies (archived in rust-old/)
 
-**Status:** `tracing` 0.1 (always), `tracing-subscriber` 0.3 (optional, `logging` feature)
-
-**Note:** `tracing` 0.1 is a lightweight facade — it adds near-zero overhead when no subscriber is active. The `logging` feature adds `tracing-subscriber` with env-filter for `HISAB_LOG` support.
-
-## criterion (dev-dependency)
-
-**Status:** `criterion` 0.5
-
-**Note:** criterion 0.5 is the last version with the `criterion_group!`/`criterion_main!` macro API. Version 0.8+ changed to a builder pattern. Pinned for stability. Upgrade when convenient — not urgent.
+These are no longer used but documented for reference:
+- `glam` 0.29 — replaced by hisab's own vec/mat/quat types
+- `serde` 1.0 — no serialization in Cyrius port (yet)
+- `thiserror` 2.0 — replaced by ERR_* integer codes
+- `tracing` 0.1 — replaced by sakshi
+- `reqwest` 0.12, `tokio` 1.0 — AI module not ported
+- `rayon` 1.0 — parallel module not ported
+- `criterion` 0.5 — replaced by bench.cyr

@@ -2,32 +2,39 @@
 
 ## Scope
 
-Hisab is a pure mathematics library providing linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, interval arithmetic, and tensor operations for Rust. The core library performs no I/O and contains no `unsafe` code.
+Hisab is a pure mathematics library written in Cyrius providing linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, interval arithmetic, and tensor operations. The core library performs no I/O.
 
 ## Attack Surface
 
 | Area | Risk | Mitigation |
 |------|------|------------|
-| Numerical stability | Catastrophic cancellation, overflow | IEEE 754 f32/f64; documented precision limits |
-| Matrix decompositions | Division by near-zero pivot | Partial pivoting with threshold checks; returns `Err(SingularPivot)` |
-| Iterative solvers | Non-convergence on adversarial input | max_iter bounds; returns `Err(NoConvergence)` |
-| FFT | Invalid input length | Returns `Err(InvalidInput)` for non-power-of-2 |
-| Integration functions | Zero step count | Returns `Err(ZeroSteps)` |
-| Spatial structures | Unbounded tree depth | Configurable `max_depth`; prevents stack overflow |
-| GJK/EPA | Non-convergence on degenerate shapes | Configurable iteration limits (`GJK_MAX_ITERATIONS`, `EPA_MAX_ITERATIONS`) |
-| Geometric constructors | Invalid input (zero-length normals, negative radius) | All return `Result`; no panics |
-| Symbolic expressions | Deep recursion on pathological trees | Consumer responsibility; practical depth well within stack limits |
-| Serde deserialization | Crafted JSON | Enum validation via serde derive |
-| AI client (opt-in) | Network I/O to daimon/hoosh | Feature-gated; not compiled by default |
-| Dependencies | Supply chain compromise | cargo-deny, cargo-audit in CI; minimal core deps |
+| Allocation overflow | Integer overflow in `rows * cols * 8` could cause undersized allocation | Overflow guards on tensor, complex matrix, diffgeo allocations; dimension caps |
+| Numerical stability | Catastrophic cancellation, overflow | IEEE 754 f64 throughout; documented precision limits |
+| Matrix decompositions | Division by near-zero pivot | Partial pivoting with EPSILON_F64 threshold checks |
+| Iterative solvers | Non-convergence on adversarial input | max_iter bounds; returns ERR_NO_CONVERGENCE |
+| FFT | Invalid input length | Requires power-of-2 |
+| Integration | Zero step count | Returns ERR_ZERO_STEPS |
+| GJK/EPA | Non-convergence on degenerate shapes | 64-iteration hard limit |
+| Sieve of Eratosthenes | Unbounded allocation | Capped at 10M elements |
+| Division by zero | NaN/Inf propagation through complex, autodiff, transforms | Zero guards on cx_div, cx_inv, dual_div, dual_sqrt, dual_ln, f64_fmod, world_to_screen, linearize_depth_reverse_z |
+| Modular arithmetic | Overflow in multiplication for large moduli | Russian peasant _num_mulmod avoids overflow |
+| Symbolic eval | Process abort on undefined variable | Returns 0 with warning (no longer aborts) |
+| Perlin noise | Global mutable state for permutation table | Single-threaded only; documented |
+
+## Known Limitations
+
+- `num_modpow` is NOT constant-time. Do not use for cryptographic applications.
+- Jacobi eigensolver is O(n^5) worst case. Not suitable for n > 50.
+- SVD via A^T*A squares the condition number. See roadmap for Golub-Kahan replacement.
+- PCG32 uses signed arithmetic with masking. Verified safe but not cryptographically secure.
+- `m4_get`/`m4_set` do not bounds-check col/row arguments. Caller must validate.
 
 ## Supported Versions
 
 | Version | Supported |
 |---------|-----------|
-| 1.0.x | Yes |
-| 0.22.x–0.28.x | Security fixes only |
-| < 0.22 | No |
+| Cyrius 1.4.x | Yes |
+| Rust 1.4.x (rust-old/) | Archive only |
 
 ## Reporting
 
@@ -38,9 +45,10 @@ Hisab is a pure mathematics library providing linear algebra, geometry, calculus
 
 ## Design Principles
 
-- Zero `unsafe` code
-- No `unwrap()` or `panic!()` in library code — all errors via `Result`
-- All public types are `Send + Sync` (compile-time verified)
-- No network I/O in core library (AI client is opt-in via feature flag)
-- Minimal dependency surface (core depends only on glam, serde, thiserror, tracing)
-- Spatial structures have configurable depth limits to prevent resource exhaustion
+- No `syscall(60, ...)` (process abort) in library code — errors via return codes
+- All public functions document their error conditions
+- Allocation sizes are guarded against overflow where inputs are user-controlled
+- Bump allocator (no free) — no use-after-free, no double-free
+- No network I/O in core library
+- Single external dependency (sakshi for structured logging)
+- P(-1) audit completed 2026-04-15 — see docs/audit/2026-04-15.md

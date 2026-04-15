@@ -56,15 +56,16 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 - [x] External: CG upgraded from Fletcher-Reeves to Polak-Ribiere+
 
 ### Remaining audit items
-- [ ] H1: tensor_contract — implement proper multi-index contraction (stub)
-- [ ] H4: dual_div/dual_sqrt/dual_ln zero guards
-- [ ] H6: linearize_depth_reverse_z zero guard
+- [ ] C3: matrix.cyr integer overflow in alloc — **upstream to cyrius 5.0.1** (mat_new rows*cols*8 can wrap)
+- [x] H1: tensor_contract — full multi-index contraction implemented
+- [x] H4: dual_div/dual_sqrt/dual_ln zero guards added
+- [x] H6: linearize_depth_reverse_z zero guard added
 - [ ] H8: m4_get/m4_set bounds documentation
-- [ ] H9: BDF-5 coefficient verification
-- [ ] M1: num_modpow overflow for moduli > 2^31
+- [x] H9: BDF-5 coefficients recomputed exact (verified via IEEE 754)
+- [x] M1: num_modpow overflow-safe via Russian peasant _num_mulmod
 - [ ] M2: PCG32 signed shift verification
-- [ ] M3: geo_ray_plane ambiguous 0 return
-- [ ] M7: expr_eval return error instead of abort
+- [x] M3: geo_ray_plane returns -1 for miss (not 0)
+- [x] M7: expr_eval returns 0 with warning instead of aborting
 - [ ] M8: SVD via Golub-Kahan (future — replaces A^T*A approach)
 - [ ] L1-L7: Low-priority quality items
 

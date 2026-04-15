@@ -113,43 +113,91 @@ fn tensor_scale(t, s) {
     return r;
 }
 
-# Contract indices i and j of a rank-N tensor (trace)
+# Contract indices idx_i and idx_j of a rank-N tensor (trace over those two indices).
+# The two indices must have the same dimension.
 fn tensor_contract(t, idx_i, idx_j) {
     var rank = HTensor_rank(t);
     var shape = HTensor_shape(t);
-    var dim = load64(shape + idx_i * 8);  # Must equal dim at idx_j
+    var dim = load64(shape + idx_i * 8);
     var new_rank = rank - 2;
+    if (new_rank < 0) { new_rank = 0; }
 
-    # Build new shape (skip idx_i and idx_j)
-    var ns = alloc(new_rank * 8);
+    # Ensure idx_i < idx_j for consistency
+    var ii = idx_i; var jj = idx_j;
+    if (ii > jj) { var tmp = ii; ii = jj; jj = tmp; }
+
+    # Build output shape (skip positions ii and jj)
+    var ns = alloc((new_rank + 1) * 8);  # +1 to avoid alloc(0)
     var ni = 0;
     var oi = 0;
     while (oi < rank) {
-        if (oi != idx_i && oi != idx_j) {
+        if (oi != ii && oi != jj) {
             store64(ns + ni * 8, load64(shape + oi * 8));
             ni = ni + 1;
         }
         oi = oi + 1;
     }
 
-    var result = tensor_new(new_rank, ns);
-    # Sum over the contracted dimension
-    # This is a general implementation — iterate all output indices
-    # and sum over the contracted index
-    var out_total = HTensor_total(result);
-    var rd = HTensor_data(result);
-    var td = HTensor_data(t);
-
-    # For each output element, compute the sum
-    var out_idx = 0;
-    while (out_idx < out_total) {
+    # Handle scalar result (rank-0)
+    if (new_rank == 0) {
+        store64(ns, 1);
+        var result = tensor_new(1, ns);
         var sum = 0;
         var k = 0;
         while (k < dim) {
-            # Build full input index from output index + contracted index
-            # This needs the multi-index expansion — simplified for rank <= 4
-            # For now, store the sum
-            sum = f64_add(sum, 0);  # TODO: full multi-index expansion
+            # Build full index with ii=k, jj=k, all others=0
+            var full_idx = alloc(rank * 8);
+            var fi = 0;
+            while (fi < rank) { store64(full_idx + fi * 8, 0); fi = fi + 1; }
+            store64(full_idx + ii * 8, k);
+            store64(full_idx + jj * 8, k);
+            sum = f64_add(sum, tensor_get(t, full_idx));
+            k = k + 1;
+        }
+        store64(HTensor_data(result), sum);
+        return result;
+    }
+
+    var result = tensor_new(new_rank, ns);
+    var out_total = HTensor_total(result);
+    var rd = HTensor_data(result);
+
+    # Compute strides for the output tensor (for multi-index expansion)
+    var out_strides = alloc(new_rank * 8);
+    var si = new_rank - 1;
+    var stride = 1;
+    while (si >= 0) {
+        store64(out_strides + si * 8, stride);
+        stride = stride * load64(ns + si * 8);
+        si = si - 1;
+    }
+
+    # For each output flat index, expand to multi-index, insert contracted index, sum
+    var full_idx = alloc(rank * 8);
+    var out_idx = 0;
+    while (out_idx < out_total) {
+        # Expand out_idx to output multi-index
+        var remaining = out_idx;
+        var omi = 0;
+        while (omi < new_rank) {
+            var os = load64(out_strides + omi * 8);
+            var idx_val = remaining / os;
+            remaining = remaining - idx_val * os;
+            # Map output index omi to input index (skip ii and jj)
+            var input_pos = omi;
+            if (input_pos >= ii) { input_pos = input_pos + 1; }
+            if (input_pos >= jj) { input_pos = input_pos + 1; }
+            store64(full_idx + input_pos * 8, idx_val);
+            omi = omi + 1;
+        }
+
+        # Sum over contracted dimension
+        var sum = 0;
+        var k = 0;
+        while (k < dim) {
+            store64(full_idx + ii * 8, k);
+            store64(full_idx + jj * 8, k);
+            sum = f64_add(sum, tensor_get(t, full_idx));
             k = k + 1;
         }
         store64(rd + out_idx * 8, sum);

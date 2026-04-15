@@ -89,12 +89,12 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.0.0 |
-| Library | 27 files, 11,943 lines of Cyrius |
+| Version | 2.2.0 |
+| Library | 33 files, 15,676 lines of Cyrius |
 | Tests | 821 assertions across 4 test suites |
 | Benchmarks | 22 operations |
 | Fuzz targets | 5 with invariant checks |
-| Binary | 426KB static ELF |
+| Binary | 511KB static ELF |
 | Toolchain | Cyrius 4.10.3 |
 | Dependencies | 1 (sakshi) |
 | Security | P(-1) audited, 25 of 31 issues fixed |

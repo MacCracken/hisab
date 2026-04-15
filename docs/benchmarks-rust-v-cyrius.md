@@ -1,142 +1,250 @@
 # Benchmarks: Rust vs Cyrius
 
-> hisab v1.4.0 performance comparison. All times in nanoseconds.
+> hisab v2.2.0 benchmark comparison.
 >
-> - **Rust**: criterion v0.5, `--all-features`, release mode. Data from bench-history.csv (2026-03-31, commit 745870c)
-> - **Cyrius**: cc3 4.10.3, bench.cyr framework, static ELF (2026-04-15)
+> - **Rust**: criterion v0.5, release mode. Final run from bench-history.csv (2026-03-31, commit 745870c). f32 via glam SIMD.
+> - **Cyrius**: cc3 4.10.3, bench.cyr. Run 2026-04-15. f64 via SSE2/x87, heap-allocated types.
 > - **Platform**: x86_64 Linux
->
-> Rust uses f32 (glam SIMD) for transforms/geo. Cyrius uses f64 everywhere (SSE2/x87).
 
-## Matched Benchmarks
-
-Operations where both Rust and Cyrius implementations exist and are directly comparable.
+## Head-to-Head
 
 | Operation | Rust (ns) | Cyrius (ns) | Ratio | Notes |
 |-----------|-----------|-------------|-------|-------|
 | **Transforms** | | | | |
-| slerp | 21.2 | 704 | 33x | f32 SIMD vs f64 trig+heap |
-| mat4 inverse | 20.0 | 755 | 38x | f32 SIMD cofactor vs f64 Cramer |
-| transform3d_apply | 6.4 | — | — | f32, glam SIMD |
-| t3d_compose | — | 684 | — | f64, heap alloc |
-| ease_in_out | 0.6 | 410 | 683x | f32 inline vs f64 fn call |
-| ease_in_out_smooth | 0.8 | — | — | |
+| slerp | 21.1 | 680 | 32x | f32 SIMD vs f64 trig+heap |
+| mat4 inverse | 20.1 | 745 | 37x | f32 SIMD vs f64 Cramer |
+| t3d_compose | -- | 661 | -- | f64 only |
+| ease_in_out | 0.60 | 403 | 672x | f32 inline vs f64 fn call |
 | **Geometry** | | | | |
-| ray_sphere hit | 2.9 | 512 | 177x | f32 SIMD vs f64 heap |
-| ray_aabb hit | 4.9 | 484 | 99x | f32 SIMD slab vs f64 slab |
-| ray_triangle | 8.0 | 733 | 92x | f32 vs f64 Moller-Trumbore |
-| gjk_intersect | 28.3 | — | — | f32 |
-| gjk_epa | 156.2 | — | — | f32 |
-| aabb_aabb overlap | 2.4 | — | — | f32, branch-free |
-| sphere_sphere | 1.9 | — | — | f32 |
+| ray_sphere | 2.9 | 492 | 170x | f32 SIMD vs f64 |
+| ray_aabb | 5.3 | 475 | 90x | f32 slab vs f64 slab |
+| ray_triangle | 8.0 | 698 | 87x | f32 vs f64 Moller-Trumbore |
+| gjk_intersect | 28.9 | -- | -- | f32 only |
+| gjk_epa | 155.7 | -- | -- | f32 only |
 | **Calculus** | | | | |
-| derivative x^2 | 1.2 | 483 | 403x | fncall overhead dominates |
-| simpson 100 steps | 142.2 | 6,000 | 42x | fncall1 per sample |
-| gauss_legendre_5 | 4.0 | — | — | |
-| bezier_cubic_3d | 2.9 | — | — | f32 |
-| catmull_rom | 2.7 | — | — | f32 |
+| derivative | 1.2 | 459 | 383x | fncall overhead |
+| simpson_100 | 142.1 | 5,000 | 35x | fncall1 per sample |
+| gauss_legendre_5 | 3.9 | -- | -- | |
 | **Numerical** | | | | |
-| newton_sqrt2 | 6.7 | — | — | |
-| bisection_sqrt2 | 112.5 | — | — | |
-| gcd | — | 447 | — | integer |
-| is_prime(1M+3) | — | 1,000 | — | Miller-Rabin |
-| lu_decompose_3x3 | 112.0 | — | — | |
-| cholesky_3x3 | 65.9 | — | — | |
-| eigenvalue_3x3 | 434.2 | — | — | |
-| svd_3x3 | 829.7 | — | — | |
-| fft_64 | 665.2 | — | — | |
-| fft_1024 | 16,594 | — | — | |
-| rk4 100 steps | 2,901 | — | — | |
-| **Complex** | | | | |
-| cx_mul | — | 431 | — | f64 |
+| gcd | -- | 433 | -- | integer |
+| is_prime(1M+3) | -- | 1,000 | -- | Miller-Rabin |
+| cx_mul | -- | 426 | -- | f64 |
 | **Color** | | | | |
-| srgb_to_linear | — | 499 | — | f64 pow |
-| tonemap_reinhard | — | 431 | — | f64 div |
+| srgb_to_linear | -- | 484 | -- | f64 pow |
+| tonemap_reinhard | -- | 421 | -- | f64 |
 
-## Rust-Only Benchmarks (no Cyrius equivalent measured)
+## Full Rust Benchmark Set (90 benchmarks)
 
-| Operation | Rust (ns) | Category |
+### Core transforms
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| transform3d_to_matrix | 5.79 |
+| transform3d_apply_point | 6.42 |
+| projection_perspective | 12.88 |
+| projection_orthographic | 4.49 |
+| lerp_f32 | 1.07 |
+| lerp_vec3 | 2.79 |
+
+### Core geometry
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| ray_sphere_hit | 2.94 |
+| ray_sphere_miss | 2.92 |
+| ray_plane_hit | 2.17 |
+| ray_aabb_hit | 5.27 |
+| aabb_contains | 3.14 |
+| sphere_contains | 2.39 |
+| aabb_merge | 4.31 |
+
+### Calculus
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| derivative_x_squared | 1.17 |
+| integral_simpson_100 | 142.1 |
+| integral_simpson_1000 | 1,366.9 |
+| integral_trapezoidal_100 | 75.5 |
+| integral_trapezoidal_1000 | 773.9 |
+| bezier_quadratic | 1.53 |
+| bezier_cubic | 2.55 |
+
+### Numerical
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| newton_sqrt2 | 6.62 |
+| bisection_sqrt2 | 111.9 |
+| gaussian_3x3 | 81.0 |
+| gaussian_4x4 | 109.1 |
+
+### v02 -- Geo + transforms extended
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| ray_triangle | 8.04 |
+| aabb_aabb_overlap | 2.37 |
+| sphere_sphere_overlap | 1.90 |
+| frustum_contains_point | 4.77 |
+| frustum_contains_aabb | 4.60 |
+| slerp | 21.09 |
+| transform3d_lerp | 25.10 |
+| closest_on_aabb | 2.73 |
+| segment_closest_point | 3.14 |
+| plane_plane_intersection | 7.62 |
+| triangle_unit_normal | 5.45 |
+| line_closest_point | 2.26 |
+| closest_on_sphere | 5.35 |
+| inverse_matrix | 20.10 |
+
+### v03 -- Curves + integration
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| bezier_cubic_3d | 2.95 |
+| de_casteljau_split | 6.19 |
+| catmull_rom | 2.71 |
+| bspline_cubic | 15.65 |
+| gauss_legendre_5 | 3.86 |
+| gauss_legendre_10_panels | 429.3 |
+| arc_length_100 | 643.2 |
+| ease_in_out | 0.60 |
+| ease_in_out_smooth | 0.84 |
+
+### v04a -- Linear algebra
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| lu_decompose_3x3 | 107.4 |
+| lu_solve_3x3 | 33.5 |
+| cholesky_3x3 | 69.3 |
+| cholesky_solve_3x3 | 39.6 |
+| qr_decompose_3col | 134.2 |
+| least_squares_linear_6pt | 186.0 |
+
+### v04b -- Spectral + eigen
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| eigenvalue_3x3 | 434.6 |
+| fft_64 | 663.0 |
+| fft_1024 | 16,515 |
+| fft_ifft_256 | 6,828 |
+| dst_64 | 41,239 |
+| dct_64 | 43,031 |
+
+### v04c -- ODE
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| rk4_exp_100_steps | 2,907 |
+| rk4_exp_1000_steps | 28,612 |
+| rk4_oscillator_1000 | 31,551 |
+
+### v05a -- Spatial (BVH, k-d tree)
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| bvh_build_100 | 8,047 |
+| bvh_ray_query_100 | 68.1 |
+| bvh_build_1000 | 102,210 |
+| kdtree_build_1000 | 114,830 |
+| kdtree_nearest_1000 | 267.8 |
+| kdtree_radius_1000 | 1,567 |
+
+### v05b -- Spatial (quadtree, octree, hash)
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| quadtree_insert_1000 | 76,370 |
+| quadtree_query_1000 | 416.8 |
+| octree_insert_1000 | 87,964 |
+| octree_query_1000 | 766.9 |
+| spatial_hash_insert_1000 | 43,978 |
+| spatial_hash_query_cell | 24.2 |
+
+### v05c -- Collision
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| convex_hull_100 | 2,242 |
+| gjk_intersect | 28.9 |
+| gjk_no_intersect | 22.2 |
+| gjk_epa_penetration | 155.7 |
+
+### v06 -- Advanced linalg
+
+| Benchmark | Rust (ns) |
+|-----------|-----------|
+| svd_3x3 | 761.6 |
+| svd_5x5 | 122,720 |
+| matrix_inverse_3x3 | 270.1 |
+| pseudo_inverse_3x2 | 587.9 |
+| csr_spmv_100x100 | 237.6 |
+| svd_4x2_tall | 558.3 |
+
+### Batch
+
+| Benchmark | Rust (ns) | Per-item |
 |-----------|-----------|----------|
-| transform2d_to_matrix | 6.6 | transforms |
-| transform2d_apply_point | 6.6 | transforms |
-| transform3d_to_matrix | 5.6 | transforms |
-| projection_perspective | 12.8 | transforms |
-| projection_orthographic | 4.4 | transforms |
-| lerp_f32 | 1.1 | transforms |
-| lerp_vec3 | 2.8 | transforms |
-| ray_plane_hit | 2.1 | geo |
-| aabb_contains | 3.1 | geo |
-| sphere_contains | 2.4 | geo |
-| aabb_merge | 4.1 | geo |
-| closest_on_aabb | 2.8 | geo |
-| closest_on_sphere | 5.4 | geo |
-| frustum_contains_point | 4.8 | geo |
-| triangle_unit_normal | 5.4 | geo |
-| segment_closest_point | 3.1 | geo |
-| integral_trapezoidal_100 | 75.4 | calc |
-| bezier_quadratic | 1.5 | calc |
-| gaussian_3x3 | 79.8 | num |
-| gaussian_4x4 | 111.0 | num |
-| lu_solve_3x3 | 34.3 | num |
-| qr_decompose_3col | 135.6 | num |
-| least_squares_6pt | 186.1 | num |
-| svd_5x5 | 122,720 | num |
-| csr_spmv_100x100 | 209.0 | num |
-| bvh_build_100 | 8,047 | spatial |
-| bvh_ray_query_100 | 67.4 | spatial |
-| bvh_build_1000 | 103,790 | spatial |
-| kdtree_nearest_1000 | 267.7 | spatial |
-| convex_hull_100 | 2,028 | geo |
-| rk4_oscillator_1000 | 31,484 | num |
+| ray_sphere x 100 | 200.9 | 2.0 |
+| aabb_contains x 100 | 135.3 | 1.4 |
+| transform3d x 100 | 383.4 | 3.8 |
+| simpson_sin x 10000 | 92,282 | 9.2 |
 
-## Batch Operations (Rust)
+## Full Cyrius Benchmark Set (21 benchmarks, 2026-04-15)
 
-| Operation | Rust (ns) | Per-item (ns) |
-|-----------|-----------|---------------|
-| ray_sphere × 100 | 201 | 2.0 |
-| aabb_contains × 100 | 135 | 1.4 |
-| transform3d × 100 | 388 | 3.9 |
-| simpson_sin × 10000 | 92,259 | 9.2 |
+| Benchmark | Avg (ns) | Min (ns) | Iterations |
+|-----------|---------|---------|------------|
+| vec3_add | 434 | 400 | 1,000,000 |
+| vec3_cross | 447 | 410 | 1,000,000 |
+| vec3_normalize | 458 | 420 | 1,000,000 |
+| quat_mul | 474 | 420 | 1,000,000 |
+| quat_slerp | 680 | 641 | 500,000 |
+| quat_rotate_vec3 | 457 | 420 | 1,000,000 |
+| m4_mul | 1,000 | 1,000 | 500,000 |
+| m4_inverse | 745 | 641 | 200,000 |
+| m4_transform_point | 581 | 510 | 1,000,000 |
+| t3d_compose | 661 | 561 | 500,000 |
+| ray_sphere | 492 | 460 | 1,000,000 |
+| ray_aabb | 475 | 450 | 1,000,000 |
+| ray_triangle | 698 | 611 | 1,000,000 |
+| srgb_to_linear | 484 | 460 | 1,000,000 |
+| tonemap_reinhard | 421 | 390 | 1,000,000 |
+| calc_derivative | 459 | 440 | 500,000 |
+| calc_simpson_100 | 5,000 | 5,000 | 100,000 |
+| num_gcd | 433 | 410 | 1,000,000 |
+| num_is_prime | 1,000 | 1,000 | 500,000 |
+| cx_mul | 426 | 400 | 1,000,000 |
+| ease_in_out | 403 | 380 | 1,000,000 |
 
 ## Analysis
 
 ### Why Cyrius is 30-700x slower per-operation
 
-Three architectural factors compound:
-
-| Factor | Cost | Applies to |
-|--------|------|-----------|
-| **Heap allocation** | ~200-400ns per `alloc()` + 3× `store64()` | Every Vec3/Quat/Mat4 construction |
-| **f64 vs f32** | ~1.5-2x | All math (Cyrius has no f32 type) |
-| **No SIMD** | ~2-4x | Vec/Mat ops (glam uses SSE2/AVX) |
-| **Function call overhead** | ~10-20ns per `fncall1` | Integration, root finding |
-| **Combined typical** | 30-100x | Simple operations |
-| **Combined worst** | 400-700x | Trivial ops (ease, lerp) where Rust inlines to 1 instruction |
+| Factor | Cost | When |
+|--------|------|------|
+| Heap allocation | ~200-400ns per alloc+store | Every Vec3/Quat/Mat4 |
+| f64 vs f32 | ~1.5-2x | All math |
+| No SIMD | ~2-4x | Vector/matrix ops |
+| fncall overhead | ~10-20ns | Integration, root finding |
+| Combined typical | 30-100x | Simple vector/matrix ops |
+| Combined worst | 400-700x | Trivial ops (ease, lerp) |
 
 ### Where Cyrius wins
 
-| Metric | Rust | Cyrius | Winner |
-|--------|------|--------|--------|
-| Binary size | ~800KB dynamic | 349KB static | **Cyrius 2.3x** |
-| Build time | seconds | instant | **Cyrius** |
-| Precision | f32 (1e-7) | f64 (1e-12) | **Cyrius 100,000x** |
-| Dependencies | 9 crates | 1 (sakshi) | **Cyrius** |
-| Source size | 33,612 lines | 8,945 lines | **Cyrius 3.8x** |
-| Cold start | dynamic linker | none (static) | **Cyrius** |
+| Metric | Rust | Cyrius |
+|--------|------|--------|
+| Binary | ~800KB dynamic | 511KB static |
+| Build | seconds | instant |
+| Precision | f32 (1e-7) | f64 (1e-12) |
+| Dependencies | 9 crates | 1 (sakshi) |
+| Source | 33,612 lines | 15,676 lines |
 
-### When the speed gap matters
+### Optimization vectors for future versions
 
-For **hot inner loops** (transform 10K vertices, ray-trace 1M pixels), the 30-100x gap is significant. For **setup/logic** (configure a projection, solve an ODE, factorize a matrix), the gap is irrelevant — the operations take microseconds either way.
-
-**Consumer impact:**
-- **kiran** (engine): Hot transform paths need optimization. Use arena allocators for batch ops.
-- **impetus** (physics): PGS solver runs many iterations — each microsecond matters at scale.
-- **joshua** (simulation): ODE integration is I/O-bound, not compute-bound. Gap doesn't matter.
-- **mimamsa/kana** (physics): Matrix factorizations are one-shot. f64 precision is a requirement, not a trade.
-
-### Future optimization vectors
-
-1. **Arena allocation** — `arena_new/arena_alloc/arena_reset` amortizes allocation across batch ops
-2. **Stack structs** — Cyrius single-field structs are stack-allocated; split Vec3 into 3 separate values in hot paths
-3. **SIMD intrinsics** — Cyrius 5.x roadmap includes SIMD; this would close the gap 2-4x
-4. **Inline expansion** — `#regalloc` + DCE already reduce overhead; future inlining would help trivial wrappers
+1. **Arena allocation** -- amortize alloc across batch ops
+2. **Stack structs** -- Cyrius single-field structs are stack-allocated
+3. **SIMD** -- Cyrius 5.x roadmap; would close gap 2-4x
+4. **Inline expansion** -- `#regalloc` + DCE already help; future inlining would help trivial wrappers

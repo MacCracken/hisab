@@ -1,0 +1,497 @@
+# sakshi.cyr — tracing, error handling, and structured logging
+# Single-file distribution. Zero heap allocation. No external dependencies.
+# Version: 0.9.0
+#
+# Usage: include "lib/sakshi_full.cyr"
+#
+# Error:  sakshi_err_new(code, cat), sakshi_err_with_ctx(code, cat, ctx),
+#         sakshi_err_code(e), sakshi_err_category(e), sakshi_err_context(e),
+#         sakshi_is_err(e), sakshi_is_ok(e), sakshi_err_at_span(code, cat)
+# Trace:  sakshi_error(msg, len), sakshi_warn, sakshi_info, sakshi_debug, sakshi_trace
+#         sakshi_set_level(lvl), sakshi_get_level()
+# Span:   sakshi_span_enter(name, len), sakshi_span_exit(), sakshi_span_depth()
+# Output: sakshi_set_output(target), sakshi_set_output_fd(fd),
+#         sakshi_output_file(path), sakshi_output_file_close(),
+#         sakshi_output_buffer(), sakshi_ring_read_raw(dst, max), sakshi_ring_len(),
+#         sakshi_ring_clear(), sakshi_ring_event_count(), sakshi_ring_decode_event(...),
+#         sakshi_output_udp(ip, port), sakshi_output_udp_close(), sakshi_ipv4(a,b,c,d)
+
+# ================================================================
+# Constants (all in enums — zero global variable slots)
+# ================================================================
+
+enum ErrCat {
+    ERR_CAT_NONE    = 0x0000;
+    ERR_CAT_SYSCALL = 0x0001;
+    ERR_CAT_IO      = 0x0002;
+    ERR_CAT_PARSE   = 0x0003;
+    ERR_CAT_CONFIG  = 0x0004;
+    ERR_CAT_RUNTIME = 0x0005;
+    ERR_CAT_ALLOC   = 0x0006;
+    ERR_CAT_NET     = 0x0007;
+    ERR_CAT_AUTH    = 0x0008;
+}
+
+enum ErrCode {
+    ERR_OK          = 0;
+    ERR_UNKNOWN     = 1;
+    ERR_INVALID     = 2;
+    ERR_NOT_FOUND   = 3;
+    ERR_PERMISSION  = 4;
+    ERR_TIMEOUT     = 5;
+    ERR_OVERFLOW    = 6;
+    ERR_BUSY        = 7;
+}
+
+enum LogLevel {
+    SK_ERROR = 0;
+    SK_WARN  = 1;
+    SK_INFO  = 2;
+    SK_DEBUG = 3;
+    SK_TRACE = 4;
+}
+
+enum SpanAction {
+    SK_SPAN_ENTER = 10;
+    SK_SPAN_EXIT  = 11;
+}
+
+enum OutputTarget {
+    SK_OUT_STDERR = 0;
+    SK_OUT_FILE   = 1;
+    SK_OUT_BUFFER = 2;
+    SK_OUT_UDP    = 3;
+}
+
+enum _SkConst {
+    _SK_SYS_CLOCK_GETTIME = 228;
+    _SK_CLOCK_MONO_RAW    = 4;
+    _SK_BIN_HDR           = 12;
+    _SK_RING_MASK         = 0xFFF;
+    _SK_MAX_SPANS         = 16;
+}
+
+# ================================================================
+# Global state (8 vars + 3 arrays = minimal footprint)
+# ================================================================
+
+var _sk_log_level = 2;
+var _sk_output_target = 0;
+var _sk_stderr_fd = 2;
+var _sk_file_fd: i64 = 0 - 1;
+var _sk_udp_fd: i64 = 0 - 1;
+var _sk_ring_write: i64 = 0;
+var _sk_ring_count: i64 = 0;
+var _sk_span_depth: i64 = 0;
+var _sk_ring_buf[4096];
+var _sk_udp_addr[16];
+var _sk_span_stack[384];
+
+# ================================================================
+# Internal primitives
+# ================================================================
+
+fn _sk_strlen(s) {
+    var n: i64 = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    return n;
+}
+
+fn _sk_memcpy(dst, src, n) {
+    for (var i = 0; i < n; i = i + 1) { store8(dst + i, load8(src + i)); }
+    return dst;
+}
+
+fn _sk_now_ns() {
+    var ts[16];
+    syscall(_SK_SYS_CLOCK_GETTIME, _SK_CLOCK_MONO_RAW, &ts);
+    return load64(&ts) * 1000000000 + load64(&ts + 8);
+}
+
+fn _sk_fmt_int(n, buf) {
+    var bi = 23;
+    var neg: i64 = 0;
+    if (n < 0) { neg = 1; n = 0 - n; }
+    if (n == 0) { store8(buf + bi, 48); bi = bi - 1; }
+    while (n > 0) { store8(buf + bi, 48 + n % 10); bi = bi - 1; n = n / 10; }
+    if (neg == 1) { store8(buf + bi, 45); bi = bi - 1; }
+    var len = 23 - bi;
+    var src = bi + 1;
+    for (var si = 0; si < len; si = si + 1) { store8(buf + si, load8(buf + src + si)); }
+    store8(buf + len, 0);
+    return len;
+}
+
+fn _sk_write_int(buf, pos, cap, val) {
+    var tmp[24];
+    var tlen = _sk_fmt_int(val, &tmp);
+    var ti = 0;
+    while (ti < tlen && pos < cap) {
+        store8(buf + pos, load8(&tmp + ti));
+        pos = pos + 1; ti = ti + 1;
+    }
+    return pos;
+}
+
+fn _sk_write_str(buf, pos, cap, s, slen) {
+    var wi = 0;
+    while (wi < slen && pos < cap) { store8(buf + pos, load8(s + wi)); pos = pos + 1; wi = wi + 1; }
+    return pos;
+}
+
+# ================================================================
+# Level-to-string helper
+# ================================================================
+
+fn _sk_level_str(level, out_str, out_len) {
+    match level {
+        0  => { store64(out_str, "ERROR"); store64(out_len, 5); }
+        1  => { store64(out_str, "WARN");  store64(out_len, 4); }
+        2  => { store64(out_str, "INFO");  store64(out_len, 4); }
+        3  => { store64(out_str, "DEBUG"); store64(out_len, 5); }
+        4  => { store64(out_str, "TRACE"); store64(out_len, 5); }
+        10 => { store64(out_str, "ENTER"); store64(out_len, 5); }
+        11 => { store64(out_str, "EXIT");  store64(out_len, 4); }
+        _  => { store64(out_str, "?????"); store64(out_len, 5); }
+    }
+    return 0;
+}
+
+# ================================================================
+# Text formatters
+# ================================================================
+
+fn _sk_fmt_line(buf, cap, level_str, level_len, msg, msg_len) {
+    var pos: i64 = 0;
+    var ts = _sk_now_ns();
+    if (pos < cap) { store8(buf + pos, 91); pos = pos + 1; }
+    pos = _sk_write_int(buf, pos, cap, ts);
+    if (pos < cap) { store8(buf + pos, 93); pos = pos + 1; }
+    if (pos < cap) { store8(buf + pos, 32); pos = pos + 1; }
+    if (pos < cap) { store8(buf + pos, 91); pos = pos + 1; }
+    pos = _sk_write_str(buf, pos, cap, level_str, level_len);
+    if (pos < cap) { store8(buf + pos, 93); pos = pos + 1; }
+    if (pos < cap) { store8(buf + pos, 32); pos = pos + 1; }
+    pos = _sk_write_str(buf, pos, cap, msg, msg_len);
+    if (pos < cap) { store8(buf + pos, 10); pos = pos + 1; }
+    return pos;
+}
+
+fn _sk_fmt_span(buf, cap, action, action_len, name, name_len, elapsed_ns) {
+    var pos: i64 = 0;
+    var ts = _sk_now_ns();
+    if (pos < cap) { store8(buf + pos, 91); pos = pos + 1; }
+    pos = _sk_write_int(buf, pos, cap, ts);
+    if (pos < cap) { store8(buf + pos, 93); pos = pos + 1; }
+    if (pos < cap) { store8(buf + pos, 32); pos = pos + 1; }
+    if (pos < cap) { store8(buf + pos, 91); pos = pos + 1; }
+    pos = _sk_write_str(buf, pos, cap, action, action_len);
+    if (pos < cap) { store8(buf + pos, 93); pos = pos + 1; }
+    if (pos < cap) { store8(buf + pos, 32); pos = pos + 1; }
+    pos = _sk_write_str(buf, pos, cap, name, name_len);
+    if (elapsed_ns > 0) {
+        if (pos < cap) { store8(buf + pos, 32); pos = pos + 1; }
+        if (pos < cap) { store8(buf + pos, 40); pos = pos + 1; }
+        pos = _sk_write_int(buf, pos, cap, elapsed_ns);
+        if (pos < cap) { store8(buf + pos, 110); pos = pos + 1; }
+        if (pos < cap) { store8(buf + pos, 115); pos = pos + 1; }
+        if (pos < cap) { store8(buf + pos, 41); pos = pos + 1; }
+    }
+    if (pos < cap) { store8(buf + pos, 10); pos = pos + 1; }
+    return pos;
+}
+
+# ================================================================
+# Output: stderr
+# ================================================================
+
+fn _sk_write_stderr(buf, len) {
+    syscall(1, _sk_stderr_fd, buf, len);
+    return 0;
+}
+
+fn _sk_write_file(buf, len) {
+    if (_sk_file_fd >= 0) { syscall(1, _sk_file_fd, buf, len); }
+    return 0;
+}
+
+fn _sk_write(buf, len) {
+    if (_sk_output_target == SK_OUT_FILE) { return _sk_write_file(buf, len); }
+    return _sk_write_stderr(buf, len);
+}
+
+# ================================================================
+# Output: ring buffer (binary events, 4KB, overwrite-oldest)
+# ================================================================
+
+fn _sk_ring_put(byte) {
+    store8(&_sk_ring_buf + (_sk_ring_write & _SK_RING_MASK), byte);
+    _sk_ring_write = _sk_ring_write + 1;
+    return 0;
+}
+
+fn _sk_write_ring_event(level, category, msg, msg_len) {
+    var ts = _sk_now_ns();
+    _sk_ring_put(ts & 0xFF);
+    _sk_ring_put((ts >> 8) & 0xFF);
+    _sk_ring_put((ts >> 16) & 0xFF);
+    _sk_ring_put((ts >> 24) & 0xFF);
+    _sk_ring_put((ts >> 32) & 0xFF);
+    _sk_ring_put((ts >> 40) & 0xFF);
+    _sk_ring_put((ts >> 48) & 0xFF);
+    _sk_ring_put((ts >> 56) & 0xFF);
+    _sk_ring_put(level & 0xFF);
+    _sk_ring_put(category & 0xFF);
+    _sk_ring_put(msg_len & 0xFF);
+    _sk_ring_put((msg_len >> 8) & 0xFF);
+    var mi = 0;
+    while (mi < msg_len) { _sk_ring_put(load8(msg + mi)); mi = mi + 1; }
+    _sk_ring_count = _sk_ring_count + 1;
+    return 0;
+}
+
+# ================================================================
+# Output: UDP (binary events)
+# ================================================================
+
+fn _sk_write_udp_event(level, category, msg, msg_len) {
+    if (_sk_udp_fd < 0) { return 0; }
+    var ts = _sk_now_ns();
+    var pkt[268];
+    store64(&pkt, ts);
+    store8(&pkt + 8, level);
+    store8(&pkt + 9, category);
+    store16(&pkt + 10, msg_len);
+    var pml = msg_len;
+    if (pml > 256) { pml = 256; }
+    _sk_memcpy(&pkt + 12, msg, pml);
+    syscall(44, _sk_udp_fd, &pkt, 12 + pml, 0, &_sk_udp_addr, 16);
+    return 0;
+}
+
+# ================================================================
+# Emit dispatchers
+# ================================================================
+
+fn _sk_emit(level, category, msg, msg_len) {
+    if (_sk_output_target == SK_OUT_BUFFER) {
+        return _sk_write_ring_event(level, category, msg, msg_len);
+    }
+    if (_sk_output_target == SK_OUT_UDP) {
+        return _sk_write_udp_event(level, category, msg, msg_len);
+    }
+    var buf[256];
+    var ls: i64 = 0;
+    var ll: i64 = 0;
+    _sk_level_str(level, &ls, &ll);
+    var len = _sk_fmt_line(&buf, 256, ls, ll, msg, msg_len);
+    _sk_write(&buf, len);
+    return 0;
+}
+
+fn _sk_emit_span(action_level, action_str, action_len, name, name_len, elapsed_ns) {
+    if (_sk_output_target == SK_OUT_BUFFER) {
+        return _sk_write_ring_event(action_level, 0, name, name_len);
+    }
+    if (_sk_output_target == SK_OUT_UDP) {
+        return _sk_write_udp_event(action_level, 0, name, name_len);
+    }
+    var buf[256];
+    var len = _sk_fmt_span(&buf, 256, action_str, action_len, name, name_len, elapsed_ns);
+    _sk_write(&buf, len);
+    return 0;
+}
+
+# ================================================================
+# Error API
+# ================================================================
+
+# Create a packed error (code + category)
+fn sakshi_err_new(code, category) {
+    return ((category & 0xFFFF) << 16) | (code & 0xFFFF);
+}
+
+# Create a packed error with context
+fn sakshi_err_with_ctx(code, category, context) {
+    return ((context & 0xFFFFFFFF) << 32) | ((category & 0xFFFF) << 16) | (code & 0xFFFF);
+}
+
+# Extract error code from packed error
+fn sakshi_err_code(err) { return err & 0xFFFF; }
+# Extract category from packed error
+fn sakshi_err_category(err) { return (err >> 16) & 0xFFFF; }
+# Extract context from packed error
+fn sakshi_err_context(err) { return (err >> 32) & 0xFFFFFFFF; }
+# Check if value is an error (non-zero)
+fn sakshi_is_err(err) { if (err != 0) { return 1; } return 0; }
+# Check if value is OK (zero)
+fn sakshi_is_ok(err) { if (err == 0) { return 1; } return 0; }
+
+# ================================================================
+# Trace API
+# ================================================================
+
+# Set minimum log level for output
+fn sakshi_set_level(level) { _sk_log_level = level; return 0; }
+# Get current minimum log level
+fn sakshi_get_level() { return _sk_log_level; }
+
+fn _sk_log(level, msg, msg_len) {
+    if (level > _sk_log_level) { return 0; }
+    _sk_emit(level, 0, msg, msg_len);
+    return 0;
+}
+
+# Log an error message
+fn sakshi_error(msg, msg_len) { _sk_log(SK_ERROR, msg, msg_len); return 0; }
+# Log a warning message
+fn sakshi_warn(msg, msg_len)  { _sk_log(SK_WARN, msg, msg_len); return 0; }
+# Log an info message
+fn sakshi_info(msg, msg_len)  { _sk_log(SK_INFO, msg, msg_len); return 0; }
+# Log a debug message
+fn sakshi_debug(msg, msg_len) { _sk_log(SK_DEBUG, msg, msg_len); return 0; }
+# Log a trace message
+fn sakshi_trace(msg, msg_len) { _sk_log(SK_TRACE, msg, msg_len); return 0; }
+
+# ================================================================
+# Span API
+# ================================================================
+
+# Enter a named span (push onto span stack with timestamp)
+fn sakshi_span_enter(name, name_len) {
+    if (_sk_span_depth >= _SK_MAX_SPANS) { return 0; }
+    var offset = _sk_span_depth * 24;
+    store64(&_sk_span_stack + offset, name);
+    store64(&_sk_span_stack + offset + 8, name_len);
+    store64(&_sk_span_stack + offset + 16, _sk_now_ns());
+    _sk_span_depth = _sk_span_depth + 1;
+    _sk_emit_span(SK_SPAN_ENTER, "ENTER", 5, name, name_len, 0);
+    return 0;
+}
+
+# Exit current span (pop, compute elapsed, emit)
+fn sakshi_span_exit() {
+    if (_sk_span_depth <= 0) { return 0; }
+    _sk_span_depth = _sk_span_depth - 1;
+    var offset = _sk_span_depth * 24;
+    var name = load64(&_sk_span_stack + offset);
+    var name_len = load64(&_sk_span_stack + offset + 8);
+    var start = load64(&_sk_span_stack + offset + 16);
+    var elapsed = _sk_now_ns() - start;
+    _sk_emit_span(SK_SPAN_EXIT, "EXIT", 4, name, name_len, elapsed);
+    return elapsed;
+}
+
+# Get current span nesting depth
+fn sakshi_span_depth() { return _sk_span_depth; }
+
+# Create error with current span depth as context
+fn sakshi_err_at_span(code, category) {
+    return sakshi_err_with_ctx(code, category, sakshi_span_depth());
+}
+
+# ================================================================
+# Output API
+# ================================================================
+
+# Set output target (stderr, file, buffer, UDP)
+fn sakshi_set_output(target) { _sk_output_target = target; return 0; }
+
+# Set the stderr file descriptor directly
+fn sakshi_set_output_fd(fd) {
+    _sk_stderr_fd = fd;
+    _sk_output_target = SK_OUT_STDERR;
+    return 0;
+}
+
+# Open a file for log output
+fn sakshi_output_file(path) {
+    var fd = syscall(2, path, 1089, 0x1A4);
+    if (fd < 0) { return fd; }
+    _sk_file_fd = fd;
+    _sk_output_target = SK_OUT_FILE;
+    return fd;
+}
+
+# Close the log output file
+fn sakshi_output_file_close() {
+    if (_sk_file_fd >= 0) { syscall(3, _sk_file_fd); _sk_file_fd = 0 - 1; }
+    _sk_output_target = SK_OUT_STDERR;
+    return 0;
+}
+
+# Switch to ring buffer output mode
+fn sakshi_output_buffer() { _sk_output_target = SK_OUT_BUFFER; return 0; }
+
+# Read raw bytes from ring buffer
+fn sakshi_ring_read_raw(dst, max_len) {
+    var avail = _sk_ring_write;
+    if (avail > 4096) { avail = 4096; }
+    if (avail > max_len) { avail = max_len; }
+    var start = _sk_ring_write - avail;
+    var ri = 0;
+    while (ri < avail) {
+        store8(dst + ri, load8(&_sk_ring_buf + ((start + ri) & _SK_RING_MASK)));
+        ri = ri + 1;
+    }
+    return avail;
+}
+
+# Get number of events in ring buffer
+fn sakshi_ring_event_count() { return _sk_ring_count; }
+# Get current ring buffer byte length
+fn sakshi_ring_len() { if (_sk_ring_write > 4096) { return 4096; } return _sk_ring_write; }
+# Clear the ring buffer
+fn sakshi_ring_clear() { _sk_ring_write = 0; _sk_ring_count = 0; return 0; }
+
+# Decode a binary ring event to text
+fn sakshi_ring_decode_event(buf, buf_len, dst, dst_cap, out_text_len) {
+    if (buf_len < _SK_BIN_HDR) { store64(out_text_len, 0); return 0; }
+    var ts = load64(buf);
+    var level = load8(buf + 8);
+    var msg_len = load16(buf + 10);
+    var event_size = _SK_BIN_HDR + msg_len;
+    if (buf_len < event_size) { store64(out_text_len, 0); return 0; }
+    var ls: i64 = 0;
+    var ll: i64 = 0;
+    _sk_level_str(level, &ls, &ll);
+    var pos: i64 = 0;
+    if (pos < dst_cap) { store8(dst + pos, 91); pos = pos + 1; }
+    pos = _sk_write_int(dst, pos, dst_cap, ts);
+    if (pos < dst_cap) { store8(dst + pos, 93); pos = pos + 1; }
+    if (pos < dst_cap) { store8(dst + pos, 32); pos = pos + 1; }
+    if (pos < dst_cap) { store8(dst + pos, 91); pos = pos + 1; }
+    pos = _sk_write_str(dst, pos, dst_cap, ls, ll);
+    if (pos < dst_cap) { store8(dst + pos, 93); pos = pos + 1; }
+    if (pos < dst_cap) { store8(dst + pos, 32); pos = pos + 1; }
+    pos = _sk_write_str(dst, pos, dst_cap, buf + _SK_BIN_HDR, msg_len);
+    if (pos < dst_cap) { store8(dst + pos, 10); pos = pos + 1; }
+    store64(out_text_len, pos);
+    return event_size;
+}
+
+# Open UDP socket for log output
+fn sakshi_output_udp(ip, port) {
+    var fd = syscall(41, 2, 2, 0);
+    if (fd < 0) { return fd; }
+    _sk_udp_fd = fd;
+    var port_be = ((port & 0xFF) << 8) | ((port >> 8) & 0xFF);
+    store16(&_sk_udp_addr, 2);
+    store16(&_sk_udp_addr + 2, port_be);
+    store32(&_sk_udp_addr + 4, ip);
+    store64(&_sk_udp_addr + 8, 0);
+    _sk_output_target = SK_OUT_UDP;
+    return fd;
+}
+
+# Close UDP output socket
+fn sakshi_output_udp_close() {
+    if (_sk_udp_fd >= 0) { syscall(3, _sk_udp_fd); _sk_udp_fd = 0 - 1; }
+    _sk_output_target = SK_OUT_STDERR;
+    return 0;
+}
+
+# Build IPv4 address from 4 octets
+fn sakshi_ipv4(a, b, c, d) {
+    return a | (b << 8) | (c << 16) | (d << 24);
+}

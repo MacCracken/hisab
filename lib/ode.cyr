@@ -1,0 +1,692 @@
+# ode.cyr — ODE solvers for hisab
+# Usage: include "lib/ode.cyr"
+# Requires: alloc.cyr, vec.cyr, fnptr.cyr, math.cyr, f64_util.cyr, error.cyr
+#
+# Provides:
+#   Adaptive:     ode_dopri45, ode_dopri45_trajectory
+#   Implicit:     ode_backward_euler
+#   Stiff (BDF):  ode_bdf2, ode_bdf
+#   Stochastic:   ode_euler_maruyama, ode_milstein
+#   Symplectic:   ode_symplectic_euler, ode_verlet, ode_leapfrog, ode_yoshida4
+#
+# All f64 values are bit patterns (IEEE 754). Integer arguments are raw i64.
+# Functions return 0 (ERR_NONE) on success, negative ERR_* on failure.
+# Results are written through out-param pointers.
+# Function pointers: fncall1(fp, arg), fncall2(fp, arg1, arg2)
+
+# ================================================================
+# Constants (f64 bit patterns)
+# ================================================================
+var _ODE_F64_ZERO     = 0;                           # 0.0
+var _ODE_F64_ONE      = 0x3FF0000000000000;          # 1.0
+var _ODE_F64_TWO      = 0x4000000000000000;          # 2.0
+var _ODE_F64_HALF     = 0x3FE0000000000000;          # 0.5
+var _ODE_F64_SIX      = 0x4018000000000000;          # 6.0
+var _ODE_F64_THREE    = 0x4008000000000000;          # 3.0
+var _ODE_F64_FOUR     = 0x4010000000000000;          # 4.0
+var _ODE_F64_FIVE     = 0x4014000000000000;          # 5.0
+
+# Safety factor for adaptive step control: 0.9
+var _ODE_SAFETY       = 0x3FECCCCCCCCCCCCD;          # 0.9
+# Step growth clamp: 0.2
+var _ODE_MIN_FACTOR   = 0x3FC999999999999A;          # 0.2
+# Step growth clamp: 5.0
+var _ODE_MAX_FACTOR   = 0x4014000000000000;          # 5.0
+# Exponent for DOPRI error control: -0.2 = -1/5
+var _ODE_EXP_NEG_0P2  = 0xBFC999999999999A;         # -0.2
+# Max steps for trajectory integration
+var _ODE_MAX_STEPS    = 100000;
+
+# ================================================================
+# Dormand-Prince RK4(5) Butcher tableau coefficients (f64 hex)
+# ================================================================
+
+# Time nodes: c2=1/5, c3=3/10, c4=4/5, c5=8/9, c6=1, c7=1
+var _DP_C2 = 0x3FC999999999999A;   # 0.2
+var _DP_C3 = 0x3FD3333333333333;   # 0.3
+var _DP_C4 = 0x3FE999999999999A;   # 0.8
+var _DP_C5 = 0x3FEC71C71C71C71C;   # 8/9 = 0.888...
+
+# Stage 2: a21 = 1/5
+var _DP_A21 = 0x3FC999999999999A;  # 0.2
+
+# Stage 3: a31 = 3/40, a32 = 9/40
+var _DP_A31 = 0x3FB3333333333333;  # 0.075
+var _DP_A32 = 0x3FC6666666666666;  # 0.225
+
+# Stage 4: a41 = 44/45, a42 = -56/15, a43 = 32/9
+var _DP_A41 = 0x3FEEEEEEEEEEEEEF;  # 44/45 = 0.97777...
+var _DP_A42 = 0xC00EAAAAAAAAAAAB;  # -56/15 = -3.73333...
+var _DP_A43 = 0x400C71C71C71C71C;  # 32/9 = 3.55555...
+
+# Stage 5: a51..a54
+var _DP_A51 = 0x4007A5EB3F13EB9C;  # 19372/6561 = 2.95259...
+var _DP_A52 = 0xC027556D5556D556;  # -25360/2187 = -11.5959...
+var _DP_A53 = 0x40237AEB6D9F5C29;  # 64448/6561 = 9.82269...
+var _DP_A54 = 0xBFCA3752D25F0CB1;  # -212/729 = -0.29080...
+
+# Stage 6: a61..a65
+var _DP_A61 = 0x400C9234D9234D92;  # 9017/3168 = 2.84627...
+var _DP_A62 = 0xC025B0B0B0B0B0B1;  # -355/33 = -10.7575...
+var _DP_A63 = 0x4022E60F5E60F5E6;  # 46732/5247 = 8.90642...
+var _DP_A64 = 0x3FC638E38E38E38E;  # 49/176 = 0.27840909...
+var _DP_A65 = 0xBFE15E13B45DA4A0;  # -5103/18656 = -0.27352...
+
+# 5th-order weights b1..b7 (b2=0, b7=0)
+var _DP_B1 = 0x3FA72D1972D1972D;   # 35/384 = 0.09114583...
+var _DP_B3 = 0x3FCBF08EB83E36EB;   # 500/1113 = 0.44923...
+var _DP_B4 = 0x3FE4AAAAAAAAAAAB;   # 125/192 = 0.65104166...
+var _DP_B5 = 0xBFD4252D4252D425;   # -2187/6784 = -0.32237...
+var _DP_B6 = 0x3FA4FA4FA4FA4FA5;   # 11/84 = 0.13095...
+
+# Error coefficients: e_i = b5_i - b4_i
+var _DP_E1 = 0x3F93DA2C4FC5A37B;   # 71/57600 = 0.0012326...
+var _DP_E3 = 0xBFA10F8A7B3FB5D8;   # -71/16695 = -0.004252...
+var _DP_E4 = 0x3FB28F5C28F5C28F;   # 71/1920 = 0.036979...
+var _DP_E5 = 0xBFD484C8A9FE9C4C;   # -17253/339200 = -0.050862...
+var _DP_E6 = 0x3FA5604189374BC7;   # 22/525 = 0.041904...
+var _DP_E7 = 0xBF89999999999999;   # -1/40 = -0.025
+
+# ================================================================
+# BDF coefficients
+# ================================================================
+
+# BDF-2: y_{n+1} = (4/3)*y_n - (1/3)*y_{n-1} + (2/3)*h*f(t_{n+1}, y_{n+1})
+var _BDF2_A0 = 0x3FF5555555555555;  # 4/3
+var _BDF2_A1 = 0xBFD5555555555555;  # -1/3
+var _BDF2_BETA = 0x3FE5555555555555; # 2/3
+
+# BDF-3: alpha = [18/11, -9/11, 2/11], beta = 6/11
+var _BDF3_A0 = 0x3FFA2E8BA2E8BA2F;  # 18/11 = 1.636363...
+var _BDF3_A1 = 0xBFEA2E8BA2E8BA2F;  # -9/11 = -0.818181...
+var _BDF3_A2 = 0x3FC745D1745D1746;  # 2/11 = 0.181818...
+var _BDF3_BETA = 0x3FE1745D1745D174; # 6/11 = 0.545454...
+
+# BDF-4: alpha = [48/25, -36/25, 16/25, -3/25], beta = 12/25
+var _BDF4_A0 = 0x3FFEB851EB851EB8;  # 48/25 = 1.92
+var _BDF4_A1 = 0xBFF70A3D70A3D70A;  # -36/25 = -1.44
+var _BDF4_A2 = 0x3FE428F5C28F5C29;  # 16/25 = 0.64
+var _BDF4_A3 = 0xBFB999999999999A;  # -3/25 = -0.12
+var _BDF4_BETA = 0x3FDED916872B020C; # 12/25 = 0.48
+
+# BDF-5: alpha = [300/137, -300/137, 200/137, -75/137, 12/137], beta = 60/137
+var _BDF5_A0 = 0x40018348B5965880;  # 300/137 = 2.189781...
+var _BDF5_A1 = 0xC00183C0CA4587A5;  # -300/137 = -2.189781... (wait, it's the same?)
+# Correction: BDF-5 alphas from standard tables
+# y_{n+1} = (300/137)*y_n - (300/137)*y_{n-1} + (200/137)*y_{n-2} - (75/137)*y_{n-3} + (12/137)*y_{n-4} + (60/137)*h*f
+var _BDF5_A1_C = 0xC00183C0CA4587A5;  # -300/137
+var _BDF5_A2 = 0x3FFD1745D1745D17;  # 200/137 = 1.459854...
+var _BDF5_A3 = 0xBFE1745D1745D174;  # -75/137 = -0.547445...
+var _BDF5_A4 = 0x3FB1A7B9611A7B96;  # 12/137 = 0.087591...
+var _BDF5_BETA = 0x3FDC0CA4587A5F4D; # 60/137 = 0.437956...
+
+# ================================================================
+# Yoshida 4th-order coefficients
+# ================================================================
+# cbrt(2) = 1.2599210498948732
+# w1 = 1 / (2 - cbrt(2))
+# w0 = -cbrt(2) / (2 - cbrt(2))
+# c = [w1/2, (w0+w1)/2, (w0+w1)/2, w1/2]
+# d = [w1, w0, w1]
+
+var _Y4_W1   = 0x3FF294A4B0DC9060;  # 1/(2 - 2^(1/3)) = 1.35120719...
+var _Y4_W0   = 0xBFEB29493B925842;  # -2^(1/3)/(2 - 2^(1/3)) = -1.70241438...
+
+# c[0] = w1 * 0.5
+var _Y4_C0   = 0x3FE294A4B0DC9060;  # 0.67560359...
+# c[1] = (w0 + w1) * 0.5
+var _Y4_C1   = 0xBFC35F05BD1791E2;  # -0.17560359...
+# c[2] = c[1]
+# c[3] = c[0]
+
+# ================================================================
+# DOPRI45 — Dormand-Prince adaptive RK4(5)
+# ================================================================
+
+# Single DOPRI45 step (scalar ODE).
+# f: function pointer, fncall2(f, t, y) -> dy/dt
+# t: current time (f64)
+# y: current state (f64)
+# dt: time step (f64)
+# out_y: pointer — new y value written here
+# out_err: pointer — error estimate written here
+# Returns: ERR_NONE
+fn ode_dopri45(f, t, y, dt, out_y, out_err) {
+    # Stage 1
+    var k1 = fncall2(f, t, y);
+
+    # Stage 2
+    var t2 = f64_add(t, f64_mul(dt, _DP_C2));
+    var y2 = f64_add(y, f64_mul(dt, f64_mul(_DP_A21, k1)));
+    var k2 = fncall2(f, t2, y2);
+
+    # Stage 3
+    var t3 = f64_add(t, f64_mul(dt, _DP_C3));
+    var y3 = f64_add(y, f64_mul(dt, f64_add(
+        f64_mul(_DP_A31, k1),
+        f64_mul(_DP_A32, k2))));
+    var k3 = fncall2(f, t3, y3);
+
+    # Stage 4
+    var t4 = f64_add(t, f64_mul(dt, _DP_C4));
+    var y4 = f64_add(y, f64_mul(dt, f64_add(
+        f64_mul(_DP_A41, k1),
+        f64_add(f64_mul(_DP_A42, k2),
+                f64_mul(_DP_A43, k3)))));
+    var k4 = fncall2(f, t4, y4);
+
+    # Stage 5
+    var t5 = f64_add(t, f64_mul(dt, _DP_C5));
+    var y5 = f64_add(y, f64_mul(dt, f64_add(
+        f64_mul(_DP_A51, k1),
+        f64_add(f64_mul(_DP_A52, k2),
+        f64_add(f64_mul(_DP_A53, k3),
+                f64_mul(_DP_A54, k4))))));
+    var k5 = fncall2(f, t5, y5);
+
+    # Stage 6
+    var t6 = f64_add(t, dt);
+    var y6 = f64_add(y, f64_mul(dt, f64_add(
+        f64_mul(_DP_A61, k1),
+        f64_add(f64_mul(_DP_A62, k2),
+        f64_add(f64_mul(_DP_A63, k3),
+        f64_add(f64_mul(_DP_A64, k4),
+                f64_mul(_DP_A65, k5)))))));
+    var k6 = fncall2(f, t6, y6);
+
+    # 5th-order solution (b2=0, b7=0)
+    var y_new = f64_add(y, f64_mul(dt, f64_add(
+        f64_mul(_DP_B1, k1),
+        f64_add(f64_mul(_DP_B3, k3),
+        f64_add(f64_mul(_DP_B4, k4),
+        f64_add(f64_mul(_DP_B5, k5),
+                f64_mul(_DP_B6, k6)))))));
+
+    # Stage 7 (FSAL — for error estimate)
+    var k7 = fncall2(f, f64_add(t, dt), y_new);
+
+    # Error estimate: sum of e_i * k_i
+    var err = f64_mul(dt, f64_add(
+        f64_mul(_DP_E1, k1),
+        f64_add(f64_mul(_DP_E3, k3),
+        f64_add(f64_mul(_DP_E4, k4),
+        f64_add(f64_mul(_DP_E5, k5),
+        f64_add(f64_mul(_DP_E6, k6),
+                f64_mul(_DP_E7, k7)))))));
+
+    store64(out_y, y_new);
+    store64(out_err, f64_abs(err));
+    return ERR_NONE;
+}
+
+# Full DOPRI45 trajectory with adaptive stepping (scalar ODE).
+# f: function pointer, fncall2(f, t, y) -> dy/dt
+# t0: initial time (f64)
+# y0: initial state (f64)
+# tf: final time (f64)
+# dt0: initial step size (f64)
+# tol: error tolerance (f64)
+# out_ts: vec — time values pushed here
+# out_ys: vec — state values pushed here
+# Returns: ERR_NONE on success, ERR_NO_CONVERGENCE if max steps exceeded
+fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
+    var t = t0;
+    var y = y0;
+    var h = dt0;
+
+    vec_push(out_ts, t);
+    vec_push(out_ys, y);
+
+    var out_y_buf = alloc(8);
+    var out_err_buf = alloc(8);
+
+    var steps = 0;
+    while (steps < _ODE_MAX_STEPS) {
+        # Check if we reached the end
+        if (f64_lt(f64_sub(tf, t), EPSILON_F64) == 1) {
+            return ERR_NONE;
+        }
+        # Do not allow t == tf check with >=
+        if (f64_gt(t, tf) == 1) {
+            return ERR_NONE;
+        }
+
+        # Clamp step to not overshoot tf
+        var remaining = f64_sub(tf, t);
+        if (f64_gt(h, remaining) == 1) {
+            h = remaining;
+        }
+
+        # Take a DOPRI45 step
+        ode_dopri45(f, t, y, h, out_y_buf, out_err_buf);
+        var y_new = load64(out_y_buf);
+        var err = load64(out_err_buf);
+
+        # Compute scaled error: err / max(tol, tol * |y_new|)
+        var scale = tol;
+        var abs_y = f64_abs(y_new);
+        var tol_scaled = f64_mul(tol, abs_y);
+        if (f64_gt(tol_scaled, scale) == 1) {
+            scale = tol_scaled;
+        }
+        var err_norm = f64_div(err, scale);
+
+        if (f64_gt(err_norm, _ODE_F64_ONE) == 1) {
+            # Reject step — shrink h
+            var factor = f64_mul(_ODE_SAFETY, f64_pow(err_norm, _ODE_EXP_NEG_0P2));
+            if (f64_lt(factor, _ODE_MIN_FACTOR) == 1) {
+                factor = _ODE_MIN_FACTOR;
+            }
+            h = f64_mul(h, factor);
+        } else {
+            # Accept step
+            t = f64_add(t, h);
+            y = y_new;
+            vec_push(out_ts, t);
+            vec_push(out_ys, y);
+
+            # Grow h
+            var factor = _ODE_MAX_FACTOR;
+            if (f64_gt(err_norm, _ODE_F64_ZERO) == 1) {
+                factor = f64_mul(_ODE_SAFETY, f64_pow(err_norm, _ODE_EXP_NEG_0P2));
+                if (f64_gt(factor, _ODE_MAX_FACTOR) == 1) {
+                    factor = _ODE_MAX_FACTOR;
+                }
+                if (f64_lt(factor, _ODE_MIN_FACTOR) == 1) {
+                    factor = _ODE_MIN_FACTOR;
+                }
+            }
+            h = f64_mul(h, factor);
+        }
+
+        steps = steps + 1;
+    }
+
+    return ERR_NO_CONVERGENCE;
+}
+
+# ================================================================
+# BACKWARD EULER — implicit solver for stiff systems
+# ================================================================
+
+# Single backward Euler step (scalar ODE) with Newton iteration.
+# f: function pointer, fncall2(f, t, y) -> dy/dt
+# t: current time (f64) — the step targets t+dt
+# y: current state (f64)
+# dt: time step (f64)
+# tol: Newton convergence tolerance (f64)
+# max_newton: max Newton iterations (integer)
+# Returns: new y value (f64), or y on non-convergence
+#
+# Solves: y_new = y + dt * f(t + dt, y_new)
+# Newton: g(z) = z - y - dt * f(t+dt, z) = 0
+# Update: z -= g(z) / g'(z)
+# g'(z) approx 1 - dt * df/dy, approximated via finite difference
+fn ode_backward_euler(f, t, y, dt, tol, max_newton) {
+    var t_next = f64_add(t, dt);
+    # Initial guess: forward Euler
+    var z = f64_add(y, f64_mul(dt, fncall2(f, t, y)));
+
+    var iter = 0;
+    while (iter < max_newton) {
+        var fz = fncall2(f, t_next, z);
+        var g = f64_sub(z, f64_add(y, f64_mul(dt, fz)));
+
+        # Check convergence
+        if (f64_lt(f64_abs(g), tol) == 1) {
+            return z;
+        }
+
+        # Approximate Jacobian via finite difference
+        var eps = f64_mul(EPSILON_F64, f64_add(_ODE_F64_ONE, f64_abs(z)));
+        var fz_eps = fncall2(f, t_next, f64_add(z, eps));
+        var dfdy = f64_div(f64_sub(fz_eps, fz), eps);
+
+        # g'(z) = 1 - dt * df/dy
+        var gp = f64_sub(_ODE_F64_ONE, f64_mul(dt, dfdy));
+
+        # Guard against zero derivative
+        if (f64_lt(f64_abs(gp), EPSILON_F64) == 1) {
+            return z;
+        }
+
+        z = f64_sub(z, f64_div(g, gp));
+        iter = iter + 1;
+    }
+    return z;
+}
+
+# ================================================================
+# BDF-2 — Backward Differentiation Formula, order 2
+# ================================================================
+
+# Single BDF-2 step (scalar ODE).
+# f: function pointer, fncall2(f, t, y) -> dy/dt
+# t: time at the NEW step (f64)
+# y: current state y_n (f64)
+# y_prev: previous state y_{n-1} (f64)
+# dt: time step (f64)
+# tol: Newton convergence tolerance (f64)
+# Returns: y_{n+1} (f64)
+#
+# BDF-2: y_{n+1} = (4/3)*y_n - (1/3)*y_{n-1} + (2/3)*h*f(t_{n+1}, y_{n+1})
+fn ode_bdf2(f, t, y, y_prev, dt, tol) {
+    var max_iter = 50;
+    # Predictor
+    var pred = f64_add(f64_mul(_BDF2_A0, y), f64_mul(_BDF2_A1, y_prev));
+    var z = pred;
+
+    var iter = 0;
+    while (iter < max_iter) {
+        var fz = fncall2(f, t, z);
+        # Residual: g = z - (4/3)*y + (1/3)*y_prev - (2/3)*h*f(t, z)
+        var g = f64_sub(z, f64_add(pred, f64_mul(_BDF2_BETA, f64_mul(dt, fz))));
+
+        if (f64_lt(f64_abs(g), tol) == 1) {
+            return z;
+        }
+
+        # Finite-difference Jacobian
+        var eps = f64_mul(EPSILON_F64, f64_add(_ODE_F64_ONE, f64_abs(z)));
+        var fz_eps = fncall2(f, t, f64_add(z, eps));
+        var dfdy = f64_div(f64_sub(fz_eps, fz), eps);
+        var gp = f64_sub(_ODE_F64_ONE, f64_mul(_BDF2_BETA, f64_mul(dt, dfdy)));
+
+        if (f64_lt(f64_abs(gp), EPSILON_F64) == 1) {
+            return z;
+        }
+
+        z = f64_sub(z, f64_div(g, gp));
+        iter = iter + 1;
+    }
+    return z;
+}
+
+# ================================================================
+# BDF — General BDF step, orders 2-5
+# ================================================================
+
+# General BDF step (scalar ODE).
+# f: function pointer, fncall2(f, t, y) -> dy/dt
+# t: time at the NEW step (f64)
+# history: vec of previous y values (most recent last). Must have >= order entries.
+# order: BDF order (2, 3, 4, or 5, integer)
+# dt: time step (f64)
+# tol: Newton convergence tolerance (f64)
+# Returns: y_{n+1} (f64), or 0 on invalid input
+fn ode_bdf(f, t, history, order, dt, tol) {
+    var max_iter = 50;
+    var hlen = vec_len(history);
+
+    if (hlen < order) {
+        return _ODE_F64_ZERO;
+    }
+    if (order < 2) { return _ODE_F64_ZERO; }
+    if (order > 5) { return _ODE_F64_ZERO; }
+
+    # Select coefficients based on order
+    # alphas[k] multiplies y_{n-k}, beta multiplies h*f
+    # We compute the predictor: sum(alpha_k * y_{n-k})
+    var pred = _ODE_F64_ZERO;
+    var beta = _ODE_F64_ZERO;
+
+    if (order == 2) {
+        var y_n = vec_get(history, hlen - 1);
+        var y_nm1 = vec_get(history, hlen - 2);
+        pred = f64_add(f64_mul(_BDF2_A0, y_n), f64_mul(_BDF2_A1, y_nm1));
+        beta = _BDF2_BETA;
+    }
+    if (order == 3) {
+        var y_n = vec_get(history, hlen - 1);
+        var y_nm1 = vec_get(history, hlen - 2);
+        var y_nm2 = vec_get(history, hlen - 3);
+        pred = f64_add(f64_mul(_BDF3_A0, y_n),
+               f64_add(f64_mul(_BDF3_A1, y_nm1),
+                       f64_mul(_BDF3_A2, y_nm2)));
+        beta = _BDF3_BETA;
+    }
+    if (order == 4) {
+        var y_n = vec_get(history, hlen - 1);
+        var y_nm1 = vec_get(history, hlen - 2);
+        var y_nm2 = vec_get(history, hlen - 3);
+        var y_nm3 = vec_get(history, hlen - 4);
+        pred = f64_add(f64_mul(_BDF4_A0, y_n),
+               f64_add(f64_mul(_BDF4_A1, y_nm1),
+               f64_add(f64_mul(_BDF4_A2, y_nm2),
+                       f64_mul(_BDF4_A3, y_nm3))));
+        beta = _BDF4_BETA;
+    }
+    if (order == 5) {
+        var y_n = vec_get(history, hlen - 1);
+        var y_nm1 = vec_get(history, hlen - 2);
+        var y_nm2 = vec_get(history, hlen - 3);
+        var y_nm3 = vec_get(history, hlen - 4);
+        var y_nm4 = vec_get(history, hlen - 5);
+        pred = f64_add(f64_mul(_BDF5_A0, y_n),
+               f64_add(f64_mul(_BDF5_A1_C, y_nm1),
+               f64_add(f64_mul(_BDF5_A2, y_nm2),
+               f64_add(f64_mul(_BDF5_A3, y_nm3),
+                       f64_mul(_BDF5_A4, y_nm4)))));
+        beta = _BDF5_BETA;
+    }
+
+    # Newton iteration
+    var z = pred;
+    var iter = 0;
+    while (iter < max_iter) {
+        var fz = fncall2(f, t, z);
+        var g = f64_sub(z, f64_add(pred, f64_mul(beta, f64_mul(dt, fz))));
+
+        if (f64_lt(f64_abs(g), tol) == 1) {
+            return z;
+        }
+
+        # Finite-difference Jacobian
+        var eps = f64_mul(EPSILON_F64, f64_add(_ODE_F64_ONE, f64_abs(z)));
+        var fz_eps = fncall2(f, t, f64_add(z, eps));
+        var dfdy = f64_div(f64_sub(fz_eps, fz), eps);
+        var gp = f64_sub(_ODE_F64_ONE, f64_mul(beta, f64_mul(dt, dfdy)));
+
+        if (f64_lt(f64_abs(gp), EPSILON_F64) == 1) {
+            return z;
+        }
+
+        z = f64_sub(z, f64_div(g, gp));
+        iter = iter + 1;
+    }
+    return z;
+}
+
+# ================================================================
+# STOCHASTIC: Euler-Maruyama
+# ================================================================
+
+# Single Euler-Maruyama step for SDE: dY = f(t,Y)*dt + g(t,Y)*dW
+# f: drift function pointer, fncall2(f, t, y) -> drift value (f64)
+# g: diffusion function pointer, fncall2(g, t, y) -> diffusion coefficient (f64)
+# t: current time (f64)
+# y: current state (f64)
+# dt: time step (f64)
+# dW: Wiener increment (f64), typically N(0, sqrt(dt))
+# Returns: new y value (f64)
+fn ode_euler_maruyama(f, g, t, y, dt, dW) {
+    var drift = fncall2(f, t, y);
+    var diff = fncall2(g, t, y);
+    return f64_add(y, f64_add(
+        f64_mul(drift, dt),
+        f64_mul(diff, dW)));
+}
+
+# ================================================================
+# STOCHASTIC: Milstein
+# ================================================================
+
+# Single Milstein step for SDE: dY = f(t,Y)*dt + g(t,Y)*dW
+# Higher-order than Euler-Maruyama (strong order 1.0 vs 0.5).
+# f: drift function pointer, fncall2(f, t, y) -> drift value (f64)
+# g: diffusion function pointer, fncall2(g, t, y) -> diffusion coefficient (f64)
+# dg_dy: derivative of diffusion wrt y, fncall2(dg_dy, t, y) -> dg/dy (f64)
+# t: current time (f64)
+# y: current state (f64)
+# dt: time step (f64)
+# dW: Wiener increment (f64)
+# Returns: new y value (f64)
+fn ode_milstein(f, g, dg_dy, t, y, dt, dW) {
+    var drift = fncall2(f, t, y);
+    var diff = fncall2(g, t, y);
+    var diff_deriv = fncall2(dg_dy, t, y);
+
+    # Milstein: y + f*dt + g*dW + 0.5*g*(dg/dy)*(dW^2 - dt)
+    var dW2 = f64_mul(dW, dW);
+    var correction = f64_mul(_ODE_F64_HALF,
+        f64_mul(diff,
+        f64_mul(diff_deriv,
+                f64_sub(dW2, dt))));
+
+    return f64_add(y, f64_add(
+        f64_mul(drift, dt),
+        f64_add(f64_mul(diff, dW),
+                correction)));
+}
+
+# ================================================================
+# SYMPLECTIC EULER
+# ================================================================
+
+# Single symplectic (semi-implicit) Euler step.
+# Updates momentum (velocity) first, then position — preserves phase-space volume.
+# dq_dp: function pointer, fncall1(dq_dp, p) -> dq/dt (often just p/m, or identity)
+# dp_dq: function pointer, fncall1(dp_dq, q) -> dp/dt (i.e. force = -dV/dq)
+# q: current position (f64)
+# p: current momentum (f64)
+# dt: time step (f64)
+# Returns: new q (stored at q_out), new p (stored at p_out)
+#   We return new_q since we cannot return two values — caller reads p from convention.
+#   Actually, use out params for both.
+#
+# Convention: returns via alloc'd 16-byte block [q_new, p_new]
+# For simplicity, returns new_q and caller can reconstruct.
+# Better: use two out-param pointers.
+# Re-reading the spec: "ode_symplectic_euler(dq_dp, dp_dq, q, p, dt)"
+# We return a 16-byte alloc with [q_new, p_new].
+fn ode_symplectic_euler(dq_dp, dp_dq, q, p, dt) {
+    # Kick: update p first using force at current q
+    var force = fncall1(dp_dq, q);
+    var p_new = f64_add(p, f64_mul(dt, force));
+
+    # Drift: update q using new p
+    var vel = fncall1(dq_dp, p_new);
+    var q_new = f64_add(q, f64_mul(dt, vel));
+
+    var result = alloc(16);
+    store64(result, q_new);
+    store64(result + 8, p_new);
+    return result;
+}
+
+# ================================================================
+# VELOCITY VERLET
+# ================================================================
+
+# Single velocity Verlet step.
+# accel_fn: function pointer, fncall1(accel_fn, q) -> acceleration (f64)
+# q: current position (f64)
+# v: current velocity (f64)
+# dt: time step (f64)
+# Returns: pointer to 16-byte block [q_new, v_new]
+fn ode_verlet(accel_fn, q, v, dt) {
+    var half_dt = f64_mul(_ODE_F64_HALF, dt);
+    var a = fncall1(accel_fn, q);
+
+    # Position: q_new = q + v*dt + 0.5*a*dt^2
+    var q_new = f64_add(q, f64_add(
+        f64_mul(v, dt),
+        f64_mul(half_dt, f64_mul(dt, a))));
+
+    # Acceleration at new position
+    var a_new = fncall1(accel_fn, q_new);
+
+    # Velocity: v_new = v + 0.5*(a + a_new)*dt
+    var v_new = f64_add(v, f64_mul(half_dt, f64_add(a, a_new)));
+
+    var result = alloc(16);
+    store64(result, q_new);
+    store64(result + 8, v_new);
+    return result;
+}
+
+# ================================================================
+# LEAPFROG
+# ================================================================
+
+# Single leapfrog step.
+# accel_fn: function pointer, fncall1(accel_fn, q) -> acceleration (f64)
+# q: current position (f64)
+# v: current velocity at half-step t - dt/2 (f64)
+# dt: time step (f64)
+# Returns: pointer to 16-byte block [q_new, v_half_new]
+#   q_new = position at t+dt
+#   v_half_new = velocity at t+dt/2
+fn ode_leapfrog(accel_fn, q, v, dt) {
+    var a = fncall1(accel_fn, q);
+
+    # Kick: v(t+dt/2) = v(t-dt/2) + a(t)*dt
+    var v_new = f64_add(v, f64_mul(dt, a));
+
+    # Drift: q(t+dt) = q(t) + v(t+dt/2)*dt
+    var q_new = f64_add(q, f64_mul(dt, v_new));
+
+    var result = alloc(16);
+    store64(result, q_new);
+    store64(result + 8, v_new);
+    return result;
+}
+
+# ================================================================
+# YOSHIDA 4TH ORDER
+# ================================================================
+
+# Single Yoshida 4th-order symplectic step.
+# Uses the triple-jump composition with Yoshida coefficients.
+# accel_fn: function pointer, fncall1(accel_fn, q) -> acceleration (f64)
+# q: current position (f64)
+# v: current velocity (f64)
+# dt: time step (f64)
+# Returns: pointer to 16-byte block [q_new, v_new]
+fn ode_yoshida4(accel_fn, q, v, dt) {
+    # Yoshida coefficients
+    # c = [c0, c1, c1, c0], d = [w1, w0, w1]
+    var c0 = _Y4_C0;
+    var c1 = _Y4_C1;
+    var w1 = _Y4_W1;
+    var w0 = _Y4_W0;
+
+    # Step 1: drift by c0*dt
+    var qi = f64_add(q, f64_mul(f64_mul(c0, dt), v));
+
+    # Step 1: kick by d0*dt = w1*dt
+    var a = fncall1(accel_fn, qi);
+    var vi = f64_add(v, f64_mul(f64_mul(w1, dt), a));
+
+    # Step 2: drift by c1*dt
+    qi = f64_add(qi, f64_mul(f64_mul(c1, dt), vi));
+
+    # Step 2: kick by d1*dt = w0*dt
+    a = fncall1(accel_fn, qi);
+    vi = f64_add(vi, f64_mul(f64_mul(w0, dt), a));
+
+    # Step 3: drift by c2*dt = c1*dt
+    qi = f64_add(qi, f64_mul(f64_mul(c1, dt), vi));
+
+    # Step 3: kick by d2*dt = w1*dt
+    a = fncall1(accel_fn, qi);
+    vi = f64_add(vi, f64_mul(f64_mul(w1, dt), a));
+
+    # Step 4: final drift by c3*dt = c0*dt
+    qi = f64_add(qi, f64_mul(f64_mul(c0, dt), vi));
+
+    var result = alloc(16);
+    store64(result, qi);
+    store64(result + 8, vi);
+    return result;
+}

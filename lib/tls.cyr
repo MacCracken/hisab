@@ -1,0 +1,168 @@
+# tls.cyr — TLS client via libssl.so.3 (dynlib bridge)
+# Usage: include "lib/tls.cyr"
+# Requires: alloc.cyr, syscalls.cyr, net.cyr, mmap.cyr, fnptr.cyr,
+#           string.cyr, dynlib.cyr
+#
+# Loads libssl.so.3 + libcrypto.so.3 at runtime via dynlib_open.
+# SNI and system-CA peer verification enabled by default.
+#
+# Interface:
+#   tls_available()            → 1 if libssl usable, 0 otherwise
+#   tls_connect(sock, host)    → ctx on success, 0 on failure
+#   tls_write(ctx, buf, len)   → bytes written or -1
+#   tls_read(ctx, buf, maxlen) → bytes read or -1
+#   tls_close(ctx)             → 0
+#
+# ctx layout (24 bytes):
+#   +0   SSL_CTX*
+#   +8   SSL*
+#   +16  socket fd
+
+# OpenSSL constants
+enum TlsConst {
+    SSL_VERIFY_PEER = 1;
+    SSL_CTRL_SET_TLSEXT_HOSTNAME = 55;
+    TLSEXT_NAMETYPE_host_name = 0;
+}
+
+var _tls_inited = 0;
+var _tls_ok = 0;
+
+# Function pointers resolved from libssl/libcrypto
+var _fn_TLS_client_method = 0;
+var _fn_SSL_CTX_new = 0;
+var _fn_SSL_CTX_free = 0;
+var _fn_SSL_CTX_set_default_verify_paths = 0;
+var _fn_SSL_CTX_set_verify = 0;
+var _fn_SSL_new = 0;
+var _fn_SSL_free = 0;
+var _fn_SSL_set_fd = 0;
+var _fn_SSL_ctrl = 0;
+var _fn_SSL_connect = 0;
+var _fn_SSL_write = 0;
+var _fn_SSL_read = 0;
+var _fn_SSL_shutdown = 0;
+var _fn_SSL_get_error = 0;
+
+# Lazy-init: load libssl on first use
+fn _tls_init() {
+    if (_tls_inited == 1) { return 0; }
+    _tls_inited = 1;
+
+    # Load libcrypto first — libssl depends on it for symbol resolution
+    var hc = dynlib_open("libcrypto.so.3");
+    if (hc == 0) { return 0; }
+
+    var h = dynlib_open("libssl.so.3");
+    if (h == 0) { return 0; }
+
+    # Resolve all symbols via global search (spans libssl + libcrypto)
+    _fn_TLS_client_method = _dynlib_resolve_global("TLS_client_method");
+    _fn_SSL_CTX_new = _dynlib_resolve_global("SSL_CTX_new");
+    _fn_SSL_CTX_free = _dynlib_resolve_global("SSL_CTX_free");
+    _fn_SSL_CTX_set_default_verify_paths = _dynlib_resolve_global("SSL_CTX_set_default_verify_paths");
+    _fn_SSL_CTX_set_verify = _dynlib_resolve_global("SSL_CTX_set_verify");
+    _fn_SSL_new = _dynlib_resolve_global("SSL_new");
+    _fn_SSL_free = _dynlib_resolve_global("SSL_free");
+    _fn_SSL_set_fd = _dynlib_resolve_global("SSL_set_fd");
+    _fn_SSL_ctrl = _dynlib_resolve_global("SSL_ctrl");
+    _fn_SSL_connect = _dynlib_resolve_global("SSL_connect");
+    _fn_SSL_write = _dynlib_resolve_global("SSL_write");
+    _fn_SSL_read = _dynlib_resolve_global("SSL_read");
+    _fn_SSL_shutdown = _dynlib_resolve_global("SSL_shutdown");
+    _fn_SSL_get_error = _dynlib_resolve_global("SSL_get_error");
+
+    # Minimum viable set — bail if any critical symbol missing
+    if (_fn_TLS_client_method == 0) { return 0; }
+    if (_fn_SSL_CTX_new == 0) { return 0; }
+    if (_fn_SSL_new == 0) { return 0; }
+    if (_fn_SSL_set_fd == 0) { return 0; }
+    if (_fn_SSL_connect == 0) { return 0; }
+    if (_fn_SSL_write == 0) { return 0; }
+    if (_fn_SSL_read == 0) { return 0; }
+    if (_fn_SSL_ctrl == 0) { return 0; }
+
+    _tls_ok = 1;
+    return 0;
+}
+
+# Returns 1 if TLS support is available on this system
+fn tls_available() {
+    _tls_init();
+    return _tls_ok;
+}
+
+# Wrap an already-connected TCP socket in a TLS session.
+# SNI set from host. System CAs used for peer verification.
+fn tls_connect(sock, host) {
+    _tls_init();
+    if (_tls_ok == 0) { return 0; }
+
+    var method = fncall0(_fn_TLS_client_method);
+    if (method == 0) { return 0; }
+
+    var ssl_ctx = fncall1(_fn_SSL_CTX_new, method);
+    if (ssl_ctx == 0) { return 0; }
+
+    # Load system CA certificates for peer verification
+    if (_fn_SSL_CTX_set_default_verify_paths != 0) {
+        fncall1(_fn_SSL_CTX_set_default_verify_paths, ssl_ctx);
+    }
+
+    # Enable peer certificate verification
+    if (_fn_SSL_CTX_set_verify != 0) {
+        fncall3(_fn_SSL_CTX_set_verify, ssl_ctx, SSL_VERIFY_PEER, 0);
+    }
+
+    var ssl = fncall1(_fn_SSL_new, ssl_ctx);
+    if (ssl == 0) {
+        fncall1(_fn_SSL_CTX_free, ssl_ctx);
+        return 0;
+    }
+
+    fncall2(_fn_SSL_set_fd, ssl, sock);
+
+    # Set SNI hostname via SSL_ctrl (SSL_set_tlsext_host_name is a macro)
+    if (host != 0) {
+        fncall4(_fn_SSL_ctrl, ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, host);
+    }
+
+    var r = fncall1(_fn_SSL_connect, ssl);
+    if (r != 1) {
+        fncall1(_fn_SSL_free, ssl);
+        fncall1(_fn_SSL_CTX_free, ssl_ctx);
+        return 0;
+    }
+
+    # Allocate ctx struct
+    var ctx = alloc(24);
+    store64(ctx, ssl_ctx);
+    store64(ctx + 8, ssl);
+    store64(ctx + 16, sock);
+    return ctx;
+}
+
+# Write through TLS session
+fn tls_write(ctx, buf, len) {
+    if (ctx == 0) { return 0 - 1; }
+    var ssl = load64(ctx + 8);
+    return fncall3(_fn_SSL_write, ssl, buf, len);
+}
+
+# Read from TLS session
+fn tls_read(ctx, buf, maxlen) {
+    if (ctx == 0) { return 0 - 1; }
+    var ssl = load64(ctx + 8);
+    return fncall3(_fn_SSL_read, ssl, buf, maxlen);
+}
+
+# Close TLS session and free resources
+fn tls_close(ctx) {
+    if (ctx == 0) { return 0; }
+    var ssl_ctx = load64(ctx);
+    var ssl = load64(ctx + 8);
+    if (_fn_SSL_shutdown != 0) { fncall1(_fn_SSL_shutdown, ssl); }
+    if (_fn_SSL_free != 0) { fncall1(_fn_SSL_free, ssl); }
+    if (_fn_SSL_CTX_free != 0) { fncall1(_fn_SSL_CTX_free, ssl_ctx); }
+    return 0;
+}

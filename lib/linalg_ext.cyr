@@ -1,0 +1,876 @@
+# linalg_ext.cyr — sparse linear algebra, iterative solvers, SVD wrappers,
+#                   eigendecomposition, Lyapunov exponents, inertia tensors
+# Usage: include "lib/linalg_ext.cyr"
+# Requires: alloc.cyr, math.cyr, matrix.cyr, linalg.cyr, error.cyr, fnptr.cyr
+#
+# Ported from rust-old/src/num/{sparse,solvers,svd,eigen,stability,inertia}.rs
+#
+# CSR sparse matrix layout (48 bytes header + data arrays):
+#   { nrows: i64, ncols: i64, nnz: i64, row_ptr: ptr, col_idx: ptr, values: ptr }
+#   Offset 0:  nrows
+#   Offset 8:  ncols
+#   Offset 16: nnz
+#   Offset 24: row_ptr  — flat i64 array, length nrows+1
+#   Offset 32: col_idx  — flat i64 array, length nnz
+#   Offset 40: values   — flat f64 array, length nnz
+
+# ================================================================
+# Section 1 — CSR Sparse Matrix
+# ================================================================
+
+# Construct a CSR matrix from pre-built arrays.
+# row_ptr: flat i64 array (nrows+1 entries)
+# col_idx: flat i64 array (nnz entries)
+# values:  flat f64 array (nnz entries)
+# Returns pointer to CSR struct (48 bytes).
+fn csr_new(nrows, ncols, nnz, row_ptr, col_idx, values) {
+    var csr = alloc(48);
+    store64(csr,      nrows);
+    store64(csr + 8,  ncols);
+    store64(csr + 16, nnz);
+    store64(csr + 24, row_ptr);
+    store64(csr + 32, col_idx);
+    store64(csr + 40, values);
+    return csr;
+}
+
+# Accessors
+fn csr_nrows(csr)   { return load64(csr); }
+fn csr_ncols(csr)   { return load64(csr + 8); }
+fn csr_nnz(csr)     { return load64(csr + 16); }
+fn csr_row_ptr(csr) { return load64(csr + 24); }
+fn csr_col_idx(csr) { return load64(csr + 32); }
+fn csr_values(csr)  { return load64(csr + 40); }
+
+# Convert a stdlib dense matrix (from matrix.cyr) to CSR.
+# Drops entries with |value| < EPSILON_F64.
+# Returns pointer to CSR struct.
+fn csr_from_dense(dense_mat) {
+    var nrows = mat_rows(dense_mat);
+    var ncols = mat_cols(dense_mat);
+
+    # First pass: count non-zeros
+    var count = 0;
+    var i = 0;
+    while (i < nrows) {
+        var j = 0;
+        while (j < ncols) {
+            var v = mat_get(dense_mat, i, j);
+            if (f64_gt(f64_abs(v), EPSILON_F64) == 1) {
+                count = count + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    var row_ptr = alloc((nrows + 1) * 8);
+    var col_idx = alloc(count * 8);
+    var values  = alloc(count * 8);
+
+    var pos = 0;
+    store64(row_ptr, 0);
+    i = 0;
+    while (i < nrows) {
+        var j = 0;
+        while (j < ncols) {
+            var v = mat_get(dense_mat, i, j);
+            if (f64_gt(f64_abs(v), EPSILON_F64) == 1) {
+                store64(col_idx + pos * 8, j);
+                store64(values + pos * 8, v);
+                pos = pos + 1;
+            }
+            j = j + 1;
+        }
+        store64(row_ptr + (i + 1) * 8, pos);
+        i = i + 1;
+    }
+
+    return csr_new(nrows, ncols, count, row_ptr, col_idx, values);
+}
+
+# Sparse matrix-vector multiply: y = CSR * x.
+# x: flat f64 array of length ncols.
+# Returns: flat f64 array of length nrows.
+fn csr_spmv(csr, x) {
+    var nrows   = load64(csr);
+    var row_ptr = load64(csr + 24);
+    var col_idx = load64(csr + 32);
+    var vals    = load64(csr + 40);
+
+    var y = alloc(nrows * 8);
+    var i = 0;
+    while (i < nrows) {
+        var sum = f64_from(0);
+        var start = load64(row_ptr + i * 8);
+        var end   = load64(row_ptr + (i + 1) * 8);
+        var idx = start;
+        while (idx < end) {
+            var col = load64(col_idx + idx * 8);
+            var val = load64(vals + idx * 8);
+            sum = f64_add(sum, f64_mul(val, load64(x + col * 8)));
+            idx = idx + 1;
+        }
+        store64(y + i * 8, sum);
+        i = i + 1;
+    }
+    return y;
+}
+
+# Sparse matrix addition: C = A + B (both CSR, same dimensions).
+# Uses sorted merge of each row. Drops zeros.
+# Returns new CSR struct, or 0 on dimension mismatch.
+fn csr_add(a, b) {
+    var nrows_a = load64(a);
+    var ncols_a = load64(a + 8);
+    var nrows_b = load64(b);
+    var ncols_b = load64(b + 8);
+    if (nrows_a != nrows_b) { return 0; }
+    if (ncols_a != ncols_b) { return 0; }
+
+    var nrows = nrows_a;
+    var ncols = ncols_a;
+    var a_rp = load64(a + 24);
+    var a_ci = load64(a + 32);
+    var a_v  = load64(a + 40);
+    var b_rp = load64(b + 24);
+    var b_ci = load64(b + 32);
+    var b_v  = load64(b + 40);
+
+    # Upper bound on nnz: sum of both nnz counts
+    var max_nnz = load64(a + 16) + load64(b + 16);
+    var out_rp = alloc((nrows + 1) * 8);
+    var out_ci = alloc(max_nnz * 8);
+    var out_v  = alloc(max_nnz * 8);
+
+    var pos = 0;
+    store64(out_rp, 0);
+
+    var i = 0;
+    while (i < nrows) {
+        var ai = load64(a_rp + i * 8);
+        var ae = load64(a_rp + (i + 1) * 8);
+        var bi = load64(b_rp + i * 8);
+        var be = load64(b_rp + (i + 1) * 8);
+
+        while (ai < ae && bi < be) {
+            var ac = load64(a_ci + ai * 8);
+            var bc = load64(b_ci + bi * 8);
+            if (ac < bc) {
+                store64(out_ci + pos * 8, ac);
+                store64(out_v + pos * 8, load64(a_v + ai * 8));
+                pos = pos + 1;
+                ai = ai + 1;
+            } else {
+                if (ac > bc) {
+                    store64(out_ci + pos * 8, bc);
+                    store64(out_v + pos * 8, load64(b_v + bi * 8));
+                    pos = pos + 1;
+                    bi = bi + 1;
+                } else {
+                    # Same column — add values
+                    var s = f64_add(load64(a_v + ai * 8), load64(b_v + bi * 8));
+                    if (f64_gt(f64_abs(s), EPSILON_F64) == 1) {
+                        store64(out_ci + pos * 8, ac);
+                        store64(out_v + pos * 8, s);
+                        pos = pos + 1;
+                    }
+                    ai = ai + 1;
+                    bi = bi + 1;
+                }
+            }
+        }
+        # Drain remaining from A
+        while (ai < ae) {
+            store64(out_ci + pos * 8, load64(a_ci + ai * 8));
+            store64(out_v + pos * 8, load64(a_v + ai * 8));
+            pos = pos + 1;
+            ai = ai + 1;
+        }
+        # Drain remaining from B
+        while (bi < be) {
+            store64(out_ci + pos * 8, load64(b_ci + bi * 8));
+            store64(out_v + pos * 8, load64(b_v + bi * 8));
+            pos = pos + 1;
+            bi = bi + 1;
+        }
+        store64(out_rp + (i + 1) * 8, pos);
+        i = i + 1;
+    }
+
+    return csr_new(nrows, ncols, pos, out_rp, out_ci, out_v);
+}
+
+# Transpose a CSR matrix. Returns new CSR struct.
+fn csr_transpose(csr) {
+    var nrows   = load64(csr);
+    var ncols   = load64(csr + 8);
+    var nnz     = load64(csr + 16);
+    var row_ptr = load64(csr + 24);
+    var col_idx = load64(csr + 32);
+    var vals    = load64(csr + 40);
+
+    # Count entries per column (= rows of transposed)
+    var row_counts = alloc(ncols * 8);
+    var k = 0;
+    while (k < ncols) { store64(row_counts + k * 8, 0); k = k + 1; }
+
+    k = 0;
+    while (k < nnz) {
+        var c = load64(col_idx + k * 8);
+        store64(row_counts + c * 8, load64(row_counts + c * 8) + 1);
+        k = k + 1;
+    }
+
+    # Build new row_ptr from counts
+    var new_rp = alloc((ncols + 1) * 8);
+    var cum = 0;
+    store64(new_rp, 0);
+    k = 0;
+    while (k < ncols) {
+        cum = cum + load64(row_counts + k * 8);
+        store64(new_rp + (k + 1) * 8, cum);
+        k = k + 1;
+    }
+
+    # Fill transposed data
+    var new_ci = alloc(nnz * 8);
+    var new_v  = alloc(nnz * 8);
+    # cursor tracks current write position per row of transposed
+    var cursor = alloc(ncols * 8);
+    k = 0;
+    while (k < ncols) {
+        store64(cursor + k * 8, load64(new_rp + k * 8));
+        k = k + 1;
+    }
+
+    var i = 0;
+    while (i < nrows) {
+        var start = load64(row_ptr + i * 8);
+        var end   = load64(row_ptr + (i + 1) * 8);
+        var idx = start;
+        while (idx < end) {
+            var col = load64(col_idx + idx * 8);
+            var dest = load64(cursor + col * 8);
+            store64(new_ci + dest * 8, i);
+            store64(new_v + dest * 8, load64(vals + idx * 8));
+            store64(cursor + col * 8, dest + 1);
+            idx = idx + 1;
+        }
+        i = i + 1;
+    }
+
+    return csr_new(ncols, nrows, nnz, new_rp, new_ci, new_v);
+}
+
+# ================================================================
+# Section 2 — Iterative Solvers
+# ================================================================
+
+# Helper: compute dot product of two flat f64 arrays of length n
+fn _lext_dot(a, b, n) {
+    var sum = f64_from(0);
+    var i = 0;
+    while (i < n) {
+        sum = f64_add(sum, f64_mul(load64(a + i * 8), load64(b + i * 8)));
+        i = i + 1;
+    }
+    return sum;
+}
+
+# Helper: Euclidean norm of flat f64 array of length n
+fn _lext_norm(v, n) {
+    return f64_sqrt(_lext_dot(v, v, n));
+}
+
+# Helper: y = a - b, flat f64 arrays of length n. Returns new array.
+fn _lext_sub(a, b, n) {
+    var out = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(out + i * 8, f64_sub(load64(a + i * 8), load64(b + i * 8)));
+        i = i + 1;
+    }
+    return out;
+}
+
+# Helper: copy flat f64 array of length n. Returns new array.
+fn _lext_copy(src, n) {
+    var out = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(out + i * 8, load64(src + i * 8));
+        i = i + 1;
+    }
+    return out;
+}
+
+# GMRES(m) iterative solver for non-symmetric systems Ax = b.
+# A_fn: function pointer, called as fncall1(A_fn, x_ptr) → Ax (flat f64 array).
+# b:    flat f64 array of length n.
+# x0:   initial guess, flat f64 array of length n.
+# n:    system dimension.
+# tol:  convergence tolerance on residual norm.
+# max_iter: maximum total matrix-vector products.
+# restart:  restart dimension (Krylov subspace size per cycle).
+# Returns: flat f64 array of length n (solution).
+fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
+    var x = _lext_copy(x0, n);
+    var m = restart;
+    if (m > n) { m = n; }
+    if (m < 1) { m = 1; }
+
+    var outer_limit = f64_to(f64_add(f64_div(f64_from(max_iter), f64_from(m)), f64_from(1)));
+
+    var outer = 0;
+    while (outer < outer_limit) {
+        # r = b - A*x
+        var ax = fncall1(A_fn, x);
+        var r = _lext_sub(b, ax, n);
+        var r_norm = _lext_norm(r, n);
+
+        if (f64_lt(r_norm, tol) == 1) { return x; }
+
+        # Normalize r → v[0]
+        var inv_r = f64_div(f64_from(1), r_norm);
+        var i = 0;
+        while (i < n) {
+            store64(r + i * 8, f64_mul(load64(r + i * 8), inv_r));
+            i = i + 1;
+        }
+
+        # v_basis: array of pointers to basis vectors (up to m+1)
+        var v_basis = alloc((m + 1) * 8);
+        store64(v_basis, r);
+
+        # Hessenberg matrix H: (m+1) x m stored row-major
+        var h = alloc((m + 1) * m * 8);
+        i = 0;
+        while (i < (m + 1) * m) { store64(h + i * 8, f64_from(0)); i = i + 1; }
+
+        # g vector: length m+1
+        var g = alloc((m + 1) * 8);
+        i = 0;
+        while (i < m + 1) { store64(g + i * 8, f64_from(0)); i = i + 1; }
+        store64(g, r_norm);
+
+        # Givens rotation coefficients
+        var cs = alloc(m * 8);
+        var sn = alloc(m * 8);
+
+        var k = 0;  # number of completed Arnoldi steps
+        var j = 0;
+        while (j < m) {
+            var vj = load64(v_basis + j * 8);
+            var wj = fncall1(A_fn, vj);
+
+            # Modified Gram-Schmidt
+            i = 0;
+            while (i <= j) {
+                var vi = load64(v_basis + i * 8);
+                var hij = _lext_dot(wj, vi, n);
+                store64(h + (i * m + j) * 8, hij);  # H[i][j]
+                var l = 0;
+                while (l < n) {
+                    store64(wj + l * 8, f64_sub(load64(wj + l * 8),
+                        f64_mul(hij, load64(vi + l * 8))));
+                    l = l + 1;
+                }
+                i = i + 1;
+            }
+
+            var wj_norm = _lext_norm(wj, n);
+            store64(h + ((j + 1) * m + j) * 8, wj_norm);  # H[j+1][j]
+
+            if (f64_gt(wj_norm, EPSILON_F64) == 1) {
+                var inv_w = f64_div(f64_from(1), wj_norm);
+                var l = 0;
+                while (l < n) {
+                    store64(wj + l * 8, f64_mul(load64(wj + l * 8), inv_w));
+                    l = l + 1;
+                }
+            }
+            store64(v_basis + (j + 1) * 8, wj);
+
+            # Apply previous Givens rotations to column j of H
+            i = 0;
+            while (i < j) {
+                var ci = load64(cs + i * 8);
+                var si = load64(sn + i * 8);
+                var h_ij   = load64(h + (i * m + j) * 8);
+                var h_i1j  = load64(h + ((i + 1) * m + j) * 8);
+                var temp = f64_add(f64_mul(ci, h_ij), f64_mul(si, h_i1j));
+                store64(h + ((i + 1) * m + j) * 8,
+                    f64_add(f64_mul(f64_neg(si), h_ij), f64_mul(ci, h_i1j)));
+                store64(h + (i * m + j) * 8, temp);
+                i = i + 1;
+            }
+
+            # Compute new Givens rotation for row j
+            var hjj  = load64(h + (j * m + j) * 8);
+            var hj1j = load64(h + ((j + 1) * m + j) * 8);
+            var r_val = f64_sqrt(f64_add(f64_mul(hjj, hjj), f64_mul(hj1j, hj1j)));
+            if (f64_gt(r_val, EPSILON_F64) == 1) {
+                store64(cs + j * 8, f64_div(hjj, r_val));
+                store64(sn + j * 8, f64_div(hj1j, r_val));
+            } else {
+                store64(cs + j * 8, f64_from(1));
+                store64(sn + j * 8, f64_from(0));
+            }
+            store64(h + (j * m + j) * 8, r_val);
+            store64(h + ((j + 1) * m + j) * 8, f64_from(0));
+
+            # Apply new rotation to g
+            var cj = load64(cs + j * 8);
+            var sj = load64(sn + j * 8);
+            var gj = load64(g + j * 8);
+            store64(g + (j + 1) * 8, f64_mul(f64_neg(sj), gj));
+            store64(g + j * 8, f64_mul(cj, gj));
+
+            k = j + 1;
+
+            if (f64_lt(f64_abs(load64(g + k * 8)), tol) == 1) {
+                j = m;  # break
+            } else {
+                j = j + 1;
+            }
+        }
+
+        # Back-substitution: solve upper triangular H * y = g
+        var y = alloc(k * 8);
+        i = k - 1;
+        while (i >= 0) {
+            var yi = load64(g + i * 8);
+            var jj = i + 1;
+            while (jj < k) {
+                yi = f64_sub(yi, f64_mul(load64(h + (i * m + jj) * 8), load64(y + jj * 8)));
+                jj = jj + 1;
+            }
+            var hii = load64(h + (i * m + i) * 8);
+            if (f64_gt(f64_abs(hii), EPSILON_F64) == 1) {
+                yi = f64_div(yi, hii);
+            }
+            store64(y + i * 8, yi);
+            i = i - 1;
+        }
+
+        # Update x: x += V * y
+        i = 0;
+        while (i < n) {
+            var xi = load64(x + i * 8);
+            var jj = 0;
+            while (jj < k) {
+                var vj_ptr = load64(v_basis + jj * 8);
+                xi = f64_add(xi, f64_mul(load64(y + jj * 8), load64(vj_ptr + i * 8)));
+                jj = jj + 1;
+            }
+            store64(x + i * 8, xi);
+            i = i + 1;
+        }
+
+        if (f64_lt(f64_abs(load64(g + k * 8)), tol) == 1) {
+            return x;
+        }
+
+        outer = outer + 1;
+    }
+
+    return x;
+}
+
+# BiCGSTAB iterative solver for non-symmetric systems Ax = b.
+# A_fn: function pointer, called as fncall1(A_fn, x_ptr) → Ax.
+# b:    flat f64 array of length n.
+# x0:   initial guess, flat f64 array of length n.
+# n:    system dimension.
+# tol:  convergence tolerance on residual norm.
+# max_iter: maximum iterations.
+# Returns: flat f64 array of length n (solution).
+fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
+    var x = _lext_copy(x0, n);
+    var ax = fncall1(A_fn, x);
+    var r = _lext_sub(b, ax, n);
+    var r_hat = _lext_copy(r, n);  # Shadow residual (fixed)
+
+    var rho   = f64_from(1);
+    var alpha = f64_from(1);
+    var omega = f64_from(1);
+
+    var v = alloc(n * 8);
+    var p = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(v + i * 8, f64_from(0));
+        store64(p + i * 8, f64_from(0));
+        i = i + 1;
+    }
+
+    var breakdown_tol = f64_from(0x3C32725DD1D243AC);  # ~1e-30 approx — very small
+
+    var iter = 0;
+    while (iter < max_iter) {
+        var rho_new = _lext_dot(r_hat, r, n);
+
+        if (f64_lt(f64_abs(rho_new), breakdown_tol) == 1) {
+            return x;  # Breakdown
+        }
+
+        var beta = f64_mul(f64_div(rho_new, rho), f64_div(alpha, omega));
+        rho = rho_new;
+
+        # p = r + beta * (p - omega * v)
+        i = 0;
+        while (i < n) {
+            var pi = load64(p + i * 8);
+            var vi = load64(v + i * 8);
+            var ri = load64(r + i * 8);
+            store64(p + i * 8, f64_add(ri, f64_mul(beta, f64_sub(pi, f64_mul(omega, vi)))));
+            i = i + 1;
+        }
+
+        v = fncall1(A_fn, p);
+
+        var r_hat_v = _lext_dot(r_hat, v, n);
+        if (f64_lt(f64_abs(r_hat_v), breakdown_tol) == 1) {
+            return x;  # Breakdown
+        }
+        alpha = f64_div(rho, r_hat_v);
+
+        # s = r - alpha * v
+        var s = alloc(n * 8);
+        i = 0;
+        while (i < n) {
+            store64(s + i * 8, f64_sub(load64(r + i * 8), f64_mul(alpha, load64(v + i * 8))));
+            i = i + 1;
+        }
+
+        var s_norm = _lext_norm(s, n);
+        if (f64_lt(s_norm, tol) == 1) {
+            i = 0;
+            while (i < n) {
+                store64(x + i * 8, f64_add(load64(x + i * 8), f64_mul(alpha, load64(p + i * 8))));
+                i = i + 1;
+            }
+            return x;
+        }
+
+        var t = fncall1(A_fn, s);
+
+        var t_dot_s = _lext_dot(t, s, n);
+        var t_dot_t = _lext_dot(t, t, n);
+        if (f64_lt(f64_abs(t_dot_t), breakdown_tol) == 1) {
+            return x;  # Breakdown
+        }
+        omega = f64_div(t_dot_s, t_dot_t);
+
+        # x += alpha * p + omega * s
+        i = 0;
+        while (i < n) {
+            store64(x + i * 8, f64_add(load64(x + i * 8),
+                f64_add(f64_mul(alpha, load64(p + i * 8)),
+                         f64_mul(omega, load64(s + i * 8)))));
+            i = i + 1;
+        }
+
+        # r = s - omega * t
+        i = 0;
+        while (i < n) {
+            store64(r + i * 8, f64_sub(load64(s + i * 8), f64_mul(omega, load64(t + i * 8))));
+            i = i + 1;
+        }
+
+        var r_norm = _lext_norm(r, n);
+        if (f64_lt(r_norm, tol) == 1) {
+            return x;
+        }
+
+        iter = iter + 1;
+    }
+
+    return x;
+}
+
+# Projected Gauss-Seidel (PGS) for contact/constraint solvers.
+# Solves A*x = b subject to lo[i] <= x[i] <= hi[i].
+# A:   stdlib matrix (n x n, via mat_get/mat_set).
+# b:   flat f64 array of length n.
+# x:   flat f64 array of length n (initial guess, modified in place).
+# n:   system dimension.
+# lo:  flat f64 array of lower bounds (length n).
+# hi:  flat f64 array of upper bounds (length n).
+# max_iter: maximum iterations.
+# Returns: 0 on success (solution written into x).
+fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
+    var iter = 0;
+    while (iter < max_iter) {
+        var max_change = f64_from(0);
+        var i = 0;
+        while (i < n) {
+            var aii = mat_get(A, i, i);
+            if (f64_lt(f64_abs(aii), EPSILON_F64) == 1) {
+                i = i + 1;
+                # skip near-zero diagonal
+            } else {
+                var sigma = load64(b + i * 8);
+                var j = 0;
+                while (j < n) {
+                    if (j != i) {
+                        sigma = f64_sub(sigma, f64_mul(mat_get(A, i, j), load64(x + j * 8)));
+                    }
+                    j = j + 1;
+                }
+                var gs_x = f64_div(sigma, aii);
+                var new_x = f64_clamp(gs_x, load64(lo + i * 8), load64(hi + i * 8));
+                var change = f64_abs(f64_sub(new_x, load64(x + i * 8)));
+                if (f64_gt(change, max_change) == 1) { max_change = change; }
+                store64(x + i * 8, new_x);
+                i = i + 1;
+            }
+        }
+        # Early out if converged (use EPSILON_F64 as tolerance)
+        if (f64_lt(max_change, EPSILON_F64) == 1) {
+            return 0;
+        }
+        iter = iter + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# Section 3 — SVD (thin wrappers around linalg.cyr mat_svd)
+# ================================================================
+
+# Full SVD: A = U * diag(S) * Vt.
+# A:      stdlib matrix (m x n).
+# out_U:  stdlib matrix (m x n, caller allocates via mat_new).
+# out_S:  flat f64 array of length n (caller allocates via alloc(n*8)).
+# out_Vt: stdlib matrix (n x n, caller allocates via mat_new).
+# Returns: 0 on success.
+fn svd_compute(A, out_U, out_S, out_Vt) {
+    return mat_svd(A, out_U, out_S, out_Vt);
+}
+
+# Truncated (rank-k) SVD: keep only the top k singular values.
+# A:      stdlib matrix (m x n).
+# k:      number of singular values to keep (1 <= k <= n).
+# out_U:  stdlib matrix (m x k, caller allocates).
+# out_S:  flat f64 array of length k (caller allocates).
+# out_Vt: stdlib matrix (k x n, caller allocates).
+# Returns: 0 on success, ERR_INVALID_INPUT if k is invalid.
+fn svd_truncated(A, k, out_U, out_S, out_Vt) {
+    var rows = mat_rows(A);
+    var cols = mat_cols(A);
+    if (k < 1) { return ERR_INVALID_INPUT; }
+    if (k > cols) { return ERR_INVALID_INPUT; }
+
+    # Compute full SVD into temporaries
+    var full_u  = mat_new(rows, cols);
+    var full_s  = alloc(cols * 8);
+    var full_vt = mat_new(cols, cols);
+    mat_svd(A, full_u, full_s, full_vt);
+
+    # Copy top k singular values
+    var i = 0;
+    while (i < k) {
+        store64(out_S + i * 8, load64(full_s + i * 8));
+        i = i + 1;
+    }
+
+    # Copy first k columns of U into out_U (m x k)
+    i = 0;
+    while (i < rows) {
+        var j = 0;
+        while (j < k) {
+            mat_set(out_U, i, j, mat_get(full_u, i, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    # Copy first k rows of Vt into out_Vt (k x n)
+    i = 0;
+    while (i < k) {
+        var j = 0;
+        while (j < cols) {
+            mat_set(out_Vt, i, j, mat_get(full_vt, i, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return 0;
+}
+
+# ================================================================
+# Section 4 — Eigendecomposition
+# ================================================================
+
+# Power iteration for the dominant eigenvalue.
+# A:        stdlib matrix (n x n).
+# n:        matrix dimension.
+# max_iter: maximum iterations.
+# out_val:  pointer to store eigenvalue (f64, allocate 8 bytes).
+# out_vec:  flat f64 array of length n (caller allocates, receives eigenvector).
+# Returns:  0 on success, ERR_NO_CONVERGENCE if max_iter exceeded.
+fn eigen_power(A, n, max_iter, out_val, out_vec) {
+    # Initial guess: unit vector e_0
+    var v = alloc(n * 8);
+    var i = 0;
+    while (i < n) { store64(v + i * 8, f64_from(0)); i = i + 1; }
+    store64(v, f64_from(1));
+
+    var w = alloc(n * 8);
+    var eigenvalue = f64_from(0);
+    var tol = EPSILON_F64;
+
+    var iter = 0;
+    while (iter < max_iter) {
+        # w = A * v
+        i = 0;
+        while (i < n) {
+            var sum = f64_from(0);
+            var j = 0;
+            while (j < n) {
+                sum = f64_add(sum, f64_mul(mat_get(A, i, j), load64(v + j * 8)));
+                j = j + 1;
+            }
+            store64(w + i * 8, sum);
+            i = i + 1;
+        }
+
+        # Find component with largest absolute value
+        var max_val = f64_from(0);
+        i = 0;
+        while (i < n) {
+            var wi = load64(w + i * 8);
+            if (f64_gt(f64_abs(wi), f64_abs(max_val)) == 1) {
+                max_val = wi;
+            }
+            i = i + 1;
+        }
+
+        if (f64_lt(f64_abs(max_val), EPSILON_F64) == 1) {
+            return ERR_NO_CONVERGENCE;
+        }
+
+        var new_eigenvalue = max_val;
+
+        # Normalize w → v
+        var inv_max = f64_div(f64_from(1), max_val);
+        i = 0;
+        while (i < n) {
+            store64(v + i * 8, f64_mul(load64(w + i * 8), inv_max));
+            i = i + 1;
+        }
+
+        if (f64_lt(f64_abs(f64_sub(new_eigenvalue, eigenvalue)), tol) == 1) {
+            store64(out_val, new_eigenvalue);
+            i = 0;
+            while (i < n) {
+                store64(out_vec + i * 8, load64(v + i * 8));
+                i = i + 1;
+            }
+            return 0;
+        }
+
+        eigenvalue = new_eigenvalue;
+        iter = iter + 1;
+    }
+
+    return ERR_NO_CONVERGENCE;
+}
+
+# Symmetric eigendecomposition via Jacobi rotation.
+# Wrapper around linalg.cyr's mat_eigen_sym with hisab API convention.
+# A:        stdlib matrix (n x n, must be symmetric).
+# n:        matrix dimension.
+# out_vals: flat f64 array of length n (caller allocates, receives eigenvalues).
+# out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as columns).
+# Returns:  0 on success, ERR_NO_CONVERGENCE if max_iter exceeded.
+fn eigen_symmetric(A, n, out_vals, out_vecs) {
+    var result = mat_eigen_sym(A, out_vals, out_vecs);
+    if (result < 0) { return ERR_NO_CONVERGENCE; }
+    return 0;
+}
+
+# ================================================================
+# Section 5 — Lyapunov Exponent
+# ================================================================
+
+# Compute the maximal Lyapunov exponent via QR method.
+# A:          stdlib matrix (n x n), the Jacobian of the system.
+# n:          state dimension.
+# iterations: number of QR iterations.
+# out:        pointer to store the result (f64, allocate 8 bytes).
+# Returns:    0 on success.
+#
+# Method: repeatedly QR-decompose A^k. The growth rate of R's diagonal
+# entries gives the Lyapunov exponent. This is the simplified discrete
+# version: repeatedly multiply A, QR-factor, and track log growth.
+fn lyapunov_max(A, n, iterations, out) {
+    var Q = mat_new(n, n);
+    var R = mat_new(n, n);
+
+    # Initialize Q to identity
+    var i = 0;
+    while (i < n) { mat_set(Q, i, i, f64_from(1)); i = i + 1; }
+
+    var sum_log = f64_from(0);
+    var count = 0;
+
+    var iter = 0;
+    while (iter < iterations) {
+        # Z = A * Q
+        var Z = mat_mul(A, Q);
+
+        # QR decompose Z → Q, R
+        mat_qr(Z, Q, R);
+
+        # Accumulate log of |R[0][0]| (dominant direction growth)
+        var r00 = f64_abs(mat_get(R, 0, 0));
+        if (f64_gt(r00, EPSILON_F64) == 1) {
+            sum_log = f64_add(sum_log, f64_ln(r00));
+            count = count + 1;
+        }
+
+        iter = iter + 1;
+    }
+
+    if (count == 0) {
+        store64(out, f64_from(0));
+    } else {
+        store64(out, f64_div(sum_log, f64_from(count)));
+    }
+    return 0;
+}
+
+# ================================================================
+# Section 6 — Inertia Tensors
+# ================================================================
+
+# Inertia tensor of a solid sphere.
+# Returns: 3x3 stdlib matrix.
+fn inertia_sphere(mass, radius) {
+    var I = f64_mul(f64_div(f64_from(2), f64_from(5)), f64_mul(mass, f64_mul(radius, radius)));
+    var m = mat_new(3, 3);
+    mat_set(m, 0, 0, I);
+    mat_set(m, 1, 1, I);
+    mat_set(m, 2, 2, I);
+    return m;
+}
+
+# Inertia tensor of a solid box (cuboid).
+# hx, hy, hz are half-extents.
+# Returns: 3x3 stdlib matrix.
+fn inertia_box(mass, hx, hy, hz) {
+    var w = f64_mul(f64_from(2), hx);
+    var h = f64_mul(f64_from(2), hy);
+    var d = f64_mul(f64_from(2), hz);
+    var c = f64_div(mass, f64_from(12));
+
+    var m = mat_new(3, 3);
+    mat_set(m, 0, 0, f64_mul(c, f64_add(f64_mul(h, h), f64_mul(d, d))));
+    mat_set(m, 1, 1, f64_mul(c, f64_add(f64_mul(w, w), f64_mul(d, d))));
+    mat_set(m, 2, 2, f64_mul(c, f64_add(f64_mul(w, w), f64_mul(h, h))));
+    return m;
+}

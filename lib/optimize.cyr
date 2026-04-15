@@ -1,0 +1,703 @@
+# optimize.cyr — optimization algorithms for hisab
+# Usage: include "lib/optimize.cyr"
+# Requires: alloc.cyr, math.cyr, f64_util.cyr, fnptr.cyr, error.cyr, matrix.cyr, linalg.cyr
+#
+# Provides:
+#   opt_gradient_descent      — steepest descent with fixed learning rate
+#   opt_conjugate_gradient    — Fletcher-Reeves conjugate gradient
+#   opt_bfgs                  — BFGS quasi-Newton with Armijo line search
+#   opt_lbfgs                 — limited-memory BFGS (two-loop recursion)
+#   opt_levenberg_marquardt   — nonlinear least squares (damped Gauss-Newton)
+#
+# All f64 values are bit patterns (IEEE 754). Integer arguments are raw i64.
+# Functions return 0 (ERR_NONE) on success, negative ERR_* on failure.
+# Results are written through out-param pointers.
+#
+# Flat arrays: alloc(n * 8), load64(arr + i * 8), store64(arr + i * 8, val).
+# Function pointers:
+#   f:         fncall1(f, x_ptr)           -> f64 value
+#   grad:      fncall2(grad, x_ptr, out)   -> writes n f64s to out
+#   residuals: fncall1(fp, x_ptr)          -> pointer to residual vector
+#   jacobian:  fncall2(fp, x_ptr, out_J)   -> writes m*n f64s to out_J
+
+# ================================================================
+# Constants
+# ================================================================
+
+var _OPT_F64_ZERO  = 0;
+var _OPT_F64_ONE   = 0x3FF0000000000000;          # 1.0
+var _OPT_F64_HALF  = 0x3FE0000000000000;          # 0.5
+var _OPT_F64_C1    = 0x3F1A36E2EB1C432D;          # 1e-4 (Armijo constant)
+var _OPT_MAX_LS    = 40;                           # max line search iterations
+
+# ================================================================
+# Internal helpers
+# ================================================================
+
+# Dot product of two flat f64 arrays of length n
+fn _opt_dot(a, b, n) {
+    var sum = _OPT_F64_ZERO;
+    var i = 0;
+    while (i < n) {
+        var ai = load64(a + i * 8);
+        var bi = load64(b + i * 8);
+        sum = f64_add(sum, f64_mul(ai, bi));
+        i = i + 1;
+    }
+    return sum;
+}
+
+# Euclidean norm of a flat f64 array of length n
+fn _opt_norm(v, n) {
+    return f64_sqrt(_opt_dot(v, v, n));
+}
+
+# Copy n f64 values from src to dst
+fn _opt_copy(dst, src, n) {
+    var i = 0;
+    while (i < n) {
+        store64(dst + i * 8, load64(src + i * 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# dst = a + scale * b  (flat f64 arrays of length n)
+fn _opt_axpy(dst, a, scale, b, n) {
+    var i = 0;
+    while (i < n) {
+        var ai = load64(a + i * 8);
+        var bi = load64(b + i * 8);
+        store64(dst + i * 8, f64_add(ai, f64_mul(scale, bi)));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Armijo backtracking line search.
+# Finds alpha such that f(x + alpha*d) <= f(x) + c1*alpha*(grad . d).
+# Writes x + alpha*d into x_trial.
+# Returns the f64 step size alpha.
+fn _opt_armijo(f, x, d, grad_ptr, n, f_old, x_trial) {
+    var dg = _opt_dot(d, grad_ptr, n);
+    var alpha = _OPT_F64_ONE;
+
+    var ls = 0;
+    while (ls < _OPT_MAX_LS) {
+        _opt_axpy(x_trial, x, alpha, d, n);
+        var f_new = fncall1(f, x_trial);
+        var threshold = f64_add(f_old, f64_mul(_OPT_F64_C1, f64_mul(alpha, dg)));
+        if (f64_lt(f_new, threshold) == 1) {
+            return alpha;
+        }
+        # f_new == threshold is also acceptable
+        if (f64_lt(threshold, f_new) == 0) {
+            return alpha;
+        }
+        alpha = f64_mul(alpha, _OPT_F64_HALF);
+        ls = ls + 1;
+    }
+    # Fallback: use the last alpha
+    _opt_axpy(x_trial, x, alpha, d, n);
+    return alpha;
+}
+
+# ================================================================
+# 1. GRADIENT DESCENT
+# ================================================================
+
+# Steepest descent minimization of f: R^n -> R.
+# f:        function pointer, fncall1(f, x_ptr) -> f64 value
+# grad:     function pointer, fncall2(grad, x_ptr, out_grad) -> writes gradient
+# x0:       initial point (flat array of n f64s)
+# n:        dimension (integer)
+# lr:       learning rate (f64 bit pattern)
+# tol:      convergence tolerance on gradient norm (f64)
+# max_iter: maximum iterations (integer)
+# out_x:    pointer where optimal x is written (n f64s, caller allocates)
+# out_fmin: pointer where minimum f value is written (1 f64, caller allocates)
+# Returns:  ERR_NONE on success, ERR_INVALID_INPUT or ERR_NO_CONVERGENCE
+fn opt_gradient_descent(f, grad, x0, n, lr, tol, max_iter, out_x, out_fmin) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+
+    # Working copy of x
+    var x = alloc(n * 8);
+    _opt_copy(x, x0, n);
+
+    # Gradient buffer
+    var g = alloc(n * 8);
+
+    var iter = 0;
+    while (iter < max_iter) {
+        # Evaluate gradient
+        fncall2(grad, x, g);
+
+        # Check convergence: ||g|| < tol
+        var gnorm = _opt_norm(g, n);
+        if (f64_lt(gnorm, tol) == 1) {
+            _opt_copy(out_x, x, n);
+            store64(out_fmin, fncall1(f, x));
+            return ERR_NONE;
+        }
+
+        # x = x - lr * g
+        var i = 0;
+        while (i < n) {
+            var xi = load64(x + i * 8);
+            var gi = load64(g + i * 8);
+            store64(x + i * 8, f64_sub(xi, f64_mul(lr, gi)));
+            i = i + 1;
+        }
+
+        iter = iter + 1;
+    }
+
+    # Return best estimate even on non-convergence
+    _opt_copy(out_x, x, n);
+    store64(out_fmin, fncall1(f, x));
+    return ERR_NO_CONVERGENCE;
+}
+
+# ================================================================
+# 2. CONJUGATE GRADIENT (Fletcher-Reeves)
+# ================================================================
+
+# Fletcher-Reeves conjugate gradient minimization of f: R^n -> R.
+# f:        function pointer, fncall1(f, x_ptr) -> f64 value
+# grad:     function pointer, fncall2(grad, x_ptr, out_grad) -> writes gradient
+# x0:       initial point (flat array of n f64s)
+# n:        dimension (integer)
+# tol:      convergence tolerance on gradient norm (f64)
+# max_iter: maximum iterations (integer)
+# out_x:    pointer where optimal x is written (n f64s, caller allocates)
+# out_fmin: pointer where minimum f value is written (1 f64, caller allocates)
+# Returns:  ERR_NONE on success, ERR_INVALID_INPUT or ERR_NO_CONVERGENCE
+fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+
+    var x       = alloc(n * 8);
+    var g       = alloc(n * 8);
+    var d       = alloc(n * 8);
+    var g_new   = alloc(n * 8);
+    var x_trial = alloc(n * 8);
+
+    _opt_copy(x, x0, n);
+
+    # Initial gradient and search direction d = -g
+    fncall2(grad, x, g);
+    var i = 0;
+    while (i < n) {
+        store64(d + i * 8, f64_neg(load64(g + i * 8)));
+        i = i + 1;
+    }
+
+    var gg_old = _opt_dot(g, g, n);
+
+    var iter = 0;
+    while (iter < max_iter) {
+        var gnorm = f64_sqrt(gg_old);
+        if (f64_lt(gnorm, tol) == 1) {
+            _opt_copy(out_x, x, n);
+            store64(out_fmin, fncall1(f, x));
+            return ERR_NONE;
+        }
+
+        # Line search along d
+        var f_old = fncall1(f, x);
+        _opt_armijo(f, x, d, g, n, f_old, x_trial);
+
+        # New gradient at x_trial
+        fncall2(grad, x_trial, g_new);
+        var gg_new = _opt_dot(g_new, g_new, n);
+
+        # Fletcher-Reeves beta
+        var beta = _OPT_F64_ZERO;
+        if (f64_lt(EPSILON_F64, gg_old) == 1) {
+            beta = f64_div(gg_new, gg_old);
+        }
+
+        # Update search direction: d = -g_new + beta * d
+        i = 0;
+        while (i < n) {
+            var gnew_i = load64(g_new + i * 8);
+            var d_i    = load64(d + i * 8);
+            store64(d + i * 8, f64_add(f64_neg(gnew_i), f64_mul(beta, d_i)));
+            i = i + 1;
+        }
+
+        # Advance
+        _opt_copy(x, x_trial, n);
+        _opt_copy(g, g_new, n);
+        gg_old = gg_new;
+
+        iter = iter + 1;
+    }
+
+    _opt_copy(out_x, x, n);
+    store64(out_fmin, fncall1(f, x));
+    return ERR_NO_CONVERGENCE;
+}
+
+# ================================================================
+# 3. BFGS (Broyden-Fletcher-Goldfarb-Shanno)
+# ================================================================
+
+# BFGS quasi-Newton minimization with Armijo backtracking line search.
+# f:        function pointer, fncall1(f, x_ptr) -> f64 value
+# grad:     function pointer, fncall2(grad, x_ptr, out_grad) -> writes gradient
+# x0:       initial point (flat array of n f64s)
+# n:        dimension (integer)
+# tol:      convergence tolerance on gradient norm (f64)
+# max_iter: maximum iterations (integer)
+# out_x:    pointer where optimal x is written (n f64s, caller allocates)
+# out_fmin: pointer where minimum f value is written (1 f64, caller allocates)
+# Returns:  ERR_NONE on success, ERR_INVALID_INPUT or ERR_NO_CONVERGENCE
+fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+
+    var x       = alloc(n * 8);
+    var g       = alloc(n * 8);
+    var d       = alloc(n * 8);
+    var x_new   = alloc(n * 8);
+    var g_new   = alloc(n * 8);
+    var s       = alloc(n * 8);
+    var y       = alloc(n * 8);
+    var hy      = alloc(n * 8);
+
+    # Inverse Hessian approximation H_inv stored as flat n*n f64 array (row-major)
+    var nn = n * n;
+    var h_inv = alloc(nn * 8);
+
+    # Initialize H_inv = I
+    var idx = 0;
+    while (idx < nn) {
+        store64(h_inv + idx * 8, _OPT_F64_ZERO);
+        idx = idx + 1;
+    }
+    idx = 0;
+    while (idx < n) {
+        store64(h_inv + (idx * n + idx) * 8, _OPT_F64_ONE);
+        idx = idx + 1;
+    }
+
+    _opt_copy(x, x0, n);
+    fncall2(grad, x, g);
+
+    var iter = 0;
+    while (iter < max_iter) {
+        # Check convergence
+        var gnorm = _opt_norm(g, n);
+        if (f64_lt(gnorm, tol) == 1) {
+            _opt_copy(out_x, x, n);
+            store64(out_fmin, fncall1(f, x));
+            return ERR_NONE;
+        }
+
+        # Search direction: d = -H_inv * g
+        var i = 0;
+        while (i < n) {
+            var sum = _OPT_F64_ZERO;
+            var j = 0;
+            while (j < n) {
+                var hij = load64(h_inv + (i * n + j) * 8);
+                var gj  = load64(g + j * 8);
+                sum = f64_add(sum, f64_mul(hij, gj));
+                j = j + 1;
+            }
+            store64(d + i * 8, f64_neg(sum));
+            i = i + 1;
+        }
+
+        # Armijo backtracking line search
+        var f_old = fncall1(f, x);
+        _opt_armijo(f, x, d, g, n, f_old, x_new);
+
+        # Compute s = x_new - x, and new gradient
+        fncall2(grad, x_new, g_new);
+        i = 0;
+        while (i < n) {
+            store64(s + i * 8, f64_sub(load64(x_new + i * 8), load64(x + i * 8)));
+            store64(y + i * 8, f64_sub(load64(g_new + i * 8), load64(g + i * 8)));
+            i = i + 1;
+        }
+
+        var sy = _opt_dot(s, y, n);
+
+        # BFGS update of H_inv (skip if curvature condition fails)
+        if (f64_lt(EPSILON_F64, sy) == 1) {
+            var rho = f64_div(_OPT_F64_ONE, sy);
+
+            # hy = H_inv * y
+            i = 0;
+            while (i < n) {
+                var sum = _OPT_F64_ZERO;
+                var j = 0;
+                while (j < n) {
+                    var hij = load64(h_inv + (i * n + j) * 8);
+                    var yj  = load64(y + j * 8);
+                    sum = f64_add(sum, f64_mul(hij, yj));
+                    j = j + 1;
+                }
+                store64(hy + i * 8, sum);
+                i = i + 1;
+            }
+
+            var yhy = _opt_dot(y, hy, n);
+
+            # H_inv += rho * ((1 + rho*yhy)*s*s^T - hy*s^T - s*hy^T)
+            var factor = f64_add(_OPT_F64_ONE, f64_mul(rho, yhy));
+            i = 0;
+            while (i < n) {
+                var si  = load64(s + i * 8);
+                var hyi = load64(hy + i * 8);
+                var j = 0;
+                while (j < n) {
+                    var sj  = load64(s + j * 8);
+                    var hyj = load64(hy + j * 8);
+                    var old = load64(h_inv + (i * n + j) * 8);
+                    var upd = f64_mul(rho,
+                        f64_sub(
+                            f64_mul(factor, f64_mul(si, sj)),
+                            f64_add(f64_mul(hyi, sj), f64_mul(si, hyj))
+                        )
+                    );
+                    store64(h_inv + (i * n + j) * 8, f64_add(old, upd));
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+        }
+
+        # Advance
+        _opt_copy(x, x_new, n);
+        _opt_copy(g, g_new, n);
+
+        iter = iter + 1;
+    }
+
+    _opt_copy(out_x, x, n);
+    store64(out_fmin, fncall1(f, x));
+    return ERR_NO_CONVERGENCE;
+}
+
+# ================================================================
+# 4. L-BFGS (Limited-memory BFGS)
+# ================================================================
+
+# L-BFGS minimization with two-loop recursion and Armijo line search.
+# f:        function pointer, fncall1(f, x_ptr) -> f64 value
+# grad:     function pointer, fncall2(grad, x_ptr, out_grad) -> writes gradient
+# x0:       initial point (flat array of n f64s)
+# n:        dimension (integer)
+# m:        history size (integer, typically 5-20)
+# tol:      convergence tolerance on gradient norm (f64)
+# max_iter: maximum iterations (integer)
+# out_x:    pointer where optimal x is written (n f64s, caller allocates)
+# out_fmin: pointer where minimum f value is written (1 f64, caller allocates)
+# Returns:  ERR_NONE on success, ERR_INVALID_INPUT or ERR_NO_CONVERGENCE
+fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
+    if (n <= 0) { return ERR_INVALID_INPUT; }
+    if (m <= 0) { return ERR_INVALID_INPUT; }
+
+    var x       = alloc(n * 8);
+    var g       = alloc(n * 8);
+    var q       = alloc(n * 8);
+    var x_new   = alloc(n * 8);
+
+    # History ring buffer: m slots, each with s[n], y[n], rho
+    # Layout per slot: n f64 (s) + n f64 (y) + 1 f64 (rho) = (2n+1)*8 bytes
+    var slot_size = (2 * n + 1) * 8;
+    var hist = alloc(m * slot_size);
+    var alpha_buf = alloc(m * 8);
+
+    # k = number of stored pairs (0..m), head = next write index
+    var k    = 0;
+    var head = 0;
+
+    _opt_copy(x, x0, n);
+    fncall2(grad, x, g);
+
+    var iter = 0;
+    while (iter < max_iter) {
+        var gnorm = _opt_norm(g, n);
+        if (f64_lt(gnorm, tol) == 1) {
+            _opt_copy(out_x, x, n);
+            store64(out_fmin, fncall1(f, x));
+            return ERR_NONE;
+        }
+
+        # --- Two-loop recursion ---
+        # q = g (copy)
+        _opt_copy(q, g, n);
+
+        # First loop: newest to oldest
+        var loop_i = k - 1;
+        while (loop_i >= 0) {
+            # Map loop_i to ring index: (head - 1 - loop_i + m) % m
+            # But we stored oldest first. Let's use: ring index of i-th newest
+            # newest is at (head - 1 + m) % m, second newest at (head - 2 + m) % m, etc.
+            # i-th from newest (loop_i=0 is newest, loop_i=k-1 is oldest) would be wrong.
+            # We want newest to oldest: j = k-1 downto 0 maps to ring[(head-1-j+m)%m]
+            # But loop_i goes from k-1 downto 0, and we want newest first.
+            # Reindex: newest first means idx = k - 1 - loop_i reversed.
+            # Actually: loop_i = k-1 is first iteration. We want it to be newest.
+            # ring index of newest = (head - 1 + m) % m
+            # ring index of j-th newest (j=0 newest) = (head - 1 - j + m) % m
+            # j-th newest where j = k - 1 - loop_i
+            var j_newest = k - 1 - loop_i;
+            var ring_idx = (head - 1 - j_newest + m * 2) % m;  # +m*2 ensures positive
+            var slot_base = hist + ring_idx * slot_size;
+            var s_ptr = slot_base;
+            var y_ptr = slot_base + n * 8;
+            var rho_i = load64(slot_base + 2 * n * 8);
+
+            var sq = _opt_dot(s_ptr, q, n);
+            var ai = f64_mul(rho_i, sq);
+            store64(alpha_buf + j_newest * 8, ai);
+
+            # q = q - ai * y
+            var vi = 0;
+            while (vi < n) {
+                var qv = load64(q + vi * 8);
+                var yv = load64(y_ptr + vi * 8);
+                store64(q + vi * 8, f64_sub(qv, f64_mul(ai, yv)));
+                vi = vi + 1;
+            }
+
+            loop_i = loop_i - 1;
+        }
+
+        # Scale q by gamma = s_k . y_k / (y_k . y_k) using most recent pair
+        if (k > 0) {
+            var newest_ring = (head - 1 + m * 2) % m;
+            var newest_base = hist + newest_ring * slot_size;
+            var s_newest = newest_base;
+            var y_newest = newest_base + n * 8;
+            var yy = _opt_dot(y_newest, y_newest, n);
+            if (f64_lt(EPSILON_F64, yy) == 1) {
+                var rho_newest = load64(newest_base + 2 * n * 8);
+                var gamma = f64_div(_OPT_F64_ONE, f64_mul(rho_newest, yy));
+                var vi = 0;
+                while (vi < n) {
+                    var qv = load64(q + vi * 8);
+                    store64(q + vi * 8, f64_mul(qv, gamma));
+                    vi = vi + 1;
+                }
+            }
+        }
+
+        # Second loop: oldest to newest
+        var loop_j = 0;
+        while (loop_j < k) {
+            # j_newest = loop_j means j-th from newest (0 = newest)
+            # But this loop goes oldest to newest, so j_oldest = loop_j
+            # oldest is j_newest = k-1, so j_newest = k - 1 - loop_j
+            var j_new2 = k - 1 - loop_j;
+            var ring_idx2 = (head - 1 - j_new2 + m * 2) % m;
+            var slot_base2 = hist + ring_idx2 * slot_size;
+            var y_ptr2 = slot_base2 + n * 8;
+            var rho_j = load64(slot_base2 + 2 * n * 8);
+
+            var yq = _opt_dot(y_ptr2, q, n);
+            var beta_j = f64_mul(rho_j, yq);
+
+            var aj = load64(alpha_buf + j_new2 * 8);
+            var diff = f64_sub(aj, beta_j);
+            var s_ptr2 = slot_base2;
+
+            var vi = 0;
+            while (vi < n) {
+                var qv = load64(q + vi * 8);
+                var sv = load64(s_ptr2 + vi * 8);
+                store64(q + vi * 8, f64_add(qv, f64_mul(diff, sv)));
+                vi = vi + 1;
+            }
+
+            loop_j = loop_j + 1;
+        }
+
+        # d = -q (search direction, stored back in q for reuse)
+        var vi = 0;
+        while (vi < n) {
+            store64(q + vi * 8, f64_neg(load64(q + vi * 8)));
+            vi = vi + 1;
+        }
+
+        # Armijo line search
+        var f_old = fncall1(f, x);
+        _opt_armijo(f, x, q, g, n, f_old, x_new);
+
+        # Compute new gradient
+        var g_new_buf = alloc(n * 8);
+        fncall2(grad, x_new, g_new_buf);
+
+        # Store correction pair in ring buffer
+        var s_k = alloc(n * 8);
+        var y_k = alloc(n * 8);
+        vi = 0;
+        while (vi < n) {
+            store64(s_k + vi * 8, f64_sub(load64(x_new + vi * 8), load64(x + vi * 8)));
+            store64(y_k + vi * 8, f64_sub(load64(g_new_buf + vi * 8), load64(g + vi * 8)));
+            vi = vi + 1;
+        }
+
+        var sy = _opt_dot(s_k, y_k, n);
+
+        if (f64_lt(EPSILON_F64, sy) == 1) {
+            var slot_wr = hist + head * slot_size;
+            _opt_copy(slot_wr, s_k, n);
+            _opt_copy(slot_wr + n * 8, y_k, n);
+            store64(slot_wr + 2 * n * 8, f64_div(_OPT_F64_ONE, sy));
+            head = (head + 1) % m;
+            if (k < m) { k = k + 1; }
+        }
+
+        # Advance
+        _opt_copy(x, x_new, n);
+        _opt_copy(g, g_new_buf, n);
+
+        iter = iter + 1;
+    }
+
+    _opt_copy(out_x, x, n);
+    store64(out_fmin, fncall1(f, x));
+    return ERR_NO_CONVERGENCE;
+}
+
+# ================================================================
+# 5. LEVENBERG-MARQUARDT (nonlinear least squares)
+# ================================================================
+
+# Levenberg-Marquardt solver for minimizing sum(r_i(x)^2).
+# residuals: fncall1(fp, x_ptr) -> pointer to flat array of n_residuals f64s
+# jacobian:  fncall2(fp, x_ptr, out_J) -> writes n_residuals*n_params f64s (row-major)
+# x0:        initial parameters (flat array of n_params f64s)
+# n_params:  number of parameters (integer)
+# n_residuals: number of residuals (integer)
+# tol:       convergence tolerance on residual norm (f64)
+# max_iter:  maximum iterations (integer)
+# out_x:     pointer where optimal parameters are written (n_params f64s, caller allocates)
+# Returns:   ERR_NONE on success, ERR_INVALID_INPUT or ERR_NO_CONVERGENCE
+fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals, tol, max_iter, out_x) {
+    if (n_params <= 0) { return ERR_INVALID_INPUT; }
+    if (n_residuals <= 0) { return ERR_INVALID_INPUT; }
+
+    var np = n_params;
+    var nr = n_residuals;
+
+    var x       = alloc(np * 8);
+    var x_trial = alloc(np * 8);
+    var jtr     = alloc(np * 8);
+    var delta   = alloc(np * 8);
+    var j_buf   = alloc(nr * np * 8);  # Jacobian buffer (row-major: nr rows x np cols)
+
+    _opt_copy(x, x0, np);
+
+    # Evaluate initial residuals and cost
+    var r_ptr = fncall1(residuals, x);
+    var cost = _opt_dot(r_ptr, r_ptr, nr);
+
+    # Initial damping parameter
+    var lambda = f64_div(f64_from(1), f64_from(1000));  # 1e-3
+    var lambda_up   = f64_from(10);
+    var lambda_down = f64_div(_OPT_F64_ONE, f64_from(10));  # 0.1
+
+    var iter = 0;
+    while (iter < max_iter) {
+        # Check convergence: sqrt(cost) < tol
+        if (f64_lt(f64_sqrt(cost), tol) == 1) {
+            _opt_copy(out_x, x, np);
+            return ERR_NONE;
+        }
+
+        # Evaluate Jacobian
+        fncall2(jacobian, x, j_buf);
+
+        # Compute J^T * J (np x np) and J^T * r (np x 1)
+        # Use mat_new for JtJ to leverage mat_lu_solve
+        var jtj = mat_new(np, np);
+
+        var pi = 0;
+        while (pi < np) {
+            # jtr[pi] = sum_k J[k][pi] * r[k]
+            var sum_r = _OPT_F64_ZERO;
+            var kk = 0;
+            while (kk < nr) {
+                var j_kpi = load64(j_buf + (kk * np + pi) * 8);
+                var r_kk  = load64(r_ptr + kk * 8);
+                sum_r = f64_add(sum_r, f64_mul(j_kpi, r_kk));
+                kk = kk + 1;
+            }
+            store64(jtr + pi * 8, sum_r);
+
+            # jtj[pi][pj] = sum_k J[k][pi] * J[k][pj]
+            var pj = 0;
+            while (pj < np) {
+                var sum_jj = _OPT_F64_ZERO;
+                kk = 0;
+                while (kk < nr) {
+                    var j_kpi2 = load64(j_buf + (kk * np + pi) * 8);
+                    var j_kpj  = load64(j_buf + (kk * np + pj) * 8);
+                    sum_jj = f64_add(sum_jj, f64_mul(j_kpi2, j_kpj));
+                    kk = kk + 1;
+                }
+                mat_set(jtj, pi, pj, sum_jj);
+                pj = pj + 1;
+            }
+            pi = pi + 1;
+        }
+
+        # Damped normal equations: (J^T J + lambda * I) delta = -J^T r
+        # Add lambda to diagonal
+        pi = 0;
+        while (pi < np) {
+            var diag = mat_get(jtj, pi, pi);
+            mat_set(jtj, pi, pi, f64_add(diag, lambda));
+            pi = pi + 1;
+        }
+
+        # Negate jtr for RHS: b = -J^T r
+        var rhs = alloc(np * 8);
+        pi = 0;
+        while (pi < np) {
+            store64(rhs + pi * 8, f64_neg(load64(jtr + pi * 8)));
+            pi = pi + 1;
+        }
+
+        # Solve via LU decomposition
+        var lu  = mat_new(np, np);
+        var piv = alloc(np * 8);
+        var sign = mat_lu(jtj, lu, piv);
+
+        if (sign == 0) {
+            # Singular — increase damping and retry
+            lambda = f64_mul(lambda, lambda_up);
+            iter = iter + 1;
+            continue;
+        }
+
+        mat_lu_solve(lu, piv, rhs, delta);
+
+        # Trial step: x_trial = x + delta
+        _opt_axpy(x_trial, x, _OPT_F64_ONE, delta, np);
+
+        var r_trial = fncall1(residuals, x_trial);
+        var cost_trial = _opt_dot(r_trial, r_trial, nr);
+
+        if (f64_lt(cost_trial, cost) == 1) {
+            # Accept step
+            _opt_copy(x, x_trial, np);
+            r_ptr = r_trial;
+            cost = cost_trial;
+            lambda = f64_mul(lambda, lambda_down);
+        } else {
+            # Reject step — increase damping
+            lambda = f64_mul(lambda, lambda_up);
+        }
+
+        iter = iter + 1;
+    }
+
+    _opt_copy(out_x, x, np);
+    return ERR_NO_CONVERGENCE;
+}

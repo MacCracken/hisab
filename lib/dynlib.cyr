@@ -1,0 +1,735 @@
+# dynlib.cyr — pure Cyrius dynamic library loader (ELF .so)
+# Usage: include "lib/dynlib.cyr"
+# Requires: string.cyr, syscalls.cyr, mmap.cyr
+#
+# Loads ELF shared objects via mmap, parses ELF64 headers,
+# walks .dynsym + .dynstr to resolve exported symbols.
+# No libc. No dlopen. Pure syscalls.
+#
+# API:
+#   dynlib_open(path)         → handle (pointer to DynLib struct) or 0 on failure
+#   dynlib_sym(handle, name)  → function pointer (address) or 0 if not found
+#   dynlib_close(handle)      → 0
+#
+# DynLib struct layout (64 bytes):
+#   +0:  base       — mmap'd base address
+#   +8:  size       — mmap'd total span
+#   +16: dynsym     — pointer to .dynsym section
+#   +24: dynstr     — pointer to .dynstr section
+#   +32: nsyms      — number of symbols in .dynsym
+#   +40: load_bias  — difference between mmap'd base and ELF p_vaddr
+#   +48: gnu_hash   — pointer to .gnu.hash section (0 if not present)
+#   +56: strtab_sz  — size of .dynstr in bytes (bounds checking)
+
+# ================================================================
+# ELF64 constants
+# ================================================================
+
+enum ElfMagic {
+    ELFMAG      = 0x464C457F;  # \x7FELF (little-endian u32)
+}
+
+enum ElfClass {
+    ELFCLASS64  = 2;
+}
+
+enum ElfType {
+    ET_DYN      = 3;           # Shared object
+}
+
+enum ElfPhdr {
+    PT_LOAD     = 1;
+    PT_DYNAMIC  = 2;
+}
+
+# Dynamic section tag types
+enum ElfDyn {
+    DT_NULL     = 0;
+    DT_NEEDED   = 1;           # Name of needed library (strtab offset)
+    DT_STRTAB   = 5;           # Address of .dynstr
+    DT_SYMTAB   = 6;           # Address of .dynsym
+    DT_RELA     = 7;           # Address of .rela.dyn
+    DT_RELASZ   = 8;           # Size of .rela.dyn
+    DT_STRSZ    = 10;          # Size of .dynstr
+    DT_INIT     = 12;          # Init function address
+    DT_JMPREL   = 23;          # Address of .rela.plt
+    DT_PLTRELSZ = 2;           # Size of .rela.plt
+    DT_GNU_HASH = 0x6FFFFEF5;  # GNU hash table
+    DT_INIT_ARRAY   = 25;      # Init function array address
+    DT_INIT_ARRAYSZ = 27;      # Init function array size
+}
+
+# Relocation types (x86_64)
+enum ElfReloc {
+    R_X86_64_64        = 1;    # S + A
+    R_X86_64_GLOB_DAT  = 6;    # S
+    R_X86_64_JUMP_SLOT = 7;    # S (same as GLOB_DAT for eager binding)
+    R_X86_64_RELATIVE  = 8;    # B + A
+    R_X86_64_IRELATIVE = 37;   # indirect — call(B + A), write result
+}
+
+# Symbol table entry binding/type extraction
+# st_info byte: binding = info >> 4, type = info & 0xF
+enum ElfStBind {
+    STB_GLOBAL  = 1;
+    STB_WEAK    = 2;
+}
+
+enum ElfStType {
+    STT_FUNC    = 2;
+    STT_OBJECT  = 1;
+}
+
+# ELF64 struct sizes
+enum ElfSizes {
+    EHDR_SIZE   = 64;          # ELF64 header
+    PHDR_SIZE   = 56;          # Program header entry
+    SYM_SIZE    = 24;          # Elf64_Sym entry
+    DYN_SIZE    = 16;          # Elf64_Dyn entry
+}
+
+# ================================================================
+# DynLib struct accessors
+# ================================================================
+
+fn _dynlib_base(h)     { return load64(h); }
+fn _dynlib_size(h)     { return load64(h + 8); }
+fn _dynlib_dynsym(h)   { return load64(h + 16); }
+fn _dynlib_dynstr(h)   { return load64(h + 24); }
+fn _dynlib_nsyms(h)    { return load64(h + 32); }
+fn _dynlib_bias(h)     { return load64(h + 40); }
+fn _dynlib_gnuhash(h)  { return load64(h + 48); }
+fn _dynlib_strsz(h)    { return load64(h + 56); }
+
+# ================================================================
+# ELF64 header field readers (from mmap'd base)
+# ================================================================
+
+# Check ELF magic bytes at base
+fn _elf_check_magic(base) {
+    var magic = load32(base);
+    if (magic != ELFMAG) { return 0; }
+    # Check class = 64-bit
+    if (load8(base + 4) != ELFCLASS64) { return 0; }
+    return 1;
+}
+
+# e_type at offset 16 (u16)
+fn _elf_type(base) { return load16(base + 16); }
+
+# e_phoff at offset 32 (u64)
+fn _elf_phoff(base) { return load64(base + 32); }
+
+# e_phentsize at offset 54 (u16)
+fn _elf_phentsize(base) { return load16(base + 54); }
+
+# e_phnum at offset 56 (u16)
+fn _elf_phnum(base) { return load16(base + 56); }
+
+# ================================================================
+# Program header field readers
+# ================================================================
+
+# p_type at +0 (u32)
+fn _phdr_type(p) { return load32(p); }
+
+# p_offset at +8 (u64)
+fn _phdr_offset(p) { return load64(p + 8); }
+
+# p_vaddr at +16 (u64)
+fn _phdr_vaddr(p) { return load64(p + 16); }
+
+# p_filesz at +32 (u64)
+fn _phdr_filesz(p) { return load64(p + 32); }
+
+# p_memsz at +40 (u64)
+fn _phdr_memsz(p) { return load64(p + 40); }
+
+# ================================================================
+# Dynamic section parsing
+# ================================================================
+
+# Walk PT_DYNAMIC entries to extract linking metadata.
+# Returns a scratch struct (128 bytes):
+#   +0:  symtab_vaddr    +8:  strtab_vaddr   +16: strtab_size
+#   +24: gnuhash_vaddr   +32: rela_vaddr     +40: rela_size
+#   +48: jmprel_vaddr    +56: jmprel_size    +64: init_vaddr
+#   +72: init_array_vaddr +80: init_array_size
+#   +88: needed[8] (up to 8 DT_NEEDED strtab offsets)
+#   +88+0..63: needed offsets   +88+64: needed_count
+fn _parse_dynamic(base, dyn_offset, dyn_size) {
+    var result = alloc(160);
+    var ri = 0;
+    while (ri < 160) { store8(result + ri, 0); ri = ri + 1; }
+
+    var needed_count = 0;
+    var pos = base + dyn_offset;
+    var end = pos + dyn_size;
+
+    while (pos < end) {
+        var d_tag = load64(pos);
+        var d_val = load64(pos + 8);
+
+        if (d_tag == DT_NULL)       { pos = end; }
+        elif (d_tag == DT_SYMTAB)   { store64(result, d_val); }
+        elif (d_tag == DT_STRTAB)   { store64(result + 8, d_val); }
+        elif (d_tag == DT_STRSZ)    { store64(result + 16, d_val); }
+        elif (d_tag == DT_GNU_HASH) { store64(result + 24, d_val); }
+        elif (d_tag == DT_RELA)     { store64(result + 32, d_val); }
+        elif (d_tag == DT_RELASZ)   { store64(result + 40, d_val); }
+        elif (d_tag == DT_JMPREL)   { store64(result + 48, d_val); }
+        elif (d_tag == DT_PLTRELSZ) { store64(result + 56, d_val); }
+        elif (d_tag == DT_INIT)     { store64(result + 64, d_val); }
+        elif (d_tag == DT_INIT_ARRAY)   { store64(result + 72, d_val); }
+        elif (d_tag == DT_INIT_ARRAYSZ) { store64(result + 80, d_val); }
+        elif (d_tag == DT_NEEDED) {
+            if (needed_count < 8) {
+                store64(result + 88 + needed_count * 8, d_val);
+                needed_count = needed_count + 1;
+            }
+        }
+
+        pos = pos + DYN_SIZE;
+    }
+    store64(result + 152, needed_count);
+    return result;
+}
+
+# ================================================================
+# GNU hash lookup (fast O(1) average)
+# ================================================================
+
+# GNU hash function
+fn _gnu_hash(name) {
+    var h = 5381;
+    var i = 0;
+    var c = load8(name + i);
+    while (c != 0) {
+        h = ((h << 5) + h) + c;
+        # Keep to 32-bit range
+        h = h & 0xFFFFFFFF;
+        i = i + 1;
+        c = load8(name + i);
+    }
+    return h;
+}
+
+# GNU hash table layout:
+#   +0:  nbuckets (u32)
+#   +4:  symoffset (u32) — first symbol index in hash chains
+#   +8:  bloom_size (u32)
+#   +12: bloom_shift (u32)
+#   +16: bloom[bloom_size] (u64 each)
+#   +16+bloom_size*8: buckets[nbuckets] (u32 each)
+#   after buckets: chains[] (u32 each, one per symbol starting from symoffset)
+
+fn _gnu_hash_lookup(gnuhash, dynsym, dynstr, strsz, bias, name) {
+    var nbuckets    = load32(gnuhash);
+    var symoffset   = load32(gnuhash + 4);
+    var bloom_size  = load32(gnuhash + 8);
+    var bloom_shift = load32(gnuhash + 12);
+
+    # Guard against zero divisors and degenerate tables
+    if (nbuckets == 0 || bloom_size == 0) { return 0; }
+
+    var h1 = _gnu_hash(name);
+
+    # Bloom filter check
+    var bloom_base = gnuhash + 16;
+    var bloom_word = load64(bloom_base + ((h1 / 64) % bloom_size) * 8);
+    var mask = (1 << (h1 % 64)) | (1 << ((h1 >> bloom_shift) % 64));
+    if ((bloom_word & mask) != mask) { return 0; }
+
+    # Bucket lookup
+    var buckets_base = bloom_base + bloom_size * 8;
+    var bucket_idx = h1 % nbuckets;
+    var sym_idx = load32(buckets_base + bucket_idx * 4);
+    if (sym_idx == 0) { return 0; }
+
+    # Chain walk — limit iterations to prevent infinite loops on corrupt data
+    var chains_base = buckets_base + nbuckets * 4;
+    var h1_masked = h1 | 1;  # Set bottom bit for comparison
+    var max_iter = 16384;
+
+    while (max_iter > 0) {
+        max_iter -= 1;
+        if (sym_idx < symoffset) { return 0; }
+        var chain_val = load32(chains_base + (sym_idx - symoffset) * 4);
+
+        # Compare hash (ignoring bottom bit which marks chain end)
+        if ((chain_val | 1) == h1_masked) {
+            # Hash matches — verify string
+            var sym_entry = dynsym + sym_idx * SYM_SIZE;
+            var st_name_off = load32(sym_entry);  # st_name (u32 offset into dynstr)
+            if (strsz > 0 && st_name_off >= strsz) { return 0; }
+            var sym_name = dynstr + st_name_off;
+            if (streq(sym_name, name) == 1) {
+                # Found it — return address
+                var st_value = load64(sym_entry + 8);  # st_value at +8
+                if (st_value == 0) { return 0; }       # Undefined symbol
+                return bias + st_value;
+            }
+        }
+
+        # Check chain end (bottom bit of chain_val)
+        if ((chain_val & 1) == 1) { return 0; }
+
+        sym_idx = sym_idx + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# Linear symbol search fallback (no GNU hash)
+# ================================================================
+
+fn _linear_sym_lookup(dynsym, dynstr, nsyms, strsz, bias, name) {
+    # Skip symbol 0 (null entry)
+    for (var i = 1; i < nsyms; i = i + 1) {
+        var sym = dynsym + i * SYM_SIZE;
+        var st_name_off = load32(sym);           # st_name (u32)
+        var st_info     = load8(sym + 4);        # st_info (u8)
+        var st_value    = load64(sym + 8);       # st_value (u64)
+
+        # Skip undefined symbols
+        if (st_value == 0) { continue; }
+
+        # Validate string table offset
+        if (strsz > 0 && st_name_off >= strsz) { continue; }
+
+        # Check binding: must be GLOBAL or WEAK
+        var binding = st_info >> 4;
+        if (binding != STB_GLOBAL) {
+            if (binding != STB_WEAK) { continue; }
+        }
+
+        # Compare name
+        var sym_name = dynstr + st_name_off;
+        if (streq(sym_name, name) == 1) {
+            return bias + st_value;
+        }
+    }
+    return 0;
+}
+
+# ================================================================
+# Estimate symbol count from dynstr/dynsym gap
+# ================================================================
+# When no hash table is present, estimate nsyms from section layout.
+# .dynsym immediately precedes .dynstr in most ELF .so files.
+
+fn _estimate_nsyms(symtab_vaddr, strtab_vaddr) {
+    if (strtab_vaddr <= symtab_vaddr) { return 256; }  # fallback guess
+    var gap = strtab_vaddr - symtab_vaddr;
+    var n = gap / SYM_SIZE;
+    if (n > 16384) { n = 16384; }
+    return n;
+}
+
+# ================================================================
+# Loaded-library registry (up to 16 libs)
+# ================================================================
+# Tracks all loaded libraries by name hash to avoid duplicates and
+# enable cross-library symbol resolution during relocation.
+
+var _dynlib_registry[256];  # 16 entries × 16 bytes (hash + handle)
+var _dynlib_reg_count = 0;
+
+# Simple hash of a library basename for dedup
+fn _dynlib_namehash(name) {
+    var h = 5381;
+    var i = 0;
+    while (load8(name + i) != 0) {
+        h = ((h << 5) + h) + load8(name + i);
+        h = h & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
+# Check if library is already loaded, return handle or 0
+fn _dynlib_find_loaded(name) {
+    var h = _dynlib_namehash(name);
+    var i = 0;
+    while (i < _dynlib_reg_count) {
+        if (load64(&_dynlib_registry + i * 16) == h) {
+            return load64(&_dynlib_registry + i * 16 + 8);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Register a loaded library
+fn _dynlib_register(name, handle) {
+    if (_dynlib_reg_count >= 16) { return 0; }
+    var h = _dynlib_namehash(name);
+    store64(&_dynlib_registry + _dynlib_reg_count * 16, h);
+    store64(&_dynlib_registry + _dynlib_reg_count * 16 + 8, handle);
+    _dynlib_reg_count = _dynlib_reg_count + 1;
+    return 0;
+}
+
+# Resolve a symbol across ALL loaded libraries
+fn _dynlib_resolve_global(name) {
+    var i = 0;
+    while (i < _dynlib_reg_count) {
+        var h = load64(&_dynlib_registry + i * 16 + 8);
+        var addr = dynlib_sym(h, name);
+        if (addr != 0) { return addr; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Try to find a .so file on common search paths
+# Writes the full path into buf, returns 1 on success
+fn _dynlib_find_path(name, buf, bufsz) {
+    # Try common library paths (4 pointers × 8 bytes = 32 bytes)
+    var paths[32];
+    store64(&paths, "/usr/lib/");
+    store64(&paths + 8, "/lib/");
+    store64(&paths + 16, "/usr/lib/x86_64-linux-gnu/");
+    store64(&paths + 24, "/lib/x86_64-linux-gnu/");
+
+    var pi = 0;
+    while (pi < 4) {
+        var prefix = load64(&paths + pi * 8);
+        var plen = strlen(prefix);
+        var nlen = strlen(name);
+        if (plen + nlen + 1 < bufsz) {
+            memcpy(buf, prefix, plen);
+            memcpy(buf + plen, name, nlen);
+            store8(buf + plen + nlen, 0);
+            var fd = syscall(2, buf, 0, 0);
+            if (fd >= 0) { syscall(3, fd); return 1; }
+        }
+        pi = pi + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# Relocation processing
+# ================================================================
+
+# Process RELA relocations for a loaded library.
+# Phase 1: RELATIVE (no symbol lookup, just base adjustment)
+# Phase 2: GLOB_DAT, JUMP_SLOT, 64 (symbol lookup)
+# Phase 3: IRELATIVE (calls resolver functions — must run last)
+fn _dynlib_process_rela(handle, bias, rela_addr, rela_size) {
+    if (rela_addr == 0 || rela_size == 0) { return 0; }
+
+    var dynsym = load64(handle + 16);
+    var dynstr = load64(handle + 24);
+    var span   = load64(handle + 8);
+    var strsz  = load64(handle + 56);
+
+    # Phase 1: RELATIVE
+    var pos = rela_addr;
+    var end = pos + rela_size;
+    while (pos < end) {
+        var rtype = load64(pos + 8) & 0xFFFFFFFF;
+        if (rtype == R_X86_64_RELATIVE) {
+            var r_offset = load64(pos);
+            if (r_offset < span) {
+                var r_addend = load64(pos + 16);
+                store64(bias + r_offset, bias + r_addend);
+            }
+        }
+        pos += 24;
+    }
+
+    # Phase 2: GLOB_DAT, JUMP_SLOT, 64
+    pos = rela_addr;
+    while (pos < end) {
+        var r_info = load64(pos + 8);
+        var rtype = r_info & 0xFFFFFFFF;
+        if (rtype == R_X86_64_GLOB_DAT || rtype == R_X86_64_JUMP_SLOT || rtype == R_X86_64_64) {
+            var rsym = r_info >> 32;
+            if (rsym > 0) {
+                var sym_entry = dynsym + rsym * SYM_SIZE;
+                var st_name_off = load32(sym_entry);
+                # Validate string table offset before resolving
+                if (strsz > 0 && st_name_off >= strsz) {
+                    pos = pos + 24;
+                    continue;
+                }
+                var sym_name = dynstr + st_name_off;
+                var addr = _dynlib_resolve_global(sym_name);
+                if (addr != 0) {
+                    var r_offset = load64(pos);
+                    if (r_offset < span) {
+                        var target = bias + r_offset;
+                        if (rtype == R_X86_64_64) {
+                            store64(target, addr + load64(pos + 16));
+                        } else {
+                            store64(target, addr);
+                        }
+                    }
+                }
+            }
+        }
+        pos = pos + 24;
+    }
+
+    # Phase 3: IRELATIVE (calls resolver functions to pick IFUNC impls)
+    # These resolvers read CPU features via __cpu_features or CPUID.
+    # On a statically-linked binary, the CPU features struct isn't
+    # initialized by glibc's startup code. Skip IRELATIVE for now —
+    # the default symbol table entries cover the basic implementations.
+    # TODO: initialize CPU features struct or call resolvers safely.
+
+    return 0;
+}
+
+# ================================================================
+# Public API
+# ================================================================
+
+# Open a shared library (.so file) with full dynamic linking.
+# Loads dependencies recursively, processes relocations, runs init.
+# Returns handle pointer or 0 on failure.
+fn dynlib_open(path) {
+    # Check if already loaded
+    var existing = _dynlib_find_loaded(path);
+    if (existing != 0) { return existing; }
+
+    # Open the file
+    var fd = syscall(2, path, 0, 0);  # open(path, O_RDONLY, 0)
+    if (fd < 0) {
+        # Try search paths if not an absolute path
+        if (load8(path) != 47) {
+            var pbuf[512];
+            if (_dynlib_find_path(path, &pbuf, 512) == 1) {
+                fd = syscall(2, &pbuf, 0, 0);
+            }
+        }
+        if (fd < 0) { return 0; }
+    }
+
+    # Get file size via fstat
+    var statbuf[144];
+    var r = syscall(5, fd, &statbuf);
+    if (r < 0) { syscall(3, fd); return 0; }
+    var file_size = load64(&statbuf + 48);
+
+    if (file_size < EHDR_SIZE) { syscall(3, fd); return 0; }
+
+    # First pass: mmap entire file RO to read headers
+    var hdr = cyr_mmap(0, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (hdr < 0) { syscall(3, fd); return 0; }
+
+    # Validate ELF header
+    if (_elf_check_magic(hdr) == 0) {
+        cyr_munmap(hdr, file_size);
+        syscall(3, fd);
+        return 0;
+    }
+    if (_elf_type(hdr) != ET_DYN) {
+        cyr_munmap(hdr, file_size);
+        syscall(3, fd);
+        return 0;
+    }
+
+    # Walk program headers — find address span and segments
+    var phoff = _elf_phoff(hdr);
+    var phnum = _elf_phnum(hdr);
+    var phentsz = _elf_phentsize(hdr);
+
+    # Validate program header table fits within file
+    if (phentsz < PHDR_SIZE) {
+        cyr_munmap(hdr, file_size);
+        syscall(3, fd);
+        return 0;
+    }
+    if (phoff + phnum * phentsz > file_size) {
+        cyr_munmap(hdr, file_size);
+        syscall(3, fd);
+        return 0;
+    }
+
+    var lo_vaddr = 0xFFFFFFFFFFFFFFFF;
+    var hi_vaddr = 0;
+    var dyn_offset = 0;
+    var dyn_size = 0;
+
+    for (var i = 0; i < phnum; i = i + 1) {
+        var ph = hdr + phoff + i * phentsz;
+        var ptype = _phdr_type(ph);
+        if (ptype == PT_LOAD) {
+            var va = _phdr_vaddr(ph);
+            var msz = _phdr_memsz(ph);
+            if (va < lo_vaddr) { lo_vaddr = va; }
+            if (va + msz > hi_vaddr) { hi_vaddr = va + msz; }
+        }
+        elif (ptype == PT_DYNAMIC) {
+            dyn_offset = _phdr_vaddr(ph);
+            dyn_size = _phdr_filesz(ph);
+        }
+    }
+
+    if (dyn_offset == 0 || lo_vaddr >= hi_vaddr) {
+        cyr_munmap(hdr, file_size);
+        syscall(3, fd);
+        return 0;
+    }
+
+    # Align span to page boundaries
+    var page_lo = lo_vaddr & (0 - 4096);
+    var page_hi = (hi_vaddr + 4095) & (0 - 4096);
+    var span = page_hi - page_lo;
+
+    # Reserve address space with anonymous PROT_NONE mmap
+    var base = cyr_mmap(0, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0 - 1, 0);
+    if (base < 0) {
+        cyr_munmap(hdr, file_size);
+        syscall(3, fd);
+        return 0;
+    }
+    var bias = base - page_lo;
+
+    # Map each PT_LOAD segment with correct permissions
+    for (var i = 0; i < phnum; i = i + 1) {
+        var ph = hdr + phoff + i * phentsz;
+        if (_phdr_type(ph) == PT_LOAD) {
+            var va = _phdr_vaddr(ph);
+            var off = _phdr_offset(ph);
+            var fsz = _phdr_filesz(ph);
+            var msz = _phdr_memsz(ph);
+            # Read p_flags at +4 (u32)
+            var pflags = load32(ph + 4);
+            var prot = 0;
+            if (pflags & 4 != 0) { prot = prot | PROT_READ; }
+            if (pflags & 2 != 0) { prot = prot | PROT_WRITE; }
+            if (pflags & 1 != 0) { prot = prot | PROT_EXEC; }
+            # Need WRITE during relocation, will mprotect after
+            var map_prot = prot | PROT_WRITE;
+            var page_va = va & (0 - 4096);
+            var page_off = off & (0 - 4096);
+            var page_adj = va - page_va;
+            var map_fsz = (fsz + page_adj + 4095) & (0 - 4096);
+            var map_msz = (msz + page_adj + 4095) & (0 - 4096);
+            # Map file-backed portion
+            cyr_mmap(bias + page_va, map_fsz, map_prot,
+            MAP_PRIVATE | MAP_FIXED, fd, page_off);
+            # BSS: if memsz > filesz, map anonymous pages for the rest
+            if (map_msz > map_fsz) {
+                cyr_mmap(bias + page_va + map_fsz,
+                map_msz - map_fsz, map_prot,
+                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                0 - 1, 0);
+            }
+            # Zero partial BSS within the last file-backed page
+            if (msz > fsz) {
+                var bss_start = bias + va + fsz;
+                var bss_in_page = map_fsz - (fsz + page_adj);
+                if (bss_in_page > 0) {
+                    memset(bss_start, 0, bss_in_page);
+                }
+            }
+        }
+    }
+
+    # Done with header mmap and fd
+    cyr_munmap(hdr, file_size);
+    syscall(3, fd);
+
+    # Parse dynamic section from the properly loaded segments
+    var dinfo = _parse_dynamic(bias, dyn_offset, dyn_size);
+    var symtab_vaddr  = load64(dinfo);
+    var strtab_vaddr  = load64(dinfo + 8);
+    var gnuhash_vaddr = load64(dinfo + 24);
+
+    if (symtab_vaddr == 0 || strtab_vaddr == 0) {
+        cyr_munmap(base, span);
+        return 0;
+    }
+
+    var strtab_size = load64(dinfo + 16);
+    var dynsym = bias + symtab_vaddr;
+    var dynstr = bias + strtab_vaddr;
+    var gnuhash = 0;
+    if (gnuhash_vaddr != 0) { gnuhash = bias + gnuhash_vaddr; }
+    var nsyms = _estimate_nsyms(symtab_vaddr, strtab_vaddr);
+
+    # Allocate handle
+    var h = alloc(64);
+    store64(h, base);
+    store64(h + 8, span);
+    store64(h + 16, dynsym);
+    store64(h + 24, dynstr);
+    store64(h + 32, nsyms);
+    store64(h + 40, bias);
+    store64(h + 48, gnuhash);
+    store64(h + 56, strtab_size);
+
+    # Register before loading deps (prevents circular loading)
+    _dynlib_register(path, h);
+
+    # Load dependencies (DT_NEEDED)
+    var needed_count = load64(dinfo + 152);
+    var ni = 0;
+    while (ni < needed_count) {
+        var name_off = load64(dinfo + 88 + ni * 8);
+        # Validate name offset is within string table
+        if (strtab_size > 0 && name_off >= strtab_size) {
+            ni += 1;
+            continue;
+        }
+        var dep_name = dynstr + name_off;
+        # Skip ld-linux (already loaded by kernel)
+        if (memeq(dep_name, "ld-linux", 8) == 0) {
+            dynlib_open(dep_name);
+        }
+        ni += 1;
+    }
+
+    # Process relocations (RELA + JMPREL)
+    var rela_vaddr = load64(dinfo + 32);
+    var rela_size  = load64(dinfo + 40);
+    if (rela_vaddr != 0 && rela_size != 0) {
+        _dynlib_process_rela(h, bias, bias + rela_vaddr, rela_size);
+    }
+    var jmprel_vaddr = load64(dinfo + 48);
+    var jmprel_size  = load64(dinfo + 56);
+    if (jmprel_vaddr != 0 && jmprel_size != 0) {
+        _dynlib_process_rela(h, bias, bias + jmprel_vaddr, jmprel_size);
+    }
+
+    # Run init functions
+    # Skip init functions for now — they depend on IRELATIVE resolvers
+    # which we can't call safely from a static binary. Symbol resolution
+    # still works; most functions are callable without init.
+    # TODO: implement CPU feature detection to enable IRELATIVE + init.
+
+    return h;
+}
+
+# Look up a symbol by name in a loaded library
+# Returns the symbol's absolute address (function pointer) or 0
+fn dynlib_sym(handle, name) {
+    if (handle == 0) { return 0; }
+
+    var dynsym  = _dynlib_dynsym(handle);
+    var dynstr  = _dynlib_dynstr(handle);
+    var nsyms   = _dynlib_nsyms(handle);
+    var bias    = _dynlib_bias(handle);
+    var gnuhash = _dynlib_gnuhash(handle);
+    var strsz   = _dynlib_strsz(handle);
+
+    # Use GNU hash if available (fast O(1) average), else linear scan
+    if (gnuhash != 0) {
+        return _gnu_hash_lookup(gnuhash, dynsym, dynstr, strsz, bias, name);
+    }
+    return _linear_sym_lookup(dynsym, dynstr, nsyms, strsz, bias, name);
+}
+
+# Close a loaded library (unmap)
+fn dynlib_close(handle) {
+    if (handle == 0) { return 0; }
+    var base = _dynlib_base(handle);
+    var size = _dynlib_size(handle);
+    cyr_munmap(base, size);
+    return 0;
+}

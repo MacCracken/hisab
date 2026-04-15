@@ -71,7 +71,7 @@ Cyrius 5.0 expands the 1MB preprocess buffer. These are written and ready to shi
 | 2.2.0 | 2026-04-15 | 15,676 | 33 | SE(3), SO(3), adjoint, BCH, spatial structures, MPR, impulse solver, simplex noise, einsum, Golub-Kahan SVD |
 | 2.1.0 | 2026-04-15 | 13,715 | 30 | Golub-Kahan SVD, QR eigen, complex QR, simplex noise, einsum |
 | 2.0.0 | 2026-04-15 | 11,943 | 27 | Cyrius port from Rust. P(-1) audit. |
-| Rust 1.4.0 | 2026-03-30 | 33,612 | 65 | Final Rust release. Archived in rust-old/. |
+| Rust 1.4.0 | 2026-03-30 | 33,612 | 65 | Final Rust release. Available via pre-2.0 git tags. |
 
 ---
 

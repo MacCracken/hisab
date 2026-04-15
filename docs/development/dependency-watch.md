@@ -35,7 +35,7 @@ Tracked dependency version constraints and upgrade paths.
 
 **Risk:** Low. Logging is write-only — no data flows back. If sakshi breaks, hisab still compiles (just without logging).
 
-## Rust-era dependencies (archived in rust-old/)
+## Rust-era dependencies (archived in pre-2.0 git tags)
 
 These are no longer used but documented for reference:
 - `glam` 0.29 — replaced by hisab's own vec/mat/quat types

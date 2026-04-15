@@ -5,723 +5,94 @@
 ## 2.2.0 (2026-04-15) -- Geometry & group extensions
 
 ### Added
-- **lie_ext.cyr** (523 lines) -- SE(3) rigid body motions (exp/log, compose, transform), SO(3) explicit (Rodrigues, exp/log), adjoint representations (SU(2), Lorentz, SE(3)), Baker-Campbell-Hausdorff 2nd/3rd order for SU(2) and SO(3)
+- **lie_ext.cyr** (523 lines) -- SE(3) rigid body motions (exp/log, compose, transform), SO(3) explicit (Rodrigues, exp/log), adjoint representations (SU(2), Lorentz, SE(3)), Baker-Campbell-Hausdorff 2nd/3rd order
 - **spatial.cyr** (864 lines) -- k-d tree (build, nearest, within_radius), quadtree (insert, query), octree (insert, query), spatial hash (insert, query_cell, query_radius, clear)
 - **collision_core.cyr** (574 lines) -- MPR/XenoCollide (intersect + penetration), sequential impulse solver with friction, convex hull 2D (Andrew's monotone chain), polygon triangulation (ear clipping)
-- **collision_mesh.cyr** (522 lines) -- Delaunay triangulation (Bowyer-Watson), half-edge mesh, island detection (union-find). *Deferred: exceeds cc3 1MB preprocess buffer. Ships with Cyrius 5.0.*
-- **noise_simplex.cyr** (343 lines) -- OpenSimplex2 2D+3D with fBm layering
-- **einsum.cyr** (305 lines) -- Einstein summation notation parser (`"ij,jk->ik"`)
-- **linalg_precision.cyr** (1,124 lines) -- Golub-Kahan SVD, QR eigendecomposition (O(n^3)), complex Householder QR
+- **collision_mesh.cyr** (522 lines, written but deferred) -- Delaunay triangulation (Bowyer-Watson), half-edge mesh, island detection (union-find). Exceeds cc3 1MB preprocess buffer. Ships with Cyrius 5.0.
 
 ### Changed
-- All .cyr files cleaned of Unicode in comments (em-dashes -> --, Greek -> ASCII)
+- All .cyr files cleaned of Unicode in comments (em-dashes, Greek letters -> ASCII)
 
 ### Known issue
-- Cyrius cc3 1MB preprocess buffer limit reached at ~16K lines. collision_mesh.cyr (Delaunay, half-edge, islands) deferred to Cyrius 5.0 which expands the buffer.
+- Cyrius cc3 1MB preprocess buffer limit reached at ~16K lines. collision_mesh.cyr deferred to Cyrius 5.0.
 
-## 2.1.0 (2026-04-15) — Precision + depth
+## 2.1.0 (2026-04-15) -- Precision + depth
 
 ### Added
-- **linalg_precision.cyr** (1,124 lines) — precision-grade linear algebra:
-  - `svd_golub_kahan` — Golub-Kahan bidiagonalization + implicit QR for SVD (preserves full precision, replaces A^T*A approach)
-  - `eigen_qr` — Householder tridiagonalization + implicit symmetric QR with Wilkinson shift (O(n^3) vs Jacobi's O(n^5))
-  - `cqr_decompose` — complex Householder QR decomposition
-- **noise_simplex.cyr** (343 lines) — OpenSimplex2 noise:
-  - `simplex_2d`, `simplex_3d` — gradient noise on triangular/tetrahedral grids
-  - `simplex_fbm_2d`, `simplex_fbm_3d` — fractional Brownian motion layering
-- **einsum.cyr** (305 lines) — Einstein summation notation:
-  - `einsum(notation, tensors, n)` — parses `"ij,jk->ik"` style strings, supports matrix multiply, trace, transpose, outer product, contraction
+- **linalg_precision.cyr** (1,124 lines) -- Golub-Kahan SVD (full precision, replaces A^T*A), QR eigendecomposition O(n^3) (replaces Jacobi O(n^5)), complex Householder QR
+- **noise_simplex.cyr** (343 lines) -- OpenSimplex2 2D+3D with fBm layering
+- **einsum.cyr** (305 lines) -- Einstein summation notation parser (`"ij,jk->ik"`)
 
 ### Changed
-- Audit M8 (SVD precision) resolved — `svd_golub_kahan` replaces the A^T*A eigendecomposition approach
+- Audit M8 (SVD precision) resolved
 
 ### Performance
 - `eigen_qr`: O(n^3) for symmetric eigenproblems (was O(n^5) with Jacobi for large n)
 
-## 2.0.0 (2026-04-15) — Cyrius port
+## 2.0.0 (2026-04-15) -- Cyrius port
 
-**Breaking: complete rewrite from Rust to Cyrius.** This is a new language, new API, new binary format. The Rust source is archived in `rust-old/`.
+**Breaking: complete rewrite from Rust to Cyrius.** New language, new API, new binary format. Rust source available via pre-2.0 git tags.
 
 ### Changed
-- **Language**: Rust → Cyrius (self-hosting systems language, static ELF binaries)
-- **Types**: glam f32 SIMD types → native f64 heap-allocated types (HVec2/3/4, HQuat, Mat3, Mat4)
-- **Errors**: `Result<T, HisabError>` → integer error codes (`ERR_NONE`, `ERR_SINGULAR_MATRIX`, etc.)
-- **API**: method syntax (`v.dot(w)`) → free functions (`hvec3_dot(v, w)`)
-- **Precision**: f32 (1e-7) → f64 (1e-12) everywhere
-- **Dependencies**: 9 Rust crates → 1 Cyrius dep (sakshi)
-- **Binary**: ~800KB dynamic → 420KB static ELF
+- **Language**: Rust -> Cyrius (self-hosting systems language, static ELF binaries)
+- **Types**: glam f32 SIMD types -> native f64 heap-allocated types (HVec2/3/4, HQuat, Mat3, Mat4)
+- **Errors**: `Result<T, HisabError>` -> integer error codes (ERR_NONE, ERR_SINGULAR_MATRIX, etc.)
+- **API**: method syntax (v.dot(w)) -> free functions (hvec3_dot(v, w))
+- **Precision**: f32 (1e-7) -> f64 (1e-12) everywhere
+- **Dependencies**: 9 Rust crates -> 1 Cyrius dep (sakshi)
+- **Binary**: ~800KB dynamic -> 420KB static ELF
 
-### Added — 27 library files, 11,769 lines
+### Added -- 27 library files, 11,943 lines
 
-#### Foundation (7 files)
-- **error.cyr** — 10 error codes, EPSILON_F64
-- **f64_util.cyr** — f64_tan, f64_fmod, f64_copysign, f64_approx_eq
-- **vec2.cyr** — HVec2 with full arithmetic, products, norms, interpolation
-- **vec3.cyr** — HVec3 with cross, reflect, min/max/abs
-- **vec4.cyr** — HVec4 with Vec3 conversion
-- **quat.cyr** — HQuat with slerp, rotation, axis-angle, Euler
-- **mat3.cyr** — 3x3 matrix (determinant, inverse, from_quat, normal_matrix, trace, frobenius)
-- **mat4.cyr** — 4x4 matrix (Cramer inverse, SRT, ortho/perspective/reverse-Z, look-at)
+**Foundation (8 files):** error, f64_util, vec2, vec3, vec4, quat, mat3, mat4
+**Transforms (2 files):** transforms (T2D/T3D, Euler, screen), color (sRGB, Porter-Duff, tone mapping, SH, EV)
+**Geometry (2 files):** geo (9 primitives, 6 ray tests), geo_advanced (GJK/EPA, BVH, SDF, CGA 5D)
+**Calculus (2 files):** calc (integration, Bezier, easing, Perlin), calc_ext (gradient/Jacobian/Hessian, B-spline, NURBS, Hermite, monotone cubic, 3D Perlin)
+**Numerical (5 files):** num (roots, FFT, RK4, PCG32, primes), ode (DOPRI45, BDF, symplectic), optimize (GD, CG, BFGS, L-BFGS, LM), linalg_ext (CSR, GMRES, BiCGSTAB, PGS, SVD, eigen, inertia), num_ext (extended GCD, totient, Mobius, factorize, CRT, DST/DCT, 2D-FFT, Halton/Sobol, tridiagonal)
+**Physics (3 files):** complex (numbers + matrices, Pauli, Dirac, matrix exp), lie (U(1), SU(2), SU(3), SO(3,1)), diffgeo (Christoffel -> Einstein, geodesics, exterior algebra)
+**Symbolic (2 files):** symbolic (expr tree, eval, diff, simplify), symbolic_ext (integration, LaTeX, pattern matching)
+**Other (3 files):** autodiff (dual numbers), interval (arithmetic), tensor (N-D dense, contraction, physics tensors)
 
-#### Transforms (2 files)
-- **transforms.cyr** — Transform2D/3D, compose, lerp, Euler angles, screen projection
-- **color.cyr** — sRGB/HSV/HSL, Porter-Duff compositing (8 ops), Reinhard/ACES tone mapping, SH L2, EV/exposure
-
-#### Geometry (2 files)
-- **geo.cyr** — 9 primitives (Ray, Plane, AABB, Sphere, OBB, Capsule, Triangle, Line, Segment), 6 ray tests, closest-point queries
-- **geo_advanced.cyr** — GJK/EPA 3D, BVH (build + query), SDF+CSG, swept AABB, TOI, conformal geometric algebra (5D CGA multivectors)
-
-#### Calculus (2 files)
-- **calc.cyr** — derivative, Simpson/Gauss-Legendre integration, Bezier 2D/3D, Catmull-Rom, easing (6 functions), 2D Perlin noise + fBm
-- **calc_ext.cyr** — partial derivative, gradient, Jacobian, Hessian, adaptive Simpson, B-spline, NURBS, Hermite TCB, monotone cubic, 3D Perlin + fBm
-
-#### Numerical (5 files)
-- **num.cyr** — Newton-Raphson, bisection, FFT/IFFT, RK4, PCG32, GCD, modpow (overflow-safe), Miller-Rabin primality, Eratosthenes sieve, Kahan/Neumaier compensated summation
-- **ode.cyr** — DOPRI45 (adaptive), backward Euler, BDF-2..5, Euler-Maruyama, Milstein, symplectic Euler, Verlet, leapfrog, Yoshida 4th-order
-- **optimize.cyr** — gradient descent, conjugate gradient (Polak-Ribiere+), BFGS, L-BFGS, Levenberg-Marquardt (all with Armijo line search)
-- **linalg_ext.cyr** — CSR sparse matrix (spmv, add, transpose), GMRES, BiCGSTAB, projected Gauss-Seidel, SVD, eigendecomposition, Lyapunov exponent, inertia tensors
-- **num_ext.cyr** — extended GCD, modular inverse, Euler totient, Mobius, divisor sigma, Pollard rho, factorize, CRT, continued fractions, DST/DCT, 2D-FFT, Halton/Sobol, tridiagonal solver
-
-#### Physics (3 files)
-- **complex.cyr** — complex numbers + matrices, Pauli spin matrices, Dirac gamma matrices, matrix exponential, commutator/anticommutator, Kronecker product
-- **lie.cyr** — U(1), SU(2), SU(3) Gell-Mann (8 generators + structure constants), SO(3,1) Lorentz (boosts, rotations, Minkowski interval, validity check)
-- **diffgeo.cyr** — Christoffel symbols, Riemann tensor, Ricci tensor/scalar, Einstein tensor, geodesic RK4, Killing vector residual, wedge product, Hodge star
-
-#### Symbolic (2 files)
-- **symbolic.cyr** — expression tree (10 node types), evaluate, differentiate, simplify, to_str
-- **symbolic_ext.cyr** — symbolic integration (constant/poly/trig/exp/sum rules), LaTeX rendering, pattern matching with 7 built-in rewrite rules (sin²+cos²=1, ln(exp(x))=x, etc.)
-
-#### Other (3 files)
-- **autodiff.cyr** — dual numbers (forward-mode AD) with sin/cos/exp/ln/sqrt/pow, zero guards
-- **interval.cyr** — interval arithmetic (add/sub/mul/div/neg/abs/sqrt/exp/sin), contains, overlaps
-- **tensor.cyr** — N-D dense tensor with full contraction, Kronecker delta, Minkowski metric, Levi-Civita 3D+4D
-
-### Security — P(-1) audit (31 issues found, 25 fixed)
-- **C1-C5**: Allocation overflow guards (tensor, complex matrix, diffgeo dim cap 16, sieve cap 10M)
-- **H1**: tensor_contract fully implemented (was returning zeros)
-- **H2**: m4_determinant rewritten with correct cofactor formula
-- **H3-H7**: Division-by-zero guards on cx_div, cx_inv, dual_div/ln/sqrt, f64_fmod, world_to_screen, linearize_depth_reverse_z
-- **H9**: BDF-5 coefficients recomputed exact (IEEE 754 verified)
-- **H10**: ivl_sin no longer always returns [-1,1]
-- **M1**: num_modpow overflow-safe via Russian peasant multiplication
-- **M3**: geo_ray_plane returns -1 for miss (disambiguates from t=0 hit)
-- **M7**: expr_eval returns 0 with warning instead of aborting process
-- Bisection midpoint overflow fix: `lo + (hi-lo)/2`
-- CG upgraded Fletcher-Reeves → Polak-Ribiere+
-- Upstream: matrix.cyr alloc overflow noted for cyrius 5.0.1
+### Security -- P(-1) audit (31 issues found, 25 fixed)
+- Allocation overflow guards (tensor, complex matrix, diffgeo dim cap, sieve cap)
+- Division-by-zero guards throughout (complex, autodiff, transforms, depth)
+- m4_determinant rewritten with correct cofactor formula
+- tensor_contract implemented (was returning zeros)
+- BDF-5 coefficients recomputed exact (IEEE 754 verified)
+- Bisection midpoint overflow fix, CG upgraded to Polak-Ribiere+
+- modpow overflow-safe via Russian peasant multiplication
+- expr_eval warns instead of aborting process
 
 ### Testing
-- 821 assertions across 4 test suites (foundation 307, modules 249, smoke 116, edge cases 149)
-- 22 benchmarks covering all major operations
-- 5 fuzz targets with invariant checking
-- Benchmark comparison: docs/benchmarks-rust-v-cyrius.md
+- 821 assertions (4 suites), 22 benchmarks, 5 fuzz targets
 
 ### Documentation
-- README.md — Cyrius quick-start, module table, build commands
-- CONTRIBUTING.md — Cyrius development workflow
-- SECURITY.md — attack surface, known limitations, audit history
-- docs/architecture/overview.md — full 27-file module map
-- docs/guides/testing.md — test suite breakdown, patterns
-- docs/development/roadmap.md — Cyrius-specific with completed/remaining items
-- docs/development/threat-model.md — 20+ mitigated attack vectors
-- docs/development/dependency-watch.md — Cyrius stdlib + sakshi deps
-- docs/audit/2026-04-15.md — full 31-issue P(-1) audit report
-- docs/benchmarks-rust-v-cyrius.md — 85 Rust + 22 Cyrius benchmark comparison
-- examples/basic_math.cyr — working example demonstrating 8 features
-
-## 1.4.0 (2026-03-30)
-
-### Added — Theoretical physics foundation (P0 — mimamsa + kana)
-
-#### num — Complex linear algebra
-- **`ComplexMatrix`** — row-major dense complex matrix with adjoint, trace, Frobenius norm, Hermitian/unitary checks
-- `eigen_hermitian()` — Hermitian eigendecomposition via complex Jacobi rotations (real eigenvalues, unitary eigenvectors)
-- `complex_svd()` — complex singular value decomposition (A = UΣV†)
-- `pauli_x()`, `pauli_y()`, `pauli_z()`, `pauli_matrices()` — Pauli spin matrices with verified anticommutation and SU(2) algebra
-- `gamma_0()`, `gamma_spatial()`, `gamma_matrices()`, `gamma_5()` — Dirac gamma matrices (4×4, Dirac representation) satisfying Clifford algebra {γᵘ, γᵛ} = 2ηᵘᵛI
-- `spinor_rotation()` — SU(2) rotation of 2-component spinors by axis + angle
-- `dirac_boost()` — Lorentz boost of 4-component Dirac spinors
-- `commutator()`, `anticommutator()` — [A,B] and {A,B} for complex matrices
-- `kronecker()` — Kronecker (tensor) product
-- `matrix_exp()` — complex matrix exponential (Taylor series with scaling and squaring)
-- Extended `Complex` with `norm_sq`, `arg`, `from_polar`, `exp`, `ln`, `sqrt`, `powf`, `sin`, `cos`, `inv`, `is_zero`, `AddAssign`, `SubAssign`, `MulAssign`
-
-#### tensor — Indexed tensor algebra
-- **`IndexedTensor`** — tensor with named covariant/contravariant indices (`TensorIndex`, `IndexVariance`)
-- `contract()` — trace over two indices by position
-- `contract_with()` — Einstein summation: automatic contraction on matching upper/lower label pairs
-- `outer()` — tensor (outer) product with concatenated indices
-- `raise_index()`, `lower_index()` — index raising/lowering via metric tensor
-- `permute()` — reorder indices with arbitrary permutation
-- `kronecker_delta()`, `minkowski()`, `minkowski_inverse()`, `levi_civita()` — standard physics tensors
-- **`SymmetricTensor`** — storage-efficient fully symmetric tensor (C(n+k-1,k) independent components)
-- **`AntisymmetricTensor`** — storage-efficient fully antisymmetric tensor (C(n,k) components, automatic sign on permuted access)
-- **`SparseTensor`** — COO-format sparse tensor for high-rank objects with many zeros
-- Refactored `tensor.rs` → `tensor/` module directory (dense, indexed, symmetric, sparse)
-
-#### transforms — Lie groups and algebras
-- **`U1`** — U(1) phase group (compose, inverse, exp/log, unitary matrix)
-- **`Su2`** — SU(2) spin group as unit quaternion (compose, inverse, exp/log, 2×2 unitary matrix, 3×3 rotation matrix, axis/angle extraction)
-- **`Lorentz`** — SO(3,1) Lorentz group (boosts along x/y/z/arbitrary, rotations, compose, inverse, 4-vector transform, Minkowski interval preservation, validity check Λᵀ η Λ = η)
-- `gell_mann()`, `gell_mann_matrices()` — SU(3) Gell-Mann matrices λ₁–λ₈ (Hermitian, traceless)
-- `su3_structure_constant()` — totally antisymmetric SU(3) structure constants f_{abc}
-- `lorentz_generator()` — six generators of so(3,1): J₁,J₂,J₃ (rotations), K₁,K₂,K₃ (boosts)
-- `lorentz_exp()` — exponential map from so(3,1) Lie algebra to SO(3,1) group
-- `casimir_quadratic()` — quadratic Casimir operator C₂ = Σ Tₐ² for any set of generators
-
-#### calc — Differential geometry
-- `christoffel_symbols()` — Christoffel symbols Γᵅ_μν from metric and its derivatives
-- `riemann_tensor()` — Riemann curvature tensor R^ρ_σμν from Christoffel symbols
-- `ricci_tensor()` — Ricci tensor R_μν by contracting Riemann tensor
-- `ricci_scalar()` — Ricci scalar R = g^{μν} R_μν
-- `einstein_tensor()` — Einstein tensor G_μν = R_μν − ½Rg_μν
-- `geodesic_rk4()` — geodesic equation integrator via RK4 (position + velocity trajectory)
-- `killing_residual()` — check Killing's equation ∇_μ ξ_ν + ∇_ν ξ_μ = 0
-- `wedge_1_1()`, `wedge_1_2()` — wedge products of differential forms
-- `hodge_star_2form_4d()` — Hodge dual of 2-forms in 4D Minkowski spacetime
-
-#### geo — Conformal geometric algebra
-- **`Multivector`** — 5D CGA multivector (32 components, grades 0–5)
-- Geometric, outer (wedge), and inner products with full 5D metric (e₁²=e₂²=e₃²=e₊²=+1, e₋²=−1)
-- Reverse, grade involution, grade extraction, norm
-- `point()`, `extract_point()` — conformal point embedding/extraction
-- `sphere()`, `plane()` — conformal sphere and plane representations
-- `translator()` — translation versor (sandwich product application)
-- `rotor()` — rotation versor from axis + angle
-- `dilator()` — uniform scaling versor about origin
-
-### Stats
-- 1155 tests (1099 unit + 34 integration + 22 doc) — up from 887
-- Zero clippy warnings, cargo audit clean, cargo deny clean
-
-## 1.3.0 (2026-03-27)
-
-### num — Number theory
-- `sieve_eratosthenes()`, `sieve_atkin()`, `sieve_segmented()` — prime sieves (Eratosthenes, Atkin, O(√n)-memory segmented)
-- `is_prime_u64()` — deterministic Miller-Rabin for all u64 (Jim Sinclair witnesses)
-- `is_prime_miller_rabin()` — probabilistic Miller-Rabin with configurable witness count
-- `is_prime_baillie_psw()` — Baillie-PSW primality test (no known counterexample)
-- `factor_trial_division()`, `pollard_rho()`, `factorize()` — integer factorization (trial division, Pollard's rho, hybrid)
-- `modpow()`, `modinv()`, `extended_gcd()` — modular arithmetic with 128-bit intermediates
-- `gcd()` — binary GCD algorithm
-- `euler_totient()`, `mobius()`, `mertens()`, `divisor_sigma()` — number-theoretic functions
-- `continued_fraction_rational()`, `continued_fraction_f64()`, `convergents()` — continued fraction expansion + rational approximants
-- `chinese_remainder_theorem()` — CRT solver for pairwise coprime moduli
-
-### symbolic — Advanced simplification
-- `simplify_advanced()` — trig identities (sin²+cos²=1, sin(-x)=-sin(x), cos(-x)=cos(x)), log rules (ln(e^x)=x, ln(x^n)=n·ln(x)), power rules ((x^a)^b=x^(a·b), x·x=x²)
-
-### symbolic — Symbolic integration
-- `symbolic_integrate()` — indefinite integration for polynomial, trig, exponential, sums, constant multiples, negation, and reciprocal forms
-
-### symbolic — LaTeX rendering
-- `to_latex()` — render expressions as LaTeX strings with smart formatting (\\frac, \\sqrt, \\cdot, subtraction, multi-char variable wrapping)
-
-### symbolic — Pattern matching engine
-- `Pattern` enum with `Wildcard`, `AnyConst`, structural matching
-- `match_expr()`, `instantiate()` — pattern matching and template instantiation
-- `apply_rule()`, `rewrite()`, `rewrite_fixpoint()` — single/recursive/fixpoint rewrite rule application
-- `RewriteRule` struct for composable expression transformations
-
-### symbolic — abaco bridge API
-- `ExprValue` — serializable flat representation for cross-crate transport (serde-enabled)
-- `expr_to_value()`, `value_to_expr()` — bidirectional Expr ↔ ExprValue conversion
-- `solve_expr()` — equation solver dispatch (Newton-Raphson + bisection fallback with symbolic differentiation)
-- `SolveOptions` — configurable initial guess, bracket, tolerance, max iterations
-- `eval_verified()` — interval arithmetic evaluation for verified error bounds (requires `interval` feature)
-
-### geo — Constraint warm-starting
-- `sequential_impulse_warm()` — warm-started sequential impulse solver; seeds from previous frame's impulses (configurable warm factor) for faster convergence in stable stacking
-- `sequential_impulse()` now delegates to warm variant internally
-
-### geo — Island detection
-- `detect_islands()` — contact graph connectivity via union-find (O(n·α(n))); classifies active vs sleeping islands
-- `ContactEdge`, `Island` types for contact graph representation
-
-### geo — Frustum-OBB culling
-- `Frustum::contains_obb()` — conservative OBB culling via separating axis test against frustum planes
-
-### geo — Point-in-convex-polygon 2D
-- `point_in_convex_polygon()` — cross-product winding test for convex polygons
-
-### geo — AABB-from-transformed-AABB
-- `Aabb::transformed()` — fast tight AABB from affine-transformed AABB (Arvo method, no 8-corner expansion)
-
-### geo — Half-edge mesh
-- `HalfEdgeMesh` — half-edge data structure for triangle mesh adjacency queries
-- `from_triangles()`, `adjacent_faces()`, `vertex_faces()`, `is_boundary_vertex()`, `boundary_edges()`
-
-### num — DenseMatrix flat layout
-- `DenseMatrix` — row-major flat `Vec<f64>` matrix (cache-friendly alternative to `Vec<Vec<f64>>`)
-- `mul_vec()`, `mul_mat()`, `transpose()`, `frobenius_norm()`, `Index`/`IndexMut` via `(row, col)` tuples
-- Bidirectional conversion: `from_vec_of_vec()`, `to_vec_of_vec()`
-
-### num — Compensated summation in ODE solvers
-- `rk4()`, `rk4_trajectory()` now use Neumaier-compensated accumulation across steps
-- `integral_simpson()` now uses Neumaier accumulator for panel summation
-
-### transforms — Gamma-aware interpolation
-- `lerp_srgb()`, `lerp_srgb_vec3()` — decode sRGB → lerp in linear space → encode sRGB
-
-### transforms — Exposure / EV ↔ luminance
-- `ev100_to_luminance()`, `luminance_to_ev100()` — EV100 ↔ cd/m² (Lagarde & de Rousiers 2014)
-- `ev100_to_exposure()` — EV to exposure multiplier for HDR pipelines
-
-### Stats
-- 971 tests (921 unit + 34 integration + 16 doc), zero clippy warnings
-
-## 1.2.0 (2026-03-27)
-
-### transforms — Interpolation utilities
-- `inverse_lerp()` — compute parameter `t` from a value in a range
-- `remap()` — remap a value from one range to another
-
-### transforms — Reverse-Z projection
-- `projection_perspective_reverse_z()` — infinite far-plane reverse-Z projection (modern GPU standard)
-
-### transforms — HSV/HSL color conversion
-- `linear_to_hsv()`, `hsv_to_linear()` — HSV color space (hue in radians)
-- `linear_to_hsl()`, `hsl_to_linear()` — HSL color space (hue in radians)
-
-### transforms — Premultiplied alpha
-- `premultiply_alpha()`, `unpremultiply_alpha()` — straight ↔ premultiplied alpha conversion
-
-### transforms — Transform composition
-- `Transform2D::compose()` — chain two 2D transforms (rotation, scale, position composed directly)
-- `Transform3D::compose()` — chain two 3D transforms (quaternion multiplication, scale composition)
-
-### geo — Closest point on triangle
-- `closest_point_on_triangle()` — 3D Voronoi region test (Ericson algorithm)
-
-### geo — Barycentric coordinates
-- `barycentric_coords()` — compute (u, v, w) for a point projected onto a 3D triangle
-
-### geo — Segment-segment distance
-- `segment_segment_closest()` — closest points between two 3D line segments + squared distance
-
-### geo — Friction in sequential impulse
-- `ImpulseResult` struct with normal + friction impulse vectors
-- `sequential_impulse()` now solves tangent-plane Coulomb friction (clamped to friction cone)
-- **Breaking**: `sequential_impulse()` returns `ImpulseResult` instead of `Vec<f32>`
-
-### num — Compensated summation
-- `kahan_sum()` — Kahan compensated summation (O(1) error vs O(n) naive)
-- `neumaier_sum()` — improved Kahan that handles large+small value mixing
-
-### num — SOR for PGS
-- `projected_gauss_seidel_sor()` — PGS with configurable relaxation parameter omega
-- `projected_gauss_seidel()` now delegates to SOR with omega=1.0
-
-### num — BiCGSTAB iterative solver
-- `bicgstab()` — Bi-Conjugate Gradient Stabilized for non-symmetric linear systems
-
-### num — BDF high-order stiff solvers
-- `bdf()` — BDF-3, BDF-4, BDF-5 with configurable order, Newton corrector, and bootstrap
-
-### num — Quasi-random sequences
-- `halton()`, `halton_2d()` — Halton low-discrepancy sequence (any prime base)
-- `sobol()` — Sobol/Van der Corput sequence via Gray code + bit reversal
-
-### num — Sparse spmvt
-- `CsrMatrix::spmvt()` — sparse matrix-transpose-vector multiply without forming Aᵀ
-
-### num — Yoshida 4th-order symplectic integrator
-- `yoshida4_step()`, `yoshida4()` — triple-jump composition, more accurate than Verlet
-
-### calc — Hermite TCB spline
-- `hermite_tcb()` — Kochanek-Bartels spline with tension, continuity, bias parameters
-
-### calc — Monotone cubic interpolation
-- `monotone_cubic()` — Fritsch-Carlson method, guarantees no overshoot (ideal for replay)
-
-### transforms — Porter-Duff compositing
-- 10 operators: `composite_src_over`, `dst_over`, `src_in`, `dst_in`, `src_out`, `dst_out`, `src_atop`, `dst_atop`, `xor`, `plus` — all premultiplied alpha
-
-### transforms — HDR tone mapping
-- `tonemap_reinhard()`, `tonemap_reinhard_extended()` — Reinhard operator with optional white point
-- `tonemap_aces()` — ACES filmic curve (Narkowicz approximation)
-
-### transforms — Depth buffer utilities
-- `linearize_depth()` — standard NDC to view-space depth
-- `linearize_depth_reverse_z()` — reverse-Z NDC to view-space depth
-
-### geo — Tangent space computation
-- `compute_tangent()` — per-triangle tangent/bitangent from UV coordinates (Mikktspace-compatible)
-
-### geo — MPR / XenoCollide collision
-- `mpr_intersect()` — Minkowski Portal Refinement overlap test (3D)
-- `mpr_penetration()` — MPR with penetration normal and depth
-
-### geo — Delaunay triangulation + Voronoi diagrams
-- `delaunay_2d()` — Bowyer-Watson incremental Delaunay triangulation
-- `voronoi_2d()` — Voronoi diagram as dual of Delaunay (finite edges)
-- `DelaunayTriangle`, `Triangulation`, `VoronoiEdge`, `VoronoiDiagram` types
-
-### calc — NURBS evaluation
-- `nurbs_eval()` — Non-Uniform Rational B-Spline evaluation via weighted de Boor's algorithm
-
-### num — Sparse factorization
-- `sparse_cholesky_solve()` — Cholesky factorization + solve for sparse SPD matrices
-- `sparse_lu_solve()` — LU factorization + solve for sparse systems via Gaussian elimination
-- `CsrMatrix::get()` — random access to sparse matrix elements via binary search
-
-### Fixed
-- EPA 2D winding: enforce CCW polytope orientation before expansion (prevents inverted normals)
-- `backward_euler()`, `bdf2()`: emit `tracing::warn!` on Newton non-convergence instead of silent acceptance
-- Replaced `unreachable!()` in 2D GJK with safe fallback return
-- Rustdoc: escaped `[0,1]` bracket in color.rs, wrapped `Vec<f64>` in backticks in optimize.rs
-
-### Stats
-- 786 tests (743 unit + 34 integration + 9 doc), zero clippy warnings
-
-## 1.1.0 (2026-03-25)
-
-### num — Full eigendecomposition
-- `eigen_symmetric()` — Jacobi rotation algorithm for all eigenvalues + orthonormal eigenvectors
-- `EigenDecomposition` struct
-
-### num — Stiff ODE solvers
-- `backward_euler()` — implicit Euler with Newton+LU iteration
-- `bdf2()` — second-order backward differentiation formula
-
-### num — Stochastic differential equations
-- `Pcg32::next_normal()` — Box-Muller normal distribution
-- `euler_maruyama()` — SDE solver (strong order 0.5)
-- `milstein()` — SDE solver with Ito correction (strong order 1.0)
-
-### num — Stability analysis
-- `lyapunov_max()` — maximal Lyapunov exponent via variational equation
-
-### num — Projected Gauss-Seidel
-- `projected_gauss_seidel()` — box-constrained linear solver for physics
-
-### geo — Continuous collision detection
-- `swept_aabb()` — expand AABB along velocity
-- `time_of_impact()` — conservative advancement TOI for convex shapes
-
-### geo — Constraint solvers
-- `ContactConstraint` struct
-- `sequential_impulse()` — iterative contact constraint solver
-
-### geo — Convex decomposition
-- `TriMesh`, `ConvexDecomposition`, `AcdConfig` types
-- `convex_decompose()` — approximate convex decomposition via PCA splitting
-
-### autodiff — Reverse-mode automatic differentiation
-- `Tape`, `Var`, `TapeOp` — computation graph with recording
-- `tape.backward()` — backpropagation for all gradients in one pass
-- `reverse_gradient()` — convenience API for gradient computation
-- Operations: add, sub, mul, div, neg, sin, cos, exp, ln, powf
-
-### geo — Signed distance fields
-
-### geo — Signed distance fields
-- `sdf_sphere()`, `sdf_box()`, `sdf_capsule()` — analytical SDFs
-- `sdf_union()`, `sdf_intersection()`, `sdf_subtraction()`, `sdf_smooth_union()` — CSG operations
-
-### geo — Polygon triangulation
-- `triangulate_polygon()` — ear-clipping triangulation for simple polygons
-
-### geo — Ray-quadric + Fresnel
-- `ray_quadric()` — general quadric surface intersection (ellipsoid, paraboloid, etc.)
-- `refract()` — Snell's law refraction vector
-- `fresnel_schlick()`, `fresnel_exact()` — Fresnel reflectance
-
-### geo — Sweep-and-prune broadphase
-- `sweep_and_prune()` — SAP broadphase collision detection
-
-### transforms — Dual quaternions
-- `DualQuat` — rigid body transform type for blend skinning
-- `from_rotation_translation()`, `translation()`, `rotation()`, `to_matrix()`, `transform_point()`, `blend()`
-
-### transforms — CSS transform decomposition
-- `decompose_mat4()` — extract translate/rotate/scale from arbitrary 4×4 matrix
-- `recompose_mat4()` — reconstruct from components
-- `DecomposedTransform` struct
-
-### transforms — Color + Oklab
-- `color_matrix_saturation()`, `color_matrix_hue_rotate()` — color matrix operations
-- `linear_to_oklab()`, `oklab_to_linear()` — Oklab perceptual color space
-
-### transforms — Spherical harmonics
-- `sh_eval_l2()` — evaluate 9 SH basis functions at a direction
-- `sh_project_l2()`, `sh_evaluate_l2()` — project and reconstruct from SH coefficients
-
-### num — Inertia tensors
-- `inertia_sphere()`, `inertia_box()` — primitive shape inertia tensors
-- `inertia_mesh()` — inertia tensor from triangle mesh (divergence theorem)
-
-### num — GMRES iterative solver
-- `gmres()` — GMRES(m) for non-symmetric linear systems
-
-### num — Symplectic integrators
-- `symplectic_euler()`, `symplectic_euler_step()` — semi-implicit Euler
-- `verlet()`, `verlet_step()` — velocity Störmer-Verlet
-- `leapfrog_step()` — kick-drift-kick leapfrog
-
-### num — PCG32 random number generator
-- `Pcg32` struct — fast, deterministic, seedable PRNG for simulation replay
-- `next_u32()`, `next_f64()`, `next_f32()`, `next_f64_range()`
-
-### num — 2D FFT + truncated SVD
-- `fft_2d()`, `ifft_2d()` — row-major 2D Fourier transforms
-- `truncated_svd()` — top-k singular values/vectors
-
-### transforms — Quaternion utilities
-- `quat_from_euler()`, `quat_to_euler()` with `EulerOrder` enum (6 rotation orders)
-- `quat_look_at()`, `look_at_rh()` — camera/direction construction
-
-### transforms — Screen-space + color
-- `world_to_screen()`, `screen_to_world_ray()` — 3D↔2D projection
-- `srgb_to_linear()`, `linear_to_srgb()`, vec3 variants — piecewise sRGB transfer
-
-### geo — Frustum-sphere test
-- `Frustum::contains_sphere()` — conservative sphere culling
-
-### calc — Spring dynamics + easing
-- `spring_step()` — analytical critically/under/over-damped spring solver
-- `cubic_bezier_ease()` — CSS cubic-bezier timing function via Newton-Raphson
-
-### calc — Noise functions
-- `perlin_2d()`, `perlin_3d()` — classic Perlin gradient noise
-- `fbm_2d()` — fractal Brownian motion with configurable octaves
-
-### symbolic — Substitution
-- `Expr::substitute()` — replace variables with sub-expressions
-
-### Refactoring
-- Split `num.rs` (6097 lines) into 13 submodules: roots, linalg, eigen, complex, fft, ode, inertia, solvers, stability, optimize, rng, sparse, svd
-- Split `geo.rs` (5466 lines) into 7 submodules: primitives, intersection, closest, spatial, collision, sdf, decompose
-- Zero API changes — all re-exports preserved
-
-### Stats
-- 714 tests (671 unit + 34 integration + 9 doc), zero clippy warnings
-
-## 1.0.0 (2026-03-31)
-
-Stable release. All pre-1.0 milestones complete.
-
-### Final changes
-- GJK/EPA iteration limits now configurable via `GJK_MAX_ITERATIONS` and `EPA_MAX_ITERATIONS` constants
-- Resolved all known technical debt
-- 617 tests (574 unit + 34 integration + 9 doc), zero clippy warnings
-
-## 0.28.3 (2026-03-28)
-
-### parallel — Rayon batch operations (new module)
-- `par_transform_points()` — batch 3D transform application
-- `par_ray_aabb_batch()`, `par_ray_sphere_batch()` — parallel intersection tests
-- `par_matrix_vector_multiply()` — parallel dense matvec
-- `par_map()` — parallel element-wise operation
-- Feature-gated: `parallel` (requires rayon)
-
-### Doctests
-- Added doc examples on key entry points: `Transform2D`, `Ray`, `derivative`, `newton_raphson`, `Dual`, `Interval`, `Expr`, `Tensor`
-- 9 doctests passing
-
-### API review
-- Added missing `#[must_use]` on `Expr::evaluate()`
-- Verified naming consistency, argument order, `#[non_exhaustive]` coverage across all modules
-
-### Audit hardening (0.26.3 code)
-- autodiff: Added `Sub<f64>`, `Div<f64>`, `f64 + Dual`, `f64 * Dual` ops
-- interval: Made fields private, added `lo()`/`hi()` accessors (invariant protection)
-- symbolic: Epsilon-based simplification (handles `-0.0`, near-zero/one correctly)
-
-### Consumer smoke tests (integration)
-- impetus: broadphase→narrowphase pipeline, raycast scene query
-- kiran: camera frustum culling, transform hierarchy composition
-- joshua: ODE deterministic replay, multibody conservation laws
-- aethersafha: compositor projection chain, keyframe animation interpolation
-- abaco: symbolic differentiation→evaluation pipeline
-
-### Stats
-- 617 tests (574 unit + 34 integration + 9 doc), zero clippy warnings
-
-## 0.27.3 (2026-03-27)
-
-### autodiff — Forward-mode automatic differentiation (new module)
-- `Dual` type with val/deriv, `var()`, `constant()`
-- Arithmetic: Add, Sub, Mul, Div, Neg, scalar ops
-- Transcendentals: sin, cos, tan, exp, ln, sqrt, powf, abs
-- Feature-gated: `autodiff`
-
-### interval — Interval arithmetic (new module)
-- `Interval` type with lo/hi bounds
-- Arithmetic: Add, Sub, Mul, Div, Neg
-- Operations: contains, overlaps, intersect, hull, width, midpoint, abs, sqr, sqrt
-- Feature-gated: `interval`
-
-### symbolic — Symbolic algebra (new module)
-- `Expr` enum: Const, Var, Add, Mul, Pow, Neg, Sin, Cos, Exp, Ln
-- `evaluate(vars)`, `differentiate(var)`, `simplify()`
-- Simplification: 0+x, 1*x, x^0, x^1, double-neg, constant folding
-- Feature-gated: `symbolic`
-
-### tensor — N-dimensional tensor (new module)
-- `Tensor` type with shape/data, zeros, ones
-- get/set, reshape, add, sub, scale, matmul (2D), transpose (2D)
-- Feature-gated: `tensor`
-
-### Stats
-- 578 tests, zero clippy warnings
-
-## 0.26.3 (2026-03-26)
-
-### num — Optimization solvers
-- `gradient_descent()` — steepest descent with fixed learning rate
-- `conjugate_gradient()` — iterative SPD linear solver (Ax=b)
-- `bfgs()` — quasi-Newton optimizer with backtracking line search
-- `levenberg_marquardt()` — nonlinear least squares (damped Gauss-Newton)
-- `OptResult` struct for optimization output
-
-### num — Adaptive ODE solver
-- `dopri45()` — Dormand-Prince RK4(5) with automatic step-size control
-
-### geo — 3D collision detection
-- `ConvexSupport3D` trait, `ConvexHull3D` type
-- `gjk_intersect_3d()`, `gjk_epa_3d()`, `Penetration3D`
-- `Sphere`, `Obb`, `Capsule` implement `ConvexSupport3D`
-
-### geo — New primitives
-- `Obb` — oriented bounding box (center, half_extents, rotation)
-  - `contains_point()`, `closest_point()`, `axes()`
-  - `ray_obb()` intersection
-- `Capsule` — line segment + radius (Minkowski sum)
-  - `contains_point()`, `axis_length()`
-  - `ray_capsule()` intersection
-
-### Stats
-- 504 tests, zero clippy warnings
-
-## 0.25.3 (2026-03-25)
-
-### num — Singular Value Decomposition
-- `svd()` — one-sided Jacobi SVD for m×n matrices, returns U, σ, Vᵀ
-- `Svd` struct with `u`, `sigma`, `vt` fields
-
-### num — Matrix utilities (built on SVD + LU)
-- `matrix_rank()` — numerical rank via singular value thresholding
-- `condition_number()` — ratio σ_max/σ_min
-- `matrix_inverse()` — full inverse via LU decomposition
-- `pseudo_inverse()` — Moore-Penrose pseudo-inverse via SVD
-
-### num — Sparse matrices (CSR)
-- `CsrMatrix` — Compressed Sparse Row format
-- `from_dense()`, `to_dense()`, `spmv()`, `add()`, `transpose()`
-- `nnz()`, `new()` with full validation
-
-### calc — Multivariable calculus
-- `partial_derivative()` — central difference on single variable
-- `gradient()` — full gradient vector ∇f
-- `jacobian()` — m×n Jacobian matrix of vector-valued function
-- `hessian()` — n×n Hessian matrix of scalar function
-
-### calc — Advanced integration
-- `integral_adaptive_simpson()` — recursive adaptive Simpson with Richardson extrapolation
-- `integral_monte_carlo()` — N-dimensional Monte Carlo integration with deterministic LCG
-
-### geo — Edge-case hardening (from P(-1) audit)
-- `Plane::from_point_normal()` now returns `Result` (rejects zero-length normals)
-- `Segment::direction()` returns fallback instead of NaN on zero-length segments
-- `Triangle::unit_normal()` returns fallback instead of NaN on degenerate triangles
-
-### Performance
-- `matrix_determinant()` uses `lu_decompose_in_place` (avoids double allocation)
-- GJK: deduplicated `gjk_intersect`/`gjk_epa` via shared `gjk_core()` (~60 lines removed)
-
-### Stats
-- 466 tests, 89 benchmarks, zero clippy warnings
-
-## 0.24.3 (2026-03-24)
-
-### num — Discrete Sine/Cosine Transforms
-- `dst()` — Discrete Sine Transform Type-I (Dirichlet boundary conditions)
-- `idst()` — Inverse DST-I (self-inverse with `2/(N+1)` scaling)
-- `dct()` — Discrete Cosine Transform Type-II (Neumann boundary conditions)
-- `idct()` — Inverse DCT (DCT-III)
-
-### num — Complex API completeness
-- `Div`, `Div<f64>`, `Neg`, `From<f64>`, `From<(f64, f64)>` operators
-- `Serialize`/`Deserialize` derives
-
-### num — Matrix helpers
-- `matrix_determinant()` — via LU decomposition with permutation parity
-- `matrix_trace()` — sum of diagonal elements
-- `matrix_multiply()` — dense A*B with dimension validation
-
-### geo — Display + Rect parity
-- `Display` for `Ray`, `Plane`, `Aabb`, `Sphere`, `Triangle`
-- `Rect::merge()`, `Rect::area()`
-
-### transforms
-- `Transform2D::inverse_matrix()`
-
-### Safety — Panic elimination
-- All `assert!`/`unwrap`/`panic!` in library code replaced with `Result` returns
-  - calc: `integral_trapezoidal`, `integral_simpson`, `integral_gauss_legendre`, `bezier_cubic_3d_arc_length`, `bezier_cubic_3d_param_at_length`
-  - num: `fft`, `ifft`, `rk4`, `rk4_trajectory`
-  - geo: `SpatialHash::new`, `ConvexPolygon::new`, `Sphere::new`, `Ray::new`, `Line::new`
-
-### Quality
-- `#[must_use]` on all ~90 pure public functions/methods
-- `#[inline]` on 14 hot-path functions
-- `EPSILON_F32` (1e-7), `EPSILON_F64` (1e-12) constants; all tolerance checks normalized
-- `# Errors` doc sections on all Result-returning public functions
-- `cargo doc --all-features` zero warnings
-- Removed duplicate `Result<T>` type alias
-- License identifier: `GPL-3.0` → `GPL-3.0-only`
-
-### Performance
-- `rk4`/`rk4_trajectory`: closure refactored to `f(t, y, out: &mut [f64])` — 4 allocs/step → 0
-- GJK: `Vec` simplex → fixed `[Vec2; 3]` array (zero heap allocation)
-- EPA: pre-allocated polytope (`Vec::with_capacity(32)`)
-- `lu_decompose_in_place()` — zero-clone LU decomposition
-- `qr_decompose_in_place()` — zero-clone QR decomposition
-
-### Stats
-- 408 tests, 82 benchmarks, zero clippy warnings
-
-## 0.22.3 (2026-03-22)
-
-Initial release — 360 tests, 82 benchmarks.
-
-### transforms
-- Vec2/Vec3/Vec4/Mat3/Mat4/Quat re-exports from glam
-- `Transform2D`, `Transform3D` with `to_matrix()`, `apply_to_point()`
-- Orthographic and perspective projection matrices
-- `lerp_f32`, `lerp_vec3`, `slerp`, `transform3d_lerp`
-- `Transform3D::inverse_matrix()`, `flip_handedness_z()`
-
-### geo — Primitives & Intersections
-- `Ray`, `Plane`, `Aabb`, `Sphere`, `Triangle`, `Line`, `Segment`
-- `Frustum` with `contains_point()`, `contains_aabb()`
-- Ray-plane, ray-sphere, ray-AABB, ray-triangle intersection
-- Plane-plane, AABB-AABB, sphere-sphere overlap
-- Closest point on ray, plane, sphere, AABB
-- `Rect` with `contains_point()`, `overlaps()`
-
-### geo — Spatial Structures
-- `Bvh`, `KdTree`, `Quadtree`, `Octree`, `SpatialHash`
-
-### geo — Collision
-- `convex_hull_2d()`, `ConvexSupport` trait, `ConvexPolygon`
-- `gjk_intersect()`, `epa_penetration()`, `gjk_epa()`
-
-### calc
-- `derivative`, `integral_trapezoidal`, `integral_simpson`
-- `integral_gauss_legendre_5`, `integral_gauss_legendre`
-- `bezier_quadratic/cubic` (2D/3D), `de_casteljau_split`
-- `catmull_rom`, `bspline_eval`, arc-length parameterization
-- Easing: `ease_in/out/in_out`, cubic, quintic smootherstep
-
-### num
-- `newton_raphson`, `bisection`, `gaussian_elimination`
-- `lu_decompose/solve`, `cholesky/solve`, `qr_decompose`
-- `least_squares_poly`, `eigenvalue_power`
-- `Complex` with arithmetic, `fft`/`ifft`
-- `rk4`, `rk4_trajectory`
-
-### Infrastructure
-- Feature flags, unified `HisabError`, `DaimonError`
-- CI, benchmarks with CSV history, docs
+- README, CONTRIBUTING, SECURITY updated for Cyrius
+- Architecture overview, testing guide, threat model, dependency watch
+- P(-1) audit report, Rust vs Cyrius benchmark comparison
+- Working example (examples/basic_math.cyr)
+
+---
+
+## Rust era (archived in pre-2.0 git tags)
+
+### 1.4.0 (2026-03-30) -- Theoretical physics foundation
+- Complex linear algebra (ComplexMatrix, Hermitian eigen, complex SVD, Pauli/Dirac, spinors, matrix exp)
+- Indexed tensor algebra (Einstein summation, contraction, raising/lowering)
+- Symmetric/antisymmetric/sparse tensors
+- Lie groups (U(1), SU(2), SU(3), SO(3,1), exponential maps, Casimir)
+- Differential geometry (Christoffel, Riemann, Ricci, Einstein, geodesics, Killing, exterior algebra)
+- Conformal geometric algebra (5D CGA multivectors)
+
+### 1.3.0 (2026-03-27) -- Number theory + symbolic
+- Prime sieves, primality, factorization, modular arithmetic
+- Symbolic integration, LaTeX, pattern matching, abaco bridge
+
+### 1.2.0 (2026-03-27) -- Interpolation + color
+- Inverse lerp, remap, reverse-Z, HSV/HSL/Oklab, Porter-Duff, compensated summation
+
+### 1.1.0 (2026-03-25) -- Feature completion
+- Symplectic integrators, SDFs, DualQuat, SH, stiff ODE, SDE, eigen, reverse-mode AD
+
+### 1.0.0 -- Stable release
+- Core: transforms, geo, calc, num, autodiff, interval, symbolic, tensor, parallel, ai, logging

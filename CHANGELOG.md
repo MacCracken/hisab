@@ -2,41 +2,96 @@
 
 ## [Unreleased]
 
-## 1.4.0-cyrius (2026-04-15)
+## 2.0.0 (2026-04-15) — Cyrius port
 
-### Changed — Ported from Rust to Cyrius
-- **Complete rewrite** from 33,612 lines of Rust to 11,769 lines of Cyrius (27 lib files)
-- Replaced glam dependency with native HVec2/3/4, HQuat, Mat3, Mat4 types (f64, heap-allocated)
-- Replaced Rust error types with integer error codes (ERR_* constants)
-- Replaced serde serialization with manual storage patterns
-- Replaced tracing with sakshi structured logging
-- Single external dependency (sakshi) vs 9 Rust crates
-- Static 420KB binary vs ~800KB dynamic
+**Breaking: complete rewrite from Rust to Cyrius.** This is a new language, new API, new binary format. The Rust source is archived in `rust-old/`.
 
-### Added
-- **mat3.cyr** — 3x3 matrix type (determinant, inverse, from_quat, normal_matrix)
-- **ode.cyr** — DOPRI45, backward Euler, BDF-2..5, Euler-Maruyama, Milstein, symplectic Euler/Verlet/leapfrog/Yoshida4
-- **optimize.cyr** — gradient descent, conjugate gradient (Polak-Ribiere+), BFGS, L-BFGS, Levenberg-Marquardt
-- **linalg_ext.cyr** — CSR sparse matrix, GMRES, BiCGSTAB, PGS, SVD wrappers, eigendecomposition, Lyapunov, inertia tensors
-- **calc_ext.cyr** — gradient/Jacobian/Hessian, adaptive Simpson, B-spline, NURBS, Hermite TCB, monotone cubic, 3D Perlin noise
-- **symbolic_ext.cyr** — symbolic integration, LaTeX rendering, pattern matching + 7 rewrite rules
-- **num_ext.cyr** — extended GCD, Euler totient, Mobius, factorize, CRT, DST/DCT, 2D-FFT, Halton/Sobol, tridiagonal solver
-- 821 test assertions (4 suites), 22 benchmarks, 5 fuzz targets
-- P(-1) security audit: 31 issues found, 25 fixed
+### Changed
+- **Language**: Rust → Cyrius (self-hosting systems language, static ELF binaries)
+- **Types**: glam f32 SIMD types → native f64 heap-allocated types (HVec2/3/4, HQuat, Mat3, Mat4)
+- **Errors**: `Result<T, HisabError>` → integer error codes (`ERR_NONE`, `ERR_SINGULAR_MATRIX`, etc.)
+- **API**: method syntax (`v.dot(w)`) → free functions (`hvec3_dot(v, w)`)
+- **Precision**: f32 (1e-7) → f64 (1e-12) everywhere
+- **Dependencies**: 9 Rust crates → 1 Cyrius dep (sakshi)
+- **Binary**: ~800KB dynamic → 420KB static ELF
 
-### Security
-- Allocation overflow guards on tensor, complex matrix, diffgeo (C1, C2, C4)
-- Sieve limit cap at 10M to prevent OOM (C5)
-- Division-by-zero guards on cx_div, cx_inv, dual_div/ln/sqrt, f64_fmod, world_to_screen, linearize_depth_reverse_z
-- Modpow overflow-safe via Russian peasant multiplication
+### Added — 27 library files, 11,769 lines
+
+#### Foundation (7 files)
+- **error.cyr** — 10 error codes, EPSILON_F64
+- **f64_util.cyr** — f64_tan, f64_fmod, f64_copysign, f64_approx_eq
+- **vec2.cyr** — HVec2 with full arithmetic, products, norms, interpolation
+- **vec3.cyr** — HVec3 with cross, reflect, min/max/abs
+- **vec4.cyr** — HVec4 with Vec3 conversion
+- **quat.cyr** — HQuat with slerp, rotation, axis-angle, Euler
+- **mat3.cyr** — 3x3 matrix (determinant, inverse, from_quat, normal_matrix, trace, frobenius)
+- **mat4.cyr** — 4x4 matrix (Cramer inverse, SRT, ortho/perspective/reverse-Z, look-at)
+
+#### Transforms (2 files)
+- **transforms.cyr** — Transform2D/3D, compose, lerp, Euler angles, screen projection
+- **color.cyr** — sRGB/HSV/HSL, Porter-Duff compositing (8 ops), Reinhard/ACES tone mapping, SH L2, EV/exposure
+
+#### Geometry (2 files)
+- **geo.cyr** — 9 primitives (Ray, Plane, AABB, Sphere, OBB, Capsule, Triangle, Line, Segment), 6 ray tests, closest-point queries
+- **geo_advanced.cyr** — GJK/EPA 3D, BVH (build + query), SDF+CSG, swept AABB, TOI, conformal geometric algebra (5D CGA multivectors)
+
+#### Calculus (2 files)
+- **calc.cyr** — derivative, Simpson/Gauss-Legendre integration, Bezier 2D/3D, Catmull-Rom, easing (6 functions), 2D Perlin noise + fBm
+- **calc_ext.cyr** — partial derivative, gradient, Jacobian, Hessian, adaptive Simpson, B-spline, NURBS, Hermite TCB, monotone cubic, 3D Perlin + fBm
+
+#### Numerical (5 files)
+- **num.cyr** — Newton-Raphson, bisection, FFT/IFFT, RK4, PCG32, GCD, modpow (overflow-safe), Miller-Rabin primality, Eratosthenes sieve, Kahan/Neumaier compensated summation
+- **ode.cyr** — DOPRI45 (adaptive), backward Euler, BDF-2..5, Euler-Maruyama, Milstein, symplectic Euler, Verlet, leapfrog, Yoshida 4th-order
+- **optimize.cyr** — gradient descent, conjugate gradient (Polak-Ribiere+), BFGS, L-BFGS, Levenberg-Marquardt (all with Armijo line search)
+- **linalg_ext.cyr** — CSR sparse matrix (spmv, add, transpose), GMRES, BiCGSTAB, projected Gauss-Seidel, SVD, eigendecomposition, Lyapunov exponent, inertia tensors
+- **num_ext.cyr** — extended GCD, modular inverse, Euler totient, Mobius, divisor sigma, Pollard rho, factorize, CRT, continued fractions, DST/DCT, 2D-FFT, Halton/Sobol, tridiagonal solver
+
+#### Physics (3 files)
+- **complex.cyr** — complex numbers + matrices, Pauli spin matrices, Dirac gamma matrices, matrix exponential, commutator/anticommutator, Kronecker product
+- **lie.cyr** — U(1), SU(2), SU(3) Gell-Mann (8 generators + structure constants), SO(3,1) Lorentz (boosts, rotations, Minkowski interval, validity check)
+- **diffgeo.cyr** — Christoffel symbols, Riemann tensor, Ricci tensor/scalar, Einstein tensor, geodesic RK4, Killing vector residual, wedge product, Hodge star
+
+#### Symbolic (2 files)
+- **symbolic.cyr** — expression tree (10 node types), evaluate, differentiate, simplify, to_str
+- **symbolic_ext.cyr** — symbolic integration (constant/poly/trig/exp/sum rules), LaTeX rendering, pattern matching with 7 built-in rewrite rules (sin²+cos²=1, ln(exp(x))=x, etc.)
+
+#### Other (3 files)
+- **autodiff.cyr** — dual numbers (forward-mode AD) with sin/cos/exp/ln/sqrt/pow, zero guards
+- **interval.cyr** — interval arithmetic (add/sub/mul/div/neg/abs/sqrt/exp/sin), contains, overlaps
+- **tensor.cyr** — N-D dense tensor with full contraction, Kronecker delta, Minkowski metric, Levi-Civita 3D+4D
+
+### Security — P(-1) audit (31 issues found, 25 fixed)
+- **C1-C5**: Allocation overflow guards (tensor, complex matrix, diffgeo dim cap 16, sieve cap 10M)
+- **H1**: tensor_contract fully implemented (was returning zeros)
+- **H2**: m4_determinant rewritten with correct cofactor formula
+- **H3-H7**: Division-by-zero guards on cx_div, cx_inv, dual_div/ln/sqrt, f64_fmod, world_to_screen, linearize_depth_reverse_z
+- **H9**: BDF-5 coefficients recomputed exact (IEEE 754 verified)
+- **H10**: ivl_sin no longer always returns [-1,1]
+- **M1**: num_modpow overflow-safe via Russian peasant multiplication
+- **M3**: geo_ray_plane returns -1 for miss (disambiguates from t=0 hit)
+- **M7**: expr_eval returns 0 with warning instead of aborting process
 - Bisection midpoint overflow fix: `lo + (hi-lo)/2`
-- BDF-5 coefficients recomputed exact (IEEE 754 verified)
-- expr_eval no longer aborts process on undefined variables
+- CG upgraded Fletcher-Reeves → Polak-Ribiere+
+- Upstream: matrix.cyr alloc overflow noted for cyrius 5.0.1
 
-### Performance
-- Benchmark comparison: see docs/benchmarks-rust-v-cyrius.md
-- Sub-microsecond for vec3_add (454ns), quat_mul (475ns), ray_sphere (512ns)
-- Cyrius is 30-100x slower per-operation vs Rust/glam (f64 heap vs f32 SIMD) but 2.3x smaller binary
+### Testing
+- 821 assertions across 4 test suites (foundation 307, modules 249, smoke 116, edge cases 149)
+- 22 benchmarks covering all major operations
+- 5 fuzz targets with invariant checking
+- Benchmark comparison: docs/benchmarks-rust-v-cyrius.md
+
+### Documentation
+- README.md — Cyrius quick-start, module table, build commands
+- CONTRIBUTING.md — Cyrius development workflow
+- SECURITY.md — attack surface, known limitations, audit history
+- docs/architecture/overview.md — full 27-file module map
+- docs/guides/testing.md — test suite breakdown, patterns
+- docs/development/roadmap.md — Cyrius-specific with completed/remaining items
+- docs/development/threat-model.md — 20+ mitigated attack vectors
+- docs/development/dependency-watch.md — Cyrius stdlib + sakshi deps
+- docs/audit/2026-04-15.md — full 31-issue P(-1) audit report
+- docs/benchmarks-rust-v-cyrius.md — 85 Rust + 22 Cyrius benchmark comparison
+- examples/basic_math.cyr — working example demonstrating 8 features
 
 ## 1.4.0 (2026-03-30)
 

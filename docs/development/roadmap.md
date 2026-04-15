@@ -27,9 +27,9 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 
 ---
 
-## Current — Cyrius v1.4.0 (2026-04-15)
+## Current — v2.0.0 (2026-04-15)
 
-- **23 lib files, 8,945 lines** (ported from 33,612 lines Rust)
+- **27 lib files, 11,769 lines** (ported from 33,612 lines Rust)
 - **821 test assertions** across 4 test suites
 - **22 benchmarks**, 5 fuzz targets
 - **349KB static binary** (vs ~800KB Rust dynamic)
@@ -71,7 +71,7 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 
 ---
 
-## 1.5.0 — Numerical depth + remaining audit
+## 2.1.0 — Numerical depth + remaining audit
 
 ### Audit completion
 - [ ] All remaining H/M items from 2026-04-15 audit
@@ -109,7 +109,7 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 
 ---
 
-## 1.6.0 — Geometry & group extensions
+## 2.2.0 — Geometry & group extensions
 
 ### Lie group extensions
 - [ ] SE(3) — rigid body motions
@@ -132,7 +132,7 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 
 ---
 
-## 1.7.0 — Differential geometry & curvature
+## 2.3.0 — Differential geometry & curvature
 
 - [ ] Parallel transport
 - [ ] Sectional curvature
@@ -142,7 +142,7 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 
 ---
 
-## 1.8.0 — Rendering & GPU
+## 2.4.0 — Rendering & GPU
 
 - [ ] Differentiable rendering math
 - [ ] GPU compute via soorat (feature-gated)
@@ -152,25 +152,14 @@ Hisab owns **typed mathematical operations** — the programmatic math that engi
 
 ## Release History
 
-### Cyrius 1.4.0 (2026-04-15) — Port from Rust
+### 2.0.0 (2026-04-15) — Cyrius port
 
-**Ported from 33,612 lines of Rust to 8,945 lines of Cyrius.**
+Complete rewrite from Rust to Cyrius. 27 lib files, 11,769 lines. 821 test assertions,
+22 benchmarks, 5 fuzz targets. P(-1) audit: 31 issues found, 25 fixed. 420KB static binary.
+See CHANGELOG.md for full details.
 
-Modules ported (23 lib files):
-- Foundation: error, f64_util, vec2, vec3, vec4, quat, mat4
-- Transforms: transforms, color (sRGB, Porter-Duff, tone mapping, SH, EV)
-- Geometry: geo (9 primitives, 6 ray tests), geo_advanced (GJK/EPA, BVH, SDF, CGA)
-- Calculus: calc (integration, Bezier, easing, Perlin)
-- Numerical: num (roots, FFT, RK4, PCG32, primes), ode (DOPRI45, BDF, symplectic), optimize (GD, CG, BFGS, L-BFGS, LM), linalg_ext (CSR, GMRES, BiCGSTAB, PGS, SVD, eigen)
-- Physics: complex (numbers + matrices, Pauli, Dirac), lie (U(1), SU(2), SU(3), SO(3,1)), diffgeo (Christoffel→Einstein, geodesics, exterior algebra)
-- Symbolic: symbolic (expr tree, eval, diff, simplify)
-- Other: autodiff (dual numbers), interval (arithmetic), tensor (N-D dense, physics tensors)
-
-Testing: 821 assertions, 22 benchmarks, 5 fuzz targets.
-Security: P(-1) audit completed, 15 critical/high fixes applied.
-
-### Rust 1.4.0 (2026-03-30) — Theoretical physics foundation
-(See CHANGELOG.md for full Rust history)
+### Rust 1.4.0 (2026-03-30) — Final Rust release
+Theoretical physics foundation. Archived in rust-old/. See CHANGELOG.md for history.
 
 ---
 

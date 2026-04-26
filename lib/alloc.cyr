@@ -1,11 +1,29 @@
-# alloc.cyr — heap allocator using brk syscall
+# alloc.cyr — heap allocator with per-OS dispatch.
 # Usage: include "lib/alloc.cyr"
 # Call alloc_init() before any allocations.
 #
 # Bump allocator: fast, no individual free.
 # alloc(size) returns aligned pointer or 0 on failure.
 # alloc_reset() frees everything (batch).
+#
+# v5.5.0 split the implementation: Linux + aarch64 use the brk-
+# based path below; Windows (CYRIUS_TARGET_WIN) delegates to
+# lib/alloc_windows.cyr which uses VirtualAlloc. v5.5.16 adds the
+# macOS (CYRIUS_TARGET_MACOS) delegation to lib/alloc_macos.cyr
+# (mmap-based — Darwin has no brk, and BSD syscall 12 is chdir,
+# so the Linux branch silently corrupts _heap_base when it runs
+# on Mach-O). arena_* helpers are OS-agnostic and shipped inline
+# after the selector.
 
+#ifdef CYRIUS_TARGET_WIN
+include "lib/alloc_windows.cyr"
+#endif
+
+#ifdef CYRIUS_TARGET_MACOS
+include "lib/alloc_macos.cyr"
+#endif
+
+#ifdef CYRIUS_TARGET_LINUX
 var _heap_base = 0;
 var _heap_ptr = 0;
 var _heap_end = 0;
@@ -19,15 +37,29 @@ fn alloc_init() {
     return _heap_base;
 }
 
+# Maximum single allocation size (256MB)
+var ALLOC_MAX = 0x10000000;
+
 # Allocate size bytes from the heap, 8-byte aligned
 fn alloc(size) {
+    # Reject oversized or negative allocations
+    if (size <= 0) { return 0; }
+    if (size > ALLOC_MAX) { return 0; }
     # Align to 8 bytes
     size = (size + 7) & (0 - 8);
     var ptr = _heap_ptr;
-    _heap_ptr = _heap_ptr + size;
+    var new_ptr = ptr + size;
+    # Overflow check: wrapped pointer means arithmetic overflow
+    if (new_ptr < ptr) { return 0; }
+    _heap_ptr = new_ptr;
     if (_heap_ptr > _heap_end) {
-        # Grow heap by 1MB
-        var new_end = _heap_end + 0x100000;
+        # Grow to cover _heap_ptr, rounded up to the next 1MB boundary.
+        # v5.6.34: previously stepped by exactly 0x100000 regardless of
+        # how far past _heap_end the new_ptr was, so any alloc(>1MB) near
+        # the grow point returned a pointer past the brk — SIGSEGV on
+        # first tail-write. Rounding up to a 1MB grain keeps the
+        # brk-per-alloc churn low while always mapping enough space.
+        var new_end = (_heap_ptr + 0xFFFFF) & (0 - 0x100000);
         var result = syscall(12, new_end);
         if (result < new_end) {
             # brk failed — out of memory
@@ -49,9 +81,10 @@ fn alloc_reset() {
 fn alloc_used() {
     return _heap_ptr - _heap_base;
 }
+#endif
 
 # ================================================================
-# Arena allocator — independent memory pools
+# Arena allocator — independent memory pools (OS-agnostic)
 # ================================================================
 # Unlike alloc_reset() which frees EVERYTHING, arenas are independent.
 # Each arena has its own bump pointer. Freeing one arena doesn't
@@ -78,9 +111,11 @@ fn arena_new(capacity) {
 
 # Allocate size bytes from the arena, 8-byte aligned. Returns 0 on overflow.
 fn arena_alloc(a, size) {
+    if (size <= 0) { return 0; }
     size = (size + 7) & (0 - 8);
     var ptr = load64(a + 8);
     var new_ptr = ptr + size;
+    if (new_ptr < ptr) { return 0; }
     if (new_ptr > load64(a + 16)) { return 0; }
     store64(a + 8, new_ptr);
     return ptr;

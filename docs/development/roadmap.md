@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: 4.10.3. Stdlib linalg.cyr provides dense decompositions.
+> Written in Cyrius. Toolchain: **5.7.8**. Stdlib `linalg.cyr` provides dense decompositions.
 
 ## Scope
 
@@ -11,23 +11,40 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.2.0
+## Current -- v2.2.2
 
 - **33 lib files, 15,676 lines**
 - **821 test assertions**, 22 benchmarks, 5 fuzz targets
-- **511KB static binary**
-- P(-1) audit: 26/31 fixed. C3 awaiting cyrius 5.0.1.
+- **CLI smoke binary** ~140 KB static ELF
+- **`dist/hisab.cyr` distlib bundle** ~505 KB (32 modules) — fits cc5 5.7.8's 512 KB input_buf
+- P(-1) audit: 26/31 fixed.
 
 ---
 
-## 2.3.0 -- Mesh + buffer expansion (blocked on Cyrius 5.0)
+## 2.3.0 -- Restore collision modules (gated on cc5 5.7.9)
 
-Cyrius 5.0 expands the 1MB preprocess buffer. These are written and ready to ship.
+cc5 5.7.9 raises `input_buf` from 512 KB → 1 MB (announced in the cc5
+5.7.8 release header). That ~40 % bump unblocks adding back the two
+modules currently excluded from `dist/hisab.cyr`. The bundle today has
+~7 KB of headroom under the 512 KB cap; on 5.7.9 we get ~520 KB of
+headroom — easily enough for both files plus future growth.
 
-- [ ] collision_mesh.cyr -- Delaunay triangulation (Bowyer-Watson), half-edge mesh, island detection (union-find). 522 lines, ready.
-- [ ] C3 upstream fix -- matrix.cyr alloc overflow (cyrius 5.0.1)
+When cc5 5.7.9 ships:
+
+- [ ] Bump toolchain pin in `cyrius.cyml` 5.7.8 → 5.7.9
+- [ ] Diagnose + fix the pre-existing parse issue in `lib/collision_core.cyr` (compiles standalone but trips inside larger compilation units — likely an upstream parse-state interaction with a 5.7.x-reserved keyword or syntax shift; was masked in 2.2.1 by the orphan-include trick in `src/main.cyr`)
+- [ ] Same diagnosis + fix for `lib/collision_mesh.cyr` (Delaunay triangulation, half-edge mesh, island detection — 522 lines, written but never validated against cc5 5.7.x)
+- [ ] Restore `"lib/collision_core.cyr"` and `"lib/collision_mesh.cyr"` in `cyrius.cyml [lib] modules` (after the foundation/types section, before calculus — see git history pre-2.2.2 for the prior position)
+- [ ] Regenerate + commit `dist/hisab.cyr` (CI distlib drift gate enforces this)
+- [ ] Add coverage in `tests/modules.tcyr` for the MPR / impulse-solver / Delaunay paths that 2.2.0 added but never exercised post-port
+
+After this lands, hisab is back to "all 33 modules ship in the bundle."
+
+## 2.3.x -- CGA + matrix overflow guards
+
 - [ ] CGA left/right contraction operators
 - [ ] CGA dual operation, blade projection/rejection
+- [ ] Confirm `lib/matrix.cyr` `mat_new(rows, cols)` overflow is fixed upstream (was C3 in P(-1) audit; expected fixed by cyrius 5.x)
 
 ---
 

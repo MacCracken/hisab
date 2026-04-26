@@ -38,17 +38,14 @@ cyrius      = "5.7.8"
 [deps]
 stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "matrix", "linalg", "tagged", "fnptr"]
 
-# 2.2.2 ships per-module includes — no flat distlib bundle yet.
-# (cc5 5.7.8's 512 KB input_buf can't fit the full 544 KB bundle;
-# upstream input_buf expansion is queued for a later cc5 release.)
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
 tag     = "2.2.2"
-modules = [
-    "lib/f64_util.cyr", "lib/error.cyr",
-    "lib/vec3.cyr", "lib/quat.cyr", "lib/mat4.cyr",
-    # ...add the modules your code uses
-]
+modules = ["dist/hisab.cyr"]   # ~505 KB self-contained bundle (32 modules)
+# Or pull individual files for a smaller compilation unit:
+# modules = ["lib/f64_util.cyr", "lib/error.cyr", "lib/vec3.cyr", ...]
+# Note: `lib/collision_core.cyr` + `lib/collision_mesh.cyr` are not in
+# the bundle — they hit pre-existing parse issues against cc5 5.7.x.
 ```
 
 ```cyrius

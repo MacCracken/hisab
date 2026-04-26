@@ -11,7 +11,7 @@ differential geometry, symbolic algebra.
 - **Language**: Cyrius (sovereign systems language, compiled by cc5)
 - **Toolchain**: Cyrius 5.7.8 (`cyrius.cyml: cyrius = "5.7.8"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.2.2 — actually compiles under cc5 5.7.8 (CLI smoke binary builds; library validated via tests). Distlib bundle deferred until upstream cc5 5.7.9 raises input_buf to 1 MB.
+- **Status**: 2.2.2 — actually compiles under cc5 5.7.8. CLI smoke binary builds; 32-module distlib bundle (~505 KB, fits cc5's 512 KB input_buf) ships at `dist/hisab.cyr` and is consumer-tested. Library validated via tests (821/821).
 
 ## Consumers
 
@@ -42,8 +42,9 @@ No external deps. No FFI. No libc. All first-party, pinned in
 src/main.cyr         — CLI smoke binary (prints version, exits — does NOT
                        include the library; library coverage is in tests/)
 lib/                 — vendored deps (managed by `cyrius deps`) + math modules
-                       (consumers pull project modules directly via
-                       [deps.hisab] modules = ["lib/<file>.cyr", ...])
+dist/hisab.cyr       — 32-module distlib bundle (~505 KB), regenerated via
+                       `cyrius distlib`. Consumers pull this single file via
+                       [deps.hisab] modules = ["dist/hisab.cyr"]
 examples/            — small demos (basic_math.cyr)
 tests/
   hisab.tcyr         — primary assertion suite
@@ -135,12 +136,9 @@ VERSION              — single source of truth for version
 - **Fmt gate**: `cyrius fmt --check` per source — drift fails the build
 - **Vet gate**: `cyrius vet src/main.cyr`
 - **Lock gate**: `cyrius deps --verify` against committed `cyrius.lock` (when present)
+- **Distlib gate**: `cyrius distlib` regenerates `dist/hisab.cyr`; CI fails on drift
+  (run `cyrius distlib` locally before committing changes to `lib/*.cyr` or `[lib]`)
 - **Test/Fuzz/Bench gates**: every `tests/*.tcyr`, `tests/*.fcyr`, `tests/*.bcyr` runs
-- **Distlib**: deferred — `[lib] modules = []` is intentional for 2.2.2.
-  The flat 33-file bundle is 544 KB and exceeds cc5 5.7.8's 512 KB
-  input_buf. cc5 5.7.9 raises input_buf to 1 MB (per the 5.7.8 release
-  header) — restore the full `[lib]` list (see git history pre-2.2.2)
-  when we bump the toolchain pin to 5.7.9.
 - **Concurrency**: CI uses `cancel-in-progress: true` keyed on workflow + ref
 
 ## DO NOT

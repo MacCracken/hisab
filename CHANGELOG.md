@@ -2,16 +2,16 @@
 
 ## [Unreleased]
 
-## [2.2.2] - 2026-04-26 — Make it actually build under cc5 5.7.8
+## [2.2.2] - 2026-04-26 — Make it actually build under cc5 5.7.8 + distlib bundle
 
 2.2.1 captured the manifest/CI/release modernization intent but was never
 tagged because `cyrius build src/main.cyr` didn't pass — Cyrius 5.7.x's
 new reserved keywords + an oversized include chain (the CLI prepended all
 33 project modules, exceeding cc5's 512 KB input_buf) blocked the build.
 2.2.2 closes those, picks up the 5.7.8 toolchain bump for its `syscall
-arity mismatch` warning fix + lockfile-default behavior, gets all gates
-green locally, and defers the distlib bundle until cc5 5.7.9 raises
-input_buf to 1 MB.
+arity mismatch` warning fix + lockfile-default behavior, ships a 32-module
+`dist/hisab.cyr` distlib bundle (~505 KB, fits cc5 5.7.8's input_buf and
+verified end-to-end against a consumer build), and gets all gates green.
 
 ### Fixed
 - **`lib/num_ext.cyr`**: renamed local variable `stack` → `stk` (6 identifier sites in `_factorize_pollard_rho`). `stack` became a reserved keyword in Cyrius 5.7.x; the four mentions in comments were left intact
@@ -20,9 +20,13 @@ input_buf to 1 MB.
 - **`examples/basic_math.cyr` + `tests/{edge_cases,foundation,hisab,modules}.tcyr`**: applied `cyrius fmt` to flatten multi-line continuation-indent drift from the modern formatter
 - **CI lint loop**: added `set +e` and per-file rc capture so warning-count exit codes don't abort the sweep before later files report. Adds `::error file=...::` annotations so the offending file is visible in the GHA UI
 
+### Added
+- **`dist/hisab.cyr`** — 32-module distlib bundle (~505 KB), regenerated from `[lib]` via `cyrius distlib`. Consumers pull it as `[deps.hisab] modules = ["dist/hisab.cyr"]` — single self-contained file, no per-module `include` choreography. Verified end-to-end: a fresh `[deps] stdlib = [...]` consumer build of a `hvec3_dot` example exits 0 and prints expected output. Fits cc5 5.7.8's 512 KB input_buf with ~7 KB headroom; restoring `lib/collision_core.cyr` + `lib/collision_mesh.cyr` (~33 KB) is gated on cc5 5.7.9's input_buf bump to 1 MB
+- **CI distlib drift gate** in `ci.yml` — `cyrius distlib` runs on every push and CI fails if the committed `dist/hisab.cyr` differs from what the current `lib/` produces, so consumers always pull a fresh bundle that matches `lib/`
+- **Release distlib regeneration** in `release.yml` — bundle is regenerated and shipped as `hisab-<TAG>.cyr` alongside the source tarball + linux binary + `SHA256SUMS`
+
 ### Changed
 - **Toolchain pin**: 5.7.7 → **5.7.8**. Picks up the cc5-level fix for the noisy `lib/syscalls_x86_64_linux.cyr:358: syscall arity mismatch` warning (was firing on every build of every downstream that includes syscalls), `cyrius deps` writing `cyrius.lock` by default, `cyrius check` no longer auto-prepending manifest deps, and the new `cyrius build --no-deps` flag
-- **`[lib]` block**: trimmed to `modules = []` for 2.2.2. The flat 33-file bundle is 544 KB and exceeds cc5 5.7.8's 512 KB input_buf, so consumers can't compile it. cc5 5.7.9 raises input_buf to 1 MB (per the 5.7.8 release header) — the full module list (in dependency order) lives in git history pre-2.2.2 and gets restored when we bump to 5.7.9
 - **Distlib gates removed from CI/release** — the regenerate-and-diff step in `ci.yml` and the bundle archive step in `release.yml` are gone for 2.2.2. The release still ships the source tarball + linux binary + `SHA256SUMS`
 - **`README.md` quick-start**: `[deps.hisab] modules = ["dist/hisab.cyr"]` → per-module `["lib/<file>.cyr", ...]` example; toolchain version → 5.7.7; CLI binary description corrected (it's a smoke test, not a library entry point)
 - **`CLAUDE.md` status + layout**: reflects that the CLI is a smoke binary and library coverage runs through `cyrius test`; CI/Release section drops the distlib gate and adds the deferral note
@@ -43,7 +47,7 @@ All gates pass locally on this branch:
 - `cyrius bench tests/hisab.bcyr` — 22 benchmarks complete
 
 ### Notes
-- `lib/collision_core.cyr` and `lib/collision_mesh.cyr` are present but not validated against cc5 5.7.7 in 2.2.2. They were appended at the bottom of the prior `src/main.cyr` (after `syscall(SYS_EXIT)`, so the parser saw them but `fn main` never used them) and the parser tripped on their `struct` decls — symptom of an upstream parse-state drift that surfaces only inside a large compilation unit. The minimal `src/main.cyr` no longer pulls them in. They'll be re-validated when the [lib] block is restored
+- `lib/collision_core.cyr` and `lib/collision_mesh.cyr` are present in `lib/` but excluded from the `[lib]` distlib bundle — both have pre-existing parse issues against cc5 5.7.x (originally surfaced because the prior `src/main.cyr` had three orphan `include` lines after `syscall(SYS_EXIT)`, which the parser still walked). Combined size ~33 KB, which would push the bundle past cc5 5.7.8's 512 KB input_buf anyway. Restoration is gated on cc5 5.7.9's input_buf bump to 1 MB — see roadmap
 - `lib/` still mixes vendored stdlib + project source — a yukti-style split (project source in `src/*.cyr`, `lib/` purely deps + gitignored) is a natural future restructure but out of 2.2.2's scope
 
 ## [2.2.1] - 2026-04-26 — Cyrius 5.7.7 modernization + distlib bundle

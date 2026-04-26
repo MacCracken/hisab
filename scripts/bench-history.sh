@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-# Run criterion benchmarks, append results to CSV history, and generate benchmarks.md
-# with a 3-point trend table (baseline → previous → current).
+# Run hisab's Cyrius benchmark suite, append results to CSV history,
+# and regenerate benchmarks.md with a 3-point trend table
+# (baseline → middle → current).
 #
 # Usage:
-#   ./scripts/bench-history.sh              # defaults to bench-history.csv
-#   ./scripts/bench-history.sh results.csv  # custom output file
+#   ./scripts/bench-history.sh                      # default CSV: bench-history.csv
+#   ./scripts/bench-history.sh results.csv         # custom output
+#   ./scripts/bench-history.sh "" tests/foo.bcyr   # custom suite
+set -euo pipefail
 
 HISTORY_FILE="${1:-bench-history.csv}"
+SUITE="${2:-tests/hisab.bcyr}"
 BENCHMARKS_MD="benchmarks.md"
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
 
-# Create header if file doesn't exist
 if [ ! -f "$HISTORY_FILE" ]; then
     echo "timestamp,commit,branch,benchmark,estimate_ns" > "$HISTORY_FILE"
 fi
@@ -22,55 +23,58 @@ fi
 echo "╔══════════════════════════════════════════╗"
 echo "║         hisab benchmark suite            ║"
 echo "╠══════════════════════════════════════════╣"
-echo "║  commit: $COMMIT                          ║"
-echo "║  branch: $BRANCH                            ║"
-echo "║  date:   $TIMESTAMP   ║"
+echo "║  commit: $COMMIT"
+echo "║  branch: $BRANCH"
+echo "║  date:   $TIMESTAMP"
+echo "║  suite:  $SUITE"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# Run benchmarks and capture output, stripping ANSI escape codes
-BENCH_OUTPUT=$(cargo bench --bench benchmarks 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
-
-# Show full output
+# `cyrius bench` emits one line per benchmark in the form:
+#   <name> ... <median>{ps|ns|us|µs|ms|s} (per iter)
+# The exact format is owned by lib/bench.cyr; this parser tolerates
+# extra columns by anchoring on "ns/iter", "ms/iter", etc.
+BENCH_OUTPUT=$(cyrius bench "$SUITE" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 echo "$BENCH_OUTPUT"
 echo ""
 
-# Collect results for CSV
+normalize_to_ns() {
+    local val="$1"
+    local unit="$2"
+    case "$unit" in
+        ps)        awk -v v="$val" 'BEGIN{printf "%.4f", v / 1000}' ;;
+        ns)        echo "$val" ;;
+        us|µs)     awk -v v="$val" 'BEGIN{printf "%.4f", v * 1000}' ;;
+        ms)        awk -v v="$val" 'BEGIN{printf "%.4f", v * 1000000}' ;;
+        s)         awk -v v="$val" 'BEGIN{printf "%.4f", v * 1000000000}' ;;
+        *)         echo "$val" ;;
+    esac
+}
+
 declare -a BENCH_NAMES=()
 declare -a BENCH_NS=()
 
-PREV_LINE=""
 while IFS= read -r line; do
-    if [[ "$line" == *"time:"*"["* ]]; then
-        BENCH_NAME=$(echo "$line" | sed -E 's/[[:space:]]*time:.*//' | xargs)
-        if [ -z "$BENCH_NAME" ]; then
-            BENCH_NAME=$(echo "$PREV_LINE" | xargs)
-        fi
-
-        VALS=$(echo "$line" | sed -E 's/.*\[(.+)\]/\1/')
-        MEDIAN=$(echo "$VALS" | awk '{print $3}')
-        UNIT=$(echo "$VALS" | awk '{print $4}')
-
-        # Normalize to nanoseconds
-        case "$UNIT" in
-            ps)  NS=$(echo "$MEDIAN" | awk '{printf "%.4f", $1 / 1000}') ;;
-            ns)  NS="$MEDIAN" ;;
-            µs|us)  NS=$(echo "$MEDIAN" | awk '{printf "%.4f", $1 * 1000}') ;;
-            ms)  NS=$(echo "$MEDIAN" | awk '{printf "%.4f", $1 * 1000000}') ;;
-            s)   NS=$(echo "$MEDIAN" | awk '{printf "%.4f", $1 * 1000000000}') ;;
-            *)   NS="$MEDIAN" ;;
-        esac
-
+    # Match lines containing "<num><unit>/iter" or trailing "<num> <unit>"
+    if echo "$line" | grep -qE '([0-9.]+)[[:space:]]*(ps|ns|µs|us|ms|s)(/iter)?'; then
+        # Pull benchmark name (before "..." or first whitespace burst)
+        BENCH_NAME=$(echo "$line" | sed -E 's/[[:space:]]+(\.{2,}|[0-9]).*$//' | xargs)
+        [ -z "$BENCH_NAME" ] && continue
+        # Last <num><unit> in the line wins
+        TOKEN=$(echo "$line" | grep -oE '[0-9]+(\.[0-9]+)?[[:space:]]*(ps|ns|µs|us|ms|s)' | tail -n 1)
+        VAL=$(echo "$TOKEN" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n 1)
+        UNIT=$(echo "$TOKEN" | grep -oE '(ps|ns|µs|us|ms|s)$')
+        NS=$(normalize_to_ns "$VAL" "$UNIT")
         echo "${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${NS}" >> "$HISTORY_FILE"
         BENCH_NAMES+=("$BENCH_NAME")
         BENCH_NS+=("$NS")
     fi
-    PREV_LINE="$line"
 done <<< "$BENCH_OUTPUT"
 
 COUNT=${#BENCH_NAMES[@]}
 
-# Generate benchmarks.md with 3-point trend using python
+# Trend table (3-point). Skip if Python missing — CSV is the primary record.
+if command -v python3 >/dev/null 2>&1; then
 python3 - "$HISTORY_FILE" "$BENCHMARKS_MD" <<'PYEOF'
 import csv, sys
 from collections import OrderedDict
@@ -82,10 +86,7 @@ rows = list(csv.DictReader(open(history_file)))
 if not rows:
     sys.exit(0)
 
-# Get unique timestamps (runs) in order
 timestamps = list(OrderedDict.fromkeys(r["timestamp"] for r in rows))
-
-# Pick up to 3: first, middle-ish, last
 if len(timestamps) >= 3:
     pick = [timestamps[0], timestamps[len(timestamps)//2], timestamps[-1]]
 elif len(timestamps) == 2:
@@ -93,20 +94,20 @@ elif len(timestamps) == 2:
 else:
     pick = [timestamps[0]]
 
-# Deduplicate while preserving order
 seen = set()
 pick = [t for t in pick if not (t in seen or seen.add(t))]
 
-# Build data: {benchmark: {timestamp: ns}}
 data = {}
 commits = {}
 for r in rows:
     ts = r["timestamp"]
     if ts in pick:
-        data.setdefault(r["benchmark"], {})[ts] = float(r["estimate_ns"])
+        try:
+            data.setdefault(r["benchmark"], {})[ts] = float(r["estimate_ns"])
+        except ValueError:
+            continue
         commits[ts] = r["commit"]
 
-# Labels for columns
 labels = []
 for i, ts in enumerate(pick):
     if i == 0 and len(pick) > 1:
@@ -139,23 +140,21 @@ with open(md_file, "w") as f:
     ts_last = pick[-1]
     f.write(f"Latest: **{ts_last}** — commit `{commits[ts_last]}`\n\n")
     if len(pick) >= 3:
-        f.write(f"Tracking: `{commits[pick[0]]}` (baseline) → `{commits[pick[1]]}` (optimized) → `{commits[pick[-1]]}` (current)\n\n")
+        f.write(f"Tracking: `{commits[pick[0]]}` (baseline) → `{commits[pick[1]]}` (mid) → `{commits[pick[-1]]}` (current)\n\n")
 
-    # Group by prefix
     groups = OrderedDict()
     for bench in data:
-        group = bench.split("/")[0]
+        group = bench.split("/")[0] if "/" in bench else bench
         groups.setdefault(group, []).append(bench)
 
     for group, benches in groups.items():
         f.write(f"## {group}\n\n")
-        # Header
         cols = " | ".join(labels)
         f.write(f"| Benchmark | {cols} |\n")
         f.write(f"|-----------|{'|'.join(['------'] * len(labels))}|\n")
 
         for bench in benches:
-            name = bench.split("/")[1]
+            name = bench.split("/", 1)[1] if "/" in bench else bench
             vals = data[bench]
             cells = []
             for ts in pick:
@@ -164,7 +163,6 @@ with open(md_file, "w") as f:
                     cells.append("—")
                 else:
                     cell = fmt_ns(ns)
-                    # Add delta vs baseline if not the first column
                     if ts != pick[0] and pick[0] in vals:
                         cell += delta(vals[pick[0]], ns)
                     cells.append(cell)
@@ -176,9 +174,10 @@ with open(md_file, "w") as f:
 
 print(f"  Generated {md_file} with {len(pick)}-point trend across {len(data)} benchmarks")
 PYEOF
+fi
 
 echo "════════════════════════════════════════════"
 echo "  ${COUNT} benchmarks recorded"
 echo "  CSV:      ${HISTORY_FILE}"
-echo "  Markdown: ${BENCHMARKS_MD}"
+[ -f "$BENCHMARKS_MD" ] && echo "  Markdown: ${BENCHMARKS_MD}"
 echo "════════════════════════════════════════════"

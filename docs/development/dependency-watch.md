@@ -4,11 +4,14 @@ Tracked dependency version constraints and upgrade paths.
 
 ## Cyrius Toolchain
 
-**Status:** Pinned to 4.10.3 via `.cyrius-toolchain`
+**Status:** Pinned to **5.7.7** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
 
-**Note:** Cyrius 4.10.3 provides `lib/linalg.cyr` (957 lines) with LU, Cholesky, QR, SVD, eigendecomposition. This is a critical dependency — hisab's `linalg_ext.cyr` wraps these functions.
+**Note:** Cyrius stdlib provides `lib/linalg.cyr` with LU, Cholesky, QR, SVD, eigendecomposition. This is a critical dependency — hisab's `linalg_ext.cyr` wraps these functions.
 
-**Upstream issue:** `lib/matrix.cyr` has integer overflow in `mat_new(rows, cols)` allocation size calculation. Tracked for cyrius 5.0.1.
+**Upstream notes (5.x line):**
+- 5.0+: `lib/matrix.cyr` overflow class addressed; SVD precision improvements landed.
+- 5.5.x: structured-deps protocol, `cyrius distlib` multi-profile, `#deprecated("...")` attribute, `cyrius vet`/`cyrius lint`/`cyrius fmt` matured.
+- 5.7.x: cyrius-ts JSX AST (not consumed here), fixup-table cap 262K → 1M, `cyrius build` atomic-output (failed compile no longer destroys an existing binary).
 
 ## Cyrius stdlib modules (23 used)
 
@@ -27,9 +30,9 @@ Tracked dependency version constraints and upgrade paths.
 | assert, bench | Test/benchmark framework | Stable |
 | callback | Higher-order functions | Stable |
 
-## sakshi (external dependency)
+## sakshi (first-party dependency)
 
-**Status:** `sakshi` 0.9.0 via git
+**Status:** `sakshi` **2.1.0** via git, modules path `dist/sakshi.cyr`
 
 **Purpose:** Structured logging (timestamps, levels, categories)
 

@@ -2,7 +2,11 @@ name: Release
 
 on:
   push:
-    tags: ['[0-9]*']
+    # Accept both `v1.2.3` and `1.2.3` tag styles. The version-verify
+    # step below enforces semver shape + match against VERSION file.
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
@@ -12,8 +16,8 @@ jobs:
     name: CI Gate
     uses: ./.github/workflows/ci.yml
 
-  release:
-    name: Build & Release
+  build:
+    name: Build Release
     needs: [ci]
     runs-on: ubuntu-latest
     steps:
@@ -22,12 +26,16 @@ jobs:
       - name: Verify version
         run: |
           FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          TAG_VERSION="${GITHUB_REF_NAME}"
-          test "$FILE_VERSION" = "$TAG_VERSION" || { echo "VERSION ($FILE_VERSION) != tag ($TAG_VERSION)"; exit 1; }
+          TAG="${GITHUB_REF_NAME#v}"   # strip optional leading 'v' so v1.3.0 == 1.3.0
+          echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "tag ($TAG) is not semver x.y.z"; exit 1; }
+          [ "$FILE_VERSION" = "$TAG" ] || {
+            echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
+          echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
           echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
@@ -39,14 +47,93 @@ jobs:
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
 
+      - name: Resolve deps
+        run: cyrius deps
+
+      - name: Verify dep hashes
+        run: |
+          if [ -f cyrius.lock ]; then
+            cyrius deps --verify
+          fi
+
+      - name: Regenerate dist bundle
+        run: |
+          cyrius distlib
+          echo "dist/hisab.cyr: $(wc -c < dist/hisab.cyr) bytes"
+
       - name: Build
         run: |
-          cyrius deps
           mkdir -p build
-          cyrius build src/main.cyr build/${{ github.event.repository.name }}
+          cyrius build src/main.cyr build/hisab
+          echo "hisab: $(wc -c < build/hisab) bytes"
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - name: Test
+        run: |
+          for f in tests/*.tcyr; do
+            [ -f "$f" ] || continue
+            cyrius test "$f"
+          done
+
+      - name: Fuzz
+        run: |
+          for f in tests/*.fcyr; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f" .fcyr)
+            cyrius build "$f" "build/$name"
+            timeout 10 "build/$name" || { echo "FUZZ CRASH: $name"; exit 1; }
+          done
+
+      - name: Clean toolchain artifacts
+        run: rm -f cyrius-*.tar.gz
+
+      - name: Archive
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          git archive --format=tar.gz --prefix="hisab-${TAG}/" -o "hisab-${TAG}-src.tar.gz" HEAD
+          # Ship the distlib bundle so consumers can pull a single
+          # self-contained module via [deps.hisab] modules = ["dist/hisab.cyr"].
+          cp dist/hisab.cyr "hisab-${TAG}.cyr"
+          if [ -f build/hisab ]; then
+            cp build/hisab "hisab-${TAG}-x86_64-linux"
+          fi
+          sha256sum hisab-*.tar.gz hisab-*.cyr hisab-*-linux 2>/dev/null > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
         with:
-          generate_release_notes: true
-          files: build/*
+          name: release-artifacts
+          path: |
+            hisab-*.tar.gz
+            hisab-*.cyr
+            hisab-*-linux
+            cyrius.lock
+            SHA256SUMS
+        if: always()
+
+  release:
+    name: Create GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+      - name: Changelog
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          awk "/^## \\[${TAG}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md > /tmp/body.md
+          # Fallback to legacy "## TAG" header if "## [TAG]" not found
+          if [ ! -s /tmp/body.md ]; then
+            awk "/^## ${TAG}/{found=1; next} /^## /{if(found) exit} found{print}" CHANGELOG.md > /tmp/body.md
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "hisab ${{ github.ref_name }}"
+          body_path: /tmp/body.md
+          prerelease: ${{ startsWith(github.ref_name, '0.') || startsWith(github.ref_name, 'v0.') }}
+          files: |
+            hisab-*.tar.gz
+            hisab-*.cyr
+            hisab-*-linux
+            cyrius.lock
+            SHA256SUMS

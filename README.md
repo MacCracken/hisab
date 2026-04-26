@@ -28,9 +28,20 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 ## Quick Start
 
 ```toml
-# cyrius.toml
+# cyrius.cyml
+[package]
+name        = "your-project"
+version     = "${file:VERSION}"
+language    = "cyrius"
+cyrius      = "5.7.7"
+
 [deps]
 stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "matrix", "linalg", "tagged", "fnptr"]
+
+[deps.hisab]
+git     = "https://github.com/MacCracken/hisab.git"
+tag     = "2.2.1"
+modules = ["dist/hisab.cyr"]
 ```
 
 ```cyrius

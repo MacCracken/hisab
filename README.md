@@ -33,15 +33,22 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "5.7.7"
+cyrius      = "5.7.8"
 
 [deps]
 stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "matrix", "linalg", "tagged", "fnptr"]
 
+# 2.2.2 ships per-module includes — no flat distlib bundle yet.
+# (cc5 5.7.8's 512 KB input_buf can't fit the full 544 KB bundle;
+# upstream input_buf expansion is queued for a later cc5 release.)
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.2.1"
-modules = ["dist/hisab.cyr"]
+tag     = "2.2.2"
+modules = [
+    "lib/f64_util.cyr", "lib/error.cyr",
+    "lib/vec3.cyr", "lib/quat.cyr", "lib/mat4.cyr",
+    # ...add the modules your code uses
+]
 ```
 
 ```cyrius
@@ -100,14 +107,14 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.2.0 |
+| Version | 2.2.2 |
 | Library | 33 files, 15,676 lines of Cyrius |
 | Tests | 821 assertions across 4 test suites |
 | Benchmarks | 22 operations |
 | Fuzz targets | 5 with invariant checks |
-| Binary | 511KB static ELF |
-| Toolchain | Cyrius 4.10.3 |
-| Dependencies | 1 (sakshi) |
+| CLI binary | ~140 KB static ELF (`build/hisab` — version smoke test only) |
+| Toolchain | Cyrius 5.7.8 |
+| Dependencies | 1 (sakshi 2.1.0) |
 | Security | P(-1) audited, 25 of 31 issues fixed |
 
 ## License

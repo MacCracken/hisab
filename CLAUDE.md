@@ -9,9 +9,9 @@ differential geometry, symbolic algebra.
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (sovereign systems language, compiled by cc5)
-- **Toolchain**: Cyrius 5.7.7 (`cyrius.cyml: cyrius = "5.7.7"`)
+- **Toolchain**: Cyrius 5.7.8 (`cyrius.cyml: cyrius = "5.7.8"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.2.1 — Cyrius 5.7.7 modernization + `dist/hisab.cyr` distlib bundle
+- **Status**: 2.2.2 — actually compiles under cc5 5.7.8 (CLI smoke binary builds; library validated via tests). Distlib bundle deferred until upstream cc5 5.7.9 raises input_buf to 1 MB.
 
 ## Consumers
 
@@ -30,7 +30,7 @@ cyrius bench tests/hisab.bcyr            # run benchmarks
 
 - **Cyrius stdlib** — `syscalls`, `string`, `alloc`, `str`, `fmt`, `vec`,
   `io`, `args`, `assert`, `math`, `matrix`, `linalg`, `tagged`, `fnptr`,
-  `bench`, `callback` (ships with Cyrius >= 5.7.7)
+  `bench`, `callback` (ships with Cyrius >= 5.7.8)
 - **sakshi** 2.1.0 — structured logging (first-party)
 
 No external deps. No FFI. No libc. All first-party, pinned in
@@ -39,10 +39,11 @@ No external deps. No FFI. No libc. All first-party, pinned in
 ## Layout
 
 ```
-src/main.cyr         — CLI entry point
+src/main.cyr         — CLI smoke binary (prints version, exits — does NOT
+                       include the library; library coverage is in tests/)
 lib/                 — vendored deps (managed by `cyrius deps`) + math modules
-dist/hisab.cyr       — distlib bundle (regenerated via `cyrius distlib`,
-                       consumed by downstream projects via [deps.hisab])
+                       (consumers pull project modules directly via
+                       [deps.hisab] modules = ["lib/<file>.cyr", ...])
 examples/            — small demos (basic_math.cyr)
 tests/
   hisab.tcyr         — primary assertion suite
@@ -125,7 +126,7 @@ VERSION              — single source of truth for version
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "5.7.7"` in `cyrius.cyml`. CI and release both grep
+- **Toolchain pin**: `cyrius = "5.7.8"` in `cyrius.cyml`. CI and release both grep
   the manifest; no hardcoded versions in YAML
 - **Tag filter**: release triggers on `tags: ['v?[0-9]+.[0-9]+.[0-9]+']` (with or without `v` prefix)
 - **Version-verify gate**: release asserts `VERSION == git tag` before building
@@ -134,9 +135,12 @@ VERSION              — single source of truth for version
 - **Fmt gate**: `cyrius fmt --check` per source — drift fails the build
 - **Vet gate**: `cyrius vet src/main.cyr`
 - **Lock gate**: `cyrius deps --verify` against committed `cyrius.lock` (when present)
-- **Distlib gate**: `cyrius distlib` regenerates `dist/hisab.cyr`; CI fails on drift
-  (run `cyrius distlib` locally before committing changes to `lib/*.cyr` or `[lib]`)
 - **Test/Fuzz/Bench gates**: every `tests/*.tcyr`, `tests/*.fcyr`, `tests/*.bcyr` runs
+- **Distlib**: deferred — `[lib] modules = []` is intentional for 2.2.2.
+  The flat 33-file bundle is 544 KB and exceeds cc5 5.7.8's 512 KB
+  input_buf. cc5 5.7.9 raises input_buf to 1 MB (per the 5.7.8 release
+  header) — restore the full `[lib]` list (see git history pre-2.2.2)
+  when we bump the toolchain pin to 5.7.9.
 - **Concurrency**: CI uses `cancel-in-progress: true` keyed on workflow + ref
 
 ## DO NOT

@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **5.7.8**. Stdlib `linalg.cyr` provides dense decompositions.
+> Written in Cyrius. Toolchain: **5.7.10**. Stdlib `linalg.cyr` provides dense decompositions.
 
 ## Scope
 
@@ -14,31 +14,30 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 ## Current -- v2.2.2
 
 - **33 lib files, 15,676 lines**
-- **821 test assertions**, 22 benchmarks, 5 fuzz targets
+- **825 test assertions**, 22 benchmarks, 5 fuzz targets
 - **CLI smoke binary** ~140 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~505 KB (32 modules) — fits cc5 5.7.8's 512 KB input_buf
-- P(-1) audit: 26/31 fixed.
+- **`dist/hisab.cyr` distlib bundle** ~544 KB / 16,200 lines (all **34 modules**) — fits cc5 5.7.10's 1 MB input_buf with ~480 KB headroom
+- P(-1) audit: 26/31 fixed
 
 ---
 
-## 2.3.0 -- Restore collision modules (gated on cc5 5.7.9)
+## 2.3.0 -- Collision module audit (algorithmic correctness)
 
-cc5 5.7.9 raises `input_buf` from 512 KB → 1 MB (announced in the cc5
-5.7.8 release header). That ~40 % bump unblocks adding back the two
-modules currently excluded from `dist/hisab.cyr`. The bundle today has
-~7 KB of headroom under the 512 KB cap; on 5.7.9 we get ~520 KB of
-headroom — easily enough for both files plus future growth.
+`collision_core.cyr` and `collision_mesh.cyr` now compile and link, but
+the algorithms themselves carry pre-existing bugs from the 2.2.0 port —
+they were added back then but never actually exercised because they sat
+outside the build chain (orphan-include-after-syscall trick in the old
+`src/main.cyr`). 2.2.2 only smoke-tests the API surface (`contact_new` +
+`ColContact_*` accessors, `detect_islands`); the heavy algorithms need a
+correctness pass.
 
-When cc5 5.7.9 ships:
-
-- [ ] Bump toolchain pin in `cyrius.cyml` 5.7.8 → 5.7.9
-- [ ] Diagnose + fix the pre-existing parse issue in `lib/collision_core.cyr` (compiles standalone but trips inside larger compilation units — likely an upstream parse-state interaction with a 5.7.x-reserved keyword or syntax shift; was masked in 2.2.1 by the orphan-include trick in `src/main.cyr`)
-- [ ] Same diagnosis + fix for `lib/collision_mesh.cyr` (Delaunay triangulation, half-edge mesh, island detection — 522 lines, written but never validated against cc5 5.7.x)
-- [ ] Restore `"lib/collision_core.cyr"` and `"lib/collision_mesh.cyr"` in `cyrius.cyml [lib] modules` (after the foundation/types section, before calculus — see git history pre-2.2.2 for the prior position)
-- [ ] Regenerate + commit `dist/hisab.cyr` (CI distlib drift gate enforces this)
-- [ ] Add coverage in `tests/modules.tcyr` for the MPR / impulse-solver / Delaunay paths that 2.2.0 added but never exercised post-port
-
-After this lands, hisab is back to "all 33 modules ship in the bundle."
+- [ ] **`convex_hull_2d`** — `vec: index < 0` runtime bounds check on a 5-point input (square + interior point). Insertion-sort + monotone-chain logic needs review
+- [ ] **`triangulate_polygon`** (ear clipping) — likely similar boundary issues; not exercised yet
+- [ ] **`mpr_intersect`** + **`mpr_penetration`** — XenoCollide / Minkowski Portal Refinement in 3D; correctness against known test fixtures (sphere-sphere, OBB-OBB)
+- [ ] **`sequential_impulse`** + **`solve_pgs`** — projected Gauss-Seidel solver for contact constraints; verify convergence + restitution behavior
+- [ ] **`delaunay_2d`** (Bowyer-Watson) — needs a numerical-stability pass alongside basic correctness fixtures
+- [ ] **`halfedge_from_triangles`** + `halfedge_adjacent_faces` + `halfedge_is_boundary` — half-edge mesh accessors; check twin-pointer wiring
+- [ ] Add coverage to `tests/modules.tcyr` as each algorithm is fixed
 
 ## 2.3.x -- CGA + matrix overflow guards
 

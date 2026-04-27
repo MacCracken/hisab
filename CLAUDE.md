@@ -9,9 +9,9 @@ differential geometry, symbolic algebra.
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (sovereign systems language, compiled by cc5)
-- **Toolchain**: Cyrius 5.7.8 (`cyrius.cyml: cyrius = "5.7.8"`)
+- **Toolchain**: Cyrius 5.7.10 (`cyrius.cyml: cyrius = "5.7.10"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.2.2 — actually compiles under cc5 5.7.8. CLI smoke binary builds; 32-module distlib bundle (~505 KB, fits cc5's 512 KB input_buf) ships at `dist/hisab.cyr` and is consumer-tested. Library validated via tests (821/821).
+- **Status**: 2.2.2 — compiles cleanly under cc5 5.7.10. CLI smoke binary builds; **full 34-module distlib bundle** (~544 KB / 16,200 lines, fits cc5 5.7.10's 1 MB input_buf with ~480 KB headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (825/825).
 
 ## Consumers
 
@@ -30,7 +30,7 @@ cyrius bench tests/hisab.bcyr            # run benchmarks
 
 - **Cyrius stdlib** — `syscalls`, `string`, `alloc`, `str`, `fmt`, `vec`,
   `io`, `args`, `assert`, `math`, `matrix`, `linalg`, `tagged`, `fnptr`,
-  `bench`, `callback` (ships with Cyrius >= 5.7.8)
+  `bench`, `callback` (ships with Cyrius >= 5.7.10)
 - **sakshi** 2.1.0 — structured logging (first-party)
 
 No external deps. No FFI. No libc. All first-party, pinned in
@@ -42,9 +42,9 @@ No external deps. No FFI. No libc. All first-party, pinned in
 src/main.cyr         — CLI smoke binary (prints version, exits — does NOT
                        include the library; library coverage is in tests/)
 lib/                 — vendored deps (managed by `cyrius deps`) + math modules
-dist/hisab.cyr       — 32-module distlib bundle (~505 KB), regenerated via
-                       `cyrius distlib`. Consumers pull this single file via
-                       [deps.hisab] modules = ["dist/hisab.cyr"]
+dist/hisab.cyr       — full 34-module distlib bundle (~544 KB / 16,200 lines),
+                       regenerated via `cyrius distlib`. Consumers pull this
+                       single file via [deps.hisab] modules = ["dist/hisab.cyr"]
 examples/            — small demos (basic_math.cyr)
 tests/
   hisab.tcyr         — primary assertion suite
@@ -127,7 +127,7 @@ VERSION              — single source of truth for version
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "5.7.8"` in `cyrius.cyml`. CI and release both grep
+- **Toolchain pin**: `cyrius = "5.7.10"` in `cyrius.cyml`. CI and release both grep
   the manifest; no hardcoded versions in YAML
 - **Tag filter**: release triggers on `tags: ['v?[0-9]+.[0-9]+.[0-9]+']` (with or without `v` prefix)
 - **Version-verify gate**: release asserts `VERSION == git tag` before building

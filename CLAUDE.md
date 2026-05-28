@@ -8,10 +8,10 @@ differential geometry, symbolic algebra.
 
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
-- **Language**: Cyrius (sovereign systems language, compiled by cc5)
-- **Toolchain**: Cyrius 5.7.10 (`cyrius.cyml: cyrius = "5.7.10"`)
+- **Language**: Cyrius (sovereign systems language, compiled by cycc)
+- **Toolchain**: Cyrius 6.0.14 (`cyrius.cyml: cyrius = "6.0.14"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.2.2 — compiles cleanly under cc5 5.7.10. CLI smoke binary builds; **full 34-module distlib bundle** (~544 KB / 16,200 lines, fits cc5 5.7.10's 1 MB input_buf with ~480 KB headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (825/825).
+- **Status**: 2.3.0 — compiles cleanly under cycc 6.0.14. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~545 KB / 16,195 lines, fits cycc 6.0.14's 1 MB input_buf with ~480 KB headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (825/825).
 
 ## Consumers
 
@@ -30,7 +30,7 @@ cyrius bench tests/hisab.bcyr            # run benchmarks
 
 - **Cyrius stdlib** — `syscalls`, `string`, `alloc`, `str`, `fmt`, `vec`,
   `io`, `args`, `assert`, `math`, `matrix`, `linalg`, `tagged`, `fnptr`,
-  `bench`, `callback` (ships with Cyrius >= 5.7.10)
+  `bench`, `callback` (ships with Cyrius >= 6.0.14)
 - **sakshi** 2.1.0 — structured logging (first-party)
 
 No external deps. No FFI. No libc. All first-party, pinned in
@@ -41,8 +41,11 @@ No external deps. No FFI. No libc. All first-party, pinned in
 ```
 src/main.cyr         — CLI smoke binary (prints version, exits — does NOT
                        include the library; library coverage is in tests/)
-lib/                 — vendored deps (managed by `cyrius deps`) + math modules
-dist/hisab.cyr       — full 34-module distlib bundle (~544 KB / 16,200 lines),
+src/*.cyr            — the 34 math modules (the library source). Self-contained
+                       (no `include` lines); stdlib resolves via [deps] stdlib
+lib/                 — vendored stdlib + first-party deps ONLY (managed by
+                       `cyrius deps`) — no project source here
+dist/hisab.cyr       — full 34-module distlib bundle (~545 KB / 16,195 lines),
                        regenerated via `cyrius distlib`. Consumers pull this
                        single file via [deps.hisab] modules = ["dist/hisab.cyr"]
 examples/            — small demos (basic_math.cyr)
@@ -123,11 +126,11 @@ VERSION              — single source of truth for version
 - **Source files only need project includes** — stdlib + first-party deps auto-resolve from `cyrius.cyml`
 - **Every buffer is a contract**: `var buf[N]` = N bytes
 - **Programs call `main()` at top level**: `var exit_code = main(); syscall(60, exit_code);`
-- **`cyrius build` handles everything** — never shell out to `cc5` directly
+- **`cyrius build` handles everything** — never shell out to `cycc` directly
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "5.7.10"` in `cyrius.cyml`. CI and release both grep
+- **Toolchain pin**: `cyrius = "6.0.14"` in `cyrius.cyml`. CI and release both grep
   the manifest; no hardcoded versions in YAML
 - **Tag filter**: release triggers on `tags: ['v?[0-9]+.[0-9]+.[0-9]+']` (with or without `v` prefix)
 - **Version-verify gate**: release asserts `VERSION == git tag` before building
@@ -151,7 +154,7 @@ VERSION              — single source of truth for version
 - Do not hardcode toolchain versions in CI YAML — read `cyrius.cyml`
 - Do not commit `build/` — it's regenerated per-build
 - Do not re-vendor stdlib or first-party deps into `src/` — `cyrius deps` manages `lib/`
-- Do not shell out to `cc5` directly — always go through `cyrius <subcommand>`
+- Do not shell out to `cycc` directly — always go through `cyrius <subcommand>`
 - Do not use `sys_system()` with unsanitized input — command injection risk
 
 ## Documentation Structure

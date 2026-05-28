@@ -33,17 +33,17 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "5.7.10"
+cyrius      = "6.0.14"
 
 [deps]
 stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "matrix", "linalg", "tagged", "fnptr"]
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.2.2"
-modules = ["dist/hisab.cyr"]   # ~544 KB self-contained bundle (all 34 modules)
+tag     = "2.3.0"
+modules = ["dist/hisab.cyr"]   # ~545 KB self-contained bundle (all 34 modules)
 # Or pull individual files for a smaller compilation unit:
-# modules = ["lib/f64_util.cyr", "lib/error.cyr", "lib/vec3.cyr", ...]
+# modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec3.cyr", ...]
 ```
 
 ```cyrius
@@ -108,7 +108,7 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 | Benchmarks | 22 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~140 KB static ELF (`build/hisab` — version smoke test only) |
-| Toolchain | Cyrius 5.7.10 |
+| Toolchain | Cyrius 6.0.14 |
 | Dependencies | 1 (sakshi 2.1.0) |
 | Security | P(-1) audited, 25 of 31 issues fixed |
 

@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **5.7.10**. Stdlib `linalg.cyr` provides dense decompositions.
+> Written in Cyrius. Toolchain: **6.0.14**. Stdlib `linalg.cyr` provides dense decompositions.
 
 ## Scope
 
@@ -16,7 +16,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **33 lib files, 15,676 lines**
 - **825 test assertions**, 22 benchmarks, 5 fuzz targets
 - **CLI smoke binary** ~140 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~544 KB / 16,200 lines (all **34 modules**) — fits cc5 5.7.10's 1 MB input_buf with ~480 KB headroom
+- **`dist/hisab.cyr` distlib bundle** ~545 KB / 16,195 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ~480 KB headroom
 - P(-1) audit: 26/31 fixed
 
 ---

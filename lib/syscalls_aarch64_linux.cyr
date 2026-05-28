@@ -1,0 +1,677 @@
+# syscalls_aarch64_linux.cyr — Linux aarch64 syscall wrappers
+# Usage: include "lib/syscalls.cyr" (selector picks this peer
+#        when CYRIUS_ARCH_AARCH64 is defined; do NOT include this
+#        file directly — go through the selector so cross-arch
+#        builds work).
+#
+# Companion peer: lib/syscalls_x86_64_linux.cyr.
+#
+# Numbers: Linux generic syscall table from
+# include/uapi/asm-generic/unistd.h. Wholly different from
+# x86_64's table — `SYS_OPEN = 56` here is `io_setup` on x86_64,
+# `SYS_STAT = 4` on x86_64 is `pivot_root` on aarch64. The split
+# fixes the yukti regression filed 2026-04-19 (yukti
+# `test_query_permissions_dev_null` SIGSEGV'd because cross-built
+# aarch64 binaries inherited x86_64 numbers verbatim from the
+# pre-v5.4.11 monolithic lib/syscalls.cyr).
+#
+# At-family wrappers: aarch64 has no bare `open`, `stat`, `fstat`,
+# `mkdir`, `rmdir`, `unlink`, `chmod`, `access`, `pipe`, `fork`,
+# `dup2`, `epoll_create`, `epoll_wait`, `poll`, `pause` syscalls.
+# Wrappers below route to the at-family equivalents (`openat`,
+# `newfstatat`, `mkdirat`, `unlinkat`, `fchmodat`, `faccessat`,
+# `pipe2`, `clone(SIGCHLD)`, `dup3`, `epoll_create1`,
+# `epoll_pwait`, `ppoll`) using `AT_FDCWD = -100` for the
+# directory-fd argument so behavior matches the x86_64 wrappers.
+#
+# Most cross-arch-stable Linux constants (CLONE_*, PROT_*, MAP_*,
+# FUTEX_*, O_*, signals, mount flags, errno, …) are duplicated
+# from the x86_64 peer in this file. Drift risk is low (kernel
+# UAPI headers anchor these values across all Linux arches);
+# extraction to a shared `lib/syscalls_linux_constants.cyr` is a
+# v5.4.13 closeout cleanup candidate if duplication becomes
+# painful.
+
+# ================================================================
+# Syscall numbers (aarch64 — from include/uapi/asm-generic/unistd.h)
+# ================================================================
+enum SysNr {
+    # File I/O
+    SYS_READ = 63;
+    SYS_WRITE = 64;
+    SYS_CLOSE = 57;
+    SYS_LSEEK = 62;
+    SYS_DUP = 23;
+    SYS_DUP3 = 24;
+    SYS_FCNTL = 25;
+    SYS_IOCTL = 29;
+
+    # At-family (aarch64 has no bare open/stat/mkdir/etc.)
+    SYS_OPENAT = 56;        # → sys_open  (AT_FDCWD)
+    SYS_NEWFSTATAT = 79;    # → sys_stat  (AT_FDCWD) and sys_fstat (AT_EMPTY_PATH)
+    SYS_FSTAT = 80;         # bare fstat exists; takes fd
+    SYS_MKDIRAT = 34;       # → sys_mkdir (AT_FDCWD)
+    SYS_UNLINKAT = 35;      # → sys_rmdir (AT_REMOVEDIR) and sys_unlink
+    SYS_SYMLINKAT = 36;     # → sys_symlink (AT_FDCWD)
+    SYS_READLINKAT = 78;    # → sys_readlink (AT_FDCWD)
+    SYS_FCHMODAT = 53;      # → sys_chmod (AT_FDCWD)
+    SYS_FACCESSAT = 48;     # → sys_access (AT_FDCWD)
+    SYS_PIPE2 = 59;         # → sys_pipe (flags=0)
+    SYS_PPOLL = 73;         # → sys_pause (NULL fds, NULL timeout)
+
+    # Directory + cwd
+    SYS_GETCWD = 17;
+    SYS_CHDIR = 49;
+
+    # Process control
+    SYS_CLONE = 220;        # → sys_fork (clone(SIGCHLD,...)); also thread spawning
+    SYS_EXECVE = 221;
+    SYS_EXIT = 93;
+    SYS_EXIT_GROUP = 94;
+    SYS_WAIT4 = 260;
+    SYS_KILL = 129;
+    SYS_GETPID = 172;
+    SYS_GETPPID = 173;
+    SYS_GETTID = 178;
+    SYS_SETSID = 157;
+    SYS_SET_TID_ADDRESS = 96;
+
+    # Identity
+    SYS_GETUID = 174;
+    SYS_GETGID = 176;
+    SYS_GETEUID = 175;
+    SYS_GETEGID = 177;
+    SYS_SETUID = 146;
+    SYS_SETGID = 144;
+    SYS_SETGROUPS = 159;
+
+    # Memory
+    SYS_BRK = 214;
+    SYS_MMAP = 222;
+    SYS_MUNMAP = 215;
+
+    # Mount + sync + reboot
+    SYS_MOUNT = 40;
+    SYS_UMOUNT2 = 39;
+    SYS_SYNC = 81;
+    SYS_REBOOT = 142;
+    SYS_UNAME = 160;
+
+    # Signals + sync primitives
+    SYS_RT_SIGPROCMASK = 135;
+    SYS_FUTEX = 98;
+    SYS_SIGNALFD4 = 74;
+
+    # Epoll
+    SYS_EPOLL_CREATE1 = 20;
+    SYS_EPOLL_CTL = 21;
+    SYS_EPOLL_PWAIT = 22;   # → sys_epoll_wait (NULL sigmask)
+
+    # Timers + waitid
+    SYS_TIMERFD_CREATE = 85;
+    SYS_TIMERFD_SETTIME = 86;
+    SYS_WAITID = 95;
+
+    # Inotify
+    SYS_INOTIFY_INIT1 = 26;
+    SYS_INOTIFY_ADD_WATCH = 27;
+    SYS_INOTIFY_RM_WATCH = 28;
+
+    # v5.7.35 (agnosys-surfaced — drm/luks/security)
+    SYS_GETDENTS64 = 61;
+    SYS_GETRANDOM = 278;
+    SYS_LANDLOCK_CREATE_RULESET = 444;
+    SYS_LANDLOCK_ADD_RULE = 445;
+    SYS_LANDLOCK_RESTRICT_SELF = 446;
+}
+
+# AT_FDCWD = special "current working directory" fd for at-family
+# syscalls. Defined as -100 on every Linux arch; wrappers below
+# pass this so consumer-facing semantics match the x86_64
+# `sys_open(path, flags, mode)` etc. calling convention.
+var AT_FDCWD = 0 - 100;
+var AT_EMPTY_PATH = 4096;       # 0x1000 — for fstatat(fd, "", ..., AT_EMPTY_PATH)
+var AT_REMOVEDIR = 512;         # 0x200  — for unlinkat used as rmdir
+
+# ================================================================
+# Clone flags (cross-arch identical — same as x86_64 peer)
+# ================================================================
+enum CloneFlag {
+    CLONE_VM = 256;
+    CLONE_FS = 512;
+    CLONE_FILES = 1024;
+    CLONE_SIGHAND = 2048;
+    CLONE_THREAD = 65536;
+    CLONE_SYSVSEM = 262144;
+    CLONE_SETTLS = 524288;
+    CLONE_PARENT_SETTID = 1048576;
+    CLONE_CHILD_CLEARTID = 2097152;
+}
+
+# ================================================================
+# mmap constants (cross-arch identical)
+# ================================================================
+enum MmapConst {
+    PROT_READ = 1;
+    PROT_WRITE = 2;
+    PROT_EXEC = 4;
+    MAP_PRIVATE = 2;
+    MAP_ANONYMOUS = 32;
+    MAP_STACK = 131072;
+}
+
+# ================================================================
+# Futex operations (cross-arch identical)
+# ================================================================
+enum FutexOp {
+    FUTEX_WAIT = 0;
+    FUTEX_WAKE = 1;
+    FUTEX_PRIVATE_FLAG = 128;
+}
+
+# ================================================================
+# Open flags (cross-arch identical — values from
+# asm-generic/fcntl.h, which aarch64 uses unmodified)
+# ================================================================
+enum OpenFlag {
+    O_RDONLY = 0;
+    O_WRONLY = 1;
+    O_RDWR = 2;
+    O_CREAT = 64;
+    O_EXCL = 128;
+    O_TRUNC = 512;
+    O_APPEND = 1024;
+    O_NONBLOCK = 2048;
+    O_CLOEXEC = 524288;
+}
+
+# ================================================================
+# Signals (cross-arch identical — asm-generic/signal.h)
+# ================================================================
+enum Signal {
+    SIGHUP = 1;
+    SIGINT = 2;
+    SIGQUIT = 3;
+    SIGKILL = 9;
+    SIGUSR1 = 10;
+    SIGUSR2 = 12;
+    SIGTERM = 15;
+    SIGCHLD = 17;
+    SIGCONT = 18;
+    SIGSTOP = 19;
+    SIGPWR = 30;
+}
+
+enum SigAction {
+    SIG_BLOCK = 0;
+    SIG_UNBLOCK = 1;
+    SIG_SETMASK = 2;
+}
+
+# ================================================================
+# Mount flags (cross-arch identical)
+# ================================================================
+enum MsFlag {
+    MS_RDONLY = 1;
+    MS_NOSUID = 2;
+    MS_NODEV = 4;
+    MS_NOEXEC = 8;
+    MS_REMOUNT = 32;
+    MS_BIND = 4096;
+    MS_MOVE = 8192;
+}
+
+# ================================================================
+# Epoll constants (cross-arch identical)
+# ================================================================
+enum EpollConst {
+    EPOLL_CLOEXEC = 524288;
+    EPOLL_CTL_ADD = 1;
+    EPOLL_CTL_DEL = 2;
+    EPOLL_CTL_MOD = 3;
+    EPOLLIN = 1;
+    EPOLLOUT = 4;
+    EPOLLERR = 8;
+    EPOLLHUP = 16;
+}
+
+# ================================================================
+# Timer, wait, signalfd, reboot, errno (cross-arch identical)
+# ================================================================
+enum TimerConst {
+    CLOCK_MONOTONIC = 1;
+    TFD_NONBLOCK = 2048;
+    TFD_CLOEXEC = 524288;
+}
+
+enum WaitFlag {
+    WNOHANG = 1;
+    WUNTRACED = 2;
+}
+
+enum SfdFlag {
+    SFD_NONBLOCK = 2048;
+    SFD_CLOEXEC = 524288;
+}
+
+enum RebootCmd {
+    RB_POWER_OFF = 0x4321FEDC;
+    RB_AUTOBOOT = 0x01234567;
+    RB_HALT_SYSTEM = 0xCDEF0123;
+}
+
+enum Errno {
+    EPERM = 1;
+    ENOENT = 2;
+    ESRCH = 3;
+    EINTR = 4;
+    EIO = 5;
+    ENXIO = 6;
+    EAGAIN = 11;
+    EACCES = 13;
+    EBUSY = 16;
+    EEXIST = 17;
+    ENOTDIR = 20;
+    EISDIR = 21;
+    EINVAL = 22;
+    ENFILE = 23;
+    EMFILE = 24;
+    ENOSPC = 28;
+    ECHILD = 10;
+}
+
+# Standard fds
+enum StdFd {
+    STDIN_FD = 0;
+    STDOUT_FD = 1;
+    STDERR_FD = 2;
+}
+
+# Reboot magic
+var LINUX_REBOOT_MAGIC1 = 0xFEE1DEAD;
+var LINUX_REBOOT_MAGIC2 = 672274793;
+
+# ================================================================
+# struct stat layout — aarch64 generic-stat layout
+# (include/uapi/asm-generic/stat.h)
+# ================================================================
+# st_dev    @ 0   (8 bytes)
+# st_ino    @ 8   (8 bytes)
+# st_mode   @ 16  (4 bytes)   <-- offset differs from x86's 144-byte layout (@24)
+# st_nlink  @ 20  (4 bytes)
+# st_uid    @ 24  (4 bytes)   <-- x86 layout: @28
+# st_gid    @ 28  (4 bytes)   <-- x86 layout: @32
+# st_rdev   @ 32
+# (pad)     @ 40
+# st_size   @ 48  (8 bytes)   <-- coincidentally @48 on both arches
+# ...
+# Total = 128 bytes; we use STAT_BUFSZ = 144 (= max of both arches)
+# so consumer alloc/var sites stay arch-clean.
+enum Stat {
+    STAT_MODE = 16;
+    STAT_NLINK = 20;
+    STAT_UID = 24;
+    STAT_GID = 28;
+    STAT_SIZE = 48;
+    STAT_MTIME = 88;
+    STAT_MTIME_NSEC = 96;
+    STAT_BUFSZ = 144;
+}
+
+# ================================================================
+# Syscall wrappers
+# ================================================================
+
+# File operations — all routed through at-family equivalents.
+
+# Open a file. Translates to openat(AT_FDCWD, path, flags, mode).
+fn sys_open(path, flags, mode) {
+    return syscall(SYS_OPENAT, AT_FDCWD, path, flags, mode);
+}
+
+# Close a file descriptor.
+fn sys_close(fd) {
+    return syscall(SYS_CLOSE, fd);
+}
+
+# Read bytes from fd into buffer. Returns bytes read.
+fn sys_read(fd, buf, count) {
+    return syscall(SYS_READ, fd, buf, count);
+}
+
+# Write bytes from buffer to fd. Returns bytes written.
+fn sys_write(fd, buf, count) {
+    return syscall(SYS_WRITE, fd, buf, count);
+}
+
+# stat(2) equivalent — newfstatat(AT_FDCWD, path, buf, 0).
+# Buffer must be STAT_BUFSZ (= 144) bytes; aarch64 only writes
+# 128 of them but consumers shouldn't have to know that.
+fn sys_stat(path, buf) {
+    return syscall(SYS_NEWFSTATAT, AT_FDCWD, path, buf, 0);
+}
+
+# fstat(2) equivalent — bare SYS_FSTAT exists on aarch64 (= 80).
+fn sys_fstat(fd, buf) {
+    return syscall(SYS_FSTAT, fd, buf);
+}
+
+# Duplicate fd oldfd to newfd. Translates to dup3(oldfd, newfd, 0).
+fn sys_dup2(oldfd, newfd) {
+    return syscall(SYS_DUP3, oldfd, newfd, 0);
+}
+
+# Create a directory at path with given mode.
+# Translates to mkdirat(AT_FDCWD, path, mode).
+fn sys_mkdir(path, mode) {
+    return syscall(SYS_MKDIRAT, AT_FDCWD, path, mode);
+}
+
+# Remove an empty directory.
+# Translates to unlinkat(AT_FDCWD, path, AT_REMOVEDIR).
+fn sys_rmdir(path) {
+    return syscall(SYS_UNLINKAT, AT_FDCWD, path, AT_REMOVEDIR);
+}
+
+# Delete a file.
+# Translates to unlinkat(AT_FDCWD, path, 0).
+fn sys_unlink(path) {
+    return syscall(SYS_UNLINKAT, AT_FDCWD, path, 0);
+}
+
+# Create a symbolic link at `linkpath` pointing to `target`.
+# Translates to symlinkat(target, AT_FDCWD, linkpath).
+# Returns 0 on success, negative errno on failure.
+fn sys_symlink(target, linkpath) {
+    return syscall(SYS_SYMLINKAT, target, AT_FDCWD, linkpath);
+}
+
+# Read the target of a symbolic link into `buf` (cap `bufsize`).
+# Translates to readlinkat(AT_FDCWD, path, buf, bufsize).
+# Returns the number of bytes placed in buf (no null terminator),
+# or negative errno on failure. Buf is NOT null-terminated by the
+# kernel — caller must store0 if used as a cstring.
+fn sys_readlink(path, buf, bufsize) {
+    return syscall(SYS_READLINKAT, AT_FDCWD, path, buf, bufsize);
+}
+
+# Change file permissions.
+# Translates to fchmodat(AT_FDCWD, path, mode, 0).
+fn sys_chmod(path, mode) {
+    return syscall(SYS_FCHMODAT, AT_FDCWD, path, mode, 0);
+}
+
+# Check file access permissions.
+# Translates to faccessat(AT_FDCWD, path, mode).
+fn sys_access(path, mode) {
+    return syscall(SYS_FACCESSAT, AT_FDCWD, path, mode);
+}
+
+# Process operations.
+
+# fork(2) equivalent — clone(SIGCHLD, NULL, NULL, NULL, NULL).
+# `SIGCHLD` (=17) tells the kernel to send SIGCHLD to the parent
+# on child exit. No CLONE_* bits set, so child gets its own VM,
+# files, signal handlers, etc. — POSIX-fork semantics. Verified:
+# the proposal originally suggested `CLONE_CHILD|SIGCHLD`, but
+# `CLONE_CHILD` isn't a real Linux clone flag.
+fn sys_fork() {
+    return syscall(SYS_CLONE, SIGCHLD, 0, 0, 0, 0);
+}
+
+# Terminate process with exit code.
+fn sys_exit(code) {
+    syscall(SYS_EXIT, code);
+    return 0;
+}
+
+# execve: replace process image. argv and envp are null-terminated arrays of pointers.
+fn sys_execve(path, argv, envp) {
+    return syscall(SYS_EXECVE, path, argv, envp);
+}
+
+# pipe: create pipe, fds[0]=read end, fds[1]=write end.
+# Translates to pipe2(fds, 0).
+fn sys_pipe(fds) {
+    return syscall(SYS_PIPE2, fds, 0);
+}
+
+# Get current process ID.
+fn sys_getpid() {
+    return syscall(SYS_GETPID);
+}
+
+# Get parent process ID.
+fn sys_getppid() {
+    return syscall(SYS_GETPPID);
+}
+
+# Send signal to process.
+fn sys_kill(pid, sig) {
+    return syscall(SYS_KILL, pid, sig);
+}
+
+# Wait for a signal.
+# aarch64 has no bare `pause` syscall; emulate via ppoll with NULL
+# fds and NULL timeout — equivalent to pause(2) semantics
+# (block until a signal handler interrupts it).
+fn sys_pause() {
+    return syscall(SYS_PPOLL, 0, 0, 0, 0, 0);
+}
+
+# Create a new session.
+fn sys_setsid() {
+    return syscall(SYS_SETSID);
+}
+
+# waitpid via wait4 with rusage=NULL
+fn sys_waitpid(pid, status_ptr, options) {
+    return syscall(SYS_WAIT4, pid, status_ptr, options, 0);
+}
+
+# Wait status macros (cross-arch identical — bit layout in `int
+# status` is defined by the kernel's wait4 contract, not arch).
+fn WIFEXITED(status) {
+    if ((status & 0x7F) == 0) { return 1; }
+    return 0;
+}
+
+# Get exit status from wait status.
+fn WEXITSTATUS(status) {
+    return (status >> 8) & 0xFF;
+}
+
+# Check if child was killed by signal.
+fn WIFSIGNALED(status) {
+    var sig = status & 0x7F;
+    if (sig > 0) {
+        if (sig != 0x7F) { return 1; }
+    }
+    return 0;
+}
+
+# Get signal number from wait status.
+fn WTERMSIG(status) {
+    return status & 0x7F;
+}
+
+# Identity
+fn sys_getuid() { return syscall(SYS_GETUID); }
+# Get group ID.
+fn sys_getgid() { return syscall(SYS_GETGID); }
+# Get effective user ID.
+fn sys_geteuid() { return syscall(SYS_GETEUID); }
+# Get effective group ID.
+fn sys_getegid() { return syscall(SYS_GETEGID); }
+# Set user ID.
+fn sys_setuid(uid) { return syscall(SYS_SETUID, uid); }
+# Set group ID.
+fn sys_setgid(gid) { return syscall(SYS_SETGID, gid); }
+# sys_setgroups syscall wrapper.
+fn sys_setgroups(size, list) { return syscall(SYS_SETGROUPS, size, list); }
+
+# Mount
+fn sys_mount(source, target, fstype, flags, data) {
+    return syscall(SYS_MOUNT, source, target, fstype, flags, data);
+}
+
+# Unmount a filesystem.
+fn sys_umount2(target, flags) {
+    return syscall(SYS_UMOUNT2, target, flags);
+}
+
+# Sync + reboot
+fn sys_sync() {
+    syscall(SYS_SYNC);
+    return 0;
+}
+
+# sys_reboot syscall wrapper.
+fn sys_reboot(cmd) {
+    return syscall(SYS_REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, cmd, 0);
+}
+
+# Signal operations
+fn sigset_new() {
+    var set = alloc(8);
+    store64(set, 0);
+    return set;
+}
+
+# sigset_add syscall wrapper.
+fn sigset_add(set, signum) {
+    var mask = load64(set);
+    mask = mask | (1 << (signum - 1));
+    store64(set, mask);
+    return 0;
+}
+
+# sigset_has syscall wrapper.
+fn sigset_has(set, signum) {
+    var mask = load64(set);
+    if ((mask & (1 << (signum - 1))) != 0) { return 1; }
+    return 0;
+}
+
+# sys_sigprocmask syscall wrapper.
+fn sys_sigprocmask(how, set, oldset) {
+    return syscall(SYS_RT_SIGPROCMASK, how, set, oldset, 8);
+}
+
+# sys_signalfd syscall wrapper. signalfd4 is the only signalfd
+# variant in the aarch64 generic table; it takes the sigset_t size
+# as the 3rd arg (=8 for our 64-bit sigset).
+fn sys_signalfd(fd, mask, flags) {
+    return syscall(SYS_SIGNALFD4, fd, mask, 8, flags);
+}
+
+# Epoll. aarch64 has only epoll_create1 (no bare epoll_create).
+fn sys_epoll_create() {
+    return syscall(SYS_EPOLL_CREATE1, EPOLL_CLOEXEC);
+}
+
+# epoll_event: { u32 events, u64 data } = 12 bytes
+fn epoll_event_new(events, data) {
+    var ev = alloc(16);
+    store32(ev, events);
+    store64(ev + 4, data);
+    return ev;
+}
+
+# Control epoll: add/mod/del fd.
+fn sys_epoll_ctl(epfd, op, fd, event) {
+    return syscall(SYS_EPOLL_CTL, epfd, op, fd, event);
+}
+
+# Wait for epoll events. aarch64 has only epoll_pwait (no bare
+# epoll_wait); we pass NULL sigmask + sigset size 0 to mimic
+# epoll_wait semantics.
+fn sys_epoll_wait(epfd, events, maxevents, timeout) {
+    return syscall(SYS_EPOLL_PWAIT, epfd, events, maxevents, timeout, 0, 8);
+}
+
+# Timers
+fn sys_timerfd_create(clockid, flags) {
+    return syscall(SYS_TIMERFD_CREATE, clockid, flags);
+}
+
+# itimerspec: { interval: {sec, nsec}, value: {sec, nsec} } = 32 bytes
+fn timerspec_new(interval_sec, initial_sec) {
+    var ts = alloc(32);
+    store64(ts, interval_sec);
+    store64(ts + 8, 0);
+    store64(ts + 16, initial_sec);
+    store64(ts + 24, 0);
+    return ts;
+}
+
+# Set timer expiration.
+fn sys_timerfd_settime(fd, flags, new_value, old_value) {
+    return syscall(SYS_TIMERFD_SETTIME, fd, flags, new_value, old_value);
+}
+
+# timerfd_drain syscall wrapper.
+fn timerfd_drain(fd) {
+    var buf[1];
+    var n = sys_read(fd, &buf, 8);
+    if (n == 8) { return load64(&buf); }
+    return 0;
+}
+
+# Utility
+fn is_err(ret) {
+    if (ret < 0) { return 1; }
+    return 0;
+}
+
+# err_code syscall wrapper.
+fn err_code(ret) {
+    return 0 - ret;
+}
+
+# Inotify — file system event monitoring (cross-arch identical
+# event flag values; only the syscall numbers differ from x86_64).
+enum InotifyEvent {
+    IN_MODIFY = 2;
+    IN_CREATE = 256;
+    IN_DELETE = 512;
+    IN_MOVED_FROM = 64;
+    IN_MOVED_TO = 128;
+    IN_CLOSE_WRITE = 8;
+}
+
+# Initialise an inotify instance and return its fd.
+fn sys_inotify_init() { return syscall(SYS_INOTIFY_INIT1, 0); }
+# Add a watch on a path for inotify events
+fn sys_inotify_add_watch(fd, path, mask) { return syscall(SYS_INOTIFY_ADD_WATCH, fd, path, mask); }
+# Remove an inotify watch
+fn sys_inotify_rm_watch(fd, wd) { return syscall(SYS_INOTIFY_RM_WATCH, fd, wd); }
+
+# v5.7.35 — agnosys-surfaced (drm/luks/security). Same wrapper
+# bodies as the x86_64 peer; the per-arch SYS_* constants in
+# this file's enum route to the right kernel entry points.
+
+# Read directory entries — see x86_64 peer for record layout.
+fn sys_getdents64(fd, buf, count) {
+    return syscall(SYS_GETDENTS64, fd, buf, count);
+}
+
+# Fill buf with kernel-CSPRNG bytes — see x86_64 peer.
+fn sys_getrandom(buf, len, flags) {
+    return syscall(SYS_GETRANDOM, buf, len, flags);
+}
+
+# Landlock — create a ruleset; see x86_64 peer + lib/security.cyr.
+fn sys_landlock_create_ruleset(attr_ptr, size, flags) {
+    return syscall(SYS_LANDLOCK_CREATE_RULESET, attr_ptr, size, flags);
+}
+
+# Landlock — add a rule to a ruleset; see x86_64 peer.
+fn sys_landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags) {
+    return syscall(SYS_LANDLOCK_ADD_RULE, ruleset_fd, rule_type, rule_attr, flags);
+}
+
+# Landlock — apply ruleset to calling thread; see x86_64 peer.
+fn sys_landlock_restrict_self(ruleset_fd, flags) {
+    return syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, flags);
+}

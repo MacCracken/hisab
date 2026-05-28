@@ -69,14 +69,20 @@ jobs:
           [ $fail -eq 0 ] || { echo "lint: warnings present"; exit 1; }
 
       - name: Format check
+        # `cyrius fmt <file> --check` signals drift via EXIT CODE; in check
+        # mode it writes nothing to stdout (its report goes to stderr), so
+        # never diff its stdout against the file — that always "differs" for
+        # a non-empty file and fails every file (the old bug). Aggregate the
+        # rc across files so every drifted file is annotated, not just the
+        # first. Matches abaco's gate.
         run: |
           fail=0
           for f in src/*.cyr examples/*.cyr tests/*.tcyr tests/*.bcyr tests/*.fcyr; do
             [ -f "$f" ] || continue
-            if ! diff -q <(cyrius fmt "$f" --check 2>/dev/null) "$f" > /dev/null 2>&1; then
-              echo "::error file=$f::needs fmt — run 'cyrius fmt $f > tmp && mv tmp $f'"
+            cyrius fmt "$f" --check >/dev/null 2>&1 || {
+              echo "::error file=$f::fmt drift — run 'cyrius fmt $f > tmp && mv tmp $f'"
               fail=1
-            fi
+            }
           done
           [ $fail -eq 0 ] || { echo "fmt: drift detected"; exit 1; }
 
@@ -150,5 +156,46 @@ jobs:
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
           echo "VERSION file: $VERSION"
+          # VERSION is the single source of truth; confirm the manifest pin
+          # template is intact (matches abaco) before checking the changelog.
+          grep -qF 'version = "${file:VERSION}"' cyrius.cyml \
+            || { echo "FAIL: cyrius.cyml version is not \${file:VERSION}"; exit 1; }
           grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in CHANGELOG.md"; exit 1; }
           echo "Version consistent (manifest pulls VERSION via \${file:VERSION})"
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for dangerous patterns
+        # Mirrors abaco's security gate. Now that the 34 math modules live in
+        # src/, this scans the full library surface. Comment lines are ignored.
+        run: |
+          FAIL=0
+          scan() {
+            local label="$1"; shift
+            local pat="$1"; shift
+            local hits
+            hits=$(grep -rn "$pat" src/ 2>/dev/null | awk -F: '
+              { line=$3; for(i=4;i<=NF;i++) line=line":"$i;
+                sub(/^[[:space:]]+/,"",line);
+                if (substr(line,1,1) != "#") print $1":"$2":"line }')
+            if [ -n "$hits" ]; then
+              echo "FAIL: $label"; echo "$hits"; FAIL=1
+            fi
+          }
+          scan "raw execve"      'syscall\(\s*59'
+          scan "raw fork"        'syscall\(\s*57'
+          scan "sys_system"      '\bsys_system\s*\('
+          scan "writes to /etc"  '"/etc/'
+          scan "writes to /bin"  '"/bin/'
+          scan "writes to /sbin" '"/sbin/'
+          awk -F: '
+            /var [A-Za-z_][A-Za-z0-9_]*\[[0-9]+\]/ {
+              match($0, /\[[0-9]+\]/); s=substr($0,RSTART+1,RLENGTH-2); n=s+0;
+              if (n >= 65536) print FILENAME":"NR": large stack buffer ("n" bytes): "$0
+            }' src/*.cyr | tee /tmp/bigbuf.txt
+          [ -s /tmp/bigbuf.txt ] && FAIL=1
+          echo "security scan complete (fail: $FAIL)"
+          exit $FAIL

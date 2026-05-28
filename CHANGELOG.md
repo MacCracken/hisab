@@ -32,7 +32,14 @@ for a pure math library (no forced source-syntax breaks).
   retained; `cyrius deps --verify` is green (94 verified, 0 failed).
 - **lint**: collapsed 7 "multiple consecutive blank lines" warnings in
   `src/geo_advanced.cyr` (4) and `src/spatial.cyr` (3) — newly gated now that
-  the modules live under `src/`. Lint, fmt, and vet are clean.
+  the modules live under `src/`.
+- **lint (global-init-order)**: 6.0.14's lint (the check landed at 5.7.32,
+  after the old 5.7.10 pin) flagged 5 "global var init refs … (silent zero at
+  init)" warnings in `tests/hisab.tcyr` — caused by duplicate top-level var
+  names reused across test sections (`t`, `sx`, `sx2`, `se`), where an early
+  reference resolved to a later redeclaration. Renamed the later (symbolic +
+  tensor) instances to unique names (`symx`/`symx2`/`sexpr`/`tn`). Lint, fmt,
+  and vet are now clean across the full CI file set (src + examples + tests).
 
 ### Notes
 - The empty 0-byte `cyrius.lock` (a symlink/file-copy bug present ecosystem-

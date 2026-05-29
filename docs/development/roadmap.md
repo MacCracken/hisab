@@ -11,12 +11,12 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.3.3
+## Current -- v2.3.4
 
-- **34 math modules in `src/`, 16,195 lines** (`lib/` is vendored-only)
+- **34 math modules in `src/`, 16,424 lines** (`lib/` is vendored-only)
 - **833 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~540 KB / 16,195 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ~480 KB headroom
+- **`dist/hisab.cyr` distlib bundle** ~16,404 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
 - P(-1) audit: 26/31 fixed
 
@@ -71,12 +71,25 @@ load-bearing invariants.
 - [x] **Overflow** — no factorial/binomial kernels exist (abaco's); Pollard-rho/modpow already use `_num_mulmod` (Russian-peasant) to avoid `a*b` overflow. Pinned by a Fermat test at p≈1e11.
 - [x] **Regression coverage** — `tests/edge_cases.tcyr` invariants: logical-shift, mulmod overflow-safety (Fermat), PCG32 determinism, render-buffer independence.
 
-### 2.3.4 — Layout & idiom modernization
-- [ ] Replace duplicated literal buffer sizes with enum-const array sizes (v5.10.48: `var buf[ENUM_CONST]` now parses)
-- [ ] Where manual `load64`/`store64` + named-offset blocks exist, evaluate typed structs + `#derive(accessors)` + `sizeof(T)` (keeps accessor fn names stable, kills hand-computed offsets)
-- [ ] Use slices (`[T]` / `slice<T>`) for bounds-checked array views; `slice_unchecked_get_W` in proven-hot inner loops
-- [ ] `defer` for alloc/fd cleanup in the few resource-holding paths
-- [ ] Annotate pure computational fns with `#must_use` / `#pure` (warn-only; hardens the API surface, documents purity)
+### 2.3.4 — Layout & idiom modernization ✅ shipped
+Internal-only; public API/results/codegen unchanged, 833/833 bit-identical,
+benchmarks flat (`sizeof(T)` == old literal; derived setter == same `store64`).
+- [x] **`alloc(sizeof(T))` + derived setters** in the constructors of all 13
+  `#derive(accessors)` modules (vec2/3/4, quat, complex, autodiff, interval,
+  tensor, geo×9, collision_core, collision_mesh) — eliminates the last
+  hand-computed offsets/sizes; allocation is now coupled to the struct layout.
+- [x] **Enum-const buffer/grid sizes**: `MAT3_BYTES=72`, `MAT4_BYTES=128`
+  (alloc + copy-loop bounds), `FLOAT_RENDER_BUF=32` (`var buf[ENUM_CONST]`,
+  shared by the symbolic float renderers). The 2 bare `var buf[32]` literals
+  were the only stack-buffer duplication; matrices were the only repeated
+  heap-size literal.
+- [x] **`#must_use`** on the core value-returning API (9 foundational modules) —
+  build-time warning on discarded pure results; setters (`m3_set`/`m4_set`)
+  excluded. Full build + suite verified warning-free.
+- Deferred (evaluated): **`#pure`** (unsafe CSE interaction with the
+  allocate-fresh-result convention; speculative win, no driver); **slices**
+  (would regress the proven raw-pointer SIMD hot paths; unchecked slices add
+  no safety); **`defer`** (N/A — bump/arena model, no per-resource lifecycle).
 
 ---
 
@@ -158,6 +171,7 @@ a major, with a migration guide, not a 2.3.x patch.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.3.4 | 2026-05-28 | 16,424 | 34 | Layout/idiom modernization — `alloc(sizeof(T))`+derived setters (13 modules), enum-const grid/buffer sizes, `#must_use` on core API. Codegen-identical, 833/833 |
 | 2.3.3 | 2026-05-28 | 16,195 | 34 | Safety/numerical audit — no bugs; fixed wrong `>>` comment + 8 invariant tests. 833/833 |
 | 2.3.2 | 2026-05-28 | 16,195 | 34 | Bounded einsum scratch via reused arena — 3960 → 176 B/call (~22×). Memory-only, 825/825 |
 | 2.3.1 | 2026-05-28 | 16,195 | 34 | SIMD hot paths (`f64v_*`) for vec/mat/quat — vec4 dot 6.5×, m4_mul 4.5×, m3_mul 3.2×. Bit-identical, 825/825 |

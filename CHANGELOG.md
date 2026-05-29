@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+## [2.3.4] - 2026-05-28 — Layout & idiom modernization (2.3.x arc)
+
+A **layout/idiom** patch: tie heap allocations and field writes to the typed
+struct definitions so a future field addition can't silently under-allocate or
+land at a stale offset. Internal-only — public API, results, and machine code
+are unchanged. All 833 tests pass **bit-identical**; key benchmarks verified
+**flat** (`sizeof(T)` is a compile-time constant equal to the old literal, and
+a derived setter lowers to the same `store64` at the same offset, so codegen is
+byte-identical — no perf claim).
+
+### Changed
+- **Constructors → `sizeof(T)` + derived setters** across all 13 `#derive(accessors)`
+  struct modules: `alloc(<magic-literal>)` → `alloc(sizeof(T))` and
+  `store64(p + <offset>, v)` → `T_set_field(p, v)`. This eliminates the last
+  hand-computed offsets (reads already used the derived getters) and couples
+  every allocation to its struct layout:
+  - **vec2/vec3/vec4** (`HVec2`/`HVec3`/`HVec4`), **quat** (`HQuat`),
+    **complex** (`HComplex`), **autodiff** (`Dual`), **interval** (`Interval`),
+    **tensor** (`HTensor` header), **geo** (all 9: `GeoRay`/`GeoPlane`/`GeoAabb`/
+    `GeoSphere`/`GeoObb`/`GeoCapsule`/`GeoTriangle`/`GeoLine`/`GeoSegment`),
+    **collision_core** (`ColContact`), **collision_mesh** (`HalfEdge`/`HalfEdgeMesh`).
+  - SIMD scalar tails (e.g. vec3's `store64(r + 16, …)` z-write) also moved to
+    `HVec3_set_z` — packed `f64v_*` writes stay as raw-memory ops.
+- **Matrix grid sizes → enum constants**: `mat3.cyr` `MAT3_BYTES = 72` and
+  `mat4.cyr` `MAT4_BYTES = 128` replace the magic byte-size literal that was
+  repeated across `alloc` + copy-loop bounds (couples the copy length to the
+  allocation length). `m3_set`/`m4_set` (column-major grids, no named fields)
+  stay computed-index — a field-struct doesn't fit a flat NxN grid.
+- **Float-render buffer → enum constant**: `FLOAT_RENDER_BUF = 32`
+  (`var buf[FLOAT_RENDER_BUF]`) shared by the `symbolic.cyr` / `symbolic_ext.cyr`
+  float renderers, replacing two bare `var buf[32]` literals.
+
+### Added
+- **`#must_use` on the core value-returning API** (9 modules: vec2/3/4, quat,
+  complex, interval, autodiff, mat3, mat4) — the compiler now warns at build
+  time if a pure constructor/operation result is discarded (a guaranteed bug
+  for a side-effect-free function). Status-returning setters (`m3_set`/`m4_set`)
+  are deliberately **not** annotated. Verified the full 34-module build and the
+  833-test suite emit **zero** "result is discarded" warnings.
+
+### Notes (evaluated — deferred or N/A)
+- **`#pure`**: deferred. Its CSE/memoization semantics interact unsafely with
+  hisab's allocate-a-fresh-result convention (two "equal" calls must return
+  distinct mutable pointers); the win is speculative (hot paths are already SIMD)
+  with no benchmark driver. Not worth the risk for a patch.
+- **Slices (`[T]`/`slice<T>`)**: deferred. The hot loops are raw-pointer +
+  `load64`/`store64`, already SIMD-optimized (2.3.1). Bounds-checked slices would
+  regress them; `slice_unchecked_get_W` discards the safety benefit, leaving only
+  churn. No consumer demand.
+- **`defer`**: N/A. The library holds no per-resource lifecycles — long-lived
+  data uses the bump/arena allocator (never individually freed) and the library
+  opens no file descriptors. Nothing for `defer` to clean up.
+
 ## [2.3.3] - 2026-05-28 — Safety & numerical-correctness audit (2.3.x arc)
 
 A correctness audit of the integer/bit-math surface against the vidya gotcha

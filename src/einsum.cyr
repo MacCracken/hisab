@@ -15,6 +15,30 @@
 var _EINSUM_MAX_LABELS = 8;    # a through h
 var _EINSUM_MAX_RANK   = 4;    # max tensor rank
 
+# --- Scratch arena (bounded memory across repeated calls) ---
+# Every einsum call needs ~KB of parse/contraction scratch (op specs,
+# label dims, per-element index buffers). Previously each call leaked
+# that to the never-freeing global bump allocator — unbounded growth for
+# long-running consumers. einsum is non-reentrant and single-threaded, so
+# a module-global arena reset at entry reuses one fixed region for all
+# calls. `tensor_new` copies the shape, so no scratch escapes into the
+# returned tensor (verified). label_vals/indices are fixed-size buffers
+# reused across every element/product instead of re-allocated per element.
+var _EINSUM_ARENA_CAP  = 8192;
+var _einsum_arena      = 0;
+var _einsum_label_vals = 0;    # [_EINSUM_MAX_LABELS], reused across elements
+var _einsum_indices    = 0;    # [_EINSUM_MAX_RANK], reused across products
+
+# Reset the scratch arena for a fresh einsum call and re-reserve the two
+# persistent reused buffers at the base (stable pointers each call).
+fn _einsum_scratch_begin() {
+    if (_einsum_arena == 0) { _einsum_arena = arena_new(_EINSUM_ARENA_CAP); }
+    arena_reset(_einsum_arena);
+    _einsum_label_vals = arena_alloc(_einsum_arena, _EINSUM_MAX_LABELS * 8);
+    _einsum_indices = arena_alloc(_einsum_arena, _EINSUM_MAX_RANK * 8);
+    return 0;
+}
+
 # ================================================================
 # INTERNAL: NOTATION PARSER
 # ================================================================
@@ -61,6 +85,7 @@ fn _einsum_parse_operand(notation_data, start, end, labels_out) {
 #
 # Returns a new HTensor with the result, or 0 on error.
 fn einsum(notation, tensors, n_tensors) {
+    _einsum_scratch_begin();
     var ndata = str_data(notation);
     var nlen = str_len(notation);
 
@@ -82,8 +107,8 @@ fn einsum(notation, tensors, n_tensors) {
     # --- Step 2: Split input spec on "," to get per-tensor specs ---
     # Find comma positions to delineate operands
     # operand_starts[i], operand_ends[i] for up to 8 operands
-    var op_starts = alloc(8 * 8);
-    var op_ends   = alloc(8 * 8);
+    var op_starts = arena_alloc(_einsum_arena, 8 * 8);
+    var op_ends   = arena_alloc(_einsum_arena, 8 * 8);
     var n_ops = 0;
     var seg_start = 0;
 
@@ -105,8 +130,8 @@ fn einsum(notation, tensors, n_tensors) {
     # --- Step 3: Parse each operand's label indices ---
     # op_labels[op][rank_pos] = label_index (0-7)
     # op_ranks[op] = number of indices for this operand
-    var op_labels = alloc(8 * _EINSUM_MAX_RANK * 8);  # 8 operands * 4 indices
-    var op_ranks  = alloc(8 * 8);
+    var op_labels = arena_alloc(_einsum_arena, 8 * _EINSUM_MAX_RANK * 8);  # 8 operands * 4 indices
+    var op_ranks  = arena_alloc(_einsum_arena, 8 * 8);
 
     var oi = 0;
     while (oi < n_ops) {
@@ -119,12 +144,12 @@ fn einsum(notation, tensors, n_tensors) {
     }
 
     # --- Step 4: Parse output labels ---
-    var out_labels = alloc(_EINSUM_MAX_RANK * 8);
+    var out_labels = arena_alloc(_einsum_arena, _EINSUM_MAX_RANK * 8);
     var out_rank = _einsum_parse_operand(ndata, output_start, nlen, out_labels);
 
     # --- Step 5: Determine dimension for each label ---
     # label_dims[label_idx] = dimension size (0 = unused)
-    var label_dims = alloc(_EINSUM_MAX_LABELS * 8);
+    var label_dims = arena_alloc(_einsum_arena, _EINSUM_MAX_LABELS * 8);
     var li = 0;
     while (li < _EINSUM_MAX_LABELS) {
         store64(label_dims + li * 8, 0);
@@ -155,11 +180,11 @@ fn einsum(notation, tensors, n_tensors) {
     # --- Step 6: Identify which labels are contracted (summed over) ---
     # A label is contracted if it appears in inputs but NOT in output.
     # contracted_labels: list of label indices to sum over
-    var contracted = alloc(_EINSUM_MAX_LABELS * 8);
+    var contracted = arena_alloc(_einsum_arena, _EINSUM_MAX_LABELS * 8);
     var n_contracted = 0;
 
     # Track which labels appear in output
-    var in_output = alloc(_EINSUM_MAX_LABELS * 8);
+    var in_output = arena_alloc(_einsum_arena, _EINSUM_MAX_LABELS * 8);
     li = 0;
     while (li < _EINSUM_MAX_LABELS) {
         store64(in_output + li * 8, 0);
@@ -183,7 +208,7 @@ fn einsum(notation, tensors, n_tensors) {
     }
 
     # --- Step 7: Build output tensor ---
-    var out_shape = alloc((_EINSUM_MAX_RANK + 1) * 8);  # +1 for scalar case
+    var out_shape = arena_alloc(_einsum_arena, (_EINSUM_MAX_RANK + 1) * 8);  # +1 for scalar case
     if (out_rank == 0) {
         # Scalar result -- use rank 1, shape [1]
         store64(out_shape, 1);
@@ -233,8 +258,8 @@ fn _einsum_compute_element(result, out_idx, out_labels, out_rank,
 label_dims, contracted, n_contracted,
 op_labels, op_ranks, n_ops, tensors) {
 
-    # label_vals[label_idx] = current value for that label
-    var label_vals = alloc(_EINSUM_MAX_LABELS * 8);
+    # label_vals[label_idx] = current value for that label (reused buffer)
+    var label_vals = _einsum_label_vals;
 
     # Expand out_idx to output multi-index and assign to label_vals
     var remaining = out_idx;
@@ -282,7 +307,7 @@ op_labels, op_ranks, n_ops, tensors) {
 # Compute the product of all input tensor elements for current label assignment.
 fn _einsum_product(label_vals, op_labels, op_ranks, n_ops, tensors) {
     var product = F64_ONE;
-    var indices = alloc(_EINSUM_MAX_RANK * 8);
+    var indices = _einsum_indices;
 
     var oi = 0;
     while (oi < n_ops) {

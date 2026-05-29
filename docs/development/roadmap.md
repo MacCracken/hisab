@@ -11,7 +11,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.3.1
+## Current -- v2.3.2
 
 - **34 math modules in `src/`, 16,195 lines** (`lib/` is vendored-only)
 - **825 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
@@ -23,6 +23,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 ### Shipped in 2.3.0–2.3.1
 - **2.3.0** — toolchain 5.7.10 → **6.0.14**; library source moved `lib/*.cyr` → `src/*.cyr`; sakshi resolution repaired; tree reformatted under 6.0.x `cyrfmt`; CI aligned to abaco (fmt gate, security scan, version-template gate)
 - **2.3.1** — SIMD hot paths via `f64v_*`: vec4 dot 6.5×, m4_mul 4.5×, m3_mul 3.2×, vec3 dot 2.2× (825/825 bit-identical)
+- **2.3.2** — bounded einsum scratch (reused arena): 3960 → 176 bytes/call (~22× less allocator footprint); memory-only, speed unchanged
 
 ---
 
@@ -51,10 +52,13 @@ named as the gap-close consumer — the single biggest perf lever available.
 - Wins: vec4 dot 6.5×, m4_mul 4.5×, m3_mul 3.2×, vec3 dot 2.2× (see CHANGELOG 2.3.1)
 - Deferred: cross/lerp (need shuffles, not a clean f64v fit); `f64v2`/`f64v4` value-form (pointer-form via heap vecs was sufficient)
 
-### 2.3.2 — Scalar ops + scratch allocators
-- [ ] Replace hand-rolled scalar transcendentals with `f64_sin/cos/exp/ln`; use `f64_abs` (v5.11.37–.40, peephole-optimized to 2 instructions)
-- [ ] Adopt stdlib `arena_*` (v5.11.14: `arena_new/alloc/reset/free`) for per-call scratch in tensor / einsum / symbolic instead of bump-and-leak — `arena_reset` for per-frame reuse
-- [ ] Benchmark allocator-heavy paths (einsum contraction, symbolic simplify)
+### 2.3.2 — Scratch allocators ✅ shipped (re-scoped)
+Verification re-scoped this patch — the transcendental half was a no-op, and
+arena adoption only fit einsum:
+- [x] ~~Replace hand-rolled scalar transcendentals~~ — **already optimal**: hisab uses the stdlib `f64_sin/cos/exp/ln/abs` named-op intrinsics throughout (zero hand-rolled series). No change.
+- [x] **einsum scratch → reused module-global arena** (`arena_reset` at entry; `label_vals`/`indices` hoisted to reused buffers). **3960 → 176 bytes/call (~22×)**, scratch leak eliminated. Escape-verified (`tensor_new` copies shapes; einsum non-reentrant).
+- [x] symbolic/tensor left alone — their allocations are escaping result nodes (expr trees / tensors), not scratch; an arena-reset would corrupt results.
+- Memory win measured before/after; speed unchanged (arena ≈ bump, both O(1)).
 
 ### 2.3.3 — Safety & numerical-correctness audit (mined from vidya gotchas)
 - [ ] Audit every `var buf[N]` in a helper that returns a buffer-backed handle — these are **process-static** and silently corrupt across calls; switch to per-call `alloc()` (compiler now warns on static data > 4K)
@@ -150,6 +154,7 @@ a major, with a migration guide, not a 2.3.x patch.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.3.2 | 2026-05-28 | 16,195 | 34 | Bounded einsum scratch via reused arena — 3960 → 176 B/call (~22×). Memory-only, 825/825 |
 | 2.3.1 | 2026-05-28 | 16,195 | 34 | SIMD hot paths (`f64v_*`) for vec/mat/quat — vec4 dot 6.5×, m4_mul 4.5×, m3_mul 3.2×. Bit-identical, 825/825 |
 | 2.3.0 | 2026-05-28 | 16,195 | 34 | Cyrius 6.0.14 toolchain; library source moved to `src/`; sakshi resolution repaired; CI aligned to abaco (fmt/security/version gates). No behavioral change |
 | 2.2.0 | 2026-04-15 | 15,676 | 33 | SE(3), SO(3), adjoint, BCH, spatial structures, MPR, impulse solver, simplex noise, einsum, Golub-Kahan SVD |

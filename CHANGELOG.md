@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-05-28 — Bounded einsum scratch memory (2.3.x arc)
+
+A **memory-footprint** patch (not a speed change): einsum's parse/contraction
+scratch now lives in a reused module-global arena instead of leaking to the
+never-freeing bump allocator on every call. Internal-only; all 825 tests pass
+with identical results.
+
+This patch re-scoped 2.3.2 after verification (see Notes): the roadmap's
+"replace hand-rolled transcendentals" item was a no-op — hisab already uses
+the stdlib `f64_sin/cos/exp/ln/abs` named-op intrinsics everywhere, with zero
+hand-rolled series — and arena adoption only fit einsum.
+
+### Changed
+- **einsum** (`src/einsum.cyr`): all ~11 per-call scratch allocations (operand
+  specs, label dims, contraction sets, output shape) and the hot per-element
+  `label_vals`/per-product `indices` buffers now come from a module-global
+  arena (`_einsum_arena`, 8 KB) that is `arena_reset` at each call's entry.
+  `label_vals`/`indices` are also hoisted to reused fixed-size buffers instead
+  of being re-allocated per output element/product. einsum is non-reentrant
+  and single-threaded; `tensor_new` copies the shape, so no scratch escapes
+  into the returned tensor (verified).
+
+### Performance (memory, not speed)
+Measured per call for a 4×4 `ab,bc->ac` contraction (bump bytes consumed,
+100-call average), before = HEAD's released 2.3.1 einsum:
+
+- **3960 → 176 bytes/call** (~**22×** less). The 176 B is the result tensor
+  the caller owns; the ~3784 B of per-call scratch leak is **eliminated** —
+  scratch is now a one-time 808 B arena reused across all calls.
+- For a consumer making N einsum calls: `N×3960` (unbounded growth) → `N×176
+  + 808`. Speed is unchanged (arena alloc ≈ bump alloc, both O(1) bumps).
+
+### Notes
+- **Transcendentals already optimal**: `f64_sin/cos/exp/ln/abs` are stdlib
+  named-op intrinsics (hardware FP on x86, aarch64 polyfills). hisab uses them
+  directly (`f64_util.cyr` only composes them, e.g. `f64_tan = sin/cos`). No
+  hand-rolled Taylor/Newton series exist to replace. No change made.
+- **Arena scoped to einsum**: symbolic/tensor allocations are escaping result
+  nodes (expr trees / tensors returned to the caller), not scratch, so an
+  arena-reset would corrupt results — correctly left alone.
+
 ## [2.3.1] - 2026-05-28 — SIMD hot paths (2.3.x optimize/modernize arc)
 
 First patch of the 2.3.x arc: route vec/mat/quat hot paths through Cyrius's

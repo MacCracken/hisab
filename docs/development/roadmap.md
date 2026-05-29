@@ -11,15 +11,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.0
+## Current -- v2.6.1
 
-- **34 math modules in `src/`, ~16,520 lines** (`lib/` is vendored-only)
-- **934 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,540 lines** (`lib/` is vendored-only)
+- **939 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,575 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security), and 2.5.x (CGA depth + matrix guard) arcs are all **complete**. Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 929 across them; the 2.4.x arc fixed three real collision bugs, the 2.5.x arc grew CGA from 1 → 29 assertions.
-- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) shipped; 2.6.1 (Weyl) → 2.6.2 (parallel transport) → 2.6.3 (geodesic deviation) → 2.6.4 (higher forms) → 2.6.5 (closeout) pending.
+- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) + 2.6.1 (Weyl) shipped; 2.6.2 (parallel transport) → 2.6.3 (geodesic deviation) → 2.6.4 (higher forms) → 2.6.5 (closeout) pending.
 
 ---
 
@@ -52,12 +52,10 @@ tensors, verify green, no regression. Commit-bites per patch.
 - [x] **Implement:** lower `R_{ασμν} = g_{αρ} R^ρ_{σμν}`, contract over the plane, degenerate-plane guard; `_dg_inner` metric inner product. Sign verified positive for a sphere (hisab convention: `R^θ_{φθφ} = +1` at the equator).
 - [x] **Coverage:** constant-curvature space form → `K = 1` for any plane (axis + skew); radius-2 sphere (`metric = diag(4,4)`) → `1/4` (index-lowering); flat → 0; degenerate plane → 0.
 
-### 2.6.1 — Weyl conformal-curvature tensor (`weyl_tensor`)
-The trace-free part of Riemann: `C = R − (Ricci/scalar trace terms)` with the
-dimension-dependent coefficients `2/(n−2)` and `2/((n−1)(n−2))`.
-- [ ] **Bite 1 (oracle):** **vanishes identically for `n ≤ 3`** and for any **conformally-flat** metric (flat space → 0). Failing baseline.
-- [ ] **Bite 2 (implement):** assemble from lowered Riemann + Ricci + scalar; guard `n < 3` (coefficient singular / Weyl undefined there).
-- [ ] **Bite 3 (coverage):** `C = 0` in 3D; `C = 0` for the flat 4D metric; trace-free contraction `g^{ρμ} C_{ρσμν} = 0`.
+### 2.6.1 — Weyl conformal-curvature tensor (`weyl_tensor`) ✅ shipped
+Trace-free part of Riemann (`1/(n−2)` and `R/((n−1)(n−2))` trace terms). 5 assertions (934 → 939).
+- [x] **Implement:** `weyl_tensor` / `weyl_get` from lowered Riemann + Ricci + scalar; all-zero for `n ≤ 2` (undefined there).
+- [x] **Coverage:** `C = 0` for 3D and 4D space forms (Riemann ≠ 0 — conformally-flat oracle); non-space-form 4D → `C ≠ 0`; trace-free `g^{ρμ} C_{ρσμν} = 0`.
 
 ### 2.6.2 — Parallel transport along a curve (`parallel_transport`)
 Integrate `dV^a/dt = −Γ^a_{μν}(x(t)) · V^μ · (dx^ν/dt)` along a supplied curve,
@@ -139,6 +137,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.1 | 2026-05-29 | 16,540 | 34 | Diffgeo arc — Weyl conformal-curvature tensor (`weyl_tensor`); 5 space-form/trace-free assertions. 939 |
 | 2.6.0 | 2026-05-29 | 16,520 | 34 | Diffgeo arc — sectional curvature (`sectional_curvature` from Riemann); 5 space-form/sphere assertions. 934 |
 | 2.5.4 | 2026-05-29 | 16,500 | 34 | CGA arc closeout — P(-1)/security audit (posture solid) + `architecture/math.md` equation catalogue. Docs-only, 929 |
 | 2.5.3 | 2026-05-29 | 16,500 | 34 | CGA arc — `mat_new_guarded` (CWE-190 real-matrix guard); 4 assertions. 929 |

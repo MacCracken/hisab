@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-05-29 — Weyl conformal-curvature tensor (2.6.x arc)
+
+Second patch of the 2.6.x arc. Adds the trace-free (conformally-invariant) part
+of the Riemann tensor. Additive; suite 934 → **939**.
+
+### Added
+- **`weyl_tensor(riemann, ricci, scalar, metric, dim)`** + **`weyl_get`**
+  (`diffgeo.cyr`) — the covariant Weyl tensor `C_{ρσμν}` assembled from the
+  lowered Riemann minus the dimension-weighted Ricci/scalar trace terms
+  (`1/(n−2)` and `R/((n−1)(n−2))`). Returns all-zero for `n ≤ 2` (Weyl
+  undefined / identically zero there).
+- **`tests/hisab.tcyr`** — 5 assertions + space-form/trace helpers: `C = 0` for a
+  **3D space form** (Riemann & Ricci nonzero), `C = 0` for a **4D space form**
+  (conformally flat, Riemann ≠ 0 — the defining oracle), a non-space-form 4D
+  Riemann gives `C ≠ 0`, and that `C` is **trace-free** (`g^{ρμ} C_{ρσμν} = 0`).
+
 ## [2.6.0] - 2026-05-29 — Sectional curvature (2.6.x arc)
 
 First patch of the 2.6.x arc (differential-geometry depth). Adds the sectional

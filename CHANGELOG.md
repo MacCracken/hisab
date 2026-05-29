@@ -23,6 +23,9 @@
   currency (Cyrius pin 6.0.14, `src/` not `lib/`, +fmt/distlib gates).
 - Re-verified the five `docs/development/issues/` toolchain filings against the
   pinned 6.0.14 — all still reproduce (none stale-fixed).
+- Re-organized the roadmap's flat 2.5.0 item into a **2.5.x CGA arc** (2.5.0
+  contraction → 2.5.1 dual → 2.5.2 projection/rejection → 2.5.3 `mat_new` guard
+  closeout), mirroring the 2.4.x per-patch + commit-bite structure.
 
 ## [2.4.6] - 2026-05-29 — Security & hardening audit; 2.4.x closeout
 

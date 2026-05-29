@@ -22,11 +22,57 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 
 ---
 
-## 2.5.0 -- CGA + matrix overflow guard
+## 2.5.x -- CGA depth + matrix guard
 
-- [ ] CGA left/right contraction operators
-- [ ] CGA dual operation, blade projection/rejection
-- [ ] **`mat_new` overflow guard** — the 2026-05-29 audit confirmed stdlib `matrix.cyr` `mat_new(rows, cols)` (`16 + rows*cols*8`) is **still unguarded in the pinned 6.0.14 snapshot** (was C3 in the P(-1) audit). The fix belongs upstream in cyrius (hisab must not edit vendored `lib/`); hisab's own usage is mitigated (dims come from already-allocated matrices, and the raw-dimension `cmat_new` is guarded). Verify/land the upstream fix, then add a regression test.
+Conformal geometric algebra already ships in `geo_advanced.cyr` — a 32-blade
+(2⁵) conformal multivector with geometric product, outer (wedge) product,
+reverse, sandwich, norms, and the conformal constructors (`cga_point`,
+`cga_sphere`, `cga_plane`, `cga_translator`, `cga_rotor`). What's **missing** is
+the interior-product family — contraction, dual, projection/rejection — and CGA
+currently has a single alloc smoke assertion. This arc adds those operators and
+gives CGA real coverage, then closes out the carried-over `mat_new` guard.
+
+Unlike the 2.4.x arc (bug fixes, red-fixture-first), these are **additive feature
+patches** (new public `cga_*` functions, no signature changes), so each ships as
+a patch. The discipline: each operator lands with the **GA identities that define
+it** as its test oracle (e.g. contraction grade rules, dual involution,
+projection idempotence) — write the identity assertion, implement against the
+existing blade machinery (`_cga_geo_blades` / `_cga_blade_grade`), verify green,
+no regression on the 901-assertion suite. Commit-bites per patch below.
+
+> Order is dependency-aware: contraction is the interior-product primitive; dual
+> needs the pseudoscalar inverse; projection/rejection compose contraction + a
+> blade inverse. The `mat_new` guard is independent and lands last as the
+> hardening closeout.
+
+### 2.5.0 — CGA contraction operators (`cga_left_contraction` / `cga_right_contraction`)
+The interior products (⌋ left, ⌊ right) — like the existing outer product but
+keeping the *lowered*-grade terms instead of the raised ones.
+- [ ] **Bite 1 (identity fixture):** grade rule — `vec ⌋ bivector → vector` (left keeps grade `g(b)−g(a)`; right keeps `g(a)−g(b)`); orthogonal-blade contraction → 0. Failing baseline against the not-yet-implemented fn.
+- [ ] **Bite 2 (implement):** filter `_cga_geo_blades(a,b)` terms by the contraction grade rule (mirror `cga_outer_product`'s grade-sum filter with the grade-difference rule + sign from the blade product).
+- [ ] **Bite 3 (coverage):** `a ⌋ a == |a|²` for vectors; left/right duality (`a ⌋ b == reverse(reverse(b) ⌊ reverse(a))`); contraction of a blade with a higher-grade blade containing it.
+
+### 2.5.1 — CGA dual + pseudoscalar inverse (`cga_pseudoscalar`, `cga_dual`)
+Duality via multiplication by the inverse unit pseudoscalar `I` (grade-5 blade
+`[31]` = `e123+−`).
+- [ ] **Bite 1 (identity fixture):** `cga_pseudoscalar()` is the grade-5 unit blade; `I · I⁻¹ == 1`. Failing baseline.
+- [ ] **Bite 2 (implement):** pseudoscalar + its inverse (sign from `reverse`/metric), then `cga_dual(x) = x · I⁻¹` via the existing geometric product.
+- [ ] **Bite 3 (coverage):** grade flip `grade(dual(grade-k)) == 5−k`; involution `dual(dual(x)) == ±x` (pin the sign for the 5D conformal metric).
+
+### 2.5.2 — CGA blade projection / rejection (`cga_project`, `cga_reject`)
+Project a blade `X` onto blade `B`: `project(X,B) = (X ⌋ B) ⌋ B⁻¹`; rejection is
+the complement.
+- [ ] **Bite 1 (identity fixture):** `project(b, b) == b` (projection onto self); `project + reject == X`. Failing baseline.
+- [ ] **Bite 2 (implement):** blade-inverse helper (`B⁻¹ = reverse(B) / norm_sq(B)`), then `cga_project` via 2.5.0's contraction; `cga_reject(X,B) = X − project(X,B)`.
+- [ ] **Bite 3 (coverage):** idempotence `project(project(X,B),B) == project(X,B)`; orthogonality `project ⌋ reject == 0`; a concrete point-onto-plane / point-onto-line projection fixture.
+
+### 2.5.3 — `mat_new` overflow guard (arc closeout)
+Carried over from the 2.4.6 audit (was C3 in the P(-1) audit). The audit confirmed
+stdlib `matrix.cyr` `mat_new(rows, cols)` (`16 + rows*cols*8`) is **still unguarded
+in the pinned 6.0.14 snapshot**.
+- [ ] **Re-check upstream:** re-test on the current cyrius pin — if the stdlib guard has landed, pin a regression test and close.
+- [ ] **If still unguarded:** since hisab must not edit vendored `lib/`, add a defensive dimension check at hisab's `mat_new` call sites (linalg_ext SVD/QR, optimize LM/Newton) or a small guarded wrapper, mirroring the `cmat_new` cap. hisab's exposure is already mitigated (dims come from already-allocated matrices), so this is belt-and-suspenders.
+- [ ] **Pin it:** add a CWE-190 regression assertion alongside the existing `cmat_new` / `tensor_new` guard tests in `edge_cases.tcyr`.
 
 ---
 

@@ -11,14 +11,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.5.4
+## Current -- v2.6.0
 
-- **34 math modules in `src/`, ~16,500 lines** (`lib/` is vendored-only)
-- **929 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,520 lines** (`lib/` is vendored-only)
+- **934 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,575 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security), and 2.5.x (CGA depth + matrix guard) arcs are all **complete**. Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 929 across them; the 2.4.x arc fixed three real collision bugs, the 2.5.x arc grew CGA from 1 → 29 assertions.
+- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) shipped; 2.6.1 (Weyl) → 2.6.2 (parallel transport) → 2.6.3 (geodesic deviation) → 2.6.4 (higher forms) → 2.6.5 (closeout) pending.
 
 ---
 
@@ -45,12 +46,11 @@ tensors, verify green, no regression. Commit-bites per patch.
 > extend the exterior algebra independently. A P(-1)/security/docs closeout lands
 > last (and grows the diffgeo section of `math.md`).
 
-### 2.6.0 — Sectional curvature (`sectional_curvature`)
-`K(u,v) = R(u,v,v,u) / (⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩²)` — lower the first Riemann index
-with the metric, contract over the plane spanned by `u`, `v`.
-- [ ] **Bite 1 (oracle):** constant-curvature 2-sphere of radius `r` → `K = 1/r²` for any orthonormal pair; flat metric → `K = 0`. Failing baseline.
-- [ ] **Bite 2 (implement):** lower the index `R_{ρσμν} = g_{ρλ} R^λ_{σμν}`, then the sectional quotient with a degenerate-plane guard (`|denominator| < EPSILON → 0`).
-- [ ] **Bite 3 (coverage):** sphere `1/r²` at two radii; flat → 0; symmetry `K(u,v) = K(v,u)`.
+### 2.6.0 — Sectional curvature (`sectional_curvature`) ✅ shipped
+`K(u,v) = R(u,v,v,u) / (⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩²)` with the first Riemann index lowered.
+5 assertions (929 → 934).
+- [x] **Implement:** lower `R_{ασμν} = g_{αρ} R^ρ_{σμν}`, contract over the plane, degenerate-plane guard; `_dg_inner` metric inner product. Sign verified positive for a sphere (hisab convention: `R^θ_{φθφ} = +1` at the equator).
+- [x] **Coverage:** constant-curvature space form → `K = 1` for any plane (axis + skew); radius-2 sphere (`metric = diag(4,4)`) → `1/4` (index-lowering); flat → 0; degenerate plane → 0.
 
 ### 2.6.1 — Weyl conformal-curvature tensor (`weyl_tensor`)
 The trace-free part of Riemann: `C = R − (Ricci/scalar trace terms)` with the
@@ -139,6 +139,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.0 | 2026-05-29 | 16,520 | 34 | Diffgeo arc — sectional curvature (`sectional_curvature` from Riemann); 5 space-form/sphere assertions. 934 |
 | 2.5.4 | 2026-05-29 | 16,500 | 34 | CGA arc closeout — P(-1)/security audit (posture solid) + `architecture/math.md` equation catalogue. Docs-only, 929 |
 | 2.5.3 | 2026-05-29 | 16,500 | 34 | CGA arc — `mat_new_guarded` (CWE-190 real-matrix guard); 4 assertions. 929 |
 | 2.5.2 | 2026-05-29 | 16,490 | 34 | CGA arc — blade projection/rejection (`cga_project`/`cga_reject` + blade inverse); 10 assertions. 925 |

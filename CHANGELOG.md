@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-05-29 — Sectional curvature (2.6.x arc)
+
+First patch of the 2.6.x arc (differential-geometry depth). Adds the sectional
+curvature on top of the existing Riemann tensor. Additive; suite 929 → **934**.
+
+### Added
+- **`sectional_curvature(riemann, metric, u, v, dim)`** (`diffgeo.cyr`) —
+  `K(u,v) = R(u,v,v,u) / (⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩²)`, lowering the first Riemann index
+  with the metric (`R_{ασμν} = g_{αρ} R^ρ_{σμν}`) and contracting over the plane.
+  Guards a degenerate plane (`|denominator| < EPSILON → 0`). Positive for a
+  sphere — verified against hisab's Riemann convention (`R^θ_{φθφ} = +1` at the
+  equator). Plus a `_dg_inner` metric-inner-product helper.
+- **`tests/hisab.tcyr`** — 5 assertions against a constant-curvature space form:
+  unit-curvature → `K = 1` for any plane (axis-aligned + skew); a radius-2 sphere
+  (`metric = diag(4,4)`) → `K = 1/4` (exercises the metric index-lowering); flat →
+  `0`; and a degenerate plane → `0` (denominator guard).
+
 ### Documentation
 - Roadmap maintenance: removed the completed 2.5.x arc section (now in Release
   History) and condensed the Current arc-history; re-organized the flat 2.6.0

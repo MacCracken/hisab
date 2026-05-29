@@ -11,7 +11,7 @@ differential geometry, symbolic algebra.
 - **Language**: Cyrius (sovereign systems language, compiled by cycc)
 - **Toolchain**: Cyrius 6.0.14 (`cyrius.cyml: cyrius = "6.0.14"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.5.4 — compiles cleanly under cycc 6.0.14. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~540 KB / 16,575 lines, fits cycc 6.0.14's 1 MB input_buf with ample headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (929/929). The 2.3.x (optimize/modernize), 2.4.x (collision-correctness + security), and 2.5.x (CGA depth + matrix guard) arcs are all complete.
+- **Status**: 2.6.0 — compiles cleanly under cycc 6.0.14. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~545 KB / 16,642 lines, fits cycc 6.0.14's 1 MB input_buf with ample headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (934/934). The 2.3.x, 2.4.x, and 2.5.x arcs are complete; the 2.6.x (differential-geometry depth) arc is in progress.
 
 ## Consumers
 

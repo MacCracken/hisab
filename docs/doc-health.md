@@ -6,12 +6,13 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-05-29 (v2.5.4). Scaffolded at v2.4.6 during the post-2.4.x
+> **Last refresh**: 2026-05-29 (v2.6.0). Scaffolded at v2.4.6 during the post-2.4.x
 > doc sweep; the **2.5.x** CGA arc ran the same day — 2.5.0 (contraction) + 2.5.1
-> (dual) + 2.5.2 (projection/rejection) + 2.5.3 (`mat_new` guard), then **2.5.4**
-> the closeout (P(-1)/security audit — posture solid — and the new
-> `architecture/math.md` equation catalogue). Suite 901 → 929. README / CLAUDE /
-> testing / roadmap current-state counts kept synced per-patch through the arc. The v2.4.6
+> (dual) + 2.5.2 (projection/rejection) + 2.5.3 (`mat_new` guard) + **2.5.4**
+> closeout (P(-1)/security audit + the new `architecture/math.md` catalogue) —
+> then the **2.6.x** diffgeo arc opened with 2.6.0 (sectional curvature). Suite
+> 901 → 934. README / CLAUDE / testing / roadmap current-state counts kept synced
+> per-patch through the arcs. The v2.4.6
 > verify-and-cleanup pass: re-ran `bench-history.sh`
 > (benchmarks.md fresh again — **26** benchmarks at commit `b1165f9`); deleted
 > the ad-hoc `development/tool-issues.md` catalog (file real bugs in `issues/`,
@@ -33,7 +34,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 
 ---
 
-## At a glance — inventory (last reviewed 2026-05-29, v2.5.4)
+## At a glance — inventory (last reviewed 2026-05-29, v2.6.0)
 
 **~23 markdown files** across the repo. Bucket counts:
 

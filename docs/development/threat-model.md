@@ -20,7 +20,7 @@ Hisab does NOT trust:
 | cmat_new | Integer overflow in `rows * cols * 16` | Overflow guard, max 64K elements |
 | christoffel/riemann | `dim^3` / `dim^4` overflow | Dim capped at 16 |
 | num_sieve | Unbounded allocation | Capped at 10M |
-| mat_new (stdlib) | Integer overflow in `16 + rows*cols*8` | **Upstream bug** — still unguarded in pinned 6.0.14; roadmap 2.5.3. hisab's calls use dims from already-allocated matrices (mitigated); raw-dim `cmat_new` is guarded |
+| mat_new (stdlib) | Integer overflow in `16 + rows*cols*8` | **Upstream bug** — still unguarded in pinned 6.0.14 (fix tracked for when the cyrius pin moves). hisab provides **`mat_new_guarded`** (2.5.3) as the safe constructor for untrusted dims (cap 16M elems); internal `mat_new` calls use dims from already-allocated matrices (mitigated); raw-dim `cmat_new` is guarded |
 | convex_hull_2d | Monotone-chain pop underflow / index | Fixed in 2.4.0 (sort + `f64_le`/`f64_ge`); `vec_get` traps on OOB rather than corrupting |
 | triangulate_polygon | Ear-clip non-termination | `n*n` iteration cap + "no ear → bail" |
 | delaunay_2d | Bad-triangle / cocircular degeneracy | Super-triangle + strict in-circle; collinear → empty (no trap) |

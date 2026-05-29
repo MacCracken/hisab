@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [2.5.3] - 2026-05-29 — `mat_new` overflow guard; 2.5.x closeout
+
+Final patch of the 2.5.x arc. Carryover from the 2.4.6 audit (P(-1) C3): stdlib
+`matrix.cyr` `mat_new(rows, cols)` computes `16 + rows*cols*8` with **no guard**
+and is still unguarded in the pinned 6.0.14 (the cyrius fix is upstream/later).
+This adds the hisab-side mitigation. Suite 925 → **929**; the 2.5.x arc is complete.
+
+### Added
+- **`mat_new_guarded(rows, cols)`** (`linalg_ext.cyr`) — overflow-guarded
+  real-matrix constructor (CWE-190). Returns null for non-positive or
+  overflow-prone dimensions (cap `_MAT_MAX_ELEMS = 16M`, keeping `rows*cols`
+  well below 2⁶⁰ so `16 + rows*cols*8` can't wrap); otherwise delegates to
+  stdlib `mat_new`. The guarded entry point for matrices sized from untrusted /
+  external input — parity with the existing `cmat_new` guard. hisab's internal
+  callers (SVD/QR, optimize) pass dims from already-allocated matrices and are
+  unaffected.
+- **`tests/hisab.tcyr`** — 4 CWE-190 regression assertions (huge dims, zero rows,
+  over-cap 25M-element, and a valid small matrix).
+
+### Notes
+- The stdlib `mat_new` fix remains **upstream / roadmap-tracked** — re-verify when
+  the cyrius pin moves; until then `mat_new_guarded` is the safe constructor and
+  hisab's direct `mat_new` calls stay mitigated (dims from existing matrices).
+
 ## [2.5.2] - 2026-05-29 — CGA blade projection / rejection (2.5.x arc)
 
 Third patch of the 2.5.x arc — the last CGA piece, composing 2.5.0's contraction

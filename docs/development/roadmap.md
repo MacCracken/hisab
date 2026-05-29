@@ -11,15 +11,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.5.2
+## Current -- v2.5.3
 
-- **34 math modules in `src/`, ~16,490 lines** (`lib/` is vendored-only)
-- **925 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,500 lines** (`lib/` is vendored-only)
+- **929 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,446 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization) and 2.4.x (collision-correctness + security) arcs are **complete**; per-version detail is in the Release History table and CHANGELOG. The 2.4.x arc fixed three real collision bugs (hull sort, MPR, contact solver), verified the rest, and audited the security posture (`docs/audit/2026-05-29.md`).
-- **2.5.x arc in progress** — CGA depth + matrix guard. 2.5.0 (contraction) + 2.5.1 (dual) + 2.5.2 (projection/rejection) shipped; only 2.5.3 (`mat_new` guard closeout) pending.
+- **2.5.x arc COMPLETE** — CGA depth + matrix guard. 2.5.0 (contraction) → 2.5.1 (dual) → 2.5.2 (projection/rejection) → 2.5.3 (`mat_new` guard). CGA grew from 1 smoke assertion to 29; `mat_new_guarded` added as the CWE-190-safe constructor. The upstream stdlib `mat_new` fix remains tracked for when the cyrius pin moves.
 
 ---
 
@@ -62,13 +62,13 @@ Added `cga_blade_inverse` / `cga_project` / `cga_reject`. 10 assertions (915 →
 - [x] **Implement:** `cga_blade_inverse(B) = reverse(B)/norm_sq(B)` (zero-norm guard for null blades); `cga_project(X,B) = (X ⌋ B) ⌋ B⁻¹` (preserves grade(X)); `cga_reject = X − project`.
 - [x] **Coverage:** `project(e1,e12)=e1`, `project(e12,e12)=e12` (self), `project(e3,e12)=0` / `reject(e3,e12)=e3` (orthogonal), `reject(e1,e12)=0`, idempotence, `project+reject=X`, null-blade guard (no trap).
 
-### 2.5.3 — `mat_new` overflow guard (arc closeout)
-Carried over from the 2.4.6 audit (was C3 in the P(-1) audit). The audit confirmed
-stdlib `matrix.cyr` `mat_new(rows, cols)` (`16 + rows*cols*8`) is **still unguarded
-in the pinned 6.0.14 snapshot**.
-- [ ] **Re-check upstream:** re-test on the current cyrius pin — if the stdlib guard has landed, pin a regression test and close.
-- [ ] **If still unguarded:** since hisab must not edit vendored `lib/`, add a defensive dimension check at hisab's `mat_new` call sites (linalg_ext SVD/QR, optimize LM/Newton) or a small guarded wrapper, mirroring the `cmat_new` cap. hisab's exposure is already mitigated (dims come from already-allocated matrices), so this is belt-and-suspenders.
-- [ ] **Pin it:** add a CWE-190 regression assertion alongside the existing `cmat_new` / `tensor_new` guard tests in `edge_cases.tcyr`.
+### 2.5.3 — `mat_new` overflow guard (arc closeout) ✅ shipped
+Added `mat_new_guarded` as the hisab-side mitigation. 4 assertions (925 → 929).
+- [x] **Re-check upstream:** stdlib `mat_new` (`16 + rows*cols*8`) still unguarded on the pinned 6.0.14 — the cyrius fix is deferred until the toolchain pin moves (tracked, not a hisab edit since `lib/` is vendored).
+- [x] **Guarded wrapper:** `mat_new_guarded(rows, cols)` in `linalg_ext.cyr` caps dims (`_MAT_MAX_ELEMS = 16M`) and returns null on non-positive / overflow-prone sizes, else delegates to `mat_new`. Parity with `cmat_new`; the safe entry point for untrusted dims. Internal callers stay mitigated.
+- [x] **Pin it:** 4 CWE-190 regression assertions in `tests/hisab.tcyr` (huge / zero / over-cap / valid).
+
+> **Still open (deferred):** verify/land the upstream stdlib `mat_new` guard when the cyrius pin advances, then a regression test can target stdlib `mat_new` directly.
 
 ---
 
@@ -134,6 +134,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.5.3 | 2026-05-29 | 16,500 | 34 | CGA arc COMPLETE — `mat_new_guarded` (CWE-190 real-matrix guard); 4 assertions. 929 |
 | 2.5.2 | 2026-05-29 | 16,490 | 34 | CGA arc — blade projection/rejection (`cga_project`/`cga_reject` + blade inverse); 10 assertions. 925 |
 | 2.5.1 | 2026-05-29 | 16,480 | 34 | CGA arc — dual + pseudoscalar inverse (`cga_pseudoscalar`/`cga_dual`); 6 GA-identity assertions. 915 |
 | 2.5.0 | 2026-05-29 | 16,470 | 34 | CGA arc — contraction operators (`cga_left_contraction`/`cga_right_contraction`); 8 GA-identity assertions. 909 |

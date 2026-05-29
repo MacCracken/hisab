@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-05-28 — SIMD hot paths (2.3.x optimize/modernize arc)
+
+First patch of the 2.3.x arc: route vec/mat/quat hot paths through Cyrius's
+packed-double `f64v_*` builtins (added with hisab named as the gap-close
+consumer). Internal-only — public API and results unchanged; all 825 tests
+pass with **bit-identical** output to the scalar paths.
+
+### Performance
+Measured with an amplified microbench (loop timed by two `now_ns()` calls;
+the committed `bench()` harness has a ~488 ns per-iteration floor that hides
+op-level timings — see Notes). Before → after, ns/op:
+
+- **vec4 dot**: 26 → 4 ns (**~6.5×**, no alloc)
+- **vec4 add**: 46 → 20 ns (**~2.3×**)
+- **vec3 dot**: 20 → 9 ns (**~2.2×**, n=2 xy + scalar z)
+- **vec3 add**: 35 → 22 ns (**~1.6×**)
+- **m4_mul**: 716 → 158 ns (**~4.5×** — scalar path made 64+ accessor calls)
+- **m4_mul_vec4**: 106 → 59 ns (**~1.8×**)
+- **m3_mul**: 349 → 108 ns (**~3.2×**, over-read-safe hybrid)
+
+### Changed
+- **vec4** (`src/vec4.cyr`): `dot`/`add`/`sub`/`scale` → `f64v_*` at n=4 (HVec4
+  is exactly 4 contiguous f64; even n → no over-read). `length`/`length_sq`/
+  `normalize` inherit via `dot`.
+- **vec3** (`src/vec3.cyr`): `dot`/`add`/`sub`/`mul`/`scale` → over-read-safe
+  hybrid (`f64v_*` at n=2 on the xy pair + scalar z tail). HVec3 is 24 B = 3
+  doubles, so n=3 would read one f64 past the allocation.
+- **mat4** (`src/mat4.cyr`): `m4_mul` and `m4_mul_vec4` → column-major linear
+  combination (`f64v_scale`+`f64v_add` over contiguous 32-B columns).
+  `m4_transform_point`/`dir` inherit it.
+- **mat3** (`src/mat3.cyr`): `m3_mul`, `m3_mul_vec3` → over-read-safe hybrid.
+- **quat** (`src/quat.cyr`): `dot` → `f64v_dot` n=4; `normalize` scale → `f64v_scale`.
+  The Hamilton product stays scalar (not elementwise).
+
+### Added
+- **`tests/hisab.bcyr`**: amplified batch benchmarks (`vec3_dot_x64`,
+  `vec4_dot_x64`, `m4_mul_x16`, `m4_transform_x64`) that loop N ops per timed
+  call to clear the harness floor, so the SIMD wins are regression-trackable
+  in `bench-history.csv`.
+
+### Notes
+- `f64v_*` are **global codegen intrinsics** (no `[deps]`/include needed). They
+  MUST be reached through a function prologue: a bare `f64v_*` call from a
+  top-level `.tcyr` statement SIGSEGVs on a misaligned stack (SSE alignment).
+  All hisab ops are functions, so production + tests-via-wrappers are safe.
+- FP associativity: SIMD pairwise-sum vs scalar left-fold gave bit-identical
+  results across all 825 assertions — no tolerance regressions.
+
 ## [2.3.0] - 2026-05-28 — Cyrius 6.0.14 toolchain + library laid out in `src/`
 
 Toolchain modernization to **Cyrius 6.0.14** (from 5.7.10) and a structural

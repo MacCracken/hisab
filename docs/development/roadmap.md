@@ -11,15 +11,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.1
+## Current -- v2.6.2
 
-- **34 math modules in `src/`, ~16,540 lines** (`lib/` is vendored-only)
-- **939 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,560 lines** (`lib/` is vendored-only)
+- **943 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,575 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security), and 2.5.x (CGA depth + matrix guard) arcs are all **complete**. Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 929 across them; the 2.4.x arc fixed three real collision bugs, the 2.5.x arc grew CGA from 1 → 29 assertions.
-- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) + 2.6.1 (Weyl) shipped; 2.6.2 (parallel transport) → 2.6.3 (geodesic deviation) → 2.6.4 (higher forms) → 2.6.5 (closeout) pending.
+- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) + 2.6.1 (Weyl) + 2.6.2 (parallel transport) shipped; 2.6.3 (geodesic deviation) → 2.6.4 (higher forms) → 2.6.5 (closeout) pending.
 
 ---
 
@@ -57,12 +57,11 @@ Trace-free part of Riemann (`1/(n−2)` and `R/((n−1)(n−2))` trace terms). 5
 - [x] **Implement:** `weyl_tensor` / `weyl_get` from lowered Riemann + Ricci + scalar; all-zero for `n ≤ 2` (undefined there).
 - [x] **Coverage:** `C = 0` for 3D and 4D space forms (Riemann ≠ 0 — conformally-flat oracle); non-space-form 4D → `C ≠ 0`; trace-free `g^{ρμ} C_{ρσμν} = 0`.
 
-### 2.6.2 — Parallel transport along a curve (`parallel_transport`)
-Integrate `dV^a/dt = −Γ^a_{μν}(x(t)) · V^μ · (dx^ν/dt)` along a supplied curve,
-RK4, reusing the `geodesic_rk4` integrator shape.
-- [ ] **Bite 1 (oracle):** metric-compatible transport **preserves length** `⟨V,V⟩` along any curve; on flat space components are unchanged. Failing baseline.
-- [ ] **Bite 2 (implement):** RK4 step of the transport ODE given a curve sampler (position + velocity); per-step Christoffel at `x(t)`.
-- [ ] **Bite 3 (coverage):** length preserved along a sphere geodesic; flat-space identity transport; holonomy around a sphere loop ≈ enclosed solid angle.
+### 2.6.2 — Parallel transport along a curve (`parallel_transport`) ✅ shipped
+RK4 integration of `dV^a/dt = −Γ^a_{μν} V^μ ẋ^ν` (constant-Γ per step, like
+`geodesic_rk4`). 4 assertions (939 → 943).
+- [x] **Implement:** `parallel_transport` + `_pt_deriv` RHS; the transport ODE is linear in V (`dV/dt = M·V` for fixed `ẋ`).
+- [x] **Coverage:** flat (`Γ=0`) leaves V unchanged; unit-sphere latitude circle (θ=π/4) preserves `⟨V,V⟩` (metric compatibility) and rotates the vector.
 
 ### 2.6.3 — Geodesic deviation / Jacobi equation (`geodesic_deviation`)
 The tidal acceleration `D²J^a/dτ² = −R^a_{μνρ} u^μ J^ν u^ρ` for a separation
@@ -137,6 +136,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.2 | 2026-05-29 | 16,560 | 34 | Diffgeo arc — parallel transport (`parallel_transport`, RK4); 4 flat/sphere length-preservation assertions. 943 |
 | 2.6.1 | 2026-05-29 | 16,540 | 34 | Diffgeo arc — Weyl conformal-curvature tensor (`weyl_tensor`); 5 space-form/trace-free assertions. 939 |
 | 2.6.0 | 2026-05-29 | 16,520 | 34 | Diffgeo arc — sectional curvature (`sectional_curvature` from Riemann); 5 space-form/sphere assertions. 934 |
 | 2.5.4 | 2026-05-29 | 16,500 | 34 | CGA arc closeout — P(-1)/security audit (posture solid) + `architecture/math.md` equation catalogue. Docs-only, 929 |

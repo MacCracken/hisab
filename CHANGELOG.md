@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-05-29 — Parallel transport along a curve (2.6.x arc)
+
+Third patch of the 2.6.x arc — the first that adds connection *integration*
+(RK4) rather than an algebraic tensor combination. Additive; suite 939 → **943**.
+
+### Added
+- **`parallel_transport(v0, curve_vel, christoffel, dim, dt, steps)`**
+  (`diffgeo.cyr`) — RK4 integration of `dV^a/dt = −Γ^a_{μν} V^μ ẋ^ν` along a
+  curve with constant coordinate velocity `ẋ` (Christoffels held constant per
+  step, same convention as `geodesic_rk4`). Plus the `_pt_deriv` RHS helper.
+- **`tests/hisab.tcyr`** — 4 assertions: flat space (`Γ=0`) leaves the vector
+  unchanged; on a **unit-sphere latitude circle at θ=π/4** (Γ^θ_φφ=−½,
+  Γ^φ_θφ=1, metric `diag(1,½)`) transport along `φ` **preserves `⟨V,V⟩`**
+  (metric compatibility) and genuinely rotates the vector.
+
 ## [2.6.1] - 2026-05-29 — Weyl conformal-curvature tensor (2.6.x arc)
 
 Second patch of the 2.6.x arc. Adds the trace-free (conformally-invariant) part

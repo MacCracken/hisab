@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+## [2.4.4] - 2026-05-28 — Collision arc: MPR narrowphase fixed (2.4.x arc)
+
+Fifth patch of the collision-correctness arc, and the second with a real bug
+(after 2.4.0's hull). `mpr_intersect` / `mpr_penetration` (Minkowski Portal
+Refinement, 3D) returned a **false positive on every separated pair** — they
+never detected non-overlap. Fixed; suite 878 → **888**.
+
+### Fixed
+- **MPR origin-containment early-out** (`collision_core.cyr`): after building the
+  first portal support point `v1` (the farthest Minkowski-difference point toward
+  the origin), the code lacked the standard check that the origin is actually
+  reachable. For separated shapes `v1` falls short of the origin, and — when the
+  centers are colinear with it — execution dropped into the degenerate
+  `(v1−v0)×(−v0) == 0` branch whose comment says "check if between them" but which
+  **unconditionally returned 1 (hit)**. Off-axis separated pairs slipped through
+  the refinement loop's convergence test the same way. Added
+  `if dot(v1, dir) < 0 → miss` to both `mpr_intersect` (returns 0) and
+  `mpr_penetration` (returns 0); once it passes, the origin is genuinely within
+  the support toward it and the existing portal refinement is correct.
+
+### Added
+- **`tests/modules.tcyr`** — 10 MPR assertions + sphere/box support-function
+  helpers: sphere-sphere overlap (hit) vs separated on- and off-axis (miss — the
+  regression); penetration depth (`sum_radii − dist` = 1.0, plus the deeper 3.0
+  case) with a ±x normal; separated → miss; and box-box overlap / separated.
+
+### Notes
+- Of the five arc patches so far, only 2.4.0 (hull sort) and 2.4.4 (MPR) carried
+  genuine bugs; triangulate / delaunay / half-edge were already correct.
+
 ## [2.4.3] - 2026-05-28 — Collision arc: half-edge mesh audited (2.4.x arc)
 
 Fourth patch of the collision-correctness arc. The roadmap flagged the half-edge

@@ -11,16 +11,16 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.4.3
+## Current -- v2.4.4
 
-- **34 math modules in `src/`, ~16,450 lines** (`lib/` is vendored-only)
-- **878 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,460 lines** (`lib/` is vendored-only)
+- **888 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,426 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
 - P(-1) audit: 26/31 fixed
 - **2.3.x optimization/modernization arc complete** (2.3.0 toolchain → 2.3.1 SIMD → 2.3.2 einsum scratch → 2.3.3 safety audit → 2.3.4 layout/idiom). Per-version detail in the Release History table + CHANGELOG.
-- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) + 2.4.1 (`triangulate_polygon`) + 2.4.2 (`delaunay_2d`) + 2.4.3 (half-edge mesh) shipped; 2.4.4–2.4.5 pending.
+- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) + 2.4.1 (`triangulate_polygon`) + 2.4.2 (`delaunay_2d`) + 2.4.3 (half-edge mesh) + 2.4.4 (MPR narrowphase) shipped; only 2.4.5 (PGS solver) pending.
 
 ---
 
@@ -71,12 +71,11 @@ closed and open meshes. Deliverable: 11 assertions (867 → 878), no source chan
 - [x] **Audit:** reverse-edge twin pairing wires closed meshes fully and leaves open-boundary half-edges at `_COL_SENTINEL`; the `next→next→twin` one-ring walk (1000-step guard) detects interior vs boundary; adjacency collects each shared edge's twin face.
 - [x] **Coverage:** tetrahedron (closed → 0 boundary, 3 neighbours/face), single triangle (open → all boundary, 0 neighbours), 2-tri quad (4 boundary corners, 1 shared edge), hexagon fan (interior center + 6-vertex boundary rim), and the empty → null error path.
 
-### 2.4.4 — MPR narrowphase (`mpr_intersect` + `mpr_penetration`)
-XenoCollide / Minkowski Portal Refinement in 3D.
-- [ ] **Bite 1 (red):** analytic fixtures — sphere-sphere (overlap + separated), OBB-OBB (overlap + separated) → known boolean + penetration depth. Failing baseline.
-- [ ] **Bite 2 (fix `mpr_intersect`):** interior point `v0`, portal `v1/v2/v3` from support points, portal-refinement loop with a real termination criterion.
-- [ ] **Bite 3 (fix `mpr_penetration`):** depth + contact-normal extraction along the refined portal.
-- [ ] **Bite 4 (coverage):** sphere-sphere analytic depth, OBB-OBB, sphere-AABB; separated pairs return false / zero depth.
+### 2.4.4 — MPR narrowphase (`mpr_intersect` + `mpr_penetration`) ✅ shipped (real bug fixed)
+Found + fixed a false-positive: separated shapes always reported a hit.
+Deliverable: 10 assertions (878 → 888).
+- [x] **Fix:** added the missing origin-containment early-out `if dot(v1, dir) < 0 → miss`. Without it, separated colinear shapes hit a degenerate `(v1−v0)×(−v0)==0` branch that returned 1 unconditionally, and off-axis pairs slipped through convergence. Applied to both `mpr_intersect` and `mpr_penetration`.
+- [x] **Coverage:** sphere-sphere overlap vs separated (on/off-axis), penetration depth (1.0 and 3.0 cases) + ±x normal, separated → miss, box-box overlap/separated.
 
 ### 2.4.5 — contact solver (`sequential_impulse` + `solve_pgs`)
 Projected Gauss-Seidel for contact constraints; verify convergence + restitution.
@@ -158,6 +157,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.4.4 | 2026-05-28 | 16,460 | 34 | Collision arc — MPR narrowphase fixed (separated pairs were false +ve); 10 assertions. 888 |
 | 2.4.3 | 2026-05-28 | 16,450 | 34 | Collision arc — half-edge mesh audited (no bug; twin/boundary wiring correct); 11 assertions. 878 |
 | 2.4.2 | 2026-05-28 | 16,450 | 34 | Collision arc — `delaunay_2d` audited (no bug; cocircular-robust); 8 empty-circumcircle assertions. 867 |
 | 2.4.1 | 2026-05-28 | 16,450 | 34 | Collision arc — `triangulate_polygon` audited (no bug); 13 tiling/count assertions added. 859 |

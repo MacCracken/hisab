@@ -104,6 +104,36 @@ fn _he_boundary_sum(m, nv) {
     return s;
 }
 
+# MPR support functions. Sphere: shape = HVec4 (cx,cy,cz, radius);
+# support(dir) = center + radius * normalize(dir).
+fn _mpr_sup_sphere(shape, dir) {
+    var c = hvec3_new(HVec4_x(shape), HVec4_y(shape), HVec4_z(shape));
+    var dn = hvec3_normalize(dir);
+    return hvec3_add(c, hvec3_scale(dn, HVec4_w(shape)));
+}
+
+# Axis-aligned box: shape = 6 f64 [cx,cy,cz, hx,hy,hz]; per-axis far corner.
+fn _mpr_box_axis(c, h, d) {
+    if (f64_lt(d, 0) == 1) { return f64_sub(c, h); }
+    return f64_add(c, h);
+}
+fn _mpr_sup_box(shape, dir) {
+    var rx = _mpr_box_axis(load64(shape), load64(shape + 24), HVec3_x(dir));
+    var ry = _mpr_box_axis(load64(shape + 8), load64(shape + 32), HVec3_y(dir));
+    var rz = _mpr_box_axis(load64(shape + 16), load64(shape + 40), HVec3_z(dir));
+    return hvec3_new(rx, ry, rz);
+}
+fn _mpr_mkbox(cx, cy, cz, hx, hy, hz) {
+    var s = alloc(48);
+    store64(s, cx);
+    store64(s + 8, cy);
+    store64(s + 16, cz);
+    store64(s + 24, hx);
+    store64(s + 32, hy);
+    store64(s + 40, hz);
+    return s;
+}
+
 alloc_init();
 
 # ================================================================
@@ -1130,10 +1160,9 @@ assert_eq(f64_to(tensor_get2(t_sum, 1, 1)), 44, "tensor_add [1,1]");
 # ================================================================
 # 2.4.x collision-correctness arc: each algorithm is audited + covered in its
 # own patch. convex_hull_2d (2.4.0), triangulate_polygon (2.4.1), delaunay_2d
-# (2.4.2), and the half-edge mesh (2.4.3) are covered below. mpr_intersect /
-# solve_pgs remain deliberately unexercised until their patches — they may still
-# trip pre-existing port bugs (file was outside the build chain before 2.2.2 —
-# see CHANGELOG + roadmap).
+# (2.4.2), the half-edge mesh (2.4.3), and MPR narrowphase (2.4.4) are covered
+# below. sequential_impulse / solve_pgs (the PGS contact solver) remain
+# deliberately unexercised until 2.4.5 — see CHANGELOG + roadmap.
 test_group("collision_core: contact_new + accessors");
 
 var c_norm = hvec3_new(0, F64_ONE, 0);
@@ -1141,6 +1170,52 @@ var contact = contact_new(0, 1, c_norm, F64_HALF, F64_HALF, F64_HALF, F64_ONE, F
 assert_eq(ColContact_body_a(contact), 0, "ColContact body_a");
 assert_eq(ColContact_body_b(contact), 1, "ColContact body_b");
 assert_eq(f64_to(ColContact_penetration(contact)), 0, "ColContact penetration (0.5 → f64_to → 0 truncated)");
+
+# MPR narrowphase (2.4.4) — fixed a false-positive: separated shapes used to
+# report a hit (missing origin-containment early-out → degenerate colinear
+# branch returned 1). Now intersect/penetration are correct for spheres + boxes.
+test_group("collision_core: MPR narrowphase");
+
+var mpr_a = hvec4_new(0, 0, 0, F64_TWO);            # sphere r=2 @ origin
+var mpr_b_ov = hvec4_new(f64_from(3), 0, 0, F64_TWO);   # dist 3 < 4 → overlap
+var mpr_b_sep = hvec4_new(f64_from(5), 0, 0, F64_ONE);  # dist 5 > 3 → separated
+var mpr_b_off = hvec4_new(f64_from(5), f64_from(5), 0, F64_ONE);  # off-axis sep
+
+var mpr_ov = mpr_intersect(&_mpr_sup_sphere, mpr_a, &_mpr_sup_sphere, mpr_b_ov);
+assert_eq(mpr_ov, 1, "mpr_intersect: spheres overlap");
+var mpr_sep = mpr_intersect(&_mpr_sup_sphere, mpr_a, &_mpr_sup_sphere, mpr_b_sep);
+assert_eq(mpr_sep, 0, "mpr_intersect: spheres separated (was false +ve)");
+var mpr_off = mpr_intersect(&_mpr_sup_sphere, mpr_a, &_mpr_sup_sphere, mpr_b_off);
+assert_eq(mpr_off, 0, "mpr_intersect: spheres separated off-axis");
+
+# Penetration: depth = sum_radii − dist. Normal along ±x. Scale by 100 for f64_to.
+var mpr_n = alloc(8);
+var mpr_d = alloc(8);
+var mpr_hit = mpr_penetration(&_mpr_sup_sphere, mpr_a, &_mpr_sup_sphere, mpr_b_ov, mpr_n, mpr_d);
+assert_eq(mpr_hit, 1, "mpr_penetration: overlap returns hit");
+assert_eq(f64_to(f64_mul(load64(mpr_d), f64_from(100))), 100, "mpr_penetration: depth ~1.0 (4-3)");
+var mpr_nx = f64_abs(HVec3_x(load64(mpr_n)));
+assert_eq(f64_to(f64_mul(mpr_nx, f64_from(100))), 100, "mpr_penetration: normal ~±x");
+
+var mpr_b_deep = hvec4_new(F64_ONE, 0, 0, F64_TWO);     # dist 1 → depth 4-1 = 3
+var mpr_n2 = alloc(8);
+var mpr_d2 = alloc(8);
+mpr_penetration(&_mpr_sup_sphere, mpr_a, &_mpr_sup_sphere, mpr_b_deep, mpr_n2, mpr_d2);
+assert_eq(f64_to(f64_mul(load64(mpr_d2), f64_from(100))), 300, "mpr_penetration: deep depth ~3.0 (4-1)");
+
+var mpr_n3 = alloc(8);
+var mpr_d3 = alloc(8);
+var mpr_miss = mpr_penetration(&_mpr_sup_sphere, mpr_a, &_mpr_sup_sphere, mpr_b_sep, mpr_n3, mpr_d3);
+assert_eq(mpr_miss, 0, "mpr_penetration: separated returns miss");
+
+# Boxes (axis-aligned): overlap + separated.
+var mpr_box_a = _mpr_mkbox(0, 0, 0, F64_ONE, F64_ONE, F64_ONE);
+var mpr_box_ov = _mpr_mkbox(F64_ONE, 0, 0, F64_ONE, F64_ONE, F64_ONE);
+var mpr_boxov = mpr_intersect(&_mpr_sup_box, mpr_box_a, &_mpr_sup_box, mpr_box_ov);
+assert_eq(mpr_boxov, 1, "mpr_intersect: boxes overlap");
+var mpr_box_sep = _mpr_mkbox(f64_from(5), 0, 0, F64_ONE, F64_ONE, F64_ONE);
+var mpr_boxsep = mpr_intersect(&_mpr_sup_box, mpr_box_a, &_mpr_sup_box, mpr_box_sep);
+assert_eq(mpr_boxsep, 0, "mpr_intersect: boxes separated");
 
 # convex_hull_2d (2.4.0) — Andrew's monotone chain. Square (side 2) plus an
 # interior point: the hull is the 4 corners in CCW order; the interior point

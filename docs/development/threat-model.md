@@ -29,6 +29,8 @@ Hisab does NOT trust:
 | sequential_impulse | Zero/unbounded impulse | Fixed in 2.4.5 (sign + accumulate-into-velocity); impulse clamped ≥ 0, converges |
 | num_newton/bisection | Non-convergence | max_iter bound; returns ERR_NO_CONVERGENCE |
 | num_modpow | Intermediate multiplication overflow | _num_mulmod (Russian peasant) avoids overflow |
+| cga_blade_inverse | Division by zero on a null blade (`⟨B~B⟩₀ ≈ 0`) | Zero guard returns the zero multivector; pinned by the project-onto-null-blade test |
+| cga_pseudoscalar_inv | Division by `⟨I~I⟩₀` | Structurally `−1` for the unit pseudoscalar (no external input); cannot be zero |
 | cx_div, cx_inv | Division by zero | Zero guard returns cx_zero() |
 | dual_div/ln/sqrt | Division by zero | Zero guard returns dual_new(0,0) |
 | world_to_screen | Perspective divide by w=0 | Returns hvec3_zero() |
@@ -74,3 +76,4 @@ BDF-5 coefficients (300/137, etc.) were recomputed exact and verified via IEEE 7
 
 - **2026-04-15**: P(-1) audit — 31 issues found, 25 fixed. See [docs/audit/2026-04-15.md](../audit/2026-04-15.md).
 - **2026-05-29**: P(-1) hardening (v2.4.6) — security/CVE/supply-chain review closing the 2.4.x collision arc. No new vulnerability; 6 allocation-guard regression tests added; `mat_new` upstream item reconfirmed. See [docs/audit/2026-05-29.md](../audit/2026-05-29.md).
+- **2026-05-29**: 2.5.x closeout (v2.5.4) — P(-1)/security review of the CGA operators + `mat_new_guarded`. Posture solid (fixed-size allocs, bounded loops, guarded/structural divisions); no fix needed. Earned `architecture/math.md` (equation catalogue). See [docs/audit/2026-05-29-cga-arc-closeout.md](../audit/2026-05-29-cga-arc-closeout.md).

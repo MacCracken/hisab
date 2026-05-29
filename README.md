@@ -41,7 +41,7 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "matrix", "linalg", "t
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.5.3"
+tag     = "2.5.4"
 modules = ["dist/hisab.cyr"]   # ~550 KB self-contained bundle (all 34 modules)
 # Or pull individual files for a smaller compilation unit:
 # modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec3.cyr", ...]
@@ -97,13 +97,13 @@ cyrius bench tests/hisab.bcyr       # 26 benchmarks
 
 ## Architecture
 
-See [docs/architecture/overview.md](docs/architecture/overview.md) for the full module map, data flow, and design principles.
+See [docs/architecture/overview.md](docs/architecture/overview.md) for the full module map, data flow, and design principles, and [docs/architecture/math.md](docs/architecture/math.md) for the equation reference (CGA operators, plus a catalogue index of the other formula families).
 
 ## Stats
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.5.3 |
+| Version | 2.5.4 |
 | Library | 34 modules, ~16,500 lines of Cyrius |
 | Tests | 929 assertions across 4 suites |
 | Benchmarks | 26 operations |

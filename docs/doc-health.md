@@ -6,11 +6,12 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-05-29 (v2.5.3). Scaffolded at v2.4.6 during the post-2.4.x
-> doc sweep; the **2.5.x** CGA arc ran the same day and is now **complete** — 2.5.0
-> (contraction) + 2.5.1 (dual) + 2.5.2 (projection/rejection) + 2.5.3 (`mat_new`
-> guard) shipped (suite 901 → 929), with README / CLAUDE / testing / roadmap
-> current-state counts kept synced per-patch through the arc. The v2.4.6
+> **Last refresh**: 2026-05-29 (v2.5.4). Scaffolded at v2.4.6 during the post-2.4.x
+> doc sweep; the **2.5.x** CGA arc ran the same day — 2.5.0 (contraction) + 2.5.1
+> (dual) + 2.5.2 (projection/rejection) + 2.5.3 (`mat_new` guard), then **2.5.4**
+> the closeout (P(-1)/security audit — posture solid — and the new
+> `architecture/math.md` equation catalogue). Suite 901 → 929. README / CLAUDE /
+> testing / roadmap current-state counts kept synced per-patch through the arc. The v2.4.6
 > verify-and-cleanup pass: re-ran `bench-history.sh`
 > (benchmarks.md fresh again — **26** benchmarks at commit `b1165f9`); deleted
 > the ad-hoc `development/tool-issues.md` catalog (file real bugs in `issues/`,
@@ -32,7 +33,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 
 ---
 
-## At a glance — inventory (last reviewed 2026-05-29, v2.5.3)
+## At a glance — inventory (last reviewed 2026-05-29, v2.5.4)
 
 **~23 markdown files** across the repo. Bucket counts:
 
@@ -42,7 +43,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 | 🟡 **Stale — refresh in place** | 0 | `benchmarks.md` was stale; re-ran `bench-history.sh` this pass. None outstanding. |
 | 🟠 **Read-through outstanding** | 0 | CONTRIBUTING refreshed; `tool-issues.md` deleted; `linalg-proposal` archived. Cleared. |
 | 🔵 **Evergreen** | 1 | `CODE_OF_CONDUCT.md` — Contributor Covenant; re-read only on policy change. |
-| 📅 **Dated artifact — supersede, don't edit** | 5 | `audit/2026-04-15.md`, `audit/2026-05-29.md`, `benchmarks-rust-v-cyrius.md` (v2.2.0), `port-audit.md` (2026-04-15 + addendum), `development/archive/cyrius-linalg-proposal.md` (shipped). |
+| 📅 **Dated artifact — supersede, don't edit** | 6 | `audit/2026-04-15.md`, `audit/2026-05-29.md`, `audit/2026-05-29-cga-arc-closeout.md`, `benchmarks-rust-v-cyrius.md` (v2.2.0), `port-audit.md` (2026-04-15 + addendum), `development/archive/cyrius-linalg-proposal.md` (shipped). |
 | 🐞 **Tracked toolchain issues (live on 6.0.14)** | 5 | `development/issues/*` — all five cyrius/cbt bugs **re-verified still reproducing** on the pinned 6.0.14 this pass (see Tier 6). |
 
 Numbers approximate; rolls up from the per-tier tables below.
@@ -73,7 +74,7 @@ the scaffold's open items rather than letting them linger.
 | File | Last touched | Status | Action |
 |---|---|---|---|
 | `overview.md` | 2026-05-29 | ✅ Fresh | v2.4.6 sweep: header → v2.4.6 / 34 modules; module map completed (+Collision section); collision data-flow shows MPR + sequential-impulse. |
-| `math.md` | — | ⚪ Not yet earned | "When applicable" math reference (CLAUDE.md). Create when a non-obvious derivation needs a home (e.g. MPR portal refinement, in-circle predicate). |
+| `math.md` | 2026-05-29 | ✅ Fresh | **Created in the v2.5.4 closeout** — equation catalogue: CGA operators (contraction / dual / projection-rejection, with the pinned identities + literature references) plus a catalogue index of the library's other formula families. Earns the CLAUDE.md "math reference" slot. |
 
 ---
 
@@ -109,6 +110,7 @@ Periodic audit reports; per-audit timestamped. **Don't refresh in place — supe
 |---|---|---|
 | `2026-04-15.md` | 2026-04-15 | 📅 Dated artifact — P(-1) audit (31 issues, 25 fixed) |
 | `2026-05-29.md` | 2026-05-29 | 📅 Dated artifact — security/hardening audit closing the 2.4.x arc (no new vuln) |
+| `2026-05-29-cga-arc-closeout.md` | 2026-05-29 | 📅 Dated artifact — 2.5.x closeout (v2.5.4): P(-1)/security review of the CGA operators + `mat_new_guarded` (posture solid) + the math.md deliverable |
 
 Next periodic security audit: per CLAUDE.md, before a major release or after significant surface change. Natural next boundary is the 3.0.0 (`Result<T,E>`) cut.
 

@@ -2,9 +2,43 @@
 
 ## [Unreleased]
 
-## [2.5.3] - 2026-05-29 — `mat_new` overflow guard; 2.5.x closeout
+## [2.5.4] - 2026-05-29 — 2.5.x closeout: P(-1) / security audit + equation catalogue
 
-Final patch of the 2.5.x arc. Carryover from the 2.4.6 audit (P(-1) C3): stdlib
+Closeout pass for the 2.5.x arc — P(-1) cleanliness, a memory-safety / numerical
+review of the new CGA operators + `mat_new_guarded`, and the documentation
+deliverable. **No new vulnerability; no source change** (the arc's additions are
+bounded and guarded). Docs-only.
+
+### Added
+- **`docs/architecture/math.md`** — equation catalogue (earns the CLAUDE.md
+  "mathematical reference" doc slot). Documents the conformal model / metric /
+  blade layout; the product family (geometric, outer, left/right contraction with
+  grade rules); reverse / norm / blade inverse; dual + pseudoscalar; projection /
+  rejection — each with the pinned GA identities and literature references
+  (Dorst-Fontijne-Mann, Hestenes-Sobczyk, Doran-Lasenby) — plus a catalogue index
+  pointing at the rest of the library's formula material.
+- **`docs/audit/2026-05-29-cga-arc-closeout.md`** — the closeout audit report.
+
+### Security
+- Reviewed the six 2.5.x functions: results use fixed 256-byte allocations,
+  loops are bounded to blade indices 0..31 (no computed/unbounded indexing),
+  `cga_blade_inverse` guards null blades, `cga_pseudoscalar_inv`'s divisor is the
+  structural constant `⟨I~I⟩₀ = −1`, and `mat_new_guarded` caps dims (CWE-190).
+  No new shell/FFI/syscall surface. Posture solid.
+
+### Changed
+- **`threat-model.md`** — CGA division guards added to the attack-surface table;
+  2.5.4 audit-history entry. **`overview.md` / `README.md`** now reference
+  `math.md`. **`doc-health.md`** — math.md marked earned + the new audit logged.
+
+### Notes
+- Stdlib `mat_new` overflow remains **upstream / deferred** (cyrius pin unchanged);
+  `mat_new_guarded` is the mitigation. The CGA identity tests (29 assertions
+  across 2.5.0–2.5.3) pin the equation material catalogued in `math.md`.
+
+## [2.5.3] - 2026-05-29 — `mat_new` overflow guard (2.5.x arc)
+
+Final feature patch of the 2.5.x arc (the 2.5.4 audit/doc pass closes it out). Carryover from the 2.4.6 audit (P(-1) C3): stdlib
 `matrix.cyr` `mat_new(rows, cols)` computes `16 + rows*cols*8` with **no guard**
 and is still unguarded in the pinned 6.0.14 (the cyrius fix is upstream/later).
 This adds the hisab-side mitigation. Suite 925 → **929**; the 2.5.x arc is complete.

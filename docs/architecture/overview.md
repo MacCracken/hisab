@@ -1,6 +1,9 @@
 # Architecture Overview
 
-> hisab v2.4.6 — 34 math modules in `src/`, ~16,460 lines of Cyrius (`lib/` is
+> Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
+> of the library's other formula families).
+>
+> hisab v2.5.4 — 34 math modules in `src/`, ~16,500 lines of Cyrius (`lib/` is
 > vendored stdlib + first-party deps only). Compiled by cycc 6.0.14.
 
 ## Module Map

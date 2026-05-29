@@ -11,7 +11,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.5.3
+## Current -- v2.5.4
 
 - **34 math modules in `src/`, ~16,500 lines** (`lib/` is vendored-only)
 - **929 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
@@ -19,7 +19,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **`dist/hisab.cyr` distlib bundle** ~16,446 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization) and 2.4.x (collision-correctness + security) arcs are **complete**; per-version detail is in the Release History table and CHANGELOG. The 2.4.x arc fixed three real collision bugs (hull sort, MPR, contact solver), verified the rest, and audited the security posture (`docs/audit/2026-05-29.md`).
-- **2.5.x arc COMPLETE** — CGA depth + matrix guard. 2.5.0 (contraction) → 2.5.1 (dual) → 2.5.2 (projection/rejection) → 2.5.3 (`mat_new` guard). CGA grew from 1 smoke assertion to 29; `mat_new_guarded` added as the CWE-190-safe constructor. The upstream stdlib `mat_new` fix remains tracked for when the cyrius pin moves.
+- **2.5.x arc COMPLETE** — CGA depth + matrix guard. 2.5.0 (contraction) → 2.5.1 (dual) → 2.5.2 (projection/rejection) → 2.5.3 (`mat_new` guard) → 2.5.4 (P(-1)/security closeout + `architecture/math.md` equation catalogue). CGA grew from 1 smoke assertion to 29; `mat_new_guarded` added as the CWE-190-safe constructor. The upstream stdlib `mat_new` fix remains tracked for when the cyrius pin moves.
 
 ---
 
@@ -69,6 +69,12 @@ Added `mat_new_guarded` as the hisab-side mitigation. 4 assertions (925 → 929)
 - [x] **Pin it:** 4 CWE-190 regression assertions in `tests/hisab.tcyr` (huge / zero / over-cap / valid).
 
 > **Still open (deferred):** verify/land the upstream stdlib `mat_new` guard when the cyrius pin advances, then a regression test can target stdlib `mat_new` directly.
+
+### 2.5.4 — P(-1) / security closeout + equation catalogue ✅ shipped
+Closeout pass. P(-1) cleanliness + a memory-safety/numerical review of the CGA
+operators + `mat_new_guarded` — **posture solid, no source change**. Docs-only.
+- [x] **Audit:** fixed 256-byte allocs, loops bounded 0..31, `cga_blade_inverse` null-guard, `cga_pseudoscalar_inv` divisor structurally −1, `mat_new_guarded` CWE-190. See `docs/audit/2026-05-29-cga-arc-closeout.md`.
+- [x] **Equation catalogue:** created `docs/architecture/math.md` (CGA reference + identities + literature refs + catalogue index of the other formula families); wired from README / overview / threat-model / doc-health.
 
 ---
 
@@ -134,7 +140,8 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
-| 2.5.3 | 2026-05-29 | 16,500 | 34 | CGA arc COMPLETE — `mat_new_guarded` (CWE-190 real-matrix guard); 4 assertions. 929 |
+| 2.5.4 | 2026-05-29 | 16,500 | 34 | CGA arc closeout — P(-1)/security audit (posture solid) + `architecture/math.md` equation catalogue. Docs-only, 929 |
+| 2.5.3 | 2026-05-29 | 16,500 | 34 | CGA arc — `mat_new_guarded` (CWE-190 real-matrix guard); 4 assertions. 929 |
 | 2.5.2 | 2026-05-29 | 16,490 | 34 | CGA arc — blade projection/rejection (`cga_project`/`cga_reject` + blade inverse); 10 assertions. 925 |
 | 2.5.1 | 2026-05-29 | 16,480 | 34 | CGA arc — dual + pseudoscalar inverse (`cga_pseudoscalar`/`cga_dual`); 6 GA-identity assertions. 915 |
 | 2.5.0 | 2026-05-29 | 16,470 | 34 | CGA arc — contraction operators (`cga_left_contraction`/`cga_right_contraction`); 8 GA-identity assertions. 909 |

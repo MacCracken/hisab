@@ -84,7 +84,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `roadmap.md` | 2026-05-29 | ✅ Fresh | **Rotates every release.** Pruned to forward-facing only (completed arcs → Release History). Open: 2.5.x arc (CGA depth + `mat_new` guard), 2.6.0 (diffgeo), 2.7.0 (rendering/GPU/reverse-AD), 3.0.0 (`Result<T,E>`), + Parked. |
+| `roadmap.md` | 2026-05-29 | ✅ Fresh | **Rotates every release.** Pruned to forward-facing only (completed 2.3.x/2.4.x/2.5.x arcs → Release History). Open: **2.6.x arc** (diffgeo depth — sectional/Weyl/transport/Jacobi/forms + closeout, 2.6.0–2.6.5), then 2.7.0 (rendering/GPU/reverse-AD), 3.0.0 (`Result<T,E>`), + Parked. |
 | `threat-model.md` | 2026-05-29 | ✅ Fresh | v2.4.6 sweep: +six collision algorithms, `mat_new` note → 6.0.14, +Supply Chain, +2026-05-29 audit-history entry. |
 | `dependency-watch.md` | 2026-05-29 | ✅ Fresh | Cyrius toolchain version-watch. Build/test marker → 901/901 @ v2.4.6. Watching: 5.7.11 (RISC-V). |
 | `port-audit.md` | 2026-05-29 | 📅 Dated + addendum | 2026-04-15 Rust→Cyrius parity snapshot, preserved; 2026-05-29 status addendum records nearly all "P0 gaps" now ported. Don't rewrite the body. |

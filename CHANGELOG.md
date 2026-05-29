@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Documentation
+- Roadmap maintenance: removed the completed 2.5.x arc section (now in Release
+  History) and condensed the Current arc-history; re-organized the flat 2.6.0
+  "differential geometry depth" item into a **2.6.x arc** (2.6.0 sectional
+  curvature → 2.6.1 Weyl → 2.6.2 parallel transport → 2.6.3 geodesic deviation →
+  2.6.4 higher-order forms → 2.6.5 closeout), grounded in the existing
+  `diffgeo.cyr` primitives with known-manifold test oracles per patch.
+
 ## [2.5.4] - 2026-05-29 — 2.5.x closeout: P(-1) / security audit + equation catalogue
 
 Closeout pass for the 2.5.x arc — P(-1) cleanliness, a memory-safety / numerical

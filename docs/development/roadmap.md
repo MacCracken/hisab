@@ -16,75 +16,73 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **34 math modules in `src/`, ~16,500 lines** (`lib/` is vendored-only)
 - **929 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~16,446 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
+- **`dist/hisab.cyr` distlib bundle** ~16,575 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
-- **Arc history** — the 2.3.x (optimization/modernization) and 2.4.x (collision-correctness + security) arcs are **complete**; per-version detail is in the Release History table and CHANGELOG. The 2.4.x arc fixed three real collision bugs (hull sort, MPR, contact solver), verified the rest, and audited the security posture (`docs/audit/2026-05-29.md`).
-- **2.5.x arc COMPLETE** — CGA depth + matrix guard. 2.5.0 (contraction) → 2.5.1 (dual) → 2.5.2 (projection/rejection) → 2.5.3 (`mat_new` guard) → 2.5.4 (P(-1)/security closeout + `architecture/math.md` equation catalogue). CGA grew from 1 smoke assertion to 29; `mat_new_guarded` added as the CWE-190-safe constructor. The upstream stdlib `mat_new` fix remains tracked for when the cyrius pin moves.
+- **Arc history** — the 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security), and 2.5.x (CGA depth + matrix guard) arcs are all **complete**. Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 929 across them; the 2.4.x arc fixed three real collision bugs, the 2.5.x arc grew CGA from 1 → 29 assertions.
 
 ---
 
-## 2.5.x -- CGA depth + matrix guard
+## 2.6.x -- Differential geometry depth
 
-Conformal geometric algebra already ships in `geo_advanced.cyr` — a 32-blade
-(2⁵) conformal multivector with geometric product, outer (wedge) product,
-reverse, sandwich, norms, and the conformal constructors (`cga_point`,
-`cga_sphere`, `cga_plane`, `cga_translator`, `cga_rotor`). What's **missing** is
-the interior-product family — contraction, dual, projection/rejection — and CGA
-currently has a single alloc smoke assertion. This arc adds those operators and
-gives CGA real coverage, then closes out the carried-over `mat_new` guard.
+`diffgeo.cyr` already provides the curvature machinery — `christoffel_symbols`,
+`riemann_tensor`, `ricci_tensor` / `ricci_scalar`, `einstein_tensor`,
+`geodesic_rk4`, `killing_residual`, and a starter exterior algebra (`wedge_1_1`,
+`hodge_star_2form_4d`). This arc deepens it with the curvature / transport
+operators that build on those tensors, and extends the exterior algebra to
+higher grades.
 
-Unlike the 2.4.x arc (bug fixes, red-fixture-first), these are **additive feature
-patches** (new public `cga_*` functions, no signature changes), so each ships as
-a patch. The discipline: each operator lands with the **GA identities that define
-it** as its test oracle (e.g. contraction grade rules, dual involution,
-projection idempotence) — write the identity assertion, implement against the
-existing blade machinery (`_cga_geo_blades` / `_cga_blade_grade`), verify green,
-no regression on the 901-assertion suite. Commit-bites per patch below.
+Additive feature patches (new functions, no signature changes), so each ships as
+a patch. Discipline: each operator lands with a **closed-form / known-manifold
+oracle** as its test — constant-curvature sphere `K = 1/r²`, Weyl vanishing for
+`n ≤ 3` and conformally-flat metrics, metric-compatible transport preserving
+length, the Jacobi equation `J'' = −K·J` on a sphere, form identities
+(antisymmetry, `d² = 0`). Write the identity, implement against the existing
+tensors, verify green, no regression. Commit-bites per patch.
 
-> Order is dependency-aware: contraction is the interior-product primitive; dual
-> needs the pseudoscalar inverse; projection/rejection compose contraction + a
-> blade inverse. The `mat_new` guard is independent and lands last as the
-> hardening closeout.
+> Order is dependency-aware: sectional curvature + Weyl are algebraic on the
+> existing Riemann/Ricci (lowest-risk first); parallel transport adds connection
+> integration; geodesic deviation builds on Riemann + transport; higher forms
+> extend the exterior algebra independently. A P(-1)/security/docs closeout lands
+> last (and grows the diffgeo section of `math.md`).
 
-### 2.5.0 — CGA contraction operators (`cga_left_contraction` / `cga_right_contraction`) ✅ shipped
-Added the interior products (⌋ left, ⌊ right) — the outer-product loop with a
-grade-difference selector instead of grade-sum. 8 assertions (901 → 909).
-- [x] **Implement:** `cga_left_contraction` keeps `grade(b)−grade(a)`, `cga_right_contraction` keeps `grade(a)−grade(b)`; negative targets never match a non-negative blade grade, so out-of-range terms drop to zero.
-- [x] **Coverage (GA identities):** `e1 ⌋ e12 = e2`, `e1 ⌋ e1 = 1`, `(2e1+3e2) ⌋ self = 13` (vector norm²), `e1 ⌋ e23 = 0` (orthogonal), scalar contraction as scaling, `e12 ⌊ e1 = −e2` with grade drop.
+### 2.6.0 — Sectional curvature (`sectional_curvature`)
+`K(u,v) = R(u,v,v,u) / (⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩²)` — lower the first Riemann index
+with the metric, contract over the plane spanned by `u`, `v`.
+- [ ] **Bite 1 (oracle):** constant-curvature 2-sphere of radius `r` → `K = 1/r²` for any orthonormal pair; flat metric → `K = 0`. Failing baseline.
+- [ ] **Bite 2 (implement):** lower the index `R_{ρσμν} = g_{ρλ} R^λ_{σμν}`, then the sectional quotient with a degenerate-plane guard (`|denominator| < EPSILON → 0`).
+- [ ] **Bite 3 (coverage):** sphere `1/r²` at two radii; flat → 0; symmetry `K(u,v) = K(v,u)`.
 
-### 2.5.1 — CGA dual + pseudoscalar inverse (`cga_pseudoscalar`, `cga_dual`) ✅ shipped
-Added `cga_pseudoscalar` / `cga_pseudoscalar_inv` / `cga_dual`. 6 assertions (909 → 915).
-- [x] **Implement:** `I` = grade-5 unit blade; `I⁻¹ = reverse(I)/(I·reverse(I))_scalar` (= −I, em²=−1, derived not hard-coded); `dual(x) = x · I⁻¹`.
-- [x] **Coverage:** `I·I⁻¹ = 1`; grade flips `dual(1) = −I` (0→5), `dual(I) = 1` (5→0), `dual(e1) = −e23pm` (1→4); involution `dual(dual(e1)) = −e1` (sign pinned for this metric).
+### 2.6.1 — Weyl conformal-curvature tensor (`weyl_tensor`)
+The trace-free part of Riemann: `C = R − (Ricci/scalar trace terms)` with the
+dimension-dependent coefficients `2/(n−2)` and `2/((n−1)(n−2))`.
+- [ ] **Bite 1 (oracle):** **vanishes identically for `n ≤ 3`** and for any **conformally-flat** metric (flat space → 0). Failing baseline.
+- [ ] **Bite 2 (implement):** assemble from lowered Riemann + Ricci + scalar; guard `n < 3` (coefficient singular / Weyl undefined there).
+- [ ] **Bite 3 (coverage):** `C = 0` in 3D; `C = 0` for the flat 4D metric; trace-free contraction `g^{ρμ} C_{ρσμν} = 0`.
 
-### 2.5.2 — CGA blade projection / rejection (`cga_project`, `cga_reject`) ✅ shipped
-Added `cga_blade_inverse` / `cga_project` / `cga_reject`. 10 assertions (915 → 925).
-- [x] **Implement:** `cga_blade_inverse(B) = reverse(B)/norm_sq(B)` (zero-norm guard for null blades); `cga_project(X,B) = (X ⌋ B) ⌋ B⁻¹` (preserves grade(X)); `cga_reject = X − project`.
-- [x] **Coverage:** `project(e1,e12)=e1`, `project(e12,e12)=e12` (self), `project(e3,e12)=0` / `reject(e3,e12)=e3` (orthogonal), `reject(e1,e12)=0`, idempotence, `project+reject=X`, null-blade guard (no trap).
+### 2.6.2 — Parallel transport along a curve (`parallel_transport`)
+Integrate `dV^a/dt = −Γ^a_{μν}(x(t)) · V^μ · (dx^ν/dt)` along a supplied curve,
+RK4, reusing the `geodesic_rk4` integrator shape.
+- [ ] **Bite 1 (oracle):** metric-compatible transport **preserves length** `⟨V,V⟩` along any curve; on flat space components are unchanged. Failing baseline.
+- [ ] **Bite 2 (implement):** RK4 step of the transport ODE given a curve sampler (position + velocity); per-step Christoffel at `x(t)`.
+- [ ] **Bite 3 (coverage):** length preserved along a sphere geodesic; flat-space identity transport; holonomy around a sphere loop ≈ enclosed solid angle.
 
-### 2.5.3 — `mat_new` overflow guard (arc closeout) ✅ shipped
-Added `mat_new_guarded` as the hisab-side mitigation. 4 assertions (925 → 929).
-- [x] **Re-check upstream:** stdlib `mat_new` (`16 + rows*cols*8`) still unguarded on the pinned 6.0.14 — the cyrius fix is deferred until the toolchain pin moves (tracked, not a hisab edit since `lib/` is vendored).
-- [x] **Guarded wrapper:** `mat_new_guarded(rows, cols)` in `linalg_ext.cyr` caps dims (`_MAT_MAX_ELEMS = 16M`) and returns null on non-positive / overflow-prone sizes, else delegates to `mat_new`. Parity with `cmat_new`; the safe entry point for untrusted dims. Internal callers stay mitigated.
-- [x] **Pin it:** 4 CWE-190 regression assertions in `tests/hisab.tcyr` (huge / zero / over-cap / valid).
+### 2.6.3 — Geodesic deviation / Jacobi equation (`geodesic_deviation`)
+The tidal acceleration `D²J^a/dτ² = −R^a_{μνρ} u^μ J^ν u^ρ` for a separation
+field `J` along a geodesic with tangent `u`.
+- [ ] **Bite 1 (oracle):** unit sphere → nearby geodesics satisfy `J'' = −J` (`K = 1`); flat space → `J'' = 0`. Failing baseline.
+- [ ] **Bite 2 (implement):** evaluate the tidal term from `riemann_get` along a geodesic state.
+- [ ] **Bite 3 (coverage):** sphere convergence vs flat zero-deviation; linearity of the tidal operator in `J`.
 
-> **Still open (deferred):** verify/land the upstream stdlib `mat_new` guard when the cyrius pin advances, then a regression test can target stdlib `mat_new` directly.
+### 2.6.4 — Higher-order differential forms (`wedge_2_1`, `wedge_3_1`, …)
+Extend the exterior algebra past 2-forms to 3- and 4-forms (4D), with grade
+bookkeeping and antisymmetry.
+- [ ] **Bite 1 (oracle):** graded antisymmetry `α∧β = (−1)^{pq} β∧α`, `α∧α = 0` for odd degree, associativity. Failing baseline.
+- [ ] **Bite 2 (implement):** general graded wedge for 1/2/3-forms → up to 4-forms, reusing the antisymmetrization pattern in `wedge_1_1`.
+- [ ] **Bite 3 (coverage):** grade/sign bookkeeping; `d(dα) = 0` on a sampled form if an exterior derivative is in scope.
 
-### 2.5.4 — P(-1) / security closeout + equation catalogue ✅ shipped
-Closeout pass. P(-1) cleanliness + a memory-safety/numerical review of the CGA
-operators + `mat_new_guarded` — **posture solid, no source change**. Docs-only.
-- [x] **Audit:** fixed 256-byte allocs, loops bounded 0..31, `cga_blade_inverse` null-guard, `cga_pseudoscalar_inv` divisor structurally −1, `mat_new_guarded` CWE-190. See `docs/audit/2026-05-29-cga-arc-closeout.md`.
-- [x] **Equation catalogue:** created `docs/architecture/math.md` (CGA reference + identities + literature refs + catalogue index of the other formula families); wired from README / overview / threat-model / doc-health.
-
----
-
-## 2.6.0 -- Differential geometry depth
-
-- [ ] Parallel transport of vector fields along curves
-- [ ] Sectional curvature computation
-- [ ] Geodesic deviation equation
-- [ ] Weyl tensor (conformal curvature)
-- [ ] Higher-order differential forms (3-forms, 4-forms)
+### 2.6.5 — P(-1) / security / docs closeout
+- [ ] Audit the new tensor allocations + contraction loops (dim caps, index bounds, degenerate-plane / `n<3` guards); cleanliness + full gate.
+- [ ] Grow the **differential-geometry section of `docs/architecture/math.md`** (curvature conventions, sectional / Weyl / Jacobi formulas, the transport ODE, form grading) with references; dated audit report; doc-health refresh.
 
 ---
 
@@ -118,6 +116,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 - **`#pure` annotations** (from 2.3.4) — unsafe CSE interaction with hisab's allocate-a-fresh-result convention; speculative perf, no driver.
 - **Slices (`[T]` / `slice<T>`)** (from 2.3.4) — would regress the proven raw-pointer SIMD hot paths; `slice_unchecked_get_W` discards the safety benefit.
 - **`defer`** (from 2.3.4) — N/A under the bump/arena model (no per-resource lifecycle to clean up).
+- **Stdlib `mat_new` overflow guard** (from 2.5.3) — upstream cyrius fix; re-verify when the toolchain pin moves past it (hisab's `mat_new_guarded` is the local mitigation).
 
 ---
 

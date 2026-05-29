@@ -19,96 +19,76 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **`dist/hisab.cyr` distlib bundle** ~16,404 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
 - P(-1) audit: 26/31 fixed
-
-### Shipped in 2.3.0–2.3.1
-- **2.3.0** — toolchain 5.7.10 → **6.0.14**; library source moved `lib/*.cyr` → `src/*.cyr`; sakshi resolution repaired; tree reformatted under 6.0.x `cyrfmt`; CI aligned to abaco (fmt gate, security scan, version-template gate)
-- **2.3.1** — SIMD hot paths via `f64v_*`: vec4 dot 6.5×, m4_mul 4.5×, m3_mul 3.2×, vec3 dot 2.2× (825/825 bit-identical)
-- **2.3.2** — bounded einsum scratch (reused arena): 3960 → 176 bytes/call (~22× less allocator footprint); memory-only, speed unchanged
-- **2.3.3** — safety/numerical audit: no bugs (hisab already correct); fixed a wrong `>>` comment + pinned 8 invariants (logical-shift, mulmod overflow-safety, PCG determinism)
+- **2.3.x optimization/modernization arc complete** (2.3.0 toolchain → 2.3.1 SIMD → 2.3.2 einsum scratch → 2.3.3 safety audit → 2.3.4 layout/idiom). Per-version detail in the Release History table + CHANGELOG.
 
 ---
 
-## 2.3.x -- Optimization & Modernization Arc
+## 2.4.x -- Collision correctness arc
 
-Now that the toolchain is on 6.0.14, fold in the language + stdlib features
-that landed across 5.8–6.0 to make hot paths faster and the code more
-idiomatic — **without changing the public API**, so these ship as patches.
-Principles hold: every perf claim is benchmark-gated against
-`bench-history.csv`; every behavioral-adjacent change adds tests *first*;
-large items get broken into small, individually-verified bites.
-
-> Patch numbers below are thematic groupings, not hard commitments — reorder
-> by leverage as benchmarks dictate. The **breaking** error-handling migration
-> (`Result<T,E>` + `?`) is intentionally *not* here — see 3.0.0.
-
-### 2.3.1 — SIMD hot paths (keystone) ✅ shipped
-Cyrius's `f64v_*` packed-double builtins (v5.10.16) were added with hisab
-named as the gap-close consumer — the single biggest perf lever available.
-- [x] vec3/vec4 dot · add · sub · scale via `f64v_dot`/`f64v_add`/`f64v_sub`/`f64v_scale` (vec4 n=4; vec3 n=2+scalar-z). `length`/`normalize` inherit via `dot`
-- [x] mat3/mat4 multiply + vec transform via column-major linear combination (`f64v_scale`+`f64v_add`)
-- [x] quat `dot`/`normalize` via packed ops (Hamilton product stays scalar — not elementwise)
-- [x] **Guarded the odd-`n` over-read** — vec3/mat3 (24-B = 3 doubles) use n=2 + scalar tail; vec4/mat4/quat use n=4 (even, safe)
-- [x] Correctness verified against the 825-assertion suite (bit-identical to scalar) + amplified equivalence probes
-- [x] Benchmarked before/after; amplified batch benches added to `bench-history.csv` (single-op benches sit below the harness's ~488 ns floor)
-- Wins: vec4 dot 6.5×, m4_mul 4.5×, m3_mul 3.2×, vec3 dot 2.2× (see CHANGELOG 2.3.1)
-- Deferred: cross/lerp (need shuffles, not a clean f64v fit); `f64v2`/`f64v4` value-form (pointer-form via heap vecs was sufficient)
-
-### 2.3.2 — Scratch allocators ✅ shipped (re-scoped)
-Verification re-scoped this patch — the transcendental half was a no-op, and
-arena adoption only fit einsum:
-- [x] ~~Replace hand-rolled scalar transcendentals~~ — **already optimal**: hisab uses the stdlib `f64_sin/cos/exp/ln/abs` named-op intrinsics throughout (zero hand-rolled series). No change.
-- [x] **einsum scratch → reused module-global arena** (`arena_reset` at entry; `label_vals`/`indices` hoisted to reused buffers). **3960 → 176 bytes/call (~22×)**, scratch leak eliminated. Escape-verified (`tensor_new` copies shapes; einsum non-reentrant).
-- [x] symbolic/tensor left alone — their allocations are escaping result nodes (expr trees / tensors), not scratch; an arena-reset would corrupt results.
-- Memory win measured before/after; speed unchanged (arena ≈ bump, both O(1)).
-
-### 2.3.3 — Safety & numerical-correctness audit ✅ shipped (no bugs; invariants pinned)
-Audited against the vidya gotcha catalogue — **hisab was already correct**.
-Deliverable: one fixed comment + 8 regression assertions pinning the
-load-bearing invariants.
-- [x] **Static `var buf[N]`** — only 2 (float render), both copied by `str_from_buf` (alloc+memcpy). No escape, no cross-call corruption. Pinned by a render-independence test.
-- [x] **`var name[N]` sizing** — no bug: element arrays use `alloc(n*8)`; only stack arrays are byte buffers used as bytes.
-- [x] **Signed bit-math** — verified `>>` is **logical** (zero-fill) on 6.0.14; every shift is on non-negative/masked values, so it's correct throughout. Fixed a num.cyr comment that wrongly claimed `>>` was arithmetic. No unary `~` is used (all `~` are "≈" in comments). No `asr()` needed.
-- [x] **Overflow** — no factorial/binomial kernels exist (abaco's); Pollard-rho/modpow already use `_num_mulmod` (Russian-peasant) to avoid `a*b` overflow. Pinned by a Fermat test at p≈1e11.
-- [x] **Regression coverage** — `tests/edge_cases.tcyr` invariants: logical-shift, mulmod overflow-safety (Fermat), PCG32 determinism, render-buffer independence.
-
-### 2.3.4 — Layout & idiom modernization ✅ shipped
-Internal-only; public API/results/codegen unchanged, 833/833 bit-identical,
-benchmarks flat (`sizeof(T)` == old literal; derived setter == same `store64`).
-- [x] **`alloc(sizeof(T))` + derived setters** in the constructors of all 13
-  `#derive(accessors)` modules (vec2/3/4, quat, complex, autodiff, interval,
-  tensor, geo×9, collision_core, collision_mesh) — eliminates the last
-  hand-computed offsets/sizes; allocation is now coupled to the struct layout.
-- [x] **Enum-const buffer/grid sizes**: `MAT3_BYTES=72`, `MAT4_BYTES=128`
-  (alloc + copy-loop bounds), `FLOAT_RENDER_BUF=32` (`var buf[ENUM_CONST]`,
-  shared by the symbolic float renderers). The 2 bare `var buf[32]` literals
-  were the only stack-buffer duplication; matrices were the only repeated
-  heap-size literal.
-- [x] **`#must_use`** on the core value-returning API (9 foundational modules) —
-  build-time warning on discarded pure results; setters (`m3_set`/`m4_set`)
-  excluded. Full build + suite verified warning-free.
-- Deferred (evaluated): **`#pure`** (unsafe CSE interaction with the
-  allocate-fresh-result convention; speculative win, no driver); **slices**
-  (would regress the proven raw-pointer SIMD hot paths; unchecked slices add
-  no safety); **`defer`** (N/A — bump/arena model, no per-resource lifecycle).
-
----
-
-## 2.4.0 -- Collision module audit (algorithmic correctness)
-
-`collision_core.cyr` and `collision_mesh.cyr` compile and link, but the
-algorithms carry pre-existing bugs from the 2.2.0 port — they were added
+`collision_core.cyr` and `collision_mesh.cyr` compile and link, but the heavy
+algorithms carry pre-existing bugs from the 2.2.0 Rust port — they were added
 then but never exercised (they sat outside the build chain via the old
-orphan-include-after-syscall trick). 2.2.2 only smoke-tests the API surface
-(`contact_new` + `ColContact_*` accessors, `detect_islands`); the heavy
-algorithms need a correctness pass.
+orphan-include-after-syscall trick). 2.2.x only smoke-tests the API surface
+(`contact_new` + `ColContact_*` accessors, `detect_islands`); the algorithms
+below need a real correctness pass.
 
-- [ ] **`convex_hull_2d`** — `vec: index < 0` runtime bounds check on a 5-point input (square + interior point). Insertion-sort + monotone-chain logic needs review
-- [ ] **`triangulate_polygon`** (ear clipping) — likely similar boundary issues; not exercised yet
-- [ ] **`mpr_intersect`** + **`mpr_penetration`** — XenoCollide / Minkowski Portal Refinement in 3D; correctness against known test fixtures (sphere-sphere, OBB-OBB)
-- [ ] **`sequential_impulse`** + **`solve_pgs`** — projected Gauss-Seidel solver for contact constraints; verify convergence + restitution behavior
-- [ ] **`delaunay_2d`** (Bowyer-Watson) — needs a numerical-stability pass alongside basic correctness fixtures
-- [ ] **`halfedge_from_triangles`** + `halfedge_adjacent_faces` + `halfedge_is_boundary` — half-edge mesh accessors; check twin-pointer wiring
-- [ ] Add coverage to `tests/modules.tcyr` as each algorithm is fixed
+Unlike the 2.3.x arc (internal / codegen-neutral), **these patches change
+behavior** — so the discipline inverts: a **red fixture comes first** (a test
+that reproduces the bug or pins the expected result and currently fails), then
+the fix, then robustness + coverage. Each algorithm is **its own patch**;
+within a patch the work splits into **commit-sized bites** — each bite is one
+self-contained, individually-verified commit (gates green before the next).
+Public function signatures are unchanged (the functions already exist), so
+every fix ships as a **patch**.
+
+> Order is dependency- and risk-aware: 2D primitives first (smallest, one has a
+> known trap), mesh connectivity next, then 3D narrowphase, then the solver that
+> consumes contacts. Reorder by leverage as fixtures reveal coupling.
+
+### 2.4.1 — `convex_hull_2d` (monotone chain)
+Known: a 5-point input (unit square + interior point) trips a `vec: index < 0`
+runtime bounds check. The insertion-sort + Andrew's-monotone-chain logic needs
+review.
+- [ ] **Bite 1 (red):** fixture in `tests/modules.tcyr` — square + interior point → expect a 4-vertex CCW hull; capture the current `index < 0` trap as the failing baseline.
+- [ ] **Bite 2 (fix):** guard the chain-pop underflow (`while k >= 2 && cross(lower[k-2], lower[k-1], p) <= 0`); audit the sort comparator for the same off-by-one.
+- [ ] **Bite 3 (degeneracies):** collinear points, duplicates, `< 3` points, all-collinear → defined behavior (hull or empty, never a trap).
+- [ ] **Bite 4 (coverage):** assert hull vertex count, CCW orientation, and area against known fixtures (square, triangle, collinear set, random cloud).
+
+### 2.4.2 — `triangulate_polygon` (ear clipping)
+Same untested-port risk as the hull; ear detection + index bookkeeping unverified.
+- [ ] **Bite 1 (red):** convex quad → 2 triangles; concave L/arrow polygon → `n−2` triangles. Failing baseline first.
+- [ ] **Bite 2 (fix):** ear test (reflex-vertex classification + point-in-triangle), CCW-normalize the input, fix the vertex-list bookkeeping as ears are clipped.
+- [ ] **Bite 3 (degeneracies):** collinear edges, CW input, `< 3` verts, repeated vertices.
+- [ ] **Bite 4 (coverage):** triangle count `== n−2`; Σ triangle areas `==` polygon area; no overlaps; convex + concave fixtures.
+
+### 2.4.3 — `delaunay_2d` (Bowyer-Watson)
+Needs a numerical-stability pass alongside basic correctness.
+- [ ] **Bite 1 (red):** small point set → triangulation satisfying the empty-circumcircle (Delaunay) property. Failing baseline.
+- [ ] **Bite 2 (fix):** super-triangle setup, bad-triangle cavity collection, re-triangulation, super-triangle vertex removal.
+- [ ] **Bite 3 (robustness):** robust orientation + in-circle predicate (determinant sign); handle near-cocircular / near-collinear inputs without trapping.
+- [ ] **Bite 4 (coverage):** in-circle property holds for every output triangle; known fixtures (grid, cocircular quad, random cloud); full vertex coverage.
+
+### 2.4.4 — half-edge mesh (`halfedge_from_triangles` + accessors)
+Check twin-pointer wiring and the boundary / adjacency queries.
+- [ ] **Bite 1 (red):** two-triangle quad (shared edge) → twins paired across the shared edge, the 4 outer edges flagged boundary. Failing baseline.
+- [ ] **Bite 2 (fix):** edge-key → half-edge map for twin pairing; `next` pointers cycling each face.
+- [ ] **Bite 3:** `halfedge_adjacent_faces` + `halfedge_is_boundary` correctness on the wired mesh.
+- [ ] **Bite 4 (coverage):** closed mesh (tetrahedron) → every half-edge has a twin, zero boundary; open mesh (single quad / strip) → exact boundary count.
+
+### 2.4.5 — MPR narrowphase (`mpr_intersect` + `mpr_penetration`)
+XenoCollide / Minkowski Portal Refinement in 3D.
+- [ ] **Bite 1 (red):** analytic fixtures — sphere-sphere (overlap + separated), OBB-OBB (overlap + separated) → known boolean + penetration depth. Failing baseline.
+- [ ] **Bite 2 (fix `mpr_intersect`):** interior point `v0`, portal `v1/v2/v3` from support points, portal-refinement loop with a real termination criterion.
+- [ ] **Bite 3 (fix `mpr_penetration`):** depth + contact-normal extraction along the refined portal.
+- [ ] **Bite 4 (coverage):** sphere-sphere analytic depth, OBB-OBB, sphere-AABB; separated pairs return false / zero depth.
+
+### 2.4.6 — contact solver (`sequential_impulse` + `solve_pgs`)
+Projected Gauss-Seidel for contact constraints; verify convergence + restitution.
+Depends on correct contacts (2.4.5), so it lands last.
+- [ ] **Bite 1 (red):** one contact, two bodies, known normal + penetration → expected accumulated normal impulse / post-solve relative velocity. Failing baseline.
+- [ ] **Bite 2 (fix PGS):** effective mass, accumulated normal impulse with `≥ 0` clamping, Baumgarte / bias position correction.
+- [ ] **Bite 3:** restitution (bounce) + friction-cone clamping.
+- [ ] **Bite 4 (coverage):** resting contact → relative normal velocity → 0; restitution = 1 → velocity reverses; multi-contact island (via `detect_islands`) converges.
 
 ---
 
@@ -144,11 +124,22 @@ The integer-error-code convention (`lib/error.cyr`: functions return 0 / a
 negative `ERR_*` code) predates the stdlib `Result<T,E>` (`lib/result.cyr`,
 v5.8.28) and `?` propagation (v5.8.29). Migrating is a library-wide signature
 change — breaking for consumers (impetus, kiran, joshua, …) — so it lands as
-a major, with a migration guide, not a 2.3.x patch.
+a major, with a migration guide, not a 2.x patch.
 
 - [ ] Wrap fallible returns in `Result<T,E>` (keep `ERR_*` codes as the `E` payload)
 - [ ] Adopt `?` to replace manual `-1`-return + check chains
 - [ ] Migration guide + deprecation window for the old integer-code API
+
+---
+
+## Parked / deferred (revisit when a driver appears)
+
+Evaluated during earlier arcs and consciously deferred — recorded so they
+aren't silently lost (full rationale in the CHANGELOG):
+- **SIMD `cross` / `lerp`** (from 2.3.1) — need lane shuffles, not a clean `f64v_*` fit. Revisit if Cyrius adds packed shuffles.
+- **`#pure` annotations** (from 2.3.4) — unsafe CSE interaction with hisab's allocate-a-fresh-result convention; speculative perf, no driver.
+- **Slices (`[T]` / `slice<T>`)** (from 2.3.4) — would regress the proven raw-pointer SIMD hot paths; `slice_unchecked_get_W` discards the safety benefit.
+- **`defer`** (from 2.3.4) — N/A under the bump/arena model (no per-resource lifecycle to clean up).
 
 ---
 

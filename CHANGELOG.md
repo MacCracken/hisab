@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Documentation
+- Repo-wide documentation sweep to v2.4.6 state: pruned the roadmap to
+  forward-facing / deferred work only (the completed 2.3.x and 2.4.x arcs now
+  live in Release History); refreshed README (added the **Collision** module row
+  + spatial/einsum/lie_ext/linalg_precision/noise_simplex; version, counts,
+  binary size); completed the `architecture/overview.md` module map (all 34
+  modules + a Collision section) and updated the collision data-flow (MPR +
+  sequential-impulse); synced test/benchmark counts (901 / 28) in `testing.md`;
+  added collision + supply-chain entries to `SECURITY.md`; added a 2026-05-29
+  status addendum to the dated `port-audit.md`; refreshed `dependency-watch.md`
+  and the CLAUDE.md status line.
+
 ## [2.4.6] - 2026-05-29 — Security & hardening audit; 2.4.x closeout
 
 P(-1) hardening step closing the 2.4.x arc: a memory-safety / allocation-overflow

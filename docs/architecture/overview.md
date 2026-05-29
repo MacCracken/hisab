@@ -1,6 +1,7 @@
 # Architecture Overview
 
-> Cyrius port of hisab v1.4.0 — 27 lib files, 11,769 lines
+> hisab v2.4.6 — 34 math modules in `src/`, ~16,460 lines of Cyrius (`lib/` is
+> vendored stdlib + first-party deps only). Compiled by cycc 6.0.14.
 
 ## Module Map
 
@@ -8,38 +9,47 @@
 hisab (Cyrius)
 ├── Foundation types
 │   ├── error.cyr          — Error codes (ERR_*), epsilon constants
-│   ├── f64_util.cyr       — f64_tan, f64_fmod, f64_copysign, f64_approx_eq
+│   ├── f64_util.cyr       — f64_tan/fmod/copysign/approx_eq, f64_le/f64_ge (non-strict cmp)
 │   ├── vec2.cyr           — HVec2: 2D f64 vector (heap-allocated)
-│   ├── vec3.cyr           — HVec3: 3D f64 vector with cross, reflect, min/max
-│   ├── vec4.cyr           — HVec4: 4D f64 vector, Vec3 conversion
+│   ├── vec3.cyr           — HVec3: 3D f64 vector with cross, reflect, min/max (SIMD f64v)
+│   ├── vec4.cyr           — HVec4: 4D f64 vector, Vec3 conversion (SIMD f64v)
 │   ├── quat.cyr           — HQuat: quaternion with slerp, rotation, axis-angle
 │   ├── mat3.cyr           — 3x3 matrix: mul, inverse, determinant, from_quat
 │   └── mat4.cyr           — 4x4 matrix: inverse, SRT, projections, look-at
 │
 ├── Transforms
 │   ├── transforms.cyr     — Transform2D/3D, compose, Euler, screen projection, lerp
-│   └── color.cyr          — sRGB/HSV/HSL, Porter-Duff (8 ops), tone mapping, SH L2, EV
+│   └── color.cyr          — sRGB/HSV/HSL/Oklab, Porter-Duff (8 ops), tone mapping, SH L2, EV
 │
 ├── Geometry
 │   ├── geo.cyr            — 9 primitives, 6 ray tests, closest-point queries
-│   └── geo_advanced.cyr   — GJK/EPA 3D, BVH, SDF+CSG, swept AABB, TOI, CGA 5D
+│   ├── geo_advanced.cyr   — GJK/EPA 3D, SDF+CSG, swept AABB, TOI, CGA 5D
+│   └── spatial.cyr        — BVH, k-d tree, octree, quadtree, spatial hash
+│
+├── Collision
+│   ├── collision_core.cyr — MPR/XenoCollide narrowphase, sequential-impulse solver,
+│   │                         convex hull 2D (monotone chain), triangulation (ear clipping)
+│   └── collision_mesh.cyr — Delaunay (Bowyer-Watson), half-edge mesh, island detection (union-find)
 │
 ├── Calculus
 │   ├── calc.cyr           — Derivative, Simpson/Gauss-Legendre, Bezier, easing, Perlin 2D
-│   └── calc_ext.cyr       — Gradient/Jacobian/Hessian, adaptive Simpson, B-spline, NURBS,
-│                             Hermite TCB, monotone cubic, 3D Perlin noise
+│   ├── calc_ext.cyr       — Gradient/Jacobian/Hessian, adaptive Simpson, B-spline, NURBS,
+│   │                         Hermite TCB, monotone cubic, 3D Perlin noise
+│   └── noise_simplex.cyr  — Simplex noise (2D/3D)
 │
 ├── Numerical
 │   ├── num.cyr            — Newton/bisection, FFT/IFFT, RK4, PCG32, primes, sieve, Kahan sum
 │   ├── ode.cyr            — DOPRI45, backward Euler, BDF-2..5, SDE, symplectic, Verlet, Yoshida
 │   ├── optimize.cyr       — Gradient descent, CG (Polak-Ribiere+), BFGS, L-BFGS, LM
-│   ├── linalg_ext.cyr     — CSR sparse, GMRES, BiCGSTAB, PGS, SVD, eigen, Lyapunov, inertia
+│   ├── linalg_ext.cyr     — CSR sparse, GMRES, BiCGSTAB, PGS/LCP, SVD, eigen, Lyapunov, inertia
+│   ├── linalg_precision.cyr — Compensated / high-precision linear algebra
 │   └── num_ext.cyr        — Extended GCD, totient, Mobius, factorize, CRT, DST/DCT, 2D-FFT,
 │                             Halton/Sobol, tridiagonal solver
 │
 ├── Physics
 │   ├── complex.cyr        — Complex numbers + matrices, Pauli, Dirac gamma, matrix exp
 │   ├── lie.cyr            — U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz
+│   ├── lie_ext.cyr        — SE(3)/SO(3), adjoint, exp/log maps, BCH
 │   └── diffgeo.cyr        — Christoffel→Einstein, geodesic RK4, Killing, exterior algebra
 │
 ├── Symbolic
@@ -49,7 +59,8 @@ hisab (Cyrius)
 └── Other
     ├── autodiff.cyr       — Dual numbers (forward-mode AD)
     ├── interval.cyr       — Interval arithmetic
-    └── tensor.cyr         — N-D dense tensor, Kronecker/Minkowski/Levi-Civita, contraction
+    ├── tensor.cyr         — N-D dense tensor, Kronecker/Minkowski/Levi-Civita
+    └── einsum.cyr         — Einstein-summation contraction (bounded reused arena)
 ```
 
 ## Dependencies
@@ -81,22 +92,28 @@ Scene objects
       │
       ▼
 ┌─────────┐
-│   BVH   │  (bvh_build, bvh_query_ray/aabb)
+│  BVH /  │  (bvh_build, bvh_query_ray/aabb; k-d tree, octree, spatial hash)
+│ spatial │
 └────┬────┘
      ▼
 Candidate pairs
      │
      ▼
-┌──────────┐
-│ GJK/EPA  │  (gjk_intersect_3d, gjk_epa_3d)
-└────┬─────┘
+┌────────────────────┐
+│  Narrowphase:      │  GJK/EPA  (gjk_intersect_3d, gjk_epa_3d)
+│  GJK/EPA  or  MPR  │  MPR      (mpr_intersect, mpr_penetration — XenoCollide)
+└────┬───────────────┘
      ▼
-Penetration { normal, depth }
+Penetration { normal, depth }  →  contact_new()
      │
      ▼
-┌─────────────────┐
-│ solve_pgs()     │  (projected Gauss-Seidel)
-└─────────────────┘
+┌──────────────────────────────┐
+│  Constraint solve:           │  sequential_impulse()  (accumulate-clamp impulses)
+│  sequential_impulse / PGS    │  solve_pgs()           (projected Gauss-Seidel LCP)
+└──────────────────────────────┘
+     │
+     ▼
+detect_islands()  (union-find — partitions the contact graph)
 ```
 
 ## Data Flow — ODE Solving

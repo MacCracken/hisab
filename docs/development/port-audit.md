@@ -2,6 +2,21 @@
 
 > Audit of hisab v1.4.0 Rust → Cyrius port completeness.
 
+> **Status update (2026-05-29, v2.4.6):** this is the original 2026-04-15
+> snapshot, preserved as-is. Since then nearly all of the "Genuine P0 gaps"
+> below have been ported — the library is now **34 modules / ~16,460 lines**.
+> Done since: full ODE suite (DOPRI45, BDF-2..5, symplectic, SDE), optimization
+> (GD/CG/BFGS/L-BFGS/LM), sparse + GMRES/BiCGSTAB/PGS, SVD/eigen, DST/DCT/2D-FFT,
+> advanced number theory, all splines + adaptive Simpson + gradient/Jacobian/
+> Hessian, simplex noise, spatial (k-d tree/quadtree/octree/spatial hash), the
+> **full collision arc** (MPR, sequential-impulse, convex hull, triangulation,
+> Delaunay, half-edge, island detection — audited + fixed in 2.4.x), SE(3)/SO(3)
+> + adjoint + BCH (lie_ext), einsum, and symbolic integration/LaTeX/pattern
+> matching. **Genuinely still open** (tracked in the roadmap): reverse-mode
+> (tape) autodiff + differentiable rendering + GPU (2.7.0), deeper differential
+> geometry (2.6.0), and the `Result<T,E>` error migration (3.0.0). Dual
+> quaternions and convex *decomposition* remain demand-gated.
+
 ## Summary
 
 | Metric | Rust | Cyrius | Status |

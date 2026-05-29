@@ -11,7 +11,7 @@ differential geometry, symbolic algebra.
 - **Language**: Cyrius (sovereign systems language, compiled by cycc)
 - **Toolchain**: Cyrius 6.0.14 (`cyrius.cyml: cyrius = "6.0.14"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.3.0 — compiles cleanly under cycc 6.0.14. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~545 KB / 16,195 lines, fits cycc 6.0.14's 1 MB input_buf with ~480 KB headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (825/825).
+- **Status**: 2.4.6 — compiles cleanly under cycc 6.0.14. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~535 KB / 16,446 lines, fits cycc 6.0.14's 1 MB input_buf with ample headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (901/901). The 2.3.x (optimize/modernize) and 2.4.x (collision-correctness + security) arcs are complete.
 
 ## Consumers
 
@@ -45,7 +45,7 @@ src/*.cyr            — the 34 math modules (the library source). Self-containe
                        (no `include` lines); stdlib resolves via [deps] stdlib
 lib/                 — vendored stdlib + first-party deps ONLY (managed by
                        `cyrius deps`) — no project source here
-dist/hisab.cyr       — full 34-module distlib bundle (~545 KB / 16,195 lines),
+dist/hisab.cyr       — full 34-module distlib bundle (~535 KB / 16,446 lines),
                        regenerated via `cyrius distlib`. Consumers pull this
                        single file via [deps.hisab] modules = ["dist/hisab.cyr"]
 examples/            — small demos (basic_math.cyr)

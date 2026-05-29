@@ -16,91 +16,17 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **34 math modules in `src/`, ~16,460 lines** (`lib/` is vendored-only)
 - **901 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~16,426 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
-- Toolchain **6.0.14**; CI fmt/lint/vet/security all green
-- P(-1) audit: 26/31 fixed
-- **2.3.x optimization/modernization arc complete** (2.3.0 toolchain → 2.3.1 SIMD → 2.3.2 einsum scratch → 2.3.3 safety audit → 2.3.4 layout/idiom). Per-version detail in the Release History table + CHANGELOG.
-- **2.4.x collision-correctness arc COMPLETE** — 2.4.0 (`convex_hull_2d`) → 2.4.1 (`triangulate_polygon`) → 2.4.2 (`delaunay_2d`) → 2.4.3 (half-edge mesh) → 2.4.4 (MPR narrowphase) → 2.4.5 (contact solver) → 2.4.6 (security/hardening closeout). Real bugs fixed in 2.4.0 / 2.4.4 / 2.4.5; the rest were already correct. All six algorithms audited + covered; security posture reviewed (see `docs/audit/2026-05-29.md`).
+- **`dist/hisab.cyr` distlib bundle** ~16,446 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
+- Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
+- **Arc history** — the 2.3.x (optimization/modernization) and 2.4.x (collision-correctness + security) arcs are **complete**; per-version detail is in the Release History table and CHANGELOG. The 2.4.x arc fixed three real collision bugs (hull sort, MPR, contact solver), verified the rest, and audited the security posture (`docs/audit/2026-05-29.md`).
 
 ---
 
-## 2.4.x -- Collision correctness arc
-
-`collision_core.cyr` and `collision_mesh.cyr` compile and link, but the heavy
-algorithms carry pre-existing bugs from the 2.2.0 Rust port — they were added
-then but never exercised (they sat outside the build chain via the old
-orphan-include-after-syscall trick). 2.2.x only smoke-tests the API surface
-(`contact_new` + `ColContact_*` accessors, `detect_islands`); the algorithms
-below need a real correctness pass.
-
-Unlike the 2.3.x arc (internal / codegen-neutral), **these patches change
-behavior** — so the discipline inverts: a **red fixture comes first** (a test
-that reproduces the bug or pins the expected result and currently fails), then
-the fix, then robustness + coverage. Each algorithm is **its own patch**;
-within a patch the work splits into **commit-sized bites** — each bite is one
-self-contained, individually-verified commit (gates green before the next).
-Public function signatures are unchanged (the functions already exist), so
-every fix ships as a **patch**.
-
-> Order is dependency- and risk-aware: 2D primitives first (smallest, one has a
-> known trap), mesh connectivity next, then 3D narrowphase, then the solver that
-> consumes contacts. Reorder by leverage as fixtures reveal coupling.
-
-### 2.4.0 — `convex_hull_2d` (monotone chain) ✅ shipped
-Two pre-existing port bugs made the function trap on any non-trivial input
-(it had never run). Both fixed; 13 assertions added (833 → 846).
-- [x] **Sort fix:** the hand-rolled insertion sort's `done`-exit path overwrote the insertion index with `-1` on mid-array inserts → `vec: index < 0` trap. Rewritten as a standard insertion sort (shift-greater, drop `key` at `sj + 1`).
-- [x] **Missing primitives:** the chain's pop test calls `f64_le`/`f64_ge`, which were never defined (only strict `f64_lt`/`f64_gt` are intrinsics) → SIGILL once the sort was fixed. Defined both in `f64_util.cyr`; also clears the same latent references at 6 `spatial.cyr` sites.
-- [x] **Coverage:** square + interior (4-vertex CCW hull, shoelace 2×area = +8); degeneracies — empty/single, triangle (count + CCW area), collinear (→ 2 endpoints), duplicate corner (→ 4). None trap.
-
-### 2.4.1 — `triangulate_polygon` (ear clipping) ✅ shipped (no bug found)
-Audited the suspected-buggy port — it was **already correct**. Deliverable: 13
-assertions (846 → 859), no source change.
-- [x] **Audit:** ear test (reflex classification + point-in-triangle), CCW/CW winding normalization, and shrink-as-clipped bookkeeping all correct. The `n*n` cap + bail guard terminate degenerate inputs without trapping. Shares none of the hull's broken sort and never referenced the undefined `f64_le`/`f64_ge`.
-- [x] **Coverage:** count `== 3*(n−2)` + tiling check (|Σ 2×area| == polygon |2×area|) over convex quad, concave 5-gon, hexagon, U-shape (2 reflex), CW quad, collinear edge vertex, and `n < 3`.
-
-### 2.4.2 — `delaunay_2d` (Bowyer-Watson) ✅ shipped (no bug found)
-Audited the suspected-fragile algorithm — it was **already correct and robust**,
-including the cocircular grid. Deliverable: 8 assertions (859 → 867), no source change.
-- [x] **Audit:** the in-circle predicate adjusts by winding sign and tests *strict* interiority (cocircular points not flagged), so super-triangle setup/removal, bad-triangle cavity, boundary-edge extraction, swap-remove, and CCW output all hold.
-- [x] **Coverage:** empty-circumcircle property verified (0 violations) on square+interior, **3×3 grid** (cocircular stress), and an irregular 6-point set; plus `n = 3`, `n < 3`, and all-collinear (→ empty, no trap).
-
-### 2.4.3 — half-edge mesh (`halfedge_from_triangles` + accessors) ✅ shipped (no bug found)
-Audited the twin wiring + boundary/adjacency queries — **already correct** on
-closed and open meshes. Deliverable: 11 assertions (867 → 878), no source change.
-- [x] **Audit:** reverse-edge twin pairing wires closed meshes fully and leaves open-boundary half-edges at `_COL_SENTINEL`; the `next→next→twin` one-ring walk (1000-step guard) detects interior vs boundary; adjacency collects each shared edge's twin face.
-- [x] **Coverage:** tetrahedron (closed → 0 boundary, 3 neighbours/face), single triangle (open → all boundary, 0 neighbours), 2-tri quad (4 boundary corners, 1 shared edge), hexagon fan (interior center + 6-vertex boundary rim), and the empty → null error path.
-
-### 2.4.4 — MPR narrowphase (`mpr_intersect` + `mpr_penetration`) ✅ shipped (real bug fixed)
-Found + fixed a false-positive: separated shapes always reported a hit.
-Deliverable: 10 assertions (878 → 888).
-- [x] **Fix:** added the missing origin-containment early-out `if dot(v1, dir) < 0 → miss`. Without it, separated colinear shapes hit a degenerate `(v1−v0)×(−v0)==0` branch that returned 1 unconditionally, and off-axis pairs slipped through convergence. Applied to both `mpr_intersect` and `mpr_penetration`.
-- [x] **Coverage:** sphere-sphere overlap vs separated (on/off-axis), penetration depth (1.0 and 3.0 cases) + ±x normal, separated → miss, box-box overlap/separated.
-
-### 2.4.5 — contact solver (`sequential_impulse` + `solve_pgs`) ✅ shipped (real bug fixed)
-`sequential_impulse` returned all-zero impulses (did nothing); `solve_pgs` was
-correct but barely tested. Deliverable: 7 assertions (888 → 895).
-- [x] **Fix `sequential_impulse`:** the normal impulse had the wrong sign (`(1+e)·v_n/inv_mass` with `v_n=−pen` → negative → clamped to 0) and never folded the accumulated impulse back into the velocity. Rewrote as proper sequential impulse (`v_eff = v_n + λ·inv_mass`, `Δλ = −(1+e)·v_eff/inv_mass`, accumulate-clamp) — converges to `(1+e)·pen/inv_mass`, iteration-independent.
-- [x] **`solve_pgs` audited correct** (PGS/LCP in `linalg_ext`): strengthened its test from `x1 > 0` to exact-solution + bounds-active-clamp assertions.
-- [x] **Coverage:** resting / single-iter / dynamic-vs-static / both-static impulse cases; PGS exact + clamped solutions.
-
-### 2.4.6 — Security & hardening audit (arc closeout) ✅ shipped
-P(-1) hardening step. Memory-safety / allocation-overflow review, supply-chain
-integrity, dependency CVE posture (known + web), security review of the six 2.4.x
-algorithms. **No new vulnerability.** Deliverable: 6 allocation-guard regression
-tests (895 → 901) + `docs/audit/2026-05-29.md` + threat-model refresh.
-- [x] No shell/exec/FFI/libc surface; iterative paths all capped; `vec_get` traps on OOB.
-- [x] hisab's dimension allocators guard the multiply (`tensor_new`/`cmat_new`/christoffel/num_sieve) — pinned by new CWE-190 regression tests.
-- [x] Supply chain: `deps --verify` 60/60, `vet` 0 untrusted; no third-party deps → zero third-party-CVE surface; no cyrius/cycc CVEs.
-- [x] Open (upstream): stdlib `mat_new` overflow unguarded in 6.0.14 — hisab's usage mitigated; fix tracked in 2.5.0.
-
----
-
-## 2.5.0 -- CGA + matrix overflow guards
+## 2.5.0 -- CGA + matrix overflow guard
 
 - [ ] CGA left/right contraction operators
 - [ ] CGA dual operation, blade projection/rejection
-- [ ] Confirm `matrix.cyr` `mat_new(rows, cols)` overflow is fixed upstream (was C3 in P(-1) audit; expected fixed by cyrius 5.x/6.x — verify with a regression test)
+- [ ] **`mat_new` overflow guard** — the 2026-05-29 audit confirmed stdlib `matrix.cyr` `mat_new(rows, cols)` (`16 + rows*cols*8`) is **still unguarded in the pinned 6.0.14 snapshot** (was C3 in the P(-1) audit). The fix belongs upstream in cyrius (hisab must not edit vendored `lib/`); hisab's own usage is mitigated (dims come from already-allocated matrices, and the raw-dimension `cmat_new` is guarded). Verify/land the upstream fix, then add a regression test.
 
 ---
 
@@ -151,7 +77,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Consumer | Status |
 |----------|--------|
-| **impetus** (physics) | Usable -- GJK/EPA, PGS, inertia, spatial |
+| **impetus** (physics) | Usable -- GJK/EPA, MPR, PGS, sequential-impulse, inertia, spatial |
 | **kiran** (engine) | Usable -- projections, BVH, k-d tree, frustum |
 | **joshua** (simulation) | Usable -- DOPRI45, BDF, symplectic, optimize |
 | **aethersafha** (compositor) | Usable -- projections, compositing, color |

@@ -12,18 +12,19 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 
 | Module | Files | Description |
 |--------|-------|-------------|
-| **Foundation** | vec2, vec3, vec4, quat, mat3, mat4 | Vector/matrix/quaternion types (f64, heap-allocated) |
+| **Foundation** | vec2, vec3, vec4, quat, mat3, mat4 | Vector/matrix/quaternion types (f64, heap-allocated; SIMD `f64v_*` hot paths) |
 | **Transforms** | transforms, color | 2D/3D affine transforms, projections, slerp/lerp, Euler angles, sRGB/HSV/HSL/Oklab, Porter-Duff compositing (8 ops), tone mapping (Reinhard, ACES), SH L2, EV/exposure |
-| **Geometry** | geo, geo_advanced | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, BVH, SDF+CSG, TOI, conformal geometric algebra (5D CGA) |
-| **Calculus** | calc, calc_ext | Differentiation, integration (Simpson, Gauss-Legendre, adaptive), Bezier/Catmull-Rom/B-spline/NURBS/Hermite TCB/monotone cubic, easing, Perlin 2D+3D, gradient/Jacobian/Hessian |
-| **Numerical** | num, ode, optimize, linalg_ext, num_ext | Root finding, FFT/DST/DCT/2D-FFT, ODE (RK4, DOPRI45, BDF, symplectic, SDE), optimization (GD, CG, BFGS, L-BFGS, LM), sparse CSR, GMRES, PGS, SVD, eigendecomposition, number theory (primes, factorize, CRT, totient, Mobius), PCG32, Halton/Sobol, tridiagonal solver |
+| **Geometry** | geo, geo_advanced, spatial | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, SDF+CSG, swept-AABB/TOI, conformal geometric algebra (5D CGA); spatial structures (BVH, k-d tree, octree, quadtree, spatial hash) |
+| **Collision** | collision_core, collision_mesh | MPR/XenoCollide narrowphase, sequential-impulse contact solver, convex hull 2D (monotone chain), polygon triangulation (ear clipping), Delaunay (Bowyer-Watson), half-edge mesh, island detection (union-find) |
+| **Calculus** | calc, calc_ext, noise_simplex | Differentiation, integration (Simpson, Gauss-Legendre, adaptive), Bezier/Catmull-Rom/B-spline/NURBS/Hermite TCB/monotone cubic, easing, Perlin 2D+3D, simplex noise, gradient/Jacobian/Hessian |
+| **Numerical** | num, ode, optimize, linalg_ext, linalg_precision, num_ext | Root finding, FFT/DST/DCT/2D-FFT, ODE (RK4, DOPRI45, BDF, symplectic, SDE), optimization (GD, CG, BFGS, L-BFGS, LM), sparse CSR, GMRES, PGS/LCP, SVD, eigendecomposition, compensated/high-precision linalg, number theory (primes, factorize, CRT, totient, Mobius), PCG32, Halton/Sobol, tridiagonal solver |
 | **Complex** | complex | Complex numbers + matrices, Pauli/Dirac gamma matrices, matrix exponential |
-| **Lie groups** | lie | U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz, exponential maps |
+| **Lie groups** | lie, lie_ext | U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz, SE(3)/SO(3), exponential/log maps, adjoint, BCH |
 | **Diff geometry** | diffgeo | Christoffel symbols, Riemann/Ricci/Einstein tensors, geodesic solver, Killing vectors, exterior algebra |
 | **Symbolic** | symbolic, symbolic_ext | Expression tree, evaluate, differentiate, simplify, symbolic integration, LaTeX rendering, pattern matching + rewrite rules |
 | **Autodiff** | autodiff | Forward-mode automatic differentiation (dual numbers) |
 | **Interval** | interval | Interval arithmetic for verified numerics |
-| **Tensor** | tensor | N-dimensional dense tensor, Kronecker delta, Minkowski metric, Levi-Civita |
+| **Tensor** | tensor, einsum | N-dimensional dense tensor, Kronecker delta, Minkowski metric, Levi-Civita, Einstein-summation (einsum) |
 
 ## Quick Start
 
@@ -40,8 +41,8 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "matrix", "linalg", "t
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.3.0"
-modules = ["dist/hisab.cyr"]   # ~545 KB self-contained bundle (all 34 modules)
+tag     = "2.4.6"
+modules = ["dist/hisab.cyr"]   # ~550 KB self-contained bundle (all 34 modules)
 # Or pull individual files for a smaller compilation unit:
 # modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec3.cyr", ...]
 ```
@@ -87,11 +88,11 @@ num_newton(&f, &df, F64_ONE, EPSILON_F64, 100, root);
 
 ```sh
 cyrius build src/main.cyr build/hisab
-cyrius test tests/hisab.tcyr        # 116 smoke tests
+cyrius test tests/hisab.tcyr        # 119 smoke tests
 cyrius test tests/foundation.tcyr   # 307 foundation tests
-cyrius test tests/modules.tcyr      # 249 module tests
-cyrius test tests/edge_cases.tcyr   # 149 edge case tests
-cyrius bench tests/hisab.bcyr       # 22 benchmarks
+cyrius test tests/modules.tcyr      # 312 module tests
+cyrius test tests/edge_cases.tcyr   # 163 edge case tests
+cyrius bench tests/hisab.bcyr       # 28 benchmarks
 ```
 
 ## Architecture
@@ -102,15 +103,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.2.2 |
-| Library | 33 files, 15,676 lines of Cyrius |
-| Tests | 821 assertions across 4 test suites |
-| Benchmarks | 22 operations |
+| Version | 2.4.6 |
+| Library | 34 modules, ~16,460 lines of Cyrius |
+| Tests | 901 assertions across 4 suites |
+| Benchmarks | 28 operations |
 | Fuzz targets | 5 with invariant checks |
-| CLI binary | ~140 KB static ELF (`build/hisab` — version smoke test only) |
+| CLI binary | ~152 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.0.14 |
-| Dependencies | 1 (sakshi 2.1.0) |
-| Security | P(-1) audited, 25 of 31 issues fixed |
+| Dependencies | 1 (sakshi 2.1.0); no third-party, no FFI/libc |
+| Security | P(-1) audited (2026-04-15) + security/hardening pass (2026-05-29); no known vulnerabilities |
 
 ## License
 

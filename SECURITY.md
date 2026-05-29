@@ -8,13 +8,14 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Area | Risk | Mitigation |
 |------|------|------------|
-| Allocation overflow | Integer overflow in `rows * cols * 8` could cause undersized allocation | Overflow guards on tensor, complex matrix, diffgeo allocations; dimension caps |
+| Allocation overflow | Integer overflow in `rows * cols * 8` could cause undersized allocation (CWE-190) | Overflow guards on tensor, complex-matrix, diffgeo allocations; dimension caps — pinned by regression tests (2026-05-29 audit). Stdlib `mat_new` is unguarded (upstream, roadmap 2.5.0); hisab's usage is mitigated (dims from already-allocated matrices) |
 | Numerical stability | Catastrophic cancellation, overflow | IEEE 754 f64 throughout; documented precision limits |
 | Matrix decompositions | Division by near-zero pivot | Partial pivoting with EPSILON_F64 threshold checks |
 | Iterative solvers | Non-convergence on adversarial input | max_iter bounds; returns ERR_NO_CONVERGENCE |
 | FFT | Invalid input length | Requires power-of-2 |
 | Integration | Zero step count | Returns ERR_ZERO_STEPS |
-| GJK/EPA | Non-convergence on degenerate shapes | 64-iteration hard limit |
+| GJK/EPA, MPR narrowphase | Non-convergence on degenerate shapes | 64-iteration hard limit (`_COL_MAX_ITER`) |
+| Collision algorithms | OOB index / non-termination (convex hull, triangulation, Delaunay, half-edge) | All index access via `vec_get` (traps on OOB, no silent corruption); ear-clip `n*n` cap, half-edge one-ring 1000-step guard. Audited + covered in the 2.4.x arc |
 | Sieve of Eratosthenes | Unbounded allocation | Capped at 10M elements |
 | Division by zero | NaN/Inf propagation through complex, autodiff, transforms | Zero guards on cx_div, cx_inv, dual_div, dual_sqrt, dual_ln, f64_fmod, world_to_screen, linearize_depth_reverse_z |
 | Modular arithmetic | Overflow in multiplication for large moduli | Russian peasant _num_mulmod avoids overflow |
@@ -33,7 +34,8 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Version | Supported |
 |---------|-----------|
-| Cyrius 2.x | Yes |
+| hisab 2.4.x (current) | Yes |
+| hisab 2.0–2.3 | Best-effort |
 | Rust 1.x | Available via pre-2.0 git tags, unsupported |
 
 ## Reporting

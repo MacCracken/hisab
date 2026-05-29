@@ -4,12 +4,12 @@
 
 ```bash
 # All test suites
-cyrius test tests/hisab.tcyr        # 116 smoke/integration tests
+cyrius test tests/hisab.tcyr        # 119 smoke/integration tests
 cyrius test tests/foundation.tcyr   # 307 exhaustive foundation type tests
-cyrius test tests/modules.tcyr      # 249 per-module tests
-cyrius test tests/edge_cases.tcyr   # 149 edge case + boundary tests
+cyrius test tests/modules.tcyr      # 312 per-module tests
+cyrius test tests/edge_cases.tcyr   # 163 edge case + boundary tests
 
-# Benchmarks (22 operations)
+# Benchmarks (28 operations)
 cyrius bench tests/hisab.bcyr
 
 # Fuzz self-test
@@ -21,16 +21,17 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 | Suite | Assertions | Covers |
 |-------|-----------|--------|
 | `foundation.tcyr` | 307 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
-| `modules.tcyr` | 249 | All 10+ modules — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff, interval, tensor |
-| `hisab.tcyr` | 116 | Cross-module integration — ODE, optimization, sparse, ray-sphere, Newton, Euler identity |
-| `edge_cases.tcyr` | 149 | Zero-length normalize, degenerate cross, singular inverse, parallel ray, division by zero, empty sums, undefined variables |
-| **Total** | **821** | |
+| `modules.tcyr` | 312 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff, interval, tensor, and collision (convex hull, triangulation, Delaunay, half-edge, MPR, sequential-impulse) |
+| `hisab.tcyr` | 119 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity |
+| `edge_cases.tcyr` | 163 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards) |
+| **Total** | **901** | |
 
-## Benchmarks (22 operations)
+## Benchmarks (28 operations)
 
 | Category | Benchmarks |
 |----------|-----------|
 | Vec/Quat/Mat | vec3_add, vec3_cross, vec3_normalize, quat_mul, quat_slerp, quat_rotate_vec3, m4_mul, m4_inverse, m4_transform_point, t3d_compose |
+| SIMD batches | vec3_dot_x64, vec4_dot_x64, m4_mul_x16, m4_transform_x64 (amplified — single-op timings sit below the harness floor) |
 | Geometry | ray_sphere, ray_aabb, ray_triangle |
 | Color | srgb_to_linear, tonemap_reinhard |
 | Calculus | calc_derivative, calc_integral_simpson |

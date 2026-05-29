@@ -11,16 +11,16 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.4.4
+## Current -- v2.4.5
 
 - **34 math modules in `src/`, ~16,460 lines** (`lib/` is vendored-only)
-- **888 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **895 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,426 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
 - P(-1) audit: 26/31 fixed
 - **2.3.x optimization/modernization arc complete** (2.3.0 toolchain → 2.3.1 SIMD → 2.3.2 einsum scratch → 2.3.3 safety audit → 2.3.4 layout/idiom). Per-version detail in the Release History table + CHANGELOG.
-- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) + 2.4.1 (`triangulate_polygon`) + 2.4.2 (`delaunay_2d`) + 2.4.3 (half-edge mesh) + 2.4.4 (MPR narrowphase) shipped; only 2.4.5 (PGS solver) pending.
+- **2.4.x collision-correctness arc COMPLETE** — 2.4.0 (`convex_hull_2d`) → 2.4.1 (`triangulate_polygon`) → 2.4.2 (`delaunay_2d`) → 2.4.3 (half-edge mesh) → 2.4.4 (MPR narrowphase) → 2.4.5 (contact solver). Real bugs fixed in 2.4.0 / 2.4.4 / 2.4.5; the rest were already correct. All six algorithms now audited + covered.
 
 ---
 
@@ -77,13 +77,12 @@ Deliverable: 10 assertions (878 → 888).
 - [x] **Fix:** added the missing origin-containment early-out `if dot(v1, dir) < 0 → miss`. Without it, separated colinear shapes hit a degenerate `(v1−v0)×(−v0)==0` branch that returned 1 unconditionally, and off-axis pairs slipped through convergence. Applied to both `mpr_intersect` and `mpr_penetration`.
 - [x] **Coverage:** sphere-sphere overlap vs separated (on/off-axis), penetration depth (1.0 and 3.0 cases) + ±x normal, separated → miss, box-box overlap/separated.
 
-### 2.4.5 — contact solver (`sequential_impulse` + `solve_pgs`)
-Projected Gauss-Seidel for contact constraints; verify convergence + restitution.
-Depends on correct contacts (2.4.4), so it lands last.
-- [ ] **Bite 1 (red):** one contact, two bodies, known normal + penetration → expected accumulated normal impulse / post-solve relative velocity. Failing baseline.
-- [ ] **Bite 2 (fix PGS):** effective mass, accumulated normal impulse with `≥ 0` clamping, Baumgarte / bias position correction.
-- [ ] **Bite 3:** restitution (bounce) + friction-cone clamping.
-- [ ] **Bite 4 (coverage):** resting contact → relative normal velocity → 0; restitution = 1 → velocity reverses; multi-contact island (via `detect_islands`) converges.
+### 2.4.5 — contact solver (`sequential_impulse` + `solve_pgs`) ✅ shipped (real bug fixed)
+`sequential_impulse` returned all-zero impulses (did nothing); `solve_pgs` was
+correct but barely tested. Deliverable: 7 assertions (888 → 895).
+- [x] **Fix `sequential_impulse`:** the normal impulse had the wrong sign (`(1+e)·v_n/inv_mass` with `v_n=−pen` → negative → clamped to 0) and never folded the accumulated impulse back into the velocity. Rewrote as proper sequential impulse (`v_eff = v_n + λ·inv_mass`, `Δλ = −(1+e)·v_eff/inv_mass`, accumulate-clamp) — converges to `(1+e)·pen/inv_mass`, iteration-independent.
+- [x] **`solve_pgs` audited correct** (PGS/LCP in `linalg_ext`): strengthened its test from `x1 > 0` to exact-solution + bounds-active-clamp assertions.
+- [x] **Coverage:** resting / single-iter / dynamic-vs-static / both-static impulse cases; PGS exact + clamped solutions.
 
 ---
 
@@ -157,6 +156,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.4.5 | 2026-05-29 | 16,460 | 34 | Collision arc COMPLETE — contact solver fixed (impulse was always 0); solve_pgs verified; 7 assertions. 895 |
 | 2.4.4 | 2026-05-28 | 16,460 | 34 | Collision arc — MPR narrowphase fixed (separated pairs were false +ve); 10 assertions. 888 |
 | 2.4.3 | 2026-05-28 | 16,450 | 34 | Collision arc — half-edge mesh audited (no bug; twin/boundary wiring correct); 11 assertions. 878 |
 | 2.4.2 | 2026-05-28 | 16,450 | 34 | Collision arc — `delaunay_2d` audited (no bug; cocircular-robust); 8 empty-circumcircle assertions. 867 |

@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## [2.4.5] - 2026-05-29 — Collision arc: contact solver fixed; arc complete (2.4.x)
+
+Final patch of the collision-correctness arc, and the third with a real bug.
+`sequential_impulse` produced **all-zero impulses** — it did nothing.
+`solve_pgs` (the general PGS/LCP solver in `linalg_ext`) was already correct but
+barely tested. Suite 888 → **895**. This closes the 2.4.x arc.
+
+### Fixed
+- **`sequential_impulse` normal impulse** (`collision_core.cyr`): the impulse was
+  computed as `(1+e)·v_n / inv_mass` with `v_n = −pen` — i.e. **negative** for a
+  penetrating contact (the leading `−` the comment specified was missing), so
+  `max(0, accumulate)` clamped it to 0 on every iteration. Separately, the loop
+  re-added the full bias each iteration without folding the accumulated impulse
+  back into the velocity, so it could never converge. Rewritten as proper
+  sequential impulse: `v_eff = v_n + λ·inv_mass`, `Δλ = −(1+e)·v_eff / inv_mass`,
+  accumulate-and-clamp. The total impulse now converges to `(1+e)·pen / inv_mass`
+  (e.g. 0.25 for pen=0.5, inv_mass=2) and is iteration-independent.
+
+### Added
+- **`tests/modules.tcyr`** — 4 `sequential_impulse` assertions: resting contact
+  (λ=0.25, the case that was 0), single-iteration convergence (idempotence),
+  dynamic-vs-static (λ=1.0), and both-static (skipped → 0).
+- **`tests/hisab.tcyr`** — strengthened the `solve_pgs` test from a lone `x1 > 0`
+  sanity check to exact-solution assertions (`x ≈ [1/11, 7/11]` for
+  `[[4,1],[1,3]]x=[1,2]`) plus a **bounds-active** LCP (`diag(1,1)·x=[5,5]` clamped
+  to `hi=[2,2]` → `[2,2]`). solve_pgs was audited correct — no change.
+
+### Notes — 2.4.x arc complete
+- All six collision algorithms audited and covered. Genuine bugs found + fixed in
+  three: the hull insertion sort + undefined `f64_le`/`f64_ge` (2.4.0), the MPR
+  origin-containment early-out (2.4.4), and this impulse-sign/convergence fix
+  (2.4.5). `triangulate_polygon`, `delaunay_2d`, the half-edge mesh, and
+  `solve_pgs` were already correct — they just lacked coverage, which they now have.
+
 ## [2.4.4] - 2026-05-28 — Collision arc: MPR narrowphase fixed (2.4.x arc)
 
 Fifth patch of the collision-correctness arc, and the second with a real bug

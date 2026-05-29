@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## [2.4.3] - 2026-05-28 — Collision arc: half-edge mesh audited (2.4.x arc)
+
+Fourth patch of the collision-correctness arc. The roadmap flagged the half-edge
+mesh (`halfedge_from_triangles` + `halfedge_adjacent_faces` + `halfedge_is_boundary`)
+for a twin-pointer-wiring check — but a thorough audit found it **already correct**
+on both closed and open meshes. Deliverable: coverage, no source change; suite
+867 → **878**.
+
+### Added
+- **`tests/modules.tcyr`** — 11 half-edge assertions + `_he_tri` / `_he_boundary_sum`
+  helpers, over four reference meshes: a **tetrahedron** (closed manifold → no
+  boundary vertices, 3 neighbours/face), a **single triangle** (open → all-boundary,
+  no neighbours), a **2-triangle quad** sharing a diagonal (4 boundary corners, 1
+  shared edge), and a **hexagon fan** (center interior, 6-vertex boundary rim — the
+  case that exercises the one-ring walk closing on an interior vertex). Plus the
+  empty-input → null-mesh error path.
+
+### Notes (audit — no change needed)
+- Twin assignment pairs each directed half-edge `src→dst` with the reverse
+  `dst→src` (O(n²) scan); closed meshes wire every twin, open meshes leave
+  boundary half-edges at `_COL_SENTINEL`. `halfedge_is_boundary` walks the
+  one-ring (`next→next→twin`) with a 1000-step guard, returning 1 on any sentinel
+  twin and 0 only when the ring closes back to the start. `halfedge_adjacent_faces`
+  collects the twin's face for each shared edge. All correct.
+
 ## [2.4.2] - 2026-05-28 — Collision arc: `delaunay_2d` audited (2.4.x arc)
 
 Third patch of the collision-correctness arc. The roadmap flagged

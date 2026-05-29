@@ -11,16 +11,16 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.4.2
+## Current -- v2.4.3
 
 - **34 math modules in `src/`, ~16,450 lines** (`lib/` is vendored-only)
-- **867 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **878 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,426 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
 - P(-1) audit: 26/31 fixed
 - **2.3.x optimization/modernization arc complete** (2.3.0 toolchain → 2.3.1 SIMD → 2.3.2 einsum scratch → 2.3.3 safety audit → 2.3.4 layout/idiom). Per-version detail in the Release History table + CHANGELOG.
-- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) + 2.4.1 (`triangulate_polygon`) + 2.4.2 (`delaunay_2d`) shipped; 2.4.3–2.4.5 pending.
+- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) + 2.4.1 (`triangulate_polygon`) + 2.4.2 (`delaunay_2d`) + 2.4.3 (half-edge mesh) shipped; 2.4.4–2.4.5 pending.
 
 ---
 
@@ -65,12 +65,11 @@ including the cocircular grid. Deliverable: 8 assertions (859 → 867), no sourc
 - [x] **Audit:** the in-circle predicate adjusts by winding sign and tests *strict* interiority (cocircular points not flagged), so super-triangle setup/removal, bad-triangle cavity, boundary-edge extraction, swap-remove, and CCW output all hold.
 - [x] **Coverage:** empty-circumcircle property verified (0 violations) on square+interior, **3×3 grid** (cocircular stress), and an irregular 6-point set; plus `n = 3`, `n < 3`, and all-collinear (→ empty, no trap).
 
-### 2.4.3 — half-edge mesh (`halfedge_from_triangles` + accessors)
-Check twin-pointer wiring and the boundary / adjacency queries.
-- [ ] **Bite 1 (red):** two-triangle quad (shared edge) → twins paired across the shared edge, the 4 outer edges flagged boundary. Failing baseline.
-- [ ] **Bite 2 (fix):** edge-key → half-edge map for twin pairing; `next` pointers cycling each face.
-- [ ] **Bite 3:** `halfedge_adjacent_faces` + `halfedge_is_boundary` correctness on the wired mesh.
-- [ ] **Bite 4 (coverage):** closed mesh (tetrahedron) → every half-edge has a twin, zero boundary; open mesh (single quad / strip) → exact boundary count.
+### 2.4.3 — half-edge mesh (`halfedge_from_triangles` + accessors) ✅ shipped (no bug found)
+Audited the twin wiring + boundary/adjacency queries — **already correct** on
+closed and open meshes. Deliverable: 11 assertions (867 → 878), no source change.
+- [x] **Audit:** reverse-edge twin pairing wires closed meshes fully and leaves open-boundary half-edges at `_COL_SENTINEL`; the `next→next→twin` one-ring walk (1000-step guard) detects interior vs boundary; adjacency collects each shared edge's twin face.
+- [x] **Coverage:** tetrahedron (closed → 0 boundary, 3 neighbours/face), single triangle (open → all boundary, 0 neighbours), 2-tri quad (4 boundary corners, 1 shared edge), hexagon fan (interior center + 6-vertex boundary rim), and the empty → null error path.
 
 ### 2.4.4 — MPR narrowphase (`mpr_intersect` + `mpr_penetration`)
 XenoCollide / Minkowski Portal Refinement in 3D.
@@ -159,6 +158,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.4.3 | 2026-05-28 | 16,450 | 34 | Collision arc — half-edge mesh audited (no bug; twin/boundary wiring correct); 11 assertions. 878 |
 | 2.4.2 | 2026-05-28 | 16,450 | 34 | Collision arc — `delaunay_2d` audited (no bug; cocircular-robust); 8 empty-circumcircle assertions. 867 |
 | 2.4.1 | 2026-05-28 | 16,450 | 34 | Collision arc — `triangulate_polygon` audited (no bug); 13 tiling/count assertions added. 859 |
 | 2.4.0 | 2026-05-28 | 16,450 | 34 | Collision arc — `convex_hull_2d` fixed (broken insertion sort + undefined `f64_le`/`f64_ge`); 13 assertions added. 846 |

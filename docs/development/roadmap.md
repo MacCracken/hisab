@@ -11,10 +11,10 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.3.2
+## Current -- v2.3.3
 
 - **34 math modules in `src/`, 16,195 lines** (`lib/` is vendored-only)
-- **825 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **833 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~540 KB / 16,195 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ~480 KB headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
@@ -24,6 +24,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **2.3.0** — toolchain 5.7.10 → **6.0.14**; library source moved `lib/*.cyr` → `src/*.cyr`; sakshi resolution repaired; tree reformatted under 6.0.x `cyrfmt`; CI aligned to abaco (fmt gate, security scan, version-template gate)
 - **2.3.1** — SIMD hot paths via `f64v_*`: vec4 dot 6.5×, m4_mul 4.5×, m3_mul 3.2×, vec3 dot 2.2× (825/825 bit-identical)
 - **2.3.2** — bounded einsum scratch (reused arena): 3960 → 176 bytes/call (~22× less allocator footprint); memory-only, speed unchanged
+- **2.3.3** — safety/numerical audit: no bugs (hisab already correct); fixed a wrong `>>` comment + pinned 8 invariants (logical-shift, mulmod overflow-safety, PCG determinism)
 
 ---
 
@@ -60,12 +61,15 @@ arena adoption only fit einsum:
 - [x] symbolic/tensor left alone — their allocations are escaping result nodes (expr trees / tensors), not scratch; an arena-reset would corrupt results.
 - Memory win measured before/after; speed unchanged (arena ≈ bump, both O(1)).
 
-### 2.3.3 — Safety & numerical-correctness audit (mined from vidya gotchas)
-- [ ] Audit every `var buf[N]` in a helper that returns a buffer-backed handle — these are **process-static** and silently corrupt across calls; switch to per-call `alloc()` (compiler now warns on static data > 4K)
-- [ ] Audit `var name[N]` sizing — `[N]` is **bytes, not elements**; vector/matrix lane buffers need `[N*8]`
-- [ ] Review signed bit-math: `>>` is logical (zero-fill), there is no unary `~` (use `x ^ -1`); add an `asr()` helper where arithmetic shift is intended
-- [ ] Apply overflow-explicit operators (`+%`/`+|`/`+?` from `lib/overflow.cyr`) in numerically-careful kernels (factorial, binomial, Pollard-rho factorization) for intent + checked-panic safety
-- [ ] Property/fuzz coverage for the fixed-point and signed paths
+### 2.3.3 — Safety & numerical-correctness audit ✅ shipped (no bugs; invariants pinned)
+Audited against the vidya gotcha catalogue — **hisab was already correct**.
+Deliverable: one fixed comment + 8 regression assertions pinning the
+load-bearing invariants.
+- [x] **Static `var buf[N]`** — only 2 (float render), both copied by `str_from_buf` (alloc+memcpy). No escape, no cross-call corruption. Pinned by a render-independence test.
+- [x] **`var name[N]` sizing** — no bug: element arrays use `alloc(n*8)`; only stack arrays are byte buffers used as bytes.
+- [x] **Signed bit-math** — verified `>>` is **logical** (zero-fill) on 6.0.14; every shift is on non-negative/masked values, so it's correct throughout. Fixed a num.cyr comment that wrongly claimed `>>` was arithmetic. No unary `~` is used (all `~` are "≈" in comments). No `asr()` needed.
+- [x] **Overflow** — no factorial/binomial kernels exist (abaco's); Pollard-rho/modpow already use `_num_mulmod` (Russian-peasant) to avoid `a*b` overflow. Pinned by a Fermat test at p≈1e11.
+- [x] **Regression coverage** — `tests/edge_cases.tcyr` invariants: logical-shift, mulmod overflow-safety (Fermat), PCG32 determinism, render-buffer independence.
 
 ### 2.3.4 — Layout & idiom modernization
 - [ ] Replace duplicated literal buffer sizes with enum-const array sizes (v5.10.48: `var buf[ENUM_CONST]` now parses)
@@ -154,6 +158,7 @@ a major, with a migration guide, not a 2.3.x patch.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.3.3 | 2026-05-28 | 16,195 | 34 | Safety/numerical audit — no bugs; fixed wrong `>>` comment + 8 invariant tests. 833/833 |
 | 2.3.2 | 2026-05-28 | 16,195 | 34 | Bounded einsum scratch via reused arena — 3960 → 176 B/call (~22×). Memory-only, 825/825 |
 | 2.3.1 | 2026-05-28 | 16,195 | 34 | SIMD hot paths (`f64v_*`) for vec/mat/quat — vec4 dot 6.5×, m4_mul 4.5×, m3_mul 3.2×. Bit-identical, 825/825 |
 | 2.3.0 | 2026-05-28 | 16,195 | 34 | Cyrius 6.0.14 toolchain; library source moved to `src/`; sakshi resolution repaired; CI aligned to abaco (fmt/security/version gates). No behavioral change |

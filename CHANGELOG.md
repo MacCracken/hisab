@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+## [2.3.3] - 2026-05-28 — Safety & numerical-correctness audit (2.3.x arc)
+
+A correctness audit of the integer/bit-math surface against the vidya gotcha
+catalogue (signed shifts, static buffers, element-vs-byte sizing, overflow).
+**Verdict: no bugs found — hisab was already careful.** The deliverable is a
+fixed misleading comment plus regression tests that pin the load-bearing
+invariants, so a future toolchain change can't silently break them. 833/833
+tests pass (was 825 + 8 new invariant assertions).
+
+### Fixed
+- **num.cyr PCG comment**: the note claimed "Cyrius `>>` is arithmetic
+  (sign-extending)" — it is **logical** (zero-fill), verified on 6.0.14
+  (`0x8000…0 >> 1 == 0x4000…0`). The PCG RNG is correct either way (it wants
+  unsigned shifts and masks to 32 bits), but the comment actively misinformed.
+  Corrected.
+
+### Added
+- **`tests/edge_cases.tcyr`** — safety-invariant section (8 assertions):
+  - `>>` is logical/zero-fill (the PCG + bit-reversal code depends on it).
+  - `_num_mulmod` (Russian-peasant) stays overflow-safe — Fermat check
+    `2^(p−1) ≡ 1 (mod p)` for prime p≈1e11, whose intermediate squares (~1e22)
+    far exceed i64 (a naive `a*b` would overflow).
+  - PCG32 determinism/reproducibility for a fixed seed.
+  - float-render `var buf[N]` independence across calls (`str_from_buf` copies,
+    so the process-static buffer is safe).
+
+### Notes (audit findings — no change needed)
+- **Static buffers**: only two `var buf[32]` (float rendering), both passed to
+  `str_from_buf`, which allocates + `memcpy`s — no escape, no cross-call
+  corruption despite `var buf[N]` being process-static in Cyrius.
+- **Bytes-vs-elements**: no bug — element arrays consistently use `alloc(n*8)`;
+  the only stack arrays are byte buffers used as bytes.
+- **Signed shifts**: every `>>`/`<<` operates on non-negative or masked values
+  (FFT lengths, masked RNG state, non-negative exponents, bit-index masks), so
+  logical `>>` is correct throughout. No `asr()` helper needed.
+- **Overflow**: no factorial/binomial kernels exist (those are abaco's);
+  Pollard-rho/modpow already use `_num_mulmod` to avoid `a*b` overflow. No
+  unary `~` is used anywhere (all `~` are "≈" in comments).
+
 ## [2.3.2] - 2026-05-28 — Bounded einsum scratch memory (2.3.x arc)
 
 A **memory-footprint** patch (not a speed change): einsum's parse/contraction

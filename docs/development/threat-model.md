@@ -20,7 +20,13 @@ Hisab does NOT trust:
 | cmat_new | Integer overflow in `rows * cols * 16` | Overflow guard, max 64K elements |
 | christoffel/riemann | `dim^3` / `dim^4` overflow | Dim capped at 16 |
 | num_sieve | Unbounded allocation | Capped at 10M |
-| mat_new (stdlib) | Integer overflow in `rows * cols * 8` | **Upstream bug** — tracked for cyrius 5.0.1 |
+| mat_new (stdlib) | Integer overflow in `16 + rows*cols*8` | **Upstream bug** — still unguarded in pinned 6.0.14; roadmap 2.5.0. hisab's calls use dims from already-allocated matrices (mitigated); raw-dim `cmat_new` is guarded |
+| convex_hull_2d | Monotone-chain pop underflow / index | Fixed in 2.4.0 (sort + `f64_le`/`f64_ge`); `vec_get` traps on OOB rather than corrupting |
+| triangulate_polygon | Ear-clip non-termination | `n*n` iteration cap + "no ear → bail" |
+| delaunay_2d | Bad-triangle / cocircular degeneracy | Super-triangle + strict in-circle; collinear → empty (no trap) |
+| halfedge_is_boundary | One-ring walk non-termination | 1000-step guard |
+| mpr_intersect/penetration | False positive on separated shapes; non-convergence | Fixed in 2.4.4 (origin-containment early-out); `_COL_MAX_ITER = 64` |
+| sequential_impulse | Zero/unbounded impulse | Fixed in 2.4.5 (sign + accumulate-into-velocity); impulse clamped ≥ 0, converges |
 | num_newton/bisection | Non-convergence | max_iter bound; returns ERR_NO_CONVERGENCE |
 | num_modpow | Intermediate multiplication overflow | _num_mulmod (Russian peasant) avoids overflow |
 | cx_div, cx_inv | Division by zero | Zero guard returns cx_zero() |
@@ -55,6 +61,16 @@ All math uses f64 (IEEE 754 double precision, ~15 significant digits).
 
 BDF-5 coefficients (300/137, etc.) were recomputed exact and verified via IEEE 754 encoding during the 2026-04-15 audit.
 
+## Supply Chain
+
+- No third-party runtime dependencies — only the cyrius stdlib and first-party
+  **sakshi**. No FFI, no libc. Third-party-CVE attack surface is zero.
+- Integrity enforced by the SHA-locked `cyrius.lock`: `cyrius deps --verify` →
+  60 verified / 0 failed; `cyrius vet` → 0 untrusted (verified 2026-05-29).
+- No CVEs/advisories exist for the Cyrius/cycc toolchain (niche sovereign
+  project, not indexed in public CVE databases).
+
 ## Audit History
 
 - **2026-04-15**: P(-1) audit — 31 issues found, 25 fixed. See [docs/audit/2026-04-15.md](../audit/2026-04-15.md).
+- **2026-05-29**: P(-1) hardening (v2.4.6) — security/CVE/supply-chain review closing the 2.4.x collision arc. No new vulnerability; 6 allocation-guard regression tests added; `mat_new` upstream item reconfirmed. See [docs/audit/2026-05-29.md](../audit/2026-05-29.md).

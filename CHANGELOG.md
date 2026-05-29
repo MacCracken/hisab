@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## [2.4.6] - 2026-05-29 — Security & hardening audit; 2.4.x closeout
+
+P(-1) hardening step closing the 2.4.x arc: a memory-safety / allocation-overflow
+review of the whole library, supply-chain integrity, dependency CVE posture
+(known + web research), and a security review of the six collision algorithms
+brought into the build chain across 2.4.0–2.4.5. **No new vulnerability found.**
+Suite 895 → **901**. Full report: `docs/audit/2026-05-29.md`.
+
+### Added
+- **`tests/edge_cases.tcyr`** — 6 allocation-overflow-guard regression assertions
+  (CWE-190): `cmat_new` rejects huge / non-positive dims and allocates valid ones;
+  `tensor_new` rejects rank > 8 and overflow-prone shapes and allocates valid ones.
+  Pins the documented guards so removing one fails the build.
+
+### Security
+- **Audit verdict — posture solid.** No shell/exec/FFI/libc surface (no CWE-78).
+  hisab's own dimension allocators all guard the multiply before allocating
+  (`tensor_new`, `cmat_new`, christoffel/riemann, num_sieve). All iterative paths
+  are capped. Collision index access goes through `vec_get`, which traps on OOB
+  rather than corrupting memory.
+- **Supply chain**: `cyrius deps --verify` → 60 verified / 0 failed;
+  `cyrius vet` → 0 untrusted. No third-party deps (cyrius stdlib + first-party
+  sakshi only) → zero third-party-CVE surface. No CVEs exist for the cyrius/cycc
+  toolchain.
+- **Open (upstream)**: stdlib `mat_new` integer overflow (`16 + rows*cols*8`,
+  unguarded) is still present in the pinned 6.0.14 snapshot. hisab's usage is
+  mitigated (dims come from already-allocated matrices; raw-dim `cmat_new` is
+  guarded). Fix belongs in cyrius stdlib — tracked as roadmap 2.5.0.
+
+### Changed
+- **`docs/development/threat-model.md`** — added the six 2.4.x collision algorithms
+  to the attack-surface table; refreshed the `mat_new` note for 6.0.14 + roadmap
+  2.5.0; added a Supply Chain section and a 2026-05-29 audit-history entry.
+
 ## [2.4.5] - 2026-05-29 — Collision arc: contact solver fixed; arc complete (2.4.x)
 
 Final patch of the collision-correctness arc, and the third with a real bug.

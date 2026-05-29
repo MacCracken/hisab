@@ -9,7 +9,7 @@ cyrius test tests/foundation.tcyr   # 307 exhaustive foundation type tests
 cyrius test tests/modules.tcyr      # 312 per-module tests
 cyrius test tests/edge_cases.tcyr   # 163 edge case + boundary tests
 
-# Benchmarks (28 operations)
+# Benchmarks (26 operations)
 cyrius bench tests/hisab.bcyr
 
 # Fuzz self-test
@@ -26,7 +26,7 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 | `edge_cases.tcyr` | 163 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards) |
 | **Total** | **901** | |
 
-## Benchmarks (28 operations)
+## Benchmarks (26 operations)
 
 | Category | Benchmarks |
 |----------|-----------|

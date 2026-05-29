@@ -92,7 +92,7 @@ cyrius test tests/hisab.tcyr        # 119 smoke tests
 cyrius test tests/foundation.tcyr   # 307 foundation tests
 cyrius test tests/modules.tcyr      # 312 module tests
 cyrius test tests/edge_cases.tcyr   # 163 edge case tests
-cyrius bench tests/hisab.bcyr       # 28 benchmarks
+cyrius bench tests/hisab.bcyr       # 26 benchmarks
 ```
 
 ## Architecture
@@ -106,7 +106,7 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 | Version | 2.4.6 |
 | Library | 34 modules, ~16,460 lines of Cyrius |
 | Tests | 901 assertions across 4 suites |
-| Benchmarks | 28 operations |
+| Benchmarks | 26 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~152 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.0.14 |

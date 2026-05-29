@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius) 5.7.10+ (`cyrius.cyml [package].cyrius` pins the exact version)
+- [Cyrius](https://github.com/MacCracken/cyrius) 6.0.14 (`cyrius.cyml [package].cyrius` pins the exact version — match it, don't hardcode elsewhere)
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work
@@ -33,20 +33,26 @@ cyrius bench tests/hisab.bcyr
 # Run fuzz self-test
 cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 
-# Lint
+# Lint + format check (CI runs these per file across src/ AND tests/; warnings are errors)
 cyrius lint src/main.cyr
+cyrius fmt src/main.cyr --check
 
 # Vet dependencies
 cyrius vet src/main.cyr
+
+# Regenerate the distlib bundle (CI fails on drift; required after any src/ or [lib] change)
+cyrius distlib
 ```
 
 ## Adding a Module
 
-1. Create `lib/module_name.cyr` with header comment (usage, requires)
-2. Add `include "lib/module_name.cyr"` to `src/main.cyr`
+Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never add project source there).
+
+1. Create `src/module_name.cyr` with a header comment (purpose, requires). Source files are self-contained — no `include` lines; stdlib + first-party deps resolve via `cyrius.cyml`.
+2. Add it to the `[lib] modules` list in `cyrius.cyml` (this is what the distlib bundle pulls in)
 3. Add tests to the appropriate `.tcyr` file or create a new one
-4. Update README module table
-5. Update `docs/architecture/overview.md`
+4. Update the README module table, `docs/architecture/overview.md`, and `docs/doc-health.md`
+5. Run `cyrius distlib` to regenerate `dist/hisab.cyr`
 
 ## Code Style
 

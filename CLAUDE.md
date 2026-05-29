@@ -172,6 +172,8 @@ Root files (required):
   cyrius.cyml        — package manifest (toolchain pin, deps, build)
 
 docs/ (required):
+  doc-health.md      — living doc-currency ledger (fresh/stale/read-through/dated
+                       per file); refresh the affected row whenever a doc is touched
   architecture/
     overview.md      — module map, data flow, consumers, dependency stack
     math.md          — (when applicable) mathematical reference for algorithms/formulas

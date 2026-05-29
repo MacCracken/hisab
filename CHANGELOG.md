@@ -9,10 +9,20 @@
   + spatial/einsum/lie_ext/linalg_precision/noise_simplex; version, counts,
   binary size); completed the `architecture/overview.md` module map (all 34
   modules + a Collision section) and updated the collision data-flow (MPR +
-  sequential-impulse); synced test/benchmark counts (901 / 28) in `testing.md`;
-  added collision + supply-chain entries to `SECURITY.md`; added a 2026-05-29
-  status addendum to the dated `port-audit.md`; refreshed `dependency-watch.md`
-  and the CLAUDE.md status line.
+  sequential-impulse); synced test/benchmark counts (901 assertions / 26
+  benchmarks) in `testing.md`; added collision + supply-chain entries to
+  `SECURITY.md`; added a 2026-05-29 status addendum to the dated `port-audit.md`;
+  refreshed `dependency-watch.md` and the CLAUDE.md status line.
+- Added `docs/doc-health.md` — a living doc-currency ledger (fresh/stale/dated/
+  tracked-issue per file), adapted from `cyrius/docs/doc-health.md`.
+- Re-ran `scripts/bench-history.sh` (benchmarks.md was stale at an old commit) —
+  refreshed to v2.4.6, 26 benchmarks.
+- Removed `docs/development/tool-issues.md` (ad-hoc catalog; real bugs are filed
+  individually under `docs/development/issues/`). Archived the shipped
+  `cyrius-linalg-proposal.md` to `docs/development/archive/`. Fixed CONTRIBUTING
+  currency (Cyrius pin 6.0.14, `src/` not `lib/`, +fmt/distlib gates).
+- Re-verified the five `docs/development/issues/` toolchain filings against the
+  pinned 6.0.14 — all still reproduce (none stale-fixed).
 
 ## [2.4.6] - 2026-05-29 — Security & hardening audit; 2.4.x closeout
 

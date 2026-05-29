@@ -14,7 +14,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 ## Current -- v2.4.6
 
 - **34 math modules in `src/`, ~16,460 lines** (`lib/` is vendored-only)
-- **901 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **901 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,446 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)

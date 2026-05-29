@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-05-28 — Collision correctness arc: `convex_hull_2d` (2.4.x arc)
+
+First patch of the 2.4.x collision-correctness arc. `convex_hull_2d` (Andrew's
+monotone chain) carried two pre-existing port bugs and trapped on any non-trivial
+input — it had never run, having sat outside the build chain until 2.2.2. Both
+bugs are fixed and the algorithm is now exercised + covered. Unlike the 2.3.x
+arc this **changes behavior** (a trapping function now returns correct results),
+so it follows a red-fixture-first cadence.
+
+### Fixed
+- **`convex_hull_2d` insertion sort** (`collision_core.cyr`,
+  `_col_sort_indices_by_xy`): the hand-rolled sort's `done`-exit path
+  overwrote the insertion index with `-1` on every *mid-array* insertion, so
+  `vec_set(indices, -1, key)` tripped a `vec: index < 0` trap (front insertions
+  happened to work). Rewritten as a standard insertion sort — shift-greater
+  then drop `key` at `sj + 1` (always `>= 0`).
+- **Missing `f64_le` / `f64_ge` primitives** (`f64_util.cyr`): the monotone
+  chain's pop test calls `f64_le(cross, 0)`, but `f64_le`/`f64_ge` were never
+  defined (only the strict `f64_lt`/`f64_gt` exist as named-op intrinsics) —
+  so once the sort was fixed and execution reached the chain, the call bound to
+  an undefined symbol and trapped (SIGILL). Defined both in terms of the strict
+  intrinsics (`a <= b == !(a > b)`, `a >= b == !(a < b)`). This also resolves
+  the same latent undefined-symbol references at 6 call sites in `spatial.cyr`
+  (point-in-region tests) that current tests didn't reach.
+
+### Added
+- **`tests/modules.tcyr`** — 13 `convex_hull_2d` assertions: the keystone
+  square + interior-point fixture (4-vertex CCW hull, shoelace 2×area = +8),
+  plus degeneracy coverage — empty/single point, triangle (count + CCW area),
+  collinear set (→ 2 extreme endpoints, interior dropped), and a duplicated
+  corner (→ still 4 vertices). None trap. Suite: 833 → **846**.
+
 ## [2.3.4] - 2026-05-28 — Layout & idiom modernization (2.3.x arc)
 
 A **layout/idiom** patch: tie heap allocations and field writes to the typed

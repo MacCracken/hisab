@@ -11,15 +11,16 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.3.4
+## Current -- v2.4.0
 
-- **34 math modules in `src/`, 16,424 lines** (`lib/` is vendored-only)
-- **833 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,450 lines** (`lib/` is vendored-only)
+- **846 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~16,404 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
+- **`dist/hisab.cyr` distlib bundle** ~16,426 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
 - P(-1) audit: 26/31 fixed
 - **2.3.x optimization/modernization arc complete** (2.3.0 toolchain → 2.3.1 SIMD → 2.3.2 einsum scratch → 2.3.3 safety audit → 2.3.4 layout/idiom). Per-version detail in the Release History table + CHANGELOG.
+- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) shipped; 2.4.1–2.4.5 pending.
 
 ---
 
@@ -45,46 +46,44 @@ every fix ships as a **patch**.
 > known trap), mesh connectivity next, then 3D narrowphase, then the solver that
 > consumes contacts. Reorder by leverage as fixtures reveal coupling.
 
-### 2.4.1 — `convex_hull_2d` (monotone chain)
-Known: a 5-point input (unit square + interior point) trips a `vec: index < 0`
-runtime bounds check. The insertion-sort + Andrew's-monotone-chain logic needs
-review.
-- [ ] **Bite 1 (red):** fixture in `tests/modules.tcyr` — square + interior point → expect a 4-vertex CCW hull; capture the current `index < 0` trap as the failing baseline.
-- [ ] **Bite 2 (fix):** guard the chain-pop underflow (`while k >= 2 && cross(lower[k-2], lower[k-1], p) <= 0`); audit the sort comparator for the same off-by-one.
-- [ ] **Bite 3 (degeneracies):** collinear points, duplicates, `< 3` points, all-collinear → defined behavior (hull or empty, never a trap).
-- [ ] **Bite 4 (coverage):** assert hull vertex count, CCW orientation, and area against known fixtures (square, triangle, collinear set, random cloud).
+### 2.4.0 — `convex_hull_2d` (monotone chain) ✅ shipped
+Two pre-existing port bugs made the function trap on any non-trivial input
+(it had never run). Both fixed; 13 assertions added (833 → 846).
+- [x] **Sort fix:** the hand-rolled insertion sort's `done`-exit path overwrote the insertion index with `-1` on mid-array inserts → `vec: index < 0` trap. Rewritten as a standard insertion sort (shift-greater, drop `key` at `sj + 1`).
+- [x] **Missing primitives:** the chain's pop test calls `f64_le`/`f64_ge`, which were never defined (only strict `f64_lt`/`f64_gt` are intrinsics) → SIGILL once the sort was fixed. Defined both in `f64_util.cyr`; also clears the same latent references at 6 `spatial.cyr` sites.
+- [x] **Coverage:** square + interior (4-vertex CCW hull, shoelace 2×area = +8); degeneracies — empty/single, triangle (count + CCW area), collinear (→ 2 endpoints), duplicate corner (→ 4). None trap.
 
-### 2.4.2 — `triangulate_polygon` (ear clipping)
+### 2.4.1 — `triangulate_polygon` (ear clipping)
 Same untested-port risk as the hull; ear detection + index bookkeeping unverified.
 - [ ] **Bite 1 (red):** convex quad → 2 triangles; concave L/arrow polygon → `n−2` triangles. Failing baseline first.
 - [ ] **Bite 2 (fix):** ear test (reflex-vertex classification + point-in-triangle), CCW-normalize the input, fix the vertex-list bookkeeping as ears are clipped.
 - [ ] **Bite 3 (degeneracies):** collinear edges, CW input, `< 3` verts, repeated vertices.
 - [ ] **Bite 4 (coverage):** triangle count `== n−2`; Σ triangle areas `==` polygon area; no overlaps; convex + concave fixtures.
 
-### 2.4.3 — `delaunay_2d` (Bowyer-Watson)
+### 2.4.2 — `delaunay_2d` (Bowyer-Watson)
 Needs a numerical-stability pass alongside basic correctness.
 - [ ] **Bite 1 (red):** small point set → triangulation satisfying the empty-circumcircle (Delaunay) property. Failing baseline.
 - [ ] **Bite 2 (fix):** super-triangle setup, bad-triangle cavity collection, re-triangulation, super-triangle vertex removal.
 - [ ] **Bite 3 (robustness):** robust orientation + in-circle predicate (determinant sign); handle near-cocircular / near-collinear inputs without trapping.
 - [ ] **Bite 4 (coverage):** in-circle property holds for every output triangle; known fixtures (grid, cocircular quad, random cloud); full vertex coverage.
 
-### 2.4.4 — half-edge mesh (`halfedge_from_triangles` + accessors)
+### 2.4.3 — half-edge mesh (`halfedge_from_triangles` + accessors)
 Check twin-pointer wiring and the boundary / adjacency queries.
 - [ ] **Bite 1 (red):** two-triangle quad (shared edge) → twins paired across the shared edge, the 4 outer edges flagged boundary. Failing baseline.
 - [ ] **Bite 2 (fix):** edge-key → half-edge map for twin pairing; `next` pointers cycling each face.
 - [ ] **Bite 3:** `halfedge_adjacent_faces` + `halfedge_is_boundary` correctness on the wired mesh.
 - [ ] **Bite 4 (coverage):** closed mesh (tetrahedron) → every half-edge has a twin, zero boundary; open mesh (single quad / strip) → exact boundary count.
 
-### 2.4.5 — MPR narrowphase (`mpr_intersect` + `mpr_penetration`)
+### 2.4.4 — MPR narrowphase (`mpr_intersect` + `mpr_penetration`)
 XenoCollide / Minkowski Portal Refinement in 3D.
 - [ ] **Bite 1 (red):** analytic fixtures — sphere-sphere (overlap + separated), OBB-OBB (overlap + separated) → known boolean + penetration depth. Failing baseline.
 - [ ] **Bite 2 (fix `mpr_intersect`):** interior point `v0`, portal `v1/v2/v3` from support points, portal-refinement loop with a real termination criterion.
 - [ ] **Bite 3 (fix `mpr_penetration`):** depth + contact-normal extraction along the refined portal.
 - [ ] **Bite 4 (coverage):** sphere-sphere analytic depth, OBB-OBB, sphere-AABB; separated pairs return false / zero depth.
 
-### 2.4.6 — contact solver (`sequential_impulse` + `solve_pgs`)
+### 2.4.5 — contact solver (`sequential_impulse` + `solve_pgs`)
 Projected Gauss-Seidel for contact constraints; verify convergence + restitution.
-Depends on correct contacts (2.4.5), so it lands last.
+Depends on correct contacts (2.4.4), so it lands last.
 - [ ] **Bite 1 (red):** one contact, two bodies, known normal + penetration → expected accumulated normal impulse / post-solve relative velocity. Failing baseline.
 - [ ] **Bite 2 (fix PGS):** effective mass, accumulated normal impulse with `≥ 0` clamping, Baumgarte / bias position correction.
 - [ ] **Bite 3:** restitution (bounce) + friction-cone clamping.
@@ -162,6 +161,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.4.0 | 2026-05-28 | 16,450 | 34 | Collision arc — `convex_hull_2d` fixed (broken insertion sort + undefined `f64_le`/`f64_ge`); 13 assertions added. 846 |
 | 2.3.4 | 2026-05-28 | 16,424 | 34 | Layout/idiom modernization — `alloc(sizeof(T))`+derived setters (13 modules), enum-const grid/buffer sizes, `#must_use` on core API. Codegen-identical, 833/833 |
 | 2.3.3 | 2026-05-28 | 16,195 | 34 | Safety/numerical audit — no bugs; fixed wrong `>>` comment + 8 invariant tests. 833/833 |
 | 2.3.2 | 2026-05-28 | 16,195 | 34 | Bounded einsum scratch via reused arena — 3960 → 176 B/call (~22×). Memory-only, 825/825 |

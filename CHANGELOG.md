@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-05-28 — Collision arc: `triangulate_polygon` audited (2.4.x arc)
+
+Second patch of the collision-correctness arc. The roadmap flagged
+`triangulate_polygon` (ear clipping) as a likely-buggy untested port — but a
+thorough audit found it **already correct**. The deliverable is comprehensive
+coverage that promotes it from "deliberately unexercised" to verified, plus an
+honest record that no bug existed. No source change; suite 846 → **859**.
+
+### Added
+- **`tests/modules.tcyr`** — 13 `triangulate_polygon` assertions + a `_tp_area2x`
+  helper. Each fixture checks the triangle count (`3*(n−2)` flat indices) and
+  that the output **tiles the polygon** (|Σ 2×area| == polygon |2×area|; abs ⇒
+  winding-agnostic): convex quad, concave 5-gon (reflex vertex), convex hexagon,
+  U-shape (2 reflex vertices), CW-wound quad, a collinear edge vertex, and the
+  `n < 3` empty case.
+
+### Notes (audit — no change needed)
+- Ear detection (reflex classification via signed area + point-in-triangle),
+  winding normalization (CCW/CW), and the shrink-as-clipped index bookkeeping
+  are all correct. The `n*n` iteration cap + "no ear found → bail" guard make
+  degenerate inputs (e.g. duplicate vertices) terminate without trapping.
+- Unlike `convex_hull_2d` (2.4.0, two real bugs), `triangulate_polygon` shares
+  no code with the broken sort and never referenced the undefined `f64_le`/
+  `f64_ge` — it uses only the strict `f64_lt`/`f64_gt` intrinsics, which is why
+  it was sound where the hull was not.
+
 ## [2.4.0] - 2026-05-28 — Collision correctness arc: `convex_hull_2d` (2.4.x arc)
 
 First patch of the 2.4.x collision-correctness arc. `convex_hull_2d` (Andrew's

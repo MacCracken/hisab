@@ -11,16 +11,16 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.4.0
+## Current -- v2.4.1
 
 - **34 math modules in `src/`, ~16,450 lines** (`lib/` is vendored-only)
-- **846 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **859 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,426 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
 - P(-1) audit: 26/31 fixed
 - **2.3.x optimization/modernization arc complete** (2.3.0 toolchain → 2.3.1 SIMD → 2.3.2 einsum scratch → 2.3.3 safety audit → 2.3.4 layout/idiom). Per-version detail in the Release History table + CHANGELOG.
-- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) shipped; 2.4.1–2.4.5 pending.
+- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) + 2.4.1 (`triangulate_polygon`) shipped; 2.4.2–2.4.5 pending.
 
 ---
 
@@ -53,12 +53,11 @@ Two pre-existing port bugs made the function trap on any non-trivial input
 - [x] **Missing primitives:** the chain's pop test calls `f64_le`/`f64_ge`, which were never defined (only strict `f64_lt`/`f64_gt` are intrinsics) → SIGILL once the sort was fixed. Defined both in `f64_util.cyr`; also clears the same latent references at 6 `spatial.cyr` sites.
 - [x] **Coverage:** square + interior (4-vertex CCW hull, shoelace 2×area = +8); degeneracies — empty/single, triangle (count + CCW area), collinear (→ 2 endpoints), duplicate corner (→ 4). None trap.
 
-### 2.4.1 — `triangulate_polygon` (ear clipping)
-Same untested-port risk as the hull; ear detection + index bookkeeping unverified.
-- [ ] **Bite 1 (red):** convex quad → 2 triangles; concave L/arrow polygon → `n−2` triangles. Failing baseline first.
-- [ ] **Bite 2 (fix):** ear test (reflex-vertex classification + point-in-triangle), CCW-normalize the input, fix the vertex-list bookkeeping as ears are clipped.
-- [ ] **Bite 3 (degeneracies):** collinear edges, CW input, `< 3` verts, repeated vertices.
-- [ ] **Bite 4 (coverage):** triangle count `== n−2`; Σ triangle areas `==` polygon area; no overlaps; convex + concave fixtures.
+### 2.4.1 — `triangulate_polygon` (ear clipping) ✅ shipped (no bug found)
+Audited the suspected-buggy port — it was **already correct**. Deliverable: 13
+assertions (846 → 859), no source change.
+- [x] **Audit:** ear test (reflex classification + point-in-triangle), CCW/CW winding normalization, and shrink-as-clipped bookkeeping all correct. The `n*n` cap + bail guard terminate degenerate inputs without trapping. Shares none of the hull's broken sort and never referenced the undefined `f64_le`/`f64_ge`.
+- [x] **Coverage:** count `== 3*(n−2)` + tiling check (|Σ 2×area| == polygon |2×area|) over convex quad, concave 5-gon, hexagon, U-shape (2 reflex), CW quad, collinear edge vertex, and `n < 3`.
 
 ### 2.4.2 — `delaunay_2d` (Bowyer-Watson)
 Needs a numerical-stability pass alongside basic correctness.
@@ -161,6 +160,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.4.1 | 2026-05-28 | 16,450 | 34 | Collision arc — `triangulate_polygon` audited (no bug); 13 tiling/count assertions added. 859 |
 | 2.4.0 | 2026-05-28 | 16,450 | 34 | Collision arc — `convex_hull_2d` fixed (broken insertion sort + undefined `f64_le`/`f64_ge`); 13 assertions added. 846 |
 | 2.3.4 | 2026-05-28 | 16,424 | 34 | Layout/idiom modernization — `alloc(sizeof(T))`+derived setters (13 modules), enum-const grid/buffer sizes, `#must_use` on core API. Codegen-identical, 833/833 |
 | 2.3.3 | 2026-05-28 | 16,195 | 34 | Safety/numerical audit — no bugs; fixed wrong `>>` comment + 8 invariant tests. 833/833 |

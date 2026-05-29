@@ -11,16 +11,16 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.4.1
+## Current -- v2.4.2
 
 - **34 math modules in `src/`, ~16,450 lines** (`lib/` is vendored-only)
-- **859 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **867 test assertions**, 28 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,426 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green
 - P(-1) audit: 26/31 fixed
 - **2.3.x optimization/modernization arc complete** (2.3.0 toolchain → 2.3.1 SIMD → 2.3.2 einsum scratch → 2.3.3 safety audit → 2.3.4 layout/idiom). Per-version detail in the Release History table + CHANGELOG.
-- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) + 2.4.1 (`triangulate_polygon`) shipped; 2.4.2–2.4.5 pending.
+- **2.4.x collision-correctness arc in progress** — 2.4.0 (`convex_hull_2d`) + 2.4.1 (`triangulate_polygon`) + 2.4.2 (`delaunay_2d`) shipped; 2.4.3–2.4.5 pending.
 
 ---
 
@@ -59,12 +59,11 @@ assertions (846 → 859), no source change.
 - [x] **Audit:** ear test (reflex classification + point-in-triangle), CCW/CW winding normalization, and shrink-as-clipped bookkeeping all correct. The `n*n` cap + bail guard terminate degenerate inputs without trapping. Shares none of the hull's broken sort and never referenced the undefined `f64_le`/`f64_ge`.
 - [x] **Coverage:** count `== 3*(n−2)` + tiling check (|Σ 2×area| == polygon |2×area|) over convex quad, concave 5-gon, hexagon, U-shape (2 reflex), CW quad, collinear edge vertex, and `n < 3`.
 
-### 2.4.2 — `delaunay_2d` (Bowyer-Watson)
-Needs a numerical-stability pass alongside basic correctness.
-- [ ] **Bite 1 (red):** small point set → triangulation satisfying the empty-circumcircle (Delaunay) property. Failing baseline.
-- [ ] **Bite 2 (fix):** super-triangle setup, bad-triangle cavity collection, re-triangulation, super-triangle vertex removal.
-- [ ] **Bite 3 (robustness):** robust orientation + in-circle predicate (determinant sign); handle near-cocircular / near-collinear inputs without trapping.
-- [ ] **Bite 4 (coverage):** in-circle property holds for every output triangle; known fixtures (grid, cocircular quad, random cloud); full vertex coverage.
+### 2.4.2 — `delaunay_2d` (Bowyer-Watson) ✅ shipped (no bug found)
+Audited the suspected-fragile algorithm — it was **already correct and robust**,
+including the cocircular grid. Deliverable: 8 assertions (859 → 867), no source change.
+- [x] **Audit:** the in-circle predicate adjusts by winding sign and tests *strict* interiority (cocircular points not flagged), so super-triangle setup/removal, bad-triangle cavity, boundary-edge extraction, swap-remove, and CCW output all hold.
+- [x] **Coverage:** empty-circumcircle property verified (0 violations) on square+interior, **3×3 grid** (cocircular stress), and an irregular 6-point set; plus `n = 3`, `n < 3`, and all-collinear (→ empty, no trap).
 
 ### 2.4.3 — half-edge mesh (`halfedge_from_triangles` + accessors)
 Check twin-pointer wiring and the boundary / adjacency queries.
@@ -160,6 +159,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.4.2 | 2026-05-28 | 16,450 | 34 | Collision arc — `delaunay_2d` audited (no bug; cocircular-robust); 8 empty-circumcircle assertions. 867 |
 | 2.4.1 | 2026-05-28 | 16,450 | 34 | Collision arc — `triangulate_polygon` audited (no bug); 13 tiling/count assertions added. 859 |
 | 2.4.0 | 2026-05-28 | 16,450 | 34 | Collision arc — `convex_hull_2d` fixed (broken insertion sort + undefined `f64_le`/`f64_ge`); 13 assertions added. 846 |
 | 2.3.4 | 2026-05-28 | 16,424 | 34 | Layout/idiom modernization — `alloc(sizeof(T))`+derived setters (13 modules), enum-const grid/buffer sizes, `#must_use` on core API. Codegen-identical, 833/833 |

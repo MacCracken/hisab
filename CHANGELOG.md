@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [2.4.2] - 2026-05-28 — Collision arc: `delaunay_2d` audited (2.4.x arc)
+
+Third patch of the collision-correctness arc. The roadmap flagged
+`delaunay_2d` (Bowyer-Watson) as needing a numerical-stability pass — but a
+thorough audit found it **already correct and robust**, including the cocircular
+grid stress case. The deliverable is coverage that verifies the empty-circumcircle
+property, plus an honest "no bug" record. No source change; suite 859 → **867**.
+
+### Added
+- **`tests/modules.tcyr`** — 8 `delaunay_2d` assertions + a `_dl_violations`
+  helper that counts points strictly inside any output triangle's circumcircle
+  (the Delaunay property holds iff that count is 0). Fixtures: square + interior
+  (4 triangles), a **3×3 grid** (heavy cocircularity — the stability stress
+  case, 8 triangles), an irregular 6-point set, a single triangle (`n = 3`), and
+  degenerates (`n < 3` and all-collinear → empty, no trap). Every non-degenerate
+  case has **0 circumcircle violations**.
+
+### Notes (audit — no change needed)
+- The in-circle predicate (`_col_in_circumcircle`) adjusts the determinant by the
+  triangle's winding sign and tests **strict** interiority, so cocircular points
+  (grid corners) are correctly not flagged — that's why the grid triangulates
+  cleanly. Super-triangle setup/removal, bad-triangle cavity collection, boundary
+  (non-shared) edge extraction, descending swap-remove, and CCW-normalized output
+  are all correct.
+- Collinear / `n < 3` inputs return an empty triangulation (all triangles
+  reference super-triangle vertices and are filtered) rather than trapping.
+
 ## [2.4.1] - 2026-05-28 — Collision arc: `triangulate_polygon` audited (2.4.x arc)
 
 Second patch of the collision-correctness arc. The roadmap flagged

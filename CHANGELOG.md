@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-05-29 — CGA dual + pseudoscalar inverse (2.5.x arc)
+
+Second patch of the 2.5.x arc. Adds Hodge-style duality on top of 2.5.0's
+contraction. Additive (new public functions); suite 909 → **915**.
+
+### Added
+- **`cga_pseudoscalar()`** — the unit pseudoscalar `I = e1∧e2∧e3∧ep∧em` (grade-5
+  blade `[31]`).
+- **`cga_pseudoscalar_inv()`** — `I⁻¹ = reverse(I) / (I · reverse(I))_scalar`. In
+  this metric (em² = −1) `I² = −1`, so `I⁻¹ = −I` — derived from the geometric
+  product rather than hard-coded.
+- **`cga_dual(x)`** — `x* = x · I⁻¹`, mapping a grade-k blade to grade `5−k`
+  (since `I` is the top blade, this geometric product is exactly the contraction
+  onto the pseudoscalar).
+- **`tests/hisab.tcyr`** — 6 assertions: `I · I⁻¹ = 1`; grade flips `dual(1) = −I`
+  (0→5) and `dual(I) = 1` (5→0); `dual(e1) = −e23pm` (1→4) with no residual e1;
+  and the involution `dual(dual(e1)) = −e1` (pins the −x sign for this metric).
+
 ## [2.5.0] - 2026-05-29 — CGA contraction operators + doc catchup (2.5.x arc)
 
 First patch of the 2.5.x arc (CGA depth + matrix guard). Conformal geometric

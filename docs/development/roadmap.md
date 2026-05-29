@@ -11,15 +11,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.5.0
+## Current -- v2.5.1
 
-- **34 math modules in `src/`, ~16,470 lines** (`lib/` is vendored-only)
-- **909 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,480 lines** (`lib/` is vendored-only)
+- **915 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,446 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization) and 2.4.x (collision-correctness + security) arcs are **complete**; per-version detail is in the Release History table and CHANGELOG. The 2.4.x arc fixed three real collision bugs (hull sort, MPR, contact solver), verified the rest, and audited the security posture (`docs/audit/2026-05-29.md`).
-- **2.5.x arc in progress** — CGA depth + matrix guard. 2.5.0 (contraction operators) shipped; 2.5.1 (dual) → 2.5.2 (projection/rejection) → 2.5.3 (`mat_new` guard) pending.
+- **2.5.x arc in progress** — CGA depth + matrix guard. 2.5.0 (contraction) + 2.5.1 (dual) shipped; 2.5.2 (projection/rejection) → 2.5.3 (`mat_new` guard) pending.
 
 ---
 
@@ -52,12 +52,10 @@ grade-difference selector instead of grade-sum. 8 assertions (901 → 909).
 - [x] **Implement:** `cga_left_contraction` keeps `grade(b)−grade(a)`, `cga_right_contraction` keeps `grade(a)−grade(b)`; negative targets never match a non-negative blade grade, so out-of-range terms drop to zero.
 - [x] **Coverage (GA identities):** `e1 ⌋ e12 = e2`, `e1 ⌋ e1 = 1`, `(2e1+3e2) ⌋ self = 13` (vector norm²), `e1 ⌋ e23 = 0` (orthogonal), scalar contraction as scaling, `e12 ⌊ e1 = −e2` with grade drop.
 
-### 2.5.1 — CGA dual + pseudoscalar inverse (`cga_pseudoscalar`, `cga_dual`)
-Duality via multiplication by the inverse unit pseudoscalar `I` (grade-5 blade
-`[31]` = `e123+−`).
-- [ ] **Bite 1 (identity fixture):** `cga_pseudoscalar()` is the grade-5 unit blade; `I · I⁻¹ == 1`. Failing baseline.
-- [ ] **Bite 2 (implement):** pseudoscalar + its inverse (sign from `reverse`/metric), then `cga_dual(x) = x · I⁻¹` via the existing geometric product.
-- [ ] **Bite 3 (coverage):** grade flip `grade(dual(grade-k)) == 5−k`; involution `dual(dual(x)) == ±x` (pin the sign for the 5D conformal metric).
+### 2.5.1 — CGA dual + pseudoscalar inverse (`cga_pseudoscalar`, `cga_dual`) ✅ shipped
+Added `cga_pseudoscalar` / `cga_pseudoscalar_inv` / `cga_dual`. 6 assertions (909 → 915).
+- [x] **Implement:** `I` = grade-5 unit blade; `I⁻¹ = reverse(I)/(I·reverse(I))_scalar` (= −I, em²=−1, derived not hard-coded); `dual(x) = x · I⁻¹`.
+- [x] **Coverage:** `I·I⁻¹ = 1`; grade flips `dual(1) = −I` (0→5), `dual(I) = 1` (5→0), `dual(e1) = −e23pm` (1→4); involution `dual(dual(e1)) = −e1` (sign pinned for this metric).
 
 ### 2.5.2 — CGA blade projection / rejection (`cga_project`, `cga_reject`)
 Project a blade `X` onto blade `B`: `project(X,B) = (X ⌋ B) ⌋ B⁻¹`; rejection is
@@ -138,6 +136,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.5.1 | 2026-05-29 | 16,480 | 34 | CGA arc — dual + pseudoscalar inverse (`cga_pseudoscalar`/`cga_dual`); 6 GA-identity assertions. 915 |
 | 2.5.0 | 2026-05-29 | 16,470 | 34 | CGA arc — contraction operators (`cga_left_contraction`/`cga_right_contraction`); 8 GA-identity assertions. 909 |
 | 2.4.6 | 2026-05-29 | 16,460 | 34 | Security/hardening audit — posture solid, no new vuln; 6 alloc-guard tests + threat-model refresh. 901 |
 | 2.4.5 | 2026-05-29 | 16,460 | 34 | Collision arc COMPLETE — contact solver fixed (impulse was always 0); solve_pgs verified; 7 assertions. 895 |

@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-05-29 — CGA blade projection / rejection (2.5.x arc)
+
+Third patch of the 2.5.x arc — the last CGA piece, composing 2.5.0's contraction
+with a blade inverse. Additive; suite 915 → **925**.
+
+### Added
+- **`cga_blade_inverse(b)`** — `B⁻¹ = reverse(B) / (B · reverse(B))_scalar`, with a
+  zero-norm guard (returns the zero multivector for a **null** blade, e.g. conformal
+  points, instead of dividing by zero).
+- **`cga_project(x, b)`** — `project(X,B) = (X ⌋ B) ⌋ B⁻¹`, the component of `X`
+  lying in blade `B`. Preserves grade(X) (inner contraction lowers by grade(X),
+  outer raises it back).
+- **`cga_reject(x, b)`** — `X − project(X,B)`, the part of `X` orthogonal to `B`
+  (grade-consistent since projection preserves grade).
+- **`tests/hisab.tcyr`** — 10 assertions: `project(e1,e12) = e1` (in-plane, no e2
+  leak), `project(e12,e12) = e12` (self), `project(e3,e12) = 0` / `reject(e3,e12) = e3`
+  (orthogonal), `reject(e1,e12) = 0` (in-plane), idempotence, `project + reject = X`
+  for `X = e1+e3`, and the null-blade guard (`project(e1, 0) = 0`, no trap).
+
 ## [2.5.1] - 2026-05-29 — CGA dual + pseudoscalar inverse (2.5.x arc)
 
 Second patch of the 2.5.x arc. Adds Hodge-style duality on top of 2.5.0's

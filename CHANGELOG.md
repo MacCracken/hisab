@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-05-29 — CGA contraction operators + doc catchup (2.5.x arc)
+
+First patch of the 2.5.x arc (CGA depth + matrix guard). Conformal geometric
+algebra already had the geometric/outer products, reverse, sandwich, and
+conformal constructors; this adds the **interior-product** primitives. Additive
+(new public functions, no signature changes); suite 901 → **909**. This release
+also folds in the post-2.4.6 documentation catch-up (the repo-wide sweep + the
+new `docs/doc-health.md` ledger), recorded below.
+
+### Added
+- **`cga_left_contraction(a, b)`** (a ⌋ b) and **`cga_right_contraction(a, b)`**
+  (a ⌊ b) in `geo_advanced.cyr` — the contraction interior products. Same blade
+  loop as `cga_outer_product` with a grade-difference selector: left keeps
+  `grade(b) − grade(a)`, right keeps `grade(a) − grade(b)` (negative targets
+  never match a non-negative blade grade, so out-of-range terms drop to zero).
+- **`tests/hisab.tcyr`** — 8 CGA contraction assertions pinning the GA identities:
+  `e1 ⌋ e12 = e2` (grade lowering), `e1 ⌋ e1 = 1` and `(2e1+3e2) ⌋ self = 13`
+  (vector self-contraction → scalar norm²), `e1 ⌋ e23 = 0` (orthogonal), scalar
+  contraction as scaling, and right contraction `e12 ⌊ e1 = −e2` with its grade
+  drop. CGA went from 1 smoke assertion to 9.
+
 ### Documentation
 - Repo-wide documentation sweep to v2.4.6 state: pruned the roadmap to
   forward-facing / deferred work only (the completed 2.3.x and 2.4.x arcs now

@@ -11,14 +11,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.4.6
+## Current -- v2.5.0
 
-- **34 math modules in `src/`, ~16,460 lines** (`lib/` is vendored-only)
-- **901 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,470 lines** (`lib/` is vendored-only)
+- **909 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,446 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization) and 2.4.x (collision-correctness + security) arcs are **complete**; per-version detail is in the Release History table and CHANGELOG. The 2.4.x arc fixed three real collision bugs (hull sort, MPR, contact solver), verified the rest, and audited the security posture (`docs/audit/2026-05-29.md`).
+- **2.5.x arc in progress** — CGA depth + matrix guard. 2.5.0 (contraction operators) shipped; 2.5.1 (dual) → 2.5.2 (projection/rejection) → 2.5.3 (`mat_new` guard) pending.
 
 ---
 
@@ -45,12 +46,11 @@ no regression on the 901-assertion suite. Commit-bites per patch below.
 > blade inverse. The `mat_new` guard is independent and lands last as the
 > hardening closeout.
 
-### 2.5.0 — CGA contraction operators (`cga_left_contraction` / `cga_right_contraction`)
-The interior products (⌋ left, ⌊ right) — like the existing outer product but
-keeping the *lowered*-grade terms instead of the raised ones.
-- [ ] **Bite 1 (identity fixture):** grade rule — `vec ⌋ bivector → vector` (left keeps grade `g(b)−g(a)`; right keeps `g(a)−g(b)`); orthogonal-blade contraction → 0. Failing baseline against the not-yet-implemented fn.
-- [ ] **Bite 2 (implement):** filter `_cga_geo_blades(a,b)` terms by the contraction grade rule (mirror `cga_outer_product`'s grade-sum filter with the grade-difference rule + sign from the blade product).
-- [ ] **Bite 3 (coverage):** `a ⌋ a == |a|²` for vectors; left/right duality (`a ⌋ b == reverse(reverse(b) ⌊ reverse(a))`); contraction of a blade with a higher-grade blade containing it.
+### 2.5.0 — CGA contraction operators (`cga_left_contraction` / `cga_right_contraction`) ✅ shipped
+Added the interior products (⌋ left, ⌊ right) — the outer-product loop with a
+grade-difference selector instead of grade-sum. 8 assertions (901 → 909).
+- [x] **Implement:** `cga_left_contraction` keeps `grade(b)−grade(a)`, `cga_right_contraction` keeps `grade(a)−grade(b)`; negative targets never match a non-negative blade grade, so out-of-range terms drop to zero.
+- [x] **Coverage (GA identities):** `e1 ⌋ e12 = e2`, `e1 ⌋ e1 = 1`, `(2e1+3e2) ⌋ self = 13` (vector norm²), `e1 ⌋ e23 = 0` (orthogonal), scalar contraction as scaling, `e12 ⌊ e1 = −e2` with grade drop.
 
 ### 2.5.1 — CGA dual + pseudoscalar inverse (`cga_pseudoscalar`, `cga_dual`)
 Duality via multiplication by the inverse unit pseudoscalar `I` (grade-5 blade
@@ -138,6 +138,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.5.0 | 2026-05-29 | 16,470 | 34 | CGA arc — contraction operators (`cga_left_contraction`/`cga_right_contraction`); 8 GA-identity assertions. 909 |
 | 2.4.6 | 2026-05-29 | 16,460 | 34 | Security/hardening audit — posture solid, no new vuln; 6 alloc-guard tests + threat-model refresh. 901 |
 | 2.4.5 | 2026-05-29 | 16,460 | 34 | Collision arc COMPLETE — contact solver fixed (impulse was always 0); solve_pgs verified; 7 assertions. 895 |
 | 2.4.4 | 2026-05-28 | 16,460 | 34 | Collision arc — MPR narrowphase fixed (separated pairs were false +ve); 10 assertions. 888 |

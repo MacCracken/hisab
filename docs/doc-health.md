@@ -6,8 +6,10 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-05-29 (v2.4.6). Scaffolded during the post-2.4.x doc
-> sweep, then a same-day **verify-and-cleanup pass**: re-ran `bench-history.sh`
+> **Last refresh**: 2026-05-29 (v2.5.0). Scaffolded at v2.4.6 during the post-2.4.x
+> doc sweep; the **2.5.0** CGA-contraction patch shipped same day (suite 901 → 909,
+> opening the 2.5.x arc) and README / CLAUDE / testing / roadmap current-state
+> counts were bumped to v2.5.0 / 909. The v2.4.6 verify-and-cleanup pass: re-ran `bench-history.sh`
 > (benchmarks.md fresh again — **26** benchmarks at commit `b1165f9`); deleted
 > the ad-hoc `development/tool-issues.md` catalog (file real bugs in `issues/`,
 > not a random catalog); archived the **shipped** `cyrius-linalg-proposal.md` to
@@ -28,7 +30,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 
 ---
 
-## At a glance — inventory (last reviewed 2026-05-29, v2.4.6 verify pass)
+## At a glance — inventory (last reviewed 2026-05-29, v2.5.0)
 
 **~23 markdown files** across the repo. Bucket counts:
 

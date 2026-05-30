@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-05-29 — Higher-order differential forms (2.6.x arc)
+
+Fifth (last feature) patch of the 2.6.x arc. Extends the exterior algebra past
+2-forms. Additive; suite 949 → **957**.
+
+### Added
+- **`wedge_2_1(omega, alpha)`** (2-form ∧ 1-form → 3-form) and **`wedge_3_1(beta,
+  alpha)`** (3-form ∧ 1-form → 4-form) in `diffgeo.cyr`, in the same reduced
+  strictly-increasing basis as `wedge_1_1`. Chaining `wedge_1_1 → wedge_2_1 →
+  wedge_3_1` builds every basis k-form up to the 4D top form.
+- **`tests/hisab.tcyr`** — 8 assertions: `e0∧e1∧e2 = (012)` and the unit 4-form
+  `e0∧e1∧e2∧e3`; graded antisymmetry `e1∧e0 = −(e0∧e1)` and nilpotence `e0∧e0 = 0`;
+  permutation signs (`e0∧e2∧e1 = −(012)`, `e1∧e2∧e3∧e0 = −(0123)`); and a repeated
+  factor → 0.
+
 ## [2.6.3] - 2026-05-29 — Geodesic deviation / Jacobi equation (2.6.x arc)
 
 Fourth patch of the 2.6.x arc. Adds the tidal acceleration between neighbouring

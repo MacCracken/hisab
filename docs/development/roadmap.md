@@ -11,15 +11,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.3
+## Current -- v2.6.4
 
-- **34 math modules in `src/`, ~16,580 lines** (`lib/` is vendored-only)
-- **949 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,600 lines** (`lib/` is vendored-only)
+- **957 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,575 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security), and 2.5.x (CGA depth + matrix guard) arcs are all **complete**. Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 929 across them; the 2.4.x arc fixed three real collision bugs, the 2.5.x arc grew CGA from 1 → 29 assertions.
-- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) + 2.6.1 (Weyl) + 2.6.2 (parallel transport) + 2.6.3 (geodesic deviation) shipped; 2.6.4 (higher forms) → 2.6.5 (closeout) pending.
+- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) + 2.6.1 (Weyl) + 2.6.2 (parallel transport) + 2.6.3 (geodesic deviation) + 2.6.4 (higher forms) shipped; only 2.6.5 (closeout) pending.
 
 ---
 
@@ -68,12 +68,10 @@ Tidal term `D²J^ρ/dτ² = −R^ρ_{σμν} u^σ J^μ u^ν`. 6 assertions (943 
 - [x] **Implement:** Riemann contraction with `u, J, u`; for a space form reduces to `−(|u|² J − ⟨u,J⟩ u)`.
 - [x] **Coverage:** unit sphere `J⊥u → J'' = −J`, `J∥u → 0`, `|u|²` scaling, flat → 0, linearity in `J`.
 
-### 2.6.4 — Higher-order differential forms (`wedge_2_1`, `wedge_3_1`, …)
-Extend the exterior algebra past 2-forms to 3- and 4-forms (4D), with grade
-bookkeeping and antisymmetry.
-- [ ] **Bite 1 (oracle):** graded antisymmetry `α∧β = (−1)^{pq} β∧α`, `α∧α = 0` for odd degree, associativity. Failing baseline.
-- [ ] **Bite 2 (implement):** general graded wedge for 1/2/3-forms → up to 4-forms, reusing the antisymmetrization pattern in `wedge_1_1`.
-- [ ] **Bite 3 (coverage):** grade/sign bookkeeping; `d(dα) = 0` on a sampled form if an exterior derivative is in scope.
+### 2.6.4 — Higher-order differential forms (`wedge_2_1`, `wedge_3_1`) ✅ shipped
+Extends the exterior algebra to 3- and 4-forms (4D, reduced basis). 8 assertions (949 → 957).
+- [x] **Implement:** `wedge_2_1` (2∧1→3) and `wedge_3_1` (3∧1→4); chaining `wedge_1_1 → wedge_2_1 → wedge_3_1` builds every basis k-form up to the top 4-form.
+- [x] **Coverage:** grade bookkeeping (e0∧e1∧e2, the unit 4-form), graded antisymmetry + nilpotence (`e0∧e0=0`), permutation signs, repeated-factor → 0. (No exterior-derivative `d` yet, so `d²=0` deferred.)
 
 ### 2.6.5 — P(-1) / security / docs closeout
 - [ ] Audit the new tensor allocations + contraction loops (dim caps, index bounds, degenerate-plane / `n<3` guards); cleanliness + full gate.
@@ -134,6 +132,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.4 | 2026-05-29 | 16,600 | 34 | Diffgeo arc — higher-order forms (`wedge_2_1`/`wedge_3_1`); 8 wedge antisymmetry/grading assertions. 957 |
 | 2.6.3 | 2026-05-29 | 16,580 | 34 | Diffgeo arc — geodesic deviation / Jacobi (`geodesic_deviation`); 6 sphere/flat/linearity assertions. 949 |
 | 2.6.2 | 2026-05-29 | 16,560 | 34 | Diffgeo arc — parallel transport (`parallel_transport`, RK4); 4 flat/sphere length-preservation assertions. 943 |
 | 2.6.1 | 2026-05-29 | 16,540 | 34 | Diffgeo arc — Weyl conformal-curvature tensor (`weyl_tensor`); 5 space-form/trace-free assertions. 939 |

@@ -13,10 +13,10 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 
 ## Current -- v2.6.5
 
-- **34 math modules in `src/`, ~16,600 lines** (`lib/` is vendored-only)
+- **34 math modules in `src/`, ~16,900 lines** (`lib/` is vendored-only)
 - **957 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~16,575 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
+- **`dist/hisab.cyr` distlib bundle** ~16,887 lines / 556 KB (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history (all complete)** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security, fixed three real collision bugs), 2.5.x (CGA depth + matrix guard, CGA 1 → 29 assertions), and 2.6.x (differential-geometry depth — sectional curvature, Weyl, parallel transport, geodesic deviation, higher forms; 28 known-manifold assertions, posture audited solid). Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 957 across them.
 

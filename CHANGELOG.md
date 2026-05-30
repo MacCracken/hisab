@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [2.6.3] - 2026-05-29 — Geodesic deviation / Jacobi equation (2.6.x arc)
+
+Fourth patch of the 2.6.x arc. Adds the tidal acceleration between neighbouring
+geodesics. Additive; suite 943 → **949**.
+
+### Added
+- **`geodesic_deviation(riemann, u, jac, dim)`** (`diffgeo.cyr`) — the Jacobi
+  tidal term `D²J^ρ/dτ² = −R^ρ_{σμν} u^σ J^μ u^ν` (the J and the second `u` sit in
+  Riemann's antisymmetric last-index pair, so the contraction is nonzero). For a
+  space form it reduces to `−(|u|² J − ⟨u,J⟩ u)`.
+- **`tests/hisab.tcyr`** — 6 assertions on the unit-sphere space form: a
+  separation `⊥ u` gives `J'' = −J` (geodesics converge), `∥ u` gives `0`, the
+  result scales with `|u|²`, flat space → `0`, and the operator is linear in `J`.
+
 ## [2.6.2] - 2026-05-29 — Parallel transport along a curve (2.6.x arc)
 
 Third patch of the 2.6.x arc — the first that adds connection *integration*

@@ -11,15 +11,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.2
+## Current -- v2.6.3
 
-- **34 math modules in `src/`, ~16,560 lines** (`lib/` is vendored-only)
-- **943 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **34 math modules in `src/`, ~16,580 lines** (`lib/` is vendored-only)
+- **949 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~16,575 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security), and 2.5.x (CGA depth + matrix guard) arcs are all **complete**. Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 929 across them; the 2.4.x arc fixed three real collision bugs, the 2.5.x arc grew CGA from 1 → 29 assertions.
-- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) + 2.6.1 (Weyl) + 2.6.2 (parallel transport) shipped; 2.6.3 (geodesic deviation) → 2.6.4 (higher forms) → 2.6.5 (closeout) pending.
+- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) + 2.6.1 (Weyl) + 2.6.2 (parallel transport) + 2.6.3 (geodesic deviation) shipped; 2.6.4 (higher forms) → 2.6.5 (closeout) pending.
 
 ---
 
@@ -63,12 +63,10 @@ RK4 integration of `dV^a/dt = −Γ^a_{μν} V^μ ẋ^ν` (constant-Γ per step,
 - [x] **Implement:** `parallel_transport` + `_pt_deriv` RHS; the transport ODE is linear in V (`dV/dt = M·V` for fixed `ẋ`).
 - [x] **Coverage:** flat (`Γ=0`) leaves V unchanged; unit-sphere latitude circle (θ=π/4) preserves `⟨V,V⟩` (metric compatibility) and rotates the vector.
 
-### 2.6.3 — Geodesic deviation / Jacobi equation (`geodesic_deviation`)
-The tidal acceleration `D²J^a/dτ² = −R^a_{μνρ} u^μ J^ν u^ρ` for a separation
-field `J` along a geodesic with tangent `u`.
-- [ ] **Bite 1 (oracle):** unit sphere → nearby geodesics satisfy `J'' = −J` (`K = 1`); flat space → `J'' = 0`. Failing baseline.
-- [ ] **Bite 2 (implement):** evaluate the tidal term from `riemann_get` along a geodesic state.
-- [ ] **Bite 3 (coverage):** sphere convergence vs flat zero-deviation; linearity of the tidal operator in `J`.
+### 2.6.3 — Geodesic deviation / Jacobi equation (`geodesic_deviation`) ✅ shipped
+Tidal term `D²J^ρ/dτ² = −R^ρ_{σμν} u^σ J^μ u^ν`. 6 assertions (943 → 949).
+- [x] **Implement:** Riemann contraction with `u, J, u`; for a space form reduces to `−(|u|² J − ⟨u,J⟩ u)`.
+- [x] **Coverage:** unit sphere `J⊥u → J'' = −J`, `J∥u → 0`, `|u|²` scaling, flat → 0, linearity in `J`.
 
 ### 2.6.4 — Higher-order differential forms (`wedge_2_1`, `wedge_3_1`, …)
 Extend the exterior algebra past 2-forms to 3- and 4-forms (4D), with grade
@@ -136,6 +134,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.3 | 2026-05-29 | 16,580 | 34 | Diffgeo arc — geodesic deviation / Jacobi (`geodesic_deviation`); 6 sphere/flat/linearity assertions. 949 |
 | 2.6.2 | 2026-05-29 | 16,560 | 34 | Diffgeo arc — parallel transport (`parallel_transport`, RK4); 4 flat/sphere length-preservation assertions. 943 |
 | 2.6.1 | 2026-05-29 | 16,540 | 34 | Diffgeo arc — Weyl conformal-curvature tensor (`weyl_tensor`); 5 space-form/trace-free assertions. 939 |
 | 2.6.0 | 2026-05-29 | 16,520 | 34 | Diffgeo arc — sectional curvature (`sectional_curvature` from Riemann); 5 space-form/sphere assertions. 934 |

@@ -29,6 +29,9 @@ Hisab does NOT trust:
 | sequential_impulse | Zero/unbounded impulse | Fixed in 2.4.5 (sign + accumulate-into-velocity); impulse clamped ≥ 0, converges |
 | num_newton/bisection | Non-convergence | max_iter bound; returns ERR_NO_CONVERGENCE |
 | num_modpow | Intermediate multiplication overflow | _num_mulmod (Russian peasant) avoids overflow |
+| sectional_curvature | Division by a degenerate plane area (`⟨u,u⟩⟨v,v⟩−⟨u,v⟩² ≈ 0`) | Zero guard (`< EPSILON → 0`); pinned by the degenerate-plane test |
+| weyl_tensor | Division by `(n−2)` for `n < 3` | Early `if (dim < 3) return zero` — the formula is undefined / identically zero there |
+| wedge_2_1 / wedge_3_1 / hodge_star_2form_4d | Fixed 4D reduced-basis layout assumed | Documented 4D contract; caller must pass 4D forms (6-/4-component) |
 | cga_blade_inverse | Division by zero on a null blade (`⟨B~B⟩₀ ≈ 0`) | Zero guard returns the zero multivector; pinned by the project-onto-null-blade test |
 | cga_pseudoscalar_inv | Division by `⟨I~I⟩₀` | Structurally `−1` for the unit pseudoscalar (no external input); cannot be zero |
 | cx_div, cx_inv | Division by zero | Zero guard returns cx_zero() |
@@ -77,3 +80,4 @@ BDF-5 coefficients (300/137, etc.) were recomputed exact and verified via IEEE 7
 - **2026-04-15**: P(-1) audit — 31 issues found, 25 fixed. See [docs/audit/2026-04-15.md](../audit/2026-04-15.md).
 - **2026-05-29**: P(-1) hardening (v2.4.6) — security/CVE/supply-chain review closing the 2.4.x collision arc. No new vulnerability; 6 allocation-guard regression tests added; `mat_new` upstream item reconfirmed. See [docs/audit/2026-05-29.md](../audit/2026-05-29.md).
 - **2026-05-29**: 2.5.x closeout (v2.5.4) — P(-1)/security review of the CGA operators + `mat_new_guarded`. Posture solid (fixed-size allocs, bounded loops, guarded/structural divisions); no fix needed. Earned `architecture/math.md` (equation catalogue). See [docs/audit/2026-05-29-cga-arc-closeout.md](../audit/2026-05-29-cga-arc-closeout.md).
+- **2026-05-30**: 2.6.x closeout (v2.6.5) — P(-1)/security review of the new diffgeo functions (sectional/Weyl/Jacobi contractions, parallel transport, higher-form wedges). Posture solid (bounded loops, guarded divisions, dims inherit the `dim ≤ 16` cap); no fix needed. Grew `math.md §2` (differential geometry). See [docs/audit/2026-05-30.md](../audit/2026-05-30.md).

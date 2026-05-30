@@ -133,7 +133,99 @@ or grade-4 (direct) blades; rigid motions are versors applied by the sandwich
 
 ---
 
-## 2. Catalogue index — where the rest of the equation material lives
+## 2. Differential Geometry (`diffgeo.cyr`)
+
+Tensors are flat `f64` arrays: metric `g[i·n+j]`, Christoffel `Γ[(a·n+μ)·n+ν]`,
+Riemann `R[((ρ·n+σ)·n+μ)·n+ν]` (dim `n` capped at 16). Index helpers `_dg_idx2/3/4`.
+
+### 2.1 Curvature tensors
+
+```
+Γ^a_{μν} = ½ g^{aλ} (∂_μ g_{λν} + ∂_ν g_{λμ} − ∂_λ g_{μν})
+R^ρ_{σμν} = ∂_μ Γ^ρ_{νσ} − ∂_ν Γ^ρ_{μσ} + Γ^ρ_{μλ}Γ^λ_{νσ} − Γ^ρ_{νλ}Γ^λ_{μσ}
+```
+
+`R^ρ_{σμν}` is antisymmetric in the **last two** indices (μ,ν). **Sign convention**
+(load-bearing for everything below): a sphere has *positive* curvature — verified
+numerically, `R^θ_{φθφ} = +1` at the equator of the unit 2-sphere. Then
+
+```
+Ricci   R_{μν} = R^λ_{μλν}            (contract 1st & 3rd)
+scalar  R      = g^{μν} R_{μν}
+Einstein G_{μν} = R_{μν} − ½ R g_{μν}
+```
+
+### 2.2 Sectional curvature (`sectional_curvature`)
+
+```
+K(u,v) = R(u,v,v,u) / (⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩²),   R(u,v,v,u) = R_{ασμν} u^α v^σ u^μ v^ν
+```
+
+with the first index lowered `R_{ασμν} = g_{αρ} R^ρ_{σμν}` and `⟨a,b⟩ = g_{ij}a^i b^j`
+(`_dg_inner`). A degenerate plane (`|denominator| < EPSILON`) returns 0. For a
+constant-curvature space form `K = K₀` on every plane; a radius-`r` sphere gives
+`K = 1/r²`. **Pinned:** space-form `K=1` (axis + skew planes), radius-2 sphere `1/4`,
+flat `0`, degenerate `0`.
+
+### 2.3 Weyl conformal-curvature tensor (`weyl_tensor`)
+
+The trace-free part of Riemann (conformally invariant), for `n ≥ 3`:
+
+```
+C_{ρσμν} = R_{ρσμν}
+         − 1/(n−2) (g_{ρμ}R_{σν} − g_{ρν}R_{σμ} − g_{σμ}R_{ρν} + g_{σν}R_{ρμ})
+         + R/((n−1)(n−2)) (g_{ρμ}g_{σν} − g_{ρν}g_{σμ})
+```
+
+Returns all-zero for `n ≤ 2` (the `1/(n−2)` factor guards it). **Pinned:** vanishes
+for 3D and 4D space forms (conformally flat, Riemann ≠ 0), nonzero for a
+non-space-form Riemann, and trace-free `g^{ρμ} C_{ρσμν} = 0`.
+
+### 2.4 Geodesic deviation / Jacobi (`geodesic_deviation`)
+
+```
+D²J^ρ/dτ² = −R^ρ_{σμν} u^σ J^μ u^ν
+```
+
+(J and the second `u` occupy Riemann's antisymmetric pair). For a space form this
+is `−(|u|² J − ⟨u,J⟩ u)`. **Pinned:** unit sphere `J⊥u → J'' = −J` (geodesics
+converge), `J∥u → 0`, `|u|²` scaling, flat `0`, linear in `J`.
+
+### 2.5 Parallel transport (`parallel_transport`)
+
+```
+dV^a/dt = −Γ^a_{μν} V^μ ẋ^ν     (RK4; Γ constant per step, like geodesic_rk4)
+```
+
+Linear in V (`dV/dt = M·V` for fixed `ẋ`). Metric-compatible: `⟨V,V⟩` is preserved.
+**Pinned:** flat space leaves V unchanged; a unit-sphere latitude circle (θ=π/4)
+preserves `⟨V,V⟩` and rotates the vector.
+
+### 2.6 Exterior algebra (`wedge_*`, `hodge_star_2form_4d`)
+
+Forms use the **reduced strictly-increasing basis**: in 4D a 1-form is `[0,1,2,3]`,
+2-form `[01,02,03,12,13,23]`, 3-form `[012,013,023,123]`, 4-form `[0123]`.
+
+```
+(α∧β)_{i<j}     = α_i β_j − α_j β_i                         (wedge_1_1)
+(ω∧α)_{i<j<k}   = ω_{ij}α_k − ω_{ik}α_j + ω_{jk}α_i          (wedge_2_1, 2∧1→3)
+(β∧α)_{0123}    = β_{012}α_3 − β_{013}α_2 + β_{023}α_1 − β_{123}α_0   (wedge_3_1, 3∧1→4)
+```
+
+Graded antisymmetry `α∧β = (−1)^{pq} β∧α`, nilpotence `α∧α = 0` (odd degree),
+repeated factor → 0. `hodge_star_2form_4d` dualises a 4D 2-form (Lorentzian /
+Euclidean via the sign flag). `wedge_2_1` / `wedge_3_1` / the Hodge star are 4D-specific.
+
+### References
+
+- M. do Carmo — *Riemannian Geometry*, Birkhäuser, 1992.
+- J. M. Lee — *Introduction to Riemannian Manifolds*, 2nd ed., Springer, 2018.
+- R. M. Wald — *General Relativity*, Univ. of Chicago Press, 1984.
+- C. Misner, K. Thorne, J. Wheeler — *Gravitation*, Freeman, 1973.
+
+---
+
+## 3. Catalogue index — where the rest of the equation material lives
 
 hisab's other formula families are documented at their source (header comments)
 and in the references below. This index keeps them findable from one place.
@@ -150,7 +242,7 @@ and in the references below. This index keeps them findable from one place.
 | Number theory | extended GCD, totient, Möbius, CRT, Pollard-rho, Russian-peasant `_num_mulmod` | `num.cyr`, `num_ext.cyr` |
 | Complex / physics | matrix exponential, Pauli/Dirac γ, einsum contraction | `complex.cyr`, `einsum.cyr` |
 | Lie groups | U(1)/SU(2)/SU(3) generators, SO(3,1), SE(3)/SO(3) exp/log, adjoint, BCH | `lie.cyr`, `lie_ext.cyr` |
-| Differential geometry | Christoffel → Riemann/Ricci/Einstein, geodesic RK4, Killing, exterior algebra | `diffgeo.cyr` (depth expansion → roadmap 2.6.0) |
+| Differential geometry | Christoffel → Riemann/Ricci/Einstein, sectional/Weyl curvature, geodesic deviation, parallel transport, exterior algebra | **§2 above** + `diffgeo.cyr` |
 | Tensors | Kronecker δ, Minkowski η, Levi-Civita ε, einsum | `tensor.cyr`, `einsum.cyr` |
 | Verified constants | `EPSILON_F64`, `F64_PI`, `F64_E`, BDF-5 coefficients (IEEE-754 verified) | [`../development/threat-model.md`](../development/threat-model.md) |
 

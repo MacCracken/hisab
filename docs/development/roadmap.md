@@ -11,7 +11,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.4
+## Current -- v2.6.5
 
 - **34 math modules in `src/`, ~16,600 lines** (`lib/` is vendored-only)
 - **957 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
@@ -19,7 +19,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **`dist/hisab.cyr` distlib bundle** ~16,575 lines (all **34 modules**) — fits cycc 6.0.14's 1 MB input_buf with ample headroom
 - Toolchain **6.0.14**; CI fmt/lint/vet/security all green; supply chain SHA-locked (`deps --verify` 60/60, 0 untrusted)
 - **Arc history** — the 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security), and 2.5.x (CGA depth + matrix guard) arcs are all **complete**. Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 929 across them; the 2.4.x arc fixed three real collision bugs, the 2.5.x arc grew CGA from 1 → 29 assertions.
-- **2.6.x arc in progress** — differential-geometry depth. 2.6.0 (sectional curvature) + 2.6.1 (Weyl) + 2.6.2 (parallel transport) + 2.6.3 (geodesic deviation) + 2.6.4 (higher forms) shipped; only 2.6.5 (closeout) pending.
+- **2.6.x arc COMPLETE** — differential-geometry depth. 2.6.0 (sectional curvature) → 2.6.1 (Weyl) → 2.6.2 (parallel transport) → 2.6.3 (geodesic deviation) → 2.6.4 (higher forms) → 2.6.5 (P(-1)/security closeout + `math.md §2`). All additive (no API breaks); 28 known-manifold assertions; posture audited solid.
 
 ---
 
@@ -73,9 +73,10 @@ Extends the exterior algebra to 3- and 4-forms (4D, reduced basis). 8 assertions
 - [x] **Implement:** `wedge_2_1` (2∧1→3) and `wedge_3_1` (3∧1→4); chaining `wedge_1_1 → wedge_2_1 → wedge_3_1` builds every basis k-form up to the top 4-form.
 - [x] **Coverage:** grade bookkeeping (e0∧e1∧e2, the unit 4-form), graded antisymmetry + nilpotence (`e0∧e0=0`), permutation signs, repeated-factor → 0. (No exterior-derivative `d` yet, so `d²=0` deferred.)
 
-### 2.6.5 — P(-1) / security / docs closeout
-- [ ] Audit the new tensor allocations + contraction loops (dim caps, index bounds, degenerate-plane / `n<3` guards); cleanliness + full gate.
-- [ ] Grow the **differential-geometry section of `docs/architecture/math.md`** (curvature conventions, sectional / Weyl / Jacobi formulas, the transport ODE, form grading) with references; dated audit report; doc-health refresh.
+### 2.6.5 — P(-1) / security / docs closeout ✅ shipped
+Posture solid, no source change. Docs-only.
+- [x] **Audit:** bounded contraction loops; guarded divisions (sectional degenerate-plane, Weyl `n<3`, transport `/6`); dims inherit the `riemann_tensor` `≤16` cap; 4D-form contract documented. See `docs/audit/2026-05-30.md`.
+- [x] **Equation reference:** added `math.md §2` (curvature conventions + sectional/Weyl/Jacobi/transport/forms with references); threat-model + doc-health refreshed.
 
 ---
 
@@ -132,6 +133,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.5 | 2026-05-30 | 16,600 | 34 | Diffgeo arc COMPLETE — P(-1)/security audit (posture solid) + `math.md §2` differential-geometry reference. Docs-only, 957 |
 | 2.6.4 | 2026-05-29 | 16,600 | 34 | Diffgeo arc — higher-order forms (`wedge_2_1`/`wedge_3_1`); 8 wedge antisymmetry/grading assertions. 957 |
 | 2.6.3 | 2026-05-29 | 16,580 | 34 | Diffgeo arc — geodesic deviation / Jacobi (`geodesic_deviation`); 6 sphere/flat/linearity assertions. 949 |
 | 2.6.2 | 2026-05-29 | 16,560 | 34 | Diffgeo arc — parallel transport (`parallel_transport`, RK4); 4 flat/sphere length-preservation assertions. 943 |

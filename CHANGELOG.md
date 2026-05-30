@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## [2.6.5] - 2026-05-30 — 2.6.x closeout: P(-1) / security audit + diffgeo equation reference
+
+Closeout pass for the 2.6.x differential-geometry arc — P(-1) cleanliness, a
+memory-safety / numerical review of the seven new `diffgeo.cyr` functions, and
+the documentation deliverable. **No new vulnerability; no source change.**
+Docs-only. The 2.6.x arc is complete.
+
+### Added
+- **`docs/architecture/math.md` §2 — Differential Geometry** — curvature
+  conventions (Riemann `R^ρ_{σμν}`, the load-bearing sphere sign `R^θ_{φθφ}=+1`),
+  the sectional / Weyl / Jacobi formulas, the transport ODE, and the
+  exterior-algebra grading — each with its pinned identities and references
+  (do Carmo; Lee; Wald; Misner-Thorne-Wheeler). The catalogue index now points at §2.
+- **`docs/audit/2026-05-30.md`** — the closeout audit report.
+
+### Security
+- Reviewed the seven new diffgeo functions: bounded contraction loops; the RK4
+  transport allocates fixed work arrays once per call; `weyl_tensor`'s `dim⁴`
+  allocation matches its Riemann input (dim inherits `riemann_tensor`'s `≤ 16`
+  cap). All divisions guarded or structurally safe — `sectional_curvature`
+  degenerate-plane guard, `weyl_tensor` `n<3` guard, transport `/6`;
+  `geodesic_deviation` and the wedges have no division. No new
+  shell/FFI/syscall surface. Posture solid.
+
+### Changed
+- **`threat-model.md`** — recorded the sectional degenerate-plane guard, the Weyl
+  `n<3` guard, and the 4D-form contract; added the 2026-05-30 audit-history entry.
+  **`doc-health.md`** — math.md §2 logged + the new audit; bumped to v2.6.5.
+
 ## [2.6.4] - 2026-05-29 — Higher-order differential forms (2.6.x arc)
 
 Fifth (last feature) patch of the 2.6.x arc. Extends the exterior algebra past

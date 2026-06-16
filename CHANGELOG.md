@@ -30,8 +30,13 @@ is green on the new pin.
   all of `f64_lt`/`f64_gt`/`f64_eq`, so the inclusive forms correctly return 0),
   superseding hisab's negation-based versions. `f64_tan`/`f64_fmod`/
   `f64_copysign`/`f64_approx_eq` stay local (still absent from stdlib).
-- **Vendored stdlib** — `lib/*.cyr` resynced to the 6.2.11 snapshot
-  (`cyrius lib sync`); `cyrius.lock` re-resolved (111 deps).
+- **Vendored stdlib** — `lib/*.cyr` re-resolved to the 6.2.11 toolchain via
+  `cyrius deps` (the manifest-driven resolver, per CLAUDE.md — **not** the
+  full-snapshot `cyrius lib sync`, which over-vendors unused platform variants
+  like `process_agnos.cyr`/`*_win`/`*_macos` and bloats the lock). Result: a
+  minimal **30-file** `lib/` and a 30-entry `cyrius.lock` that matches
+  `cyrius deps --verify` exactly (30/30) — fixing the CI hash-verify failure on
+  the spurious `lib/process_agnos.cyr` entry that the snapshot had pulled in.
 - **`dist/hisab.cyr`** — regenerated via `cyrius distlib` (header now v2.6.6).
 
 ### Fixed

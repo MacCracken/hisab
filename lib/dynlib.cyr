@@ -1,6 +1,25 @@
 # dynlib.cyr — pure Cyrius dynamic library loader (ELF .so)
 # Usage: include "lib/dynlib.cyr"
 # Requires: string.cyr, syscalls.cyr, mmap.cyr
+
+include "lib/fnptr.cyr"
+# v5.8.31: Result-returning *_r variants (dynlib_open_r,
+# dynlib_sym_r) for typed error returns.
+include "lib/result.cyr"
+
+# v5.8.31 — DynlibError variants. `DynlibNotFound` for path
+# resolution / open failure; `DynlibBadElf` for malformed ELF
+# (parse failure); `DynlibSymMissing` for unresolved symbol
+# lookups; `DynlibOther` for the rest. Variant-name prefix
+# `Dynlib` keeps these distinct in the global enum-variant
+# namespace.
+enum DynlibError {
+    DynlibNotFound;
+    DynlibBadElf;
+    DynlibSymMissing;
+    DynlibOther;
+}
+
 #
 # Loads ELF shared objects via mmap, parses ELF64 headers,
 # walks .dynsym + .dynstr to resolve exported symbols.
@@ -11,15 +30,22 @@
 #   dynlib_sym(handle, name)  → function pointer (address) or 0 if not found
 #   dynlib_close(handle)      → 0
 #
-# DynLib struct layout (64 bytes):
-#   +0:  base       — mmap'd base address
-#   +8:  size       — mmap'd total span
-#   +16: dynsym     — pointer to .dynsym section
-#   +24: dynstr     — pointer to .dynstr section
-#   +32: nsyms      — number of symbols in .dynsym
-#   +40: load_bias  — difference between mmap'd base and ELF p_vaddr
-#   +48: gnu_hash   — pointer to .gnu.hash section (0 if not present)
-#   +56: strtab_sz  — size of .dynstr in bytes (bounds checking)
+# DynLib struct layout (120 bytes):
+#   +0:  base            — mmap'd base address
+#   +8:  size            — mmap'd total span
+#   +16: dynsym          — pointer to .dynsym section
+#   +24: dynstr          — pointer to .dynstr section
+#   +32: nsyms           — number of symbols in .dynsym
+#   +40: load_bias       — difference between mmap'd base and ELF p_vaddr
+#   +48: gnu_hash        — pointer to .gnu.hash section (0 if not present)
+#   +56: strtab_sz       — size of .dynstr in bytes (bounds checking)
+#   +64: init_vaddr      — DT_INIT entry offset (0 if absent)
+#   +72: init_array_vaddr — DT_INIT_ARRAY offset
+#   +80: init_array_sz   — DT_INIT_ARRAYSZ (bytes)
+#   +88: rela_addr       — absolute address of .rela.dyn (for opt-in IRELATIVE)
+#   +96: rela_size       — bytes
+#   +104: jmprel_addr    — absolute address of .rela.plt
+#   +112: jmprel_size    — bytes
 
 # ================================================================
 # ELF64 constants
@@ -78,6 +104,7 @@ enum ElfStBind {
 enum ElfStType {
     STT_FUNC    = 2;
     STT_OBJECT  = 1;
+    STT_GNU_IFUNC = 10;        # GNU IFUNC — st_value points at a resolver
 }
 
 # ELF64 struct sizes
@@ -87,6 +114,18 @@ enum ElfSizes {
     SYM_SIZE    = 24;          # Elf64_Sym entry
     DYN_SIZE    = 16;          # Elf64_Dyn entry
 }
+
+# ================================================================
+# Module-level flags
+# ================================================================
+# `_dynlib_ifunc_safe` is set to 1 by `dynlib_bootstrap_cpu_features()`
+# once glibc's `__cpu_features` struct has been zero-filled via the
+# ld-linux getter. While it's 0, IFUNC resolvers in loaded libraries
+# (libcrypto etc.) are unsafe to call — their HWCAP reads segfault.
+# While it's 1, `dynlib_sym` auto-resolves `STT_GNU_IFUNC` symbols by
+# calling the resolver; callers see the concrete implementation
+# pointer rather than the resolver address.
+var _dynlib_ifunc_safe = 0;
 
 # ================================================================
 # DynLib struct accessors
@@ -106,7 +145,7 @@ fn _dynlib_strsz(h)    { return load64(h + 56); }
 # ================================================================
 
 # Check ELF magic bytes at base
-fn _elf_check_magic(base) {
+fn _elf_check_magic(base): i64 {
     var magic = load32(base);
     if (magic != ELFMAG) { return 0; }
     # Check class = 64-bit
@@ -115,35 +154,35 @@ fn _elf_check_magic(base) {
 }
 
 # e_type at offset 16 (u16)
-fn _elf_type(base) { return load16(base + 16); }
+fn _elf_type(base) : i64 { return load16(base + 16); }
 
 # e_phoff at offset 32 (u64)
-fn _elf_phoff(base) { return load64(base + 32); }
+fn _elf_phoff(base) : i64 { return load64(base + 32); }
 
 # e_phentsize at offset 54 (u16)
-fn _elf_phentsize(base) { return load16(base + 54); }
+fn _elf_phentsize(base) : i64 { return load16(base + 54); }
 
 # e_phnum at offset 56 (u16)
-fn _elf_phnum(base) { return load16(base + 56); }
+fn _elf_phnum(base) : i64 { return load16(base + 56); }
 
 # ================================================================
 # Program header field readers
 # ================================================================
 
 # p_type at +0 (u32)
-fn _phdr_type(p) { return load32(p); }
+fn _phdr_type(p) : i64 { return load32(p); }
 
 # p_offset at +8 (u64)
-fn _phdr_offset(p) { return load64(p + 8); }
+fn _phdr_offset(p) : i64 { return load64(p + 8); }
 
 # p_vaddr at +16 (u64)
-fn _phdr_vaddr(p) { return load64(p + 16); }
+fn _phdr_vaddr(p) : i64 { return load64(p + 16); }
 
 # p_filesz at +32 (u64)
-fn _phdr_filesz(p) { return load64(p + 32); }
+fn _phdr_filesz(p) : i64 { return load64(p + 32); }
 
 # p_memsz at +40 (u64)
-fn _phdr_memsz(p) { return load64(p + 40); }
+fn _phdr_memsz(p) : i64 { return load64(p + 40); }
 
 # ================================================================
 # Dynamic section parsing
@@ -157,7 +196,7 @@ fn _phdr_memsz(p) { return load64(p + 40); }
 #   +72: init_array_vaddr +80: init_array_size
 #   +88: needed[8] (up to 8 DT_NEEDED strtab offsets)
 #   +88+0..63: needed offsets   +88+64: needed_count
-fn _parse_dynamic(base, dyn_offset, dyn_size) {
+fn _parse_dynamic(base, dyn_offset, dyn_size): i64 {
     var result = alloc(160);
     var ri = 0;
     while (ri < 160) { store8(result + ri, 0); ri = ri + 1; }
@@ -200,7 +239,7 @@ fn _parse_dynamic(base, dyn_offset, dyn_size) {
 # ================================================================
 
 # GNU hash function
-fn _gnu_hash(name) {
+fn _gnu_hash(name): i64 {
     var h = 5381;
     var i = 0;
     var c = load8(name + i);
@@ -223,7 +262,7 @@ fn _gnu_hash(name) {
 #   +16+bloom_size*8: buckets[nbuckets] (u32 each)
 #   after buckets: chains[] (u32 each, one per symbol starting from symoffset)
 
-fn _gnu_hash_lookup(gnuhash, dynsym, dynstr, strsz, bias, name) {
+fn _gnu_hash_lookup(gnuhash, dynsym, dynstr, strsz, bias, name): i64 {
     var nbuckets    = load32(gnuhash);
     var symoffset   = load32(gnuhash + 4);
     var bloom_size  = load32(gnuhash + 8);
@@ -264,10 +303,20 @@ fn _gnu_hash_lookup(gnuhash, dynsym, dynstr, strsz, bias, name) {
             if (strsz > 0 && st_name_off >= strsz) { return 0; }
             var sym_name = dynstr + st_name_off;
             if (streq(sym_name, name) == 1) {
-                # Found it — return address
-                var st_value = load64(sym_entry + 8);  # st_value at +8
-                if (st_value == 0) { return 0; }       # Undefined symbol
-                return bias + st_value;
+                # Found it — return address. For STT_GNU_IFUNC symbols
+                # the address points at a resolver; call it to get the
+                # concrete impl, but only after `_dynlib_ifunc_safe`
+                # is set (cpu_features bootstrap has run). Otherwise
+                # return the resolver address — matches pre-v5.3.11
+                # behaviour for consumers that aren't bootstrapping.
+                var st_value = load64(sym_entry + 8);
+                if (st_value == 0) { return 0; }
+                var st_info = load8(sym_entry + 4);
+                var addr = bias + st_value;
+                if ((st_info & 0xF) == STT_GNU_IFUNC) {
+                    if (_dynlib_ifunc_safe == 1) { addr = fncall0(addr); }
+                }
+                return addr;
             }
         }
 
@@ -283,7 +332,7 @@ fn _gnu_hash_lookup(gnuhash, dynsym, dynstr, strsz, bias, name) {
 # Linear symbol search fallback (no GNU hash)
 # ================================================================
 
-fn _linear_sym_lookup(dynsym, dynstr, nsyms, strsz, bias, name) {
+fn _linear_sym_lookup(dynsym, dynstr, nsyms, strsz, bias, name): i64 {
     # Skip symbol 0 (null entry)
     for (var i = 1; i < nsyms; i = i + 1) {
         var sym = dynsym + i * SYM_SIZE;
@@ -306,7 +355,11 @@ fn _linear_sym_lookup(dynsym, dynstr, nsyms, strsz, bias, name) {
         # Compare name
         var sym_name = dynstr + st_name_off;
         if (streq(sym_name, name) == 1) {
-            return bias + st_value;
+            var addr = bias + st_value;
+            if ((st_info & 0xF) == STT_GNU_IFUNC) {
+                if (_dynlib_ifunc_safe == 1) { addr = fncall0(addr); }
+            }
+            return addr;
         }
     }
     return 0;
@@ -318,7 +371,7 @@ fn _linear_sym_lookup(dynsym, dynstr, nsyms, strsz, bias, name) {
 # When no hash table is present, estimate nsyms from section layout.
 # .dynsym immediately precedes .dynstr in most ELF .so files.
 
-fn _estimate_nsyms(symtab_vaddr, strtab_vaddr) {
+fn _estimate_nsyms(symtab_vaddr, strtab_vaddr): i64 {
     if (strtab_vaddr <= symtab_vaddr) { return 256; }  # fallback guess
     var gap = strtab_vaddr - symtab_vaddr;
     var n = gap / SYM_SIZE;
@@ -336,7 +389,7 @@ var _dynlib_registry[256];  # 16 entries × 16 bytes (hash + handle)
 var _dynlib_reg_count = 0;
 
 # Simple hash of a library basename for dedup
-fn _dynlib_namehash(name) {
+fn _dynlib_namehash(name): i64 {
     var h = 5381;
     var i = 0;
     while (load8(name + i) != 0) {
@@ -348,7 +401,7 @@ fn _dynlib_namehash(name) {
 }
 
 # Check if library is already loaded, return handle or 0
-fn _dynlib_find_loaded(name) {
+fn _dynlib_find_loaded(name): i64 {
     var h = _dynlib_namehash(name);
     var i = 0;
     while (i < _dynlib_reg_count) {
@@ -361,7 +414,7 @@ fn _dynlib_find_loaded(name) {
 }
 
 # Register a loaded library
-fn _dynlib_register(name, handle) {
+fn _dynlib_register(name, handle): i64 {
     if (_dynlib_reg_count >= 16) { return 0; }
     var h = _dynlib_namehash(name);
     store64(&_dynlib_registry + _dynlib_reg_count * 16, h);
@@ -371,7 +424,7 @@ fn _dynlib_register(name, handle) {
 }
 
 # Resolve a symbol across ALL loaded libraries
-fn _dynlib_resolve_global(name) {
+fn _dynlib_resolve_global(name): i64 {
     var i = 0;
     while (i < _dynlib_reg_count) {
         var h = load64(&_dynlib_registry + i * 16 + 8);
@@ -384,7 +437,7 @@ fn _dynlib_resolve_global(name) {
 
 # Try to find a .so file on common search paths
 # Writes the full path into buf, returns 1 on success
-fn _dynlib_find_path(name, buf, bufsz) {
+fn _dynlib_find_path(name, buf, bufsz): i64 {
     # Try common library paths (4 pointers × 8 bytes = 32 bytes)
     var paths[32];
     store64(&paths, "/usr/lib/");
@@ -417,7 +470,7 @@ fn _dynlib_find_path(name, buf, bufsz) {
 # Phase 1: RELATIVE (no symbol lookup, just base adjustment)
 # Phase 2: GLOB_DAT, JUMP_SLOT, 64 (symbol lookup)
 # Phase 3: IRELATIVE (calls resolver functions — must run last)
-fn _dynlib_process_rela(handle, bias, rela_addr, rela_size) {
+fn _dynlib_process_rela(handle, bias, rela_addr, rela_size): i64 {
     if (rela_addr == 0 || rela_size == 0) { return 0; }
 
     var dynsym = load64(handle + 16);
@@ -473,13 +526,97 @@ fn _dynlib_process_rela(handle, bias, rela_addr, rela_size) {
         pos = pos + 24;
     }
 
-    # Phase 3: IRELATIVE (calls resolver functions to pick IFUNC impls)
-    # These resolvers read CPU features via __cpu_features or CPUID.
-    # On a statically-linked binary, the CPU features struct isn't
-    # initialized by glibc's startup code. Skip IRELATIVE for now —
-    # the default symbol table entries cover the basic implementations.
-    # TODO: initialize CPU features struct or call resolvers safely.
+    # Phase 3 IRELATIVE is intentionally NOT run here — see
+    # _dynlib_apply_irelative. Calling IFUNC resolvers without a
+    # populated glibc `__cpu_features` segfaults for the resolvers
+    # that read it (most of libcrypto's, much of libc's hot
+    # string/memory paths). Consumers that need IRELATIVE call
+    # dynlib_init(handle) to opt in.
 
+    return 0;
+}
+
+# Opt-in Phase 3: walk the same RELA/JMPREL tables and invoke each
+# IRELATIVE resolver, writing the returned pointer back. Zero-arg
+# invocation is tolerated by the SSE2-baseline resolvers in modern
+# glibc. Unsafe for libcrypto/libssl — call only on libraries that
+# are known to behave (currently just libc.so.6 / NSS modules).
+#
+# Defense in depth: refuses to run if `_dynlib_ifunc_safe` is 0
+# (cpu_features bootstrap hasn't run). This matches the IFUNC
+# guards in `_gnu_hash_lookup` and `_linear_sym_lookup` — calling
+# a resolver without a zeroed cpu_features segfaults on the first
+# x86_64 feature-probe inside glibc.
+fn _dynlib_apply_irelative(handle, bias, rela_addr, rela_size): i64 {
+    if (rela_addr == 0 || rela_size == 0) { return 0; }
+    if (_dynlib_ifunc_safe == 0) { return 0; }
+    var span = load64(handle + 8);
+    var pos = rela_addr;
+    var end = pos + rela_size;
+    while (pos < end) {
+        var r_info = load64(pos + 8);
+        var rtype = r_info & 0xFFFFFFFF;
+        if (rtype == R_X86_64_IRELATIVE) {
+            var r_offset = load64(pos);
+            if (r_offset < span) {
+                var r_addend = load64(pos + 16);
+                var resolver = bias + r_addend;
+                # Resolver must live inside the mapped library. A
+                # corrupted r_addend would otherwise jump to arbitrary
+                # memory on the first IFUNC call.
+                if (_dynlib_fp_in_span(handle, resolver) == 1) {
+                    var resolved = fncall0(resolver);
+                    if (resolved != 0) {
+                        store64(bias + r_offset, resolved);
+                    }
+                }
+            }
+        }
+        pos = pos + 24;
+    }
+    return 0;
+}
+
+# Returns 1 if `fp` falls inside the mapped span of `handle`.
+# Used to refuse calling function pointers derived from
+# corrupted/untrusted dynamic-section entries — every DT_INIT,
+# DT_INIT_ARRAY, and IRELATIVE resolver address should resolve
+# to code inside the library we loaded.
+fn _dynlib_fp_in_span(handle, fp): i64 {
+    if (handle == 0 || fp == 0) { return 0; }
+    var base = load64(handle);
+    var span = load64(handle + 8);
+    if (fp < base) { return 0; }
+    if (fp >= base + span) { return 0; }
+    return 1;
+}
+
+# Run DT_INIT (single init func) and DT_INIT_ARRAY (array of init funcs).
+# Must run AFTER _dynlib_process_rela for both RELA and JMPREL so that
+# any libc-internal pointers the init functions reach through are fixed.
+# DT_INIT runs first, then DT_INIT_ARRAY in ascending order — matches
+# the ELF ABI contract (libc sets up locale, malloc state, NSS module
+# table, etc. inside these; skipping them is what broke getgrouplist).
+#
+# Every fptr is bounds-checked against the library's mapped span
+# before being invoked. A corrupted init_array_vaddr or init_vaddr
+# (or a garbage entry in the array) won't jump into random memory.
+fn _dynlib_run_init(handle, bias, init_vaddr, init_array_vaddr, init_array_sz): i64 {
+    if (init_vaddr != 0) {
+        var ifp = bias + init_vaddr;
+        if (_dynlib_fp_in_span(handle, ifp) == 1) { fncall0(ifp); }
+    }
+    if (init_array_vaddr != 0 && init_array_sz > 0) {
+        var n_inits = init_array_sz / 8;
+        var ii = 0;
+        while (ii < n_inits) {
+            var fp = load64(bias + init_array_vaddr + ii * 8);
+            if (fp != 0 && _dynlib_fp_in_span(handle, fp) == 1) {
+                fncall0(fp);
+            }
+            ii = ii + 1;
+        }
+    }
     return 0;
 }
 
@@ -490,7 +627,7 @@ fn _dynlib_process_rela(handle, bias, rela_addr, rela_size) {
 # Open a shared library (.so file) with full dynamic linking.
 # Loads dependencies recursively, processes relocations, runs init.
 # Returns handle pointer or 0 on failure.
-fn dynlib_open(path) {
+fn dynlib_open(path): i64 {
     # Check if already loaded
     var existing = _dynlib_find_loaded(path);
     if (existing != 0) { return existing; }
@@ -654,7 +791,7 @@ fn dynlib_open(path) {
     var nsyms = _estimate_nsyms(symtab_vaddr, strtab_vaddr);
 
     # Allocate handle
-    var h = alloc(64);
+    var h = alloc(120);
     store64(h, base);
     store64(h + 8, span);
     store64(h + 16, dynsym);
@@ -663,6 +800,21 @@ fn dynlib_open(path) {
     store64(h + 40, bias);
     store64(h + 48, gnuhash);
     store64(h + 56, strtab_size);
+    store64(h + 64, load64(dinfo + 64));       # init_vaddr
+    store64(h + 72, load64(dinfo + 72));       # init_array_vaddr
+    store64(h + 80, load64(dinfo + 80));       # init_array_sz
+    var _r_v = load64(dinfo + 32);
+    var _r_s = load64(dinfo + 40);
+    var _jr_v = load64(dinfo + 48);
+    var _jr_s = load64(dinfo + 56);
+    var _rela = 0;
+    if (_r_v != 0) { _rela = bias + _r_v; }
+    var _jmprel = 0;
+    if (_jr_v != 0) { _jmprel = bias + _jr_v; }
+    store64(h + 88, _rela);
+    store64(h + 96, _r_s);
+    store64(h + 104, _jmprel);
+    store64(h + 112, _jr_s);
 
     # Register before loading deps (prevents circular loading)
     _dynlib_register(path, h);
@@ -697,18 +849,312 @@ fn dynlib_open(path) {
         _dynlib_process_rela(h, bias, bias + jmprel_vaddr, jmprel_size);
     }
 
-    # Run init functions
-    # Skip init functions for now — they depend on IRELATIVE resolvers
-    # which we can't call safely from a static binary. Symbol resolution
-    # still works; most functions are callable without init.
-    # TODO: implement CPU feature detection to enable IRELATIVE + init.
+    # Run DT_INIT + DT_INIT_ARRAY only when the caller opted in. These
+    # initialise locale, malloc state, NSS module tables, stdio buffers,
+    # etc. — needed for NSS/PAM flows but they expect a real glibc
+    # runtime (auxv, TLS, __libc_stack_end) which a static Cyrius binary
+    # doesn't set up. Running them against libcrypto for example SIGSEGVs
+    # at first touch. Consumers that need NSS/PAM call
+    # dynlib_run_init(h) explicitly after dynlib_open succeeds.
 
     return h;
 }
 
+# Bootstrap a minimal x86_64 TLS block so libc entry points that
+# access thread-local state (errno, tid cache) don't crash on an
+# uninitialised `%fs` segment. The kernel normally sets this up via
+# `__libc_start_main`; a statically-linked Cyrius binary has to do
+# it by hand.
+#
+# Layout: 4KB zero-filled buffer with two NPTL-compatible anchors —
+#   offset  0: tcb->self  (pointer to the block itself)
+#   offset 16: self       (NPTL requires this for __pthread_self())
+# Then `arch_prctl(ARCH_SET_FS, tls)` installs the base. After this
+# call, `mov %fs:0, rax` reads the self-pointer and most libc
+# internals that touch `%fs:N` for small `N` see zeroed slots
+# instead of segfaulting.
+#
+# Returns the TLS block pointer (caller can keep it for debugging)
+# or 0 if the syscall failed.
+fn dynlib_bootstrap_tls(): i64 {
+    var tls = alloc(4096);
+    if (tls == 0) { return 0; }
+    var i = 0;
+    while (i < 4096) { store8(tls + i, 0); i = i + 1; }
+    store64(tls, tls);            # tcb->self
+    store64(tls + 16, tls);       # NPTL self-pointer
+    # arch_prctl(ARCH_SET_FS=0x1002, tls) — syscall 158
+    var rc = syscall(158, 0x1002, tls);
+    if (rc != 0) { return 0; }
+    return tls;
+}
+
+# Populate `__libc_stack_end` (exported from ld-linux) with a sensible
+# high stack-top value. libc internals consult this to find the top of
+# the main thread's stack — the kernel fills it from auxv, but a
+# static Cyrius binary has to supply it. Pass 0 to use a default
+# "top of user VA" value that works as a sentinel; pass a specific
+# address if you want the real RSP top.
+#
+# Returns 0 on success, 1 if ld-linux isn't reachable.
+fn dynlib_bootstrap_stack_end(stack_top): i64 {
+    var hld = dynlib_open("/lib64/ld-linux-x86-64.so.2");
+    if (hld == 0) { hld = dynlib_open("ld-linux-x86-64.so.2"); }
+    if (hld == 0) { return 1; }
+    var sep = dynlib_sym(hld, "__libc_stack_end");
+    if (sep == 0) { return 2; }
+    var v = stack_top;
+    if (v == 0) { v = 0x7FFFFFFFFFFF; }
+    store64(sep, v);
+    return 0;
+}
+
+# Bootstrap glibc's `__cpu_features` struct to a zero-initialised
+# (SSE2-baseline) state so IRELATIVE resolvers can run without the
+# usual kernel-provided auxv setup. Returns 0 on success, non-zero
+# if the dynamic linker can't be loaded or the getter is missing.
+#
+# How it works: `/lib64/ld-linux-x86-64.so.2` exports
+# `_dl_x86_get_cpu_features@@GLIBC_PRIVATE`, a getter that returns
+# a pointer to the `cpu_features` struct inside `_rtld_global_ro`.
+# We call it and zero the first 768 bytes — covers the struct layout
+# across current glibc versions. With all "usable" flags cleared,
+# IFUNC resolvers fall back to the SSE2-baseline implementation
+# (guaranteed on every x86_64 CPU).
+#
+# This unblocks IRELATIVE resolution but NOT the rest of glibc
+# startup state (TLS, `__libc_stack_end`, stdio buffers, locale).
+# Calling libc entry points after just this bootstrap still crashes
+# inside functions that touch those — full NSS/PAM requires the
+# follow-on work to populate TLS and stack end too.
+fn dynlib_bootstrap_cpu_features(): i64 {
+    var hld = dynlib_open("/lib64/ld-linux-x86-64.so.2");
+    if (hld == 0) { hld = dynlib_open("ld-linux-x86-64.so.2"); }
+    if (hld == 0) { return 1; }
+    var getter = dynlib_sym(hld, "_dl_x86_get_cpu_features");
+    if (getter == 0) { return 2; }
+    var cpf = fncall0(getter);
+    if (cpf == 0) { return 3; }
+    var i = 0;
+    while (i < 768) { store8(cpf + i, 0); i = i + 1; }
+    # From here on, IFUNC resolvers can be safely invoked (they read
+    # cpu_features and now see the SSE2-baseline zero state).
+    _dynlib_ifunc_safe = 1;
+    return 0;
+}
+
+# Bootstrap per-thread locale via glibc's `newlocale` + `uselocale`
+# rather than `setlocale`. Why the detour: calling
+# `setlocale(LC_ALL, "C")` from a cyrius-driven libc handle SIGSEGVs
+# inside `__libc_setlocale_lock` / the global-locale rwlock — that
+# state expects `__libc_start_main`'s full init, which we don't
+# run. `newlocale` builds a thread-local locale_t object, and
+# `uselocale` installs it for the current thread without touching
+# the global lock. The "C" locale is built-in (no /usr/lib/locale
+# file loading), so this works on every glibc host.
+#
+# Call sequence expected by consumers:
+#   dynlib_bootstrap_cpu_features();
+#   dynlib_bootstrap_tls();
+#   dynlib_bootstrap_stack_end(0);
+#   var hc = dynlib_open("libc.so.6");
+#   dynlib_init(hc);                  # IRELATIVE + DT_INIT_ARRAY
+#   dynlib_bootstrap_locale(hc);      # ← this fn
+#   # ... now strftime / strtol / other locale-aware fns work
+#
+# After this, `setlocale(LC_ALL, NULL)` (query) and any locale-
+# dependent parsing / formatting runs correctly.
+#
+# What this does NOT fix: NSS dispatch (`getpwuid` / `getgrouplist`
+# / `pam_authenticate` / `getaddrinfo`). Those crash in a different
+# libc layer (NSS module-table walk). Tracked for a follow-up
+# patch — v5.5.23 is scoped to locale only after the v5.5.23
+# reproducer-staging session found:
+#   • setlocale(LC_ALL, "C")  SIGSEGV  (the modifying global path)
+#   • setlocale(LC_ALL, NULL) works    (query-only)
+#   • newlocale + uselocale  works     (per-thread path)
+#   • getpwuid(0)            SIGSEGV  (NSS dispatch — separate)
+#
+# Returns:
+#   0  — locale installed successfully
+#   1  — hc is null or newlocale symbol missing
+#   2  — uselocale symbol missing
+#   3  — newlocale returned null (allocation failed inside libc)
+#
+# LC_ALL_MASK = 0x1FBF on x86_64 glibc (LC_{CTYPE,NUMERIC,TIME,
+# COLLATE,MONETARY,MESSAGES,PAPER,NAME,ADDRESS,TELEPHONE,
+# MEASUREMENT,IDENTIFICATION} = bits 0-12 with LC_ALL excluded).
+fn dynlib_bootstrap_locale(hc): i64 {
+    if (hc == 0) { return 1; }
+    var fp_newlocale = dynlib_sym(hc, "newlocale");
+    if (fp_newlocale == 0) { return 1; }
+    var fp_uselocale = dynlib_sym(hc, "uselocale");
+    if (fp_uselocale == 0) { return 2; }
+    var loc = fncall3(fp_newlocale, 0x1FBF, "C", 0);
+    if (loc == 0) { return 3; }
+    fncall1(fp_uselocale, loc);
+    return 0;
+}
+
+# Populate glibc's `__environ` / `environ` globals with a valid
+# empty-but-terminated env array so getenv() doesn't dereference
+# null. `__libc_start_main` normally sets these from argv's envp;
+# a static Cyrius binary has to point them at something
+# non-null before any libc fn that walks the env array
+# (getenv, secure_getenv, setenv, strerror on some glibc builds,
+# NSS setup, ...). With both slots set to an empty terminator-
+# only array, getenv returns null for any name (as if env were
+# empty) and the internal walks don't crash.
+#
+# Returns:
+#   0  — both symbols located and initialised
+#   1  — hc is null
+#   2  — neither `__environ` nor `environ` symbol exported
+#   3  — alloc failed
+#
+# Usage (after the other bootstraps):
+#   dynlib_bootstrap_cpu_features();
+#   dynlib_bootstrap_tls();
+#   dynlib_bootstrap_stack_end(0);
+#   var hc = dynlib_open("libc.so.6");
+#   dynlib_init(hc);
+#   dynlib_bootstrap_locale(hc);
+#   dynlib_bootstrap_environ(hc);      // ← this fn
+#
+# Intermediate step: getenv + simple env-query work post-call, but
+# NSS-dispatching (getpwuid / getgrouplist / pam_authenticate / etc.)
+# + strerror still SIGSEGV — needs deeper libc init, pinned forward.
+# See CHANGELOG [5.5.24] + docs/development/issues/dynlib-nss-bootstrap.md.
+fn dynlib_bootstrap_environ(hc): i64 {
+    if (hc == 0) { return 1; }
+    var fp_env  = dynlib_sym(hc, "__environ");
+    var fp_env2 = dynlib_sym(hc, "environ");
+    if (fp_env == 0) {
+        if (fp_env2 == 0) { return 2; }
+    }
+    var empty = alloc(16);
+    if (empty == 0) { return 3; }
+    store64(empty, 0);       # env[0] = NULL (terminator)
+    store64(empty + 8, 0);   # slack — libc sometimes reads one past
+    if (fp_env  != 0) { store64(fp_env,  empty); }
+    if (fp_env2 != 0) { store64(fp_env2, empty); }
+    return 0;
+}
+
+# Read the kernel's auxiliary vector (auxv) for the current process
+# by slurping /proc/self/auxv. The file contains a sequence of
+# (u64 type, u64 value) pairs terminated by (AT_NULL=0, 0).
+#
+# Copies the raw pairs into buf, up to maxbytes. Returns bytes read
+# on success (always a multiple of 16), or a negative error code:
+#   -1 — open failed (no /proc mounted, or sandboxed)
+#   -2 — read failed
+#   -3 — buf is null or maxbytes < 16
+#
+# Typical auxv entries of interest:
+#   AT_PAGESZ    = 6    bytes per page (usually 4096)
+#   AT_CLKTCK    = 17   sysconf(_SC_CLK_TCK)
+#   AT_HWCAP     = 16   arch-specific CPU feature bitmap
+#   AT_SYSINFO_EHDR = 33  VDSO base address (x86_64)
+#   AT_RANDOM    = 25   pointer to 16 bytes of kernel randomness
+#   AT_EXECFN    = 31   pointer to program path
+#
+# Caller walks the pairs: for (p = buf; load64(p) != 0; p += 16).
+# Shipping this primitive standalone — useful independent of the
+# NSS dispatch work (v5.5.25 auxv synthesis investigation).
+fn dynlib_read_auxv(buf, maxbytes): i64 {
+    if (buf == 0) { return 0 - 3; }
+    if (maxbytes < 16) { return 0 - 3; }
+    var path = "/proc/self/auxv";
+    var fd = syscall(2, path, 0, 0);  # open(O_RDONLY)
+    if (fd < 0) { return 0 - 1; }
+    var total = 0;
+    while (total < maxbytes) {
+        var want = maxbytes - total;
+        var n = syscall(0, fd, buf + total, want);
+        if (n < 0) { syscall(3, fd); return 0 - 2; }
+        if (n == 0) { break; }
+        total = total + n;
+    }
+    syscall(3, fd);
+    return total;
+}
+
+# Scan auxv pairs for a specific tag. Returns the value associated
+# with that tag, or 0 if not present. `auxv_bytes` must be the return
+# value from `dynlib_read_auxv`.
+#
+# Common uses:
+#   var r = dynlib_read_auxv(abuf, 4096);
+#   var page = dynlib_auxv_get(abuf, r, 6);       # AT_PAGESZ
+#   var rnd  = dynlib_auxv_get(abuf, r, 25);      # AT_RANDOM ptr
+#   var vdso = dynlib_auxv_get(abuf, r, 33);      # AT_SYSINFO_EHDR
+fn dynlib_auxv_get(auxv, auxv_bytes, tag): i64 {
+    if (auxv == 0) { return 0; }
+    if (auxv_bytes < 16) { return 0; }
+    var p = auxv;
+    var end = auxv + auxv_bytes;
+    while (p + 16 <= end) {
+        var t = load64(p);
+        var v = load64(p + 8);
+        if (t == 0) { return 0; }          # AT_NULL — end of list
+        if (t == tag) { return v; }
+        p = p + 16;
+    }
+    return 0;
+}
+
+# Opt-in full initialisation: applies IRELATIVE relocations THEN runs
+# DT_INIT + DT_INIT_ARRAY. Use only when the loaded library's init
+# surface is compatible with a Cyrius static binary (libc.so.6 for
+# NSS/PAM after `dynlib_bootstrap_cpu_features` has run; skip for
+# libcrypto/libssl which expect the full glibc startup machinery).
+#
+# Returns:
+#   0  — success
+#   1  — handle is null
+#   2  — `dynlib_bootstrap_cpu_features()` has not run yet (required —
+#        IRELATIVE resolvers read glibc's `__cpu_features` struct;
+#        calling them without it being zeroed crashes on the first
+#        x86_64 feature probe)
+#   3  — init_array_sz is implausibly large (> 1 MB = 131072 init
+#        funcs). Indicates a corrupted handle or a misparsed dynamic
+#        section — refuse to iterate rather than run arbitrary fptrs
+#
+# Typical usage for NSS/PAM:
+#   dynlib_bootstrap_cpu_features();
+#   var hc = dynlib_open("libc.so.6");
+#   dynlib_init(hc);
+#   var fp = dynlib_sym(hc, "getgrouplist");
+#   fncall4(fp, user, gid, buf, ngroups_ptr);
+#
+# Note: current status — IRELATIVE resolves, but libc entry points
+# still crash on uninitialised TLS / `__libc_stack_end`. Tracked for
+# a follow-up patch. Consumers should treat `dynlib_init` + libc as
+# experimental until TLS bootstrap lands.
+fn dynlib_init(handle): i64 {
+    if (handle == 0) { return 1; }
+    if (_dynlib_ifunc_safe == 0) { return 2; }
+    var init_array_sz = load64(handle + 80);
+    # 1 MB of fptrs is already ~131k inits — any real library has
+    # O(10) entries. Reject anything larger as corruption.
+    if (init_array_sz > 0x100000) { return 3; }
+    var bias = load64(handle + 40);
+    var rela_addr = load64(handle + 88);
+    var rela_size = load64(handle + 96);
+    var jmprel_addr = load64(handle + 104);
+    var jmprel_size = load64(handle + 112);
+    _dynlib_apply_irelative(handle, bias, rela_addr, rela_size);
+    _dynlib_apply_irelative(handle, bias, jmprel_addr, jmprel_size);
+    var init_vaddr = load64(handle + 64);
+    var init_array_vaddr = load64(handle + 72);
+    _dynlib_run_init(handle, bias, init_vaddr, init_array_vaddr, init_array_sz);
+    return 0;
+}
+
 # Look up a symbol by name in a loaded library
 # Returns the symbol's absolute address (function pointer) or 0
-fn dynlib_sym(handle, name) {
+fn dynlib_sym(handle, name): i64 {
     if (handle == 0) { return 0; }
 
     var dynsym  = _dynlib_dynsym(handle);
@@ -726,10 +1172,38 @@ fn dynlib_sym(handle, name) {
 }
 
 # Close a loaded library (unmap)
-fn dynlib_close(handle) {
+fn dynlib_close(handle): i64 {
     if (handle == 0) { return 0; }
     var base = _dynlib_base(handle);
     var size = _dynlib_size(handle);
     cyr_munmap(base, size);
     return 0;
+}
+
+# v5.8.31 — Result variant of dynlib_open. On success: Ok(handle);
+# on path/open failure: Err(DynlibNotFound); on ELF parse failure
+# (dynlib_open returns 0 because the file wasn't a valid ELF):
+# Err(DynlibBadElf). The two error modes are distinguished by
+# checking file existence first.
+fn dynlib_open_r(path) : Result {
+    var handle = dynlib_open(path);
+    if (handle != 0) { return Ok(handle); }
+    # Distinguish "couldn't open the file" from "file opened but
+    # ELF parse failed" by re-probing the path. open(2) succeeding
+    # means the file exists and is readable; the failure must then
+    # have been parse-side.
+    var probe = syscall(2, path, 0, 0);
+    if (probe < 0) { return Err(DynlibNotFound); }
+    syscall(3, probe);
+    return Err(DynlibBadElf);
+}
+
+# v5.8.31 — Result variant of dynlib_sym. On success: Ok(addr);
+# on null handle: Err(DynlibNotFound) (caller never opened);
+# on missing symbol: Err(DynlibSymMissing).
+fn dynlib_sym_r(handle, name) : Result {
+    if (handle == 0) { return Err(DynlibNotFound); }
+    var addr = dynlib_sym(handle, name);
+    if (addr == 0) { return Err(DynlibSymMissing); }
+    return Ok(addr);
 }

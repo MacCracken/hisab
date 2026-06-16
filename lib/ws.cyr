@@ -36,7 +36,7 @@ enum WsState {
 # +24 flags    (FIN, RSV, etc.)
 
 # Create WebSocket handle from connected socket
-fn ws_new(fd) {
+fn ws_new(fd): i64 {
     var ws = alloc(32);
     store64(ws, fd);
     store64(ws + 8, WS_CONNECTING);
@@ -46,29 +46,31 @@ fn ws_new(fd) {
 }
 
 # Get socket fd from WebSocket handle
-fn ws_fd(ws) { return load64(ws); }
+fn ws_fd(ws): i64 { return load64(ws); }
 
 # Get WebSocket connection state
-fn ws_state(ws) { return load64(ws + 8); }
+fn ws_state(ws): i64 { return load64(ws + 8); }
 
-# Generate 4-byte mask key from /dev/urandom
-fn _ws_gen_mask(ws) {
+# Generate the 4-byte frame mask key from the kernel CSPRNG.
+# CVE-19 (v6.1.36): fail-CLOSED. RFC 6455 §5.3 requires an UNPREDICTABLE
+# masking key; the old `/dev/urandom` open could fail (absent on macOS sandbox /
+# Windows) and silently store an uninitialized stack value. sys_getrandom routes
+# through getrandom(2) (getentropy on macOS); on failure we MUST NOT emit a weak
+# mask — return -1 so the caller aborts the send. Returns 0 on success.
+fn _ws_gen_mask(ws): i64 {
     var mask[4];
-    var fd = syscall(2, "/dev/urandom", 0, 0);
-    if (fd >= 0) {
-        syscall(0, fd, &mask, 4);
-        syscall(3, fd);
-    }
+    if (sys_getrandom(&mask, 4, 0) != 4) { return 0 - 1; }
     store64(ws + 16, load64(&mask) & 0xFFFFFFFF);
     return 0;
 }
 
-# Build WebSocket upgrade request
-fn _ws_handshake_request(path, host, key_out) {
-    # Generate 16-byte random key, base64 encode
+# Build WebSocket upgrade request. Returns the request buffer, or 0 if the
+# CSPRNG is unavailable (CVE-19 v6.1.36: fail-CLOSED — the old /dev/urandom open
+# could fail and emit an uninitialized Sec-WebSocket-Key nonce).
+fn _ws_handshake_request(path, host, key_out): i64 {
+    # Generate the 16-byte Sec-WebSocket-Key nonce from the kernel CSPRNG.
     var raw[16];
-    var fd = syscall(2, "/dev/urandom", 0, 0);
-    if (fd >= 0) { syscall(0, fd, &raw, 16); syscall(3, fd); }
+    if (sys_getrandom(&raw, 16, 0) != 16) { return 0; }
     var key = base64_encode(&raw, 16);
     memcpy(key_out, key, strlen(key));
     store8(key_out + strlen(key), 0);
@@ -95,15 +97,16 @@ fn _ws_handshake_request(path, host, key_out) {
 }
 
 # Perform WebSocket handshake on connected socket
-fn ws_connect(sock, path, host) {
+fn ws_connect(sock, path, host): i64 {
     var ws = ws_new(sock);
     var key[32];
     var req = _ws_handshake_request(path, host, &key);
-    syscall(1, sock, req, strlen(req));
+    if (req == 0) { store64(ws + 8, WS_CLOSED); return ws; }   # CVE-19: no entropy → fail closed
+    sys_write(sock, req, strlen(req));
 
     # Read response (simplified — check for 101)
     var resp[512];
-    var n = syscall(0, sock, &resp, 511);
+    var n = sys_read(sock, &resp, 511);
     if (n <= 0) { store64(ws + 8, WS_CLOSED); return ws; }
     store8(&resp + n, 0);
 
@@ -119,7 +122,7 @@ fn ws_connect(sock, path, host) {
 }
 
 # Send a WebSocket frame
-fn _ws_send_frame(ws, opcode, data, len) {
+fn _ws_send_frame(ws, opcode, data, len): i64 {
     if (ws_state(ws) != WS_OPEN) { return 0 - 1; }
     var fd = ws_fd(ws);
     var hdr[14];
@@ -149,8 +152,9 @@ fn _ws_send_frame(ws, opcode, data, len) {
         hlen = 10;
     }
 
-    # Mask key
-    _ws_gen_mask(ws);
+    # Mask key (CVE-19: fail closed if the CSPRNG is unavailable — never send
+    # a frame under a predictable/uninitialized mask).
+    if (_ws_gen_mask(ws) != 0) { return 0 - 1; }
     var mask = load64(ws + 16) & 0xFFFFFFFF;
     store8(&hdr + hlen, mask & 0xFF);
     store8(&hdr + hlen + 1, (mask >> 8) & 0xFF);
@@ -159,7 +163,7 @@ fn _ws_send_frame(ws, opcode, data, len) {
     hlen = hlen + 4;
 
     # Send header
-    syscall(1, fd, &hdr, hlen);
+    sys_write(fd, &hdr, hlen);
 
     # Mask and send payload
     var masked = alloc(len);
@@ -169,32 +173,32 @@ fn _ws_send_frame(ws, opcode, data, len) {
         store8(masked + i, load8(data + i) ^ mb);
         i = i + 1;
     }
-    syscall(1, fd, masked, len);
+    sys_write(fd, masked, len);
     return len;
 }
 
 # Send text message
-fn ws_send_text(ws, msg) {
+fn ws_send_text(ws, msg): i64 {
     return _ws_send_frame(ws, WS_OP_TEXT, msg, strlen(msg));
 }
 
 # Send binary message
-fn ws_send_binary(ws, data, len) {
+fn ws_send_binary(ws, data, len): i64 {
     return _ws_send_frame(ws, WS_OP_BINARY, data, len);
 }
 
 # Send ping
-fn ws_ping(ws) {
+fn ws_ping(ws): i64 {
     return _ws_send_frame(ws, WS_OP_PING, "", 0);
 }
 
 # Receive a WebSocket frame, returns payload pointer (caller must check opcode)
 # Sets opcode_out to the frame opcode
-fn ws_recv_frame(ws, opcode_out, len_out) {
+fn ws_recv_frame(ws, opcode_out, len_out): i64 {
     if (ws_state(ws) != WS_OPEN) { return 0; }
     var fd = ws_fd(ws);
     var hdr[2];
-    var n = syscall(0, fd, &hdr, 2);
+    var n = sys_read(fd, &hdr, 2);
     if (n < 2) { store64(ws + 8, WS_CLOSED); return 0; }
 
     var opcode = load8(&hdr) & 0x0F;
@@ -204,11 +208,11 @@ fn ws_recv_frame(ws, opcode_out, len_out) {
 
     if (plen == 126) {
         var ext[2];
-        syscall(0, fd, &ext, 2);
+        sys_read(fd, &ext, 2);
         plen = (load8(&ext) << 8) | load8(&ext + 1);
     } elif (plen == 127) {
         var ext[8];
-        syscall(0, fd, &ext, 8);
+        sys_read(fd, &ext, 8);
         var _e4 = load8(&ext + 4) << 24;
         var _e5 = load8(&ext + 5) << 16;
         var _e6 = load8(&ext + 6) << 8;
@@ -220,14 +224,14 @@ fn ws_recv_frame(ws, opcode_out, len_out) {
     var mask = 0;
     if (masked == 1) {
         var mk[4];
-        syscall(0, fd, &mk, 4);
+        sys_read(fd, &mk, 4);
         mask = load8(&mk) | (load8(&mk + 1) << 8) | (load8(&mk + 2) << 16) | (load8(&mk + 3) << 24);
     }
 
     # Read payload
     var payload = alloc(plen + 1);
     if (plen > 0) {
-        syscall(0, fd, payload, plen);
+        sys_read(fd, payload, plen);
     }
 
     # Unmask if needed
@@ -256,7 +260,7 @@ fn ws_recv_frame(ws, opcode_out, len_out) {
 }
 
 # Receive text message (convenience — returns string or 0)
-fn ws_recv(ws) {
+fn ws_recv(ws): i64 {
     var opcode[1];
     var len[1];
     var data = ws_recv_frame(ws, &opcode, &len);
@@ -267,7 +271,7 @@ fn ws_recv(ws) {
 }
 
 # Close WebSocket connection
-fn ws_close(ws) {
+fn ws_close(ws): i64 {
     if (ws_state(ws) == WS_OPEN) {
         _ws_send_frame(ws, WS_OP_CLOSE, "", 0);
         store64(ws + 8, WS_CLOSING);

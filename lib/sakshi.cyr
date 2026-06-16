@@ -1,5 +1,5 @@
 # sakshi.cyr — tracing, error handling, and structured logging for Cyrius
-# Bundled distribution of sakshi v2.1.0
+# Bundled distribution of sakshi v2.2.6
 # Source: https://github.com/MacCracken/sakshi
 # License: GPL-3.0-only
 #
@@ -16,6 +16,270 @@
 #   - UDP output is unencrypted and unauthenticated.
 #   - Monotonic timestamps overflow i64 after ~292 years of uptime.
 
+# --- syscalls.cyr ---
+
+# syscalls.cyr — sakshi's minimal, arch-dispatched Linux syscall numbers.
+#
+# Sakshi cannot pull `lib/syscalls.cyr` from the cyrius stdlib because the
+# foundation-layer rule forbids external deps and that file's enum surface
+# (~60+ values per arch) is too large to inline through the bundle. Instead
+# we define just the syscalls sakshi actually uses, as plain `var` slots so
+# the project memory note about enum-heavy includes (bug #16) doesn't apply.
+#
+# Numbers: x86_64 from `arch/x86/entry/syscalls/syscall_64.tbl`;
+# aarch64 from `include/uapi/asm-generic/unistd.h`.
+#
+# v2.2.2 — closes the cross-build syscall-arity warnings reported on
+# `cyrius build --aarch64`. Pre-v2.2.2 the numbers were inlined as bare
+# integers, so the aarch64 binary called the wrong syscall (silent UB).
+
+#ifdef CYRIUS_ARCH_X86
+var _SK_SYS_WRITE         = 1;
+var _SK_SYS_OPEN          = 2;
+var _SK_SYS_CLOSE         = 3;
+var _SK_SYS_NANOSLEEP     = 35;
+var _SK_SYS_SOCKET        = 41;
+var _SK_SYS_SENDTO        = 44;
+var _SK_SYS_EXIT          = 60;
+var _SK_SYS_CLOCK_GETTIME = 228;
+#endif
+
+#ifdef CYRIUS_ARCH_AARCH64
+# aarch64 has no `open` — use `openat(AT_FDCWD, path, flags, mode)`.
+var _SK_SYS_OPENAT        = 56;
+var _SK_SYS_CLOSE         = 57;
+var _SK_SYS_WRITE         = 64;
+var _SK_SYS_EXIT          = 93;
+var _SK_SYS_NANOSLEEP     = 101;
+var _SK_SYS_CLOCK_GETTIME = 113;
+var _SK_SYS_SOCKET        = 198;
+var _SK_SYS_SENDTO        = 206;
+var _SK_AT_FDCWD          = 0 - 100;
+#endif
+
+# open(path, flags, mode) — arity-stable wrapper. x86_64 calls `open`;
+# aarch64 calls `openat(AT_FDCWD, path, flags, mode)`. Returns fd or
+# negative errno.
+fn _sk_open(path, flags, mode): i64 {
+    #ifdef CYRIUS_ARCH_X86
+    return syscall(_SK_SYS_OPEN, path, flags, mode);
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    return syscall(_SK_SYS_OPENAT, _SK_AT_FDCWD, path, flags, mode);
+    #endif
+}
+
+# --- clock.cyr ---
+
+# clock.cyr — cycle-counter timestamps for sakshi
+#
+# Reads the host's cycle counter directly without going through the kernel:
+# x86_64: `rdtsc`. aarch64: `mrs cntvct_el0` (added in step 5).
+#
+# Public-internal API:
+#   _sk_now_ticks()        → i64    raw cycle counter
+#   _sk_clock_init()       → i64    invariant-TSC check + freq calibration
+#   _sk_ticks_to_ns(ticks) → i64    host-specific scale (step 3)
+#   _sk_now_ns()           → i64    drop-in replacement for the syscall version (step 4)
+#
+# Calibration policy: invariant-TSC required on x86_64. Non-invariant hosts
+# panic at init — sakshi targets sovereign systems on real hardware, no soft
+# fallback to clock_gettime.
+#
+# Inline asm follows the local-store pattern (writes only to [rbp-N] / [x29-N])
+# to stay clear of the cyrius include-boundary store bug.
+
+# Calibrated TSC frequency (Hz). Zero until _sk_clock_init() runs.
+var _sk_tsc_freq_hz: i64 = 0;
+
+# Q32 fixed-point ns-per-tick scale (set in step 3).
+var _sk_tsc_scale: i64 = 0;
+
+# Read the cycle counter. Returns raw ticks; convert with _sk_ticks_to_ns.
+fn _sk_now_ticks(): i64 {
+    var ticks: i64 = 0;
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        # Frame: [rbp-8]=ticks
+        # rdtsc puts the 64-bit counter in edx:eax. Combine into rax.
+        0x0F; 0x31;                    # rdtsc
+        0x48; 0xC1; 0xE2; 0x20;        # shl rdx, 32
+        0x48; 0x09; 0xD0;              # or rax, rdx
+        0x48; 0x89; 0x45; 0xF8;        # mov [rbp-8], rax  ; ticks
+    }
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm {
+        # Frame: [x29-8]=ticks
+        # CNTVCT_EL0 is architectural in ARMv8.0-A — no feature check needed.
+        0x40; 0xE0; 0x3B; 0xD5;        # mrs x0, cntvct_el0
+        0xA0; 0x83; 0x1F; 0xF8;        # stur x0, [x29, #-8]
+    }
+    #endif
+    return ticks;
+}
+
+# aarch64 only: read CNTFRQ_EL0 (timer frequency in Hz). Architectural —
+# no calibration required.
+fn _sk_aarch64_cntfrq(): i64 {
+    var freq: i64 = 0;
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm {
+        # Frame: [x29-8]=freq
+        0x00; 0xE0; 0x3B; 0xD5;        # mrs x0, cntfrq_el0
+        0xA0; 0x83; 0x1F; 0xF8;        # stur x0, [x29, #-8]
+    }
+    #endif
+    return freq;
+}
+
+# CPUID(0x80000007) EDX bit 8 — invariant TSC. Returns 1 if supported, 0 if not.
+fn _sk_cpuid_invariant_tsc(): i64 {
+    var result: i64 = 0;
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        # Frame: [rbp-8]=result
+        # cpuid clobbers rax/rbx/rcx/rdx. rbx is callee-saved in the SysV ABI;
+        # save it across the cpuid call so the cyrius compiler's caller-side
+        # invariants hold.
+        0xB8; 0x07; 0x00; 0x00; 0x80;  # mov eax, 0x80000007
+        0x53;                          # push rbx
+        0x0F; 0xA2;                    # cpuid
+        0x5B;                          # pop rbx
+        0x48; 0xC1; 0xEA; 0x08;        # shr rdx, 8
+        0x48; 0x83; 0xE2; 0x01;        # and rdx, 1
+        0x48; 0x89; 0x55; 0xF8;        # mov [rbp-8], rdx
+    }
+    #endif
+    return result;
+}
+
+# Write to fd 2 and exit. Used for the invariant-TSC-absent panic.
+fn _sk_clock_panic(msg, len): i64 {
+    syscall(_SK_SYS_WRITE, 2, msg, len);
+    syscall(_SK_SYS_EXIT, 1);
+    return 0;
+}
+
+# clock_gettime(MONOTONIC_RAW) wrapper used only at calibration time.
+# Inlines the same syscall the v2.1.x _sk_now_ns used so the calibration
+# anchor is in the same time base as a non-cycle-counter implementation.
+fn _sk_clock_now_ns_raw(): i64 {
+    var ts[2];
+    var ret = syscall(_SK_SYS_CLOCK_GETTIME, 4, &ts);
+    if (ret < 0) { return 0; }
+    return load64(&ts) * 1000000000 + load64(&ts + 8);
+}
+
+# One-shot init: panic if invariant TSC is absent, then calibrate freq with
+# a 10 ms nanosleep window. Stores _sk_tsc_freq_hz (and, in step 3, _sk_tsc_scale).
+# Idempotent — early-returns if already initialized.
+fn _sk_clock_init(): i64 {
+    if (_sk_tsc_freq_hz > 0) { return 0; }
+
+    #ifdef CYRIUS_ARCH_X86
+    if (_sk_cpuid_invariant_tsc() == 0) {
+        _sk_clock_panic("sakshi: clock_init: invariant TSC absent (CPUID 0x80000007 EDX bit 8 = 0)\n", 75);
+    }
+
+    var t0_ns = _sk_clock_now_ns_raw();
+    var t0_ticks = _sk_now_ticks();
+
+    # nanosleep(10 ms). timespec is { tv_sec, tv_nsec }.
+    var sleep_ts[2];
+    store64(&sleep_ts, 0);
+    store64(&sleep_ts + 8, 10000000);
+    syscall(_SK_SYS_NANOSLEEP, &sleep_ts, 0);
+
+    var t1_ticks = _sk_now_ticks();
+    var t1_ns = _sk_clock_now_ns_raw();
+
+    var dn = t1_ns - t0_ns;
+    var dt = t1_ticks - t0_ticks;
+
+    # freq_hz = dt * 1e9 / dn. At 3 GHz, dt ≈ 3e7 over 10 ms, so dt*1e9 ≈ 3e16
+    # — well inside i64 (max ≈ 9.2e18).
+    if (dn > 0) {
+        _sk_tsc_freq_hz = dt * 1000000000 / dn;
+    }
+    #endif
+
+    #ifdef CYRIUS_ARCH_AARCH64
+    # CNTFRQ_EL0 is architectural — read directly, no calibration needed.
+    _sk_tsc_freq_hz = _sk_aarch64_cntfrq();
+    #endif
+
+    # Q32 ns-per-tick scale: scale = (1e9 << 32) / freq.
+    # 1e9 << 32 = 4.29e18 — fits in i64 (max ≈ 9.22e18).
+    # For 3 GHz, scale ≈ 1.43e9 (fits in u32). _sk_ticks_to_ns recovers ns
+    # via 64×64→128 mul + 32-bit shrd, accurate to <1 ppm across the full
+    # u64 tick range.
+    if (_sk_tsc_freq_hz > 0) {
+        _sk_tsc_scale = (1000000000 << 32) / _sk_tsc_freq_hz;
+    }
+    return 0;
+}
+
+# Monotonic nanoseconds — drop-in replacement for the v2.1.x clock_gettime
+# implementation. Lazy first-call init; subsequent calls are rdtsc + mul-shift,
+# no syscall. Magnitude differs from v2.1.x (TSC origin vs MONOTONIC_RAW
+# origin), but monotonicity and ns scaling are preserved — span elapsed
+# computation and event ordering are unaffected.
+fn _sk_now_ns(): i64 {
+    if (_sk_tsc_scale == 0) {
+        _sk_clock_init();
+    }
+    return _sk_ticks_to_ns(_sk_now_ticks());
+}
+
+# Re-run the calibration loop and refresh _sk_tsc_freq_hz / _sk_tsc_scale.
+# Useful for long-running consumers (uptime > ~1 hour) where the TSC's true
+# rate has drifted relative to the kernel's MONOTONIC_RAW. Pauses the calling
+# context for ~10 ms (one nanosleep + two clock_gettime syscalls). Returns
+# the new freq in Hz.
+#
+# Single-threaded only — sakshi makes no concurrency guarantees, so callers
+# must ensure no other thread is in _sk_now_ns / span / trace during the call.
+# Recommended cadence for ppm-level accuracy: hourly from a low-priority
+# context. x86_64: panics if invariant TSC has somehow disappeared (won't on
+# real hardware). aarch64: reads CNTFRQ_EL0 (architectural; cannot drift).
+fn sakshi_clock_recalibrate(): i64 {
+    _sk_tsc_freq_hz = 0;
+    _sk_clock_init();
+    return _sk_tsc_freq_hz;
+}
+
+# Convert raw ticks to nanoseconds using the calibrated Q32 scale.
+# Result = (ticks * scale) >> 32, computed via 64×64→128 multiply + double-
+# precision right shift so the full u64 tick range is safe with no native
+# 128-bit math.
+fn _sk_ticks_to_ns(ticks): i64 {
+    var scale = _sk_tsc_scale;
+    var ret: i64 = 0;
+    #ifdef CYRIUS_ARCH_X86
+    asm {
+        # Frame: [rbp-8]=ticks, [rbp-16]=scale, [rbp-24]=ret
+        0x48; 0x8B; 0x45; 0xF8;        # mov rax, [rbp-8]    ; ticks
+        0x48; 0x8B; 0x4D; 0xF0;        # mov rcx, [rbp-16]   ; scale
+        0x48; 0xF7; 0xE1;              # mul rcx              ; rdx:rax = ticks*scale
+        0x48; 0x0F; 0xAC; 0xD0; 0x20;  # shrd rax, rdx, 32    ; rax = (rdx:rax) >> 32
+        0x48; 0x89; 0x45; 0xE8;        # mov [rbp-24], rax    ; ret
+    }
+    #endif
+    #ifdef CYRIUS_ARCH_AARCH64
+    asm {
+        # Frame: [x29-8]=ticks, [x29-16]=scale, [x29-24]=ret
+        0xA0; 0x83; 0x5F; 0xF8;        # ldur x0, [x29, #-8]   ; ticks
+        0xA1; 0x03; 0x5F; 0xF8;        # ldur x1, [x29, #-16]  ; scale
+        0x02; 0x7C; 0x01; 0x9B;        # mul   x2, x0, x1      ; low 64 bits of ticks*scale
+        0x03; 0x7C; 0xC1; 0x9B;        # umulh x3, x0, x1      ; high 64 bits
+        0x64; 0x80; 0xC2; 0x93;        # extr  x4, x3, x2, #32 ; (x3:x2) >> 32
+        0xA4; 0x83; 0x1E; 0xF8;        # stur  x4, [x29, #-24] ; ret
+    }
+    #endif
+    return ret;
+}
+
 # --- format.cyr ---
 
 # format.cyr — internal formatting helpers for sakshi
@@ -27,7 +291,7 @@
 # ================================================================
 
 # Copy n bytes from src to dst (8-byte bulk + byte remainder)
-fn _sk_memcpy(dst, src, n) {
+fn _sk_memcpy(dst, src, n): i64 {
     var i: i64 = 0;
     while (i + 8 <= n) {
         store64(dst + i, load64(src + i));
@@ -41,30 +305,11 @@ fn _sk_memcpy(dst, src, n) {
 }
 
 # Fill n bytes at dst with val
-fn _sk_memset(dst, val, n) {
+fn _sk_memset(dst, val, n): i64 {
     for (var i = 0; i < n; i = i + 1) {
         store8(dst + i, val);
     }
     return dst;
-}
-
-# ================================================================
-# Timestamp
-# ================================================================
-
-# clock_gettime constants (x86_64 Linux)
-enum _SkSyscall {
-    _SK_SYS_CLOCK_GETTIME = 228;
-    _SK_CLOCK_MONOTONIC_RAW = 4;
-}
-
-# Get monotonic nanoseconds. Returns 0 on failure.
-# Overflow after ~292 years of uptime (i64 limit).
-fn _sk_now_ns() {
-    var ts[2];
-    var ret = syscall(_SK_SYS_CLOCK_GETTIME, _SK_CLOCK_MONOTONIC_RAW, &ts);
-    if (ret < 0) { return 0; }
-    return load64(&ts) * 1000000000 + load64(&ts + 8);
 }
 
 # ================================================================
@@ -73,7 +318,7 @@ fn _sk_now_ns() {
 
 # Convert integer to decimal string in buffer, return length written.
 # Buffer must be at least 24 bytes.
-fn _sk_fmt_int(n, buf) {
+fn _sk_fmt_int(n, buf): i64 {
     var bi = 23;
     var neg: i64 = 0;
     if (n < 0) { neg = 1; n = 0 - n; }
@@ -92,7 +337,7 @@ fn _sk_fmt_int(n, buf) {
 # ================================================================
 # Internal: write an integer into buf at pos, respecting cap. Returns new pos.
 # ================================================================
-fn _sk_write_int(buf, pos, cap, val) {
+fn _sk_write_int(buf, pos, cap, val): i64 {
     var tmp[24];
     var tlen = _sk_fmt_int(val, &tmp);
     var ti = 0;
@@ -105,7 +350,7 @@ fn _sk_write_int(buf, pos, cap, val) {
 }
 
 # Internal: write a string into buf at pos, respecting cap. Returns new pos.
-fn _sk_write_str(buf, pos, cap, s, slen) {
+fn _sk_write_str(buf, pos, cap, s, slen): i64 {
     var wi = 0;
     while (wi < slen && pos < cap) {
         store8(buf + pos, load8(s + wi));
@@ -121,7 +366,7 @@ fn _sk_write_str(buf, pos, cap, s, slen) {
 
 # Format a trace line: "[timestamp] [LEVEL] msg\n"
 # Returns bytes written. Caller provides timestamp.
-fn _sk_fmt_line(buf, cap, ts, level_str, level_len, msg, msg_len) {
+fn _sk_fmt_line(buf, cap, ts, level_str, level_len, msg, msg_len): i64 {
     var pos: i64 = 0;
 
     # [timestamp]
@@ -147,7 +392,7 @@ fn _sk_fmt_line(buf, cap, ts, level_str, level_len, msg, msg_len) {
 
 # Format a span line: "[timestamp] [ACTION] name (elapsed ns)\n"
 # Returns bytes written. Caller provides timestamp.
-fn _sk_fmt_span(buf, cap, ts, action, action_len, name, name_len, elapsed_ns) {
+fn _sk_fmt_span(buf, cap, ts, action, action_len, name, name_len, elapsed_ns): i64 {
     var pos: i64 = 0;
 
     # [timestamp]
@@ -198,7 +443,7 @@ enum _SkBinConst {
 }
 
 # Write a binary event header into buf. Returns header size (12).
-fn _sk_bin_write_hdr(buf, timestamp, level, category, msg_len) {
+fn _sk_bin_write_hdr(buf, timestamp, level, category, msg_len): i64 {
     store64(buf, timestamp);
     store8(buf + 8, level);
     store8(buf + 9, category);
@@ -208,7 +453,7 @@ fn _sk_bin_write_hdr(buf, timestamp, level, category, msg_len) {
 
 # Read a binary event header from buf. Returns fields via out pointers.
 # out_ts, out_level, out_cat, out_msg_len are pointers to i64.
-fn _sk_bin_read_hdr(buf, out_ts, out_level, out_cat, out_msg_len) {
+fn _sk_bin_read_hdr(buf, out_ts, out_level, out_cat, out_msg_len): i64 {
     store64(out_ts, load64(buf));
     store64(out_level, load8(buf + 8));
     store64(out_cat, load8(buf + 9));
@@ -221,7 +466,7 @@ fn _sk_bin_read_hdr(buf, out_ts, out_level, out_cat, out_msg_len) {
 # output.cyr — output targets for sakshi
 # Supports: stderr (default), file, ring buffer (binary), UDP (binary), hook.
 # Target selection via sakshi_set_output / sakshi_set_emit_hook at runtime.
-# Depends: format.cyr (for _sk_memcpy, _sk_now_ns, _sk_bin_write_hdr),
+# Depends: clock.cyr (for _sk_now_ns), format.cyr (for _sk_memcpy, _sk_bin_write_hdr),
 #          lib/fnptr.cyr (for subscriber hook dispatch — fncall6)
 
 # Output target constants
@@ -241,8 +486,8 @@ var _sk_output_target = SK_OUT_STDERR;
 # ================================================================
 var _sk_stderr_fd = 2;
 
-fn _sk_write_stderr(buf, len) {
-    syscall(1, _sk_stderr_fd, buf, len);
+fn _sk_write_stderr(buf, len): i64 {
+    syscall(_SK_SYS_WRITE, _sk_stderr_fd, buf, len);
     return 0;
 }
 
@@ -255,8 +500,8 @@ var _sk_file_fd: i64 = 0 - 1;
 # path must be a trusted, hardcoded or config-derived value — no user input.
 # flags: O_WRONLY | O_CREAT | O_APPEND = 1 | 64 | 1024 = 1089
 # mode: 0644 = 0x1A4
-fn sakshi_output_file(path) {
-    var fd = syscall(2, path, 1089, 0x1A4);
+fn sakshi_output_file(path): i64 {
+    var fd = _sk_open(path, 1089, 0x1A4);
     if (fd < 0) { return fd; }
     _sk_file_fd = fd;
     _sk_output_target = SK_OUT_FILE;
@@ -264,18 +509,18 @@ fn sakshi_output_file(path) {
 }
 
 # Close the file output target, revert to stderr
-fn sakshi_output_file_close() {
+fn sakshi_output_file_close(): i64 {
     if (_sk_file_fd >= 0) {
-        syscall(3, _sk_file_fd);
+        syscall(_SK_SYS_CLOSE, _sk_file_fd);
         _sk_file_fd = 0 - 1;
     }
     _sk_output_target = SK_OUT_STDERR;
     return 0;
 }
 
-fn _sk_write_file(buf, len) {
+fn _sk_write_file(buf, len): i64 {
     if (_sk_file_fd >= 0) {
-        syscall(1, _sk_file_fd, buf, len);
+        syscall(_SK_SYS_WRITE, _sk_file_fd, buf, len);
     }
     return 0;
 }
@@ -295,7 +540,7 @@ enum _SkRingConst {
 
 # Enable ring buffer output.
 # Emits a metadata event (level=0xFF) describing the binary format.
-fn sakshi_output_buffer() {
+fn sakshi_output_buffer(): i64 {
     _sk_output_target = SK_OUT_BUFFER;
     # Emit metadata event: version 1, 12-byte header layout
     # Payload: [version:u8] [hdr_size:u8] "sakshi"
@@ -308,7 +553,7 @@ fn sakshi_output_buffer() {
 }
 
 # Write a single byte into the ring buffer, advancing the write cursor
-fn _sk_ring_put(byte) {
+fn _sk_ring_put(byte): i64 {
     store8(&_sk_ring_buf + (_sk_ring_write & _SK_RING_MASK), byte);
     _sk_ring_write = _sk_ring_write + 1;
     return 0;
@@ -318,7 +563,7 @@ fn _sk_ring_put(byte) {
 # ts: pre-computed timestamp (callers share one _sk_now_ns per event)
 # level: log level, category: error category (0 for trace events)
 # msg: message pointer, msg_len: message length
-fn _sk_write_ring_event(ts, level, category, msg, msg_len) {
+fn _sk_write_ring_event(ts, level, category, msg, msg_len): i64 {
     # Build 12-byte header on stack, then copy into ring
     var hdr[12];
     store64(&hdr, ts);
@@ -349,7 +594,7 @@ fn _sk_write_ring_event(ts, level, category, msg, msg_len) {
 # Read raw ring buffer bytes into dst. Returns bytes read.
 # Reads the most recent data (up to 4096 bytes).
 # Caller must ensure dst points to a buffer of at least max_len bytes.
-fn sakshi_ring_read_raw(dst, max_len) {
+fn sakshi_ring_read_raw(dst, max_len): i64 {
     var avail = _sk_ring_write;
     if (avail > 4096) { avail = 4096; }
     if (avail > max_len) { avail = max_len; }
@@ -363,18 +608,18 @@ fn sakshi_ring_read_raw(dst, max_len) {
 }
 
 # Get the number of events written to the ring buffer
-fn sakshi_ring_event_count() {
+fn sakshi_ring_event_count(): i64 {
     return _sk_ring_count;
 }
 
 # Get the number of bytes used in the ring buffer (capped at 4096)
-fn sakshi_ring_len() {
+fn sakshi_ring_len(): i64 {
     if (_sk_ring_write > 4096) { return 4096; }
     return _sk_ring_write;
 }
 
 # Clear the ring buffer
-fn sakshi_ring_clear() {
+fn sakshi_ring_clear(): i64 {
     _sk_ring_write = 0;
     _sk_ring_count = 0;
     return 0;
@@ -383,7 +628,7 @@ fn sakshi_ring_clear() {
 # Decode one binary event from buf into a text line in dst.
 # Returns total bytes consumed from buf (header + msg), or 0 if not enough data.
 # Writes text "[timestamp] [LEVEL] msg\n" into dst, returns text len via out_text_len ptr.
-fn sakshi_ring_decode_event(buf, buf_len, dst, dst_cap, out_text_len) {
+fn sakshi_ring_decode_event(buf, buf_len, dst, dst_cap, out_text_len): i64 {
     if (buf_len < _SK_BIN_HDR_SIZE) {
         store64(out_text_len, 0);
         return 0;
@@ -442,9 +687,9 @@ var _sk_udp_addr[16];
 # WARNING: UDP transport is unencrypted and unauthenticated.
 # ip: 32-bit IPv4 address in network byte order
 # port: 16-bit port in host byte order
-fn sakshi_output_udp(ip, port) {
-    # socket(AF_INET=2, SOCK_DGRAM=2, 0) — syscall 41
-    var fd = syscall(41, 2, 2, 0);
+fn sakshi_output_udp(ip, port): i64 {
+    # socket(AF_INET=2, SOCK_DGRAM=2, 0)
+    var fd = syscall(_SK_SYS_SOCKET, 2, 2, 0);
     if (fd < 0) { return fd; }
     _sk_udp_fd = fd;
 
@@ -460,9 +705,9 @@ fn sakshi_output_udp(ip, port) {
 }
 
 # Close UDP socket, revert to stderr
-fn sakshi_output_udp_close() {
+fn sakshi_output_udp_close(): i64 {
     if (_sk_udp_fd >= 0) {
-        syscall(3, _sk_udp_fd);
+        syscall(_SK_SYS_CLOSE, _sk_udp_fd);
         _sk_udp_fd = 0 - 1;
     }
     _sk_output_target = SK_OUT_STDERR;
@@ -472,7 +717,7 @@ fn sakshi_output_udp_close() {
 # Send a binary event packet over UDP.
 # ts: pre-computed timestamp (callers share one _sk_now_ns per event)
 # Packet format: same 12-byte header + message bytes.
-fn _sk_write_udp_event(ts, level, category, msg, msg_len) {
+fn _sk_write_udp_event(ts, level, category, msg, msg_len): i64 {
     if (_sk_udp_fd < 0) { return 0; }
 
     # Build packet in a stack buffer (12 header + msg, max 256)
@@ -487,7 +732,7 @@ fn _sk_write_udp_event(ts, level, category, msg, msg_len) {
     _sk_memcpy(&pkt + 12, msg, pkt_msg_len);
 
     var total = 12 + pkt_msg_len;
-    syscall(44, _sk_udp_fd, &pkt, total, 0, &_sk_udp_addr, 16);
+    syscall(_SK_SYS_SENDTO, _sk_udp_fd, &pkt, total, 0, &_sk_udp_addr, 16);
     return 0;
 }
 
@@ -495,7 +740,7 @@ fn _sk_write_udp_event(ts, level, category, msg, msg_len) {
 # Helper: build IPv4 address from 4 octets (e.g. 127, 0, 0, 1)
 # Returns 32-bit address in network byte order
 # ================================================================
-fn sakshi_ipv4(a, b, c, d) {
+fn sakshi_ipv4(a, b, c, d): i64 {
     return a | (b << 8) | (c << 16) | (d << 24);
 }
 
@@ -524,14 +769,14 @@ var _sk_emit_hook: i64 = 0;
 
 # Install a subscriber — all subsequent events are routed to fp.
 # Pass `&my_hook_fn` to register. Implicitly sets target to SK_OUT_HOOK.
-fn sakshi_set_emit_hook(fp) {
+fn sakshi_set_emit_hook(fp): i64 {
     _sk_emit_hook = fp;
     _sk_output_target = SK_OUT_HOOK;
     return 0;
 }
 
 # Uninstall the subscriber and revert output to stderr.
-fn sakshi_clear_emit_hook() {
+fn sakshi_clear_emit_hook(): i64 {
     _sk_emit_hook = 0;
     _sk_output_target = SK_OUT_STDERR;
     return 0;
@@ -542,14 +787,14 @@ fn sakshi_clear_emit_hook() {
 # ================================================================
 
 # Text write — used by stderr and file targets
-fn _sk_write(buf, len) {
+fn _sk_write(buf, len): i64 {
     if (_sk_output_target == SK_OUT_FILE) { return _sk_write_file(buf, len); }
     # stderr is also text
     return _sk_write_stderr(buf, len);
 }
 
 # Level-to-string helper using match
-fn _sk_level_str(level, out_str, out_len) {
+fn _sk_level_str(level, out_str, out_len): i64 {
     match level {
         0  => { store64(out_str, "FATAL"); store64(out_len, 5); }
         1  => { store64(out_str, "ERROR"); store64(out_len, 5); }
@@ -567,7 +812,7 @@ fn _sk_level_str(level, out_str, out_len) {
 
 # Event write — used by trace.cyr for ring buffer and UDP (binary),
 # falls back to text formatting for stderr/file. Computes ts once.
-fn _sk_emit(level, category, msg, msg_len) {
+fn _sk_emit(level, category, msg, msg_len): i64 {
     var ts = _sk_now_ns();
     if (_sk_output_target == SK_OUT_HOOK) {
         if (_sk_emit_hook != 0) {
@@ -593,7 +838,7 @@ fn _sk_emit(level, category, msg, msg_len) {
 
 # Span emit — binary for buffer/UDP, text for stderr/file.
 # ts: caller-supplied (span_enter/span_exit already read the clock).
-fn _sk_emit_span(ts, action_level, action_str, action_len, name, name_len, elapsed_ns) {
+fn _sk_emit_span(ts, action_level, action_str, action_len, name, name_len, elapsed_ns): i64 {
     if (_sk_output_target == SK_OUT_HOOK) {
         if (_sk_emit_hook != 0) {
             fncall6(_sk_emit_hook, ts, action_level, 0, name, name_len, elapsed_ns);
@@ -615,14 +860,14 @@ fn _sk_emit_span(ts, action_level, action_str, action_len, name, name_len, elaps
 # ================================================================
 # Public: set output target directly
 # ================================================================
-fn sakshi_set_output(target) {
+fn sakshi_set_output(target): i64 {
     _sk_output_target = target;
     return 0;
 }
 
 # Legacy compat: set fd directly (forces stderr target mode)
 # fd must be a valid open file descriptor (>= 0).
-fn sakshi_set_output_fd(fd) {
+fn sakshi_set_output_fd(fd): i64 {
     if (fd < 0) { return 0 - 1; }
     _sk_stderr_fd = fd;
     _sk_output_target = SK_OUT_STDERR;
@@ -662,46 +907,46 @@ enum ErrCode {
 }
 
 # Pack an error code + category into a single i64 (context = 0)
-fn sakshi_err_new(code, category) {
+fn sakshi_err_new(code, category): i64 {
     return ((category & 0xFFFF) << 16) | (code & 0xFFFF);
 }
 
 # Pack an error code + category + context into a single i64
 # context: 32-bit value stored in upper bits (source hash, span ID, etc.)
-fn sakshi_err_with_ctx(code, category, context) {
+fn sakshi_err_with_ctx(code, category, context): i64 {
     return ((context & 0xFFFFFFFF) << 32) | ((category & 0xFFFF) << 16) | (code & 0xFFFF);
 }
 
 # Extract the error code (bits 0-15)
-fn sakshi_err_code(err) {
+fn sakshi_err_code(err): i64 {
     return err & 0xFFFF;
 }
 
 # Extract the category (bits 16-31)
-fn sakshi_err_category(err) {
+fn sakshi_err_category(err): i64 {
     return (err >> 16) & 0xFFFF;
 }
 
 # Extract the context (bits 32-63)
-fn sakshi_err_context(err) {
+fn sakshi_err_context(err): i64 {
     return (err >> 32) & 0xFFFFFFFF;
 }
 
 # Check if a value is an error (non-zero)
-fn sakshi_is_err(err) {
+fn sakshi_is_err(err): i64 {
     if (err != 0) { return 1; }
     return 0;
 }
 
 # Check if a value is ok (zero)
-fn sakshi_is_ok(err) {
+fn sakshi_is_ok(err): i64 {
     if (err == 0) { return 1; }
     return 0;
 }
 
 # Create an error with the current span depth as context.
 # Links errors to the active trace span for correlation.
-fn sakshi_err_at_span(code, category) {
+fn sakshi_err_at_span(code, category): i64 {
     return sakshi_err_with_ctx(code, category, sakshi_span_depth());
 }
 
@@ -719,6 +964,10 @@ fn sakshi_err_at_span(code, category) {
 # The public fn stays defined (source compat); its body becomes an
 # early return. `#if <expr>` for numeric thresholds is not yet in the
 # preprocessor — discrete per-level flags are the available primitive.
+#
+# v2.2.1: cyrius 5.7.48 evaluates user-macro `#ifdef` / `#ifndef` inside
+# fn bodies (verified via probe). Each level is now a single fn with the
+# guard around the `_sk_log` call — no more dual-define at outer scope.
 
 # Log levels — lower value = higher severity
 enum LogLevel {
@@ -740,103 +989,82 @@ enum SpanAction {
 var _sk_log_level = SK_INFO;
 
 # Set the active log level
-fn sakshi_set_level(level) {
+fn sakshi_set_level(level): i64 {
     _sk_log_level = level;
     return 0;
 }
 
 # Get the active log level
-fn sakshi_get_level() {
+fn sakshi_get_level(): i64 {
     return _sk_log_level;
 }
 
 # Internal: emit a log event if level is enabled
-fn _sk_log(level, msg, msg_len) {
+fn _sk_log(level, msg, msg_len): i64 {
     if (level > _sk_log_level) { return 0; }
     _sk_emit(level, 0, msg, msg_len);
     return 0;
 }
 
 # Public API — each takes a message string and its byte length.
-# Each level has a dual definition: the real emit path, and an early-
-# return stub selected when `SAKSHI_DISABLE_<LEVEL>` is defined. The
-# cyrius preprocessor (5.5.11) only evaluates `#ifdef` / `#ifndef`
-# at module scope, not inside function bodies — so the gating has to
-# sit at the fn definition level, not around the emit call.
+# When `SAKSHI_DISABLE_<LEVEL>` is defined the body's `_sk_log` call is
+# preprocessed out, leaving a bare `return 0;` stub.
 
 # Log a fatal message (always emitted regardless of runtime level)
-#ifndef SAKSHI_DISABLE_FATAL
-fn sakshi_fatal(msg, msg_len) {
+fn sakshi_fatal(msg, msg_len): i64 {
+    #ifndef SAKSHI_DISABLE_FATAL
     _sk_log(SK_FATAL, msg, msg_len);
+    #endif
     return 0;
 }
-#endif
-#ifdef SAKSHI_DISABLE_FATAL
-fn sakshi_fatal(msg, msg_len) { return 0; }
-#endif
 
 # Log an error message to the configured output
-#ifndef SAKSHI_DISABLE_ERROR
-fn sakshi_error(msg, msg_len) {
+fn sakshi_error(msg, msg_len): i64 {
+    #ifndef SAKSHI_DISABLE_ERROR
     _sk_log(SK_ERROR, msg, msg_len);
+    #endif
     return 0;
 }
-#endif
-#ifdef SAKSHI_DISABLE_ERROR
-fn sakshi_error(msg, msg_len) { return 0; }
-#endif
 
 # Log a warning message
-#ifndef SAKSHI_DISABLE_WARN
-fn sakshi_warn(msg, msg_len) {
+fn sakshi_warn(msg, msg_len): i64 {
+    #ifndef SAKSHI_DISABLE_WARN
     _sk_log(SK_WARN, msg, msg_len);
+    #endif
     return 0;
 }
-#endif
-#ifdef SAKSHI_DISABLE_WARN
-fn sakshi_warn(msg, msg_len) { return 0; }
-#endif
 
 # Log an info message
-#ifndef SAKSHI_DISABLE_INFO
-fn sakshi_info(msg, msg_len) {
+fn sakshi_info(msg, msg_len): i64 {
+    #ifndef SAKSHI_DISABLE_INFO
     _sk_log(SK_INFO, msg, msg_len);
+    #endif
     return 0;
 }
-#endif
-#ifdef SAKSHI_DISABLE_INFO
-fn sakshi_info(msg, msg_len) { return 0; }
-#endif
 
 # Log a debug message
-#ifndef SAKSHI_DISABLE_DEBUG
-fn sakshi_debug(msg, msg_len) {
+fn sakshi_debug(msg, msg_len): i64 {
+    #ifndef SAKSHI_DISABLE_DEBUG
     _sk_log(SK_DEBUG, msg, msg_len);
+    #endif
     return 0;
 }
-#endif
-#ifdef SAKSHI_DISABLE_DEBUG
-fn sakshi_debug(msg, msg_len) { return 0; }
-#endif
 
 # Log a trace message
-#ifndef SAKSHI_DISABLE_TRACE
-fn sakshi_trace(msg, msg_len) {
+fn sakshi_trace(msg, msg_len): i64 {
+    #ifndef SAKSHI_DISABLE_TRACE
     _sk_log(SK_TRACE, msg, msg_len);
+    #endif
     return 0;
 }
-#endif
-#ifdef SAKSHI_DISABLE_TRACE
-fn sakshi_trace(msg, msg_len) { return 0; }
-#endif
 
 # --- span.cyr ---
 
 # span.cyr — enter/exit function tracking with timing
-# Uses _sk_now_ns() from format.cyr for nanosecond precision.
+# Uses _sk_now_ns() from clock.cyr for nanosecond precision (cycle-counter backed since v2.2.0).
 # Routes through _sk_emit_span: binary for buffer/UDP, text for stderr/file.
 # Fixed-depth span stack — no heap allocation.
-# Depends: format.cyr, output.cyr, trace.cyr (included via lib.cyr)
+# Depends: clock.cyr, format.cyr, output.cyr, trace.cyr (included via lib.cyr)
 #
 # Recommended usage with defer (Cyrius >= 3.2.0):
 #   fn my_function() {
@@ -858,7 +1086,7 @@ enum _SkSpanConst {
 # Enter a span — push name + timestamp onto the stack.
 # One _sk_now_ns per call: the same reading seeds both the stack start time
 # and the emitted event's timestamp.
-fn sakshi_span_enter(name, name_len) {
+fn sakshi_span_enter(name, name_len): i64 {
     if (_sk_span_depth >= _SK_MAX_SPANS) { return 0; }
     var ts = _sk_now_ns();
     var offset = _sk_span_depth * 24;
@@ -873,7 +1101,7 @@ fn sakshi_span_enter(name, name_len) {
 
 # Exit the current span — pop, compute elapsed, emit.
 # One _sk_now_ns per call: used for both elapsed computation and event ts.
-fn sakshi_span_exit() {
+fn sakshi_span_exit(): i64 {
     if (_sk_span_depth <= 0) { return 0; }
     _sk_span_depth = _sk_span_depth - 1;
     var offset = _sk_span_depth * 24;
@@ -888,18 +1116,18 @@ fn sakshi_span_exit() {
 }
 
 # Get current span depth
-fn sakshi_span_depth() {
+fn sakshi_span_depth(): i64 {
     return _sk_span_depth;
 }
 
 # Set the active trace ID for correlating spans and events.
 # Typically set once at the root span of a request/operation.
-fn sakshi_trace_set(id) {
+fn sakshi_trace_set(id): i64 {
     _sk_trace_id = id;
     return 0;
 }
 
 # Get the active trace ID.
-fn sakshi_trace_id() {
+fn sakshi_trace_id(): i64 {
     return _sk_trace_id;
 }

@@ -2,14 +2,16 @@
 #
 # Companion to lib/ws.cyr (client-side).
 # Requires: alloc.cyr, string.cyr, fmt.cyr, str.cyr, syscalls.cyr, base64.cyr,
-#           net.cyr, tagged.cyr, http_server.cyr (for handshake parsing).
+#           sha1.cyr, net.cyr, tagged.cyr, http_server.cyr (for handshake parsing).
 #
 # Design: integrates with lib/http_server.cyr — an HTTP handler detects a WS
 # upgrade request, calls ws_server_handshake(cfd, buf, n) to upgrade in
 # place, then runs the read/write loop. When the loop exits, the http
 # handler returns and http_server_run closes cfd as normal.
 #
-# Shipped post-4.5.0.
+# Shipped post-4.5.0. v5.6.13: SHA-1 extracted to lib/sha1.cyr.
+
+include "lib/sha1.cyr"
 
 # ================================================================
 # WebSocket constants
@@ -28,131 +30,18 @@ var WS_CLOSED  = 3;
 var WS_MAX_PAYLOAD = 1048576;   # 1 MB cap on incoming frame payloads
 
 # Magic GUID per RFC 6455 § 1.3 — appended to client key before SHA-1.
-fn _wss_magic() { return "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"; }
+fn _wss_magic(): i64 { return "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"; }
 
 # ================================================================
-# SHA-1 (inlined — used only for Sec-WebSocket-Accept)
+# SHA-1 (via lib/sha1.cyr)
 # ================================================================
-# Bog-standard FIPS 180-4 SHA-1. Operates on a context allocated lazily.
-# Public surface: _wss_sha1(data, len, digest_out) — writes 20 bytes.
+# v5.6.13: SHA-1 was inlined here as `_wss_sha1` for years. Promoted
+# to a first-class stdlib module so owl / majra / sit can use it
+# without vendor-copying. `_wss_sha1` stays as a thin delegate for
+# ws_server-internal readability; body calls `sha1(...)`.
 
-fn _wss_rotl32(x, n) {
-    x = x & 0xFFFFFFFF;
-    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF;
-}
-
-fn _wss_sha1(data, len, digest_out) {
-    # Initial hash values
-    var h0 = 0x67452301;
-    var h1 = 0xEFCDAB89;
-    var h2 = 0x98BADCFE;
-    var h3 = 0x10325476;
-    var h4 = 0xC3D2E1F0;
-
-    # Padded message length (multiple of 64 bytes, with 0x80 + zero-pad + 8-byte len)
-    var msg_len = len + 1 + 8;
-    var pad_len = 64 - (msg_len % 64);
-    if (pad_len == 64) { pad_len = 0; }
-    var total = len + 1 + pad_len + 8;
-    var buf = alloc(total);
-    memset(buf, 0, total);
-    memcpy(buf, data, len);
-    store8(buf + len, 0x80);
-    # Length in bits, big-endian, last 8 bytes
-    var bit_len = len * 8;
-    store8(buf + total - 1, bit_len & 0xFF);
-    store8(buf + total - 2, (bit_len >> 8) & 0xFF);
-    store8(buf + total - 3, (bit_len >> 16) & 0xFF);
-    store8(buf + total - 4, (bit_len >> 24) & 0xFF);
-    store8(buf + total - 5, (bit_len >> 32) & 0xFF);
-    store8(buf + total - 6, (bit_len >> 40) & 0xFF);
-    store8(buf + total - 7, (bit_len >> 48) & 0xFF);
-    store8(buf + total - 8, (bit_len >> 56) & 0xFF);
-
-    var w = alloc(80 * 8);   # 80 32-bit words, store 8 bytes apart for alignment
-
-    var chunk_off = 0;
-    while (chunk_off < total) {
-        # Fill w[0..15] from big-endian 32-bit words
-        var i = 0;
-        while (i < 16) {
-            var b0 = load8(buf + chunk_off + i * 4);
-            var b1 = load8(buf + chunk_off + i * 4 + 1);
-            var b2 = load8(buf + chunk_off + i * 4 + 2);
-            var b3 = load8(buf + chunk_off + i * 4 + 3);
-            store64(w + i * 8, (b0 << 24) | (b1 << 16) | (b2 << 8) | b3);
-            i = i + 1;
-        }
-        # Extend w[16..79]
-        i = 16;
-        while (i < 80) {
-            var v = load64(w + (i - 3) * 8) ^ load64(w + (i - 8) * 8)
-            ^ load64(w + (i - 14) * 8) ^ load64(w + (i - 16) * 8);
-            store64(w + i * 8, _wss_rotl32(v, 1));
-            i = i + 1;
-        }
-
-        var a = h0;
-        var b = h1;
-        var c = h2;
-        var d = h3;
-        var e = h4;
-
-        i = 0;
-        while (i < 80) {
-            var f = 0;
-            var k = 0;
-            if (i < 20) {
-                f = (b & c) | ((~b) & d);
-                k = 0x5A827999;
-            } elif (i < 40) {
-                f = b ^ c ^ d;
-                k = 0x6ED9EBA1;
-            } elif (i < 60) {
-                f = (b & c) | (b & d) | (c & d);
-                k = 0x8F1BBCDC;
-            } else {
-                f = b ^ c ^ d;
-                k = 0xCA62C1D6;
-            }
-            var temp = (_wss_rotl32(a, 5) + f + e + k + load64(w + i * 8)) & 0xFFFFFFFF;
-            e = d;
-            d = c;
-            c = _wss_rotl32(b, 30);
-            b = a;
-            a = temp;
-            i = i + 1;
-        }
-
-        h0 = (h0 + a) & 0xFFFFFFFF;
-        h1 = (h1 + b) & 0xFFFFFFFF;
-        h2 = (h2 + c) & 0xFFFFFFFF;
-        h3 = (h3 + d) & 0xFFFFFFFF;
-        h4 = (h4 + e) & 0xFFFFFFFF;
-        chunk_off = chunk_off + 64;
-    }
-
-    # Write digest big-endian
-    store8(digest_out + 0,  (h0 >> 24) & 0xFF);
-    store8(digest_out + 1,  (h0 >> 16) & 0xFF);
-    store8(digest_out + 2,  (h0 >> 8) & 0xFF);
-    store8(digest_out + 3,   h0 & 0xFF);
-    store8(digest_out + 4,  (h1 >> 24) & 0xFF);
-    store8(digest_out + 5,  (h1 >> 16) & 0xFF);
-    store8(digest_out + 6,  (h1 >> 8) & 0xFF);
-    store8(digest_out + 7,   h1 & 0xFF);
-    store8(digest_out + 8,  (h2 >> 24) & 0xFF);
-    store8(digest_out + 9,  (h2 >> 16) & 0xFF);
-    store8(digest_out + 10, (h2 >> 8) & 0xFF);
-    store8(digest_out + 11,  h2 & 0xFF);
-    store8(digest_out + 12, (h3 >> 24) & 0xFF);
-    store8(digest_out + 13, (h3 >> 16) & 0xFF);
-    store8(digest_out + 14, (h3 >> 8) & 0xFF);
-    store8(digest_out + 15,  h3 & 0xFF);
-    store8(digest_out + 16, (h4 >> 24) & 0xFF);
-    store8(digest_out + 17, (h4 >> 16) & 0xFF);
-    store8(digest_out + 18, (h4 >> 8) & 0xFF);
-    store8(digest_out + 19,  h4 & 0xFF);
+fn _wss_sha1(data, len, digest_out): i64 {
+    sha1(data, len, digest_out);
     return 0;
 }
 
@@ -167,7 +56,7 @@ fn _wss_sha1(data, len, digest_out) {
 # Allocate a new WebSocket server handle wrapping an already-upgraded fd.
 # Normally you get one back from ws_server_handshake; use this directly only
 # if you're driving the upgrade yourself.
-fn ws_server_new(fd) {
+fn ws_server_new(fd): i64 {
     var ws = alloc(24);
     store64(ws, fd);
     store64(ws + 8, WS_OPEN);
@@ -176,9 +65,9 @@ fn ws_server_new(fd) {
 }
 
 # Accessor: underlying socket file descriptor for a ws handle.
-fn ws_server_fd(ws)    { return load64(ws); }
+fn ws_server_fd(ws): i64 { return load64(ws); }
 # Accessor: current state (WS_OPEN / WS_CLOSING / WS_CLOSED).
-fn ws_server_state(ws) { return load64(ws + 8); }
+fn ws_server_state(ws): i64 { return load64(ws + 8); }
 
 # ================================================================
 # Handshake
@@ -187,7 +76,7 @@ fn ws_server_state(ws) { return load64(ws + 8); }
 # Parse req_buf as a WebSocket upgrade. On success: send 101 Switching
 # Protocols + Sec-WebSocket-Accept, return upgraded ws handle. On failure
 # (not a valid WS upgrade): return 0 — caller should respond 400.
-fn ws_server_handshake(cfd, req_buf, req_len) {
+fn ws_server_handshake(cfd, req_buf, req_len): i64 {
     var upgrade = http_find_header(req_buf, req_len, "Upgrade");
     var conn    = http_find_header(req_buf, req_len, "Connection");
     var version = http_find_header(req_buf, req_len, "Sec-WebSocket-Version");
@@ -201,8 +90,12 @@ fn ws_server_handshake(cfd, req_buf, req_len) {
         return 0;
     }
 
-    # Compute Sec-WebSocket-Accept = base64(sha1(key + magic))
+    # RFC 6455 §4.1: Sec-WebSocket-Key is the base64 of a 16-byte value
+    # — exactly 24 chars including the trailing `=` padding. Reject any
+    # other length so we don't derive an Accept from malformed input.
+    # See CHANGELOG [5.11.16].
     var klen = strlen(key);
+    if (klen != 24) { return 0; }
     var magic = _wss_magic();
     var mlen = strlen(magic);
     var concat_len = klen + mlen;
@@ -236,7 +129,7 @@ fn ws_server_handshake(cfd, req_buf, req_len) {
 # Unmasks the payload in place (server reads MASKED client frames).
 # Writes the opcode to *opcode_out.
 # Returns the payload length, or 0 - 1 on socket error / close.
-fn ws_server_recv_frame(ws, payload_buf, max, opcode_out) {
+fn ws_server_recv_frame(ws, payload_buf, max, opcode_out): i64 {
     var fd = ws_server_fd(ws);
 
     # First two bytes: FIN/opcode + MASK/length
@@ -304,7 +197,7 @@ fn ws_server_recv_frame(ws, payload_buf, max, opcode_out) {
 }
 
 # Send a frame. Server-to-client frames are NOT masked per RFC 6455.
-fn ws_server_send_frame(ws, opcode, data, len) {
+fn ws_server_send_frame(ws, opcode, data, len): i64 {
     var fd = ws_server_fd(ws);
     var hdr[14];
     var pos = 0;
@@ -345,7 +238,7 @@ var _wss_recv_buf = 0;
 # Block until a TEXT or BINARY data frame arrives. Handles ping/pong/close
 # transparently. Returns the payload as an alloc'd cstr (NUL-terminated for
 # text safety) on success, or 0 if the peer closed the connection.
-fn ws_server_recv(ws) {
+fn ws_server_recv(ws): i64 {
     if (_wss_recv_buf == 0) { _wss_recv_buf = alloc(WS_MAX_PAYLOAD + 1); }
     while (1 == 1) {
         var op_slot[8];
@@ -378,28 +271,28 @@ fn ws_server_recv(ws) {
 
 # Send a TEXT frame. msg is a NUL-terminated cstr; the terminator is not
 # included in the frame. Unmasked per RFC 6455 server-to-client rule.
-fn ws_server_send_text(ws, msg) {
+fn ws_server_send_text(ws, msg): i64 {
     return ws_server_send_frame(ws, WS_OP_TEXT, msg, strlen(msg));
 }
 
 # Send a BINARY frame. `data` is `len` bytes of arbitrary payload.
-fn ws_server_send_binary(ws, data, len) {
+fn ws_server_send_binary(ws, data, len): i64 {
     return ws_server_send_frame(ws, WS_OP_BINARY, data, len);
 }
 
 # Send an empty PING frame. Peer is expected to reply with a PONG echoing
 # any (absent here) application data.
-fn ws_server_send_ping(ws) {
+fn ws_server_send_ping(ws): i64 {
     return ws_server_send_frame(ws, WS_OP_PING, "", 0);
 }
 
 # Send a PONG frame. When responding to a peer PING, echo the PING's payload.
-fn ws_server_send_pong(ws, data, len) {
+fn ws_server_send_pong(ws, data, len): i64 {
     return ws_server_send_frame(ws, WS_OP_PONG, data, len);
 }
 
 # Send a Close frame with status code (e.g. 1000 = normal) and optional reason.
-fn ws_server_send_close(ws, code, reason) {
+fn ws_server_send_close(ws, code, reason): i64 {
     var rlen = 0;
     if (reason != 0) { rlen = strlen(reason); }
     var payload_buf = alloc(2 + rlen);
@@ -410,7 +303,7 @@ fn ws_server_send_close(ws, code, reason) {
 }
 
 # Full close handshake + close the underlying socket.
-fn ws_server_close(ws) {
+fn ws_server_close(ws): i64 {
     if (ws_server_state(ws) == WS_OPEN) {
         ws_server_send_close(ws, 1000, "");
     }

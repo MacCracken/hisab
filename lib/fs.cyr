@@ -12,8 +12,15 @@ var DT_REG = 8;
 var DT_DIR = 4;
 var DT_LNK = 10;
 
+# v6.1.18: Windows has no getdents64 — directory enumeration is FindFirstFileW.
+# fs_win.cyr supplies the Windows dir_list/is_dir; the getdents64 bodies below
+# are excluded on PE (#ifndef CYRIUS_TARGET_WIN). Mirrors args.cyr/process.cyr.
+#ifdef CYRIUS_TARGET_WIN
+include "lib/fs_win.cyr"
+#endif
+
 # Join two path components with /
-fn path_join(dir, name) {
+fn path_join(dir, name): i64 {
     var sb = str_builder_new();
     str_builder_add(sb, dir);
     if (str_len(dir) > 0) {
@@ -25,7 +32,7 @@ fn path_join(dir, name) {
 }
 
 # Get basename (last component after /)
-fn path_basename(path) {
+fn path_basename(path): i64 {
     var slen = str_len(path);
     var sd = str_data(path);
     var last_slash = 0 - 1;
@@ -39,7 +46,7 @@ fn path_basename(path) {
 }
 
 # Get dirname (everything before last /)
-fn path_dirname(path) {
+fn path_dirname(path): i64 {
     var slen = str_len(path);
     var sd = str_data(path);
     var last_slash = 0 - 1;
@@ -52,27 +59,55 @@ fn path_dirname(path) {
     return str_sub(path, 0, last_slash);
 }
 
-# Check if path has a specific extension
-fn path_has_ext(path, ext) {
+# Check if path has a specific extension. Both args are Str
+# (matches str_ends_with's signature). Callers passing a cstring
+# literal must wrap via str_from(".tcyr"). v5.9.6 added the wrap
+# at programs/checks/selfhost.cyr's _testsuite_gate caller.
+fn path_has_ext(path, ext): i64 {
     return str_ends_with(path, ext);
 }
 
 # List directory entries. Returns vec of Str (filenames).
-fn dir_list(path) {
+#
+# v5.9.6 fix: clone each filename out of the getdents64 batch
+# buffer before pushing to the vec. Pre-fix `vec_push(entries,
+# str_from(name))` borrowed the byte pointer into the 4096-byte
+# `buf`; on the next outer iteration, getdents64 overwrote that
+# buf with the next batch, and previously-pushed Strs silently
+# pointed at garbage. Surfaced when programs/checks/selfhost.cyr's
+# `_testsuite_gate` reported "0 files" despite 128 .tcyr files
+# present — `path_has_ext(name, ".tcyr")` returned false for
+# every borrowed-then-clobbered name. dir_list_full + dir_walk
+# inherit the fix transitively (they call dir_list).
+#ifndef CYRIUS_TARGET_WIN
+fn dir_list(path): i64 {
     var entries = vec_new();
     var fd = sys_open(str_data(path), O_RDONLY, 0);
     if (fd < 0) { return entries; }
     var buf = alloc(4096);
+    # v6.0.60: Darwin getdirentries64 takes a 4th basep out-param (the new dir
+    # position); Linux getdents64 ignores a 4th arg, so passing it is portable.
+    # The Mach-O backends translate 217 → getdirentries64 (344). See
+    # 2026-06-02-macos-getdirentries-dir-listing-port.md.
+    var basep = alloc(8);
+    store64(basep, 0);
     var rgo = 1;
     while (rgo == 1) {
-        var n = syscall(SYS_GETDENTS64, fd, buf, 4096);
+        var n = syscall(SYS_GETDENTS64, fd, buf, 4096, basep);
         if (n <= 0) { rgo = 0; }
         else {
             var pos = 0;
             while (pos < n) {
                 var reclen = load16(buf + pos + 16);
+                # Darwin dirent: d_type @20, d_name @21 (Linux: @18 / @19); reclen
+                # is @16 on both. Layout confirmed empirically on ecb (arm64).
+                #ifdef CYRIUS_TARGET_MACOS
+                var dtype = load8(buf + pos + 20);
+                var name = buf + pos + 21;
+                #else
                 var dtype = load8(buf + pos + 18);
                 var name = buf + pos + 19;
+                #endif
                 # Skip . and ..
                 var skip = 0;
                 if (load8(name) == 46) {
@@ -82,7 +117,7 @@ fn dir_list(path) {
                     }
                 }
                 if (skip == 0) {
-                    vec_push(entries, str_from(name));
+                    vec_push(entries, str_clone(str_from(name)));
                 }
                 pos = pos + reclen;
             }
@@ -91,9 +126,10 @@ fn dir_list(path) {
     sys_close(fd);
     return entries;
 }
+#endif
 
 # List directory entries with full paths
-fn dir_list_full(path) {
+fn dir_list_full(path): i64 {
     var names = dir_list(path);
     var full = vec_new();
     var di = 0;
@@ -105,18 +141,26 @@ fn dir_list_full(path) {
 }
 
 # Check if path is a directory (try to open with getdents)
-fn is_dir(path) {
+#ifndef CYRIUS_TARGET_WIN
+fn is_dir(path): i64 {
     var fd = sys_open(str_data(path), O_RDONLY, 0);
     if (fd < 0) { return 0; }
-    var buf = alloc(32);
-    var n = syscall(SYS_GETDENTS64, fd, buf, 32);
+    # v6.0.60: use a full 4096 buffer, not 32. Linux getdents64 returns the
+    # first entry in a 32-byte buffer, but Darwin getdirentries64 fails on a
+    # buffer that small (verified on ecb: 32 → error, dir misreported as
+    # non-dir); 4096 matches dir_list and works on both.
+    var buf = alloc(4096);
+    var basep = alloc(8);
+    store64(basep, 0);
+    var n = syscall(SYS_GETDENTS64, fd, buf, 4096, basep);
     sys_close(fd);
     if (n >= 0) { return 1; }
     return 0;
 }
+#endif
 
 # Walk a directory tree, push all file paths to a vec
-fn dir_walk(path, results) {
+fn dir_walk(path, results): i64 {
     var entries = dir_list(path);
     var wi = 0;
     while (wi < vec_len(entries)) {
@@ -132,9 +176,65 @@ fn dir_walk(path, results) {
 }
 
 # Find files matching an extension in a directory tree
-fn find_files(path, ext) {
+fn find_files(path, ext): i64 {
     var all = vec_new();
     dir_walk(path, all);
+    var matched = vec_new();
+    var fi = 0;
+    while (fi < vec_len(all)) {
+        var fp = vec_get(all, fi);
+        if (path_has_ext(fp, ext) == 1) {
+            vec_push(matched, fp);
+        }
+        fi = fi + 1;
+    }
+    return matched;
+}
+
+# Walk a directory tree, push all file paths to `results`,
+# pruning any subtree whose entry name matches a member of
+# `prunes`. `prunes` is a vec of Str; comparison is exact
+# (no glob, no path-prefix). Equivalent to `find PATH -type f
+# ( -path '*/X/*' -o ... ) -prune -o -print` with X drawn
+# from `prunes`.
+#
+# Pinned at v5.9.17 for the TS corpus regression gates which
+# walk `~/Repos/secureyeoman` for *.ts / *.tsx while skipping
+# node_modules, dist, build, .next, coverage. Signature picked
+# to mirror `dir_walk(path, results)` so callers can use the
+# same shape.
+fn dir_walk_with_prunes(path, results, prunes): i64 {
+    var entries = dir_list(path);
+    var wi = 0;
+    while (wi < vec_len(entries)) {
+        var name = vec_get(entries, wi);
+        var pruned = 0;
+        var pi = 0;
+        while (pi < vec_len(prunes)) {
+            if (str_eq(name, vec_get(prunes, pi)) == 1) {
+                pruned = 1;
+            }
+            pi = pi + 1;
+        }
+        if (pruned == 0) {
+            var full = path_join(path, name);
+            if (is_dir(full) == 1) {
+                dir_walk_with_prunes(full, results, prunes);
+            } else {
+                vec_push(results, full);
+            }
+        }
+        wi = wi + 1;
+    }
+    return vec_len(results);
+}
+
+# Find files matching an extension under `path`, pruning any
+# subtree whose entry name matches a member of `prunes`. Same
+# shape as `find_files(path, ext)`; adds the pruning hook.
+fn find_files_with_prunes(path, ext, prunes): i64 {
+    var all = vec_new();
+    dir_walk_with_prunes(path, all, prunes);
     var matched = vec_new();
     var fi = 0;
     while (fi < vec_len(all)) {

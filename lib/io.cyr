@@ -2,17 +2,11 @@
 # Usage: include "lib/io.cyr"
 # Wraps Linux syscalls for file operations.
 #
-# v5.5.18: routes through lib/syscalls.cyr's per-arch sys_* wrappers
-# (sys_open/sys_close/sys_read/sys_write) rather than literal Linux
-# x86_64 syscall numbers 0/1/2/3. On aarch64 those numbers mean
-# io_setup/io_destroy/io_submit/io_cancel — this file's prior file_*
-# helpers would fire the wrong syscall on arm64 hosts (reproduced on
-# real Pi during the v5.5.18 stdlib shakedown — file_open returned
-# an error immediately). Same root-cause pattern as the v5.4.11
-# yukti fix; io.cyr was missed during that split.
+# Routes through lib/syscalls.cyr's per-arch sys_* wrappers, NOT
+# literal x86_64 syscall numbers (0/1/2/3 mean io_setup/io_destroy
+# on aarch64 — silent misroute). See CHANGELOG [5.5.18].
 include "lib/syscalls.cyr"
-# v5.8.30: Result-returning *_r variants (added below) construct
-# Result via lib/result.cyr's compiler-generated `Ok` / `Err`.
+# Result-returning *_r variants below; see CHANGELOG [5.8.30].
 include "lib/result.cyr"
 
 # v5.8.30 — IoError variants. Bare-variant enum so each name folds
@@ -54,28 +48,48 @@ var STDIN = 0;
 var STDOUT = 1;
 var STDERR = 2;
 
-# Open a file with given flags and mode, return fd
+# Open a file with given flags and mode, return fd.
+#
+# v6.0.55: agnos's sys_open is (name, namelen, ao_flags) — NOT the Linux
+# (path, O_flags, mode) shape — and its AO_* bits differ from O_* (AO_CREAT
+# 0x100 vs O_CREAT 64, etc.). Passing Linux args straight through lands the
+# O_flags value in `namelen` and the mode in `ao_flags` → a silent ABI
+# miscompile (no ud2) that breaks every file op. The agnos branch computes
+# namelen = strlen(path) and maps O_* → AO_*. All io.cyr open sites funnel
+# through here so the bridge applies once. See CHANGELOG [6.0.55].
 fn file_open(path: cstring, flags, mode): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var namelen = 0;
+    while (load8(path + namelen) != 0) { namelen = namelen + 1; }
+    var ao = 0;
+    if ((flags & 3) != 0) { ao = ao | 0x1; }       # O_WRONLY/O_RDWR -> AO_WRONLY (O_RDONLY=0)
+    if ((flags & 64) != 0) { ao = ao | 0x100; }    # O_CREAT  -> AO_CREAT
+    if ((flags & 512) != 0) { ao = ao | 0x200; }   # O_TRUNC  -> AO_TRUNC
+    if ((flags & 1024) != 0) { ao = ao | 0x400; }  # O_APPEND -> AO_APPEND
+    return sys_open(path, namelen, ao);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     return sys_open(path, flags, mode);
+    #endif
 }
 
 # Close a file descriptor
-fn file_close(fd) {
+fn file_close(fd): i64 {
     return sys_close(fd);
 }
 
 # Read up to len bytes from fd into buf
-fn file_read(fd, buf, len) {
+fn file_read(fd, buf, len): i64 {
     return sys_read(fd, buf, len);
 }
 
 # Write len bytes from buf to fd
-fn file_write(fd, buf, len) {
+fn file_write(fd, buf, len): i64 {
     return sys_write(fd, buf, len);
 }
 
 # Read entire file into buffer. Returns bytes read.
-fn file_read_all(path, buf, maxlen) {
+fn file_read_all(path, buf, maxlen): i64 {
     var fd = file_open(path, 0, 0);
     if (fd < 0) { return fd; }
     var total: i64 = 0;
@@ -93,7 +107,7 @@ fn file_read_all(path, buf, maxlen) {
 }
 
 # Write buffer to file. Returns bytes written or error.
-fn file_write_all(path, buf, len) {
+fn file_write_all(path, buf, len): i64 {
     var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
     if (fd < 0) { return fd; }
     var written = file_write(fd, buf, len);
@@ -101,36 +115,32 @@ fn file_write_all(path, buf, len) {
     return written;
 }
 
-# v5.5.16: flock helpers gated to CYRIUS_TARGET_LINUX. syscall(73) is
-# flock on Linux but a different BSD number on macOS (131), and the
-# ESYSXLAT chain doesn't currently translate it. Rather than emit
-# warnings on every Mach-O cross-build for dead-code the tools don't
-# call, skip the block entirely on non-Linux. v5.5.17 can add a BSD
-# translation if a real consumer needs file locking on Mach-O.
+# flock gated to Linux: syscall 73 is flock on Linux, different BSD
+# number on macOS; ESYSXLAT doesn't translate. See CHANGELOG [5.5.16].
 #ifdef CYRIUS_TARGET_LINUX
 # Exclusive file lock (blocking). Use for append-only logs, audit chains.
-fn file_lock(fd) {
+fn file_lock(fd): i64 {
     return syscall(73, fd, LOCK_EX);
 }
 
 # Release file lock.
-fn file_unlock(fd) {
+fn file_unlock(fd): i64 {
     return syscall(73, fd, LOCK_UN);
 }
 
 # Non-blocking exclusive lock. Returns 0 on success, -1 if already locked.
-fn file_trylock(fd) {
+fn file_trylock(fd): i64 {
     return syscall(73, fd, LOCK_EX | LOCK_NB);
 }
 
 # Shared (read) lock. Multiple readers, no writers.
-fn file_lock_shared(fd) {
+fn file_lock_shared(fd): i64 {
     return syscall(73, fd, LOCK_SH);
 }
 
 # Append data to a file with exclusive lock (atomic append).
 # Opens with O_APPEND, locks, writes, unlocks, closes.
-fn file_append_locked(path, buf, len) {
+fn file_append_locked(path, buf, len): i64 {
     var fd = file_open(path, O_WRONLY | O_CREAT | O_APPEND, 0x1A4);
     if (fd < 0) { return fd; }
     file_lock(fd);
@@ -142,7 +152,7 @@ fn file_append_locked(path, buf, len) {
 #endif
 
 # Check if file exists (try to open read-only)
-fn file_exists(path) {
+fn file_exists(path): i64 {
     var fd = file_open(path, 0, 0);
     if (fd < 0) { return 0; }
     file_close(fd);
@@ -150,13 +160,13 @@ fn file_exists(path) {
 }
 
 # Write string to stdout
-fn print(msg, len) {
+fn print(msg, len): i64 {
     file_write(STDOUT, msg, len);
     return 0;
 }
 
 # Write string to stderr
-fn eprint(msg, len) {
+fn eprint(msg, len): i64 {
     file_write(STDERR, msg, len);
     return 0;
 }
@@ -178,7 +188,7 @@ fn eprint(msg, len) {
 # Map a negative kernel-style return into the closest IoError
 # variant. `errn` is the POSITIVE errno (the caller passes
 # `0 - sys_open_result`).
-fn _io_errno_to_iorr(errn) {
+fn _io_errno_to_iorr(errn): i64 {
     if (errn == 2)  { return IoNotFound; }
     if (errn == 13) { return IoAccessDenied; }
     if (errn == 9)  { return IoBadFd; }
@@ -188,15 +198,15 @@ fn _io_errno_to_iorr(errn) {
 
 # Result variant of file_open. On success: Ok(fd); on failure:
 # Err(IoError variant for the underlying errno).
-fn file_open_r(path: cstring, flags, mode) {
-    var fd = sys_open(path, flags, mode);
+fn file_open_r(path: cstring, flags, mode): Result {
+    var fd = file_open(path, flags, mode);   # via the agnos AO_*/namelen bridge
     if (fd < 0) { return Err(_io_errno_to_iorr(0 - fd)); }
     return Ok(fd);
 }
 
 # Result variant of file_close. Kernel close(2) almost never fails
 # on a valid fd, but if it does, we surface it.
-fn file_close_r(fd) {
+fn file_close_r(fd): Result {
     var rc = sys_close(fd);
     if (rc < 0) { return Err(_io_errno_to_iorr(0 - rc)); }
     return Ok(rc);
@@ -204,7 +214,7 @@ fn file_close_r(fd) {
 
 # Result variant of file_read. On success: Ok(bytes_read); on
 # failure: Err. Note that 0 bytes read at EOF is Ok(0), not Err.
-fn file_read_r(fd, buf, len) {
+fn file_read_r(fd, buf, len): Result {
     var n = sys_read(fd, buf, len);
     if (n < 0) { return Err(_io_errno_to_iorr(0 - n)); }
     return Ok(n);
@@ -212,7 +222,7 @@ fn file_read_r(fd, buf, len) {
 
 # Result variant of file_write. On success: Ok(bytes_written).
 # Short writes (n < len) are still Ok — caller may need to loop.
-fn file_write_r(fd, buf, len) {
+fn file_write_r(fd, buf, len): Result {
     var n = sys_write(fd, buf, len);
     if (n < 0) { return Err(_io_errno_to_iorr(0 - n)); }
     return Ok(n);
@@ -222,8 +232,8 @@ fn file_write_r(fd, buf, len) {
 # maxlen bytes, closes. Open failure surfaces as Err with the
 # corresponding IoError variant; read failure mid-stream returns
 # whatever was read up to that point as Ok.
-fn file_read_all_r(path, buf, maxlen) {
-    var fd = sys_open(path, 0, 0);
+fn file_read_all_r(path, buf, maxlen): Result {
+    var fd = file_open(path, 0, 0);          # via the agnos AO_*/namelen bridge
     if (fd < 0) { return Err(_io_errno_to_iorr(0 - fd)); }
     var total = 0;
     var rgo = 1;
@@ -242,8 +252,8 @@ fn file_read_all_r(path, buf, maxlen) {
 # Result variant of file_write_all. Opens with O_WRONLY|O_CREAT|
 # O_TRUNC, writes, closes. Open failure → Err; write failure →
 # Err with errno mapping.
-fn file_write_all_r(path, buf, len) {
-    var fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
+fn file_write_all_r(path, buf, len): Result {
+    var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);   # via the agnos bridge
     if (fd < 0) { return Err(_io_errno_to_iorr(0 - fd)); }
     var n = sys_write(fd, buf, len);
     sys_close(fd);
@@ -253,7 +263,20 @@ fn file_write_all_r(path, buf, len) {
 
 # Read environment variable by name. Returns pointer to value or 0 if not found.
 # Reads from /proc/self/environ (null-separated KEY=VALUE pairs).
-fn getenv(name) {
+fn getenv(name): i64 {
+    # agnos has no /proc/self/environ; the kernel stages envp on the exec init
+    # stack (agnos 1.43.2). Delegate to args_agnos.cyr's _agnos_getenv, which
+    # reads the r15-parked init rsp (forward fn ref — io.cyr precedes args in
+    # the stdlib include order). See ABI §4.6. v6.0.87.
+    #ifdef CYRIUS_TARGET_AGNOS
+    return _agnos_getenv(name);
+    #endif
+    # The /proc/self/environ reader (and its 8 KB var buf) must stay out of the
+    # agnos frame entirely: a function-local var[] in a statically-dead region
+    # after the early agnos return still reserves stack at the prologue, and
+    # agnos hands ring-3 only ~12 KB of init stack — an 8 KB phantom frame
+    # overflows it (agnoshi_147 #PF). See CHANGELOG [6.1.12].
+    #ifndef CYRIUS_TARGET_AGNOS
     var buf[8192];
     var fd = file_open("/proc/self/environ", 0, 0);
     if (fd < 0) { return 0; }
@@ -287,4 +310,5 @@ fn getenv(name) {
         pos = pos + 1;
     }
     return 0;
+    #endif
 }

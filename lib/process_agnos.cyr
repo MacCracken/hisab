@@ -1,0 +1,144 @@
+# process_agnos.cyr — process management on agnos (ring-3 x86_64)
+# Usage: include "lib/process.cyr" (dispatches here under CYRIUS_TARGET_AGNOS)
+#
+# agnos has no fork/exec/dup2 in the frozen 0-33 syscall surface. It spawns an
+# IN-MEMORY ELF image: `sys_spawn(elf_addr, elf_size)` → pid, then
+# `sys_waitpid(pid)` → exit_code DIRECTLY (not a Linux wait-status word). So
+# "run the program at PATH" = read the ELF file into memory, sys_spawn it,
+# wait. The W* wait-status decoders are trivial on agnos (the agnos peer
+# defines them: WEXITSTATUS = the code itself).
+#
+# TWO agnos ABI limitations (frozen 0-33 — flag-back to the agnos owner, not
+# cyrius gaps; see docs/development/issues/2026-06-03-agnos-followup-after-boot.md):
+#   1. `sys_spawn(elf, size)` takes NO argv/envp → arguments to the spawned
+#      program are NOT passed (only the program itself runs).
+#   2. `sys_dup` is a stub → the spawned program's stdout CANNOT be redirected,
+#      so the capture variants run the program (output goes to the terminal)
+#      and report 0 captured bytes rather than buffering it.
+
+var _AGNOS_ELF_MAX = 8388608;   # 8 MB ELF read cap (covers agnsh-class programs)
+
+# Read the ELF file at `cmd` (a cstr path) into a fresh heap buffer and
+# sys_spawn it. Returns the child pid, or -1 on open/read/spawn failure.
+fn _agnos_spawn_path(cmd): i64 {
+    var namelen = 0;
+    while (load8(cmd + namelen) != 0) { namelen = namelen + 1; }
+    var fd = sys_open(cmd, namelen, 0);          # AO_RDONLY
+    if (fd < 0) { return 0 - 1; }
+    var buf = alloc(_AGNOS_ELF_MAX);
+    if (buf == 0) { sys_close(fd); return 0 - 1; }
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var n = sys_read(fd, buf + total, _AGNOS_ELF_MAX - total);
+        if (n <= 0) { rgo = 0; }
+        else {
+            total = total + n;
+            if (total >= _AGNOS_ELF_MAX) { rgo = 0; }
+        }
+    }
+    sys_close(fd);
+    if (total <= 0) { return 0 - 1; }
+    return sys_spawn(buf, total);
+}
+
+# Run `cmd` (args not passable on agnos) and wait. Returns Result(exit_code).
+fn run(cmd, arg1, arg2): Result {
+    var pid = _agnos_spawn_path(cmd);
+    if (pid < 0) { return Err(1); }
+    var code = sys_waitpid(pid);
+    if (code < 0) { return Err(1); }
+    return Ok(code);
+}
+
+# Capture is unsupported on agnos (no working dup → can't redirect the child's
+# stdout). Run the program (its output goes to the terminal) + report 0 bytes.
+fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
+    var pid = _agnos_spawn_path(cmd);
+    if (pid < 0) { return Err(1); }
+    sys_waitpid(pid);
+    return Ok(0);
+}
+
+# Spawn `cmd` without waiting. Returns Result(pid).
+fn spawn(cmd, arg1, arg2): Result {
+    var pid = _agnos_spawn_path(cmd);
+    if (pid < 0) { return Err(1); }
+    return Ok(pid);
+}
+
+# Wait for a pid. agnos sys_waitpid returns the exit code directly.
+fn wait_pid(pid): Result {
+    var code = sys_waitpid(pid);
+    if (code < 0) { return Err(0 - code); }
+    return Ok(code);
+}
+
+# Current process id.
+fn getpid(): i64 { return sys_getpid(); }
+# Parent process id — agnos has no getppid in the frozen 0-33 surface; returns 0.
+fn getppid(): i64 { return 0; }
+
+# vec-of-cstr argv variants. cmd = args[0]; args[1..] cannot be passed.
+fn exec_vec(args): i64 {
+    var argc = vec_len(args);
+    if (argc < 1) { return 0 - 1; }
+    var pid = _agnos_spawn_path(vec_get(args, 0));
+    if (pid < 0) { return 0 - 1; }
+    return sys_waitpid(pid);
+}
+
+# Capture variant — unsupported on agnos (no stdout redirect): runs the
+# program (its output goes to the terminal) and reports 0 captured bytes.
+fn exec_capture(args, buf, buflen): i64 {
+    var argc = vec_len(args);
+    if (argc < 1) { return 0 - 1; }
+    var pid = _agnos_spawn_path(vec_get(args, 0));
+    if (pid < 0) { return 0 - 1; }
+    sys_waitpid(pid);
+    return 0;                       # capture unsupported on agnos
+}
+
+# Run with an env block — agnos can't pass envp, so identical to exec_vec.
+fn exec_env(args, env): i64 { return exec_vec(args); }
+
+# vec-of-Str argv variants. cmd = str_data(args[0]).
+fn exec_vec_str(args): i64 {
+    var argc = vec_len(args);
+    if (argc < 1) { return 0 - 1; }
+    var pid = _agnos_spawn_path(str_data(vec_get(args, 0)));
+    if (pid < 0) { return 0 - 1; }
+    return sys_waitpid(pid);
+}
+
+# Str-argv capture variant — also unsupported on agnos (see exec_capture).
+fn exec_capture_str(args, buf, buflen): i64 {
+    var argc = vec_len(args);
+    if (argc < 1) { return 0 - 1; }
+    var pid = _agnos_spawn_path(str_data(vec_get(args, 0)));
+    if (pid < 0) { return 0 - 1; }
+    sys_waitpid(pid);
+    return 0;
+}
+
+# Str-argv env variant — agnos can't pass envp, so identical to exec_vec_str.
+fn exec_env_str(args, env): i64 { return exec_vec_str(args); }
+
+# Run a single cmdline string. agnos can't pass args, so spawn just the first
+# token (the program path), up to the first space.
+fn exec_cmd(cmdline): i64 {
+    var pathlen = 0;
+    var done = 0;
+    while (done == 0) {
+        var c = load8(cmdline + pathlen);
+        if (c == 0) { done = 1; }
+        else { if (c == 32) { done = 1; } else { pathlen = pathlen + 1; } }
+    }
+    var path = alloc(pathlen + 1);
+    var i = 0;
+    while (i < pathlen) { store8(path + i, load8(cmdline + i)); i = i + 1; }
+    store8(path + i, 0);
+    var pid = _agnos_spawn_path(path);
+    if (pid < 0) { return 0 - 1; }
+    return sys_waitpid(pid);
+}

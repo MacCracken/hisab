@@ -1,0 +1,104 @@
+# dxgi.cyr — DXGI GPU enumeration on Windows (PE/x86_64)
+# Usage: include "lib/dxgi.cyr" under CYRIUS_TARGET_WIN; call dxgi_vram_bytes().
+#
+# The v6.0.70 §0 headline capability — calling through a COM vtable from
+# ordinary cyrius — made concrete. CreateDXGIFactory1 (`syscall(0xF012)` ->
+# ECREATEDXGI_PE, dxgi.dll, the 3rd PE import via the v6.0.69 multi-DLL
+# foundation) returns an IDXGIFactory1*; its methods (and IDXGIAdapter1's)
+# are dispatched with the `callptr` indirect-call builtin (IR_CALL_INDIRECT)
+# over the object's vtable: `callptr(load64(vtbl + slot*8), this, args...)`.
+#
+# v6.0.71: the first REAL Win64 COM callee path. callptr to a real Win64
+# callee (COM vtable method, kernel32 entry) was corrupting the cyrius caller
+# at v6.0.70 (issue 2026-06-05-windows-com-vtable-real-callee-frame-corruption.md)
+# because the indirect call landed the callee misaligned — its ABI-required
+# aligned `movaps` SSE spill then #GP-faulted (AV 0xC0000005). Fixed by
+# ECALLPTR_PE (src/backend/x86/emit.cyr): the callptr site now force-16-aligns
+# rsp with the same rbx-anchored `and rsp,-16` the kernel32 IAT reroutes use,
+# so the callee is entered ABI-correct regardless of caller alignment. Verified
+# on cass: `CreateDXGIFactory1 → EnumAdapters1 → GetDesc1` dispatch correctly
+# (the §0 capability — calling a COM vtable from cyrius — works).
+#
+# v6.0.86: the full `dxgi_vram_bytes()` chain is GPU-VERIFIED on cass
+# (Intel UHD 600): factory → EnumAdapters1 → GetDesc1 → Release(adapter) →
+# Release(factory) → DedicatedVideoMemory (128 MB), exit clean. The v6.0.71
+# residual AV (GetDesc1 / 1-arg `Release`) was NOT a callptr-alignment issue —
+# cdb on cass pinned it to the v6.0.70 callptr design spilling the callee to a
+# GFLC frame slot that could ALIAS a `&`-taken local (here EnumAdapters1's
+# `&pAdapter` out-param shared the callee-spill slot → frame / regalloc
+# corruption → AV). Fixed by emitting the PE callptr callee on the STACK +
+# `call rax` (no frame slot → no alias); see ECALLPTR_PE. CHANGELOG [6.0.86].
+#
+# COM vtable layout (each method N at load64(vtbl + N*8)):
+#   IUnknown:        QueryInterface@0, AddRef@1, Release@2
+#   IDXGIObject:     3..6
+#   IDXGIFactory:    EnumAdapters@7 .. CreateSoftwareAdapter@11
+#   IDXGIFactory1:   EnumAdapters1@12, IsCurrent@13
+#   IDXGIAdapter:    EnumOutputs@7, GetDesc@8, CheckInterfaceSupport@9
+#   IDXGIAdapter1:   GetDesc1@10
+# DXGI_ADAPTER_DESC1: Description[128]WCHAR @0 (256 B); VendorId @256;
+#   DeviceId @260; SubSysId @264; Revision @268; DedicatedVideoMemory @272
+#   (SIZE_T); DedicatedSystemMemory @280; SharedSystemMemory @288;
+#   AdapterLuid @296; Flags @304. A 320-byte buffer holds the whole struct.
+
+#ifdef CYRIUS_TARGET_WIN
+
+# Fill `dst` (>=16 bytes) with IID_IDXGIFactory1
+# {770aae78-f26f-4dba-a829-253c83d1b387} in COM's little-endian-Data1..3 +
+# big-endian-Data4 byte order.
+fn _dxgi_iid_factory1(dst) {
+    store8(dst + 0, 0x78);  store8(dst + 1, 0xAE);  store8(dst + 2, 0x0A);  store8(dst + 3, 0x77);
+    store8(dst + 4, 0x6F);  store8(dst + 5, 0xF2);  store8(dst + 6, 0xBA);  store8(dst + 7, 0x4D);
+    store8(dst + 8, 0xA8);  store8(dst + 9, 0x29);  store8(dst + 10, 0x25); store8(dst + 11, 0x3C);
+    store8(dst + 12, 0x83); store8(dst + 13, 0xD1); store8(dst + 14, 0xB3); store8(dst + 15, 0x87);
+}
+
+# IUnknown::Release(obj) @ vtable slot 2. No-op on NULL. (callptr is an
+# expression-only builtin — it can't be a bare statement — so the result is
+# bound to a local even though the refcount return is discarded.)
+fn _dxgi_release(obj) {
+    if (obj == 0) { return 0; }
+    var vtbl = load64(obj);
+    var rc = callptr(load64(vtbl + 2 * 8), obj);
+    return 0;
+}
+
+# Dedicated video memory (VRAM) in bytes of DXGI adapter `index`, or 0 on
+# any failure. Walks CreateDXGIFactory1 -> EnumAdapters1 -> GetDesc1 ->
+# DedicatedVideoMemory, releasing both COM objects before returning.
+fn dxgi_adapter_vram_bytes(index): i64 {
+    var iid[16];                                   # 16-byte GUID buffer
+    _dxgi_iid_factory1(&iid);
+    var pFactory = 0;
+    var hr = syscall(0xF012, &iid, &pFactory);     # CreateDXGIFactory1 -> S_OK + factory
+    if (hr != 0) { return 0; }
+    if (pFactory == 0) { return 0; }
+    var fvtbl = load64(pFactory);
+    var pAdapter = 0;
+    # EnumAdapters1(this, index, &pAdapter) @ IDXGIFactory1 slot 12.
+    var hr2 = callptr(load64(fvtbl + 12 * 8), pFactory, index, &pAdapter);
+    if (hr2 != 0) {
+        _dxgi_release(pFactory);
+        return 0;
+    }
+    if (pAdapter == 0) {
+        _dxgi_release(pFactory);
+        return 0;
+    }
+    var avtbl = load64(pAdapter);
+    var desc[320];                                 # DXGI_ADAPTER_DESC1 (>= 308 B)
+    # GetDesc1(this, &desc) @ IDXGIAdapter1 slot 10.
+    var hr3 = callptr(load64(avtbl + 10 * 8), pAdapter, &desc);
+    var vram = 0;
+    if (hr3 == 0) { vram = load64(&desc + 272); }  # DedicatedVideoMemory (SIZE_T)
+    _dxgi_release(pAdapter);                        # Release(adapter)
+    _dxgi_release(pFactory);                        # Release(factory)
+    return vram;
+}
+
+# VRAM bytes of the primary adapter (index 0).
+fn dxgi_vram_bytes(): i64 {
+    return dxgi_adapter_vram_bytes(0);
+}
+
+#endif

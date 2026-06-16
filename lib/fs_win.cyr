@@ -1,0 +1,153 @@
+# fs_win.cyr — Windows (PE) directory enumeration for lib/fs.cyr.
+# Included from lib/fs.cyr under `#ifdef CYRIUS_TARGET_WIN`, mirroring how
+# args.cyr → args_win.cyr and process.cyr → process_win.cyr dispatch.
+#
+# v6.1.18: dir_list/is_dir/dir_walk bottomed out on syscall(SYS_GETDENTS64,…)
+# (arity 5), which has no Windows route — since v6.1.17 it returned an honest
+# -38, so directory walking was a no-op on Windows. This implements the real
+# port via four kernel32 reroutes (see src/backend/pe/emit.cyr + parse_expr.cyr):
+#   0xF016 FindFirstFileW(pattern, &data) → HANDLE  (INVALID_HANDLE_VALUE = -1)
+#   0xF017 FindNextFileW(h, &data)        → BOOL     (0 = end of enumeration)
+#   0xF018 FindClose(h)                   → BOOL
+#   0xF019 GetFileAttributesW(path)       → DWORD    (0xFFFFFFFF = invalid)
+# dir_walk / dir_list_full / find_files need no changes — they sit on dir_list
+# + is_dir and become correct transitively.
+#
+# Self-contained on purpose: lib/fs.cyr's dependency contract is
+# string/alloc/str/vec/syscalls — it does NOT pull in args.cyr or process_win.cyr,
+# so this file carries its own UTF-8↔UTF-16 helpers rather than reusing
+# _args_w2u8 / _w_append_cstr (which would force every fs.cyr consumer to also
+# include those modules, FATAL under --strict). _fs_narrow mirrors
+# lib/args.cyr::_args_w2u8.
+
+# WIN32_FIND_DATAW field offsets (pack=4): dwFileAttributes@0, cFileName@44
+# (WCHAR[260]); total sizeof = 592. FILE_ATTRIBUTE_DIRECTORY = 0x10.
+
+# Widen a UTF-8 (ASCII) path to UTF-16LE in dst, translating '/' → '\' so
+# callers' POSIX-style paths (e.g. "tests/tcyr") enumerate. Writes a trailing
+# NUL WCHAR; returns the WCHAR count (excluding the NUL). dst needs (len+1)*2
+# bytes. ASCII-only zero-extend (the toolchain walks ASCII paths) — non-ASCII
+# path components won't round-trip, matching the EOPEN_PE/ECREATEDIR_PE limit.
+fn _fs_widen(dst, src): i64 {
+    var i = 0;
+    var c = load8(src + i);
+    while (c != 0) {
+        if (c == 47) { c = 92; }            # '/' → '\'
+        store8(dst + i * 2, c);
+        store8(dst + i * 2 + 1, 0);
+        i = i + 1;
+        c = load8(src + i);
+    }
+    store8(dst + i * 2, 0);                  # trailing NUL WCHAR
+    store8(dst + i * 2 + 1, 0);
+    return i;
+}
+
+# Convert ONE UTF-16LE NUL-terminated wide string at `w` into UTF-8 in `dst`
+# (≤ cap bytes), NUL-terminated; returns bytes written EXCLUDING the NUL.
+# Surrogate pairs (U+10000+) decode to 4-byte UTF-8. Mirror of
+# lib/args.cyr::_args_w2u8 (kept local so fs.cyr stays decoupled from args.cyr).
+fn _fs_narrow(w, dst, cap): i64 {
+    var i = 0;
+    var o = 0;
+    var lo = 0;
+    var hi = 0;
+    var cu = 0;
+    var cp = 0;
+    var lo2 = 0;
+    var hi2 = 0;
+    var cu2 = 0;
+    var done = 0;
+    while (done == 0) {
+        lo = load8(w + i);
+        hi = load8(w + i + 1);
+        cu = lo | (hi << 8);
+        if (cu == 0) {
+            done = 1;
+        } else {
+            cp = cu;
+            i = i + 2;
+            if (cu >= 0xD800) {
+                if (cu <= 0xDBFF) {
+                    lo2 = load8(w + i);
+                    hi2 = load8(w + i + 1);
+                    cu2 = lo2 | (hi2 << 8);
+                    if (cu2 >= 0xDC00) {
+                        if (cu2 <= 0xDFFF) {
+                            cp = 0x10000 + ((cu - 0xD800) << 10) + (cu2 - 0xDC00);
+                            i = i + 2;
+                        }
+                    }
+                }
+            }
+            if (o + 5 < cap) {
+                if (cp < 0x80) {
+                    store8(dst + o, cp);
+                    o = o + 1;
+                } elif (cp < 0x800) {
+                    store8(dst + o, 0xC0 | (cp >> 6));
+                    store8(dst + o + 1, 0x80 | (cp & 0x3F));
+                    o = o + 2;
+                } elif (cp < 0x10000) {
+                    store8(dst + o, 0xE0 | (cp >> 12));
+                    store8(dst + o + 1, 0x80 | ((cp >> 6) & 0x3F));
+                    store8(dst + o + 2, 0x80 | (cp & 0x3F));
+                    o = o + 3;
+                } else {
+                    store8(dst + o, 0xF0 | (cp >> 18));
+                    store8(dst + o + 1, 0x80 | ((cp >> 12) & 0x3F));
+                    store8(dst + o + 2, 0x80 | ((cp >> 6) & 0x3F));
+                    store8(dst + o + 3, 0x80 | (cp & 0x3F));
+                    o = o + 4;
+                }
+            }
+        }
+    }
+    store8(dst + o, 0);
+    return o;
+}
+
+# List directory entries (filenames; . and .. skipped). Windows analogue of the
+# getdents64 dir_list — same return contract (a vec of cloned Str).
+fn dir_list(path): i64 {
+    var entries = vec_new();
+    # Build the UTF-16LE search pattern "<path>\*".
+    var wpat = alloc(1024);
+    var n = _fs_widen(wpat, str_data(path));
+    store8(wpat + n * 2, 92);          store8(wpat + n * 2 + 1, 0);        # '\'
+    store8(wpat + (n + 1) * 2, 42);    store8(wpat + (n + 1) * 2 + 1, 0);  # '*'
+    store8(wpat + (n + 2) * 2, 0);     store8(wpat + (n + 2) * 2 + 1, 0);  # NUL
+
+    var fd = alloc(592);               # WIN32_FIND_DATAW
+    var h = syscall(61462, wpat, fd);  # FindFirstFileW
+    if (h == 0 - 1) { return entries; }  # INVALID_HANDLE_VALUE — no entries
+
+    var name8 = alloc(1056);
+    var more = 1;
+    while (more != 0) {
+        _fs_narrow(fd + 44, name8, 1056);   # cFileName (UTF-16) → UTF-8
+        var skip = 0;
+        if (load8(name8) == 46) {
+            if (load8(name8 + 1) == 0) { skip = 1; }
+            if (load8(name8 + 1) == 46) {
+                if (load8(name8 + 2) == 0) { skip = 1; }
+            }
+        }
+        if (skip == 0) {
+            vec_push(entries, str_clone(str_from(name8)));
+        }
+        more = syscall(61463, h, fd);   # FindNextFileW (0 at end)
+    }
+    syscall(61464, h);                  # FindClose
+    return entries;
+}
+
+# Is `path` a directory? One GetFileAttributesW call — no handle churn.
+fn is_dir(path): i64 {
+    var wpath = alloc(1024);
+    _fs_widen(wpath, str_data(path));
+    var attrs = syscall(61465, wpath);          # GetFileAttributesW
+    if (attrs == 4294967295) { return 0; }      # INVALID_FILE_ATTRIBUTES
+    if ((attrs & 16) != 0) { return 1; }        # FILE_ATTRIBUTE_DIRECTORY
+    return 0;
+}

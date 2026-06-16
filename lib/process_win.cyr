@@ -1,0 +1,396 @@
+# process_win.cyr — Windows (PE) process management via CreateProcessW.
+# Usage: included by lib/process.cyr under #ifdef CYRIUS_TARGET_WIN.
+# Requires: lib/syscalls.cyr, lib/string.cyr, lib/alloc.cyr, lib/tagged.cyr,
+#           lib/str.cyr, lib/vec.cyr (for the exec_* family).
+#
+# Win32 has no fork/exec — every consumer verb maps to CreateProcessW plus
+# the kernel32 reroutes wired into src/backend/x86/emit.cyr (the PE-internal
+# syscall numbers 0xF001-0xF005), reusing the existing EREAD_PE (raw-handle
+# ReadFile, v6.0.45) and ECLOSE_PE (CloseHandle, syscall 3). See issue
+# 2026-06-03-windows-pe-syscall-surface-blocks-detection.md and the v6.0.51
+# CHANGELOG entry. Runtime-verified on cass (Windows x86_64) at v6.0.51 — the
+# spawn-runtime smoke landed here; v6.0.52 carries only the ai-hwaccel wheel.
+#
+# Win32 call numbers (PE-internal; mirror the parse_expr.cyr dispatch):
+#   0xF001 (61441) WaitForSingleObject(handle, timeout)
+#   0xF002 (61442) GetExitCodeProcess(handle, &code)
+#   0xF003 (61443) SetHandleInformation(handle, mask, flags)
+#   0xF004 (61444) CreatePipe(&rd, &wr, &sa, size)
+#   0xF005 (61445) CreateProcessW(&args10)
+#
+# A spawned "pid" (from spawn()) is the process HANDLE, not a Unix PID —
+# treat it opaquely and pass it to wait_pid(). getpid()/getppid() are stubs
+# (Windows self-pid via GetCurrentProcessId is out of this arc's scope).
+
+# ================================================================
+# UTF-16LE command-line / environment construction
+# ================================================================
+
+# Append NUL-terminated cstr `src` to UTF-16LE buffer `wbuf` at byte offset
+# `woff` (ASCII zero-extend — each byte becomes a 2-byte little-endian wide
+# char; adequate for tool paths and flags). Returns the new byte offset.
+fn _w_append_cstr(wbuf, woff, src): i64 {
+    var i = 0;
+    while (load8(src + i) != 0) {
+        store8(wbuf + woff, load8(src + i));
+        store8(wbuf + woff + 1, 0);
+        woff = woff + 2;
+        i = i + 1;
+    }
+    return woff;
+}
+
+# Append a single space (U+0020) at woff. Returns the new offset.
+fn _w_append_space(wbuf, woff): i64 {
+    store8(wbuf + woff, 32);
+    store8(wbuf + woff + 1, 0);
+    return woff + 2;
+}
+
+# Write the two-byte wide NUL terminator at woff. Returns the new offset.
+fn _w_terminate(wbuf, woff): i64 {
+    store8(wbuf + woff, 0);
+    store8(wbuf + woff + 1, 0);
+    return woff + 2;
+}
+
+# Build a writable UTF-16LE command line "cmd [arg1 [arg2]]" on the heap.
+# (CreateProcessW may modify lpCommandLine in place, so it must be writable
+# heap, never a read-only literal.) Returns the buffer pointer.
+fn _win_wcmdline3(cmd, arg1, arg2): i64 {
+    var total = strlen(cmd) + 1;
+    if (arg1 != 0) { total = total + strlen(arg1) + 1; }
+    if (arg2 != 0) { total = total + strlen(arg2) + 1; }
+    var wbuf = alloc((total + 1) * 2);
+    var o = _w_append_cstr(wbuf, 0, cmd);
+    if (arg1 != 0) { o = _w_append_space(wbuf, o); o = _w_append_cstr(wbuf, o, arg1); }
+    if (arg2 != 0) { o = _w_append_space(wbuf, o); o = _w_append_cstr(wbuf, o, arg2); }
+    _w_terminate(wbuf, o);
+    return wbuf;
+}
+
+# Build a UTF-16LE command line from a vec of argv elements. `is_str` = 1 →
+# elements are Str fat-pointers (extract str_data); 0 → raw cstr. Elements
+# are space-joined. Returns the heap buffer pointer.
+fn _win_wcmdline_vec(args, is_str): i64 {
+    var argc = vec_len(args);
+    var total = 0;
+    var i = 0;
+    while (i < argc) {
+        var e = vec_get(args, i);
+        if (is_str == 1) { e = str_data(e); }
+        total = total + strlen(e) + 1;
+        i = i + 1;
+    }
+    var wbuf = alloc((total + 1) * 2);
+    var o = 0;
+    var j = 0;
+    while (j < argc) {
+        var e = vec_get(args, j);
+        if (is_str == 1) { e = str_data(e); }
+        if (j > 0) { o = _w_append_space(wbuf, o); }
+        o = _w_append_cstr(wbuf, o, e);
+        j = j + 1;
+    }
+    _w_terminate(wbuf, o);
+    return wbuf;
+}
+
+# Build a UTF-16LE environment block from a vec of "KEY=VALUE" elements.
+# Format: each entry NUL-terminated, the whole block double-NUL-terminated.
+# Pass with CREATE_UNICODE_ENVIRONMENT (0x400). Returns the block pointer.
+fn _win_wenvblock_vec(env, is_str): i64 {
+    var envc = vec_len(env);
+    var total = 1;
+    var i = 0;
+    while (i < envc) {
+        var e = vec_get(env, i);
+        if (is_str == 1) { e = str_data(e); }
+        total = total + strlen(e) + 1;
+        i = i + 1;
+    }
+    var wbuf = alloc((total + 1) * 2);
+    var o = 0;
+    var j = 0;
+    while (j < envc) {
+        var e = vec_get(env, j);
+        if (is_str == 1) { e = str_data(e); }
+        o = _w_append_cstr(wbuf, o, e);
+        o = _w_terminate(wbuf, o);
+        j = j + 1;
+    }
+    _w_terminate(wbuf, o);
+    return wbuf;
+}
+
+# ================================================================
+# CreateProcessW core
+# ================================================================
+
+# Create a process. `wcmdline` = writable UTF-16LE command line.
+# `hStdOut` = write-handle for child stdout+stderr (0 = inherit parent's).
+# `wenv` = UTF-16LE env block (0 = inherit parent's). `pi` = caller's
+# 24-byte PROCESS_INFORMATION (zeroed + filled here). Returns the
+# CreateProcessW BOOL (non-zero = success).
+fn _win_create_process(wcmdline, hStdOut, wenv, pi): i64 {
+    # STARTUPINFOW (104 bytes), zeroed. Offsets: cb=0x00, dwFlags=0x3C,
+    # hStdInput=0x50, hStdOutput=0x58, hStdError=0x60.
+    var si[104];
+    var z = 0;
+    while (z < 104) { store8(&si + z, 0); z = z + 1; }
+    store64(&si, 104);                          # cb = sizeof(STARTUPINFOW)
+    if (hStdOut != 0) {
+        store64(&si + 60, 256);                 # dwFlags = STARTF_USESTDHANDLES
+        store64(&si + 88, hStdOut);             # hStdOutput
+        store64(&si + 96, hStdOut);             # hStdError
+    }
+    # PROCESS_INFORMATION (24 bytes), zeroed.
+    var pz = 0;
+    while (pz < 24) { store8(pi + pz, 0); pz = pz + 1; }
+    # CreateProcessW argument struct (10 qwords) — see ECREATEPROC_PE.
+    var a[80];
+    var flags = 0;
+    if (wenv != 0) { flags = 1024; }            # CREATE_UNICODE_ENVIRONMENT
+    store64(&a + 0, 0);                          # lpApplicationName
+    store64(&a + 8, wcmdline);                   # lpCommandLine (writable)
+    store64(&a + 16, 0);                         # lpProcessAttributes
+    store64(&a + 24, 0);                         # lpThreadAttributes
+    store64(&a + 32, 1);                         # bInheritHandles = TRUE
+    store64(&a + 40, flags);                     # dwCreationFlags
+    store64(&a + 48, wenv);                      # lpEnvironment
+    store64(&a + 56, 0);                         # lpCurrentDirectory
+    store64(&a + 64, &si);                       # lpStartupInfo
+    store64(&a + 72, pi);                        # lpProcessInformation
+    return syscall(61445, &a);                   # CreateProcessW
+}
+
+# Wait for the process in `pi` to exit, return its exit code, and close
+# both the process and thread handles.
+fn _win_wait_close(pi): i64 {
+    var hProcess = load64(pi + 0);
+    var hThread = load64(pi + 8);
+    syscall(61441, hProcess, 4294967295);        # WaitForSingleObject(INFINITE)
+    var code[8];
+    store64(&code, 0);
+    syscall(61442, hProcess, &code);             # GetExitCodeProcess
+    var ec = load32(&code);
+    syscall(3, hThread);                          # CloseHandle(hThread)
+    syscall(3, hProcess);                         # CloseHandle(hProcess)
+    return ec;
+}
+
+# v6.0.85 — spawn `cc < source > output` for `cyrius build` on Windows. cycc
+# reads its source from stdin and writes the PE to stdout; Win32 has no
+# fork/dup2/execve, so we hand the redirect to cmd.exe via CreateProcessW.
+# `cmd /s /c "<inner>"` strips ONLY the outermost quote pair (the /s rule), so
+# the inner per-path quotes + the `<` / `>` operators reach cmd intact:
+#   cmd /s /c ""C:\...\cycc.exe" < "src.cyr" > "out.exe""
+# Writes directly to `output` (SYS_RENAME is not a PE reroute, so the POSIX
+# atomic tmp+rename can't be used here). Returns the child exit code; 1 if the
+# spawn itself fails.
+fn _win_compile_spawn(cc, source, output): i64 {
+    var wbuf = alloc(16384);
+    var o = 0;
+    o = _w_append_cstr(wbuf, o, "cmd /s /c \"\"");
+    o = _w_append_cstr(wbuf, o, cc);
+    o = _w_append_cstr(wbuf, o, "\" < \"");
+    o = _w_append_cstr(wbuf, o, source);
+    o = _w_append_cstr(wbuf, o, "\" > \"");
+    o = _w_append_cstr(wbuf, o, output);
+    o = _w_append_cstr(wbuf, o, "\"\"");
+    _w_terminate(wbuf, o);
+    var pi[24];
+    if (_win_create_process(wbuf, 0, 0, &pi) == 0) { return 1; }
+    return _win_wait_close(&pi);
+}
+
+# Create an anonymous inheritable pipe, mark the read end non-inheritable,
+# and return the read handle (write handle returned via *wr_out). Returns
+# the read handle, or 0 on failure.
+fn _win_make_pipe(wr_out): i64 {
+    var pipeh[16];
+    store64(&pipeh, 0);
+    store64(&pipeh + 8, 0);
+    # SECURITY_ATTRIBUTES { nLength=24, lpSecurityDescriptor=0, bInheritHandle=1 }
+    var sa[24];
+    store64(&sa, 24);
+    store64(&sa + 8, 0);
+    store64(&sa + 16, 1);
+    var pr = syscall(61444, &pipeh, &pipeh + 8, &sa, 0);   # CreatePipe
+    if (pr == 0) { return 0; }
+    var hRead = load64(&pipeh);
+    var hWrite = load64(&pipeh + 8);
+    syscall(61443, hRead, 1, 0);                  # SetHandleInformation(hRead, INHERIT, 0)
+    store64(wr_out, hWrite);
+    return hRead;
+}
+
+# Drain a pipe read handle into buf (up to buflen). Returns bytes read.
+fn _win_drain(hRead, buf, buflen): i64 {
+    var total = 0;
+    var rgo = 1;
+    while (rgo == 1) {
+        var n = sys_read(hRead, buf + total, buflen - total);
+        if (n <= 0) { rgo = 0; }
+        else {
+            total = total + n;
+            if (total >= buflen) { rgo = 0; }
+        }
+    }
+    return total;
+}
+
+# ================================================================
+# Public API (mirrors lib/process.cyr's POSIX surface)
+# ================================================================
+
+# Run a command and wait for it. Returns Result(exit_code).
+fn run(cmd, arg1, arg2): Result {
+    var wcmd = _win_wcmdline3(cmd, arg1, arg2);
+    var pi[24];
+    var ok = _win_create_process(wcmd, 0, 0, &pi);
+    if (ok == 0) { return Err(1); }
+    return Ok(_win_wait_close(&pi));
+}
+
+# Run a command and capture stdout (+stderr) into buf. Returns Result(bytes).
+fn run_capture(cmd, arg1, arg2, buf, buflen): Result {
+    var hWrite = 0;
+    var hRead = _win_make_pipe(&hWrite);
+    if (hRead == 0) { return Err(1); }
+    var wcmd = _win_wcmdline3(cmd, arg1, arg2);
+    var pi[24];
+    var ok = _win_create_process(wcmd, hWrite, 0, &pi);
+    if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return Err(1); }
+    syscall(3, hWrite);                           # parent drops write end → EOF on child exit
+    var total = _win_drain(hRead, buf, buflen);
+    syscall(3, hRead);
+    _win_wait_close(&pi);
+    return Ok(total);
+}
+
+# Spawn a command in the background. Returns Result(process_handle).
+# The handle is the "pid" token — pass it to wait_pid().
+fn spawn(cmd, arg1, arg2): Result {
+    var wcmd = _win_wcmdline3(cmd, arg1, arg2);
+    var pi[24];
+    var ok = _win_create_process(wcmd, 0, 0, &pi);
+    if (ok == 0) { return Err(1); }
+    syscall(3, load64(&pi + 8));                  # close hThread (unused)
+    return Ok(load64(&pi + 0));                   # hProcess as the pid token
+}
+
+# Wait for a previously-spawned process handle. Returns Result(exit_code).
+fn wait_pid(pid): Result {
+    syscall(61441, pid, 4294967295);              # WaitForSingleObject(INFINITE)
+    var code[8];
+    store64(&code, 0);
+    syscall(61442, pid, &code);                   # GetExitCodeProcess
+    var ec = load32(&code);
+    syscall(3, pid);                              # CloseHandle
+    return Ok(ec);
+}
+
+# Windows self-pid (GetCurrentProcessId) is out of this arc's scope —
+# the v6.0.51 arc routes process *creation*. Returns 0 until a consumer
+# needs it; see issue 2026-06-03-windows-pe-syscall-surface.
+fn getpid(): i64 { return 0; }
+# Parent-pid is likewise unavailable on Win32 within this arc's scope.
+fn getppid(): i64 { return 0; }
+
+# ================================================================
+# vec-based family (cstr argv) — mirrors exec_vec / exec_capture / exec_env
+# ================================================================
+
+# Run command with a vec of cstr argv elements. Returns exit code or -1.
+fn exec_vec(args): i64 {
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var wcmd = _win_wcmdline_vec(args, 0);
+    var pi[24];
+    var ok = _win_create_process(wcmd, 0, 0, &pi);
+    if (ok == 0) { return 0 - 1; }
+    return _win_wait_close(&pi);
+}
+
+# Run command with cstr args vec and capture stdout. Returns bytes read.
+fn exec_capture(args, buf, buflen): i64 {
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var hWrite = 0;
+    var hRead = _win_make_pipe(&hWrite);
+    if (hRead == 0) { return 0 - 1; }
+    var wcmd = _win_wcmdline_vec(args, 0);
+    var pi[24];
+    var ok = _win_create_process(wcmd, hWrite, 0, &pi);
+    if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return 0 - 1; }
+    syscall(3, hWrite);
+    var total = _win_drain(hRead, buf, buflen);
+    syscall(3, hRead);
+    _win_wait_close(&pi);
+    return total;
+}
+
+# Run command with cstr args vec + cstr "KEY=VALUE" env vec.
+fn exec_env(args, env): i64 {
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var wcmd = _win_wcmdline_vec(args, 0);
+    var wenv = _win_wenvblock_vec(env, 0);
+    var pi[24];
+    var ok = _win_create_process(wcmd, 0, wenv, &pi);
+    if (ok == 0) { return 0 - 1; }
+    return _win_wait_close(&pi);
+}
+
+# ================================================================
+# Str-shape family — argv elements are Str fat-pointers (str_data extracted)
+# ================================================================
+
+# Run command with a vec of Str argv elements. Returns exit code or -1.
+fn exec_vec_str(args): i64 {
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var wcmd = _win_wcmdline_vec(args, 1);
+    var pi[24];
+    var ok = _win_create_process(wcmd, 0, 0, &pi);
+    if (ok == 0) { return 0 - 1; }
+    return _win_wait_close(&pi);
+}
+
+# Run command with Str args vec and capture stdout. Returns bytes read.
+fn exec_capture_str(args, buf, buflen): i64 {
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var hWrite = 0;
+    var hRead = _win_make_pipe(&hWrite);
+    if (hRead == 0) { return 0 - 1; }
+    var wcmd = _win_wcmdline_vec(args, 1);
+    var pi[24];
+    var ok = _win_create_process(wcmd, hWrite, 0, &pi);
+    if (ok == 0) { syscall(3, hRead); syscall(3, hWrite); return 0 - 1; }
+    syscall(3, hWrite);
+    var total = _win_drain(hRead, buf, buflen);
+    syscall(3, hRead);
+    _win_wait_close(&pi);
+    return total;
+}
+
+# Run command with Str args vec + Str "KEY=VALUE" env vec.
+fn exec_env_str(args, env): i64 {
+    if (vec_len(args) < 1) { return 0 - 1; }
+    var wcmd = _win_wcmdline_vec(args, 1);
+    var wenv = _win_wenvblock_vec(env, 1);
+    var pi[24];
+    var ok = _win_create_process(wcmd, 0, wenv, &pi);
+    if (ok == 0) { return 0 - 1; }
+    return _win_wait_close(&pi);
+}
+
+# Build an args vec from a space-separated command string + run it.
+fn exec_cmd(cmdline): i64 {
+    var args = vec_new();
+    var parts = str_split(str_from(cmdline), 32);
+    var pi = 0;
+    while (pi < vec_len(parts)) {
+        var part = vec_get(parts, pi);
+        vec_push(args, str_data(part));
+        pi = pi + 1;
+    }
+    return exec_vec(args);
+}

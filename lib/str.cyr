@@ -328,33 +328,99 @@ fn str_trim(s: Str): Str {
 # v5.8.43 — Allocator-as-first-arg variant of str_split. Routes
 # the result vec, every per-part Str header, AND any vec grow
 # allocations through `a`. Returns 0 on OOM at any step.
-fn str_split_a(a, s: Str, sep: Str): i64 {
+#
+# Runtime separator dispatch (v5.10.43 — fixes the long-standing
+# str_split sep-treated-as-pointer bug filed at
+# `docs/development/issues/2026-05-03-str-split-sep-treated-as-pointer.md`):
+#
+# - `sep < 256` → BYTE path. `sep` is a single byte value (e.g. `44`
+#   for `,`, `10` for `\n`, `32` for ` `). Compares each input byte
+#   to `sep` directly. This is the behavior every internal stdlib
+#   caller (lib/agnosys.cyr / lib/yukti.cyr / etc.) relied on prior
+#   to v5.10.43 and stays byte-identical for them.
+#
+# - `sep >= 256` → STR path. `sep` is a `Str` fat-pointer (16-byte
+#   `{data, len}` struct). Supports arbitrary-length separator via
+#   per-position byte-compare loop. The natural cyrius idiom —
+#   `str_split(s, str_from(","))` — now works as the type signature
+#   suggests it should. Empty Str sep (len == 0) is a no-op: returns
+#   a single-element vec containing the whole input.
+#
+# **NOT supported: cstr separator (raw byte pointer to a NUL-
+# terminated cstr literal).** Passing `" "` (a cstr) would land
+# in the STR path and read garbage past the byte payload. Use
+# `str_split_cstr(s, " ")` for cstr separators (single byte only
+# per its own contract), or pass the byte int directly
+# (`str_split(s, 32)`).
+#
+# `sep` is intentionally not type-annotated — the runtime dispatch
+# means the same parameter slot accepts either an int or a Str
+# pointer. Annotating either way would lie to half the call sites.
+fn str_split_a(a, s: Str, sep): i64 {
     var parts = vec_new_a(a);
     if (parts == 0) { return 0; }
     var slen = str_len(s);
     var sd = str_data(s);
     var start = 0;
     var si = 0;
-    while (si < slen) {
-        if (load8(sd + si) == sep) {
+    if (sep < 256) {
+        # BYTE path — pre-v5.10.43 behavior preserved.
+        while (si < slen) {
+            if (load8(sd + si) == sep) {
+                var part = str_new_a(a, sd + start, si - start);
+                if (part == 0) { return 0; }
+                if (vec_push_a(a, parts, part) != 0) { return 0; }
+                start = si + 1;
+            }
+            si = si + 1;
+        }
+        if (start <= slen) {
+            var tail = str_new_a(a, sd + start, slen - start);
+            if (tail == 0) { return 0; }
+            if (vec_push_a(a, parts, tail) != 0) { return 0; }
+        }
+        return parts;
+    }
+    # STR path. sep is a Str fat-pointer.
+    var seplen = str_len(sep);
+    var sepd = str_data(sep);
+    # Empty-sep no-op: return the whole input as one part.
+    if (seplen == 0) {
+        var only = str_new_a(a, sd, slen);
+        if (only == 0) { return 0; }
+        if (vec_push_a(a, parts, only) != 0) { return 0; }
+        return parts;
+    }
+    while (si + seplen <= slen) {
+        var hit = 1;
+        var ki = 0;
+        while (ki < seplen) {
+            if (load8(sd + si + ki) != load8(sepd + ki)) { hit = 0; ki = seplen; }
+            else { ki = ki + 1; }
+        }
+        if (hit == 1) {
             var part = str_new_a(a, sd + start, si - start);
             if (part == 0) { return 0; }
             if (vec_push_a(a, parts, part) != 0) { return 0; }
-            start = si + 1;
+            start = si + seplen;
+            si = start;
+        } else {
+            si = si + 1;
         }
-        si = si + 1;
     }
-    if (start <= slen) {
-        var tail = str_new_a(a, sd + start, slen - start);
-        if (tail == 0) { return 0; }
-        if (vec_push_a(a, parts, tail) != 0) { return 0; }
-    }
+    # Tail from `start` to end of input.
+    var tail = str_new_a(a, sd + start, slen - start);
+    if (tail == 0) { return 0; }
+    if (vec_push_a(a, parts, tail) != 0) { return 0; }
     return parts;
 }
 
-# Split Str by byte separator, return vec of Str pointers. v5.8.43
-# wrapper.
-fn str_split(s: Str, sep: Str): i64 {
+# Split Str by byte OR Str separator (runtime dispatch via
+# str_split_a — see that fn's docstring for the full contract).
+# v5.8.43 wrapper. v5.10.43: sep parameter retypes to untyped int
+# (was misleadingly `Str`); both single-byte and Str fat-pointer
+# inputs are accepted.
+fn str_split(s: Str, sep): i64 {
     return str_split_a(default_alloc(), s, sep);
 }
 
@@ -398,9 +464,23 @@ fn _sb_grow_a(a, sb, n): i64 {
     return 0;
 }
 
-# Ensure builder has room for n more bytes
+# Ensure builder has room for n more bytes. Returns 0 on success or -1 on grow
+# OOM. CVE-25 (v6.1.38): previously dropped `_sb_grow_a`'s rc and returned 0, so
+# the back-compat builders below wrote past the un-grown buffer on OOM.
 fn _sb_grow(sb, n): i64 {
-    var rc = _sb_grow_a(default_alloc(), sb, n);
+    return _sb_grow_a(default_alloc(), sb, n);
+}
+
+# CVE-25 (v6.1.38): abort on a string-builder grow OOM, mirroring _vec_die — the
+# back-compat builders have no error return, so (like vec_push) they write the
+# diagnostic + exit(1) rather than corrupt the heap past the old allocation.
+fn _sb_die(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    syscall(0, 1);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    syscall(60, 1);
+    #endif
     return 0;
 }
 
@@ -419,7 +499,7 @@ fn str_builder_add_a(a, sb, s: Str): i64 {
 # Append a Str to the string builder
 fn str_builder_add(sb, s: Str): i64 {
     var slen = str_len(s);
-    _sb_grow(sb, slen);
+    if (_sb_grow(sb, slen) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     memcpy(buf + len, str_data(s), slen);
@@ -441,7 +521,7 @@ fn str_builder_add_cstr_a(a, sb, cstr): i64 {
 # Append a C string to the string builder
 fn str_builder_add_cstr(sb, cstr): i64 {
     var slen = strlen(cstr);
-    _sb_grow(sb, slen);
+    if (_sb_grow(sb, slen) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     memcpy(buf + len, cstr, slen);
@@ -455,7 +535,7 @@ fn str_builder_add_cstr(sb, cstr): i64 {
 # stash a one-byte cstring. Required by agnosys 1.1.12 verbatim
 # repro (the original filing's spec uses this shape).
 fn str_builder_putc(sb, ch): i64 {
-    _sb_grow(sb, 1);
+    if (_sb_grow(sb, 1) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     store8(buf + len, ch & 0xFF);
@@ -479,7 +559,7 @@ fn str_builder_add_int_a(a, sb, n): i64 {
 fn str_builder_add_int(sb, n): i64 {
     var tmp[24];
     var tlen = fmt_int_buf(n, &tmp);
-    _sb_grow(sb, tlen);
+    if (_sb_grow(sb, tlen) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     memcpy(buf + len, &tmp, tlen);
@@ -579,7 +659,7 @@ fn str_builder_add_str(sb, s): i64 {
 
 # str_builder_add_byte — append a single byte
 fn str_builder_add_byte(sb, byte): i64 {
-    _sb_grow(sb, 1);
+    if (_sb_grow(sb, 1) != 0) { syscall(1, 2, "str_builder: alloc failed\n", 26); _sb_die(); }
     var buf = load64(sb);
     var len = load64(sb + 8);
     store8(buf + len, byte);
@@ -645,34 +725,34 @@ fn str_to_hex(s): i64 {
 # ================================================================
 
 # Return length of string
-fn Str_len(self) { return str_len(self); }
+fn Str_len(self): i64 { return str_len(self); }
 # Return pointer to raw byte data
-fn Str_data(self) { return str_data(self); }
+fn Str_data(self): i64 { return str_data(self); }
 # Print string to stdout
-fn Str_print(self) { return str_print(self); }
+fn Str_print(self): i64 { return str_print(self); }
 # Print string + newline to stdout
-fn Str_println(self) { return str_println(self); }
+fn Str_println(self): i64 { return str_println(self); }
 # Compare two Strs for equality
-fn Str_eq(self, other) { return str_eq(self, other); }
+fn Str_eq(self, other): i64 { return str_eq(self, other); }
 # Concatenate two Strs (allocates new)
-fn Str_cat(self, other) { return str_cat(self, other); }
+fn Str_cat(self, other): Str { return str_cat(self, other); }
 # Substring from start with given length
-fn Str_sub(self, start, len) { return str_sub(self, start, len); }
+fn Str_sub(self, start, len): Str { return str_sub(self, start, len); }
 # Deep copy of string
-fn Str_clone(self) { return str_clone(self); }
+fn Str_clone(self): Str { return str_clone(self); }
 # Check if string contains needle (C string)
-fn Str_contains(self, needle) { return str_contains(self, needle); }
+fn Str_contains(self, needle): i64 { return str_contains(self, needle); }
 # Check if string starts with prefix (C string)
-fn Str_starts_with(self, prefix) { return str_starts_with(self, prefix); }
+fn Str_starts_with(self, prefix): i64 { return str_starts_with(self, prefix); }
 # Check if string ends with suffix (C string)
-fn Str_ends_with(self, suffix) { return str_ends_with(self, suffix); }
+fn Str_ends_with(self, suffix): i64 { return str_ends_with(self, suffix); }
 # Find first occurrence of needle, return offset or -1
-fn Str_index_of(self, needle) { return str_index_of(self, needle); }
+fn Str_index_of(self, needle): i64 { return str_index_of(self, needle); }
 # Create Str from integer
-fn Str_from_int(n) { return str_from_int(n); }
+fn Str_from_int(n): Str { return str_from_int(n); }
 # Parse Str as integer
-fn Str_to_int(self) { return str_to_int(self); }
+fn Str_to_int(self): i64 { return str_to_int(self); }
 # Trim whitespace from both ends
-fn Str_trim(self) { return str_trim(self); }
+fn Str_trim(self): Str { return str_trim(self); }
 # Split by separator into vec of Strs
-fn Str_split(self, sep) { return str_split(self, sep); }
+fn Str_split(self, sep): i64 { return str_split(self, sep); }

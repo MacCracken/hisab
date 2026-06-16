@@ -1,0 +1,78 @@
+# sync.cyr — portable process-internal mutex.
+# Usage: include "lib/atomic.cyr", "lib/alloc.cyr", then "lib/sync.cyr".
+#
+# WHY THIS EXISTS (issue 2026-06-09-no-portable-mutex-stdlib.md, from patra):
+# the only stdlib mutex used to live inside lib/thread.cyr, bundled with the
+# Linux clone/futex/trampoline thread-spawn machinery — which "can't even parse
+# under Win32". So a first-party library that just wanted an internal lock had
+# to either vendor a Linux-only futex (what patra did) or hand-roll a per-OS
+# lock. This module is the lock ALONE, selected per-OS exactly like alloc.cyr,
+# with NO dependency on thread spawning.
+#
+# MEMORY-ORDERING CONTRACT (the same on every backend):
+#   - mutex_lock(m)   has ACQUIRE semantics: loads/stores in the critical
+#                     section cannot be reordered before the lock is taken.
+#   - mutex_unlock(m) has RELEASE semantics: all writes made under the lock are
+#                     visible to the next acquirer before it observes the lock
+#                     free. On Linux/macOS this is an explicit atomic_fence
+#                     pairing; on Windows SRWLOCK provides it intrinsically.
+#   A mutex is one 8-byte cell (MUTEX_SIZE). mutex_new() returns a non-zero
+#   pointer (heap cell); callers may null-check it.
+#
+# BACKENDS (one active per build — selected like alloc.cyr, no #else in cyrius):
+#   Linux x86_64 / aarch64 : SYS_FUTEX 2-state lock, BLOCKS on contention
+#                            (mirrors lib/thread.cyr's proven mutex).
+#   Windows                : SRWLOCK — lib/sync_windows.cyr (blocks, fair-ish).
+#   macOS                  : atomic_cas SPINLOCK — lib/sync_macos.cyr. macOS has
+#                            no routed futex/__ulock/os_unfair_lock primitive
+#                            (see lib/alloc.cyr:37 + _macho_arm_routes), so the
+#                            macOS lock SPINS. Correct for short, low-contention
+#                            critical sections (the portable-lock use case); a
+#                            blocking macOS lock awaits __ulock backend routing.
+#
+# Provides: MUTEX_SIZE, mutex_new(), mutex_lock(m), mutex_unlock(m).
+# (No trylock: Windows SRWLOCK has no routed TryAcquire, so a non-blocking
+# acquire isn't portable yet — keep the surface to what every backend supports.)
+
+var MUTEX_SIZE = 8;
+
+#ifdef CYRIUS_TARGET_WIN
+include "lib/sync_windows.cyr"
+#endif
+
+#ifdef CYRIUS_TARGET_MACOS
+include "lib/sync_macos.cyr"
+#endif
+
+#ifdef CYRIUS_TARGET_LINUX
+# 2-state futex mutex. SYS_FUTEX + FUTEX_* are the per-arch constants from
+# lib/syscalls_{x86_64,aarch64}_linux.cyr (x86 202 / aarch64 98); they are
+# compile-time literals, so the syscall lowers correctly on both arches.
+fn mutex_new(): i64 {
+    alloc_init();
+    var m = alloc(MUTEX_SIZE);
+    store64(m, 0);
+    return m;
+}
+
+# Blocking acquire. Spins the CAS fast-path; FUTEX_WAITs when contended.
+fn mutex_lock(m): i64 {
+    while (atomic_cas(m, 0, 1) == 0) {
+        # FUTEX_WAIT re-checks *m == 1 against the kernel: if the holder
+        # released in the race window the syscall returns EAGAIN and we
+        # retry the CAS — no lost-wakeup. PRIVATE_FLAG: process-internal.
+        syscall(SYS_FUTEX, m, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+    }
+    atomic_fence();   # acquire barrier
+    return 0;
+}
+
+# Release. Flushes the critical section (release barrier), clears the cell,
+# wakes one waiter (kernel no-ops the wake when none are parked).
+fn mutex_unlock(m): i64 {
+    atomic_fence();   # release barrier
+    atomic_store(m, 0);
+    syscall(SYS_FUTEX, m, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0);
+    return 0;
+}
+#endif

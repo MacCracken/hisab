@@ -5,7 +5,7 @@
 **Severity:** Silent miscompile — every `[lib]` module gets auto-prepended to every build, blowing past `input_buf` and surfacing pre-existing parse errors in modules not meant to be in the build chain. Misleading because the error blames a module the user didn't include.
 **Hisab impact:** Spent significant time hunting a phantom `lib/collision_core.cyr:223 unexpected struct` error before realizing that `cbt` was prepending the entire `[lib]` list to `cyrius build src/main.cyr`. Comment containing the literal token `modules` was the trigger.
 **Hisab workaround:** A banner comment at the top of `[build]` in `cyrius.cyml` warns about this and uses split-token (`m`+`odules`) to dodge the same trap. See `cyrius.cyml`.
-**Status:** Open upstream. Same false-positive class as the `stdlib` substring bug already guarded against in `cbt/deps.cyr` ~L170 (added v5.5.26 when patra hit it).
+**Status:** ✅ **RESOLVED on cyrius 6.2.11** (re-verified 2026-06-15 during the 6.0.14→6.2.11 bump). A `[build]` comment containing the literal token `modules` followed by a `[lib] modules = [...]` array no longer mis-binds — `cyrius build` compiles only the build source and ignores the (deliberately broken) `[lib]` modules. Archived. (Historical: same false-positive class as the `stdlib` substring bug guarded in `cbt/deps.cyr` ~L170, added v5.5.26 when patra hit it.)
 
 ## Symptom
 

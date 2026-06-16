@@ -5,7 +5,7 @@
 **Severity:** Silent miscompile — wrong values, no warning, downstream segfault
 **Hisab impact:** `lib/calc.cyr` `_perm_init` (Perlin noise table init) corrupts the 256-byte permutation table, causing every subsequent `perlin_2d` call to crash. Surfaced as bench segfault (exit 139) after `ease_in_out`.
 **Hisab workaround:** `_perm_store_block` (18 args) refactored into `_perm_store_8` (10 args) called twice as often. See `lib/calc.cyr` `_perm_init` and the helper at the bottom of section 4.
-**Status:** Open upstream. Hisab unblocked.
+**Status:** ✅ **RESOLVED on cyrius 6.2.11** (re-verified 2026-06-15 during the 6.0.14→6.2.11 bump). A minimal 18-arg fn that returns a sum of register- and stack-class params (incl. the previously-scrambled 1, 2, 7–12) now returns the correct value (verified: `f18(1..18)` of params {1,2,7,8,11,12,18} → exit 59, exact). The cc5 SysV codegen scramble is gone. The `_perm_store_8` (10-arg) split in `src/calc.cyr` still works and is left in place — reverting it is optional cleanup, not required. Archived.
 
 ## Symptom
 

@@ -9,9 +9,9 @@ differential geometry, symbolic algebra.
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (sovereign systems language, compiled by cycc)
-- **Toolchain**: Cyrius 6.0.14 (`cyrius.cyml: cyrius = "6.0.14"`)
+- **Toolchain**: Cyrius 6.2.11 (`cyrius.cyml: cyrius = "6.2.11"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.6.5 — compiles cleanly under cycc 6.0.14. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~545 KB / 16,887 lines, fits cycc 6.0.14's 1 MB input_buf with ample headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (957/957). The 2.3.x, 2.4.x, 2.5.x, and 2.6.x (differential-geometry depth) arcs are all complete.
+- **Status**: 2.6.6 — compiles cleanly under cycc 6.2.11. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~545 KB / 16,878 lines, fits cycc 6.2.11's 1 MB input_buf with ample headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (957/957). The 2.3.x, 2.4.x, 2.5.x, and 2.6.x (differential-geometry depth) arcs are all complete. The 6.2.11 bump moved the stdlib transcendentals into the new `ganita` module (which also subsumes `matrix`/`linalg`) — see CHANGELOG 2.6.6.
 
 ## Consumers
 
@@ -29,8 +29,12 @@ cyrius bench tests/hisab.bcyr            # run benchmarks
 ## Dependencies
 
 - **Cyrius stdlib** — `syscalls`, `string`, `alloc`, `str`, `fmt`, `vec`,
-  `io`, `args`, `assert`, `math`, `matrix`, `linalg`, `tagged`, `fnptr`,
-  `bench`, `callback` (ships with Cyrius >= 6.0.14)
+  `io`, `args`, `assert`, `math`, `ganita`, `tagged`, `fnptr`,
+  `bench`, `callback` (ships with Cyrius >= 6.2.11). `ganita` is the 6.2.x
+  math umbrella — transcendentals (acos/asin/atan2/pow/sinh/cosh/tanh +
+  inverses) plus the full `matrix`/`linalg` API; do **not** also list `matrix`
+  or `linalg` (duplicate-definition collisions). `math` stays for the inclusive
+  comparisons, clamp/lerp/min/max/sign and the exp/ln polyfills.
 - **sakshi** 2.1.0 — structured logging (first-party)
 
 No external deps. No FFI. No libc. All first-party, pinned in
@@ -130,7 +134,7 @@ VERSION              — single source of truth for version
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.0.14"` in `cyrius.cyml`. CI and release both grep
+- **Toolchain pin**: `cyrius = "6.2.11"` in `cyrius.cyml`. CI and release both grep
   the manifest; no hardcoded versions in YAML
 - **Tag filter**: release triggers on `tags: ['v?[0-9]+.[0-9]+.[0-9]+']` (with or without `v` prefix)
 - **Version-verify gate**: release asserts `VERSION == git tag` before building

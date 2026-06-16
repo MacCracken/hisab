@@ -34,14 +34,18 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "6.0.14"
+cyrius      = "6.2.11"
 
 [deps]
-stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "matrix", "linalg", "tagged", "fnptr"]
+# `ganita` (Cyrius 6.2.x) provides the transcendentals (acos/asin/atan2/pow/
+# sinh/cosh/tanh + inverses) AND subsumes `matrix`/`linalg` — do not list those
+# alongside it or you get duplicate-definition collisions. `math` stays for the
+# inclusive comparisons, clamp/lerp/min/max/sign and the polyfills.
+stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "fnptr"]
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.6.5"
+tag     = "2.6.6"
 modules = ["dist/hisab.cyr"]   # ~550 KB self-contained bundle (all 34 modules)
 # Or pull individual files for a smaller compilation unit:
 # modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec3.cyr", ...]
@@ -103,13 +107,13 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.6.5 |
+| Version | 2.6.6 |
 | Library | 34 modules, ~16,600 lines of Cyrius |
 | Tests | 957 assertions across 4 suites |
 | Benchmarks | 26 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~152 KB static ELF (`build/hisab` — version smoke test only) |
-| Toolchain | Cyrius 6.0.14 |
+| Toolchain | Cyrius 6.2.11 |
 | Dependencies | 1 (sakshi 2.1.0); no third-party, no FFI/libc |
 | Security | P(-1) audited (2026-04-15) + security/hardening pass (2026-05-29); no known vulnerabilities |
 

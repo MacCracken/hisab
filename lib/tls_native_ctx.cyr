@@ -1,0 +1,238 @@
+# ================================================================
+# Opaque context handle
+# ================================================================
+# Returned by tls_native_new_client / new_server; passed to every
+# stateful fn. Internally points to an alloc()'d struct laid out
+# below (.15). Callers MUST treat as opaque and free via
+# tls_native_close (which calls into the bump allocator's
+# no-individual-free path — the heap is reclaimed on alloc_reset,
+# not per-ctx).
+#
+# At the API boundary a context is an i64 handle. 0 means "alloc
+# failed / invalid"; positive means a valid pointer.
+
+# ================================================================
+# Connection context + server handshake state machine (.15)
+# ================================================================
+# The context is an alloc()'d struct; the API handle is its pointer
+# (>0). Shared by client (Mini-arc B) and server (Mini-arc C) — the
+# server path is wired first. Offsets +0..+128 are the handshake
+# control block; +136..+255 is reserved for the read/write key
+# material, sequence numbers, and I/O buffers Mini-arcs B-D append.
+
+var TLS_CTX_LEN          = 480;   # 60 i64 slots (+1 @ v6.2.8: CERT_REQUESTED, mTLS client-auth)
+var TLS_CTX_OFF_ROLE       = 0;   # TlsRole (CLIENT/SERVER)
+var TLS_CTX_OFF_STATE      = 8;   # TlsState
+var TLS_CTX_OFF_VERSION    = 16;  # negotiated TlsProtocolVersion (0 until SH)
+var TLS_CTX_OFF_CIPHER     = 24;  # negotiated TlsCipherSuite (0 until SH)
+var TLS_CTX_OFF_VERIFY     = 32;  # TlsVerifyMode
+var TLS_CTX_OFF_MIN_VER    = 40;  # min acceptable TlsProtocolVersion
+var TLS_CTX_OFF_MAX_VER    = 48;  # max acceptable TlsProtocolVersion
+var TLS_CTX_OFF_TRANSCRIPT = 56;  # transcript-hash handle (0 until cipher known)
+var TLS_CTX_OFF_KEYSCHED   = 64;  # key-schedule handle (0 until derived)
+var TLS_CTX_OFF_CERT_CHAIN = 72;  # server: DER cert-chain ptr
+var TLS_CTX_OFF_CERT_LEN   = 80;  # server: cert-chain byte len
+var TLS_CTX_OFF_KEY        = 88;  # server: DER private-key ptr
+var TLS_CTX_OFF_KEY_LEN    = 96;  # server: key byte len
+var TLS_CTX_OFF_HOST       = 104; # client: SNI host cstr ptr
+var TLS_CTX_OFF_HOST_LEN   = 112; # client: host byte len
+var TLS_CTX_OFF_SOCK_FD    = 120; # caller socket fd (set by accept/connect)
+var TLS_CTX_OFF_LAST_ERR   = 128; # last TLS_ERR_* recorded (0 if none)
+# Parsed server credentials (.16) — populated by load_creds:
+var TLS_CTX_OFF_KEY_ALGO   = 136; # SIG_PRIVKEY_* of the loaded private key
+var TLS_CTX_OFF_KEY_MAT    = 144; # ptr to parsed key material (scalar/seed)
+var TLS_CTX_OFF_KEY_MAT_LEN = 152; # key material length (32 P-256/Ed25519, 48 P-384)
+var TLS_CTX_OFF_LEAF_CERT  = 160; # ptr to the parsed x509 leaf-cert struct (256 B)
+var TLS_CTX_OFF_CREDS_LOADED = 168; # 1 once load_creds has succeeded
+# Hello exchange (.17) — populated by server_respond_hello:
+var TLS_CTX_OFF_CLIENT_RANDOM = 176; # ptr to client_random (32 B, from ClientHello)
+var TLS_CTX_OFF_SERVER_RANDOM = 184; # ptr to server_random (32 B, ours)
+var TLS_CTX_OFF_SESSION_ID    = 192; # ptr to legacy_session_id echo bytes
+var TLS_CTX_OFF_SESSION_ID_LEN = 200; # session-id length (0..32)
+var TLS_CTX_OFF_GROUP         = 208; # negotiated TlsNamedGroup (0 until SH)
+var TLS_CTX_OFF_EPH_PRIV      = 216; # ptr to our ephemeral private scalar (32 B)
+var TLS_CTX_OFF_EPH_PUB       = 224; # ptr to our ephemeral public key (32 B)
+var TLS_CTX_OFF_SHARED        = 232; # ptr to the ECDHE shared secret (32 B)
+var TLS_CTX_OFF_PEER_PUB      = 240; # ptr to the client's x25519 pubkey (into CH buf)
+var TLS_CTX_OFF_SENT_HRR      = 248; # 1 if the last response was a HelloRetryRequest
+var TLS_CTX_OFF_CLIENT_CERT   = 256; # ptr to the parsed client leaf cert (client auth)
+var TLS_CTX_OFF_STEK          = 264; # ptr to the server ticket-encryption key (32 B, lazy)
+# Record-protection traffic keys (.21) — installed after derive_handshake:
+var TLS_CTX_OFF_SRV_HS_KEY    = 272; # server handshake-traffic key ptr
+var TLS_CTX_OFF_SRV_HS_IV     = 280; # server handshake-traffic static IV ptr (12 B)
+var TLS_CTX_OFF_CLI_HS_KEY    = 288; # client handshake-traffic key ptr
+var TLS_CTX_OFF_CLI_HS_IV     = 296; # client handshake-traffic static IV ptr (12 B)
+var TLS_CTX_OFF_SRV_SEQ       = 304; # inline 8-byte server write sequence number
+var TLS_CTX_OFF_CLI_SEQ       = 312; # inline 8-byte client (read) sequence number
+# Client-side (.24): buffered ClientHello for retroactive transcript
+# init once the cipher (hence hash) is known from the ServerHello.
+var TLS_CTX_OFF_CH_BUF        = 320; # ptr to the sent ClientHello message bytes
+var TLS_CTX_OFF_CH_LEN        = 328; # ClientHello message length
+var TLS_CTX_OFF_SERVER_CERT   = 336; # client: parsed server leaf cert (.26)
+var TLS_CTX_OFF_SRV_FIN_BUF   = 344; # client: stashed server Finished message (.26 → .27)
+var TLS_CTX_OFF_SRV_FIN_LEN   = 352; # client: server Finished message length
+# Application-traffic keys (.28) — installed after derive_master:
+var TLS_CTX_OFF_SRV_APP_KEY   = 360; # server application-traffic key ptr
+var TLS_CTX_OFF_SRV_APP_IV    = 368; # server application-traffic static IV ptr
+var TLS_CTX_OFF_CLI_APP_KEY   = 376; # client application-traffic key ptr
+var TLS_CTX_OFF_CLI_APP_IV    = 384; # client application-traffic static IV ptr
+var TLS_CTX_OFF_SRV_APP_SEQ   = 392; # inline 8-byte server app-record sequence
+var TLS_CTX_OFF_CLI_APP_SEQ   = 400; # inline 8-byte client app-record sequence
+var TLS_CTX_OFF_CA_ROOT       = 408; # client: parsed trust-anchor cert (.29)
+var TLS_CTX_OFF_MASTER12      = 416; # TLS 1.2: ptr to the 48-byte master_secret (.74)
+# — 1.2 has no HKDF keysched object, so both
+# Finished verify_data computations need a home
+# for the master here. (Offsets continue contiguously
+# below to CERT_REQUESTED=472; TLS_CTX_LEN=480.)
+var TLS_CTX_OFF_USE_EMS       = 424; # TLS 1.2 Extended Master Secret (RFC 7627, .77):
+# 1 = EMS negotiated, 0 = legacy. READ by
+# derive_keys; SET/cleared by the CH/SH parsers.
+# Zeroed by the new_ctx loop → defaults to legacy.
+var TLS_CTX_OFF_ALPN_OFFER    = 432; # ALPN (RFC 7301, .78): ptr to [be16 len][protos]
+# offered list (OpenSSL-style 1-byte-len-prefixed protos), or 0.
+# SET by set_alpn; READ by the CH builders.
+var TLS_CTX_OFF_ALPN_SEL      = 440; # ALPN: ptr to [u8 len][proto] the peer selected, or 0.
+# SET by the SH/EE parsers; READ by get_alpn_selected.
+var TLS_CTX_OFF_SERVER_INTERS = 448; # client: ptr to [count][interm0 ptr]... the server's
+# intermediate certs in TLS (leaf→root) order, or 0. SET by the cert-chain parser;
+# READ (reversed) by verify_chain. (.78 trust-store + intermediate-chain walk)
+# v6.1.36 (CVE-30): the current application-traffic secrets, retained so a
+# post-handshake KeyUpdate (RFC 8446 §7.2) can derive secret_{N+1}. SET by
+# install_app_keys; rotated in place by _tn_rotate_recv_keys/_tn_rotate_send_keys.
+var TLS_CTX_OFF_SRV_APP_SECRET = 456; # server application-traffic secret ptr
+var TLS_CTX_OFF_CLI_APP_SECRET = 464; # client application-traffic secret ptr
+var TLS_CTX_OFF_CERT_REQUESTED = 472; # v6.2.8 client: 1 if server sent a CertificateRequest (mTLS client-auth)
+
+# Handshake state-machine events. The protocol-message build/parse
+# that fires each event lands in .16-.19; this slot validates the
+# transitions in isolation so the driver they plug into is trusted.
+var TLS_EV_START         = 0;   # accept()/connect() begins the handshake
+var TLS_EV_RECV_CH       = 1;   # server got ClientHello (and emits its flight)
+var TLS_EV_RECV_CERT     = 2;   # received peer Certificate (client-auth)
+var TLS_EV_RECV_CV       = 3;   # received peer CertificateVerify (client-auth)
+var TLS_EV_RECV_FINISHED = 4;   # received peer Finished
+
+# Allocate + zero-init a context for `role`, applying handshake
+# defaults: state INIT, verify NONE, version range 1.2..1.3.
+# Returns the ctx pointer (>0) or 0 on OOM.
+fn _tn_ctx_new(role): i64 {
+    var ctx = alloc(TLS_CTX_LEN);
+    if (ctx == 0) { return 0; }
+    var i = 0;
+    while (i < TLS_CTX_LEN) {
+        store64(ctx + i, 0);
+        i = i + 8;
+    }
+    store64(ctx + TLS_CTX_OFF_ROLE,    role);
+    store64(ctx + TLS_CTX_OFF_STATE,   TLS_STATE_INIT);
+    store64(ctx + TLS_CTX_OFF_VERIFY,  TLS_VERIFY_NONE);
+    store64(ctx + TLS_CTX_OFF_MIN_VER, TLS_VERSION_1_2);
+    store64(ctx + TLS_CTX_OFF_MAX_VER, TLS_VERSION_1_3);
+    return ctx;
+}
+
+# Record a fatal error: stash it in LAST_ERR and drive the ctx to the
+# ERROR state (unusable). Returns `err` so callers can `return
+# _tn_ctx_fail(ctx, ...)` directly.
+fn _tn_ctx_fail(ctx, err): i64 {
+    store64(ctx + TLS_CTX_OFF_LAST_ERR, err);
+    store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_ERROR);
+    return err;
+}
+
+# Server-side handshake state machine (RFC 8446 §A.2). Drives one
+# transition per event:
+#   INIT --START--> WAIT_CH
+#   WAIT_CH --RECV_CH--> WAIT_FINISHED           (no client auth)
+#                     \-> WAIT_CLIENT_FLIGHT2     (client cert requested)
+#   WAIT_CLIENT_FLIGHT2 --RECV_CERT/RECV_CV--> (stay; client auth flight)
+#   WAIT_FINISHED      --RECV_FINISHED--> CONNECTED
+#   WAIT_CLIENT_FLIGHT2--RECV_FINISHED--> CONNECTED
+# Any event illegal for the current state drives the ctx to ERROR and
+# returns TLS_ERR_PROTOCOL. Returns TLS_OK on a legal transition.
+fn tls_native_server_transition(ctx, event): i64 {
+    if (ctx == 0) { return TLS_ERR_INVALID_PARAM; }
+    if (load64(ctx + TLS_CTX_OFF_ROLE) != TLS_ROLE_SERVER) {
+        return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
+    }
+    var st = load64(ctx + TLS_CTX_OFF_STATE);
+    if (event == TLS_EV_START) {
+        if (st != TLS_STATE_INIT) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
+        store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_WAIT_CH);
+        return TLS_OK;
+    }
+    if (event == TLS_EV_RECV_CH) {
+        if (st != TLS_STATE_WAIT_CH) { return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL); }
+        # ClientHello consumed; the server's full flight is emitted in
+        # .16-.18. Whether we then expect the client's auth flight or
+        # just its Finished is decided by the verify mode set on the ctx.
+        if (load64(ctx + TLS_CTX_OFF_VERIFY) == TLS_VERIFY_NONE) {
+            store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_WAIT_FINISHED);
+        } else {
+            store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_WAIT_CLIENT_FLIGHT2);
+        }
+        return TLS_OK;
+    }
+    if (event == TLS_EV_RECV_CERT) {
+        if (st != TLS_STATE_WAIT_CLIENT_FLIGHT2) {
+            return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
+        }
+        return TLS_OK;   # client Certificate consumed; CertificateVerify next
+    }
+    if (event == TLS_EV_RECV_CV) {
+        if (st != TLS_STATE_WAIT_CLIENT_FLIGHT2) {
+            return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
+        }
+        return TLS_OK;   # client CertificateVerify consumed; Finished next
+    }
+    if (event == TLS_EV_RECV_FINISHED) {
+        if (st == TLS_STATE_WAIT_FINISHED) {
+            store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_CONNECTED);
+            return TLS_OK;
+        }
+        if (st == TLS_STATE_WAIT_CLIENT_FLIGHT2) {
+            store64(ctx + TLS_CTX_OFF_STATE, TLS_STATE_CONNECTED);
+            return TLS_OK;
+        }
+        return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
+    }
+    return _tn_ctx_fail(ctx, TLS_ERR_PROTOCOL);
+}
+
+# ================================================================
+# Public API
+# ================================================================
+
+# Capability check. Returns 1 if cyrius can complete a TLS handshake
+# (at least one ciphersuite end-to-end wired through encrypt/decrypt).
+# Flipped 0→1 at v6.0.14 with AES-256-GCM-SHA384 + ChaCha20-Poly1305-
+# SHA256 backed by sigil 3.5.6. AES-128-GCM-SHA256 still needs sigil
+# AES-128; lands when that ships (see sigil audit issue 2026-05-28).
+fn tls_native_available(): i64 {
+    return 1;
+}
+
+# Create a client-side context for connecting to `host` (NUL-terminated
+# cstr, used for SNI + hostname verification). `host_len` is the byte
+# length excluding the NUL; pass 0 to derive via strlen.
+# Returns: ctx handle (>0) on success, 0 on OOM. The ctx is NOT yet
+# connected — call tls_native_set_* hooks then tls_native_connect.
+fn tls_native_new_client(host, host_len): i64 {
+    var ctx = _tn_ctx_new(TLS_ROLE_CLIENT);
+    if (ctx == 0) { return 0; }
+    store64(ctx + TLS_CTX_OFF_VERIFY, TLS_VERIFY_PEER);   # clients verify by default
+    if (host != 0) {
+        var hl = host_len;
+        if (hl == 0) { hl = strlen(host); }
+        if (hl > 0) {
+            var hbuf = alloc(hl + 1);
+            if (hbuf == 0) { return 0; }
+            memcpy(hbuf, host, hl);
+            store8(hbuf + hl, 0);
+            store64(ctx + TLS_CTX_OFF_HOST, hbuf);
+            store64(ctx + TLS_CTX_OFF_HOST_LEN, hl);
+        }
+    }
+    return ctx;
+}
+

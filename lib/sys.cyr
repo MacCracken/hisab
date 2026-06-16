@@ -1,0 +1,179 @@
+# lib/sys.cyr — system introspection: uname, sysinfo, root check.
+#
+# Carved off agnosys's src/syscall.cyr (v6.1.28) so system libraries don't each
+# hand-roll the uname/sysinfo struct plumbing. Raw return convention — the
+# syscalls return 0 / -errno, accessors return plain values — matching the
+# lib/syscalls.cyr floor (callers wanting Result wrap at their own layer).
+#
+# Process pid/uid use the floor's raw wrappers directly (sys_getpid / sys_getuid
+# / sys_geteuid in lib/syscalls.cyr) — only `is_root` is provided here since it
+# carries per-target euid-vs-uid logic.
+#
+# Linux + AGNOS are the real targets. uname/sysinfo are Linux-specific syscalls;
+# macOS (sysctl) / Windows (GetVersionEx / GlobalMemoryStatusEx) are not yet
+# wired, so they return -ENOSYS rather than mis-issuing a Linux number.
+# Requires: lib/syscalls.cyr. See CHANGELOG [6.1.28].
+
+include "lib/syscalls.cyr"
+
+# ================================================================
+# uname (utsname)
+# ================================================================
+# Linux utsname: 6 × 65-byte NUL-terminated fields (sysname / nodename / release
+# / version / machine / domainname) = 390 bytes. AGNOS uname#34 is a sovereign
+# 64-byte struct (agnos-userland-abi.md §4.3): four 16-byte NUL-padded fields
+# (sysname / nodename / release / machine — no version/domainname).
+#ifdef CYRIUS_TARGET_AGNOS
+enum SysUtsOffset { UTS_SYSNAME = 0; UTS_NODENAME = 16; UTS_RELEASE = 32; UTS_MACHINE = 48; }
+enum SysUtsConst { UTS_SIZE = 64; }
+#endif
+#ifndef CYRIUS_TARGET_AGNOS
+enum SysUtsOffset { UTS_SYSNAME = 0; UTS_NODENAME = 65; UTS_RELEASE = 130; UTS_VERSION = 195; UTS_MACHINE = 260; }
+enum SysUtsConst { UTS_SIZE = 390; }
+#endif
+
+# Fill a caller-provided utsname buffer (>= UTS_SIZE bytes). Returns 0 / -errno.
+fn sys_uname(out): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(34, out, 64);
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
+    return syscall(SYS_UNAME, out);
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 38;   # ENOSYS — macOS uname is sysctl-based (not yet wired)
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0 - 38;   # ENOSYS — Windows has no uname (GetVersionEx)
+    #endif
+}
+
+# Pointer to the nodename (hostname) field of a filled utsname buffer.
+fn uname_hostname(uts): i64 { return uts + UTS_NODENAME; }
+# Pointer to the kernel-release field of a filled utsname buffer.
+fn uname_release(uts): i64 { return uts + UTS_RELEASE; }
+# Pointer to the machine-architecture field of a filled utsname buffer.
+fn uname_machine(uts): i64 { return uts + UTS_MACHINE; }
+
+# ================================================================
+# sysinfo
+# ================================================================
+# Linux sysinfo (<sys/sysinfo.h>): uptime@0, totalram@32, freeram@40,
+# procs@80 (u16), mem_unit@104 — 112-byte struct, pass a 120-byte buffer.
+# AGNOS sysinfo#35 is a sovereign 40-byte all-u64 struct (agnos-userland-abi.md
+# §4.4): uptime@0, totalram@8, freeram@16, procs@24, cpus@32 (byte counts
+# direct — no mem_unit scaling).
+#ifdef CYRIUS_TARGET_AGNOS
+enum SysInfoOffset { SI_UPTIME = 0; SI_TOTALRAM = 8; SI_FREERAM = 16; SI_PROCS = 24; SI_CPUS = 32; }
+enum SysInfoConst { SYSINFO_SIZE = 40; }
+#endif
+#ifndef CYRIUS_TARGET_AGNOS
+enum SysInfoOffset { SI_UPTIME = 0; SI_TOTALRAM = 32; SI_FREERAM = 40; SI_PROCS = 80; SI_MEM_UNIT = 104; }
+enum SysInfoConst { SYSINFO_SIZE = 120; }
+#endif
+
+# Fill a caller-provided sysinfo buffer (>= SYSINFO_SIZE bytes). Returns 0 / -errno.
+fn sys_sysinfo(out): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return syscall(35, out, 40);
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
+    return syscall(SYS_SYSINFO, out);
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0 - 38;   # ENOSYS — macOS uses sysctl(hw.memsize / kern.boottime)
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0 - 38;   # ENOSYS — Windows uses GlobalMemoryStatusEx / GetTickCount64
+    #endif
+}
+
+# Uptime in seconds from a filled sysinfo buffer.
+fn sysinfo_uptime(info): i64 { return load64(info + SI_UPTIME); }
+
+# Total RAM in bytes. AGNOS reports byte counts directly; Linux scales by
+# mem_unit with a saturating multiply to prevent overflow.
+fn sysinfo_total_memory(info): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return load64(info + SI_TOTALRAM);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var ram = load64(info + SI_TOTALRAM);
+    var unit = load32(info + SI_MEM_UNIT);
+    if (unit == 0) { return ram; }
+    if (unit == 1) { return ram; }
+    if (ram > 0x7FFFFFFFFFFFFFFF / unit) { return 0x7FFFFFFFFFFFFFFF; }
+    return ram * unit;
+    #endif
+}
+
+# Free RAM in bytes (same mem_unit handling as total).
+fn sysinfo_free_memory(info): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return load64(info + SI_FREERAM);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var ram = load64(info + SI_FREERAM);
+    var unit = load32(info + SI_MEM_UNIT);
+    if (unit == 0) { return ram; }
+    if (unit == 1) { return ram; }
+    if (ram > 0x7FFFFFFFFFFFFFFF / unit) { return 0x7FFFFFFFFFFFFFFF; }
+    return ram * unit;
+    #endif
+}
+
+# Number of running processes. AGNOS stores a u64; Linux a u16.
+fn sysinfo_procs(info): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return load64(info + SI_PROCS);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return load16(info + SI_PROCS);
+    #endif
+}
+
+# ================================================================
+# Convenience — one-call introspection (value, or -errno on failure)
+# ================================================================
+fn system_uptime(): i64 {
+    var buf[120];
+    var r = sys_sysinfo(&buf);
+    if (r < 0) { return r; }
+    return sysinfo_uptime(&buf);
+}
+# Total system memory in bytes (one sysinfo call), or -errno on failure.
+fn system_total_memory(): i64 {
+    var buf[120];
+    var r = sys_sysinfo(&buf);
+    if (r < 0) { return r; }
+    return sysinfo_total_memory(&buf);
+}
+# Free system memory in bytes (one sysinfo call), or -errno on failure.
+fn system_free_memory(): i64 {
+    var buf[120];
+    var r = sys_sysinfo(&buf);
+    if (r < 0) { return r; }
+    return sysinfo_free_memory(&buf);
+}
+
+# ================================================================
+# Root check
+# ================================================================
+# Linux: effective uid == 0. AGNOS: uid == 0 (no separate euid concept —
+# capability gates, not euid perms). macOS/Windows: stubbed false.
+fn is_root(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (sys_getuid() == 0) { return 1; }
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
+    if (sys_geteuid() == 0) { return 1; }
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0;
+    #endif
+}

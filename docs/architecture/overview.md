@@ -3,8 +3,8 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v2.5.4 — 34 math modules in `src/`, ~16,500 lines of Cyrius (`lib/` is
-> vendored stdlib + first-party deps only). Compiled by cycc 6.0.14.
+> hisab v2.6.6 — 34 math modules in `src/`, ~16,900 lines of Cyrius (`lib/` is
+> vendored stdlib + first-party deps only). Compiled by cycc 6.2.11.
 
 ## Module Map
 
@@ -72,7 +72,7 @@ hisab (Cyrius)
 |-----------|--------|---------|
 | sakshi | External (git) | Structured logging |
 | alloc, string, fmt, vec, str | Cyrius stdlib | Core data structures |
-| math, matrix, linalg | Cyrius stdlib | f64 ops, dense matrix, decompositions |
+| math, ganita | Cyrius stdlib | `math`: inclusive cmp, clamp/lerp/min/max/sign, polyfills. `ganita` (6.2.x umbrella): transcendentals + dense matrix + decompositions (subsumes the former `matrix`/`linalg`) |
 | tagged, fnptr | Cyrius stdlib | Option/Result types, function pointers |
 | syscalls, io, args | Cyrius stdlib | System interface |
 | assert, bench | Cyrius stdlib | Testing, benchmarking |

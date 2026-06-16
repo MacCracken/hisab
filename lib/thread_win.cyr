@@ -1,0 +1,130 @@
+# thread_win.cyr — Windows (PE) threading: REAL preemptive threads (v6.0.61).
+# Usage: included by lib/thread.cyr under #ifdef CYRIUS_TARGET_WIN.
+# Requires: alloc.cyr, fnptr.cyr.
+#
+# Win32 has no clone/futex; this maps the cyrius thread surface onto kernel32
+# (the PE-internal 0xF00N reroutes — see backend/pe/emit.cyr + backend/x86/emit.cyr):
+#   thread_create → CreateThread (0xF007). The cyrius thread-body fn is a valid
+#     MS-x64 ThreadProc directly — PE arg0 == RCX == lpParameter — so NO trampoline.
+#   thread_join   → WaitForSingleObject(INFINITE) (0xF001) + CloseHandle (syscall 3).
+#   mutex_*       → SRWLOCK: InitializeSRWLock (0xF008) / AcquireSRWLockExclusive
+#     (0xF009) / ReleaseSRWLockExclusive (0xF00A) — an 8-byte in-place lock cell.
+#   chan_*        → a mutex-protected FIFO ring (thread-safe send/recv). recv is
+#     NON-BLOCKING (returns 0 on empty) — a blocking recv needs a condition
+#     variable (SleepConditionVariableSRW), a future upgrade when a consumer
+#     forces it.
+# Supersedes the v6.0.53 serial fallback. See
+# 2026-06-03-windows-threading-stdlib-gap.md + the Windows nuances issue.
+# NOTE: the bump allocator (alloc.cyr) is not itself thread-safe, so thread
+# bodies should avoid concurrent alloc() (same as the Linux thread.cyr model);
+# pass pre-allocated buffers via the arg pointer.
+#
+# The public surface MUST match lib/thread.cyr's so consumers stay
+# target-agnostic: thread_create / thread_join / gettid / mutex_new /
+# mutex_lock / mutex_unlock / chan_new / chan_send / chan_recv /
+# chan_close / chan_try_recv.
+#
+# >>> include "lib/fnptr.cyr"
+include "lib/fnptr.cyr"
+
+# Create a real OS thread: CreateThread(NULL, 0, fp, arg, 0, NULL). fp is the
+# cyrius thread-body fn pointer (&body) — a single-i64-param fn returning i64,
+# which compiled for PE is already a valid MS-x64 ThreadProc (lpParameter arrives
+# in RCX = the cyrius arg0 register). Returns the OS thread HANDLE (0 on failure),
+# matching thread.cyr's "pointer or 0" contract. The 6 CreateThread params are
+# packed into a struct + passed by address (the 0xF007 reroute reads them).
+fn thread_create(fp, arg): i64 {
+    alloc_init();
+    var a = alloc(48);
+    store64(a,      0);    # lpThreadAttributes = NULL
+    store64(a + 8,  0);    # dwStackSize = 0 (default)
+    store64(a + 16, fp);   # lpStartAddress = the cyrius body
+    store64(a + 24, arg);  # lpParameter
+    store64(a + 32, 0);    # dwCreationFlags = 0 (run immediately)
+    store64(a + 40, 0);    # lpThreadId = NULL
+    return syscall(61447, a);   # CreateThread → HANDLE in rax
+}
+
+# Join: WaitForSingleObject(handle, INFINITE) then CloseHandle. Mirrors
+# thread.cyr's returns (-1 on a null handle, 0 on success). INFINITE = 0xFFFFFFFF.
+fn thread_join(t): i64 {
+    if (t == 0) { return 0 - 1; }
+    syscall(61441, t, 4294967295);   # WaitForSingleObject(t, INFINITE)
+    syscall(3, t);                    # CloseHandle(t)
+    return 0;
+}
+
+# Current thread id — the real Win32 GetCurrentThreadId (0xF00B reroute).
+fn gettid(): i64 { return syscall(61451); }
+
+# Mutex = an 8-byte in-place SRWLOCK cell. mutex_new returns a non-zero pointer
+# (callers null-check); InitializeSRWLock sets it to the SRWLOCK_INIT state.
+fn mutex_new(): i64 {
+    alloc_init();
+    var m = alloc(8);
+    store64(m, 0);
+    syscall(61448, m);   # InitializeSRWLock(&m)
+    return m;
+}
+# Lock — real exclusive SRWLOCK acquire (preemptive-safe, blocks contenders).
+fn mutex_lock(m): i64 { syscall(61449, m); return 0; }    # AcquireSRWLockExclusive
+# Unlock — real exclusive SRWLOCK release (pairs with mutex_lock).
+fn mutex_unlock(m): i64 { syscall(61450, m); return 0; }  # ReleaseSRWLockExclusive
+
+# Channel — a thread-safe FIFO ring over the same 56-byte layout as thread.cyr
+# ({buf@0, cap@8, head@16, tail@24, count@32, mutex@40 (inline SRWLOCK), closed@48}).
+# send/recv are SRWLOCK-protected; recv is NON-BLOCKING (0 when empty — a blocking
+# recv needs a condvar, future).
+fn chan_new(cap): i64 {
+    alloc_init();
+    var ch = alloc(56);
+    var buf = alloc(cap * 8);
+    store64(ch, buf);          # buf
+    store64(ch + 8, cap);      # cap
+    store64(ch + 16, 0);       # head
+    store64(ch + 24, 0);       # tail
+    store64(ch + 32, 0);       # count
+    store64(ch + 40, 0);       # mutex (inline SRWLOCK)
+    syscall(61448, ch + 40);   # InitializeSRWLock(&mutex)
+    store64(ch + 48, 0);       # closed
+    return ch;
+}
+# Enqueue val (FIFO ring). Returns 0, or -1 if the channel is full.
+fn chan_send(ch, val): i64 {
+    syscall(61449, ch + 40);   # AcquireSRWLockExclusive
+    var cap = load64(ch + 8);
+    var count = load64(ch + 32);
+    if (count >= cap) { syscall(61450, ch + 40); return 0 - 1; }
+    var buf = load64(ch);
+    var tail = load64(ch + 24);
+    store64(buf + tail * 8, val);
+    store64(ch + 24, (tail + 1) % cap);
+    store64(ch + 32, count + 1);
+    syscall(61450, ch + 40);   # ReleaseSRWLockExclusive
+    return 0;
+}
+# Dequeue the oldest value (FIFO), or 0 if empty (never blocks).
+fn chan_try_recv(ch): i64 {
+    syscall(61449, ch + 40);
+    var count = load64(ch + 32);
+    if (count == 0) { syscall(61450, ch + 40); return 0; }
+    var buf = load64(ch);
+    var cap = load64(ch + 8);
+    var head = load64(ch + 16);
+    var val = load64(buf + head * 8);
+    store64(ch + 16, (head + 1) % cap);
+    store64(ch + 32, count - 1);
+    syscall(61450, ch + 40);
+    return val;
+}
+# recv is non-blocking here (no condvar yet); identical to try_recv.
+fn chan_recv(ch): i64 {
+    return chan_try_recv(ch);
+}
+# Mark the channel closed.
+fn chan_close(ch): i64 {
+    syscall(61449, ch + 40);
+    store64(ch + 48, 1);
+    syscall(61450, ch + 40);
+    return 0;
+}

@@ -1,0 +1,129 @@
+# thread_agnos.cyr — AGNOS (ring-3) threading: single-threaded SERIAL fallback.
+# Usage: included by lib/thread.cyr under #ifdef CYRIUS_TARGET_AGNOS.
+# Requires: alloc.cyr, fnptr.cyr, syscalls.cyr (sys_getpid).
+#
+# AGNOS's frozen syscall surface has no clone/futex — it's the cooperative-iron
+# single-core model (true preemptive threads wait on the 1.46.x kstacks). So
+# cyrius threads run SERIALLY here, mirroring the v6.0.53 Windows serial
+# fallback (later superseded by real Win32 threads) and the macOS
+# single-threaded thread_local model: thread_create runs the body INLINE and
+# returns before join; mutexes are no-ops (no contention on one thread);
+# channels are a plain FIFO ring (no lock). Consumers that use threads only for
+# throughput — sigil's crypto batch workers each write to a distinct "bank"
+# (bank 0 = main thread) — get CORRECT results, just unparallelized.
+#
+# The public surface MUST match lib/thread.cyr's so consumers stay
+# target-agnostic: thread_create / thread_join / gettid / mutex_new /
+# mutex_lock / mutex_unlock / chan_new / chan_send / chan_recv / chan_close /
+# chan_try_recv.
+#
+# >>> include "lib/fnptr.cyr"
+include "lib/fnptr.cyr"
+# thread_local.cyr supplies thread_local_get/set + TLOCAL_MAX_SLOTS (16), used
+# by thread_create below to emulate per-thread TLS isolation. On a real system
+# thread creation and TLS setup are coupled (thread.cyr's _thread_spawn uses
+# CLONE_SETTLS to give the child a fresh block), so this dependency mirrors the
+# real path. include-once dedupes if the consumer already pulled it.
+include "lib/thread_local.cyr"
+
+# Run the thread body INLINE (serial — there is no second thread). fp is a
+# single-i64-param fn ptr; its result is discarded, matching the spawn-and-join
+# throughput model (workers communicate via shared memory, not the join value).
+#
+# TLS isolation: a REAL spawned thread gets a FRESH, zeroed thread-local block
+# (CLONE_SETTLS), so its thread_local_set writes never leak back into the
+# parent. The serial path shares one process-global TLS array, so we emulate
+# that contract — snapshot the caller's slots, hand the body a zeroed view, run
+# it, then restore. Without this the body's thread-local writes (e.g. sigil's
+# crypto_bank_set(worker_bank)) would persist past join and corrupt the main
+# thread's invariant (cbank()==0 on the main/serial path) — a latent
+# wrong-scratch-lane bug for any crypto run on main after a batch fans out.
+# Returns a fake non-zero handle so callers' null-checks pass + join is valid.
+fn thread_create(fp, arg): i64 {
+    var save: i64[16];    # TLOCAL_MAX_SLOTS slots
+    var i = 0;
+    while (i < 16) {
+        store64(&save + i * 8, thread_local_get(i));
+        thread_local_set(i, 0);
+        i = i + 1;
+    }
+    fncall1(fp, arg);
+    i = 0;
+    while (i < 16) {
+        thread_local_set(i, load64(&save + i * 8));
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Join is a no-op — the body already ran inline at thread_create. Mirrors
+# thread.cyr's contract (-1 on a null handle, 0 on success).
+fn thread_join(t): i64 {
+    if (t == 0) { return 0 - 1; }
+    return 0;
+}
+
+# Current thread id — the (single) process id on agnos.
+fn gettid(): i64 { return sys_getpid(); }
+
+# Mutex = an 8-byte cell (callers null-check the returned ptr). Single-threaded,
+# so lock/unlock are no-ops — there is never a contender.
+fn mutex_new(): i64 {
+    alloc_init();
+    var m = alloc(8);
+    if (m == 0) { return 0; }
+    store64(m, 0);
+    return m;
+}
+# Acquire — no-op on the single-threaded agnos path (no contender exists).
+fn mutex_lock(m): i64 { return 0; }
+# Release — pairs with mutex_lock; no-op (single-threaded).
+fn mutex_unlock(m): i64 { return 0; }
+
+# Channel — a plain FIFO ring (single-threaded → no lock needed). Same 56-byte
+# layout as thread.cyr / thread_win.cyr ({buf@0, cap@8, head@16, tail@24,
+# count@32, _@40, closed@48}); recv is non-blocking (0 when empty).
+fn chan_new(cap): i64 {
+    alloc_init();
+    var ch = alloc(56);
+    if (ch == 0) { return 0; }
+    var buf = alloc(cap * 8);
+    store64(ch, buf);          # buf
+    store64(ch + 8, cap);      # cap
+    store64(ch + 16, 0);       # head
+    store64(ch + 24, 0);       # tail
+    store64(ch + 32, 0);       # count
+    store64(ch + 40, 0);       # (unused — no lock on the serial path)
+    store64(ch + 48, 0);       # closed
+    return ch;
+}
+# Enqueue val (FIFO ring). Returns 0, or -1 if the channel is full.
+fn chan_send(ch, val): i64 {
+    var cap = load64(ch + 8);
+    var count = load64(ch + 32);
+    if (count >= cap) { return 0 - 1; }
+    var buf = load64(ch);
+    var tail = load64(ch + 24);
+    store64(buf + tail * 8, val);
+    store64(ch + 24, (tail + 1) % cap);
+    store64(ch + 32, count + 1);
+    return 0;
+}
+# Dequeue the oldest value (FIFO), or 0 if empty (never blocks — a blocking
+# recv would deadlock on a single thread with no concurrent sender).
+fn chan_try_recv(ch): i64 {
+    var count = load64(ch + 32);
+    if (count == 0) { return 0; }
+    var buf = load64(ch);
+    var cap = load64(ch + 8);
+    var head = load64(ch + 16);
+    var val = load64(buf + head * 8);
+    store64(ch + 16, (head + 1) % cap);
+    store64(ch + 32, count - 1);
+    return val;
+}
+# recv is non-blocking here (serial path — a blocking recv would deadlock
+# with no concurrent sender); identical to try_recv.
+fn chan_recv(ch): i64 { return chan_try_recv(ch); }
+# Mark the channel closed.
+fn chan_close(ch): i64 { store64(ch + 48, 1); return 0; }

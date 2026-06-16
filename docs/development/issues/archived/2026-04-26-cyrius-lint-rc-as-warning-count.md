@@ -5,7 +5,7 @@
 **Severity:** CI ergonomics — masks which file tripped the gate
 **Hisab impact:** First saw it as `Error: Process completed with exit code 6.` in CI with no file context. The captured-but-unprinted lint output contained 6 "multiple consecutive blank lines" warnings on `tests/modules.tcyr`.
 **Hisab workaround:** CI lint loop uses `set +e` and per-file rc capture, then emits `::error file=$f::cyrius lint failed (rc=$rc)` annotations so the GHA UI shows which file is broken. See `.github/workflows/ci.yml` `Lint` step.
-**Status:** Open — the rc-as-warning-count behavior is useful in some scripts but should probably be opt-in.
+**Status:** ✅ **RESOLVED on cyrius 6.2.11** (re-verified 2026-06-15 during the 6.0.14→6.2.11 bump). `cyrius lint` on a file with 2 "multiple consecutive blank lines" warnings now exits **0** while still printing the per-warning `  warn line N: …` lines and a `2 warnings` summary — rc is no longer the warning count. The CI `Lint` step's dual check (`rc != 0` **OR** `grep -qE '^\s*warn '` on stdout) still gates correctly: the stdout grep is now the load-bearing condition. The stale "returns the warning count as its exit code" comment in `.github/workflows/ci.yml` should be refreshed opportunistically. Archived.
 
 ## Symptom
 

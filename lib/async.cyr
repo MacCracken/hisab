@@ -12,6 +12,26 @@
 #   async_run(rt);  # blocks until all tasks complete
 #
 # Tasks can yield via async_sleep or async_await_fd.
+#
+# Cancellation tokens (v5.11.15) — load-bearing for bote streaming
+# dispatch: handler polls `cancel_token_check(tok)` between progress
+# emissions; transport thread sets via `cancel_token_signal(tok)` on
+# $/cancelRequest. Backed by atomic_load/store from lib/atomic.cyr —
+# no busy-wait; the handler explicitly observes the flag on each
+# iteration. Pair with `chan_try_recv` (lib/thread.cyr) for the
+# progress channel side. See CHANGELOG [5.11.15].
+
+# v6.2.7: AGNOS has no epoll_create1 / fcntl / clone-fork / wait4 in its frozen
+# syscall surface, and async is a SERVER-path runtime unused on the agnos
+# CLIENT target (inbound TCP is AGNOS Phase B; sit is a client). Route to a
+# serial/blocking peer, exactly as thread.cyr → thread_agnos.cyr (v6.2.3). The
+# cancel-token API at the bottom stays SHARED (atomic-only, portable). Resolves
+# docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md §2.
+#ifdef CYRIUS_TARGET_AGNOS
+include "lib/async_agnos.cyr"
+#endif
+
+#ifndef CYRIUS_TARGET_AGNOS
 
 # Task states
 var TASK_READY = 0;
@@ -21,24 +41,49 @@ var TASK_DONE = 2;
 # Task struct: { fp, arg, state, next } = 32 bytes
 var TASK_SIZE = 32;
 
-# Runtime struct: { epfd, tasks, task_count, active } = 32 bytes
-var RT_SIZE = 32;
+# Runtime struct: { epfd, tasks, task_count, active, allocator } = 40 bytes.
+# v6.1.22 — +allocator slot @32: async_new_in threads a caller-owned Allocator
+# so the rt AND its spawned task structs come from it. A long-running batched
+# accept loop (daimon serve_async, sandhi sandhi_server_run_async) recreates the
+# runtime each batch (async_run closes its epfd → single-use); with the global
+# bump (no free) that leaked ~32 B/task + 32 B/batch forever. Passing an
+# arena_allocator + reset_via(a) per batch reclaims it. See
+# docs/development/issues/2026-06-09-async-runtime-no-free-task-leak.md.
+var RT_SIZE = 40;
 
-# Create a new async runtime with epoll
-fn async_new() {
-    alloc_init();
-    var rt = alloc(RT_SIZE);
+# Create a new async runtime whose rt + every async_spawn task struct are
+# allocated from `a` — an Allocator from lib/alloc.cyr (bump_allocator /
+# arena_allocator / default_alloc). For a long-running batched loop, pass an
+# arena_allocator and reset_via(a) after each async_run to reclaim that batch's
+# runtime + tasks with zero residual leak (the global bump has no free). v6.1.22.
+fn async_new_in(a): i64 {
+    var rt = alloc_via(a, RT_SIZE);
+    if (rt == 0) { return 0; }
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
     store64(rt, epfd);
     store64(rt + 8, 0);
     store64(rt + 16, 0);
     store64(rt + 24, 0);
+    store64(rt + 32, a);
     return rt;
 }
 
+# Create a new async runtime with epoll, backed by the global bump allocator
+# (back-compat — wraps async_new_in(default_alloc())). Consumer: daimon
+# (src/main.cyr) — the cooperative multitasking event loop kybernet sd_notify +
+# bote streaming dispatch both delegate to. NOTE: the global bump has no free,
+# so a loop that recreates the runtime per batch leaks; use
+# async_new_in(arena_allocator(...)) + reset_via for a zero-leak server.
+fn async_new(): i64 {
+    return async_new_in(default_alloc());
+}
+
 # Spawn a task on the runtime. fp is a function pointer, arg is its argument.
-fn async_spawn(rt, fp, arg) {
-    var t = alloc(TASK_SIZE);
+# The task struct comes from the runtime's allocator (set by async_new_in),
+# so an arena-backed runtime keeps spawned tasks out of the global bump.
+fn async_spawn(rt, fp, arg): i64 {
+    var t = alloc_via(load64(rt + 32), TASK_SIZE);
+    if (t == 0) { return 0; }
     store64(t, fp);
     store64(t + 8, arg);
     store64(t + 16, TASK_READY);
@@ -51,7 +96,7 @@ fn async_spawn(rt, fp, arg) {
 
 # Run all spawned tasks to completion.
 # Tasks run cooperatively — each task runs to completion or yield.
-fn async_run(rt) {
+fn async_run(rt): i64 {
     var go = 1;
     while (go == 1) {
         var active = 0;
@@ -77,7 +122,7 @@ fn async_run(rt) {
 }
 
 # Timer: sleep for ms milliseconds using timerfd + epoll
-fn async_sleep_ms(ms) {
+fn async_sleep_ms(ms): i64 {
     var tfd = syscall(SYS_TIMERFD_CREATE, 1, 0);
     if (tfd < 0) { return 0 - 1; }
     # itimerspec: { interval_sec, interval_nsec, value_sec, value_nsec }
@@ -95,7 +140,7 @@ fn async_sleep_ms(ms) {
 }
 
 # Non-blocking read: set fd non-blocking, try read, restore
-fn async_read(fd, buf, len) {
+fn async_read(fd, buf, len): i64 {
     # Set O_NONBLOCK (0x800) via fcntl
     var flags = syscall(SYS_FCNTL, fd, 3, 0);
     syscall(SYS_FCNTL, fd, 4, flags | 2048);
@@ -106,7 +151,7 @@ fn async_read(fd, buf, len) {
 }
 
 # Wait for fd to be readable using epoll (blocks efficiently)
-fn async_await_readable(fd) {
+fn async_await_readable(fd): i64 {
     var epfd = syscall(SYS_EPOLL_CREATE1, 0);
     # epoll_event: { events: u32, data: u64 } = 12 bytes (padded to 16)
     var ev[16];
@@ -114,19 +159,19 @@ fn async_await_readable(fd) {
     store64(&ev + 4, fd);
     syscall(SYS_EPOLL_CTL, epfd, 1, fd, &ev);
     var revents[16];
-    syscall(SYS_EPOLL_WAIT, epfd, &revents, 1, 0 - 1);
+    sys_epoll_wait(epfd, &revents, 1, 0 - 1);
     syscall(SYS_CLOSE, epfd);
     return 0;
 }
 
 # Run a function with a timeout (ms). Returns function result or -1 on timeout.
 # Uses fork: child runs fn, parent waits with timeout.
-fn async_timeout(fp, arg, ms) {
+fn async_timeout(fp, arg, ms): i64 {
     var pipefd[16];
-    syscall(SYS_PIPE, &pipefd);
+    sys_pipe(&pipefd);
     var rfd = load32(&pipefd);
     var wfd = load32(&pipefd + 4);
-    var pid = syscall(SYS_FORK);
+    var pid = sys_fork();
     if (pid == 0) {
         syscall(SYS_CLOSE, rfd);
         var result = fncall1(fp, arg);
@@ -142,7 +187,7 @@ fn async_timeout(fp, arg, ms) {
     store64(&ev + 4, rfd);
     syscall(SYS_EPOLL_CTL, epfd, 1, rfd, &ev);
     var revents[16];
-    var nr = syscall(SYS_EPOLL_WAIT, epfd, &revents, 1, ms);
+    var nr = sys_epoll_wait(epfd, &revents, 1, ms);
     syscall(SYS_CLOSE, epfd);
     if (nr > 0) {
         # Child finished in time
@@ -157,4 +202,55 @@ fn async_timeout(fp, arg, ms) {
     syscall(SYS_WAIT4, pid, 0, 0, 0);
     syscall(SYS_CLOSE, rfd);
     return 0 - 1;
+}
+
+#endif
+
+# ================================================================
+# Cancellation tokens (v5.11.15) — SHARED across all targets (atomic-only,
+# portable; no epoll/fork). Defined OUTSIDE the agnos guard so bote/sandhi
+# streaming-dispatch cancellation works on AGNOS too.
+# ================================================================
+# Minimum viable shape for the bote streaming-dispatch flow:
+#   transport thread:
+#       var tok = cancel_token_new();
+#       # ... pass tok to worker, dispatch_streaming(handler, tok) ...
+#       # ... later, on $/cancelRequest from client:
+#       cancel_token_signal(tok);
+#
+#   worker (handler) thread:
+#       while (more_work) {
+#           if (cancel_token_check(tok) == 1) { cleanup(); return; }
+#           emit_progress(...);
+#           do_work_chunk();
+#       }
+#
+# A token is a single 8-byte heap slot holding 0 (not cancelled) or
+# 1 (cancelled). Writes go through atomic_store, reads through
+# atomic_load (aligned i64 ops are atomic on both x86_64 and aarch64;
+# explicit API documents intent). No busy-wait; the worker chooses
+# its own polling cadence between work chunks.
+
+include "lib/atomic.cyr"
+
+# Create a fresh cancellation token (0 = not cancelled).
+fn cancel_token_new(): i64 {
+    var tok = alloc(8);
+    if (tok == 0) { return 0; }
+    atomic_store(tok, 0);
+    return tok;
+}
+
+# Signal cancellation. Idempotent — safe to call multiple times.
+# Returns 0 on success.
+fn cancel_token_signal(tok): i64 {
+    if (tok == 0) { return 0 - 1; }
+    atomic_store(tok, 1);
+    return 0;
+}
+
+# Read the token. Returns 1 if cancelled, 0 if still live.
+fn cancel_token_check(tok): i64 {
+    if (tok == 0) { return 0; }
+    return atomic_load(tok);
 }

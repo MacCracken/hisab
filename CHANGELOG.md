@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+## [2.6.6] - 2026-06-15 — Cyrius 6.2.11 toolchain bump + stdlib math reorg
+
+Toolchain upgrade from **6.0.14 → 6.2.11**. The 6.2.x stdlib reorganised its
+math surface: the transcendental functions moved out of `math` into a new
+**`ganita`** umbrella module, and `ganita` now subsumes the `matrix` and
+`linalg` modules entirely (re-exporting their full public API). The library
+source needed two adjustments; all 957 tests pass and every cleanliness gate
+is green on the new pin.
+
+### Breaking
+- **Consumer dependency change.** Consumers pulling `dist/hisab.cyr` must update
+  their `[deps] stdlib` list: **add `"ganita"`** (the bundle now references
+  `f64_acos`/`f64_pow`/`f64_atan2`/`f64_cosh`/`f64_sinh` and the hyperbolic
+  inverses, which live in `ganita`) and **remove `"matrix"` and `"linalg"`**
+  (subsumed by `ganita` — keeping them alongside `ganita` triggers
+  duplicate-definition collisions). Keep `"math"` — it still uniquely provides
+  `f64_le`/`f64_ge`/`f64_clamp`/`f64_lerp`/`f64_min`/`f64_max`/`f64_sign`/
+  `f64_trunc`/`f64_parse`/`gcd`/`lcm` and the exp/ln polyfills.
+  Migration: `["…", "math", "matrix", "linalg", …]` → `["…", "math", "ganita", …]`.
+
+### Changed
+- **`cyrius.cyml`** — toolchain pin `6.0.14` → `6.2.11`; `[deps] stdlib` adds
+  `ganita`, drops `matrix` and `linalg` (now provided by `ganita`).
+- **`src/f64_util.cyr`** — removed the local `f64_le`/`f64_ge` definitions. The
+  stdlib `math` module now ships them (NaN-correct: a NaN operand yields 0 for
+  all of `f64_lt`/`f64_gt`/`f64_eq`, so the inclusive forms correctly return 0),
+  superseding hisab's negation-based versions. `f64_tan`/`f64_fmod`/
+  `f64_copysign`/`f64_approx_eq` stay local (still absent from stdlib).
+- **Vendored stdlib** — `lib/*.cyr` resynced to the 6.2.11 snapshot
+  (`cyrius lib sync`); `cyrius.lock` re-resolved (111 deps).
+- **`dist/hisab.cyr`** — regenerated via `cyrius distlib` (header now v2.6.6).
+
+### Fixed
+- **Tracked toolchain issues re-verified on 6.2.11** (doc-health mandate at each
+  pin bump): **3 of 5 now fixed upstream** —
+  `cbt` `[build]`-comment `modules` substring false-positive,
+  the cc5 18-arg-fn register/stack scramble (Perlin `_perm_init` corruptor),
+  and `cyrius lint` returning the warning count as its exit code (now returns 0;
+  the CI `^\s*warn ` stdout grep remains the load-bearing warning gate). Archived
+  to `docs/development/issues/archived/`. Still open: the C-style
+  `for (;cond;)` empty-clause parse error (workaround: `while`). The CLI
+  unknown-flag-clobbers-source issue was not re-tested (destructive).
+
 ## [2.6.5] - 2026-05-30 — 2.6.x closeout: P(-1) / security audit + diffgeo equation reference
 
 Closeout pass for the 2.6.x differential-geometry arc — P(-1) cleanliness, a

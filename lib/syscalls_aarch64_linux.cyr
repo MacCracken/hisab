@@ -48,7 +48,14 @@ enum SysNr {
 
     # At-family (aarch64 has no bare open/stat/mkdir/etc.)
     SYS_OPENAT = 56;        # → sys_open  (AT_FDCWD)
-    SYS_NEWFSTATAT = 79;    # → sys_stat  (AT_FDCWD) and sys_fstat (AT_EMPTY_PATH)
+    # v6.1.3: newfstatat uses the X86 number 262 (not the aarch64-native 79),
+    # renumbered 262→79 by ESYSXLAT. The aarch64-native 79 COLLIDES with
+    # ESYSXLAT's x86 getcwd(79→17) entry (cbt issues raw x86 getcwd(79)), so a
+    # stdlib `syscall(79,...)` was wrongly remapped to getcwd → -EFAULT. This
+    # was a SILENT sys_stat break on native aarch64 since v6.0.41. x86 newfstatat
+    # (262) and aarch64 newfstatat (79) have identical arg layouts, so the
+    # ESYSXLAT 262→79 entry is a pure renumber. See CHANGELOG [6.1.3].
+    SYS_NEWFSTATAT = 262;   # x86 newfstatat → ESYSXLAT 262→79 (collision-free)
     SYS_FSTAT = 80;         # bare fstat exists; takes fd
     SYS_MKDIRAT = 34;       # → sys_mkdir (AT_FDCWD)
     SYS_UNLINKAT = 35;      # → sys_rmdir (AT_REMOVEDIR) and sys_unlink
@@ -56,6 +63,14 @@ enum SysNr {
     SYS_READLINKAT = 78;    # → sys_readlink (AT_FDCWD)
     SYS_FCHMODAT = 53;      # → sys_chmod (AT_FDCWD)
     SYS_FACCESSAT = 48;     # → sys_access (AT_FDCWD)
+    # v6.1.3 — at-family peers missing until now (kriya M2). linkat(37) +
+    # renameat(38) are aarch64-native (no ESYSXLAT collision → pass through).
+    SYS_LINKAT = 37;        # → sys_link (AT_FDCWD, flags=0)
+    SYS_RENAMEAT = 38;      # → sys_rename (AT_FDCWD)
+    # utimensat uses the X86 number 280 (not aarch64-native 88), renumbered
+    # 280→88 by ESYSXLAT — the aarch64-native 88 COLLIDES with ESYSXLAT's
+    # x86 symlink(88→36) entry. Same class as newfstatat above.
+    SYS_UTIMENSAT = 280;    # x86 utimensat → ESYSXLAT 280→88 (collision-free)
     SYS_PIPE2 = 59;         # → sys_pipe (flags=0)
     SYS_PPOLL = 73;         # → sys_pause (NULL fds, NULL timeout)
 
@@ -84,6 +99,8 @@ enum SysNr {
     SYS_SETUID = 146;
     SYS_SETGID = 144;
     SYS_SETGROUPS = 159;
+    SYS_SETRESUID = 147;
+    SYS_SETRESGID = 149;
 
     # Memory
     SYS_BRK = 214;
@@ -96,6 +113,7 @@ enum SysNr {
     SYS_SYNC = 81;
     SYS_REBOOT = 142;
     SYS_UNAME = 160;
+    SYS_SYSINFO = 179;
 
     # Signals + sync primitives
     SYS_RT_SIGPROCMASK = 135;
@@ -120,18 +138,33 @@ enum SysNr {
     # v5.7.35 (agnosys-surfaced — drm/luks/security)
     SYS_GETDENTS64 = 61;
     SYS_GETRANDOM = 278;
+    # v5.11.0 (kavach-surfaced — sandbox post-fork hardening)
+    SYS_FCHMOD = 52;
+    SYS_PRCTL = 167;
+    SYS_SECCOMP = 277;
+    SYS_EXECVEAT = 281;
     SYS_LANDLOCK_CREATE_RULESET = 444;
     SYS_LANDLOCK_ADD_RULE = 445;
     SYS_LANDLOCK_RESTRICT_SELF = 446;
+    # v5.11.18 (kybernet 1.1.5-surfaced — sd_notify dgram + supervisor IPC).
+    # Wrappers exist to prevent silent aarch64 syscall-number misroute when
+    # consumers hardcode x86_64 numbers. See CHANGELOG [5.11.18].
+    SYS_SOCKET = 198;
+    SYS_SOCKETPAIR = 199;
+    SYS_SETSOCKOPT = 208;
+    SYS_BIND = 200;
+    SYS_LISTEN = 201;
+    SYS_CONNECT = 203;
+    SYS_RECVFROM = 207;
+    SYS_RECVMSG = 212;
+    SYS_ACCEPT4 = 242;
 }
 
-# AT_FDCWD = special "current working directory" fd for at-family
-# syscalls. Defined as -100 on every Linux arch; wrappers below
-# pass this so consumer-facing semantics match the x86_64
+# AT_FDCWD / AT_EMPTY_PATH / AT_REMOVEDIR (+ AT_SYMLINK_* / UTIME_*) are
+# defined once in lib/syscalls_linux_common.cyr (included below) as of
+# v6.1.3 — they were aarch64-peer-only before. The at-family wrappers
+# below pass AT_FDCWD so consumer-facing semantics match the x86_64
 # `sys_open(path, flags, mode)` etc. calling convention.
-var AT_FDCWD = 0 - 100;
-var AT_EMPTY_PATH = 4096;       # 0x1000 — for fstatat(fd, "", ..., AT_EMPTY_PATH)
-var AT_REMOVEDIR = 512;         # 0x200  — for unlinkat used as rmdir
 
 # ================================================================
 # Clone flags (cross-arch identical — same as x86_64 peer)
@@ -173,6 +206,27 @@ enum FutexOp {
 # Open flags (cross-arch identical — values from
 # asm-generic/fcntl.h, which aarch64 uses unmodified)
 # ================================================================
+# O_* flag VALUES differ between Linux and macOS/BSD (the access-mode low
+# bits 0/1/2 match, but CREAT/EXCL/TRUNC/APPEND/etc. don't). This file is
+# included for BOTH Linux-aarch64 AND macho-arm (lib/syscalls.cyr dispatch
+# + ESYSXLAT translating the call numbers), so the constants must match the
+# RUNTIME OS. Without this, a macho tool/wrapper opening O_CREAT|O_TRUNC
+# passes Linux bits to BSD open → wrong flags → file not created (v6.0.34
+# "cyrius build … FAIL", cyrfmt --write). See CHANGELOG.
+#ifdef CYRIUS_TARGET_MACOS
+enum OpenFlag {
+    O_RDONLY = 0;
+    O_WRONLY = 1;
+    O_RDWR = 2;
+    O_CREAT = 0x200;
+    O_EXCL = 0x800;
+    O_TRUNC = 0x400;
+    O_APPEND = 0x8;
+    O_NONBLOCK = 0x4;
+    O_CLOEXEC = 0x1000000;
+}
+#endif
+#ifdef CYRIUS_TARGET_LINUX
 enum OpenFlag {
     O_RDONLY = 0;
     O_WRONLY = 1;
@@ -184,6 +238,7 @@ enum OpenFlag {
     O_NONBLOCK = 2048;
     O_CLOEXEC = 524288;
 }
+#endif
 
 # ================================================================
 # Signals (cross-arch identical — asm-generic/signal.h)
@@ -307,6 +362,29 @@ var LINUX_REBOOT_MAGIC2 = 672274793;
 # ...
 # Total = 128 bytes; we use STAT_BUFSZ = 144 (= max of both arches)
 # so consumer alloc/var sites stay arch-clean.
+#
+# This file is included for BOTH aarch64-Linux AND macho-arm (arm64-macOS); the
+# ESYSXLAT macho branch renumbers newfstatat(262)→Darwin fstatat64(470), which
+# fills a Darwin `struct stat64` whose field offsets differ from the Linux
+# generic-stat layout. So the Stat enum is per-OS (mirrors the OpenFlag split
+# above). Darwin arm64 offsets EMPIRICALLY verified on ecb (v6.1.20):
+# st_mode@4, st_size@96, st_mtimespec@48 (sec) / @56 (nsec). Note these differ
+# from x86-macOS's legacy-stat layout in syscalls_macos.cyr (st_size@72) — the
+# arm64 fstatat64 struct is the modern stat64 with birthtimespec.
+# See issues/2026-06-08-macho-arm-at-family-darwin-syscall-mappings.md.
+#ifdef CYRIUS_TARGET_MACOS
+enum Stat {
+    STAT_MODE = 4;
+    STAT_NLINK = 6;
+    STAT_UID = 16;
+    STAT_GID = 20;
+    STAT_SIZE = 96;
+    STAT_MTIME = 48;
+    STAT_MTIME_NSEC = 56;
+    STAT_BUFSZ = 144;
+}
+#endif
+#ifdef CYRIUS_TARGET_LINUX
 enum Stat {
     STAT_MODE = 16;
     STAT_NLINK = 20;
@@ -317,73 +395,76 @@ enum Stat {
     STAT_MTIME_NSEC = 96;
     STAT_BUFSZ = 144;
 }
+#endif
 
 # ================================================================
 # Syscall wrappers
 # ================================================================
 
+# Body-identical wrappers shared with the x86_64 peer live in
+# lib/syscalls_linux_common.cyr (~46 wrappers extracted v5.11.20).
+# This peer keeps only aarch64-specific at-family wrappers below.
+
+include "lib/syscalls_linux_common.cyr"
+
 # File operations — all routed through at-family equivalents.
 
 # Open a file. Translates to openat(AT_FDCWD, path, flags, mode).
-fn sys_open(path, flags, mode) {
+fn sys_open(path, flags, mode): i64 {
     return syscall(SYS_OPENAT, AT_FDCWD, path, flags, mode);
-}
-
-# Close a file descriptor.
-fn sys_close(fd) {
-    return syscall(SYS_CLOSE, fd);
-}
-
-# Read bytes from fd into buffer. Returns bytes read.
-fn sys_read(fd, buf, count) {
-    return syscall(SYS_READ, fd, buf, count);
-}
-
-# Write bytes from buffer to fd. Returns bytes written.
-fn sys_write(fd, buf, count) {
-    return syscall(SYS_WRITE, fd, buf, count);
 }
 
 # stat(2) equivalent — newfstatat(AT_FDCWD, path, buf, 0).
 # Buffer must be STAT_BUFSZ (= 144) bytes; aarch64 only writes
 # 128 of them but consumers shouldn't have to know that.
-fn sys_stat(path, buf) {
+fn sys_stat(path, buf): i64 {
     return syscall(SYS_NEWFSTATAT, AT_FDCWD, path, buf, 0);
 }
 
-# fstat(2) equivalent — bare SYS_FSTAT exists on aarch64 (= 80).
-fn sys_fstat(fd, buf) {
-    return syscall(SYS_FSTAT, fd, buf);
-}
-
 # Duplicate fd oldfd to newfd. Translates to dup3(oldfd, newfd, 0).
-fn sys_dup2(oldfd, newfd) {
+fn sys_dup2(oldfd, newfd): i64 {
     return syscall(SYS_DUP3, oldfd, newfd, 0);
 }
 
 # Create a directory at path with given mode.
 # Translates to mkdirat(AT_FDCWD, path, mode).
-fn sys_mkdir(path, mode) {
+fn sys_mkdir(path, mode): i64 {
     return syscall(SYS_MKDIRAT, AT_FDCWD, path, mode);
 }
 
 # Remove an empty directory.
 # Translates to unlinkat(AT_FDCWD, path, AT_REMOVEDIR).
-fn sys_rmdir(path) {
+fn sys_rmdir(path): i64 {
     return syscall(SYS_UNLINKAT, AT_FDCWD, path, AT_REMOVEDIR);
 }
 
 # Delete a file.
 # Translates to unlinkat(AT_FDCWD, path, 0).
-fn sys_unlink(path) {
+fn sys_unlink(path): i64 {
     return syscall(SYS_UNLINKAT, AT_FDCWD, path, 0);
 }
 
 # Create a symbolic link at `linkpath` pointing to `target`.
 # Translates to symlinkat(target, AT_FDCWD, linkpath).
 # Returns 0 on success, negative errno on failure.
-fn sys_symlink(target, linkpath) {
+fn sys_symlink(target, linkpath): i64 {
     return syscall(SYS_SYMLINKAT, target, AT_FDCWD, linkpath);
+}
+
+# v6.1.3 — bare-name fs peers routed through the at-family (aarch64
+# dropped the bare link/lstat/rename syscalls). sys_link uses flags=0
+# to match POSIX link(2)'s no-follow default; sys_lstat sets
+# AT_SYMLINK_NOFOLLOW so it does NOT follow a trailing symlink.
+fn sys_link(oldpath, newpath): i64 {
+    return sys_linkat(AT_FDCWD, oldpath, AT_FDCWD, newpath, 0);
+}
+# lstat(path, buf) — stat that does NOT follow a trailing symlink (via fstatat).
+fn sys_lstat(path, buf): i64 {
+    return sys_fstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
+}
+# rename(oldpath, newpath) — single-filesystem rename/move (via renameat).
+fn sys_rename(oldpath, newpath): i64 {
+    return sys_renameat(AT_FDCWD, oldpath, AT_FDCWD, newpath);
 }
 
 # Read the target of a symbolic link into `buf` (cap `bufsize`).
@@ -391,19 +472,19 @@ fn sys_symlink(target, linkpath) {
 # Returns the number of bytes placed in buf (no null terminator),
 # or negative errno on failure. Buf is NOT null-terminated by the
 # kernel — caller must store0 if used as a cstring.
-fn sys_readlink(path, buf, bufsize) {
+fn sys_readlink(path, buf, bufsize): i64 {
     return syscall(SYS_READLINKAT, AT_FDCWD, path, buf, bufsize);
 }
 
 # Change file permissions.
 # Translates to fchmodat(AT_FDCWD, path, mode, 0).
-fn sys_chmod(path, mode) {
+fn sys_chmod(path, mode): i64 {
     return syscall(SYS_FCHMODAT, AT_FDCWD, path, mode, 0);
 }
 
 # Check file access permissions.
 # Translates to faccessat(AT_FDCWD, path, mode).
-fn sys_access(path, mode) {
+fn sys_access(path, mode): i64 {
     return syscall(SYS_FACCESSAT, AT_FDCWD, path, mode);
 }
 
@@ -415,131 +496,42 @@ fn sys_access(path, mode) {
 # files, signal handlers, etc. — POSIX-fork semantics. Verified:
 # the proposal originally suggested `CLONE_CHILD|SIGCHLD`, but
 # `CLONE_CHILD` isn't a real Linux clone flag.
-fn sys_fork() {
+fn sys_fork(): i64 {
     return syscall(SYS_CLONE, SIGCHLD, 0, 0, 0, 0);
-}
-
-# Terminate process with exit code.
-fn sys_exit(code) {
-    syscall(SYS_EXIT, code);
-    return 0;
-}
-
-# execve: replace process image. argv and envp are null-terminated arrays of pointers.
-fn sys_execve(path, argv, envp) {
-    return syscall(SYS_EXECVE, path, argv, envp);
 }
 
 # pipe: create pipe, fds[0]=read end, fds[1]=write end.
 # Translates to pipe2(fds, 0).
-fn sys_pipe(fds) {
+fn sys_pipe(fds): i64 {
     return syscall(SYS_PIPE2, fds, 0);
-}
-
-# Get current process ID.
-fn sys_getpid() {
-    return syscall(SYS_GETPID);
-}
-
-# Get parent process ID.
-fn sys_getppid() {
-    return syscall(SYS_GETPPID);
-}
-
-# Send signal to process.
-fn sys_kill(pid, sig) {
-    return syscall(SYS_KILL, pid, sig);
 }
 
 # Wait for a signal.
 # aarch64 has no bare `pause` syscall; emulate via ppoll with NULL
 # fds and NULL timeout — equivalent to pause(2) semantics
 # (block until a signal handler interrupts it).
-fn sys_pause() {
+fn sys_pause(): i64 {
     return syscall(SYS_PPOLL, 0, 0, 0, 0, 0);
 }
 
-# Create a new session.
-fn sys_setsid() {
-    return syscall(SYS_SETSID);
-}
+# sys_setsid / sys_waitpid / WIFEXITED / WEXITSTATUS / WIFSIGNALED /
+# WTERMSIG / sys_getuid / sys_getgid / sys_geteuid / sys_getegid /
+# sys_setuid / sys_setgid / sys_setgroups / sys_setresuid /
+# sys_setresgid / sys_prctl / sys_seccomp / sys_execveat / sys_mount /
+# sys_umount2 / sys_sync moved to lib/syscalls_linux_common.cyr at
+# v5.11.20.
 
-# waitpid via wait4 with rusage=NULL
-fn sys_waitpid(pid, status_ptr, options) {
-    return syscall(SYS_WAIT4, pid, status_ptr, options, 0);
-}
-
-# Wait status macros (cross-arch identical — bit layout in `int
-# status` is defined by the kernel's wait4 contract, not arch).
-fn WIFEXITED(status) {
-    if ((status & 0x7F) == 0) { return 1; }
-    return 0;
-}
-
-# Get exit status from wait status.
-fn WEXITSTATUS(status) {
-    return (status >> 8) & 0xFF;
-}
-
-# Check if child was killed by signal.
-fn WIFSIGNALED(status) {
-    var sig = status & 0x7F;
-    if (sig > 0) {
-        if (sig != 0x7F) { return 1; }
-    }
-    return 0;
-}
-
-# Get signal number from wait status.
-fn WTERMSIG(status) {
-    return status & 0x7F;
-}
-
-# Identity
-fn sys_getuid() { return syscall(SYS_GETUID); }
-# Get group ID.
-fn sys_getgid() { return syscall(SYS_GETGID); }
-# Get effective user ID.
-fn sys_geteuid() { return syscall(SYS_GETEUID); }
-# Get effective group ID.
-fn sys_getegid() { return syscall(SYS_GETEGID); }
-# Set user ID.
-fn sys_setuid(uid) { return syscall(SYS_SETUID, uid); }
-# Set group ID.
-fn sys_setgid(gid) { return syscall(SYS_SETGID, gid); }
-# sys_setgroups syscall wrapper.
-fn sys_setgroups(size, list) { return syscall(SYS_SETGROUPS, size, list); }
-
-# Mount
-fn sys_mount(source, target, fstype, flags, data) {
-    return syscall(SYS_MOUNT, source, target, fstype, flags, data);
-}
-
-# Unmount a filesystem.
-fn sys_umount2(target, flags) {
-    return syscall(SYS_UMOUNT2, target, flags);
-}
-
-# Sync + reboot
-fn sys_sync() {
-    syscall(SYS_SYNC);
-    return 0;
-}
-
-# sys_reboot syscall wrapper.
-fn sys_reboot(cmd) {
-    return syscall(SYS_REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, cmd, 0);
-}
+# sys_reboot also in lib/syscalls_linux_common.cyr at v5.11.20.
 
 # Signal operations
-fn sigset_new() {
+fn sigset_new(): i64 {
     var set = alloc(8);
     store64(set, 0);
     return set;
 }
 
 # sigset_add syscall wrapper.
-fn sigset_add(set, signum) {
+fn sigset_add(set, signum): i64 {
     var mask = load64(set);
     mask = mask | (1 << (signum - 1));
     store64(set, mask);
@@ -547,56 +539,36 @@ fn sigset_add(set, signum) {
 }
 
 # sigset_has syscall wrapper.
-fn sigset_has(set, signum) {
+fn sigset_has(set, signum): i64 {
     var mask = load64(set);
     if ((mask & (1 << (signum - 1))) != 0) { return 1; }
     return 0;
 }
 
-# sys_sigprocmask syscall wrapper.
-fn sys_sigprocmask(how, set, oldset) {
-    return syscall(SYS_RT_SIGPROCMASK, how, set, oldset, 8);
-}
-
-# sys_signalfd syscall wrapper. signalfd4 is the only signalfd
-# variant in the aarch64 generic table; it takes the sigset_t size
-# as the 3rd arg (=8 for our 64-bit sigset).
-fn sys_signalfd(fd, mask, flags) {
-    return syscall(SYS_SIGNALFD4, fd, mask, 8, flags);
-}
-
-# Epoll. aarch64 has only epoll_create1 (no bare epoll_create).
-fn sys_epoll_create() {
-    return syscall(SYS_EPOLL_CREATE1, EPOLL_CLOEXEC);
-}
+# sys_sigprocmask / sys_signalfd / sys_epoll_create moved to
+# lib/syscalls_linux_common.cyr at v5.11.20.
 
 # epoll_event: { u32 events, u64 data } = 12 bytes
-fn epoll_event_new(events, data) {
+fn epoll_event_new(events, data): i64 {
     var ev = alloc(16);
     store32(ev, events);
     store64(ev + 4, data);
     return ev;
 }
 
-# Control epoll: add/mod/del fd.
-fn sys_epoll_ctl(epfd, op, fd, event) {
-    return syscall(SYS_EPOLL_CTL, epfd, op, fd, event);
-}
+# sys_epoll_ctl moved to lib/syscalls_linux_common.cyr at v5.11.20.
 
 # Wait for epoll events. aarch64 has only epoll_pwait (no bare
 # epoll_wait); we pass NULL sigmask + sigset size 0 to mimic
 # epoll_wait semantics.
-fn sys_epoll_wait(epfd, events, maxevents, timeout) {
+fn sys_epoll_wait(epfd, events, maxevents, timeout): i64 {
     return syscall(SYS_EPOLL_PWAIT, epfd, events, maxevents, timeout, 0, 8);
 }
 
-# Timers
-fn sys_timerfd_create(clockid, flags) {
-    return syscall(SYS_TIMERFD_CREATE, clockid, flags);
-}
+# sys_timerfd_create moved to lib/syscalls_linux_common.cyr at v5.11.20.
 
 # itimerspec: { interval: {sec, nsec}, value: {sec, nsec} } = 32 bytes
-fn timerspec_new(interval_sec, initial_sec) {
+fn timerspec_new(interval_sec, initial_sec): i64 {
     var ts = alloc(32);
     store64(ts, interval_sec);
     store64(ts + 8, 0);
@@ -605,13 +577,10 @@ fn timerspec_new(interval_sec, initial_sec) {
     return ts;
 }
 
-# Set timer expiration.
-fn sys_timerfd_settime(fd, flags, new_value, old_value) {
-    return syscall(SYS_TIMERFD_SETTIME, fd, flags, new_value, old_value);
-}
+# sys_timerfd_settime moved to lib/syscalls_linux_common.cyr at v5.11.20.
 
 # timerfd_drain syscall wrapper.
-fn timerfd_drain(fd) {
+fn timerfd_drain(fd): i64 {
     var buf[1];
     var n = sys_read(fd, &buf, 8);
     if (n == 8) { return load64(&buf); }
@@ -619,13 +588,13 @@ fn timerfd_drain(fd) {
 }
 
 # Utility
-fn is_err(ret) {
+fn is_err(ret): i64 {
     if (ret < 0) { return 1; }
     return 0;
 }
 
 # err_code syscall wrapper.
-fn err_code(ret) {
+fn err_code(ret): i64 {
     return 0 - ret;
 }
 
@@ -641,37 +610,14 @@ enum InotifyEvent {
 }
 
 # Initialise an inotify instance and return its fd.
-fn sys_inotify_init() { return syscall(SYS_INOTIFY_INIT1, 0); }
+fn sys_inotify_init(): i64 { return syscall(SYS_INOTIFY_INIT1, 0); }
 # Add a watch on a path for inotify events
-fn sys_inotify_add_watch(fd, path, mask) { return syscall(SYS_INOTIFY_ADD_WATCH, fd, path, mask); }
+fn sys_inotify_add_watch(fd, path, mask): i64 { return syscall(SYS_INOTIFY_ADD_WATCH, fd, path, mask); }
 # Remove an inotify watch
-fn sys_inotify_rm_watch(fd, wd) { return syscall(SYS_INOTIFY_RM_WATCH, fd, wd); }
+fn sys_inotify_rm_watch(fd, wd): i64 { return syscall(SYS_INOTIFY_RM_WATCH, fd, wd); }
 
-# v5.7.35 — agnosys-surfaced (drm/luks/security). Same wrapper
-# bodies as the x86_64 peer; the per-arch SYS_* constants in
-# this file's enum route to the right kernel entry points.
-
-# Read directory entries — see x86_64 peer for record layout.
-fn sys_getdents64(fd, buf, count) {
-    return syscall(SYS_GETDENTS64, fd, buf, count);
-}
-
-# Fill buf with kernel-CSPRNG bytes — see x86_64 peer.
-fn sys_getrandom(buf, len, flags) {
-    return syscall(SYS_GETRANDOM, buf, len, flags);
-}
-
-# Landlock — create a ruleset; see x86_64 peer + lib/security.cyr.
-fn sys_landlock_create_ruleset(attr_ptr, size, flags) {
-    return syscall(SYS_LANDLOCK_CREATE_RULESET, attr_ptr, size, flags);
-}
-
-# Landlock — add a rule to a ruleset; see x86_64 peer.
-fn sys_landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags) {
-    return syscall(SYS_LANDLOCK_ADD_RULE, ruleset_fd, rule_type, rule_attr, flags);
-}
-
-# Landlock — apply ruleset to calling thread; see x86_64 peer.
-fn sys_landlock_restrict_self(ruleset_fd, flags) {
-    return syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, flags);
-}
+# v5.7.35 (drm/luks/security) + v5.11.18 (kybernet socket family) —
+# sys_getdents64 / sys_getrandom / sys_landlock_create_ruleset /
+# sys_landlock_add_rule / sys_landlock_restrict_self / sys_socket /
+# sys_bind / sys_listen / sys_connect / sys_recvfrom / sys_accept4 /
+# sys_recvmsg moved to lib/syscalls_linux_common.cyr at v5.11.20.

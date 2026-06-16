@@ -1,0 +1,299 @@
+# ================================================================
+# Big-endian wire-format helpers (TLS is BE end-to-end)
+# ================================================================
+# Internal helpers. No stdlib peer exists, so they live inline here;
+# if a second TLS-adjacent stdlib consumer surfaces (e.g. QUIC, HTTP/2
+# binary frames), promote to lib/be.cyr at that point.
+fn _tn_be16_w(p, v): i64 {
+    store8(p,     (v >> 8) & 0xFF);
+    store8(p + 1, v        & 0xFF);
+    return 2;
+}
+fn _tn_be16_r(p): i64 {
+    return (load8(p) << 8) | load8(p + 1);
+}
+fn _tn_be24_w(p, v): i64 {
+    store8(p,     (v >> 16) & 0xFF);
+    store8(p + 1, (v >>  8) & 0xFF);
+    store8(p + 2,  v        & 0xFF);
+    return 3;
+}
+fn _tn_be24_r(p): i64 {
+    return (load8(p) << 16) | (load8(p + 1) << 8) | load8(p + 2);
+}
+fn _tn_be32_w(p, v): i64 {
+    store8(p,     (v >> 24) & 0xFF);
+    store8(p + 1, (v >> 16) & 0xFF);
+    store8(p + 2, (v >>  8) & 0xFF);
+    store8(p + 3,  v        & 0xFF);
+    return 4;
+}
+fn _tn_be32_r(p): i64 {
+    return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+}
+fn _tn_be64_w(p, v): i64 {
+    store8(p,     (v >> 56) & 0xFF);
+    store8(p + 1, (v >> 48) & 0xFF);
+    store8(p + 2, (v >> 40) & 0xFF);
+    store8(p + 3, (v >> 32) & 0xFF);
+    store8(p + 4, (v >> 24) & 0xFF);
+    store8(p + 5, (v >> 16) & 0xFF);
+    store8(p + 6, (v >>  8) & 0xFF);
+    store8(p + 7,  v        & 0xFF);
+    return 8;
+}
+fn _tn_be64_r(p): i64 {
+    var hi = (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+    var lo = (load8(p + 4) << 24) | (load8(p + 5) << 16) | (load8(p + 6) << 8) | load8(p + 7);
+    return (hi << 32) | (lo & 0xFFFFFFFF);
+}
+
+# ================================================================
+# Record header encode / decode
+# ================================================================
+
+# Write a 5-byte TLSPlaintext/TLSCiphertext header into `buf`.
+# Returns TLS_RECORD_HEADER_LEN on success, TLS_ERR_INVALID_PARAM if
+# `length` exceeds the ciphertext cap (16640).
+fn tls_native_record_write_header(buf, ct, version, length): i64 {
+    if (length < 0) { return TLS_ERR_INVALID_PARAM; }
+    if (length > TLS_RECORD_MAX_CIPHERTEXT) { return TLS_ERR_INVALID_PARAM; }
+    store8(buf, ct & 0xFF);
+    _tn_be16_w(buf + 1, version);
+    _tn_be16_w(buf + 3, length);
+    return TLS_RECORD_HEADER_LEN;
+}
+
+# Parse a 5-byte record header from the head of `buf` (which must
+# have at least `buflen >= 5` bytes). Writes ContentType, version,
+# length through the output pointers. Returns TLS_RECORD_HEADER_LEN
+# on success, TLS_ERR_BAD_RECORD on short buffer, or
+# TLS_ERR_RECORD_OVERFLOW if length > 16640.
+fn tls_native_record_read_header(buf, buflen, ct_out, version_out, length_out): i64 {
+    if (buflen < TLS_RECORD_HEADER_LEN) { return TLS_ERR_BAD_RECORD; }
+    var ct = load8(buf);
+    var version = _tn_be16_r(buf + 1);
+    var length = _tn_be16_r(buf + 3);
+    if (length > TLS_RECORD_MAX_CIPHERTEXT) { return TLS_ERR_BAD_RECORD; }
+    store64(ct_out, ct);
+    store64(version_out, version);
+    store64(length_out, length);
+    return TLS_RECORD_HEADER_LEN;
+}
+
+# Return the number of plaintext records needed to ship `plaintext_len`
+# bytes (each ≤ TLS_RECORD_MAX_PLAINTEXT). Caller iterates this many
+# times, writing one record per iteration. Returns 0 for plaintext_len=0
+# (no record needed for empty payload; spec allows empty Application
+# Data records but they have no consumer).
+fn tls_native_record_fragment_count(plaintext_len): i64 {
+    if (plaintext_len <= 0) { return 0; }
+    var n = plaintext_len / TLS_RECORD_MAX_PLAINTEXT;
+    if ((plaintext_len % TLS_RECORD_MAX_PLAINTEXT) != 0) { n = n + 1; }
+    return n;
+}
+
+# ================================================================
+# Sequence numbers + AEAD nonce derivation (RFC 8446 §5.3)
+# ================================================================
+# Per RFC 8446 §5.3, each record's per-direction sequence number is
+# combined with the static IV to produce the AEAD nonce. The seq is
+# 64-bit big-endian; AEAD nonces are 12 bytes (96 bits); the seq is
+# zero-padded on the LEFT (high 32 bits = 0) then XOR'd with the IV.
+# Implementations MUST NOT let seq wrap (§5.3); callers should rekey
+# (KeyUpdate) before approaching 2^64 records.
+
+# Zero out an 8-byte sequence-number buffer.
+fn tls_native_seq_init(seq8): i64 {
+    store64(seq8, 0);
+    return TLS_OK;
+}
+
+# Increment the sequence number (treated as 64-bit BE) by 1. Returns
+# TLS_OK normally, TLS_ERR_PROTOCOL if the new value would wrap from
+# the all-ones state (§5.3 forbids this).
+fn tls_native_seq_increment(seq8): i64 {
+    var cur = _tn_be64_r(seq8);
+    # Detect imminent wrap: all 64 bits set.
+    if (cur == 0 - 1) { return TLS_ERR_PROTOCOL; }
+    _tn_be64_w(seq8, cur + 1);
+    return TLS_OK;
+}
+
+# Derive the per-record AEAD nonce. `static_iv12` is the
+# direction-specific 12-byte IV (from the key schedule); `seq8` is
+# the current 8-byte BE sequence number. The output is written to
+# `nonce_out12`. Operation: zero-extend seq to 12 bytes (4 high
+# zero bytes), then XOR with static_iv. Both AEAD ciphersuites
+# (AES-GCM and ChaCha20-Poly1305) use this same per-RFC-8446
+# construction.
+fn tls_native_aead_nonce(static_iv12, seq8, nonce_out12): i64 {
+    # High 4 bytes: just copy from static_iv (XOR with 0).
+    store8(nonce_out12,     load8(static_iv12));
+    store8(nonce_out12 + 1, load8(static_iv12 + 1));
+    store8(nonce_out12 + 2, load8(static_iv12 + 2));
+    store8(nonce_out12 + 3, load8(static_iv12 + 3));
+    # Low 8 bytes: XOR static_iv[4..12] with seq8[0..8].
+    var i = 0;
+    while (i < 8) {
+        store8(nonce_out12 + 4 + i, load8(static_iv12 + 4 + i) ^ load8(seq8 + i));
+        i = i + 1;
+    }
+    return TLS_OK;
+}
+
+# Build the AAD for a TLS 1.3 AEAD record. Per RFC 8446 §5.2, the
+# AAD IS the 5-byte record header (ct=23 for application data;
+# version=0x0303; length=plaintext_len + tag_len + 1-byte inner type).
+# Writes 5 bytes to `aad_out5`. Returns TLS_RECORD_HEADER_LEN on
+# success.
+fn tls_native_record_aad(ct, version, length, aad_out5): i64 {
+    return tls_native_record_write_header(aad_out5, ct, version, length);
+}
+
+# Add a missing error code referenced by record_read_header. (Most
+# callers will treat this as a BAD_RECORD class; spec-aligned name
+# kept distinct because §6 has a dedicated record_overflow alert at
+# wire value 22.)
+var TLS_ERR_RECORD_OVERFLOW = 0 - 20;
+
+# Server's private key (or its algorithm) can't be used: a recognized
+# but unsupported key type (e.g. RSA — sigil parses the label but the
+# RSA private-key parser + RSA-PSS sign arrive in a later sigil tag),
+# or a key whose format sigil couldn't decode.
+var TLS_ERR_KEY_UNSUPPORTED = 0 - 21;
+
+# ================================================================
+# Handshake message framing (RFC 8446 §4)
+# ================================================================
+# Each handshake message has a 4-byte header:
+#   uint8  msg_type;    // TlsHandshakeType (TLS_HS_*)
+#   uint24 length;      // body length in bytes
+#   opaque body[length];
+# Handshake messages are emitted inside record fragments
+# (ContentType = TLS_CT_HANDSHAKE) and may span multiple records.
+
+var TLS_HANDSHAKE_HEADER_LEN = 4;
+
+# Write a 4-byte handshake message header into `buf`. Returns
+# TLS_HANDSHAKE_HEADER_LEN on success, TLS_ERR_INVALID_PARAM if
+# body_len doesn't fit in a uint24 (>= 16777216).
+fn tls_native_handshake_write_header(buf, hs_type, body_len): i64 {
+    if (body_len < 0) { return TLS_ERR_INVALID_PARAM; }
+    if (body_len > 0xFFFFFF) { return TLS_ERR_INVALID_PARAM; }
+    store8(buf, hs_type & 0xFF);
+    _tn_be24_w(buf + 1, body_len);
+    return TLS_HANDSHAKE_HEADER_LEN;
+}
+
+# Parse a 4-byte handshake header. Writes msg_type to `hs_type_out`,
+# body length to `body_len_out`. Returns TLS_HANDSHAKE_HEADER_LEN on
+# success, TLS_ERR_BAD_HANDSHAKE on short buffer.
+fn tls_native_handshake_read_header(buf, buflen, hs_type_out, body_len_out): i64 {
+    if (buflen < TLS_HANDSHAKE_HEADER_LEN) { return TLS_ERR_BAD_HANDSHAKE; }
+    store64(hs_type_out, load8(buf));
+    store64(body_len_out, _tn_be24_r(buf + 1));
+    return TLS_HANDSHAKE_HEADER_LEN;
+}
+
+# ================================================================
+# Transcript hash accumulator (RFC 8446 §4.4.1)
+# ================================================================
+# Transcript-Hash(M1 || M2 || … || Mn) where each Mi is a serialized
+# handshake message (header + body, BUT pre-encryption — TLS 1.3
+# uses the same shape as 1.2 for transcript purposes). The hash is
+# used for:
+#   - Finished MAC (§4.4.4)
+#   - CertificateVerify signature input (§4.4.3)
+#   - Key schedule binding (binder_key for PSK, §7.1)
+#   - HelloRetryRequest synthetic-ClientHello substitution (§4.4.1)
+#
+# Algorithm follows the negotiated ciphersuite: SHA-256 for
+# TLS_AES_128_GCM_SHA256 and TLS_CHACHA20_POLY1305_SHA256;
+# SHA-384 for TLS_AES_256_GCM_SHA384.
+
+var TLS_HASH_SHA256 = 0;
+var TLS_HASH_SHA384 = 1;
+
+# Hash output lengths (bytes).
+var TLS_HASH_SHA256_LEN = 32;
+var TLS_HASH_SHA384_LEN = 48;
+
+# Sigil sha256 ctx is 144 bytes, sha384 is 208. The transcript state
+# itself is 16 bytes (algo + ctx-pointer) plus the heap-alloc'd
+# hash ctx.
+var TLS_TRANSCRIPT_STATE_LEN = 16;
+var TLS_SHA256_CTX_LEN = 144;
+var TLS_SHA384_CTX_LEN = 208;
+
+# Initialize a transcript-hash accumulator. `hash_algo` is one of
+# TLS_HASH_SHA256 / TLS_HASH_SHA384. Returns a state handle (>0) or
+# 0 on OOM / invalid algo. Free implicit — the bump allocator
+# reclaims on alloc_reset.
+fn tls_native_transcript_init(hash_algo): i64 {
+    if (hash_algo != TLS_HASH_SHA256) {
+        if (hash_algo != TLS_HASH_SHA384) { return 0; }
+    }
+    var state = alloc(TLS_TRANSCRIPT_STATE_LEN);
+    if (state == 0) { return 0; }
+    var hctx = 0;
+    if (hash_algo == TLS_HASH_SHA256) {
+        hctx = sha256_init();
+    } else {
+        hctx = sha384_init();
+    }
+    if (hctx == 0) { return 0; }
+    store64(state,     hash_algo);
+    store64(state + 8, hctx);
+    return state;
+}
+
+# Feed `len` bytes from `data` into the transcript. Returns TLS_OK.
+# In TLS 1.3 the caller passes the FULL serialized handshake message
+# (header + body); the transcript hash never sees record-layer
+# wrapping.
+fn tls_native_transcript_update(state, data, len): i64 {
+    if (state == 0) { return TLS_ERR_INVALID_PARAM; }
+    var algo = load64(state);
+    var hctx = load64(state + 8);
+    if (algo == TLS_HASH_SHA256) {
+        sha256_update(hctx, data, len);
+    } else {
+        sha384_update(hctx, data, len);
+    }
+    return TLS_OK;
+}
+
+# Snapshot the current digest into `digest_out`. Critical: this must
+# NOT destroy the running ctx — the next handshake message will
+# extend it. sigil's *_finalize mutates the ctx (padding + length
+# block), so we clone the ctx, finalize the clone, and discard the
+# clone. Returns the digest length (32 for SHA-256, 48 for SHA-384).
+fn tls_native_transcript_digest(state, digest_out): i64 {
+    if (state == 0) { return 0 - 1; }
+    var algo = load64(state);
+    var hctx = load64(state + 8);
+    if (algo == TLS_HASH_SHA256) {
+        var clone = alloc(TLS_SHA256_CTX_LEN);
+        if (clone == 0) { return 0 - 1; }
+        memcpy(clone, hctx, TLS_SHA256_CTX_LEN);
+        sha256_finalize(clone, digest_out);
+        return TLS_HASH_SHA256_LEN;
+    }
+    var clone = alloc(TLS_SHA384_CTX_LEN);
+    if (clone == 0) { return 0 - 1; }
+    memcpy(clone, hctx, TLS_SHA384_CTX_LEN);
+    sha384_finalize(clone, digest_out);
+    return TLS_HASH_SHA384_LEN;
+}
+
+# Return the digest length for the transcript's algo without
+# computing it. 32 for SHA-256, 48 for SHA-384, -1 for invalid.
+fn tls_native_transcript_digest_len(state): i64 {
+    if (state == 0) { return 0 - 1; }
+    var algo = load64(state);
+    if (algo == TLS_HASH_SHA256) { return TLS_HASH_SHA256_LEN; }
+    if (algo == TLS_HASH_SHA384) { return TLS_HASH_SHA384_LEN; }
+    return 0 - 1;
+}
+

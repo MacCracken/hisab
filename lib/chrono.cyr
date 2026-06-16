@@ -5,34 +5,61 @@
 var CLOCK_REALTIME = 0;
 var CLOCK_MONOTONIC = 1;
 
-# Get current time in nanoseconds (monotonic clock)
-fn clock_now_ns() {
+# Get current time in nanoseconds (monotonic clock).
+# v6.2.6: agnos binds the monotonic clock to uptime_ms (#40, since kernel
+# 1.43.x) — ms since boot, scaled to ns. The low 6 digits are zero at the
+# 100 Hz / 10 ms tick resolution (same sub-tick-zero shape as the wall-clock
+# clock_epoch_ns note). (Was a fixed-zero stub through v6.2.5, predicated on
+# the obsolete "no monotonic syscall in the frozen 0-33 surface" assumption —
+# 228=clock_gettime is out of range, but #40 always was the agnos path.)
+fn clock_now_ns(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_uptime_ms() * 1000000;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var ts[16];
     syscall(228, CLOCK_MONOTONIC, &ts);
     return load64(&ts) * 1000000000 + load64(&ts + 8);
+    #endif
 }
 
 # Get current time in milliseconds (monotonic)
-fn clock_now_ms() {
+fn clock_now_ms(): i64 {
     return clock_now_ns() / 1000000;
 }
 
-# Get current epoch seconds (wall clock)
-fn clock_epoch_secs() {
+# Get current epoch seconds (wall clock). v6.2.3: agnos now has a real
+# wall clock via time_unix(#46, RTC-derived) — returns whole Unix seconds
+# (no sub-second), or 0 if the RTC is mid-update/unreadable (callers treat
+# 0 as "unknown", not epoch; sigil's _x509_in_window skips the cert window
+# when now==0). This is what tls_native's cert-validity check binds to.
+fn clock_epoch_secs(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_time_unix();
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var ts[16];
     syscall(228, CLOCK_REALTIME, &ts);
     return load64(&ts);
+    #endif
 }
 
-# Get current epoch nanoseconds (wall clock)
-fn clock_epoch_ns() {
+# Get current epoch nanoseconds (wall clock). v6.2.3: agnos derives ns from
+# the whole-second time_unix(#46) — sub-second resolution is unavailable
+# (RTC granularity), so the low 9 digits are always zero. 0 stays "unknown".
+fn clock_epoch_ns(): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_time_unix() * 1000000000;
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
     var ts[16];
     syscall(228, CLOCK_REALTIME, &ts);
     return load64(&ts) * 1000000000 + load64(&ts + 8);
+    #endif
 }
 
 # Duration struct: {secs: i64, nsecs: i64} = 16 bytes
-fn dur_new(secs, nsecs) {
+fn dur_new(secs, nsecs): i64 {
     var d = alloc(16);
     store64(d, secs);
     store64(d + 8, nsecs);
@@ -40,32 +67,61 @@ fn dur_new(secs, nsecs) {
 }
 
 # Get seconds component of a duration
-fn dur_secs(d) { return load64(d); }
+fn dur_secs(d): i64 { return load64(d); }
 # Get nanoseconds component of a duration
-fn dur_nsecs(d) { return load64(d + 8); }
+fn dur_nsecs(d): i64 { return load64(d + 8); }
 
 # Convert duration to total milliseconds
-fn dur_to_ms(d) {
+fn dur_to_ms(d): i64 {
     return load64(d) * 1000 + load64(d + 8) / 1000000;
 }
 
 # Convert duration to total nanoseconds
-fn dur_to_ns(d) {
+fn dur_to_ns(d): i64 {
     return load64(d) * 1000000000 + load64(d + 8);
 }
 
 # Measure elapsed time between two ns timestamps
-fn dur_between(start_ns, end_ns) {
+fn dur_between(start_ns, end_ns): i64 {
     var diff = end_ns - start_ns;
     return dur_new(diff / 1000000000, diff % 1000000000);
 }
 
-# Sleep for ms milliseconds (blocking)
-fn sleep_ms(ms) {
-    var ts[16];
-    store64(&ts, ms / 1000);
-    store64(&ts + 8, (ms % 1000) * 1000000);
-    syscall(35, &ts, 0);
+# Sleep for ms milliseconds (blocking). Portable across targets — v6.0.65
+# replaced the raw `syscall(35)` (Linux nanosleep) that faulted off Linux:
+# Darwin has NO plain `nanosleep` BSD syscall (XNU implements it over
+# semaphore primitives) and PE never routed 35, so on macOS/Windows the old
+# body emitted a bad `svc`/illegal-instruction. `poll(NULL, 0, ms)` is the
+# portable ms-granular sleep — `poll` (syscall 7 → Darwin 230) is already
+# rerouted on both Mach-O backends and works on Linux; Windows uses kernel32
+# `Sleep`. v6.2.6: agnos binds the real sleep_ms (#41, since kernel 1.43.x;
+# was a no-op fall-through through v6.2.5 under the obsolete "no sleep in the
+# frozen 0-33 surface" note, which made every agnos poll loop busy-spin).
+# See CHANGELOG [6.0.65]/[6.2.6], issues 2026-06-04-macos-nanosleep-syscall-35-not-in-esysxlat,
+# 2026-06-14-chrono-agnos-monotonic-sleep-stale-stubs.
+fn sleep_ms(ms): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (ms <= 0) { return 0; }
+    sys_sleep_ms(ms);               # sleep_ms(ms) — #41, blocks ~ms
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    # Sleep(ms) via kernel32 (PE reroute 0xF00F). nanosleep(35) was never routed
+    # on PE, and WaitForSingleObject on the current process/thread pseudo-handle
+    # returns immediately (doesn't block) — verified on cass — so a real Sleep
+    # reroute is the correct path.
+    syscall(0xF00F, ms);            # Sleep(ms)
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_MACOS
+    syscall(7, 0, 0, ms);           # poll(NULL, 0, ms) — 7→230 on Darwin
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_LINUX
+    syscall(7, 0, 0, ms);           # poll(NULL, 0, ms)
+    return 0;
+    #endif
+    # cx + any other target: no-op (agnos handled above)
     return 0;
 }
 
@@ -75,7 +131,7 @@ fn sleep_ms(ms) {
 
 # Days in each month (non-leap)
 var _chrono_mdays = 0;
-fn _chrono_init_mdays() {
+fn _chrono_init_mdays(): i64 {
     if (_chrono_mdays != 0) { return 0; }
     _chrono_mdays = alloc(96);
     store64(_chrono_mdays, 31);       # Jan
@@ -94,7 +150,7 @@ fn _chrono_init_mdays() {
 }
 
 # Check leap year
-fn is_leap_year(y) {
+fn is_leap_year(y): i64 {
     if (y % 4 != 0) { return 0; }
     if (y % 100 != 0) { return 1; }
     if (y % 400 != 0) { return 0; }
@@ -103,7 +159,7 @@ fn is_leap_year(y) {
 
 # Convert epoch seconds to date components {year, month, day, hour, min, sec}
 # Returns alloc'd 48-byte struct
-fn epoch_to_date(epoch) {
+fn epoch_to_date(epoch): i64 {
     _chrono_init_mdays();
     var r = alloc(48);
     var secs = epoch;
@@ -137,14 +193,14 @@ fn epoch_to_date(epoch) {
 }
 
 # Write 2-digit zero-padded number to buffer
-fn _chrono_w2(buf, pos, val) {
+fn _chrono_w2(buf, pos, val): i64 {
     store8(buf + pos, 48 + val / 10);
     store8(buf + pos + 1, 48 + val % 10);
     return 0;
 }
 
 # Write 4-digit year to buffer
-fn _chrono_w4(buf, pos, val) {
+fn _chrono_w4(buf, pos, val): i64 {
     store8(buf + pos, 48 + val / 1000);
     store8(buf + pos + 1, 48 + (val / 100) % 10);
     store8(buf + pos + 2, 48 + (val / 10) % 10);
@@ -154,7 +210,7 @@ fn _chrono_w4(buf, pos, val) {
 
 # Format epoch seconds as ISO-8601: "2026-04-09T15:30:00Z"
 # Returns null-terminated string (alloc'd)
-fn iso8601(epoch) {
+fn iso8601(epoch): i64 {
     var d = epoch_to_date(epoch);
     var buf = alloc(24);
     _chrono_w4(buf, 0, load64(d));       # year
@@ -174,13 +230,13 @@ fn iso8601(epoch) {
 }
 
 # Format current time as ISO-8601
-fn iso8601_now() {
+fn iso8601_now(): i64 {
     return iso8601(clock_epoch_secs());
 }
 
 # Parse ISO-8601 string "YYYY-MM-DDTHH:MM:SSZ" to epoch seconds
 # Returns epoch seconds or -1 on parse error
-fn iso8601_parse(s) {
+fn iso8601_parse(s): i64 {
     var len = strlen(s);
     if (len < 19) { return 0 - 1; }
     # Parse digits

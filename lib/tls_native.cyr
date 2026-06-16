@@ -1,0 +1,302 @@
+# tls_native.cyr — Sovereign, pure-Cyrius TLS protocol-layer stack
+# Usage: include "lib/tls_native.cyr"
+# Requires: lib/syscalls.cyr (sockets), lib/alloc.cyr, lib/sigil.cyr
+#           (crypto primitives: ChaCha20-Poly1305, AES-GCM, HKDF, SHA-2,
+#            X25519, ECDSA, X.509)
+#
+# **Status (corrected 2026-06-04 — the prior "v6.0.10 SCAFFOLD / every fn
+# returns NOT_IMPLEMENTED" header was stale and false; the stack works):**
+#   IMPLEMENTED — TLS 1.3 client + server: record layer, handshake framing,
+#     1.3 key schedule (HKDF tree), ciphersuite negotiation (slots .11–.28).
+#     Interops with OpenSSL 3.x (client↔server CONNECTED). A working 1.3 stack.
+#   KNOWN HOLES — three PUBLIC fns still `return TLS_ERR_NOT_IMPLEMENTED`:
+#     `tls_native_set_alpn`, `tls_native_set_version_range`, `tls_native_close`
+#     (no clean close_notify). A consumer hits these silently. Tracked:
+#     issues/2026-06-04-shipped-broken-functionality-found-by-consumers.md.
+#   IN PROGRESS — TLS 1.2 backport (Mini-arc D). .72 landed the 1.2 AEAD
+#     record layer (record_seal_12 / _open_12: 13-byte AAD, GCM explicit
+#     nonce per RFC 5288, ChaCha20-Poly1305 implicit nonce per RFC 7905;
+#     legacy CBC intentionally skipped). Still ahead: 1.2 handshake +
+#     PRF key derivation + cert/Finished + ciphersuites + e2e.
+#   NOT YET DONE — consumer wiring/closeout (Mini-arc E); pinned in
+#     roadmap.md (v6.0.x). Per-slot landing history in CHANGELOG.
+#
+# **Why a sovereign stack** (vs the existing `lib/tls.cyr` libssl
+# wrapper):
+#   1. The wrapper is client-only.
+#   2. The wrapper dlopens libssl.so.3 via fdlopen, which needs ld.so
+#      to bootstrap glibc's TCB. A bare-metal AGNOS kernel has neither
+#      libssl nor ld.so — structurally cannot use the wrapper.
+#   3. Sovereignty: no external governance over the crypto stack.
+#
+# **Naming**: `tls_native_*` to keep the namespace distinct from the
+# existing `tls_*` wrapper. The wrapper's disposition (retire /
+# deprecate-with-shim / keep-both) lands at the consumer-wiring slot
+# (.35); namespace collapse to `tls_*` only happens then if at all.
+#
+# **Threading model**: single-threaded per-context. Multi-context
+# scenarios (a server accepting concurrent clients) need one ctx per
+# connection; callers may use lib/thread.cyr around them. Mutexes
+# inside the stack would invite the same TCB-init issues that gated
+# the libssl wrapper.
+
+include "lib/syscalls.cyr"
+include "lib/alloc.cyr"
+include "lib/freelist.cyr"
+include "lib/string.cyr"
+include "lib/vec.cyr"
+include "lib/hashmap.cyr"
+include "lib/io.cyr"
+include "lib/fs.cyr"
+# v6.1.25 bayan carve: bigint (u256_*) moved into lib/bayan.cyr. sigil's
+# ECDSA/crypto path calls u256_* — satisfied by bayan's back-compat aliases.
+# bayan's bundled json portion references result/fnptr (io is above);
+# include-once dedupes. See CHANGELOG [6.1.25].
+include "lib/result.cyr"
+include "lib/fnptr.cyr"
+include "lib/bayan.cyr"
+include "lib/ct.cyr"
+include "lib/keccak.cyr"
+# v6.0.53: sigil 3.6.0 added a thread-local constant-bank (reachable
+# thread_local_init at init) + worker-batch thread_create/join, and declares
+# `# Requires: lib/thread_local.cyr` — so any sigil consumer must pull
+# thread.cyr + thread_local.cyr BEFORE sigil or sigil's thread_* calls emit ud2
+# (the v6.0.53 CI SIGILL in tls_native_scaffold). include-once dedupes.
+include "lib/thread.cyr"
+include "lib/thread_local.cyr"
+include "lib/sigil.cyr"
+
+# ================================================================
+# Error codes (negative — TLS_OK = 0; positive returns are byte counts).
+# Cyrius enum initializers don't take arithmetic, so these are
+# top-level `var` constants instead.
+# ================================================================
+var TLS_OK = 0;
+var TLS_ERR_NOT_IMPLEMENTED = 0 - 1;
+var TLS_ERR_HANDSHAKE_FAILED = 0 - 2;
+var TLS_ERR_BAD_RECORD = 0 - 3;          # malformed record-layer frame
+var TLS_ERR_BAD_HANDSHAKE = 0 - 4;       # malformed handshake message
+var TLS_ERR_CIPHER_NOT_SUPPORTED = 0 - 5;
+var TLS_ERR_CERT_INVALID = 0 - 6;        # chain doesn't verify
+var TLS_ERR_CERT_HOSTNAME_MISMATCH = 0 - 7;
+var TLS_ERR_PEER_CLOSED = 0 - 8;         # clean close from peer
+var TLS_ERR_WOULD_BLOCK = 0 - 9;         # non-blocking socket, retry
+var TLS_ERR_INVALID_PARAM = 0 - 10;
+var TLS_ERR_OOM = 0 - 11;
+var TLS_ERR_IO = 0 - 12;                 # socket read/write failed
+var TLS_ERR_INTERNAL = 0 - 13;           # logic error / unreachable
+var TLS_ERR_VERSION = 0 - 14;            # peer wants unsupported version
+var TLS_ERR_DECRYPT = 0 - 15;            # AEAD tag mismatch
+var TLS_ERR_AUTHN = 0 - 16;              # signature verification failed
+var TLS_ERR_ALERT = 0 - 17;              # peer sent a fatal alert
+var TLS_ERR_BUFFER_FULL = 0 - 18;        # output buffer too small
+var TLS_ERR_PROTOCOL = 0 - 19;           # state-machine violation
+
+# ================================================================
+# Record-layer types (RFC 8446 §5.1, RFC 5246 §6.2)
+# ================================================================
+enum TlsContentType {
+    TLS_CT_INVALID = 0;                   # RFC 8446 §5.1
+    TLS_CT_CHANGE_CIPHER_SPEC = 20;       # legacy 1.2; "middlebox compat" in 1.3
+    TLS_CT_ALERT = 21;
+    TLS_CT_HANDSHAKE = 22;
+    TLS_CT_APPLICATION_DATA = 23;
+}
+
+enum TlsProtocolVersion {
+    TLS_VERSION_1_0 = 0x0301;
+    TLS_VERSION_1_1 = 0x0302;
+    TLS_VERSION_1_2 = 0x0303;
+    TLS_VERSION_1_3 = 0x0304;             # In 1.3, the record-layer version
+    # field stays at 0x0303 for middlebox
+    # compat; real version negotiated
+    # via supported_versions extension.
+}
+
+# ================================================================
+# Handshake message types (RFC 8446 §4)
+# ================================================================
+enum TlsHandshakeType {
+    TLS_HS_HELLO_REQUEST = 0;             # 1.2 only; deprecated in 1.3
+    TLS_HS_CLIENT_HELLO = 1;
+    TLS_HS_SERVER_HELLO = 2;
+    TLS_HS_NEW_SESSION_TICKET = 4;
+    TLS_HS_END_OF_EARLY_DATA = 5;
+    TLS_HS_ENCRYPTED_EXTENSIONS = 8;      # 1.3 only
+    TLS_HS_CERTIFICATE = 11;
+    TLS_HS_SERVER_KEY_EXCHANGE = 12;      # 1.2 only
+    TLS_HS_CERTIFICATE_REQUEST = 13;
+    TLS_HS_SERVER_HELLO_DONE = 14;        # 1.2 only
+    TLS_HS_CERTIFICATE_VERIFY = 15;
+    TLS_HS_CLIENT_KEY_EXCHANGE = 16;      # 1.2 only
+    TLS_HS_FINISHED = 20;
+    TLS_HS_KEY_UPDATE = 24;               # 1.3 only
+    TLS_HS_MESSAGE_HASH = 254;            # 1.3 internal: HelloRetryRequest digest synth
+}
+
+# ================================================================
+# TLS 1.3 ciphersuites (IANA, RFC 8446 §B.4)
+# All three available via sigil 3.5.5 (AES-GCM + ChaCha20-Poly1305
+# + SHA-2 all shipped pre-tls_native).
+# ================================================================
+enum TlsCipherSuite {
+    TLS_AES_128_GCM_SHA256 = 0x1301;
+    TLS_AES_256_GCM_SHA384 = 0x1302;
+    TLS_CHACHA20_POLY1305_SHA256 = 0x1303;
+}
+
+# ================================================================
+# TLS 1.2 ciphersuites (IANA — RFC 5289 §3.2 GCM + RFC 7905 ChaCha)
+# ================================================================
+# Modern AEAD-only set: ECDHE key exchange, ECDSA/RSA auth, AES-GCM
+# or ChaCha20-Poly1305. The 2-byte WIRE id is distinct from the
+# internal AEAD-identity (the 1.3 0x130x consts) the .72/.73 record +
+# PRF layer dispatches on — tls_native_12_cipher_aead_identity maps
+# wire -> identity. Completable today: 0xC02C + 0xCCA9 only (ECDSA
+# auth + a sigil-backed AEAD). AES-128 (0x1301) is unbacked in sigil
+# AND has no aead_encrypt branch; RSA-auth suites await sigil RSA
+# sign/verify. See CHANGELOG [6.0.74].
+enum Tls12CipherSuite {
+    TLS12_ECDHE_ECDSA_AES128_GCM_SHA256 = 0xC02B;
+    TLS12_ECDHE_ECDSA_AES256_GCM_SHA384 = 0xC02C;
+    TLS12_ECDHE_RSA_AES128_GCM_SHA256   = 0xC02F;
+    TLS12_ECDHE_RSA_AES256_GCM_SHA384   = 0xC030;
+    TLS12_ECDHE_RSA_CHACHA20_SHA256     = 0xCCA8;   # RSA = LOWER last byte
+    TLS12_ECDHE_ECDSA_CHACHA20_SHA256   = 0xCCA9;
+}
+
+# Authentication algorithm a 1.2 ciphersuite requires of the server's
+# certificate / signature. The AEAD-identity collapse erases this
+# (0xC02B and 0xC02F both -> 0x1301), so it is a separate lookup.
+enum Tls12AuthAlgo {
+    TLS12_AUTH_ECDSA = 0;
+    TLS12_AUTH_RSA   = 1;
+}
+
+# ================================================================
+# Alert level + description (RFC 8446 §6)
+# ================================================================
+enum TlsAlertLevel {
+    TLS_ALERT_WARNING = 1;
+    TLS_ALERT_FATAL = 2;
+}
+
+enum TlsAlertDescription {
+    TLS_AD_CLOSE_NOTIFY = 0;
+    TLS_AD_UNEXPECTED_MESSAGE = 10;
+    TLS_AD_BAD_RECORD_MAC = 20;
+    TLS_AD_RECORD_OVERFLOW = 22;
+    TLS_AD_HANDSHAKE_FAILURE = 40;
+    TLS_AD_BAD_CERTIFICATE = 42;
+    TLS_AD_UNSUPPORTED_CERTIFICATE = 43;
+    TLS_AD_CERTIFICATE_REVOKED = 44;
+    TLS_AD_CERTIFICATE_EXPIRED = 45;
+    TLS_AD_CERTIFICATE_UNKNOWN = 46;
+    TLS_AD_ILLEGAL_PARAMETER = 47;
+    TLS_AD_UNKNOWN_CA = 48;
+    TLS_AD_ACCESS_DENIED = 49;
+    TLS_AD_DECODE_ERROR = 50;
+    TLS_AD_DECRYPT_ERROR = 51;
+    TLS_AD_PROTOCOL_VERSION = 70;
+    TLS_AD_INSUFFICIENT_SECURITY = 71;
+    TLS_AD_INTERNAL_ERROR = 80;
+    TLS_AD_INAPPROPRIATE_FALLBACK = 86;
+    TLS_AD_USER_CANCELED = 90;
+    TLS_AD_MISSING_EXTENSION = 109;
+    TLS_AD_UNSUPPORTED_EXTENSION = 110;
+    TLS_AD_UNRECOGNIZED_NAME = 112;
+    TLS_AD_BAD_CERTIFICATE_STATUS_RESPONSE = 113;
+    TLS_AD_UNKNOWN_PSK_IDENTITY = 115;
+    TLS_AD_CERTIFICATE_REQUIRED = 116;
+    TLS_AD_NO_APPLICATION_PROTOCOL = 120;
+}
+
+# ================================================================
+# Connection role + state-machine state
+# ================================================================
+enum TlsRole {
+    TLS_ROLE_CLIENT = 0;
+    TLS_ROLE_SERVER = 1;
+}
+
+enum TlsState {
+    TLS_STATE_INIT = 0;                   # before handshake start
+    TLS_STATE_WAIT_SH = 1;                # client: sent CH, waiting ServerHello
+    TLS_STATE_WAIT_EE = 2;                # client: SH parsed, waiting EncryptedExtensions
+    TLS_STATE_WAIT_CERT_CR = 3;           # client: waiting Certificate or CertificateRequest
+    TLS_STATE_WAIT_CERT = 4;              # client: waiting Certificate after CR
+    TLS_STATE_WAIT_CV = 5;                # client: waiting CertificateVerify
+    TLS_STATE_WAIT_FINISHED = 6;          # waiting peer Finished
+    TLS_STATE_WAIT_CH = 7;                # server: waiting ClientHello
+    TLS_STATE_WAIT_EOED = 8;              # server: waiting EndOfEarlyData (0-RTT)
+    TLS_STATE_WAIT_CLIENT_FLIGHT2 = 9;    # server: waiting Cert/CV/Finished from client
+    TLS_STATE_CONNECTED = 10;             # handshake done; app data flowing
+    TLS_STATE_CLOSING = 11;               # close_notify sent or received
+    TLS_STATE_CLOSED = 12;                # fully shut down
+    TLS_STATE_ERROR = 13;                 # fatal — ctx unusable
+}
+
+# ================================================================
+# Peer-certificate verification mode
+# ================================================================
+enum TlsVerifyMode {
+    TLS_VERIFY_NONE = 0;                  # accept any cert (DANGER; testing only)
+    TLS_VERIFY_PEER = 1;                  # verify peer's cert chain
+    TLS_VERIFY_FAIL_IF_NO_PEER_CERT = 2;  # server: fail if client didn't present cert
+}
+
+# ================================================================
+# Supported curves / groups for ECDHE key share
+# ================================================================
+enum TlsNamedGroup {
+    TLS_GROUP_SECP256R1 = 0x0017;         # P-256 (sigil ecdsa_p256)
+    TLS_GROUP_SECP384R1 = 0x0018;         # P-384 (sigil ecdsa_p384)
+    TLS_GROUP_X25519 = 0x001D;            # X25519 (sigil x25519)
+}
+
+# ================================================================
+# Signature schemes (RFC 8446 §4.2.3)
+# ================================================================
+enum TlsSignatureScheme {
+    TLS_SIG_RSA_PKCS1_SHA256 = 0x0401;
+    TLS_SIG_RSA_PKCS1_SHA384 = 0x0501;
+    TLS_SIG_ECDSA_SECP256R1_SHA256 = 0x0403;
+    TLS_SIG_ECDSA_SECP384R1_SHA384 = 0x0503;
+    TLS_SIG_RSA_PSS_RSAE_SHA256 = 0x0804;
+    TLS_SIG_RSA_PSS_RSAE_SHA384 = 0x0805;
+    TLS_SIG_ED25519 = 0x0807;
+}
+
+# ================================================================
+# Record-layer constants (RFC 8446 §5.1 + §5.2)
+# ================================================================
+# Wire format of a record:
+#   uint8  type;          // ContentType (TLS_CT_*)
+#   uint16 version;       // legacy_record_version (always 0x0303 in 1.3)
+#   uint16 length;        // fragment length (max 16384 plaintext;
+#                         //  max 16384+256 ciphertext per §5.2)
+#   opaque fragment[length];
+# Total header overhead = 5 bytes. Records exceeding the cap MUST be
+# fragmented (§5.1). AEAD overhead = 16-byte tag + 1-byte inner-type
+# trailer (TLSInnerPlaintext, §5.2) ≤ 256 bytes of headroom.
+var TLS_RECORD_HEADER_LEN = 5;
+var TLS_RECORD_MAX_PLAINTEXT = 16384;             # 2^14, §5.1
+var TLS_RECORD_MAX_CIPHERTEXT = 16640;            # 16384 + 256, §5.2
+# CVE-30 (v6.1.36): max post-handshake records (NewSessionTicket / KeyUpdate)
+# tls_native_read drains before yielding to the caller — bounds a peer that
+# floods post-handshake messages instead of sending application data.
+var TLS_POST_HANDSHAKE_DRAIN_MAX = 32;
+var TLS_AEAD_NONCE_LEN = 12;                      # 96-bit per §5.3
+var TLS_AEAD_TAG_LEN = 16;                        # Poly1305 + GCM both 128-bit
+var TLS_SEQ_NUM_LEN = 8;                          # 64-bit counter
+
+# v6.2.5: tls_native split into focused modules (was a 5,857-line monolith).
+# Pure fn-relocation, included here IN ORIGINAL ORDER so the preprocessed
+# text is unchanged. Do NOT include the sub-modules directly — go through
+# this hub (which also pulls the dep tree + shared enums/consts/ctx above).
+include "lib/tls_native_lowlevel.cyr"   # BE wire helpers, record framing, seq/nonce, transcript
+include "lib/tls_native_keysched.cyr"   # TLS 1.3 key schedule + 1.3/1.2 ciphersuite registries
+include "lib/tls_native_ctx.cyr"        # ctx layout + new_client/new_server + ctx public API
+include "lib/tls_native_hs13.cyr"       # TLS 1.3 client + server handshake + app-data + 1.3 record protection
+include "lib/tls_native_hs12.cyr"       # TLS 1.2 record + PRF + handshake driver
+include "lib/tls_native_conn.cyr"       # hostname verify + transport vtable + connect/accept + I/O + getters

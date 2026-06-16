@@ -29,21 +29,31 @@ var _heap_end = 0;
 # startup + more RSS).
 var _WIN_HEAP_SIZE = 0x1000000;
 
-# Initialize the heap. On Windows, syscall(12, ...) is rerouted
-# by the PE backend to VirtualAlloc. First call with addr=0 gets
-# a fresh reservation of _WIN_HEAP_SIZE bytes (MEM_COMMIT |
-# MEM_RESERVE, PAGE_READWRITE). Returns the base address; bump
-# allocation proceeds upward inside that region.
+# Initialize the heap via mmap (syscall 9), which the PE backend
+# routes to VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE,
+# PAGE_READWRITE) — the SAME reroute the main compiler heap uses.
 #
-# Second/subsequent `syscall(12, addr)` calls are treated as
-# no-op by the PE reroute (Windows can't grow a committed
-# region in-place). `alloc()` below detects overflow and
-# returns 0 rather than silently corrupting.
+# v6.0.39 FIX: this used `syscall(12)` (brk), assuming a
+# "PE-reroutes-brk-to-VirtualAlloc" that was NEVER implemented — the
+# PE syscall dispatch (parse_expr.cyr) has cases for 0/1/2/3/8/9/60/228
+# but NOT 12, so `syscall(12)` fell through to a raw SYSCALL instruction,
+# illegal on Windows → STATUS_ACCESS_VIOLATION. cycc's own `vec_new()`
+# at startup hit it on the first `alloc()` and crashed before reading a
+# single byte of source — which is why no program ever compiled on
+# Windows. It shipped since v5.5.0 because CI only ran EMITTED programs,
+# never compiled one THROUGH cycc on real Windows. mmap is rerouted and
+# works on both hosts (Linux: real mmap; Windows: VirtualAlloc). No grow
+# on Windows: `alloc()` returns 0 on overflow rather than corrupting.
+# See CHANGELOG [6.0.39].
 fn alloc_init() {
-    # Pass the desired size as the addr arg; PE reroute
-    # recognises the first-call shape and issues a
-    # VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_RW).
-    _heap_base = syscall(12, _WIN_HEAP_SIZE);
+    # Idempotent (v6.1.23): re-call is a no-op once the heap is up — pre-fix every
+    # recall VirtualAlloc'd a fresh 16 MB reservation, abandoning the live one.
+    # Free via alloc_reset(). See issue 2026-06-09-chunked-alloc-init-not-idempotent.
+    if (_heap_base != 0) { return _heap_base; }
+    # mmap(addr=0, len=_WIN_HEAP_SIZE, prot=RW(3), MAP_PRIVATE|ANON(0x22),
+    # fd=-1, off=0). PE EMMAP_PE ignores prot/flags/fd/off and always
+    # COMMIT|RESERVE + PAGE_READWRITE.
+    _heap_base = syscall(9, 0, _WIN_HEAP_SIZE, 3, 0x22, 0 - 1, 0);
     _heap_end = _heap_base + _WIN_HEAP_SIZE;
     _heap_ptr = _heap_base;
     return _heap_base;
@@ -57,27 +67,33 @@ var ALLOC_MAX = 0x10000000;
 # Allocate size bytes, 8-byte aligned. Returns 0 on overflow /
 # out-of-region.
 fn alloc(size) {
-    # v5.8.37 — lazy-init the heap if alloc_init() was never called.
-    # Mirrors the Linux + macOS branches; alloc_init() is now
-    # optional. See lib/alloc.cyr header for the full migration note.
-    if (_heap_base == 0) { alloc_init(); }
+    # Pure validation OUTSIDE the v6.0.64 alloc lock (no shared state).
     if (size <= 0) { return 0; }
     if (size > ALLOC_MAX) { return 0; }
     size = (size + 7) & (0 - 8);
+    # --- critical section (shared bump pointer) ---
+    _alloc_lock_acquire();
+    # v5.8.37 — lazy-init the heap if alloc_init() was never called
+    # (now race-safe). See lib/alloc.cyr header for the migration note.
+    if (_heap_base == 0) { alloc_init(); }
     var ptr = _heap_ptr;
     var new_ptr = ptr + size;
     # Overflow check: wrapped pointer = arithmetic overflow.
-    if (new_ptr < ptr) { return 0; }
+    if (new_ptr < ptr) { _alloc_lock_release(); return 0; }
     # Out-of-region: no grow on Windows.
-    if (new_ptr > _heap_end) { return 0; }
+    if (new_ptr > _heap_end) { _alloc_lock_release(); return 0; }
     _heap_ptr = new_ptr;
+    _alloc_lock_release();
     return ptr;
 }
 
 # Reset the bump pointer back to base. All previously-allocated
-# memory is invalidated (same contract as Linux peer).
+# memory is invalidated (same contract as Linux peer). Locked so a
+# concurrent alloc() can't observe a half-updated bump pointer.
 fn alloc_reset() {
+    _alloc_lock_acquire();
     _heap_ptr = _heap_base;
+    _alloc_lock_release();
     return 0;
 }
 

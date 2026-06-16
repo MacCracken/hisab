@@ -1,0 +1,588 @@
+# ================================================================
+# TLS 1.3 Key Schedule (RFC 8446 §7.1, §7.2, §7.3)
+# ================================================================
+# Three-phase HKDF tree (Extract on each phase boundary, Derive-Secret
+# taps along the way). Phases:
+#   1. Early Secret    = HKDF-Extract(salt=0, ikm=PSK | 0^HashLen)
+#   2. Handshake Secret = HKDF-Extract(salt=Derive-Secret(early,"derived"),
+#                                       ikm=(EC)DHE_shared)
+#      taps: client_hs_traffic, server_hs_traffic (over CH through SH transcript)
+#   3. Master Secret    = HKDF-Extract(salt=Derive-Secret(hs,"derived"),
+#                                       ikm=0^HashLen)
+#      taps: client_app_traffic, server_app_traffic (over CH through server-Fin),
+#            exporter_master, resumption_master (over CH through client-Fin)
+#
+# Per-sec key+IV (RFC 8446 §7.3):
+#   write_key = HKDF-Expand-Label(sec, "key", "", key_len)
+#   write_iv  = HKDF-Expand-Label(sec, "iv",  "", iv_len)
+#
+# Ciphersuite picks the hash: SHA-256 for AES-128-GCM + ChaCha20-Poly,
+# SHA-384 for AES-256-GCM (sigil 3.5.6 + cyrius v6.0.13).
+
+# Sigil's hkdf_expand max OKM bound (255 * HashLen). We never request
+# that much; max single TLS expansion is the digest itself (48 bytes
+# for SHA-384). Buffer caps:
+var TLS_HKDF_LABEL_BUF_LEN = 512;     # HkdfLabel.length(2) + label(≤256) + ctx(≤256)
+var TLS_KEYSCHED_STATE_LEN = 96;      # 12 i64 slots — see layout below
+var TLS_MAX_DIGEST_LEN = 48;          # SHA-384
+
+# Key schedule "which sec" identifiers (for keysched_get_secret).
+var TLS_KS_EARLY            = 0;
+var TLS_KS_HANDSHAKE        = 1;
+var TLS_KS_MASTER           = 2;
+var TLS_KS_CLIENT_HANDSHAKE = 3;
+var TLS_KS_SERVER_HANDSHAKE = 4;
+var TLS_KS_CLIENT_APPLICATION = 5;
+var TLS_KS_SERVER_APPLICATION = 6;
+var TLS_KS_EXPORTER_MASTER  = 7;
+var TLS_KS_RESUMPTION_MASTER = 8;
+
+# Key schedule phase (cyrius enums don't take expressions but the
+# state needs to distinguish "Early derived" vs "Handshake derived"
+# for the API contract — caller can read tls_native_keysched_phase
+# to know what's safe to extract).
+var TLS_KSP_NONE      = 0;
+var TLS_KSP_EARLY     = 1;
+var TLS_KSP_HANDSHAKE = 2;
+var TLS_KSP_MASTER    = 3;
+
+# State layout (96 bytes total, 12 i64 slots — indexed by offset):
+#   +0   hash_algo (0=sha256, 1=sha384)
+#   +8   hash_len (32 or 48)
+#   +16  phase (TLS_KSP_*)
+#   +24  early_secret ptr
+#   +32  handshake_secret ptr
+#   +40  master_secret ptr
+#   +48  client_handshake_secret ptr
+#   +56  server_handshake_secret ptr
+#   +64  client_application_secret ptr
+#   +72  server_application_secret ptr
+#   +80  exporter_master_secret ptr
+#   +88  resumption_master_secret ptr
+
+# ----------------------------------------------------------------
+# HKDF-Expand-Label (RFC 8446 §7.1)
+# ----------------------------------------------------------------
+# Build HkdfLabel:
+#   uint16 length;
+#   opaque label<7..255>   = "tls13 " ++ Label
+#   opaque context<0..255> = Context
+# Then call HKDF-Expand(sec, HkdfLabel, length).
+# Returns 0 on success, negative TLS_ERR_* on failure.
+fn tls_native_hkdf_expand_label(sec, secret_len, label, label_len,
+ctx, ctx_len, hash_algo, out, out_len): i64 {
+    if (out_len < 0) { return TLS_ERR_INVALID_PARAM; }
+    if (label_len < 0) { return TLS_ERR_INVALID_PARAM; }
+    if (ctx_len < 0) { return TLS_ERR_INVALID_PARAM; }
+    # The HkdfLabel label opaque is uint8-prefixed (max 255 incl. the
+    # "tls13 " prefix). 6 + label_len must fit.
+    if (label_len + 6 > 255) { return TLS_ERR_INVALID_PARAM; }
+    if (ctx_len > 255) { return TLS_ERR_INVALID_PARAM; }
+
+    # Build the HkdfLabel into a scratch buffer.
+    var info = alloc(TLS_HKDF_LABEL_BUF_LEN);
+    if (info == 0) { return TLS_ERR_OOM; }
+    # uint16 length BE
+    _tn_be16_w(info, out_len);
+    var pos = 2;
+    # opaque label<7..255>: 1-byte length + "tls13 " + caller_label
+    store8(info + pos, label_len + 6);
+    pos = pos + 1;
+    store8(info + pos,     116);  # 't'
+    store8(info + pos + 1, 108);  # 'l'
+    store8(info + pos + 2, 115);  # 's'
+    store8(info + pos + 3,  49);  # '1'
+    store8(info + pos + 4,  51);  # '3'
+    store8(info + pos + 5,  32);  # ' '
+    pos = pos + 6;
+    memcpy(info + pos, label, label_len);
+    pos = pos + label_len;
+    # opaque context<0..255>: 1-byte length + context bytes
+    store8(info + pos, ctx_len);
+    pos = pos + 1;
+    if (ctx_len > 0) {
+        memcpy(info + pos, ctx, ctx_len);
+        pos = pos + ctx_len;
+    }
+
+    var rc = 0;
+    if (hash_algo == TLS_HASH_SHA256) {
+        rc = hkdf_expand(sec, secret_len, info, pos, out, out_len);
+    } else {
+        rc = hkdf_expand_sha384(sec, secret_len, info, pos, out, out_len);
+    }
+    if (rc != 0) { return TLS_ERR_INTERNAL; }
+    return TLS_OK;
+}
+
+# ----------------------------------------------------------------
+# Derive-Secret (RFC 8446 §7.1)
+# ----------------------------------------------------------------
+# Derive-Secret(Secret, Label, Messages) =
+#   HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length)
+#
+# `transcript_state` is a tls_native_transcript_* state (already
+# accumulating messages). Output length matches the transcript's
+# hash length (32 or 48 bytes).
+fn tls_native_derive_secret(sec, secret_len, label, label_len,
+transcript_state, out): i64 {
+    if (transcript_state == 0) { return TLS_ERR_INVALID_PARAM; }
+    var hash_algo = load64(transcript_state);
+    var hash_len = tls_native_transcript_digest_len(transcript_state);
+    if (hash_len < 0) { return TLS_ERR_INVALID_PARAM; }
+
+    # Compute Transcript-Hash(Messages) into a scratch buffer.
+    var th = alloc(TLS_MAX_DIGEST_LEN);
+    if (th == 0) { return TLS_ERR_OOM; }
+    tls_native_transcript_digest(transcript_state, th);
+
+    return tls_native_hkdf_expand_label(sec, secret_len, label, label_len,
+    th, hash_len, hash_algo, out, hash_len);
+}
+
+# Internal: HKDF-Extract dispatched by hash algorithm. Used by the
+# keysched phase transitions. Returns 0 on success.
+fn _tn_hkdf_extract(salt, salt_len, ikm, ikm_len, hash_algo, prk_out): i64 {
+    if (hash_algo == TLS_HASH_SHA256) {
+        return hkdf_extract(salt, salt_len, ikm, ikm_len, prk_out);
+    }
+    return hkdf_extract_sha384(salt, salt_len, ikm, ikm_len, prk_out);
+}
+
+# Internal: a fresh transcript-hash state with NO messages — used by
+# Derive-Secret(., "derived", "") which always hashes the empty
+# message list. Allocates the sigil hash ctx; caller owns the
+# returned tn-transcript state (16 bytes) and the underlying ctx.
+fn _tn_empty_transcript(hash_algo): i64 {
+    return tls_native_transcript_init(hash_algo);
+}
+
+# ----------------------------------------------------------------
+# Key schedule state + phase transitions
+# ----------------------------------------------------------------
+
+# Initialize a key-schedule state. hash_algo is TLS_HASH_SHA256 or
+# TLS_HASH_SHA384. Computes the Early Secret with PSK = 0^HashLen (no
+# PSK case — call tls_native_keysched_set_psk first to override).
+# Returns the state handle (>0) or 0 on OOM / invalid algo.
+fn tls_native_keysched_new(hash_algo): i64 {
+    if (hash_algo != TLS_HASH_SHA256) {
+        if (hash_algo != TLS_HASH_SHA384) { return 0; }
+    }
+    var hash_len = TLS_HASH_SHA256_LEN;
+    if (hash_algo == TLS_HASH_SHA384) { hash_len = TLS_HASH_SHA384_LEN; }
+    var st = alloc(TLS_KEYSCHED_STATE_LEN);
+    if (st == 0) { return 0; }
+    # Zero all slots.
+    var z = 0;
+    while (z < TLS_KEYSCHED_STATE_LEN) { store8(st + z, 0); z = z + 1; }
+    store64(st,      hash_algo);
+    store64(st + 8,  hash_len);
+    store64(st + 16, TLS_KSP_NONE);
+    # Compute Early Secret = HKDF-Extract(0, PSK).
+    # No-PSK case: PSK = HashLen zero bytes. Salt is also 0 (length 0).
+    var zero_psk = alloc(hash_len);
+    if (zero_psk == 0) { return 0; }
+    var i = 0;
+    while (i < hash_len) { store8(zero_psk + i, 0); i = i + 1; }
+    var early = alloc(hash_len);
+    if (early == 0) { return 0; }
+    _tn_hkdf_extract(0, 0, zero_psk, hash_len, hash_algo, early);
+    store64(st + 24, early);
+    store64(st + 16, TLS_KSP_EARLY);
+    return st;
+}
+
+# Override the PSK and recompute the Early Secret. Must be called
+# before tls_native_keysched_derive_handshake. PSK is hash_len bytes
+# (binder-derived in real handshakes — for now caller supplies it).
+fn tls_native_keysched_set_psk(ks, psk, psk_len): i64 {
+    if (ks == 0) { return TLS_ERR_INVALID_PARAM; }
+    var hash_algo = load64(ks);
+    var hash_len = load64(ks + 8);
+    var phase = load64(ks + 16);
+    if (phase != TLS_KSP_EARLY) { return TLS_ERR_PROTOCOL; }
+    var early = load64(ks + 24);
+    if (early == 0) { return TLS_ERR_INTERNAL; }
+    _tn_hkdf_extract(0, 0, psk, psk_len, hash_algo, early);
+    return TLS_OK;
+}
+
+# Advance to the Handshake Secret. `dhe` is the (EC)DHE shared sec
+# (e.g. 32 bytes from X25519); `transcript` is the running transcript
+# state containing ClientHello + ServerHello. Derives:
+#   - handshake_secret
+#   - client_handshake_traffic_secret  ("c hs traffic")
+#   - server_handshake_traffic_secret  ("s hs traffic")
+fn tls_native_keysched_derive_handshake(ks, dhe, dhe_len, transcript): i64 {
+    if (ks == 0) { return TLS_ERR_INVALID_PARAM; }
+    if (transcript == 0) { return TLS_ERR_INVALID_PARAM; }
+    var hash_algo = load64(ks);
+    var hash_len = load64(ks + 8);
+    var phase = load64(ks + 16);
+    if (phase != TLS_KSP_EARLY) { return TLS_ERR_PROTOCOL; }
+    var early = load64(ks + 24);
+
+    # Derive-Secret(early, "derived", "") — the empty-transcript
+    # bridge to the next HKDF-Extract.
+    var derived = alloc(hash_len);
+    if (derived == 0) { return TLS_ERR_OOM; }
+    var empty_th = _tn_empty_transcript(hash_algo);
+    if (empty_th == 0) { return TLS_ERR_OOM; }
+    var drc = tls_native_derive_secret(early, hash_len, "derived", 7, empty_th, derived);
+    if (drc != TLS_OK) { return drc; }
+
+    # Handshake Secret = HKDF-Extract(derived, DHE).
+    var hs = alloc(hash_len);
+    if (hs == 0) { return TLS_ERR_OOM; }
+    _tn_hkdf_extract(derived, hash_len, dhe, dhe_len, hash_algo, hs);
+    store64(ks + 32, hs);
+
+    # client_handshake_traffic_secret = Derive-Secret(hs, "c hs traffic", CH through SH)
+    var chs = alloc(hash_len);
+    if (chs == 0) { return TLS_ERR_OOM; }
+    var rc1 = tls_native_derive_secret(hs, hash_len, "c hs traffic", 12, transcript, chs);
+    if (rc1 != TLS_OK) { return rc1; }
+    store64(ks + 48, chs);
+
+    # server_handshake_traffic_secret = Derive-Secret(hs, "s hs traffic", CH through SH)
+    var shs = alloc(hash_len);
+    if (shs == 0) { return TLS_ERR_OOM; }
+    var rc2 = tls_native_derive_secret(hs, hash_len, "s hs traffic", 12, transcript, shs);
+    if (rc2 != TLS_OK) { return rc2; }
+    store64(ks + 56, shs);
+
+    store64(ks + 16, TLS_KSP_HANDSHAKE);
+    return TLS_OK;
+}
+
+# Advance to the Master Secret. `transcript` must contain everything
+# through server Finished (for app/exporter) — caller is responsible
+# for the resumption_master derivation needing the FULL transcript
+# through client Finished; that's the slot-.21 wiring concern, not
+# .13's. For now we derive resumption_master with whatever's in the
+# transcript at call time; consumer-level fns at .21+ orchestrate.
+# Derives:
+#   - master_secret
+#   - client_application_traffic_secret  ("c ap traffic")
+#   - server_application_traffic_secret  ("s ap traffic")
+#   - exporter_master_secret             ("exp master")
+#   - resumption_master_secret           ("res master")
+fn tls_native_keysched_derive_master(ks, transcript): i64 {
+    if (ks == 0) { return TLS_ERR_INVALID_PARAM; }
+    if (transcript == 0) { return TLS_ERR_INVALID_PARAM; }
+    var hash_algo = load64(ks);
+    var hash_len = load64(ks + 8);
+    var phase = load64(ks + 16);
+    if (phase != TLS_KSP_HANDSHAKE) { return TLS_ERR_PROTOCOL; }
+    var hs = load64(ks + 32);
+
+    # Derive-Secret(hs, "derived", "") bridge.
+    var derived = alloc(hash_len);
+    if (derived == 0) { return TLS_ERR_OOM; }
+    var empty_th = _tn_empty_transcript(hash_algo);
+    if (empty_th == 0) { return TLS_ERR_OOM; }
+    var drc = tls_native_derive_secret(hs, hash_len, "derived", 7, empty_th, derived);
+    if (drc != TLS_OK) { return drc; }
+
+    # Master Secret = HKDF-Extract(derived, 0^HashLen).
+    var zero = alloc(hash_len);
+    if (zero == 0) { return TLS_ERR_OOM; }
+    var zi = 0;
+    while (zi < hash_len) { store8(zero + zi, 0); zi = zi + 1; }
+    var ms = alloc(hash_len);
+    if (ms == 0) { return TLS_ERR_OOM; }
+    _tn_hkdf_extract(derived, hash_len, zero, hash_len, hash_algo, ms);
+    store64(ks + 40, ms);
+
+    # Four Derive-Secret() taps off the master sec.
+    var cas = alloc(hash_len);
+    if (cas == 0) { return TLS_ERR_OOM; }
+    tls_native_derive_secret(ms, hash_len, "c ap traffic", 12, transcript, cas);
+    store64(ks + 64, cas);
+
+    var sas = alloc(hash_len);
+    if (sas == 0) { return TLS_ERR_OOM; }
+    tls_native_derive_secret(ms, hash_len, "s ap traffic", 12, transcript, sas);
+    store64(ks + 72, sas);
+
+    var em = alloc(hash_len);
+    if (em == 0) { return TLS_ERR_OOM; }
+    tls_native_derive_secret(ms, hash_len, "exp master", 10, transcript, em);
+    store64(ks + 80, em);
+
+    var rm = alloc(hash_len);
+    if (rm == 0) { return TLS_ERR_OOM; }
+    tls_native_derive_secret(ms, hash_len, "res master", 10, transcript, rm);
+    store64(ks + 88, rm);
+
+    store64(ks + 16, TLS_KSP_MASTER);
+    return TLS_OK;
+}
+
+# Copy a derived sec into `out`. Returns the sec length (32 or
+# 48) on success, TLS_ERR_PROTOCOL if the requested sec hasn't
+# been derived in the current phase yet, TLS_ERR_INVALID_PARAM on
+# bad `which`.
+fn tls_native_keysched_get_secret(ks, which, out): i64 {
+    if (ks == 0) { return TLS_ERR_INVALID_PARAM; }
+    var hash_len = load64(ks + 8);
+    var src = 0;
+    if (which == TLS_KS_EARLY)              { src = load64(ks + 24); }
+    if (which == TLS_KS_HANDSHAKE)          { src = load64(ks + 32); }
+    if (which == TLS_KS_MASTER)             { src = load64(ks + 40); }
+    if (which == TLS_KS_CLIENT_HANDSHAKE)   { src = load64(ks + 48); }
+    if (which == TLS_KS_SERVER_HANDSHAKE)   { src = load64(ks + 56); }
+    if (which == TLS_KS_CLIENT_APPLICATION) { src = load64(ks + 64); }
+    if (which == TLS_KS_SERVER_APPLICATION) { src = load64(ks + 72); }
+    if (which == TLS_KS_EXPORTER_MASTER)    { src = load64(ks + 80); }
+    if (which == TLS_KS_RESUMPTION_MASTER)  { src = load64(ks + 88); }
+    if (src == 0) { return TLS_ERR_PROTOCOL; }
+    memcpy(out, src, hash_len);
+    return hash_len;
+}
+
+# Get the current phase (TLS_KSP_NONE/EARLY/HANDSHAKE/MASTER).
+fn tls_native_keysched_phase(ks): i64 {
+    if (ks == 0) { return TLS_KSP_NONE; }
+    return load64(ks + 16);
+}
+
+# ----------------------------------------------------------------
+# Per-sec key + IV derivation (RFC 8446 §7.3)
+# ----------------------------------------------------------------
+# [sender]_write_key = HKDF-Expand-Label(Secret, "key", "", key_len)
+# [sender]_write_iv  = HKDF-Expand-Label(Secret, "iv",  "", iv_len)
+#
+# Caller picks key_len based on the AEAD cipher:
+#   AES-128-GCM         : key_len=16, iv_len=12
+#   AES-256-GCM         : key_len=32, iv_len=12
+#   ChaCha20-Poly1305   : key_len=32, iv_len=12
+
+# 7+ args don't fit cyrius's register budget — split into two
+# single-output helpers. Caller picks key_len from the AEAD; iv_len
+# is always 12 for the TLS 1.3 AEADs.
+fn tls_native_derive_key(sec, secret_len, hash_algo, key_out, key_len): i64 {
+    return tls_native_hkdf_expand_label(sec, secret_len, "key", 3,
+    0, 0, hash_algo, key_out, key_len);
+}
+
+# Derive the per-direction write_iv = HKDF-Expand-Label(secret, "iv", "", iv_len).
+# iv_len is always 12 for the three TLS 1.3 AEAD ciphersuites.
+fn tls_native_derive_iv(sec, secret_len, hash_algo, iv_out, iv_len): i64 {
+    return tls_native_hkdf_expand_label(sec, secret_len, "iv", 2,
+    0, 0, hash_algo, iv_out, iv_len);
+}
+
+# ================================================================
+# Ciphersuite registry + AEAD dispatch (RFC 8446 §B.4, §5.2)
+# ================================================================
+# Three TLS 1.3 ciphersuites are IANA-defined; sigil 3.5.6 backs
+# 2 of 3 today (AES-256-GCM-SHA384 + ChaCha20-Poly1305-SHA256).
+# AES-128-GCM-SHA256 is the RFC 8446 §9.1 mandatory minimum suite
+# but needs AES-128 in sigil — filed at the comprehensive sigil
+# audit issue (2026-05-28-cyrius-tls-arc-full-audit.md). Until that
+# lands, tls_native_cipher_supported(TLS_AES_128_GCM_SHA256) returns
+# 0, and a peer offering ONLY 0x1301 cannot complete a handshake.
+
+# Lookup: return TLS_HASH_SHA256 / SHA384 / -1 for unknown cipher.
+fn tls_native_cipher_hash_algo(cipher): i64 {
+    if (cipher == TLS_AES_128_GCM_SHA256)       { return TLS_HASH_SHA256; }
+    if (cipher == TLS_AES_256_GCM_SHA384)       { return TLS_HASH_SHA384; }
+    if (cipher == TLS_CHACHA20_POLY1305_SHA256) { return TLS_HASH_SHA256; }
+    return 0 - 1;
+}
+
+# Lookup: AEAD key length in bytes (16 for AES-128, 32 for AES-256
+# and ChaCha20-Poly1305). Returns -1 for unknown.
+fn tls_native_cipher_key_len(cipher): i64 {
+    if (cipher == TLS_AES_128_GCM_SHA256)       { return 16; }
+    if (cipher == TLS_AES_256_GCM_SHA384)       { return 32; }
+    if (cipher == TLS_CHACHA20_POLY1305_SHA256) { return 32; }
+    return 0 - 1;
+}
+
+# Lookup: AEAD IV/nonce length (always 12 for all three TLS 1.3
+# ciphersuites per RFC 8446 §5.3). Returns -1 for unknown.
+fn tls_native_cipher_iv_len(cipher): i64 {
+    if (cipher == TLS_AES_128_GCM_SHA256)       { return 12; }
+    if (cipher == TLS_AES_256_GCM_SHA384)       { return 12; }
+    if (cipher == TLS_CHACHA20_POLY1305_SHA256) { return 12; }
+    return 0 - 1;
+}
+
+# Lookup: AEAD authentication-tag length (always 16 for all three).
+fn tls_native_cipher_tag_len(cipher): i64 {
+    if (cipher == TLS_AES_128_GCM_SHA256)       { return 16; }
+    if (cipher == TLS_AES_256_GCM_SHA384)       { return 16; }
+    if (cipher == TLS_CHACHA20_POLY1305_SHA256) { return 16; }
+    return 0 - 1;
+}
+
+# Capability: returns 1 if cyrius can complete a handshake using this
+# ciphersuite, 0 otherwise. AES-128-GCM-SHA256 returns 0 until sigil
+# ships AES-128 (see audit issue 2026-05-28).
+fn tls_native_cipher_supported(cipher): i64 {
+    if (cipher == TLS_AES_256_GCM_SHA384)       { return 1; }
+    if (cipher == TLS_CHACHA20_POLY1305_SHA256) { return 1; }
+    if (cipher == TLS_AES_128_GCM_SHA256)       { return 1; }   # See CHANGELOG [6.0.83]
+    return 0;
+}
+
+# Server-side selection: walks the server's preference list in order
+# and picks the first ciphersuite that is both (a) supported by us
+# and (b) offered by the client. Returns the picked cipher id (>0),
+# or 0 if no overlap.
+#
+# `client_offers` is a buffer of uint16 BE values (the TLS wire
+# format for the cipher_suites field of ClientHello). `server_prefs`
+# is the SAME wire format — caller-owned, in descending preference.
+# n_offers and n_prefs are COUNTS (not byte lengths).
+fn tls_native_cipher_select(client_offers, n_offers, server_prefs, n_prefs): i64 {
+    if (n_offers <= 0) { return 0; }
+    if (n_prefs <= 0)  { return 0; }
+    var i = 0;
+    while (i < n_prefs) {
+        var pref = _tn_be16_r(server_prefs + i * 2);
+        if (tls_native_cipher_supported(pref) == 1) {
+            var j = 0;
+            while (j < n_offers) {
+                var off = _tn_be16_r(client_offers + j * 2);
+                if (off == pref) { return pref; }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ================================================================
+# TLS 1.2 ciphersuite registry (wire-id lookups)
+# ================================================================
+# The .72/.73 record + PRF layer dispatches on the internal AEAD
+# identity (the 1.3 0x130x consts), NOT the 1.2 wire id. These map a
+# 1.2 wire ciphersuite onto that identity + its auth algo + its PRF
+# hash, so the protocol layer can negotiate by wire id while the
+# crypto layer stays identity-driven. See CHANGELOG [6.0.74].
+
+# Map a 1.2 wire ciphersuite to the internal AEAD-identity const used
+# by every .72/.73 helper (key_len / iv_len_12 / tag_len / hash_algo /
+# is_gcm / aead_encrypt / 12_prf). Returns -1 for an unknown id. The
+# value MUST be stored at TLS_CTX_OFF_CIPHER (never the wire id) — a
+# wire id there makes all those lookups return -1/0 and silently
+# mis-derives the whole key schedule.
+fn tls_native_12_cipher_aead_identity(wire_id): i64 {
+    if (wire_id == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256) { return TLS_AES_128_GCM_SHA256; }
+    if (wire_id == TLS12_ECDHE_RSA_AES128_GCM_SHA256)   { return TLS_AES_128_GCM_SHA256; }
+    if (wire_id == TLS12_ECDHE_ECDSA_AES256_GCM_SHA384) { return TLS_AES_256_GCM_SHA384; }
+    if (wire_id == TLS12_ECDHE_RSA_AES256_GCM_SHA384)   { return TLS_AES_256_GCM_SHA384; }
+    if (wire_id == TLS12_ECDHE_ECDSA_CHACHA20_SHA256)   { return TLS_CHACHA20_POLY1305_SHA256; }
+    if (wire_id == TLS12_ECDHE_RSA_CHACHA20_SHA256)     { return TLS_CHACHA20_POLY1305_SHA256; }
+    return 0 - 1;
+}
+
+# Map a 1.2 wire ciphersuite to the server-auth algorithm (TLS12_AUTH_*).
+# Drives the ServerKeyExchange signer + the client's sig-verify path.
+# Returns -1 for an unknown id.
+fn tls_native_12_cipher_auth(wire_id): i64 {
+    if (wire_id == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256) { return TLS12_AUTH_ECDSA; }
+    if (wire_id == TLS12_ECDHE_ECDSA_AES256_GCM_SHA384) { return TLS12_AUTH_ECDSA; }
+    if (wire_id == TLS12_ECDHE_ECDSA_CHACHA20_SHA256)   { return TLS12_AUTH_ECDSA; }
+    if (wire_id == TLS12_ECDHE_RSA_AES128_GCM_SHA256)   { return TLS12_AUTH_RSA; }
+    if (wire_id == TLS12_ECDHE_RSA_AES256_GCM_SHA384)   { return TLS12_AUTH_RSA; }
+    if (wire_id == TLS12_ECDHE_RSA_CHACHA20_SHA256)     { return TLS12_AUTH_RSA; }
+    return 0 - 1;
+}
+
+# Map a 1.2 wire ciphersuite to its PRF + transcript hash (TLS_HASH_*).
+# Answers for all six registered suites (even unsupported ones).
+# Consumers: transcript_init + verify_data's handshake-hash length.
+# (NOT 12_prf, which derives its hash from the identity internally.)
+# Returns -1 for an unknown id.
+fn tls_native_12_cipher_hash(wire_id): i64 {
+    if (wire_id == TLS12_ECDHE_ECDSA_AES256_GCM_SHA384) { return TLS_HASH_SHA384; }
+    if (wire_id == TLS12_ECDHE_RSA_AES256_GCM_SHA384)   { return TLS_HASH_SHA384; }
+    if (wire_id == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256) { return TLS_HASH_SHA256; }
+    if (wire_id == TLS12_ECDHE_RSA_AES128_GCM_SHA256)   { return TLS_HASH_SHA256; }
+    if (wire_id == TLS12_ECDHE_ECDSA_CHACHA20_SHA256)   { return TLS_HASH_SHA256; }
+    if (wire_id == TLS12_ECDHE_RSA_CHACHA20_SHA256)     { return TLS_HASH_SHA256; }
+    return 0 - 1;
+}
+
+# Capability: 1 if cyrius can complete a 1.2 handshake using this wire
+# ciphersuite, 0 otherwise. EXPLICIT allowlist (so unregistered ids
+# default unsupported). ECDHE_ECDSA + ECDHE_RSA over AES-128-GCM /
+# AES-256-GCM / ChaCha20-Poly1305 — RSA-auth (SKE verify) and AES-128-GCM
+# both wired in .83. See CHANGELOG [6.0.83].
+fn tls_native_12_cipher_supported(wire_id): i64 {
+    if (wire_id == TLS12_ECDHE_ECDSA_AES256_GCM_SHA384) { return 1; }
+    if (wire_id == TLS12_ECDHE_ECDSA_CHACHA20_SHA256)   { return 1; }
+    if (wire_id == TLS12_ECDHE_ECDSA_AES128_GCM_SHA256) { return 1; }
+    if (wire_id == TLS12_ECDHE_RSA_AES256_GCM_SHA384)   { return 1; }
+    if (wire_id == TLS12_ECDHE_RSA_AES128_GCM_SHA256)   { return 1; }
+    if (wire_id == TLS12_ECDHE_RSA_CHACHA20_SHA256)     { return 1; }
+    return 0;
+}
+
+# Reverse map: pick the 1.2 wire ciphersuite to put in the ServerHello
+# for a chosen AEAD identity + auth algo. Only the two supported
+# (ECDSA) suites are emitted; returns -1 otherwise. 2-of-our-3-arg.
+fn tls_native_aead_to_wire_12(aead_id, auth): i64 {
+    if (auth == TLS12_AUTH_ECDSA) {
+        if (aead_id == TLS_AES_256_GCM_SHA384)       { return TLS12_ECDHE_ECDSA_AES256_GCM_SHA384; }
+        if (aead_id == TLS_CHACHA20_POLY1305_SHA256) { return TLS12_ECDHE_ECDSA_CHACHA20_SHA256; }
+    }
+    return 0 - 1;
+}
+
+# ----------------------------------------------------------------
+# AEAD encrypt / decrypt (RFC 8446 §5.2)
+# ----------------------------------------------------------------
+# Both branches use sigil's AEAD primitives directly. The key,
+# iv (12 bytes), aad + len, and pt/ct + len are caller-supplied;
+# tag_out / tag input is exactly 16 bytes.
+# Return TLS_OK / TLS_ERR_CIPHER_NOT_SUPPORTED / TLS_ERR_DECRYPT.
+
+# Encrypt: writes ciphertext + 16-byte tag.
+fn tls_native_aead_encrypt(cipher, key, iv12, aad, aad_len,
+pt, pt_len, ct_out, tag_out): i64 {
+    if (cipher == TLS_AES_256_GCM_SHA384) {
+        aes_gcm_encrypt(key, iv12, aad, aad_len, pt, pt_len, ct_out, tag_out);
+        return TLS_OK;
+    }
+    if (cipher == TLS_AES_128_GCM_SHA256) {
+        # AES-128 = nr=10; aes_gcm_encrypt hardcodes nr=14 (AES-256) and would
+        # run a 14-round schedule over a 16-byte key. See CHANGELOG [6.0.83].
+        aes_128_gcm_encrypt(key, iv12, aad, aad_len, pt, pt_len, ct_out, tag_out);
+        return TLS_OK;
+    }
+    if (cipher == TLS_CHACHA20_POLY1305_SHA256) {
+        chacha20poly1305_encrypt(key, iv12, aad, aad_len, pt, pt_len, ct_out, tag_out);
+        return TLS_OK;
+    }
+    return TLS_ERR_CIPHER_NOT_SUPPORTED;
+}
+
+# Decrypt + verify: returns TLS_OK on tag-match, TLS_ERR_DECRYPT on
+# tag mismatch (sigil's AEAD decrypt returns non-zero on bad tag).
+fn tls_native_aead_decrypt(cipher, key, iv12, aad, aad_len,
+ct, ct_len, tag, pt_out): i64 {
+    if (cipher == TLS_AES_256_GCM_SHA384) {
+        var r = aes_gcm_decrypt(key, iv12, aad, aad_len, ct, ct_len, tag, pt_out);
+        if (r != 0) { return TLS_ERR_DECRYPT; }
+        return TLS_OK;
+    }
+    if (cipher == TLS_AES_128_GCM_SHA256) {
+        var r3 = aes_128_gcm_decrypt(key, iv12, aad, aad_len, ct, ct_len, tag, pt_out);
+        if (r3 != 0) { return TLS_ERR_DECRYPT; }
+        return TLS_OK;
+    }
+    if (cipher == TLS_CHACHA20_POLY1305_SHA256) {
+        var r2 = chacha20poly1305_decrypt(key, iv12, aad, aad_len, ct, ct_len, tag, pt_out);
+        if (r2 != 0) { return TLS_ERR_DECRYPT; }
+        return TLS_OK;
+    }
+    return TLS_ERR_CIPHER_NOT_SUPPORTED;
+}
+

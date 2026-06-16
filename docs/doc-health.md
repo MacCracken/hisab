@@ -6,7 +6,15 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-05-30 (v2.6.5). Scaffolded at v2.4.6 during the post-2.4.x
+> **Last refresh**: 2026-06-15 (v2.6.6) — Cyrius 6.0.14 → **6.2.11** toolchain bump.
+> Synced the pin + dep-list across README / CLAUDE / CONTRIBUTING / roadmap /
+> overview / dependency-watch (stdlib reorg: transcendentals + matrix/linalg →
+> `ganita`; `math` keeps `f64_le`/`f64_ge`); added the CHANGELOG 2.6.6 entry and
+> the threat-model 2026-06-15 audit row. Re-verified the five tracked toolchain
+> issues on the new pin: **3 fixed → archived** (`issues/archived/`:
+> modules-substring, 18-arg-fn scramble, lint rc-as-count), **2 still live**
+> (for-empty-clauses; CLI clobber — not re-tested, destructive). Prior refresh:
+> 2026-05-30 (v2.6.5). Scaffolded at v2.4.6 during the post-2.4.x
 > doc sweep; the **2.5.x** CGA arc then ran (2.5.0–2.5.3 + 2.5.4 closeout with the
 > new `architecture/math.md` catalogue), then the **2.6.x** diffgeo arc — 2.6.0
 > (sectional) + 2.6.1 (Weyl) + 2.6.2 (transport) + 2.6.3 (deviation) + 2.6.4
@@ -34,7 +42,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 
 ---
 
-## At a glance — inventory (last reviewed 2026-05-30, v2.6.5)
+## At a glance — inventory (last reviewed 2026-06-15, v2.6.6)
 
 **~23 markdown files** across the repo. Bucket counts:
 
@@ -45,7 +53,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 | 🟠 **Read-through outstanding** | 0 | CONTRIBUTING refreshed; `tool-issues.md` deleted; `linalg-proposal` archived. Cleared. |
 | 🔵 **Evergreen** | 1 | `CODE_OF_CONDUCT.md` — Contributor Covenant; re-read only on policy change. |
 | 📅 **Dated artifact — supersede, don't edit** | 7 | `audit/2026-04-15.md`, `audit/2026-05-29.md`, `audit/2026-05-29-cga-arc-closeout.md`, `audit/2026-05-30.md`, `benchmarks-rust-v-cyrius.md` (v2.2.0), `port-audit.md` (2026-04-15 + addendum), `development/archive/cyrius-linalg-proposal.md` (shipped). |
-| 🐞 **Tracked toolchain issues (live on 6.0.14)** | 5 | `development/issues/*` — all five cyrius/cbt bugs **re-verified still reproducing** on the pinned 6.0.14 this pass (see Tier 6). |
+| 🐞 **Tracked toolchain issues (live on 6.2.11)** | 2 | `development/issues/*` — down from 5: the 6.2.11 bump **fixed 3** (modules-substring, 18-arg-fn scramble, lint rc-as-count → `issues/archived/`). 2 still reproduce: for-empty-clauses (verified); CLI-clobber (not re-tested, destructive). See Tier 6. |
 
 Numbers approximate; rolls up from the per-tier tables below.
 
@@ -60,11 +68,11 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `README.md` | 2026-05-29 | ✅ Fresh | v2.4.6 sweep: +Collision module row + spatial/einsum/lie_ext/linalg_precision/noise_simplex; version→2.4.6, counts→901/34, 26 benches, binary→~152 KB. |
-| `CHANGELOG.md` | 2026-05-29 | ✅ Fresh | **Source of truth per CLAUDE.md.** Through v2.4.6 + an `[Unreleased]` Documentation entry. Refreshed every release. |
-| `CLAUDE.md` | 2026-05-29 | ✅ Fresh | Process + principles + identity. Status line → 2.4.6 / 16,446-line bundle / 901 tests; +doc-health.md pointer in the docs-structure list. |
-| `VERSION` | 2026-05-29 | ✅ Fresh | Single source of truth (`2.4.6`); bumped via `scripts/version-bump.sh`. |
-| `CONTRIBUTING.md` | 2026-05-29 | ✅ Fresh | **Refreshed this pass**: Cyrius pin 5.7.10 → 6.0.14; "Adding a Module" corrected (`src/` not `lib/`, self-contained sources, `[lib] modules` + `cyrius distlib`); +fmt/distlib gates in the check suite. |
+| `README.md` | 2026-06-15 | ✅ Fresh | v2.6.6: toolchain → 6.2.11, version → 2.6.6, consumer `[deps] stdlib` example → `math`+`ganita` (−matrix/−linalg), hisab tag → 2.6.6. (Prior v2.4.6 sweep: +Collision/spatial/einsum/lie_ext/etc.) |
+| `CHANGELOG.md` | 2026-06-15 | ✅ Fresh | **Source of truth per CLAUDE.md.** +2.6.6 entry (toolchain 6.2.11 + ganita reorg, Breaking consumer-dep note). Refreshed every release. |
+| `CLAUDE.md` | 2026-06-15 | ✅ Fresh | v2.6.6: toolchain/pin → 6.2.11, status line, stdlib dep list → `math`+`ganita` with the no-matrix/linalg caveat. |
+| `VERSION` | 2026-06-15 | ✅ Fresh | Single source of truth (`2.6.6`). |
+| `CONTRIBUTING.md` | 2026-06-15 | ✅ Fresh | v2.6.6: Cyrius pin → 6.2.11. (Prior pass: 5.7.10 → 6.0.14; "Adding a Module" corrected; +fmt/distlib gates.) |
 | `SECURITY.md` | 2026-05-29 | ✅ Fresh | v2.4.6 sweep: +MPR/collision rows, CWE-190/`mat_new` note, supply-chain, supported-versions → hisab 2.4.x. Mirrors `threat-model.md`. |
 | `CODE_OF_CONDUCT.md` | 2026-03-22 | 🔵 Evergreen | Contributor Covenant. Re-read only on policy change. |
 
@@ -74,7 +82,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `overview.md` | 2026-05-29 | ✅ Fresh | v2.4.6 sweep: header → v2.4.6 / 34 modules; module map completed (+Collision section); collision data-flow shows MPR + sequential-impulse. |
+| `overview.md` | 2026-06-15 | ✅ Fresh | v2.6.6: header → v2.6.6 / cycc 6.2.11; dependency-stack row → `math`+`ganita` (ganita subsumes matrix/linalg). (Prior v2.4.6 sweep: module map completed +Collision.) |
 | `math.md` | 2026-05-30 | ✅ Fresh | Equation catalogue. §1 CGA (v2.5.4); **§2 differential geometry added in the v2.6.5 closeout** (curvature conventions, sectional/Weyl/Jacobi, transport, exterior algebra + references); §3 catalogue index. Earns the CLAUDE.md "math reference" slot. |
 
 ---
@@ -85,9 +93,9 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `roadmap.md` | 2026-05-29 | ✅ Fresh | **Rotates every release.** Pruned to forward-facing only (completed 2.3.x/2.4.x/2.5.x arcs → Release History). Open: **2.6.x arc** (diffgeo depth — sectional/Weyl/transport/Jacobi/forms + closeout, 2.6.0–2.6.5), then 2.7.0 (rendering/GPU/reverse-AD), 3.0.0 (`Result<T,E>`), + Parked. |
-| `threat-model.md` | 2026-05-29 | ✅ Fresh | v2.4.6 sweep: +six collision algorithms, `mat_new` note → 6.0.14, +Supply Chain, +2026-05-29 audit-history entry. |
-| `dependency-watch.md` | 2026-05-29 | ✅ Fresh | Cyrius toolchain version-watch. Build/test marker → 901/901 @ v2.4.6. Watching: 5.7.11 (RISC-V). |
+| `roadmap.md` | 2026-06-15 | ✅ Fresh | **Rotates every release.** v2.6.6: header toolchain → 6.2.11, Current section → v2.6.6 (ganita reorg), +2.6.6 Release-History row. Forward: 2.7.0 (rendering/GPU/reverse-AD), 3.0.0 (`Result<T,E>`), + Parked. |
+| `threat-model.md` | 2026-06-15 | ✅ Fresh | v2.6.6: `mat_new` overflow re-verified on 6.2.11 (moved to `ganita_mat_new`, still unguarded); +2026-06-15 audit-history entry (toolchain bump, no new surface). |
+| `dependency-watch.md` | 2026-06-15 | ✅ Fresh | Cyrius toolchain version-watch. Pin → 6.2.11 (6.2.x reorg note: math→ganita); stdlib module table → ganita row; 22 modules used. Watching: 5.7.11 (RISC-V). |
 | `port-audit.md` | 2026-05-29 | 📅 Dated + addendum | 2026-04-15 Rust→Cyrius parity snapshot, preserved; 2026-05-29 status addendum records nearly all "P0 gaps" now ported. Don't rewrite the body. |
 
 > Removed this pass: `tool-issues.md` (deleted — ad-hoc catalog; real bugs live in `issues/`), `cyrius-linalg-proposal.md` (→ `archive/`, shipped).
@@ -121,17 +129,24 @@ Next periodic security audit: per CLAUDE.md, before a major release or after sig
 ## Tier 6 — Tracked issues (`docs/development/issues/`)
 
 Toolchain/CLI bug filings observed from hisab's vantage. Filed against cyrius
-**5.7.x**; **re-verified 2026-05-29 against the pinned 6.0.14 — all five still
-reproduce** (none stale-fixed). hisab carries workarounds for each; the bugs
-belong upstream in cyrius. No `issues/archived/` yet (nothing resolved to move).
+**5.7.x**; **re-verified 2026-06-15 against the pinned 6.2.11 — 3 of 5 now fixed
+upstream and moved to `issues/archived/`; 2 still live.** hisab carries
+workarounds for each open one; the bugs belong upstream in cyrius.
 
-| File | Filed | Status (verified 2026-05-29 on 6.0.14) |
+**Open (`docs/development/issues/`)** — verified 2026-06-15 on 6.2.11:
+
+| File | Filed | Status |
 |---|---|---|
-| `2026-04-26-cyrius-cli-arg-clobbers-source.md` | 2026-04-26 | 🐞 **Live (destructive)** — `cyrius -v build src out` overwrote the source file with the 155 KB binary. Workaround: `CYRIUS_VERBOSE=1` env, never an unknown flag. |
-| `2026-04-26-cc5-18-arg-fn-scrambles-params.md` | 2026-04-26 | 🐞 **Live** — 18-arg fn sum returned 180 vs expected 171 (params scrambled). Workaround: keep fns ≤ ~10 args (hisab's widest is `contact_new`, 8). |
-| `2026-04-26-cyrius-lint-rc-as-warning-count.md` | 2026-04-26 | 🐞 **Live** — 2-warning file → exit code 2 (rc = warning count). Workaround: CI uses `set +e` + per-file rc capture. |
-| `2026-04-26-cyrius-for-empty-clauses.md` | 2026-04-26 | 🐞 **Live** — `for (; cond;)` → parser `unexpected ';'`. Workaround: `while` loops in collision_core/mesh. |
-| `2026-04-26-cbt-modules-substring-false-positive.md` | 2026-04-26 | 🐞 Open — manifest-parser `modules` substring grab. Not isolation-tested this pass; workaround (banner + split-token comments) in `cyrius.cyml`. |
+| `2026-04-26-cyrius-cli-arg-clobbers-source.md` | 2026-04-26 | 🐞 **Live (presumed)** — not re-tested (destructive: overwrites source). Workaround: `CYRIUS_VERBOSE=1` env, never an unknown flag before a subcommand. |
+| `2026-04-26-cyrius-for-empty-clauses.md` | 2026-04-26 | 🐞 **Live** — re-confirmed: `for (; cond;)` → parser `unexpected ';'`. Workaround: `while` loops in collision_core/mesh. |
+
+**Archived — fixed on 6.2.11 (`docs/development/issues/archived/`)**:
+
+| File | Filed | Resolution (verified 2026-06-15) |
+|---|---|---|
+| `2026-04-26-cbt-modules-substring-false-positive.md` | 2026-04-26 | ✅ Fixed — a `[build]` comment with the token `modules` + a `[lib] modules` array no longer mis-binds; build compiles only the source. |
+| `2026-04-26-cc5-18-arg-fn-scrambles-params.md` | 2026-04-26 | ✅ Fixed — `f18(1..18)` of params {1,2,7,8,11,12,18} → exit 59 (exact); SysV scramble gone. `src/calc.cyr`'s 10-arg split left in place (optional revert). |
+| `2026-04-26-cyrius-lint-rc-as-warning-count.md` | 2026-04-26 | ✅ Fixed — 2-warning file now exits 0 while still printing `  warn …` lines; CI's `^\s*warn ` stdout grep remains the load-bearing gate. |
 
 ---
 
@@ -186,7 +201,7 @@ Scheduled doc decisions, surfaced so they aren't forgotten when the trigger arri
 |---|---|---|---|
 | 1 | **Roadmap + Release History rotate every release** — completed arcs move out of active-work into the Release History table at closeout. | Every release | Per CLAUDE.md Work Loop §10–11. Last done in the v2.4.6 sweep. |
 | 2 | **Re-run `bench-history.sh` at release closeout** — keep `benchmarks.md` + `bench-history.csv` current; "numbers don't lie." | Every release with perf-relevant change | ✅ Done 2026-05-29 (was stale at `8a08c99`; now `b1165f9`). |
-| 3 | **Re-verify tracked `issues/` filings at each toolchain bump** — re-test on the new pin; `git mv` resolved ones to `issues/archived/`. | Each `cyrius.cyml` pin bump | ✅ Done 2026-05-29 on 6.0.14 — all 5 still live, none moved. |
+| 3 | **Re-verify tracked `issues/` filings at each toolchain bump** — re-test on the new pin; move resolved ones to `issues/archived/`. | Each `cyrius.cyml` pin bump | ✅ Done 2026-06-15 on 6.2.11 — 3 of 5 fixed and archived (modules-substring, 18-arg-fn, lint rc); 2 still live (for-empty-clauses confirmed; CLI-clobber not re-tested). Prior: 2026-05-29 on 6.0.14 (all 5 live). |
 | 4 | **Periodic security audit** — full source scan before a major release or after significant surface change; supersede with a new dated `docs/audit/` doc. | Before 3.0.0; on significant change | Last: 2026-04-15 + 2026-05-29. |
 
 ---

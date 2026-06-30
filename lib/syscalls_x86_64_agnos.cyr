@@ -54,6 +54,20 @@ enum SysNrAgnos {
     SYS_RENAME = 31;               # rename(old, oldlen, new, newlen) → 0 / -1  (uses a4=r10)
     SYS_LINK = 32;                 # link(target, targetlen, linkpath, linkpathlen) → 0 / -1 (a4)
     SYS_STAT = 33;                 # stat(path, pathlen, statbuf) → 0 / -1
+    SYS_UNAME = 34;                # uname(buf, len=64) → 0; 4×16-byte fields (§4.3)
+    SYS_SYSINFO = 35;             # sysinfo(buf, len=40) → 0; 5×u64, byte-direct (§4.4)
+    SYS_LSEEK = 58;               # lseek(fd, offset, whence) → new pos / -1; whence 0=SET/1=CUR/2=END
+    #   (agnos 1.46.x — repositions the VFS_EXT2_FILE cursor). Linux peer = 8.
+    SYS_FLOCK = 59;               # flock(fd, op) → 0 / -1; op SH=1/EX=2/UN=8 (+NB=4); inode-keyed advisory
+    #   lock, non-blocking (contended → -1), released on close#6 + exit (agnos 1.46.x). Linux peer = 73.
+    SYS_WINSIZE = 60;             # winsize() → (cols<<16)|rows / -1; no args, live FB char grid (agnos 1.45.13).
+    #   NOTE: #60 == the Linux exit number, so `_agnos_emit_gate` was reworked to verify
+    #   the actual program-exit syscall (#0) rather than scan for any `mov eax,60`.
+    SYS_SYMLINK = 63;             # symlink(target, targetlen, linkpath, linkpathlen) → 0 / -1 (a4=r10).
+    #   target/targetlen = the link's TEXT contents (1..4096 B; NOT a path the kernel resolves);
+    #   linkpath/linkpathlen = where the link is created (ext2 only). agnos #63 — the next free
+    #   number after WINSIZE (#0–62 taken), kernel `symlink`#63 landed at agnos 1.51.0. Mirrors
+    #   SYS_LINK=32's 4-arg ABI exactly. (issue 2026-06-29-agnos-sys-symlink-peer.)
 }
 
 # ================================================================
@@ -112,10 +126,14 @@ enum SysNrAgnosTimer {
 
 # ================================================================
 # 1.45.x net / entropy / wall-clock band — the TLS + net-tools
-# enabler (agnos 1.45.0–1.45.4). NOT part of the frozen 0-33 surface;
-# mirrors agnos/kernel/core/syscall.cyr's #45–#55 dispatch. The
+# enabler (agnos 1.45.0–1.45.6). NOT part of the frozen 0-33 surface;
+# mirrors agnos/kernel/core/syscall.cyr's #45–#57 dispatch. The
 # register ABI is unchanged (rax=num, rdi/rsi/rdx/r10 = a1..a4); #52/#53
-# ride a4=r10. See proposal 2026-06-14-agnos-net-entropy-clock-syscalls.md.
+# ride a4=r10. The CLIENT band (#45–#55) landed 1.45.0–1.45.4; the SERVER
+# band (#56/#57, both 1-arg) landed 1.45.5 (sock_listen/sock_accept) +
+# 1.45.6 (LISTEN-slot reclaim hardening). See proposal
+# 2026-06-14-agnos-net-entropy-clock-syscalls.md +
+# 2026-06-18-agnos-server-socket-peer.md.
 # ================================================================
 enum SysNrAgnosNet {
     SYS_GETRANDOM = 45;    # getrandom(buf, len, flags) → bytes / 0 (len<=0) / -1 (bad range)
@@ -123,12 +141,49 @@ enum SysNrAgnosNet {
     SYS_SOCK_CONNECT = 47; # sock_connect(dst_ip, dst_port, src_port) → conn_id 0..7 / -1; BLOCKS ~8s
     SYS_SOCK_SEND = 48;    # sock_send(conn_id, buf, len) → bytes (≤len) / -1; BLOCKS
     SYS_SOCK_RECV = 49;    # sock_recv(conn_id, buf, maxlen) → bytes / 0=WOULD_BLOCK / -1=EOF (inverted from Linux)
-    SYS_SOCK_CLOSE = 50;   # sock_close(conn_id) → 0 / -1
+    SYS_SOCK_CLOSE = 50;   # sock_close(conn_id|listen_id) → 0/-1; on a LISTEN slot reaps children (1.45.6)
     SYS_UDP_BIND = 51;     # udp_bind(port) → listener_id 0..7 / -1
     SYS_UDP_SEND = 52;     # udp_send(dst_ip, (sport<<16)|dport, buf, len[=a4]) → bytes / 0 / -1
     SYS_UDP_RECV = 53;     # udp_recv(listener_id, buf, maxlen, addr_out[=a4]) → bytes / 0=none / -1
     SYS_UDP_UNBIND = 54;   # udp_unbind(listener_id) → 0 / -1
     SYS_ICMP_ECHO = 55;    # icmp_echo(dst_ip) → RTT ms (≥0) / -1; BLOCKS ~3s
+    SYS_SOCK_LISTEN = 56;  # sock_listen(port) → listen_id 0..7 / -1; merges bind+listen, non-blocking (1.45.5)
+    SYS_SOCK_ACCEPT = 57;  # sock_accept(listen_id) → conn_id / -1 (WOULD_BLOCK / bad id); non-blocking (1.45.5)
+    SYS_NET_CONFIG = 61;   # net_config(field) → packed IPv4 / 0 unset / -1 bad field (agnos 1.45.16)
+}
+
+# ================================================================
+# Signals — agnos kernel uses POSIX/Linux numbering (SIGCHLD=17 is
+# hard-coded in the kernel; kill#16 sets `1<<sig`; signalfd#18 returns
+# the bit position AS the signal number — kernel vfs_read_signalfd).
+# The MECHANISM (SYS_KILL/SIGPROCMASK/SIGNALFD + sys_* wrappers) was
+# already present; these are the userland number/flag constants the
+# Linux/macOS/aarch64 peers carry but agnos lacked. From
+# 2026-06-23-cyrius-agnos-peer-missing-signal-number-constants.md.
+# ================================================================
+enum AgnosSignal {
+    SIGHUP = 1;
+    SIGINT = 2;
+    SIGQUIT = 3;
+    SIGKILL = 9;
+    SIGUSR1 = 10;
+    SIGUSR2 = 12;
+    SIGTERM = 15;
+    SIGCHLD = 17;
+    SIGCONT = 18;
+    SIGSTOP = 19;
+    SIGPWR = 30;
+}
+
+enum AgnosSigAction {
+    SIG_BLOCK = 0;
+    SIG_UNBLOCK = 1;
+    SIG_SETMASK = 2;
+}
+
+enum AgnosSfdFlag {
+    SFD_NONBLOCK = 2048;
+    SFD_CLOEXEC = 524288;
 }
 
 # ----------------------------------------------------------------
@@ -148,6 +203,18 @@ enum SysNrAgnosNet {
 var AGNOS_SOCK_TAG = 0x40000000;
 var _agnos_conn_tbl: i64[8];
 var _agnos_conn_ready = 0;
+# v6.2.22: server-socket adapter (sock_listen#56 / sock_accept#57). A LISTEN
+# socket reuses the SAME fd-slot allocator + tag as a client conn, but its slot
+# holds a kernel listen_id in _agnos_listen_tbl (listen_id+1; 0 = not a listen
+# socket) rather than a conn_id in _agnos_conn_tbl. The conn_tbl slot of a listen
+# socket stays -1 (reserved) so (a) _agnos_fd_conn returns -1 → sys_read/sys_write
+# on a listen fd fail-loud instead of mis-#48/#49-ing, and (b) _agnos_sock_open
+# won't reallocate it. _agnos_listen_port stashes the bind() port for listen() to
+# issue #56 with (the kernel merges bind+listen). sock_accept allocates a FRESH
+# conn fd-slot for each accepted conn_id → it rides the existing #48/#49/#50 path.
+# See 2026-06-18-agnos-server-socket-peer.md.
+var _agnos_listen_tbl: i64[8];
+var _agnos_listen_port: i64[8];
 # recv-poll bounds: a wall-clock deadline (#46) plus a hlt-count
 # backstop for when the RTC is unreadable (time_unix → 0).
 var AGNOS_SOCK_RECV_TIMEOUT_S = 30;
@@ -196,9 +263,19 @@ fn sys_read(fd, buf, count): i64 {
 fn sys_close(fd): i64 {
     if (_agnos_is_sock_fd(fd) == 1) {
         var slot = fd & 7;
-        var v = load64(&_agnos_conn_tbl + slot * 8);
-        store64(&_agnos_conn_tbl + slot * 8, 0);   # free the slot
-        if (v > 0) { return syscall(SYS_SOCK_CLOSE, v - 1); }
+        # v6.2.22: free ALL server-socket state for the slot uniformly, then
+        # issue the right kernel close. Clearing listen_port + listen_tbl on
+        # EVERY socket-fd close (not just the listen path) stops a recycled slot
+        # from inheriting a stale port: a bind-without-listen — or a bind then a
+        # FAILED listen — close used to leave listen_port set, so the next user
+        # that listened without re-binding would silently mis-listen on it.
+        var lv = load64(&_agnos_listen_tbl + slot * 8);   # listen_id+1, or 0
+        var v = load64(&_agnos_conn_tbl + slot * 8);      # conn_id+1, -1, or 0
+        store64(&_agnos_listen_tbl + slot * 8, 0);
+        store64(&_agnos_listen_port + slot * 8, 0);
+        store64(&_agnos_conn_tbl + slot * 8, 0);
+        if (lv > 0) { return syscall(SYS_SOCK_CLOSE, lv - 1); }   # LISTEN: reaps children (1.45.6)
+        if (v > 0) { return syscall(SYS_SOCK_CLOSE, v - 1); }     # client/accepted conn: FIN
         return 0;
     }
     return syscall(SYS_CLOSE, fd);
@@ -215,6 +292,17 @@ fn sys_chmod(path, mode): i64 { return 0; }
 # (a3) lands with 1.41.2 mount-routing — passing it now is forward-
 # compatible (kernel ignores a3 until then). Explicit length, no NUL.
 fn sys_open(name, namelen, flags): i64 { return syscall(SYS_OPEN, name, namelen, flags); }
+
+# lseek(fd, offset, whence) — reposition a VFS_EXT2_FILE cursor (agnos 1.46.x).
+# whence 0=SEEK_SET / 1=SEEK_CUR / 2=SEEK_END. Returns the new absolute pos / -1.
+# Same arg order as Linux lseek (the agnos kernel handler reads a1/a2/a3), so a
+# raw `syscall(SYS_LSEEK, fd, off, whence)` is ABI-correct on agnos too.
+fn sys_lseek(fd, off, whence): i64 { return syscall(SYS_LSEEK, fd, off, whence); }
+
+# flock(fd, op) — advisory whole-file lock (agnos 1.46.x). op = LOCK_SH(1) /
+# LOCK_EX(2) / LOCK_UN(8) (+ LOCK_NB(4)). Returns 0 / -1. NON-BLOCKING on agnos
+# (contended → -1 WOULD_BLOCK; the caller poll-spins), released on close#6 + exit.
+fn sys_flock(fd, op): i64 { return syscall(SYS_FLOCK, fd, op); }
 
 # Duplicate `fd` (stub: returns `fd` unchanged today).
 fn sys_dup(fd): i64 { return syscall(SYS_DUP, fd); }
@@ -243,6 +331,32 @@ fn WIFSIGNALED(status): i64 { return 0; }
 # The terminating signal — always 0 on agnos (signals aren't encoded in the status).
 fn WTERMSIG(status): i64 { return 0; }
 
+# Allocate an 8-byte (64-bit) pending-signal mask, zeroed.
+fn sigset_new(): i64 {
+    var set = alloc(8);
+    store64(set, 0);
+    return set;
+}
+
+# Set signal `signum` in `set`. LOAD-BEARING: agnos's kernel mask is
+# bit-per-signal-NUMBER (`1<<sig`) — NOT libc's `1<<(sig-1)` that the Linux
+# peer uses — because kill#16 sets `1<<sig` and signalfd#18 returns the bit
+# position AS the signal number (kernel vfs_read_signalfd). Mirroring the
+# Linux -1 here would silently desync sigset_add from kill/signalfd.
+fn sigset_add(set, signum): i64 {
+    var mask = load64(set);
+    mask = mask | (1 << signum);
+    store64(set, mask);
+    return 0;
+}
+
+# True iff signal `signum` is set in `set` (same `1<<sig` convention).
+fn sigset_has(set, signum): i64 {
+    var mask = load64(set);
+    if ((mask & (1 << signum)) != 0) { return 1; }
+    return 0;
+}
+
 # Send signal `sig` to process `pid` (pid 0 protected; self/child only).
 fn sys_kill(pid, sig): i64 { return syscall(SYS_KILL, pid, sig); }
 
@@ -251,6 +365,11 @@ fn sys_pause(): i64 { return syscall(SYS_PAUSE); }
 
 # Return the current uid (stub: always 0 / root).
 fn sys_getuid(): i64 { return syscall(SYS_GETUID); }
+
+# Effective uid. agnos has no separate euid (capability-gated, not euid-perms),
+# so it routes to getuid — giving the portable `sys_geteuid` surface (present in
+# the Linux/macOS peers) a uniform agnos definition. See lib/sys.cyr is_root.
+fn sys_geteuid(): i64 { return syscall(SYS_GETUID); }
 
 # Halt the machine (does not return).
 fn sys_reboot(): i64 { return syscall(SYS_REBOOT); }
@@ -281,12 +400,30 @@ fn sys_getdents(dir_fd, buf, bufsize): i64 { return syscall(SYS_GETDENTS, dir_fd
 # Returns 0, or -1.
 fn sys_stat(path, pathlen, statbuf): i64 { return syscall(SYS_STAT, path, pathlen, statbuf); }
 
+# agnos has no access(2). sigil's ~20 call sites all probe TPM / IMA /
+# secureboot / cert paths with mode=0 (F_OK), none of which exist on
+# agnos, and treat !=0 as absent — so report absent for every probe.
+# `mode` is ignored (agnos has no ring-3 permission model). Fail-closed:
+# a security probe that cannot confirm presence must report absent.
+# UPGRADE PATH (consumer needing existence-true on agnos): strlen(path),
+# then `syscall(SYS_STAT, path, len, scratch) == 0 ? 0 : -1` with a
+# ≥STAT_BUFSZ scratch buffer. (issue 2026-06-21 C2.)
+fn sys_access(path, mode): i64 { return 0 - 1; }
+
 # Rename `old`→`new` within one filesystem (4-arg: a4 rides r10 §1a).
 fn sys_rename(old, oldlen, new, newlen): i64 { return syscall(SYS_RENAME, old, oldlen, new, newlen); }
 
 # Hard-link `target`→`linkpath` (4-arg, a4 in r10; ext2 only initially).
 fn sys_link(target, targetlen, linkpath, linkpathlen): i64 {
     return syscall(SYS_LINK, target, targetlen, linkpath, linkpathlen);
+}
+
+# Create a symbolic link at `linkpath` whose TEXT contents are `target` (4-arg, a4 in r10; ext2
+# only). `target` is the link body — it may point at a nonexistent or relative path; the kernel
+# validates it as a 1..4096-byte user buffer and does NOT resolve it. Returns 0 / -1. Unblocks
+# `--agnos` programs (ark `.so → .so.N` install, agnova, kriya `ln -s`). (issue 2026-06-29.)
+fn sys_symlink(target, targetlen, linkpath, linkpathlen): i64 {
+    return syscall(SYS_SYMLINK, target, targetlen, linkpath, linkpathlen);
 }
 
 # Map `length` bytes (anonymous, zero-filled, 2 MB-granular). Returns
@@ -360,6 +497,17 @@ fn sys_sock_recv(conn_id, buf, maxlen): i64 { return syscall(SYS_SOCK_RECV, conn
 # Close a conn (#50; FIN+ACK if established) + free its buffers. 0, or -1.
 fn sys_sock_close(conn_id): i64 { return syscall(SYS_SOCK_CLOSE, conn_id); }
 
+# Server-socket band (#56/#57, agnos 1.45.5/.6). Both 1-arg, non-blocking.
+# net.cyr's sock_bind/listen/accept compose these via the listen↔fd adapter
+# below. See 2026-06-18-agnos-server-socket-peer.md.
+# sock_listen(port): merge bind+listen on a local TCP port → listen_id 0..7,
+# or -1 (port already bound / kernel conn table full).
+fn sys_sock_listen(port): i64 { return syscall(SYS_SOCK_LISTEN, port); }
+# sock_accept(listen_id): drive net_poll then tcp_accept → the next ESTABLISHED
+# conn_id 0..7 (a normal conn for #48/#49/#50), or -1 (none pending = WOULD_BLOCK
+# / bad listen_id).
+fn sys_sock_accept(listen_id): i64 { return syscall(SYS_SOCK_ACCEPT, listen_id); }
+
 # Raw UDP (dig / DNS). #52 packs both ports into arg2 (src<<16|dst) and
 # rides `len` on a4=r10; #53 rides the optional 16-byte `addr_out` on
 # a4=r10 (peer src_ip@+0, src_port@+8; pass 0 to skip). recv: 0 = none
@@ -381,13 +529,41 @@ fn sys_udp_unbind(listener_id): i64 { return syscall(SYS_UDP_UNBIND, listener_id
 # BLOCKS ~3s. dst_ip is the kernel ip4() form (resolve via dig first).
 fn sys_icmp_echo(dst_ip): i64 { return syscall(SYS_ICMP_ECHO, dst_ip); }
 
+# winsize() — live framebuffer character grid (#60). Returns (cols<<16)|rows,
+# or -1. No args, non-blocking, IF=0-safe. Consumed by agnsh / darshana tty
+# sizing / kii / the desktop terminal grid. (agnos 1.45.13)
+fn sys_winsize(): i64 { return syscall(SYS_WINSIZE); }
+
+# net_config(field) — kernel network-config getter (#61). Each field is a
+# packed IPv4 (oct1<<24|...|oct4): 0=net_ip, 1=net_netmask, 2=net_gateway,
+# 3=net_dns_server. Returns the packed addr (>=0; 0 if the global is
+# unconfigured) or -1 for an unknown field. No buffer, non-blocking,
+# IF=0-safe (like uptime_ms#40 / winsize#60). Lets a ring-3 resolver target
+# the DHCP-leased on-subnet DNS instead of an off-subnet public IP. Consumers
+# MUST use these wrappers (not bare syscall(61,...)) — on Linux #61 is wait4.
+# See 2026-06-23-agnos-net-config-syscall-wrapper.md.
+fn sys_net_config(field): i64 { return syscall(SYS_NET_CONFIG, field); }
+# Packed IPv4 of this host's interface (net_config field 0).
+fn sys_net_ip(): i64 { return syscall(SYS_NET_CONFIG, 0); }
+# Packed IPv4 netmask (net_config field 1).
+fn sys_net_netmask(): i64 { return syscall(SYS_NET_CONFIG, 1); }
+# Packed IPv4 of the default-route gateway (net_config field 2).
+fn sys_net_gateway(): i64 { return syscall(SYS_NET_CONFIG, 2); }
+# Packed IPv4 of the DHCP-leased DNS resolver, else the gateway (net_config field 3).
+fn sys_net_dns_server(): i64 { return syscall(SYS_NET_CONFIG, 3); }
+
 # Lazily zero the conn table (defensive — globals are zero-init, but the
 # explicit pass mirrors lib/chrono.cyr's _chrono_init_mdays idiom and is
 # robust to the array landing in a non-zeroed region).
 fn _agnos_conn_init(): i64 {
     if (_agnos_conn_ready != 0) { return 0; }
     var i = 0;
-    while (i < 8) { store64(&_agnos_conn_tbl + i * 8, 0); i = i + 1; }
+    while (i < 8) {
+        store64(&_agnos_conn_tbl + i * 8, 0);
+        store64(&_agnos_listen_tbl + i * 8, 0);   # v6.2.22: server-socket tables
+        store64(&_agnos_listen_port + i * 8, 0);
+        i = i + 1;
+    }
     _agnos_conn_ready = 1;
     return 0;
 }
@@ -429,6 +605,43 @@ fn _agnos_fd_conn(fd): i64 {
     _agnos_conn_init();
     var slot = fd & 7;
     var v = load64(&_agnos_conn_tbl + slot * 8);
+    if (v <= 0) { return 0 - 1; }
+    return v - 1;
+}
+
+# v6.2.22: server-socket adapter helpers — net.cyr's sock_bind/listen/accept
+# compose these. Indexed by the tagged fd's slot (fd & 7), the same fd-slot
+# space the client adapter uses.
+
+# sock_bind: stash the local port so sock_listen can issue #56 with it (the
+# kernel merges bind+listen, so bind itself does no syscall). Returns 0.
+fn _agnos_listen_stash_port(fd, port): i64 {
+    _agnos_conn_init();
+    var slot = fd & 7;
+    store64(&_agnos_listen_port + slot * 8, port);
+    return 0;
+}
+
+# sock_listen: issue sock_listen(#56) on the stashed port and store listen_id+1
+# in the slot's listen table (marking it a LISTEN socket). Returns 0, or -1
+# (port in use / kernel conn table full). The conn_tbl slot stays -1 so the
+# listen fd never routes a read/write to #48/#49.
+fn _agnos_listen_start(fd): i64 {
+    _agnos_conn_init();
+    var slot = fd & 7;
+    var port = load64(&_agnos_listen_port + slot * 8);
+    var lid = syscall(SYS_SOCK_LISTEN, port);
+    if (lid < 0) { return 0 - 1; }
+    store64(&_agnos_listen_tbl + slot * 8, lid + 1);
+    return 0;
+}
+
+# Resolve a tagged listen fd to its kernel listen_id, or -1 if the slot isn't a
+# LISTEN socket (used by sock_accept to map the fd back to its id before #57).
+fn _agnos_fd_listen(fd): i64 {
+    _agnos_conn_init();
+    var slot = fd & 7;
+    var v = load64(&_agnos_listen_tbl + slot * 8);
     if (v <= 0) { return 0 - 1; }
     return v - 1;
 }

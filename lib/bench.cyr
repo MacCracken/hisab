@@ -20,15 +20,36 @@
 #   bench_batch_stop(b, 10000);
 #   bench_report(b);
 
-# clock_gettime syscall
-var SYS_CLOCK_GETTIME = 228;
+# clock_gettime clock-id. NOTE: the syscall NUMBER 228 MUST be a literal at each
+# call site below — never a `var`. The macOS __got reroute and Windows IAT reroute
+# for syscall(228) are keyed on a COMPILE-TIME LITERAL in parse_expr (sc_num is set
+# only when the first arg const-folds; a `var` does not fold → sc_num=-1 → no reroute
+# → a raw Darwin/Windows syscall 228, which is garbage). A `var SYS_CLOCK_GETTIME=228`
+# here returned -9 (dead clock, all elapsed=0) on arm64-macOS — issue 2026-06-16, the
+# yantra bench-zero. Linux is immune (svc 228 genuinely IS clock_gettime). Mirrors
+# chrono.clock_now_ns. See CHANGELOG [6.2.15].
 var CLOCK_MONOTONIC_RAW = 4;
 
 # Get monotonic nanoseconds
 fn now_ns(): i64 {
-    var ts[2];
-    syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC_RAW, &ts);
+    var ts[16];   # 16-byte timespec (Linux reads load64(&ts) + load64(&ts+8))
+    #ifdef CYRIUS_TARGET_MACOS
+    # arm64 Darwin: syscall(228) → libSystem `_clock_gettime_nsec_np(clock_id)`, which
+    # RETURNS ns (it does NOT fill the timespec); Darwin CLOCK_MONOTONIC is **6**. Take
+    # the return value; `&ts` is the 3rd-arg placeholder. (x86-macho 228 unrouted → HELD.)
+    return syscall(228, 6, &ts);
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    # Windows: syscall(228) → kernel32!GetTickCount64 → ms since boot in the return
+    # register (not the timespec). ×1e6 = ns. (clock-id arg is ignored by GetTickCount64.)
+    return syscall(228, CLOCK_MONOTONIC_RAW, &ts) * 1000000;
+    #endif
+    #ifndef CYRIUS_TARGET_MACOS
+    #ifndef CYRIUS_TARGET_WIN
+    syscall(228, CLOCK_MONOTONIC_RAW, &ts);
     return load64(&ts) * 1000000000 + load64(&ts + 8);
+    #endif
+    #endif
 }
 
 # Benchmark state: { name_ptr, start_ns, elapsed_ns, iterations, min_ns, max_ns }
@@ -208,6 +229,22 @@ fn bench_batch_stop(b, batch_size): i64 {
 }
 
 # Format nanoseconds as human-readable
+# Write `minor` (0-999, the sub-unit fraction in thousandths) zero-padded to 3
+# digits at buf. Returns chars written (always 3). Without the pad, fmt_int_buf
+# drops leading zeros — "1.50us" for 1050ns parses as 1500ns (a 45% error), which
+# flat-lined the micro-bench history (issue 2026-06-10 PF-01). 3-digit pad keeps
+# _fmt_time both human-readable AND exactly machine-parseable by bench-history.sh.
+fn _fmt_pad3(minor, buf): i64 {
+    var t = 0;
+    if (minor < 100) { store8(buf, 48); t = t + 1; }
+    if (minor < 10)  { store8(buf + t, 48); t = t + 1; }
+    return t + fmt_int_buf(minor, buf + t);
+}
+
+# Format nanoseconds as a human-readable, exactly-parseable string. Each branch
+# prints `major.fff<unit>` where fff is the next-smaller unit zero-padded to 3
+# digits (s→ms, ms→us, us→ns). v6.2.15 (PF-01): the us branch used to print
+# integer us (no fraction), pinning every sub-2us bench at 1000-2000ns.
 fn _fmt_time(ns, buf): i64 {
     var major = 0;
     var minor = 0;
@@ -217,7 +254,7 @@ fn _fmt_time(ns, buf): i64 {
         minor = (ns % 1000000000) / 1000000;
         tlen = fmt_int_buf(major, buf);
         store8(buf + tlen, 46);
-        tlen = tlen + 1 + fmt_int_buf(minor, buf + tlen + 1);
+        tlen = tlen + 1 + _fmt_pad3(minor, buf + tlen + 1);
         store8(buf + tlen, 115);
         store8(buf + tlen + 1, 0);
         return tlen + 1;
@@ -227,14 +264,17 @@ fn _fmt_time(ns, buf): i64 {
         minor = (ns % 1000000) / 1000;
         tlen = fmt_int_buf(major, buf);
         store8(buf + tlen, 46);
-        tlen = tlen + 1 + fmt_int_buf(minor, buf + tlen + 1);
+        tlen = tlen + 1 + _fmt_pad3(minor, buf + tlen + 1);
         memcpy(buf + tlen, "ms", 2);
         store8(buf + tlen + 2, 0);
         return tlen + 2;
     }
     if (ns >= 1000) {
         major = ns / 1000;
+        minor = ns % 1000;
         tlen = fmt_int_buf(major, buf);
+        store8(buf + tlen, 46);
+        tlen = tlen + 1 + _fmt_pad3(minor, buf + tlen + 1);
         memcpy(buf + tlen, "us", 2);
         store8(buf + tlen + 2, 0);
         return tlen + 2;

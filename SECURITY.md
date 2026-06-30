@@ -34,8 +34,8 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Version | Supported |
 |---------|-----------|
-| hisab 2.4.x (current) | Yes |
-| hisab 2.0–2.3 | Best-effort |
+| hisab 2.6.x (current) | Yes |
+| hisab 2.0–2.5 | Best-effort |
 | Rust 1.x | Available via pre-2.0 git tags, unsupported |
 
 ## Reporting

@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+## [2.6.7] - 2026-06-30 — Cyrius 6.3.11 toolchain bump + sakshi 2.4.2
+
+Maintenance release: toolchain pin **6.2.11 → 6.3.11** and first-party dep
+**sakshi 2.1.0 → 2.4.2**. Pure infrastructure — **no library source change**.
+All 34 math modules compile clean on the new pin; the `dist/hisab.cyr` bundle is
+byte-identical apart from its version header. 957/957 tests pass; every
+cleanliness gate (lint/fmt/vet), the fuzz harness, and all 26 benchmarks are
+green on 6.3.11. **Not breaking** — the bundle's stdlib leaf requirements are
+unchanged from 2.6.6 (`ganita` + `math`); consumers need no `[deps]` edits,
+though bumping their own toolchain pin to 6.3.11 is recommended for parity.
+
+### Changed
+- **`cyrius.cyml`** — toolchain pin `6.2.11` → `6.3.11`; `[deps.sakshi]` tag
+  `2.1.0` → `2.4.2`.
+- **Vendored stdlib** — `lib/*.cyr` re-resolved to the 6.3.11 toolchain. Note the
+  6.3.x CLI split: `cyrius deps` now resolves **git deps only** (it commit-pins
+  sakshi in `cyrius.lock`), while **`cyrius lib sync`** (no `--full`) vendors the
+  declared `[deps] stdlib` subset — superseding the 6.2.x-era `cyrius deps`-does-
+  both flow. Stdlib files that actually changed on the bump: `assert`, `bench`,
+  `fnptr`, `io`, `math`, and the `syscalls` platform variants
+  (`aarch64_linux`/`linux_common`/`windows`/`x86_64_agnos`/`x86_64_linux`).
+  `ganita` (the math umbrella) is unchanged. Every vendored stdlib file now
+  byte-matches the 6.3.11 toolchain; `cyrius.lock` is 30 deps (1 commit-pinned),
+  `cyrius deps --verify` 30/30.
+- **`src/main.cyr`** — CLI smoke version string `hisab 2.3.3` → `hisab 2.6.7`
+  (had been stale since 2.3.3; Cyrius source can't interpolate `VERSION`, so the
+  string is hand-maintained — it had drifted across the 2.4.x/2.5.x/2.6.x bumps).
+- **`dist/hisab.cyr`** — regenerated via `cyrius distlib` (header now v2.6.7;
+  bundle body unchanged, 16,878 lines).
+- **`.gitignore`** — ignore `/dist/hisab.deps`, the leaf-requirements companion
+  6.3.x `cyrius distlib` emits alongside the tracked `dist/hisab.cyr`.
+
+### Fixed
+- **`lib/result.cyr`** (vendored stdlib, transitive dep of `io`/`tagged`) — picked
+  up the 6.3.11 `_die` portability fix: the unwrap-on-`Err` abort was a bare
+  `syscall(60, 1)` that no-op'd on agnos (an undefined syscall number → `-1`), so
+  unwrap-on-`Err` **failed open** and continued with garbage; it is now a
+  target-guarded abort (`#60` on backed targets, `exit` on agnos). No effect on
+  the Linux x86_64 build path, but vendoring a 6.2.11 stdlib file under a 6.3.11
+  pin was wrong. `cyrius lib sync` skipped it (transitive include not in the
+  declared subset); completed from the authoritative `6.3.11/lib`. `atomic.cyr`
+  (transitive dep of `alloc`) was already byte-identical to 6.3.11.
+
+### Security
+- **Tracked toolchain issues re-verified on 6.3.11** (doc-health mandate at each
+  pin bump). The 2 still-open filings carry forward unchanged: the C-style
+  `for (;cond;)` empty-clause parse error **still reproduces** (confirmed on
+  6.3.11 — workaround remains `while`); the destructive CLI unknown-flag-clobbers-
+  source issue was not re-tested. No regressions; the 3 issues fixed at the
+  6.2.11 bump remain archived.
+
 ## [2.6.6] - 2026-06-15 — Cyrius 6.2.11 toolchain bump + stdlib math reorg
 
 Toolchain upgrade from **6.0.14 → 6.2.11**. The 6.2.x stdlib reorganised its

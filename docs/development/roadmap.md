@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.2.11**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
+> Written in Cyrius. Toolchain: **6.3.11**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
 
 ## Scope
 
@@ -11,13 +11,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.6
+## Current -- v2.6.7
 
 - **34 math modules in `src/`, ~16,900 lines** (`lib/` is vendored-only)
 - **957 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~16,878 lines / 553 KB (all **34 modules**) — fits cycc 6.2.11's 1 MB input_buf with ample headroom
-- Toolchain **6.2.11** (bumped from 6.0.14 this release — stdlib transcendentals + matrix/linalg now live in the new `ganita` umbrella module; `math` keeps `f64_le`/`f64_ge`); CI fmt/lint/vet/security all green; supply chain SHA-locked. Tracked-issue re-verify on the new pin: **3 of 5 upstream bugs fixed** (archived); for-empty-clauses still open
+- **`dist/hisab.cyr` distlib bundle** ~16,878 lines / 553 KB (all **34 modules**) — fits cycc 6.3.11's 1 MB input_buf with ample headroom
+- Toolchain **6.3.11** (bumped from 6.2.11 this release — infrastructure-only: no library source change, `ganita` math umbrella unchanged, `lib/result.cyr` picked up the 6.3.11 `_die` agnos-portability fix; first-party dep sakshi 2.1.0 → 2.4.2); CI fmt/lint/vet/security all green; supply chain SHA-locked. Tracked-issue re-verify on the new pin: for-empty-clauses **still open** (no new fixes; the 3 fixed at the 6.2.11 bump stay archived)
 - **Arc history (all complete)** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security, fixed three real collision bugs), 2.5.x (CGA depth + matrix guard, CGA 1 → 29 assertions), and 2.6.x (differential-geometry depth — sectional curvature, Weyl, parallel transport, geodesic deviation, higher forms; 28 known-manifold assertions, posture audited solid). Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 957 across them.
 
 ---
@@ -75,6 +75,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.7 | 2026-06-30 | 16,600 | 34 | Toolchain 6.2.11 → **6.3.11** + sakshi 2.1.0 → **2.4.2**. Infrastructure-only — no library source change; bundle byte-identical bar the header. `lib/result.cyr` `_die` agnos-portability fix; smoke version string 2.3.3 → 2.6.7. for-empty-clauses still open on 6.3.11 (no new fixes). 957 |
 | 2.6.6 | 2026-06-15 | 16,600 | 34 | Toolchain 6.0.14 → **6.2.11**. Stdlib math reorg: transcendentals + matrix/linalg → new `ganita` umbrella; `math` gains NaN-correct `f64_le`/`f64_ge` (dropped local copies). `[deps]`: +ganita −matrix −linalg. 3 of 5 tracked toolchain bugs fixed (archived). 957 |
 | 2.6.5 | 2026-05-30 | 16,600 | 34 | Diffgeo arc COMPLETE — P(-1)/security audit (posture solid) + `math.md §2` differential-geometry reference. Docs-only, 957 |
 | 2.6.4 | 2026-05-29 | 16,600 | 34 | Diffgeo arc — higher-order forms (`wedge_2_1`/`wedge_3_1`); 8 wedge antisymmetry/grading assertions. 957 |

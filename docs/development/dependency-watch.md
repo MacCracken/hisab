@@ -4,7 +4,7 @@ Tracked dependency version constraints and upgrade paths.
 
 ## Cyrius Toolchain
 
-**Status:** Pinned to **6.2.11** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
+**Status:** Pinned to **6.3.11** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
 
 **Note:** Cyrius stdlib provides dense LU, Cholesky, QR, SVD, eigendecomposition. As of 6.2.x these live in the new **`ganita`** umbrella module (which re-exports the former `matrix`/`linalg` API in full and also hosts the transcendentals). This is a critical dependency — hisab's `linalg_ext.cyr` wraps these functions. The `[deps] stdlib` list pulls `ganita` (not `matrix`/`linalg` — listing those alongside `ganita` collides).
 
@@ -19,7 +19,8 @@ Tracked dependency version constraints and upgrade paths.
 - **6.0.0**: `cc5`→`cycc` / `cyrc`→`cybs` binary rename (transparent to consumers; `cyrius build` dispatches, back-compat symlinks ship through 6.0.x). No source-syntax breaks for a pure math library.
 - 6.0.2: lockfile/vendoring fix — `cyrius deps` now hashes all `.cyr` under `lib/` and writes a real lock (the empty 0-byte `cyrius.lock` bug present since 5.11.8); vendored deps are regular file-copies, not the dangling symlinks that broke CI.
 - **6.0.14**: clean build/test (901/901 as of v2.4.6). Migration was manifest-only (pin bump + sakshi resolution); the 34 math modules moved `lib/`→`src/` so the committed `lib/` no longer shadows the toolchain's version-pinned stdlib snapshot.
-- **6.2.11** (current pin, v2.6.6): stdlib math reorg. The transcendentals (`f64_acos`/`f64_asin`/`f64_atan2`/`f64_pow`/`f64_sinh`/`f64_cosh`/`f64_tanh` + hyperbolic inverses) moved out of `math` into the new **`ganita`** module, which also subsumes `matrix`/`linalg` (re-exports their full API). `math` now ships NaN-correct `f64_le`/`f64_ge` (hisab dropped its local copies). `[deps] stdlib`: `+ganita`, `−matrix`, `−linalg`. Clean build, 957/957 tests, all gates green. Tracked-issue re-verify: **3 of 5 fixed** (modules-substring, 18-arg-fn scramble, lint rc-as-count → all archived); for-empty-clauses still open. Vendored `lib/` re-resolved via `cyrius deps` (30 files — **not** the full-snapshot `cyrius lib sync`, which over-vendors unused platform variants and breaks `deps --verify` on a spurious `process_agnos.cyr` entry); `cyrius.lock` 30 deps, verify 30/30.
+- **6.2.11** (v2.6.6): stdlib math reorg. The transcendentals (`f64_acos`/`f64_asin`/`f64_atan2`/`f64_pow`/`f64_sinh`/`f64_cosh`/`f64_tanh` + hyperbolic inverses) moved out of `math` into the new **`ganita`** module, which also subsumes `matrix`/`linalg` (re-exports their full API). `math` now ships NaN-correct `f64_le`/`f64_ge` (hisab dropped its local copies). `[deps] stdlib`: `+ganita`, `−matrix`, `−linalg`. Clean build, 957/957 tests, all gates green. Tracked-issue re-verify: **3 of 5 fixed** (modules-substring, 18-arg-fn scramble, lint rc-as-count → all archived); for-empty-clauses still open. Vendored `lib/` re-resolved via `cyrius deps` (30 files — **not** the full-snapshot `cyrius lib sync`, which over-vendors unused platform variants and breaks `deps --verify` on a spurious `process_agnos.cyr` entry); `cyrius.lock` 30 deps, verify 30/30.
+- **6.3.11** (current pin, v2.6.7): infrastructure-only bump from 6.2.11. **No library source change** — all 34 modules compile clean; `dist/hisab.cyr` byte-identical apart from the version header. Stdlib delta touched `assert`/`bench`/`fnptr`/`io`/`math` + the `syscalls` platform variants (`ganita` unchanged); `lib/result.cyr` (transitive dep of `io`/`tagged`) picked up the 6.3.11 `_die` agnos-portability fix (was a bare `syscall(60,1)` that no-op'd → failed-open on agnos; now target-guarded). 6.3.x CLI split: **`cyrius deps`** resolves git deps only (commit-pins sakshi in the lock), **`cyrius lib sync`** (no `--full`) vendors the declared stdlib subset — superseding the 6.2.x `cyrius deps`-does-both flow. Every vendored stdlib file byte-matches 6.3.11; `cyrius.lock` 30 deps (1 commit-pinned), verify 30/30. 957/957 tests, all gates green. Tracked-issue re-verify: for-empty-clauses **still open** on 6.3.11; no new fixes (3 prior fixes stay archived).
 
 **Watching upstream:**
 - **5.7.11** — RISC-V rv64.
@@ -42,7 +43,7 @@ Tracked dependency version constraints and upgrade paths.
 
 ## sakshi (first-party dependency)
 
-**Status:** `sakshi` **2.1.0** via git, modules path `dist/sakshi.cyr`
+**Status:** `sakshi` **2.4.2** via git, modules path `dist/sakshi.cyr` (bumped 2.1.0 → 2.4.2 in v2.6.7; now commit-pinned in `cyrius.lock`)
 
 **Purpose:** Structured logging (timestamps, levels, categories)
 

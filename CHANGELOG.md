@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [2.6.8] - 2026-07-06 — collision hardening for co-compilation with the sandhi/TLS stack
+
+Two consumer-facing hardening fixes surfaced when a consumer (prakash) opts hisab
+in alongside the `sandhi` HTTP/TLS stdlib stack:
+
+### Fixed
+- **symbolic** — the two float-render scratch buffers switched from a stack array
+  sized by an enum constant (`var buf[FLOAT_RENDER_BUF]`) to `alloc(FLOAT_RENDER_BUF)`.
+  When co-compiled with the `tls`/`dynlib` stdlib modules (which relocate oversized
+  locals to shared globals), the enum-sized stack-array form tripped the compiler's
+  "array size identifier must be an enum constant" path; the heap form the compiler
+  itself recommends sidesteps it. No behavioral change — same 32-byte buffer, same
+  `fmt_float_buf` render.
+
+### Changed
+- **error** — bare error constants namespaced `ERR_*` → `HSB_ERR_*`
+  (`HSB_ERR_NONE`, `HSB_ERR_INVALID_INPUT`, `HSB_ERR_NO_CONVERGENCE`, …). hisab's
+  bare `ERR_NONE` previously imposed a last-wins global collision on every consumer
+  (prakash namespaced its own errors `PK_ERR_*` to work around it); moving the
+  namespace into hisab fixes it at the root. **Values are unchanged** (`HSB_ERR_NONE`
+  is still 0); consumers that check numeric return values (`== 0`) are unaffected —
+  only name-based references need the `HSB_` prefix.
+
+
 ## [2.6.7] - 2026-06-30 — Cyrius 6.3.11 toolchain bump + sakshi 2.4.2
 
 Maintenance release: toolchain pin **6.2.11 → 6.3.11** and first-party dep

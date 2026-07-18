@@ -6,7 +6,7 @@
 **Hisab impact:** `lib/collision_core.cyr` (3 sites) and `lib/collision_mesh.cyr` (1 site) had loops in this shape from the original 2.2.0 port. Files were never in the build chain pre-2.2.2, so the syntax errors were dormant.
 **Hisab workaround:** Converted to `while`. See `lib/collision_core.cyr` lines ~376, 404, 498 and `lib/collision_mesh.cyr` line ~204 (current state) and the CHANGELOG 2.2.2 "Fixed" entry.
 **Status:** Open — possibly intentional (Cyrius prefers `for ident in start..end` / `for ident in collection`).
-**Re-verified:** 2026-06-30 on pinned **6.3.11** (v2.6.7 bump) — both forms still reject: `for (; cond; step)` → `unexpected ';'`; `for (init; cond;)` → `expected '=', got '{'`. Prior re-verify 2026-06-15 on 6.2.11 (also live).
+**Re-verified:** 2026-07-17 on pinned **6.4.66** (v2.6.9 bump) — both forms still reject: `for (; cond; step)` → `unexpected ';'`; `for (init; cond;)` → `expected '=', got '{'`. Prior: 2026-06-30 on 6.3.11; 2026-06-15 on 6.2.11 (all live).
 
 ## Symptom
 

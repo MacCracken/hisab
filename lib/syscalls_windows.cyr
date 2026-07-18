@@ -177,7 +177,40 @@ fn WTERMSIG(status): i64 { return 0; }
 fn sys_chmod(path, mode): i64 { return 0; }
 # Best-effort dup2 stub: returns the requested newfd (handle dup is rerouted).
 fn sys_dup2(oldfd, newfd): i64 { return newfd; }
-# mkdir stub (Windows dir creation is rerouted via Win32); no-op success.
-fn sys_mkdir(path, mode): i64 { return 0; }
-# unlink stub (Windows file deletion is rerouted via Win32); no-op success.
-fn sys_unlink(path): i64 { return 0; }
+# mkdir — routed to kernel32!CreateDirectoryW by the PE backend's syscall(83)
+# reroute (src/backend/pe/emit.cyr _pe_ensure_createdir, v5.11.22). Returns 0 on
+# success, -1 on failure. (Was a no-op `return 0` stub through v6.3.42 — VR-01
+# surfaced that it never actually created the directory on Windows.)
+fn sys_mkdir(path, mode): i64 { return syscall(83, path, mode); }
+# unlink — routed to kernel32!DeleteFileW by the PE backend's syscall(87) reroute
+# (_pe_ensure_deletef, v5.11.22). Returns 0 on success, -1 on failure. (Was a
+# no-op `return 0` stub through v6.3.42 — VR-01 surfaced the file was never deleted.)
+fn sys_unlink(path): i64 { return syscall(87, path); }
+
+# v6.4.66 — getpeername / getsockname now route to ws2_32 (was a fail-closed -ENOSYS
+# stub v6.4.64→.65). The PE syscall router maps 0xF036 → ws2_32!getpeername and
+# 0xF037 → ws2_32!getsockname (src/backend/x86/emit.cyr EGETPEERNAME_PE / EGETSOCKNAME_PE),
+# 3-arg, same shape as bind — so sandhi's per-IP rate limiting has a real peer address
+# on Windows. Winsock returns 0 on success, SOCKET_ERROR (-1) with WSAGetLastError =
+# WSAENOTCONN (10057) on an unconnected socket (NOT the POSIX errno space). Consumers
+# still treat <0 as "peer unknown" and fail open — sandhi's peer API already does.
+# Closes docs/development/issues/2026-07-14-windows-getpeername-reroute-missing.md
+#
+# Normalize to the POSIX contract consumers check (`r < 0` = failure): ws2_32
+# returns 0 on success (peer written) or SOCKET_ERROR (int -1, which cyrius sees
+# ZERO-extended as 0xFFFFFFFF — a POSITIVE value that would defeat a `< 0` check
+# and let a caller fabricate a peer, cf. sandhi_server_peer_sockaddr's
+# `if (r < 0) return 0`). On failure return `-WSAGetLastError` (negative, and it
+# carries the real Winsock error, e.g. -10057 WSAENOTCONN). WSAGetLastError is read
+# immediately, before any other call can reset the per-thread last-error.
+fn sys_getpeername(fd, addr, addrlen): i64 {
+    var r = syscall(61494, fd, addr, addrlen);
+    if (r == 0) { return 0; }
+    return 0 - syscall(61476);      # -WSAGetLastError (0xF024)
+}
+# getsockname (0xF037 → ws2_32!getsockname): same normalization as getpeername.
+fn sys_getsockname(fd, addr, addrlen): i64 {
+    var r = syscall(61495, fd, addr, addrlen);
+    if (r == 0) { return 0; }
+    return 0 - syscall(61476);
+}

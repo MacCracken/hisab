@@ -6,7 +6,21 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-06-30 (v2.6.7) — Cyrius 6.2.11 → **6.3.11** toolchain
+> **Last refresh**: 2026-07-17 (v2.6.9) — Cyrius 6.3.11 → **6.4.66** toolchain
+> bump + sakshi 2.4.2 → **2.4.6**. Infrastructure + a test-only fix. Synced the pin +
+> dep versions across README / CLAUDE / CONTRIBUTING / roadmap / overview /
+> dependency-watch / cyrius.cyml; added the CHANGELOG 2.6.9 entry, the roadmap 2.6.9 **and
+> the missing 2.6.8** release-history rows, and the threat-model 2026-07-17 audit row.
+> Re-vendored `lib/` to 6.4.66 (all 27 declared-subset files byte-match; transitive
+> `result`/`atomic` already identical — no hand-refresh this bump); smoke version string
+> 2.6.7 → 2.6.9. **Fixed** the pre-existing `tests/modules.tcyr` compile failure (cycc
+> identifier-lexer bug — `iv_add`/`iv_sub`/`iv_mul` → `unknown` with `interval.cyr`;
+> renamed `iv_sum`/`iv_diff`/`iv_prod`), restoring 312/312 → **957/957** across 4 suites;
+> filed `issues/2026-07-17-cyrius-interval-ident-lex.md`. Re-verified the (now 3) open
+> tracked toolchain issues on 6.4.66: for-empty-clauses **still live**, interval-ident-lex
+> **new/worked-around**, cli-arg-clobber not re-tested (destructive).
+>
+> **Prior refresh**: 2026-06-30 (v2.6.7) — Cyrius 6.2.11 → **6.3.11** toolchain
 > bump + sakshi 2.1.0 → **2.4.2**. Infrastructure-only (no library source change).
 > Synced the pin + dep versions across README / CLAUDE / CONTRIBUTING / roadmap /
 > overview / dependency-watch; added the CHANGELOG 2.6.7 entry and the
@@ -45,7 +59,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 
 ---
 
-## At a glance — inventory (last reviewed 2026-06-30, v2.6.7)
+## At a glance — inventory (last reviewed 2026-07-17, v2.6.9)
 
 **~23 markdown files** across the repo. Bucket counts:
 
@@ -56,7 +70,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 | 🟠 **Read-through outstanding** | 0 | CONTRIBUTING refreshed; `tool-issues.md` deleted; `linalg-proposal` archived. Cleared. |
 | 🔵 **Evergreen** | 1 | `CODE_OF_CONDUCT.md` — Contributor Covenant; re-read only on policy change. |
 | 📅 **Dated artifact — supersede, don't edit** | 7 | `audit/2026-04-15.md`, `audit/2026-05-29.md`, `audit/2026-05-29-cga-arc-closeout.md`, `audit/2026-05-30.md`, `benchmarks-rust-v-cyrius.md` (v2.2.0), `port-audit.md` (2026-04-15 + addendum), `development/archive/cyrius-linalg-proposal.md` (shipped). |
-| 🐞 **Tracked toolchain issues (live on 6.3.11)** | 2 | `development/issues/*` — down from 5: the 6.2.11 bump **fixed 3** (modules-substring, 18-arg-fn scramble, lint rc-as-count → `issues/archived/`). 2 still reproduce, re-confirmed on 6.3.11: for-empty-clauses (verified); CLI-clobber (not re-tested, destructive). See Tier 6. |
+| 🐞 **Tracked toolchain issues (live on 6.4.66)** | 3 | `development/issues/*` — the 6.2.11 bump fixed 3 (archived). 3 now live, re-confirmed on 6.4.66: for-empty-clauses (verified); CLI-clobber (not re-tested, destructive); **interval-ident-lex (new, v2.6.9)** — `iv_add`/`iv_sub`/`iv_mul` lex as `unknown` with `interval.cyr`, worked around by rename. See Tier 6. |
 
 Numbers approximate; rolls up from the per-tier tables below.
 
@@ -71,8 +85,8 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `README.md` | 2026-06-30 | ✅ Fresh | v2.6.7: toolchain → 6.3.11, version → 2.6.7, hisab tag → 2.6.7, sakshi 2.1.0 → 2.4.2. (Prior v2.6.6: consumer `[deps] stdlib` example → `math`+`ganita`, −matrix/−linalg.) |
-| `CHANGELOG.md` | 2026-06-30 | ✅ Fresh | **Source of truth per CLAUDE.md.** +2.6.7 entry (toolchain 6.3.11 + sakshi 2.4.2, infrastructure-only, **not** breaking). Refreshed every release. |
+| `README.md` | 2026-07-17 | ✅ Fresh | v2.6.9: toolchain → 6.4.66, version → 2.6.9, hisab tag → 2.6.9, sakshi 2.4.2 → 2.4.6. |
+| `CHANGELOG.md` | 2026-07-17 | ✅ Fresh | **Source of truth per CLAUDE.md.** +2.6.9 entry (toolchain 6.4.66 + sakshi 2.4.6 + modules.tcyr compile fix, **not** breaking). Refreshed every release. |
 | `CLAUDE.md` | 2026-06-30 | ✅ Fresh | v2.6.7: toolchain/pin → 6.3.11, status line, sakshi dep → 2.4.2. (Prior v2.6.6: stdlib dep list → `math`+`ganita`.) |
 | `VERSION` | 2026-06-30 | ✅ Fresh | Single source of truth (`2.6.7`). |
 | `CONTRIBUTING.md` | 2026-06-30 | ✅ Fresh | v2.6.7: Cyrius pin → 6.3.11. (Prior: 6.2.11; 5.7.10 → 6.0.14; "Adding a Module" corrected; +fmt/distlib gates.) |

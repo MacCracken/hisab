@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.3.11**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
+> Written in Cyrius. Toolchain: **6.4.66**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
 
 ## Scope
 
@@ -11,13 +11,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.7
+## Current -- v2.6.9
 
 - **34 math modules in `src/`, ~16,900 lines** (`lib/` is vendored-only)
-- **957 test assertions**, 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **957 test assertions** (foundation 307 + hisab 175 + edge_cases 163 + modules 312), 26 benchmarks (incl. amplified SIMD batches), fuzz harness
 - **CLI smoke binary** ~152 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~16,878 lines / 553 KB (all **34 modules**) — fits cycc 6.3.11's 1 MB input_buf with ample headroom
-- Toolchain **6.3.11** (bumped from 6.2.11 this release — infrastructure-only: no library source change, `ganita` math umbrella unchanged, `lib/result.cyr` picked up the 6.3.11 `_die` agnos-portability fix; first-party dep sakshi 2.1.0 → 2.4.2); CI fmt/lint/vet/security all green; supply chain SHA-locked. Tracked-issue re-verify on the new pin: for-empty-clauses **still open** (no new fixes; the 3 fixed at the 6.2.11 bump stay archived)
+- **`dist/hisab.cyr` distlib bundle** ~16,878 lines / 553 KB (all **34 modules**) — fits cycc 6.4.66's 1 MB input_buf with ample headroom
+- Toolchain **6.4.66** (bumped from 6.3.11 this release — infrastructure + a test-only fix: no library source change, bundle byte-identical bar the header; first-party dep sakshi 2.4.2 → 2.4.6). `tests/modules.tcyr` had been silently un-compilable (a cycc identifier-lexer bug: result vars `iv_add`/`iv_sub`/`iv_mul` lex as `unknown` with `interval.cyr` in the unit — pre-existing, reproduces on 6.3.11; renamed to `iv_sum`/`iv_diff`/`iv_prod`, restoring the suite to 312/312). CI fmt/lint/vet/security all green; supply chain SHA-locked. Tracked-issue re-verify on the new pin: for-empty-clauses **still open**; new interval-ident-lex issue filed (`docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`) and worked around
 - **Arc history (all complete)** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security, fixed three real collision bugs), 2.5.x (CGA depth + matrix guard, CGA 1 → 29 assertions), and 2.6.x (differential-geometry depth — sectional curvature, Weyl, parallel transport, geodesic deviation, higher forms; 28 known-manifold assertions, posture audited solid). Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 957 across them.
 
 ---
@@ -75,6 +75,8 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.9 | 2026-07-17 | 16,600 | 34 | Toolchain 6.3.11 → **6.4.66** + sakshi 2.4.2 → **2.4.6**. Infrastructure + test-only fix — no library source change; bundle byte-identical bar the header. Fixed a pre-existing `tests/modules.tcyr` compile failure (cycc identifier-lexer bug: `iv_add`/`iv_sub`/`iv_mul` → `unknown` with `interval.cyr`; renamed `iv_sum`/`iv_diff`/`iv_prod`), restoring the suite to 312/312. Smoke string 2.6.7 → 2.6.9. New interval-ident-lex issue filed; for-empty-clauses still open. 957 |
+| 2.6.8 | 2026-07-06 | 16,600 | 34 | Collision hardening for co-compilation with the sandhi/TLS stack: `symbolic` float-render scratch moved `var buf[N]` → `alloc(N)` (dodges the "array size must be enum constant" path under `tls`/`dynlib` co-compile); bare error constants namespaced `ERR_*` → `HSB_ERR_*` (values unchanged) to stop a last-wins global collision on consumers. 957 |
 | 2.6.7 | 2026-06-30 | 16,600 | 34 | Toolchain 6.2.11 → **6.3.11** + sakshi 2.1.0 → **2.4.2**. Infrastructure-only — no library source change; bundle byte-identical bar the header. `lib/result.cyr` `_die` agnos-portability fix; smoke version string 2.3.3 → 2.6.7. for-empty-clauses still open on 6.3.11 (no new fixes). 957 |
 | 2.6.6 | 2026-06-15 | 16,600 | 34 | Toolchain 6.0.14 → **6.2.11**. Stdlib math reorg: transcendentals + matrix/linalg → new `ganita` umbrella; `math` gains NaN-correct `f64_le`/`f64_ge` (dropped local copies). `[deps]`: +ganita −matrix −linalg. 3 of 5 tracked toolchain bugs fixed (archived). 957 |
 | 2.6.5 | 2026-05-30 | 16,600 | 34 | Diffgeo arc COMPLETE — P(-1)/security audit (posture solid) + `math.md §2` differential-geometry reference. Docs-only, 957 |

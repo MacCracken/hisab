@@ -77,7 +77,7 @@ fn file_open(path: cstring, flags, mode): i64 {
     var namelen = 0;
     while (load8(path + namelen) != 0) { namelen = namelen + 1; }
     var ao = 0;
-    if ((flags & 3) != 0) { ao = ao | 0x1; }       # O_WRONLY/O_RDWR -> AO_WRONLY (O_RDONLY=0)
+    ao = ao | (flags & 3);   # O_/AO_ access mode 1:1 (0/1/2); v6.4.27: was folding O_RDWR→AO_WRONLY
     if ((flags & 64) != 0) { ao = ao | 0x100; }    # O_CREAT  -> AO_CREAT
     if ((flags & 512) != 0) { ao = ao | 0x200; }   # O_TRUNC  -> AO_TRUNC
     if ((flags & 1024) != 0) { ao = ao | 0x400; }  # O_APPEND -> AO_APPEND
@@ -112,11 +112,60 @@ fn xunlink(path): i64 {
     return sys_unlink(path, an);
     #endif
     #ifdef CYRIUS_TARGET_WIN
-    return -1;   # Windows: no POSIX unlink (DeleteFileW — not wired; no consumer)
+    return syscall(0xF035, path);   # v6.4.58: kernel32!DeleteFileW reroute (EDELETEFILEW_PE)
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     #ifndef CYRIUS_TARGET_WIN
     return sys_unlink(path);
+    #endif
+    #endif
+}
+
+# Rename `oldpath` → `newpath` on the SAME filesystem (atomic replace of an
+# existing target — the durable half of file_write_atomic). Portable exactly as
+# file_open bridges sys_open: POSIX (Linux/macOS/aarch64) is 2-arg
+# sys_rename(old,new) (the backend ESYSXLAT handles aarch64 82→renameat 38+AT_FDCWD
+# and macho 82→BSD 128); AGNOS is length-carrying 4-arg sys_rename(old,ol,new,nl);
+# Windows has no POSIX rename — route to a MoveFileExW(old,new,
+# MOVEFILE_REPLACE_EXISTING) reroute (syscall 0xF034; backend/x86/emit.cyr
+# EMOVEFILEEX_PE). Returns 0 on success / negative errno (POSIX/AGNOS) or -1
+# (Windows BOOL fail). See issue 2026-07-12-thoth-portable-atomic-file-write.md.
+fn file_rename(oldpath, newpath): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var ol = 0;
+    while (load8(oldpath + ol) != 0) { ol = ol + 1; }
+    var nl = 0;
+    while (load8(newpath + nl) != 0) { nl = nl + 1; }
+    return sys_rename(oldpath, ol, newpath, nl);
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return syscall(0xF034, oldpath, newpath);   # kernel32!MoveFileExW (REPLACE_EXISTING)
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_rename(oldpath, newpath);
+    #endif
+    #endif
+}
+
+# Flush a file descriptor's data + metadata to stable storage. Portable:
+# Linux x86/aarch64 + macOS use sys_fsync (x86 #74; the backend renumbers to
+# aarch64 82 / Darwin BSD 95). AGNOS has no per-fd fsync in its AO_* syscall set,
+# so a whole-system sys_sync() is the best available approximation (documented
+# residual — coarser than fsync but honestly durable). Windows is a no-op: the
+# MoveFileExW replace after a closed handle is durable enough for the atomic-write
+# use, and there is no cheap portable FlushFileBuffers reroute wired (documented
+# choice). Returns 0 / negative errno.
+fn xfsync(fd): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_sync();          # no per-fd fsync on agnos — whole-fs sync (residual)
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0;                   # MoveFileEx-after-close is durable enough (documented)
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_fsync(fd);
     #endif
     #endif
 }
@@ -234,6 +283,114 @@ fn file_write_all(path, buf, len): i64 {
     var written = file_write(fd, buf, len);
     file_close(fd);
     return written;
+}
+
+# ── v6.4.57: portable crash-safe atomic write (thoth's model edit/create tools).
+# file_write_all is NOT crash-safe (O_TRUNC empties the target at open, so a short
+# write / crash leaves the user's file truncated). file_write_atomic writes to a
+# unique sibling temp, fsyncs, then rename()s over the target — an atomic same-fs
+# replace — so the original is never left half-written. See issue
+# 2026-07-12-thoth-portable-atomic-file-write.md.
+
+# Per-process monotonic counter for temp-name uniqueness (combined with the pid so
+# two concurrent writers of the same path pick disjoint temp names).
+var _io_atomic_ctr = 0;
+
+# Portable getpid: Windows via GetCurrentProcessId (0xF01C); everything else
+# (Linux x86/aarch64, macOS, agnos) via sys_getpid.
+fn _io_pid(): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    return syscall(0xF01C);
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_getpid();
+    #endif
+}
+
+# Append the decimal digits of a non-negative value to `buf` at `pos`; return the
+# new pos. No `%` (division-based; reverse-then-emit).
+fn _io_append_dec(buf, pos, val): i64 {
+    if (val == 0) { store8(buf + pos, 48); return pos + 1; }
+    var tmp[24];
+    var n = 0;
+    var v = val;
+    while (v > 0) {
+        var q = v / 10;
+        store8(&tmp + n, 48 + (v - q * 10));
+        n = n + 1;
+        v = q;
+    }
+    while (n > 0) {
+        n = n - 1;
+        store8(buf + pos, load8(&tmp + n));
+        pos = pos + 1;
+    }
+    return pos;
+}
+
+# Build "<path>.cyrtmp.<pid>.<ctr>" into a freshly alloc'd, NUL-terminated buffer.
+# Returns the pointer (caller does not free — same short-lived-heap convention as
+# getenv's result copy). ~40 bytes of suffix headroom covers pid+ctr decimals.
+fn _io_tmp_name(path): i64 {
+    var plen = strlen(path);
+    var buf = alloc(plen + 48);
+    memcpy(buf, path, plen);
+    memcpy(buf + plen, ".cyrtmp.", 8);
+    var pos = plen + 8;
+    pos = _io_append_dec(buf, pos, _io_pid());
+    store8(buf + pos, 46);   # '.'
+    pos = pos + 1;
+    _io_atomic_ctr = _io_atomic_ctr + 1;
+    pos = _io_append_dec(buf, pos, _io_atomic_ctr);
+    store8(buf + pos, 0);
+    return buf;
+}
+
+# Crash-safe write of `len` bytes from `buf` to `path`. Writes a unique sibling
+# temp, loops the write until all bytes land (partial-write-safe), fsyncs, closes,
+# then atomically renames the temp over `path`. On ANY failure the temp is unlinked
+# and the negative errno is returned, leaving the original `path` intact. Returns
+# 0 on success. v6.4.58: the on-failure unlink is now real on EVERY target — xunlink
+# routes to DeleteFileW (0xF035) on Windows, so no rare-path temp leak lingers there.
+fn file_write_atomic(path, buf, len): i64 {
+    var tmp = _io_tmp_name(path);
+    var fd = file_open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
+    if (fd < 0) { return fd; }
+    var off = 0;
+    while (off < len) {
+        var w = file_write(fd, buf + off, len - off);
+        if (w <= 0) {
+            file_close(fd);
+            xunlink(tmp);
+            if (w == 0) { return -5; }   # no forward progress → -EIO
+            return w;                    # negative errno from the kernel
+        }
+        off = off + w;
+    }
+    xfsync(fd);
+    var cr = file_close(fd);
+    if (cr < 0) { xunlink(tmp); return cr; }
+    var rr = file_rename(tmp, path);
+    if (rr < 0) { xunlink(tmp); return rr; }
+    return 0;
+}
+
+# Create `path` ONLY if it does not already exist (no-clobber), returning the new
+# write fd or -EEXIST (-17). On Linux/macOS this is enforced atomically at the
+# kernel via O_CREAT|O_EXCL. AGNOS has no exclusive-create AO_* bit (its AO_* set
+# is RDONLY/WRONLY/RDWR/CREAT/TRUNC/APPEND/DIRECTORY only), so there it degrades to
+# a file_exists pre-check + plain O_CREAT — RESIDUAL: NOT atomic. v6.4.58: Windows is
+# now atomic too — EOPEN_PE maps O_CREAT|O_EXCL (mask 0xC0) → CREATE_NEW, so the open
+# itself fails with ERROR_FILE_EXISTS when the target already exists (no clobber, no
+# race). See issue 2026-07-12-windows-atomic-write-residuals.md (item A).
+fn file_create_exclusive(path, mode): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (file_exists(path) == 1) { return -17; }   # -EEXIST (non-atomic residual)
+    return file_open(path, O_WRONLY | O_CREAT, mode);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return file_open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+    #endif
 }
 
 # File-lock helpers — portable via xflock, which centralizes the per-target

@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+## [2.6.9] - 2026-07-17 — Cyrius 6.4.66 toolchain bump + sakshi 2.4.6; modules.tcyr compile fix
+
+Maintenance release: toolchain pin **6.3.11 → 6.4.66** (a full minor across 55 patch
+releases) and first-party dep **sakshi 2.4.2 → 2.4.6**. **No library source change** — all
+34 math modules compile clean on the new pin; the `dist/hisab.cyr` bundle is byte-identical
+apart from its version header, and a consumer that includes the full bundle compiles and runs
+end-to-end on 6.4.66. Not breaking — the bundle's stdlib leaf requirements are unchanged from
+2.6.8 (`ganita` + `math`); consumers need no `[deps]` edits (bumping their own pin to 6.4.66
+is recommended for parity).
+
+### Changed
+- **Toolchain pin `6.3.11` → `6.4.66`.** Re-vendored `lib/` from the new pin via
+  `cyrius lib sync` — all 27 declared-subset stdlib files byte-match 6.4.66; the transitive
+  `lib/result.cyr` + `lib/atomic.cyr` were already identical (no hand-refresh needed this
+  bump). `cyrius.lock` 30 deps (1 commit-pinned), `deps --verify` 30/30. Smoke version string
+  `src/main.cyr` 2.6.7 → 2.6.9 (was stale from 2.6.8).
+- **sakshi `2.4.2` → `2.4.6`** (git, `dist/sakshi.cyr`). 2.4.6 pins cyrius 6.4.49 (≤ 6.4.66);
+  its shipped surface links only `fnptr` + `atomic` and is unchanged, so logging behaviour is
+  identical.
+
+### Fixed
+- **tests/modules.tcyr — the suite could not compile** (a pre-existing failure, unrelated to
+  the toolchain bump: it reproduces identically on the prior 6.3.11 pin). The interval-
+  arithmetic section named its result vars `iv_add` / `iv_sub` / `iv_mul`, which trip a cycc
+  identifier-lexer bug — they lex as an `unknown` token once `src/interval.cyr` is in the unit,
+  failing the whole file at `var iv_add = ivl_add(...)` (`expected identifier, got unknown`),
+  deterministically (8/8). Renamed them to `iv_sum` / `iv_diff` / `iv_prod` (`iv_div` /
+  `iv_neg` / `iv_abs` were unaffected). The suite now compiles stably and runs **312/312**,
+  restoring the full **957/957** across all four suites. Filed the toolchain bug at
+  `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`; a `NOTE:` comment in the
+  test guards the names against a well-meaning rename-back.
+
+### Verified
+- `cyrius build` + smoke (prints `hisab 2.6.9`), `cyrius tests tests/` (**957/957**, 4 suites,
+  0 failed), `cyrius bench` (all metrics nominal), `cyrius lint` / `cyrius fmt --check` /
+  `cyrius vet` (clean), `cyrius distlib` (regenerated, v2.6.9, 16,878 lines) — all green on
+  6.4.66. Tracked-issue re-verify on the new pin: for-empty-clauses **still open**
+  (unchanged); the new interval-ident-lex issue filed and worked around.
+
 ## [2.6.8] - 2026-07-06 — collision hardening for co-compilation with the sandhi/TLS stack
 
 Two consumer-facing hardening fixes surfaced when a consumer (prakash) opts hisab

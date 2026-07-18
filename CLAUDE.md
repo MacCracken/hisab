@@ -9,9 +9,9 @@ differential geometry, symbolic algebra.
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (sovereign systems language, compiled by cycc)
-- **Toolchain**: Cyrius 6.3.11 (`cyrius.cyml: cyrius = "6.3.11"`)
+- **Toolchain**: Cyrius 6.4.66 (`cyrius.cyml: cyrius = "6.4.66"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.6.7 — compiles cleanly under cycc 6.3.11. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~553 KB / 16,878 lines, fits cycc 6.3.11's 1 MB input_buf with ample headroom) ships at `dist/hisab.cyr` and is consumer-tested end-to-end. Library validated via tests (957/957). The 2.3.x, 2.4.x, 2.5.x, and 2.6.x (differential-geometry depth) arcs are all complete. The stdlib transcendentals live in the `ganita` module (introduced at the 6.2.11 bump, which also subsumed `matrix`/`linalg`); the 6.3.11 bump (2.6.7) was infrastructure-only — see CHANGELOG 2.6.7.
+- **Status**: 2.6.9 — compiles cleanly under cycc 6.4.66. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~553 KB / 16,878 lines, well under cycc's 1 MB input_buf) ships at `dist/hisab.cyr` and is consumer-tested end-to-end on 6.4.66. Library validated via tests (957/957 across 4 suites). The 2.3.x, 2.4.x, 2.5.x, and 2.6.x (differential-geometry depth) arcs are all complete. The stdlib transcendentals live in the `ganita` module (introduced at the 6.2.11 bump, which also subsumed `matrix`/`linalg`); the 6.4.66 bump (2.6.9) was infrastructure + a test-only fix — the `modules.tcyr` suite had been silently un-compilable due to a cycc identifier-lexer bug (result vars `iv_add`/`iv_sub`/`iv_mul` lex as `unknown` with `interval.cyr` in the unit; renamed to `iv_sum`/`iv_diff`/`iv_prod`, see `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`) — see CHANGELOG 2.6.9.
 
 ## Consumers
 
@@ -35,7 +35,7 @@ cyrius bench tests/hisab.bcyr            # run benchmarks
   inverses) plus the full `matrix`/`linalg` API; do **not** also list `matrix`
   or `linalg` (duplicate-definition collisions). `math` stays for the inclusive
   comparisons, clamp/lerp/min/max/sign and the exp/ln polyfills.
-- **sakshi** 2.4.2 — structured logging (first-party)
+- **sakshi** 2.4.6 — structured logging (first-party)
 
 No external deps. No FFI. No libc. All first-party, pinned in
 `cyrius.cyml` and SHA-locked in `cyrius.lock`.
@@ -49,7 +49,7 @@ src/*.cyr            — the 34 math modules (the library source). Self-containe
                        (no `include` lines); stdlib resolves via [deps] stdlib
 lib/                 — vendored stdlib + first-party deps ONLY (managed by
                        `cyrius deps`) — no project source here
-dist/hisab.cyr       — full 34-module distlib bundle (~535 KB / 16,446 lines),
+dist/hisab.cyr       — full 34-module distlib bundle (~553 KB / 16,878 lines),
                        regenerated via `cyrius distlib`. Consumers pull this
                        single file via [deps.hisab] modules = ["dist/hisab.cyr"]
 examples/            — small demos (basic_math.cyr)
@@ -134,7 +134,7 @@ VERSION              — single source of truth for version
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.3.11"` in `cyrius.cyml`. CI and release both grep
+- **Toolchain pin**: `cyrius = "6.4.66"` in `cyrius.cyml`. CI and release both grep
   the manifest; no hardcoded versions in YAML
 - **Tag filter**: release triggers on `tags: ['v?[0-9]+.[0-9]+.[0-9]+']` (with or without `v` prefix)
 - **Version-verify gate**: release asserts `VERSION == git tag` before building

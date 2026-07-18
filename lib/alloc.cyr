@@ -45,6 +45,16 @@ include "lib/atomic.cyr"
 
 var _alloc_lock = 0;
 
+# v6.3.17 (PF-02): single-threaded fast path. The v6.0.64 spinlock+2-fences is only
+# needed once REAL threads share the heap; the dominant case (cycc itself, and every
+# non-threaded consumer) is single-threaded and paid a 3-6× alloc tax for a lock it
+# never contends. `_threads_active` is armed to 1 by thread_create/_thread_spawn
+# (Linux/agnos/Windows) BEFORE the child runs — a monotonic 0→1 set that happens-before
+# any concurrency (clone/CreateThread is a full barrier), so both parent and child then
+# take the locked path. While it is 0, acquire/release are no-ops → the ~10 ns bump path
+# is restored. See issues/2026-06-10-runtime-bench-suite-blind.md (PF-02).
+var _threads_active = 0;
+
 # Acquire the global alloc spinlock (busy-wait until the 0→1 CAS wins), then an
 # ACQUIRE barrier. Mirrors lib/thread.cyr mutex_lock: on x86 the CAS (lock
 # cmpxchg) is already a full barrier so atomic_fence is a cheap near-no-op, but
@@ -52,6 +62,7 @@ var _alloc_lock = 0;
 # critical-section _heap_ptr read can be observed before the lock is held,
 # yielding a stale bump pointer → overlap-allocation on a weak memory model.
 fn _alloc_lock_acquire(): i64 {
+    if (_threads_active == 0) { return 0; }   # v6.3.17 PF-02: single-threaded → no lock
     #ifdef CYRIUS_ARCH_X86
     while (atomic_cas(&_alloc_lock, 0, 1) == 0) { }
     atomic_fence();
@@ -71,6 +82,7 @@ fn _alloc_lock_acquire(): i64 {
 # acquirer reads a stale bump pointer and overlap-allocates. Mirrors
 # lib/thread.cyr mutex_unlock.
 fn _alloc_lock_release(): i64 {
+    if (_threads_active == 0) { return 0; }   # v6.3.17 PF-02: single-threaded → no lock
     #ifdef CYRIUS_ARCH_X86
     atomic_fence();
     atomic_store(&_alloc_lock, 0);
@@ -79,6 +91,21 @@ fn _alloc_lock_release(): i64 {
     atomic_fence();
     atomic_store(&_alloc_lock, 0);
     #endif
+    return 0;
+}
+
+# Zero `n` bytes at `base`. Used only by alloc_reset() to scrub the reclaimed
+# span before the allocator hands those addresses to a new owner — closing the
+# memory-reuse information-leak (CVE-2026-34988 / CVE-2022-39393 class; filed
+# 2026-07-03 by daimon, VULN-007). A local store64/store8 loop so the
+# foundational allocator carries NO lib/string.cyr (memset) dependency; un-gated
+# so every platform backend (win/macos/agnos + the Linux block below) can call
+# it. Allocation sizes round up to 8, so spans are 8-byte-aligned and the byte
+# tail is a safety net that normally never runs. (v6.4.1)
+fn _alloc_zero(base, n): i64 {
+    var i = 0;
+    while (i + 8 <= n) { store64(base + i, 0); i = i + 8; }
+    while (i < n) { store8(base + i, 0); i = i + 1; }
     return 0;
 }
 
@@ -139,7 +166,7 @@ var _LINUX_CHUNK = 0x10000000;
 var _LINUX_MAP_ANON_PRIVATE = 0x22;
 
 # Maximum single allocation size (256MB)
-var ALLOC_MAX = 0x10000000;
+var ALLOC_MAX = 0x80000000;   # 2 GiB (v6.4.51: was 256 MiB; output_buf now allocs 1 GiB off-heap)
 
 # Round `n` up to the next _LINUX_CHUNK multiple.
 fn _linux_round_chunk(n): i64 {
@@ -215,6 +242,18 @@ fn alloc(size): i64 {
 # alloc() can't observe a half-updated bump pointer.
 fn alloc_reset(): i64 {
     _alloc_lock_acquire();
+    # Scrub the reused span of the FIRST chunk before rewinding, so a later
+    # alloc() can't read the prior occupant's bytes (memory-reuse info-leak,
+    # CVE-2026-34988 class). alloc_reset is the ONLY point the allocator hands
+    # the same address to a new owner — spills past the first chunk re-mmap
+    # FRESH kernel-zeroed chunks, so only the first chunk is a reuse channel.
+    # Still in the first chunk (the common case): the written extent is exactly
+    # _heap_ptr. Spilled to a later chunk: zero the whole first chunk — its exact
+    # fill point isn't tracked, so the untouched tail costs only a one-time page
+    # commit in the rare >256 MB-then-reset case.
+    var span = _heap_ptr - _heap_first_base;
+    if (_heap_base != _heap_first_base) { span = _heap_first_end - _heap_first_base; }
+    if (span > 0) { _alloc_zero(_heap_first_base, span); }
     _heap_base = _heap_first_base;
     _heap_ptr = _heap_first_base;
     _heap_end = _heap_first_end;

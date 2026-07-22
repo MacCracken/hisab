@@ -108,11 +108,11 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 | Metric | Value |
 |--------|-------|
 | Version | 2.6.10 |
-| Library | 34 modules, ~16,600 lines of Cyrius |
+| Library | 34 modules, ~16,900 lines of Cyrius |
 | Tests | 957 assertions across 4 suites |
 | Benchmarks | 26 operations |
 | Fuzz targets | 5 with invariant checks |
-| CLI binary | ~152 KB static ELF (`build/hisab` — version smoke test only) |
+| CLI binary | ~207 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.4.69 |
 | Dependencies | 1 (sakshi 2.4.6); no third-party, no FFI/libc |
 | Security | P(-1) audited (2026-04-15) + security/hardening pass (2026-05-29); no known vulnerabilities |

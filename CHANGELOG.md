@@ -10,7 +10,9 @@ bundle is byte-identical apart from its version header, and the bundle's stdlib 
 requirements are unchanged (`ganita` + `math`), so consumers need no `[deps]` edits (bumping
 their own pin to 6.4.69 is recommended for parity). First-party dep **sakshi stays at 2.4.6**
 — already the latest tag, so no dep change this release. The vendored stdlib picks up three
-upstream 6.4.67–6.4.69 fixes; two harden code hisab actually links (`fmt`, `math`).
+upstream 6.4.67–6.4.69 fixes; only one is on a code path hisab actually links (`fmt`, via
+`fmt_float_buf` in the `symbolic` modules), while the `math` float-parse and agnos `sys_reboot`
+fixes are vendored for snapshot parity but sit on paths hisab never exercises.
 
 ### Changed
 - **Toolchain pin `6.4.66` → `6.4.69`.** Re-vendored `lib/` from the new pin via

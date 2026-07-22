@@ -9,9 +9,9 @@ differential geometry, symbolic algebra.
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (sovereign systems language, compiled by cycc)
-- **Toolchain**: Cyrius 6.4.66 (`cyrius.cyml: cyrius = "6.4.66"`)
+- **Toolchain**: Cyrius 6.4.69 (`cyrius.cyml: cyrius = "6.4.69"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.6.9 — compiles cleanly under cycc 6.4.66. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~553 KB / 16,878 lines, well under cycc's 1 MB input_buf) ships at `dist/hisab.cyr` and is consumer-tested end-to-end on 6.4.66. Library validated via tests (957/957 across 4 suites). The 2.3.x, 2.4.x, 2.5.x, and 2.6.x (differential-geometry depth) arcs are all complete. The stdlib transcendentals live in the `ganita` module (introduced at the 6.2.11 bump, which also subsumed `matrix`/`linalg`); the 6.4.66 bump (2.6.9) was infrastructure + a test-only fix — the `modules.tcyr` suite had been silently un-compilable due to a cycc identifier-lexer bug (result vars `iv_add`/`iv_sub`/`iv_mul` lex as `unknown` with `interval.cyr` in the unit; renamed to `iv_sum`/`iv_diff`/`iv_prod`, see `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`) — see CHANGELOG 2.6.9.
+- **Status**: 2.6.10 — compiles cleanly under cycc 6.4.69. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~553 KB / 16,878 lines, well under cycc's 1 MB input_buf) ships at `dist/hisab.cyr` and is consumer-tested end-to-end on 6.4.69. Library validated via tests (957/957 across 4 suites). The 2.3.x, 2.4.x, 2.5.x, and 2.6.x (differential-geometry depth) arcs are all complete. The stdlib transcendentals live in the `ganita` module (introduced at the 6.2.11 bump, which also subsumed `matrix`/`linalg`); the 6.4.69 bump (2.6.10) is a clean patch bump — no library source change, bundle byte-identical bar the version header — that also picks up three upstream stdlib fixes (`fmt` hex/non-finite-float rendering, `math` float-parse DoS hardening, an agnos `sys_reboot` widening), see CHANGELOG 2.6.10. The prior 6.4.66 bump (2.6.9) renamed `modules.tcyr`'s interval result vars `iv_add`/`iv_sub`/`iv_mul` → `iv_sum`/`iv_diff`/`iv_prod` because the originals collide with reserved cycc SIMD intrinsic names (unusable as variables — `expected identifier, got unknown`, still live on 6.4.69); the rename is guarded by a `NOTE:` in the test — see `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`.
 
 ## Consumers
 
@@ -134,7 +134,7 @@ VERSION              — single source of truth for version
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.4.66"` in `cyrius.cyml`. CI and release both grep
+- **Toolchain pin**: `cyrius = "6.4.69"` in `cyrius.cyml`. CI and release both grep
   the manifest; no hardcoded versions in YAML
 - **Tag filter**: release triggers on `tags: ['v?[0-9]+.[0-9]+.[0-9]+']` (with or without `v` prefix)
 - **Version-verify gate**: release asserts `VERSION == git tag` before building

@@ -1,58 +1,56 @@
-# 2026-07-17 — cyrius lexer: identifiers `iv_add`/`iv_sub`/`iv_mul` lex as "unknown"
+# 2026-07-17 — cyrius: `iv_add`/`iv_sub`/`iv_mul` are reserved SIMD intrinsics, unusable as var names
 
-**Component:** `cyrius` lexer / identifier interning (cycc `lex.cyr`)
-**Toolchain seen:** cyrius 6.4.66 — **also reproduces on 6.3.11, 6.4.0, 6.4.65** (not a
-6.4.x regression; pre-dates the 2.6.9 toolchain bump)
-**Severity:** High for the affected suite — a whole `.tcyr` fails to **compile**, and the
-diagnostic points at a clean identifier, so the real cause is invisible without bisection.
-**Hisab impact:** `tests/modules.tcyr` — the interval-arithmetic section named its result
-vars `iv_add` / `iv_sub` / `iv_mul`. Any compile unit that includes `src/interval.cyr` and
-declares those names fails at the first one (`var iv_add = ivl_add(...)` →
-`expected identifier, got unknown`), taking the entire 312-assertion suite (and thus the
-whole 957-assertion run) down at compile time. Discovered during the v2.6.9 bump; the suite
-had been silently un-compilable.
-**Hisab workaround (shipped in 2.6.9):** renamed the three result vars to
-`iv_sum` / `iv_diff` / `iv_prod`. Suite compiles deterministically (0/8 fail) and runs
-312/312. A `NOTE:` comment at `tests/modules.tcyr` `test_group("interval: arithmetic")`
-warns against renaming them back.
-**Status:** Open (toolchain bug) — worked around in-tree. No known cycc fix.
+**Component:** `cyrius` lexer/parser (cycc `src/frontend/lex.cyr` ~L991-997, `parse.cyr`)
+**Toolchain seen:** cyrius 6.4.69 — reproduces on **6.3.11, 6.4.5, 6.4.6, 6.4.65, 6.4.66, 6.4.69**
+(every version tested; re-verified 2026-07-21 on the 6.4.69 pin: `var iv_add = 1;` →
+`expected identifier, got unknown`. The reserved name predates the toolchain bump — not a 6.4.x regression).
+**Severity:** Medium — hard compile failure on this suite with a misleading diagnostic; a
+one-line rename works around it.
+**Hisab impact:** `tests/modules.tcyr` — the interval-arithmetic section named its result vars
+`iv_add` / `iv_sub` / `iv_mul`. Those are reserved intrinsic tokens, so `var iv_add = ...`
+fails to compile (`expected identifier, got unknown`), taking the whole 312-assertion suite
+(and thus the 957-assertion run) down. **This is name-based, not interval-specific** — the
+interval section is simply where hisab happened to use the names.
+**Hisab workaround (shipped in 2.6.9):** renamed to `iv_sum` / `iv_diff` / `iv_prod`. Suite
+compiles deterministically (0/8 fail) and runs 312/312. A `NOTE:` comment at
+`tests/modules.tcyr` `test_group("interval: arithmetic")` guards the names.
+**Upstream:** filed at `cyrius/docs/development/issues/2026-07-17-iv-simd-intrinsic-shadows-var-name.md`
+(+ repro `.../repros/2026-07-17-iv-intrinsic-var-name.cyr`).
+**Status:** Open (toolchain bug) — worked around in-tree.
 
 ## Symptom
 
-In a compile unit that includes `src/interval.cyr`, the identifiers `iv_add`, `iv_sub`,
-`iv_mul` are lexed as an `unknown` token when they appear as a `var` name — the parser then
-reports `expected identifier, got unknown` at that line and desyncs (cascading
-`expected '(', got ')'` on the following `assert_eq` lines, then `undefined variable` for
-the never-bound name). The sibling names `iv_div`, `iv_neg`, `iv_abs`, `iv_a`, `iv_b` are
-**not** affected. Behaviour is **deterministic** for a given source (8/8 fail with the toxic
-names, 8/8 pass renamed) — it is not run-to-run flaky; it depends on the identifier
-population of the unit (a lex/intern hash collision is the leading hypothesis).
+Declaring a variable named `iv_add`, `iv_sub`, or `iv_mul` fails at compile time with
+`error: expected identifier, got unknown` pointing at the (clean) name, then the parser
+desyncs — following lines cascade into `expected '(', got ')'` and `undefined variable`. In a
+large file the real line is buried; only bisection (or knowing the cause) finds it.
+Deterministic: 8/8 fail with these names, 8/8 pass renamed. `iv_div`, `iv_neg`, `iv_abs` are
+**not** affected.
 
-Note: `iv_add` / `iv_sub` / `iv_mul` each have a one-character-longer library counterpart
-(`ivl_add` / `ivl_sub` / `ivl_mul`), but `iv_div` — which also has `ivl_div` — is fine, so a
-naive "collides with the `ivl_*` name" explanation does not hold; the trigger is
-hash-slot-specific.
+## Root cause
+
+`iv_add` / `iv_sub` / `iv_mul` (and `iv_dp8`) are **reserved SIMD intrinsics** — the lexer
+tokenizes them unconditionally as packed integer-vector ops (cycc `lib/simd.cyr` calls them as
+builtins for `i8v16`/`i16v8`/`i32v4`/`i64v2` add/sub/mul; there is no `fn iv_add` — it's a
+compiler token, `lex.cyr` L993 `ADDTOK(S, 143, 0)`). In `var <name>` position the parser wants
+an identifier, gets the intrinsic token, and falls through to the catch-all
+`expected identifier, got unknown`. `iv_div` is safe because there is no integer-vector divide
+instruction, so it was never reserved — which is exactly why the failure looks name-arbitrary.
+**Not** a hash collision or a size/buffer cap (earlier speculation): the stat tables have huge
+headroom (`CYRIUS_STATS`: identifiers 28303/262144), and a two-line program reproduces it.
 
 ## Self-contained reproducer
 
 ```cyrius
-include "src/f64_util.cyr"
-include "src/error.cyr"
-include "src/interval.cyr"
-
-alloc_init();
-test_group("repro");
-var iv_a = ivl_new(f64_from(1), f64_from(3));
-var iv_b = ivl_new(f64_from(2), f64_from(4));
-var iv_add = ivl_add(iv_a, iv_b);          # <-- error: expected identifier, got unknown
-assert_eq(f64_to(Interval_lo(iv_add)), 3, "lo");
+include "lib/syscalls.cyr"
+var iv_add = 1;          # -> error: expected identifier, got unknown
 ```
 
-`cyrius test <file>` → fails 6/6. Rename `iv_add`→`iv_sum` (and `iv_sub`/`iv_mul`
-likewise) → passes 6/6.
+`cyrius test <file>` → fails 8/8. Rename `iv_add`→`iv_sum` (etc.) → passes.
 
 ## Suggested upstream fix
 
-Audit the lexer's identifier interning / dedup hash for the `unknown`-token fallback path —
-a colliding or truncated intern for these specific byte sequences appears to mis-classify the
-token. Until then, the in-tree rename is the mitigation.
+Minimum: when the parser expects an identifier and sees an `iv_*` intrinsic token, emit a
+clear "`iv_add` is a reserved SIMD intrinsic" diagnostic and recover without desyncing.
+Better: make the intrinsics *contextual* keywords (keyword only before `(`), so the names are
+usable as identifiers everywhere else.

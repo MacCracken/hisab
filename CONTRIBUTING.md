@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius) 6.4.66 (`cyrius.cyml [package].cyrius` pins the exact version — match it, don't hardcode elsewhere)
+- [Cyrius](https://github.com/MacCracken/cyrius) 6.4.69 (`cyrius.cyml [package].cyrius` pins the exact version — match it, don't hardcode elsewhere)
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work

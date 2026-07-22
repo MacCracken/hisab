@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+## [2.6.10] - 2026-07-21 — Cyrius 6.4.69 toolchain bump
+
+Maintenance release: toolchain pin **6.4.66 → 6.4.69** (3 patch releases). **No library
+source change** — all 34 math modules compile clean on the new pin; the `dist/hisab.cyr`
+bundle is byte-identical apart from its version header, and the bundle's stdlib leaf
+requirements are unchanged (`ganita` + `math`), so consumers need no `[deps]` edits (bumping
+their own pin to 6.4.69 is recommended for parity). First-party dep **sakshi stays at 2.4.6**
+— already the latest tag, so no dep change this release. The vendored stdlib picks up three
+upstream 6.4.67–6.4.69 fixes; two harden code hisab actually links (`fmt`, `math`).
+
+### Changed
+- **Toolchain pin `6.4.66` → `6.4.69`.** Re-vendored `lib/` from the new pin via
+  `cyrius lib sync` — all 27 declared-subset stdlib files byte-match 6.4.69; the transitive
+  `lib/result.cyr` + `lib/atomic.cyr` were already identical (no hand-refresh needed, as at
+  6.4.66). `cyrius.lock` 30 deps (1 commit-pinned), `deps --verify` 30/30. Smoke version
+  string `src/main.cyr` 2.6.9 → 2.6.10.
+- **Vendored stdlib delta — three files, all upstream bug/hardening fixes:**
+  - `fmt.cyr` — `fmt_hex` / `fmt_sprintf %x` loop guard `> 0` → `!= 0`, so high-bit-set
+    values (negatives / u64 ≥ 2^63) render every digit instead of zero; and `fmt_float_buf`
+    gained a non-finite guard emitting `inf` / `-inf` / `nan` instead of the garbage
+    `-.00000-` token for Inf/NaN/out-of-i64-range inputs. **hisab links this** —
+    `symbolic.cyr` + `symbolic_ext.cyr` render coefficients via `fmt_float_buf`; for every
+    finite in-range value the output is byte-identical, so this is a pure correctness gain on
+    the non-finite edge (suite stays 957/957).
+  - `math.cyr` — the float-parse exponent accumulator now saturates at 340 (10^340 already
+    overflows f64 to ±Inf), turning an O(exp_val) apply loop into O(1) and closing an
+    algorithmic-complexity DoS (`"1e100000000"` burned ~237 ms upstream). Behaviour-preserving
+    for every representable value.
+  - `syscalls_x86_64_agnos.cyr` — `sys_reboot()` widened nullary → 4-arg
+    `power_sys(magic1, magic2, cmd, arg)` (agnos 1.55.25 power-control). Agnos-only platform
+    variant; hisab builds and tests the x86_64-linux target, so no behavioural impact —
+    vendored for snapshot parity.
+
+### Verified
+- `cyrius build` + smoke (prints `hisab 2.6.10`), `cyrius test tests/*.tcyr` (**957/957** —
+  foundation 307 + hisab 175 + edge_cases 163 + modules 312, 4 suites), fuzz harness clean,
+  benchmarks nominal. Cleanliness gates green: `cyrius lint` (all `src`/`examples`/`tests`
+  globs, warnings-as-errors), `cyrius fmt --check`, `cyrius vet src/main.cyr` (2 deps, 0
+  untrusted, 0 missing). `cyrius distlib` regenerated `dist/hisab.cyr` (header-only diff,
+  2.6.9 → 2.6.10); `cyrius deps --verify` 30/30.
+- Tracked toolchain issues re-verified on 6.4.69 (minimal repros): interval-ident-lex
+  **still live** (`var iv_add` → `expected identifier, got unknown` — the reserved-SIMD-name
+  shadow is still worked around in `tests/modules.tcyr`); for-empty-clauses **still live**
+  (`for (; …)` → `unexpected ';'`); cli-arg-clobber not re-tested (destructive). No tracked
+  issue newly fixed by this bump.
+
 ## [2.6.9] - 2026-07-17 — Cyrius 6.4.66 toolchain bump + sakshi 2.4.6; modules.tcyr compile fix
 
 Maintenance release: toolchain pin **6.3.11 → 6.4.66** (a full minor across 55 patch
@@ -24,15 +70,17 @@ is recommended for parity).
 
 ### Fixed
 - **tests/modules.tcyr — the suite could not compile** (a pre-existing failure, unrelated to
-  the toolchain bump: it reproduces identically on the prior 6.3.11 pin). The interval-
-  arithmetic section named its result vars `iv_add` / `iv_sub` / `iv_mul`, which trip a cycc
-  identifier-lexer bug — they lex as an `unknown` token once `src/interval.cyr` is in the unit,
-  failing the whole file at `var iv_add = ivl_add(...)` (`expected identifier, got unknown`),
-  deterministically (8/8). Renamed them to `iv_sum` / `iv_diff` / `iv_prod` (`iv_div` /
-  `iv_neg` / `iv_abs` were unaffected). The suite now compiles stably and runs **312/312**,
-  restoring the full **957/957** across all four suites. Filed the toolchain bug at
-  `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`; a `NOTE:` comment in the
-  test guards the names against a well-meaning rename-back.
+  the toolchain bump: it reproduces on cycc 6.3.11–6.4.66). The interval-arithmetic section
+  named its result vars `iv_add` / `iv_sub` / `iv_mul` — which are **reserved cycc SIMD
+  intrinsic names** (packed integer-vector add/sub/mul; the lexer tokenizes them as builtins,
+  see the toolchain's `lib/simd.cyr`). Using one as a variable name fails with a misleading
+  `expected identifier, got unknown` at `var iv_add = ...`, which then desyncs the parser and
+  took the whole file down (deterministic, 8/8). Renamed to `iv_sum` / `iv_diff` / `iv_prod`
+  (`iv_div` / `iv_neg` / `iv_abs` are unaffected — there is no integer-vector divide, so
+  `iv_div` was never reserved). The suite now compiles stably and runs **312/312**, restoring
+  the full **957/957** across all four suites. Filed the toolchain bug at
+  `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md` (and upstream in the cyrius
+  repo); a `NOTE:` comment in the test guards the names against a well-meaning rename-back.
 
 ### Verified
 - `cyrius build` + smoke (prints `hisab 2.6.9`), `cyrius tests tests/` (**957/957**, 4 suites,

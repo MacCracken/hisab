@@ -1,9 +1,10 @@
 # 2026-07-17 — cyrius: `iv_add`/`iv_sub`/`iv_mul` are reserved SIMD intrinsics, unusable as var names
 
 **Component:** `cyrius` lexer/parser (cycc `src/frontend/lex.cyr` ~L991-997, `parse.cyr`)
-**Toolchain seen:** cyrius 6.4.69 — reproduces on **6.3.11, 6.4.5, 6.4.6, 6.4.65, 6.4.66, 6.4.69**
-(every version tested; re-verified 2026-07-21 on the 6.4.69 pin: `var iv_add = 1;` →
-`expected identifier, got unknown`. The reserved name predates the toolchain bump — not a 6.4.x regression).
+**Toolchain seen:** cyrius 6.5.6 — reproduces on **6.3.11, 6.4.5, 6.4.6, 6.4.65, 6.4.66, 6.4.69, 6.5.6**
+(every version tested; re-verified 2026-08-03 on the 6.5.6 pin: `var iv_add = 1;` →
+`expected identifier, got unknown` — still live across the 6.4 → 6.5 minor. Prior: 2026-07-21 on
+6.4.69. The reserved name predates the toolchain bump — not a 6.4.x or 6.5.x regression).
 **Severity:** Medium — hard compile failure on this suite with a misleading diagnostic; a
 one-line rename works around it.
 **Hisab impact:** `tests/modules.tcyr` — the interval-arithmetic section named its result vars

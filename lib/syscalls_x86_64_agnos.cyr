@@ -95,6 +95,32 @@ enum SysNrAgnos {
     SYS_READDIR    = 81;          # readdir(path, buf, max) → count / <0 (agnos #81; fchdir on Linux)
     SYS_GPU_DISPATCH     = 82;    # gpu_dispatch(a,b,c) → 0/<0; 64xi32 8x8 A*B→C on GPU (RENAME on Linux)
     SYS_GPU_DISPATCH_F64 = 83;    # gpu_dispatch_f64(a,b,c) → 0/<0; 64xf64, unfused (MKDIR on Linux)
+    SYS_GPU_PRESENT      = 84;    # present() → 1/0; flip back buffer (RMDIR on Linux — DESTRUCTIVE)
+    SYS_GPU_FILL         = 85;    # gpu_fill(color) → 0/-1; CP-DMA constant-fill of the back buffer (CREAT on Linux)
+    SYS_SHM_CREATE_GPU   = 86;    # shm_create_gpu(size) → id/-1; GPU-visible shm page (LINK on Linux)
+    SYS_GPU_BLIT_SHM     = 87;    # gpu_blit_shm(id,wh,dstxy) → 0/-1 (UNLINK on Linux — DELETES A FILE)
+    SYS_GPU_FILL_RECT    = 88;    # gpu_fill_rect(color,wh,dstxy) → 0/-1 (SYMLINK on Linux)
+    SYS_GPU_CAPS         = 89;    # gpu_caps(buf,len) → 0/-1; bb geometry (READLINK on Linux — WRITES arg2)
+    SYS_GPU_READBACK_SHM = 90;    # gpu_readback_shm(id,wh,srcxy) → 0/-1; capture bb→shm (CHMOD on Linux)
+    SYS_GPU_BLIT_BB      = 91;    # gpu_blit_bb(srcxy,wh,dstxy) → 0/-1; bb→bb move (FCHMOD on Linux — SUCCEEDS)
+    SYS_GPU_SHADER_OP    = 92;    # gpu_shader_op(desc_uva,len) → 0/<0; 64B op recs (CHOWN — arg1 read as a PATH)
+    SYS_GPU_MODESET_OP   = 93;    # gpu_modeset_op(desc_uva,len) → 0/<0; descriptor recs (FCHOWN on Linux)
+    SYS_GPU_RECOVER_OP   = 94;    # gpu_recover_op(arm) → 95/-1/-2..-5 (LCHOWN on x86 — arg1 read as a PATH;
+    #   **EXIT_GROUP on aarch64 — a raw syscall(94) TERMINATES THE PROCESS**)
+    SYS_UPTIME_US        = 95;    # uptime_us() → µs since calibration / -1 (UMASK on x86 — nullary here, so the
+    #   Linux call would read a garbage mask and SUCCEED, returning the old one)
+}
+
+# ── GPU recovery arms (agnos 3D arc RUNG 5) ────────────────────
+# Exported so consumers stop hand-rolling the arm numbers, per the same rule that
+# put PWR_MAGIC1/PWR_HALT here at v6.4.68. Values mirror kernel/core/syscall.cyr
+# :3093-3097 — keep them in lockstep with that file, it is canonical.
+enum GpuRecoverArm {
+    RECOV_ARM_A = 1;   # controlled wedge — the bracket must name the WAIT packet
+    RECOV_ARM_B = 2;   # dequeue + re-map — CP_HQD_ACTIVE must read 0, then work must retire
+    RECOV_ARM_C = 3;   # negative control — matmul bit-correct BEFORE and AFTER
+    RECOV_ARM_D = 4;   # free — is the console still painting while wedged?
+    RECOV_ARM_E = 5;   # the guard's own negative control
 }
 
 # ================================================================
@@ -280,6 +306,13 @@ var AGNOS_SOCK_RECV_MAX_SPINS = 6000;
 # Terminate the process with `code` (agnos exit = syscall 0; the
 # _start/EEXIT epilogue emits the same). Does not return.
 fn sys_exit(code): i64 { return syscall(SYS_EXIT, code); }
+
+# Terminate every thread in the process — the Linux exit_group(2) peer.
+# agnos defines no exit_group: SYS_EXIT (#0) already tears the whole proc
+# down, so this is sys_exit by another name. It exists so a portable
+# epilogue can call one name on every target rather than #ifdef'ing.
+# CHANGELOG [6.5.6]
+fn sys_exit_group(code): i64 { return syscall(SYS_EXIT, code); }
 
 # Write `count` bytes from `buf` to `fd` (fd 1/2 → console). Returns
 # bytes written, or -1. Same shape as Linux → portable. v6.2.3: a TAGGED
@@ -585,6 +618,200 @@ fn sys_readdir(path, buf, max): i64      { return syscall(SYS_READDIR, path, buf
 fn sys_gpu_dispatch(a, b, c): i64     { return syscall(SYS_GPU_DISPATCH, a, b, c); }
 # gpu_dispatch_f64(a, b, c) — 8x8 f64 matmul, rosnet-bit-correct (unfused); C = A * B → 0 / <0.
 fn sys_gpu_dispatch_f64(a, b, c): i64 { return syscall(SYS_GPU_DISPATCH_F64, a, b, c); }
+
+# present() — flip the accumulated blit back buffer to the scanout. NULLARY.
+# Tear-free + vsync-paced: BLOCKS until the pipe takes the surface at the next
+# vblank (<= one frame) — it IS the vsync pacer. The explicit half of the P7
+# blit/present split: a compositor blits with blit #39's DEFER_PRESENT bit (no
+# flip), then calls this ONCE per frame. Returns 1 = presented, 0 = nothing to
+# present (double-buffer not armed / direct-FB path). IRON-ONLY: under QEMU this
+# returns 0 CLEANLY — read that as "no GPU here", not a failure (the #82/#83
+# precedent). agnos 1.55.x.
+# SAFETY: syscall 84 is rmdir(pathname) on Linux x86_64 — a DESTRUCTIVE call that
+# would delete a directory at whatever stale pointer sits in rdi. This wrapper is
+# reachable ONLY on agnos: the entire peer is included behind
+# `#ifdef CYRIUS_TARGET_AGNOS` in lib/syscalls.cyr, so off-agnos the fn does not
+# exist and any build referencing it fails at COMPILE time with no binary emitted
+# — stronger than an in-function guard (guarding 2 of ~80 rows would be false
+# comfort when SYS_OPEN=7 is Linux lseek). Both legs gated by
+# scripts/agnos-crossbuild-gate.sh. CHANGELOG [6.4.70].
+fn sys_gpu_present(): i64 { return syscall(SYS_GPU_PRESENT); }
+
+# gpu_fill(color) — GPU-clear the current blit back buffer to `color` (32-bit
+# xRGB8888) via a PM4 CP-DMA DMA_DATA constant fill (SRC_SEL=2 DATA) on the MEC
+# compute ring, replacing a full-screen CPU store loop. Arms the double-buffer
+# lazily; pair with sys_gpu_present() to show it. Only the colour crosses the
+# ring-3 boundary — fb_phys stays unexposed (same discipline as blit #39).
+# BLOCKS on a bounded CP-DMA completion fence (~100 ms cap). Needs NO cache flush
+# to be scanout-visible (CP-DMA writes MC-direct, bypassing GL2). Returns
+# 0 = filled, -1 = no usable display (no GPU/pipe — e.g. QEMU) or the fill failed;
+# treat -1 under QEMU as "no GPU here". agnos 1.55.30 (iron-proven: CP-DMA
+# hardware fill verified 4KB all=pattern).
+# SAFETY: syscall 85 is creat(pathname, mode) on Linux x86_64 — a 32-bit colour
+# reinterpreted as a path pointer would create/truncate a file. Same file-level
+# agnos gate as sys_gpu_present above. CHANGELOG [6.4.70].
+fn sys_gpu_fill(color): i64 { return syscall(SYS_GPU_FILL, color); }
+
+# shm_create_gpu(size) — the GPU-VISIBLE peer of shm_create #71. Same table and the same
+# shm_write #72 / shm_read #73 / shm_free #74 afterwards; only the backing differs: the
+# page is carved from the GPU carveout, so it has an MC address the CP-DMA engine can
+# read. This is NOT an optimisation — #71 uses pmm_alloc_2mb() (system RAM), which the GPU
+# cannot reach at all (bus-master is off by design; the engines see only the FB aperture),
+# so a GPU composite from a #71 buffer is impossible. Returns id (>=1), or -1 when there is
+# no carveout (QEMU) — the caller then falls back to #71 and the CPU path, unchanged.
+# agnos 1.55.31. SAFETY: 86 is link(old,new) on Linux — two garbage pointers, FS litter.
+# Reachable ONLY on agnos (file-level #ifdef CYRIUS_TARGET_AGNOS on the whole peer; off-agnos
+# the fn does not exist and a referencing build fails at COMPILE time). CHANGELOG [6.4.71].
+fn sys_shm_create_gpu(size): i64 { return syscall(SYS_SHM_CREATE_GPU, size); }
+
+# gpu_blit_shm(id, wh, dstxy) — GPU-composite a client surface from its carveout slot
+# straight into the blit back buffer at (dx,dy) via gpu_cp_dma_blit (one CP-DMA per row;
+# src stride w*4, dst stride = framebuffer pitch). Replaces BOTH the shm→userland read and
+# the per-pixel composite loop — pixels never leave kernel GPU-visible memory. Packing
+# matches blit #39: wh = (h<<16)|w, dstxy = (dy<<16)|dx. ⚠ REJECTS rather than clips
+# anything off-screen — the compositor owns clipping, which is why sys_gpu_caps() is a
+# prerequisite for using this correctly. Returns 0 / -1 (-1 under QEMU = "no GPU here").
+# agnos 1.55.31. SAFETY: 87 is unlink(path) on Linux — it DELETES A FILE. Reachable ONLY on
+# agnos via the file-level peer gate. CHANGELOG [6.4.71].
+fn sys_gpu_blit_shm(id, wh, dstxy): i64 { return syscall(SYS_GPU_BLIT_SHM, id, wh, dstxy); }
+
+# gpu_fill_rect(color, wh, dstxy) — GPU-clear a RECTANGLE of the blit back buffer to a
+# 32-bit xRGB8888 colour (h × gpu_cp_dma_fill of w*4 bytes per row). The rect form of
+# #85, which only fills the whole buffer; this is the primitive compositor chrome needs
+# (window body, titlebar, focus accent, buttons — ~10x per window per frame). Packing
+# matches #87: wh = (h<<16)|w, dstxy = (dy<<16)|dx. Rejects rather than clips.
+# Returns 0 / -1 (-1 under QEMU = "no GPU here"). agnos 1.55.32.
+# SAFETY: 88 is symlink(target,link) on Linux — and arg1 is a 32-bit COLOUR that can decode
+# to a mapped address (0x00FF0000 = 16 MB), so the string read is not guaranteed to fault.
+# Reachable ONLY on agnos via the file-level peer gate. CHANGELOG [6.4.71].
+fn sys_gpu_fill_rect(color, wh, dstxy): i64 { return syscall(SYS_GPU_FILL_RECT, color, wh, dstxy); }
+
+# gpu_caps(buf, len) — report back-buffer geometry/capabilities into the caller's buffer.
+# Ring 3 otherwise cannot learn the true back-buffer width/height, and #87/#88 REJECT
+# off-screen rects, so a compositor must call this to clip correctly (the only prior probe
+# was "call #86 and look for -1"). ⚠ It ARMS THE DOUBLE-BUFFER LAZILY — it must: a cold
+# probe would otherwise report width=0/height=0 and, since #87/#88 reject rather than clip,
+# every later blit would fail (caught on iron before any compositor consumed it).
+# Returns 0 / -1 (-1 under QEMU = "no GPU here"). agnos 1.55.32.
+# SAFETY: 89 is readlink(path,buf,sz) on Linux — the kernel WRITES into arg2 for arg3 bytes,
+# a wild process-memory write if rsi ever holds a mapped address. Reachable ONLY on agnos via
+# the file-level peer gate. CHANGELOG [6.4.71].
+fn sys_gpu_caps(buf, len): i64 { return syscall(SYS_GPU_CAPS, buf, len); }
+
+# gpu_readback_shm(id, wh, srcxy) — the INVERSE of #87 gpu_blit_shm: GPU-copy a w×h rect OUT
+# of the blit back buffer at (sx,sy) INTO the client's carveout shm slot `id`. The
+# screen-capture / read-pixels primitive: without it a compositor reading its own shm sees
+# STALE content (the composited frame lives in the kernel back buffer, never the client
+# page). Packing matches #87: wh = (h<<16)|w, srcxy = (sy<<16)|sx. Rejects (does not clip):
+# off-screen, a slot too small for w*h*4, a PMM-backed slot (the GPU can't write it), or no
+# display. Built on the same iron-proven gpu_cp_dma_blit as #87 — direction-agnostic (both
+# operands are MC), so this is #87 with the operands swapped. Returns 0 / -1 (-1 under QEMU =
+# "no GPU here"). agnos 1.55.x (iron-proven /bin/gpucopy 2026-07-23). SAFETY: 90 is
+# chmod(path,mode) on Linux — a packed geometry word as a mode can set SETUID. Reachable ONLY
+# on agnos via the file-level #ifdef CYRIUS_TARGET_AGNOS peer gate. CHANGELOG [6.4.72].
+fn sys_gpu_readback_shm(id, wh, srcxy): i64 { return syscall(SYS_GPU_READBACK_SHM, id, wh, srcxy); }
+
+# gpu_blit_bb(srcxy, wh, dstxy) — GPU rect COPY WITHIN the blit back buffer (move a window /
+# scroll a region); no fb→fb copy existed before. Packing: srcxy = (sy<<16)|sx,
+# wh = (h<<16)|w, dstxy = (dy<<16)|dx. Rejects either rect off-screen. OVERLAP is handled
+# kernel-side (a downward move copies rows bottom-up, memmove semantics) — the wrapper needs
+# no reverse-order logic. Residual: intra-row HORIZONTAL overlap on the SAME source row is
+# undefined; a caller must not self-overlap a single row. Returns 0 / -1 (-1 under QEMU =
+# "no GPU here"). agnos 1.55.x. SAFETY: 91 is fchmod(fd,mode) on Linux — and arg1 is a packed
+# srcxy where (0,0) packs to fd 0 = STDIN, so small coordinates are valid fd numbers and the
+# Linux call would PLAUSIBLY SUCCEED. Reachable ONLY on agnos via the file-level peer gate.
+# CHANGELOG [6.4.72].
+fn sys_gpu_blit_bb(srcxy, wh, dstxy): i64 { return syscall(SYS_GPU_BLIT_BB, srcxy, wh, dstxy); }
+
+# ---- agnos GPU descriptor-array band (#92-93) ----
+# #92 and #93 share ONE shape: `(desc_uva, len)` — a userland VA pointing at an ARRAY of
+# fixed-size records, `len` the array's byte length, and the OP CODE INSIDE each record
+# rather than in the syscall number. That is agnos decisions D-3 (shader) + MD-4 (modeset):
+# per-operation syscalls with inline scalar args run OUT of argument slots — a gradient
+# needing two stops plus geometry had no room left and never got a ring-3 path at all, an
+# ABI break that cost the shader arc its S12. A record has no such ceiling, so these bands
+# are ONE number each, extended by record.
+#
+# Consequence for these wrappers: they are LAYOUT-AGNOSTIC. They pass a pointer and a
+# length and encode not one field of the record, so the kernel-side record layout can keep
+# growing (new ops, new fields, bigger records) without ever touching this signature. That
+# is why #93 is wrapped BEFORE its kernel half lands (agnos bite H3) even though the Tier-2
+# rule for #84-#91 was "don't wrap until agnos ships it" — that rule existed because those
+# syscalls encode PACKED GEOMETRY in their arguments, where a kernel-side repack silently
+# invalidates a shipped wrapper. A (ptr, len) pair has no such failure mode. Frozen for
+# both: the number, the arity/meaning, the 0/negative return, and the name.
+#
+# Kernel side (both): validates in-kernel, derives MC addresses in-kernel — NO MC address
+# ever crosses the ring-3 boundary — and REJECTS rather than clips.
+#
+# IRON-ONLY: QEMU emulates no AMD GPU, so a return under QEMU means "no GPU here", not
+# "the op ran". (issue 2026-07-23-agnos-gpu-modeset-op-93.) CHANGELOG [6.4.73].
+
+# gpu_shader_op(desc_uva, len) — the ring-3 entry point for the SHADER band; an array of
+# 64-byte op records. Every dword an op does not define MUST be zero: the kernel REJECTS a
+# non-zero reserved field rather than ignoring it, which is precisely what keeps the unused
+# dwords safe to define later without an ABI break. agnos SHIPPED and consumed end-to-end
+# by the compositor. SAFETY: 92 is chown(path,uid,gid) on Linux and arg1 is a real user VA
+# that the kernel reads as a PATH — the most dangerous collision in the whole #82-#93 band
+# (a real path-resolving metadata write, not an EBADF). Reachable ONLY on agnos via the
+# file-level #ifdef CYRIUS_TARGET_AGNOS peer gate.
+fn sys_gpu_shader_op(desc_uva, len): i64 { return syscall(SYS_GPU_SHADER_OP, desc_uva, len); }
+
+# gpu_modeset_op(desc_uva, len) — the single ring-3 entry point for the MODESET work; every
+# modeset write bite drives from userland /bin/modeset through this one syscall behind an
+# on-disk arm-once latch. Shape frozen + operator-ratified (MD-4); the kernel half is agnos
+# bite H3 and lands in parallel — see "layout-agnostic" above for why wrapping ahead is
+# safe here. SAFETY: 93 is fchown(fd,uid,gid) on Linux. arg1 is a userland VA — a large
+# value essentially never a valid fd — so a stray off-agnos call is overwhelmingly EBADF.
+# That is a reason for calm, NOT for dropping the gate: "EBADF most of the time" is not a
+# safety property, so the file-level peer gate stays load-bearing and off-agnos this fn
+# must not exist (a referencing build fails at COMPILE time rather than issuing fchown).
+fn sys_gpu_modeset_op(desc_uva, len): i64 { return syscall(SYS_GPU_MODESET_OP, desc_uva, len); }
+
+# gpu_recover_op(arm) — the 3D arc's RUNG 5 hang/recovery battery. `arm` is one of
+# RECOV_ARM_A..E (see the GpuRecoverArm enum above). Returns **95** on the expected
+# path for every arm (the recovery ladder's rung number, NOT a byte count), `-1` when
+# there is no GPU or the arm is unknown, and a per-arm negative on failure: -2 = arm A's
+# wedge RETIRED (so nothing was actually hung and arms B-E prove nothing), -3 = arm C's
+# matmul was not bit-correct, -4 = arm B's escalation ladder did not recover, -5 = arm E's
+# negative control fired. Iron-only: under QEMU `gpu_present == 0` so it returns -1
+# cleanly, which means "no GPU here", not a failure.
+#
+# ⛔ The arms that deliberately WEDGE the GPU are compiled out of agnos unless the kernel
+# is built with GPU_RECOVER, so a production kernel cannot be asked to hang itself. The
+# RECOVERY half is always present — a shipping kernel must survive a hang it did not ask
+# for. That asymmetry is the kernel's, not ours; this wrapper just reaches it.
+#
+# SAFETY — this is the most dangerous number in the band so far. On x86_64 Linux 94 is
+# `lchown(path, uid, gid)`, so `arm` would be read as a PATH POINTER. On **aarch64 94 is
+# `exit_group`** — a raw `syscall(94, arm)` there does not misbehave, it **TERMINATES THE
+# PROCESS**, silently and with `arm` as the exit status. That is the same class the open
+# chown filing documents (a consumer hardcoding 94 for `lchown` gets exit_group on ARM).
+# Off-agnos this fn MUST NOT EXIST: the file-level `#ifdef CYRIUS_TARGET_AGNOS` around the
+# whole peer in lib/syscalls.cyr means a referencing non-agnos build fails at COMPILE time
+# with "reachable undefined function" and emits no binary — strictly stronger than any
+# in-function guard, per the v6.4.63 lesson.
+fn sys_gpu_recover_op(arm): i64 { return syscall(SYS_GPU_RECOVER_OP, arm); }
+
+# uptime_us() — MICROSECOND monotonic clock, read via rdtsc so it works with INTERRUPTS
+# DISABLED. This is not a nicer `uptime_ms`: a FOREGROUND `run` program executes with IF
+# cleared, so the 100 Hz timer never fires and `sys_uptime_ms` (#40, which reads
+# timer_ticks) is FROZEN for that program's entire run — anything timing itself with #40
+# on that path measures zero. rdtsc needs no interrupts, so #95 is the only correct clock
+# there.
+#
+# Returns µs since calibration, or **-1 if calibration was REFUSED** — deliberately never
+# a plausible-looking 0, because a tool that cannot tell "no clock" from "0 µs elapsed" is
+# exactly the failure that burned two flashes on agnos's rung-10 gate. Check `< 0`.
+#
+# SAFETY: on x86_64 Linux 95 is `umask(mask)`. This wrapper is NULLARY, so off-agnos the
+# call would read whatever garbage sits in rdi as the new mask and **SUCCEED**, returning
+# the old umask — a plausible-looking positive number that a caller would happily treat as
+# a timestamp, while having changed the process's file-creation mask as a side effect.
+# Fail-plausible is worse than fail-loud, which is why the file-level peer gate carries
+# this rather than an in-function check. (aarch64 `umask` is 166, so #95 is a different
+# call again there — one more reason not to reason per-arch about an ungated peer.)
+fn sys_uptime_us(): i64 { return syscall(SYS_UPTIME_US); }
 
 # ---- agnos HDA audio band (#64-69) — the ring-3 half of the agnos 1.52.x Gate-2
 # freeze (kernel handlers land in parallel). Single frozen format: 48000 Hz / S16 /

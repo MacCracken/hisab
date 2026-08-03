@@ -8,7 +8,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Area | Risk | Mitigation |
 |------|------|------------|
-| Allocation overflow | Integer overflow in `rows * cols * 8` could cause undersized allocation (CWE-190) | Overflow guards on tensor, complex-matrix, diffgeo allocations; dimension caps — pinned by regression tests (2026-05-29 audit). Stdlib `mat_new` is unguarded (upstream, roadmap 2.5.3); hisab's usage is mitigated (dims from already-allocated matrices) |
+| Allocation overflow | Integer overflow in `rows * cols * 8` could cause undersized allocation (CWE-190) | Overflow guards on tensor, complex-matrix, diffgeo allocations; dimension caps — pinned by regression tests (2026-05-29 audit). Stdlib `mat_new` gained its own upstream guard in **ganita 1.0.4** (cyrius 6.5.6 pin, hisab **2.6.11**) — rejects non-positive dims and element counts over 33,554,430, returning null — and that contract is now pinned by regression tests. Before 2.6.11 the vendored copy was stale at 1.0.3, where `mat_new(-5, 3)` segfaulted; hisab's own usage was mitigated throughout (dims taken from already-allocated matrices), and `mat_new_guarded` is retained as the stricter 16M-element entry point for untrusted dimensions |
 | Numerical stability | Catastrophic cancellation, overflow | IEEE 754 f64 throughout; documented precision limits |
 | Matrix decompositions | Division by near-zero pivot | Partial pivoting with EPSILON_F64 threshold checks |
 | Iterative solvers | Non-convergence on adversarial input | max_iter bounds; returns ERR_NO_CONVERGENCE |

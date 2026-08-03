@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.4.69**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
+> Written in Cyrius. Toolchain: **6.5.6**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
 
 ## Scope
 
@@ -11,13 +11,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.10
+## Current -- v2.6.11
 
 - **34 math modules in `src/`, ~16,900 lines** (`lib/` is vendored-only)
-- **957 test assertions** (foundation 307 + hisab 175 + edge_cases 163 + modules 312), 26 benchmarks (incl. amplified SIMD batches), fuzz harness
+- **961 test assertions** (foundation 307 + hisab 175 + edge_cases 167 + modules 312), 26 benchmarks (incl. amplified SIMD batches), fuzz harness (now actually discovered by `cyrius fuzz`, 1/1)
 - **CLI smoke binary** ~207 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~16,878 lines / 553 KB (all **34 modules**) — fits cycc 6.4.69's 1 MB input_buf with ample headroom
-- Toolchain **6.4.69** (bumped from 6.4.66 this release — a clean 3-patch bump: no library source change, bundle byte-identical bar the header; sakshi stays at 2.4.6, already the latest tag). The vendored stdlib picks up three upstream 6.4.67–6.4.69 fixes — `fmt` (hex high-bit rendering + `fmt_float_buf` non-finite guard, which hisab's `symbolic` modules link), `math` (float-parse exponent-saturation DoS hardening), and an agnos-only `sys_reboot` widening. CI fmt/lint/vet/security all green; supply chain SHA-locked (`cyrius.lock` 30 deps, verify 30/30). Tracked-issue re-verify on the new pin (minimal repros): for-empty-clauses **still live**, interval-ident-lex **still live** (both worked around) — no new fixes. The prior 6.4.66 bump (2.6.9) is the one that renamed `tests/modules.tcyr`'s interval result vars `iv_add`/`iv_sub`/`iv_mul` → `iv_sum`/`iv_diff`/`iv_prod` (reserved cycc SIMD intrinsic names, unusable as variables; `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`)
+- **`dist/hisab.cyr` distlib bundle** ~16,885 lines / 554 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
+- Toolchain **6.5.6** (bumped from 6.4.69 this release — a **minor** jump across 24 releases: no executable library change, the bundle diff being the version header plus one `mat_new_guarded` doc comment; sakshi 2.4.6 → **2.4.7**). The headline effect is the vendored `ganita` reaching **1.0.4**: the repo's copy had been stale at **1.0.3** since before the 6.4.69 pin, so this bump closes the long-tracked CWE-190 in stdlib `mat_new` — measured, `mat_new(-5, 3)` **segfaulted** on 1.0.3 and returns null on 1.0.4. hisab's `mat_new_guarded` stays as the stricter 16M-element policy cap (upstream's ceiling is 33.5M). Also adopted this release: the 6.5.6 `sys_exit_group` epilogue idiom, and an **exit-code clamp** in all four test harnesses — the unclamped `assert_summary()` count meant exactly 256/512/768 failures exited 0 and scored PASS (proven, then fixed). `cyrius fuzz` now discovers `tests/*.fcyr` (6.5.6 walks `tests/`, not just `fuzz/`), so the harness runs for the first time — and passes. CI fmt/lint/vet/security all green; supply chain SHA-locked (`cyrius.lock` 30 deps, verify 30/30). Tracked-issue re-verify on the new pin (minimal repros): for-empty-clauses **still live**, interval-ident-lex **still live** (both worked around) — no new fixes
 - **Arc history (all complete)** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security, fixed three real collision bugs), 2.5.x (CGA depth + matrix guard, CGA 1 → 29 assertions), and 2.6.x (differential-geometry depth — sectional curvature, Weyl, parallel transport, geodesic deviation, higher forms; 28 known-manifold assertions, posture audited solid). Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 957 across them.
 
 ---
@@ -52,7 +52,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 - **`#pure` annotations** (from 2.3.4) — unsafe CSE interaction with hisab's allocate-a-fresh-result convention; speculative perf, no driver.
 - **Slices (`[T]` / `slice<T>`)** (from 2.3.4) — would regress the proven raw-pointer SIMD hot paths; `slice_unchecked_get_W` discards the safety benefit.
 - **`defer`** (from 2.3.4) — N/A under the bump/arena model (no per-resource lifecycle to clean up).
-- **Stdlib `mat_new` overflow guard** (from 2.5.3) — upstream cyrius fix; re-verify when the toolchain pin moves past it (hisab's `mat_new_guarded` is the local mitigation).
+- ~~**Stdlib `mat_new` overflow guard** (from 2.5.3) — upstream cyrius fix; re-verify when the toolchain pin moves past it (hisab's `mat_new_guarded` is the local mitigation).~~ **RESOLVED in 2.6.11** — ganita 1.0.4 (vendored at the 6.5.6 pin) guards `ganita_mat_new` with `GANITA_MAT_MAX_ELEMS = 33_554_430` and propagates null through `ganita_mat_identity` / `ganita_mat_from_array`. hisab's `mat_new_guarded` is **kept**, not retired: its 16M cap is deliberately stricter than upstream's 33.5M, so it remains the entry point for untrusted dimensions.
 
 ---
 
@@ -75,6 +75,7 @@ aren't silently lost (full rationale in the CHANGELOG):
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.11 | 2026-08-03 | 16,600 | 34 | Toolchain 6.4.69 → **6.5.6** (a **minor** jump across 24 releases) + sakshi 2.4.6 → **2.4.7**. No executable library change — the bundle diff is the version header plus one `mat_new_guarded` doc comment, zero code lines. **Security:** the vendored `lib/ganita.cyr` was stale at **1.0.3** (the 6.4.69 pin already shipped 1.0.4); re-vendoring closes the tracked CWE-190 in stdlib `mat_new` — `mat_new(-5, 3)` **segfaulted** on 1.0.3, returns null on 1.0.4 (measured, same compiler, only ganita swapped). **Fixed:** all four `.tcyr` harnesses exited with `assert_summary()`'s raw failure count, so exactly 256/512/768 failures truncated to 0 and scored PASS — now clamped. Adopted the 6.5.6 `sys_exit_group` epilogue. `cyrius fuzz` now discovers `tests/*.fcyr` (1 passed — previously never run). Smoke string 2.6.10 → 2.6.11. Tracked issues re-verified still-live (interval-ident-lex, for-empty-clauses). +4 assertions pinning the upstream `mat_new` contract. 961 |
 | 2.6.10 | 2026-07-21 | 16,600 | 34 | Toolchain 6.4.66 → **6.4.69** (clean 3-patch bump; sakshi unchanged at 2.4.6, already latest). No library source change — bundle byte-identical bar the header. Vendored stdlib picks up three upstream fixes: `fmt` hex-high-bit + `fmt_float_buf` non-finite guard (linked by `symbolic`; byte-identical for finite values), `math` float-parse DoS hardening, agnos-only `sys_reboot` widening. Smoke string 2.6.9 → 2.6.10. Tracked issues re-verified still-live (interval-ident-lex, for-empty-clauses); no new fixes. 957 |
 | 2.6.9 | 2026-07-17 | 16,600 | 34 | Toolchain 6.3.11 → **6.4.66** + sakshi 2.4.2 → **2.4.6**. Infrastructure + test-only fix — no library source change; bundle byte-identical bar the header. Fixed a pre-existing `tests/modules.tcyr` compile failure (`iv_add`/`iv_sub`/`iv_mul` collide with reserved cycc SIMD intrinsic names; renamed `iv_sum`/`iv_diff`/`iv_prod`), restoring the suite to 312/312. Smoke string 2.6.7 → 2.6.9. New interval-ident-lex issue filed; for-empty-clauses still open. 957 |
 | 2.6.8 | 2026-07-06 | 16,600 | 34 | Collision hardening for co-compilation with the sandhi/TLS stack: `symbolic` float-render scratch moved `var buf[N]` → `alloc(N)` (dodges the "array size must be enum constant" path under `tls`/`dynlib` co-compile); bare error constants namespaced `ERR_*` → `HSB_ERR_*` (values unchanged) to stop a last-wins global collision on consumers. 957 |

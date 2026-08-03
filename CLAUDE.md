@@ -9,9 +9,9 @@ differential geometry, symbolic algebra.
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (sovereign systems language, compiled by cycc)
-- **Toolchain**: Cyrius 6.4.69 (`cyrius.cyml: cyrius = "6.4.69"`)
+- **Toolchain**: Cyrius 6.5.6 (`cyrius.cyml: cyrius = "6.5.6"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
-- **Status**: 2.6.10 — compiles cleanly under cycc 6.4.69. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~553 KB / 16,878 lines, well under cycc's 1 MB input_buf) ships at `dist/hisab.cyr` and is consumer-tested end-to-end on 6.4.69. Library validated via tests (957/957 across 4 suites). The 2.3.x, 2.4.x, 2.5.x, and 2.6.x (differential-geometry depth) arcs are all complete. The stdlib transcendentals live in the `ganita` module (introduced at the 6.2.11 bump, which also subsumed `matrix`/`linalg`); the 6.4.69 bump (2.6.10) is a clean patch bump — no library source change, bundle byte-identical bar the version header — that also picks up three upstream stdlib fixes (`fmt` hex/non-finite-float rendering, `math` float-parse DoS hardening, an agnos `sys_reboot` widening), see CHANGELOG 2.6.10. The prior 6.4.66 bump (2.6.9) renamed `modules.tcyr`'s interval result vars `iv_add`/`iv_sub`/`iv_mul` → `iv_sum`/`iv_diff`/`iv_prod` because the originals collide with reserved cycc SIMD intrinsic names (unusable as variables — `expected identifier, got unknown`, still live on 6.4.69); the rename is guarded by a `NOTE:` in the test — see `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`.
+- **Status**: 2.6.11 — compiles cleanly under cycc 6.5.6. Library source lives in `src/` (smoke `main.cyr` + 34 math modules); `lib/` is vendored stdlib + deps only. CLI smoke binary builds; **full 34-module distlib bundle** (~554 KB / 16,885 lines, well under cycc's 1 MB input_buf) ships at `dist/hisab.cyr` and is consumer-tested end-to-end on 6.5.6. Library validated via tests (961/961 across 4 suites). The 2.3.x, 2.4.x, 2.5.x, and 2.6.x (differential-geometry depth) arcs are all complete. The stdlib transcendentals live in the `ganita` module (introduced at the 6.2.11 bump, which also subsumed `matrix`/`linalg`); the 6.5.6 bump (2.6.11) is a **minor** jump across 24 releases — no executable library change, the bundle differing only by its version header and one rewritten `mat_new_guarded` doc comment — whose headline effect is that the vendored `ganita` reached **1.0.4**, closing the long-tracked CWE-190 in stdlib `mat_new` (the pre-bump vendored copy was stale at 1.0.3 and `mat_new(-5, 3)` **segfaulted**; hisab's stricter `mat_new_guarded` remains as the 16M-element policy cap). 2.6.11 also adopts the 6.5.6 epilogue idiom (`sys_exit_group`) and clamps the test harnesses' exit codes — an unclamped `assert_summary()` count meant exactly 256 failures scored PASS. See CHANGELOG 2.6.11. The prior 6.4.66 bump (2.6.9) renamed `modules.tcyr`'s interval result vars `iv_add`/`iv_sub`/`iv_mul` → `iv_sum`/`iv_diff`/`iv_prod` because the originals collide with reserved cycc SIMD intrinsic names (unusable as variables — `expected identifier, got unknown`, still live on 6.5.6); the rename is guarded by a `NOTE:` in the test — see `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md`.
 
 ## Consumers
 
@@ -24,6 +24,7 @@ cyrius deps                              # resolve deps into lib/
 cyrius build src/main.cyr build/hisab    # build CLI
 cyrius test tests/hisab.tcyr             # run a test suite
 cyrius bench tests/hisab.bcyr            # run benchmarks
+cyrius fuzz                              # run fuzz harnesses (walks tests/, needs >= 6.5.6)
 ```
 
 ## Dependencies
@@ -35,7 +36,7 @@ cyrius bench tests/hisab.bcyr            # run benchmarks
   inverses) plus the full `matrix`/`linalg` API; do **not** also list `matrix`
   or `linalg` (duplicate-definition collisions). `math` stays for the inclusive
   comparisons, clamp/lerp/min/max/sign and the exp/ln polyfills.
-- **sakshi** 2.4.6 — structured logging (first-party)
+- **sakshi** 2.4.7 — structured logging (first-party)
 
 No external deps. No FFI. No libc. All first-party, pinned in
 `cyrius.cyml` and SHA-locked in `cyrius.lock`.
@@ -49,7 +50,7 @@ src/*.cyr            — the 34 math modules (the library source). Self-containe
                        (no `include` lines); stdlib resolves via [deps] stdlib
 lib/                 — vendored stdlib + first-party deps ONLY (managed by
                        `cyrius deps`) — no project source here
-dist/hisab.cyr       — full 34-module distlib bundle (~553 KB / 16,878 lines),
+dist/hisab.cyr       — full 34-module distlib bundle (~554 KB / 16,885 lines),
                        regenerated via `cyrius distlib`. Consumers pull this
                        single file via [deps.hisab] modules = ["dist/hisab.cyr"]
 examples/            — small demos (basic_math.cyr)
@@ -129,12 +130,17 @@ VERSION              — single source of truth for version
 - **Enums for constants** — zero `gvar_toks` cost vs. `var` globals
 - **Source files only need project includes** — stdlib + first-party deps auto-resolve from `cyrius.cyml`
 - **Every buffer is a contract**: `var buf[N]` = N bytes
-- **Programs call `main()` at top level**: `var exit_code = main(); syscall(60, exit_code);`
+- **Programs call `main()` at top level**: `var exit_code = main(); sys_exit_group(exit_code);`
+  — `sys_exit_group`, never `syscall(60, …)`/`syscall(SYS_EXIT, …)`: SYS_EXIT is exit(2) and
+  ends only the *calling thread*, so a program that ever spawns one hangs. Test harnesses must
+  also **clamp** first (`if (r > 0) { r = 1; }`) — `assert_summary()` returns the raw failure
+  count and a wait status is 8 bits, so exactly 256/512/768 failures would otherwise exit 0
+  and score PASS
 - **`cyrius build` handles everything** — never shell out to `cycc` directly
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.4.69"` in `cyrius.cyml`. CI and release both grep
+- **Toolchain pin**: `cyrius = "6.5.6"` in `cyrius.cyml`. CI and release both grep
   the manifest; no hardcoded versions in YAML
 - **Tag filter**: release triggers on `tags: ['v?[0-9]+.[0-9]+.[0-9]+']` (with or without `v` prefix)
 - **Version-verify gate**: release asserts `VERSION == git tag` before building

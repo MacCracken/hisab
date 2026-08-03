@@ -2,6 +2,125 @@
 
 ## [Unreleased]
 
+## [2.6.11] - 2026-08-03 — Cyrius 6.5.6 toolchain bump + sakshi 2.4.7; stdlib `mat_new` CWE-190 guard lands
+
+Maintenance release: toolchain pin **6.4.69 → 6.5.6** (a **minor** jump across 24 releases —
+6.4.70–6.4.86 plus 6.5.0–6.5.6) and first-party dep **sakshi 2.4.6 → 2.4.7**. **No executable
+math-module change** — all 34 modules compile clean on the new pin, and `dist/hisab.cyr` differs
+only by its version header and one rewritten `mat_new_guarded` doc comment (verified: the bundle
+diff contains **zero** non-comment lines, 16,878 → 16,885 lines). The bundle's stdlib leaf requirements are
+unchanged (`syscalls` + `io`, verified identical when regenerated under *both* pins), so
+consumers need no `[deps]` edits; bumping their own pin to 6.5.6 is recommended for parity.
+
+Not a routine bump, though. Two latent defects were found and closed, and neither was in the
+math: hisab had been building against a **stale vendored `ganita`** whose `mat_new` segfaults
+on a negative dimension, and all four test suites could **score PASS with 256 failing
+assertions**. Both are fixed and both are now pinned by tests.
+
+### Security
+- **Stdlib `mat_new` CWE-190 guard (ganita 1.0.3 → 1.0.4).** `ganita_mat_new` now rejects
+  non-positive dimensions and element counts above `GANITA_MAT_MAX_ELEMS = 33_554_430` (the
+  `ALLOC_MAX`-derived ceiling), returning 0; `ganita_mat_identity` and `ganita_mat_from_array`
+  propagate the null. **This is a live hisab code path** — `mat_new` / `mat_mul` / `mat_lu` are
+  thin `ganita_*` aliases (`lib/ganita.cyr:1329+`) used from `optimize.cyr` and `linalg_ext.cyr`.
+  Measured with the compiler held constant and only `ganita.cyr` swapped:
+
+  | vendored ganita | `mat_new(-5, 3)` |
+  |---|---|
+  | 1.0.3 (shipped through 2.6.10) | **SIGSEGV — exit 139** |
+  | 1.0.4 (this release) | returns null, exit 0 |
+
+  **The exposure was a vendoring miss, not a pin miss, and it was worse than the threat model
+  recorded.** The repo's `lib/ganita.cyr` sat at **1.0.3 while the 6.4.69 pin already shipped
+  1.0.4** — so hisab spent the entire 2.6.10 cycle on the unguarded copy. Every prior audit
+  entry (2026-06-15 through 2026-07-21) called this item "unguarded upstream, mitigated" because
+  the vendoring check compared *toolchain snapshot against toolchain snapshot*, which cannot see
+  drift in the committed `lib/`. The check is now `lib/*.cyr` byte-compared against
+  `~/.cyrius/versions/<pin>/lib/`, which is what surfaced it. Closes the roadmap's tracked
+  "stdlib `mat_new` overflow guard" item (open since 2.5.3).
+- **Upstream contract now pinned by tests.** `tests/edge_cases.tcyr` gained 4 assertions on
+  stdlib `mat_new` itself (negative / zero / overflow-prone / valid dims). Previously only
+  hisab's own `mat_new_guarded` wrapper was asserted, which is exactly why the stale vendoring
+  was invisible. Mutation-proven: reverting `lib/ganita.cyr` to 1.0.3 crashes the suite with
+  **exit 139** instead of passing.
+
+### Fixed
+- **Test suites could report PASS with 256 failing assertions.** All four `tests/*.tcyr` ended
+  at a bare `var r = assert_summary();`, and `assert_summary()` returns the raw failure *count*.
+  A POSIX wait status is 8 bits, so exactly 256 / 512 / 768 failures truncated to 0 and the
+  `cyrius test` gate scored **PASS**. Demonstrated on hisab's own epilogue before fixing, then
+  re-measured after:
+
+  | epilogue | 256 failures | 1 failure | 0 failures |
+  |---|---|---|---|
+  | unclamped (through 2.6.10) | **exit 0 — PASS** | exit 1 | exit 0 |
+  | clamped (this release) | **exit 1 — FAIL** | exit 1 | exit 0 |
+
+  All four suites now clamp (`if (r > 0) { r = 1; }`) before exiting. This was a CI-gate
+  integrity hole, not a library defect — no shipped math behaviour changes. cyrius 6.5.6 fixed
+  the identical hole in its own `proj-tcyr` scaffold template.
+- **`cyrius fuzz` never discovered `tests/hisab.fcyr`.** Through 6.5.5 the verb walked only
+  `fuzz/`, a directory this repo does not have, so the fuzz gate had been silently exercising
+  **zero** harnesses (it exits 0 when it finds nothing). 6.5.6 walks `tests/` as well; the
+  harness now actually runs, and passes (**1/1**) on its first real execution.
+
+### Changed
+- **Toolchain pin `6.4.69` → `6.5.6`; sakshi `2.4.6` → `2.4.7`.** Re-vendored `lib/` via
+  `cyrius lib sync` — all 27 declared-subset stdlib files byte-match 6.5.6; the transitive
+  `lib/result.cyr` + `lib/atomic.cyr` were already identical (no hand-refresh needed, as at
+  6.4.66/6.4.69). `cyrius.lock` 30 deps (1 commit-pinned), `deps --verify` 30/30. Smoke version
+  string `src/main.cyr` 2.6.10 → 2.6.11.
+- **Vendored stdlib delta — six files.** `ganita.cyr` (the guard above); `vec.cyr` (6.5.4 added
+  `vec_sort_by` introsort + `vec_select_nth` quickselect, comparator via `fncall2` — purely
+  additive, **not adopted**, see below); `syscalls_linux_common.cyr` (+`sys_exit_group`);
+  `syscalls_windows.cyr` / `syscalls_x86_64_agnos.cyr` (peer `sys_exit_group` definitions plus
+  agnos GPU present/fill wrappers — non-Linux-x86_64, vendored for parity); and `io.cyr`
+  (upstream changes that leave hisab's `println` path behaviour unchanged).
+- **`sys_exit_group` epilogue.** `sys_exit` is `exit(2)` and ends only the *calling thread*.
+  `src/main.cyr`, `examples/basic_math.cyr`, `tests/hisab.bcyr`, `tests/hisab.fcyr` and all four
+  `tests/*.tcyr` migrated off `syscall(SYS_EXIT, r)` / `syscall(60, r)`. hisab is single-threaded
+  so either form terminated correctly; the group form is correct by construction. CLAUDE.md's
+  program-epilogue principle updated to match.
+- **sakshi `2.4.6` → `2.4.7`** — a latent-bug fix with **no public API change**: two private
+  helpers renamed (`_sk_write_int` → `_sk_buf_write_number`, `_sk_write_str` →
+  `_sk_buf_write_string`) because `_int` / `_str` / `_cstr` are reserved cyrius overload-dispatch
+  suffixes, so `_sk_write_int` was squatting the dispatch slot of the unrelated `_sk_write(buf,
+  len)`. Both symbols are `_sk_`-private; hisab links nothing that moved. **Audited hisab for the
+  same defect class**: `src/` defines exactly one function with a reserved suffix (`expr_to_str`)
+  and there is no `expr_to` base for it to shadow — clean.
+- **`src/linalg_ext.cyr`** — `mat_new_guarded`'s doc comment no longer claims stdlib `mat_new` is
+  unguarded. The wrapper is **kept, not retired**: its 16,777,216-element cap is deliberately
+  stricter than upstream's 33,554,430, so it remains the entry point for untrusted dimensions.
+  `tests/hisab.tcyr`'s comment corrected to match (its over-cap assertion at 25M elements is
+  precisely the band where hisab rejects and upstream accepts).
+
+### Verified
+- `cyrius build` + smoke (prints `hisab 2.6.11`), `cyrius test tests/*.tcyr` **961/961** —
+  foundation 307 + hisab 175 + edge_cases **167** (+4, the new upstream `mat_new` assertions) +
+  modules 312, 4 suites. `cyrius fuzz` **1/1**. Benchmarks re-run via `./scripts/bench-history.sh`
+  (26 benchmarks, commit `5331f05`); **no performance claim is made** — this release changes no
+  math code path, and the run-to-run spread against the June baseline is not attributable to the
+  bump. Cleanliness gates green: `cyrius lint` (all `src`/`examples`/`tests` globs,
+  warnings-as-errors), `cyrius fmt --check`, `cyrius vet src/main.cyr` (2 deps, 0 untrusted,
+  0 missing). `cyrius distlib` regenerated `dist/hisab.cyr` (header-only diff, 2.6.10 → 2.6.11);
+  `cyrius deps --verify` 30/30.
+- **Consumer end-to-end** against the regenerated bundle on 6.5.6: `hvec3_length`, `hquat_length`,
+  stdlib `mat_new` (valid + both guard paths) and `mat_new_guarded` — 7/7, exit 0.
+- Tracked toolchain issues re-verified on 6.5.6 (minimal repros): interval-ident-lex **still
+  live** (`var iv_add` → `expected identifier, got unknown`; the reserved-SIMD-name rename stays
+  in `tests/modules.tcyr`); for-empty-clauses **still live** (`for (; …)` → `unexpected ';'`);
+  cli-arg-clobber not re-tested (destructive). No tracked issue newly fixed by this bump.
+
+### Not adopted (recorded, with reason)
+- **`vec_sort_by` / `vec_select_nth`** (new in 6.5.4). hisab's one hand-rolled sort —
+  `_col_sort_indices_by_xy` (`src/collision_core.cyr:339`, single caller at `:393`, the
+  `convex_hull_2d` pre-sort) — **does not fit the API**: `vec_sort_by` passes element *values* to
+  the comparator (`fncall2(cmp, a, b)`), while hisab sorts *indices* by dereferencing into a
+  separate `points` vector, and Cyrius has no closures. Deferred on the API mismatch, CLAUDE.md's
+  "wait for the third instance" rule (this is the first), and because swapping a hot-path sort is
+  a performance change that needs its own before/after numbers rather than riding a maintenance
+  bump. `vec_select_nth` has no call site in hisab today.
+
 ## [2.6.10] - 2026-07-21 — Cyrius 6.4.69 toolchain bump
 
 Maintenance release: toolchain pin **6.4.66 → 6.4.69** (3 patch releases). **No library

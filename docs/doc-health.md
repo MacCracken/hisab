@@ -29,6 +29,14 @@ type: state
 > `deps --verify` 30/30. Re-verified the 3 open tracked toolchain issues on 6.5.6: interval-ident-lex
 > **still live**, for-empty-clauses **still live**, cli-arg-clobber not re-tested (destructive).
 >
+> **Same-day second pass (2026-08-03, post-2.6.11):** full P(-1) audit sweep of the released tree
+> → `audit/2026-08-03.md` (**70 verified findings, 2 critical**), and a roadmap restructure that
+> opens **2.6.12** as a repair release. Two ledger corrections fall out of it: the 2026-05-29 and
+> 2026-05-30 closeouts' "posture solid" verdicts were **scope-limited** to each arc's new
+> functions and did not reach the 8 modules no suite includes (noted in Tier 5, originals left
+> per the dated-artifact rule); and forward-commitment #4 is now discharged. The Parked list
+> gained a rule — shipped items are **removed** with a retirement note, not left struck through.
+>
 > **Prior refresh**: 2026-07-21 (v2.6.10) — Cyrius 6.4.66 → **6.4.69** toolchain
 > bump (a clean 3-patch bump; sakshi unchanged at **2.4.6**, already the latest tag). No
 > library source change — `dist/hisab.cyr` byte-identical bar the version header. Synced the
@@ -107,7 +115,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 | 🟡 **Stale — refresh in place** | 0 | `benchmarks.md` was stale; re-ran `bench-history.sh` this pass. None outstanding. |
 | 🟠 **Read-through outstanding** | 0 | CONTRIBUTING refreshed; `tool-issues.md` deleted; `linalg-proposal` archived. Cleared. |
 | 🔵 **Evergreen** | 1 | `CODE_OF_CONDUCT.md` — Contributor Covenant; re-read only on policy change. |
-| 📅 **Dated artifact — supersede, don't edit** | 7 | `audit/2026-04-15.md`, `audit/2026-05-29.md`, `audit/2026-05-29-cga-arc-closeout.md`, `audit/2026-05-30.md`, `benchmarks-rust-v-cyrius.md` (v2.2.0), `port-audit.md` (2026-04-15 + addendum), `development/archive/cyrius-linalg-proposal.md` (shipped). |
+| 📅 **Dated artifact — supersede, don't edit** | 8 | `audit/2026-04-15.md`, `audit/2026-05-29.md`, `audit/2026-05-29-cga-arc-closeout.md`, `audit/2026-05-30.md`, `benchmarks-rust-v-cyrius.md` (v2.2.0), `port-audit.md` (2026-04-15 + addendum), `development/archive/cyrius-linalg-proposal.md` (shipped). |
 | 🐞 **Tracked toolchain issues (live on 6.5.6)** | 3 | `development/issues/*` — the 6.2.11 bump fixed 3 (archived). 3 now live, re-confirmed on 6.5.6 (v2.6.11, minimal repros): for-empty-clauses (verified); interval-ident-lex (verified — `iv_add`/`iv_sub`/`iv_mul` are reserved cycc SIMD intrinsics, unusable as var names, worked around by rename); CLI-clobber (not re-tested, destructive). Neither of the two verified ones was fixed by the 6.4 → 6.5 minor. See Tier 6. |
 
 Numbers approximate; rolls up from the per-tier tables below.
@@ -148,7 +156,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `roadmap.md` | 2026-08-03 | ✅ Fresh | **Rotates every release.** v2.6.11: header toolchain → 6.5.6, Current → v2.6.11 (minor jump, 24 releases), assertions → 961, +2.6.11 Release-History row, and the Parked item **"Stdlib `mat_new` overflow guard (from 2.5.3)" struck as RESOLVED** — the condition ("when the toolchain pin moves past it") was met by ganita 1.0.4. Forward: 2.7.0 (rendering/GPU/reverse-AD), 3.0.0 (`Result<T,E>`), + Parked. |
+| `roadmap.md` | 2026-08-03 | ✅ Fresh | **Rotates every release.** v2.6.11: header → 6.5.6, Current → v2.6.11, assertions → 961, +2.6.11 Release-History row. **Restructured same-day for 2.6.12**: new **2.6.12 audit/hardening/repair** section scoped from the 2026-08-03 audit (P0 correctness → P4 docs, with sequencing); the resolved `mat_new` Parked item **removed** (not struck) with a one-line retirement note, per the new "shipped items leave this list" rule; 2.6.x recorded as **feature-closed with no residue**, and the three items too large for a patch (`vec_sort_by` adoption, SIMD flat-array kernels, per-module dependency manifest) **moved to 2.7.0**. Forward: 2.6.12 (repair), 2.7.0, 3.0.0, + Parked. |
 | `threat-model.md` | 2026-08-03 | ✅ Fresh | v2.6.11: the `mat_new` attack-surface row **flipped open → ✅ RESOLVED** (ganita 1.0.3 → 1.0.4: `GANITA_MAT_MAX_ELEMS = 33554430` + null propagation), recording that the exposure was *worse* than prior entries stated — the vendored copy was stale at 1.0.3 and segfaulted (exit 139), which the toolchain-vs-toolchain vendoring check could not see. +2026-08-03 audit-history entry with the corrected process. (Prior: 2026-07-21 for v2.6.10; 2026-07-17 for v2.6.9.) |
 | `dependency-watch.md` | 2026-08-03 | ✅ Fresh | Cyrius toolchain version-watch. Pin → **6.5.6** (+6-file stdlib delta: `ganita` CWE-190 `mat_new` guard, `syscalls*` `sys_exit_group`, `vec` `vec_sort_by`/`vec_select_nth`, `io`); sakshi 2.4.6 → **2.4.7** (private `_int`/`_str` dispatch-suffix rename; hisab audited clean). Records the `vec_sort_by` non-adoption with its concrete API-mismatch reason. Watching: 5.7.11 (RISC-V). |
 | `port-audit.md` | 2026-05-29 | 📅 Dated + addendum | 2026-04-15 Rust→Cyrius parity snapshot, preserved; 2026-05-29 status addendum records nearly all "P0 gaps" now ported. Don't rewrite the body. |
@@ -176,8 +184,13 @@ Periodic audit reports; per-audit timestamped. **Don't refresh in place — supe
 | `2026-05-29.md` | 2026-05-29 | 📅 Dated artifact — security/hardening audit closing the 2.4.x arc (no new vuln) |
 | `2026-05-29-cga-arc-closeout.md` | 2026-05-29 | 📅 Dated artifact — 2.5.x closeout (v2.5.4): P(-1)/security review of the CGA operators + `mat_new_guarded` (posture solid) + the math.md deliverable |
 | `2026-05-30.md` | 2026-05-30 | 📅 Dated artifact — 2.6.x closeout (v2.6.5): P(-1)/security review of the diffgeo curvature/transport/form functions (posture solid) + the math.md §2 deliverable |
+| `2026-08-03.md` | 2026-08-03 | 📅 Dated artifact — **full P(-1) sweep of the v2.6.11 tree, scoping 2.6.12.** 8 audit dimensions over all 34 modules, adversarially verified: **70 findings confirmed / 7 refuted** (2 critical, 23 high, 23 medium, 22 low; 64 sites in 27 files). Headline: 7 mis-transcribed hex-constant tables, 4 of them published tableaux falsified by their own invariants (DOPRI45 Σb = 0.636, Gauss-5 Σw = 2.000492, BDF-4 Σα = 1.01, Yoshida-4 = 1.474). Root cause identified as coverage: 8 modules / 5,068 lines / 104 public fns included by no suite; 35 of 65 source defects sit at ≤30% coverage. **Explicitly corrects the "posture solid" conclusion of the two 2026-05-29/30 closeouts** (they were scoped to arc-new functions only). |
 
-Next periodic security audit: per CLAUDE.md, before a major release or after significant surface change. Natural next boundary is the 3.0.0 (`Result<T,E>`) cut.
+> **Note on the two "posture solid" closeouts above.** Left at their shipped wording per the
+> dated-artifact rule, but read them with the 2026-08-03 correction in hand: neither reached the
+> never-included modules, so "solid" described the arc's new code, not the library.
+
+Next periodic security audit: per CLAUDE.md, before a major release or after significant surface change. Natural next boundary is the 3.0.0 (`Result<T,E>`) cut — but 2.6.12 must close the 2026-08-03 findings first.
 
 ---
 
@@ -260,7 +273,7 @@ Scheduled doc decisions, surfaced so they aren't forgotten when the trigger arri
 | 1 | **Roadmap + Release History rotate every release** — completed arcs move out of active-work into the Release History table at closeout. | Every release | Per CLAUDE.md Work Loop §10–11. Last done in the v2.6.11 bump (+2.6.11 row; the `mat_new` Parked item struck as RESOLVED). |
 | 2 | **Re-run `bench-history.sh` at release closeout** — keep `benchmarks.md` + `bench-history.csv` current; "numbers don't lie." | Every release with perf-relevant change | ✅ Done 2026-08-03 at v2.6.11 (was at `7ae75ef`; now `5331f05`, 26 benchmarks). No perf claim attached — 2.6.11 changes no math code path. |
 | 3 | **Re-verify tracked `issues/` filings at each toolchain bump** — re-test on the new pin; move resolved ones to `issues/archived/`. | Each `cyrius.cyml` pin bump | ✅ Done 2026-08-03 on 6.5.6 — all 3 open issues still live (interval-ident-lex + for-empty-clauses confirmed by minimal repro; CLI-clobber not re-tested, destructive); the 6.4 → 6.5 minor fixed none. Prior: 2026-07-21 on 6.4.69; 2026-07-17 on 6.4.66; 2026-06-30 on 6.3.11; 2026-06-15 on 6.2.11 (3 of 5 fixed and archived). |
-| 4 | **Periodic security audit** — full source scan before a major release or after significant surface change; supersede with a new dated `docs/audit/` doc. | Before 3.0.0; on significant change | Last: 2026-04-15 + 2026-05-29. **Interim finding 2026-08-03 (v2.6.11)**, recorded in `threat-model.md` rather than a new dated doc because it is a dependency-currency fix, not a source audit: the vendored `lib/ganita.cyr` had been stale at 1.0.3 against a pin shipping 1.0.4, exposing an unguarded (crashing) `mat_new`. Vendoring is now byte-checked against the pin's own snapshot. |
+| 4 | **Periodic security audit** — full source scan before a major release or after significant surface change; supersede with a new dated `docs/audit/` doc. | Before 3.0.0; on significant change | ✅ **Done 2026-08-03 — `audit/2026-08-03.md`**, a full P(-1) sweep of all 34 modules: 70 verified findings (2 critical), scoping 2.6.12. Supersedes the scope, though not the text, of the 2026-05-29/30 closeouts. Also 2026-08-03 in `threat-model.md`: the vendored `ganita` staleness (dependency currency, not source). Prior: 2026-04-15, 2026-05-29. **Next: re-audit after 2.6.12 lands, to confirm the repairs.** |
 | 5 | **Byte-check `lib/*.cyr` against `~/.cyrius/versions/<pin>/lib/` at every pin bump** — compare the vendored tree to the *pin*, never previous-pin against new-pin. | Each `cyrius.cyml` pin bump | **New at v2.6.11.** The toolchain-vs-toolchain comparison used through 2.6.10 is blind to vendoring drift and hid the stale `ganita` 1.0.3 for three releases. `cyrius lib sync` then `cmp` every file (excluding `sakshi.cyr`), and treat any `lib/` file that differs from the pin as a defect, not a diff. |
 
 ---

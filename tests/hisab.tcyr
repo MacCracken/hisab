@@ -144,6 +144,19 @@ var lin = srgb_to_linear(half);
 var back = linear_to_srgb(lin);
 assert(f64_lt(f64_abs(f64_sub(back, half)), f64_from(1)) == 1, "srgb roundtrip");
 
+# A round-trip is BLIND to a wrong transfer curve — the same wrong breakpoint is
+# applied in both directions and the error cancels. Both sRGB piecewise breakpoints
+# were mis-transcribed through 2.6.11 (0.03275 shipped for the spec's 0.04045) and
+# the round-trip above stayed green. Pin the absolute value instead:
+# srgb_to_linear(0.5) = ((0.5 + 0.055) / 1.055)^2.4 = 0.21404114048223255
+var _srgb_half_lin = 0x3FCB65B3392F5354;  # 0.21404114048223255
+assert(f64_lt(f64_abs(f64_sub(lin, _srgb_half_lin)), f64_div(F64_ONE, f64_from(100000000))) == 1,
+"srgb_to_linear(0.5) == 0.2140411404822 (absolute, not round-trip)");
+# Just above the breakpoint the power segment must be in use, just below the linear
+# one — this is what actually pins the 0.04045 threshold itself.
+assert(f64_lt(srgb_to_linear(f64_div(F64_ONE, f64_from(100))),
+f64_div(F64_ONE, f64_from(100))) == 1, "srgb: linear segment below breakpoint");
+
 # Reinhard: 1.0 → 0.5
 var tr = tonemap_reinhard(F64_ONE, F64_ONE, F64_ONE);
 var trx = f64_to(f64_mul(HVec3_x(tr), f64_from(10)));
@@ -412,10 +425,48 @@ var dp_y = alloc(8);
 var dp_err = alloc(8);
 var _dp_dt = f64_div(F64_ONE, f64_from(10));  # 0.1
 ode_dopri45(&_ode_exp, 0, F64_ONE, _dp_dt, dp_y, dp_err);
-# After dt=0.1: y should be > 1 (growth)
 var dp_val = load64(dp_y);
+# VALUE assertion, not a bounds check. Through 2.6.11 the only assertions here
+# were `1 < y < 2`, which a *non-consistent* integrator passes: 23 of the 30
+# Dormand-Prince tableau constants were mis-transcribed (sum(b) = 0.636, not 1)
+# and this test stayed green for six releases. One step of dt=0.1 on y'=y from
+# y(0)=1 has the exact value e^0.1; a 5th-order method must hit it to ~1e-9.
 assert(f64_gt(dp_val, F64_ONE) == 1, "dopri45 exp grows");
 assert(f64_lt(dp_val, F64_TWO) == 1, "dopri45 exp bounded");
+var _dp_exact = 0x3FF1AEC7B35A00D4;                       # e^0.1 = 1.1051709180756477
+var _dp_err = f64_abs(f64_sub(dp_val, _dp_exact));
+assert(f64_lt(_dp_err, f64_div(F64_ONE, f64_from(1000000000))) == 1,
+"dopri45: one step of y'=y equals e^0.1 to 1e-9");
+# The embedded 4th/5th-order error estimate must be small, not garbage.
+assert(f64_lt(f64_abs(load64(dp_err)), f64_div(F64_ONE, f64_from(1000000))) == 1,
+"dopri45: embedded error estimate < 1e-6");
+
+# BDF-4 and Yoshida-4 had NO numeric assertions at all through 2.6.11, which is
+# why their mis-transcribed coefficient tables shipped. Both are pinned here by
+# the consistency invariant the wrong constants violated, not by a bounds check.
+
+# BDF-4 on the constant solution y' = 0, y == 1. The alpha row must sum to 1, so
+# a constant history must reproduce itself exactly. Pre-fix, sum(alpha) = 1.01
+# and this drifted by 1% per step.
+fn _ode_zero(t, y) { return 0; }
+var _bdf_hist = vec_new();
+vec_push(_bdf_hist, F64_ONE);
+vec_push(_bdf_hist, F64_ONE);
+vec_push(_bdf_hist, F64_ONE);
+vec_push(_bdf_hist, F64_ONE);
+var _bdf4 = ode_bdf(&_ode_zero, 0, _bdf_hist, 4, f64_div(F64_ONE, f64_from(10)),
+f64_div(F64_ONE, f64_from(1000000000000)));
+assert(f64_lt(f64_abs(f64_sub(_bdf4, F64_ONE)), f64_div(F64_ONE, f64_from(100000000))) == 1,
+"bdf4: constant solution is reproduced exactly (sum(alpha) == 1)");
+
+# Yoshida-4 on a free particle (accel == 0): the drift coefficients must sum to 1,
+# so q advances by exactly v*dt. Pre-fix they summed to 0.859 and it moved 85.9%
+# of the correct distance.
+fn _ode_free(q) { return 0; }
+var _y4 = ode_yoshida4(&_ode_free, 0, F64_ONE, F64_ONE);   # q=0, v=1, dt=1 -> q=1
+assert(_y4 != 0, "yoshida4 returns result");
+assert(f64_lt(f64_abs(f64_sub(load64(_y4), F64_ONE)), f64_div(F64_ONE, f64_from(100000000))) == 1,
+"yoshida4: free particle advances exactly v*dt (sum(c) == 1)");
 
 # Verlet: simple harmonic oscillator q''=-q, start q=1,v=0
 # After dt=pi, q should be ≈ -1
@@ -453,6 +504,39 @@ assert(f64_lt(opt_result, F64_ONE) == 1, "gd x near 0");
 # Sparse / SVD / Eigen
 # ================================================================
 test_group("linalg_ext");
+
+# BiCGSTAB on A x = b with A = [[4,1,0],[1,3,1],[0,1,2]], b = (6,10,8), x = (1,2,3).
+# solve_bicgstab had NO test through 2.6.11 and was a complete no-op: its breakdown
+# tolerance was written `f64_from(0x3C32725DD1D243AC)`, and f64_from CONVERTS an
+# integer rather than reinterpreting bits, so the tolerance was 4.34e18 instead of
+# 1e-18 and the first `|rho| < tol` check always fired — the solver returned the
+# initial guess verbatim. These assert the SOLUTION, so a no-op cannot pass.
+fn _bicg_matvec(xp) {
+    var o = alloc(24);
+    var bx0 = load64(xp);
+    var bx1 = load64(xp + 8);
+    var bx2 = load64(xp + 16);
+    store64(o, f64_add(f64_mul(f64_from(4), bx0), bx1));
+    store64(o + 8, f64_add(f64_add(bx0, f64_mul(f64_from(3), bx1)), bx2));
+    store64(o + 16, f64_add(bx1, f64_mul(f64_from(2), bx2)));
+    return o;
+}
+var _bicg_b = alloc(24);
+store64(_bicg_b, f64_from(6));
+store64(_bicg_b + 8, f64_from(10));
+store64(_bicg_b + 16, f64_from(8));
+var _bicg_x0 = alloc(24);
+store64(_bicg_x0, 0);
+store64(_bicg_x0 + 8, 0);
+store64(_bicg_x0 + 16, 0);
+var _bicg_x = solve_bicgstab(&_bicg_matvec, _bicg_b, _bicg_x0, 3,
+f64_div(F64_ONE, f64_from(1000000000)), 100);
+assert(_bicg_x != 0, "bicgstab returns a solution");
+var _bicg_eps = f64_div(F64_ONE, f64_from(1000000));
+assert(f64_lt(f64_abs(f64_sub(load64(_bicg_x), F64_ONE)), _bicg_eps) == 1, "bicgstab x[0] == 1");
+assert(f64_lt(f64_abs(f64_sub(load64(_bicg_x + 8), F64_TWO)), _bicg_eps) == 1, "bicgstab x[1] == 2");
+assert(f64_lt(f64_abs(f64_sub(load64(_bicg_x + 16), f64_from(3))), _bicg_eps) == 1,
+"bicgstab x[2] == 3");
 
 # Inertia sphere: I = (2/5)*m*r^2 on diagonal
 var isph = inertia_sphere(f64_from(10), F64_ONE);

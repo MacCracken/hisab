@@ -2,6 +2,101 @@
 
 ## [Unreleased]
 
+### Remaining from the 2.6.12 audit (P0 not yet fixed)
+`svd_golub_kahan` returns U transposed; `eigen_qr` never converges for n ≥ 3; the SU(2)/SE(3)
+half-vs-full-angle convention split; `einsum` label validation; `ivl_sin`'s invalid enclosure.
+Plus all of P1–P4. See [`docs/development/roadmap.md`](docs/development/roadmap.md) §2.6.12 and
+[`docs/audit/2026-08-03.md`](docs/audit/2026-08-03.md).
+
+## [2.6.12] - 2026-08-03 — Audit sweep: seven mis-transcribed constant tables repaired
+
+**A repair release, not a feature release.** A full P(-1) audit of the 2.6.11 tree — 8 parallel
+dimensions over all 34 modules, every finding adversarially re-verified against running code —
+produced **70 confirmed findings (2 critical, 23 high, 23 medium, 22 low)** across 64 sites.
+Full report: [`docs/audit/2026-08-03.md`](docs/audit/2026-08-03.md). This release closes the
+critical tier plus the two highest-value independent defects; the rest is tracked under
+`[Unreleased]` and roadmap §2.6.12.
+
+**No API change. No signature change. Consumers need only rebuild** — but every consumer of
+`ode_dopri45`, `ode_bdf(order=4)`, `ode_yoshida4`, `calc_integral_gauss5`, `num_is_prime`,
+`solve_bicgstab`, the sRGB conversions, the spherical-harmonic basis or `simplex_*` was getting
+**numerically wrong answers** before this release.
+
+### Fixed — seven hand-encoded constant tables did not encode their documented values
+
+hisab stores f64 constants as raw i64 bit patterns (Cyrius has no float literals), so the
+adjacent comment is the only readable statement of intent. In seven tables the bits disagreed
+with the comment. **47 constants re-derived from exact rationals and closed forms**, each table
+now pinned by its own mathematical invariant:
+
+| Table | Site | Invariant | Was | Now |
+|---|---|---|---|---|
+| Dormand-Prince RK4(5) | `ode.cyr` | Σb = 1 | **0.635581152612211** | 1.0 |
+| Gauss-Legendre 5-point | `calc.cyr` | Σw = 2 | **2.000492320194892** | 2.0 |
+| BDF-4 | `ode.cyr` | Σα = 1 | **1.01** | 1.0 |
+| Yoshida-4 symplectic | `ode.cyr` | 2w₁+w₀ = 1 | **1.4737899450113117** | 1.0 |
+
+- **DOPRI45 — 23 of 30 tableau constants were wrong.** Stage rows also failed `Σⱼ a_ij = c_i`
+  (row 3 summed to 0.25 against c₃ = 0.3). It was **not a consistent integrator at any order**:
+  it did not merely lose accuracy, it converged to the wrong solution. One step of `y' = y` from
+  `y(0) = 1` at `dt = 0.1` now matches e^0.1 to < 1e-9; before, it was wrong in the second digit.
+- **BDF-4** drifted 1% per step on a constant solution. **Yoshida-4** advanced a free particle
+  only 85.9% of the correct distance. **Gauss-Legendre-5** carried a 246 ppm relative error
+  floor on a rule that is exact for polynomials of degree ≤ 9.
+- **`color.cyr`** — both sRGB piecewise breakpoints (0.03275 shipped for the IEC 61966-2-1 value
+  **0.04045**; 0.0031294 for 0.0031308) and four of five spherical-harmonic normalisations.
+- **`noise_simplex.cyr`** — `_SIMPLEX_G2` encoded √3 as 1.73158 instead of 1.73205, so the
+  skew/unskew pair was not an exact inverse.
+- **`quat.cyr`** — the slerp/nlerp switchover threshold was 0.999375, not the documented 0.9995.
+
+### Fixed — `num_is_prime` reported real primes as composite above 3.03e9
+`_num_miller_rabin_test`'s squaring step used a raw `(x * x) % n` while `num_modpow` alongside it
+already used the overflow-safe `_num_mulmod`. `x` ranges over `[0, n-1]`, so once
+`n > 3037000499` (≈√2^63) the product wrapped negative and every witness failed. Measured: the
+genuine primes **3037218841** and **4294967357** both returned composite. Now routed through
+`_num_mulmod`; verified against an independent Miller-Rabin implementation across the band.
+
+### Fixed — `solve_bicgstab` never iterated
+`var breakdown_tol = f64_from(0x3C32725DD1D243AC);` — `f64_from` **converts** an integer to a
+double, it does not reinterpret bits, so the tolerance was **4.34e18** instead of 1e-18 and the
+first `|rho| < tol` check fired immediately. The solver returned the initial guess verbatim on
+every call. The literal already is the bit pattern; the `f64_from` wrapper is removed. (The
+comment also mis-stated the value as ~1e-30; it is 1e-18.) This was the only `f64_from(0x…)` in
+`src/`.
+
+### Added — `scripts/check-constants.sh`, a CI gate for the whole defect class
+Decodes **every** hand-encoded f64 literal in `src/` and asserts it against the value in its own
+comment, handling exact rationals, closed-form expressions (`1/(2 - 2^(1/3))`, `sqrt`, `pi`) and
+truncated decimals, with the tolerance derived from the precision the comment itself claims. It
+also cross-checks comments that state both an exact form and a decimal — which caught four
+DOPRI45 comments whose decimals disagreed with their own fractions. **110/110 now verified.**
+Wired into CI between the vet and distlib gates. The class is mechanical; the guard is too.
+
+### Changed — assertions that a broken implementation could pass
+Every fix landed with the assertion that would have caught it. The pre-existing tests were the
+reason six releases shipped a broken integrator:
+- `ode_dopri45` asserted only `1 < y < 2` for a value whose exact answer is 1.10517 — replaced
+  with a value assertion plus a check that the embedded error estimate is not garbage.
+- `gauss5` compared `f64_round(result)` to an integer, tolerating ±0.5 absolute (7.1% relative
+  on the const-7 case) — replaced with 1e-11 tolerances and a weights-sum check.
+- **BDF-4 and Yoshida-4 had no numeric assertions at all** — now pinned by the consistency
+  invariants their wrong constants violated.
+- The sRGB test was a **round-trip**, which is structurally blind to a wrong transfer curve (the
+  same wrong breakpoint applies in both directions and the error cancels) — added an absolute
+  value assertion and a breakpoint-segment check.
+- `solve_bicgstab` and the `num_is_prime` overflow band had no coverage at all.
+
+### Verified
+- Suite **981/981** (foundation 307 + hisab 186 + edge_cases 173 + modules 315), up from 961:
+  +20 assertions, all mutation-proven. Reverting `src/ode.cyr` alone fails 4; reverting
+  `src/calc.cyr` fails 3; reverting `src/linalg_ext.cyr` fails 3; reverting `src/num.cyr` fails 4.
+- `cyrius fuzz` 1/1. `check-constants.sh` 110/110. `cyrius lint` / `fmt --check` / `vet` clean;
+  `deps --verify` 30/30; `cyrius distlib` regenerated (16,885 → 16,897 lines).
+- Benchmarks re-run (26, commit `ee8032c`). **No performance claim** — `num_is_prime` measured
+  20.3 µs against 20.7 µs before, which is run-to-run noise, and no other changed path is
+  benchmarked. The `_num_mulmod` routing is strictly more work per squaring step; it was not
+  measurably slower at the benchmark's input sizes, and correctness is not negotiable regardless.
+
 ## [2.6.11] - 2026-08-03 — Cyrius 6.5.6 toolchain bump + sakshi 2.4.7; stdlib `mat_new` CWE-190 guard lands
 
 Maintenance release: toolchain pin **6.4.69 → 6.5.6** (a **minor** jump across 24 releases —

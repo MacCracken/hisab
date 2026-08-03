@@ -4,10 +4,10 @@
 
 ```bash
 # All test suites
-cyrius test tests/hisab.tcyr        # 175 smoke/integration tests
+cyrius test tests/hisab.tcyr        # 186 smoke/integration tests
 cyrius test tests/foundation.tcyr   # 307 exhaustive foundation type tests
-cyrius test tests/modules.tcyr      # 312 per-module tests
-cyrius test tests/edge_cases.tcyr   # 167 edge case + boundary tests
+cyrius test tests/modules.tcyr      # 315 per-module tests
+cyrius test tests/edge_cases.tcyr   # 173 edge case + boundary tests
 
 # Benchmarks (26 operations)
 cyrius bench tests/hisab.bcyr
@@ -28,7 +28,7 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 | `modules.tcyr` | 312 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff, interval, tensor, and collision (convex hull, triangulation, Delaunay, half-edge, MPR, sequential-impulse) |
 | `hisab.tcyr` | 175 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms) |
 | `edge_cases.tcyr` | 167 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11) |
-| **Total** | **961** | |
+| **Total** | **981** | |
 
 ## Benchmarks (26 operations)
 

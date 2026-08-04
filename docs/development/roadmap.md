@@ -67,229 +67,30 @@ a future reader needs:
 
 ---
 
-## 2.7.0 -- Re-audit & refactor  (IN PROGRESS)
+## 2.7.0 -- Re-audit & refactor  **RELEASED 2026-08-04**
 
-The re-audit has **run** — see [`../audit/2026-08-04.md`](../audit/2026-08-04.md): **42 findings
-confirmed, 8 refuted** (4 high, 21 medium, 17 low; no criticals) across six dimensions.
+Closed the 2026-08-04 re-audit: **35 of 41 findings fixed**, disposition recorded per-finding in
+[`../audit/2026-08-04.md`](../audit/2026-08-04.md), close-out in
+[`../audit/2026-08-04-2.7.0-closeout.md`](../audit/2026-08-04-2.7.0-closeout.md). Suite
+**1127 → 1605**, coverage **59% → 71%**, benchmarks 28 → 35, constant gate 110 → 141 plus a new
+duplicate-global check. Every fix mutation-proven except two that say so.
 
-> **Regression verification came back CLEAN** — every 2.6.12–2.6.15 repair holds under execution,
-> verified against mathematical invariants rather than comments, with the pre-fix files re-run as
-> controls. The rewrites are correct as well as fast.
->
-> ⚠️ **But it also corrected the record: the 2026-08-03 audit was NOT fully discharged.** Six of
-> the original 70 findings were never fixed, because the repair work was scheduled from this
-> roadmap's P0–P4 *summary bullets* — a deduplicated digest — rather than from the audit's finding
-> list. "All P-tiers closed" was then read as "all findings closed". **An audit's finding list is
-> the unit of disposition.** Every numbered finding now needs an explicit disposition before 2.7.0
-> closes.
+Four defects were found by *checking that a repair preserved behaviour*, not by any audit — the
+biggest being `kdtree_within_radius` returning wrong counts on 274/400 queries after three
+releases. Two findings had never been scheduled at all, surfaced only by the per-finding
+disposition sweep. Three confirmed performance wins were **withheld** because each regresses on
+some input class; their measurements and reviews are filed under `issues/`.
 
-### Already fixed during the audit (gate infrastructure, not scheduled work)
-- [x] **`check-constants.sh` had a 25% blind spot** — its regex rejected `_` digit separators, so
-      it printed "110/110 verified" while skipping 35 of 145 declarations. Coverage now
-      **110 → 145**, ±Infinity verified rather than skipped, and the skip list is printed
-- [x] **`symbolic_ext.cyr:213`** — `limit` encoded 9999999978962944.0 against a documented `1e15`;
-      exposed by the fixed gate
-
-### Carried over — never fixed from the 2026-08-03 audit  ✅ **CLOSED (2.7.0-A)**
-
-All six fixed and **mutation-proven**: each source file was reverted and the new assertions
-confirmed to fail. Suite 1127 → 1154.
-
-- [x] `geo_ray_capsule` returned NaN instead of 0 on a parallel miss (`geo.cyr:456`) — `a == 0`
-      made `disc` exactly `+0.0`, which does not satisfy `disc < 0`, so the cap-sphere fallback
-      was skipped and `0.5/0` was evaluated. The parallel case now joins the cap path
-- [x] `cmat_exp` scaling loop never terminated on an infinite Frobenius norm (`complex.cyr:390`) —
-      `+Inf * 0.5` is still `+Inf`. Proven: 1 s with the fix, >110 s without. Bounded at 64
-- [x] `geo_ray_plane` now returns 0 on a miss, matching the contract stated twice in its own
-      module. **Behaviour change** — the old `-1` was a negative NaN as an f64
-- [x] `f64_fmod` used floor where IEEE-754 `fmod` truncates — the result carried the sign of the
-      divisor, not the dividend (`fmod(-7, 3)` gave `+2`, not `-1`)
-- [x] `f64_copysign` branched on an *ordered* comparison, so it was blind to `-0.0` and could
-      never produce it; replaced with the specified sign-bit splice
-- [x] `lorentz_is_valid` used an absolute `1e-12` against terms of size cosh²(η), rejecting valid
-      boosts from rapidity ~5 up; now scaled by matrix magnitude, with rejection still asserted
-- [x] *(found while fixing)* `lorentz_boost_x/y/z` took **rapidity** but named the parameter
-      `beta` (velocity), contradicting their own doc comments — renamed `eta`
-
-### High  ✅ **CLOSED (2.7.0-B)**
-
-`geo_advanced.cyr` — the largest module at 1,261 lines — had **zero** coverage on GJK/EPA/BVH/TOI
-before this. Suite 1154 → 1181.
-
-- [x] **`cmat_mul` never checked `cmat_cols(a) == cmat_rows(b)`** and read past the end of b's
-      buffer (`complex.cyr:224`) — a 2×3 times a 2×2 read two complex numbers of adjacent heap
-- [x] **`_bvh_build_rec` degenerated to a 1-vs-(n−1) split** on coincident AABBs
-      (`geo_advanced.cyr:532,594`). Not O(n) depth alone — because each level re-merges its whole
-      range for `bounds`, build cost was **O(n²)**. Median split restores O(n log n):
-      `bvh_degenerate_4k` **2.722 s → 15.5 ms (−99.4%)**, row in `bench-history.csv`.
-      ⚠️ Proven by benchmark, **not** by assertion — both forms return the same answer, so the
-      defect is a cost and `assert_eq` cannot state it
-- [x] **`time_of_impact` missed every collision beyond 0.64 units** of relative travel
-      (`geo_advanced.cyr:744`) — the loop was bounded by `GJK_MAX_ITER`, a cap on simplex
-      refinement, not on time sampling, so `max_t` was ignored entirely. A false negative from a
-      collision query. Step budget is now its own constant spanning the full horizon
-
-### Medium — correctness & safety
-- [x] `cmat_commutator`/`add`/`sub`/`adjoint`/`scale`/`trace` dereferenced `cmat_mul`'s designed 0
-      — the 2.6.14 null-propagation fix stopped one call-link short. **Both mutants SIGSEGV**;
-      guarded, plus shape checks on `add`/`sub` *(closed with 2.7.0-B)*
-- [x] `detect_islands` validated only the upper bound of contact body indices; a negative index
-      subscripted before the union-find arrays (`collision_mesh.cyr:538`). **SIGSEGV** at large
-      magnitude; at small magnitude a *silent* wrong partition (3 islands where 4 is correct)
-      *(2.7.0-C)*
-- [x] diffgeo's downstream tensor functions applied neither the dim cap nor a null check, so both
-      the cap path and the alloc-failure path dereferenced NULL (`diffgeo.cyr:336`). Shared
-      `_DG_MAX_DIM`, operand guards on 9 functions, checks at **all ten** alloc sites — plus
-      `wedge_1_1`, a live SIGSEGV the finding never mentioned *(2.7.0-C)*
-- [x] `svd_golub_kahan` returned NO_CONVERGENCE plus all-zero singular values for a
-      **rank-deficient** matrix (`linalg_precision.cyr:340`). A zero DIAGONAL entry makes the
-      implicit shift a no-op — the rotation from `(d²−mu, d·f)` is a bare sign flip when `d == 0`.
-      Added `_lp_split_zero_diag`, the zero-diagonal case of Golub & Van Loan Alg. 8.6.2 omitted
-      from the original transcription. Rank-1 3×3 now gives `S = (14, 0, 0)` exactly *(2.7.0-E)*
-- [x] `expr_to_str`/`sym_to_latex` dropped the rounding carry — 0.9999999 rendered as "0.1000000"
-      and 2.9999999 as "2.1000000". stdlib `fmt_float_buf` skips its zero-pad when the fraction
-      rounds up to 10^decimals. hisab now carries `_sym_render_f64` *(2.7.0-D)*
-- [x] `levi_civita_3`/`_4` returned raw i64 while their siblings return f64 bit patterns; the −1
-      case was a **negative NaN**, poisoning even the exactly-zero components of a contraction
-      (`tensor.cyr:227`). 8 existing assertions migrated with it *(2.7.0-C)*
-- [x] `num_ifft` conjugated the caller's buffer before validating, so its error return left the
-      input corrupted (`num.cyr:236`) — a failure code *and* silently mutated data *(2.7.0-C)*
-- [x] **Householder reflector construction was unscaled** (`linalg_precision.cyr:31`) — usable band
-      only ~1 .. 1e23; **40/40 failures at scale 1e-10** (SI metres) across 440 random matrices.
-      Overflow gave NaN `U` + NO_CONVERGENCE; underflow silently returned the raw diagonal of A,
-      42.6% off, with `HSB_ERR_NONE`. `svd_golub_kahan`/`eigen_qr`/`cqr_decompose` now balance to
-      unit max magnitude with a **power-of-two divisor**, so unit-scale results are bit-identical.
-      9 of 11 new assertions fail on revert *(2.7.0-D)*
-
-### Test quality  (12 findings — assertions that cannot fail for the right reason)
-- [x] `num_rk4`'s **only** assertion in the whole tree could not fail — the test problem
-      (`f = 1`) carries no order information *and* `f64_to` truncates, accepting `[1.0, 2.0)`.
-      Proven: replacing `num_rk4` with plain Euler kept all 1250 assertions green. Now 16
-      assertions on independently-derived references (stability function, exact-rational
-      multi-step, observed order-of-convergence in (14,17)); an Euler stub fails 14 of 16
-      *(2.7.0-G)*
-- [x] **~35 surviving mutants catalogued by adversarial review** — closed alongside the six
-      repairs themselves, not deferred. Every highest-value one is now caught: the Simpson a-drops,
-      the ode function-pointers, `eigen_power`'s transposed matvec and sign loss, the λ₄..λ₇ signs,
-      `cx_exp` conjugation, the `cmat_adjoint` stub, `minkowski_interval`'s dropped z². The
-      per-finding spec files under `../development/issues/` have been retired *(2.7.0-G)*
-- [ ] Raise `cyrius coverage` from **59%** toward the 80% target
-
-### Performance  (each needs before/after rows in `bench-history.csv`)
-- [ ] `delaunay_2d` rescans every triangle per inserted point — **CONFIRMED O(n²)**: growth ratio
-      converges on 4.0x per doubling, 217 ms at n=1,600. An x-sweep-with-retirement rewrite reaches
-      2.1-2.5x per doubling (**-93% at n=3,200**) but is **NOT applied**: it is 1.9-3.0x *slower*
-      with up to 2.5x memory on cocircular input, and changes the triangulation on inputs as simple
-      as the unit square (both valid, zero shared triangles). Spec + review filed
-- [ ] `triangulate_polygon` reflex-only pruning — **sound on simple polygons**: ~33,000 tested
-      including an exhaustive enumeration of every 4-, 5- and 6-gon on a 3x3 grid, **0 divergences**.
-      Diverges only on self-intersecting input (outside the documented contract), but **output
-      LENGTH changes in both directions** — including cases where the old code returned EMPTY and
-      the new one returns a complete triangulation. That interacts with the never-scheduled
-      `collision_core.cyr:511` finding below, so land them together. **NOT applied**
-- [x] `solve_bicgstab` allocated `s` inside its iteration loop — the bump allocator never frees, so
-      every pass abandoned another `n*8` bytes. Hoisted: arena at n=1024/max_iter=128 **3,194,880 B
-      -> 2,154,496 B (-32.6%)**, results bit-identical. The "superlinear" framing in the finding was
-      **refuted** — the cost is linear; it is a leak, not a complexity defect *(2.7.0-I)*
-- [ ] `_kd_partition` value-midpoint split — **CONFIRMED**, but the patch costs **+28-30% on
-      duplicate-heavy skewed data** and has **zero permanent regression coverage**. **NOT applied.**
-      Its review is what surfaced the `kdtree_within_radius` correctness defect above
-- [x] Benchmarked the hot public functions that had none — `kdtree_build`, `kdtree_within_radius`,
-      `delaunay_2d`, `triangulate_polygon`, `svd_golub_kahan`, `eigen_qr`. 29 → **35** benchmarks;
-      `spatial.cyr`, `linalg_ext.cyr` and `linalg_precision.cyr` had never been benchmarked at all.
-      Baselines, not wins — their point is that the three withheld optimisations now have a
-      committed before-number to be judged against *(2.7.0-L)*
-
-### Found during 2.7.0-C (new — not in the 2026-08-04 audit)
-- [x] **`eigen_qr` returned `HSB_ERR_NO_CONVERGENCE`** on a moderately-conditioned symmetric 4×4.
-      Re-derived the repro as promised — swept 150 random symmetric 4×4s, 1 failed, **cond only
-      240**, non-convergent even at `max_iter = 1e6`. Cause was the block-boundary logic, not the
-      sweep: a dead loop with a **fake break** (`var _break = 1;` + no-op `p_lo = p_lo;`) whose
-      result was then discarded by a re-find using an **absolute** epsilon against the **relative**
-      deflation threshold beside it. One loop now, same threshold. Sweep 1 → 0 failures *(2.7.0-F)*
-
-### Found during 2.7.0-B (new — not in the 2026-08-04 audit)
-- [ ] **`lib/hisab.cyr` is a tracked 591 KB copy of hisab's own distlib bundle** sitting in the
-      directory CLAUDE.md reserves for "vendored stdlib + first-party deps ONLY — no project source
-      here". Nothing in the build reads it: not `cyrius.cyml`, not a source `include`, not CI, not a
-      script. Nothing regenerates it either — the distlib gate writes `dist/hisab.cyr`. So it is
-      stale by construction and, in a flat last-definition-wins namespace, a standing shadowing
-      hazard for all 777 functions if anything ever pulls it in.
-      ⚠️ **Correction to the first write-up of this item (which said "referenced by nothing"):** it
-      *is* **SHA-locked in `cyrius.lock`**, alongside the 30 genuine vendored stdlib files, and
-      `cyrius deps --verify` checks all 31. So deleting it is a **dependency-management operation**
-      that also requires regenerating the lock — not a file cleanup. That is the user's call, and
-      the reason this stays open rather than being actioned.
-      **Decide:** (a) delete + regenerate `cyrius.lock`, (b) keep and document why `lib/` carries a
-      self-copy, or (c) find out which command vendored it (`cyrius lib sync`?) and stop it.
-
-### Refactor  (CLAUDE.md: third instance only, never speculative, same gates as new code)
-- [x] **`calc.cyr` and `calc_ext.cyr` both defined `F64_THREE`, `F64_FOUR`, `F64_SIX`,
-      `F64_FIFTEEN`** — same bundle, last-definition-wins, so manifest ORDER decided what shipped.
-      Deduped, and `scripts/check-constants.sh` now **fails on any duplicate top-level global**,
-      whether the values differ or agree. Mutation-proven *(2.7.0-H)*
-- [x] Resolved the cross-module private-symbol question by **measuring** it. Six pairs, not five,
-      and the two that looked circular were comment-only mentions — the real graph is **acyclic**,
-      four modules are standalone, and the deepest (`lie_ext`) needs 9. Every private edge runs from
-      a derived module to its own base, i.e. the layering the module names already declare. So it
-      is a documentation gap, not tangled coupling: shipped a **dependency manifest** in
-      `../architecture/overview.md`, derived from source and **verified by compiling all 34 modules
-      against exactly their listed sets — 0 undefined, with a negative control** *(2.7.0-M)*
-- [x] README's à-la-carte example did not compile — wrong paths (`lib/` instead of `src/`) and
-      missing `vec2.cyr`/`vec4.cyr`. Fixed and **verified by building and running it**; the
-      documented ray-sphere hit really is 4.0 *(2.7.0-H)*
-- [x] BVH block header was wrong in **five** ways — not a flattened arena, 32 bytes not 40, no
-      padding slot, child POINTERS not indices, and `bvh_build` returns the root node not a
-      handle. Each checked against the code; old claims kept inline so the correction is
-      auditable. (The block is no longer zero-coverage — see 2.7.0-B) *(2.7.0-H)*
-
-### Found by the 2.7.0-I performance investigation — **two shipped correctness defects**
-Neither is a performance issue. Both were surfaced by adversarial reviewers who built independent
-oracles to check that an optimisation preserved results, and found the *shipped* code was already
-wrong. They outrank the perf work that exposed them.
-
-- [x] 🔴 **`kdtree_within_radius` returned the wrong count on most queries** — 274/400 measured.
-      Root cause was NOT the pruning code: `split_val` was read from `items[split]` (some
-      right-side value) while the partition was made at `mid_val`. **3,412 points sat on the wrong
-      side of an ancestor's plane.** Also removed a positional clamp whose justifying comment
-      ("can ONLY degenerate when lo == hi") is false in floating point. Now asserted structurally
-      on every node *and* against brute force *(2.7.0-J)*
-- [ ] 🟡 **`_col_in_circumcircle` is non-robust on extreme mixed-magnitude inputs** — 3 of 40
-      synthetic cases disagree with exact rational arithmetic. **Downgraded from red after
-      re-measurement:** using `delaunay_2d`'s actual geometry (super-triangle at 10x the extent),
-      **0 of 180** disagree across cluster spreads from 1e3 to 1e13. The failure tracks the
-      *absolute* magnitude of the far vertex, not the ratio, so no reachable path through
-      `delaunay_2d` is known — it is latent, not live. Adaptive predicate remains the remedy if the
-      function is exposed publicly or the 10x constant changes. Spec + both probes filed
-
-### Found by the disposition sweep — **the same failure mode, again**
-Assigning a disposition to every one of the 41 numbered findings (rather than reasoning from the
-digest) surfaced **two that had never been scheduled at all** — neither appeared in any tier
-heading, so neither was ever worked. This is precisely the error the 2026-08-04 re-audit was
-written to correct, recurring inside the very release that corrected it. The per-finding table in
-`../audit/2026-08-04.md` now carries a Disposition column so it cannot happen a third time.
-
-- [x] **`triangulate_polygon` documented a return length it does not always deliver** — the header
-      claimed `3*(n-2)` unconditionally while the no-ear bail returns early with no error signal.
-      Real contract now documented (complete / partial / empty) with the detection test spelled
-      out, and pinned by assertions *(2.7.0-K)*
-- [x] **`solve_gmres` overshot its documented `max_iter` budget without bound** — it converted a
-      matvec budget into an outer-cycle count while spending `1 + m` per cycle. The reviewer's
-      "unbounded" beat the audit's "2.2x": measured 4 products against a budget of 1. Now counted,
-      with a mid-cycle break that keeps the partial Krylov space valid *(2.7.0-K)*
-
-### Close-out
-- [x] Gave **every** one of the 41 numbered findings in `audit/2026-08-04.md` an explicit
-      disposition — a per-row column, not prose: **35 closed**, 4 open (performance), 2 open and
-      **never scheduled** (see above). Section 2's carried-over table also still read "still live"
-      for all six; corrected to closed *(2.7.0-H)*
-- [x] Folded the 2.6.14 **and** 2.7.0 memory-safety closures into `SECURITY.md` and
-      `threat-model.md` — 7 new attack-surface rows organised by *defect class*, two new
-      sub-tables, three audit-history entries. Also corrected a threat-model row that my own
-      `geo_ray_plane` change had falsified *(2.7.0-B)*
-- [ ] Supersede with a new dated audit once the above lands
-
----
+### Carried into 2.7.x
+- [ ] `delaunay_2d` x-sweep — −96% at n=6,400, but 1.9-3.0x slower on cocircular input and it
+      changes the triangulation of a unit square. Spec + review filed
+- [ ] `_kd_partition` median selection — +28-30% on duplicate-heavy skewed data. Spec + review filed
+- [ ] `triangulate_polygon` reflex-only pruning — sound on ~33,000 simple polygons; output length
+      changes on self-intersecting input. Land with the `collision_core.cyr:511` contract work
+- [ ] `_col_in_circumcircle` adaptive exact predicate — latent (0/180 under real `delaunay_2d`
+      geometry), needed only if the function is exposed publicly or the 10x constant changes
+- [ ] Coverage 71% → 80%. Largest holes: `color.cyr`, `complex.cyr` 35/48, `geo.cyr` 27/37,
+      `symbolic.cyr` 14/21
 
 ## 2.7.x -- Feature line  (after 2.7.0 lands)
 

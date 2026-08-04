@@ -6,7 +6,18 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-08-04 — **re-audit pass** (`audit/2026-08-04.md`). Doc-health work:
+> **Last refresh**: 2026-08-04 — **v2.7.0 RELEASED.** Suite 1127 → **1605**, coverage 59% → **71%**,
+> benchmarks 28 → **35**, constant gate 110 → **141** + a duplicate-global check. 35 of the
+> re-audit's 41 findings fixed; the 6 open ones each carry a written reason and a filed spec.
+> `lib/hisab.cyr` **deleted** and `cyrius.lock` regenerated (30 verified) — it was a tracked 591 KB
+> copy of hisab's own distlib inside the vendored-deps directory. New: a verified module dependency
+> manifest in `architecture/overview.md`, and `audit/2026-08-04-2.7.0-closeout.md` superseding the
+> re-audit. **Three corrections to my own analysis are recorded in that close-out** — a grep that
+> assumed one space before `=`, a probe that generated coordinates by magnitude class instead of
+> reconstructing the caller's geometry, and a scan that counted comments as code. Each contradicted
+> a finding; each was wrong. The standing rule: **gates beat greps.**
+>
+> **Previous refresh**: 2026-08-04 — **re-audit pass** (`audit/2026-08-04.md`). Doc-health work:
 > every Tier 1–7 row re-dated to the v2.6.15 state; at-a-glance buckets recounted (Fresh 13,
 > read-through **2**, dated artifacts **9**); forward-commitments rewritten with **two new
 > entries** (#6 run the constant gate after any constant change, #7 state an audit's SCOPE

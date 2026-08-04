@@ -2,6 +2,60 @@
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-08-04 — re-audit, repair, and the defects the repairs uncovered
+
+Closes the 2026-08-04 re-audit. **35 of its 41 numbered findings are fixed**; the six that are not
+each carry a written reason and a filed spec. Suite **1127 → 1605** (+42%), `cyrius coverage`
+**59% → 71%**, benchmarks 28 → 35, constant gate 110 → 141 verified plus a new duplicate-global
+check.
+
+**Every fix is mutation-proven** — the source file is reverted and the new assertions confirmed to
+fail — except two that are labelled rather than glossed: the BVH split (a cost, not a wrong answer,
+so a benchmark guards it) and the incircle investigation (not fixed at all).
+
+### The headline is not the audit's findings — it is what looking for them turned up
+
+Four defects in this release were found by *checking that a repair preserved behaviour*, not by any
+audit:
+
+- **`kdtree_within_radius` returned the wrong count on 274 of 400 queries.** `split_val` was read
+  from `items[split]` — some right-side value — while the partition was made at `mid_val`. 3,412
+  points sat on the wrong side of an ancestor's pruning plane. Shipped for three releases; the
+  2.6.14 kd-tree assertions pass happily on such a tree.
+- **`solve_gmres` overshot its documented matvec budget without bound** — it converted a budget
+  into an outer-cycle count while spending `1 + m` per cycle.
+- **`triangulate_polygon` documented a return length it does not always deliver.**
+- **Two findings had never been scheduled at all** — surfaced only by assigning a disposition to
+  every numbered finding rather than reasoning from the tier summaries. That is the same failure
+  mode this re-audit was written to correct, recurring inside the release correcting it.
+
+### Corrections to this document, made before release
+
+Recorded because the corrections matter more than the claims they replace:
+
+- The incircle finding was filed **red** on the claim that `delaunay_2d`'s super-triangle makes
+  every early insertion a mixed-magnitude test. The super-triangle is at **10x** the extent;
+  re-measured with the real geometry, **0 of 180** cases disagree with exact arithmetic. Downgraded
+  to latent.
+- The duplicate-globals finding was first dismissed as overstated on the strength of a `grep` whose
+  pattern assumed one space before `=`. All four globals really were duplicated. The gate found
+  what the grep missed.
+- The private-symbol coupling was reported as five pairs including a cycle. It is **six pairs and
+  acyclic**; the two "extra" edges were comment-only mentions.
+
+### Deliberately not applied
+
+Three performance optimisations are confirmed real complexity wins and are **withheld**, each with
+its measurement and review filed under `docs/development/issues/`:
+
+- `delaunay_2d` x-sweep — **−96% at n=6,400**, but 1.9–3.0x *slower* on cocircular input and it
+  changes the triangulation of a unit square.
+- `_kd_partition` median selection — **+28–30%** on duplicate-heavy skewed data.
+- `triangulate_polygon` reflex-only pruning — sound on ~33,000 simple polygons, but output length
+  changes on self-intersecting input.
+
+A faster wrong answer is worse than a slow right one.
+
 ### CORRECTION — the 2026-08-03 audit was **not** fully discharged
 The 2.6.15 entry below claims it was. That claim is **wrong**, and the 2026-08-04 re-audit
 ([`docs/audit/2026-08-04.md`](docs/audit/2026-08-04.md)) found it. All four P-tiers *were* closed,
@@ -337,6 +391,33 @@ caller's function pointer (hardcoding the SHO survives every assertion), and sur
 where 16 bytes are stored; `eigen_power` survives a transposed matvec because both test matrices
 are symmetric; and the Gell-Mann basis leaves the **sign of λ₄..λ₇ unconstrained** — pinning it
 needs the SU(3) structure constants.
+
+#### Added — quadtree, octree and spatial hash had **zero** coverage (2.7.0-N)
+
+Three whole data structures, **11 public functions**, untested through 2.7.0: `quadtree_new` /
+`_insert` / `_query`, `octree_new` / `_insert` / `_query`, and `spatial_hash_new` / `_insert` /
+`_query_cell` / `_query_radius` / `_clear`.
+
+That is exactly the shape of the k-d tree defect closed in 2.7.0-J — a spatial structure in
+`spatial.cyr` whose queries nobody checked, which then returned wrong answers for three releases.
+`spatial.cyr` stood at **3 of 14 functions** referenced.
+
+Each is now checked against a counted expectation rather than for non-null:
+
+- **quadtree** — a 20×20 grid over `[0,100]²`; the box `[10,30]²` must find exactly **25** of 400,
+  the whole domain exactly **400**, and a disjoint box exactly **0**.
+- **octree** — an 8×8×8 grid over `[0,80]³`; `[0,20]³` must find exactly **27** of 512, the whole
+  domain **512**.
+- **spatial hash** — `query_cell` must find exactly the **10** points sharing cell (0,0,0). The
+  radius query is documented as a *broadphase*, so it is asserted as a **superset** of the true
+  answer — it may over-report but must never miss — with a companion assertion that the true-hit
+  count is non-zero, so the superset test cannot pass vacuously. `clear()` must actually empty it.
+
+All twelve passed on the first run, so the expected counts were right independently of the
+implementation.
+
+`cyrius coverage` **63% → 65%** (587 functions, 382 referenced); it was 59% at the start of the
+2.7.0 line. Suite 1533 → **1545**.
 
 #### Added — a verified module dependency manifest (2.7.0-M)
 

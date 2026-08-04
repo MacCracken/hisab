@@ -32,6 +32,8 @@ include "src/einsum.cyr"
 include "src/spatial.cyr"
 include "src/collision_core.cyr"
 include "src/collision_mesh.cyr"
+include "src/linalg_ext.cyr"
+include "src/ode.cyr"
 
 # All helper functions must be defined before alloc_init() to avoid
 # compiler pass ordering issues with the permutation table init in Perlin noise.
@@ -242,6 +244,11 @@ fn _kdv_invariant_bad(node, points) {
     bad = bad + _kdv_invariant_bad(_kd_node_right(node), points);
     return bad;
 }
+
+# dy/dt = y for the implicit integrators.
+fn _cv_dydt_y(t, y) { return y; }
+# SHO acceleration for leapfrog.
+fn _cv_accel(q) { return f64_neg(q); }
 
 alloc_init();
 
@@ -2926,6 +2933,255 @@ assert(tpd_len < 9, "self-intersecting pentagon returns FEWER than 3*(n-2) = 9")
 # The returned prefix is still whole triples -- a partial triangulation, not a
 # truncated array.
 assert_eq(tpd_len % 3, 0, "partial return is still a whole number of triples");
+
+test_group("spatial: quadtree / octree / spatial hash had ZERO coverage");
+
+# Three whole data structures, 11 public functions, untested through 2.7.0 --
+# the same shape as the k-d tree defect that hid for three releases. Each is
+# checked against brute force, not just for non-null.
+
+# --- quadtree: 20x20 grid of points over [0,100]^2 ---
+var qt = quadtree_new(0, 0, f64_from(100), f64_from(100), 6);
+assert_neq(qt, 0, "quadtree_new returns a root");
+var qgx = 0;
+var qt_in = 0;
+while (qgx < 20) {
+    var qgy = 0;
+    while (qgy < 20) {
+        quadtree_insert(qt, f64_from(qgx * 5), f64_from(qgy * 5), qgx * 100 + qgy);
+        qgy = qgy + 1;
+    }
+    qgx = qgx + 1;
+}
+# Box [10,30]x[10,30] inclusive covers grid coords 2..6 on each axis = 5*5 = 25.
+var qres = quadtree_query(qt, f64_from(10), f64_from(10), f64_from(30), f64_from(30));
+assert_eq(vec_len(qres), 25, "quadtree_query [10,30]^2 finds exactly 25 of 400");
+# Whole-domain query must return everything.
+assert_eq(vec_len(quadtree_query(qt, 0, 0, f64_from(100), f64_from(100))), 400,
+"quadtree_query over the whole domain finds all 400");
+# Disjoint box finds nothing.
+assert_eq(vec_len(quadtree_query(qt, f64_from(200), f64_from(200), f64_from(300), f64_from(300))), 0,
+"quadtree_query outside the domain finds nothing");
+
+# --- octree: 8x8x8 grid over [0,80]^3 ---
+var ot = octree_new(hvec3_zero(), hvec3_new(f64_from(80), f64_from(80), f64_from(80)), 5);
+assert_neq(ot, 0, "octree_new returns a handle");
+var oi = 0;
+while (oi < 8) {
+    var oj = 0;
+    while (oj < 8) {
+        var ok = 0;
+        while (ok < 8) {
+            octree_insert(ot, hvec3_new(f64_from(oi * 10), f64_from(oj * 10), f64_from(ok * 10)),
+            oi * 64 + oj * 8 + ok);
+            ok = ok + 1;
+        }
+        oj = oj + 1;
+    }
+    oi = oi + 1;
+}
+# [0,20]^3 inclusive covers grid 0..2 per axis = 27.
+assert_eq(vec_len(octree_query(ot, hvec3_zero(), hvec3_new(f64_from(20), f64_from(20), f64_from(20)))),
+27, "octree_query [0,20]^3 finds exactly 27 of 512");
+assert_eq(vec_len(octree_query(ot, hvec3_zero(),
+hvec3_new(f64_from(80), f64_from(80), f64_from(80)))), 512, "octree_query whole domain finds all 512");
+
+# --- spatial hash: broadphase, so it may over-report but must never MISS ---
+var sh = spatial_hash_new(f64_from(10));
+assert_neq(sh, 0, "spatial_hash_new returns a handle");
+var si = 0;
+while (si < 100) {
+    spatial_hash_insert(sh, hvec3_new(f64_from(si), f64_from(si), 0), si);
+    si = si + 1;
+}
+# Same-cell query at the origin: points 0..9 share cell (0,0,0) with cell_size 10.
+assert_eq(vec_len(spatial_hash_query_cell(sh, hvec3_zero())), 10,
+"spatial_hash_query_cell finds the 10 points sharing cell (0,0,0)");
+# Radius query is a broadphase: it must be a SUPERSET of the true answer.
+var sh_r = spatial_hash_query_radius(sh, hvec3_zero(), f64_from(15));
+var sh_true = 0;
+si = 0;
+while (si < 100) {
+    var sd = f64_mul(f64_from(si), f64_sqrt(F64_TWO));
+    if (f64_gt(sd, f64_from(15)) == 0) { sh_true = sh_true + 1; }
+    si = si + 1;
+}
+assert(vec_len(sh_r) >= sh_true, "spatial_hash_query_radius never misses a true hit");
+assert(sh_true > 0, "the radius test is non-vacuous -- there ARE true hits");
+# clear() must actually empty it.
+spatial_hash_clear(sh);
+assert_eq(vec_len(spatial_hash_query_cell(sh, hvec3_zero())), 0,
+"spatial_hash_clear empties every cell");
+
+test_group("color: alpha compositing, tonemap, depth, EV -- 21 untested functions");
+
+# premultiply / unpremultiply round-trip. a = 0.5 is dyadic so this is exact.
+var cpm = premultiply_alpha(F64_ONE, F64_HALF, 0, F64_HALF);
+assert_eq(HVec4_x(cpm), F64_HALF, "premultiply r = 1*0.5 = 0.5 exactly");
+assert_eq(HVec4_y(cpm), 0x3FD0000000000000, "premultiply g = 0.5*0.5 = 0.25 exactly");
+assert_eq(HVec4_w(cpm), F64_HALF, "premultiply keeps alpha");
+var cup = unpremultiply_alpha(HVec4_x(cpm), HVec4_y(cpm), HVec4_z(cpm), HVec4_w(cpm));
+assert_eq(HVec4_x(cup), F64_ONE, "unpremultiply round-trips r to 1");
+assert_eq(HVec4_y(cup), F64_HALF, "unpremultiply round-trips g to 0.5");
+# a == 0 is the documented guard.
+assert_eq(HVec4_x(unpremultiply_alpha(F64_ONE, F64_ONE, F64_ONE, 0)), 0,
+"unpremultiply with a = 0 returns zero, not Inf");
+
+# Porter-Duff. Opaque dst under opaque src: dst_over keeps DST.
+var cdo = composite_dst_over(F64_ONE, 0, 0, F64_ONE, 0, F64_ONE, 0, F64_ONE);
+assert_eq(HVec4_y(cdo), F64_ONE, "dst_over over opaque dst keeps dst green");
+assert_eq(HVec4_x(cdo), 0, "dst_over over opaque dst drops src red");
+# src_in with opaque dst is src; with transparent dst it is nothing.
+assert_eq(HVec4_x(composite_src_in(F64_ONE, 0, 0, F64_ONE, 0, 0, 0, F64_ONE)), F64_ONE,
+"src_in with opaque dst keeps src");
+assert_eq(HVec4_x(composite_src_in(F64_ONE, 0, 0, F64_ONE, 0, 0, 0, 0)), 0,
+"src_in with transparent dst is empty");
+assert_eq(HVec4_x(composite_dst_in(0, 0, 0, F64_ONE, F64_ONE, 0, 0, F64_ONE)), F64_ONE,
+"dst_in with opaque src keeps dst");
+assert_eq(HVec4_x(composite_src_out(F64_ONE, 0, 0, F64_ONE, 0, 0, 0, 0)), F64_ONE,
+"src_out against transparent dst keeps src");
+assert_eq(HVec4_x(composite_dst_out(0, 0, 0, 0, F64_ONE, 0, 0, F64_ONE)), F64_ONE,
+"dst_out against transparent src keeps dst");
+assert_eq(HVec4_w(composite_xor(F64_ONE, 0, 0, F64_ONE, 0, 0, 0, F64_ONE)), 0,
+"xor of two opaque layers has zero alpha");
+# plus saturates at 1.
+var cpl = composite_plus(F64_ONE, F64_HALF, 0, F64_ONE, F64_ONE, F64_HALF, 0, F64_ONE);
+assert_eq(HVec4_x(cpl), F64_ONE, "plus saturates red at 1");
+assert_eq(HVec4_y(cpl), F64_ONE, "plus 0.5 + 0.5 = 1");
+
+# Depth linearisation. ndc = 0 with near/far = 1/100 gives near*far/far = 1.
+assert_eq(linearize_depth(0, F64_ONE, f64_from(100)), F64_ONE,
+"linearize_depth at ndc = 0 returns near");
+# Reverse-Z: ndc = 0 is the far plane and is guarded.
+assert_eq(linearize_depth_reverse_z(0, F64_ONE), 0, "reverse-Z at ndc = 0 is guarded");
+assert_eq(linearize_depth_reverse_z(F64_HALF, F64_ONE), F64_TWO,
+"reverse-Z near/ndc = 1/0.5 = 2");
+
+# EV100 round-trip: luminance_to_ev100(ev100_to_luminance(x)) == x.
+var cev = f64_from(10);
+var cev_rt = luminance_to_ev100(ev100_to_luminance(cev));
+assert(f64_lt(f64_abs(f64_sub(cev_rt, cev)), LOOSE_TOL_M) == 1, "EV100 round-trips at 10");
+assert(f64_gt(ev100_to_luminance(cev), ev100_to_luminance(F64_ONE)) == 1,
+"higher EV means higher luminance");
+assert(f64_gt(ev100_to_exposure(F64_ONE), ev100_to_exposure(cev)) == 1,
+"higher EV means LOWER exposure");
+
+# Vec3 sRGB wrappers must agree with the scalar path they wrap.
+var csv = srgb_to_linear_vec3(hvec3_new(F64_HALF, F64_HALF, F64_HALF));
+assert_eq(HVec3_x(csv), srgb_to_linear(F64_HALF), "srgb_to_linear_vec3 matches the scalar");
+var cls = linear_to_srgb_vec3(csv);
+assert(f64_lt(f64_abs(f64_sub(HVec3_x(cls), F64_HALF)), LOOSE_TOL_M) == 1,
+"linear_to_srgb_vec3 round-trips 0.5");
+# lerp at the endpoints is exact.
+var cla = hvec3_new(F64_ONE, 0, 0);
+var clb = hvec3_new(0, F64_ONE, 0);
+# Not bit-exact: lerp_srgb converts to linear, interpolates, and converts back,
+# so the endpoints come back 1 ulp low. Tolerance, not equality.
+assert(f64_lt(f64_abs(f64_sub(HVec3_x(lerp_srgb_vec3(cla, clb, 0)), F64_ONE)), LOOSE_TOL_M) == 1,
+"lerp_srgb t = 0 is a");
+assert(f64_lt(f64_abs(f64_sub(HVec3_y(lerp_srgb_vec3(cla, clb, F64_ONE)), F64_ONE)), LOOSE_TOL_M) == 1,
+"lerp_srgb t = 1 is b");
+
+# Tonemaps: monotone, and black maps to black.
+assert_eq(HVec3_x(tonemap_aces(0, 0, 0)), 0, "ACES maps black to black");
+assert(f64_gt(HVec3_x(tonemap_aces(F64_ONE, 0, 0)), 0) == 1, "ACES of 1 is positive");
+assert(f64_lt(HVec3_x(tonemap_reinhard_extended(F64_ONE, 0, 0, f64_from(4))), F64_ONE) == 1,
+"Reinhard-extended of 1 stays below 1");
+
+# Spherical harmonics L2: 9 coefficients, and the DC term is constant.
+var csh = sh_eval_l2(hvec3_unit_z());
+assert_neq(csh, 0, "sh_eval_l2 returns coefficients");
+assert(f64_gt(load64(csh), 0) == 1, "sh_eval_l2 DC term is positive");
+var csh2 = sh_eval_l2(hvec3_unit_x());
+assert_eq(load64(csh), load64(csh2), "sh_eval_l2 DC term is direction-independent");
+
+test_group("linalg_ext CSR + ode implicit integrators -- previously untested");
+
+# --- CSR sparse. A = [[1,0,2],[0,3,0],[4,0,5]] ---
+var cs_d = mat_new(3, 3);
+mat_set(cs_d, 0, 0, F64_ONE);       mat_set(cs_d, 0, 2, F64_TWO);
+mat_set(cs_d, 1, 1, f64_from(3));
+mat_set(cs_d, 2, 0, f64_from(4));   mat_set(cs_d, 2, 2, f64_from(5));
+var cs = csr_from_dense(cs_d);
+assert_neq(cs, 0, "csr_from_dense returns a matrix");
+assert_eq(csr_nrows(cs), 3, "csr_nrows = 3");
+assert_eq(csr_ncols(cs), 3, "csr_ncols = 3");
+assert_eq(csr_nnz(cs), 5, "csr_nnz counts exactly the 5 stored entries, not 9");
+assert_neq(csr_row_ptr(cs), 0, "csr_row_ptr is populated");
+assert_neq(csr_col_idx(cs), 0, "csr_col_idx is populated");
+assert_neq(csr_values(cs), 0, "csr_values is populated");
+
+# A * (1,1,1) = (3, 3, 9)
+var cs_x = alloc(24);
+store64(cs_x, F64_ONE); store64(cs_x + 8, F64_ONE); store64(cs_x + 16, F64_ONE);
+var cs_y = csr_spmv(cs, cs_x);
+assert_eq(f64_to(load64(cs_y)), 3, "csr_spmv row0 = 1+2 = 3");
+assert_eq(f64_to(load64(cs_y + 8)), 3, "csr_spmv row1 = 3");
+assert_eq(f64_to(load64(cs_y + 16)), 9, "csr_spmv row2 = 4+5 = 9");
+
+# A + A = 2A, so spmv doubles.
+var cs_sum = csr_add(cs, cs);
+assert_neq(cs_sum, 0, "csr_add returns a matrix");
+var cs_y2 = csr_spmv(cs_sum, cs_x);
+assert_eq(f64_to(load64(cs_y2 + 16)), 18, "csr_add: (A+A)*x doubles row2 to 18");
+
+# A^T = [[1,0,4],[0,3,0],[2,0,5]]; A^T*(1,1,1) = (5, 3, 7).
+var cs_t = csr_transpose(cs);
+assert_eq(csr_nnz(cs_t), 5, "csr_transpose preserves nnz");
+var cs_y3 = csr_spmv(cs_t, cs_x);
+assert_eq(f64_to(load64(cs_y3)), 5, "csr_transpose row0 = 1+4 = 5");
+assert_eq(f64_to(load64(cs_y3 + 16)), 7, "csr_transpose row2 = 2+5 = 7");
+
+# --- inertia_box: solid box I_xx = m(hy^2 + hz^2)/3 for HALF-extents.
+# m = 12, h = (1,1,1) -> 12*(1+1)/3 = 8 on every axis.
+var ib = inertia_box(f64_from(12), F64_ONE, F64_ONE, F64_ONE);
+assert_neq(ib, 0, "inertia_box returns a tensor");
+# Returns a Mat3, not a vector. Formula uses FULL extents: w = 2*hx, so for
+# m = 12 and half-extents (1,1,1) the box is 2x2x2 and I_xx = (m/12)(h^2+d^2) = 8.
+assert_eq(f64_to(mat_get(ib, 0, 0)), 8, "inertia_box 2x2x2 cube I_xx = (m/12)(h^2+d^2) = 8");
+assert_eq(f64_to(mat_get(ib, 2, 2)), 8, "inertia_box cube is isotropic");
+assert_eq(f64_to(mat_get(ib, 0, 1)), 0, "inertia_box is diagonal for an axis-aligned box");
+
+# --- matrix_condition_number: identity is perfectly conditioned.
+var mc_i = mat_identity(3);
+var mc = matrix_condition_number(mc_i);
+# This uses the FROBENIUS norm, not the 2-norm, so cond(I_3) = sqrt(3)*sqrt(3) = 3,
+# not 1. The doc says ||A|| * ||A^-1|| without naming the norm, so it is
+# self-consistent -- but it is NOT the spectral condition number a caller may expect.
+assert(f64_lt(f64_abs(f64_sub(mc, f64_from(3))), LOOSE_TOL_M) == 1,
+"cond_F(I_3) = ||I||_F * ||I^-1||_F = 3");
+# A badly-scaled matrix must score worse than the identity.
+var mc_b = mat_new(2, 2);
+mat_set(mc_b, 0, 0, f64_from(1000)); mat_set(mc_b, 1, 1, f64_div(F64_ONE, f64_from(1000)));
+assert(f64_gt(matrix_condition_number(mc_b), mc) == 1,
+"cond(diag(1000, 0.001)) is far worse than cond(I)");
+
+# --- eigen_symmetric on diag(3,1): eigenvalues 3 and 1.
+var es_A = mat_new(2, 2);
+mat_set(es_A, 0, 0, f64_from(3)); mat_set(es_A, 1, 1, F64_ONE);
+var es_vals = alloc(16);
+var es_vecs = mat_new(2, 2);
+assert_eq(eigen_symmetric(es_A, 2, es_vals, es_vecs), HSB_ERR_NONE, "eigen_symmetric converges");
+assert_eq(f64_to(load64(es_vals)), 3, "eigen_symmetric dominant eigenvalue = 3");
+
+# --- implicit ODE integrators on y' = y, y(0) = 1, dt = 1/4.
+# Backward Euler: y1 = y/(1-dt) = 1/0.75 = 4/3.
+var oi_dt = f64_div(F64_ONE, f64_from(4));
+var oi_be = ode_backward_euler(&_cv_dydt_y, 0, F64_ONE, oi_dt, EPSILON_F64, 50);
+var oi_be_want = f64_div(f64_from(4), f64_from(3));
+assert(f64_lt(f64_abs(f64_sub(oi_be, oi_be_want)), LOOSE_TOL_M) == 1,
+"backward Euler y1 = 1/(1-dt) = 4/3");
+# It must be ABOVE the exact e^dt -- backward Euler over-shoots on a growing solution.
+assert(f64_gt(oi_be, f64_exp(oi_dt)) == 1, "backward Euler overshoots exp(dt), as it must");
+
+# BDF2 with a consistent history is at least as accurate as backward Euler here.
+var oi_bdf = ode_bdf2(&_cv_dydt_y, 0, F64_ONE, f64_div(F64_ONE, f64_exp(oi_dt)), oi_dt, EPSILON_F64);
+assert(f64_gt(oi_bdf, F64_ONE) == 1, "bdf2 advances a growing solution");
+
+# Leapfrog on the SHO from (q,v) = (1,0): one step must reduce q and drive v negative.
+var oi_lf = ode_leapfrog(&_cv_accel, F64_ONE, 0, F64_HALF);
+assert(f64_lt(load64(oi_lf), F64_ONE) == 1, "leapfrog q decreases from the turning point");
+assert(f64_lt(load64(oi_lf + 8), 0) == 1, "leapfrog v goes negative from the turning point");
 
 # ================================================================
 var r = assert_summary();

@@ -51,3 +51,42 @@ enough to stop Bowyer-Watson producing a non-triangulation but does not make the
 
 **Do not** attempt to fix this by rescaling: the magnitude spread is inherent to the super-triangle
 construction, so the only sound answers are an exact predicate or a different initialisation.
+
+
+---
+
+## CORRECTION (same session, after the above was written)
+
+The write-up above says *"`delaunay_2d` starts from a super-triangle placed far outside the data,
+so **every early insertion** is a mixed-magnitude test."* **That is wrong**, and the severity here
+was overstated.
+
+`delaunay_2d` builds its super-triangle at `d_max = max(dx, dy) * 10` — only **10x** the data
+extent, not "far outside" it. Re-measured against exact rational arithmetic using that actual
+geometry (span 1, super-triangle 10, cluster shrunk to force the spread):
+
+| cluster spread vs span | wrong of 30 |
+|---|---|
+| 1e3 | 0 |
+| 1e5 | 0 |
+| 1e7 | 0 |
+| 1e9 | 0 |
+| 1e11 | 0 |
+| 1e13 | 0 |
+
+**0 of 180.** The 3-of-40 result that opened this file used a synthetic configuration with
+*absolute* coordinates spanning 1e7 down to 1e-10; the failure depends on the absolute magnitude of
+the far vertex (it enters the determinant squared, as `a_sq`), not on the ratio alone. Under the
+geometry `delaunay_2d` actually constructs, the dominant `a_sq * cross(b,c)` term carries the sign
+and the predicate agrees with exact arithmetic.
+
+**Revised disposition.** The predicate is genuinely non-robust — 3 of 40 synthetic cases is a real
+wrong answer — but it is **not** reachable through `delaunay_2d`'s own construction at any spread
+tested. It is reachable by a caller invoking `_col_in_circumcircle` directly on far-apart
+coordinates, which is a private function. Severity drops from "red, Delaunay output already
+suspect" to "latent, no known reachable path". The adaptive-predicate work is still the correct
+remedy if this is ever exposed publicly or the super-triangle constant changes.
+
+**Method note.** The first probe generated coordinates by magnitude class rather than by
+reconstructing the caller's actual geometry. Measuring the *construct under test* rather than an
+abstraction of it is what changed the answer.

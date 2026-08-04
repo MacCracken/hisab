@@ -254,14 +254,13 @@ wrong. They outrank the perf work that exposed them.
       side of an ancestor's plane.** Also removed a positional clamp whose justifying comment
       ("can ONLY degenerate when lo == hi") is false in floating point. Now asserted structurally
       on every node *and* against brute force *(2.7.0-J)*
-- [ ] 🔴 **`_col_in_circumcircle` loses the sign on mixed-magnitude inputs.** CONFIRMED against
-      exact rational arithmetic, and the original claim **narrowed**: uniformly small
-      near-coincident clusters are fine (**0 of 30**); the trigger is a *magnitude spread* — one
-      super-triangle-scale vertex with a near-coincident cluster gives **3 of 40** wrong signs.
-      `delaunay_2d` starts from a super-triangle, so **every early insertion is such a test**.
-      Remedy is an adaptive exact predicate (Shewchuk); rescaling cannot help, the spread is
-      inherent to the construction. Spec + repro filed at
-      `../development/issues/2026-08-04-incircle-precision.md`
+- [ ] 🟡 **`_col_in_circumcircle` is non-robust on extreme mixed-magnitude inputs** — 3 of 40
+      synthetic cases disagree with exact rational arithmetic. **Downgraded from red after
+      re-measurement:** using `delaunay_2d`'s actual geometry (super-triangle at 10x the extent),
+      **0 of 180** disagree across cluster spreads from 1e3 to 1e13. The failure tracks the
+      *absolute* magnitude of the far vertex, not the ratio, so no reachable path through
+      `delaunay_2d` is known — it is latent, not live. Adaptive predicate remains the remedy if the
+      function is exposed publicly or the 10x constant changes. Spec + both probes filed
 
 ### Found by the disposition sweep — **the same failure mode, again**
 Assigning a disposition to every one of the 41 numbered findings (rather than reasoning from the

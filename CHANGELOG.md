@@ -473,8 +473,17 @@ correctly. What breaks it is the *magnitude spread*: `a_sq` for the far vertex i
 terms it is differenced against are ~1e-14, so the determinant is a difference across ~28 orders of
 magnitude and every significant bit is lost.
 
-That configuration is not exotic here — `delaunay_2d` begins from a super-triangle placed far
-outside the data, so **every early insertion is a mixed-magnitude test**.
+**CORRECTED before release.** The first draft of this entry claimed the configuration is common
+here, because `delaunay_2d` "begins from a super-triangle placed far outside the data, so every
+early insertion is a mixed-magnitude test". That is false: the super-triangle sits at
+`max(dx, dy) * 10` — **10x** the extent. Re-measured with that actual geometry, across cluster
+spreads from 1e3 to 1e13: **0 wrong of 180**. The 3-of-40 failures came from a synthetic
+configuration with absolute coordinates from 1e7 down to 1e-10, and the failure tracks the
+*absolute* magnitude of the far vertex (it enters the determinant squared) rather than the ratio.
+
+So the predicate is genuinely non-robust, but **no reachable path through `delaunay_2d` is known**.
+Severity is latent, not red. The lesson is in the method: the first probe generated coordinates by
+magnitude class instead of reconstructing the caller's real geometry.
 
 **Not fixed.** The remedy is an adaptive exact predicate (Shewchuk's `incircle`: floating-point
 determinant with a forward error bound, exact expansion only when |det| falls below it). Rescaling

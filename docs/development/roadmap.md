@@ -240,11 +240,12 @@ Neither is a performance issue. Both were surfaced by adversarial reviewers who 
 oracles to check that an optimisation preserved results, and found the *shipped* code was already
 wrong. They outrank the perf work that exposed them.
 
-- [ ] 🔴 **`kdtree_within_radius` returns the wrong count on most queries.** Measured on a
-      1,500-point scatter with 400 radius-60 queries: **222 of 400 return a wrong count**. The
-      reviewer characterised the shipped pruning plane as violating its own invariant (a 676-
-      violation tree went undetected by the 2.6.14 kdtree assertions at `modules.tcyr:2421-2450`).
-      This is a **wrong answer from a spatial query**, not a slowdown
+- [x] 🔴 **`kdtree_within_radius` returned the wrong count on most queries** — 274/400 measured.
+      Root cause was NOT the pruning code: `split_val` was read from `items[split]` (some
+      right-side value) while the partition was made at `mid_val`. **3,412 points sat on the wrong
+      side of an ancestor's plane.** Also removed a positional clamp whose justifying comment
+      ("can ONLY degenerate when lo == hi") is false in floating point. Now asserted structurally
+      on every node *and* against brute force *(2.7.0-J)*
 - [ ] 🔴 **`_col_in_circumcircle` is less accurate than a straightforward circumcentre test.** All
       23,741 retirements flagged by the candidate sweep predicate were re-checked in **exact
       rational arithmetic**: 0 were geometrically unsound — the divergences came from the shipped

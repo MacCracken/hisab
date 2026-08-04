@@ -191,6 +191,58 @@ fn _gm_is_herm(m) {
     return 1;
 }
 
+# Brute-force reference for kdtree_within_radius.
+fn _kdv_brute(points, n, query, radius) {
+    var rsq = f64_mul(radius, radius);
+    var c = 0;
+    var i = 0;
+    while (i < n) {
+        var p = load64(points + i * 8);
+        var dx = f64_sub(HVec3_x(p), HVec3_x(query));
+        var dy = f64_sub(HVec3_y(p), HVec3_y(query));
+        var dz = f64_sub(HVec3_z(p), HVec3_z(query));
+        var d2 = f64_add(f64_add(f64_mul(dx, dx), f64_mul(dy, dy)), f64_mul(dz, dz));
+        if (f64_gt(d2, rsq) == 0) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+# Walk the tree and count points that sit on the WRONG side of their ancestor's
+# pruning plane. This is the invariant the whole query algorithm rests on:
+# every point in a left subtree has axis <= split_val, every point on the right
+# has axis >= split_val. Returns the violation count.
+fn _kdv_side_bad(node, points, axis, plane, want_le) {
+    if (node == 0) { return 0; }
+    var bad = 0;
+    var pidx = _kd_node_point_idx(node);
+    if (pidx != 0 - 1) {
+        var pt = load64(points + pidx * 8);
+        var v = _kd_axis_val(pt, axis);
+        if (want_le == 1) {
+            if (f64_gt(v, plane) == 1) { bad = 1; }
+        } else {
+            if (f64_lt(v, plane) == 1) { bad = 1; }
+        }
+        return bad;
+    }
+    bad = bad + _kdv_side_bad(_kd_node_left(node), points, axis, plane, want_le);
+    bad = bad + _kdv_side_bad(_kd_node_right(node), points, axis, plane, want_le);
+    return bad;
+}
+
+fn _kdv_invariant_bad(node, points) {
+    if (node == 0) { return 0; }
+    if (_kd_node_point_idx(node) != 0 - 1) { return 0; }
+    var axis = _kd_node_split_axis(node);
+    var plane = _kd_node_split_val(node);
+    var bad = _kdv_side_bad(_kd_node_left(node), points, axis, plane, 1);
+    bad = bad + _kdv_side_bad(_kd_node_right(node), points, axis, plane, 0);
+    bad = bad + _kdv_invariant_bad(_kd_node_left(node), points);
+    bad = bad + _kdv_invariant_bad(_kd_node_right(node), points);
+    return bad;
+}
+
 alloc_init();
 
 # ================================================================
@@ -2815,6 +2867,40 @@ assert_eq(str_eq_cstr(sym_to_latex(expr_const(fc_d)), "1.000000"), 1,
 var fc_e = f64_div(f64_from(1), f64_from(3));
 assert_eq(str_eq_cstr(expr_to_str(expr_const(fc_e)), "0.333333"), 1,
 "carry fix does not perturb non-carrying values");
+
+test_group("kdtree: the split plane must actually separate the subtrees");
+
+# `split_val` used to be read from items[split] -- SOME right-side value, not the
+# partition plane. Every right-side point below that value then sat on the wrong
+# side of its own node's pruning plane, so the query pruned subtrees that still
+# held valid hits. Measured before the fix: 274 of 400 radius queries returned
+# the WRONG COUNT. The suites at the time did not notice.
+var KDV_N = 1500;
+var kdv_pts = alloc(KDV_N * 8);
+var kdv_i = 0;
+while (kdv_i < KDV_N) {
+    store64(kdv_pts + kdv_i * 8, hvec3_new(f64_from((kdv_i * 2654435761) % 1009),
+    f64_from((kdv_i * 40503) % 1013), f64_from((kdv_i * 69069) % 1019)));
+    kdv_i = kdv_i + 1;
+}
+var kdv_tree = kdtree_build(kdv_pts, KDV_N);
+assert_neq(kdv_tree, 0, "kdtree_build(1500 scattered) returns a tree");
+
+# The structural invariant, checked directly on every node.
+assert_eq(_kdv_invariant_bad(kdv_tree, kdv_pts), 0,
+"kdtree: no point sits on the wrong side of its ancestor's split plane");
+
+# And the behaviour that invariant exists to protect, against brute force.
+var kdv_bad = 0;
+var kdv_q = 0;
+while (kdv_q < 200) {
+    var kdv_qp = hvec3_new(f64_from((kdv_q * 7919) % 1009), f64_from((kdv_q * 104729) % 1013),
+    f64_from((kdv_q * 1299709) % 1019));
+    if (vec_len(kdtree_within_radius(kdv_tree, kdv_pts, kdv_qp, f64_from(60)))
+    != _kdv_brute(kdv_pts, KDV_N, kdv_qp, f64_from(60))) { kdv_bad = kdv_bad + 1; }
+    kdv_q = kdv_q + 1;
+}
+assert_eq(kdv_bad, 0, "kdtree_within_radius matches brute force on 200 queries");
 
 # ================================================================
 var r = assert_summary();

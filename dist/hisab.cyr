@@ -4785,7 +4785,17 @@ fn _kd_axis_val(point, axis) {
 # Partition items[start..end) around median on given axis.
 # items_vec: vec of interleaved [point_ptr, index, point_ptr, index, ...]
 # Returns the median position (pair index).
-fn _kd_partition(items, points, start, end, axis) {
+# out_plane receives the axis value that SEPARATES the two partitions. The caller
+# must store that as the node's split_val -- not the axis value of items[split].
+#
+# Through 2.7.0 the caller read items[split] instead, i.e. SOME right-side value
+# rather than the plane. Every right-side point whose axis value is below that
+# one then sits on the wrong side of the node's own pruning plane, so
+# _kd_nearest_rec / _kd_radius_rec prune a subtree that still contains valid
+# hits. Measured on a 1,500-point scatter with 400 radius-60 queries: 274 of 400
+# returned the WRONG COUNT. The plane is the invariant; the value of any
+# particular item is not.
+fn _kd_partition(items, points, start, end, axis, out_plane) {
     # Simple selection: find item closest to midpoint on axis
     # First pass: find min/max on axis
     var lo = _SP_F64_POS_INF;
@@ -4811,6 +4821,7 @@ fn _kd_partition(items, points, start, end, axis) {
     # split_val (read by the caller from items[split]) is then the common value, so
     # query pruning compares exactly and either subtree is a valid destination.
     if (f64_eq(lo, hi) == 1) {
+        store64(out_plane, lo);
         return start + (end - start) / 2;
     }
 
@@ -4830,9 +4841,35 @@ fn _kd_partition(items, points, start, end, axis) {
             split = split + 1;
         }
     }
-    # Ensure at least one item on each side
-    if (split == start) { split = start + 1; }
-    if (split == end) { split = end - 1; }
+    # split == start means NOTHING compared below mid_val. The comment above used
+    # to claim that can only happen when lo == hi; that reasoning does not hold in
+    # floating point, because (lo + hi) * 0.5 can round down to exactly lo, and
+    # then `lo < mid_val` is false for the very point that attains lo.
+    #
+    # Retry with the plane at hi. Since lo < hi here, at least the lo-attaining
+    # point goes left and at least the hi-attaining point stays right, so both
+    # sides are non-empty AND the partition stays value-sound. The old fix --
+    # peeling one element positionally -- produced a left subtree containing a
+    # point ABOVE the plane, which is exactly what broke pruning.
+    if (split == start) {
+        mid_val = hi;
+        split = start;
+        for (var ri = start; ri < end; ri = ri + 1) {
+            var idx3 = vec_get(items, ri);
+            var pt3 = load64(points + idx3 * 8);
+            if (f64_lt(_kd_axis_val(pt3, axis), mid_val) == 1) {
+                var tmp3 = vec_get(items, split);
+                vec_set(items, split, vec_get(items, ri));
+                vec_set(items, ri, tmp3);
+                split = split + 1;
+            }
+        }
+    }
+    # split == end is unreachable when lo < hi: mid_val = (lo+hi)*0.5 <= hi, so the
+    # hi-attaining point never satisfies v < mid_val. Asserted by construction
+    # rather than clamped, because a positional clamp here would reintroduce the
+    # same invariant violation.
+    store64(out_plane, mid_val);
     return split;
 }
 
@@ -4846,12 +4883,11 @@ fn _kd_build_rec(items, points, start, end, depth) {
     }
 
     var axis = depth % 3;
-    var split = _kd_partition(items, points, start, end, axis);
+    var plane_out = alloc(8);
+    var split = _kd_partition(items, points, start, end, axis, plane_out);
 
-    # Split value: axis value of first item in right partition
-    var split_idx = vec_get(items, split);
-    var split_pt = load64(points + split_idx * 8);
-    var split_val = _kd_axis_val(split_pt, axis);
+    # The PLANE, not the axis value of any particular item -- see _kd_partition.
+    var split_val = load64(plane_out);
 
     var left = _kd_build_rec(items, points, start, split, depth + 1);
     var right = _kd_build_rec(items, points, split, end, depth + 1);

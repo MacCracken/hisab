@@ -338,6 +338,40 @@ where 16 bytes are stored; `eigen_power` survives a transposed matvec because bo
 are symmetric; and the Gell-Mann basis leaves the **sign of λ₄..λ₇ unconstrained** — pinning it
 needs the SU(3) structure constants.
 
+#### Fixed — the k-d tree's split plane did not separate its own subtrees (2.7.0-J)
+
+**The most serious defect found in the 2.7.0 line.** `kdtree_within_radius` returned the wrong
+count on **274 of 400** queries over a 1,500-point scatter — a spatial query silently under-reporting
+hits, with no error signal.
+
+`_kd_build_rec` set each node's `split_val` from `items[split]` — *some* right-side value — while
+the partition was actually made at `mid_val`. Those are not the same number. Every right-side point
+whose axis value fell below `items[split]`'s therefore sat on the wrong side of its own node's
+pruning plane, and `_kd_nearest_rec` / `_kd_radius_rec` pruned subtrees that still contained valid
+hits. Measured on the pre-fix tree: **3,412 points on the wrong side of an ancestor's plane.**
+
+A second, independent defect in the same function: the "ensure at least one item on each side"
+clamp moved an item across the partition *after* the fact, producing a left subtree containing a
+point above the plane. Its justifying comment claimed the midpoint split "can ONLY degenerate when
+lo == hi" — **that reasoning does not hold in floating point**, because `(lo + hi) * 0.5` can round
+down to exactly `lo`, and then `lo < mid_val` is false for the very point that attains `lo`. The
+clamp now retries with the plane at `hi`, which keeps both sides non-empty *and* value-sound.
+
+`split == end` is genuinely unreachable when `lo < hi` (`mid_val <= hi`, so the hi-attaining point
+never compares below it), so that clamp is gone rather than kept as dead defensive code.
+
+The 2.6.14 coincident-point fix is untouched and still asserted — for `lo == hi` the plane is the
+common value, which separates correctly whichever way the positional split falls.
+
+*Evidence:* against the shipped code the two new assertions fail with **3,412** plane violations and
+**137 of 200** wrong query counts. Both were absent before: the 2.6.14 kdtree assertions pass
+happily on a 3,412-violation tree, which is why this survived three releases. The invariant is now
+checked structurally on **every node**, not just through behaviour. Suite 1523 → **1526**.
+
+**How it was found.** Not by an audit. It surfaced because an adversarial reviewer, checking whether
+a *performance* patch preserved results, built a brute-force oracle — and the shipped code failed it.
+The perf patch that prompted this was **not applied** (see 2.7.0-I); the defect it exposed was.
+
 #### Performance — `solve_bicgstab` leaked a work vector per iteration (2.7.0-I)
 
 `s` was allocated **inside** the iteration loop. `alloc()` is a bump allocator that never frees, so

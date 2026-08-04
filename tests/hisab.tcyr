@@ -28,6 +28,14 @@ include "src/tensor.cyr"
 # ~1e-8 — for iterative / decomposition results where exact bit equality is not
 # achievable but 8 significant digits is.
 var LOOSE_TOL_H = 0x3E45798EE2308C3A;
+# ~1e-15 -- a few ulp of 1.0. For quantities whose closed form is exactly 0 or 1
+# (unit-vector rotations, M*M^-1 diagonals, group-inverse round-trips, Euler's
+# identity). Every one of them lands within 1 ulp on 6.5.6, so this is ~4.5x the
+# measured floor. It replaces a literal f64_from(1): a tolerance of 1.0 around an
+# expected 1.0 admits everything in [0, 2] and can never fail.
+var ULP_TOL_H = 0x3CD203AF9EE75616;
+var TOL_1EM14 = 0x3D06849B86A12B9B;  # 1e-14
+var TOL_1EM12 = 0x3D719799812DEA11;  # 1e-12 (== EPSILON_F64)  # 1e-15
 
 alloc_init();
 
@@ -90,8 +98,19 @@ assert(f64_lt(f64_abs(f64_sub(HQuat_w(qr), HQuat_w(qri))), EPSILON_F64) == 1, "m
 
 # Rotate (1,0,0) by 90deg around Z → approx (0,1,0)
 var rotated = hquat_rotate_vec3(qr, hvec3_unit_x());
-assert(f64_lt(f64_abs(HVec3_x(rotated)), f64_from(1)) == 1, "rot90.x near 0");
-assert(f64_lt(f64_abs(f64_sub(HVec3_y(rotated), F64_ONE)), f64_from(1)) == 1, "rot90.y near 1");
+# Closed form: exactly (0, 1, 0). Measured on 6.5.6: x = 2.220446e-16 (1 ulp of
+# 1.0), y - 1 = 0, z = 0. The old bound of 1.0 was met by EVERY nonzero rotation
+# angle -- |x| = |cos t| < 1 and |y - 1| = |1 - sin t| < 1 for all t in (0, pi).
+assert(f64_lt(f64_abs(HVec3_x(rotated)), ULP_TOL_H) == 1, "rot90.x == 0 (1e-15)");
+assert(f64_lt(f64_abs(f64_sub(HVec3_y(rotated), F64_ONE)), ULP_TOL_H) == 1, "rot90.y == 1 (1e-15)");
+assert(f64_lt(f64_abs(HVec3_z(rotated)), ULP_TOL_H) == 1, "rot90.z == 0 (1e-15)");
+# |x| <= 1 holds for every rotation of a unit vector, so the bound above only
+# bites next to a case that pins the ANGLE. 45 deg about Z sends (1,0,0) to
+# (sqrt(2)/2, sqrt(2)/2, 0) = (0.7071067811865476, 0.7071067811865476, 0).
+var _sqrt2_2 = 0x3FE6A09E667F3BCD;  # 0.7071067811865476
+var rot45 = hquat_rotate_vec3(hquat_from_rotation_z(F64_PI_4), hvec3_unit_x());
+assert(f64_lt(f64_abs(f64_sub(HVec3_x(rot45), _sqrt2_2)), ULP_TOL_H) == 1, "rot45.x == sqrt(2)/2");
+assert(f64_lt(f64_abs(f64_sub(HVec3_y(rot45), _sqrt2_2)), ULP_TOL_H) == 1, "rot45.y == sqrt(2)/2");
 
 # ================================================================
 # Mat4
@@ -118,7 +137,48 @@ assert_eq(f64_to(HVec3_z(tp)), 4, "srt.z");
 # Inverse: M * M^-1 ≈ I
 var inv = m4_inverse(srt);
 var prod = m4_mul(srt, inv);
-assert(f64_lt(f64_abs(f64_sub(m4_get(prod, 0, 0), F64_ONE)), f64_from(1)) == 1, "inv diag");
+# srt is a pure translation, so M * M^-1 is I exactly -- measured residual 0 on
+# every entry. The old bound of 1.0 accepted any [0][0] in [0, 2]; and a single
+# diagonal entry is not an inverse test anyway (m4_inverse returning I unchanged
+# leaves [0][0] == 1). Check all 16 entries.
+assert(f64_lt(f64_abs(f64_sub(m4_get(prod, 0, 0), F64_ONE)), ULP_TOL_H) == 1, "inv diag [0][0] == 1");
+var _mi_bad = 0;
+var _mi_r = 0;
+while (_mi_r < 4) {
+    var _mi_c = 0;
+    while (_mi_c < 4) {
+        var _mi_want = 0;
+        if (_mi_r == _mi_c) { _mi_want = F64_ONE; }
+        if (f64_lt(f64_abs(f64_sub(m4_get(prod, _mi_c, _mi_r), _mi_want)), ULP_TOL_H) == 0) {
+            _mi_bad = _mi_bad + 1;
+        }
+        _mi_c = _mi_c + 1;
+    }
+    _mi_r = _mi_r + 1;
+}
+assert_eq(_mi_bad, 0, "M * M^-1 == I in all 16 entries (1e-15)");
+# The sweep's input is a pure translation, whose 3x3 block is I -- transposing it
+# is a no-op, so a row/column-major slip in m4_inverse still passes (verified;
+# only foundation.tcyr catches it). Repeat with a non-symmetric rotation block.
+var _rq = hquat_from_rotation_z(F64_PI_4);
+var _rm = m4_from_srt(hvec3_one(), _rq, hvec3_new(F64_TWO, f64_from(3), f64_from(4)));
+var _rp = m4_mul(_rm, m4_inverse(_rm));
+var _rbad = 0;
+var _rr = 0;
+while (_rr < 4) {
+    var _rc = 0;
+    while (_rc < 4) {
+        var _rwant = 0;
+        if (_rr == _rc) { _rwant = F64_ONE; }
+        if (f64_lt(f64_abs(f64_sub(m4_get(_rp, _rc, _rr), _rwant)), TOL_1EM14) == 0) {
+            _rbad = _rbad + 1;
+        }
+        _rc = _rc + 1;
+    }
+    _rr = _rr + 1;
+}
+assert_eq(_rbad, 0, "rot+trans M * M^-1 == I in all 16 entries (1e-14)");
+# where: var TOL_1EM14 = 0x3D06849B86A12B9B;  # 1e-14
 
 # ================================================================
 # Transform3D
@@ -147,7 +207,9 @@ test_group("color");
 var half = F64_HALF;
 var lin = srgb_to_linear(half);
 var back = linear_to_srgb(lin);
-assert(f64_lt(f64_abs(f64_sub(back, half)), f64_from(1)) == 1, "srgb roundtrip");
+# Measured round-trip residual on 6.5.6: 1.665e-16. The old bound of 1.0 was met
+# by anything in (-0.5, 1.5) -- i.e. by every value linear_to_srgb can return.
+assert(f64_lt(f64_abs(f64_sub(back, half)), ULP_TOL_H) == 1, "srgb roundtrip == 0.5 (1e-15)");
 
 # A round-trip is BLIND to a wrong transfer curve — the same wrong breakpoint is
 # applied in both directions and the error cancels. Both sRGB piecewise breakpoints
@@ -161,6 +223,26 @@ assert(f64_lt(f64_abs(f64_sub(lin, _srgb_half_lin)), f64_div(F64_ONE, f64_from(1
 # one — this is what actually pins the 0.04045 threshold itself.
 assert(f64_lt(srgb_to_linear(f64_div(F64_ONE, f64_from(100))),
 f64_div(F64_ONE, f64_from(100))) == 1, "srgb: linear segment below breakpoint");
+# Only the forward leg was pinned absolutely; a compensating pair of wrong
+# exponents still round-trips green. Pin the inverse leg too:
+# linear_to_srgb(0.2) = 1.055 * 0.2^(1/2.4) - 0.055 = 0.48452920448170694
+var _srgb_lin_02 = 0x3FC999999999999A;   # 0.2
+var _srgb_enc_02 = 0x3FDF0286C7CD2C49;   # 0.48452920448170694
+assert(f64_lt(f64_abs(f64_sub(linear_to_srgb(_srgb_lin_02), _srgb_enc_02)), ULP_TOL_H) == 1,
+"linear_to_srgb(0.2) == 0.4845292044817069 (absolute, not round-trip)");
+# The 0.2 pin is in the POWER segment, so it does not pin the encode-side
+# breakpoint. Using 0.04045 (the decode threshold) here instead of 0.0031308
+# passes every existing colour assertion -- verified against all four suites.
+# linear_to_srgb(0.004) = 1.055*0.004^(1/2.4) - 0.055 = 0.05070871397734796,
+# vs 12.92*0.004 = 0.05168 if the linear branch is wrongly taken.
+var _lts_in_hi = 0x3F70624DD2F1A9FC;   # 0.004
+var _lts_hi = 0x3FA9F67E184F52AB;      # 0.05070871397734796
+assert(f64_lt(f64_abs(f64_sub(linear_to_srgb(_lts_in_hi), _lts_hi)), ULP_TOL_H) == 1,
+"linear_to_srgb(0.004) uses the power segment");
+var _lts_in_lo = 0x3F60624DD2F1A9FC;   # 0.002
+var _lts_lo = 0x3F9A75CD0BB6ED68;      # 0.025840000000000002 = 12.92 * 0.002
+assert(f64_lt(f64_abs(f64_sub(linear_to_srgb(_lts_in_lo), _lts_lo)), ULP_TOL_H) == 1,
+"linear_to_srgb(0.002) uses the linear segment");
 
 # Reinhard: 1.0 → 0.5
 var tr = tonemap_reinhard(F64_ONE, F64_ONE, F64_ONE);
@@ -1099,7 +1181,19 @@ assert_eq(f64_to(HComplex_im(cconj)), (0 - 4), "conj.im");
 # e^(iπ) + 1 ≈ 0
 var eipi = cx_exp(cx_new(0, F64_PI));
 var euler = cx_add(eipi, cx_one());
-assert(f64_lt(cx_abs(euler), f64_from(1)) == 1, "euler identity");
+# e^(i*pi_d) = cos(pi_d) + i sin(pi_d) with pi_d the double nearest pi:
+# cos(pi_d) rounds to exactly -1.0 and sin(pi_d) = 1.2246467991473532e-16, so the
+# closed-form modulus is 1.2246e-16 (measured: identical). The old bound of 1.0
+# passed for any argument within about +-60 deg of pi.
+assert(f64_lt(cx_abs(euler), ULP_TOL_H) == 1, "euler e^(i*pi)+1 == 0 (1e-15)");
+# e^(i*pi)+1 == 0 is BLIND to conjugation: pi is a fixed point of z -> conj(z), so
+# negating the imaginary output of cx_exp leaves this bit-identical (verified: such
+# a mutant passes all four suites). Pin a point where the two differ.
+# e^(i*pi/2) = 6.123233995736766e-17 + 1i
+var _e_ih = cx_exp(cx_new(0, F64_PI_2));
+assert(f64_lt(f64_abs(HComplex_re(_e_ih)), ULP_TOL_H) == 1, "cx_exp(i*pi/2).re == 0");
+assert(f64_lt(f64_abs(f64_sub(HComplex_im(_e_ih), F64_ONE)), ULP_TOL_H) == 1,
+"cx_exp(i*pi/2).im == +1 (not -1)");
 
 # Pauli: σx² = I
 var sx = pauli_x();
@@ -1131,7 +1225,11 @@ assert_eq(u_phase, pi2_1000, "u1 compose");
 # U(1) inverse: phase + (-phase) = 0
 var u_inv = u1_inv(u_a);
 var u_id = u1_compose(u_a, u_inv);
-assert(f64_lt(f64_abs(load64(u_id)), f64_from(1)) == 1, "u1 inv");
+# u1_compose(a, u1_inv(a)) is literally f64_add(theta, f64_neg(theta)); IEEE-754
+# round-to-nearest makes x + (-x) exactly +0.0 for every finite x. So this is an
+# exact assertion, not an approximate one. Measured bit pattern: 0x0.
+# (The old bound of 1.0 passed for any residual phase up to +-57 deg.)
+assert_eq(load64(u_id), 0, "u1 inv phase is exactly +0.0");
 
 # SU(2): identity to quat → w=1
 var su2_id = su2_identity();

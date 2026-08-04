@@ -175,17 +175,17 @@ before this. Suite 1154 → 1181.
       caller's function pointer at all; `eigen_power` survives a transposed matvec (both test
       matrices are symmetric); Gell-Mann leaves the sign of λ₄..λ₇ free (needs the SU(3) structure
       constants)
-- [ ] Apply the last specified test-quality repair — the **unit-tolerance sweep**: 21 assertions
-      whose tolerance is a literal `f64_from(1)` on quantities whose exact value is 0 or 1. Filed
-      at `../development/issues/2026-08-04-tq-unit_tolerance_1p0.md`, verified and adversarially
-      reviewed
 - [x] `ode_verlet` / `ode_symplectic_euler` asserted only `!= 0` — unconditional, since `alloc()`
       never returns 0 on success. Now the exact closed form of each linear map plus the *bounded*
       energy error a symplectic method guarantees (`h^2/8`, `h/(2(2-h))`) over 4000 steps, with the
       bound's **attainment** asserted too so a frozen integrator fails. Review's three extra holes
       closed: hardcoded force, shared scratch buffer, `alloc(8)` overrun *(2.7.0-G)*
-- [ ] **21 assertions use `f64_from(1)` — a literal tolerance of 1.0** — on quantities whose exact
-      value is 0 or 1
+- [x] **21 assertions used `f64_from(1)` — a literal tolerance of 1.0** — on quantities whose exact
+      value is 0 or 1, i.e. accepting `[0, 2]`. 15 static sites + 8 loop iterations, plus a dead
+      `var TOL = f64_from(1)` in foundation. `"rot90.x near 0"` was satisfied by *every* rotation
+      angle. Replaced with `ULP_TOL_*` (1e-15) and closed forms. Review found 7 survivors, all
+      closed — notably a `cmat_adjoint` stub that would have made the new Hermiticity sweep vacuous
+      again, and `cx_exp` returning the conjugate (π is a fixed point of conjugation) *(2.7.0-G)*
 - [x] "gell-mann hermitian" was a tautology passing for every complex matrix (`cx_conj` copies the
       real part, tolerance was 1.0). Now elementwise Hermiticity + tracelessness +
       `tr(la lb) = 2 delta_ab` over 64 pairs, plus convention pins for λ₄..λ₇ (review showed those

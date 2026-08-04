@@ -38,6 +38,16 @@ include "src/collision_mesh.cyr"
 # ~1e-8 — for assertions on transcendental / iterative results where exact
 # bit equality is not achievable but 8 significant digits is.
 var LOOSE_TOL_M = 0x3E45798EE2308C3A;
+# ~1e-15 -- a few ulp of 1.0, for quantities whose closed form is exactly 0 or 1
+# (group-inverse round-trips, traceless generators, Euler's identity). Measured
+# floor for all of them on 6.5.6 is <= 2.3e-16. Replaces a literal f64_from(1),
+# which is a tolerance of 1.0 and admits everything in [0, 2].
+var ULP_TOL_M = 0x3CD203AF9EE75616;
+var TOL_1EM14 = 0x3D06849B86A12B9B;  # 1e-14
+var TOL_1EM12 = 0x3D719799812DEA11;  # 1e-12 (== EPSILON_F64)  # 1e-15
+# ~1e-13 -- for the Minkowski interval of (5,3,0,0), whose magnitude is 16 and
+# whose measured boost drift is 7.105e-15 (4 ulp of 16).
+var IVL_TOL_M = 0x3D3C25C268497682;  # 1e-13
 
 fn _tc_x2(x) { return f64_mul(x, x); }
 fn _tc_sin(x) { return f64_sin(x); }
@@ -639,8 +649,13 @@ assert_eq(f64_to(f64_round(load64(n_lin_out))), 5, "newton linear root");
 # Newton sin root at 0
 
 var n_sin_out = alloc(8);
-num_newton(&_tn_sin_f, &_tn_sin_df, F64_HALF, EPSILON_F64, 100, n_sin_out);
-assert(f64_lt(f64_abs(load64(n_sin_out)), f64_from(1)) == 1, "newton sin root near 0");
+var n_sin_rc = num_newton(&_tn_sin_f, &_tn_sin_df, F64_HALF, EPSILON_F64, 100, n_sin_out);
+assert_eq(n_sin_rc, 0, "newton sin converged");
+# num_newton returns the first iterate with |sin(x)| < tol = EPSILON_F64 = 1e-12.
+# Near 0, |sin x| >= |x| - |x|^3/6, so the root is bounded by 1.0000000000002e-12
+# -- and that bound also excludes the other roots (+-pi, ...). Measured: 1.21e-14.
+# The old bound of 1.0 was satisfied by every point in (-1, 1), including x0=0.5.
+assert(f64_lt(f64_abs(load64(n_sin_out)), EPSILON_F64) == 1, "newton sin root == 0 (1e-12)");
 
 # ----------------------------------------------------------------
 test_group("num: bisection");
@@ -800,7 +815,18 @@ test_group("complex: euler identity");
 # e^(i*pi) + 1 ~ 0
 var c_eipi = cx_exp(cx_new(0, F64_PI));
 var c_euler = cx_add(c_eipi, cx_one());
-assert(f64_lt(cx_abs(c_euler), f64_from(1)) == 1, "euler e^(ipi)+1 ~ 0");
+# cos(pi_d) rounds to exactly -1.0 and sin(pi_d) = 1.2246467991473532e-16, so the
+# closed-form modulus is 1.2246e-16 (measured: identical). The old bound of 1.0
+# passed for any argument within about +-60 deg of pi.
+assert(f64_lt(cx_abs(c_euler), ULP_TOL_M) == 1, "euler e^(ipi)+1 == 0 (1e-15)");
+# e^(i*pi)+1 == 0 is BLIND to conjugation: pi is a fixed point of z -> conj(z), so
+# negating the imaginary output of cx_exp leaves this bit-identical (verified: such
+# a mutant passes all four suites). Pin a point where the two differ.
+# e^(i*pi/2) = 6.123233995736766e-17 + 1i
+var _e_ih = cx_exp(cx_new(0, F64_PI_2));
+assert(f64_lt(f64_abs(HComplex_re(_e_ih)), ULP_TOL_M) == 1, "cx_exp(i*pi/2).re == 0");
+assert(f64_lt(f64_abs(f64_sub(HComplex_im(_e_ih), F64_ONE)), ULP_TOL_M) == 1,
+"cx_exp(i*pi/2).im == +1 (not -1)");
 
 # ----------------------------------------------------------------
 test_group("complex: pauli matrices");
@@ -848,6 +874,15 @@ assert_eq(f64_to(HComplex_re(c_id_tr)), 3, "identity(3) trace=3");
 var c_id_adj = cmat_adjoint(c_id);
 var c_id_adj_tr = cmat_trace(c_id_adj);
 assert_eq(f64_to(HComplex_re(c_id_adj_tr)), 3, "adj(I) trace=3");
+# If cmat_adjoint were a plain copy, the 8-generator hermitian sweep is A == A
+# again -- verified: such a stub passes all four suites, because 'adj(I) trace==3'
+# is satisfied by the identity function. Pin adjoint on a NON-hermitian matrix.
+var _adj_m = cmat_new(2, 2);
+cmat_set(_adj_m, 0, 1, cx_new(F64_TWO, f64_from(3)));
+var _adj_r = cmat_adjoint(_adj_m);
+assert_eq(f64_to(HComplex_re(cmat_get(_adj_r, 1, 0))), 2, "adj[1][0].re == 2 (transposed)");
+assert_eq(f64_to(HComplex_im(cmat_get(_adj_r, 1, 0))), (0 - 3), "adj[1][0].im == -3 (conjugated)");
+assert_eq(f64_to(HComplex_re(cmat_get(_adj_r, 0, 1))), 0, "adj[0][1] == 0 (not a copy)");
 
 # ================================================================
 # LIE GROUPS (~15)
@@ -865,7 +900,9 @@ assert_eq(l_u_phase, l_pi2_1000, "u1 compose pi/4+pi/4=pi/2");
 # Inverse: phase + (-phase) ~ 0
 var l_u_inv = u1_inv(l_u_a);
 var l_u_id = u1_compose(l_u_a, l_u_inv);
-assert(f64_lt(f64_abs(load64(l_u_id)), f64_from(1)) == 1, "u1 inv ~ 0");
+# f64_add(theta, f64_neg(theta)) is exactly +0.0 in IEEE-754 round-to-nearest for
+# every finite theta, so this is exact. Measured bit pattern: 0x0.
+assert_eq(load64(l_u_id), 0, "u1 inv phase is exactly +0.0");
 
 # Exp/log roundtrip
 var l_u_exp = u1_exp(F64_PI_4);
@@ -886,14 +923,45 @@ assert_eq(f64_to(HQuat_w(l_su2_q)), 1, "su2 identity w=1");
 var l_su2_r = su2_from_axis_angle(hvec3_unit_z(), F64_PI_4);
 var l_su2_ri = su2_inv(l_su2_r);
 var l_su2_p = su2_compose(l_su2_r, l_su2_ri);
-# w component should be ~1
-assert(f64_lt(f64_abs(f64_sub(_su2_w(l_su2_p), F64_ONE)), f64_from(1)) == 1, "su2 compose inv ~ id");
+# Half-angle convention: su2_from_axis_angle(z_hat, pi/4) = cos(pi/8) + sin(pi/8) k.
+# Pin those first -- w = 1 after compose-with-inverse and dw = 0 after a to_quat
+# round-trip are both TRUE under a full-angle build, so neither check below can
+# see the half-vs-full-angle split that shipped through 2.6.12.
+#   cos(pi/8) = 0.9238795325112867   (a full-angle build would put 0.7071067811865476 here)
+#   sin(pi/8) = 0.3826834323650898
+var _cos_pi8 = 0x3FED906BCF328D46;  # 0.9238795325112867
+var _sin_pi8 = 0x3FD87DE2A6AEA963;  # 0.3826834323650898
+assert(f64_lt(f64_abs(f64_sub(_su2_w(l_su2_r), _cos_pi8)), ULP_TOL_M) == 1, "su2 axis-angle w == cos(pi/8)");
+assert(f64_lt(f64_abs(f64_sub(_su2_z(l_su2_r), _sin_pi8)), ULP_TOL_M) == 1, "su2 axis-angle z == sin(pi/8)");
+# w of q*q^-1 is w^2+x^2+y^2+z^2 = 1 exactly for a unit quaternion (measured
+# residual 0). The old bound of 1.0 merely asserted w > 0.
+assert(f64_lt(f64_abs(f64_sub(_su2_w(l_su2_p), F64_ONE)), ULP_TOL_M) == 1, "su2 compose inv w == 1 (1e-15)");
+# w of q*q^-1 is an inner product, so EVERY su2 assertion in the repo (w == 1, the
+# to_quat dw, the axis-angle pins) survives a sign flip in su2_compose's x/y/z
+# cross terms -- verified. Pin all four components of a product of two
+# non-parallel rotations.
+var _c07 = 0x3FE6666666666666;  # 0.7
+var _c11 = 0x3FF199999999999A;  # 1.1
+var _sa = su2_from_axis_angle(hvec3_new(F64_ONE, F64_TWO, f64_from(3)), _c07);
+var _sb = su2_from_axis_angle(hvec3_new(f64_neg(F64_TWO), F64_ONE, F64_HALF), _c11);
+var _sp = su2_compose(_sa, _sb);
+var _sp_w = 0x3FE89F9435EE839F;   # 0.7694798520425258
+var _sp_x = 0xBFD91ACF6D1B1AAA;   # -0.392261368321139
+var _sp_y = 0x3FCE094E17426F47;   # 0.23465896735876354
+var _sp_z = 0x3FDC8C331EC15140;   # 0.44605710986549596  (a z-sign flip gives 0.2788)
+assert(f64_lt(f64_abs(f64_sub(_su2_w(_sp), _sp_w)), TOL_1EM12) == 1, "su2_compose generic w");
+assert(f64_lt(f64_abs(f64_sub(_su2_x(_sp), _sp_x)), TOL_1EM12) == 1, "su2_compose generic x");
+assert(f64_lt(f64_abs(f64_sub(_su2_y(_sp), _sp_y)), TOL_1EM12) == 1, "su2_compose generic y");
+assert(f64_lt(f64_abs(f64_sub(_su2_z(_sp), _sp_z)), TOL_1EM12) == 1, "su2_compose generic z");
+# where: var TOL_1EM12 = 0x3D719799812DEA11;  # 1e-12 (== EPSILON_F64)
 
 # to_quat roundtrip
 var l_su2_q2 = su2_to_quat(l_su2_r);
 var l_su2_back = su2_from_quat(l_su2_q2);
-assert(f64_lt(f64_abs(f64_sub(_su2_w(l_su2_back), _su2_w(l_su2_r))), f64_from(1)) == 1,
-"su2 to_quat roundtrip");
+# Both w's live in [-1, 1], so |dw| < 1.0 was near-unfalsifiable. The round trip
+# renormalizes by a norm of exactly 1.0 here: measured dw = 0.
+assert(f64_lt(f64_abs(f64_sub(_su2_w(l_su2_back), _su2_w(l_su2_r))), ULP_TOL_M) == 1,
+"su2 to_quat roundtrip dw == 0 (1e-15)");
 
 # ----------------------------------------------------------------
 test_group("lie: Gell-Mann");
@@ -936,6 +1004,16 @@ var _gm_a = 0;
 while (_gm_a < 8) {
     var l_gma = gell_mann(_gm_a);
     assert_eq(_gm_is_herm(l_gma), 1, "gell-mann hermitian (all 9 entries, re and im)");
+    # Hermitian + traceless is invariant under PERMUTING the generators: swapping the
+    # lambda_4 and lambda_5 bodies passes all four suites. Pin each one's identity.
+    assert_eq(f64_to(HComplex_re(cmat_get(gell_mann(3), 0, 2))), 1, "lambda_4[0][2] == +1 (real)");
+    assert_eq(f64_to(HComplex_im(cmat_get(gell_mann(3), 0, 2))), 0, "lambda_4[0][2] has no i");
+    assert_eq(f64_to(HComplex_im(cmat_get(gell_mann(4), 0, 2))), (0 - 1), "lambda_5[0][2] == -i");
+    assert_eq(f64_to(HComplex_re(cmat_get(gell_mann(4), 0, 2))), 0, "lambda_5[0][2] is pure imaginary");
+    assert_eq(f64_to(HComplex_re(cmat_get(gell_mann(5), 1, 2))), 1, "lambda_6[1][2] == +1 (real)");
+    assert_eq(f64_to(HComplex_im(cmat_get(gell_mann(6), 1, 2))), (0 - 1), "lambda_7[1][2] == -i");
+    assert_eq(f64_to(HComplex_re(cmat_get(gell_mann(2), 0, 0))), 1, "lambda_3[0][0] == +1");
+    assert_eq(f64_to(HComplex_re(cmat_get(gell_mann(2), 1, 1))), (0 - 1), "lambda_3[1][1] == -1");
     # cmat_adjoint must reproduce the matrix exactly — all 9 entries, both
     # components. Off-diagonal entries make this a real transpose+conjugate test.
     var l_gma_h = cmat_adjoint(l_gma);
@@ -1104,13 +1182,32 @@ assert_eq(f64_to(load64(l_tv4_out + 8)), 0, "lorentz id x");
 # Boost validity: a boost should satisfy Lambda^T eta Lambda = eta
 var l_boost = lorentz_boost_x(F64_HALF);
 assert_eq(lorentz_is_valid(l_boost), 1, "boost is valid");
+# lorentz_boost_x takes RAPIDITY, not velocity: Lambda^0_0 = cosh(0.5) and
+# Lambda^1_0 = sinh(0.5). If it ever silently reverts to reading the argument as
+# beta, those become gamma = 1.1547005383792517 and gamma*beta = 0.5773502691896258
+# -- 0.027 and 0.056 away, both far outside 1e-15. The compose-inverse and
+# interval-preservation checks below hold under EITHER reading, so they cannot
+# see that regression; these two can.
+var _cosh_half = 0x3FF20AC1862AE8D0;  # cosh(0.5) = 1.1276259652063807
+var _sinh_half = 0x3FE0ACD00FE63B97;  # sinh(0.5) = 0.5210953054937474
+assert(f64_lt(f64_abs(f64_sub(m4_get(l_boost, 0, 0), _cosh_half)), ULP_TOL_M) == 1,
+"boost_x(0.5)[0][0] == cosh(0.5)");
+assert(f64_lt(f64_abs(f64_sub(m4_get(l_boost, 1, 0), _sinh_half)), ULP_TOL_M) == 1,
+"boost_x(0.5)[1][0] == sinh(0.5)");
 
 # Compose inverse = identity (approx)
 var l_boost_inv = lorentz_inv(l_boost);
 var l_comp = lorentz_compose(l_boost, l_boost_inv);
 # Diagonal should be ~1, off-diagonal ~0
-assert(f64_lt(f64_abs(f64_sub(m4_get(l_comp, 0, 0), F64_ONE)), f64_from(1)) == 1,
-"lorentz compose inv diag");
+# cosh^2 - sinh^2 = 1 in closed form; measured residual 2.22e-16 (1 ulp). The old
+# bound of 1.0 accepted any [0][0] in [0, 2]. Check an off-diagonal too, or a
+# lorentz_inv that returned the identity would leave [0][0] = cosh(0.5) = 1.128
+# and still pass.
+assert(f64_lt(f64_abs(f64_sub(m4_get(l_comp, 0, 0), F64_ONE)), ULP_TOL_M) == 1,
+"lorentz compose inv [0][0] == 1 (1e-15)");
+assert(f64_lt(f64_abs(f64_sub(m4_get(l_comp, 1, 1), F64_ONE)), ULP_TOL_M) == 1,
+"lorentz compose inv [1][1] == 1 (1e-15)");
+assert(f64_lt(f64_abs(m4_get(l_comp, 0, 1)), ULP_TOL_M) == 1, "lorentz compose inv [0][1] == 0");
 
 # Preserves Minkowski interval
 var l_tv4b = alloc(32);
@@ -1120,7 +1217,25 @@ var l_intv_before = minkowski_interval(l_tv4b);
 var l_tv4b_out = lorentz_transform_4vec(l_boost, l_tv4b);
 var l_intv_after = minkowski_interval(l_tv4b_out);
 var l_intv_diff = f64_abs(f64_sub(l_intv_before, l_intv_after));
-assert(f64_lt(l_intv_diff, f64_from(1)) == 1, "lorentz preserves interval");
+# Pin the interval itself: 5^2 - 3^2 = 16 exactly. A (-,+,+,+) signature would
+# give -16 and the before/after DIFFERENCE would still be 0, so the preservation
+# check alone is blind to a global sign flip.
+assert_eq(f64_to(l_intv_before), 16, "minkowski interval of (5,3,0,0) == +16");
+# Boosted by rapidity 0.5: t' = 5cosh+3sinh = 7.201415742513145,
+# x' = 5sinh+3cosh = 5.988354423087879, t'^2 - x'^2 = 15.999999999999993.
+# Measured drift 7.105e-15 = 4 ulp of 16. The old bound of 1.0 was a 6.25%
+# relative tolerance on a quantity of magnitude 16.
+assert(f64_lt(l_intv_diff, IVL_TOL_M) == 1, "lorentz preserves interval (1e-13)");
+# (5,3,0,0) leaves y and z at zero, so dropping either spatial term is invisible
+# to both the +16 pin and the 1e-13 drift bound -- verified across all four suites.
+var _mv = alloc(32);
+store64(_mv, f64_from(5)); store64(_mv + 8, f64_from(3));
+store64(_mv + 16, f64_from(4)); store64(_mv + 24, F64_TWO);
+# 25 - 9 - 16 - 4 = -4
+assert_eq(f64_to(minkowski_interval(_mv)), (0 - 4), "interval(5,3,4,2) == -4");
+var _mo = lorentz_transform_4vec(l_boost, _mv);
+assert(f64_lt(f64_abs(f64_sub(minkowski_interval(_mo), minkowski_interval(_mv))), TOL_1EM12) == 1,
+"boost preserves interval(5,3,4,2)");
 
 # ================================================================
 # DIFFERENTIAL GEOMETRY (~10)

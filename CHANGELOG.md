@@ -288,7 +288,45 @@ mutant to source and watching the suite fail:
 *Evidence:* 1353 -> **1430**. The three mutants above fail 1, 3 and 1 assertions respectively; a
 lambda_5 or lambda_7 sign flip fails 2 each; stubbing `su3_structure_constant` to 0 fails 1.
 
-**One further test-quality repair remains specified but not applied**, filed under
+#### Test quality — 21 assertions whose tolerance was a literal 1.0 (2.7.0-G cont.)
+
+The last and largest of the six. **15 static assertion sites** (6 in `hisab.tcyr`, 9 in
+`modules.tcyr`) plus 8 loop iterations — 22 at runtime — compared a quantity whose closed form is
+exactly 0 or 1 against `f64_from(1)`. A tolerance of 1.0 around an expected 1.0 admits everything
+in `[0, 2]`. `foundation.tcyr` additionally declared `var TOL = f64_from(1);` — dead, unreferenced,
+and a trap waiting to be picked up; removed after verifying nothing uses it.
+
+Concrete examples of what those bounds accepted:
+- `"rot90.x near 0"` / `"rot90.y near 1"` were satisfied by **every** rotation angle, since
+  `|cos t| < 1` and `|1 - sin t| < 1` for all `t` in `(0, pi)`.
+- `"srgb roundtrip"` was satisfied by every value `linear_to_srgb` can return.
+- A single `[0][0]` entry is not an inverse test at all — `m4_inverse` returning its input
+  unchanged passed it.
+
+Replaced with named tolerances (`ULP_TOL_*` = 1e-15, ~4.5x the measured floor of a few ulp) and
+closed-form expected values. Measured residuals: `rot90.x` 2.22e-16, `rot45.x` 1.11e-16,
+srgb round-trip 1.67e-16, Euler 1.22e-16 — every one within 1 ulp.
+
+The adversarial review is again the more interesting half. It confirmed the census was complete
+(`\bTOL\b` across `tests/` returns exactly the one dead site) and that the patch **kills 11
+mutants** — including a quaternion full-angle error, `lorentz_boost_x` reading velocity as
+rapidity, and `m4_inverse` dropping its translation column, caught only by the new 16-entry sweep.
+But it also found **seven survivors**, each now closed:
+
+- **`cx_exp` returning the conjugate.** `|e^(i*pi) + 1| == 0` is blind to conjugation, because pi
+  is a fixed point of `z -> conj(z)`. Pinned at `e^(i*pi/2)`, where the two differ.
+- **`cmat_adjoint` stubbed to a plain copy.** This is the one that matters most: it would make the
+  new 8-generator Hermiticity sweep compare `A` with `A` — vacuous again, the exact failure mode
+  being repaired. Pinned on a non-Hermitian matrix.
+- `minkowski_interval` dropping the z² term (the test 4-vector was `(5,3,0,0)`), `linear_to_srgb`
+  using the decode-side breakpoint, an `su2_compose` cross-term sign flip, a Gell-Mann λ₄/λ₅ swap,
+  and `m4_inverse` transposing its upper-left 3×3.
+
+*Evidence:* 1430 -> **1523**. Re-running the survivors: conjugated `cx_exp` fails 1 in each of two
+suites, the `cmat_adjoint` stub fails 3, the dropped z² fails 1.
+
+**All six test-quality findings are now closed.**
+
 
 `docs/development/issues/2026-08-04-tq-*.md` (the unit-tolerance sweep -- 21 assertions whose tolerance is a literal 1.0). All six were adversarially reviewed and all six stand
 — but the reviewers also catalogued **~35 mutants the new assertions still would not catch**, which

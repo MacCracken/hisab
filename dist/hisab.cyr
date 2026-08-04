@@ -2672,18 +2672,29 @@ fn minkowski(i, j) {
     return f64_neg(F64_ONE);
 }
 
-# Levi-Civita symbol eps_{ijk} (3D)
+# Levi-Civita symbol eps_{ijk} (3D). Returns an f64 BIT PATTERN (+1.0 / 0.0 / -1.0),
+# matching kronecker_delta and minkowski above -- every value in this section is a
+# tensor COMPONENT and is consumed by f64_mul / f64_add.
+#
+# Through 2.6.15 these returned RAW i64. That is not a cosmetic type mismatch: the
+# raw (0 - 1) is the bit pattern 0xFFFF_FFFF_FFFF_FFFF, a NEGATIVE NaN, so an eps
+# contraction such as c_i = sum_jk eps_ijk a_j b_k poisoned every component --
+# including the ones that are exactly zero, since NaN * 0.0 = NaN. Raw 1 is
+# 4.94e-324 (the smallest subnormal), not 1.0.
+#
+# The `return 0` branches are deliberately left alone: integer 0 and f64 +0.0 are
+# the same 64-bit word, so they already satisfy the contract.
 fn levi_civita_3(i, j, k) {
     if (i == j || j == k || i == k) { return 0; }
     # Even permutations of (0,1,2): +1
-    if (i == 0 && j == 1 && k == 2) { return 1; }
-    if (i == 1 && j == 2 && k == 0) { return 1; }
-    if (i == 2 && j == 0 && k == 1) { return 1; }
+    if (i == 0 && j == 1 && k == 2) { return F64_ONE; }
+    if (i == 1 && j == 2 && k == 0) { return F64_ONE; }
+    if (i == 2 && j == 0 && k == 1) { return F64_ONE; }
     # Odd permutations: -1
-    return (0 - 1);
+    return f64_neg(F64_ONE);
 }
 
-# 4D Levi-Civita
+# 4D Levi-Civita. Same f64-bit-pattern contract as levi_civita_3.
 fn levi_civita_4(i, j, k, l) {
     # Check for repeated indices
     if (i == j || i == k || i == l || j == k || j == l || k == l) { return 0; }
@@ -2700,8 +2711,8 @@ fn levi_civita_4(i, j, k, l) {
         }
         a = a + 1;
     }
-    if (inv % 2 == 0) { return 1; }
-    return (0 - 1);
+    if (inv % 2 == 0) { return F64_ONE; }
+    return f64_neg(F64_ONE);
 }
 
 # --- geo.cyr ---
@@ -6774,10 +6785,18 @@ fn detect_islands(contacts, n_contacts, n_bodies) {
         var c = vec_get(contacts, ci);
         var ba = ColContact_body_a(c);
         var bb = ColContact_body_b(c);
-        if (ba < n_bodies) {
-            if (bb < n_bodies) {
-                _col_uf_union(uf, ba, bb);
-            }
+        # BOTH bounds, not just the upper one. Through 2.6.15 only `< n_bodies`
+        # was checked, so a NEGATIVE body index passed the guard and _col_uf_find
+        # subscripted parent[ba] BEFORE the array. parent[-1] aliases the uf
+        # header's rank POINTER, making `parent + rank_ptr * 8` a wild address --
+        # observed SIGSEGV, exit 139. Small negatives land inside the heap
+        # instead and corrupt silently: with n_bodies = 4 and body_a = -3 the
+        # out-of-bounds read returned root 0, fusing unrelated bodies 0 and 1, so
+        # detect_islands answered 3 islands where the correct answer is 4.
+        # Skipping an out-of-range endpoint is the decision this line already
+        # made for out-of-range-HIGH indices; it now covers both directions.
+        if (ba >= 0 && ba < n_bodies && bb >= 0 && bb < n_bodies) {
+            _col_uf_union(uf, ba, bb);
         }
     }
 
@@ -8395,6 +8414,16 @@ fn num_fft(data, n) {
 # n: number of complex elements (must be power of 2)
 # Returns: 0 on success, HSB_ERR_INVALID_INPUT if n is not power of 2
 fn num_ifft(data, n) {
+    # Validate BEFORE touching the caller's buffer. The conjugate pass below
+    # mutates `data` IN PLACE, so through 2.6.15 leaving validation to num_fft
+    # meant the error return handed back HSB_ERR_INVALID_INPUT with every
+    # imaginary part already negated: the caller saw a failure code AND a
+    # silently conjugated input. num_fft rejects the same n with `data`
+    # bit-identical; the inverse must offer the same guarantee. Guard order
+    # mirrors num_fft so n <= 1 still returns HSB_ERR_NONE.
+    if (n <= 1) { return HSB_ERR_NONE; }
+    if (_num_is_pow2(n) == 0) { return HSB_ERR_INVALID_INPUT; }
+
     # Conjugate all elements
     var i = 0;
     while (i < n) {
@@ -15024,6 +15053,14 @@ fn bch_so3_3rd_order(X, Y) {
 
 var F64_SIX_DG = 0x4018_0000_0000_0000;  # 6.0
 
+# Shared dimension cap for every tensor entry point in this module.
+# christoffel_symbols and riemann_tensor have capped at 16 and returned 0 above it
+# since they were written; the downstream contractions did neither, so they both
+# (a) dereferenced that documented 0 error signal and (b) sized their own alloc
+# from an unbounded dim. Same class as the 2.6.14 cmat_new / opt_bfgs repairs
+# (CWE-190 -> CWE-476).
+var _DG_MAX_DIM = 16;
+
 # ================================================================
 # INTERNAL HELPERS
 # ================================================================
@@ -15062,6 +15099,7 @@ fn christoffel_symbols(metric_inv, metric_deriv, dim) {
     if (dim <= 0 || dim > 16) { return 0; }  # Cap to prevent overflow (16^3 = 4096)
     var n3 = dim * dim * dim;
     var out = alloc(n3 * 8);
+    if (out == 0) { return 0; }
 
     var alpha = 0;
     while (alpha < dim) {
@@ -15122,6 +15160,7 @@ fn riemann_tensor(christoffel, christoffel_deriv, dim) {
     if (dim <= 0 || dim > 16) { return 0; }  # Cap to prevent overflow (16^4 = 65536)
     var n4 = dim * dim * dim * dim;
     var out = alloc(n4 * 8);
+    if (out == 0) { return 0; }
     var d2 = dim * dim;
 
     var rho = 0;
@@ -15181,8 +15220,11 @@ fn riemann_get(riemann, dim, rho, sigma, mu, nu) {
 # Returns: pointer to allocated flat f64 array of dim^2 elements.
 
 fn ricci_tensor(riemann, dim) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (riemann == 0) { return 0; }
     var n2 = dim * dim;
     var out = alloc(n2 * 8);
+    if (out == 0) { return 0; }
 
     var mu = 0;
     while (mu < dim) {
@@ -15213,6 +15255,8 @@ fn ricci_get(ricci, dim, mu, nu) {
 # ================================================================
 
 fn ricci_scalar(ricci, metric_inv, dim) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (ricci == 0 || metric_inv == 0) { return 0; }
     var scalar = 0;  # f64 0.0
     var mu = 0;
     while (mu < dim) {
@@ -15233,11 +15277,14 @@ fn ricci_scalar(ricci, metric_inv, dim) {
 # ================================================================
 
 fn einstein_tensor(ricci, metric, metric_inv, dim) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (ricci == 0 || metric == 0 || metric_inv == 0) { return 0; }
     var r = ricci_scalar(ricci, metric_inv, dim);
     var half_r = f64_mul(F64_HALF, r);
 
     var n2 = dim * dim;
     var out = alloc(n2 * 8);
+    if (out == 0) { return 0; }
 
     var mu = 0;
     while (mu < dim) {
@@ -15337,8 +15384,11 @@ fn sectional_curvature(riemann, metric, u, v, dim) {
 # scalar: Ricci scalar R;  metric: covariant g_{ij} (flat dim²).
 # Returns: covariant C_{ρσμν} (flat dim⁴); all-zero when dim < 3.
 fn weyl_tensor(riemann, ricci, scalar, metric, dim) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (riemann == 0 || ricci == 0 || metric == 0) { return 0; }
     var n4 = dim * dim * dim * dim;
     var out = alloc(n4 * 8);
+    if (out == 0) { return 0; }
     var zi = 0;
     while (zi < n4) { store64(out + zi * 8, 0); zi = zi + 1; }
     if (dim < 3) { return out; }  # Weyl undefined / identically zero for n ≤ 2
@@ -15410,6 +15460,7 @@ fn weyl_get(weyl, dim, rho, sigma, mu, nu) {
 # jac: separation field J (flat dim). Returns the acceleration A^ρ (new alloc).
 fn geodesic_deviation(riemann, u, jac, dim) {
     var out = alloc(dim * 8);
+    if (out == 0) { return 0; }
     var rho = 0;
     while (rho < dim) {
         var acc = 0;
@@ -15449,6 +15500,8 @@ fn geodesic_deviation(riemann, u, jac, dim) {
 # pos, vel: pointers to f64 arrays of length dim
 # Returns: pointer to allocated flat f64 array of 2*dim elements
 fn geodesic_state_new(pos, vel, dim) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (pos == 0 || vel == 0) { return 0; }
     var state = alloc(dim * 2 * 8);
     var i = 0;
     while (i < dim) {
@@ -15492,6 +15545,8 @@ fn _geodesic_accel(pos_ptr, vel_ptr, christoffel, dim, out_acc) {
 # steps: integer number of steps
 # Returns: pointer to new state after integration (2*dim f64 values)
 fn geodesic_rk4(state, christoffel, dim, dt, steps) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (state == 0 || christoffel == 0) { return 0; }
     # Working arrays: current position and velocity
     var x = alloc(dim * 8);
     var u = alloc(dim * 8);
@@ -15652,6 +15707,8 @@ fn _pt_deriv(v, curve_vel, christoffel, dim, out) {
 }
 
 fn parallel_transport(v0, curve_vel, christoffel, dim, dt, steps) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (v0 == 0 || curve_vel == 0 || christoffel == 0) { return 0; }
     var v = alloc(dim * 8);
     var i = 0;
     while (i < dim) { store64(v + i * 8, load64(v0 + i * 8)); i = i + 1; }
@@ -15730,6 +15787,8 @@ fn parallel_transport(v0, curve_vel, christoffel, dim, dt, steps) {
 # Returns: f64 -- maximum absolute residual of nabla_mu xi_nu + nabla_nu xi_mu
 
 fn killing_residual(field, metric, christoffel, dim) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (field == 0 || metric == 0 || christoffel == 0) { return 0; }
     # Extract xi pointer and dxi pointer from field layout
     var xi = field;
     var dxi = field + dim * 8;
@@ -15812,8 +15871,14 @@ fn killing_residual(field, metric, christoffel, dim) {
 # Stored in strictly-increasing index order: (0,1), (0,2), ..., (0,dim-1), (1,2), ...
 
 fn wedge_1_1(alpha, beta, dim) {
+    # Identical defect to the contractions above, and NOT part of the original
+    # finding: n2 = dim*(dim-1)/2 with dim = 100000 asks for 40 GB, so alloc
+    # returns 0 and the store below writes to address 0. Measured: exit 139.
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (alpha == 0 || beta == 0) { return 0; }
     var n2 = dim * (dim - 1) / 2;
     var out = alloc(n2 * 8);
+    if (out == 0) { return 0; }
 
     var pos = 0;
     var i = 0;
@@ -15857,7 +15922,8 @@ fn wedge_1_1(alpha, beta, dim) {
 #   *(01) =  F_{23},  *(02) = -F_{13}, *(03) =  F_{12}
 #   *(12) = -F_{03},  *(13) =  F_{02}, *(23) = -F_{01}
 fn hodge_star_2form_4d(form, sign) {
-    var out = alloc(48);  # 6 * 8 bytes
+    var out = alloc(48);
+    if (out == 0) { return 0; }  # 6 * 8 bytes
 
     # Components: 0=(01), 1=(02), 2=(03), 3=(12), 4=(13), 5=(23)
     var f01 = load64(form);
@@ -15887,7 +15953,8 @@ fn hodge_star_2form_4d(form, sign) {
 # Wedge of a 2-form ω and a 1-form α → 3-form.
 # (ω ∧ α)_{ijk} = ω_{ij} α_k − ω_{ik} α_j + ω_{jk} α_i   (i < j < k)
 fn wedge_2_1(omega, alpha) {
-    var out = alloc(32);  # C(4,3) = 4
+    var out = alloc(32);
+    if (out == 0) { return 0; }  # C(4,3) = 4
     var w01 = load64(omega);
     var w02 = load64(omega + 8);
     var w03 = load64(omega + 16);
@@ -15909,6 +15976,7 @@ fn wedge_2_1(omega, alpha) {
 # (β ∧ α)_{0123} = β_{012} α_3 − β_{013} α_2 + β_{023} α_1 − β_{123} α_0
 fn wedge_3_1(beta, alpha) {
     var out = alloc(8);
+    if (out == 0) { return 0; }
     var b012 = load64(beta);
     var b013 = load64(beta + 8);
     var b023 = load64(beta + 16);

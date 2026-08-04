@@ -133,19 +133,30 @@ before this. Suite 1154 → 1181.
 - [x] `cmat_commutator`/`add`/`sub`/`adjoint`/`scale`/`trace` dereferenced `cmat_mul`'s designed 0
       — the 2.6.14 null-propagation fix stopped one call-link short. **Both mutants SIGSEGV**;
       guarded, plus shape checks on `add`/`sub` *(closed with 2.7.0-B)*
-- [ ] `detect_islands` validates only the upper bound of contact body indices; a negative index
-      subscripts before the union-find arrays (`collision_mesh.cyr:538`)
-- [ ] diffgeo's downstream tensor functions apply neither the dim cap nor a null check, so both
-      the cap path and the alloc-failure path dereference NULL (`diffgeo.cyr:336`)
+- [x] `detect_islands` validated only the upper bound of contact body indices; a negative index
+      subscripted before the union-find arrays (`collision_mesh.cyr:538`). **SIGSEGV** at large
+      magnitude; at small magnitude a *silent* wrong partition (3 islands where 4 is correct)
+      *(2.7.0-C)*
+- [x] diffgeo's downstream tensor functions applied neither the dim cap nor a null check, so both
+      the cap path and the alloc-failure path dereferenced NULL (`diffgeo.cyr:336`). Shared
+      `_DG_MAX_DIM`, operand guards on 9 functions, checks at **all ten** alloc sites — plus
+      `wedge_1_1`, a live SIGSEGV the finding never mentioned *(2.7.0-C)*
 - [ ] `svd_golub_kahan` returns NO_CONVERGENCE plus all-zero singular values for a **rank-deficient**
-      matrix (`linalg_precision.cyr:340`)
-- [ ] `expr_to_str`/`sym_to_latex` drop the rounding carry — 0.999999995 renders as "0.1000000"
-- [ ] `levi_civita_3`/`_4` return raw i64 while their siblings return f64 bit patterns; the −1
-      case is a NaN (`tensor.cyr:227`)
-- [ ] `num_ifft` conjugates the caller's buffer before validating, so its error return leaves the
-      input corrupted (`num.cyr:236`)
-- [ ] Householder reflector construction is unscaled and overflows on large column norms
-      (`linalg_precision.cyr:31`)
+      matrix (`linalg_precision.cyr:340`). ✅ verified + challenged, fix specified, **not applied**
+- [ ] `expr_to_str`/`sym_to_latex` drop the rounding carry — 0.999999995 renders as "0.1000000".
+      ✅ verified + challenged, fix specified, **not applied**
+- [x] `levi_civita_3`/`_4` returned raw i64 while their siblings return f64 bit patterns; the −1
+      case was a **negative NaN**, poisoning even the exactly-zero components of a contraction
+      (`tensor.cyr:227`). 8 existing assertions migrated with it *(2.7.0-C)*
+- [x] `num_ifft` conjugated the caller's buffer before validating, so its error return left the
+      input corrupted (`num.cyr:236`) — a failure code *and* silently mutated data *(2.7.0-C)*
+- [ ] **Householder reflector construction is unscaled** (`linalg_precision.cyr:31`). ✅ verified +
+      challenged; fix specified with a power-of-two balancing divisor so unit-scale results stay
+      **bit-identical**. **Severity raised by measurement**: across 440 random matrices,
+      `svd_golub_kahan` is correct only in the band 1 .. 1e23 — it fails **40/40 at scale 1e-10**
+      on a relative reconstruction check, so a physics consumer in SI metres gets silently wrong
+      singular values *today*. Root cause of the small-magnitude half is the *absolute*
+      `EPSILON_F64` deflation thresholds, which balancing converts to relative ones. **Not applied**
 
 ### Test quality  (12 findings — assertions that cannot fail for the right reason)
 - [ ] `num_rk4`'s **only** assertion in the whole tree tolerates a 90% error
@@ -166,6 +177,12 @@ before this. Suite 1154 → 1181.
 - [ ] `_kd_partition` value-midpoint split costs O(n·log(range/min_gap)) on geometrically-spaced
       coordinates — 574 ms vs 38 ms at n = 50,000
 - [ ] Benchmark the hot public functions that still have none, so regressions are visible
+
+### Found during 2.7.0-C (new — not in the 2026-08-04 audit)
+- [ ] **`eigen_qr` returns `HSB_ERR_NO_CONVERGENCE` at unit scale** for a well-conditioned
+      symmetric 4×4 (numpy cond 6.85, eigenvalues −1.877, −0.278, 0.274, 1.387), even at
+      `max_iter = 1,000,000`. Reproduced on **unpatched** source, so it is independent of the
+      Householder work. Repro matrix bit patterns are in the 2.7.0-C verification record
 
 ### Found during 2.7.0-B (new — not in the 2026-08-04 audit)
 - [ ] **`lib/hisab.cyr` is a tracked 591 KB copy of hisab's own 2.6.15 distlib bundle**, sitting in

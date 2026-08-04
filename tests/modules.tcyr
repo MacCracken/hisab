@@ -1156,17 +1156,17 @@ assert_eq(f64_to(minkowski(0, 1)), 0, "eta 01=0");
 # ----------------------------------------------------------------
 test_group("tensor: levi-civita 3D");
 
-assert_eq(levi_civita_3(0, 1, 2), 1, "eps 012=+1");
-assert_eq(levi_civita_3(1, 2, 0), 1, "eps 120=+1");
-assert_eq(levi_civita_3(2, 0, 1), 1, "eps 201=+1");
-assert_eq(levi_civita_3(1, 0, 2), (0 - 1), "eps 102=-1");
+assert_eq(f64_to(levi_civita_3(0, 1, 2)), 1, "eps 012=+1");
+assert_eq(f64_to(levi_civita_3(1, 2, 0)), 1, "eps 120=+1");
+assert_eq(f64_to(levi_civita_3(2, 0, 1)), 1, "eps 201=+1");
+assert_eq(f64_to(levi_civita_3(1, 0, 2)), (0 - 1), "eps 102=-1");
 assert_eq(levi_civita_3(0, 0, 1), 0, "eps repeated=0");
 
 # ----------------------------------------------------------------
 test_group("tensor: levi-civita 4D");
 
-assert_eq(levi_civita_4(0, 1, 2, 3), 1, "eps4 0123=+1");
-assert_eq(levi_civita_4(1, 0, 2, 3), (0 - 1), "eps4 1023=-1");
+assert_eq(f64_to(levi_civita_4(0, 1, 2, 3)), 1, "eps4 0123=+1");
+assert_eq(f64_to(levi_civita_4(1, 0, 2, 3)), (0 - 1), "eps4 1023=-1");
 assert_eq(levi_civita_4(0, 0, 1, 2), 0, "eps4 repeated=0");
 
 # ----------------------------------------------------------------
@@ -2200,6 +2200,121 @@ assert_eq(time_of_impact(&_mpr_sup_sphere, toi_a, toi_still,
 &_mpr_sup_sphere, toi_over, toi_left, f64_from(10), toi_t, toi_n), 1,
 "already overlapping -> hit");
 assert_eq(load64(toi_t), 0, "overlap at t = 0 reports t = 0");
+
+# ================================================================
+# 2.7.0-C -- medium correctness & safety findings.
+# Every fix below was independently verified AND adversarially
+# challenged against the real source before it was applied.
+# ================================================================
+
+test_group("detect_islands: negative body indices must be rejected, not subscripted");
+
+# Only the UPPER bound was checked through 2.6.15, so a negative index sailed
+# through and _col_uf_find subscripted parent[] BEFORE the array.
+var isl_a_c = contact_new(0 - 3, 1, hvec3_unit_y(), F64_HALF, F64_HALF, F64_HALF, F64_ONE, F64_ONE);
+var isl_a_v = vec_new();
+vec_push(isl_a_v, isl_a_c);
+var isl_a = detect_islands(isl_a_v, 1, 4);
+assert_eq(vec_len(isl_a), 4, "detect_islands: neg body_a is skipped -> 4 singletons");
+# Pins the CORRUPTION, not just the count: pre-fix, island 0 was [0, 1] -- two
+# unrelated bodies fused because the OOB read of parent[-3] returned root 0.
+assert_eq(vec_len(vec_get(isl_a, 0)), 1, "detect_islands: neg body_a must not merge body 0");
+
+# Second operand independently -- a fix guarding only `ba` would still fail this.
+var isl_b_c = contact_new(1, 0 - 3, hvec3_unit_y(), F64_HALF, F64_HALF, F64_HALF, F64_ONE, F64_ONE);
+var isl_b_v = vec_new();
+vec_push(isl_b_v, isl_b_c);
+assert_eq(vec_len(detect_islands(isl_b_v, 1, 4)), 4, "detect_islands: neg body_b is skipped -> 4 singletons");
+
+# The memory-safety half. Pre-fix this SIGSEGVs (exit 139) and the suite prints
+# nothing past the group header -- the count assertions above cannot reach it,
+# because small-magnitude aliasing happens to stay inside the heap.
+var isl_c_c = contact_new(0 - 1000000, 1, hvec3_unit_y(), F64_HALF, F64_HALF, F64_HALF, F64_ONE, F64_ONE);
+var isl_c_v = vec_new();
+vec_push(isl_c_v, isl_c_c);
+assert_eq(vec_len(detect_islands(isl_c_v, 1, 4)), 4, "detect_islands: large neg index must not fault");
+
+test_group("num_ifft: an error return must not leave the caller's buffer conjugated");
+
+# n = 3 is not a power of 2. Through 2.6.15 the conjugate pass ran FIRST, so the
+# rejection came back with every imaginary part already negated.
+var ift_d = alloc(48);
+store64(ift_d + 0,  f64_from(1));  store64(ift_d + 8,  f64_from(2));
+store64(ift_d + 16, f64_from(3));  store64(ift_d + 24, f64_from(4));
+store64(ift_d + 32, f64_from(5));  store64(ift_d + 40, f64_from(6));
+assert_eq(num_ifft(ift_d, 3), HSB_ERR_INVALID_INPUT, "n=3 rejected (rc is -10 either way)");
+assert_eq(f64_to(load64(ift_d + 8)),  2, "ifft error leaves im[0] intact");
+assert_eq(f64_to(load64(ift_d + 24)), 4, "ifft error leaves im[1] intact");
+assert_eq(f64_to(load64(ift_d + 40)), 6, "ifft error leaves im[2] intact");
+# Deliberate control: passes BOTH ways. It proves the corruption was confined to
+# the imaginary lane -- i.e. silent, not obviously garbage.
+assert_eq(f64_to(load64(ift_d + 0)), 1, "re[0] intact (control -- passes both ways)");
+# One aggregate that flips sign: +12 correct, -12 corrupted.
+var ift_s = f64_add(f64_add(load64(ift_d + 8), load64(ift_d + 24)), load64(ift_d + 40));
+assert_eq(f64_to(ift_s), 12, "sum(im) still +12 after a failed ifft");
+
+# The success path must be untouched: n = 4 round-trips.
+var ift_r = alloc(64);
+store64(ift_r + 0,  f64_from(1));  store64(ift_r + 8,  0);
+store64(ift_r + 16, f64_from(2));  store64(ift_r + 24, 0);
+store64(ift_r + 32, f64_from(3));  store64(ift_r + 40, 0);
+store64(ift_r + 48, f64_from(4));  store64(ift_r + 56, 0);
+assert_eq(num_fft(ift_r, 4), HSB_ERR_NONE, "fft n=4 ok");
+assert_eq(num_ifft(ift_r, 4), HSB_ERR_NONE, "ifft n=4 ok");
+assert_eq(f64_to(load64(ift_r + 0)), 1, "round-trip re[0] = 1");
+assert_eq(f64_to(load64(ift_r + 48)), 4, "round-trip re[3] = 4");
+
+test_group("levi_civita: f64 bit patterns, not raw i64");
+
+# Raw (0 - 1) is 0xFFFF_FFFF_FFFF_FFFF -- a NEGATIVE NaN. These four catch the
+# ENCODING (pre-fix, f64_to of the raw 1 subnormal truncates to 0)...
+assert_eq(f64_to(levi_civita_3(0, 1, 2)), 1, "eps 012 = +1.0 as f64");
+assert_eq(f64_to(levi_civita_4(0, 1, 2, 3)), 1, "eps4 0123 = +1.0 as f64");
+# ...and these two catch the SIGN. They are not redundant: a mutant with the
+# correct f64 encoding but f64_neg dropped passes every encoding assertion above.
+assert_eq(f64_to(levi_civita_3(1, 0, 2)), (0 - 1), "eps 102 = -1.0 (pins the sign)");
+assert_eq(f64_to(levi_civita_4(1, 0, 2, 3)), (0 - 1), "eps4 1023 = -1.0 (pins the sign)");
+
+# NaN is unordered, so it fails BOTH directions of an ordered comparison -- the
+# cleanest statement that the odd branch is a real number at all.
+assert_eq(f64_lt(levi_civita_3(1, 0, 2), 0), 1, "eps 102 is an ordered negative, not NaN");
+assert_eq(f64_gt(levi_civita_3(0, 1, 2), 0), 1, "eps 012 is an ordered positive");
+
+# The downstream consequence: NaN * 0.0 is NaN, so a raw -1 poisoned even the
+# components a contraction should leave at exactly zero.
+var lc_prod = f64_mul(levi_civita_3(1, 0, 2), 0);
+assert_eq(f64_eq(lc_prod, 0), 1, "eps 102 * 0.0 == 0.0 (was NaN)");
+assert_eq(f64_to(levi_civita_3(0, 0, 1)), 0, "eps repeated = 0.0");
+
+test_group("diffgeo: the documented 0 must not be dereferenced, and dims are capped");
+
+# christoffel_symbols and riemann_tensor have capped at 16 and returned 0 since
+# they were written. The downstream contractions did neither -- they dereferenced
+# that 0 AND sized their own alloc from an unbounded dim (CWE-190 -> CWE-476).
+var dg_ch_big = christoffel_symbols(0, 0, 100);
+assert_eq(dg_ch_big, 0, "christoffel_symbols over the cap still returns 0");
+assert_eq(ricci_tensor(dg_ch_big, 100), 0, "ricci_tensor(0, over-cap) -> 0, not a null store");
+assert_eq(ricci_tensor(0, 4), 0, "ricci_tensor(null riemann) -> 0");
+assert_eq(einstein_tensor(0, 0, 0, 4), 0, "einstein_tensor(null) -> 0");
+assert_eq(weyl_tensor(0, 0, 0, 0, 4), 0, "weyl_tensor(null) -> 0");
+assert_eq(geodesic_state_new(0, 0, 4), 0, "geodesic_state_new(null) -> 0");
+assert_eq(geodesic_rk4(0, 0, 4, F64_HALF, 1), 0, "geodesic_rk4(null) -> 0");
+assert_eq(parallel_transport(0, 0, 0, 4, F64_HALF, 1), 0, "parallel_transport(null) -> 0");
+assert_eq(killing_residual(0, 0, 0, 4), 0, "killing_residual(null) -> 0");
+
+# The dimension cap itself, on each entry point that previously had none.
+assert_eq(ricci_tensor(0, 100000), 0, "ricci_tensor over the dim cap -> 0");
+assert_eq(geodesic_state_new(0, 0, 100000), 0, "geodesic_state_new over the dim cap -> 0");
+
+# wedge_1_1 was NOT in the original finding. dim = 100000 asks for 40 GB, so
+# alloc returns 0 and the store wrote to address 0 -- measured exit 139.
+var dg_a = alloc(32);
+var dg_b = alloc(32);
+assert_eq(wedge_1_1(dg_a, dg_b, 100000), 0, "wedge_1_1 over the dim cap -> 0, not a null store");
+assert_eq(wedge_1_1(0, dg_b, 4), 0, "wedge_1_1(null alpha) -> 0");
+
+# The valid path must be untouched: a real 2-sphere still contracts correctly.
+assert_neq(wedge_1_1(dg_a, dg_b, 4), 0, "wedge_1_1 at dim 4 still returns a form");
 
 # ================================================================
 var r = assert_summary();

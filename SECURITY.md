@@ -21,6 +21,13 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 | Modular arithmetic | Overflow in multiplication for large moduli | Russian peasant _num_mulmod avoids overflow |
 | Symbolic eval | Process abort on undefined variable | Returns 0 with warning (no longer aborts) |
 | Perlin noise | Global mutable state for permutation table | Single-threaded only; documented |
+| Capped constructors | A designed `0` (null) return from a dimension cap being **stored through** by the caller (CWE-476) | Closed in two passes: **2.6.14** for `cmat_new`'s four callers and the BFGS/L-BFGS working-memory allocations (`_OPT_MAX_DIM = 4096`, new `HSB_ERR_ALLOC`); **2.7.0** for `cmat_add`/`sub`/`adjoint`/`scale`/`trace`, which `cmat_commutator` feeds directly. Pre-fix mutants exit **139 (SIGSEGV)** |
+| Complex matrix multiply | Out-of-bounds read past `b`'s buffer when `cols(a) != rows(b)` (CWE-125) | Conformability check added 2.7.0 |
+| Unbounded / non-terminating loops | Work bounds that do not actually bound work | `cmat_exp`'s scaling loop hung forever on a non-finite norm (`+Inf * 0.5 == +Inf`) — capped 2.7.0. Adaptive Simpson capped recursion *depth* but permitted 2^50 integrand evaluations, which a NaN integrand reached exactly — bounded 2.6.14 |
+| Recursion depth on degenerate geometry | Coincident points/boxes collapsing a spatial split to one element per level | `kdtree_build` **SIGSEGV measured at 60,000** coincident points — fixed 2.6.14 (positional split). `_bvh_build_rec` was the unfixed sibling: not a crash but **O(n²)** build cost, a resource-exhaustion vector — fixed 2.7.0 (median split), **2.722 s → 15.5 ms** at n=4,000 |
+| Spline evaluation | Negative indexing of the control-point array from an unvalidated `degree` | Fixed 2.6.14 — `degree` and control-point-count validation |
+| NaN acceptance | A NaN comparing false against every ordered test being read as "passed the check" | `_opt_armijo` accepted a NaN objective as a valid step and propagated it into `x` for three solvers — fixed 2.6.14 (requires `f_new == f_new` first). `geo_ray_capsule` returned NaN for an axis-parallel ray — fixed 2.7.0 |
+| Collision query completeness | A query that silently under-reports is worse than one that errors | `time_of_impact` capped its search at 0.64 units of relative travel regardless of `max_t` — a **false negative**. Fixed 2.7.0 with a step budget spanning the full horizon |
 
 ## Known Limitations
 
@@ -34,7 +41,8 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Version | Supported |
 |---------|-----------|
-| hisab 2.6.x (current) | Yes |
+| hisab 2.7.x (current) | Yes |
+| hisab 2.6.x | Yes |
 | hisab 2.0–2.5 | Best-effort |
 | Rust 1.x | Available via pre-2.0 git tags, unsupported |
 
@@ -54,3 +62,11 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 - No network I/O in core library
 - Single external dependency (sakshi for structured logging)
 - P(-1) audit completed 2026-04-15 — see docs/audit/2026-04-15.md
+- Full sweep 2026-08-03 (70 findings, 2 critical) — repaired across 2.6.12–2.6.15; re-audited
+  2026-08-04 with **zero regressions**. See docs/audit/ and docs/development/threat-model.md
+- Fixes are **mutation-proven**: a repair lands only once its source file has been reverted and the
+  new assertions confirmed to fail. Where a defect is a cost rather than a wrong answer, that is
+  stated explicitly and a benchmark guards it instead — a passing suite is not allowed to imply a
+  proof it did not provide
+- Hand-encoded IEEE-754 constants are verified against their own comments by
+  `scripts/check-constants.sh` (a CI gate since 2.6.12, after seven mis-transcribed tables shipped)

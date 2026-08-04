@@ -58,6 +58,57 @@ the failing output is the evidence, not the passing output. Suite 1127 → **115
   genuinely non-Lorentzian matrix (whose defect is O(scale²), not O(1e-12)) — both directions are
   asserted.
 
+#### Fixed — medium correctness & safety (2.7.0-C, 4 of 7)
+
+Each finding was **independently verified against the source and then adversarially challenged**
+before it was applied — 7 confirmed, 0 refuted, and every reviewer ran real code rather than
+reasoning about it. The challenges were not a formality: one showed that the proposed
+`levi_civita` assertions all pass a wrong-sign mutant, and another found a live SIGSEGV in
+`wedge_1_1` that the finding never mentioned. Both corrections are in the fixes below.
+Suite 1181 → **1217**.
+
+- **`detect_islands` checked only the *upper* bound of a contact's body indices.** A negative
+  index sailed through `ba < n_bodies` and `_col_uf_find` subscripted `parent[]` *before* the
+  array. Two distinct failure modes, both measured: `parent[-1]` aliases the union-find header's
+  `rank` **pointer**, so `parent + rank_ptr * 8` is a wild address (**SIGSEGV, exit 139**); small
+  negatives stay inside the heap and corrupt *silently* — with `n_bodies = 4` and `body_a = -3`
+  the out-of-bounds read returned root 0, fusing unrelated bodies 0 and 1, so the function
+  answered **3 islands where the correct answer is 4**. Skipping an out-of-range endpoint is the
+  decision the line already made for out-of-range-*high* indices; it now covers both directions.
+- **`num_ifft` corrupted the caller's buffer on its error path.** Validation lived only in
+  `num_fft`, which `num_ifft` calls *after* running its in-place conjugate pass — so a rejected
+  length returned `HSB_ERR_INVALID_INPUT` with every imaginary part already negated. The caller
+  got a failure code **and** a silently conjugated input. `num_fft` rejects the same `n` leaving
+  `data` bit-identical; the inverse now offers the same guarantee.
+- **`levi_civita_3` / `levi_civita_4` returned raw i64 where their siblings return f64 bit
+  patterns.** Not a cosmetic type mismatch: raw `(0 - 1)` is `0xFFFF_FFFF_FFFF_FFFF`, a **negative
+  NaN**, so a contraction `c_i = Σ_jk ε_ijk a_j b_k` poisoned every component — *including the ones
+  that are exactly zero*, since `NaN * 0.0 = NaN`. Raw `1` is 4.94e-324, not 1.0. Eight existing
+  in-tree assertions encoded the old integer contract and were migrated with the fix.
+- **diffgeo's downstream contractions dereferenced the documented 0 and sized allocations from an
+  unbounded dim** (CWE-190 → CWE-476). `christoffel_symbols` and `riemann_tensor` have capped at
+  16 and returned 0 since they were written; `ricci_tensor`, `ricci_scalar`, `einstein_tensor`,
+  `weyl_tensor`, `geodesic_state_new`, `geodesic_rk4`, `parallel_transport` and `killing_residual`
+  did neither. Added a shared `_DG_MAX_DIM`, null guards on every operand, and an allocation check
+  at **all ten** `alloc` sites — including the two in `christoffel_symbols`/`riemann_tensor` that
+  the finding left asymmetric. Also fixes **`wedge_1_1`**, which was not in the finding at all:
+  `n2 = dim*(dim-1)/2` at `dim = 100000` asks for 40 GB, so `alloc` returned 0 and the store wrote
+  to address 0.
+
+**Evidence.** Reverting `collision_mesh.cyr` yields 3 failures **plus SIGSEGV**; `num.cyr` 4
+failures; `tensor.cyr` 12 (and a second, sign-only mutant that keeps the correct f64 encoding
+still fails 5 — the case the original assertions missed); `diffgeo.cyr` **SIGSEGVs before printing
+a single line**. Every restore was verified byte-identical afterwards, not assumed.
+
+**Still open (3 of 7)** — all verified, challenged and fully specified, but not yet applied:
+`svd_golub_kahan` on rank-deficient input, the `expr_to_str`/`sym_to_latex` rounding carry, and the
+unscaled Householder reflector. The last one is **more severe than the finding stated**: a
+cross-scale probe of 440 random matrices found `svd_golub_kahan` is only correct in the band
+1 .. 1e23 — it fails 40/40 at scale 1e-10 on a relative reconstruction check, so a physics
+consumer working in SI metres gets silently wrong singular values today. A separate pre-existing
+defect surfaced alongside it: `eigen_qr` returns `HSB_ERR_NO_CONVERGENCE` at *unit* scale for a
+well-conditioned symmetric 4×4 (cond 6.85), reproduced on unpatched source.
+
 ### Changed
 - **`lorentz_boost_x/y/z/…` parameter renamed `beta` → `eta`.** The bodies take `cosh`/`sinh` of the
   argument — it was always **rapidity** — while the signature said `beta` (velocity) and the doc

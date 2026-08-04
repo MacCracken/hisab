@@ -41,13 +41,41 @@ Hisab does NOT trust:
 | f64_fmod | Division by y=0 | Returns 0 |
 | f64_tan | cos(x)=0 at PI/2 | Returns IEEE 754 Inf (documented) |
 | expr_eval | Undefined variable | Returns 0 with stderr warning (no longer aborts) |
-| geo_ray_plane | Ambiguous t=0 hit vs miss | Returns -1 for miss (not 0) |
+| geo_ray_plane | Ambiguous t=0 hit vs miss | **Changed 2.7.0** — returns **0** for a miss, matching the contract stated twice in `geo.cyr`'s own headers and every sibling intersection routine. The previous `-1` was the raw i64 `0xFFFFFFFFFFFFFFFF`, i.e. a **negative NaN** as an f64: detectable only by integer comparison, and silently poisoning any float arithmetic a consumer performed on it |
 | GJK/EPA | Non-convergence on degenerate shapes | 64-iteration hard limit |
 | Perlin noise | Global mutable permutation table | Single-threaded only |
 | PCG32 | Signed arithmetic for unsigned ops | Verified safe: & masks discard sign extension |
 | m4_get/m4_set | No bounds check | Contract: col/row in [0,3], caller must validate |
 | Jacobi eigensolver | O(n^5) for large matrices | Documented: not for n > 50 |
 | SVD via A^T*A | Squares condition number | Documented: Golub-Kahan planned |
+
+### Memory-safety tier — closed in v2.6.14
+
+Recorded here because three of these four groups **crashed the process**: reverting `complex.cyr`,
+`calc_ext.cyr` or `optimize.cyr` individually makes the suite exit **139 (SIGSEGV)**.
+
+| Module | Risk | Mitigation |
+|--------|------|------------|
+| `cmat_mul` / `cmat_kronecker` / `cmat_inverse` / `cmat_identity` | `cmat_new` correctly returns 0 above `_CMAT_MAX_ELEMS` (65536); four callers then **stored through that 0** (CWE-476). Reachable from operands that are themselves under the cap — 1000×1 times 1×1000 asks for 1e6; 17×17 ⊗ 17×17 is 83521; `cmat_inverse` doubles width building `[M ǀ I]` | Fixed 2.6.14 — null checks at every store site. Tests pin **both sides** of the 16×16 ⊗ 16×16 = 65536 edge, which is legitimately allowed |
+| `opt_bfgs` / `opt_lbfgs` | Working memory sized from an **unbounded** caller dimension: an `n × n` inverse Hessian and an `m × (2n+1)` history ring, with `alloc` returning 0 and the init loop storing through it (CWE-190 → CWE-476) | Fixed 2.6.14 — `_OPT_MAX_DIM = 4096` (the `ALLOC_MAX` hard ceiling is 5792) + explicit allocation checks in all four solvers + a new `HSB_ERR_ALLOC` (`-11`) so allocation failure is reportable rather than fatal |
+| `calc_bspline` / `calc_nurbs` | `degree` itself was never validated, nor the well-formedness rule that a degree-*d* spline needs ≥ *d+1* control points. With `degree >= n_pts` the sentinel-undo produced `k - n_pts` and de Boor indexed `ctrl_pts` at a **negative** offset — a wild-pointer read instead of the documented 0-on-invalid-input | Fixed 2.6.14 — degree and control-point-count validation |
+| adaptive Simpson | Capped recursion **depth** at 50 but not **work**: each non-converged node spawns two children, permitting 2^50 (~1e15) integrand evaluations. A NaN integrand takes exactly that path, since every f64 comparison with NaN returns 0, so `ǀerrorǀ < tol` is false forever | Fixed 2.6.14 — explicit non-finite bail plus a stop-when-bisection-stops-progressing check, bounding real work by f64 resolution rather than by a counter |
+| `kdtree_build` | `_kd_partition` splits on the axis **value** midpoint, which can only degenerate when every point shares that value — and that case fell to the one-element-per-level clamp, giving O(n) depth. **Measured**, not inferred: fine at 40,000 coincident points, **SIGSEGV at 60,000** | Fixed 2.6.14 — splits positionally in exactly that case, sound because the values are equal (the `split_val` the caller reads is then the common value, so query pruning still compares exactly) |
+| `_opt_armijo` | Tie-breaker written `f64_lt(threshold, f_new) == 0`, which is **also true when `f_new` is NaN** — so a NaN objective was accepted as a valid step and propagated into `x` for `opt_bfgs`, `opt_lbfgs` and `opt_conjugate_gradient` | Fixed 2.6.14 — requires `f_new` to compare equal to itself first |
+
+### Closed in v2.7.0
+
+| Module | Risk | Mitigation |
+|--------|------|------------|
+| `cmat_mul` | Never checked `cols(a) == rows(b)` and ran the inner product over `cols(a)` while indexing `b` by that bound — an **out-of-bounds read** (CWE-125) past a buffer allocated at exactly `rows(b)*cols(b)*16` bytes. A 2×3 times a 2×2 read two complex numbers of adjacent heap | Conformability check returns 0 |
+| `cmat_add` / `sub` / `adjoint` / `scale` / `trace` | Dereferenced the **designed-0** return of `cmat_new`/`cmat_mul` (CWE-476) — the 2.6.14 null-propagation fix stopped one call-link short, and `cmat_commutator` feeds exactly that in by passing two `cmat_mul` results straight to `cmat_sub`. Both pre-fix mutants **SIGSEGV** | Null + shape guards; `cmat_trace` returns 0 rather than `cx_zero()`, since zero is a valid trace |
+| `cmat_exp` | Scaling loop halves the Frobenius norm until it drops below 1 — but `+Inf * 0.5` is still `+Inf`, so **a single overflowing entry hung the process forever**. Measured: 1 s with the fix, >110 s without | `_CMAT_EXP_MAX_SCALING = 64`; `exp` overflows f64 above 709, so no larger scaling parameter can describe a representable result |
+| `_bvh_build_rec` | Fell back to a 1-vs-(n−1) split whenever no center sorted below the midpoint — precisely what coincident or clustered AABBs do. Because each level re-merges its whole range for `bounds`, build cost was **O(n²)** in time and arena: a resource-exhaustion vector on attacker-chosen geometry. Measured 2.722 s at n=4,000 | Median fallback restores O(n log n) — `bvh_degenerate_4k` **2.722 s → 15.5 ms**. Guarded by benchmark, not assertion: both forms return the same tree |
+| `time_of_impact` | **False negative from a collision query.** The advancement loop was bounded by `GJK_MAX_ITER` — a cap on GJK's *simplex refinement*, not on time sampling — while stepping a fixed `0.01/speed`, so it covered `64 × 0.01 = 0.64` units of relative displacement and returned 0 regardless of the `max_t` the caller asked for | Dedicated `_GA_TOI_MAX_STEPS` budget spanning the full horizon, with the tolerance step as a floor |
+| `geo_ray_capsule` | A ray **parallel to the capsule axis** makes `d_perp` exactly zero, so `a == 0`, `b == 0` and the discriminant is exactly `+0.0` — which does not satisfy the `disc < 0` test guarding the cap-sphere fallback. Execution reached `0.5 / 0 = +Inf` and returned NaN from a function documented to return 0 on a miss, propagating into caller arithmetic | The parallel case now joins the cap-sphere path, which is the whole answer for it |
+| `f64_copysign` | Branched on `f64_lt(y, 0)`, an **ordered** comparison: `-0.0` compares equal to `+0.0`, so the sign of a negative zero was invisible and the function could never return `-0.0` at all | Replaced with the IEEE-754 sign-bit splice `(x & ~signmask) ǀ (y & signmask)` |
+| `f64_fmod` | Used `f64_floor` on the quotient where IEEE-754 `fmod` truncates, so the result carried the sign of the **divisor** rather than the **dividend**: `fmod(-7, 3)` returned `+2` where C returns `-1` | `f64_trunc` |
+
 
 ## Known Non-Cryptographic Functions
 
@@ -76,6 +104,10 @@ BDF-5 coefficients (300/137, etc.) were recomputed exact and verified via IEEE 7
   project, not indexed in public CVE databases).
 
 ## Audit History
+
+- **2026-08-03**: P(-1) full sweep of the v2.6.11 tree — **70 findings confirmed / 7 refuted** (2 critical, 23 high, 23 medium, 22 low; 64 sites in 27 files). See [docs/audit/2026-08-03.md](../audit/2026-08-03.md). Headline was not a memory-safety issue but a **correctness** one: seven hand-encoded IEEE-754 constant tables did not encode their documented values, four of them published numerical-method tableaux falsified by their own mathematical invariants — DOPRI45 had 23 of 30 coefficients wrong and Σb = 0.636, so it was **not a consistent integrator at any order**. Root cause identified as coverage: 8 shipped modules were included by no test suite and held 35 of 65 source defects. Repaired across **2.6.12–2.6.15**; the constant class is now a CI gate (`scripts/check-constants.sh`).
+- **2026-08-04**: Re-audit of the repaired tree (v2.6.15) — see [docs/audit/2026-08-04.md](../audit/2026-08-04.md). **Regression verification CLEAN**: every 2.6.12–2.6.15 repair holds under execution, verified against mathematical invariants with the pre-fix files re-run as controls. 42 new findings confirmed / 8 refuted (4 high, 21 medium, 17 low; **no criticals**). Two corrections to the record, both process failures rather than code defects, and both recorded because the failure mode is what matters: (1) the 2026-08-03 audit was **not** fully discharged — six of the 70 findings were never scheduled, because repair work was driven from this roadmap's deduplicated P0–P4 *digest* rather than from the audit's **finding list**, and "all tiers closed" was then read as "all findings closed"; (2) `scripts/check-constants.sh` — the gate added to prevent the headline defect recurring — had a **25% blind spot**, its regex rejecting `_` digit separators so it skipped 35 of 145 declarations while printing a confident "110/110 verified". Fixing the gate immediately exposed a real mis-encoded constant. **A gate that reports its own coverage must have that coverage checked.**
+- **2026-08-04**: v2.7.0-A/B repair batches. Ten findings closed (the 6 carried over, the 3 high, 1 medium) plus one found while fixing. Security-relevant closures are tabled above under *Closed in v2.7.0*: an out-of-bounds read (`cmat_mul`), a null-dereference family that **SIGSEGVs** (`cmat_add`/`sub`/`adjoint`/`scale`/`trace`), a **non-terminating loop** on non-finite input (`cmat_exp`), an **O(n²) resource-exhaustion** path on attacker-chosen geometry (`_bvh_build_rec`), and a **false negative from a collision query** (`time_of_impact`). Every fix except the BVH one is **mutation-proven** — the source file was reverted and the new assertions confirmed to fail. The exception is labelled rather than glossed: both forms of `_bvh_build_rec` return the same tree, so the defect is a *cost* and is guarded by a benchmark instead. Suite 1127 → **1181**; all gates green.
 
 - **2026-04-15**: P(-1) audit — 31 issues found, 25 fixed. See [docs/audit/2026-04-15.md](../audit/2026-04-15.md).
 - **2026-05-29**: P(-1) hardening (v2.4.6) — security/CVE/supply-chain review closing the 2.4.x collision arc. No new vulnerability; 6 allocation-guard regression tests added; `mat_new` upstream item reconfirmed. See [docs/audit/2026-05-29.md](../audit/2026-05-29.md).

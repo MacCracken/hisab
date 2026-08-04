@@ -213,8 +213,11 @@ Forms use the **reduced strictly-increasing basis**: in 4D a 1-form is `[0,1,2,3
 ```
 
 Graded antisymmetry `α∧β = (−1)^{pq} β∧α`, nilpotence `α∧α = 0` (odd degree),
-repeated factor → 0. `hodge_star_2form_4d` dualises a 4D 2-form (Lorentzian /
-Euclidean via the sign flag). `wedge_2_1` / `wedge_3_1` / the Hodge star are 4D-specific.
+repeated factor → 0. `hodge_star_2form_4d` dualises a 4D 2-form under
+eta = diag(+1,-1,-1,-1); its `sign` argument is an overall multiplier on that
+Lorentzian dual (+1 standard, -1 for the opposite signature convention), NOT a
+Euclidean/Lorentzian selector — no value of it yields the Euclidean dual, whose
+sign pattern differs per component rather than globally. `wedge_2_1` / `wedge_3_1` / the Hodge star are 4D-specific.
 
 ### References
 

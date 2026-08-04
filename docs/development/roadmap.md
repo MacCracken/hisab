@@ -11,12 +11,12 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.14
+## Current -- v2.6.15
 
 - **34 math modules in `src/`, ~16,900 lines** (`lib/` is vendored-only)
-- **1093 test assertions** (foundation 307 + hisab 205 + edge_cases 199 + modules 382), 26 benchmarks (incl. amplified SIMD batches), fuzz harness (1/1), and `scripts/check-constants.sh` verifying **110/110** hand-encoded f64 constants against their own comments. `cyrius coverage` **335/587 (57%)**, files 32/35 — 6 of the 8 never-tested modules closed across 2.6.13/2.6.14
+- **1127 test assertions** (foundation 307 + hisab 205 + edge_cases 199 + modules 416), 28 benchmarks (incl. amplified SIMD batches), fuzz harness (1/1), and `scripts/check-constants.sh` verifying **110/110** hand-encoded f64 constants against their own comments. `cyrius coverage` **348/587 (59%)**, files 34/35 — **all 34 modules now covered by a suite**
 - **CLI smoke binary** ~207 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~17,159 lines / 571 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
+- **`dist/hisab.cyr` distlib bundle** ~17,286 lines / 578 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
 - Toolchain **6.5.6** (bumped from 6.4.69 in **2.6.11** — a **minor** jump across 24 releases: no executable library change, the bundle diff being the version header plus one `mat_new_guarded` doc comment; sakshi 2.4.6 → **2.4.7**). The headline effect is the vendored `ganita` reaching **1.0.4**: the repo's copy had been stale at **1.0.3** since before the 6.4.69 pin, so this bump closes the long-tracked CWE-190 in stdlib `mat_new` — measured, `mat_new(-5, 3)` **segfaulted** on 1.0.3 and returns null on 1.0.4. hisab's `mat_new_guarded` stays as the stricter 16M-element policy cap (upstream's ceiling is 33.5M). Also adopted this release: the 6.5.6 `sys_exit_group` epilogue idiom, and an **exit-code clamp** in all four test harnesses — the unclamped `assert_summary()` count meant exactly 256/512/768 failures exited 0 and scored PASS (proven, then fixed). `cyrius fuzz` now discovers `tests/*.fcyr` (6.5.6 walks `tests/`, not just `fuzz/`), so the harness runs for the first time — and passes. CI fmt/lint/vet/security all green; supply chain SHA-locked (`cyrius.lock` 30 deps, verify 30/30). Tracked-issue re-verify on the new pin (minimal repros): for-empty-clauses **still live**, interval-ident-lex **still live** (both worked around) — no new fixes
 - **Arc history** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security, fixed three real collision bugs), 2.5.x (CGA depth + matrix guard, CGA 1 → 29 assertions), and 2.6.x (differential-geometry depth — sectional curvature, Weyl, parallel transport, geodesic deviation, higher forms; 28 known-manifold assertions). Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 961 across them.
 - **The 2.6.x *feature* line is closed** — no residual feature work carried forward; the diffgeo
@@ -29,14 +29,15 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 
 ---
 
-## 2.6.12 -- Audit, hardening & repair sweep (P0 + P1 CLOSED — P3/P4 open)
+## 2.6.12 -- Audit, hardening & repair sweep (COMPLETE — all tiers closed)
 
-> **Status 2026-08-03.** **P0 and P1 are both fully closed** across three releases — 2.6.12
-> (constants, harness, `num_is_prime`, `solve_bicgstab`), 2.6.13 (SVD, eigensolver, SE(3),
-> einsum, intervals) and 2.6.14 (the memory-safety tier). Suite 961 → **1093**, every fix
-> mutation-proven; five of the defect groups crashed the process pre-fix. `cyrius coverage`
-> 50% → **57%**, files 25/35 → **32/35**; six of the eight never-tested modules are now in the
-> suites. **P3 and P4 remain open**, plus `num_ext` and `symbolic_ext`.
+> **Status 2026-08-03 — DISCHARGED.** All four tiers are closed across four releases: 2.6.12
+> (constants + harness, `num_is_prime`, `solve_bicgstab`), 2.6.13 (SVD, eigensolver, SE(3),
+> einsum, intervals), 2.6.14 (memory safety) and 2.6.15 (performance + docs). Suite 961 →
+> **1127**, every fix mutation-proven; five defect groups crashed the process pre-fix. **All 34
+> modules are now included by a test suite** — eight were not even compiled by `cyrius test`
+> before. `cyrius coverage` 50% → **59%**, files 25/35 → **34/35**. Next per doc-health
+> forward-commitment #4: a **re-audit** confirming the repairs, then 2.7.0.
 
 A full P(-1) sweep of the 2.6.11 tree: 8 parallel audit dimensions over all 34 modules, every
 finding then adversarially re-verified against the running code. **70 findings survived
@@ -132,9 +133,10 @@ correlation with the defect map is the finding: **35 of 65 source defects sit in
 functions** — are included by *no* test suite, so they are not even compiled by `cyrius test`,
 yet all eight ship in `dist/hisab.cyr` to 8 consumers.
 
-- [~] Bring the 8 never-included modules into the suites; then raise `cyrius coverage` past 80%.
-      **6 done**: `einsum`, `lie_ext`, `mat3`, `linalg_precision` (2.6.13) + `calc_ext`,
-      `noise_simplex` (2.6.14). Coverage 50% → **57%**. Remaining: `num_ext`, `symbolic_ext`
+- [x] **All 8 never-included modules are now in the suites** — `einsum`, `lie_ext`, `mat3`,
+      `linalg_precision` (2.6.13), `calc_ext`, `noise_simplex` (2.6.14), `num_ext`,
+      `symbolic_ext` (2.6.15). Coverage 50% → **59%**, files 34/35. The 80% target remains
+      open as ongoing work, not an audit item
 - [ ] Replace bounds-check assertions with **value** assertions where a broken method still passes:
       the only `ode_dopri45` test asserts `1 < y < 2` for a value whose exact answer is 1.10517,
       and the `gauss5` tests round to the nearest integer, hiding a 246 ppm error floor
@@ -150,30 +152,45 @@ yet all eight ship in `dist/hisab.cyr` to 8 consumers.
 - [ ] Pin the remaining CWE-190 guard (`num_sieve`'s 10M cap) that the 2026-05-29 audit claims is
       already pinned but is not
 
-### P3 -- Performance (each needs before/after numbers before any claim)
+### P3 -- Performance  **CLOSED in 2.6.15**
 
-- [ ] `halfedge_from_triangles` twin pairing is O(n_he²) — **3.07 s on an 8,192-triangle mesh**
-      (`collision_mesh.cyr:331`); a hash of vertex-pair keys makes it linear
-- [ ] `convex_hull_2d`'s insertion-sort pre-pass — **690 ms on 8,000 points** (`collision_core.cyr:339`)
-- [ ] Levenberg-Marquardt allocates 4 loop-invariant scratch buffers per iteration (5.35 MB of
-      unreclaimed bump scratch over 200 iterations) and computes the symmetric JᵀJ twice
-- [ ] L-BFGS allocates 3 n-length buffers per iteration
+Both hot paths were benchmarked BEFORE the rewrite; before/after rows are in `bench-history.csv`.
 
-### P4 -- Documentation drift (10 findings)
+| Benchmark | Before | After | Change |
+|---|---|---|---|
+| `halfedge_2k_tris` (2,048 tris) | **190.1 ms** | **1.2 ms** | −99.4% (~156x) |
+| `convex_hull_2d_2k` (2,000 pts) | **22.1 ms** | **2.1 ms** | −90.3% (~10x) |
 
-- [ ] `overview.md`'s module map credits BVH to `spatial.cyr` (all 12 `bvh_*` live in
-      `geo_advanced.cyr`) and lists `f64_le`/`f64_ge` in `f64_util.cyr`, which documents them as removed
-- [ ] `opt_conjugate_gradient` documented Fletcher-Reeves, implements Polak-Ribière+
-- [ ] `num_dst` documented DST-II, implements DST-I
-- [ ] `expr_eval` documents "aborts on undefined variable"; it warns and returns 0.0 — and a test
-      was skipped *because of* that false comment
-- [ ] `hodge_star_2form_4d` documents its `sign` parameter three mutually contradictory ways
-- [ ] `collision_core.cyr`'s header names a file that no longer exists
-- [x] README's Building block said 163 edge-case tests — synced to the real counts. **Shipped 2.6.12**
+- [x] `halfedge_from_triangles` twin pairing O(n_he^2) -> open-addressed hash of directed edges.
+      Structurally identical output verified (`twin(twin(i)) == i`, boundary count `4(W-1)`).
+      **Shipped 2.6.15**
+- [x] `convex_hull_2d`'s insertion-sort pre-pass -> heapsort (O(n log n), O(1) extra memory —
+      merge sort's scratch would leak per call under the bump allocator). Hull output
+      byte-identical at n = 50/500/2000/4000. **Shipped 2.6.15**
+- [x] Levenberg-Marquardt: 4 loop-invariant buffers hoisted; symmetric J^T J computed once and
+      mirrored (bit-identical). **Shipped 2.6.15**
+- [x] L-BFGS: 3 per-iteration buffers hoisted. **Shipped 2.6.15**
 
-> **Sequencing.** P0 first, each fix landing with the value-assertion that would have caught it.
-> P2's constant harness before closing P0, so the tableau re-derivations are verified mechanically.
-> P1 and P3 are independent and can batch. P3 claims need `./scripts/bench-history.sh` numbers.
+### P4 -- Documentation drift  **CLOSED in 2.6.15**
+
+- [x] `overview.md` credited BVH to `spatial.cyr` (all `bvh_*` are in `geo_advanced.cyr`), listed
+      `f64_le`/`f64_ge` under `f64_util.cyr` which documents them as removed, and named the bare
+      `ERR_*` constants namespaced in 2.6.8. **Shipped 2.6.15**
+- [x] `opt_conjugate_gradient` documented Fletcher-Reeves, implements Polak-Ribiere+. **2.6.15**
+- [x] `num_dst`/`num_idst` documented DST-II, implement DST-I (`num_dct` checked and genuinely
+      DCT-II, left alone). **Shipped 2.6.15**
+- [x] `expr_eval` documented "aborts"; it warns and returns 0.0 — and a test had been skipped
+      because of that. **Shipped 2.6.15**
+- [x] `hodge_star_2form_4d` documented its `sign` three contradictory ways; corrected here and in
+      `math.md`. **Shipped 2.6.15**
+- [x] `collision_core.cyr` header named a file deleted at the 2.2.2 split and advertised three
+      capabilities that live in `collision_mesh.cyr`. **Shipped 2.6.15**
+- [x] README Building block test counts. **Shipped 2.6.12**
+
+> **Sequencing (as executed).** P0 first, each fix landing with the value-assertion that would
+> have caught it, and P2's constant harness built before the tableau re-derivations so they were
+> verified mechanically. Then P1 (memory safety), then P3/P4. Every P3 claim is backed by
+> before/after rows in `bench-history.csv`, captured by benchmarking the hot paths *first*.
 
 ---
 
@@ -255,6 +272,7 @@ entry point, so nothing further is owed.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.15 | 2026-08-03 | 17,100 | 34 | **P3 + P4 closeout — the 2026-08-03 audit is fully discharged.** Both O(n^2) hot paths rewritten, benchmarked before and after (rows in `bench-history.csv`): `halfedge_from_triangles` twin pairing 190.1 ms -> **1.2 ms** (-99.4%) via an open-addressed hash of directed edges, and `convex_hull_2d`'s insertion-sort pre-pass 22.1 ms -> **2.1 ms** (-90.3%) via heapsort (chosen over merge sort because its scratch would leak per call under the bump allocator; the comparator is inlined because Cyrius has no closures). Both verified output-identical to the old code. Levenberg-Marquardt's 4 loop-invariant buffers hoisted and its symmetric J^T J computed once; L-BFGS's 3 per-iteration buffers hoisted. Six documentation drifts corrected (BVH mis-attributed to `spatial.cyr`, Fletcher-Reeves vs Polak-Ribiere+, DST-II vs DST-I, `expr_eval` "aborts", `hodge_star_2form_4d`'s three contradictory `sign` docs, `collision_core`'s header naming a deleted file). **`num_ext` + `symbolic_ext` brought in — all 34 modules are now covered by a suite**; coverage 57% -> **59%**, files 34/35. 1127 |
 | 2.6.14 | 2026-08-03 | 17,000 | 34 | **P1 closeout — the memory-safety tier.** Three of the four defect groups **crashed the process** pre-fix: reverting `complex.cyr`, `calc_ext.cyr` or `optimize.cyr` individually makes the suite exit 139. Capped constructors (`cmat_mul`, `cmat_kronecker`, `cmat_identity`, `cmat_inverse`) stored through `cmat_new`'s documented 0-on-failure return — reachable from operands *under* the cap, since `cmat_mul` of 1000×1 by 1×1000 asks for 1e6 and `cmat_inverse` doubles the width. `opt_bfgs`/`opt_lbfgs` sized `n×n` / `m×(2n+1)` buffers from an unbounded dimension (added `_OPT_MAX_DIM`, alloc checks, `HSB_ERR_ALLOC`). `calc_bspline`/`calc_nurbs` indexed control points **negatively** when `n_pts <= degree`. Adaptive Simpson bounded depth but not work (2^50 evaluations on a NaN integrand). `kdtree_build` recursed O(n) deep on coincident points — fine at 40k, **SIGSEGV at 60k**. `_opt_armijo` accepted NaN. `cx_div`/`cx_inv`/`cx_powf` used a 1e-6 cutoff instead of 1e-12 (squared vs unsquared tolerance). `FLOAT_RENDER_BUF` was 32 against a scratch reach of 45. Four fBm entry points returned NaN for `octaves <= 0`. **+`calc_ext`, `noise_simplex` into the suites**; coverage 54% → **57%**. 1093 |
 | 2.6.13 | 2026-08-03 | 16,900 | 34 | **P0 closeout** of the 2026-08-03 audit — every remaining critical/high correctness defect, all in modules with **zero test coverage**. `svd_golub_kahan` composed the left Householder reflectors forward, returning U **transposed** so `A != U·S·Vᵀ` (8 of 9 entries wrong); now accumulated backward. `eigen_qr` applied `Gᵀ T G` instead of `G T Gᵀ` — the transpose of the rotation that zeroes the bulge — so it **never converged for n ≥ 3** (NO_CONVERGENCE on a symmetric 3×3 at 100k iters) and paired wrong eigenvectors at n = 2. `su2_exp`/`su2_log` moved to half-angle, restoring `su2_to_rotation_matrix(su2_exp(ω)) == so3_exp(ω)` and fixing `se3_exp`, which had built R and t from angles a factor of 2 apart. `einsum` accepted only labels `a`–`h`, so **every example in its own header** was silently mis-parsed — it returned the trace (5, not 19) then segfaulted; alphabet widened to `a`–`z` with real validation. Three interval enclosure-soundness violations fixed (`ivl_sin` under-approximated across extrema, `ivl_sqrt` returned `[0,NaN]` which `ivl_contains` treated as universal, `ivl_div` missed `-0.0`). **4 of the 8 never-tested modules brought into the suites** (`einsum`, `lie_ext`, `mat3`, `linalg_precision`); coverage 50% → **54%**. 1063 |
 | 2.6.12 | 2026-08-03 | 16,600 | 34 | **Audit sweep — repair release.** Full P(-1) audit of all 34 modules found **70 verified defects (2 critical)**; see `audit/2026-08-03.md`. Closed the critical tier: **seven hand-encoded constant tables** did not encode their documented values — **47 constants re-derived** from exact rationals. DOPRI45 had 23 of 30 tableau constants wrong (Σb = 0.636, not 1) and was **not a consistent integrator at any order**; BDF-4 drifted 1%/step; Yoshida-4 moved a free particle 85.9% of the correct distance; Gauss-5 carried a 246 ppm error floor; plus sRGB breakpoints, spherical harmonics, `_SIMPLEX_G2`, the slerp threshold. Also fixed `num_is_prime` (i64 overflow reported real primes composite above 3.03e9) and `solve_bicgstab` (`f64_from` on a bit pattern made the tolerance 4.34e18 — it never iterated). Added **`scripts/check-constants.sh`**, a CI gate verifying all 110 hex f64 literals against their comments. Replaced the loose assertions that let it all ship (dopri45 asserted only `1 < y < 2`). 981 |

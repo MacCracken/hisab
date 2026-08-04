@@ -2,12 +2,92 @@
 
 ## [Unreleased]
 
-### Remaining from the 2.6.12 audit
-**P0 and P1 are now closed.** Outstanding: **P3** (the two O(n²) hot paths, plus the
-Levenberg-Marquardt / L-BFGS per-iteration allocations) and **P4** (10 documentation drifts),
-plus the two modules still included by no test suite: `num_ext`, `symbolic_ext`.
-See [`docs/development/roadmap.md`](docs/development/roadmap.md) §2.6.12 and
-[`docs/audit/2026-08-03.md`](docs/audit/2026-08-03.md).
+### The 2026-08-03 audit is fully discharged
+All four tiers (P0–P4) of [`docs/audit/2026-08-03.md`](docs/audit/2026-08-03.md) are closed
+across 2.6.12–2.6.15, and **all 34 modules are now included by a test suite** for the first time.
+Next natural step per `docs/doc-health.md` forward-commitment #4: a **re-audit** to confirm the
+repairs, then the 2.7.0 items.
+
+## [2.6.15] - 2026-08-03 — P3/P4 closeout: two O(n²) hot paths, doc drift, full module coverage
+
+Final repair release of the 2.6.12 audit. Closes the **performance** and **documentation** tiers
+and brings the last two never-tested modules into the suites — so every one of the 34 modules
+shipped in `dist/hisab.cyr` is now compiled and asserted by `cyrius test`. Suite 1093 → **1127**;
+`cyrius coverage` 57% → **59%**, files 32/35 → **34/35** (the 35th is `main.cyr`, the CLI smoke
+binary, which by design does not include the library).
+
+### Performance — measured, not asserted
+
+Both hot paths were benchmarked **before** the rewrite, per CLAUDE.md. Two new benchmarks were
+added to `tests/hisab.bcyr` first, and both the before and after rows are in `bench-history.csv`:
+
+| Benchmark | Before | After | Change |
+|---|---|---|---|
+| `halfedge_2k_tris` (2,048 triangles) | **190.1 ms** | **1.2 ms** | **−99.4%** (~156×) |
+| `convex_hull_2d_2k` (2,000 points) | **22.1 ms** | **2.1 ms** | **−90.3%** (~10×) |
+
+- **`halfedge_from_triangles` twin pairing was O(n_he²)** — the inner loop scanned every later
+  half-edge and never broke after a match, ~2.25·n_tris² iterations. A directed edge `(src → dst)`
+  has exactly one possible twin, `(dst → src)`, so an open-addressed hash of directed edges
+  replaces the scan with one lookup. Verified structurally identical to the old implementation:
+  `twin(twin(i)) == i` for every paired edge and a boundary count of exactly `4(W−1)` on a grid
+  mesh, with both implementations agreeing.
+- **`convex_hull_2d`'s pre-sort was an insertion sort** — the only super-linear step, since the
+  monotone chain itself is O(n), and uncapped because the public entry point bounds nothing.
+  Replaced with heapsort: O(n log n) worst case and O(1) extra memory. Heapsort rather than merge
+  sort deliberately — merge sort's n-slot scratch would be *leaked on every call* under the
+  never-freeing bump allocator. The comparison is inlined rather than passed as a comparator
+  because it must dereference a separate `points` vector and Cyrius has no closures; this is
+  exactly why stdlib `vec_sort_by` (element-value comparator via `fncall2`) does not fit here.
+  **Hull output is byte-identical** to the old sort at n = 50, 500, 2,000 and 4,000.
+- **Levenberg-Marquardt** allocated `jtj`, `rhs`, `lu` and `piv` inside its iteration loop
+  (5.35 MB of unreclaimed bump scratch over 200 iterations) while `j_buf` beside them was already
+  hoisted; all four are now hoisted, which is safe because each is fully overwritten at the top of
+  every iteration. It also computed the **symmetric** JᵀJ twice — the loop now runs the upper
+  triangle only and mirrors, which is bit-identical since the k-accumulation order is unchanged
+  and `f64_mul` is commutative. A 2-parameter line fit converges to the same `(a, b)` as before.
+- **L-BFGS** allocated three n-length buffers per iteration, all dead by the end of it; hoisted.
+
+No claim is made for LM/L-BFGS: they are memory reductions, and neither has a benchmark.
+
+### Fixed — documentation that contradicted the code
+- **`docs/architecture/overview.md`** credited **BVH to `spatial.cyr`**; all `bvh_*` functions are
+  in `geo_advanced.cyr` (`spatial.cyr` contains zero occurrences of "bvh"). Also listed
+  `f64_le`/`f64_ge` under `f64_util.cyr`, which explicitly documents them as *removed* in favour
+  of stdlib `math`; and its Design Principles still named the bare `ERR_*` constants, namespaced
+  to `HSB_ERR_*` back in 2.6.8.
+- **`opt_conjugate_gradient`** was documented as Fletcher-Reeves in two places; it implements
+  Polak-Ribière+ with a `max(0, β)` restart.
+- **`num_dst` / `num_idst`** were labelled DST **Type II**; the kernel is
+  `sin(π(i+1)(k+1)/(n+1))`, which is DST-**I** (FFTW RODFT00). Documentation only — the transform
+  is a correct DST-I and `num_idst` inverts it, now pinned by a round-trip test. (`num_dct` was
+  checked too and is genuinely DCT-II, so it was left alone.)
+- **`expr_eval`** documented "Aborts if a variable is not found"; it writes a warning to fd 2 and
+  returns 0.0. A test had been *skipped* on the strength of that false claim.
+- **`hodge_star_2form_4d`** described its `sign` parameter three mutually contradictory ways —
+  "+1 Euclidean, −1 Lorentzian", then "baked in; parameter kept for API consistency" (it is live),
+  then "1 for Lorentzian, −1 for Euclidean". It is an overall multiplier on the Lorentzian dual;
+  **no value of it produces a Euclidean dual**, whose sign pattern differs per component rather
+  than globally. Corrected here and in `docs/architecture/math.md`, which propagated the claim.
+- **`collision_core.cyr`**'s header named `collision.cyr`, a file that has not existed since the
+  2.2.2 split, and advertised Delaunay, half-edge mesh and island detection — all three of which
+  live in `collision_mesh.cyr`.
+
+### Changed — final two modules brought into the suites
+`num_ext` and `symbolic_ext` were the last of the eight modules included by no suite. `num_ext`
+now has DST-I round-trip, DCT-II, Möbius and tridiagonal-solve assertions; `symbolic_ext` has
+integration (differentiating the integral recovers the integrand), LaTeX rendering, and pattern
+matching. The `sym_match` tests initially failed because `sym_match` takes a **Pattern**
+(`PAT_*`, built with `pat_*`), not an `Expr` — passing an `Expr` silently returns 0. That is now
+asserted explicitly, including that `pat_any_const` matches a constant but not a variable.
+
+### Verified
+- Suite **1127/1127** (foundation 307 + hisab 205 + edge_cases 199 + modules 416), up from 1093.
+- **All 34 library modules included by a suite** — previously 8 were not compiled by `cyrius test`
+  at all. `cyrius coverage` 335/587 → **348/587 (59%)**; files 32/35 → **34/35**.
+- Benchmarks **28** (was 26); before/after rows for both hot paths in `bench-history.csv`.
+- `cyrius fuzz` 1/1; `check-constants.sh` 110/110; `lint` / `fmt --check` / `vet` clean;
+  `deps --verify` 30/30; `cyrius distlib` regenerated.
 
 ## [2.6.14] - 2026-08-03 — P1 closeout: memory safety and robustness
 

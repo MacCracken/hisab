@@ -6,8 +6,8 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-08-03 (v2.6.14) — see the fourth- and third-pass blocks below
-> for the audit-repair sequence. The v2.6.11 record follows.
+> **Last refresh**: 2026-08-03 (v2.6.15) — the 2026-08-03 audit is fully discharged; see
+> the fifth- through third-pass blocks below for the repair sequence. The v2.6.11 record follows.
 >
 > **v2.6.11**: Cyrius 6.4.69 → **6.5.6** toolchain bump (a
 > **minor** jump across 24 releases) + sakshi 2.4.6 → **2.4.7**. No executable library change —
@@ -32,6 +32,19 @@ type: state
 > `deps --verify` 30/30. Re-verified the 3 open tracked toolchain issues on 6.5.6: interval-ident-lex
 > **still live**, for-empty-clauses **still live**, cli-arg-clobber not re-tested (destructive).
 >
+> **Fifth pass (2026-08-03, v2.6.15) — THE AUDIT IS DISCHARGED.** P3 (performance) and P4
+> (documentation) closed, and the last two never-tested modules (`num_ext`, `symbolic_ext`)
+> brought in: **all 34 shipped modules are now included by a test suite**, where eight were not
+> even compiled by `cyrius test` when the audit opened. Both O(n^2) hot paths were benchmarked
+> BEFORE the rewrite and both rows are in `bench-history.csv`: halfedge twin pairing
+> 190.1 ms -> **1.2 ms**, convex-hull pre-sort 22.1 ms -> **2.1 ms**, each verified
+> output-identical to the old code. Six documentation drifts corrected across `overview.md`,
+> `math.md`, `optimize.cyr`, `num_ext.cyr`, `symbolic.cyr`, `diffgeo.cyr` and
+> `collision_core.cyr` — including a module map that credited BVH to the wrong file and a
+> `sign` parameter documented three contradictory ways. Suite 1093 -> **1127**; benchmarks
+> 26 -> **28**; coverage 57% -> **59%**, files 34/35. **Next: a re-audit** to confirm the
+> repairs (doc-health forward-commitment #4), then the 2.7.0 items.
+>
 > **Fourth pass (2026-08-03, v2.6.14):** audit **P1 — the memory-safety tier — is closed**.
 > Capped-constructor null propagation (`cmat_*`), solver dimension caps + `HSB_ERR_ALLOC`,
 > B-spline negative indexing, the adaptive-Simpson work bound, `kdtree_build`'s O(n) recursion on
@@ -43,7 +56,7 @@ type: state
 > 2.6.14 + Release-History row added. **Still open:** audit P3 (two O(n²) hot paths, LM/L-BFGS
 > per-iteration allocations) and P4 (10 doc drifts).
 >
-> > **Third pass (2026-08-03, v2.6.12 + v2.6.13 — the audit-repair pair):** P0 of the
+> **Third pass (2026-08-03, v2.6.12 + v2.6.13 — the audit-repair pair):** P0 of the
 > 2026-08-03 audit is **fully closed**. 2.6.12 re-derived 47 hand-encoded constants across seven
 > tables and added `scripts/check-constants.sh` as a CI gate (110/110); 2.6.13 fixed
 > `svd_golub_kahan` (U transposed), `eigen_qr` (never converged for n >= 3), the SU(2)/SE(3)
@@ -216,7 +229,7 @@ Periodic audit reports; per-audit timestamped. **Don't refresh in place — supe
 > dated-artifact rule, but read them with the 2026-08-03 correction in hand: neither reached the
 > never-included modules, so "solid" described the arc's new code, not the library.
 
-Next periodic security audit: per CLAUDE.md, before a major release or after significant surface change. Natural next boundary is the 3.0.0 (`Result<T,E>`) cut — but 2.6.12 must close the 2026-08-03 findings first.
+Next periodic security audit: **due now** — all 70 findings of `2026-08-03.md` were closed across 2.6.12–2.6.15, and forward-commitment #4 calls for a re-audit confirming the repairs (and re-running the sweep against a tree where, for the first time, every module is under test). After that, the 3.0.0 (`Result<T,E>`) cut is the next natural boundary.
 
 ---
 

@@ -328,31 +328,75 @@ fn halfedge_from_triangles(triangles, n_tris, n_verts) {
 
     # Assign twins: for each half-edge (src->dst), find (dst->src)
     # O(n^2) scan -- acceptable for moderate meshes
+    # ---- Twin pairing via an open-addressed hash of directed edges ----
+    #
+    # This was an O(n_he^2) double loop that scanned every later half-edge and
+    # never broke after a match, giving ~2.25*n_tris^2 inner iterations. Measured
+    # on a 33x33 grid (2048 triangles): 184 ms. A directed edge (src -> dst) has
+    # exactly one possible twin, (dst -> src), so one hash lookup replaces the
+    # scan and the pass becomes O(n_he) expected.
+    #
+    # The table is open-addressed with linear probing at <= 50% load, sized to a
+    # power of two so the mask is a single AND. Slots hold (src, dst, index) and
+    # an empty slot is marked by src == _COL_SENTINEL. Keys are compared exactly,
+    # so a hash collision costs a probe, never a wrong pairing.
+    var _he_cap = 1;
+    while (_he_cap < n_he * 2) { _he_cap = _he_cap * 2; }
+    var _he_mask = _he_cap - 1;
+    var _he_src = alloc(_he_cap * 8);
+    var _he_dst = alloc(_he_cap * 8);
+    var _he_idx = alloc(_he_cap * 8);
+    for (var s = 0; s < _he_cap; s = s + 1) {
+        store64(_he_src + s * 8, _COL_SENTINEL);
+    }
+
+    # Pass 1: index every half-edge by its (src, dst) pair.
     for (var i = 0; i < n_he; i = i + 1) {
         var he_i = vec_get(half_edges, i);
-        if (HalfEdge_twin(he_i) == _COL_SENTINEL) {
-            var dst_i = HalfEdge_vertex(he_i);
-            # Find src of he_i: src is triangles[face*3 + local_k]
-            var face_i = HalfEdge_face(he_i);
-            var local_i = i - face_i * 3;
-            var src_i = vec_get(triangles, face_i * 3 + local_i);
+        var dst_i = HalfEdge_vertex(he_i);
+        var face_i = HalfEdge_face(he_i);
+        var src_i = vec_get(triangles, face_i * 3 + (i - face_i * 3));
+        # Multiplicative mix of the two endpoints. Masking with a power-of-two
+        # mask keeps the slot in range regardless of multiplication overflow.
+        var h = (src_i * 73856093) ^ (dst_i * 19349663);
+        var slot = h & _he_mask;
+        while (load64(_he_src + slot * 8) != _COL_SENTINEL) {
+            slot = (slot + 1) & _he_mask;
+        }
+        store64(_he_src + slot * 8, src_i);
+        store64(_he_dst + slot * 8, dst_i);
+        store64(_he_idx + slot * 8, i);
+    }
 
-            for (var j = i + 1; j < n_he; j = j + 1) {
-                var he_j = vec_get(half_edges, j);
-                if (HalfEdge_twin(he_j) == _COL_SENTINEL) {
-                    var dst_j = HalfEdge_vertex(he_j);
-                    var face_j = HalfEdge_face(he_j);
-                    var local_j = j - face_j * 3;
-                    var src_j = vec_get(triangles, face_j * 3 + local_j);
+    # Pass 2: for each unpaired half-edge, look up the reverse edge directly.
+    for (var i2 = 0; i2 < n_he; i2 = i2 + 1) {
+        var he_a = vec_get(half_edges, i2);
+        if (HalfEdge_twin(he_a) == _COL_SENTINEL) {
+            var dst_a = HalfEdge_vertex(he_a);
+            var face_a = HalfEdge_face(he_a);
+            var src_a = vec_get(triangles, face_a * 3 + (i2 - face_a * 3));
 
-                    # Check if (src_i->dst_i) matches (dst_j->src_j)
-                    if (src_i == dst_j) {
-                        if (dst_i == src_j) {
-                            # Found twin pair
-                            # Update twin fields in the heap structs
-                            store64(he_i + 24, j);
-                            store64(he_j + 24, i);
+            # The twin of (src_a -> dst_a) is (dst_a -> src_a).
+            var h2 = (dst_a * 73856093) ^ (src_a * 19349663);
+            var slot2 = h2 & _he_mask;
+            var probing = 1;
+            while (probing == 1) {
+                var cur = load64(_he_src + slot2 * 8);
+                if (cur == _COL_SENTINEL) {
+                    probing = 0;               # boundary edge, no twin
+                } else {
+                    if (cur == dst_a && load64(_he_dst + slot2 * 8) == src_a) {
+                        var j = load64(_he_idx + slot2 * 8);
+                        if (j != i2) {
+                            var he_b = vec_get(half_edges, j);
+                            if (HalfEdge_twin(he_b) == _COL_SENTINEL) {
+                                store64(he_a + 24, j);
+                                store64(he_b + 24, i2);
+                            }
                         }
+                        probing = 0;
+                    } else {
+                        slot2 = (slot2 + 1) & _he_mask;
                     }
                 }
             }

@@ -3,7 +3,7 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v2.6.14 — 34 math modules in `src/`, ~16,900 lines of Cyrius (`lib/` is
+> hisab v2.6.15 — 34 math modules in `src/`, ~16,900 lines of Cyrius (`lib/` is
 > vendored stdlib + first-party deps only). Compiled by cycc 6.5.6.
 
 ## Module Map
@@ -11,8 +11,8 @@
 ```
 hisab (Cyrius)
 ├── Foundation types
-│   ├── error.cyr          — Error codes (ERR_*), epsilon constants
-│   ├── f64_util.cyr       — f64_tan/fmod/copysign/approx_eq, f64_le/f64_ge (non-strict cmp)
+│   ├── error.cyr          — Error codes (HSB_ERR_*), epsilon constants
+│   ├── f64_util.cyr       — f64_tan/fmod/copysign/approx_eq (f64_le/f64_ge come from stdlib `math`)
 │   ├── vec2.cyr           — HVec2: 2D f64 vector (heap-allocated)
 │   ├── vec3.cyr           — HVec3: 3D f64 vector with cross, reflect, min/max (SIMD f64v)
 │   ├── vec4.cyr           — HVec4: 4D f64 vector, Vec3 conversion (SIMD f64v)
@@ -26,8 +26,8 @@ hisab (Cyrius)
 │
 ├── Geometry
 │   ├── geo.cyr            — 9 primitives, 6 ray tests, closest-point queries
-│   ├── geo_advanced.cyr   — GJK/EPA 3D, SDF+CSG, swept AABB, TOI, CGA 5D
-│   └── spatial.cyr        — BVH, k-d tree, octree, quadtree, spatial hash
+│   ├── geo_advanced.cyr   — GJK/EPA 3D, SDF+CSG, swept AABB, TOI, CGA 5D, BVH
+│   └── spatial.cyr        — k-d tree, octree, quadtree, spatial hash (BVH lives in geo_advanced)
 │
 ├── Collision
 │   ├── collision_core.cyr — MPR/XenoCollide narrowphase, sequential-impulse solver,
@@ -82,9 +82,9 @@ hisab (Cyrius)
 - **Pure math** — no I/O in library code
 - **f64 everywhere** — all math is IEEE 754 double precision (1e-12 tolerance)
 - **Heap-allocated types** — multi-field structs via `alloc()` + `#derive(accessors)`
-- **Error codes** — functions return `ERR_NONE` (0) on success, negative `ERR_*` on failure
+- **Error codes** — functions return `HSB_ERR_NONE` (0) on success, negative `HSB_ERR_*` on failure (namespaced from bare `ERR_*` in 2.6.8 to avoid consumer collisions)
 - **Out-parameters** — results written via `store64(out, value)` pointers
-- **No abort** — library code never calls `syscall(60, ...)` (warnings only)
+- **No abort** — library code never calls `syscall(60, ...)` / `sys_exit_group` (warnings only)
 - **Overflow guards** — allocation sizes checked against caps for user-controlled dimensions
 - **Function pointers** — callbacks via `fncall1`/`fncall2` from fnptr.cyr
 

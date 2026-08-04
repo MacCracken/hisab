@@ -4,7 +4,7 @@
 #
 # Provides:
 #   opt_gradient_descent      -- steepest descent with fixed learning rate
-#   opt_conjugate_gradient    -- Fletcher-Reeves conjugate gradient
+#   opt_conjugate_gradient    -- Polak-Ribiere+ conjugate gradient (with max(0,.) restart)
 #   opt_bfgs                  -- BFGS quasi-Newton with Armijo line search
 #   opt_lbfgs                 -- limited-memory BFGS (two-loop recursion)
 #   opt_levenberg_marquardt   -- nonlinear least squares (damped Gauss-Newton)
@@ -173,7 +173,9 @@ fn opt_gradient_descent(f, grad, x0, n, lr, tol, max_iter, out_x, out_fmin) {
 # 2. CONJUGATE GRADIENT (Polak-Ribiere+)
 # ================================================================
 
-# Fletcher-Reeves conjugate gradient minimization of f: R^n -> R.
+# Polak-Ribiere+ conjugate gradient minimization of f: R^n -> R.
+# (The beta update below is Polak-Ribiere with a max(0, beta) restart, NOT
+# Fletcher-Reeves; both doc lines said Fletcher-Reeves through 2.6.14.)
 # f:        function pointer, fncall1(f, x_ptr) -> f64 value
 # grad:     function pointer, fncall2(grad, x_ptr, out_grad) -> writes gradient
 # x0:       initial point (flat array of n f64s)
@@ -448,7 +450,16 @@ fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
     var hist = alloc(m * slot_size);
     var alpha_buf = alloc(m * 8);
 
-    if (x == 0 || g == 0 || q == 0 || x_new == 0 || hist == 0 || alpha_buf == 0) {
+    # Loop-invariant scratch, hoisted. These three were allocated on EVERY
+    # iteration through 2.6.14 and were dead by the end of it — g_new_buf is
+    # copied into g, and s_k/y_k are copied into the history ring. Under the
+    # never-freeing bump allocator that is 3*n*8 bytes leaked per iteration.
+    var g_new_buf = alloc(n * 8);
+    var s_k = alloc(n * 8);
+    var y_k = alloc(n * 8);
+
+    if (x == 0 || g == 0 || q == 0 || x_new == 0 || hist == 0 || alpha_buf == 0 ||
+    g_new_buf == 0 || s_k == 0 || y_k == 0) {
         return HSB_ERR_ALLOC;
     }
 
@@ -569,13 +580,10 @@ fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
         var f_old = fncall1(f, x);
         _opt_armijo(f, x, q, g, n, f_old, x_new);
 
-        # Compute new gradient
-        var g_new_buf = alloc(n * 8);
+        # Compute new gradient (g_new_buf is hoisted)
         fncall2(grad, x_new, g_new_buf);
 
-        # Store correction pair in ring buffer
-        var s_k = alloc(n * 8);
-        var y_k = alloc(n * 8);
+        # Store correction pair in ring buffer (s_k / y_k are hoisted)
         vi = 0;
         while (vi < n) {
             store64(s_k + vi * 8, f64_sub(load64(x_new + vi * 8), load64(x + vi * 8)));
@@ -633,6 +641,23 @@ fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals, tol, 
     var delta   = alloc(np * 8);
     var j_buf   = alloc(nr * np * 8);  # Jacobian buffer (row-major: nr rows x np cols)
 
+    # Loop-invariant scratch, hoisted out of the iteration loop. These four were
+    # allocated per iteration through 2.6.14 while `j_buf` above was already
+    # hoisted — the audit measured 5.35 MB of unreclaimed bump scratch over 200
+    # iterations. Every one is fully overwritten at the top of each iteration
+    # (jtj by the JtJ fill, rhs by the negation loop, lu/piv by mat_lu), so
+    # reusing them is safe; in particular the `+lambda` added to jtj's diagonal
+    # cannot accumulate because the fill rewrites every element first.
+    var jtj = mat_new(np, np);
+    var lu  = mat_new(np, np);
+    var rhs = alloc(np * 8);
+    var piv = alloc(np * 8);
+
+    if (x == 0 || x_trial == 0 || jtr == 0 || delta == 0 || j_buf == 0 ||
+    jtj == 0 || lu == 0 || rhs == 0 || piv == 0) {
+        return HSB_ERR_ALLOC;
+    }
+
     _opt_copy(x, x0, np);
 
     # Evaluate initial residuals and cost
@@ -655,10 +680,7 @@ fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals, tol, 
         # Evaluate Jacobian
         fncall2(jacobian, x, j_buf);
 
-        # Compute J^T * J (np x np) and J^T * r (np x 1)
-        # Use mat_new for JtJ to leverage mat_lu_solve
-        var jtj = mat_new(np, np);
-
+        # Compute J^T * J (np x np) and J^T * r (np x 1) into the hoisted jtj.
         var pi = 0;
         while (pi < np) {
             # jtr[pi] = sum_k J[k][pi] * r[k]
@@ -672,8 +694,13 @@ fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals, tol, 
             }
             store64(jtr + pi * 8, sum_r);
 
-            # jtj[pi][pj] = sum_k J[k][pi] * J[k][pj]
-            var pj = 0;
+            # jtj[pi][pj] = sum_k J[k][pi] * J[k][pj].
+            # J^T J is symmetric by construction, so only the upper triangle is
+            # accumulated and the transpose is mirrored. Through 2.6.14 the loop
+            # started at pj = 0 and recomputed every off-diagonal dot product
+            # twice. The mirrored value is bit-identical, not merely equal: the
+            # k-accumulation order is the same and f64_mul is commutative.
+            var pj = pi;
             while (pj < np) {
                 var sum_jj = _OPT_F64_ZERO;
                 kk = 0;
@@ -684,6 +711,7 @@ fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals, tol, 
                     kk = kk + 1;
                 }
                 mat_set(jtj, pi, pj, sum_jj);
+                if (pj != pi) { mat_set(jtj, pj, pi, sum_jj); }
                 pj = pj + 1;
             }
             pi = pi + 1;
@@ -698,17 +726,14 @@ fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals, tol, 
             pi = pi + 1;
         }
 
-        # Negate jtr for RHS: b = -J^T r
-        var rhs = alloc(np * 8);
+        # Negate jtr for RHS: b = -J^T r  (rhs is hoisted)
         pi = 0;
         while (pi < np) {
             store64(rhs + pi * 8, f64_neg(load64(jtr + pi * 8)));
             pi = pi + 1;
         }
 
-        # Solve via LU decomposition
-        var lu  = mat_new(np, np);
-        var piv = alloc(np * 8);
+        # Solve via LU decomposition (lu / piv are hoisted)
         var sign = mat_lu(jtj, lu, piv);
 
         if (sign == 0) {

@@ -372,6 +372,32 @@ checked structurally on **every node**, not just through behaviour. Suite 1523 �
 a *performance* patch preserved results, built a brute-force oracle — and the shipped code failed it.
 The perf patch that prompted this was **not applied** (see 2.7.0-I); the defect it exposed was.
 
+#### Investigated — `_col_in_circumcircle` sign loss: confirmed, and the claim narrowed (2.7.0-J)
+
+The 2.7.0-I review reported the shipped in-circle predicate as wrong on "near-coincident clusters".
+Checked against exact rational arithmetic (`fractions.Fraction`, every operand converted exactly
+from its f64 bit pattern):
+
+| Configuration | Disagreements with exact |
+|---|---|
+| Uniformly small clusters, scale 1e-11 … 1e-6, plus unit-scale controls | **0 of 30** |
+| **Mixed magnitude** — one vertex at 1e3 … 1e7 with two near-coincident vertices at 1e-10 … 1e-7 | **3 of 40** |
+
+**Near-coincidence is not the trigger.** The predicate translates every point to the query point
+first, which is the well-conditioned formulation, and it handles a uniformly small cluster
+correctly. What breaks it is the *magnitude spread*: `a_sq` for the far vertex is ~1e14 while the
+terms it is differenced against are ~1e-14, so the determinant is a difference across ~28 orders of
+magnitude and every significant bit is lost.
+
+That configuration is not exotic here — `delaunay_2d` begins from a super-triangle placed far
+outside the data, so **every early insertion is a mixed-magnitude test**.
+
+**Not fixed.** The remedy is an adaptive exact predicate (Shewchuk's `incircle`: floating-point
+determinant with a forward error bound, exact expansion only when |det| falls below it). Rescaling
+cannot help — the spread is inherent to the super-triangle construction. Filed with its repro at
+`docs/development/issues/2026-08-04-incircle-precision.md` rather than attempted here, because a
+half-done robust predicate is worse than a documented sharp edge.
+
 #### Performance — `solve_bicgstab` leaked a work vector per iteration (2.7.0-I)
 
 `s` was allocated **inside** the iteration loop. `alloc()` is a bump allocator that never frees, so

@@ -246,11 +246,14 @@ wrong. They outrank the perf work that exposed them.
       side of an ancestor's plane.** Also removed a positional clamp whose justifying comment
       ("can ONLY degenerate when lo == hi") is false in floating point. Now asserted structurally
       on every node *and* against brute force *(2.7.0-J)*
-- [ ] 🔴 **`_col_in_circumcircle` is less accurate than a straightforward circumcentre test.** All
-      23,741 retirements flagged by the candidate sweep predicate were re-checked in **exact
-      rational arithmetic**: 0 were geometrically unsound — the divergences came from the shipped
-      in-circle determinant being wrong on near-coincident clusters. Delaunay output on such inputs
-      is therefore already suspect, independent of any optimisation
+- [ ] 🔴 **`_col_in_circumcircle` loses the sign on mixed-magnitude inputs.** CONFIRMED against
+      exact rational arithmetic, and the original claim **narrowed**: uniformly small
+      near-coincident clusters are fine (**0 of 30**); the trigger is a *magnitude spread* — one
+      super-triangle-scale vertex with a near-coincident cluster gives **3 of 40** wrong signs.
+      `delaunay_2d` starts from a super-triangle, so **every early insertion is such a test**.
+      Remedy is an adaptive exact predicate (Shewchuk); rescaling cannot help, the spread is
+      inherent to the construction. Spec + repro filed at
+      `../development/issues/2026-08-04-incircle-precision.md`
 
 ### Found by the disposition sweep — **the same failure mode, again**
 Assigning a disposition to every one of the 41 numbered findings (rather than reasoning from the

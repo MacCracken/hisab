@@ -2,11 +2,92 @@
 
 ## [Unreleased]
 
-### Remaining from the 2.6.12 audit (P0 not yet fixed)
-`svd_golub_kahan` returns U transposed; `eigen_qr` never converges for n ≥ 3; the SU(2)/SE(3)
-half-vs-full-angle convention split; `einsum` label validation; `ivl_sin`'s invalid enclosure.
-Plus all of P1–P4. See [`docs/development/roadmap.md`](docs/development/roadmap.md) §2.6.12 and
+### Remaining from the 2.6.12 audit
+**P0 is now closed.** Outstanding: all of P1 (null-return dereferences, `calc_bspline` negative
+index, `kdtree_build` depth, adaptive-Simpson work bound, `FLOAT_RENDER_BUF`, `cx_div` epsilon),
+P3 (the two O(n²) hot paths) and P4 (docs drift), plus the four modules still included by no test
+suite: `calc_ext`, `noise_simplex`, `num_ext`, `symbolic_ext`.
+See [`docs/development/roadmap.md`](docs/development/roadmap.md) §2.6.12 and
 [`docs/audit/2026-08-03.md`](docs/audit/2026-08-03.md).
+
+## [2.6.13] - 2026-08-03 — P0 closeout: SVD, eigensolver, SE(3) and interval soundness
+
+Second repair release of the 2.6.12 audit. Closes the **remaining five P0 findings**, every one
+of them in a module that had **zero test coverage** — which is precisely why they shipped. Four
+of the eight never-tested modules are now in the suites (`einsum`, `lie_ext`, `mat3`,
+`linalg_precision`), `cyrius coverage` moves 50% → **54%**, and the suite grows 981 → **1063**.
+
+No API or signature changes; consumers rebuild only. But every consumer of `svd_golub_kahan`,
+`eigen_qr`, `se3_exp`/`se3_log`, `su2_exp`/`su2_log`, `einsum`, `ivl_sin`, `ivl_sqrt` or
+`ivl_div` was getting wrong answers — in three cases with no error signalled at all.
+
+### Fixed — `svd_golub_kahan` returned U transposed, so `A != U·S·Vᵀ`
+`_lp_bidiagonalize` accumulated the left Householder reflectors in **forward** order, building
+`H_{n-1}···H_0` where the decomposition needs `U = H_0···H_{n-1}`. Rewritten to store the
+reflectors and accumulate **backward** after the sweep. `S` and `Vᵀ` were always correct — `Vᵀ`
+is literally `G_{n-1}···G_0`, so forward order happens to be right there, which is exactly why
+the error was one-sided and invisible. Verified by reconstructing `U·S·Vᵀ` entrywise: pre-fix,
+**8 of 9 entries wrong** on both a symmetric and a non-symmetric 3×3.
+
+### Fixed — `eigen_qr` never converged for n ≥ 3
+`_lp_tridiag_qr` applied the similarity `Gᵀ·T·G` where `G = [[cs, sn], [-sn, cs]]` is the
+rotation that *zeroes* the bulge (`G·[x;z] = [r;0]`). The matching similarity is `G·T·Gᵀ`; only
+the signs of the cross terms differ, which is why it read as correct. The off-diagonal therefore
+never decayed: measured, a plain symmetric 3×3 returned `HSB_ERR_NO_CONVERGENCE` **even at
+max_iter = 100000**, and at n = 2 it paired each eigenvalue with the wrong eigenvector. The `Q`
+accumulation (`Q ← Q·Gᵀ`) was already the correct companion to the *fixed* update and needed no
+change — the two were inconsistent, not `Q` alone. A dead first attempt at the update, whose
+stores were immediately overwritten, was removed. Now converges and matches reference
+eigenvalues to 1e-8, with `A·v = λ·v` asserted for every returned pair at n = 2, 3 and 4.
+
+### Fixed — SU(2)/SE(3) half-vs-full-angle convention split
+`su2_exp` returned `cos(|ω|) + sin(|ω|)/|ω| · ω`, the generator convention denoting a rotation by
+**2|ω|**, while `so3_exp`, `su2_from_axis_angle` and `su2_to_rotation_matrix` all use half-angle.
+`se3_exp` built its translation block `V` from `theta = |ω|` but took `R` from `su2_exp`, so `R`
+and `t` came from angles a factor of two apart — the resulting `(R, t)` was **not the exponential
+of any twist**. `su2_exp` and `su2_log` moved to half-angle, restoring the double-cover identity
+`su2_to_rotation_matrix(su2_exp(ω)) == so3_exp(ω)`, which is now asserted entrywise along with
+`su2_log ∘ su2_exp = id` and the `se3_log ∘ se3_exp` round-trip.
+
+### Fixed — `einsum` silently mis-computed its own documented examples
+`_einsum_is_label` accepted only `a`–`h`, so `i`/`j`/`k` — used in **every** example in
+`einsum.cyr`'s own header — were rejected; and the parser **skipped** unrecognised characters
+rather than erroring. `einsum("ij,jk->ik", …)` therefore parsed to zero labels and returned the
+*trace* (5, not 19) before **segfaulting**. Alphabet widened to `a`–`z`, and the parser now
+rejects: unknown characters, specs longer than `_EINSUM_MAX_RANK`, and any notation rank that
+disagrees with the tensor's actual `HTensor_rank` (the out-of-bounds shape read). `tensor_new`'s
+documented 0-on-failure return is now checked at both sites. Spaces are tolerated.
+
+### Fixed — three interval enclosure-soundness violations
+The one contract an interval type must never break is that the result **contains** the true range.
+- `ivl_sin` returned `[min(sin a, sin b), max(sin a, sin b)]` for any width ≤ π, which
+  **under-approximates** whenever the interval straddles an extremum without an endpoint at it:
+  `ivl_sin([1.4, 1.8])` excluded 1.0 although sin peaks at π/2 inside. Extrema are now located
+  exactly (`ceil(k_lo) <= floor(k_hi)` on `π/2 + kπ`), which is both sound *and* tighter than the
+  old `width > π → [-1,1]` shortcut: `[0.1, 3.3]` contains a maximum but no minimum and now
+  yields `[sin(3.3), 1]` instead of all of `[-1, 1]`.
+- `ivl_sqrt` clamped only the lower bound, so a wholly-negative interval produced `[0, NaN]` —
+  and since `ivl_new` cannot order around NaN, `ivl_contains` then reported that interval as
+  containing **everything**. Both ends are now clamped.
+- `ivl_div`'s zero guard used a raw integer `== 0` on an f64 bit pattern, matching only `+0.0`;
+  `-0.0` (`0x8000000000000000`) slipped through and divided by zero. Now uses `f64_le`/`f64_ge`.
+
+### Changed — four more modules brought into the suites
+`einsum`, `lie_ext`, `mat3` and `linalg_precision` had **no test suite including them** — they
+were not even compiled by `cyrius test` — while all four shipped in `dist/hisab.cyr`. Each now
+has coverage asserting its defining identities. Remaining untested: `calc_ext`, `noise_simplex`,
+`num_ext`, `symbolic_ext`.
+
+### Verified
+- Suite **1063/1063** (foundation 307 + hisab 200 + edge_cases 187 + modules 369), up from 981.
+  Every fix is mutation-proven against the pre-fix source: reverting `linalg_precision.cyr` fails
+  10, `lie.cyr` fails 24, `interval.cyr` fails 6, `einsum.cyr` fails 2 **and then segfaults**.
+- `cyrius coverage` 297/587 → **320/587 (54%)**; files referenced 25/35 → **29/35**.
+- `cyrius fuzz` 1/1; `check-constants.sh` 110/110; `lint` / `fmt --check` / `vet` clean;
+  `deps --verify` 30/30; `cyrius distlib` regenerated (16,897 → 17,021 lines).
+- **No performance claim.** No benchmarked path changed; `_lp_bidiagonalize` now allocates an
+  `m*n` scratch buffer for the reflectors, which is a memory cost, not a speed one, and SVD has
+  no benchmark to measure against.
 
 ## [2.6.12] - 2026-08-03 — Audit sweep: seven mis-transcribed constant tables repaired
 

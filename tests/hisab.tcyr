@@ -17,12 +17,17 @@ include "src/ode.cyr"
 include "src/optimize.cyr"
 include "src/linalg_ext.cyr"
 include "src/complex.cyr"
+include "src/linalg_precision.cyr"
 include "src/lie.cyr"
 include "src/diffgeo.cyr"
 include "src/symbolic.cyr"
 include "src/autodiff.cyr"
 include "src/interval.cyr"
 include "src/tensor.cyr"
+
+# ~1e-8 — for iterative / decomposition results where exact bit equality is not
+# achievable but 8 significant digits is.
+var LOOSE_TOL_H = 0x3E45798EE2308C3A;
 
 alloc_init();
 
@@ -537,6 +542,105 @@ assert(f64_lt(f64_abs(f64_sub(load64(_bicg_x), F64_ONE)), _bicg_eps) == 1, "bicg
 assert(f64_lt(f64_abs(f64_sub(load64(_bicg_x + 8), F64_TWO)), _bicg_eps) == 1, "bicgstab x[1] == 2");
 assert(f64_lt(f64_abs(f64_sub(load64(_bicg_x + 16), f64_from(3))), _bicg_eps) == 1,
 "bicgstab x[2] == 3");
+
+# ================================================================
+# linalg_precision — first coverage (module shipped untested through 2.6.12)
+# ================================================================
+# Both headline routines were broken and neither had a single assertion:
+#   svd_golub_kahan composed the left Householder reflectors in FORWARD order,
+#     yielding U transposed, so A != U*S*Vt (S and Vt were correct).
+#   eigen_qr applied the similarity G^T T G instead of G T G^T — the transpose of
+#     the rotation that zeroes the bulge — so it NEVER converged for n >= 3
+#     (measured: HSB_ERR_NO_CONVERGENCE on a plain symmetric 3x3 at 100k iters)
+#     and paired the wrong eigenvector with each eigenvalue at n = 2.
+# These assert the defining identities, so neither failure mode can return.
+
+fn _lp_check_svd(A, m, n, U, S, Vt, label) {
+    var bad = 0;
+    var i = 0;
+    while (i < m) {
+        var j = 0;
+        while (j < n) {
+            var acc = f64_from(0);
+            var k = 0;
+            while (k < n) {
+                acc = f64_add(acc, f64_mul(f64_mul(mat_get(U, i, k), load64(S + k * 8)),
+                mat_get(Vt, k, j)));
+                k = k + 1;
+            }
+            if (f64_approx_eq(acc, mat_get(A, i, j), LOOSE_TOL_H) == 0) { bad = bad + 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    assert_eq(bad, 0, label);
+    return 0;
+}
+
+fn _lp_check_eig(A, n, vals, V, label) {
+    var bad = 0;
+    var c = 0;
+    while (c < n) {
+        var lam = load64(vals + c * 8);
+        var i = 0;
+        while (i < n) {
+            var av = f64_from(0);
+            var k = 0;
+            while (k < n) {
+                av = f64_add(av, f64_mul(mat_get(A, i, k), mat_get(V, k, c)));
+                k = k + 1;
+            }
+            if (f64_approx_eq(av, f64_mul(lam, mat_get(V, i, c)), LOOSE_TOL_H) == 0) {
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        c = c + 1;
+    }
+    assert_eq(bad, 0, label);
+    return 0;
+}
+
+test_group("linalg_precision: svd_golub_kahan A == U*S*Vt");
+var lps_A = mat_new(3, 3);
+mat_set(lps_A, 0, 0, F64_ONE);      mat_set(lps_A, 0, 1, F64_TWO);      mat_set(lps_A, 0, 2, f64_from(3));
+mat_set(lps_A, 1, 0, f64_from(4));  mat_set(lps_A, 1, 1, f64_from(5));  mat_set(lps_A, 1, 2, f64_from(6));
+mat_set(lps_A, 2, 0, f64_from(7));  mat_set(lps_A, 2, 1, f64_from(8));  mat_set(lps_A, 2, 2, f64_from(10));
+var lps_U = mat_new(3, 3);
+var lps_Vt = mat_new(3, 3);
+var lps_S = alloc(24);
+assert_eq(svd_golub_kahan(lps_A, lps_U, lps_S, lps_Vt), HSB_ERR_NONE, "svd returns HSB_ERR_NONE");
+_lp_check_svd(lps_A, 3, 3, lps_U, lps_S, lps_Vt, "svd: A == U*S*Vt (non-symmetric 3x3)");
+assert(f64_ge(load64(lps_S), load64(lps_S + 8)) == 1, "svd: S sorted descending (0>=1)");
+assert(f64_ge(load64(lps_S + 8), load64(lps_S + 16)) == 1, "svd: S sorted descending (1>=2)");
+assert(f64_ge(load64(lps_S + 16), 0) == 1, "svd: singular values non-negative");
+
+test_group("linalg_precision: eigen_qr A*v == lambda*v");
+var lpe_A2 = mat_new(2, 2);
+mat_set(lpe_A2, 0, 0, F64_TWO); mat_set(lpe_A2, 0, 1, F64_ONE);
+mat_set(lpe_A2, 1, 0, F64_ONE); mat_set(lpe_A2, 1, 1, F64_TWO);
+var lpe_v2 = alloc(16);
+var lpe_V2 = mat_new(2, 2);
+assert_eq(eigen_qr(lpe_A2, 2, 1000, lpe_v2, lpe_V2), HSB_ERR_NONE, "eigen_qr 2x2 converges");
+assert(f64_approx_eq(load64(lpe_v2), f64_from(3), LOOSE_TOL_H) == 1, "eigen_qr 2x2 lambda0=3");
+assert(f64_approx_eq(load64(lpe_v2 + 8), F64_ONE, LOOSE_TOL_H) == 1, "eigen_qr 2x2 lambda1=1");
+_lp_check_eig(lpe_A2, 2, lpe_v2, lpe_V2, "eigen_qr 2x2: A*v == lambda*v (pairing)");
+
+var lpe_A3 = mat_new(3, 3);
+mat_set(lpe_A3, 0, 0, f64_from(4)); mat_set(lpe_A3, 0, 1, F64_ONE);     mat_set(lpe_A3, 0, 2, 0);
+mat_set(lpe_A3, 1, 0, F64_ONE);     mat_set(lpe_A3, 1, 1, f64_from(3)); mat_set(lpe_A3, 1, 2, F64_ONE);
+mat_set(lpe_A3, 2, 0, 0);           mat_set(lpe_A3, 2, 1, F64_ONE);     mat_set(lpe_A3, 2, 2, F64_TWO);
+var lpe_v3 = alloc(24);
+var lpe_V3 = mat_new(3, 3);
+assert_eq(eigen_qr(lpe_A3, 3, 10000, lpe_v3, lpe_V3), HSB_ERR_NONE,
+"eigen_qr 3x3 CONVERGES (was NO_CONVERGENCE at any iteration count)");
+# 2 + 2*cos(pi/4) = 4.732050807568877, 3, 2 - 2*cos(pi/4) = 1.2679491924311228
+assert(f64_approx_eq(load64(lpe_v3), 0x4012ED9EBA16132A, LOOSE_TOL_H) == 1,
+"eigen_qr 3x3 lambda0 = 4.732050807568877");
+assert(f64_approx_eq(load64(lpe_v3 + 8), f64_from(3), LOOSE_TOL_H) == 1, "eigen_qr 3x3 lambda1 = 3");
+assert(f64_approx_eq(load64(lpe_v3 + 16), 0x3FF4498517A7B356, LOOSE_TOL_H) == 1,
+"eigen_qr 3x3 lambda2 = 1.2679491924311228");
+_lp_check_eig(lpe_A3, 3, lpe_v3, lpe_V3, "eigen_qr 3x3: A*v == lambda*v");
 
 # Inertia sphere: I = (2/5)*m*r^2 on diagonal
 var isph = inertia_sphere(f64_from(10), F64_ONE);

@@ -11,12 +11,12 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.12
+## Current -- v2.6.13
 
 - **34 math modules in `src/`, ~16,900 lines** (`lib/` is vendored-only)
-- **981 test assertions** (foundation 307 + hisab 186 + edge_cases 173 + modules 315), 26 benchmarks (incl. amplified SIMD batches), fuzz harness (1/1), and `scripts/check-constants.sh` verifying **110/110** hand-encoded f64 constants against their own comments
+- **1063 test assertions** (foundation 307 + hisab 200 + edge_cases 187 + modules 369), 26 benchmarks (incl. amplified SIMD batches), fuzz harness (1/1), and `scripts/check-constants.sh` verifying **110/110** hand-encoded f64 constants against their own comments. `cyrius coverage` **320/587 (54%)**, files 29/35 — 4 of the 8 never-tested modules closed in 2.6.13
 - **CLI smoke binary** ~207 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~16,897 lines / 554 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
+- **`dist/hisab.cyr` distlib bundle** ~17,021 lines / 560 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
 - Toolchain **6.5.6** (bumped from 6.4.69 in **2.6.11** — a **minor** jump across 24 releases: no executable library change, the bundle diff being the version header plus one `mat_new_guarded` doc comment; sakshi 2.4.6 → **2.4.7**). The headline effect is the vendored `ganita` reaching **1.0.4**: the repo's copy had been stale at **1.0.3** since before the 6.4.69 pin, so this bump closes the long-tracked CWE-190 in stdlib `mat_new` — measured, `mat_new(-5, 3)` **segfaulted** on 1.0.3 and returns null on 1.0.4. hisab's `mat_new_guarded` stays as the stricter 16M-element policy cap (upstream's ceiling is 33.5M). Also adopted this release: the 6.5.6 `sys_exit_group` epilogue idiom, and an **exit-code clamp** in all four test harnesses — the unclamped `assert_summary()` count meant exactly 256/512/768 failures exited 0 and scored PASS (proven, then fixed). `cyrius fuzz` now discovers `tests/*.fcyr` (6.5.6 walks `tests/`, not just `fuzz/`), so the harness runs for the first time — and passes. CI fmt/lint/vet/security all green; supply chain SHA-locked (`cyrius.lock` 30 deps, verify 30/30). Tracked-issue re-verify on the new pin (minimal repros): for-empty-clauses **still live**, interval-ident-lex **still live** (both worked around) — no new fixes
 - **Arc history** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security, fixed three real collision bugs), 2.5.x (CGA depth + matrix guard, CGA 1 → 29 assertions), and 2.6.x (differential-geometry depth — sectional curvature, Weyl, parallel transport, geodesic deviation, higher forms; 28 known-manifold assertions). Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 961 across them.
 - **The 2.6.x *feature* line is closed** — no residual feature work carried forward; the diffgeo
@@ -29,12 +29,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 
 ---
 
-## 2.6.12 -- Audit, hardening & repair sweep (PARTIAL — constants + harness shipped)
+## 2.6.12 -- Audit, hardening & repair sweep (P0 CLOSED — P1/P3/P4 open)
 
-> **Status 2026-08-03.** The systemic constant defect is closed and guarded; `num_is_prime` and
-> `solve_bicgstab` are fixed. **Five P0 items and all of P1–P4 remain open** — see the unchecked
-> boxes below. Suite 961 → **981**, all mutation-proven. Next up, in order: `svd_golub_kahan`,
-> `eigen_qr`, the SU(2)/SE(3) convention split, `einsum` validation, `ivl_sin`.
+> **Status 2026-08-03.** **P0 is fully closed** across 2.6.12 (constants, harness,
+> `num_is_prime`, `solve_bicgstab`) and 2.6.13 (SVD, eigensolver, SE(3), einsum, intervals).
+> Suite 961 → **1063**, every fix mutation-proven. `cyrius coverage` 50% → **54%**; four of the
+> eight never-tested modules are now in the suites. **P1, P3 and P4 remain open**, plus the four
+> modules still untested: `calc_ext`, `noise_simplex`, `num_ext`, `symbolic_ext`.
 
 A full P(-1) sweep of the 2.6.11 tree: 8 parallel audit dimensions over all 34 modules, every
 finding then adversarially re-verified against the running code. **70 findings survived
@@ -73,21 +74,23 @@ sRGB breakpoints (0.03275 vs the spec's 0.04045) and spherical-harmonic normalis
 - [x] **`solve_bicgstab` was a no-op** (`linalg_ext.cyr`) — `f64_from(0x3C32725DD1D243AC)`
       *converted* a bit pattern instead of reinterpreting it, making the breakdown tolerance
       4.34e18 so the solver returned the initial guess verbatim. **Shipped 2.6.12**
-- [ ] **`svd_golub_kahan` returns U transposed** (`linalg_precision.cyr:180`) — `A != U·S·Vᵀ`;
-      S and Vᵀ are correct, only the left-reflector composition order is reversed
-- [ ] **`eigen_qr` never converges for n ≥ 3** (`linalg_precision.cyr:851-859`) — the Givens
-      similarity is applied transposed relative to the rotation that zeroes the bulge; at n = 2 it
-      pairs each eigenvalue with the wrong eigenvector
-- [ ] **SU(2)/SE(3) angle-convention split** (`lie.cyr:139`, `lie_ext.cyr:371`) — `su2_exp`/`se3_exp`
-      use a full-angle convention while `so3_exp`, `su2_from_axis_angle` and every SE(3) consumer
-      assume half-angle, so `se3_exp` yields an (R, t) pair that is not the exponential of any twist
-- [ ] **`einsum` silently returns wrong answers for its own documented examples** (`einsum.cyr:5,65`)
-      — labels are accepted only in `a`..`h`, so the `i,j,k` used in the module's header examples are
-      *silently dropped* rather than rejected; plus an out-of-bounds shape read when an operand has
-      more than `_EINSUM_MAX_RANK` labels
-- [ ] **`ivl_sin` violates the interval contract** (`interval.cyr:135`) — returns an enclosure
-      *narrower* than the true range when the input straddles an extremum. An interval library that
-      under-approximates is worse than none; abaco consumes this
+- [x] **`svd_golub_kahan` returned U transposed** — left reflectors were composed forward,
+      building `H_{n-1}···H_0` instead of `U = H_0···H_{n-1}`, so `A != U·S·Vᵀ` (8 of 9 entries
+      wrong). Now accumulated backward. **Shipped 2.6.13**
+- [x] **`eigen_qr` never converged for n ≥ 3** — applied `Gᵀ T G` where `G` is the rotation that
+      zeroes the bulge, so the off-diagonal never decayed (NO_CONVERGENCE on a symmetric 3×3 even
+      at 100k iters) and n = 2 paired the wrong eigenvector. Now `G T Gᵀ`; the Q accumulation was
+      already correct for the fixed update. **Shipped 2.6.13**
+- [x] **SU(2)/SE(3) angle-convention split** — `su2_exp`/`su2_log` moved to half-angle, so
+      `su2_to_rotation_matrix(su2_exp(ω)) == so3_exp(ω)` holds and `se3_exp` no longer builds R
+      and t from angles a factor of 2 apart. **Shipped 2.6.13**
+- [x] **`einsum` silently mis-computed its own documented examples** — alphabet widened `a-h` →
+      `a-z`, unknown characters/over-long specs/rank mismatches now rejected, `tensor_new` null
+      checked. It returned the trace (5, not 19) and then segfaulted. **Shipped 2.6.13**
+- [x] **Interval enclosure soundness** — `ivl_sin` under-approximated when straddling an extremum
+      (now locates extrema exactly, and is *tighter* than the old width>π shortcut); `ivl_sqrt`
+      returned `[0, NaN]` for wholly-negative input, which `ivl_contains` reported as containing
+      everything; `ivl_div`'s raw-integer zero guard missed `-0.0`. **Shipped 2.6.13**
 
 ### P1 -- Memory safety & robustness
 
@@ -118,7 +121,9 @@ correlation with the defect map is the finding: **35 of 65 source defects sit in
 functions** — are included by *no* test suite, so they are not even compiled by `cyrius test`,
 yet all eight ship in `dist/hisab.cyr` to 8 consumers.
 
-- [ ] Bring the 8 never-included modules into the suites; then raise `cyrius coverage` past 80%
+- [~] Bring the 8 never-included modules into the suites; then raise `cyrius coverage` past 80%.
+      **4 done in 2.6.13** (`einsum`, `lie_ext`, `mat3`, `linalg_precision`); coverage 50% → 54%.
+      Remaining: `calc_ext`, `noise_simplex`, `num_ext`, `symbolic_ext`
 - [ ] Replace bounds-check assertions with **value** assertions where a broken method still passes:
       the only `ode_dopri45` test asserts `1 < y < 2` for a value whose exact answer is 1.10517,
       and the `gauss5` tests round to the nearest integer, hiding a 246 ppm error floor
@@ -239,6 +244,7 @@ entry point, so nothing further is owed.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.13 | 2026-08-03 | 16,900 | 34 | **P0 closeout** of the 2026-08-03 audit — every remaining critical/high correctness defect, all in modules with **zero test coverage**. `svd_golub_kahan` composed the left Householder reflectors forward, returning U **transposed** so `A != U·S·Vᵀ` (8 of 9 entries wrong); now accumulated backward. `eigen_qr` applied `Gᵀ T G` instead of `G T Gᵀ` — the transpose of the rotation that zeroes the bulge — so it **never converged for n ≥ 3** (NO_CONVERGENCE on a symmetric 3×3 at 100k iters) and paired wrong eigenvectors at n = 2. `su2_exp`/`su2_log` moved to half-angle, restoring `su2_to_rotation_matrix(su2_exp(ω)) == so3_exp(ω)` and fixing `se3_exp`, which had built R and t from angles a factor of 2 apart. `einsum` accepted only labels `a`–`h`, so **every example in its own header** was silently mis-parsed — it returned the trace (5, not 19) then segfaulted; alphabet widened to `a`–`z` with real validation. Three interval enclosure-soundness violations fixed (`ivl_sin` under-approximated across extrema, `ivl_sqrt` returned `[0,NaN]` which `ivl_contains` treated as universal, `ivl_div` missed `-0.0`). **4 of the 8 never-tested modules brought into the suites** (`einsum`, `lie_ext`, `mat3`, `linalg_precision`); coverage 50% → **54%**. 1063 |
 | 2.6.12 | 2026-08-03 | 16,600 | 34 | **Audit sweep — repair release.** Full P(-1) audit of all 34 modules found **70 verified defects (2 critical)**; see `audit/2026-08-03.md`. Closed the critical tier: **seven hand-encoded constant tables** did not encode their documented values — **47 constants re-derived** from exact rationals. DOPRI45 had 23 of 30 tableau constants wrong (Σb = 0.636, not 1) and was **not a consistent integrator at any order**; BDF-4 drifted 1%/step; Yoshida-4 moved a free particle 85.9% of the correct distance; Gauss-5 carried a 246 ppm error floor; plus sRGB breakpoints, spherical harmonics, `_SIMPLEX_G2`, the slerp threshold. Also fixed `num_is_prime` (i64 overflow reported real primes composite above 3.03e9) and `solve_bicgstab` (`f64_from` on a bit pattern made the tolerance 4.34e18 — it never iterated). Added **`scripts/check-constants.sh`**, a CI gate verifying all 110 hex f64 literals against their comments. Replaced the loose assertions that let it all ship (dopri45 asserted only `1 < y < 2`). 981 |
 | 2.6.11 | 2026-08-03 | 16,600 | 34 | Toolchain 6.4.69 → **6.5.6** (a **minor** jump across 24 releases) + sakshi 2.4.6 → **2.4.7**. No executable library change — the bundle diff is the version header plus one `mat_new_guarded` doc comment, zero code lines. **Security:** the vendored `lib/ganita.cyr` was stale at **1.0.3** (the 6.4.69 pin already shipped 1.0.4); re-vendoring closes the tracked CWE-190 in stdlib `mat_new` — `mat_new(-5, 3)` **segfaulted** on 1.0.3, returns null on 1.0.4 (measured, same compiler, only ganita swapped). **Fixed:** all four `.tcyr` harnesses exited with `assert_summary()`'s raw failure count, so exactly 256/512/768 failures truncated to 0 and scored PASS — now clamped. Adopted the 6.5.6 `sys_exit_group` epilogue. `cyrius fuzz` now discovers `tests/*.fcyr` (1 passed — previously never run). Smoke string 2.6.10 → 2.6.11. Tracked issues re-verified still-live (interval-ident-lex, for-empty-clauses). +4 assertions pinning the upstream `mat_new` contract. 961 |
 | 2.6.10 | 2026-07-21 | 16,600 | 34 | Toolchain 6.4.66 → **6.4.69** (clean 3-patch bump; sakshi unchanged at 2.4.6, already latest). No library source change — bundle byte-identical bar the header. Vendored stdlib picks up three upstream fixes: `fmt` hex-high-bit + `fmt_float_buf` non-finite guard (linked by `symbolic`; byte-identical for finite values), `math` float-parse DoS hardening, agnos-only `sys_reboot` widening. Smoke string 2.6.9 → 2.6.10. Tracked issues re-verified still-live (interval-ident-lex, for-empty-clauses); no new fixes. 957 |

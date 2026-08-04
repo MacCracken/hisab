@@ -8,6 +8,7 @@ include "src/vec2.cyr"
 include "src/vec3.cyr"
 include "src/vec4.cyr"
 include "src/quat.cyr"
+include "src/mat3.cyr"
 include "src/mat4.cyr"
 include "src/transforms.cyr"
 include "src/color.cyr"
@@ -17,17 +18,23 @@ include "src/calc.cyr"
 include "src/num.cyr"
 include "src/complex.cyr"
 include "src/lie.cyr"
+include "src/lie_ext.cyr"
 include "src/diffgeo.cyr"
 include "src/symbolic.cyr"
 include "src/autodiff.cyr"
 include "src/interval.cyr"
 include "src/tensor.cyr"
+include "src/einsum.cyr"
 include "src/spatial.cyr"
 include "src/collision_core.cyr"
 include "src/collision_mesh.cyr"
 
 # All helper functions must be defined before alloc_init() to avoid
 # compiler pass ordering issues with the permutation table init in Perlin noise.
+# ~1e-8 — for assertions on transcendental / iterative results where exact
+# bit equality is not achievable but 8 significant digits is.
+var LOOSE_TOL_M = 0x3E45798EE2308C3A;
+
 fn _tc_x2(x) { return f64_mul(x, x); }
 fn _tc_sin(x) { return f64_sin(x); }
 fn _tc_cos(x) { return f64_cos(x); }
@@ -1554,6 +1561,139 @@ vec_push(ic_vec, ic1);
 vec_push(ic_vec, ic2);
 var islands = detect_islands(ic_vec, 2, 4);
 assert_eq(vec_len(islands), 2, "detect_islands: 2 disjoint contact pairs → 2 islands");
+
+# ================================================================
+# einsum — first coverage (the module shipped untested through 2.6.12)
+# ================================================================
+# `_einsum_is_label` accepted only 'a'..'h', so every example in einsum.cyr's OWN
+# header ("ij,jk->ik", "ii->", "ij->ji", "i,j->ij") used labels the parser
+# rejected — and it SKIPPED them silently rather than erroring, so matmul returned
+# the trace (5, not 19) and then SEGFAULTED. Alphabet widened to a-z and every
+# malformed spec is now an explicit 0-return.
+test_group("einsum: documented notations");
+
+fn _es_mk2(r2, c2, v0, v1, v2, v3) {
+    var sh = alloc(16);
+    store64(sh, r2);
+    store64(sh + 8, c2);
+    var t = tensor_new(2, sh);
+    var d = HTensor_data(t);
+    store64(d, v0);
+    store64(d + 8, v1);
+    store64(d + 16, v2);
+    store64(d + 24, v3);
+    return t;
+}
+
+# A = [[1,2],[3,4]], B = [[5,6],[7,8]] -> A*B = [[19,22],[43,50]]
+var es_A = _es_mk2(2, 2, f64_from(1), f64_from(2), f64_from(3), f64_from(4));
+var es_B = _es_mk2(2, 2, f64_from(5), f64_from(6), f64_from(7), f64_from(8));
+var es_two = alloc(16);
+store64(es_two, es_A);
+store64(es_two + 8, es_B);
+var es_one = alloc(8);
+store64(es_one, es_A);
+
+var es_mm = einsum(str_from("ij,jk->ik"), es_two, 2);
+assert_neq(es_mm, 0, "einsum: matmul returns a tensor");
+assert_eq(f64_to(tensor_get2(es_mm, 0, 0)), 19, "einsum matmul [0][0]=19");
+assert_eq(f64_to(tensor_get2(es_mm, 0, 1)), 22, "einsum matmul [0][1]=22");
+assert_eq(f64_to(tensor_get2(es_mm, 1, 0)), 43, "einsum matmul [1][0]=43");
+assert_eq(f64_to(tensor_get2(es_mm, 1, 1)), 50, "einsum matmul [1][1]=50");
+
+var es_tr = einsum(str_from("ii->"), es_one, 1);
+assert_neq(es_tr, 0, "einsum: trace returns a tensor");
+assert_eq(f64_to(load64(HTensor_data(es_tr))), 5, "einsum trace(A)=5");
+
+var es_tp = einsum(str_from("ij->ji"), es_one, 1);
+assert_neq(es_tp, 0, "einsum: transpose returns a tensor");
+assert_eq(f64_to(tensor_get2(es_tp, 0, 1)), 3, "einsum transpose [0][1]=3");
+assert_eq(f64_to(tensor_get2(es_tp, 1, 0)), 2, "einsum transpose [1][0]=2");
+
+test_group("mat3 — first coverage (module shipped untested through 2.6.12)");
+var m3i = m3_identity();
+assert_eq(f64_to(m3_determinant(m3i)), 1, "m3_determinant(I)=1");
+assert_eq(f64_to(m3_trace(m3i)), 3, "m3_trace(I)=3");
+var m3p = m3_mul(m3i, m3i);
+assert_eq(f64_to(m3_get(m3p, 0, 0)), 1, "m3_mul(I,I)[0][0]=1");
+assert_eq(f64_to(m3_get(m3p, 1, 0)), 0, "m3_mul(I,I)[1][0]=0");
+# M * M^-1 = I for a non-symmetric invertible matrix
+var m3a = m3_new();
+m3_set(m3a, 0, 0, f64_from(2)); m3_set(m3a, 0, 1, F64_ONE);   m3_set(m3a, 0, 2, 0);
+m3_set(m3a, 1, 0, F64_ONE);     m3_set(m3a, 1, 1, f64_from(3)); m3_set(m3a, 1, 2, F64_ONE);
+m3_set(m3a, 2, 0, 0);           m3_set(m3a, 2, 1, F64_ONE);   m3_set(m3a, 2, 2, F64_TWO);
+var m3inv = m3_inverse(m3a);
+assert_neq(m3inv, 0, "m3_inverse returns non-null");
+var m3ii = m3_mul(m3a, m3inv);
+assert(f64_approx_eq(m3_get(m3ii, 0, 0), F64_ONE, LOOSE_TOL_M), "m3 inv round-trip [0][0]=1");
+assert(f64_approx_eq(m3_get(m3ii, 1, 1), F64_ONE, LOOSE_TOL_M), "m3 inv round-trip [1][1]=1");
+assert(f64_approx_eq(m3_get(m3ii, 0, 1), 0, LOOSE_TOL_M), "m3 inv round-trip [0][1]=0");
+# transpose is an involution; det(M^T) == det(M)
+assert(f64_approx_eq(m3_determinant(m3_transpose(m3a)), m3_determinant(m3a), LOOSE_TOL_M),
+"m3 det(M^T)==det(M)");
+# from_quat(identity) is the identity rotation
+assert(f64_approx_eq(m3_trace(m3_from_quat(hquat_identity())), f64_from(3), LOOSE_TOL_M),
+"m3_from_quat(identity) trace=3");
+
+test_group("Lie: SU(2)->SO(3) double cover (half-angle convention)");
+# su2_exp used a FULL-angle convention through 2.6.12 while so3_exp,
+# su2_from_axis_angle and su2_to_rotation_matrix all use half-angle, so these two
+# rotations differed by a factor of 2 — and se3_exp built R and t from angles a
+# factor of 2 apart, producing a pair that was not the exponential of any twist.
+var lw = hvec3_new(f64_div(F64_ONE, f64_from(3)), f64_div(F64_ONE, F64_TWO),
+f64_div(F64_ONE, f64_from(5)));
+var lR_su2 = su2_to_rotation_matrix(su2_exp(lw));
+var lR_so3 = so3_exp(lw);
+var lei = 0;
+while (lei < 9) {
+    assert(f64_approx_eq(load64(lR_su2 + lei * 8), load64(lR_so3 + lei * 8), LOOSE_TOL_M),
+    "su2_to_rotation_matrix(su2_exp(w)) == so3_exp(w)");
+    lei = lei + 1;
+}
+# exp must agree with the axis-angle constructor
+var lax = hvec3_new(0, 0, F64_ONE);
+assert(f64_approx_eq(_su2_w(su2_exp(hvec3_scale(lax, F64_PI_2))),
+_su2_w(su2_from_axis_angle(lax, F64_PI_2)), LOOSE_TOL_M),
+"su2_exp == su2_from_axis_angle (w)");
+# log inverts exp
+var llg = su2_log(su2_exp(lw));
+assert(f64_approx_eq(HVec3_x(llg), HVec3_x(lw), LOOSE_TOL_M), "su2_log(su2_exp(w)).x == w.x");
+assert(f64_approx_eq(HVec3_y(llg), HVec3_y(lw), LOOSE_TOL_M), "su2_log(su2_exp(w)).y == w.y");
+assert(f64_approx_eq(HVec3_z(llg), HVec3_z(lw), LOOSE_TOL_M), "su2_log(su2_exp(w)).z == w.z");
+
+test_group("lie_ext: SE(3) — first coverage (module shipped untested through 2.6.12)");
+var ltw = alloc(48);
+store64(ltw, HVec3_x(lw));
+store64(ltw + 8, HVec3_y(lw));
+store64(ltw + 16, HVec3_z(lw));
+store64(ltw + 24, F64_ONE);
+store64(ltw + 32, F64_TWO);
+store64(ltw + 40, f64_from(3));
+var lse = se3_exp(ltw);
+assert_neq(lse, 0, "se3_exp returns non-null");
+# se3_log must invert se3_exp on all six twist components
+var ltw2 = se3_log(lse);
+lei = 0;
+while (lei < 6) {
+    assert(f64_approx_eq(load64(ltw2 + lei * 8), load64(ltw + lei * 8), LOOSE_TOL_M),
+    "se3_log(se3_exp(twist)) round-trips");
+    lei = lei + 1;
+}
+# and its rotation block must be the SAME rotation so3_exp gives for that omega
+var lR_se3 = su2_to_rotation_matrix(_se3_rot(lse));
+lei = 0;
+while (lei < 9) {
+    assert(f64_approx_eq(load64(lR_se3 + lei * 8), load64(lR_so3 + lei * 8), LOOSE_TOL_M),
+    "se3_exp rotation block == so3_exp(omega)");
+    lei = lei + 1;
+}
+
+test_group("einsum: malformed notation must error, not mis-compute");
+assert_eq(einsum(str_from("i9,jk->ik"), es_two, 2), 0, "einsum: digit in spec -> 0");
+assert_eq(einsum(str_from("IJ,JK->IK"), es_two, 2), 0, "einsum: uppercase -> 0");
+assert_eq(einsum(str_from("ijklm,jk->ik"), es_two, 2), 0, "einsum: rank > MAX_RANK -> 0");
+assert_eq(einsum(str_from("ijk,jk->ik"), es_two, 2), 0, "einsum: rank != tensor rank -> 0");
+assert_eq(einsum(str_from("ij,jk"), es_two, 2), 0, "einsum: missing -> separator -> 0");
 
 # ================================================================
 var r = assert_summary();

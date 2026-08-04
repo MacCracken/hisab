@@ -6,7 +6,10 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-08-03 (v2.6.11) — Cyrius 6.4.69 → **6.5.6** toolchain bump (a
+> **Last refresh**: 2026-08-03 (v2.6.13) — see the third-pass block below for the
+> audit-repair pair. The v2.6.11 record follows.
+>
+> **v2.6.11**: Cyrius 6.4.69 → **6.5.6** toolchain bump (a
 > **minor** jump across 24 releases) + sakshi 2.4.6 → **2.4.7**. No executable library change —
 > the `dist/hisab.cyr` diff is the version header plus one `mat_new_guarded` doc comment, zero
 > code lines (16,878 → 16,885). Synced the pin/version across README /
@@ -28,6 +31,18 @@ type: state
 > assertions pinning the upstream `mat_new` contract, mutation-proven). `cyrius.lock` 30 deps,
 > `deps --verify` 30/30. Re-verified the 3 open tracked toolchain issues on 6.5.6: interval-ident-lex
 > **still live**, for-empty-clauses **still live**, cli-arg-clobber not re-tested (destructive).
+>
+> **Third pass (2026-08-03, v2.6.12 + v2.6.13 — the audit-repair pair):** P0 of the
+> 2026-08-03 audit is **fully closed**. 2.6.12 re-derived 47 hand-encoded constants across seven
+> tables and added `scripts/check-constants.sh` as a CI gate (110/110); 2.6.13 fixed
+> `svd_golub_kahan` (U transposed), `eigen_qr` (never converged for n >= 3), the SU(2)/SE(3)
+> half-vs-full-angle split, `einsum` (mis-parsed its own documented examples, then segfaulted)
+> and three interval enclosure-soundness violations. Suite **961 -> 1063**, every fix
+> mutation-proven; `cyrius coverage` 50% -> **54%**; 4 of the 8 never-tested modules brought into
+> the suites (`einsum`, `lie_ext`, `mat3`, `linalg_precision`). Synced version/counts across
+> README / CLAUDE / testing / overview / roadmap / cyrius.cyml, added CHANGELOG 2.6.12 + 2.6.13
+> and both Release-History rows. **Still open:** audit P1/P3/P4, and `calc_ext`, `noise_simplex`,
+> `num_ext`, `symbolic_ext` remain included by no suite.
 >
 > **Same-day second pass (2026-08-03, post-2.6.11):** full P(-1) audit sweep of the released tree
 > → `audit/2026-08-03.md` (**70 verified findings, 2 critical**), and a roadmap restructure that
@@ -169,7 +184,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `testing.md` | 2026-08-03 | ✅ Fresh | v2.6.11: suite counts → 307/175/312/**167** (**961** total, edge_cases +4 for the upstream `mat_new` contract); fuzz recipe now leads with `cyrius fuzz` (6.5.6 walks `tests/`; before that it looked only in `fuzz/`, found nothing, and still exited 0). (Prior v2.4.6 sweep: 901 total, **26** benchmarks, +collision/invariant coverage.) |
+| `testing.md` | 2026-08-03 | ✅ Fresh | v2.6.13: suite counts → 307/200/369/**187** (**1063** total). (v2.6.11: 307/175/312/167 (**961** total, edge_cases +4 for the upstream `mat_new` contract); fuzz recipe now leads with `cyrius fuzz` (6.5.6 walks `tests/`; before that it looked only in `fuzz/`, found nothing, and still exited 0). (Prior v2.4.6 sweep: 901 total, **26** benchmarks, +collision/invariant coverage.) |
 | `usage.md` | — | ⚪ Not yet earned | "When earned" patterns/examples guide (CLAUDE.md). README Quick Start covers basics today; promote if onboarding needs more. |
 
 ---

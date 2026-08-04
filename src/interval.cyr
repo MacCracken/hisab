@@ -76,13 +76,17 @@ fn ivl_mul(a, b) {
 #must_use
 fn ivl_div(a, b) {
     var bl = Interval_lo(b); var bh = Interval_hi(b);
-    # Division by interval containing zero -> widen to [-inf, inf]
-    if (f64_lt(bl, 0) == 1 || bl == 0) {
-        if (f64_gt(bh, 0) == 1 || bh == 0) {
-            # Contains zero -- return huge interval
-            var big = f64_from(1000000000);
-            return ivl_new(f64_neg(big), big);
-        }
+    # Division by an interval containing zero -> widen.
+    #
+    # The zero test must go through f64_le/f64_ge, NOT a raw integer `== 0`.
+    # Through 2.6.12 this read `bl == 0`, which compares the f64 BIT PATTERN
+    # against integer zero and therefore matches only +0.0 — negative zero is
+    # 0x8000000000000000, non-zero as an integer, so an interval whose endpoint
+    # was -0.0 slipped past the guard and divided by zero.
+    if (f64_le(bl, 0) == 1 && f64_ge(bh, 0) == 1) {
+        # Contains zero -- return huge interval
+        var big = f64_from(1000000000);
+        return ivl_new(f64_neg(big), big);
     }
     return ivl_mul(a, ivl_new(f64_div(F64_ONE, bh), f64_div(F64_ONE, bl)));
 }
@@ -102,11 +106,22 @@ fn ivl_abs(iv) {
     return ivl_new(f64_min(al, ah), f64_max(al, ah));
 }
 
+# Enclosure of sqrt over the interval, restricted to the non-negative part.
+#
+# The upper bound must be clamped too, not just the lower one. Through 2.6.12 only
+# `lo` was clamped, so a wholly-negative interval called f64_sqrt on a negative hi
+# and returned [0, NaN] — and ivl_new cannot order around a NaN, so ivl_contains
+# then reported that interval as containing EVERYTHING, silently poisoning every
+# downstream bound. Clamping both ends yields [0, 0] for a wholly-negative input.
+# hisab has no empty-interval representation, and [0, 0] vacuously encloses the
+# empty set, so this is sound where [0, NaN] was not.
 #must_use
 fn ivl_sqrt(iv) {
     var lo = Interval_lo(iv);
+    var hi = Interval_hi(iv);
     if (f64_lt(lo, 0) == 1) { lo = 0; }
-    return ivl_new(f64_sqrt(lo), f64_sqrt(Interval_hi(iv)));
+    if (f64_lt(hi, 0) == 1) { hi = 0; }
+    return ivl_new(f64_sqrt(lo), f64_sqrt(hi));
 }
 
 #must_use
@@ -114,23 +129,51 @@ fn ivl_exp(iv) {
     return ivl_new(f64_exp(Interval_lo(iv)), f64_exp(Interval_hi(iv)));
 }
 
+# Enclosure of sin over the interval.
+#
+# The result is guaranteed to CONTAIN the true range — that is the whole contract
+# of an interval type, and through 2.6.12 this function broke it. It returned only
+# [min(sin a, sin b), max(sin a, sin b)] for any width <= PI, which is strictly
+# NARROWER than the truth whenever the interval straddles an extremum without
+# containing an endpoint at it: ivl_sin([1.4, 1.8]) returned [0.9738, 0.9854] and
+# excluded 1.0, even though sin peaks at PI/2 ~ 1.5708 inside. An interval library
+# that under-approximates is worse than none, because every downstream bound
+# silently becomes unsound.
+#
+# The old "width > PI -> [-1, 1]" shortcut was sound but imprecise, and it is now
+# unnecessary: extrema are located exactly rather than guessed at. sin attains +1
+# at PI/2 + 2k*PI and -1 at -PI/2 + 2k*PI, so an extremum lies in [a, b] iff there
+# is an integer k in the corresponding range — i.e. iff ceil(lo_k) <= floor(hi_k).
+# This is both sound AND tighter than the shortcut: [0.1, 3.3] contains a maximum
+# but no minimum, so it now yields [sin(3.3), 1] instead of the whole of [-1, 1].
+#
+# Rounding note: if an extremum sits within an ulp of an endpoint the integer test
+# may not fire, but sin is flat there (its derivative is 0), so the endpoint value
+# is already within O(eps^2) of +/-1. The enclosure stays sound to that order.
 #must_use
 fn ivl_sin(iv) {
     var a = Interval_lo(iv);
     var b = Interval_hi(iv);
     var w = f64_sub(b, a);
-    # Wide interval: full range
-    if (f64_gt(w, F64_TAU) == 1) {
+    # A span of a full period always covers both extrema.
+    if (f64_ge(w, F64_TAU) == 1) {
         return ivl_new(f64_neg(F64_ONE), F64_ONE);
     }
     var sa = f64_sin(a);
     var sb = f64_sin(b);
     var lo = f64_min(sa, sb);
     var hi = f64_max(sa, sb);
-    # Check if interval contains a maximum (PI/2 + 2kPI) or minimum (3PI/2 + 2kPI)
-    # Simplified: if width > PI, could span an extremum
-    if (f64_gt(w, F64_PI) == 1) {
-        return ivl_new(f64_neg(F64_ONE), F64_ONE);
-    }
+
+    # Maximum (+1) at PI/2 + 2k*PI: contained iff some integer k satisfies
+    # (a - PI/2)/TAU <= k <= (b - PI/2)/TAU.
+    var max_k_lo = f64_ceil(f64_div(f64_sub(a, F64_PI_2), F64_TAU));
+    var max_k_hi = f64_floor(f64_div(f64_sub(b, F64_PI_2), F64_TAU));
+    if (f64_le(max_k_lo, max_k_hi) == 1) { hi = F64_ONE; }
+
+    # Minimum (-1) at -PI/2 + 2k*PI.
+    var min_k_lo = f64_ceil(f64_div(f64_add(a, F64_PI_2), F64_TAU));
+    var min_k_hi = f64_floor(f64_div(f64_add(b, F64_PI_2), F64_TAU));
+    if (f64_le(min_k_lo, min_k_hi) == 1) { lo = f64_neg(F64_ONE); }
+
     return ivl_new(lo, hi);
 }

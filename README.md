@@ -45,8 +45,8 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "f
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.6.12"
-modules = ["dist/hisab.cyr"]   # ~550 KB self-contained bundle (all 34 modules)
+tag     = "2.6.13"
+modules = ["dist/hisab.cyr"]   # ~562 KB self-contained bundle (all 34 modules)
 # Or pull individual files for a smaller compilation unit:
 # modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec3.cyr", ...]
 ```
@@ -92,10 +92,10 @@ num_newton(&f, &df, F64_ONE, EPSILON_F64, 100, root);
 
 ```sh
 cyrius build src/main.cyr build/hisab
-cyrius test tests/hisab.tcyr        # 186 smoke tests
+cyrius test tests/hisab.tcyr        # 200 smoke tests
 cyrius test tests/foundation.tcyr   # 307 foundation tests
-cyrius test tests/modules.tcyr      # 315 module tests
-cyrius test tests/edge_cases.tcyr   # 173 edge case tests
+cyrius test tests/modules.tcyr      # 369 module tests
+cyrius test tests/edge_cases.tcyr   # 187 edge case tests
 cyrius bench tests/hisab.bcyr       # 26 benchmarks
 ```
 
@@ -107,9 +107,9 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.6.12 |
+| Version | 2.6.13 |
 | Library | 34 modules, ~16,900 lines of Cyrius |
-| Tests | 981 assertions across 4 suites |
+| Tests | 1063 assertions across 4 suites |
 | Benchmarks | 26 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~207 KB static ELF (`build/hisab` — version smoke test only) |

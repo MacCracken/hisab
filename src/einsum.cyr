@@ -12,7 +12,13 @@
 # CONSTANTS
 # ================================================================
 
-var _EINSUM_MAX_LABELS = 8;    # a through h
+# Label alphabet: 'a'..'z'. This was 'a'..'h' (8 labels) through 2.6.12, which did
+# not cover the module's OWN documented examples — "ij,jk->ik", "ii->", "ij->ji",
+# "i,j->ij" all use i/j/k (105-107), outside the accepted range. Worse, the parser
+# silently SKIPPED unrecognised characters, so those notations parsed to zero
+# labels and einsum returned a wrong scalar instead of an error. Widening to the
+# full lowercase alphabet costs 3 x 144 bytes of arena (well inside the 8192 cap).
+var _EINSUM_MAX_LABELS = 26;   # a through z
 var _EINSUM_MAX_RANK   = 4;    # max tensor rank
 
 # --- Scratch arena (bounded memory across repeated calls) ---
@@ -43,32 +49,42 @@ fn _einsum_scratch_begin() {
 # INTERNAL: NOTATION PARSER
 # ================================================================
 
-# Check if character is a valid index label (a-h, i.e. 97-104)
+# Check if character is a valid index label (a-z, i.e. 97-122)
 fn _einsum_is_label(ch) {
-    if (ch >= 97 && ch <= 104) { return 1; }
+    if (ch >= 97 && ch <= 122) { return 1; }
     return 0;
 }
 
-# Convert label character to index (a=0, b=1, ..., h=7)
+# Convert label character to index (a=0, b=1, ..., z=25)
 fn _einsum_label_idx(ch) {
     return ch - 97;
 }
 
-# Parse a single operand spec string (e.g. "ij" or "ijk") into
-# label indices. Returns count of labels found.
-# labels_out: pointer to store label indices (up to _EINSUM_MAX_RANK).
+# Parse a single operand spec string (e.g. "ij" or "ijk") into label indices.
+# Returns the count of labels, or -1 if the spec is invalid.
+#
+# REJECTS rather than skips. Through 2.6.12 an unrecognised character was silently
+# dropped and an over-long spec silently truncated to the first _EINSUM_MAX_RANK
+# labels while still returning the true count — so "ij" (with the old a-h alphabet)
+# parsed to rank 0 and produced a confidently wrong scalar, and a rank-5 spec
+# returned 5 while only 4 slots were written, leaving the caller to read an
+# uninitialised label and index a tensor out of bounds. Both are now errors.
+# labels_out: pointer to store label indices (capacity _EINSUM_MAX_RANK).
 fn _einsum_parse_operand(notation_data, start, end, labels_out) {
     var count = 0;
     var pos = start;
     while (pos < end) {
         var ch = load8(notation_data + pos);
-        if (_einsum_is_label(ch) == 1) {
-            if (count < _EINSUM_MAX_RANK) {
-                store64(labels_out + count * 8, _einsum_label_idx(ch));
-            }
+        if (ch == 32) {
+            # tolerate spaces, e.g. "ij, jk -> ik"
+            pos = pos + 1;
+        } else {
+            if (_einsum_is_label(ch) == 0) { return 0 - 1; }
+            if (count >= _EINSUM_MAX_RANK) { return 0 - 1; }
+            store64(labels_out + count * 8, _einsum_label_idx(ch));
             count = count + 1;
+            pos = pos + 1;
         }
-        pos = pos + 1;
     }
     return count;
 }
@@ -139,6 +155,11 @@ fn einsum(notation, tensors, n_tensors) {
         var ostart = load64(op_starts + oi * 8);
         var oend   = load64(op_ends + oi * 8);
         var rank = _einsum_parse_operand(ndata, ostart, oend, lbuf);
+        if (rank < 0) { return 0; }               # malformed operand spec
+        # The notation's rank must match the tensor it describes. Without this the
+        # Step-5 loop walks `rank` entries of a shape array that only has
+        # HTensor_rank(t) of them -- an out-of-bounds read past the allocation.
+        if (rank != HTensor_rank(load64(tensors + oi * 8))) { return 0; }
         store64(op_ranks + oi * 8, rank);
         oi = oi + 1;
     }
@@ -146,6 +167,7 @@ fn einsum(notation, tensors, n_tensors) {
     # --- Step 4: Parse output labels ---
     var out_labels = arena_alloc(_einsum_arena, _EINSUM_MAX_RANK * 8);
     var out_rank = _einsum_parse_operand(ndata, output_start, nlen, out_labels);
+    if (out_rank < 0) { return 0; }               # malformed output spec
 
     # --- Step 5: Determine dimension for each label ---
     # label_dims[label_idx] = dimension size (0 = unused)
@@ -213,6 +235,7 @@ fn einsum(notation, tensors, n_tensors) {
         # Scalar result -- use rank 1, shape [1]
         store64(out_shape, 1);
         var result = tensor_new(1, out_shape);
+        if (result == 0) { return 0; }            # tensor_new is documented 0-on-failure
         # Compute the single scalar value
         var val = _einsum_compute_element(result, 0, out_labels, out_rank,
         label_dims, contracted, n_contracted,
@@ -229,6 +252,7 @@ fn einsum(notation, tensors, n_tensors) {
     }
 
     var result = tensor_new(out_rank, out_shape);
+    if (result == 0) { return 0; }                # tensor_new is documented 0-on-failure
     var total = HTensor_total(result);
     var rd = HTensor_data(result);
 

@@ -123,6 +123,18 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
         i = i + 1;
     }
 
+    # Storage for the left Householder reflectors, so U can be accumulated in
+    # REVERSE afterwards. A = H_0*H_1*...*H_{n-1} * B * (right reflectors), so
+    # U = H_0*H_1*...*H_{n-1}. Applying them to the identity in FORWARD order —
+    # which is what this loop did through 2.6.12 — builds H_{n-1}*...*H_0, the
+    # transpose, so `A != U*S*Vt` while `A == U^T*B*Vt` held. (Vt_acc is
+    # unaffected: V^T is literally G_{n-1}*...*G_0, so forward order is correct
+    # there, which is why S and Vt were right and only U was wrong.)
+    # v_k has length m-k and lives at lv_store[k*m ...]; lv_tv[k] == 0 means the
+    # reflector was skipped for that k.
+    var lv_store = _lp_vec_new(m * n);
+    var lv_tv = _lp_vec_new(n);
+
     var k = 0;
     while (k < n) {
         # ---- Left Householder: zero out column k below diagonal ----
@@ -177,25 +189,12 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
                     j = j + 1;
                 }
 
-                # Accumulate into U_acc: U_acc[k:m, :] -= (2/vTv) * v * (v^T * U_acc[k:m, :])
-                j = 0;
-                while (j < n) {
-                    var dot = f64_from(0);
-                    i = 0;
-                    while (i < len_l) {
-                        dot = f64_add(dot, f64_mul(load64(v_l + i * 8),
-                        mat_get(U_acc, k + i, j)));
-                        i = i + 1;
-                    }
-                    var coeff = f64_mul(two_over_vtv, dot);
-                    i = 0;
-                    while (i < len_l) {
-                        var uij = mat_get(U_acc, k + i, j);
-                        mat_set(U_acc, k + i, j,
-                        f64_sub(uij, f64_mul(coeff, load64(v_l + i * 8))));
-                        i = i + 1;
-                    }
-                    j = j + 1;
+                # Save this reflector; U is accumulated in reverse after the loop.
+                store64(lv_tv + k * 8, vtv);
+                i = 0;
+                while (i < len_l) {
+                    store64(lv_store + (k * m + i) * 8, load64(v_l + i * 8));
+                    i = i + 1;
                 }
             }
         }
@@ -276,6 +275,39 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
         }
 
         k = k + 1;
+    }
+
+    # ---- Backward accumulation of U ----
+    # U = H_0 * H_1 * ... * H_{n-1}, so left-applying to the identity must run
+    # from the LAST reflector to the first. Running it forward (as through 2.6.12)
+    # produces the transpose and silently breaks A = U*S*Vt.
+    k = n - 1;
+    while (k >= 0) {
+        var bvtv = load64(lv_tv + k * 8);
+        if (f64_gt(bvtv, EPSILON_F64) == 1) {
+            var blen = m - k;
+            var btwo = f64_div(F64_TWO, bvtv);
+            var bj = 0;
+            while (bj < n) {
+                var bdot = f64_from(0);
+                i = 0;
+                while (i < blen) {
+                    bdot = f64_add(bdot, f64_mul(load64(lv_store + (k * m + i) * 8),
+                    mat_get(U_acc, k + i, bj)));
+                    i = i + 1;
+                }
+                var bcoeff = f64_mul(btwo, bdot);
+                i = 0;
+                while (i < blen) {
+                    var buij = mat_get(U_acc, k + i, bj);
+                    mat_set(U_acc, k + i, bj,
+                    f64_sub(buij, f64_mul(bcoeff, load64(lv_store + (k * m + i) * 8))));
+                    i = i + 1;
+                }
+                bj = bj + 1;
+            }
+        }
+        k = k - 1;
     }
 
     # Extract bidiagonal entries from W
@@ -829,33 +861,35 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
                 var dk1 = load64(diag + (k + 1) * 8);
                 var ek1 = load64(offdiag + (k + 1) * 8);
 
-                var w = f64_sub(dk, dk1);
-                var t_val = f64_add(f64_mul(w, sn), f64_mul(f64_from(2), f64_mul(cs, ek1)));
-                var tau = f64_mul(sn, t_val);
-
-                store64(diag + k * 8, f64_sub(dk, tau));
-                store64(diag + (k + 1) * 8, f64_add(dk1, tau));
-                store64(offdiag + (k + 1) * 8,
-                f64_sub(f64_mul(cs, ek1),
-                f64_mul(F64_HALF, f64_mul(sn, f64_mul(w, cs)))));
-                # Fix: proper formula for the off-diagonal
-                # After rotation: e[k+1] = cs*e[k+1] - sn*(dk - dk1)/2 ... not quite
-                # Use the standard formulas:
-                # d'_k = cs^2*dk + sn^2*dk1 - 2*cs*sn*ek1
-                # d'_{k+1} = sn^2*dk + cs^2*dk1 + 2*cs*sn*ek1
-                # e'_{k+1} = cs*sn*(dk - dk1) + (cs^2 - sn^2)*ek1
+                # Similarity update T <- G T G^T, with G = [[cs, sn], [-sn, cs]].
+                #
+                # G is the rotation that ZEROES the bulge: G*[x; z] = [r; 0] for
+                # cs = x/r, sn = z/r (set above). The matching similarity is
+                # therefore G T G^T. Through 2.6.12 this block applied G^T T G
+                # instead — the transpose — which is a valid similarity but not the
+                # one that annihilates the bulge, so the off-diagonal never decayed
+                # and eigen_qr returned HSB_ERR_NO_CONVERGENCE for every n >= 3
+                # (measured: a plain symmetric 3x3 failed even at max_iter=100000).
+                # Only the signs of the cross terms differ, which is why it looked
+                # right. Expanding G T G^T on the 2x2 block [[dk, ek1], [ek1, dk1]]:
+                #   d'_k     = cs^2*dk + sn^2*dk1 + 2*cs*sn*ek1
+                #   d'_{k+1} = sn^2*dk + cs^2*dk1 - 2*cs*sn*ek1
+                #   e'_{k+1} = cs*sn*(dk1 - dk) + (cs^2 - sn^2)*ek1
+                # The Q accumulation below (Q <- Q*G^T) is the correct companion to
+                # THIS update and needed no change; it was the pair that was
+                # inconsistent, not Q alone.
                 var cs2 = f64_mul(cs, cs);
                 var sn2 = f64_mul(sn, sn);
                 var cs_sn = f64_mul(cs, sn);
 
                 store64(diag + k * 8,
-                f64_sub(f64_add(f64_mul(cs2, dk), f64_mul(sn2, dk1)),
+                f64_add(f64_add(f64_mul(cs2, dk), f64_mul(sn2, dk1)),
                 f64_mul(f64_from(2), f64_mul(cs_sn, ek1))));
                 store64(diag + (k + 1) * 8,
-                f64_add(f64_add(f64_mul(sn2, dk), f64_mul(cs2, dk1)),
+                f64_sub(f64_add(f64_mul(sn2, dk), f64_mul(cs2, dk1)),
                 f64_mul(f64_from(2), f64_mul(cs_sn, ek1))));
                 store64(offdiag + (k + 1) * 8,
-                f64_add(f64_mul(cs_sn, f64_sub(dk, dk1)),
+                f64_add(f64_mul(cs_sn, f64_sub(dk1, dk)),
                 f64_mul(f64_sub(cs2, sn2), ek1)));
 
                 # Prepare next bulge

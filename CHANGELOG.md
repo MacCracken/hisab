@@ -13,6 +13,48 @@ check.
 fail — except two that are labelled rather than glossed: the BVH split (a cost, not a wrong answer,
 so a benchmark guards it) and the incircle investigation (not fixed at all).
 
+#### Performance — two of the three withheld optimisations now landed (2.7.0-O)
+
+They were withheld in 2.7.0-I because each regressed on some input class. Both regressions are
+addressed rather than accepted.
+
+**`triangulate_polygon` reflex-only ear pruning.** Only a *reflex* vertex can lie inside a candidate
+ear, so the containment scan skips convex ones.
+
+| Benchmark | Before | After | Change |
+|---|---|---|---|
+| `triangulate_600gon` | **9.93 ms** | **1.59 ms** | **−84%** |
+
+The blocker was that output length changes on *self-intersecting* input. That is now settled rather
+than tolerated: 2.7.0-K documented the real contract (`== 3*(n-2)` complete, `< 3*(n-2)` partial),
+and ear clipping is only defined for simple polygons anyway. The divergence direction is
+**old-partial → new-complete** — the new code succeeds where the old bailed.
+
+One of my own 2.7.0-K assertions failed on this, and it was the *assertion* that was wrong: it
+pinned `< 9` for a self-intersecting pentagon, i.e. it asserted that this particular input bails.
+That is pinning an implementation detail, not the contract. Re-pinned to `<= 9`.
+
+**`_kd_partition` balance guard.** Unconditional quickselect fixed the distribution sensitivity but
+cost **kdtree_build_4k 2.27 ms → 4.85 ms (+114%)** — far worse than the +28–30% the review
+predicted, and the wrong trade for a case most inputs never hit. Made it a *fallback* instead: the
+cheap value-midpoint split runs first, and exact median selection is taken only when the midpoint
+leaves a child below a quarter of its parent. That bounds depth at log₍₄∕₃₎(n) — ~24 levels at
+n = 10⁶ — for **+12%** on the common path.
+
+| Benchmark | Midpoint only | Unconditional select | **Hybrid (shipped)** |
+|---|---|---|---|
+| `kdtree_build_4k` | 2.27 ms | 4.85 ms | **2.54 ms** |
+
+**What I did not verify:** the finding's headline case — 574 ms vs 38 ms at n = 50,000 on
+geometrically-spaced coordinates — **did not reproduce**. My probe used a ratio so close to 1 that
+it degenerated into the coincident case the `lo == hi` path already handled, and hybrid and
+midpoint-only timed identically (0.34 s). So the balance guard is justified by the depth bound it
+provably enforces and by the plane invariant holding under geometric spacing (now asserted), **not**
+by a measured win on that input. The 574 ms figure remains unconfirmed.
+
+`delaunay_2d` stays withheld: its rewrite is 1.9–3.0x *slower* on cocircular input and changes the
+triangulation of a unit square, and neither is addressed by a guard.
+
 ### The headline is not the audit's findings — it is what looking for them turned up
 
 Four defects in this release were found by *checking that a repair preserved behaviour*, not by any

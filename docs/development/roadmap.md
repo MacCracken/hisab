@@ -84,9 +84,11 @@ some input class; their measurements and reviews are filed under `issues/`.
 ### Carried into 2.7.x
 - [ ] `delaunay_2d` x-sweep — −96% at n=6,400, but 1.9-3.0x slower on cocircular input and it
       changes the triangulation of a unit square. Spec + review filed
-- [ ] `_kd_partition` median selection — +28-30% on duplicate-heavy skewed data. Spec + review filed
-- [ ] `triangulate_polygon` reflex-only pruning — sound on ~33,000 simple polygons; output length
-      changes on self-intersecting input. Land with the `collision_core.cyr:511` contract work
+- [x] `_kd_partition` — landed as a **balance guard**, not unconditional selection: midpoint first,
+      exact median only when a child falls below a quarter of its parent. +12% on the common path
+      instead of +114%. ⚠️ The finding's 574 ms geometric case **did not reproduce** *(2.7.0-O)*
+- [x] `triangulate_polygon` reflex-only pruning — **9.93 ms → 1.59 ms (−84%)**. Unblocked by the
+      2.7.0-K contract documentation; divergence is old-partial → new-complete *(2.7.0-O)*
 - [ ] `_col_in_circumcircle` adaptive exact predicate — latent (0/180 under real `delaunay_2d`
       geometry), needed only if the function is exposed publicly or the 10x constant changes
 - [ ] Coverage 71% → 80%. Largest holes: `color.cyr`, `complex.cyr` 35/48, `geo.cyr` 27/37,

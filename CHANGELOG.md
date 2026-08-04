@@ -338,6 +338,32 @@ where 16 bytes are stored; `eigen_power` survives a transposed matvec because bo
 are symmetric; and the Gell-Mann basis leaves the **sign of λ₄..λ₇ unconstrained** — pinning it
 needs the SU(3) structure constants.
 
+#### Added — benchmarks for the hot public paths that had none (2.7.0-L)
+
+Every function repaired in 2.7.0-I/J/K, and every target of a *withheld* performance patch, was
+invisible to `bench-history.csv` — so a regression in any of them could not be seen. That is the
+gap that let a 3,412-violation k-d tree and an O(n²) Delaunay both sit unnoticed. 29 → **35**
+benchmarks.
+
+| Benchmark | Baseline |
+|---|---|
+| `kdtree_build_4k` | 2.27 ms |
+| `kdtree_radius_4k` | 7.1 µs |
+| `delaunay_2d_400` | 15.2 ms |
+| `triangulate_600gon` | 9.9 ms |
+| `svd_golub_kahan_12` | 181 µs |
+| `eigen_qr_12` | 140 µs |
+
+These are **baselines, not wins** — nothing here got faster. Their value is that the three withheld
+optimisations (`delaunay_2d`, `_kd_partition`, `triangulate_polygon`) now have a committed
+before-number to be measured against when they are revisited, rather than being re-derived from
+scratch by whoever picks them up. `kdtree_radius_4k` also guards the 2.7.0-J repair on the cost
+side: the corrected split plane prunes *more*, so a future regression that re-broke the invariant
+would likely show up as a speed change too.
+
+`tests/hisab.bcyr` gained `spatial.cyr`, `linalg_ext.cyr` and `linalg_precision.cyr` includes —
+none of the three had ever been benchmarked at all.
+
 #### Fixed — the two findings that were never scheduled (2.7.0-K)
 
 Both were surfaced by the disposition sweep, not by any tier heading — they had sat in the audit

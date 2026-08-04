@@ -194,7 +194,11 @@ before this. Suite 1154 → 1181.
 - [ ] `_kd_partition` value-midpoint split — **CONFIRMED**, but the patch costs **+28-30% on
       duplicate-heavy skewed data** and has **zero permanent regression coverage**. **NOT applied.**
       Its review is what surfaced the `kdtree_within_radius` correctness defect above
-- [ ] Benchmark the hot public functions that still have none, so regressions are visible
+- [x] Benchmarked the hot public functions that had none — `kdtree_build`, `kdtree_within_radius`,
+      `delaunay_2d`, `triangulate_polygon`, `svd_golub_kahan`, `eigen_qr`. 29 → **35** benchmarks;
+      `spatial.cyr`, `linalg_ext.cyr` and `linalg_precision.cyr` had never been benchmarked at all.
+      Baselines, not wins — their point is that the three withheld optimisations now have a
+      committed before-number to be judged against *(2.7.0-L)*
 
 ### Found during 2.7.0-C (new — not in the 2026-08-04 audit)
 - [x] **`eigen_qr` returned `HSB_ERR_NO_CONVERGENCE`** on a moderately-conditioned symmetric 4×4.

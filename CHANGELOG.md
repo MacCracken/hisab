@@ -204,8 +204,56 @@ kill it.
 *Evidence:* against an Euler stub, **14 of the 16 new assertions fail**. The previous single
 assertion passed. Suite 1250 → **1266**.
 
-**Five further test-quality repairs are specified but not yet applied**, filed under
-`docs/development/issues/2026-08-04-tq-*.md`. All six were adversarially reviewed and all six stand
+#### Test quality — `calc_integral_simpson` was untested for `a != 0` (2.7.0-G)
+
+The existing assertions quantised through `f64_to`/`f64_round` and certified almost nothing:
+`round(3I) == 1` accepts `I` in `[1/6, 1/2)` — ±50% on 1/3; `trunc(I) == 7` accepts `[7, 8)`. No
+tolerance-based Simpson assertion existed anywhere in the tree.
+
+Replaced with 20 assertions that are **exact where the rule is exact**. Simpson is exact for every
+polynomial of degree ≤ 3, and on a dyadic grid (`n = 64` gives `h = 2^-6` or `2^-5`) every node,
+node value, weighted term and partial sum is an exactly representable dyadic — the only rounding in
+the whole computation is the closing divide by 3. So the degree-0..3 answers are asserted as **bit
+patterns**, not tolerances. Degree 4 is where the rule stops being exact, and by exactly how much:
+the fourth derivative is constant for a quartic, so Euler–Maclaurin is an identity rather than an
+estimate and the returned value must be `1/5 + 2h^4/15` — provably *not* 0.2. Plus a 4th-order
+convergence check against the exact-rational rule value for the integral of `1/(1+x)`:
+`e(32)/e(64)` must land in (15.9, 16.05).
+
+Adversarial review then found the whole block still blind to `a != 0` — **every case started at
+zero**, so two independent a-drop mutants survived: `h = (b-a)/n -> b/n` and `xi = a + i*h -> i*h`.
+Added the integrals of `x^2` and `x^3` over `[1,3]` (still dyadic, still bit-exact). Both mutants
+now fail.
+
+#### Test quality — `ode_verlet` / `ode_symplectic_euler` had zero numeric coverage (2.7.0-G)
+
+Both were asserted **only** with `!= 0` on the returned block. `alloc()` never returns 0 on
+success, so neither assertion could fail for any input: two integrators, no coverage at all.
+
+Both maps are linear on the SHO, so both have an exact closed form, derived from the textbook
+definitions independently of `src/ode.cyr`. With `theta = 2*asin(h/2)`, Verlet gives
+`q_n = cos(n*theta)` and `v_n = -cos(theta/2)*sin(n*theta)`. Each conserves a quadratic **shadow
+Hamiltonian** exactly, which yields the property that makes a symplectic method worth having —
+*bounded* energy error forever: `|E_n - 1/2| <= h^2/8` for Verlet, `<= h/(2(2-h))` for symplectic
+Euler. Both bounds are asserted over 4000 steps (t = 125, ~19.9 periods), **and so is their
+attainment** — a lower bound too, since a frozen no-op integrator would sit at `E = 1/2` exactly
+and sail through the upper bound alone. Explicit Euler violates the symplectic-Euler bound by
+~3000x.
+
+Review found three further holes, all now closed: neither integrator was ever handed a force other
+than `a(q) = -q`, so **hardcoding the SHO and ignoring the function pointer passed every
+assertion**; the result was always consumed before the next call, so a shared static scratch buffer
+would have been invisible; and `alloc(8)` where 16 bytes are stored overran undetected. Added
+constant-acceleration cases (integrated exactly by both methods, so bit-exact), guard allocations,
+and a re-read of the first result after 4001 later calls.
+
+*Evidence:* each of the three previously-surviving mutants now fails — hardcoded `accel_fn` 2
+failures, hardcoded `dp_dq` 2, `alloc(8)` 1. Suite 1266 → **1298**.
+
+**Three further test-quality repairs remain specified but not applied**, filed under
+
+`docs/development/issues/2026-08-04-tq-*.md` (existence-only, the unit-tolerance sweep, and
+Gell-Mann). All six were adversarially reviewed and all six stand
 — but the reviewers also catalogued **~35 mutants the new assertions still would not catch**, which
 is the next round of work rather than a rejection. The most alarming: `calc_integral_simpson`
 survives `h = (b − a)/steps` → `h = b/steps` **and** `xi = a + i·h` → `xi = i·h`, i.e. it is

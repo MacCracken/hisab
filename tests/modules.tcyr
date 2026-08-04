@@ -46,6 +46,16 @@ fn _tc_exp(x) { return f64_exp(x); }
 fn _tc_const(x) { return f64_from(7); }
 fn _tc_one(x) { return F64_ONE; }
 fn _tc_linear(x) { return x; }
+fn _tc_cubic(x) {
+    var cx2 = f64_mul(x, x);
+    var cx3 = f64_mul(cx2, x);
+    var ct1 = f64_sub(cx3, f64_mul(F64_TWO, cx2));
+    var ct2 = f64_add(ct1, f64_mul(f64_from(3), x));
+    return f64_sub(ct2, f64_from(4));
+}
+fn _tc_x4(x) { var qx2 = f64_mul(x, x); return f64_mul(qx2, qx2); }
+fn _tc_inv1p(x) { return f64_div(F64_ONE, f64_add(F64_ONE, x)); }
+fn _tc_cubic_pure(x) { return f64_mul(x, f64_mul(x, x)); }
 fn _tn_f(x) { return f64_sub(f64_mul(x, x), F64_TWO); }
 fn _tn_df(x) { return f64_mul(F64_TWO, x); }
 fn _tn_cube_f(x) { return f64_sub(f64_mul(x, f64_mul(x, x)), f64_from(8)); }
@@ -382,24 +392,100 @@ assert_eq(f64_to(c_deriv_c), 0, "deriv const = 0");
 # ----------------------------------------------------------------
 test_group("calc: simpson integration");
 
-# int(x^2, 0, 1) = 1/3
+# EXACT WHERE THE RULE IS EXACT, TIGHT WHERE IT IS NOT.
+# The assertions here through 2.7.x quantised the result through f64_to/f64_round
+# and so certified almost nothing: round(3I) == 1 accepts I in [1/6, 1/2), i.e.
+# -50%/+50% on 1/3; trunc(I) == 7 accepts [7, 8) (+14.3%); round(I) == 2 accepts
+# [1.5, 2.5) (+/-25%). No tolerance-based Simpson assertion existed anywhere.
+#
+# Simpson's rule is EXACT for every polynomial of degree <= 3, and 4th-order
+# otherwise: int - S = -(b-a) h^4 f''''(xi) / 180. Each case below runs on a
+# dyadic grid -- n = 64 gives h = 2^-6 on [0,1] and h = 2^-5 on [0,2] -- so every
+# node i*h, every f(x_i), every weighted term (the weights 4 and 2 are powers of
+# two) and every partial sum is an exactly representable dyadic well inside 2^53.
+# The ONLY rounding in the whole computation is the closing divide by 3, which is
+# correctly rounded. The polynomial answers are therefore bit-exact and are
+# asserted as bit patterns; every constant below is the closed-form value, not a
+# recorded output.
 var c_int_out = alloc(8);
-var c_rc = calc_integral_simpson(&_tc_x2, 0, F64_ONE, 100, c_int_out);
+
+# degree 0: int(7, 0, 1) = 7. T = 7*(2 + 4*32 + 2*31) = 1344, T*h = 21, 21/3 = 7.
+var c_rc = calc_integral_simpson(&_tc_const, 0, F64_ONE, 64, c_int_out);
 assert_eq(c_rc, 0, "simpson ok");
-var c_int_v = load64(c_int_out);
-var c_int_3 = f64_to(f64_round(f64_mul(c_int_v, f64_from(3))));
-assert_eq(c_int_3, 1, "simpson x^2 = 1/3");
+assert_eq(load64(c_int_out), 0x401C000000000000, "simpson deg-0: int(7,0,1) is 7.0 bit-exact");
 
-# int(const 7, 0, 1) = 7
-var c_const_out = alloc(8);
-calc_integral_simpson(&_tc_const, 0, F64_ONE, 100, c_const_out);
-assert_eq(f64_to(load64(c_const_out)), 7, "simpson const=7");
+# degree 1: int(x, 0, 2) = 2. T = 192, T*h = 6, 6/3 = 2.
+calc_integral_simpson(&_tc_linear, 0, F64_TWO, 64, c_int_out);
+assert_eq(load64(c_int_out), 0x4000000000000000, "simpson deg-1: int(x,0,2) is 2.0 bit-exact");
 
-# int(x, 0, 2) = 2: linear function
+# degree 2: int(x^2, 0, 1) = 1/3. T = 64 exactly, T*h = 1.0, and 1.0/3.0 is the
+# correctly rounded fl(1/3) = 0x3FD5555555555555.
+calc_integral_simpson(&_tc_x2, 0, F64_ONE, 64, c_int_out);
+assert_eq(load64(c_int_out), 0x3FD5555555555555, "simpson deg-2: int(x^2,0,1) is fl(1/3) bit-exact");
 
-var c_lin_out = alloc(8);
-calc_integral_simpson(&_tc_linear, 0, F64_TWO, 100, c_lin_out);
-assert_eq(f64_to(f64_round(load64(c_lin_out))), 2, "simpson linear");
+# degree 3 -- the defining property. int(x^3 - 2x^2 + 3x - 4, 0, 2)
+#           = 4 - 16/3 + 6 - 8 = -10/3. T = -320, T*h = -10, fl(-10/3).
+calc_integral_simpson(&_tc_cubic, 0, F64_TWO, 64, c_int_out);
+assert_eq(load64(c_int_out), 0xC00AAAAAAAAAAAAB, "simpson deg-3: int(cubic,0,2) is fl(-10/3) bit-exact");
+
+# degree 4 -- where the rule stops being exact, and by exactly how much. f'''' is
+# constant for a quartic, so Euler-Maclaurin is an identity, not an estimate:
+#   S_n = int + (b-a) h^4 f''''/180 = 1/5 + 24 h^4/180 = 1/5 + 2 h^4/15.
+# h = 2^-6 gives 2/(15*2^24) = 7.947285970052083e-09, so the rule must return
+# 0.20000000794728598 = 0x3FC99999AAAAAAAB -- provably NOT 0.2.
+calc_integral_simpson(&_tc_x4, 0, F64_ONE, 64, c_int_out);
+assert_eq(load64(c_int_out), 0x3FC99999AAAAAAAB, "simpson deg-4: int(x^4,0,1) is fl(1/5 + 2h^4/15)");
+var c_q_dev = f64_sub(load64(c_int_out), 0x3FC999999999999A);   # minus fl(0.2)
+assert(f64_gt(c_q_dev, 0x3E410D0FA854A07E) == 1, "simpson deg-4 error term > 7.94e-9");
+assert(f64_lt(c_q_dev, 0x3E41128F084CFED7) == 1, "simpson deg-4 error term < 7.95e-9");
+
+# The n=100 shape the old assertions used. h = fl(1/100) is not dyadic, so the
+# nodes and node values round -- yet x^2 still lands under one ulp of 1/3.
+calc_integral_simpson(&_tc_x2, 0, F64_ONE, 100, c_int_out);
+var c_int_err = f64_abs(f64_sub(load64(c_int_out), 0x3FD5555555555555));
+assert(f64_lt(c_int_err, 0x3C9CD2B297D889BC) == 1, "simpson x^2 n=100 within 1e-16 of 1/3 (< 2 ulp)");
+
+# 1000 subintervals. The Neumaier compensation in the accumulator is what holds
+# these two to zero error: deleting it costs 2 ulp at n=100 and 3 ulp here, so
+# this pair is also the only regression test the compensated sum has.
+calc_integral_simpson(&_tc_x2, 0, F64_ONE, 1000, c_int_out);
+var c_int_err_k = f64_abs(f64_sub(load64(c_int_out), 0x3FD5555555555555));
+assert(f64_lt(c_int_err_k, 0x3C9CD2B297D889BC) == 1, "simpson x^2 n=1000 within 1e-16 of 1/3");
+
+# NON-POLYNOMIAL, so the rule is genuinely inexact: int(1/(1+x), 0, 1) = ln 2.
+# 1/(1+x) on a dyadic grid is one correctly rounded IEEE divide, so the rule's
+# value is computable in exact rational arithmetic independently of this library:
+# S_64 = 0.6931471824214548 (0x3FE62E42FFFA11FA), S_32 = 0.693147210289823.
+var c_ln2_64 = alloc(8);
+calc_integral_simpson(&_tc_inv1p, 0, F64_ONE, 64, c_ln2_64);
+var c_s64_err = f64_abs(f64_sub(load64(c_ln2_64), 0x3FE62E42FFFA11FA));
+assert(f64_lt(c_s64_err, 0x3CD203AF9EE75616) == 1, "simpson 1/(1+x) n=64 hits exact rule value to 1e-15");
+
+# 4th-order convergence: halving h must cut the error by 16. The exact-rational
+# prediction is e(32)/e(64) = 15.9708437; the trapezoid rule would give ~4, and a
+# mis-weighted Simpson gives O(1). e(64) itself is pinned to the h^4 term,
+# (h^4/180)*(f'''(1) - f'''(0)) = 0.03125*h^4 = 1.8626e-09.
+var c_ln2_32 = alloc(8);
+calc_integral_simpson(&_tc_inv1p, 0, F64_ONE, 32, c_ln2_32);
+var c_e64 = f64_abs(f64_sub(load64(c_ln2_64), 0x3FE62E42FEFA39EF));   # fl(ln 2)
+var c_e32 = f64_abs(f64_sub(load64(c_ln2_32), 0x3FE62E42FEFA39EF));
+assert(f64_gt(c_e64, 0x3E1EEC7BD512B572) == 1, "simpson n=64 error > 1.8e-9 (h^4 term is real)");
+assert(f64_lt(c_e64, 0x3E20C01868BF779E) == 1, "simpson n=64 error < 1.95e-9");
+var c_ratio = f64_div(c_e32, c_e64);
+assert(f64_gt(c_ratio, 0x402FCCCCCCCCCCCD) == 1, "simpson 4th order: e(32)/e(64) > 15.9");
+assert(f64_lt(c_ratio, 0x40300CCCCCCCCCCD) == 1, "simpson 4th order: e(32)/e(64) < 16.05");
+
+# a != 0 -- THE GAP ADVERSARIAL REVIEW FOUND. Every case above starts at a = 0,
+# so two independent a-drop mutants survived the whole block:
+#   h  = (b - a)/n  ->  b/n          (step size ignores the lower limit)
+#   xi = a + i*h    ->  i*h          (nodes ignore the lower limit)
+# Both are silent when a == 0. On [1,3] with n = 64 the step is 2^-5, still
+# dyadic, so these stay bit-exact: int(x^2,1,3) = 26/3 and int(x^3,1,3) = 20.
+# Under the xi a-drop the first becomes int(x^2,0,2) = 8/3 -- off by 3x.
+calc_integral_simpson(&_tc_x2, F64_ONE, f64_from(3), 64, c_int_out);
+assert_eq(load64(c_int_out), 0x4021555555555555, "simpson a!=0 deg-2: int(x^2,1,3) is fl(26/3)");
+calc_integral_simpson(&_tc_cubic_pure, F64_ONE, f64_from(3), 64, c_int_out);
+assert_eq(load64(c_int_out), 0x4034000000000000, "simpson a!=0 deg-3: int(x^3,1,3) is 20.0 bit-exact");
 
 # ----------------------------------------------------------------
 test_group("calc: gauss-legendre");

@@ -37,6 +37,11 @@ type: state
 > The challenges paid for themselves twice — one proved the proposed `levi_civita` assertions all
 > pass a wrong-sign mutant, the other found a live SIGSEGV in `wedge_1_1` that the finding never
 > mentioned. **A proposed test is not evidence until something has tried to defeat it.**
+> **2.7.0-D (same day).** Two more closed — the unscaled Householder (the most consequential fix of
+> the line: `svd_golub_kahan` was correct only in roughly 1 .. 1e23, failing **40/40 at scale
+> 1e-10**, i.e. SI metres) and the symbolic render carry. Suite **1217 → 1234**. One finding
+> remains, `svd_golub_kahan` on rank-deficient input, still filed under `development/issues/`;
+> it was **re-checked after balancing landed** rather than assumed fixed, and it is not.
 > The v2.6.11 record follows.
 >
 > **v2.6.11**: Cyrius 6.4.69 → **6.5.6** toolchain bump (a
@@ -202,7 +207,7 @@ the scaffold's open items rather than letting them linger.
 | File | Last touched | Status | Action |
 |---|---|---|---|
 | `README.md` | 2026-08-03 | ✅ Fresh | v2.6.15: version → 2.6.15, tag → 2.6.15, tests → **1127**, benchmarks 26 → **28**, bundle → ~578 KB. Counts re-synced each release of the 2.6.12–2.6.15 arc. |
-| `CHANGELOG.md` | 2026-08-04 (2.7.0-C) | ✅ Fresh | **Source of truth per CLAUDE.md.** +2.6.12/13/14/15 entries — the audit-repair arc — plus the **[Unreleased] 2.7.0** section: the correction notice, 2.7.0-A (6 carried-over findings + the `beta`→`eta` rename), 2.7.0-B (3 high + the `cmat` null medium), a **Breaking** entry for `geo_ray_plane`, and a Performance table for `bvh_degenerate_4k` (2.722 s → 15.5 ms). 2.6.12 and 2.6.14 carry **### Security** sections. None breaking; no API or signature change across the arc, so consumers only rebuild. |
+| `CHANGELOG.md` | 2026-08-04 (2.7.0-D) | ✅ Fresh | **Source of truth per CLAUDE.md.** +2.6.12/13/14/15 entries — the audit-repair arc — plus the **[Unreleased] 2.7.0** section: the correction notice, 2.7.0-A (6 carried-over findings + the `beta`→`eta` rename), 2.7.0-B (3 high + the `cmat` null medium), a **Breaking** entry for `geo_ray_plane`, and a Performance table for `bvh_degenerate_4k` (2.722 s → 15.5 ms). 2.6.12 and 2.6.14 carry **### Security** sections. None breaking; no API or signature change across the arc, so consumers only rebuild. |
 | `CLAUDE.md` | 2026-08-03 | ✅ Fresh | v2.6.15: status line rewritten to summarise the whole repair arc; tests → 1127; coverage 59%; bundle figures. Also **+Constant gate** in CI/Release, and the program-epilogue principle (`sys_exit_group` + harness clamp) added at 2.6.11. |
 | `VERSION` | 2026-08-03 | ✅ Fresh | Single source of truth (`2.6.15`). |
 | `CONTRIBUTING.md` | 2026-08-03 | ✅ Fresh | v2.6.15: **+`./scripts/check-constants.sh`** to the local gate list, and the fuzz recipe now leads with `cyrius fuzz` (6.5.6 walks `tests/`). Cyrius pin → 6.5.6 at v2.6.11. |
@@ -226,7 +231,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `roadmap.md` | 2026-08-04 (2.7.0-C) | ✅ Fresh | **Rotates every release.** 2.7.0 sections *Carried over* and *High* marked **CLOSED** with evidence inline; the `cmat` null-propagation medium ticked; a new *Found during 2.7.0-B* section holds the `lib/hisab.cyr` item. 26 items still open under 2.7.0. v2.6.15: Current → v2.6.15; the **whole 2.6.12 audit section retired** (all 32 items closed) to a one-paragraph record + Release-History rows — 327 → 228 lines, **zero completed items left inline**; 2.7.0 re-scoped as **re-audit & refactor**; new **2.7.x feature line** holding the original 2.7.0 items plus those moved out of 2.6.x. |
+| `roadmap.md` | 2026-08-04 (2.7.0-D) | ✅ Fresh | **Rotates every release.** 2.7.0 sections *Carried over* and *High* marked **CLOSED** with evidence inline; the `cmat` null-propagation medium ticked; a new *Found during 2.7.0-B* section holds the `lib/hisab.cyr` item. 26 items still open under 2.7.0. v2.6.15: Current → v2.6.15; the **whole 2.6.12 audit section retired** (all 32 items closed) to a one-paragraph record + Release-History rows — 327 → 228 lines, **zero completed items left inline**; 2.7.0 re-scoped as **re-audit & refactor**; new **2.7.x feature line** holding the original 2.7.0 items plus those moved out of 2.6.x. |
 | `threat-model.md` | 2026-08-04 | ✅ Fresh | **Debt discharged.** Two new sub-tables — *Memory-safety tier — closed in v2.6.14* (6 rows) and *Closed in v2.7.0* (8 rows) — plus three audit-history entries (the 2026-08-03 sweep, the 2026-08-04 re-audit, the 2.7.0-A/B batches). The re-audit entry records **both** process failures verbatim, since the failure mode is the transferable part: scheduling from a digest instead of the finding list, and a coverage-reporting gate whose own coverage was never checked. ⚠️ Also **corrected a row my own change falsified** — `geo_ray_plane` no longer returns −1. |
 | `dependency-watch.md` | 2026-08-03 | ✅ Fresh | Cyrius toolchain version-watch. Pin **6.5.6**, sakshi **2.4.7**; 6-file stdlib delta recorded, plus the `vec_sort_by` non-adoption rationale. Watching: 5.7.11 (RISC-V). |
 | `port-audit.md` | 2026-05-29 | 📅 Dated + addendum | 2026-04-15 Rust→Cyrius parity snapshot, preserved; 2026-05-29 status addendum records nearly all "P0 gaps" now ported. Don't rewrite the body. |

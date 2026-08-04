@@ -100,13 +100,54 @@ failures; `tensor.cyr` 12 (and a second, sign-only mutant that keeps the correct
 still fails 5 — the case the original assertions missed); `diffgeo.cyr` **SIGSEGVs before printing
 a single line**. Every restore was verified byte-identical afterwards, not assumed.
 
-**Still open (3 of 7)** — all verified, challenged and fully specified, but not yet applied:
-`svd_golub_kahan` on rank-deficient input, the `expr_to_str`/`sym_to_latex` rounding carry, and the
-unscaled Householder reflector. The last one is **more severe than the finding stated**: a
-cross-scale probe of 440 random matrices found `svd_golub_kahan` is only correct in the band
-1 .. 1e23 — it fails 40/40 at scale 1e-10 on a relative reconstruction check, so a physics
-consumer working in SI metres gets silently wrong singular values today. A separate pre-existing
-defect surfaced alongside it: `eigen_qr` returns `HSB_ERR_NO_CONVERGENCE` at *unit* scale for a
+#### Fixed — unscaled Householder / unbalanced decompositions (2.7.0-D)
+
+**The most consequential fix of the 2.7.0 line so far**, and the finding materially understated it.
+Every step of these decompositions squares matrix entries — the Householder norms in
+`_lp_bidiagonalize`/`_lp_tridiagonalize`, and the Wilkinson shifts, which form entries of `BᵀB`
+explicitly. `|x| > 1.34e154` squares to `+Inf` and `|x| < 1.49e-154` squares to `0`, so the usable
+band was only about **1 .. 1e23**. Measured across 440 random matrices, `svd_golub_kahan` failed
+**40/40 at scale 1e-10** on a relative reconstruction check — that is SI metres, so the physics
+consumer was in the failure region, not at some exotic endpoint.
+
+Failure modes differed by direction, and both were bad:
+- **Overflow (1e200):** `||v||² = +Inf`, then `2/Inf = 0` and `0*Inf = NaN` — `svd_golub_kahan`
+  returned `HSB_ERR_NO_CONVERGENCE` with `U` **all NaN**; `cqr_decompose` was worse, because
+  `cx_abs(x1) = Inf` made the `v^H v` guard false so **every reflector was skipped** and it
+  returned `HSB_ERR_NONE` with `Q = I` and `R = A` — R not even upper triangular.
+- **Underflow (1e-200):** every reflector skipped, `HSB_ERR_NONE` returned, and `S` set to the
+  **raw diagonal of A** — 42.6% off, with no error code.
+
+`svd_golub_kahan`, `eigen_qr` and `cqr_decompose` now balance to unit max magnitude before
+decomposing and rescale on the way out (`sv(cA) = c·sv(A)`, `eig(cA) = c·eig(A)`; U/Vt/Q are
+invariant). Balancing also converts the **absolute** `EPSILON_F64` deflation thresholds into
+relative ones, which is what repairs the small-magnitude half.
+
+The divisor is rounded **down to a power of two**, so the divide and the un-scale are exact and
+every unit-scale result is **bit-identical to what shipped before** — verified: all four suites
+pass unchanged. Without that refinement the shipped `S[0]` would have drifted by 1 ulp for no
+reason. Doc comments for the new `HSB_ERR_ALLOC` return were updated in the same edit.
+
+*Evidence:* reverting `linalg_precision.cyr` fails **9 of 11** new assertions. The other two are
+deliberately vacuous and labelled as such — they document that the pre-fix failure was *silent*.
+
+- **`expr_to_str` / `sym_to_latex` dropped the rounding carry.** stdlib `fmt_float_buf` zero-pads
+  only under `if (pad > 0)` with `pad = decimals - flen`. A fraction that rounds *up* to exactly
+  `10^decimals` needs `decimals+1` digits, so `pad` goes negative, the pad branch is skipped, and
+  the overflowed digit is emitted **after** the `.` with nothing carrying into the whole part:
+  `0.9999999` rendered as **"0.1000000"** and `2.9999999` as **"2.1000000"**. `lib/` is regenerated
+  by `cyrius lib sync`, so the fix could not live there — hisab now carries `_sym_render_f64`, the
+  stdlib algorithm plus the two lines that fold the overflow into `whole`. Deliberately *not* fixed
+  by pre-rounding the value: `val * 10^6` is inexact above ~1e15 and would perturb the
+  large-magnitude integral values `_latex_fmt_const` routes down the same branch. 5 of 6 new
+  assertions fail on revert; the sixth is a control proving non-carrying values are untouched.
+
+**Still open (1 of 7).** `svd_golub_kahan` on rank-deficient input — verified, challenged and fully
+specified in `docs/development/issues/2026-08-04-svd_rank_deficient.md`, not yet applied. Checked
+explicitly after the balancing work landed, in case it was fixed incidentally: it is **not**. A
+rank-1 3×3 (true singular values 14, 0, 0) still returns `HSB_ERR_NO_CONVERGENCE` with `S` all
+zero, so the finding stands on its own. A separate pre-existing defect surfaced
+alongside the balancing work: `eigen_qr` returns `HSB_ERR_NO_CONVERGENCE` at *unit* scale for a
 well-conditioned symmetric 4×4 (cond 6.85), reproduced on unpatched source.
 
 ### Changed

@@ -142,21 +142,23 @@ before this. Suite 1154 → 1181.
       `_DG_MAX_DIM`, operand guards on 9 functions, checks at **all ten** alloc sites — plus
       `wedge_1_1`, a live SIGSEGV the finding never mentioned *(2.7.0-C)*
 - [ ] `svd_golub_kahan` returns NO_CONVERGENCE plus all-zero singular values for a **rank-deficient**
-      matrix (`linalg_precision.cyr:340`). ✅ verified + challenged, fix specified, **not applied**
-- [ ] `expr_to_str`/`sym_to_latex` drop the rounding carry — 0.999999995 renders as "0.1000000".
-      ✅ verified + challenged, fix specified, **not applied**
+      matrix (`linalg_precision.cyr:340`). ✅ verified + challenged, fix specified, **not applied**.
+      Re-checked after the 2.7.0-D balancing landed in case it was fixed incidentally — it is
+      **not**: a rank-1 3×3 (true sv 14, 0, 0) still returns NO_CONVERGENCE with S all zero
+- [x] `expr_to_str`/`sym_to_latex` dropped the rounding carry — 0.9999999 rendered as "0.1000000"
+      and 2.9999999 as "2.1000000". stdlib `fmt_float_buf` skips its zero-pad when the fraction
+      rounds up to 10^decimals. hisab now carries `_sym_render_f64` *(2.7.0-D)*
 - [x] `levi_civita_3`/`_4` returned raw i64 while their siblings return f64 bit patterns; the −1
       case was a **negative NaN**, poisoning even the exactly-zero components of a contraction
       (`tensor.cyr:227`). 8 existing assertions migrated with it *(2.7.0-C)*
 - [x] `num_ifft` conjugated the caller's buffer before validating, so its error return left the
       input corrupted (`num.cyr:236`) — a failure code *and* silently mutated data *(2.7.0-C)*
-- [ ] **Householder reflector construction is unscaled** (`linalg_precision.cyr:31`). ✅ verified +
-      challenged; fix specified with a power-of-two balancing divisor so unit-scale results stay
-      **bit-identical**. **Severity raised by measurement**: across 440 random matrices,
-      `svd_golub_kahan` is correct only in the band 1 .. 1e23 — it fails **40/40 at scale 1e-10**
-      on a relative reconstruction check, so a physics consumer in SI metres gets silently wrong
-      singular values *today*. Root cause of the small-magnitude half is the *absolute*
-      `EPSILON_F64` deflation thresholds, which balancing converts to relative ones. **Not applied**
+- [x] **Householder reflector construction was unscaled** (`linalg_precision.cyr:31`) — usable band
+      only ~1 .. 1e23; **40/40 failures at scale 1e-10** (SI metres) across 440 random matrices.
+      Overflow gave NaN `U` + NO_CONVERGENCE; underflow silently returned the raw diagonal of A,
+      42.6% off, with `HSB_ERR_NONE`. `svd_golub_kahan`/`eigen_qr`/`cqr_decompose` now balance to
+      unit max magnitude with a **power-of-two divisor**, so unit-scale results are bit-identical.
+      9 of 11 new assertions fail on revert *(2.7.0-D)*
 
 ### Test quality  (12 findings — assertions that cannot fail for the right reason)
 - [ ] `num_rk4`'s **only** assertion in the whole tree tolerates a 90% error

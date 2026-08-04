@@ -12,7 +12,8 @@
 #
 #   cqr_decompose     -- Householder QR for complex matrices
 #
-# All functions use out-params and return error codes (HSB_ERR_NONE / HSB_ERR_NO_CONVERGENCE).
+# All functions use out-params and return error codes
+# (HSB_ERR_NONE / HSB_ERR_NO_CONVERGENCE / HSB_ERR_ALLOC).
 
 # ================================================================
 # Internal helpers
@@ -40,6 +41,75 @@ fn _lp_vec_norm(arr, start, len) {
 }
 
 # Allocate a zero-filled flat f64 array of length n
+# Balancing helpers (2.7.0). EVERY step of these decompositions squares matrix
+# entries -- the Householder norms in _lp_bidiagonalize/_lp_tridiagonalize, and the
+# Wilkinson shifts, which form entries of B^T*B explicitly. |x| > 1.34e154 squares
+# to +Inf and |x| < 1.49e-154 squares to 0, so the usable band was only about
+# 1 .. 1e23: measured across 440 random matrices, svd_golub_kahan failed 40/40 at
+# scale 1e-10 on a relative reconstruction check. Balancing to unit max magnitude
+# first also converts the ABSOLUTE EpsilonF64 deflation thresholds into relative
+# ones, which is what fixes the small-magnitude half.
+#
+# NOTE: these _lp_* internals are NOT individually overflow-safe. They are only
+# sound when reached through the balanced public entry points below.
+
+# Largest |entry| of a stdlib matrix (0 for the zero matrix).
+fn _lp_mat_max_abs(A) {
+    var total = mat_rows(A) * mat_cols(A);
+    var mx = f64_from(0);
+    var i = 0;
+    while (i < total) {
+        var a = f64_abs(load64(A + 16 + i * 8));
+        if (f64_gt(a, mx) == 1) { mx = a; }
+        i = i + 1;
+    }
+    return mx;
+}
+
+# Round a positive scale DOWN to a power of two. Dividing and re-multiplying by
+# 2^e is EXACT, so balancing costs zero rounding and unit-scale results stay
+# bit-identical to what shipped before this change.
+fn _lp_pow2_floor(s) {
+    var e = s & 0x7FF0_0000_0000_0000;
+    if (e == 0) { return F64_ONE; }
+    return e;
+}
+
+# Fresh copy of A with every entry divided by s (s > 0). Divide, never multiply
+# by 1/s: a subnormal s makes 1/s overflow to +Inf.
+fn _lp_mat_div_scalar(A, s) {
+    var B = mat_copy(A);
+    if (B == 0) { return 0; }
+    var total = mat_rows(A) * mat_cols(A);
+    var i = 0;
+    while (i < total) {
+        store64(B + 16 + i * 8, f64_div(load64(B + 16 + i * 8), s));
+        i = i + 1;
+    }
+    return B;
+}
+
+# Largest |re| or |im| over a complex matrix (0 for the zero matrix).
+fn _lp_cmat_max_abs(A) {
+    var rows = cmat_rows(A);
+    var cols = cmat_cols(A);
+    var mx = f64_from(0);
+    var i = 0;
+    while (i < rows) {
+        var j = 0;
+        while (j < cols) {
+            var z = cmat_get(A, i, j);
+            var a = f64_abs(HComplex_re(z));
+            if (f64_gt(a, mx) == 1) { mx = a; }
+            a = f64_abs(HComplex_im(z));
+            if (f64_gt(a, mx) == 1) { mx = a; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return mx;
+}
+
 fn _lp_vec_new(n) {
     var v = alloc(n * 8);
     var i = 0;
@@ -81,7 +151,10 @@ fn _lp_mat_copy_into(dst, src) {
 # out_U:  stdlib matrix (m x n, caller allocates).
 # out_S:  flat f64 array of length n (caller allocates, receives singular values).
 # out_Vt: stdlib matrix (n x n, caller allocates).
-# Returns: HSB_ERR_NONE on success, HSB_ERR_NO_CONVERGENCE if QR iteration fails.
+# Returns: HSB_ERR_NONE on success, HSB_ERR_NO_CONVERGENCE if QR iteration
+#          fails, HSB_ERR_ALLOC if the balancing copy fails.
+# A is balanced to unit max magnitude before decomposing and rescaled on the way
+# out; the balance uses a power-of-two divisor, so it is exact..
 #
 # Algorithm:
 #   Step 1: Householder bidiagonalization  A = U1 * B * V1^T
@@ -546,7 +619,14 @@ fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     var diag = _lp_vec_new(n);
     var superdiag = _lp_vec_new(n);  # n-1 used, extra slot harmless
 
-    var err = _lp_bidiagonalize(A, m, n, diag, superdiag, out_U, out_Vt);
+    # Balance to unit max magnitude before decomposing; undo it on the singular
+    # values below. sv(c*A) = c*sv(A) for c > 0 and U/Vt are invariant, and the
+    # power-of-two divisor makes both the divide and the un-scale exact.
+    var sc = _lp_pow2_floor(_lp_mat_max_abs(A));
+    var As = _lp_mat_div_scalar(A, sc);
+    if (As == 0) { return HSB_ERR_ALLOC; }
+
+    var err = _lp_bidiagonalize(As, m, n, diag, superdiag, out_U, out_Vt);
     if (err != HSB_ERR_NONE) { return err; }
 
     # Step 2: QR iteration on bidiagonal
@@ -605,6 +685,13 @@ fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
             }
         }
         i = i + 1;
+    }
+
+    # Undo the balancing: sv(c*A) = c*sv(A), U and Vt are invariant.
+    var sv_i = 0;
+    while (sv_i < n) {
+        store64(diag + sv_i * 8, f64_mul(sc, load64(diag + sv_i * 8)));
+        sv_i = sv_i + 1;
     }
 
     # Copy singular values to output
@@ -943,12 +1030,26 @@ fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     var diag = _lp_vec_new(n);
     var offdiag = _lp_vec_new(n);
 
-    var err = _lp_tridiagonalize(A, n, diag, offdiag, out_vecs);
+    # Balance first; see svd_golub_kahan. The Wilkinson shift squares the
+    # offdiagonal (e2sq = e2*e2), so this overflowed at 1e200 exactly as the
+    # Householder norm did.
+    var sc = _lp_pow2_floor(_lp_mat_max_abs(A));
+    var As = _lp_mat_div_scalar(A, sc);
+    if (As == 0) { return HSB_ERR_ALLOC; }
+
+    var err = _lp_tridiagonalize(As, n, diag, offdiag, out_vecs);
     if (err != HSB_ERR_NONE) { return err; }
 
     # Step 2: Implicit QR iteration on tridiagonal
     err = _lp_tridiag_qr(diag, offdiag, n, out_vecs, max_iter);
     if (err != HSB_ERR_NONE) { return err; }
+
+    # Undo the balancing: eig(c*A) = c*eig(A), eigenvectors invariant.
+    var ev_i = 0;
+    while (ev_i < n) {
+        store64(diag + ev_i * 8, f64_mul(sc, load64(diag + ev_i * 8)));
+        ev_i = ev_i + 1;
+    }
 
     # Step 3: Copy eigenvalues, sort by descending magnitude
     # First, copy raw eigenvalues
@@ -1007,12 +1108,21 @@ fn cqr_decompose(A, out_Q, out_R) {
     var m = cmat_rows(A);
     var n = cmat_cols(A);
 
+    # Balance on the way into out_R; undo it on R at the end. Q is invariant under
+    # a positive rescale of A. Unbalanced, ||v||^2 = Inf made cx_abs(x1) = Inf,
+    # phase = cx_div(x1, Inf) = NaN and v^H v = NaN, so the f64_gt(vhv, EPSILON)
+    # guard was false and EVERY reflector was skipped: at 1e200 this returned
+    # HSB_ERR_NONE with Q = I and R = A -- R not even upper triangular.
+    var sc = _lp_pow2_floor(_lp_cmat_max_abs(A));
+
     # Copy A into out_R
     var i = 0;
     while (i < m) {
         var j = 0;
         while (j < n) {
-            cmat_set(out_R, i, j, cmat_get(A, i, j));
+            var aij = cmat_get(A, i, j);
+            cmat_set(out_R, i, j, cx_new(f64_div(HComplex_re(aij), sc),
+            f64_div(HComplex_im(aij), sc)));
             j = j + 1;
         }
         i = i + 1;
@@ -1140,6 +1250,17 @@ fn cqr_decompose(A, out_Q, out_R) {
         }
 
         k = k + 1;
+    }
+
+    # Undo the balancing on R: A/sc = Q*R implies A = Q*(sc*R).
+    i = 0;
+    while (i < m) {
+        var j = 0;
+        while (j < n) {
+            cmat_set(out_R, i, j, cx_scale(cmat_get(out_R, i, j), sc));
+            j = j + 1;
+        }
+        i = i + 1;
     }
 
     # Q has accumulated H_k ... H_1. Take conjugate transpose to get Q where A = QR.

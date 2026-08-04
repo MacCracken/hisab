@@ -30,14 +30,18 @@ cyrius test tests/edge_cases.tcyr
 # Run benchmarks
 cyrius bench tests/hisab.bcyr
 
-# Run fuzz self-test
-cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
+# Run fuzz self-test (cyrius >= 6.5.6 walks tests/; older toolchains need the manual build)
+cyrius fuzz
 
 # Lint + format check (CI runs these per file across src/ AND tests/; warnings are errors)
 cyrius lint src/main.cyr
 cyrius fmt src/main.cyr --check
 
-# Vet dependencies
+# Verify hand-encoded f64 constants against their own comments (CI gate since 2.6.12,
+# after seven mis-transcribed constant tables shipped). Run after touching any constant.
+./scripts/check-constants.sh
+
+# Vet include dependencies
 cyrius vet src/main.cyr
 
 # Regenerate the distlib bundle (CI fails on drift; required after any src/ or [lib] change)

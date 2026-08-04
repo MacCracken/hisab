@@ -17,208 +17,175 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **1127 test assertions** (foundation 307 + hisab 205 + edge_cases 199 + modules 416), 28 benchmarks (incl. amplified SIMD batches), fuzz harness (1/1), and `scripts/check-constants.sh` verifying **110/110** hand-encoded f64 constants against their own comments. `cyrius coverage` **348/587 (59%)**, files 34/35 — **all 34 modules now covered by a suite**
 - **CLI smoke binary** ~207 KB static ELF
 - **`dist/hisab.cyr` distlib bundle** ~17,286 lines / 578 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
-- Toolchain **6.5.6** (bumped from 6.4.69 in **2.6.11** — a **minor** jump across 24 releases: no executable library change, the bundle diff being the version header plus one `mat_new_guarded` doc comment; sakshi 2.4.6 → **2.4.7**). The headline effect is the vendored `ganita` reaching **1.0.4**: the repo's copy had been stale at **1.0.3** since before the 6.4.69 pin, so this bump closes the long-tracked CWE-190 in stdlib `mat_new` — measured, `mat_new(-5, 3)` **segfaulted** on 1.0.3 and returns null on 1.0.4. hisab's `mat_new_guarded` stays as the stricter 16M-element policy cap (upstream's ceiling is 33.5M). Also adopted this release: the 6.5.6 `sys_exit_group` epilogue idiom, and an **exit-code clamp** in all four test harnesses — the unclamped `assert_summary()` count meant exactly 256/512/768 failures exited 0 and scored PASS (proven, then fixed). `cyrius fuzz` now discovers `tests/*.fcyr` (6.5.6 walks `tests/`, not just `fuzz/`), so the harness runs for the first time — and passes. CI fmt/lint/vet/security all green; supply chain SHA-locked (`cyrius.lock` 30 deps, verify 30/30). Tracked-issue re-verify on the new pin (minimal repros): for-empty-clauses **still live**, interval-ident-lex **still live** (both worked around) — no new fixes
-- **Arc history** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security, fixed three real collision bugs), 2.5.x (CGA depth + matrix guard, CGA 1 → 29 assertions), and 2.6.x (differential-geometry depth — sectional curvature, Weyl, parallel transport, geodesic deviation, higher forms; 28 known-manifold assertions). Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 961 across them.
-- **The 2.6.x *feature* line is closed** — no residual feature work carried forward; the diffgeo
-  arc completed at 2.6.5 and 2.6.6–2.6.11 were toolchain/dependency maintenance. What the 2.6.x
-  line still owes is **repair, not features**: the 2.6.12 sweep below. Items too large for a patch
-  release have been moved to 2.7.0.
-- ⚠️ **The "posture audited solid" claim from the 2.5.4 / 2.6.5 closeouts did not hold.** Those
-  audits were scoped to the arcs' *new* functions and did not reach the modules no test suite
-  includes. The 2026-08-03 sweep found 70 verified defects, 2 critical — see 2.6.12.
+- Toolchain **6.5.6**, sakshi **2.4.7**. CI fmt/lint/vet/security green; supply chain SHA-locked
+  (`cyrius.lock` 30 deps, verify 30/30). Pin/vendoring detail lives in
+  [`dependency-watch.md`](dependency-watch.md); the 6.5.6 bump story is CHANGELOG 2.6.11
+- **Tracked toolchain issues: 3 open, all worked around** — interval-ident-lex and
+  for-empty-clauses re-confirmed live on 6.5.6; cli-arg-clobber not re-tested (destructive).
+  See [`issues/`](issues/)
+- **Arc history** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security),
+  2.5.x (CGA depth), 2.6.0–2.6.5 (differential-geometry depth), 2.6.6–2.6.11 (toolchain/dependency
+  maintenance), **2.6.12–2.6.15 (audit & repair)**. Per-version detail is in the Release History
+  table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md).
+  Suite grew 825 → 1127 across them
+- **The 2.6.x line is closed** — features ended at 2.6.5, and the repair arc discharged the
+  2026-08-03 audit in full. Nothing carries forward; 2.7.0 is next
+- ⚠️ **Standing caution for future closeouts.** The "posture audited solid" verdicts of the 2.5.4
+  and 2.6.5 closeouts did **not** hold: both were scoped to the functions their own arc had just
+  added and never reached the modules no suite included. The 2026-08-03 sweep then found 70
+  defects, 2 critical, almost all in exactly those modules. **An audit's scope is part of its
+  result** — say what was not looked at
 
 ---
 
-## 2.6.12 -- Audit, hardening & repair sweep (COMPLETE — all tiers closed)
+## 2.6.12–2.6.15 -- Audit & repair arc  **CLOSED**
 
-> **Status 2026-08-03 — DISCHARGED.** All four tiers are closed across four releases: 2.6.12
-> (constants + harness, `num_is_prime`, `solve_bicgstab`), 2.6.13 (SVD, eigensolver, SE(3),
-> einsum, intervals), 2.6.14 (memory safety) and 2.6.15 (performance + docs). Suite 961 →
-> **1127**, every fix mutation-proven; five defect groups crashed the process pre-fix. **All 34
-> modules are now included by a test suite** — eight were not even compiled by `cyrius test`
-> before. `cyrius coverage` 50% → **59%**, files 25/35 → **34/35**. Next per doc-health
-> forward-commitment #4: a **re-audit** confirming the repairs, then 2.7.0.
+Retired from active work 2026-08-03. The full record lives in
+[`../audit/2026-08-03.md`](../audit/2026-08-03.md) (all 70 findings), the CHANGELOG entries for
+2.6.12–2.6.15, and the Release History table below. Kept here only as the one-paragraph summary
+a future reader needs:
 
-A full P(-1) sweep of the 2.6.11 tree: 8 parallel audit dimensions over all 34 modules, every
-finding then adversarially re-verified against the running code. **70 findings survived
-verification** (2 critical, 23 high, 23 medium, 22 low) across 64 distinct sites in 27 files;
-7 were refuted and dropped. This is a **repair release**, not a feature release.
+> A P(-1) sweep of the 2.6.11 tree — 8 parallel dimensions over all 34 modules, every finding
+> adversarially re-verified — produced **70 confirmed findings (2 critical, 23 high, 23 medium,
+> 22 low)** across 64 sites. All four tiers closed across four releases. The headline was
+> systemic, not scattered: **seven hand-encoded IEEE-754 constant tables did not encode the
+> values their own comments stated**, including four published tableaux each falsified by its own
+> invariant — DOPRI45's Σb was 0.636, so it was **not a consistent integrator at any order**.
+> Also closed: an SVD returning U transposed, an eigensolver that never converged for n ≥ 3,
+> `einsum` mis-parsing its own documented examples then segfaulting, a `kdtree_build` that
+> SIGSEGV'd at 60k coincident points, and two O(n²) hot paths (190 ms → 1.2 ms, 22 ms → 2.1 ms).
+> **Every defect sat in a module with zero or near-zero coverage** — eight modules were not even
+> compiled by `cyrius test`. Suite 957 → 1127; coverage → 59%; all 34 modules now under test.
+> `scripts/check-constants.sh` was added as a CI gate so the constant class cannot recur.
 
-**The headline is a systemic defect class, not a scattering of unrelated bugs.** Seven separate
-hand-encoded IEEE-754 hex constant tables were mis-transcribed — in every case the adjacent
-comment states the *correct* value and the bit pattern does not encode it. Four are published
-numerical-method tableaux, and each one is falsified by its own mathematical invariant
-(independently re-confirmed by decoding the shipped literals):
-
-| table | site | invariant | shipped | required |
-|---|---|---|---|---|
-| Dormand-Prince RK4(5) | `ode.cyr:55-88` | Σb = 1 | **0.6356** | 1.0 |
-| Gauss-Legendre 5-pt | `calc.cyr:96-107` | Σw = 2 | **2.000492** | 2.0 |
-| BDF-4 | `ode.cyr:108-110` | Σα = 1 | **1.01** | 1.0 |
-| Yoshida-4 symplectic | `ode.cyr:130-136` | 2w₁+w₀ = 1 | **1.4738** | 1.0 |
-
-23 of DOPRI45's 30 tableau constants are wrong and its stage rows fail `Σa_ij = c_i` — it is
-**not a consistent integrator at any order**. All four ship in `dist/hisab.cyr`; **joshua**
-(simulation) consumes exactly these. The other three mis-transcribed tables are `color.cyr`'s
-sRGB breakpoints (0.03275 vs the spec's 0.04045) and spherical-harmonic normalisations, and
-`noise_simplex.cyr`'s `_SIMPLEX_G2`.
-
-### P0 -- Correctness (critical / high)
-
-- [x] **Re-derived all four numerical-method tableaux** from exact rationals (DOPRI45, BDF-4,
-      Yoshida-4, Gauss-Legendre-5) plus the three other mis-transcribed tables (sRGB breakpoints,
-      spherical harmonics, `_SIMPLEX_G2`) and the `quat` slerp threshold — **47 constants**, each
-      table now pinned by its own invariant rather than a bounds check. Σb = 1, Σα = 1,
-      2w₁+w₀ = 1, Σw = 2 all hold. **Shipped 2.6.12**
-- [x] **`num_is_prime` i64 overflow** (`num.cyr`) — Miller-Rabin squared with raw `x * x` instead
-      of `_num_mulmod`; returned *composite* for the genuine primes 3037218841 and 4294967357.
-      Fixed and pinned across the overflow band. **Shipped 2.6.12**
-- [x] **`solve_bicgstab` was a no-op** (`linalg_ext.cyr`) — `f64_from(0x3C32725DD1D243AC)`
-      *converted* a bit pattern instead of reinterpreting it, making the breakdown tolerance
-      4.34e18 so the solver returned the initial guess verbatim. **Shipped 2.6.12**
-- [x] **`svd_golub_kahan` returned U transposed** — left reflectors were composed forward,
-      building `H_{n-1}···H_0` instead of `U = H_0···H_{n-1}`, so `A != U·S·Vᵀ` (8 of 9 entries
-      wrong). Now accumulated backward. **Shipped 2.6.13**
-- [x] **`eigen_qr` never converged for n ≥ 3** — applied `Gᵀ T G` where `G` is the rotation that
-      zeroes the bulge, so the off-diagonal never decayed (NO_CONVERGENCE on a symmetric 3×3 even
-      at 100k iters) and n = 2 paired the wrong eigenvector. Now `G T Gᵀ`; the Q accumulation was
-      already correct for the fixed update. **Shipped 2.6.13**
-- [x] **SU(2)/SE(3) angle-convention split** — `su2_exp`/`su2_log` moved to half-angle, so
-      `su2_to_rotation_matrix(su2_exp(ω)) == so3_exp(ω)` holds and `se3_exp` no longer builds R
-      and t from angles a factor of 2 apart. **Shipped 2.6.13**
-- [x] **`einsum` silently mis-computed its own documented examples** — alphabet widened `a-h` →
-      `a-z`, unknown characters/over-long specs/rank mismatches now rejected, `tensor_new` null
-      checked. It returned the trace (5, not 19) and then segfaulted. **Shipped 2.6.13**
-- [x] **Interval enclosure soundness** — `ivl_sin` under-approximated when straddling an extremum
-      (now locates extrema exactly, and is *tighter* than the old width>π shortcut); `ivl_sqrt`
-      returned `[0, NaN]` for wholly-negative input, which `ivl_contains` reported as containing
-      everything; `ivl_div`'s raw-integer zero guard missed `-0.0`. **Shipped 2.6.13**
-
-### P1 -- Memory safety & robustness
-
-**Closed in 2.6.14.** Three of the four groups crashed the process pre-fix — reverting
-`complex.cyr`, `calc_ext.cyr` or `optimize.cyr` individually makes the suite exit 139 (SIGSEGV).
-
-- [x] Null-return dereferences after capped constructors — `cmat_mul`, `cmat_kronecker`,
-      `cmat_identity` (`complex.cyr`) and `cmat_inverse` (`linalg_ext.cyr`). Each is reachable
-      from operands that are themselves under the 65536 cap: `cmat_mul` of 1000x1 by 1x1000 asks
-      for 1e6; `cmat_inverse` doubles the width building `[M | I]`. **Shipped 2.6.14**
-- [x] `opt_bfgs` / `opt_lbfgs` sized an `n x n` (resp. `m x (2n+1)`) working buffer from an
-      unbounded dimension — added `_OPT_MAX_DIM = 4096`, alloc checks in all four solvers, and a
-      new `HSB_ERR_ALLOC`. **Shipped 2.6.14**
-- [x] `calc_bspline` / `calc_nurbs` indexed control points **negatively** when `n_pts <= degree`
-      — neither validated `degree` nor the `n_pts >= degree+1` well-formedness rule.
-      **Shipped 2.6.14**
-- [x] Adaptive Simpson bounded *depth* (50) but not *work* — 2^50 evaluations on a NaN integrand,
-      which never satisfies the tolerance test because every NaN comparison returns 0. Added an
-      explicit non-finite bail and a stop-when-bisection-stalls check. **Shipped 2.6.14**
-- [x] `kdtree_build` recursed to depth O(n) on coincident points — measured fine at 40k,
-      **SIGSEGV at 60k**. The value-midpoint split can only degenerate when all points share the
-      axis value, which is exactly when a positional split is sound. **Shipped 2.6.14**
-- [x] `_opt_armijo` accepted a NaN objective (its `f64_lt(threshold, f_new) == 0` tie-breaker is
-      also true for NaN), poisoning BFGS / L-BFGS / CG. **Shipped 2.6.14**
-- [x] `cx_div` / `cx_inv` / `cx_powf` compared a squared modulus against an unsquared tolerance,
-      making the zero-divisor cutoff 1e-6 rather than 1e-12. **Shipped 2.6.14**
-- [x] `FLOAT_RENDER_BUF` was 32 against stdlib `fmt_float_buf`'s scratch reach of offset 45.
-      Raised to 64. **Shipped 2.6.14**
-- [x] Four fBm entry points returned NaN for `octaves <= 0`. **Shipped 2.6.14**
-- [x] Interval enclosure soundness (`ivl_div` `-0.0`, `ivl_sqrt` `[0, NaN]`). **Shipped 2.6.13**
-
-### P2 -- Test coverage (the root cause)
-
-`cyrius coverage` reports **297/587 functions (50%)** against CLAUDE.md's 80% target, and the
-correlation with the defect map is the finding: **35 of 65 source defects sit in modules with
-≤30% function coverage.** Eight modules — `calc_ext`, `einsum`, `lie_ext`, `linalg_precision`,
-`mat3`, `noise_simplex`, `num_ext`, `symbolic_ext` — **5,068 lines (30% of `src/`), 104 public
-functions** — are included by *no* test suite, so they are not even compiled by `cyrius test`,
-yet all eight ship in `dist/hisab.cyr` to 8 consumers.
-
-- [x] **All 8 never-included modules are now in the suites** — `einsum`, `lie_ext`, `mat3`,
-      `linalg_precision` (2.6.13), `calc_ext`, `noise_simplex` (2.6.14), `num_ext`,
-      `symbolic_ext` (2.6.15). Coverage 50% → **59%**, files 34/35. The 80% target remains
-      open as ongoing work, not an audit item
-- [ ] Replace bounds-check assertions with **value** assertions where a broken method still passes:
-      the only `ode_dopri45` test asserts `1 < y < 2` for a value whose exact answer is 1.10517,
-      and the `gauss5` tests round to the nearest integer, hiding a 246 ppm error floor
-- [x] **Constant-verification harness** — `scripts/check-constants.sh` decodes every hex f64
-      literal in `src/` and asserts it against the value in its own comment (exact rationals,
-      closed-form expressions, truncated decimals; tolerance derived from the precision the
-      comment claims). Also cross-checks comments stating both an exact form and a decimal, which
-      caught four DOPRI45 comments whose decimals disagreed with their own fractions.
-      **110/110 verified; wired into CI.** **Shipped 2.6.12**
-- [x] Replaced the loose assertions that let the broken tableaux ship — see the P2 note above;
-      `ode_dopri45`, `gauss5`, BDF-4, Yoshida-4, sRGB, `solve_bicgstab` and the `num_is_prime`
-      overflow band all now carry value assertions. Suite 961 → **981**. **Shipped 2.6.12**
-- [ ] Pin the remaining CWE-190 guard (`num_sieve`'s 10M cap) that the 2026-05-29 audit claims is
-      already pinned but is not
-
-### P3 -- Performance  **CLOSED in 2.6.15**
-
-Both hot paths were benchmarked BEFORE the rewrite; before/after rows are in `bench-history.csv`.
-
-| Benchmark | Before | After | Change |
-|---|---|---|---|
-| `halfedge_2k_tris` (2,048 tris) | **190.1 ms** | **1.2 ms** | −99.4% (~156x) |
-| `convex_hull_2d_2k` (2,000 pts) | **22.1 ms** | **2.1 ms** | −90.3% (~10x) |
-
-- [x] `halfedge_from_triangles` twin pairing O(n_he^2) -> open-addressed hash of directed edges.
-      Structurally identical output verified (`twin(twin(i)) == i`, boundary count `4(W-1)`).
-      **Shipped 2.6.15**
-- [x] `convex_hull_2d`'s insertion-sort pre-pass -> heapsort (O(n log n), O(1) extra memory —
-      merge sort's scratch would leak per call under the bump allocator). Hull output
-      byte-identical at n = 50/500/2000/4000. **Shipped 2.6.15**
-- [x] Levenberg-Marquardt: 4 loop-invariant buffers hoisted; symmetric J^T J computed once and
-      mirrored (bit-identical). **Shipped 2.6.15**
-- [x] L-BFGS: 3 per-iteration buffers hoisted. **Shipped 2.6.15**
-
-### P4 -- Documentation drift  **CLOSED in 2.6.15**
-
-- [x] `overview.md` credited BVH to `spatial.cyr` (all `bvh_*` are in `geo_advanced.cyr`), listed
-      `f64_le`/`f64_ge` under `f64_util.cyr` which documents them as removed, and named the bare
-      `ERR_*` constants namespaced in 2.6.8. **Shipped 2.6.15**
-- [x] `opt_conjugate_gradient` documented Fletcher-Reeves, implements Polak-Ribiere+. **2.6.15**
-- [x] `num_dst`/`num_idst` documented DST-II, implement DST-I (`num_dct` checked and genuinely
-      DCT-II, left alone). **Shipped 2.6.15**
-- [x] `expr_eval` documented "aborts"; it warns and returns 0.0 — and a test had been skipped
-      because of that. **Shipped 2.6.15**
-- [x] `hodge_star_2form_4d` documented its `sign` three contradictory ways; corrected here and in
-      `math.md`. **Shipped 2.6.15**
-- [x] `collision_core.cyr` header named a file deleted at the 2.2.2 split and advertised three
-      capabilities that live in `collision_mesh.cyr`. **Shipped 2.6.15**
-- [x] README Building block test counts. **Shipped 2.6.12**
-
-> **Sequencing (as executed).** P0 first, each fix landing with the value-assertion that would
-> have caught it, and P2's constant harness built before the tableau re-derivations so they were
-> verified mechanically. Then P1 (memory safety), then P3/P4. Every P3 claim is backed by
-> before/after rows in `bench-history.csv`, captured by benchmarking the hot paths *first*.
+**What the arc leaves behind as standing practice** (not work items — they are already in place):
+- `scripts/check-constants.sh` runs in CI between the vet and distlib gates.
+- Vendoring is byte-checked against the **pin's own snapshot**, not previous-pin vs new-pin.
+- Test harnesses clamp `assert_summary()` before exiting, and use `sys_exit_group`.
+- Fixes land with the assertion that would have caught them; perf claims need before/after rows
+  in `bench-history.csv`.
 
 ---
 
-## 2.7.0 -- Rendering, GPU, reverse-mode AD
+## 2.7.0 -- Re-audit & refactor  (IN PROGRESS)
 
+The re-audit has **run** — see [`../audit/2026-08-04.md`](../audit/2026-08-04.md): **42 findings
+confirmed, 8 refuted** (4 high, 21 medium, 17 low; no criticals) across six dimensions.
+
+> **Regression verification came back CLEAN** — every 2.6.12–2.6.15 repair holds under execution,
+> verified against mathematical invariants rather than comments, with the pre-fix files re-run as
+> controls. The rewrites are correct as well as fast.
+>
+> ⚠️ **But it also corrected the record: the 2026-08-03 audit was NOT fully discharged.** Six of
+> the original 70 findings were never fixed, because the repair work was scheduled from this
+> roadmap's P0–P4 *summary bullets* — a deduplicated digest — rather than from the audit's finding
+> list. "All P-tiers closed" was then read as "all findings closed". **An audit's finding list is
+> the unit of disposition.** Every numbered finding now needs an explicit disposition before 2.7.0
+> closes.
+
+### Already fixed during the audit (gate infrastructure, not scheduled work)
+- [x] **`check-constants.sh` had a 25% blind spot** — its regex rejected `_` digit separators, so
+      it printed "110/110 verified" while skipping 35 of 145 declarations. Coverage now
+      **110 → 145**, ±Infinity verified rather than skipped, and the skip list is printed
+- [x] **`symbolic_ext.cyr:213`** — `limit` encoded 9999999978962944.0 against a documented `1e15`;
+      exposed by the fixed gate
+
+### Carried over — never fixed from the 2026-08-03 audit
+- [ ] `geo_ray_capsule` returns NaN instead of 0 on a parallel miss (`geo.cyr:456`)
+- [ ] `cmat_exp` scaling loop never terminates on an infinite Frobenius norm (`complex.cyr:390`)
+- [ ] `geo.cyr`'s ray-section header states a miss contract `geo_ray_plane` does not implement
+- [ ] `f64_fmod` uses floor where its own doc says trunc (`f64_util.cyr:19`)
+- [ ] `f64_copysign` wrong for a negative-zero sign argument (`f64_util.cyr:26`)
+- [ ] `lorentz_is_valid` uses an absolute tolerance, rejecting valid boosts at rapidity ≥ 5
+
+### High
+- [ ] **`cmat_mul` never checks `cmat_cols(a) == cmat_rows(b)`** and reads past the end of b's
+      buffer (`complex.cyr:224`)
+- [ ] **`_bvh_build_rec` degenerates to a 1-vs-(n−1) split** on coincident AABBs — O(n²) time and
+      arena, O(n)-deep tree. The unfixed sibling of the 2.6.14 `kdtree_build` fix
+      (`geo_advanced.cyr:532,594`)
+- [ ] **`time_of_impact` misses every collision beyond 0.63 units** of relative travel; its
+      advancement quantum is a fixed distance and `max_t` can only shrink the horizon
+      (`geo_advanced.cyr:744`)
+
+### Medium — correctness & safety
+- [ ] `cmat_commutator`/`anticommutator`/`add`/`sub`/`adjoint`/`scale`/`trace` dereference
+      `cmat_mul`'s designed 0 — the 2.6.14 null-propagation fix stops one call-link short
+- [ ] `detect_islands` validates only the upper bound of contact body indices; a negative index
+      subscripts before the union-find arrays (`collision_mesh.cyr:538`)
+- [ ] diffgeo's downstream tensor functions apply neither the dim cap nor a null check, so both
+      the cap path and the alloc-failure path dereference NULL (`diffgeo.cyr:336`)
+- [ ] `svd_golub_kahan` returns NO_CONVERGENCE plus all-zero singular values for a **rank-deficient**
+      matrix (`linalg_precision.cyr:340`)
+- [ ] `expr_to_str`/`sym_to_latex` drop the rounding carry — 0.999999995 renders as "0.1000000"
+- [ ] `levi_civita_3`/`_4` return raw i64 while their siblings return f64 bit patterns; the −1
+      case is a NaN (`tensor.cyr:227`)
+- [ ] `num_ifft` conjugates the caller's buffer before validating, so its error return leaves the
+      input corrupted (`num.cyr:236`)
+- [ ] Householder reflector construction is unscaled and overflows on large column norms
+      (`linalg_precision.cyr:31`)
+
+### Test quality  (12 findings — assertions that cannot fail for the right reason)
+- [ ] `num_rk4`'s **only** assertion in the whole tree tolerates a 90% error
+- [ ] `ode_verlet` / `ode_symplectic_euler` asserted only `!= 0` — unconditional
+- [ ] **21 assertions use `f64_from(1)` — a literal tolerance of 1.0** — on quantities whose exact
+      value is 0 or 1
+- [ ] "gell-mann hermitian" is a tautology that passes for every complex matrix
+- [ ] `calc_integral_simpson` has no tolerance assertion anywhere; the existing ones admit ±49%
+- [ ] `eigen_power`, `cga_point`, `sym_to_latex`, `opt_gradient_descent`, `hvec4_length`,
+      `num_dst` — existence asserted, value never checked
+- [ ] Raise `cyrius coverage` from **59%** toward the 80% target
+
+### Performance  (each needs before/after rows in `bench-history.csv`)
+- [ ] `delaunay_2d` rescans every triangle per inserted point — O(n²), 232 ms at n = 1,600
+- [ ] `triangulate_polygon` tests every remaining vertex for containment instead of only reflex
+      ones — 29 ms for a 1,000-gon that should be O(n)
+- [ ] `solve_bicgstab` allocates `s` inside its iteration loop — the defect 2.6.15 fixed in LM/L-BFGS
+- [ ] `_kd_partition` value-midpoint split costs O(n·log(range/min_gap)) on geometrically-spaced
+      coordinates — 574 ms vs 38 ms at n = 50,000
+- [ ] Benchmark the hot public functions that still have none, so regressions are visible
+
+### Refactor  (CLAUDE.md: third instance only, never speculative, same gates as new code)
+- [ ] **`calc.cyr` and `calc_ext.cyr` both define the unprefixed public globals `F64_THREE`,
+      `F64_FOUR`, `F64_SIX`, `F64_FIFTEEN`** — both are in the same bundle, so last-definition
+      silently wins. This is the flat-namespace hazard 2.6.8 addressed for `ERR_*`, recurring
+- [ ] Resolve the cross-module private-symbol coupling — five pairs reach into another module's
+      `_`-prefixed internals, breaking the README's à-la-carte consumption path. **Decide:** ship a
+      dependency manifest, promote the symbols, or drop the à-la-carte claim
+- [ ] README's à-la-carte example does not compile — `vec2.cyr` and `vec4.cyr` are missing
+- [ ] BVH node-layout header documents a 40-byte node against a 32-byte allocation, plus three
+      other false statements about a 12-function, zero-coverage block
+
+### Close-out
+- [ ] Give **every** numbered finding in `audit/2026-08-04.md` an explicit disposition
+- [ ] Fold the 2.6.14 memory-safety closures into `SECURITY.md` and `threat-model.md` (both owe an
+      entry — tracked in doc-health as read-through outstanding)
+- [ ] Supersede with a new dated audit once the above lands
+
+---
+
+## 2.7.x -- Feature line  (after 2.7.0 lands)
+
+Carried forward from the original 2.7.0 plan, plus the items moved out of the 2.6.x line because
+each needs its own design and benchmark pass rather than riding a repair release.
+
+### Features
 - [ ] Differentiable rendering math (autodiff through ray-surface intersections)
 - [ ] Reverse-mode autodiff (Tape-based)
 - [ ] GPU compute via soorat (feature-gated)
 
-**Moved here from the 2.6.x line** (too large for a patch release; each needs its own benchmark
-and design pass rather than riding the 2.6.12 repair sweep):
-
+### Moved out of the 2.6.x line
 - [ ] **Adopt `vec_sort_by` / `vec_select_nth`** (cyrius 6.5.4). Blocked on an API mismatch, not
       effort: the comparator receives element *values* via `fncall2`, while hisab sorts *indices*
-      by dereferencing a separate `points` vector, and Cyrius has no closures. Needs either a
-      packed key+index encoding or a context-carrying comparator upstream. 2.6.12 fixes the
-      *complexity* of the two hot sorts; this item is the *consolidation*
-- [ ] **SIMD the flat-array kernels** — `_opt_dot`/`_opt_norm`/`_opt_axpy`, the three L-BFGS sweeps
-      and `_lext_dot`/`_lext_norm` are scalar while `f64v_dot`/`f64v_scale` take a runtime `n`
-      (measured 5-8× on comparable kernels in 2.3.1). Deferred out of 2.6.12 because a hot-path
-      rewrite must not ride a correctness release
-- [ ] **Declare the per-module dependency graph.** The README documents an à-la-carte
-      `modules = ["src/vec3.cyr", ...]` consumption path, but 5 module pairs reach across
-      boundaries into another module's *private* (`_`-prefixed) symbols — `noise_simplex` and
-      `calc_ext` need `calc`'s `_perm`/`_perm_init`, `lie_ext` needs `lie`'s `_su2_*`, `num_ext`
-      needs `num`'s `_num_mulmod`, `symbolic_ext` needs `symbolic`'s `_sym_is_zero`. The full
-      bundle is unaffected (the graph is a DAG and `[lib]` order is a valid topological sort), but
-      a consumer picking files individually gets link errors with no manifest to consult
+      by dereferencing a separate `points` vector, and Cyrius has no closures. Needs a packed
+      key+index encoding or a context-carrying comparator upstream. **2.6.15 already fixed the
+      complexity** of both hot sorts (heapsort / hashed pairing); this item is only the
+      *consolidation onto stdlib*, so it is now optional rather than load-bearing
+- [ ] **SIMD the flat-array kernels** — `_opt_dot`/`_opt_norm`/`_opt_axpy`, the three L-BFGS
+      sweeps and `_lext_dot`/`_lext_norm` are scalar while `f64v_dot`/`f64v_scale` take a runtime
+      `n` (5–8× on comparable kernels in 2.3.1). Needs a benchmark for each kernel first — none
+      of them is currently benchmarked, so there is nothing to prove a win against
+- [ ] Any further work the 2.7.0 re-audit turns up
 
 ---
 

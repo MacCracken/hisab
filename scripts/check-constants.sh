@@ -46,12 +46,17 @@ from fractions import Fraction
 verbose = sys.argv[1] == "1"
 
 # var NAME = 0xHEX;  # comment
-DECL = re.compile(r'^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f]{1,16})\s*;\s*#\s*(.*?)\s*$')
+# The hex class MUST allow `_` digit separators: Cyrius accepts
+# `0x4008_0000_0000_0000`, and 37 of the 148 declarations in src/ are written
+# that way. The original class here was [0-9A-Fa-f]{1,16}, which silently did
+# not match them -- so the gate skipped a quarter of the constants while
+# printing a confident "verified" count. Found by the 2.7.0 re-audit.
+DECL = re.compile(r'^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*#\s*(.*?)\s*$')
 # Constants whose comment is prose, not a value.
 SKIP_RE = re.compile(r'\b(nan|inf|sentinel|mask|bits? pattern|magic|seed|hash)\b', re.I)
 
 def as_double(h):
-    return struct.unpack('>d', struct.pack('>Q', int(h, 16) & 0xFFFFFFFFFFFFFFFF))[0]
+    return struct.unpack('>d', struct.pack('>Q', int(h.replace('_', ''), 16) & 0xFFFFFFFFFFFFFFFF))[0]
 
 def ulp(x):
     if x == 0 or x != x: return 5e-324
@@ -125,13 +130,27 @@ for path in sorted(glob.glob('src/*.cyr')):
         m = DECL.match(line)
         if not m: continue
         name, hexlit, comment = m.group(1), m.group(2), m.group(3)
-        if len(hexlit) - 2 < 12:      # short masks/flags, not f64 payloads
+        if len(hexlit.replace('_', '')) - 2 < 12:   # short masks/flags, not f64 payloads
             continue
-        if SKIP_RE.search(comment):
-            skipped.append((path, lineno, name, comment, 'prose comment')); continue
-
         actual = as_double(hexlit)
         site = f"{path}:{lineno} {name}"
+
+        # +/-Infinity is checkable exactly, so verify rather than skip. These are
+        # real sentinel values used by the geometry and spatial modules and a
+        # wrong one would silently break every min/max seed that starts from them.
+        cl = comment.strip().lower().lstrip('+')
+        if cl in ('infinity', 'inf', '-infinity', '-inf'):
+            want = float('-inf') if cl.startswith('-') else float('inf')
+            ok = (actual == want)
+            results.append(ok)
+            if not ok:
+                errors.append((site, comment, actual, want, 'infinity literal', float('inf')))
+            elif verbose:
+                print(f"  ok   {site:52s} = {actual!r} (infinity literal)")
+            continue
+
+        if SKIP_RE.search(comment):
+            skipped.append((path, lineno, name, comment, 'prose comment')); continue
 
         # Split "EXACT = DECIMAL" if present; prefer the exact form.
         head, sep, tail = comment.partition('=')

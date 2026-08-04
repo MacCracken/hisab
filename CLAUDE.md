@@ -148,6 +148,9 @@ VERSION              — single source of truth for version
 - **Lint gate**: `cyrius lint` per source — warnings are errors
 - **Fmt gate**: `cyrius fmt --check` per source — drift fails the build
 - **Vet gate**: `cyrius vet src/main.cyr`
+- **Constant gate**: `./scripts/check-constants.sh` — decodes every hand-encoded hex f64 literal
+  in `src/` and asserts it against the value in its own comment (110/110). Added 2.6.12 after
+  seven mis-transcribed constant tables shipped; run it after touching ANY constant
 - **Lock gate**: `cyrius deps --verify` against committed `cyrius.lock` (when present)
 - **Distlib gate**: `cyrius distlib` regenerates `dist/hisab.cyr`; CI fails on drift
   (run `cyrius distlib` locally before committing changes to `lib/*.cyr` or `[lib]`)

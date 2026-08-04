@@ -6,8 +6,15 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-08-03 (v2.6.15) — the 2026-08-03 audit is fully discharged; see
-> the fifth- through third-pass blocks below for the repair sequence. The v2.6.11 record follows.
+> **Last refresh**: 2026-08-04 — **re-audit pass** (`audit/2026-08-04.md`). Doc-health work:
+> every Tier 1–7 row re-dated to the v2.6.15 state; at-a-glance buckets recounted (Fresh 13,
+> read-through **2**, dated artifacts **9**); forward-commitments rewritten with **two new
+> entries** (#6 run the constant gate after any constant change, #7 state an audit's SCOPE
+> alongside its verdict). Real drift fixed alongside the ledger: CONTRIBUTING and CLAUDE.md did
+> not list `check-constants.sh` among the gates, and CONTRIBUTING still led with the manual fuzz
+> build. **Correction:** the fifth pass below recorded the 2026-08-03 audit as discharged in full
+> — it was not; six of the 70 findings were never scheduled. See `audit/2026-08-04.md` §2.
+> The v2.6.11 record follows.
 >
 > **v2.6.11**: Cyrius 6.4.69 → **6.5.6** toolchain bump (a
 > **minor** jump across 24 releases) + sakshi 2.4.6 → **2.4.7**. No executable library change —
@@ -32,7 +39,8 @@ type: state
 > `deps --verify` 30/30. Re-verified the 3 open tracked toolchain issues on 6.5.6: interval-ident-lex
 > **still live**, for-empty-clauses **still live**, cli-arg-clobber not re-tested (destructive).
 >
-> **Fifth pass (2026-08-03, v2.6.15) — THE AUDIT IS DISCHARGED.** P3 (performance) and P4
+> **Fifth pass (2026-08-03, v2.6.15).** *(Header corrected 2026-08-04 — this pass claimed the
+> audit was discharged in full; it was not. See the sixth pass above.)* P3 (performance) and P4
 > (documentation) closed, and the last two never-tested modules (`num_ext`, `symbolic_ext`)
 > brought in: **all 34 shipped modules are now included by a test suite**, where eight were not
 > even compiled by `cyrius test` when the audit opened. Both O(n^2) hot paths were benchmarked
@@ -144,18 +152,18 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 
 ---
 
-## At a glance — inventory (last reviewed 2026-08-03, v2.6.11)
+## At a glance — inventory (last reviewed 2026-08-03, v2.6.15)
 
 **~23 markdown files** across the repo. Bucket counts:
 
 | Bucket | Count | What it means |
 |---|---|---|
-| ✅ **Fresh / current** | ~12 | README, CHANGELOG, CLAUDE.md, CONTRIBUTING, SECURITY, `architecture/overview.md`, `guides/testing.md`, the four `development/` docs (roadmap, threat-model, dependency-watch, port-audit), and `benchmarks.md` — all current to v2.6.11. |
-| 🟡 **Stale — refresh in place** | 0 | `benchmarks.md` was stale; re-ran `bench-history.sh` this pass. None outstanding. |
-| 🟠 **Read-through outstanding** | 0 | CONTRIBUTING refreshed; `tool-issues.md` deleted; `linalg-proposal` archived. Cleared. |
+| ✅ **Fresh / current** | 13 | README, CHANGELOG, CLAUDE.md, CONTRIBUTING, SECURITY, VERSION, `architecture/overview.md` + `math.md`, `guides/testing.md`, `development/` roadmap + threat-model + dependency-watch, and `benchmarks.md` — all re-synced to **v2.6.15**. Two carry an explicit debt to the 2.7.0 audit (SECURITY + threat-model owe the 2.6.14 memory-safety entries; testing.md owes the test-quality revision). |
+| 🟡 **Stale — refresh in place** | 0 | None outstanding. `benchmarks.md` was re-run at every release of the 2.6.12–2.6.15 arc. |
+| 🟠 **Read-through outstanding** | 2 | `SECURITY.md` and `development/threat-model.md` — both need the 2.6.14 memory-safety closures folded into their attack-surface tables. Scheduled with the 2.7.0 re-audit rather than done piecemeal, so the entries land against a re-verified tree. |
 | 🔵 **Evergreen** | 1 | `CODE_OF_CONDUCT.md` — Contributor Covenant; re-read only on policy change. |
-| 📅 **Dated artifact — supersede, don't edit** | 8 | `audit/2026-04-15.md`, `audit/2026-05-29.md`, `audit/2026-05-29-cga-arc-closeout.md`, `audit/2026-05-30.md`, `benchmarks-rust-v-cyrius.md` (v2.2.0), `port-audit.md` (2026-04-15 + addendum), `development/archive/cyrius-linalg-proposal.md` (shipped). |
-| 🐞 **Tracked toolchain issues (live on 6.5.6)** | 3 | `development/issues/*` — the 6.2.11 bump fixed 3 (archived). 3 now live, re-confirmed on 6.5.6 (v2.6.11, minimal repros): for-empty-clauses (verified); interval-ident-lex (verified — `iv_add`/`iv_sub`/`iv_mul` are reserved cycc SIMD intrinsics, unusable as var names, worked around by rename); CLI-clobber (not re-tested, destructive). Neither of the two verified ones was fixed by the 6.4 → 6.5 minor. See Tier 6. |
+| 📅 **Dated artifact — supersede, don't edit** | 9 | `audit/2026-04-15.md`, `audit/2026-05-29.md`, `audit/2026-05-29-cga-arc-closeout.md`, `audit/2026-05-30.md`, `benchmarks-rust-v-cyrius.md` (v2.2.0), `port-audit.md` (2026-04-15 + addendum), `development/archive/cyrius-linalg-proposal.md` (shipped), and **`audit/2026-08-03.md`** (discharged in full across 2.6.12–2.6.15 — superseded by the forthcoming 2.7.0 re-audit, not edited). |
+| 🐞 **Tracked toolchain issues (live on 6.5.6)** | 3 | `development/issues/*` — the 6.2.11 bump fixed 3 (archived). 3 now live, re-confirmed on 6.5.6 (minimal repros): for-empty-clauses (verified); interval-ident-lex (verified — `iv_add`/`iv_sub`/`iv_mul` are reserved cycc SIMD intrinsics, unusable as var names, worked around by rename); CLI-clobber (not re-tested, destructive). Neither of the two verified ones was fixed by the 6.4 → 6.5 minor. See Tier 6. |
 
 Numbers approximate; rolls up from the per-tier tables below.
 
@@ -170,12 +178,12 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `README.md` | 2026-08-03 | ✅ Fresh | v2.6.11: toolchain → 6.5.6, version → 2.6.11, hisab tag → 2.6.11, sakshi 2.4.6 → **2.4.7**, tests 957 → **961**. (Prior v2.6.10: toolchain → 6.4.69, version → 2.6.10.) |
-| `CHANGELOG.md` | 2026-08-03 | ✅ Fresh | **Source of truth per CLAUDE.md.** +2.6.11 entry (toolchain 6.4.69 → 6.5.6 + sakshi 2.4.6 → 2.4.7). Carries a **### Security** section — the upstream ganita 1.0.4 CWE-190 `mat_new` guard landed and the vendored copy had been stale at 1.0.3 — plus **### Fixed** for the 256-failure exit-code truncation. **Not** breaking. Refreshed every release. |
-| `CLAUDE.md` | 2026-08-03 | ✅ Fresh | v2.6.11: toolchain/pin → 6.5.6, sakshi → 2.4.7, status line + CI-pin note, tests → 961; **program-epilogue principle changed** to `sys_exit_group` + harness clamp; Quick Start gained `cyrius fuzz`. (Prior v2.6.10: pin → 6.4.69.) |
-| `VERSION` | 2026-08-03 | ✅ Fresh | Single source of truth (`2.6.11`). *(Row had drifted — it recorded `2.6.7` through the 2.6.8/2.6.9/2.6.10 releases.)* |
-| `CONTRIBUTING.md` | 2026-08-03 | ✅ Fresh | v2.6.11: Cyrius pin → 6.5.6. (Prior v2.6.10: 6.4.69; v2.6.7: 6.3.11; +fmt/distlib gates.) |
-| `SECURITY.md` | 2026-08-03 | ✅ Fresh | v2.6.11: allocation-overflow row **flipped from open to resolved** — stdlib `mat_new` gained its upstream guard in ganita 1.0.4 (cap 33,554,430, null on non-positive dims), with the note that the vendored copy was stale at 1.0.3 (where it segfaulted) and that `mat_new_guarded` is retained as the stricter 16M entry point. (Prior v2.6.7: Supported Versions → hisab **2.6.x**.) Mirrors `threat-model.md`. |
+| `README.md` | 2026-08-03 | ✅ Fresh | v2.6.15: version → 2.6.15, tag → 2.6.15, tests → **1127**, benchmarks 26 → **28**, bundle → ~578 KB. Counts re-synced each release of the 2.6.12–2.6.15 arc. |
+| `CHANGELOG.md` | 2026-08-03 | ✅ Fresh | **Source of truth per CLAUDE.md.** +2.6.12/13/14/15 entries — the audit-repair arc. 2.6.12 and 2.6.14 carry **### Security** sections. None breaking; no API or signature change across the arc, so consumers only rebuild. |
+| `CLAUDE.md` | 2026-08-03 | ✅ Fresh | v2.6.15: status line rewritten to summarise the whole repair arc; tests → 1127; coverage 59%; bundle figures. Also **+Constant gate** in CI/Release, and the program-epilogue principle (`sys_exit_group` + harness clamp) added at 2.6.11. |
+| `VERSION` | 2026-08-03 | ✅ Fresh | Single source of truth (`2.6.15`). |
+| `CONTRIBUTING.md` | 2026-08-03 | ✅ Fresh | v2.6.15: **+`./scripts/check-constants.sh`** to the local gate list, and the fuzz recipe now leads with `cyrius fuzz` (6.5.6 walks `tests/`). Cyrius pin → 6.5.6 at v2.6.11. |
+| `SECURITY.md` | 2026-08-03 | ✅ Fresh | v2.6.11: allocation-overflow row flipped open → resolved (stdlib `mat_new` guarded upstream in ganita 1.0.4). **Re-read at the 2.7.0 audit** — the arc closed 11 memory-safety findings that the attack-surface table does not yet reflect. Mirrors `threat-model.md`. |
 | `CODE_OF_CONDUCT.md` | 2026-03-22 | 🔵 Evergreen | Contributor Covenant. Re-read only on policy change. |
 
 ---
@@ -184,8 +192,8 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `overview.md` | 2026-08-03 | ✅ Fresh | v2.6.11: header → v2.6.11 / cycc 6.5.6. (Prior v2.6.10: → v2.6.10 / 6.4.69; v2.6.6: dependency-stack row → `math`+`ganita`, ganita subsumes matrix/linalg.) |
-| `math.md` | 2026-05-30 | ✅ Fresh | Equation catalogue. §1 CGA (v2.5.4); **§2 differential geometry added in the v2.6.5 closeout** (curvature conventions, sectional/Weyl/Jacobi, transport, exterior algebra + references); §3 catalogue index. Earns the CLAUDE.md "math reference" slot. |
+| `overview.md` | 2026-08-03 | ✅ Fresh | v2.6.15: header → v2.6.15 / cycc 6.5.6; module map corrected — **BVH moved to `geo_advanced` (it was credited to `spatial`)**, `f64_le`/`f64_ge` removed from `f64_util`, CG relabelled Polak-Ribière+, error constants → `HSB_ERR_*`. |
+| `math.md` | 2026-08-03 | ✅ Fresh | Equation catalogue. §1 CGA (v2.5.4), §2 differential geometry (v2.6.5). v2.6.15: `hodge_star_2form_4d`'s `sign` corrected — it is an overall multiplier on the Lorentzian dual, **not** a Euclidean/Lorentzian selector. |
 
 ---
 
@@ -195,9 +203,9 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `roadmap.md` | 2026-08-03 | ✅ Fresh | **Rotates every release.** v2.6.11: header → 6.5.6, Current → v2.6.11, assertions → 961, +2.6.11 Release-History row. **Restructured same-day for 2.6.12**: new **2.6.12 audit/hardening/repair** section scoped from the 2026-08-03 audit (P0 correctness → P4 docs, with sequencing); the resolved `mat_new` Parked item **removed** (not struck) with a one-line retirement note, per the new "shipped items leave this list" rule; 2.6.x recorded as **feature-closed with no residue**, and the three items too large for a patch (`vec_sort_by` adoption, SIMD flat-array kernels, per-module dependency manifest) **moved to 2.7.0**. Forward: 2.6.12 (repair), 2.7.0, 3.0.0, + Parked. |
-| `threat-model.md` | 2026-08-03 | ✅ Fresh | v2.6.11: the `mat_new` attack-surface row **flipped open → ✅ RESOLVED** (ganita 1.0.3 → 1.0.4: `GANITA_MAT_MAX_ELEMS = 33554430` + null propagation), recording that the exposure was *worse* than prior entries stated — the vendored copy was stale at 1.0.3 and segfaulted (exit 139), which the toolchain-vs-toolchain vendoring check could not see. +2026-08-03 audit-history entry with the corrected process. (Prior: 2026-07-21 for v2.6.10; 2026-07-17 for v2.6.9.) |
-| `dependency-watch.md` | 2026-08-03 | ✅ Fresh | Cyrius toolchain version-watch. Pin → **6.5.6** (+6-file stdlib delta: `ganita` CWE-190 `mat_new` guard, `syscalls*` `sys_exit_group`, `vec` `vec_sort_by`/`vec_select_nth`, `io`); sakshi 2.4.6 → **2.4.7** (private `_int`/`_str` dispatch-suffix rename; hisab audited clean). Records the `vec_sort_by` non-adoption with its concrete API-mismatch reason. Watching: 5.7.11 (RISC-V). |
+| `roadmap.md` | 2026-08-03 | ✅ Fresh | **Rotates every release.** v2.6.15: Current → v2.6.15; the **whole 2.6.12 audit section retired** (all 32 items closed) to a one-paragraph record + Release-History rows — 327 → 228 lines, **zero completed items left inline**; 2.7.0 re-scoped as **re-audit & refactor**; new **2.7.x feature line** holding the original 2.7.0 items plus those moved out of 2.6.x. |
+| `threat-model.md` | 2026-08-03 | ✅ Fresh | v2.6.11: `mat_new` row flipped open → ✅ RESOLVED; +2026-08-03 audit-history entry with the corrected vendoring process. **Owes a 2.7.0 entry** for the 11 memory-safety findings closed in 2.6.14 (capped-constructor null derefs, solver dimension caps, kdtree recursion) — do it with the re-audit. |
+| `dependency-watch.md` | 2026-08-03 | ✅ Fresh | Cyrius toolchain version-watch. Pin **6.5.6**, sakshi **2.4.7**; 6-file stdlib delta recorded, plus the `vec_sort_by` non-adoption rationale. Watching: 5.7.11 (RISC-V). |
 | `port-audit.md` | 2026-05-29 | 📅 Dated + addendum | 2026-04-15 Rust→Cyrius parity snapshot, preserved; 2026-05-29 status addendum records nearly all "P0 gaps" now ported. Don't rewrite the body. |
 
 > Removed this pass: `tool-issues.md` (deleted — ad-hoc catalog; real bugs live in `issues/`), `cyrius-linalg-proposal.md` (→ `archive/`, shipped).
@@ -208,7 +216,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `testing.md` | 2026-08-03 | ✅ Fresh | v2.6.13: suite counts → 307/200/369/**187** (**1063** total). (v2.6.11: 307/175/312/167 (**961** total, edge_cases +4 for the upstream `mat_new` contract); fuzz recipe now leads with `cyrius fuzz` (6.5.6 walks `tests/`; before that it looked only in `fuzz/`, found nothing, and still exited 0). (Prior v2.4.6 sweep: 901 total, **26** benchmarks, +collision/invariant coverage.) |
+| `testing.md` | 2026-08-03 | ✅ Fresh | v2.6.15: suite counts → 307/205/199/**416** (**1127** total), benchmarks 26 → **28**. **Owes a 2.7.0 revision** — the re-audit's test-quality survey will name the assertions that pass for the wrong reason. |
 | `usage.md` | — | ⚪ Not yet earned | "When earned" patterns/examples guide (CLAUDE.md). README Quick Start covers basics today; promote if onboarding needs more. |
 
 ---
@@ -223,7 +231,8 @@ Periodic audit reports; per-audit timestamped. **Don't refresh in place — supe
 | `2026-05-29.md` | 2026-05-29 | 📅 Dated artifact — security/hardening audit closing the 2.4.x arc (no new vuln) |
 | `2026-05-29-cga-arc-closeout.md` | 2026-05-29 | 📅 Dated artifact — 2.5.x closeout (v2.5.4): P(-1)/security review of the CGA operators + `mat_new_guarded` (posture solid) + the math.md deliverable |
 | `2026-05-30.md` | 2026-05-30 | 📅 Dated artifact — 2.6.x closeout (v2.6.5): P(-1)/security review of the diffgeo curvature/transport/form functions (posture solid) + the math.md §2 deliverable |
-| `2026-08-03.md` | 2026-08-03 | 📅 Dated artifact — **full P(-1) sweep of the v2.6.11 tree, scoping 2.6.12.** 8 audit dimensions over all 34 modules, adversarially verified: **70 findings confirmed / 7 refuted** (2 critical, 23 high, 23 medium, 22 low; 64 sites in 27 files). Headline: 7 mis-transcribed hex-constant tables, 4 of them published tableaux falsified by their own invariants (DOPRI45 Σb = 0.636, Gauss-5 Σw = 2.000492, BDF-4 Σα = 1.01, Yoshida-4 = 1.474). Root cause identified as coverage: 8 modules / 5,068 lines / 104 public fns included by no suite; 35 of 65 source defects sit at ≤30% coverage. **Explicitly corrects the "posture solid" conclusion of the two 2026-05-29/30 closeouts** (they were scoped to arc-new functions only). |
+| `2026-08-04.md` | 2026-08-04 | 📅 Dated artifact — **re-audit of the repaired v2.6.15 tree, scoping 2.7.0.** 6 dimensions; **42 confirmed / 8 refuted** (4 high, 21 medium, 17 low; no criticals). **Regression verification CLEAN** — every 2.6.12–2.6.15 repair holds under execution, verified against mathematical invariants with pre-fix files re-run as controls. **Corrects the 2026-08-03 disposition record**: six of the original 70 findings were never scheduled, because work was driven from the roadmap digest rather than the finding list. Also found the constant gate silently skipping 35 of 145 declarations. Findings concentrate in `geo_advanced.cyr` (largest module, zero coverage on GJK/EPA/BVH/TOI, uncited by the first sweep) and in test quality (12 findings). |
+| `2026-08-03.md` | 2026-08-03 | 📅 Dated artifact — **full P(-1) sweep of the v2.6.11 tree.** 70 findings confirmed / 7 refuted (2 critical, 23 high, 23 medium, 22 low; 64 sites in 27 files). **Disposition corrected 2026-08-04**: the four P-tiers were closed across 2.6.12–2.6.15, but **six findings were never scheduled** and remain open — they never appeared in the roadmap digest the work was driven from. See `2026-08-04.md` §2. Headline: 7 mis-transcribed hex-constant tables, 4 of them published tableaux falsified by their own invariants. Root cause identified as coverage: 8 modules included by no suite, holding 35 of 65 source defects. Explicitly corrects the "posture solid" conclusion of the two 2026-05-29/30 closeouts. |
 
 > **Note on the two "posture solid" closeouts above.** Left at their shipped wording per the
 > dated-artifact rule, but read them with the 2026-08-03 correction in hand: neither reached the
@@ -264,7 +273,7 @@ open one; the bugs belong upstream in cyrius.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `benchmarks.md` | 2026-08-03 | ✅ Fresh | **Re-run this pass** via `scripts/bench-history.sh` — now reflects commit `5331f05` (v2.6.11), 26 benchmarks; appended a `bench-history.csv` row. **No performance claim is attached to 2.6.11** — it changes no math code path, so the delta against the June baseline (`7ae75ef`) is run-to-run spread, not an effect of the bump. Cadence: every release closeout with perf-relevant change. |
+| `benchmarks.md` | 2026-08-03 | ✅ Fresh | **Re-run each release of the arc** via `scripts/bench-history.sh` — now **28** benchmarks (+`convex_hull_2d_2k`, `halfedge_2k_tris`, added *before* the 2.6.15 rewrites so the wins are provable). Both before/after rows are in `bench-history.csv`. |
 | `benchmarks-rust-v-cyrius.md` | 2026-04-15 | 📅 Dated artifact | Rust vs Cyrius comparison, bounded to **v2.2.0**. Supersede only if a port-parity question resurfaces. |
 
 ---
@@ -309,11 +318,13 @@ Scheduled doc decisions, surfaced so they aren't forgotten when the trigger arri
 
 | # | Commitment | Trigger | Notes |
 |---|---|---|---|
-| 1 | **Roadmap + Release History rotate every release** — completed arcs move out of active-work into the Release History table at closeout. | Every release | Per CLAUDE.md Work Loop §10–11. Last done in the v2.6.11 bump (+2.6.11 row; the `mat_new` Parked item struck as RESOLVED). |
-| 2 | **Re-run `bench-history.sh` at release closeout** — keep `benchmarks.md` + `bench-history.csv` current; "numbers don't lie." | Every release with perf-relevant change | ✅ Done 2026-08-03 at v2.6.11 (was at `7ae75ef`; now `5331f05`, 26 benchmarks). No perf claim attached — 2.6.11 changes no math code path. |
-| 3 | **Re-verify tracked `issues/` filings at each toolchain bump** — re-test on the new pin; move resolved ones to `issues/archived/`. | Each `cyrius.cyml` pin bump | ✅ Done 2026-08-03 on 6.5.6 — all 3 open issues still live (interval-ident-lex + for-empty-clauses confirmed by minimal repro; CLI-clobber not re-tested, destructive); the 6.4 → 6.5 minor fixed none. Prior: 2026-07-21 on 6.4.69; 2026-07-17 on 6.4.66; 2026-06-30 on 6.3.11; 2026-06-15 on 6.2.11 (3 of 5 fixed and archived). |
-| 4 | **Periodic security audit** — full source scan before a major release or after significant surface change; supersede with a new dated `docs/audit/` doc. | Before 3.0.0; on significant change | ✅ **Done 2026-08-03 — `audit/2026-08-03.md`**, a full P(-1) sweep of all 34 modules: 70 verified findings (2 critical), scoping 2.6.12. Supersedes the scope, though not the text, of the 2026-05-29/30 closeouts. Also 2026-08-03 in `threat-model.md`: the vendored `ganita` staleness (dependency currency, not source). Prior: 2026-04-15, 2026-05-29. **Next: re-audit after 2.6.12 lands, to confirm the repairs.** |
-| 5 | **Byte-check `lib/*.cyr` against `~/.cyrius/versions/<pin>/lib/` at every pin bump** — compare the vendored tree to the *pin*, never previous-pin against new-pin. | Each `cyrius.cyml` pin bump | **New at v2.6.11.** The toolchain-vs-toolchain comparison used through 2.6.10 is blind to vendoring drift and hid the stale `ganita` 1.0.3 for three releases. `cyrius lib sync` then `cmp` every file (excluding `sakshi.cyr`), and treat any `lib/` file that differs from the pin as a defect, not a diff. |
+| 1 | **Roadmap + Release History rotate every release** — completed arcs move out of active-work into the Release History table at closeout. | Every release | Per CLAUDE.md Work Loop §10–11. ✅ **Done 2026-08-03 at v2.6.15** — the entire 2.6.12 audit section (32 closed items, 165 lines) retired to a one-paragraph record plus Release-History rows; the roadmap now carries **zero completed items inline** |
+| 2 | **Re-run `bench-history.sh` at release closeout** — keep `benchmarks.md` + `bench-history.csv` current; "numbers don't lie." | Every release with perf-relevant change | ✅ Done at every release of the 2.6.12–2.6.15 arc. **28** benchmarks (26 + the two collision hot paths, added *before* the 2.6.15 rewrites so the wins were provable). Both before/after rows are in `bench-history.csv` |
+| 3 | **Re-verify tracked `issues/` filings at each toolchain bump** — re-test on the new pin; move resolved ones to `issues/archived/`. | Each `cyrius.cyml` pin bump | ✅ Done 2026-08-03 on 6.5.6 — all 3 open issues still live (interval-ident-lex + for-empty-clauses by minimal repro; CLI-clobber not re-tested, destructive); the 6.4 → 6.5 minor fixed none. Prior: 6.4.69, 6.4.66, 6.3.11, 6.2.11 |
+| 4 | **Periodic security audit** — full source scan before a major release or after significant surface change; supersede with a new dated `docs/audit/` doc. | Before 3.0.0; on significant change | ✅ 2026-08-03 → `audit/2026-08-03.md` (70 findings). ✅ **Re-audit done 2026-08-04 → `audit/2026-08-04.md`** (42 confirmed; regression-verification clean). ⏭ 2.7.0 must give **every numbered finding** an explicit disposition — the 2026-08-03 cycle closed on tier summaries and left six findings unscheduled. Also owes the SECURITY.md / threat-model.md memory-safety entries. |
+| 5 | **Byte-check `lib/*.cyr` against `~/.cyrius/versions/<pin>/lib/` at every pin bump** — compare the vendored tree to the *pin*, never previous-pin against new-pin. | Each `cyrius.cyml` pin bump | Added at v2.6.11. The toolchain-vs-toolchain comparison used through 2.6.10 is blind to vendoring drift and hid a stale `ganita` 1.0.3 for three releases. `cyrius lib sync`, then `cmp` every file (excluding `sakshi.cyr`) against the pin; any difference is a defect, not a diff |
+| 6 | **Run `./scripts/check-constants.sh` after touching any hand-encoded f64 constant** — it decodes every hex literal in `src/` and compares it to the value in its own comment. | Any constant change; runs in CI | **New at v2.6.12.** Seven constant tables shipped not encoding their documented values, including four published tableaux each falsified by its own invariant. 110/110 verified. The class is mechanical, so the guard is too. |
+| 7 | **State an audit's SCOPE alongside its verdict** — say what was *not* examined. | Every audit / closeout | **New at v2.6.15, reinforced 2026-08-04.** The 2.5.4 and 2.6.5 closeouts concluded "posture solid" while scoped only to their own arc's new functions; the 2026-08-03 sweep then found 70 defects in the modules they never reached. The 2026-08-03 cycle then made the mirror-image error — declaring itself discharged on the strength of a tier summary rather than its finding list. **State scope, and close on the finding list.** |
 
 ---
 

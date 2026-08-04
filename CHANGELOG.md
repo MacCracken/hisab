@@ -2,11 +2,23 @@
 
 ## [Unreleased]
 
-### The 2026-08-03 audit is fully discharged
-All four tiers (P0–P4) of [`docs/audit/2026-08-03.md`](docs/audit/2026-08-03.md) are closed
-across 2.6.12–2.6.15, and **all 34 modules are now included by a test suite** for the first time.
-Next natural step per `docs/doc-health.md` forward-commitment #4: a **re-audit** to confirm the
-repairs, then the 2.7.0 items.
+### CORRECTION — the 2026-08-03 audit was **not** fully discharged
+The 2.6.15 entry below claims it was. That claim is **wrong**, and the 2026-08-04 re-audit
+([`docs/audit/2026-08-04.md`](docs/audit/2026-08-04.md)) found it. All four P-tiers *were* closed,
+but six of the original 70 findings never appeared in those tiers and so were never scheduled:
+`geo_ray_capsule`'s NaN miss, `cmat_exp`'s non-terminating scaling loop, `geo.cyr`'s ray-miss
+contract, `f64_fmod`'s floor-vs-trunc, `f64_copysign`'s negative zero, and `lorentz_is_valid`'s
+absolute tolerance. The repair work was scheduled from the roadmap's P0–P4 *summary bullets* — a
+deduplicated digest — rather than from the audit's finding list, and "all tiers closed" was then
+read as "all findings closed". **An audit's finding list is the unit of disposition.**
+
+### 2.7.0 — re-audit & refactor (in progress)
+The re-audit itself came back **clean on regression**: every 2.6.12–2.6.15 repair holds under
+execution. It confirmed 42 new findings (4 high, 21 medium, 17 low; no criticals) — see
+[`docs/development/roadmap.md`](docs/development/roadmap.md) §2.7.0. Two were fixed immediately
+because they are gate infrastructure: `scripts/check-constants.sh` was silently skipping **35 of
+145** constants (its regex rejected `_` digit separators) while printing "110/110 verified", and
+the constant that exposed (`symbolic_ext.cyr:213`, encoding ~1e16 against a documented 1e15).
 
 ## [2.6.15] - 2026-08-03 — P3/P4 closeout: two O(n²) hot paths, doc drift, full module coverage
 

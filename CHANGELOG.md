@@ -338,6 +338,33 @@ where 16 bytes are stored; `eigen_power` survives a transposed matvec because bo
 are symmetric; and the Gell-Mann basis leaves the **sign of λ₄..λ₇ unconstrained** — pinning it
 needs the SU(3) structure constants.
 
+#### Added — a verified module dependency manifest (2.7.0-M)
+
+`src/` modules carry **no `include` lines** — they are self-contained text the bundler
+concatenates. That makes à-la-carte consumption possible but leaves the required set implicit,
+which is exactly why the README's example shipped broken until 2.7.0-H.
+
+The open item asked for a decision between three options — ship a manifest, promote the private
+symbols, or drop the à-la-carte claim. **Measuring the graph settled it**, and corrected the
+finding on the way:
+
+- Six module pairs reach into another module's `_`-prefixed internals, not five. Two more pairs
+  *appeared* to, including a `symbolic` ↔ `symbolic_ext` cycle — both were **comment-only
+  mentions**, which a naive grep counts and a comment-stripping scan does not.
+- The real graph is **acyclic**. Four modules are fully standalone (`error`, `interval`,
+  `symbolic`, `tensor`); the deepest is `lie_ext` at 9.
+- **Every** private edge runs from a derived module to its own base — `calc_ext`→`calc`,
+  `num_ext`→`num`, `lie_ext`→`lie`, `symbolic_ext`→`symbolic`, `collision_mesh`→`collision_core`,
+  `noise_simplex`→`calc`. That is the layering the module *names* already declare.
+
+So this was never tangled coupling requiring symbol promotion; it was an undocumented layering.
+`docs/architecture/overview.md` now carries the per-module include sets, **derived from source and
+verified by compiling each of the 34 modules against exactly its listed set — 0 undefined symbols
+for all 34**, plus a negative control (`geo` without `quat` correctly reports 1). The sets are the
+transitive closure, so they are what you must include rather than what a module names directly.
+
+The README's à-la-carte comment now points at the table instead of restating a partial list.
+
 #### Added — benchmarks for the hot public paths that had none (2.7.0-L)
 
 Every function repaired in 2.7.0-I/J/K, and every target of a *withheld* performance patch, was

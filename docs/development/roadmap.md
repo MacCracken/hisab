@@ -228,9 +228,13 @@ before this. Suite 1154 → 1181.
       `F64_FIFTEEN`** — same bundle, last-definition-wins, so manifest ORDER decided what shipped.
       Deduped, and `scripts/check-constants.sh` now **fails on any duplicate top-level global**,
       whether the values differ or agree. Mutation-proven *(2.7.0-H)*
-- [ ] Resolve the cross-module private-symbol coupling — five pairs reach into another module's
-      `_`-prefixed internals, breaking the README's à-la-carte consumption path. **Decide:** ship a
-      dependency manifest, promote the symbols, or drop the à-la-carte claim
+- [x] Resolved the cross-module private-symbol question by **measuring** it. Six pairs, not five,
+      and the two that looked circular were comment-only mentions — the real graph is **acyclic**,
+      four modules are standalone, and the deepest (`lie_ext`) needs 9. Every private edge runs from
+      a derived module to its own base, i.e. the layering the module names already declare. So it
+      is a documentation gap, not tangled coupling: shipped a **dependency manifest** in
+      `../architecture/overview.md`, derived from source and **verified by compiling all 34 modules
+      against exactly their listed sets — 0 undefined, with a negative control** *(2.7.0-M)*
 - [x] README's à-la-carte example did not compile — wrong paths (`lib/` instead of `src/`) and
       missing `vec2.cyr`/`vec4.cyr`. Fixed and **verified by building and running it**; the
       documented ray-sphere hit really is 4.0 *(2.7.0-H)*

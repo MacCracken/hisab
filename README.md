@@ -47,9 +47,10 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "f
 git     = "https://github.com/MacCracken/hisab.git"
 tag     = "2.6.15"
 modules = ["dist/hisab.cyr"]   # ~578 KB self-contained bundle (all 34 modules)
-# Or pull individual files for a smaller compilation unit. Note the à-la-carte set
-# below is the VERIFIED minimum for this example -- vec2/vec4 are required even
-# though the example never names them (quat/mat4/transforms reach into HVec4_*):
+# Or pull individual files for a smaller compilation unit. The per-module include
+# sets are tabulated in docs/architecture/overview.md -- derived from the source
+# and verified by compiling each of the 34 modules against exactly its listed set.
+# The example below needs vec2/vec4 even though it never names them:
 # modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec2.cyr", "src/vec3.cyr", ...]
 ```
 

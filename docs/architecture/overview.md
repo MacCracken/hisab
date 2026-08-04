@@ -77,6 +77,68 @@ hisab (Cyrius)
 | syscalls, io, args | Cyrius stdlib | System interface |
 | assert, bench | Cyrius stdlib | Testing, benchmarking |
 
+## Module dependency manifest
+
+Cyrius modules in `src/` carry **no `include` lines** — they are self-contained text that the
+bundler concatenates. That makes à-la-carte consumption possible but leaves the required set
+implicit, which is why the README's à-la-carte example shipped broken until 2.7.0-H (it named
+`lib/` paths and omitted two modules the example needed without ever mentioning them).
+
+This table is **derived and verified, not hand-maintained**: every symbol referenced in code (with
+comments stripped) is resolved to its defining module, closed transitively, and then each row is
+confirmed by actually compiling that module against exactly its listed set — **0 undefined symbols
+for all 34**, with a negative control (`geo` without `quat`) correctly reporting 1.
+
+The sets are minimal in the sense that they contain no module that is not reached; they are the
+transitive closure, so they are what you must include, not merely what the module names directly.
+
+Consumers pulling the whole `dist/hisab.cyr` bundle can ignore this table entirely.
+
+| Module | Also include |
+|---|---|
+| `error` | *(standalone)* |
+| `interval` | *(standalone)* |
+| `symbolic` | *(standalone)* |
+| `tensor` | *(standalone)* |
+| `autodiff` | `error` |
+| `complex` | `error` |
+| `diffgeo` | `error` |
+| `einsum` | `tensor` |
+| `f64_util` | `error` |
+| `num` | `error` |
+| `ode` | `error` |
+| `optimize` | `error` |
+| `symbolic_ext` | `symbolic` |
+| `vec2` | `error` |
+| `vec3` | `error` |
+| `collision_core` | `error` `vec3` |
+| `linalg_ext` | `complex` `error` |
+| `linalg_precision` | `complex` `error` |
+| `mat3` | `error` `vec3` |
+| `num_ext` | `error` `num` |
+| `quat` | `error` `vec3` |
+| `vec4` | `error` `vec3` |
+| `calc` | `error` `vec2` `vec3` |
+| `color` | `error` `vec3` `vec4` |
+| `geo` | `error` `quat` `vec3` |
+| `calc_ext` | `calc` `error` `vec2` `vec3` |
+| `collision_mesh` | `collision_core` `error` `vec2` `vec3` |
+| `geo_advanced` | `error` `geo` `quat` `vec3` |
+| `mat4` | `error` `f64_util` `vec3` `vec4` |
+| `noise_simplex` | `calc` `error` `vec2` `vec3` |
+| `spatial` | `error` `geo` `quat` `vec3` |
+| `lie` | `complex` `error` `f64_util` `mat4` `quat` `vec3` `vec4` |
+| `transforms` | `error` `f64_util` `mat4` `quat` `vec2` `vec3` `vec4` |
+| `lie_ext` | `complex` `error` `f64_util` `lie` `mat3` `mat4` `quat` `vec3` `vec4` |
+
+**Shape of the graph.** Four modules are fully standalone (`error`, `interval`, `symbolic`,
+`tensor`); the deepest is `lie_ext` at 9. There are **no cycles**. Six module pairs reach into
+another module's `_`-prefixed internals — `calc_ext`→`calc`, `collision_mesh`→`collision_core`,
+`lie_ext`→`lie`, `noise_simplex`→`calc`, `num_ext`→`num`, `symbolic_ext`→`symbolic` — and every one
+of those runs from a derived module to its own base, which is the layering the module *names*
+already declare. That is a documentation gap rather than tangled coupling, and this table is the
+documentation.
+
 ## Design Principles
 
 - **Pure math** — no I/O in library code

@@ -49,6 +49,24 @@ fn _ec_x_plus1(x) { return f64_add(x, F64_ONE); }
 # Helper for RK4 test: dy/dt = 1 (constant rate)
 fn _ec_dydt_const(t, y) { return F64_ONE; }
 
+# Helpers for the RK4 order/accuracy tests
+fn _ec_dydt_y(t, y) { return y; }
+fn _ec_dydt_ty(t, y) { return f64_mul(t, y); }
+fn _ec_dydt_4t3(t, y) { return f64_mul(f64_from(4), f64_mul(t, f64_mul(t, t))); }
+
+# n fixed RK4 steps of size h starting from (t0, y0). Returns y(t0 + n*h).
+fn _ec_rk4_run(f, t0, y0, h, n) {
+    var t = t0;
+    var y = y0;
+    var i = 0;
+    while (i < n) {
+        y = num_rk4(f, t, y, h);
+        t = f64_add(t, h);
+        i = i + 1;
+    }
+    return y;
+}
+
 alloc_init();
 
 # ================================================================
@@ -676,11 +694,92 @@ assert_eq(ee_io, 50, "ease_in_out(0.5)*100=50");
 # ================================================================
 # Num — RK4 basic test
 # ================================================================
-test_group("edge: num rk4");
+# ================================================================
+# Num — RK4: 4th-order accuracy and observed order of convergence
+# ================================================================
+# Every reference value below is derived independently of src/num.cyr:
+#   * y' = y  is integrated by ANY explicit RK method as y1 = y0*R(z),
+#     R(z) = sum b_i over the tableau; for classical RK4 (and only for it)
+#     R(z) = 1 + z + z^2/2 + z^3/6 + z^4/24  (textbook stability function).
+#   * y' = 4t^3 makes RK4 collapse to Simpson's rule, exact for cubics.
+#   * y' = t*y has the closed-form solution y(t) = y0*exp(t^2/2).
+# Multi-step reference values were computed in exact rational arithmetic
+# (python3 fractions) and every hex literal via python3 struct.pack('>d').
+test_group("edge: num rk4 accuracy");
 
-# dy/dt = 1 (constant), y(0)=0, dt=1 → y(1) = 1
+var RK4_T13   = 0x3D3C25C268497682;  # 1e-13
+var RK4_T14   = 0x3D06849B86A12B9B;  # 1e-14
+var RK4_T15   = 0x3CD203AF9EE75616;  # 1e-15
+var RK4_2EM6  = 0x3EC0C6F7A0B5ED8D;  # 2e-6
+var RK4_E     = 0x4005BF0A8B145769;  # e       = 2.718281828459045
+var RK4_SQRTE = 0x3FFA61298E1E069C;  # sqrt(e) = 1.6487212707001282
+
+# --- 1. y' = 1, y(0)=0, dt=1 -> y(1)=1 exactly (was the only rk4 assertion;
+#        it is exact for Euler too, so it is kept only as a sanity check).
 var erx = num_rk4(&_ec_dydt_const, 0, 0, F64_ONE);
-assert_eq(f64_to(erx), 1, "rk4 const dy/dt=1 → y=1");
+assert(f64_approx_eq(erx, F64_ONE, RK4_T15), "rk4 const dy/dt=1 -> y=1 (1e-15)");
+
+# --- 2. y' = y, y(0)=1, one step dt=1: R(1) = 65/24 = 2.7083333333333333.
+#        Euler gives 2.0, midpoint/RK2 2.5, RK3 8/3 = 2.6666667 -- all fail 1e-13.
+var erk_r1 = num_rk4(&_ec_dydt_y, 0, F64_ONE, F64_ONE);
+assert(f64_approx_eq(erk_r1, 0x4005AAAAAAAAAAAB, RK4_T13), "rk4 R(1)=65/24 (1e-13)");
+
+# --- 3. Same map at dt=1/2: R(1/2) = 211/128 = 1.6484375 exactly.
+#        RK3 gives 1.6458333 (2.6e-3 off) -- a second point pins the polynomial.
+var erk_rh = num_rk4(&_ec_dydt_y, 0, F64_ONE, F64_HALF);
+assert(f64_approx_eq(erk_rh, 0x3FFA600000000000, RK4_T14), "rk4 R(1/2)=211/128 (1e-14)");
+
+# --- 4. y' = 4t^3, y(0)=0, one step dt=1 -> Simpson: (1/6)(0 + 4*0.5 + 4) = 1,
+#        which is also the exact solution t^4 at t=1. Euler gives 0, midpoint 0.5,
+#        and evaluating k2/k3 at t instead of t+dt/2 gives 2/3 -- all fail 1e-15.
+var erk_q = num_rk4(&_ec_dydt_4t3, 0, 0, F64_ONE);
+assert(f64_approx_eq(erk_q, F64_ONE, RK4_T15), "rk4 cubic quadrature = 1 (1e-15)");
+
+# --- 5. y' = y on [0,1] with n = 8/16/32 fixed steps, y(0)=1.
+#        Exact-rational RK4 references: 2.7182768444167342, 2.7182815003405851,
+#        2.7182818074111932 (errors vs e: 4.984e-6, 3.281e-7, 2.105e-8).
+var erk_h8  = f64_div(F64_ONE, f64_from(8));
+var erk_h16 = f64_div(F64_ONE, f64_from(16));
+var erk_h32 = f64_div(F64_ONE, f64_from(32));
+var erk_y8  = _ec_rk4_run(&_ec_dydt_y, 0, F64_ONE, erk_h8, 8);
+var erk_y16 = _ec_rk4_run(&_ec_dydt_y, 0, F64_ONE, erk_h16, 16);
+var erk_y32 = _ec_rk4_run(&_ec_dydt_y, 0, F64_ONE, erk_h32, 32);
+assert(f64_approx_eq(erk_y8, 0x4005BF07EE21F39E, RK4_T13), "rk4 exp n=8 (1e-13)");
+assert(f64_approx_eq(erk_y16, 0x4005BF0A5F0A46EA, RK4_T13), "rk4 exp n=16 (1e-13)");
+assert(f64_approx_eq(erk_y32, 0x4005BF0A8841248C, RK4_T13), "rk4 exp n=32 (1e-13)");
+
+# --- 6. Observed order: err(h)/err(h/2) must be ~2^4 = 16.
+#        Measured 15.190 and 15.589; RK3 gives 7.61, RK2 3.82, Euler 1.90.
+var erk_e8  = f64_abs(f64_sub(erk_y8, RK4_E));
+var erk_e16 = f64_abs(f64_sub(erk_y16, RK4_E));
+var erk_e32 = f64_abs(f64_sub(erk_y32, RK4_E));
+var erk_ra = f64_div(erk_e8, erk_e16);
+var erk_rb = f64_div(erk_e16, erk_e32);
+assert(f64_gt(erk_ra, f64_from(14)) == 1, "rk4 order ratio 8->16 > 14");
+assert(f64_lt(erk_ra, f64_from(17)) == 1, "rk4 order ratio 8->16 < 17");
+assert(f64_gt(erk_rb, f64_from(14)) == 1, "rk4 order ratio 16->32 > 14");
+assert(f64_lt(erk_rb, f64_from(17)) == 1, "rk4 order ratio 16->32 < 17");
+
+# --- 7. Non-autonomous, non-polynomial: y' = t*y, y(0)=1 -> y(1) = sqrt(e).
+#        n=8 exact-rational RK4 reference 1.6487206103294634 (err 6.604e-7);
+#        n=16 reference 1.6487212322380775 (err 3.846e-8).
+#        RK3 errs 9.40e-5, RK2 3.95e-3, Euler 1.25e-1 -- all fail the 2e-6 bound.
+var erk_t8  = _ec_rk4_run(&_ec_dydt_ty, 0, F64_ONE, erk_h8, 8);
+var erk_t16 = _ec_rk4_run(&_ec_dydt_ty, 0, F64_ONE, erk_h16, 16);
+assert(f64_approx_eq(erk_t8, 0x3FFA6128DCD9B304, RK4_T13), "rk4 t*y n=8 (1e-13)");
+assert(f64_approx_eq(erk_t16, 0x3FFA612983CAEF0F, RK4_T13), "rk4 t*y n=16 (1e-13)");
+assert(f64_approx_eq(erk_t8, RK4_SQRTE, RK4_2EM6), "rk4 t*y n=8 vs sqrt(e) < 2e-6");
+assert(f64_approx_eq(erk_t16, RK4_SQRTE, RK4_2EM6), "rk4 t*y n=16 vs sqrt(e) < 2e-6");
+
+# --- 8. Backward integration (dt < 0). Nothing above ever uses a negative or
+#        zero step, so a sign defect in dt/half_dt is invisible to 1-7.
+#        y' = y, one step dt=-1: R(-1) = 1 - 1 + 1/2 - 1/6 + 1/24 = 3/8 exactly.
+#        y' = 4t^3 from (t=1, y=1) with dt=-1 lands on the exact solution t^4
+#        at t=0, i.e. 0 (Simpson again, and it pins t_half = t + dt/2 < t).
+var erk_rn = num_rk4(&_ec_dydt_y, 0, F64_ONE, f64_neg(F64_ONE));
+assert(f64_approx_eq(erk_rn, 0x3FD8000000000000, RK4_T13), "rk4 R(-1)=3/8 (1e-13)");
+var erk_qb = num_rk4(&_ec_dydt_4t3, F64_ONE, F64_ONE, f64_neg(F64_ONE));
+assert(f64_approx_eq(erk_qb, 0, RK4_T15), "rk4 backward cubic t=1->0 gives 0 (1e-15)");
 
 # ================================================================
 # Complex — cx_mul with zero = zero

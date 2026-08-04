@@ -172,11 +172,75 @@ are **not** standalone and are labelled as such in the test — pre-fix, `out_S`
 a zero-filled buffer satisfies them trivially; they are meaningful only bundled with the
 return-code and reconstruction assertions beside them.
 
-**Not reproduced:** the `eigen_qr` unit-scale non-convergence filed during 2.7.0-C. A 12-matrix
-random symmetric-4×4 probe shows **0 failures on every version tested**, including pre-balancing —
-so the probe is too weak to exercise the claim, and the specific matrix that did reproduce it was
-lost with a temp file. The finding stays **open**, unverified either way, rather than being closed
-on evidence that does not support it. A separate pre-existing defect surfaced
+#### Test quality — `num_rk4` had **zero effective coverage** (2.7.0-G)
+
+`num_rk4`'s only assertion in the entire tree was `dy/dt = 1, y(0) = 0, dt = 1 → y(1) = 1`, checked
+with `f64_to(erx) == 1`. It could not fail, for two independent reasons:
+
+1. **The test problem carries no order information.** With `f(t,y) = 1` every stage of every
+   explicit RK method returns 1, so Euler, midpoint, RK3, stages evaluated at the wrong `t`, and
+   `k3` built from `k1` all return exactly 1.0. Order 1 versus order 4 is invisible.
+2. **The comparison is a truncation, not a tolerance.** `f64_to` truncates toward zero, so the
+   assertion accepts anything in `[1.0, 2.0)` — up to +100% relative error, roughly 1e15× looser
+   than the method's own round-off floor.
+
+`num_rk4` could have been replaced by `return f64_add(y, f64_mul(dt, f(t,y)));` — plain Euler — and
+the whole 1250-assertion tree would have stayed green. **Confirmed by doing exactly that.**
+
+Replaced with 16 assertions built on references derived independently of the implementation: the
+stability function `R(z) = 1 + z + z²/2 + z³/6 + z⁴/24` that any 4-stage order-4 method must
+satisfy (`R(1) = 65/24`, `R(1/2) = 211/128`, `R(−1) = 3/8`, all exact); Simpson-exactness on
+`y' = 4t³`; the closed form `y(t) = exp(t²/2)`; and multi-step values computed in **exact rational
+arithmetic** (`fractions.Fraction`, no floating point in the reference) against `e` and `√e` at 60
+digits. Every hex constant produced by `struct.pack('>d')`, none typed by hand.
+
+The strongest of these is an **observed order-of-convergence** check — `err(h)/err(h/2)` must land
+in (14, 17). Measured 15.190 and 15.589 for RK4; RK3 gives 7.61, RK2 3.82, Euler 1.90.
+
+Adversarial review then found the block still blind to `dt ≤ 0` — every case used a forward step —
+so a sign defect in `half_dt` survived. Two backward-integration assertions were added, and both
+kill it.
+
+*Evidence:* against an Euler stub, **14 of the 16 new assertions fail**. The previous single
+assertion passed. Suite 1250 → **1266**.
+
+**Five further test-quality repairs are specified but not yet applied**, filed under
+`docs/development/issues/2026-08-04-tq-*.md`. All six were adversarially reviewed and all six stand
+— but the reviewers also catalogued **~35 mutants the new assertions still would not catch**, which
+is the next round of work rather than a rejection. The most alarming: `calc_integral_simpson`
+survives `h = (b − a)/steps` → `h = b/steps` **and** `xi = a + i·h` → `xi = i·h`, i.e. it is
+effectively untested for `a ≠ 0`; `ode_verlet`/`ode_symplectic_euler` never actually invoke the
+caller's function pointer (hardcoding the SHO survives every assertion), and survive `alloc(8)`
+where 16 bytes are stored; `eigen_power` survives a transposed matvec because both test matrices
+are symmetric; and the Gell-Mann basis leaves the **sign of λ₄..λ₇ unconstrained** — pinning it
+needs the SU(3) structure constants.
+
+#### Fixed — `eigen_qr` non-convergence (2.7.0-F)
+
+Last release I said this finding was **not reproduced** and left it open rather than close it on
+evidence that did not support either verdict. Reproduced now, by sweeping 150 random symmetric
+4×4s across three magnitude regimes: **1 failed**. Its condition number is only **240** — a matrix
+LAPACK's `dsyev` handles without comment — with eigenvalues 27.793, −2.999, 0.417, −0.116, and
+`eigen_qr` returned `HSB_ERR_NO_CONVERGENCE` even at `max_iter = 1,000,000`.
+
+The cause was the **block-boundary logic**, not the QR sweep. `_lp_tridiag_qr` located the start of
+the unreduced block with two loops:
+
+1. The first contained a **fake break** — a `var _break = 1;` and two no-op `p_lo = p_lo;`
+   statements with a `# break` comment. Cyrius has a real `break`; this one does nothing, so the
+   loop always ran to 0, zeroing offdiagonals across the whole matrix as a side effect.
+2. The author evidently noticed it did not work and discarded its result — the next line is
+   literally `# Re-find p_lo properly` — with a second loop whose test was an **absolute**
+   `EPSILON_F64`, inconsistent with the **relative** `eps·(|d[i]| + |d[i−1]|)` threshold the
+   deflation test three lines above uses.
+
+On a matrix whose entries span 0.04 .. 24.6 those two disagree about what counts as negligible, so
+the block bounds and the deflation test could contradict each other and the sweep stalled. Replaced
+with a single loop using the same relative threshold as the deflation test.
+
+*Evidence:* the 150-matrix sweep goes **1 failure → 0**. All six new assertions — convergence, the
+four eigenvalues against `numpy.linalg.eigvalsh`, and the `A·v = λ·v` relation — fail on revert.
+All four suites are unchanged by the fix, so it is not a tolerance loosening. A separate pre-existing defect surfaced
 alongside the balancing work: `eigen_qr` returns `HSB_ERR_NO_CONVERGENCE` at *unit* scale for a
 well-conditioned symmetric 4×4 (cond 6.85), reproduced on unpatched source.
 

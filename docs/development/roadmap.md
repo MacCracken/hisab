@@ -162,7 +162,22 @@ before this. Suite 1154 → 1181.
       9 of 11 new assertions fail on revert *(2.7.0-D)*
 
 ### Test quality  (12 findings — assertions that cannot fail for the right reason)
-- [ ] `num_rk4`'s **only** assertion in the whole tree tolerates a 90% error
+- [x] `num_rk4`'s **only** assertion in the whole tree could not fail — the test problem
+      (`f = 1`) carries no order information *and* `f64_to` truncates, accepting `[1.0, 2.0)`.
+      Proven: replacing `num_rk4` with plain Euler kept all 1250 assertions green. Now 16
+      assertions on independently-derived references (stability function, exact-rational
+      multi-step, observed order-of-convergence in (14,17)); an Euler stub fails 14 of 16
+      *(2.7.0-G)*
+- [ ] **~35 surviving mutants catalogued by adversarial review** of the six test-quality repairs —
+      the next round, filed per-finding in `../development/issues/2026-08-04-tq-*.md`. Highest
+      value: `calc_integral_simpson` is effectively untested for `a != 0` (both the `h = (b-a)/n`
+      and `xi = a + i*h` a-drops survive); `ode_verlet`/`ode_symplectic_euler` never invoke the
+      caller's function pointer at all; `eigen_power` survives a transposed matvec (both test
+      matrices are symmetric); Gell-Mann leaves the sign of λ₄..λ₇ free (needs the SU(3) structure
+      constants)
+- [ ] Apply the five remaining specified test-quality repairs (ode_verlet, unit-tolerance sweep,
+      gell-mann, simpson, existence-only) — all verified to compile and pass, all adversarially
+      reviewed, filed under `../development/issues/2026-08-04-tq-*.md`
 - [ ] `ode_verlet` / `ode_symplectic_euler` asserted only `!= 0` — unconditional
 - [ ] **21 assertions use `f64_from(1)` — a literal tolerance of 1.0** — on quantities whose exact
       value is 0 or 1
@@ -182,14 +197,12 @@ before this. Suite 1154 → 1181.
 - [ ] Benchmark the hot public functions that still have none, so regressions are visible
 
 ### Found during 2.7.0-C (new — not in the 2026-08-04 audit)
-- [ ] **`eigen_qr` reported as returning `HSB_ERR_NO_CONVERGENCE` at unit scale** for a
-      well-conditioned symmetric 4×4 (cond 6.85, eigenvalues −1.877, −0.278, 0.274, 1.387) at
-      `max_iter = 1,000,000`, reproduced on unpatched source during 2.7.0-C.
-      ⚠️ **NOT reproduced since, and NOT confirmed fixed.** A 12-matrix random symmetric-4×4 probe
-      returns 0 failures on *every* version including pre-balancing, so the probe does not exercise
-      whatever the original matrix hit; those bit patterns were lost with a temp file. **Next step
-      is to re-derive a repro** (sweep symmetric 4×4s until one fails), not to assume either
-      outcome — the finding is open and unverified in both directions
+- [x] **`eigen_qr` returned `HSB_ERR_NO_CONVERGENCE`** on a moderately-conditioned symmetric 4×4.
+      Re-derived the repro as promised — swept 150 random symmetric 4×4s, 1 failed, **cond only
+      240**, non-convergent even at `max_iter = 1e6`. Cause was the block-boundary logic, not the
+      sweep: a dead loop with a **fake break** (`var _break = 1;` + no-op `p_lo = p_lo;`) whose
+      result was then discarded by a re-find using an **absolute** epsilon against the **relative**
+      deflation threshold beside it. One loop now, same threshold. Sweep 1 → 0 failures *(2.7.0-F)*
 
 ### Found during 2.7.0-B (new — not in the 2026-08-04 audit)
 - [ ] **`lib/hisab.cyr` is a tracked 591 KB copy of hisab's own 2.6.15 distlib bundle**, sitting in

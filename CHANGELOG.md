@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+## [2.7.2] - 2026-08-04 — **coverage target met: 80%**
+
+`cyrius coverage` **76% → 80%** (474/587 functions), the target set at the start of the 2.6.x audit
+arc and carried through eleven releases. Suite **1643 → 1677**.
+
++34 assertions closing the last two large holes:
+
+- **`lie_ext` SO(3)/SE(3)** — group identities, which are exact and need no tolerance: `R·R⁻¹ = I`
+  on all nine entries, `|log(R)|` equal to the rotation angle, `(g·g⁻¹)` fixing an arbitrary point,
+  `se3_identity` fixing every point, `se3_to_mat4`/`from_mat4` round-tripping, and BCH reducing to
+  plain addition for parallel (commuting) arguments.
+- **`num_ext` number theory** — exact integer answers: `extended_gcd(240,46) = 2` *and* its Bézout
+  identity, `modinv(3,11) = 4`, `φ(36) = 12`, `σ₀(28) = 6` / `σ₁(28) = 56` (28 is perfect), CRT
+  `(2 mod 3, 3 mod 5, 2 mod 7) → 23 mod 105`, `84 = 2·2·3·7` as four factors, Pollard-rho returning
+  a real divisor of 8051, and Halton `(1, base 2) = ½` exactly.
+
+### Three of my own errors, caught by the gates rather than by review
+
+Worth recording because all three were *type* mistakes that a passing suite would have hidden:
+
+- **`so3_from_quat` takes an SU(2) element, not an `HQuat`** — it calls `su2_to_quat` internally.
+  Passing an `HQuat` silently reinterprets it and yields a **double-angle** rotation: `R[0][0]` came
+  back `−1` (cos 180°) where `0` (cos 90°) was meant. This looks exactly like the half-vs-full-angle
+  defect repaired in 2.6.13, and I initially took it for a recurrence of it. It is not — the library
+  is correct and the call was wrong.
+- **`se3_new` takes an SU(2) rotation, not a `Mat3`** — same family, same symptom.
+- **`num_crt` takes vecs, not raw `alloc()` buffers** — it reads them with `vec_get`. Passing raw
+  buffers **SIGSEGVs**, which is how that assertion was first written and how it was found.
+
+None is a library defect. All three are recorded because "the test crashed" is the cheap outcome;
+the expensive one is a test that passes against the wrong types and certifies nothing.
+
+### Still open — carried to 2.8.x
+
+`delaunay_2d` needs a data-structure change, not an optimisation (see 2.7.1 for the measurements
+that rejected the x-sweep), and `_col_in_circumcircle`'s adaptive predicate remains latent at
+0/180 under real geometry.
+
 ## [2.7.1] - 2026-08-04 — performance landings, coverage, and a rejected optimisation
 
 Suite **1607 → 1643**, `cyrius coverage` **71% → 76%** (448/587 functions).

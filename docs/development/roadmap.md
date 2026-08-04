@@ -11,12 +11,12 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.13
+## Current -- v2.6.14
 
 - **34 math modules in `src/`, ~16,900 lines** (`lib/` is vendored-only)
-- **1063 test assertions** (foundation 307 + hisab 200 + edge_cases 187 + modules 369), 26 benchmarks (incl. amplified SIMD batches), fuzz harness (1/1), and `scripts/check-constants.sh` verifying **110/110** hand-encoded f64 constants against their own comments. `cyrius coverage` **320/587 (54%)**, files 29/35 — 4 of the 8 never-tested modules closed in 2.6.13
+- **1093 test assertions** (foundation 307 + hisab 205 + edge_cases 199 + modules 382), 26 benchmarks (incl. amplified SIMD batches), fuzz harness (1/1), and `scripts/check-constants.sh` verifying **110/110** hand-encoded f64 constants against their own comments. `cyrius coverage` **335/587 (57%)**, files 32/35 — 6 of the 8 never-tested modules closed across 2.6.13/2.6.14
 - **CLI smoke binary** ~207 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~17,021 lines / 560 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
+- **`dist/hisab.cyr` distlib bundle** ~17,159 lines / 571 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
 - Toolchain **6.5.6** (bumped from 6.4.69 in **2.6.11** — a **minor** jump across 24 releases: no executable library change, the bundle diff being the version header plus one `mat_new_guarded` doc comment; sakshi 2.4.6 → **2.4.7**). The headline effect is the vendored `ganita` reaching **1.0.4**: the repo's copy had been stale at **1.0.3** since before the 6.4.69 pin, so this bump closes the long-tracked CWE-190 in stdlib `mat_new` — measured, `mat_new(-5, 3)` **segfaulted** on 1.0.3 and returns null on 1.0.4. hisab's `mat_new_guarded` stays as the stricter 16M-element policy cap (upstream's ceiling is 33.5M). Also adopted this release: the 6.5.6 `sys_exit_group` epilogue idiom, and an **exit-code clamp** in all four test harnesses — the unclamped `assert_summary()` count meant exactly 256/512/768 failures exited 0 and scored PASS (proven, then fixed). `cyrius fuzz` now discovers `tests/*.fcyr` (6.5.6 walks `tests/`, not just `fuzz/`), so the harness runs for the first time — and passes. CI fmt/lint/vet/security all green; supply chain SHA-locked (`cyrius.lock` 30 deps, verify 30/30). Tracked-issue re-verify on the new pin (minimal repros): for-empty-clauses **still live**, interval-ident-lex **still live** (both worked around) — no new fixes
 - **Arc history** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security, fixed three real collision bugs), 2.5.x (CGA depth + matrix guard, CGA 1 → 29 assertions), and 2.6.x (differential-geometry depth — sectional curvature, Weyl, parallel transport, geodesic deviation, higher forms; 28 known-manifold assertions). Per-version detail is in the Release History table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md). Suite grew 825 → 961 across them.
 - **The 2.6.x *feature* line is closed** — no residual feature work carried forward; the diffgeo
@@ -29,13 +29,14 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 
 ---
 
-## 2.6.12 -- Audit, hardening & repair sweep (P0 CLOSED — P1/P3/P4 open)
+## 2.6.12 -- Audit, hardening & repair sweep (P0 + P1 CLOSED — P3/P4 open)
 
-> **Status 2026-08-03.** **P0 is fully closed** across 2.6.12 (constants, harness,
-> `num_is_prime`, `solve_bicgstab`) and 2.6.13 (SVD, eigensolver, SE(3), einsum, intervals).
-> Suite 961 → **1063**, every fix mutation-proven. `cyrius coverage` 50% → **54%**; four of the
-> eight never-tested modules are now in the suites. **P1, P3 and P4 remain open**, plus the four
-> modules still untested: `calc_ext`, `noise_simplex`, `num_ext`, `symbolic_ext`.
+> **Status 2026-08-03.** **P0 and P1 are both fully closed** across three releases — 2.6.12
+> (constants, harness, `num_is_prime`, `solve_bicgstab`), 2.6.13 (SVD, eigensolver, SE(3),
+> einsum, intervals) and 2.6.14 (the memory-safety tier). Suite 961 → **1093**, every fix
+> mutation-proven; five of the defect groups crashed the process pre-fix. `cyrius coverage`
+> 50% → **57%**, files 25/35 → **32/35**; six of the eight never-tested modules are now in the
+> suites. **P3 and P4 remain open**, plus `num_ext` and `symbolic_ext`.
 
 A full P(-1) sweep of the 2.6.11 tree: 8 parallel audit dimensions over all 34 modules, every
 finding then adversarially re-verified against the running code. **70 findings survived
@@ -94,23 +95,33 @@ sRGB breakpoints (0.03275 vs the spec's 0.04045) and spherical-harmonic normalis
 
 ### P1 -- Memory safety & robustness
 
-- [ ] Null-return dereferences after capped constructors: `cmat_mul`/`cmat_kronecker`
-      (`complex.cyr:332`), `cmat_inverse` (`linalg_ext.cyr:931`), `einsum` (`einsum.cyr:231`),
-      `opt_bfgs`/`opt_lbfgs` (`optimize.cyr:279`) — each turns a designed error signal into SIGSEGV
-- [ ] `calc_bspline` / `calc_nurbs` negative control-point index → wild-pointer deref when
-      `n_pts <= degree` (`calc_ext.cyr:335`)
-- [ ] `kdtree_build` O(n) recursion depth on coincident points → **segfault at 60k points**
-      (`spatial.cyr:61`); `_kd_partition` splits on the value midpoint, not a positional median
-- [ ] Adaptive Simpson bounds *depth* (50) but not *work* → ~2^50 evaluations on a NaN integrand
-      (`calc_ext.cyr:243`); NaN also defeats the Armijo test in `_opt_armijo` (`optimize.cyr:94`),
-      poisoning BFGS/L-BFGS/CG
-- [ ] `FLOAT_RENDER_BUF = 32` too small for `fmt_float_buf`, which uses the caller buffer as scratch
-      out to offset 40 (`symbolic.cyr:19`)
-- [ ] `cx_div`/`cx_inv`/`cx_powf` compare a **squared** modulus against the unsquared `EPSILON_F64`,
-      so the effective zero-divisor cutoff is 1e-6, not 1e-12 (`complex.cyr:57`)
-- [ ] `ivl_div` zero-guard uses raw integer `== 0` on an f64 bit pattern, so **-0.0 slips through**
-      (`interval.cyr:80`); `ivl_sqrt` of a wholly-negative interval returns `[0, NaN]`
-- [ ] Four fBm entry points return NaN for `octaves <= 0` despite documenting a `[-1,1]` range
+**Closed in 2.6.14.** Three of the four groups crashed the process pre-fix — reverting
+`complex.cyr`, `calc_ext.cyr` or `optimize.cyr` individually makes the suite exit 139 (SIGSEGV).
+
+- [x] Null-return dereferences after capped constructors — `cmat_mul`, `cmat_kronecker`,
+      `cmat_identity` (`complex.cyr`) and `cmat_inverse` (`linalg_ext.cyr`). Each is reachable
+      from operands that are themselves under the 65536 cap: `cmat_mul` of 1000x1 by 1x1000 asks
+      for 1e6; `cmat_inverse` doubles the width building `[M | I]`. **Shipped 2.6.14**
+- [x] `opt_bfgs` / `opt_lbfgs` sized an `n x n` (resp. `m x (2n+1)`) working buffer from an
+      unbounded dimension — added `_OPT_MAX_DIM = 4096`, alloc checks in all four solvers, and a
+      new `HSB_ERR_ALLOC`. **Shipped 2.6.14**
+- [x] `calc_bspline` / `calc_nurbs` indexed control points **negatively** when `n_pts <= degree`
+      — neither validated `degree` nor the `n_pts >= degree+1` well-formedness rule.
+      **Shipped 2.6.14**
+- [x] Adaptive Simpson bounded *depth* (50) but not *work* — 2^50 evaluations on a NaN integrand,
+      which never satisfies the tolerance test because every NaN comparison returns 0. Added an
+      explicit non-finite bail and a stop-when-bisection-stalls check. **Shipped 2.6.14**
+- [x] `kdtree_build` recursed to depth O(n) on coincident points — measured fine at 40k,
+      **SIGSEGV at 60k**. The value-midpoint split can only degenerate when all points share the
+      axis value, which is exactly when a positional split is sound. **Shipped 2.6.14**
+- [x] `_opt_armijo` accepted a NaN objective (its `f64_lt(threshold, f_new) == 0` tie-breaker is
+      also true for NaN), poisoning BFGS / L-BFGS / CG. **Shipped 2.6.14**
+- [x] `cx_div` / `cx_inv` / `cx_powf` compared a squared modulus against an unsquared tolerance,
+      making the zero-divisor cutoff 1e-6 rather than 1e-12. **Shipped 2.6.14**
+- [x] `FLOAT_RENDER_BUF` was 32 against stdlib `fmt_float_buf`'s scratch reach of offset 45.
+      Raised to 64. **Shipped 2.6.14**
+- [x] Four fBm entry points returned NaN for `octaves <= 0`. **Shipped 2.6.14**
+- [x] Interval enclosure soundness (`ivl_div` `-0.0`, `ivl_sqrt` `[0, NaN]`). **Shipped 2.6.13**
 
 ### P2 -- Test coverage (the root cause)
 
@@ -122,8 +133,8 @@ functions** — are included by *no* test suite, so they are not even compiled b
 yet all eight ship in `dist/hisab.cyr` to 8 consumers.
 
 - [~] Bring the 8 never-included modules into the suites; then raise `cyrius coverage` past 80%.
-      **4 done in 2.6.13** (`einsum`, `lie_ext`, `mat3`, `linalg_precision`); coverage 50% → 54%.
-      Remaining: `calc_ext`, `noise_simplex`, `num_ext`, `symbolic_ext`
+      **6 done**: `einsum`, `lie_ext`, `mat3`, `linalg_precision` (2.6.13) + `calc_ext`,
+      `noise_simplex` (2.6.14). Coverage 50% → **57%**. Remaining: `num_ext`, `symbolic_ext`
 - [ ] Replace bounds-check assertions with **value** assertions where a broken method still passes:
       the only `ode_dopri45` test asserts `1 < y < 2` for a value whose exact answer is 1.10517,
       and the `gauss5` tests round to the nearest integer, hiding a 246 ppm error floor
@@ -244,6 +255,7 @@ entry point, so nothing further is owed.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.6.14 | 2026-08-03 | 17,000 | 34 | **P1 closeout — the memory-safety tier.** Three of the four defect groups **crashed the process** pre-fix: reverting `complex.cyr`, `calc_ext.cyr` or `optimize.cyr` individually makes the suite exit 139. Capped constructors (`cmat_mul`, `cmat_kronecker`, `cmat_identity`, `cmat_inverse`) stored through `cmat_new`'s documented 0-on-failure return — reachable from operands *under* the cap, since `cmat_mul` of 1000×1 by 1×1000 asks for 1e6 and `cmat_inverse` doubles the width. `opt_bfgs`/`opt_lbfgs` sized `n×n` / `m×(2n+1)` buffers from an unbounded dimension (added `_OPT_MAX_DIM`, alloc checks, `HSB_ERR_ALLOC`). `calc_bspline`/`calc_nurbs` indexed control points **negatively** when `n_pts <= degree`. Adaptive Simpson bounded depth but not work (2^50 evaluations on a NaN integrand). `kdtree_build` recursed O(n) deep on coincident points — fine at 40k, **SIGSEGV at 60k**. `_opt_armijo` accepted NaN. `cx_div`/`cx_inv`/`cx_powf` used a 1e-6 cutoff instead of 1e-12 (squared vs unsquared tolerance). `FLOAT_RENDER_BUF` was 32 against a scratch reach of 45. Four fBm entry points returned NaN for `octaves <= 0`. **+`calc_ext`, `noise_simplex` into the suites**; coverage 54% → **57%**. 1093 |
 | 2.6.13 | 2026-08-03 | 16,900 | 34 | **P0 closeout** of the 2026-08-03 audit — every remaining critical/high correctness defect, all in modules with **zero test coverage**. `svd_golub_kahan` composed the left Householder reflectors forward, returning U **transposed** so `A != U·S·Vᵀ` (8 of 9 entries wrong); now accumulated backward. `eigen_qr` applied `Gᵀ T G` instead of `G T Gᵀ` — the transpose of the rotation that zeroes the bulge — so it **never converged for n ≥ 3** (NO_CONVERGENCE on a symmetric 3×3 at 100k iters) and paired wrong eigenvectors at n = 2. `su2_exp`/`su2_log` moved to half-angle, restoring `su2_to_rotation_matrix(su2_exp(ω)) == so3_exp(ω)` and fixing `se3_exp`, which had built R and t from angles a factor of 2 apart. `einsum` accepted only labels `a`–`h`, so **every example in its own header** was silently mis-parsed — it returned the trace (5, not 19) then segfaulted; alphabet widened to `a`–`z` with real validation. Three interval enclosure-soundness violations fixed (`ivl_sin` under-approximated across extrema, `ivl_sqrt` returned `[0,NaN]` which `ivl_contains` treated as universal, `ivl_div` missed `-0.0`). **4 of the 8 never-tested modules brought into the suites** (`einsum`, `lie_ext`, `mat3`, `linalg_precision`); coverage 50% → **54%**. 1063 |
 | 2.6.12 | 2026-08-03 | 16,600 | 34 | **Audit sweep — repair release.** Full P(-1) audit of all 34 modules found **70 verified defects (2 critical)**; see `audit/2026-08-03.md`. Closed the critical tier: **seven hand-encoded constant tables** did not encode their documented values — **47 constants re-derived** from exact rationals. DOPRI45 had 23 of 30 tableau constants wrong (Σb = 0.636, not 1) and was **not a consistent integrator at any order**; BDF-4 drifted 1%/step; Yoshida-4 moved a free particle 85.9% of the correct distance; Gauss-5 carried a 246 ppm error floor; plus sRGB breakpoints, spherical harmonics, `_SIMPLEX_G2`, the slerp threshold. Also fixed `num_is_prime` (i64 overflow reported real primes composite above 3.03e9) and `solve_bicgstab` (`f64_from` on a bit pattern made the tolerance 4.34e18 — it never iterated). Added **`scripts/check-constants.sh`**, a CI gate verifying all 110 hex f64 literals against their comments. Replaced the loose assertions that let it all ship (dopri45 asserted only `1 < y < 2`). 981 |
 | 2.6.11 | 2026-08-03 | 16,600 | 34 | Toolchain 6.4.69 → **6.5.6** (a **minor** jump across 24 releases) + sakshi 2.4.6 → **2.4.7**. No executable library change — the bundle diff is the version header plus one `mat_new_guarded` doc comment, zero code lines. **Security:** the vendored `lib/ganita.cyr` was stale at **1.0.3** (the 6.4.69 pin already shipped 1.0.4); re-vendoring closes the tracked CWE-190 in stdlib `mat_new` — `mat_new(-5, 3)` **segfaulted** on 1.0.3, returns null on 1.0.4 (measured, same compiler, only ganita swapped). **Fixed:** all four `.tcyr` harnesses exited with `assert_summary()`'s raw failure count, so exactly 256/512/768 failures truncated to 0 and scored PASS — now clamped. Adopted the 6.5.6 `sys_exit_group` epilogue. `cyrius fuzz` now discovers `tests/*.fcyr` (1 passed — previously never run). Smoke string 2.6.10 → 2.6.11. Tracked issues re-verified still-live (interval-ident-lex, for-empty-clauses). +4 assertions pinning the upstream `mat_new` contract. 961 |

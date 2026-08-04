@@ -3,12 +3,108 @@
 ## [Unreleased]
 
 ### Remaining from the 2.6.12 audit
-**P0 is now closed.** Outstanding: all of P1 (null-return dereferences, `calc_bspline` negative
-index, `kdtree_build` depth, adaptive-Simpson work bound, `FLOAT_RENDER_BUF`, `cx_div` epsilon),
-P3 (the two O(n²) hot paths) and P4 (docs drift), plus the four modules still included by no test
-suite: `calc_ext`, `noise_simplex`, `num_ext`, `symbolic_ext`.
+**P0 and P1 are now closed.** Outstanding: **P3** (the two O(n²) hot paths, plus the
+Levenberg-Marquardt / L-BFGS per-iteration allocations) and **P4** (10 documentation drifts),
+plus the two modules still included by no test suite: `num_ext`, `symbolic_ext`.
 See [`docs/development/roadmap.md`](docs/development/roadmap.md) §2.6.12 and
 [`docs/audit/2026-08-03.md`](docs/audit/2026-08-03.md).
+
+## [2.6.14] - 2026-08-03 — P1 closeout: memory safety and robustness
+
+Third repair release of the 2.6.12 audit, closing the **memory-safety tier**. Three of the four
+defect groups **crashed the process** before this release — reverting `complex.cyr`, `calc_ext.cyr`
+or `optimize.cyr` individually makes the new suite exit **139 (SIGSEGV)** rather than merely fail.
+
+Two more never-tested modules (`calc_ext`, `noise_simplex`) are now in the suites, leaving only
+`num_ext` and `symbolic_ext`. Suite 1063 → **1093**; `cyrius coverage` 54% → **57%**, files 29/35
+→ **32/35**.
+
+### Fixed — capped constructors' null return was stored through (CWE-476)
+`cmat_new` caps at `_CMAT_MAX_ELEMS` (65536) and correctly returns 0 above it. Four callers then
+wrote through that 0, converting a designed error signal into a segfault. Each is reachable from
+operands that are themselves *under* the cap:
+- `cmat_mul` — `ar × bc` can exceed it when the operands cannot: 1000×1 times 1×1000 asks for 1e6.
+- `cmat_kronecker` — multiplies *both* dimensions; 17×17 ⊗ 17×17 is 83521. (16×16 ⊗ 16×16 is
+  exactly 65536 — at the cap, and legitimately allowed; the tests pin both sides of that edge.)
+- `cmat_inverse` (`linalg_ext`) — builds `[M | I]`, doubling the width, so a 250×250 input under
+  the cap produces a 250×500 augmented matrix over it.
+- `cmat_identity` — propagates from a caller-supplied `n`.
+
+### Fixed — `opt_bfgs` / `opt_lbfgs` sized working memory from an unbounded dimension
+`opt_bfgs` allocates an `n × n` inverse Hessian and `opt_lbfgs` an `m × (2n+1)` history ring, with
+no cap on `n` or `m`: `alloc` returned 0 and the initialisation loop stored through it (CWE-190 →
+CWE-476). Added `_OPT_MAX_DIM = 4096` (the hard ceiling from `ALLOC_MAX` is 5792) plus explicit
+allocation checks in all four solvers, and a new `HSB_ERR_ALLOC` (`-11`) so allocation failure is
+reportable rather than fatal.
+
+### Fixed — `calc_bspline` / `calc_nurbs` indexed control points negatively
+Both validated `n_pts != 0` and the knot-count relation but never `degree` itself, nor the
+well-formedness requirement that a degree-*d* spline needs at least *d+1* control points. With
+`degree >= n_pts` the span search left `k = degree`, the sentinel-undo turned that into
+`k - n_pts`, and de Boor indexed `ctrl_pts` at a **negative** offset — an out-of-bounds read
+resolving to a wild-pointer dereference instead of the documented 0-on-invalid-input return.
+
+### Fixed — adaptive Simpson bounded depth but not work
+The recursion capped *depth* at 50, but every non-converged node spawns two children, so the cap
+permits 2^50 (~1e15) integrand evaluations. A NaN integrand takes exactly that path: every f64
+comparison involving NaN returns 0, so `|error| < tol` is false forever. Two bounds added — an
+explicit non-finite bail (NaN is the only value comparing unequal to itself), and a
+stop-when-bisection-stops-progressing check, which bounds real work by f64 resolution rather than
+by the counter.
+
+### Fixed — `kdtree_build` recursed to depth O(n) on coincident points
+`_kd_partition` splits on the axis **value** midpoint. That separates properly whenever
+`lo < hi` — the point attaining `lo` is below the midpoint, the one attaining `hi` is not — so it
+can *only* degenerate when every point shares the axis value. That case fell to the
+"ensure at least one item per side" clamp, which peels exactly **one** element per level. Measured
+on the pre-fix code: fine at 40,000 coincident points, **SIGSEGV at 60,000**. Now splits
+positionally in exactly that case, which is sound precisely because the values are equal — the
+`split_val` the caller reads is then the common value, so query pruning compares exactly. Pinned
+by both a 60,000-point build and a half-coincident tree asserting an exact nearest-neighbour hit.
+
+### Fixed — NaN accepted by the Armijo line search
+`_opt_armijo`'s tie-breaker was written `f64_lt(threshold, f_new) == 0`, which is also true when
+`f_new` is NaN, so a NaN objective was accepted as a valid step and propagated into `x` for
+`opt_bfgs`, `opt_lbfgs` and `opt_conjugate_gradient`. Now requires `f_new` to compare equal to
+itself first.
+
+### Fixed — complex zero-divisor cutoff was 1e-6, not 1e-12
+`cx_div`, `cx_inv` and `cx_powf` compared a **squared** modulus against the **unsquared**
+`EPSILON_F64`, so any divisor with |z| < 1e-6 was silently flushed to zero — six orders of
+magnitude more aggressive than intended. `cx_is_zero` alongside them always squared its tolerance
+correctly, which is the tell. Now `norm_sq < EPSILON_F64²`; a 1e-9 divisor inverts correctly and
+an exact zero is still guarded.
+
+### Fixed — `FLOAT_RENDER_BUF` was 14 bytes short of stdlib's scratch requirement
+`fmt_int_buf` renders digits backwards from `buf + 23` before shifting them down, so it needs 24
+bytes at whatever pointer it is handed — and `fmt_float_buf` calls it **twice**, the second time
+at an offset that can reach 22 (sign + 20 whole digits + `.`), touching offset **45**. The buffer
+was 32. Raised to 64. A large-magnitude symbolic coefficient overran the allocation.
+
+### Fixed — four fBm entry points returned NaN for `octaves <= 0`
+`fbm_2d`, `fbm_3d`, `simplex_fbm_2d` and `simplex_fbm_3d` all end in an unguarded
+`f64_div(sum, max_amp)`, and `max_amp` only accumulates inside the octave loop — so it is exactly
+0 when `octaves <= 0` and the functions returned NaN despite documenting a roughly `[-1, 1]`
+range. NaN then propagated silently through every downstream sample. All four now return 0.
+
+### Changed
+- **`src/error.cyr`** — added `HSB_ERR_ALLOC = -11`.
+- **`calc_ext` and `noise_simplex` brought into `tests/modules.tcyr`** — both shipped in
+  `dist/hisab.cyr` while being included by no suite, so they were not even compiled by
+  `cyrius test`.
+
+### Verified
+- Suite **1093/1093** (foundation 307 + hisab 205 + edge_cases 199 + modules 382), up from 1063.
+  Mutation-proven per file against pre-fix source: reverting `complex.cyr` → **SIGSEGV**,
+  `calc_ext.cyr` → **SIGSEGV**, `optimize.cyr` → **SIGSEGV**, `noise_simplex.cyr` → 2 failures,
+  `spatial.cyr` → **SIGSEGV** at 60k points.
+- `cyrius coverage` 320/587 → **335/587 (57%)**; files 29/35 → **32/35**.
+- `cyrius fuzz` 1/1; `check-constants.sh` 110/110; `lint` / `fmt --check` / `vet` clean;
+  `deps --verify` 30/30; `cyrius distlib` regenerated (17,021 → 17,159 lines).
+- **No performance claim.** No benchmarked path changed. The kd-tree fix alters build *shape* on
+  degenerate input — from O(n²) to O(n log n) — but `kdtree_build` has no benchmark, so the
+  improvement is stated as a complexity argument and a 60k-point build that previously crashed,
+  not as a measured number.
 
 ## [2.6.13] - 2026-08-03 — P0 closeout: SVD, eigensolver, SE(3) and interval soundness
 

@@ -15,6 +15,8 @@ include "src/color.cyr"
 include "src/geo.cyr"
 include "src/geo_advanced.cyr"
 include "src/calc.cyr"
+include "src/calc_ext.cyr"
+include "src/noise_simplex.cyr"
 include "src/num.cyr"
 include "src/complex.cyr"
 include "src/lie.cyr"
@@ -1687,6 +1689,77 @@ while (lei < 9) {
     "se3_exp rotation block == so3_exp(omega)");
     lei = lei + 1;
 }
+
+# ================================================================
+# calc_ext + noise_simplex — first coverage (untested through 2.6.13)
+# ================================================================
+test_group("calc_ext: B-spline / NURBS reject ill-formed degree");
+# A degree-d B-spline needs at least d+1 control points. Only `n_pts != 0` and the
+# knot-count relation were checked through 2.6.13, so degree >= n_pts fell through
+# to de Boor with a NEGATIVE control-point index — an out-of-bounds read that
+# dereferenced a wild pointer instead of returning the documented 0.
+var ce_cps = alloc(3 * 24);
+var ce_kn = alloc(7 * 8);
+var ce_i = 0;
+while (ce_i < 7) {
+    store64(ce_kn + ce_i * 8, f64_from(ce_i));
+    ce_i = ce_i + 1;
+}
+assert_eq(calc_bspline(3, ce_cps, 3, ce_kn, 7, f64_from(3)), 0,
+"calc_bspline: n_pts <= degree -> 0 (no wild deref)");
+assert_eq(calc_nurbs(3, ce_cps, ce_cps, 3, ce_kn, 7, f64_from(3)), 0,
+"calc_nurbs: n_pts <= degree -> 0");
+assert_eq(calc_bspline(0 - 1, ce_cps, 3, ce_kn, 3, F64_ONE), 0,
+"calc_bspline: negative degree -> 0");
+
+test_group("calc_ext / calc / noise_simplex: fBm normalisation is guarded");
+# All four fBm entry points divided by an amplitude accumulator that is still
+# exactly 0 when octaves <= 0, returning NaN from a function documenting a
+# roughly [-1, 1] range — and NaN then propagated through every downstream sample.
+var fb2 = fbm_2d(F64_ONE, F64_ONE, 0, F64_ONE, F64_ONE, F64_HALF);
+assert_eq(f64_eq(fb2, fb2), 1, "fbm_2d(octaves=0) is not NaN");
+assert_eq(f64_to(fb2), 0, "fbm_2d(octaves=0) == 0");
+var fb3 = fbm_3d(F64_ONE, F64_ONE, F64_ONE, 0, F64_ONE, F64_ONE, F64_HALF);
+assert_eq(f64_eq(fb3, fb3), 1, "fbm_3d(octaves=0) is not NaN");
+var sf2 = simplex_fbm_2d(F64_ONE, F64_ONE, 0, F64_ONE, F64_ONE, F64_HALF);
+assert_eq(f64_eq(sf2, sf2), 1, "simplex_fbm_2d(octaves=0) is not NaN");
+var sf3 = simplex_fbm_3d(F64_ONE, F64_ONE, F64_ONE, 0, F64_ONE, F64_ONE, F64_HALF);
+assert_eq(f64_eq(sf3, sf3), 1, "simplex_fbm_3d(octaves=0) is not NaN");
+# and a real call is still finite and in range
+var fb_ok = fbm_2d(F64_ONE, F64_TWO, 4, F64_ONE, F64_ONE, F64_HALF);
+assert_eq(f64_eq(fb_ok, fb_ok), 1, "fbm_2d(octaves=4) is finite");
+assert_eq(f64_le(f64_abs(fb_ok), F64_TWO), 1, "fbm_2d(octaves=4) is in a sane range");
+
+test_group("spatial: kdtree_build survives coincident points");
+# _kd_partition splits on the axis VALUE midpoint. That separates properly
+# whenever lo < hi, so it can only degenerate when every point shares the axis
+# value — where the old "one item per side" clamp peeled ONE element per level,
+# giving O(n) recursion depth. Measured on the pre-fix code: fine at 40k,
+# **SIGSEGV at 60k**. 60000 is the proven threshold and costs ~24 ms.
+var kd_n = 60000;
+var kd_pts = alloc(kd_n * 8);
+var kd_i = 0;
+while (kd_i < kd_n) {
+    store64(kd_pts + kd_i * 8, hvec3_new(F64_ONE, F64_TWO, f64_from(3)));
+    kd_i = kd_i + 1;
+}
+assert_neq(kdtree_build(kd_pts, kd_n), 0,
+"kdtree_build(60000 coincident points) returns a tree (no stack overflow)");
+# Pruning must still be correct once the positional fallback fires: build a tree
+# that is half coincident, half spread, and demand an exact nearest-neighbour hit.
+var kd_m = 4000;
+var kd_p2 = alloc(kd_m * 8);
+kd_i = 0;
+while (kd_i < kd_m) {
+    if (kd_i < kd_m / 2) { store64(kd_p2 + kd_i * 8, hvec3_new(0, 0, 0)); }
+    else { store64(kd_p2 + kd_i * 8, hvec3_new(f64_from(kd_i), f64_from(kd_i), f64_from(kd_i))); }
+    kd_i = kd_i + 1;
+}
+var kd_t2 = kdtree_build(kd_p2, kd_m);
+assert_neq(kd_t2, 0, "kdtree_build(half-coincident) returns a tree");
+var kd_tv = f64_from(kd_m - 1);
+assert_eq(kdtree_nearest(kd_t2, kd_p2, hvec3_new(kd_tv, kd_tv, kd_tv)), kd_m - 1,
+"kdtree_nearest still finds the exact point (pruning correct)");
 
 test_group("einsum: malformed notation must error, not mis-compute");
 assert_eq(einsum(str_from("i9,jk->ik"), es_two, 2), 0, "einsum: digit in spec -> 0");

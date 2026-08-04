@@ -6,8 +6,8 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-08-03 (v2.6.13) — see the third-pass block below for the
-> audit-repair pair. The v2.6.11 record follows.
+> **Last refresh**: 2026-08-03 (v2.6.14) — see the fourth- and third-pass blocks below
+> for the audit-repair sequence. The v2.6.11 record follows.
 >
 > **v2.6.11**: Cyrius 6.4.69 → **6.5.6** toolchain bump (a
 > **minor** jump across 24 releases) + sakshi 2.4.6 → **2.4.7**. No executable library change —
@@ -32,7 +32,18 @@ type: state
 > `deps --verify` 30/30. Re-verified the 3 open tracked toolchain issues on 6.5.6: interval-ident-lex
 > **still live**, for-empty-clauses **still live**, cli-arg-clobber not re-tested (destructive).
 >
-> **Third pass (2026-08-03, v2.6.12 + v2.6.13 — the audit-repair pair):** P0 of the
+> **Fourth pass (2026-08-03, v2.6.14):** audit **P1 — the memory-safety tier — is closed**.
+> Capped-constructor null propagation (`cmat_*`), solver dimension caps + `HSB_ERR_ALLOC`,
+> B-spline negative indexing, the adaptive-Simpson work bound, `kdtree_build`'s O(n) recursion on
+> coincident points (SIGSEGV at 60k), the Armijo NaN acceptance, the complex 1e-6-vs-1e-12
+> tolerance, `FLOAT_RENDER_BUF`, and four fBm NaN returns. **Three of the four defect groups
+> crashed the process pre-fix.** `calc_ext` and `noise_simplex` brought into the suites, leaving
+> only `num_ext` and `symbolic_ext`. Suite 1063 → **1093**; coverage 54% → **57%**, files 32/35.
+> Counts synced across README / CLAUDE / testing / overview / roadmap / cyrius.cyml; CHANGELOG
+> 2.6.14 + Release-History row added. **Still open:** audit P3 (two O(n²) hot paths, LM/L-BFGS
+> per-iteration allocations) and P4 (10 doc drifts).
+>
+> > **Third pass (2026-08-03, v2.6.12 + v2.6.13 — the audit-repair pair):** P0 of the
 > 2026-08-03 audit is **fully closed**. 2.6.12 re-derived 47 hand-encoded constants across seven
 > tables and added `scripts/check-constants.sh` as a CI gate (110/110); 2.6.13 fixed
 > `svd_golub_kahan` (U transposed), `eigen_qr` (never converged for n >= 3), the SU(2)/SE(3)

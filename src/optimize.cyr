@@ -30,6 +30,13 @@ var _OPT_F64_HALF  = 0x3FE0000000000000;          # 0.5
 var _OPT_F64_C1    = 0x3F1A36E2EB1C432D;          # 1e-4 (Armijo constant)
 var _OPT_MAX_LS    = 40;                           # max line search iterations
 
+# Dimension cap for the solvers that allocate an n x n working matrix (currently
+# only opt_bfgs' inverse Hessian). n*n*8 bytes must stay inside stdlib alloc's
+# ALLOC_MAX (0x10000000 = 256 MB), which puts the hard ceiling at n = 5792; 4096
+# is the policy cap, 128 MB of Hessian. Without it, a large n made `alloc(n*n*8)`
+# return 0 and the identity-initialisation loop immediately stored through null.
+var _OPT_MAX_DIM   = 4096;
+
 # ================================================================
 # Internal helpers
 # ================================================================
@@ -90,8 +97,12 @@ fn _opt_armijo(f, x, d, grad_ptr, n, f_old, x_trial) {
         if (f64_lt(f_new, threshold) == 1) {
             return alpha;
         }
-        # f_new == threshold is also acceptable
-        if (f64_lt(threshold, f_new) == 0) {
+        # f_new == threshold is also acceptable — but ONLY when the comparison is
+        # ordered. Every f64 comparison involving NaN returns 0, so the old
+        # `f64_lt(threshold, f_new) == 0` tie-breaker also fired for a NaN
+        # objective, accepting the step and poisoning x for BFGS, L-BFGS and CG.
+        # Requiring f_new to compare equal to itself rejects NaN explicitly.
+        if (f64_eq(f_new, f_new) == 1 && f64_lt(threshold, f_new) == 0) {
             return alpha;
         }
         alpha = f64_mul(alpha, _OPT_F64_HALF);
@@ -122,10 +133,10 @@ fn opt_gradient_descent(f, grad, x0, n, lr, tol, max_iter, out_x, out_fmin) {
 
     # Working copy of x
     var x = alloc(n * 8);
-    _opt_copy(x, x0, n);
-
     # Gradient buffer
     var g = alloc(n * 8);
+    if (x == 0 || g == 0) { return HSB_ERR_ALLOC; }
+    _opt_copy(x, x0, n);
 
     var iter = 0;
     while (iter < max_iter) {
@@ -180,6 +191,10 @@ fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
     var d       = alloc(n * 8);
     var g_new   = alloc(n * 8);
     var x_trial = alloc(n * 8);
+
+    if (x == 0 || g == 0 || d == 0 || g_new == 0 || x_trial == 0) {
+        return HSB_ERR_ALLOC;
+    }
 
     _opt_copy(x, x0, n);
 
@@ -264,6 +279,10 @@ fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
 # Returns:  HSB_ERR_NONE on success, HSB_ERR_INVALID_INPUT or HSB_ERR_NO_CONVERGENCE
 fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
     if (n <= 0) { return HSB_ERR_INVALID_INPUT; }
+    # CWE-190/CWE-476: the inverse Hessian is n*n, so an unbounded n both risks
+    # wrapping the size expression and drives alloc past ALLOC_MAX. Reject up
+    # front rather than storing through the resulting null.
+    if (n > _OPT_MAX_DIM) { return HSB_ERR_INVALID_INPUT; }
 
     var x       = alloc(n * 8);
     var g       = alloc(n * 8);
@@ -277,6 +296,11 @@ fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
     # Inverse Hessian approximation H_inv stored as flat n*n f64 array (row-major)
     var nn = n * n;
     var h_inv = alloc(nn * 8);
+
+    if (x == 0 || g == 0 || d == 0 || x_new == 0 || g_new == 0 ||
+    s == 0 || y == 0 || hy == 0 || h_inv == 0) {
+        return HSB_ERR_ALLOC;
+    }
 
     # Initialize H_inv = I
     var idx = 0;
@@ -408,6 +432,10 @@ fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
 fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
     if (n <= 0) { return HSB_ERR_INVALID_INPUT; }
     if (m <= 0) { return HSB_ERR_INVALID_INPUT; }
+    # The history ring is m * (2n+1) f64s, so both dimensions need bounding
+    # before the size expression is computed (CWE-190 -> CWE-476).
+    if (n > _OPT_MAX_DIM) { return HSB_ERR_INVALID_INPUT; }
+    if (m > _OPT_MAX_DIM) { return HSB_ERR_INVALID_INPUT; }
 
     var x       = alloc(n * 8);
     var g       = alloc(n * 8);
@@ -419,6 +447,10 @@ fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
     var slot_size = (2 * n + 1) * 8;
     var hist = alloc(m * slot_size);
     var alpha_buf = alloc(m * 8);
+
+    if (x == 0 || g == 0 || q == 0 || x_new == 0 || hist == 0 || alpha_buf == 0) {
+        return HSB_ERR_ALLOC;
+    }
 
     # k = number of stored pairs (0..m), head = next write index
     var k    = 0;

@@ -458,3 +458,55 @@ REQUIRED CORRECTIONS BEFORE LANDING:
 6. The CI bench fixture must not be scattered-only. Add a cocircular guard -- e.g. `bench("delaunay_2d_circle_200", ...)` on 200 points of a circle -- so the 1.9x regression is visible in bench-history.csv rather than discovered by a consumer. Add regression tests for the n=8 cluster reproducer and the n=4 unit square, pinning whatever behaviour is chosen.
 7. Run `cyrius distlib` and commit dist/hisab.cyr.
 8. File the separate finding the proposal already gestures at, and make it a blocker for anyone feeding near-cocircular data: `_col_in_circumcircle` is a non-adaptive determinant with catastrophic cancellation. Both the shipped and patched functions produce heavily overlapping non-triangulations on cocircular input (n=400 on a circle: 17,325 / 25,078 triangles where 398 is correct). The honest fix for that module is an adaptive or filtered in-circle predicate; this sweep optimisation is orthogonal to it and should not be described as if it were unaffected by it.
+
+---
+
+## 2.8.0 ATTEMPT — sqrt-free retirement. Also failed. Recorded so it is not retried blind.
+
+The 2.7.1 rejection identified the cost precisely: `_col_circum_max_x` computes a `sqrt` and is
+paid **once per triangle created**, and on cocircular input Bowyer-Watson creates O(n^2) triangles.
+That diagnosis is correct and the obvious remedy looks sound: a retirement test is a *distance
+comparison*, and distance comparisons do not need the root — store the circumcentre x and r^2, and
+test `(front - cx)^2 > r^2`.
+
+**It was implemented and it broke the triangulation.** A 4-triangle square came back with 2; the
+3x3 grid came back with 6 of 8; the cocircular empty-circumcircle check went from 0 violations to 2.
+
+Two causes were found and fixed, and the failure survived both:
+
+1. **The pad must stay LINEAR.** The original bound is `cx + r + pad` where `pad` scales with
+   `|ax| + |ux|`. Inflating `r^2` by a relative slack instead is strictly weaker, so triangles
+   retire too early and live ones are dropped. Corrected to fold the linear pad into `cx` and test
+   `(front - cx - pad)^2 > r^2`, which is exactly the original inequality squared.
+2. **Both early `+Inf` returns must also write `out_rsq`**, or the caller reads an uninitialised
+   slot.
+
+After both corrections the counts were unchanged — 6 where 12 is expected. So there is a **third**
+defect in the conversion that was not found. Do not retry this approach without first writing a
+differential harness that compares the retired-set of the sqrt version against the squared version
+triangle by triangle; the suite-level counts localise nothing.
+
+**Standing recommendation is unchanged and now better supported:** `delaunay_2d` needs triangle
+adjacency and a walk-and-flood-fill Bowyer-Watson, not another bolt-on to the flat vec. Two
+independent attempts to make the flat representation fast have now failed for two different
+reasons — the first on cost, the second on correctness.
+
+
+---
+
+## RESOLVED in 2.8.0 — triangle adjacency, and the premise of both failures was wrong
+
+Three independent adjacency implementations were built in isolated worktrees, each checked by a
+separate adversarial verifier writing its OWN differential harness. All three passed; attempt C was
+merged.
+
+**The correction that matters:** both earlier failures rested on "cocircular input is inherently
+expensive — the bad set really is most of the triangulation". That is false. The SHIPPED code was
+producing overlapping soup on that class (n=150: 1651 triangles vs 148 correct, 206 over-shared
+edges, 9 dropped points, 244x hull area), because the full rescan flagged distant triangles through
+cancellation in the non-adaptive in-circle determinant. A flood fill cannot reach those, so the
+cavity stays small — the rewrite is faster there *because* it is correct.
+
+delaunay_2d_400 14.54 ms -> 1.66 ms. delaunay_2d_circle_150 600 ms -> 455 us. Growth per doubling
+3.9x -> 2.1x. Still open: the adaptive in-circle predicate, and pre-existing extreme-aspect
+failures (parabola, sliver) that are byte-identical in both implementations.

@@ -2,6 +2,71 @@
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-08-04 — delaunay_2d adjacency rewrite; it was **wrong**, not just slow
+
+`delaunay_2d` now carries triangle adjacency and inserts by **walk + flood-fill Bowyer-Watson**,
+replacing the flat-vec full rescan. Two previous attempts to speed it up failed (2.7.1: 2.6x slower
+on cocircular; 2.8.0-attempt: broke the triangulation) — both are written up in
+`docs/development/issues/2026-08-04-perf-delaunay_2d.md`, and both failed because they optimised a
+representation that could not support the operation.
+
+### The headline is a correctness defect, not the speedup
+
+The premise behind the earlier attempts — "cocircular input is inherently expensive, the bad set
+really is most of the triangulation" — was **wrong**, and I had accepted it. The shipped code was
+not producing a triangulation at all on that class. At 150 points on a circle it returned **1651
+triangles where 148 is correct**, with **206 edges shared by three or more triangles**, **9 input
+points dropped**, and a total area **244x the convex hull**. It was overlapping soup.
+
+The full rescan flagged far-away triangles through cancellation in the non-adaptive in-circle
+determinant, so Bowyer-Watson kept creating spurious triangles. A flood fill cannot reach them, so
+the cavity stays small — which is why the rewrite is both correct *and* faster here. The earlier
+attempts were adding per-triangle work on top of the garbage.
+
+**Nothing in the suite asserted any of this.** The eight existing `delaunay_2d` assertions all used
+fixtures where the shipped code happened to be right.
+
+| Benchmark | Before | After | |
+|---|---|---|---|
+| `delaunay_2d_400` (uniform) | 14.54 ms | **1.66 ms** | **−88.6%** |
+| **`delaunay_2d_circle_150`** (cocircular) | **600 ms** | **455 µs** | **~1300x** |
+| n = 1600 uniform | 222 ms | 7.9 ms | −96.5% |
+
+Growth per doubling went from **3.9x (O(n²))** to **2.1x (O(n log n))** — the exponent changed, not
+the constant. Arena use per call fell too: uniform n=1600 2090 → 1632 KiB; cocircular n=300
+20118 → 329 KiB, a 61x reduction under an allocator that never frees.
+
+`delaunay_2d_circle_150` is now a permanent benchmark. Its absence is exactly why the 2.7.1
+regression would not have been caught.
+
+### Method
+
+Three independent implementations were built in isolated worktrees and each was checked by a
+separate adversarial verifier that wrote its **own** differential harness — the issue file's
+standing instruction after attempt 2 wasted a cycle on suite-level counts that localise nothing.
+All three passed. The merged one (attempt C) was verified across **298 fixtures**: identical
+canonical triangle sets everywhere the shipped output was valid, and on the 55 divergent
+cocircular/near-cocircular fixtures the new output satisfies count = 2n−2−h, area = hull area,
+zero non-manifold edges, zero dropped points, while the shipped output satisfies none of them.
+**There is no input where the shipped code is valid and the rewrite is not.**
+
+### Behaviour change
+
+On exact/near-cocircular convex input the output set changes completely (circle n=60: 472 triangles
+→ 58). That is a change from an invalid overlapping non-triangulation to a valid one, but a consumer
+mapping triangle indices to per-index attributes will read a different mesh.
+
+*Evidence:* five new assertions pin count, point-usage and manifoldness. Against the shipped code
+they fail with 472-vs-58 triangles, 2 dropped points and 48 over-shared edges. Suite → **1801**.
+
+### Coverage
+
+`cyrius coverage` **94% → 97%** (570/587), all 35 files referenced. +31 assertions across the calc,
+num_ext, optimize, lie_ext and linalg_ext tails. Four more of my own type errors were caught by the
+gates — `pcg32_new` arity, `lorentz_adjoint` taking a Mat4 generator rather than a 4-vector, and
+`bch_2nd_order` taking complex matrices rather than HVec3 (that one **SIGSEGV**'d, found by
+bisecting the crashing suite).
+
 ## [2.7.3] - 2026-08-04 — coverage **80% → 94%**, all 35 files referenced
 
 Target was 90%; the result is **94%** (555/587 functions). **Files referenced 34/35 → 35/35** — the

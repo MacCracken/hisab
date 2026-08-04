@@ -82,12 +82,13 @@ disposition sweep. Three confirmed performance wins were **withheld** because ea
 some input class; their measurements and reviews are filed under `issues/`.
 
 ### Carried into 2.8.x
-- [ ] **`delaunay_2d` needs a different data structure, not an optimisation.** The x-sweep rewrite
-      was implemented, measured and **rejected in 2.7.1**: −64% on uniform scatter but **2.6x
-      SLOWER on cocircular** (615 ms → 1616 ms at n=150), and a pay-for-itself guard did not help
-      because the cost is a per-triangle `sqrt` paid **at creation**, before any switch can know.
-      The real fix is triangle adjacency enabling walk-and-flood-fill Bowyer-Watson. The 2.7.1
-      measurements are the spec.
+- [x] **`delaunay_2d` rewritten with triangle adjacency** (walk + flood-fill Bowyer-Watson) in
+      **2.8.0**, after two failed attempts. The premise behind both — "cocircular is inherently
+      expensive" — was **wrong**: the shipped code was not triangulating that class at all (1651
+      triangles where 148 is correct, 206 non-manifold edges, 9 points dropped, 244x the hull area).
+      Fixing the correctness made it **~1300x faster** there, and −88.6% on uniform, with growth per
+      doubling 3.9x → 2.1x. Verified across 298 fixtures by an independent adversarial harness;
+      5 new assertions pin count, point-usage and manifoldness
 - [ ] `_col_in_circumcircle` adaptive exact predicate — latent (0/180 under real `delaunay_2d`
       geometry); needed only if the function is exposed publicly or the 10x constant changes
 - [x] **Coverage 94%** (555/587) and **all 35 files referenced** — target was 80%, then 90%.

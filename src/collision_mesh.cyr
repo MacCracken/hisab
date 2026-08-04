@@ -1,7 +1,12 @@
-# 5. Delaunay Triangulation -- Bowyer-Watson
+# 5. Delaunay Triangulation -- Bowyer-Watson over triangle adjacency
 # ================================================================
 # Input: points = vec of HVec2 pointers, n = number of points
 # Returns: vec of index triples [i0, i1, i2, ...] (flat)
+#
+# Each point is placed by WALKING the adjacency graph to the triangle that
+# contains it and then FLOOD-FILLING the bad set across shared edges. The
+# earlier form rescanned every live triangle per point, which is O(n^2)
+# circumcircle determinants; the flood fill touches only the cavity.
 
 # Check if point p is inside circumcircle of triangle (a, b, c)
 fn _col_in_circumcircle(points, ai, bi, ci, px, py) {
@@ -42,23 +47,112 @@ fn _col_in_circumcircle(points, ai, bi, ci, px, py) {
     return 0;
 }
 
-# Check if triangle has edge (e0, e1) in either direction
-fn _col_tri_has_edge(tris, ti, e0, e1) {
-    var base = ti * 3;
-    var t0 = vec_get(tris, base);
-    var t1 = vec_get(tris, base + 1);
-    var t2 = vec_get(tris, base + 2);
+# --- adjacency-based Bowyer-Watson: representation -------------------------
+#
+# delaunay_2d keeps two parallel flat vecs plus a stamp vec:
+#
+#   tris[t * 3 + k]  vertex k of triangle t, or (0 - 1) in slot k=0 when the
+#                    triangle has been TOMBSTONED (removed but not compacted)
+#   nbrs[t * 3 + e]  the triangle across edge e of t, or (0 - 1) at a boundary
+#   tstamp[t]        how far triangle t got during the current insertion
+#
+# Edge e is the edge OPPOSITE vertex e, i.e. the directed segment
+# (tris[t*3 + (e+1)%3], tris[t*3 + (e+2)%3]). Every triangle is stored
+# counter-clockwise, so for a point strictly inside, all three of those
+# directed edges have positive orientation -- which is what makes the walk in
+# _col_dl_walk directional and the flood fill in delaunay_2d local.
 
-    # Edge 0-1
-    if (t0 == e0) { if (t1 == e1) { return 1; } }
-    if (t0 == e1) { if (t1 == e0) { return 1; } }
-    # Edge 1-2
-    if (t1 == e0) { if (t2 == e1) { return 1; } }
-    if (t1 == e1) { if (t2 == e0) { return 1; } }
-    # Edge 2-0
-    if (t2 == e0) { if (t0 == e1) { return 1; } }
-    if (t2 == e1) { if (t0 == e0) { return 1; } }
-    return 0;
+# Twice the signed area of the triangle (p, a, b), where p = (px, py).
+# Positive when p, a, b turn counter-clockwise; negative when p lies strictly
+# on the right of the directed edge a -> b, which is the "step across edge e"
+# test. Coordinates are translated by p first so both products stay on the
+# scale of the edge rather than the scale of the absolute coordinates.
+fn _col_orient2d(points, ai, bi, px, py) {
+    var ap = vec_get(points, ai);
+    var bp = vec_get(points, bi);
+    var ax = f64_sub(HVec2_x(ap), px);
+    var ay = f64_sub(HVec2_y(ap), py);
+    var bx = f64_sub(HVec2_x(bp), px);
+    var by = f64_sub(HVec2_y(bp), py);
+    return f64_sub(f64_mul(ax, by), f64_mul(ay, bx));
+}
+
+# 1 when (px, py) is strictly inside CCW triangle (v0, v1, v2), 0 otherwise
+# (including on an edge or a vertex).
+fn _col_dl_strict_inside(points, v0, v1, v2, px, py) {
+    if (f64_gt(_col_orient2d(points, v1, v2, px, py), _COL_F64_ZERO) == 0) { return 0; }
+    if (f64_gt(_col_orient2d(points, v2, v0, px, py), _COL_F64_ZERO) == 0) { return 0; }
+    if (f64_gt(_col_orient2d(points, v0, v1, px, py), _COL_F64_ZERO) == 0) { return 0; }
+    return 1;
+}
+
+# Locate the triangle containing (px, py) by walking the adjacency graph from
+# `start`, stepping across whichever edge the point is outside of. Returns the
+# triangle index, or (0 - 1) if the walk exceeded `budget` or fell off the
+# boundary.
+#
+# The first edge tried rotates with the step count. A walk that always tries
+# edge 0 first can enter a two- or three-triangle cycle when the orientation
+# determinant round-trips through zero on near-degenerate geometry; rotating
+# the entry point breaks those cycles. `budget` is the backstop for the rest --
+# the predicate is not exact, so termination cannot be assumed, and the caller
+# falls back to a linear scan.
+fn _col_dl_walk(points, tris, nbrs, start, px, py, budget) {
+    var cur = start;
+    var steps = 0;
+    while (steps < budget) {
+        var b = cur * 3;
+        # Liveness guard. Every back-pointer into the cavity is rewired when
+        # the fan is built, so a tombstone should be unreachable -- but a
+        # vertex index of (0 - 1) reaches vec_get, which aborts the process
+        # rather than returning an error. Bail to the caller's linear scan
+        # instead of trusting the invariant.
+        if (vec_get(tris, b) < 0) { return 0 - 1; }
+        var nxt = 0 - 1;
+        var outside = 0;
+        var j = 0;
+        while (j < 3) {
+            var e = (steps + j) % 3;
+            var ea = vec_get(tris, b + (e + 1) % 3);
+            var eb = vec_get(tris, b + (e + 2) % 3);
+            if (f64_lt(_col_orient2d(points, ea, eb, px, py), _COL_F64_ZERO) == 1) {
+                outside = 1;
+                nxt = vec_get(nbrs, b + e);
+                j = 3;
+            } else {
+                j = j + 1;
+            }
+        }
+        if (outside == 0) { return cur; }
+        if (nxt < 0) { return 0 - 1; }
+        cur = nxt;
+        steps = steps + 1;
+    }
+    return 0 - 1;
+}
+
+# Fallback for _col_dl_walk: scan every live slot for one containing the point.
+# `mode` 0 tests containment, mode 1 tests the circumcircle (the last resort,
+# used only when no triangle claims to contain the point at all).
+fn _col_dl_locate_scan(points, tris, n_slots, px, py, mode) {
+    for (var t = 0; t < n_slots; t = t + 1) {
+        var b = t * 3;
+        var v0 = vec_get(tris, b);
+        if (v0 >= 0) {
+            var v1 = vec_get(tris, b + 1);
+            var v2 = vec_get(tris, b + 2);
+            if (mode == 0) {
+                var ok = 1;
+                if (f64_lt(_col_orient2d(points, v1, v2, px, py), _COL_F64_ZERO) == 1) { ok = 0; }
+                if (f64_lt(_col_orient2d(points, v2, v0, px, py), _COL_F64_ZERO) == 1) { ok = 0; }
+                if (f64_lt(_col_orient2d(points, v0, v1, px, py), _COL_F64_ZERO) == 1) { ok = 0; }
+                if (ok == 1) { return t; }
+            } else {
+                if (_col_in_circumcircle(points, v0, v1, v2, px, py) == 1) { return t; }
+            }
+        }
+    }
+    return 0 - 1;
 }
 
 fn delaunay_2d(points, n) {
@@ -103,154 +197,241 @@ fn delaunay_2d(points, n) {
     var st_b = n + 1;
     var st_c = n + 2;
 
-    # Triangles stored as flat array of index triples in a vec
+    # Triangles + adjacency, both flat. See the representation note above
+    # _col_orient2d. The super-triangle is CCW by construction and has no
+    # neighbours; every triangle created below inherits CCW winding because a
+    # cavity boundary edge is oriented CCW around the cavity.
     var tris = vec_new();
+    var nbrs = vec_new();
+    var tstamp = vec_new();
     vec_push(tris, st_a);
     vec_push(tris, st_b);
     vec_push(tris, st_c);
-    var n_tris = 1;
+    vec_push(nbrs, 0 - 1);
+    vec_push(nbrs, 0 - 1);
+    vec_push(nbrs, 0 - 1);
+    vec_push(tstamp, 0);
+    # Slots ever allocated, tombstones included. Slots are never reused, so an
+    # adjacency index stays valid for the whole build; the compaction pass at
+    # the bottom drops the tombstones once.
+    var n_slots = 1;
+
+    # Working buffers, allocated ONCE. alloc() is a bump allocator that never
+    # frees, so a vec_new() inside the insertion loop would leak one buffer per
+    # point; vec_truncate reuses the same storage instead.
+    var bad = vec_new();
+    var pending = vec_new();
+    var ep_u = vec_new();       # cavity boundary edge, first vertex
+    var ep_v = vec_new();       # cavity boundary edge, second vertex
+    var ep_nb = vec_new();      # triangle outside that edge, or (0 - 1)
+    var ep_ne = vec_new();      # which edge of ep_nb faces back into the cavity
+
+    # vertex -> new triangle maps, used to stitch the fan created around each
+    # point in O(boundary) instead of the O(boundary^2) pairwise edge match.
+    # Sized over every vertex index, super-triangle apexes included; reset only
+    # at the entries touched, so the per-point cost stays proportional to the
+    # cavity boundary.
+    var first_of = vec_new();
+    var second_of = vec_new();
+    for (var i = 0; i < n + 3; i = i + 1) {
+        vec_push(first_of, 0 - 1);
+        vec_push(second_of, 0 - 1);
+    }
 
     # Incrementally insert each point
+    var hint = 0;
     for (var i = 0; i < n; i = i + 1) {
         var p = vec_get(all_points, i);
         var px = HVec2_x(p);
         var py = HVec2_y(p);
+        # Stamp values for this insertion: mark + 1 = "tested, kept",
+        # mark + 2 = "tested, bad". Step i uses 2i+1 and 2i+2, so a stamp left
+        # by any earlier step is strictly less than mark + 1 and reads as
+        # untested -- no per-point clear of an n_slots-sized array.
+        var mark = i * 2;
 
-        # Find bad triangles
-        var bad = vec_new();
-        for (var ti = 0; ti < n_tris; ti = ti + 1) {
-            var t0 = vec_get(tris, ti * 3);
-            var t1 = vec_get(tris, ti * 3 + 1);
-            var t2 = vec_get(tris, ti * 3 + 2);
-            if (_col_in_circumcircle(all_points, t0, t1, t2, px, py) == 1) {
-                vec_push(bad, ti);
+        # 1. LOCATE the containing triangle, walking from the fan created for
+        #    the previous point. Consecutive points are usually close, so this
+        #    is a few steps; the linear scans are the degenerate-input paths.
+        var seed = _col_dl_walk(all_points, tris, nbrs, hint, px, py, n_slots + 16);
+        if (seed < 0) { seed = _col_dl_locate_scan(all_points, tris, n_slots, px, py, 0); }
+        if (seed < 0) { seed = _col_dl_locate_scan(all_points, tris, n_slots, px, py, 1); }
+
+        # 2. FLOOD-FILL the bad set across shared edges. Only triangles
+        #    reachable from the containing one can have the point in their
+        #    circumcircle, so this costs O(bad set) rather than O(all
+        #    triangles) -- the whole point of carrying adjacency.
+        vec_truncate(bad, 0);
+        vec_truncate(pending, 0);
+        if (seed >= 0) {
+            var sb = seed * 3;
+            var sv0 = vec_get(tris, sb);
+            var sv1 = vec_get(tris, sb + 1);
+            var sv2 = vec_get(tris, sb + 2);
+            var seed_bad = _col_in_circumcircle(all_points, sv0, sv1, sv2, px, py);
+            # A point strictly inside a triangle is strictly inside that
+            # triangle's circumcircle, so a "no" here can only be round-off in
+            # the non-adaptive determinant. Believing it would leave the point
+            # uninserted and punch a hole in the mesh, so strict containment
+            # overrides it. Containment is NOT strict when the point coincides
+            # with an existing vertex, which is exactly when an empty bad set
+            # is the right answer (a duplicate point adds nothing).
+            if (seed_bad == 0) {
+                if (_col_dl_strict_inside(all_points, sv0, sv1, sv2, px, py) == 1) {
+                    seed_bad = 1;
+                }
+            }
+            if (seed_bad == 1) {
+                vec_set(tstamp, seed, mark + 2);
+                vec_push(bad, seed);
+                vec_push(pending, seed);
+            } else {
+                vec_set(tstamp, seed, mark + 1);
             }
         }
-
-        # Find boundary polygon (non-shared edges of bad triangles)
-        var poly_edges = vec_new();  # pairs: [e0, e1, e0, e1, ...]
-        var n_bad = vec_len(bad);
-        for (var bi = 0; bi < n_bad; bi = bi + 1) {
-            var ti = vec_get(bad, bi);
-            var t0 = vec_get(tris, ti * 3);
-            var t1 = vec_get(tris, ti * 3 + 1);
-            var t2 = vec_get(tris, ti * 3 + 2);
-            var edges_v = vec_new();
-            vec_push(edges_v, t0); vec_push(edges_v, t1);
-            vec_push(edges_v, t1); vec_push(edges_v, t2);
-            vec_push(edges_v, t2); vec_push(edges_v, t0);
-
-            for (var ei = 0; ei < 3; ei = ei + 1) {
-                var e0 = vec_get(edges_v, ei * 2);
-                var e1 = vec_get(edges_v, ei * 2 + 1);
-                var is_shared = 0;
-                for (var bj = 0; bj < n_bad; bj = bj + 1) {
-                    if (is_shared == 0) {
-                        var otj = vec_get(bad, bj);
-                        if (otj != ti) {
-                            if (_col_tri_has_edge(tris, otj, e0, e1) == 1) {
-                                is_shared = 1;
+        while (vec_len(pending) > 0) {
+            var t = vec_pop(pending);
+            var tb = t * 3;
+            for (var e = 0; e < 3; e = e + 1) {
+                var nb = vec_get(nbrs, tb + e);
+                if (nb >= 0) {
+                    if (vec_get(tstamp, nb) < mark + 1) {
+                        var nbb = nb * 3;
+                        var w0 = vec_get(tris, nbb);
+                        # Same liveness guard as the walk: a tombstone's
+                        # (0 - 1) vertex index would reach vec_get, which
+                        # aborts the process. Stamp it kept and move on.
+                        var keep_it = mark + 1;
+                        if (w0 >= 0) {
+                            var w1 = vec_get(tris, nbb + 1);
+                            var w2 = vec_get(tris, nbb + 2);
+                            if (_col_in_circumcircle(all_points, w0, w1, w2, px, py) == 1) {
+                                keep_it = mark + 2;
+                                vec_push(bad, nb);
+                                vec_push(pending, nb);
                             }
                         }
+                        vec_set(tstamp, nb, keep_it);
                     }
                 }
-                if (is_shared == 0) {
-                    vec_push(poly_edges, e0);
-                    vec_push(poly_edges, e1);
-                }
             }
         }
 
-        # Remove bad triangles (mark as deleted by sorting indices descending)
-        # Sort bad indices descending
-        for (var si = 0; si < n_bad; si = si + 1) {
-            for (var sj = si + 1; sj < n_bad; sj = sj + 1) {
-                if (vec_get(bad, sj) > vec_get(bad, si)) {
-                    var tmp = vec_get(bad, si);
-                    vec_set(bad, si, vec_get(bad, sj));
-                    vec_set(bad, sj, tmp);
-                }
-            }
-        }
-        # Swap-remove in descending order
+        # 3. Collect the cavity BOUNDARY: every edge of a bad triangle whose
+        #    other side is not bad. Recorded with the outside triangle and the
+        #    slot in that triangle pointing back, so the back-pointer can be
+        #    rewired in step 5 without re-searching.
+        vec_truncate(ep_u, 0);
+        vec_truncate(ep_v, 0);
+        vec_truncate(ep_nb, 0);
+        vec_truncate(ep_ne, 0);
+        var n_bad = vec_len(bad);
         for (var bi = 0; bi < n_bad; bi = bi + 1) {
-            var ti = vec_get(bad, bi);
-            var last = n_tris - 1;
-            if (ti != last) {
-                vec_set(tris, ti * 3,     vec_get(tris, last * 3));
-                vec_set(tris, ti * 3 + 1, vec_get(tris, last * 3 + 1));
-                vec_set(tris, ti * 3 + 2, vec_get(tris, last * 3 + 2));
+            var t = vec_get(bad, bi);
+            var tb = t * 3;
+            for (var e = 0; e < 3; e = e + 1) {
+                var nb = vec_get(nbrs, tb + e);
+                var outer = 1;
+                if (nb >= 0) {
+                    if (vec_get(tstamp, nb) == mark + 2) { outer = 0; }
+                }
+                if (outer == 1) {
+                    var ne = 0 - 1;
+                    if (nb >= 0) {
+                        if (vec_get(nbrs, nb * 3) == t) { ne = 0; }
+                        if (vec_get(nbrs, nb * 3 + 1) == t) { ne = 1; }
+                        if (vec_get(nbrs, nb * 3 + 2) == t) { ne = 2; }
+                    }
+                    vec_push(ep_u, vec_get(tris, tb + (e + 1) % 3));
+                    vec_push(ep_v, vec_get(tris, tb + (e + 2) % 3));
+                    vec_push(ep_nb, nb);
+                    vec_push(ep_ne, ne);
+                }
             }
-            # Pop last 3 entries
-            vec_pop(tris);
-            vec_pop(tris);
-            vec_pop(tris);
-            n_tris = n_tris - 1;
         }
 
-        # Create new triangles from polygon edges to point i
-        var n_poly = vec_len(poly_edges) / 2;
-        for (var ei = 0; ei < n_poly; ei = ei + 1) {
-            var e0 = vec_get(poly_edges, ei * 2);
-            var e1 = vec_get(poly_edges, ei * 2 + 1);
-            vec_push(tris, e0);
-            vec_push(tris, e1);
+        # 4. TOMBSTONE the bad triangles. Swap-removing here would renumber a
+        #    live triangle and silently invalidate every nbrs entry aimed at
+        #    it, so the slot is only marked dead.
+        for (var bi = 0; bi < n_bad; bi = bi + 1) {
+            vec_set(tris, vec_get(bad, bi) * 3, 0 - 1);
+        }
+
+        # 5. Fan one new triangle (u, v, p) per boundary edge. Vertex order
+        #    puts the boundary edge opposite p, so edge 2 is the outward one
+        #    and edges 0/1 face the two fan siblings.
+        var m = vec_len(ep_u);
+        var base_new = n_slots;
+        for (var j = 0; j < m; j = j + 1) {
+            var u = vec_get(ep_u, j);
+            var v = vec_get(ep_v, j);
+            var nb = vec_get(ep_nb, j);
+            var nt = n_slots;
+            vec_push(tris, u);
+            vec_push(tris, v);
             vec_push(tris, i);
-            n_tris = n_tris + 1;
-        }
-    }
-
-    # Filter out triangles referencing super-triangle vertices
-    var ti = 0;
-    while (ti < n_tris) {
-        var t0 = vec_get(tris, ti * 3);
-        var t1 = vec_get(tris, ti * 3 + 1);
-        var t2 = vec_get(tris, ti * 3 + 2);
-        var remove = 0;
-        if (t0 >= n) { remove = 1; }
-        if (t1 >= n) { remove = 1; }
-        if (t2 >= n) { remove = 1; }
-
-        if (remove == 1) {
-            var last = n_tris - 1;
-            if (ti != last) {
-                vec_set(tris, ti * 3,     vec_get(tris, last * 3));
-                vec_set(tris, ti * 3 + 1, vec_get(tris, last * 3 + 1));
-                vec_set(tris, ti * 3 + 2, vec_get(tris, last * 3 + 2));
+            vec_push(nbrs, 0 - 1);
+            vec_push(nbrs, 0 - 1);
+            vec_push(nbrs, nb);
+            vec_push(tstamp, 0);
+            n_slots = n_slots + 1;
+            if (nb >= 0) {
+                var ne = vec_get(ep_ne, j);
+                if (ne >= 0) { vec_set(nbrs, nb * 3 + ne, nt); }
             }
-            vec_pop(tris);
-            vec_pop(tris);
-            vec_pop(tris);
-            n_tris = n_tris - 1;
-        } else {
-            ti = ti + 1;
+            # Triangle nt owns edge (p, u) and edge (v, p); index it by both
+            # endpoints so its two siblings can find it.
+            vec_set(first_of, u, nt);
+            vec_set(second_of, v, nt);
         }
+        for (var j = 0; j < m; j = j + 1) {
+            var nt = base_new + j;
+            vec_set(nbrs, nt * 3, vec_get(first_of, vec_get(ep_v, j)));
+            vec_set(nbrs, nt * 3 + 1, vec_get(second_of, vec_get(ep_u, j)));
+        }
+        for (var j = 0; j < m; j = j + 1) {
+            vec_set(first_of, vec_get(ep_u, j), 0 - 1);
+            vec_set(second_of, vec_get(ep_v, j), 0 - 1);
+        }
+        # Start the next walk inside the fan just built. Only updated when the
+        # fan exists, because otherwise nothing was tombstoned and the previous
+        # hint is still a live triangle.
+        if (m > 0) { hint = base_new; }
     }
 
-    # Ensure CCW winding and copy to result
-    for (var ti = 0; ti < n_tris; ti = ti + 1) {
-        var t0 = vec_get(tris, ti * 3);
-        var t1 = vec_get(tris, ti * 3 + 1);
-        var t2 = vec_get(tris, ti * 3 + 2);
+    # Compact: skip tombstones, drop anything touching a super-triangle vertex,
+    # and emit CCW.
+    for (var t = 0; t < n_slots; t = t + 1) {
+        var tb = t * 3;
+        var t0 = vec_get(tris, tb);
+        if (t0 >= 0) {
+            var t1 = vec_get(tris, tb + 1);
+            var t2 = vec_get(tris, tb + 2);
+            var keep = 1;
+            if (t0 >= n) { keep = 0; }
+            if (t1 >= n) { keep = 0; }
+            if (t2 >= n) { keep = 0; }
+            if (keep == 1) {
+                var ap = vec_get(all_points, t0);
+                var bp = vec_get(all_points, t1);
+                var cp = vec_get(all_points, t2);
 
-        var ap = vec_get(all_points, t0);
-        var bp = vec_get(all_points, t1);
-        var cp = vec_get(all_points, t2);
+                var cross = f64_sub(
+                f64_mul(f64_sub(HVec2_x(bp), HVec2_x(ap)), f64_sub(HVec2_y(cp), HVec2_y(ap))),
+                f64_mul(f64_sub(HVec2_x(cp), HVec2_x(ap)), f64_sub(HVec2_y(bp), HVec2_y(ap)))
+                );
 
-        var cross = f64_sub(
-        f64_mul(f64_sub(HVec2_x(bp), HVec2_x(ap)), f64_sub(HVec2_y(cp), HVec2_y(ap))),
-        f64_mul(f64_sub(HVec2_x(cp), HVec2_x(ap)), f64_sub(HVec2_y(bp), HVec2_y(ap)))
-        );
-
-        if (f64_lt(cross, _COL_F64_ZERO) == 1) {
-            # Swap t0 and t1 for CCW
-            vec_push(result, t1);
-            vec_push(result, t0);
-            vec_push(result, t2);
-        } else {
-            vec_push(result, t0);
-            vec_push(result, t1);
-            vec_push(result, t2);
+                if (f64_lt(cross, _COL_F64_ZERO) == 1) {
+                    # Swap t0 and t1 for CCW
+                    vec_push(result, t1);
+                    vec_push(result, t0);
+                    vec_push(result, t2);
+                } else {
+                    vec_push(result, t0);
+                    vec_push(result, t1);
+                    vec_push(result, t2);
+                }
+            }
         }
     }
 

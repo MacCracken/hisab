@@ -34,6 +34,7 @@ include "src/collision_core.cyr"
 include "src/collision_mesh.cyr"
 include "src/linalg_ext.cyr"
 include "src/ode.cyr"
+include "src/optimize.cyr"
 
 # All helper functions must be defined before alloc_init() to avoid
 # compiler pass ordering issues with the permutation table init in Perlin noise.
@@ -257,6 +258,12 @@ fn _c9_g(x, out) {
     return 0;
 }
 fn _c9_x2(x) { return f64_mul(x, x); }
+
+fn _c80_sq(x) { return f64_mul(x, x); }
+fn _c80_f(x) { var a = load64(x); return f64_mul(a, a); }
+fn _c80_g(x, out) { store64(out, f64_mul(F64_TWO, load64(x))); return 0; }
+fn _c80_sde_f(t, y) { return 0; }
+fn _c80_sde_g(t, y) { return F64_ONE; }
 
 alloc_init();
 
@@ -3528,6 +3535,173 @@ assert_neq(p9rules, 0, "sym_default_rules returns rules");
 var p9e = expr_add(expr_var(str_from("x")), expr_const(0));
 assert_neq(sym_rewrite(p9e, p9rules), 0, "sym_rewrite returns an expression");
 assert_neq(sym_rule(pat_var(str_from("x")), expr_var(str_from("x"))), 0, "sym_rule builds a rule");
+
+test_group("2.8.0 coverage: calc, num, optimize, lie_ext, linalg_ext tails");
+
+# Trapezoid on x^2 over [0,1] is 1/3 + h^2/6; at n=1000 that is ~1.67e-7 above.
+var c80_o = alloc(8);
+assert_eq(calc_integral_trapez(&_c80_sq, 0, F64_ONE, 1000, c80_o), HSB_ERR_NONE, "trapez ok");
+assert(f64_lt(f64_abs(f64_sub(load64(c80_o), 0x3FD5555555555555)), f64_div(F64_ONE, f64_from(1000000))) == 1,
+"trapez of x^2 over [0,1] is within 1e-6 of 1/3");
+# lerp endpoints are exact.
+assert_eq(calc_lerp(F64_TWO, f64_from(6), 0), F64_TWO, "calc_lerp t=0 is a");
+assert_eq(calc_lerp(F64_TWO, f64_from(6), F64_ONE), f64_from(6), "calc_lerp t=1 is b");
+assert_eq(f64_to(calc_lerp(0, f64_from(10), F64_HALF)), 5, "calc_lerp midpoint = 5");
+# Bezier ease is pinned at both ends by construction.
+assert(f64_lt(f64_abs(cubic_bezier_ease(f64_div(F64_ONE, f64_from(4)), 0,
+f64_div(f64_from(3), f64_from(4)), F64_ONE, 0)), LOOSE_TOL_M) == 1, "cubic_bezier_ease(0) = 0");
+# A critically-damped spring already at its target must not move.
+var c80_p = alloc(8);
+var c80_v = alloc(8);
+spring_step(F64_ONE, F64_ONE, 0, f64_from(100), f64_from(20), f64_div(F64_ONE, f64_from(60)),
+c80_p, c80_v);
+assert(f64_lt(f64_abs(f64_sub(load64(c80_p), F64_ONE)), LOOSE_TOL_M) == 1,
+"spring_step at rest on target does not move");
+assert(f64_lt(f64_abs(load64(c80_v)), LOOSE_TOL_M) == 1, "spring_step at rest keeps zero velocity");
+assert(f64_lt(f64_abs(perlin_2d(F64_HALF, F64_HALF)), F64_ONE) == 1, "perlin_2d bounded");
+
+# PCG32 float output is in [0,1) and advances.
+var c80_r = pcg32_new(42);
+var c80_a = pcg32_next_f64(c80_r);
+assert(f64_lt(c80_a, F64_ONE) == 1, "pcg32_next_f64 < 1");
+assert(f64_lt(f64_neg(EPSILON_F64), c80_a) == 1, "pcg32_next_f64 >= 0");
+assert_neq(c80_a, pcg32_next_f64(c80_r), "pcg32_next_f64 advances the stream");
+
+# Continued fraction of 415/93 is [4;2,6,7].
+var c80_cf = num_continued_fraction_rational(415, 93);
+assert_neq(c80_cf, 0, "continued fraction returns terms");
+assert_eq(vec_get(c80_cf, 0), 4, "415/93 first term is 4");
+assert_eq(vec_len(c80_cf), 4, "415/93 = [4;2,6,7] is 4 terms");
+# Sobol stays in [0,1).
+assert(f64_lt(num_sobol(7), F64_ONE) == 1, "num_sobol < 1");
+# DCT/IDCT round-trip.
+var c80_d = alloc(32);
+store64(c80_d, F64_ONE); store64(c80_d + 8, F64_TWO);
+store64(c80_d + 16, f64_from(3)); store64(c80_d + 24, f64_from(4));
+assert_eq(num_dct(c80_d, 4), HSB_ERR_NONE, "num_dct ok");
+assert_eq(num_idct(c80_d, 4), HSB_ERR_NONE, "num_idct ok");
+assert(f64_lt(f64_abs(f64_sub(load64(c80_d), F64_ONE)), LOOSE_TOL_M) == 1,
+"dct/idct round-trips element 0");
+
+# Conjugate gradient on f(x) = x^2 must reach 0.
+var c80_x0 = alloc(8);
+store64(c80_x0, f64_from(5));
+var c80_ox = alloc(8);
+var c80_of = alloc(8);
+assert_eq(opt_conjugate_gradient(&_c80_f, &_c80_g, c80_x0, 1, EPSILON_F64, 200, c80_ox, c80_of),
+HSB_ERR_NONE, "conjugate gradient converges");
+assert(f64_lt(f64_abs(load64(c80_ox)), f64_div(F64_ONE, f64_from(1000))) == 1,
+"conjugate gradient finds x* = 0");
+
+# Lyapunov exponent of the identity map is 0 (no expansion).
+var c80_I = mat_identity(2);
+var c80_ly = alloc(8);
+assert_eq(lyapunov_max(c80_I, 2, 50, c80_ly), HSB_ERR_NONE, "lyapunov_max runs");
+assert(f64_lt(f64_abs(load64(c80_ly)), LOOSE_TOL_M) == 1, "lyapunov of the identity is 0");
+
+# svd_compute on a diagonal matrix gives its diagonal as the singular values.
+var c80_A = mat_new(2, 2);
+mat_set(c80_A, 0, 0, f64_from(3)); mat_set(c80_A, 1, 1, F64_TWO);
+var c80_U = mat_new(2, 2);
+var c80_V = mat_new(2, 2);
+var c80_S = alloc(16);
+assert_eq(svd_compute(c80_A, c80_U, c80_S, c80_V), HSB_ERR_NONE, "svd_compute succeeds");
+assert(f64_lt(f64_abs(f64_sub(load64(c80_S), f64_from(3))), LOOSE_TOL_M) == 1,
+"svd_compute s0 = 3 for diag(3,2)");
+
+# Euler-Maruyama with zero drift and zero noise increment is a no-op.
+assert_eq(ode_euler_maruyama(&_c80_sde_f, &_c80_sde_g, 0, F64_ONE, F64_HALF, 0), F64_ONE,
+"euler_maruyama with dW = 0 and zero drift leaves y unchanged");
+
+# bch_2nd_order takes COMPLEX MATRICES (cmat), not HVec3 -- bch_so3_2nd_order is
+# the vector one. For commuting X, Y the commutator vanishes and Z = X + Y.
+var c80_bx = cmat_identity(2);
+var c80_by = cmat_scale(cmat_identity(2), cx_real(F64_TWO));
+var c80_bz = bch_2nd_order(c80_bx, c80_by);
+assert_neq(c80_bz, 0, "bch_2nd_order returns a matrix");
+assert(f64_lt(f64_abs(f64_sub(HComplex_re(cmat_get(c80_bz, 0, 0)), f64_from(3))), LOOSE_TOL_M) == 1,
+"bch_2nd_order of commuting I and 2I is 3I");
+# Ad_L(X) takes a Mat4 GENERATOR X, not a 4-vector. Ad_I(X) = I*X*I^-1 = X.
+var c80_X = m4_identity();
+var c80_ad = lorentz_adjoint(lorentz_identity(), c80_X);
+assert_neq(c80_ad, 0, "lorentz_adjoint returns a Mat4");
+assert(f64_lt(f64_abs(f64_sub(m4_get(c80_ad, 0, 0), F64_ONE)), LOOSE_TOL_M) == 1,
+"Ad_I(I) = I on the diagonal");
+assert(f64_lt(f64_abs(m4_get(c80_ad, 0, 1)), LOOSE_TOL_M) == 1, "Ad_I(I) is off-diagonal zero");
+
+test_group("delaunay_2d: cocircular input must be a real triangulation");
+
+# The shipped implementation did NOT triangulate points on a circle. At n=150 it
+# returned 1651 triangles where 148 is correct, with 206 edges shared by 3+
+# triangles, 9 input points dropped, and a total area 244x the convex hull -- an
+# overlapping soup, not a mesh. Nothing asserted that, so it survived. These pin
+# the class: a convex polygon of n points triangulates to exactly n-2 triangles.
+var dcc_n = 60;
+var dcc = vec_new();
+var dcc_i = 0;
+while (dcc_i < dcc_n) {
+    var dcc_a = f64_div(f64_mul(f64_mul(F64_TWO, F64_PI), f64_from(dcc_i)), f64_from(dcc_n));
+    vec_push(dcc, hvec2_new(f64_mul(f64_from(100), f64_cos(dcc_a)),
+    f64_mul(f64_from(100), f64_sin(dcc_a))));
+    dcc_i = dcc_i + 1;
+}
+var dcc_t = delaunay_2d(dcc, dcc_n);
+assert_eq(vec_len(dcc_t) / 3, dcc_n - 2, "circle-60 gives exactly n-2 = 58 triangles");
+
+# Every input point must appear. The shipped code dropped 9 of 150 on this class.
+var dcc_used = alloc(dcc_n * 8);
+dcc_i = 0;
+while (dcc_i < dcc_n) { store64(dcc_used + dcc_i * 8, 0); dcc_i = dcc_i + 1; }
+dcc_i = 0;
+while (dcc_i < vec_len(dcc_t)) {
+    store64(dcc_used + vec_get(dcc_t, dcc_i) * 8, 1);
+    dcc_i = dcc_i + 1;
+}
+var dcc_missing = 0;
+dcc_i = 0;
+while (dcc_i < dcc_n) {
+    if (load64(dcc_used + dcc_i * 8) == 0) { dcc_missing = dcc_missing + 1; }
+    dcc_i = dcc_i + 1;
+}
+assert_eq(dcc_missing, 0, "circle-60 uses every input point (shipped dropped 9 of 150)");
+
+# No edge may be shared by more than two triangles -- the manifoldness check that
+# would have caught the 206 over-shared edges directly.
+var dcc_over = 0;
+var dcc_e = 0;
+while (dcc_e < vec_len(dcc_t)) {
+    var dcc_ta = vec_get(dcc_t, dcc_e);
+    var dcc_tb = vec_get(dcc_t, dcc_e + 1);
+    var dcc_cnt = 0;
+    var dcc_f = 0;
+    while (dcc_f < vec_len(dcc_t)) {
+        var x0 = vec_get(dcc_t, dcc_f);
+        var x1 = vec_get(dcc_t, dcc_f + 1);
+        var x2 = vec_get(dcc_t, dcc_f + 2);
+        var hit = 0;
+        if (x0 == dcc_ta || x1 == dcc_ta || x2 == dcc_ta) {
+            if (x0 == dcc_tb || x1 == dcc_tb || x2 == dcc_tb) { hit = 1; }
+        }
+        dcc_cnt = dcc_cnt + hit;
+        dcc_f = dcc_f + 3;
+    }
+    if (dcc_cnt > 2) { dcc_over = dcc_over + 1; }
+    dcc_e = dcc_e + 3;
+}
+assert_eq(dcc_over, 0, "circle-60 is manifold: no edge shared by 3+ triangles");
+
+# A smaller circle, and a circle with an interior point, for the same invariant.
+var dcc2 = vec_new();
+dcc_i = 0;
+while (dcc_i < 12) {
+    var a2 = f64_div(f64_mul(f64_mul(F64_TWO, F64_PI), f64_from(dcc_i)), f64_from(12));
+    vec_push(dcc2, hvec2_new(f64_mul(f64_from(50), f64_cos(a2)),
+    f64_mul(f64_from(50), f64_sin(a2))));
+    dcc_i = dcc_i + 1;
+}
+assert_eq(vec_len(delaunay_2d(dcc2, 12)) / 3, 10, "circle-12 gives exactly 10 triangles");
+vec_push(dcc2, hvec2_new(0, 0));
+assert_eq(vec_len(delaunay_2d(dcc2, 13)) / 3, 12, "circle-12 + centre gives 12 triangles");
 
 # ================================================================
 var r = assert_summary();

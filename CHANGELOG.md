@@ -338,6 +338,60 @@ where 16 bytes are stored; `eigen_power` survives a transposed matvec because bo
 are symmetric; and the Gell-Mann basis leaves the **sign of λ₄..λ₇ unconstrained** — pinning it
 needs the SU(3) structure constants.
 
+#### Performance — `solve_bicgstab` leaked a work vector per iteration (2.7.0-I)
+
+`s` was allocated **inside** the iteration loop. `alloc()` is a bump allocator that never frees, so
+every pass abandoned another `n*8` bytes — the same hot-loop-allocation class 2.6.15 cleared out of
+LM and L-BFGS. Hoisted alongside `v` and `p`.
+
+| Measure | Before | After | Change |
+|---|---|---|---|
+| Arena, n=1024, max_iter=128 | **3,194,880 B** | **2,154,496 B** | **−32.6%** |
+
+Asymptotically `8n(6 + 3·max_iter)` → `8n(7 + 2·max_iter)`. Results are **bit-identical** —
+verified across `n` ∈ {0, 1, 3, 7, 64, 65, 400, 512, 1024}, convergent and non-convergent, because
+all `n` slots are overwritten before any read.
+
+The finding's "superlinear" framing was **refuted**: the time cost is linear. This is a leak, not a
+complexity defect, and saying so is the point — the CSV would not have shown a time win.
+
+#### Two shipped correctness defects found while checking that optimisations preserve results
+
+Neither is a performance issue. Both came from adversarial reviewers building independent oracles
+to verify that a proposed optimisation did not change results — and finding the **shipped** code
+was already wrong. They outrank the perf work that exposed them, and are filed accordingly.
+
+- **`kdtree_within_radius` returns the wrong count on most queries.** Measured on a 1,500-point
+  scatter with 400 radius-60 queries: **222 of 400 wrong**. The 2.6.14 kdtree assertions did not
+  detect a tree with 676 pruning-plane violations. A spatial query returning wrong answers.
+- **`_col_in_circumcircle` is less accurate than a plain circumcentre test.** All 23,741 retirements
+  flagged by a candidate sweep predicate were re-checked in **exact rational arithmetic**: zero were
+  geometrically unsound. The divergences came from the *shipped* in-circle determinant losing
+  precision on near-coincident clusters, so Delaunay output on such inputs is already suspect.
+
+#### Three optimisations confirmed but deliberately NOT applied
+
+Each is a real complexity win, and each was measured at multiple sizes so the *growth ratio* — not
+a single timing — carries the claim. All three are filed with their reviews under
+`docs/development/issues/2026-08-04-perf-*.md`.
+
+- **`delaunay_2d`** is O(n²) confirmed: growth converges on **4.0x per doubling**, 217 ms at
+  n=1,600. An x-sweep-with-retirement rewrite reaches 2.1–2.5x per doubling (**−93% at n=3,200,
+  −96% at n=6,400**). Not applied: it is **1.9–3.0x slower** with up to 2.5x memory on *cocircular*
+  input, and it changes the triangulation on inputs as simple as the **unit square** — both results
+  valid, zero shared triangles.
+- **`_kd_partition`** confirmed, but the patch costs **+28–30% on duplicate-heavy skewed data** and
+  ships **zero permanent regression coverage** for the invariant it depends on.
+- **`triangulate_polygon`** reflex-only pruning is **sound on simple polygons** — ~33,000 tested,
+  including an exhaustive enumeration of every 4-, 5- and 6-gon on a 3×3 integer grid, **0
+  divergences**. It diverges only on self-intersecting input, which is outside the documented
+  contract — but **output length changes in both directions**, including cases where the shipped
+  code returns EMPTY and the new one returns a complete triangulation. That is entangled with the
+  never-scheduled `collision_core.cyr:511` contract finding, so the two should land together.
+
+A faster wrong answer is worse than a slow right one; these stay open until the regressions and the
+missing coverage are addressed.
+
 #### Fixed — duplicate globals in a flat namespace, now gated (2.7.0-H)
 
 `calc.cyr` and `calc_ext.cyr` each declared `F64_THREE`, `F64_FOUR`, `F64_SIX` and `F64_FIFTEEN`.

@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+## [2.7.1] - 2026-08-04 — performance landings, coverage, and a rejected optimisation
+
+Suite **1607 → 1643**, `cyrius coverage` **71% → 76%** (448/587 functions).
+
+### Performance
+
+| Benchmark | Before | After | Change |
+|---|---|---|---|
+| `triangulate_600gon` | 9.93 ms | **1.59 ms** | **−84%** |
+| `kdtree_build_4k` | 2.27 ms | 2.54 ms | +12% (see below) |
+
+**`triangulate_polygon`** now skips convex vertices when testing ear containment — only a *reflex*
+vertex can lie inside a candidate ear. Unblocked by the 2.7.0-K contract documentation: it diverges
+only on self-intersecting input, which ear clipping does not define, and the divergence direction is
+old-partial → new-complete.
+
+**`_kd_partition`** gained a balance guard rather than the unconditional quickselect the spec
+proposed. That cost **+114%** on the common path (2.27 → 4.85 ms), so selection is now a *fallback*
+taken only when the cheap midpoint split leaves a child below a quarter of its parent. Depth is
+bounded at log₍₄∕₃₎(n) for +12%.
+
+### `delaunay_2d` — implemented, measured, and REJECTED
+
+The x-sweep-with-retirement rewrite was applied in full and measured on both input classes:
+
+| Input | Shipped | x-sweep | |
+|---|---|---|---|
+| uniform scatter, n=400 | 15.09 ms | **5.37 ms** | −64% |
+| **cocircular, n=150** | **615 ms** | **1616 ms** | **2.6× SLOWER** |
+
+A pay-for-itself guard was then added — disable retirement once it has demonstrably failed to
+retire anything — and **it did not help**: still 1.615 s. The cost is not the retirement scan. On
+cocircular input Bowyer-Watson creates O(n²) triangles and each pays a `_col_circum_max_x` (with a
+`sqrt`) **at creation**, before any switch can know whether retirement will pay.
+
+So the optimisation is **reverted**, not shipped behind a flag. `delaunay_2d` stays O(n²).
+Fixing it properly needs a different data structure — triangle adjacency for a walk-and-flood-fill
+Bowyer-Watson — not a bolt-on to the flat vec. That is 2.8.x work, and the measurements above are
+the specification for it.
+
+### Coverage
+
++36 assertions closing the largest remaining holes: complex scalar ops (`cx_ln`, `cx_sqrt`,
+`cx_sin`/`cos`, `cx_from_polar`, Pauli/Dirac matrices), geometry (`geo_line_*`, `geo_segment_*`,
+`geo_obb_*`, barycentric, closest-point-on-triangle), and the symbolic accessors. Every expected
+value is a closed form.
+
 ## [2.7.0] - 2026-08-04 — re-audit, repair, and the defects the repairs uncovered
 
 Closes the 2026-08-04 re-audit. **35 of its 41 numbered findings are fixed**; the six that are not

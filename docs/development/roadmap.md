@@ -81,18 +81,16 @@ releases. Two findings had never been scheduled at all, surfaced only by the per
 disposition sweep. Three confirmed performance wins were **withheld** because each regresses on
 some input class; their measurements and reviews are filed under `issues/`.
 
-### Carried into 2.7.x
-- [ ] `delaunay_2d` x-sweep — −96% at n=6,400, but 1.9-3.0x slower on cocircular input and it
-      changes the triangulation of a unit square. Spec + review filed
-- [x] `_kd_partition` — landed as a **balance guard**, not unconditional selection: midpoint first,
-      exact median only when a child falls below a quarter of its parent. +12% on the common path
-      instead of +114%. ⚠️ The finding's 574 ms geometric case **did not reproduce** *(2.7.0-O)*
-- [x] `triangulate_polygon` reflex-only pruning — **9.93 ms → 1.59 ms (−84%)**. Unblocked by the
-      2.7.0-K contract documentation; divergence is old-partial → new-complete *(2.7.0-O)*
+### Carried into 2.8.x
+- [ ] **`delaunay_2d` needs a different data structure, not an optimisation.** The x-sweep rewrite
+      was implemented, measured and **rejected in 2.7.1**: −64% on uniform scatter but **2.6x
+      SLOWER on cocircular** (615 ms → 1616 ms at n=150), and a pay-for-itself guard did not help
+      because the cost is a per-triangle `sqrt` paid **at creation**, before any switch can know.
+      The real fix is triangle adjacency enabling walk-and-flood-fill Bowyer-Watson. The 2.7.1
+      measurements are the spec.
 - [ ] `_col_in_circumcircle` adaptive exact predicate — latent (0/180 under real `delaunay_2d`
-      geometry), needed only if the function is exposed publicly or the 10x constant changes
-- [ ] Coverage 71% → 80%. Largest holes: `color.cyr`, `complex.cyr` 35/48, `geo.cyr` 27/37,
-      `symbolic.cyr` 14/21
+      geometry); needed only if the function is exposed publicly or the 10x constant changes
+- [ ] Coverage 76% → 80%. Remaining: `linalg_precision`, `lie_ext`, `calc_ext` tails
 
 ## 2.7.x -- Feature line  (after 2.7.0 lands)
 

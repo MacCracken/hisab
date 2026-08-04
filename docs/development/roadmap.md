@@ -262,14 +262,14 @@ heading, so neither was ever worked. This is precisely the error the 2026-08-04 
 written to correct, recurring inside the very release that corrected it. The per-finding table in
 `../audit/2026-08-04.md` now carries a Disposition column so it cannot happen a third time.
 
-- [ ] **`triangulate_polygon` documents a return length of exactly `3*(n-2)`** but a live bail path
-      (`if (ear_found == 0) { return result; }`) returns a SHORTER vec on degenerate input, with no
-      error signal — the caller cannot distinguish a partial triangulation from a complete one
-      (`collision_core.cyr:511`, api-consistency)
-- [ ] **`solve_gmres` overshoots its documented `max_iter` budget** — `max_iter` is documented as
-      "maximum total matrix-vector products", but the restart loop converts it into an *outer*
-      count. The audit says 2.2x; the verifier's note says the overshoot is **unbounded**, not
-      2.2x, so the doc and the code disagree without limit (`linalg_ext.cyr:343`, api-consistency)
+- [x] **`triangulate_polygon` documented a return length it does not always deliver** — the header
+      claimed `3*(n-2)` unconditionally while the no-ear bail returns early with no error signal.
+      Real contract now documented (complete / partial / empty) with the detection test spelled
+      out, and pinned by assertions *(2.7.0-K)*
+- [x] **`solve_gmres` overshot its documented `max_iter` budget without bound** — it converted a
+      matvec budget into an outer-cycle count while spending `1 + m` per cycle. The reviewer's
+      "unbounded" beat the audit's "2.2x": measured 4 products against a budget of 1. Now counted,
+      with a mid-cycle break that keeps the partial Krylov space valid *(2.7.0-K)*
 
 ### Close-out
 - [x] Gave **every** one of the 41 numbered findings in `audit/2026-08-04.md` an explicit

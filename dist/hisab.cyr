@@ -6152,7 +6152,24 @@ fn convex_hull_2d(points, n) {
 # 4. Polygon Triangulation -- Ear Clipping
 # ================================================================
 # Input: vertices = vec of HVec2 pointers, n = number of vertices
-# Returns: vec of index triples [i0, i1, i2, ...] (flat, length = 3*(n-2))
+#
+# Returns: vec of index triples [i0, i1, i2, ...], flat.
+#
+#   length == 3*(n-2)  -- COMPLETE triangulation
+#   length <  3*(n-2)  -- PARTIAL. The ear-clipping pass found no ear among the
+#                         remaining vertices and stopped; what is returned is a
+#                         valid triangulation of the part that WAS clipped.
+#   length == 0        -- no ear found on the very first pass.
+#
+# Through 2.7.0 this comment stated `length = 3*(n-2)` unconditionally, which is
+# false: the `if (ear_found == 0) { return result; }` bail below returns early on
+# degenerate or self-intersecting input, with no error signal. The information to
+# detect that was always present but never documented, so callers could not tell
+# a complete triangulation from a truncated one.
+#
+# CHECK `vec_len(result) == 3*(n-2)` before trusting the output. Ear clipping is
+# only defined for SIMPLE polygons; a self-intersecting input has no ear
+# decomposition and a short return is the honest answer, not a failure to fix.
 
 # Sign of 2D cross product for winding test
 fn _col_triangle_area_2x(ax, ay, bx, by, cx, cy) {
@@ -6281,7 +6298,10 @@ fn triangulate_polygon(vertices, n) {
             }
         }
 
-        # If no ear found this pass, polygon may be degenerate
+        # No ear this pass: the remaining vertices admit no ear decomposition
+        # (degenerate or self-intersecting). Return what was clipped so far --
+        # a PARTIAL result, which the header documents and the caller detects
+        # with vec_len(result) != 3*(n-2).
         if (ear_found == 0) { return result; }
     }
     return result;
@@ -11410,7 +11430,7 @@ fn _lext_copy(src, n) {
 # x0:   initial guess, flat f64 array of length n.
 # n:    system dimension.
 # tol:  convergence tolerance on residual norm.
-# max_iter: maximum total matrix-vector products.
+# max_iter: maximum total matrix-vector products. COUNTED, not estimated.
 # restart:  restart dimension (Krylov subspace size per cycle).
 # Returns: flat f64 array of length n (solution).
 fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
@@ -11419,12 +11439,26 @@ fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     if (m > n) { m = n; }
     if (m < 1) { m = 1; }
 
-    var outer_limit = f64_to(f64_add(f64_div(f64_from(max_iter), f64_from(m)), f64_from(1)));
+    # COUNT the matrix-vector products rather than deriving an outer-cycle bound
+    # from them. Through 2.7.0 this computed
+    #     outer_limit = trunc(max_iter / m) + 1
+    # and then spent 1 + m products per cycle, so the true cost was
+    #     (trunc(max_iter/m) + 1) * (m + 1)
+    # which is neither max_iter nor a bounded multiple of it. Measured: budget 1
+    # with restart 100 spent 4 products on a 3x3 system, and the ratio grows
+    # without limit as restart rises relative to max_iter -- no fixed safety
+    # factor fixes it.
+    #
+    # The caller's budget is a resource limit: A_fn may be arbitrarily expensive,
+    # which is the whole reason it is a callback. Honouring it exactly is the
+    # contract, not a nicety.
+    var mv_used = 0;
 
     var outer = 0;
-    while (outer < outer_limit) {
+    while (mv_used < max_iter) {
         # r = b - A*x
         var ax = fncall1(A_fn, x);
+        mv_used = mv_used + 1;
         var r = _lext_sub(b, ax, n);
         var r_norm = _lext_norm(r, n);
 
@@ -11460,8 +11494,13 @@ fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
         var k = 0;  # number of completed Arnoldi steps
         var j = 0;
         while (j < m) {
+            # Stop mid-cycle the moment the budget is spent. The Krylov space
+            # built so far is still valid, so the least-squares solve below uses
+            # k steps and returns the best answer available within budget.
+            if (mv_used >= max_iter) { break; }
             var vj = load64(v_basis + j * 8);
             var wj = fncall1(A_fn, vj);
+            mv_used = mv_used + 1;
 
             # Modified Gram-Schmidt
             i = 0;

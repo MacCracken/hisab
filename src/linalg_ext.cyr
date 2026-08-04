@@ -340,7 +340,7 @@ fn _lext_copy(src, n) {
 # x0:   initial guess, flat f64 array of length n.
 # n:    system dimension.
 # tol:  convergence tolerance on residual norm.
-# max_iter: maximum total matrix-vector products.
+# max_iter: maximum total matrix-vector products. COUNTED, not estimated.
 # restart:  restart dimension (Krylov subspace size per cycle).
 # Returns: flat f64 array of length n (solution).
 fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
@@ -349,12 +349,26 @@ fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     if (m > n) { m = n; }
     if (m < 1) { m = 1; }
 
-    var outer_limit = f64_to(f64_add(f64_div(f64_from(max_iter), f64_from(m)), f64_from(1)));
+    # COUNT the matrix-vector products rather than deriving an outer-cycle bound
+    # from them. Through 2.7.0 this computed
+    #     outer_limit = trunc(max_iter / m) + 1
+    # and then spent 1 + m products per cycle, so the true cost was
+    #     (trunc(max_iter/m) + 1) * (m + 1)
+    # which is neither max_iter nor a bounded multiple of it. Measured: budget 1
+    # with restart 100 spent 4 products on a 3x3 system, and the ratio grows
+    # without limit as restart rises relative to max_iter -- no fixed safety
+    # factor fixes it.
+    #
+    # The caller's budget is a resource limit: A_fn may be arbitrarily expensive,
+    # which is the whole reason it is a callback. Honouring it exactly is the
+    # contract, not a nicety.
+    var mv_used = 0;
 
     var outer = 0;
-    while (outer < outer_limit) {
+    while (mv_used < max_iter) {
         # r = b - A*x
         var ax = fncall1(A_fn, x);
+        mv_used = mv_used + 1;
         var r = _lext_sub(b, ax, n);
         var r_norm = _lext_norm(r, n);
 
@@ -390,8 +404,13 @@ fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
         var k = 0;  # number of completed Arnoldi steps
         var j = 0;
         while (j < m) {
+            # Stop mid-cycle the moment the budget is spent. The Krylov space
+            # built so far is still valid, so the least-squares solve below uses
+            # k steps and returns the best answer available within budget.
+            if (mv_used >= max_iter) { break; }
             var vj = load64(v_basis + j * 8);
             var wj = fncall1(A_fn, vj);
+            mv_used = mv_used + 1;
 
             # Modified Gram-Schmidt
             i = 0;

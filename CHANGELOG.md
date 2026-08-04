@@ -338,6 +338,37 @@ where 16 bytes are stored; `eigen_power` survives a transposed matvec because bo
 are symmetric; and the Gell-Mann basis leaves the **sign of λ₄..λ₇ unconstrained** — pinning it
 needs the SU(3) structure constants.
 
+#### Fixed — the two findings that were never scheduled (2.7.0-K)
+
+Both were surfaced by the disposition sweep, not by any tier heading — they had sat in the audit
+since 2026-08-04 without ever entering the work-list.
+
+**`solve_gmres` overshot its documented matvec budget without bound.** `max_iter` is documented as
+"maximum total matrix-vector products", but the code converted it into an *outer-cycle* count —
+`outer_limit = trunc(max_iter / m) + 1` — while each cycle spends `1 + m` products. True cost:
+`(trunc(max_iter/m) + 1) * (m + 1)`, which is neither `max_iter` nor a bounded multiple of it. The
+audit said 2.2x; the reviewer said unbounded, and **the reviewer was right** — the ratio grows with
+`restart / max_iter`, so no fixed safety factor fixes it. Measured on a 3×3 system: budget 1 with
+restart 100 spent **4** products.
+
+`A_fn` is a callback precisely because it may be arbitrarily expensive, so the budget is a resource
+limit, not a hint. Now counted, with a mid-cycle break — the Krylov space built so far is still
+valid, so the least-squares solve uses the completed steps and returns the best answer within
+budget. Measured after: 4, 1, 3 products against budgets 10, 1, 3.
+
+**`triangulate_polygon` documented a return length it does not always deliver.** The header stated
+`length = 3*(n-2)` unconditionally, but `if (ear_found == 0) { return result; }` returns early on
+degenerate or self-intersecting input with no error signal — a caller could not distinguish a
+complete triangulation from a truncated one. The information was always present; it was simply
+undocumented.
+
+Documented the real contract (`== 3*(n-2)` complete, `< 3*(n-2)` partial, `0` no ear on the first
+pass) with the detection test spelled out, and pinned it with assertions so it is a *tested*
+contract rather than an accident. Ear clipping is only defined for simple polygons, so a short
+return on self-intersecting input is the honest answer, not a bug to paper over.
+
+*Evidence:* reverting `linalg_ext.cyr` fails both budget assertions. Suite 1526 → **1533**.
+
 #### Fixed — the k-d tree's split plane did not separate its own subtrees (2.7.0-J)
 
 **The most serious defect found in the 2.7.0 line.** `kdtree_within_radius` returned the wrong

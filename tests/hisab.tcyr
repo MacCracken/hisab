@@ -37,6 +37,19 @@ var ULP_TOL_H = 0x3CD203AF9EE75616;
 var TOL_1EM14 = 0x3D06849B86A12B9B;  # 1e-14
 var TOL_1EM12 = 0x3D719799812DEA11;  # 1e-12 (== EPSILON_F64)  # 1e-15
 
+# Counts how many times solve_gmres actually invokes the caller's callback, so
+# the documented "maximum total matrix-vector products" budget can be asserted
+# rather than assumed. 3x3 SPD tridiagonal.
+var _gmb_calls = 0;
+fn _gmb_A(x) {
+    _gmb_calls = _gmb_calls + 1;
+    var out = alloc(3 * 8);
+    store64(out, f64_add(f64_mul(f64_from(4), load64(x)), load64(x + 8)));
+    store64(out + 8, f64_add(f64_add(load64(x), f64_mul(f64_from(4), load64(x + 8))), load64(x + 16)));
+    store64(out + 16, f64_add(load64(x + 8), f64_mul(f64_from(4), load64(x + 16))));
+    return out;
+}
+
 alloc_init();
 
 # ================================================================
@@ -1830,6 +1843,37 @@ assert(f64_approx_eq(load64(eqL + 24), 0xBFBDAB161234EC74, LOOSE_TOL_H) == 1, "e
 
 # And the eigenvector relation A*v = lambda*v, which the values alone do not pin.
 _lp_check_eig(eqA, 4, eqL, eqV, "eigen_qr 4x4 cond 240: A*v == lambda*v");
+
+test_group("solve_gmres: max_iter is a COUNTED matvec budget, not an estimate");
+
+# `max_iter` is documented as "maximum total matrix-vector products". Through
+# 2.7.0 it was converted into an OUTER-CYCLE count -- outer_limit =
+# trunc(max_iter/m) + 1 -- while each cycle spends 1 + m products, so the true
+# cost was (trunc(max_iter/m)+1)*(m+1). That is not a bounded multiple of the
+# budget: the overshoot grows without limit as `restart` rises relative to
+# `max_iter`. A_fn is a callback precisely because it may be expensive, so the
+# budget is a resource limit, not a hint.
+var gmb_b = alloc(24);
+store64(gmb_b, F64_ONE); store64(gmb_b + 8, F64_ONE); store64(gmb_b + 16, F64_ONE);
+var gmb_x = alloc(24);
+store64(gmb_x, 0); store64(gmb_x + 8, 0); store64(gmb_x + 16, 0);
+var gmb_tol = 0x3C32725DD1D243AC;   # 1e-18 -- force the budget to bind
+
+# The headline case: budget 1, restart 100. Pre-fix this spent 4 products.
+_gmb_calls = 0;
+solve_gmres(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 1, 100);
+assert(_gmb_calls <= 1, "gmres budget=1 restart=100 spends at most 1 matvec");
+assert(_gmb_calls > 0, "gmres budget=1 still does useful work");
+
+# Restart smaller than the budget. Pre-fix: 6 products for a budget of 3.
+_gmb_calls = 0;
+solve_gmres(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 3, 2);
+assert(_gmb_calls <= 3, "gmres budget=3 restart=2 spends at most 3 matvecs");
+
+# And a generous budget must still be respected exactly.
+_gmb_calls = 0;
+solve_gmres(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 10, 10);
+assert(_gmb_calls <= 10, "gmres budget=10 restart=10 spends at most 10 matvecs");
 
 var r = assert_summary();
 # Clamp before exiting: assert_summary() returns the raw failure COUNT, and a wait

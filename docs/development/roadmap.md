@@ -90,8 +90,8 @@ some input class; their measurements and reviews are filed under `issues/`.
       measurements are the spec.
 - [ ] `_col_in_circumcircle` adaptive exact predicate — latent (0/180 under real `delaunay_2d`
       geometry); needed only if the function is exposed publicly or the 10x constant changes
-- [x] **Coverage target MET: 80%** (474/587) in 2.7.2 — the goal set at the start of the 2.6.x
-      audit arc, carried through eleven releases. Suite 1127 → **1677**
+- [x] **Coverage 94%** (555/587) and **all 35 files referenced** — target was 80%, then 90%.
+      Suite 1127 → **1765** across the 2.6.x/2.7.x arc
 
 ## 2.7.x -- Feature line  (after 2.7.0 lands)
 

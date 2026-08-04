@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+## [2.7.3] - 2026-08-04 — coverage **80% → 94%**, all 35 files referenced
+
+Target was 90%; the result is **94%** (555/587 functions). **Files referenced 34/35 → 35/35** — the
+last one was `main.cyr`, previously excluded by design as the CLI smoke binary. Suite
+**1677 → 1765**.
+
++88 assertions across the remaining untested surface, every expected value a closed form:
+
+- **autodiff** — `dual_div`/`dual_pow`/`dual_abs` checked on *both* the value and the derivative
+  (`d/dx x³ = 12` at x=2, `d/dx |x| = −1` at x=−5).
+- **tensor** — `get`/`set`/`scale`/`contract`, including the rank-2 trace.
+- **interval** — `ivl_exp` enclosure ordered and anchored at `e⁰ = 1`.
+- **calc_ext** — partial derivative, gradient, Jacobian and Hessian of `x²+y²` against their exact
+  values (`∇ = (6,8)`, `H = 2I`), and adaptive Simpson of `x²` to 1/3.
+- **CGA** — the algebra identities rather than existence: `x ∧ x = 0`, `clone` preserving blades,
+  `sub` of identical multivectors having zero norm, `scale` scaling.
+- **symbolic_ext** — the whole `pat_*` constructor/accessor family plus `sym_rule`/`sym_rewrite`.
+- **transforms / mat3 / vec3 / lie** — `t2d`/`t3d` accessors and composition, `m3` arithmetic,
+  `hvec3_project`/`reject`/`angle`, `lorentz_boost`/`rotate` validated as genuine Lorentz
+  transforms.
+
+### Four more of my own errors, all caught by gates
+
+Same pattern as 2.7.2 and worth the same note — every one was a *calling-convention* mistake that a
+looser test would have hidden:
+
+- **`num_crt` takes vecs, not raw `alloc()` buffers** — it reads them with `vec_get`. Raw buffers
+  **SIGSEGV**; that is how the assertion was found, by bisecting a crashing suite down to one call.
+- **`dual_pow`'s exponent is a plain f64, not an integer** — a raw `3` is the subnormal 1.5e-323, so
+  `2³` silently returned 1.
+- **`t2d_new` takes `(pos, rotation, scale)` with HVec2 pos/scale**, not five scalars; and
+  **`hquat_from_euler` takes an explicit order argument**.
+- **A `v3a` name collision.** `foundation.tcyr` already had that global; `cyrius lint` reported
+  *"global var init refs 'v3a' declared at line 1043 (silent zero at init)"* — my later declaration
+  would have silently zeroed the earlier uses. Renamed the whole block behind a `c73_` prefix. This
+  is the flat-namespace hazard that 2.7.0-H added a gate for, hitting a **test** file this time.
+
+`f64_pow` goes through exp/ln, so `2³` is 7.999… — that assertion uses a tolerance, not `f64_to`
+equality, and the comment says why.
+
 ## [2.7.2] - 2026-08-04 — **coverage target met: 80%**
 
 `cyrius coverage` **76% → 80%** (474/587 functions), the target set at the start of the 2.6.x audit

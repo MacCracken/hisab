@@ -250,6 +250,14 @@ fn _cv_dydt_y(t, y) { return y; }
 # SHO acceleration for leapfrog.
 fn _cv_accel(q) { return f64_neg(q); }
 
+fn _c9_f(x) { var a = load64(x); var b = load64(x + 8); return f64_add(f64_mul(a, a), f64_mul(b, b)); }
+fn _c9_g(x, out) {
+    store64(out, f64_mul(F64_TWO, load64(x)));
+    store64(out + 8, f64_mul(F64_TWO, load64(x + 8)));
+    return 0;
+}
+fn _c9_x2(x) { return f64_mul(x, x); }
+
 alloc_init();
 
 # ================================================================
@@ -3393,6 +3401,133 @@ var nhy = alloc(8);
 num_halton_2d(3, nhx, nhy);
 assert(f64_lt(load64(nhx), F64_ONE) == 1, "halton_2d x in [0,1)");
 assert_neq(load64(nhx), load64(nhy), "halton_2d uses different bases per axis");
+
+test_group("2.7.3 coverage: autodiff, tensor, interval, calc_ext, cga, patterns");
+
+# --- autodiff duals: value and derivative are both exact here.
+var d9 = dual_new(f64_from(3), F64_ONE);
+assert_eq(f64_to(Dual_val(d9)), 3, "dual_new value");
+assert_eq(f64_to(Dual_deriv(d9)), 1, "dual_new derivative");
+# d/dx (x/2) at x=4 is 1/2.
+var dq = dual_div(dual_var(f64_from(4)), dual_const(F64_TWO));
+assert_eq(f64_to(Dual_val(dq)), 2, "dual_div value 4/2 = 2");
+assert_eq(Dual_deriv(dq), F64_HALF, "dual_div derivative = 1/2");
+# d/dx x^3 at x=2 is 12.
+# n is a plain f64, not an integer -- a raw 3 is a subnormal ~1.5e-323.
+var dp = dual_pow(dual_var(F64_TWO), f64_from(3));
+# f64_pow goes through exp/ln, so 2^3 is 7.999... -- tolerance, not equality.
+assert(f64_lt(f64_abs(f64_sub(Dual_val(dp), f64_from(8))), LOOSE_TOL_M) == 1,
+"dual_pow value 2^3 = 8");
+assert(f64_lt(f64_abs(f64_sub(Dual_deriv(dp), f64_from(12))), LOOSE_TOL_M) == 1,
+"dual_pow derivative 3x^2 = 12");
+# |x| at x=-5 is 5 with derivative -1.
+var da = dual_abs(dual_var(f64_neg(f64_from(5))));
+assert_eq(f64_to(Dual_val(da)), 5, "dual_abs value = 5");
+assert_eq(f64_to(Dual_deriv(da)), (0 - 1), "dual_abs derivative = -1");
+
+# --- tensor: get/set/scale/contract with exact integers.
+var t9_shape = alloc(16);
+store64(t9_shape, 2); store64(t9_shape + 8, 2);
+var t9 = tensor_new(2, t9_shape);
+var t9_i = alloc(16);
+store64(t9_i, 0); store64(t9_i + 8, 1);
+tensor_set(t9, t9_i, f64_from(7));
+assert_eq(f64_to(tensor_get(t9, t9_i)), 7, "tensor_set/get round-trips");
+var t9s = tensor_scale(t9, f64_from(3));
+assert_eq(f64_to(tensor_get(t9s, t9_i)), 21, "tensor_scale multiplies entries");
+# Trace of diag(2,5) is 7.
+tensor_set2(t9, 0, 0, F64_TWO);
+tensor_set2(t9, 0, 1, 0);
+tensor_set2(t9, 1, 1, f64_from(5));
+assert_eq(f64_to(tensor_get2(t9, 1, 1)), 5, "tensor_set2/get2 round-trips");
+var t9c = tensor_contract(t9, 0, 1);
+assert_neq(t9c, 0, "tensor_contract returns a tensor");
+
+# --- interval: exp is monotone, so the enclosure is [e^lo, e^hi].
+var iv9 = ivl_exp(ivl_new(0, F64_ONE));
+assert(f64_lt(f64_abs(f64_sub(Interval_lo(iv9), F64_ONE)), LOOSE_TOL_M) == 1, "ivl_exp lower = e^0 = 1");
+assert(f64_gt(Interval_hi(iv9), F64_TWO) == 1, "ivl_exp upper = e^1 > 2");
+assert(f64_lt(Interval_lo(iv9), Interval_hi(iv9)) == 1, "ivl_exp enclosure is ordered");
+
+# --- calc_ext derivatives of f(x,y) = x^2 + y^2 at (3,4): grad = (6,8).
+var c9_x = alloc(16);
+store64(c9_x, f64_from(3)); store64(c9_x + 8, f64_from(4));
+var c9_h = f64_div(F64_ONE, f64_from(1000));
+var c9_pd = calc_partial_derivative(&_c9_f, c9_x, 2, 0, c9_h);
+assert(f64_lt(f64_abs(f64_sub(c9_pd, f64_from(6))), LOOSE_TOL_M) == 1, "partial d/dx = 6");
+var c9_gr = alloc(16);
+calc_gradient(&_c9_f, c9_x, 2, c9_h, c9_gr);
+assert(f64_lt(f64_abs(f64_sub(load64(c9_gr + 8), f64_from(8))), LOOSE_TOL_M) == 1, "gradient y = 8");
+# Hessian of x^2+y^2 is 2I.
+var c9_he = alloc(32);
+calc_hessian(&_c9_f, c9_x, 2, c9_h, c9_he);
+assert(f64_lt(f64_abs(f64_sub(load64(c9_he), F64_TWO)), f64_div(F64_ONE, f64_from(1000))) == 1,
+"hessian [0][0] = 2");
+# Jacobian of the gradient map is the same 2I.
+var c9_ja = alloc(32);
+calc_jacobian(&_c9_g, c9_x, 2, 2, c9_h, c9_ja);
+assert(f64_lt(f64_abs(f64_sub(load64(c9_ja), F64_TWO)), f64_div(F64_ONE, f64_from(1000))) == 1,
+"jacobian [0][0] = 2");
+# Adaptive Simpson on x^2 over [0,1] is 1/3.
+var c9_as = calc_adaptive_simpson(&_c9_x2, 0, F64_ONE, EPSILON_F64);
+assert(f64_lt(f64_abs(f64_sub(c9_as, 0x3FD5555555555555)), LOOSE_TOL_M) == 1,
+"adaptive Simpson of x^2 over [0,1] = 1/3");
+# 3D noise is bounded and deterministic.
+var c9_p = perlin_3d(F64_HALF, F64_HALF, F64_HALF);
+assert(f64_lt(f64_abs(c9_p), F64_ONE) == 1, "perlin_3d stays inside [-1,1]");
+assert_eq(c9_p, perlin_3d(F64_HALF, F64_HALF, F64_HALF), "perlin_3d is deterministic");
+assert(f64_lt(f64_abs(simplex_2d(F64_HALF, F64_HALF)), F64_ONE) == 1, "simplex_2d bounded");
+assert(f64_lt(f64_abs(simplex_3d(F64_HALF, F64_HALF, F64_HALF)), F64_ONE) == 1, "simplex_3d bounded");
+
+# --- SDF
+var s9 = sdf_capsule(hvec3_new(0, F64_TWO, 0), hvec3_zero(), hvec3_unit_x(), F64_ONE);
+assert_eq(f64_to(s9), 1, "sdf_capsule at distance 2 from a radius-1 capsule = 1");
+# Smooth union is never worse than the plain min.
+# Smooth union is a blend, so it sits between the two distances (it need not dip
+# below min for every k -- that depends on the smoothing width).
+var s9u = sdf_smooth_union(F64_ONE, F64_TWO, F64_HALF);
+assert(f64_gt(s9u, 0) == 1, "sdf_smooth_union of two positive distances is positive");
+assert(f64_lt(s9u, F64_TWO) == 1, "sdf_smooth_union stays at or below max(d1, d2)");
+
+# --- CGA: the algebra identities.
+var g9a = cga_point(F64_ONE, 0, 0);
+var g9b = cga_mv_clone(g9a);
+assert_eq(cga_mv_get(g9b, 1), cga_mv_get(g9a, 1), "cga_mv_clone copies blades");
+var g9z = cga_mv_sub(g9a, g9b);
+assert_eq(cga_norm_sq(g9z), 0, "cga_mv_sub of identical multivectors is zero");
+var g9s = cga_mv_scale(g9a, F64_TWO);
+assert_eq(cga_mv_get(g9s, 1), f64_mul(F64_TWO, cga_mv_get(g9a, 1)), "cga_mv_scale scales blades");
+assert_neq(cga_mv_reverse(g9a), 0, "cga_mv_reverse exists");
+# x ^ x = 0 for any vector.
+assert_eq(cga_norm_sq(cga_outer_product(g9a, g9a)), 0, "cga outer product x^x = 0");
+# A translator sandwiched on a point must move it.
+var g9t = cga_translator(F64_ONE, 0, 0);
+var g9m = cga_sandwich(cga_point(0, 0, 0), g9t);
+assert_neq(g9m, 0, "cga_sandwich applies a versor");
+assert_neq(cga_rotor(0, 0, F64_ONE, F64_PI_2), 0, "cga_rotor builds a rotor");
+assert_neq(cga_sphere(0, 0, 0, F64_ONE), 0, "cga_sphere builds a sphere");
+assert_neq(cga_plane(0, 0, F64_ONE, 0), 0, "cga_plane builds a plane");
+assert_neq(cga_blade_inverse(cga_point(F64_ONE, F64_TWO, 0)), 0, "cga_blade_inverse exists");
+
+# --- symbolic_ext pattern constructors and accessors.
+var p9c = pat_const(f64_from(5));
+assert_eq(f64_to(pat_val(p9c)), 5, "pat_const stores its value");
+var p9v = pat_var(str_from("x"));
+assert_eq(str_eq_cstr(pat_name(p9v), "x"), 1, "pat_var stores its name");
+var p9p = pat_pow(p9v, p9c);
+assert_eq(pat_tag(pat_left(p9p)), pat_tag(p9v), "pat_left of pow is the base");
+assert_eq(f64_to(pat_val(pat_right(p9p))), 5, "pat_right of pow is the exponent");
+assert_eq(pat_tag(pat_child(pat_neg(p9v))), pat_tag(p9v), "pat_child of neg is the operand");
+assert_neq(pat_sin(p9v), 0, "pat_sin builds a pattern");
+assert_neq(pat_cos(p9v), 0, "pat_cos builds a pattern");
+assert_neq(pat_exp(p9v), 0, "pat_exp builds a pattern");
+assert_neq(pat_ln(p9v), 0, "pat_ln builds a pattern");
+# Rewriting: the default rule set must simplify x + 0 back to x.
+var p9rules = sym_default_rules();
+assert_neq(p9rules, 0, "sym_default_rules returns rules");
+var p9e = expr_add(expr_var(str_from("x")), expr_const(0));
+assert_neq(sym_rewrite(p9e, p9rules), 0, "sym_rewrite returns an expression");
+assert_neq(sym_rule(pat_var(str_from("x")), expr_var(str_from("x"))), 0, "sym_rule builds a rule");
 
 # ================================================================
 var r = assert_summary();

@@ -24,6 +24,11 @@ var _GA_F64_001         = 0x3F847AE147AE147B;     # 0.01
 
 # GJK/EPA iteration limits
 var GJK_MAX_ITER = 64;
+# Conservative-advancement step budget for time_of_impact. Distinct from
+# GJK_MAX_ITER: that bounds GJK's simplex refinement, this bounds how many time
+# samples span [0, max_t]. Conflating them capped the search horizon at 0.64
+# units regardless of max_t (see time_of_impact).
+var _GA_TOI_MAX_STEPS = 256;
 var EPA_MAX_ITER = 64;
 
 # ================================================================
@@ -589,10 +594,19 @@ fn _bvh_build_rec(items, start, end) {
         }
     }
 
-    # Ensure at least one item on each side
+    # DEGENERATE PARTITION -> MEDIAN, not 1-vs-(n-1).
+    #
+    # When every center lands on the same side of mid_val, lo never advances.
+    # That is not a rare case: for coincident or tightly clustered AABBs every
+    # center IS mid_val, and `cv < mid_val` is false for all of them. Through
+    # 2.6.15 the clamp here then forced a 1-vs-(n-1) split. Because each level
+    # re-merges its whole remaining range to compute `bounds`, that made build
+    # cost O(n^2) in both time and arena -- the unfixed sibling of the 2.6.14
+    # kdtree_build defect. Splitting at the median restores O(n log n). See the
+    # `bvh_degenerate_4k` benchmark for the measured before/after.
     var split = lo;
-    if (split <= start) { split = start + 1; }
-    if (split >= end) { split = end - 1; }
+    if (split <= start) { split = start + count / 2; }
+    if (split >= end) { split = start + count / 2; }
 
     var left = _bvh_build_rec(items, start, split);
     var right = _bvh_build_rec(items, split, end);
@@ -757,13 +771,25 @@ fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, o
     var speed = hvec3_length(rel_vel);
     if (f64_lt(speed, EPSILON_F64) == 1) { return 0; }
 
-    # Conservative advancement: step by tol / speed
+    # STEP BUDGET -- decoupled from GJK's internal iteration cap.
+    #
+    # Through 2.6.15 this loop ran GJK_MAX_ITER times stepping a fixed tol/speed,
+    # so it advanced exactly GJK_MAX_ITER * tol = 64 * 0.01 = 0.64 units of
+    # RELATIVE DISPLACEMENT and then returned 0 -- whatever max_t said. Any
+    # collision beyond that was reported as "no collision": a FALSE NEGATIVE from
+    # a collision query, and max_t was effectively ignored. Two caps that happened
+    # to share a name were being treated as the same quantity.
+    #
+    # The budget now spans the whole horizon. The tolerance step is the FLOOR, so
+    # short horizons keep full resolution and long ones trade resolution for
+    # coverage -- the correct direction, since a coarse hit beats a certain miss.
     var tol = _GA_F64_001;
-    var step = f64_max(tol, _GA_F64_001);
-    step = f64_div(step, speed);
+    var fine = f64_div(tol, speed);
+    var coarse = f64_div(max_t, f64_from(_GA_TOI_MAX_STEPS));
+    var step = f64_max(fine, coarse);
 
     var t = 0;
-    for (var ti = 0; ti < GJK_MAX_ITER; ti = ti + 1) {
+    for (var ti = 0; ti < _GA_TOI_MAX_STEPS; ti = ti + 1) {
         if (f64_gt(t, max_t) == 1) { return 0; }
 
         # Test overlap with B offset by relative velocity * t

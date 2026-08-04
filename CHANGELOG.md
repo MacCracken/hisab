@@ -20,6 +20,111 @@ because they are gate infrastructure: `scripts/check-constants.sh` was silently 
 145** constants (its regex rejected `_` digit separators) while printing "110/110 verified", and
 the constant that exposed (`symbolic_ext.cyr:213`, encoding ~1e16 against a documented 1e15).
 
+#### Fixed — the six carried-over findings (2.7.0-A) *(all mutation-proven)*
+
+Every fix below was verified by reverting its source file and confirming the new assertions fail;
+the failing output is the evidence, not the passing output. Suite 1127 → **1154**.
+
+- **`f64_fmod` computed a floored modulo, not `fmod`.** It used `f64_floor` on the quotient where
+  IEEE-754 `fmod` truncates. The two agree only when the quotient is non-negative, so the result
+  carried the sign of the **divisor** instead of the **dividend**: `fmod(-7, 3)` returned `+2`
+  where C returns `-1`, and `fmod(7, -3)` returned `-2` where C returns `+1`. Now `f64_trunc`.
+- **`f64_copysign` could not see, or produce, a negative zero.** It branched on `f64_lt(y, 0)` — an
+  *ordered* comparison — but `-0.0` compares equal to `+0.0`, so `copysign(3, -0.0)` returned `+3`,
+  and `f64_neg` of a positive zero meant the function could never return `-0.0` at all. Replaced
+  with the bit splice IEEE-754 actually specifies: `(x & ~signmask) | (y & signmask)`.
+- **`geo_ray_capsule` returned NaN for any ray parallel to the capsule axis.** In that
+  configuration `d_perp` is exactly the zero vector, so `a == 0`, `b == 0`, and the discriminant is
+  exactly `+0.0` — which does *not* satisfy the `disc < 0` test guarding the cap-sphere fallback.
+  Execution fell through to the quadratic and evaluated `0.5 / 0 = +Inf`, so a function documented
+  to return `0` on a miss returned a NaN that then propagated into caller arithmetic. The parallel
+  case now joins the cap-sphere path, which is the whole answer for it.
+- **`geo_ray_plane` returned `-1` on a miss, against its own documented contract.** `geo.cyr` states
+  "returns 0 on miss" in both the file header and the ray-section header, and every sibling
+  intersection routine does exactly that. The raw i64 `-1` is `0xFFFFFFFFFFFFFFFF` — a **negative
+  NaN** as an f64 — detectable only by integer comparison and silently poisoning any float
+  arithmetic done on it. **Behaviour change:** see *Breaking* below.
+- **`cmat_exp` never terminated on a non-finite Frobenius norm.** The scaling-squaring loop halves
+  the norm until it drops below 1, but `+Inf * 0.5` is still `+Inf` and still `> 1` — so a single
+  overflowing entry anywhere in the matrix hung the process forever. Verified: the pre-fix suite
+  runs 1 second with the fix and does not finish in 110 seconds without it. Bounded at
+  `_CMAT_EXP_MAX_SCALING = 64`, which is not a heuristic — `exp` overflows f64 above 709, so no
+  larger scaling parameter can describe a representable result.
+- **`lorentz_is_valid` rejected valid boosts.** It checked `Λᵀ η Λ = η` against a *fixed absolute*
+  `1e-12`, but the entries of that product are sums of products of two matrix entries, so their
+  rounding error scales with **cosh²(η)**. At rapidity 10, `cosh² ≈ 1.2e8` and one ulp is already
+  `1.5e-8` — four orders of magnitude past the tolerance demanded. Now scaled by the matrix
+  magnitude, leaving ~4500× headroom over the true rounding bound while still rejecting a
+  genuinely non-Lorentzian matrix (whose defect is O(scale²), not O(1e-12)) — both directions are
+  asserted.
+
+### Changed
+- **`lorentz_boost_x/y/z/…` parameter renamed `beta` → `eta`.** The bodies take `cosh`/`sinh` of the
+  argument — it was always **rapidity** — while the signature said `beta` (velocity) and the doc
+  comment said "rapidity eta". A consumer trusting the signature and passing a velocity would have
+  silently built the boost for a much smaller speed. No behaviour change; the name now matches.
+
+#### Fixed — the three high findings (2.7.0-B)
+
+`geo_advanced.cyr` is the largest module (1,261 lines) and had **zero** coverage on GJK / EPA /
+BVH / TOI before this release. Suite 1154 → **1181**.
+
+- **`cmat_mul` never checked conformability and read past the end of `b`.** It ran the inner
+  product over `cols(a)` while indexing `b` by that same bound, so any `b` with fewer rows than
+  `a` has columns was read out of bounds — `b`'s buffer is allocated at exactly
+  `rows(b)*cols(b)*16` bytes. A 2×3 times a 2×2 read two complex numbers of adjacent heap. Now
+  returns 0 for non-conformable operands.
+- **The designed-0 return was being dereferenced one call-link further out.** `cmat_new` and
+  `cmat_mul` both return 0 by design (dimension cap, non-conformable), but `cmat_add`, `cmat_sub`,
+  `cmat_adjoint`, `cmat_scale` and `cmat_trace` all called `load64` on it immediately —
+  `cmat_commutator` feeds exactly that in, since it passes two `cmat_mul` results straight to
+  `cmat_sub`. Both mutants **SIGSEGV**; with the guards they return 0. `cmat_add`/`cmat_sub` also
+  now reject mismatched shapes, and `cmat_trace` returns 0 rather than `cx_zero()` — zero is a
+  valid trace, so returning it would make a propagated failure indistinguishable from a result.
+- **`time_of_impact` ignored `max_t` and missed every collision past 0.64 units.** The advancement
+  loop was bounded by `GJK_MAX_ITER` — a cap on GJK's *simplex refinement*, not on time sampling —
+  while stepping a fixed `0.01 / speed`. The two were conflated, so the search covered
+  `64 × 0.01 = 0.64` units of relative displacement and then returned 0 no matter what horizon the
+  caller asked for: a **false negative from a collision query**. The step budget is now its own
+  constant and spans the whole horizon, with the tolerance step as a floor so short horizons keep
+  full resolution.
+
+### Performance
+
+`_bvh_build_rec` fell back to a **1-vs-(n−1) split** whenever no center sorted below the split
+midpoint — which is precisely what coincident or tightly clustered AABBs do, since then every
+center *is* the midpoint. Because each level re-merges its whole remaining range to compute
+`bounds`, that made the build **O(n²)** in time and arena, not merely O(n)-deep. It is the unfixed
+sibling of the `kdtree_build` defect closed in 2.6.14. Splitting at the median restores O(n log n).
+
+| Benchmark | Before | After | Change |
+|---|---|---|---|
+| `bvh_degenerate_4k` (4,000 coincident AABBs) | **2.722 s** | **15.5 ms** | **−99.4%** (~176×) |
+
+Measured in `tests/hisab.bcyr` on both sides; the row is in `bench-history.csv`. An isolated
+scaling probe confirms the complexity change rather than a constant-factor win — per doubling of
+n the old form cost 4.0× and the new form 2.1×:
+
+| n | Before | After |
+|---|---|---|
+| 1,000 | 174.3 ms | 3.46 ms |
+| 2,000 | 677.3 ms | 7.36 ms |
+| 4,000 | 2,690 ms | 15.94 ms |
+| 8,000 | 10,720 ms | 35.22 ms |
+
+Note on evidence: unlike every other fix this release, the BVH repair is **not** mutation-proven by
+an assertion — 20,000 coincident boxes complete under both forms, so the defect is a cost, not a
+wrong answer, and `assert_eq` cannot state it. The new assertions guard the *result* (all 20,000
+boxes still reported, disjoint queries still empty, separated inputs unaffected); the benchmark
+guards the cost.
+
+### Breaking
+- **`geo_ray_plane` now returns `0` on a miss instead of `-1`.** This aligns the code with the
+  contract stated twice in its own module and with every sibling intersection function. No caller
+  in `src/` depended on the old sentinel. **Migration:** consumers testing `== (0 - 1)` should test
+  `== 0`. Consumers already doing float comparisons on the result were getting NaN semantics and
+  are strictly better off.
+
 ## [2.6.15] - 2026-08-03 — P3/P4 closeout: two O(n²) hot paths, doc drift, full module coverage
 
 Final repair release of the 2.6.12 audit. Closes the **performance** and **documentation** tiers

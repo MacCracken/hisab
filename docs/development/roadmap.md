@@ -90,27 +90,49 @@ confirmed, 8 refuted** (4 high, 21 medium, 17 low; no criticals) across six dime
 - [x] **`symbolic_ext.cyr:213`** — `limit` encoded 9999999978962944.0 against a documented `1e15`;
       exposed by the fixed gate
 
-### Carried over — never fixed from the 2026-08-03 audit
-- [ ] `geo_ray_capsule` returns NaN instead of 0 on a parallel miss (`geo.cyr:456`)
-- [ ] `cmat_exp` scaling loop never terminates on an infinite Frobenius norm (`complex.cyr:390`)
-- [ ] `geo.cyr`'s ray-section header states a miss contract `geo_ray_plane` does not implement
-- [ ] `f64_fmod` uses floor where its own doc says trunc (`f64_util.cyr:19`)
-- [ ] `f64_copysign` wrong for a negative-zero sign argument (`f64_util.cyr:26`)
-- [ ] `lorentz_is_valid` uses an absolute tolerance, rejecting valid boosts at rapidity ≥ 5
+### Carried over — never fixed from the 2026-08-03 audit  ✅ **CLOSED (2.7.0-A)**
 
-### High
-- [ ] **`cmat_mul` never checks `cmat_cols(a) == cmat_rows(b)`** and reads past the end of b's
-      buffer (`complex.cyr:224`)
-- [ ] **`_bvh_build_rec` degenerates to a 1-vs-(n−1) split** on coincident AABBs — O(n²) time and
-      arena, O(n)-deep tree. The unfixed sibling of the 2.6.14 `kdtree_build` fix
-      (`geo_advanced.cyr:532,594`)
-- [ ] **`time_of_impact` misses every collision beyond 0.63 units** of relative travel; its
-      advancement quantum is a fixed distance and `max_t` can only shrink the horizon
-      (`geo_advanced.cyr:744`)
+All six fixed and **mutation-proven**: each source file was reverted and the new assertions
+confirmed to fail. Suite 1127 → 1154.
+
+- [x] `geo_ray_capsule` returned NaN instead of 0 on a parallel miss (`geo.cyr:456`) — `a == 0`
+      made `disc` exactly `+0.0`, which does not satisfy `disc < 0`, so the cap-sphere fallback
+      was skipped and `0.5/0` was evaluated. The parallel case now joins the cap path
+- [x] `cmat_exp` scaling loop never terminated on an infinite Frobenius norm (`complex.cyr:390`) —
+      `+Inf * 0.5` is still `+Inf`. Proven: 1 s with the fix, >110 s without. Bounded at 64
+- [x] `geo_ray_plane` now returns 0 on a miss, matching the contract stated twice in its own
+      module. **Behaviour change** — the old `-1` was a negative NaN as an f64
+- [x] `f64_fmod` used floor where IEEE-754 `fmod` truncates — the result carried the sign of the
+      divisor, not the dividend (`fmod(-7, 3)` gave `+2`, not `-1`)
+- [x] `f64_copysign` branched on an *ordered* comparison, so it was blind to `-0.0` and could
+      never produce it; replaced with the specified sign-bit splice
+- [x] `lorentz_is_valid` used an absolute `1e-12` against terms of size cosh²(η), rejecting valid
+      boosts from rapidity ~5 up; now scaled by matrix magnitude, with rejection still asserted
+- [x] *(found while fixing)* `lorentz_boost_x/y/z` took **rapidity** but named the parameter
+      `beta` (velocity), contradicting their own doc comments — renamed `eta`
+
+### High  ✅ **CLOSED (2.7.0-B)**
+
+`geo_advanced.cyr` — the largest module at 1,261 lines — had **zero** coverage on GJK/EPA/BVH/TOI
+before this. Suite 1154 → 1181.
+
+- [x] **`cmat_mul` never checked `cmat_cols(a) == cmat_rows(b)`** and read past the end of b's
+      buffer (`complex.cyr:224`) — a 2×3 times a 2×2 read two complex numbers of adjacent heap
+- [x] **`_bvh_build_rec` degenerated to a 1-vs-(n−1) split** on coincident AABBs
+      (`geo_advanced.cyr:532,594`). Not O(n) depth alone — because each level re-merges its whole
+      range for `bounds`, build cost was **O(n²)**. Median split restores O(n log n):
+      `bvh_degenerate_4k` **2.722 s → 15.5 ms (−99.4%)**, row in `bench-history.csv`.
+      ⚠️ Proven by benchmark, **not** by assertion — both forms return the same answer, so the
+      defect is a cost and `assert_eq` cannot state it
+- [x] **`time_of_impact` missed every collision beyond 0.64 units** of relative travel
+      (`geo_advanced.cyr:744`) — the loop was bounded by `GJK_MAX_ITER`, a cap on simplex
+      refinement, not on time sampling, so `max_t` was ignored entirely. A false negative from a
+      collision query. Step budget is now its own constant spanning the full horizon
 
 ### Medium — correctness & safety
-- [ ] `cmat_commutator`/`anticommutator`/`add`/`sub`/`adjoint`/`scale`/`trace` dereference
-      `cmat_mul`'s designed 0 — the 2.6.14 null-propagation fix stops one call-link short
+- [x] `cmat_commutator`/`add`/`sub`/`adjoint`/`scale`/`trace` dereferenced `cmat_mul`'s designed 0
+      — the 2.6.14 null-propagation fix stopped one call-link short. **Both mutants SIGSEGV**;
+      guarded, plus shape checks on `add`/`sub` *(closed with 2.7.0-B)*
 - [ ] `detect_islands` validates only the upper bound of contact body indices; a negative index
       subscripts before the union-find arrays (`collision_mesh.cyr:538`)
 - [ ] diffgeo's downstream tensor functions apply neither the dim cap nor a null check, so both
@@ -144,6 +166,17 @@ confirmed, 8 refuted** (4 high, 21 medium, 17 low; no criticals) across six dime
 - [ ] `_kd_partition` value-midpoint split costs O(n·log(range/min_gap)) on geometrically-spaced
       coordinates — 574 ms vs 38 ms at n = 50,000
 - [ ] Benchmark the hot public functions that still have none, so regressions are visible
+
+### Found during 2.7.0-B (new — not in the 2026-08-04 audit)
+- [ ] **`lib/hisab.cyr` is a tracked 591 KB copy of hisab's own 2.6.15 distlib bundle**, sitting in
+      the directory CLAUDE.md reserves for "vendored stdlib + first-party deps ONLY — no project
+      source here". Nothing references it: not `cyrius.cyml`, not a source `include`, not CI, not a
+      script, not the docs. Nothing regenerates it either — the distlib gate writes
+      `dist/hisab.cyr`. So it is stale by construction and, in a flat last-definition-wins
+      namespace, a standing shadowing hazard: any harness that pulls it in silently gets a frozen
+      2.6.15 definition of all 777 functions. **Decide:** delete it, or document why lib/ carries
+      a self-copy. *(Cost real time this session — it was the first suspect for a benchmark that
+      appeared to ignore a source fix.)*
 
 ### Refactor  (CLAUDE.md: third instance only, never speculative, same gates as new code)
 - [ ] **`calc.cyr` and `calc_ext.cyr` both define the unprefixed public globals `F64_THREE`,

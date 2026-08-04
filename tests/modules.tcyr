@@ -194,11 +194,13 @@ assert_eq(f64_to(g_rp_t), 5, "ray-plane hit");
 
 # Parallel ray (miss)
 var g_rp_par = geo_ray_new(hvec3_new(0, f64_from(5), 0), hvec3_unit_x());
-assert_eq(geo_ray_plane(g_rp_par, g_plane), (0 - 1), "ray-plane parallel miss");
+# 0, not the old -1. -1 as an f64 bit pattern is a NEGATIVE NaN, which the
+# module header never promised and which poisons any arithmetic done on it.
+assert_eq(geo_ray_plane(g_rp_par, g_plane), 0, "ray-plane parallel miss");
 
 # Behind origin (negative t)
 var g_rp_behind = geo_ray_new(hvec3_new(0, f64_neg(F64_ONE), 0), hvec3_new(0, f64_neg(F64_ONE), 0));
-assert_eq(geo_ray_plane(g_rp_behind, g_plane), (0 - 1), "ray-plane behind");
+assert_eq(geo_ray_plane(g_rp_behind, g_plane), 0, "ray-plane behind");
 
 # ----------------------------------------------------------------
 test_group("geo: ray-sphere");
@@ -1982,6 +1984,222 @@ assert_eq(einsum(str_from("IJ,JK->IK"), es_two, 2), 0, "einsum: uppercase -> 0")
 assert_eq(einsum(str_from("ijklm,jk->ik"), es_two, 2), 0, "einsum: rank > MAX_RANK -> 0");
 assert_eq(einsum(str_from("ijk,jk->ik"), es_two, 2), 0, "einsum: rank != tensor rank -> 0");
 assert_eq(einsum(str_from("ij,jk"), es_two, 2), 0, "einsum: missing -> separator -> 0");
+
+# ================================================================
+# 2.7.0-A -- the six 2026-08-03 findings that the 2.6.12-2.6.15 arc
+# missed. Every assertion below FAILS against the pre-2.7.0 source.
+# ================================================================
+
+test_group("f64_fmod: truncated, not floored (sign of the DIVIDEND)");
+
+# The whole point of the fix. floor() gives the sign of the divisor, trunc()
+# gives the sign of the dividend, and only the latter is fmod.
+assert_eq(f64_to(f64_fmod(f64_neg(f64_from(7)), f64_from(3))), (0 - 1),
+"fmod(-7, 3) = -1 (floor form gave +2)");
+assert_eq(f64_to(f64_fmod(f64_from(7), f64_neg(f64_from(3)))), 1,
+"fmod(7, -3) = +1 (floor form gave -2)");
+assert_eq(f64_to(f64_fmod(f64_from(7), f64_from(3))), 1, "fmod(7, 3) = 1");
+assert_eq(f64_to(f64_fmod(f64_neg(f64_from(7)), f64_neg(f64_from(3)))), (0 - 1),
+"fmod(-7, -3) = -1");
+
+# Non-integer quotient: -5.5 mod 2 is -1.5 truncated, +0.5 floored.
+var fm_a = f64_neg(f64_div(f64_from(11), f64_from(2)));
+var fm_r = f64_fmod(fm_a, f64_from(2));
+assert_eq(fm_r, f64_neg(f64_div(f64_from(3), f64_from(2))), "fmod(-5.5, 2) = -1.5");
+
+# Contract: y == 0 returns 0.
+assert_eq(f64_fmod(f64_from(7), 0), 0, "fmod(x, 0) = 0");
+
+test_group("f64_copysign: the SIGN BIT of y, not an ordered comparison");
+
+var cs_neg_zero = 0x8000_0000_0000_0000;
+
+# -0.0 is EQUAL to +0.0, so the old `f64_lt(y, 0)` test could not see it.
+assert_eq(f64_copysign(f64_from(3), cs_neg_zero), f64_neg(f64_from(3)),
+"copysign(3, -0.0) = -3 (ordered form gave +3)");
+# ... and the old form could never PRODUCE -0.0 either.
+assert_eq(f64_copysign(0, f64_neg(F64_ONE)), cs_neg_zero,
+"copysign(0, -1) = -0.0 (ordered form gave +0.0)");
+assert_eq(f64_copysign(f64_from(3), f64_from(2)), f64_from(3), "copysign(3, 2) = 3");
+assert_eq(f64_copysign(f64_neg(f64_from(5)), f64_from(2)), f64_from(5), "copysign(-5, 2) = 5");
+assert_eq(f64_copysign(f64_neg(f64_from(5)), f64_neg(F64_ONE)), f64_neg(f64_from(5)),
+"copysign(-5, -1) = -5");
+assert_eq(f64_copysign(f64_from(3), 0), f64_from(3), "copysign(3, +0.0) = +3");
+
+test_group("geo_ray_capsule: ray parallel to the capsule axis");
+
+# a == dot(d_perp, d_perp) is exactly 0 here, so disc is exactly +0.0 -- which
+# is NOT < 0, so the pre-2.7.0 code took the quadratic branch and evaluated
+# 0.5/0 = +Inf, returning NaN.
+var rc_cap = geo_capsule_new(hvec3_zero(), hvec3_new(0, 0, f64_from(4)), F64_ONE);
+var rc_par = geo_ray_new(hvec3_new(0, 0, f64_neg(f64_from(10))), hvec3_unit_z());
+var rc_t = geo_ray_capsule(rc_par, rc_cap);
+assert_eq(f64_to(rc_t), 9, "parallel ray hits the start cap at t = 9");
+# A NaN return would satisfy neither of these (both comparisons are unordered).
+assert_eq(f64_gt(rc_t, 0), 1, "parallel-ray hit is a real ordered number (not NaN)");
+
+# Parallel and 5 units off a radius-1 axis: a genuine miss, contract says 0.
+var rc_miss = geo_ray_new(hvec3_new(f64_from(5), 0, f64_neg(f64_from(10))), hvec3_unit_z());
+assert_eq(geo_ray_capsule(rc_miss, rc_cap), 0, "parallel ray outside the radius misses -> 0");
+
+# Parallel, aimed the other way: the capsule is entirely behind the ray.
+var rc_away = geo_ray_new(hvec3_new(0, 0, f64_neg(f64_from(10))),
+hvec3_new(0, 0, f64_neg(F64_ONE)));
+assert_eq(geo_ray_capsule(rc_away, rc_cap), 0, "parallel ray pointing away misses -> 0");
+
+test_group("lorentz_is_valid: tolerance relative to the matrix, not absolute");
+
+# lorentz_boost_x takes RAPIDITY. cosh(10) is 11013, so the entries of
+# Lambda^T eta Lambda are O(1.2e8) and one ulp there is 1.5e-8 -- ten thousand
+# times the fixed 1e-12 the pre-2.7.0 code demanded. A perfectly valid boost
+# was rejected.
+assert_eq(lorentz_is_valid(lorentz_boost_x(f64_from(10))), 1, "boost rapidity 10 is valid");
+assert_eq(lorentz_is_valid(lorentz_boost_y(f64_from(10))), 1, "boost_y rapidity 10 is valid");
+assert_eq(lorentz_is_valid(lorentz_boost_z(f64_from(8))), 1, "boost_z rapidity 8 is valid");
+assert_eq(lorentz_is_valid(lorentz_identity()), 1, "identity is valid");
+assert_eq(lorentz_is_valid(lorentz_boost_x(F64_ONE)), 1, "boost rapidity 1 is valid");
+
+# The relaxation must not make the predicate vacuous: a non-Lorentzian matrix
+# is still rejected, because its defect is O(scale^2), not O(1e-12).
+var lv_bad = m4_identity();
+m4_set(lv_bad, 0, 0, f64_from(2));
+assert_eq(lorentz_is_valid(lv_bad), 0, "diag(2,1,1,1) is NOT a Lorentz transform");
+var lv_bad2 = lorentz_boost_x(f64_from(10));
+m4_set(lv_bad2, 2, 2, f64_from(3));
+assert_eq(lorentz_is_valid(lv_bad2), 0, "perturbed boost is still rejected");
+
+test_group("cmat_exp: the scaling loop terminates on a non-finite norm");
+
+# Halving never brings +Inf below 1, so the pre-2.7.0 loop spun forever. That
+# this suite reaches the next line at all is the assertion.
+var ce_inf = cmat_new(2, 2);
+cmat_set(ce_inf, 0, 0, cx_real(_GEO_F64_POS_INF));
+cmat_set(ce_inf, 1, 1, cx_one());
+assert_neq(cmat_exp(ce_inf), 0, "cmat_exp(+Inf entry) returns instead of hanging");
+
+# And the ordinary path still works: exp(0) = I.
+var ce_zero = cmat_new(2, 2);
+var ce_i = cmat_exp(ce_zero);
+assert_eq(f64_to(HComplex_re(cmat_get(ce_i, 0, 0))), 1, "exp(0 matrix) diagonal = 1");
+assert_eq(f64_to(HComplex_re(cmat_get(ce_i, 0, 1))), 0, "exp(0 matrix) off-diagonal = 0");
+assert_eq(f64_to(HComplex_re(cmat_get(ce_i, 1, 1))), 1, "exp(0 matrix) diagonal = 1 (1,1)");
+
+# ================================================================
+# 2.7.0-B -- the three high findings from the 2026-08-04 re-audit.
+# geo_advanced.cyr is the largest module (1,261 lines) and had ZERO
+# coverage on GJK / EPA / BVH / TOI before this block.
+# ================================================================
+
+test_group("cmat_mul: conformability, not an out-of-bounds read");
+
+# 2x3 times 2x2 is undefined. The inner loop ran k over cols(a) = 3 while b's
+# buffer holds only rows(b)*cols(b) = 4 elements, so k = 2 read past it.
+var cm_2x3 = cmat_new(2, 3);
+var cm_2x2 = cmat_new(2, 2);
+var cm_3x2 = cmat_new(3, 2);
+assert_eq(cmat_mul(cm_2x3, cm_2x2), 0, "2x3 * 2x2 is non-conformable -> 0");
+assert_neq(cmat_mul(cm_2x3, cm_3x2), 0, "2x3 * 3x2 IS conformable -> matrix");
+assert_eq(cmat_rows(cmat_mul(cm_2x3, cm_3x2)), 2, "conformable product has 2 rows");
+assert_eq(cmat_cols(cmat_mul(cm_2x3, cm_3x2)), 2, "conformable product has 2 cols");
+assert_eq(cmat_mul(0, cm_2x2), 0, "cmat_mul(null, m) -> 0, not a null deref");
+assert_eq(cmat_mul(cm_2x2, 0), 0, "cmat_mul(m, null) -> 0, not a null deref");
+
+# The designed 0 must survive being fed onward instead of being dereferenced.
+assert_eq(cmat_add(0, cm_2x2), 0, "cmat_add(null, m) -> 0");
+assert_eq(cmat_sub(cm_2x2, 0), 0, "cmat_sub(m, null) -> 0");
+assert_eq(cmat_add(cm_2x3, cm_2x2), 0, "cmat_add on mismatched shapes -> 0");
+assert_eq(cmat_scale(0, cx_one()), 0, "cmat_scale(null) -> 0");
+assert_eq(cmat_adjoint(0), 0, "cmat_adjoint(null) -> 0");
+assert_eq(cmat_trace(0), 0, "cmat_trace(null) -> 0");
+# cmat_commutator feeds cmat_mul's result straight into cmat_sub.
+assert_eq(cmat_commutator(cm_2x3, cm_2x2), 0, "commutator of non-conformable -> 0");
+assert_neq(cmat_commutator(cm_2x2, cm_2x2), 0, "commutator of conformable -> matrix");
+
+test_group("bvh_build: coincident AABBs must not recurse O(n) deep");
+
+# Every center is identical, so every center IS the split midpoint and
+# `cv < mid_val` is false for all of them -- the partition never advances. The
+# pre-2.7.0 clamp then forced a 1-vs-(n-1) split, giving recursion depth n and a
+# quadratic build. These assertions cover the RESULT; the cost regression is
+# guarded by the `bvh_degenerate_20k` benchmark, since 130x slower is a timing
+# fact, not something an assert_eq can state.
+var bv_n = 20000;
+var bv_arr = alloc(bv_n * 8);
+var bv_pt = hvec3_new(F64_ONE, F64_ONE, F64_ONE);
+var bv_box = geo_aabb_new(bv_pt, hvec3_new(F64_TWO, F64_TWO, F64_TWO));
+var bv_i = 0;
+while (bv_i < bv_n) {
+    store64(bv_arr + bv_i * 8, bv_box);
+    bv_i = bv_i + 1;
+}
+var bv_tree = bvh_build(bv_arr, bv_n);
+assert_neq(bv_tree, 0, "bvh_build(20k coincident AABBs) returns a tree");
+
+# Depth is not the only thing that has to survive: the tree must still answer.
+var bv_hits = bvh_query_aabb(bv_tree, bv_box);
+assert_eq(vec_len(bv_hits), bv_n, "every coincident box is still reported");
+var bv_none = geo_aabb_new(hvec3_new(f64_from(100), f64_from(100), f64_from(100)),
+hvec3_new(f64_from(101), f64_from(101), f64_from(101)));
+assert_eq(vec_len(bvh_query_aabb(bv_tree, bv_none)), 0, "disjoint query returns nothing");
+
+# A well-separated set must keep working -- the median fallback only fires on the
+# degenerate branch and must not disturb the normal partition.
+var bv_m = 64;
+var bv_sep = alloc(bv_m * 8);
+var bv_j = 0;
+while (bv_j < bv_m) {
+    var bv_x = f64_from(bv_j * 10);
+    store64(bv_sep + bv_j * 8,
+    geo_aabb_new(hvec3_new(bv_x, 0, 0),
+    hvec3_new(f64_add(bv_x, F64_ONE), F64_ONE, F64_ONE)));
+    bv_j = bv_j + 1;
+}
+var bv_tree2 = bvh_build(bv_sep, bv_m);
+assert_neq(bv_tree2, 0, "bvh_build(separated) returns a tree");
+var bv_q = geo_aabb_new(hvec3_new(f64_from(30), 0, 0),
+hvec3_new(f64_from(31), F64_ONE, F64_ONE));
+assert_eq(vec_len(bvh_query_aabb(bv_tree2, bv_q)), 1, "separated query finds exactly its box");
+
+test_group("time_of_impact: the horizon is max_t, not 0.64 units");
+
+# A needs B to travel 3 units before they touch (centres 5 apart, radii 1+1).
+# The pre-2.7.0 loop advanced GJK_MAX_ITER * 0.01 = 0.64 units total and then
+# returned 0 -- a false negative from a collision query, with max_t ignored.
+var toi_a = hvec4_new(0, 0, 0, F64_ONE);
+var toi_b = hvec4_new(f64_from(5), 0, 0, F64_ONE);
+var toi_still = hvec3_zero();
+var toi_left = hvec3_new(f64_neg(F64_ONE), 0, 0);
+var toi_t = alloc(8);
+var toi_n = alloc(8);
+
+var toi_hit = time_of_impact(&_mpr_sup_sphere, toi_a, toi_still,
+&_mpr_sup_sphere, toi_b, toi_left, f64_from(10), toi_t, toi_n);
+assert_eq(toi_hit, 1, "collision 3 units out IS found within max_t = 10");
+assert_eq(f64_gt(load64(toi_t), F64_TWO), 1, "impact time is past t = 2");
+assert_eq(f64_lt(load64(toi_t), f64_from(4)), 1, "impact time is before t = 4");
+
+# max_t must still be honoured as a genuine bound in the other direction.
+assert_eq(time_of_impact(&_mpr_sup_sphere, toi_a, toi_still,
+&_mpr_sup_sphere, toi_b, toi_left, F64_ONE, toi_t, toi_n), 0,
+"same approach with max_t = 1 is out of range -> 0");
+
+# Receding: never collides no matter how long the horizon.
+var toi_right = hvec3_new(F64_ONE, 0, 0);
+assert_eq(time_of_impact(&_mpr_sup_sphere, toi_a, toi_still,
+&_mpr_sup_sphere, toi_b, toi_right, f64_from(100), toi_t, toi_n), 0,
+"receding spheres never collide");
+
+# Zero relative velocity and already apart -> no collision.
+assert_eq(time_of_impact(&_mpr_sup_sphere, toi_a, toi_still,
+&_mpr_sup_sphere, toi_b, toi_still, f64_from(10), toi_t, toi_n), 0,
+"stationary and disjoint -> 0");
+
+# Already overlapping at t = 0 -> immediate hit.
+var toi_over = hvec4_new(F64_ONE, 0, 0, F64_ONE);
+assert_eq(time_of_impact(&_mpr_sup_sphere, toi_a, toi_still,
+&_mpr_sup_sphere, toi_over, toi_left, f64_from(10), toi_t, toi_n), 1,
+"already overlapping -> hit");
+assert_eq(load64(toi_t), 0, "overlap at t = 0 reports t = 0");
 
 # ================================================================
 var r = assert_summary();

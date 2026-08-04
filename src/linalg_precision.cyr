@@ -398,6 +398,136 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
     return HSB_ERR_NONE;
 }
 
+# Split the active bidiagonal block at a negligible DIAGONAL entry.
+#
+# The implicit-shift step in _lp_bidiag_qr builds its first rotation from the
+# pair (d[p_lo]^2 - mu, d[p_lo]*f[p_lo]). When d[p_lo] is zero that pair is
+# (-mu, 0), whose rotation is a bare sign flip: the sweep reproduces the block
+# unchanged and spins until max_iter, so svd_golub_kahan returns
+# HSB_ERR_NO_CONVERGENCE with out_S never written. This is TYPICAL of, but not
+# universal to, rank-deficient input: bidiagonalization can instead leave an
+# exactly-zero SUPERdiagonal, which lets the outer deflation loop split the block
+# before any zero diagonal sits inside an active one. Measured on the pre-fix
+# code: 104 of 240 random rank-deficient matrices failed, but 60 of 60 did once
+# columns were forced dependent. The rank-1 [[1,2,3],[2,4,6],[3,6,9]] bidiagonalizes to
+# d = (-3.7417, 0, 0), f = (13.4907, 0), and one sweep drives it to
+# d = (~1e-16, 0, 0), f = (-14, 0), which then repeats forever.
+#
+# A negligible d[k] means row k (for k < p_hi) or column p_hi (for k == p_hi)
+# of the block is empty apart from one superdiagonal entry, and a chase of exact
+# Givens rotations removes that entry outright -- splitting the block and
+# deflating a singular value of exactly 0. This is the zero-diagonal case of
+# Golub & Van Loan Alg. 8.6.2, omitted from the original transcription.
+#
+# Returns 1 if a split was performed (caller must restart the sweep), else 0.
+fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
+    # The zero test must be RELATIVE to the block: a bare EPSILON_F64 would call
+    # every entry of a 1e-20-scaled block zero and no entry of a 1e+20 one.
+    var scale = f64_from(0);
+    var i = p_lo;
+    while (i <= p_hi) {
+        var dv = f64_abs(load64(diag + i * 8));
+        if (f64_gt(dv, scale) == 1) { scale = dv; }
+        if (i < p_hi) {
+            var fv = f64_abs(load64(superdiag + i * 8));
+            if (f64_gt(fv, scale) == 1) { scale = fv; }
+        }
+        i = i + 1;
+    }
+    # NOTE: EPSILON_F64 is 1e-12, not machine epsilon (2.22e-16), so this snaps
+    # any singular value below 1e-12 * ||B_block||_inf to exactly 0 where LAPACK's
+    # dbdsqr would keep it. Probed at 1e-9 / 1e-11 / 1e-13: no regression -- at
+    # 1e-13 the PRE-FIX code already returned NO_CONVERGENCE with S all zero, so
+    # the fix is strictly better. Consistent with the deflation threshold above.
+    var tol = f64_mul(EPSILON_F64, scale);
+
+    var hit = (0 - 1);
+    i = p_lo;
+    while (i <= p_hi) {
+        if (f64_lt(f64_abs(load64(diag + i * 8)), tol) == 1) {
+            hit = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if (hit < 0) { return 0; }
+
+    # Snap it to a hard zero first: both chases assume row `hit` (resp. column
+    # p_hi) is empty, and a residual 1e-16 left there would be rotated into the
+    # sub-diagonal and destroy the bidiagonal form.
+    store64(diag + hit * 8, f64_from(0));
+
+    if (hit < p_hi) {
+        # Row `hit` holds only f[hit], at column hit+1. Rotate it away against
+        # d[hit+1] (rows hit, hit+1); that pulls f[hit+1] into column hit+2 of
+        # row `hit`, so the entry is chased one column right per rotation until
+        # it falls off the end of the block.
+        var carry = load64(superdiag + hit * 8);
+        store64(superdiag + hit * 8, f64_from(0));
+        var j = hit + 1;
+        while (j <= p_hi) {
+            var dj = load64(diag + j * 8);
+            var r = f64_sqrt(f64_add(f64_mul(dj, dj), f64_mul(carry, carry)));
+            if (f64_lt(r, tol) == 1) { break; }
+            var cs = f64_div(dj, r);
+            var sn = f64_div(carry, r);
+            store64(diag + j * 8, r);
+            if (j < p_hi) {
+                var fj = load64(superdiag + j * 8);
+                store64(superdiag + j * 8, f64_mul(cs, fj));
+                carry = f64_mul(f64_neg(sn), fj);
+            } else {
+                carry = f64_from(0);
+            }
+            # Left rotation on rows (hit, j) of B == columns (hit, j) of U --
+            # same G = [[cs, -sn], [sn, cs]] convention as the bulge chase.
+            var t = 0;
+            while (t < m) {
+                var u0 = mat_get(U_acc, t, hit);
+                var u1 = mat_get(U_acc, t, j);
+                mat_set(U_acc, t, hit, f64_sub(f64_mul(cs, u0), f64_mul(sn, u1)));
+                mat_set(U_acc, t, j, f64_add(f64_mul(sn, u0), f64_mul(cs, u1)));
+                t = t + 1;
+            }
+            j = j + 1;
+        }
+        return 1;
+    }
+
+    # hit == p_hi: column p_hi holds only f[p_hi-1], at row p_hi-1. Rotate it
+    # away against d[p_hi-1] (columns p_hi-1, p_hi); that pulls f[p_hi-2] into
+    # row p_hi-2 of column p_hi, chasing the entry one row up per rotation.
+    var ccarry = load64(superdiag + (p_hi - 1) * 8);
+    store64(superdiag + (p_hi - 1) * 8, f64_from(0));
+    var c = p_hi - 1;
+    while (c >= p_lo) {
+        var dc = load64(diag + c * 8);
+        var r2 = f64_sqrt(f64_add(f64_mul(dc, dc), f64_mul(ccarry, ccarry)));
+        if (f64_lt(r2, tol) == 1) { break; }
+        var cs2 = f64_div(dc, r2);
+        var sn2 = f64_div(f64_neg(ccarry), r2);
+        store64(diag + c * 8, r2);
+        if (c > p_lo) {
+            var fc = load64(superdiag + (c - 1) * 8);
+            store64(superdiag + (c - 1) * 8, f64_mul(cs2, fc));
+            ccarry = f64_mul(sn2, fc);
+        } else {
+            ccarry = f64_from(0);
+        }
+        # Right rotation on columns (c, p_hi) of B == rows (c, p_hi) of Vt.
+        var t2 = 0;
+        while (t2 < n) {
+            var v0 = mat_get(Vt_acc, c, t2);
+            var v1 = mat_get(Vt_acc, p_hi, t2);
+            mat_set(Vt_acc, c, t2, f64_sub(f64_mul(cs2, v0), f64_mul(sn2, v1)));
+            mat_set(Vt_acc, p_hi, t2, f64_add(f64_mul(sn2, v0), f64_mul(cs2, v1)));
+            t2 = t2 + 1;
+        }
+        c = c - 1;
+    }
+    return 1;
+}
+
 # Step 2: Implicit QR iteration on bidiagonal matrix for SVD.
 # Operates on diag[0..n) and superdiag[0..n-1) in place.
 # Accumulates Givens rotations into U_acc (m x n) and Vt_acc (n x n).
@@ -459,6 +589,15 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
             while (p_lo > 0 &&
             f64_gt(f64_abs(load64(superdiag + (p_lo - 1) * 8)), EPSILON_F64) == 1) {
                 p_lo = p_lo - 1;
+            }
+
+            # A zero diagonal entry inside the block makes the shifted step below
+            # a no-op (see _lp_split_zero_diag), which is what rank-deficient
+            # input typically produces. Split there instead and restart.
+            if (_lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc,
+            p_lo, p_hi) == 1) {
+                iter = iter + 1;
+                continue;
             }
 
             # Wilkinson shift: eigenvalue of trailing 2x2 of B^T*B closer to d[p_hi]^2

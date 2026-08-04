@@ -141,10 +141,11 @@ before this. Suite 1154 → 1181.
       the cap path and the alloc-failure path dereferenced NULL (`diffgeo.cyr:336`). Shared
       `_DG_MAX_DIM`, operand guards on 9 functions, checks at **all ten** alloc sites — plus
       `wedge_1_1`, a live SIGSEGV the finding never mentioned *(2.7.0-C)*
-- [ ] `svd_golub_kahan` returns NO_CONVERGENCE plus all-zero singular values for a **rank-deficient**
-      matrix (`linalg_precision.cyr:340`). ✅ verified + challenged, fix specified, **not applied**.
-      Re-checked after the 2.7.0-D balancing landed in case it was fixed incidentally — it is
-      **not**: a rank-1 3×3 (true sv 14, 0, 0) still returns NO_CONVERGENCE with S all zero
+- [x] `svd_golub_kahan` returned NO_CONVERGENCE plus all-zero singular values for a
+      **rank-deficient** matrix (`linalg_precision.cyr:340`). A zero DIAGONAL entry makes the
+      implicit shift a no-op — the rotation from `(d²−mu, d·f)` is a bare sign flip when `d == 0`.
+      Added `_lp_split_zero_diag`, the zero-diagonal case of Golub & Van Loan Alg. 8.6.2 omitted
+      from the original transcription. Rank-1 3×3 now gives `S = (14, 0, 0)` exactly *(2.7.0-E)*
 - [x] `expr_to_str`/`sym_to_latex` dropped the rounding carry — 0.9999999 rendered as "0.1000000"
       and 2.9999999 as "2.1000000". stdlib `fmt_float_buf` skips its zero-pad when the fraction
       rounds up to 10^decimals. hisab now carries `_sym_render_f64` *(2.7.0-D)*
@@ -181,10 +182,14 @@ before this. Suite 1154 → 1181.
 - [ ] Benchmark the hot public functions that still have none, so regressions are visible
 
 ### Found during 2.7.0-C (new — not in the 2026-08-04 audit)
-- [ ] **`eigen_qr` returns `HSB_ERR_NO_CONVERGENCE` at unit scale** for a well-conditioned
-      symmetric 4×4 (numpy cond 6.85, eigenvalues −1.877, −0.278, 0.274, 1.387), even at
-      `max_iter = 1,000,000`. Reproduced on **unpatched** source, so it is independent of the
-      Householder work. Repro matrix bit patterns are in the 2.7.0-C verification record
+- [ ] **`eigen_qr` reported as returning `HSB_ERR_NO_CONVERGENCE` at unit scale** for a
+      well-conditioned symmetric 4×4 (cond 6.85, eigenvalues −1.877, −0.278, 0.274, 1.387) at
+      `max_iter = 1,000,000`, reproduced on unpatched source during 2.7.0-C.
+      ⚠️ **NOT reproduced since, and NOT confirmed fixed.** A 12-matrix random symmetric-4×4 probe
+      returns 0 failures on *every* version including pre-balancing, so the probe does not exercise
+      whatever the original matrix hit; those bit patterns were lost with a temp file. **Next step
+      is to re-derive a repro** (sweep symmetric 4×4s until one fails), not to assume either
+      outcome — the finding is open and unverified in both directions
 
 ### Found during 2.7.0-B (new — not in the 2026-08-04 audit)
 - [ ] **`lib/hisab.cyr` is a tracked 591 KB copy of hisab's own 2.6.15 distlib bundle**, sitting in

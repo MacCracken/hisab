@@ -142,11 +142,41 @@ deliberately vacuous and labelled as such — they document that the pre-fix fai
   large-magnitude integral values `_latex_fmt_const` routes down the same branch. 5 of 6 new
   assertions fail on revert; the sixth is a control proving non-carrying values are untouched.
 
-**Still open (1 of 7).** `svd_golub_kahan` on rank-deficient input — verified, challenged and fully
-specified in `docs/development/issues/2026-08-04-svd_rank_deficient.md`, not yet applied. Checked
-explicitly after the balancing work landed, in case it was fixed incidentally: it is **not**. A
-rank-1 3×3 (true singular values 14, 0, 0) still returns `HSB_ERR_NO_CONVERGENCE` with `S` all
-zero, so the finding stands on its own. A separate pre-existing defect surfaced
+#### Fixed — rank-deficient SVD (2.7.0-E). **All 7 medium findings now closed.**
+
+A zero entry on the **diagonal** of the active bidiagonal block makes the implicit-shift step a
+no-op: `_lp_bidiag_qr` builds its first rotation from `(d[p_lo]² − mu, d[p_lo]·f[p_lo])`, and when
+`d[p_lo]` is zero that pair is `(−mu, 0)`, whose rotation is a bare sign flip. The sweep reproduces
+the block unchanged and spins until `max_iter`, so `svd_golub_kahan` returned
+`HSB_ERR_NO_CONVERGENCE` with `out_S` **never written** — the caller's zero-filled buffer was all
+it got back. The rank-1 `[[1,2,3],[2,4,6],[3,6,9]]` bidiagonalizes to `d = (−3.7417, 0, 0)`,
+`f = (13.4907, 0)`, and one sweep drives it to `d = (~1e-16, 0, 0)`, `f = (−14, 0)`, which then
+repeats forever.
+
+Added `_lp_split_zero_diag`: a chase of exact Givens rotations that removes the lone superdiagonal
+entry, splitting the block and deflating a singular value of exactly 0. This is the zero-diagonal
+case of **Golub & Van Loan Alg. 8.6.2**, omitted from the original transcription. The rank-1
+matrix above now returns `HSB_ERR_NONE` with `S = (14, 0, 0)` — the exact singular values.
+
+Two claims in the proposal were corrected by review before landing, and the corrections are in the
+source comments: the defect is **typical of** rank-deficient input, not universal (a 6×6 rank-3
+counterexample converges on the unpatched module, because bidiagonalization can leave an
+exactly-zero *superdiagonal* that the outer deflation loop splits first — measured 104/240 random
+rank-deficient failures, but 60/60 once columns were forced dependent); and the split's `tol` uses
+`EPSILON_F64` = 1e-12 rather than machine epsilon, a resolution floor probed at 1e-9/1e-11/1e-13
+and found to cause no regression — at 1e-13 the pre-fix code already returned NO_CONVERGENCE with
+`S` all zero, so the fix is strictly better.
+
+*Evidence:* reverting `linalg_precision.cyr` fails 7 of 11 new assertions. The `s == 0` assertions
+are **not** standalone and are labelled as such in the test — pre-fix, `out_S` is never written, so
+a zero-filled buffer satisfies them trivially; they are meaningful only bundled with the
+return-code and reconstruction assertions beside them.
+
+**Not reproduced:** the `eigen_qr` unit-scale non-convergence filed during 2.7.0-C. A 12-matrix
+random symmetric-4×4 probe shows **0 failures on every version tested**, including pre-balancing —
+so the probe is too weak to exercise the claim, and the specific matrix that did reproduce it was
+lost with a temp file. The finding stays **open**, unverified either way, rather than being closed
+on evidence that does not support it. A separate pre-existing defect surfaced
 alongside the balancing work: `eigen_qr` returns `HSB_ERR_NO_CONVERGENCE` at *unit* scale for a
 well-conditioned symmetric 4×4 (cond 6.85), reproduced on unpatched source.
 

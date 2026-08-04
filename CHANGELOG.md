@@ -338,6 +338,47 @@ where 16 bytes are stored; `eigen_power` survives a transposed matvec because bo
 are symmetric; and the Gell-Mann basis leaves the **sign of λ₄..λ₇ unconstrained** — pinning it
 needs the SU(3) structure constants.
 
+#### Fixed — duplicate globals in a flat namespace, now gated (2.7.0-H)
+
+`calc.cyr` and `calc_ext.cyr` each declared `F64_THREE`, `F64_FOUR`, `F64_SIX` and `F64_FIFTEEN`.
+Cyrius has **one flat namespace with last-definition-wins**, and `calc_ext.cyr` follows `calc.cyr`
+in the `[lib]` bundle order — so the values that actually shipped were chosen by *manifest order*,
+not by the file being edited. Invisible for exactly as long as the two copies happened to agree.
+This is the hazard 2.6.8 addressed for `ERR_*`, recurring.
+
+Removed the four duplicates from `calc_ext.cyr`, and — more importantly — **added duplicate
+detection to `scripts/check-constants.sh`**, so the class cannot come back. It reports every
+top-level global declared in more than one `src/` file, and fails whether the values differ *or*
+agree; two copies agreeing today is a coincidence with a deadline, not safety. The matcher is
+anchored at column 0, since Cyrius indents function bodies and a leading-whitespace `var` is a
+local that shadows nothing.
+
+*Evidence:* re-adding `F64_SIX` to `calc_ext.cyr` with a different value exits 1 and names both
+sites and both values; restoring exits 0. Constant coverage 145 -> 141 declarations (four fewer
+because four duplicates are gone), 1523 assertions unchanged.
+
+**A correction to my own analysis.** My first census of this finding reported it as overstated —
+"only `F64_FIFTEEN` is duplicated; `F64_THREE`/`FOUR`/`SIX` are not defined in `src/` at all". That
+was **wrong**. My grep pattern used a single space before `=` and these files align their
+declarations with several, so it silently matched nothing. The original finding was accurate on all
+four. The gate found what the grep missed, which is the argument for gates over greps.
+
+#### Fixed — README's à-la-carte example did not compile (2.7.0-H)
+
+It listed `include "lib/…"` paths, but `lib/` holds vendored stdlib only — the library source is in
+`src/`. It was also missing `vec2.cyr` and `vec4.cyr`, which the example needs without ever naming
+them (`quat`/`mat4`/`transforms` reach into `HVec4_*`). Both fixed and **verified by building and
+running it**: it compiles clean and the ray-sphere hit really is `4.0`, as the comment claims.
+
+#### Fixed — BVH block header described a different data structure (2.7.0-H)
+
+The header over `geo_advanced.cyr`'s BVH block was wrong in five ways, each checked against the
+code: it is **not** a flattened vec-of-nodes arena (every node is its own `alloc()`); nodes are
+**32 bytes, not 40**; there is no `[32]` padding slot; `[8]`/`[16]` hold child **pointers**, not
+indices; and `bvh_build` returns the **root node pointer**, not a `{ nodes_ptr, count }` handle.
+Rewritten to describe what is actually there, with the old claims listed so the correction is
+auditable.
+
 #### Fixed — `eigen_qr` non-convergence (2.7.0-F)
 
 Last release I said this finding was **not reproduced** and left it open rather than close it on

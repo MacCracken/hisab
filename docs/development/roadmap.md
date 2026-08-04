@@ -168,39 +168,11 @@ before this. Suite 1154 → 1181.
       assertions on independently-derived references (stability function, exact-rational
       multi-step, observed order-of-convergence in (14,17)); an Euler stub fails 14 of 16
       *(2.7.0-G)*
-- [ ] **~35 surviving mutants catalogued by adversarial review** of the six test-quality repairs —
-      the next round, filed per-finding in `../development/issues/2026-08-04-tq-*.md`. Highest
-      value: `calc_integral_simpson` is effectively untested for `a != 0` (both the `h = (b-a)/n`
-      and `xi = a + i*h` a-drops survive); `ode_verlet`/`ode_symplectic_euler` never invoke the
-      caller's function pointer at all; `eigen_power` survives a transposed matvec (both test
-      matrices are symmetric); Gell-Mann leaves the sign of λ₄..λ₇ free (needs the SU(3) structure
-      constants)
-- [x] `ode_verlet` / `ode_symplectic_euler` asserted only `!= 0` — unconditional, since `alloc()`
-      never returns 0 on success. Now the exact closed form of each linear map plus the *bounded*
-      energy error a symplectic method guarantees (`h^2/8`, `h/(2(2-h))`) over 4000 steps, with the
-      bound's **attainment** asserted too so a frozen integrator fails. Review's three extra holes
-      closed: hardcoded force, shared scratch buffer, `alloc(8)` overrun *(2.7.0-G)*
-- [x] **21 assertions used `f64_from(1)` — a literal tolerance of 1.0** — on quantities whose exact
-      value is 0 or 1, i.e. accepting `[0, 2]`. 15 static sites + 8 loop iterations, plus a dead
-      `var TOL = f64_from(1)` in foundation. `"rot90.x near 0"` was satisfied by *every* rotation
-      angle. Replaced with `ULP_TOL_*` (1e-15) and closed forms. Review found 7 survivors, all
-      closed — notably a `cmat_adjoint` stub that would have made the new Hermiticity sweep vacuous
-      again, and `cx_exp` returning the conjugate (π is a fixed point of conjugation) *(2.7.0-G)*
-- [x] "gell-mann hermitian" was a tautology passing for every complex matrix (`cx_conj` copies the
-      real part, tolerance was 1.0). Now elementwise Hermiticity + tracelessness +
-      `tr(la lb) = 2 delta_ab` over 64 pairs, plus convention pins for λ₄..λ₇ (review showed those
-      three properties are invariant under any orthogonal mixing of that subspace) and the algebra
-      closure `[la,lb] = 2i f_abc lc` — the **first coverage `su3_structure_constant` has ever
-      had** *(2.7.0-G)*
-- [x] `calc_integral_simpson` had no tolerance assertion anywhere; the existing ones admitted
-      ±49%. Now bit-exact for degree ≤ 3 on a dyadic grid, the exact `1/5 + 2h^4/15` for degree 4,
-      and a 4th-order convergence ratio in (15.9, 16.05). Review found the block blind to `a != 0`
-      — added `[1,3]` cases; both a-drop mutants now fail *(2.7.0-G)*
-- [x] `eigen_power`, `cga_point`, `sym_to_latex`, `opt_gradient_descent`, `hvec4_length`,
-      `num_dst` — existence asserted, value never checked. All six now pin closed-form results.
-      Review closed three residual holes: `eigen_power` used only **symmetric** matrices (a
-      transposed matvec was invisible) and only positive dominant eigenvalues (sign loss was
-      invisible); `sym_to_latex` rendered MUL/NEG only in `paren == 0` position *(2.7.0-G)*
+- [x] **~35 surviving mutants catalogued by adversarial review** — closed alongside the six
+      repairs themselves, not deferred. Every highest-value one is now caught: the Simpson a-drops,
+      the ode function-pointers, `eigen_power`'s transposed matvec and sign loss, the λ₄..λ₇ signs,
+      `cx_exp` conjugation, the `cmat_adjoint` stub, `minkowski_interval`'s dropped z². The
+      per-finding spec files under `../development/issues/` have been retired *(2.7.0-G)*
 - [ ] Raise `cyrius coverage` from **59%** toward the 80% target
 
 ### Performance  (each needs before/after rows in `bench-history.csv`)
@@ -232,20 +204,27 @@ before this. Suite 1154 → 1181.
       appeared to ignore a source fix.)*
 
 ### Refactor  (CLAUDE.md: third instance only, never speculative, same gates as new code)
-- [ ] **`calc.cyr` and `calc_ext.cyr` both define the unprefixed public globals `F64_THREE`,
-      `F64_FOUR`, `F64_SIX`, `F64_FIFTEEN`** — both are in the same bundle, so last-definition
-      silently wins. This is the flat-namespace hazard 2.6.8 addressed for `ERR_*`, recurring
+- [x] **`calc.cyr` and `calc_ext.cyr` both defined `F64_THREE`, `F64_FOUR`, `F64_SIX`,
+      `F64_FIFTEEN`** — same bundle, last-definition-wins, so manifest ORDER decided what shipped.
+      Deduped, and `scripts/check-constants.sh` now **fails on any duplicate top-level global**,
+      whether the values differ or agree. Mutation-proven *(2.7.0-H)*
 - [ ] Resolve the cross-module private-symbol coupling — five pairs reach into another module's
       `_`-prefixed internals, breaking the README's à-la-carte consumption path. **Decide:** ship a
       dependency manifest, promote the symbols, or drop the à-la-carte claim
-- [ ] README's à-la-carte example does not compile — `vec2.cyr` and `vec4.cyr` are missing
-- [ ] BVH node-layout header documents a 40-byte node against a 32-byte allocation, plus three
-      other false statements about a 12-function, zero-coverage block
+- [x] README's à-la-carte example did not compile — wrong paths (`lib/` instead of `src/`) and
+      missing `vec2.cyr`/`vec4.cyr`. Fixed and **verified by building and running it**; the
+      documented ray-sphere hit really is 4.0 *(2.7.0-H)*
+- [x] BVH block header was wrong in **five** ways — not a flattened arena, 32 bytes not 40, no
+      padding slot, child POINTERS not indices, and `bvh_build` returns the root node not a
+      handle. Each checked against the code; old claims kept inline so the correction is
+      auditable. (The block is no longer zero-coverage — see 2.7.0-B) *(2.7.0-H)*
 
 ### Close-out
 - [ ] Give **every** numbered finding in `audit/2026-08-04.md` an explicit disposition
-- [ ] Fold the 2.6.14 memory-safety closures into `SECURITY.md` and `threat-model.md` (both owe an
-      entry — tracked in doc-health as read-through outstanding)
+- [x] Folded the 2.6.14 **and** 2.7.0 memory-safety closures into `SECURITY.md` and
+      `threat-model.md` — 7 new attack-surface rows organised by *defect class*, two new
+      sub-tables, three audit-history entries. Also corrected a threat-model row that my own
+      `geo_ray_plane` change had falsified *(2.7.0-B)*
 - [ ] Supersede with a new dated audit once the above lands
 
 ---

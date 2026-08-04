@@ -223,6 +223,48 @@ for path in sorted(glob.glob('src/*.cyr')):
                                        abs(shown - expected) / abs(expected) if expected else float('inf')))
                         results.append(False)
 
+# ---------------------------------------------------------------------------
+# DUPLICATE GLOBALS. Cyrius has ONE flat namespace and last-definition-wins, so
+# two modules in the same bundle declaring the same unprefixed global silently
+# resolve to whichever the bundler emits last. That is invisible until someone
+# edits one copy and not the other -- at which point the value that ships is
+# decided by manifest ORDER, not by the file being edited. Added 2.7.0 after
+# F64_FIFTEEN was found declared in both calc.cyr and calc_ext.cyr.
+#
+# Two copies agreeing today is not safety, it is a coincidence with a deadline.
+# Column 0 ONLY. Cyrius indents function bodies, so a leading-whitespace `var`
+# is a LOCAL and shadows nothing outside its function.
+GLOBAL_DECL = re.compile(r'^var\s+([A-Z][A-Z0-9_]*)\s*=\s*(\S.*?);')
+seen_globals = {}
+for path in sorted(glob.glob('src/*.cyr')):
+    for lineno, line in enumerate(open(path, encoding='utf-8', errors='replace'), 1):
+        m = GLOBAL_DECL.match(line)
+        if not m:
+            continue
+        name, val = m.group(1), m.group(2).strip()
+        seen_globals.setdefault(name, []).append((path, lineno, val))
+
+dup_errors = []
+for name, sites in sorted(seen_globals.items()):
+    if len(sites) < 2:
+        continue
+    vals = {v for _, _, v in sites}
+    where = ', '.join(f"{p}:{l}" for p, l, _ in sites)
+    if len(vals) == 1:
+        dup_errors.append((name, where, f"same value ({sites[0][2]}) -- still a hazard: an edit to one copy silently loses to bundle order"))
+    else:
+        dup_errors.append((name, where, "DIFFERENT VALUES: " + ' | '.join(sorted(vals))))
+
+if dup_errors:
+    print(f"\n!! {len(dup_errors)} DUPLICATE GLOBAL(S) ACROSS src/\n")
+    for name, where, why in dup_errors:
+        print(f"  {name}")
+        print(f"      sites : {where}")
+        print(f"      note  : {why}")
+        print()
+    print("Cyrius resolves these by bundle order, not by file. Declare each global once.")
+    sys.exit(1)
+
 total = len(results)
 bad = len(errors)
 print(f"=== constant check: {total - bad}/{total} verified, {len(skipped)} skipped ===")

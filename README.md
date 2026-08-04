@@ -47,20 +47,24 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "f
 git     = "https://github.com/MacCracken/hisab.git"
 tag     = "2.6.15"
 modules = ["dist/hisab.cyr"]   # ~578 KB self-contained bundle (all 34 modules)
-# Or pull individual files for a smaller compilation unit:
-# modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec3.cyr", ...]
+# Or pull individual files for a smaller compilation unit. Note the à-la-carte set
+# below is the VERIFIED minimum for this example -- vec2/vec4 are required even
+# though the example never names them (quat/mat4/transforms reach into HVec4_*):
+# modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec2.cyr", "src/vec3.cyr", ...]
 ```
 
 ```cyrius
-include "lib/f64_util.cyr"
-include "lib/error.cyr"
-include "lib/vec3.cyr"
-include "lib/quat.cyr"
-include "lib/mat4.cyr"
-include "lib/transforms.cyr"
-include "lib/geo.cyr"
-include "lib/calc.cyr"
-include "lib/num.cyr"
+include "src/f64_util.cyr"
+include "src/error.cyr"
+include "src/vec2.cyr"
+include "src/vec3.cyr"
+include "src/vec4.cyr"
+include "src/quat.cyr"
+include "src/mat4.cyr"
+include "src/transforms.cyr"
+include "src/geo.cyr"
+include "src/calc.cyr"
+include "src/num.cyr"
 
 alloc_init();
 

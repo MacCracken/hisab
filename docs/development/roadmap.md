@@ -175,9 +175,10 @@ before this. Suite 1154 → 1181.
       caller's function pointer at all; `eigen_power` survives a transposed matvec (both test
       matrices are symmetric); Gell-Mann leaves the sign of λ₄..λ₇ free (needs the SU(3) structure
       constants)
-- [ ] Apply the three remaining specified test-quality repairs (unit-tolerance sweep, gell-mann,
-      existence-only) — all verified to compile and pass, all adversarially reviewed, filed under
-      `../development/issues/2026-08-04-tq-*.md`
+- [ ] Apply the last specified test-quality repair — the **unit-tolerance sweep**: 21 assertions
+      whose tolerance is a literal `f64_from(1)` on quantities whose exact value is 0 or 1. Filed
+      at `../development/issues/2026-08-04-tq-unit_tolerance_1p0.md`, verified and adversarially
+      reviewed
 - [x] `ode_verlet` / `ode_symplectic_euler` asserted only `!= 0` — unconditional, since `alloc()`
       never returns 0 on success. Now the exact closed form of each linear map plus the *bounded*
       energy error a symplectic method guarantees (`h^2/8`, `h/(2(2-h))`) over 4000 steps, with the
@@ -185,13 +186,21 @@ before this. Suite 1154 → 1181.
       closed: hardcoded force, shared scratch buffer, `alloc(8)` overrun *(2.7.0-G)*
 - [ ] **21 assertions use `f64_from(1)` — a literal tolerance of 1.0** — on quantities whose exact
       value is 0 or 1
-- [ ] "gell-mann hermitian" is a tautology that passes for every complex matrix
+- [x] "gell-mann hermitian" was a tautology passing for every complex matrix (`cx_conj` copies the
+      real part, tolerance was 1.0). Now elementwise Hermiticity + tracelessness +
+      `tr(la lb) = 2 delta_ab` over 64 pairs, plus convention pins for λ₄..λ₇ (review showed those
+      three properties are invariant under any orthogonal mixing of that subspace) and the algebra
+      closure `[la,lb] = 2i f_abc lc` — the **first coverage `su3_structure_constant` has ever
+      had** *(2.7.0-G)*
 - [x] `calc_integral_simpson` had no tolerance assertion anywhere; the existing ones admitted
       ±49%. Now bit-exact for degree ≤ 3 on a dyadic grid, the exact `1/5 + 2h^4/15` for degree 4,
       and a 4th-order convergence ratio in (15.9, 16.05). Review found the block blind to `a != 0`
       — added `[1,3]` cases; both a-drop mutants now fail *(2.7.0-G)*
-- [ ] `eigen_power`, `cga_point`, `sym_to_latex`, `opt_gradient_descent`, `hvec4_length`,
-      `num_dst` — existence asserted, value never checked
+- [x] `eigen_power`, `cga_point`, `sym_to_latex`, `opt_gradient_descent`, `hvec4_length`,
+      `num_dst` — existence asserted, value never checked. All six now pin closed-form results.
+      Review closed three residual holes: `eigen_power` used only **symmetric** matrices (a
+      transposed matvec was invisible) and only positive dominant eigenvalues (sign loss was
+      invisible); `sym_to_latex` rendered MUL/NEG only in `paren == 0` position *(2.7.0-G)*
 - [ ] Raise `cyrius coverage` from **59%** toward the 80% target
 
 ### Performance  (each needs before/after rows in `bench-history.csv`)

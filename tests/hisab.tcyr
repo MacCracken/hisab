@@ -236,10 +236,43 @@ var svel = hvec3_new(F64_TWO, 0, 0);
 var swept = swept_aabb(saabb, svel, F64_ONE);
 assert_eq(f64_to(HVec3_x(GeoAabb_max(swept))), 3, "swept max.x");
 
-# CGA: point embedding round-trip
+# CGA: conformal point embedding.
+#   P = x e1 + y e2 + z e3 + a ep + b em,   a = (p^2-1)/2,  b = (p^2+1)/2
+# Through 2.6.15 this only asserted cga_p != 0, which cannot fail unless alloc
+# returns null -- every component was unchecked. The two null-basis coefficients
+# are FORCED by the two defining properties of the embedding (metric ep^2=+1,
+# em^2=-1, e_inf = ep+em), so they are derivable without reading the source:
+#   P.P     = p^2 + a^2 - b^2 = 0   (P must be a null vector)
+#   P.e_inf = a - b           = -1  (P must be normalized)
+# Solving: a = (p^2-1)/2, b = (p^2+1)/2. For p=(1,2,3): p^2=14, a=6.5, b=7.5.
+# Both are dyadic rationals, hence exact in f64 -- assert bit equality.
 var cga_p = cga_point(F64_ONE, F64_TWO, f64_from(3));
-# Just check it's non-null (32 components allocated)
 assert(cga_p != 0, "cga point alloc");
+assert_eq(cga_mv_get(cga_p, 1), F64_ONE, "cga point e1 = 1");
+assert_eq(cga_mv_get(cga_p, 2), F64_TWO, "cga point e2 = 2");
+assert_eq(cga_mv_get(cga_p, 3), f64_from(3), "cga point e3 = 3");
+assert_eq(cga_mv_get(cga_p, 4), 0x401A000000000000, "cga point ep = (14-1)/2 = 6.5");
+assert_eq(cga_mv_get(cga_p, 5), 0x401E000000000000, "cga point em = (14+1)/2 = 7.5");
+assert_eq(cga_mv_get(cga_p, 0), 0, "cga point scalar part = 0");
+var cga_p_nz = 0;
+var cga_pi = 6;
+while (cga_pi < 32) {
+    if (cga_mv_get(cga_p, cga_pi) != 0) { cga_p_nz = cga_p_nz + 1; }
+    cga_pi = cga_pi + 1;
+}
+assert_eq(cga_p_nz, 0, "cga point writes only blades 1..5");
+# The two derived invariants, recomputed from the returned components.
+assert_eq(f64_sub(f64_add(f64_from(14), f64_mul(cga_mv_get(cga_p, 4), cga_mv_get(cga_p, 4))),
+f64_mul(cga_mv_get(cga_p, 5), cga_mv_get(cga_p, 5))), 0, "cga point is null: P.P = 0");
+assert_eq(f64_sub(cga_mv_get(cga_p, 4), cga_mv_get(cga_p, 5)), f64_neg(F64_ONE),
+"cga point normalized: P.e_inf = -1");
+# Fractional + negative coordinates: p = (0.5, -1.5, 2) -> p^2 = 6.5, a = 2.75, b = 3.75.
+var cga_q = cga_point(F64_HALF, 0xBFF8000000000000, F64_TWO);
+assert_eq(cga_mv_get(cga_q, 1), F64_HALF, "cga point q e1 = 0.5");
+assert_eq(cga_mv_get(cga_q, 2), 0xBFF8000000000000, "cga point q e2 = -1.5");
+assert_eq(cga_mv_get(cga_q, 3), F64_TWO, "cga point q e3 = 2");
+assert_eq(cga_mv_get(cga_q, 4), 0x4006000000000000, "cga point q ep = (6.5-1)/2 = 2.75");
+assert_eq(cga_mv_get(cga_q, 5), 0x400E000000000000, "cga point q em = (6.5+1)/2 = 3.75");
 
 # CGA contraction operators (2.5.0) — interior products. Left (a |_ b) lowers
 # grade(b) by grade(a); right (a _| b) lowers grade(a) by grade(b). Verified
@@ -657,17 +690,104 @@ test_group("optimize");
 
 # Gradient descent: minimize f(x) = x^2, starting at x=5
 # Gradient: 2x
-fn _opt_f(x_ptr) { var x = load64(x_ptr); return f64_mul(x, x); }
-fn _opt_grad(x_ptr, out) { var x = load64(x_ptr); store64(out, f64_mul(F64_TWO, x)); return 0; }
-var opt_x0 = alloc(8);
+# Gradient descent on an ANISOTROPIC quadratic with a non-zero minimizer:
+#   f(x,y) = (x-3)^2 + 5(y+2)^2,   grad = (2(x-3), 10(y+2)),   x0 = (5, 3)
+# Through 2.6.15 the test minimized x^2 from x0=5 with lr=0.5. That step size
+# lands on the exact minimum in ONE update (x <- 5 - 0.5*10 = 0), and the only
+# value assertion was |x| < 1 -- a window so wide that halving the step, or
+# ignoring lr entirely, still passes; out_fmin was never read at all.
+#
+# Closed form. With lr, each coordinate contracts geometrically and independently:
+#   x_k - 3 = (1 - 2*lr)^k * 2,   y_k + 2 = (1 - 10*lr)^k * 5
+# At lr = 1/20 the factors are exactly 0.9 and 0.5.
+fn _opt_f(x_ptr) {
+    var dx = f64_sub(load64(x_ptr), f64_from(3));
+    var dy = f64_add(load64(x_ptr + 8), F64_TWO);
+    return f64_add(f64_mul(dx, dx), f64_mul(f64_from(5), f64_mul(dy, dy)));
+}
+fn _opt_grad(x_ptr, out) {
+    var dx = f64_sub(load64(x_ptr), f64_from(3));
+    var dy = f64_add(load64(x_ptr + 8), F64_TWO);
+    store64(out, f64_mul(F64_TWO, dx));
+    store64(out + 8, f64_mul(f64_from(10), dy));
+    return 0;
+}
+var opt_lr = f64_div(F64_ONE, f64_from(20));          # 0.05
+var opt_x0 = alloc(16);
 store64(opt_x0, f64_from(5));
-var opt_out_x = alloc(8);
+store64(opt_x0 + 8, f64_from(3));
+var opt_out_x = alloc(16);
 var opt_out_f = alloc(8);
-var opt_rc = opt_gradient_descent(&_opt_f, &_opt_grad, opt_x0, 1, F64_HALF, EPSILON_F64, 1000, opt_out_x, opt_out_f);
-assert_eq(opt_rc, 0, "gd converged");
-# Result should be near 0
-var opt_result = f64_abs(load64(opt_out_x));
-assert(f64_lt(opt_result, F64_ONE) == 1, "gd x near 0");
+
+# (a) Exactly 10 steps, tol unreachable -> pins the whole trajectory.
+#   x = 3 + 2*0.9^10  = 3.6973568802
+#   y = -2 + 5*0.5^10 = -1.9951171875   (exact: -2 + 5/1024)
+#   f = (2*0.9^10)^2 + 5*(5/1024)^2 = 0.4864258276518282
+var opt_rc = opt_gradient_descent(&_opt_f, &_opt_grad, opt_x0, 2, opt_lr, EPSILON_F64, 10,
+opt_out_x, opt_out_f);
+assert_eq(opt_rc, HSB_ERR_NO_CONVERGENCE, "gd 10 steps: no convergence yet");
+assert(f64_approx_eq(load64(opt_out_x), 0x400D942FD810CBF6, EPSILON_F64),
+"gd x_10 = 3 + 2*0.9^10 = 3.6973568802");
+assert(f64_approx_eq(load64(opt_out_x + 8), 0xBFFFEC0000000000, EPSILON_F64),
+"gd y_10 = -2 + 5/1024 = -1.9951171875");
+assert(f64_approx_eq(load64(opt_out_f), 0x3FDF2199CB6C6FF8, EPSILON_F64),
+"gd f_10 = 0.4864258276518282");
+assert_eq(load64(opt_x0), f64_from(5), "gd does not clobber x0");
+assert_eq(load64(opt_x0 + 8), f64_from(3), "gd does not clobber x0[1]");
+
+# (b) Run to convergence with tol = 1e-6 on ||grad||. The stopping index is
+#   determined in closed form: sqrt(4*(2*0.9^k)^2 + 100*(5*0.5^k)^2) < 1e-6
+#   first holds at k = 145, giving x = 3 + 2*0.9^145 = 3.0000004636538438.
+var opt_tol6 = 0x3EB0C6F7A0B5ED8D;                    # 1e-6
+var opt_out_x2 = alloc(16);
+var opt_out_f2 = alloc(8);
+var opt_rc2 = opt_gradient_descent(&_opt_f, &_opt_grad, opt_x0, 2, opt_lr, opt_tol6, 1000,
+opt_out_x2, opt_out_f2);
+assert_eq(opt_rc2, HSB_ERR_NONE, "gd converged");
+assert(f64_approx_eq(load64(opt_out_x2), 0x400800003E3B0657, EPSILON_F64),
+"gd x* = 3 + 2*0.9^145 = 3.0000004636538438");
+assert_eq(load64(opt_out_x2 + 8), 0xC000000000000000, "gd y* = -2 exactly");
+assert(f64_lt(load64(opt_out_f2), 0x3DA5FD7FE1796495) == 1, "gd f* < 1e-11");
+assert_eq(load64(opt_out_f2), _opt_f(opt_out_x2), "gd out_fmin == f(out_x)");
+# Documented postcondition: the returned point satisfies ||grad|| < tol.
+var opt_g = alloc(16);
+_opt_grad(opt_out_x2, opt_g);
+assert(f64_lt(f64_sqrt(f64_add(f64_mul(load64(opt_g), load64(opt_g)),
+f64_mul(load64(opt_g + 8), load64(opt_g + 8)))), opt_tol6) == 1, "gd ||grad(x*)|| < tol");
+# GAP: in (b) the y-coordinate contracts by 0.5 per step while x contracts by 0.9,
+# so at the stopping index |g_y| ~ 1e-42 and |g_x| ~ 9e-7 -- the two are 35 orders
+# apart and ||g||_1 == ||g||_2 bit-for-bit. The FORM of _opt_norm is therefore
+# unconstrained by (a) or (b). Add a third coordinate that contracts at the SAME
+# rate as x, so the two norms differ by ~sqrt(2) at the stop and the iteration
+# index moves: f(x,y,z) = (x-3)^2 + 5(y+2)^2 + (z-1)^2, x0 = (5,3,4), lr = 1/20.
+#   L2 stops at k = 150 -> x = 3 + 2*0.9^150 = 3.000000273782958
+#   L1 would stop at k = 153 -> x = 3.0000001995877765  (7.4e-8 apart)
+fn _opt_f3(x_ptr) {
+    var ax = f64_sub(load64(x_ptr), f64_from(3));
+    var ay = f64_add(load64(x_ptr + 8), F64_TWO);
+    var az = f64_sub(load64(x_ptr + 16), F64_ONE);
+    return f64_add(f64_add(f64_mul(ax, ax), f64_mul(f64_from(5), f64_mul(ay, ay))),
+    f64_mul(az, az));
+}
+fn _opt_grad3(x_ptr, out) {
+    store64(out, f64_mul(F64_TWO, f64_sub(load64(x_ptr), f64_from(3))));
+    store64(out + 8, f64_mul(f64_from(10), f64_add(load64(x_ptr + 8), F64_TWO)));
+    store64(out + 16, f64_mul(F64_TWO, f64_sub(load64(x_ptr + 16), F64_ONE)));
+    return 0;
+}
+var opt3_x0 = alloc(24);
+store64(opt3_x0, f64_from(5));
+store64(opt3_x0 + 8, f64_from(3));
+store64(opt3_x0 + 16, f64_from(4));
+var opt3_x = alloc(24);
+var opt3_f = alloc(8);
+assert_eq(opt_gradient_descent(&_opt_f3, &_opt_grad3, opt3_x0, 3, opt_lr, opt_tol6, 1000,
+opt3_x, opt3_f), HSB_ERR_NONE, "gd 3d converged");
+assert(f64_approx_eq(load64(opt3_x), 0x4008000024BF1C5E, EPSILON_F64),
+"gd 3d x* = 3 + 2*0.9^150 (L2 stop at k=150, an L1 norm would stop at 153)");
+assert(f64_approx_eq(load64(opt3_x + 16), 0x3FF000006E3D551B, EPSILON_F64),
+"gd 3d z* = 1 + 3*0.9^150");
+assert_eq(load64(opt3_x + 8), 0xC000000000000000, "gd 3d y* = -2 exactly");
 
 # ================================================================
 # Sparse / SVD / Eigen
@@ -834,9 +954,83 @@ mat_set(epm, 0, 0, f64_from(2));
 mat_set(epm, 1, 1, F64_ONE);
 var ep_val = alloc(8);
 var ep_vec = alloc(16);
+# Through 2.6.15: A = diag(2,1) with round(val) == 2, i.e. anything in [1.5,2.5)
+# passed -- and e_0 is ALREADY the exact eigenvector of diag(2,1), so the iteration
+# never had to do anything. The eigenvector output was never read.
+#
+# A = [[2,1],[1,3]]. char poly lambda^2 - 5 lambda + 5 = 0  =>  lambda = (5 +- sqrt5)/2.
+#   lambda_1 = (5 + sqrt5)/2 = 3.618033988749895   (= phi + 2)
+# From (2 - lambda_1) x + y = 0, y = (lambda_1 - 2) x = phi x, so the eigenvector
+# scaled to max-|component| = 1 (this routine's normalization) is
+#   v = (1/phi, 1) = (0.6180339887498949, 1).
+# Convergence ratio |lambda_2/lambda_1| = 0.381966, so 1000 iterations is ample.
+var epm = mat_new(2, 2);
+mat_set(epm, 0, 0, F64_TWO);   mat_set(epm, 0, 1, F64_ONE);
+mat_set(epm, 1, 0, F64_ONE);   mat_set(epm, 1, 1, f64_from(3));
+var ep_val = alloc(8);
+var ep_vec = alloc(16);
 var ep_rc = eigen_power(epm, 2, 1000, ep_val, ep_vec);
 assert_eq(ep_rc, 0, "eigen_power ok");
-assert_eq(f64_to(f64_round(load64(ep_val))), 2, "eigen_power val=2");
+var EP_TOL = 0x3DA5FD7FE1796495;   # 1e-11 (measured error is 2.5e-13; tol=EPSILON_F64
+# is the routine's own |dlambda| stopping test)
+assert(f64_approx_eq(load64(ep_val), 0x400CF1BBCDCBFA54, EP_TOL),
+"eigen_power lambda = (5+sqrt5)/2 = 3.618033988749895");
+assert(f64_approx_eq(load64(ep_vec), 0x3FE3C6EF372FE94F, EP_TOL),
+"eigen_power v[0] = 1/phi = 0.6180339887498949");
+assert_eq(load64(ep_vec + 8), F64_ONE, "eigen_power v[1] = 1 (max component, exact)");
+# Residual ||A v - lambda v||_inf, recomputed from the two outputs.
+assert(f64_lt(f64_abs(f64_sub(f64_add(f64_mul(F64_TWO, load64(ep_vec)), load64(ep_vec + 8)),
+f64_mul(load64(ep_val), load64(ep_vec)))), EP_TOL) == 1, "eigen_power residual row 0");
+assert(f64_lt(f64_abs(f64_sub(f64_add(load64(ep_vec), f64_mul(f64_from(3), load64(ep_vec + 8))),
+f64_mul(load64(ep_val), load64(ep_vec + 8)))), EP_TOL) == 1, "eigen_power residual row 1");
+
+# 3x3 with a degenerate trailing spectrum: A = 3I + J (J = all ones).
+# J has eigenvalues (3,0,0), so A has (6,3,3): lambda_1 = 6, v = (1,1,1).
+var ep3 = mat_new(3, 3);
+for (var ep3i = 0; ep3i < 3; ep3i = ep3i + 1) {
+    for (var ep3j = 0; ep3j < 3; ep3j = ep3j + 1) {
+        if (ep3i == ep3j) { mat_set(ep3, ep3i, ep3j, f64_from(4)); }
+        else { mat_set(ep3, ep3i, ep3j, F64_ONE); }
+    }
+}
+var ep3_val = alloc(8);
+var ep3_vec = alloc(24);
+assert_eq(eigen_power(ep3, 3, 1000, ep3_val, ep3_vec), 0, "eigen_power 3x3 ok");
+assert(f64_approx_eq(load64(ep3_val), f64_from(6), EP_TOL), "eigen_power 3x3 lambda = 6");
+assert(f64_approx_eq(load64(ep3_vec), F64_ONE, EP_TOL), "eigen_power 3x3 v[0] = 1");
+assert(f64_approx_eq(load64(ep3_vec + 8), F64_ONE, EP_TOL), "eigen_power 3x3 v[1] = 1");
+assert(f64_approx_eq(load64(ep3_vec + 16), F64_ONE, EP_TOL), "eigen_power 3x3 v[2] = 1");
+# GAP 1: both matrices above are SYMMETRIC, so mat_get(A, i, j) -> mat_get(A, j, i)
+# (power iteration on A^T, i.e. the LEFT eigenvector) is invisible to them.
+# A = [[1,2],[3,4]]: lambda_1 = (5+sqrt33)/2 = 5.372281323269014.
+#   right dominant eigenvector (max-component normalized) = (0.4574271077563381, 1)
+#   LEFT  dominant eigenvector (what a transposed matvec yields) = (0.6861406616345072, 1)
+var epn = mat_new(2, 2);
+mat_set(epn, 0, 0, F64_ONE);       mat_set(epn, 0, 1, F64_TWO);
+mat_set(epn, 1, 0, f64_from(3));   mat_set(epn, 1, 1, f64_from(4));
+var epn_val = alloc(8);
+var epn_vec = alloc(16);
+assert_eq(eigen_power(epn, 2, 1000, epn_val, epn_vec), 0, "eigen_power nonsym ok");
+assert(f64_approx_eq(load64(epn_val), 0x40157D3750B16878, EP_TOL),
+"eigen_power nonsym lambda = (5+sqrt33)/2 = 5.372281323269014");
+assert(f64_approx_eq(load64(epn_vec), 0x3FDD467C59078280, EP_TOL),
+"eigen_power nonsym v[0] = 0.4574271077563381 (NOT the left eigenvector 0.6861406616)");
+assert(f64_approx_eq(load64(epn_vec + 8), F64_ONE, EP_TOL), "eigen_power nonsym v[1] = 1");
+
+# GAP 2: both matrices above have a POSITIVE dominant eigenvalue and a positive
+# eigenvector, so max_val = wi -> max_val = f64_abs(wi) is invisible.
+# B = [[-3,1],[1,-2]]: lambda_1 = -(5+sqrt5)/2 = -3.618033988749895, v = (1, -1/phi).
+var epb = mat_new(2, 2);
+mat_set(epb, 0, 0, f64_neg(f64_from(3)));   mat_set(epb, 0, 1, F64_ONE);
+mat_set(epb, 1, 0, F64_ONE);                mat_set(epb, 1, 1, f64_neg(F64_TWO));
+var epb_val = alloc(8);
+var epb_vec = alloc(16);
+assert_eq(eigen_power(epb, 2, 1000, epb_val, epb_vec), 0, "eigen_power negdom ok");
+assert(f64_approx_eq(load64(epb_val), 0xC00CF1BBCDCBFA54, EP_TOL),
+"eigen_power negdom lambda = -3.618033988749895 (sign must survive)");
+assert(f64_approx_eq(load64(epb_vec), F64_ONE, EP_TOL), "eigen_power negdom v[0] = 1");
+assert(f64_approx_eq(load64(epb_vec + 8), 0xBFE3C6EF372FE94F, EP_TOL),
+"eigen_power negdom v[1] = -1/phi");
 
 # PGS: solve [[4,1],[1,3]]*x = [1,2] with no bounds
 var pgs_A = mat_new(2, 2);

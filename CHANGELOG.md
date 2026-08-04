@@ -250,10 +250,47 @@ and a re-read of the first result after 4001 later calls.
 *Evidence:* each of the three previously-surviving mutants now fails — hardcoded `accel_fn` 2
 failures, hardcoded `dp_dq` 2, `alloc(8)` 1. Suite 1266 → **1298**.
 
-**Three further test-quality repairs remain specified but not applied**, filed under
+#### Test quality — Gell-Mann tautology and six existence-only assertions (2.7.0-G cont.)
 
-`docs/development/issues/2026-08-04-tq-*.md` (existence-only, the unit-tolerance sweep, and
-Gell-Mann). All six were adversarially reviewed and all six stand
+**`gell_mann`.** The "hermitian" assertion compared `Re(l1[0][0])` against
+`Re(adjoint(l1)[0][0])` with a tolerance of **1.0**. `cx_conj` copies the real part unchanged, so
+that is `Re(x) - Re(x) = 0 < 1` — an identity for *every* complex matrix ever built. The traceless
+check used a tolerance of 1.0 as well.
+
+Replaced with the three properties that actually characterise the SU(3) basis — elementwise
+Hermiticity (deliberately *not* via `cmat_adjoint`, which is what made the original vacuous),
+tracelessness, and `tr(la lb) = 2 delta_ab` across all 64 pairs. Adversarial review then showed
+those three are invariant under **any real orthogonal mixing of lambda_4..lambda_7**, so a sign
+flip on l5 or l7, a swap of l4 and l6, or a 45-degree rotation of (l4, l6) all still passed. Added
+convention pins for each of those four generators, plus the algebra closure
+`[la, lb] = 2i sum_c f_abc lc` over all 64 pairs — which is also the **first coverage
+`su3_structure_constant` has ever had**; `grep -rn "su3_" tests/` previously returned nothing, so
+the table and the matrices had never been checked against each other.
+
+**Six existence-only assertions.** `cga_point`, `opt_gradient_descent`, `eigen_power`,
+`hvec4_length`, `num_dst` and `sym_to_latex` all had their existence asserted and their value never
+checked. Each now pins a closed-form result: the CGA null-basis coefficients are *forced* by the
+two defining properties of the embedding (`P.P = 0`, `P.e_inf = -1`), so they are derivable without
+reading the source; DST-I is pinned with delta inputs that read off one column of the kernel,
+because a round-trip alone is satisfied by `-S` and by any other symmetric involution.
+
+Review found three residual holes and all three are now closed — each verified by applying the
+mutant to source and watching the suite fail:
+
+- `eigen_power` used only **symmetric** test matrices, so a transposed matvec (power iteration on
+  `A^T`, i.e. the *left* eigenvector) was invisible. Added `[[1,2],[3,4]]`, whose right and left
+  dominant eigenvectors differ.
+- Both `eigen_power` matrices had a **positive** dominant eigenvalue and a positive eigenvector, so
+  losing the sign of the pivot was invisible. Added `[[-3,1],[1,-2]]`.
+- `sym_to_latex` rendered MUL and NEG only in `paren == 0` position, so dropping a
+  `\left(...\right)` group was invisible.
+
+*Evidence:* 1353 -> **1430**. The three mutants above fail 1, 3 and 1 assertions respectively; a
+lambda_5 or lambda_7 sign flip fails 2 each; stubbing `su3_structure_constant` to 0 fails 1.
+
+**One further test-quality repair remains specified but not applied**, filed under
+
+`docs/development/issues/2026-08-04-tq-*.md` (the unit-tolerance sweep -- 21 assertions whose tolerance is a literal 1.0). All six were adversarially reviewed and all six stand
 — but the reviewers also catalogued **~35 mutants the new assertions still would not catch**, which
 is the next round of work rather than a rejection. The most alarming: `calc_integral_simpson`
 survives `h = (b − a)/steps` → `h = b/steps` **and** `xi = a + i·h` → `xi = i·h`, i.e. it is

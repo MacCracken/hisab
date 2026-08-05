@@ -2,8 +2,57 @@
 
 ## [Unreleased]
 
+## [2.8.3] - 2026-08-05 — the eight-track audit-repair merge; the narrowphase now returns the exact MTV
+
+Discharges the bulk of the 2026-08-04 audit (42 findings). Eight parallel repair tracks were
+integrated into one tree; suite **1818 → 2263** across four harnesses, constant gate 147 → **153**,
+all gates green (`lint` 0 warnings, `fmt --check` clean, `vet` 2 deps / 0 untrusted, `fuzz` 1/0).
+
+**Two tracks solved the same problems differently and only one of each could land.** `geo_advanced.cyr`
+was edited by five tracks. The EPA work was taken from the track that rewrote the algorithm for
+*correctness* (its rewrite removed the per-face allocation as a side effect, so nothing was lost by
+dropping the track that only fixed the allocation); `time_of_impact` was taken from the track that
+replaced the sampler outright; the BVH work was disjoint and merged unchanged. Every other track's
+fixes are in the tree — verified file by file, not assumed.
+
+**Known, deliberately not fixed here:** `gjk_epa_3d` and `gjk_intersect_3d` now disagree on exact
+tangency and on coincident degenerate points (4 of 90 swept pairs). `gjk_epa_3d` is the correct one
+— two touching convex sets do intersect — so `gjk_intersect_3d` is what needs the repair, and it is
+a hot public entry point that consumers use for broadphase. It gets its own cycle rather than the
+tail of this one. The test group at `tests/modules.tcyr` titled "agrees with `gjk_intersect_3d`"
+exercises that agreement only on overlapping fixtures, so the suite does **not** currently police it.
+
 ### Fixed
 
+- **geo_advanced — the narrowphase returns the exact MTV.** `mpr_penetration` kept a portal whose
+  `v0` is the INTERIOR point, so the plane it refined against passed through the inside of the
+  Minkowski difference: its distance from the origin is not a depth, and can be zero or negative.
+  Its convergence test was unsatisfiable for a body with interior, so it also burned all 64
+  iterations every call. `mpr_intersect` had false positives from the same root cause. EPA's
+  expansion loop had a fixed point instead of a limit, kept coplanar faces while removing their
+  neighbours, and used an ABSOLUTE convergence test (`< 1e-12`, unreachable at scene scale). GJK's
+  own degeneracy tests were absolute on a SQUARED length. Measured against an **exact** reference —
+  never a previous hisab output: 15-axis OBB SAT in `python3` `Fractions` for box/box, closed forms
+  for sphere/sphere and sphere/box, independent Nelder-Mead minimisation of the support function
+  elsewhere — over 862 configurations in 35 shape classes:
+
+  | function | agreement before | agreement after |
+  |---|---|---|
+  | `mpr_penetration` | 66 / 455 (216 wrong sign) | **862 / 862** |
+  | `gjk_epa_3d` | 415 / 455 | **862 / 862** |
+  | `mpr_intersect` vs exact overlap | 9 false positives / 862 | **0 / 862** |
+
+  Worst relative error after: **1.6e-9**.
+- **geo_advanced — `time_of_impact` missed real collisions.** It advertised conservative advancement
+  but was a fixed-step **sampler**: it walked `t` in equal steps asking a *boolean* overlap test, and
+  a boolean carries no information about separation, so the step could only come from the horizon
+  while the overlap window in `t` is only ~`2R/|v_rel|` wide. Replaced with real conservative
+  advancement over a new GJK **distance** sub-algorithm (Voronoi-region simplex closest point).
+- **geo_advanced — `gjk_epa_3d` contradicted its own sibling and left both out-params unwritten.**
+  `alloc()` hands back zeroed pages, so a path that returned without writing published the NULL
+  `HVec3` into the caller's slot and the first accessor faulted. Every return path now writes both;
+  on a `0` return the normal is a documented placeholder, not a contact normal. `time_of_impact`
+  had the same defect on two paths.
 - **geo_advanced** — `gjk_epa_3d` reported "no contact" for shapes in EXACT TANGENCY. Two convex
   sets touching at a point put the origin ON the boundary of their Minkowski difference, and GJK's
   containment test is strict, so a unit sphere at the origin against a unit-half box centred at
@@ -27,12 +76,91 @@
   now report a depth-0 contact (was 114/190) and 0 of 1,290 strictly separated pairs report contact
   (unchanged)**. Every case whose verdict did not change is bit-identical, normal and depth.
 
+- **geo_advanced — a manufactured probe direction certified a touch it had not proved.**
+  `hvec3_length_sq` SQUARES, so for two zero-volume shapes separated by less than
+  `sqrt(DBL_MIN) ~ 1.5e-154` the search direction underflows to exactly 0; the degenerate-direction
+  repair then substitutes a cardinal axis, whose support value is exactly 0, and that read as a
+  supporting plane through the origin. 64 genuinely separated point-vs-point pairs reported contact.
+  A manufactured direction is now settled against the geometry by probing the six cardinal axes
+  (exact unit vectors, immune to the underflow); rejecting it outright was tried first and cost the
+  legitimate coincident-shape case, which is a real depth-0 touch. Both are now pinned by assertions.
+- **geo_advanced — `bvh_query_ray` silently discarded whole subtrees.** `geo_ray_aabb` returns the
+  hit parameter, and a `t = 0` hit — the ray origin inside the box — was being read as a miss.
+- **collision_core — `sequential_impulse` never converged for restitution >= 1.** The `(1 + e)`
+  factor multiplied the *effective* velocity, already carrying the accumulated impulse, so
+  restitution was re-applied every sweep. At `e = 1` the update is a period-2 orbit: an **even**
+  `iterations` returned zero impulse and an **odd** one twice the right answer, so the result
+  depended on the parity of a convergence parameter. Bit-identical at `e = 0`, the only case the
+  previous assertions covered.
+- **collision_mesh — `halfedge_from_triangles` aborted the process** instead of returning its
+  documented 0.
+- **calc_ext — `calc_monotone_cubic` was not monotone.** Fritsch-Carlson has two parts and only the
+  `α² + β² <= 9` circle was implemented; the circle test squares its arguments, so it is blind to a
+  tangent pointing *against* its own secant. Scored against exact-rational extrema of the Hermite
+  cubic: **58,647 of 100,000** random sets containing an extremum left their own `[y_k, y_k+1]` box,
+  overshooting by up to **57.6**. After: **0** on the same 100,000, and bit-identical on 60,000
+  strictly monotone sets. The function previously had **no assertions at all**.
+- **linalg_precision — `svd_golub_kahan` accepted wide matrices.** The `m >= n` precondition was
+  documented and enforced nowhere, so a wide matrix ran the whole decomposition and returned
+  `HSB_ERR_NONE` with numbers that are not its singular values — structurally impossible, since
+  `out_U` is m×n and a rank-m matrix cannot carry n orthonormal columns. Measured against the exact
+  identity `Σσᵢ² == ‖A‖_F²`, which needs no reference implementation: **200 of 200** wide matrices
+  violated it silently; 0 of 200 tall ones did. Now rejects `m < n` and non-positive dimensions, and
+  guards NULL handles.
+- **interval — `ivl_div` returned a finite `[-1e9, +1e9]` for a zero-straddling divisor**, which is
+  not an enclosure of the true result.
+- **einsum — a repeated OUTPUT label was accepted** and returned a confidently wrong tensor.
+- **spatial / geo_advanced — an integration defect that no textual conflict revealed.** Two tracks
+  changed `spatial_hash` in ways that merged cleanly and crashed: one replaced the per-bucket vecs
+  with an intrusive chain (i64 heads, `-1` empty, entries in one flat vec with a `next` link), while
+  the other added a full-scan query that read those slots as vecs. `vec_len` on a chain head is a
+  wild pointer. The scan now walks the flat entry list, which under the new layout needs no bucket
+  traversal at all. Its crossover constant — derived from the old FIXED 1024 buckets — was likewise
+  replaced by a direct cost comparison; left alone it would have full-scanned 4,194,304 buckets to
+  avoid 1,331 probes.
+- **Memory-safety and bounds guards** across `calc_ext`, `complex`, `linalg_ext`, `num_ext`,
+  `tensor` and `spatial`: NULL-handle checks on the capped constructors, `tensor_contract` index
+  validation against the rank, `calc_partial_derivative` bounding BOTH ends of its index, and
+  `num_halton` rejecting bases below 2 (it previously raised SIGFPE at base 0 and never returned at
+  base 1).
+
 ### Performance
 
+- **spatial** — `spatial_hash_*` bucket count now GROWS with the data instead of sitting at a fixed
+  1024, so the average chain stops being O(n) in a large scene.
+- **geo_advanced** — `bvh_build` no longer recomputes centroids per level or allocates per node.
+- **num_ext** — `num_dct` / `num_idct` / `num_dst` / `num_idst` gained O(n log n) reductions,
+  replacing the O(n²) transforms.
 - `gjk_epa_3d` on the NO-CONTACT path costs the probe: 0.65 us → 1.24 us per call and 344 → 656
   arena bytes per call (box@2 vs box@9, 16,000 calls, median of 9 runs). Contact paths are
   untouched. No benchmark in `tests/hisab.bcyr` covers a separated pair, so this number comes from
   a standalone harness rather than `bench-history.csv`.
+
+  The three algorithmic wins above are **not** quoted with before/after numbers. Each track measured
+  in its own worktree under parallel load, and those runs disagree by up to 40× on code neither of
+  them touched (`vec3_add` 79,550 vs 3,205,000 ns for the identical function), so no worktree figure
+  is admissible. Re-measurement on the integrated tree is owed before any of them is claimed.
+
+### Added
+
+- **The test-quality tier of the 2026-08-04 audit (7 findings)** — assertions that passed against
+  broken code, now replaced by ones that discriminate: `calc_hessian`'s 4-point mixed-partial cross
+  stencil, `calc_catmull_rom` (tested only at t = 0 and t = 1 on collinear equally-spaced points,
+  where the spline is pinned by construction), `calc_adaptive_simpson` (whose only integrand was x²,
+  which one unrefined Simpson panel integrates exactly), `ode_bdf` (order 4 with `f == 0` and a
+  constant history — a fixed point of any consistent method), `se3_adjoint` (passed a 24-byte
+  `HVec3` where a 48-byte twist is required), `so3_from_mat3`, and `delaunay_2d` winding.
+- `se3_twist_new` / `se3_twist_omega` / `se3_twist_v` — the exported way to build and read a twist.
+- New assertions pinning: EPA out-param contract on every return path, exact tangency in both
+  operand orders, coplanar flat boxes, crossing segments, coincident zero-volume shapes, the
+  1e-165 separation that must NOT read as contact, and `spatial_hash_query_radius` being bounded by
+  the grid rather than by the caller's radius.
+
+### Changed
+
+- **Breaking (narrow):** `so3_from_mat3` now returns 0 for a matrix that is not a rotation. It
+  documented "checks determinant ~ +1 and orthogonality" and performed neither, so callers that
+  relied on it silently accepting a non-rotation will now see the documented failure return.
 
 ## [2.8.2] - 2026-08-04 — delaunay completeness via symbolic ghost vertices. **Two critical repairs rejected.**
 

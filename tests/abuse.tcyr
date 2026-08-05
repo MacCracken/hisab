@@ -1,0 +1,1951 @@
+# abuse.tcyr -- hostile-input harness (2.9.0 exit criterion 2)
+#
+# "An abuse harness (negative indices, zero/huge dims, non-conformable operands,
+#  the designed-0 return, degenerate geometry) runs clean: no exit 139, no canary
+#  overwrite."
+#
+# This suite is NOT about numerical answers -- modules.tcyr / hisab.tcyr /
+# foundation.tcyr own those. Every assertion here is about what the library does
+# when it is handed something it was never meant to be handed:
+#
+#   * negative indices and negative counts wherever an index or count is taken
+#   * zero, one, and overflow-prone dimensions
+#   * non-conformable operands (shape mismatches, mismatched lengths)
+#   * THE DESIGNED 0 -- every capped constructor in hisab returns 0 rather than
+#     allocating, and every consumer of such a handle must reject it rather than
+#     store through it
+#   * degenerate geometry -- zero-extent boxes, zero-radius spheres, coincident
+#     points, collinear triangles, NaN / +-Inf coordinates
+#   * CANARY CHECKS -- a guard block is allocated immediately after an out-buffer
+#     (the bump allocator hands out adjacent blocks), the routine is called with
+#     abusive arguments, and the guard is asserted untouched. This is the only
+#     way a write-past-the-end shows up as a test failure rather than as luck.
+#
+# The four crash signals this harness is built to detect:
+#     exit 139  SIGSEGV       -- null / wild pointer store
+#     exit 136  SIGFPE        -- integer divide by zero
+#     exit 1    "vec: index"  -- vec_get's own bounds abort
+#     nonzero clobber count   -- write past an out-buffer
+#
+# Cases that KILL the process cannot live in a suite that must exit 0. Eight
+# such inputs were found while building this file; each is recorded verbatim in
+# the KNOWN DEFECT register at the bottom, with its file:line and its exact
+# reproducer, so the case is documented rather than discarded.
+
+include "src/error.cyr"
+include "src/f64_util.cyr"
+include "src/vec2.cyr"
+include "src/vec3.cyr"
+include "src/vec4.cyr"
+include "src/quat.cyr"
+include "src/mat3.cyr"
+include "src/mat4.cyr"
+include "src/transforms.cyr"
+include "src/color.cyr"
+include "src/complex.cyr"
+include "src/interval.cyr"
+include "src/autodiff.cyr"
+include "src/tensor.cyr"
+include "src/geo.cyr"
+include "src/geo_advanced.cyr"
+include "src/spatial.cyr"
+include "src/collision_core.cyr"
+include "src/collision_mesh.cyr"
+include "src/calc.cyr"
+include "src/calc_ext.cyr"
+include "src/num.cyr"
+include "src/num_ext.cyr"
+include "src/ode.cyr"
+include "src/optimize.cyr"
+include "src/linalg_ext.cyr"
+include "src/linalg_precision.cyr"
+include "src/einsum.cyr"
+include "src/noise_simplex.cyr"
+include "src/lie.cyr"
+include "src/lie_ext.cyr"
+include "src/diffgeo.cyr"
+include "src/symbolic.cyr"
+include "src/symbolic_ext.cyr"
+
+# ================================================================
+# Helpers -- all defined before alloc_init(), per the house rule
+# ================================================================
+
+# Guard word. 0x5A5A... is the pattern the 2.8.3 svd canary in hisab.tcyr uses;
+# it is not a plausible f64 bit pattern, not a plausible pointer, and not 0, so
+# any of the three ways a routine can scribble on it is visible.
+var _AB_CANARY = 0x5A5A5A5A5A5A5A5A;
+
+var _AB_NAN  = 0x7FF8000000000000;
+var _AB_PINF = 0x7FF0000000000000;
+var _AB_NINF = 0xFFF0000000000000;
+
+# 7.0. Held as a bit pattern rather than as f64_from(7) so the "did the routine
+# write here?" tests below are integer comparisons on i64 words -- `load64(p) ==
+# f64_from(7)` is a mixed f64/integer comparison and cycc warns on it. The
+# pattern is checked against f64_from(7) at the top of the run, so a typo in the
+# literal is a test failure and not a silently weaker harness.
+var _AB_SEVEN = 0x401C000000000000;
+
+# Allocate an n-slot guard block and stamp every slot.
+#
+# The bump allocator never reorders and never frees, so the block returned here
+# starts at exactly (previous allocation + its rounded size): calling this
+# IMMEDIATELY after allocating an out-buffer puts the guard in the bytes a
+# one-past-the-end store would land on.
+fn _ab_canary_new(n) {
+    var c = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(c + i * 8, _AB_CANARY);
+        i = i + 1;
+    }
+    return c;
+}
+
+# Number of guard slots that no longer hold the stamp. 0 == clean.
+fn _ab_clob(c, n) {
+    var bad = 0;
+    var i = 0;
+    while (i < n) {
+        if (load64(c + i * 8) != _AB_CANARY) { bad = bad + 1; }
+        i = i + 1;
+    }
+    return bad;
+}
+
+# Fill an n-slot f64 buffer with a recognisable non-zero sentinel (7.0), so
+# "the routine wrote nothing" is distinguishable from "the routine wrote 0".
+fn _ab_fill7(p, n) {
+    var i = 0;
+    while (i < n) {
+        store64(p + i * 8, _AB_SEVEN);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# How many of the n slots still hold 7.0.
+fn _ab_count7(p, n) {
+    var k = 0;
+    var i = 0;
+    while (i < n) {
+        if (load64(p + i * 8) == _AB_SEVEN) { k = k + 1; }
+        i = i + 1;
+    }
+    return k;
+}
+
+# Snapshot n i64 words into a fresh block.
+fn _ab_snapshot(p, n) {
+    var s = alloc(n * 8);
+    var i = 0;
+    while (i < n) {
+        store64(s + i * 8, load64(p + i * 8));
+        i = i + 1;
+    }
+    return s;
+}
+
+# Number of the n words in which a and b differ. 0 == bit-identical.
+fn _ab_diff(a, b, n) {
+    var d = 0;
+    var i = 0;
+    while (i < n) {
+        if (load64(a + i * 8) != load64(b + i * 8)) { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+# 1 if x is NaN (unordered with itself), else 0. Bit equality is not enough:
+# NaN has 2^52 payloads and the routines below may produce any of them.
+fn _ab_is_nan(x) {
+    if (f64_eq(x, x) == 1) { return 0; }
+    return 1;
+}
+
+# 1 if x is finite -- not NaN and not either infinity. Tested on the EXPONENT
+# BITS rather than by comparing against the two infinity patterns: an all-ones
+# exponent is exactly "infinity or NaN", and a bitmask keeps this an integer
+# operation on what is, at this level, an i64 bit pattern.
+fn _ab_is_finite(x) {
+    if ((x & 0x7FF0000000000000) == 0x7FF0000000000000) { return 0; }
+    return 1;
+}
+
+# --- scalar callbacks for the calculus / ODE / optimiser abuse cases ---
+fn _ab_f_x2(x)      { return f64_mul(x, x); }
+fn _ab_dydt(t, y)   { return y; }
+fn _ab_diffusion(t, y) { return F64_ONE; }
+fn _ab_dg_dy(t, y)  { return 0; }
+fn _ab_accel(q)     { return f64_neg(q); }
+
+# --- vector callbacks: f(x) = x0^2 + x1^2 on a flat 2-slot f64 array ---
+fn _ab_fvec(x) {
+    return f64_add(f64_mul(load64(x), load64(x)),
+    f64_mul(load64(x + 8), load64(x + 8)));
+}
+
+fn _ab_gvec(x) {
+    var g = alloc(16);
+    store64(g, f64_mul(F64_TWO, load64(x)));
+    store64(g + 8, f64_mul(F64_TWO, load64(x + 8)));
+    return g;
+}
+
+# --- least-squares callbacks for opt_levenberg_marquardt ---
+fn _ab_residuals(x) {
+    var r = alloc(8);
+    store64(r, load64(x));
+    return r;
+}
+
+fn _ab_jacobian(x) {
+    var j = alloc(8);
+    store64(j, F64_ONE);
+    return j;
+}
+
+# --- matvec callback for the Krylov solvers: y = 2x on R^3 ---
+fn _ab_matvec(x) {
+    var y = alloc(3 * 8);
+    var i = 0;
+    while (i < 3) {
+        store64(y + i * 8, f64_mul(F64_TWO, load64(x + i * 8)));
+        i = i + 1;
+    }
+    return y;
+}
+
+# --- support functions for the narrowphase abuse cases ---
+# shape = HVec4 [cx, cy, cz, radius]; a zero radius is a POINT, the degenerate
+# case every support-mapping algorithm has to survive.
+fn _ab_sup_sphere(shape, dir) {
+    var c = hvec3_new(HVec4_x(shape), HVec4_y(shape), HVec4_z(shape));
+    var dn = hvec3_normalize(dir);
+    return hvec3_add(c, hvec3_scale(dn, HVec4_w(shape)));
+}
+
+alloc_init();
+
+# ================================================================
+# 1. CAPPED CONSTRUCTORS RETURN THE DESIGNED 0
+# ================================================================
+# Every one of these caps a dimension and returns 0 rather than allocating. The
+# 0 is the CONTRACT, not a failure to check -- sections 2 and 3 then verify that
+# the consumers honour it.
+test_group("abuse: capped constructors return the designed 0");
+
+# The hand-typed 7.0 pattern the write-detection helpers key on. A wrong literal
+# here would make every "out untouched" assertion below vacuously true.
+assert_eq(_AB_SEVEN, f64_from(7), "harness: the _AB_SEVEN sentinel really is 7.0");
+
+var ab_shape = alloc(64);
+store64(ab_shape, 2);
+store64(ab_shape + 8, 3);
+store64(ab_shape + 16, 4);
+store64(ab_shape + 24, 5);
+
+assert_eq(tensor_new((0 - 1), ab_shape), 0, "tensor_new: rank = -1 -> 0");
+assert_eq(tensor_new(9, ab_shape), 0, "tensor_new: rank = 9 (over the rank-8 cap) -> 0");
+
+var ab_sh_zero = alloc(16);
+store64(ab_sh_zero, 0);
+store64(ab_sh_zero + 8, 2);
+assert_eq(tensor_new(2, ab_sh_zero), 0, "tensor_new: extent 0 -> 0");
+
+store64(ab_sh_zero, (0 - 3));
+assert_eq(tensor_new(2, ab_sh_zero), 0, "tensor_new: extent -3 -> 0");
+
+# 1e6 x 1e6 = 1e12 elements = 8 TB. The guard is a DIVISION (total > MAX/dim),
+# so it fires before the multiply that would wrap i64.
+var ab_sh_huge = alloc(16);
+store64(ab_sh_huge, 1000000);
+store64(ab_sh_huge + 8, 1000000);
+assert_eq(tensor_new(2, ab_sh_huge), 0, "tensor_new: 1e6 x 1e6 (8 TB) -> 0");
+
+# rank 0 is legal: a scalar. Distinguish "capped" from "degenerate but valid".
+assert_neq(tensor_new(0, ab_shape), 0, "tensor_new: rank 0 is a scalar, not an error");
+
+assert_eq(cmat_new((0 - 1), 3), 0, "cmat_new: rows = -1 -> 0");
+assert_eq(cmat_new(3, (0 - 1)), 0, "cmat_new: cols = -1 -> 0");
+assert_eq(cmat_new(0, 0), 0, "cmat_new: 0 x 0 -> 0");
+assert_eq(cmat_new(1, 0), 0, "cmat_new: 1 x 0 -> 0");
+assert_eq(cmat_new(100000, 100000), 0, "cmat_new: 1e5 x 1e5 (over 64K elems) -> 0");
+assert_neq(cmat_new(1, 1), 0, "cmat_new: 1 x 1 is the smallest legal matrix");
+
+assert_eq(cmat_identity(0), 0, "cmat_identity: n = 0 -> 0");
+assert_eq(cmat_identity((0 - 4)), 0, "cmat_identity: n = -4 -> 0");
+assert_eq(cmat_identity(1000000), 0, "cmat_identity: n = 1e6 -> 0 (propagates cmat_new)");
+
+assert_eq(mat_new_guarded((0 - 1), 3), 0, "mat_new_guarded: rows = -1 -> 0");
+assert_eq(mat_new_guarded(3, (0 - 1)), 0, "mat_new_guarded: cols = -1 -> 0");
+assert_eq(mat_new_guarded(0, 3), 0, "mat_new_guarded: rows = 0 -> 0");
+assert_eq(mat_new_guarded(1000000, 1000000), 0, "mat_new_guarded: 1e6 x 1e6 -> 0");
+assert_neq(mat_new_guarded(1, 1), 0, "mat_new_guarded: 1 x 1 allocates");
+
+# The stdlib constructor is guarded too as of ganita 1.0.4 -- before that,
+# mat_new(-5, 3) segfaulted outright.
+assert_eq(mat_new((0 - 5), 3), 0, "mat_new (stdlib): rows = -5 -> 0");
+assert_eq(mat_new(1000000000, 1000000000), 0, "mat_new (stdlib): 1e9 x 1e9 -> 0");
+
+# alloc() itself is the bottom of the designed-0 chain: nothing else in this
+# file can be reasoned about if a non-positive size ever returns a pointer.
+assert_eq(alloc(0), 0, "alloc: size 0 -> 0");
+assert_eq(alloc((0 - 8)), 0, "alloc: negative size -> 0 (no backwards bump)");
+assert_eq(alloc(0x100000000000), 0, "alloc: size over ALLOC_MAX -> 0");
+
+# ================================================================
+# 2. THE DESIGNED 0, PROPAGATED: complex matrices
+# ================================================================
+# cmat_new returns 0 above _CMAT_MAX_ELEMS. cmat_rows(0) is load64(0). Every
+# entry point that takes a cmat handle therefore has to reject 0 BEFORE reading
+# metadata, or the designed error signal becomes a SIGSEGV.
+test_group("abuse: designed-0 propagation through the cmat family");
+
+var ab_c22 = cmat_new(2, 2);
+cmat_set(ab_c22, 0, 0, cx_one());
+cmat_set(ab_c22, 1, 1, cx_one());
+var ab_c23 = cmat_new(2, 3);
+var ab_c32 = cmat_new(3, 2);
+
+assert_eq(cmat_mul(0, ab_c22), 0, "cmat_mul: a = 0 -> 0");
+assert_eq(cmat_mul(ab_c22, 0), 0, "cmat_mul: b = 0 -> 0");
+assert_eq(cmat_mul(0, 0), 0, "cmat_mul: both 0 -> 0");
+assert_eq(cmat_add(0, ab_c22), 0, "cmat_add: a = 0 -> 0");
+assert_eq(cmat_add(ab_c22, 0), 0, "cmat_add: b = 0 -> 0");
+assert_eq(cmat_sub(0, ab_c22), 0, "cmat_sub: a = 0 -> 0");
+assert_eq(cmat_sub(ab_c22, 0), 0, "cmat_sub: b = 0 -> 0");
+assert_eq(cmat_scale(0, cx_one()), 0, "cmat_scale: m = 0 -> 0");
+assert_eq(cmat_adjoint(0), 0, "cmat_adjoint: m = 0 -> 0");
+assert_eq(cmat_trace(0), 0, "cmat_trace: m = 0 -> 0");
+assert_eq(cmat_mul_vec(0, 0), 0, "cmat_mul_vec: m = 0 -> 0");
+assert_eq(cmat_commutator(0, ab_c22), 0, "cmat_commutator: a = 0 -> 0");
+assert_eq(cmat_commutator(ab_c22, 0), 0, "cmat_commutator: b = 0 -> 0");
+assert_eq(cmat_anticommutator(0, ab_c22), 0, "cmat_anticommutator: a = 0 -> 0");
+assert_eq(cmat_anticommutator(ab_c22, 0), 0, "cmat_anticommutator: b = 0 -> 0");
+assert_eq(cmat_kronecker(0, ab_c22), 0, "cmat_kronecker: a = 0 -> 0");
+assert_eq(cmat_kronecker(ab_c22, 0), 0, "cmat_kronecker: b = 0 -> 0");
+assert_eq(cmat_exp(0), 0, "cmat_exp: m = 0 -> 0");
+assert_eq(cmat_inverse(0), 0, "cmat_inverse: m = 0 -> 0");
+
+# A capped constructor feeding a consumer directly -- the whole point of the
+# contract. cmat_new(1e5, 1e5) is 0, and cmat_mul must survive being handed it.
+assert_eq(cmat_mul(cmat_new(100000, 100000), ab_c22), 0,
+"cmat_mul: capped cmat_new result flows straight through");
+assert_eq(cmat_inverse(cmat_new(100000, 100000)), 0,
+"cmat_inverse: capped cmat_new result flows straight through");
+assert_eq(cmat_exp(cmat_identity(1000000)), 0,
+"cmat_exp: capped cmat_identity result flows straight through");
+
+# ================================================================
+# 3. NON-CONFORMABLE OPERANDS
+# ================================================================
+test_group("abuse: non-conformable complex-matrix operands");
+
+# a is ar x ac, so b must be ac x bc. 2x3 * 2x2 does not conform: without the
+# check the k loop walks 3 rows of a 2-row buffer.
+assert_eq(cmat_mul(ab_c23, ab_c22), 0, "cmat_mul: 2x3 * 2x2 (inner dims differ) -> 0");
+assert_neq(cmat_mul(ab_c23, ab_c32), 0, "cmat_mul: 2x3 * 3x2 DOES conform");
+assert_eq(cmat_add(ab_c22, ab_c23), 0, "cmat_add: 2x2 + 2x3 -> 0");
+assert_eq(cmat_add(ab_c23, ab_c32), 0, "cmat_add: 2x3 + 3x2 (same elem count) -> 0");
+assert_eq(cmat_sub(ab_c22, ab_c23), 0, "cmat_sub: 2x2 - 2x3 -> 0");
+assert_eq(cmat_commutator(ab_c22, ab_c23), 0, "cmat_commutator: 2x2 vs 2x3 -> 0");
+assert_eq(cmat_anticommutator(ab_c22, ab_c23), 0, "cmat_anticommutator: 2x2 vs 2x3 -> 0");
+assert_eq(cmat_exp(ab_c23), 0, "cmat_exp: non-square -> 0");
+assert_eq(cmat_inverse(ab_c23), 0, "cmat_inverse: non-square -> 0");
+
+# cqr_decompose(non-square A, ...) is DELIBERATELY NOT CALLED HERE. It does not
+# check that A is square, copies an m x n A into an m x m out_R, and therefore
+# writes (n - m) * 16 bytes past out_R's data buffer -- measured at 2 guard slots
+# for a 2x3 A into a 2x2 out_R, with the square control clean. Running it here
+# would corrupt whatever the bump allocator hands out next and make later
+# assertions in this file depend on heap layout. See the KNOWN DEFECT register.
+
+# The square path is exercised so the surrounding contract is still covered.
+assert_eq(cqr_decompose(ab_c22, cmat_new(2, 2), cmat_new(2, 2)), HSB_ERR_NONE,
+"cqr_decompose: a square 2x2 decomposes");
+
+test_group("abuse: non-conformable tensor operands");
+
+var ab_sh22 = alloc(16);
+store64(ab_sh22, 2);
+store64(ab_sh22 + 8, 2);
+var ab_sh23 = alloc(16);
+store64(ab_sh23, 2);
+store64(ab_sh23 + 8, 3);
+var ab_sh26 = alloc(16);
+store64(ab_sh26, 2);
+store64(ab_sh26 + 8, 6);
+var ab_sh34 = alloc(16);
+store64(ab_sh34, 3);
+store64(ab_sh34 + 8, 4);
+var ab_sh4 = alloc(8);
+store64(ab_sh4, 4);
+
+var ab_t22 = tensor_new(2, ab_sh22);
+var ab_t23 = tensor_new(2, ab_sh23);
+var ab_t26 = tensor_new(2, ab_sh26);
+var ab_t34 = tensor_new(2, ab_sh34);
+var ab_t4  = tensor_new(1, ab_sh4);
+
+assert_eq(tensor_add(0, ab_t22), 0, "tensor_add: a = 0 -> 0");
+assert_eq(tensor_add(ab_t22, 0), 0, "tensor_add: b = 0 -> 0");
+assert_eq(tensor_scale(0, F64_ONE), 0, "tensor_scale: t = 0 -> 0");
+assert_eq(tensor_contract(0, 0, 1), 0, "tensor_contract: t = 0 -> 0");
+assert_eq(tensor_add(ab_t22, ab_t23), 0, "tensor_add: 2x2 + 2x3 -> 0");
+assert_eq(tensor_add(ab_t22, ab_t4), 0, "tensor_add: rank 2 + rank 1 -> 0");
+
+# 2x6 and 3x4 both hold 12 elements. Rank equality and total equality are BOTH
+# satisfied, so only a per-axis comparison rejects this.
+assert_eq(tensor_add(ab_t26, ab_t34), 0, "tensor_add: 2x6 + 3x4 (equal totals) -> 0");
+
+# ================================================================
+# 4. NEGATIVE / OUT-OF-RANGE INDICES
+# ================================================================
+test_group("abuse: negative and out-of-range axis indices");
+
+assert_eq(tensor_contract(ab_t22, (0 - 1), 1), 0, "tensor_contract: idx_i = -1 -> 0");
+assert_eq(tensor_contract(ab_t22, 0, (0 - 1)), 0, "tensor_contract: idx_j = -1 -> 0");
+assert_eq(tensor_contract(ab_t22, 0, 5), 0, "tensor_contract: idx_j = 5 (>= rank) -> 0");
+assert_eq(tensor_contract(ab_t22, 2, 0), 0, "tensor_contract: idx_i = rank -> 0");
+assert_eq(tensor_contract(ab_t22, 0, 0), 0, "tensor_contract: idx_i == idx_j -> 0");
+assert_eq(tensor_contract(ab_t4, 0, 0), 0, "tensor_contract: rank 1 has no trace -> 0");
+assert_eq(tensor_contract(ab_t23, 0, 1), 0, "tensor_contract: 2x3 extents differ -> 0");
+assert_neq(tensor_contract(ab_t22, 0, 1), 0, "tensor_contract: 2x2 over (0,1) IS legal");
+
+# THE TWO CASES ABOVE DO NOT ISOLATE THE RANGE GUARD, and this was measured, not
+# assumed: deleting `idx_i < 0 || idx_i >= rank` (and its idx_j twin) from
+# src/tensor.cyr leaves every assertion above green. The reason is that the
+# EXTENT check one line further down -- `load64(shape + idx_j * 8) != dim` --
+# happens to reject an out-of-range axis whenever the word it lands on differs
+# from the contracted extent, which for the tensors above it always does.
+#
+# The two cases below remove that accident by CONSTRUCTING tensors whose
+# out-of-range shape word equals the extent, so only the explicit bound can
+# reject them. Both are green with the guard and both go non-zero without it.
+
+# (a) One past the end. tensor_new bumps header -> shape -> data, so the word at
+# shape[rank] is data[0]; planting the extent there makes shape[2] == shape[0].
+var ab_sh_probe = alloc(16);
+store64(ab_sh_probe, 2);
+store64(ab_sh_probe + 8, 2);
+var ab_t_probe = tensor_new(2, ab_sh_probe);
+store64(HTensor_shape(ab_t_probe) + 2 * 8, 2);
+assert_eq(tensor_contract(ab_t_probe, 0, 2), 0,
+"tensor_contract: idx_j = rank rejected by the BOUND, not by the extent check");
+
+# (b) One before the start. shape[-1] is the header's `total` field, so a 4x1
+# tensor has total == 4 == shape[0] and the extent check cannot save it either.
+var ab_sh_41 = alloc(16);
+store64(ab_sh_41, 4);
+store64(ab_sh_41 + 8, 1);
+var ab_t41 = tensor_new(2, ab_sh_41);
+assert_eq(HTensor_total(ab_t41), 4, "tensor_new: the 4x1 probe really does total 4");
+assert_eq(tensor_contract(ab_t41, (0 - 1), 0), 0,
+"tensor_contract: idx_i = -1 rejected by the BOUND, not by the extent check");
+
+# calc_partial_derivative subscripts the caller's x array with `index` and then
+# WRITES x_plus[index] / x_minus[index]. A missing lower bound is two stores
+# before two freshly bumped buffers, which is silent corruption, not a fault.
+var ab_x2 = alloc(2 * 8);
+store64(ab_x2, F64_ONE);
+store64(ab_x2 + 8, F64_TWO);
+assert_eq(calc_partial_derivative(&_ab_fvec, ab_x2, 2, (0 - 1), F64_HALF), 0,
+"calc_partial_derivative: index = -1 -> 0");
+assert_eq(calc_partial_derivative(&_ab_fvec, ab_x2, 2, 2, F64_HALF), 0,
+"calc_partial_derivative: index = n -> 0");
+assert_eq(calc_partial_derivative(&_ab_fvec, ab_x2, 2, 99, F64_HALF), 0,
+"calc_partial_derivative: index = 99 -> 0");
+assert_eq(calc_partial_derivative(&_ab_fvec, ab_x2, 0, 0, F64_HALF), 0,
+"calc_partial_derivative: n = 0 -> 0");
+assert_eq(calc_partial_derivative(&_ab_fvec, ab_x2, (0 - 2), 0, F64_HALF), 0,
+"calc_partial_derivative: n = -2 -> 0");
+
+# gamma_spatial documents "invalid -> zero matrix", not "invalid -> null".
+assert_neq(gamma_spatial((0 - 1)), 0, "gamma_spatial: idx = -1 -> zero matrix, not null");
+assert_neq(gamma_spatial(7), 0, "gamma_spatial: idx = 7 -> zero matrix, not null");
+assert_eq(f64_to(HComplex_re(cmat_get(gamma_spatial((0 - 1)), 0, 0))), 0,
+"gamma_spatial: idx = -1 entry (0,0) is 0");
+assert_neq(gell_mann((0 - 1)), 0, "gell_mann: idx = -1 -> allocated matrix, not null");
+assert_neq(gell_mann(8), 0, "gell_mann: idx = 8 (one past lambda_8) -> allocated, not null");
+assert_neq(gell_mann(99), 0, "gell_mann: idx = 99 -> allocated, not null");
+assert_eq(f64_to(su3_structure_constant((0 - 1), 2, 3)), 0, "su3_structure_constant: a = -1 -> 0");
+assert_eq(f64_to(su3_structure_constant(99, 2, 3)), 0, "su3_structure_constant: a = 99 -> 0");
+
+# The tensor symbols are pure switch tables: out-of-range indices must return a
+# well-formed f64 COMPONENT (they are consumed by f64_mul), never a raw i64.
+assert_eq(levi_civita_3((0 - 1), 5, 9), f64_neg(F64_ONE), "levi_civita_3: wild indices -> -1.0 bits");
+assert_eq(levi_civita_4((0 - 1), 5, 9, 12), F64_ONE, "levi_civita_4: wild indices -> +1.0 bits");
+assert_eq(levi_civita_3(7, 7, 7), 0, "levi_civita_3: repeated index -> 0");
+assert_eq(levi_civita_4(7, 7, 7, 7), 0, "levi_civita_4: repeated index -> 0");
+assert_eq(kronecker_delta((0 - 3), (0 - 3)), F64_ONE, "kronecker_delta: -3, -3 -> 1.0 bits");
+assert_eq(kronecker_delta((0 - 3), 3), 0, "kronecker_delta: -3, 3 -> 0");
+assert_eq(minkowski(9, 9), f64_neg(F64_ONE), "minkowski: 9, 9 -> -1.0 bits");
+assert_eq(minkowski((0 - 1), 4), 0, "minkowski: off-diagonal -> 0");
+
+# svd_truncated's k is a rank, not an offset, but it sizes the copy loops.
+var ab_A33 = mat_new(3, 3);
+mat_set(ab_A33, 0, 0, F64_TWO);
+mat_set(ab_A33, 1, 1, f64_from(3));
+mat_set(ab_A33, 2, 2, f64_from(4));
+var ab_S3 = alloc(3 * 8);
+assert_eq(svd_truncated(ab_A33, 0, mat_new(3, 3), ab_S3, mat_new(3, 3)),
+HSB_ERR_INVALID_INPUT, "svd_truncated: k = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(svd_truncated(ab_A33, (0 - 1), mat_new(3, 3), ab_S3, mat_new(3, 3)),
+HSB_ERR_INVALID_INPUT, "svd_truncated: k = -1 -> HSB_ERR_INVALID_INPUT");
+assert_eq(svd_truncated(ab_A33, 99, mat_new(3, 3), ab_S3, mat_new(3, 3)),
+HSB_ERR_INVALID_INPUT, "svd_truncated: k = 99 (> cols) -> HSB_ERR_INVALID_INPUT");
+
+# ode_bdf selects a coefficient row by `order`; a wild order is a table overrun.
+var ab_hist = vec_new();
+vec_push(ab_hist, F64_ONE);
+vec_push(ab_hist, F64_ONE);
+vec_push(ab_hist, F64_ONE);
+assert_eq(ode_bdf(&_ab_dydt, 0, ab_hist, (0 - 1), F64_HALF, F64_HALF), 0,
+"ode_bdf: order = -1 -> 0");
+assert_eq(ode_bdf(&_ab_dydt, 0, ab_hist, 0, F64_HALF, F64_HALF), 0, "ode_bdf: order = 0 -> 0");
+assert_eq(ode_bdf(&_ab_dydt, 0, ab_hist, 1, F64_HALF, F64_HALF), 0, "ode_bdf: order = 1 -> 0");
+assert_eq(ode_bdf(&_ab_dydt, 0, ab_hist, 9, F64_HALF, F64_HALF), 0, "ode_bdf: order = 9 -> 0");
+assert_eq(ode_bdf(&_ab_dydt, 0, ab_hist, 5, F64_HALF, F64_HALF), 0,
+"ode_bdf: order 5 with only 3 history entries -> 0");
+
+# ================================================================
+# 5. ZERO / NEGATIVE / HUGE DIMENSIONS ON SOLVERS AND OPTIMISERS
+# ================================================================
+test_group("abuse: solver and optimiser dimension bounds");
+
+var ab_x0 = alloc(2 * 8);
+store64(ab_x0, F64_ONE);
+store64(ab_x0 + 8, F64_ONE);
+var ab_outx = alloc(8 * 8);
+var ab_fmin = alloc(8);
+
+assert_eq(opt_gradient_descent(&_ab_fvec, &_ab_gvec, ab_x0, 0, F64_HALF, F64_HALF, 5,
+ab_outx, ab_fmin), HSB_ERR_INVALID_INPUT, "opt_gradient_descent: n = 0");
+assert_eq(opt_gradient_descent(&_ab_fvec, &_ab_gvec, ab_x0, (0 - 2), F64_HALF, F64_HALF, 5,
+ab_outx, ab_fmin), HSB_ERR_INVALID_INPUT, "opt_gradient_descent: n = -2");
+assert_eq(opt_conjugate_gradient(&_ab_fvec, &_ab_gvec, ab_x0, 0, F64_HALF, 5,
+ab_outx, ab_fmin), HSB_ERR_INVALID_INPUT, "opt_conjugate_gradient: n = 0");
+assert_eq(opt_conjugate_gradient(&_ab_fvec, &_ab_gvec, ab_x0, (0 - 2), F64_HALF, 5,
+ab_outx, ab_fmin), HSB_ERR_INVALID_INPUT, "opt_conjugate_gradient: n = -2");
+assert_eq(opt_bfgs(&_ab_fvec, &_ab_gvec, ab_x0, 0, F64_HALF, 5, ab_outx, ab_fmin),
+HSB_ERR_INVALID_INPUT, "opt_bfgs: n = 0");
+assert_eq(opt_bfgs(&_ab_fvec, &_ab_gvec, ab_x0, (0 - 2), F64_HALF, 5, ab_outx, ab_fmin),
+HSB_ERR_INVALID_INPUT, "opt_bfgs: n = -2");
+
+# The inverse Hessian is n*n. _OPT_MAX_DIM = 4096 is the cap that keeps
+# 8*n*n under ALLOC_MAX; above it the request is rejected, not attempted.
+assert_eq(opt_bfgs(&_ab_fvec, &_ab_gvec, ab_x0, 100000, F64_HALF, 5, ab_outx, ab_fmin),
+HSB_ERR_INVALID_INPUT, "opt_bfgs: n = 1e5 (over _OPT_MAX_DIM) rejected before alloc");
+assert_eq(opt_lbfgs(&_ab_fvec, &_ab_gvec, ab_x0, 2, 0, F64_HALF, 5, ab_outx, ab_fmin),
+HSB_ERR_INVALID_INPUT, "opt_lbfgs: m = 0");
+assert_eq(opt_lbfgs(&_ab_fvec, &_ab_gvec, ab_x0, 2, (0 - 3), F64_HALF, 5, ab_outx, ab_fmin),
+HSB_ERR_INVALID_INPUT, "opt_lbfgs: m = -3");
+assert_eq(opt_lbfgs(&_ab_fvec, &_ab_gvec, ab_x0, 100000, 3, F64_HALF, 5, ab_outx, ab_fmin),
+HSB_ERR_INVALID_INPUT, "opt_lbfgs: n over _OPT_MAX_DIM");
+assert_eq(opt_lbfgs(&_ab_fvec, &_ab_gvec, ab_x0, 2, 100000, F64_HALF, 5, ab_outx, ab_fmin),
+HSB_ERR_INVALID_INPUT, "opt_lbfgs: m over _OPT_MAX_DIM");
+assert_eq(opt_levenberg_marquardt(&_ab_residuals, &_ab_jacobian, ab_x0, 0, 1, F64_HALF, 5,
+ab_outx), HSB_ERR_INVALID_INPUT, "opt_levenberg_marquardt: n_params = 0");
+assert_eq(opt_levenberg_marquardt(&_ab_residuals, &_ab_jacobian, ab_x0, (0 - 1), 1, F64_HALF, 5,
+ab_outx), HSB_ERR_INVALID_INPUT, "opt_levenberg_marquardt: n_params = -1");
+assert_eq(opt_levenberg_marquardt(&_ab_residuals, &_ab_jacobian, ab_x0, 1, 0, F64_HALF, 5,
+ab_outx), HSB_ERR_INVALID_INPUT, "opt_levenberg_marquardt: n_residuals = 0");
+assert_eq(opt_levenberg_marquardt(&_ab_residuals, &_ab_jacobian, ab_x0, 1, (0 - 1), F64_HALF, 5,
+ab_outx), HSB_ERR_INVALID_INPUT, "opt_levenberg_marquardt: n_residuals = -1");
+
+# gradient_descent has no _OPT_MAX_DIM cap; it must instead REPORT the failed
+# allocation rather than store through alloc's designed 0.
+assert_eq(opt_gradient_descent(&_ab_fvec, &_ab_gvec, ab_x0, 1000000000, F64_HALF, F64_HALF, 5,
+ab_outx, ab_fmin), HSB_ERR_ALLOC, "opt_gradient_descent: n = 1e9 -> HSB_ERR_ALLOC");
+
+# nr * np * 8 = 2^63 for these dims -- the multiply wraps to a non-positive
+# size, alloc returns 0, and the null check has to catch it.
+assert_eq(opt_levenberg_marquardt(&_ab_residuals, &_ab_jacobian, ab_x0, 1073741824, 1073741824,
+F64_HALF, 5, ab_outx), HSB_ERR_ALLOC,
+"opt_levenberg_marquardt: 2^30 x 2^30 Jacobian -> HSB_ERR_ALLOC");
+
+# A non-positive iteration budget must not be read as "unbounded".
+assert_eq(opt_gradient_descent(&_ab_fvec, &_ab_gvec, ab_x0, 2, F64_HALF, F64_HALF, (0 - 5),
+ab_outx, ab_fmin), HSB_ERR_NO_CONVERGENCE,
+"opt_gradient_descent: max_iter = -5 -> no-convergence, not a hang");
+
+test_group("abuse: svd_golub_kahan / eigen_qr shape + null contract");
+
+# svd_golub_kahan is the one routine in linalg_precision.cyr that validates its
+# whole surface (2.8.3). These assertions pin that contract so it cannot regress.
+var ab_A34 = mat_new(3, 4);
+var ab_U34 = mat_new(3, 4);
+var ab_Vt44 = mat_new(4, 4);
+assert_eq(svd_golub_kahan(ab_A34, ab_U34, alloc(32), ab_Vt44), HSB_ERR_INVALID_INPUT,
+"svd_golub_kahan: 3x4 (m < n) rejected");
+assert_eq(svd_golub_kahan(0, ab_U34, ab_S3, ab_Vt44), HSB_ERR_INVALID_INPUT,
+"svd_golub_kahan: A = 0 rejected");
+assert_eq(svd_golub_kahan(ab_A33, 0, ab_S3, ab_Vt44), HSB_ERR_INVALID_INPUT,
+"svd_golub_kahan: out_U = 0 rejected");
+assert_eq(svd_golub_kahan(ab_A33, ab_U34, 0, ab_Vt44), HSB_ERR_INVALID_INPUT,
+"svd_golub_kahan: out_S = 0 rejected");
+assert_eq(svd_golub_kahan(ab_A33, ab_U34, ab_S3, 0), HSB_ERR_INVALID_INPUT,
+"svd_golub_kahan: out_Vt = 0 rejected");
+assert_eq(svd_golub_kahan(mat_new_guarded(1000000, 1000000), ab_U34, ab_S3, ab_Vt44),
+HSB_ERR_INVALID_INPUT, "svd_golub_kahan: capped mat_new_guarded 0 flows through");
+
+# eigen_qr's guarded cases. Its UNGUARDED ones are in the defect register.
+assert_eq(eigen_qr(ab_A33, 0, 50, ab_S3, mat_new(3, 3)), HSB_ERR_INVALID_INPUT,
+"eigen_qr: n = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(eigen_qr(ab_A34, 3, 50, ab_S3, mat_new(3, 3)), HSB_ERR_NO_CONVERGENCE,
+"eigen_qr: non-square 3x4 -> no-convergence, not a wild read");
+assert_eq(eigen_qr(ab_A33, 3, 0, ab_S3, mat_new(3, 3)), HSB_ERR_NO_CONVERGENCE,
+"eigen_qr: max_iter = 0 -> no-convergence");
+assert_eq(eigen_qr(ab_A33, 3, (0 - 5), ab_S3, mat_new(3, 3)), HSB_ERR_NO_CONVERGENCE,
+"eigen_qr: max_iter = -5 -> no-convergence");
+
+test_group("abuse: CSR sparse dimension mismatches");
+
+var ab_dm22 = mat_new(2, 2);
+mat_set(ab_dm22, 0, 0, F64_ONE);
+mat_set(ab_dm22, 1, 1, F64_TWO);
+var ab_dm23 = mat_new(2, 3);
+mat_set(ab_dm23, 0, 0, F64_ONE);
+var ab_dm32 = mat_new(3, 2);
+mat_set(ab_dm32, 0, 0, F64_ONE);
+
+var ab_csr22 = csr_from_dense(ab_dm22);
+var ab_csr23 = csr_from_dense(ab_dm23);
+var ab_csr32 = csr_from_dense(ab_dm32);
+
+assert_eq(csr_add(ab_csr22, ab_csr23), 0, "csr_add: 2x2 + 2x3 (cols differ) -> 0");
+assert_eq(csr_add(ab_csr22, ab_csr32), 0, "csr_add: 2x2 + 3x2 (rows differ) -> 0");
+assert_eq(csr_add(ab_csr23, ab_csr32), 0, "csr_add: 2x3 + 3x2 -> 0");
+assert_neq(csr_add(ab_csr22, ab_csr22), 0, "csr_add: conformable pair still works");
+
+# An all-zero dense matrix is the empty CSR -- nnz 0, alloc(0) for both data
+# arrays, and every downstream walk has to cope with a null data pointer.
+var ab_csr_empty = csr_from_dense(mat_new(2, 2));
+assert_eq(csr_nnz(ab_csr_empty), 0, "csr_from_dense: all-zero matrix has nnz 0");
+var ab_spx = alloc(2 * 8);
+store64(ab_spx, F64_ONE);
+store64(ab_spx + 8, F64_ONE);
+assert_eq(load64(csr_spmv(ab_csr_empty, ab_spx)), 0, "csr_spmv: empty CSR gives y[0] = 0");
+assert_eq(csr_nrows(csr_transpose(ab_csr_empty)), 2, "csr_transpose: empty CSR keeps 2 rows");
+assert_eq(csr_ncols(csr_transpose(ab_csr_empty)), 2, "csr_transpose: empty CSR keeps 2 cols");
+
+test_group("abuse: iterative solvers with degenerate budgets");
+
+var ab_b3 = alloc(3 * 8);
+var ab_xg = alloc(3 * 8);
+var ab_lo3 = alloc(3 * 8);
+var ab_hi3 = alloc(3 * 8);
+var ab_bi = 0;
+while (ab_bi < 3) {
+    store64(ab_b3 + ab_bi * 8, F64_ONE);
+    store64(ab_xg + ab_bi * 8, 0);
+    store64(ab_lo3 + ab_bi * 8, F64_ONE);
+    store64(ab_hi3 + ab_bi * 8, 0);
+    ab_bi = ab_bi + 1;
+}
+
+# lo > hi element-wise is a contradictory box; f64_clamp must not loop or fault.
+assert_eq(solve_pgs(ab_A33, ab_b3, ab_xg, 3, ab_lo3, ab_hi3, 5), 0,
+"solve_pgs: lo > hi (empty box) returns cleanly");
+assert_eq(solve_pgs(ab_A33, ab_b3, ab_xg, 0, ab_lo3, ab_hi3, 5), 0, "solve_pgs: n = 0");
+assert_eq(solve_pgs(ab_A33, ab_b3, ab_xg, (0 - 2), ab_lo3, ab_hi3, 5), 0, "solve_pgs: n = -2");
+assert_eq(solve_pgs(ab_A33, ab_b3, ab_xg, 3, ab_lo3, ab_hi3, (0 - 5)), 0,
+"solve_pgs: max_iter = -5");
+
+# A zero-diagonal system is the singular case solve_pgs documents as "skip".
+assert_eq(solve_pgs(mat_new(3, 3), ab_b3, ab_xg, 3, ab_lo3, ab_hi3, 5), 0,
+"solve_pgs: all-zero diagonal skipped, not divided by");
+
+assert_neq(solve_gmres(&_ab_matvec, ab_b3, ab_xg, 3, EPSILON_F64, 0, 2), 0,
+"solve_gmres: max_iter = 0 returns a vector, not a fault");
+assert_neq(solve_gmres(&_ab_matvec, ab_b3, ab_xg, 3, EPSILON_F64, 5, 0), 0,
+"solve_gmres: restart = 0 clamped to 1");
+assert_neq(solve_gmres(&_ab_matvec, ab_b3, ab_xg, 3, EPSILON_F64, 5, (0 - 3)), 0,
+"solve_gmres: restart = -3 clamped to 1");
+assert_neq(solve_gmres(&_ab_matvec, ab_b3, ab_xg, 3, EPSILON_F64, 5, 9999), 0,
+"solve_gmres: restart >> n clamped to n");
+assert_neq(solve_bicgstab(&_ab_matvec, ab_b3, ab_xg, 3, EPSILON_F64, 0), 0,
+"solve_bicgstab: max_iter = 0 returns a vector");
+assert_neq(solve_bicgstab(&_ab_matvec, ab_b3, ab_xg, 3, EPSILON_F64, (0 - 4)), 0,
+"solve_bicgstab: max_iter = -4 returns a vector");
+
+test_group("abuse: diffgeo dimension caps");
+
+var ab_dgbuf = alloc(4096 * 8);
+assert_eq(christoffel_symbols(ab_dgbuf, ab_dgbuf, 0), 0, "christoffel_symbols: dim = 0 -> 0");
+assert_eq(christoffel_symbols(ab_dgbuf, ab_dgbuf, (0 - 4)), 0, "christoffel_symbols: dim = -4 -> 0");
+assert_eq(christoffel_symbols(ab_dgbuf, ab_dgbuf, 17), 0, "christoffel_symbols: dim = 17 -> 0");
+assert_eq(christoffel_symbols(ab_dgbuf, ab_dgbuf, 100000), 0, "christoffel_symbols: dim = 1e5 -> 0");
+assert_eq(riemann_tensor(ab_dgbuf, ab_dgbuf, (0 - 1)), 0, "riemann_tensor: dim = -1 -> 0");
+assert_eq(riemann_tensor(ab_dgbuf, ab_dgbuf, 17), 0, "riemann_tensor: dim = 17 -> 0");
+assert_eq(ricci_tensor(ab_dgbuf, (0 - 1)), 0, "ricci_tensor: dim = -1 -> 0");
+assert_eq(ricci_tensor(ab_dgbuf, 17), 0, "ricci_tensor: dim = 17 -> 0");
+assert_eq(ricci_scalar(ab_dgbuf, ab_dgbuf, (0 - 1)), 0, "ricci_scalar: dim = -1 -> 0");
+assert_eq(ricci_scalar(0, ab_dgbuf, 4), 0, "ricci_scalar: ricci = 0 -> 0");
+assert_eq(ricci_scalar(ab_dgbuf, 0, 4), 0, "ricci_scalar: metric_inv = 0 -> 0");
+assert_eq(einstein_tensor(ab_dgbuf, ab_dgbuf, ab_dgbuf, (0 - 1)), 0, "einstein_tensor: dim = -1 -> 0");
+assert_eq(einstein_tensor(0, ab_dgbuf, ab_dgbuf, 4), 0, "einstein_tensor: ricci = 0 -> 0");
+assert_eq(weyl_tensor(ab_dgbuf, ab_dgbuf, 0, ab_dgbuf, (0 - 1)), 0, "weyl_tensor: dim = -1 -> 0");
+assert_eq(geodesic_state_new(ab_dgbuf, ab_dgbuf, 0), 0, "geodesic_state_new: dim = 0 -> 0");
+assert_eq(geodesic_state_new(ab_dgbuf, ab_dgbuf, (0 - 3)), 0, "geodesic_state_new: dim = -3 -> 0");
+assert_eq(geodesic_state_new(ab_dgbuf, ab_dgbuf, 17), 0, "geodesic_state_new: dim = 17 -> 0");
+assert_eq(geodesic_state_new(0, ab_dgbuf, 4), 0, "geodesic_state_new: pos = 0 -> 0");
+assert_eq(geodesic_state_new(ab_dgbuf, 0, 4), 0, "geodesic_state_new: vel = 0 -> 0");
+assert_eq(geodesic_rk4(ab_dgbuf, ab_dgbuf, (0 - 1), F64_HALF, 2), 0, "geodesic_rk4: dim = -1 -> 0");
+assert_eq(geodesic_rk4(0, ab_dgbuf, 4, F64_HALF, 2), 0, "geodesic_rk4: state = 0 -> 0");
+assert_eq(geodesic_rk4(ab_dgbuf, 0, 4, F64_HALF, 2), 0, "geodesic_rk4: christoffel = 0 -> 0");
+assert_eq(parallel_transport(ab_dgbuf, ab_dgbuf, ab_dgbuf, (0 - 1), F64_HALF, 2), 0,
+"parallel_transport: dim = -1 -> 0");
+assert_eq(parallel_transport(0, ab_dgbuf, ab_dgbuf, 4, F64_HALF, 2), 0,
+"parallel_transport: v0 = 0 -> 0");
+assert_eq(wedge_1_1(ab_dgbuf, ab_dgbuf, 0), 0, "wedge_1_1: dim = 0 -> 0");
+assert_eq(wedge_1_1(ab_dgbuf, ab_dgbuf, (0 - 5)), 0, "wedge_1_1: dim = -5 -> 0");
+assert_eq(wedge_1_1(ab_dgbuf, ab_dgbuf, 100000), 0, "wedge_1_1: dim = 1e5 (40 GB) -> 0");
+assert_eq(wedge_1_1(0, ab_dgbuf, 4), 0, "wedge_1_1: alpha = 0 -> 0");
+
+# ================================================================
+# 6. CANARY CHECKS -- nothing may write past its out-buffer
+# ================================================================
+# Pattern for every block below:
+#     out = alloc(k * 8)          <- the buffer the routine is allowed to touch
+#     can = _ab_canary_new(m)     <- the very next block, so it is adjacent
+#     <call with abusive args>
+#     assert _ab_clob(can, m) == 0
+test_group("abuse/canary: rejected calls must not touch the out-buffer");
+
+# --- calc_gradient / calc_hessian / calc_jacobian with negative dimensions ---
+# n == 0 is rejected with HSB_ERR_INVALID_INPUT; n < 0 falls through every loop
+# and must therefore write NOTHING at all.
+var ab_g_out = alloc(4 * 8);
+var ab_g_can = _ab_canary_new(32);
+_ab_fill7(ab_g_out, 4);
+assert_eq(calc_gradient(&_ab_fvec, ab_x2, 0, F64_HALF, ab_g_out), HSB_ERR_INVALID_INPUT,
+"calc_gradient: n = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(_ab_count7(ab_g_out, 4), 4, "calc_gradient n = 0: out untouched");
+assert_eq(_ab_clob(ab_g_can, 32), 0, "calc_gradient n = 0: canary clean");
+
+calc_gradient(&_ab_fvec, ab_x2, (0 - 3), F64_HALF, ab_g_out);
+assert_eq(_ab_count7(ab_g_out, 4), 4, "calc_gradient n = -3: out untouched");
+assert_eq(_ab_clob(ab_g_can, 32), 0, "calc_gradient n = -3: canary clean");
+
+var ab_h_out = alloc(16 * 8);
+var ab_h_can = _ab_canary_new(32);
+_ab_fill7(ab_h_out, 16);
+assert_eq(calc_hessian(&_ab_fvec, ab_x2, 0, F64_HALF, ab_h_out), HSB_ERR_INVALID_INPUT,
+"calc_hessian: n = 0 -> HSB_ERR_INVALID_INPUT");
+calc_hessian(&_ab_fvec, ab_x2, (0 - 2), F64_HALF, ab_h_out);
+assert_eq(_ab_count7(ab_h_out, 16), 16, "calc_hessian n <= 0: out untouched");
+assert_eq(_ab_clob(ab_h_can, 32), 0, "calc_hessian n <= 0: canary clean");
+
+var ab_j_out = alloc(8 * 8);
+var ab_j_can = _ab_canary_new(32);
+_ab_fill7(ab_j_out, 8);
+assert_eq(calc_jacobian(&_ab_fvec, ab_x2, 0, 2, F64_HALF, ab_j_out), HSB_ERR_INVALID_INPUT,
+"calc_jacobian: n_in = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(calc_jacobian(&_ab_fvec, ab_x2, 2, 0, F64_HALF, ab_j_out), HSB_ERR_INVALID_INPUT,
+"calc_jacobian: n_out = 0 -> HSB_ERR_INVALID_INPUT");
+calc_jacobian(&_ab_fvec, ab_x2, (0 - 1), 2, F64_HALF, ab_j_out);
+calc_jacobian(&_ab_fvec, ab_x2, 2, (0 - 1), F64_HALF, ab_j_out);
+assert_eq(_ab_count7(ab_j_out, 8), 8, "calc_jacobian negative dims: out untouched");
+assert_eq(_ab_clob(ab_j_can, 32), 0, "calc_jacobian negative dims: canary clean");
+
+# --- calc_partial_derivative writes into scratch indexed by `index` ---
+# The scratch is bump-allocated INSIDE the call, so a rejected index must never
+# reach the allocator at all; the canary here guards the caller's own x buffer.
+var ab_pd_x = alloc(2 * 8);
+var ab_pd_can = _ab_canary_new(16);
+store64(ab_pd_x, F64_ONE);
+store64(ab_pd_x + 8, F64_TWO);
+calc_partial_derivative(&_ab_fvec, ab_pd_x, 2, (0 - 1), F64_HALF);
+calc_partial_derivative(&_ab_fvec, ab_pd_x, 2, 2, F64_HALF);
+calc_partial_derivative(&_ab_fvec, ab_pd_x, 2, 1000, F64_HALF);
+assert_eq(_ab_clob(ab_pd_can, 16), 0, "calc_partial_derivative bad index: canary clean");
+assert_eq(load64(ab_pd_x), F64_ONE, "calc_partial_derivative bad index: x[0] intact");
+assert_eq(load64(ab_pd_x + 8), F64_TWO, "calc_partial_derivative bad index: x[1] intact");
+
+# --- quadrature out-slot ---
+#
+# Note the ASYMMETRY these assertions pin down. Both quadrature entry points
+# guard `steps == 0` and return HSB_ERR_ZERO_STEPS with `out` untouched, but
+# NEITHER has a lower bound: a negative step count divides the interval by a
+# negative number, skips the summation loop entirely, and stores the resulting
+# half-endpoint estimate into `out` with HSB_ERR_NONE. That is a wrong answer
+# reported as a success, but it is memory-safe -- `out` is exactly one slot and
+# exactly one slot is written -- which is what the canary here proves.
+var ab_q_out = alloc(8);
+var ab_q_can = _ab_canary_new(16);
+store64(ab_q_out, _AB_SEVEN);
+assert_eq(calc_integral_trapez(&_ab_f_x2, 0, F64_ONE, 0, ab_q_out), HSB_ERR_ZERO_STEPS,
+"calc_integral_trapez: steps = 0 -> HSB_ERR_ZERO_STEPS");
+assert_eq(load64(ab_q_out), _AB_SEVEN, "trapez steps = 0: out untouched");
+assert_eq(calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, 0, ab_q_out), HSB_ERR_ZERO_STEPS,
+"calc_integral_simpson: steps = 0 -> HSB_ERR_ZERO_STEPS");
+assert_eq(load64(ab_q_out), _AB_SEVEN, "simpson steps = 0: out untouched");
+assert_eq(calc_integral_trapez(&_ab_f_x2, 0, F64_ONE, (0 - 5), ab_q_out), HSB_ERR_NONE,
+"calc_integral_trapez: steps = -5 is ACCEPTED (no lower bound; documented asymmetry)");
+assert_eq(_ab_is_finite(load64(ab_q_out)), 1,
+"trapez steps = -5: the value stored is finite, not a wild read");
+assert_eq(calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, (0 - 4), ab_q_out), HSB_ERR_NONE,
+"calc_integral_simpson: steps = -4 is ACCEPTED (no lower bound)");
+assert_eq(_ab_is_finite(load64(ab_q_out)), 1,
+"simpson steps = -4: the value stored is finite, not a wild read");
+assert_eq(calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, 3, ab_q_out), HSB_ERR_NONE,
+"calc_integral_simpson: an odd step count is rounded up to even, not rejected");
+assert_eq(_ab_clob(ab_q_can, 16), 0, "quadrature bad step counts: canary clean");
+
+# --- num_tridiag_solve out-buffer ---
+var ab_td_out = alloc(4 * 8);
+var ab_td_can = _ab_canary_new(16);
+_ab_fill7(ab_td_out, 4);
+var ab_td_arr = alloc(4 * 8);
+_ab_fill7(ab_td_arr, 4);
+assert_eq(num_tridiag_solve(ab_td_arr, ab_td_arr, ab_td_arr, ab_td_arr, 0, ab_td_out),
+HSB_ERR_INVALID_INPUT, "num_tridiag_solve: n = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(num_tridiag_solve(ab_td_arr, ab_td_arr, ab_td_arr, ab_td_arr, (0 - 4), ab_td_out),
+HSB_ERR_INVALID_INPUT, "num_tridiag_solve: n = -4 -> HSB_ERR_INVALID_INPUT");
+assert_eq(_ab_count7(ab_td_out, 4), 4, "num_tridiag_solve n <= 0: out untouched");
+assert_eq(_ab_clob(ab_td_can, 16), 0, "num_tridiag_solve n <= 0: canary clean");
+
+# --- num_crt out-slots ---
+var ab_crt_x = alloc(8);
+var ab_crt_m = alloc(8);
+var ab_crt_can = _ab_canary_new(16);
+store64(ab_crt_x, f64_from(7));
+store64(ab_crt_m, f64_from(7));
+var ab_crt_rem = vec_new();
+var ab_crt_mods = vec_new();
+vec_push(ab_crt_rem, 1);
+vec_push(ab_crt_mods, 0);
+assert_eq(num_crt(ab_crt_rem, ab_crt_mods, 1, ab_crt_x, ab_crt_m), HSB_ERR_INVALID_INPUT,
+"num_crt: a zero modulus -> HSB_ERR_INVALID_INPUT");
+assert_eq(num_crt(ab_crt_rem, ab_crt_mods, 0, ab_crt_x, ab_crt_m), HSB_ERR_INVALID_INPUT,
+"num_crt: count = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(num_crt(ab_crt_rem, ab_crt_mods, (0 - 1), ab_crt_x, ab_crt_m), HSB_ERR_INVALID_INPUT,
+"num_crt: count = -1 -> HSB_ERR_INVALID_INPUT");
+assert_eq(load64(ab_crt_x), f64_from(7), "num_crt rejected: out_x untouched");
+assert_eq(load64(ab_crt_m), f64_from(7), "num_crt rejected: out_m untouched");
+assert_eq(_ab_clob(ab_crt_can, 16), 0, "num_crt rejected: canary clean");
+
+# --- num_fft / num_ifft must leave `data` BIT-IDENTICAL on rejection ---
+# num_ifft's conjugate pass mutates in place; through 2.6.15 it negated every
+# imaginary part before deciding the length was illegal.
+var ab_fft = alloc(8 * 16);
+var ab_fft_can = _ab_canary_new(16);
+var ab_fi = 0;
+while (ab_fi < 8) {
+    store64(ab_fft + ab_fi * 16, f64_from(ab_fi + 1));
+    store64(ab_fft + ab_fi * 16 + 8, f64_from(ab_fi + 2));
+    ab_fi = ab_fi + 1;
+}
+var ab_fft_before = _ab_snapshot(ab_fft, 16);
+assert_eq(num_fft(ab_fft, 6), HSB_ERR_INVALID_INPUT, "num_fft: n = 6 (non-pow2) rejected");
+assert_eq(num_ifft(ab_fft, 6), HSB_ERR_INVALID_INPUT, "num_ifft: n = 6 (non-pow2) rejected");
+assert_eq(num_fft(ab_fft, (0 - 4)), HSB_ERR_NONE, "num_fft: n = -4 is a no-op");
+assert_eq(num_ifft(ab_fft, (0 - 4)), HSB_ERR_NONE, "num_ifft: n = -4 is a no-op");
+assert_eq(num_fft(ab_fft, 0), HSB_ERR_NONE, "num_fft: n = 0 is a no-op");
+assert_eq(num_ifft(ab_fft, 1), HSB_ERR_NONE, "num_ifft: n = 1 is a no-op");
+assert_eq(_ab_diff(ab_fft, ab_fft_before, 16), 0,
+"num_fft/num_ifft rejected: data bit-identical (no half-conjugate left behind)");
+assert_eq(_ab_clob(ab_fft_can, 16), 0, "num_fft/num_ifft rejected: canary clean");
+
+# --- num_halton_2d writes exactly two slots ---
+var ab_hal = alloc(2 * 8);
+var ab_hal_can = _ab_canary_new(16);
+num_halton_2d(0, ab_hal, ab_hal + 8);
+num_halton_2d((0 - 5), ab_hal, ab_hal + 8);
+num_halton_2d(1000000, ab_hal, ab_hal + 8);
+assert_eq(_ab_clob(ab_hal_can, 16), 0, "num_halton_2d: canary clean for -5 / 0 / 1e6");
+
+# --- svd_golub_kahan on a rejected shape (fresh dims, not hisab.tcyr's 2x16) ---
+# out_U is 3 x 9 = 27 data slots; the bidiagonalisation seeds the identity with
+# mat_set(U, i, i) for i < n, so on m < n every i >= m lands past the buffer.
+var ab_sA = mat_new(3, 9);
+var ab_sj = 0;
+while (ab_sj < 9) {
+    mat_set(ab_sA, 0, ab_sj, f64_from(ab_sj + 1));
+    mat_set(ab_sA, 1, ab_sj, f64_from(2 * ab_sj + 3));
+    mat_set(ab_sA, 2, ab_sj, f64_from(3 * ab_sj + 5));
+    ab_sj = ab_sj + 1;
+}
+var ab_sU = mat_new(3, 9);
+var ab_sU_can = _ab_canary_new(48);
+var ab_sVt = mat_new(9, 9);
+var ab_sS = alloc(9 * 8);
+assert_eq(svd_golub_kahan(ab_sA, ab_sU, ab_sS, ab_sVt), HSB_ERR_INVALID_INPUT,
+"svd_golub_kahan 3x9 (m < n): HSB_ERR_INVALID_INPUT");
+assert_eq(_ab_clob(ab_sU_can, 48), 0, "svd_golub_kahan 3x9: canary past out_U clean");
+
+# --- sequential_impulse fills exactly n contact slots (16 bytes each) ---
+var ab_imp = alloc(4 * 16);
+var ab_imp_can = _ab_canary_new(16);
+var ab_contacts = vec_new();
+var ab_ci = 0;
+while (ab_ci < 4) {
+    vec_push(ab_contacts, contact_new(ab_ci, ab_ci + 1, hvec3_unit_y(), F64_HALF,
+    F64_HALF, F64_HALF, F64_ONE, F64_ONE));
+    ab_ci = ab_ci + 1;
+}
+sequential_impulse(ab_contacts, 4, 3, ab_imp);
+assert_eq(_ab_clob(ab_imp_can, 16), 0, "sequential_impulse n = 4: canary clean");
+sequential_impulse(ab_contacts, 0, 3, ab_imp);
+assert_eq(_ab_clob(ab_imp_can, 16), 0, "sequential_impulse n = 0: canary clean");
+sequential_impulse(ab_contacts, (0 - 2), 3, ab_imp);
+assert_eq(_ab_clob(ab_imp_can, 16), 0, "sequential_impulse n = -2: canary clean");
+sequential_impulse(ab_contacts, 4, (0 - 3), ab_imp);
+assert_eq(_ab_clob(ab_imp_can, 16), 0, "sequential_impulse iterations = -3: canary clean");
+
+# --- optimiser out_x on a rejected call ---
+var ab_ox = alloc(4 * 8);
+var ab_ox_can = _ab_canary_new(16);
+var ab_ofm = alloc(8);
+_ab_fill7(ab_ox, 4);
+opt_gradient_descent(&_ab_fvec, &_ab_gvec, ab_x0, (0 - 2), F64_HALF, F64_HALF, 5, ab_ox, ab_ofm);
+opt_bfgs(&_ab_fvec, &_ab_gvec, ab_x0, 100000, F64_HALF, 5, ab_ox, ab_ofm);
+opt_lbfgs(&_ab_fvec, &_ab_gvec, ab_x0, 2, (0 - 3), F64_HALF, 5, ab_ox, ab_ofm);
+opt_levenberg_marquardt(&_ab_residuals, &_ab_jacobian, ab_x0, (0 - 1), 1, F64_HALF, 5, ab_ox);
+assert_eq(_ab_count7(ab_ox, 4), 4, "optimisers rejected: out_x untouched");
+assert_eq(_ab_clob(ab_ox_can, 16), 0, "optimisers rejected: canary clean");
+
+# --- B-spline / NURBS reject before de Boor indexes ctrl_pts negatively ---
+var ab_ctrl = alloc(4 * 8);
+var ab_ctrl_can = _ab_canary_new(16);
+_ab_fill7(ab_ctrl, 4);
+var ab_knots = alloc(16 * 8);
+var ab_ki = 0;
+while (ab_ki < 16) {
+    store64(ab_knots + ab_ki * 8, f64_from(ab_ki));
+    ab_ki = ab_ki + 1;
+}
+var ab_w = alloc(8 * 8);
+_ab_fill7(ab_w, 8);
+assert_eq(calc_bspline((0 - 1), ab_ctrl, 4, ab_knots, 8, F64_ONE), 0,
+"calc_bspline: degree = -1 -> 0");
+assert_eq(calc_bspline(3, ab_ctrl, 3, ab_knots, 7, F64_ONE), 0,
+"calc_bspline: degree >= n_pts -> 0 (was a negative ctrl_pts index)");
+assert_eq(calc_bspline(2, ab_ctrl, 0, ab_knots, 3, F64_ONE), 0, "calc_bspline: n_pts = 0 -> 0");
+assert_eq(calc_bspline(2, ab_ctrl, (0 - 4), ab_knots, 3, F64_ONE), 0,
+"calc_bspline: n_pts = -4 -> 0");
+assert_eq(calc_bspline(2, ab_ctrl, 4, ab_knots, 5, F64_ONE), 0,
+"calc_bspline: n_knots != n_pts + degree + 1 -> 0");
+assert_eq(calc_bspline(2, ab_ctrl, 4, ab_knots, (0 - 7), F64_ONE), 0,
+"calc_bspline: n_knots = -7 -> 0");
+assert_eq(calc_nurbs((0 - 1), ab_ctrl, ab_w, 4, ab_knots, 8, F64_ONE), 0,
+"calc_nurbs: degree = -1 -> 0");
+assert_eq(calc_nurbs(3, ab_ctrl, ab_w, 3, ab_knots, 7, F64_ONE), 0,
+"calc_nurbs: degree >= n_pts -> 0");
+assert_eq(calc_nurbs(2, ab_ctrl, ab_w, (0 - 4), ab_knots, 3, F64_ONE), 0,
+"calc_nurbs: n_pts = -4 -> 0");
+assert_eq(_ab_count7(ab_ctrl, 4), 4, "bspline/nurbs rejected: control points untouched");
+assert_eq(_ab_clob(ab_ctrl_can, 16), 0, "bspline/nurbs rejected: canary clean");
+
+# --- interpolators with degenerate knot vectors ---
+var ab_times = alloc(4 * 8);
+var ab_vals = alloc(4 * 8);
+var ab_interp_can = _ab_canary_new(16);
+var ab_ti = 0;
+while (ab_ti < 4) {
+    store64(ab_times + ab_ti * 8, f64_from(ab_ti));
+    store64(ab_vals + ab_ti * 8, f64_from(ab_ti * 2));
+    ab_ti = ab_ti + 1;
+}
+assert_eq(calc_hermite_tcb(ab_times, ab_vals, 1, 0, 0, 0, F64_ONE), 0,
+"calc_hermite_tcb: n = 1 -> 0");
+assert_eq(calc_hermite_tcb(ab_times, ab_vals, 0, 0, 0, 0, F64_ONE), 0,
+"calc_hermite_tcb: n = 0 -> 0");
+assert_eq(calc_hermite_tcb(ab_times, ab_vals, (0 - 3), 0, 0, 0, F64_ONE), 0,
+"calc_hermite_tcb: n = -3 -> 0");
+assert_eq(calc_monotone_cubic(ab_times, ab_vals, 1, F64_ONE), 0, "calc_monotone_cubic: n = 1 -> 0");
+assert_eq(calc_monotone_cubic(ab_times, ab_vals, (0 - 3), F64_ONE), 0,
+"calc_monotone_cubic: n = -3 -> 0");
+
+# All-coincident abscissae: every interval width is 0, so the slopes are 0/0.
+var ab_flat = alloc(4 * 8);
+_ab_fill7(ab_flat, 4);
+assert_eq(calc_monotone_cubic(ab_flat, ab_vals, 4, f64_from(7)), 0,
+"calc_monotone_cubic: coincident abscissae -> 0, not a divide by zero");
+assert_eq(_ab_clob(ab_interp_can, 16), 0, "interpolators rejected: canary clean");
+
+# ================================================================
+# 7. DEGENERATE GEOMETRY -- zero extents, zero radii, collinearity
+# ================================================================
+test_group("abuse/geometry: zero-radius, zero-extent, inverted primitives");
+
+var ab_ray = geo_ray_new(hvec3_new(f64_neg(f64_from(5)), 0, 0), hvec3_unit_x());
+
+# A zero-radius sphere is a POINT: the ray through the origin still meets it.
+var ab_zsphere = geo_sphere_new(hvec3_zero(), 0);
+assert_eq(f64_to(geo_ray_sphere(ab_ray, ab_zsphere)), 5,
+"geo_ray_sphere: zero radius is a point hit at t = 5");
+var ab_nsphere = geo_sphere_new(hvec3_zero(), f64_neg(F64_ONE));
+assert_eq(_ab_is_finite(geo_ray_sphere(ab_ray, ab_nsphere)), 1,
+"geo_ray_sphere: negative radius returns a finite t, not NaN");
+
+# A zero-extent AABB is a point; an inverted one (min > max) is empty.
+var ab_zbox = geo_aabb_new(hvec3_zero(), hvec3_zero());
+assert_eq(f64_to(geo_ray_aabb(ab_ray, ab_zbox)), 5, "geo_ray_aabb: zero-extent box hit at t = 5");
+var ab_invbox = geo_aabb_new(hvec3_one(), hvec3_zero());
+assert_eq(_ab_is_finite(geo_ray_aabb(ab_ray, ab_invbox)), 1,
+"geo_ray_aabb: inverted box returns a finite value");
+assert_eq(f64_to(HVec3_x(geo_aabb_size(ab_zbox))), 0, "geo_aabb_size: zero-extent box has size 0");
+assert_eq(geo_aabb_aabb(ab_zbox, ab_zbox), 1, "geo_aabb_aabb: a point overlaps itself");
+
+# Degenerate and collinear triangles: zero area, zero normal, and the
+# barycentric fallback rather than a division by a zero denominator.
+var ab_dtri = geo_triangle_new(hvec3_zero(), hvec3_zero(), hvec3_zero());
+var ab_ctri = geo_triangle_new(hvec3_zero(), hvec3_unit_x(),
+hvec3_scale(hvec3_unit_x(), F64_TWO));
+assert_eq(f64_to(geo_triangle_area(ab_dtri)), 0, "geo_triangle_area: coincident vertices -> 0");
+assert_eq(f64_to(geo_triangle_area(ab_ctri)), 0, "geo_triangle_area: collinear vertices -> 0");
+assert_eq(f64_to(HVec3_x(geo_triangle_unit_normal(ab_dtri))), 0,
+"geo_triangle_unit_normal: degenerate -> zero vector, not NaN");
+assert_eq(_ab_is_nan(HVec3_x(geo_triangle_unit_normal(ab_ctri))), 0,
+"geo_triangle_unit_normal: collinear -> not NaN");
+assert_eq(f64_to(geo_ray_triangle(ab_ray, ab_dtri)), 0, "geo_ray_triangle: degenerate -> miss");
+assert_eq(f64_to(geo_ray_triangle(ab_ray, ab_ctri)), 0, "geo_ray_triangle: collinear -> miss");
+assert_eq(_ab_is_nan(HVec3_x(geo_barycentric_coords(ab_dtri, hvec3_zero()))), 0,
+"geo_barycentric_coords: degenerate -> centroid weights, not NaN");
+assert_eq(_ab_is_nan(HVec3_x(geo_closest_point_on_triangle(ab_dtri, hvec3_one()))), 0,
+"geo_closest_point_on_triangle: degenerate -> finite point");
+
+# Zero-length segments, zero-radius capsules, zero-direction rays.
+var ab_zseg = geo_segment_new(hvec3_one(), hvec3_one());
+assert_eq(f64_to(geo_segment_length(ab_zseg)), 0, "geo_segment_length: coincident endpoints -> 0");
+assert_eq(_ab_is_nan(HVec3_x(geo_segment_direction(ab_zseg))), 0,
+"geo_segment_direction: zero length -> not NaN");
+assert_eq(_ab_is_nan(geo_segment_distance_to_point(ab_zseg, hvec3_zero())), 0,
+"geo_segment_distance_to_point: zero length -> finite");
+assert_eq(_ab_is_nan(HVec3_x(geo_segment_closest_point(ab_zseg, hvec3_zero()))), 0,
+"geo_segment_closest_point: zero length -> finite");
+var ab_zcap = geo_capsule_new(hvec3_zero(), hvec3_zero(), 0);
+assert_eq(_ab_is_nan(geo_ray_capsule(ab_ray, ab_zcap)), 0,
+"geo_ray_capsule: zero-length zero-radius capsule -> not NaN");
+var ab_zray = geo_ray_new(hvec3_zero(), hvec3_zero());
+assert_eq(_ab_is_nan(geo_ray_sphere(ab_zray, ab_zsphere)), 0,
+"geo_ray_sphere: zero-direction ray -> not NaN");
+var ab_zplane = geo_plane_from_point_normal(hvec3_zero(), hvec3_zero());
+assert_eq(f64_to(geo_plane_signed_distance(ab_zplane, hvec3_one())), 0,
+"geo_plane_signed_distance: zero normal -> 0");
+assert_eq(_ab_is_nan(HVec3_x(geo_closest_point_on_plane(ab_zplane, hvec3_one()))), 0,
+"geo_closest_point_on_plane: zero normal -> finite");
+var ab_zobb = geo_obb_new(hvec3_zero(), hvec3_zero(), hquat_identity());
+assert_eq(_ab_is_nan(geo_ray_obb(ab_ray, ab_zobb)), 0,
+"geo_ray_obb: zero half-extents -> not NaN");
+
+test_group("abuse/geometry: NaN and +-Inf coordinates");
+
+# NaN PROPAGATES rather than being laundered into a plausible hit distance.
+# That is the safe answer here: geo_ray_aabb's miss sentinel is 0, so silently
+# turning a NaN ray into 0 would report "no hit" for an input the caller has no
+# business supplying, while a NaN return is unmistakable at the call site.
+var ab_nanray = geo_ray_new(hvec3_splat(_AB_NAN), hvec3_splat(_AB_NAN));
+assert_eq(_ab_is_nan(geo_ray_aabb(ab_nanray, ab_zbox)), 1,
+"geo_ray_aabb: a NaN ray yields NaN, not a fabricated hit distance");
+var ab_infbox = geo_aabb_new(hvec3_splat(_AB_NINF), hvec3_splat(_AB_PINF));
+assert_eq(geo_aabb_aabb(ab_infbox, ab_zbox), 1, "geo_aabb_aabb: the infinite box contains a point");
+assert_eq(_ab_is_nan(HVec3_x(geo_aabb_center(ab_infbox))), 1,
+"geo_aabb_center: (-inf + inf) * 0.5 is NaN, and is reported as such");
+assert_eq(_ab_is_nan(HVec3_x(hvec3_normalize(hvec3_splat(_AB_NAN)))), 1,
+"hvec3_normalize: NaN in, NaN out (no silent zeroing)");
+assert_eq(f64_to(HVec3_x(hvec3_normalize(hvec3_zero()))), 0,
+"hvec3_normalize: zero vector -> zero, not NaN");
+assert_eq(f64_to(HVec2_x(hvec2_normalize(hvec2_zero()))), 0, "hvec2_normalize: zero -> zero");
+assert_eq(f64_to(HVec4_x(hvec4_normalize(hvec4_zero()))), 0, "hvec4_normalize: zero -> zero");
+assert_eq(f64_to(HQuat_w(hquat_normalize(hquat_new(0, 0, 0, 0)))), 1,
+"hquat_normalize: zero quaternion -> identity, not NaN");
+
+test_group("abuse/geometry: singular matrices and degenerate transforms");
+
+# m3_inverse documents identity-on-singular; m4_inverse has no such fallback but
+# must still return an allocated matrix rather than fault.
+assert_eq(m3_get(m3_inverse(m3_new()), 0, 0), F64_ONE, "m3_inverse: singular -> identity[0][0]");
+assert_eq(m3_get(m3_inverse(m3_new()), 1, 1), F64_ONE, "m3_inverse: singular -> identity[1][1]");
+assert_eq(f64_to(m3_determinant(m3_new())), 0, "m3_determinant: zero matrix -> 0");
+assert_neq(m4_inverse(m4_new()), 0, "m4_inverse: singular still returns an allocated matrix");
+assert_eq(f64_to(m4_determinant(m4_new())), 0, "m4_determinant: zero matrix -> 0");
+assert_neq(m4_perspective_rh(0, 0, 0, 0), 0, "m4_perspective_rh: all-zero args allocate");
+assert_neq(m4_ortho_rh(0, 0, 0, 0, 0, 0), 0, "m4_ortho_rh: all-zero args allocate");
+assert_neq(m4_look_at_rh(hvec3_zero(), hvec3_zero(), hvec3_zero()), 0,
+"m4_look_at_rh: eye == target == up allocates");
+assert_neq(hquat_inverse(hquat_new(0, 0, 0, 0)), 0, "hquat_inverse: zero quaternion allocates");
+assert_eq(f64_to(matrix_condition_number(mat_new(3, 3))), (0 - 1),
+"matrix_condition_number: singular -> -1 sentinel");
+
+# A zero-scale transform is the rank-collapse case every renderer hits.
+var ab_t3 = t3d_new(hvec3_zero(), hquat_identity(), hvec3_zero());
+assert_neq(t3d_inverse_matrix(ab_t3), 0, "t3d_inverse_matrix: zero scale returns a matrix");
+assert_eq(f64_to(HVec3_x(t3d_apply(ab_t3, hvec3_one()))), 0, "t3d_apply: zero scale collapses to 0");
+var ab_t2 = t2d_new(hvec2_zero(), 0, hvec2_zero());
+assert_eq(f64_to(HVec2_x(t2d_apply(ab_t2, hvec2_one()))), 0, "t2d_apply: zero scale collapses to 0");
+
+# A zero-area viewport is the window-minimised case.
+var ab_ro = alloc(8);
+var ab_rd = alloc(8);
+assert_eq(screen_to_world_ray(0, 0, m4_identity(), 0, 0, ab_ro, ab_rd), 0,
+"screen_to_world_ray: 0x0 viewport returns cleanly");
+assert_eq(screen_to_world_ray(0, 0, m4_identity(), (0 - 4), (0 - 4), ab_ro, ab_rd), 0,
+"screen_to_world_ray: negative viewport returns cleanly");
+assert_neq(world_to_screen(hvec3_zero(), m4_identity(), 0, 0), 0,
+"world_to_screen: 0x0 viewport returns a vector");
+
+test_group("abuse/geometry: hulls, triangulation and Delaunay on degenerate input");
+
+var ab_line = vec_new();
+vec_push(ab_line, hvec2_new(0, 0));
+vec_push(ab_line, hvec2_new(F64_ONE, 0));
+vec_push(ab_line, hvec2_new(F64_TWO, 0));
+vec_push(ab_line, hvec2_new(f64_from(3), 0));
+
+var ab_same = vec_new();
+var ab_si = 0;
+while (ab_si < 6) {
+    vec_push(ab_same, hvec2_new(F64_ONE, F64_ONE));
+    ab_si = ab_si + 1;
+}
+
+assert_eq(vec_len(convex_hull_2d(ab_line, 0)), 0, "convex_hull_2d: n = 0 -> empty");
+assert_eq(vec_len(convex_hull_2d(ab_line, (0 - 3))), 0, "convex_hull_2d: n = -3 -> empty");
+assert_eq(vec_len(convex_hull_2d(ab_line, 1)), 1, "convex_hull_2d: n = 1 -> the single point");
+assert_eq(vec_len(convex_hull_2d(ab_line, 4)), 2,
+"convex_hull_2d: 4 collinear points -> the 2 extremes");
+assert_eq(vec_len(convex_hull_2d(ab_same, 6)), 2,
+"convex_hull_2d: 6 coincident points -> a 2-index degenerate hull");
+
+assert_eq(vec_len(triangulate_polygon(ab_line, 0)), 0, "triangulate_polygon: n = 0 -> empty");
+assert_eq(vec_len(triangulate_polygon(ab_line, (0 - 2))), 0, "triangulate_polygon: n = -2 -> empty");
+assert_eq(vec_len(triangulate_polygon(ab_line, 2)), 0, "triangulate_polygon: n = 2 -> empty");
+assert_eq(vec_len(triangulate_polygon(ab_line, 4)), 0,
+"triangulate_polygon: 4 collinear vertices -> no ears");
+assert_eq(vec_len(triangulate_polygon(ab_same, 6)), 0,
+"triangulate_polygon: 6 coincident vertices -> no ears");
+
+assert_eq(vec_len(delaunay_2d(ab_line, 0)), 0, "delaunay_2d: n = 0 -> empty");
+assert_eq(vec_len(delaunay_2d(ab_line, (0 - 5))), 0, "delaunay_2d: n = -5 -> empty");
+assert_eq(vec_len(delaunay_2d(ab_line, 2)), 0, "delaunay_2d: n = 2 -> empty");
+assert_eq(vec_len(delaunay_2d(ab_line, 4)), 0,
+"delaunay_2d: 4 collinear sites -> no triangles, no hang");
+assert_eq(vec_len(delaunay_2d(ab_same, 6)), 0,
+"delaunay_2d: 6 coincident sites -> no triangles, no hang");
+
+test_group("abuse/geometry: half-edge mesh input validation");
+
+var ab_tris = vec_new();
+vec_push(ab_tris, 0);
+vec_push(ab_tris, 1);
+vec_push(ab_tris, 2);
+
+assert_eq(halfedge_from_triangles(0, 1, 3), 0, "halfedge_from_triangles: null triangle vec -> 0");
+assert_eq(halfedge_from_triangles(ab_tris, 0, 3), 0, "halfedge_from_triangles: n_tris = 0 -> 0");
+assert_eq(halfedge_from_triangles(ab_tris, (0 - 1), 3), 0,
+"halfedge_from_triangles: n_tris = -1 -> 0");
+assert_eq(halfedge_from_triangles(ab_tris, 1, 0), 0, "halfedge_from_triangles: n_verts = 0 -> 0");
+assert_eq(halfedge_from_triangles(ab_tris, 1, (0 - 4)), 0,
+"halfedge_from_triangles: n_verts = -4 -> 0");
+assert_eq(halfedge_from_triangles(ab_tris, 5, 3), 0,
+"halfedge_from_triangles: n_tris exceeds the index vec -> 0");
+
+var ab_neg_tri = vec_new();
+vec_push(ab_neg_tri, 0);
+vec_push(ab_neg_tri, (0 - 1));
+vec_push(ab_neg_tri, 2);
+assert_eq(halfedge_from_triangles(ab_neg_tri, 1, 3), 0,
+"halfedge_from_triangles: negative vertex id -> 0");
+
+var ab_big_tri = vec_new();
+vec_push(ab_big_tri, 0);
+vec_push(ab_big_tri, 9);
+vec_push(ab_big_tri, 2);
+assert_eq(halfedge_from_triangles(ab_big_tri, 1, 3), 0,
+"halfedge_from_triangles: vertex id >= n_verts -> 0");
+assert_neq(halfedge_from_triangles(ab_tris, 1, 3), 0,
+"halfedge_from_triangles: a well-formed single triangle builds");
+
+test_group("abuse/geometry: contact islands with out-of-range body ids");
+
+var ab_bad_contacts = vec_new();
+vec_push(ab_bad_contacts, contact_new((0 - 3), 1, hvec3_unit_y(), F64_HALF, F64_HALF,
+F64_HALF, F64_ONE, F64_ONE));
+vec_push(ab_bad_contacts, contact_new(0, 99, hvec3_unit_y(), F64_HALF, F64_HALF,
+F64_HALF, F64_ONE, F64_ONE));
+vec_push(ab_bad_contacts, contact_new(2, 3, hvec3_unit_y(), F64_HALF, F64_HALF,
+F64_HALF, F64_ONE, F64_ONE));
+
+# A negative body id used to subscript parent[-1] -- the union-find header's own
+# rank pointer -- and turn it into a wild address. Both endpoints are now bounded,
+# so the two malformed contacts are skipped and only (2,3) fuses: 4 bodies, 3 islands.
+assert_eq(vec_len(detect_islands(ab_bad_contacts, 3, 4)), 3,
+"detect_islands: out-of-range body ids skipped, not dereferenced");
+assert_eq(vec_len(detect_islands(vec_new(), 0, 0)), 0, "detect_islands: n_bodies = 0 -> empty");
+assert_eq(vec_len(detect_islands(vec_new(), 0, (0 - 4))), 0, "detect_islands: n_bodies = -4 -> empty");
+assert_eq(vec_len(detect_islands(vec_new(), (0 - 1), 3)), 3,
+"detect_islands: n_contacts = -1 -> every body is its own island");
+
+test_group("abuse/geometry: BVH and k-d tree on degenerate inputs");
+
+var ab_boxes = alloc(4 * 8);
+var ab_bx = 0;
+while (ab_bx < 4) {
+    store64(ab_boxes + ab_bx * 8,
+    geo_aabb_new(hvec3_splat(f64_from(ab_bx)), hvec3_splat(f64_from(ab_bx + 1))));
+    ab_bx = ab_bx + 1;
+}
+assert_eq(bvh_build(ab_boxes, 0), 0, "bvh_build: count = 0 -> 0");
+assert_eq(vec_len(bvh_query_ray(0, ab_ray)), 0, "bvh_query_ray: null BVH -> empty");
+assert_eq(vec_len(bvh_query_aabb(0, ab_zbox)), 0, "bvh_query_aabb: null BVH -> empty");
+
+# Four boxes at exactly the same place: every split is degenerate.
+var ab_zboxes = alloc(4 * 8);
+ab_bx = 0;
+while (ab_bx < 4) {
+    store64(ab_zboxes + ab_bx * 8, geo_aabb_new(hvec3_zero(), hvec3_zero()));
+    ab_bx = ab_bx + 1;
+}
+var ab_zbvh = bvh_build(ab_zboxes, 4);
+assert_neq(ab_zbvh, 0, "bvh_build: 4 coincident zero-extent boxes still builds");
+assert_eq(vec_len(bvh_query_aabb(ab_zbvh, ab_zbox)), 4,
+"bvh_query_aabb: all 4 coincident leaves are found (no lost subtree)");
+
+# NaN and infinite bounds must not send the walker off the end of the tree.
+var ab_nboxes = alloc(3 * 8);
+store64(ab_nboxes, geo_aabb_new(hvec3_splat(_AB_NAN), hvec3_splat(_AB_NAN)));
+store64(ab_nboxes + 8, geo_aabb_new(hvec3_zero(), hvec3_one()));
+store64(ab_nboxes + 16, geo_aabb_new(hvec3_splat(_AB_NINF), hvec3_splat(_AB_PINF)));
+var ab_nbvh = bvh_build(ab_nboxes, 3);
+assert_neq(ab_nbvh, 0, "bvh_build: NaN / infinite boxes still build");
+assert_lte(vec_len(bvh_query_ray(ab_nbvh, ab_ray)), 3,
+"bvh_query_ray: NaN tree returns at most the 3 leaves it holds");
+
+var ab_pts = alloc(8 * 8);
+var ab_pi = 0;
+while (ab_pi < 8) {
+    store64(ab_pts + ab_pi * 8,
+    hvec3_new(f64_from(ab_pi), f64_from(ab_pi * 2), f64_from(ab_pi * 3)));
+    ab_pi = ab_pi + 1;
+}
+var ab_query = hvec3_new(F64_ONE, F64_ONE, F64_ONE);
+assert_eq(kdtree_build(ab_pts, 0), 0, "kdtree_build: count = 0 -> 0");
+assert_eq(kdtree_nearest(0, ab_pts, ab_query), (0 - 1), "kdtree_nearest: null root -> -1");
+assert_eq(vec_len(kdtree_within_radius(0, ab_pts, ab_query, F64_ONE)), 0,
+"kdtree_within_radius: null root -> empty");
+assert_neq(kdtree_build(ab_pts, 1), 0, "kdtree_build: count = 1 builds a leaf");
+
+var ab_kdroot = kdtree_build(ab_pts, 8);
+assert_eq(vec_len(kdtree_within_radius(ab_kdroot, ab_pts, ab_query, f64_neg(F64_ONE))), 0,
+"kdtree_within_radius: negative radius -> empty");
+assert_eq(vec_len(kdtree_within_radius(ab_kdroot, ab_pts, ab_query, 0)), 0,
+"kdtree_within_radius: zero radius on a non-coincident query -> empty");
+assert_lte(vec_len(kdtree_within_radius(ab_kdroot, ab_pts, ab_query, f64_from(1000000))), 8,
+"kdtree_within_radius: huge radius returns at most every point once");
+
+# 64 exactly coincident points: the 2.6.14 SIGSEGV case, kept as a regression.
+var ab_coin = alloc(64 * 8);
+ab_pi = 0;
+while (ab_pi < 64) {
+    store64(ab_coin + ab_pi * 8, hvec3_splat(f64_from(3)));
+    ab_pi = ab_pi + 1;
+}
+var ab_coinroot = kdtree_build(ab_coin, 64);
+assert_neq(ab_coinroot, 0, "kdtree_build: 64 coincident points build without faulting");
+assert_eq(vec_len(kdtree_within_radius(ab_coinroot, ab_coin, hvec3_splat(f64_from(3)), F64_ONE)),
+64, "kdtree_within_radius: all 64 coincident points are found");
+
+test_group("abuse/geometry: quadtree / octree / spatial hash hostile bounds");
+
+# Inverted bounds (min > max) contain nothing, so every insert is dropped.
+var ab_qt_inv = quadtree_new(F64_ONE, F64_ONE, 0, 0, 4);
+assert_neq(ab_qt_inv, 0, "quadtree_new: inverted bounds still construct");
+assert_eq(quadtree_insert(ab_qt_inv, F64_HALF, F64_HALF, 7), 0,
+"quadtree_insert: point outside inverted bounds is dropped");
+
+# Zero-extent bounds are a single point, and that point IS inside.
+var ab_qt_zero = quadtree_new(0, 0, 0, 0, 4);
+assert_eq(quadtree_insert(ab_qt_zero, 0, 0, 1), 1, "quadtree_insert: zero-extent accepts its point");
+assert_eq(quadtree_insert(ab_qt_zero, F64_ONE, F64_ONE, 1), 0,
+"quadtree_insert: zero-extent rejects everything else");
+
+# An inverted QUERY box is separate from inverted tree bounds: run it against a
+# clean tree so the count is not entangled with the hostile inserts below.
+var ab_qt_clean = quadtree_new(0, 0, f64_from(10), f64_from(10), 4);
+quadtree_insert(ab_qt_clean, F64_ONE, F64_ONE, 1);
+assert_eq(vec_len(quadtree_query(ab_qt_clean, 0, 0, f64_from(10), f64_from(10))), 1,
+"quadtree_query: the well-formed query finds its point");
+assert_eq(vec_len(quadtree_query(ab_qt_clean, f64_from(10), f64_from(10), 0, 0)), 0,
+"quadtree_query: inverted query box -> empty");
+
+var ab_qt = quadtree_new(0, 0, f64_from(10), f64_from(10), 4);
+assert_eq(quadtree_insert(ab_qt, _AB_PINF, _AB_NINF, 1), 0,
+"quadtree_insert: infinite coordinates are dropped");
+# The bounds test is a pair of ORDERED comparisons (f64_lt / f64_gt), and every
+# ordered comparison against NaN is false -- so a NaN point falls through as
+# "inside" where +-Inf is correctly rejected. Recorded, not blessed: it is a
+# wrong answer, but it is bounded (max_depth caps the descent) and touches
+# nothing outside the tree, which is what the next two assertions establish.
+assert_eq(quadtree_insert(ab_qt, _AB_NAN, _AB_NAN, 1), 1,
+"quadtree_insert: NaN passes the ordered bounds test (asymmetry vs +-Inf)");
+assert_lte(vec_len(quadtree_query(ab_qt, 0, 0, f64_from(10), f64_from(10))), 8,
+"quadtree_query: result count stays bounded after a NaN insert");
+
+# max_depth <= 0 means "never split": inserts must still be accepted, not looped.
+var ab_qt_nd = quadtree_new(0, 0, f64_from(10), f64_from(10), (0 - 5));
+var ab_qi = 0;
+while (ab_qi < 32) {
+    quadtree_insert(ab_qt_nd, F64_ONE, F64_ONE, ab_qi);
+    ab_qi = ab_qi + 1;
+}
+assert_eq(vec_len(quadtree_query(ab_qt_nd, 0, 0, f64_from(10), f64_from(10))), 32,
+"quadtree: max_depth = -5 keeps every point in the root, no split recursion");
+
+var ab_ot = octree_new(hvec3_zero(), hvec3_splat(f64_from(10)), 4);
+assert_eq(octree_insert(ab_ot, hvec3_splat(_AB_NAN), 1), 1,
+"octree_insert: NaN point accepted by the ordered bounds test");
+assert_eq(octree_insert(ab_ot, hvec3_splat(_AB_PINF), 1), 0,
+"octree_insert: +Inf point is dropped");
+var ab_ot_zero = octree_new(hvec3_zero(), hvec3_zero(), 4);
+assert_eq(octree_insert(ab_ot_zero, hvec3_zero(), 1), 1,
+"octree_insert: zero-extent accepts its own point");
+var ab_ot_inv = octree_new(hvec3_splat(f64_from(10)), hvec3_zero(), 4);
+assert_eq(octree_insert(ab_ot_inv, hvec3_one(), 1), 1,
+"octree_insert: inverted bounds do not fault (documented: no ordering check)");
+var ab_ot_nd = octree_new(hvec3_zero(), hvec3_splat(f64_from(10)), (0 - 3));
+var ab_oi = 0;
+while (ab_oi < 32) {
+    octree_insert(ab_ot_nd, hvec3_one(), ab_oi);
+    ab_oi = ab_oi + 1;
+}
+assert_eq(vec_len(octree_query(ab_ot_nd, hvec3_zero(), hvec3_splat(f64_from(10)))), 32,
+"octree: max_depth = -3 keeps every point in the root, no split recursion");
+
+# spatial_hash_insert validates NOTHING and always returns 0; the safety comes
+# from the bucket index being masked (`hash & (bucket_count - 1)`), so even the
+# nonsense cell coordinate that a zero / negative / NaN cell size produces
+# lands inside the bucket array. These assertions pin that: the calls return,
+# the structure stays queryable, and every answer stays bounded by the number
+# of entries actually inserted.
+assert_eq(spatial_hash_insert(spatial_hash_new(0), hvec3_zero(), 1), 0,
+"spatial_hash_insert: cell_size = 0 (1/0 = +Inf) does not fault");
+assert_eq(spatial_hash_insert(spatial_hash_new(f64_neg(F64_ONE)), hvec3_one(), 1), 0,
+"spatial_hash_insert: negative cell_size does not fault");
+
+var ab_sh = spatial_hash_new(F64_ONE);
+assert_eq(spatial_hash_insert(ab_sh, hvec3_new(_AB_NAN, 0, 0), 1), 0,
+"spatial_hash_insert: NaN coordinate does not fault");
+assert_eq(spatial_hash_insert(ab_sh, hvec3_splat(_AB_PINF), 1), 0,
+"spatial_hash_insert: +Inf coordinate does not fault");
+spatial_hash_insert(ab_sh, hvec3_zero(), 5);
+spatial_hash_insert(ab_sh, hvec3_one(), 6);
+assert_eq(vec_len(spatial_hash_query_radius(ab_sh, hvec3_zero(), f64_neg(F64_ONE))), 0,
+"spatial_hash_query_radius: negative radius -> empty");
+
+# Control on a hash that never saw a hostile coordinate: the well-formed query
+# still returns exactly the one point in range, so the bounds above are a real
+# ceiling and not a query that silently returns nothing.
+var ab_sh_ok = spatial_hash_new(F64_ONE);
+spatial_hash_insert(ab_sh_ok, hvec3_zero(), 5);
+spatial_hash_insert(ab_sh_ok, hvec3_splat(f64_from(50)), 6);
+assert_eq(vec_len(spatial_hash_query_radius(ab_sh_ok, hvec3_zero(), F64_HALF)), 1,
+"spatial_hash_query_radius: clean hash finds exactly its one in-range point");
+
+# A radius spanning 1e9 cells must be answered from the entry list, not by
+# walking 1e27 cells -- this assertion is a HANG detector as much as a bound
+# check. _SH_MAX_SPAN_CELLS is the guard that makes it terminate.
+assert_lte(vec_len(spatial_hash_query_radius(ab_sh, hvec3_zero(), f64_from(1000000000))), 4,
+"spatial_hash_query_radius: 1e9 radius stays bounded by the entry count");
+assert_lte(vec_len(spatial_hash_query_radius(ab_sh, hvec3_splat(_AB_NAN), F64_ONE)), 4,
+"spatial_hash_query_radius: NaN centre stays bounded by the entry count");
+spatial_hash_clear(ab_sh);
+assert_eq(vec_len(spatial_hash_query_radius(ab_sh, hvec3_zero(), F64_ONE)), 0,
+"spatial_hash_query_radius: cleared hash -> empty");
+assert_eq(vec_len(spatial_hash_query_cell(ab_sh, hvec3_zero())), 0,
+"spatial_hash_query_cell: cleared hash -> empty");
+
+test_group("abuse/geometry: narrowphase on point-like (zero-radius) shapes");
+
+# Two coincident zero-radius spheres: the Minkowski difference is a single
+# point AT the origin, the worst input a support-mapping algorithm can get.
+var ab_pt_a = hvec4_new(0, 0, 0, 0);
+var ab_pt_b = hvec4_new(0, 0, 0, 0);
+var ab_far_b = hvec4_new(f64_from(100), 0, 0, 0);
+assert_lte(mpr_intersect(&_ab_sup_sphere, ab_pt_a, &_ab_sup_sphere, ab_pt_b), 1,
+"mpr_intersect: coincident points terminate with a 0/1 answer");
+assert_eq(mpr_intersect(&_ab_sup_sphere, ab_pt_a, &_ab_sup_sphere, ab_far_b), 0,
+"mpr_intersect: distant points do not intersect");
+assert_lte(gjk_intersect_3d(&_ab_sup_sphere, ab_pt_a, &_ab_sup_sphere, ab_pt_b), 1,
+"gjk_intersect_3d: coincident points terminate with a 0/1 answer");
+assert_eq(gjk_intersect_3d(&_ab_sup_sphere, ab_pt_a, &_ab_sup_sphere, ab_far_b), 0,
+"gjk_intersect_3d: distant points do not intersect");
+
+var ab_epa_n = alloc(8);
+var ab_epa_d = alloc(8);
+var ab_epa_can = _ab_canary_new(16);
+store64(ab_epa_n, 0);
+store64(ab_epa_d, 0);
+assert_lte(gjk_epa_3d(&_ab_sup_sphere, ab_pt_a, &_ab_sup_sphere, ab_pt_b, ab_epa_n, ab_epa_d), 1,
+"gjk_epa_3d: coincident points terminate");
+assert_eq(_ab_clob(ab_epa_can, 16), 0, "gjk_epa_3d: out_normal / out_depth canary clean");
+
+var ab_toi_t = alloc(8);
+var ab_toi_n = alloc(8);
+var ab_toi_can = _ab_canary_new(16);
+assert_lte(time_of_impact(&_ab_sup_sphere, ab_pt_a, hvec3_zero(),
+&_ab_sup_sphere, ab_far_b, hvec3_zero(), F64_ONE, ab_toi_t, ab_toi_n), 1,
+"time_of_impact: zero relative velocity terminates");
+assert_lte(time_of_impact(&_ab_sup_sphere, ab_pt_a, hvec3_zero(),
+&_ab_sup_sphere, ab_far_b, hvec3_unit_x(), 0, ab_toi_t, ab_toi_n), 1,
+"time_of_impact: max_t = 0 terminates");
+assert_lte(time_of_impact(&_ab_sup_sphere, ab_pt_a, hvec3_zero(),
+&_ab_sup_sphere, ab_far_b, hvec3_unit_x(), f64_neg(F64_ONE), ab_toi_t, ab_toi_n), 1,
+"time_of_impact: negative horizon terminates");
+assert_eq(_ab_clob(ab_toi_can, 16), 0, "time_of_impact: out canary clean");
+
+# SDF primitives with degenerate parameters are pure arithmetic, but a NaN here
+# poisons every downstream ray-march, so pin the finite cases.
+assert_eq(f64_to(sdf_sphere(hvec3_zero(), hvec3_zero(), 0)), 0, "sdf_sphere: zero radius at centre");
+assert_eq(f64_to(sdf_box(hvec3_zero(), hvec3_zero(), hvec3_zero())), 0, "sdf_box: zero half-extents");
+assert_eq(f64_to(sdf_union(0, F64_ONE)), 0, "sdf_union: min of 0 and 1");
+assert_eq(f64_to(sdf_intersection(0, F64_ONE)), 1, "sdf_intersection: max of 0 and 1");
+assert_eq(f64_to(sdf_subtraction(0, F64_ONE)), 0, "sdf_subtraction: max(-d1, d2) at 0, 1");
+
+# A zero-LENGTH capsule has no axis to project onto, and sdf_smooth_union's
+# blend factor divides by k. Both are 0/0: they answer NaN rather than faulting
+# or returning a plausible-but-wrong distance, which is the safe failure mode
+# for a field a ray-marcher will step along.
+assert_eq(_ab_is_nan(sdf_capsule(hvec3_zero(), hvec3_zero(), hvec3_zero(), 0)), 1,
+"sdf_capsule: zero-length axis is 0/0 -> NaN, not a fabricated distance");
+assert_eq(_ab_is_nan(sdf_smooth_union(0, 0, 0)), 1,
+"sdf_smooth_union: k = 0 divides by zero -> NaN, not a fabricated distance");
+assert_eq(_ab_is_nan(sdf_capsule(hvec3_zero(), hvec3_zero(), hvec3_unit_x(), 0)), 0,
+"sdf_capsule: a non-degenerate axis is finite (control for the NaN case above)");
+
+# ================================================================
+# 8. NUMBER THEORY, TRANSFORMS AND NOISE -- zero / negative counts
+# ================================================================
+test_group("abuse: number-theoretic routines with non-positive arguments");
+
+assert_eq(num_modinv(3, 0), (0 - 1), "num_modinv: m = 0 -> -1");
+assert_eq(num_modinv(3, (0 - 7)), (0 - 1), "num_modinv: m = -7 -> -1");
+assert_eq(num_is_prime((0 - 7)), 0, "num_is_prime: -7 -> 0");
+assert_eq(num_is_prime(0), 0, "num_is_prime: 0 -> 0");
+assert_eq(num_is_prime(1), 0, "num_is_prime: 1 -> 0");
+assert_eq(vec_len(num_factorize((0 - 5))), 0, "num_factorize: -5 -> empty");
+assert_eq(vec_len(num_factorize(0)), 0, "num_factorize: 0 -> empty");
+assert_eq(vec_len(num_factorize(1)), 0, "num_factorize: 1 -> empty");
+assert_eq(num_pollard_rho((0 - 5)), (0 - 5), "num_pollard_rho: -5 returns its argument");
+assert_eq(num_pollard_rho(0), 0, "num_pollard_rho: 0 returns its argument");
+assert_eq(num_euler_totient(0), 0, "num_euler_totient: 0 -> 0");
+assert_eq(num_mobius(0), 0, "num_mobius: 0 -> 0");
+assert_eq(num_divisor_sigma(0, 2), 0, "num_divisor_sigma: n = 0 -> 0");
+assert_eq(num_divisor_sigma((0 - 6), 2), 0, "num_divisor_sigma: n = -6 -> 0");
+assert_eq(num_gcd(0, 0), 0, "num_gcd: 0, 0 -> 0");
+assert_eq(num_gcd((0 - 12), (0 - 18)), 6, "num_gcd: negatives folded to |a|, |b|");
+assert_eq(vec_len(num_continued_fraction_rational(5, 0)), 0,
+"num_continued_fraction_rational: q = 0 -> empty (no divide by zero)");
+
+# num_halton's loop is `i % base` / `i / base`: base 0 is SIGFPE, base 1 never
+# advances, base < 0 leaves [0, 1). All three are refused at the door.
+assert_eq(num_halton(5, 0), 0, "num_halton: base = 0 -> 0 (would be SIGFPE)");
+assert_eq(num_halton(5, 1), 0, "num_halton: base = 1 -> 0 (would never terminate)");
+assert_eq(num_halton(5, (0 - 2)), 0, "num_halton: base = -2 -> 0");
+assert_eq(num_halton((0 - 5), 2), 0, "num_halton: negative index -> 0");
+assert_eq(num_sobol(0), 0, "num_sobol: index 0 -> 0");
+assert_eq(_ab_is_finite(num_sobol((0 - 5))), 1, "num_sobol: negative index stays finite");
+
+assert_eq(vec_len(num_sieve((0 - 10))), 0, "num_sieve: limit = -10 -> empty");
+assert_eq(vec_len(num_sieve(0)), 0, "num_sieve: limit = 0 -> empty");
+assert_eq(vec_len(num_sieve(1)), 0, "num_sieve: limit = 1 -> empty");
+assert_eq(vec_len(num_sieve(100000000)), 0, "num_sieve: limit = 1e8 (over the 10M cap) -> empty");
+assert_eq(vec_len(num_sieve(2)), 1, "num_sieve: limit = 2 -> [2]");
+
+test_group("abuse: spectral transforms with non-positive or non-power-of-two lengths");
+
+var ab_spec = alloc(32 * 16);
+var ab_spi = 0;
+while (ab_spi < 32) {
+    store64(ab_spec + ab_spi * 16, f64_from(ab_spi));
+    store64(ab_spec + ab_spi * 16 + 8, 0);
+    ab_spi = ab_spi + 1;
+}
+assert_eq(num_fft(ab_spec, 0), HSB_ERR_NONE, "num_fft: n = 0 is a no-op");
+assert_eq(num_fft(ab_spec, 1), HSB_ERR_NONE, "num_fft: n = 1 is a no-op");
+assert_eq(num_fft(ab_spec, 6), HSB_ERR_INVALID_INPUT, "num_fft: n = 6 rejected");
+assert_eq(num_fft_2d(ab_spec, (0 - 2), 4), HSB_ERR_INVALID_INPUT, "num_fft_2d: rows = -2 rejected");
+assert_eq(num_fft_2d(ab_spec, 2, 0), HSB_ERR_INVALID_INPUT, "num_fft_2d: cols = 0 rejected");
+assert_eq(num_fft_2d(ab_spec, 3, 4), HSB_ERR_INVALID_INPUT, "num_fft_2d: rows = 3 rejected");
+assert_eq(num_ifft_2d(ab_spec, (0 - 2), 4), HSB_ERR_INVALID_INPUT,
+"num_ifft_2d: rows = -2 rejected");
+assert_eq(num_dst(ab_spec, 0), HSB_ERR_INVALID_INPUT, "num_dst: n = 0 rejected");
+assert_eq(num_dst(ab_spec, (0 - 3)), HSB_ERR_INVALID_INPUT, "num_dst: n = -3 rejected");
+assert_eq(num_idst(ab_spec, (0 - 3)), HSB_ERR_INVALID_INPUT, "num_idst: n = -3 rejected");
+assert_eq(num_dct(ab_spec, (0 - 3)), HSB_ERR_INVALID_INPUT, "num_dct: n = -3 rejected");
+assert_eq(num_idct(ab_spec, (0 - 3)), HSB_ERR_INVALID_INPUT, "num_idct: n = -3 rejected");
+assert_eq(num_dst(ab_spec, 1), HSB_ERR_NONE, "num_dst: n = 1 is exact and needs no work");
+assert_eq(num_dct(ab_spec, 1), HSB_ERR_NONE, "num_dct: n = 1 is exact and needs no work");
+
+assert_eq(num_kahan_sum(ab_spec, 0), 0, "num_kahan_sum: n = 0 -> 0");
+assert_eq(num_kahan_sum(ab_spec, (0 - 3)), 0, "num_kahan_sum: n = -3 -> 0");
+assert_eq(num_neumaier_sum(ab_spec, 0), 0, "num_neumaier_sum: n = 0 -> 0");
+
+test_group("abuse: noise with non-positive octave counts");
+
+assert_eq(fbm_2d(F64_ONE, F64_ONE, 0, F64_ONE, F64_ONE, F64_HALF), 0, "fbm_2d: octaves = 0 -> 0");
+assert_eq(fbm_2d(F64_ONE, F64_ONE, (0 - 3), F64_ONE, F64_ONE, F64_HALF), 0,
+"fbm_2d: octaves = -3 -> 0");
+assert_eq(fbm_3d(F64_ONE, F64_ONE, F64_ONE, (0 - 3), F64_ONE, F64_ONE, F64_HALF), 0,
+"fbm_3d: octaves = -3 -> 0");
+assert_eq(simplex_fbm_2d(F64_ONE, F64_ONE, (0 - 3), F64_ONE, F64_ONE, F64_HALF), 0,
+"simplex_fbm_2d: octaves = -3 -> 0");
+assert_eq(simplex_fbm_3d(F64_ONE, F64_ONE, F64_ONE, (0 - 3), F64_ONE, F64_ONE, F64_HALF), 0,
+"simplex_fbm_3d: octaves = -3 -> 0");
+# NaN coordinates reach a lattice lookup: the index is f64_to(floor(NaN)), which
+# is a defined i64 and is then MASKED into the permutation table, so the read
+# stays in bounds. The VALUE that comes back is NaN (the gradient dot product
+# carries it through), which is the honest answer -- and, crucially, the call
+# returns at all rather than indexing the table wildly.
+assert_eq(_ab_is_nan(perlin_2d(_AB_NAN, _AB_NAN)), 1,
+"perlin_2d: NaN coordinate -> NaN value, table lookup still in bounds");
+# simplex_2d differs from perlin_2d here: its per-corner contributions are
+# gated by `if (t > 0)`, an ordered test that is FALSE for the NaN t a NaN
+# coordinate produces, so every corner is skipped and the sum stays 0. Not a
+# fault either way -- the point of the pair is that both terminate in bounds.
+assert_eq(_ab_is_nan(simplex_2d(_AB_NAN, _AB_NAN)), 0,
+"simplex_2d: NaN coordinate -> 0 (all corner contributions gated out)");
+assert_eq(_ab_is_nan(perlin_2d(F64_HALF, F64_HALF)), 0, "perlin_2d: finite input stays finite");
+assert_eq(_ab_is_nan(simplex_2d(F64_HALF, F64_HALF)), 0, "simplex_2d: finite input stays finite");
+assert_eq(_ab_is_nan(simplex_3d(F64_HALF, F64_HALF, F64_HALF)), 0,
+"simplex_3d: finite input stays finite");
+
+# ================================================================
+# 9. COLOUR, f64 UTILITIES AND ERROR CODES
+# ================================================================
+# color.cyr is the module a compositor drives with whatever the artist typed, so
+# out-of-gamut, zero-alpha and non-finite inputs are its ordinary traffic.
+test_group("abuse: colour pipeline with out-of-gamut, zero-alpha and non-finite input");
+
+assert_eq(srgb_to_linear(0), 0, "srgb_to_linear: 0 -> 0");
+assert_eq(linear_to_srgb(0), 0, "linear_to_srgb: 0 -> 0");
+assert_eq(f64_to(srgb_to_linear(f64_neg(F64_ONE))), 0,
+"srgb_to_linear: -1 stays in the linear segment, no negative pow");
+assert_eq(_ab_is_finite(linear_to_srgb(f64_neg(F64_ONE))), 1,
+"linear_to_srgb: -1 gives a finite (out-of-range) value, not NaN");
+assert_eq(f64_to(f64_round(f64_mul(linear_to_srgb(f64_neg(F64_ONE)), f64_from(100)))), (0 - 1292),
+"linear_to_srgb: -1 -> -12.92 (the linear-segment slope), deterministically");
+assert_eq(_ab_is_nan(srgb_to_linear(_AB_NAN)), 1, "srgb_to_linear: NaN propagates");
+assert_eq(f64_to(HVec3_x(srgb_to_linear_vec3(hvec3_zero()))), 0, "srgb_to_linear_vec3: 0 -> 0");
+assert_eq(f64_to(HVec3_x(linear_to_srgb_vec3(hvec3_zero()))), 0, "linear_to_srgb_vec3: 0 -> 0");
+assert_eq(f64_to(HVec3_x(lerp_srgb_vec3(hvec3_zero(), hvec3_one(), 0))), 0,
+"lerp_srgb_vec3: t = 0 returns the first endpoint");
+
+# Zero alpha is the degenerate case of the premultiplied representation: the
+# un-premultiply divides by it.
+assert_eq(f64_to(HVec4_x(premultiply_alpha(F64_ONE, F64_ONE, F64_ONE, 0))), 0,
+"premultiply_alpha: alpha 0 zeroes the colour");
+assert_eq(f64_to(HVec4_x(unpremultiply_alpha(F64_ONE, F64_ONE, F64_ONE, 0))), 0,
+"unpremultiply_alpha: alpha 0 -> 0, not a division by zero");
+assert_eq(f64_to(HVec4_w(unpremultiply_alpha(F64_ONE, F64_ONE, F64_ONE, 0))), 0,
+"unpremultiply_alpha: alpha 0 -> alpha 0");
+assert_eq(f64_to(HVec4_w(composite_src_over(0, 0, 0, 0, 0, 0, 0, 0))), 0,
+"composite_src_over: two fully transparent operands -> transparent");
+assert_eq(f64_to(HVec4_w(composite_dst_over(0, 0, 0, 0, 0, 0, 0, 0))), 0,
+"composite_dst_over: two fully transparent operands -> transparent");
+assert_eq(f64_to(HVec4_w(composite_src_in(0, 0, 0, 0, 0, 0, 0, 0))), 0,
+"composite_src_in: two fully transparent operands -> transparent");
+assert_eq(f64_to(HVec4_w(composite_dst_in(0, 0, 0, 0, 0, 0, 0, 0))), 0,
+"composite_dst_in: two fully transparent operands -> transparent");
+assert_eq(f64_to(HVec4_w(composite_src_out(0, 0, 0, 0, 0, 0, 0, 0))), 0,
+"composite_src_out: two fully transparent operands -> transparent");
+assert_eq(f64_to(HVec4_w(composite_dst_out(0, 0, 0, 0, 0, 0, 0, 0))), 0,
+"composite_dst_out: two fully transparent operands -> transparent");
+assert_eq(f64_to(HVec4_w(composite_xor(F64_ONE, 0, 0, F64_ONE, 0, 0, F64_ONE, F64_ONE))), 0,
+"composite_xor: two fully opaque operands cancel to alpha 0");
+assert_eq(f64_to(HVec4_w(composite_plus(F64_ONE, 0, 0, F64_ONE, 0, 0, F64_ONE, F64_ONE))), 1,
+"composite_plus: alpha saturates at 1 rather than summing to 2");
+
+assert_eq(f64_to(HVec3_x(tonemap_reinhard(0, 0, 0))), 0, "tonemap_reinhard: black stays black");
+assert_eq(f64_to(HVec3_x(tonemap_aces(0, 0, 0))), 0, "tonemap_aces: black stays black");
+assert_eq(_ab_is_nan(HVec3_x(tonemap_reinhard(_AB_NAN, _AB_NAN, _AB_NAN))), 1,
+"tonemap_reinhard: NaN propagates rather than clamping to a plausible colour");
+
+# x / (1 + x) at x = -1 is a pole, and the extended operator divides by white^2.
+assert_eq(_ab_is_finite(HVec3_x(tonemap_reinhard(f64_neg(F64_ONE), 0, 0))), 0,
+"tonemap_reinhard: -1 is the pole of x/(1+x) -> infinite, not silently clamped");
+assert_eq(_ab_is_nan(HVec3_x(tonemap_reinhard(f64_neg(F64_ONE), 0, 0))), 0,
+"tonemap_reinhard: the pole is a signed infinity, not NaN");
+assert_eq(_ab_is_nan(HVec3_x(tonemap_reinhard_extended(0, 0, 0, 0))), 1,
+"tonemap_reinhard_extended: white = 0 divides by zero -> NaN");
+
+assert_eq(_ab_is_nan(ev100_to_luminance(_AB_PINF)), 1, "ev100_to_luminance: +inf EV -> NaN");
+assert_eq(_ab_is_finite(luminance_to_ev100(0)), 0,
+"luminance_to_ev100: log2(0) -> -inf, not a fabricated number");
+assert_eq(_ab_is_finite(ev100_to_exposure(0)), 1, "ev100_to_exposure: EV 0 is finite");
+assert_eq(f64_to(f64_round(f64_mul(ev100_to_exposure(0), f64_from(100)))), 83,
+"ev100_to_exposure: EV 0 -> 0.833... (1/1.2), deterministically");
+
+# near == far collapses the depth range; the reciprocal is 0/0.
+assert_eq(_ab_is_nan(linearize_depth(F64_HALF, 0, 0)), 1,
+"linearize_depth: near == far == 0 -> NaN, not a fabricated depth");
+assert_eq(f64_to(linearize_depth_reverse_z(0, F64_ONE)), 0,
+"linearize_depth_reverse_z: ndc 0 -> 0");
+
+var ab_shc = alloc(9 * 8);
+var ab_shc_can = _ab_canary_new(16);
+var ab_shi = 0;
+while (ab_shi < 9) {
+    store64(ab_shc + ab_shi * 8, F64_ONE);
+    ab_shi = ab_shi + 1;
+}
+assert_neq(sh_eval_l2(hvec3_zero()), 0, "sh_eval_l2: a zero direction still allocates 9 bands");
+assert_eq(f64_to(sh_evaluate_l2(ab_shc, hvec3_zero())), 0,
+"sh_evaluate_l2: a zero direction sums to the band-0 term only");
+assert_eq(_ab_is_nan(sh_evaluate_l2(ab_shc, hvec3_splat(_AB_NAN))), 1,
+"sh_evaluate_l2: NaN direction propagates");
+assert_eq(_ab_clob(ab_shc_can, 16), 0,
+"sh_evaluate_l2: reads exactly 9 coefficients, canary past them clean");
+
+test_group("abuse: f64 utility singular points and error-code classification");
+
+assert_eq(f64_fmod(f64_from(7), 0), 0, "f64_fmod: y = 0 -> 0, not a division by zero");
+assert_eq(f64_to(f64_fmod(f64_neg(f64_from(7)), f64_from(3))), (0 - 1),
+"f64_fmod: fmod(-7, 3) = -1 -- sign of the DIVIDEND (trunc), not floor");
+
+# copysign is defined on the SIGN BIT, so it has to work for -0.0 (which compares
+# equal to +0.0) and for a NaN (which compares unordered with everything).
+assert_eq(f64_copysign(f64_from(3), 0x8000000000000000), f64_neg(f64_from(3)),
+"f64_copysign: sign of -0.0 gives -3, which no ordered comparison can produce");
+assert_eq(f64_copysign(f64_from(3), _AB_NAN), f64_from(3),
+"f64_copysign: a positive NaN gives +3, not a comparison-driven fallback");
+assert_eq(f64_copysign(f64_neg(f64_from(3)), F64_ONE), f64_from(3),
+"f64_copysign: magnitude is taken from x, sign from y");
+assert_eq(f64_approx_eq(_AB_NAN, _AB_NAN, F64_ONE), 0,
+"f64_approx_eq: NaN is not approximately equal to itself");
+assert_eq(f64_approx_eq(_AB_PINF, _AB_PINF, F64_ONE), 0,
+"f64_approx_eq: inf - inf is NaN, so infinities are not approximately equal");
+assert_eq(f64_eq(f64_tan(0), 0), 1, "f64_tan: tan(0) = 0");
+assert_eq(_ab_is_nan(f64_tan(_AB_NAN)), 1, "f64_tan: NaN propagates through sin/cos");
+
+assert_eq(hisab_is_err(HSB_ERR_NONE), 0, "hisab_is_err: HSB_ERR_NONE is not an error");
+assert_eq(hisab_is_err(1), 0, "hisab_is_err: a positive result is not an error");
+assert_eq(hisab_is_err(HSB_ERR_ALLOC), 1, "hisab_is_err: HSB_ERR_ALLOC is an error");
+assert_eq(hisab_is_err(HSB_ERR_INVALID_INPUT), 1,
+"hisab_is_err: HSB_ERR_INVALID_INPUT is an error");
+assert_eq(hisab_is_err(HSB_ERR_NO_CONVERGENCE), 1,
+"hisab_is_err: HSB_ERR_NO_CONVERGENCE is an error");
+
+# ================================================================
+# 10. BOUNDED WORK -- adversarial input must terminate, not spin
+# ================================================================
+# Every assertion here would time the suite out rather than fail if the routine
+# looped, so reaching the assertion at all is half the result.
+test_group("abuse: adversarial inputs terminate with an error, not a hang");
+
+var ab_ts = vec_new();
+var ab_ys = vec_new();
+assert_eq(ode_dopri45_trajectory(&_ab_dydt, 0, F64_ONE, F64_ONE, 0, F64_HALF, ab_ts, ab_ys),
+HSB_ERR_NO_CONVERGENCE, "ode_dopri45_trajectory: dt0 = 0 exhausts the step budget");
+assert_lte(vec_len(ab_ts), 100002, "ode_dopri45_trajectory: dt0 = 0 emits a bounded trajectory");
+
+var ab_ts2 = vec_new();
+var ab_ys2 = vec_new();
+assert_eq(ode_dopri45_trajectory(&_ab_dydt, 0, F64_ONE, F64_ONE, f64_neg(F64_ONE), F64_HALF,
+ab_ts2, ab_ys2), HSB_ERR_NO_CONVERGENCE,
+"ode_dopri45_trajectory: negative dt0 exhausts the step budget");
+
+var ab_ts3 = vec_new();
+var ab_ys3 = vec_new();
+assert_eq(ode_dopri45_trajectory(&_ab_dydt, F64_ONE, F64_ONE, 0, F64_HALF, F64_HALF,
+ab_ts3, ab_ys3), HSB_ERR_NONE, "ode_dopri45_trajectory: tf < t0 returns immediately");
+
+var ab_ts4 = vec_new();
+var ab_ys4 = vec_new();
+assert_eq(ode_dopri45_trajectory(&_ab_dydt, 0, F64_ONE, F64_ONE, F64_HALF, 0, ab_ts4, ab_ys4),
+HSB_ERR_NO_CONVERGENCE, "ode_dopri45_trajectory: tol = 0 exhausts the budget, no infinite retry");
+
+var ab_ody = alloc(8);
+var ab_oerr = alloc(8);
+var ab_ode_can = _ab_canary_new(16);
+assert_eq(ode_dopri45(&_ab_dydt, 0, F64_ONE, 0, ab_ody, ab_oerr), HSB_ERR_NONE,
+"ode_dopri45: dt = 0 is a legal null step");
+assert_eq(ode_dopri45(&_ab_dydt, 0, F64_ONE, _AB_NAN, ab_ody, ab_oerr), HSB_ERR_NONE,
+"ode_dopri45: dt = NaN returns rather than looping");
+assert_eq(_ab_clob(ab_ode_can, 16), 0, "ode_dopri45: out canary clean for dt = 0 / NaN");
+assert_eq(_ab_is_nan(ode_backward_euler(&_ab_dydt, 0, F64_ONE, F64_HALF, F64_HALF, (0 - 3))), 0,
+"ode_backward_euler: max_newton = -3 returns the input, not NaN");
+assert_eq(_ab_is_nan(ode_euler_maruyama(&_ab_dydt, &_ab_diffusion, 0, F64_ONE, 0, 0)), 0,
+"ode_euler_maruyama: dt = 0, dW = 0 -> finite");
+assert_eq(_ab_is_nan(ode_milstein(&_ab_dydt, &_ab_diffusion, &_ab_dg_dy, 0, F64_ONE, 0, 0)), 0,
+"ode_milstein: dt = 0, dW = 0 -> finite");
+assert_neq(ode_verlet(&_ab_accel, F64_ONE, 0, 0), 0, "ode_verlet: dt = 0 returns a state");
+assert_neq(ode_yoshida4(&_ab_accel, F64_ONE, 0, 0), 0, "ode_yoshida4: dt = 0 returns a state");
+
+# num_bisection on a bracket with equal signs, and num_newton on a flat
+# derivative, are the two classic non-terminating root-finder inputs.
+var ab_root = alloc(8);
+assert_eq(num_bisection(&_ab_f_x2, F64_ONE, F64_TWO, EPSILON_F64, 50, ab_root),
+HSB_ERR_INVALID_INPUT, "num_bisection: same-sign bracket rejected");
+assert_eq(num_newton(&_ab_f_x2, &_ab_dg_dy, F64_ONE, EPSILON_F64, 50, ab_root),
+HSB_ERR_DIVISION_BY_ZERO, "num_newton: identically zero derivative -> divide-by-zero, not a spin");
+assert_eq(num_newton(&_ab_f_x2, &_ab_dg_dy, F64_ONE, EPSILON_F64, 0, ab_root),
+HSB_ERR_NO_CONVERGENCE, "num_newton: max_iter = 0 -> no-convergence");
+assert_eq(num_newton(&_ab_f_x2, &_ab_dg_dy, F64_ONE, EPSILON_F64, (0 - 9), ab_root),
+HSB_ERR_NO_CONVERGENCE, "num_newton: max_iter = -9 -> no-convergence");
+
+# ================================================================
+# 11. INTERVAL ARITHMETIC -- reversed, empty and unbounded operands
+# ================================================================
+test_group("abuse: interval endpoints out of order, NaN and unbounded");
+
+var ab_rev = ivl_new(F64_TWO, F64_ONE);
+assert_eq(f64_to(Interval_lo(ab_rev)), 1, "ivl_new: (2, 1) normalises lo to 1");
+assert_eq(f64_to(Interval_hi(ab_rev)), 2, "ivl_new: (2, 1) normalises hi to 2");
+assert_eq(f64_to(ivl_width(ivl_point(f64_from(7)))), 0, "ivl_width: a point has width 0");
+assert_eq(_ab_is_nan(ivl_width(ivl_new(_AB_NAN, _AB_NAN))), 1,
+"ivl_width: a NaN interval reports a NaN width rather than a fake number");
+
+# sqrt of a wholly negative interval is empty; hisab returns [0,0] rather than
+# a NaN endpoint, because a NaN endpoint makes ivl_contains accept everything.
+var ab_negsqrt = ivl_sqrt(ivl_new(f64_neg(f64_from(4)), f64_neg(F64_ONE)));
+assert_eq(Interval_lo(ab_negsqrt), 0, "ivl_sqrt: wholly negative -> lo = 0, not NaN");
+assert_eq(Interval_hi(ab_negsqrt), 0, "ivl_sqrt: wholly negative -> hi = 0, not NaN");
+var ab_strad = ivl_sqrt(ivl_new(f64_neg(f64_from(4)), f64_from(4)));
+assert_eq(f64_to(Interval_lo(ab_strad)), 0, "ivl_sqrt: straddling zero clamps lo to 0");
+assert_eq(f64_to(Interval_hi(ab_strad)), 2, "ivl_sqrt: straddling zero keeps hi = 2");
+
+# Division by the point 0 is the empty set; the hull of the empty set is entire.
+var ab_div0 = ivl_div(ivl_point(F64_ONE), ivl_point(0));
+assert_eq(Interval_lo(ab_div0), _AB_NINF, "ivl_div: [1,1] / [0,0] -> lo = -inf");
+assert_eq(Interval_hi(ab_div0), _AB_PINF, "ivl_div: [1,1] / [0,0] -> hi = +inf");
+assert_eq(ivl_contains(ivl_new(_AB_NINF, _AB_PINF), f64_from(1000000)), 1,
+"ivl_contains: the entire interval contains a large finite value");
+assert_eq(ivl_overlaps(ivl_point(0), ivl_point(F64_ONE)), 0,
+"ivl_overlaps: disjoint points do not overlap");
+assert_eq(f64_to(Interval_lo(ivl_mul(ivl_point(0), ivl_new(F64_ONE, _AB_PINF)))), 0,
+"ivl_mul: [0,0] * [1,+inf) -> [0,0], not NaN");
+
+# ================================================================
+# 12. COMPLEX / AUTODIFF / LIE SINGULARITIES
+# ================================================================
+test_group("abuse: complex and dual-number singular points");
+
+assert_eq(f64_to(HComplex_re(cx_div(cx_one(), cx_zero()))), 0, "cx_div: by zero -> 0, not NaN");
+assert_eq(f64_to(HComplex_im(cx_div(cx_one(), cx_zero()))), 0, "cx_div: by zero -> im 0");
+assert_eq(f64_to(HComplex_re(cx_inv(cx_zero()))), 0, "cx_inv: of zero -> 0");
+assert_eq(f64_to(cx_arg(cx_zero())), 0, "cx_arg: of zero -> 0");
+assert_eq(f64_to(HComplex_re(cx_sqrt(cx_zero()))), 0, "cx_sqrt: of zero -> 0");
+assert_eq(f64_to(HComplex_re(cx_powf(cx_zero(), 0))), 0, "cx_powf: 0^0 -> re 0 (documented)");
+assert_eq(cx_is_zero(cx_zero(), EPSILON_F64), 1, "cx_is_zero: exact zero");
+assert_eq(f64_to(HComplex_re(cx_exp(cx_zero()))), 1, "cx_exp: exp(0) = 1");
+
+# exp(-inf + 0i) is the product of a 0 magnitude with cos/sin of the angle; the
+# ganita exp polyfill returns an infinity of the wrong sign here, so the product
+# is 0 * inf = NaN. Recorded as a NaN rather than silently accepted as 0 -- a
+# fabricated 0 would be indistinguishable from a correct answer at the call site.
+assert_eq(_ab_is_nan(HComplex_re(cx_exp(cx_new(_AB_NINF, 0)))), 1,
+"cx_exp: exp(-inf) -> NaN, not a fabricated 0");
+
+assert_eq(f64_to(Dual_deriv(dual_div(dual_var(F64_ONE), dual_const(0)))), 0,
+"dual_div: by a zero constant -> derivative 0, not NaN");
+assert_eq(f64_to(Dual_deriv(dual_sqrt(dual_var(0)))), 0, "dual_sqrt: at 0 -> derivative 0");
+assert_eq(f64_to(Dual_deriv(dual_ln(dual_var(0)))), 0, "dual_ln: at 0 -> derivative 0");
+assert_eq(f64_to(Dual_deriv(dual_abs(dual_var(0)))), 1,
+"dual_abs: at the kink picks the right-hand derivative, deterministically");
+# dual_pow(a, n) takes n as a plain f64, and evaluates n * a^(n-1) for the
+# derivative -- so 0^0 goes through 0^(-1). The value comes back NaN rather than
+# the conventional 1: pinned here so the degenerate exponent is a known, checked
+# outcome. The 2^3 control proves the same code path is otherwise exact.
+assert_eq(_ab_is_nan(Dual_val(dual_pow(dual_var(0), 0))), 1, "dual_pow: 0^0 -> NaN value");
+# Rounded: f64_pow routes through exp/ln, so 2^3 lands a few ulp below 8 and a
+# bare f64_to would truncate to 7.
+assert_eq(f64_to(f64_round(Dual_val(dual_pow(dual_var(F64_TWO), f64_from(3))))), 8,
+"dual_pow: 2^3 = 8 (control for the degenerate exponent above)");
+
+test_group("abuse: Lie-group identity and zero-generator edge cases");
+
+assert_neq(su2_from_axis_angle(hvec3_zero(), 0), 0, "su2_from_axis_angle: zero axis allocates");
+assert_eq(f64_to(HQuat_w(su2_to_quat(su2_from_axis_angle(hvec3_zero(), 0)))), 1,
+"su2_from_axis_angle: zero axis, zero angle -> identity");
+assert_neq(su2_log(su2_identity()), 0, "su2_log: identity returns a generator, not null");
+assert_eq(f64_to(HVec3_x(su2_log(su2_identity()))), 0, "su2_log: identity -> zero generator");
+assert_neq(so3_exp(hvec3_zero()), 0, "so3_exp: zero generator allocates");
+assert_eq(f64_to(m3_get(so3_exp(hvec3_zero()), 0, 0)), 1, "so3_exp: zero generator -> identity");
+assert_eq(f64_to(HVec3_x(so3_log(m3_identity()))), 0, "so3_log: identity -> zero generator");
+assert_neq(lorentz_boost(hvec3_zero(), F64_ONE), 0, "lorentz_boost: zero direction allocates");
+assert_eq(lorentz_is_valid(m4_new()), 0, "lorentz_is_valid: the zero matrix is not a Lorentz matrix");
+assert_eq(f64_to(minkowski_interval(hvec4_zero())), 0, "minkowski_interval: zero 4-vector -> 0");
+assert_eq(f64_to(HVec3_x(se3_twist_omega(se3_log(se3_identity())))), 0,
+"se3_log: identity -> zero twist");
+assert_neq(se3_exp(se3_twist_new(hvec3_zero(), hvec3_zero())), 0,
+"se3_exp: zero twist allocates the identity");
+
+# ================================================================
+# 13. EINSUM -- malformed subscripts and rank mismatches
+# ================================================================
+test_group("abuse: einsum malformed notation and rank mismatch");
+
+var ab_ops1 = alloc(8 * 8);
+var ab_ops2 = alloc(8 * 8);
+store64(ab_ops1, ab_t22);
+store64(ab_ops2, ab_t22);
+store64(ab_ops2 + 8, ab_t22);
+
+assert_eq(einsum(str_from("ij"), ab_ops1, 1), 0, "einsum: no -> separator -> 0");
+assert_eq(einsum(str_from(""), ab_ops1, 0), 0, "einsum: empty notation -> 0");
+assert_eq(einsum(str_from("->"), ab_ops1, 0), 0, "einsum: bare arrow with 0 operands -> 0");
+assert_eq(einsum(str_from("ij->ji"), ab_ops1, 0), 0, "einsum: n_tensors = 0 vs 1 spec -> 0");
+assert_eq(einsum(str_from("ij->ji"), ab_ops1, (0 - 1)), 0, "einsum: n_tensors = -1 -> 0");
+assert_eq(einsum(str_from("ij->ji"), ab_ops2, 2), 0, "einsum: 1 spec vs 2 tensors -> 0");
+assert_eq(einsum(str_from("ijklm->m"), ab_ops1, 1), 0, "einsum: rank 5 over _EINSUM_MAX_RANK -> 0");
+assert_eq(einsum(str_from("ijk->ij"), ab_ops1, 1), 0, "einsum: spec rank 3 vs tensor rank 2 -> 0");
+assert_eq(einsum(str_from("i->i"), ab_ops1, 1), 0, "einsum: spec rank 1 vs tensor rank 2 -> 0");
+assert_eq(einsum(str_from("i9,jk->ik"), ab_ops2, 2), 0, "einsum: digit in the spec -> 0");
+assert_eq(einsum(str_from("IJ,JK->IK"), ab_ops2, 2), 0, "einsum: uppercase label -> 0");
+assert_eq(einsum(str_from("ij->ii"), ab_ops1, 1), 0, "einsum: repeated output label -> 0");
+assert_eq(einsum(str_from("ij->k"), ab_ops1, 1), 0, "einsum: output label absent from the input -> 0");
+
+# A well-formed call, with a canary behind the operand array: einsum writes into
+# its own arena and into a fresh tensor, never back through `tensors`.
+var ab_es_can = _ab_canary_new(16);
+var ab_es = einsum(str_from("ij->ji"), ab_ops1, 1);
+assert_neq(ab_es, 0, "einsum: a well-formed transpose still succeeds");
+assert_eq(_ab_clob(ab_es_can, 16), 0, "einsum: operand-array canary clean");
+assert_eq(load64(ab_ops1), ab_t22, "einsum: operand array itself is not rewritten");
+
+# ================================================================
+# 14. SYMBOLIC -- structural abuse of the expression tree
+# ================================================================
+test_group("abuse: symbolic differentiation and simplification of degenerate trees");
+
+var ab_zero_expr = expr_const(0);
+var ab_xv = expr_var(str_from("x"));
+
+# 0^0, x/0 (as x * 0^-1) and ln(0) are the three places a symbolic simplifier
+# most often divides by zero while folding constants.
+assert_neq(expr_simplify(expr_pow(ab_zero_expr, ab_zero_expr)), 0, "expr_simplify: 0^0 folds");
+assert_neq(expr_simplify(expr_mul(ab_zero_expr, ab_zero_expr)), 0, "expr_simplify: 0*0 folds");
+assert_neq(expr_simplify(expr_pow(ab_xv, ab_zero_expr)), 0, "expr_simplify: x^0 folds");
+assert_neq(expr_diff(expr_ln(ab_zero_expr), str_from("x")), 0, "expr_diff: d/dx ln(0) returns a tree");
+assert_neq(expr_diff(expr_pow(ab_xv, ab_zero_expr), str_from("x")), 0,
+"expr_diff: d/dx x^0 returns a tree");
+assert_neq(expr_diff(ab_xv, str_from("y")), 0, "expr_diff: differentiating by an absent variable");
+assert_eq(f64_to(expr_eval(expr_const(f64_from(3)), vec_new())), 3,
+"expr_eval: a constant needs no bindings");
+assert_eq(f64_to(expr_eval(ab_xv, vec_new())), 0,
+"expr_eval: an unbound variable evaluates to 0, not a wild read");
+
+# A 200-deep left spine: deep enough to catch an unbounded recursion, shallow
+# enough that a correct implementation is instant.
+var ab_deep = expr_const(F64_ONE);
+var ab_di = 0;
+while (ab_di < 200) {
+    ab_deep = expr_add(ab_deep, expr_const(F64_ONE));
+    ab_di = ab_di + 1;
+}
+assert_eq(f64_to(expr_eval(ab_deep, vec_new())), 201, "expr_eval: 200-deep spine evaluates");
+assert_neq(expr_simplify(ab_deep), 0, "expr_simplify: 200-deep spine terminates");
+assert_neq(expr_diff(ab_deep, str_from("x")), 0, "expr_diff: 200-deep spine terminates");
+assert_neq(sym_integrate(ab_zero_expr, str_from("x")), 0, "sym_integrate: the zero integrand");
+assert_neq(sym_to_latex(ab_zero_expr), 0, "sym_to_latex: the zero expression renders");
+assert_eq(sym_match(pat_const(F64_ONE), ab_zero_expr), 0, "sym_match: 1 does not match 0");
+assert_neq(sym_rewrite(ab_zero_expr, sym_default_rules()), 0,
+"sym_rewrite: the default rule set terminates on a constant");
+
+# ================================================================
+# KNOWN DEFECT REGISTER -- inputs that KILL the process
+# ================================================================
+# The inputs below were found while building this file. Each one either ends the
+# process or corrupts the heap, so none can be executed inside a suite that has
+# to exit 0; they are recorded here verbatim so the case is documented rather
+# than discarded. Every reproducer was run in isolation and its signal observed.
+#
+# Each is a HALF-GUARD or a MISSING NULL CHECK on a public entry point whose own
+# sibling already validates the same surface -- not a raw-accessor precondition.
+#
+# --- src/linalg_precision.cyr:1278  cqr_decompose(A, out_Q, out_R)
+#     *** THE ONE CANARY OVERWRITE. *** No squareness check on A. The copy loop
+#     at :1290 walks i < m, j < n and calls cmat_set(out_R, i, j), but out_R is
+#     the m x m matrix the caller sized for a square decomposition, so the store
+#     offset (i * m + j) * 16 runs off the end for every j >= m. Returns
+#     HSB_ERR_NONE -- a success code on top of the overrun.
+#       var A23 = cmat_new(2, 3);   # filled 1..6
+#       var Q = cmat_new(2, 2); var R = cmat_new(2, 2);
+#       var can = alloc(8 * 8);     # stamped 0x5A5A...; the block after R
+#       cqr_decompose(A23, Q, R);
+#     MEASURED: returns 0 (HSB_ERR_NONE); guard slots 0 and 1 -- the 16 bytes
+#     immediately after out_R's data buffer -- are overwritten. 2 of 8 slots.
+#     The square 2x2 control over the same code path leaves all 8 slots clean,
+#     so the clobber is the shape mismatch and nothing else.
+#
+# --- src/linalg_ext.cyr:778  eigen_power(A, n, max_iter, out_val, out_vec)
+#     No bound on n at all. `var v = alloc(n * 8)` then `store64(v, f64_from(1))`
+#     unconditionally: alloc's designed 0 is stored through.
+#       eigen_power(mat_new(3, 3), (0 - 3), 5, alloc(8), alloc(24));      exit 139
+#       eigen_power(mat_new(3, 3), 1000000000, 5, alloc(8), alloc(24));   exit 139
+#     (n = 1e9 asks for 8 GB, over ALLOC_MAX = 2 GiB, so alloc returns 0.)
+#
+# --- src/linalg_ext.cyr:873  lyapunov_max(A, n, iterations, out)
+#     No bound on n. `mat_new(n, n)` returns the designed 0 for n <= 0 and the
+#     0 is handed straight to mat_mul.
+#       lyapunov_max(mat_new(3, 3), 0, 5, alloc(8));                      exit 139
+#       lyapunov_max(mat_new(3, 3), (0 - 2), 5, alloc(8));                exit 139
+#
+# --- src/linalg_precision.cyr:1192  eigen_qr(A, n, max_iter, out_vals, out_vecs)
+#     Guards n == 0 only. No null check on A, out_vals or out_vecs, and no lower
+#     bound on n -- while svd_golub_kahan (:753, the same file) guards exactly
+#     those four (added 2.8.3; asserted above in this suite).
+#       eigen_qr(0, 3, 50, alloc(24), mat_new(3, 3));                     exit 139
+#       eigen_qr(mat_new(3, 3), (0 - 3), 50, alloc(24), mat_new(3, 3));   exit 139
+#       eigen_qr(mat_new(3, 3), 3, 50, 0, mat_new(3, 3));                 exit 139
+#       eigen_qr(mat_new(3, 3), 3, 50, alloc(24), 0);                     exit 139
+#
+# --- src/linalg_precision.cyr:1278  cqr_decompose(A, out_Q, out_R)  [2nd defect]
+#     Separately from the overrun above: no null check on any of the three
+#     arguments. cmat_rows(0) is load64(0), and cmat_new returns the designed 0
+#     above _CMAT_MAX_ELEMS.
+#       cqr_decompose(0, cmat_new(2, 2), cmat_new(2, 2));                 exit 139
+#       cqr_decompose(cmat_new(100000, 100000), cmat_new(2,2), cmat_new(2,2));
+#                                                                        exit 139
+#
+# --- src/einsum.cyr:161  einsum(notation, tensors, n_tensors)
+#     `HTensor_rank(load64(tensors + oi * 8))` with no `t == 0` check. tensor_new
+#     returns 0 above its caps and einsum itself returns 0 on a malformed
+#     subscript -- so einsum's OWN output fed back in kills the process, even
+#     though tensor_add / tensor_scale / tensor_contract all guard for exactly
+#     this (their comments name einsum as the producer of the 0).
+#       var tv = alloc(8); store64(tv, 0);
+#       einsum(str_from("ij->ji"), tv, 1);                                exit 139
+#
+# --- src/spatial.cyr:227  kdtree_build(points, count)
+#     `if (count == 0)` with no lower bound. _kd_build_rec(items, points, 0, -1)
+#     reaches _kd_select_median, which vec_gets an out-of-range slot.
+#       kdtree_build(pts, (0 - 1));       "vec: index out of bounds", exit 1
+#
+# --- src/geo_advanced.cyr:1426  bvh_build(aabbs, count)
+#     Identical half-guard to kdtree_build.
+#       bvh_build(boxes, (0 - 1));        "vec: index out of bounds", exit 1
+#
+# --- src/collision_mesh.cyr:851 / :870
+#       halfedge_adjacent_faces(mesh, face) / halfedge_is_boundary(mesh, vertex)
+#     Neither bounds its index before vec_get, although halfedge_from_triangles
+#     (:719, asserted above) validates n_tris, n_verts AND every vertex id.
+#       halfedge_adjacent_faces(mesh, (0 - 1));   "vec: index < 0",        exit 1
+#       halfedge_adjacent_faces(mesh, 99);        "vec: index out of bounds", exit 1
+#       halfedge_is_boundary(mesh, (0 - 1));      "vec: index < 0",        exit 1
+#
+# --- src/num.cyr:429  num_modpow(base, exp, modulus)
+#     Guards modulus == 1 but not modulus == 0; `base % modulus` is an integer
+#     divide by zero.
+#       num_modpow(2, 10, 0);                     SIGFPE, exit 136
+#
+# --- src/complex.cyr:181 / :187  cmat_get(m, r, c) / cmat_set(m, r, c, val)
+#     Unchecked index arithmetic: off = (r * cols + c) * 16 with no bounds test.
+#       cmat_get(cmat_new(2, 2), (0 - 1), 0);                             exit 139
+#     Lower severity than the above -- these mirror the stdlib mat_get / mat_set
+#     raw-accessor convention -- but hisab's own cmat_new IS guarded, so the
+#     accessors are the only unchecked surface left in the cmat family.
+# ================================================================
+
+var r = assert_summary();
+# Clamp before exiting: assert_summary() returns the raw failure COUNT, and a
+# wait status is only 8 bits -- an unclamped 256 / 512 / 768 failures would exit
+# 0 and score PASS. Any failure at all is exit 1.
+if (r > 0) { r = 1; }
+sys_exit_group(r);

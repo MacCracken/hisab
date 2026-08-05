@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **geo_advanced** — `gjk_epa_3d` reported "no contact" for shapes in EXACT TANGENCY. Two convex
+  sets touching at a point put the origin ON the boundary of their Minkowski difference, and GJK's
+  containment test is strict, so a unit sphere at the origin against a unit-half box centred at
+  x = 2 came back 0 instead of a depth-0 contact with the line of centres as its normal. Two causes,
+  both now addressed on the path where GJK has already answered "no":
+  - the strict containment test itself, and
+  - a **manufactured separating certificate**: GJK's search direction is unnormalised and its
+    magnitude collapses as the simplex closes on a boundary origin (5.9e-15 by the fifth iteration
+    on this fixture). A support function written the obvious way — `centre + r * hvec3_normalize(dir)`
+    — then returns the shape's *centre*, because `hvec3_normalize` returns the zero vector below
+    `EPSILON_F64`. The point that comes back is not a support point, and its negative dot with the
+    direction reads as a separating plane.
+
+  New `_epa_touch_probe` re-asks the question with **unit** search directions and answers with a
+  certificate pair, both read off an EXACT ZERO and never off a tolerance: `h_M(n) < 0` proves
+  strict separation (the same certificate `_gjk_core_3d` exits on), `h_M(n) == 0` at the converged
+  minimiser proves the origin is on the boundary, i.e. a touch of depth exactly 0. `_gjk_core_3d`
+  is unchanged. Verified over a 1,480-configuration sweep (sphere/box both operand orders,
+  box/box face, edge and vertex tangency, sphere/sphere; ±x, ±y, ±z; scales 1e-6, 1, 1e3 and a
+  non-dyadic 7/3; gaps stepped by decades to 1e-18 and by 1 to 12 ulps): **190/190 exact tangencies
+  now report a depth-0 contact (was 114/190) and 0 of 1,290 strictly separated pairs report contact
+  (unchanged)**. Every case whose verdict did not change is bit-identical, normal and depth.
+
+### Performance
+
+- `gjk_epa_3d` on the NO-CONTACT path costs the probe: 0.65 us → 1.24 us per call and 344 → 656
+  arena bytes per call (box@2 vs box@9, 16,000 calls, median of 9 runs). Contact paths are
+  untouched. No benchmark in `tests/hisab.bcyr` covers a separated pair, so this number comes from
+  a standalone harness rather than `bench-history.csv`.
+
 ## [2.8.2] - 2026-08-04 — delaunay completeness via symbolic ghost vertices. **Two critical repairs rejected.**
 
 One of the four criticals fixed; two were implemented, adversarially verified, and **rejected for

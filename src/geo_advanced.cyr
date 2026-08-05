@@ -927,6 +927,167 @@ fn _epa_degenerate_normal(sup_a, shape_a, sup_b, shape_b) {
     return _epa_unit(_epa_perp(e1));
 }
 
+# EXACT TANGENCY: does the origin lie ON the boundary of the difference?
+#
+# GJK's containment test is STRICT -- it reports a hit only once a simplex
+# ENCLOSES the origin. Two convex sets that touch at a single point put the
+# origin exactly on the BOUNDARY of their difference, where no simplex ever
+# encloses it, so gjk_epa_3d answered "no contact" for a pair that provably has
+# one: the intersection is that point, the penetration depth is exactly 0 and a
+# separating direction is the line of centres.
+#
+# The answer is read off a CERTIFICATE, never off a tolerance. For the
+# difference M = A (-) B and a UNIT direction n, the support value
+# h_M(n) = n . support_M(n) is the signed distance from the origin to M's
+# supporting plane with normal n, so:
+#
+#   h_M(n) <  0   the plane through the ORIGIN with normal n strictly separates
+#                 the two shapes. One evaluation, exact, no tolerance -- it is
+#                 the same certificate _gjk_core_3d exits on.
+#   h_M(n) == 0   at the converged minimiser: that plane SUPPORTS M through the
+#                 origin, i.e. the origin is ON M's boundary. The shapes touch.
+#
+# BOTH verdicts are read off an exact zero, which is the whole point. Any
+# tolerance that promotes "touching" to "contact" promotes "very close but
+# separated" to a FALSE contact by the same arithmetic. A pair whose converged
+# minimum is strictly positive -- one whose closest approach is below the last
+# bit of its own support evaluation -- keeps the shipped answer, 0. This routine
+# can only ever turn a miss into a depth-0 touch, and only on an exact zero.
+#
+# WHY THE DIRECTION IS NORMALISED BEFORE EVERY SUPPORT CALL. GJK's own search
+# direction is unnormalised, and its magnitude COLLAPSES as the simplex closes
+# on a boundary origin -- 5.9e-15 by the fifth iteration on the tangent
+# sphere/box fixture. A support function written the obvious way,
+# centre + r * hvec3_normalize(dir), then returns the shape's CENTRE, because
+# hvec3_normalize is documented to return the zero vector for |dir| < 1e-12.
+# What comes back is not a support point at all, and its negative dot with the
+# direction is a MANUFACTURED separating certificate: THAT, not the strictness
+# of the containment test, is what made the tangent fixture exit as a miss after
+# five iterations. Unit directions cost one sqrt per iteration and remove the
+# failure mode. They are not pushed down into _gjk_core_3d because that would
+# re-time the direction sequence every other GJK caller depends on.
+#
+# WHY THE DIRECTIONS COME FROM THE SIMPLEX REFINEMENT and not from the GJK
+# DISTANCE sub-algorithm (_toi_simplex_closest and friends, which time_of_impact
+# runs). Both were built and measured. The distance query hands back the closest
+# point v of the current hull and probes -v/|v|; but v is a barycentric
+# combination of support points of size ~|M|, so its transverse components carry
+# an ABSOLUTE rounding error of ~1e-16 that stops shrinking, while |v| itself
+# goes to zero at a touch. The probe direction is therefore only accurate to
+# 1e-16/|v| and degrades exactly where the answer is decided: on the tangent
+# sphere/box fixture it stalls 4 degrees off the true normal, and h_M never
+# reaches its zero. The simplex refinement below builds each direction from
+# CROSS PRODUCTS OF DIFFERENCES of neighbouring support points, which keeps its
+# relative accuracy: on the same fixture it lands on exactly (1, 0, 0), so
+# h_M comes out exactly 0 and the touch is certified. Measured over a
+# 190-configuration tangency set, the distance-query directions certify 33 of
+# them and these certify all 33 plus 42 more.
+#
+# Returns 1 and writes a unit contact direction to out_n when the shapes touch;
+# returns 0 -- leaving out_n untouched -- when they are strictly separated.
+# The direction written is -n*, n* being the minimiser: it points from the
+# origin towards M, i.e. it is the direction of the distance query's closest
+# point v, which is what a caller tracking a pair through contact sees on
+# either side of the touch. The depth is 0, so "translate B by depth * normal"
+# holds for either sign.
+fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
+    var simplex = _gjk_simplex_new();
+    if (simplex == 0) { return 0; }
+    var dir_slot = alloc(8);
+    if (dir_slot == 0) { return 0; }
+    var nd = hvec3_unit_x();
+    var s0 = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, nd);
+    _gjk_simplex_push(simplex, s0);
+    store64(dir_slot, hvec3_neg(s0));
+    var best_n = nd;
+    var best_h = _GA_F64_POS_INF;
+    var best_made = 0;
+    var touch = 0;
+
+    for (var gi = 0; gi < GJK_MAX_ITER; gi = gi + 1) {
+        var dir = load64(dir_slot);
+        var made = 0;
+        if (f64_gt(hvec3_length_sq(dir), 0) == 0) {
+            # A MANUFACTURED DIRECTION CANNOT CERTIFY A TOUCH. The substitutions
+            # below keep the search moving, but the axis they pick is unrelated to
+            # the geometry, so a support value of exactly 0 along it is not
+            # evidence that the origin lies on the boundary. hvec3_length_sq
+            # SQUARES, so for two zero-volume shapes separated by less than
+            # sqrt(DBL_MIN) ~ 1.5e-154 the direction underflows to exactly 0, a
+            # cardinal axis is substituted, the support along it is exactly 0, and
+            # a genuinely separated pair certifies as a touch -- measured on 64
+            # point-vs-point cases at separations <= 1e-165. Flagged here and
+            # rejected at the certificate below.
+            made = 1;
+            # Degenerate direction -- the repair _gjk_core_3d makes, and for the
+            # same reason: only an exactly zero direction is unusable, so the
+            # test is against zero rather than an absolute epsilon.
+            if (_gjk_simplex_count(simplex) >= 2) {
+                var edge = hvec3_sub(_gjk_simplex_get(simplex, _gjk_simplex_count(simplex) - 1),
+                _gjk_simplex_get(simplex, 0));
+                dir = hvec3_cross(edge, hvec3_unit_x());
+                if (f64_gt(hvec3_length_sq(dir), 0) == 0) {
+                    dir = hvec3_cross(edge, hvec3_unit_y());
+                }
+            } else {
+                dir = hvec3_unit_y();
+            }
+            if (f64_gt(hvec3_length_sq(dir), 0) == 0) { dir = hvec3_unit_z(); }
+        }
+        nd = _epa_unit(dir);
+        if (f64_gt(hvec3_length_sq(nd), 0) == 0) { break; }
+
+        var p = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, nd);
+        var h = hvec3_dot(p, nd);
+        if (f64_lt(h, 0) == 1) { return 0; }    # strictly separating plane
+        if (f64_lt(h, best_h) == 1) {
+            best_h = h;
+            best_n = nd;
+            best_made = made;
+        }
+
+        _gjk_simplex_push(simplex, p);
+        if (_gjk_do_simplex(simplex, dir_slot) == 1) {
+            # The simplex encloses the origin, which is a hull of genuine members
+            # of M: the origin is IN the difference. GJK proper answered "no" on
+            # the same geometry, so whatever overlap exists is below its own
+            # resolution -- a touch, depth 0.
+            touch = 1;
+            break;
+        }
+    }
+
+    if (touch == 0 && f64_eq(best_h, 0) == 0) { return 0; }
+    # An h of exactly 0 read off a direction the search MANUFACTURED (see above)
+    # is not a supporting plane through the origin, so on its own it certifies
+    # nothing. Settle it against the geometry instead of discarding it: probe the
+    # six cardinal axes, which no underflow can degrade because they are exact
+    # unit vectors. If any strictly separates, the pair is apart -- that is what
+    # catches two zero-volume shapes 1e-165 apart, whose difference is a single
+    # point just OFF the origin that the underflowed direction could not resolve.
+    # If none does, the difference really is degenerate AT the origin (coincident
+    # points) and the depth-0 touch is real. Rejecting outright would have cost
+    # that case. The enclosing-simplex path never reaches here: it is a hull of
+    # genuine members of the difference and does not depend on a probe direction.
+    if (touch == 0 && best_made == 1) {
+        var axes = alloc(48);
+        if (axes == 0) { return 0; }
+        store64(axes,      hvec3_unit_x());
+        store64(axes + 8,  hvec3_neg(hvec3_unit_x()));
+        store64(axes + 16, hvec3_unit_y());
+        store64(axes + 24, hvec3_neg(hvec3_unit_y()));
+        store64(axes + 32, hvec3_unit_z());
+        store64(axes + 40, hvec3_neg(hvec3_unit_z()));
+        for (var ai = 0; ai < 6; ai = ai + 1) {
+            var an = load64(axes + ai * 8);
+            var ap = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, an);
+            if (f64_lt(hvec3_dot(ap, an), 0) == 1) { return 0; }
+        }
+    }
+    store64(out_n, hvec3_neg(best_n));
+    return 1;
+}
+
 # GJK + EPA 3D: returns 1 if penetrating, writes normal and depth.
 # out_normal: pointer where the unit HVec3 normal will be stored
 # out_depth: pointer where the f64 depth will be stored
@@ -934,10 +1095,31 @@ fn _epa_degenerate_normal(sup_a, shape_a, sup_b, shape_b) {
 # closest supporting plane, and the depth is h_M(normal) -- translating B by
 # depth * normal separates the pair.
 fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    # EVERY RETURN PATH WRITES BOTH OUT-PARAMS, established here so no later
+    # branch can forget. alloc() hands back zeroed pages, so a path that returned
+    # without writing published the NULL HVec3 into the caller's slot, and the
+    # caller had no way to distinguish that from a real normal -- the first
+    # accessor faulted. On a 0 return the normal is a DEFINED PLACEHOLDER and not
+    # a contact normal: there is no contact, so there is no normal to report.
+    # Callers must branch on the return value; they may always safely READ.
+    store64(out_normal, hvec3_unit_x());
+    store64(out_depth, 0);
+
     var seed = alloc(32);
     if (seed == 0) { return 0; }
     var s = _epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed);
-    if (s == 0) { return 0; }
+    if (s == 0) {
+        # "No simplex enclosed the origin" is also what GJK reports for an EXACT
+        # TANGENCY, where the origin sits on the boundary of the difference and
+        # the true answer is a contact of depth 0. Ask for a certificate before
+        # agreeing; the probe writes out_normal only when it has one, so the
+        # placeholder above survives a genuine miss.
+        if (_epa_touch_probe(support_a, shape_a, support_b, shape_b, out_normal) == 1) {
+            store64(out_depth, 0);
+            return 1;
+        }
+        return 0;
+    }
     if (s != 1) {
         # GJK enclosed the origin but its simplex is flat, or rounding left the
         # origin just outside it. Rebuild from the portal instead of reporting

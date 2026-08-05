@@ -116,6 +116,7 @@ enum SysNr {
     SYS_LINK = 86;
     SYS_OPENAT = 257;
     SYS_MKDIRAT = 258;
+    SYS_FCHOWNAT = 260;
     SYS_NEWFSTATAT = 262;
     SYS_UNLINKAT = 263;
     SYS_RENAMEAT = 264;
@@ -206,20 +207,36 @@ enum SigAction {
 }
 
 # ================================================================
-# struct stat — DARWIN x86_64 layout. st_size sits at offset 72 in the
-# struct the BSD stat syscall fills (empirically dumped on real macOS,
-# NOT the SDK header — see cbt/deps.cyr _file_size + the CHANGELOG
-# [6.0.41] st_size-at-72 precedent). STAT_BUFSZ is 144 to match the
-# other peers' buffer contract.
+# struct stat — DARWIN x86_64 layout, the LEGACY (non-INODE64) struct that
+# syscall 188 fills. The backend maps stat(4) → Darwin 188 via
+# `_msx(S, 4, 0x20000BC)` in backend/x86/emit.cyr, NOT to stat64 (338), so
+# these must be 188's offsets.
+#
+# ⛔ v6.5.7 — THIS ENUM WAS A MIX OF TWO STRUCTS AND MOSTLY WRONG. Only
+# STAT_SIZE was ever corrected (v6.0.41, empirically); MODE / NLINK / UID / GID /
+# MTIME kept **stat64** offsets, which describe a different struct entirely. So on
+# macOS-x86 `STAT_MODE` read the low half of st_ino — every mode test silently
+# false — and `STAT_MTIME` read mtime's NANOSECONDS as its seconds. Nothing
+# noticed because nothing on the x86-macOS path read a mode until `_xdir_exists`
+# did this release; `cbt/deps.cyr:_file_size` uses STAT_SIZE and was fine, which is
+# exactly why the half-fix looked complete.
+#
+# Re-dumped on real ach (Intel, 13.7.8) against a 0755 directory — st_mode came
+# back at offset 8 as 0x241ED, i.e. 0x41ED (S_IFDIR|0755) with st_nlink=2 packed
+# in the high half, since mode_t/nlink_t are u16 here:
+#   dev@0(4) ino@4(4) mode@8(2) nlink@10(2) uid@12 gid@16 rdev@20
+#   atime@24 mtime@40 ctime@56 (each timespec: sec@+0, nsec@+8) size@72
+#   blocks@80 blksize@88
+# STAT_BUFSZ stays 144 to match the other peers' buffer contract.
 # ================================================================
 enum Stat {
-    STAT_MODE = 4;
-    STAT_NLINK = 6;
-    STAT_UID = 16;
-    STAT_GID = 20;
+    STAT_MODE = 8;
+    STAT_NLINK = 10;
+    STAT_UID = 12;
+    STAT_GID = 16;
     STAT_SIZE = 72;
-    STAT_MTIME = 48;
-    STAT_MTIME_NSEC = 56;
+    STAT_MTIME = 40;
+    STAT_MTIME_NSEC = 48;
     STAT_BUFSZ = 144;
 }
 
@@ -335,6 +352,23 @@ fn sys_rmdir(path): i64 {
 # Delete a file.
 fn sys_unlink(path): i64 {
     return syscall(SYS_UNLINK, path);
+}
+
+# Change a file's owner/group, relative to `dirfd`. The ONE wrapped primitive of
+# the chown family: with AT_FDCWD + AT_SYMLINK_NOFOLLOW it gives lchown semantics,
+# with AT_FDCWD + 0 it gives chown, and with a real dirfd it gives the *at form —
+# so wrapping the legacy trio separately buys nothing. Returns 0, or -errno.
+#
+# NOT AVAILABLE ON aarch64 (Linux or macOS-arm64), by construction rather than
+# oversight: aarch64's native fchownat is 54, which the backend's setsockopt shim
+# (`54 -> 208`, src/backend/aarch64/emit.cyr:840) unconditionally rewrites, and that
+# shim is load-bearing for 51 ecosystem repos incl. consumer-authored source. The
+# usual house fallback (use the x86 number, 260) collides with aarch64's own
+# SYS_WAIT4 = 260. See the disproven-steps banner on roadmap.md's W1 item 1 — the
+# aarch64 arm needs a sentinel-number decision and stubs to -ENOSYS until then.
+# CHANGELOG [6.5.7]
+fn sys_fchownat(dirfd, path, uid, gid, flags): i64 {
+    return syscall(SYS_FCHOWNAT, dirfd, path, uid, gid, flags);
 }
 
 # Create a symbolic link at `linkpath` pointing to `target`.

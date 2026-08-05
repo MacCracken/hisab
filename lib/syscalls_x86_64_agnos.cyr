@@ -2,8 +2,23 @@
 # Usage: include "lib/syscalls.cyr" (the selector picks this peer when
 #        CYRIUS_TARGET_AGNOS is defined; do NOT include directly).
 #
-# Faithful mirror of agnos/docs/development/agnos-userland-abi.md
-# (agnos 1.41.x). STANDALONE — does NOT include syscalls_linux_common.cyr:
+# Mirrors agnos's SYSCALL DISPATCH — `agnos/kernel/core/syscall.cyr` — which is the
+# single canonical source. `agnos/docs/development/agnos-userland-abi.md` is a
+# secondary reference: useful, but it documents 65 of the kernel's 96 arms and is
+# NOT authority.
+#
+# ⛔ v6.5.7 — this header used to read "faithful mirror of …/agnos-userland-abi.md",
+# and that doc in turn names "the cyrius syscalls_x86_64_agnos.cyr peer" as part of
+# ITS authority. For agnos syscalls 45-59 the chain was doc → cyrius → doc:
+# **neither file was canonical and each named the other**, so a wrong number
+# introduced in either could then be "verified" against the other. The kernel
+# dispatch is the tiebreak, and always was — §5 below already said so; the header
+# contradicted it. (Verified at agnos 1.56.39 / cycc 6.5.6: 96 kernel arms #0-#95,
+# 96 SysNrAgnos constants, ZERO gaps — this file is complete and correct; only its
+# stated provenance was wrong. The old `(agnos 1.41.x)` stamp was 15 minors stale,
+# which is worse than no stamp because it invites distrust of a file that is right.)
+#
+# STANDALONE — does NOT include syscalls_linux_common.cyr:
 # agnos has its own syscall numbers, exit=0 (not Linux 60), the a4=r10
 # 4-arg convention (§1a), AO_* open flags (NOT Linux O_*, §3.3), and the
 # explicit-length invariant (every path arg carries its length — no
@@ -11,10 +26,27 @@
 # x86_64-Linux (rax=num, rdi/rsi/rdx/r10 = a1..a4), so the syscall
 # instruction emit is unchanged — only the NUMBERS differ.
 #
-# RE-FREEZE RULE (§5): the agnos kernel is canonical; this file mirrors
-# the doc. If a number / signature / struct layout changes in the doc's
-# §2/§3/§4, update this file in the same change. Return convention:
-# rax >= 0 on success, -1 on error (NOT Linux -errno).
+# RE-FREEZE RULE (§5): the agnos KERNEL is canonical — `kernel/core/syscall.cyr`.
+# If a number / signature / struct layout changes there, update this file in the
+# same change; if the ABI doc disagrees with the kernel, the kernel wins and the
+# doc is the bug. Return convention: rax >= 0 on success, -1 on error (NOT
+# Linux -errno).
+#
+# ⚠ #96 / #97 (agnos, assigned by operator ruling 2026-08-05; next free = #98).
+# Neither may be swapped on first-come grounds.
+#   #97 = chan_op — MINTED at cyrius 6.5.8. The kernel arm shipped in agnos 1.56.40
+#                   (`kernel/core/syscall.cyr:7620`, `if (num == 97)`), with all five
+#                   ops CAPS/MINT/SEND/RECV/CLOSE dispatching and `CH_OP_SUPPORTED`
+#                   = 0x1F advertising exactly those. Verified by reading the kernel,
+#                   not the ABI doc — see the RE-FREEZE RULE above.
+#   #96 = fork    — STILL NOT MINTED. No dispatch arm exists in agnos 1.56.40
+#                   (`grep 'num == 96'` finds nothing). Do NOT add the constant until
+#                   it does: on agnos an unknown `num` falls THROUGH the dispatch
+#                   chain and the caller reads the fall-through value as DATA, so a
+#                   minted-but-unimplemented constant is strictly worse than an absent
+#                   one — and a host build of the same consumer looks healthy either
+#                   way, so nothing off-target catches it. Gated by
+#                   tests/syscall_wrapper_pass.sh axis 5.
 
 # ================================================================
 # Syscall numbers — §2 FROZEN (0-28) + §3 (29-33)
@@ -109,6 +141,79 @@ enum SysNrAgnos {
     #   **EXIT_GROUP on aarch64 — a raw syscall(94) TERMINATES THE PROCESS**)
     SYS_UPTIME_US        = 95;    # uptime_us() → µs since calibration / -1 (UMASK on x86 — nullary here, so the
     #   Linux call would read a garbage mask and SUCCEED, returning the old one)
+    # v6.5.8 — the local-IPC channel band. ONE syscall, op-dispatched on arg1, which is
+    # the same `MDO_OP_SUPPORTED` shape that grew #93 across a whole arc with no ABI
+    # break. (#96 fork is NOT minted — see the header; no kernel arm exists yet.)
+    SYS_CHAN_OP          = 97;    # chan_op(op, a1, a2, a3) → 0/len / negative CH_E_*
+}
+
+# ── Local-IPC channel band (agnos 1.56.40, `#97 chan_op`) ───────────
+# agnos is replacing TCP-on-loopback as the desktop's control transport with a
+# kernel-owned channel band. Values mirror kernel/core/syscall.cyr:4556-4574 — keep
+# them in lockstep with that file, it is canonical.
+#
+# ⭐ A CHANNEL IS MINTED AS A PAIR AND HAS NO NAME: MINT hands back both ends or
+# nothing. That deletes the entire unlink-before-bind race class AF_UNIX carries —
+# there is no name for a second process to bind first, so "whoever binds the port
+# first owns the display protocol and every keystroke on it" cannot be reproduced.
+enum ChanOp {
+    CH_CAPS   = 0x00;   # (out_uva, out_len >= 16) → 0; writes the caps block
+    CH_MINT   = 0x01;   # (out_uva) → 0; writes TWO fds (16 B) — a pair, never one end
+    CH_SEND   = 0x02;   # (fd, buf, len <= 64) → len / negative CH_E_*
+    CH_RECV   = 0x03;   # (fd, buf, cap) → len / -CH_E_WOULDBLOCK / -CH_E_PEERGONE
+    CH_CLOSE  = 0x04;   # (fd) → 0
+}
+
+# ⚠ WOULDBLOCK and PEERGONE are per-RECORD RESULTS, not failures — a poll batch that
+# aborts on them is wrong. The kernel comments say so explicitly.
+enum ChanErr {
+    CH_E_BADOP       = 2;   # unknown, reserved, or not implemented in THIS kernel
+    CH_E_OUTBUF      = 3;   # CAPS out_uva/out_len invalid
+    CH_E_NOREGION    = 4;   # the 2 MB region is absent or unreachable from this CR3
+    CH_E_BADFD       = 5;   # not a channel fd, or authority failed (incl. an INHERITED claim)
+    CH_E_ARG         = 6;   # bad buffer / length
+    CH_E_FULL        = 7;   # no free channel
+    CH_E_WOULDBLOCK  = 8;   # per-record result
+    CH_E_PEERGONE    = 9;   # per-record result
+}
+
+# ⛔ NEGOTIATE ON THE CAPS MASK, DO NOT ASSUME. One bit per IMPLEMENTED op; a merely
+# reserved op reads 0. Advertising an op the kernel cannot run is exactly how a client
+# "works" against a kernel that cannot serve it, so a client that skips CAPS and calls
+# SEND blind is relying on a kernel version it never checked.
+# Caps block layout: +0 op-support mask (u32) · +4 region pages (u32) · +8 region
+# reachable (u64, a LIVE probe under the CALLER's CR3, not a boot-time cached answer).
+var CH_CAPS_BUFSZ = 16;
+
+# ⚠ THE `sys_chan_` PREFIX IS DELIBERATE AND MUST NOT BE SHORTENED. `chan_send`,
+# `chan_recv`, `chan_close` and `chan_new` are ALREADY the in-process MPSC thread
+# channel in lib/thread.cyr; cyrius resolves duplicate fns last-definition-wins, so a
+# bare `chan_send` here would silently replace the thread channel's for any consumer
+# including both files, on agnos only. Different transport, different namespace.
+fn sys_chan_caps(out, outlen): i64 {
+    return syscall(SYS_CHAN_OP, CH_CAPS, out, outlen);
+}
+
+# Mint a channel PAIR. `out` must be a 16-byte buffer; receives two fds.
+fn sys_chan_mint(out): i64 {
+    return syscall(SYS_CHAN_OP, CH_MINT, out);
+}
+
+# Send up to 64 bytes as one record. Returns the length sent, or a negative CH_E_*.
+fn sys_chan_send(fd, buf, len): i64 {
+    return syscall(SYS_CHAN_OP, CH_SEND, fd, buf, len);
+}
+
+# Receive one record. Returns its length, or -CH_E_WOULDBLOCK / -CH_E_PEERGONE, both
+# of which are RESULTS to handle rather than errors to abort on.
+fn sys_chan_recv(fd, buf, cap): i64 {
+    return syscall(SYS_CHAN_OP, CH_RECV, fd, buf, cap);
+}
+
+# Close one END of a channel. The peer stays open and observes -CH_E_PEERGONE on its
+# next RECV, which is a result to handle rather than an error to abort on.
+fn sys_chan_close(fd): i64 {
+    return syscall(SYS_CHAN_OP, CH_CLOSE, fd);
 }
 
 # ── GPU recovery arms (agnos 3D arc RUNG 5) ────────────────────
@@ -313,6 +418,33 @@ fn sys_exit(code): i64 { return syscall(SYS_EXIT, code); }
 # epilogue can call one name on every target rather than #ifdef'ing.
 # CHANGELOG [6.5.6]
 fn sys_exit_group(code): i64 { return syscall(SYS_EXIT, code); }
+
+# Change the working directory — NOT IMPLEMENTED on agnos.
+#
+# agnos ring-3 has no cwd concept and no chdir number, so this returns
+# -ENOSYS (-38) rather than mis-dispatching to whatever occupies the Linux
+# number. An EXPLICIT stub is the point: without it a consumer calling
+# sys_chdir gets a link error on agnos only, which surfaces as "the stdlib
+# does not build for agnos" rather than "this call is unavailable here".
+# CHANGELOG [6.5.7]
+fn sys_chdir(path): i64 { return 0 - 38; }
+
+# fchownat — NOT IMPLEMENTED on agnos. Returns -ENOSYS (-38).
+#
+# agnos has no chown family at all. An EXPLICIT stub, not a missing symbol, and
+# NOT a raw number: two of the agnos 92-95 band TERMINATE THE CALLER on ARM, so
+# guessing a number here is the worst available option. CHANGELOG [6.5.7]
+fn sys_fchownat(dirfd, path, uid, gid, flags): i64 { return 0 - 38; }
+
+# at-family constants. The Linux values, defined here so the PORTABLE surface is
+# complete: this peer is STANDALONE (it does not include syscalls_linux_common.cyr,
+# where these live for the Linux/macOS peers), so without them a consumer calling
+# sys_fchownat(AT_FDCWD, ...) fails to compile on this target even though the
+# wrapper exists. The wrapper is a stub here, so the values are nominal — but
+# source portability is the whole point of having the name. CHANGELOG [6.5.7]
+var AT_FDCWD = 0 - 100;
+var AT_SYMLINK_NOFOLLOW = 256;   # 0x100
+var AT_REMOVEDIR = 512;          # 0x200
 
 # Write `count` bytes from `buf` to `fd` (fd 1/2 → console). Returns
 # bytes written, or -1. Same shape as Linux → portable. v6.2.3: a TAGGED

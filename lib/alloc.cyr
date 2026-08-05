@@ -240,6 +240,17 @@ fn alloc(size): i64 {
 # fresh mmaps if growth is needed again — reclaimed at process exit), so this is
 # a cheap reuse of the first chunk, not a munmap sweep. Locked so a concurrent
 # alloc() can't observe a half-updated bump pointer.
+#
+# ⚠ THIS INVALIDATES EVERY POINTER THE ALLOCATOR HAS EVER HANDED OUT, including
+# ones the STDLIB itself is holding. Any Str, Vec, HashMap, arena or struct built
+# before the reset is dangling afterwards; the span is zeroed AND re-issuable, so
+# a stale pointer reads zeros until something else is allocated over it and then
+# reads that. The comment below reasons carefully about the info-leak channel and
+# used to say nothing about live references, which is how the default-Allocator
+# memo went unnoticed (v6.5.7 — that one is fixed by moving the vtable to static
+# storage, but consumer-held pointers are still the caller's problem).
+#
+# Reset only when nothing from the previous epoch will be read again.
 fn alloc_reset(): i64 {
     _alloc_lock_acquire();
     # Scrub the reused span of the FIRST chunk before rewinding, so a later
@@ -646,6 +657,22 @@ fn test_allocator_bytes_total(a): i64 {
 
 var _default_allocator = 0;
 
+# The default Allocator's 40-byte vtable lives HERE, in static storage — never in
+# the bump arena. `alloc_reset()` zeroes and rewinds the arena, so an Allocator
+# built by `allocator_new` (which calls `alloc(40)`) sat inside the scrubbed span:
+# the memo survived as a pointer into wiped, re-issuable memory and the next
+# `vec_new()` loaded a null fn pointer out of the dead vtable and jumped to 0.
+# Filed by hisab 2026-08-05 (SIGSEGV from `alloc_init; vec_new; alloc_reset; vec_new`,
+# both calls used exactly as documented). CHANGELOG [6.5.7]
+#
+# TYPED `: i64[5]`, not a bare `[5]` or `[40]`. A bare top-level `var x[N]` is
+# N*8 bytes under cycc but N bytes under **cybs** — so `[5]` reserves 40 B in the
+# compiler and 8 B in the bootstrap compiler, and gen1 then writes the vtable over
+# whatever follows. That variant still passes `gen2 == gen3`, because the corruption
+# is confined to gen1, i.e. it is a GREEN seed-derive over a silently broken
+# intermediate. The typed form is 40 B on both by construction.
+var _default_allocator_storage: i64[5];
+
 # Return (lazy-init) the process-wide default Allocator. Wraps
 # the global bump (`bump_allocator()`); identical to calling
 # bump_allocator() each time except memoized — every call returns
@@ -659,23 +686,27 @@ fn default_alloc(): i64 {
     # theirs. atomic_cas is gated to the real-thread arches; on cx the bare
     # store path is correct (single-threaded VM).
     if (_default_allocator == 0) {
-        var a = bump_allocator();
+        # Build the vtable IN PLACE in static storage — same four slots
+        # `bump_allocator()` passes to `allocator_new`, with state = 0 (the bump
+        # allocator is stateless; nothing here points into the arena).
+        var s = &_default_allocator_storage;
+        store64(s,      &_bump_alloc);
+        store64(s + 8,  &_bump_realloc);
+        store64(s + 16, &_alloc_free_noop);
+        store64(s + 24, &_bump_reset);
+        store64(s + 32, 0);
         # CVE-28 (v6.1.38): fence so the 40-byte vtable's writes are committed
-        # before the pointer is CAS-published — a peer thread observing the
-        # published pointer must see the fully-built vtable, not stale slots.
-        # (atomic_cas now also uses stlxr release on aarch64, but the explicit
-        # fence makes the publish-after-init ordering unambiguous on every arch;
-        # no-op on cx. This is the once-per-process lazy-init path.)
+        # before the pointer is published — a peer thread observing the published
+        # pointer must see the fully-built vtable, not stale slots.
         atomic_fence();
-        #ifdef CYRIUS_ARCH_X86
-        atomic_cas(&_default_allocator, 0, a);
-        return _default_allocator;
-        #endif
-        #ifdef CYRIUS_ARCH_AARCH64
-        atomic_cas(&_default_allocator, 0, a);
-        return _default_allocator;
-        #endif
-        _default_allocator = a;
+        # v6.5.7: the CAS is GONE, and its absence is the point. It existed to
+        # arbitrate between two threads each publishing their OWN freshly-alloc'd
+        # Allocator. The address is now a compile-time constant, so racing threads
+        # store the identical value and write identical bytes into the identical
+        # buffer — the publish is idempotent and a plain store is race-safe. That
+        # also retires the self-deadlock hazard the old comment documented (the
+        # build path could not take _alloc_lock because alloc(40) already holds it).
+        _default_allocator = s;
     }
     return _default_allocator;
 }

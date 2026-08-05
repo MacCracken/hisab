@@ -147,6 +147,176 @@ fn xrmdir(path): i64 {
     #endif
 }
 
+# Create directory `path` with mode `mode`. The xrmdir counterpart, same shape.
+#
+# AGNOS's raw wrapper is LENGTH-CARRYING (`sys_mkdir(path, pathlen)`) and takes NO
+# mode, while POSIX takes `(path, mode)` — so a consumer reaching for `sys_mkdir`
+# directly is correct on Linux/macOS and silently wrong on agnos, the surplus
+# argument binding to garbage. That divergence is the whole reason this wrapper
+# exists; it is the same trap `xrmdir` was added for at v6.5.2.
+#
+# Windows DOES route here (83 is in the PE reroute set), unlike xrmdir which has no
+# RemoveDirectoryW wired. Returns 0 on success, negative errno on POSIX/agnos.
+# CHANGELOG [6.5.7]
+fn xmkdir(path, mode): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var mn = 0;
+    while (load8(path + mn) != 0) { mn = mn + 1; }
+    return sys_mkdir(path, mn);
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    return sys_mkdir(path, mode);
+    #endif
+}
+
+# Create `path` and every missing parent, like `mkdir -p`. Returns 0 on success.
+#
+# Ordering follows Rust's `create_dir_all`: try the FULL path first and walk parents
+# only when that fails, rather than stat-ing every component up front. The common
+# case — the parent already exists — is then a single syscall. An existing directory
+# is success, not an error (EEXIST is swallowed), which is what makes this callable
+# unconditionally.
+#
+# Paths are bounded at 1023 bytes; longer returns -1 rather than truncating, since a
+# silently truncated mkdir would create the WRONG directory. CHANGELOG [6.5.7]
+fn xmkdir_p(path, mode): i64 {
+    var n = 0;
+    while (load8(path + n) != 0) { n = n + 1; }
+    if (n == 0) { return 0 - 1; }
+    if (n > 1023) { return 0 - 1; }
+    if (xmkdir(path, mode) == 0) { return 0; }
+    if (_xdir_exists(path) == 1) { return 0; }
+    # Full-path create failed: build each prefix and create it in turn.
+    var buf[1024];
+    var i = 0;
+    while (i < n) {
+        store8(&buf + i, load8(path + i));
+        i = i + 1;
+    }
+    store8(&buf + n, 0);
+    var j = 1;
+    while (j < n) {
+        if (load8(&buf + j) == 47) {
+            store8(&buf + j, 0);
+            if (_xdir_exists(&buf) == 0) { xmkdir(&buf, mode); }
+            store8(&buf + j, 47);
+        }
+        j = j + 1;
+    }
+    if (xmkdir(path, mode) == 0) { return 0; }
+    if (_xdir_exists(path) == 1) { return 0; }
+    return 0 - 1;
+}
+
+# Does `path` exist and is it a directory? Used by xmkdir_p to treat an existing
+# directory as success. Kept private: consumers want `is_dir` from lib/fs.cyr,
+# which takes a Str; this one takes a raw cstr because that is what xmkdir_p holds.
+fn _xdir_exists(path): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    # Windows has no POSIX stat — `xstat` returns -1 here — so ask the filesystem
+    # directly, the same way fs_win.cyr's `is_dir` does. Without this arm `xmkdir_p`
+    # loses its idempotence on Windows: CreateDirectoryW fails on an existing directory
+    # and nothing else can tell "already there" from "could not create".
+    # ⚠ The 0xF019 reroute takes an ALREADY-WIDE path, unlike the mkdir/unlink reroutes
+    # which widen inline — hence the widen loop here. ASCII-only, matching `_fs_widen`.
+    var wp = alloc(1024);
+    var wi = 0;
+    while (load8(path + wi) != 0) {
+        if (wi >= 510) { break; }
+        store16(wp + wi * 2, load8(path + wi));
+        wi = wi + 1;
+    }
+    store16(wp + wi * 2, 0);
+    var attrs = syscall(61465, wp);             # GetFileAttributesW
+    if (attrs == 4294967295) { return 0; }      # INVALID_FILE_ATTRIBUTES
+    if ((attrs & 16) != 0) { return 1; }        # FILE_ATTRIBUTE_DIRECTORY
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
+    var st[144];
+    if (xstat(path, &st) != 0) { return 0; }
+    # ⚠ MUST go through STAT_MODE — `xstat` does NOT normalise the struct, it only
+    # normalises the CALL. st_mode is at 24 on x86-Linux, **16** on aarch64-Linux, and
+    # **4** on macOS-arm64's stat64. A hardcoded 24 reads st_uid on aarch64 and quietly
+    # reports every directory as not-a-directory; found by running
+    # vr01_syscall_wrappers.tcyr under aarch64 (it returned uid 1000 as the mode), never
+    # by the host suite. This is the exact rule the x86 peer's Stat enum is annotated
+    # with — "must use the Stat enum to stay arch-clean", v5.4.11 chunk-A.
+    # S_IFMT 0xF000, S_IFDIR 0x4000.
+    var mode = load32(&st + STAT_MODE);
+    if (mode & 0xF000 == 0x4000) { return 1; }
+    return 0;
+    #endif
+}
+
+# Create a symlink at `linkpath` pointing to `target`.
+#
+# AGNOS is 4-arg length-carrying (`target, targetlen, linkpath, linkpathlen`) where
+# POSIX is 2-arg — the same divergence class as xmkdir. Windows has no POSIX symlink
+# and no CreateSymbolicLinkW reroute wired, so it degrades to -1 the way xrmdir and
+# xstat already do; wire the reroute when a consumer needs it. CHANGELOG [6.5.7]
+fn xsymlink(target, linkpath): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var tn = 0;
+    while (load8(target + tn) != 0) { tn = tn + 1; }
+    var ln = 0;
+    while (load8(linkpath + ln) != 0) { ln = ln + 1; }
+    return sys_symlink(target, tn, linkpath, ln);
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0 - 1;   # no CreateSymbolicLinkW reroute wired
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_symlink(target, linkpath);
+    #endif
+    #endif
+}
+
+# Read the target of the symlink at `path` into `buf` (capacity `bufsize`).
+# Returns the byte count written, or negative on error. NOT NUL-terminated — that
+# is readlink(2)'s contract and callers already expect it.
+#
+# AGNOS is 4-arg length-carrying; POSIX is 3-arg. Windows degrades to -1.
+# CHANGELOG [6.5.7]
+fn xreadlink(path, buf, bufsize): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var rn = 0;
+    while (load8(path + rn) != 0) { rn = rn + 1; }
+    return sys_readlink(path, rn, buf, bufsize);
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0 - 1;   # no reroute wired
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_readlink(path, buf, bufsize);
+    #endif
+    #endif
+}
+
+# Create a hard link at `newpath` pointing at the same inode as `oldpath`.
+#
+# AGNOS is 4-arg length-carrying; POSIX is 2-arg. Windows has no CreateHardLinkW
+# reroute wired and degrades to -1. CHANGELOG [6.5.7]
+fn xlink(oldpath, newpath): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    var on = 0;
+    while (load8(oldpath + on) != 0) { on = on + 1; }
+    var nn = 0;
+    while (load8(newpath + nn) != 0) { nn = nn + 1; }
+    return sys_link(oldpath, on, newpath, nn);
+    #endif
+    #ifdef CYRIUS_TARGET_WIN
+    return 0 - 1;   # no CreateHardLinkW reroute wired
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    #ifndef CYRIUS_TARGET_WIN
+    return sys_link(oldpath, newpath);
+    #endif
+    #endif
+}
+
 # Rename `oldpath` → `newpath` on the SAME filesystem (atomic replace of an
 # existing target — the durable half of file_write_atomic). Portable exactly as
 # file_open bridges sys_open: POSIX (Linux/macOS/aarch64) is 2-arg

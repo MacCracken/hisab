@@ -95,6 +95,129 @@ fn _tp_area2x(p, t) {
     return s;
 }
 
+# --- delaunay_2d completeness harness (2.8.2) ------------------------------
+# The 10x super-triangle left HOLES in the mesh — real triangles that were never
+# created because a super-vertex sat inside their circumcircle, then silently
+# dropped with the super-triangle at compaction. Nothing in the suite noticed,
+# because every fixture was either small enough to be unaffected or checked a
+# property (empty circumcircle, manifoldness) that a mesh with a hole still
+# satisfies. What catches it is COVERAGE: a triangulation of n points tiles the
+# convex hull exactly, so the summed triangle area must equal the hull area and
+# the triangle count must be 2n - 2 - h.
+#
+# splitmix64 so a whole input class is pinned by one seed rather than by
+# hundreds of literal coordinates. Integer-only, hence bit-identical anywhere.
+var _DLR_STATE = 0;
+
+fn _dlr_next() {
+    _DLR_STATE = _DLR_STATE + 0x9E37_79B9_7F4A_7C15;
+    var z = _DLR_STATE;
+    z = (z ^ (z >> 30)) * 0xBF58_476D_1CE4_E5B9;
+    z = (z ^ (z >> 27)) * 0x94D0_49BB_1331_11EB;
+    return z ^ (z >> 31);
+}
+
+# Uniform in [0, 1): the top 53 bits of the state, scaled by 2^-53.
+fn _dlr_unit() {
+    return f64_mul(f64_from(_dlr_next() >> 11), 0x3CA0_0000_0000_0000);
+}
+
+# n uniform points in a box `span` wide and `span * flat` tall.
+fn _dlr_points(n, seed, span, flat) {
+    _DLR_STATE = seed;
+    var p = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var ux = _dlr_unit();
+        var uy = _dlr_unit();
+        vec_push(p, hvec2_new(f64_mul(span, ux),
+        f64_mul(f64_mul(span, flat), uy)));
+    }
+    return p;
+}
+
+# Total 2x area covered, taking each triangle's area as POSITIVE so a folded or
+# duplicated triangle adds instead of cancelling.
+fn _dl_area2_abs(p, t) {
+    var s = 0;
+    var k = 0;
+    while (k < vec_len(t)) {
+        var a = vec_get(p, vec_get(t, k));
+        var b = vec_get(p, vec_get(t, k + 1));
+        var c = vec_get(p, vec_get(t, k + 2));
+        s = f64_add(s, f64_abs(_col_triangle_area_2x(HVec2_x(a), HVec2_y(a),
+        HVec2_x(b), HVec2_y(b), HVec2_x(c), HVec2_y(c))));
+        k = k + 3;
+    }
+    return s;
+}
+
+# 2x area of the convex hull of the first n points (shoelace over the hull).
+fn _dl_hull_area2(p, n) {
+    var h = convex_hull_2d(p, n);
+    var m = vec_len(h);
+    if (m < 3) { return 0; }
+    var s = 0;
+    for (var i = 0; i < m; i = i + 1) {
+        var a = vec_get(p, vec_get(h, i));
+        var b = vec_get(p, vec_get(h, (i + 1) % m));
+        s = f64_add(s, f64_sub(f64_mul(HVec2_x(a), HVec2_y(b)),
+        f64_mul(HVec2_y(a), HVec2_x(b))));
+    }
+    return f64_abs(s);
+}
+
+# How many of the first n input points appear anywhere in the triangle list.
+fn _dl_used(n, t) {
+    var seen = alloc(n * 8);
+    for (var i = 0; i < n; i = i + 1) { store64(seen + i * 8, 0); }
+    for (var k = 0; k < vec_len(t); k = k + 1) {
+        store64(seen + vec_get(t, k) * 8, 1);
+    }
+    var c = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if (load64(seen + i * 8) == 1) { c = c + 1; }
+    }
+    return c;
+}
+
+# Largest number of triangles sharing any single edge. 2 for a manifold mesh,
+# 3+ for the overlapping soup a broken cavity produces.
+fn _dl_max_edge_share(t) {
+    var worst = 0;
+    var e = 0;
+    while (e < vec_len(t)) {
+        for (var s = 0; s < 3; s = s + 1) {
+            var ua = vec_get(t, e + s);
+            var ub = vec_get(t, e + (s + 1) % 3);
+            var cnt = 0;
+            var f = 0;
+            while (f < vec_len(t)) {
+                var x0 = vec_get(t, f);
+                var x1 = vec_get(t, f + 1);
+                var x2 = vec_get(t, f + 2);
+                if (x0 == ua || x1 == ua || x2 == ua) {
+                    if (x0 == ub || x1 == ub || x2 == ub) { cnt = cnt + 1; }
+                }
+                f = f + 3;
+            }
+            if (cnt > worst) { worst = cnt; }
+        }
+        e = e + 3;
+    }
+    return worst;
+}
+
+# 1 when the mesh covers exactly the convex hull: |mesh area - hull area| under
+# a relative 1e-9. A single missing triangle shows up here at 1e-4 and an
+# overlapping fold at 10^-1 or worse, so the threshold is nowhere near either.
+fn _dl_tiles_hull(p, n, t) {
+    var ha = _dl_hull_area2(p, n);
+    var ma = _dl_area2_abs(p, t);
+    var tol = f64_mul(ha, 0x3E112E0BE826D695);   # 1e-9
+    if (f64_lt(f64_abs(f64_sub(ma, ha)), tol) == 1) { return 1; }
+    return 0;
+}
+
 # Count points strictly inside any output triangle's circumcircle — the
 # Delaunay empty-circumcircle property holds iff this is 0. Reuses the same
 # winding-aware predicate the algorithm uses; cocircular points are not strictly
@@ -3702,6 +3825,80 @@ while (dcc_i < 12) {
 assert_eq(vec_len(delaunay_2d(dcc2, 12)) / 3, 10, "circle-12 gives exactly 10 triangles");
 vec_push(dcc2, hvec2_new(0, 0));
 assert_eq(vec_len(delaunay_2d(dcc2, 13)) / 3, 12, "circle-12 + centre gives 12 triangles");
+
+test_group("delaunay_2d: symbolic ghost vertices — completeness (2.8.2)");
+
+# Until 2.8.2 the enclosing triangle was placed at 10x the bounding box. That is
+# not far enough for Bowyer-Watson to reduce to the true Delaunay triangulation:
+# a super-vertex lands inside a real circumcircle, the real triangle is never
+# created, and compaction then drops the super-vertex triangle that was covering
+# the gap — so the mesh comes back with a HOLE and no error signal. Every number
+# asserted below was computed independently in exact rational arithmetic
+# (python3 fractions) from these same points; the "was" figures are what the 10x
+# build actually returned.
+#
+# Twenty uniform points. Correct answer 32 triangles; the 10x build returned 31,
+# missing exactly (3, 7, 17) and leaving a hole of 1.5e-4 of the hull.
+var dlu_p = vec_new();
+vec_push(dlu_p, hvec2_new(0x3FD8C0CEC328E270, 0x3FE812E629B272E6));
+vec_push(dlu_p, hvec2_new(0x3FCDC969F80835E0, 0x3FB96E4EC2DA05B8));
+vec_push(dlu_p, hvec2_new(0x3FC80F13C7D500AC, 0x3FD85BE58C2C01D0));
+vec_push(dlu_p, hvec2_new(0x3FEF89BC83E37983, 0x3FE05AF18260D33D));
+vec_push(dlu_p, hvec2_new(0x3FDB4AFA8EA7BA7A, 0x3FE34F6290EC133A));
+vec_push(dlu_p, hvec2_new(0x3FDCD4957A495F30, 0x3FC17F76452A82D0));
+vec_push(dlu_p, hvec2_new(0x3FEBF9DC63B08AF1, 0x3FDCF927BD572532));
+vec_push(dlu_p, hvec2_new(0x3FEE8CBA8769242D, 0x3FEE0C15B7632E23));
+vec_push(dlu_p, hvec2_new(0x3FEA98636076B666, 0x3FDD81DBD1A9532A));
+vec_push(dlu_p, hvec2_new(0x3FC422E52A6C09C8, 0x3FDD22851977B7FC));
+vec_push(dlu_p, hvec2_new(0x3FBD67C34F6A2A30, 0x3FEF99504BDA8630));
+vec_push(dlu_p, hvec2_new(0x3FC70CE1A98856CC, 0x3FEC05582B4C6EE6));
+vec_push(dlu_p, hvec2_new(0x3FC3F8F2F2A3F09C, 0x3FE6CDCE8132D3F1));
+vec_push(dlu_p, hvec2_new(0x3FEDF6B8FF30665C, 0x3FBF3E8962E9DA60));
+vec_push(dlu_p, hvec2_new(0x3FDD591B04B156E8, 0x3FEB0438AD2BC08A));
+vec_push(dlu_p, hvec2_new(0x3FD1676710F19B32, 0x3FC8E45942145290));
+vec_push(dlu_p, hvec2_new(0x3FEF472D623A46FD, 0x3FD908955BC97386));
+vec_push(dlu_p, hvec2_new(0x3FEF1066CD5B4598, 0x3FE6ADE2DE457104));
+vec_push(dlu_p, hvec2_new(0x3FD7DAE09D47AB16, 0x3FDCAA334C08CCB8));
+vec_push(dlu_p, hvec2_new(0x3FBF6F4281D4A0C0, 0x3F5B894417A4F800));
+var dlu_t = delaunay_2d(dlu_p, 20);
+assert_eq(vec_len(dlu_t) / 3, 32, "uniform-20: 32 triangles (10x super-triangle gave 31)");
+assert_eq(_dl_tiles_hull(dlu_p, 20, dlu_t), 1, "uniform-20: mesh tiles the hull, no hole");
+assert_eq(_dl_used(20, dlu_t), 20, "uniform-20: every input point used");
+assert_eq(_dl_max_edge_share(dlu_t), 2, "uniform-20: manifold");
+assert_eq(_dl_violations(dlu_p, 20, dlu_t), 0, "uniform-20: empty-circumcircle");
+
+# 160 uniform points — the class the audit measured at 15-37% incomplete, and
+# 29 of 40 seeds short at this size. Correct 305; the 10x build returned 304.
+var dlb_p = _dlr_points(160, 2, F64_ONE, F64_ONE);
+var dlb_t = delaunay_2d(dlb_p, 160);
+assert_eq(vec_len(dlb_t) / 3, 305, "uniform-160: 305 triangles (10x gave 304)");
+assert_eq(_dl_tiles_hull(dlb_p, 160, dlb_t), 1, "uniform-160: mesh tiles the hull");
+assert_eq(_dl_used(160, dlb_t), 160, "uniform-160: every input point used");
+
+# A cluster of span 1e-20. The old `dx = max(span, 1.0)` floor gave this a
+# super-triangle 1e20 times the data, so the in-circle determinant differenced
+# quantities 40 orders apart and lost the sign entirely: 61 triangles instead of
+# 70, five points dropped, and a total area 1.69x the convex hull — overlapping,
+# not merely incomplete. Ghost vertices have no scale, so there is nothing left
+# to mis-scale.
+var dlc_p = _dlr_points(40, 1, 0x3BC79CA10C924223, F64_ONE);   # span 1e-20
+var dlc_t = delaunay_2d(dlc_p, 40);
+assert_eq(vec_len(dlc_t) / 3, 70, "cluster-1e-20: 70 triangles (10x gave 61)");
+assert_eq(_dl_tiles_hull(dlc_p, 40, dlc_t), 1,
+"cluster-1e-20: mesh tiles the hull (10x covered 1.69x it)");
+assert_eq(_dl_used(40, dlc_t), 40, "cluster-1e-20: every input point used (10x dropped 5)");
+assert_eq(_dl_max_edge_share(dlc_t), 2, "cluster-1e-20: manifold");
+assert_eq(_dl_violations(dlc_p, 40, dlc_t), 0, "cluster-1e-20: empty-circumcircle");
+
+# Aspect ratio 1e6 (a 1 x 1e-6 strip). The 10x build returned ONE triangle of
+# the 70 required and dropped 37 of the 40 points, covering 0.07% of the hull —
+# the "extreme-aspect" failure carried on the roadmap since 2.7.0.
+var dls_p = _dlr_points(40, 1, F64_ONE, 0x3EB0C6F7A0B5ED8D);   # flat 1e-6
+var dls_t = delaunay_2d(dls_p, 40);
+assert_eq(vec_len(dls_t) / 3, 70, "thin-strip-1e6: 70 triangles (10x gave 1)");
+assert_eq(_dl_used(40, dls_t), 40, "thin-strip-1e6: every input point used (10x dropped 37)");
+assert_eq(_dl_max_edge_share(dls_t), 2, "thin-strip-1e6: manifold");
+assert_eq(_dl_violations(dls_p, 40, dls_t), 0, "thin-strip-1e6: empty-circumcircle");
 
 # ================================================================
 var r = assert_summary();

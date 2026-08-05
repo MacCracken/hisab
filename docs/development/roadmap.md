@@ -74,16 +74,37 @@ confirmed, 0 refuted** across six adversarially-verified dimensions — 4 critic
 medium, 5 low. Ordered by severity. **The finding list is the unit of disposition, not this
 summary** — every row in the audit table gets an explicit outcome before 2.8.x closes.
 
-### 2.8.2 -- critical
+### 2.8.2 -- critical  **(1 of 4 landed; 2 rejected on verification, 1 folded in)**
 
-- [ ] **mpr_penetration returns a wrong (frequently zero or negative) penetration depth for any non-axis-aligned overlap — 65 of 81 sampled box/box configurat**
-      `/home/macro/Repos/hisab/src/collision_core.cyr:151-224 (portal built through the interior ` *(numerical)*
-- [ ] **gjk_epa_3d is O(k²) in EPA iterations — 8,576 face evaluations, 1.24 MB of never-freed arena and milliseconds per single narrowphase call**
-      `src/geo_advanced.cyr:394 (closest-face rescan) and src/geo_advanced.cyr:430 (visibility re` *(performance)*
-- [ ] **gjk_epa_3d and mpr_penetration return wrong penetration depths for sphere-vs-box**
-      `src/geo_advanced.cyr:308 (gjk_epa_3d), src/collision_core.cyr:150 (mpr_penetration)` *(performance)*
-- [ ] **delaunay_2d's 10x super-triangle leaves holes in the mesh on ordinary uniform-random input (silent incomplete triangulation)**
-      `/home/macro/Repos/hisab/src/collision_mesh.cyr:181 (`var d_max = f64_mul(f64_max(dx, dy), ` *(regression)*
+- [x] **delaunay_2d silently incomplete on ordinary uniform-random input** — fixed by REMOVING the
+      super-triangle, not retuning it. Vertices n..n+2 are now **symbolic ghosts** (the limit of
+      `A + M*u_k` as `M -> inf`), every ghost predicate decided by the sign of the leading
+      coefficient in `M`. 534/769 -> **729/769** point sets fully correct across 22 classes,
+      **0 regressions**, 195 improvements; 57,600 exact-rational checks of the ghost rules at
+      M = 1e5..1e34 with zero failures *(2.8.2)*
+- [x] **Folded in by the above, at no extra cost:** the separately-filed 1e-20-cluster failure
+      (0/40 -> 40/40) and the aspect-1e6 thin-strip failure (0/40 -> 40/40). They were the same
+      coupling seen from the other end *(2.8.2)*
+- [ ] **`gjk_epa_3d` O(k^2) — REPAIR REJECTED, do not simply retry.** The heap + flood-fill rewrite
+      achieves quadratic -> linear on evaluations, time AND arena (8,576 -> 812 face evals;
+      1.23 MB -> 99.6 KB), but its flood fill **under-reports the visible set when rounding splits
+      that set into disconnected components** (239 of 47,134 cases), and a deterministic
+      cylinder-vs-rotated-box case returns a depth **40.7x too small** where the shipped code is
+      right. The verifier's suggested remedies, in preference order:
+      (a) an O(1)-per-iteration self-check — EPA's closest-face distance must be **non-decreasing**,
+          so a decrease proves polytope corruption and triggers a full-scan restart;
+      (b) keep only the cached face records + min-heap + hoisted buffers and **drop the flood fill**
+          — that alone removes the alloc-per-face and the closest-face rescan, and may retain most
+          of the win with none of the risk;
+      (c) validate that the horizon closes into exactly one cycle, O(horizon), which detects the
+          disconnected-region case directly.
+      **Add the reproducer as a fixture** (exact depth 0.19783922047988); nothing in the 1818-
+      assertion suite catches it, and the added tests used no curved support against a rotated box.
+- [ ] **`mpr_penetration` wrong/negative depth — REPAIR REJECTED** on the same grounds: removes the
+      defect, regresses another class. Retry against the verifier's exact reference set.
+- [ ] `gjk_epa_3d` / `mpr_penetration` wrong depths for sphere-vs-box — untouched by the rejected
+      EPA repair, which explicitly left the depth-accuracy findings alone (per-class mean error
+      identical to the bit)
 
 ### 2.8.3 -- high
 
@@ -153,9 +174,10 @@ summary** — every row in the audit table gets an explicit outcome before 2.8.x
 - [ ] Supersede with a new dated audit once the criticals and highs land
 
 ### Carried in from 2.8.x, unchanged
-- [ ] `_col_in_circumcircle` adaptive exact predicate — now **coupled** to the delaunay
-      super-triangle finding above; the multiplier cannot be raised safely until the predicate is
-      adaptive, so these two should land together
+- [x] `_col_in_circumcircle` adaptive exact predicate — **SUPERSEDED by 2.8.2**. The item existed
+      because the super-triangle multiplier could not be raised safely without it. There is no
+      multiplier any more, so the coupling is dissolved rather than resolved. The predicate remains
+      non-adaptive for real-vs-real triples; no known reachable defect depends on it
 - [ ] `delaunay_2d` / `convex_hull_2d` extreme-aspect failures (parabola, thin slivers) — points
       dropped, hull under-covered; byte-identical before and after the 2.8.0 rewrite
 

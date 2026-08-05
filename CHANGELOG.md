@@ -2,6 +2,77 @@
 
 ## [Unreleased]
 
+## [2.8.2] - 2026-08-04 — delaunay completeness via symbolic ghost vertices. **Two critical repairs rejected.**
+
+One of the four criticals fixed; two were implemented, adversarially verified, and **rejected for
+regressing other input classes**. Suite 1801 → **1818**.
+
+### Fixed — delaunay_2d is complete
+
+The audit proved no super-triangle multiplier wins both classes: 10x leaves holes on 15–37% of
+uniform-random input, and raising it breaks tight clusters. The multiplier *is* the coupling to the
+non-adaptive in-circle predicate.
+
+**So the super-triangle is gone.** Vertices n, n+1, n+2 are now **symbolic ghosts** — the limit of
+`A + M·u_k` as `M → ∞`, with `u = (1,2), (-2,1), (1,-2)` and apex `points[0]`. Nothing is stored for
+a ghost. Every predicate touching one is decided by the sign of the leading nonzero coefficient of
+its determinant expanded as a polynomial in `M`, i.e. its sign for all sufficiently large finite
+`M`. A build evaluates finitely many predicates, so a single `M` satisfies all of them at once —
+the predicate set is realisable by an actual configuration, which is what keeps the walk and the
+flood fill consistent.
+
+The equal-norm requirement on the direction vectors is load-bearing and was found by measurement,
+not by reasoning: with `|u_k|²` all equal to 5 the two-ghost tie coefficient collapses to a plain
+distance comparison against the apex. The obvious set `(-1,-1), (1,-1), (0,1)` was tried first and
+its tie rule **failed 1,429 of 35,968 exact trials**.
+
+Verified against exact rational arithmetic — every coordinate rescaled from its bit pattern to exact
+integers, with a completeness certificate (soundness + exact hull-area partition + manifoldness +
+Euler count). Over 769 point sets in 22 classes: **534/769 → 729/769 fully correct, 0 regressions,
+195 improvements.**
+
+| class | before | after |
+|---|---|---|
+| uniform-unit n=160 | 11/40 | **40/40** |
+| uniform-unit n=500 | 0/5 | **5/5** |
+| cluster span 1e-14 | 24/40 | **40/40** |
+| cluster span 1e-20 | 0/40 | **40/40** |
+| thin strip, aspect 1e6 | 0/40 | **40/40** |
+
+The last two rows matter beyond this finding: the 1e-20 cluster and the aspect-1e6 strip were
+*separately filed* defects (746 unsound triangles and 173 dropped points; 2,701 triangles short and
+1,478 dropped points). Removing the super-triangle fixed them as a side effect, because they were
+the same coupling seen from the other end.
+
+Also verified independently of the implementation: **57,600 exact-rational comparisons** of every
+ghost rule against the true determinant at M = 1e5 … 1e34, including all four degenerate branches
+deliberately constructed. Zero failures. `delaunay_2d_400` 3.56 → 3.45 ms.
+
+**This supersedes the adaptive-predicate work item.** There is no multiplier left to unblock.
+
+### Rejected — two critical repairs that regressed
+
+Both were reported FIXED by their implementer, both removed the defect they targeted, and both were
+**rejected on independent verification**. Recorded because the rejections are the useful part.
+
+- **`gjk_epa_3d` O(k²).** The repair works: face evaluations 8,576 → 812 at the shipped budget,
+  4.36 ms → 0.70 ms, arena 1.23 MB → 99.6 KB, and all three metrics go quadratic → linear. But its
+  flood-fill visible-set search **under-reports when rounding splits the visible region into
+  disconnected components** — 239 of 47,134 cases — and every divergence coincides with one. A
+  deterministic reproducer (cylinder vs rotated box) returns a depth **40.7× too small** where the
+  shipped code is correct. The verifier also found the CHANGELOG, roadmap and source comment it
+  shipped all claimed "0 regressions", which its own 104,000-configuration sweep contradicts.
+- **`mpr_penetration`.** Rejected on the same grounds — removes the defect, regresses elsewhere.
+
+Both are back on the roadmap with the verifiers' specific remedies, not as blank retries.
+
+### What the rejections say about the method
+
+Three of the last four performance or correctness rewrites in this repo were reported working and
+were not. The pattern is consistent: an optimisation that replaces a full scan with a smarter search
+inherits an invariant the full scan never needed, and the new invariant fails on degenerate input.
+The full scan is slow precisely because it assumes nothing.
+
 ## [2.8.1] - 2026-08-04 — full audit of the v2.8.0 tree. **42 findings, 4 critical.**
 
 An audit release: no library code changes. Six dimensions — memory-safety, numerical,

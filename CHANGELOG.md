@@ -2,6 +2,76 @@
 
 ## [Unreleased]
 
+## [2.8.4] - 2026-08-05 — the DCT/DST dispatch heuristic, and what the 23× ratio actually was
+
+**This release does not make `num_dst` faster at n = 1024.** It stays at ~6.7 ms, and
+`num_dct_1024` stays at ~276 us. That 23× ratio prompted the investigation and turned out not to
+be a defect at all; the defect the investigation found is somewhere else and is small. Both are
+below, in that order, because the second is the one that ships code.
+
+### The 23× was two effects, one real and one a benchmark artifact — no code change
+
+Measured by forcing both paths at ten sizes (`cyrius bench`, 10 iters, no concurrent load):
+
+| | n = 1023 | n = 1024 |
+|---|---|---|
+| `num_dct` | 1.623 ms (Bluestein) | **276.5 us** (radix-2) |
+| `num_dst` | **460.8 us** (radix-2) | 6.728 ms (Bluestein) |
+
+A DCT-II of n points takes a length-**n** DFT; a DST-I of n points takes a length-**2(n+1)** one.
+So the two transforms are fast at *opposite* sizes, and n = 1024 is simultaneously the DCT's best
+case and the DST's worst: 2·(1024+1) = 2050 = 2·5²·41 is not a power of two, so `_numx_dft` falls
+to Bluestein with m = 8192 — three length-8192 FFTs against the DCT's single length-1024 one.
+
+Decomposing the ratio exactly: DCT@1024 276.5 us → DST@1023 460.8 us is **1.6×**, the irreducible
+cost of DST-I needing a twice-as-long DFT; DST@1023 → DST@1024 is a further **14.6×**, purely the
+size. The parity penalty reproduces at every adjacent pair — 15.2× / 14.4× / 14.7× / 14.1× / 14.0×
+at 255-256 / 511-512 / 1023-1024 / 2047-2048 / 4095-4096.
+
+That is a property of the transform, not a bug, so nothing was rewritten. What was wrong was the
+**reporting**: the suite benchmarked both transforms at the single size that flatters one and
+punishes the other, and printed the two rows next to each other. `num_dct_1023` and `num_dst_1023`
+are now benchmarked **alongside** — not instead of — the 1024 pair, so the cliff is visible in the
+suite's own output instead of being a bare ratio waiting to be misread.
+
+### Fixed
+
+- **num_ext — `_numx_use_fft` dispatched to the slower path at five sizes.** The gate charged every
+  caller `2*len` for post-processing. That is right for DCT-II and its inverse, which compute a cos
+  and a sin twiddle per output bin, and wrong for DST-I, whose entire post-pass is a negate and a
+  halve — so DST-I was billed for transcendentals it never evaluates, its reduction branch priced
+  at 17.4–18.0 ns per abstract unit against the direct path's 22.0–23.7, and n = 7 went to the
+  direct loop when the FFT is faster. Separately, measured Bluestein cost per unit is not flat
+  (26.2 ns/unit at m = 512 falling to 19.9 at m = 32768, as the setup amortises), so the flat model
+  under-charged small m — the band the DCT mispicks sit in. `post` is now a per-caller parameter
+  (0 for `num_dst`, 2 for `num_dct` / `num_idct`) and Bluestein carries a 10% surcharge below
+  m = 128. Measured effect, both paths batch-timed at min of 10 rounds × 1000–2000 calls:
+
+  | size | was | now | gain |
+  |---|---|---|---|
+  | `num_dst` n = 7 | 2189 ns (direct) | 1738 ns (FFT) | **−20.6%** |
+  | `num_dct` n = 26 | 32500 ns (FFT) | 28939 ns (direct) | **−11.0%** |
+  | `num_dct` n = 38 | 66141 ns (FFT) | 60713 ns (direct) | **−8.2%** |
+  | `num_dct` n = 39 | 66118 ns (FFT) | 64430 ns (direct) | **−2.6%** |
+
+  Every other n from 2 to 20000, for all three callers, keeps the pick it had — enumerated before
+  landing, not sampled. The total saving is single-digit microseconds per call at four small sizes;
+  this is a correctness fix to a decision function with a provably bounded blast radius, not a
+  throughput win. The 1/10 surcharge and the m <= 128 bound are a **fit to two measured bands**,
+  not a derivation: widening to m <= 256 drags n = 58/59/60 across a band that is currently picked
+  correctly, and raising it to 1/8 flips n = 40, where the FFT is measurably faster. `num_dct`
+  n = 27 remains a **3% mispick** — a fit boundary, recorded rather than papered over. The gate no
+  longer errs by more than 3%; it is not exact.
+
+### Added
+
+- **Assertions on the dispatch decision itself.** `_numx_use_fft` is a decision function, and
+  nothing asserted what it decides — only that both paths compute the right answer, which stays
+  true whichever one runs. A mispick was therefore invisible: it cost time and changed no result.
+  Eight assertions now pin the four corrected decisions, the two bound-defining sizes (n = 40 and
+  the n = 27 residual), and the two headline sizes that must not move.
+- `num_dct_1023` / `num_dst_1023` benchmarks, beside the existing 1024 pair.
+
 ## [2.8.3] - 2026-08-05 — the eight-track audit-repair merge; the narrowphase now returns the exact MTV
 
 Discharges the bulk of the 2026-08-04 audit (42 findings). Eight parallel repair tracks were

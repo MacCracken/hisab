@@ -292,6 +292,93 @@ fn _mpr_mkbox(cx, cy, cz, hx, hy, hz) {
     return s;
 }
 
+# --- 2.9.0: gjk_intersect_3d / gjk_epa_3d sibling-agreement sweep ---------
+#
+# The group below used to assert that the two agree while exercising the claim
+# only on OVERLAPPING fixtures, so it stayed green through a period when they
+# disagreed on 141 of 3,012 swept pair evaluations. These counters let the
+# assertions police the whole fixture range instead: every fixture is run
+# through BOTH entry points, in BOTH operand orders, and the aggregate is
+# asserted.
+#
+# cls is the EXACT classification of the pair, established from rational
+# arithmetic or a closed form and never from a hisab output. It is stated in
+# terms of the MINIMUM TRANSLATION that separates the pair, because that is the
+# quantity both entry points are answering about:
+#   0  disjoint                -- both must report 0
+#   1  touching, MTV exactly 0 -- the two must AGREE, and any depth reported
+#                                 with a 1 must be 0 up to rounding
+#   2  MTV strictly positive   -- both must report 1
+# Note the third class is not "the intersection has interior": a zero-radius
+# sphere strictly inside a box meets it in a single point, yet the MTV is the
+# point's distance to the nearest face, so it belongs in class 2.
+var _ag_pairs = 0;
+var _ag_mismatch = 0;
+var _ag_falsepos = 0;
+var _ag_missov = 0;
+var _ag_touch = 0;
+var _ag_baddepth = 0;
+var _ag_n_slot = 0;
+var _ag_d_slot = 0;
+# Size of the fixtures currently being swept. Set by the sweep before each
+# block; the depth bound below is relative to it, because the sweep deliberately
+# runs the same geometry at 2^-20 and 2^20 and an absolute bound would be
+# meaningless at both ends.
+var _ag_scale = 0;
+
+fn _ag_eval(fa, sa, fb, sb, cls) {
+    if (_ag_n_slot == 0) {
+        _ag_n_slot = alloc(8);
+        _ag_d_slot = alloc(8);
+    }
+    var gi = gjk_intersect_3d(fa, sa, fb, sb);
+    var ge = gjk_epa_3d(fa, sa, fb, sb, _ag_n_slot, _ag_d_slot);
+    _ag_pairs = _ag_pairs + 1;
+    if (gi != ge) { _ag_mismatch = _ag_mismatch + 1; }
+    if (cls == 0 && gi == 1) { _ag_falsepos = _ag_falsepos + 1; }
+    if (cls == 2 && gi == 0) { _ag_missov = _ag_missov + 1; }
+    if (cls == 1 && gi == 1) {
+        _ag_touch = _ag_touch + 1;
+        # The exact MTV of a class-1 pair is 0, so the reported depth must be 0
+        # up to rounding, and never negative. It is NOT always exactly 0: the
+        # touch probe writes an exact 0, but a tangency that GJK's own core
+        # happens to enclose at rounding level goes through EPA instead and
+        # comes back at 1e-20 .. 1e-24 for a unit-scale fixture. The bound below
+        # is eight orders above the worst of those and twelve orders below any
+        # real penetration, so it separates the two without excusing either.
+        var ag_d = load64(_ag_d_slot);
+        if (f64_lt(ag_d, 0) == 1) { _ag_baddepth = _ag_baddepth + 1; }
+        elif (f64_gt(ag_d, f64_mul(_ag_scale, TOL_1EM14)) == 1) {
+            _ag_baddepth = _ag_baddepth + 1;
+        }
+    }
+    return 0;
+}
+
+# Both operand orders. The 2.8.3 tangency defect showed up in both, and an
+# overlap test that is not symmetric is broken whatever else it does.
+fn _ag_pair(fa, sa, fb, sb, cls) {
+    _ag_eval(fa, sa, fb, sb, cls);
+    _ag_eval(fb, sb, fa, sa, cls);
+    return 0;
+}
+
+# n sixteenths. Dyadic, so the value is exact in f64 AND exact in the rational
+# arithmetic the classifications were computed in.
+fn _ag_q(n) { return f64_div(f64_from(n), f64_from(16)); }
+
+# Same, scaled by a power of two -- still exact, and it moves a fixture to a
+# scene scale where an ABSOLUTE epsilon anywhere in the stack would show up.
+fn _ag_qs(n, p2) { return f64_mul(_ag_q(n), p2); }
+
+fn _ag_box(cx, cy, cz, hx, hy, hz) {
+    return _mpr_mkbox(_ag_q(cx), _ag_q(cy), _ag_q(cz), _ag_q(hx), _ag_q(hy), _ag_q(hz));
+}
+
+fn _ag_sph(cx, cy, cz, r) {
+    return hvec4_new(_ag_q(cx), _ag_q(cy), _ag_q(cz), _ag_q(r));
+}
+
 # Elementwise Hermiticity test: A[i][j] == conj(A[j][i]) for EVERY (i,j),
 # checked on the raw components. Deliberately does NOT go through
 # cmat_adjoint: that writes r[j][i] = cx_conj(m[i][j]) and cx_conj copies the
@@ -5648,6 +5735,171 @@ assert_eq(gjk_epa_3d(&_mpr_sup_box, ep_z0, &_mpr_sup_box, ep_z2, ep_n, ep_d), 1,
 "coincident zero-volume boxes: a touch at depth 0");
 assert_eq(load64(ep_d), 0, "coincident zero-volume boxes: depth is exactly 0");
 
+# ================================================================
+# 2.9.0: the four fixtures the two entry points actually disagreed on.
+# ================================================================
+# Named individually because they are the reproducers, and an aggregate that
+# happens to come out right must not be able to hide any one of them.
+assert_eq(gjk_intersect_3d(&_mpr_sup_sphere, ep_sph, &_mpr_sup_box, ep_box), 1,
+"tangent sphere/box: gjk_intersect agrees with gjk_epa (was 0)");
+assert_eq(gjk_intersect_3d(&_mpr_sup_box, ep_box, &_mpr_sup_sphere, ep_sph), 1,
+"tangent box/sphere: same in the reversed operand order (was 0)");
+assert_eq(gjk_intersect_3d(&_mpr_sup_box, ep_z0, &_mpr_sup_box, ep_z2), 1,
+"coincident zero-size boxes: gjk_intersect agrees with gjk_epa (was 0)");
+var ag_p0 = hvec4_new(0, 0, 0, 0);
+var ag_p1 = hvec4_new(0, 0, 0, 0);
+assert_eq(gjk_epa_3d(&_mpr_sup_sphere, ag_p0, &_mpr_sup_sphere, ag_p1, ep_n, ep_d), 1,
+"coincident zero-radius spheres: gjk_epa reports a touch");
+assert_eq(gjk_intersect_3d(&_mpr_sup_sphere, ag_p0, &_mpr_sup_sphere, ag_p1), 1,
+"coincident zero-radius spheres: gjk_intersect agrees (was 0)");
+
+# The complement, and the one that matters most: the repair must NOT turn the
+# 1e-165 separation above -- the case a manufactured probe direction reported as
+# 64 false contacts -- into a contact for the cheap test either.
+assert_eq(gjk_intersect_3d(&_mpr_sup_box, ep_z0, &_mpr_sup_box, ep_z1), 0,
+"zero-volume boxes 1e-165 apart: gjk_intersect says separated, like gjk_epa");
+
+# ================================================================
+# 2.9.0: THE AGREEMENT SWEEP. Both entry points, both operand orders, over
+# separated / tangent / overlapping / degenerate fixtures at three scales.
+# ================================================================
+# Every cls below is an EXACT classification, not a hisab output:
+#   sphere/sphere  |c1-c0|^2 vs (r0+r1)^2         -- integer sixteenths, exact
+#   box/box        per-axis |dc| vs h0+h1          -- exact
+#   sphere/box     sum of max(0,|dc|-h)^2 vs r^2   -- exact
+# and the tangency fixtures are built on Pythagorean triples (3,4,5) so that the
+# touching configuration is exactly representable rather than nearly so.
+
+_ag_scale = F64_ONE;
+
+# --- sphere/sphere, walked through tangency at d = 2 = r0 + r1 ---
+var ag_s_unit = _ag_sph(0, 0, 0, 16);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(24, 0, 0, 16), 2);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(31, 0, 0, 16), 2);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(32, 0, 0, 16), 1);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(33, 0, 0, 16), 0);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(64, 0, 0, 16), 0);
+# 3-4-5: centres exactly 5 apart, radii 2 + 3 -- off-axis tangency, exact.
+var ag_s2 = _ag_sph(0, 0, 0, 32);
+_ag_pair(&_mpr_sup_sphere, ag_s2, &_mpr_sup_sphere, _ag_sph(48, 64, 0, 48), 1);
+_ag_pair(&_mpr_sup_sphere, ag_s2, &_mpr_sup_sphere, _ag_sph(48, 64, 0, 47), 0);
+_ag_pair(&_mpr_sup_sphere, ag_s2, &_mpr_sup_sphere, _ag_sph(48, 64, 0, 49), 2);
+# a POINT exactly on the surface, and a sixteenth either side of it
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(16, 0, 0, 0), 1);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(17, 0, 0, 0), 0);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(15, 0, 0, 0), 2);
+# two points: coincident (a touch) and a sixteenth apart (not)
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 0, 0), &_mpr_sup_sphere, _ag_sph(0, 0, 0, 0), 1);
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 0, 0), &_mpr_sup_sphere, _ag_sph(1, 0, 0, 0), 0);
+_ag_pair(&_mpr_sup_sphere, _ag_sph(8, 8, 8, 0), &_mpr_sup_sphere, _ag_sph(8, 8, 8, 0), 1);
+# fully contained
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_sphere, _ag_sph(0, 0, 0, 8), 2);
+
+# --- box/box: face, edge and corner tangency, each with both neighbours ---
+var ag_b_unit = _ag_box(0, 0, 0, 16, 16, 16);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(16, 0, 0, 16, 16, 16), 2);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(31, 0, 0, 16, 16, 16), 2);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(32, 0, 0, 16, 16, 16), 1);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(33, 0, 0, 16, 16, 16), 0);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(64, 0, 0, 16, 16, 16), 0);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(32, 32, 0, 16, 16, 16), 1);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(32, 32, 32, 16, 16, 16), 1);
+# corner touch pulled apart on ONE axis is separated; pushed together on one
+# axis is still a touch, because the other two axes still meet exactly.
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(33, 32, 32, 16, 16, 16), 0);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(31, 32, 32, 16, 16, 16), 1);
+# zero-volume: coplanar flat boxes, crossing segments, coincident points
+_ag_pair(&_mpr_sup_box, _ag_box(0, 0, 0, 16, 16, 0), &_mpr_sup_box,
+_ag_box(8, 8, 0, 16, 16, 0), 1);
+_ag_pair(&_mpr_sup_box, _ag_box(0, 0, 0, 16, 0, 0), &_mpr_sup_box,
+_ag_box(0, 0, 0, 0, 16, 0), 1);
+_ag_pair(&_mpr_sup_box, _ag_box(0, 0, 0, 0, 0, 0), &_mpr_sup_box,
+_ag_box(0, 0, 0, 0, 0, 0), 1);
+_ag_pair(&_mpr_sup_box, _ag_box(0, 0, 0, 0, 0, 0), &_mpr_sup_box,
+_ag_box(1, 0, 0, 0, 0, 0), 0);
+# a point box exactly on a face, and a sixteenth either side
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(16, 0, 0, 0, 0, 0), 1);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(17, 0, 0, 0, 0, 0), 0);
+_ag_pair(&_mpr_sup_box, ag_b_unit, &_mpr_sup_box, _ag_box(15, 0, 0, 0, 0, 0), 2);
+# anisotropic: the shape that made mpr_intersect report a false positive
+_ag_pair(&_mpr_sup_box, _ag_box(0, 0, 0, 16, 160, 160), &_mpr_sup_box,
+_ag_box(112, 0, 0, 96, 16, 16), 1);
+_ag_pair(&_mpr_sup_box, _ag_box(0, 0, 0, 16, 160, 160), &_mpr_sup_box,
+_ag_box(113, 0, 0, 96, 16, 16), 0);
+
+# --- sphere/box ---
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_box, _ag_box(31, 0, 0, 16, 16, 16), 2);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_box, _ag_box(32, 0, 0, 16, 16, 16), 1);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_box, _ag_box(33, 0, 0, 16, 16, 16), 0);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_box, _ag_box(0, 32, 0, 16, 16, 16), 1);
+_ag_pair(&_mpr_sup_sphere, ag_s_unit, &_mpr_sup_box, _ag_box(0, 0, 32, 16, 16, 16), 1);
+# zero-radius sphere exactly on a box CORNER, and a sixteenth either side
+_ag_pair(&_mpr_sup_sphere, _ag_sph(16, 16, 16, 0), &_mpr_sup_box, ag_b_unit, 1);
+_ag_pair(&_mpr_sup_sphere, _ag_sph(17, 16, 16, 0), &_mpr_sup_box, ag_b_unit, 0);
+# A zero-radius sphere strictly INSIDE the box: a single-point intersection, but
+# the MTV is the point's 1/16 distance to the nearest face, so it is class 2 and
+# gjk_epa_3d is right to report a depth of 0.0625 for it.
+_ag_pair(&_mpr_sup_sphere, _ag_sph(15, 15, 15, 0), &_mpr_sup_box, ag_b_unit, 2);
+# 3-4-5 again: a point box exactly r away from the sphere centre
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 0, 80), &_mpr_sup_box,
+_ag_box(48, 64, 0, 0, 0, 0), 1);
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 0, 79), &_mpr_sup_box,
+_ag_box(48, 64, 0, 0, 0, 0), 0);
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 0, 81), &_mpr_sup_box,
+_ag_box(48, 64, 0, 0, 0, 0), 2);
+# sphere resting exactly on a zero-height box
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 16, 16), &_mpr_sup_box,
+_ag_box(0, 0, 0, 16, 16, 0), 1);
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 17, 16), &_mpr_sup_box,
+_ag_box(0, 0, 0, 16, 16, 0), 0);
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 15, 16), &_mpr_sup_box,
+_ag_box(0, 0, 0, 16, 16, 0), 2);
+# point vs point across the two shape kinds
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 0, 0), &_mpr_sup_box,
+_ag_box(0, 0, 0, 0, 0, 0), 1);
+_ag_pair(&_mpr_sup_sphere, _ag_sph(0, 0, 0, 0), &_mpr_sup_box,
+_ag_box(1, 0, 0, 0, 0, 0), 0);
+
+# --- the same tangency at 2^-20 and 2^20 ---
+# A uniform dyadic scaling cannot change any of the three classifications, so
+# a fixture that changes answer under it has an ABSOLUTE epsilon somewhere in
+# the stack. 2^-20 is where the pre-2.9.0 cheap test reported 66 genuine
+# interior overlaps as misses, because the sphere support function's
+# hvec3_normalize floor (1e-12) is absolute.
+var ag_small = f64_div(F64_ONE, f64_from(1048576));
+var ag_big = f64_from(1048576);
+_ag_scale = ag_small;
+_ag_pair(&_mpr_sup_sphere, hvec4_new(0, 0, 0, _ag_qs(16, ag_small)), &_mpr_sup_box,
+_mpr_mkbox(_ag_qs(32, ag_small), 0, 0, _ag_qs(16, ag_small), _ag_qs(16, ag_small),
+_ag_qs(16, ag_small)), 1);
+_ag_pair(&_mpr_sup_sphere, hvec4_new(0, 0, 0, _ag_qs(16, ag_small)), &_mpr_sup_box,
+_mpr_mkbox(_ag_qs(31, ag_small), 0, 0, _ag_qs(16, ag_small), _ag_qs(16, ag_small),
+_ag_qs(16, ag_small)), 2);
+_ag_pair(&_mpr_sup_sphere, hvec4_new(0, 0, 0, _ag_qs(16, ag_small)), &_mpr_sup_box,
+_mpr_mkbox(_ag_qs(33, ag_small), 0, 0, _ag_qs(16, ag_small), _ag_qs(16, ag_small),
+_ag_qs(16, ag_small)), 0);
+_ag_scale = ag_big;
+_ag_pair(&_mpr_sup_sphere, hvec4_new(0, 0, 0, _ag_qs(16, ag_big)), &_mpr_sup_box,
+_mpr_mkbox(_ag_qs(32, ag_big), 0, 0, _ag_qs(16, ag_big), _ag_qs(16, ag_big),
+_ag_qs(16, ag_big)), 1);
+_ag_pair(&_mpr_sup_sphere, hvec4_new(0, 0, 0, _ag_qs(16, ag_big)), &_mpr_sup_box,
+_mpr_mkbox(_ag_qs(31, ag_big), 0, 0, _ag_qs(16, ag_big), _ag_qs(16, ag_big),
+_ag_qs(16, ag_big)), 2);
+_ag_pair(&_mpr_sup_sphere, hvec4_new(0, 0, 0, _ag_qs(16, ag_big)), &_mpr_sup_box,
+_mpr_mkbox(_ag_qs(33, ag_big), 0, 0, _ag_qs(16, ag_big), _ag_qs(16, ag_big),
+_ag_qs(16, ag_big)), 0);
+
+# --- the aggregate. These are the assertions that police the group's title. ---
+assert_eq(_ag_pairs, 110, "agreement sweep: 55 fixtures x 2 operand orders were evaluated");
+assert_eq(_ag_mismatch, 0,
+"agreement sweep: gjk_intersect_3d == gjk_epa_3d on EVERY swept pair (was 21 of 124)");
+assert_eq(_ag_falsepos, 0,
+"agreement sweep: no exactly-separated pair is reported as a contact");
+assert_eq(_ag_missov, 0,
+"agreement sweep: no pair with interior overlap is reported as a miss (was 66 at 2^-20)");
+assert_eq(_ag_touch, 46, "agreement sweep: every exact tangency is certified, both orders");
+assert_eq(_ag_baddepth, 0, "agreement sweep: a certified touch always carries depth exactly 0");
+
 test_group("time_of_impact: a reported collision carries a readable normal");
 
 # alloc() hands back zeroed pages, so when gjk_epa_3d returned without writing,
@@ -5662,6 +5914,17 @@ assert_eq(time_of_impact(&_mpr_sup_box, ep_fa, toi_zero, &_mpr_sup_box, ep_fb, t
 f64_from(10), toi_t2, toi_n2), 1, "coplanar flat boxes overlap at t = 0 -> hit");
 assert_neq(load64(toi_n2), 0, "t = 0 hit stores a real normal, not a NULL HVec3");
 assert_eq(_ac_len_sq_e9(toi_n2), 1000000000, "t = 0 hit stores a unit normal");
+
+# 2.9.0: time_of_impact's t = 0 overlap test IS gjk_intersect_3d, so the
+# tangency repair reaches it. Two shapes exactly touching at t = 0 are in
+# contact at t = 0, and now report so even with no relative motion at all --
+# before, the cheap test said "apart" and the zero-speed early out returned 0.
+store64(toi_n2, 0);
+store64(toi_t2, F64_ONE);
+assert_eq(time_of_impact(&_mpr_sup_sphere, ep_sph, toi_zero, &_mpr_sup_box, ep_box, toi_zero,
+f64_from(10), toi_t2, toi_n2), 1, "tangent pair at rest: contact at t = 0 (was 0)");
+assert_eq(load64(toi_t2), 0, "tangent pair at rest: t is exactly 0");
+assert_eq(_ac_len_sq_e9(toi_n2), 1000000000, "tangent pair at rest: normal is a unit vector");
 
 # The swept branch stores its normal through the same guard.
 store64(toi_n2, 0);

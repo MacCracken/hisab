@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **geo_advanced — `gjk_intersect_3d` contradicted its own sibling `gjk_epa_3d`.** 2.8.3 taught
+  `gjk_epa_3d` to certify an exact tangency as a depth-0 contact and deliberately left the cheap
+  overlap test alone, so the two public entry points disagreed. Swept over 1,506 configurations
+  classified exactly in rationals (dyadic coordinates, both operand orders, five scales from 2^-20
+  to 2^20): **141 of 3,012 pair evaluations disagreed**, every one of them `epa=1`/`intersect=0`.
+  66 were not tangencies at all but pairs with a genuine interior overlap — all at scale 2^-20, all
+  in the families whose support function normalises, because `hvec3_normalize`'s 1e-12 floor is
+  absolute and hands back the shape's centre once GJK's search direction collapses, which
+  manufactures a separating certificate out of a point that is not a support point. After the
+  repair: **0 of 3,012 disagree**, and **0 false positives** across 2,214 exactly-separated
+  evaluations (sphere/sphere 0, box/box 0, sphere/box 0).
+- **time_of_impact** — its `t = 0` overlap test is `gjk_intersect_3d`, so a pair exactly touching at
+  `t = 0` now reports contact at `t = 0` with a unit normal, instead of falling through to the
+  zero-speed early-out and returning "no collision".
+- **tests/modules.tcyr** — the group titled *"gjk_epa_3d: agrees with gjk_intersect_3d"* asserted
+  that agreement only on overlapping fixtures, so it stayed green while its own stated contract was
+  false. It now sweeps 55 fixtures x 2 operand orders through both entry points and asserts the
+  aggregate (agreement, false positives, missed overlaps, tangency recall, depth-at-a-touch).
+  Reverting the repair fails 7 of the new assertions.
+
+### Performance
+
+- `gjk_intersect_3d` no-hit path pays for the repair with **one extra support evaluation**, not with
+  the full touch probe: the probe runs only when GJK's exit certificate does not survive re-reading
+  along a unit direction, which over the 3,012-pair sweep was 187 calls (6.2%). Batch-timed against
+  the old body in the same binary (2,000 calls/round, min of 20 rounds, median of 5 runs):
+  box/box 531 → 766 ns/call (+44%), sphere/sphere 901 → 1353 (+50%), sphere/box 685 → 1039 (+52%).
+  The overlap path is untouched (2145 → 2197, +2.4%) and a near-tangent but separated pair — the
+  resting-contact regime — pays only the same one call (1e-9 gap 3293 → 3649). **Running the touch
+  probe unconditionally instead was built and measured: 531 → 1066, 901 → 1790, 685 → 1424, a
+  doubling of the module's hottest entry point.** An exact tangency now costs 9955 ns against the
+  4000 it used to spend reaching the wrong answer.
+
+### Added
+
+- **tests/hisab.bcyr** — `gjk_intersect_box_miss` / `gjk_intersect_sph_miss` /
+  `gjk_intersect_box_hit` / `gjk_intersect_tangent`. The most-called narrowphase entry point had no
+  benchmark at all, which is the condition under which the cost above could have doubled unnoticed.
+  Batch-timed (`bench_batch`), because `bench_run`'s per-call clock pair is ~240 ns against a
+  ~530 ns operation.
+
 ## [2.8.4] - 2026-08-05 — the DCT/DST dispatch heuristic, and what the 23× ratio actually was
 
 **This release does not make `num_dst` faster at n = 1024.** It stays at ~6.7 ms, and

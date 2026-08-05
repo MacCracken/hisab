@@ -11,20 +11,28 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.8.2
+## Current — v2.8.4
 
-Suite **1818**, `cyrius coverage` **97%** (all 35 files referenced), 38 benchmarks, constant gate
-**147/147** plus a duplicate-global check. All gates green.
+Suite **2271** across four harnesses, 40 benchmarks, constant gate **153/153** plus a
+duplicate-global check. All gates green (`lint` 0 warnings, `fmt --check` clean across
+`.cyr`/`.tcyr`/`.bcyr`/`.fcyr`, `vet` 2 deps / 0 untrusted, `fuzz` 1/0).
 
-Shipped since 2.6.15: the 2.7.0 re-audit and repair arc, 2.7.1–2.7.3 (performance landings and
-coverage to 97%), 2.8.0 (`delaunay_2d` rewritten with triangle adjacency), 2.8.1 (full audit), and
-2.8.2 (delaunay completeness via symbolic ghost vertices).
+Shipped since 2.8.2: **2.8.3**, the eight-track audit-repair merge — the narrowphase now returns
+the exact MTV (862/862 against a reference computed in Python `Fractions`, worst relative error
+1.6e-9, against `mpr_penetration`'s prior 66/455 with 216 wrong signs), `time_of_impact` replaced
+its fixed-step sampler with real conservative advancement, and `gjk_epa_3d` gained an out-param
+contract on every return path. **2.8.4** corrected the DCT/DST dispatch heuristic.
 
-**Open against the tree:** the 2026-08-04 audit found **42 findings, 0 refuted** — 4 critical, 17
-high, 16 medium, 5 low. One critical is fixed; two were repaired, adversarially verified, and
-**rejected for regressing another input class**. The full record and per-finding disposition live in
-[`../audit/2026-08-04-v2.8.0-full.md`](../audit/2026-08-04-v2.8.0-full.md). They gate 2.9.0; they
-are not roadmap items.
+**This retired most of what 2.9.0 was scoped to deliver** — see that section, which has been
+rewritten to what actually remains rather than left describing a tree that no longer exists.
+
+**Open against the tree:** of the 2026-08-04 audit's **42 findings**, the bulk were discharged by
+2.8.3. The remaining gap is not a finding count, it is that
+[`../audit/2026-08-04-v2.8.0-full.md`](../audit/2026-08-04-v2.8.0-full.md) has **no disposition
+column** — its table is `| Sev | Dimension | Finding | Site |`. The doc asserts the standing rule
+that "the finding list is the unit of disposition" and then provides nowhere to record one, which
+is the same shape as the 2.7.0 failure it was written to prevent. Closing that is 2.9.0 exit
+criterion 5, and it is a mechanism gap, not a roadmap item.
 
 ## 2.6.12–2.6.15 -- Audit & repair arc  **CLOSED**
 
@@ -64,7 +72,7 @@ appear on this page at all.
 
 | Release | Deliverable | Gated on |
 |---|---|---|
-| **2.9.0** | A narrowphase a physics engine can build on | audit tracks A–C discharged |
+| **2.9.0** | A narrowphase a physics engine can build on | sibling agreement + abuse harness + finding disposition (exact-MTV and arena bound shipped in 2.8.3) |
 | **2.10.0** | Differentiable geometry (autodiff through intersections) | 2.9.0 |
 | **2.11.0** | Reverse-mode autodiff (tape-based) | 2.10.0 |
 | **3.0.0** | `Result<T,E>` API — breaking | 2.11.0 feature-complete |
@@ -73,34 +81,43 @@ appear on this page at all.
 
 ## 2.9.0 — a narrowphase a physics engine can build on
 
-**The capability:** today a consumer cannot trust a contact. `mpr_penetration` returns the wrong
-sign on a third of box pairs, `time_of_impact` misses half of real swept collisions and writes a
-NULL normal while returning "hit", `gjk_epa_3d` burns 1.23 MB of never-freed arena per call. impetus,
-kiran and joshua all sit on this. 2.9.0 makes the narrowphase contract true, and — equally — makes
-it *stay* true, because the current suite cannot tell.
+**Most of this shipped early, inside 2.8.3.** The capability statement this section carried —
+"a consumer cannot trust a contact" — is no longer true: the wrong-sign penetration depth, the
+swept query that missed half its collisions and published a NULL normal, and the 1.23 MB of
+never-freed arena per call are all fixed and measured. So is every item this section had
+"deliberately deferred to 2.9.1" (spatial-hash bucket growth, BVH centroid recomputation, the
+O(n²) DCT/DST — the last in 2.8.4). Rewritten below to what actually remains, rather than left
+describing a tree that no longer exists.
 
-**What a consumer can rely on after 2.9.0:**
-- A penetration depth that agrees in sign and magnitude with the exact minimum translation vector,
-  with a published worst-case relative error.
-- A swept query that finds every collision inside `max_t`, and never reports a hit without a normal.
-- Bounded arena per narrowphase call, asserted — so a physics step of a few hundred contacts does
-  not exhaust a bump allocator that never frees.
-- No public entry point that crashes or corrupts the heap on hostile input.
+**What a consumer can already rely on (2.8.3):** a penetration depth agreeing with the exact MTV
+in sign and magnitude, worst relative error **1.6e-9** over 862 configurations in 35 shape
+classes; a swept query using real conservative advancement; and `gjk_epa_3d` writing both
+out-params on **every** return path, so a `1` return always carries a readable normal.
 
-**Exit criteria** (measurable; the release does not cut until all hold):
-1. Narrowphase matches an independent exact reference — 15-axis OBB SAT for boxes, closed form for
-   spheres — with **zero wrong-sign results** and a stated worst-case error.
+**Exit criteria** — 2 of 5 met, and the release does not cut until all do:
+
+1. ~~Narrowphase matches an independent exact reference with zero wrong-sign results and a stated
+   worst-case error.~~ **MET (2.8.3)** — 862/862, worst 1.6e-9, reference computed in exact
+   rationals and never from a previous hisab output.
 2. An abuse harness (negative indices, zero/huge dims, non-conformable operands, the designed-0
-   return, degenerate geometry) runs clean: no exit 139, no canary overwrite.
-3. Arena per narrowphase call bounded **and asserted**, not merely improved.
-4. Every fix mutation-proven, with the mutation set including the shape family that broke the prior
-   attempt — not just the reported reproducer.
-5. Every one of the 42 audit findings has an explicit disposition: fixed, refuted, or deferred with
-   a reason. (Standing rule since two findings were never scheduled in 2.7.0.)
+   return, degenerate geometry) runs clean: no exit 139, no canary overwrite. **OPEN** — two
+   canary assertions exist; there is no harness.
+3. ~~Arena per narrowphase call bounded **and asserted**.~~ **MET** — `assert_lt(alloc_used() -
+   before, 262144)` per narrowphase call, plus a separate EPA arena bound.
+4. Every fix mutation-proven, with the mutation set including the shape family that broke the
+   prior attempt — not just the reported reproducer. **PARTIAL.**
+5. Every one of the 42 audit findings has an explicit disposition: fixed, refuted, or deferred
+   with a reason. **OPEN, and blocked on a mechanism** — the audit table has no disposition
+   column, so the standing rule it states cannot currently be satisfied by anyone.
 
-**Deliberately deferred to 2.9.1** — real wins, no consumer blocked, and every optimisation in this
-repo so far has needed a regression cycle: `spatial_hash` bucket growth, `_bvh_build_rec` centroid
-recomputation, O(n²) DCT/DST. Correctness releases do not carry optimisation risk.
+**The one narrowphase defect still open**, deferred out of 2.8.3 deliberately rather than missed:
+`gjk_epa_3d` and `gjk_intersect_3d` **disagree** on 4 of 90 swept pairs — exact tangency in both
+operand orders, and two coincident degenerate-point pairs. `gjk_epa_3d` is the correct one (two
+touching convex sets do intersect), so `gjk_intersect_3d` is what needs repair. It is a hot public
+entry point that consumers call per pair per frame, and the probe that fixes it measured at roughly
+double the no-hit path cost on `gjk_epa_3d`, so it needs its own cost measurement before it lands.
+The suite does **not** currently police this: the test group named "agrees with `gjk_intersect_3d`"
+exercises that agreement only on overlapping fixtures.
 
 ---
 

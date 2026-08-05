@@ -232,7 +232,18 @@ fn _gjk_do_simplex(simplex, dir_ptr) {
 }
 
 # Core GJK 3D. Returns the simplex pointer if intersecting, 0 if not.
-fn _gjk_core_3d(sup_a, shape_a, sup_b, shape_b) {
+#
+# out_dir (pass 0 to skip) PUBLISHES THE CERTIFICATE THIS EXITED ON. On a 0
+# return it receives the search direction whose support value came out negative
+# -- the claimed separating plane -- or the NULL HVec3 when the loop ran out of
+# iterations and there is no certificate at all. Nothing else changes: the
+# direction sequence, the simplex, and the return value are byte-identical to
+# what every existing caller already gets, and a caller passing 0 pays nothing.
+# gjk_intersect_3d is the only consumer; see the certificate re-reading there.
+fn _gjk_core_dir_3d(sup_a, shape_a, sup_b, shape_b, out_dir) {
+    # alloc() does NOT zero (only a fresh mmap chunk is zero), so the "no
+    # certificate" value is written explicitly rather than assumed.
+    if (out_dir != 0) { store64(out_dir, 0); }
     var simplex = _gjk_simplex_new();
     var dir = hvec3_unit_x();
     var dir_slot = alloc(8);
@@ -271,6 +282,7 @@ fn _gjk_core_3d(sup_a, shape_a, sup_b, shape_b) {
 
         var new_pt = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir);
         if (f64_lt(hvec3_dot(new_pt, dir), 0) == 1) {
+            if (out_dir != 0) { store64(out_dir, dir); }
             return 0;  # No intersection
         }
         _gjk_simplex_push(simplex, new_pt);
@@ -282,12 +294,120 @@ fn _gjk_core_3d(sup_a, shape_a, sup_b, shape_b) {
     return 0;
 }
 
+fn _gjk_core_3d(sup_a, shape_a, sup_b, shape_b) {
+    return _gjk_core_dir_3d(sup_a, shape_a, sup_b, shape_b, 0);
+}
+
+# Is GJK's exit certificate a GENUINE separating plane? Returns 1 only when it
+# provably is, 0 otherwise (including "cannot tell").
+#
+# For a UNIT direction n, h_M(n) = n . support_M(n) is the signed distance from
+# the origin to M's supporting plane with normal n, so h_M(n) < 0 proves every
+# point of M lies strictly on one side of the plane through the origin: the
+# origin is strictly OUTSIDE M. One support evaluation, and the TEST carries no
+# tolerance -- it is a strict f64_lt against zero.
+#
+# WHAT THAT DOES **NOT** MEAN. The test is exact; the CONCLUSION is only as good
+# as the support evaluation feeding it. `support_M(n)` is computed in f64, so at
+# large coordinate magnitudes its absolute error grows with the scale -- around
+# 1e-9 at radius ~5e6 -- and a genuinely TANGENT pair can hand back a slightly
+# negative dot. Measured: 5 of 2,440 evaluations at scale 2^20 (sphere/sphere,
+# off-axis triple tangency, one operand order) are certified apart when they
+# touch. That direction is the safe one -- this gate can only ever SKIP the
+# probe, so its failure mode is a MISSED touch, never a false contact -- and it
+# is the pre-2.9.0 answer for those fixtures, not a regression. But do not read
+# "exact" as "correct at every scale": it is not, and the residual is recorded
+# here rather than left for the next reader to rediscover.
+#
+# WHY IT IS RE-READ AT ALL. GJK's own certificate is dot(support_M(dir), dir)
+# with an UNNORMALISED dir, and the sign of that is only as good as the support
+# point it was taken at. A support function written the documented way,
+# centre + r * hvec3_normalize(dir), returns the shape's CENTRE once |dir| falls
+# under hvec3_normalize's 1e-12 floor -- and |dir| COLLAPSES precisely when the
+# origin approaches the boundary of the difference, i.e. at a tangency. The
+# centre is still a member of the difference, so the dot is still negative and
+# GJK still exits, but the plane it names supports nothing: the certificate is
+# manufactured. Re-reading it with a unit direction cannot manufacture anything,
+# because support_M(n) at |n| = 1 is a real support point of M.
+#
+# A pair that fails this test is not thereby overlapping -- it is UNRESOLVED,
+# and the caller escalates to the exact touch certificate.
+fn _gjk_certifies_apart(sup_a, shape_a, sup_b, shape_b, dir) {
+    if (dir == 0) { return 0; }
+    var nd = _epa_unit(dir);
+    if (f64_gt(hvec3_length_sq(nd), 0) == 0) { return 0; }
+    var p = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, nd);
+    return f64_lt(hvec3_dot(p, nd), 0);
+}
+
 # GJK intersection test (3D). Returns 1 if shapes overlap, 0 otherwise.
 # support_a/support_b: function pointers  fn(shape, dir) -> HVec3
+#
+# 2.9.0: AGREES WITH gjk_epa_3d ON EXACT TANGENCY. GJK's containment test is
+# strict -- it reports a hit only once a simplex ENCLOSES the origin -- so two
+# convex sets touching at a point, whose difference has the origin exactly on its
+# boundary, came back 0 while gjk_epa_3d (which has certified that case since
+# 2.8.3) came back 1 with depth 0. Swept over 1,506 configurations classified
+# EXACTLY in rationals (dyadic coordinates, so the reference is exact in both
+# f64 and Fractions), both operand orders, five scales from 2^-20 to 2^20: the
+# two entry points disagreed on 141 of 3,012 pair evaluations. Two convex sets
+# that touch DO intersect -- their intersection is that point -- so this is the
+# one that was wrong. 66 of the 141 were not even tangencies but pairs with a
+# genuine INTERIOR overlap, all of them at scale 2^-20 and all in the two
+# families whose support function normalises (see below): gjk_intersect_3d was
+# reporting "apart" for shapes that provably overlap.
+#
+# THE REPAIR IS GATED, and the gate is the whole design. Running
+# _epa_touch_probe on every no-hit return -- the obvious repair -- was built and
+# batch-timed against the old body IN THE SAME BINARY (2,000 calls per round,
+# min of 20 rounds, median of 5 runs): box/box 531 -> 1066 ns/call, sphere/sphere
+# 901 -> 1790, sphere/box 685 -> 1424. That is a DOUBLING of the cheapest and
+# most-called entry point in the module, paid by every broadphase pair that does
+# NOT touch, which is nearly all of them. Instead the no-hit path first re-reads
+# GJK's own exit certificate along a unit direction -- ONE support evaluation.
+# When it holds, the pair is apart and the probe is skipped. Same fixtures, same
+# binary: box/box 531 -> 766 ns/call (+44%), sphere/sphere 901 -> 1353 (+50%),
+# sphere/box 685 -> 1039 (+52%).
+#
+# THOSE THREE RATIOS ARE UNDERSTATED, and the honest figure is +50% to +63%,
+# MEDIAN +55%. The same-binary harness above never calls alloc_reset, so the
+# arena grows across the run and adds roughly 100 ns of soft page faults to BOTH
+# terms -- which inflates the baseline and deflates the ratio. Two independent
+# methods agree at ~1.55: two builds differing only in this file (HEAD vs working
+# tree), and a same-binary reconstruction, over nine separated fixtures in both
+# shape families. The suite's own `gjk_intersect_box_miss` row prints min=807 ns
+# against the 766 quoted here, which is the same discrepancy visible from the
+# outside. Quote +55% when quoting this change, not +44%. The OVERLAP path is
+# untouched (2145 -> 2197, +2.4%, one 8-byte alloc), and a near-tangent but
+# still separated pair -- the resting-contact regime a physics broadphase lives
+# in -- pays only that same one support call (1e-9 gap 3293 -> 3649, 1e-15 gap
+# 3963 -> 4340), because the certificate still re-reads clean there. Only a
+# genuinely unresolved exit runs the probe: over the 3,012-pair sweep 187 did
+# (6.2%) -- 88 tangencies, 66 genuine overlaps GJK's own core had missed, and 33
+# separated pairs the probe then correctly rejected. All 3,012 answers now agree
+# with gjk_epa_3d. An exact tangency costs 9955 ns against the 4000 it used to spend
+# arriving at the wrong answer.
+#
+# The gate cannot manufacture a contact: it only ever SKIPS the probe, and it
+# skips on a proof of separation. Its failure direction is a missed touch --
+# exactly the pre-2.9.0 answer -- never a false one. Measured false positives
+# against the exact reference: 0 of 2,214 separated pair evaluations
+# (sphere/sphere 0, box/box 0, sphere/box 0).
 fn gjk_intersect_3d(support_a, shape_a, support_b, shape_b) {
-    var result = _gjk_core_3d(support_a, shape_a, support_b, shape_b);
+    var exit_dir = alloc(8);
+    if (exit_dir == 0) { return 0; }
+    var result = _gjk_core_dir_3d(support_a, shape_a, support_b, shape_b, exit_dir);
     if (result != 0) { return 1; }
-    return 0;
+    if (_gjk_certifies_apart(support_a, shape_a, support_b, shape_b, load64(exit_dir)) == 1) {
+        return 0;
+    }
+    # Unresolved: either the certificate did not survive re-reading, or the loop
+    # exhausted its iterations without producing one (two coincident zero-size
+    # shapes never produce one -- every support value is exactly 0). Settle it
+    # with the same exact touch certificate gjk_epa_3d uses.
+    var touch_n = alloc(8);
+    if (touch_n == 0) { return 0; }
+    return _epa_touch_probe(support_a, shape_a, support_b, shape_b, touch_n);
 }
 
 # --- EPA 3D (Expanding Polytope Algorithm) ---

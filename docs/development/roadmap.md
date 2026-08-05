@@ -11,32 +11,20 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current -- v2.6.15
+## Current — v2.8.2
 
-- **34 math modules in `src/`, ~16,900 lines** (`lib/` is vendored-only)
-- **1127 test assertions** (foundation 307 + hisab 205 + edge_cases 199 + modules 416), 28 benchmarks (incl. amplified SIMD batches), fuzz harness (1/1), and `scripts/check-constants.sh` verifying **110/110** hand-encoded f64 constants against their own comments. `cyrius coverage` **348/587 (59%)**, files 34/35 — **all 34 modules now covered by a suite**
-- **CLI smoke binary** ~207 KB static ELF
-- **`dist/hisab.cyr` distlib bundle** ~17,286 lines / 578 KB (all **34 modules**) — fits cycc 6.5.6's 1 MB input_buf with ample headroom
-- Toolchain **6.5.6**, sakshi **2.4.7**. CI fmt/lint/vet/security green; supply chain SHA-locked
-  (`cyrius.lock` 30 deps, verify 30/30). Pin/vendoring detail lives in
-  [`dependency-watch.md`](dependency-watch.md); the 6.5.6 bump story is CHANGELOG 2.6.11
-- **Tracked toolchain issues: 3 open, all worked around** — interval-ident-lex and
-  for-empty-clauses re-confirmed live on 6.5.6; cli-arg-clobber not re-tested (destructive).
-  See [`issues/`](issues/)
-- **Arc history** — 2.3.x (optimization/modernization), 2.4.x (collision-correctness + security),
-  2.5.x (CGA depth), 2.6.0–2.6.5 (differential-geometry depth), 2.6.6–2.6.11 (toolchain/dependency
-  maintenance), **2.6.12–2.6.15 (audit & repair)**. Per-version detail is in the Release History
-  table + CHANGELOG; equation material in [`../architecture/math.md`](../architecture/math.md).
-  Suite grew 825 → 1127 across them
-- **The 2.6.x line is closed** — features ended at 2.6.5, and the repair arc discharged the
-  2026-08-03 audit in full. Nothing carries forward; 2.7.0 is next
-- ⚠️ **Standing caution for future closeouts.** The "posture audited solid" verdicts of the 2.5.4
-  and 2.6.5 closeouts did **not** hold: both were scoped to the functions their own arc had just
-  added and never reached the modules no suite included. The 2026-08-03 sweep then found 70
-  defects, 2 critical, almost all in exactly those modules. **An audit's scope is part of its
-  result** — say what was not looked at
+Suite **1818**, `cyrius coverage` **97%** (all 35 files referenced), 38 benchmarks, constant gate
+**147/147** plus a duplicate-global check. All gates green.
 
----
+Shipped since 2.6.15: the 2.7.0 re-audit and repair arc, 2.7.1–2.7.3 (performance landings and
+coverage to 97%), 2.8.0 (`delaunay_2d` rewritten with triangle adjacency), 2.8.1 (full audit), and
+2.8.2 (delaunay completeness via symbolic ghost vertices).
+
+**Open against the tree:** the 2026-08-04 audit found **42 findings, 0 refuted** — 4 critical, 17
+high, 16 medium, 5 low. One critical is fixed; two were repaired, adversarially verified, and
+**rejected for regressing another input class**. The full record and per-finding disposition live in
+[`../audit/2026-08-04-v2.8.0-full.md`](../audit/2026-08-04-v2.8.0-full.md). They gate 2.9.0; they
+are not roadmap items.
 
 ## 2.6.12–2.6.15 -- Audit & repair arc  **CLOSED**
 
@@ -67,170 +55,80 @@ a future reader needs:
 
 ---
 
-## 2.8.x -- audit repair arc  (OPEN)
+## Release train
 
-Driven by [`../audit/2026-08-04-v2.8.0-full.md`](../audit/2026-08-04-v2.8.0-full.md): **42 findings
-confirmed, 0 refuted** across six adversarially-verified dimensions — 4 critical, 17 high, 16
-medium, 5 low. Ordered by severity. **The finding list is the unit of disposition, not this
-summary** — every row in the audit table gets an explicit outcome before 2.8.x closes.
+What each release **delivers to a consumer**. Defects are not roadmap items — they are tracked in
+`../audit/2026-08-04-v2.8.0-full.md` and discharged as a **precondition** of the release they gate,
+not as line items here. If a finding does not change what a consumer can rely on, it does not
+appear on this page at all.
 
-### 2.8.2 -- critical  **(1 of 4 landed; 2 rejected on verification, 1 folded in)**
+| Release | Deliverable | Gated on |
+|---|---|---|
+| **2.9.0** | A narrowphase a physics engine can build on | audit tracks A–C discharged |
+| **2.10.0** | Differentiable geometry (autodiff through intersections) | 2.9.0 |
+| **2.11.0** | Reverse-mode autodiff (tape-based) | 2.10.0 |
+| **3.0.0** | `Result<T,E>` API — breaking | 2.11.0 feature-complete |
 
-- [x] **delaunay_2d silently incomplete on ordinary uniform-random input** — fixed by REMOVING the
-      super-triangle, not retuning it. Vertices n..n+2 are now **symbolic ghosts** (the limit of
-      `A + M*u_k` as `M -> inf`), every ghost predicate decided by the sign of the leading
-      coefficient in `M`. 534/769 -> **729/769** point sets fully correct across 22 classes,
-      **0 regressions**, 195 improvements; 57,600 exact-rational checks of the ghost rules at
-      M = 1e5..1e34 with zero failures *(2.8.2)*
-- [x] **Folded in by the above, at no extra cost:** the separately-filed 1e-20-cluster failure
-      (0/40 -> 40/40) and the aspect-1e6 thin-strip failure (0/40 -> 40/40). They were the same
-      coupling seen from the other end *(2.8.2)*
-- [ ] **`gjk_epa_3d` O(k^2) — REPAIR REJECTED, do not simply retry.** The heap + flood-fill rewrite
-      achieves quadratic -> linear on evaluations, time AND arena (8,576 -> 812 face evals;
-      1.23 MB -> 99.6 KB), but its flood fill **under-reports the visible set when rounding splits
-      that set into disconnected components** (239 of 47,134 cases), and a deterministic
-      cylinder-vs-rotated-box case returns a depth **40.7x too small** where the shipped code is
-      right. The verifier's suggested remedies, in preference order:
-      (a) an O(1)-per-iteration self-check — EPA's closest-face distance must be **non-decreasing**,
-          so a decrease proves polytope corruption and triggers a full-scan restart;
-      (b) keep only the cached face records + min-heap + hoisted buffers and **drop the flood fill**
-          — that alone removes the alloc-per-face and the closest-face rescan, and may retain most
-          of the win with none of the risk;
-      (c) validate that the horizon closes into exactly one cycle, O(horizon), which detects the
-          disconnected-region case directly.
-      **Add the reproducer as a fixture** (exact depth 0.19783922047988); nothing in the 1818-
-      assertion suite catches it, and the added tests used no curved support against a rotated box.
-- [ ] **`mpr_penetration` wrong/negative depth — REPAIR REJECTED** on the same grounds: removes the
-      defect, regresses another class. Retry against the verifier's exact reference set.
-- [ ] `gjk_epa_3d` / `mpr_penetration` wrong depths for sphere-vs-box — untouched by the rejected
-      EPA repair, which explicitly left the depth-accuracy findings alone (per-class mean error
-      identical to the bit)
+---
 
-### 2.8.3 -- high
+## 2.9.0 — a narrowphase a physics engine can build on
 
-- [ ] time_of_impact returns 1 ("collision found") while storing a NULL HVec3 pointer into out_normal — it ignores gjk_epa_3d's failure return
-      `src/geo_advanced.cyr:773 and :820 (both stores verified present at those exact lines)` *(api-consistency)*
-- [ ] bvh_query_ray silently drops entire subtrees: geo_ray_aabb returns 0 for both "miss" and "hit at t=0", and the BVH walker uses `== 0` as its prune tes
-      `src/geo_advanced.cyr:641 (verified: `if (geo_ray_aabb(ray, aabb) == 0) { return 0; }`)` *(api-consistency)*
-- [ ] svd_golub_kahan writes past out_U whenever rows < cols — its own "m >= n" contract is never checked
-      `src/linalg_precision.cyr:752 (entry, `fn svd_golub_kahan`); OOB store at src/linalg_precis` *(memory-safety)*
-- [ ] tensor_add / tensor_scale / tensor_contract dereference einsum's and tensor_new's documented 0-on-failure return, and tensor_add over-reads b on shape
-      `src/tensor.cyr:88 (tensor_add), src/tensor.cyr:103 (tensor_scale), src/tensor.cyr:119 (ten` *(memory-safety)*
-- [ ] calc_partial_derivative bounds-checks only the upper end of `index`; a negative index reads and writes before the buffers
-      `src/calc_ext.cyr:60` *(memory-safety)*
-- [ ] tensor_contract never validates idx_i / idx_j against the tensor's rank
-      `src/tensor.cyr:121` *(memory-safety)*
-- [ ] sequential_impulse never converges for restitution >= 1 (period-2 oscillation, answer depends on the parity of `iterations`); restitution has no effec
-      `/home/macro/Repos/hisab/src/collision_core.cyr:294 (delta) and :306-316 (friction block)` *(numerical)*
-- [ ] time_of_impact misses real collisions — 48 of 101 swept sphere pairs report "no collision" although contact occurs well inside max_t; the doc claims c
-      `/home/macro/Repos/hisab/src/geo_advanced.cyr:748 (doc: "Uses conservative advancement"), :` *(numerical)*
-- [ ] calc_monotone_cubic is not monotone — the Fritsch-Carlson sign condition is missing, so the interpolant overshoots both endpoints on a strictly monoto
-      `/home/macro/Repos/hisab/src/calc_ext.cyr:667-687 (monotonicity constraint block)` *(numerical)*
-- [ ] spatial_hash_* has a hard-coded 1,024 buckets that never grows, so every query costs Θ(n/1024) instead of Θ(1)
-      `src/spatial.cyr:810 (`var _SH_BUCKET_COUNT = 1024;`), consumed at :821 (mask), :865 (inser` *(performance)*
-- [ ] _bvh_build_rec recomputes every primitive's centroid at every tree level and allocates 5 heap blocks per bounds merge — 36.6 MB of arena to build a 16
-      `src/geo_advanced.cyr:555 (`bounds = _bvh_aabb_merge(...)`) and src/geo_advanced.cyr:584 (`` *(performance)*
-- [ ] cmat_kronecker, cmat_mul_vec and cmat_exp dereference the capped-constructor 0 that the other seven cmat_* functions guard
-      `/home/macro/Repos/hisab/src/complex.cyr:379 (cmat_kronecker `var ar = cmat_rows(a)`), :245` *(regression)*
-- [ ] Every ODE test integrand reaching ode_dopri45 is autonomous, so the DOPRI45 abscissa row (c2..c7) is certified by nothing
-      `src/ode.cyr:157,162,169,177,186 (stage times t2..t6); fixtures tests/hisab.tcyr:563 `_ode_` *(test-quality)*
-- [ ] All four noise functions can be replaced by `return 0;` and the suite stays green
-      `src/noise_simplex.cyr:96 simplex_2d, :177 simplex_3d; src/calc.cyr:446 perlin_2d; src/calc` *(test-quality)*
-- [ ] christoffel_symbols is only ever called with an all-zero metric-derivative array, so its formula is unreachable by the suite
-      `src/diffgeo.cyr:64-104 (bracket at :90); fixtures tests/modules.tcyr:1325-1332 and tests/h` *(test-quality)*
-- [ ] opt_bfgs, opt_lbfgs and opt_levenberg_marquardt are asserted only through their input-validation guards; ~490 lines of solver body never run
-      `src/optimize.cyr:282 opt_bfgs, :434 opt_lbfgs, :631 opt_levenberg_marquardt (file is 770 l` *(test-quality)*
-- [ ] num_tridiag_solve is tested only on a DIAGONAL system, so the entire Thomas elimination and back-substitution are multiplied by zero
-      `src/num_ext.cyr:704-773 (back-substitution at :769); fixture tests/modules.tcyr:2262-2279` *(test-quality)*
+**The capability:** today a consumer cannot trust a contact. `mpr_penetration` returns the wrong
+sign on a third of box pairs, `time_of_impact` misses half of real swept collisions and writes a
+NULL normal while returning "hit", `gjk_epa_3d` burns 1.23 MB of never-freed arena per call. impetus,
+kiran and joshua all sit on this. 2.9.0 makes the narrowphase contract true, and — equally — makes
+it *stay* true, because the current suite cannot tell.
 
-### 2.8.4 -- medium
+**What a consumer can rely on after 2.9.0:**
+- A penetration depth that agrees in sign and magnitude with the exact minimum translation vector,
+  with a published worst-case relative error.
+- A swept query that finds every collision inside `max_t`, and never reports a hit without a normal.
+- Bounded arena per narrowphase call, asserted — so a physics step of a few hundred contacts does
+  not exhaust a bump allocator that never frees.
+- No public entry point that crashes or corrupts the heap on hostile input.
 
-- [ ] gjk_epa_3d returns 0 ("not penetrating") for shapes its own sibling gjk_intersect_3d reports as overlapping, and leaves both out-params unwr *(api-consistency)*
-- [ ] halfedge_from_triangles aborts the process instead of returning the documented 0 on error *(api-consistency)*
-- [ ] ivl_div's divide-by-zero widening returns a finite [-1e9, 1e9] that does not enclose the true range — the module's own stated soundness cont *(api-consistency)*
-- [ ] einsum accepts a repeated output label and returns a confidently wrong tensor instead of the documented 0-on-error *(api-consistency)*
-- [ ] cmat_exp / cmat_mul_vec / cmat_kronecker / cmat_inverse dereference the designed 0 that cmat_new and cmat_mul return — the 2.7.0-B null-guar *(memory-safety)*
-- [ ] num_halton crashes with SIGFPE on base 0 and never terminates on base 1 *(memory-safety)*
-- [ ] spatial_hash_query_radius has an unbounded (radius/cell_size)^3 triple loop *(memory-safety)*
-- [ ] svd_golub_kahan silently returns wrong singular values for a wide matrix (m < n) — the documented m >= n precondition is never checked and t *(numerical)*
-- [ ] num_dct / num_idct / num_dst / num_idst are O(n²) while an O(n log n) num_fft ships alongside them *(performance)*
-- [ ] calc_hessian's mixed-partial block is never asserted, and the test function is separable so the true value is zero anyway *(test-quality)*
-- [ ] calc_catmull_rom is tested only at t=0 and t=1 on collinear equally-spaced points, where the t^2 and t^3 coefficients are identically zero *(test-quality)*
-- [ ] Adaptive Simpson is tested only on x^2, for which a single unrefined Simpson panel is already exact, so the entire refinement machinery is d *(test-quality)*
-- [ ] ode_bdf is exercised only at order 4 with f == 0 and a constant history, leaving beta unconstrained and orders 2/3/5 unreachable *(test-quality)*
-- [ ] The se3_adjoint assertion passes a 24-byte HVec3 where a 48-byte twist is required; the non-null check hides a 24-byte out-of-bounds read *(test-quality)*
-- [ ] so3_from_mat3 documents a validation it does not perform, and the only assertion is that it returns non-null *(test-quality)*
-- [ ] delaunay_2d normalises every emitted triangle to CCW and nothing verifies the winding *(test-quality)*
+**Exit criteria** (measurable; the release does not cut until all hold):
+1. Narrowphase matches an independent exact reference — 15-axis OBB SAT for boxes, closed form for
+   spheres — with **zero wrong-sign results** and a stated worst-case error.
+2. An abuse harness (negative indices, zero/huge dims, non-conformable operands, the designed-0
+   return, degenerate geometry) runs clean: no exit 139, no canary overwrite.
+3. Arena per narrowphase call bounded **and asserted**, not merely improved.
+4. Every fix mutation-proven, with the mutation set including the shape family that broke the prior
+   attempt — not just the reported reproducer.
+5. Every one of the 42 audit findings has an explicit disposition: fixed, refuted, or deferred with
+   a reason. (Standing rule since two findings were never scheduled in 2.7.0.)
 
-### 2.8.5 -- low / close-out
+**Deliberately deferred to 2.9.1** — real wins, no consumer blocked, and every optimisation in this
+repo so far has needed a regression cycle: `spatial_hash` bucket growth, `_bvh_build_rec` centroid
+recomputation, O(n²) DCT/DST. Correctness releases do not carry optimisation risk.
 
-- [ ] eigen_symmetric and eigen_qr carry the same documented contract but return eigenvalues in different orders, and eigen_symmetric's doc names  *(api-consistency)*
-- [ ] geo_ray_plane's doc block states the opposite convention from the code, in the line immediately above the note that corrects it *(api-consistency)*
-- [ ] spatial_hash_insert returns 0 on success while its sibling inserts return 1 on success *(api-consistency)*
-- [ ] quadtree_insert / octree_insert recurse to max_depth on coincident points, with no cap on max_depth *(memory-safety)*
-- [ ] Four residual allocation-inside-loop sites in a never-freeing bump allocator *(performance)*
-- [ ] Give **every** one of the 42 numbered findings an explicit disposition (the sweep that caught
-      two never-scheduled findings in 2.7.0 is why this is a standing item, not a formality)
-- [ ] Supersede with a new dated audit once the criticals and highs land
+---
 
-### Carried in from 2.8.x, unchanged
-- [x] `_col_in_circumcircle` adaptive exact predicate — **SUPERSEDED by 2.8.2**. The item existed
-      because the super-triangle multiplier could not be raised safely without it. There is no
-      multiplier any more, so the coupling is dissolved rather than resolved. The predicate remains
-      non-adaptive for real-vs-real triples; no known reachable defect depends on it
-- [ ] `delaunay_2d` / `convex_hull_2d` extreme-aspect failures (parabola, thin slivers) — points
-      dropped, hull under-covered; byte-identical before and after the 2.8.0 rewrite
+## 2.10.0 — differentiable geometry
 
+Autodiff through ray–surface intersection, so consumers can optimise *through* geometry rather than
+around it. The forward-mode dual infrastructure already ships (`autodiff.cyr`); this is the geometry
+integration and the chain-rule coverage for `geo_ray_*`.
 
-## 2.7.0 -- Re-audit & refactor  **RELEASED 2026-08-04**
+Driver: aethersafha (compositor) and the differentiable-rendering use case. Blocked on 2.9.0 only
+because it consumes the same intersection routines.
 
-Closed the 2026-08-04 re-audit: **35 of 41 findings fixed**, disposition recorded per-finding in
-[`../audit/2026-08-04.md`](../audit/2026-08-04.md), close-out in
-[`../audit/2026-08-04-2.7.0-closeout.md`](../audit/2026-08-04-2.7.0-closeout.md). Suite
-**1127 → 1605**, coverage **59% → 71%**, benchmarks 28 → 35, constant gate 110 → 141 plus a new
-duplicate-global check. Every fix mutation-proven except two that say so.
+## 2.11.0 — reverse-mode autodiff
 
-Four defects were found by *checking that a repair preserved behaviour*, not by any audit — the
-biggest being `kdtree_within_radius` returning wrong counts on 274/400 queries after three
-releases. Two findings had never been scheduled at all, surfaced only by the per-finding
-disposition sweep. Three confirmed performance wins were **withheld** because each regresses on
-some input class; their measurements and reviews are filed under `issues/`.
+Tape-based reverse mode for gradients of many-input scalar objectives, where forward-mode's
+per-input cost is the wrong shape. Pairs with `optimize.cyr`'s solvers, which currently require a
+caller-supplied gradient.
 
-### Carried into 2.8.x
-- [x] **`delaunay_2d` rewritten with triangle adjacency** (walk + flood-fill Bowyer-Watson) in
-      **2.8.0**, after two failed attempts. The premise behind both — "cocircular is inherently
-      expensive" — was **wrong**: the shipped code was not triangulating that class at all (1651
-      triangles where 148 is correct, 206 non-manifold edges, 9 points dropped, 244x the hull area).
-      Fixing the correctness made it **~1300x faster** there, and −88.6% on uniform, with growth per
-      doubling 3.9x → 2.1x. Verified across 298 fixtures by an independent adversarial harness;
-      5 new assertions pin count, point-usage and manifoldness
-- [ ] `_col_in_circumcircle` adaptive exact predicate — latent (0/180 under real `delaunay_2d`
-      geometry); needed only if the function is exposed publicly or the 10x constant changes
-- [x] **Coverage 94%** (555/587) and **all 35 files referenced** — target was 80%, then 90%.
-      Suite 1127 → **1765** across the 2.6.x/2.7.x arc
+## Optional, demand-gated
 
-## 2.7.x -- Feature line  (after 2.7.0 lands)
-
-Carried forward from the original 2.7.0 plan, plus the items moved out of the 2.6.x line because
-each needs its own design and benchmark pass rather than riding a repair release.
-
-### Features
-- [ ] Differentiable rendering math (autodiff through ray-surface intersections)
-- [ ] Reverse-mode autodiff (Tape-based)
-- [ ] GPU compute via soorat (feature-gated)
-
-### Moved out of the 2.6.x line
-- [ ] **Adopt `vec_sort_by` / `vec_select_nth`** (cyrius 6.5.4). Blocked on an API mismatch, not
-      effort: the comparator receives element *values* via `fncall2`, while hisab sorts *indices*
-      by dereferencing a separate `points` vector, and Cyrius has no closures. Needs a packed
-      key+index encoding or a context-carrying comparator upstream. **2.6.15 already fixed the
-      complexity** of both hot sorts (heapsort / hashed pairing); this item is only the
-      *consolidation onto stdlib*, so it is now optional rather than load-bearing
-- [ ] **SIMD the flat-array kernels** — `_opt_dot`/`_opt_norm`/`_opt_axpy`, the three L-BFGS
-      sweeps and `_lext_dot`/`_lext_norm` are scalar while `f64v_dot`/`f64v_scale` take a runtime
-      `n` (5–8× on comparable kernels in 2.3.1). Needs a benchmark for each kernel first — none
-      of them is currently benchmarked, so there is nothing to prove a win against
-- [ ] Any further work the 2.7.0 re-audit turns up
+- **GPU compute via soorat** (feature-gated) — no consumer has asked; parked until one does.
+- **Adopt `vec_sort_by` / `vec_select_nth`** (cyrius 6.5.4) — consolidation onto stdlib, not a fix.
+  Blocked on an API mismatch: the comparator receives element *values*, hisab sorts *indices* by
+  dereferencing a separate vector, and Cyrius has no closures. 2.6.15 already fixed the *complexity*
+  of both hot sorts, so this is now optional rather than load-bearing.
+- **SIMD the flat-array kernels** — `_opt_dot`/`_opt_norm`/`_opt_axpy`, the L-BFGS sweeps,
+  `_lext_dot`/`_lext_norm`. 5–8× on comparable kernels in 2.3.1. **Needs a benchmark per kernel
+  first** — none is benchmarked, so there is nothing to prove a win against.
 
 ---
 
@@ -264,6 +162,33 @@ Release History table below.
 entry point, so nothing further is owed.
 
 ---
+
+## 2.7.0 -- Re-audit & refactor  **RELEASED 2026-08-04**
+
+Closed the 2026-08-04 re-audit: **35 of 41 findings fixed**, disposition recorded per-finding in
+[`../audit/2026-08-04.md`](../audit/2026-08-04.md), close-out in
+[`../audit/2026-08-04-2.7.0-closeout.md`](../audit/2026-08-04-2.7.0-closeout.md). Suite
+**1127 → 1605**, coverage **59% → 71%**, benchmarks 28 → 35, constant gate 110 → 141 plus a new
+duplicate-global check. Every fix mutation-proven except two that say so.
+
+Four defects were found by *checking that a repair preserved behaviour*, not by any audit — the
+biggest being `kdtree_within_radius` returning wrong counts on 274/400 queries after three
+releases. Two findings had never been scheduled at all, surfaced only by the per-finding
+disposition sweep. Three confirmed performance wins were **withheld** because each regresses on
+some input class; their measurements and reviews are filed under `issues/`.
+
+### Carried into 2.8.x
+- [x] **`delaunay_2d` rewritten with triangle adjacency** (walk + flood-fill Bowyer-Watson) in
+      **2.8.0**, after two failed attempts. The premise behind both — "cocircular is inherently
+      expensive" — was **wrong**: the shipped code was not triangulating that class at all (1651
+      triangles where 148 is correct, 206 non-manifold edges, 9 points dropped, 244x the hull area).
+      Fixing the correctness made it **~1300x faster** there, and −88.6% on uniform, with growth per
+      doubling 3.9x → 2.1x. Verified across 298 fixtures by an independent adversarial harness;
+      5 new assertions pin count, point-usage and manifoldness
+- [ ] `_col_in_circumcircle` adaptive exact predicate — latent (0/180 under real `delaunay_2d`
+      geometry); needed only if the function is exposed publicly or the 10x constant changes
+- [x] **Coverage 94%** (555/587) and **all 35 files referenced** — target was 80%, then 90%.
+      Suite 1127 → **1765** across the 2.6.x/2.7.x arc
 
 ## Consumers
 

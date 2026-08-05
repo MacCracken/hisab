@@ -67,6 +67,99 @@ a future reader needs:
 
 ---
 
+## 2.8.x -- audit repair arc  (OPEN)
+
+Driven by [`../audit/2026-08-04-v2.8.0-full.md`](../audit/2026-08-04-v2.8.0-full.md): **42 findings
+confirmed, 0 refuted** across six adversarially-verified dimensions — 4 critical, 17 high, 16
+medium, 5 low. Ordered by severity. **The finding list is the unit of disposition, not this
+summary** — every row in the audit table gets an explicit outcome before 2.8.x closes.
+
+### 2.8.2 -- critical
+
+- [ ] **mpr_penetration returns a wrong (frequently zero or negative) penetration depth for any non-axis-aligned overlap — 65 of 81 sampled box/box configurat**
+      `/home/macro/Repos/hisab/src/collision_core.cyr:151-224 (portal built through the interior ` *(numerical)*
+- [ ] **gjk_epa_3d is O(k²) in EPA iterations — 8,576 face evaluations, 1.24 MB of never-freed arena and milliseconds per single narrowphase call**
+      `src/geo_advanced.cyr:394 (closest-face rescan) and src/geo_advanced.cyr:430 (visibility re` *(performance)*
+- [ ] **gjk_epa_3d and mpr_penetration return wrong penetration depths for sphere-vs-box**
+      `src/geo_advanced.cyr:308 (gjk_epa_3d), src/collision_core.cyr:150 (mpr_penetration)` *(performance)*
+- [ ] **delaunay_2d's 10x super-triangle leaves holes in the mesh on ordinary uniform-random input (silent incomplete triangulation)**
+      `/home/macro/Repos/hisab/src/collision_mesh.cyr:181 (`var d_max = f64_mul(f64_max(dx, dy), ` *(regression)*
+
+### 2.8.3 -- high
+
+- [ ] time_of_impact returns 1 ("collision found") while storing a NULL HVec3 pointer into out_normal — it ignores gjk_epa_3d's failure return
+      `src/geo_advanced.cyr:773 and :820 (both stores verified present at those exact lines)` *(api-consistency)*
+- [ ] bvh_query_ray silently drops entire subtrees: geo_ray_aabb returns 0 for both "miss" and "hit at t=0", and the BVH walker uses `== 0` as its prune tes
+      `src/geo_advanced.cyr:641 (verified: `if (geo_ray_aabb(ray, aabb) == 0) { return 0; }`)` *(api-consistency)*
+- [ ] svd_golub_kahan writes past out_U whenever rows < cols — its own "m >= n" contract is never checked
+      `src/linalg_precision.cyr:752 (entry, `fn svd_golub_kahan`); OOB store at src/linalg_precis` *(memory-safety)*
+- [ ] tensor_add / tensor_scale / tensor_contract dereference einsum's and tensor_new's documented 0-on-failure return, and tensor_add over-reads b on shape
+      `src/tensor.cyr:88 (tensor_add), src/tensor.cyr:103 (tensor_scale), src/tensor.cyr:119 (ten` *(memory-safety)*
+- [ ] calc_partial_derivative bounds-checks only the upper end of `index`; a negative index reads and writes before the buffers
+      `src/calc_ext.cyr:60` *(memory-safety)*
+- [ ] tensor_contract never validates idx_i / idx_j against the tensor's rank
+      `src/tensor.cyr:121` *(memory-safety)*
+- [ ] sequential_impulse never converges for restitution >= 1 (period-2 oscillation, answer depends on the parity of `iterations`); restitution has no effec
+      `/home/macro/Repos/hisab/src/collision_core.cyr:294 (delta) and :306-316 (friction block)` *(numerical)*
+- [ ] time_of_impact misses real collisions — 48 of 101 swept sphere pairs report "no collision" although contact occurs well inside max_t; the doc claims c
+      `/home/macro/Repos/hisab/src/geo_advanced.cyr:748 (doc: "Uses conservative advancement"), :` *(numerical)*
+- [ ] calc_monotone_cubic is not monotone — the Fritsch-Carlson sign condition is missing, so the interpolant overshoots both endpoints on a strictly monoto
+      `/home/macro/Repos/hisab/src/calc_ext.cyr:667-687 (monotonicity constraint block)` *(numerical)*
+- [ ] spatial_hash_* has a hard-coded 1,024 buckets that never grows, so every query costs Θ(n/1024) instead of Θ(1)
+      `src/spatial.cyr:810 (`var _SH_BUCKET_COUNT = 1024;`), consumed at :821 (mask), :865 (inser` *(performance)*
+- [ ] _bvh_build_rec recomputes every primitive's centroid at every tree level and allocates 5 heap blocks per bounds merge — 36.6 MB of arena to build a 16
+      `src/geo_advanced.cyr:555 (`bounds = _bvh_aabb_merge(...)`) and src/geo_advanced.cyr:584 (`` *(performance)*
+- [ ] cmat_kronecker, cmat_mul_vec and cmat_exp dereference the capped-constructor 0 that the other seven cmat_* functions guard
+      `/home/macro/Repos/hisab/src/complex.cyr:379 (cmat_kronecker `var ar = cmat_rows(a)`), :245` *(regression)*
+- [ ] Every ODE test integrand reaching ode_dopri45 is autonomous, so the DOPRI45 abscissa row (c2..c7) is certified by nothing
+      `src/ode.cyr:157,162,169,177,186 (stage times t2..t6); fixtures tests/hisab.tcyr:563 `_ode_` *(test-quality)*
+- [ ] All four noise functions can be replaced by `return 0;` and the suite stays green
+      `src/noise_simplex.cyr:96 simplex_2d, :177 simplex_3d; src/calc.cyr:446 perlin_2d; src/calc` *(test-quality)*
+- [ ] christoffel_symbols is only ever called with an all-zero metric-derivative array, so its formula is unreachable by the suite
+      `src/diffgeo.cyr:64-104 (bracket at :90); fixtures tests/modules.tcyr:1325-1332 and tests/h` *(test-quality)*
+- [ ] opt_bfgs, opt_lbfgs and opt_levenberg_marquardt are asserted only through their input-validation guards; ~490 lines of solver body never run
+      `src/optimize.cyr:282 opt_bfgs, :434 opt_lbfgs, :631 opt_levenberg_marquardt (file is 770 l` *(test-quality)*
+- [ ] num_tridiag_solve is tested only on a DIAGONAL system, so the entire Thomas elimination and back-substitution are multiplied by zero
+      `src/num_ext.cyr:704-773 (back-substitution at :769); fixture tests/modules.tcyr:2262-2279` *(test-quality)*
+
+### 2.8.4 -- medium
+
+- [ ] gjk_epa_3d returns 0 ("not penetrating") for shapes its own sibling gjk_intersect_3d reports as overlapping, and leaves both out-params unwr *(api-consistency)*
+- [ ] halfedge_from_triangles aborts the process instead of returning the documented 0 on error *(api-consistency)*
+- [ ] ivl_div's divide-by-zero widening returns a finite [-1e9, 1e9] that does not enclose the true range — the module's own stated soundness cont *(api-consistency)*
+- [ ] einsum accepts a repeated output label and returns a confidently wrong tensor instead of the documented 0-on-error *(api-consistency)*
+- [ ] cmat_exp / cmat_mul_vec / cmat_kronecker / cmat_inverse dereference the designed 0 that cmat_new and cmat_mul return — the 2.7.0-B null-guar *(memory-safety)*
+- [ ] num_halton crashes with SIGFPE on base 0 and never terminates on base 1 *(memory-safety)*
+- [ ] spatial_hash_query_radius has an unbounded (radius/cell_size)^3 triple loop *(memory-safety)*
+- [ ] svd_golub_kahan silently returns wrong singular values for a wide matrix (m < n) — the documented m >= n precondition is never checked and t *(numerical)*
+- [ ] num_dct / num_idct / num_dst / num_idst are O(n²) while an O(n log n) num_fft ships alongside them *(performance)*
+- [ ] calc_hessian's mixed-partial block is never asserted, and the test function is separable so the true value is zero anyway *(test-quality)*
+- [ ] calc_catmull_rom is tested only at t=0 and t=1 on collinear equally-spaced points, where the t^2 and t^3 coefficients are identically zero *(test-quality)*
+- [ ] Adaptive Simpson is tested only on x^2, for which a single unrefined Simpson panel is already exact, so the entire refinement machinery is d *(test-quality)*
+- [ ] ode_bdf is exercised only at order 4 with f == 0 and a constant history, leaving beta unconstrained and orders 2/3/5 unreachable *(test-quality)*
+- [ ] The se3_adjoint assertion passes a 24-byte HVec3 where a 48-byte twist is required; the non-null check hides a 24-byte out-of-bounds read *(test-quality)*
+- [ ] so3_from_mat3 documents a validation it does not perform, and the only assertion is that it returns non-null *(test-quality)*
+- [ ] delaunay_2d normalises every emitted triangle to CCW and nothing verifies the winding *(test-quality)*
+
+### 2.8.5 -- low / close-out
+
+- [ ] eigen_symmetric and eigen_qr carry the same documented contract but return eigenvalues in different orders, and eigen_symmetric's doc names  *(api-consistency)*
+- [ ] geo_ray_plane's doc block states the opposite convention from the code, in the line immediately above the note that corrects it *(api-consistency)*
+- [ ] spatial_hash_insert returns 0 on success while its sibling inserts return 1 on success *(api-consistency)*
+- [ ] quadtree_insert / octree_insert recurse to max_depth on coincident points, with no cap on max_depth *(memory-safety)*
+- [ ] Four residual allocation-inside-loop sites in a never-freeing bump allocator *(performance)*
+- [ ] Give **every** one of the 42 numbered findings an explicit disposition (the sweep that caught
+      two never-scheduled findings in 2.7.0 is why this is a standing item, not a formality)
+- [ ] Supersede with a new dated audit once the criticals and highs land
+
+### Carried in from 2.8.x, unchanged
+- [ ] `_col_in_circumcircle` adaptive exact predicate — now **coupled** to the delaunay
+      super-triangle finding above; the multiplier cannot be raised safely until the predicate is
+      adaptive, so these two should land together
+- [ ] `delaunay_2d` / `convex_hull_2d` extreme-aspect failures (parabola, thin slivers) — points
+      dropped, hull under-covered; byte-identical before and after the 2.8.0 rewrite
+
+
 ## 2.7.0 -- Re-audit & refactor  **RELEASED 2026-08-04**
 
 Closed the 2026-08-04 re-audit: **35 of 41 findings fixed**, disposition recorded per-finding in

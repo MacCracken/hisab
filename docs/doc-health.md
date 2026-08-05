@@ -6,7 +6,18 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-08-04 — **v2.7.0 RELEASED.** Suite 1127 → **1605**, coverage 59% → **71%**,
+> **Last refresh**: 2026-08-04 — **v2.8.1, audit release.** Six-dimension sweep of the v2.8.0 tree,
+> each dimension adversarially verified by reproduction: **42 confirmed, 0 refuted** (4 critical,
+> 17 high, 16 medium, 5 low) — `audit/2026-08-04-v2.8.0-full.md`, scheduled across 2.8.2–2.8.5.
+> **The headline is a defect in what 2.8.0 shipped**: `delaunay_2d` is silently incomplete on 15–37%
+> of ordinary uniform-random input, from a 10x super-triangle that predates the rewrite — and the
+> obvious fix (raise the multiplier) breaks clustered input, because it is coupled to the
+> already-filed non-adaptive in-circle predicate. Standing lesson recorded: **1801 assertions and
+> 97% coverage caught none of these**, because coverage counts whether a function is *referenced*,
+> not whether its contract is *checked*. The sharpest illustration is in the report — every ODE test
+> integrand is autonomous, so the DOPRI45 abscissa row is certified by nothing.
+>
+> **Previous refresh**: 2026-08-04 — **v2.7.0 RELEASED.** Suite 1127 → **1605**, coverage 59% → **71%**,
 > benchmarks 28 → **35**, constant gate 110 → **141** + a duplicate-global check. 35 of the
 > re-audit's 41 findings fixed; the 6 open ones each carry a written reason and a filed spec.
 > `lib/hisab.cyr` **deleted** and `cyrius.lock` regenerated (30 verified) — it was a tracked 591 KB

@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+## [2.8.1] - 2026-08-04 — full audit of the v2.8.0 tree. **42 findings, 4 critical.**
+
+An audit release: no library code changes. Six dimensions — memory-safety, numerical,
+api-consistency, performance, test-quality, and a regression check that the 2.6.12–2.8.0 repairs
+still hold — each swept by an independent agent and then **adversarially verified** by a second
+that reproduced every finding with its own harness before it entered the report.
+
+**42 confirmed, 0 refuted** (4 critical, 17 high, 16 medium, 5 low). Full report at
+[`docs/audit/2026-08-04-v2.8.0-full.md`](docs/audit/2026-08-04-v2.8.0-full.md); the work is
+scheduled across 2.8.2–2.8.5 in the roadmap.
+
+The zero-refutation rate is not a compliment to the finders. Verifiers were required to reproduce
+by **execution**, so speculative findings died inside the verify step rather than arriving as
+refutations. Two findings were downgraded on verification and one materially corrected.
+
+### The headline is a defect in what 2.8.0 shipped
+
+`delaunay_2d` was rewritten in 2.8.0 with triangle adjacency and verified across 298 fixtures. It
+is still **incomplete on ordinary uniform-random input** — 15–37% of point sets come back missing at
+least one triangle, silently, no error signal. At n = 2000, eight triangles short.
+
+The cause is not the rewrite. `d_max = max(dx, dy) * 10` builds a super-triangle only 10x the
+bounding box, and Bowyer-Watson reduces to the true Delaunay triangulation only once no super-vertex
+lies inside any real circumcircle. At 10x that fails, the real triangle is never created, and
+compaction drops the super-vertex triangle covering the gap. Proven in exact rational arithmetic:
+across 40 point sets, the triangles whose circumcircle encloses a super-vertex matched the observed
+missing set **40 of 40**.
+
+**And the obvious fix is wrong.** Raising the multiplier fixes uniform data and *breaks* clustered
+data: at 1e9, a 1e-8-span cluster loses 20 triangles and gains 9 spurious overlapping ones, where
+the current 10x is exactly correct. The multiplier is a genuine trade-off against the non-adaptive
+in-circle determinant's conditioning — the two defects are **coupled**, precisely as
+`issues/2026-08-04-incircle-precision.md` warned when it said not to fix that one by rescaling. 1e6
+is a defensible interim; 1e9 must not be used; the durable fix is an adaptive predicate.
+
+Three of the four criticals are in the collision narrowphase: `mpr_penetration` returns a wrong and
+frequently negative penetration depth (65 of 81 box/box configurations disagree with the exact MTV,
+27 with the wrong sign), and `gjk_epa_3d` is O(k²) in EPA iterations — 8,576 face evaluations and
+1.24 MB of never-freed arena per call — while also returning wrong depths for sphere-vs-box.
+
+### What this says about the last five releases
+
+Every one of these 42 lived in code that 1801 assertions and 97% function coverage did not catch.
+Coverage counts whether a function is *referenced*, not whether its contract is *checked* — the
+report labels it "a floor, not a correctness proof" for exactly this reason. The test-quality
+dimension found the sharpest example: **every ODE test integrand is autonomous**, so the entire
+DOPRI45 abscissa row is certified by nothing.
+
+### Not regressions
+
+The regression dimension re-verified the 2.6.12–2.8.0 repairs by execution and found them all
+holding: half-edge twin pairing, BVH degenerate split, interval enclosures (48,000 checks per
+operator), FFT/IFFT round-trip and input preservation, `f64_fmod`/`f64_copysign` over 3,000 random
+pairs, the SU(2)/SO(3)/SE(3) angle conventions over 600 axis/angle pairs, `geo_ray_plane`/
+`geo_ray_capsule` over 2,000 rays, and the k-d tree split plane. One apparent SE(3) failure was the
+verifier's own test bug and was refuted rather than reported.
+
 ## [2.8.0] - 2026-08-04 — delaunay_2d adjacency rewrite; it was **wrong**, not just slow
 
 `delaunay_2d` now carries triangle adjacency and inserts by **walk + flood-fill Bowyer-Watson**,

@@ -20,14 +20,31 @@ var _GA_F64_NEG_HALF    = 0xBFE0_0000_0000_0000;  # -0.5
 var _GA_F64_NEG_ONE     = 0xBFF0_0000_0000_0000;  # -1.0
 var _GA_F64_POS_INF     = 0x7FF0_0000_0000_0000;  # +Infinity
 var _GA_F64_NEG_INF     = 0xFFF0_0000_0000_0000;  # -Infinity
-var _GA_F64_001         = 0x3F847AE147AE147B;     # 0.01
+# _GA_F64_001 (0.01) is gone: its only consumer was time_of_impact's sampling
+# step, and an absolute world length was exactly the wrong thing for that loop
+# to be built on.
+
+# time_of_impact tolerances.
+#   _GA_TOI_REL     relative optimality gap that ends the GJK distance loop
+#   _GA_TOI_TOL_REL contact gap, RELATIVE to the Minkowski difference's own
+#                   extent along the direction of travel, at which two shapes
+#                   count as touching. Relative, so the query behaves the same
+#                   on millimetre and on kilometre geometry.
+# There is deliberately NO absolute length epsilon here. An earlier draft used
+# 1e-24 as a "squared length that counts as zero"; on 1e-6-scale geometry that
+# is LOOSER than the contact tolerance itself, and it reported three misses out
+# of forty as impacts. Every degeneracy test below is scale-free instead --
+# each one compares a quantity against zero or against another quantity of the
+# same units, never against a hard-coded world length.
+var _GA_TOI_REL         = 0x3D719799812DEA11;     # 1e-12
+var _GA_TOI_TOL_REL     = 0x3E112E0BE826D695;     # 1e-9
 
 # GJK/EPA iteration limits
 var GJK_MAX_ITER = 64;
 # Conservative-advancement step budget for time_of_impact. Distinct from
-# GJK_MAX_ITER: that bounds GJK's simplex refinement, this bounds how many time
-# samples span [0, max_t]. Conflating them capped the search horizon at 0.64
-# units regardless of max_t (see time_of_impact).
+# GJK_MAX_ITER: that bounds GJK's simplex refinement, this bounds how many
+# advancement steps span [0, max_t]. Conflating them capped the search horizon
+# at 0.64 units regardless of max_t (see time_of_impact).
 var _GA_TOI_MAX_STEPS = 256;
 var EPA_MAX_ITER = 64;
 
@@ -227,20 +244,27 @@ fn _gjk_core_3d(sup_a, shape_a, sup_b, shape_b) {
 
     for (var gi = 0; gi < GJK_MAX_ITER; gi = gi + 1) {
         dir = load64(dir_slot);
-        var dir_len_sq = hvec3_length_sq(dir);
-        if (f64_lt(dir_len_sq, EPSILON_F64) == 1) {
+        # 2.9.0: these three tests were `< EPSILON_F64` (1e-12) on a SQUARED
+        # length. A scene at scale 1e-9 has |dir|^2 ~ 1e-18, so every direction
+        # GJK ever computed was declared degenerate, the search wandered off down
+        # a cardinal axis and the whole overlap test failed: two 1e-9 boxes with
+        # an exact overlap of 7e-10 came back "no intersection", taking
+        # gjk_epa_3d's depth with them. The support function only reads the
+        # DIRECTION of `dir`, never its magnitude, so the only value that is
+        # genuinely unusable is zero -- and testing against zero is scale-free.
+        if (f64_gt(hvec3_length_sq(dir), 0) == 0) {
             # Degenerate direction, pick perpendicular
             if (_gjk_simplex_count(simplex) >= 2) {
                 var edge = hvec3_sub(_gjk_simplex_get(simplex, _gjk_simplex_count(simplex) - 1),
                 _gjk_simplex_get(simplex, 0));
                 dir = hvec3_cross(edge, hvec3_unit_x());
-                if (f64_lt(hvec3_length_sq(dir), EPSILON_F64) == 1) {
+                if (f64_gt(hvec3_length_sq(dir), 0) == 0) {
                     dir = hvec3_cross(edge, hvec3_unit_y());
                 }
             } else {
                 dir = hvec3_unit_y();
             }
-            if (f64_lt(hvec3_length_sq(dir), EPSILON_F64) == 1) {
+            if (f64_gt(hvec3_length_sq(dir), 0) == 0) {
                 dir = hvec3_unit_z();
             }
         }
@@ -267,232 +291,622 @@ fn gjk_intersect_3d(support_a, shape_a, support_b, shape_b) {
 }
 
 # --- EPA 3D (Expanding Polytope Algorithm) ---
-# Operates on the GJK simplex (tetrahedron containing origin).
-# Expands the polytope to find the minimum penetration depth/normal.
 #
-# Face list: vec of face structs.
-# Each face: [v0_idx, v1_idx, v2_idx] stored as 3 consecutive i64 in a vec.
-# Vertex list: vec of HVec3 pointers.
+# Expands a tetrahedron that contains the origin, in Minkowski-difference space,
+# until the closest supporting plane of the difference is pinned. That plane's
+# distance from the origin IS the minimum translation vector: for a convex body
+# M with the origin in its interior, min over unit n of h_M(n) equals the
+# distance from the origin to M's boundary.
+#
+# 2.9.0 REWRITE. Three defects, each measured against an exact reference
+# (15-axis OBB SAT for box/box in rationals, r0+r1-|c1-c0| for sphere/sphere,
+# r-sdBox(c,h) for sphere/box) over a 455-configuration sweep:
+#
+#   1. THE LOOP HAD A FIXED POINT INSTEAD OF A LIMIT. `_epa_face_normal_dist`
+#      flipped a face normal whenever the plane distance came out negative, to
+#      "ensure outward", but the visible-face test in the expansion step used the
+#      RAW winding normal. When the two disagreed the closest face was never
+#      marked visible, so it survived the rebuild, was selected again on the next
+#      pass, produced the identical support point, and the polytope stopped
+#      growing. Two concentric unit spheres (exact depth 2.0) returned 1.8875 at
+#      the 64-iteration cap and still only 1.9794 at 400 -- not iteration
+#      starvation, a stall. Every face record now carries ONE oriented normal and
+#      both the min-search and the visibility test read that single field.
+#
+#   2. THE CONVERGENCE TEST WAS ABSOLUTE. `|d - dist| < EPSILON_F64` (1e-12) is
+#      unreachable at scene scale 1e3 and is met far too early at 1e-3; the same
+#      sphere pair scaled by 1e-3 / 1e3 / 1e6 all came back at 1.078e-5 relative
+#      error. Termination is now a two-sided certificate:
+#        * the closest face's plane distance is a LOWER bound on the depth (the
+#          polytope is inscribed in the difference),
+#        * best_d = min over probed directions of h_M(n) is an UPPER bound (every
+#          supporting plane already separates the two shapes),
+#      and the loop stops when the gap closes to a RELATIVE tolerance. best_d is
+#      what gets returned, so the reported depth is always a translation that
+#      genuinely separates -- returning the face distance can under-separate.
+#
+#   3. A DEGENERATE GJK SIMPLEX WAS REPORTED AS "no penetration". The old code
+#      bailed with 0 once the seed tetrahedron's volume fell under 1e-12, leaving
+#      both out-params unwritten for shapes that provably overlap: box(h=1,1,1)
+#      vs sphere(c=(1.2,0,0.7), r=1), exact depth 0.8, came back 2.2e-16. A
+#      rejected seed now falls back to the Minkowski portal construction.
+#
+# DELIBERATELY NOT CHANGED: the visible set is still found by a FULL SCAN over
+# every live face. The 2.8.2 heap + flood-fill rewrite was rejected because the
+# flood fill under-reports the visible set when rounding splits that set into
+# disconnected components; a scan cannot. The per-face record plus in-place
+# compaction below is the low-risk half of that proposal (cached face records, no
+# alloc per face per iteration) and it is what removes the arena growth.
 
-fn _epa_face_normal_dist(verts, fi_base, faces) {
-    # fi_base is index into faces vec (3 consecutive entries per face)
-    var i0 = vec_get(faces, fi_base);
-    var i1 = vec_get(faces, fi_base + 1);
-    var i2 = vec_get(faces, fi_base + 2);
-    var va = vec_get(verts, i0);
-    var vb = vec_get(verts, i1);
-    var vc = vec_get(verts, i2);
-    var cross = hvec3_cross(hvec3_sub(vb, va), hvec3_sub(vc, va));
-    var len = hvec3_length(cross);
-    if (f64_lt(len, EPSILON_F64) == 1) {
-        # Degenerate face
+# Face record: 6 slots, 48 bytes.
+#   [0]  i0   [8] i1   [16] i2   vertex indices, wound to match `normal`
+#   [24] normal  unit HVec3, outward (pointing away from the origin)
+#   [32] dist    plane distance from the origin along `normal`
+#   [40] state   0 = removed, 1 = live, 2 = live but zero-area,
+#                3 = live but EXHAUSTED (its support point is already a vertex,
+#                    so expanding through it cannot grow the hull; it still
+#                    bounds the depth from below and still takes part in the
+#                    visibility test, it is just never chosen for expansion)
+var _EPA_FACE_SIZE = 48;
+# Pattern-search budget for _epa_polish: 4 support calls per round, and the
+# angular step halves whenever a round finds nothing.
+var _EPA_POLISH_ITER = 64;
+
+# Relative convergence tolerance for the EPA upper/lower bound gap. Relative,
+# not absolute: see note 2 above.
+var _GA_EPA_REL_TOL = 0x3DDB7CDFD9D7BDBB;  # 1e-10
+# Fraction of the difference's own extent used to nudge a portal interior point
+# that lands exactly on the origin.
+var _GA_F64_1EM6    = 0x3EB0C6F7A0B5ED8D;  # 1e-6
+
+# Normalise without EPSILON_F64's ABSOLUTE cutoff. hvec3_normalize returns the
+# zero vector for any |v| < 1e-12, which silently kills every direction in a
+# scene scaled to 1e-6. Here the only unusable input is a length that is zero,
+# subnormal or NaN -- all caught by requiring len > 0.
+fn _epa_unit(v) {
+    var l = hvec3_length(v);
+    if (f64_gt(l, 0) == 0) { return hvec3_zero(); }
+    return hvec3_scale(v, f64_div(F64_ONE, l));
+}
+
+# Any unit vector perpendicular to v. Crossing with the cardinal axis v is LEAST
+# aligned with keeps the cross product well away from zero.
+fn _epa_perp(v) {
+    var ax = hvec3_unit_x();
+    var m = f64_abs(HVec3_x(v));
+    if (f64_lt(f64_abs(HVec3_y(v)), m) == 1) {
+        ax = hvec3_unit_y();
+        m = f64_abs(HVec3_y(v));
+    }
+    if (f64_lt(f64_abs(HVec3_z(v)), m) == 1) { ax = hvec3_unit_z(); }
+    return _epa_unit(hvec3_cross(v, ax));
+}
+
+# Store face `fi` and its oriented plane. `iref` selects the orientation rule:
+#   iref >= 0 -- orient away from vertex `iref` (the seed tetrahedron, where
+#                nothing is yet known about the winding),
+#   iref <  0 -- trust the winding, repairing it only if the plane distance comes
+#                out strictly negative (faces fanned onto a horizon edge inherit
+#                their winding from the face they replace).
+# The origin-based repair is applied only for a STRICTLY negative distance, so a
+# face that legitimately passes through the origin -- a touching contact -- keeps
+# its winding instead of being flipped on the sign of a rounding error.
+# Returns 1 for a usable plane, 0 for a zero-area triangle.
+fn _epa_face_set(fbuf, fi, verts, i0, i1, i2, iref) {
+    var base = fbuf + fi * _EPA_FACE_SIZE;
+    var a = load64(verts + i0 * 8);
+    var b = load64(verts + i1 * 8);
+    var c = load64(verts + i2 * 8);
+    var ab = hvec3_sub(b, a);
+    var ac = hvec3_sub(c, a);
+    var cr = hvec3_cross(ab, ac);
+    var len = hvec3_length(cr);
+    store64(base, i0);
+    store64(base + 8, i1);
+    store64(base + 16, i2);
+    # |ab x ac| = |ab| |ac| sin(t), so this is the scale-free test sin(t) <= 1e-12.
+    # Comparing the area itself against 1e-12 would call every face of a
+    # millimetre-scale scene degenerate.
+    if (f64_le(len, f64_mul(EPSILON_F64, f64_mul(hvec3_length(ab), hvec3_length(ac)))) == 1) {
+        store64(base + 24, hvec3_zero());
+        store64(base + 32, _GA_F64_POS_INF);
+        store64(base + 40, 2);
         return 0;
     }
-    var normal = hvec3_scale(cross, f64_div(F64_ONE, len));
-    var dist = hvec3_dot(normal, va);
-    # Ensure outward (dist >= 0)
-    if (f64_lt(dist, 0) == 1) {
-        normal = hvec3_neg(normal);
-        dist = f64_neg(dist);
+    var nrm = hvec3_scale(cr, f64_div(F64_ONE, len));
+    var flip = 0;
+    if (iref >= 0) {
+        if (f64_gt(hvec3_dot(nrm, hvec3_sub(load64(verts + iref * 8), a)), 0) == 1) { flip = 1; }
+    } elif (f64_lt(hvec3_dot(nrm, a), 0) == 1) {
+        flip = 1;
     }
-    # Return packed: alloc {normal, dist}
-    var result = alloc(16);
-    store64(result, normal);
-    store64(result + 8, dist);
-    return result;
+    if (flip == 1) {
+        nrm = hvec3_neg(nrm);
+        store64(base + 8, i2);
+        store64(base + 16, i1);
+    }
+    store64(base + 24, nrm);
+    store64(base + 32, hvec3_dot(nrm, a));
+    store64(base + 40, 1);
+    return 1;
+}
+
+# Push directed edge (ea, eb) onto the horizon list, cancelling against an
+# already-present reversed edge (eb, ea). Two visible faces sharing an edge
+# traverse it in opposite directions, so what survives is exactly the boundary of
+# the removed region. Returns the new edge count.
+fn _epa_edge_push(ebuf, ne, ea, eb) {
+    for (var i = 0; i < ne; i = i + 1) {
+        if (load64(ebuf + i * 16) == eb && load64(ebuf + i * 16 + 8) == ea) {
+            var last = ne - 1;
+            store64(ebuf + i * 16, load64(ebuf + last * 16));
+            store64(ebuf + i * 16 + 8, load64(ebuf + last * 16 + 8));
+            return last;
+        }
+    }
+    store64(ebuf + ne * 16, ea);
+    store64(ebuf + ne * 16 + 8, eb);
+    return ne + 1;
+}
+
+# Signed distance from the origin to the plane of triangle (a, b, c), positive
+# on the side that `opp` -- the tetrahedron's fourth vertex -- lies on.
+fn _epa_face_gap(a, b, c, opp) {
+    var nrm = _epa_unit(hvec3_cross(hvec3_sub(b, a), hvec3_sub(c, a)));
+    if (f64_gt(hvec3_length_sq(nrm), 0) == 0) { return _GA_F64_NEG_INF; }
+    if (f64_lt(hvec3_dot(nrm, hvec3_sub(opp, a)), 0) == 1) { nrm = hvec3_neg(nrm); }
+    return f64_sub(hvec3_dot(nrm, hvec3_sub(hvec3_zero(), a)), 0);
+}
+
+# A usable EPA seed: a volume that is non-degenerate RELATIVE to its own edge
+# lengths, and the origin STRICTLY inside -- off every face plane by a margin
+# scaled to the tetrahedron's own size.
+#
+# Strictly, not merely "inside or on". _epa_face_set decides a face's outward
+# direction from the sign of its plane distance, and that sign is undecidable
+# for a plane through the origin. It is not a theoretical worry: the MPR portal
+# of any SMOOTH body degenerates exactly this way. v1 is the support point in the
+# direction of the origin, so for a ball it is antiparallel to v0 and the origin
+# lands ON the v0-v1 EDGE of the portal tetrahedron -- two faces at distance
+# zero. Fed to EPA that seed produced 4.0 for two radius-2 spheres whose exact
+# depth is 1.3599 (it stalled on iteration 1). Rejecting it here is what routes
+# the smooth cases to the GJK seed, which has no such alignment.
+fn _epa_tetra_ok(seed) {
+    var a = load64(seed);
+    var b = load64(seed + 8);
+    var c = load64(seed + 16);
+    var d = load64(seed + 24);
+    var ab = hvec3_sub(b, a);
+    var ac = hvec3_sub(c, a);
+    var ad = hvec3_sub(d, a);
+    var vol = f64_abs(hvec3_dot(ab, hvec3_cross(ac, ad)));
+    var la = hvec3_length(ab);
+    var lb = hvec3_length(ac);
+    var lc = hvec3_length(ad);
+    var eref = f64_mul(la, f64_mul(lb, lc));
+    if (f64_gt(eref, 0) == 0) { return 0; }
+    if (f64_le(vol, f64_mul(EPSILON_F64, eref)) == 1) { return 0; }
+    var margin = f64_neg(f64_mul(EPSILON_F64, f64_max(la, f64_max(lb, lc))));
+    if (f64_lt(_epa_face_gap(a, b, c, d), margin) == 1) { return 0; }
+    if (f64_lt(_epa_face_gap(a, b, d, c), margin) == 1) { return 0; }
+    if (f64_lt(_epa_face_gap(a, c, d, b), margin) == 1) { return 0; }
+    if (f64_lt(_epa_face_gap(b, c, d, a), margin) == 1) { return 0; }
+    return 1;
+}
+
+# As _epa_tetra_ok, but the origin must be STRICTLY off every face plane by a
+# margin scaled to the tetrahedron's own size. Used to decide whether a candidate
+# seed is good enough to prefer over another -- never to reject outright, because
+# a tetrahedron whose face happens to pass through the origin is still usable
+# once the expansion gets going.
+fn _epa_tetra_strict(seed) {
+    if (_epa_tetra_ok(seed) == 0) { return 0; }
+    var a = load64(seed);
+    var b = load64(seed + 8);
+    var c = load64(seed + 16);
+    var d = load64(seed + 24);
+    var lmax = f64_max(hvec3_length(hvec3_sub(b, a)),
+    f64_max(hvec3_length(hvec3_sub(c, a)), hvec3_length(hvec3_sub(d, a))));
+    var margin = f64_mul(EPSILON_F64, lmax);
+    if (f64_le(_epa_face_gap(a, b, c, d), margin) == 1) { return 0; }
+    if (f64_le(_epa_face_gap(a, b, d, c), margin) == 1) { return 0; }
+    if (f64_le(_epa_face_gap(a, c, d, b), margin) == 1) { return 0; }
+    if (f64_le(_epa_face_gap(b, c, d, a), margin) == 1) { return 0; }
+    return 1;
+}
+
+# Seed from GJK's terminating simplex.
+# Returns 0 = shapes do not overlap, 1 = out4 holds a usable tetrahedron,
+# 2 = they overlap but the simplex is not a usable seed (caller should fall back).
+fn _epa_seed_gjk(sup_a, shape_a, sup_b, shape_b, out4) {
+    var simplex = _gjk_core_3d(sup_a, shape_a, sup_b, shape_b);
+    if (simplex == 0) { return 0; }
+    if (_gjk_simplex_count(simplex) < 4) { return 2; }
+    for (var i = 0; i < 4; i = i + 1) { store64(out4 + i * 8, _gjk_simplex_get(simplex, i)); }
+    if (_epa_tetra_ok(out4) == 1) { return 1; }
+    return 2;
+}
+
+# Minkowski portal construction -- XenoCollide phase 1 (discover) plus the
+# portal refinement that pushes the portal outward until the origin is on the
+# near side of it. Used here as an EPA seed: it ends with a tetrahedron
+# (v0, v1, v2, v3) containing the origin, where v0 is an interior point of the
+# difference and (v1, v2, v3) is a boundary triangle the ray v0 -> origin
+# crosses. Returns 1 when out4 was written, 0 otherwise.
+fn _epa_seed_portal(sup_a, shape_a, sup_b, shape_b, out4) {
+    var px = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_unit_x());
+    var nx = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_neg(hvec3_unit_x()));
+    # Midpoint of the difference's x-extent: the midpoint of two of its own
+    # points, hence interior. Same interior point _mpr_center picks.
+    var v0 = hvec3_scale(hvec3_add(px, nx), F64_HALF);
+    var scale = hvec3_length(hvec3_sub(px, nx));
+    if (f64_gt(scale, 0) == 0) { return 0; }
+    if (f64_le(hvec3_length(v0), f64_mul(EPSILON_F64, scale)) == 1) {
+        # v0 IS the origin, so the ray v0 -> origin has no direction. Nudge the
+        # interior point rather than the ray: a millionth of the body's own
+        # extent cannot leave a body whose x-midpoint is the origin.
+        v0 = hvec3_new(f64_mul(_GA_F64_1EM6, scale), 0, 0);
+    }
+
+    var dir = _epa_unit(hvec3_neg(v0));
+    if (f64_gt(hvec3_length_sq(dir), 0) == 0) { return 0; }
+    var v1 = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir);
+    if (f64_lt(hvec3_dot(v1, dir), 0) == 1) { return 0; }
+
+    # Second portal vertex: perpendicular to the plane through origin, v0 and v1.
+    # When those three are colinear the ray is an axis of symmetry of the
+    # difference (two concentric spheres, say) and ANY perpendicular to v0 will
+    # do -- the shipped code treated this as a failure and bailed.
+    dir = hvec3_cross(v0, v1);
+    if (f64_le(hvec3_length(dir),
+    f64_mul(EPSILON_F64, f64_mul(hvec3_length(v0), hvec3_length(v1)))) == 1) {
+        dir = _epa_perp(v0);
+    }
+    dir = _epa_unit(dir);
+    if (f64_gt(hvec3_length_sq(dir), 0) == 0) { return 0; }
+    var v2 = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir);
+    if (f64_lt(hvec3_dot(v2, dir), 0) == 1) { return 0; }
+
+    # Third: normal of (v0, v1, v2), pointed along the ray, i.e. away from v0.
+    dir = hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v2, v0));
+    if (f64_gt(hvec3_dot(dir, v0), 0) == 1) {
+        var sw = v1;
+        v1 = v2;
+        v2 = sw;
+        dir = hvec3_neg(dir);
+    }
+
+    var v3 = hvec3_zero();
+    var found = 0;
+    for (var it = 0; it < GJK_MAX_ITER; it = it + 1) {
+        dir = _epa_unit(dir);
+        if (f64_gt(hvec3_length_sq(dir), 0) == 0) { return 0; }
+        v3 = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir);
+        if (f64_lt(hvec3_dot(v3, dir), 0) == 1) { return 0; }
+        var cont = 0;
+        if (f64_lt(hvec3_dot(hvec3_cross(v1, v3), v0), 0) == 1) {
+            v2 = v3;
+            cont = 1;
+        } elif (f64_lt(hvec3_dot(hvec3_cross(v3, v2), v0), 0) == 1) {
+            v1 = v3;
+            cont = 1;
+        }
+        if (cont == 0) {
+            found = 1;
+            break;
+        }
+        dir = hvec3_cross(hvec3_sub(v1, v0), hvec3_sub(v2, v0));
+    }
+    if (found == 0) { return 0; }
+
+    # Push the portal outward until the origin lies between v0 and the portal
+    # plane. Only then does the tetrahedron (v0, v1, v2, v3) contain the origin,
+    # which is the whole point of building it.
+    for (var it = 0; it < GJK_MAX_ITER; it = it + 1) {
+        var pn = hvec3_cross(hvec3_sub(v2, v1), hvec3_sub(v3, v1));
+        if (f64_lt(hvec3_dot(pn, hvec3_sub(v1, v0)), 0) == 1) { pn = hvec3_neg(pn); }
+        pn = _epa_unit(pn);
+        if (f64_gt(hvec3_length_sq(pn), 0) == 0) { break; }
+        if (f64_ge(hvec3_dot(pn, v1), 0) == 1) { break; }
+        var v4 = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, pn);
+        var d4 = hvec3_dot(v4, pn);
+        if (f64_lt(d4, 0) == 1) { return 0; }
+        if (f64_le(f64_sub(d4, hvec3_dot(v1, pn)),
+        f64_mul(EPSILON_F64, f64_abs(d4))) == 1) { break; }
+        # Replace whichever portal vertex keeps the ray v0 -> origin inside the
+        # portal wedge (libccd's expandPortal decision).
+        var v4v0 = hvec3_cross(v4, v0);
+        if (f64_gt(hvec3_dot(v1, v4v0), 0) == 1) {
+            if (f64_gt(hvec3_dot(v2, v4v0), 0) == 1) { v1 = v4; } else { v3 = v4; }
+        } elif (f64_gt(hvec3_dot(v3, v4v0), 0) == 1) {
+            v2 = v4;
+        } else {
+            v1 = v4;
+        }
+    }
+
+    # PREFER FOUR BOUNDARY POINTS. v0 is an INTERIOR point, and for a smooth body
+    # v1 -- the support toward the origin -- is antiparallel to it, so the origin
+    # lands exactly ON the v0-v1 edge of the portal tetrahedron. That tetrahedron
+    # is a legal portal but a terrible EPA seed: two of its faces pass through the
+    # origin, EPA's first probe asks for a support point that is already v3, and
+    # the refinement stalls (two radius-2 spheres, exact depth 1.3599, came back
+    # 4.0). Swapping v0 for the support point OPPOSITE the portal replaces it with
+    # a fourth boundary point and puts the origin strictly inside. Kept only if it
+    # really does enclose the origin; otherwise the original portal stands.
+    var pn = _epa_unit(hvec3_cross(hvec3_sub(v2, v1), hvec3_sub(v3, v1)));
+    if (f64_gt(hvec3_length_sq(pn), 0) == 1) {
+        if (f64_lt(hvec3_dot(pn, hvec3_sub(v1, v0)), 0) == 1) { pn = hvec3_neg(pn); }
+        var v0b = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_neg(pn));
+        store64(out4, v0b);
+        store64(out4 + 8, v1);
+        store64(out4 + 16, v2);
+        store64(out4 + 24, v3);
+        if (_epa_tetra_strict(out4) == 1) { return 1; }
+    }
+    store64(out4, v0);
+    store64(out4 + 8, v1);
+    store64(out4 + 16, v2);
+    store64(out4 + 24, v3);
+    return _epa_tetra_ok(out4);
+}
+
+# Local pattern search on the DIRECTION, run only when the expansion loop ran out
+# of iterations without closing its certificate.
+#
+# Why this is safe, and why it is not just "more EPA": the returned depth is
+# min over probed directions of h_M(n), and EVERY h_M(n) is >= the true MTV
+# because every supporting plane already separates the shapes. So probing more
+# directions can only lower an upper bound that can never go under the answer --
+# monotone, with no way to trade one error for another.
+#
+# Why it is needed: EPA resolves the direction only as finely as it can afford to
+# triangulate a curved surface, and near-concentric smooth bodies are the worst
+# case because h_M is almost flat there -- two spheres 0.1 apart left the probe
+# direction 0.14 rad off the true one, a 2.7e-4 relative error that no realistic
+# iteration budget fixes by triangulating harder. A few dozen support calls do.
+# Polytopes never reach here: their certificate closes exactly.
+fn _epa_polish(sup_a, shape_a, sup_b, shape_b, n0, d0, out_normal, out_depth) {
+    var n = n0;
+    var d = d0;
+    var step = _GA_F64_QUARTER;  # start at 0.25 rad
+    for (var it = 0; it < _EPA_POLISH_ITER; it = it + 1) {
+        var u = _epa_perp(n);
+        var v = hvec3_cross(n, u);
+        var moved = 0;
+        for (var k = 0; k < 4; k = k + 1) {
+            var t = u;
+            if (k == 1) { t = hvec3_neg(u); }
+            if (k == 2) { t = v; }
+            if (k == 3) { t = hvec3_neg(v); }
+            var cand = _epa_unit(hvec3_add(n, hvec3_scale(t, step)));
+            if (f64_gt(hvec3_length_sq(cand), 0) == 1) {
+                var p = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, cand);
+                var dc = hvec3_dot(p, cand);
+                if (f64_lt(dc, d) == 1) {
+                    d = dc;
+                    n = cand;
+                    moved = 1;
+                }
+            }
+        }
+        if (moved == 0) {
+            step = f64_mul(step, F64_HALF);
+            if (f64_lt(step, EPSILON_F64) == 1) { break; }
+        }
+    }
+    store64(out_normal, n);
+    store64(out_depth, d);
+    return 0;
+}
+
+# Expand `seed` (4 HVec3 pointers, a tetrahedron containing the origin) until the
+# closest supporting plane of the Minkowski difference is pinned. Writes the unit
+# outward normal and the depth. Returns 1 on success, 0 if the seed is unusable.
+fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
+    var vmax = 4 + EPA_MAX_ITER;
+    var fmax = 2 * vmax + 8;
+    var verts = alloc(vmax * 8);
+    var fbuf = alloc(fmax * _EPA_FACE_SIZE);
+    var ebuf = alloc(fmax * 3 * 16);
+    if (verts == 0 || fbuf == 0 || ebuf == 0) { return 0; }
+    for (var i = 0; i < 4; i = i + 1) { store64(verts + i * 8, load64(seed + i * 8)); }
+    var nv = 4;
+    _epa_face_set(fbuf, 0, verts, 0, 1, 2, 3);
+    _epa_face_set(fbuf, 1, verts, 0, 1, 3, 2);
+    _epa_face_set(fbuf, 2, verts, 0, 2, 3, 1);
+    _epa_face_set(fbuf, 3, verts, 1, 2, 3, 0);
+    var nf = 4;
+
+    var best_n = hvec3_unit_x();
+    var best_d = _GA_F64_POS_INF;
+    var prev_lo = _GA_F64_NEG_INF;
+    var certified = 0;
+    # Does the seed put the origin strictly inside? If not, `lo` is not a valid
+    # lower bound on the depth and the two-sided certificate below cannot be
+    # trusted -- see the note at the convergence test.
+    var strict = _epa_tetra_strict(seed);
+    var eps2 = f64_mul(EPSILON_F64, EPSILON_F64);
+
+    for (var it = 0; it < EPA_MAX_ITER; it = it + 1) {
+        # Closest live face -- full scan over every face, deliberately not a
+        # heap; see the note at the top of this section.
+        # `lo` is the LOWER bound and must range over every live face, exhausted
+        # ones included -- dropping them would make the certificate claim more
+        # than it knows. `bi` is the face to expand through and must skip them.
+        var bi = 0 - 1;
+        var lo = _GA_F64_POS_INF;
+        var bd_sel = _GA_F64_POS_INF;
+        for (var f = 0; f < nf; f = f + 1) {
+            var fst = load64(fbuf + f * _EPA_FACE_SIZE + 40);
+            var fdi = load64(fbuf + f * _EPA_FACE_SIZE + 32);
+            if (fst == 1 || fst == 3) {
+                if (f64_lt(fdi, lo) == 1) { lo = fdi; }
+            }
+            if (fst == 1) {
+                if (f64_lt(fdi, bd_sel) == 1) {
+                    bd_sel = fdi;
+                    bi = f;
+                }
+            }
+        }
+        if (bi < 0) { break; }
+
+        var nrm = load64(fbuf + bi * _EPA_FACE_SIZE + 24);
+        var p = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, nrm);
+        var d = hvec3_dot(p, nrm);
+        if (f64_lt(d, best_d) == 1) {
+            best_d = d;
+            best_n = nrm;
+        }
+
+        # Tolerance relative to the SHAPE scale, not to the depth. EPA's
+        # accuracy on a curved surface is set by how finely the polytope
+        # approximates it, which is a property of the body, not of how deeply the
+        # two overlap: demanding 1e-10 OF A 1e-6 DEPTH asks the hull to track a
+        # radius-2 sphere to 1e-16 and simply burns the iteration budget. |p| is
+        # a support point of the difference, so it is that body's own scale.
+        var tol = f64_mul(_GA_EPA_REL_TOL, f64_max(f64_abs(best_d), hvec3_length(p)));
+        if (f64_le(f64_sub(best_d, lo), tol) == 1) {
+            # The certificate is only meaningful while the lower bound is
+            # POSITIVE. lo <= 0 means a face plane passes through or behind the
+            # origin, i.e. the origin sits on the hull rather than inside it --
+            # an exactly tangent contact. There the gap can close on a value that
+            # is not the depth at all (two spheres touching at exactly 4.0
+            # apart, true depth 0, closed the gap at 0.0105), so leave
+            # `certified` clear and let the direction polish finish the job.
+            # The same applies when the SEED was not strictly enclosing: the
+            # lower-bound argument assumes the origin is inside the polytope, so
+            # a seed that only just contains it cannot certify anything.
+            if (f64_gt(lo, 0) == 1 && strict == 1) { certified = 1; }
+            break;
+        }
+        # The closest-face distance of an EPA polytope can only grow: the hull
+        # only ever gains vertices. A decrease proves the last rebuild corrupted
+        # the surface -- the exact failure mode that sank the 2.8.2 flood-fill
+        # rewrite -- so stop and keep the certified upper bound rather than
+        # continue on top of a broken hull.
+        if (f64_lt(lo, f64_sub(prev_lo, tol)) == 1) { break; }
+        prev_lo = lo;
+        if (nv >= vmax) { break; }
+
+        # Support point already on the hull: the polytope cannot grow further.
+        var dup = 0;
+        for (var q = 0; q < nv; q = q + 1) {
+            var vq = load64(verts + q * 8);
+            var sc2 = f64_add(hvec3_length_sq(p), hvec3_length_sq(vq));
+            if (f64_le(hvec3_length_sq(hvec3_sub(vq, p)), f64_mul(eps2, sc2)) == 1) { dup = 1; }
+        }
+        if (dup == 1) {
+            # The support point through this face is already a hull vertex, so
+            # expanding here cannot grow the polytope. Retire the face from the
+            # expansion search and take the next one instead of abandoning the
+            # whole refinement -- a portal seed on a smooth body reaches this on
+            # its FIRST iteration (v3 is exactly the support point the first
+            # probe asks for), and breaking there returned 4.0 for two radius-2
+            # spheres whose exact depth is 1.3599.
+            store64(fbuf + bi * _EPA_FACE_SIZE + 40, 3);
+            continue;
+        }
+
+        var ne = 0;
+        for (var f = 0; f < nf; f = f + 1) {
+            var fb = fbuf + f * _EPA_FACE_SIZE;
+            var st = load64(fb + 40);
+            if (st != 0) {
+                var vis = 0;
+                if (st == 2) {
+                    # Zero-area face: it has no usable plane, so it cannot be
+                    # tested. Always retire it -- its edges rejoin the horizon and
+                    # the fan re-triangulates the region properly.
+                    vis = 1;
+                } elif (f64_lt(hvec3_dot(load64(fb + 24), p),
+                f64_sub(load64(fb + 32), f64_mul(EPSILON_F64,
+                f64_add(f64_abs(load64(fb + 32)), hvec3_length(p))))) == 0) {
+                    # COPLANAR FACES MUST GO TOO. A box's Minkowski difference is
+                    # a box, so its own face is split into coplanar triangles and
+                    # the support point lands EXACTLY on several of their planes.
+                    # A strict "> dist" test then removes one and keeps its
+                    # coplanar neighbours, the removed region is no longer a disc,
+                    # the horizon does not close into one cycle, and the rebuilt
+                    # surface folds. That fold was measurable: axis-aligned unit
+                    # boxes offset (0.3, 0, -0.39) had the closest-face distance
+                    # COLLAPSE 1.5962 -> 0.4879 at iteration 7 and the answer came
+                    # out 2.0 against an exact MTV of 1.61. The test is therefore
+                    # "not strictly behind the plane", with the slack scaled to
+                    # the plane's own magnitude.
+                    vis = 1;
+                }
+                if (vis == 1) {
+                    store64(fb + 40, 0);
+                    ne = _epa_edge_push(ebuf, ne, load64(fb), load64(fb + 8));
+                    ne = _epa_edge_push(ebuf, ne, load64(fb + 8), load64(fb + 16));
+                    ne = _epa_edge_push(ebuf, ne, load64(fb + 16), load64(fb));
+                }
+            }
+        }
+        if (ne < 3) { break; }
+
+        # Compact the survivors to the front, then fan the horizon onto the new
+        # vertex. Compaction keeps `nf` at O(V) instead of accumulating every
+        # face ever built.
+        var w = 0;
+        for (var f = 0; f < nf; f = f + 1) {
+            if (load64(fbuf + f * _EPA_FACE_SIZE + 40) != 0) {
+                if (w != f) {
+                    for (var s = 0; s < 6; s = s + 1) {
+                        store64(fbuf + w * _EPA_FACE_SIZE + s * 8,
+                        load64(fbuf + f * _EPA_FACE_SIZE + s * 8));
+                    }
+                }
+                w = w + 1;
+            }
+        }
+        nf = w;
+
+        var pi = nv;
+        store64(verts + pi * 8, p);
+        nv = nv + 1;
+        for (var e = 0; e < ne; e = e + 1) {
+            if (nf < fmax) {
+                _epa_face_set(fbuf, nf, verts, load64(ebuf + e * 16),
+                load64(ebuf + e * 16 + 8), pi, 0 - 1);
+                nf = nf + 1;
+            }
+        }
+    }
+
+    if (f64_lt(best_d, _GA_F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(best_d, 0) == 1) { best_d = 0; }
+    if (certified == 0) {
+        _epa_polish(sup_a, shape_a, sup_b, shape_b, best_n, best_d, out_normal, out_depth);
+        if (f64_lt(load64(out_depth), 0) == 1) { store64(out_depth, 0); }
+        return 1;
+    }
+    store64(out_normal, best_n);
+    store64(out_depth, best_d);
+    return 1;
 }
 
 # GJK + EPA 3D: returns 1 if penetrating, writes normal and depth.
-# out_normal: pointer where HVec3 normal will be stored
-# out_depth: pointer where f64 depth will be stored
+# out_normal: pointer where the unit HVec3 normal will be stored
+# out_depth: pointer where the f64 depth will be stored
+# The normal is the outward normal of the Minkowski difference A (-) B at the
+# closest supporting plane, and the depth is h_M(normal) -- translating B by
+# depth * normal separates the pair.
 fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
-    var simplex = _gjk_core_3d(support_a, shape_a, support_b, shape_b);
-    if (simplex == 0) { return 0; }
-
-    var n_pts = _gjk_simplex_count(simplex);
-
-    # Build vertex list from simplex
-    var verts = vec_new();
-    for (var vi = 0; vi < n_pts; vi = vi + 1) {
-        vec_push(verts, _gjk_simplex_get(simplex, vi));
+    var seed = alloc(32);
+    if (seed == 0) { return 0; }
+    var s = _epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed);
+    if (s == 0) { return 0; }
+    if (s != 1) {
+        # GJK enclosed the origin but its simplex is flat, or rounding left the
+        # origin just outside it. Rebuild from the portal instead of reporting
+        # "no penetration" -- that is what made box(h=1,1,1) against
+        # sphere(c=(1.2,0,0.7), r=1) return 0 for an exact depth of 0.8.
+        if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) == 0) { return 0; }
     }
-
-    # Pad to 4 vertices if needed (try cardinal directions)
-    var card_dirs = alloc(48);  # 6 HVec3 pointers
-    store64(card_dirs,      hvec3_unit_x());
-    store64(card_dirs + 8,  hvec3_unit_y());
-    store64(card_dirs + 16, hvec3_unit_z());
-    store64(card_dirs + 24, hvec3_neg(hvec3_unit_x()));
-    store64(card_dirs + 32, hvec3_neg(hvec3_unit_y()));
-    store64(card_dirs + 40, hvec3_neg(hvec3_unit_z()));
-    for (var ci = 0; ci < 6; ci = ci + 1) {
-        if (vec_len(verts) >= 4) { ci = 6; } else {
-            var cd = load64(card_dirs + ci * 8);
-            var p = _gjk_mink_support(support_a, shape_a, support_b, shape_b, cd);
-            var is_dup = 0;
-            for (var di = 0; di < vec_len(verts); di = di + 1) {
-                if (f64_lt(hvec3_length_sq(hvec3_sub(vec_get(verts, di), p)), EPSILON_F64) == 1) {
-                    is_dup = 1;
-                }
-            }
-            if (is_dup == 0) { vec_push(verts, p); }
-        }
-    }
-    if (vec_len(verts) < 4) { return 0; }  # degenerate
-
-    # Check tetrahedron volume
-    var v01 = hvec3_sub(vec_get(verts, 1), vec_get(verts, 0));
-    var v02 = hvec3_sub(vec_get(verts, 2), vec_get(verts, 0));
-    var v03 = hvec3_sub(vec_get(verts, 3), vec_get(verts, 0));
-    var vol = f64_abs(hvec3_dot(v01, hvec3_cross(v02, v03)));
-    if (f64_lt(vol, EPSILON_F64) == 1) { return 0; }
-
-    # Build initial 4 triangular faces
-    # faces vec stores triples: [i0, i1, i2, i0, i1, i2, ...]
-    var faces = vec_new();
-
-    # Compute centroid to orient normals outward
-    var centroid = hvec3_scale(hvec3_add(hvec3_add(vec_get(verts, 0), vec_get(verts, 1)),
-    hvec3_add(vec_get(verts, 2), vec_get(verts, 3))),
-    _GA_F64_QUARTER);
-
-    # 4 faces of tetrahedron: [0,1,2], [0,3,1], [0,2,3], [1,3,2]
-    var _init_faces = alloc(96);  # 4 * 3 * 8
-    store64(_init_faces,      0); store64(_init_faces + 8,  1); store64(_init_faces + 16, 2);
-    store64(_init_faces + 24, 0); store64(_init_faces + 32, 3); store64(_init_faces + 40, 1);
-    store64(_init_faces + 48, 0); store64(_init_faces + 56, 2); store64(_init_faces + 64, 3);
-    store64(_init_faces + 72, 1); store64(_init_faces + 80, 3); store64(_init_faces + 88, 2);
-
-    for (var fi = 0; fi < 4; fi = fi + 1) {
-        var base = fi * 24;
-        var i0 = load64(_init_faces + base);
-        var i1 = load64(_init_faces + base + 8);
-        var i2 = load64(_init_faces + base + 16);
-        # Fix winding: normal should point away from centroid
-        var va = vec_get(verts, i0);
-        var vb = vec_get(verts, i1);
-        var vc = vec_get(verts, i2);
-        var normal = hvec3_cross(hvec3_sub(vb, va), hvec3_sub(vc, va));
-        if (f64_lt(hvec3_dot(normal, hvec3_sub(va, centroid)), 0) == 1) {
-            # Swap winding
-            vec_push(faces, i0); vec_push(faces, i2); vec_push(faces, i1);
-        } else {
-            vec_push(faces, i0); vec_push(faces, i1); vec_push(faces, i2);
-        }
-    }
-
-    # EPA iteration loop
-    var best_normal = hvec3_unit_x();
-    var best_depth = _GA_F64_POS_INF;
-
-    for (var ei = 0; ei < EPA_MAX_ITER; ei = ei + 1) {
-        var num_faces = vec_len(faces) / 3;
-        var closest_dist = _GA_F64_POS_INF;
-        var closest_normal = hvec3_zero();
-        var closest_face = 0;
-
-        for (var fj = 0; fj < num_faces; fj = fj + 1) {
-            var fb = fj * 3;
-            var nd = _epa_face_normal_dist(verts, fb, faces);
-            if (nd != 0) {
-                var fn_normal = load64(nd);
-                var fn_dist = load64(nd + 8);
-                if (f64_lt(fn_dist, closest_dist) == 1) {
-                    closest_dist = fn_dist;
-                    closest_normal = fn_normal;
-                    closest_face = fj;
-                }
-            }
-        }
-
-        if (closest_dist == _GA_F64_POS_INF) {
-            # All faces degenerate
-            ei = EPA_MAX_ITER;
-        } else {
-            var support = _gjk_mink_support(support_a, shape_a, support_b, shape_b, closest_normal);
-            var d = hvec3_dot(support, closest_normal);
-
-            if (f64_lt(f64_abs(f64_sub(d, closest_dist)), EPSILON_F64) == 1) {
-                # Converged
-                store64(out_normal, closest_normal);
-                store64(out_depth, f64_abs(closest_dist));
-                return 1;
-            }
-
-            # Add new vertex
-            var new_idx = vec_len(verts);
-            vec_push(verts, support);
-
-            # Find visible faces and collect horizon edges
-            var edges = vec_new();  # pairs: [e0, e1, e0, e1, ...]
-            var new_faces = vec_new();
-
-            for (var fk = 0; fk < num_faces; fk = fk + 1) {
-                var fb = fk * 3;
-                var fi0 = vec_get(faces, fb);
-                var fi1 = vec_get(faces, fb + 1);
-                var fi2 = vec_get(faces, fb + 2);
-                var fva = vec_get(verts, fi0);
-                var fvb = vec_get(verts, fi1);
-                var fvc = vec_get(verts, fi2);
-                var fnorm = hvec3_cross(hvec3_sub(fvb, fva), hvec3_sub(fvc, fva));
-
-                if (f64_gt(hvec3_dot(fnorm, hvec3_sub(support, fva)), 0) == 1) {
-                    # Visible face -- collect edges
-                    # Edge fi0-fi1
-                    var _edge_pairs = alloc(48);
-                    store64(_edge_pairs,      fi0); store64(_edge_pairs + 8,  fi1);
-                    store64(_edge_pairs + 16, fi1); store64(_edge_pairs + 24, fi2);
-                    store64(_edge_pairs + 32, fi2); store64(_edge_pairs + 40, fi0);
-
-                    for (var ek = 0; ek < 3; ek = ek + 1) {
-                        var ea = load64(_edge_pairs + ek * 16);
-                        var eb = load64(_edge_pairs + ek * 16 + 8);
-                        # Check if reverse edge already in list
-                        var found = 0 - 1;
-                        var ne = vec_len(edges) / 2;
-                        for (var el = 0; el < ne; el = el + 1) {
-                            if (vec_get(edges, el * 2) == eb) {
-                                if (vec_get(edges, el * 2 + 1) == ea) {
-                                    found = el;
-                                }
-                            }
-                        }
-                        if (found >= 0) {
-                            # Remove the matched edge (shift left by 2)
-                            vec_remove(edges, found * 2 + 1);
-                            vec_remove(edges, found * 2);
-                        } else {
-                            vec_push(edges, ea);
-                            vec_push(edges, eb);
-                        }
-                    }
-                } else {
-                    # Keep this face
-                    vec_push(new_faces, fi0);
-                    vec_push(new_faces, fi1);
-                    vec_push(new_faces, fi2);
-                }
-            }
-
-            # Create new faces from horizon edges to new vertex
-            var ne = vec_len(edges) / 2;
-            for (var el = 0; el < ne; el = el + 1) {
-                vec_push(new_faces, vec_get(edges, el * 2));
-                vec_push(new_faces, vec_get(edges, el * 2 + 1));
-                vec_push(new_faces, new_idx);
-            }
-
-            faces = new_faces;
-            best_normal = closest_normal;
-            best_depth = closest_dist;
-        }
-    }
-
-    # Return best estimate
-    store64(out_normal, best_normal);
-    store64(out_depth, f64_abs(best_depth));
-    return 1;
+    return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
 }
 
 # ================================================================
@@ -532,34 +946,78 @@ fn _bvh_node_left(n) { return load64(n + 8); }
 fn _bvh_node_right(n) { return load64(n + 16); }
 fn _bvh_node_leaf_idx(n) { return load64(n + 24); }
 
-# Merge two AABBs
-fn _bvh_aabb_merge(a, b) {
-    return geo_aabb_new(hvec3_min(GeoAabb_min(a), GeoAabb_min(b)),
-    hvec3_max(GeoAabb_max(a), GeoAabb_max(b)));
+# CENTROIDS ONCE, BOUNDS WITHOUT A HEAP BLOCK (2.8.3).
+#
+# The build item grew from 2 slots to 5. The extra three hold the AABB's
+# centroid, computed once in bvh_build. Through 2.8.2 the partition loop
+# called geo_aabb_center() on every item at every tree level -- two HVec3
+# allocations per item per level, i.e. Theta(n log n) allocations for a
+# quantity that never changes -- and the range bounds were folded with
+# _bvh_aabb_merge, which cost FIVE heap blocks per step (hvec3_min,
+# hvec3_max, then geo_aabb_new's own hvec3_min/hvec3_max/alloc). Building a
+# 16k-primitive BVH allocated 36.6 MB of never-freed arena.
+#
+# The fold is now six f64 registers and one GeoAabb per internal node, and
+# it is bit-identical to the old one: f64_min/f64_max are exactly what
+# hvec3_min/hvec3_max apply componentwise, in the same left-to-right
+# argument order (accumulator first), and the centroid is the same
+# (min + max) * 0.5. So mid_val, the axis choice and the partition -- hence
+# the whole tree shape -- are unchanged, and the repair is checked by
+# comparing every node AABB against the pre-2.8.3 build, not just the query
+# answers. Measured at n = 16k uniform: 85.3 ms -> 31.2 ms and 36.6 MB ->
+# 4.14 MB of arena; at n = 8k coincident, 35.8 ms -> 8.1 ms and 16.7 MB ->
+# 2.07 MB. What remains is the one O(n log n) bounds scan a top-down binary
+# BVH inherently needs.
+var _BVH_ITEM_SIZE = 5;  # aabb_ptr, index, centroid x, y, z
+
+fn _bvh_item_swap(items, i, j) {
+    var ib = i * _BVH_ITEM_SIZE;
+    var jb = j * _BVH_ITEM_SIZE;
+    for (var k = 0; k < _BVH_ITEM_SIZE; k = k + 1) {
+        var t = vec_get(items, ib + k);
+        vec_set(items, ib + k, vec_get(items, jb + k));
+        vec_set(items, jb + k, t);
+    }
+    return 0;
 }
 
-# Build BVH recursively from a vec of {aabb, index} pairs.
-# items_vec: vec of interleaved [aabb_ptr, index, aabb_ptr, index, ...]
-# start, end: range in items_vec (in pairs, so item i is at items[i*2], items[i*2+1])
+# Build BVH recursively from a vec of {aabb, index, cx, cy, cz} records.
+# items: vec of interleaved [aabb_ptr, index, cx, cy, cz, ...] -- item i
+#        occupies items[i*5 .. i*5+4]
+# start, end: half-open item range
 fn _bvh_build_rec(items, start, end) {
     var count = end - start;
     if (count == 1) {
-        var aabb = vec_get(items, start * 2);
-        var idx = vec_get(items, start * 2 + 1);
+        var aabb = vec_get(items, start * _BVH_ITEM_SIZE);
+        var idx = vec_get(items, start * _BVH_ITEM_SIZE + 1);
         return _bvh_node_alloc(aabb, 0 - 1, 0 - 1, idx);
     }
 
-    # Compute bounding box of all items
-    var bounds = vec_get(items, start * 2);
+    # Bounding box of the whole range, folded into six registers
+    var first = GeoAabb_min(vec_get(items, start * _BVH_ITEM_SIZE));
+    var lo_x = HVec3_x(first);
+    var lo_y = HVec3_y(first);
+    var lo_z = HVec3_z(first);
+    first = GeoAabb_max(vec_get(items, start * _BVH_ITEM_SIZE));
+    var hi_x = HVec3_x(first);
+    var hi_y = HVec3_y(first);
+    var hi_z = HVec3_z(first);
     for (var bi = start + 1; bi < end; bi = bi + 1) {
-        bounds = _bvh_aabb_merge(bounds, vec_get(items, bi * 2));
+        var box = vec_get(items, bi * _BVH_ITEM_SIZE);
+        var bmin = GeoAabb_min(box);
+        var bmax = GeoAabb_max(box);
+        lo_x = f64_min(lo_x, HVec3_x(bmin));
+        lo_y = f64_min(lo_y, HVec3_y(bmin));
+        lo_z = f64_min(lo_z, HVec3_z(bmin));
+        hi_x = f64_max(hi_x, HVec3_x(bmax));
+        hi_y = f64_max(hi_y, HVec3_y(bmax));
+        hi_z = f64_max(hi_z, HVec3_z(bmax));
     }
 
     # Find longest axis
-    var size = geo_aabb_size(bounds);
-    var sx = f64_abs(HVec3_x(size));
-    var sy = f64_abs(HVec3_y(size));
-    var sz = f64_abs(HVec3_z(size));
+    var sx = f64_abs(f64_sub(hi_x, lo_x));
+    var sy = f64_abs(f64_sub(hi_y, lo_y));
+    var sz = f64_abs(f64_sub(hi_z, lo_z));
     var axis = 0;
     if (f64_gt(sy, sx) == 1) {
         if (f64_gt(sy, sz) == 1) { axis = 1; } else { axis = 2; }
@@ -568,35 +1026,24 @@ fn _bvh_build_rec(items, start, end) {
     }
 
     # Midpoint of bounding box on chosen axis
-    var bmin = GeoAabb_min(bounds);
-    var bmax = GeoAabb_max(bounds);
-    var mid_val = 0;
-    if (axis == 0) { mid_val = f64_mul(f64_add(HVec3_x(bmin), HVec3_x(bmax)), F64_HALF); }
-    if (axis == 1) { mid_val = f64_mul(f64_add(HVec3_y(bmin), HVec3_y(bmax)), F64_HALF); }
-    if (axis == 2) { mid_val = f64_mul(f64_add(HVec3_z(bmin), HVec3_z(bmax)), F64_HALF); }
+    var mid_val = f64_mul(f64_add(lo_x, hi_x), F64_HALF);
+    if (axis == 1) { mid_val = f64_mul(f64_add(lo_y, hi_y), F64_HALF); }
+    if (axis == 2) { mid_val = f64_mul(f64_add(lo_z, hi_z), F64_HALF); }
 
-    # Partition: items with center < mid go to left
-    # Simple in-place partition by swapping pairs
+    # One GeoAabb per node. geo_aabb_new would re-run hvec3_min/hvec3_max
+    # over an already-sorted pair for two more heap blocks; lo_* <= hi_*
+    # holds by construction of the fold above.
+    var bounds = alloc(sizeof(GeoAabb));
+    GeoAabb_set_min(bounds, hvec3_new(lo_x, lo_y, lo_z));
+    GeoAabb_set_max(bounds, hvec3_new(hi_x, hi_y, hi_z));
+
+    # Partition: items with center < mid go to left.
+    # Centroid components sit at item slots 2, 3, 4 -- so slot 2 + axis.
     var lo = start;
-    var hi = end - 1;
-    for (var pi = start; pi <= hi; pi = pi + 1) {
-        var item_aabb = vec_get(items, pi * 2);
-        var center = geo_aabb_center(item_aabb);
-        var cv = 0;
-        if (axis == 0) { cv = HVec3_x(center); }
-        if (axis == 1) { cv = HVec3_y(center); }
-        if (axis == 2) { cv = HVec3_z(center); }
-
+    for (var pi = start; pi < end; pi = pi + 1) {
+        var cv = vec_get(items, pi * _BVH_ITEM_SIZE + 2 + axis);
         if (f64_lt(cv, mid_val) == 1) {
-            # Swap pair at pi with pair at lo
-            if (pi != lo) {
-                var tmp_a = vec_get(items, lo * 2);
-                var tmp_i = vec_get(items, lo * 2 + 1);
-                vec_set(items, lo * 2, vec_get(items, pi * 2));
-                vec_set(items, lo * 2 + 1, vec_get(items, pi * 2 + 1));
-                vec_set(items, pi * 2, tmp_a);
-                vec_set(items, pi * 2 + 1, tmp_i);
-            }
+            if (pi != lo) { _bvh_item_swap(items, lo, pi); }
             lo = lo + 1;
         }
     }
@@ -628,17 +1075,106 @@ fn bvh_build(aabbs, count) {
     if (count == 0) { return 0; }
     var items = vec_new();
     for (var bi = 0; bi < count; bi = bi + 1) {
-        vec_push(items, load64(aabbs + bi * 8));
+        var box = load64(aabbs + bi * 8);
+        var bmin = GeoAabb_min(box);
+        var bmax = GeoAabb_max(box);
+        vec_push(items, box);
         vec_push(items, bi);
+        # Centroid ONCE, here -- the same (min + max) * 0.5 geo_aabb_center
+        # returns, but computed n times instead of n per tree level.
+        vec_push(items, f64_mul(f64_add(HVec3_x(bmin), HVec3_x(bmax)), F64_HALF));
+        vec_push(items, f64_mul(f64_add(HVec3_y(bmin), HVec3_y(bmax)), F64_HALF));
+        vec_push(items, f64_mul(f64_add(HVec3_z(bmin), HVec3_z(bmax)), F64_HALF));
     }
     return _bvh_build_rec(items, 0, count);
+}
+
+# Does the ray meet the box at any t >= 0? Returns 1 or 0.
+#
+# THE BVH WALKER NEEDS A PREDICATE, NOT A DISTANCE. geo_ray_aabb returns the hit
+# parameter t and uses 0 as its miss sentinel, so "miss" and "hit exactly at
+# t = 0" are the same return value. Testing it with `== 0` -- which is what the
+# walker did through 2.8.2 -- therefore prunes any node the ray enters at t = 0,
+# and pruning a node discards its ENTIRE subtree.
+#
+# That is not an exotic input. A ray starting on a face of a box, or on the
+# shared face of two adjacent boxes, or at the minimum corner of the scene, all
+# give t_min = 0 for some node -- and the root's bounds are the whole scene, so
+# a ray launched from the scene's minimum corner returned NOTHING at all. On the
+# two-unit-box fixture in tests/modules.tcyr the truth is 2 candidates and the
+# walker reported 0.
+#
+# The slab arithmetic below is geo_ray_aabb's, with the final "which t do I
+# report" step replaced by the question the caller actually asked: the slab
+# intersection must be non-empty (t_min <= t_max) and must reach forward from
+# the origin (t_max >= 0). geo_ray_aabb itself is left alone -- its 0-on-miss
+# convention is documented, shared with every other geo_ray_* function, and
+# depended on elsewhere; the defect was reading a distance as a boolean.
+fn _bvh_ray_hits_aabb(ray, aabb) {
+    var ox = HVec3_x(GeoRay_origin(ray));
+    var oy = HVec3_y(GeoRay_origin(ray));
+    var oz = HVec3_z(GeoRay_origin(ray));
+    var dx = HVec3_x(GeoRay_direction(ray));
+    var dy = HVec3_y(GeoRay_direction(ray));
+    var dz = HVec3_z(GeoRay_direction(ray));
+    var bmin = GeoAabb_min(aabb);
+    var bmax = GeoAabb_max(aabb);
+
+    var t_min = _GA_F64_NEG_INF;
+    var t_max = _GA_F64_POS_INF;
+
+    # X slab
+    if (f64_lt(f64_abs(dx), EPSILON_F64) == 1) {
+        if (f64_lt(ox, HVec3_x(bmin)) == 1) { return 0; }
+        if (f64_gt(ox, HVec3_x(bmax)) == 1) { return 0; }
+    } else {
+        var ix = f64_div(F64_ONE, dx);
+        var x1 = f64_mul(f64_sub(HVec3_x(bmin), ox), ix);
+        var x2 = f64_mul(f64_sub(HVec3_x(bmax), ox), ix);
+        if (f64_gt(x1, x2) == 1) { var xt = x1; x1 = x2; x2 = xt; }
+        t_min = f64_max(t_min, x1);
+        t_max = f64_min(t_max, x2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    }
+
+    # Y slab
+    if (f64_lt(f64_abs(dy), EPSILON_F64) == 1) {
+        if (f64_lt(oy, HVec3_y(bmin)) == 1) { return 0; }
+        if (f64_gt(oy, HVec3_y(bmax)) == 1) { return 0; }
+    } else {
+        var iy = f64_div(F64_ONE, dy);
+        var y1 = f64_mul(f64_sub(HVec3_y(bmin), oy), iy);
+        var y2 = f64_mul(f64_sub(HVec3_y(bmax), oy), iy);
+        if (f64_gt(y1, y2) == 1) { var yt = y1; y1 = y2; y2 = yt; }
+        t_min = f64_max(t_min, y1);
+        t_max = f64_min(t_max, y2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    }
+
+    # Z slab
+    if (f64_lt(f64_abs(dz), EPSILON_F64) == 1) {
+        if (f64_lt(oz, HVec3_z(bmin)) == 1) { return 0; }
+        if (f64_gt(oz, HVec3_z(bmax)) == 1) { return 0; }
+    } else {
+        var iz = f64_div(F64_ONE, dz);
+        var z1 = f64_mul(f64_sub(HVec3_z(bmin), oz), iz);
+        var z2 = f64_mul(f64_sub(HVec3_z(bmax), oz), iz);
+        if (f64_gt(z1, z2) == 1) { var zt = z1; z1 = z2; z2 = zt; }
+        t_min = f64_max(t_min, z1);
+        t_max = f64_min(t_max, z2);
+        if (f64_gt(t_min, t_max) == 1) { return 0; }
+    }
+
+    # Behind the origin entirely -> not a forward hit, same as geo_ray_aabb.
+    if (f64_lt(t_max, 0) == 1) { return 0; }
+    return 1;
 }
 
 # Query BVH for ray hits. Returns a vec of hit primitive indices.
 fn _bvh_query_ray_rec(node, ray, results) {
     if (node == 0) { return 0; }
     var aabb = _bvh_node_aabb(node);
-    if (geo_ray_aabb(ray, aabb) == 0) { return 0; }
+    if (_bvh_ray_hits_aabb(ray, aabb) == 0) { return 0; }
 
     var leaf_idx = _bvh_node_leaf_idx(node);
     if (leaf_idx != 0 - 1) {
@@ -744,33 +1280,347 @@ fn swept_aabb(aabb, velocity, dt) {
     hvec3_max(GeoAabb_max(aabb), end_max));
 }
 
-# Compute time of impact between two moving convex shapes.
-# Uses conservative advancement with GJK overlap tests.
-# support_a/b, shape_a/b: support function pointers and shape data
-# vel_a, vel_b: HVec3 velocities
-# Offset support function for TOI: wraps another support and adds translation.
-# shape_desc: {original_support_fp, original_shape, offset_hvec3}
-fn _toi_offset_support(shape_desc, dir) {
-    var orig_fp = load64(shape_desc);
-    var orig_shape = load64(shape_desc + 8);
-    var offset = load64(shape_desc + 16);
-    var pt = fncall2(orig_fp, orig_shape, dir);
-    return hvec3_add(pt, offset);
+# --- GJK distance sub-algorithm (used only by time_of_impact) --------------
+#
+# WHY A DISTANCE AND NOT A BOOLEAN.
+#
+# `time_of_impact` advertises conservative advancement, but through 2.8.2 it was
+# a fixed-step SAMPLER: it walked t from 0 to max_t in _GA_TOI_MAX_STEPS equal
+# steps and asked gjk_intersect_3d "do they overlap NOW?" at each one. A boolean
+# overlap test carries no information about how far away the shapes are, so the
+# step length could only be chosen from the horizon, never from the geometry.
+# The overlap window in t has width ~2R/|v_rel| (R the contact radius), so any
+# pair whose shapes are small, or fast, or whose horizon is long, has a window
+# narrower than the step and is tunnelled straight through -- reported as "no
+# collision" with no error signal. 2.7.0-B fixed the horizon budget; the step
+# being blind to geometry is a different defect in the same loop.
+#
+# Conservative advancement needs the DISTANCE. Everything below computes the
+# nearest point of a convex set to the ORIGIN via the standard GJK distance
+# sub-algorithm, so the loop can take a step that is provably no larger than the
+# time remaining to contact. That cannot tunnel by construction: it never
+# advances past the first contact, so there is no window to step over.
+
+# Closest point of segment [a, b] to the ORIGIN.
+# out_mask receives the endpoints that span the answer: 1 = a, 2 = b, 3 = both.
+fn _toi_seg_closest(a, b, out_mask) {
+    var ab = hvec3_sub(b, a);
+    var d2 = hvec3_dot(ab, ab);
+    # Only an EXACTLY coincident pair is degenerate. For a merely short segment
+    # the t below loses precision but is then clamped into [0, 1], so the answer
+    # still lies between two points that are themselves nearly identical.
+    if (f64_le(d2, 0) == 1) {
+        store64(out_mask, 1);
+        return a;
+    }
+    var t = f64_div(f64_neg(hvec3_dot(a, ab)), d2);
+    if (f64_le(t, 0) == 1) {
+        store64(out_mask, 1);
+        return a;
+    }
+    if (f64_ge(t, F64_ONE) == 1) {
+        store64(out_mask, 2);
+        return b;
+    }
+    store64(out_mask, 3);
+    return hvec3_add(a, hvec3_scale(ab, t));
 }
 
+# Closest point of triangle (a, b, c) to the ORIGIN, by Voronoi region.
+# out_mask bits: 1 = a, 2 = b, 4 = c.
+fn _toi_tri_closest(a, b, c, out_mask) {
+    var ab = hvec3_sub(b, a);
+    var ac = hvec3_sub(c, a);
+    var ap = hvec3_neg(a);
+    var d1 = hvec3_dot(ab, ap);
+    var d2 = hvec3_dot(ac, ap);
+    if (f64_le(d1, 0) == 1 && f64_le(d2, 0) == 1) {
+        store64(out_mask, 1);
+        return a;
+    }
+
+    var bp = hvec3_neg(b);
+    var d3 = hvec3_dot(ab, bp);
+    var d4 = hvec3_dot(ac, bp);
+    if (f64_ge(d3, 0) == 1 && f64_le(d4, d3) == 1) {
+        store64(out_mask, 2);
+        return b;
+    }
+
+    var vc = f64_sub(f64_mul(d1, d4), f64_mul(d3, d2));
+    if (f64_le(vc, 0) == 1 && f64_ge(d1, 0) == 1 && f64_le(d3, 0) == 1) {
+        store64(out_mask, 3);
+        return hvec3_add(a, hvec3_scale(ab, f64_div(d1, f64_sub(d1, d3))));
+    }
+
+    var cp = hvec3_neg(c);
+    var d5 = hvec3_dot(ab, cp);
+    var d6 = hvec3_dot(ac, cp);
+    if (f64_ge(d6, 0) == 1 && f64_le(d5, d6) == 1) {
+        store64(out_mask, 4);
+        return c;
+    }
+
+    var vb = f64_sub(f64_mul(d5, d2), f64_mul(d1, d6));
+    if (f64_le(vb, 0) == 1 && f64_ge(d2, 0) == 1 && f64_le(d6, 0) == 1) {
+        store64(out_mask, 5);
+        return hvec3_add(a, hvec3_scale(ac, f64_div(d2, f64_sub(d2, d6))));
+    }
+
+    var va = f64_sub(f64_mul(d3, d6), f64_mul(d5, d4));
+    var d43 = f64_sub(d4, d3);
+    var d56 = f64_sub(d5, d6);
+    if (f64_le(va, 0) == 1 && f64_ge(d43, 0) == 1 && f64_ge(d56, 0) == 1) {
+        store64(out_mask, 6);
+        return hvec3_add(b, hvec3_scale(hvec3_sub(c, b), f64_div(d43, f64_add(d43, d56))));
+    }
+
+    # Reaching here means the origin projects into the FACE region, where the
+    # three barycentric numerators are all strictly positive; den <= 0 is
+    # therefore possible only for a colinear triangle. Comparing against zero
+    # keeps the test scale-free -- va/vb/vc carry length^4, so any absolute
+    # epsilon would be wrong by twelve orders of magnitude per metre of scale.
+    var den = f64_add(f64_add(va, vb), vc);
+    if (f64_le(den, 0) == 1) {
+        return _toi_seg_closest(a, b, out_mask);
+    }
+    var inv = f64_div(F64_ONE, den);
+    store64(out_mask, 7);
+    return hvec3_add(a, hvec3_add(hvec3_scale(ab, f64_mul(vb, inv)),
+    hvec3_scale(ac, f64_mul(vc, inv))));
+}
+
+# Is the ORIGIN on the far side of plane(a, b, c) from d? Coplanar counts as
+# "outside" so a degenerate tetrahedron still has all four faces examined --
+# its hull is then contained in the union of its faces, so the minimum over the
+# faces is still the right answer.
+fn _toi_outside_plane(a, b, c, d) {
+    var n = hvec3_cross(hvec3_sub(b, a), hvec3_sub(c, a));
+    var sp = hvec3_dot(hvec3_neg(a), n);
+    var sd = hvec3_dot(hvec3_sub(d, a), n);
+    if (f64_gt(f64_mul(sp, sd), 0) == 1) { return 0; }
+    return 1;
+}
+
+# Remap a triangle mask (bits over the triangle's own 3 vertices) onto the
+# tetrahedron's 4-vertex numbering. b0/b1/b2 are the tetra bits of the face.
+fn _toi_remap(m, b0, b1, b2) {
+    var r = 0;
+    if (m % 2 == 1) { r = r + b0; }
+    if ((m / 2) % 2 == 1) { r = r + b1; }
+    if ((m / 4) % 2 == 1) { r = r + b2; }
+    return r;
+}
+
+# Closest point of tetrahedron (a, b, c, d) to the ORIGIN.
+# out_mask bits: 1 = a, 2 = b, 4 = c, 8 = d. Mask 15 means the origin is INSIDE.
+fn _toi_tetra_closest(a, b, c, d, out_mask) {
+    var best = hvec3_zero();
+    var best2 = _GA_F64_POS_INF;
+    var best_mask = 0;
+    var any_out = 0;
+    var fm = alloc(8);
+
+    if (_toi_outside_plane(a, b, c, d) == 1) {
+        any_out = 1;
+        var p1 = _toi_tri_closest(a, b, c, fm);
+        var q1 = hvec3_length_sq(p1);
+        if (f64_lt(q1, best2) == 1) {
+            best2 = q1;
+            best = p1;
+            best_mask = _toi_remap(load64(fm), 1, 2, 4);
+        }
+    }
+    if (_toi_outside_plane(a, c, d, b) == 1) {
+        any_out = 1;
+        var p2 = _toi_tri_closest(a, c, d, fm);
+        var q2 = hvec3_length_sq(p2);
+        if (f64_lt(q2, best2) == 1) {
+            best2 = q2;
+            best = p2;
+            best_mask = _toi_remap(load64(fm), 1, 4, 8);
+        }
+    }
+    if (_toi_outside_plane(a, d, b, c) == 1) {
+        any_out = 1;
+        var p3 = _toi_tri_closest(a, d, b, fm);
+        var q3 = hvec3_length_sq(p3);
+        if (f64_lt(q3, best2) == 1) {
+            best2 = q3;
+            best = p3;
+            best_mask = _toi_remap(load64(fm), 1, 8, 2);
+        }
+    }
+    if (_toi_outside_plane(b, d, c, a) == 1) {
+        any_out = 1;
+        var p4 = _toi_tri_closest(b, d, c, fm);
+        var q4 = hvec3_length_sq(p4);
+        if (f64_lt(q4, best2) == 1) {
+            best2 = q4;
+            best = p4;
+            best_mask = _toi_remap(load64(fm), 2, 8, 4);
+        }
+    }
+
+    if (any_out == 0) {
+        # The origin is on the inner side of all four faces -- it is inside.
+        store64(out_mask, 15);
+        return hvec3_zero();
+    }
+    store64(out_mask, best_mask);
+    return best;
+}
+
+# Reduce the simplex held in `w` (up to 4 HVec3 pointers, count at cnt_ptr) to
+# the smallest face that supports the closest point, and return that point.
+fn _toi_simplex_closest(w, cnt_ptr) {
+    var n = load64(cnt_ptr);
+    if (n <= 1) { return load64(w); }
+
+    var mk = alloc(8);
+    var pt = 0;
+    if (n == 2) {
+        pt = _toi_seg_closest(load64(w), load64(w + 8), mk);
+    } elif (n == 3) {
+        pt = _toi_tri_closest(load64(w), load64(w + 8), load64(w + 16), mk);
+    } else {
+        pt = _toi_tetra_closest(load64(w), load64(w + 8), load64(w + 16), load64(w + 24), mk);
+    }
+
+    var mask = load64(mk);
+    var keep = 0;
+    var i = 0;
+    var bit = 1;
+    while (i < n) {
+        if ((mask / bit) % 2 == 1) {
+            store64(w + keep * 8, load64(w + i * 8));
+            keep = keep + 1;
+        }
+        bit = bit * 2;
+        i = i + 1;
+    }
+    store64(cnt_ptr, keep);
+    return pt;
+}
+
+# Support point of the Minkowski difference A - B, translated by -offset.
+# The whole TOI search runs against the FIXED difference A - B with a moving
+# query point rel_vel * t, so `offset` is that query point and nothing else
+# needs re-wrapping per step (the pre-2.8.3 loop allocated a 24-byte support
+# descriptor on every one of up to 256 iterations, into a never-freeing bump
+# allocator, purely to express this subtraction).
+fn _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, dir) {
+    return hvec3_sub(_gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir), offset);
+}
+
+# Nearest point of (A - B - offset) to the ORIGIN.
+#   out_v:  receives that point. |out_v| is an UPPER bound on the distance,
+#           because the point is a genuine member of the set.
+#   out_lb: receives a LOWER bound, valid even if the iteration is cut short --
+#           it comes from a supporting plane, which is a certificate rather than
+#           an estimate. Conservative advancement steps on this one.
+# Returns 1 if the origin is inside (the shapes overlap), 0 otherwise.
+fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_lb) {
+    var w = alloc(40);          # 4 vertex slots + count at +32, hoisted
+    var v = _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, seed_dir);
+    store64(w, v);
+    store64(w + 32, 1);
+
+    var best = v;
+    var best2 = hvec3_length_sq(v);
+    var lb = 0;
+    store64(out_lb, 0);
+
+    for (var it = 0; it < GJK_MAX_ITER; it = it + 1) {
+        var vv = hvec3_length_sq(v);
+        # Exactly on the origin: the sets touch. Anything larger than that is
+        # left to the CALLER's scale-relative contact tolerance -- deciding
+        # "close enough" here with an absolute length is what made this query
+        # report grazing misses as impacts on micro-scale geometry.
+        if (f64_le(vv, 0) == 1) {
+            store64(out_v, v);
+            store64(out_lb, 0);
+            return 1;
+        }
+
+        var p = _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, hvec3_neg(v));
+        var vp = hvec3_dot(v, p);
+        if (f64_gt(vp, 0) == 1) {
+            var cand = f64_div(vp, f64_sqrt(vv));
+            if (f64_gt(cand, lb) == 1) { lb = cand; }
+        }
+
+        # Optimality: v is the projection of the origin onto the whole set once
+        # no support point lies closer to the origin along v than v itself.
+        if (f64_le(f64_sub(vv, vp), f64_mul(_GA_TOI_REL, vv)) == 1) { break; }
+
+        var cnt = load64(w + 32);
+        store64(w + cnt * 8, p);
+        store64(w + 32, cnt + 1);
+        v = _toi_simplex_closest(w, w + 32);
+
+        if (load64(w + 32) == 4) {
+            # The reduced simplex is the full tetrahedron: the origin is in it.
+            store64(out_v, hvec3_zero());
+            store64(out_lb, lb);
+            return 1;
+        }
+
+        var nv2 = hvec3_length_sq(v);
+        if (f64_lt(nv2, best2) == 1) {
+            best = v;
+            best2 = nv2;
+        } else {
+            # No improvement -- a near-degenerate simplex made the barycentric
+            # solve unreliable. |v| is monotone in exact arithmetic, so this is
+            # a rounding event, not a geometry event: keep the best point.
+            v = best;
+            break;
+        }
+    }
+
+    store64(out_v, v);
+    store64(out_lb, lb);
+    return 0;
+}
+
+# Compute time of impact between two moving convex shapes.
+#
+# Conservative advancement (Mirtich): at each step measure the distance d
+# between the shapes at the current t, then advance by d / (rel_vel . n) where n
+# is the direction of closest approach. Because d is a distance and the shapes
+# translate at a bounded rate along n, that step provably cannot reach contact,
+# so t only ever approaches the true impact time FROM BELOW and never steps over
+# it. Two facts fall out that the pre-2.8.3 sampler could not provide:
+#   * rel_vel . n <= 0 is a PROOF of "no collision, ever" (not "none sampled");
+#   * the reported t is a lower bound on the true impact time, tight to the
+#     contact tolerance, rather than an over-estimate quantised to the step.
+#
+# support_a/b, shape_a/b: support function pointers and shape data
+# vel_a, vel_b: HVec3 velocities
 # max_t: f64 maximum time horizon
 # out_t: pointer where f64 time of impact will be stored
-# out_normal: pointer where HVec3 contact normal will be stored (from EPA)
+# out_normal: pointer where the HVec3 contact normal will be stored -- always a
+#             unit vector, never 0 (the direction of closest approach at impact)
 # Returns 1 if collision found within max_t, 0 otherwise.
+#
+# CONTACT TOLERANCE. Impact is declared once the gap falls under
+# _GA_TOI_TOL_REL times the Minkowski difference's own extent along the motion,
+# i.e. relative to the size of the two shapes rather than to any world scale.
+# A pass that misses by less than that reads as a touch, which is the standard
+# and unavoidable contract for a continuous query on floating point.
 fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, out_normal) {
-    # Check overlap at t=0
+    # Overlap at t = 0.
     if (gjk_intersect_3d(support_a, shape_a, support_b, shape_b) == 1) {
         store64(out_t, 0);
-        # Get normal from EPA
         var n_slot = alloc(8);
         var d_slot = alloc(8);
         gjk_epa_3d(support_a, shape_a, support_b, shape_b, n_slot, d_slot);
-        store64(out_normal, load64(n_slot));
+        var n0 = load64(n_slot);
+        # EPA returns 0 on a degenerate polytope and left out_normal holding a
+        # NULL pointer for every caller that dereferenced it.
+        if (n0 == 0) { n0 = hvec3_unit_x(); }
+        store64(out_normal, n0);
         return 1;
     }
 
@@ -778,50 +1628,56 @@ fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, o
     var speed = hvec3_length(rel_vel);
     if (f64_lt(speed, EPSILON_F64) == 1) { return 0; }
 
-    # STEP BUDGET -- decoupled from GJK's internal iteration cap.
-    #
-    # Through 2.6.15 this loop ran GJK_MAX_ITER times stepping a fixed tol/speed,
-    # so it advanced exactly GJK_MAX_ITER * tol = 64 * 0.01 = 0.64 units of
-    # RELATIVE DISPLACEMENT and then returned 0 -- whatever max_t said. Any
-    # collision beyond that was reported as "no collision": a FALSE NEGATIVE from
-    # a collision query, and max_t was effectively ignored. Two caps that happened
-    # to share a name were being treated as the same quantity.
-    #
-    # The budget now spans the whole horizon. The tolerance step is the FLOOR, so
-    # short horizons keep full resolution and long ones trade resolution for
-    # coverage -- the correct direction, since a coarse hit beats a certain miss.
-    var tol = _GA_F64_001;
-    var fine = f64_div(tol, speed);
-    var coarse = f64_div(max_t, f64_from(_GA_TOI_MAX_STEPS));
-    var step = f64_max(fine, coarse);
+    # Contact tolerance from the geometry, not from the horizon: the extent of
+    # the Minkowski difference along the direction of travel is exactly
+    # (diameter of A + diameter of B) in that direction, independent of how far
+    # apart the two shapes start.
+    var u0 = hvec3_scale(rel_vel, f64_div(F64_ONE, speed));
+    var ext_p = _gjk_mink_support(support_a, shape_a, support_b, shape_b, u0);
+    var ext_n = _gjk_mink_support(support_a, shape_a, support_b, shape_b, hvec3_neg(u0));
+    var gscale = hvec3_length(hvec3_sub(ext_p, ext_n));
+    # Two point shapes have no extent; then the only length in the problem is
+    # how far apart they are, so use that instead of a fabricated 1.0.
+    if (f64_le(gscale, 0) == 1) { gscale = hvec3_length(ext_p); }
+    if (f64_le(gscale, 0) == 1) { gscale = F64_ONE; }
+    var tol = f64_mul(gscale, _GA_TOI_TOL_REL);
 
+    var v_slot = alloc(8);
+    var lb_slot = alloc(8);
     var t = 0;
+    var seed = hvec3_neg(rel_vel);
+
     for (var ti = 0; ti < _GA_TOI_MAX_STEPS; ti = ti + 1) {
-        if (f64_gt(t, max_t) == 1) { return 0; }
-
-        # Test overlap with B offset by relative velocity * t
-        # We create offset support: support_b(shape, dir) + rel_vel * t
-        # For simplicity, adjust shape_b's position by moving vel*t
-        # Use the _toi_offset_support wrapper
         var offset = hvec3_scale(rel_vel, t);
+        var inside = _toi_near_point(support_a, shape_a, support_b, shape_b,
+        offset, seed, v_slot, lb_slot);
+        var v = load64(v_slot);
+        var dist = hvec3_length(v);
 
-        # Build an offset shape descriptor: {original_support, original_shape, offset}
-        var offset_desc = alloc(24);
-        store64(offset_desc, support_b);
-        store64(offset_desc + 8, shape_b);
-        store64(offset_desc + 16, offset);
-
-        if (gjk_intersect_3d(support_a, shape_a, &_toi_offset_support, offset_desc) == 1) {
+        if (inside == 1 || f64_le(dist, tol) == 1) {
             store64(out_t, t);
-            # Get penetration normal
-            var n_slot = alloc(8);
-            var d_slot = alloc(8);
-            gjk_epa_3d(support_a, shape_a, &_toi_offset_support, offset_desc, n_slot, d_slot);
-            store64(out_normal, load64(n_slot));
+            var nrm = hvec3_unit_x();
+            if (f64_gt(dist, 0) == 1) { nrm = hvec3_scale(v, f64_div(F64_ONE, dist)); }
+            store64(out_normal, nrm);
             return 1;
         }
 
-        t = f64_add(t, step);
+        var u = hvec3_scale(v, f64_div(F64_ONE, dist));
+        var denom = hvec3_dot(rel_vel, u);
+        if (f64_le(denom, 0) == 1) {
+            # PROOF of no collision: every point of the Minkowski difference is
+            # on the far side of the plane through v with normal u, and the
+            # query point rel_vel * t moves away from (or parallel to) that
+            # plane. No later t can put it inside. This is the branch the old
+            # sampler could never take -- it could only run out of samples.
+            return 0;
+        }
+
+        var lb = load64(lb_slot);
+        if (f64_lt(lb, tol) == 1) { lb = tol; }
+        t = f64_add(t, f64_div(lb, denom));
+        if (f64_gt(t, max_t) == 1) { return 0; }
+        seed = hvec3_neg(v);
     }
     return 0;
 }

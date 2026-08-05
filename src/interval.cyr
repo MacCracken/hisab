@@ -8,6 +8,14 @@
 #derive(accessors)
 struct Interval { lo; hi; }
 
+# Unbounded endpoints. An interval endpoint of +/-Infinity means "this bound is
+# not finite", i.e. the enclosed SET is unbounded in that direction -- it does
+# NOT mean the set contains an infinity. ivl_div needs them: dividing by an
+# interval that straddles zero has an unbounded true range, and the only sound
+# enclosure of an unbounded set is an unbounded interval.
+var _IVL_F64_POS_INF = 0x7FF0_0000_0000_0000;  # +Infinity
+var _IVL_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
+
 #must_use
 fn ivl_new(a, b) {
     var v = alloc(sizeof(Interval));
@@ -60,33 +68,111 @@ fn ivl_sub(a, b) {
     f64_sub(Interval_hi(a), Interval_lo(b)));
 }
 
+# Endpoint product with the 0 * Infinity convention interval arithmetic requires.
+#
+# An infinite endpoint means the enclosed SET is unbounded, not that it contains
+# an infinity, so the products contributed by the element x = 0 of the other
+# operand are all exactly 0 -- there is no element to pair with "infinity". IEEE
+# 754 has no way to know that and returns NaN, which ivl_new cannot order around,
+# so a single NaN endpoint turns the interval into a catch-all that ivl_contains
+# reports as containing everything (the same failure mode ivl_sqrt had before
+# 2.6.12). Only the exact (0, +/-Infinity) pair is special-cased: a NaN operand
+# still propagates as NaN, because an interval with a NaN endpoint is already
+# meaningless and silently rewriting it to 0 would hide that.
+fn _ivl_mul_pt(x, y) {
+    if (f64_eq(x, 0) == 1 && f64_eq(f64_abs(y), _IVL_F64_POS_INF) == 1) { return 0; }
+    if (f64_eq(y, 0) == 1 && f64_eq(f64_abs(x), _IVL_F64_POS_INF) == 1) { return 0; }
+    return f64_mul(x, y);
+}
+
 #must_use
 fn ivl_mul(a, b) {
     var al = Interval_lo(a); var ah = Interval_hi(a);
     var bl = Interval_lo(b); var bh = Interval_hi(b);
-    var p1 = f64_mul(al, bl);
-    var p2 = f64_mul(al, bh);
-    var p3 = f64_mul(ah, bl);
-    var p4 = f64_mul(ah, bh);
+    var p1 = _ivl_mul_pt(al, bl);
+    var p2 = _ivl_mul_pt(al, bh);
+    var p3 = _ivl_mul_pt(ah, bl);
+    var p4 = _ivl_mul_pt(ah, bh);
     var lo = f64_min(f64_min(p1, p2), f64_min(p3, p4));
     var hi = f64_max(f64_max(p1, p2), f64_max(p3, p4));
     return ivl_new(lo, hi);
 }
 
+# Enclosure of a/b over the two intervals, excluding the divisor value 0.
+#
+# The result is the interval HULL of  S = { x / y : x in A, y in B, y != 0 }.
+#
+# ENCLOSURE SOUNDNESS. Through 2.8.2 a divisor straddling zero returned the
+# FINITE interval [-1e9, +1e9], which is not an enclosure of anything: S is
+# unbounded whenever 0 is in B and A is not {0}, so [1,2] / [0,1] = [1, +inf)
+# and the shipped answer excluded every quotient above 1e9 -- 1/1e-12 = 1e12 for
+# one. This module's entire contract is that the returned interval CONTAINS the
+# true range; an under-approximation is worse than no interval type at all,
+# because every bound derived from it is silently wrong and nothing says so.
+# 1e9 was not a bound, it was a decoration.
+#
+# The zero test goes through f64_le/f64_ge, NOT a raw integer `== 0`. Through
+# 2.6.12 this read `bl == 0`, which compares the f64 BIT PATTERN against integer
+# zero and therefore matches only +0.0 — negative zero is 0x8000000000000000,
+# non-zero as an integer, so an interval whose endpoint was -0.0 slipped past the
+# guard and divided by zero.
+#
+# The zero-straddling case is Kahan/Ratz extended division: B minus {0} splits
+# into at most two half-lines,
+#     y in [bl, 0)  ->  1/y in (-inf, 1/bl]
+#     y in (0, bh]  ->  1/y in [1/bh, +inf)
+# and the answer is the hull of A times each present half-line. That is EXACT --
+# the tightest interval containing S -- not merely sound: [1,2]/[0,1] gives
+# [1, +inf), [1,2]/[-1,0] gives (-inf, -1], [1,2]/[-1,1] gives the whole line
+# (S really is (-inf,-1] union [1,+inf), whose hull is entire), and [0,0]/[-1,1]
+# gives [0,0] because 0/y is 0 for every admissible y.
+#
+# LIMIT: an unbounded result makes the ADDITIVE operators reachable with two
+# unbounded operands, and ivl_add/ivl_sub then compute Infinity - Infinity = NaN
+# rather than the correct "entire". ivl_mul is handled (see _ivl_mul_pt); add and
+# sub are not, because the correct fix there is an explicit entire/empty tag on
+# the type, which this struct does not have. Dividing by a zero-straddling
+# interval and then ADDING the result to another unbounded interval is therefore
+# still unsound; every other consumer of the result is now correct.
 #must_use
 fn ivl_div(a, b) {
+    var al = Interval_lo(a); var ah = Interval_hi(a);
     var bl = Interval_lo(b); var bh = Interval_hi(b);
-    # Division by an interval containing zero -> widen.
-    #
-    # The zero test must go through f64_le/f64_ge, NOT a raw integer `== 0`.
-    # Through 2.6.12 this read `bl == 0`, which compares the f64 BIT PATTERN
-    # against integer zero and therefore matches only +0.0 — negative zero is
-    # 0x8000000000000000, non-zero as an integer, so an interval whose endpoint
-    # was -0.0 slipped past the guard and divided by zero.
+
     if (f64_le(bl, 0) == 1 && f64_ge(bh, 0) == 1) {
-        # Contains zero -- return huge interval
-        var big = f64_from(1000000000);
-        return ivl_new(f64_neg(big), big);
+        # B has a negative part iff bl < 0, a positive part iff bh > 0. Both
+        # tests are FP comparisons, so -0.0 counts as zero and contributes no
+        # half-line -- [-0.0, 1] behaves exactly like [0, 1], as it must.
+        var has_neg = f64_lt(bl, 0);
+        var has_pos = f64_gt(bh, 0);
+        if (has_neg == 0 && has_pos == 0) {
+            # B == [0, 0]: S is empty. hisab has no empty-interval
+            # representation, so return the widest interval -- every interval
+            # vacuously encloses the empty set, and entire is the one that
+            # cannot be mistaken for a useful bound.
+            return ivl_new(_IVL_F64_NEG_INF, _IVL_F64_POS_INF);
+        }
+        var lo = _IVL_F64_POS_INF;
+        var hi = _IVL_F64_NEG_INF;
+        if (has_neg == 1) {
+            var nu = f64_div(F64_ONE, bl);          # half-line [-inf, 1/bl]
+            var n1 = _ivl_mul_pt(al, _IVL_F64_NEG_INF);
+            var n2 = _ivl_mul_pt(al, nu);
+            var n3 = _ivl_mul_pt(ah, _IVL_F64_NEG_INF);
+            var n4 = _ivl_mul_pt(ah, nu);
+            lo = f64_min(lo, f64_min(f64_min(n1, n2), f64_min(n3, n4)));
+            hi = f64_max(hi, f64_max(f64_max(n1, n2), f64_max(n3, n4)));
+        }
+        if (has_pos == 1) {
+            var pv = f64_div(F64_ONE, bh);          # half-line [1/bh, +inf]
+            var q1 = _ivl_mul_pt(al, pv);
+            var q2 = _ivl_mul_pt(al, _IVL_F64_POS_INF);
+            var q3 = _ivl_mul_pt(ah, pv);
+            var q4 = _ivl_mul_pt(ah, _IVL_F64_POS_INF);
+            lo = f64_min(lo, f64_min(f64_min(q1, q2), f64_min(q3, q4)));
+            hi = f64_max(hi, f64_max(f64_max(q1, q2), f64_max(q3, q4)));
+        }
+        return ivl_new(lo, hi);
     }
     return ivl_mul(a, ivl_new(f64_div(F64_ONE, bh), f64_div(F64_ONE, bl)));
 }

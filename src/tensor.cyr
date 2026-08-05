@@ -84,10 +84,29 @@ fn tensor_set2(t, i, j, val) {
 # Tensor operations
 # ================================================================
 
+# Elementwise sum of two tensors of IDENTICAL shape.
+# Returns a fresh tensor, or 0 if either operand is null or the shapes differ.
 fn tensor_add(a, b) {
+    # Either operand may be the designed 0 that tensor_new returns above its rank
+    # or element cap, or that einsum returns on a malformed subscript string;
+    # HTensor_total(0) is a null dereference, so guard before reading metadata.
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     var total = HTensor_total(a);
     var rank = HTensor_rank(a);
+    # SHAPE EQUALITY. The loop below walks total(a) elements of BOTH data buffers.
+    # b's buffer is allocated at exactly total(b)*8 bytes, so a smaller b was read
+    # out of bounds -- a 2x2 plus a 2x1 over-read 16 bytes of adjacent heap and
+    # returned it as tensor entries. Rank alone is not enough: 2x6 and 3x4 have
+    # the same total but are not addable, so every axis is compared.
+    if (HTensor_rank(b) != rank) { return 0; }
+    var si = 0;
+    while (si < rank) {
+        if (load64(HTensor_shape(b) + si * 8) != load64(HTensor_shape(a) + si * 8)) { return 0; }
+        si = si + 1;
+    }
     var r = tensor_new(rank, HTensor_shape(a));
+    if (r == 0) { return 0; }
     var ad = HTensor_data(a);
     var bd = HTensor_data(b);
     var rd = HTensor_data(r);
@@ -99,10 +118,16 @@ fn tensor_add(a, b) {
     return r;
 }
 
+# Scale every entry of t by the f64 s.
+# Returns a fresh tensor, or 0 if t is null.
 fn tensor_scale(t, s) {
+    # t may be the designed 0 that tensor_new or einsum returns on failure;
+    # HTensor_total(0) is a null dereference, so guard before reading metadata.
+    if (t == 0) { return 0; }
     var total = HTensor_total(t);
     var rank = HTensor_rank(t);
     var r = tensor_new(rank, HTensor_shape(t));
+    if (r == 0) { return 0; }
     var td = HTensor_data(t);
     var rd = HTensor_data(r);
     var i = 0;
@@ -114,13 +139,27 @@ fn tensor_scale(t, s) {
 }
 
 # Contract indices idx_i and idx_j of a rank-N tensor (trace over those two indices).
-# The two indices must have the same dimension.
+# The two indices must be distinct, in [0, rank), and have the same dimension.
+# Returns a fresh rank-(N-2) tensor, or 0 if t is null or the indices are invalid.
 fn tensor_contract(t, idx_i, idx_j) {
+    # t may be the designed 0 that tensor_new or einsum returns on failure;
+    # HTensor_rank(0) is a null dereference, so guard before reading metadata.
+    if (t == 0) { return 0; }
     var rank = HTensor_rank(t);
     var shape = HTensor_shape(t);
+    # AXIS VALIDATION. Nothing checked these through 2.8.2, and every one of them
+    # is a raw store64/load64 offset below: `load64(shape + idx_i * 8)` reads
+    # outside the rank*8-byte shape array for idx_i >= rank and BEFORE it for a
+    # negative index, and `store64(full_idx + ii * 8, k)` then writes there. A
+    # trace needs two DISTINCT axes of a rank >= 2 tensor, and the contracted
+    # extents must match or the k loop indexes one axis past its own extent.
+    if (rank < 2) { return 0; }
+    if (idx_i < 0 || idx_i >= rank) { return 0; }
+    if (idx_j < 0 || idx_j >= rank) { return 0; }
+    if (idx_i == idx_j) { return 0; }
     var dim = load64(shape + idx_i * 8);
+    if (load64(shape + idx_j * 8) != dim) { return 0; }
     var new_rank = rank - 2;
-    if (new_rank < 0) { new_rank = 0; }
 
     # Ensure idx_i < idx_j for consistency
     var ii = idx_i; var jj = idx_j;
@@ -142,6 +181,7 @@ fn tensor_contract(t, idx_i, idx_j) {
     if (new_rank == 0) {
         store64(ns, 1);
         var result = tensor_new(1, ns);
+        if (result == 0) { return 0; }
         var sum = 0;
         var k = 0;
         while (k < dim) {
@@ -159,6 +199,7 @@ fn tensor_contract(t, idx_i, idx_j) {
     }
 
     var result = tensor_new(new_rank, ns);
+    if (result == 0) { return 0; }
     var out_total = HTensor_total(result);
     var rd = HTensor_data(result);
 

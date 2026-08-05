@@ -54,10 +54,22 @@ fn _f64arr_set(arr, i, val) {
 # Partial derivative of f:R^n -> R with respect to variable at index.
 # f: function pointer, fncall1(f, x_ptr) -> f64 (scalar).
 # x: pointer to flat f64 array of n values.
-# n: dimension count, index: variable index, h: step size (f64).
+# n: dimension count (must be > 0), index: variable index in [0, n),
+# h: step size (f64).
 # Returns f64 (the partial derivative), or 0 on error.
 fn calc_partial_derivative(f, x, n, index, h) {
-    if (index >= n) { return 0; }
+    # BOTH bounds, not just the upper one -- the same half-guard 2.7.0-C closed in
+    # detect_islands. `index` is a raw f64-array subscript: _f64arr_get(x, -1)
+    # reads the 8 bytes BEFORE the caller's buffer, and the two _f64arr_set calls
+    # then WRITE there, one to x_plus and one to x_minus. Because those two
+    # buffers are the bump allocator's most recent blocks, x_plus[-1] lands in
+    # the allocator's own bookkeeping-adjacent bytes and x_minus[-1] lands inside
+    # x_plus -- silent corruption, not a fault, so the caller gets a plausible
+    # number back. n <= 0 is rejected for the same reason: it makes both
+    # _f64arr_alloc calls alloc(0) or alloc(negative), after which every
+    # subscript is out of bounds.
+    if (n <= 0) { return 0; }
+    if (index < 0 || index >= n) { return 0; }
 
     # Allocate x_plus and x_minus buffers
     var x_plus = _f64arr_alloc(n);
@@ -192,6 +204,15 @@ fn calc_hessian(f, x, n, h, out) {
 
     # Off-diagonal: d^2f/dx_i dx_j (symmetric)
     # = (f(x+h*e_i+h*e_j) - f(x+h*e_i-h*e_j) - f(x-h*e_i+h*e_j) + f(x-h*e_i-h*e_j)) / (4h^2)
+    #
+    # Through 2.8.2 this block was covered by nothing: the only calc_hessian
+    # fixture used f(x, y) = x^2 + y^2, which is SEPARABLE, so the true mixed
+    # partial is zero and every one of the four stencil terms cancels against
+    # its partner no matter how the signs are arranged. `return 0;` here passed
+    # the suite. It is now pinned on f(x, y) = x^2*y + y^3, a cubic whose mixed
+    # partial 2x is nonzero and which BOTH stencils reproduce exactly (a central
+    # second difference and this 4-point cross are exact for total degree <= 3),
+    # so the assertion is an exact equality rather than a tolerance.
     var inv_4h2 = f64_div(F64_ONE, f64_mul(F64_FOUR, h2));
 
     i = 0;
@@ -303,6 +324,15 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
 # Adaptive Simpson's rule for numerical integration.
 # f: function pointer (f64 -> f64), a/b: interval bounds (f64), tol: tolerance (f64).
 # Returns f64 result. Recursively bisects until error < tol (max depth 50).
+#
+# Through 2.8.2 the only integrand ever passed here was x^2, for which the
+# INITIAL unrefined panel below is already exact -- Simpson integrates cubics
+# with zero error, so `refined - whole` was 0 on the first test and the whole of
+# _adaptive_simpson_rec past its first tolerance test never ran. It is now
+# driven by x^4 (one panel is 8.3e-3 off 1/5), sqrt (unbounded derivative at 0,
+# so the refinement must be non-uniform to reach 1e-11 at all), 1/(1+x) and a
+# narrow Lorentzian peak, each against its exact closed form, plus an
+# evaluation counter that reads 3 for x^2 and >1000 for x^4.
 fn calc_adaptive_simpson(f, a, b, tol) {
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
@@ -631,6 +661,12 @@ fn _hermite_tcb_segment(p0, p1, p2, p3, u, tension, continuity, bias) {
 # xs: flat f64 array of n sorted x-values, ys: flat f64 array of n y-values,
 # n: number of points (>= 2), x: query point (f64).
 # Returns f64 interpolated value. Returns 0 if n < 2 or x out of range.
+#
+# SHAPE-PRESERVING GUARANTEE (2.8.3): on every interval [xs[k], xs[k+1]] the
+# result stays inside [ys[k], ys[k+1]] and the segment is monotone in the same
+# direction as its own secant. Both halves of the Fritsch-Carlson constraint are
+# needed for that -- the sign condition as well as the alpha^2 + beta^2 <= 9
+# circle; see the block below.
 fn calc_monotone_cubic(xs, ys, n, x) {
     if (n < 2) { return 0; }
 
@@ -675,6 +711,39 @@ fn calc_monotone_cubic(xs, ys, n, x) {
         } else {
             var alpha = f64_div(_f64arr_get(ms, i), di);
             var beta = f64_div(_f64arr_get(ms, i + 1), di);
+
+            # SIGN CONDITION -- the half of Fritsch-Carlson that was missing.
+            #
+            # The circle test below (alpha^2 + beta^2 <= 9) is only sufficient
+            # INSIDE THE FIRST QUADRANT: FC's monotonicity region M requires
+            # alpha >= 0 and beta >= 0 as well. Squaring throws the signs away, so
+            # a tangent pointing against its own secant sailed straight through the
+            # test. That is exactly what happens at a local extremum in the data,
+            # where ms[i] = (delta[i-1] + delta[i])/2 inherits the sign of the
+            # LARGER neighbour and therefore opposes one of the two secants: on
+            # 60,000 random sets containing an extremum the interpolant left the
+            # [y_k, y_k+1] box on 58.6% of them, overshooting by up to 57.6 -- in
+            # the one function in this file whose entire contract is that it does
+            # not do that.
+            #
+            # Zeroing the offending tangent is FC's own remedy and it also covers
+            # the extremum pre-pass some presentations write separately: whichever
+            # of the two intervals meeting at ms[i] disagrees in sign clamps it to
+            # 0, and the other interval only ever shrinks it further (tau <= 1), so
+            # the constraint of an already-processed interval can never be undone.
+            #
+            # Strictly monotone data has alpha, beta > 0 throughout, so this is a
+            # no-op there -- verified bit-identical tangents on 60,000 strictly
+            # monotone sets.
+            if (f64_lt(alpha, 0) == 1) {
+                _f64arr_set(ms, i, 0);
+                alpha = 0;
+            }
+            if (f64_lt(beta, 0) == 1) {
+                _f64arr_set(ms, i + 1, 0);
+                beta = 0;
+            }
+
             var s = f64_add(f64_mul(alpha, alpha), f64_mul(beta, beta));
             if (f64_lt(F64_NINE, s) == 1) {
                 # s > 9: constrain
@@ -754,6 +823,10 @@ fn _grad3(hash, x, y, z) {
 
 # 3D improved Perlin noise. Returns f64 in approximately [-1, 1].
 # x, y, z: f64 coordinates.
+#
+# Certified the same way as perlin_2d (see src/calc.cyr): bit-exact point values
+# and 1728-sample L1 mass against an independent reference, plus the exact
+# multiple-of-1/8 cell-centre histogram over 512 cells.
 fn perlin_3d(x, y, z) {
     _perm_init();  # Ensure permutation table is initialized (from calc.cyr)
 

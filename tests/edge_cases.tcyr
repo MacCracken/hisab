@@ -893,10 +893,15 @@ var ei_nz = 0x8000000000000000;
 assert_eq(ei_nz == 0, 0, "sanity: -0.0 is not integer-zero (this was the bug)");
 assert_eq(f64_mul(0, f64_neg(F64_ONE)) == ei_nz, 1, "sanity: 0.0 * -1.0 produces -0.0");
 var ei_dz = ivl_div(ivl_new(F64_ONE, F64_ONE), ivl_new(ei_nz, F64_ONE));
-# Assert the SPECIFIC guard interval: the unguarded path yields [-inf, 1], which
-# is also "wide" and would satisfy a width check while being garbage.
-assert_eq(f64_to(Interval_lo(ei_dz)), (0 - 1000000000), "ivl_div by [-0.0,1] guard lo=-1e9");
-assert_eq(f64_to(Interval_hi(ei_dz)), 1000000000, "ivl_div by [-0.0,1] guard hi=+1e9");
+# [1,1] / [-0.0, 1] -- as a REAL interval the divisor is [0,1], so the true range
+# is {1/y : 0 < y <= 1} = [1, +inf). Three different answers are distinguished
+# here: the unguarded path yields [-inf, 1] (the -0.0 bug), the 2.6.12..2.8.2
+# guard yielded the finite [-1e9, 1e9] (which EXCLUDES 1/1e-12 = 1e12 and is
+# therefore not an enclosure at all), and the correct hull is [1, +inf).
+assert_eq(f64_to(Interval_lo(ei_dz)), 1, "ivl_div by [-0.0,1] lo = 1 (exact hull)");
+assert_eq(Interval_hi(ei_dz), 0x7FF0000000000000, "ivl_div by [-0.0,1] hi = +Infinity");
+assert_eq(ivl_contains(ei_dz, f64_from(1000000000000)), 1,
+"ivl_div by [-0.0,1] encloses 1e12 (the 1e9 guard did not)");
 
 # ================================================================
 # Vec3 — Distance symmetry
@@ -974,6 +979,67 @@ assert_eq(mat_new(0 - 5, 3), 0, "mat_new (stdlib): negative rows rejected");
 assert_eq(mat_new(0, 5), 0, "mat_new (stdlib): zero rows rejected");
 assert_eq(mat_new(1000000000, 1000000000), 0, "mat_new (stdlib): overflow-prone dims rejected");
 assert_neq(mat_new(3, 3), 0, "mat_new (stdlib): valid dims allocate");
+
+# ================================================================
+test_group("ivl_div: extended division must ENCLOSE, and enclose tightly");
+
+# The whole contract of an interval type is that the returned interval CONTAINS
+# the true range. Through 2.8.2 a divisor straddling zero returned the finite
+# [-1e9, +1e9], which contains nothing in particular: the true range is unbounded
+# whenever 0 is in the divisor and the numerator is not {0}. The answers below
+# are the EXACT interval hulls of {x/y : x in A, y in B, y != 0}, cross-checked
+# against a python3 Fraction reference over all 4356 ordered pairs of an 11-point
+# rational endpoint grid (0 mismatches; the same reference reports 2706
+# mismatches against the 2.8.2 source).
+var xd_pinf = 0x7FF0000000000000;
+var xd_ninf = 0xFFF0000000000000;
+
+# [1,2] / [0,1] -> [1, +inf)
+var xd_a = ivl_div(ivl_new(F64_ONE, F64_TWO), ivl_new(0, F64_ONE));
+assert_eq(f64_to(Interval_lo(xd_a)), 1, "[1,2]/[0,1] lo = 1");
+assert_eq(Interval_hi(xd_a), xd_pinf, "[1,2]/[0,1] hi = +inf");
+
+# [1,2] / [-1,0] -> (-inf, -1]
+var xd_b = ivl_div(ivl_new(F64_ONE, F64_TWO), ivl_new(f64_neg(F64_ONE), 0));
+assert_eq(Interval_lo(xd_b), xd_ninf, "[1,2]/[-1,0] lo = -inf");
+assert_eq(f64_to(Interval_hi(xd_b)), (0 - 1), "[1,2]/[-1,0] hi = -1");
+
+# [1,2] / [-1,1] -> the true set is (-inf,-1] u [1,+inf); its hull is entire.
+var xd_c = ivl_div(ivl_new(F64_ONE, F64_TWO), ivl_new(f64_neg(F64_ONE), F64_ONE));
+assert_eq(Interval_lo(xd_c), xd_ninf, "[1,2]/[-1,1] lo = -inf");
+assert_eq(Interval_hi(xd_c), xd_pinf, "[1,2]/[-1,1] hi = +inf");
+
+# [-4,-2] / [0,2] -> (-inf, -1]
+var xd_d = ivl_div(ivl_new(f64_neg(f64_from(4)), f64_neg(F64_TWO)), ivl_new(0, F64_TWO));
+assert_eq(Interval_lo(xd_d), xd_ninf, "[-4,-2]/[0,2] lo = -inf");
+assert_eq(f64_to(Interval_hi(xd_d)), (0 - 1), "[-4,-2]/[0,2] hi = -1");
+
+# [0,0] / [-1,1] -> exactly [0,0]: 0/y is 0 for every admissible y. The old
+# guard returned [-1e9, 1e9] here, which is sound but 2e9 wide for an answer
+# that is a single point.
+var xd_e = ivl_div(ivl_point(0), ivl_new(f64_neg(F64_ONE), F64_ONE));
+assert_eq(f64_to(Interval_lo(xd_e)), 0, "[0,0]/[-1,1] lo = 0");
+assert_eq(f64_to(Interval_hi(xd_e)), 0, "[0,0]/[-1,1] hi = 0");
+
+# Soundness spot-check with a value the 1e9 box excluded: 1 / 1e-12 = 1e12.
+assert_eq(ivl_contains(xd_a, f64_from(1000000000000)), 1, "[1,2]/[0,1] encloses 1e12");
+assert_eq(ivl_contains(xd_a, F64_HALF), 0, "[1,2]/[0,1] does NOT enclose 0.5 (still tight)");
+
+# The divisor-free-of-zero path is untouched: [1,3]/[2,4] = [0.25, 1.5].
+var xd_f = ivl_div(ivl_new(F64_ONE, f64_from(3)), ivl_new(F64_TWO, f64_from(4)));
+assert_eq(f64_to(f64_round(f64_mul(Interval_lo(xd_f), f64_from(100)))), 25,
+"[1,3]/[2,4] lo = 0.25 (unchanged)");
+assert_eq(f64_to(f64_round(f64_mul(Interval_hi(xd_f), f64_from(100)))), 150,
+"[1,3]/[2,4] hi = 1.5 (unchanged)");
+
+# An unbounded interval must survive multiplication by [0,0] as [0,0], not NaN:
+# an infinite ENDPOINT means the set is unbounded, not that it holds an infinity,
+# so the products contributed by x = 0 are all 0. IEEE 754 gives NaN, and a NaN
+# endpoint makes ivl_contains report the interval as containing everything.
+var xd_z = ivl_mul(ivl_point(0), xd_a);
+assert_eq(f64_to(Interval_lo(xd_z)), 0, "[0,0] * [1,+inf) lo = 0, not NaN");
+assert_eq(f64_to(Interval_hi(xd_z)), 0, "[0,0] * [1,+inf) hi = 0, not NaN");
+assert_eq(ivl_contains(xd_z, f64_from(7)), 0, "[0,0] * [1,+inf) is not a NaN catch-all");
 
 # ================================================================
 var r = assert_summary();

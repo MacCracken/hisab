@@ -11,7 +11,24 @@
 #
 # SE(3) layout: { rotation: SU(2) ptr, translation: HVec3 ptr } = 16 bytes
 # SO(3) uses Mat3 from mat3.cyr (72 bytes, column-major)
-# Twists (se(3) algebra) are 6-vectors stored as 48 bytes: [omega(3), v(3)]
+# Twists (se(3) algebra) are 6-vectors stored as 48 bytes: [omega(3), v(3)].
+#   Build one with se3_twist_new and read it with se3_twist_omega /
+#   se3_twist_v. se3_exp and se3_adjoint take a twist, NOT an HVec3 -- an
+#   HVec3 is 24 bytes and both read 48, which is a silent out-of-bounds read
+#   that no null check can catch (see se3_twist_new).
+
+# ================================================================
+# CONSTANTS
+# ================================================================
+
+# Membership tolerance for so3_from_mat3. Every entry of a rotation matrix is
+# bounded by 1, so an ABSOLUTE tolerance is the right scale here -- there is no
+# dynamic range to normalise against. The rotations this module builds
+# (so3_exp, so3_from_axis_angle, so3_from_quat) reproduce R^T R = I and
+# det R = 1 to ~1e-16, seven orders inside this bound, so a legitimate rotation
+# that has been through a compose chain is still accepted while a reflection
+# (det = -1), a shear or a scaled rotation is rejected by a wide margin.
+var _SO3_ORTHO_TOL = 0x3E112E0BE826D695;  # 1e-9
 
 # ================================================================
 # Internal helpers
@@ -131,9 +148,41 @@ fn so3_from_quat(q) {
     return m3_from_quat(su2_to_quat(q));
 }
 
-# Validate and return a Mat3 as SO(3)
-# (Checks determinant ~ +1 and orthogonality)
+# Validate and return a Mat3 as SO(3).
+# Checks R^T R == I on all nine entries and det(R) == +1, both to
+# _SO3_ORTHO_TOL. Returns a fresh Mat3 copy, or 0 if m is null or is not a
+# rotation.
+#
+# Through 2.8.2 this doc block claimed both checks and the body performed
+# NEITHER -- it was a bare m3_copy, so a reflection, a shear or a scaled
+# rotation was accepted and propagated into so3_compose/so3_log/so3_inverse as
+# if it were a rotation (so3_inverse is a transpose, which is only an inverse
+# for an orthogonal matrix). The only assertion was `!= 0`, which m3_copy
+# cannot fail for any input. Implemented rather than deleting the doc: every
+# other constructor in this file returns 0 on invalid input, and a caller
+# reaching for `from_mat3` rather than `from_axis_angle`/`from_quat` is exactly
+# the caller holding a matrix of unknown provenance.
 fn so3_from_mat3(m) {
+    if (m == 0) { return 0; }
+
+    # Orthogonality: R^T R - I must vanish on every entry.
+    var gram = m3_mul(m3_transpose(m), m);
+    for (var c = 0; c < 3; c = c + 1) {
+        for (var r = 0; r < 3; r = r + 1) {
+            var want = 0;
+            if (c == r) { want = F64_ONE; }
+            if (f64_lt(f64_abs(f64_sub(m3_get(gram, c, r), want)), _SO3_ORTHO_TOL) == 0) {
+                return 0;
+            }
+        }
+    }
+
+    # Orthogonal leaves det = +/-1. SO(3) is the +1 component: a determinant of
+    # -1 is a reflection, which is orthogonal but not a rotation.
+    if (f64_lt(f64_abs(f64_sub(m3_determinant(m), F64_ONE)), _SO3_ORTHO_TOL) == 0) {
+        return 0;
+    }
+
     return m3_copy(m);
 }
 
@@ -219,6 +268,35 @@ fn _se3_trans(se) { return load64(se + 8); }
 # Construct SE(3) from SU(2) rotation and HVec3 translation
 fn se3_new(rotation, translation) {
     return _se3_alloc(rotation, translation);
+}
+
+# Build an se(3) twist -- a 48-byte 6-vector [omega(3), v(3)] -- from two HVec3.
+# omega is the angular part, v the linear part. Returns 0 if either is null.
+#
+# This is the ONLY correct input shape for se3_exp and se3_adjoint, and until
+# 2.8.2 there was no exported way to build one: every twist in the library came
+# out of _twist_from, an internal. The suite duly passed a 24-byte HVec3 to
+# se3_adjoint and asserted only `!= 0` -- which cannot see the 24-byte
+# out-of-bounds read that _twist_v then performs at offsets 24/32/40. A pointer
+# carries no length in Cyrius, so no guard inside se3_adjoint can detect a short
+# buffer; the fix is to make the right shape the easy one to build.
+fn se3_twist_new(omega, v) {
+    if (omega == 0 || v == 0) { return 0; }
+    return _twist_from(omega, v);
+}
+
+# Angular part (components 0-2) of a 48-byte twist, as a fresh HVec3.
+# Returns 0 if twist is null.
+fn se3_twist_omega(twist) {
+    if (twist == 0) { return 0; }
+    return _twist_omega(twist);
+}
+
+# Linear part (components 3-5) of a 48-byte twist, as a fresh HVec3.
+# Returns 0 if twist is null.
+fn se3_twist_v(twist) {
+    if (twist == 0) { return 0; }
+    return _twist_v(twist);
 }
 
 # Identity: no rotation, no translation
@@ -451,7 +529,14 @@ fn lorentz_adjoint(L, X) {
 # For SE(3) element (R, t) and twist [omega, v]:
 # Ad = [[R, 0], [[t]_x R, R]]
 # Result: [R*omega, [t]_x * R * omega + R * v]
+#
+# se: SE(3) element. twist: a 48-byte se(3) twist -- build it with
+# se3_twist_new, NEVER with hvec3_new. An HVec3 here is 24 bytes where 48 are
+# read, and since a Cyrius pointer carries no length the guard below can only
+# reject null; the size mistake is caught by construction, not by validation.
+# Returns a fresh 48-byte twist, or 0 if either argument is null.
 fn se3_adjoint(se, twist) {
+    if (se == 0 || twist == 0) { return 0; }
     var rot = _se3_rot(se);
     var trans = _se3_trans(se);
     var omega = _twist_omega(twist);

@@ -795,62 +795,175 @@ fn octree_query(ot, min_vec3, max_vec3) {
 # 4. SpatialHash -- uniform grid for fast neighbor queries
 # ================================================================
 #
-# Handle layout (24 bytes):
+# Handle layout (48 bytes):
 #   offset  0: cell_size     (f64)
 #   offset  8: inv_cell_size (f64) -- 1.0 / cell_size
-#   offset 16: buckets       (ptr) -- pointer to array of 1024 vec ptrs
+#   offset 16: buckets       (ptr) -- one i64 chain head per bucket, -1 = empty
+#   offset 24: bucket_count  (i64) -- a power of two, and it GROWS
+#   offset 32: entries       (vec) -- flat [ix, iy, iz, data, next] records
+#   offset 40: occupied      (i64) -- number of non-empty buckets
 #
-# Hashing: cell coords (ix, iy, iz) are hashed to a bucket index [0..1023].
-# Each bucket is a vec of data values. Collisions are handled by the vec
-# (multiple cells can map to the same bucket -- query checks all entries).
+# Hashing: cell coords (ix, iy, iz) are hashed and masked to a bucket index.
+# Several cells can share a bucket, so every entry carries its own (ix, iy,
+# iz) and the query filters on an exact cell match.
 #
-# Bucket entry: interleaved [ix, iy, iz, data, ix, iy, iz, data, ...]
-# This allows distinguishing entries from different cells sharing a bucket.
+# GROWING BUCKET COUNT (2.8.3). Through 2.8.2 the bucket count was the
+# literal 1024, masked by a hard-coded `& 1023`, and never grew. With n
+# points the average chain is n/1024, so query_cell -- the O(1) primitive
+# this structure exists to provide -- actually cost Theta(n/1024). Measured
+# over 5,000 queries on uniform points at ~1 point per cell:
+# 1.48 / 1.62 / 2.07 / 2.82 / 4.19 / 7.17 ms at n = 2k..64k, a growth ratio
+# climbing to 1.71x per doubling and still rising. The table now doubles
+# whenever the OCCUPIED bucket count passes 3/4 of the bucket count.
+#
+# Why *occupied* buckets and not entry count: every entry in one cell hashes
+# to one bucket however large the table is, so an entry-count load factor
+# would double the table forever on coincident input (1M coincident points
+# -> a 32 MB bucket array that removes not one comparison). The occupied
+# count for that input is 1, so the table correctly stays at its initial
+# size and the chain walk stays exactly as long as it has to be.
+#
+# Storage is one flat entry vec plus a chain head per bucket, rather than a
+# vec per bucket: an empty vec still costs 152 bytes, so a vec-per-bucket
+# table cannot be grown at all (2^20 buckets = 159 MB of empty vecs,
+# re-allocated on every rehash).
+#
+# Chains are built by PREPENDING, so the `next` link is known at push time
+# and insert needs no write-back into an earlier entry. A chain therefore
+# walks newest-first, and each query reverses its own run of matches before
+# returning -- so results still come back in INSERTION ORDER, exactly as the
+# vec-per-bucket version returned them.
 
-var _SH_BUCKET_COUNT = 1024;
-var _SH_ENTRY_SIZE = 4;  # 4 slots per entry: ix, iy, iz, data
+var _SH_INIT_BUCKETS = 1024;
+var _SH_ENTRY_SIZE = 5;   # ix, iy, iz, data, next
+var _SH_MAX_BUCKETS = 0x400000;  # 4,194,304 buckets = 32 MB of chain heads
 
 fn _sh_hash(ix, iy, iz) {
-    # Simple hash combining cell coordinates
-    # Uses prime multipliers and XOR for distribution
+    # Teschner's prime-multiplier XOR combine...
     var h = ix * 73856093;
     h = h ^ (iy * 19349663);
     h = h ^ (iz * 83492791);
-    # Ensure positive and mask to bucket count
-    if (h < 0) { h = 0 - h; }
-    return h & 1023;  # _SH_BUCKET_COUNT - 1 (power of 2)
+    # ...followed by the murmur3 64-bit finalizer, which the pre-2.8.3 hash
+    # did not have. The bucket index is the LOW bits of h, and the combine
+    # alone leaves those bits carrying almost no entropy for the grid-aligned
+    # coordinates this structure is built for: a point set on a stride-4 grid
+    # gives ix = 4g, so h = g * 4 * 73856093 has its bottom two bits always
+    # zero and 30,000 distinct cells land in 256 buckets out of 1024. That is
+    # already a 117-deep chain, and -- worse for the growth policy below --
+    # the occupied count then never reaches 3/4 of the table, so the table
+    # would never grow no matter how many cells were added. The finalizer
+    # avalanches the high bits down; the same 30,000 cells then occupy 19,619
+    # buckets of 32,768 and the longest chain in the table is 6.
+    # `>>` is logical in Cyrius (verified: (0-1) >> 1 == 0x7fff_ffff_ffff_ffff),
+    # which is what the finalizer requires. The caller masks with
+    # (bucket_count - 1) >= 0, so a negative h needs no separate correction.
+    h = h ^ (h >> 33);
+    h = h * 0xFF51AFD7ED558CCD;
+    h = h ^ (h >> 33);
+    h = h * 0xC4CEB9FE1A85EC53;
+    h = h ^ (h >> 33);
+    return h;
 }
 
 fn _sh_cell_coord(val, inv_cell_size) {
     return f64_to(f64_floor(f64_mul(val, inv_cell_size)));
 }
 
+# Allocate a bucket array of `bc` chain heads, all empty (-1).
+fn _sh_buckets_new(bc) {
+    var b = alloc(bc * 8);
+    for (var bi = 0; bi < bc; bi = bi + 1) {
+        store64(b + bi * 8, 0 - 1);
+    }
+    return b;
+}
+
 # Create a new spatial hash grid.
 # cell_size: size of each grid cell (f64)
 # Returns: spatial hash handle pointer
 fn spatial_hash_new(cell_size) {
-    var sh = alloc(24);
+    var sh = alloc(48);
     store64(sh, cell_size);
     store64(sh + 8, f64_div(F64_ONE, cell_size));
-
-    # Allocate bucket array: 1024 pointers, each initially a new empty vec
-    var buckets = alloc(_SH_BUCKET_COUNT * 8);
-    for (var bi = 0; bi < _SH_BUCKET_COUNT; bi = bi + 1) {
-        store64(buckets + bi * 8, vec_new());
-    }
-    store64(sh + 16, buckets);
-
+    store64(sh + 16, _sh_buckets_new(_SH_INIT_BUCKETS));
+    store64(sh + 24, _SH_INIT_BUCKETS);
+    store64(sh + 32, vec_new());
+    store64(sh + 40, 0);
     return sh;
 }
 
 fn _sh_cell_size(sh) { return load64(sh); }
 fn _sh_inv_cell_size(sh) { return load64(sh + 8); }
 fn _sh_buckets(sh) { return load64(sh + 16); }
+fn _sh_bucket_count(sh) { return load64(sh + 24); }
+fn _sh_entries(sh) { return load64(sh + 32); }
+fn _sh_occupied(sh) { return load64(sh + 40); }
 
-fn _sh_get_bucket(sh, ix, iy, iz) {
-    var buckets = _sh_buckets(sh);
-    var idx = _sh_hash(ix, iy, iz);
-    return load64(buckets + idx * 8);
+fn _sh_bucket_of(sh, ix, iy, iz) {
+    return _sh_hash(ix, iy, iz) & (load64(sh + 24) - 1);
+}
+
+# Index of the newest entry in the chain for (ix, iy, iz), or -1 if empty.
+fn _sh_chain_head(sh, ix, iy, iz) {
+    return load64(_sh_buckets(sh) + _sh_bucket_of(sh, ix, iy, iz) * 8);
+}
+
+# Point bucket b's head at entry `e`, returning `e`'s `next` link (the old
+# head). The caller stores that link, so no earlier entry is ever rewritten.
+fn _sh_chain_push(sh, b, e) {
+    var slot = _sh_buckets(sh) + b * 8;
+    var old = load64(slot);
+    store64(slot, e);
+    return old;
+}
+
+# Reverse results[from..len) in place -- one query's run of matches, walked
+# newest-first off the chain, restored to insertion order.
+#
+# Raw load64/store64 on the vec's data pointer rather than vec_get/vec_set:
+# `results` is a vec this file created moments ago, `from` is a length this
+# file read off it, and the loop only ever touches [from, len), so both
+# bounds are established here rather than trusted from a caller. Through the
+# checked accessors the reversal costs four bounds tests per swap and shows
+# up as a 38% regression on a query that returns thousands of matches from
+# one cell -- the case the pre-2.8.3 full-bucket scan handled best.
+fn _sh_reverse_from(results, from) {
+    var data = load64(results);
+    var hi = load64(results + 8) - 1;
+    while (from < hi) {
+        var lo_p = data + from * 8;
+        var hi_p = data + hi * 8;
+        var t = load64(lo_p);
+        store64(lo_p, load64(hi_p));
+        store64(hi_p, t);
+        from = from + 1;
+        hi = hi - 1;
+    }
+    return 0;
+}
+
+# Double the bucket array and re-chain every entry. Amortized O(1) per insert
+# because the count doubles; the entries themselves never move. Re-chaining
+# forward (e = 0..n-1) reproduces the newest-first order incremental inserts
+# would have produced, so query order is unchanged by a growth.
+fn _sh_grow(sh) {
+    var bc = _sh_bucket_count(sh);
+    if (bc >= _SH_MAX_BUCKETS) { return 0; }
+    store64(sh + 16, _sh_buckets_new(bc * 2));
+    store64(sh + 24, bc * 2);
+    var entries = _sh_entries(sh);
+    var n = vec_len(entries) / _SH_ENTRY_SIZE;
+    var occ = 0;
+    for (var e = 0; e < n; e = e + 1) {
+        var base = e * _SH_ENTRY_SIZE;
+        var b = _sh_bucket_of(sh, vec_get(entries, base),
+        vec_get(entries, base + 1), vec_get(entries, base + 2));
+        var old = _sh_chain_push(sh, b, e);
+        vec_set(entries, base + 4, old);
+        if (old < 0) { occ = occ + 1; }
+    }
+    store64(sh + 40, occ);
+    return 0;
 }
 
 # Insert a point with associated data into the spatial hash.
@@ -862,17 +975,30 @@ fn spatial_hash_insert(sh, point, data) {
     var iy = _sh_cell_coord(HVec3_y(point), inv);
     var iz = _sh_cell_coord(HVec3_z(point), inv);
 
-    var bucket = _sh_get_bucket(sh, ix, iy, iz);
-    vec_push(bucket, ix);
-    vec_push(bucket, iy);
-    vec_push(bucket, iz);
-    vec_push(bucket, data);
+    var entries = _sh_entries(sh);
+    var e = vec_len(entries) / _SH_ENTRY_SIZE;
+    var old = _sh_chain_push(sh, _sh_bucket_of(sh, ix, iy, iz), e);
+    vec_push(entries, ix);
+    vec_push(entries, iy);
+    vec_push(entries, iz);
+    vec_push(entries, data);
+    vec_push(entries, old);
+
+    var occ = _sh_occupied(sh);
+    if (old < 0) {
+        occ = occ + 1;
+        store64(sh + 40, occ);
+        # Load factor 3/4 on OCCUPIED buckets (see the block comment above).
+        # Only a newly occupied bucket can cross it, so the test is skipped
+        # on every insert into a cell that already exists.
+        if (occ * 4 >= _sh_bucket_count(sh) * 3) { _sh_grow(sh); }
+    }
 
     return 0;
 }
 
 # Query all data values in the same cell as the given point.
-# Returns vec of data (i64) values.
+# Returns vec of data (i64) values, in insertion order.
 fn spatial_hash_query_cell(sh, point) {
     var results = vec_new();
     var inv = _sh_inv_cell_size(sh);
@@ -880,32 +1006,59 @@ fn spatial_hash_query_cell(sh, point) {
     var iy = _sh_cell_coord(HVec3_y(point), inv);
     var iz = _sh_cell_coord(HVec3_z(point), inv);
 
-    var bucket = _sh_get_bucket(sh, ix, iy, iz);
-    var blen = vec_len(bucket);
-    var ei = 0;
-    while (ei < blen) {
-        var eix = vec_get(bucket, ei);
-        var eiy = vec_get(bucket, ei + 1);
-        var eiz = vec_get(bucket, ei + 2);
-        var ed = vec_get(bucket, ei + 3);
+    var entries = _sh_entries(sh);
+    var e = _sh_chain_head(sh, ix, iy, iz);
+    while (e >= 0) {
+        var base = e * _SH_ENTRY_SIZE;
         # Only include entries from the exact cell (not hash collisions)
-        if (eix == ix) {
-            if (eiy == iy) {
-                if (eiz == iz) {
-                    vec_push(results, ed);
+        if (vec_get(entries, base) == ix) {
+            if (vec_get(entries, base + 1) == iy) {
+                if (vec_get(entries, base + 2) == iz) {
+                    vec_push(results, vec_get(entries, base + 3));
                 }
             }
         }
-        ei = ei + _SH_ENTRY_SIZE;
+        e = vec_get(entries, base + 4);
     }
 
+    _sh_reverse_from(results, 0);
     return results;
+}
+
+# Cell-block half-width at which the per-cell walk stops being the cheaper plan.
+# The grid only HAS _SH_BUCKET_COUNT buckets, so a block of (2r+1)^3 cells starts
+# probing buckets more than once at 11^3 = 1331 > 1024, i.e. from r = 5 up.
+var _SH_FULL_SCAN_CELLS = 5;
+
+# Largest radius/cell_size ratio for which ceil() still lands inside i64. Above
+# it -- and for +Inf or NaN, which fail every f64_lt below -- the cell block
+# covers the whole representable coordinate range, so the range test is dropped
+# and every stored entry qualifies.
+var _SH_MAX_SPAN_CELLS = 1000000000000000;   # 1e15
+
+# |a - b| <= r, written as one subtraction so it carries exactly the overflow
+# exposure the `tx = cx + dx` form it replaces already had.
+fn _sh_within(e, c, r) {
+    var d = e - c;
+    if (d < 0) { d = 0 - d; }
+    if (d <= r) { return 1; }
+    return 0;
 }
 
 # Query all data values within radius of the given point.
 # Checks all cells that could contain points within radius.
 # Returns vec of candidate data (i64) values (broadphase -- caller should
 # perform exact distance checks).
+#
+# COST IS BOUNDED BY THE GRID, NOT BY THE RADIUS. The cell-block walk below is
+# (2*radius/cell_size + 1)^3 probes, which is unbounded in the caller's radius:
+# radius 1e4 on a unit grid asks for 8e12 probes and radius 1e6 for 8e18, i.e.
+# the call never returns. Once the block exceeds the bucket count there is a
+# strictly cheaper plan that returns the IDENTICAL multiset -- walk each of the
+# _SH_BUCKET_COUNT buckets once and apply the same per-entry cell-range test.
+# The membership predicate is unchanged (an entry is emitted iff its cell lies in
+# the block, and it can match at most one cell either way); only the visit ORDER
+# differs, and only in a regime where the old code was effectively a hang.
 fn spatial_hash_query_radius(sh, point, radius) {
     var results = vec_new();
     var inv = _sh_inv_cell_size(sh);
@@ -914,8 +1067,42 @@ fn spatial_hash_query_radius(sh, point, radius) {
     var cz = _sh_cell_coord(HVec3_z(point), inv);
 
     # Number of cells to search in each direction
-    var cells_r = f64_to(f64_ceil(f64_mul(radius, inv)));
+    var span = f64_mul(radius, inv);
+    # A negative radius encloses nothing. Unchanged behaviour -- the old loop's
+    # `dx = -cells_r; while (dx <= cells_r)` was already empty for cells_r < 0 --
+    # but stated, because f64_to of a negative NaN-ish span is not a bound.
+    if (f64_lt(span, 0) == 1) { return results; }
+    var ranged = 1;
+    var cells_r = 0;
+    if (f64_lt(span, f64_from(_SH_MAX_SPAN_CELLS)) == 1) {
+        cells_r = f64_to(f64_ceil(span));
+    } else {
+        ranged = 0;   # +Inf, NaN, or past i64: every cell is in range
+    }
 
+    if (ranged == 0 || cells_r >= _SH_FULL_SCAN_CELLS) {
+        var buckets = _sh_buckets(sh);
+        var bi = 0;
+        while (bi < _SH_BUCKET_COUNT) {
+            var fb = load64(buckets + bi * 8);
+            var fblen = vec_len(fb);
+            var fei = 0;
+            while (fei < fblen) {
+                var keep = 1;
+                if (ranged == 1) {
+                    keep = _sh_within(vec_get(fb, fei), cx, cells_r);
+                    if (keep == 1) { keep = _sh_within(vec_get(fb, fei + 1), cy, cells_r); }
+                    if (keep == 1) { keep = _sh_within(vec_get(fb, fei + 2), cz, cells_r); }
+                }
+                if (keep == 1) { vec_push(results, vec_get(fb, fei + 3)); }
+                fei = fei + _SH_ENTRY_SIZE;
+            }
+            bi = bi + 1;
+        }
+        return results;
+    }
+
+    var entries = _sh_entries(sh);
     var dx = 0 - cells_r;
     while (dx <= cells_r) {
         var dy = 0 - cells_r;
@@ -925,24 +1112,22 @@ fn spatial_hash_query_radius(sh, point, radius) {
                 var tx = cx + dx;
                 var ty = cy + dy;
                 var tz = cz + dz;
-                var bucket = _sh_get_bucket(sh, tx, ty, tz);
-                var blen = vec_len(bucket);
-                var ei = 0;
-                while (ei < blen) {
-                    var eix = vec_get(bucket, ei);
-                    var eiy = vec_get(bucket, ei + 1);
-                    var eiz = vec_get(bucket, ei + 2);
-                    var ed = vec_get(bucket, ei + 3);
+                var run = vec_len(results);
+                var e = _sh_chain_head(sh, tx, ty, tz);
+                while (e >= 0) {
+                    var base = e * _SH_ENTRY_SIZE;
                     # Only include entries from the exact target cell
-                    if (eix == tx) {
-                        if (eiy == ty) {
-                            if (eiz == tz) {
-                                vec_push(results, ed);
+                    if (vec_get(entries, base) == tx) {
+                        if (vec_get(entries, base + 1) == ty) {
+                            if (vec_get(entries, base + 2) == tz) {
+                                vec_push(results, vec_get(entries, base + 3));
                             }
                         }
                     }
-                    ei = ei + _SH_ENTRY_SIZE;
+                    e = vec_get(entries, base + 4);
                 }
+                # This cell's run only -- cells stay in their scan order.
+                _sh_reverse_from(results, run);
                 dz = dz + 1;
             }
             dy = dy + 1;
@@ -956,10 +1141,13 @@ fn spatial_hash_query_radius(sh, point, radius) {
 # Remove all entries from the spatial hash.
 fn spatial_hash_clear(sh) {
     var buckets = _sh_buckets(sh);
-    for (var bi = 0; bi < _SH_BUCKET_COUNT; bi = bi + 1) {
-        var bucket = load64(buckets + bi * 8);
-        # Reset vec length to 0 (keeps allocation)
-        store64(bucket + 8, 0);
+    var bc = _sh_bucket_count(sh);
+    for (var bi = 0; bi < bc; bi = bi + 1) {
+        store64(buckets + bi * 8, 0 - 1);
     }
+    # Reset the entry vec's length to 0 (keeps its allocation) and the
+    # occupied count with it, so the load factor is re-derived from scratch.
+    store64(_sh_entries(sh) + 8, 0);
+    store64(sh + 40, 0);
     return 0;
 }

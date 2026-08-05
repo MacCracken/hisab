@@ -1025,11 +1025,6 @@ fn spatial_hash_query_cell(sh, point) {
     return results;
 }
 
-# Cell-block half-width at which the per-cell walk stops being the cheaper plan.
-# The grid only HAS _SH_BUCKET_COUNT buckets, so a block of (2r+1)^3 cells starts
-# probing buckets more than once at 11^3 = 1331 > 1024, i.e. from r = 5 up.
-var _SH_FULL_SCAN_CELLS = 5;
-
 # Largest radius/cell_size ratio for which ceil() still lands inside i64. Above
 # it -- and for +Inf or NaN, which fail every f64_lt below -- the cell block
 # covers the whole representable coordinate range, so the range test is dropped
@@ -1055,7 +1050,7 @@ fn _sh_within(e, c, r) {
 # radius 1e4 on a unit grid asks for 8e12 probes and radius 1e6 for 8e18, i.e.
 # the call never returns. Once the block exceeds the bucket count there is a
 # strictly cheaper plan that returns the IDENTICAL multiset -- walk each of the
-# _SH_BUCKET_COUNT buckets once and apply the same per-entry cell-range test.
+# bucket once and apply the same per-entry cell-range test.
 # The membership predicate is unchanged (an entry is emitted iff its cell lies in
 # the block, and it can match at most one cell either way); only the visit ORDER
 # differs, and only in a regime where the old code was effectively a hang.
@@ -1080,29 +1075,49 @@ fn spatial_hash_query_radius(sh, point, radius) {
         ranged = 0;   # +Inf, NaN, or past i64: every cell is in range
     }
 
-    if (ranged == 0 || cells_r >= _SH_FULL_SCAN_CELLS) {
-        var buckets = _sh_buckets(sh);
-        var bi = 0;
-        while (bi < _SH_BUCKET_COUNT) {
-            var fb = load64(buckets + bi * 8);
-            var fblen = vec_len(fb);
-            var fei = 0;
-            while (fei < fblen) {
-                var keep = 1;
-                if (ranged == 1) {
-                    keep = _sh_within(vec_get(fb, fei), cx, cells_r);
-                    if (keep == 1) { keep = _sh_within(vec_get(fb, fei + 1), cy, cells_r); }
-                    if (keep == 1) { keep = _sh_within(vec_get(fb, fei + 2), cz, cells_r); }
-                }
-                if (keep == 1) { vec_push(results, vec_get(fb, fei + 3)); }
-                fei = fei + _SH_ENTRY_SIZE;
+    # WHICH PLAN IS CHEAPER, measured against what each one actually costs. The
+    # per-cell walk costs (2*cells_r + 1)^3 bucket probes; the flat scan below
+    # costs one visit per STORED ENTRY. Through 2.8.2 the table was a fixed 1024
+    # buckets and this was the constant `cells_r >= 5` (11^3 = 1331 > 1024); the
+    # table now grows, and the entry count is the honest bound on the scan, so
+    # the two are compared directly. Below cells_r = 1024 the cube stays under
+    # 8.6e9 and cannot overflow i64; at or above it the walk is hopeless against
+    # any population.
+    var entries = _sh_entries(sh);
+    var nentries = vec_len(entries) / _SH_ENTRY_SIZE;
+    var full_scan = 0;
+    if (ranged == 0) {
+        full_scan = 1;
+    } elif (cells_r >= 1024) {
+        full_scan = 1;
+    } else {
+        var w = 2 * cells_r + 1;
+        if (w * w * w > nentries) { full_scan = 1; }
+    }
+
+    # FLAT SCAN over the entry list. Every entry carries its own (ix, iy, iz), so
+    # the cheap plan needs no bucket traversal at all. It must not walk the bucket
+    # array either: since the 2.8.3 growing table those slots hold i64 chain HEADS
+    # (-1 = empty), not a vec per bucket, so `vec_len` on one is a wild pointer.
+    # Membership is the same predicate as the per-cell walk -- an entry is emitted
+    # iff its cell lies in the block, and it matches at most one cell either way --
+    # so this returns the identical multiset; only the visit ORDER differs.
+    if (full_scan == 1) {
+        var flen = vec_len(entries);
+        var fei = 0;
+        while (fei < flen) {
+            var keep = 1;
+            if (ranged == 1) {
+                keep = _sh_within(vec_get(entries, fei), cx, cells_r);
+                if (keep == 1) { keep = _sh_within(vec_get(entries, fei + 1), cy, cells_r); }
+                if (keep == 1) { keep = _sh_within(vec_get(entries, fei + 2), cz, cells_r); }
             }
-            bi = bi + 1;
+            if (keep == 1) { vec_push(results, vec_get(entries, fei + 3)); }
+            fei = fei + _SH_ENTRY_SIZE;
         }
         return results;
     }
 
-    var entries = _sh_entries(sh);
     var dx = 0 - cells_r;
     while (dx <= cells_r) {
         var dy = 0 - cells_r;

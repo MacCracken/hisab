@@ -382,11 +382,315 @@ fn _c9_g(x, out) {
 }
 fn _c9_x2(x) { return f64_mul(x, x); }
 
+# --- calc_ext: Hessian mixed partials (2.8.x test-quality repair) -----------
+# f(x, y) = x^2*y + y^3. NOT separable, so the true mixed partial d2f/dxdy = 2x
+# is nonzero -- unlike _c9_f above (x^2 + y^2), whose Hessian is 2I and whose
+# zero off-diagonal is reproduced by ANY sign arrangement of the 4-point cross
+# stencil, including deleting the block outright.
+# Total degree 3, and both a central second difference and the cross stencil are
+# exact through total degree 3, so the finite differences here are the TRUE
+# derivatives bit-for-bit at any step size.
+fn _hx_f(x) {
+    var a = load64(x);
+    var b = load64(x + 8);
+    return f64_add(f64_mul(f64_mul(a, a), b), f64_mul(f64_mul(b, b), b));
+}
+
+# --- calc_ext: adaptive Simpson integrands (2.8.x test-quality repair) ------
+# Every integrand counts its own evaluations. The count is the direct evidence
+# that the refinement machinery runs: x^2 is integrated exactly by the single
+# initial panel and stops at 3 evaluations, everything below does not.
+var _as_calls = 0;
+
+fn _as_x2(x) { _as_calls = _as_calls + 1; return f64_mul(x, x); }
+
+fn _as_x4(x) {
+    _as_calls = _as_calls + 1;
+    var x2 = f64_mul(x, x);
+    return f64_mul(x2, x2);
+}
+
+# Unbounded derivative at 0: the error concentrates in one corner, so reaching
+# 1e-11 is only possible if the subdivision is NON-UNIFORM.
+fn _as_sqrt(x) { _as_calls = _as_calls + 1; return f64_sqrt(x); }
+
+# 1/(1+x): no Simpson panel is ever exact, so every level contributes.
+fn _as_recip(x) {
+    _as_calls = _as_calls + 1;
+    return f64_div(F64_ONE, f64_add(F64_ONE, x));
+}
+
+# Lorentzian of half-width 1/20 centred in [0,1]: 1 / (1 + 400 (x - 1/2)^2).
+# Integral over [0,1] = (1/10) atan(10). One unrefined panel is 355% wrong.
+fn _as_peak(x) {
+    _as_calls = _as_calls + 1;
+    var d = f64_sub(x, F64_HALF);
+    return f64_div(F64_ONE, f64_add(F64_ONE, f64_mul(f64_from(400), f64_mul(d, d))));
+}
+
+# --- lie_ext: do two SE(3) elements act identically? ------------------------
+# Four points (the origin plus the three axes) determine a rigid motion, so
+# agreement on all four is agreement everywhere. Used to check the defining
+# adjoint identity exp(Ad_g xi) == g exp(xi) g^-1 without reaching into the
+# internal layout of either operand.
+fn _se_same(a, b) {
+    var pts = alloc(32);
+    store64(pts, hvec3_zero());
+    store64(pts + 8, hvec3_unit_x());
+    store64(pts + 16, hvec3_unit_y());
+    store64(pts + 24, hvec3_unit_z());
+    for (var i = 0; i < 4; i = i + 1) {
+        var p = load64(pts + i * 8);
+        var qa = se3_transform_point(a, p);
+        var qb = se3_transform_point(b, p);
+        if (f64_lt(f64_abs(f64_sub(HVec3_x(qa), HVec3_x(qb))), LOOSE_TOL_M) == 0) { return 0; }
+        if (f64_lt(f64_abs(f64_sub(HVec3_y(qa), HVec3_y(qb))), LOOSE_TOL_M) == 0) { return 0; }
+        if (f64_lt(f64_abs(f64_sub(HVec3_z(qa), HVec3_z(qb))), LOOSE_TOL_M) == 0) { return 0; }
+    }
+    return 1;
+}
+
+# --- delaunay_2d: winding (2.8.x test-quality repair) -----------------------
+# How many emitted triangles are NOT strictly counter-clockwise. delaunay_2d
+# documents CCW output and normalises for it at emit time, and every other
+# delaunay assertion in this file is orientation-blind -- |signed area| for the
+# hull-coverage harness, plus edge-share count, point usage and the
+# empty-circumcircle test, none of which a clockwise triangle violates. This is
+# the only check that can see the normalisation at all.
+fn _dl_non_ccw(p, t) {
+    var bad = 0;
+    for (var k = 0; k < vec_len(t); k = k + 3) {
+        var a = vec_get(p, vec_get(t, k));
+        var b = vec_get(p, vec_get(t, k + 1));
+        var c = vec_get(p, vec_get(t, k + 2));
+        var s = _col_triangle_area_2x(HVec2_x(a), HVec2_y(a),
+        HVec2_x(b), HVec2_y(b), HVec2_x(c), HVec2_y(c));
+        if (f64_gt(s, 0) == 0) { bad = bad + 1; }
+    }
+    return bad;
+}
+
 fn _c80_sq(x) { return f64_mul(x, x); }
 fn _c80_f(x) { var a = load64(x); return f64_mul(a, a); }
 fn _c80_g(x, out) { store64(out, f64_mul(F64_TWO, load64(x))); return 0; }
 fn _c80_sde_f(t, y) { return 0; }
 fn _c80_sde_g(t, y) { return F64_ONE; }
+
+# --- 2.8.3: support functions for the gjk_epa_3d (EPA) fixtures ---
+# Every one bumps _ga_sup_calls. EPA issues exactly one Minkowski support query
+# (= two of these) per iteration, so the counter is a direct, black-box read of
+# how many EPA iterations a call ran -- which is what the arena budget below is
+# normalised against.
+var _ga_sup_calls = 0;
+
+# Sphere: shape = HVec4 [cx, cy, cz, r]
+fn _ga_sup_sphere(shape, dir) {
+    _ga_sup_calls = _ga_sup_calls + 1;
+    var dn = hvec3_normalize(dir);
+    var r = HVec4_w(shape);
+    return hvec3_new(f64_add(HVec4_x(shape), f64_mul(HVec3_x(dn), r)),
+    f64_add(HVec4_y(shape), f64_mul(HVec3_y(dn), r)),
+    f64_add(HVec4_z(shape), f64_mul(HVec3_z(dn), r)));
+}
+
+# Cylinder about +z: shape = [cx, cy, cz, radius, half_height]
+fn _ga_mkcyl(cx, cy, cz, r, hz) {
+    var s = alloc(40);
+    store64(s, cx); store64(s + 8, cy); store64(s + 16, cz);
+    store64(s + 24, r); store64(s + 32, hz);
+    return s;
+}
+fn _ga_sup_cyl(shape, dir) {
+    _ga_sup_calls = _ga_sup_calls + 1;
+    var dx = HVec3_x(dir);
+    var dy = HVec3_y(dir);
+    var rho = f64_sqrt(f64_add(f64_mul(dx, dx), f64_mul(dy, dy)));
+    var px = 0;
+    var py = 0;
+    if (f64_gt(rho, 0) == 1) {
+        px = f64_mul(load64(shape + 24), f64_div(dx, rho));
+        py = f64_mul(load64(shape + 24), f64_div(dy, rho));
+    }
+    var pz = load64(shape + 32);
+    if (f64_lt(HVec3_z(dir), 0) == 1) { pz = f64_neg(pz); }
+    return hvec3_new(f64_add(load64(shape), px), f64_add(load64(shape + 8), py),
+    f64_add(load64(shape + 16), pz));
+}
+
+# Oriented box: shape = [cx, cy, cz, hx, hy, hz, qx, qy, qz, qw]
+fn _ga_mkobb(cx, cy, cz, hx, hy, hz, qx, qy, qz, qw) {
+    var s = alloc(80);
+    store64(s, cx); store64(s + 8, cy); store64(s + 16, cz);
+    store64(s + 24, hx); store64(s + 32, hy); store64(s + 40, hz);
+    store64(s + 48, qx); store64(s + 56, qy); store64(s + 64, qz); store64(s + 72, qw);
+    return s;
+}
+fn _ga_sup_obb(shape, dir) {
+    _ga_sup_calls = _ga_sup_calls + 1;
+    var q = hquat_new(load64(shape + 48), load64(shape + 56), load64(shape + 64), load64(shape + 72));
+    var ld = hquat_rotate_vec3(hquat_conjugate(q), dir);
+    var lx = load64(shape + 24);
+    var ly = load64(shape + 32);
+    var lz = load64(shape + 40);
+    if (f64_lt(HVec3_x(ld), 0) == 1) { lx = f64_neg(lx); }
+    if (f64_lt(HVec3_y(ld), 0) == 1) { ly = f64_neg(ly); }
+    if (f64_lt(HVec3_z(ld), 0) == 1) { lz = f64_neg(lz); }
+    var wp = hquat_rotate_vec3(q, hvec3_new(lx, ly, lz));
+    return hvec3_new(f64_add(load64(shape), HVec3_x(wp)),
+    f64_add(load64(shape + 8), HVec3_y(wp)),
+    f64_add(load64(shape + 16), HVec3_z(wp)));
+}
+# --- 2.8.3 memory-safety helpers ---------------------------------
+# Deterministic LCG shared with the Python reference in the audit workflow record;
+# every value stays under 2^61 so the i64 multiply cannot wrap.
+var _m3_lcg = 12345;
+fn _m3_next() {
+    _m3_lcg = (_m3_lcg * 1103515245 + 12345) % 2147483648;
+    return _m3_lcg % 21 - 10;
+}
+# Cell index k -> coordinate k + 0.5, so floor() is exact for both signs.
+fn _m3_cc(k) { return f64_add(f64_from(k), F64_HALF); }
+fn _m3_shq(sh, qx, qy, qz, r) {
+    return vec_len(spatial_hash_query_radius(sh,
+    hvec3_new(_m3_cc(qx), _m3_cc(qy), _m3_cc(qz)), f64_from(r)));
+}
+# --- 2.8.3 api-consistency helpers ---
+# Squared length of the HVec3 at a store64 slot, as an integer scaled by 1e9.
+# Used to assert "the reported normal is a unit vector", which is also the
+# assertion that it is not the NULL pointer the pre-2.8.3 code stored (a null
+# would fault in HVec3_x long before the comparison).
+fn _ac_len_sq_e9(nptr) {
+    var n = load64(nptr);
+    var l = hvec3_length_sq(n);
+    return f64_to(f64_round(f64_mul(l, f64_from(1000000000))));
+}
+fn _ac_comp_e9(nptr, axis) {
+    var n = load64(nptr);
+    var c = HVec3_x(n);
+    if (axis == 1) { c = HVec3_y(n); }
+    if (axis == 2) { c = HVec3_z(n); }
+    return f64_to(f64_round(f64_mul(c, f64_from(1000000000))));
+}
+# --- calc_monotone_cubic shape oracle (2.8.3) ------------------------------
+# The CONTRACT, not a reference implementation: on [xs[k], xs[k+1]] the
+# interpolant may not leave [ys[k], ys[k+1]]. Worst violation over a 1/steps
+# grid across every interval; 0 when the function honours its own name.
+fn _mc_box_violation(xs, ys, n, steps) {
+    var worst = 0;
+    var k = 0;
+    while (k < n - 1) {
+        var xk = _f64arr_get(xs, k);
+        var xk1 = _f64arr_get(xs, k + 1);
+        var lo = f64_min(_f64arr_get(ys, k), _f64arr_get(ys, k + 1));
+        var hi = f64_max(_f64arr_get(ys, k), _f64arr_get(ys, k + 1));
+        var s = 0;
+        while (s <= steps) {
+            var u = f64_div(f64_from(s), f64_from(steps));
+            var v = calc_monotone_cubic(xs, ys, n,
+            f64_add(xk, f64_mul(u, f64_sub(xk1, xk))));
+            if (f64_gt(f64_sub(v, hi), worst) == 1) { worst = f64_sub(v, hi); }
+            if (f64_gt(f64_sub(lo, v), worst) == 1) { worst = f64_sub(lo, v); }
+            s = s + 1;
+        }
+        k = k + 1;
+    }
+    return worst;
+}
+
+# Largest step taken AGAINST the direction of interval k's own secant.
+fn _mc_backstep(xs, ys, n, k, steps) {
+    var xk = _f64arr_get(xs, k);
+    var xk1 = _f64arr_get(xs, k + 1);
+    var up = 1;
+    if (f64_lt(_f64arr_get(ys, k + 1), _f64arr_get(ys, k)) == 1) { up = 0; }
+    var worst = 0;
+    var prev = calc_monotone_cubic(xs, ys, n, xk);
+    var s = 1;
+    while (s <= steps) {
+        var u = f64_div(f64_from(s), f64_from(steps));
+        var v = calc_monotone_cubic(xs, ys, n,
+        f64_add(xk, f64_mul(u, f64_sub(xk1, xk))));
+        var d = f64_sub(v, prev);
+        if (up == 0) { d = f64_neg(d); }
+        if (f64_lt(d, 0) == 1) {
+            if (f64_gt(f64_neg(d), worst) == 1) { worst = f64_neg(d); }
+        }
+        prev = v;
+        s = s + 1;
+    }
+    return worst;
+}
+
+# --- time_of_impact exact references (2.8.3) -------------------------------
+# Exact first-contact time of two TRANSLATING spheres: the smaller root of
+# |d + w t|^2 = R^2. Closed form, so it inherits nothing from the code under
+# test. Returns -1 when they never touch.
+fn _toi_ref_sphere(ca, ra, va, cb, rb, vb) {
+    var d = hvec3_sub(cb, ca);
+    var w = hvec3_sub(vb, va);
+    var rr = f64_add(ra, rb);
+    var qa = hvec3_dot(w, w);
+    var qb = hvec3_dot(d, w);
+    var qc = f64_sub(hvec3_dot(d, d), f64_mul(rr, rr));
+    if (f64_le(qc, 0) == 1) { return 0; }
+    # `qa <= 0`, not `qa < EPSILON_F64`: qa is a SQUARED speed, so on 1e-6-scale
+    # geometry it is ~1e-12 for a perfectly ordinary approach and an absolute
+    # 1e-12 floor makes this oracle declare "never collides" for half of them.
+    # The first draft did exactly that and blamed the three resulting
+    # disagreements on the code under test.
+    if (f64_le(qa, 0) == 1) { return f64_neg(F64_ONE); }
+    var disc = f64_sub(f64_mul(qb, qb), f64_mul(qa, qc));
+    if (f64_lt(disc, 0) == 1) { return f64_neg(F64_ONE); }
+    var t = f64_div(f64_sub(f64_neg(qb), f64_sqrt(disc)), qa);
+    if (f64_lt(t, 0) == 1) { return f64_neg(F64_ONE); }
+    return t;
+}
+
+# Tally block: [0] cases [1] collide [2] miss [3] falsepos [4] late [5] early
+fn _toi_tally() {
+    var s = alloc(48);
+    for (var i = 0; i < 6; i = i + 1) { store64(s + i * 8, 0); }
+    return s;
+}
+fn _toi_bump(s, i) {
+    store64(s + i * 8, load64(s + i * 8) + 1);
+    return 0;
+}
+
+# Score one sphere-vs-sphere sweep (A at the origin, stationary) against the
+# exact root. `late`/`early` also catch a null out_normal, which the pre-2.8.3
+# code could store whenever EPA failed on the contact polytope.
+fn _toi_score(tally, ra, cb, rb, vb, max_t, tol_t) {
+    var exact = _toi_ref_sphere(hvec3_zero(), ra, hvec3_zero(), cb, rb, vb);
+    var sa = hvec4_new(0, 0, 0, ra);
+    var sb = hvec4_new(HVec3_x(cb), HVec3_y(cb), HVec3_z(cb), rb);
+    var ot = alloc(8);
+    var on = alloc(8);
+    store64(on, 0);
+    var got = time_of_impact(&_mpr_sup_sphere, sa, hvec3_zero(),
+    &_mpr_sup_sphere, sb, vb, max_t, ot, on);
+
+    _toi_bump(tally, 0);
+    var should = 0;
+    if (f64_ge(exact, 0) == 1 && f64_le(exact, max_t) == 1) { should = 1; }
+    if (should == 1) { _toi_bump(tally, 1); }
+    if (should == 1 && got == 0) { _toi_bump(tally, 2); }
+    if (should == 0 && got == 1) { _toi_bump(tally, 3); }
+    if (got == 1 && load64(on) == 0) { _toi_bump(tally, 5); }
+    if (should == 1 && got == 1) {
+        var dt = f64_sub(load64(ot), exact);
+        if (f64_gt(dt, tol_t) == 1) { _toi_bump(tally, 4); }
+        if (f64_lt(dt, f64_neg(tol_t)) == 1) { _toi_bump(tally, 5); }
+    }
+    return 0;
+}
+
+# Deterministic f64 in [lo/den, hi/den] from the shared splitmix64 stream.
+fn _toi_frac(lo, hi, den) {
+    var r = _dlr_next();
+    if (r < 0) { r = 0 - r; }
+    return f64_div(f64_from(lo + (r % (hi - lo + 1))), f64_from(den));
+}
 
 alloc_init();
 
@@ -787,6 +1091,50 @@ assert_eq(f64_to(HVec3_y(c_cr_0)), 1, "catmull t=0 y");
 var c_cr_1 = calc_catmull_rom(c_cr_p0, c_cr_p1, c_cr_p2, c_cr_p3, F64_ONE);
 assert_eq(f64_to(HVec3_x(c_cr_1)), 2, "catmull t=1 x");
 assert_eq(f64_to(HVec3_y(c_cr_1)), 2, "catmull t=1 y");
+
+# The four assertions above were the WHOLE of this function's coverage through
+# 2.8.2, and they are the weakest fixture available for it: at t = 0 the t, t^2
+# and t^3 terms all vanish; at t = 1 the four coefficients telescope to 2*p2;
+# and on collinear EQUALLY-SPACED points coeff2 = 2a - 5b + 4c - d and
+# coeff3 = -a + 3b - 3c + d are both identically zero. Deleting term2 and term3
+# from _cmr_comp kept the suite green.
+#
+# Non-collinear, non-uniform control points, evaluated where the cubic terms
+# carry real weight. The reference is the closed form, NOT the implementation:
+#   q(1/2) = (-p0 + 9 p1 + 9 p2 - p3) / 16        (Catmull-Rom midpoint identity)
+#   q(1/4) = (-9 p0 + 111 p1 + 29 p2 - 3 p3) / 128
+# Both come out exact dyadic rationals for these coordinates, and replaying
+# _cmr_comp's own operation order in IEEE-754 reproduces them bit-for-bit
+# (python3: 7/4, 87/64, 11/8, 59/32, -1/8, -3/32), so these are EXACT equalities
+# rather than tolerance bands.
+var c_cr_q0 = hvec3_new(0, 0, F64_ONE);
+var c_cr_q1 = hvec3_new(F64_ONE, F64_TWO, 0);
+var c_cr_q2 = hvec3_new(f64_from(3), F64_ONE, 0);
+var c_cr_q3 = hvec3_new(f64_from(8), f64_from(5), F64_ONE);
+
+var c_cr_h = calc_catmull_rom(c_cr_q0, c_cr_q1, c_cr_q2, c_cr_q3, F64_HALF);
+assert_eq(HVec3_x(c_cr_h), f64_div(f64_from(7), f64_from(4)),
+"catmull t=1/2 x = 7/4 exactly");
+assert_eq(HVec3_y(c_cr_h), f64_div(f64_from(11), f64_from(8)),
+"catmull t=1/2 y = 11/8 exactly");
+assert_eq(HVec3_z(c_cr_h), f64_neg(f64_div(F64_ONE, f64_from(8))),
+"catmull t=1/2 z = -1/8 exactly");
+
+var c_cr_q = calc_catmull_rom(c_cr_q0, c_cr_q1, c_cr_q2, c_cr_q3,
+f64_div(F64_ONE, f64_from(4)));
+assert_eq(HVec3_x(c_cr_q), f64_div(f64_from(87), f64_from(64)),
+"catmull t=1/4 x = 87/64 exactly");
+assert_eq(HVec3_y(c_cr_q), f64_div(f64_from(59), f64_from(32)),
+"catmull t=1/4 y = 59/32 exactly");
+assert_eq(HVec3_z(c_cr_q), f64_neg(f64_div(f64_from(3), f64_from(32))),
+"catmull t=1/4 z = -3/32 exactly");
+
+# Endpoint interpolation on the non-collinear fixture too -- that is the
+# property which makes this a Catmull-Rom spline rather than a Bezier.
+assert_eq(HVec3_y(calc_catmull_rom(c_cr_q0, c_cr_q1, c_cr_q2, c_cr_q3, 0)), F64_TWO,
+"catmull t=0 interpolates p1 exactly (non-collinear)");
+assert_eq(HVec3_x(calc_catmull_rom(c_cr_q0, c_cr_q1, c_cr_q2, c_cr_q3, F64_ONE)),
+f64_from(3), "catmull t=1 interpolates p2 exactly (non-collinear)");
 
 # ----------------------------------------------------------------
 test_group("calc: easing");
@@ -1454,6 +1802,92 @@ assert_eq(f64_to(christoffel_get(dg_chris, 2, 1, 0, 1)), 0, "flat Gamma^1_01=0")
 assert_eq(f64_to(christoffel_get(dg_chris, 2, 0, 1, 0)), 0, "flat Gamma^0_10=0");
 assert_eq(f64_to(christoffel_get(dg_chris, 2, 1, 1, 1)), 0, "flat Gamma^1_11=0");
 
+# ----------------------------------------------------------------
+# christoffel_symbols with a metric that actually CURVES (2.8.3)
+#
+# Both call sites in the suite (here and tests/hisab.tcyr) passed an all-zero
+# metric_deriv array. With d_k g_ij == 0 the bracket d1 + d2 - d3 is 0 for every
+# index and the whole formula at src/diffgeo.cyr:64-104 -- the lambda contraction,
+# the three derivative permutations, the sign on d3, the factor 1/2 -- collapses
+# to "return zeros". Replacing the body with `store64(out + off, 0)` kept the
+# suite green. The flat-metric assertions above are still worth keeping (a
+# Christoffel symbol that is nonzero in flat space is a real defect) but they
+# certify only that.
+
+test_group("diffgeo: curved metric");
+
+# (a) UNIT 2-SPHERE, g = diag(1, sin^2 th), coordinates (th, phi), at th = pi/3.
+# The only nonvanishing derivative is d_th g_phiphi = 2 sin th cos th = sin(2 th),
+# which at th = pi/3 is sqrt(3)/2 exactly (2 cos(pi/3) == 1). Closed forms from
+# any textbook, independent of this implementation:
+#     Gamma^th_phiphi = -sin th cos th = -sqrt(3)/4
+#     Gamma^phi_thphi =  cot th        =  1/sqrt(3)
+# and every other component is zero. This exercises g^{a lambda} with a != 0,
+# the -d3 term (Gamma^th_phiphi comes from d3 alone) and the +d1 term
+# (Gamma^phi_thphi comes from d1 alone).
+var _s2_ginv = alloc(32);
+store64(_s2_ginv, F64_ONE);                          # g^{th th} = 1
+store64(_s2_ginv + 8, 0);
+store64(_s2_ginv + 16, 0);
+store64(_s2_ginv + 24, 0x3FF5555555555555);          # g^{phi phi} = 1/sin^2(pi/3) = 4/3
+var _s2_dg = alloc(64);
+var _s2_i = 0;
+while (_s2_i < 8) { store64(_s2_dg + _s2_i * 8, 0); _s2_i = _s2_i + 1; }
+# metric_deriv[(i*dim + j)*dim + k] = d_k g_ij -> (i,j,k) = (1,1,0) is index 6
+store64(_s2_dg + 6 * 8, 0x3FEBB67AE8584CAA);         # d_th g_phiphi = sqrt(3)/2
+var _s2_ch = christoffel_symbols(_s2_ginv, _s2_dg, 2);
+assert_neq(_s2_ch, 0, "2-sphere: christoffel_symbols allocates");
+var _s2_gam011 = 0xBFDBB67AE8584CAA;                 # -sqrt(3)/4 = -0.4330127018922193
+var _s2_gam101 = 0x3FE279A74590331D;                 # 1/sqrt(3) =  0.5773502691896258
+assert_eq(christoffel_get(_s2_ch, 2, 0, 1, 1), _s2_gam011,
+"2-sphere: Gamma^th_phiphi == -sqrt(3)/4 bit-exact");
+assert_eq(f64_lt(f64_abs(f64_sub(christoffel_get(_s2_ch, 2, 1, 0, 1), _s2_gam101)),
+ULP_TOL_M), 1, "2-sphere: Gamma^phi_thphi == cot(pi/3) == 1/sqrt(3)");
+assert_eq(f64_lt(f64_abs(f64_sub(christoffel_get(_s2_ch, 2, 1, 1, 0), _s2_gam101)),
+ULP_TOL_M), 1, "2-sphere: Gamma^phi_phith == Gamma^phi_thphi (symmetric in mu,nu)");
+assert_eq(christoffel_get(_s2_ch, 2, 0, 0, 0), 0, "2-sphere: Gamma^th_thth == 0");
+assert_eq(christoffel_get(_s2_ch, 2, 0, 0, 1), 0, "2-sphere: Gamma^th_thphi == 0");
+assert_eq(christoffel_get(_s2_ch, 2, 1, 0, 0), 0, "2-sphere: Gamma^phi_thth == 0");
+assert_eq(christoffel_get(_s2_ch, 2, 1, 1, 1), 0, "2-sphere: Gamma^phi_phiphi == 0");
+
+# (b) GENERIC 2-METRIC, every input nonzero and every input DYADIC, so the whole
+# contraction stays inside binary floating point and the answer is bit-exact --
+# no tolerance, no rounding argument. g^{ij} = [[2, 1/2], [1/2, 3]] (off-diagonal
+# nonzero, so the lambda sum is live); d_k g_ij runs over 1/2, 1/4, 3/4, 1/8,
+# 5/8, 7/8 with the (i,j) symmetry a metric derivative must have. The eight
+# expected values were computed by an independent exact-rational evaluation of
+# the published formula (python3 fractions.Fraction), not by this code:
+#   Gamma^0 = [[13/16, 13/32], [13/32, -5/32]]   Gamma^1 = [[2, 1], [1, 39/32]]
+# Sign-flipping d3, dropping d3, permuting d3's indices or dropping the 1/2 each
+# change all EIGHT entries.  (Swapping d1 and d2 is a genuine no-op: the bracket
+# is symmetric under mu <-> nu, which is why Gamma is too.)
+var _gm_ginv = alloc(32);
+store64(_gm_ginv, F64_TWO);                                  # g^{00} = 2
+store64(_gm_ginv + 8, F64_HALF);                             # g^{01} = 1/2
+store64(_gm_ginv + 16, F64_HALF);                            # g^{10} = 1/2
+store64(_gm_ginv + 24, f64_from(3));                         # g^{11} = 3
+var _gm_dg = alloc(64);
+store64(_gm_dg + 0 * 8, F64_HALF);                           # d_0 g_00 = 1/2
+store64(_gm_dg + 1 * 8, 0x3FD0000000000000);                 # d_1 g_00 = 1/4
+store64(_gm_dg + 2 * 8, 0x3FE8000000000000);                 # d_0 g_01 = 3/4
+store64(_gm_dg + 3 * 8, 0x3FC0000000000000);                 # d_1 g_01 = 1/8
+store64(_gm_dg + 4 * 8, 0x3FE8000000000000);                 # d_0 g_10 = 3/4
+store64(_gm_dg + 5 * 8, 0x3FC0000000000000);                 # d_1 g_10 = 1/8
+store64(_gm_dg + 6 * 8, 0x3FE4000000000000);                 # d_0 g_11 = 5/8
+store64(_gm_dg + 7 * 8, 0x3FEC000000000000);                 # d_1 g_11 = 7/8
+var _gm_ch = christoffel_symbols(_gm_ginv, _gm_dg, 2);
+assert_neq(_gm_ch, 0, "generic metric: christoffel_symbols allocates");
+assert_eq(christoffel_get(_gm_ch, 2, 0, 0, 0), 0x3FEA000000000000, "generic: Gamma^0_00 == 13/16");
+assert_eq(christoffel_get(_gm_ch, 2, 0, 0, 1), 0x3FDA000000000000, "generic: Gamma^0_01 == 13/32");
+assert_eq(christoffel_get(_gm_ch, 2, 0, 1, 0), 0x3FDA000000000000, "generic: Gamma^0_10 == 13/32");
+assert_eq(christoffel_get(_gm_ch, 2, 0, 1, 1), 0xBFC4000000000000, "generic: Gamma^0_11 == -5/32");
+assert_eq(christoffel_get(_gm_ch, 2, 1, 0, 0), 0x4000000000000000, "generic: Gamma^1_00 == 2");
+assert_eq(christoffel_get(_gm_ch, 2, 1, 0, 1), 0x3FF0000000000000, "generic: Gamma^1_01 == 1");
+assert_eq(christoffel_get(_gm_ch, 2, 1, 1, 0), 0x3FF0000000000000, "generic: Gamma^1_10 == 1");
+assert_eq(christoffel_get(_gm_ch, 2, 1, 1, 1), 0x3FF3800000000000, "generic: Gamma^1_11 == 39/32");
+
+test_group("diffgeo: flat metric (continued)");
+
 # Riemann from flat (all zero christoffel derivs -> all zero riemann)
 var dg_chris_deriv = alloc(128);
 var _dg_j = 0;
@@ -1829,8 +2263,15 @@ var mpr_d = alloc(8);
 var mpr_hit = mpr_penetration(&_mpr_sup_sphere, mpr_a, &_mpr_sup_sphere, mpr_b_ov, mpr_n, mpr_d);
 assert_eq(mpr_hit, 1, "mpr_penetration: overlap returns hit");
 assert_eq(f64_to(f64_mul(load64(mpr_d), f64_from(100))), 100, "mpr_penetration: depth ~1.0 (4-3)");
+# 2.9.0: was assert_eq(f64_to(|nx| * 100), 100). f64_to TRUNCATES, so that read
+# "0.99 <= |nx| <= 1.00" -- and it FAILS the moment the normal is right to only
+# 15 digits instead of exact, because 0.9999999999 * 100 truncates to 99. The
+# depth is now refined to the true MTV, so the normal is a converged direction
+# rather than an exact axis; the check below is 1e-9 ABSOLUTE, i.e. seven orders
+# of magnitude tighter than the truncation it replaces.
 var mpr_nx = f64_abs(HVec3_x(load64(mpr_n)));
-assert_eq(f64_to(f64_mul(mpr_nx, f64_from(100))), 100, "mpr_penetration: normal ~±x");
+assert(f64_approx_eq(mpr_nx, F64_ONE, 0x3E112E0BE826D695),
+"mpr_penetration: normal ~±x within 1e-9");
 
 var mpr_b_deep = hvec4_new(F64_ONE, 0, 0, F64_TWO);     # dist 1 → depth 4-1 = 3
 var mpr_n2 = alloc(8);
@@ -1851,6 +2292,285 @@ assert_eq(mpr_boxov, 1, "mpr_intersect: boxes overlap");
 var mpr_box_sep = _mpr_mkbox(f64_from(5), 0, 0, F64_ONE, F64_ONE, F64_ONE);
 var mpr_boxsep = mpr_intersect(&_mpr_sup_box, mpr_box_a, &_mpr_sup_box, mpr_box_sep);
 assert_eq(mpr_boxsep, 0, "mpr_intersect: boxes separated");
+
+# ================================================================
+# 2.9.0 -- narrowphase depth against an EXACT reference
+# ================================================================
+# Every expected value below is a closed form or an exact-rational computation,
+# never a previous hisab output:
+#   box/box     -- 15-axis OBB SAT evaluated in python3 Fractions
+#   sphere/box  -- r - sdBox(centre in box frame, half-extents)
+#   sphere/sph  -- r0 + r1 - |c1 - c0|
+#   cylinder/box-- independent Nelder-Mead minimisation of the support function
+#                  h_M over the unit sphere (no closed form exists)
+#
+# What each assertion catches, measured against the pre-2.9.0 source:
+#   off-axis box/box      mpr 0.0        -> 1.61          (portal plane through
+#                                                          the INTERIOR point)
+#   MPR-is-not-MTV box    mpr 1.0-ish    -> 0.5           (textbook MPR picks the
+#                                                          wrong axis; the error
+#                                                          ratio is unbounded)
+#   separated pair        mpr hit @ 4.6  -> miss
+#   box vs sphere         gjk 2.2e-16    -> 0.8           (degenerate GJK simplex
+#                                                          reported "no contact")
+#   concentric spheres    gjk 1.8875     -> 2.0           (expansion stalled)
+#   scale 1e3             gjk 999.98922  -> 1000.0        (absolute epsilon)
+#   near tangency         gjk 4.4114e-5  -> 1e-6
+#   cylinder vs OBB       mpr 3.2801     -> 0.19769663
+var NP9_TOL = 0x3E112E0BE826D695;   # 1e-9 -- absolute, values here are O(1)
+
+# Oriented box: 15 slots [cx,cy,cz, hx,hy,hz, u0(3), u1(3), u2(3)].
+fn _mpr_sup_obb(shape, dir) {
+    var acc = hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16));
+    for (var oi = 0; oi < 3; oi = oi + 1) {
+        var u = hvec3_new(load64(shape + 48 + oi * 24), load64(shape + 56 + oi * 24),
+        load64(shape + 64 + oi * 24));
+        var hh = load64(shape + 24 + oi * 8);
+        if (f64_lt(hvec3_dot(dir, u), 0) == 1) { hh = f64_neg(hh); }
+        acc = hvec3_add(acc, hvec3_scale(u, hh));
+    }
+    return acc;
+}
+
+# z-axis cylinder: 5 slots [cx,cy,cz, radius, half_height].
+fn _mpr_sup_cyl(shape, dir) {
+    var acc = hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16));
+    var pl = f64_sqrt(f64_add(f64_mul(HVec3_x(dir), HVec3_x(dir)),
+    f64_mul(HVec3_y(dir), HVec3_y(dir))));
+    if (f64_gt(pl, 0) == 1) {
+        var sc = f64_div(load64(shape + 24), pl);
+        acc = hvec3_add(acc, hvec3_new(f64_mul(HVec3_x(dir), sc),
+        f64_mul(HVec3_y(dir), sc), 0));
+    }
+    var hz = load64(shape + 32);
+    if (f64_lt(HVec3_z(dir), 0) == 1) { hz = f64_neg(hz); }
+    return hvec3_add(acc, hvec3_new(0, 0, hz));
+}
+
+fn _mpr_mkobb(cx, cy, cz, hx, hy, hz) {
+    var s = alloc(120);
+    store64(s, cx);
+    store64(s + 8, cy);
+    store64(s + 16, cz);
+    store64(s + 24, hx);
+    store64(s + 32, hy);
+    store64(s + 40, hz);
+    for (var oi = 0; oi < 9; oi = oi + 1) { store64(s + 48 + oi * 8, 0); }
+    store64(s + 48, F64_ONE);
+    store64(s + 80, F64_ONE);
+    store64(s + 112, F64_ONE);
+    return s;
+}
+
+fn _mpr_obb_axis(s, i, x, y, z) {
+    store64(s + 48 + i * 24, x);
+    store64(s + 56 + i * 24, y);
+    store64(s + 64 + i * 24, z);
+    return 0;
+}
+
+# Depth of one narrowphase call; mode 0 = gjk_epa_3d, 1 = mpr_penetration.
+# Returns -inf on a reported miss so a miss can never pass an approx-equality.
+fn _np9_depth(fa, sa, fb, sb, mode) {
+    var nn = alloc(8);
+    var dd = alloc(8);
+    store64(dd, 0);
+    var r = gjk_epa_3d(fa, sa, fb, sb, nn, dd);
+    if (mode == 1) { r = mpr_penetration(fa, sa, fb, sb, nn, dd); }
+    if (r != 1) { return _COL_F64_NEG_INF; }
+    return load64(dd);
+}
+
+test_group("collision_core: narrowphase depth == exact MTV (2.9.0)");
+
+var np9_pn_n = alloc(8);
+var np9_pn_d = alloc(8);
+var np9_pn_n2 = alloc(8);
+var np9_pn_d2 = alloc(8);
+
+# --- off-axis box/box. Unit boxes, offset (0.3, 0, -0.39).
+# Minkowski difference = box centred (-0.3, 0, 0.39) with half-extents 2, so the
+# MTV is min(2-0.3, 2-0, 2-0.39) = 1.61 on the z axis. The shipped code reported
+# 0.0: it measured the plane through v0, the INTERIOR point.
+var np9_bb_a = _mpr_mkbox(0, 0, 0, F64_ONE, F64_ONE, F64_ONE);
+var np9_bb_b = _mpr_mkbox(f64_div(f64_from(3), f64_from(10)), 0,
+f64_neg(f64_div(f64_from(39), f64_from(100))), F64_ONE, F64_ONE, F64_ONE);
+var np9_bb_exp = f64_div(f64_from(161), f64_from(100));   # 1.61 exactly
+assert_eq(mpr_penetration(&_mpr_sup_box, np9_bb_a, &_mpr_sup_box, np9_bb_b, np9_pn_n, np9_pn_d), 1,
+"mpr_penetration: off-axis boxes report a hit");
+assert(f64_approx_eq(load64(np9_pn_d), np9_bb_exp, NP9_TOL),
+"mpr_penetration: off-axis box/box depth == 1.61 exact SAT (was 0.0)");
+assert(f64_approx_eq(f64_abs(HVec3_z(load64(np9_pn_n))), F64_ONE, NP9_TOL),
+"mpr_penetration: off-axis box/box normal is the z axis");
+assert_eq(gjk_epa_3d(&_mpr_sup_box, np9_bb_a, &_mpr_sup_box, np9_bb_b, np9_pn_n2, np9_pn_d2), 1,
+"gjk_epa_3d: off-axis boxes report a hit");
+assert(f64_approx_eq(load64(np9_pn_d2), np9_bb_exp, NP9_TOL),
+"gjk_epa_3d: off-axis box/box depth == 1.61 exact SAT");
+
+# The unit normal really is a unit vector (the old code stored a portal normal
+# built from a cross product it never renormalised on the fallback path).
+assert(f64_approx_eq(hvec3_length(load64(np9_pn_n)), F64_ONE, NP9_TOL),
+"mpr_penetration: normal is unit length");
+
+# --- MPR's OWN answer is not the MTV, and this fixture pins the difference.
+# A and B are 0.5 x 5 x 5 boxes, B offset (0.5, 9, 0). The difference is a box
+# centred (-0.5, -9, 0) with half-extents (1, 10, 10): textbook MPR leaves
+# through the axis maximising |c_i|/h_i (y: 0.9) and reports 10-9 = 1.0, while
+# the MTV is on the axis minimising h_i-|c_i| (x) and equals 0.5. Stretching the
+# y extent makes that ratio arbitrarily large, which is why the depth is refined
+# rather than read off the portal.
+var np9_mv_h = f64_div(F64_ONE, F64_TWO);
+var np9_mv_a = _mpr_mkbox(0, 0, 0, np9_mv_h, f64_from(5), f64_from(5));
+var np9_mv_b = _mpr_mkbox(np9_mv_h, f64_from(9), 0, np9_mv_h, f64_from(5), f64_from(5));
+assert_eq(mpr_penetration(&_mpr_sup_box, np9_mv_a, &_mpr_sup_box, np9_mv_b, np9_pn_n, np9_pn_d), 1,
+"mpr_penetration: anisotropic boxes report a hit");
+assert(f64_approx_eq(load64(np9_pn_d), np9_mv_h, NP9_TOL),
+"mpr_penetration: depth is the MTV 0.5, not MPR's own portal answer 1.0");
+assert(f64_approx_eq(f64_abs(HVec3_x(load64(np9_pn_n))), F64_ONE, NP9_TOL),
+"mpr_penetration: anisotropic MTV normal is the x axis, not y");
+gjk_epa_3d(&_mpr_sup_box, np9_mv_a, &_mpr_sup_box, np9_mv_b, np9_pn_n2, np9_pn_d2);
+assert(f64_approx_eq(load64(np9_pn_d2), np9_mv_h, NP9_TOL),
+"gjk_epa_3d: anisotropic box/box depth == MTV 0.5");
+
+# --- SEPARATED must be a miss. Half-extents (1,10,10) at the origin against a
+# 1e-9 box at (1.4, 0.5, 0.1): the x gap is 0.4. The shipped code returned 1
+# with depth 4.6063.
+var np9_sep_a = _mpr_mkbox(0, 0, 0, F64_ONE, f64_from(10), f64_from(10));
+var np9_sep_tiny = f64_div(F64_ONE, f64_from(1000000000));
+var np9_sep_b = _mpr_mkbox(f64_div(f64_from(14), f64_from(10)), f64_div(F64_ONE, F64_TWO),
+f64_div(F64_ONE, f64_from(10)), np9_sep_tiny, np9_sep_tiny, np9_sep_tiny);
+assert_eq(mpr_penetration(&_mpr_sup_box, np9_sep_a, &_mpr_sup_box, np9_sep_b, np9_pn_n, np9_pn_d), 0,
+"mpr_penetration: separated anisotropic pair is a miss (was hit @ 4.6063)");
+assert_eq(gjk_epa_3d(&_mpr_sup_box, np9_sep_a, &_mpr_sup_box, np9_sep_b, np9_pn_n2, np9_pn_d2), 0,
+"gjk_epa_3d: separated anisotropic pair is a miss");
+
+# --- box vs sphere, BOX FIRST. r - sdBox((1.2,0,0.7), (1,1,1)) = 1 - 0.2 = 0.8.
+# Order matters to GJK's direction sequence: this ordering produced a degenerate
+# simplex, which the shipped code answered with 2.2e-16.
+var np9_bs_box = _mpr_mkbox(0, 0, 0, F64_ONE, F64_ONE, F64_ONE);
+var np9_bs_sph = hvec4_new(f64_div(f64_from(12), f64_from(10)), 0,
+f64_div(f64_from(7), f64_from(10)), F64_ONE);
+var np9_bs_exp = f64_div(f64_from(8), f64_from(10));
+assert_eq(gjk_epa_3d(&_mpr_sup_box, np9_bs_box, &_mpr_sup_sphere, np9_bs_sph, np9_pn_n2, np9_pn_d2), 1,
+"gjk_epa_3d: box-then-sphere reports a hit");
+assert(f64_approx_eq(load64(np9_pn_d2), np9_bs_exp, NP9_TOL),
+"gjk_epa_3d: box vs sphere depth == 0.8 = r - sdBox (was 2.2e-16)");
+mpr_penetration(&_mpr_sup_box, np9_bs_box, &_mpr_sup_sphere, np9_bs_sph, np9_pn_n, np9_pn_d);
+assert(f64_approx_eq(load64(np9_pn_d), np9_bs_exp, NP9_TOL),
+"mpr_penetration: box vs sphere depth == 0.8 (was -1.3964)");
+
+# --- concentric unit spheres. Depth = r0 + r1 = 2 exactly. This is the case the
+# expansion could not converge on (1.8875 at 64 iterations, 1.9794 at 400) and
+# the case where the MPR portal degenerates onto its own v0-v1 edge (0.0).
+var np9_cc_a = hvec4_new(0, 0, 0, F64_ONE);
+var np9_cc_b = hvec4_new(0, 0, 0, F64_ONE);
+assert(f64_approx_eq(_np9_depth(&_mpr_sup_sphere, np9_cc_a, &_mpr_sup_sphere, np9_cc_b, 0),
+F64_TWO, NP9_TOL), "gjk_epa_3d: concentric unit spheres depth == 2.0 (was 1.8875)");
+assert(f64_approx_eq(_np9_depth(&_mpr_sup_sphere, np9_cc_a, &_mpr_sup_sphere, np9_cc_b, 1),
+F64_TWO, NP9_TOL), "mpr_penetration: concentric unit spheres depth == 2.0 (was 0.0)");
+
+# --- SCALE INVARIANCE. r=2 spheres 3 apart -> depth 1, the identical geometry at
+# 1e-3 / 1e3 / 1e6 -> depth 1e-3 / 1e3 / 1e6. The convergence test used to be an
+# ABSOLUTE 1e-12, so the same shape at a different scale gave a different answer
+# (1.078e-5 relative at every scale away from 1).
+for (var sk = 0; sk < 3; sk = sk + 1) {
+    var kf = F64_ONE;
+    if (sk == 0) { kf = f64_div(F64_ONE, f64_from(1000)); }
+    if (sk == 2) { kf = f64_from(1000000); }
+    if (sk == 1) { kf = f64_from(1000); }
+    var sc_a = hvec4_new(0, 0, 0, f64_mul(F64_TWO, kf));
+    var sc_b = hvec4_new(f64_mul(f64_from(3), kf), 0, 0, f64_mul(F64_TWO, kf));
+    var sc_got = _np9_depth(&_mpr_sup_sphere, sc_a, &_mpr_sup_sphere, sc_b, 0);
+    assert(f64_approx_eq(f64_div(sc_got, kf), F64_ONE, f64_div(F64_ONE, f64_from(1000000))),
+    "gjk_epa_3d: sphere depth is scale-invariant (relative, not absolute, tolerance)");
+    var sc_got2 = _np9_depth(&_mpr_sup_sphere, sc_a, &_mpr_sup_sphere, sc_b, 1);
+    assert(f64_approx_eq(f64_div(sc_got2, kf), F64_ONE, f64_div(F64_ONE, f64_from(1000000))),
+    "mpr_penetration: sphere depth is scale-invariant");
+}
+
+# --- NEAR TANGENCY. r=2 spheres 3.999999 apart -> depth 1e-6. The shipped code
+# answered 4.4114e-5, a 43x over-report, because it stopped refining direction
+# long before the depth mattered.
+var np9_tg_a = hvec4_new(0, 0, 0, F64_TWO);
+var np9_tg_b = hvec4_new(f64_sub(f64_from(4), f64_div(F64_ONE, f64_from(1000000))), 0, 0, F64_TWO);
+var np9_tg_exp = f64_div(F64_ONE, f64_from(1000000));
+var np9_tg_tol = f64_div(F64_ONE, f64_from(1000000000000));
+assert(f64_approx_eq(_np9_depth(&_mpr_sup_sphere, np9_tg_a, &_mpr_sup_sphere, np9_tg_b, 0),
+np9_tg_exp, np9_tg_tol), "gjk_epa_3d: near-tangent spheres depth == 1e-6 (was 4.4114e-5)");
+assert(f64_approx_eq(_np9_depth(&_mpr_sup_sphere, np9_tg_a, &_mpr_sup_sphere, np9_tg_b, 1),
+np9_tg_exp, np9_tg_tol), "mpr_penetration: near-tangent spheres depth == 1e-6");
+
+# --- THE MANDATORY CYLINDER vs ROTATED-BOX FIXTURE (roadmap 2.8.2).
+# A z-axis cylinder r=1.8793535667752475, half-height=1.2791168772746317 at the
+# origin against an OBB. The roadmap records this reproducer's exact depth as
+# 0.19783922047988; that number is WRONG -- it came from a coarse spherical grid
+# search. An independent Nelder-Mead minimisation of h_M over the unit sphere,
+# multi-started from a 200k-point Fibonacci lattice, converges to
+# 0.19769663486454, and hisab's own answer 0.19769663487882 is a CERTIFIED upper
+# bound on the MTV (it is h_M evaluated at a real direction), so the true value
+# cannot exceed it. Both agree to 7.2e-11 relative. The shipped mpr_penetration
+# returned 3.2801295 here.
+var np9_cy_s = alloc(40);
+store64(np9_cy_s, 0);
+store64(np9_cy_s + 8, 0);
+store64(np9_cy_s + 16, 0);
+store64(np9_cy_s + 24, 0x3FFE11D50BAEBAF1);   # radius      1.8793535667752475
+store64(np9_cy_s + 32, 0x3FF47743423A7FC0);   # half-height 1.2791168772746317
+var np9_cy_b = _mpr_mkobb(0x4005732F92CFB63E, 0xC006EB1792881994, 0xBFFF55B8C5B1A9C0,
+0x3FFE93DAB8D7F5D9, 0x3FFAE1DE4A99CE2F, 0x3FF3482F05E60E8C);
+_mpr_obb_axis(np9_cy_b, 0, 0x3FEF2D85DD7338A3, 0xBFCBFD941B69FBE9, 0x3FAB9A84DBCB55FA);
+_mpr_obb_axis(np9_cy_b, 1, 0x3FCCC1C7CD456741, 0x3FEDA7F420E83330, 0xBFD34519497EDB0B);
+_mpr_obb_axis(np9_cy_b, 2, 0x3F90423091D65D37, 0x3FD38CCD2BAACD4D, 0x3FEE775ADA949BF9);
+var np9_cy_exp = 0x3FC94E1F92A2E068;          # 0.1976966348645448
+var np9_cy_tol = f64_div(F64_ONE, f64_from(100000000));   # 1e-8 absolute
+assert_eq(mpr_penetration(&_mpr_sup_cyl, np9_cy_s, &_mpr_sup_obb, np9_cy_b, np9_pn_n, np9_pn_d), 1,
+"mpr_penetration: cylinder vs rotated OBB reports a hit");
+assert(f64_approx_eq(load64(np9_pn_d), np9_cy_exp, np9_cy_tol),
+"mpr_penetration: cylinder vs rotated OBB depth == 0.19769663 (was 3.2801295)");
+assert_eq(gjk_epa_3d(&_mpr_sup_cyl, np9_cy_s, &_mpr_sup_obb, np9_cy_b, np9_pn_n2, np9_pn_d2), 1,
+"gjk_epa_3d: cylinder vs rotated OBB reports a hit");
+assert(f64_approx_eq(load64(np9_pn_d2), np9_cy_exp, np9_cy_tol),
+"gjk_epa_3d: cylinder vs rotated OBB depth == 0.19769663");
+# The two siblings carry the same documented contract, so they must agree.
+assert(f64_approx_eq(load64(np9_pn_d), load64(np9_pn_d2), np9_cy_tol),
+"mpr_penetration and gjk_epa_3d agree on the cylinder fixture");
+
+# --- THE INVARIANT A WRONG ANSWER CANNOT SATISFY: translating B by
+# depth * normal must SEPARATE the pair. This does not compare against any
+# reference value at all -- it re-runs the overlap test on the corrected pose.
+var np9_iv_box_a = _mpr_mkbox(0, 0, 0, F64_ONE, F64_ONE, F64_ONE);
+var np9_iv_box_b = _mpr_mkbox(f64_div(f64_from(3), f64_from(10)), 0,
+f64_neg(f64_div(f64_from(39), f64_from(100))), F64_ONE, F64_ONE, F64_ONE);
+mpr_penetration(&_mpr_sup_box, np9_iv_box_a, &_mpr_sup_box, np9_iv_box_b, np9_pn_n, np9_pn_d);
+var np9_iv_push = f64_mul(load64(np9_pn_d), f64_div(f64_from(1000001), f64_from(1000000)));
+var np9_iv_nrm = load64(np9_pn_n);
+var np9_iv_moved = _mpr_mkbox(f64_add(load64(np9_iv_box_b), f64_mul(HVec3_x(np9_iv_nrm), np9_iv_push)),
+f64_add(load64(np9_iv_box_b + 8), f64_mul(HVec3_y(np9_iv_nrm), np9_iv_push)),
+f64_add(load64(np9_iv_box_b + 16), f64_mul(HVec3_z(np9_iv_nrm), np9_iv_push)),
+F64_ONE, F64_ONE, F64_ONE);
+assert_eq(mpr_intersect(&_mpr_sup_box, np9_iv_box_a, &_mpr_sup_box, np9_iv_moved), 0,
+"mpr_penetration: translating B by depth*normal separates the pair");
+# ... and translating by 1% LESS must NOT separate it, so the depth is tight and
+# not merely large enough.
+var np9_iv_short = f64_mul(load64(np9_pn_d), f64_div(f64_from(99), f64_from(100)));
+var np9_iv_near = _mpr_mkbox(f64_add(load64(np9_iv_box_b), f64_mul(HVec3_x(np9_iv_nrm), np9_iv_short)),
+f64_add(load64(np9_iv_box_b + 8), f64_mul(HVec3_y(np9_iv_nrm), np9_iv_short)),
+f64_add(load64(np9_iv_box_b + 16), f64_mul(HVec3_z(np9_iv_nrm), np9_iv_short)),
+F64_ONE, F64_ONE, F64_ONE);
+assert_eq(mpr_intersect(&_mpr_sup_box, np9_iv_box_a, &_mpr_sup_box, np9_iv_near), 1,
+"mpr_penetration: 99% of the depth does NOT separate -- the depth is tight");
+
+# --- ARENA BOUND. A narrowphase call must not scale its allocation with the
+# iteration count: the pre-2.9.0 expansion allocated a fresh 16-byte record for
+# every face on every pass and rebuilt two vecs per pass.
+var np9_ar_before = alloc_used();
+gjk_epa_3d(&_mpr_sup_cyl, np9_cy_s, &_mpr_sup_obb, np9_cy_b, np9_pn_n2, np9_pn_d2);
+var np9_ar_used = alloc_used() - np9_ar_before;
+assert_lt(np9_ar_used, 262144, "gjk_epa_3d: arena per call stays under 256 KB");
+var np9_ar_before2 = alloc_used();
+mpr_penetration(&_mpr_sup_box, np9_bb_a, &_mpr_sup_box, np9_bb_b, np9_pn_n, np9_pn_d);
+assert_lt(alloc_used() - np9_ar_before2, 262144,
+"mpr_penetration: arena per call stays under 256 KB");
 
 # sequential_impulse (2.4.5) — fixed: the normal impulse was computed with the
 # wrong sign and without folding the accumulated impulse into the effective
@@ -1886,6 +2606,56 @@ vec_push(si_cs3, si_c3);
 var si_out3 = alloc(16);
 sequential_impulse(si_cs3, 1, 5, si_out3);
 assert_eq(f64_to(load64(si_out3)), 0, "sequential_impulse: both-static skipped (λ=0)");
+
+# 2.8.3 — RESTITUTION. Every assertion above uses e = 0, where the pre-2.8.3
+# (1+e)-on-the-effective-velocity form happens to be right. For e > 0 that form
+# is the affine map λ_{k+1} = -e·λ_k + (1+e)·pen/inv_mass, which only settles
+# for |e| < 1: at e = 1 it is a period-2 orbit alternating 0 and 2·pen/inv_mass,
+# so an EVEN iteration count returned 0 — no impulse at all — and an odd one
+# returned twice the right answer. The solver's result depended on the PARITY of
+# a convergence parameter. Restitution is now a one-off bias on the target
+# velocity, so λ = (1+e)·pen/inv_mass after a single sweep for every e >= 0.
+# pen = 0.5, inv_mass = 2 → 0.375 / 0.5 / 0.75, all exact in binary.
+var sr_i = 0;
+while (sr_i < 3) {
+    var sr_e = F64_HALF;
+    var sr_want = 375;
+    if (sr_i == 1) { sr_e = F64_ONE; sr_want = 500; }
+    if (sr_i == 2) { sr_e = F64_TWO; sr_want = 750; }
+
+    var sr_c = contact_new(0, 1, hvec3_unit_y(), F64_HALF, 0, sr_e, F64_ONE, F64_ONE);
+    var sr_cs = vec_new();
+    vec_push(sr_cs, sr_c);
+    var sr_o1 = alloc(16);
+    var sr_o8 = alloc(16);
+    var sr_o9 = alloc(16);
+    sequential_impulse(sr_cs, 1, 1, sr_o1);
+    sequential_impulse(sr_cs, 1, 8, sr_o8);
+    sequential_impulse(sr_cs, 1, 9, sr_o9);
+
+    assert_eq(f64_to(f64_mul(load64(sr_o1), f64_from(1000))), sr_want,
+    "sequential_impulse: 1 sweep reaches (1+e)·pen/inv_mass");
+    assert_eq(load64(sr_o8), load64(sr_o1),
+    "sequential_impulse: 8 sweeps == 1 sweep (no period-2 orbit)");
+    assert_eq(load64(sr_o9), load64(sr_o8),
+    "sequential_impulse: 9 sweeps == 8 sweeps (parity-independent)");
+    sr_i = sr_i + 1;
+}
+
+# Restitution must MOVE the answer at an even sweep count, where the old form
+# collapsed it to exactly zero.
+var sr_a = contact_new(0, 1, hvec3_unit_y(), F64_HALF, 0, 0, F64_ONE, F64_ONE);
+var sr_b = contact_new(0, 1, hvec3_unit_y(), F64_HALF, 0, F64_ONE, F64_ONE, F64_ONE);
+var sr_va = vec_new();
+var sr_vb = vec_new();
+vec_push(sr_va, sr_a);
+vec_push(sr_vb, sr_b);
+var sr_oa = alloc(16);
+var sr_ob = alloc(16);
+sequential_impulse(sr_va, 1, 4, sr_oa);
+sequential_impulse(sr_vb, 1, 4, sr_ob);
+assert_eq(load64(sr_ob), f64_mul(F64_TWO, load64(sr_oa)),
+"sequential_impulse: e=1 doubles the e=0 impulse at an even sweep count");
 
 # convex_hull_2d (2.4.0) — Andrew's monotone chain. Square (side 2) plus an
 # interior point: the hull is the 4 corners in CCW order; the interior point
@@ -2401,6 +3171,106 @@ assert_eq(num_tridiag_solve(ne_a, ne_b, ne_cc, ne_d, 3, ne_out), HSB_ERR_NONE,
 assert_eq(f64_to(load64(ne_out)), 1, "tridiag identity x[0]=1");
 assert_eq(f64_to(load64(ne_out + 16)), 3, "tridiag identity x[2]=3");
 
+# ----------------------------------------------------------------
+# num_tridiag_solve on systems with LIVE off-diagonals (2.8.3)
+#
+# The fixture above is DIAGONAL: a and c are all zero, so c'[i] = 0 for every
+# i, the elimination denominator collapses to b[i], the d' recurrence loses its
+# a*d'[i-1] term and the back-substitution at src/num_ext.cyr:769 subtracts
+# c'[j] * x[j+1] == 0. The entire Thomas algorithm -- 60 of the function's 70
+# lines -- is multiplied by zero and the test still passes. The two systems
+# below have nonzero sub- AND super-diagonals so every one of those terms is
+# load-bearing.
+#
+# Both right-hand sides were formed as d = A x for a CHOSEN integer x (exact in
+# f64, no rounding in the input), and the solutions were re-derived independently
+# by exact-rational Gaussian elimination with partial pivoting (python3
+# fractions.Fraction), NOT by running this solver.
+
+# (a) 1-D Poisson, n = 5: sub = super = -1, diag = 2, x = (1,2,3,4,5),
+# so d = (0,0,0,0,6). Four of the five right-hand sides are ZERO -- the answer
+# is produced entirely by the elimination and the back-substitution sweep.
+var _tds_n = 5;
+var _tds_a = alloc(_tds_n * 8);
+var _tds_b = alloc(_tds_n * 8);
+var _tds_c = alloc(_tds_n * 8);
+var _tds_d = alloc(_tds_n * 8);
+var _tds_x = alloc(_tds_n * 8);
+var _tds_i = 0;
+var _tds_m1 = f64_neg(F64_ONE);
+while (_tds_i < _tds_n) {
+    store64(_tds_a + _tds_i * 8, _tds_m1);
+    store64(_tds_b + _tds_i * 8, F64_TWO);
+    store64(_tds_c + _tds_i * 8, _tds_m1);
+    store64(_tds_d + _tds_i * 8, 0);
+    _tds_i = _tds_i + 1;
+}
+store64(_tds_d + 4 * 8, f64_from(6));
+assert_eq(num_tridiag_solve(_tds_a, _tds_b, _tds_c, _tds_d, _tds_n, _tds_x), HSB_ERR_NONE,
+"tridiag poisson: solve succeeds");
+var _tds_bad = 0;
+_tds_i = 0;
+while (_tds_i < _tds_n) {
+    var _tds_want = f64_from(_tds_i + 1);
+    if (f64_lt(f64_abs(f64_sub(load64(_tds_x + _tds_i * 8), _tds_want)), TOL_1EM12) == 0) {
+        _tds_bad = _tds_bad + 1;
+    }
+    _tds_i = _tds_i + 1;
+}
+assert_eq(_tds_bad, 0, "tridiag poisson n=5: x == (1,2,3,4,5) (Thomas sweep + back-substitution)");
+
+# (b) ASYMMETRIC system, n = 4: sub = (1,2,3), diag = 9, super = (3,2,1),
+# x = (1,2,3,4) -> d = (15,25,35,45). Diagonally dominant, so Thomas without
+# pivoting is stable here. sub != super is the point: swapping the a and c
+# arguments yields (1.4583, 1.875, 1.875, 4.7917) instead, which the symmetric
+# Poisson system in (a) could never distinguish.
+var _tda_n = 4;
+var _tda_a = alloc(_tda_n * 8);
+var _tda_b = alloc(_tda_n * 8);
+var _tda_c = alloc(_tda_n * 8);
+var _tda_d = alloc(_tda_n * 8);
+var _tda_x = alloc(_tda_n * 8);
+store64(_tda_a, F64_ONE); store64(_tda_a + 8, F64_TWO); store64(_tda_a + 16, f64_from(3));
+store64(_tda_c, f64_from(3)); store64(_tda_c + 8, F64_TWO); store64(_tda_c + 16, F64_ONE);
+var _tda_i = 0;
+while (_tda_i < _tda_n) {
+    store64(_tda_b + _tda_i * 8, f64_from(9));
+    store64(_tda_d + _tda_i * 8, f64_from(15 + 10 * _tda_i));
+    _tda_i = _tda_i + 1;
+}
+assert_eq(num_tridiag_solve(_tda_a, _tda_b, _tda_c, _tda_d, _tda_n, _tda_x), HSB_ERR_NONE,
+"tridiag asymmetric: solve succeeds");
+var _tda_bad = 0;
+_tda_i = 0;
+while (_tda_i < _tda_n) {
+    var _tda_want = f64_from(_tda_i + 1);
+    if (f64_lt(f64_abs(f64_sub(load64(_tda_x + _tda_i * 8), _tda_want)), TOL_1EM12) == 0) {
+        _tda_bad = _tda_bad + 1;
+    }
+    _tda_i = _tda_i + 1;
+}
+assert_eq(_tda_bad, 0, "tridiag asymmetric n=4: x == (1,2,3,4) (sub != super)");
+
+# Residual check: A * x_computed must reproduce d. This is the invariant form of
+# the same statement -- it holds for no wrong x, and it needs no reference at all.
+var _tdr_max = 0;
+_tda_i = 0;
+while (_tda_i < _tda_n) {
+    var _tdr_row = f64_mul(load64(_tda_b + _tda_i * 8), load64(_tda_x + _tda_i * 8));
+    if (_tda_i > 0) {
+        _tdr_row = f64_add(_tdr_row, f64_mul(load64(_tda_a + (_tda_i - 1) * 8),
+        load64(_tda_x + (_tda_i - 1) * 8)));
+    }
+    if (_tda_i < _tda_n - 1) {
+        _tdr_row = f64_add(_tdr_row, f64_mul(load64(_tda_c + _tda_i * 8),
+        load64(_tda_x + (_tda_i + 1) * 8)));
+    }
+    var _tdr_r = f64_abs(f64_sub(_tdr_row, load64(_tda_d + _tda_i * 8)));
+    if (f64_gt(_tdr_r, _tdr_max) == 1) { _tdr_max = _tdr_r; }
+    _tda_i = _tda_i + 1;
+}
+assert_eq(f64_lt(_tdr_max, TOL_1EM12), 1, "tridiag asymmetric: residual |A x - d| < 1e-12");
+
 test_group("symbolic_ext: integration, LaTeX, pattern matching");
 # d/dx of the integral must recover the integrand (up to simplification):
 # integral of x is x^2/2, whose derivative evaluated at x=3 is 3.
@@ -2596,6 +3466,80 @@ assert_eq(calc_nurbs(3, ce_cps, ce_cps, 3, ce_kn, 7, f64_from(3)), 0,
 "calc_nurbs: n_pts <= degree -> 0");
 assert_eq(calc_bspline(0 - 1, ce_cps, 3, ce_kn, 3, F64_ONE), 0,
 "calc_bspline: negative degree -> 0");
+
+# ------------------------------------------------------------------
+test_group("calc_ext: calc_monotone_cubic is actually monotone (2.8.3)");
+# The function had NO assertions of any kind before 2.8.3, and it was not
+# monotone: Fritsch-Carlson has TWO parts and only the alpha^2 + beta^2 <= 9
+# circle was implemented. The circle test squares its arguments, so it is blind
+# to a tangent that points against its own secant — precisely what the averaged
+# tangent does at a local extremum, where it inherits the sign of the larger
+# neighbouring secant. Measured against exact-rational extrema of the Hermite
+# cubic on 60,000 random data sets containing an extremum: 58.6% left their own
+# [y_k, y_k+1] box, by up to 57.6.
+#
+# xs = 0,1,2,3   ys = 0,10,1,0 — one interior maximum. Secants +10, -9, -1;
+# averaged tangent at x=1 is +0.5 while the secant of [1,2] is -9, giving
+# alpha = -0.056 and alpha^2 + beta^2 = 0.31, comfortably inside the circle.
+# The resulting cubic on [1,2] is 13.5t^3 - 23t^2 + 0.5t + 10, which climbs
+# above the peak it is supposed to interpolate. With the sign condition the
+# tangent is clamped to 0 and the cubic is 13t^3 - 22t^2 + 10, monotone.
+var mc_x = _f64arr_alloc(4);
+var mc_y = _f64arr_alloc(4);
+_f64arr_set(mc_x, 0, 0);
+_f64arr_set(mc_x, 1, F64_ONE);
+_f64arr_set(mc_x, 2, F64_TWO);
+_f64arr_set(mc_x, 3, f64_from(3));
+_f64arr_set(mc_y, 0, 0);
+_f64arr_set(mc_y, 1, f64_from(10));
+_f64arr_set(mc_y, 2, F64_ONE);
+_f64arr_set(mc_y, 3, 0);
+assert_eq(f64_gt(calc_monotone_cubic(mc_x, mc_y, 4,
+f64_add(F64_ONE, f64_div(F64_ONE, f64_from(64)))), f64_from(10)), 0,
+"monotone_cubic: the sample just past the peak does not exceed the peak");
+assert_eq(f64_gt(_mc_box_violation(mc_x, mc_y, 4, 256), TOL_1EM12), 0,
+"monotone_cubic: no interval leaves its own [y_k, y_k+1] box");
+assert_eq(f64_gt(_mc_backstep(mc_x, mc_y, 4, 1, 256), TOL_1EM12), 0,
+"monotone_cubic: the descending interval never turns back upwards");
+
+# The mirror case: a local MINIMUM must not undershoot the trough.
+var mc_nx = _f64arr_alloc(4);
+var mc_ny = _f64arr_alloc(4);
+_f64arr_set(mc_nx, 0, 0);
+_f64arr_set(mc_nx, 1, F64_ONE);
+_f64arr_set(mc_nx, 2, F64_TWO);
+_f64arr_set(mc_nx, 3, f64_from(3));
+_f64arr_set(mc_ny, 0, f64_from(10));
+_f64arr_set(mc_ny, 1, 0);
+_f64arr_set(mc_ny, 2, f64_from(9));
+_f64arr_set(mc_ny, 3, f64_from(10));
+assert_eq(f64_gt(_mc_box_violation(mc_nx, mc_ny, 4, 256), TOL_1EM12), 0,
+"monotone_cubic: local minimum -- no undershoot below the trough");
+
+# NO REGRESSION on strictly monotone data, which is the class the function was
+# already right about: all secants share a sign there, so alpha and beta are
+# positive and the sign condition is a no-op. Verified bit-identical tangents on
+# 60,000 strictly monotone sets; these two values are the pre-2.8.3 output.
+var mc_sx = _f64arr_alloc(4);
+var mc_sy = _f64arr_alloc(4);
+_f64arr_set(mc_sx, 0, 0);
+_f64arr_set(mc_sx, 1, F64_ONE);
+_f64arr_set(mc_sx, 2, f64_from(3));
+_f64arr_set(mc_sx, 3, f64_from(6));
+_f64arr_set(mc_sy, 0, 0);
+_f64arr_set(mc_sy, 1, F64_ONE);
+_f64arr_set(mc_sy, 2, f64_from(5));
+_f64arr_set(mc_sy, 3, f64_from(6));
+assert_eq(calc_monotone_cubic(mc_sx, mc_sy, 4, F64_HALF), 0x3FDC000000000000,
+"monotone_cubic: strictly monotone f(0.5) bit-identical to 2.8.2");
+assert_eq(calc_monotone_cubic(mc_sx, mc_sy, 4, F64_TWO), 0x400913B322151FAB,
+"monotone_cubic: strictly monotone f(2.0) bit-identical to 2.8.2");
+assert_eq(f64_gt(_mc_box_violation(mc_sx, mc_sy, 4, 256), TOL_1EM12), 0,
+"monotone_cubic: strictly monotone stays inside every box");
+assert_eq(calc_monotone_cubic(mc_sx, mc_sy, 4, f64_from(7)), 0,
+"monotone_cubic: query past the last knot -> 0");
+assert_eq(calc_monotone_cubic(mc_sx, mc_sy, 1, 0), 0,
+"monotone_cubic: n < 2 -> 0");
 
 test_group("calc_ext / calc / noise_simplex: fBm normalisation is guarded");
 # All four fBm entry points divided by an amplitude accumulator that is still
@@ -2868,6 +3812,134 @@ assert_eq(time_of_impact(&_mpr_sup_sphere, toi_a, toi_still,
 &_mpr_sup_sphere, toi_over, toi_left, f64_from(10), toi_t, toi_n), 1,
 "already overlapping -> hit");
 assert_eq(load64(toi_t), 0, "overlap at t = 0 reports t = 0");
+assert_neq(load64(toi_n), 0, "overlap at t = 0 writes a non-null contact normal");
+
+# ------------------------------------------------------------------
+# 2.8.3 — TOI vs the EXACT swept-sphere root, in the regimes a sampler
+# cannot survive.
+#
+# Through 2.8.2 the loop walked t from 0 to max_t in _GA_TOI_MAX_STEPS equal
+# steps and asked a BOOLEAN overlap test at each. A boolean says nothing about
+# how far apart the shapes are, so the step could only come from the horizon,
+# never from the geometry — and the overlap window in t is ~2R/|v_rel| wide.
+# Small shapes, fast shapes or a long horizon all shrink the window below the
+# step and the collision is tunnelled through in silence. Measured against the
+# exact quadratic root, on the reverted source with the seeds below: 120/120
+# missed in the tiny+fast regime, 40/40 at a 1e6-unit horizon, 37/40 on 1e-6
+# geometry, 22/120 grazing — and in the uniform regime, where it does find the
+# hit, 95/101 impact times were quantised LATE by up to a whole step.
+#
+# Conservative advancement measures the DISTANCE and steps by distance / closing
+# speed, which provably cannot reach contact, so it never steps over the window.
+# The references below are closed forms; none of them reads geo_advanced.cyr.
+test_group("time_of_impact: exact swept-sphere root, four regimes");
+
+var TOI_TOL6 = 0x3EB0C6F7A0B5ED8D;  # 1e-6
+var TOI_TOL3 = 0x3F50624DD2F1A9FC;  # 1e-3
+
+# (a) uniform — radii 0.2..2, |v| 0.5..4, horizon 10.
+_DLR_STATE = 0x2026_0805_0000_0001;
+var toiu = _toi_tally();
+for (var tu = 0; tu < 101; tu = tu + 1) {
+    var tu_cb = hvec3_new(_toi_frac(0 - 80, 80, 10), _toi_frac(0 - 80, 80, 10),
+    _toi_frac(0 - 80, 80, 10));
+    var tu_d = hvec3_length(tu_cb);
+    var tu_v = hvec3_zero();
+    if (f64_gt(tu_d, F64_ONE) == 1) {
+        tu_v = hvec3_scale(tu_cb, f64_neg(f64_div(_toi_frac(5, 40, 10), tu_d)));
+    }
+    _toi_score(toiu, _toi_frac(2, 20, 10), tu_cb, _toi_frac(2, 20, 10), tu_v,
+    f64_from(10), TOI_TOL6);
+}
+assert_eq(load64(toiu), 101, "toi/uniform: 101 pairs scored");
+assert_gt(load64(toiu + 8), 40, "toi/uniform: a real share of them collide");
+assert_eq(load64(toiu + 16), 0, "toi/uniform: zero false negatives");
+assert_eq(load64(toiu + 24), 0, "toi/uniform: zero false positives");
+assert_eq(load64(toiu + 32), 0, "toi/uniform: no impact time reported LATE (was 95/101)");
+assert_eq(load64(toiu + 40), 0, "toi/uniform: none early, no null normal");
+
+# (b) tiny + fast — radii 0.01..0.05, |v| 20..200, horizon 100. The overlap
+# window is ~1e-3 in t; the old step was 100/256 = 0.39.
+_DLR_STATE = 0x2026_0805_0000_0002;
+var toif = _toi_tally();
+for (var tf = 0; tf < 120; tf = tf + 1) {
+    var tf_cb = hvec3_new(_toi_frac(0 - 500, 500, 10), _toi_frac(0 - 500, 500, 10),
+    _toi_frac(0 - 500, 500, 10));
+    var tf_d = hvec3_length(tf_cb);
+    var tf_v = hvec3_zero();
+    if (f64_gt(tf_d, F64_ONE) == 1) {
+        tf_v = hvec3_scale(tf_cb, f64_neg(f64_div(_toi_frac(200, 2000, 10), tf_d)));
+    }
+    _toi_score(toif, _toi_frac(1, 5, 100), tf_cb, _toi_frac(1, 5, 100), tf_v,
+    f64_from(100), TOI_TOL6);
+}
+assert_eq(load64(toif), 120, "toi/tiny+fast: 120 pairs scored");
+assert_gt(load64(toif + 8), 60, "toi/tiny+fast: most of them collide");
+assert_eq(load64(toif + 16), 0, "toi/tiny+fast: zero false negatives (was 120/120)");
+assert_eq(load64(toif + 24), 0, "toi/tiny+fast: zero false positives");
+assert_eq(load64(toif + 32), 0, "toi/tiny+fast: no impact time LATE");
+
+# (c) grazing — impact parameter swept through ra + rb = 2, so half just touch
+# and half just miss: the class a sampler is least likely to land inside.
+_DLR_STATE = 0x2026_0805_0000_0003;
+var toig = _toi_tally();
+for (var tg = 0; tg < 120; tg = tg + 1) {
+    _toi_score(toig, F64_ONE,
+    hvec3_new(f64_from(0 - 20), _toi_frac(1900, 2100, 1000), 0), F64_ONE,
+    hvec3_new(_toi_frac(10, 50, 10), 0, 0), f64_from(100), TOI_TOL3);
+}
+assert_eq(load64(toig), 120, "toi/grazing: 120 pairs scored");
+assert_gt(load64(toig + 8), 30, "toi/grazing: some genuinely collide");
+assert_eq(load64(toig + 16), 0, "toi/grazing: zero false negatives (was 22/120)");
+assert_eq(load64(toig + 32), 0, "toi/grazing: no impact time LATE");
+
+# (d) scale — 1e6 units away with a 1e7 horizon, and 1e-6 geometry. The old
+# step was 1e7/256 = 39,000 world units in the first and 0.039 in the second;
+# both are astronomically larger than the contact window.
+_DLR_STATE = 0x2026_0805_0000_0004;
+var toib = _toi_tally();
+for (var tb = 0; tb < 40; tb = tb + 1) {
+    _toi_score(toib, F64_ONE, hvec3_new(_toi_frac(10000, 1000000, 1), 0, 0), F64_ONE,
+    hvec3_new(f64_neg(_toi_frac(10, 100, 10)), 0, 0), f64_from(10000000), TOI_TOL3);
+}
+var toim = _toi_tally();
+var toi_mu = f64_div(F64_ONE, f64_from(1000000));
+for (var tm = 0; tm < 40; tm = tm + 1) {
+    var tm_cb = hvec3_new(f64_mul(_toi_frac(0 - 80, 80, 10), toi_mu),
+    f64_mul(_toi_frac(0 - 80, 80, 10), toi_mu),
+    f64_mul(_toi_frac(0 - 80, 80, 10), toi_mu));
+    var tm_d = hvec3_length(tm_cb);
+    var tm_v = hvec3_zero();
+    if (f64_gt(tm_d, f64_mul(toi_mu, F64_HALF)) == 1) {
+        tm_v = hvec3_scale(tm_cb,
+        f64_neg(f64_div(f64_mul(_toi_frac(5, 40, 10), toi_mu), tm_d)));
+    }
+    _toi_score(toim, toi_mu, tm_cb, toi_mu, tm_v, f64_from(10), LOOSE_TOL_M);
+}
+assert_gt(load64(toib + 8), 30, "toi/1e6-horizon: the cases really collide");
+assert_eq(load64(toib + 16), 0, "toi/1e6-horizon: zero false negatives (was 40/40)");
+assert_eq(load64(toib + 24), 0, "toi/1e6-horizon: zero false positives");
+assert_gt(load64(toim + 8), 30, "toi/1e-6-geometry: the cases really collide");
+assert_eq(load64(toim + 16), 0, "toi/1e-6-geometry: zero false negatives (was 37/40)");
+assert_eq(load64(toim + 24), 0, "toi/1e-6-geometry: zero false positives");
+
+# (e) receding pairs must be CERTIFIED misses, not "no sample found one": the
+# closing speed along the direction of closest approach is <= 0, which is a
+# proof for all t, and the branch the old sampler had no way to express.
+_DLR_STATE = 0x2026_0805_0000_0005;
+var toir = _toi_tally();
+for (var tr = 0; tr < 60; tr = tr + 1) {
+    var tr_cb = hvec3_new(_toi_frac(0 - 80, 80, 10), _toi_frac(0 - 80, 80, 10),
+    _toi_frac(0 - 80, 80, 10));
+    var tr_d = hvec3_length(tr_cb);
+    var tr_v = hvec3_zero();
+    if (f64_gt(tr_d, F64_ONE) == 1) {
+        tr_v = hvec3_scale(tr_cb, f64_div(_toi_frac(5, 40, 10), tr_d));
+    }
+    _toi_score(toir, F64_ONE, tr_cb, F64_ONE, tr_v, f64_from(1000), TOI_TOL6);
+}
+assert_eq(load64(toir + 24), 0, "toi/receding: zero false positives");
+assert_eq(load64(toir + 16), 0, "toi/receding: zero false negatives");
 
 # ================================================================
 # 2.7.0-C -- medium correctness & safety findings.
@@ -3456,7 +4528,33 @@ assert(f64_lt(f64_abs(f64_sub(hvec3_length(l3_log), F64_PI_2)), LOOSE_TOL_M) == 
 var l3_q = so3_from_quat(su2_from_axis_angle(l3_ax, F64_PI_2));
 assert(f64_lt(f64_abs(f64_sub(m3_get(l3_q, 0, 0), m3_get(l3_R, 0, 0))), LOOSE_TOL_M) == 1,
 "so3_from_quat agrees with so3_from_axis_angle");
-assert_neq(so3_from_mat3(l3_R), 0, "so3_from_mat3 accepts a rotation matrix");
+# so3_from_mat3's doc block claimed "checks determinant ~ +1 and orthogonality"
+# and the body did NEITHER -- it was a bare m3_copy, and `!= 0` is the one
+# assertion m3_copy cannot fail for any input whatsoever. Both checks are
+# implemented as of 2.8.x; the rejections below are the real coverage, and the
+# acceptances are the regression guard on the tolerance.
+var l3_ok = so3_from_mat3(l3_R);
+assert_neq(l3_ok, 0, "so3_from_mat3 accepts a rotation matrix");
+assert_eq(m3_get(l3_ok, 0, 1), m3_get(l3_R, 0, 1), "so3_from_mat3 copies the matrix through");
+# A reflection is ORTHOGONAL with det = -1. This is the case the determinant
+# test exists for: so3_inverse is a bare transpose, which is a true inverse for
+# a reflection too, so nothing downstream would ever notice.
+var l3_ref = m3_identity();
+m3_set(l3_ref, 2, 2, f64_neg(F64_ONE));
+assert_eq(so3_from_mat3(l3_ref), 0, "so3_from_mat3 rejects a reflection (det = -1)");
+# A shear has det = +1 EXACTLY and is not orthogonal, so only the R^T R test
+# can see it -- the determinant check alone would pass it.
+var l3_sh = m3_identity();
+m3_set(l3_sh, 1, 0, F64_ONE);
+assert_eq(so3_from_mat3(l3_sh), 0, "so3_from_mat3 rejects a unit-determinant shear");
+# A uniformly scaled rotation fails both tests (R^T R = 4I, det = 8).
+assert_eq(so3_from_mat3(m3_scale(l3_R, F64_TWO)), 0, "so3_from_mat3 rejects 2R");
+assert_eq(so3_from_mat3(0), 0, "so3_from_mat3 rejects null");
+# The tolerance must not be tighter than the arithmetic: a rotation that has
+# been through a long compose chain is still a rotation.
+var l3_chain = l3_R;
+for (var l3_k = 0; l3_k < 64; l3_k = l3_k + 1) { l3_chain = so3_compose(l3_chain, l3_R); }
+assert_neq(so3_from_mat3(l3_chain), 0, "so3_from_mat3 accepts a 65-fold composed rotation");
 
 # --- SE(3): identity, compose, inverse, and the point action.
 var se_id = se3_identity();
@@ -3479,7 +4577,63 @@ LOOSE_TOL_M) == 1, "se3_identity fixes every point");
 assert_neq(se3_to_mat4(se_g), 0, "se3_to_mat4 produces a Mat4");
 assert_neq(se3_from_mat4(se3_to_mat4(se_g)), 0, "se3_from_mat4 round-trips");
 # Both adjoints act ON something -- Ad_g(xi), not Ad(g).
-assert_neq(se3_adjoint(se_g, hvec3_unit_x()), 0, "se3_adjoint acts on a twist");
+#
+# This assertion used to read `se3_adjoint(se_g, hvec3_unit_x()) != 0`. An
+# HVec3 is 24 bytes and a twist is 48, so _twist_v read offsets 24/32/40 past
+# the end of the allocation -- and a non-null check cannot see that, because
+# alloc() never returns 0 on success. Build the twist with se3_twist_new, added
+# in 2.8.x precisely because there was no exported way to build one at all.
+#
+# Closed form, from the textbook Ad_{(R,t)} = [[R, 0], [[t]_x R, R]]:
+# g = (rotation of pi/2 about z, t = (1,2,3)) and xi = [omega = e_x, v = e_y]
+# give R omega = e_y, R v = -e_x, t x (R omega) = (-3, 0, 1), hence
+# Ad_g(xi) = [ (0, 1, 0), (-4, 0, 1) ].
+var se_xi = se3_twist_new(hvec3_unit_x(), hvec3_unit_y());
+var se_ad = se3_adjoint(se_g, se_xi);
+assert_neq(se_ad, 0, "se3_adjoint acts on a twist");
+var se_ad_w = se3_twist_omega(se_ad);
+var se_ad_v = se3_twist_v(se_ad);
+assert(f64_lt(f64_abs(HVec3_x(se_ad_w)), LOOSE_TOL_M) == 1, "se3_adjoint: Ad omega_x = 0");
+assert(f64_lt(f64_abs(f64_sub(HVec3_y(se_ad_w), F64_ONE)), LOOSE_TOL_M) == 1,
+"se3_adjoint: Ad omega_y = 1");
+assert(f64_lt(f64_abs(HVec3_z(se_ad_w)), LOOSE_TOL_M) == 1, "se3_adjoint: Ad omega_z = 0");
+assert(f64_lt(f64_abs(f64_add(HVec3_x(se_ad_v), f64_from(4))), LOOSE_TOL_M) == 1,
+"se3_adjoint: Ad v_x = -4 (the [t]_x R omega term)");
+assert(f64_lt(f64_abs(HVec3_y(se_ad_v)), LOOSE_TOL_M) == 1, "se3_adjoint: Ad v_y = 0");
+assert(f64_lt(f64_abs(f64_sub(HVec3_z(se_ad_v), F64_ONE)), LOOSE_TOL_M) == 1,
+"se3_adjoint: Ad v_z = 1");
+
+# The DEFINING identity: exp(Ad_g xi) == g exp(xi) g^-1. It couples the adjoint
+# to se3_exp / se3_compose / se3_inverse, so an internally tidy but wrong
+# adjoint -- R^T where R belongs, or the [t]_x term attached to the angular
+# half -- cannot satisfy it. Compared by the action on four points.
+var se_lhs = se3_exp(se_ad);
+var se_rhs = se3_compose(se3_compose(se_g, se3_exp(se_xi)), se3_inverse(se_g));
+assert_eq(_se_same(se_lhs, se_rhs), 1, "se3: exp(Ad_g xi) == g exp(xi) g^-1");
+
+# Ad is linear in the twist: Ad_g(2 xi) == 2 Ad_g(xi) on all six components.
+var se_xi2 = se3_twist_new(hvec3_scale(hvec3_unit_x(), F64_TWO),
+hvec3_scale(hvec3_unit_y(), F64_TWO));
+var se_ad2 = se3_adjoint(se_g, se_xi2);
+var se_lin = 0;
+for (var se_i = 0; se_i < 6; se_i = se_i + 1) {
+    if (f64_lt(f64_abs(f64_sub(_vec6_get(se_ad2, se_i),
+    f64_mul(F64_TWO, _vec6_get(se_ad, se_i)))), LOOSE_TOL_M) == 0) {
+        se_lin = se_lin + 1;
+    }
+}
+assert_eq(se_lin, 0, "se3_adjoint is linear in the twist (all 6 components)");
+
+# Null guards. A pointer carries no length in Cyrius, so these are the only
+# validations se3_adjoint can perform -- the 48-vs-24 byte mistake is closed by
+# se3_twist_new being the way you build a twist, not by a check in here.
+assert_eq(se3_adjoint(0, se_xi), 0, "se3_adjoint rejects a null group element");
+assert_eq(se3_adjoint(se_g, 0), 0, "se3_adjoint rejects a null twist");
+assert_eq(se3_twist_new(0, hvec3_unit_x()), 0, "se3_twist_new rejects a null omega");
+assert_eq(se3_twist_new(hvec3_unit_x(), 0), 0, "se3_twist_new rejects a null v");
+assert_eq(se3_twist_omega(0), 0, "se3_twist_omega rejects null");
+assert_eq(se3_twist_v(0), 0, "se3_twist_v rejects null");
+
 assert_neq(su2_adjoint(su2_identity(), hvec3_unit_x()), 0, "su2_adjoint acts on a vector");
 
 # --- BCH: for commuting arguments it is just the sum.
@@ -3598,10 +4752,92 @@ var c9_ja = alloc(32);
 calc_jacobian(&_c9_g, c9_x, 2, 2, c9_h, c9_ja);
 assert(f64_lt(f64_abs(f64_sub(load64(c9_ja), F64_TWO)), f64_div(F64_ONE, f64_from(1000))) == 1,
 "jacobian [0][0] = 2");
-# Adaptive Simpson on x^2 over [0,1] is 1/3.
-var c9_as = calc_adaptive_simpson(&_c9_x2, 0, F64_ONE, EPSILON_F64);
+
+# --- calc_hessian: the mixed-partial block (2.8.x) -------------------------
+# The Hessian assertion above pins ONE diagonal entry of 2I on a separable
+# integrand. The off-diagonal 4-point cross stencil in calc_ext.cyr was covered
+# by nothing at all: for x^2 + y^2 the true mixed partial is zero, so every
+# sign arrangement of the four terms -- and deleting the block entirely --
+# reproduces it.
+#
+# f(x, y) = x^2*y + y^3 at (3, 4). Exact derivatives fxx = 2y = 8,
+# fyy = 6y = 24, fxy = 2x = 6. The integrand is a cubic and both stencils are
+# exact through total degree 3, so the computed values are the true ones
+# bit-for-bit -- verified in exact rationals (python3 fractions) AND by
+# replaying the implementation's own operation order in IEEE-754, which returns
+# 8.0 / 24.0 / 6.0 with zero error. These are equalities, not tolerances.
+#
+# Asserted at TWO step sizes because h = 1/2 makes 4h^2 exactly 1, which would
+# hide any mutation of the inv_4h2 divisor; at h = 1 the divisor is 4.
+var hx_x = alloc(16);
+store64(hx_x, f64_from(3)); store64(hx_x + 8, f64_from(4));
+var hx_he = alloc(32);
+assert_eq(calc_hessian(&_hx_f, hx_x, 2, F64_HALF, hx_he), HSB_ERR_NONE,
+"calc_hessian returns HSB_ERR_NONE");
+assert_eq(load64(hx_he), f64_from(8), "hessian x^2y+y^3 h=1/2: H[0][0] = 2y = 8 exactly");
+assert_eq(load64(hx_he + 24), f64_from(24), "hessian x^2y+y^3 h=1/2: H[1][1] = 6y = 24 exactly");
+assert_eq(load64(hx_he + 8), f64_from(6), "hessian x^2y+y^3 h=1/2: H[0][1] = 2x = 6 exactly");
+assert_eq(load64(hx_he + 16), load64(hx_he + 8), "hessian: H[1][0] == H[0][1] (stored symmetric)");
+
+var hx_he1 = alloc(32);
+calc_hessian(&_hx_f, hx_x, 2, F64_ONE, hx_he1);
+assert_eq(load64(hx_he1), f64_from(8), "hessian x^2y+y^3 h=1: H[0][0] = 8 exactly");
+assert_eq(load64(hx_he1 + 24), f64_from(24), "hessian x^2y+y^3 h=1: H[1][1] = 24 exactly");
+assert_eq(load64(hx_he1 + 8), f64_from(6), "hessian x^2y+y^3 h=1: H[0][1] = 6 exactly (4h^2 = 4)");
+
+# --- calc_adaptive_simpson: the refinement machinery (2.8.x) ---------------
+# x^2 is retained but it is NOT coverage. Simpson integrates any cubic exactly,
+# so `refined - whole` is zero at the FIRST tolerance test and
+# _adaptive_simpson_rec accepts without ever recursing. The evaluation counter
+# says so out loud: 5 calls -- the three initial panel points plus the two
+# sub-midpoints of the single accepted bisection, and no descent below it.
+_as_calls = 0;
+var c9_as = calc_adaptive_simpson(&_as_x2, 0, F64_ONE, EPSILON_F64);
 assert(f64_lt(f64_abs(f64_sub(c9_as, 0x3FD5555555555555)), LOOSE_TOL_M) == 1,
 "adaptive Simpson of x^2 over [0,1] = 1/3");
+assert_eq(_as_calls, 5, "adaptive Simpson never recurses on x^2 (5 evaluations, no descent)");
+
+# x^4 over [0,1] = 1/5. The single panel gives 5/24 = 0.208333..., off by
+# 8.3e-3, so landing within 1e-14 is only reachable by actually refining.
+_as_calls = 0;
+var as_x4 = calc_adaptive_simpson(&_as_x4, 0, F64_ONE, EPSILON_F64);
+assert(f64_lt(f64_abs(f64_sub(as_x4, f64_div(F64_ONE, f64_from(5)))), TOL_1EM14) == 1,
+"adaptive Simpson of x^4 over [0,1] = 1/5 (one panel is 8.3e-3 wrong)");
+assert(_as_calls > 100, "adaptive Simpson does refine on x^4 (>100 evaluations)");
+
+# Additivity. A refinement that loses or double-counts a sub-panel can still
+# land near the right total; it cannot also stay consistent across a split.
+var as_lo = calc_adaptive_simpson(&_as_x4, 0, F64_HALF, EPSILON_F64);
+var as_hi = calc_adaptive_simpson(&_as_x4, F64_HALF, F64_ONE, EPSILON_F64);
+assert(f64_lt(f64_abs(f64_sub(as_x4, f64_add(as_lo, as_hi))), TOL_1EM14) == 1,
+"adaptive Simpson is additive across a split interval");
+
+# sqrt over [0,1] = 2/3. The derivative blows up at 0, so the error is
+# concentrated in one corner: composite Simpson on a UNIFORM grid of the ~1000
+# points used here is still ~6e-5 off. Reaching 1e-11 requires the subdivision
+# to be non-uniform, which is the entire point of the algorithm and was
+# unexercised until 2.8.x.
+_as_calls = 0;
+var as_sq = calc_adaptive_simpson(&_as_sqrt, 0, F64_ONE, f64_div(F64_ONE, f64_from(10000000000)));
+assert(f64_lt(f64_abs(f64_sub(as_sq, f64_div(F64_TWO, f64_from(3)))),
+f64_div(F64_ONE, f64_from(100000000000))) == 1,
+"adaptive Simpson of sqrt over [0,1] = 2/3 (needs non-uniform refinement)");
+assert(_as_calls < 4000, "adaptive Simpson reaches 1e-11 on sqrt in under 4000 evaluations");
+
+# 1/(1+x) over [0,1] = ln 2. Not a polynomial anywhere, so no panel at any level
+# is ever exact and every recursion level contributes to the answer.
+var as_ln = calc_adaptive_simpson(&_as_recip, 0, F64_ONE, EPSILON_F64);
+assert(f64_lt(f64_abs(f64_sub(as_ln, f64_ln(F64_TWO))), TOL_1EM14) == 1,
+"adaptive Simpson of 1/(1+x) over [0,1] = ln 2");
+
+# A Lorentzian with 99% of its mass in 10% of the domain. One panel returns
+# 0.6702 against a true 0.1471 -- 355% error -- and only adaptivity recovers it.
+var as_pk = calc_adaptive_simpson(&_as_peak, 0, F64_ONE,
+f64_div(F64_ONE, f64_from(100000000000)));
+var as_pk_want = f64_mul(f64_div(F64_ONE, f64_from(10)), f64_atan2(f64_from(10), F64_ONE));
+assert(f64_lt(f64_abs(f64_sub(as_pk, as_pk_want)), f64_div(F64_ONE, f64_from(100000000000))) == 1,
+"adaptive Simpson resolves a narrow peak: (1/10) atan(10)");
+
 # 3D noise is bounded and deterministic.
 var c9_p = perlin_3d(F64_HALF, F64_HALF, F64_HALF);
 assert(f64_lt(f64_abs(c9_p), F64_ONE) == 1, "perlin_3d stays inside [-1,1]");
@@ -3899,6 +5135,1162 @@ assert_eq(vec_len(dls_t) / 3, 70, "thin-strip-1e6: 70 triangles (10x gave 1)");
 assert_eq(_dl_used(40, dls_t), 40, "thin-strip-1e6: every input point used (10x dropped 37)");
 assert_eq(_dl_max_edge_share(dls_t), 2, "thin-strip-1e6: manifold");
 assert_eq(_dl_violations(dls_p, 40, dls_t), 0, "thin-strip-1e6: empty-circumcircle");
+
+test_group("delaunay_2d: emitted winding is counter-clockwise");
+
+# delaunay_2d normalises every emitted triangle to CCW at compaction time and
+# nothing verified it. Every other assertion in this file is orientation-blind:
+# _dl_area2_abs takes |signed area| specifically so a folded triangle cannot
+# cancel, _dl_tiles_hull is built on it, and edge-share count, point usage and
+# the empty-circumcircle test are all invariant under a vertex swap. Deleting
+# or inverting the swap therefore changed nothing the suite could see -- and
+# consumers (halfedge_from_triangles, and anything computing a face normal from
+# the vertex order) depend on it.
+#
+# Strictly positive signed area, over every delaunay fixture in this file: the
+# regular grid, the cocircular circle-60, the two irregular hand fixtures, and
+# all four ghost-vertex classes including the 1e-20 cluster and the 1e6 strip.
+# Strict, not >= 0 -- a zero-area triangle has no winding and would be a defect
+# in its own right.
+assert_eq(_dl_non_ccw(dl_sq, dl_sqt), 0, "winding: square+interior all CCW");
+assert_eq(_dl_non_ccw(dl_g, dl_gt), 0, "winding: 3x3 grid all CCW (cocircular)");
+assert_eq(_dl_non_ccw(dl_i, dl_it), 0, "winding: irregular-6 all CCW");
+assert_eq(_dl_non_ccw(dcc, dcc_t), 0, "winding: cocircular circle-60 all CCW");
+assert_eq(_dl_non_ccw(dlu_p, dlu_t), 0, "winding: uniform-20 all CCW");
+assert_eq(_dl_non_ccw(dlb_p, dlb_t), 0, "winding: uniform-160 all CCW");
+assert_eq(_dl_non_ccw(dlc_p, dlc_t), 0, "winding: cluster-1e-20 all CCW");
+assert_eq(_dl_non_ccw(dls_p, dls_t), 0, "winding: thin-strip-1e6 all CCW");
+
+# The eight assertions above pin the CONTRACT, but on all eight of those inputs
+# the swap never fires: the ghost-vertex Bowyer-Watson orients its cavity
+# boundaries counter-clockwise by construction, exactly as the comment in
+# collision_mesh.cyr claims, so the emitted triangles are already CCW and
+# deleting the swap changes nothing they can see.
+#
+# It is NOT dead code, though. Sweeping 432 point sets -- six generators
+# (uniform, clustered, thin-strip, lattice-snapped, cocircular, duplicated) x
+# four spans (1, 1e-20, 1e16, 1e-4) x three aspect ratios (1, 1e-6, 5.7e6) --
+# with the swap disabled, 430 still came back all-CCW and exactly two did not,
+# both in the lattice-snapped extreme-aspect class. That class is reproduced
+# here: 16 points on a 6x6 lattice, x = i/6, y = (j/6) * 1e-6, with (1,1)
+# duplicated, so the input is simultaneously degenerate (repeated point,
+# collinear rows) and aspect-1e6. This is the fixture that makes the
+# normalisation load-bearing rather than decorative.
+var dlw_ij = alloc(128);
+store64(dlw_ij, 101); store64(dlw_ij + 8, 303);
+store64(dlw_ij + 16, 305); store64(dlw_ij + 24, 505);
+store64(dlw_ij + 32, 0); store64(dlw_ij + 40, 404);
+store64(dlw_ij + 48, 504); store64(dlw_ij + 56, 300);
+store64(dlw_ij + 64, 1); store64(dlw_ij + 72, 101);
+store64(dlw_ij + 80, 302); store64(dlw_ij + 88, 202);
+store64(dlw_ij + 96, 3); store64(dlw_ij + 104, 104);
+store64(dlw_ij + 112, 403); store64(dlw_ij + 120, 304);
+var dlw_p = vec_new();
+for (var dlw_i = 0; dlw_i < 16; dlw_i = dlw_i + 1) {
+    var dlw_c = load64(dlw_ij + dlw_i * 8);
+    vec_push(dlw_p, hvec2_new(f64_div(f64_from(dlw_c / 100), f64_from(6)),
+    f64_mul(0x3EB0C6F7A0B5ED8D, f64_div(f64_from(dlw_c % 100), f64_from(6)))));
+}
+var dlw_t = delaunay_2d(dlw_p, 16);
+assert(vec_len(dlw_t) > 0, "winding: the lattice-strip fixture produces triangles at all");
+assert_eq(_dl_non_ccw(dlw_p, dlw_t), 0,
+"winding: lattice-snapped 1e6 strip all CCW (the class that REACHES the swap)");
+
+# The harness itself must be able to fail, or the assertions above are just
+# ways of counting an empty set. Feed it the same triangles with two vertices
+# of each transposed: every one must now read as non-CCW.
+var dlw_flip = vec_new();
+for (var dlw_k = 0; dlw_k < vec_len(dlu_t); dlw_k = dlw_k + 3) {
+    vec_push(dlw_flip, vec_get(dlu_t, dlw_k + 1));
+    vec_push(dlw_flip, vec_get(dlu_t, dlw_k));
+    vec_push(dlw_flip, vec_get(dlu_t, dlw_k + 2));
+}
+assert_eq(_dl_non_ccw(dlu_p, dlw_flip), vec_len(dlu_t) / 3,
+"winding: the CCW harness flags all 32 triangles when they are transposed");
+
+# ================================================================
+# gjk_epa_3d — EPA narrowphase (2.8.3)
+# ================================================================
+#
+# Before 2.8.3 gjk_epa_3d had ZERO assertions in all four suites: neither the
+# O(k²) blow-up nor a 40x-wrong depth would have been caught by anything. The
+# fixtures below are the two the 2026-08-04 audit and the rejected flood-fill
+# repair turned on, and each reference value was computed independently of
+# hisab — never by running the code being tested.
+test_group("geo_advanced: gjk_epa_3d (EPA narrowphase)");
+
+# --- Fixture 1: cylinder vs rotated box (the rejected repair's counter-example)
+# A flood-fill visibility scan returns a depth 40.7x too small here. The
+# reference depth is the distance from the origin to the boundary of the
+# Minkowski difference K = A ⊖ B, i.e. min over unit d of
+#   h_K(d) = r·√(dx²+dy²) + hz·|dz| − ⟨d,c⟩ + Σ hᵢ·|⟨d,uᵢ⟩|
+# minimised EXACTLY: the four planes dz = 0 and ⟨d,uᵢ⟩ = 0 cut the sphere into
+# cells, h_K is r·ρ(d) + ⟨w,d⟩ inside each one (closed-form minimum), and the
+# cell boundaries are four great circles (1-D minimisation) meeting at twelve
+# vertices. Enumerating all three families is complete → 0.19769663486454536.
+# The audit quotes 0.19783922047988 for this fixture; that is a grid minimum,
+# 7.2e-4 relative HIGH — both bounds are asserted below, so either reading
+# rejects the flood-fill answer.
+var epa_cyl = _ga_mkcyl(0, 0, 0,
+0x3FFE11D50BAEBAF1,   # 1.8793535667752475
+0x3FF47743423A7FC0);  # 1.2791168772746317
+var epa_box = _ga_mkobb(
+0x4005732F92CFB63E,   # 2.681243082965721
+0xC006EB1792881994,   # -2.8647910545143507
+0xBFFF55B8C5B1A9C0,   # -1.9584281656667457
+0x3FFE93DAB8D7F5D9,   # 1.911097261472028
+0x3FFAE1DE4A99CE2F,   # 1.6801436342328875
+0x3FF3482F05E60E8C,   # 1.20512296966709
+0xBFC3C6C421B492C3,   # -0.15450336118478533
+0xBF83D78D1A18CF7C,   # -0.009688474997439071
+0xBFBCE8D2315CE899,   # -0.11292756753110424
+0x3FEF68328B0A8894);  # 0.9814694133422273
+var epa_n = alloc(8);
+var epa_d = alloc(8);
+_ga_sup_calls = 0;
+var epa_arena0 = alloc_used();
+var epa_hit = gjk_epa_3d(&_ga_sup_cyl, epa_cyl, &_ga_sup_obb, epa_box, epa_n, epa_d);
+var epa_arena = alloc_used() - epa_arena0;
+assert_eq(epa_hit, 1, "gjk_epa_3d: cylinder vs rotated box penetrates");
+assert(f64_approx_eq(load64(epa_d), 0x3FC94E1F92A2E07C, 0x3EB0C6F7A0B5ED8D),
+"gjk_epa_3d: cyl/box depth == 0.1976966349 ± 1e-6 (flood fill gave 0.00486)");
+assert(f64_approx_eq(load64(epa_d), 0x3FC952CBAAE9E248, 0x3F2A36E2EB1C432D),
+"gjk_epa_3d: cyl/box depth == 0.19783922047988 ± 2e-4 (the audit's own figure)");
+var epa_nlen = hvec3_length(load64(epa_n));
+assert(f64_approx_eq(epa_nlen, F64_ONE, TOL_1EM12), "gjk_epa_3d: returned normal is unit");
+
+# --- The O(k²) gate. The polytope's face planes used to be recomputed for
+# EVERY face on EVERY iteration, each recompute alloc()ing five blocks from an
+# arena that never frees — so arena grew with the SQUARE of the iteration count
+# (8,576 face evaluations and 1,474,416 bytes for this one call). Cached face
+# records make it linear: 82,968 bytes, and the plane is computed once per face
+# created. EPA issues exactly one Minkowski support query per iteration, so
+# bytes-per-support-call is the scale-free form of that claim: it was 10,531
+# and is now 593. This assertion FAILS against the pre-2.8.3 source, and stays
+# valid if EPA_MAX_ITER is ever raised — which is the whole point of testing
+# the ratio rather than the total.
+assert_lt(epa_arena / _ga_sup_calls, 2000,
+"gjk_epa_3d: arena per EPA iteration is O(1), not O(faces) (was 10,531 B)");
+
+# Two identical calls must agree bit-for-bit: the face records are built per
+# call, so a leaked pointer or a stale cache between calls would show up here.
+var epa_n2 = alloc(8);
+var epa_d2 = alloc(8);
+gjk_epa_3d(&_ga_sup_cyl, epa_cyl, &_ga_sup_obb, epa_box, epa_n2, epa_d2);
+assert_eq(load64(epa_d2), load64(epa_d), "gjk_epa_3d: repeated call is bit-identical (depth)");
+assert_eq(HVec3_x(load64(epa_n2)), HVec3_x(load64(epa_n)),
+"gjk_epa_3d: repeated call is bit-identical (normal.x)");
+
+# --- Fixture 2: two spheres, where the depth has a closed form.
+# r_a + r_b − |c_a − c_b| = 2.433 + 2.041 − 2.0780998532313117.
+var epa_sa = hvec4_new(0, 0, 0, 0x400376C8B4395810);            # r = 2.433
+var epa_sb = hvec4_new(0xBFF68B4395810625,                      # -1.409
+0x3FF85E353F7CED91,                                             # 1.523
+0x3FBDF3B645A1CAC1,                                             # 0.117
+0x400053F7CED91687);                                            # r = 2.041
+var epa_n3 = alloc(8);
+var epa_d3 = alloc(8);
+var epa_hit3 = gjk_epa_3d(&_ga_sup_sphere, epa_sa, &_ga_sup_sphere, epa_sb, epa_n3, epa_d3);
+assert_eq(epa_hit3, 1, "gjk_epa_3d: overlapping spheres penetrate");
+assert(f64_approx_eq(load64(epa_d3), 0x40032ACDB236D32F, 0x3EE4F8B588E368F1),
+"gjk_epa_3d: sphere/sphere depth == 2.3959001468 ± 1e-5 (closed form)");
+
+# --- Fixture 3: the closest-face TIE-BREAK, which is load-bearing.
+# The scan keeps the first face with a STRICTLY smaller distance, and the face
+# list is in creation order, so ties resolve to the lowest creation index.
+# Relaxing that to ">= wins" (keep the LAST minimum) changes 6,042 of 50,000
+# random narrowphase results, 383 of them by more than 0.1% — this fixture is
+# one of them: it drops from 0.7379589527 to 0.3718195100. Reference computed
+# by the same exact cell/great-circle enumeration as fixture 1:
+# 0.737958952740702, which the shipped answer matches to 1.1e-11.
+var epa_cyl2 = _ga_mkcyl(0, 0, 0,
+0x4001666666666666,   # 2.175
+0x3FF1A5E353F7CED9);  # 1.103
+var epa_box2 = _ga_mkobb(
+0x40067CED916872B0,   # 2.811
+0xC005916872B020C5,   # -2.696
+0xBFE353F7CED91687,   # -0.604
+0x3FE29FBE76C8B439,   # 0.582
+0x40036872B020C49C,   # 2.426
+0x3FF58D4FDF3B645A,   # 1.347
+0x3FEA9F35A31B555D,   # 0.8319347558669211
+0xBF82EE5F07E5ED0F,   # -0.009243719509632457
+0x3FE1BF7917678E3E,   # 0.5546231705779474
+0x3F8C658E8BD8E397);  # 0.013865579264448686
+var epa_n5 = alloc(8);
+var epa_d5 = alloc(8);
+assert_eq(gjk_epa_3d(&_ga_sup_cyl, epa_cyl2, &_ga_sup_obb, epa_box2, epa_n5, epa_d5), 1,
+"gjk_epa_3d: tie-break fixture penetrates");
+assert(f64_approx_eq(load64(epa_d5), 0x3FE79D5C17F9F9A6, 0x3EB0C6F7A0B5ED8D),
+"gjk_epa_3d: cyl/box depth == 0.7379589527 ± 1e-6 (last-minimum tie-break gives 0.372)");
+
+# Separated shapes: no penetration, and the miss must not be reported as a hit.
+var epa_far = hvec4_new(0x4024000000000000, 0, 0, F64_ONE);     # centre x=10, r=1
+var epa_n4 = alloc(8);
+var epa_d4 = alloc(8);
+assert_eq(gjk_epa_3d(&_ga_sup_sphere, epa_sa, &_ga_sup_sphere, epa_far, epa_n4, epa_d4), 0,
+"gjk_epa_3d: separated spheres do not penetrate");
+# 2.8.3 memory safety — the guards, and the answers they must not change
+# ================================================================
+#
+# Every assertion in this block was written against the UNFIXED source first.
+# The ones marked "(SIGSEGV)" killed the process with exit 139 rather than
+# printing a FAIL line; the num_halton base-0 case raised SIGFPE and base 1
+# never returned; the spatial-hash 1e6 case did not terminate in 120 s.
+
+test_group("2.8.3: tensor_add / tensor_scale / tensor_contract null + shape guards");
+
+# tensor_new and einsum both document a 0 return on failure. Storing through it
+# is a null dereference (SIGSEGV).
+var ms_sh22 = alloc(16); store64(ms_sh22, 2); store64(ms_sh22 + 8, 2);
+var ms_sh21 = alloc(16); store64(ms_sh21, 2); store64(ms_sh21 + 8, 1);
+var ms_a = tensor_new(2, ms_sh22);
+var ms_b = tensor_new(2, ms_sh21);
+tensor_set2(ms_a, 0, 0, F64_ONE); tensor_set2(ms_a, 0, 1, F64_TWO);
+tensor_set2(ms_a, 1, 0, f64_from(3)); tensor_set2(ms_a, 1, 1, f64_from(4));
+assert_eq(tensor_add(0, ms_a), 0, "tensor_add(0, t) -> 0 (SIGSEGV)");
+assert_eq(tensor_add(ms_a, 0), 0, "tensor_add(t, 0) -> 0 (SIGSEGV)");
+# 2x2 + 2x1 walked 4 elements of a 2-element buffer and returned adjacent heap.
+assert_eq(tensor_add(ms_a, ms_b), 0, "tensor_add: shape mismatch -> 0 (was an over-read)");
+assert_eq(tensor_scale(0, F64_TWO), 0, "tensor_scale(0, s) -> 0 (SIGSEGV)");
+assert_eq(tensor_contract(0, 0, 1), 0, "tensor_contract(0, ..) -> 0 (SIGSEGV)");
+# Same total, different shape: rank alone would let this through.
+var ms_sh26 = alloc(16); store64(ms_sh26, 2); store64(ms_sh26 + 8, 6);
+var ms_sh34 = alloc(16); store64(ms_sh34, 3); store64(ms_sh34 + 8, 4);
+assert_eq(tensor_add(tensor_new(2, ms_sh26), tensor_new(2, ms_sh34)), 0,
+"tensor_add: 2x6 + 3x4 (equal totals) -> 0");
+# The valid path is untouched: 1+3 = 4 and 2+4 = 6 on identical shapes.
+var ms_sum = tensor_add(ms_a, ms_a);
+assert_eq(f64_to(tensor_get2(ms_sum, 1, 0)), 6, "tensor_add: identical shapes still add");
+
+test_group("2.8.3: tensor_contract validates idx_i / idx_j against the rank");
+
+# Every one of these was a raw load64/store64 at `shape + idx*8` and
+# `full_idx + idx*8` with no bound of any kind.
+assert_eq(tensor_contract(ms_a, 0 - 1, 1), 0, "contract: idx_i = -1 -> 0 (read/write before shape)");
+assert_eq(tensor_contract(ms_a, 0, 0 - 1), 0, "contract: idx_j = -1 -> 0");
+assert_eq(tensor_contract(ms_a, 0, 5), 0, "contract: idx_j >= rank -> 0");
+assert_eq(tensor_contract(ms_a, 7, 1), 0, "contract: idx_i >= rank -> 0");
+assert_eq(tensor_contract(ms_a, 1, 1), 0, "contract: idx_i == idx_j -> 0 (not a trace)");
+var ms_r1 = alloc(8); store64(ms_r1, 3);
+assert_eq(tensor_contract(tensor_new(1, ms_r1), 0, 0), 0, "contract: rank 1 -> 0");
+# Extents must match or the k loop overruns one of the two axes.
+var ms_sh23 = alloc(16); store64(ms_sh23, 2); store64(ms_sh23 + 8, 3);
+assert_eq(tensor_contract(tensor_new(2, ms_sh23), 0, 1), 0,
+"contract: mismatched extents (2 vs 3) -> 0");
+
+# ...and the arithmetic is unchanged. Rank-4 shape (2,3,2,3), entry = flat+1.
+# Reference computed exactly in Python over the integers:
+#   contract(0,2) -> 3x3 = [[23,25,27],[35,37,39],[47,49,51]]
+#   contract(1,3) -> 2x2 = [[24,33],[78,87]]
+var ms_sh4 = alloc(32);
+store64(ms_sh4, 2); store64(ms_sh4 + 8, 3); store64(ms_sh4 + 16, 2); store64(ms_sh4 + 24, 3);
+var ms_t4 = tensor_new(4, ms_sh4);
+var ms_fi = 0;
+while (ms_fi < 36) {
+    store64(HTensor_data(ms_t4) + ms_fi * 8, f64_from(ms_fi + 1));
+    ms_fi = ms_fi + 1;
+}
+var ms_c02 = tensor_contract(ms_t4, 0, 2);
+assert_eq(HTensor_rank(ms_c02), 2, "contract(0,2): rank 4 -> 2");
+assert_eq(f64_to(tensor_get2(ms_c02, 0, 0)), 23, "contract(0,2)[0][0] = 23");
+assert_eq(f64_to(tensor_get2(ms_c02, 0, 2)), 27, "contract(0,2)[0][2] = 27");
+assert_eq(f64_to(tensor_get2(ms_c02, 2, 0)), 47, "contract(0,2)[2][0] = 47");
+assert_eq(f64_to(tensor_get2(ms_c02, 2, 2)), 51, "contract(0,2)[2][2] = 51");
+var ms_c13 = tensor_contract(ms_t4, 1, 3);
+assert_eq(f64_to(tensor_get2(ms_c13, 0, 0)), 24, "contract(1,3)[0][0] = 24");
+assert_eq(f64_to(tensor_get2(ms_c13, 0, 1)), 33, "contract(1,3)[0][1] = 33");
+assert_eq(f64_to(tensor_get2(ms_c13, 1, 0)), 78, "contract(1,3)[1][0] = 78");
+assert_eq(f64_to(tensor_get2(ms_c13, 1, 1)), 87, "contract(1,3)[1][1] = 87");
+# Axis order must not matter for a trace.
+var ms_c20 = tensor_contract(ms_t4, 2, 0);
+assert_eq(f64_to(tensor_get2(ms_c20, 1, 1)), 37, "contract(2,0) == contract(0,2)");
+
+test_group("2.8.3: cmat_* null guards (the four the 2.7.0-B family missed)");
+
+# No cap breach is needed to reach any of these: cmat_mul's own conformability
+# guard hands back the 0.
+var ms_23 = cmat_new(2, 3);
+var ms_22 = cmat_new(2, 2);
+assert_eq(cmat_mul(ms_23, ms_22), 0, "cmat_mul(2x3, 2x2) -> 0 (non-conformable)");
+assert_eq(cmat_exp(cmat_mul(ms_23, ms_22)), 0, "cmat_exp(that 0) -> 0 (SIGSEGV)");
+# Non-square. This one did NOT crash before: the Frobenius loop over-read the
+# last element of a 3x2 and the Taylor loop then cascaded to 0 through
+# cmat_mul's own guard, so the return value is unchanged and only the over-read
+# and the wasted work are gone. Kept as a contract assertion, not a repro.
+assert_eq(cmat_exp(cmat_new(3, 2)), 0, "cmat_exp(3x2) -> 0 (non-square)");
+assert_eq(cmat_exp(ms_23), 0, "cmat_exp(2x3) -> 0 (non-square)");
+assert_eq(cmat_mul_vec(0, alloc(32)), 0, "cmat_mul_vec(0, v) -> 0 (SIGSEGV)");
+assert_eq(cmat_mul_vec(ms_22, 0), 0, "cmat_mul_vec(m, 0) -> 0 (SIGSEGV)");
+assert_eq(cmat_kronecker(0, ms_22), 0, "cmat_kronecker(0, b) -> 0 (SIGSEGV)");
+assert_eq(cmat_kronecker(ms_22, 0), 0, "cmat_kronecker(a, 0) -> 0 (SIGSEGV)");
+assert_eq(cmat_inverse(0), 0, "cmat_inverse(0) -> 0 (SIGSEGV)");
+# exp(0) = I on a square input is unchanged.
+var ms_e = cmat_exp(cmat_new(2, 2));
+assert_neq(ms_e, 0, "cmat_exp(2x2 zero) still returns a matrix");
+assert_eq(f64_to(HComplex_re(cmat_get(ms_e, 0, 0))), 1, "cmat_exp(0) = I: [0][0] = 1");
+assert_eq(f64_to(HComplex_re(cmat_get(ms_e, 0, 1))), 0, "cmat_exp(0) = I: [0][1] = 0");
+
+test_group("2.8.3: calc_partial_derivative bounds BOTH ends of index");
+
+# index = -1 was one out-of-bounds READ of x and two out-of-bounds WRITES, one
+# into each of the freshly bumped x_plus / x_minus blocks.
+var ms_x = alloc(16);
+store64(ms_x, f64_from(3)); store64(ms_x + 8, f64_from(4));
+var ms_h = F64_HALF;
+assert_eq(calc_partial_derivative(&_c9_f, ms_x, 2, 0 - 1, ms_h), 0, "index = -1 -> 0");
+assert_eq(calc_partial_derivative(&_c9_f, ms_x, 2, 0 - 4096, ms_h), 0, "index = -4096 -> 0");
+assert_eq(calc_partial_derivative(&_c9_f, ms_x, 2, 2, ms_h), 0, "index == n -> 0 (already held)");
+assert_eq(calc_partial_derivative(&_c9_f, ms_x, 0, 0, ms_h), 0, "n = 0 -> 0 (already held)");
+assert_eq(calc_partial_derivative(&_c9_f, ms_x, 0 - 3, 0, ms_h), 0, "n = -3 -> 0 (already held)");
+# n <= 0 only reached the old `index >= n` guard when index was >= n as well.
+# n = -3 with index = -5 slips past it into alloc(-24) plus two wild stores.
+assert_eq(calc_partial_derivative(&_c9_f, ms_x, 0 - 3, 0 - 5, ms_h), 0,
+"n = -3, index = -5 -> 0 (SIGSEGV)");
+# Closed form, exact in binary: for f = x0^2 + x1^2 the central difference is
+# ((3+h)^2 - (3-h)^2) / 2h = 12h / 2h = 6 for ANY h, and h = 0.5 keeps every
+# intermediate exactly representable.
+assert_eq(calc_partial_derivative(&_c9_f, ms_x, 2, 0, ms_h), f64_from(6),
+"valid index: d/dx0 = 6 exactly");
+assert_eq(calc_partial_derivative(&_c9_f, ms_x, 2, 1, ms_h), f64_from(8),
+"valid index: d/dx1 = 8 exactly");
+
+test_group("2.8.3: num_halton rejects bases below 2");
+
+# base 0 divided by zero (SIGFPE, process dead); base 1 made i / base == i, so
+# the loop never advanced and the call never returned.
+assert_eq(num_halton(7, 0), 0, "base 0 -> 0.0 (was SIGFPE)");
+assert_eq(num_halton(7, 1), 0, "base 1 -> 0.0 (was an infinite loop)");
+assert_eq(num_halton(7, 0 - 2), 0, "base -2 -> 0.0 (left the documented range)");
+# Van der Corput base 2 is exact in binary: 1/2, 1/4, 3/4, 1/8, 5/8, 3/8, 7/8.
+assert_eq(num_halton(1, 2), F64_HALF, "halton(1,2) = 0.5");
+assert_eq(num_halton(2, 2), f64_div(F64_ONE, f64_from(4)), "halton(2,2) = 0.25");
+assert_eq(num_halton(3, 2), f64_div(f64_from(3), f64_from(4)), "halton(3,2) = 0.75");
+assert_eq(num_halton(5, 2), f64_div(f64_from(5), f64_from(8)), "halton(5,2) = 0.625");
+assert_eq(num_halton(7, 2), f64_div(f64_from(7), f64_from(8)), "halton(7,2) = 0.875");
+# Base 3 is not exact in binary, but index 1 is a single term: 1 * (1/3).
+assert_eq(num_halton(1, 3), f64_div(F64_ONE, f64_from(3)), "halton(1,3) = 1/3");
+
+test_group("2.8.3: spatial_hash_query_radius is bounded by the grid, not the radius");
+
+# 300 points on a unit grid at (k + 0.5) so the cell index is exact. Every count
+# below is an exact integer computed in Python over the cell indices --
+# #{p : max(|px-qx|, |py-qy|, |pz-qz|) <= ceil(radius)} -- not read off this
+# implementation. r <= 4 takes the per-cell block walk, r >= 5 takes the
+# bucket walk, so both branches and the crossover are pinned.
+var ms_sh = spatial_hash_new(F64_ONE);
+var ms_n = 0;
+while (ms_n < 300) {
+    var ms_ix = _m3_next();
+    var ms_iy = _m3_next();
+    var ms_iz = _m3_next();
+    spatial_hash_insert(ms_sh, hvec3_new(_m3_cc(ms_ix), _m3_cc(ms_iy), _m3_cc(ms_iz)), ms_n);
+    ms_n = ms_n + 1;
+}
+assert_eq(_m3_shq(ms_sh, 0, 0, 0, 2), 4, "q(0,0,0) r=2 -> 4");
+assert_eq(_m3_shq(ms_sh, 0, 0, 0, 4), 18, "q(0,0,0) r=4 -> 18 (per-cell path)");
+assert_eq(_m3_shq(ms_sh, 0, 0, 0, 5), 37, "q(0,0,0) r=5 -> 37 (bucket-walk path)");
+assert_eq(_m3_shq(ms_sh, 0, 0, 0, 6), 65, "q(0,0,0) r=6 -> 65");
+assert_eq(_m3_shq(ms_sh, 0, 0, 0, 8), 155, "q(0,0,0) r=8 -> 155");
+assert_eq(_m3_shq(ms_sh, 0, 0, 0, 12), 300, "q(0,0,0) r=12 -> all 300");
+assert_eq(_m3_shq(ms_sh, 7, 0 - 7, 3, 3), 8, "q(7,-7,3) r=3 -> 8");
+assert_eq(_m3_shq(ms_sh, 7, 0 - 7, 3, 4), 16, "q(7,-7,3) r=4 -> 16 (per-cell path)");
+assert_eq(_m3_shq(ms_sh, 7, 0 - 7, 3, 5), 24, "q(7,-7,3) r=5 -> 24 (bucket-walk path)");
+assert_eq(_m3_shq(ms_sh, 7, 0 - 7, 3, 8), 70, "q(7,-7,3) r=8 -> 70");
+assert_eq(_m3_shq(ms_sh, 7, 0 - 7, 3, 12), 159, "q(7,-7,3) r=12 -> 159");
+# 1e6 / 1.0 asked for (2e6+1)^3 = 8e18 cell probes: no answer in 120 s.
+assert_eq(_m3_shq(ms_sh, 0, 0, 0, 1000000), 300, "q(0,0,0) r=1e6 -> 300 (was 8e18 probes)");
+assert_eq(_m3_shq(ms_sh, 0, 0, 0, 0 - 5), 0, "negative radius -> empty");
+# Coincident cluster: 50 in cell (3,3,3), 1 in (9,9,9) at Chebyshev distance 6.
+var ms_sh2 = spatial_hash_new(F64_ONE);
+var ms_c = 0;
+while (ms_c < 50) {
+    spatial_hash_insert(ms_sh2, hvec3_new(_m3_cc(3), _m3_cc(3), _m3_cc(3)), ms_c);
+    ms_c = ms_c + 1;
+}
+spatial_hash_insert(ms_sh2, hvec3_new(_m3_cc(9), _m3_cc(9), _m3_cc(9)), 999);
+assert_eq(_m3_shq(ms_sh2, 3, 3, 3, 0), 50, "cluster r=0 -> 50");
+assert_eq(_m3_shq(ms_sh2, 3, 3, 3, 5), 50, "cluster r=5 -> 50 (bucket walk still filters)");
+assert_eq(_m3_shq(ms_sh2, 3, 3, 3, 6), 51, "cluster r=6 -> 51");
+assert_eq(_m3_shq(ms_sh2, 3, 3, 3, 1000000), 51, "cluster r=1e6 -> 51");
+assert_eq(vec_len(spatial_hash_query_radius(ms_sh2,
+hvec3_new(_m3_cc(3), _m3_cc(3), _m3_cc(3)), _SP_F64_POS_INF)), 51,
+"+Inf radius -> every entry (range test dropped, not the loop)");
+# 2.8.3 -- api-consistency repairs.
+# Every assertion below fails against the 2.8.2 source.
+# ================================================================
+
+test_group("bvh_query_ray: a t = 0 hit is a hit, not a pruned subtree");
+
+# geo_ray_aabb returns the hit parameter t and uses 0 as its miss sentinel, so
+# "miss" and "hit at t = 0" were the same value and the walker's `== 0` prune
+# threw away the node AND ITS WHOLE SUBTREE. Two unit boxes sharing the plane
+# x = 1; truth for every ray below is computed by hand and cross-checked against
+# an exact python3 Fraction slab reference over 1680 queries (42 scenes).
+var br_arr = alloc(16);
+store64(br_arr, geo_aabb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_ONE, F64_ONE)));
+store64(br_arr + 8, geo_aabb_new(hvec3_new(F64_ONE, 0, 0),
+hvec3_new(F64_TWO, F64_ONE, F64_ONE)));
+var br_tree = bvh_build(br_arr, 2);
+var br_dirx = hvec3_new(F64_ONE, 0, 0);
+
+# Origin ON the shared face: enters box 1 at t = 0, grazes box 0's far face at
+# t = 0 as well. Both are hits; the old walker reported neither.
+var br_face = geo_ray_new(hvec3_new(F64_ONE, F64_HALF, F64_HALF), br_dirx);
+assert_eq(vec_len(bvh_query_ray(br_tree, br_face)), 2,
+"ray from the shared face reports both boxes (was 0)");
+
+# Origin at the scene's minimum corner: t = 0 at the ROOT, so the old walker
+# pruned the entire tree in one test.
+var br_min = geo_ray_new(hvec3_new(0, F64_HALF, F64_HALF), br_dirx);
+assert_eq(vec_len(bvh_query_ray(br_tree, br_min)), 2,
+"ray from the scene minimum corner reports both boxes (was 0)");
+
+# Strictly interior origin: t_min < 0 < t_max, so this ALREADY worked. It is the
+# regression guard -- the widened predicate must not have changed it.
+var br_in = geo_ray_new(hvec3_new(F64_HALF, F64_HALF, F64_HALF), br_dirx);
+assert_eq(vec_len(bvh_query_ray(br_tree, br_in)), 2, "interior origin still reports both");
+
+# Pruning must still prune: a ray behind the scene pointing away hits nothing,
+# and a parallel ray outside the slab hits nothing.
+var br_away = geo_ray_new(hvec3_new(f64_from(10), F64_HALF, F64_HALF), br_dirx);
+assert_eq(vec_len(bvh_query_ray(br_tree, br_away)), 0, "ray past the scene, pointing away -> 0");
+var br_miss = geo_ray_new(hvec3_new(0, f64_from(5), F64_HALF), br_dirx);
+assert_eq(vec_len(bvh_query_ray(br_tree, br_miss)), 0, "parallel ray outside the y slab -> 0");
+
+# A zero-size AABB sitting exactly on the ray: t_min == t_max == 0 at that leaf.
+var br_pt = alloc(8);
+var br_p = hvec3_new(F64_TWO, 0, 0);
+store64(br_pt, geo_aabb_new(br_p, br_p));
+var br_ptree = bvh_build(br_pt, 1);
+assert_eq(vec_len(bvh_query_ray(br_ptree, geo_ray_new(hvec3_zero(), br_dirx))), 1,
+"degenerate point AABB on the ray is found (was 0)");
+
+test_group("gjk_epa_3d: agrees with gjk_intersect_3d, always writes its out-params");
+
+# Two zero-height boxes overlapping in the z = 0 plane. The Minkowski difference
+# contains the origin but has no volume, so EPA has no polytope to expand: the
+# old code returned 0 ("not penetrating"), contradicting its own sibling, and
+# wrote NEITHER out-param. The right answer is depth exactly 0 with a unit
+# normal of the set's affine hull -- here exactly +/-z, a closed form.
+var ep_n = alloc(8);
+var ep_d = alloc(8);
+var ep_fa = _mpr_mkbox(0, 0, 0, F64_ONE, F64_ONE, 0);
+var ep_fb = _mpr_mkbox(F64_HALF, F64_HALF, 0, F64_ONE, F64_ONE, 0);
+assert_eq(gjk_intersect_3d(&_mpr_sup_box, ep_fa, &_mpr_sup_box, ep_fb), 1,
+"coplanar flat boxes: gjk_intersect says overlapping");
+assert_eq(gjk_epa_3d(&_mpr_sup_box, ep_fa, &_mpr_sup_box, ep_fb, ep_n, ep_d), 1,
+"coplanar flat boxes: gjk_epa agrees (was 0)");
+assert_eq(load64(ep_d), 0, "coplanar flat boxes: depth is exactly 0");
+assert_neq(load64(ep_n), 0, "coplanar flat boxes: normal is not the NULL HVec3");
+assert_eq(_ac_len_sq_e9(ep_n), 1000000000, "coplanar flat boxes: normal is a unit vector");
+assert_eq(_ac_comp_e9(ep_n, 0), 0, "coplanar flat boxes: normal has no x component");
+assert_eq(_ac_comp_e9(ep_n, 1), 0, "coplanar flat boxes: normal has no y component");
+
+# Two zero-thickness segments crossing at the origin: hull is a planar
+# parallelogram, so again +/-z with depth 0.
+var ep_sa = _mpr_mkbox(0, 0, 0, F64_ONE, 0, 0);
+var ep_sb = _mpr_mkbox(0, 0, 0, 0, F64_ONE, 0);
+assert_eq(gjk_intersect_3d(&_mpr_sup_box, ep_sa, &_mpr_sup_box, ep_sb), 1,
+"crossing segments: gjk_intersect says overlapping");
+assert_eq(gjk_epa_3d(&_mpr_sup_box, ep_sa, &_mpr_sup_box, ep_sb, ep_n, ep_d), 1,
+"crossing segments: gjk_epa agrees (was 0)");
+assert_eq(load64(ep_d), 0, "crossing segments: depth is exactly 0");
+assert_eq(_ac_len_sq_e9(ep_n), 1000000000, "crossing segments: normal is a unit vector");
+
+# EXACT TANGENCY. Unit sphere at the origin, unit-half box centred at x = 2:
+# they touch at the single point (1,0,0). Penetration depth is exactly 0 and the
+# contact normal is exactly the line of centres.
+var ep_sph = hvec4_new(0, 0, 0, F64_ONE);
+var ep_box = _mpr_mkbox(F64_TWO, 0, 0, F64_ONE, F64_ONE, F64_ONE);
+assert_eq(gjk_epa_3d(&_mpr_sup_sphere, ep_sph, &_mpr_sup_box, ep_box, ep_n, ep_d), 1,
+"tangent sphere/box: gjk_epa reports contact (was 0)");
+assert_eq(load64(ep_d), 0, "tangent sphere/box: depth is exactly 0");
+assert_eq(_ac_comp_e9(ep_n, 0), (0 - 1000000000), "tangent sphere/box: normal is exactly -x");
+assert_eq(_ac_comp_e9(ep_n, 1), 0, "tangent sphere/box: normal has no y component");
+assert_eq(_ac_comp_e9(ep_n, 2), 0, "tangent sphere/box: normal has no z component");
+
+# Genuinely separated shapes must still report 0 -- and now leave DEFINED
+# out-params rather than whatever the caller's slots held.
+store64(ep_n, 0);
+store64(ep_d, 0);
+var ep_far = _mpr_mkbox(f64_from(9), 0, 0, F64_ONE, F64_ONE, F64_ONE);
+assert_eq(gjk_epa_3d(&_mpr_sup_box, ep_box, &_mpr_sup_box, ep_far, ep_n, ep_d), 0,
+"well-separated boxes: still 0");
+assert_neq(load64(ep_n), 0, "0 return still writes a readable normal, not a null");
+assert_eq(_ac_len_sq_e9(ep_n), 1000000000, "0 return writes a unit normal");
+
+# A real, full-dimensional overlap is untouched by the degenerate paths: it must
+# still report a strictly positive depth. (The VALUE of that depth is the
+# subject of a separate open finding and is deliberately not pinned here.)
+var ep_ov = _mpr_mkbox(f64_add(F64_ONE, F64_HALF), 0, 0, F64_ONE, F64_ONE, F64_ONE);
+assert_eq(gjk_epa_3d(&_mpr_sup_box, ep_box, &_mpr_sup_box, ep_ov, ep_n, ep_d), 1,
+"overlapping boxes: still 1");
+assert_eq(f64_gt(load64(ep_d), 0), 1, "overlapping boxes: depth is strictly positive");
+assert_eq(_ac_len_sq_e9(ep_n), 1000000000, "overlapping boxes: normal is a unit vector");
+
+test_group("time_of_impact: a reported collision carries a readable normal");
+
+# alloc() hands back zeroed pages, so when gjk_epa_3d returned without writing,
+# time_of_impact copied 0 into out_normal and returned 1 -- "collision found,
+# here is the normal", where the normal is a null pointer that faults on the
+# first accessor. Two coplanar flat boxes overlapping at t = 0 reproduced it.
+var toi_n2 = alloc(8);
+var toi_t2 = alloc(8);
+store64(toi_n2, 0);
+var toi_zero = hvec3_zero();
+assert_eq(time_of_impact(&_mpr_sup_box, ep_fa, toi_zero, &_mpr_sup_box, ep_fb, toi_zero,
+f64_from(10), toi_t2, toi_n2), 1, "coplanar flat boxes overlap at t = 0 -> hit");
+assert_neq(load64(toi_n2), 0, "t = 0 hit stores a real normal, not a NULL HVec3");
+assert_eq(_ac_len_sq_e9(toi_n2), 1000000000, "t = 0 hit stores a unit normal");
+
+# The swept branch stores its normal through the same guard.
+store64(toi_n2, 0);
+var toi_left2 = hvec3_new(f64_neg(F64_ONE), 0, 0);
+var toi_fc = _mpr_mkbox(f64_from(5), 0, 0, F64_ONE, F64_ONE, 0);
+assert_eq(time_of_impact(&_mpr_sup_box, ep_fa, toi_zero, &_mpr_sup_box, toi_fc, toi_left2,
+f64_from(10), toi_t2, toi_n2), 1, "swept coplanar flat boxes collide within max_t");
+assert_neq(load64(toi_n2), 0, "swept hit stores a real normal, not a NULL HVec3");
+assert_eq(_ac_len_sq_e9(toi_n2), 1000000000, "swept hit stores a unit normal");
+
+test_group("halfedge_from_triangles: malformed input returns 0, it does not abort");
+
+# Every one of these went straight into vec_get, whose bounds check calls
+# _vec_die() -- so the documented "0 on error" was unreachable and the PROCESS
+# exited 1 instead. Against the 2.8.2 source this suite dies here.
+var hb_short = vec_new();
+vec_push(hb_short, 0); vec_push(hb_short, 1); vec_push(hb_short, 2);
+assert_eq(halfedge_from_triangles(hb_short, 2, 3), 0,
+"n_tris larger than the supplied triples -> 0 (was: abort)");
+
+var hb_oob = vec_new();
+vec_push(hb_oob, 0); vec_push(hb_oob, 1); vec_push(hb_oob, 7);
+assert_eq(halfedge_from_triangles(hb_oob, 1, 3), 0,
+"vertex index >= n_verts -> 0 (was: abort)");
+
+var hb_neg = vec_new();
+vec_push(hb_neg, 0); vec_push(hb_neg, 0 - 1); vec_push(hb_neg, 2);
+assert_eq(halfedge_from_triangles(hb_neg, 1, 3), 0,
+"negative vertex index -> 0 (was: abort)");
+
+var hb_ok = vec_new();
+vec_push(hb_ok, 0); vec_push(hb_ok, 1); vec_push(hb_ok, 2);
+assert_eq(halfedge_from_triangles(hb_ok, 1, 0), 0,
+"n_verts = 0 with a triangle -> 0 (was: abort)");
+assert_eq(halfedge_from_triangles(0, 1, 3), 0, "null triangle vec -> 0");
+# And the valid mesh still builds -- the guard must not reject good input.
+assert_neq(halfedge_from_triangles(hb_ok, 1, 3), 0, "a well-formed triangle still builds");
+
+test_group("einsum: a repeated OUTPUT label is an error, not a wrong tensor");
+
+# _einsum_compute_element assigns each output axis into label_vals[label], so two
+# axes sharing a label overwrite each other and the leading axis wins. "ij->ii"
+# on [[1,2],[3,4]] returned [[3,3],[7,7]] -- right shape, wrong tensor, no error.
+assert_eq(einsum(str_from("ij->ii"), es_one, 1), 0, "einsum: repeated output label -> 0");
+assert_eq(einsum(str_from("ij,jk->ii"), es_two, 2), 0,
+"einsum: repeated output label with two operands -> 0");
+assert_eq(einsum(str_from("ij->jj"), es_one, 1), 0, "einsum: repeated output label (jj) -> 0");
+# The legal notations are untouched.
+assert_neq(einsum(str_from("ij->ji"), es_one, 1), 0, "einsum: transpose still works");
+assert_neq(einsum(str_from("ii->"), es_one, 1), 0, "einsum: trace still works");
+assert_neq(einsum(str_from("ij,jk->ik"), es_two, 2), 0, "einsum: matmul still works");
+# 2.8.3 -- the performance tier of the 2026-08-04 audit
+# ================================================================
+# Three findings, three different ways of pinning a performance repair
+# WITHOUT a timing assertion (timings live in bench-history.csv):
+#   spatial_hash  -- the table must size itself to the data, and no chain may
+#                    be long; both are structural facts a never-growing 1024
+#                    bucket table cannot satisfy.
+#   bvh_build     -- arena bytes per primitive must be O(1); the pre-2.8.3
+#                    5-blocks-per-merge fold made it O(log n).
+#   num_dct/dst   -- the FFT reductions must agree with closed forms at sizes
+#                    on BOTH sides of the direct/FFT crossover.
+
+test_group("2.8.3 spatial_hash: the table grows with the data");
+
+# 30,000 points, one per cell, on a STRIDE-4 grid. The stride matters: the
+# pre-2.8.3 hash (prime-multiply + XOR, no avalanche) is masked by its LOW
+# bits, and ix = 4g forces the bottom two of those to zero, so these 30,000
+# cells collapse into 256 buckets of 1024 -- 117-deep chains, and an occupied
+# count that can never reach the growth threshold.
+var shg = spatial_hash_new(F64_ONE);
+for (var shi = 0; shi < 30000; shi = shi + 1) {
+    spatial_hash_insert(shg, hvec3_new(f64_from(shi * 4), 0, 0), shi);
+}
+assert_gte(_sh_bucket_count(shg), 16384, "bucket count grew past its initial 1024");
+assert_gt(_sh_occupied(shg), 15000, "stride-4 cells spread over the table, not into 256");
+assert_gte(_sh_bucket_count(shg) * 3, _sh_occupied(shg) * 4, "load factor stays under 3/4");
+
+# The actual per-query work bound: the longest chain in the table.
+fn _sh_longest_chain(sh) {
+    var bk = _sh_buckets(sh);
+    var bc = _sh_bucket_count(sh);
+    var en = _sh_entries(sh);
+    var worst = 0;
+    for (var b = 0; b < bc; b = b + 1) {
+        var e = load64(bk + b * 8);
+        var len = 0;
+        while (e >= 0) {
+            len = len + 1;
+            e = vec_get(en, e * _SH_ENTRY_SIZE + 4);
+        }
+        if (len > worst) { worst = len; }
+    }
+    return worst;
+}
+assert_lte(_sh_longest_chain(shg), 12, "no chain exceeds 12 entries out of 30,000");
+assert_eq(vec_len(spatial_hash_query_cell(shg, hvec3_new(f64_from(4 * 777), 0, 0))), 1,
+"every one of the 30,000 cells still answers exactly its own point");
+
+test_group("2.8.3 spatial_hash: brute-force equality, insertion order, clear");
+
+# Ground truth is the DEFINITION of the grid (cell = floor(coord / size)),
+# not the previous implementation.
+fn _sh_ref_cell(v, inv) { return f64_to(f64_floor(f64_mul(v, inv))); }
+
+fn _sh_ref_query(pts, npts, inv, px, py, pz) {
+    var want = vec_new();
+    var cx = _sh_ref_cell(px, inv);
+    var cy = _sh_ref_cell(py, inv);
+    var cz = _sh_ref_cell(pz, inv);
+    for (var i = 0; i < npts; i = i + 1) {
+        var p = vec_get(pts, i);
+        if (_sh_ref_cell(HVec3_x(p), inv) == cx) {
+            if (_sh_ref_cell(HVec3_y(p), inv) == cy) {
+                if (_sh_ref_cell(HVec3_z(p), inv) == cz) { vec_push(want, i); }
+            }
+        }
+    }
+    return want;
+}
+
+fn _sh_seq_eq(got, want) {
+    if (vec_len(got) != vec_len(want)) { return 0; }
+    for (var i = 0; i < vec_len(got); i = i + 1) {
+        if (vec_get(got, i) != vec_get(want, i)) { return 0; }
+    }
+    return 1;
+}
+
+# 900 points: a third uniform, a third all coincident, a third on a plane --
+# so one table holds a sparse region, a single 300-deep cell and a flat slab.
+var shp = vec_new();
+_DLR_STATE = 90210;
+for (var spi = 0; spi < 300; spi = spi + 1) {
+    vec_push(shp, hvec3_new(f64_mul(f64_from(30), _dlr_unit()),
+    f64_mul(f64_from(30), _dlr_unit()), f64_mul(f64_from(30), _dlr_unit())));
+}
+for (var spj = 0; spj < 300; spj = spj + 1) {
+    vec_push(shp, hvec3_new(F64_HALF, F64_HALF, F64_HALF));
+}
+for (var spk = 0; spk < 300; spk = spk + 1) {
+    vec_push(shp, hvec3_new(f64_sub(f64_mul(f64_from(20), _dlr_unit()), f64_from(10)),
+    f64_mul(f64_from(20), _dlr_unit()), 0));
+}
+var shb = spatial_hash_new(F64_ONE);
+for (var spl = 0; spl < 900; spl = spl + 1) {
+    spatial_hash_insert(shb, vec_get(shp, spl), spl);
+}
+var sh_mismatch = 0;
+for (var spm = 0; spm < 900; spm = spm + 1) {
+    var sq = vec_get(shp, spm);
+    if (_sh_seq_eq(spatial_hash_query_cell(shb, sq),
+    _sh_ref_query(shp, 900, F64_ONE, HVec3_x(sq), HVec3_y(sq), HVec3_z(sq))) == 0) {
+        sh_mismatch = sh_mismatch + 1;
+    }
+}
+assert_eq(sh_mismatch, 0, "query_cell matches brute force, in insertion order, 900/900");
+assert_eq(vec_len(spatial_hash_query_cell(shb, hvec3_new(F64_HALF, F64_HALF, F64_HALF))), 300,
+"the 300 coincident points all come back from one cell");
+
+# clear() then reuse. This is what caught a 16-vs-8 byte bucket stride during
+# the repair: the over-wide reset ran off the end of the bucket array and
+# corrupted the entry vec's header, so the NEXT insert died in vec_push.
+spatial_hash_clear(shb);
+assert_eq(vec_len(spatial_hash_query_cell(shb, vec_get(shp, 0))), 0, "clear empties the table");
+for (var spn = 0; spn < 900; spn = spn + 1) {
+    spatial_hash_insert(shb, vec_get(shp, spn), spn);
+}
+var sq0 = vec_get(shp, 0);
+assert_eq(_sh_seq_eq(spatial_hash_query_cell(shb, sq0),
+_sh_ref_query(shp, 900, F64_ONE, HVec3_x(sq0), HVec3_y(sq0), HVec3_z(sq0))), 1,
+"the table is fully usable after clear()");
+
+# The broadphase contract: query_radius may over-return, never under-return.
+var shr = spatial_hash_query_radius(shb, sq0, f64_from(3));
+var sh_missing = 0;
+var sh_r2 = f64_from(9);
+for (var spq = 0; spq < 900; spq = spq + 1) {
+    var pq = vec_get(shp, spq);
+    var ddx = f64_sub(HVec3_x(pq), HVec3_x(sq0));
+    var ddy = f64_sub(HVec3_y(pq), HVec3_y(sq0));
+    var ddz = f64_sub(HVec3_z(pq), HVec3_z(sq0));
+    var dd = f64_add(f64_add(f64_mul(ddx, ddx), f64_mul(ddy, ddy)), f64_mul(ddz, ddz));
+    if (f64_lt(dd, sh_r2) == 1) {
+        var seen = 0;
+        for (var spr = 0; spr < vec_len(shr); spr = spr + 1) {
+            if (vec_get(shr, spr) == spq) { seen = 1; }
+        }
+        if (seen == 0) { sh_missing = sh_missing + 1; }
+    }
+}
+assert_eq(sh_missing, 0, "query_radius returns every point inside the radius");
+
+test_group("2.8.3 bvh_build: subtree bounds are exact and the arena is O(n)");
+
+# Every internal node's AABB must be the exact componentwise min/max of the
+# AABBs of the leaves beneath it, every leaf index must appear exactly once,
+# and every leaf must alias its input box. Recomputed from the leaves, so it
+# does not trust the fold that built the node.
+var _BV_SEEN = 0;
+var _BV_BAD = 0;
+
+fn _bv_check(node, aabbs, out) {
+    var leaf = _bvh_node_leaf_idx(node);
+    var box = _bvh_node_aabb(node);
+    if (leaf != 0 - 1) {
+        if (box != load64(aabbs + leaf * 8)) { _BV_BAD = _BV_BAD + 1; }
+        vec_set(_BV_SEEN, leaf, vec_get(_BV_SEEN, leaf) + 1);
+        var mn = GeoAabb_min(box);
+        var mx = GeoAabb_max(box);
+        store64(out, HVec3_x(mn));
+        store64(out + 8, HVec3_y(mn));
+        store64(out + 16, HVec3_z(mn));
+        store64(out + 24, HVec3_x(mx));
+        store64(out + 32, HVec3_y(mx));
+        store64(out + 40, HVec3_z(mx));
+        return 0;
+    }
+    var lb = alloc(48);
+    var rb = alloc(48);
+    _bv_check(_bvh_node_left(node), aabbs, lb);
+    _bv_check(_bvh_node_right(node), aabbs, rb);
+    for (var k = 0; k < 3; k = k + 1) {
+        store64(out + k * 8, f64_min(load64(lb + k * 8), load64(rb + k * 8)));
+    }
+    for (var k2 = 3; k2 < 6; k2 = k2 + 1) {
+        store64(out + k2 * 8, f64_max(load64(lb + k2 * 8), load64(rb + k2 * 8)));
+    }
+    var nmn = GeoAabb_min(box);
+    var nmx = GeoAabb_max(box);
+    if (HVec3_x(nmn) != load64(out)) { _BV_BAD = _BV_BAD + 1; }
+    if (HVec3_y(nmn) != load64(out + 8)) { _BV_BAD = _BV_BAD + 1; }
+    if (HVec3_z(nmn) != load64(out + 16)) { _BV_BAD = _BV_BAD + 1; }
+    if (HVec3_x(nmx) != load64(out + 24)) { _BV_BAD = _BV_BAD + 1; }
+    if (HVec3_y(nmx) != load64(out + 32)) { _BV_BAD = _BV_BAD + 1; }
+    if (HVec3_z(nmx) != load64(out + 40)) { _BV_BAD = _BV_BAD + 1; }
+    return 0;
+}
+
+# kind 0 uniform, 1 coincident, 2 a 1e-8 cluster, 3 a 1e6:1 strip
+fn _bv_boxes(n, kind, seed) {
+    _DLR_STATE = seed;
+    var arr = alloc(n * 8);
+    for (var i = 0; i < n; i = i + 1) {
+        var sx = f64_from(1000);
+        var sy = sx;
+        var sz = sx;
+        if (kind == 1) { sx = 0; sy = 0; sz = 0; }
+        if (kind == 2) { sx = 0x3E45798EE2308C3A; sy = sx; sz = sx; }
+        if (kind == 3) { sx = f64_from(1000000); sy = F64_ONE; sz = F64_ONE; }
+        var bx = f64_mul(sx, _dlr_unit());
+        var by = f64_mul(sy, _dlr_unit());
+        var bz = f64_mul(sz, _dlr_unit());
+        store64(arr + i * 8, geo_aabb_new(hvec3_new(bx, by, bz),
+        hvec3_new(f64_add(bx, F64_ONE), f64_add(by, F64_ONE), f64_add(bz, F64_ONE))));
+    }
+    return arr;
+}
+
+var bv_total_bad = 0;
+for (var bvk = 0; bvk < 4; bvk = bvk + 1) {
+    for (var bvs = 0; bvs < 4; bvs = bvs + 1) {
+        var bvn = 1;
+        if (bvs == 1) { bvn = 2; }
+        if (bvs == 2) { bvn = 37; }
+        if (bvs == 3) { bvn = 400; }
+        var bva = _bv_boxes(bvn, bvk, 700 + bvk * 13 + bvs);
+        var bvt = bvh_build(bva, bvn);
+        _BV_SEEN = vec_new();
+        for (var bvi = 0; bvi < bvn; bvi = bvi + 1) { vec_push(_BV_SEEN, 0); }
+        _BV_BAD = 0;
+        _bv_check(bvt, bva, alloc(48));
+        for (var bvj = 0; bvj < bvn; bvj = bvj + 1) {
+            if (vec_get(_BV_SEEN, bvj) != 1) { _BV_BAD = _BV_BAD + 1; }
+        }
+        bv_total_bad = bv_total_bad + _BV_BAD;
+    }
+}
+assert_eq(bv_total_bad, 0,
+"16 BVHs over 4 input classes x n=1,2,37,400: every node bound exact, every leaf used once");
+
+# ARENA BOUND. Pre-2.8.3 the range-bounds fold allocated FIVE heap blocks per
+# merge step and the partition allocated two per item per level, so bytes per
+# primitive grew with log n: 1,650 B/prim at n=1000 and 2,288 B/prim at
+# n=16000. The rewritten fold is three blocks per internal node, flat at
+# 259 B/prim. 700 is loose enough to absorb allocator alignment and tight
+# enough that the old fold (1,970 B/prim at n=4000) cannot pass.
+var bva4 = _bv_boxes(4000, 0, 31337);
+var bv_used0 = alloc_used();
+var bvt4 = bvh_build(bva4, 4000);
+var bv_bytes = alloc_used() - bv_used0;
+assert_neq(bvt4, 0, "bvh_build(4000) returns a tree");
+assert_lt(bv_bytes, 700 * 4000, "bvh_build allocates under 700 B per primitive");
+
+test_group("2.8.3 num_dct / num_dst: closed forms on both sides of the crossover");
+
+# Sizes chosen to hit every dispatch branch: 8 and 16 are direct (DST) or
+# radix-2 FFT (DCT); 15 makes DST's 2(n+1) a power of two; 17 and 100 force
+# Bluestein; 128 and 256 are the large radix-2 path.
+fn _tx_sizes(i) {
+    if (i == 0) { return 8; }
+    if (i == 1) { return 15; }
+    if (i == 2) { return 16; }
+    if (i == 3) { return 17; }
+    if (i == 4) { return 100; }
+    if (i == 5) { return 128; }
+    return 256;
+}
+
+var tx_bad_const = 0;
+var tx_bad_delta = 0;
+var tx_bad_rt = 0;
+var tx_bad_inv = 0;
+for (var txi = 0; txi < 7; txi = txi + 1) {
+    var tn = _tx_sizes(txi);
+
+    # (1) DCT-II of a constant c: X[0] = n*c exactly, X[k>0] = 0 exactly.
+    var tc = alloc(tn * 8);
+    for (var t1 = 0; t1 < tn; t1 = t1 + 1) { store64(tc + t1 * 8, F64_TWO); }
+    if (num_dct(tc, tn) != HSB_ERR_NONE) { tx_bad_const = tx_bad_const + 1; }
+    if (f64_approx_eq(load64(tc), f64_from(2 * tn), LOOSE_TOL_M) == 0) {
+        tx_bad_const = tx_bad_const + 1;
+    }
+    for (var t2 = 1; t2 < tn; t2 = t2 + 1) {
+        if (f64_approx_eq(load64(tc + t2 * 8), 0, LOOSE_TOL_M) == 0) {
+            tx_bad_const = tx_bad_const + 1;
+        }
+    }
+
+    # (2) DCT-II of e_j reads off column j: X[k] = cos(PI (2j+1) k / (2n)).
+    var tj = tn / 3;
+    var td = alloc(tn * 8);
+    for (var t3 = 0; t3 < tn; t3 = t3 + 1) { store64(td + t3 * 8, 0); }
+    store64(td + tj * 8, F64_ONE);
+    if (num_dct(td, tn) != HSB_ERR_NONE) { tx_bad_delta = tx_bad_delta + 1; }
+    for (var t4 = 0; t4 < tn; t4 = t4 + 1) {
+        var ang = f64_div(f64_mul(F64_PI, f64_from((2 * tj + 1) * t4)), f64_from(2 * tn));
+        if (f64_approx_eq(load64(td + t4 * 8), f64_cos(ang), LOOSE_TOL_M) == 0) {
+            tx_bad_delta = tx_bad_delta + 1;
+        }
+    }
+
+    # (3) round trips: idct(dct(x)) == x and idst(dst(x)) == x
+    var tx = alloc(tn * 8);
+    var tk = alloc(tn * 8);
+    _DLR_STATE = 5150 + tn;
+    for (var t5 = 0; t5 < tn; t5 = t5 + 1) {
+        var tv = f64_sub(_dlr_unit(), F64_HALF);
+        store64(tx + t5 * 8, tv);
+        store64(tk + t5 * 8, tv);
+    }
+    num_dct(tx, tn);
+    num_idct(tx, tn);
+    for (var t6 = 0; t6 < tn; t6 = t6 + 1) {
+        if (f64_approx_eq(load64(tx + t6 * 8), load64(tk + t6 * 8), LOOSE_TOL_M) == 0) {
+            tx_bad_rt = tx_bad_rt + 1;
+        }
+    }
+    for (var t7 = 0; t7 < tn; t7 = t7 + 1) { store64(tx + t7 * 8, load64(tk + t7 * 8)); }
+    num_dst(tx, tn);
+    num_idst(tx, tn);
+    for (var t8 = 0; t8 < tn; t8 = t8 + 1) {
+        if (f64_approx_eq(load64(tx + t8 * 8), load64(tk + t8 * 8), LOOSE_TOL_M) == 0) {
+            tx_bad_rt = tx_bad_rt + 1;
+        }
+    }
+
+    # (4) DST-I is a symmetric involution: S^2 = ((n+1)/2) I. Unlike the round
+    # trip above this does NOT go through num_idst, so a scale error in the
+    # forward transform cannot cancel itself out.
+    for (var t9 = 0; t9 < tn; t9 = t9 + 1) { store64(tx + t9 * 8, load64(tk + t9 * 8)); }
+    num_dst(tx, tn);
+    num_dst(tx, tn);
+    var thalf = f64_mul(f64_from(tn + 1), F64_HALF);
+    for (var ta = 0; ta < tn; ta = ta + 1) {
+        if (f64_approx_eq(load64(tx + ta * 8),
+        f64_mul(thalf, load64(tk + ta * 8)), LOOSE_TOL_M) == 0) {
+            tx_bad_inv = tx_bad_inv + 1;
+        }
+    }
+}
+assert_eq(tx_bad_const, 0, "DCT-II of a constant is n*c at k=0 and 0 elsewhere, 7 sizes");
+assert_eq(tx_bad_delta, 0, "DCT-II of e_j is column j of the cosine kernel, 7 sizes");
+assert_eq(tx_bad_rt, 0, "idct(dct(x)) and idst(dst(x)) round-trip, 7 sizes");
+assert_eq(tx_bad_inv, 0, "dst(dst(x)) == ((n+1)/2) x -- DST-I is an involution, 7 sizes");
+assert_eq(num_dct(alloc(8), 0), HSB_ERR_INVALID_INPUT, "num_dct(n=0) still rejects");
+assert_eq(num_idct(alloc(8), 0), HSB_ERR_INVALID_INPUT, "num_idct(n=0) still rejects");
+assert_eq(num_idst(alloc(8), 0), HSB_ERR_INVALID_INPUT, "num_idst(n=0) still rejects");
+# NOISE — the four generators had no assertion that any of them computes
+# anything (2.8.3)
+# ================================================================
+test_group("noise: perlin_2d / perlin_3d / simplex_2d / simplex_3d");
+
+# Every noise assertion in the tree through 2.8.2 was of the form
+# `|noise(p)| < 1` or `noise(p) == noise(p)` at a single point, plus the fBm
+# NaN guards. Replacing the body of any of the four with `return 0;` satisfies
+# all of them: 0 is bounded by 1, deterministic, and not NaN. That is roughly
+# 320 lines of lattice hashing, skew/unskew, fade curves and gradient tables
+# certified by nothing.
+#
+# Two independent things are checked below.
+#
+# (1) STRUCTURAL IDENTITIES that follow from the definition of gradient noise
+#     and hold for no constant function. They are exact, so they carry no
+#     tolerance argument at all.
+# (2) VALUES, cross-checked against a reference implementation written from the
+#     published algorithm in python3 (Perlin's 2002 "Improving Noise" for the
+#     fade curve and permutation, Gustavson's simplex note for the skew factors
+#     and the 0.5 - r^2 / 0.6 - r^2 falloff) and NOT transcribed from src/. The
+#     permutation table in src/calc.cyr was separately diffed against Perlin's
+#     published 256-entry table: identical, and a genuine permutation of 0..255.
+#     Agreement is bit-exact for perlin_2d and perlin_3d at every point and
+#     aggregate below; simplex differs by at most 3 ulp, purely from
+#     associativity in the corner-offset expressions.
+
+# --- (1a) Gradient noise vanishes exactly at its lattice points. At integer
+# (x, y) the fractional offsets are 0, the fade weights are 0, and the surviving
+# corner contributes grad . (0, 0) == 0. Not a tolerance: exactly zero.
+assert_eq(perlin_2d(f64_from(3), f64_from(5)), 0, "perlin_2d == 0 exactly at a lattice point");
+assert_eq(perlin_3d(F64_TWO, f64_from(7), f64_from(4)), 0,
+"perlin_3d == 0 exactly at a lattice point");
+# Simplex noise vanishes at the origin of the skewed lattice for the same
+# reason (the near corner contributes grad . 0, the other two/three corners are
+# outside the 0.5 / 0.6 falloff radius).
+assert_eq(simplex_2d(0, 0), 0, "simplex_2d(0,0) == 0 exactly");
+assert_eq(simplex_3d(0, 0, 0), 0, "simplex_3d(0,0,0) == 0 exactly");
+
+# --- (1b) CELL-CENTRE QUANTISATION. fade(1/2) = 6/32 - 15/16 + 10/8 = 1/2
+# exactly, and at a cell centre every corner offset is (+-1/2, +-1/2), so each
+# 2D gradient dot product is exactly one of {-1, 0, +1}. The two nested lerps at
+# weight 1/2 then make perlin_2d(i+1/2, j+1/2) an exact multiple of 1/4 in
+# [-1, 1] -- in dyadic arithmetic, with no rounding anywhere. In 3D the eight
+# corners and three lerps make it an exact multiple of 1/8.
+#
+# The histogram of those quantised values over a block of cells is a fingerprint
+# of the entire pipeline (permutation table, corner hashing, gradient selection
+# and the fade curve at once). Both histograms below were produced by the
+# independent reference and match src bin for bin.
+var _nz_hp = alloc(7 * 8);
+var _nz_i = 0;
+while (_nz_i < 7) { store64(_nz_hp + _nz_i * 8, 0); _nz_i = _nz_i + 1; }
+var _nz_bad = 0;
+var _nz_oob = 0;
+_nz_i = 0;
+while (_nz_i < 16) {
+    var _nz_j = 0;
+    while (_nz_j < 16) {
+        var _nz_v = perlin_2d(f64_add(f64_from(_nz_i), F64_HALF),
+        f64_add(f64_from(_nz_j), F64_HALF));
+        var _nz_q = f64_mul(_nz_v, f64_from(4));
+        var _nz_n = f64_to(f64_round(_nz_q));
+        if (f64_lt(f64_abs(f64_sub(_nz_q, f64_from(_nz_n))), TOL_1EM12) == 0) {
+            _nz_bad = _nz_bad + 1;
+        }
+        if (_nz_n < 0 - 3 || _nz_n > 3) {
+            _nz_oob = _nz_oob + 1;
+        } else {
+            store64(_nz_hp + (_nz_n + 3) * 8, load64(_nz_hp + (_nz_n + 3) * 8) + 1);
+        }
+        _nz_j = _nz_j + 1;
+    }
+    _nz_i = _nz_i + 1;
+}
+assert_eq(_nz_bad, 0, "perlin_2d: all 256 cell centres are exact multiples of 1/4");
+assert_eq(_nz_oob, 0, "perlin_2d: all 256 cell centres lie in [-3/4, 3/4]");
+assert_eq(load64(_nz_hp), 7, "perlin_2d cell-centre histogram: 4v = -3 occurs 7x");
+assert_eq(load64(_nz_hp + 8), 25, "perlin_2d cell-centre histogram: 4v = -2 occurs 25x");
+assert_eq(load64(_nz_hp + 16), 62, "perlin_2d cell-centre histogram: 4v = -1 occurs 62x");
+assert_eq(load64(_nz_hp + 24), 67, "perlin_2d cell-centre histogram: 4v = 0 occurs 67x");
+assert_eq(load64(_nz_hp + 32), 62, "perlin_2d cell-centre histogram: 4v = +1 occurs 62x");
+assert_eq(load64(_nz_hp + 40), 22, "perlin_2d cell-centre histogram: 4v = +2 occurs 22x");
+assert_eq(load64(_nz_hp + 48), 11, "perlin_2d cell-centre histogram: 4v = +3 occurs 11x");
+
+var _nz_hq = alloc(12 * 8);
+_nz_i = 0;
+while (_nz_i < 12) { store64(_nz_hq + _nz_i * 8, 0); _nz_i = _nz_i + 1; }
+var _nz_bad3 = 0;
+var _nz_oob3 = 0;
+_nz_i = 0;
+while (_nz_i < 8) {
+    var _nz_j3 = 0;
+    while (_nz_j3 < 8) {
+        var _nz_k3 = 0;
+        while (_nz_k3 < 8) {
+            var _nz_v3 = perlin_3d(f64_add(f64_from(_nz_i), F64_HALF),
+            f64_add(f64_from(_nz_j3), F64_HALF), f64_add(f64_from(_nz_k3), F64_HALF));
+            var _nz_q3 = f64_mul(_nz_v3, f64_from(8));
+            var _nz_n3 = f64_to(f64_round(_nz_q3));
+            if (f64_lt(f64_abs(f64_sub(_nz_q3, f64_from(_nz_n3))), TOL_1EM12) == 0) {
+                _nz_bad3 = _nz_bad3 + 1;
+            }
+            if (_nz_n3 < 0 - 6 || _nz_n3 > 5) {
+                _nz_oob3 = _nz_oob3 + 1;
+            } else {
+                store64(_nz_hq + (_nz_n3 + 6) * 8, load64(_nz_hq + (_nz_n3 + 6) * 8) + 1);
+            }
+            _nz_k3 = _nz_k3 + 1;
+        }
+        _nz_j3 = _nz_j3 + 1;
+    }
+    _nz_i = _nz_i + 1;
+}
+assert_eq(_nz_bad3, 0, "perlin_3d: all 512 cell centres are exact multiples of 1/8");
+assert_eq(_nz_oob3, 0, "perlin_3d: all 512 cell centres lie in [-6/8, 5/8]");
+assert_eq(load64(_nz_hq), 1, "perlin_3d cell-centre histogram: 8v = -6 occurs 1x");
+assert_eq(load64(_nz_hq + 8), 3, "perlin_3d cell-centre histogram: 8v = -5 occurs 3x");
+assert_eq(load64(_nz_hq + 16), 8, "perlin_3d cell-centre histogram: 8v = -4 occurs 8x");
+assert_eq(load64(_nz_hq + 24), 39, "perlin_3d cell-centre histogram: 8v = -3 occurs 39x");
+assert_eq(load64(_nz_hq + 32), 65, "perlin_3d cell-centre histogram: 8v = -2 occurs 65x");
+assert_eq(load64(_nz_hq + 40), 93, "perlin_3d cell-centre histogram: 8v = -1 occurs 93x");
+assert_eq(load64(_nz_hq + 48), 85, "perlin_3d cell-centre histogram: 8v = 0 occurs 85x");
+assert_eq(load64(_nz_hq + 56), 105, "perlin_3d cell-centre histogram: 8v = +1 occurs 105x");
+assert_eq(load64(_nz_hq + 64), 67, "perlin_3d cell-centre histogram: 8v = +2 occurs 67x");
+assert_eq(load64(_nz_hq + 72), 32, "perlin_3d cell-centre histogram: 8v = +3 occurs 32x");
+assert_eq(load64(_nz_hq + 80), 10, "perlin_3d cell-centre histogram: 8v = +4 occurs 10x");
+assert_eq(load64(_nz_hq + 88), 4, "perlin_3d cell-centre histogram: 8v = +5 occurs 4x");
+
+# --- (2) POINT VALUES against the independent reference.
+var _nz_p1 = f64_div(F64_ONE, f64_from(10));                   # 0.1
+var _nz_p2 = f64_div(F64_ONE, f64_from(5));                    # 0.2
+var _nz_p3 = f64_div(f64_from(3), f64_from(10));               # 0.3
+var _nz_a = f64_div(f64_from(13), f64_from(4));                # 3.25
+var _nz_b = f64_div(f64_from(31), f64_from(4));                # 7.75
+var _nz_c = f64_div(f64_from(5), f64_from(4));                 # 1.25
+var _nz_d = f64_div(f64_from(5), F64_TWO);                     # 2.5
+var _nz_e = f64_div(f64_from(15), f64_from(4));                # 3.75
+assert_eq(perlin_2d(_nz_a, _nz_b), 0xBFD8B07000000000,
+"perlin_2d(3.25, 7.75) == -0.38576889038085938 (bit-exact vs reference)");
+assert_eq(perlin_2d(_nz_p1, _nz_p2), 0x3FC32F725475690A,
+"perlin_2d(0.1, 0.2) == 0.14988545536000003 (bit-exact vs reference)");
+assert_eq(perlin_3d(_nz_p1, _nz_p2, _nz_p3), 0x3FD2B8E731B20FE7,
+"perlin_3d(0.1, 0.2, 0.3) == 0.29253558972436483 (bit-exact vs reference)");
+assert_eq(perlin_3d(_nz_c, _nz_d, _nz_e), 0x3FD8AF9000000000,
+"perlin_3d(1.25, 2.5, 3.75) == 0.38571548461914062 (bit-exact vs reference)");
+# Simplex agrees to <= 3 ulp; the difference is association order in the corner
+# offsets (src forms x0 + (-i1) - G2, the reference x0 - i1 - G2), not the
+# algorithm, so these are pinned at 1e-14 rather than bit-exact.
+var _nz_tol = 0x3D06849B86A12B9B;                              # 1e-14
+assert(f64_lt(f64_abs(f64_sub(simplex_2d(_nz_p1, _nz_p2), 0x3FD25EECBFB15B55)), _nz_tol) == 1,
+"simplex_2d(0.1, 0.2) == 0.28704375 (vs reference)");
+assert(f64_lt(f64_abs(f64_sub(simplex_2d(f64_div(f64_from(25), F64_TWO),
+f64_div(F64_ONE, f64_from(8))), 0x3FA4E0CB72CED103)), _nz_tol) == 1,
+"simplex_2d(12.5, 0.125) == 0.040777547611840624 (vs reference)");
+assert(f64_lt(f64_abs(f64_sub(simplex_3d(_nz_p1, _nz_p2, _nz_p3), 0x3FDB826DEA2487AE)),
+_nz_tol) == 1, "simplex_3d(0.1, 0.2, 0.3) == 0.42983577599999989 (vs reference)");
+assert(f64_lt(f64_abs(f64_sub(simplex_3d(_nz_c, _nz_d, _nz_e), 0xBF81CB1A444367EC)),
+_nz_tol) == 1, "simplex_3d(1.25, 2.5, 3.75) == -0.0086881687242801 (vs reference)");
+
+# --- (2b) AGGREGATES over a 40x40 grid at step 1/4 (2D) and a 12x12x12 grid
+# (3D), so 1600 / 1728 samples are folded into each number. The L1 mass is the
+# statement that the generator produces SIGNAL: `return 0;` gives 0 where the
+# reference gives 369.35 / 252.12 / 363.05 / 236.59. max|v| is the amplitude,
+# and 3/4 is exact for both Perlin variants (the largest reachable convex
+# combination of gradient dots). The rigorous convex-combination bound on
+# perlin_2d over a cell is 1.0, so the < 1 range claim in the doc is proved,
+# not sampled.
+var _nz_step = f64_div(F64_ONE, f64_from(4));
+var _nz_eps = f64_div(F64_ONE, f64_from(1024));
+var _nz_l1p = 0;
+var _nz_l1s = 0;
+var _nz_mxp = 0;
+var _nz_mxs = 0;
+var _nz_cp = 0;
+var _nz_cs = 0;
+_nz_i = 0;
+while (_nz_i < 40) {
+    var _nz_jj = 0;
+    while (_nz_jj < 40) {
+        var _nz_x = f64_mul(f64_from(_nz_i), _nz_step);
+        var _nz_y = f64_mul(f64_from(_nz_jj), _nz_step);
+        var _nz_vp = perlin_2d(_nz_x, _nz_y);
+        var _nz_vs = simplex_2d(_nz_x, _nz_y);
+        _nz_l1p = f64_add(_nz_l1p, f64_abs(_nz_vp));
+        _nz_l1s = f64_add(_nz_l1s, f64_abs(_nz_vs));
+        if (f64_gt(f64_abs(_nz_vp), _nz_mxp) == 1) { _nz_mxp = f64_abs(_nz_vp); }
+        if (f64_gt(f64_abs(_nz_vs), _nz_mxs) == 1) { _nz_mxs = f64_abs(_nz_vs); }
+        var _nz_dp = f64_abs(f64_sub(perlin_2d(f64_add(_nz_x, _nz_eps), _nz_y), _nz_vp));
+        var _nz_ds = f64_abs(f64_sub(simplex_2d(f64_add(_nz_x, _nz_eps), _nz_y), _nz_vs));
+        if (f64_gt(_nz_dp, _nz_cp) == 1) { _nz_cp = _nz_dp; }
+        if (f64_gt(_nz_ds, _nz_cs) == 1) { _nz_cs = _nz_ds; }
+        _nz_jj = _nz_jj + 1;
+    }
+    _nz_i = _nz_i + 1;
+}
+var _nz_tol9 = 0x3E112E0BE826D695;                             # 1e-9
+assert(f64_lt(f64_abs(f64_sub(_nz_l1p, 0x407715A274000000)), _nz_tol9) == 1,
+"perlin_2d: L1 mass over 1600 samples == 369.3521614074707 (reference, bit-exact)");
+assert(f64_lt(f64_abs(f64_sub(_nz_l1s, 0x406F83D49FD06065)), _nz_tol9) == 1,
+"simplex_2d: L1 mass over 1600 samples == 252.11970511148971 (reference)");
+assert_eq(_nz_mxp, 0x3FE8000000000000, "perlin_2d: max|v| over the grid == 3/4 exactly");
+assert(f64_lt(f64_abs(f64_sub(_nz_mxs, 0x3FED2230814660DF)), _nz_tol) == 1,
+"simplex_2d: max|v| over the grid == 0.9104235196018883 (reference)");
+# Continuity: gradient noise is C^2 and simplex is C^1 across its falloff
+# boundary, so a 1/1024 step can never move the value far. A hash-scrambled or
+# mis-indexed lattice shows up here as a discontinuity even when the amplitude
+# statistics still look plausible. Measured maxima: 0.00269 / 0.00427.
+var _nz_c01 = 0x3F847AE147AE147B;                              # 0.01
+assert(f64_lt(_nz_cp, _nz_c01) == 1, "perlin_2d: no jump > 0.01 across a 1/1024 step");
+assert(f64_lt(_nz_cs, _nz_c01) == 1, "simplex_2d: no jump > 0.01 across a 1/1024 step");
+# Rigorous bound: |perlin_2d| is a convex combination of four gradient dots
+# whose supremum over the cell is exactly 1.
+assert(f64_lt(_nz_mxp, F64_ONE) == 1, "perlin_2d: inside the analytic bound of 1");
+assert(f64_lt(_nz_mxs, F64_ONE) == 1, "simplex_2d: inside the documented [-1, 1] range");
+
+var _nz_l1p3 = 0;
+var _nz_l1s3 = 0;
+var _nz_mxp3 = 0;
+var _nz_mxs3 = 0;
+var _nz_cp3 = 0;
+var _nz_cs3 = 0;
+_nz_i = 0;
+while (_nz_i < 12) {
+    var _nz_j5 = 0;
+    while (_nz_j5 < 12) {
+        var _nz_k5 = 0;
+        while (_nz_k5 < 12) {
+            var _nz_x3 = f64_mul(f64_from(_nz_i), _nz_step);
+            var _nz_y3 = f64_mul(f64_from(_nz_j5), _nz_step);
+            var _nz_z3 = f64_mul(f64_from(_nz_k5), _nz_step);
+            var _nz_w = perlin_3d(_nz_x3, _nz_y3, _nz_z3);
+            var _nz_u = simplex_3d(_nz_x3, _nz_y3, _nz_z3);
+            _nz_l1p3 = f64_add(_nz_l1p3, f64_abs(_nz_w));
+            _nz_l1s3 = f64_add(_nz_l1s3, f64_abs(_nz_u));
+            if (f64_gt(f64_abs(_nz_w), _nz_mxp3) == 1) { _nz_mxp3 = f64_abs(_nz_w); }
+            if (f64_gt(f64_abs(_nz_u), _nz_mxs3) == 1) { _nz_mxs3 = f64_abs(_nz_u); }
+            var _nz_e3 = f64_abs(f64_sub(perlin_3d(f64_add(_nz_x3, _nz_eps), _nz_y3, _nz_z3),
+            _nz_w));
+            var _nz_e4 = f64_abs(f64_sub(simplex_3d(f64_add(_nz_x3, _nz_eps), _nz_y3, _nz_z3),
+            _nz_u));
+            if (f64_gt(_nz_e3, _nz_cp3) == 1) { _nz_cp3 = _nz_e3; }
+            if (f64_gt(_nz_e4, _nz_cs3) == 1) { _nz_cs3 = _nz_e4; }
+            _nz_k5 = _nz_k5 + 1;
+        }
+        _nz_j5 = _nz_j5 + 1;
+    }
+    _nz_i = _nz_i + 1;
+}
+assert(f64_lt(f64_abs(f64_sub(_nz_l1p3, 0x4076B0C2DDE20000)), _nz_tol9) == 1,
+"perlin_3d: L1 mass over 1728 samples == 363.04757488518953 (reference, bit-exact)");
+assert(f64_lt(f64_abs(f64_sub(_nz_l1s3, 0x406D92E1565F2544)), _nz_tol9) == 1,
+"simplex_3d: L1 mass over 1728 samples == 236.59000700553054 (reference)");
+assert_eq(_nz_mxp3, 0x3FE8000000000000, "perlin_3d: max|v| over the grid == 3/4 exactly");
+assert(f64_lt(f64_abs(f64_sub(_nz_mxs3, 0x3FEC7D712FA66F29)), _nz_tol) == 1,
+"simplex_3d: max|v| over the grid == 0.8903127604166673 (reference)");
+assert(f64_lt(_nz_cp3, _nz_c01) == 1, "perlin_3d: no jump > 0.01 across a 1/1024 step");
+assert(f64_lt(_nz_cs3, _nz_c01) == 1, "simplex_3d: no jump > 0.01 across a 1/1024 step");
+assert(f64_lt(_nz_mxp3, F64_ONE) == 1, "perlin_3d: inside the analytic bound of 1");
+assert(f64_lt(_nz_mxs3, F64_ONE) == 1, "simplex_3d: inside the documented [-1, 1] range");
 
 # ================================================================
 var r = assert_summary();

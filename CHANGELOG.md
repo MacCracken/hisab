@@ -2,6 +2,75 @@
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-08-05 — a narrowphase a physics engine can build on
+
+All five exit criteria met. Suite **1818 → 3294** across five harnesses (a fifth was added:
+`tests/abuse.tcyr`), constant gate 153/153, toolchain 6.5.6 → **6.5.8**, sakshi 2.4.7 → **2.4.8**.
+
+**Read the shape of this release before the list.** It was scoped as "make the narrowphase
+trustworthy" — and that shipped early, in 2.8.3. What 2.9.0 actually delivers is the tail that only
+became visible once there were mechanisms to see it: an abuse harness that found 11 defects on
+public entry points, a disposition column that caught a finding marked FIXED when half of it was
+not, and a mutation sweep that found the property behind a CRITICAL had zero assertions. Every one
+of those was cheap to find and had been invisible because nothing looked.
+
+### Added
+
+- **`tests/abuse.tcyr` — an abuse harness** (exit criterion 2). 732 assertions over negative
+  indices, zero/huge dimensions, non-conformable operands, the designed-0 return, degenerate
+  geometry, and canary checks. It surfaced **11 real defects on public entry points**, held in a
+  known-defect register rather than deleted.
+- **A Disposition column on the 2026-08-04 audit** (exit criterion 5). The table stated the rule
+  "the finding list is the unit of disposition" and provided nowhere to record one. Now
+  **36 FIXED / 6 OPEN / 0 REFUTED** of 42, plus an addendum row.
+- **A struct-layout contract**, set deliberately while nothing depends on it. 32 assertions across
+  16 public structs. Construct via the constructor, read via accessors, size with `sizeof(T)` —
+  never a hardcoded byte count, never a hand-computed offset. `ColContact` grew 64 → 72 bytes this
+  release and nothing would have noticed; now a layout change trips a gate and forces an entry here.
+
+### Fixed
+
+- **`cqr_decompose` overran its output buffer while returning `HSB_ERR_NONE`** — a success code on
+  top of the overrun, 2 of 8 canary slots clobbered. The algorithm was proved general for
+  rectangular input first, so what is rejected is the mis-sized out-buffer, not the shape.
+- **`gjk_intersect_3d` missed 134 genuine interior overlaps.** Measured against an exact-rational
+  reference over 4,386 evaluations, scales 2⁻³⁰–2³⁰: missed overlaps 134 → 0, sibling disagreement
+  with `gjk_epa_3d` 390 → 0, tangencies certified 221/612 → 477/612, regressions 0. Costs +55%
+  median on the no-hit path (the honest figure; a first measurement said +44% and was deflated by
+  arena growth in its own harness).
+- **The friction impulse was identically zero at every μ and every iteration count.** `old_fric`
+  was loaded from the output slot the function had itself zeroed, clamped, and stored back — no
+  update between load and clamp. `friction` was a silently ignored constructor parameter. It
+  survived because every solver fixture uses friction = 0, so the branch was never entered.
+- **Crash tier:** `eigen_power`, `lyapunov_max`, `eigen_qr` (null handles and unbounded `n`),
+  `einsum` (its own output fed back in), `kdtree_build` and `bvh_build` (`count == 0` half-guards),
+  `halfedge_adjacent_faces`/`halfedge_is_boundary`, `num_modpow` (SIGFPE at modulus 0 — and three
+  silent WRONG ANSWERS found alongside it, where a negative base collapsed the accumulator).
+- **The never-worked low tier**, 5 of 5 — never deferred with a reason, simply never picked up, and
+  invisible until there was a column to record it in. Includes a return-convention split where
+  three sibling inserters used two conventions (**Breaking**, below).
+
+### Changed
+
+- **Breaking:** `quadtree_insert` and `octree_insert` move from `1`-on-success to the project's
+  `0 / HSB_ERR_NONE` convention, matching `spatial_hash_insert` and the rest of the library. Nine
+  test expectations updated; every caller in `src/`, `tests/` and `examples/` audited.
+- **Breaking (narrow):** `so3_from_mat3` returns 0 for a matrix that is not a rotation.
+
+### Verification
+
+- **54 mutations on the integrated tree** (exit criterion 4) — a different claim from each of eight
+  merge tracks proving its own in isolation. 45 caught. Of the 11 that broke nothing, 5 were real
+  coverage gaps and are closed; 6 are referred to 2.9.1 as a design question rather than papered
+  over. **The delaunay ghost-direction invariant — the property the 2.8.2 critical was rebuilt
+  around — had zero assertions**, and its own documented failing set passed every suite.
+- Two measurements stated in committed comments were found not to reproduce and were corrected
+  (`eigen_qr`'s justification; `cqr_decompose`'s arena figures, wrong by ~2× across four files).
+  Both were caught by an adversarial reader, neither by a gate. `scripts/check-measurements.sh`
+  exists but is **not adoptable** and is deferred to 2.9.1 — it misses 8 of 10 realistically-phrased
+  claims, and a gate that flags noise while missing real claims is worse than none.
+
+
 ### Breaking
 
 - **`quadtree_insert` and `octree_insert` now return `HSB_ERR_NONE` (0) on success and

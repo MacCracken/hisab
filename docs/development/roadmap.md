@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.5.6**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
+> Written in Cyrius. Toolchain: **6.5.8**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
 
 ## Scope
 
@@ -94,7 +94,7 @@ in sign and magnitude, worst relative error **1.6e-9** over 862 configurations i
 classes; a swept query using real conservative advancement; and `gjk_epa_3d` writing both
 out-params on **every** return path, so a `1` return always carries a readable normal.
 
-**Exit criteria** — 2 of 5 met, and the release does not cut until all do:
+**Exit criteria — ALL FIVE MET.** 2.9.0 cuts.
 
 1. ~~Narrowphase matches an independent exact reference with zero wrong-sign results and a stated
    worst-case error.~~ **MET (2.8.3)** — 862/862, worst 1.6e-9, reference computed in exact
@@ -105,12 +105,27 @@ out-params on **every** return path, so a `1` return always carries a readable n
    deleted. The headline is precisely what this criterion names: `cqr_decompose`
    (`src/linalg_precision.cyr:1278`) has no squareness check, walks `i<m, j<n` storing into an m×m
    `out_R`, and **overruns the buffer while returning `HSB_ERR_NONE`** — a success code on top of
-   the overrun (2 of 8 canary slots clobbered; the square control clobbers 0). The criterion is not
-   satisfied until those 11 are dispositioned.
+   the overrun (2 of 8 canary slots clobbered; the square control clobbers 0). **All 11 are now
+   dispositioned:** 7 fixed with guards and assertions, 4 reclassified. `cmat_get`/`cmat_set` were
+   deliberately left unguarded and marked `[BY DESIGN]` — the register's own reproducer did not
+   reproduce, there is no error channel (the success value is a handle, and `cx_zero()` is
+   bit-identical to a legitimate element), the identical unchecked accessor ships in
+   `lib/ganita.cyr`, the validated surface one level up is complete, and guarding costs a measured
+   +6.5%. Harness now 732 assertions.
 3. ~~Arena per narrowphase call bounded **and asserted**.~~ **MET** — `assert_lt(alloc_used() -
    before, 262144)` per narrowphase call, plus a separate EPA arena bound.
-4. Every fix mutation-proven, with the mutation set including the shape family that broke the
-   prior attempt — not just the reported reproducer. **PARTIAL.**
+4. ~~Every fix mutation-proven, with the mutation set including the shape family that broke the
+   prior attempt.~~ **MET.** 54 mutations on the INTEGRATED tree — a different claim from each of
+   the eight tracks proving its own in isolation, since the merge dropped one track's
+   `geo_advanced.cyr` as subsumed and re-implemented another's fix against a different structure.
+   45 were caught; several reproduced the CHANGELOG's failure counts exactly. The 11 that broke
+   nothing were the point: 5 were real coverage gaps and are now closed, 6 were referred to 2.9.1
+   as a design question rather than papered over with invented assertions. The sharpest: the
+   delaunay ghost-direction invariant — the property the 2.8.2 critical was rebuilt around — had
+   **zero** assertions, and the documented failing set passed every suite. Its replacement pins the
+   in-circle determinant's leading coefficients, re-derived and validated in exact rationals over
+   3,584 trials with zero sign mismatches. The EPA arena bounds went from 25x headroom (blind to an
+   80 B/face/iter leak) to 12-35%.
 5. Every one of the 42 audit findings has an explicit disposition. **MECHANISM IN PLACE, SIX
    FINDINGS OPEN.** The audit table now carries a Disposition column: **36 FIXED / 6 OPEN /
    0 REFUTED** of the original 42, plus one addendum row. It earned its keep on the first pass —
@@ -153,6 +168,66 @@ The suite does **not** currently police this: the test group named "agrees with 
 exercises that agreement only on overlapping fixtures.
 
 ---
+
+## 2.9.1 — the deferred tier: everything 2.9.0 found and consciously did not fix
+
+Every item here was **found, measured, and deliberately left** during the 2.9.0 arc. None is a
+regression; all are pre-existing or latent. They are gathered so that "we decided not to fix this
+yet" cannot decay into "nobody remembered." Each has an issue file or an audit row — this page
+carries the schedule, not the detail.
+
+**Correctness — latent, unreachable on today's paths:**
+- [ ] `_col_dl_ic_g2`'s tie branch applies orientation twice (`s2 * cr > 0` where the determinant
+      says `s2 > 0`) — `src/collision_mesh.cyr:292`, while the M³ branch at `:274` is correct for
+      both signs. Exact-rational check: 0 mismatches on cyclic pairs, **8,737 of 8,737 on
+      anti-cyclic**. Unreachable only because callers always pass CCW triangles. The real decision
+      is whether to handle `cr == -1` or to **assert** the CCW precondition.
+      → [`issues/2026-08-05-two-ghost-tie-branch-sign-rule-inconsistent.md`](issues/2026-08-05-two-ghost-tie-branch-sign-rule-inconsistent.md)
+- [ ] `_col_in_circumcircle` adaptive exact predicate — carried since 2.7.0, still latent (0/180
+      under real `delaunay_2d` geometry).
+      → [`issues/2026-08-04-incircle-precision.md`](issues/2026-08-04-incircle-precision.md)
+
+**Consistency — two siblings answering the same question differently:**
+- [ ] `mpr_intersect` vs `gjk_intersect_3d` diverge at exact tangency. 2.9.0 repaired
+      `gjk_intersect_3d` and left `mpr_intersect` on the strict reading, so the pair that agreed
+      before now does not. Recorded as the addendum row in the 2026-08-04 audit. Note the earlier
+      "26 of 3,012, all exact tangencies" characterisation was **not** independently reproduced —
+      one sweep found 0 disagreements and only coincident degenerate pairs diverging. Re-measure
+      before acting.
+
+**Coverage the mutation sweep could not close honestly:**
+- [ ] U6–U11: six EPA repairs whose mutants produce **bit-identical** output because `_epa_polish`
+      recovers the answer whenever `certified == 0`. There is no observable to assert on until it
+      is decided whether that redundancy is intended. **A design question, not a missing test** —
+      writing assertions here without answering it first would be padding.
+- [ ] The `mpr_penetration` arena bound clears its injection by 32 B (0.125%); the other three
+      bounds clear theirs by 65–129%. That fixture runs too few iterations for a per-face leak to
+      show, so a differently-shaped partial regression could still pass. Needs a fixture with more
+      iterations, not a tighter number.
+
+**Process — the gate this arc argued for but could not finish:**
+- [ ] `scripts/check-measurements.sh` is built and **not adoptable**. It flags measurement-shaped
+      claims lacking a provenance marker (0 of 417 in-tree claims carry one), but an adversarial
+      test planted ten realistically-phrased claims and it **missed eight** — its shapes only know
+      `ns|us|ms` and comma-grouped byte counts, so "0.9 seconds before, 0.4 after" and "998400
+      bytes" sail through. A gate that flags noise while missing real claims is worse than none.
+      Either fix recall or drop it; do not enable it as-is. The motivating evidence stands: two
+      false measurements reached committed text in two cycles, both caught by a reader, neither by
+      a gate.
+
+**Performance, demand-gated** (measured, filed, no consumer blocked):
+- [ ] `delaunay_2d`, `_kd_partition`, `triangulate_polygon`
+      → [`issues/2026-08-04-perf-delaunay_2d.md`](issues/2026-08-04-perf-delaunay_2d.md),
+      [`issues/2026-08-04-perf-kd_partition.md`](issues/2026-08-04-perf-kd_partition.md),
+      [`issues/2026-08-04-perf-triangulate_polygon.md`](issues/2026-08-04-perf-triangulate_polygon.md)
+
+**Toolchain issues** are tracked upstream in the cyrius repo, not here:
+`cyrius-cli-arg-clobbers-source`, `cyrius-for-empty-clauses`, `cyrius-interval-ident-lex`.
+The 2026-08-05 `alloc_reset` defect filed during this arc was **fixed upstream in 6.5.8** and
+archived — the workaround it required has been removed.
+
+---
+
 
 ## 2.10.0 — differentiable geometry
 

@@ -179,12 +179,50 @@ fn cmat_rows(m) { return load64(m); }
 fn cmat_cols(m) { return load64(m + 8); }
 fn _cmat_data(m) { return load64(m + 16); }
 
+# RAW ACCESSORS -- PRECONDITION, NOT GUARD. Deliberately unchecked, reviewed as
+# part of the crash-tier pass and left that way; this block is the record of why,
+# so the next reader does not "fix" it.
+#
+#   PRECONDITION: m != 0, 0 <= r < cmat_rows(m), 0 <= c < cmat_cols(m).
+#   Violating it reads or writes outside the data buffer. Callers validate.
+#
+# 1. THERE IS NO ERROR CHANNEL. cmat_get's success value is a HANDLE from
+#    cx_new. Returning 0 for a bad index only moves the crash one frame out --
+#    the caller's HComplex_re(0) is load64(0) -- and returning cx_zero() is
+#    WORSE: it is bit-identical to a legitimate 0+0i element, so an out-of-range
+#    read would silently feed a real-looking zero into cmat_mul, cqr_decompose
+#    and every other consumer. A guard whose rejection value cannot be told
+#    apart from a valid answer is not a fix.
+# 2. THE VALIDATED SURFACE IS ONE LEVEL UP, and it is complete. cmat_new caps at
+#    _CMAT_MAX_ELEMS and returns the designed 0; every public cmat_* entry point
+#    -- mul, add, sub, scale, adjoint, trace, mul_vec, commutator,
+#    anticommutator, kronecker, exp, inverse, identity -- rejects that 0 before
+#    it reaches an accessor, and cmat_mul additionally enforces conformability.
+#    All of that is asserted in tests/abuse.tcyr. Every in-tree call site (39
+#    cmat_get, 58 cmat_set in src/) is inside such a validated routine.
+# 3. THEY MIRROR THE STDLIB. ganita_mat_get / ganita_mat_set (lib/ganita.cyr:53
+#    and :59) are the same two-line unchecked stride computation, and the real
+#    matrix family here is built on them. Checking only the complex half would
+#    make the two families disagree about what an accessor promises.
+# 4. IT IS THE INNER LOOP. Measured with the bounds tests temporarily added to
+#    both accessors, 120x120 complex matmul (1.728M inner iterations), best of
+#    5: 276 ms unguarded -> 294 ms guarded, +6.5%, for a check every legitimate
+#    caller has already done. Same c[0][0] checksum (583220) either way.
+#
+# The register in tests/abuse.tcyr carried `cmat_get(cmat_new(2, 2), -1, 0)` as
+# an exit-139 crash. IT IS NOT ONE -- re-measured, that call exits 0 and returns
+# 0+0i, because -1 * 2 * 16 = -32 bytes lands inside the 24-byte header the bump
+# allocator handed out just before the data buffer. What does fault is a far
+# index (+-1e8, exit 139) or a null handle (exit 139), both of which are
+# precondition violations by the contract above.
 fn cmat_get(m, r, c) {
     var off = (r * cmat_cols(m) + c) * 16;
     var dp = _cmat_data(m);
     return cx_new(load64(dp + off), load64(dp + off + 8));
 }
 
+# Same precondition as cmat_get above. Returns 0 (HSB_ERR_NONE) always -- no
+# in-tree caller reads it, and there is no failure it could report.
 fn cmat_set(m, r, c, val) {
     var off = (r * cmat_cols(m) + c) * 16;
     var dp = _cmat_data(m);

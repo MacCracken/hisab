@@ -873,14 +873,23 @@ fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
 # A:        stdlib matrix (n x n, must be symmetric).
 # n:        matrix dimension.
 # max_iter: maximum QR iterations.
-# out_vals: flat f64 array of length n (caller allocates, receives eigenvalues).
-# out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as columns).
+# out_vals: flat f64 array of length n (caller allocates, receives eigenvalues,
+#           SORTED BY DESCENDING |lambda| -- step 3 below).
+# out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as
+#           columns, permuted alongside out_vals).
 # Returns:  HSB_ERR_NONE on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded.
+#
+# The descending-|lambda| order has always been implemented here (the selection
+# sort at the end of eigen_qr) but was never stated; the 2026-08-04 audit's
+# api-consistency row recorded that eigen_symmetric returned a different,
+# undocumented order for the same contract. Both are now documented AND sorted the
+# same way -- eigen_symmetric (src/linalg_ext.cyr) was given this routine's sort.
 #
 # Algorithm:
 #   Step 1: Householder tridiagonalization  A = Q * T * Q^T
 #   Step 2: Implicit symmetric QR with Wilkinson shift on T
-#   Step 3: Eigenvalues from diagonal of T, eigenvectors from accumulated Q
+#   Step 3: Eigenvalues from diagonal of T, eigenvectors from accumulated Q,
+#           then sorted by descending |lambda| with the columns carried along
 
 # Step 1: Householder tridiagonalization of symmetric matrix
 # A: n x n symmetric matrix.
@@ -1374,12 +1383,25 @@ fn cqr_decompose(A, out_Q, out_R) {
     var min_mn = m;
     if (n < min_mn) { min_mn = n; }
 
+    # Reflector scratch, HOISTED out of the k loop (2026-08-04 audit, performance).
+    # `len` is m - k, so the k = 0 pass needs the largest buffer and every later
+    # pass fits inside it; only the leading `len` slots are ever read. The arena is
+    # a bump allocator that never frees, so the per-iteration alloc cost
+    # sum(m-k)*16 = 16*m*(m+1)/2 bytes per call -- 33,280 B on a 64x64, against
+    # 1,024 B for this single allocation. Measured per cqr_decompose(64x64) call:
+    # 32,942,104 B of arena before, 32,909,848 B after (-32,256 B). That is only
+    # -0.098% of the call's total, because the bulk is cx_new's 16 B per complex
+    # temporary inside the O(m^2 n) reflector application -- a separate problem
+    # this hoist does not claim to solve.
+    var vbuf = alloc(m * 16);
+    if (vbuf == 0) { return HSB_ERR_ALLOC; }
+
     var k = 0;
     while (k < min_mn) {
         var len = m - k;
 
         # Extract column k below diagonal as complex vector (flat: len * 16 bytes)
-        var v = alloc(len * 16);
+        var v = vbuf;
         i = 0;
         while (i < len) {
             var elem = cmat_get(out_R, k + i, k);

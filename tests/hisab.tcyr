@@ -2314,6 +2314,191 @@ assert(f64_approx_eq(load64(eqL + 24), 0xBFBDAB161234EC74, LOOSE_TOL_H) == 1, "e
 # And the eigenvector relation A*v = lambda*v, which the values alone do not pin.
 _lp_check_eig(eqA, 4, eqL, eqV, "eigen_qr 4x4 cond 240: A*v == lambda*v");
 
+# ================================================================
+# 2026-08-04 audit, api-consistency (low): eigen_symmetric and eigen_qr carry the
+# same documented contract but returned eigenvalues in DIFFERENT, undocumented
+# orders. Measured on the 2.8.4 tree (scratch harness, cyrius test, hex dumps):
+#     A = [[2,0,0],[0,3,1],[0,1,3]]   sym -> 2, 4, 2      qr -> 4, 2, 2
+#     diag(1,5,3)                     sym -> 1, 5, 3      qr -> 5, 3, 1
+#     dense C below                   sym -> 2, 3.697, 7.303   qr -> 7.303, 3.697, 2
+# eigen_qr already sorted by descending |lambda| and already had assertions
+# pinning it, so eigen_symmetric was given the SAME sort (src/linalg_ext.cyr).
+# These assertions pin the agreement itself, so the two cannot diverge again --
+# and the routine-to-routine comparison, not just a fixed expected list, is what
+# makes that true.
+# ================================================================
+
+test_group("eigen_symmetric / eigen_qr: one documented eigenvalue order");
+
+fn _eso_zero3(M) {
+    for (var i = 0; i < 3; i = i + 1) {
+        for (var j = 0; j < 3; j = j + 1) { mat_set(M, i, j, f64_from(0)); }
+    }
+    return 0;
+}
+
+# Runs both routines on the same symmetric M and asserts (a) both converge,
+# (b) both come back sorted by DESCENDING |lambda|, (c) they agree elementwise,
+# and (d) eigen_symmetric's eigenvector columns are still paired with its values
+# after the permutation. `label` is only used to keep the failures readable.
+fn _eso_agree(M, label) {
+    var sv = alloc(24);
+    var sV = mat_new(3, 3);
+    var qv = alloc(24);
+    var qV = mat_new(3, 3);
+    assert_eq(eigen_symmetric(M, 3, sv, sV), HSB_ERR_NONE, label);
+    assert_eq(eigen_qr(M, 3, 1000, qv, qV), HSB_ERR_NONE, label);
+    var bad_order = 0;
+    var bad_match = 0;
+    for (var i = 0; i < 3; i = i + 1) {
+        if (f64_approx_eq(load64(sv + i * 8), load64(qv + i * 8), LOOSE_TOL_H) == 0) {
+            bad_match = bad_match + 1;
+        }
+        if (i > 0) {
+            if (f64_gt(f64_abs(load64(sv + i * 8)), f64_abs(load64(sv + (i - 1) * 8))) == 1) {
+                bad_order = bad_order + 1;
+            }
+            if (f64_gt(f64_abs(load64(qv + i * 8)), f64_abs(load64(qv + (i - 1) * 8))) == 1) {
+                bad_order = bad_order + 1;
+            }
+        }
+    }
+    assert_eq(bad_order, 0, label);
+    assert_eq(bad_match, 0, label);
+    _lp_check_eig(M, 3, sv, sV, label);
+    _lp_check_eig(M, 3, qv, qV, label);
+    return 0;
+}
+
+# A = [[2,0,0],[0,3,1],[0,1,3]], spectrum {4, 2, 2}. This is the matrix the two
+# routines disagreed on: sym gave 2, 4, 2 and qr gave 4, 2, 2.
+var eso_A = mat_new(3, 3);
+_eso_zero3(eso_A);
+mat_set(eso_A, 0, 0, F64_TWO);
+mat_set(eso_A, 1, 1, f64_from(3)); mat_set(eso_A, 1, 2, F64_ONE);
+mat_set(eso_A, 2, 1, F64_ONE);     mat_set(eso_A, 2, 2, f64_from(3));
+_eso_agree(eso_A, "eigen_symmetric/eigen_qr agree: [[2,0,0],[0,3,1],[0,1,3]]");
+assert_eq(eigen_symmetric(eso_A, 3, alloc(24), mat_new(3, 3)), HSB_ERR_NONE,
+"eigen_symmetric returns HSB_ERR_NONE, and takes NO max_iter -- the doc named one");
+
+# The exact post-sort values for that matrix, so a regression that reorders
+# WITHOUT reordering the sibling is still caught by this file alone.
+var eso_v = alloc(24);
+var eso_V = mat_new(3, 3);
+eigen_symmetric(eso_A, 3, eso_v, eso_V);
+assert_eq(load64(eso_v), f64_from(4), "eigen_symmetric: lambda0 == 4 (was 2 -- unsorted)");
+assert_eq(load64(eso_v + 8), F64_TWO, "eigen_symmetric: lambda1 == 2");
+assert_eq(load64(eso_v + 16), F64_TWO, "eigen_symmetric: lambda2 == 2");
+
+# diag(1,5,3): Jacobi has nothing to rotate, so this is the input order verbatim
+# unless the sort runs. sym returned 1, 5, 3 before the fix.
+var eso_B = mat_new(3, 3);
+_eso_zero3(eso_B);
+mat_set(eso_B, 0, 0, F64_ONE); mat_set(eso_B, 1, 1, f64_from(5)); mat_set(eso_B, 2, 2, f64_from(3));
+_eso_agree(eso_B, "eigen_symmetric/eigen_qr agree: diag(1,5,3)");
+var eso_bv = alloc(24);
+var eso_bV = mat_new(3, 3);
+eigen_symmetric(eso_B, 3, eso_bv, eso_bV);
+assert_eq(load64(eso_bv), f64_from(5), "eigen_symmetric diag(1,5,3): lambda0 == 5 (was 1)");
+assert_eq(load64(eso_bv + 8), f64_from(3), "eigen_symmetric diag(1,5,3): lambda1 == 3 (was 5)");
+assert_eq(load64(eso_bv + 16), F64_ONE, "eigen_symmetric diag(1,5,3): lambda2 == 1 (was 3)");
+
+# Dense, no zero structure to lean on.
+var eso_C = mat_new(3, 3);
+mat_set(eso_C, 0, 0, f64_from(4)); mat_set(eso_C, 0, 1, F64_ONE);     mat_set(eso_C, 0, 2, F64_TWO);
+mat_set(eso_C, 1, 0, F64_ONE);     mat_set(eso_C, 1, 1, f64_from(3)); mat_set(eso_C, 1, 2, 0);
+mat_set(eso_C, 2, 0, F64_TWO);     mat_set(eso_C, 2, 1, 0);           mat_set(eso_C, 2, 2, f64_from(6));
+_eso_agree(eso_C, "eigen_symmetric/eigen_qr agree: dense [[4,1,2],[1,3,0],[2,0,6]]");
+
+# diag(-5,1,3) separates "descending |lambda|" from "descending lambda": -5 leads.
+# If either routine ever sorts by signed value this fails, and the doc says |.|.
+var eso_D = mat_new(3, 3);
+_eso_zero3(eso_D);
+mat_set(eso_D, 0, 0, f64_neg(f64_from(5)));
+mat_set(eso_D, 1, 1, F64_ONE);
+mat_set(eso_D, 2, 2, f64_from(3));
+_eso_agree(eso_D, "eigen_symmetric/eigen_qr agree: diag(-5,1,3)");
+var eso_dv = alloc(24);
+var eso_dV = mat_new(3, 3);
+eigen_symmetric(eso_D, 3, eso_dv, eso_dV);
+assert_eq(load64(eso_dv), f64_neg(f64_from(5)),
+"eigen_symmetric: the order is descending |lambda|, so -5 leads 3 and 1");
+
+test_group("cqr_decompose: the hoisted reflector scratch is reused, not corrupted");
+
+# 2026-08-04 audit, performance: `var v = alloc(len * 16);` sat inside
+# cqr_decompose's k loop, so a call spent sum(m-k)*16 = 16*m*(m+1)/2 bytes of a
+# bump allocator that never frees -- 33,280 B on a 64x64. It is now ONE alloc(m*16)
+# before the loop, reused by every reflector (only the leading `len` slots are
+# read). Measured per cqr_decompose(64x64) call: 32,942,104 B of arena before,
+# 32,909,848 B after (-32,256 B, exactly the triangular sum minus the one buffer).
+#
+# The real hazard of buffer reuse is not the byte count, it is a reflector reading
+# a stale tail from the previous iteration. min_mn = 4 here, so the buffer is
+# rewritten three times after its first use; these assertions would fail on any
+# staleness because Q*R would stop reproducing A.
+var cqh_A = cmat_new(4, 4);
+for (var cqhi = 0; cqhi < 4; cqhi = cqhi + 1) {
+    for (var cqhj = 0; cqhj < 4; cqhj = cqhj + 1) {
+        cmat_set(cqh_A, cqhi, cqhj,
+        cx_new(f64_from((cqhi * 7 + cqhj * 3) % 11), f64_from((cqhi + cqhj * 5) % 7)));
+    }
+}
+var cqh_Q = cmat_new(4, 4);
+var cqh_R = cmat_new(4, 4);
+assert_eq(cqr_decompose(cqh_A, cqh_Q, cqh_R), HSB_ERR_NONE, "cqr 4x4: decomposes");
+
+# Q*R == A, entrywise.
+var cqh_QR = cmat_mul(cqh_Q, cqh_R);
+var cqh_bad = 0;
+for (var cqri = 0; cqri < 4; cqri = cqri + 1) {
+    for (var cqrj = 0; cqrj < 4; cqrj = cqrj + 1) {
+        var cqh_d = cx_sub(cmat_get(cqh_QR, cqri, cqrj), cmat_get(cqh_A, cqri, cqrj));
+        if (f64_gt(cx_abs(cqh_d), LOOSE_TOL_H) == 1) { cqh_bad = cqh_bad + 1; }
+    }
+}
+assert_eq(cqh_bad, 0, "cqr 4x4: Q*R == A after the shared-buffer hoist");
+
+# Q^H Q == I: a stale tail in the reflector breaks orthogonality first.
+var cqh_QhQ = cmat_mul(cmat_adjoint(cqh_Q), cqh_Q);
+var cqh_obad = 0;
+for (var cqoi = 0; cqoi < 4; cqoi = cqoi + 1) {
+    for (var cqoj = 0; cqoj < 4; cqoj = cqoj + 1) {
+        var cqh_w = cx_zero();
+        if (cqoi == cqoj) { cqh_w = cx_one(); }
+        var cqh_e = cx_sub(cmat_get(cqh_QhQ, cqoi, cqoj), cqh_w);
+        if (f64_gt(cx_abs(cqh_e), LOOSE_TOL_H) == 1) { cqh_obad = cqh_obad + 1; }
+    }
+}
+assert_eq(cqh_obad, 0, "cqr 4x4: Q^H Q == I after the shared-buffer hoist");
+
+# R upper triangular -- the third thing a corrupted reflector would break.
+var cqh_lbad = 0;
+for (var cqli = 1; cqli < 4; cqli = cqli + 1) {
+    for (var cqlj = 0; cqlj < cqli; cqlj = cqlj + 1) {
+        if (f64_gt(cx_abs(cmat_get(cqh_R, cqli, cqlj)), LOOSE_TOL_H) == 1) {
+            cqh_lbad = cqh_lbad + 1;
+        }
+    }
+}
+assert_eq(cqh_lbad, 0, "cqr 4x4: R is upper triangular after the shared-buffer hoist");
+
+# An arena ceiling, and an HONEST one: it is coarse and cannot be otherwise.
+# The hoist removes 8*m^2 - 8*m bytes, which is 32,256 B of a 32,942,104 B call at
+# 64x64 (-0.098%) and 96 B of 14,072 B here. The rest is cx_new's 16 B per complex
+# temporary in the O(m^2 n) reflector application, so a ceiling tight enough to
+# fail on the reflector scratch ALONE would be a 0.7% window that any unrelated
+# change to complex.cyr would break. It is not written that way on purpose --
+# a test that has to be re-tuned by whoever touches a different file is worse than
+# no test. The buffer-reuse hazard is guarded by the three correctness assertions
+# above instead; this one catches a gross allocation regression.
+var cqh_Q2 = cmat_new(4, 4);
+var cqh_R2 = cmat_new(4, 4);
+var cqh_a0 = alloc_used();
+cqr_decompose(cqh_A, cqh_Q2, cqh_R2);
+assert_lt(alloc_used() - cqh_a0, 16384,
+"cqr 4x4: under 16 KB of arena per call (measured 14,072 B on this exact matrix)");
+
 test_group("solve_gmres: max_iter is a COUNTED matvec budget, not an estimate");
 
 # `max_iter` is documented as "maximum total matrix-vector products". Through

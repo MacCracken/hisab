@@ -27,10 +27,12 @@
 #     exit 1    "vec: index"  -- vec_get's own bounds abort
 #     nonzero clobber count   -- write past an out-buffer
 #
-# Cases that KILL the process cannot live in a suite that must exit 0. Eight
-# such inputs were found while building this file; each is recorded verbatim in
-# the KNOWN DEFECT register at the bottom, with its file:line and its exact
-# reproducer, so the case is documented rather than discarded.
+# Cases that KILL the process cannot live in a suite that must exit 0. Ten such
+# inputs were found while building this file; each is recorded verbatim in the
+# KNOWN DEFECT register at the bottom, with its file:line and its exact
+# reproducer, so the case is documented rather than discarded. Nine are now
+# fixed and asserted in the body above; the tenth was re-measured, found not to
+# reproduce as written, and reclassified as a documented precondition.
 
 include "src/error.cyr"
 include "src/f64_util.cyr"
@@ -338,6 +340,53 @@ assert_eq(cmat_inverse(cmat_new(100000, 100000)), 0,
 "cmat_inverse: capped cmat_new result flows straight through");
 assert_eq(cmat_exp(cmat_identity(1000000)), 0,
 "cmat_exp: capped cmat_identity result flows straight through");
+
+# --- cmat_get / cmat_set: RAW ACCESSORS, DELIBERATELY UNGUARDED ---
+#
+# The register at the bottom of this file listed these as an [OPEN] crash. They
+# were re-measured and REVIEWED, and the decision is NO GUARD -- the reasoning
+# now lives in full at src/complex.cyr above cmat_get. In short: the success
+# value of cmat_get is a HANDLE from cx_new, so a rejection can only be 0 (which
+# moves the SIGSEGV one frame out to the caller's HComplex_re(0)) or cx_zero()
+# (which is bit-identical to a legitimate 0+0i element and would feed a
+# real-looking zero into every consumer). They mirror stdlib ganita_mat_get /
+# ganita_mat_set (lib/ganita.cyr:53, :59), which are the same unchecked stride
+# computation; and with the tests temporarily added to both, a 120x120 complex
+# matmul went 276 ms -> 294 ms (+6.5%) for a check every caller has already
+# done. The validated surface is the block of assertions ABOVE this comment --
+# every public cmat_* entry point rejects the designed 0 before an accessor can
+# see it, and all 97 in-tree accessor call sites live inside those routines.
+#
+# THE REGISTER'S REPRODUCER DID NOT REPRODUCE. `cmat_get(cmat_new(2, 2), -1, 0)`
+# was recorded as exit 139; re-measured in isolation it exits 0 and returns
+# 0+0i, because -1 * 2 * 16 = -32 bytes lands inside the 24-byte header the bump
+# allocator handed out just ahead of the data buffer. What does fault is a far
+# index (r = -1e8 or +1e8, exit 139) or a null handle (exit 139) -- both
+# precondition violations, neither assertable from a suite that must exit 0.
+#
+# What IS assertable, and what these pin, is the precondition's other half: an
+# IN-BOUNDS access must stay inside the buffer at every corner, including the
+# last element, because that is the only way the documented contract can be
+# honoured by a caller who does bound its indices.
+var ab_cg = cmat_new(2, 3);
+var ab_cg_can = _ab_canary_new(8);
+var ab_cgr = 0;
+while (ab_cgr < 2) {
+    var ab_cgc = 0;
+    while (ab_cgc < 3) {
+        cmat_set(ab_cg, ab_cgr, ab_cgc, cx_new(f64_from(ab_cgr * 3 + ab_cgc + 1), F64_TWO));
+        ab_cgc = ab_cgc + 1;
+    }
+    ab_cgr = ab_cgr + 1;
+}
+assert_eq(_ab_clob(ab_cg_can, 8), 0,
+"cmat_set: filling every in-bounds slot of a 2x3 leaves the next block clean");
+assert_eq(f64_to(HComplex_re(cmat_get(ab_cg, 0, 0))), 1, "cmat_get: (0,0) round-trips");
+assert_eq(f64_to(HComplex_re(cmat_get(ab_cg, 1, 2))), 6,
+"cmat_get: the LAST element (1,2) round-trips -- stride is exact at the corner");
+assert_eq(f64_to(HComplex_im(cmat_get(ab_cg, 1, 2))), 2, "cmat_get: last element imag part");
+assert_eq(f64_to(HComplex_re(cmat_get(ab_cg, 1, 0))), 4, "cmat_get: (1,0) crosses one full row");
+assert_eq(_ab_clob(ab_cg_can, 8), 0, "cmat_get: reading every slot touches nothing");
 
 # ================================================================
 # 3. NON-CONFORMABLE OPERANDS
@@ -1361,6 +1410,91 @@ assert_eq(halfedge_from_triangles(ab_big_tri, 1, 3), 0,
 assert_neq(halfedge_from_triangles(ab_tris, 1, 3), 0,
 "halfedge_from_triangles: a well-formed single triangle builds");
 
+# --- the two accessors that halfedge_from_triangles' own output feeds ---
+#
+# halfedge_from_triangles validated n_tris, n_verts AND every vertex id; these
+# two took an index straight into vec_get and aborted the process. All six
+# signals measured on the meshes below before the guards landed:
+#   halfedge_adjacent_faces(mesh, -1)  "vec: index < 0",           exit 1
+#   halfedge_adjacent_faces(mesh, 99)  "vec: index out of bounds", exit 1
+#   halfedge_adjacent_faces(0, 0)                                  exit 139
+#   halfedge_is_boundary(mesh, -1)     "vec: index < 0",           exit 1
+#   halfedge_is_boundary(mesh, 99)     "vec: index out of bounds", exit 1
+#   halfedge_is_boundary(0, 0)                                     exit 139
+#
+# The two rejection values DIFFER on purpose. adjacent_faces returns a vec
+# HANDLE, so 0 is its error value -- and it has to be 0 rather than an empty
+# vec, because an isolated face legitimately has no neighbours and answers with
+# a non-null EMPTY vec (asserted immediately below, and in modules.tcyr).
+# is_boundary is a PREDICATE with no spare handle value: answering 0 would
+# assert "interior" about a vertex that does not exist, so it returns the
+# documented negative codes, which sit outside {0, 1} and leave both `== 1` and
+# `== 0` callers intact.
+var ab_he_one = halfedge_from_triangles(ab_tris, 1, 3);
+
+var ab_he_two_tris = vec_new();
+vec_push(ab_he_two_tris, 0);
+vec_push(ab_he_two_tris, 1);
+vec_push(ab_he_two_tris, 2);
+vec_push(ab_he_two_tris, 2);
+vec_push(ab_he_two_tris, 1);
+vec_push(ab_he_two_tris, 3);
+var ab_he_two = halfedge_from_triangles(ab_he_two_tris, 2, 4);
+assert_neq(ab_he_two, 0, "halfedge_from_triangles: two triangles sharing an edge build");
+
+# The valid answers first -- a guard that also broke these would be no fix.
+assert_neq(halfedge_adjacent_faces(ab_he_one, 0), 0,
+"halfedge_adjacent_faces: isolated face returns a NON-NULL vec");
+assert_eq(vec_len(halfedge_adjacent_faces(ab_he_one, 0)), 0,
+"halfedge_adjacent_faces: isolated face has no neighbours (empty, not rejected)");
+assert_eq(vec_len(halfedge_adjacent_faces(ab_he_two, 0)), 1,
+"halfedge_adjacent_faces: shared-edge face has exactly 1 neighbour");
+assert_eq(vec_get(halfedge_adjacent_faces(ab_he_two, 0), 0), 1,
+"halfedge_adjacent_faces: face 0's neighbour is face 1");
+assert_eq(vec_len(halfedge_adjacent_faces(ab_he_two, 1)), 1,
+"halfedge_adjacent_faces: face 1's neighbour is face 0");
+
+assert_eq(halfedge_adjacent_faces(ab_he_one, (0 - 1)), 0,
+"halfedge_adjacent_faces: face = -1 -> 0 (was 'vec: index < 0', exit 1)");
+assert_eq(halfedge_adjacent_faces(ab_he_one, (0 - 1000000)), 0,
+"halfedge_adjacent_faces: face = -1e6 -> 0");
+assert_eq(halfedge_adjacent_faces(ab_he_one, 1), 0,
+"halfedge_adjacent_faces: face = 1 on a 1-face mesh -> 0 (one past the end)");
+assert_eq(halfedge_adjacent_faces(ab_he_one, 99), 0,
+"halfedge_adjacent_faces: face = 99 -> 0 (was 'vec: index out of bounds', exit 1)");
+assert_eq(halfedge_adjacent_faces(ab_he_two, 2), 0,
+"halfedge_adjacent_faces: face = 2 on a 2-face mesh -> 0");
+assert_eq(halfedge_adjacent_faces(0, 0), 0,
+"halfedge_adjacent_faces: null mesh -> 0 (was exit 139)");
+assert_eq(halfedge_adjacent_faces(0, (0 - 1)), 0,
+"halfedge_adjacent_faces: null mesh and negative face -> 0");
+
+assert_eq(halfedge_is_boundary(ab_he_one, 0), 1,
+"halfedge_is_boundary: every vertex of a lone triangle is boundary");
+assert_eq(halfedge_is_boundary(ab_he_one, 2), 1,
+"halfedge_is_boundary: last valid vertex of a lone triangle is boundary");
+assert_eq(halfedge_is_boundary(ab_he_two, 1), 1,
+"halfedge_is_boundary: shared-edge mesh still has boundary vertices");
+assert_eq(halfedge_is_boundary(ab_he_one, (0 - 1)), HSB_ERR_OUT_OF_RANGE,
+"halfedge_is_boundary: vertex = -1 -> HSB_ERR_OUT_OF_RANGE (was 'vec: index < 0', exit 1)");
+assert_eq(halfedge_is_boundary(ab_he_one, (0 - 1000000)), HSB_ERR_OUT_OF_RANGE,
+"halfedge_is_boundary: vertex = -1e6 -> HSB_ERR_OUT_OF_RANGE");
+assert_eq(halfedge_is_boundary(ab_he_one, 3), HSB_ERR_OUT_OF_RANGE,
+"halfedge_is_boundary: vertex = 3 on a 3-vertex mesh -> HSB_ERR_OUT_OF_RANGE");
+assert_eq(halfedge_is_boundary(ab_he_one, 99), HSB_ERR_OUT_OF_RANGE,
+"halfedge_is_boundary: vertex = 99 -> HSB_ERR_OUT_OF_RANGE (was 'vec: index oob', exit 1)");
+assert_eq(halfedge_is_boundary(ab_he_two, 4), HSB_ERR_OUT_OF_RANGE,
+"halfedge_is_boundary: vertex = 4 on a 4-vertex mesh -> HSB_ERR_OUT_OF_RANGE");
+assert_eq(halfedge_is_boundary(0, 0), HSB_ERR_INVALID_INPUT,
+"halfedge_is_boundary: null mesh -> HSB_ERR_INVALID_INPUT (was exit 139)");
+assert_eq(halfedge_is_boundary(0, (0 - 1)), HSB_ERR_INVALID_INPUT,
+"halfedge_is_boundary: null mesh outranks a bad vertex index");
+# The rejection must not be mistakable for either real answer.
+assert_neq(halfedge_is_boundary(ab_he_one, 99), 0,
+"halfedge_is_boundary: rejection is not the 'interior' answer");
+assert_neq(halfedge_is_boundary(ab_he_one, 99), 1,
+"halfedge_is_boundary: rejection is not the 'boundary' answer");
+
 test_group("abuse/geometry: contact islands with out-of-range body ids");
 
 var ab_bad_contacts = vec_new();
@@ -1391,6 +1525,23 @@ while (ab_bx < 4) {
     ab_bx = ab_bx + 1;
 }
 assert_eq(bvh_build(ab_boxes, 0), 0, "bvh_build: count = 0 -> 0");
+# `count == 0` was the SAME HALF-GUARD kdtree_build carried (asserted below), and
+# this sibling kept it one cycle longer, so the pair disagreed on identical
+# malformed input. A negative count reached _bvh_build_rec(items, 0, -1), whose
+# `count = end - start` is -1, so it missed the `count == 1` leaf case and folded
+# bounds over an empty vec -- vec_get(items, 0) then aborted the process
+# ("vec: index out of bounds", exit 1, measured). aabbs = 0 is the same story one
+# level down: load64(0 + bi * 8) (exit 139, measured). bvh_build returns a
+# HANDLE, so 0 -- the documented empty tree -- is the rejection value; there is
+# no negative HSB_ERR_* to return through a pointer. Guard is now verbatim in
+# shape with kdtree_build's so the two cannot drift apart again.
+assert_eq(bvh_build(ab_boxes, (0 - 1)), 0,
+"bvh_build: count = -1 -> 0 (was 'vec: index out of bounds', exit 1)");
+assert_eq(bvh_build(ab_boxes, (0 - 1000000)), 0, "bvh_build: count = -1e6 -> 0");
+assert_eq(bvh_build(0, 4), 0, "bvh_build: aabbs = 0 -> 0 (was exit 139)");
+assert_eq(bvh_build(0, 0), 0, "bvh_build: null array and count 0 -> 0");
+assert_eq(bvh_build(0, (0 - 1)), 0, "bvh_build: null array and negative count -> 0");
+assert_neq(bvh_build(ab_boxes, 1), 0, "bvh_build: count = 1 builds a leaf");
 assert_eq(vec_len(bvh_query_ray(0, ab_ray)), 0, "bvh_query_ray: null BVH -> empty");
 assert_eq(vec_len(bvh_query_aabb(0, ab_zbox)), 0, "bvh_query_aabb: null BVH -> empty");
 
@@ -1435,6 +1586,15 @@ assert_eq(kdtree_build(ab_pts, (0 - 1)), 0,
 "kdtree_build: count = -1 -> 0 (was 'vec: index out of bounds', exit 1)");
 assert_eq(kdtree_build(ab_pts, (0 - 1000000)), 0, "kdtree_build: count = -1e6 -> 0");
 assert_eq(kdtree_build(0, 8), 0, "kdtree_build: points = 0 -> 0");
+# THE SIBLINGS MUST AGREE. bvh_build carried the identical half-guard and was
+# fixed one cycle later; these three pin the pair together so a future edit to
+# one shows up as a failure rather than as a silent divergence.
+assert_eq(kdtree_build(ab_pts, (0 - 1)), bvh_build(ab_boxes, (0 - 1)),
+"kdtree_build and bvh_build agree on count = -1");
+assert_eq(kdtree_build(ab_pts, 0), bvh_build(ab_boxes, 0),
+"kdtree_build and bvh_build agree on count = 0");
+assert_eq(kdtree_build(0, 8), bvh_build(0, 4),
+"kdtree_build and bvh_build agree on a null array");
 assert_eq(kdtree_nearest(0, ab_pts, ab_query), (0 - 1), "kdtree_nearest: null root -> -1");
 assert_eq(vec_len(kdtree_within_radius(0, ab_pts, ab_query, F64_ONE)), 0,
 "kdtree_within_radius: null root -> empty");
@@ -1462,16 +1622,26 @@ assert_eq(vec_len(kdtree_within_radius(ab_coinroot, ab_coin, hvec3_splat(f64_fro
 
 test_group("abuse/geometry: quadtree / octree / spatial hash hostile bounds");
 
+# CONVENTION CHANGE at 2.8.5 (2026-08-04 audit, api-consistency): quadtree_insert
+# and octree_insert returned 1 for "stored" and 0 for "dropped", inverted against
+# the project's 0-is-success rule and against their own sibling
+# spatial_hash_insert, which has always returned 0. The expected values in this
+# group moved with the code: stored is now HSB_ERR_NONE (0) and a dropped
+# out-of-bounds point is HSB_ERR_OUT_OF_RANGE (-3). Every assertion below still
+# tests the same behaviour -- which points are accepted and which are dropped --
+# only the encoding of the answer changed.
+
 # Inverted bounds (min > max) contain nothing, so every insert is dropped.
 var ab_qt_inv = quadtree_new(F64_ONE, F64_ONE, 0, 0, 4);
 assert_neq(ab_qt_inv, 0, "quadtree_new: inverted bounds still construct");
-assert_eq(quadtree_insert(ab_qt_inv, F64_HALF, F64_HALF, 7), 0,
+assert_eq(quadtree_insert(ab_qt_inv, F64_HALF, F64_HALF, 7), HSB_ERR_OUT_OF_RANGE,
 "quadtree_insert: point outside inverted bounds is dropped");
 
 # Zero-extent bounds are a single point, and that point IS inside.
 var ab_qt_zero = quadtree_new(0, 0, 0, 0, 4);
-assert_eq(quadtree_insert(ab_qt_zero, 0, 0, 1), 1, "quadtree_insert: zero-extent accepts its point");
-assert_eq(quadtree_insert(ab_qt_zero, F64_ONE, F64_ONE, 1), 0,
+assert_eq(quadtree_insert(ab_qt_zero, 0, 0, 1), HSB_ERR_NONE,
+"quadtree_insert: zero-extent accepts its point");
+assert_eq(quadtree_insert(ab_qt_zero, F64_ONE, F64_ONE, 1), HSB_ERR_OUT_OF_RANGE,
 "quadtree_insert: zero-extent rejects everything else");
 
 # An inverted QUERY box is separate from inverted tree bounds: run it against a
@@ -1484,14 +1654,14 @@ assert_eq(vec_len(quadtree_query(ab_qt_clean, f64_from(10), f64_from(10), 0, 0))
 "quadtree_query: inverted query box -> empty");
 
 var ab_qt = quadtree_new(0, 0, f64_from(10), f64_from(10), 4);
-assert_eq(quadtree_insert(ab_qt, _AB_PINF, _AB_NINF, 1), 0,
+assert_eq(quadtree_insert(ab_qt, _AB_PINF, _AB_NINF, 1), HSB_ERR_OUT_OF_RANGE,
 "quadtree_insert: infinite coordinates are dropped");
 # The bounds test is a pair of ORDERED comparisons (f64_lt / f64_gt), and every
 # ordered comparison against NaN is false -- so a NaN point falls through as
 # "inside" where +-Inf is correctly rejected. Recorded, not blessed: it is a
 # wrong answer, but it is bounded (max_depth caps the descent) and touches
 # nothing outside the tree, which is what the next two assertions establish.
-assert_eq(quadtree_insert(ab_qt, _AB_NAN, _AB_NAN, 1), 1,
+assert_eq(quadtree_insert(ab_qt, _AB_NAN, _AB_NAN, 1), HSB_ERR_NONE,
 "quadtree_insert: NaN passes the ordered bounds test (asymmetry vs +-Inf)");
 assert_lte(vec_len(quadtree_query(ab_qt, 0, 0, f64_from(10), f64_from(10))), 8,
 "quadtree_query: result count stays bounded after a NaN insert");
@@ -1507,15 +1677,15 @@ assert_eq(vec_len(quadtree_query(ab_qt_nd, 0, 0, f64_from(10), f64_from(10))), 3
 "quadtree: max_depth = -5 keeps every point in the root, no split recursion");
 
 var ab_ot = octree_new(hvec3_zero(), hvec3_splat(f64_from(10)), 4);
-assert_eq(octree_insert(ab_ot, hvec3_splat(_AB_NAN), 1), 1,
+assert_eq(octree_insert(ab_ot, hvec3_splat(_AB_NAN), 1), HSB_ERR_NONE,
 "octree_insert: NaN point accepted by the ordered bounds test");
-assert_eq(octree_insert(ab_ot, hvec3_splat(_AB_PINF), 1), 0,
+assert_eq(octree_insert(ab_ot, hvec3_splat(_AB_PINF), 1), HSB_ERR_OUT_OF_RANGE,
 "octree_insert: +Inf point is dropped");
 var ab_ot_zero = octree_new(hvec3_zero(), hvec3_zero(), 4);
-assert_eq(octree_insert(ab_ot_zero, hvec3_zero(), 1), 1,
+assert_eq(octree_insert(ab_ot_zero, hvec3_zero(), 1), HSB_ERR_NONE,
 "octree_insert: zero-extent accepts its own point");
 var ab_ot_inv = octree_new(hvec3_splat(f64_from(10)), hvec3_zero(), 4);
-assert_eq(octree_insert(ab_ot_inv, hvec3_one(), 1), 1,
+assert_eq(octree_insert(ab_ot_inv, hvec3_one(), 1), HSB_ERR_NONE,
 "octree_insert: inverted bounds do not fault (documented: no ordering check)");
 var ab_ot_nd = octree_new(hvec3_zero(), hvec3_splat(f64_from(10)), (0 - 3));
 var ab_oi = 0;
@@ -1526,9 +1696,10 @@ while (ab_oi < 32) {
 assert_eq(vec_len(octree_query(ab_ot_nd, hvec3_zero(), hvec3_splat(f64_from(10)))), 32,
 "octree: max_depth = -3 keeps every point in the root, no split recursion");
 
-# spatial_hash_insert validates NOTHING and always returns 0; the safety comes
-# from the bucket index being masked (`hash & (bucket_count - 1)`), so even the
-# nonsense cell coordinate that a zero / negative / NaN cell size produces
+# spatial_hash_insert validates NOTHING and always returns HSB_ERR_NONE (0) --
+# it has no bounds to fall outside of, so it has no rejection path; the safety
+# comes from the bucket index being masked (`hash & (bucket_count - 1)`), so even
+# the nonsense cell coordinate that a zero / negative / NaN cell size produces
 # lands inside the bucket array. These assertions pin that: the calls return,
 # the structure stays queryable, and every answer stays bounded by the number
 # of entries actually inserted.
@@ -1568,6 +1739,52 @@ assert_eq(vec_len(spatial_hash_query_radius(ab_sh, hvec3_zero(), F64_ONE)), 0,
 "spatial_hash_query_radius: cleared hash -> empty");
 assert_eq(vec_len(spatial_hash_query_cell(ab_sh, hvec3_zero())), 0,
 "spatial_hash_query_cell: cleared hash -> empty");
+
+test_group("spatial: the three sibling inserts share ONE return convention");
+
+# 2026-08-04 audit, api-consistency (low). Three sibling insert routines, two
+# conventions: spatial_hash_insert returned 0 on success while quadtree_insert and
+# octree_insert returned 1, so `if (insert(...) == 0)` meant "worked" for one and
+# "was dropped" for the other two. The project convention is 0 / HSB_ERR_NONE on
+# success and a negative HSB_ERR_* on failure, so the two outliers were moved onto
+# it. These assertions compare the three AGAINST EACH OTHER rather than against a
+# hardcoded number, so the group fails the moment any one of them drifts again.
+var ab_cv_qt = quadtree_new(0, 0, f64_from(10), f64_from(10), 4);
+var ab_cv_ot = octree_new(hvec3_zero(), hvec3_splat(f64_from(10)), 4);
+var ab_cv_sh = spatial_hash_new(F64_ONE);
+var ab_cv_q = quadtree_insert(ab_cv_qt, F64_ONE, F64_ONE, 1);
+var ab_cv_o = octree_insert(ab_cv_ot, hvec3_one(), 1);
+var ab_cv_s = spatial_hash_insert(ab_cv_sh, hvec3_one(), 1);
+assert_eq(ab_cv_q, ab_cv_s, "quadtree_insert and spatial_hash_insert agree on success");
+assert_eq(ab_cv_o, ab_cv_s, "octree_insert and spatial_hash_insert agree on success");
+assert_eq(ab_cv_q, HSB_ERR_NONE, "quadtree_insert: success is HSB_ERR_NONE (was 1)");
+assert_eq(ab_cv_o, HSB_ERR_NONE, "octree_insert: success is HSB_ERR_NONE (was 1)");
+assert_eq(ab_cv_s, HSB_ERR_NONE, "spatial_hash_insert: success is HSB_ERR_NONE (unchanged)");
+
+# The point really was stored -- a convention change that quietly turned success
+# into a no-op would otherwise satisfy every assertion above.
+assert_eq(vec_len(quadtree_query(ab_cv_qt, 0, 0, f64_from(10), f64_from(10))), 1,
+"quadtree_insert: an HSB_ERR_NONE insert actually stored the point");
+assert_eq(vec_len(octree_query(ab_cv_ot, hvec3_zero(), hvec3_splat(f64_from(10)))), 1,
+"octree_insert: an HSB_ERR_NONE insert actually stored the point");
+assert_eq(vec_len(spatial_hash_query_cell(ab_cv_sh, hvec3_one())), 1,
+"spatial_hash_insert: an HSB_ERR_NONE insert actually stored the point");
+
+# Failure is NEGATIVE, and distinguishable from success -- the whole point of
+# moving off 1/0, where "dropped" and "the project's success value" were the same
+# integer. A dropped point must also leave the structure unchanged.
+var ab_cv_qbad = quadtree_insert(ab_cv_qt, f64_from(1000), f64_from(1000), 2);
+var ab_cv_obad = octree_insert(ab_cv_ot, hvec3_splat(f64_from(1000)), 2);
+assert_eq(ab_cv_qbad, HSB_ERR_OUT_OF_RANGE, "quadtree_insert: dropped -> HSB_ERR_OUT_OF_RANGE");
+assert_eq(ab_cv_obad, HSB_ERR_OUT_OF_RANGE, "octree_insert: dropped -> HSB_ERR_OUT_OF_RANGE");
+assert_lt(ab_cv_qbad, 0, "quadtree_insert: the failure value is negative");
+assert_lt(ab_cv_obad, 0, "octree_insert: the failure value is negative");
+assert_neq(ab_cv_qbad, ab_cv_q, "quadtree_insert: failure is not the success value");
+assert_neq(ab_cv_obad, ab_cv_o, "octree_insert: failure is not the success value");
+assert_eq(vec_len(quadtree_query(ab_cv_qt, 0, 0, f64_from(10), f64_from(10))), 1,
+"quadtree_insert: a dropped point is not stored");
+assert_eq(vec_len(octree_query(ab_cv_ot, hvec3_zero(), hvec3_splat(f64_from(10)))), 1,
+"octree_insert: a dropped point is not stored");
 
 test_group("abuse/geometry: narrowphase on point-like (zero-radius) shapes");
 
@@ -1634,6 +1851,37 @@ test_group("abuse: number-theoretic routines with non-positive arguments");
 
 assert_eq(num_modinv(3, 0), (0 - 1), "num_modinv: m = 0 -> -1");
 assert_eq(num_modinv(3, (0 - 7)), (0 - 1), "num_modinv: m = -7 -> -1");
+
+# num_modpow guarded `modulus == 1` and not `modulus == 0`, so the next line --
+# `base % modulus` -- was an integer divide by zero: num_modpow(2, 10, 0) raised
+# SIGFPE, exit 136 (measured). x mod 0 is undefined in the mathematics too, so
+# there is no residue to return; HSB_ERR_DIVISION_BY_ZERO is the code num.cyr
+# already uses for exactly this. The other three cases were not crashes but
+# silent WRONG NUMBERS -- measured against a verbatim copy of the pre-fix body:
+# (2, 10, -3) -> 1, (2, -1, 5) -> 1, and (-2, 3, 5) -> 0 where the true residue
+# is 2. The header always said the arguments are non-negative; now it is
+# enforced, so every legal call answers in [0, modulus) and a negative return is
+# unambiguously an error code.
+assert_eq(num_modpow(2, 10, 0), HSB_ERR_DIVISION_BY_ZERO,
+"num_modpow: modulus = 0 -> HSB_ERR_DIVISION_BY_ZERO (was SIGFPE, exit 136)");
+assert_eq(num_modpow(0, 0, 0), HSB_ERR_DIVISION_BY_ZERO,
+"num_modpow: all-zero arguments -> HSB_ERR_DIVISION_BY_ZERO");
+assert_eq(num_modpow(2, 10, (0 - 3)), HSB_ERR_INVALID_INPUT,
+"num_modpow: modulus = -3 -> HSB_ERR_INVALID_INPUT (was 1)");
+assert_eq(num_modpow(2, (0 - 1), 5), HSB_ERR_INVALID_INPUT,
+"num_modpow: exp = -1 -> HSB_ERR_INVALID_INPUT (was 1)");
+assert_eq(num_modpow((0 - 2), 3, 5), HSB_ERR_INVALID_INPUT,
+"num_modpow: base = -2 -> HSB_ERR_INVALID_INPUT (was 0; true residue is 2)");
+# The legal surface is unchanged -- the guard rejects, it does not re-answer.
+assert_eq(num_modpow(2, 10, 1000), 24, "num_modpow: 2^10 mod 1000 still 24");
+assert_eq(num_modpow(5, 3, 1), 0, "num_modpow: modulus = 1 still 0");
+assert_eq(num_modpow(0, 0, 7), 1, "num_modpow: 0^0 mod 7 -> 1 (empty product)");
+assert_eq(num_modpow(0, 5, 7), 0, "num_modpow: 0^5 mod 7 -> 0");
+assert_eq(num_modpow(7, 0, 13), 1, "num_modpow: exp = 0 -> 1");
+# num_is_prime routes every Miller-Rabin witness through num_modpow; the guards
+# must not have disturbed it.
+assert_eq(num_is_prime(3037218841), 1, "num_is_prime: 3037218841 is prime (modpow path intact)");
+assert_eq(num_is_prime(3037218843), 0, "num_is_prime: 3037218843 is composite");
 assert_eq(num_is_prime((0 - 7)), 0, "num_is_prime: -7 -> 0");
 assert_eq(num_is_prime(0), 0, "num_is_prime: 0 -> 0");
 assert_eq(num_is_prime(1), 0, "num_is_prime: 1 -> 0");
@@ -2146,16 +2394,25 @@ assert_eq(sizeof(Interval) % 8, 0, "sizeof(Interval) is 8-byte aligned");
 # to exit 0; they were recorded here verbatim so the case was documented rather
 # than discarded. Every reproducer was run in isolation and its signal observed.
 #
-# Each is a HALF-GUARD or a MISSING NULL CHECK on a public entry point whose own
-# sibling already validates the same surface -- not a raw-accessor precondition.
+# All but the last are a HALF-GUARD or a MISSING NULL CHECK on a public entry
+# point whose own sibling already validates the same surface. The last one --
+# cmat_get / cmat_set -- turned out on review to be the opposite: a raw-accessor
+# precondition, kept and documented rather than guarded. See its entry.
 #
-# STATUS, [Unreleased] crash-tier pass: the six entries marked [FIXED] below are guarded in src/ and
-# every one of their reproducers is now a live assertion in the body of this
-# file -- the input returns its documented error code cleanly instead of ending
-# the process. They are kept here, struck through rather than deleted, so the
-# defect and its measured signal stay on the record next to the assertion that
-# replaced it. The four entries marked [OPEN] are NOT fixed: nothing in this pass
-# touched them and they still kill the process, so they still may not be called.
+# STATUS, [Unreleased] crash-tier pass: NOTHING IN THIS REGISTER STILL KILLS THE
+# PROCESS. The nine entries marked [FIXED] below are guarded in src/ and every
+# one of their reproducers is now a live assertion in the body of this file --
+# the input returns its documented error code cleanly instead of ending the
+# process. They are kept here, struck through rather than deleted, so the defect
+# and its measured signal stay on the record next to the assertion that replaced
+# it.
+#
+# The tenth entry, cmat_get / cmat_set, is now [BY DESIGN] rather than [OPEN]:
+# re-measured, its recorded reproducer does not reproduce, and the surface it
+# describes is a documented precondition on a raw accessor, not a half-guard.
+# The reasoning for leaving it unguarded is in src/complex.cyr above cmat_get and
+# summarised at the assertions in section 2 of this file. It is the one entry
+# whose calls still may not all be made from a suite that must exit 0.
 #
 # ---------------- [FIXED] -- crash tier, [Unreleased] ----------------
 #
@@ -2254,34 +2511,87 @@ assert_eq(sizeof(Interval) % 8, 0, "sizeof(Interval) is 8-byte aligned");
 #     documented empty/failure value is already 0, so there is no negative
 #     HSB_ERR_* to hand back through a pointer. Asserted above.
 #
-# ---------------- [OPEN] -- still kill the process, do NOT call ----------------
-#
-# --- src/geo_advanced.cyr:1425  bvh_build(aabbs, count)                 [OPEN]
-#     Identical half-guard to kdtree_build. NOT fixed in this pass -- kdtree_build
-#     was fixed and this was not, so the siblings now disagree; whoever takes this
-#     should copy the kdtree_build guard verbatim.
+# --- src/geo_advanced.cyr:1425  bvh_build(aabbs, count)                [FIXED]
+#     THE HALF-GUARD'S OTHER HALF. kdtree_build (above) was fixed a cycle
+#     earlier and this, its sibling, was not -- so for one release the two
+#     answered the same malformed input differently: one returned 0, the other
+#     ended the process.
 #       bvh_build(boxes, (0 - 1));        "vec: index out of bounds", exit 1
+#       bvh_build(0, 2);                                              exit 139
+#     (The null-array case was not in the original entry; measured while fixing.)
+#     A negative count reached _bvh_build_rec(items, 0, -1), whose
+#     `count = end - start` is -1, so it missed the `count == 1` leaf case and
+#     folded bounds over an empty vec.
+#     FIX: kdtree_build's guard, copied verbatim in shape so the pair cannot
+#     drift again -- `count <= 0` and a null array both return 0. 0 is the right
+#     rejection value and not a dodge: the header at :1424 already documents
+#     bvh_build as returning a node HANDLE whose empty value is 0, so there is no
+#     negative HSB_ERR_* to hand back through a pointer. Asserted above,
+#     including three assertions that pin bvh_build's answer to kdtree_build's on
+#     the same input.
 #
-# --- src/collision_mesh.cyr:851 / :870                                  [OPEN]
+# --- src/collision_mesh.cyr:851 / :870                                 [FIXED]
 #       halfedge_adjacent_faces(mesh, face) / halfedge_is_boundary(mesh, vertex)
 #     Neither bounds its index before vec_get, although halfedge_from_triangles
-#     (:719, asserted above) validates n_tris, n_verts AND every vertex id.
+#     (:719, asserted above) validates n_tris, n_verts AND every vertex id --
+#     including the face and vertex ids these two are then called with.
 #       halfedge_adjacent_faces(mesh, (0 - 1));   "vec: index < 0",        exit 1
 #       halfedge_adjacent_faces(mesh, 99);        "vec: index out of bounds", exit 1
+#       halfedge_adjacent_faces(0, 0);                                   exit 139
 #       halfedge_is_boundary(mesh, (0 - 1));      "vec: index < 0",        exit 1
+#       halfedge_is_boundary(mesh, 99);           "vec: index out of bounds", exit 1
+#       halfedge_is_boundary(0, 0);                                      exit 139
+#     (The last three were not in the original entry; measured while fixing.)
+#     FIX, AND THE TWO REJECTION VALUES DIFFER ON PURPOSE.
+#     halfedge_adjacent_faces returns a vec HANDLE, so its error value is 0 --
+#     and it must be 0 rather than an empty vec, because an isolated face
+#     legitimately has no neighbours and answers with a non-null EMPTY vec
+#     (asserted above, and in modules.tcyr:3157). halfedge_is_boundary is a
+#     PREDICATE with no spare handle value: 0 would assert "interior" about a
+#     vertex that does not exist and 1 would assert "boundary", so it returns
+#     HSB_ERR_OUT_OF_RANGE / HSB_ERR_INVALID_INPUT, which sit outside {0, 1} and
+#     leave both `== 1` and `== 0` callers intact. Asserted above.
 #
-# --- src/num.cyr:429  num_modpow(base, exp, modulus)                    [OPEN]
+# --- src/num.cyr:429  num_modpow(base, exp, modulus)                   [FIXED]
 #     Guards modulus == 1 but not modulus == 0; `base % modulus` is an integer
 #     divide by zero.
 #       num_modpow(2, 10, 0);                     SIGFPE, exit 136
+#     FIX: HSB_ERR_DIVISION_BY_ZERO -- x mod 0 is undefined in the mathematics,
+#     so there is no residue to return, and num.cyr:51 already uses that code for
+#     exactly this. While measuring it, three NON-crash siblings turned up in the
+#     same signature: the header said "all arguments are non-negative integers"
+#     and nothing enforced it, so (2, 10, -3) returned 1, (2, -1, 5) returned 1,
+#     and (-2, 3, 5) returned 0 where the true residue is 2 -- all three measured
+#     against a verbatim copy of the pre-fix body. They now return
+#     HSB_ERR_INVALID_INPUT, which also makes the return space unambiguous: every
+#     legal call answers in [0, modulus), so a negative result is an error code.
+#     Asserted above, valid cases and the num_is_prime path included.
 #
 # --- src/complex.cyr:182 / :188  cmat_get(m, r, c) / cmat_set(m, r, c, val)
-#     [OPEN] Unchecked index arithmetic: off = (r * cols + c) * 16 with no bounds
-#     test.
-#       cmat_get(cmat_new(2, 2), (0 - 1), 0);                             exit 139
-#     Lower severity than the above -- these mirror the stdlib mat_get / mat_set
-#     raw-accessor convention -- but hisab's own cmat_new IS guarded, so the
-#     accessors are the only unchecked surface left in the cmat family.
+#     [BY DESIGN -- reviewed, deliberately NOT guarded]
+#     REPRODUCER CORRECTED: this entry recorded
+#       cmat_get(cmat_new(2, 2), (0 - 1), 0);                            exit 139
+#     and that call does NOT crash -- re-measured in isolation it exits 0 and
+#     returns 0+0i, because -1 * 2 * 16 = -32 bytes lands inside the 24-byte
+#     header the bump allocator handed out just ahead of the data buffer. What
+#     does fault is a FAR index (r = +-1e8, exit 139) or a null handle
+#     (cmat_get(0, 0, 0), exit 139), both measured.
+#     DECISION: no guard. Unlike every other entry in this register these are not
+#     half-guarded public entry points but raw accessors with a stated
+#     precondition, and there is no rejection value that is not worse than the
+#     precondition: cmat_get's success value is a HANDLE from cx_new, so 0 merely
+#     moves the SIGSEGV to the caller's HComplex_re(0), and cx_zero() is
+#     bit-identical to a legitimate 0+0i element -- a wrong answer wearing a
+#     valid answer's clothes. They also mirror stdlib ganita_mat_get /
+#     ganita_mat_set (lib/ganita.cyr:53, :59), which are the same unchecked
+#     stride computation, and they are the inner loop: with the tests temporarily
+#     added to both, a 120x120 complex matmul went 276 ms -> 294 ms (+6.5%).
+#     The surface a caller can actually reach IS validated, one level up: every
+#     public cmat_* entry point rejects cmat_new's designed 0 before an accessor
+#     sees it (asserted above), and all 97 in-tree accessor call sites are inside
+#     those routines. Full reasoning at src/complex.cyr above cmat_get; the
+#     in-bounds half of the precondition -- including the last element and a
+#     canary on the block after the buffer -- is asserted above.
 # ================================================================
 
 var r = assert_summary();

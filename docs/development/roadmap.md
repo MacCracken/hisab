@@ -126,6 +126,23 @@ out-params on **every** return path, so a `1` return always carries a readable n
    column to record it in. That is the 2.7.0 failure recurring, and it is the argument for the
    column existing at all.
 
+   **CLOSED 2026-08-05.** The low tier was worked as one pass; all five dispositions in the audit
+   table are now `FIXED`, each with a measured before/after and a mutation-proved guard. Two of the
+   five were **understated by their own tier**: `quadtree_new`/`octree_new`'s uncapped `max_depth`
+   was a measured **SIGSEGV** (exit 139 at `max_depth` 23,906, 8 MiB stack, 64 coincident points),
+   now capped at `_SP_MAX_TREE_DEPTH = 1075` — a value taken from measurement (1 ULP apart at 0.5
+   separates at depth 53; 0 against the smallest denormal at depth 1074) rather than picked round;
+   and the `spatial_hash_insert` return-convention row is a **breaking API change**
+   (`quadtree_insert`/`octree_insert` now return `HSB_ERR_NONE` / `HSB_ERR_OUT_OF_RANGE` instead of
+   1 / 0), with a migration note in the CHANGELOG. Two sub-claims inside the
+   allocation-inside-loop row did **not** survive: `src/tensor.cyr:217` was already hoisted
+   (**REFUTED**, 1,272 B per call measured identical before and after), and that row's fourth site
+   is truncated to `src/geo_` in the audit's own text in `70e7c8b` as well as HEAD and stays
+   **UNRESOLVED** rather than guessed at. A brace-depth scan of `src/` while resolving it found
+   **six allocation-in-loop sites the audit never named**, all in `solve_gmres`'s restart loop
+   (`src/linalg_ext.cyr:386, 390, 395, 401, 402, 488` — `v_basis`, `h`, `g`, `cs`, `sn`, `y`);
+   they are **not fixed** and are carried forward as the one item this pass leaves behind.
+
 **The one narrowphase defect still open**, deferred out of 2.8.3 deliberately rather than missed:
 `gjk_epa_3d` and `gjk_intersect_3d` **disagree** on 4 of 90 swept pairs — exact tangency in both
 operand orders, and two coincident degenerate-point pairs. `gjk_epa_3d` is the correct one (two

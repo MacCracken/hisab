@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- **`quadtree_insert` and `octree_insert` now return `HSB_ERR_NONE` (0) on success and
+  `HSB_ERR_OUT_OF_RANGE` (−3) for a point dropped as out of bounds.** They returned `1` and `0`.
+  The 2026-08-04 audit's api-consistency row recorded three sibling insert routines carrying two
+  conventions: `spatial_hash_insert` has always returned 0 on success, matching the project rule
+  that 0 / `HSB_ERR_NONE` is success and a negative `HSB_ERR_*` is failure, while its two siblings
+  inverted it — so `if (insert(…) == 0)` meant "stored" for one and "dropped" for the other two.
+  `spatial_hash_insert` was the one already correct, so the outliers moved onto it.
+
+  **Migration.** A caller that ignores the return is unaffected — that is every call site in `src/`
+  (there are none) and every one in `tests/` that was not asserting on the value.
+  - `if (quadtree_insert(qt, x, y, d) == 1) { … }`  →  `if (quadtree_insert(qt, x, y, d) == HSB_ERR_NONE) { … }`
+  - `if (octree_insert(ot, p, d) == 0) { /* dropped */ }`  →  `if (octree_insert(ot, p, d) < 0) { /* dropped */ }`
+
+  The failure value is now negative and distinguishable from success, which the old encoding could
+  not be: "dropped" was the same integer as the project's success value. `spatial_hash_insert` is
+  unchanged in behaviour; its return contract, previously undocumented, is now stated (it has no
+  bounds to fall outside of, so it has no rejection path and always returns `HSB_ERR_NONE`).
+  Guarded by `tests/abuse.tcyr`, *"spatial: the three sibling inserts share ONE return convention"*,
+  which compares the three against **each other** rather than against hardcoded numbers.
+
 ### Fixed
 
 - **collision_core — `sequential_impulse` computed an identically-zero friction impulse.** The
@@ -84,24 +106,131 @@
     (`"vec: index out of bounds"`, exit 1). Now `count <= 0` and a null point array both return the
     documented empty-tree 0; the function returns a node **handle**, so there is no negative
     `HSB_ERR_*` to hand back through a pointer.
-- **tests/abuse.tcyr** — **577 → 632 assertions**, and the register shrinks from ten entries to four.
-  Each of the six repaired reproducers is now an executable assertion, including the canary check
-  that catches the `cqr_decompose` overrun as a **test failure** (`got 2, expected 0`) rather than
-  as luck. The four untouched entries (`bvh_build`, the two `halfedge_*` accessors, `num_modpow`,
-  `cmat_get`/`cmat_set`) are kept and marked `[OPEN]` — they still kill the process. One register
-  reproducer was also **wrong as written** and is corrected: `eigen_qr(mat_new(3, 3), 3, 50, 0,
-  mat_new(3, 3))` exits 0, not 139, because an all-zero A returns from the tridiagonal QR before it
-  ever writes an eigenvalue; the null is only dereferenced on an A that converges, e.g.
-  `diag(2, 3, 4)`.
+- **The crash tier, part two — the last four register entries.** The register is now empty of
+  `[OPEN]`: three were repaired and the fourth was re-measured and reclassified. Every signal below
+  was measured with a standalone probe (raw exit code) before `src/` was touched.
+  - **geo_advanced — `bvh_build` carried `kdtree_build`'s half-guard one cycle longer.** The two
+    siblings therefore disagreed about the same malformed input: one returned 0, the other ended
+    the process. A negative count reached `_bvh_build_rec(items, 0, -1)`, whose
+    `count = end - start` is −1, so it missed the `count == 1` leaf case and folded bounds over an
+    empty vec — `bvh_build(boxes, -1)` aborted with `"vec: index out of bounds"`, exit 1, and
+    `bvh_build(0, 2)` (a null array, not in the register) exited 139. `kdtree_build`'s guard is now
+    copied **verbatim in shape**, and three assertions pin `bvh_build`'s answer to `kdtree_build`'s
+    on identical input so the pair cannot drift again. 0 is the correct rejection value and not a
+    dodge: the header at `geo_advanced.cyr:1424` already documents the return as a node **handle**
+    whose empty value is 0.
+  - **collision_mesh — `halfedge_adjacent_faces` and `halfedge_is_boundary` took an unbounded index
+    into `vec_get`,** while `halfedge_from_triangles` — the function that produces the very face and
+    vertex ids they are called with — validates `n_tris`, `n_verts` and every vertex id. Six
+    measured signals: `(mesh, -1)` `"vec: index < 0"` exit 1, `(mesh, 99)` `"vec: index out of
+    bounds"` exit 1, and `(0, 0)` exit 139, for each of the two. **The two rejection values differ
+    on purpose.** `halfedge_adjacent_faces` returns a vec **handle**, so its error value is 0 — and
+    it must be 0 rather than an empty vec, because an isolated face legitimately has no neighbours
+    and answers with a non-null **empty** vec. `halfedge_is_boundary` is a **predicate** with no
+    spare handle value: 0 would assert "interior" about a vertex that does not exist, so it returns
+    `HSB_ERR_OUT_OF_RANGE` / `HSB_ERR_INVALID_INPUT`, which sit outside `{0, 1}` and leave both
+    `== 1` and `== 0` callers intact.
+  - **num — `num_modpow` guarded `modulus == 1` but not `modulus == 0`,** so the next line,
+    `base % modulus`, was an integer divide by zero: `num_modpow(2, 10, 0)` raised **SIGFPE, exit
+    136**. It now returns `HSB_ERR_DIVISION_BY_ZERO` — `x mod 0` is undefined in the mathematics
+    too, and `num.cyr:51` already uses that code for exactly this. Measuring it turned up three
+    **non-crash** siblings in the same signature: the header said "all arguments are non-negative
+    integers" and nothing enforced it, so — measured against a verbatim copy of the pre-fix body —
+    `(2, 10, -3)` returned **1**, `(2, -1, 5)` returned **1**, and `(-2, 3, 5)` returned **0** where
+    the true residue is 2 (a negative base reaches `_num_mulmod` as its `b`, whose own
+    `while (b > 0)` never runs, collapsing the accumulator). All three now return
+    `HSB_ERR_INVALID_INPUT`, which also makes the return space unambiguous: every legal call answers
+    in `[0, modulus)`, so a negative result is an error code.
+- **tests/abuse.tcyr** — **the KNOWN DEFECT REGISTER is discharged.** It opened this cycle at ten
+  entries, every one of them an input that could not be executed inside a suite that has to exit 0.
+  Nine are now repaired and live assertions — including the canary check that catches the
+  `cqr_decompose` overrun as a **test failure** (`got 2, expected 0`) rather than as luck — and the
+  tenth, `cmat_get` / `cmat_set`, is re-measured and reclassified `[BY DESIGN]` (see Changed). No
+  `[OPEN]` entry remains. Two register reproducers were **wrong as written** and are corrected in
+  place rather than trusted: `eigen_qr(mat_new(3, 3), 3, 50, 0, mat_new(3, 3))` exits 0, not 139,
+  because an all-zero A returns from the tridiagonal QR before it ever writes an eigenvalue (the
+  null is only dereferenced on an A that converges, e.g. `diag(2, 3, 4)`); and
+  `cmat_get(cmat_new(2, 2), -1, 0)` exits 0 returning `0+0i`, not 139. The suite ends this pass at
+  **732 assertions, 0 failed**.
+- **spatial — `quadtree_new` / `octree_new` stored the caller's `max_depth` uncapped, and it was the
+  only bound on the insert recursion.** Coincident points always route into the same child, so past
+  the node capacity every insert drives a split chain the *full* depth. Measured on this machine
+  (`ulimit -s` 8192, 64 coincident points): the quadtree exits 0 at `max_depth` 23,750 and
+  **SIGSEGVs (139) at 23,906**; the octree exits 0 at 20,000 and SIGSEGVs at 30,000. The arena — a
+  bump allocator that never frees — grew 1,216 B per quadtree level and 6,144 B per octree level,
+  i.e. **24.3 MB and 123 MB at `max_depth` 20,000**. Both constructors now clamp to
+  `[0, _SP_MAX_TREE_DEPTH]` with `_SP_MAX_TREE_DEPTH = 1075`. The cap is measured, not guessed: in a
+  unit root box a split separates two coordinates only while the cell is wider than the gap between
+  them, and the deepest depth at which that is still possible is 53 for two coordinates 1 ULP apart
+  at 0.5 and **1074 for 0 against the smallest positive denormal** — so 1075 keeps every separation
+  f64 can express and truncates only the case where no depth would ever have helped. At the cap the
+  pathological chain costs a bounded **1,311,304 B (quadtree) / 6,606,992 B (octree)**, measured, and
+  `max_depth` 1e6 and 2^31−1 now allocate byte-identically to the cap. Capping degrades nothing to
+  incorrect: an over-full leaf is still answered by linear scan. A negative `max_depth` already meant
+  "never split" and is clamped to 0, which is the same behaviour written down. Removing the clamp
+  makes `cyrius test tests/modules.tcyr` exit **139**.
+- **geo — `geo_ray_plane`'s doc block stated the opposite convention to the code**, on the line
+  directly above the 2.7.0 note that corrects it: *"Returns t >= 0 on hit, -1 on miss (negative
+  sentinel, not 0, to distinguish t=0 hits)"*. The **code is right** — `src/geo.cyr:5` and the
+  ray-section header both promise 0 on a miss, and every sibling `geo_ray_*` returns 0 — so the doc
+  line was replaced, not the code. While pinning it, the one thing the stale line gestured at turned
+  out to be real in a way nobody had recorded: a `t = 0` grazing hit returns **−0.0**
+  (`0x8000000000000000`) when `denom < 0` and **+0.0** when `denom > 0`, the latter byte-identical to
+  a miss. Both are `f64`-equal to zero, so no `f64_lt` / `f64_gt` / `f64_eq` test separates a grazing
+  hit from a miss either way; the raw bits must not be read as a discriminator. That is now stated in
+  the doc and pinned by ten assertions in `tests/modules.tcyr`. Reverting the code to the `-1`
+  sentinel fails 6 of them.
+- **linalg_ext — `eigen_symmetric`'s doc named a `max_iter` parameter that does not exist**, directly
+  above a four-parameter signature that has never had one (*"HSB_ERR_NO_CONVERGENCE if max_iter
+  exceeded"*). The budget belongs to `ganita_mat_eigen_sym` (`lib/ganita.cyr:890`,
+  `100 * n * n`) and is not caller-settable. Corrected.
 
 ### Changed
 
+- **`num_modpow` rejects negative `base`, `exp` or `modulus` with `HSB_ERR_INVALID_INPUT` instead of
+  silently returning a wrong number** (see above). No in-tree caller is affected — the only one,
+  `_num_miller_rabin_test`, passes `a % n` with `n > 3` odd — and no assertion covered the negative
+  cases before this. Consumers relying on the old values were relying on undefined behaviour of a
+  documented-non-negative contract.
+- **`cmat_get` / `cmat_set` are confirmed unguarded raw accessors — reviewed and deliberately left
+  that way**, with the reasoning recorded in `src/complex.cyr` so the next reader does not "fix"
+  it. Unlike every other register entry these are not half-guarded public entry points but
+  accessors with a stated precondition, and no rejection value beats the precondition:
+  `cmat_get`'s success value is a **handle** from `cx_new`, so returning 0 merely moves the SIGSEGV
+  to the caller's `HComplex_re(0)`, and returning `cx_zero()` is bit-identical to a legitimate
+  `0+0i` element — a wrong answer wearing a valid answer's clothes. They also mirror stdlib
+  `ganita_mat_get` / `ganita_mat_set` (`lib/ganita.cyr:53`, `:59`), the same unchecked stride
+  computation; and they are the inner loop — with bounds tests temporarily added to both, a 120×120
+  complex matmul went **276 ms → 294 ms (+6.5%)**, same `c[0][0]` checksum, for a check every
+  legitimate caller has already done. The surface a caller can actually reach **is** validated one
+  level up: every public `cmat_*` entry point rejects `cmat_new`'s designed 0 before an accessor
+  sees it, and all 97 in-tree accessor call sites (39 `cmat_get`, 58 `cmat_set`) are inside those
+  routines. **The register's reproducer did not reproduce**: `cmat_get(cmat_new(2, 2), -1, 0)` was
+  recorded as exit 139, and re-measured in isolation it exits 0 returning `0+0i`, because
+  −1 × 2 × 16 = −32 bytes lands inside the 24-byte header the bump allocator handed out just ahead
+  of the data buffer. What does fault is a far index (±1e8) or a null handle, both exit 139, both
+  precondition violations.
 - **`eigen_qr` on a non-square A returns `HSB_ERR_INVALID_INPUT` (−10) instead of
   `HSB_ERR_NO_CONVERGENCE` (−8).** The abuse assertion covering this was **tightened, not
   weakened**: a `NO_CONVERGENCE` that depends on `max_iter` is a fragile contract, and at
   `max_iter = 10000` the same 3x4-with-`n = 3` call returned `HSB_ERR_NONE` carrying the spectrum of
   the leading 3x3 block — a real number for a matrix nobody asked about. Callers relying on the old
   code for a wide or tall A should pass the square matrix they mean.
+- **`eigen_symmetric` now returns eigenvalues sorted by descending |λ|, with the eigenvector columns
+  permuted alongside — the order `eigen_qr` has always used and neither routine documented.** The
+  2026-08-04 audit's api-consistency row recorded that the two carry the same documented contract and
+  returned different orders. Measured on the 2.8.4 tree: for symmetric `A = [[2,0,0],[0,3,1],[0,1,3]]`
+  (spectrum {4, 2, 2}) `eigen_symmetric` gave **2, 4, 2** and `eigen_qr` gave **4, 2, 2**; for
+  `diag(1,5,3)`, **1, 5, 3** against **5, 3, 1**. `eigen_symmetric` delegates to ganita's Jacobi
+  sweep, whose output order is whatever the final diagonal happens to be, while `eigen_qr` has sorted
+  since 2.6.13 — and had assertions pinning that order (`tests/abuse.tcyr`, `tests/hisab.tcyr`), so
+  the sibling was moved onto it rather than the reverse. **`eigen_qr` is unchanged.** Both doc blocks
+  now state the order. A caller that read `eigen_symmetric`'s raw Jacobi order gets a different
+  permutation; there was no documented order to rely on, and the (λ, v) pairing is preserved because
+  the columns move with the values. Sorting by |λ| rather than by λ is deliberate and pinned:
+  `diag(-5,1,3)` returns −5, 3, 1. Guarded by `tests/hisab.tcyr`, *"eigen_symmetric / eigen_qr: one
+  documented eigenvalue order"*, which compares the two **against each other** on four matrices;
+  removing the sort fails **13** assertions (`cyrius test tests/hisab.tcyr` → 403 passed, 13 failed).
 
 ### Performance
 
@@ -115,6 +244,43 @@
   probe unconditionally instead was built and measured: 531 → 1066, 901 → 1790, 685 → 1424, a
   doubling of the module's hottest entry point.** An exact tangency now costs 9955 ns against the
   4000 it used to spend reaching the wrong answer.
+- **The residual allocation-inside-loop sites are hoisted.** The 2026-08-04 audit named four; three
+  were real and are fixed, the fourth is discharged by measurement (below). This is a bump allocator
+  that never frees, so an allocation inside a loop is arena growth proportional to the iteration
+  count on **every** call. All figures are `alloc_used()` deltas around a single call.
+  - `src/spatial.cyr` — `var plane_out = alloc(8);` per `_kd_build_rec` call. One 8-byte slot is now
+    owned by `kdtree_build` and threaded through the recursion; sharing it is safe because
+    `split_val` is read on the next line, before either child call can overwrite it.
+    **`kdtree_build` on 4,096 random points: 425,832 B → 393,080 B (−32,752 B, −7.7%)** — exactly
+    8 B × 4,094 internal nodes.
+  - `src/tensor.cyr:189` — `var full_idx = alloc(rank * 8);` inside `tensor_contract`'s trace loop.
+    Only slots `ii` and `jj` change per iteration and both are overwritten, so one buffer zeroed once
+    is identical. **200×200 full trace: 3,256 B → 72 B (−3,184 B, −97.8%).**
+  - `src/linalg_precision.cyr` — `var v = alloc(len * 16);` inside `cqr_decompose`'s reflector loop,
+    costing `16·m·(m+1)/2` bytes per call. Now one `alloc(m * 16)` before the loop; `len = m − k`, so
+    the first pass needs the largest buffer and every later pass fits inside it.
+    **`cqr_decompose` on a 64×64: 32,942,104 B → 32,909,848 B (−32,256 B, −0.098%).** The bulk of that
+    call is `cx_new`'s 16 B per complex temporary in the O(m²n) reflector application — a separate
+    problem this hoist does not claim to solve, and the reason no arena assertion tight enough to
+    isolate the reflector scratch is worth writing (it would be a 0.7% window that any unrelated
+    change to `complex.cyr` would break). The buffer-reuse hazard is guarded instead by `Q*R == A`,
+    `Q^H Q == I` and R-upper-triangular assertions on a 4×4, where the buffer is rewritten three
+    times after its first use.
+  - **The audit's second `tensor.cyr` site is REFUTED by measurement.** The disposition column
+    claimed `full_idx` was "still inside **both** contraction loops"; the one before the `out_idx`
+    loop was already hoisted. A 12⁴ rank-4 contraction cost **1,272 B per call both before and after**
+    this cycle's edit — there was no per-iteration allocation there to remove. Pinned as such.
+  - **The audit's fourth site is unidentifiable and stays that way.** Its Site cell is truncated to
+    `src/geo_` in the audit table's own text, and it is truncated identically in the commit that
+    first introduced the file (`70e7c8b`), so there is no earlier revision to recover it from. A
+    brace-depth scan of every file in `src/` finds **no** allocation inside a loop in `geo.cyr` or
+    `geo_advanced.cyr` today, consistent with the disposition's own note that the 2.8.1 sites there
+    were removed by the 2.8.3 EPA and `time_of_impact` rewrites. Reported as unresolved rather than
+    guessed at.
+  - The same scan surfaced **six sites the audit did not name**, all in `solve_gmres`'s restart loop
+    (`src/linalg_ext.cyr:386, 390, 395, 401, 402, 488` — `v_basis`, `h`, `g`, `cs`, `sn`, `y`). They
+    are **not** fixed in this pass and are not claimed to be; recorded here so the next cycle has
+    them.
 
 ### Added
 

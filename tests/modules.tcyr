@@ -835,6 +835,49 @@ assert_eq(geo_ray_plane(g_rp_par, g_plane), 0, "ray-plane parallel miss");
 var g_rp_behind = geo_ray_new(hvec3_new(0, f64_neg(F64_ONE), 0), hvec3_new(0, f64_neg(F64_ONE), 0));
 assert_eq(geo_ray_plane(g_rp_behind, g_plane), 0, "ray-plane behind");
 
+# --- 2026-08-04 audit, api-consistency (low): geo_ray_plane's doc block stated
+# the OPPOSITE convention to the code ("-1 on miss, negative sentinel, not 0, to
+# distinguish t = 0 hits") on the line directly above the 2.7.0 note that says 0.
+# The CODE was right -- src/geo.cyr:5 and :217 both promise 0 on a miss, and every
+# sibling ray_* returns 0 -- so the doc line was replaced. These pin the convention
+# the doc now states, so the two cannot drift apart again.
+#
+# 1. A miss is EXACTLY the integer 0, never the -1 that the stale line named.
+#    -1 as an f64 bit pattern is 0xFFFFFFFFFFFFFFFF, a negative NaN.
+assert_eq(geo_ray_plane(g_rp_par, g_plane), 0,
+"geo_ray_plane: the doc's return convention, pinned -- a miss is 0, not -1");
+assert(geo_ray_plane(g_rp_par, g_plane) != (0 - 1),
+"geo_ray_plane: a miss is not the pre-2.7.0 -1 sentinel");
+# 2. The miss value is arithmetically usable, which the -1 sentinel was not:
+#    f64 zero compares equal to zero and adding 1 gives 1. A NaN fails both.
+var g_rp_miss = geo_ray_plane(g_rp_par, g_plane);
+assert_eq(f64_eq(g_rp_miss, 0), 1, "geo_ray_plane: the miss value is f64 zero, not NaN");
+assert_eq(f64_add(g_rp_miss, F64_ONE), F64_ONE,
+"geo_ray_plane: arithmetic on the miss value does not poison (0 + 1 == 1)");
+# 3. A hit is strictly positive t, and geo_ray_at reproduces the plane point.
+assert(f64_gt(g_rp_t, 0) == 1, "geo_ray_plane: a hit is a strictly positive t");
+assert_eq(HVec3_y(geo_ray_at(g_rp_ray, g_rp_t)), 0,
+"geo_ray_plane: ray_at(t) lands exactly on the plane");
+# 4. The documented collision, MEASURED rather than assumed: an origin lying ON
+#    the plane is a t = 0 hit and carries no information a miss does not. Which
+#    ZERO comes back depends on the sign of `denom`, because t is computed as
+#    0 / denom:
+#      direction -y (denom = -1) -> -0.0, bit pattern 0x8000000000000000
+#      direction +y (denom = +1) -> +0.0, bit pattern 0, byte-identical to a miss
+#    Both are f64-equal to zero, so f64_eq / f64_lt / f64_gt cannot separate a
+#    grazing hit from a miss either way. Pinned so neither the doc nor the code
+#    can drift from this without a failing assertion.
+var g_rp_on_neg = geo_ray_new(hvec3_zero(), hvec3_new(0, f64_neg(F64_ONE), 0));
+assert_eq(geo_ray_plane(g_rp_on_neg, g_plane), 0x8000000000000000,
+"geo_ray_plane: origin ON the plane, denom < 0 -> negative zero");
+var g_rp_on_pos = geo_ray_new(hvec3_zero(), hvec3_unit_y());
+assert_eq(geo_ray_plane(g_rp_on_pos, g_plane), 0,
+"geo_ray_plane: origin ON the plane, denom > 0 -> +0.0, byte-identical to a miss");
+assert_eq(f64_eq(geo_ray_plane(g_rp_on_neg, g_plane), 0), 1,
+"geo_ray_plane: the -0.0 grazing hit is f64-equal to the miss value");
+assert_eq(f64_gt(geo_ray_plane(g_rp_on_neg, g_plane), 0), 0,
+"geo_ray_plane: a grazing hit fails the `t > 0` hit test, both signs of zero");
+
 # ----------------------------------------------------------------
 test_group("geo: ray-sphere");
 
@@ -4484,6 +4527,193 @@ assert(sh_true > 0, "the radius test is non-vacuous -- there ARE true hits");
 spatial_hash_clear(sh);
 assert_eq(vec_len(spatial_hash_query_cell(sh, hvec3_zero())), 0,
 "spatial_hash_clear empties every cell");
+
+test_group("arena: the alloc-inside-loop sites are hoisted (bump alloc never frees)");
+
+# 2026-08-04 audit, performance. Three allocation sites sat inside loops (or, for
+# _kd_build_rec, inside a recursion) of an allocator that never returns memory, so
+# the cost was proportional to the iteration count on EVERY call. Before/after
+# measured with alloc_used() around a single call, scratch binaries under
+# /tmp/.../tail29 and re-measured in-suite here.
+
+# --- src/spatial.cyr: `var plane_out = alloc(8);` per _kd_build_rec call, now one
+#     8-byte slot owned by kdtree_build and threaded through the recursion.
+#     4,096 random points: 425,832 B before -> 393,080 B after (-32,752 B = 8 B x
+#     4,094 internal nodes, -7.7%).
+var kdh_n = 4096;
+var kdh_pts = alloc(kdh_n * 8);
+var kdh_seed = 12345;
+for (var kdhi = 0; kdhi < kdh_n; kdhi = kdhi + 1) {
+    kdh_seed = (kdh_seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    var kdh_x = f64_div(f64_from(kdh_seed % 100000), f64_from(1000));
+    kdh_seed = (kdh_seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    var kdh_y = f64_div(f64_from(kdh_seed % 100000), f64_from(1000));
+    kdh_seed = (kdh_seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    var kdh_z = f64_div(f64_from(kdh_seed % 100000), f64_from(1000));
+    store64(kdh_pts + kdhi * 8, hvec3_new(kdh_x, kdh_y, kdh_z));
+}
+var kdh_a0 = alloc_used();
+var kdh_root = kdtree_build(kdh_pts, kdh_n);
+var kdh_bytes = alloc_used() - kdh_a0;
+assert_neq(kdh_root, 0, "kdtree_build: 4096 points build");
+assert_lt(kdh_bytes, kdh_n * 100,
+"kdtree_build: under 100 B per point (was 103.96, now 95.96 -- the per-node plane slot is gone)");
+# The tree must still be a tree: every point findable, and the split planes still
+# correct. Sharing one slot is only safe because split_val is read before the two
+# child calls overwrite it, so a nearest-neighbour query is the direct check.
+var kdh_probe = load64(kdh_pts + 777 * 8);
+assert_eq(kdtree_nearest(kdh_root, kdh_pts, kdh_probe), 777,
+"kdtree_nearest: the shared plane slot did not corrupt a split (point 777 finds itself)");
+# And every point in the set, not just one -- a corrupted split plane sends the
+# descent down the wrong subtree and the query silently returns a different point.
+var kdh_miss = 0;
+for (var kdhq = 0; kdhq < kdh_n; kdhq = kdhq + 4) {
+    var kdh_qp = load64(kdh_pts + kdhq * 8);
+    var kdh_got = kdtree_nearest(kdh_root, kdh_pts, kdh_qp);
+    if (f64_gt(hvec3_length(hvec3_sub(load64(kdh_pts + kdh_got * 8), kdh_qp)), 0) == 1) {
+        kdh_miss = kdh_miss + 1;
+    }
+}
+assert_eq(kdh_miss, 0,
+"kdtree_nearest: 1024 sampled points each find a coincident nearest -- no split is stale");
+
+# --- src/tensor.cyr: `var full_idx = alloc(rank * 8);` inside the trace loop.
+#     200x200 full trace: 3,256 B before -> 72 B after (-97.8%).
+var tnh_shape = alloc(16);
+store64(tnh_shape, 200);
+store64(tnh_shape + 8, 200);
+var tnh_t = tensor_new(2, tnh_shape);
+assert_neq(tnh_t, 0, "tensor_new 200x200");
+for (var tnhi = 0; tnhi < 200; tnhi = tnhi + 1) {
+    var tnh_ix = alloc(16);
+    store64(tnh_ix, tnhi);
+    store64(tnh_ix + 8, tnhi);
+    tensor_set(tnh_t, tnh_ix, F64_ONE);
+}
+var tnh_a0 = alloc_used();
+var tnh_tr = tensor_contract(tnh_t, 0, 1);
+var tnh_bytes = alloc_used() - tnh_a0;
+assert_neq(tnh_tr, 0, "tensor_contract: the 200x200 trace returns a scalar tensor");
+assert_lt(tnh_bytes, 256,
+"tensor_contract: the trace costs under 256 B of arena (was 3,256 -- one alloc per k)");
+# The hoisted buffer is zeroed ONCE and only slots ii/jj are rewritten, so a
+# wrong answer here is exactly the staleness bug the hoist could have introduced.
+# All 200 diagonal entries are 1, so the trace is 200 exactly.
+assert_eq(load64(HTensor_data(tnh_tr)), f64_from(200),
+"tensor_contract: trace of I_200 == 200 exactly (the shared full_idx stays clean)");
+
+# --- The OTHER full_idx, before the out_idx loop, was ALREADY hoisted; the audit
+#     row listed it as a second site and that half is REFUTED by measurement.
+#     A 12^4 rank-4 contraction cost 1,272 B per call both before and after this
+#     cycle's edit, i.e. no per-iteration allocation was present to remove.
+var tnh_s4 = alloc(32);
+store64(tnh_s4, 12); store64(tnh_s4 + 8, 12);
+store64(tnh_s4 + 16, 12); store64(tnh_s4 + 24, 12);
+var tnh_t4 = tensor_new(4, tnh_s4);
+var tnh_b0 = alloc_used();
+var tnh_c4 = tensor_contract(tnh_t4, 0, 1);
+assert_neq(tnh_c4, 0, "tensor_contract: 12^4 rank-4 contraction returns a tensor");
+assert_lt(alloc_used() - tnh_b0, 2048,
+"tensor_contract: the rank-4 path was already hoisted -- 1,272 B per call, unchanged");
+
+test_group("spatial: max_depth is CAPPED, so a coincident-point chain terminates");
+
+# 2026-08-04 audit, memory-safety. quadtree_new / octree_new stored the caller's
+# max_depth verbatim and it was the ONLY bound on _qt_insert_rec / _ot_insert_rec.
+# Coincident points always route into the same child, so past the node capacity
+# every insert drives a split chain the full depth. Measured on the pre-fix tree
+# (8 MiB stack, 64 coincident points, scratch binaries, exit codes recorded):
+#   quadtree  max_depth 23,750 -> exit 0     23,906 -> SIGSEGV (139)
+#   octree    max_depth 20,000 -> exit 0     30,000 -> SIGSEGV (139)
+# and the arena (a bump allocator that never frees) grew 1,216 B per quadtree
+# level and 6,144 B per octree level: 24.3 MB / 123 MB at max_depth 20,000.
+# The suite never saw it because its only fixtures use max_depth 6 and 5.
+
+fn _qtd_max(node) {
+    if (node == 0) { return (0 - 1); }
+    if (_qt_node_is_split(node) == 0) { return _qt_node_depth(node); }
+    var best = _qt_node_depth(node);
+    for (var c = 0; c < 4; c = c + 1) {
+        var d = _qtd_max(_qt_node_child(node, c));
+        if (d > best) { best = d; }
+    }
+    return best;
+}
+
+fn _otd_max(node) {
+    if (node == 0) { return (0 - 1); }
+    if (_ot_node_is_split(node) == 0) { return _ot_node_depth(node); }
+    var best = _ot_node_depth(node);
+    for (var c = 0; c < 8; c = c + 1) {
+        var d = _otd_max(_ot_node_child(node, c));
+        if (d > best) { best = d; }
+    }
+    return best;
+}
+
+# max_depth = 1e6: the pre-fix code SIGSEGV'd on this. Reaching the assertion at
+# all is half the test; the other half is that the depth and the arena are bounded
+# by the cap and not by the request.
+var qcap_a0 = alloc_used();
+var qcap = quadtree_new(0, 0, f64_from(1000), f64_from(1000), 1000000);
+for (var qcapi = 0; qcapi < 64; qcapi = qcapi + 1) {
+    assert_eq(quadtree_insert(qcap, F64_ONE, F64_ONE, qcapi), HSB_ERR_NONE,
+    "quadtree_insert: 64 coincident points at max_depth 1e6 all land");
+}
+var qcap_bytes = alloc_used() - qcap_a0;
+assert_eq(_qtd_max(load64(qcap)), _SP_MAX_TREE_DEPTH,
+"quadtree: the split chain stops at _SP_MAX_TREE_DEPTH, not at the requested 1e6");
+assert_lt(qcap_bytes, 2097152,
+"quadtree: a coincident-point chain costs under 2 MB of arena (measured 1,311,304 B)");
+assert_eq(vec_len(quadtree_query(qcap, 0, 0, f64_from(1000), f64_from(1000))), 64,
+"quadtree: capping loses no points -- all 64 are still queryable");
+
+# i64 max as max_depth must be indistinguishable from the cap itself: same depth,
+# same arena. If the clamp were ever removed this diverges immediately.
+var qcap2_a0 = alloc_used();
+var qcap2 = quadtree_new(0, 0, f64_from(1000), f64_from(1000), _SP_MAX_TREE_DEPTH);
+for (var qcap2i = 0; qcap2i < 64; qcap2i = qcap2i + 1) {
+    quadtree_insert(qcap2, F64_ONE, F64_ONE, qcap2i);
+}
+assert_eq(alloc_used() - qcap2_a0, qcap_bytes,
+"quadtree: max_depth 1e6 and max_depth _SP_MAX_TREE_DEPTH allocate identically");
+assert_eq(_qtd_max(load64(qcap2)), _SP_MAX_TREE_DEPTH, "quadtree: the cap is reachable, not off by one");
+
+# Octree: 8 children per level, so 5x the quadtree's per-level cost.
+var ocap_a0 = alloc_used();
+var ocap = octree_new(hvec3_zero(), hvec3_splat(f64_from(1000)), 1000000);
+for (var ocapi = 0; ocapi < 64; ocapi = ocapi + 1) {
+    assert_eq(octree_insert(ocap, hvec3_one(), ocapi), HSB_ERR_NONE,
+    "octree_insert: 64 coincident points at max_depth 1e6 all land");
+}
+var ocap_bytes = alloc_used() - ocap_a0;
+assert_eq(_otd_max(load64(ocap)), _SP_MAX_TREE_DEPTH,
+"octree: the split chain stops at _SP_MAX_TREE_DEPTH, not at the requested 1e6");
+assert_lt(ocap_bytes, 8388608,
+"octree: a coincident-point chain costs under 8 MB of arena (measured 6,606,992 B)");
+assert_eq(vec_len(octree_query(ocap, hvec3_zero(), hvec3_splat(f64_from(1000)))), 64,
+"octree: capping loses no points -- all 64 are still queryable");
+
+# The cap must not touch a sane tree. A 20x20 grid at max_depth 6 splits to 3
+# levels; the depth-6 fixture above is unchanged, and this pins that directly.
+var qsane = quadtree_new(0, 0, f64_from(100), f64_from(100), 6);
+for (var qsx = 0; qsx < 20; qsx = qsx + 1) {
+    for (var qsy = 0; qsy < 20; qsy = qsy + 1) {
+        quadtree_insert(qsane, f64_from(qsx * 5), f64_from(qsy * 5), qsx * 100 + qsy);
+    }
+}
+assert_lte(_qtd_max(load64(qsane)), 6, "quadtree: a max_depth 6 tree still stops at 6");
+assert(_qtd_max(load64(qsane)) > 0, "quadtree: the max_depth 6 tree really did split");
+assert_eq(vec_len(quadtree_query(qsane, 0, 0, f64_from(100), f64_from(100))), 400,
+"quadtree: the capped build is byte-for-byte the old behaviour below the cap");
+
+# A negative max_depth already meant "never split"; the clamp to 0 writes that
+# down rather than changing it.
+var qneg = quadtree_new(0, 0, f64_from(10), f64_from(10), (0 - 5));
+for (var qni = 0; qni < 32; qni = qni + 1) { quadtree_insert(qneg, F64_ONE, F64_ONE, qni); }
+assert_eq(_qtd_max(load64(qneg)), 0, "quadtree: max_depth -5 clamps to 0 -- everything in the root");
+assert_eq(vec_len(quadtree_query(qneg, 0, 0, f64_from(10), f64_from(10))), 32,
+"quadtree: max_depth -5 still stores all 32 points");
 
 test_group("color: alpha compositing, tonemap, depth, EV -- 21 untested functions");
 

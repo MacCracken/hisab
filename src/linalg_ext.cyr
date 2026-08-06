@@ -868,16 +868,73 @@ fn eigen_power(A, n, max_iter, out_val, out_vec) {
 }
 
 # Symmetric eigendecomposition via Jacobi rotation.
-# Wrapper around linalg.cyr's mat_eigen_sym with hisab API convention.
+# Wrapper around ganita's mat_eigen_sym with hisab API convention.
 # A:        stdlib matrix (n x n, must be symmetric).
 # n:        matrix dimension.
-# out_vals: flat f64 array of length n (caller allocates, receives eigenvalues).
-# out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as columns).
-# Returns:  0 on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded.
+# out_vals: flat f64 array of length n (caller allocates, receives eigenvalues,
+#           SORTED BY DESCENDING |lambda| -- see the ordering note below).
+# out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as
+#           columns, permuted to stay paired with out_vals).
+# Returns:  HSB_ERR_NONE on success, HSB_ERR_NO_CONVERGENCE if the Jacobi sweep
+#           does not reduce the off-diagonal below ganita's LINALG_EPS within its
+#           own 100 * n^2 iteration budget.
+#
+# THIS ROUTINE HAS NO max_iter PARAMETER. The doc line this replaces named one --
+# "HSB_ERR_NO_CONVERGENCE if max_iter exceeded" -- directly above a four-parameter
+# signature that has never had it; the budget belongs to ganita_mat_eigen_sym
+# (lib/ganita.cyr:890, `var max_iter = 100 * n * n;`) and is not caller-settable
+# here. Audit 2026-08-04, api-consistency (low).
+#
+# ORDERING, and why it changed. The same audit row recorded that this routine and
+# eigen_qr carry the same documented contract but returned eigenvalues in
+# DIFFERENT orders, neither documented. Measured on the 2.8.4 tree, symmetric
+# A = [[2,0,0],[0,3,1],[0,1,3]]:
+#     eigen_symmetric -> 2, 4, 2      (Jacobi's final diagonal order: arbitrary)
+#     eigen_qr        -> 4, 2, 2      (descending |lambda|, sorted at :1334)
+# and on diag(1,5,3): eigen_symmetric -> 1, 5, 3 (input order), eigen_qr -> 5, 3, 1.
+# eigen_qr already sorted and already had a suite pinning that order
+# (tests/abuse.tcyr:730-734, tests/hisab.tcyr:2309-2312), so the siblings were made
+# to agree by giving eigen_symmetric the SAME descending-|lambda| sort, permuting
+# out_vecs' columns with it so a (lambda, v) pair is never broken. eigen_qr is
+# unchanged. This is a behaviour change for any caller that read eigen_symmetric's
+# raw Jacobi order -- see CHANGELOG "Breaking".
 fn eigen_symmetric(A, n, out_vals, out_vecs) {
     var result = mat_eigen_sym(A, out_vals, out_vecs);
     if (result < 0) { return HSB_ERR_NO_CONVERGENCE; }
-    return 0;
+
+    # Selection sort by descending |eigenvalue|, columns of out_vecs carried
+    # along. Identical to eigen_qr's step 3 (src/linalg_precision.cyr:1334) so the
+    # two routines cannot disagree on order again. O(n^2) on an O(n^3)
+    # decomposition, so it is free at every n the Jacobi path is used for.
+    var i = 0;
+    while (i < n) {
+        var max_idx = i;
+        var max_abs = f64_abs(load64(out_vals + i * 8));
+        var j = i + 1;
+        while (j < n) {
+            var aj = f64_abs(load64(out_vals + j * 8));
+            if (f64_gt(aj, max_abs) == 1) {
+                max_abs = aj;
+                max_idx = j;
+            }
+            j = j + 1;
+        }
+        if (max_idx != i) {
+            var tmp = load64(out_vals + i * 8);
+            store64(out_vals + i * 8, load64(out_vals + max_idx * 8));
+            store64(out_vals + max_idx * 8, tmp);
+            var k = 0;
+            while (k < n) {
+                var tv = mat_get(out_vecs, k, i);
+                mat_set(out_vecs, k, i, mat_get(out_vecs, k, max_idx));
+                mat_set(out_vecs, k, max_idx, tv);
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    return HSB_ERR_NONE;
 }
 
 # ================================================================

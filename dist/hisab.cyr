@@ -6308,10 +6308,20 @@ fn _kd_build_rec(items, points, start, end, depth) {
 
 # Build a k-d tree from an array of HVec3 pointers.
 # points: pointer to array of HVec3 ptrs (points[i] = load64(points + i*8))
-# count: number of points
-# Returns: root node pointer
+# count: number of points (must be >= 0; a negative count is rejected)
+# Returns: root node pointer, or 0 for an empty / rejected input. This routine
+#          returns a HANDLE, not an error code, so 0 -- the documented empty
+#          tree -- is the failure value; there is no negative HSB_ERR_* to
+#          return through an i64 that is otherwise a pointer.
 fn kdtree_build(points, count) {
-    if (count == 0) { return 0; }
+    # `count == 0` was a HALF-GUARD. A negative count fell through to
+    # _kd_build_rec(items, points, 0, -1), whose `count = end - start` is -1, so
+    # it missed the `count == 1` leaf case and ran _kd_partition over an empty
+    # vec -- _kd_select_median then vec_get'd an out-of-range slot and vec's own
+    # bounds check aborted the process ("vec: index out of bounds", exit 1,
+    # measured). points == 0 is the same story one level down: load64(0 + i * 8).
+    if (count <= 0) { return 0; }
+    if (points == 0) { return 0; }
 
     # Build index list
     var items = vec_new();
@@ -7389,20 +7399,40 @@ fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, out_depth
 # ================================================================
 # 2. Sequential Impulse Solver
 # ================================================================
-# Contact constraint: 64 bytes (8 fields x 8 bytes)
+# Contact constraint: 72 bytes (9 fields x 8 bytes)
 #   offset 0:  body_a       (index)
 #   offset 8:  body_b       (index)
 #   offset 16: normal       (HVec3 pointer)
 #   offset 24: penetration  (f64)
-#   offset 32: friction     (f64)
+#   offset 32: friction     (f64)   -- Coulomb mu
 #   offset 40: restitution  (f64)
 #   offset 48: inv_mass_a   (f64)
 #   offset 56: inv_mass_b   (f64)
+#   offset 64: tangent_vel  (f64)   -- signed relative tangential speed
+#
+# `tangent_vel` (2.8.4) is the relative sliding speed of body A with respect to
+# body B, measured along a caller-chosen unit tangent t^ that lies in the contact
+# plane. It is a SIGNED SCALAR, not a vector: the solver reports one friction
+# magnitude per contact, so the tangent direction lives with the caller and the
+# solver only needs the component along it. The returned friction impulse is the
+# signed magnitude along that same t^ applied to A (its negation applies to B),
+# so a positive tangent_vel yields a negative friction impulse.
+#
+# It exists because `friction` had no input to act on. The reduced model here
+# derives the whole relative velocity from `penetration` ALONG THE NORMAL, so the
+# tangential component was structurally zero and `friction` was a silently
+# ignored parameter (see the block in sequential_impulse). Contacts built by the
+# 8-argument `contact_new` get tangent_vel = 0 and therefore behave exactly as
+# they did before 2.8.4, friction impulse included.
 
 #derive(accessors)
-struct ColContact { body_a; body_b; normal; penetration; friction; restitution; inv_mass_a; inv_mass_b; }
+struct ColContact {
+    body_a; body_b; normal; penetration; friction; restitution;
+    inv_mass_a; inv_mass_b; tangent_vel;
+}
 
-fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_mass_a, inv_mass_b) {
+fn contact_new_fric(body_a, body_b, normal, penetration, friction, restitution,
+inv_mass_a, inv_mass_b, tangent_vel) {
     var c = alloc(sizeof(ColContact));
     ColContact_set_body_a(c, body_a);
     ColContact_set_body_b(c, body_b);
@@ -7412,7 +7442,16 @@ fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_m
     ColContact_set_restitution(c, restitution);
     ColContact_set_inv_mass_a(c, inv_mass_a);
     ColContact_set_inv_mass_b(c, inv_mass_b);
+    ColContact_set_tangent_vel(c, tangent_vel);
     return c;
+}
+
+# Frictionless-input constructor: identical to contact_new_fric with a zero
+# tangential relative velocity. Kept at its original 8-argument arity so every
+# existing caller (and every consumer) is source-compatible.
+fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_mass_a, inv_mass_b) {
+    return contact_new_fric(body_a, body_b, normal, penetration, friction, restitution,
+    inv_mass_a, inv_mass_b, _COL_F64_ZERO);
 }
 
 # sequential_impulse -- solve normal + friction impulses
@@ -7421,6 +7460,9 @@ fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_m
 # iterations: solver iterations
 # out_impulses: pre-allocated flat array, 2 f64 per contact (normal, friction magnitude)
 #   Layout: [n0, f0, n1, f1, ...] -- total 16*n bytes
+#   n_i is the normal impulse, >= 0. f_i is the SIGNED friction impulse along the
+#   caller's tangent t^ (the one ColContact.tangent_vel was measured along), so it
+#   is negative for a positive tangent_vel; |f_i| <= friction * n_i always.
 fn sequential_impulse(contacts, n, iterations, out_impulses) {
     # Zero out impulses
     for (var zi = 0; zi < n; zi = zi + 1) {
@@ -7480,20 +7522,53 @@ fn sequential_impulse(contacts, n, iterations, out_impulses) {
                 }
                 store64(out_impulses + ci * 16, new_impulse);
 
-                # Friction impulse (Coulomb cone)
+                # FRICTION IS A COULOMB-CLAMPED ACCUMULATED IMPULSE.
+                #
+                # Through 2.8.4 this block LOADED the friction slot it had itself
+                # zeroed at entry, clamped that zero, and stored it back -- there
+                # was no update between the load and the clamp. |0| > mu*lambda_n
+                # is never true for a non-negative bound, so the friction impulse
+                # was identically 0 for every contact, at every mu, at every
+                # iteration count (measured: 0 of 320 sampled configs nonzero) and
+                # `friction` was a silently ignored parameter. It survived because
+                # every solver fixture used friction = 0, so the branch was never
+                # even entered.
+                #
+                # The tangential constraint drives the relative sliding speed to
+                # zero, using the same effective-velocity convention as the normal
+                # path above (the accumulated impulse folded back into the
+                # velocity it already produced):
+                #   v_t_eff = v_t + lambda_t * inv_mass
+                #   dlambda = -(v_t_eff - 0) / inv_mass
+                #   lambda_t = clamp(lambda_t + dlambda, -mu*lambda_n, +mu*lambda_n)
+                # The accumulate-then-clamp order is what makes it Coulomb rather
+                # than a per-sweep cap: the clamp bounds the TOTAL tangential
+                # impulse, so a contact that saturates stays saturated instead of
+                # gaining another mu*lambda_n on the next sweep.
+                #
+                # The unclamped update telescopes to lambda_t = -v_t / inv_mass --
+                # reached in ONE sweep and idempotent thereafter, so the answer
+                # does not depend on `iterations`, exactly like the 2.8.3
+                # restitution repair. Clamped, the closed form is
+                #   lambda_t = clamp(-v_t / inv_mass, +/- mu * lambda_n)
+                # and the sign always opposes v_t, since -v_t/inv_mass and the
+                # saturated bound -sign(v_t)*mu*lambda_n both do.
                 if (f64_gt(fric, EPSILON_F64) == 1) {
-                    # Simplified friction: magnitude = friction * normal_impulse
+                    var v_t = ColContact_tangent_vel(c);
+                    # Cone half-width: mu times the normal impulse just solved.
                     var max_fric = f64_mul(fric, new_impulse);
                     var old_fric = load64(out_impulses + ci * 16 + 8);
-                    # Clamp friction to cone
-                    if (f64_gt(f64_abs(old_fric), max_fric) == 1) {
-                        if (f64_lt(old_fric, _COL_F64_ZERO) == 1) {
-                            old_fric = f64_neg(max_fric);
+                    var v_t_eff = f64_add(v_t, f64_mul(old_fric, inv_mass));
+                    var new_fric = f64_sub(old_fric, f64_div(v_t_eff, inv_mass));
+                    # Clamp the TOTAL tangential impulse into the Coulomb cone.
+                    if (f64_gt(f64_abs(new_fric), max_fric) == 1) {
+                        if (f64_lt(new_fric, _COL_F64_ZERO) == 1) {
+                            new_fric = f64_neg(max_fric);
                         } else {
-                            old_fric = max_fric;
+                            new_fric = max_fric;
                         }
                     }
-                    store64(out_impulses + ci * 16 + 8, old_fric);
+                    store64(out_impulses + ci * 16 + 8, new_fric);
                 }
             }
         }
@@ -14387,20 +14462,44 @@ fn svd_truncated(A, k, out_U, out_S, out_Vt) {
 # ================================================================
 
 # Power iteration for the dominant eigenvalue.
-# A:        stdlib matrix (n x n).
+# A:        stdlib matrix (n x n -- SHAPE ENFORCED, see below).
 # n:        matrix dimension.
 # max_iter: maximum iterations.
 # out_val:  pointer to store eigenvalue (f64, allocate 8 bytes).
 # out_vec:  flat f64 array of length n (caller allocates, receives eigenvector).
-# Returns:  0 on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded.
+# Returns:  0 on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded,
+#           HSB_ERR_INVALID_INPUT on a null handle or a shape that does not
+#           match n, HSB_ERR_ALLOC if the working vectors cannot be allocated.
 fn eigen_power(A, n, max_iter, out_val, out_vec) {
+    # NULL HANDLES. A may be the designed 0 that mat_new_guarded returns above
+    # its element cap, and mat_rows(0) is a null dereference.
+    if (A == 0 || out_val == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (out_vec == 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # n WAS NOT BOUNDED AT ALL. `alloc(n * 8)` was called with whatever arrived
+    # and stored through unconditionally, so both ends crashed (measured, exit
+    # 139): n = -3 asks alloc for a negative size, and n = 1e9 asks for 8 GB --
+    # over ALLOC_MAX = 2 GiB -- so alloc returns its designed 0 and `store64(v, ...)`
+    # writes to address 0.
+    if (n <= 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # THE n x n PRECONDITION IS NOW CHECKED, NOT JUST DOCUMENTED. `n` is a
+    # restatement of A's own extent: the matvec below reads mat_get(A, i, j) for
+    # i, j < n, so n > A's extent is an out-of-bounds read and n < it silently
+    # iterates on A's leading n x n block and returns 0 with the dominant
+    # eigenvalue of a matrix the caller did not pass. Neither is a shape this
+    # routine can legitimately answer for, so both are rejected.
+    if (mat_rows(A) != n || mat_cols(A) != n) { return HSB_ERR_INVALID_INPUT; }
+
     # Initial guess: unit vector e_0
     var v = alloc(n * 8);
+    if (v == 0) { return HSB_ERR_ALLOC; }
     var i = 0;
     while (i < n) { store64(v + i * 8, f64_from(0)); i = i + 1; }
     store64(v, f64_from(1));
 
     var w = alloc(n * 8);
+    if (w == 0) { return HSB_ERR_ALLOC; }
     var eigenvalue = f64_from(0);
     var tol = EPSILON_F64;
 
@@ -14479,18 +14578,37 @@ fn eigen_symmetric(A, n, out_vals, out_vecs) {
 # ================================================================
 
 # Compute the maximal Lyapunov exponent via QR method.
-# A:          stdlib matrix (n x n), the Jacobian of the system.
+# A:          stdlib matrix (n x n -- SHAPE ENFORCED), the Jacobian of the system.
 # n:          state dimension.
 # iterations: number of QR iterations.
 # out:        pointer to store the result (f64, allocate 8 bytes).
-# Returns:    0 on success.
+# Returns:    0 on success, HSB_ERR_INVALID_INPUT on a null handle or a shape
+#             that does not match n, HSB_ERR_ALLOC if the working matrices
+#             cannot be allocated.
 #
 # Method: repeatedly QR-decompose A^k. The growth rate of R's diagonal
 # entries gives the Lyapunov exponent. This is the simplified discrete
 # version: repeatedly multiply A, QR-factor, and track log growth.
 fn lyapunov_max(A, n, iterations, out) {
-    var Q = mat_new(n, n);
-    var R = mat_new(n, n);
+    # NULL HANDLES. A may be the designed 0 from mat_new_guarded's cap.
+    if (A == 0 || out == 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # n WAS NOT BOUNDED AT ALL. `mat_new(n, n)` returns the designed 0 for a
+    # non-positive n and the 0 went straight into mat_mul, so lyapunov_max(A, 0,
+    # ...) and lyapunov_max(A, -2, ...) both SIGSEGV'd (measured, exit 139).
+    if (n <= 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # THE n x n PRECONDITION IS NOW CHECKED, NOT JUST DOCUMENTED. n is a
+    # restatement of A's extent and mat_mul(A, Q) conforms only when A is n x n;
+    # a mismatch is a caller error with no meaningful answer, so it is rejected.
+    if (mat_rows(A) != n || mat_cols(A) != n) { return HSB_ERR_INVALID_INPUT; }
+
+    # mat_new_guarded, not mat_new: it propagates the designed 0 for an n this
+    # module considers unreasonable instead of allocating it.
+    var Q = mat_new_guarded(n, n);
+    if (Q == 0) { return HSB_ERR_ALLOC; }
+    var R = mat_new_guarded(n, n);
+    if (R == 0) { return HSB_ERR_ALLOC; }
 
     # Initialize Q to identity
     var i = 0;
@@ -14503,6 +14621,9 @@ fn lyapunov_max(A, n, iterations, out) {
     while (iter < iterations) {
         # Z = A * Q
         var Z = mat_mul(A, Q);
+        # mat_mul allocates; a failed allocation is a 0 that mat_qr would read
+        # through. Bail with the allocation code rather than store into address 0.
+        if (Z == 0) { return HSB_ERR_ALLOC; }
 
         # QR decompose Z -> Q, R
         mat_qr(Z, Q, R);
@@ -15850,14 +15971,41 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
 }
 
 # Public: QR iteration for symmetric eigendecomposition
-# A:        stdlib matrix (n x n, must be symmetric).
+# A:        stdlib matrix (n x n, must be symmetric -- SHAPE ENFORCED, see below).
 # n:        matrix dimension.
 # max_iter: maximum QR iterations.
 # out_vals: flat f64 array of length n (caller allocates).
 # out_vecs: stdlib matrix (n x n, caller allocates, eigenvectors as columns).
-# Returns:  HSB_ERR_NONE on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded.
+# Returns:  HSB_ERR_NONE on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded,
+#           HSB_ERR_INVALID_INPUT on a null handle or a shape that does not match n.
 fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
-    if (n == 0) { return HSB_ERR_INVALID_INPUT; }
+    # Any of these may be the designed 0 that mat_new / mat_new_guarded returns
+    # above its own element cap; mat_rows(0) is a null dereference, so guard
+    # before reading dims. This is svd_golub_kahan's idiom (:753) applied to the
+    # one routine in this file that still lacked it: through 2.8.4 a null A,
+    # out_vals or out_vecs was stored through and SIGSEGV'd (exit 139, measured).
+    if (A == 0 || out_vals == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (out_vecs == 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # n <= 0 was HALF-guarded: `n == 0` only, so n = -3 fell through to
+    # _lp_vec_new(-3) -> alloc of a negative size and a wild store (exit 139).
+    if (n <= 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # THE n x n PRECONDITION IS NOW CHECKED, NOT JUST DOCUMENTED.
+    #
+    # `n` is a restatement of A's own extent, and every read below is
+    # mat_get(A, i, j) for i, j < n -- so an n larger than A is an out-of-bounds
+    # read, and an n SMALLER than A is a silently different problem: the routine
+    # would return HSB_ERR_NONE carrying the spectrum of A's leading n x n block,
+    # which is not the spectrum of A. The balancing above compounds it --
+    # _lp_mat_max_abs(A) scans mat_rows(A) * mat_cols(A) entries, so the scale is
+    # drawn from a matrix the decomposition never looks at. There is no reading of
+    # "the eigendecomposition of a non-square A", so this is rejected rather than
+    # handled. out_vecs takes mat_set(out_vecs, i, j) for i, j < n and is bounded
+    # the same way.
+    if (mat_rows(A) != n || mat_cols(A) != n) { return HSB_ERR_INVALID_INPUT; }
+    if (mat_rows(out_vecs) < n || mat_cols(out_vecs) < n) { return HSB_ERR_INVALID_INPUT; }
+
     if (n == 1) {
         store64(out_vals, mat_get(A, 0, 0));
         mat_set(out_vecs, 0, 0, F64_ONE);
@@ -15933,18 +16081,48 @@ fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
 #
 # cqr_decompose(A, out_Q, out_R) -> error code
 #
-# A:     complex matrix (cmat_new, m x n).
-# out_Q: complex matrix (m x m, caller allocates).
-# out_R: complex matrix (m x n, caller allocates).
-# Returns: HSB_ERR_NONE on success.
+# A:     complex matrix (cmat_new, m x n). ANY m, n -- see the shape note below.
+# out_Q: complex matrix (m x m, caller allocates) -- SHAPE ENFORCED.
+# out_R: complex matrix (m x n, caller allocates) -- SHAPE ENFORCED.
+# Returns: HSB_ERR_NONE on success, HSB_ERR_INVALID_INPUT on a null handle or an
+#          out_Q / out_R that is not sized exactly m x m / m x n.
 #
 # Uses Householder reflectors in complex space:
 #   H = I - (2 / v^H v) * v * v^H
 # where v = x + sign(x1)*||x||*e1, with sign chosen for numerical stability.
 
 fn cqr_decompose(A, out_Q, out_R) {
+    # NULL HANDLES. cmat_rows(0) is load64(0). Each of the three may be the
+    # designed 0 that cmat_new returns for a non-positive dimension or above
+    # _CMAT_MAX_ELEMS, so cqr_decompose(cmat_new(100000, 100000), ...) -- a call
+    # that looks like it allocated -- SIGSEGV'd through 2.8.4 (exit 139, measured).
+    if (A == 0 || out_Q == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (out_R == 0) { return HSB_ERR_INVALID_INPUT; }
+
     var m = cmat_rows(A);
     var n = cmat_cols(A);
+    if (m <= 0 || n <= 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # THE OUTPUT SHAPES ARE NOW CHECKED, NOT JUST DOCUMENTED.
+    #
+    # This was the canary overwrite. The copy loop below walks i < m, j < n and
+    # calls cmat_set(out_R, i, j), and cmat_set computes its offset from out_R's
+    # OWN column count -- so when the caller sized out_R m x m for what it assumed
+    # was a square decomposition, every j >= m stored past the end of out_R's data
+    # buffer and the routine still returned HSB_ERR_NONE. Measured on a 2x3 A into
+    # a 2x2 out_R: rc = HSB_ERR_NONE with 2 of 8 guard slots -- the 16 bytes
+    # immediately after out_R's buffer -- overwritten; the square 2x2 control over
+    # the same code path clobbered 0.
+    #
+    # The ALGORITHM is not the problem: Householder QR is general in m and n
+    # (min_mn = min(m, n) reflectors), and with out_R correctly sized m x n it is
+    # measurably right for both shapes -- Q*R == A, Q^H Q == I and R upper
+    # trapezoidal to < 1e-8 on a wide 2x3 and a tall 4x2. So the rectangular case
+    # is HANDLED, not rejected; what is rejected is the caller handing over
+    # out-buffers that are not the documented size, because there is nowhere to
+    # put an m x n R inside an m x m allocation.
+    if (cmat_rows(out_Q) != m || cmat_cols(out_Q) != m) { return HSB_ERR_INVALID_INPUT; }
+    if (cmat_rows(out_R) != m || cmat_cols(out_R) != n) { return HSB_ERR_INVALID_INPUT; }
 
     # Balance on the way into out_R; undo it on R at the end. Q is invariant under
     # a positive rescale of A. Unbalanced, ||v||^2 = Inf made cx_abs(x1) = Inf,
@@ -16221,6 +16399,11 @@ fn _einsum_parse_operand(notation_data, start, end, labels_out) {
 #
 # Returns a new HTensor with the result, or 0 on error.
 fn einsum(notation, tensors, n_tensors) {
+    # str_data(0) / load64(0 + i * 8) are null dereferences. A caller that built
+    # its operand array from another einsum call has a real path to a 0 here --
+    # see the per-operand check in Step 3.
+    if (notation == 0 || tensors == 0) { return 0; }
+
     _einsum_scratch_begin();
     var ndata = str_data(notation);
     var nlen = str_len(notation);
@@ -16276,10 +16459,19 @@ fn einsum(notation, tensors, n_tensors) {
         var oend   = load64(op_ends + oi * 8);
         var rank = _einsum_parse_operand(ndata, ostart, oend, lbuf);
         if (rank < 0) { return 0; }               # malformed operand spec
+        # THE OPERAND ITSELF MAY BE 0. tensor_new returns its designed 0 above the
+        # rank or element cap and einsum returns 0 on every error path below, so
+        # EINSUM'S OWN OUTPUT FED BACK IN lands here -- the exact composition the
+        # module is for. HTensor_rank(0) is load64(0), so through 2.8.4
+        #   var tv = alloc(8); store64(tv, 0); einsum(str_from("ij->ji"), tv, 1);
+        # SIGSEGV'd (measured, exit 139), even though tensor_add / tensor_scale /
+        # tensor_contract all guard this and name einsum as the producer of the 0.
+        var t_oi = load64(tensors + oi * 8);
+        if (t_oi == 0) { return 0; }
         # The notation's rank must match the tensor it describes. Without this the
         # Step-5 loop walks `rank` entries of a shape array that only has
         # HTensor_rank(t) of them -- an out-of-bounds read past the allocation.
-        if (rank != HTensor_rank(load64(tensors + oi * 8))) { return 0; }
+        if (rank != HTensor_rank(t_oi)) { return 0; }
         store64(op_ranks + oi * 8, rank);
         oi = oi + 1;
     }

@@ -1183,14 +1183,41 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
 }
 
 # Public: QR iteration for symmetric eigendecomposition
-# A:        stdlib matrix (n x n, must be symmetric).
+# A:        stdlib matrix (n x n, must be symmetric -- SHAPE ENFORCED, see below).
 # n:        matrix dimension.
 # max_iter: maximum QR iterations.
 # out_vals: flat f64 array of length n (caller allocates).
 # out_vecs: stdlib matrix (n x n, caller allocates, eigenvectors as columns).
-# Returns:  HSB_ERR_NONE on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded.
+# Returns:  HSB_ERR_NONE on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded,
+#           HSB_ERR_INVALID_INPUT on a null handle or a shape that does not match n.
 fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
-    if (n == 0) { return HSB_ERR_INVALID_INPUT; }
+    # Any of these may be the designed 0 that mat_new / mat_new_guarded returns
+    # above its own element cap; mat_rows(0) is a null dereference, so guard
+    # before reading dims. This is svd_golub_kahan's idiom (:753) applied to the
+    # one routine in this file that still lacked it: through 2.8.4 a null A,
+    # out_vals or out_vecs was stored through and SIGSEGV'd (exit 139, measured).
+    if (A == 0 || out_vals == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (out_vecs == 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # n <= 0 was HALF-guarded: `n == 0` only, so n = -3 fell through to
+    # _lp_vec_new(-3) -> alloc of a negative size and a wild store (exit 139).
+    if (n <= 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # THE n x n PRECONDITION IS NOW CHECKED, NOT JUST DOCUMENTED.
+    #
+    # `n` is a restatement of A's own extent, and every read below is
+    # mat_get(A, i, j) for i, j < n -- so an n larger than A is an out-of-bounds
+    # read, and an n SMALLER than A is a silently different problem: the routine
+    # would return HSB_ERR_NONE carrying the spectrum of A's leading n x n block,
+    # which is not the spectrum of A. The balancing above compounds it --
+    # _lp_mat_max_abs(A) scans mat_rows(A) * mat_cols(A) entries, so the scale is
+    # drawn from a matrix the decomposition never looks at. There is no reading of
+    # "the eigendecomposition of a non-square A", so this is rejected rather than
+    # handled. out_vecs takes mat_set(out_vecs, i, j) for i, j < n and is bounded
+    # the same way.
+    if (mat_rows(A) != n || mat_cols(A) != n) { return HSB_ERR_INVALID_INPUT; }
+    if (mat_rows(out_vecs) < n || mat_cols(out_vecs) < n) { return HSB_ERR_INVALID_INPUT; }
+
     if (n == 1) {
         store64(out_vals, mat_get(A, 0, 0));
         mat_set(out_vecs, 0, 0, F64_ONE);
@@ -1266,18 +1293,48 @@ fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
 #
 # cqr_decompose(A, out_Q, out_R) -> error code
 #
-# A:     complex matrix (cmat_new, m x n).
-# out_Q: complex matrix (m x m, caller allocates).
-# out_R: complex matrix (m x n, caller allocates).
-# Returns: HSB_ERR_NONE on success.
+# A:     complex matrix (cmat_new, m x n). ANY m, n -- see the shape note below.
+# out_Q: complex matrix (m x m, caller allocates) -- SHAPE ENFORCED.
+# out_R: complex matrix (m x n, caller allocates) -- SHAPE ENFORCED.
+# Returns: HSB_ERR_NONE on success, HSB_ERR_INVALID_INPUT on a null handle or an
+#          out_Q / out_R that is not sized exactly m x m / m x n.
 #
 # Uses Householder reflectors in complex space:
 #   H = I - (2 / v^H v) * v * v^H
 # where v = x + sign(x1)*||x||*e1, with sign chosen for numerical stability.
 
 fn cqr_decompose(A, out_Q, out_R) {
+    # NULL HANDLES. cmat_rows(0) is load64(0). Each of the three may be the
+    # designed 0 that cmat_new returns for a non-positive dimension or above
+    # _CMAT_MAX_ELEMS, so cqr_decompose(cmat_new(100000, 100000), ...) -- a call
+    # that looks like it allocated -- SIGSEGV'd through 2.8.4 (exit 139, measured).
+    if (A == 0 || out_Q == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (out_R == 0) { return HSB_ERR_INVALID_INPUT; }
+
     var m = cmat_rows(A);
     var n = cmat_cols(A);
+    if (m <= 0 || n <= 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # THE OUTPUT SHAPES ARE NOW CHECKED, NOT JUST DOCUMENTED.
+    #
+    # This was the canary overwrite. The copy loop below walks i < m, j < n and
+    # calls cmat_set(out_R, i, j), and cmat_set computes its offset from out_R's
+    # OWN column count -- so when the caller sized out_R m x m for what it assumed
+    # was a square decomposition, every j >= m stored past the end of out_R's data
+    # buffer and the routine still returned HSB_ERR_NONE. Measured on a 2x3 A into
+    # a 2x2 out_R: rc = HSB_ERR_NONE with 2 of 8 guard slots -- the 16 bytes
+    # immediately after out_R's buffer -- overwritten; the square 2x2 control over
+    # the same code path clobbered 0.
+    #
+    # The ALGORITHM is not the problem: Householder QR is general in m and n
+    # (min_mn = min(m, n) reflectors), and with out_R correctly sized m x n it is
+    # measurably right for both shapes -- Q*R == A, Q^H Q == I and R upper
+    # trapezoidal to < 1e-8 on a wide 2x3 and a tall 4x2. So the rectangular case
+    # is HANDLED, not rejected; what is rejected is the caller handing over
+    # out-buffers that are not the documented size, because there is nowhere to
+    # put an m x n R inside an m x m allocation.
+    if (cmat_rows(out_Q) != m || cmat_cols(out_Q) != m) { return HSB_ERR_INVALID_INPUT; }
+    if (cmat_rows(out_R) != m || cmat_cols(out_R) != n) { return HSB_ERR_INVALID_INPUT; }
 
     # Balance on the way into out_R; undo it on R at the end. Q is invariant under
     # a positive rescale of A. Unbalanced, ||v||^2 = Inf made cx_abs(x1) = Inf,

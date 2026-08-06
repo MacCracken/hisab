@@ -99,16 +99,32 @@ out-params on **every** return path, so a `1` return always carries a readable n
 1. ~~Narrowphase matches an independent exact reference with zero wrong-sign results and a stated
    worst-case error.~~ **MET (2.8.3)** — 862/862, worst 1.6e-9, reference computed in exact
    rationals and never from a previous hisab output.
-2. An abuse harness (negative indices, zero/huge dims, non-conformable operands, the designed-0
-   return, degenerate geometry) runs clean: no exit 139, no canary overwrite. **OPEN** — two
-   canary assertions exist; there is no harness.
+2. ~~An abuse harness runs clean: no exit 139, no canary overwrite.~~ **HARNESS MET, ITS FINDINGS
+   OPEN.** `tests/abuse.tcyr` — 577 assertions, 0 failed, exit 0, mutation-proven. It immediately
+   surfaced **11 real defects on public entry points**, held in a known-defect register rather than
+   deleted. The headline is precisely what this criterion names: `cqr_decompose`
+   (`src/linalg_precision.cyr:1278`) has no squareness check, walks `i<m, j<n` storing into an m×m
+   `out_R`, and **overruns the buffer while returning `HSB_ERR_NONE`** — a success code on top of
+   the overrun (2 of 8 canary slots clobbered; the square control clobbers 0). The criterion is not
+   satisfied until those 11 are dispositioned.
 3. ~~Arena per narrowphase call bounded **and asserted**.~~ **MET** — `assert_lt(alloc_used() -
    before, 262144)` per narrowphase call, plus a separate EPA arena bound.
 4. Every fix mutation-proven, with the mutation set including the shape family that broke the
    prior attempt — not just the reported reproducer. **PARTIAL.**
-5. Every one of the 42 audit findings has an explicit disposition: fixed, refuted, or deferred
-   with a reason. **OPEN, and blocked on a mechanism** — the audit table has no disposition
-   column, so the standing rule it states cannot currently be satisfied by anyone.
+5. Every one of the 42 audit findings has an explicit disposition. **MECHANISM IN PLACE, SIX
+   FINDINGS OPEN.** The audit table now carries a Disposition column: **36 FIXED / 6 OPEN /
+   0 REFUTED** of the original 42, plus one addendum row. It earned its keep on the first pass —
+   an adversarial check caught `sequential_impulse` marked **FIXED when only half of it was**: the
+   restitution repair landed in 2.8.3, but the friction block its own Site cell names is
+   byte-identical to 2.8.1, and the friction impulse is **identically zero at every mu and every
+   iteration count** (0 of 320 configs nonzero). No assertion mentions friction; every solver
+   fixture uses friction = 0, so the branch is never entered. Corrected in place, and the
+   mis-marking recorded rather than quietly amended.
+
+   Worth stating on its own: **the entire low tier — 5 of 5 — was never scheduled and never
+   worked.** Not deferred with a reason; simply never picked up, and invisible until there was a
+   column to record it in. That is the 2.7.0 failure recurring, and it is the argument for the
+   column existing at all.
 
 **The one narrowphase defect still open**, deferred out of 2.8.3 deliberately rather than missed:
 `gjk_epa_3d` and `gjk_intersect_3d` **disagree** on 4 of 90 swept pairs — exact tangency in both

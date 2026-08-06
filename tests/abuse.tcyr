@@ -356,16 +356,91 @@ assert_eq(cmat_anticommutator(ab_c22, ab_c23), 0, "cmat_anticommutator: 2x2 vs 2
 assert_eq(cmat_exp(ab_c23), 0, "cmat_exp: non-square -> 0");
 assert_eq(cmat_inverse(ab_c23), 0, "cmat_inverse: non-square -> 0");
 
-# cqr_decompose(non-square A, ...) is DELIBERATELY NOT CALLED HERE. It does not
-# check that A is square, copies an m x n A into an m x m out_R, and therefore
-# writes (n - m) * 16 bytes past out_R's data buffer -- measured at 2 guard slots
-# for a 2x3 A into a 2x2 out_R, with the square control clean. Running it here
-# would corrupt whatever the bump allocator hands out next and make later
-# assertions in this file depend on heap layout. See the KNOWN DEFECT register.
+# cqr_decompose: THE CANARY OVERWRITE, now an executable assertion (crash tier, [Unreleased]).
+#
+# Through 2.8.4 this call could not appear in a suite that has to exit 0: with no
+# check that out_R was the documented m x n, the copy loop walked i < m, j < n
+# into an m x m out_R and cmat_set's offset -- computed from out_R's OWN column
+# count -- ran off the end for every j >= m. It returned HSB_ERR_NONE on top of
+# the overrun. Measured before the fix: rc = HSB_ERR_NONE (0) with 2 of 8 guard
+# slots clobbered, the 16 bytes immediately after out_R's data buffer; the square
+# 2x2 control over the same code path clobbered 0 of 8.
+#
+# ab_c23 above is all zeros (it exists only for shape checks), and an all-zero A
+# would make the reconstruction assertions at the end of this block vacuously
+# true, so the decomposition fixture is a separate 2x3 filled 1..6 -- the exact
+# matrix the register's reproducer used.
+var ab_cqrA = cmat_new(2, 3);
+var ab_cqrf = 1;
+var ab_cqra = 0;
+while (ab_cqra < 2) {
+    var ab_cqrb = 0;
+    while (ab_cqrb < 3) {
+        cmat_set(ab_cqrA, ab_cqra, ab_cqrb, cx_new(f64_from(ab_cqrf), f64_from(0)));
+        ab_cqrf = ab_cqrf + 1;
+        ab_cqrb = ab_cqrb + 1;
+    }
+    ab_cqra = ab_cqra + 1;
+}
+
+# The guard block is allocated IMMEDIATELY after out_R so the bump allocator puts
+# it exactly where a one-past-the-end store lands.
+var ab_cqrR = cmat_new(2, 2);
+var ab_cqr_can = _ab_canary_new(8);
+assert_eq(cqr_decompose(ab_cqrA, cmat_new(2, 2), ab_cqrR), HSB_ERR_INVALID_INPUT,
+"cqr_decompose: 2x3 A into a 2x2 out_R -> HSB_ERR_INVALID_INPUT (was HSB_ERR_NONE)");
+assert_eq(_ab_clob(ab_cqr_can, 8), 0,
+"cqr_decompose: canary past out_R clean (was 2 of 8 slots clobbered)");
+
+# out_Q is checked on the same footing: it is written as an m x m identity.
+assert_eq(cqr_decompose(ab_c22, cmat_new(2, 3), cmat_new(2, 2)), HSB_ERR_INVALID_INPUT,
+"cqr_decompose: out_Q 2x3 for a 2x2 A -> HSB_ERR_INVALID_INPUT");
+assert_eq(cqr_decompose(ab_cqrA, cmat_new(2, 2), cmat_new(3, 3)), HSB_ERR_INVALID_INPUT,
+"cqr_decompose: out_R 3x3 for a 2x3 A -> HSB_ERR_INVALID_INPUT");
+
+# THE SECOND REGISTER DEFECT: no null check on any of the three arguments.
+# cmat_rows(0) is load64(0), and cmat_new returns the designed 0 above
+# _CMAT_MAX_ELEMS -- so the capped-constructor call below LOOKS like it allocated.
+assert_eq(cqr_decompose(0, cmat_new(2, 2), cmat_new(2, 2)), HSB_ERR_INVALID_INPUT,
+"cqr_decompose: A = 0 -> HSB_ERR_INVALID_INPUT (was exit 139)");
+assert_eq(cqr_decompose(ab_c22, 0, cmat_new(2, 2)), HSB_ERR_INVALID_INPUT,
+"cqr_decompose: out_Q = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(cqr_decompose(ab_c22, cmat_new(2, 2), 0), HSB_ERR_INVALID_INPUT,
+"cqr_decompose: out_R = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(cqr_decompose(cmat_new(100000, 100000), cmat_new(2, 2), cmat_new(2, 2)),
+HSB_ERR_INVALID_INPUT,
+"cqr_decompose: capped cmat_new 0 flows through (was exit 139)");
 
 # The square path is exercised so the surrounding contract is still covered.
 assert_eq(cqr_decompose(ab_c22, cmat_new(2, 2), cmat_new(2, 2)), HSB_ERR_NONE,
 "cqr_decompose: a square 2x2 decomposes");
+
+# AND THE RECTANGULAR CASE IS HANDLED, NOT REJECTED. The Householder algorithm is
+# general in m and n; the defect was purely that the out-buffer size was never
+# checked. With out_R sized to the documented m x n the 2x3 decomposition is
+# correct, so the guard above rejects a caller error and not a legitimate shape.
+var ab_cqrQ2 = cmat_new(2, 2);
+var ab_cqrR2 = cmat_new(2, 3);
+assert_eq(cqr_decompose(ab_cqrA, ab_cqrQ2, ab_cqrR2), HSB_ERR_NONE,
+"cqr_decompose: 2x3 A with a correctly sized 2x3 out_R decomposes");
+# Q*R must reproduce A, and R must be upper trapezoidal (R[1][0] == 0).
+var ab_cqrQR = cmat_mul(ab_cqrQ2, ab_cqrR2);
+var ab_cqr_worst = f64_from(0);
+var ab_cqri = 0;
+while (ab_cqri < 2) {
+    var ab_cqrj = 0;
+    while (ab_cqrj < 3) {
+        var ab_cqrd = cx_abs(cx_sub(cmat_get(ab_cqrQR, ab_cqri, ab_cqrj),
+        cmat_get(ab_cqrA, ab_cqri, ab_cqrj)));
+        if (f64_gt(ab_cqrd, ab_cqr_worst) == 1) { ab_cqr_worst = ab_cqrd; }
+        ab_cqrj = ab_cqrj + 1;
+    }
+    ab_cqri = ab_cqri + 1;
+}
+assert(f64_lt(ab_cqr_worst, 0x3E45798EE2308C3A) == 1,
+"cqr_decompose: 2x3 Q*R reproduces A to < 1e-8");
+assert(f64_lt(cx_abs(cmat_get(ab_cqrR2, 1, 0)), 0x3E45798EE2308C3A) == 1,
+"cqr_decompose: 2x3 R is upper trapezoidal (|R[1][0]| < 1e-8)");
 
 test_group("abuse: non-conformable tensor operands");
 
@@ -592,15 +667,139 @@ assert_eq(svd_golub_kahan(ab_A33, ab_U34, ab_S3, 0), HSB_ERR_INVALID_INPUT,
 assert_eq(svd_golub_kahan(mat_new_guarded(1000000, 1000000), ab_U34, ab_S3, ab_Vt44),
 HSB_ERR_INVALID_INPUT, "svd_golub_kahan: capped mat_new_guarded 0 flows through");
 
-# eigen_qr's guarded cases. Its UNGUARDED ones are in the defect register.
+# eigen_qr now validates the SAME four things svd_golub_kahan does ([Unreleased]);
+# the
+# register entries below this line are the ones that used to exit 139.
+#
+# ab_A33 is diag(2, 3, 4) -- a matrix that CONVERGES. That matters: the register's
+# original reproducer for the null-out_vals case used mat_new(3, 3), an all-zero
+# matrix, which returns early from the tridiagonal QR before it ever writes to
+# out_vals and so exits 0 rather than 139. The register line has been corrected.
 assert_eq(eigen_qr(ab_A33, 0, 50, ab_S3, mat_new(3, 3)), HSB_ERR_INVALID_INPUT,
 "eigen_qr: n = 0 -> HSB_ERR_INVALID_INPUT");
-assert_eq(eigen_qr(ab_A34, 3, 50, ab_S3, mat_new(3, 3)), HSB_ERR_NO_CONVERGENCE,
-"eigen_qr: non-square 3x4 -> no-convergence, not a wild read");
+assert_eq(eigen_qr(ab_A33, (0 - 3), 50, ab_S3, mat_new(3, 3)), HSB_ERR_INVALID_INPUT,
+"eigen_qr: n = -3 -> HSB_ERR_INVALID_INPUT (was exit 139)");
+assert_eq(eigen_qr(0, 3, 50, ab_S3, mat_new(3, 3)), HSB_ERR_INVALID_INPUT,
+"eigen_qr: A = 0 -> HSB_ERR_INVALID_INPUT (was exit 139)");
+assert_eq(eigen_qr(ab_A33, 3, 50, 0, mat_new(3, 3)), HSB_ERR_INVALID_INPUT,
+"eigen_qr: out_vals = 0 -> HSB_ERR_INVALID_INPUT (was exit 139 on a converging A)");
+assert_eq(eigen_qr(ab_A33, 3, 50, ab_S3, 0), HSB_ERR_INVALID_INPUT,
+"eigen_qr: out_vecs = 0 -> HSB_ERR_INVALID_INPUT (was exit 139)");
+assert_eq(eigen_qr(mat_new_guarded(1000000, 1000000), 3, 50, ab_S3, mat_new(3, 3)),
+HSB_ERR_INVALID_INPUT, "eigen_qr: capped mat_new_guarded 0 flows through");
+assert_eq(eigen_qr(ab_A33, 1000000000, 50, ab_S3, mat_new(3, 3)), HSB_ERR_INVALID_INPUT,
+"eigen_qr: n = 1e9 against a 3x3 A -> HSB_ERR_INVALID_INPUT");
+assert_eq(eigen_qr(ab_A33, 3, 50, ab_S3, mat_new(2, 2)), HSB_ERR_INVALID_INPUT,
+"eigen_qr: out_vecs 2x2 too small for n = 3 -> HSB_ERR_INVALID_INPUT");
+
+# TIGHTENED, NOT WEAKENED ([Unreleased]). This case previously asserted
+# HSB_ERR_NO_CONVERGENCE with the note "not a wild read" -- true, since n = 3
+# indexes inside a 3x4. eigen_qr now rejects any A whose extent is not exactly
+# n x n, so the expected value moves from -8 to -10, a STRICTER outcome on an
+# unchanged fixture.
+#
+# CORRECTION, and it matters more than the change it corrects. This comment
+# previously justified the move by asserting that "at max_iter = 10000 the same
+# call returns HSB_ERR_NONE carrying the spectrum of the leading 3x3 block."
+# THAT MEASUREMENT IS FALSE and was removed on 2026-08-05 by the verifying pass
+# that reproduced it. `ab_A34` is mat_new(3, 4) and is never written to, so its
+# leading 3x3 block is the ZERO matrix; replayed byte-exactly against the
+# pre-fix source it returns -8 at every budget tried -- 50, 1000, 10000,
+# 100000, 1000000, 10000000. There was no silent-wrong-answer path, and the
+# claim that there was is exactly the defect class this repo treats as
+# cardinal: a stated measurement that does not reproduce.
+#
+# The change stands on the argument that survives: n is a restatement of A's
+# extent, so a 3x4 with n = 3 is a shape eigen_qr cannot answer for, and
+# rejecting it outright is a better contract than a convergence failure that
+# happens to fall out. Not on a number nobody measured.
+assert_eq(eigen_qr(ab_A34, 3, 50, ab_S3, mat_new(3, 3)), HSB_ERR_INVALID_INPUT,
+"eigen_qr: non-square 3x4 -> HSB_ERR_INVALID_INPUT (was NO_CONVERGENCE at max_iter 50)");
+assert_eq(eigen_qr(ab_A34, 3, 10000, ab_S3, mat_new(3, 3)), HSB_ERR_INVALID_INPUT,
+"eigen_qr: non-square 3x4 stays rejected at max_iter 10000 (budget-independent)");
+
 assert_eq(eigen_qr(ab_A33, 3, 0, ab_S3, mat_new(3, 3)), HSB_ERR_NO_CONVERGENCE,
 "eigen_qr: max_iter = 0 -> no-convergence");
 assert_eq(eigen_qr(ab_A33, 3, (0 - 5), ab_S3, mat_new(3, 3)), HSB_ERR_NO_CONVERGENCE,
 "eigen_qr: max_iter = -5 -> no-convergence");
+
+# eigen_qr still WORKS on the shape it documents -- the guards reject callers,
+# not the routine's own job. diag(2, 3, 4) has eigenvalues 4, 3, 2 in eigen_qr's
+# descending-magnitude order.
+var ab_eqv = alloc(3 * 8);
+assert_eq(eigen_qr(ab_A33, 3, 1000, ab_eqv, mat_new(3, 3)), HSB_ERR_NONE,
+"eigen_qr: diag(2,3,4) still decomposes after the guards");
+assert_eq(load64(ab_eqv), f64_from(4), "eigen_qr: diag(2,3,4) lambda0 == 4");
+assert_eq(load64(ab_eqv + 8), f64_from(3), "eigen_qr: diag(2,3,4) lambda1 == 3");
+assert_eq(load64(ab_eqv + 16), F64_TWO, "eigen_qr: diag(2,3,4) lambda2 == 2");
+
+# --- eigen_power / lyapunov_max: n was not bounded AT ALL (register entries) ---
+test_group("abuse: eigen_power / lyapunov_max dimension + null contract");
+
+var ab_ep_val = alloc(8);
+var ab_ep_vec = alloc(3 * 8);
+assert_eq(eigen_power(ab_A33, (0 - 3), 5, ab_ep_val, ab_ep_vec), HSB_ERR_INVALID_INPUT,
+"eigen_power: n = -3 -> HSB_ERR_INVALID_INPUT (was exit 139, alloc of a negative size)");
+assert_eq(eigen_power(ab_A33, 0, 5, ab_ep_val, ab_ep_vec), HSB_ERR_INVALID_INPUT,
+"eigen_power: n = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(eigen_power(ab_A33, 1000000000, 5, ab_ep_val, ab_ep_vec), HSB_ERR_INVALID_INPUT,
+"eigen_power: n = 1e9 (8 GB, over ALLOC_MAX) -> HSB_ERR_INVALID_INPUT (was exit 139)");
+assert_eq(eigen_power(0, 3, 5, ab_ep_val, ab_ep_vec), HSB_ERR_INVALID_INPUT,
+"eigen_power: A = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(eigen_power(ab_A33, 3, 5, 0, ab_ep_vec), HSB_ERR_INVALID_INPUT,
+"eigen_power: out_val = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(eigen_power(ab_A33, 3, 5, ab_ep_val, 0), HSB_ERR_INVALID_INPUT,
+"eigen_power: out_vec = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(eigen_power(mat_new_guarded(1000000, 1000000), 3, 5, ab_ep_val, ab_ep_vec),
+HSB_ERR_INVALID_INPUT, "eigen_power: capped mat_new_guarded 0 flows through");
+assert_eq(eigen_power(ab_A34, 3, 5, ab_ep_val, ab_ep_vec), HSB_ERR_INVALID_INPUT,
+"eigen_power: 3x4 A with n = 3 -> HSB_ERR_INVALID_INPUT (leading-block answer refused)");
+# Still works on the documented shape.
+#
+# On diag(2, 3, 4) it returns 2, NOT the dominant 4 -- and that is the algorithm,
+# not a regression. eigen_power seeds v = e_0, which is an exact eigenvector of
+# any diagonal matrix, so the iteration is stationary at A[0][0] from the first
+# step and the |dlambda| < EPSILON test fires immediately. Pinned here so the
+# seed's consequence is documented rather than rediscovered.
+assert_eq(eigen_power(ab_A33, 3, 1000, ab_ep_val, ab_ep_vec), HSB_ERR_NONE,
+"eigen_power: diag(2,3,4) still runs after the guards");
+assert_eq(load64(ab_ep_val), F64_TWO,
+"eigen_power: diag(2,3,4) returns A[0][0] = 2 -- e_0 is already an eigenvector");
+
+# A matrix e_0 is NOT an eigenvector of, so the iteration actually iterates:
+# [[2,1],[1,3]] has dominant eigenvalue (5 + sqrt 5) / 2 = 3.618033988749895.
+var ab_ep2 = mat_new(2, 2);
+mat_set(ab_ep2, 0, 0, F64_TWO);   mat_set(ab_ep2, 0, 1, F64_ONE);
+mat_set(ab_ep2, 1, 0, F64_ONE);   mat_set(ab_ep2, 1, 1, f64_from(3));
+var ab_ep2_vec = alloc(2 * 8);
+assert_eq(eigen_power(ab_ep2, 2, 1000, ab_ep_val, ab_ep2_vec), HSB_ERR_NONE,
+"eigen_power: [[2,1],[1,3]] converges after the guards");
+assert(f64_approx_eq(load64(ab_ep_val), 0x400CF1BBCDCBFA54, 0x3E45798EE2308C3A) == 1,
+"eigen_power: [[2,1],[1,3]] dominant lambda == 3.618033988749895");
+
+var ab_ly = alloc(8);
+assert_eq(lyapunov_max(ab_A33, 0, 5, ab_ly), HSB_ERR_INVALID_INPUT,
+"lyapunov_max: n = 0 -> HSB_ERR_INVALID_INPUT (was exit 139, mat_new's designed 0)");
+assert_eq(lyapunov_max(ab_A33, (0 - 2), 5, ab_ly), HSB_ERR_INVALID_INPUT,
+"lyapunov_max: n = -2 -> HSB_ERR_INVALID_INPUT (was exit 139)");
+assert_eq(lyapunov_max(ab_A33, 1000000000, 5, ab_ly), HSB_ERR_INVALID_INPUT,
+"lyapunov_max: n = 1e9 -> HSB_ERR_INVALID_INPUT");
+assert_eq(lyapunov_max(0, 3, 5, ab_ly), HSB_ERR_INVALID_INPUT,
+"lyapunov_max: A = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(lyapunov_max(ab_A33, 3, 5, 0), HSB_ERR_INVALID_INPUT,
+"lyapunov_max: out = 0 -> HSB_ERR_INVALID_INPUT");
+assert_eq(lyapunov_max(ab_A34, 3, 5, ab_ly), HSB_ERR_INVALID_INPUT,
+"lyapunov_max: 3x4 A with n = 3 -> HSB_ERR_INVALID_INPUT");
+# A non-positive iteration budget is not "unbounded": the loop runs zero times,
+# count stays 0 and the documented 0 exponent is stored.
+assert_eq(lyapunov_max(ab_A33, 3, (0 - 5), ab_ly), HSB_ERR_NONE,
+"lyapunov_max: iterations = -5 -> HSB_ERR_NONE, not a hang");
+assert_eq(load64(ab_ly), f64_from(0), "lyapunov_max: iterations = -5 stores 0");
+# Still works on the documented shape: the identity map expands nothing.
+assert_eq(lyapunov_max(mat_identity(3), 3, 50, ab_ly), HSB_ERR_NONE,
+"lyapunov_max: identity still runs after the guards");
+assert(f64_lt(f64_abs(load64(ab_ly)), 0x3E45798EE2308C3A) == 1,
+"lyapunov_max: identity exponent is 0");
 
 test_group("abuse: CSR sparse dimension mismatches");
 
@@ -1226,6 +1425,16 @@ while (ab_pi < 8) {
 }
 var ab_query = hvec3_new(F64_ONE, F64_ONE, F64_ONE);
 assert_eq(kdtree_build(ab_pts, 0), 0, "kdtree_build: count = 0 -> 0");
+# `count == 0` was a HALF-GUARD (fixed, [Unreleased]): a negative count reached
+# _kd_build_rec(items, points, 0, -1), missed the `count == 1` leaf case and let
+# _kd_select_median vec_get an out-of-range slot -- vec's own bounds check then
+# aborted the process ("vec: index out of bounds", exit 1, measured).
+# kdtree_build returns a HANDLE, so 0 -- the documented empty tree -- is the
+# rejection value; there is no negative HSB_ERR_* to return through a pointer.
+assert_eq(kdtree_build(ab_pts, (0 - 1)), 0,
+"kdtree_build: count = -1 -> 0 (was 'vec: index out of bounds', exit 1)");
+assert_eq(kdtree_build(ab_pts, (0 - 1000000)), 0, "kdtree_build: count = -1e6 -> 0");
+assert_eq(kdtree_build(0, 8), 0, "kdtree_build: points = 0 -> 0");
 assert_eq(kdtree_nearest(0, ab_pts, ab_query), (0 - 1), "kdtree_nearest: null root -> -1");
 assert_eq(vec_len(kdtree_within_radius(0, ab_pts, ab_query, F64_ONE)), 0,
 "kdtree_within_radius: null root -> empty");
@@ -1798,6 +2007,34 @@ assert_eq(einsum(str_from("ijk->ij"), ab_ops1, 1), 0, "einsum: spec rank 3 vs te
 assert_eq(einsum(str_from("i->i"), ab_ops1, 1), 0, "einsum: spec rank 1 vs tensor rank 2 -> 0");
 assert_eq(einsum(str_from("i9,jk->ik"), ab_ops2, 2), 0, "einsum: digit in the spec -> 0");
 assert_eq(einsum(str_from("IJ,JK->IK"), ab_ops2, 2), 0, "einsum: uppercase label -> 0");
+
+# EINSUM'S OWN OUTPUT FED BACK IN (register entry, [Unreleased]). einsum returns 0 on
+# every error path above and tensor_new returns 0 above its caps, so a 0 in the
+# operand array is the ordinary result of composing two einsum calls -- exactly
+# what the module is for. HTensor_rank(0) is load64(0), so this SIGSEGV'd
+# (measured, exit 139) even though tensor_add / tensor_scale / tensor_contract
+# all guard it and name einsum as the producer of the 0.
+var ab_ein_null = alloc(8 * 8);
+store64(ab_ein_null, 0);
+assert_eq(einsum(str_from("ij->ji"), ab_ein_null, 1), 0,
+"einsum: a 0 operand (einsum's own failure output) -> 0 (was exit 139)");
+# Second operand null, first valid -- the guard must be per-operand, not just on
+# operand 0.
+var ab_ein_half = alloc(8 * 8);
+store64(ab_ein_half, ab_t22);
+store64(ab_ein_half + 8, 0);
+assert_eq(einsum(str_from("ij,jk->ik"), ab_ein_half, 2), 0,
+"einsum: second operand 0 -> 0");
+# The real composition: feed a failed einsum straight back in.
+var ab_ein_fail = alloc(8 * 8);
+store64(ab_ein_fail, einsum(str_from("ij->ii"), ab_ops1, 1));
+assert_eq(load64(ab_ein_fail), 0, "einsum: repeated output label really does return 0");
+assert_eq(einsum(str_from("ij->ji"), ab_ein_fail, 1), 0,
+"einsum: chained onto its own 0 output -> 0, not a fault");
+assert_eq(einsum(str_from("ij->ji"), 0, 1), 0, "einsum: tensors array = 0 -> 0");
+assert_eq(einsum(0, ab_ops1, 1), 0, "einsum: notation = 0 -> 0");
+# And the working path is unchanged.
+assert_neq(einsum(str_from("ij->ji"), ab_ops1, 1), 0, "einsum: transpose still works");
 assert_eq(einsum(str_from("ij->ii"), ab_ops1, 1), 0, "einsum: repeated output label -> 0");
 assert_eq(einsum(str_from("ij->k"), ab_ops1, 1), 0, "einsum: output label absent from the input -> 0");
 
@@ -1852,77 +2089,127 @@ assert_neq(sym_rewrite(ab_zero_expr, sym_default_rules()), 0,
 # KNOWN DEFECT REGISTER -- inputs that KILL the process
 # ================================================================
 # The inputs below were found while building this file. Each one either ends the
-# process or corrupts the heap, so none can be executed inside a suite that has
-# to exit 0; they are recorded here verbatim so the case is documented rather
+# process or corrupts the heap, so none could be executed inside a suite that has
+# to exit 0; they were recorded here verbatim so the case was documented rather
 # than discarded. Every reproducer was run in isolation and its signal observed.
 #
 # Each is a HALF-GUARD or a MISSING NULL CHECK on a public entry point whose own
 # sibling already validates the same surface -- not a raw-accessor precondition.
 #
-# --- src/linalg_precision.cyr:1278  cqr_decompose(A, out_Q, out_R)
-#     *** THE ONE CANARY OVERWRITE. *** No squareness check on A. The copy loop
-#     at :1290 walks i < m, j < n and calls cmat_set(out_R, i, j), but out_R is
-#     the m x m matrix the caller sized for a square decomposition, so the store
-#     offset (i * m + j) * 16 runs off the end for every j >= m. Returns
-#     HSB_ERR_NONE -- a success code on top of the overrun.
+# STATUS, [Unreleased] crash-tier pass: the six entries marked [FIXED] below are guarded in src/ and
+# every one of their reproducers is now a live assertion in the body of this
+# file -- the input returns its documented error code cleanly instead of ending
+# the process. They are kept here, struck through rather than deleted, so the
+# defect and its measured signal stay on the record next to the assertion that
+# replaced it. The four entries marked [OPEN] are NOT fixed: nothing in this pass
+# touched them and they still kill the process, so they still may not be called.
+#
+# ---------------- [FIXED] -- crash tier, [Unreleased] ----------------
+#
+# --- src/linalg_precision.cyr:1306  cqr_decompose(A, out_Q, out_R)   [FIXED]
+#     *** THE ONE CANARY OVERWRITE. *** No check that out_R was the documented
+#     m x n. The copy loop walked i < m, j < n calling cmat_set(out_R, i, j), and
+#     cmat_set takes its stride from out_R's OWN column count, so with the m x m
+#     out_R a caller sized for a square decomposition the store offset ran off the
+#     end for every j >= m. Returned HSB_ERR_NONE -- a success code on top of the
+#     overrun.
 #       var A23 = cmat_new(2, 3);   # filled 1..6
 #       var Q = cmat_new(2, 2); var R = cmat_new(2, 2);
 #       var can = alloc(8 * 8);     # stamped 0x5A5A...; the block after R
 #       cqr_decompose(A23, Q, R);
-#     MEASURED: returns 0 (HSB_ERR_NONE); guard slots 0 and 1 -- the 16 bytes
-#     immediately after out_R's data buffer -- are overwritten. 2 of 8 slots.
-#     The square 2x2 control over the same code path leaves all 8 slots clean,
-#     so the clobber is the shape mismatch and nothing else.
+#     MEASURED (2.8.4): returned 0 (HSB_ERR_NONE); guard slots 0 and 1 -- the 16
+#     bytes immediately after out_R's data buffer -- overwritten. 2 of 8 slots.
+#     The square 2x2 control over the same code path left all 8 slots clean, so
+#     the clobber was the shape mismatch and nothing else.
+#     FIX: out_Q must be exactly m x m and out_R exactly m x n, else
+#     HSB_ERR_INVALID_INPUT. The shape is REJECTED, not coerced: there is nowhere
+#     to put an m x n R inside an m x m allocation. The rectangular case itself is
+#     HANDLED -- Householder QR is general in m and n, and with out_R sized m x n
+#     the 2x3 decomposition is measurably correct (Q*R == A, Q^H Q == I, R upper
+#     trapezoidal to < 1e-8; same on a tall 4x2). Asserted above, canary included.
 #
-# --- src/linalg_ext.cyr:778  eigen_power(A, n, max_iter, out_val, out_vec)
-#     No bound on n at all. `var v = alloc(n * 8)` then `store64(v, f64_from(1))`
-#     unconditionally: alloc's designed 0 is stored through.
-#       eigen_power(mat_new(3, 3), (0 - 3), 5, alloc(8), alloc(24));      exit 139
-#       eigen_power(mat_new(3, 3), 1000000000, 5, alloc(8), alloc(24));   exit 139
-#     (n = 1e9 asks for 8 GB, over ALLOC_MAX = 2 GiB, so alloc returns 0.)
-#
-# --- src/linalg_ext.cyr:873  lyapunov_max(A, n, iterations, out)
-#     No bound on n. `mat_new(n, n)` returns the designed 0 for n <= 0 and the
-#     0 is handed straight to mat_mul.
-#       lyapunov_max(mat_new(3, 3), 0, 5, alloc(8));                      exit 139
-#       lyapunov_max(mat_new(3, 3), (0 - 2), 5, alloc(8));                exit 139
-#
-# --- src/linalg_precision.cyr:1192  eigen_qr(A, n, max_iter, out_vals, out_vecs)
-#     Guards n == 0 only. No null check on A, out_vals or out_vecs, and no lower
-#     bound on n -- while svd_golub_kahan (:753, the same file) guards exactly
-#     those four (added 2.8.3; asserted above in this suite).
-#       eigen_qr(0, 3, 50, alloc(24), mat_new(3, 3));                     exit 139
-#       eigen_qr(mat_new(3, 3), (0 - 3), 50, alloc(24), mat_new(3, 3));   exit 139
-#       eigen_qr(mat_new(3, 3), 3, 50, 0, mat_new(3, 3));                 exit 139
-#       eigen_qr(mat_new(3, 3), 3, 50, alloc(24), 0);                     exit 139
-#
-# --- src/linalg_precision.cyr:1278  cqr_decompose(A, out_Q, out_R)  [2nd defect]
-#     Separately from the overrun above: no null check on any of the three
-#     arguments. cmat_rows(0) is load64(0), and cmat_new returns the designed 0
-#     above _CMAT_MAX_ELEMS.
+# --- src/linalg_precision.cyr:1306  cqr_decompose(A, out_Q, out_R)   [FIXED]
+#     [2nd defect] Separately from the overrun above: no null check on any of the
+#     three arguments. cmat_rows(0) is load64(0), and cmat_new returns the
+#     designed 0 above _CMAT_MAX_ELEMS.
 #       cqr_decompose(0, cmat_new(2, 2), cmat_new(2, 2));                 exit 139
 #       cqr_decompose(cmat_new(100000, 100000), cmat_new(2,2), cmat_new(2,2));
 #                                                                        exit 139
+#     FIX: all three null-checked before any dim is read, plus m <= 0 / n <= 0;
+#     HSB_ERR_INVALID_INPUT. Asserted above.
 #
-# --- src/einsum.cyr:161  einsum(notation, tensors, n_tensors)
+# --- src/linalg_ext.cyr:780  eigen_power(A, n, max_iter, out_val, out_vec) [FIXED]
+#     No bound on n at all. `var v = alloc(n * 8)` then `store64(v, f64_from(1))`
+#     unconditionally: alloc's designed 0 was stored through.
+#       eigen_power(mat_new(3, 3), (0 - 3), 5, alloc(8), alloc(24));      exit 139
+#       eigen_power(mat_new(3, 3), 1000000000, 5, alloc(8), alloc(24));   exit 139
+#     (n = 1e9 asks for 8 GB, over ALLOC_MAX = 2 GiB, so alloc returns 0.)
+#     FIX: A / out_val / out_vec null-checked, n <= 0 rejected, and n must equal
+#     A's own extent (mat_rows(A) == mat_cols(A) == n) -- REJECTED rather than
+#     handled, because n is a restatement of A's shape: n > A is an out-of-bounds
+#     read and n < A silently answers for A's leading n x n block. Both alloc
+#     results are checked for the designed 0 -> HSB_ERR_ALLOC. Asserted above.
+#
+# --- src/linalg_ext.cyr:899  lyapunov_max(A, n, iterations, out)       [FIXED]
+#     No bound on n. `mat_new(n, n)` returns the designed 0 for n <= 0 and the
+#     0 was handed straight to mat_mul.
+#       lyapunov_max(mat_new(3, 3), 0, 5, alloc(8));                      exit 139
+#       lyapunov_max(mat_new(3, 3), (0 - 2), 5, alloc(8));                exit 139
+#     FIX: same shape as eigen_power -- A / out null-checked, n <= 0 rejected,
+#     n must equal A's extent, and the working matrices go through
+#     mat_new_guarded with an HSB_ERR_ALLOC on the designed 0 (mat_mul's result
+#     too). Asserted above.
+#
+# --- src/linalg_precision.cyr:1193  eigen_qr(A, n, max_iter, out_vals, out_vecs)
+#     [FIXED] Guarded n == 0 only. No null check on A, out_vals or out_vecs, and
+#     no lower bound on n -- while svd_golub_kahan (:753, the same file) guarded
+#     exactly those four (added 2.8.3; asserted above in this suite).
+#       eigen_qr(0, 3, 50, alloc(24), mat_new(3, 3));                     exit 139
+#       eigen_qr(mat_new(3, 3), (0 - 3), 50, alloc(24), mat_new(3, 3));   exit 139
+#       eigen_qr(diag(2,3,4), 3, 50, 0, mat_new(3, 3));                   exit 139
+#       eigen_qr(mat_new(3, 3), 3, 50, alloc(24), 0);                     exit 139
+#     REPRODUCER CORRECTED: the out_vals = 0 line above read
+#     `eigen_qr(mat_new(3, 3), 3, 50, 0, mat_new(3, 3))` and that call exits 0,
+#     not 139 -- an all-zero A makes the tridiagonal QR return before it ever
+#     writes an eigenvalue, so the null is never dereferenced. It needs an A that
+#     CONVERGES; diag(2, 3, 4) faults, measured. The other three were correct as
+#     written, measured.
+#     FIX: svd_golub_kahan's idiom, applied verbatim -- A / out_vals / out_vecs
+#     null-checked before any dim is read, n <= 0 rejected, plus A must be
+#     exactly n x n and out_vecs at least n x n. HSB_ERR_INVALID_INPUT.
+#
+# --- src/einsum.cyr:103  einsum(notation, tensors, n_tensors)          [FIXED]
 #     `HTensor_rank(load64(tensors + oi * 8))` with no `t == 0` check. tensor_new
 #     returns 0 above its caps and einsum itself returns 0 on a malformed
-#     subscript -- so einsum's OWN output fed back in kills the process, even
+#     subscript -- so einsum's OWN output fed back in killed the process, even
 #     though tensor_add / tensor_scale / tensor_contract all guard for exactly
 #     this (their comments name einsum as the producer of the 0).
 #       var tv = alloc(8); store64(tv, 0);
 #       einsum(str_from("ij->ji"), tv, 1);                                exit 139
+#     FIX: notation / tensors null-checked at entry, and each operand handle
+#     checked for 0 before HTensor_rank. Returns einsum's documented 0-on-error,
+#     which is the whole contract here -- there is no error code to return, the
+#     function's success value is a tensor handle. Asserted above, including the
+#     chained einsum-onto-its-own-0 case.
 #
-# --- src/spatial.cyr:227  kdtree_build(points, count)
+# --- src/spatial.cyr:229  kdtree_build(points, count)                  [FIXED]
 #     `if (count == 0)` with no lower bound. _kd_build_rec(items, points, 0, -1)
-#     reaches _kd_select_median, which vec_gets an out-of-range slot.
+#     reached _kd_select_median, which vec_gets an out-of-range slot.
 #       kdtree_build(pts, (0 - 1));       "vec: index out of bounds", exit 1
+#     FIX: `count <= 0` and a null points array both return 0. 0 is the right
+#     rejection value and not a dodge: kdtree_build returns a NODE HANDLE, whose
+#     documented empty/failure value is already 0, so there is no negative
+#     HSB_ERR_* to hand back through a pointer. Asserted above.
 #
-# --- src/geo_advanced.cyr:1426  bvh_build(aabbs, count)
-#     Identical half-guard to kdtree_build.
+# ---------------- [OPEN] -- still kill the process, do NOT call ----------------
+#
+# --- src/geo_advanced.cyr:1425  bvh_build(aabbs, count)                 [OPEN]
+#     Identical half-guard to kdtree_build. NOT fixed in this pass -- kdtree_build
+#     was fixed and this was not, so the siblings now disagree; whoever takes this
+#     should copy the kdtree_build guard verbatim.
 #       bvh_build(boxes, (0 - 1));        "vec: index out of bounds", exit 1
 #
-# --- src/collision_mesh.cyr:851 / :870
+# --- src/collision_mesh.cyr:851 / :870                                  [OPEN]
 #       halfedge_adjacent_faces(mesh, face) / halfedge_is_boundary(mesh, vertex)
 #     Neither bounds its index before vec_get, although halfedge_from_triangles
 #     (:719, asserted above) validates n_tris, n_verts AND every vertex id.
@@ -1930,13 +2217,14 @@ assert_neq(sym_rewrite(ab_zero_expr, sym_default_rules()), 0,
 #       halfedge_adjacent_faces(mesh, 99);        "vec: index out of bounds", exit 1
 #       halfedge_is_boundary(mesh, (0 - 1));      "vec: index < 0",        exit 1
 #
-# --- src/num.cyr:429  num_modpow(base, exp, modulus)
+# --- src/num.cyr:429  num_modpow(base, exp, modulus)                    [OPEN]
 #     Guards modulus == 1 but not modulus == 0; `base % modulus` is an integer
 #     divide by zero.
 #       num_modpow(2, 10, 0);                     SIGFPE, exit 136
 #
-# --- src/complex.cyr:181 / :187  cmat_get(m, r, c) / cmat_set(m, r, c, val)
-#     Unchecked index arithmetic: off = (r * cols + c) * 16 with no bounds test.
+# --- src/complex.cyr:182 / :188  cmat_get(m, r, c) / cmat_set(m, r, c, val)
+#     [OPEN] Unchecked index arithmetic: off = (r * cols + c) * 16 with no bounds
+#     test.
 #       cmat_get(cmat_new(2, 2), (0 - 1), 0);                             exit 139
 #     Lower severity than the above -- these mirror the stdlib mat_get / mat_set
 #     raw-accessor convention -- but hisab's own cmat_new IS guarded, so the

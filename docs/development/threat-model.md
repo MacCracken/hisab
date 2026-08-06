@@ -26,7 +26,8 @@ Hisab does NOT trust:
 | delaunay_2d | Bad-triangle / cocircular degeneracy | Super-triangle + strict in-circle; collinear → empty (no trap) |
 | halfedge_is_boundary | One-ring walk non-termination | 1000-step guard |
 | mpr_intersect/penetration | False positive on separated shapes; non-convergence | Fixed in 2.4.4 (origin-containment early-out); `_COL_MAX_ITER = 64` |
-| sequential_impulse | Zero/unbounded impulse | Fixed in 2.4.5 (sign + accumulate-into-velocity); impulse clamped ≥ 0, converges |
+| sequential_impulse | Zero/unbounded normal impulse | Fixed in 2.4.5 (sign + accumulate-into-velocity); impulse clamped ≥ 0, converges. Restitution re-applied per sweep (period-2 orbit at e = 1) fixed in 2.8.3 — e is a one-off bias on the target velocity |
+| sequential_impulse | Friction impulse identically 0 — Coulomb cone never enforced because nothing was ever clamped | Fixed post-2.8.4. The branch clamped the zero it had just loaded from its own output slot; measured 0 of 320 configs nonzero. Now `λ_t = clamp(-v_t/inv_mass, ±mu·λ_n)`, accumulate-then-clamp so the bound is on the total; `mu = 0` and `tangent_vel = 0` paths bit-identical |
 | num_newton/bisection | Non-convergence | max_iter bound; returns ERR_NO_CONVERGENCE |
 | num_modpow | Intermediate multiplication overflow | _num_mulmod (Russian peasant) avoids overflow |
 | sectional_curvature | Division by a degenerate plane area (`⟨u,u⟩⟨v,v⟩−⟨u,v⟩² ≈ 0`) | Zero guard (`< EPSILON → 0`); pinned by the degenerate-plane test |

@@ -131,20 +131,40 @@ fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, out_depth
 # ================================================================
 # 2. Sequential Impulse Solver
 # ================================================================
-# Contact constraint: 64 bytes (8 fields x 8 bytes)
+# Contact constraint: 72 bytes (9 fields x 8 bytes)
 #   offset 0:  body_a       (index)
 #   offset 8:  body_b       (index)
 #   offset 16: normal       (HVec3 pointer)
 #   offset 24: penetration  (f64)
-#   offset 32: friction     (f64)
+#   offset 32: friction     (f64)   -- Coulomb mu
 #   offset 40: restitution  (f64)
 #   offset 48: inv_mass_a   (f64)
 #   offset 56: inv_mass_b   (f64)
+#   offset 64: tangent_vel  (f64)   -- signed relative tangential speed
+#
+# `tangent_vel` (2.8.4) is the relative sliding speed of body A with respect to
+# body B, measured along a caller-chosen unit tangent t^ that lies in the contact
+# plane. It is a SIGNED SCALAR, not a vector: the solver reports one friction
+# magnitude per contact, so the tangent direction lives with the caller and the
+# solver only needs the component along it. The returned friction impulse is the
+# signed magnitude along that same t^ applied to A (its negation applies to B),
+# so a positive tangent_vel yields a negative friction impulse.
+#
+# It exists because `friction` had no input to act on. The reduced model here
+# derives the whole relative velocity from `penetration` ALONG THE NORMAL, so the
+# tangential component was structurally zero and `friction` was a silently
+# ignored parameter (see the block in sequential_impulse). Contacts built by the
+# 8-argument `contact_new` get tangent_vel = 0 and therefore behave exactly as
+# they did before 2.8.4, friction impulse included.
 
 #derive(accessors)
-struct ColContact { body_a; body_b; normal; penetration; friction; restitution; inv_mass_a; inv_mass_b; }
+struct ColContact {
+    body_a; body_b; normal; penetration; friction; restitution;
+    inv_mass_a; inv_mass_b; tangent_vel;
+}
 
-fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_mass_a, inv_mass_b) {
+fn contact_new_fric(body_a, body_b, normal, penetration, friction, restitution,
+inv_mass_a, inv_mass_b, tangent_vel) {
     var c = alloc(sizeof(ColContact));
     ColContact_set_body_a(c, body_a);
     ColContact_set_body_b(c, body_b);
@@ -154,7 +174,16 @@ fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_m
     ColContact_set_restitution(c, restitution);
     ColContact_set_inv_mass_a(c, inv_mass_a);
     ColContact_set_inv_mass_b(c, inv_mass_b);
+    ColContact_set_tangent_vel(c, tangent_vel);
     return c;
+}
+
+# Frictionless-input constructor: identical to contact_new_fric with a zero
+# tangential relative velocity. Kept at its original 8-argument arity so every
+# existing caller (and every consumer) is source-compatible.
+fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_mass_a, inv_mass_b) {
+    return contact_new_fric(body_a, body_b, normal, penetration, friction, restitution,
+    inv_mass_a, inv_mass_b, _COL_F64_ZERO);
 }
 
 # sequential_impulse -- solve normal + friction impulses
@@ -163,6 +192,9 @@ fn contact_new(body_a, body_b, normal, penetration, friction, restitution, inv_m
 # iterations: solver iterations
 # out_impulses: pre-allocated flat array, 2 f64 per contact (normal, friction magnitude)
 #   Layout: [n0, f0, n1, f1, ...] -- total 16*n bytes
+#   n_i is the normal impulse, >= 0. f_i is the SIGNED friction impulse along the
+#   caller's tangent t^ (the one ColContact.tangent_vel was measured along), so it
+#   is negative for a positive tangent_vel; |f_i| <= friction * n_i always.
 fn sequential_impulse(contacts, n, iterations, out_impulses) {
     # Zero out impulses
     for (var zi = 0; zi < n; zi = zi + 1) {
@@ -222,20 +254,53 @@ fn sequential_impulse(contacts, n, iterations, out_impulses) {
                 }
                 store64(out_impulses + ci * 16, new_impulse);
 
-                # Friction impulse (Coulomb cone)
+                # FRICTION IS A COULOMB-CLAMPED ACCUMULATED IMPULSE.
+                #
+                # Through 2.8.4 this block LOADED the friction slot it had itself
+                # zeroed at entry, clamped that zero, and stored it back -- there
+                # was no update between the load and the clamp. |0| > mu*lambda_n
+                # is never true for a non-negative bound, so the friction impulse
+                # was identically 0 for every contact, at every mu, at every
+                # iteration count (measured: 0 of 320 sampled configs nonzero) and
+                # `friction` was a silently ignored parameter. It survived because
+                # every solver fixture used friction = 0, so the branch was never
+                # even entered.
+                #
+                # The tangential constraint drives the relative sliding speed to
+                # zero, using the same effective-velocity convention as the normal
+                # path above (the accumulated impulse folded back into the
+                # velocity it already produced):
+                #   v_t_eff = v_t + lambda_t * inv_mass
+                #   dlambda = -(v_t_eff - 0) / inv_mass
+                #   lambda_t = clamp(lambda_t + dlambda, -mu*lambda_n, +mu*lambda_n)
+                # The accumulate-then-clamp order is what makes it Coulomb rather
+                # than a per-sweep cap: the clamp bounds the TOTAL tangential
+                # impulse, so a contact that saturates stays saturated instead of
+                # gaining another mu*lambda_n on the next sweep.
+                #
+                # The unclamped update telescopes to lambda_t = -v_t / inv_mass --
+                # reached in ONE sweep and idempotent thereafter, so the answer
+                # does not depend on `iterations`, exactly like the 2.8.3
+                # restitution repair. Clamped, the closed form is
+                #   lambda_t = clamp(-v_t / inv_mass, +/- mu * lambda_n)
+                # and the sign always opposes v_t, since -v_t/inv_mass and the
+                # saturated bound -sign(v_t)*mu*lambda_n both do.
                 if (f64_gt(fric, EPSILON_F64) == 1) {
-                    # Simplified friction: magnitude = friction * normal_impulse
+                    var v_t = ColContact_tangent_vel(c);
+                    # Cone half-width: mu times the normal impulse just solved.
                     var max_fric = f64_mul(fric, new_impulse);
                     var old_fric = load64(out_impulses + ci * 16 + 8);
-                    # Clamp friction to cone
-                    if (f64_gt(f64_abs(old_fric), max_fric) == 1) {
-                        if (f64_lt(old_fric, _COL_F64_ZERO) == 1) {
-                            old_fric = f64_neg(max_fric);
+                    var v_t_eff = f64_add(v_t, f64_mul(old_fric, inv_mass));
+                    var new_fric = f64_sub(old_fric, f64_div(v_t_eff, inv_mass));
+                    # Clamp the TOTAL tangential impulse into the Coulomb cone.
+                    if (f64_gt(f64_abs(new_fric), max_fric) == 1) {
+                        if (f64_lt(new_fric, _COL_F64_ZERO) == 1) {
+                            new_fric = f64_neg(max_fric);
                         } else {
-                            old_fric = max_fric;
+                            new_fric = max_fric;
                         }
                     }
-                    store64(out_impulses + ci * 16 + 8, old_fric);
+                    store64(out_impulses + ci * 16 + 8, new_fric);
                 }
             }
         }

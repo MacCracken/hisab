@@ -769,20 +769,44 @@ fn svd_truncated(A, k, out_U, out_S, out_Vt) {
 # ================================================================
 
 # Power iteration for the dominant eigenvalue.
-# A:        stdlib matrix (n x n).
+# A:        stdlib matrix (n x n -- SHAPE ENFORCED, see below).
 # n:        matrix dimension.
 # max_iter: maximum iterations.
 # out_val:  pointer to store eigenvalue (f64, allocate 8 bytes).
 # out_vec:  flat f64 array of length n (caller allocates, receives eigenvector).
-# Returns:  0 on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded.
+# Returns:  0 on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded,
+#           HSB_ERR_INVALID_INPUT on a null handle or a shape that does not
+#           match n, HSB_ERR_ALLOC if the working vectors cannot be allocated.
 fn eigen_power(A, n, max_iter, out_val, out_vec) {
+    # NULL HANDLES. A may be the designed 0 that mat_new_guarded returns above
+    # its element cap, and mat_rows(0) is a null dereference.
+    if (A == 0 || out_val == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (out_vec == 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # n WAS NOT BOUNDED AT ALL. `alloc(n * 8)` was called with whatever arrived
+    # and stored through unconditionally, so both ends crashed (measured, exit
+    # 139): n = -3 asks alloc for a negative size, and n = 1e9 asks for 8 GB --
+    # over ALLOC_MAX = 2 GiB -- so alloc returns its designed 0 and `store64(v, ...)`
+    # writes to address 0.
+    if (n <= 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # THE n x n PRECONDITION IS NOW CHECKED, NOT JUST DOCUMENTED. `n` is a
+    # restatement of A's own extent: the matvec below reads mat_get(A, i, j) for
+    # i, j < n, so n > A's extent is an out-of-bounds read and n < it silently
+    # iterates on A's leading n x n block and returns 0 with the dominant
+    # eigenvalue of a matrix the caller did not pass. Neither is a shape this
+    # routine can legitimately answer for, so both are rejected.
+    if (mat_rows(A) != n || mat_cols(A) != n) { return HSB_ERR_INVALID_INPUT; }
+
     # Initial guess: unit vector e_0
     var v = alloc(n * 8);
+    if (v == 0) { return HSB_ERR_ALLOC; }
     var i = 0;
     while (i < n) { store64(v + i * 8, f64_from(0)); i = i + 1; }
     store64(v, f64_from(1));
 
     var w = alloc(n * 8);
+    if (w == 0) { return HSB_ERR_ALLOC; }
     var eigenvalue = f64_from(0);
     var tol = EPSILON_F64;
 
@@ -861,18 +885,37 @@ fn eigen_symmetric(A, n, out_vals, out_vecs) {
 # ================================================================
 
 # Compute the maximal Lyapunov exponent via QR method.
-# A:          stdlib matrix (n x n), the Jacobian of the system.
+# A:          stdlib matrix (n x n -- SHAPE ENFORCED), the Jacobian of the system.
 # n:          state dimension.
 # iterations: number of QR iterations.
 # out:        pointer to store the result (f64, allocate 8 bytes).
-# Returns:    0 on success.
+# Returns:    0 on success, HSB_ERR_INVALID_INPUT on a null handle or a shape
+#             that does not match n, HSB_ERR_ALLOC if the working matrices
+#             cannot be allocated.
 #
 # Method: repeatedly QR-decompose A^k. The growth rate of R's diagonal
 # entries gives the Lyapunov exponent. This is the simplified discrete
 # version: repeatedly multiply A, QR-factor, and track log growth.
 fn lyapunov_max(A, n, iterations, out) {
-    var Q = mat_new(n, n);
-    var R = mat_new(n, n);
+    # NULL HANDLES. A may be the designed 0 from mat_new_guarded's cap.
+    if (A == 0 || out == 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # n WAS NOT BOUNDED AT ALL. `mat_new(n, n)` returns the designed 0 for a
+    # non-positive n and the 0 went straight into mat_mul, so lyapunov_max(A, 0,
+    # ...) and lyapunov_max(A, -2, ...) both SIGSEGV'd (measured, exit 139).
+    if (n <= 0) { return HSB_ERR_INVALID_INPUT; }
+
+    # THE n x n PRECONDITION IS NOW CHECKED, NOT JUST DOCUMENTED. n is a
+    # restatement of A's extent and mat_mul(A, Q) conforms only when A is n x n;
+    # a mismatch is a caller error with no meaningful answer, so it is rejected.
+    if (mat_rows(A) != n || mat_cols(A) != n) { return HSB_ERR_INVALID_INPUT; }
+
+    # mat_new_guarded, not mat_new: it propagates the designed 0 for an n this
+    # module considers unreasonable instead of allocating it.
+    var Q = mat_new_guarded(n, n);
+    if (Q == 0) { return HSB_ERR_ALLOC; }
+    var R = mat_new_guarded(n, n);
+    if (R == 0) { return HSB_ERR_ALLOC; }
 
     # Initialize Q to identity
     var i = 0;
@@ -885,6 +928,9 @@ fn lyapunov_max(A, n, iterations, out) {
     while (iter < iterations) {
         # Z = A * Q
         var Z = mat_mul(A, Q);
+        # mat_mul allocates; a failed allocation is a 0 that mat_qr would read
+        # through. Bail with the allocation code rather than store into address 0.
+        if (Z == 0) { return HSB_ERR_ALLOC; }
 
         # QR decompose Z -> Q, R
         mat_qr(Z, Q, R);

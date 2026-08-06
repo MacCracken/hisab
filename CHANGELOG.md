@@ -4,6 +4,22 @@
 
 ### Fixed
 
+- **collision_core — `sequential_impulse` computed an identically-zero friction impulse.** The
+  second half of the 2026-08-04 audit row whose restitution half shipped in 2.8.3 (the block is
+  byte-identical to 2.8.1, md5 `02696836a11a8e4898d94c2bac6bd60c`). The friction branch loaded the
+  output slot it had itself zeroed at entry, clamped that zero against `mu * lambda_n`, and stored
+  it back — there was no update between the load and the clamp, and `|0| > cone` is never true for
+  a non-negative cone. Measured before the repair: **0 of 320 sampled (mu, penetration, iteration)
+  configurations produced a nonzero friction impulse**, so `friction` was a silently ignored
+  constructor parameter at every mu and every iteration count. It survived because no assertion in
+  `tests/` mentioned friction and every solver fixture used `friction = 0`, so the branch was never
+  entered. The tangential constraint is now solved against the contact's relative sliding speed
+  with the same effective-velocity convention the normal path uses, giving the closed form
+  `lambda_t = clamp(-v_t / inv_mass, -mu*lambda_n, +mu*lambda_n)` — accumulate **then** clamp, so
+  the bound is on the TOTAL tangential impulse and a saturated contact stays saturated instead of
+  gaining another `mu*lambda_n` per sweep. Like the 2.8.3 restitution repair it converges in one
+  sweep and is iteration-count independent. Reverting it fails 12 of the new assertions; deleting
+  just the Coulomb clamp fails 10; flipping the sign fails 12.
 - **geo_advanced — `gjk_intersect_3d` contradicted its own sibling `gjk_epa_3d`.** 2.8.3 taught
   `gjk_epa_3d` to certify an exact tangency as a depth-0 contact and deliberately left the cheap
   overlap test alone, so the two public entry points disagreed. Swept over 1,506 configurations
@@ -23,6 +39,69 @@
   false. It now sweeps 55 fixtures x 2 operand orders through both entry points and asserts the
   aggregate (agreement, false positives, missed overlaps, tangency recall, depth-at-a-touch).
   Reverting the repair fails 7 of the new assertions.
+- **The crash tier — six entries of `tests/abuse.tcyr`'s KNOWN DEFECT REGISTER, all now live
+  assertions.** Each was a public entry point that ended the process or corrupted the heap on an
+  input its own sibling already validated, so none could be executed inside a suite that has to
+  exit 0. Every reproducer below was re-measured before the repair, not inherited from the register.
+  - **linalg_precision — `cqr_decompose` returned `HSB_ERR_NONE` on top of a heap overrun.** The
+    headline. Nothing checked that `out_R` was the documented `m x n`, and `cmat_set` takes its
+    stride from `out_R`'s **own** column count, so an `m x m` `out_R` — what a caller sizing for a
+    square decomposition allocates — took a store past the end for every `j >= m`. Measured on a
+    2x3 A filled 1..6 into a 2x2 `out_R`: **returns 0 (`HSB_ERR_NONE`) with 2 of 8 guard slots
+    clobbered**, the 16 bytes immediately after `out_R`'s data buffer; the square 2x2 control over
+    the same code path clobbers 0 of 8. `out_Q` (`m x m`) and `out_R` (`m x n`) are now both
+    checked, and all three handles are null-checked before any dimension is read — separately a
+    SIGSEGV, since `cmat_rows(0)` is `load64(0)` and `cmat_new` returns its designed 0 above
+    `_CMAT_MAX_ELEMS` (`cqr_decompose(cmat_new(100000, 100000), …)` exited 139). The **shape is
+    rejected, not coerced** — there is nowhere to put an `m x n` R inside an `m x m` allocation —
+    but the **rectangular case is handled, not rejected**: Householder QR is general in m and n,
+    and with `out_R` sized correctly the 2x3 decomposition is measurably right (`Q*R == A`,
+    `Q^H Q == I`, R upper trapezoidal, all to < 1e-8; same on a tall 4x2), so the guard rejects a
+    caller error and not a legitimate shape.
+  - **linalg_precision — `eigen_qr` had none of the four guards its own file-mate already had.**
+    `svd_golub_kahan` (`:753`) validates null A / null outputs / non-positive dimension / shape;
+    `eigen_qr` guarded `n == 0` and nothing else. `eigen_qr(0, 3, …)`, `n = -3`, a null `out_vecs`
+    and a null `out_vals` **on a matrix that converges** all exited 139. It now uses
+    `svd_golub_kahan`'s idiom verbatim, plus `A` must be exactly `n x n` and `out_vecs` at least
+    `n x n`.
+  - **linalg_ext — `eigen_power` and `lyapunov_max` did not bound `n` at all.** `alloc(n * 8)`
+    with whatever arrived, then stored through: `n = -3` (negative size) and `n = 1e9` (8 GB, over
+    `ALLOC_MAX`, so `alloc` returns its designed 0) both exited 139, as did `lyapunov_max` at
+    `n = 0` and `n = -2` where `mat_new`'s designed 0 went straight into `mat_mul`. Both now
+    null-check their handles, reject `n <= 0`, and require `n` to equal A's own extent; working
+    allocations are checked for the designed 0 and return `HSB_ERR_ALLOC`. A 3x4 A with `n = 3` is
+    **rejected rather than answered**: it does not read out of bounds, but it silently returned
+    `HSB_ERR_NONE` carrying the result for A's leading 3x3 block, which is not the matrix passed.
+  - **einsum — its own output fed back in killed the process.** `HTensor_rank(load64(tensors + oi * 8))`
+    with no `t == 0` check, while `tensor_add` / `tensor_scale` / `tensor_contract` all guard
+    exactly this and name einsum as the producer of the 0. `einsum` returns 0 on every error path
+    and `tensor_new` returns 0 above its caps, so composing two einsum calls is the ordinary route
+    to a null operand: `store64(tv, 0); einsum(str_from("ij->ji"), tv, 1)` exited 139. `notation`,
+    `tensors` and every operand handle are now checked.
+  - **spatial — `kdtree_build`'s `count == 0` was a half-guard.** A negative count reached
+    `_kd_build_rec(items, points, 0, -1)`, missed the `count == 1` leaf case, and let
+    `_kd_select_median` `vec_get` an out-of-range slot — vec's own bounds check aborted the process
+    (`"vec: index out of bounds"`, exit 1). Now `count <= 0` and a null point array both return the
+    documented empty-tree 0; the function returns a node **handle**, so there is no negative
+    `HSB_ERR_*` to hand back through a pointer.
+- **tests/abuse.tcyr** — **577 → 632 assertions**, and the register shrinks from ten entries to four.
+  Each of the six repaired reproducers is now an executable assertion, including the canary check
+  that catches the `cqr_decompose` overrun as a **test failure** (`got 2, expected 0`) rather than
+  as luck. The four untouched entries (`bvh_build`, the two `halfedge_*` accessors, `num_modpow`,
+  `cmat_get`/`cmat_set`) are kept and marked `[OPEN]` — they still kill the process. One register
+  reproducer was also **wrong as written** and is corrected: `eigen_qr(mat_new(3, 3), 3, 50, 0,
+  mat_new(3, 3))` exits 0, not 139, because an all-zero A returns from the tridiagonal QR before it
+  ever writes an eigenvalue; the null is only dereferenced on an A that converges, e.g.
+  `diag(2, 3, 4)`.
+
+### Changed
+
+- **`eigen_qr` on a non-square A returns `HSB_ERR_INVALID_INPUT` (−10) instead of
+  `HSB_ERR_NO_CONVERGENCE` (−8).** The abuse assertion covering this was **tightened, not
+  weakened**: a `NO_CONVERGENCE` that depends on `max_iter` is a fragile contract, and at
+  `max_iter = 10000` the same 3x4-with-`n = 3` call returned `HSB_ERR_NONE` carrying the spectrum of
+  the leading 3x3 block — a real number for a matrix nobody asked about. Callers relying on the old
+  code for a wide or tall A should pass the square matrix they mean.
 
 ### Performance
 
@@ -39,6 +118,26 @@
 
 ### Added
 
+- **collision_core — `ColContact.tangent_vel` and `contact_new_fric`.** `friction` had no input to
+  act on: the reduced model derives the entire relative velocity from `penetration` **along the
+  normal**, so the tangential component was structurally zero and no correct friction solver could
+  produce anything but zero from it. `ColContact` gains a ninth field (offset 64) carrying the
+  signed relative sliding speed of body A w.r.t. body B along a caller-chosen unit tangent, and
+  `contact_new_fric` is the 9-argument constructor that sets it. The struct grows 64 → 72 bytes;
+  offsets 0–56 and the 16-bytes-per-contact `out_impulses` layout are unchanged. **`contact_new`
+  keeps its 8-argument arity** and sets `tangent_vel = 0`, so every existing caller and every
+  consumer is source-compatible and bit-for-bit unaffected — no tangential motion means no friction
+  impulse, which is why `mu = 0` and every pre-existing solver fixture do not move by a single bit.
+- **tests/modules.tcyr** — 31 assertions in a new group *"sequential_impulse friction (Coulomb
+  cone)"*, the first in the repo to mention friction at all. Sticking (`lambda_t = -v_t/inv_mass`,
+  tangential velocity driven to **exactly** 0), sliding (clamp binding at `|lambda_t| = mu*lambda_n`
+  with `v_t` reduced 1.0 → 0.75, same sign, never reversed), sign opposition on both sides,
+  iteration independence at 1/8/9 sweeps for both regimes, the cone tracking `lambda_n` through
+  restitution, the three no-normal-load cases (`pen = 0`, separating, both-static) collapsing the
+  cone to exactly `+0`, a wide cone reproducing the unclamped solution, per-slot independence in a
+  2-contact batch, and the `mu = 0` / `contact_new` bit-identity regression guards. Every expected
+  value is the closed form evaluated by hand on binary-exact fixtures (`inv_mass = 2`, `pen = 0.5`,
+  `lambda_n = 0.25`, cone `0.125`), so they are bit-equality assertions, not tolerance bands.
 - **tests/hisab.bcyr** — `gjk_intersect_box_miss` / `gjk_intersect_sph_miss` /
   `gjk_intersect_box_hit` / `gjk_intersect_tangent`. The most-called narrowphase entry point had no
   benchmark at all, which is the condition under which the cost above could have doubled unnoticed.

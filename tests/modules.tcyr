@@ -2744,6 +2744,176 @@ sequential_impulse(sr_vb, 1, 4, sr_ob);
 assert_eq(load64(sr_ob), f64_mul(F64_TWO, load64(sr_oa)),
 "sequential_impulse: e=1 doubles the e=0 impulse at an even sweep count");
 
+# 2.8.4 — FRICTION, the other half of the same audit row. Through 2.8.4 the
+# friction block loaded the output slot it had itself zeroed, clamped that zero
+# against mu*lambda_n and stored it back, with no update in between: |0| > cone
+# is never true, so the friction impulse was identically 0 for every contact, at
+# every mu, at every iteration count (measured: 0 of 320 sampled configs
+# nonzero). `friction` was a silently ignored parameter. Nothing in tests/ so
+# much as mentioned friction and every fixture above uses mu = 0, so the branch
+# was never entered — which is why it survived.
+#
+# `sequential_impulse` now solves the tangential constraint against the relative
+# sliding speed carried in the new ColContact.tangent_vel field, giving the
+# closed form
+#   lambda_t = clamp(-v_t / inv_mass, -mu*lambda_n, +mu*lambda_n)
+# with lambda_n = (1+e)*pen/inv_mass from the restitution block above. Every
+# expected value below is that closed form evaluated by hand, not a transcript of
+# what the solver printed. The fixtures use inv_mass = 1+1 = 2, pen = 0.5 and
+# e = 0, so lambda_n = 0.25 and the cone half-width at mu = 0.5 is 0.125 — all
+# exact in binary, so these are bit-equality assertions, not tolerance bands.
+test_group("collision_core: sequential_impulse friction (Coulomb cone)");
+
+# One contact, pen = 0.5, two unit-inverse-mass bodies (inv_mass = 2).
+fn _fr_solve(mu, vt, e, iters, out) {
+    var fc = contact_new_fric(0, 1, hvec3_unit_y(), F64_HALF, mu, e, F64_ONE, F64_ONE, vt);
+    var fv = vec_new();
+    vec_push(fv, fc);
+    sequential_impulse(fv, 1, iters, out);
+    return 0;
+}
+
+var fr_8th = f64_div(F64_ONE, f64_from(8));      # 0.125
+var fr_16th = f64_div(F64_ONE, f64_from(16));    # 0.0625
+var fr_4th = f64_div(F64_ONE, f64_from(4));      # 0.25
+var fr_mu = F64_HALF;
+
+# STICKING: |v_t/inv_mass| = 0.0625 is inside the 0.125 cone, so the constraint
+# is met exactly — lambda_t = -v_t/inv_mass and the tangential velocity that
+# survives, v_t + lambda_t*inv_mass, is exactly zero.
+var fr_oa = alloc(16);
+_fr_solve(fr_mu, fr_8th, 0, 6, fr_oa);
+assert_eq(load64(fr_oa), fr_4th, "friction: normal impulse still (1+e)·pen/inv_mass = 0.25");
+assert_eq(load64(fr_oa + 8), f64_neg(fr_16th),
+"friction: sticking λ_t = -v_t/inv_mass = -0.0625");
+assert_eq(f64_add(fr_8th, f64_mul(load64(fr_oa + 8), F64_TWO)), 0,
+"friction: sticking drives tangential velocity to exactly 0");
+
+# SLIDING: v_t = 1 wants lambda_t = -0.5, four times the cone, so the Coulomb
+# clamp binds at exactly -mu*lambda_n. The tangential velocity is only REDUCED
+# (1.0 -> 0.75), never reversed.
+var fr_ob = alloc(16);
+_fr_solve(fr_mu, F64_ONE, 0, 6, fr_ob);
+assert_eq(load64(fr_ob + 8), f64_neg(fr_8th),
+"friction: sliding saturates at -mu·λ_n = -0.125");
+assert_eq(f64_abs(load64(fr_ob + 8)), f64_mul(fr_mu, load64(fr_ob)),
+"friction: clamp binds at |λ_t| = mu·λ_n");
+var fr_vb = f64_add(F64_ONE, f64_mul(load64(fr_ob + 8), F64_TWO));
+assert_eq(fr_vb, f64_div(f64_from(3), f64_from(4)),
+"friction: sliding reduces v_t 1.0 → 0.75 (same sign, not reversed)");
+assert_eq(f64_lt(fr_vb, F64_ONE), 1, "friction: |v_t| strictly decreased");
+assert_eq(f64_gt(fr_vb, 0), 1, "friction: v_t not driven past zero");
+
+# SIGN: the impulse opposes the motion on both sides.
+var fr_oc = alloc(16);
+_fr_solve(fr_mu, f64_neg(F64_ONE), 0, 6, fr_oc);
+assert_eq(load64(fr_oc + 8), fr_8th, "friction: v_t < 0 → λ_t > 0 (opposes motion)");
+assert_eq(load64(fr_oc + 8), f64_neg(load64(fr_ob + 8)),
+"friction: reversing v_t reverses λ_t exactly");
+
+# mu = 0 REGRESSION GUARD: every solver assertion above this block uses mu = 0
+# and must not move by a single bit. mu = 0 skips the friction branch entirely,
+# so the slot keeps the +0 written at entry and the normal impulse is unchanged.
+var fr_od = alloc(16);
+_fr_solve(0, F64_ONE, 0, 6, fr_od);
+assert_eq(load64(fr_od + 8), 0, "friction: mu = 0 leaves the friction slot at +0");
+assert_eq(load64(fr_od), load64(fr_ob),
+"friction: mu = 0 normal impulse bit-identical to mu = 0.5");
+
+# ITERATION INDEPENDENCE: accumulate-then-clamp bounds the TOTAL impulse, so a
+# saturated contact stays saturated instead of gaining another mu·λ_n per sweep.
+var fr_o1 = alloc(16);
+var fr_o8 = alloc(16);
+var fr_o9 = alloc(16);
+_fr_solve(fr_mu, fr_8th, 0, 1, fr_o1);
+_fr_solve(fr_mu, fr_8th, 0, 8, fr_o8);
+_fr_solve(fr_mu, fr_8th, 0, 9, fr_o9);
+assert_eq(load64(fr_o1 + 8), load64(fr_o8 + 8), "friction: sticking 1 sweep == 8 sweeps");
+assert_eq(load64(fr_o8 + 8), load64(fr_o9 + 8), "friction: sticking 8 sweeps == 9 sweeps");
+var fr_s1 = alloc(16);
+var fr_s8 = alloc(16);
+_fr_solve(fr_mu, F64_ONE, 0, 1, fr_s1);
+_fr_solve(fr_mu, F64_ONE, 0, 8, fr_s8);
+assert_eq(load64(fr_s1 + 8), load64(fr_s8 + 8),
+"friction: sliding 1 sweep == 8 sweeps (cone does not re-charge)");
+
+# The cone tracks lambda_n: e = 1 doubles the normal impulse to 0.5, so the same
+# v_t = 1 now saturates at -0.25 instead of -0.125.
+var fr_og = alloc(16);
+_fr_solve(fr_mu, F64_ONE, F64_ONE, 6, fr_og);
+assert_eq(load64(fr_og), F64_HALF, "friction: e = 1 → λ_n = 0.5");
+assert_eq(load64(fr_og + 8), f64_neg(fr_4th), "friction: cone tracks λ_n → -0.25");
+
+# NO NORMAL LOAD, NO FRICTION. pen = 0 gives lambda_n = 0, so the cone collapses
+# to a point and the clamp must return exactly +0 (not -0: f64_neg(+0) is +0).
+var fr_ch = contact_new_fric(0, 1, hvec3_unit_y(), 0, fr_mu, 0, F64_ONE, F64_ONE, F64_ONE);
+var fr_vh = vec_new();
+vec_push(fr_vh, fr_ch);
+var fr_oh = alloc(16);
+sequential_impulse(fr_vh, 1, 6, fr_oh);
+assert_eq(load64(fr_oh), 0, "friction: pen = 0 → λ_n = 0");
+assert_eq(load64(fr_oh + 8), 0, "friction: zero-width cone → friction exactly +0");
+
+# Separating contact: lambda_n clamps to 0, so friction goes with it.
+var fr_ci = contact_new_fric(0, 1, hvec3_unit_y(), f64_neg(F64_HALF), fr_mu, 0,
+F64_ONE, F64_ONE, F64_ONE);
+var fr_vi = vec_new();
+vec_push(fr_vi, fr_ci);
+var fr_oi = alloc(16);
+sequential_impulse(fr_vi, 1, 6, fr_oi);
+assert_eq(load64(fr_oi), 0, "friction: separating contact → λ_n = 0");
+assert_eq(load64(fr_oi + 8), 0, "friction: separating contact → λ_t = 0");
+
+# Both bodies static: the contact is skipped before friction is reached.
+var fr_cj = contact_new_fric(0, 1, hvec3_unit_y(), F64_HALF, fr_mu, 0, 0, 0, F64_ONE);
+var fr_vj = vec_new();
+vec_push(fr_vj, fr_cj);
+var fr_oj = alloc(16);
+sequential_impulse(fr_vj, 1, 6, fr_oj);
+assert_eq(load64(fr_oj + 8), 0, "friction: both-static contact → λ_t = 0");
+
+# A cone wide enough never to bind reproduces the unclamped solution.
+var fr_ok = alloc(16);
+_fr_solve(f64_from(4), F64_ONE, 0, 6, fr_ok);
+assert_eq(load64(fr_ok + 8), f64_neg(F64_HALF),
+"friction: mu = 4 leaves λ_t interior at -v_t/inv_mass");
+assert_eq(f64_add(F64_ONE, f64_mul(load64(fr_ok + 8), F64_TWO)), 0,
+"friction: interior solution zeroes v_t exactly");
+
+# The 8-argument contact_new is exactly contact_new_fric with tangent_vel = 0:
+# no tangential motion means no friction impulse even at mu > 0, which is why
+# every pre-2.8.4 fixture (and every consumer) is bit-for-bit unaffected.
+var fr_cl1 = contact_new(0, 1, hvec3_unit_y(), F64_HALF, fr_mu, 0, F64_ONE, F64_ONE);
+var fr_cl2 = contact_new_fric(0, 1, hvec3_unit_y(), F64_HALF, fr_mu, 0, F64_ONE, F64_ONE, 0);
+var fr_vl1 = vec_new();
+var fr_vl2 = vec_new();
+vec_push(fr_vl1, fr_cl1);
+vec_push(fr_vl2, fr_cl2);
+var fr_ol1 = alloc(16);
+var fr_ol2 = alloc(16);
+sequential_impulse(fr_vl1, 1, 6, fr_ol1);
+sequential_impulse(fr_vl2, 1, 6, fr_ol2);
+assert_eq(load64(fr_ol1), load64(fr_ol2),
+"friction: contact_new λ_n == contact_new_fric(tangent_vel = 0) λ_n");
+assert_eq(load64(fr_ol1 + 8), load64(fr_ol2 + 8),
+"friction: contact_new λ_t == contact_new_fric(tangent_vel = 0) λ_t");
+assert_eq(load64(fr_ol1 + 8), 0, "friction: no tangential motion → λ_t = 0 even at mu > 0");
+assert_eq(ColContact_tangent_vel(fr_cl1), 0, "friction: contact_new defaults tangent_vel to 0");
+assert_eq(ColContact_tangent_vel(fr_ci), F64_ONE, "friction: contact_new_fric stores tangent_vel");
+
+# Two contacts in one batch keep independent friction slots (16 bytes apart).
+var fr_m1 = contact_new_fric(0, 1, hvec3_unit_y(), F64_HALF, fr_mu, 0, F64_ONE, F64_ONE,
+F64_ONE);
+var fr_m2 = contact_new_fric(1, 2, hvec3_unit_y(), F64_HALF, fr_mu, 0, F64_ONE, F64_ONE,
+f64_neg(F64_ONE));
+var fr_vm = vec_new();
+vec_push(fr_vm, fr_m1);
+vec_push(fr_vm, fr_m2);
+var fr_om = alloc(32);
+sequential_impulse(fr_vm, 2, 6, fr_om);
+assert_eq(load64(fr_om + 8), f64_neg(fr_8th), "friction: batch slot 0 saturates negative");
+assert_eq(load64(fr_om + 24), fr_8th, "friction: batch slot 1 saturates positive");
+
 # convex_hull_2d (2.4.0) — Andrew's monotone chain. Square (side 2) plus an
 # interior point: the hull is the 4 corners in CCW order; the interior point
 # is dropped. Shoelace 2×area = +8 pins both the geometry and the orientation.

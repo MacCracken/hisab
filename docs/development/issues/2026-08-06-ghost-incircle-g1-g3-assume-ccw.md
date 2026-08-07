@@ -1,7 +1,24 @@
 # `_col_dl_ic_g1` and `_col_dl_ic_g3` drop the winding factor, so `_col_dl_incircle` is not order-free — plus a genuine M¹ tie-break defect in `g1`
 
-**Status:** 🟡 **OPEN** — latent for the CW half, **live but deeply degenerate** for the second
-defect. Filed 2026-08-06, not fixed.
+**Status:** 🟡 **PARTIALLY FIXED** — `g3` (finding 1, all-ghost half) **fixed in 2.9.1**; `g1`'s
+M¹ tie-break (finding 2) **fixed in 2.9.1**; `g1`'s missing winding factor (finding 1, one-ghost
+half) **still OPEN and latent**. Filed 2026-08-06.
+
+**2.9.1 — finding 1, `g3`.** Confirmed and repaired. The suggested repair below (`g3` becomes
+`return 1`) was re-derived from scratch rather than inherited, and holds: the body is now
+`return 1;` and the predicate takes no arguments. Two independent proofs, both checked in exact
+rationals — the equal `|u_k|²` make `A` the circumcenter of the three ghosts, and the M⁴
+coefficient `|u|²·orient(u)` shares its winding factor with the ghost triangle's own orientation
+`M²·orient(u)`, so the two cancel. One correction to the reasoning recorded below: the claim that
+"**every** finite point is inside a circle through three points at infinity, whichever way they are
+listed" is **too general**. It is true here, but for three directions chosen without the equal-norm
+(or positive-spanning) constraint a sweep of random triples answers `0` about **28%** of the
+time — 27.6/27.9/28.0% uniform in [-1,1]², 27.1/26.9/27.4% in the unit disc, 20,000 triples per
+seed in exact rationals. The rate is distribution-dependent, so the distribution is named with
+it. (An earlier draft said 36% and named no distribution; it did not reproduce, and had reached
+four files before a verifying pass re-ran it.)
+Asserted in `tests/modules.tcyr` over both windings (1800 probes: 4 scales × 3 apexes × 25 query
+points × 6 orderings), and mutation-proved in both directions.
 **Placement:** unpinned.
 **Discovered:** 2026-08-06, while deciding
 `2026-08-05-two-ghost-tie-branch-sign-rule-inconsistent.md`. That issue asked whether
@@ -29,10 +46,10 @@ cannot depend on the order the vertices arrive in. The in-circle determinant's *
 on it, so a correct implementation multiplies by the triple's winding exactly once.
 `_col_dl_ic_g2` does (`collision_mesh.cyr:298`). Its two siblings do not:
 
-| helper | CW-presented triple | wrong |
-|---|---|---|
-| `_col_dl_ic_g1` (`:237`) | 463,086 | **462,846 (99.95%)** |
-| `_col_dl_ic_g3` (`:329`) | 243 | **243 (100%)** |
+| helper | CW-presented triple | wrong | status |
+|---|---|---|---|
+| `_col_dl_ic_g1` (`:237`) | 463,086 | **462,846 (99.95%)** | 🟡 open |
+| `_col_dl_ic_g3` (`:329`) | 243 | **243 (100%)** | ✅ fixed 2.9.1 — now `return 1`, asserted both windings |
 
 - `g1` returns `sign((a−p) × (b−p))`, which is `sign(M² coeff)`. The stored triple is `(a, b, G_k)`
   and its limiting winding is `sign((b − a) × u_k)`; `g1` never forms that. Its own comment
@@ -104,7 +121,18 @@ Take them separately; they have different risk.
    `return 1`. If it is *not* to become order-free, then say so at the entry point rather than in
    two of three helper comments, and note that `_col_dl_ic_g2` is order-free anyway.
 
+   **`g3` half done in 2.9.1** — it is `return 1` and is now order-free unconditionally, at no cost,
+   so it no longer constrains the decision. Only `g1` is left, and it is the half that carries an
+   actual cost (the extra cross product), so the "is the entry point order-free?" question is now
+   purely about `g1`.
+
 Whichever way finding 1 goes, the assertion already exists in the shape needed: `_dlg_perm_bad` in
 `tests/modules.tcyr` counts entry-point answers that disagree across all six vertex orderings, and
-is asserted `== 0` for the two-ghost path. The same harness pointed at the one-ghost and all-ghost
-paths would fail today, which is why it was not added green.
+is asserted `== 0` for the two-ghost path.
+
+**2.9.1 update.** The all-ghost path now has its own harness — `_dlg3_bad` / `_dlg3_run` in
+`tests/modules.tcyr` — asserted green over both windings (1800 probes). It does not reuse
+`_dlg_perm_bad` because the all-ghost answer is a known constant rather than merely
+order-*consistent*: asserting `== 1` outright is strictly stronger than asserting that the six
+orderings agree, which a uniformly wrong constant would also satisfy. The **one-ghost** path
+remains the one that would fail if pointed at today, and it is what is left of this issue.

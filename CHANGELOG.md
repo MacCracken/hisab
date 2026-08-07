@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [2.9.1] - 2026-08-06 — the deferred tier: four latent predicate defects, and a fourth false measurement
+
+Everything 2.9.0 found and consciously left. Suite **3341 → 3351** across five harnesses, toolchain
+6.5.8 → **6.5.9**, all gates green.
+
+**The theme is that four of these were found by deriving an oracle rather than by a failing test,
+and a fifth was found by the gate built to catch exactly it.** None was reachable from a shipped
+call path except one — `_col_dl_ic_g1`, which was wrong on ordinary CCW input.
+
 ### Fixed
 
 - **`collision_core` — `mpr_intersect` and `mpr_penetration` were still running the pre-2.9.0
@@ -39,6 +48,37 @@
   (which is zeroed) held a null pointer that faults on the first accessor. Demonstrated rather than
   assumed: against the pre-2.9.1 body the new tangency group does not merely fail, it **aborts the
   suite** on exactly that read. Every path now writes a defined placeholder normal and depth 0.
+
+- **`collision_mesh` — `_col_dl_ic_g3` returned the WINDING of the ghost triple instead of the
+  in-circle answer** (modules **+10**). The all-ghost branch computed `orient(u_a, u_b, u_c) > 0`,
+  so a clockwise presentation answered "outside" for *every point in the plane*. Measured against an
+  exact-rational circumcircle oracle: **243 of 243** CW-presented triples wrong, **0 of 243** cyclic.
+
+  Root cause → fix: the answer is the **constant `1`**, so the body is `return 1;` and the predicate
+  now takes **no arguments** (`collision_mesh.cyr:383`; the entry point's `g == 3` branch loses its
+  three index arguments at `:401`). Two independent derivations, both confirmed in exact rationals
+  rather than inherited from the filed analysis. *Geometric*: all three `|u_k|²` are equal (5), so
+  the apex `A` is exactly the circumcenter of the three ghosts and their circumcircle is the circle
+  of radius `M√5` about `A`, which swallows any finite `p` once `M` is large enough. *Algebraic*:
+  the M⁴ coefficient is `|u|²·orient(u_a, u_b, u_c)` — the query point cancels out of the leading
+  term — while the ghost triangle's own orientation is `M²·orient(u_a, u_b, u_c)`, so the winding
+  factor **cancels between them** instead of having to be divided out the way `_col_dl_ic_g2`
+  divides it out with `cr`. `|u|²·orient(u) = 60 ≠ 0`, so the leading coefficient never vanishes and
+  there is no tie-break branch to get wrong.
+
+  The equal-norm premise is load-bearing and the header now says so: for three directions chosen
+  *without* that constraint the answer is **not** constant — a sweep of random direction triples
+  answers `0` about **28%** of the time (27.6/27.9/28.0% uniform in [-1,1]^2, 27.1/26.9/27.4% in the unit disc, 20,000 triples per seed in exact rationals — the rate is distribution-dependent, so the distribution is named with it). The previous header already claimed "every finite point is
+  inside"; the body had always contradicted its own documentation.
+
+  **No behaviour change on any reachable path** — `delaunay_2d` stores every triangle CCW and
+  `_col_dl_incircle`'s three rotations are even permutations, so only the cyclic half was ever
+  reached. Latent since 2.8.2, the same latency class as the `_col_dl_ic_g2` tie branch above.
+  Mutation-proved: reinstating the old winding logic at the entry point (leaving the helper's arity
+  intact) fails exactly the 4 anti-cyclic assertions with the grid counter at **900 of 1800** —
+  all three anti-cyclic orderings of all 300 configurations, cyclic half untouched; inverting the
+  constant fails all 9 behavioural assertions.
+  (`docs/development/issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`)
 
 - **`collision_mesh` — `_col_dl_ic_g2`'s two-ghost tie branch applied the winding twice**, inverting
   the in-circle answer for every anti-cyclic ghost pair. The M² coefficient of the determinant is

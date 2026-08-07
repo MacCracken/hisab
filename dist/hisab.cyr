@@ -7503,13 +7503,50 @@ var _COL_SENTINEL     = 0x7FFF_FFFF_FFFF_FFFF;  # usize::MAX sentinel
 # GJK decides that case, which is exactly what the identically-documented
 # gjk_intersect_3d publishes.
 #
+# 2.9.1: THE FALLBACK NOW IS gjk_intersect_3d, NOT A PRIVATE COPY OF ITS OLD
+# BODY. `_epa_seed_gjk != 0` is `_gjk_core_3d != 0` -- the bare strict-enclosure
+# test that WAS gjk_intersect_3d before 2.9.0 taught it exact tangency. 2.9.0
+# repaired one call site of that logic and left this one, so the two
+# identically-documented siblings drifted apart. Measured on this tree over
+# 1,149 fixtures x 5 dyadic scales (2^-20 .. 2^20) x both operand orders,
+# classified EXACTLY in rationals from the f64 coordinates the support functions
+# actually receive:
+#   * on the 7,540 pair evaluations whose support functions are EXACT (boxes,
+#     parallelepipeds, zero-radius spheres -- a ball of radius r > 0 is only
+#     approximated, its support point carries 2 ulp of the radius, which for
+#     r = 19 is 7.1e-15 against a 3.6e-15 coordinate ulp, so no algorithm can
+#     resolve a 1-ulp tangency there), gjk_intersect_3d was wrong 0 times and
+#     mpr_intersect 50 times. Every one of the 50 was an EXACT TANGENCY reported
+#     as a miss, and every one was mpr = 0 / gjk = 1.
+#   * the 50 come from 6 distinct configurations: two coincident zero-radius
+#     spheres, two coincident point boxes, two coincident zero-extent
+#     parallelepipeds, and -- NOT self-pairs, and not previously reported -- a
+#     point resting exactly on the CORNER of a solid unit box, in both the
+#     point-box and the zero-radius-sphere flavour.
+#   * 160 tangency evaluations between two shapes that BOTH have volume: 0
+#     disagreements. That is why an earlier axis-aligned face/edge/vertex sweep
+#     saw none of this.
+#   * 10 of the 50 are an OPERAND-ORDER ASYMMETRY: mpr_intersect(box, corner
+#     point) = 0 while mpr_intersect(corner point, box) = 1. A symmetric
+#     predicate that depends on argument order is broken under any tangency
+#     contract, which is why this was repaired rather than documented as strict.
+# Both candidate repairs (this one, and appending _epa_touch_probe to the
+# existing two branches) score identically: 0 wrong, 0 asymmetric, 0 false
+# positives over the same 7,540. This one is chosen because it is cheaper --
+# same-binary batch timing, median of min over 5 runs, 2000-call batches, min of
+# 20 rounds: box miss 1.452 -> 1.698 us (+17%) here against 2.055 (+42%) for the
+# unconditional probe; sphere miss 1.975 -> 2.360 (+19%) against 2.776 (+41%);
+# 1e-9-separated box pair 1.418 -> 1.692 (+19%) against 2.040 (+44%). The hit and
+# tangency paths do not move (5.610 -> 5.614, 6.307 -> 6.252). The delegation
+# inherits 2.9.0's gate: one extra support evaluation on a separated pair, and
+# the touch probe only on a genuinely unresolved GJK exit.
+#
 # Requires geo_advanced.cyr; see the module header.
 fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
     var seed = alloc(32);
     if (seed == 0) { return 0; }
     if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) == 1) { return 1; }
-    if (_epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed) != 0) { return 1; }
-    return 0;
+    return gjk_intersect_3d(support_a, shape_a, support_b, shape_b);
 }
 
 # mpr_penetration -- returns 1 on success, writes normal/depth to out pointers
@@ -7546,9 +7583,29 @@ fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
 #    construction is still MPR -- it is the depth that is no longer MPR's
 #    approximation.
 #
-# Requires geo_advanced.cyr (_epa_seed_portal / _epa_seed_gjk / _epa_refine);
-# see the module header.
+# 2.9.1: "NEITHER SEED SURVIVED" IS NOT THE SAME AS "NO CONTACT". The bail below
+# was the mpr_intersect defect in its other half, and it is one case WIDER: the
+# same six configurations (see mpr_intersect above) plus two coplanar flat plates
+# came back 0 here while gjk_epa_3d -- which has certified exactly this since
+# 2.8.3, at src/geo_advanced.cyr:1237 -- returned 1 with depth 0. It carried the
+# same operand-order asymmetry too. Repairing only mpr_intersect would have left
+# mpr_intersect = 1 and mpr_penetration = 0 on the same input, so both halves
+# move together. The probe is the SAME certificate gjk_epa_3d runs on its own
+# no-seed path, and it writes out_normal only when it has one.
+#
+# Requires geo_advanced.cyr (_epa_seed_portal / _epa_seed_gjk / _epa_refine /
+# _epa_touch_probe); see the module header.
 fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    # EVERY RETURN PATH WRITES BOTH OUT-PARAMS, the convention gjk_epa_3d has
+    # carried since 2.8.3 (src/geo_advanced.cyr:1225). This sibling never got it:
+    # every 0 return left the caller's slots untouched, so a caller who passed
+    # fresh alloc() memory -- which is zeroed -- held a NULL HVec3 that faults on
+    # the first accessor. Demonstrated, not assumed: with the pre-2.9.1 body the
+    # 2.9.1 tangency group below aborts the whole suite on exactly that read. On
+    # a 0 return the normal is a DEFINED PLACEHOLDER, not a contact normal.
+    store64(out_normal, hvec3_unit_x());
+    store64(out_depth, 0);
+
     var seed = alloc(32);
     if (seed == 0) { return 0; }
     if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) == 0) {
@@ -7556,8 +7613,15 @@ fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, out_depth
         # boundary is so nearly tangent to the ray that the wedge tests cannot
         # settle. GJK reaches the same kind of tetrahedron along a completely
         # different direction sequence, so it usually survives where the portal
-        # does not; anything it rejects genuinely has no interior to measure.
-        if (_epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed) != 1) { return 0; }
+        # does not; anything it rejects has no interior to measure -- but it may
+        # still be an exact TANGENCY, whose honest answer is depth 0, not "miss".
+        if (_epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed) != 1) {
+            if (_epa_touch_probe(support_a, shape_a, support_b, shape_b, out_normal) == 1) {
+                store64(out_depth, 0);
+                return 1;
+            }
+            return 0;
+        }
     }
     return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
 }
@@ -8377,17 +8441,32 @@ fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
     var s = _col_f64_sign(f64_sub(f64_mul(ax, by), f64_mul(ay, bx)));
     if (s > 0) { return 1; }
     if (s < 0) { return 0; }
-    # p lies exactly ON line(a, b), so the M^1 coefficient decides: the same
-    # determinant with the ghost row replaced by (u_x, u_y, 0). It evaluates to
-    # "p strictly between a and b" -- a point on the segment is inside the
-    # limiting circle, a point on the line outside the segment is not, and p
-    # coinciding with a or b gives zero, i.e. a duplicate point, not inside.
-    var aq = f64_add(f64_mul(ax, ax), f64_mul(ay, ay));
-    var bq = f64_add(f64_mul(bx, bx), f64_mul(by, by));
-    var d1 = f64_sub(f64_mul(ay, bq), f64_mul(aq, by));
-    var d2 = f64_sub(f64_mul(aq, bx), f64_mul(ax, bq));
-    var t = f64_add(f64_mul(_col_ghost_ux(k), d1), f64_mul(_col_ghost_uy(k), d2));
-    if (f64_gt(t, _COL_F64_ZERO) == 1) { return 1; }
+    # p lies exactly ON line(a, b), so the answer is "p strictly between a and b"
+    # -- a point on the segment is inside the limiting circle, a point on the line
+    # outside the segment is not, and p coinciding with a or b gives zero, i.e. a
+    # duplicate point, not inside. That is exactly dot(a - p, b - p) < 0.
+    #
+    # 2.9.1: this WAS the M^1 coefficient of the determinant, evaluated as
+    # u_x*(ay*|b|^2 - |a|^2*by) + u_y*(|a|^2*bx - ax*|b|^2). That expression
+    # factors as |b|^2*(u x a) - |a|^2*(u x b), and on this branch a and b are
+    # already collinear, so with b = lambda*a it collapses to
+    # |a|^2 * (u x a) * lambda*(lambda - 1). Two independent failures fall out:
+    #   - it VANISHES whenever the edge is parallel to u_k, because (u x a) = 0,
+    #     so the branch returned 0 for every such p regardless of position;
+    #   - lambda*(lambda - 1) > 0 for lambda > 1 as well as lambda < 0, so even
+    #     when it did not vanish it could not separate "between a and b" from
+    #     "beyond b on the same ray".
+    # Measured against an exact-rational circumcircle oracle: 228 wrong of
+    # 463,086 CCW-presented triples -- REACHABLE input, not a latent case. Every
+    # one of the 228 answered 0 where the truth is 1, and every one had
+    # dot(a - p, b - p) < 0, i.e. the exact case this comment already claimed to
+    # return 1 for. Reproducer: k = 0, u_0 = (1, 2), a = (-2, 0), b = (-4, -4),
+    # p = (-3, -2) -- p is the midpoint of ab, the old t is exactly 0.
+    #
+    # The betweenness test needs no ghost direction and no magnitudes, so it is
+    # both correct and strictly cheaper than what it replaces.
+    var dp = f64_add(f64_mul(ax, bx), f64_mul(ay, by));
+    if (f64_lt(dp, _COL_F64_ZERO) == 1) { return 1; }
     return 0;
 }
 
@@ -8395,6 +8474,30 @@ fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
 # first. The M^3 coefficient is |u|^2 * ((R - p) x (u_j - u_k)): the limiting
 # circle is the line through R parallel to the edge at infinity, and the test is
 # which side of it p falls on.
+#
+# "Inside the circumcircle" is a question about a SET of three points, so the
+# answer must not depend on the order they arrive in -- but the determinant's
+# sign does. cr = sign(u_j x u_k) is the winding of (R, G_j, G_k) in the limit
+# (the M^2 term of its orientation dominates), so multiplying the leading
+# coefficient's sign by cr exactly ONCE recovers the order-free answer. Each
+# branch below must therefore contribute cr exactly once in total:
+#
+#   M^3 coefficient = |u|^2 * (r x (u_j - u_k))          -- carries NO cr, so
+#                                                           the branch supplies it
+#   M^2 coefficient = (u_j x u_k) * (|R - A|^2 - |A - p|^2) -- ALREADY carries cr,
+#                                                           so the branch must not
+#
+# Through 2.9.0 the tie branch applied cr a second time. With cr^2 = 1 that is
+# the identity when cr = +1 and a sign INVERSION when cr = -1, so the function
+# answered correctly on the three cyclic pairs and backwards on the three
+# anti-cyclic ones -- latent, because _col_dl_incircle only ever rotates a
+# CCW-stored triangle and every rotation is even. See
+# docs/development/issues/2026-08-05-two-ghost-tie-branch-sign-rule-inconsistent.md.
+#
+# NOTE: this helper is order-free; _col_dl_incircle as a whole is NOT. Its
+# one-ghost and all-ghost helpers below take the CCW storage as a precondition
+# and drop the winding factor entirely, so do not read the cr handling here as
+# a claim that the entry point tolerates a clockwise triangle. It does not.
 fn _col_dl_ic_g2(points, ri, j, k, px, py) {
     var rp = vec_get(points, ri);
     var rx = f64_sub(HVec2_x(rp), px);
@@ -8420,9 +8523,13 @@ fn _col_dl_ic_g2(points, ri, j, k, px, py) {
     var s2 = _col_f64_sign(f64_sub(
     f64_add(f64_mul(e1x, e1x), f64_mul(e1y, e1y)),
     f64_add(f64_mul(e2x, e2x), f64_mul(e2y, e2y))));
+    # No `* cr` here, unlike the M^3 branch above: (u_j x u_k) is already a
+    # factor of this coefficient, so s2 IS sign(M^2 coeff) * cr. Applying cr
+    # again would square it away and invert the answer for anti-cyclic pairs.
+    #
     # Both coefficients zero needs p on that line AND equidistant from A with R;
     # that is codimension 2, and "not inside" is what the M^1 term gives.
-    if (s2 * cr > 0) { return 1; }
+    if (s2 > 0) { return 1; }
     return 0;
 }
 

@@ -162,6 +162,16 @@ enum ChanOp {
     CH_SEND   = 0x02;   # (fd, buf, len <= 64) → len / negative CH_E_*
     CH_RECV   = 0x03;   # (fd, buf, cap) → len / -CH_E_WOULDBLOCK / -CH_E_PEERGONE
     CH_CLOSE  = 0x04;   # (fd) → 0
+    # v6.5.9 (agnos 1.56.40 bite 5). ⚠ RETURNS AN FD, NOT 0 — the one op in this band that
+    # does. The number is decided at ARM time because the kernel cannot announce it: by the
+    # time placement happens, `elf_load_from_file` has already baked the child's env into
+    # its init stack. So the PARENT announces it, Wayland's `WAYLAND_SOCKET` shape — arm the
+    # endpoint, take the returned fd, and pass it to the child as `AGNOS_CHAN=<fd>` via
+    # `sys_spawn_path_env` below. Without endowment a child can hold no channel at all: an
+    # inherited fd is inert by construction.
+    # (The kernel's own enum comment at syscall.cyr:4588 still says "-> 0"; the ARM at :7898
+    # does `return tfd` and the design note at :4615 says the fd. Code wins — reported back.)
+    CH_ENDOW  = 0x05;   # (fd) → the fd index the CHILD will hold, or negative CH_E_*
 }
 
 # ⚠ WOULDBLOCK and PEERGONE are per-RECORD RESULTS, not failures — a poll batch that
@@ -177,6 +187,9 @@ enum ChanErr {
     CH_E_PEERGONE    = 9;   # per-record result
 }
 
+# ⚠ `CH_OP_SUPPORTED` is 0x3F on a 1.56.40 kernel (bits 0-5, ENDOW included) — it was 0x1F
+# when 6.5.8 minted this band. A client that negotiates on the mask sees bit 5; the peer
+# having no name for it was the gap this release closes.
 # ⛔ NEGOTIATE ON THE CAPS MASK, DO NOT ASSUME. One bit per IMPLEMENTED op; a merely
 # reserved op reads 0. Advertising an op the kernel cannot run is exactly how a client
 # "works" against a kernel that cannot serve it, so a client that skips CAPS and calls
@@ -214,6 +227,15 @@ fn sys_chan_recv(fd, buf, cap): i64 {
 # next RECV, which is a result to handle rather than an error to abort on.
 fn sys_chan_close(fd): i64 {
     return syscall(SYS_CHAN_OP, CH_CLOSE, fd);
+}
+
+# Arm `fd`'s endpoint for placement into the next `sys_spawn_path*` child, and return the fd
+# index that child will hold (negative CH_E_* on failure). ⚠ The return is an FD, not a
+# status — see CH_ENDOW above. The parent must then announce it to the child itself, e.g.
+# `AGNOS_CHAN=<returned fd>` in the env blob passed to `sys_spawn_path_env`; the child reads
+# it out of its environment and never searches for a channel it was not given.
+fn sys_chan_endow(fd): i64 {
+    return syscall(SYS_CHAN_OP, CH_ENDOW, fd);
 }
 
 # ── GPU recovery arms (agnos 3D arc RUNG 5) ────────────────────
@@ -986,6 +1008,24 @@ fn sys_kbscan(buf, max): i64 { return syscall(SYS_KBSCAN, buf, max); }
 
 # Non-blocking from-disk spawn of `path`; scheduled, returns its pid immediately.
 fn sys_spawn_path(path, len): i64 { return syscall(SYS_SPAWN_PATH, path, len); }
+
+# v6.5.9: `#43` with a per-process ENV BLOB — the two arguments the 2-arg wrapper above
+# never reached. The kernel has accepted them since 1.44.19 (`a3` = blob ptr, `a4` = len,
+# staged onto the child's init stack); `sys_spawn_path` is exactly this with `env = 0`, so
+# every existing caller is unaffected.
+#
+# Blob format: packed `KEY=VALUE\0…`, ≤1024 B, ≤16 entries. This is how an endowed channel
+# reaches its child: `sys_chan_endow` returns the fd, the parent packs `AGNOS_CHAN=<fd>`,
+# and the child getenv's it.
+#
+# ⛔ THE KERNEL TREATS A GARBAGE a3/a4 AS FALLBACK-TO-DEFAULT-ENV, NEVER AN ERROR. A
+# mis-shaped call therefore degrades SILENTLY — the child simply comes up with the default
+# environment and no AGNOS_CHAN — which is the argument FOR a named wrapper rather than a
+# raw 4-arg `syscall()`: this ecosystem has a confirmed history of raw arity mistakes
+# compiling clean and mis-dispatching (jalwa's `poll`(7)→`open` per frame, `read`(0)→`exit`).
+fn sys_spawn_path_env(path, len, env, envlen): i64 {
+    return syscall(SYS_SPAWN_PATH, path, len, env, envlen);
+}
 
 # Cooperative yield to the scheduler.
 fn sys_sched_yield(): i64 { return syscall(SYS_SCHED_YIELD); }

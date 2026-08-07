@@ -17,7 +17,16 @@ compiles deterministically (0/8 fail) and runs 312/312. A `NOTE:` comment at
 `tests/modules.tcyr` `test_group("interval: arithmetic")` guards the names.
 **Upstream:** filed at `cyrius/docs/development/issues/2026-07-17-iv-simd-intrinsic-shadows-var-name.md`
 (+ repro `.../repros/2026-07-17-iv-intrinsic-var-name.cyr`).
-**Status:** Open (toolchain bug) — worked around in-tree.
+**Status:** 🟢 **SUBSTANTIALLY RESOLVED on cycc 6.5.9** (verified 2026-08-06). The complaint was
+the MISLEADING DIAGNOSTIC, not the reservation itself, and the diagnostic is fixed. `iv_add` as a
+variable name now reports:
+  `expected identifier, got reserved keyword 'iv_add' (cannot be used as an identifier; rename
+   the variable/field/fn)`
+against the original `expected identifier, got unknown`, which named nothing and sent a reader
+hunting for a syntax or file-size problem. The names remain reserved — that is by design for a
+SIMD intrinsic — so the in-tree workaround (`iv_sum`/`iv_diff`/`iv_prod` in `tests/modules.tcyr`)
+stays and needs no revert. Kept unarchived only until someone confirms no other reserved name
+still produces the old wording.
 
 ## Symptom
 

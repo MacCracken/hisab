@@ -2,6 +2,133 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`collision_core` — `mpr_intersect` and `mpr_penetration` were still running the pre-2.9.0
+  containment test**, so both disagreed with their identically-documented `gjk_*` siblings on exact
+  tangency. `mpr_intersect`'s fallback `_epa_seed_gjk != 0` is `_gjk_core_3d != 0` — *literally the
+  `gjk_intersect_3d` body from before 2.9.0 taught it tangency*. 2.9.0 repaired one call site of
+  that logic and left the other two. Root cause → fix: `mpr_intersect` delegates its no-portal path
+  to `gjk_intersect_3d` (`collision_core.cyr:73`), and `mpr_penetration` runs the same
+  `_epa_touch_probe` certificate `gjk_epa_3d` runs at `geo_advanced.cyr:1237`.
+
+  **The 2026-08-05 audit addendum was re-measured from scratch before it was fixed**, because its
+  "26 of 3,012" had never been independently reproduced and a second sweep had found *zero*
+  disagreements. New sweep: 1,149 fixtures × 5 dyadic scales (2^-20 … 2^20) × both operand orders
+  = **11,490 pair evaluations**, classified exactly with `Fraction` from the f64 bit patterns the
+  support functions receive; the classifier was validated by first reproducing all 55 of the
+  suite's own independently-derived classifications, 0 disagreements. The honest count is **50 of
+  7,540** — the subset with exact support functions (boxes, parallelepipeds, zero-radius spheres).
+  The other 3,950 involve a ball of radius r > 0, whose support point carries ~2 ulp of r (measured
+  7.1e-15 at r = 19 against a 3.6e-15 coordinate ulp), so a 1-ulp tangency there is unresolvable by
+  any algorithm on that support function. On the exact half: `gjk_intersect_3d` wrong **0** times,
+  `mpr_intersect` wrong **50** — every one an exact tangency reported as a miss, every one
+  `mpr = 0`/`gjk = 1`, **0 false positives** for either.
+
+  Both prior reports were right about different things. The 50 reduce to **6 configurations**; 4 are
+  coincident degenerate self-pairs, but **2 are not and had not been reported**: a point resting
+  exactly on the **corner of a solid unit box**. Those two were also an **operand-order asymmetry** —
+  `mpr_intersect(box, corner point) = 0` but `mpr_intersect(corner point, box) = 1`. **160 tangency
+  evaluations between two shapes that both have volume: 0 disagreements**, which is precisely why an
+  axis-aligned face/edge/vertex sweep saw none of it. That asymmetry is what ruled out "keep the
+  strict reading and document it": a symmetric predicate that depends on argument order is broken
+  under any tangency contract. After: **0 wrong, 0 asymmetric, 0 false positives** on all 7,540.
+
+- **`mpr_penetration` left both out-params unwritten on every `0` return** — the NULL-`HVec3` hazard
+  `gjk_epa_3d` fixed in 2.8.3 and this sibling never got. A caller passing fresh `alloc()` memory
+  (which is zeroed) held a null pointer that faults on the first accessor. Demonstrated rather than
+  assumed: against the pre-2.9.1 body the new tangency group does not merely fail, it **aborts the
+  suite** on exactly that read. Every path now writes a defined placeholder normal and depth 0.
+
+- **`collision_mesh` — `_col_dl_ic_g2`'s two-ghost tie branch applied the winding twice**, inverting
+  the in-circle answer for every anti-cyclic ghost pair. The M² coefficient of the determinant is
+  `(u_j × u_k)·(|R − A|² − |A − p|²)`, so it *already* carries one factor of the winding; the branch
+  multiplied by `cr` again. With `cr² = 1` that is the identity when `cr = +1` and a sign inversion
+  when `cr = −1`, so the same function used two different sign conventions in its two branches.
+  Root cause → fix: `if (s2 * cr > 0)` → `if (s2 > 0)` at `collision_mesh.cyr:320`; the M³ branch at
+  `:298` was correct and is unchanged.
+
+  Re-verified against an oracle sharing no reasoning with the original derivation — the **exact
+  circumcircle of the three actual points** (`Fraction` circumcenter, exact distance-vs-radius),
+  a question that takes no orientation argument. Over 343,734 decided trials per orientation:
+  shipped 2.9.0 was 0 wrong cyclic and **24,156 wrong anti-cyclic**; fixed is **0 and 0**. On the
+  tie branch alone the split is 0 of 267,358 against **267,358 of 267,358**.
+
+  **No behaviour change on any reachable path** — `_col_dl_incircle` only ever rotates a CCW-stored
+  triangle and rotation is an even permutation, so `cr` is `+1` throughout `delaunay_2d` and the two
+  expressions coincide there. Latent since 2.8.2.
+  (`docs/development/issues/2026-08-05-two-ghost-tie-branch-sign-rule-inconsistent.md`)
+
+### Added
+
+- **A `mpr_penetration` arena bound that can actually see a per-face-per-iteration leak** (modules
+  **+4**). The existing bound was absolute and taken on a 24-support-call box pair: baseline
+  22,776 B against 25,600, where the 80 B/face/iteration injection reaches only 25,656 — it cleared
+  the bound by **56 B, 0.22%**. A thin bound is not repaired by a tighter number; it is repaired by
+  a fixture with more iterations, because the leak is quadratic in the iteration count while the
+  honest cost is linear. The new fixture is the **same sphere pair the `gjk_epa_3d` arena row
+  already uses**, so the two budgets are directly comparable, and it is normalised per support call:
+  **167,904 B over 572 calls = 293 B/call** (the sibling: 296 over 552), byte-identical across five
+  separate processes *and* five repeat calls in one process. Under injection it reads **893 B/call**,
+  a 3.05× jump matching the sibling's 296 → 917. Bound 400 → 36% headroom, and the injection
+  overshoots by **123%**. Detection margin **0.22% → 123%**. The old absolute bound is kept: it
+  still guards the polytope regime the sphere pair does not exercise.
+
+- **23 assertions covering both `mpr_*` entry points** (modules **+23**). `mpr_intersect` and
+  `mpr_penetration` now ride the existing agreement sweep — three new aggregates, against which the
+  pre-repair bodies score **9 / 2 / 13** on its 110 evaluations — plus a named group for all six
+  reproducers in both operand orders, with ±1-ulp negative controls on either side of the corner
+  tangency so the repair is pinned from both directions and cannot manufacture a contact. The audit
+  addendum's standing complaint that "no assertion anywhere compares `mpr_intersect` against either"
+  sibling is discharged. Reverting `collision_core.cyr` fails 9 of them and aborts the run.
+
+- **`mpr_intersect` benchmark rows** (`mpr_intersect_box_miss` / `_box_hit` / `_tangent`). It had no
+  benchmark at all — the same blind spot that let 2.9.0 repair one sibling and leave this one, with
+  neither a test nor a number covering the difference.
+
+- **9 assertions pinning the anti-cyclic half of the two-ghost in-circle predicate** (modules
+  **+9**). `_dlg_run()` became `_dlg_run(anti)`, running its 450-probe grid over the three
+  **anti-cyclic** ghost pairs as well as the three cyclic ones — the half no `delaunay_2d` fixture
+  in any suite reaches, which is why a 100%-wrong branch stayed green. New `_dlg_perm_bad` drives
+  the public entry point `_col_dl_incircle` with all six orderings of `(R, G_j, G_k)` and asserts
+  the answers agree: "inside the circumcircle" is a question about a *set*, so an order-dependent
+  answer is a defect by definition.
+
+  Mutation-proven both ways. Reverting the fix fails 3 assertions (678 / 224 / 672); dropping
+  `* cr` from the M³ branch — the "assert the precondition and drop the factor" alternative — also
+  fails 3 (639 / 213 / 639), which is the evidence that rejected it.
+
+### Performance
+
+- `mpr_intersect` separated-pair path: **1.452 → 1.698 µs (+17%)** for box/box and **1.975 → 2.360
+  (+19%)** for sphere/sphere; hit and tangency paths unchanged (5.610 → 5.614, 6.307 → 6.252).
+  Same-binary A/B of the old and new bodies, 2000-call batches, min of 20 rounds, median of min over
+  5 runs. This is a deliberate regression on the broadphase miss path, and it is the **cheaper** of
+  the two repairs that score identically correct: appending `_epa_touch_probe` unconditionally costs
+  **+42% / +41% / +44%** on the same three fixtures. Delegating to `gjk_intersect_3d` inherits
+  2.9.0's gate — one extra support evaluation on a separated pair, with the probe running only on a
+  genuinely unresolved GJK exit. The in-suite `mpr_intersect_box_miss` row prints min = 1.611 µs; the
+  A/B harness reads higher on both terms because it never calls `alloc_reset`, the same discrepancy
+  already on record for `gjk_intersect_box_miss` (807 ns in-suite against 766 quoted).
+
+### Changed
+
+- **`_col_dl_ic_g2` now documents that it is order-free and that `_col_dl_incircle` is not.** Its
+  siblings `_col_dl_ic_g1` and `_col_dl_ic_g3` drop the winding factor entirely and are wrong for a
+  clockwise triple (measured: **462,846 of 463,086** and **243 of 243**), so the `cr` handling in
+  `g2` must not be read as a claim about the entry point. Filed, not fixed, along with a second and
+  orientation-*independent* defect found in `g1`'s M¹ tie-break — it answers "outside" for a point
+  strictly between `a` and `b` whenever the edge is parallel to `u_k`, 228 of 463,086 probes on
+  correctly CCW-stored input. (`docs/development/issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`)
+- **`2026-08-04-incircle-precision.md` re-measured and recommended for closure.** Its correction
+  section reasoned from a super-triangle at `10 × max(dx, dy)` that 2.8.2 deleted — there is no
+  super-triangle on this tree, and `_col_in_circumcircle`'s single caller
+  (`_col_dl_incircle:353`, the `g == 0` branch) sees only real input points. Re-measured against
+  exact integer arithmetic over every point quadruple of the suite's own delaunay fixtures, a strict
+  superset of the calls `delaunay_2d` can make: **0 wrong of 1,528,820**, versus the 0-of-180 it
+  replaces. The predicate remains non-robust in isolation (**36 of 400** at the original's magnitude
+  range, up to 198 of 400 at extreme spread) — what changed is that nothing can hand it that input.
+
 ## [2.9.0] - 2026-08-05 — a narrowphase a physics engine can build on
 
 All five exit criteria met. Suite **1818 → 3294** across five harnesses (a fifth was added:

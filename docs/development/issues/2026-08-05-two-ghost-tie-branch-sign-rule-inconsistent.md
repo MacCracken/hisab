@@ -1,6 +1,8 @@
 # `_col_dl_ic_g2`'s tie branch multiplies by `cr` where the determinant says it should not — latent, unreachable today
 
-**Status:** 🟡 **OPEN** — latent. Filed 2026-08-05, not fixed, not asserted against.
+**Status:** 🟢 **FIXED in 2.9.1** — `src/collision_mesh.cyr:320` now reads `if (s2 > 0)`. Nine new
+assertions in `tests/modules.tcyr` cover the anti-cyclic half; both are mutation-proven below.
+See **Resolution** at the bottom, which also answers question (3) with measurements.
 **Placement:** unpinned. Not a 2.9.0 blocker: unreachable on every path that exists today.
 **Discovered:** 2026-08-05, while deriving an exact-rational oracle to close the 2.9.0 mutation
 sweep's U4 coverage gap. Found by the derivation, not by a failing test — nothing in the suite
@@ -68,6 +70,96 @@ own cycle with:
 
 Question (3) is the real one. Fixing the arithmetic without deciding it just moves the latent
 assumption somewhere less visible.
+
+---
+
+## Resolution (2.9.1)
+
+### The finding reproduces — re-derived from scratch, not inherited
+
+Re-verified with an oracle that shares no reasoning with the derivation above: the ground truth is
+the **exact circumcircle of the three actual points** (`Fraction` circumcenter, exact
+distance-vs-radius comparison, ghosts placed at `A + 10³⁰·u`). That question takes no orientation
+argument at all, so it cannot inherit a sign convention.
+
+Coefficient identities, 400 random `(A, R, p)` × all 6 pairs — **0 disagreements each**:
+
+- `c₃ = |u|² · (r × (u_j − u_k))`
+- `c₂ = (u_j × u_k) · (|R − A|² − |A − p|²)`
+
+Whole predicate, 7×7 integer grid of `A`, `R`, `p`, 343,734 decided trials per orientation:
+
+| variant | cyclic wrong | anti-cyclic wrong |
+|---|---|---|
+| shipped 2.9.0 | 0 | **24,156** |
+| drop `* cr` from `:292` only | 0 | **0** |
+| drop `* cr` from **both** branches | 0 | **319,578** |
+
+Restricting to the tie branch alone (295,245 trials/orientation, 267,358 decided): shipped is
+**0** wrong cyclic and **267,358 of 267,358** wrong anti-cyclic. The 0 / 100% split in the table at
+the top of this file is confirmed on an independently built and much larger grid.
+
+The third row is the load-bearing one: **`* cr` at `:274` must stay.** It is not redundant
+decoration, and removing it costs 319,578 wrong answers on the anti-cyclic half.
+
+### Answer to question (3): yes for this helper, no for the entry point
+
+`_col_dl_ic_g2` **should** be callable with either ordering, because "p is inside the circumcircle
+of these three points" is a question about a *set* — the answer cannot depend on vertex order. The
+determinant's sign does depend on order, and `cr` is exactly the factor that divides that
+dependence out. So `cr` at `:274` is not "handling a clockwise triangle"; it is what makes the
+function compute the geometric predicate it advertises. The tie branch simply applied that
+correction twice.
+
+Choosing the opposite — assert `cr == 1` and drop the factor — was rejected on evidence: it deletes
+correct code (row 3 above) to buy an assertion, and it would make `_col_dl_ic_g2` a fourth distinct
+flavour of "trusts its caller's winding" in a file whose stated house style for
+should-be-unreachable states is the opposite (`collision_mesh.cyr:362-367` and `:529-532` both
+refuse to trust an invariant and take a defined path instead).
+
+**But the entry point is a different question, and the answer there is no.** Measured the same way,
+with the shipped sources transcribed literally:
+
+| helper | CW-presented triple | wrong |
+|---|---|---|
+| `_col_dl_ic_g1` | 463,086 | **462,846 (99.95%)** |
+| `_col_dl_ic_g3` | 243 | **243 (100%)** |
+
+Both drop the winding factor entirely, so **`_col_dl_incircle` is not CW-safe and this fix does not
+make it so.** That is now stated in the source comment above `_col_dl_ic_g2` so no future reader
+infers otherwise, and filed as
+`2026-08-06-ghost-incircle-g1-g3-assume-ccw.md` — which also records a *second*, orientation-
+independent defect the same sweep turned up in `_col_dl_ic_g1`'s M¹ tie-break.
+
+### Assertions added (`tests/modules.tcyr`)
+
+`_dlg_run()` became `_dlg_run(anti)`; the existing cyclic block is unchanged and now calls
+`_dlg_run(0)`. Added: the same 450-probe grid over the three **anti-cyclic** pairs, plus
+`_dlg_perm_bad`, which drives the **public entry point** `_col_dl_incircle` with all six orderings
+of `(R, G_j, G_k)` and counts answers that disagree with the first. Modules **+9**.
+
+### Mutation proof
+
+Two mutations, applied and reverted one at a time; `src/collision_mesh.cyr` md5-verified back to
+`2d8eb32a4570fb2ab16dcdcf146f118f` after each.
+
+| mutation | result |
+|---|---|
+| revert the fix — `:320` → `if (s2 * cr > 0)` | **3 FAIL** — perm cyclic 678, oracle anti-cyclic 224, perm anti-cyclic 672 |
+| drop `* cr` from the M³ branch `:298` | **3 FAIL** — perm cyclic 639, oracle anti-cyclic 213, perm anti-cyclic 639 |
+
+The anti-cyclic oracle mismatch of **224** under the first mutation independently reproduces the
+`MISMATCH → 224` corroboration recorded above from the clockwise-equivalent constant swap.
+
+The second mutation is the evidence that closed the decision: it is precisely the "assert the
+precondition and drop the factor" repair, and the suite now rejects it.
+
+### Behaviour on reachable paths
+
+Unchanged, by construction — `cr` is `+1` on every path `delaunay_2d` takes, where `s2 * cr > 0`
+and `s2 > 0` are the same expression. All five suites green, 0 failed: abuse 732, hisab 416,
+edge_cases 233, foundation 349, modules 1576 (this change contributes +9; a concurrent 2.9.1 task
+added the other +3 to the same file). Constant gate 153/153.
 
 ## Note on the line numbers
 

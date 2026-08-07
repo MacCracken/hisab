@@ -188,12 +188,21 @@ carries the schedule, not the detail.
       → [`issues/2026-08-04-incircle-precision.md`](issues/2026-08-04-incircle-precision.md)
 
 **Consistency — two siblings answering the same question differently:**
-- [ ] `mpr_intersect` vs `gjk_intersect_3d` diverge at exact tangency. 2.9.0 repaired
-      `gjk_intersect_3d` and left `mpr_intersect` on the strict reading, so the pair that agreed
-      before now does not. Recorded as the addendum row in the 2026-08-04 audit. Note the earlier
-      "26 of 3,012, all exact tangencies" characterisation was **not** independently reproduced —
-      one sweep found 0 disagreements and only coincident degenerate pairs diverging. Re-measure
-      before acting.
+- [x] `mpr_intersect` vs `gjk_intersect_3d` diverge at exact tangency. **Re-measured, then fixed
+      in 2.9.1.** The re-measurement came first, and it changed the answer: this was never
+      `mpr_intersect` "on the strict reading" — its fallback `_epa_seed_gjk != 0` is `_gjk_core_3d`,
+      the *pre-2.9.0 `gjk_intersect_3d` body*, so 2.9.0 simply repaired one call site of that logic
+      and left the other two (`mpr_penetration` had it too, one case wider). Independent sweep:
+      1,149 fixtures × 5 dyadic scales × both orders = 11,490 evaluations classified exactly in
+      `Fraction`; the honest count is **50 of the 7,540 whose support functions are exact**, all
+      tangencies, all `mpr = 0`/`gjk = 1`, 0 false positives. Both earlier reports were partly
+      right: the 50 reduce to 6 configurations, 4 of them coincident degenerate pairs (the second
+      reporter's finding) — but 2 are a point on the **corner of a solid box**, which nobody had,
+      and which `mpr_intersect` answered **differently in the two operand orders**. 160 tangency
+      evaluations between two shapes that both have volume: 0 disagreements, which is exactly why
+      an axis-aligned sweep saw none of it. The asymmetry is what ruled out documenting it as
+      strict. Now policed by three aggregates on the existing agreement sweep plus a 6-reproducer
+      group with ±1-ulp negative controls.
 
 **Coverage the mutation sweep could not close honestly:**
 - [ ] U6–U11: six EPA repairs whose mutants produce **bit-identical** output because `_epa_polish`

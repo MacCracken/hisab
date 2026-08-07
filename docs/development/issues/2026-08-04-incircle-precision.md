@@ -1,7 +1,8 @@
 # `_col_in_circumcircle` loses the sign on mixed-magnitude inputs
 
-**Status:** CONFIRMED and characterised. **Not fixed** — the proper remedy is an adaptive exact
-predicate, which deserves its own focused change.
+**Status:** CONFIRMED as a property of the predicate in isolation. **Not fixed, and 2.9.1 recommends
+leaving it** — see **Re-measurement (2.9.1)** at the bottom, which also retires a stale premise in
+the CORRECTION section below.
 
 ## What was claimed
 
@@ -90,3 +91,66 @@ remedy if this is ever exposed publicly or the super-triangle constant changes.
 **Method note.** The first probe generated coordinates by magnitude class rather than by
 reconstructing the caller's actual geometry. Measuring the *construct under test* rather than an
 abstraction of it is what changed the answer.
+
+---
+
+## Re-measurement (2.9.1)
+
+### The CORRECTION section's premise is now stale
+
+It says *"`delaunay_2d` builds its super-triangle at `d_max = max(dx, dy) * 10`"*. **There is no
+super-triangle on this tree.** 2.8.2 replaced it with the three symbolic ghosts at infinity, which
+have no coordinates at all (`collision_mesh.cyr:58-119`). The 0-of-180 table was measured against
+geometry that has not existed for three minor versions, so it could not be inherited and had to be
+re-run.
+
+The replacement makes the reasoning *stronger*, not weaker. `_col_in_circumcircle` now has exactly
+one caller in `src/` — `_col_dl_incircle:353`, on the `g == 0` branch — which is reached only when
+all three triangle vertices are **real input points**. The query point is likewise always a real
+input point. So the mixed-magnitude configuration that produced 3 of 40 is no longer merely
+unreached: **no vertex at super-triangle scale exists to construct it with.**
+
+### Re-measured on this tree
+
+Every call `delaunay_2d` can make is a quadruple of input points, so enumerating *all* quadruples
+of a fixture is a strict superset of its call set. The shipped predicate was transcribed
+operation-for-operation into IEEE-754 doubles and compared against exact integer arithmetic
+(coordinates scaled by a common power of two, so the reference is exact, not merely higher
+precision). Fixtures are the suite's own, regenerated bit-identically from the same splitmix64
+seeds:
+
+| fixture | quadruples | wrong |
+|---|---|---|
+| cluster-1e-20 (span 1e-20, seed 1) | 365,560 | **0** |
+| thin-strip-1e6 (flat 1e-6, seed 1) | 365,560 | **0** |
+| uniform-160 (span 1, seed 2; first 48 points) | 778,320 | **0** |
+| uniform-20 (literal hex fixture) | 19,380 | **0** |
+| **total** | **1,528,820** | **0** |
+
+Points exactly *on* the circumcircle are excluded (the predicate is strict, so agreement there is a
+convention question, not a precision one); zero degenerate collinear triples occurred.
+
+### Disposition: leave it
+
+**0 of 1,528,820** — four orders of magnitude more evidence than the 0-of-180 this replaces, on
+geometry that actually exists. The adaptive Shewchuk predicate would add expansion arithmetic and a
+forward error bound to the hottest inner loop of `delaunay_2d` to fix nothing measurable. The
+remedy section above remains correct about *what* the fix would be; it is the trigger that is now
+absent.
+
+**Reopen this if** `_col_in_circumcircle` is made public, or if it acquires a caller that can pass
+coordinates not drawn from a single input set. Its non-robustness **in isolation** is real and
+unchanged — re-measured directly, with a far vertex and a tight cluster:
+
+| far vertex | cluster | wrong |
+|---|---|---|
+| 1e3 … 1e7 (the original range) | 1e-7 … 1e-12 | **36 of 400** |
+| 1e6 … 1e12 | 1e-7 … 1e-12 | 148 of 400 |
+| 1e10 … 1e18 | 1e-7 … 1e-12 | 177 of 400 |
+| 1e14 … 1e22 | 1e-7 … 1e-12 | 198 of 400 |
+
+The first row is the same order as the 3-of-40 that opened this file (9% vs 7.5%). Recorded because
+a first attempt at 40 samples returned **0 of 400-scaled-down-to-40** and would have read as a
+refutation; it was sample size, not a real disagreement, and the sweep above is what settles it.
+What changed in 2.9.1 is not the predicate — it is that the construct under test can no longer
+build that input.

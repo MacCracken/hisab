@@ -203,6 +203,12 @@ genuinely open was never the code:
   — which is what ear clipping needs, so the code was right and only the contract was mis-stated.
   Closed in 2.9.3 with five assertions.
 
+**Also closed in 2.9.3**: `2026-08-04-incircle-precision.md`, which had been recorded as
+"leave it" since 2.9.1. It was not a property of the predicate in isolation — `delaunay_2d` silently
+dropped input points on any set mixing scales. Fixed with an adaptive exact `orient2d` on raw
+coordinates; the record of what the 2.9.1 closure got wrong, and of the repair attempt that did not
+work, is in the archived filing.
+
 **Still open from that group** (documentary, carried forward): the −84% `triangulate_600gon`
 headline does not disclose a small-n regression below the prune's break-even, and there is no
 reflex-heavy benchmark guarding the prune.

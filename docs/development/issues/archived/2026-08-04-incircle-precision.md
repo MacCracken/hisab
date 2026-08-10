@@ -1,11 +1,14 @@
 # `_col_in_circumcircle` loses the sign on mixed-magnitude inputs
 
-**Status:** 🔴 **OPEN, and RE-SCOPED UPWARD 2026-08-09 (2.9.3).** No longer "a property of the
-predicate in isolation": it is a **silently wrong `delaunay_2d`** on the public entry point.
-The 2.9.1 recommendation to leave it rested on a premise that does not hold — see
-**Re-scoping (2.9.3)** immediately below, which supersedes the *Disposition: leave it* section at
-the bottom of this file. A first repair attempt was made in 2.9.3, **measured insufficient, and
-reverted**; the reason is recorded because it disqualifies the obvious fix.
+**Status:** 🟢 **FIXED in 2.9.3.** It was never "a property of the predicate in isolation" — it was
+a **silently wrong `delaunay_2d`** on the public entry point, and the 2.9.1 recommendation to leave
+it rested on a premise that does not hold. `_col_in_circumcircle`'s winding term is now an adaptive
+exact `orient2d` over the raw coordinates. This supersedes the *Disposition: leave it* section at
+the bottom of this file.
+
+⚠ **The first repair attempt was wrong and is recorded below**, because it is the attempt anyone
+would make second time round: making the determinant exact **while leaving the operands
+pre-differenced** changes nothing.
 
 ## Re-scoping (2.9.3) — three findings, one of them a refutation of the obvious remedy
 
@@ -45,6 +48,8 @@ directory are `.tcyr` but are **not under `tests/`**, so CI has never run them.
 
 ### 3. ⛔ An exact `orient2d` on the predicate's own arguments does NOT fix it — measured
 
+*(This was the first attempt. The shipped fix, in §4 below, operates on raw coordinates instead.)*
+
 The obvious repair, and the one this file's own remedy section implies, is to make the winding term
 exact. **That was implemented in 2.9.3 — an adaptive Shewchuk-style `orient2d` with Dekker splitting,
 TwoProduct/TwoSum/TwoDiff tails and a four-component `Two_Two_Diff` expansion — and it changed
@@ -71,8 +76,8 @@ rounding a difference — not an exact determinant of rounded differences. That 
 routine than the one attempted, and it belongs in its own bite with its own benchmark, since it sits
 in `delaunay_2d`'s inner loop.
 
-The 2.9.3 attempt was **reverted rather than shipped**: it added cost and a page of numerical code
-while fixing none of the measured failures.
+That first attempt was **discarded rather than shipped** — it added cost and a page of numerical code
+while fixing none of the measured failures — and replaced by §4.
 
 ## What was claimed
 
@@ -224,3 +229,42 @@ a first attempt at 40 samples returned **0 of 400-scaled-down-to-40** and would 
 refutation; it was sample size, not a real disagreement, and the sweep above is what settles it.
 What changed in 2.9.1 is not the predicate — it is that the construct under test can no longer
 build that input.
+
+### 4. The shipped fix (2.9.3)
+
+`_col_orient2d_sign` — adaptive, in `src/collision_mesh.cyr`:
+
+- **fast path**: the float determinant, returned whenever `|det|` clears
+  `(3 + 16ε)ε · (|l| + |r|)`. That is every ordinary call, so the cost lands only where a sign error
+  is actually possible.
+- **exact path**: `_col_o2d_exact_raw`, Shewchuk's `orient2dexact` shape — the determinant expanded
+  into **six products of the raw coordinates**, three `Two_Two_Diff` four-component expansions, and
+  two `fast_expansion_sum_zeroelim` merges. No difference is ever rounded, which is precisely what
+  §3 got wrong. The sign is read off the most significant component of the final expansion;
+  components are non-overlapping, so no summation and therefore no rounding is involved.
+
+**Validation.** 300 random mixed-scale triples (one vertex at ~1e6, two clustered inside ~5e-17),
+cross-checked against exact rationals: **300/300 correct**. The shipped float winding scores
+**0/300** on the same set. Plus the ordinary CCW / CW / exactly-collinear cases, and the sign-loss
+triple where the float determinant is exactly `0.0` and the truth is `-5.457401e-11`.
+
+**Assertions.** `tests/modules.tcyr`, group *"2.9.3 delaunay_2d on WIDE INTRA-SET DYNAMIC RANGE"*:
+the fixture above (structural oracles only — `_dl_used`, `_dl_max_edge_share` — never
+`_dl_violations`), plus four unit assertions on `_col_orient2d_sign`. **Three mutants caught**: the
+pre-2.9.3 float winding (fixture drops to 5 points / 4 triangles), and the filter forced always-taken
+(same, plus the unit assertion).
+
+⚠ **One mutant SURVIVES, and it is recorded rather than hidden.** Feeding `_col_orient2d_sign` the
+already-translated operands passes the entire suite, because on this fixture the query translation is
+exact and the expansion recovers the sign either way. Raw coordinates are still correct on principle —
+one fewer rounding step, and what Shewchuk's orient2d takes — but **no assertion here distinguishes
+them**, so a future change moving that call back onto translated operands would not be caught. Two
+searches for a distinguishing case (2,000,000 mixed-magnitude triples, 3,000,000 near-degenerate ones
+at 1e15..1e17) found none: a uniform shift by `p` moves all three vertices on the same lattice, so the
+roundings largely cancel out of the determinant.
+
+**Cost: none measurable.** Same machine, avg statistic, against the 2.9.2 baseline —
+`delaunay_2d_400` −3.5%, `delaunay_2d_circle_150` −5.9%, `halfedge_2k_tris` −3.9%,
+`convex_hull_2d_2k` −3.7%, `triangulate_600gon` −6.4%; median across all 55 benchmarks −3.1%, with
+**0 benchmarks above the +10% noise floor**. The negative signs are noise, not a win, and no
+improvement is claimed.

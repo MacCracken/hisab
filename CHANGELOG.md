@@ -7,6 +7,39 @@ stays at 2.9.2 until the scope closes.
 
 ### Fixed
 
+- **`delaunay_2d` silently dropped input points on any set that mixes scales** — a wrong result from
+  the public entry point, not the "latent, no reachable path" the filing had recorded. The winding
+  term of `_col_in_circumcircle` was a plain float 2x2 determinant; with one vertex at ~6e5 and five
+  points inside ~5e-17 of the origin it loses its sign entirely. Measured fixture: 5 of 6 input
+  points used, **4 triangles where the exact rational hull says 6**. Failing seeds are dense — 8 of
+  the first 20 on a 3,999-seed sweep. Absolute magnitude is not the trigger (translating a whole set
+  to 1e9 is fine, Sterbenz handles it); **ratio within one set** is.
+
+  Root cause → fix: `_col_orient2d_sign`, an adaptive exact `orient2d`. Fast path is the float
+  determinant, returned whenever it clears `(3 + 16ε)ε · (|l| + |r|)` — every ordinary call. Exact
+  path is Shewchuk's `orient2dexact` shape: six products of the **raw** coordinates, three
+  `Two_Two_Diff` expansions, two `fast_expansion_sum_zeroelim` merges, sign read off the most
+  significant component.
+
+  ⚠ **The obvious version of this fix does not work, and it was implemented first.** Making the
+  determinant exact while leaving the operands **pre-differenced** changes nothing: the information
+  is gone before the exact arithmetic starts. With `b`, `c` at ~1e-17 and `a` at ~4e5, `f64_sub(bx, ax)`
+  and `f64_sub(cx, ax)` round to the **same double**, so two distinct points become one and the exact
+  determinant of *that* question is a faithful `0` — against a true `-5.457401e-11`. The exactness has
+  to extend back **through** the subtraction, which is why this expands into six raw products instead
+  of differencing first. That first attempt was discarded, not shipped.
+
+  Validated against exact rationals on 300 random mixed-scale triples: **300/300 correct**, where the
+  shipped float winding scores **0/300**. Three mutants caught. ⚠ **One survives and is recorded**:
+  feeding the function already-translated operands passes the whole suite, so nothing here would catch
+  a future change moving it back — two searches for a distinguishing case (2M mixed-magnitude, 3M
+  near-degenerate at 1e15..1e17) found none, because a uniform shift by `p` moves all three vertices on
+  the same lattice and the roundings cancel.
+
+  **No cost measurable**: `delaunay_2d_400` −3.5%, `delaunay_2d_circle_150` −5.9%,
+  `triangulate_600gon` −6.4%, median −3.1% across 55 benchmarks, **0 above the +10% noise floor**.
+  The negative signs are noise; no improvement is claimed.
+
 - **`_col_dl_incircle` was CCW-only, because `_col_dl_ic_g1` never formed the triple's winding.**
   "Is p inside the circumcircle of these three points" is a question about a **set**, so an answer
   that depends on the order the vertices arrive in is wrong however the caller happens to store
@@ -73,37 +106,15 @@ stays at 2.9.2 until the scope closes.
 
 ### Changed
 
-- **`2026-08-04-incircle-precision.md` re-scoped from "leave it" to OPEN, and a repair attempt was
-  measured insufficient and reverted.** Three findings, recorded together because the third is the
-  useful one:
+- **`2026-08-04-incircle-precision.md` was closed as "leave it" in 2.9.1 on a premise that does not
+  hold.** The 0-of-1,528,820 sweep behind that call was real, but every one of its four fixtures
+  draws from a **single origin-anchored box**, so the family has no *intra-set* dynamic range and
+  structurally could not reach this. Filing re-opened, fixed (see **Fixed** above), and archived.
 
-  1. **It is reachable.** 2.9.1 closed it on "nothing can hand it that input", supported by a
-     0-of-1,528,820 sweep — real, but over four fixtures that all draw from a **single
-     origin-anchored box**, so the family has no *intra-set* dynamic range and structurally could not
-     reach this. What breaks the predicate is ratio within one set, not absolute magnitude:
-     translating a whole set to 1e9 is fine (Sterbenz), mixing scales inside one set is not. With one
-     vertex at ~6e5 and five points inside ~5e-17 of the origin, **`delaunay_2d` silently drops an
-     input point** — failing seeds are dense, 8 of the first 20 on a 3,999-seed sweep.
-  2. **The suite's own oracle is blind to it by construction.** `_dl_violations` decides
-     circumcircle-emptiness by calling `_col_in_circumcircle`, i.e. the code under test. Only
-     structural oracles (`_dl_used`, `_dl_max_edge_share`) can see this. The two repro `.tcyr` files
-     in `issues/` are not under `tests/`, so CI has never run them.
-  3. ⛔ **An exact `orient2d` on the predicate's own arguments does NOT fix it.** The obvious repair
-     was implemented — adaptive Shewchuk-style, Dekker splitting, TwoProduct/TwoSum/TwoDiff tails, a
-     four-component `Two_Two_Diff` expansion — and **changed nothing**: the fixture still returned 4
-     triangles instead of 6 and still dropped a point. The expansion was verified correct in
-     isolation. The information is simply gone before it runs: `_col_in_circumcircle` differences in
-     floating point first, and with `b`, `c` at ~1e-17 and `a` at ~4e5 both differences round to the
-     **same double**, so `b` and `c` become the same point and the exact determinant of those
-     operands is faithfully `0` — against a true `-5.457401e-11` from the original coordinates.
-     The exactness has to extend back **through** the subtraction (`orient2dexact`: six TwoProducts
-     of the raw coordinates combined by expansion sums), which is a materially larger routine and
-     belongs in its own bite with its own benchmark, since it sits in `delaunay_2d`'s inner loop.
-
-  **The attempt was reverted rather than shipped** — it added cost and a page of numerical code while
-  fixing none of the measured failures. A ready-made failing fixture (literal bit patterns, exact
-  hull h = 4 so the correct count is 6) is recorded in the filing so the next attempt starts from
-  evidence rather than re-deriving one.
+  **The suite's own oracle was blind to it by construction**: `_dl_violations` decides
+  circumcircle-emptiness by calling `_col_in_circumcircle`, i.e. the code under test. Only structural
+  oracles (`_dl_used`, `_dl_max_edge_share`) can see this class, and the two repro `.tcyr` files in
+  `issues/` are not under `tests/`, so CI has never run them.
 
 - **Three "NOT APPLIED, by decision" performance records were wrong on all three counts**, in both
   `doc-health.md` and `roadmap.md`. `_kd_partition` and `triangulate_polygon` **shipped in 2.7.1**

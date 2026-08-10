@@ -80,4 +80,15 @@ now recorded as a measurement with a repro instead of as a belief.
 **Upstream:** filed 2026-08-10 at `cyrius/docs/development/issues/hisab-capturing-closure-segv-across-fn-boundary.md`,
 with a standalone repro at `issues/repros/2026-08-10-capturing-closure-across-fn-boundary.cyr` — re-run
 from the filed file itself and it reproduces (SIGSEGV, exit 139).
-**Status:** 🔴 **OPEN** — live on 6.5.16.
+**Status:** 🟢 **FIXED in cyrius 6.5.17, verified 2026-08-10.** Upstream's entry reads
+*"capturing closure SIGSEGV (hisab, High)"*. Re-run from the filed repro itself: the case-3 program
+now returns **42** instead of SIGSEGV, and the `fncall1` variant (case 4) returns 42 too — so both
+dispatch paths are repaired, which matches the reading that the fault was in the shared dispatch
+rather than in `callptr`.
+
+**Consequence for hisab:** the `vec_sort_by` / `vec_select_nth` adoption is **unblocked**. It was
+parked first on a false premise ("Cyrius has no closures") and then, correctly, on this defect. The
+remaining objection is only the API-shape one — `vec_sort_by` passes element *values* while hisab
+sorts *indices* — and a capturing closure now solves exactly that, since the comparator can close
+over the `points` vector instead of reaching it through a file-scope global. Re-evaluate against
+CLAUDE.md's "wait for the third instance" rule and with before/after benchmark numbers.

@@ -191,6 +191,19 @@ def delta(old, new):
 
 with open(md_file, "w") as f:
     f.write("# Benchmarks\n\n")
+    # Dated measurement-method changes. A row's number is only comparable back to
+    # the most recent entry here that affects it — the CSV cannot express that on
+    # its own, and a silent step change reads as a win.
+    f.write("> **Measurement changes** — read before comparing across a date.\n"
+            "> * **2026-08-10**: 17 sub-microsecond benchmarks moved from `bench()` to\n"
+            ">   `bench_batch()`. `bench_run` wraps a `clock_gettime` PAIR around every call\n"
+            ">   (~240 ns, documented in `lib/bench.cyr`), so those rows were **~95% clock\n"
+            ">   overhead**: `ray_sphere` read 1,466 ns and is 79 ns; `vec3_add` read 1,457 ns\n"
+            ">   and is 36 ns. It also FLATTENED them — triangle/sphere measured 1.19x when the\n"
+            ">   true ratio is 3.6x — so a real regression could hide inside the overhead.\n"
+            ">   Their drop at this date is an artefact of the fix, not a speedup.\n"
+            "> * **2026-08-09**: `estimate_ns` changed from each benchmark's MAX to its AVG.\n"
+            ">   The `stat` column records which; rows with no value there are `max`.\n\n")
     ts_last = pick[-1]
     f.write(f"Latest: **{ts_last}** — commit `{commits[ts_last]}`\n\n")
     if len(pick) >= 3:

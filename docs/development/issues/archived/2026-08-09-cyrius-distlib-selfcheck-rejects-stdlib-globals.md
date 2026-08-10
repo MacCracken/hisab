@@ -195,4 +195,19 @@ fn/var/enum reproducer, the 6.5.9 / 6.5.13 / 6.5.14 / 6.5.16 bisection, and the 
 radius. Preferred fix proposed there: compile the self-check bundle with the project's own
 `[deps]` stdlib in scope — the `cyrius check --with-deps` shape — rather than extending
 suppression to name resolution.
-**Status:** 🔴 **OPEN** — live on 6.5.16, worked around in hisab's CI as above.
+**Status:** 🟢 **FIXED in cyrius 6.5.17, verified 2026-08-10.** Upstream's entry reads
+*"`distlib` rejected correct bundles (hisab + kavach, High) — ONE bug, and it was ours"*.
+
+Re-run on 6.5.17 rather than taken on trust — `cyrius distlib` on hisab's real bundle exits **0**
+(was 1), and the three-way minimal reproducer that isolated the class now passes on all three arms:
+
+| `[lib]` module body | 6.5.16 | 6.5.17 |
+|---|---|---|
+| `strlen(s)` — stdlib **function** | exit 0 | exit 0 |
+| `F64_ONE` — stdlib **global var** | exit 1 | **exit 0** |
+| `STDOUT_FD` — stdlib **enum constant** | exit 1 | **exit 0** |
+
+hisab's CI/release workaround is **removed**: both workflows run a bare `cyrius distlib` again and a
+non-zero exit is a real failure. `cyrius check --with-deps dist/hisab.cyr` is kept as a separate
+step — it compiles the bundle the way a consumer does, which is stronger than the self-check either
+way, and was worth having independently of the bug.

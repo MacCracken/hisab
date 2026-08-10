@@ -1,6 +1,63 @@
 # Changelog
 
-## [Unreleased]
+## [Unreleased] — 2.10.0 in progress
+
+### Fixed
+
+- **17 of 60 benchmarks were measuring `clock_gettime`, not the operation.** `bench_run` wraps a
+  `clock_gettime` PAIR around **every call** — ~240 ns, documented in `lib/bench.cyr` — and
+  `bench_batch` exists precisely to amortise that over a round. Only 7 benchmarks used it. The other
+  53 included 17 sub-microsecond operations whose recorded numbers were **~95% overhead**:
+
+  | benchmark | recorded via `bench()` | true, via `bench_batch()` |
+  |---|--:|--:|
+  | `ray_sphere` | 1,466 ns | **79 ns** |
+  | `ray_aabb` | 1,454 ns | **82 ns** |
+  | `ray_triangle` | 1,741 ns | **286 ns** |
+  | `vec3_add` | 1,457 ns | **36 ns** |
+  | `num_gcd` | 1,445 ns | **27 ns** |
+
+  ⚠ **The damage is not the inflation, it is the FLATTENING.** All 17 recorded between 1,445 and
+  1,765 ns — a 1.2× spread across operations whose true costs span **27 ns to 287 ns, over 10×**.
+  `ray_triangle` vs `ray_sphere` measured **1.19×** when the true ratio is **3.6×**. A real
+  regression of several hundred ns in any of them would have been invisible inside the overhead, and
+  the tell was in the CSV all along: `min_ns` pinned at 419–489 ns on every one of the 17, the clock
+  floor rather than anything about the code.
+
+  All 17 moved to `bench_batch` (2,000 calls per clock pair, 200 rounds). **Their drop at this date
+  is an artefact of the fix, not a speedup**, and `benchmarks.md` now carries a dated
+  *Measurement changes* header saying so — emitted by the generator, so it cannot be lost on the
+  next regeneration.
+
+  This is the **fourth** gate in this family: `bench-history.sh` recording MAX, the version gate
+  matching a byte count, the CLI version string checked by nothing, and now the benchmark harness
+  measuring its own instrumentation. Found while scoping 2.10.0's benchmark plan — no honest
+  performance claim about ray intersection was possible until it was fixed.
+
+### Changed
+
+- **Toolchain pin `6.5.16` → `6.5.17`.** Upstream fixes **all three** defects hisab filed during the
+  2.9.2/2.9.3 work. Each was re-run from its own filed repro rather than taken from the release note:
+
+  - **Capturing closure SIGSEGV across a function boundary — FIXED.** The case-3 program returns
+    **42** (was SIGSEGV 139), and the `fncall1` variant returns 42 too, so both dispatch paths are
+    repaired. **This unblocks `vec_sort_by`**: it was parked first on a false premise ("Cyrius has no
+    closures") and then correctly on this defect, and a capturing comparator now solves the
+    API-shape objection — it can close over the `points` vector instead of reaching it through a
+    file-scope global.
+  - **`distlib` rejecting correct bundles — FIXED.** `cyrius distlib` on hisab's real bundle exits
+    **0**, and the three-arm minimal reproducer passes on all of stdlib function / global var / enum
+    constant. **hisab's CI and release workaround is removed** — both workflows run a bare
+    `cyrius distlib` again and a non-zero exit is a real failure once more. The separate
+    `cyrius check --with-deps dist/hisab.cyr` step stays; it was worth having independently.
+  - ⚠ **Dead-function bodies never syntax-checked — PARTIALLY fixed.** `cyrius build` and
+    `cyrius check --with-deps` now both reject the repro (exit 1), which is the half that matters:
+    nothing unparseable can be built or shipped. But **`cyrius lint` and `cyrius vet` still exit 0**
+    on a file that does not parse, so the release note's "accepted by every gate" is not fully
+    discharged. Measured, fed back to the upstream filing, and left open here rather than closed.
+
+  **No vendored stdlib change** — all 30 files are byte-identical between 6.5.16 and 6.5.17 for
+  hisab's declared subset, so this is a compiler-only bump. Suite holds at **3376**, all gates green.
 
 ## [2.9.3] - 2026-08-10 — the open filings, and the two whose own proposed fixes were wrong
 

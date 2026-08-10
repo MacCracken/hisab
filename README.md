@@ -35,7 +35,7 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "6.5.16"
+cyrius      = "6.5.17"
 
 [deps]
 # `ganita` (Cyrius 6.2.x) provides the transcendentals (acos/asin/atan2/pow/
@@ -119,12 +119,12 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 | Metric | Value |
 |--------|-------|
 | Version | 2.9.3 |
-| Library | 34 modules, ~21,498 lines of Cyrius |
+| Library | 34 modules, ~21,512 lines of Cyrius |
 | Tests | 3376 assertions across 5 suites |
 | Benchmarks | 60 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~214 KB static ELF (`build/hisab` — version smoke test only) |
-| Toolchain | Cyrius 6.5.16 |
+| Toolchain | Cyrius 6.5.17 |
 | Dependencies | 1 (sakshi 2.4.10); no third-party, no FFI/libc |
 | Security | P(-1) audit (2026-04-15) + hardening pass (2026-05-29); [2026-08-03](docs/audit/2026-08-03.md) sweep (70 findings, 2 critical) discharged in 2.6.12–2.6.15; [2026-08-04](docs/audit/2026-08-04.md) re-audit (42 confirmed, 0 critical) discharged in 2.7.0; [2026-08-04 v2.8.0 full sweep](docs/audit/2026-08-04-v2.8.0-full.md) (42 confirmed, 4 critical) **42 FIXED / 0 OPEN** as of 2.9.1; `tests/abuse.tcyr` (2.9.0) found 11 defects on public entry points, all fixed. 10 open findings — 4 upstream toolchain, the rest precision and performance — tracked in [docs/development/issues/](docs/development/issues/) |
 

@@ -104,5 +104,22 @@ build/lint/vet/check, exit 1 after renaming `gg` → `g_g`, exit 1 after calling
 Root cause is left as an open question there — `CYRIUS_DCE_VERBOSE=1` lists both variants as
 `dead:` but only the underscore one contributes bytes, which is flagged as speculation for the
 Cyrius side to confirm.
-**Status:** 🔴 **OPEN** — live on 6.5.16. No hisab workaround needed today; recorded so the naming
-accident that protects the tree is a known dependency rather than an invisible one.
+**Status:** 🟡 **PARTIALLY FIXED in cyrius 6.5.17, verified 2026-08-10.** Upstream's entry claims
+*"a syntax error in an uncalled fn was accepted by every gate (hisab, Medium)"* — but **two gates
+still accept it**. Re-run from the filed repro on 6.5.17:
+
+| gate | 6.5.16 | 6.5.17 |
+|---|---|---|
+| `cyrius build` | exit 0 ❌ | **exit 1** ✅ |
+| `cyrius check --with-deps` | exit 0 ❌ | **exit 1** ✅ |
+| `cyrius lint` | exit 0 ❌ | **exit 0** ❌ still |
+| `cyrius vet` | exit 0 ❌ | **exit 0** ❌ still |
+
+The load-bearing half is repaired: a file that does not parse can no longer be **built** or
+**checked**, so nothing broken ships. What remains is that `lint` and `vet` still report success on
+a file that does not parse — and for `lint` that is the sharper edge of the two, since analysing
+code that never runs is a large part of what a linter is for. Whether that is in scope or by design
+(lint/vet may deliberately not do a full parse) is upstream's call; it is recorded here as measured
+rather than assumed.
+
+hisab needs no workaround either way — its build and check gates are the ones that now catch it.

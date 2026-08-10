@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.5.16**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
+> Written in Cyrius. Toolchain: **6.5.17**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
 
 ## Scope
 
@@ -14,7 +14,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 ## Current — v2.9.3
 
 Suite **3376** across five harnesses (hisab 416, foundation 349, modules 1646, edge_cases 233,
-abuse 732), constant gate **155/155**, **60** benchmarks, toolchain **6.5.16**, sakshi **2.4.10**.
+abuse 732), constant gate **155/155**, **60** benchmarks, toolchain **6.5.17**, sakshi **2.4.10**.
 All gates green:
 `lint` 0 warnings and `fmt <file> --check` 0 drift across all 43 sources, `vet` 2 deps / 0 untrusted
 / 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 588/591 functions (99%) over 35/35 files,

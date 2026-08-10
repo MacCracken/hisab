@@ -61,22 +61,25 @@
 # LAYOUT
 # ================================================================
 #
-# One fixed 48-byte jet regardless of primitive, with a `kind` tag. The shape
+# One fixed 64-byte jet regardless of primitive, with a `kind` tag. The shape
 # derivative slots are typed by that tag and reached ONLY through per-primitive
 # named accessors -- reading a sphere's radius slot off a plane jet returns the
 # error sentinel rather than that plane's distance derivative. An untyped slot
 # block would make those two indistinguishable at the call site.
 
-var GEO_JET_MISS   = 0;
-var GEO_JET_PLANE  = 1;
-var GEO_JET_SPHERE = 2;
+var GEO_JET_MISS     = 0;
+var GEO_JET_PLANE    = 1;
+var GEO_JET_SPHERE   = 2;
+var GEO_JET_TRIANGLE = 3;
 
 #derive(accessors)
-struct GeoJet { kind; t; dt_do; dt_dd; sv; ss; }
+struct GeoJet { kind; t; dt_do; dt_dd; sv; sv1; sv2; ss; }
 
-# `sv` is the HVec3 shape-parameter gradient, `ss` the scalar one:
-#   plane   sv = dt/d(normal)  ss = dt/d(distance)
-#   sphere  sv = dt/d(center)  ss = dt/d(radius)
+# The shape-parameter slots, typed by `kind` and reachable only through the
+# per-primitive accessors below:
+#   plane     sv = dt/d(normal)   ss = dt/d(distance)
+#   sphere    sv = dt/d(center)   ss = dt/d(radius)
+#   triangle  sv = dt/d(v0)       sv1 = dt/d(v1)      sv2 = dt/d(v2)
 
 #must_use
 fn _geo_jet_miss() {
@@ -89,6 +92,8 @@ fn _geo_jet_miss() {
     GeoJet_set_dt_do(j, hvec3_new(0, 0, 0));
     GeoJet_set_dt_dd(j, hvec3_new(0, 0, 0));
     GeoJet_set_sv(j, hvec3_new(0, 0, 0));
+    GeoJet_set_sv1(j, hvec3_new(0, 0, 0));
+    GeoJet_set_sv2(j, hvec3_new(0, 0, 0));
     GeoJet_set_ss(j, 0);
     return j;
 }
@@ -182,6 +187,61 @@ fn geo_jet_plane(ray, plane) {
     return j;
 }
 
+# Ray-triangle jet. Gradients w.r.t. ray origin, ray direction and all three
+# vertices -- 15 parameters from one intersection.
+#
+# The surface is the triangle's plane, F = n . (p - v0) with n = e1 x e2,
+# e1 = v1 - v0, e2 = v2 - v0. The barycentric bounds decide only WHETHER there
+# is a hit, not where it is, so they contribute nothing to the derivative in the
+# interior -- and on the boundary `t` is not differentiable at all, which is
+# what the primal's miss return already expresses.
+#
+# Both n and the constant term depend on the vertices, so the vertex gradients
+# carry two contributions. With w = p - v0 and den = n . d:
+#
+#   dt/dv0 = -[ (e1 - e2) x w  -  n ] / den
+#   dt/dv1 = -[ e2 x w ] / den
+#   dt/dv2 = -[ w x e1 ] / den
+#
+# Verified against central differences of the shipped `geo_ray_triangle` over 382
+# accepted random configurations: worst |analytic - FD| was 9.6e-10 across all
+# five gradients.
+# [measured: tests/modules.tcyr "2.10.0 geo_jet_triangle"]
+#
+# ⚠ The translation identity dt/dv0 + dt/dv1 + dt/dv2 == -dt/do holds, but it is
+# an ALGEBRAIC identity of the three expressions above (the cross-product terms
+# cancel exactly, leaving n/den), so it cannot detect a shared error in them.
+# It is asserted as a smoke test only; finite differences are the real oracle.
+#must_use
+fn geo_jet_triangle(ray, tri) {
+    var t = geo_ray_triangle(ray, tri);
+    if (t == 0) { return _geo_jet_miss(); }
+
+    var d = GeoRay_direction(ray);
+    var v0 = GeoTriangle_v0(tri);
+    var e1 = hvec3_sub(GeoTriangle_v1(tri), v0);
+    var e2 = hvec3_sub(GeoTriangle_v2(tri), v0);
+    var n = hvec3_cross(e1, e2);
+    var den = hvec3_dot(n, d);
+    if (f64_lt(f64_abs(den), EPSILON_F64) == 1) { return _geo_jet_miss(); }
+
+    var inv = f64_div(F64_ONE, den);
+    var w = hvec3_sub(geo_ray_at(ray, t), v0);
+    var dt_do = hvec3_scale(n, f64_neg(inv));
+
+    var j = alloc(sizeof(GeoJet));
+    GeoJet_set_kind(j, GEO_JET_TRIANGLE);
+    GeoJet_set_t(j, t);
+    GeoJet_set_dt_do(j, dt_do);
+    GeoJet_set_dt_dd(j, hvec3_scale(dt_do, t));
+    GeoJet_set_sv(j, hvec3_scale(hvec3_sub(hvec3_cross(hvec3_sub(e1, e2), w), n),
+    f64_neg(inv)));
+    GeoJet_set_sv1(j, hvec3_scale(hvec3_cross(e2, w), f64_neg(inv)));
+    GeoJet_set_sv2(j, hvec3_scale(hvec3_cross(w, e1), f64_neg(inv)));
+    GeoJet_set_ss(j, 0);
+    return j;
+}
+
 # ================================================================
 # Typed shape-derivative accessors
 # ================================================================
@@ -212,6 +272,24 @@ fn geo_jet_plane_dnormal(j) {
 fn geo_jet_plane_ddistance(j) {
     if (GeoJet_kind(j) != GEO_JET_PLANE) { return 0; }
     return GeoJet_ss(j);
+}
+
+#must_use
+fn geo_jet_tri_dv0(j) {
+    if (GeoJet_kind(j) != GEO_JET_TRIANGLE) { return 0; }
+    return GeoJet_sv(j);
+}
+
+#must_use
+fn geo_jet_tri_dv1(j) {
+    if (GeoJet_kind(j) != GEO_JET_TRIANGLE) { return 0; }
+    return GeoJet_sv1(j);
+}
+
+#must_use
+fn geo_jet_tri_dv2(j) {
+    if (GeoJet_kind(j) != GEO_JET_TRIANGLE) { return 0; }
+    return GeoJet_sv2(j);
 }
 
 # Tangential part of a direction gradient, (I - d d^T) v, for a caller whose

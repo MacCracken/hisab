@@ -11,13 +11,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.9.3
+## Current — v2.10.0
 
-Suite **3376** across five harnesses (hisab 416, foundation 349, modules 1646, edge_cases 233,
-abuse 732), constant gate **155/155**, **60** benchmarks, toolchain **6.5.17**, sakshi **2.4.10**.
-All gates green:
-`lint` 0 warnings and `fmt <file> --check` 0 drift across all 43 sources, `vet` 2 deps / 0 untrusted
-/ 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 588/591 functions (99%) over 35/35 files,
+Suite **3398** across five harnesses (hisab 416, foundation 349, modules 1668, edge_cases 233,
+abuse 732), constant gate **155/155**, **64** benchmarks, **35** `[lib]` modules, toolchain
+**6.5.17**, sakshi **2.4.10**. All gates green:
+`lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps / 0 untrusted
+/ 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 599/604 (99%) functions over 36/36 files,
 distlib in sync.
 
 **2.9.0** delivered the narrowphase release — but read its section for what that actually means: the
@@ -27,7 +27,10 @@ sweep on the integrated tree). **2.9.1** cleared the deferred tier: four latent 
 the ghost in-circle family, one of which was wrong on ordinary reachable input. **2.9.2** is a
 maintenance release — toolchain 6.5.9 → 6.5.16, sakshi 2.4.8 → 2.4.10, **no library source change**,
 the `dist/hisab.cyr` diff is the version header alone — and it is on this page for what the bump
-surfaced, not for the bump.
+surfaced, not for the bump. **2.9.3** worked the open filings and found two of them argued for
+repairs that measurement refuted. **2.10.0** is the first feature line since 2.8.x — differentiable
+geometry — and it too led with a defect in shipped code, found by running the feature's own
+correctness check against the primitives *before* writing the feature.
 
 **The standing lesson from this arc, stated once here so it is not rediscovered:** every defect of
 consequence was cheap to find and invisible because nothing looked. The friction impulse had been
@@ -91,7 +94,8 @@ appear on this page at all.
 | ~~2.9.1~~ | The deferred tier — latent predicate defects | **RELEASED 2026-08-06** |
 | ~~2.9.2~~ | The toolchain bump, and three gates that were not gating | **RELEASED 2026-08-09** |
 | ~~2.9.3~~ | The open filings — including the two whose own proposed fixes were wrong | **RELEASED 2026-08-10** |
-| **2.10.0** | Differentiable geometry (autodiff through intersections) | 2.9.x |
+| ~~2.10.0~~ | Differentiable geometry — jets for plane, sphere, triangle | **RELEASED 2026-08-10** |
+| **2.10.1** | The branchy primitives, and the 2.9.x carry-forwards | 2.10.0 |
 | **2.11.0** | Reverse-mode autodiff (tape-based) | 2.10.0 |
 | **3.0.0** | `Result<T,E>` API — breaking | 2.11.0 feature-complete |
 
@@ -236,7 +240,7 @@ Driver: aethersafha (compositor) and the differentiable-rendering use case. **Un
 are the exact surface the 2.8–2.9 arc spent four releases correcting. Starting now builds on ground
 that is freshly verified rather than freshly re-audited.
 
-### 2.10.0 — progress
+### 2.10.0 — delivered  **RELEASED 2026-08-10**
 
 - [x] **`geo.cyr` homogeneity repair** — the precondition. `geo_ray_sphere` was not degree −1 in the
       direction and `geo_ray_capsule` inherited it; the analytic `dt/dd` would have differentiated a
@@ -245,8 +249,10 @@ that is freshly verified rather than freshly re-audited.
       typed shape accessors behind a `kind` tag. Full gradient in one evaluation, post-pass on the
       shipped primal so no algorithm is duplicated. `jet_sphere` 336 ns vs `ray_sphere` 95 ns
       (**3.5×** for all 7 partials). FD-against-the-primal oracle, 5 mutants caught.
-- [ ] **`geo_jet_triangle`** — the compositor's actual case, and the last of the smooth seam.
-      Möller–Trumbore, so `∂F/∂v0..v2` needs deriving; same FD oracle applies unchanged.
+- [x] **`geo_jet_triangle`** — the compositor's actual case, and the last of the smooth seam.
+      15 partials in one call, FD-verified to 9.6e-10 over 382 configs, 4 mutants caught.
+      **934 ns against `ray_triangle`'s 280 ns (3.3×)** — versus the ~4,200 ns forward-mode duals
+      would need for the same 15 partials. **The scoped smooth seam is complete.**
 - [ ] **`aabb` / `obb` / `capsule` jets** — deferred. All three select their hit through
       `f64_max`/`f64_min` (12 sites), so they need a `_core(ray, shape, out)` split of shipped
       `geo.cyr` before a jet can hook the selected branch. Not worth the risk in a first bite.
@@ -264,6 +270,38 @@ handle it correctly, so this is a **sibling asymmetry**, the same class 2.9.1 re
 `mpr_intersect` vs `gjk_intersect_3d`. It blocks the jets: the analytic `dt/dd` is derived from an
 implicit-function argument that assumes the homogeneity the two routines break.
 → [`issues/2026-08-10-ray-sphere-capsule-assume-unit-direction.md`](issues/2026-08-10-ray-sphere-capsule-assume-unit-direction.md)
+
+## 2.10.1 — the branchy primitives
+
+2.10.0 deliberately shipped only the **smooth seam**: plane, sphere and triangle each have a single
+branch structure, so a jet is a post-pass on the shipped primal and no shipped line had to move.
+The remaining three do not, and that is the whole content of this release.
+
+- [ ] **`_core` split of `geo_ray_aabb` / `_obb` / `_capsule`.** All three select their hit through
+      `f64_max`/`f64_min` — **12 sites**: `geo.cyr:303-304, 319-320, 335-336, 391-392, 412-413,
+      431-432, 490, 520, 539, 553`. A jet needs to know *which* slab or cap won, and the primal
+      discards that. The shape is `_core(ray, shape, out_face)` returning `t` and writing the
+      selected branch, with the existing entry point becoming a thin wrapper that ignores it —
+      so the primal's behaviour is unchanged by construction and the 3398 existing assertions stay
+      the gate on that.
+      ⚠ **This is the first 2.10.x change that touches shipped `geo.cyr` logic rather than adding
+      beside it.** Mutation-proof the wrapper equivalence before the jets go anywhere near it.
+- [ ] **`geo_jet_aabb` / `geo_jet_obb` / `geo_jet_capsule`** on top of that split. The derivative is
+      per-face once the face is known — an aabb hit on the `+x` slab has `dt/d(max.x) = 1/d.x` and
+      zero for the other five — so the work is the plumbing, not the calculus. The capsule needs
+      three cases (cylinder body, either cap) and its cap branch routes through `geo_jet_sphere`,
+      which already exists.
+      ⚠ `t` is genuinely **non-differentiable at a slab crossing**, where the selected face changes.
+      The jet must report that honestly rather than returning whichever side it happened to land on;
+      the miss sentinel is the existing precedent (`geo_jet_sphere` already uses it at grazing
+      incidence, where the two roots merge).
+- [ ] **A `geo_jet_*` benchmark per primitive**, as the smooth three have. `jet_sphere` is 3.6× its
+      primal and `jet_triangle` 3.3×; the branchy three should be stated the same way rather than
+      claimed to be cheap.
+- [ ] **Decide whether `autodiff.cyr` stays scalar-only.** 2.10.0 answered "no dual vectors" for the
+      *geometry*, on measured grounds (allocation per op, one seed per pass). Whether duals should
+      gain a vector layer for other consumers is a separate question, and **2.11.0's reverse-mode
+      tape is the forcing function**, not this release.
 
 ### Carried into 2.10.x from the 2.9.x arc
 
@@ -407,8 +445,9 @@ answer is a cheaper pre-filter, not reverting the correctness fix.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.10.0 | 2026-08-10 | 21,855 | 36 | **Differentiable geometry — and the primal defect it found first.** `src/geo_diff.cyr`: jets for plane, sphere and triangle returning the full gradient from ONE evaluation, allocation-free, as a post-pass on the shipped primal so no intersection algorithm is duplicated. Sphere 7 partials at 335 ns vs its 93 ns primal (3.6x); triangle 15 partials at 934 ns vs 280 ns (3.3x) — against the ~4,200 ns forward-mode duals would need for the same 15. **Before any autodiff was written, the design's own homogeneity check was run against the EXISTING primitives and failed**: `geo_ray_sphere` was not degree -1 in the ray direction, returning a t whose hit point sat 3.74 from the centre of a unit sphere, with `geo_ray_capsule` inheriting it through its end caps. Silent wrong output in shipped geometry, found by a check for a feature that did not exist yet. The same pass found 17 of 60 benchmarks measuring `clock_gettime` rather than the operation (ray_sphere read 1,466 ns, is 79 ns) — the fourth non-gating gate of the arc, and the only reason the repair's +17.6% was visible. Nine mutants caught across the two jets. Toolchain 6.5.16 -> 6.5.17, which fixed all three defects hisab filed upstream. 3398 |
+| 2.9.3 | 2026-08-10 | 21,498 | 35 | **The open filings, and the two whose own proposed fixes were wrong.** Five of six internal filings closed. Two real defects: `delaunay_2d` silently DROPPED input points on any set mixing scales (one vertex at ~6e5 with five inside ~5e-17 of the origin returned 4 triangles where the exact hull says 6, and used 5 of 6 points) — fixed with an adaptive exact `orient2d` on RAW coordinates, 300/300 against exact rationals where the float winding scores 0/300; and `_col_dl_incircle` answered differently depending on VERTEX ORDER, `g1` being the last helper reading the CCW storage convention instead of forming the winding. Three guards were policing nothing: the k-d balance guard had no regression assertion (deleting it broke nothing checked) and no benchmark on its own input class (now 564.8 us guarded vs 3.397 ms unguarded, 6.0x); the ear prune's only benchmark was its BEST case (reflex-heavy is 3.6x, and the small-n regression is +15% measured against the pre-prune body); and `_col_point_in_tri` documented itself as strict-interior while being boundary-inclusive. **TWO FILINGS ARGUED FOR REPAIRS THAT MEASUREMENT REFUTED** — an exact determinant of pre-differenced operands fixes nothing (the information is gone before it runs), and dropping EPA's seed test produces wrong depths at exact tangency (`_ag_baddepth` 0 -> 4). Both were implemented in full before being rejected. The EPA filing's central claim was also false: it measured one of two entry points. 3376 |
 | 2.9.2 | 2026-08-09 | 21,262 | 35 | **The toolchain bump, and three gates that were not gating.** Toolchain 6.5.9 → **6.5.16** (seven releases) + sakshi 2.4.8 → **2.4.10**. No library source change — the bundle diff is the version header alone; all 30 vendored files byte-match the 6.5.16 snapshot, `deps --verify` 30/30. `scripts/bench-history.sh` recorded the **max** of each benchmark, not the average, in **44 of 55** rows and in every row it has ever written — the parser scavenged the last `<num><unit>` from a line that ends in `max=`. Re-anchored on the harness's named fields, CSV gains `stat`/`avg_ns`/`min_ns`/`max_ns`/`iters`, and `benchmarks.md` compares only same-`stat` rows at ±10% — the measured noise floor is a 3.5% median avg spread over three back-to-back runs of one binary, against −93%..+742% swings on the max rows. **No performance claim in this release**: it is the first correct baseline. CI's version gate was an unanchored `grep` — `2.9.2` matched `32,942,104 B` — and `src/main.cyr`'s hardcoded CLI string was checked by nothing; both now assert against `VERSION`. cyrius 6.5.14's `distlib` self-check rejects any bundle reading a stdlib constant (hisab's reads `F64_ONE`), so `ci.yml` and `release.yml` were both RED; now tolerated by exact signature plus `cyrius check --with-deps`. `dist/hisab.deps` tracked, 15 stdlib leaves. 3351 |
-| 2.9.3 | 2026-08-10 | 21498 | 58 | **The open filings, and the two whose own proposed fixes were wrong.** Five of six internal filings closed. Two real defects: `delaunay_2d` silently DROPPED input points on any set mixing scales (one vertex at ~6e5 with five inside ~5e-17 of the origin returned 4 triangles where the exact hull says 6, and used 5 of 6 points) — fixed with an adaptive exact `orient2d` on RAW coordinates, 300/300 against exact rationals where the float winding scores 0/300; and `_col_dl_incircle` answered differently depending on VERTEX ORDER, `g1` being the last helper reading the CCW storage convention instead of forming the winding. Three guards were policing nothing: the k-d balance guard had no regression assertion (deleting it broke nothing checked) and no benchmark on its own input class (now 564.8 us guarded vs 3.397 ms unguarded, 6.0x); the ear prune's only benchmark was its BEST case (reflex-heavy is 3.6x, and the small-n regression is +15% measured against the pre-prune body); and `_col_point_in_tri` documented itself as strict-interior while being boundary-inclusive. **TWO FILINGS ARGUED FOR REPAIRS THAT MEASUREMENT REFUTED** — an exact determinant of pre-differenced operands fixes nothing (the information is gone before it runs), and dropping EPA's seed test produces wrong depths at exact tangency (`_ag_baddepth` 0 -> 4). Both were implemented in full before being rejected. The EPA filing's central claim was also false: it measured one of two entry points. 3376 |
 | 2.9.1 | 2026-08-06 | 21,262 | 35 | **The deferred tier.** Four latent ghost in-circle defects, all found by deriving an exact-rational oracle rather than by a failing test. `_col_dl_ic_g1`'s M^1 tie-break was the only one wrong on REACHABLE CCW input (228 of 463,086) — it vanished whenever the edge was parallel to `u_k` and could not separate "between a and b" from "beyond b"; replaced by a betweenness test. `_col_dl_ic_g2`'s tie branch applied winding twice; `_col_dl_ic_g3` reduced to the constant 1 with two independent proofs. `mpr_intersect`/`mpr_penetration` re-measured BEFORE being touched, which changed the answer — they were still running the pre-2.9.0 containment test. A FOURTH non-reproducing measurement (the "36%" claim, actually ~28% and distribution-dependent) corrected across four files. Toolchain 6.5.8 → 6.5.9. 3351 |
 | 2.9.0 | 2026-08-05 | 21,094 | 35 | **A narrowphase a physics engine can build on.** All five exit criteria met. Scoped as the narrowphase repair, which had already shipped in 2.8.3 — the real content was the tail that mechanisms exposed: `tests/abuse.tcyr` found **11 defects on public entry points** (`cqr_decompose` overran `out_R` while returning `HSB_ERR_NONE`); a disposition column caught `sequential_impulse` marked FIXED when the friction impulse was identically zero at every mu; a 54-mutation sweep on the integrated tree found the delaunay ghost-direction invariant had **zero** assertions. `gjk_intersect_3d` stopped missing 134 genuine interior overlaps (+55% no-hit cost, stated). Struct-layout contract set. The audit's entire low tier, 5 of 5, had never been scheduled. 1818 → 3294 |
 | 2.8.4 | 2026-08-05 | 20,778 | 35 | DCT/DST dispatch heuristic. The 23x `num_dst_1024` gap was **not a defect**: 1.6x is DST-I's irreducible 2(n+1) DFT and 14.6x is that n = 1024 makes that extension non-power-of-two. Sibling sizes added to the bench so the parity cliff is visible. The real defect was `_numx_use_fft` billing DST-I for post-processing transcendentals it never evaluates — four sizes dispatched to the slower path. |

@@ -15,7 +15,7 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 | **Core** | f64_util, error | f64 helpers the stdlib does not carry; the `HSB_ERR_*` code set every fallible entry point returns |
 | **Foundation** | vec2, vec3, vec4, quat, mat3, mat4 | Vector/matrix/quaternion types (f64, heap-allocated; SIMD `f64v_*` hot paths) |
 | **Transforms** | transforms, color | 2D/3D affine transforms, projections, slerp/lerp, Euler angles, sRGB/HSV/HSL/Oklab, Porter-Duff compositing (8 ops), tone mapping (Reinhard, ACES), SH L2, EV/exposure |
-| **Geometry** | geo, geo_advanced, spatial | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, SDF+CSG, swept-AABB/TOI, conformal geometric algebra (5D CGA); spatial structures (BVH, k-d tree, octree, quadtree, spatial hash) |
+| **Geometry** | geo, geo_advanced, geo_diff, spatial | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, SDF+CSG, swept-AABB/TOI, conformal geometric algebra (5D CGA); spatial structures (BVH, k-d tree, octree, quadtree, spatial hash); differentiable ray/surface intersection — plane, sphere and triangle jets returning the full gradient from one evaluation |
 | **Collision** | collision_core, collision_mesh | MPR/XenoCollide narrowphase, sequential-impulse contact solver, convex hull 2D (monotone chain), polygon triangulation (ear clipping), Delaunay (Bowyer-Watson), half-edge mesh, island detection (union-find) |
 | **Calculus** | calc, calc_ext, noise_simplex | Differentiation, integration (Simpson, Gauss-Legendre, adaptive), Bezier/Catmull-Rom/B-spline/NURBS/Hermite TCB/monotone cubic, easing, Perlin 2D+3D, simplex noise, gradient/Jacobian/Hessian |
 | **Numerical** | num, ode, optimize, linalg_ext, linalg_precision, num_ext | Root finding, FFT/DST/DCT/2D-FFT, ODE (RK4, DOPRI45, BDF, symplectic, SDE), optimization (GD, CG, BFGS, L-BFGS, LM), sparse CSR, GMRES, PGS/LCP, SVD, eigendecomposition, compensated/high-precision linalg, number theory (primes, factorize, CRT, totient, Mobius), PCG32, Halton/Sobol, tridiagonal solver |
@@ -46,14 +46,14 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "f
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.9.3"
-modules = ["dist/hisab.cyr"]   # ~798 KB self-contained bundle (all 34 modules)
+tag     = "2.10.0"
+modules = ["dist/hisab.cyr"]   # ~798 KB self-contained bundle (all 35 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
 # pulls in hisab's own 15 stdlib leaves, so the `stdlib` list above only has to
 # name what *your* code uses.
 # Or pull individual files for a smaller compilation unit. The per-module include
 # sets are tabulated in docs/architecture/overview.md -- derived from the source
-# and verified by compiling each of the 34 modules against exactly its listed set.
+# and verified by compiling each of the 35 modules against exactly its listed set.
 # The example below needs vec2/vec4 even though it never names them:
 # modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec2.cyr", "src/vec3.cyr", ...]
 ```
@@ -107,7 +107,7 @@ cyrius test tests/modules.tcyr      # 1621 module tests
 cyrius test tests/edge_cases.tcyr   # 233 edge case tests
 cyrius test tests/abuse.tcyr        # 732 abuse tests (negative indices, zero/huge
                                     #   dimensions, non-conformable operands, canaries)
-cyrius bench tests/hisab.bcyr       # 60 benchmarks
+cyrius bench tests/hisab.bcyr       # 64 benchmarks
 ```
 
 ## Architecture
@@ -118,10 +118,10 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.9.3 |
-| Library | 34 modules, ~21,512 lines of Cyrius |
-| Tests | 3376 assertions across 5 suites |
-| Benchmarks | 60 operations |
+| Version | 2.10.0 |
+| Library | 35 modules, ~21,855 lines of Cyrius |
+| Tests | 3398 assertions across 5 suites |
+| Benchmarks | 64 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~214 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.5.17 |

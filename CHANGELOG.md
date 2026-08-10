@@ -1,6 +1,25 @@
 # Changelog
 
-## [Unreleased] — 2.10.0 in progress
+## [Unreleased]
+
+## [2.10.0] - 2026-08-10 — differentiable geometry, and the primal defect it found first
+
+The roadmap's first genuine feature line since 2.8.x: **autodiff through ray–surface intersection**,
+so consumers can optimise *through* geometry rather than around it. `src/geo_diff.cyr` ships jets for
+plane, sphere and triangle — the full gradient from one evaluation, allocation-free, as a post-pass
+on the shipped primal. Suite **3376 → 3398**, benchmarks **60 → 64**, 34 → **35** `[lib]` modules,
+toolchain 6.5.16 → **6.5.17**. All gates green.
+
+**Read the order of events before the list.** No autodiff code was written until the design's own
+correctness check had been run against the *existing* primitives — and it failed. `geo_ray_sphere`
+was not degree −1 homogeneous in the ray direction, so it returned a `t` whose hit point was not on
+the sphere, and `geo_ray_capsule` inherited it. **That is a silent wrong answer in shipped geometry,
+found by a check written to validate a feature that did not exist yet.** The jets could not have
+been correct on top of it: the analytic `dt/dd` is derived from an implicit-function argument that
+assumes exactly the homogeneity the primal broke.
+
+The same pass found the benchmark harness measuring `clock_gettime` rather than geometry on 17 of 60
+rows — which is the only reason the repair's +17.6% cost was visible at all.
 
 ### Added
 
@@ -41,9 +60,36 @@
   per-primitive accessors that check a `kind` tag, so reading a sphere's radius slot off a plane jet
   returns the error sentinel instead of that plane's distance derivative.
 
-  Scope is deliberately the smooth seam: plane and sphere. Triangle follows; `aabb`/`obb`/`capsule`
-  select their hit through `f64_max`/`f64_min` at 12 sites and need a `_core` refactor of shipped
-  `geo.cyr`, which is not worth risking under 3392 assertions for a first bite.
+- **`geo_jet_triangle` — 15 partials from one intersection.** `dt/d(origin)`, `dt/d(direction)` and
+  all three vertex gradients. The surface is the triangle's plane, so the barycentric bounds decide
+  only *whether* there is a hit, not where — they contribute nothing to the interior derivative, and
+  on the boundary `t` is not differentiable at all, which the primal's miss return already expresses.
+  Both `n` and the constant term depend on the vertices, so with `w = p − v0` and `den = n·d`:
+  `dt/dv0 = −[(e1−e2)×w − n]/den`, `dt/dv1 = −[e2×w]/den`, `dt/dv2 = −[w×e1]/den`. Verified against
+  FD over 382 accepted configurations, worst residual **9.6e-10**. **Four mutants caught**: swapping
+  `dv1`/`dv2`, dropping `dv0`'s `−n` term, reversing a cross product, and writing `e2−e1` for `e1−e2`.
+
+  ⚠ The translation identity `dt/dv0 + dt/dv1 + dt/dv2 == −dt/do` **holds for any shared error in
+  those three expressions** — the cross terms cancel algebraically to `n/den` — so it is asserted as
+  a smoke test with that stated inline, and finite differences remain the real oracle. Recorded
+  because it is exactly the kind of invariant that reads as strong verification and is not.
+
+  **This completes 2.10.0's scoped smooth seam.** Costs, all `bench_batch`:
+
+  | | primal | jet | ratio | partials |
+  |---|--:|--:|--:|--:|
+  | sphere | 93 ns | **335 ns** | 3.6× | 7 |
+  | triangle | 280 ns | **934 ns** | 3.3× | 15 |
+  | plane | — | **227 ns** | — | 7 |
+
+  The triangle is the case that justifies the whole approach: forward-mode duals would need **15
+  evaluations** for 15 partials — ~4,200 ns before counting a single allocation — against 934 ns for
+  one jet. **4.5× faster and allocation-free**, which is the measured form of the argument the design
+  made on paper.
+
+  `aabb`/`obb`/`capsule` remain deferred: all three select their hit through `f64_max`/`f64_min` at
+  12 sites and need a `_core(ray, shape, out)` split of shipped `geo.cyr` before a jet can hook the
+  selected branch — not worth risking under 3398 assertions here.
 
 ### Fixed
 

@@ -7,6 +7,15 @@
 **Hisab workaround:** Use `CYRIUS_VERBOSE=1` (env var) instead of unrecognized CLI flags. Don't pass any unknown flag before a subcommand.
 **Status:** Open. cc5 5.7.7's atomic-output fix prevents destruction on compile *failure*, but a misparsed-but-successful invocation still nukes the file.
 
+**2026-08-09 (v2.9.2, cycc 6.5.16) — deliberately NOT re-tested.** The reproducer is destructive by
+construction: it works by getting cyrius to treat a real source path as the compiler's *output*
+slot, so running it inside this tree would truncate whichever `src/*.cyr` it names to 0 bytes, and
+the loss is silent until a later command reports `cannot read file`. Every other toolchain filing was
+re-verified at this bump; this one is recorded as unverified rather than assumed-still-live, which
+is the honest state. The only safe observation available — `cyrius -v` with **no path arguments** —
+still exits 0 and prints the usage banner rather than rejecting the unknown flag, so the top-level
+parser has not gained the strict-flag check that would fix this. That is suggestive, not proof.
+
 ## Symptom
 
 `cyrius -v build src/main.cyr build/foo` is parsed as:

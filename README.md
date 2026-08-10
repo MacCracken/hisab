@@ -12,6 +12,7 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 
 | Module | Files | Description |
 |--------|-------|-------------|
+| **Core** | f64_util, error | f64 helpers the stdlib does not carry; the `HSB_ERR_*` code set every fallible entry point returns |
 | **Foundation** | vec2, vec3, vec4, quat, mat3, mat4 | Vector/matrix/quaternion types (f64, heap-allocated; SIMD `f64v_*` hot paths) |
 | **Transforms** | transforms, color | 2D/3D affine transforms, projections, slerp/lerp, Euler angles, sRGB/HSV/HSL/Oklab, Porter-Duff compositing (8 ops), tone mapping (Reinhard, ACES), SH L2, EV/exposure |
 | **Geometry** | geo, geo_advanced, spatial | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, SDF+CSG, swept-AABB/TOI, conformal geometric algebra (5D CGA); spatial structures (BVH, k-d tree, octree, quadtree, spatial hash) |
@@ -34,7 +35,7 @@ For expression evaluation and unit conversion, see [abaco](https://github.com/Ma
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "6.5.6"
+cyrius      = "6.5.16"
 
 [deps]
 # `ganita` (Cyrius 6.2.x) provides the transcendentals (acos/asin/atan2/pow/
@@ -45,8 +46,11 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "f
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.6.15"
-modules = ["dist/hisab.cyr"]   # ~578 KB self-contained bundle (all 34 modules)
+tag     = "2.9.2"
+modules = ["dist/hisab.cyr"]   # ~786 KB self-contained bundle (all 34 modules)
+# `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
+# pulls in hisab's own 15 stdlib leaves, so the `stdlib` list above only has to
+# name what *your* code uses.
 # Or pull individual files for a smaller compilation unit. The per-module include
 # sets are tabulated in docs/architecture/overview.md -- derived from the source
 # and verified by compiling each of the 34 modules against exactly its listed set.
@@ -97,11 +101,13 @@ num_newton(&f, &df, F64_ONE, EPSILON_F64, 100, root);
 
 ```sh
 cyrius build src/main.cyr build/hisab
-cyrius test tests/hisab.tcyr        # 205 smoke tests
-cyrius test tests/foundation.tcyr   # 307 foundation tests
-cyrius test tests/modules.tcyr      # 416 module tests
-cyrius test tests/edge_cases.tcyr   # 199 edge case tests
-cyrius bench tests/hisab.bcyr       # 28 benchmarks
+cyrius test tests/hisab.tcyr        # 416 smoke tests
+cyrius test tests/foundation.tcyr   # 349 foundation tests
+cyrius test tests/modules.tcyr      # 1621 module tests
+cyrius test tests/edge_cases.tcyr   # 233 edge case tests
+cyrius test tests/abuse.tcyr        # 732 abuse tests (negative indices, zero/huge
+                                    #   dimensions, non-conformable operands, canaries)
+cyrius bench tests/hisab.bcyr       # 55 benchmarks
 ```
 
 ## Architecture
@@ -112,15 +118,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.6.15 |
-| Library | 34 modules, ~16,900 lines of Cyrius |
-| Tests | 1127 assertions across 4 suites |
-| Benchmarks | 28 operations |
+| Version | 2.9.2 |
+| Library | 34 modules, ~21,262 lines of Cyrius |
+| Tests | 3351 assertions across 5 suites |
+| Benchmarks | 55 operations |
 | Fuzz targets | 5 with invariant checks |
-| CLI binary | ~207 KB static ELF (`build/hisab` — version smoke test only) |
-| Toolchain | Cyrius 6.5.6 |
-| Dependencies | 1 (sakshi 2.4.7); no third-party, no FFI/libc |
-| Security | P(-1) audited (2026-04-15) + security/hardening pass (2026-05-29); no known vulnerabilities |
+| CLI binary | ~214 KB static ELF (`build/hisab` — version smoke test only) |
+| Toolchain | Cyrius 6.5.16 |
+| Dependencies | 1 (sakshi 2.4.10); no third-party, no FFI/libc |
+| Security | P(-1) audit (2026-04-15) + hardening pass (2026-05-29); [2026-08-03](docs/audit/2026-08-03.md) sweep (70 findings, 2 critical) discharged in 2.6.12–2.6.15; [2026-08-04](docs/audit/2026-08-04.md) re-audit (42 confirmed, 0 critical) discharged in 2.7.0; [2026-08-04 v2.8.0 full sweep](docs/audit/2026-08-04-v2.8.0-full.md) (42 confirmed, 4 critical) **42 FIXED / 0 OPEN** as of 2.9.1; `tests/abuse.tcyr` (2.9.0) found 11 defects on public entry points, all fixed. 10 open findings — 4 upstream toolchain, the rest precision and performance — tracked in [docs/development/issues/](docs/development/issues/) |
 
 ## License
 

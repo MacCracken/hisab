@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius) 6.5.6 (`cyrius.cyml [package].cyrius` pins the exact version — match it, don't hardcode elsewhere)
+- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.5.16 as of 2.9.2. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work
@@ -21,11 +21,13 @@ Thank you for your interest in contributing to Hisab.
 # Build
 cyrius build src/main.cyr build/hisab
 
-# Run all tests
+# Run all five suites (3351 assertions). CI runs every tests/*.tcyr — running
+# fewer than five locally skips a whole surface, not a handful of cases.
 cyrius test tests/hisab.tcyr
 cyrius test tests/foundation.tcyr
 cyrius test tests/modules.tcyr
 cyrius test tests/edge_cases.tcyr
+cyrius test tests/abuse.tcyr
 
 # Run benchmarks
 cyrius bench tests/hisab.bcyr
@@ -41,11 +43,27 @@ cyrius fmt src/main.cyr --check
 # after seven mis-transcribed constant tables shipped). Run after touching any constant.
 ./scripts/check-constants.sh
 
+# Every measurement-shaped claim your branch ADDS to a comment must name where the
+# number came from (`[measured: …]`). CI gates this on pull requests only, over the
+# diff against the base branch — pass the branch you forked from.
+./scripts/check-measurements.sh --diff origin/main
+
 # Vet include dependencies
 cyrius vet src/main.cyr
 
-# Regenerate the distlib bundle (CI fails on drift; required after any src/ or [lib] change)
+# Regenerate the distlib bundle (CI fails on drift; required after any src/ or [lib] change).
+# ⚠ On cyrius >= 6.5.14 this exits 1 with "does not compile" + "undefined variable" even when
+# the bundle is good: distlib's new self-check compiles the bundle ALONE, and `_cc_allow_undef`
+# downgrades undefined FUNCTIONS but not undefined global VARIABLES — hisab's bundle reads
+# stdlib constants (F64_ONE) a consumer supplies via `[deps].stdlib`. The bundle is written
+# before that check runs, so regeneration and drift detection are unaffected; CI tolerates
+# exactly that signature and nothing else. See
+# docs/development/issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md
 cyrius distlib
+
+# What that self-check should have been: compile the bundle with the stdlib in scope, the
+# way a consumer actually builds it
+cyrius check --with-deps dist/hisab.cyr
 ```
 
 ## Adding a Module
@@ -56,7 +74,7 @@ Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never 
 2. Add it to the `[lib] modules` list in `cyrius.cyml` (this is what the distlib bundle pulls in)
 3. Add tests to the appropriate `.tcyr` file or create a new one
 4. Update the README module table, `docs/architecture/overview.md`, and `docs/doc-health.md`
-5. Run `cyrius distlib` to regenerate `dist/hisab.cyr`
+5. Run `cyrius distlib` to regenerate `dist/hisab.cyr` **and** `dist/hisab.deps` (the stdlib-leaf sidecar a consumer's `cyrius deps` reads — tracked since 2.9.2), and commit both; CI checks each for drift
 
 ## Code Style
 
@@ -76,6 +94,7 @@ Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never 
 - Foundation tests in `tests/foundation.tcyr` (Vec/Quat/Mat exhaustive)
 - Module tests in `tests/modules.tcyr` (per-module coverage)
 - Edge cases in `tests/edge_cases.tcyr` (boundary conditions, error paths)
+- Abuse tests in `tests/abuse.tcyr` (hostile input: negative indices and counts, zero/huge dimensions, non-conformable operands, the designed-0 handle every capped constructor returns, degenerate geometry, and canary blocks allocated after an out-buffer so a write past the end fails a test instead of passing by luck). Not about numerical answers — those belong in the suites above
 - Define all helper functions **before** `alloc_init()` to avoid compiler issues
 - Target: test every public function with at least one happy-path and one edge case
 

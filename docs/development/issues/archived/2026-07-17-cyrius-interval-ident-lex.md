@@ -28,6 +28,27 @@ SIMD intrinsic — so the in-tree workaround (`iv_sum`/`iv_diff`/`iv_prod` in `t
 stays and needs no revert. Kept unarchived only until someone confirms no other reserved name
 still produces the old wording.
 
+**Status:** 🟢 **CLOSED — ARCHIVED 2026-08-09 (v2.9.2), on cycc 6.5.16.** The close condition above
+was discharged exhaustively rather than by sampling. The authoritative reserved-name table is
+`TOKNAME_BUILTIN` at `cyrius/src/common/util.cyr:909-978` — **67 distinct names** spanning
+`syscall`, `load*`/`store*`, `f64_*`, `f64v_*`/`f32v_*`/`f32v8_*`, `iv_*`, `union`, `defer`,
+`secret`, `async`, `await`, `u128`, `bitget`/`bitset`/`bitclr`, `ret2`, `rethi`. Each was compiled
+as `var <name> = 1;`:
+
+```
+--- new-wording=67  old-wording=0  usable-as-var=0  other=0 ---
+```
+
+**67 of 67 emit the new wording; none emits `got unknown`; none is usable as a variable.** No
+reserved name still produces the old message, so nothing remains to keep this open.
+
+⚠ **The reservation itself is unchanged and is not a defect** — `iv_add`/`iv_sub`/`iv_mul` (and
+`iv_dp8`) are still reserved on 6.5.16, at file scope and inside a fn body; `iv_div` is still usable
+because there is no integer-vector divide instruction. **The `iv_sum`/`iv_diff`/`iv_prod` rename in
+`tests/modules.tcyr` is load-bearing and must not be reverted.** The guarding NOTE at that site was
+updated in 2.9.2 to quote the current diagnostic — it had gone on quoting the old one, which would
+have led a future reader to conclude the note was obsolete.
+
 ## Symptom
 
 Declaring a variable named `iv_add`, `iv_sub`, or `iv_mul` fails at compile time with

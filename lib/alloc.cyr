@@ -588,23 +588,37 @@ fn allocator_state(a): i64      { return load64(a + 32); }
 # ---- dispatch helpers ----
 
 # alloc(size) via vtable
+# ⚡ v6.5.10: the two accessor loads are INLINED. `allocator_alloc_fn(a)` and
+# `allocator_state(a)` are each a real CALL — cyrius does not inline — to perform one
+# `load64`, and they sit on the hottest path the `_a` convention has. Measured on 6.5.9:
+# `alloc_via` cost 15.1 ns of which **5.1 ns was those two calls**, against ~6.0 ns for
+# the arena bump itself. `allocator_new` fixes this layout, so reading it directly here
+# is exactly as safe as calling the accessors — which remain, as public API.
+# The tax compounds: agnosai measured 112 allocations on one route (32 % of the request),
+# and the more faithfully a consumer threads its allocator the more it pays. Filed
+# 2026-08-07. The accessors are NOT removed — only this hot path stops calling them.
 fn alloc_via(a, size): i64 {
-    return fncall2(allocator_alloc_fn(a), allocator_state(a), size);
+    return fncall2(load64(a), load64(a + 32), size);
 }
 
 # realloc(old_ptr, old_size, new_size) via vtable
+# Same inlining as alloc_via — identical shape, same two calls removed. v6.5.10.
 fn realloc_via(a, old_ptr, old_size, new_size): i64 {
-    return fncall4(allocator_realloc_fn(a), allocator_state(a), old_ptr, old_size, new_size);
+    return fncall4(load64(a + 8), load64(a + 32), old_ptr, old_size, new_size);
 }
 
 # free(ptr) via vtable. Bump + arena impls treat as a no-op.
+# Same inlining as alloc_via. v6.5.10.
 fn free_via(a, ptr): i64 {
-    return fncall2(allocator_free_fn(a), allocator_state(a), ptr);
+    return fncall2(load64(a + 16), load64(a + 32), ptr);
 }
 
 # reset() via vtable
+# Same inlining as alloc_via. ⚠ Hotter than it looks: a request loop calls this once per
+# request, but every `_a` benchmark's INNER loop calls it too, so a measurement of `_a`
+# allocation is partly a measurement of this. v6.5.10.
 fn reset_via(a): i64 {
-    return fncall1(allocator_reset_fn(a), allocator_state(a));
+    return fncall1(load64(a + 24), load64(a + 32));
 }
 
 # ---- shared helpers ----
@@ -703,10 +717,6 @@ fn bump_allocator(): i64 {
 # the global bump; freeing the Allocator's `state` pointer is not
 # meaningful (no individual free on the global bump either).
 
-fn _arena_alloc(state, size): i64 {
-    return arena_alloc(state, size);
-}
-
 fn _arena_realloc(state, old_ptr, old_size, new_size): i64 {
     var new_ptr = arena_alloc(state, new_size);
     if (new_ptr == 0) { return 0; }
@@ -722,10 +732,6 @@ fn _arena_realloc(state, old_ptr, old_size, new_size): i64 {
     return new_ptr;
 }
 
-fn _arena_reset(state): i64 {
-    return arena_reset(state);
-}
-
 # Construct an Allocator that wraps a fresh arena of the given
 # capacity (bytes). The arena is itself allocated from the global
 # bump. reset_via on the result clears only THIS allocator's
@@ -734,7 +740,7 @@ fn _arena_reset(state): i64 {
 fn arena_allocator(capacity): i64 {
     var arena = arena_new(capacity);
     if (arena == 0) { return 0; }
-    return allocator_new(&_arena_alloc, &_arena_realloc, &_alloc_free_noop, &_arena_reset, arena);
+    return allocator_new(&arena_alloc, &_arena_realloc, &_alloc_free_noop, &arena_reset, arena);
 }
 
 # v6.5.9: the allocator-interface form of arena_new_growable. This is the one a route
@@ -744,7 +750,7 @@ fn arena_allocator(capacity): i64 {
 fn arena_allocator_growable(initial): i64 {
     var arena = arena_new_growable(initial);
     if (arena == 0) { return 0; }
-    return allocator_new(&_arena_alloc, &_arena_realloc, &_alloc_free_noop, &_arena_reset, arena);
+    return allocator_new(&arena_alloc, &_arena_realloc, &_alloc_free_noop, &arena_reset, arena);
 }
 
 # v6.5.9: set the exhaustion policy on an allocator built by arena_allocator*.

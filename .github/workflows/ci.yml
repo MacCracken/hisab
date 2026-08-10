@@ -107,14 +107,51 @@ jobs:
         # modules list. Fails CI if the committed bundle drifts from
         # what the current lib/ would produce — run `cyrius distlib`
         # locally and commit the result before pushing.
+        #
+        # ⚠ cyrius 6.5.14 added a bundle self-check to `distlib` that compiles
+        # the bundle ALONE, with `_cc_allow_undef` downgrading undefined
+        # FUNCTIONS — but not undefined global VARIABLES. hisab's bundle
+        # legitimately reads stdlib constants (`F64_ONE`, …) that a consumer
+        # supplies via `[deps].stdlib`, so from 6.5.14 on `distlib` exits 1 on a
+        # perfectly good bundle. It still WRITES the bundle before running that
+        # check, so regeneration and drift detection are unaffected — only the
+        # exit code is wrong. See
+        # docs/development/issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md
+        #
+        # The failure is tolerated ONLY when it carries that exact signature; any
+        # other distlib failure still fails the job. And the coverage the broken
+        # self-check was meant to provide is replaced below by a STRONGER check —
+        # `cyrius check --with-deps`, which compiles the bundle with the stdlib
+        # actually in scope, i.e. the way a consumer builds it.
         run: |
-          cyrius distlib
-          if ! git diff --quiet dist/hisab.cyr; then
-            echo "ERROR: dist/hisab.cyr is stale. Run 'cyrius distlib' and commit."
-            git --no-pager diff dist/hisab.cyr | head -40
+          set +e
+          out=$(cyrius distlib 2>&1); rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            if echo "$out" | grep -q 'does not compile' && echo "$out" | grep -q 'undefined variable'; then
+              echo "::notice::distlib self-check false positive (cyrius >= 6.5.14) — tolerated; see the issue filing"
+            else
+              echo "ERROR: cyrius distlib failed for a reason other than the known self-check defect"
+              exit 1
+            fi
+          fi
+          # Both artifacts, not just the bundle. `dist/hisab.deps` is the leaf
+          # sidecar a consumer's `cyrius deps` reads to auto-resolve hisab's
+          # stdlib leaves; it is tracked as of 2.9.2, so it can drift too.
+          if ! git diff --quiet dist/hisab.cyr dist/hisab.deps; then
+            echo "ERROR: dist/ is stale. Run 'cyrius distlib' and commit."
+            git --no-pager diff dist/hisab.cyr dist/hisab.deps | head -40
             exit 1
           fi
-          echo "dist/hisab.cyr matches lib/"
+          echo "dist/hisab.cyr + dist/hisab.deps match lib/"
+
+      - name: Bundle compiles as a consumer builds it
+        # The half of the distlib self-check that is worth having, done right:
+        # the bundle is compiled WITH the manifest's stdlib resolved, which is
+        # exactly how a consumer includes it. Strictly stronger than compiling
+        # it alone and pretending every undefined symbol is expected.
+        run: cyrius check --with-deps dist/hisab.cyr
 
       - name: Build
         run: |
@@ -203,7 +240,29 @@ jobs:
           # template is intact (matches abaco) before checking the changelog.
           grep -qF 'version = "${file:VERSION}"' cyrius.cyml \
             || { echo "FAIL: cyrius.cyml version is not \${file:VERSION}"; exit 1; }
-          grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in CHANGELOG.md"; exit 1; }
+          # Anchored to the Keep a Changelog header, and FIXED-string, on
+          # purpose. This was `grep -q "$VERSION" CHANGELOG.md` — unanchored and
+          # unescaped, so the dots were regex wildcards and `2.9.2` matched the
+          # `32,942,104 B` in an unrelated benchmark line at CHANGELOG.md:498.
+          # The gate passed VACUOUSLY: it would have gone green on a release
+          # whose CHANGELOG section was never written. Same failure mode the
+          # `fetch-depth: 0` comment in the measurements job warns about.
+          grep -qF -- "## [$VERSION]" CHANGELOG.md \
+            || { echo "FAIL: CHANGELOG.md has no '## [$VERSION]' section header"; exit 1; }
+          # src/main.cyr hardcodes the string the CLI prints. It is the one
+          # version site ${file:VERSION} cannot reach — Cyrius has no build-time
+          # string interpolation — so it is a manual edit on every bump and was
+          # gated by nothing. Same class as the constant gate: a claim stated in
+          # committed text that no gate compared to its source of truth. Added
+          # 2.9.2, after the 2.9.1 → 2.9.2 bump left it reading "hisab 2.9.1".
+          grep -qF "\"hisab $VERSION\"" src/main.cyr \
+            || { echo "FAIL: src/main.cyr does not print \"hisab $VERSION\""; \
+                 grep -n 'println("hisab' src/main.cyr; exit 1; }
+          # And the bundle header, which `cyrius distlib` stamps from VERSION —
+          # a stale header means the bundle was not regenerated after the bump.
+          grep -qF "# Version: $VERSION" dist/hisab.cyr \
+            || { echo "FAIL: dist/hisab.cyr header is not $VERSION — run 'cyrius distlib'"; \
+                 head -3 dist/hisab.cyr; exit 1; }
           echo "Version consistent (manifest pulls VERSION via \${file:VERSION})"
 
   security:

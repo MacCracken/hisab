@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.5.9**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
+> Written in Cyrius. Toolchain: **6.5.16**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
 
 ## Scope
 
@@ -11,17 +11,22 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.9.1
+## Current — v2.9.2
 
-Suite **3351** across five harnesses, constant gate **153/153**, toolchain **6.5.9**, sakshi
-**2.4.8**. All gates green: `lint` 0 warnings, `fmt --check` clean across `.cyr`/`.tcyr`/`.bcyr`/
-`.fcyr`/examples, `vet` 2 deps / 0 untrusted, `fuzz` 1/0, distlib in sync.
+Suite **3351** across five harnesses (hisab 416, foundation 349, modules 1621, edge_cases 233,
+abuse 732), constant gate **153/153**, toolchain **6.5.16**, sakshi **2.4.10**. All gates green:
+`lint` 0 warnings and `fmt <file> --check` 0 drift across all 43 sources, `vet` 2 deps / 0 untrusted
+/ 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 588/591 functions (99%) over 35/35 files,
+distlib in sync.
 
 **2.9.0** delivered the narrowphase release — but read its section for what that actually means: the
 capability shipped early in 2.8.3, and 2.9.0's real content was the tail that only became visible
 once there were mechanisms to see it (an abuse harness, a finding-disposition column, a mutation
 sweep on the integrated tree). **2.9.1** cleared the deferred tier: four latent predicate defects in
-the ghost in-circle family, one of which was wrong on ordinary reachable input.
+the ghost in-circle family, one of which was wrong on ordinary reachable input. **2.9.2** is a
+maintenance release — toolchain 6.5.9 → 6.5.16, sakshi 2.4.8 → 2.4.10, **no library source change**,
+the `dist/hisab.cyr` diff is the version header alone — and it is on this page for what the bump
+surfaced, not for the bump.
 
 **The standing lesson from this arc, stated once here so it is not rediscovered:** every defect of
 consequence was cheap to find and invisible because nothing looked. The friction impulse had been
@@ -30,10 +35,18 @@ fixture used friction = 0. The delaunay ghost-direction invariant — the proper
 rebuilt around — had zero assertions. `cqr_decompose` overran its output buffer while returning a
 success code. None needed cleverness; they needed something that looked.
 
+**2.9.2 extended that lesson from the code to the gates.** Three of them were green while checking
+nothing, and not one was found by a test failing: CI's version-consistency gate ran an unanchored
+`grep -q "$VERSION" CHANGELOG.md`, and `2.9.2` matched `32,942,104 B` in a benchmark line, so a
+release whose CHANGELOG section was never written would have passed; `src/main.cyr`'s hardcoded CLI
+version string was compared against nothing; and `scripts/bench-history.sh` recorded the **max** of
+each benchmark rather than the average, in every row it has ever written.
+
 **FOUR separate measurements stated in committed text did not reproduce** during this arc, each
 caught by an adversarial reader rather than a gate, and two had already propagated into three or
-four files. `scripts/check-measurements.sh` exists to close that class and is **not yet enabled** —
-see 2.9.2.
+four files. `scripts/check-measurements.sh` closes that class and **is enabled** — it landed in
+`ci.yml` on 2026-08-06 (`b7b229f`), pull-request-only and scoped to the claims a branch *adds*, with
+a second step gating detector recall. What is not settled is whether to keep it — see 2.9.3.
 
 ## 2.6.12–2.6.15 -- Audit & repair arc  **CLOSED**
 
@@ -75,7 +88,8 @@ appear on this page at all.
 |---|---|---|
 | ~~2.9.0~~ | A narrowphase a physics engine can build on | **RELEASED 2026-08-05** |
 | ~~2.9.1~~ | The deferred tier — latent predicate defects | **RELEASED 2026-08-06** |
-| **2.9.2** | EPA certification + the measurement gate decision | — |
+| ~~2.9.2~~ | The toolchain bump, and three gates that were not gating | **RELEASED 2026-08-09** |
+| **2.9.3** | EPA certification + the measurement-gate decision | 2.9.2 |
 | **2.10.0** | Differentiable geometry (autodiff through intersections) | 2.9.x |
 | **2.11.0** | Reverse-mode autodiff (tape-based) | 2.10.0 |
 | **3.0.0** | `Result<T,E>` API — breaking | 2.11.0 feature-complete |
@@ -111,9 +125,39 @@ Everything 2.9.0 found and consciously left. Suite 3294 → **3351**, toolchain 
 > 2.9.0 had repaired one call site of that logic and left two. `_col_in_circumcircle` re-measured
 > at 0 wrong of 1,528,820 and deliberately left alone.
 
-## 2.9.2 — what 2.9.1 left, and why
+## 2.9.2 — the toolchain bump, and three gates that were not gating  **RELEASED 2026-08-09**
 
-Three items, each with a stated reason for not being done sooner rather than a shrug.
+Toolchain 6.5.9 → **6.5.16** (seven releases) and sakshi 2.4.8 → **2.4.10**. No library source
+change — the `dist/hisab.cyr` diff is the version header alone and the suite holds at 3351. Ten
+vendored stdlib files moved (`alloc`, `args`, `fnptr`, `io`, `sakshi`, `tagged`, four `syscalls_*`
+platform variants) plus the transitive `result.cyr`; all 30 byte-match the 6.5.16 snapshot,
+`deps --verify` 30/30.
+
+> The bump was uneventful; what it surfaced was not. Crossing **6.5.14** turned `cyrius distlib` red
+> on a correct bundle — the new self-check compiles the bundle alone under `_cc_allow_undef`, which
+> suppresses undefined *functions* and cannot reach an undefined *name* because those hard-exit in
+> the frontend, and hisab's bundle legitimately reads the stdlib constant `F64_ONE`. Both `ci.yml`
+> and `release.yml` were RED; they now tolerate exactly that signature and add
+> `cyrius check --with-deps dist/hisab.cyr`, which is the stronger check the broken one was reaching
+> for ([filed](issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md)). Chasing it
+> reached the benchmark harness, where `scripts/bench-history.sh` took "the last `<num><unit>` in the
+> line" from a format that ends in `max=`, so **44 of 55** rows — every row it has ever written —
+> track the max rather than the average. The parser now anchors on the harness's named fields and the
+> CSV carries `stat`/`avg_ns`/`min_ns`/`max_ns`/`iters`; `benchmarks.md` compares only rows sharing
+> the newest run's `stat`, at ±10% rather than ±3%, because ±3% sits below the measured noise floor
+> (same binary, three back-to-back runs: avg spread median **3.5%**, worst 6.9%, 0 of 55 above 20% —
+> against −93%..+742% swings on the max-based rows). **No performance claim is made in 2.9.2**; it
+> establishes the first correct baseline, and the next release is the first that can compare against
+> it. Also landed: `version-bump.sh` now rewrites `src/main.cyr`'s version string and CI asserts it
+> and the bundle header against `VERSION`, and `dist/hisab.deps` is tracked so a consumer's
+> `cyrius deps` auto-resolves hisab's 15 stdlib leaves.
+
+## 2.9.3 — what 2.9.1 and 2.9.2 left, and why
+
+Three items, each with a stated reason for not being done sooner rather than a shrug. They stay in
+the 2.9.x line rather than folding into 2.10.0: certification changes the value returned on every
+overlapping pair, and 2.10.0 differentiates *through* those same intersection routines, so it wants
+a settled narrowphase underneath it rather than a concurrent one.
 
 - [ ] **The EPA certified exit is never taken.** Measured 0 of 24 overlaps across boxes and spheres;
       `strict` is the sole blocker (removing it alone takes the fallback count 12 → 0). It tests the
@@ -123,23 +167,42 @@ Three items, each with a stated reason for not being done sooner rather than a s
       which value is returned on every overlapping pair, so it needs the 862-configuration exact-MTV
       harness and a benchmark, not a patch release.
       → [`issues/2026-08-06-epa-certificate-tests-the-seed-not-the-polytope.md`](issues/2026-08-06-epa-certificate-tests-the-seed-not-the-polytope.md)
-- [ ] **Enable `scripts/check-measurements.sh`, or delete it.** Recall was fixed in 2.9.1 (10/22 →
-      21/22 on a fresh planted corpus, 0/15 decoys) but false positives rose to ~21% paragraph-level,
-      and 519 existing claims carry no marker, so only a **diff-scoped** gate can run. It has already
+- [ ] **Keep `scripts/check-measurements.sh`, or delete it.** The gate itself is no longer the open
+      question: it landed in `ci.yml` on 2026-08-06 (`b7b229f`) as a **pull-request-only** job that
+      checks the claims a branch *adds* (`--diff origin/<base>`, with `fetch-depth: 0` so an
+      unresolvable base fails rather than passing vacuously), plus a `--selftest` step gating
+      detector recall — currently **21/22** on the planted corpus, **0/15** decoys falsely flagged.
+      What is unsettled is whether it earns its place. False positives are ~21% paragraph-level, and
+      a full-tree scan still reports **522** unmarked pre-existing claims across 26 files (287
+      paragraphs), so it cannot be widened past the diff without a marking campaign first. It has
       earned its keep once — it caught the fourth non-reproducing measurement of the arc. The
       decision is whether ~21% FP is tolerable on a gate people must not learn to ignore.
-      **`.github/workflows/ci.yml` is modified and unreviewed; do not land it without reading that diff.**
 - [ ] `_col_dl_ic_g1`/`g3` remain CCW-only at the entry point, by design. Documented, not a defect.
       → [`issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`](issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md)
 
 **Performance, demand-gated** (measured, filed, no consumer blocked): `delaunay_2d`,
 `_kd_partition`, `triangulate_polygon`.
 
-**Toolchain**, tracked upstream, both re-verified STILL LIVE on 6.5.9 (2026-08-06):
-`cyrius-for-empty-clauses` (`for (; c; s)` → `unexpected ';'`) and `cyrius-cli-arg-clobbers-source`.
-`cyrius-interval-ident-lex` is **substantially resolved** — the reservation stands by design, but the
-misleading diagnostic that was the actual complaint is fixed. The `alloc_reset` defect filed this arc
-was fixed upstream in 6.5.8 and archived.
+- [ ] **`einsum` is the only arena consumer in the library and has no benchmark at all.**
+      `src/einsum.cyr` holds every `arena_*` call in `src/` — `arena_new` at `:41`, `arena_reset` at
+      `:42`, and 11 `arena_alloc` calls — and `tests/hisab.bcyr` does not include the module, so none
+      of the 55 benchmarks touches the arena path. Found while separating the 6.5.10 allocator change
+      from the compiler change at the 2.9.2 bump: measuring hisab's exposure to it needed a
+      purpose-built micro-benchmark because nothing in the suite would have shown a regression there.
+      Cheap to close and worth closing before any allocator-adjacent change lands, per the standing
+      rule that a perf change needs a number to move.
+
+**Toolchain**, tracked upstream, all revisited at the 6.5.16 bump (2026-08-09):
+`cyrius-for-empty-clauses` (`for (; c; s)` → `unexpected ';'`) is **still live** in substance — both
+forms still reject — though the misleading-line-number half of the complaint is fixed, so the `while`
+rewrites stay. `cyrius-cli-arg-clobbers-source` was **deliberately not re-tested**: its reproducer
+truncates a real `src/*.cyr` to 0 bytes by construction, so it is recorded as unverified rather than
+assumed-still-live. `cyrius-interval-ident-lex` is **closed and archived** — 67 of 67 reserved names
+emit the new wording, none the old — while the reservation itself stands by design, so the
+`iv_sum`/`iv_diff`/`iv_prod` rename in `tests/modules.tcyr` remains load-bearing. Two new filings
+this release: [`distlib`'s self-check rejecting stdlib globals](issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md),
+worked around in both workflows, and
+[a syntax error inside an uncalled function passing every gate](issues/2026-08-09-cyrius-dead-fn-bodies-are-never-syntax-checked.md).
 
 ## 2.10.0 — differentiable geometry
 
@@ -171,7 +234,7 @@ caller-supplied gradient.
 
 ## 3.0.0 -- Error-handling migration (breaking)
 
-The integer-error-code convention (`lib/error.cyr`: functions return 0 / a
+The integer-error-code convention (`src/error.cyr`: functions return 0 / a
 negative `ERR_*` code) predates the stdlib `Result<T,E>` (`lib/result.cyr`,
 v5.8.28) and `?` propagation (v5.8.29). Migrating is a library-wide signature
 change — breaking for consumers (impetus, kiran, joshua, …) — so it lands as
@@ -242,6 +305,7 @@ answer is a cheaper pre-filter, not reverting the correctness fix.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.9.2 | 2026-08-09 | 21,262 | 35 | **The toolchain bump, and three gates that were not gating.** Toolchain 6.5.9 → **6.5.16** (seven releases) + sakshi 2.4.8 → **2.4.10**. No library source change — the bundle diff is the version header alone; all 30 vendored files byte-match the 6.5.16 snapshot, `deps --verify` 30/30. `scripts/bench-history.sh` recorded the **max** of each benchmark, not the average, in **44 of 55** rows and in every row it has ever written — the parser scavenged the last `<num><unit>` from a line that ends in `max=`. Re-anchored on the harness's named fields, CSV gains `stat`/`avg_ns`/`min_ns`/`max_ns`/`iters`, and `benchmarks.md` compares only same-`stat` rows at ±10% — the measured noise floor is a 3.5% median avg spread over three back-to-back runs of one binary, against −93%..+742% swings on the max rows. **No performance claim in this release**: it is the first correct baseline. CI's version gate was an unanchored `grep` — `2.9.2` matched `32,942,104 B` — and `src/main.cyr`'s hardcoded CLI string was checked by nothing; both now assert against `VERSION`. cyrius 6.5.14's `distlib` self-check rejects any bundle reading a stdlib constant (hisab's reads `F64_ONE`), so `ci.yml` and `release.yml` were both RED; now tolerated by exact signature plus `cyrius check --with-deps`. `dist/hisab.deps` tracked, 15 stdlib leaves. 3351 |
 | 2.9.1 | 2026-08-06 | 21,262 | 35 | **The deferred tier.** Four latent ghost in-circle defects, all found by deriving an exact-rational oracle rather than by a failing test. `_col_dl_ic_g1`'s M^1 tie-break was the only one wrong on REACHABLE CCW input (228 of 463,086) — it vanished whenever the edge was parallel to `u_k` and could not separate "between a and b" from "beyond b"; replaced by a betweenness test. `_col_dl_ic_g2`'s tie branch applied winding twice; `_col_dl_ic_g3` reduced to the constant 1 with two independent proofs. `mpr_intersect`/`mpr_penetration` re-measured BEFORE being touched, which changed the answer — they were still running the pre-2.9.0 containment test. A FOURTH non-reproducing measurement (the "36%" claim, actually ~28% and distribution-dependent) corrected across four files. Toolchain 6.5.8 → 6.5.9. 3351 |
 | 2.9.0 | 2026-08-05 | 21,094 | 35 | **A narrowphase a physics engine can build on.** All five exit criteria met. Scoped as the narrowphase repair, which had already shipped in 2.8.3 — the real content was the tail that mechanisms exposed: `tests/abuse.tcyr` found **11 defects on public entry points** (`cqr_decompose` overran `out_R` while returning `HSB_ERR_NONE`); a disposition column caught `sequential_impulse` marked FIXED when the friction impulse was identically zero at every mu; a 54-mutation sweep on the integrated tree found the delaunay ghost-direction invariant had **zero** assertions. `gjk_intersect_3d` stopped missing 134 genuine interior overlaps (+55% no-hit cost, stated). Struct-layout contract set. The audit's entire low tier, 5 of 5, had never been scheduled. 1818 → 3294 |
 | 2.8.4 | 2026-08-05 | 20,778 | 35 | DCT/DST dispatch heuristic. The 23x `num_dst_1024` gap was **not a defect**: 1.6x is DST-I's irreducible 2(n+1) DFT and 14.6x is that n = 1024 makes that extension non-power-of-two. Sibling sizes added to the bench so the parity cliff is visible. The real defect was `_numx_use_fft` billing DST-I for post-processing transcendentals it never evaluates — four sizes dispatched to the slower path. |

@@ -3,8 +3,8 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v2.6.15 — 34 math modules in `src/`, ~16,900 lines of Cyrius (`lib/` is
-> vendored stdlib + first-party deps only). Compiled by cycc 6.5.6.
+> hisab v2.9.2 — 34 math modules in `src/`, 21,262 lines of Cyrius (`lib/` is
+> vendored stdlib + first-party deps only). Compiled by cycc 6.5.16.
 
 ## Module Map
 
@@ -73,7 +73,7 @@ hisab (Cyrius)
 | sakshi | External (git) | Structured logging |
 | alloc, string, fmt, vec, str | Cyrius stdlib | Core data structures |
 | math, ganita | Cyrius stdlib | `math`: inclusive cmp, clamp/lerp/min/max/sign, polyfills. `ganita` (6.2.x umbrella): transcendentals + dense matrix + decompositions (subsumes the former `matrix`/`linalg`) |
-| tagged, fnptr | Cyrius stdlib | Option/Result types, function pointers |
+| tagged, fnptr, callback | Cyrius stdlib | Option/Result types, function pointers, closure-like callback patterns |
 | syscalls, io, args | Cyrius stdlib | System interface |
 | assert, bench | Cyrius stdlib | Testing, benchmarking |
 
@@ -93,6 +93,15 @@ The sets are minimal in the sense that they contain no module that is not reache
 transitive closure, so they are what you must include, not merely what the module names directly.
 
 Consumers pulling the whole `dist/hisab.cyr` bundle can ignore this table entirely.
+
+The stdlib half of the dependency set stopped being implicit in 2.9.2. `dist/hisab.deps` — the
+sidecar `cyrius distlib` writes beside the bundle, which a consumer's `cyrius deps` reads to
+auto-resolve stdlib leaves — is now **tracked** rather than gitignored, and names all 15 leaves the
+fold needs in scope: `syscalls`, `io`, `string`, `alloc`, `str`, `fmt`, `vec`, `args`, `assert`,
+`math`, `ganita`, `tagged`, `fnptr`, `bench`, `callback`. It was worth ignoring until cyrius 6.5.10
+for the same reason this section exists: the sidecar was built by scanning bundled sources for
+literal `include "lib/X.cyr"` lines, and hisab's 34 `[lib]` modules have none, so it reported 2.
+6.5.10 unions in the declared `[deps] stdlib`, which is what takes it from 2 to 15.
 
 | Module | Also include |
 |---|---|

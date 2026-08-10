@@ -4,12 +4,13 @@
 
 ```bash
 # All test suites
-cyrius test tests/hisab.tcyr        # 205 smoke/integration tests
-cyrius test tests/foundation.tcyr   # 307 exhaustive foundation type tests
-cyrius test tests/modules.tcyr      # 416 per-module tests
-cyrius test tests/edge_cases.tcyr   # 199 edge case + boundary tests
+cyrius test tests/hisab.tcyr        # 416 smoke/integration tests
+cyrius test tests/foundation.tcyr   # 349 exhaustive foundation type tests
+cyrius test tests/modules.tcyr      # 1621 per-module tests
+cyrius test tests/edge_cases.tcyr   # 233 edge case + boundary tests
+cyrius test tests/abuse.tcyr        # 732 hostile-input tests
 
-# Benchmarks (28 operations)
+# Benchmarks (55 operations)
 cyrius bench tests/hisab.bcyr
 
 # Fuzz self-test — `cyrius fuzz` walks tests/ as of cyrius 6.5.6; before that it
@@ -24,13 +25,14 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 
 | Suite | Assertions | Covers |
 |-------|-----------|--------|
-| `foundation.tcyr` | 307 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
-| `modules.tcyr` | 416 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff, interval, tensor, and collision (convex hull, triangulation, Delaunay, half-edge, MPR, sequential-impulse) |
-| `hisab.tcyr` | 205 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms) |
-| `edge_cases.tcyr` | 199 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11) |
-| **Total** | **1127** | |
+| `foundation.tcyr` | 349 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
+| `modules.tcyr` | 1621 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff, interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse) |
+| `hisab.tcyr` | 416 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms), decomposition (SVD, QR, eigen), Krylov (GMRES) |
+| `edge_cases.tcyr` | 233 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11) |
+| `abuse.tcyr` | 732 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Surfaced 11 real defects on public entry points, held in a known-defect register rather than deleted |
+| **Total** | **3351** | |
 
-## Benchmarks (28 operations)
+## Benchmarks (55 operations)
 
 | Category | Benchmarks |
 |----------|-----------|
@@ -40,7 +42,21 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 | Color | srgb_to_linear, tonemap_reinhard |
 | Calculus | calc_derivative, calc_integral_simpson |
 | Numerical | num_gcd, num_is_prime, cx_mul |
+| Hull / mesh | convex_hull_2d_2k, halfedge_2k_tris, delaunay_2d_400, delaunay_2d_circle_150, triangulate_600gon |
+| Spatial indices | bvh_degenerate_4k, bvh_scatter_4k, bvh_query_ray_200x4k, kdtree_build_4k, kdtree_radius_4k, spatial_hash_query_2k |
+| Narrowphase | gjk_epa_boxes, gjk_epa_spheres, gjk_epa_sphere_box, gjk_epa_3d_cyl_box, gjk_intersect_box_hit, gjk_intersect_box_miss, gjk_intersect_sph_miss, gjk_intersect_tangent, mpr_intersect_box_hit, mpr_intersect_box_miss, mpr_intersect_tangent, mpr_penetration_boxes |
+| Decomposition | svd_golub_kahan_12, eigen_qr_12 |
+| Transforms | num_dct_1024, num_dst_1024, num_dct_1023, num_dst_1023 |
 | Other | ease_in_out, perlin_2d |
+
+`./scripts/bench-history.sh` appends one CSV row per benchmark to `./bench-history.csv`
+and `./benchmarks.md` renders the trend. Each harness line reads
+`name: <avg> avg (min=<min> max=<max>) [N iters]`; the script parses all four and records
+`stat=avg`. Through 2.9.1 it took the *last* number on the line, so 44 of 55 rows tracked
+**max**, not average — every row it ever wrote. Rows are only compared against rows sharing
+the newest run's `stat`, and the significance threshold is ±10%: three back-to-back runs of
+the same binary put the median avg spread at 3.5% (worst 6.9%, none over 20%), against
+−93%…+742% swings on the old max-based rows.
 
 ## Fuzz Targets (5)
 
@@ -96,4 +112,4 @@ var len_after = hvec3_length(rotated);
 
 ## Performance Comparison
 
-See [docs/benchmarks-rust-v-cyrius.md](../benchmarks-rust-v-cyrius.md) for Rust vs Cyrius benchmark comparison with 85 Rust + 22 Cyrius data points.
+See [docs/benchmarks-rust-v-cyrius.md](../benchmarks-rust-v-cyrius.md) for Rust vs Cyrius benchmark comparison with 90 Rust + 21 Cyrius data points.

@@ -2,6 +2,167 @@
 
 ## [Unreleased]
 
+## [2.9.2] - 2026-08-09 — the toolchain bump, and three gates that were not gating
+
+Maintenance release: toolchain pin **6.5.9 → 6.5.16** (seven releases) and sakshi
+**2.4.8 → 2.4.10**. **No library source change** — all 34 modules compile clean, the `dist/hisab.cyr`
+diff is the version header and nothing else, and the suite holds at **3351** across five harnesses
+(hisab 416, foundation 349, modules 1621, edge_cases 233, abuse 732). Constant gate **153/153**,
+`deps --verify` **30/30**, lint 0 warnings and `fmt --check` clean across all 43 sources, vet 2 deps
+/ 0 untrusted / 0 missing, fuzz 1/0, `cyrius coverage` **588/591 fns (99%)** over 35/35 files.
+
+**The bump itself was uneventful. What it surfaced was not.** Crossing 6.5.14 turned `cyrius
+distlib` red on a correct bundle, and chasing that led into the benchmark harness, where the CSV
+that CLAUDE.md designates as the proof for every performance claim turned out to be recording the
+single worst iteration of each benchmark. Three gates in this repo were green while checking
+nothing, and none of the three was found by a test failing.
+
+### Fixed
+
+- **`scripts/bench-history.sh` recorded the MAX, not the average — every row it has ever written.**
+  Its parser took "the last `<num><unit>` in the line"; `cyrius bench` emits
+  `name: <avg> avg (min=<min> max=<max>) [N iters]`, so the last token is `max=`. The header comment
+  above it described a `<median> ... (per iter)` format that **does not exist**, which is how the
+  heuristic looked reasonable. Measured: **44 of 55** rows in the most recent run track max rather
+  than avg.
+
+  **Why it matters is a noise argument, not a naming one.** Three back-to-back runs of the *same
+  binary* put the `avg` field's spread at a median of **3.5%** (worst 6.9%; **0 of 55** benchmarks
+  above 20%) — so the harness is precise enough to detect real regressions. The max field is a
+  single worst sample and is not: consecutive max-based CSV rows swung **−93% to +742%**, and in one
+  run `srgb_to_linear` reported **avg 1,438 ns against max 48,959 ns — a 34× ratio inside one
+  measurement**. A regression baseline built on that cannot distinguish a 2× slowdown from a
+  scheduler hiccup.
+
+  Root cause → fix: the parser now **anchors on the harness's named fields** instead of scavenging
+  tokens, and records `avg` in `estimate_ns` while also carrying `min_ns` / `max_ns` / `iters`. A
+  line that does not match the expected shape is now a **hard error** rather than a silent skip, so
+  an upstream format change cannot quietly halve the recorded benchmark count again. A new `stat`
+  column names which statistic each row holds; pre-2.9.2 rows have none and are `max`. Nothing was
+  deleted — but `benchmarks.md` now builds its trend **only from rows sharing the newest run's
+  `stat`**, because comparing an avg against a max produces hundreds of percent of pure artefact.
+  The trend's significance threshold also moved **±3% → ±10%**: ±3% sits *below* the measured noise
+  floor, so roughly half the table lit up on a rebuild that changed nothing.
+
+  ⚠ **No performance claim in this release.** The one cross-run comparison available (2.9.1's
+  recorded run vs this one) confounds three variables at once — different commit, different
+  toolchain, and different statistic — so it is not quoted as a result. 2.9.2 establishes the first
+  *correct* baseline; the next release is the first that can honestly compare against it.
+
+- **CI's version-consistency gate passed vacuously.** `.github/workflows/ci.yml` ran
+  `grep -q "$VERSION" CHANGELOG.md` — unanchored, and with the dots as regex wildcards. With
+  `VERSION=2.9.2` that pattern matched **`32,942,104 B`** in an unrelated benchmark line at
+  `CHANGELOG.md:498`. The gate would have gone green on a release whose CHANGELOG section was never
+  written. Now `grep -qF -- "## [$VERSION]"`, anchored to the Keep a Changelog header. This is the
+  same failure mode the `fetch-depth: 0` comment in the measurements job already warns about, one
+  job further down the same file.
+
+- **`src/main.cyr` hardcodes the version the CLI prints, and nothing checked it.** `VERSION` is the
+  single source of truth and `cyrius.cyml` pulls it via `${file:VERSION}`, but Cyrius has no
+  build-time string interpolation, so `println("hisab 2.9.1")` is a manual edit on every bump —
+  which `scripts/version-bump.sh` did not make and no gate compared. Fixed three ways: the string is
+  updated, `version-bump.sh` now rewrites it (and reminds the caller to re-run `cyrius distlib`), and
+  CI asserts both it **and** the `# Version:` header inside `dist/hisab.cyr` against `VERSION`.
+
+### Changed
+
+- **Toolchain pin `6.5.9` → `6.5.16`; sakshi `2.4.8` → `2.4.10`.** Re-vendored via `cyrius lib sync`
+  — all 27 declared-subset stdlib files byte-match the 6.5.16 snapshot. The transitive
+  `lib/result.cyr` is not in the declared subset and `lib sync` does not touch it; it was
+  hand-refreshed (its only delta is two doc-comment paths, from 6.5.11's test-suite subfolder
+  reorg). `lib/atomic.cyr` was already identical. **All 30 vendored files now byte-match
+  `~/.cyrius/versions/6.5.16/lib/`**; `cyrius.lock` 30 deps (1 commit-pinned), verify 30/30.
+
+  ⚠ **A caveat on the standing vendoring rule.** 2.6.11 established "byte-compare `lib/` against the
+  *pin's own* snapshot, not previous-pin vs new-pin". That rule assumes the snapshot directories are
+  immutable, and on this machine they are not: `~/.cyrius/versions/6.5.9/lib/alloc.cyr` is
+  byte-identical to 6.5.16's and carries `⚡ v6.5.10` annotations, i.e. the 6.5.9 tree was refreshed
+  in place on 2026-08-07, after 2.9.1 shipped. The rule still holds for the *current* pin, which is
+  the one that matters; but a "6.5.N snapshot" on disk is not evidence of what 6.5.N contained.
+
+- **Vendored stdlib delta — 10 files** (plus the transitive `result.cyr`):
+  - **`alloc.cyr`** — 6.5.10 inlined the two accessor loads in `alloc_via` / `realloc_via` /
+    `free_via` / `reset_via` (`fncall2(allocator_alloc_fn(a), allocator_state(a), size)` →
+    `fncall2(load64(a), load64(a + 32), size)`) and removed the `_arena_alloc` / `_arena_reset`
+    shims, pointing `allocator_new` at `&arena_alloc` / `&arena_reset` directly.
+
+    ⚠ **The obvious reading of this — "hisab grepped clean for `alloc_via`, so it is unaffected" —
+    is wrong, and was written down here before it was checked.** hisab's own source names no `_a`
+    symbol, but it does not have to: `str_from(cstr)` is `str_from_a(default_alloc(), cstr)`
+    (`lib/str.cyr:35-37`) and `vec_new()` is `vec_new_a(default_alloc())` (`lib/vec.cyr:47-49`),
+    and both `_a` forms go straight through `alloc_via`. `src/` has **152 call sites** across those
+    wrappers (`str_from` 17, `vec_new` 44, `vec_push` 91), so **`alloc_via` runs constantly** —
+    demonstrated by trapping it, which aborts 4 of the 5 suites. The inlining is therefore live for
+    hisab. The *shim removal* is genuinely dead here: nothing outside `lib/` references
+    `_arena_alloc` / `_arena_reset` / `allocator_new`, and the offsets the inlining bakes in
+    (+0/+8/+16/+24 fn ptrs, +32 state) match `allocator_new`'s stores in the same file.
+
+    Measured on hisab's own call shapes, interleaved 5× before/after with the compiler held at
+    6.5.16 and only the lib tree swapped: `str_from` (1 `alloc_via`) **53/53/55/56/58 ns →
+    50/51/51/52/52 ns**, `vec_new` (2 `alloc_via`) **103/103/104/105/107 ns → 97/98/98/99/100 ns**
+    — non-overlapping distributions, roughly **4 ns per `alloc_via`**. Same direction as cyrius's
+    own 15.1 ns / 5.1 ns figure, smaller in magnitude, and measured here rather than inherited.
+    **No macro-level win is claimed**: a first pass suggested ~5% on the allocation-heavy
+    benchmarks and three repeats reversed the sign. At 4 ns against benchmarks in the microsecond
+    range, it is below this harness's noise floor.
+
+    The lib delta on its own is **behaviourally inert**: same compiler, only the lib tree swapped,
+    both trees produce byte-identical **3351/3351** across all five suites.
+  - **`syscalls_linux_common.cyr`, `syscalls_aarch64_linux.cyr`, `syscalls_macos.cyr`,
+    `syscalls_x86_64_agnos.cyr`** — the 6.5.15/6.5.16 macOS work (per-OS signal/errno constant
+    splits, Mach-O syscall routes, sysctl-backed `uname`/`sysinfo`). Non-Linux-x86_64 variants,
+    vendored for snapshot parity; no impact on hisab's build target.
+  - **`io.cyr`, `args.cyr`, `fnptr.cyr`, `tagged.cyr`, `result.cyr`** — minor upstream changes; the
+    calls hisab links behave identically, which 3351/3351 confirms.
+  - **`sakshi.cyr`** — 2.4.10, byte-identical to what cyrius 6.5.16 folds into its own `lib/`.
+    2.4.10's one behaviour change (`sakshi_log_kv` passes fields unflattened to an `SK_OUT_HOOK`
+    subscriber) reaches nothing here: hisab declares sakshi but **calls it from no file in `src/`,
+    `tests/`, or `examples/`**, and registers no emit hook.
+
+  ⚠ The pin crossed **6.5.13, whose upstream CHANGELOG section is an empty header**, though it did
+  ship a distinct `cycc` binary and one changed stdlib file (`syscalls_x86_64_agnos.cyr` — agnos
+  only, never compiled by hisab). Recorded because the audit trail has a hole in it, not because
+  anything is suspected.
+
+- **`dist/hisab.deps` is now tracked** (removed from `.gitignore`, added to CI's drift check). A
+  consumer's `cyrius deps` reads the `.deps` sidecar sitting next to a fold and auto-resolves the
+  stdlib leaves it names (`cbt/deps.cyr:1494-1519`), so ignoring it meant impetus / kiran / joshua /
+  aethersafha had to hand-declare all 15 of hisab's leaves and got no error when they under-declared.
+  It was also worth nothing before **6.5.10**: the sidecar was built by scanning bundled sources for
+  literal `include "lib/X.cyr"` lines, and hisab's `[lib]` modules are self-contained, so it reported
+  **2** leaves. 6.5.10 unions in the declared `[deps] stdlib` — hisab goes **2 → 15**.
+
+### Security
+
+- **`cyrius distlib` fails its own bundle self-check on a correct bundle, and hisab's CI and release
+  gates were both red because of it.** cyrius 6.5.14 repaired a self-check that had never once run
+  (it compiled to `/dev/null`, whose `.tmp.<pid>` sibling cannot be created, so it failed on the
+  write and printed a reassuring note). The repaired check compiles the bundle **alone** under
+  `_cc_allow_undef = 1` — and that flag is read in exactly two places in cycc, both in the *fixup*
+  stage, both gating `reachable undefined function(s)`. An unresolved **name** dies far earlier, in
+  the frontend: `parse_expr.cyr:585-593` prints `undefined variable '…'` and calls
+  `syscall(SYS_EXIT, 1)` immediately. So the suppression cannot reach it **by construction** — this
+  is not an oversight about `var`s, it is a premise that does not hold for any name-resolved symbol.
+  Confirmed with three one-line `[lib]` modules differing only in what they reference: a stdlib
+  **function** exits 0, a stdlib **global var** (`F64_ONE`) exits 1, a stdlib **enum constant**
+  (`STDOUT_FD`) exits 1.
+
+  hisab's bundle reads `F64_ONE` at `dist/hisab.cyr:111` — the ordinary way to write `1.0` in a
+  language with no float literals. Both `.github/workflows/ci.yml` and `release.yml` ran a bare
+  `cyrius distlib` under `bash -e`, so **both aborted before reaching the drift check that would
+  have passed.** Sandbox-tested across this machine's 69 repos carrying a `[lib]` block: **44 fail**
+  once pinned to 6.5.16, of which 3 are pinned ≥ 6.5.14 today (hisab and majra broken; sigil passes
+  only because its bundle happens to touch no consumer-supplied global).
+
+  Both workflows now tolerate a non-zero `distlib` rc **only** when it carries that exact signature,
+  and fail on any other distlib failure. `distlib` is write-then-verify — the bundle is written ~330
+  lines before the check and is not unlinked on failure — so regeneration is unaffected; proven by
+  the 2.9.1 → 2.9.2 header bump landing correctly on a run that exited 1. The coverage the broken
+  self-check was meant to give is replaced by a **stronger** step, `cyrius check --with-deps
+  dist/hisab.cyr`, which compiles the bundle with the stdlib actually in scope — the way a consumer
+  builds it — with no category of error suppressed.
+  → [`issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md`](docs/development/issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md)
+
 ## [2.9.1] - 2026-08-06 — the deferred tier: four latent predicate defects, and a fourth false measurement
 
 Everything 2.9.0 found and consciously left. Suite **3341 → 3351** across five harnesses, toolchain
@@ -3302,7 +3463,7 @@ against a consumer build.
 - **`lib/num_ext.cyr`**: renamed local variable `stack` → `stk` (6 identifier sites in `_factorize_pollard_rho`). `stack` became a reserved keyword in Cyrius 5.7.x; the four mentions in comments were left intact
 - **`lib/collision_core.cyr`**: 3 empty-init / empty-step `for` loops converted to `while`. Cyrius's `for (init; cond; step)` requires *all three* clauses — `for (; cont == 1;)` and `for (; sj >= 0; sj = sj - 1)` were never valid syntax. The for-with-step variant kept its step semantics by appending `sj = sj - 1` to the loop body tail. File was never in the build chain pre-2.2.2 (orphan-include-after-syscall trick masked it), so this is the first time it actually parses
 - **`lib/collision_mesh.cyr`**: same migration — one `for (var ti = 0; ti < n_tris;)` (empty step) converted to a manual `var ti = 0; while (ti < n_tris) { ...; ti = ti + 1 (or stay) }` (loop conditionally advances based on whether the current element was removed). Plus renamed local `shared` → `is_shared` (4 identifier sites — `shared` is reserved in Cyrius 5.5+; one comment mention left intact)
-- **`lib/calc.cyr`** `_perm_init` (Perlin noise table): refactored the 18-arg `_perm_store_block(base, off, a..p)` helper into a 10-arg `_perm_store_8(base, off, a..h)` form, called 32× instead of 16×. **cc5 5.7.10 has a codegen bug at 18+ args** that scrambles register/stack params (args 1, 2, 7-12 silently read garbage values — see [`docs/development/issues/2026-04-26-cc5-18-arg-fn-scrambles-params.md`](docs/development/issues/2026-04-26-cc5-18-arg-fn-scrambles-params.md) for the full reproducer). Pre-fix: bench segfaulted at exit 139 inside `perlin_2d` because the permutation table got written full of garbage. Post-fix: `perlin_2d` runs through 200,000 iterations cleanly
+- **`lib/calc.cyr`** `_perm_init` (Perlin noise table): refactored the 18-arg `_perm_store_block(base, off, a..p)` helper into a 10-arg `_perm_store_8(base, off, a..h)` form, called 32× instead of 16×. **cc5 5.7.10 has a codegen bug at 18+ args** that scrambles register/stack params (args 1, 2, 7-12 silently read garbage values — see [`docs/development/issues/archived/2026-04-26-cc5-18-arg-fn-scrambles-params.md`](docs/development/issues/archived/2026-04-26-cc5-18-arg-fn-scrambles-params.md) for the full reproducer; the filing was archived when 6.2.11 fixed it). Pre-fix: bench segfaulted at exit 139 inside `perlin_2d` because the permutation table got written full of garbage. Post-fix: `perlin_2d` runs through 200,000 iterations cleanly
 - **`src/main.cyr`**: stripped from 30+ project-module includes down to the two stdlib includes its `fn main()` actually uses (`syscalls`, `io`). The previous form prepended every project module just to "validate the include chain" — but cc5 5.7.7's 512 KB input_buf can't fit that, and the test suites already cover include integration. Bonus: fixed three orphan `include` lines that sat *after* `syscall(SYS_EXIT, r)` (parsed but unreachable; first time any of them was scrutinized was when one tripped a parse error). CLI binary: now ~140 KB static ELF, prints the version string and exits
 - **`tests/modules.tcyr`**: stripped six "multiple consecutive blank lines" lint warnings (lines 43-45, 263-264, 390 in the pre-fix file). `cyrius lint` returns the warning count as its exit code, which the prior CI loop swallowed under GHA's `set -eo pipefail` — the loop would abort on the first non-zero rc without reporting which file tripped it
 - **`examples/basic_math.cyr` + `tests/{edge_cases,foundation,hisab,modules}.tcyr`**: applied `cyrius fmt` to flatten multi-line continuation-indent drift from the modern formatter

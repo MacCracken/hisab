@@ -16,8 +16,19 @@ TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
 
+# Schema note (v2.9.2). The first five columns are unchanged and old rows still
+# parse positionally into them. `stat` names WHICH statistic `estimate_ns` holds:
+# rows written before 2.9.2 have no value there and are `max` — see the parser
+# comment below for why that was wrong. New rows are `avg` and also carry the
+# min/max/iters they came from, so no information is discarded and the two
+# populations are never silently averaged together.
 if [ ! -f "$HISTORY_FILE" ]; then
-    echo "timestamp,commit,branch,benchmark,estimate_ns" > "$HISTORY_FILE"
+    echo "timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters" > "$HISTORY_FILE"
+elif ! head -1 "$HISTORY_FILE" | grep -q ',stat,'; then
+    # Widen the header in place; existing 5-field rows keep their meaning and
+    # read back as stat="" (i.e. max).
+    sed -i '1s/.*/timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters/' "$HISTORY_FILE"
+    echo "note: bench-history header widened (estimate_ns is 'avg' from this run on; earlier rows were 'max')"
 fi
 
 echo "╔══════════════════════════════════════════╗"
@@ -30,10 +41,20 @@ echo "║  suite:  $SUITE"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# `cyrius bench` emits one line per benchmark in the form:
-#   <name> ... <median>{ps|ns|us|µs|ms|s} (per iter)
-# The exact format is owned by lib/bench.cyr; this parser tolerates
-# extra columns by anchoring on "ns/iter", "ms/iter", etc.
+# `cyrius bench` (lib/bench.cyr) emits one line per benchmark in the form:
+#   <name>: <avg><unit> avg (min=<min><unit> max=<max><unit>) [<n> iters]
+#
+# ⚠ THE COMMENT THAT USED TO BE HERE DESCRIBED A FORMAT THAT DOES NOT EXIST
+# ("<name> ... <median> (per iter)"), and the parser under it took "the last
+# <num><unit> in the line" — which in the REAL format is the `max=` field. So
+# every row this script has ever written recorded the single worst iteration,
+# under a column named `estimate_ns`, and `benchmarks.md` presented that as the
+# trend. Measured 2026-08-09, same binary, three back-to-back runs: the `avg`
+# field is stable to a median of 3.5% (worst 6.9%, 0 of 55 benchmarks over 20%),
+# while consecutive max-based CSV rows swung −93% to +742%. CLAUDE.md designates
+# this CSV as the proof for every performance claim, so the proof was being
+# recorded on the noisiest statistic the harness reports. Now parsed by ANCHORING
+# on the named fields rather than by scavenging tokens.
 BENCH_OUTPUT=$(cyrius bench "$SUITE" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 echo "$BENCH_OUTPUT"
 echo ""
@@ -54,24 +75,37 @@ normalize_to_ns() {
 declare -a BENCH_NAMES=()
 declare -a BENCH_NS=()
 
+SKIPPED=0
 while IFS= read -r line; do
-    # Match lines containing "<num><unit>/iter" or trailing "<num> <unit>"
-    if echo "$line" | grep -qE '([0-9.]+)[[:space:]]*(ps|ns|µs|us|ms|s)(/iter)?'; then
-        # Pull benchmark name (before "..." or first whitespace burst)
-        BENCH_NAME=$(echo "$line" | sed -E 's/[[:space:]]+(\.{2,}|[0-9]).*$//' | xargs)
-        [ -z "$BENCH_NAME" ] && continue
-        # Last <num><unit> in the line wins
-        TOKEN=$(echo "$line" | grep -oE '[0-9]+(\.[0-9]+)?[[:space:]]*(ps|ns|µs|us|ms|s)' | tail -n 1)
-        VAL=$(echo "$TOKEN" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n 1)
-        UNIT=$(echo "$TOKEN" | grep -oE '(ps|ns|µs|us|ms|s)$')
-        NS=$(normalize_to_ns "$VAL" "$UNIT")
-        echo "${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${NS}" >> "$HISTORY_FILE"
+    # Anchored on the harness's own field names. A line that does not match this
+    # shape is COUNTED and reported rather than silently dropped — a format
+    # change upstream must be loud, not quietly halve the recorded benchmarks.
+    if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z_0-9]*):[[:space:]]+([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)[[:space:]]+avg[[:space:]]+\(min=([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)[[:space:]]+max=([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)\)([[:space:]]+\[([0-9]+)[[:space:]]+iters\])? ]]; then
+        BENCH_NAME="${BASH_REMATCH[1]}"
+        AVG_NS=$(normalize_to_ns "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}")
+        MIN_NS=$(normalize_to_ns "${BASH_REMATCH[5]}" "${BASH_REMATCH[7]}")
+        MAX_NS=$(normalize_to_ns "${BASH_REMATCH[8]}" "${BASH_REMATCH[10]}")
+        ITERS="${BASH_REMATCH[12]:-}"
+        echo "${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${AVG_NS},avg,${AVG_NS},${MIN_NS},${MAX_NS},${ITERS}" \
+            >> "$HISTORY_FILE"
         BENCH_NAMES+=("$BENCH_NAME")
-        BENCH_NS+=("$NS")
+        BENCH_NS+=("$AVG_NS")
+    elif echo "$line" | grep -qE '^[[:space:]]+[A-Za-z_][A-Za-z_0-9]*:.*(ps|ns|µs|us|ms|s)'; then
+        SKIPPED=$((SKIPPED + 1))
+        echo "::warning:: unparsed benchmark line (format drift?): $line"
     fi
 done <<< "$BENCH_OUTPUT"
 
 COUNT=${#BENCH_NAMES[@]}
+if [ "$SKIPPED" -gt 0 ]; then
+    echo "ERROR: $SKIPPED benchmark line(s) did not match the expected format;" >&2
+    echo "       lib/bench.cyr's output shape has changed — fix the parser." >&2
+    exit 1
+fi
+if [ "$COUNT" -eq 0 ]; then
+    echo "ERROR: no benchmarks parsed — refusing to write an empty history row." >&2
+    exit 1
+fi
 
 # Trend table (3-point). Skip if Python missing — CSV is the primary record.
 if command -v python3 >/dev/null 2>&1; then
@@ -83,6 +117,19 @@ history_file = sys.argv[1]
 md_file = sys.argv[2]
 
 rows = list(csv.DictReader(open(history_file)))
+if not rows:
+    sys.exit(0)
+
+# `estimate_ns` means different things either side of 2.9.2: rows written before
+# it hold the MAX (a single worst iteration), rows after hold the AVG. Comparing
+# across that boundary produces deltas of hundreds of percent that are pure
+# artefact, so the trend is built ONLY from rows whose `stat` matches the newest
+# run's. Old rows predate the column and read back as None -> "max".
+def stat_of(r):
+    return (r.get("stat") or "max").strip() or "max"
+
+current_stat = stat_of(rows[-1])
+rows = [r for r in rows if stat_of(r) == current_stat]
 if not rows:
     sys.exit(0)
 
@@ -125,13 +172,20 @@ def fmt_ns(ns):
     else:
         return f"{ns:.2f} ns"
 
+# The threshold was +-3%, which sits BELOW this harness's measured run-to-run
+# noise floor: three back-to-back runs of one binary (2026-08-09) span a median
+# of 3.5% and up to 6.9% per benchmark. At +-3% roughly half the table lights up
+# on a rebuild that changed nothing, which is how a reader learns to ignore it.
+# 10% is the first round number clear of the measured worst case.
+NOISE_FLOOR_PCT = 10
+
 def delta(old, new):
     if old == 0:
         return ""
     pct = ((new - old) / old) * 100
-    if pct < -3:
+    if pct < -NOISE_FLOOR_PCT:
         return f" **{pct:+.0f}%**"
-    elif pct > 3:
+    elif pct > NOISE_FLOOR_PCT:
         return f" {pct:+.0f}%"
     return ""
 

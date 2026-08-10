@@ -1,3 +1,26 @@
+> **CLOSED 2026-08-09 (2.9.3).** The optimisation SHIPPED — in 2.7.1, not "NOT APPLIED" as this
+> file's header and `doc-health.md` both said for three releases. `src/collision_core.cyr:612-758` is
+> byte-identical to the FIX block below. What was genuinely open was everything around it:
+>
+> - **CORRECTION 2 (small-n regression) — now measured and disclosed.** A/B against the pre-prune
+>   body from `97bed43^`, three runs each: n = 6 goes **2.577 µs → 2.963 µs, +15%**, while n = 600
+>   goes **9.556 ms → 1.691 ms, −82%**. Non-overlapping distributions, <2% spread within each. The
+>   prune allocates an n-entry `blocked[]` and refreshes neighbour convexity per ear; below
+>   break-even that setup cannot amortise. Recorded in the 2.9.3 CHANGELOG next to the −84% headline.
+> - **The BENCH section — now shipped.** `triangulate_comb_600` (half the vertices reflex) costs
+>   **5.718 ms** against the convex `triangulate_600gon`'s **1.593 ms**, 3.6× on the same n. The only
+>   previous guard was the convex case, which is the prune's *best* case — a −84% headline policed by
+>   the input it is fastest on. `triangulate_hex_6` covers the small-n class above.
+> - **CORRECTION 4 (the false `(2D, strict interior)` comment)** — fixed in 2.9.3; the predicate is
+>   boundary-INCLUSIVE, which is what ear clipping needs, so the code was right and only the contract
+>   was wrong. Five assertions pin it.
+>
+> ⚠ **Still open, carried forward and NOT fixed here:** corrections 1 and 4-cosmetic of the CORRECTED
+> section — the CHANGELOG's claim that the divergence direction is "old-partial → new-complete" is
+> backwards on at least one reproducer, and the shadowed neighbour-refresh locals at
+> `collision_core.cyr:740,742` still collide with the winding loop's `pn`/`nn`. Neither changes
+> behaviour; both are recorded so closing this file does not bury them.
+
 <!-- 2.7.0-I performance record. Analysed and adversarially reviewed, both agents running
 real code. Each optimisation is CONFIRMED as a real complexity win, but each was also shown
 to CHANGE RESULTS or to regress on some input class -- see the CHALLENGE section before

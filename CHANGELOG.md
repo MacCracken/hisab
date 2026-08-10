@@ -71,6 +71,36 @@ stays at 2.9.2 until the scope closes.
 
 ### Added
 
+- **A benchmark for the input class the k-d balance guard exists for.** `kdtree_build_4k` is a
+  uniform scatter — the guard never fires on it, so its cost and its absence were both invisible.
+  `kdtree_build_octave_512` (every coordinate halves, so the value-midpoint sits at ~0.5 with exactly
+  one point above it) makes the guard load-bearing, and now measures what it is worth:
+  **564.8 µs with the guard, 3.397 ms without** — **6.0×**. The filing's BENCH section asked for this
+  class in 2.7.0 and it never shipped; the guard has been unmeasured on its own use case since.
+
+- **Two benchmark classes the `triangulate_polygon` prune had never been measured on.** The only
+  guard was `triangulate_600gon`, a polygon of 600 points on a **circle** — strictly convex, i.e. the
+  reflex-only ear prune's *best* case, where every vertex is convex and the containment scan is
+  skipped every time. The filing that proposed the prune asked for a reflex-heavy guard; it never
+  shipped, so a −84% headline has been policed by its own best case for three releases. Now:
+  `triangulate_comb_600` (alternating radius, so half the vertices are reflex) at **5.718 ms**
+  against the convex case's **1.593 ms** — **3.6× the cost**, on the same n. And
+  `triangulate_hex_6`, the size class every shipped call site actually uses.
+
+  **The small-n regression is real, and it is measured here rather than inherited.** A/B against the
+  pre-prune body recovered from git (`97bed43^`), same machine, same toolchain, three runs each:
+
+  | case | pre-prune | with prune | |
+  |---|--:|--:|---|
+  | `tp_hex6` (n = 6) | 2.556 / 2.596 / 2.577 µs | 2.956 / 2.976 / 2.963 µs | **+15%** |
+  | `tp_600gon` (n = 600) | 9.556 ms | 1.691 ms | **−82%** |
+
+  The distributions do not overlap and the spread within each is under 2%, so the +15% is signal.
+  The prune allocates an n-entry `blocked[]` array and refreshes neighbour convexity per ear, which
+  the naive scan does not; below break-even that setup cannot amortise. **The −84% figure in the
+  2.7.1 entry stands** (it reproduces at −82% on 6.5.16) — what was missing was the other half of the
+  sentence, and both classes are now in `bench-history.csv` so neither can move unobserved.
+
 - **`_dlg1_run` / `_DLG1_BAD`** (`tests/modules.tcyr`) — 1800 probes over 4 edges × 25 query points
   × 3 ghost directions × 6 orderings, asserting every ordering of a one-ghost triple agrees. The
   pre-2.9.3 body scores **846 of 1500** ordering comparisons. This replaces the filing's Python

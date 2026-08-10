@@ -1,3 +1,24 @@
+> **CLOSED 2026-08-09 (2.9.3).** The repair SHIPPED — in 2.7.1, as a balance guard rather than this
+> record's unconditional quickselect (the spec's variant measured +114% on `kdtree_build_4k`; the
+> hybrid was chosen instead). "NOT APPLIED" in this header and in `doc-health.md` was wrong for three
+> releases. What was genuinely open was the evidence around it, and 2.9.3 closed both halves:
+>
+> - **No regression assertion.** The two tests standing next to the guard — `kdtree_build != 0` and
+>   the split-plane invariant — both hold on a degenerate one-point-per-level spine, so **deleting the
+>   guard broke nothing that was being checked** (measured: the whole suite stays green with the
+>   condition replaced by `if (1 == 1)`). Depth is the property the guard provides, so depth is now
+>   asserted, on an **octave-spaced** fixture. Mutation-proven. ⚠ The pre-existing geometric fixture
+>   does NOT exercise it — ratio 0.99998 gives an axis range of only [0.85, 1], so the value-midpoint
+>   lands near the count-median and the guard never fires. Asserting on that fixture would have
+>   re-created the same hole; that is recorded inline beside it.
+> - **The BENCH section — now shipped.** `kdtree_build_octave_512`: **564.8 µs with the guard,
+>   3.397 ms without, 6.0×.** This record asked for the degenerate class in 2.7.0 and it never landed,
+>   so the guard was unmeasured on the only input class it exists for.
+>
+> ⚠ The 574 ms headline in this file **still has not reproduced** — CHANGELOG.md:1301-1307 already
+> says so, and nothing here restates it as fact. The guard is justified by the depth bound it
+> provably enforces and now by the 6.0× above, not by that figure.
+
 <!-- 2.7.0-I performance record. Analysed and adversarially reviewed, both agents running
 real code. Each optimisation is CONFIRMED as a real complexity win, but each was also shown
 to CHANGE RESULTS or to regress on some input class -- see the CHALLENGE section before

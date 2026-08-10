@@ -196,9 +196,11 @@ genuinely open was never the code:
 
 - the `_kd_partition` balance guard had **no regression assertion** — `kdtree_build != 0` and the
   split-plane invariant both hold on a degenerate spine, so deleting the guard broke nothing that
-  was checked. Closed in 2.9.3, mutation-proven, on an octave-spaced fixture. ⚠ The pre-existing
-  geometric fixture does **not** exercise it (ratio 0.99998 → axis range [0.85, 1], the guard never
-  fires); that is recorded inline so it is not mistaken for the guard's test.
+  was checked. Closed in 2.9.3, mutation-proven, on an octave-spaced fixture, **and benchmarked**:
+  `kdtree_build_octave_512` is **564.8 µs guarded vs 3.397 ms unguarded, 6.0×** — the class the
+  filing asked for in 2.7.0 and never got. ⚠ The pre-existing geometric fixture does **not** exercise
+  it (ratio 0.99998 → axis range [0.85, 1], the guard never fires); recorded inline so it is not
+  mistaken for the guard's test.
 - `_col_point_in_tri` documented itself as "(2D, strict interior)" while being **boundary-inclusive**
   — which is what ear clipping needs, so the code was right and only the contract was mis-stated.
   Closed in 2.9.3 with five assertions.
@@ -209,9 +211,13 @@ dropped input points on any set mixing scales. Fixed with an adaptive exact `ori
 coordinates; the record of what the 2.9.1 closure got wrong, and of the repair attempt that did not
 work, is in the archived filing.
 
-**Still open from that group** (documentary, carried forward): the −84% `triangulate_600gon`
-headline does not disclose a small-n regression below the prune's break-even, and there is no
-reflex-heavy benchmark guarding the prune.
+**That group is now CLOSED.** 2.9.3 measured the small-n regression rather than inheriting it
+(A/B against the pre-prune body from `97bed43^`: n = 6 **+15%**, n = 600 **−82%**) and disclosed it
+beside the −84% headline, and shipped the two benchmark classes the prune had never been measured on
+— `triangulate_comb_600` costs **3.6×** the convex case on the same n, and the convex case was the
+only guard there had ever been. ⚠ Two documentary items are carried forward inside the archived
+filing: a backwards divergence-direction claim in the 2.7.x CHANGELOG entries, and shadowed
+neighbour-refresh locals at `collision_core.cyr:740,742`. Neither changes behaviour.
 
 - [ ] **`einsum` is the only arena consumer in the library and has no benchmark at all.**
       `src/einsum.cyr` holds every `arena_*` call in `src/` — `arena_new` at `:41`, `arena_reset` at

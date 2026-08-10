@@ -1,8 +1,78 @@
 # `_col_in_circumcircle` loses the sign on mixed-magnitude inputs
 
-**Status:** CONFIRMED as a property of the predicate in isolation. **Not fixed, and 2.9.1 recommends
-leaving it** — see **Re-measurement (2.9.1)** at the bottom, which also retires a stale premise in
-the CORRECTION section below.
+**Status:** 🔴 **OPEN, and RE-SCOPED UPWARD 2026-08-09 (2.9.3).** No longer "a property of the
+predicate in isolation": it is a **silently wrong `delaunay_2d`** on the public entry point.
+The 2.9.1 recommendation to leave it rested on a premise that does not hold — see
+**Re-scoping (2.9.3)** immediately below, which supersedes the *Disposition: leave it* section at
+the bottom of this file. A first repair attempt was made in 2.9.3, **measured insufficient, and
+reverted**; the reason is recorded because it disqualifies the obvious fix.
+
+## Re-scoping (2.9.3) — three findings, one of them a refutation of the obvious remedy
+
+### 1. It is reachable, and the evidence that said otherwise was vacuous
+
+2.9.1 closed on "nothing can hand it that input", supported by a **0 wrong of 1,528,820** sweep over
+quadruples of four suite fixtures. That sweep was real, but every one of those fixtures is drawn from
+a **single origin-anchored box** (`_dlr_points`, `tests/modules.tcyr:126`), so the family has no
+*intra-set* dynamic range and structurally could not reach this failure mode.
+
+What breaks the predicate is **ratio within one set**, not absolute magnitude. Translating a whole
+set out to 1e9 is fine — Sterbenz differencing handles it, and 40 such sets show 0 failures. Mixing
+scales inside one set is not: with one vertex at ~6e5 and five points clustered inside ~5e-17 of the
+origin, **`delaunay_2d` silently drops an input point**. On a 3,999-seed sweep of that shape, failing
+sets are dense (seeds 1, 2, 6, 7, 9, 16, 20, … in the first twenty).
+
+A ready-made failing fixture, so the next attempt does not have to re-derive one — exact hull h = 4,
+so a correct triangulation has 2n−2−h = **6** triangles; the shipped predicate returns **4** and uses
+only **5 of 6** input points:
+
+```
+vec_push(icp, hvec2_new(0x4122_9CE2_D5D6_E212, 0x4127_8907_29BF_24A1));   # ~ (6.099e5, 7.712e5)
+vec_push(icp, hvec2_new(0x3C8E_24E8_BBBE_CC94, 0xBC5C_7CF2_DE23_7A70));
+vec_push(icp, hvec2_new(0xBC5C_8956_4E5D_FCA0, 0x3C80_D342_FFE4_0540));
+vec_push(icp, hvec2_new(0x3C88_267B_1B35_CD8E, 0x3C47_9EEC_3C48_9E00));
+vec_push(icp, hvec2_new(0xBC7B_7473_90E5_40E4, 0x3C82_D0D7_239D_1858));
+vec_push(icp, hvec2_new(0xBC68_8A23_88FE_A9B8, 0x3C6A_FCD4_4D14_CF88));
+```
+
+### 2. The suite's own oracle is blind to this by construction
+
+`_dl_violations` (`tests/modules.tcyr:225`) decides whether a circumcircle is empty by calling
+**`_col_in_circumcircle`** — the code under test. It cannot detect a sign flip in that predicate. Any
+assertion added here must use a **structural** oracle instead: `_dl_used` (which input indices appear
+in the output) and `_dl_max_edge_share` evaluate no predicate at all. The two repro files in this
+directory are `.tcyr` but are **not under `tests/`**, so CI has never run them.
+
+### 3. ⛔ An exact `orient2d` on the predicate's own arguments does NOT fix it — measured
+
+The obvious repair, and the one this file's own remedy section implies, is to make the winding term
+exact. **That was implemented in 2.9.3 — an adaptive Shewchuk-style `orient2d` with Dekker splitting,
+TwoProduct/TwoSum/TwoDiff tails and a four-component `Two_Two_Diff` expansion — and it changed
+nothing.** The fixture above still returned 4 triangles and still dropped a point. The expansion
+itself was verified correct (it reproduces exact rational results on ordinary triples, and its
+products satisfy `l + lt == acx*bcy` exactly).
+
+The reason is that **the information is already gone before the exact arithmetic starts.**
+`_col_in_circumcircle` translates to the query point and then differences in *floating point* —
+`acx = f64_sub(bx, ax)` — and with `b`, `c` at ~1e-17 and `a` at ~4e5 **both differences round to the
+same double**:
+
+```
+(b-a).x float = -390661.50221406674
+(c-a).x float = -390661.50221406674     <- identical; b and c are now the same point
+exact determinant of those float differences  =  0            <- faithfully zero
+exact determinant of the ORIGINAL coordinates = -5.457401e-11 <- the real answer
+```
+
+So an exact predicate fed pre-differenced operands correctly reports 0 for a configuration that is
+not degenerate. **The exactness has to extend back through the subtraction**: the fix is Shewchuk's
+`orient2dexact` shape — six TwoProducts of the **raw** coordinates combined by expansion sums, never
+rounding a difference — not an exact determinant of rounded differences. That is a materially larger
+routine than the one attempted, and it belongs in its own bite with its own benchmark, since it sits
+in `delaunay_2d`'s inner loop.
+
+The 2.9.3 attempt was **reverted rather than shipped**: it added cost and a page of numerical code
+while fixing none of the measured failures.
 
 ## What was claimed
 

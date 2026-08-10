@@ -73,6 +73,38 @@ stays at 2.9.2 until the scope closes.
 
 ### Changed
 
+- **`2026-08-04-incircle-precision.md` re-scoped from "leave it" to OPEN, and a repair attempt was
+  measured insufficient and reverted.** Three findings, recorded together because the third is the
+  useful one:
+
+  1. **It is reachable.** 2.9.1 closed it on "nothing can hand it that input", supported by a
+     0-of-1,528,820 sweep — real, but over four fixtures that all draw from a **single
+     origin-anchored box**, so the family has no *intra-set* dynamic range and structurally could not
+     reach this. What breaks the predicate is ratio within one set, not absolute magnitude:
+     translating a whole set to 1e9 is fine (Sterbenz), mixing scales inside one set is not. With one
+     vertex at ~6e5 and five points inside ~5e-17 of the origin, **`delaunay_2d` silently drops an
+     input point** — failing seeds are dense, 8 of the first 20 on a 3,999-seed sweep.
+  2. **The suite's own oracle is blind to it by construction.** `_dl_violations` decides
+     circumcircle-emptiness by calling `_col_in_circumcircle`, i.e. the code under test. Only
+     structural oracles (`_dl_used`, `_dl_max_edge_share`) can see this. The two repro `.tcyr` files
+     in `issues/` are not under `tests/`, so CI has never run them.
+  3. ⛔ **An exact `orient2d` on the predicate's own arguments does NOT fix it.** The obvious repair
+     was implemented — adaptive Shewchuk-style, Dekker splitting, TwoProduct/TwoSum/TwoDiff tails, a
+     four-component `Two_Two_Diff` expansion — and **changed nothing**: the fixture still returned 4
+     triangles instead of 6 and still dropped a point. The expansion was verified correct in
+     isolation. The information is simply gone before it runs: `_col_in_circumcircle` differences in
+     floating point first, and with `b`, `c` at ~1e-17 and `a` at ~4e5 both differences round to the
+     **same double**, so `b` and `c` become the same point and the exact determinant of those
+     operands is faithfully `0` — against a true `-5.457401e-11` from the original coordinates.
+     The exactness has to extend back **through** the subtraction (`orient2dexact`: six TwoProducts
+     of the raw coordinates combined by expansion sums), which is a materially larger routine and
+     belongs in its own bite with its own benchmark, since it sits in `delaunay_2d`'s inner loop.
+
+  **The attempt was reverted rather than shipped** — it added cost and a page of numerical code while
+  fixing none of the measured failures. A ready-made failing fixture (literal bit patterns, exact
+  hull h = 4 so the correct count is 6) is recorded in the filing so the next attempt starts from
+  evidence rather than re-deriving one.
+
 - **Three "NOT APPLIED, by decision" performance records were wrong on all three counts**, in both
   `doc-health.md` and `roadmap.md`. `_kd_partition` and `triangulate_polygon` **shipped in 2.7.1**
   (a balance guard rather than the spec's unconditional quickselect; reflex-only ear pruning at

@@ -2,6 +2,49 @@
 
 ## [Unreleased] — 2.10.0 in progress
 
+### Added
+
+- **`src/geo_diff.cyr` — differentiable ray–surface intersection (2.10.0, first bite).**
+  `geo_jet_sphere` and `geo_jet_plane` return the hit parameter **and its full gradient** from one
+  evaluation: `dt/d(origin)`, `dt/d(direction)`, and the shape parameters (`dt/d(center)`,
+  `dt/d(radius)`; `dt/d(normal)`, `dt/d(distance)`). Plus `geo_jet_dpoint`, the chain rule through
+  `geo_ray_at` for the hit *point* rather than the parameter.
+
+  **Not dual numbers, and that was a measured decision.** `Dual` is a heap struct and every
+  `dual_*` op allocates 16 bytes under an allocator that never frees, so threading duals through a
+  96 ns intersection would leak dozens of objects per call; and forward mode carries one seed per
+  evaluation, so a sphere's 7 parameters would need 7 passes. The implicit function theorem gives
+  the whole gradient in closed form instead — `t` is the root of `F(o + t·d; θ) = 0`, so
+  `dt/do = −g/(g·d)`, `dt/dθ = −(∂F/∂θ)/(g·d)`. Every entry point is a **post-pass on the shipped
+  primal**: it calls the same `geo_ray_*` a non-differentiating caller would, so there is no second
+  copy of any intersection algorithm that could drift from the one under test.
+
+  **Cost, measured**: `jet_sphere` **336 ns** against `ray_sphere`'s **95 ns** — **3.5×** the primal
+  for all seven partials, versus the seven full evaluations forward-mode duals would need.
+  `jet_plane` is 159 ns. Both are new rows in `bench-history.csv`.
+
+  **Verification** — the oracle is central differences of the *shipped primal itself*, so the jet is
+  checked against the function it claims to differentiate rather than a reimplementation that could
+  share a mistake with it. 16 ray/sphere configurations × 10 partials. **Five mutants caught**: a
+  sign flip on `dt/do`, `dt/dd` missing its `t` factor, a `dt/dcenter` sign flip, `dt/dradius`
+  dropping its radius factor, and a typed accessor that stops checking `kind`.
+
+  ⚠ **The radius mutant initially SURVIVED**, because the fixture used radius 1 — where
+  `dt/dr = r/(g·d)` is indistinguishable from `1/(g·d)`. Two radii, neither 1, now make the factor
+  load-bearing. That is the third time this release a fixture looked like it was testing something
+  it was not; it is recorded inline beside the fixture.
+
+  Two conventions stated rather than assumed: `dt/dd` is the **raw** partial (well-posed only
+  because the homogeneity repair below landed first), with `geo_jet_dt_dd_unit` offered for a
+  unit-constrained caller rather than projecting silently — projecting would make `d·(dt/dd)` read 0
+  when the true value is `−t`. And the shape-derivative slots are reached **only** through typed
+  per-primitive accessors that check a `kind` tag, so reading a sphere's radius slot off a plane jet
+  returns the error sentinel instead of that plane's distance derivative.
+
+  Scope is deliberately the smooth seam: plane and sphere. Triangle follows; `aabb`/`obb`/`capsule`
+  select their hit through `f64_max`/`f64_min` at 12 sites and need a `_core` refactor of shipped
+  `geo.cyr`, which is not worth risking under 3392 assertions for a first bite.
+
 ### Fixed
 
 - **`geo_ray_sphere` returned a `t` whose hit point was not on the sphere, whenever the ray

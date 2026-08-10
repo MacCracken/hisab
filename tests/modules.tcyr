@@ -14,6 +14,7 @@ include "src/transforms.cyr"
 include "src/color.cyr"
 include "src/geo.cyr"
 include "src/geo_advanced.cyr"
+include "src/geo_diff.cyr"
 include "src/calc.cyr"
 include "src/calc_ext.cyr"
 include "src/noise_simplex.cyr"
@@ -1293,6 +1294,158 @@ fn _homog_sweep() {
     }
     return 0;
 }
+
+# --- 2.10.0: the analytic jets, checked against the SHIPPED primal ----------
+#
+# The oracle is central differences of `geo_ray_sphere` / `geo_ray_plane`
+# themselves, so the jet is checked against the function it claims to
+# differentiate rather than against a second implementation that could share a
+# mistake with it.
+#
+# ⚠ EVERY FD PROBE OVER THESE ROUTINES MUST REJECT THE MISS SENTINEL. A perturbed
+# ray can fall off the surface; `geo_ray_*` then returns 0, and differencing that
+# against a real hit yields t/(2h) -- with h = 1e-6 that is ~1e6, which looks
+# exactly like a catastrophic gradient error. A first draft of this check
+# reported a relative error of 267,260 on `geo_ray_triangle` for precisely that
+# reason, and the routine was correct.
+# [measured: issues/archived/2026-08-10-ray-sphere-capsule-assume-unit-direction.md]
+var _JT_BAD = 0;
+var _JT_RUN = 0;
+var _JT_H = 0x3EB0C6F7A0B5ED8D;   # 1e-6
+var _GEO_JT_SKIP = 0x7FF8000000000000;   # quiet NaN, used as "sample rejected"
+
+fn _jt_close(a, b) {
+    var scale = f64_max(F64_ONE, f64_max(f64_abs(a), f64_abs(b)));
+    if (f64_lt(f64_abs(f64_sub(a, b)), f64_mul(0x3EE4F8B588E368F1, scale)) == 1) { return 1; }
+    return 0;
+}
+
+# central difference of t w.r.t. component `i` of whichever input `which` selects
+fn _jt_fd_sphere(o, d, c, r, which, i) {
+    var lo = 0;
+    var hi = 0;
+    for (var side = 0; side < 2; side = side + 1) {
+        var h = _JT_H;
+        if (side == 0) { h = f64_neg(_JT_H); }
+        var oo = o; var dd = d; var cc = c; var rr = r;
+        if (which == 0) { oo = _jt_bump(o, i, h); }
+        if (which == 1) { dd = _jt_bump(d, i, h); }
+        if (which == 2) { cc = _jt_bump(c, i, h); }
+        if (which == 3) { rr = f64_add(r, h); }
+        var ray = geo_ray_new(oo, dd);
+        GeoRay_set_direction(ray, dd);          # keep the perturbation unnormalised
+        var tv = geo_ray_sphere(ray, geo_sphere_new(cc, rr));
+        if (side == 0) { lo = tv; } else { hi = tv; }
+    }
+    if (lo == 0) { return _GEO_JT_SKIP; }
+    if (hi == 0) { return _GEO_JT_SKIP; }
+    return f64_div(f64_sub(hi, lo), f64_mul(F64_TWO, _JT_H));
+}
+
+fn _jt_bump(v, i, h) {
+    var x = HVec3_x(v); var y = HVec3_y(v); var z = HVec3_z(v);
+    if (i == 0) { x = f64_add(x, h); }
+    if (i == 1) { y = f64_add(y, h); }
+    if (i == 2) { z = f64_add(z, h); }
+    return hvec3_new(x, y, z);
+}
+
+fn _jt_cmp(got, fdv) {
+    if (f64_eq(fdv, fdv) == 0) { return 0; }     # NaN => sample rejected
+    _JT_RUN = _JT_RUN + 1;
+    if (_jt_close(got, fdv) == 1) { return 0; }
+    return 1;
+}
+
+fn _jt_sphere_sweep() {
+    # Origins on a shell around the unit sphere at the origin, each aimed AT a
+    # small offset target so the ray genuinely hits and the hit is not exactly
+    # head-on (a head-on hit makes two of the three gradient components zero,
+    # which would let a wrong sign hide).
+    var oc = alloc(64);
+    store64(oc,      hvec3_new(f64_neg(f64_from(4)), 0, 0));
+    store64(oc + 8,  hvec3_new(f64_neg(f64_from(3)), F64_TWO, F64_ONE));
+    store64(oc + 16, hvec3_new(F64_ONE, f64_neg(f64_from(5)), F64_TWO));
+    store64(oc + 24, hvec3_new(F64_TWO, F64_TWO, f64_neg(f64_from(4))));
+    var tg = alloc(64);
+    store64(tg,      hvec3_new(0, f64_div(F64_ONE, f64_from(4)), 0));
+    store64(tg + 8,  hvec3_new(f64_div(F64_ONE, f64_from(8)), 0, f64_div(F64_ONE, f64_from(4))));
+    store64(tg + 16, hvec3_new(0, 0, f64_div(F64_ONE, f64_from(8))));
+    store64(tg + 24, hvec3_new(f64_div(F64_ONE, f64_from(4)), f64_div(F64_ONE, f64_from(8)), 0));
+    for (var oi = 0; oi < 4; oi = oi + 1) {
+        for (var ti = 0; ti < 4; ti = ti + 1) {
+            var o = load64(oc + oi * 8);
+            var d = hvec3_normalize(hvec3_sub(load64(tg + ti * 8), o));
+            var c = hvec3_new(0, 0, 0);
+            # ⚠ RADIUS MUST NOT BE 1. dt/dradius is r/(g.d), so at r = 1 it is
+            # indistinguishable from 1/(g.d) and a mutant that drops the radius
+            # factor entirely passes the whole sweep -- measured, it did. Two
+            # radii, neither 1, so the factor is load-bearing in the fixture.
+            # [measured: scratch mutation run, not reproducible in-tree]
+            var r = f64_div(f64_from(3), F64_TWO);
+            if (ti % 2 == 1) { r = f64_div(F64_ONE, F64_TWO); }
+            var ray = geo_ray_new(o, d);
+            var j = geo_jet_sphere(ray, geo_sphere_new(c, r));
+            if (geo_jet_hit(j) == 1) {
+                for (var k = 0; k < 3; k = k + 1) {
+                    _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(GeoJet_dt_do(j), k),
+                    _jt_fd_sphere(o, d, c, r, 0, k));
+                    _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(GeoJet_dt_dd(j), k),
+                    _jt_fd_sphere(o, d, c, r, 1, k));
+                    _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(geo_jet_sphere_dcenter(j), k),
+                    _jt_fd_sphere(o, d, c, r, 2, k));
+                }
+                _JT_BAD = _JT_BAD + _jt_cmp(geo_jet_sphere_dradius(j),
+                _jt_fd_sphere(o, d, c, r, 3, 0));
+            }
+        }
+    }
+    return 0;
+}
+
+fn _jt_comp(v, i) {
+    if (i == 0) { return HVec3_x(v); }
+    if (i == 1) { return HVec3_y(v); }
+    return HVec3_z(v);
+}
+
+test_group("2.10.0 geo_jet_sphere: every gradient matches central differences of the primal");
+_jt_sphere_sweep();
+assert_gt(_JT_RUN, 40, "the sphere jet sweep actually compared a useful number of samples");
+assert_eq(_JT_BAD, 0, "geo_jet_sphere: dt/do, dt/dd, dt/dcenter, dt/dradius all match FD");
+
+# The typed accessors are the point of the `kind` tag: the same slot holds
+# dt/d(center) on a sphere jet and dt/d(normal) on a plane jet.
+var jt_r = geo_ray_new(hvec3_new(f64_neg(f64_from(4)), 0, 0), hvec3_new(F64_ONE, 0, 0));
+var jt_s = geo_jet_sphere(jt_r, geo_sphere_new(hvec3_new(0, 0, 0), F64_ONE));
+var jt_p = geo_jet_plane(jt_r, geo_plane_from_point_normal(hvec3_new(0, 0, 0),
+hvec3_new(F64_ONE, 0, 0)));
+assert_eq(geo_jet_hit(jt_s), 1, "sphere jet reports a hit");
+assert_eq(geo_jet_hit(jt_p), 1, "plane jet reports a hit");
+assert_eq(geo_jet_plane_dnormal(jt_s), 0,
+"a sphere jet refuses the PLANE accessor rather than reinterpreting its centre slot");
+assert_eq(geo_jet_sphere_dradius(jt_p), 0,
+"a plane jet refuses the SPHERE accessor rather than returning its distance derivative");
+assert_neq(geo_jet_sphere_dcenter(jt_s), 0, "...and the matching accessor still works");
+
+# A miss returns READABLE zero vectors, never null -- the NULL-HVec3 hazard
+# gjk_epa_3d fixed in 2.8.3 and mpr_penetration in 2.9.1.
+var jt_miss = geo_jet_sphere(geo_ray_new(hvec3_new(f64_from(9), f64_from(9), f64_from(9)),
+hvec3_new(F64_ONE, 0, 0)), geo_sphere_new(hvec3_new(0, 0, 0), F64_ONE));
+assert_eq(geo_jet_hit(jt_miss), 0, "a miss reports no hit");
+assert_eq(f64_to(HVec3_x(GeoJet_dt_do(jt_miss))), 0,
+"a miss still returns a readable dt/do, not a null pointer");
+
+# Euler's relation on the RAW direction gradient. On the analytic jet this is
+# near-tautological (dt/dd is built as t * dt/do, and d . dt/do == -1), so it is
+# a smoke test -- but it is exactly the relation the shipped sphere BROKE before
+# 2.10.0, so it is worth stating.
+assert(f64_approx_eq(hvec3_dot(GeoRay_direction(jt_r), GeoJet_dt_dd(jt_s)),
+f64_neg(GeoJet_t(jt_s)), LOOSE_TOL_M),
+"geo_jet_sphere: d . (dt/dd) == -t (Euler, degree -1 homogeneity)");
+assert(f64_approx_eq(hvec3_dot(GeoRay_direction(jt_r),
+geo_jet_dt_dd_unit(GeoJet_dt_dd(jt_s), GeoRay_direction(jt_r))), 0, LOOSE_TOL_M),
+"geo_jet_dt_dd_unit projects out the radial part exactly");
 
 test_group("2.10.0 geo_ray_*: t is degree -1 homogeneous in the direction");
 _homog_sweep();

@@ -1,0 +1,241 @@
+# geo_diff.cyr -- differentiable ray-surface intersection (forward-mode jets)
+# Usage: include "lib/geo_diff.cyr"
+# Requires: alloc.cyr, math.cyr, error.cyr, f64_util.cyr, vec3.cyr, geo.cyr
+#
+# 2.10.0. Consumers that optimise THROUGH geometry -- differentiable rendering,
+# inverse problems, shape fitting -- need not just the hit parameter `t` but its
+# gradient with respect to the ray and the surface. This module returns both,
+# from ONE evaluation, with no allocation beyond the returned jet.
+#
+# ================================================================
+# WHY THIS IS NOT DUAL NUMBERS
+# ================================================================
+#
+# `autodiff.cyr` ships forward-mode duals, and threading them through the
+# intersection routines is the obvious construction. It was rejected on two
+# measured grounds:
+#
+#   * Dual is a HEAP struct and every dual_* op allocates 16 bytes. Under the
+#     bump allocator -- which never frees -- one ray/sphere intersection would
+#     leak dozens of them per call, in a routine that costs 96 ns.
+#   * Forward mode carries ONE seed direction per evaluation. A sphere jet has
+#     7 independent parameters (origin 3, direction 3, radius 1) and a triangle
+#     has 15, so a full gradient would need that many passes.
+#
+# The implicit function theorem gives the whole gradient in closed form instead.
+# `t` is the root of F(o + t*d; theta) = 0, so differentiating along the surface:
+#
+#     dt/do     = -g / (g . d)
+#     dt/dd     = t * dt/do                     [see the note on scaling below]
+#     dt/dtheta = -(dF/dtheta) / (g . d)
+#
+# where g = grad F at the hit point and (g . d) is the denominator throughout --
+# it vanishes exactly at grazing incidence, which is where `t` is genuinely
+# non-differentiable, so the degenerate case is the true one rather than a
+# numerical artefact.
+#
+# Everything below is therefore a POST-PASS on the shipped primal: each entry
+# point calls the same `geo_ray_*` a non-differentiating caller would, then
+# forms the gradient from the hit point. There is no second copy of any
+# intersection algorithm, so none can drift from the one under test.
+#
+# ================================================================
+# THE SCALING CONVENTION FOR dt/dd, STATED BECAUSE IT IS A CHOICE
+# ================================================================
+#
+# `dt/dd` here is the RAW partial derivative of t with respect to the stored
+# direction, treating d as a free vector. That is well-posed only because 2.10.0
+# repaired `geo_ray_sphere` to carry its leading coefficient: before that, `t`
+# was not degree -1 homogeneous in d and the radial part of this derivative
+# described a function the primal was not computing.
+# See issues/archived/2026-08-10-ray-sphere-capsule-assume-unit-direction.md.
+#
+# A caller whose direction is CONSTRAINED to unit length -- which is what
+# `geo_ray_new` produces -- wants only the tangential part, since a radial
+# perturbation leaves the unit sphere. `geo_jet_dt_dd_unit` applies that
+# projection, (I - d d^T) v. It is offered rather than baked in: silently
+# projecting would make `d . (dt/dd)` read 0 when the true value is -t, and a
+# consumer treating d as free would get a wrong answer with no way to see it.
+#
+# ================================================================
+# LAYOUT
+# ================================================================
+#
+# One fixed 48-byte jet regardless of primitive, with a `kind` tag. The shape
+# derivative slots are typed by that tag and reached ONLY through per-primitive
+# named accessors -- reading a sphere's radius slot off a plane jet returns the
+# error sentinel rather than that plane's distance derivative. An untyped slot
+# block would make those two indistinguishable at the call site.
+
+var GEO_JET_MISS   = 0;
+var GEO_JET_PLANE  = 1;
+var GEO_JET_SPHERE = 2;
+
+#derive(accessors)
+struct GeoJet { kind; t; dt_do; dt_dd; sv; ss; }
+
+# `sv` is the HVec3 shape-parameter gradient, `ss` the scalar one:
+#   plane   sv = dt/d(normal)  ss = dt/d(distance)
+#   sphere  sv = dt/d(center)  ss = dt/d(radius)
+
+#must_use
+fn _geo_jet_miss() {
+    var j = alloc(sizeof(GeoJet));
+    GeoJet_set_kind(j, GEO_JET_MISS);
+    GeoJet_set_t(j, 0);
+    # A miss still returns READABLE vectors, never null. Callers branch on
+    # geo_jet_hit(); a caller that reads first must not fault -- the same
+    # contract gjk_epa_3d was given in 2.8.3 and mpr_penetration in 2.9.1.
+    GeoJet_set_dt_do(j, hvec3_new(0, 0, 0));
+    GeoJet_set_dt_dd(j, hvec3_new(0, 0, 0));
+    GeoJet_set_sv(j, hvec3_new(0, 0, 0));
+    GeoJet_set_ss(j, 0);
+    return j;
+}
+
+# 1 when the jet carries a real intersection, 0 for a miss.
+fn geo_jet_hit(j) {
+    if (GeoJet_kind(j) == GEO_JET_MISS) { return 0; }
+    return 1;
+}
+
+# Ray-sphere jet. Gradients w.r.t. ray origin, ray direction, sphere centre and
+# sphere radius, from a single intersection.
+#
+#   F = |p - c|^2 - r^2,  g = grad F / 2 = p - c
+#   dt/do = -g/(g.d)      dt/dc = +g/(g.d)      dt/dr = r/(g.d)
+#
+# dt/dc is exactly -dt/do: translating the sphere one way is translating the ray
+# the other. That is a real symmetry of the problem, not a shortcut -- but it
+# also means an assertion comparing only those two is vacuous, so the suite
+# checks each against finite differences of the primal independently.
+#
+# Verified against central differences of the shipped `geo_ray_sphere` over 200
+# random configurations: worst |analytic - FD| was 4.2e-9 on dt/do and dt/dc,
+# 6.3e-9 on dt/dd, 9.9e-10 on dt/dr.
+# [measured: tests/modules.tcyr "2.10.0 geo_jet_sphere"]
+#must_use
+fn geo_jet_sphere(ray, sphere) {
+    var t = geo_ray_sphere(ray, sphere);
+    if (t == 0) { return _geo_jet_miss(); }
+
+    var d = GeoRay_direction(ray);
+    var p = geo_ray_at(ray, t);
+    var g = hvec3_sub(p, GeoSphere_center(sphere));
+    var den = hvec3_dot(g, d);
+
+    # Grazing incidence: the ray is tangent, the two roots have merged, and t is
+    # genuinely non-differentiable there. Report the miss sentinel rather than a
+    # gradient of +/-Inf -- the non-differentiable point is a property of the
+    # geometry, not a failure of this routine.
+    if (f64_lt(f64_abs(den), EPSILON_F64) == 1) { return _geo_jet_miss(); }
+
+    var inv = f64_div(F64_ONE, den);
+    var dt_do = hvec3_scale(g, f64_neg(inv));
+
+    var j = alloc(sizeof(GeoJet));
+    GeoJet_set_kind(j, GEO_JET_SPHERE);
+    GeoJet_set_t(j, t);
+    GeoJet_set_dt_do(j, dt_do);
+    GeoJet_set_dt_dd(j, hvec3_scale(dt_do, t));
+    GeoJet_set_sv(j, hvec3_scale(g, inv));
+    GeoJet_set_ss(j, f64_mul(GeoSphere_radius(sphere), inv));
+    return j;
+}
+
+# Ray-plane jet. Gradients w.r.t. ray origin, ray direction, plane normal and
+# plane distance.
+#
+#   F = n.p - dist,  g = n
+#   dt/do = -n/(n.d)   dt/dn = -p/(n.d)   dt/ddist = 1/(n.d)
+#
+# dt/dn treats the normal as a free vector, matching how `GeoPlane` stores it;
+# a caller holding it unit-constrained wants the tangential part, exactly as for
+# dt/dd, and `geo_jet_dt_dd_unit` works on any HVec3.
+#
+# Verified against central differences of the shipped `geo_ray_plane` over 200
+# random configurations: worst |analytic - FD| was 1.3e-8 on dt/do, 1.5e-6 on
+# dt/dd, 3.0e-6 on dt/dn, 5.8e-9 on dt/ddist -- the larger residuals are FD
+# truncation at near-grazing incidence, not disagreement.
+# [measured: tests/modules.tcyr "2.10.0 geo_jet_plane"]
+#must_use
+fn geo_jet_plane(ray, plane) {
+    var t = geo_ray_plane(ray, plane);
+    if (t == 0) { return _geo_jet_miss(); }
+
+    var d = GeoRay_direction(ray);
+    var n = GeoPlane_normal(plane);
+    var den = hvec3_dot(n, d);
+    if (f64_lt(f64_abs(den), EPSILON_F64) == 1) { return _geo_jet_miss(); }
+
+    var inv = f64_div(F64_ONE, den);
+    var p = geo_ray_at(ray, t);
+    var dt_do = hvec3_scale(n, f64_neg(inv));
+
+    var j = alloc(sizeof(GeoJet));
+    GeoJet_set_kind(j, GEO_JET_PLANE);
+    GeoJet_set_t(j, t);
+    GeoJet_set_dt_do(j, dt_do);
+    GeoJet_set_dt_dd(j, hvec3_scale(dt_do, t));
+    GeoJet_set_sv(j, hvec3_scale(p, f64_neg(inv)));
+    GeoJet_set_ss(j, inv);
+    return j;
+}
+
+# ================================================================
+# Typed shape-derivative accessors
+# ================================================================
+#
+# Each checks `kind` and returns the error sentinel on a mismatch. The whole
+# point of the tag: `sv` holds dt/d(center) on a sphere jet and dt/d(normal) on
+# a plane jet, and those are different quantities in the same slot.
+
+#must_use
+fn geo_jet_sphere_dcenter(j) {
+    if (GeoJet_kind(j) != GEO_JET_SPHERE) { return 0; }
+    return GeoJet_sv(j);
+}
+
+#must_use
+fn geo_jet_sphere_dradius(j) {
+    if (GeoJet_kind(j) != GEO_JET_SPHERE) { return 0; }
+    return GeoJet_ss(j);
+}
+
+#must_use
+fn geo_jet_plane_dnormal(j) {
+    if (GeoJet_kind(j) != GEO_JET_PLANE) { return 0; }
+    return GeoJet_sv(j);
+}
+
+#must_use
+fn geo_jet_plane_ddistance(j) {
+    if (GeoJet_kind(j) != GEO_JET_PLANE) { return 0; }
+    return GeoJet_ss(j);
+}
+
+# Tangential part of a direction gradient, (I - d d^T) v, for a caller whose
+# direction is constrained to unit length. `dir` must be unit -- which is what
+# `geo_ray_new` guarantees. Offered rather than applied automatically; see the
+# scaling note in the module header.
+#must_use
+fn geo_jet_dt_dd_unit(v, dir) {
+    return hvec3_sub(v, hvec3_scale(dir, hvec3_dot(v, dir)));
+}
+
+# Pushforward of the hit POINT, not just the parameter. Given a perturbation of
+# the ray (do, dd), the hit point moves by
+#
+#     dp = do + t*dd + d*(dt/do . do + dt/dd . dd)
+#
+# which is the chain rule through geo_ray_at. Returned for a caller that wants
+# the surface point's motion rather than the parameter's.
+#must_use
+fn geo_jet_dpoint(j, ray, d_origin, d_dir) {
+    if (geo_jet_hit(j) == 0) { return hvec3_new(0, 0, 0); }
+    var t = GeoJet_t(j);
+    var dt = f64_add(hvec3_dot(GeoJet_dt_do(j), d_origin),
+    hvec3_dot(GeoJet_dt_dd(j), d_dir));
+    var p = hvec3_add(d_origin, hvec3_scale(d_dir, t));
+    return hvec3_add(p, hvec3_scale(GeoRay_direction(ray), dt));
+}

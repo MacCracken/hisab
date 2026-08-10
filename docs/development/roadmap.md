@@ -236,6 +236,24 @@ Driver: aethersafha (compositor) and the differentiable-rendering use case. **Un
 are the exact surface the 2.8–2.9 arc spent four releases correcting. Starting now builds on ground
 that is freshly verified rather than freshly re-audited.
 
+### 2.10.0 — progress
+
+- [x] **`geo.cyr` homogeneity repair** — the precondition. `geo_ray_sphere` was not degree −1 in the
+      direction and `geo_ray_capsule` inherited it; the analytic `dt/dd` would have differentiated a
+      function the primal was not computing. Fixed, mutation-proven, +17.6% on `ray_sphere`.
+- [x] **First jet bite — `src/geo_diff.cyr`**: `geo_jet_sphere`, `geo_jet_plane`, `geo_jet_dpoint`,
+      typed shape accessors behind a `kind` tag. Full gradient in one evaluation, post-pass on the
+      shipped primal so no algorithm is duplicated. `jet_sphere` 336 ns vs `ray_sphere` 95 ns
+      (**3.5×** for all 7 partials). FD-against-the-primal oracle, 5 mutants caught.
+- [ ] **`geo_jet_triangle`** — the compositor's actual case, and the last of the smooth seam.
+      Möller–Trumbore, so `∂F/∂v0..v2` needs deriving; same FD oracle applies unchanged.
+- [ ] **`aabb` / `obb` / `capsule` jets** — deferred. All three select their hit through
+      `f64_max`/`f64_min` (12 sites), so they need a `_core(ray, shape, out)` split of shipped
+      `geo.cyr` before a jet can hook the selected branch. Not worth the risk in a first bite.
+- [ ] **Decide whether `dual_*` should gain a vector layer at all**, or whether the analytic route
+      makes `autodiff.cyr` a scalar-only module by design. 2.11.0 (reverse mode) is the forcing
+      question, not this release.
+
 ### 2.10.0 — first finding, before any code
 
 Running the design's own Euler-homogeneity check against the **shipped** primitives found a defect

@@ -136,6 +136,31 @@ stays at 2.9.2 until the scope closes.
 
 ### Changed
 
+- **The EPA certificate filing's central claim is false, and both of its candidate repairs are now
+  measured and rejected.** `2026-08-06-epa-certificate-tests-the-seed-not-the-polytope.md` argued
+  that EPA's certified exit "is never taken", that `_epa_polish` is therefore the primary path, and
+  that this explains why six EPA repairs were unmutatable in 2.9.0. **It only ever measured one of
+  the two public entry points.** On the filing's own 12 box fixtures: `gjk_epa_3d` falls back 12 of
+  12, `mpr_penetration` falls back **0 of 12** and certifies every one. The exit is live; the real
+  defect is a **certification asymmetry**, and its cause is the seed — `_epa_seed_portal` tries a
+  strictness upgrade (`geo_advanced.cyr:757-766`) and `_epa_seed_gjk` does not.
+
+  - ⛔ **The filing's Proposed fix — drop the seed test, keep `lo > 0` — produces wrong depths.**
+    Boxes go 12 → 0 fallbacks as predicted, but **four exact-tangency pairs then report a nonzero
+    depth for a touch whose true depth is 0** (`_ag_baddepth` 0 → 4 in the 110-pair agreement
+    sweep). At exact tangency `lo` can be marginally positive from rounding; the seed test was what
+    caught it. **The seed test is load-bearing.**
+  - **The cheaper alternative works but is not obviously worth it.** Giving `_epa_seed_gjk` the
+    portal's upgrade passes every assertion, including every exact-MTV depth on both entry points,
+    and takes boxes 12 → 6 — at **+19.4% on `gjk_epa_sphere_box`** (150.4 µs vs 125.6 µs, three runs
+    each, non-overlapping, against a ~7% noise floor). Spheres pay the extra support evaluation and
+    still fall back, which points at a separate root cause in that family. **No returned answer
+    changes either way**, so this buys internal consistency and mutatability, not correctness.
+
+  **The code is unchanged**, the filing is re-diagnosed and re-titled, and its severity is downgraded
+  Medium → Low. The suite's assertions are rewritten to state the asymmetry — the `mpr_penetration`
+  half was never measured before — rather than the "unreachable path" reading.
+
 - **`2026-08-04-incircle-precision.md` was closed as "leave it" in 2.9.1 on a premise that does not
   hold.** The 0-of-1,528,820 sweep behind that call was real, but every one of its four fixtures
   draws from a **single origin-anchored box**, so the family has no *intra-set* dynamic range and

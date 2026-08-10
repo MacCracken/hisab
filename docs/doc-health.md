@@ -6,7 +6,32 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-08-09 — **v2.9.2, toolchain release.** Pin 6.5.9 → **6.5.16** (seven
+> **Last refresh**: 2026-08-10 — **v2.9.3, the open filings.** Five of the six internal filings in
+> `development/issues/` closed; the sixth re-diagnosed and correctly open. Suite 3351 → **3376**,
+> benchmarks 55 → **58**, constant gate 153 → **155**.
+>
+> **The filings were the thing that needed auditing.** Two of the six argued for repairs that
+> measurement refuted, and both were implemented in full before being rejected: `incircle-precision`
+> implies an exact determinant of *pre-differenced* operands, which fixes nothing because the two
+> operands have already rounded to the same double before any exact arithmetic runs; and
+> `epa-certificate` proposes dropping EPA's seed test, which certifies every box but makes **four
+> exact-tangency pairs report a nonzero depth for a touch whose true depth is 0**. A third claim —
+> that EPA's certified exit "is never taken" — was false because it only ever measured one of the two
+> public entry points: `gjk_epa_3d` falls back 12 of 12, `mpr_penetration` **0 of 12**.
+>
+> Two real defects came out of it, both silent: `delaunay_2d` **dropped input points** on any set
+> mixing scales (fixed with an adaptive exact `orient2d` on raw coordinates, 300/300 against exact
+> rationals where the float winding scores 0/300), and `_col_dl_incircle` answered differently
+> depending on **vertex order**. Plus three guards policing nothing — the k-d balance guard had
+> neither a regression assertion nor a benchmark on its own input class (now 6.0×), the ear prune's
+> only benchmark was its best case (reflex-heavy is 3.6×), and `_col_point_in_tri` documented itself
+> as strict-interior while being boundary-inclusive.
+>
+> **Standing lesson, and it is 2.9.2's pointed one step further back:** a gate is not evidence until
+> something has aimed it at its own output — and *a filing is not evidence until something has re-run
+> it*. Three of this release's six were wrong in the record, not in the code.
+>
+> **Previous refresh**: 2026-08-09 — **v2.9.2, toolchain release.** Pin 6.5.9 → **6.5.16** (seven
 > releases), sakshi 2.4.8 → **2.4.10**, no library source change. **The doc work was the larger half
 > of this release.** A five-dimension sweep of the tree, each dimension adversarially verified,
 > found **63 stale documentary claims across 15 files**; the verifier reproduced **59** and refuted
@@ -222,7 +247,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change.
 
 ---
 
-## At a glance — inventory (last reviewed 2026-08-09, v2.9.2)
+## At a glance — inventory (last reviewed 2026-08-10, v2.9.3)
 
 **38 tracked markdown files** (`git ls-files '*.md' | wc -l`), counted rather than estimated —
 the previous "~23" was an estimate that had been carried since 2026-05-29. Bucket counts:
@@ -234,7 +259,7 @@ the previous "~23" was an estimate that had been carried since 2026-05-29. Bucke
 | 🟠 **Read-through outstanding** | 0 | `SECURITY.md` and `development/threat-model.md` both carry the 2.7.0 → 2.9.x closures. |
 | 🔵 **Evergreen** | 1 | `CODE_OF_CONDUCT.md` — Contributor Covenant; re-read only on policy change. |
 | 📅 **Dated artifact — supersede, don't edit** | 12 | `audit/` (8 reports), `benchmarks-rust-v-cyrius.md` (v2.2.0), `development/archive/cyrius-linalg-proposal.md` (shipped), plus the two `2026-08-04-incircle-repro*.tcyr` fixtures under `issues/`. |
-| 🐞 **Tracked toolchain issues** | 4 live, 5 archived | `development/issues/*`. **Re-verified on 6.5.16, 2026-08-09.** Live: `for-empty-clauses` (still rejects both forms — but its central complaint, the error landing at the wrong line, is FIXED); `cli-arg-clobbers-source` (**not** re-tested — destructive, and recorded as unverified rather than assumed); and **two new filings from this bump** — `distlib`'s self-check rejecting bundles that read a stdlib global, and dead-function bodies never being syntax-checked. Archived this release: `interval-ident-lex`, whose own close condition (no reserved name still emits the old wording) was discharged by a **67/67** sweep of cycc's `TOKNAME_BUILTIN` table. |
+| 🐞 **Open filings** | 4 | `development/issues/*`, and **all four are now upstream-toolchain**, not hisab: `cli-arg-clobbers-source` (deliberately never re-tested — destructive, recorded as unverified rather than assumed), `distlib`'s self-check rejecting bundles that read a stdlib global, dead-function bodies never being syntax-checked, and `epa-certificate` — the one internal item still open, and **re-diagnosed in 2.9.3**: its central claim was false and both its candidate repairs are measured and rejected; what is left is the sphere-family non-convergence, which is independent of the certificate. `for-empty-clauses` was archived on discovering upstream had closed it **WON'T-FIX by design** five releases earlier. Two of the four are filed upstream in the cyrius repo. |
 
 Numbers roll up from the per-tier tables below.
 
@@ -259,11 +284,11 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `README.md` | 2026-08-09 | ✅ Fresh | **v2.9.2 — nine releases of drift closed in one pass.** Every stat re-derived from the tree: version/tag → **2.9.2**, toolchain → **6.5.16**, sakshi → **2.4.10**, tests → **3351 across five suites** (the fifth, `abuse.tcyr`, had been missing since 2.9.0), benchmarks → **55**, bundle → **805,479 B / 21,368 lines**, ELF → **220,064 B**, src → **21,262 lines**. It had been carrying the v2.6.15 figures — `~578 KB`, `1127`, `28`, `6.5.6`, `2.4.7` — since 2026-08-03. |
-| `CHANGELOG.md` | 2026-08-09 | ✅ Fresh | **Source of truth per CLAUDE.md.** +2.9.2 — the toolchain bump plus the three non-gating gates, with the alloc bullet **corrected in place**: it first claimed hisab does not reach `alloc_via`, which is false (`str_from`/`vec_new`/`vec_push` delegate through `default_alloc()`, 152 call sites in `src/`). Earlier: +2.6.12/13/14/15 entries — the audit-repair arc — plus the **[Unreleased] 2.7.0** section: the correction notice, 2.7.0-A (6 carried-over findings + the `beta`→`eta` rename), 2.7.0-B (3 high + the `cmat` null medium), a **Breaking** entry for `geo_ray_plane`, and a Performance table for `bvh_degenerate_4k` (2.722 s → 15.5 ms). 2.6.12 and 2.6.14 carry **### Security** sections. None breaking; no API or signature change across the arc, so consumers only rebuild. |
-| `CLAUDE.md` | 2026-08-09 | ✅ Fresh | **v2.9.2**: Status paragraph rewritten from v2.6.15 to the 2.7.0–2.9.2 arc; toolchain → 6.5.16; every count re-measured (3351/5 suites, 55 benchmarks, 153/153 constants, coverage 99%, bundle 805,479 B). Layout gained `tests/abuse.tcyr` and the two new scripts; CI gate list gained the measurement job and the `check --with-deps` bundle step. Also **corrected `cyrius fmt --check <file>` → `cyrius fmt <file> --check`** — the documented order prints a usage error and exits 1; CI always had it right. |
-| `VERSION` | 2026-08-09 | ✅ Fresh | Single source of truth (`2.9.2`). **Two sites it cannot reach are now gated instead of trusted**: `src/main.cyr`'s printed string (Cyrius has no build-time interpolation) and `dist/hisab.cyr`'s `# Version:` header. `scripts/version-bump.sh` rewrites the first; CI asserts both. |
-| `CONTRIBUTING.md` | 2026-08-09 | ✅ Fresh | **v2.9.2**: prerequisite pin 6.5.6 → **6.5.16**; both test-suite lists gained `tests/abuse.tcyr`; local gate recipe gained `check-measurements.sh` and the note that `cyrius distlib` exits 1 on a correct bundle under ≥ 6.5.14. |
+| `README.md` | 2026-08-10 | ✅ Fresh | **v2.9.3**: version/tag → 2.9.3, tests → **3376**, benchmarks → **58**, library → 21,498 lines, bundle → ~798 KB. Earlier, **v2.9.2 — nine releases of drift closed in one pass.** Every stat re-derived from the tree: version/tag → **2.9.2**, toolchain → **6.5.16**, sakshi → **2.4.10**, tests → **3351 across five suites** (the fifth, `abuse.tcyr`, had been missing since 2.9.0), benchmarks → **55**, bundle → **805,479 B / 21,368 lines**, ELF → **220,064 B**, src → **21,262 lines**. It had been carrying the v2.6.15 figures — `~578 KB`, `1127`, `28`, `6.5.6`, `2.4.7` — since 2026-08-03. |
+| `CHANGELOG.md` | 2026-08-10 | ✅ Fresh | **+2.9.3.** Earlier: **Source of truth per CLAUDE.md.** +2.9.2 — the toolchain bump plus the three non-gating gates, with the alloc bullet **corrected in place**: it first claimed hisab does not reach `alloc_via`, which is false (`str_from`/`vec_new`/`vec_push` delegate through `default_alloc()`, 152 call sites in `src/`). Earlier: +2.6.12/13/14/15 entries — the audit-repair arc — plus the **[Unreleased] 2.7.0** section: the correction notice, 2.7.0-A (6 carried-over findings + the `beta`→`eta` rename), 2.7.0-B (3 high + the `cmat` null medium), a **Breaking** entry for `geo_ray_plane`, and a Performance table for `bvh_degenerate_4k` (2.722 s → 15.5 ms). 2.6.12 and 2.6.14 carry **### Security** sections. None breaking; no API or signature change across the arc, so consumers only rebuild. |
+| `CLAUDE.md` | 2026-08-10 | ✅ Fresh | **v2.9.3**: status → 2.9.3, counts re-measured (3376/5 suites, 58 benchmarks, 155/155 constants, bundle 817,332 B / 21,604 lines = 78.0% of the 1 MB `input_buf`), and the arc paragraph gained what 2.9.3 found — that two of six filings argued for repairs measurement refuted. Earlier, **v2.9.2**: Status paragraph rewritten from v2.6.15 to the 2.7.0–2.9.2 arc; toolchain → 6.5.16; every count re-measured (3351/5 suites, 55 benchmarks, 153/153 constants, coverage 99%, bundle 805,479 B). Layout gained `tests/abuse.tcyr` and the two new scripts; CI gate list gained the measurement job and the `check --with-deps` bundle step. Also **corrected `cyrius fmt --check <file>` → `cyrius fmt <file> --check`** — the documented order prints a usage error and exits 1; CI always had it right. |
+| `VERSION` | 2026-08-10 | ✅ Fresh | Single source of truth (`2.9.3`). **The two sites it cannot reach are now gated AND automated** — `scripts/version-bump.sh` rewrote `src/main.cyr` on this bump, which is the gate added at 2.9.2 doing its job. **Two sites it cannot reach are now gated instead of trusted**: `src/main.cyr`'s printed string (Cyrius has no build-time interpolation) and `dist/hisab.cyr`'s `# Version:` header. `scripts/version-bump.sh` rewrites the first; CI asserts both. |
+| `CONTRIBUTING.md` | 2026-08-10 | ✅ Fresh | **v2.9.3**: pin note re-dated. Earlier, v2.9.2: prerequisite pin 6.5.6 → **6.5.16**; both test-suite lists gained `tests/abuse.tcyr`; local gate recipe gained `check-measurements.sh` and the note that `cyrius distlib` exits 1 on a correct bundle under ≥ 6.5.14. |
 | `SECURITY.md` | 2026-08-04 | ✅ Fresh | **Debt discharged.** +7 attack-surface rows organised by *defect class* rather than by module, so the table teaches the pattern: capped-constructor null stores, OOB read, work bounds that do not bound work, recursion depth on degenerate geometry, negative indexing, NaN-read-as-passed, and collision-query completeness. Design Principles gained the mutation-proof standard and the constant gate. Supported-versions table opened a 2.7.x row. Mirrors `threat-model.md`. |
 | `CODE_OF_CONDUCT.md` | 2026-03-22 | 🔵 Evergreen | Contributor Covenant. Re-read only on policy change. |
 
@@ -273,7 +298,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `overview.md` | 2026-08-09 | ✅ Fresh | **v2.9.2**: header → v2.9.2 / cycc 6.5.16 / 21,262 lines. Earlier, v2.6.15: module map corrected — **BVH moved to `geo_advanced` (it was credited to `spatial`)**, `f64_le`/`f64_ge` removed from `f64_util`, CG relabelled Polak-Ribière+, error constants → `HSB_ERR_*`. |
+| `overview.md` | 2026-08-10 | ✅ Fresh | **v2.9.3**: header → v2.9.3 / cycc 6.5.16 / 21,498 lines (the exact-`orient2d` predicate). Earlier, v2.9.2: Earlier, v2.6.15: module map corrected — **BVH moved to `geo_advanced` (it was credited to `spatial`)**, `f64_le`/`f64_ge` removed from `f64_util`, CG relabelled Polak-Ribière+, error constants → `HSB_ERR_*`. |
 | `math.md` | 2026-08-03 | ✅ Fresh | Equation catalogue. §1 CGA (v2.5.4), §2 differential geometry (v2.6.5). v2.6.15: `hodge_star_2form_4d`'s `sign` corrected — it is an overall multiplier on the Lorentzian dual, **not** a Euclidean/Lorentzian selector. |
 
 ---
@@ -284,7 +309,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `roadmap.md` | 2026-08-04 (2.7.0-D) | ✅ Fresh | **Rotates every release.** 2.7.0 sections *Carried over* and *High* marked **CLOSED** with evidence inline; the `cmat` null-propagation medium ticked; a new *Found during 2.7.0-B* section holds the `lib/hisab.cyr` item. 26 items still open under 2.7.0. v2.6.15: Current → v2.6.15; the **whole 2.6.12 audit section retired** (all 32 items closed) to a one-paragraph record + Release-History rows — 327 → 228 lines, **zero completed items left inline**; 2.7.0 re-scoped as **re-audit & refactor**; new **2.7.x feature line** holding the original 2.7.0 items plus those moved out of 2.6.x. |
+| `roadmap.md` | 2026-08-10 | ✅ Fresh | **v2.9.3 RELEASED** — Current re-stated, release-train row struck through, planning section retired to a released one, history row added. Earlier: **Rotates every release.** 2.7.0 sections *Carried over* and *High* marked **CLOSED** with evidence inline; the `cmat` null-propagation medium ticked; a new *Found during 2.7.0-B* section holds the `lib/hisab.cyr` item. 26 items still open under 2.7.0. v2.6.15: Current → v2.6.15; the **whole 2.6.12 audit section retired** (all 32 items closed) to a one-paragraph record + Release-History rows — 327 → 228 lines, **zero completed items left inline**; 2.7.0 re-scoped as **re-audit & refactor**; new **2.7.x feature line** holding the original 2.7.0 items plus those moved out of 2.6.x. |
 | `threat-model.md` | 2026-08-04 | ✅ Fresh | **Debt discharged.** Two new sub-tables — *Memory-safety tier — closed in v2.6.14* (6 rows) and *Closed in v2.7.0* (8 rows) — plus three audit-history entries (the 2026-08-03 sweep, the 2026-08-04 re-audit, the 2.7.0-A/B batches). The re-audit entry records **both** process failures verbatim, since the failure mode is the transferable part: scheduling from a digest instead of the finding list, and a coverage-reporting gate whose own coverage was never checked. ⚠️ Also **corrected a row my own change falsified** — `geo_ray_plane` no longer returns −1. **2026-08-05:** the `sequential_impulse` row was split — it credited 2.4.5 with a fix and then covered a *second* defect class it never mentioned. It now carries one row per failure (normal impulse, incl. the 2.8.3 restitution repair it had absorbed silently) plus a new row for the friction impulse that was **identically 0 at every mu** until post-2.8.4. |
 | `dependency-watch.md` | 2026-08-09 | ✅ Fresh | Cyrius toolchain version-watch. Pin **6.5.16**, sakshi **2.4.10**; the 6.5.10–6.5.16 delta recorded (10 changed vendored files + transitive `result.cyr`), including the measured ~4 ns/`alloc_via` from 6.5.10's accessor inlining and why no macro-level win is claimed. It had gone three pins without an entry — 6.5.8 and 6.5.9 were never recorded here at all. |
 | `port-audit.md` | 2026-05-29 | 📅 Dated + addendum | 2026-04-15 Rust→Cyrius parity snapshot, preserved; 2026-05-29 status addendum records nearly all "P0 gaps" now ported. Don't rewrite the body. |

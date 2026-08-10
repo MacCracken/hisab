@@ -11,10 +11,11 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.9.2
+## Current — v2.9.3
 
-Suite **3351** across five harnesses (hisab 416, foundation 349, modules 1621, edge_cases 233,
-abuse 732), constant gate **153/153**, toolchain **6.5.16**, sakshi **2.4.10**. All gates green:
+Suite **3376** across five harnesses (hisab 416, foundation 349, modules 1646, edge_cases 233,
+abuse 732), constant gate **155/155**, **60** benchmarks, toolchain **6.5.16**, sakshi **2.4.10**.
+All gates green:
 `lint` 0 warnings and `fmt <file> --check` 0 drift across all 43 sources, `vet` 2 deps / 0 untrusted
 / 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 588/591 functions (99%) over 35/35 files,
 distlib in sync.
@@ -89,7 +90,7 @@ appear on this page at all.
 | ~~2.9.0~~ | A narrowphase a physics engine can build on | **RELEASED 2026-08-05** |
 | ~~2.9.1~~ | The deferred tier — latent predicate defects | **RELEASED 2026-08-06** |
 | ~~2.9.2~~ | The toolchain bump, and three gates that were not gating | **RELEASED 2026-08-09** |
-| **2.9.3** | EPA certification + the measurement-gate decision | 2.9.2 |
+| ~~2.9.3~~ | The open filings — including the two whose own proposed fixes were wrong | **RELEASED 2026-08-10** |
 | **2.10.0** | Differentiable geometry (autodiff through intersections) | 2.9.x |
 | **2.11.0** | Reverse-mode autodiff (tape-based) | 2.10.0 |
 | **3.0.0** | `Result<T,E>` API — breaking | 2.11.0 feature-complete |
@@ -152,31 +153,22 @@ platform variants) plus the transitive `result.cyr`; all 30 byte-match the 6.5.1
 > and the bundle header against `VERSION`, and `dist/hisab.deps` is tracked so a consumer's
 > `cyrius deps` auto-resolves hisab's 15 stdlib leaves.
 
-## 2.9.3 — what 2.9.1 and 2.9.2 left, and why
+## 2.9.3 — the open filings  **RELEASED 2026-08-10**
 
 Three items, each with a stated reason for not being done sooner rather than a shrug. They stay in
 the 2.9.x line rather than folding into 2.10.0: certification changes the value returned on every
 overlapping pair, and 2.10.0 differentiates *through* those same intersection routines, so it wants
 a settled narrowphase underneath it rather than a concurrent one.
 
-- [ ] **The EPA certified exit is never taken.** Measured 0 of 24 overlaps across boxes and spheres;
-      `strict` is the sole blocker (removing it alone takes the fallback count 12 → 0). It tests the
-      **GJK seed**, but the lower-bound argument is about the polytope **at certification time**, and
-      EPA only ever adds vertices. This also explains why six EPA repairs were unmutatable in 2.9.0 —
-      the exit they improve is unreachable. **Not fixed in 2.9.1 deliberately:** certification changes
-      which value is returned on every overlapping pair, so it needs the 862-configuration exact-MTV
-      harness and a benchmark, not a patch release.
-      → [`issues/2026-08-06-epa-certificate-tests-the-seed-not-the-polytope.md`](issues/2026-08-06-epa-certificate-tests-the-seed-not-the-polytope.md)
-- [ ] **Keep `scripts/check-measurements.sh`, or delete it.** The gate itself is no longer the open
-      question: it landed in `ci.yml` on 2026-08-06 (`b7b229f`) as a **pull-request-only** job that
-      checks the claims a branch *adds* (`--diff origin/<base>`, with `fetch-depth: 0` so an
-      unresolvable base fails rather than passing vacuously), plus a `--selftest` step gating
-      detector recall — currently **21/22** on the planted corpus, **0/15** decoys falsely flagged.
-      What is unsettled is whether it earns its place. False positives are ~21% paragraph-level, and
-      a full-tree scan still reports **522** unmarked pre-existing claims across 26 files (287
-      paragraphs), so it cannot be widened past the diff without a marking campaign first. It has
-      earned its keep once — it caught the fourth non-reproducing measurement of the arc. The
-      decision is whether ~21% FP is tolerable on a gate people must not learn to ignore.
+- [~] **The EPA certificate — RE-DIAGNOSED, not fixed, and its own proposed repair refuted.** This
+      item used to read "the certified exit is never taken; 0 of 24 overlaps". That measurement only
+      covered `gjk_epa_3d`. `mpr_penetration` certifies **12 of 12** of the same boxes through the
+      same `_epa_refine`, so the exit is live and the defect is a certification ASYMMETRY caused by
+      the seed. Dropping `strict` — what the filing proposes — certifies every box and makes **four
+      exact-tangency pairs report a nonzero depth for a touch whose true depth is 0**. Both candidate
+      repairs were implemented, measured and rejected; the remaining question is the sphere family.
+      **Carried into 2.10.x**, split into the two items that are actually left.
+- [~] **The measurement-gate decision — still open. Carried into 2.10.x.**
 - [x] **`_col_dl_ic_g1`/`g3` are no longer CCW-only — `_col_dl_incircle` is order-free.** This item
       previously read *"remain CCW-only at the entry point, by design. Documented, not a defect."*
       That framing did not survive contact: `g3` became the constant `1` in 2.9.1 at no cost, which
@@ -219,14 +211,7 @@ only guard there had ever been. ⚠ Two documentary items are carried forward in
 filing: a backwards divergence-direction claim in the 2.7.x CHANGELOG entries, and shadowed
 neighbour-refresh locals at `collision_core.cyr:740,742`. Neither changes behaviour.
 
-- [ ] **`einsum` is the only arena consumer in the library and has no benchmark at all.**
-      `src/einsum.cyr` holds every `arena_*` call in `src/` — `arena_new` at `:41`, `arena_reset` at
-      `:42`, and 11 `arena_alloc` calls — and `tests/hisab.bcyr` does not include the module, so none
-      of the 55 benchmarks touches the arena path. Found while separating the 6.5.10 allocator change
-      from the compiler change at the 2.9.2 bump: measuring hisab's exposure to it needed a
-      purpose-built micro-benchmark because nothing in the suite would have shown a regression there.
-      Cheap to close and worth closing before any allocator-adjacent change lands, per the standing
-      rule that a perf change needs a number to move.
+- [x] **`einsum` had no benchmark at all** — closed 2026-08-10, see the 2.10.x carry-forward list.
 
 **Toolchain**, tracked upstream, all revisited at the 6.5.16 bump (2026-08-09):
 `cyrius-for-empty-clauses` (`for (; c; s)` → `unexpected ';'`) is **still live** in substance — both
@@ -246,8 +231,54 @@ Autodiff through ray–surface intersection, so consumers can optimise *through*
 around it. The forward-mode dual infrastructure already ships (`autodiff.cyr`); this is the geometry
 integration and the chain-rule coverage for `geo_ray_*`.
 
-Driver: aethersafha (compositor) and the differentiable-rendering use case. Blocked on 2.9.0 only
-because it consumes the same intersection routines.
+Driver: aethersafha (compositor) and the differentiable-rendering use case. **Unblocked as of
+2.9.3** — it was gated on 2.9.x only because it consumes the same intersection routines, and those
+are the exact surface the 2.8–2.9 arc spent four releases correcting. Starting now builds on ground
+that is freshly verified rather than freshly re-audited.
+
+### Carried into 2.10.x from the 2.9.x arc
+
+Not release-gating, and deliberately not folded into the feature work — each is small, independent,
+and would otherwise be lost when the 2.9.x sections retire.
+
+- [x] **`einsum` had no benchmark at all.** It is the library's only arena consumer (`arena_new`,
+      `arena_reset`, 11 `arena_alloc` calls, all in `src/einsum.cyr`) and `tests/hisab.bcyr` did not
+      even *include* the module, so nothing in the suite touched the arena path. Found at the 2.9.2
+      toolchain bump, when measuring hisab's exposure to cyrius 6.5.10's allocator change needed a
+      purpose-built micro-benchmark because no existing row would have shown a regression there.
+      **Closed 2026-08-10**: `einsum_matmul_2x2` (2.53 µs) and `einsum_trace_2x2` (1.89 µs), 58 → 60
+      benchmarks.
+- [ ] **Decide `scripts/check-measurements.sh`: keep it or delete it.** Unchanged from the 2.9.3
+      framing — the gate runs PR-only on the claims a branch *adds*, with detector recall at 21/22
+      and 0/15 decoys, but paragraph-level false positives sit at ~21% and **520** unmarked
+      pre-existing claims mean it cannot be widened past the diff without a marking campaign first.
+      It has earned its keep twice now (it caught the fourth non-reproducing measurement of the arc,
+      and it forced provenance markers onto every claim 2.9.3 added). The open question is whether
+      ~21% FP is tolerable on a gate people must not learn to ignore.
+- [ ] **The EPA seed-upgrade trade.** Giving `_epa_seed_gjk` the strictness upgrade `_epa_seed_portal`
+      already performs closes the certification asymmetry between two public entry points and makes
+      six previously-unmutatable EPA repairs observable — at a measured **+19.4% on
+      `gjk_epa_sphere_box`**, for a change that alters no returned answer. 2.9.3 measured it and
+      declined; it is a judgement call, not a defect, and the change is one contained edit.
+      → [`issues/2026-08-06-epa-certificate-tests-the-seed-not-the-polytope.md`](issues/2026-08-06-epa-certificate-tests-the-seed-not-the-polytope.md)
+- [ ] **EPA sphere-family non-convergence** — the genuinely open half of that filing, and independent
+      of the certificate wording: spheres do not certify *even with a strict seed*, and they pay the
+      upgrade's cost without gaining anything. Root cause not established. This is what the filing is
+      actually about now.
+- [ ] **Two documentary items inside the archived `triangulate_polygon` filing** — the 2.7.x
+      CHANGELOG entries state the prune's divergence direction backwards on at least one reproducer,
+      and the neighbour-refresh locals at `src/collision_core.cyr:740,742` shadow the winding loop's
+      `pn`/`nn`. Neither changes behaviour; both were recorded rather than buried when the file was
+      archived.
+      → [`issues/archived/2026-08-04-perf-triangulate_polygon.md`](issues/archived/2026-08-04-perf-triangulate_polygon.md)
+
+**Toolchain, tracked upstream and not hisab's to fix** — all four remaining open filings are cyrius
+items. Two were filed upstream in the 2.9.2/2.9.3 work (`distlib`'s self-check rejecting bundles that
+read a stdlib global; dead-function bodies never being syntax-checked), one is deliberately never
+re-tested because its reproducer is destructive (`cli-arg-clobbers-source`), and one was archived on
+discovering upstream had closed it **WON'T-FIX by design** five releases before hisab noticed
+(`for-empty-clauses`). Watch for a cyrius release that fixes the `distlib` self-check — until then
+hisab's CI tolerates exactly that signature and nothing else.
 
 ## 2.11.0 — reverse-mode autodiff
 
@@ -342,6 +373,7 @@ answer is a cheaper pre-filter, not reverting the correctness fix.
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
 | 2.9.2 | 2026-08-09 | 21,262 | 35 | **The toolchain bump, and three gates that were not gating.** Toolchain 6.5.9 → **6.5.16** (seven releases) + sakshi 2.4.8 → **2.4.10**. No library source change — the bundle diff is the version header alone; all 30 vendored files byte-match the 6.5.16 snapshot, `deps --verify` 30/30. `scripts/bench-history.sh` recorded the **max** of each benchmark, not the average, in **44 of 55** rows and in every row it has ever written — the parser scavenged the last `<num><unit>` from a line that ends in `max=`. Re-anchored on the harness's named fields, CSV gains `stat`/`avg_ns`/`min_ns`/`max_ns`/`iters`, and `benchmarks.md` compares only same-`stat` rows at ±10% — the measured noise floor is a 3.5% median avg spread over three back-to-back runs of one binary, against −93%..+742% swings on the max rows. **No performance claim in this release**: it is the first correct baseline. CI's version gate was an unanchored `grep` — `2.9.2` matched `32,942,104 B` — and `src/main.cyr`'s hardcoded CLI string was checked by nothing; both now assert against `VERSION`. cyrius 6.5.14's `distlib` self-check rejects any bundle reading a stdlib constant (hisab's reads `F64_ONE`), so `ci.yml` and `release.yml` were both RED; now tolerated by exact signature plus `cyrius check --with-deps`. `dist/hisab.deps` tracked, 15 stdlib leaves. 3351 |
+| 2.9.3 | 2026-08-10 | 21498 | 58 | **The open filings, and the two whose own proposed fixes were wrong.** Five of six internal filings closed. Two real defects: `delaunay_2d` silently DROPPED input points on any set mixing scales (one vertex at ~6e5 with five inside ~5e-17 of the origin returned 4 triangles where the exact hull says 6, and used 5 of 6 points) — fixed with an adaptive exact `orient2d` on RAW coordinates, 300/300 against exact rationals where the float winding scores 0/300; and `_col_dl_incircle` answered differently depending on VERTEX ORDER, `g1` being the last helper reading the CCW storage convention instead of forming the winding. Three guards were policing nothing: the k-d balance guard had no regression assertion (deleting it broke nothing checked) and no benchmark on its own input class (now 564.8 us guarded vs 3.397 ms unguarded, 6.0x); the ear prune's only benchmark was its BEST case (reflex-heavy is 3.6x, and the small-n regression is +15% measured against the pre-prune body); and `_col_point_in_tri` documented itself as strict-interior while being boundary-inclusive. **TWO FILINGS ARGUED FOR REPAIRS THAT MEASUREMENT REFUTED** — an exact determinant of pre-differenced operands fixes nothing (the information is gone before it runs), and dropping EPA's seed test produces wrong depths at exact tangency (`_ag_baddepth` 0 -> 4). Both were implemented in full before being rejected. The EPA filing's central claim was also false: it measured one of two entry points. 3376 |
 | 2.9.1 | 2026-08-06 | 21,262 | 35 | **The deferred tier.** Four latent ghost in-circle defects, all found by deriving an exact-rational oracle rather than by a failing test. `_col_dl_ic_g1`'s M^1 tie-break was the only one wrong on REACHABLE CCW input (228 of 463,086) — it vanished whenever the edge was parallel to `u_k` and could not separate "between a and b" from "beyond b"; replaced by a betweenness test. `_col_dl_ic_g2`'s tie branch applied winding twice; `_col_dl_ic_g3` reduced to the constant 1 with two independent proofs. `mpr_intersect`/`mpr_penetration` re-measured BEFORE being touched, which changed the answer — they were still running the pre-2.9.0 containment test. A FOURTH non-reproducing measurement (the "36%" claim, actually ~28% and distribution-dependent) corrected across four files. Toolchain 6.5.8 → 6.5.9. 3351 |
 | 2.9.0 | 2026-08-05 | 21,094 | 35 | **A narrowphase a physics engine can build on.** All five exit criteria met. Scoped as the narrowphase repair, which had already shipped in 2.8.3 — the real content was the tail that mechanisms exposed: `tests/abuse.tcyr` found **11 defects on public entry points** (`cqr_decompose` overran `out_R` while returning `HSB_ERR_NONE`); a disposition column caught `sequential_impulse` marked FIXED when the friction impulse was identically zero at every mu; a 54-mutation sweep on the integrated tree found the delaunay ghost-direction invariant had **zero** assertions. `gjk_intersect_3d` stopped missing 134 genuine interior overlaps (+55% no-hit cost, stated). Struct-layout contract set. The audit's entire low tier, 5 of 5, had never been scheduled. 1818 → 3294 |
 | 2.8.4 | 2026-08-05 | 20,778 | 35 | DCT/DST dispatch heuristic. The 23x `num_dst_1024` gap was **not a defect**: 1.6x is DST-I's irreducible 2(n+1) DFT and 14.6x is that n = 1024 makes that extension non-power-of-two. Sibling sizes added to the bench so the parity cliff is visible. The real defect was `_numx_use_fft` billing DST-I for post-processing transcendentals it never evaluates — four sizes dispatched to the slower path. |

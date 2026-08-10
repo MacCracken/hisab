@@ -46,8 +46,8 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "f
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "2.9.2"
-modules = ["dist/hisab.cyr"]   # ~786 KB self-contained bundle (all 34 modules)
+tag     = "2.9.3"
+modules = ["dist/hisab.cyr"]   # ~798 KB self-contained bundle (all 34 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
 # pulls in hisab's own 15 stdlib leaves, so the `stdlib` list above only has to
 # name what *your* code uses.
@@ -107,7 +107,7 @@ cyrius test tests/modules.tcyr      # 1621 module tests
 cyrius test tests/edge_cases.tcyr   # 233 edge case tests
 cyrius test tests/abuse.tcyr        # 732 abuse tests (negative indices, zero/huge
                                     #   dimensions, non-conformable operands, canaries)
-cyrius bench tests/hisab.bcyr       # 55 benchmarks
+cyrius bench tests/hisab.bcyr       # 60 benchmarks
 ```
 
 ## Architecture
@@ -118,10 +118,10 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 2.9.2 |
-| Library | 34 modules, ~21,262 lines of Cyrius |
-| Tests | 3351 assertions across 5 suites |
-| Benchmarks | 55 operations |
+| Version | 2.9.3 |
+| Library | 34 modules, ~21,498 lines of Cyrius |
+| Tests | 3376 assertions across 5 suites |
+| Benchmarks | 60 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~214 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.5.16 |

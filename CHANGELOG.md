@@ -1,9 +1,26 @@
 # Changelog
 
-## [Unreleased] — 2.9.3, in progress
+## [Unreleased]
 
-Repair of the items left open in `docs/development/issues/`. Landing in proven batches; `VERSION`
-stays at 2.9.2 until the scope closes.
+## [2.9.3] - 2026-08-10 — the open filings, and the two whose own proposed fixes were wrong
+
+Repair of everything left open in `docs/development/issues/`. **Five of the six internal filings are
+closed**; the sixth is re-diagnosed and correctly open. Suite **3351 → 3376**, benchmarks
+**55 → 58**, constant gate 153 → **155**, toolchain and deps unchanged from 2.9.2. All gates green.
+
+**Read the shape of this release before the list.** It was scoped as "work the filings", and the
+filings turned out to be the thing that needed auditing. **Two of the six argued for repairs that
+measurement refuted** — `incircle-precision`'s implied fix (an exact determinant of *pre-differenced*
+operands, which is exact arithmetic on information that is already gone) and `epa-certificate`'s
+stated fix (drop the seed test, which produces wrong depths at exact tangency). Both were implemented
+in full before being rejected. A third, `epa-certificate` again, rested on a measurement that had
+only ever looked at one of the two entry points it was about. **That is the 2.6.x lesson pointed at
+the record instead of the code**: a filing is a claim, and a claim nothing has re-run is not
+evidence.
+
+Two defects of consequence came out of it — `delaunay_2d` silently dropping input points on any set
+that mixes scales, and `_col_dl_incircle` answering differently depending on vertex order — plus
+three guards that were policing nothing.
 
 ### Fixed
 
@@ -70,6 +87,14 @@ stays at 2.9.2 until the scope closes.
   claimed. Closes `issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`, now archived.
 
 ### Added
+
+- **`einsum` had no benchmark at all, and `tests/hisab.bcyr` did not even include the module.** It is
+  the library's **only arena consumer** — `arena_new`, `arena_reset` and 11 `arena_alloc` calls, all
+  in `src/einsum.cyr` — so no benchmark in the suite touched the arena path. The gap surfaced at the
+  2.9.2 toolchain bump: measuring hisab's exposure to cyrius 6.5.10's allocator change needed a
+  purpose-built micro-benchmark, because no existing row would have shown a regression there.
+  `einsum_matmul_2x2` (**2.53 µs**) and `einsum_trace_2x2` (**1.89 µs**) close it; the notation `Str`s
+  are built once at setup so the rows measure `einsum` rather than `str_from`. Benchmarks 58 → **60**.
 
 - **A benchmark for the input class the k-d balance guard exists for.** `kdtree_build_4k` is a
   uniform scatter — the guard never fires on it, so its cost and its absence were both invisible.

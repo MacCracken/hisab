@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.5.16 as of 2.9.2. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
+- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.5.16 as of 2.9.3. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work

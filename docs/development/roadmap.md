@@ -236,6 +236,17 @@ Driver: aethersafha (compositor) and the differentiable-rendering use case. **Un
 are the exact surface the 2.8–2.9 arc spent four releases correcting. Starting now builds on ground
 that is freshly verified rather than freshly re-audited.
 
+### 2.10.0 — first finding, before any code
+
+Running the design's own Euler-homogeneity check against the **shipped** primitives found a defect
+in `geo.cyr` that has nothing to do with autodiff: `geo_ray_sphere` and `geo_ray_capsule` assume the
+ray direction is unit-length and silently return a `t` that is **not on the surface** when it is not
+— a unit sphere gives a "hit point" 3.74 from its centre. `plane`, `triangle`, `aabb` and `obb` all
+handle it correctly, so this is a **sibling asymmetry**, the same class 2.9.1 repaired in
+`mpr_intersect` vs `gjk_intersect_3d`. It blocks the jets: the analytic `dt/dd` is derived from an
+implicit-function argument that assumes the homogeneity the two routines break.
+→ [`issues/2026-08-10-ray-sphere-capsule-assume-unit-direction.md`](issues/2026-08-10-ray-sphere-capsule-assume-unit-direction.md)
+
 ### Carried into 2.10.x from the 2.9.x arc
 
 Not release-gating, and deliberately not folded into the feature work — each is small, independent,

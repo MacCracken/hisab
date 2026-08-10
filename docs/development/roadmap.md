@@ -291,8 +291,14 @@ caller-supplied gradient.
 - **GPU compute via soorat** (feature-gated) — no consumer has asked; parked until one does.
 - **Adopt `vec_sort_by` / `vec_select_nth`** (cyrius 6.5.4) — consolidation onto stdlib, not a fix.
   Blocked on an API mismatch: the comparator receives element *values*, hisab sorts *indices* by
-  dereferencing a separate vector, and Cyrius has no closures. 2.6.15 already fixed the *complexity*
-  of both hot sorts, so this is now optional rather than load-bearing.
+  dereferencing a separate vector. ⚠ **This entry used to add "and Cyrius has no closures" — that is
+  FALSE**, and had propagated to four files without anyone running it; Cyrius has capturing closures
+  and has since v6.3.8. The block is real but for a **measured** reason instead: on 6.5.16 a
+  capturing closure **SIGSEGVs when passed through another function and called there**, which is
+  exactly this shape. Unblocks the moment that is fixed upstream.
+  → [`issues/2026-08-10-cyrius-capturing-closure-across-fn-boundary.md`](issues/2026-08-10-cyrius-capturing-closure-across-fn-boundary.md)
+  2.6.15 already fixed the *complexity* of both hot sorts, so this is optional rather than
+  load-bearing.
 - **SIMD the flat-array kernels** — `_opt_dot`/`_opt_norm`/`_opt_axpy`, the L-BFGS sweeps,
   `_lext_dot`/`_lext_norm`. 5–8× on comparable kernels in 2.3.1. **Needs a benchmark per kernel
   first** — none is benchmarked, so there is nothing to prove a win against.

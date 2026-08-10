@@ -1233,6 +1233,96 @@ alloc_init();
 # ================================================================
 # GEO — Primitives, intersections, closest-point, SDF (~30)
 # ================================================================
+# --- 2.10.0: every geo_ray_* is degree -1 homogeneous in the direction ------
+#
+# The contract shared by all six is "return t such that geo_ray_at(ray, t) is the
+# hit point", i.e. the point is o + t*d. That forces t to be degree -1 in d:
+# scale the direction by k and the SAME geometric point is reached at t/k.
+#
+# Four of the six honoured it; `geo_ray_sphere` did not, and `geo_ray_capsule`
+# inherited the failure through its end-cap branches, which call the sphere. The
+# sphere used the reduced half-b quadratic, valid only when d.d == 1, so with a
+# non-unit direction it returned a t whose "hit point" was not on the sphere at
+# all -- 3.74 from the centre of a unit sphere, silently.
+#
+# geo_ray_new normalises, so this is unreachable through the constructor alone;
+# GeoRay is #derive(accessors) though, so GeoRay_set_direction is public and
+# nothing documented a unit-length precondition.
+#
+# This assertion is ORACLE-FREE: it compares each routine against ITSELF at two
+# direction scales, so it needs no reference implementation and cannot inherit a
+# convention from the code under test.
+# [measured: docs/development/issues/archived/2026-08-10-ray-sphere-capsule-assume-unit-direction.md]
+fn _homog_bad(t_unit, t_scaled, k) {
+    if (t_unit == 0) { return 0; }          # miss: nothing to check
+    if (t_scaled == 0) { return 1; }        # scaling must not turn a hit into a miss
+    var want = f64_div(t_unit, k);
+    if (f64_approx_eq(t_scaled, want, LOOSE_TOL_M) == 1) { return 0; }
+    return 1;
+}
+
+var _HG_BAD = 0;
+var _HG_RUN = 0;
+fn _homog_sweep() {
+    var o = hvec3_new(f64_neg(f64_from(5)), f64_neg(f64_from(5)), f64_neg(f64_from(5)));
+    var sph = geo_sphere_new(hvec3_new(0, 0, 0), F64_ONE);
+    var pl  = geo_plane_from_point_normal(hvec3_new(0, 0, 0), hvec3_new(0, 0, F64_ONE));
+    var tri = geo_triangle_new(hvec3_new(f64_neg(f64_from(9)), f64_neg(f64_from(9)), 0),
+    hvec3_new(f64_from(9), f64_neg(f64_from(9)), 0), hvec3_new(0, f64_from(9), 0));
+    var ab  = geo_aabb_new(hvec3_new(f64_neg(F64_ONE), f64_neg(F64_ONE), f64_neg(F64_ONE)),
+    hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+    var ob  = geo_obb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_ONE, F64_ONE), hquat_identity());
+    var cap = geo_capsule_new(hvec3_new(0, 0, f64_neg(F64_ONE)), hvec3_new(0, 0, F64_ONE), F64_ONE);
+    for (var ki = 0; ki < 3; ki = ki + 1) {
+        var k = F64_TWO;
+        if (ki == 1) { k = F64_HALF; }
+        if (ki == 2) { k = f64_from(7); }
+        var r = geo_ray_new(o, hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+        var du = GeoRay_direction(r);
+        var ts = geo_ray_sphere(r, sph);   var tp = geo_ray_plane(r, pl);
+        var tt = geo_ray_triangle(r, tri); var ta = geo_ray_aabb(r, ab);
+        var to = geo_ray_obb(r, ob);       var tc = geo_ray_capsule(r, cap);
+        GeoRay_set_direction(r, hvec3_scale(du, k));
+        _HG_BAD = _HG_BAD + _homog_bad(ts, geo_ray_sphere(r, sph), k);
+        _HG_BAD = _HG_BAD + _homog_bad(tp, geo_ray_plane(r, pl), k);
+        _HG_BAD = _HG_BAD + _homog_bad(tt, geo_ray_triangle(r, tri), k);
+        _HG_BAD = _HG_BAD + _homog_bad(ta, geo_ray_aabb(r, ab), k);
+        _HG_BAD = _HG_BAD + _homog_bad(to, geo_ray_obb(r, ob), k);
+        _HG_BAD = _HG_BAD + _homog_bad(tc, geo_ray_capsule(r, cap), k);
+        _HG_RUN = _HG_RUN + 6;
+    }
+    return 0;
+}
+
+test_group("2.10.0 geo_ray_*: t is degree -1 homogeneous in the direction");
+_homog_sweep();
+assert_eq(_HG_RUN, 18, "homogeneity sweep ran 6 primitives x 3 direction scales");
+assert_eq(_HG_BAD, 0,
+"every geo_ray_* returns t/k when the direction is scaled by k (sphere+capsule failed pre-2.10.0)");
+
+# The invariant that makes it matter: the reported hit point is ON the surface.
+var hsp = geo_sphere_new(hvec3_new(f64_from(2), f64_from(4), f64_from(6)), F64_ONE);
+var hry = geo_ray_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_TWO, f64_from(3)));
+GeoRay_set_direction(hry, hvec3_new(F64_ONE, F64_TWO, f64_from(3)));   # NON-unit
+var hgt = geo_ray_sphere(hry, hsp);
+assert(f64_approx_eq(hvec3_length(hvec3_sub(geo_ray_at(hry, hgt),
+hvec3_new(f64_from(2), f64_from(4), f64_from(6)))), F64_ONE, LOOSE_TOL_M),
+"ray-sphere on a NON-unit ray: geo_ray_at(t) lands ON the sphere (was 3.74 from a unit sphere)");
+
+# The degenerate direction. Carrying `a` explicitly means dividing by it, so a
+# zero-length direction must be rejected BEFORE the divide or the routine returns
+# +/-Inf or NaN from a function documented to return 0 on a miss -- the same
+# failure `geo_ray_capsule` already guards against for its parallel-axis case
+# (`f64_abs(a) < EPSILON_F64`, geo.cyr:479). Without this assertion the guard is
+# free to be deleted: a mutant that removed it passed the whole suite.
+var hz = geo_ray_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, 0, 0));
+GeoRay_set_direction(hz, hvec3_new(0, 0, 0));
+assert_eq(geo_ray_sphere(hz, hsp), 0,
+"ray-sphere with a ZERO direction returns the miss sentinel, not Inf/NaN");
+assert_eq(geo_ray_capsule(hz, geo_capsule_new(hvec3_new(0, 0, f64_neg(F64_ONE)),
+hvec3_new(0, 0, F64_ONE), F64_ONE)), 0,
+"ray-capsule with a ZERO direction likewise");
+
 test_group("geo: ray_at");
 
 var g_ray = geo_ray_new(hvec3_new(F64_ONE, F64_TWO, f64_from(3)),

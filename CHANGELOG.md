@@ -4,6 +4,41 @@
 
 ### Fixed
 
+- **`geo_ray_sphere` returned a `t` whose hit point was not on the sphere, whenever the ray
+  direction was not unit-length — and `geo_ray_capsule` inherited it.** Four of the six `geo_ray_*`
+  siblings honour the contract they share (*"the hit point is `o + t·d`"*, which forces `t` to be
+  degree −1 homogeneous in `d`); two did not. Measured by scaling a unit direction by `k` and
+  comparing against `t/k`:
+
+  | primitive | `t(2d)` | expected `t/2` | |
+  |---|--:|--:|---|
+  | `geo_ray_sphere` | 2.2872117 | 3.8301270 | ❌ |
+  | `geo_ray_capsule` | 2.1539078 | 3.7177546 | ❌ |
+  | `plane` / `triangle` / `aabb` / `obb` | — | — | ✅ all four |
+
+  Not merely a different number: for a **unit** sphere at `(2,4,6)` and `d = (1,2,3)` it returned
+  `t = 1.0`, putting `geo_ray_at(ray, t)` **3.741657387 from the centre**, silently. Root cause —
+  the reduced half-`b` quadratic drops `a = d·d` from both the discriminant and the division, which
+  is valid only for a unit direction. `geo_ray_new` normalizes so the intended path was safe, but
+  `GeoRay` is `#derive(accessors)`, `GeoRay_set_direction` is public, and no unit-length
+  precondition was documented anywhere. Same sibling-asymmetry class 2.9.1 repaired in
+  `mpr_intersect` vs `gjk_intersect_3d`, and resolved the same way rather than by documenting it.
+
+  ⚠ **One root cause, not two.** `geo_ray_capsule`'s own cylinder quadratic was *already* correct
+  (it carries `a` and divides by `2a`); it failed only because its end-cap branches call the sphere.
+  Repairing the sphere alone took the sweep 5 bad → 0.
+
+  Fix: carry `a` explicitly through discriminant and roots, plus a degenerate-direction guard.
+  **Cost, measured** — interleaved A/B, three runs each: `ray_sphere` **81.7 → 96.3 ns, +17.6%**,
+  non-overlapping, <4% spread; `ray_triangle` unchanged as control. Accepted: 14.6 ns is the price
+  of the primitive agreeing with its own contract. ⚠ **Only measurable because the benchmark harness
+  was fixed first** — on the old one this sat inside 1,460 ns of clock overhead.
+
+  Found by running 2.10.0's own design check (Euler's relation `d·∂t/∂d = −t`) against the
+  **shipped** primitives before writing any autodiff code. It blocks the jets: the analytic `dt/dd`
+  is derived from an implicit-function argument that assumes exactly the homogeneity these two broke.
+  → `issues/archived/2026-08-10-ray-sphere-capsule-assume-unit-direction.md`
+
 - **17 of 60 benchmarks were measuring `clock_gettime`, not the operation.** `bench_run` wraps a
   `clock_gettime` PAIR around **every call** — ~240 ns, documented in `lib/bench.cyr` — and
   `bench_batch` exists precisely to amortise that over a round. Only 7 benchmarks used it. The other

@@ -1,6 +1,42 @@
 # `geo_ray_sphere` and `geo_ray_capsule` silently return a `t` that is not on the surface when the ray direction is not unit-length — the other four primitives handle it
 
-**Status:** 🔴 **OPEN.** Found 2026-08-10 while scoping 2.10.0 (differentiable geometry).
+**Status:** 🟢 **FIXED 2026-08-10 (2.10.0 first bite).** Found while scoping 2.10.0.
+
+## Resolution
+
+**One root cause, not two.** `geo_ray_capsule`'s own cylinder quadratic was already correct — it
+carries `a = dot(d_perp, d_perp)` and divides by `2a` (`geo.cyr:465, 493`). It failed the sweep only
+because its **end-cap branches call `geo_ray_sphere`**. Repairing the sphere alone took the sweep
+from 5 bad to 0, which confirms the single cause rather than assuming it.
+
+Fix: option 1 as recommended — `geo_ray_sphere` carries `a = d·d` explicitly through both the
+discriminant and the roots, plus a degenerate-direction guard (`a < EPSILON_F64 → miss`) since
+carrying `a` means dividing by it.
+
+**Cost, measured** — interleaved A/B, three runs each, `bench_batch` timing: `ray_sphere`
+**81.7 ns → 96.3 ns, +17.6%**, distributions non-overlapping with <4% spread; `ray_triangle`
+unchanged as a control (287/291/294 vs 285/288/288). ⚠ The single-run CSV pair reads +28.6%; the
+interleaved figure is the one to quote. The cost is real and accepted: this is a silent-wrong-answer
+repair, and 14.6 ns is the price of the primitive agreeing with its own documented contract.
+
+⚠ **This was only measurable because the benchmark harness was fixed first.** On the pre-2026-08-10
+harness `ray_sphere` read 1,466 ns of which ~95% was `clock_gettime`, so a 14.6 ns change would have
+been invisible — the same harness that flattened a 3.6× triangle/sphere ratio into 1.19×.
+
+**Assertions** (`tests/modules.tcyr`, group *"2.10.0 geo_ray_*: t is degree -1 homogeneous"*): an
+oracle-free sweep of all 6 primitives × 3 direction scales (`_HG_BAD == 0`, 18 probes) — it compares
+each routine against itself at two scales, so it needs no reference and cannot inherit a convention
+from the code under test; plus a direct on-surface check that `geo_ray_at(t)` lands on the sphere for
+a non-unit ray, and zero-direction guards for sphere and capsule. **Three mutants caught**: the
+pre-fix reduced form (5 bad + off-surface), `a` in the discriminant but not the roots (4 bad), and
+dropping the degenerate guard (returns a huge negative instead of the miss sentinel).
+
+⚠ **The degenerate guard survived the first mutation round** — nothing asserted it, so it could have
+been deleted freely. The zero-direction assertions were added in response, which is the second time
+this release that order-consistency-style coverage turned out to be weaker than it looked.
+
+`geo_ray_capsule` also gained its first benchmark (**520 ns**); it had none, which would have left
+the indirect change to it unmeasured.
 **Severity:** **Medium.** Silent wrong output, not a crash or an error return. Unreachable through
 `geo_ray_new` alone, reachable through the public derived setter `GeoRay_set_direction`.
 **Affects:** all versions with the current `geo.cyr` (the half-`b` sphere form predates 2.9.x).

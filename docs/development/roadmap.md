@@ -177,11 +177,35 @@ a settled narrowphase underneath it rather than a concurrent one.
       paragraphs), so it cannot be widened past the diff without a marking campaign first. It has
       earned its keep once — it caught the fourth non-reproducing measurement of the arc. The
       decision is whether ~21% FP is tolerable on a gate people must not learn to ignore.
-- [ ] `_col_dl_ic_g1`/`g3` remain CCW-only at the entry point, by design. Documented, not a defect.
+- [x] **`_col_dl_ic_g1`/`g3` are no longer CCW-only — `_col_dl_incircle` is order-free.** This item
+      previously read *"remain CCW-only at the entry point, by design. Documented, not a defect."*
+      That framing did not survive contact: `g3` became the constant `1` in 2.9.1 at no cost, which
+      left the whole question resting on `g1` alone, and `g1`'s share turned out to be **one cross
+      product on the ghost path**. Landed in 2.9.3 with a 1800-probe order-freeness harness and four
+      correctness assertions; four mutants caught; no cost measurable above the noise floor. A
+      symmetric predicate whose answer depends on argument order is the same defect class 2.9.1
+      rejected "keep the strict reading and document it" for in `mpr_intersect`.
       → [`issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`](issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md)
 
-**Performance, demand-gated** (measured, filed, no consumer blocked): `delaunay_2d`,
-`_kd_partition`, `triangulate_polygon`.
+**Performance, demand-gated** — ~~`delaunay_2d`, `_kd_partition`, `triangulate_polygon`~~. **This
+line was wrong on all three, and 2.9.3 closed it.** It described them as filed-but-unapplied
+optimisations; in fact `_kd_partition` and `triangulate_polygon` **shipped in 2.7.1** (a balance
+guard, and reflex-only ear pruning at 9.93 → 1.59 ms) and `delaunay_2d`'s record was **superseded by
+the 2.8.0 adjacency rewrite**, which deleted the O(n²) rescan it proposed removing. What was
+genuinely open was never the code:
+
+- the `_kd_partition` balance guard had **no regression assertion** — `kdtree_build != 0` and the
+  split-plane invariant both hold on a degenerate spine, so deleting the guard broke nothing that
+  was checked. Closed in 2.9.3, mutation-proven, on an octave-spaced fixture. ⚠ The pre-existing
+  geometric fixture does **not** exercise it (ratio 0.99998 → axis range [0.85, 1], the guard never
+  fires); that is recorded inline so it is not mistaken for the guard's test.
+- `_col_point_in_tri` documented itself as "(2D, strict interior)" while being **boundary-inclusive**
+  — which is what ear clipping needs, so the code was right and only the contract was mis-stated.
+  Closed in 2.9.3 with five assertions.
+
+**Still open from that group** (documentary, carried forward): the −84% `triangulate_600gon`
+headline does not disclose a small-n regression below the prune's break-even, and there is no
+reflex-heavy benchmark guarding the prune.
 
 - [ ] **`einsum` is the only arena consumer in the library and has no benchmark at all.**
       `src/einsum.cyr` holds every `arena_*` call in `src/` — `arena_new` at `:41`, `arena_reset` at

@@ -4,6 +4,26 @@ to CHANGE RESULTS or to regress on some input class -- see the CHALLENGE section
 applying. NOT APPLIED. The bicgstab hoist, the only result-safe one, shipped in 2.7.0-I. -->
 
 # delaunay_2d
+
+> **CLOSED 2026-08-09 (2.9.3) — SUPERSEDED, not applied and not applicable.**
+> The optimisation this record proposes is for a `delaunay_2d` that no longer exists. It measured
+> the **O(n²) per-point full rescan** of every live triangle; the **2.8.0 triangle-adjacency
+> rewrite** replaced insertion with walk + flood-fill, so the cavity is found by crossing shared
+> edges and only the cavity is touched. There is no full rescan left to remove.
+>
+> That rewrite was not a performance change — 2.8.0 established the shipped code was **wrong, not
+> just slow** (150 points on a circle returned 1651 triangles where 148 is correct, 206 edges shared
+> by three or more triangles, 9 input points dropped) — and the speed followed from the correct
+> structure rather than from this record's proposal.
+>
+> ⚠ **This filing was NOT the reason `delaunay_2d` is fast, and should not be cited as one.** Its
+> CHALLENGE section remains worth reading for the general lesson it records — an optimisation can be
+> a genuine complexity win *and* change results on some input class — which is why it is archived
+> rather than deleted.
+>
+> Do not confuse this with `2026-08-04-incircle-precision.md`, which is about the same function and
+> is **still open**: the in-circle predicate's winding term loses its sign on inputs with a wide
+> intra-set dynamic range, and `delaunay_2d` silently drops points as a result.
 verdict=CONFIRMED
 
 ## MEASURED

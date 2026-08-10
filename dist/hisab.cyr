@@ -8040,7 +8040,15 @@ fn _col_triangle_area_2x(ax, ay, bx, by, cx, cy) {
     f64_mul(f64_sub(cx, ax), f64_sub(by, ay)));
 }
 
-# Point-in-triangle test (2D, strict interior)
+# Point-in-triangle test (2D, BOUNDARY-INCLUSIVE).
+#
+# 2.9.3: this comment read "(2D, strict interior)" and was false. A point on an
+# edge makes that edge's signed area exactly 0, which sets NEITHER has_neg nor
+# has_pos, so the "all signs agree" test below passes and the function returns 1.
+# Vertices are included for the same reason (two of the three areas vanish). The
+# closed test is the correct one for the ear-clipping caller -- an ear must not
+# be cut when another vertex lies ON its boundary, only when it lies strictly
+# outside -- so the CODE was right and only the contract was mis-stated.
 fn _col_point_in_tri(px, py, ax, ay, bx, by, cx, cy) {
     var d1 = _col_triangle_area_2x(px, py, ax, ay, bx, by);
     var d2 = _col_triangle_area_2x(px, py, bx, by, cx, cy);
@@ -8451,8 +8459,26 @@ fn _col_dl_orient(points, nr, ai, bi, px, py) {
 # The M^2 coefficient of the determinant is |u_k|^2 * ((a - p) x (b - p)) and
 # |u_k|^2 > 0, so the test degenerates to a half-plane test: the circumcircle
 # through a, b and a receding third point tends to the half-plane bounded by
-# line(a, b) on the side the third point receded towards, and the stored
-# triangle is counter-clockwise so that side is the positive one.
+# line(a, b) on the side the third point receded towards.
+#
+# 2.9.3: WHICH side that is, is `w = sign((b - a) x u_k)` -- the limiting
+# winding of the stored triple (a, b, G_k). Through 2.9.2 this function did not
+# form w; it read the sign of the M^2 coefficient directly and took the positive
+# side on trust, because `delaunay_2d` happens to store every triangle CCW. That
+# made the whole entry point CCW-only: "is p inside the circumcircle of these
+# three points" is a question about a SET, so an answer that depends on the
+# order the vertices arrive in is wrong however the caller happens to store
+# them -- the same defect class as the operand-order asymmetry repaired in
+# `mpr_intersect` in 2.9.1. `_col_dl_ic_g2` already divided its winding out
+# (`cr`, :298) and `_col_dl_ic_g3` became the constant 1 in 2.9.1, so g1 was the
+# last helper reading the convention instead of the geometry.
+#
+# Cost is one cross product on a path that already does two, and it buys the
+# entry point the order-freedom the other two helpers already had. Asserted by
+# `_dlg1_run` / `_DLG1_BAD` in tests/modules.tcyr over all six orderings; the
+# pre-2.9.3 body scores 846 of 1500 on that grid.
+# [measured: tests/modules.tcyr _dlg1_run / _DLG1_BAD, mutant = drop the `* w`]
+# See docs/development/issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md.
 fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
     var ap = vec_get(points, ai);
     var bp = vec_get(points, bi);
@@ -8460,9 +8486,34 @@ fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
     var ay = f64_sub(HVec2_y(ap), py);
     var bx = f64_sub(HVec2_x(bp), px);
     var by = f64_sub(HVec2_y(bp), py);
+    # (b - a) is p-free: the two subtractions below cancel it.
+    var ex = f64_sub(bx, ax);
+    var ey = f64_sub(by, ay);
+    var w = _col_f64_sign(f64_sub(
+    f64_mul(ex, _col_ghost_uy(k)), f64_mul(ey, _col_ghost_ux(k))));
+    # w == 0 means the edge is PARALLEL to u_k. That is NOT degenerate, and the
+    # first draft of this repair got it wrong by assuming it was. G_k is
+    # A + M*u_k with A the apex, so an edge parallel to u_k leaves the triangle
+    # (a, b, G_k) with area |(b - a) x (A - a)| / 2 -- CONSTANT in M, not
+    # vanishing. The third vertex recedes parallel to line(a, b) at a fixed
+    # perpendicular offset, and the limiting circle is the half-plane on the
+    # side that offset is on: the apex's side. So the winding falls back to
+    # sign((b - a) x (A - a)), with A = points[0] -- the same apex convention
+    # _col_dl_ic_g2's tie branch uses (:298).
+    if (w == 0) {
+        var apx = vec_get(points, 0);
+        w = _col_f64_sign(f64_sub(
+        f64_mul(ex, f64_sub(HVec2_y(apx), HVec2_y(ap))),
+        f64_mul(ey, f64_sub(HVec2_x(apx), HVec2_x(ap)))));
+    }
+    # Both zero: the edge is parallel to u_k AND the apex is on line(a, b), so
+    # all three vertices are collinear for every M and there is no circle at all.
+    # 0 is a convention here rather than a derived answer -- an exact oracle has
+    # nothing to say about it -- but it is order-free, which is what matters.
+    if (w == 0) { return 0; }
     var s = _col_f64_sign(f64_sub(f64_mul(ax, by), f64_mul(ay, bx)));
-    if (s > 0) { return 1; }
-    if (s < 0) { return 0; }
+    if (s * w > 0) { return 1; }
+    if (s != 0) { return 0; }
     # p lies exactly ON line(a, b), so the answer is "p strictly between a and b"
     # -- a point on the segment is inside the limiting circle, a point on the line
     # outside the segment is not, and p coinciding with a or b gives zero, i.e. a
@@ -8516,10 +8567,13 @@ fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
 # CCW-stored triangle and every rotation is even. See
 # docs/development/issues/2026-08-05-two-ghost-tie-branch-sign-rule-inconsistent.md.
 #
-# NOTE: this helper is order-free; _col_dl_incircle as a whole is NOT. Its
-# one-ghost and all-ghost helpers below take the CCW storage as a precondition
-# and drop the winding factor entirely, so do not read the cr handling here as
-# a claim that the entry point tolerates a clockwise triangle. It does not.
+# NOTE (2.9.3): all three helpers are order-free now, and so is _col_dl_incircle
+# as a whole. This note used to say the opposite -- that the one-ghost and
+# all-ghost helpers take CCW storage as a precondition -- and it was accurate
+# when written: g3 dropped the winding until 2.9.1 (now the constant 1) and g1
+# until 2.9.3 (now forms sign((b - a) x u_k), falling back to the apex's side
+# when the edge is parallel to u_k). Asserted at all three arities:
+# _dlg_perm_bad (two ghosts), _dlg1_run (one), _dlg3_run (all three).
 fn _col_dl_ic_g2(points, ri, j, k, px, py) {
     var rp = vec_get(points, ri);
     var rx = f64_sub(HVec2_x(rp), px);

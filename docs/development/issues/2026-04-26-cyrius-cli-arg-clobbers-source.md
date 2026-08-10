@@ -7,6 +7,18 @@
 **Hisab workaround:** Use `CYRIUS_VERBOSE=1` (env var) instead of unrecognized CLI flags. Don't pass any unknown flag before a subcommand.
 **Status:** Open. cc5 5.7.7's atomic-output fix prevents destruction on compile *failure*, but a misparsed-but-successful invocation still nukes the file.
 
+**Upstream status, checked 2026-08-09 — and it is ambiguous, which is itself the finding.** The
+upstream filing exists at
+`cyrius/docs/development/issues/archived/2026-04-26-cyrius-cli-arg-clobbers-source.md` — i.e. in
+**`archived/`**, which by that repo's own README means resolved. But it carries **no `— RESOLVED`
+suffix in its heading, no resolution paragraph naming a fix version, and no row in
+`archived/README.md`'s index** — all three of which that README requires on a real close. Its
+status line still reads `**Status:** Open.` So it was moved during a sweep rather than fixed, and
+the sibling `for-empty-clauses` filing next to it demonstrates what a genuine close looks like
+there (a `RESOLUTION` block naming v6.0.36 and the reason). **Do not read its location as
+evidence the data-loss bug is fixed.** Re-filing would only create a duplicate; the right move is
+to ask the Cyrius side to either restore it to `issues/` or attach a resolution.
+
 **2026-08-09 (v2.9.2, cycc 6.5.16) — deliberately NOT re-tested.** The reproducer is destructive by
 construction: it works by getting cyrius to treat a real source path as the compiler's *output*
 slot, so running it inside this tree would truncate whichever `src/*.cyr` it names to 0 bytes, and

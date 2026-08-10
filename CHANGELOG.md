@@ -1,6 +1,101 @@
 # Changelog
 
-## [Unreleased]
+## [Unreleased] — 2.9.3, in progress
+
+Repair of the items left open in `docs/development/issues/`. Landing in proven batches; `VERSION`
+stays at 2.9.2 until the scope closes.
+
+### Fixed
+
+- **`_col_dl_incircle` was CCW-only, because `_col_dl_ic_g1` never formed the triple's winding.**
+  "Is p inside the circumcircle of these three points" is a question about a **set**, so an answer
+  that depends on the order the vertices arrive in is wrong however the caller happens to store
+  them — the same defect class as the `mpr_intersect` operand-order asymmetry repaired in 2.9.1.
+  `_col_dl_ic_g2` already divided its winding out and `_col_dl_ic_g3` became the constant `1` in
+  2.9.1; `g1` was the last of the three still reading the CCW storage convention instead of the
+  geometry. Root cause → fix: `g1` now computes `w = sign((b − a) × u_k)` and returns
+  `sign((a−p) × (b−p)) · w > 0` (`collision_mesh.cyr:255`).
+
+  ⚠ **The obvious form of that fix is wrong on the parallel edge, and the first draft shipped it.**
+  `w` is 0 when the edge is parallel to `u_k`, which reads as degenerate but is not: `G_k = A + M·u_k`,
+  so such a triangle has area `|(b − a) × (A − a)| / 2` — **constant in M**. The third vertex
+  recedes parallel to line(a, b) at a fixed offset and the limiting circle is the half-plane on the
+  **apex's** side, so `w` falls back to `sign((b − a) × (A − a))` with `A = points[0]`, the apex
+  convention `_col_dl_ic_g2` already uses. Only when both vanish are the points collinear for every
+  M, and `0` there is a convention (order-free) rather than a derived answer. The draft was caught
+  by the 2.9.1 finding-2 reproducer, which *is* a parallel-edge case.
+
+  Validated against an **order-free** exact oracle — circumcentre in `Fraction`, `|p − O|²` vs `r²`,
+  ghosts at `A + 10³⁰·u`, a formulation that takes no orientation argument and so cannot inherit a
+  convention from the code under test: **4606 of 4606 correct**, including **1110 parallel-edge
+  probes**. (An earlier oracle attempt used the in-circle determinant's raw sign and reported 2219
+  failures — that oracle was itself order-dependent, i.e. it was measuring the thing under test.)
+
+  **No reachable behaviour changed**: `delaunay_2d` stores every triangle CCW, so the factor is `+1`
+  on every call it makes. Suite **3351 → 3359**; `delaunay_2d_400` −2.9%, `halfedge_2k_tris` −4.6%,
+  median across all 55 benchmarks −1.4% — **no cost measurable above the noise floor**, and none
+  claimed. Closes `issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`, now archived.
+
+### Added
+
+- **`_dlg1_run` / `_DLG1_BAD`** (`tests/modules.tcyr`) — 1800 probes over 4 edges × 25 query points
+  × 3 ghost directions × 6 orderings, asserting every ordering of a one-ghost triple agrees. The
+  pre-2.9.3 body scores **846 of 1500** ordering comparisons. This replaces the filing's Python
+  transcription with a first-party assertion, which the filing itself said was missing.
+
+  ⚠ **Order-consistency alone was not enough, and a mutant proved it**: negating the apex fallback's
+  sign flips every ordering together, so the grid stayed green. Four correctness assertions were
+  added, pinning two apexes on **opposite sides** of a `u_0`-parallel edge to opposite answers with
+  values from the exact oracle. Four mutants are now caught — dropping the winding, treating the
+  parallel edge as degenerate, flipping the apex fallback, and never consulting `u_k` (27 failures).
+
+- **The `_kd_partition` balance guard had no regression assertion.** The two tests standing next to
+  it — `kdtree_build != 0` and the split-plane invariant — both hold perfectly well on a degenerate
+  one-point-per-level spine, so **deleting the guard broke nothing that was being checked**
+  (measured: the whole suite stays green with the guard replaced by `if (1 == 1)`). Depth is the
+  property the guard provides, so depth is now what is asserted.
+
+  ⚠ **The obvious fixture does not exercise it, and asserting on that one would have re-created the
+  same hole one line down.** The existing geometric fixture has ratio 0.99998, so over 8000 points
+  the axis range is only `[0.85, 1]` and the value-midpoint lands near the count-median anyway — the
+  guard never fires. What degenerates the split is a range spanning many *orders of magnitude*: with
+  `v = 2^-i` the midpoint is ~0.5, exactly one point sits above it, and the build peels off a single
+  point per level. New octave-spaced fixture (512 points, all three coordinates decaying, because
+  the axis cycles 0,1,2 and one degenerate axis is diluted by two healthy ones); `log_(4/3)(512)` is
+  about 22, unguarded it builds a ~512-deep spine. Mutation-proven.
+
+- **`_col_point_in_tri` documented itself as "(2D, strict interior)" and is boundary-INCLUSIVE.** A
+  point on an edge makes that edge's signed area exactly 0, which sets neither `has_neg` nor
+  `has_pos`, so "all signs agree" holds and it returns 1; vertices likewise. **The code is right** —
+  ear clipping must not cut an ear when another vertex lies *on* its boundary, only when it lies
+  strictly outside — so only the contract was mis-stated. Comment corrected and the closed contract
+  pinned by five assertions (`collision_core.cyr:587`).
+
+### Changed
+
+- **Three "NOT APPLIED, by decision" performance records were wrong on all three counts**, in both
+  `doc-health.md` and `roadmap.md`. `_kd_partition` and `triangulate_polygon` **shipped in 2.7.1**
+  (a balance guard rather than the spec's unconditional quickselect; reflex-only ear pruning at
+  9.93 → 1.59 ms), and `delaunay_2d`'s record was **superseded by the 2.8.0 adjacency rewrite**,
+  which deleted the O(n²) per-point rescan it proposed removing — so it is archived, with a note
+  that it is **not** the reason `delaunay_2d` is fast and must not be cited as one. The lumped
+  three-filing ledger row is split into three accurate ones. What was genuinely open in that group
+  was never the code: it was the missing guard assertion and the false predicate contract above,
+  plus two documentary items carried forward (the −84% headline does not disclose a small-n
+  regression below the prune's break-even, and no reflex-heavy benchmark guards the prune).
+
+- **Toolchain filings reconciled with the upstream tracker, which nobody had checked.**
+  `2026-04-26-cyrius-for-empty-clauses` is **archived**: upstream closed it **WON'T-FIX, by design**
+  on 2026-06-02 (cycc v6.0.36) — Cyrius requires all three `for` clauses — so hisab had carried it as
+  "Open" for five releases and re-verified it six times against a documented language rule. The
+  `while` rewrites in `collision_core`/`collision_mesh` are permanent, not provisional.
+  `2026-04-26-cyrius-cli-arg-clobbers-source` now records that its upstream copy sits in `archived/`
+  **without** a resolution note, a fix version, or an index row — i.e. swept, not fixed — so its
+  location must not be read as evidence the data-loss bug is gone.
+- **The two 2.9.2 toolchain defects are filed upstream**, in that repo's required format:
+  `cyrius/docs/development/issues/hisab-distlib-selfcheck-rejects-stdlib-globals.md` (High) and
+  `hisab-dead-fn-bodies-never-syntax-checked.md` (Medium), the latter with a standalone repro at
+  `issues/repros/2026-08-09-dead-fn-body-not-parsed.cyr`, re-run from the filed file itself.
 
 ## [2.9.2] - 2026-08-09 — the toolchain bump, and three gates that were not gating
 

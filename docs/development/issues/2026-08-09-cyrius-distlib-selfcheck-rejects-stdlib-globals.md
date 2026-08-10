@@ -188,5 +188,11 @@ A second, smaller point: the two `_info` lines asserting "this is a REAL defect 
 the consumer's missing stdlib" should not be printed unconditionally, since the one case they
 exclude is the case that fires here.
 
-**Upstream:** not yet filed in `cyrius/docs/development/issues/`.
+**Upstream:** filed 2026-08-09 at
+`cyrius/docs/development/issues/hisab-distlib-selfcheck-rejects-stdlib-globals.md`
+(Severity High, unpinned on the 6.5.x line), carrying the root-cause reading, the three-way
+fn/var/enum reproducer, the 6.5.9 / 6.5.13 / 6.5.14 / 6.5.16 bisection, and the 69-repo blast
+radius. Preferred fix proposed there: compile the self-check bundle with the project's own
+`[deps]` stdlib in scope — the `cyrius check --with-deps` shape — rather than extending
+suppression to name resolution.
 **Status:** 🔴 **OPEN** — live on 6.5.16, worked around in hisab's CI as above.

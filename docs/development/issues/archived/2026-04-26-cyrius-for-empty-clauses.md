@@ -1,5 +1,26 @@
 # 2026-04-26 — cyrius parser: `for (init; cond; step)` requires all three clauses non-empty
 
+> **CLOSED 2026-08-09 (hisab v2.9.3 triage) — WON'T-FIX UPSTREAM, BY DESIGN.**
+> The upstream filing was resolved on **2026-06-02 (cycc v6.0.36)** and archived at
+> `cyrius/docs/development/issues/archived/2026-04-26-cyrius-for-empty-clauses.md`:
+>
+> > Cyrius requires all three `for` clauses; omitted clauses (`for (;;)`) are not supported by
+> > design. Use `while` for unbounded/custom-stepped loops and the counted `for` / `for x in …`
+> > forms otherwise. The convention is now documented in `docs/guides/cyrius-guide.md`
+> > (control-flow section).
+>
+> **hisab carried this as "Open" for five releases after it had been decided.** The re-verifications
+> below (6.3.11, 6.4.66, 6.4.69, 6.5.6, 6.5.9, 6.5.16) were all re-confirming a documented language
+> rule, not tracking an unfixed bug — nobody had checked the upstream tracker. The one thing those
+> passes did establish that is still worth having is that **the misleading-line-number half of the
+> complaint was genuinely fixed**: on 6.5.16 the error lands on the true `file:line` with a caret on
+> the offending token and both forms report in the same run, against the original symptom of an
+> error appearing inside an unrelated function hundreds of lines away.
+>
+> **Consequence for hisab: permanent, not provisional.** The `while` rewrites in
+> `src/collision_core.cyr` and `src/collision_mesh.cyr` are the correct idiom and must not be
+> "restored" to the C-style form by a future reader who assumes this is still pending.
+
 **Component:** `cyrius` parser (`src/frontend/parse_ctrl.cyr` `PARSE_FOR`)
 **Toolchain seen:** cyrius 5.7.10 (parser shape unchanged for several minor releases)
 **Severity:** Misleading parse errors at the wrong line — easy to chase the wrong file

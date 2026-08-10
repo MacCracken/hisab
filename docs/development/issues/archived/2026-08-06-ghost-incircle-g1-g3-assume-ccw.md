@@ -1,8 +1,60 @@
 # `_col_dl_ic_g1` and `_col_dl_ic_g3` drop the winding factor, so `_col_dl_incircle` is not order-free — plus a genuine M¹ tie-break defect in `g1`
 
-**Status:** 🟡 **PARTIALLY FIXED** — `g3` (finding 1, all-ghost half) **fixed in 2.9.1**; `g1`'s
-M¹ tie-break (finding 2) **fixed in 2.9.1**; `g1`'s missing winding factor (finding 1, one-ghost
-half) **still OPEN and latent**. Filed 2026-08-06.
+**Status:** 🟢 **CLOSED — fully discharged in 2.9.3.** `g3` (finding 1, all-ghost half) fixed in
+2.9.1; `g1`'s M¹ tie-break (finding 2) fixed in 2.9.1; **`g1`'s missing winding factor (finding 1,
+one-ghost half) fixed in 2.9.3** — `_col_dl_incircle` is now order-free at the entry point, which
+was the open question this filing was left open to answer. Filed 2026-08-06.
+
+## Resolution (2.9.3) — finding 1, `g1`
+
+The repair is the one suggested below: `g1` forms the triple's winding instead of reading it out of
+the CCW storage convention. **The suggestion was incomplete in one respect, and the gap is worth
+recording because a first draft shipped it.**
+
+`w = sign((b − a) × u_k)` is the winding *except* when the edge is parallel to `u_k`, where it is
+0. The first draft read that as "degenerate, nothing is inside" and returned 0. **That is wrong.**
+`G_k = A + M·u_k`, so an edge parallel to `u_k` leaves the triangle `(a, b, G_k)` with area
+`|(b − a) × (A − a)| / 2` — **constant in M, not vanishing**. The third vertex recedes *parallel*
+to line(a, b) at a fixed perpendicular offset, and the limiting circle is the half-plane on the
+side that offset is on: the **apex's** side. So the winding falls back to `sign((b − a) × (A − a))`
+with `A = points[0]`, the same apex convention `_col_dl_ic_g2`'s tie branch already uses. Only when
+*both* vanish — edge parallel to `u_k` **and** apex on line(a, b) — are the three points collinear
+for every M, and then there is no circumcircle at all; `0` is a convention there, chosen because it
+is order-free.
+
+The draft's error was caught by the fixture, not by reasoning: this filing's own finding-2
+reproducer (`a = (−2,0)`, `b = (−4,−4)`, `u₀ = (1,2)`) **is** a parallel-edge case, and the 2.9.1
+assertion guarding it went red.
+
+**Validated against an order-free exact oracle** — circumcentre in `Fraction`, `|p − O|²` vs `r²`,
+ghosts at `A + 10³⁰·u`, which takes no orientation argument and so cannot inherit a convention from
+the code under test. Over 5 edges × 4 apexes × 3 directions × 81 query points: **4606 of 4606
+correct, 0 wrong**, including **1110 parallel-edge probes**. (158 further probes were genuinely
+collinear and skipped — the oracle has no answer there.)
+
+### What is asserted, and one thing that was not enough
+
+`_dlg1_run` / `_DLG1_BAD` in `tests/modules.tcyr` sweeps 4 edges × 25 query points × 3 ghost
+directions × 6 orderings = **1800 probes** and asserts every ordering agrees. The pre-2.9.3 body
+scores **846 of 1500** ordering comparisons on it. That replaces this file's Python-transcription
+evidence with a first-party assertion, which is what it said was missing.
+
+⚠ **Order-consistency alone is too weak for the apex fallback, and a mutant proved it.** Negating
+the fallback's sign flips every ordering *together*, so the six still agree and the grid stays
+green — the same weakness the `g3` harness records. Four correctness assertions were added on top,
+pinning two apexes on **opposite sides** of a `u_0`-parallel edge to opposite answers, with the
+expected values taken from the exact oracle. Four mutants are now caught: dropping the winding
+(846 disagreements), treating the parallel edge as degenerate (the finding-2 reproducer), flipping
+the apex fallback's sign (4 assertions), and never consulting `u_k` (27 assertions).
+
+**Cost.** One cross product on a path that already does two, and only on the ghost path. Measured
+against the 2.9.2 avg baseline, same machine: `delaunay_2d_400` −2.9%, `delaunay_2d_circle_150`
++0.4%, `halfedge_2k_tris` −4.6%, `convex_hull_2d_2k` −4.5%; median across all 55 benchmarks
+−1.4%. **No cost is measurable above the harness's noise floor** (median 3.5%, worst 6.9% on
+back-to-back runs of an identical binary), and none is claimed in either direction.
+
+**No reachable behaviour changed**, as predicted: `delaunay_2d` stores every triangle CCW, so the
+factor is `+1` on every call it makes. Full suite 3351 → **3359**, all five harnesses green.
 
 **2.9.1 — finding 1, `g3`.** Confirmed and repaired. The suggested repair below (`g3` becomes
 `return 1`) was re-derived from scratch rather than inherited, and holds: the body is now

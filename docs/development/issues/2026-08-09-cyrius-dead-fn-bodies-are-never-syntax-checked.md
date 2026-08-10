@@ -95,6 +95,14 @@ is for.
   on line 1. Errors inside `include`d files carry the true filename and line. Not part of this
   defect, but it will confuse anyone reproducing it.
 
-**Upstream:** not yet filed in `cyrius/docs/development/issues/`.
+**Upstream:** filed 2026-08-09 at
+`cyrius/docs/development/issues/hisab-dead-fn-bodies-never-syntax-checked.md` (Severity Medium,
+unpinned on the 6.5.x line), with a standalone repro at
+`cyrius/docs/development/issues/repros/2026-08-09-dead-fn-body-not-parsed.cyr`. The repro was
+re-run from the filed file itself and reproduces all three states: as filed exit 0 on
+build/lint/vet/check, exit 1 after renaming `gg` → `g_g`, exit 1 after calling `gg` from `main`.
+Root cause is left as an open question there — `CYRIUS_DCE_VERBOSE=1` lists both variants as
+`dead:` but only the underscore one contributes bytes, which is flagged as speculation for the
+Cyrius side to confirm.
 **Status:** 🔴 **OPEN** — live on 6.5.16. No hisab workaround needed today; recorded so the naming
 accident that protects the tree is a known dependency rather than an invisible one.

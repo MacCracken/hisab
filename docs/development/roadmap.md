@@ -174,6 +174,32 @@ a major, with a migration guide, not a 2.x patch.
 - [ ] Wrap fallible returns in `Result<T,E>` (keep `ERR_*` codes as the `E` payload)
 - [ ] Adopt `?` to replace manual `-1`-return + check chains
 - [ ] Migration guide + deprecation window for the old integer-code API
+- [ ] **Public / private function surface.** hisab currently signals intent by naming convention
+      alone — a leading `_` means "internal" and nothing enforces it. Two consequences already
+      visible in the tree: `geo_diff.cyr` reaches `geo.cyr`'s helpers across a module boundary
+      because nothing distinguishes "public API" from "implementation detail", and the 2.10.1 split
+      had to be named `geo_ray_aabb_face` rather than `_core` specifically so a cross-module call
+      would not be reaching for an underscore. A major is the right place to draw that line, because
+      marking a function private is a **breaking change for anyone already calling it** — the same
+      reason the `Result<T,E>` migration lands here.
+
+      **Sized by measurement, not estimated: 269 `_`-prefixed functions across `src/`, of which 17
+      are called from a different module**, in six pairs:
+
+      | defined in | called from | count |
+      |---|---|--:|
+      | `calc` | `calc_ext` | 3 |
+      | `calc` | `noise_simplex` | 2 |
+      | `geo_advanced` | `collision_core` | 4 |
+      | `lie` | `lie_ext` | 4 |
+      | `num` | `num_ext` | 2 |
+      | `symbolic` | `symbolic_ext` | 2 |
+
+      So a blanket "`_` means private" would break six real call paths, every one of them a
+      `X` → `X_ext` pair where the split is an artefact of file size rather than of API design.
+      Decide: the visibility marker; whether those six pairs get a shared-internal escape hatch or
+      the helper is promoted to public; and whether the distlib bundle needs the distinction at all,
+      since it concatenates everything into one compilation unit.
 
 ---
 

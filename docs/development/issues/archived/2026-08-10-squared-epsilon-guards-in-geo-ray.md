@@ -1,7 +1,7 @@
 # geo_ray_sphere and geo_ray_capsule test a SQUARED length against an unsquared epsilon
 
 **Filed**: 2026-08-10 (during 2.10.1)
-**Status**: 🟢 **FIXED in 2.10.1** — `src/geo.cyr`, both functions
+**Status**: 🟢 **FIXED** — two sites in 2.10.1, four more in **2.10.2** (see the corrected table below)
 **Severity**: High — silent wrong output; one of the two returns a *wrong number*, not a sentinel
 **Class**: squared-vs-unsquared tolerance (second instance; `complex.cyr` was the first, 2.6.14)
 
@@ -95,10 +95,10 @@ Found by grep after the two above were confirmed, because a defect class is wort
 |---|---|---|
 | `geo.cyr` `geo_ray_sphere` | `d·d` | **FIXED 2.10.1** — returned a miss for a real hit |
 | `geo.cyr` `geo_ray_capsule` cyl | `d_perp·d_perp` | **FIXED 2.10.1** — returned a wrong t |
-| `geo.cyr:528` `geo_ray_capsule` degenerate | `ab·ab` | ⚠ **CORRECTED — this was wrong. Now OPEN for 2.10.2.** The reasoning below said the two answers "differ by less than the capsule's own length". Measured, they do not: capsule `(0,0,0)-(1e-7,0,0)` with `r = 1e-8`, ray from `(5e-7,0,0)` along `-x`, returns `t = 4.9e-7` against a true `3.9e-7` — **25.6% error**. Scale covariance holds from `s = 1e0` down to `1e-6` and then collapses to a miss at `1e-7`. |
-| `geo.cyr` `geo_triangle_unit_normal` | `len_sq` | ⚠ **CORRECTED — this was wrong. Now OPEN for 2.10.2.** Called a "degeneracy policy" below; it is a **fabricated answer**. A right triangle with 1e-7 legs in the xy-plane returns **(0, 1, 0)** where the truth is (0, 0, 1) — a well-formed triangle, a wrong normal, no error signal. Re-measured on this tree. |
-| `geo.cyr` `geo_segment_direction` | `len_sq` | **Left** — returns `unit_x` for a segment shorter than 1e-6. Same shape as the two above and should be re-examined with them in 2.10.2. |
-| `geo.cyr` `geo_segment_closest_point` | `len_sq` | ⚠ **Left, but note it is used as an ORACLE.** `geo_segment_distance_to_point` builds on it and returns `1e-8` where the truth is 0 for a segment of length 1e-7. The commissioned probe reached for it as a reference while checking the capsule and was silently misled by it. |
+| `geo.cyr` `geo_ray_capsule` degenerate | `ab·ab` | 🟢 **FIXED 2.10.2** — and the 2.10.1 disposition below was WRONG. The reasoning below said the two answers "differ by less than the capsule's own length". Measured, they do not: capsule `(0,0,0)-(1e-7,0,0)` with `r = 1e-8`, ray from `(5e-7,0,0)` along `-x`, returns `t = 4.9e-7` against a true `3.9e-7` — **25.6% error**. Scale covariance holds from `s = 1e0` down to `1e-6` and then collapses to a miss at `1e-7`. |
+| `geo.cyr` `geo_triangle_unit_normal` | `len_sq` | 🟢 **FIXED 2.10.2** — and the 2.10.1 disposition below was WRONG. Called a "degeneracy policy" below; it is a **fabricated answer**. A right triangle with 1e-7 legs in the xy-plane returns **(0, 1, 0)** where the truth is (0, 0, 1) — a well-formed triangle, a wrong normal, no error signal. Re-measured on this tree. |
+| `geo.cyr` `geo_segment_direction` | `len_sq` | 🟢 **FIXED 2.10.2** — returned a fabricated `unit_x` below 1e-6. ⚠ An x-aligned test segment does NOT discriminate: the fallback *is* the right answer there. The sweep uses a diagonal. |
+| `geo.cyr` `geo_segment_closest_point` | `len_sq` | 🟢 **FIXED 2.10.2**, and it was the most load-bearing of the four because it is used as an ORACLE. `geo_segment_distance_to_point` builds on it and returns `1e-8` where the truth is 0 for a segment of length 1e-7. The commissioned probe reached for it as a reference while checking the capsule and was silently misled by it. |
 | `quat.cyr:102` | `len_sq` | **Left** — same, returns identity |
 | `geo_advanced.cyr:1056/1060/1067` | `hvec3_length_sq` | **DEFERRED, not dismissed.** These are EPA's degenerate-face guards. Tightening them is a narrowphase behaviour change on a routine with a measured cost and a live open filing (`epa-certificate`), and it needs its own before/after. Filed as a 2.10.2 item on the roadmap rather than folded in here. |
 
@@ -106,6 +106,14 @@ Found by grep after the two above were confirmed, because a defect class is wort
 written from reading the code — "returns `unit_y`, that's a policy" — not from running it. An
 independent probe commissioned a few hours later measured both and found fabricated answers on
 well-formed input. Corrected in place above, and scheduled for 2.10.2.
+
+**All four are now repaired (2.10.2), at `_GEO_F64_TINY`** rather than
+`_GEO_F64_EPS_SQ` — the same rule the slab repair landed on: *guard exactly what makes the DIVISION
+fail and nothing more*. That is stricter than squaring the epsilon and it is the one threshold that
+does not need a scale to be chosen for it. The permanent assertion is a **scale-covariance sweep**
+— the same scene in different units must give the same answer — over 4 properties × 10 decades,
+because that is the only shape of test a bad threshold cannot pass. Each of the four is
+independently mutation-proven.
 
 That is the 2.9.3 lesson recurring inside a single release: *a filing is not evidence until
 something has re-run it*, and a **disposition** is a filing. Sorting nine sites into "fixed" and

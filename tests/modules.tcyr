@@ -1355,6 +1355,243 @@ fn _homog_small_sweep() {
     return 0;
 }
 
+# --- 2.10.2: the hit point a slab routine reports must be ON the box ---------
+#
+# THE STRUCTURAL CHECK THAT WOULD HAVE CAUGHT THE PHANTOM HIT, and the reason it
+# is a sweep over direction magnitudes rather than a handful of witnesses.
+#
+# `geo_ray_aabb` and `geo_ray_obb` skipped any axis whose direction component
+# fell below EPSILON_F64 (1e-12), treating it as parallel. That threshold is
+# scale-free and the consequence is not: over t ~ 1e12 a component of 9e-13 moves
+# the coordinate by ~0.9, most of a unit box, so the slab that would have
+# REJECTED the ray was deleted and a confident hit came back. Measured on 2.10.1:
+# box [0,1]^3, origin (0.5, 0.5, -1e12), direction (9e-13, 0, 1) with |d| = 1.0
+# EXACTLY -- an ordinary unit direction, so geo_ray_new offered no protection --
+# returned t = 1e12 whose hit point sits at x = 1.4.
+# [measured: docs/development/issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md]
+#
+# The invariant is the same one 2.10.0 used on the sphere ("the hit point is on
+# the surface"), which is why it is worth having on every primitive rather than
+# on the one that most recently broke. ORACLE-FREE: it compares the routine
+# against its own returned geometry, not against a reference implementation.
+# [measured: docs/development/issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md]
+# --- 2.10.2: scale covariance, the check that actually finds a bad threshold ---
+#
+# The same scene expressed in different units must give the same answer, scaled.
+# A guard comparing a SQUARED length against an unsquared tolerance breaks that
+# at a specific scale and nowhere else, so a fixture at one scale -- which is
+# every other geometry fixture in this file -- cannot see it however many samples
+# it takes. 2.10.1 fixed two such guards and left four, and dispositioned two of
+# the four "a degeneracy policy" by READING the code. Measured, they are
+# fabricated answers on well-formed input:
+# [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
+#
+#   geo_triangle_unit_normal   returned (0,1,0) for a right triangle with 1e-4
+#                              legs in the xy-plane, where the truth is (0,0,1).
+#                              Its len_sq is the SQUARED cross product, s^4, so
+#                              the guard fired three decades earlier than the
+#                              others.
+#   geo_segment_direction      returned unit_x below 1e-6
+#   geo_segment_closest_point  collapsed a short segment to its start, so
+#                              geo_segment_distance_to_point -- which callers
+#                              reach for as an ORACLE -- reported half the
+#                              segment's length as the distance from its own
+#                              MIDPOINT
+#   geo_ray_capsule degenerate treated any capsule shorter than 1e-6 as a sphere
+#
+# All four now guard at _GEO_F64_TINY, on the rule the slab repair uses: guard
+# exactly what makes the DIVISION fail and nothing more.
+# [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
+# --- 2.10.2: every capsule hit point is ON the capsule ----------------------
+#
+# The cap branches used to call geo_ray_sphere, which returns only the FIRST
+# non-negative root, and then tested that ONE root against the cap's half-space.
+# If it failed, the other root was never considered. Two symptoms, one cause:
+#
+#   * a ray leaving the capsule through a cap reported a MISS -- 32 of 600 random
+#     interior origins, 5.3%
+#     [measured: docs/development/issues/archived/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md]
+#   * when the cylinder test yielded nothing, a separate fallback returned the
+#     smaller of the two spheres' first roots with NO half-space test at all:
+#     capsule (0,0,0)-(10,0,0) r = 1, ray from (5,0,0) along +x returned t = 4,
+#     whose hit point (9,0,0) is ON THE AXIS, a full radius inside the solid
+#
+# The invariant asserted here is the surface residual, not a t value: |dist(hit,
+# segment) - r| must be 0. A t-value assertion would have passed the second case,
+# because 4.0 is a perfectly plausible number.
+#
+# ⚠ This sweep needs geo_segment_distance_to_point to be TRUSTWORTHY, and it was
+# not until earlier in this same release -- it collapsed any segment shorter than
+# 1e-6 to its start point. The commissioned probe that found these defects reached
+# for it as an oracle and was silently misled. Fixed first, deliberately.
+# [measured: docs/development/issues/archived/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md]
+var _CS_BAD = 0;
+var _CS_RUN = 0;
+var _CS_DROP = 0;
+
+fn _cs_sweep() {
+    var ca = hvec3_new(0, 0, 0);
+    var cb = hvec3_new(f64_from(10), 0, 0);
+    var cap = geo_capsule_new(ca, cb, F64_ONE);
+    var seg = geo_segment_new(ca, cb);
+    var seed = 987654321;
+    for (var n = 0; n < 400; n = n + 1) {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var ax = f64_div(f64_from(seed % 900), f64_from(100));
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var ay = f64_div(f64_from(seed % 120 - 60), f64_from(100));
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var az = f64_div(f64_from(seed % 120 - 60), f64_from(100));
+        var o = hvec3_new(ax, ay, az);
+        # INTERIOR origins only -- that is the branch that was broken, and a
+        # sweep from outside reproduces neither symptom.
+        if (f64_gt(geo_segment_distance_to_point(seg, o), F64_ONE) == 1) { continue; }
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var dx = f64_div(f64_from(seed % 200 - 100), f64_from(100));
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var dy = f64_div(f64_from(seed % 200 - 100), f64_from(100));
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        var dz = f64_div(f64_from(seed % 200 - 100), f64_from(100));
+        var d = hvec3_new(dx, dy, dz);
+        if (f64_lt(hvec3_length(d), f64_div(F64_ONE, f64_from(10))) == 1) { continue; }
+        _CS_RUN = _CS_RUN + 1;
+        var r = alloc(sizeof(GeoRay));
+        GeoRay_set_origin(r, o);
+        GeoRay_set_direction(r, hvec3_normalize(d));
+        var t = geo_ray_capsule(r, cap);
+        # An origin INSIDE always has an exit, so a miss here is a dropped hit.
+        if (t == 0) { _CS_DROP = _CS_DROP + 1; continue; }
+        var resid = f64_abs(f64_sub(geo_segment_distance_to_point(seg,
+        geo_ray_at(r, t)), F64_ONE));
+        if (f64_gt(resid, LOOSE_TOL_M) == 1) { _CS_BAD = _CS_BAD + 1; }
+    }
+    return 0;
+}
+
+var _SC_BAD = 0;
+var _SC_RUN = 0;
+
+fn _sc_bad(got, want) {
+    _SC_RUN = _SC_RUN + 1;
+    if (f64_approx_eq(got, want, LOOSE_TOL_M) == 1) { return 0; }
+    return 1;
+}
+
+fn _sc_sweep() {
+    var root_half = f64_div(F64_ONE, f64_sqrt(F64_TWO));
+    for (var e = 0; e < 10; e = e + 1) {
+        var sc = F64_ONE;
+        for (var i = 0; i < e; i = i + 1) { sc = f64_div(sc, f64_from(10)); }
+
+        # A right triangle with legs `sc` in the xy-plane: unit normal (0,0,1).
+        var tri = geo_triangle_new(hvec3_new(0, 0, 0), hvec3_new(sc, 0, 0),
+        hvec3_new(0, sc, 0));
+        _SC_BAD = _SC_BAD + _sc_bad(HVec3_z(geo_triangle_unit_normal(tri)), F64_ONE);
+
+        # ⚠ A DIAGONAL segment. An x-aligned one does NOT discriminate: the
+        # degenerate fallback is hvec3_unit_x, which is the right answer there, so
+        # the guard could fire and the assertion would still pass. Found while
+        # writing this sweep -- the first draft used an x-aligned segment.
+        var seg = geo_segment_new(hvec3_new(0, 0, 0), hvec3_new(sc, sc, 0));
+        _SC_BAD = _SC_BAD + _sc_bad(HVec3_x(geo_segment_direction(seg)), root_half);
+
+        # The midpoint of a segment is at distance 0 from it, at every scale.
+        var mid = hvec3_scale(hvec3_new(sc, sc, 0), F64_HALF);
+        _SC_BAD = _SC_BAD + _sc_bad(geo_segment_distance_to_point(seg, mid), 0);
+
+        # Capsule (0,0,0)-(sc,0,0) radius sc/4, ray from (sc/2, 2sc, 0) straight
+        # down: it hits the barrel at t = 2sc - sc/4 = 1.75sc.
+        var cap = geo_capsule_new(hvec3_new(0, 0, 0), hvec3_new(sc, 0, 0),
+        f64_div(sc, f64_from(4)));
+        var cr = alloc(sizeof(GeoRay));
+        GeoRay_set_origin(cr, hvec3_new(f64_div(sc, F64_TWO), f64_mul(F64_TWO, sc), 0));
+        GeoRay_set_direction(cr, hvec3_new(0, f64_neg(F64_ONE), 0));
+        _SC_BAD = _SC_BAD + _sc_bad(f64_div(geo_ray_capsule(cr, cap), sc),
+        f64_div(f64_from(7), f64_from(4)));
+    }
+    return 0;
+}
+
+var _SF_BAD = 0;
+var _SF_RUN = 0;
+var _SF_HITS = 0;
+
+# 1 when coordinate v lies outside [lo, hi] by more than a scale-relative slack.
+fn _sf_outside(v, lo, hi) {
+    var scale = f64_max(F64_ONE, f64_max(f64_abs(lo), f64_abs(hi)));
+    var tol = f64_mul(scale, LOOSE_TOL_M);
+    if (f64_lt(v, f64_sub(lo, tol)) == 1) { return 1; }
+    if (f64_gt(v, f64_add(hi, tol)) == 1) { return 1; }
+    return 0;
+}
+
+fn _sf_check(ray, box, t) {
+    _SF_RUN = _SF_RUN + 1;
+    if (t == 0) { return 0; }              # a miss makes no claim about a point
+    _SF_HITS = _SF_HITS + 1;
+    var p = geo_ray_at(ray, t);
+    var lo = GeoAabb_min(box);
+    var hi = GeoAabb_max(box);
+    var bad = _sf_outside(HVec3_x(p), HVec3_x(lo), HVec3_x(hi));
+    bad = bad + _sf_outside(HVec3_y(p), HVec3_y(lo), HVec3_y(hi));
+    bad = bad + _sf_outside(HVec3_z(p), HVec3_z(lo), HVec3_z(hi));
+    if (bad > 0) { return 1; }
+    return 0;
+}
+
+fn _sf_sweep() {
+    var box = geo_aabb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+    var obb = geo_obb_new(hvec3_new(F64_HALF, F64_HALF, F64_HALF),
+    hvec3_new(F64_HALF, F64_HALF, F64_HALF), hquat_identity());
+    # ⚠ THE SWEEP RANGES OVER DIRECTION-COMPONENT MAGNITUDE, which is the axis
+    # the defect lived on. A fixture at magnitude ~1 -- which is every other geo
+    # fixture in this file -- cannot reach it at any number of samples.
+    for (var e = 0; e < 18; e = e + 1) {
+        var tiny = F64_ONE;
+        for (var i = 0; i < e; i = i + 1) { tiny = f64_div(tiny, f64_from(10)); }
+        # Start far enough back that the tiny component has room to matter: the
+        # ray travels ~1/tiny before the z slab bites, so x drifts by
+        # tiny * reach -- which is the whole mechanism, expressed as a fixture.
+        var far = f64_div(F64_ONE, tiny);
+        # ⚠ TWO DRIFTS, and the first draft had only the second. With reach =
+        # 1/tiny the x drift is exactly 1.0, so the ray always exits the box on x
+        # and every sample was a MISS -- 72 checks that asserted nothing about a
+        # hit point, and the _SF_HITS counter is what said so. reach = 1/(4*tiny)
+        # drifts 0.25 and lands inside, giving the surface invariant something to
+        # be true of. The 1.0 case is kept: pre-2.10.2 it was reported as a HIT at
+        # x = 1.5, which is the defect itself.
+        for (var side = 0; side < 2; side = side + 1) {
+            var comp = tiny;
+            var reach = far;
+            if (side == 1) { reach = f64_div(far, f64_from(4)); }
+            var d = hvec3_new(comp, 0, F64_ONE);
+            var o = hvec3_new(F64_HALF, F64_HALF, f64_neg(reach));
+            var r = alloc(sizeof(GeoRay));
+            GeoRay_set_origin(r, o);
+            GeoRay_set_direction(r, d);
+            _SF_BAD = _SF_BAD + _sf_check(r, box, geo_ray_aabb(r, box));
+            # The identical box as an OBB: the two must not disagree either.
+            var to = geo_ray_obb(r, obb);
+            _SF_BAD = _SF_BAD + _sf_check(r, box, to);
+            if (_sf_agree(geo_ray_aabb(r, box), to) == 0) { _SF_BAD = _SF_BAD + 1; }
+        }
+    }
+    return 0;
+}
+
+# The same box expressed as an AABB and as an OBB must answer the same. Pre-2.10.2
+# they used OPPOSITE comparison senses around EPSILON_F64, so a component equal to
+# it took the slab branch in one and the parallel branch in the other: measured,
+# aabb 0 against obb 4.5e12.
+# [measured: docs/development/issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md]
+fn _sf_agree(ta, to) {
+    if (ta == 0) { if (to == 0) { return 1; } return 0; }
+    if (to == 0) { return 0; }
+    var scale = f64_max(F64_ONE, f64_max(f64_abs(ta), f64_abs(to)));
+    if (f64_lt(f64_abs(f64_sub(ta, to)), f64_mul(scale, LOOSE_TOL_M)) == 1) { return 1; }
+    return 0;
+}
+
 var _DD_BAD = 0;
 var _DD_RUN = 0;
 fn _degen_bad(t) {
@@ -2264,6 +2501,89 @@ hvec3_new(0, 0, F64_ONE), F64_ONE)), 0,
 
 # 2.10.1 widens that pair to all six. Pre-fix this sweep reported 2 bad of 12 --
 # geo_ray_aabb and geo_ray_obb, both with the origin inside, both +Inf.
+test_group("2.10.2 geo_ray_capsule: every hit point is ON the capsule");
+_cs_sweep();
+assert_gt(_CS_RUN, 100, "the capsule interior sweep found a useful number of interior origins");
+assert_eq(_CS_DROP, 0,
+"no interior origin loses its exit (32 of 600 did pre-2.10.2, all through a cap)");
+assert_eq(_CS_BAD, 0,
+"every capsule hit point sits at distance r from the segment, to LOOSE_TOL_M");
+
+# The witness, asserted on the SURFACE RESIDUAL rather than on t: the broken code
+# returned 4.0 here, which is a perfectly plausible number and would have passed
+# any loose t assertion. Its hit point was on the axis, a full radius inside.
+var cw_cap = geo_capsule_new(hvec3_new(0, 0, 0), hvec3_new(f64_from(10), 0, 0), F64_ONE);
+var cw_seg = geo_segment_new(hvec3_new(0, 0, 0), hvec3_new(f64_from(10), 0, 0));
+var cw_r = alloc(sizeof(GeoRay));
+GeoRay_set_origin(cw_r, hvec3_new(f64_from(5), 0, 0));
+GeoRay_set_direction(cw_r, hvec3_new(F64_ONE, 0, 0));
+var cw_t = geo_ray_capsule(cw_r, cw_cap);
+assert(f64_approx_eq(geo_segment_distance_to_point(cw_seg, geo_ray_at(cw_r, cw_t)),
+F64_ONE, LOOSE_TOL_M),
+"axial ray from inside: the hit point is on the SURFACE, not a radius inside it");
+assert(f64_approx_eq(cw_t, f64_from(6), LOOSE_TOL_M),
+"axial ray from inside: t = 6, the exit through the end cap (was 4, an interior point)");
+
+test_group("2.10.2 geo: the same scene in different units gives the same answer");
+_sc_sweep();
+assert_eq(_SC_RUN, 40, "the scale-covariance sweep ran 4 properties x 10 decades");
+assert_eq(_SC_BAD, 0,
+"triangle normal, segment direction, segment distance and capsule t are all scale-covariant to 1e-9");
+
+test_group("2.10.2 slab routines: the reported hit point is ON the box");
+_sf_sweep();
+assert_eq(_SF_RUN, 72, "the slab surface sweep ran 18 magnitudes x 2 signs x 2 primitives");
+# ⚠ The sweep is half hits and half misses BY CONSTRUCTION, and this counter is
+# what caught the first draft being all misses. A structural invariant about hit
+# points is vacuous over a sample of misses.
+assert_gt(_SF_HITS, 30, "and a useful number of them were HITS, not all misses");
+assert_eq(_SF_BAD, 0,
+"every slab hit point lies on its box, and aabb agrees with obb (both broke pre-2.10.2)");
+
+# The witnesses, kept alongside the sweep because each names a distinct symptom.
+var sf_box = geo_aabb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+var sf_e12 = F64_ONE;
+for (var i = 0; i < 12; i = i + 1) { sf_e12 = f64_mul(sf_e12, f64_from(10)); }
+var sf_9e13 = f64_from(9);
+for (var i = 0; i < 13; i = i + 1) { sf_9e13 = f64_div(sf_9e13, f64_from(10)); }
+var sf_r = alloc(sizeof(GeoRay));
+GeoRay_set_origin(sf_r, hvec3_new(F64_HALF, F64_HALF, f64_neg(sf_e12)));
+GeoRay_set_direction(sf_r, hvec3_new(sf_9e13, 0, F64_ONE));
+# The direction is UNIT to 16 digits -- the point being that geo_ray_new would
+# have produced it, so normalizing is no defence.
+assert(f64_approx_eq(hvec3_length(GeoRay_direction(sf_r)), F64_ONE, LOOSE_TOL_M),
+"phantom-hit witness: the direction really is unit length");
+assert_eq(geo_ray_aabb(sf_r, sf_box), 0,
+"phantom hit: a unit direction with d_x = 9e-13 no longer reports a hit at x = 1.4");
+
+# The same ray from INSIDE a tall box: the x slab bounds the exit, and deleting it
+# gave an exit 18x too large.
+# [measured: docs/development/issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md]
+var sf_tall = alloc(sizeof(GeoAabb));
+GeoAabb_set_min(sf_tall, hvec3_new(0, 0, 0));
+var sf_e13 = f64_mul(sf_e12, f64_from(10));
+GeoAabb_set_max(sf_tall, hvec3_new(F64_ONE, F64_ONE, sf_e13));
+var sf_ri = alloc(sizeof(GeoRay));
+GeoRay_set_origin(sf_ri, hvec3_new(F64_HALF, F64_HALF, F64_HALF));
+GeoRay_set_direction(sf_ri, hvec3_new(sf_9e13, 0, F64_ONE));
+var sf_ti = geo_ray_aabb(sf_ri, sf_tall);
+assert(f64_approx_eq(HVec3_x(geo_ray_at(sf_ri, sf_ti)), F64_ONE, LOOSE_TOL_M),
+"interior exit: the ray leaves through the +x face, not 8.5 units past it");
+
+# +Inf from entirely finite inputs. The true t overflows the exponent range, so
+# the only contract-conformant answer is the miss sentinel.
+var sf_e300 = F64_ONE;
+for (var i = 0; i < 300; i = i + 1) { sf_e300 = f64_mul(sf_e300, f64_from(10)); }
+var sf_fobb = geo_obb_new(hvec3_new(0, 0, sf_e300), hvec3_new(F64_ONE, F64_ONE, F64_ONE),
+hquat_identity());
+var sf_rf = alloc(sizeof(GeoRay));
+GeoRay_set_origin(sf_rf, hvec3_new(0, 0, 0));
+var sf_2e12 = F64_TWO;
+for (var i = 0; i < 12; i = i + 1) { sf_2e12 = f64_div(sf_2e12, f64_from(10)); }
+GeoRay_set_direction(sf_rf, hvec3_new(0, 0, sf_2e12));
+assert_eq(geo_ray_obb(sf_rf, sf_fobb), 0,
+"a t that overflows to +Inf from FINITE inputs returns the miss sentinel, not Inf");
+
 test_group("2.10.1 geo_ray_*: a degenerate direction returns the miss sentinel");
 _degen_sweep();
 assert_eq(_DD_RUN, 12, "degenerate-direction sweep ran 6 primitives x 2 origin positions");

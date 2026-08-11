@@ -4061,6 +4061,237 @@ assert(str_eq(s_str_v, str_from("y")) == 1, "to_str var y");
 # ================================================================
 # AUTODIFF (~10)
 # ================================================================
+# --- 2.11.0: every dual_* derivative against central differences ------------
+#
+# THE CHECK RUN BEFORE ANY REVERSE-MODE CODE WAS WRITTEN, and the fourth release
+# running in which that move found defects in shipped code. Reverse mode is
+# validated against forward mode, so a wrong dual_* would have been inherited
+# wholesale and then "confirmed" by agreement.
+#
+# ⚠ THE FD SWEEP ALONE FOUND NOTHING, and that is the point worth recording. At
+# every input where a guard fires, the perturbed SCALAR is NaN too, so the sample
+# is skipped and the guard is never asked. Five defects sat behind guards that no
+# amount of finite differencing could reach; they need direct interrogation,
+# which is what the block below the sweep does.
+var _AD_BAD = 0;
+var _AD_RUN = 0;
+
+fn _ad_fd_cmp(analytic, lo, hi, h) {
+    if (f64_eq(lo, lo) == 0) { return 0; }         # scalar undefined here
+    if (f64_eq(hi, hi) == 0) { return 0; }
+    _AD_RUN = _AD_RUN + 1;
+    var fd = f64_div(f64_sub(hi, lo), f64_mul(F64_TWO, h));
+    var scale = f64_max(F64_ONE, f64_max(f64_abs(analytic), f64_abs(fd)));
+    if (f64_lt(f64_abs(f64_sub(analytic, fd)), f64_mul(scale, LOOSE_TOL_M)) == 1) { return 0; }
+    return 1;
+}
+
+fn _ad_fd_sweep() {
+    # ⚠ h is SCALE-RELATIVE. An absolute 1e-6 straddles the kink of abs and the
+    # pole of 1/x at small x, which produced two "mismatches" in the first draft
+    # that were the fixture's fault, not the code's.
+    var pts = alloc(24);
+    store64(pts,     F64_TWO);
+    store64(pts + 8, f64_div(F64_ONE, F64_TWO));
+    store64(pts + 16, f64_div(f64_from(7), f64_from(3)));
+    var k = f64_div(f64_from(7), F64_TWO);
+    for (var pi = 0; pi < 3; pi = pi + 1) {
+        var x = load64(pts + pi * 8);
+        var h = f64_mul(f64_abs(x), _JT_H);
+        var xl = f64_sub(x, h);
+        var xh = f64_add(x, h);
+        var v = dual_var(x);
+        var c = dual_const(k);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_add(v, c)),
+        f64_add(xl, k), f64_add(xh, k), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_sub(v, c)),
+        f64_sub(xl, k), f64_sub(xh, k), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_mul(v, c)),
+        f64_mul(xl, k), f64_mul(xh, k), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_div(v, c)),
+        f64_div(xl, k), f64_div(xh, k), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_div(c, v)),
+        f64_div(k, xl), f64_div(k, xh), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_neg(v)),
+        f64_neg(xl), f64_neg(xh), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_sin(v)), f64_sin(xl), f64_sin(xh), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_cos(v)), f64_cos(xl), f64_cos(xh), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_exp(v)), f64_exp(xl), f64_exp(xh), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_ln(v)), f64_ln(xl), f64_ln(xh), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_sqrt(v)), f64_sqrt(xl), f64_sqrt(xh), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_pow(v, k)),
+        f64_pow(xl, k), f64_pow(xh, k), h);
+        _AD_BAD = _AD_BAD + _ad_fd_cmp(Dual_deriv(dual_abs(v)), f64_abs(xl), f64_abs(xh), h);
+    }
+    return 0;
+}
+
+test_group("2.11.0 autodiff: every dual_* derivative matches central differences");
+_ad_fd_sweep();
+assert_eq(_AD_RUN, 39, "the dual FD sweep ran 13 ops x 3 points and skipped none of them");
+assert_eq(_AD_BAD, 0, "every dual_* derivative agrees with a central difference of its own scalar");
+
+# --- 2.11.0: reverse mode against BOTH oracles -------------------------------
+#
+# f(x0..x3) = x0*x1 + sin(x2)*exp(x3/x0) - sqrt(|x1|) + x2^3
+#
+# Four inputs, ten ops, and x0 and x1 each feed MORE THAN ONE consumer -- which
+# is the part that matters. A chain where every node has one consumer never
+# exercises the reverse ACCUMULATION (adjoints summing), and that is the only
+# thing the reverse sweep does that forward mode does not.
+#
+# ⚠ AGREEMENT WITH FORWARD MODE IS NOT SUFFICIENT ON ITS OWN. The two share the
+# domain guards, so agreement is partly tautological. Central differences of the
+# plain scalar are the independent oracle and are checked alongside.
+fn _rv_scalar(x0, x1, x2, x3) {
+    var a = f64_mul(x0, x1);
+    var b = f64_mul(f64_sin(x2), f64_exp(f64_div(x3, x0)));
+    var c = f64_sqrt(f64_abs(x1));
+    var d = f64_mul(f64_mul(x2, x2), x2);
+    return f64_add(f64_sub(f64_add(a, b), c), d);
+}
+
+fn _rv_fwd(x0, x1, x2, x3, which) {
+    var d0 = dual_const(x0); var d1 = dual_const(x1);
+    var d2 = dual_const(x2); var d3 = dual_const(x3);
+    if (which == 0) { d0 = dual_var(x0); }
+    if (which == 1) { d1 = dual_var(x1); }
+    if (which == 2) { d2 = dual_var(x2); }
+    if (which == 3) { d3 = dual_var(x3); }
+    var a = dual_mul(d0, d1);
+    var b = dual_mul(dual_sin(d2), dual_exp(dual_div(d3, d0)));
+    var c = dual_sqrt(dual_abs(d1));
+    var d = dual_pow(d2, f64_from(3));
+    return Dual_deriv(dual_add(dual_sub(dual_add(a, b), c), d));
+}
+
+var _RV_BAD = 0;
+var _RV_RUN = 0;
+
+fn _rv_sweep() {
+    var xs = alloc(32);
+    store64(xs,      f64_div(f64_from(3), F64_TWO));
+    store64(xs + 8,  f64_div(f64_from(7), f64_from(4)));
+    store64(xs + 16, f64_div(F64_ONE, f64_from(3)));
+    store64(xs + 24, f64_div(f64_from(5), f64_from(6)));
+    var t = ad_tape_new(64);
+    var ids = alloc(32);
+    for (var i = 0; i < 4; i = i + 1) { store64(ids + i * 8, ad_var(t, load64(xs + i * 8))); }
+    var i0 = load64(ids); var i1 = load64(ids + 8);
+    var i2 = load64(ids + 16); var i3 = load64(ids + 24);
+    var a = ad_mul(t, i0, i1);
+    var b = ad_mul(t, ad_sin(t, i2), ad_exp(t, ad_div(t, i3, i0)));
+    var c = ad_sqrt(t, ad_abs(t, i1));
+    var d = ad_pow(t, i2, f64_from(3));
+    var root = ad_add(t, ad_sub(t, ad_add(t, a, b), c), d);
+    if (ad_grad(t, root) != 0) { _RV_BAD = _RV_BAD + 100; return 0; }
+    for (var i = 0; i < 4; i = i + 1) {
+        _RV_RUN = _RV_RUN + 2;
+        var rev = ad_grad_of(t, load64(ids + i * 8));
+        var fwd = _rv_fwd(load64(xs), load64(xs + 8), load64(xs + 16), load64(xs + 24), i);
+        if (f64_approx_eq(rev, fwd, LOOSE_TOL_M) == 0) { _RV_BAD = _RV_BAD + 1; }
+        var h = f64_mul(f64_abs(load64(xs + i * 8)), _JT_H);
+        var lo = alloc(32);
+        var hi = alloc(32);
+        for (var k = 0; k < 4; k = k + 1) {
+            store64(lo + k * 8, load64(xs + k * 8));
+            store64(hi + k * 8, load64(xs + k * 8));
+        }
+        store64(lo + i * 8, f64_sub(load64(xs + i * 8), h));
+        store64(hi + i * 8, f64_add(load64(xs + i * 8), h));
+        var fd = f64_div(f64_sub(
+        _rv_scalar(load64(hi), load64(hi + 8), load64(hi + 16), load64(hi + 24)),
+        _rv_scalar(load64(lo), load64(lo + 8), load64(lo + 16), load64(lo + 24))),
+        f64_mul(F64_TWO, h));
+        if (f64_approx_eq(rev, fd, LOOSE_TOL_M) == 0) { _RV_BAD = _RV_BAD + 1; }
+    }
+    # The VALUE too: a tape that computes the wrong function would still agree
+    # with a forward pass over the same wrong function.
+    _RV_RUN = _RV_RUN + 1;
+    if (f64_approx_eq(ad_val(t, root),
+    _rv_scalar(load64(xs), load64(xs + 8), load64(xs + 16), load64(xs + 24)),
+    LOOSE_TOL_M) == 0) { _RV_BAD = _RV_BAD + 1; }
+    return 0;
+}
+
+test_group("2.11.0 autodiff reverse mode: gradient matches forward mode AND finite differences");
+_rv_sweep();
+assert_eq(_RV_RUN, 9, "the reverse sweep compared 4 inputs x 2 oracles, plus the value");
+assert_eq(_RV_BAD, 0,
+"one reverse sweep reproduces all four partials, against duals and against central differences");
+
+# A FULL tape must report, not silently drop an operation -- the shape of defect
+# this library keeps finding. The error propagates: an op CONSUMING a bad index
+# is itself bad, so a caller that checks only the final index is still safe.
+var rv_small = ad_tape_new(3);
+var rv_a = ad_var(rv_small, F64_ONE);
+var rv_b = ad_var(rv_small, F64_TWO);
+var rv_c = ad_add(rv_small, rv_a, rv_b);
+assert_eq(rv_c, 2, "the third node fits in a tape of capacity 3");
+var rv_d = ad_add(rv_small, rv_c, rv_a);
+assert_eq(rv_d, AD_FULL, "the fourth returns AD_FULL, not a silently dropped node");
+assert_eq(ad_ok(rv_small, rv_d), 0, "and ad_ok rejects it");
+assert_eq(ad_mul(rv_small, rv_d, rv_a), AD_FULL, "an op consuming a bad index is itself AD_FULL");
+assert_eq(ad_tape_len(rv_small), 3, "and the tape did not grow past its capacity");
+
+# ⚠ ad_grad must clear the WHOLE adjoint array, not just up to `root`. A second
+# gradient from a SHORTER root would otherwise read the previous sweep's values
+# on every node above it. Asserted because the optimisation is tempting.
+var rv_t2 = ad_tape_new(16);
+var rv_x = ad_var(rv_t2, f64_from(3));
+var rv_y = ad_var(rv_t2, f64_from(5));
+var rv_big = ad_mul(rv_t2, rv_x, rv_y);
+var rv_top = ad_mul(rv_t2, rv_big, rv_x);          # x^2 * y, d/dx = 2xy = 30
+assert_eq(ad_grad(rv_t2, rv_top), 0, "gradient of the tall root");
+assert(f64_approx_eq(ad_grad_of(rv_t2, rv_x), f64_from(30), LOOSE_TOL_M),
+"d/dx of x^2*y at (3,5) is 30");
+assert_eq(ad_grad(rv_t2, rv_big), 0, "now a gradient from a SHORTER root");
+assert(f64_approx_eq(ad_grad_of(rv_t2, rv_x), f64_from(5), LOOSE_TOL_M),
+"d/dx of x*y is 5 -- not 30 left over from the previous sweep");
+assert_eq(f64_to(ad_grad_of(rv_t2, rv_top)), 0,
+"and the node ABOVE the new root has adjoint 0, not its stale 1");
+
+# ad_tape_reset lets a caller run many gradients on one tape. The bump allocator
+# never frees, so allocating a tape per iteration is a leak, not a style choice.
+ad_tape_reset(rv_t2);
+assert_eq(ad_tape_len(rv_t2), 0, "ad_tape_reset empties the tape without reallocating");
+
+test_group("2.11.0 autodiff: the guards, asked DIRECTLY (the FD sweep cannot reach them)");
+# dual_div: 1/1e-13 = 1e13 is exactly representable. The old guard fired at
+# |b| < EPSILON_F64 and fabricated BOTH a value and a derivative.
+var ad_e13 = F64_ONE;
+for (var i = 0; i < 13; i = i + 1) { ad_e13 = f64_div(ad_e13, f64_from(10)); }
+var ad_q = dual_div(dual_const(F64_ONE), dual_var(ad_e13));
+assert(f64_approx_eq(f64_div(Dual_val(ad_q), f64_from(10000000000)), f64_from(1000), LOOSE_TOL_M),
+"dual_div: 1/1e-13 is 1e13, not a fabricated 0");
+# ln's domain is v > 0. The old guard tested f64_abs(v), so a NEGATIVE passed it
+# and dual_ln(-5) came back (NaN, -0.2) -- a NaN value with a CONFIDENT finite
+# derivative, which is worse than either alone.
+var ad_ln5 = dual_ln(dual_var(f64_neg(f64_from(5))));
+assert_eq(f64_to(Dual_val(ad_ln5)), 0, "dual_ln(-5): value is the miss sentinel, not NaN");
+assert_eq(f64_to(Dual_deriv(ad_ln5)), 0,
+"dual_ln(-5): derivative is 0, not a confident -0.2 beside a NaN value");
+var ad_ln13 = dual_ln(dual_var(ad_e13));
+assert(f64_approx_eq(Dual_val(ad_ln13), f64_neg(f64_div(f64_from(299336), f64_from(10000))),
+f64_div(F64_ONE, f64_from(1000))), "dual_ln(1e-13) is -29.9336, not a fabricated 0");
+# sqrt computed s BEFORE its guard, so a negative was already NaN.
+var ad_sq = dual_sqrt(dual_var(f64_neg(f64_from(4))));
+assert_eq(f64_to(Dual_val(ad_sq)), 0, "dual_sqrt(-4): value is the miss sentinel, not NaN");
+assert_eq(f64_to(Dual_deriv(ad_sq)), 0, "dual_sqrt(-4): derivative likewise");
+# pow: f64_pow is exp(n*ln(base)) and therefore NaN for every non-positive base.
+# x^3 is a polynomial and differentiable everywhere.
+assert_eq(f64_to(Dual_deriv(dual_pow(dual_var(0), F64_ONE))), 1,
+"dual_pow: d/dx x^1 at 0 is 1, not NaN (f64_pow(0,0) is NaN)");
+assert_eq(f64_to(Dual_deriv(dual_pow(dual_var(f64_neg(F64_TWO)), f64_from(3)))), 12,
+"dual_pow: d/dx x^3 at -2 is 12, not NaN (f64_pow rejects negative bases)");
+assert_eq(f64_to(Dual_val(dual_pow(dual_var(f64_neg(F64_TWO)), f64_from(4)))), 16,
+"dual_pow: (-2)^4 is 16 by repeated multiplication");
+# ⚠ AND THE CONTROL: a case where NaN is the RIGHT answer must still be NaN, or
+# the repair has simply replaced one fabrication with another.
+assert_eq(f64_eq(Dual_val(dual_pow(dual_var(f64_neg(F64_TWO)), F64_HALF)),
+Dual_val(dual_pow(dual_var(f64_neg(F64_TWO)), F64_HALF))), 0,
+"dual_pow: (-2)^0.5 is still NaN -- the repair did not widen the domain, it fixed the integers");
+
 test_group("autodiff: x^2");
 
 # f(x) = x^2 at x=3: val=9, deriv=6

@@ -24,6 +24,7 @@ include "src/linalg_ext.cyr"
 include "src/linalg_precision.cyr"
 include "src/tensor.cyr"
 include "src/einsum.cyr"
+include "src/autodiff.cyr"
 
 # ================================================================
 # Convenience: bench(name, fn_ptr, iterations)
@@ -223,6 +224,51 @@ fn bench_jet_capsule() {
 # and the most expensive of the six (geo_obb_axes rotates three unit vectors and
 # allocates per call). Nothing would have measured a regression in it.
 # [measured: bench-history.csv ray_obb]
+# 2.11.0: the one number that justifies reverse mode. Both rows compute the FULL
+# gradient of the same 16-input scalar; forward mode needs one pass per input and
+# reverse mode needs one sweep, so the ratio is the feature.
+#
+# ⚠ The forward row must do the SAME work -- all 16 partials, not one. Timing a
+# single dual pass against a full reverse sweep would flatter reverse mode by 16x
+# for free, which is the fixture fault this repo keeps catching.
+# [measured: bench-history.csv grad_rev_16]
+#
+# Measured: 66.46 us against 5.92 us, **11.2x**, not the theoretical 16x --
+# reverse mode pays to RECORD the tape before it can sweep it. ⚠ Part of the gap
+# is allocation, not arithmetic: every dual_* op heap-allocates a 16-byte Dual
+# under an allocator that never frees, while the reverse row calls
+# ad_tape_reset and writes into memory it already owns. That is a real and
+# permanent cost of the dual design rather than an artefact of the fixture -- it
+# is the same objection geo_diff.cyr's header raises -- but the ratio is a
+# property of the two IMPLEMENTATIONS, not of forward versus reverse in the
+# abstract, and it is stated that way.
+# [measured: bench-history.csv grad_rev_16]
+fn _b_ad_body_fwd(which) {
+    var acc = dual_const(0);
+    for (var i = 0; i < _AD_N; i = i + 1) {
+        var xi = dual_const(load64(_b_adx + i * 8));
+        if (i == which) { xi = dual_var(load64(_b_adx + i * 8)); }
+        acc = dual_add(acc, dual_mul(dual_sin(xi), dual_exp(xi)));
+    }
+    return Dual_deriv(acc);
+}
+
+fn bench_grad_fwd_16() {
+    for (var w = 0; w < _AD_N; w = w + 1) { var g = _b_ad_body_fwd(w); }
+    return 0;
+}
+
+fn bench_grad_rev_16() {
+    ad_tape_reset(_b_tape);
+    var acc = ad_const(_b_tape, 0);
+    for (var i = 0; i < _AD_N; i = i + 1) {
+        var xi = ad_var(_b_tape, load64(_b_adx + i * 8));
+        acc = ad_add(_b_tape, acc, ad_mul(_b_tape, ad_sin(_b_tape, xi), ad_exp(_b_tape, xi)));
+    }
+    var rc = ad_grad(_b_tape, acc);
+    return 0;
+}
+
 fn bench_ray_obb() {
     var r = geo_ray_obb(_bray_d, _b_obb);
     return 0;
@@ -497,6 +543,9 @@ var _b_jsph = 0;
 var _b_jpln = 0;
 var _b_jtri = 0;
 var _b_obb  = 0;
+var _b_tape = 0;
+var _b_adx  = 0;
+var _AD_N   = 16;
 var _bray_d = 0;
 var _b_kdo_pts = 0;
 var _b_kdo_n = 0;
@@ -971,6 +1020,15 @@ fn main() {
     # [measured: bench-history.csv ray_aabb_diag]
     _bray_d = geo_ray_new(hvec3_new(f64_neg(f64_from(4)), f64_neg(f64_from(8)),
     f64_neg(f64_from(12))), hvec3_new(F64_ONE, F64_TWO, f64_from(3)));
+    # 2.11.0 autodiff fixtures. Capacity is generous: 16 vars + 16*3 ops + 1.
+    _b_tape = ad_tape_new(256);
+    _b_adx = alloc(_AD_N * 8);
+    var adv = f64_div(F64_ONE, f64_from(4));
+    for (var ai = 0; ai < _AD_N; ai = ai + 1) {
+        store64(_b_adx + ai * 8, adv);
+        adv = f64_add(adv, f64_div(F64_ONE, f64_from(16)));
+    }
+
     _b_obb = geo_obb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_ONE, F64_ONE),
     hquat_identity());
 
@@ -1089,6 +1147,8 @@ fn main() {
     bench_batch("jet_aabb",        &bench_jet_aabb,      2000, 200);
     bench_batch("jet_obb",         &bench_jet_obb,       2000, 200);
     bench_batch("jet_capsule",     &bench_jet_capsule,   2000, 200);
+    bench_batch("grad_fwd_16",     &bench_grad_fwd_16,   200, 200);
+    bench_batch("grad_rev_16",     &bench_grad_rev_16,   200, 200);
     bench_batch("ray_obb",         &bench_ray_obb,       2000, 200);
     bench_batch("ray_aabb_diag",   &bench_ray_aabb_diag, 2000, 200);
     bench_batch("ray_capsule_diag", &bench_ray_capsule_diag, 2000, 200);

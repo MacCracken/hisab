@@ -5,6 +5,17 @@
 # A dual number a + beps where eps^2=0.
 # Layout: { val: f64, deriv: f64 } = 16 bytes
 
+# ================================================================
+# Local constants
+# ================================================================
+
+# The smallest MAGNITUDE whose reciprocal is still finite (DBL_MIN). 2.11.0 uses
+# it wherever a guard's real job is "can I divide by this", replacing thresholds
+# that were about geometry rather than about the division. Same constant and same
+# rule as geo.cyr's `_GEO_F64_TINY`; the modules are self-contained by design, so
+# each carries its own and the constant gate verifies both.
+var _AD_F64_TINY = 0x0010_0000_0000_0000;  # 2.2250738585072014e-308
+
 #derive(accessors)
 struct Dual { val; deriv; }
 
@@ -48,10 +59,16 @@ fn dual_mul(a, b) {
     f64_mul(Dual_val(a), Dual_deriv(b))));
 }
 
+# 2.11.0: the guard was `|b| < EPSILON_F64` (1e-12) returning (0, 0) -- it
+# fabricated BOTH a value and a derivative where the answer is exactly
+# representable. Measured: 1/1e-13 returned 0.0 where the truth is 1e13, and the
+# derivative 0.0 where the truth is -1e26. The guard's real job is to avoid a
+# division that produces no usable answer, so the threshold is DBL_MIN.
+# [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
 #must_use
 fn dual_div(a, b) {
     var bv = Dual_val(b);
-    if (f64_lt(f64_abs(bv), EPSILON_F64) == 1) { return dual_new(0, 0); }  # Zero guard
+    if (f64_lt(f64_abs(bv), _AD_F64_TINY) == 1) { return dual_new(0, 0); }
     var bv2 = f64_mul(bv, bv);
     return dual_new(f64_div(Dual_val(a), bv),
     f64_div(f64_sub(f64_mul(Dual_deriv(a), bv),
@@ -85,28 +102,80 @@ fn dual_exp(a) {
     return dual_new(e, f64_mul(Dual_deriv(a), e));
 }
 
+# 2.11.0: the guard tested `f64_abs(v)`, which is not the domain of ln. Two
+# consequences, both measured:
+#   * dual_ln(-5) returned (NaN, -0.2) -- a NaN value paired with a CONFIDENT
+#     finite derivative, which is worse than either alone, because a caller
+#     checking only the derivative sees nothing wrong.
+#   * dual_ln(1e-13) returned (0, 0) where the truth is (-29.9336, 1e13).
+# The domain of ln is v > 0, and inside it ln is fine all the way to DBL_MIN
+# (ln(5e-324) = -744). `f64_gt(v, 0) != 1` rejects negatives, zero AND NaN.
+# [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
 #must_use
 fn dual_ln(a) {
     var v = Dual_val(a);
-    if (f64_lt(f64_abs(v), EPSILON_F64) == 1) { return dual_new(0, 0); }  # Domain guard
+    if (f64_gt(v, 0) != 1) { return dual_new(0, 0); }
     return dual_new(f64_ln(v), f64_div(Dual_deriv(a), v));
 }
 
+# 2.11.0: the guard ran AFTER `s = f64_sqrt(v)`, so a negative input was already
+# NaN before anything checked it -- dual_sqrt(-4) returned (NaN, NaN). The domain
+# test belongs on the INPUT. At v == 0 the derivative is unbounded, so that is a
+# miss too; above it, sqrt is fine to DBL_MIN (sqrt(1e-300) = 1e-150, derivative
+# 5e149, both finite).
+# [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
 #must_use
 fn dual_sqrt(a) {
-    var s = f64_sqrt(Dual_val(a));
-    if (f64_lt(f64_abs(s), EPSILON_F64) == 1) { return dual_new(0, 0); }  # Zero guard
+    var v = Dual_val(a);
+    if (f64_gt(v, 0) != 1) { return dual_new(0, 0); }
+    var s = f64_sqrt(v);
     return dual_new(s, f64_div(Dual_deriv(a), f64_mul(F64_TWO, s)));
 }
 
+# base^n for a plain f64 exponent, WITHOUT the stdlib's domain restriction.
+#
+# `f64_pow` is documented in lib/ganita.cyr as `exp(exp * ln(base))`, so it
+# returns NaN for every non-positive base -- that is its stated implementation,
+# not a hidden defect, and it is correct for the transcendental case. But x^3 is
+# a polynomial, differentiable everywhere, and dual_pow inherited the restriction
+# without documenting it: measured, d/dx x^3 at -2 was NaN where the truth is 12,
+# and d/dx x^1 at 0 was NaN where the truth is 1 (because f64_pow(0, 0) is NaN).
+# [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
+#
+# So: integer exponents go through repeated multiplication, which is exact and
+# has no domain restriction; everything else keeps `f64_pow` unchanged, including
+# its NaN for cases like (-2)^0.5 where NaN is the right answer.
+fn _ad_pow(base, n) {
+    if (f64_gt(base, 0) == 1) { return f64_pow(base, n); }
+    if (f64_eq(f64_round(n), n) != 1) { return f64_pow(base, n); }
+    var k = f64_to(n);
+    var neg = 0;
+    if (k < 0) { neg = 1; k = 0 - k; }
+    var acc = F64_ONE;
+    for (var i = 0; i < k; i = i + 1) { acc = f64_mul(acc, base); }
+    if (neg == 1) {
+        if (f64_lt(f64_abs(acc), _AD_F64_TINY) == 1) { return f64_pow(base, n); }
+        return f64_div(F64_ONE, acc);
+    }
+    return acc;
+}
+
+# [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
 #must_use
 fn dual_pow(a, n) {
     # a^n, where n is a plain f64 (not dual)
-    var v = f64_pow(Dual_val(a), n);
+    var v = _ad_pow(Dual_val(a), n);
     return dual_new(v, f64_mul(Dual_deriv(a),
-    f64_mul(n, f64_pow(Dual_val(a), f64_sub(n, F64_ONE)))));
+    f64_mul(n, _ad_pow(Dual_val(a), f64_sub(n, F64_ONE)))));
 }
 
+# ⚠ AT v == 0 THE DERIVATIVE DOES NOT EXIST, and this returns the RIGHT-hand one
+# (+a'). That is a choice, not a truth, and it is written down rather than left
+# for a reader to discover: |x| has a kink at 0 and any single number there is a
+# convention. The siblings that face a genuinely non-differentiable point in this
+# library -- geo_diff.cyr's jets at an edge or at grazing incidence -- return a
+# miss sentinel instead, but Dual has no such sentinel and adding one would
+# change every arithmetic op's signature.
 #must_use
 fn dual_abs(a) {
     var v = Dual_val(a);
@@ -114,4 +183,279 @@ fn dual_abs(a) {
         return dual_new(f64_neg(v), f64_neg(Dual_deriv(a)));
     }
     return dual_new(v, Dual_deriv(a));
+}
+
+# ================================================================
+# REVERSE MODE (tape-based), 2.11.0
+# ================================================================
+#
+# Forward mode above carries ONE seed per evaluation, so a gradient of an
+# n-input scalar costs n passes. Reverse mode records the computation once and
+# sweeps it backwards once, so the same gradient costs ONE pass regardless of n.
+# That is the entire reason this exists, and `bench-history.csv` carries the
+# ratio rather than this comment asserting it.
+#
+# It lives in the SAME module as the duals deliberately. Reverse mode is verified
+# against forward mode, so keeping the two together makes that pairing structural
+# instead of a convention someone has to remember. ⚠ Agreement between them is
+# NOT sufficient on its own -- they share the domain guards below, so agreement
+# is partly tautological. What it genuinely tests is the reverse ACCUMULATION
+# against the forward PROPAGATION; finite differences remain the independent
+# oracle, and the suite checks both modes against them.
+#
+# TAPE LAYOUT. One node per operation:
+#   val   the value produced
+#   d1    d(this) / d(input 1)          i1  index of input 1, or AD_NONE
+#   d2    d(this) / d(input 2)          i2  index of input 2, or AD_NONE
+# A variable or constant is a node with no inputs. Because every node's inputs
+# have STRICTLY SMALLER indices, a single descending loop is a valid reverse
+# topological order -- no sort, no visited set.
+
+var AD_NONE = 0 - 1;      # "this input does not exist"
+var AD_FULL = 0 - 2;      # returned by every op when the tape is full
+
+#derive(accessors)
+struct AdTape { nodes; adj; n; cap; }
+
+# 40 bytes per node: val, d1, d2, i1, i2
+var _AD_NODE_BYTES = 40;
+
+#must_use
+fn ad_tape_new(cap) {
+    if (cap < 1) { return 0; }
+    var t = alloc(sizeof(AdTape));
+    AdTape_set_nodes(t, alloc(cap * _AD_NODE_BYTES));
+    AdTape_set_adj(t, alloc(cap * 8));
+    AdTape_set_n(t, 0);
+    AdTape_set_cap(t, cap);
+    return t;
+}
+
+# Number of nodes recorded so far.
+fn ad_tape_len(t) { return AdTape_n(t); }
+
+# Reset without reallocating -- the bump allocator never frees, so a caller
+# running many gradients reuses one tape rather than leaking one per iteration.
+fn ad_tape_reset(t) {
+    AdTape_set_n(t, 0);
+    return 0;
+}
+
+fn _ad_node(t, i) { return AdTape_nodes(t) + i * _AD_NODE_BYTES; }
+
+# Append a node. Returns its index, or AD_FULL if the tape is full -- checkable,
+# never a silently dropped operation.
+fn _ad_push(t, val, d1, i1, d2, i2) {
+    var n = AdTape_n(t);
+    if (n >= AdTape_cap(t)) { return AD_FULL; }
+    var p = _ad_node(t, n);
+    store64(p, val);
+    store64(p + 8, d1);
+    store64(p + 16, d2);
+    store64(p + 24, i1);
+    store64(p + 32, i2);
+    AdTape_set_n(t, n + 1);
+    return n;
+}
+
+# An independent variable: no inputs, so the reverse sweep stops here and its
+# accumulated adjoint IS the gradient component.
+#must_use
+fn ad_var(t, val) { return _ad_push(t, val, 0, AD_NONE, 0, AD_NONE); }
+
+# A constant: identical shape, named separately so a reader can tell which
+# entries of the gradient are meaningful.
+#must_use
+fn ad_const(t, val) { return _ad_push(t, val, 0, AD_NONE, 0, AD_NONE); }
+
+# The value at a node, or 0 for an invalid index.
+fn ad_val(t, i) {
+    if (i < 0) { return 0; }
+    if (i >= AdTape_n(t)) { return 0; }
+    return load64(_ad_node(t, i));
+}
+
+# 1 when `i` is a usable node index. Every op returns AD_FULL on overflow, and
+# that value propagates: an op with a bad input is itself bad.
+fn ad_ok(t, i) {
+    if (i < 0) { return 0; }
+    if (i >= AdTape_n(t)) { return 0; }
+    return 1;
+}
+
+# ================================================================
+# Reverse-mode operations
+# ================================================================
+#
+# Each records the local partials and nothing else -- the chain rule is applied
+# once, later, by ad_grad. ⚠ THE DOMAIN GUARDS MIRROR THE DUAL OPS ABOVE
+# EXACTLY, including the repairs 2.11.0 made to them. A guard that differed
+# would make "reverse agrees with forward" fail for a reason that has nothing to
+# do with the chain rule, which is the one thing that comparison is for.
+
+fn _ad_bad2(t, a, b) {
+    if (ad_ok(t, a) == 0) { return 1; }
+    if (ad_ok(t, b) == 0) { return 1; }
+    return 0;
+}
+
+#must_use
+fn ad_add(t, a, b) {
+    if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
+    return _ad_push(t, f64_add(ad_val(t, a), ad_val(t, b)), F64_ONE, a, F64_ONE, b);
+}
+
+#must_use
+fn ad_sub(t, a, b) {
+    if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
+    return _ad_push(t, f64_sub(ad_val(t, a), ad_val(t, b)), F64_ONE, a,
+    f64_neg(F64_ONE), b);
+}
+
+#must_use
+fn ad_mul(t, a, b) {
+    if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
+    var av = ad_val(t, a);
+    var bv = ad_val(t, b);
+    return _ad_push(t, f64_mul(av, bv), bv, a, av, b);
+}
+
+# d(a/b)/da = 1/b,  d(a/b)/db = -a/b^2. Guard as dual_div does: DBL_MIN, because
+# the only thing that fails is the division.
+#must_use
+fn ad_div(t, a, b) {
+    if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
+    var av = ad_val(t, a);
+    var bv = ad_val(t, b);
+    if (f64_lt(f64_abs(bv), _AD_F64_TINY) == 1) { return _ad_push(t, 0, 0, a, 0, b); }
+    var inv = f64_div(F64_ONE, bv);
+    return _ad_push(t, f64_mul(av, inv), inv, a,
+    f64_neg(f64_mul(av, f64_mul(inv, inv))), b);
+}
+
+#must_use
+fn ad_neg(t, a) {
+    if (ad_ok(t, a) == 0) { return AD_FULL; }
+    return _ad_push(t, f64_neg(ad_val(t, a)), f64_neg(F64_ONE), a, 0, AD_NONE);
+}
+
+#must_use
+fn ad_sin(t, a) {
+    if (ad_ok(t, a) == 0) { return AD_FULL; }
+    var av = ad_val(t, a);
+    return _ad_push(t, f64_sin(av), f64_cos(av), a, 0, AD_NONE);
+}
+
+#must_use
+fn ad_cos(t, a) {
+    if (ad_ok(t, a) == 0) { return AD_FULL; }
+    var av = ad_val(t, a);
+    return _ad_push(t, f64_cos(av), f64_neg(f64_sin(av)), a, 0, AD_NONE);
+}
+
+#must_use
+fn ad_exp(t, a) {
+    if (ad_ok(t, a) == 0) { return AD_FULL; }
+    var e = f64_exp(ad_val(t, a));
+    return _ad_push(t, e, e, a, 0, AD_NONE);
+}
+
+# Domain is v > 0 -- the same test dual_ln uses, which rejects negatives, zero
+# and NaN alike.
+#must_use
+fn ad_ln(t, a) {
+    if (ad_ok(t, a) == 0) { return AD_FULL; }
+    var av = ad_val(t, a);
+    if (f64_gt(av, 0) != 1) { return _ad_push(t, 0, 0, a, 0, AD_NONE); }
+    return _ad_push(t, f64_ln(av), f64_div(F64_ONE, av), a, 0, AD_NONE);
+}
+
+#must_use
+fn ad_sqrt(t, a) {
+    if (ad_ok(t, a) == 0) { return AD_FULL; }
+    var av = ad_val(t, a);
+    if (f64_gt(av, 0) != 1) { return _ad_push(t, 0, 0, a, 0, AD_NONE); }
+    var s = f64_sqrt(av);
+    return _ad_push(t, s, f64_div(F64_ONE, f64_mul(F64_TWO, s)), a, 0, AD_NONE);
+}
+
+# n is a plain f64, not a tape node -- the same shape as dual_pow, and it uses
+# the same _ad_pow so integer exponents work on negative and zero bases.
+#must_use
+fn ad_pow(t, a, n) {
+    if (ad_ok(t, a) == 0) { return AD_FULL; }
+    var av = ad_val(t, a);
+    return _ad_push(t, _ad_pow(av, n),
+    f64_mul(n, _ad_pow(av, f64_sub(n, F64_ONE))), a, 0, AD_NONE);
+}
+
+# ⚠ At 0 the derivative does not exist; this takes the RIGHT-hand one, matching
+# dual_abs. See the note there.
+#must_use
+fn ad_abs(t, a) {
+    if (ad_ok(t, a) == 0) { return AD_FULL; }
+    var av = ad_val(t, a);
+    if (f64_lt(av, 0) == 1) { return _ad_push(t, f64_neg(av), f64_neg(F64_ONE), a, 0, AD_NONE); }
+    return _ad_push(t, av, F64_ONE, a, 0, AD_NONE);
+}
+
+# ================================================================
+# The reverse sweep
+# ================================================================
+#
+# Seed the root's adjoint with 1 and walk DOWN the tape. Every node's inputs have
+# strictly smaller indices, so one descending loop visits each node only after
+# every consumer of it has contributed -- no topological sort, no visited set,
+# no recursion.
+#
+#     adj[root] = 1
+#     for k = root down to 0:
+#         adj[i1(k)] += adj[k] * d1(k)
+#         adj[i2(k)] += adj[k] * d2(k)
+#
+# ONE sweep produces the gradient with respect to EVERY node, which is the whole
+# point: an n-input scalar costs one reverse pass here and n forward passes with
+# duals. Read the ratio off `bench-history.csv` (`grad_rev_16` against
+# `grad_fwd_16`) rather than from this comment.
+# [measured: bench-history.csv grad_rev_16]
+#
+# Returns 0 on success and a negative HSB_ERR_* on a bad root. The adjoints live
+# in the tape and are read back with ad_grad_of.
+fn ad_grad(t, root) {
+    if (ad_ok(t, root) == 0) { return HSB_ERR_INVALID_INPUT; }
+    var n = AdTape_n(t);
+    var adj = AdTape_adj(t);
+    # ⚠ Clear the WHOLE tape, not just up to `root`. A caller taking a second
+    # gradient from a shorter root would otherwise read the previous sweep's
+    # adjoints on every node above it.
+    for (var i = 0; i < n; i = i + 1) { store64(adj + i * 8, 0); }
+    store64(adj + root * 8, F64_ONE);
+    var k = root;
+    while (k >= 0) {
+        var a = load64(adj + k * 8);
+        # Skip nodes the root does not depend on. This is an optimisation, not a
+        # correctness condition -- adding 0 * d would be a no-op anyway.
+        if (a != 0) {
+            var p = _ad_node(t, k);
+            var i1 = load64(p + 24);
+            var i2 = load64(p + 32);
+            if (i1 >= 0) {
+                store64(adj + i1 * 8,
+                f64_add(load64(adj + i1 * 8), f64_mul(a, load64(p + 8))));
+            }
+            if (i2 >= 0) {
+                store64(adj + i2 * 8,
+                f64_add(load64(adj + i2 * 8), f64_mul(a, load64(p + 16))));
+            }
+        }
+        k = k - 1;
+    }
+    return 0;
+}
+
+# d(root)/d(node i), valid after ad_grad. Returns 0 for an invalid index, which
+# is also the honest answer for a node the root does not depend on.
+fn ad_grad_of(t, i) {
+    if (ad_ok(t, i) == 0) { return 0; }
+    return load64(AdTape_adj(t) + i * 8);
 }

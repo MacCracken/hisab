@@ -459,3 +459,56 @@ fn ad_grad_of(t, i) {
     if (ad_ok(t, i) == 0) { return 0; }
     return load64(AdTape_adj(t) + i * 8);
 }
+
+# ================================================================
+# Pairing with optimize.cyr
+# ================================================================
+#
+# `opt_gradient_descent`, `opt_conjugate_gradient`, `opt_bfgs` and `opt_lbfgs`
+# all take a gradient as `fncall2(grad, x_ptr, out)` -- and that signature needs
+# NO change to accept a tape. A capturing closure holds the tape and matches it
+# exactly:
+#
+#     var tape = ad_tape_new(256);
+#     var grad = |x, out| {
+#         ad_tape_reset(tape);
+#         var i0 = ad_var(tape, load64(x));
+#         var i1 = ad_var(tape, load64(x + 8));
+#         ... build the objective ...
+#         return ad_grad_into(tape, root, ids, 2, out);
+#     };
+#     opt_lbfgs(&f, grad, x0, 2, m, tol, max_iter, out_x, out_fmin);
+#
+# ⚠ THAT THIS WORKS AT ALL IS RECENT, and it was re-run rather than taken from
+# the release note: a capturing closure passed through a function and called
+# there with fncall2 SIGSEGVed on 6.5.16, which is the same defect that still
+# blocks `vec_sort_by`. Re-verified on 6.5.18 -- 42 both directly and across the
+# boundary. See issues/archived/2026-08-10-cyrius-capturing-closure-across-fn-boundary.md.
+#
+# ⚠ NO `ad_minimize` CONVENIENCE IS SHIPPED, and that is a decision. It would put
+# a call to optimize.cyr inside autodiff.cyr -- a module dependency that buys a
+# caller four lines, in exchange for an ordering constraint in `[lib]` and a
+# module that can no longer be read on its own. The closure form above is already
+# the whole integration. Revisit if a consumer asks.
+
+# Write d(root)/d(x_k) for the n variable nodes named by `ids` into a flat array.
+# `ids` holds the indices returned by ad_var, in the caller's parameter order.
+#
+# It exists because the alternative is a per-variable
+# `store64(out + k * 8, ad_grad_of(t, load64(ids + k * 8)))` at every call site,
+# which is exactly the shape an off-by-one hides in.
+fn ad_grad_write(t, ids, n, out) {
+    if (n < 0) { return HSB_ERR_INVALID_INPUT; }
+    for (var k = 0; k < n; k = k + 1) {
+        store64(out + k * 8, ad_grad_of(t, load64(ids + k * 8)));
+    }
+    return 0;
+}
+
+# The reverse sweep and the write-back in one call -- the form an optimizer's
+# gradient closure wants. Returns 0, or the sweep's error unchanged.
+fn ad_grad_into(t, root, ids, n, out) {
+    var rc = ad_grad(t, root);
+    if (rc != 0) { return rc; }
+    return ad_grad_write(t, ids, n, out);
+}

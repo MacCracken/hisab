@@ -11,13 +11,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.10.2
+## Current — v2.11.0
 
-Suite **3469** across five harnesses (hisab 416, foundation 349, modules 1739, edge_cases 233,
-abuse 732), constant gate **157/157**, **70** benchmarks, **35** `[lib]` modules, toolchain
+Suite **3507** across five harnesses (hisab 416, foundation 349, modules 1775, edge_cases 233,
+abuse 734), constant gate **158/158**, **72** benchmarks, **35** `[lib]` modules, toolchain
 **6.5.18**, sakshi **2.4.10**. All gates green:
 `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps / 0 untrusted
-/ 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 618/621 (99%) functions over 36/36 files,
+/ 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 640/644 (99%) functions over 36/36 files,
 distlib in sync.
 
 **2.9.0** delivered the narrowphase release — but read its section for what that actually means: the
@@ -99,7 +99,7 @@ appear on this page at all.
 | ~~2.10.0~~ | Differentiable geometry — jets for plane, sphere, triangle | **RELEASED 2026-08-10** |
 | ~~2.10.1~~ | The branchy primitives — jets for aabb, obb, capsule | **RELEASED 2026-08-10** |
 | ~~2.10.2~~ | The primal defects the jets were sitting on, and the OBB rotation derivative | **RELEASED 2026-08-11** |
-| **2.11.0** | Reverse-mode autodiff (tape-based) | 2.10.2 |
+| ~~2.11.0~~ | Reverse-mode autodiff (tape-based) | **RELEASED 2026-08-11** |
 | **3.0.0** | `Result<T,E>` API — breaking | 2.11.0 feature-complete |
 
 ---
@@ -456,11 +456,34 @@ discovering upstream had closed it **WON'T-FIX by design** five releases before 
 (`for-empty-clauses`). Watch for a cyrius release that fixes the `distlib` self-check — until then
 hisab's CI tolerates exactly that signature and nothing else.
 
-## 2.11.0 — reverse-mode autodiff
+## 2.11.0 — reverse-mode autodiff  **RELEASED 2026-08-11**
 
 Tape-based reverse mode for gradients of many-input scalar objectives, where forward-mode's
-per-input cost is the wrong shape. Pairs with `optimize.cyr`'s solvers, which currently require a
+per-input cost is the wrong shape. Pairs with `optimize.cyr`'s solvers, which required a
 caller-supplied gradient.
+
+- [x] **The tape.** One node per operation recording its value, both local partials and both input
+      indices. Inputs always have strictly smaller indices, so one descending loop is a valid
+      reverse topological order — no sort, no visited set, no recursion. `AD_FULL` propagates
+      through consuming ops, so a caller checking only the final index is safe.
+- [x] **The pairing, and it needed NO API change.** `opt_*` take `fncall2(grad, x, out)`; a
+      capturing closure holding the tape matches that exactly. Re-verified on 6.5.18 rather than
+      trusting the release note — this shape SIGSEGVed on 6.5.16.
+      ⚠ **No `ad_minimize` convenience**, deliberately: it would put a call to `optimize.cyr` inside
+      `autodiff.cyr`, buying four lines in exchange for a `[lib]` ordering constraint and a module
+      that can no longer be read alone. Revisit if a consumer asks.
+- [x] **The measurement that justifies it**: `grad_fwd_16` 63.7 µs → `grad_rev_16` **5.70 µs**,
+      **11.2×** for a 16-input gradient. Not the theoretical 16× — reverse pays to record the tape,
+      and part of the rest is `dual_*` heap-allocating under an allocator that never frees. Stated
+      as a property of the two implementations rather than of forward versus reverse in the
+      abstract.
+
+**And it led with five defects in the shipped forward-mode duals**, all behind guards no finite
+difference can reach — the fourth release running in which the feature's own oracle found something
+in the code it was going to be checked against. See the CHANGELOG.
+
+⚠ **The solvers' own contract check came back CLEAN**, for the first time in five releases. Recorded
+because a clean result from that check is worth as much as a dirty one.
 
 ## Optional, demand-gated
 
@@ -554,6 +577,7 @@ answer is a cheaper pre-filter, not reverting the correctness fix.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.11.0 | 2026-08-11 | 23,104 | 36 | **Reverse-mode autodiff, and the five forward-mode defects it found first.** Tape-based: one node per op recording both local partials and both input indices, and because inputs always have strictly smaller indices a single descending loop is a valid reverse order — no sort, no visited set. **grad_fwd_16 63.7 us -> grad_rev_16 5.70 us, 11.2x** for a 16-input gradient (not the theoretical 16x: reverse pays to RECORD the tape, and part of the rest is dual_* heap-allocating under an allocator that never frees). The pairing with optimize.cyr needed NO API change — a capturing closure holding the tape matches fncall2(grad, x, out), re-verified on 6.5.18 because that shape SIGSEGVed on 6.5.16. **Reverse mode is validated AGAINST forward mode, so autodiff.cyr was swept before a line of tape code existed**, and five defects came out: 1/1e-13 returned (0,0) where the truth is 1e13; ln(-5) returned a NaN value beside a CONFIDENT -0.2 derivative; sqrt(-4) was (NaN,NaN) because the guard ran after the sqrt; d/dx x^3 at -2 was NaN because f64_pow is exp(n*ln(base)) and rejects negative bases — the stdlib's STATED implementation, so the defect was hisab inheriting it undocumented. ⚠ **The finite-difference sweep alone found NONE of them**: at every input where a guard fires the perturbed scalar is NaN too, so the sample is skipped and the guard never asked. A guard has to be interrogated DIRECTLY. 14 mutants, 14 kills — two survived the first pass (the fixture's variables happened to BE nodes 0 and 1, so the ids indirection was untested) and one failure was the ASSERTION's fault, demanding 1e-8 where gradient descent only promises ||g|| < 1e-6. The solvers' own contract check came back CLEAN, the first time in five releases. 3507 |
 | 2.10.2 | 2026-08-11 | 22,707 | 36 | **The primal defects the jets were sitting on.** All three 2.10.1 filed, plus the OBB rotation partial it deferred. **One rule settled four thresholds** — guard exactly what makes the DIVISION fail and nothing more (`_GEO_F64_TINY` = DBL_MIN); a threshold that needs a scale chosen for it IS the defect. The slab parallel test was scale-free: a box spanning [0,1] with a **unit** direction (9e-13, 0, 1) returned a hit at **x = 1.4**, and the same ray from inside a tall box gave an exit **18x too large**; `geo_ray_new` normalizes and did not protect. `geo_ray_capsule` returned a point a **full radius inside the solid** (t = 4 where the exit is 6, hit point ON THE AXIS) because `geo_ray_sphere` hands back only the FIRST root, so a cap root rejected by the half-space test meant the other was never considered — 32 of 600 interior origins also lost their exit entirely. Fixed by splitting the quadratic onto `_geo_sphere_roots` (both roots, one copy) and deleting the `cyl_missed` fallback outright. `geo_triangle_unit_normal` returned a **fabricated** (0,1,0) for a well-formed right triangle with 1e-4 legs. `dt/d(rotation) = [a_k x (c - p)]/f_k`, derived by perturbing WITHIN the rotation group rather than freely, verified over 36 FD comparisons at worst 1.9e-10 — a world-frame ANGULAR gradient, so a step along it is a valid rotation by construction. ⚠ Two repairs cost far more before being measured (an is_inf HELPER +5.6% on a 90 ns routine; materialising a hit point per cap root +92%), two fixtures were caught by COUNTERS rather than by failing, and a toolchain defect was nearly filed that does not exist — `var buf[N]` needs `&buf`. 13 mutants, 13 killed. 3469 |
 | 2.10.1 | 2026-08-10 | 22,529 | 36 | **The branchy primitives, and two more defects the design check found first.** Jets for aabb, obb and capsule — all six `geo_ray_*` are now differentiable. Each primal split onto a face/branch-reporting variant with the plain entry point a one-line wrapper, so the value path is unchanged BY CONSTRUCTION: the `f64_max`/`f64_min` calls are byte-for-byte what they were and every added line sits behind `if (out != 0)`. aabb 3.1x its primal for 12 partials, obb 1.7x for 12, capsule 1.38x for 13 — the branchy three are CHEAPER relative to their primals than the smooth three, because the primal work they reuse is larger. **Before any feature code**, asking "what does the primal return when there is no face?" found `geo_ray_aabb` and `geo_ray_obb` returning **+Inf** for a degenerate direction (4 of 6 siblings honoured the contract; the same 4-vs-2 shape as 2.10.0) and `geo_ray_sphere`/`_capsule` comparing a **squared** length against the unsquared `EPSILON_F64` — the sphere reporting a MISS for any |d| < 1e-6 where t = 4e7 is exact, the capsule silently returning a CAP hit instead of the cylinder hit, wrong by 0.942%. ⚠ **The sphere's guard was introduced by 2.10.0's own repair**, and 2.10.0's homogeneity sweep could not have caught it: its scales are 2, 0.5 and 7, none within five orders of magnitude of the threshold the same commit added. A THIRD came from an independent derivation commissioned against the finished code — the tie flag saw edges and corners but not a zero-width slab or a tangential clip, so a flat box returned the whole gradient in the WRONG SLOT with tie = 0 on half of all configurations; the derivation confirmed all 37 partials (0 of 24,237 FD comparisons failing) and its value was entirely in the ENUMERATION. Three defects in the PRIMAL are filed OPEN for 2.10.2, including a scale-free slab test that returns a hit at x = 1.4 for a box spanning [0,1] with a UNIT direction. The capsule seam is proven C1 by a CONVERGENCE-RATE assertion after a single-offset one failed on a fixture fault. 25 mutants written, 24 killed — the survivor proved a branch update was dead code (cyl_t1 <= cyl_t2 always; 932 randomised quadratics, 0 violations). jet_obb 1.083 us -> 872 ns (-19.5%). Toolchain 6.5.17 -> 6.5.18, zero stdlib delta. 3453 |
 | 2.10.0 | 2026-08-10 | 21,855 | 36 | **Differentiable geometry — and the primal defect it found first.** `src/geo_diff.cyr`: jets for plane, sphere and triangle returning the full gradient from ONE evaluation, allocation-free, as a post-pass on the shipped primal so no intersection algorithm is duplicated. Sphere 7 partials at 335 ns vs its 93 ns primal (3.6x); triangle 15 partials at 934 ns vs 280 ns (3.3x) — against the ~4,200 ns forward-mode duals would need for the same 15. **Before any autodiff was written, the design's own homogeneity check was run against the EXISTING primitives and failed**: `geo_ray_sphere` was not degree -1 in the ray direction, returning a t whose hit point sat 3.74 from the centre of a unit sphere, with `geo_ray_capsule` inheriting it through its end caps. Silent wrong output in shipped geometry, found by a check for a feature that did not exist yet. The same pass found 17 of 60 benchmarks measuring `clock_gettime` rather than the operation (ray_sphere read 1,466 ns, is 79 ns) — the fourth non-gating gate of the arc, and the only reason the repair's +17.6% was visible. Nine mutants caught across the two jets. Toolchain 6.5.16 -> 6.5.17, which fixed all three defects hisab filed upstream. 3398 |

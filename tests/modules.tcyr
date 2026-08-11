@@ -4214,6 +4214,153 @@ fn _rv_sweep() {
     return 0;
 }
 
+# --- 2.11.0: the pairing with optimize.cyr, end to end ----------------------
+#
+# The roadmap's stated reason for reverse mode: the solvers require a
+# caller-supplied gradient, and an n-input objective means writing one by hand or
+# running n forward passes. A capturing closure holding a tape matches the
+# existing `fncall2(grad, x, out)` signature exactly -- no API change.
+#
+# ⚠ CHECKED BEFORE ANY OF THIS WAS WRITTEN, and this time it found nothing: all
+# four solvers return HSB_ERR_NONE only from `if (f64_lt(gnorm, tol) == 1)`, so a
+# 0 return asserts ||grad|| < tol at out_x, and 16 runs across two objectives and
+# both gradient sources honoured it. Recorded because a clean result from that
+# check is worth as much as a dirty one -- it is the fifth release it has been
+# run and the first to come back empty.
+#
+# ⚠ AND THE POINT OF DRIVING THE SOLVERS WITH BOTH GRADIENTS: checking a solver
+# with the same `grad` it was handed cannot see a WRONG grad -- it would converge
+# confidently to the wrong point and pass. The hand-written and tape-backed runs
+# reaching the same minimiser is what makes the check independent.
+var _OPT_TAPE = 0;
+
+fn _ot_f_bowl(x) {
+    var a = f64_sub(load64(x), F64_ONE);
+    var b = f64_sub(load64(x + 8), F64_TWO);
+    return f64_add(f64_mul(a, a), f64_mul(b, b));
+}
+
+fn _ot_g_hand(x, out) {
+    store64(out, f64_mul(F64_TWO, f64_sub(load64(x), F64_ONE)));
+    store64(out + 8, f64_mul(F64_TWO, f64_sub(load64(x + 8), F64_TWO)));
+    return 0;
+}
+
+# The tape-backed gradient, written as a plain fn here rather than a closure so
+# the assertion does not depend on closure support; the closure form is in the
+# module header and is what a consumer writes. Both compile to the same call.
+fn _ot_g_tape(x, out) {
+    ad_tape_reset(_OPT_TAPE);
+    var ids = alloc(16);
+    var i0 = ad_var(_OPT_TAPE, load64(x));
+    var i1 = ad_var(_OPT_TAPE, load64(x + 8));
+    store64(ids, i0);
+    store64(ids + 8, i1);
+    var a = ad_sub(_OPT_TAPE, i0, ad_const(_OPT_TAPE, F64_ONE));
+    var b = ad_sub(_OPT_TAPE, i1, ad_const(_OPT_TAPE, F64_TWO));
+    var root = ad_add(_OPT_TAPE, ad_mul(_OPT_TAPE, a, a), ad_mul(_OPT_TAPE, b, b));
+    return ad_grad_into(_OPT_TAPE, root, ids, 2, out);
+}
+
+var _OT_BAD = 0;
+var _OT_RUN = 0;
+
+fn _ot_drive(solver, gp, tol) {
+    var x0 = alloc(16);
+    store64(x0, f64_neg(f64_div(F64_ONE, F64_TWO)));
+    store64(x0 + 8, f64_div(f64_from(5), F64_TWO));
+    var ox = alloc(16);
+    var of = alloc(8);
+    var rc = 0 - 99;
+    if (solver == 0) { rc = opt_gradient_descent(&_ot_f_bowl, gp, x0, 2,
+        f64_div(F64_ONE, f64_from(1000)), tol, 200000, ox, of); }
+    if (solver == 1) { rc = opt_conjugate_gradient(&_ot_f_bowl, gp, x0, 2, tol, 200000, ox, of); }
+    if (solver == 2) { rc = opt_bfgs(&_ot_f_bowl, gp, x0, 2, tol, 200000, ox, of); }
+    if (solver == 3) { rc = opt_lbfgs(&_ot_f_bowl, gp, x0, 2, 5, tol, 200000, ox, of); }
+    _OT_RUN = _OT_RUN + 1;
+    if (rc != 0) { _OT_BAD = _OT_BAD + 1; return 0; }
+    # THE SOLVER'S OWN CONTRACT: a 0 return claims ||grad|| < tol at out_x.
+    var g = alloc(16);
+    fncall2(gp, ox, g);
+    var gn = f64_sqrt(f64_add(f64_mul(load64(g), load64(g)),
+    f64_mul(load64(g + 8), load64(g + 8))));
+    if (f64_lt(gn, tol) != 1) { _OT_BAD = _OT_BAD + 1; return 0; }
+    # AND it landed on the known minimiser (1, 2), which the contract alone does
+    # not guarantee -- a wrong gradient satisfies its own norm test happily.
+    #
+    # ⚠ THE TOLERANCE IS DERIVED FROM THE CONTRACT, not picked. For this bowl
+    # grad = 2(x - x*), so ||g|| < tol means ||x - x*|| < tol/2. The first draft
+    # asserted LOOSE_TOL_M (1e-8) and failed on gradient descent, which stops at
+    # ||g|| < 1e-6 and therefore lands 5e-7 away -- exactly as promised. The
+    # ASSERTION was wrong, not the solver: it demanded more than the contract
+    # offers, and the other three solvers hid that by converging far tighter.
+    var want = f64_mul(tol, F64_HALF);
+    if (f64_approx_eq(load64(ox), F64_ONE, want) == 0) { _OT_BAD = _OT_BAD + 1; }
+    if (f64_approx_eq(load64(ox + 8), F64_TWO, want) == 0) { _OT_BAD = _OT_BAD + 1; }
+    return 0;
+}
+
+test_group("2.11.0 autodiff x optimize: a tape-backed gradient drives all four solvers");
+_OPT_TAPE = ad_tape_new(64);
+var ot_tol = F64_ONE;
+for (var i = 0; i < 6; i = i + 1) { ot_tol = f64_div(ot_tol, f64_from(10)); }
+for (var sv = 0; sv < 4; sv = sv + 1) { _ot_drive(sv, &_ot_g_hand, ot_tol); }
+for (var sv = 0; sv < 4; sv = sv + 1) { _ot_drive(sv, &_ot_g_tape, ot_tol); }
+assert_eq(_OT_RUN, 8, "four solvers x two gradient sources");
+assert_eq(_OT_BAD, 0,
+"every solver converges to (1,2) with a REVERSE-MODE gradient, and honours ||g|| < tol there");
+
+# ad_grad_write is the piece that removes a per-variable store64 from every call
+# site. Checked against reading the adjoints one at a time.
+var ow_t = ad_tape_new(16);
+var ow_ids = alloc(16);
+var ow_a = ad_var(ow_t, f64_from(3));
+var ow_b = ad_var(ow_t, f64_from(5));
+store64(ow_ids, ow_a);
+store64(ow_ids + 8, ow_b);
+var ow_root = ad_mul(ow_t, ow_a, ow_b);
+var ow_out = alloc(16);
+assert_eq(ad_grad_into(ow_t, ow_root, ow_ids, 2, ow_out), 0, "ad_grad_into succeeds");
+assert(f64_approx_eq(load64(ow_out), f64_from(5), LOOSE_TOL_M),
+"ad_grad_into wrote d(xy)/dx = y = 5 into slot 0");
+assert(f64_approx_eq(load64(ow_out + 8), f64_from(3), LOOSE_TOL_M),
+"and d(xy)/dy = x = 3 into slot 1 -- slot ORDER follows the caller's ids, not the tape");
+
+# ⚠ THE FIXTURE ABOVE CANNOT SEE AN `ids` INDIRECTION BUG, and a mutant proved
+# it: replacing `ad_grad_of(t, load64(ids + k * 8))` with `ad_grad_of(t, k)`
+# survives, because there the variables happen to BE nodes 0 and 1. The whole
+# purpose of `ids` is that they need not be. This fixture puts two constants
+# first and reverses the order, so ids = {3, 2} and no index coincides with its
+# slot.
+var oz_t = ad_tape_new(16);
+var oz_c1 = ad_const(oz_t, f64_from(9));
+var oz_c2 = ad_const(oz_t, f64_from(9));
+var oz_y = ad_var(oz_t, f64_from(5));          # node 2
+var oz_x = ad_var(oz_t, f64_from(3));          # node 3
+assert_eq(oz_x, 3, "the fixture really does put a variable at node 3");
+var oz_ids = alloc(16);
+store64(oz_ids, oz_x);                          # slot 0 <- node 3
+store64(oz_ids + 8, oz_y);                      # slot 1 <- node 2
+var oz_out = alloc(16);
+assert_eq(ad_grad_into(oz_t, ad_mul(oz_t, oz_x, oz_y), oz_ids, 2, oz_out), 0,
+"ad_grad_into on a tape whose variables are not the first nodes");
+assert(f64_approx_eq(load64(oz_out), f64_from(5), LOOSE_TOL_M),
+"slot 0 holds d/dx = 5, read through ids -- NOT the adjoint of node 0");
+assert(f64_approx_eq(load64(oz_out + 8), f64_from(3), LOOSE_TOL_M),
+"slot 1 holds d/dy = 3, with ids REVERSED relative to tape order");
+
+# ⚠ And ad_grad_into must PROPAGATE the sweep's error rather than writing
+# whatever adjoints happen to be lying around. Another surviving mutant: dropping
+# the `if (rc != 0) { return rc; }` changed nothing, because nothing called it
+# with a bad root.
+var oz_bad = alloc(16);
+store64(oz_bad, f64_from(77));
+store64(oz_bad + 8, f64_from(77));
+assert(ad_grad_into(oz_t, AD_FULL, oz_ids, 2, oz_bad) != 0,
+"ad_grad_into on a bad root returns the sweep's error");
+assert_eq(f64_to(load64(oz_bad)), 77,
+"and it wrote NOTHING -- the caller's buffer still holds its own sentinel");
+
 test_group("2.11.0 autodiff reverse mode: gradient matches forward mode AND finite differences");
 _rv_sweep();
 assert_eq(_RV_RUN, 9, "the reverse sweep compared 4 inputs x 2 oracles, plus the value");

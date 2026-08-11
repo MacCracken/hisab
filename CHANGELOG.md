@@ -2,6 +2,122 @@
 
 ## [Unreleased]
 
+## [2.11.0] - 2026-08-11 — reverse-mode autodiff, and the five forward-mode defects it found first
+
+Tape-based reverse mode: one sweep produces the gradient of an n-input scalar where forward-mode
+duals need n passes. Paired with `optimize.cyr`'s solvers, which have always required a
+caller-supplied gradient. Suite **3469 → 3507**, benchmarks 70 → **72**, constant gate 157 →
+**158**, coverage **640/644**. All gates green.
+
+**And for the fourth release running, the feature's own oracle found defects in shipped code
+first.** Reverse mode is validated *against* forward mode — that is the standard and the cheapest
+check available — so `src/autodiff.cyr` was swept before a line of tape code was written. Five
+defects, every one of which would have been inherited and then *confirmed* by the two agreeing.
+
+### Fixed
+
+- **Five defects in forward-mode autodiff, all behind guards no finite difference can reach.**
+
+  | input | returned | truth |
+  |---|--:|--:|
+  | `1 / 1e-13` | **(0, 0)** | (1e13, −1e26) |
+  | `ln(−5)` | **(NaN, −0.2)** | miss sentinel |
+  | `ln(1e-13)` | **(0, 0)** | (−29.9336, 1e13) |
+  | `sqrt(−4)` | **(NaN, NaN)** | miss sentinel |
+  | `d/dx x¹ at 0` | **NaN** | 1 |
+  | `d/dx x³ at −2` | **NaN** | 12 |
+
+  `ln(−5) → (NaN, −0.2)` is the worst of them: a NaN value paired with a **confident finite
+  derivative**, so a caller checking only the gradient — the entire point of an autodiff module —
+  sees nothing wrong.
+
+  Causes, one per guard. `dual_div` guarded at `EPSILON_F64` where the division only fails below
+  DBL_MIN — the same class 2.10.2 repaired four times in `geo.cyr`, and repaired the same way.
+  `dual_ln` tested `f64_abs(v)`, which is not the domain of `ln`, so negatives sailed past it.
+  `dual_sqrt` computed `s = sqrt(v)` *before* its guard. `dual_pow` called `f64_pow`, documented in
+  `lib/ganita.cyr` as `exp(n·ln(base))` and therefore NaN for every non-positive base — ⚠ **that is
+  the stdlib's stated implementation, not a hidden defect**; the defect was hisab inheriting the
+  restriction undocumented, on a function whose commonest use is polynomials. Integer exponents now
+  go through repeated multiplication.
+
+  ⚠ **THE FINITE-DIFFERENCE SWEEP ALONE FOUND NOTHING.** A 13-op sweep was written first and
+  reported clean, for a structural reason: **at every input where a guard fires, the perturbed
+  scalar is NaN too**, so the sample is skipped and the guard is never asked. It skipped exactly the
+  rows that mattered. *A guard has to be interrogated directly; differencing a function cannot reach
+  the branch that refuses to evaluate it.* The suite carries both, plus a **control** pinning that
+  `(−2)^0.5` must still be NaN — without it, "fixed the NaN" and "replaced one fabrication with
+  another" are indistinguishable.
+  → `issues/archived/2026-08-11-forward-mode-dual-guards.md`
+
+### Added
+
+- **Tape-based reverse mode** — `ad_tape_new`, `ad_var`, `ad_const`, twelve operations mirroring the
+  duals, `ad_grad` and `ad_grad_of`. One node per operation records its value, both local partials
+  and both input indices. Because every node's inputs have **strictly smaller indices**, a single
+  descending loop is a valid reverse topological order — no sort, no visited set, no recursion.
+
+  `AD_FULL` is returned by every op on overflow and **propagates**: an op consuming a bad index is
+  itself bad, so a caller checking only the final index is still safe. `ad_tape_reset` reuses one
+  tape across many gradients, because the bump allocator never frees and a tape per iteration is a
+  leak rather than a style choice.
+
+  It lives in `src/autodiff.cyr` rather than a 36th module, deliberately: reverse mode is verified
+  against forward mode, and keeping them together makes that pairing structural instead of a
+  convention someone has to remember.
+
+- **`ad_grad_write` / `ad_grad_into`** — the pairing with `optimize.cyr`. ⚠ **No API change was
+  needed**: `opt_*` take `fncall2(grad, x, out)`, and a capturing closure holding the tape matches
+  that exactly. That this works at all is recent and was **re-run rather than taken from the release
+  note** — a capturing closure called through a function boundary SIGSEGVed on 6.5.16, the same
+  defect that still blocks `vec_sort_by`; re-verified on 6.5.18.
+
+  ⚠ **No `ad_minimize` convenience is shipped, and that is a decision.** It would put a call to
+  `optimize.cyr` inside `autodiff.cyr` — a module dependency buying a caller four lines, in exchange
+  for a `[lib]` ordering constraint and a module that can no longer be read on its own.
+
+### Performance
+
+- **`grad_fwd_16` 63.7 µs → `grad_rev_16` 5.70 µs — 11.2×** for the full gradient of a 16-input
+  scalar. A second recorded run gives 68.8 µs / 6.18 µs = **11.1×**, so the ratio is stable across
+  runs rather than a single reading; both rows are in `bench-history.csv`. The forward row computes **all 16 partials**; timing one dual pass against a full reverse
+  sweep would have flattered reverse mode 16× for free.
+
+  ⚠ Not the theoretical 16×, and the shortfall is stated rather than smoothed over: reverse mode
+  pays to **record** the tape, and part of the remaining gap is **allocation, not arithmetic** —
+  every `dual_*` op heap-allocates a 16-byte `Dual` under an allocator that never frees, while the
+  reverse row calls `ad_tape_reset` and writes into memory it already owns. The ratio is a property
+  of the two *implementations*, not of forward versus reverse in the abstract.
+
+### Verification
+
+- **Reverse mode checked against BOTH oracles, which are not interchangeable.** Reverse and forward
+  share the domain guards, so their agreement is partly tautological; only central differences are
+  independent of both. On a four-input objective exercising every op, worst disagreement **2.02e-10**
+  against each. Two inputs feed **more than one consumer** — a chain where every node has one
+  consumer never exercises the reverse *accumulation*, which is the only thing the sweep does that
+  forward mode does not.
+- **The solvers were checked against their own contract before any integration was written, and
+  this time it found nothing.** All four return `HSB_ERR_NONE` only from
+  `if (f64_lt(gnorm, tol) == 1)`; 16 runs across two objectives and both gradient sources honoured
+  it. Recorded because a clean result from that check is worth as much as a dirty one — it is the
+  fifth release it has been run and the first to come back empty.
+- **Fourteen mutants, fourteen kills** — including the two structural ones on the sweep: clearing
+  the adjoint array only up to `root` (a second gradient from a shorter root then reads the previous
+  sweep's values), and sweeping ascending instead of descending.
+
+  ⚠ **Two of them survived the first test pass**, and both were real gaps. Replacing
+  `ad_grad_of(t, load64(ids + k*8))` with `ad_grad_of(t, k)` survived because the fixture's
+  variables happened to *be* nodes 0 and 1 — the whole purpose of `ids` is that they need not be.
+  And dropping `ad_grad_into`'s error check survived because nothing called it with a bad root. New
+  fixtures put two constants first and reverse the `ids`, and call it with `AD_FULL` asserting the
+  caller's buffer is untouched.
+
+  ⚠ **And one failure was the assertion's fault, not the code's.** The first end-to-end optimizer
+  test asserted the minimiser to `LOOSE_TOL_M` (1e-8) and failed 4 of 8: gradient descent stops at
+  `‖g‖ < 1e-6` and therefore lands 5e-7 away, **exactly as promised**. The tolerance is now
+  *derived* from the contract — `grad = 2(x − x*)`, so `‖x − x*‖ < tol/2`. The other three solvers
+  hid it by converging far tighter.
+
 ## [2.10.2] - 2026-08-11 — the primal defects the jets were sitting on
 
 2.10.1 shipped jets for all six ray primitives and filed three defects **in the primal** that the

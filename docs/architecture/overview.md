@@ -27,6 +27,8 @@ hisab (Cyrius)
 ├── Geometry
 │   ├── geo.cyr            — 9 primitives, 6 ray tests, closest-point queries
 │   ├── geo_advanced.cyr   — GJK/EPA 3D, SDF+CSG, swept AABB, TOI, CGA 5D, BVH
+│   ├── geo_diff.cyr       — Ray/surface JETS for all six primitives: t plus its full
+│   │                        gradient from one evaluation, as a post-pass on the shipped primal
 │   └── spatial.cyr        — k-d tree, octree, quadtree, spatial hash (BVH lives in geo_advanced)
 │
 ├── Collision
@@ -60,7 +62,8 @@ hisab (Cyrius)
 │   └── symbolic_ext.cyr   — Symbolic integration, LaTeX rendering, pattern matching + rewrite
 │
 └── Other
-    ├── autodiff.cyr       — Dual numbers (forward-mode AD)
+    ├── autodiff.cyr       — Forward-mode duals AND a tape-based reverse mode: one sweep
+    │                        for an n-input gradient where forward needs n passes
     ├── interval.cyr       — Interval arithmetic
     ├── tensor.cyr         — N-D dense tensor, Kronecker/Minkowski/Levi-Civita
     └── einsum.cyr         — Einstein-summation contraction (bounded reused arena)
@@ -100,7 +103,7 @@ auto-resolve stdlib leaves — is now **tracked** rather than gitignored, and na
 fold needs in scope: `syscalls`, `io`, `string`, `alloc`, `str`, `fmt`, `vec`, `args`, `assert`,
 `math`, `ganita`, `tagged`, `fnptr`, `bench`, `callback`. It was worth ignoring until cyrius 6.5.10
 for the same reason this section exists: the sidecar was built by scanning bundled sources for
-literal `include "lib/X.cyr"` lines, and hisab's 34 `[lib]` modules have none, so it reported 2.
+literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, so it reported 2.
 6.5.10 unions in the declared `[deps] stdlib`, which is what takes it from 2 to 15.
 
 | Module | Also include |
@@ -133,6 +136,7 @@ literal `include "lib/X.cyr"` lines, and hisab's 34 `[lib]` modules have none, s
 | `calc_ext` | `calc` `error` `vec2` `vec3` |
 | `collision_mesh` | `collision_core` `error` `vec2` `vec3` |
 | `geo_advanced` | `error` `geo` `quat` `vec3` |
+| `geo_diff` | `error` `geo` `quat` `vec3` |
 | `mat4` | `error` `f64_util` `vec3` `vec4` |
 | `noise_simplex` | `calc` `error` `vec2` `vec3` |
 | `spatial` | `error` `geo` `quat` `vec3` |

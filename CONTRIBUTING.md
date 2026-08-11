@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.5.18 as of 2.10.0. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
+- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.5.18 as of 2.11.0. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work
@@ -51,18 +51,17 @@ cyrius fmt src/main.cyr --check
 # Vet include dependencies
 cyrius vet src/main.cyr
 
-# Regenerate the distlib bundle (CI fails on drift; required after any src/ or [lib] change).
-# ⚠ On cyrius >= 6.5.14 this exits 1 with "does not compile" + "undefined variable" even when
-# the bundle is good: distlib's new self-check compiles the bundle ALONE, and `_cc_allow_undef`
-# downgrades undefined FUNCTIONS but not undefined global VARIABLES — hisab's bundle reads
-# stdlib constants (F64_ONE) a consumer supplies via `[deps].stdlib`. The bundle is written
-# before that check runs, so regeneration and drift detection are unaffected; CI tolerates
-# exactly that signature and nothing else. See
-# docs/development/issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md
+# Regenerate the distlib bundle (CI fails on drift; required after any src/ or [lib] change,
+# and on ANY version bump — the bundle header is stamped from VERSION).
+# A non-zero exit here is a real failure. ⚠ It was not always: cyrius 6.5.14–6.5.16 ran a bundle
+# self-check that compiled the bundle ALONE, which rejected any bundle reading a stdlib global
+# (hisab's reads F64_ONE), so both workflows tolerated exactly that signature for three toolchain
+# releases. Fixed upstream in 6.5.17; the tolerance is gone. See
+# docs/development/issues/archived/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md
 cyrius distlib
 
-# What that self-check should have been: compile the bundle with the stdlib in scope, the
-# way a consumer actually builds it
+# Compile the bundle with the stdlib in scope, the way a consumer actually builds it —
+# strictly stronger than the self-check ever was, and kept independently of it
 cyrius check --with-deps dist/hisab.cyr
 ```
 

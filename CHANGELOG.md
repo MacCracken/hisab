@@ -436,11 +436,11 @@ and none belongs in a release scoped to the jets:
   `tie = 0` and a full gradient on it. Also covers an 18×-too-large exit `t` from inside, an
   AABB/OBB disagreement at exactly `EPSILON_F64`, `+Inf` from finite inputs, NaN laundered into a
   plausible `t`, and negative half-extents making one OBB both solid and empty.
-  → `issues/2026-08-10-slab-parallel-test-is-scale-free.md`
+  → `issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md`
 - **`geo_ray_capsule`'s `cyl_missed` fallback applies no hemisphere test**, so it can return a cap
   *sphere*'s entry root that lies inside the capsule. Axial ray from inside: `t = 4`, hit point
   distance to the segment **0.0** against `r = 1`. Plus 5.3% of random interior origins losing a
-  cap exit entirely. → `issues/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md`
+  cap exit entirely. → `issues/archived/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md`
 - ⚠ **Two rows of this release's own squared-epsilon disposition table were wrong**, and are
   corrected in place. They were sorted by reading the code, not running it.
   `geo_triangle_unit_normal` was called "a degeneracy policy"; it returns a **fabricated**
@@ -799,7 +799,7 @@ three guards that were policing nothing.
   **No reachable behaviour changed**: `delaunay_2d` stores every triangle CCW, so the factor is `+1`
   on every call it makes. Suite **3351 → 3359**; `delaunay_2d_400` −2.9%, `halfedge_2k_tris` −4.6%,
   median across all 55 benchmarks −1.4% — **no cost measurable above the noise floor**, and none
-  claimed. Closes `issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`, now archived.
+  claimed. Closes `issues/archived/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`, now archived.
 
 ### Added
 
@@ -1094,7 +1094,7 @@ nothing, and none of the three was found by a test failing.
   self-check was meant to give is replaced by a **stronger** step, `cyrius check --with-deps
   dist/hisab.cyr`, which compiles the bundle with the stdlib actually in scope — the way a consumer
   builds it — with no category of error suppressed.
-  → [`issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md`](docs/development/issues/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md)
+  → [`issues/archived/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md`](docs/development/issues/archived/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md)
 
 ## [2.9.1] - 2026-08-06 — the deferred tier: four latent predicate defects, and a fourth false measurement
 
@@ -1172,7 +1172,7 @@ call path except one — `_col_dl_ic_g1`, which was wrong on ordinary CCW input.
   intact) fails exactly the 4 anti-cyclic assertions with the grid counter at **900 of 1800** —
   all three anti-cyclic orderings of all 300 configurations, cyclic half untouched; inverting the
   constant fails all 9 behavioural assertions.
-  (`docs/development/issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`)
+  (`docs/development/issues/archived/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`)
 
 - **`collision_mesh` — `_col_dl_ic_g2`'s two-ghost tie branch applied the winding twice**, inverting
   the in-circle answer for every anti-cyclic ghost pair. The M² coefficient of the determinant is
@@ -1191,7 +1191,7 @@ call path except one — `_col_dl_ic_g1`, which was wrong on ordinary CCW input.
   **No behaviour change on any reachable path** — `_col_dl_incircle` only ever rotates a CCW-stored
   triangle and rotation is an even permutation, so `cr` is `+1` throughout `delaunay_2d` and the two
   expressions coincide there. Latent since 2.8.2.
-  (`docs/development/issues/2026-08-05-two-ghost-tie-branch-sign-rule-inconsistent.md`)
+  (`docs/development/issues/archived/2026-08-05-two-ghost-tie-branch-sign-rule-inconsistent.md`)
 
 ### Added
 
@@ -1253,7 +1253,7 @@ call path except one — `_col_dl_ic_g1`, which was wrong on ordinary CCW input.
   `g2` must not be read as a claim about the entry point. Filed, not fixed, along with a second and
   orientation-*independent* defect found in `g1`'s M¹ tie-break — it answers "outside" for a point
   strictly between `a` and `b` whenever the edge is parallel to `u_k`, 228 of 463,086 probes on
-  correctly CCW-stored input. (`docs/development/issues/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`)
+  correctly CCW-stored input. (`docs/development/issues/archived/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md`)
 - **`2026-08-04-incircle-precision.md` re-measured and recommended for closure.** Its correction
   section reasoned from a super-triangle at `10 × max(dx, dy)` that 2.8.2 deleted — there is no
   super-triangle on this tree, and `_col_in_circumcircle`'s single caller
@@ -1973,7 +1973,7 @@ missing set **40 of 40**.
 data: at 1e9, a 1e-8-span cluster loses 20 triangles and gains 9 spurious overlapping ones, where
 the current 10x is exactly correct. The multiplier is a genuine trade-off against the non-adaptive
 in-circle determinant's conditioning — the two defects are **coupled**, precisely as
-`issues/2026-08-04-incircle-precision.md` warned when it said not to fix that one by rescaling. 1e6
+`issues/archived/2026-08-04-incircle-precision.md` warned when it said not to fix that one by rescaling. 1e6
 is a defensible interim; 1e9 must not be used; the durable fix is an adaptive predicate.
 
 Three of the four criticals are in the collision narrowphase: `mpr_penetration` returns a wrong and
@@ -2003,7 +2003,7 @@ verifier's own test bug and was refuted rather than reported.
 `delaunay_2d` now carries triangle adjacency and inserts by **walk + flood-fill Bowyer-Watson**,
 replacing the flat-vec full rescan. Two previous attempts to speed it up failed (2.7.1: 2.6x slower
 on cocircular; 2.8.0-attempt: broke the triangulation) — both are written up in
-`docs/development/issues/2026-08-04-perf-delaunay_2d.md`, and both failed because they optimised a
+`docs/development/issues/archived/2026-08-04-perf-delaunay_2d.md`, and both failed because they optimised a
 representation that could not support the operation.
 
 ### The headline is a correctness defect, not the speedup
@@ -2797,7 +2797,7 @@ magnitude class instead of reconstructing the caller's real geometry.
 **Not fixed.** The remedy is an adaptive exact predicate (Shewchuk's `incircle`: floating-point
 determinant with a forward error bound, exact expansion only when |det| falls below it). Rescaling
 cannot help — the spread is inherent to the super-triangle construction. Filed with its repro at
-`docs/development/issues/2026-08-04-incircle-precision.md` rather than attempted here, because a
+`docs/development/issues/archived/2026-08-04-incircle-precision.md` rather than attempted here, because a
 half-done robust predicate is worse than a documented sharp edge.
 
 #### Performance — `solve_bicgstab` leaked a work vector per iteration (2.7.0-I)
@@ -3535,7 +3535,7 @@ is recommended for parity).
   (`iv_div` / `iv_neg` / `iv_abs` are unaffected — there is no integer-vector divide, so
   `iv_div` was never reserved). The suite now compiles stably and runs **312/312**, restoring
   the full **957/957** across all four suites. Filed the toolchain bug at
-  `docs/development/issues/2026-07-17-cyrius-interval-ident-lex.md` (and upstream in the cyrius
+  `docs/development/issues/archived/2026-07-17-cyrius-interval-ident-lex.md` (and upstream in the cyrius
   repo); a `NOTE:` comment in the test guards the names against a well-meaning rename-back.
 
 ### Verified

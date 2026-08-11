@@ -13,6 +13,13 @@
 var _GEO_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
 var _GEO_F64_POS_INF = 0x7FF0_0000_0000_0000;  # +Infinity
 var _GEO_F64_FOUR    = 0x4010_0000_0000_0000;  # 4.0
+# EPSILON_F64 squared, for guards that test a SQUARED length. 2.10.1: the
+# degenerate-direction guard 2.10.0 added to geo_ray_sphere compared `d.d`
+# against EPSILON_F64 itself, which is an unsquared tolerance -- so it rejected
+# every direction shorter than 1e-6 as a miss, including ones whose hit is real,
+# finite and exactly representable. Same squared-vs-unsquared mistake 2.6.14
+# repaired in cx_div / cx_inv / cx_powf.
+var _GEO_F64_EPS_SQ  = 0x3AF3_57C2_99A8_8EA7;  # 1e-24
 var _GEO_F64_THREE   = 0x4008_0000_0000_0000;  # 3.0
 var _GEO_F64_THIRD   = 0x3FD5_5555_5555_5555;  # 1.0/3.0
 
@@ -215,6 +222,61 @@ fn geo_segment_distance_to_point(seg, point) {
 # Ray intersection tests
 # ================================================================
 # All return 0 on miss, positive f64 t parameter on hit.
+#
+# ----------------------------------------------------------------
+# FACE-REPORTING VARIANTS (2.10.1)
+# ----------------------------------------------------------------
+#
+# `geo_ray_aabb` and `geo_ray_obb` pick their answer through f64_max / f64_min
+# across three slabs and then DISCARD which slab won. A differentiable caller
+# needs that back -- the derivative of t is per-face, and `src/geo_diff.cyr`
+# cannot form it from t alone -- and so does an ordinary caller that wants the
+# surface normal at the hit without recomputing it.
+#
+# So each has a `_face` variant taking an out-pointer, with the plain entry point
+# becoming a one-line wrapper that passes 0. THE VALUE PATH IS UNCHANGED BY
+# CONSTRUCTION: the f64_max / f64_min calls are byte-for-byte what they were, the
+# face bookkeeping is additive, and every added line sits behind `if (out != 0)`,
+# so a non-differentiating caller pays one i64 compare per slab and nothing else.
+# The 3402 existing assertions gate that equivalence.
+#
+# FACE ENCODING: 2 * axis + plane, where axis is 0/1/2 for x/y/z (for the OBB,
+# its own local axis 0/1/2) and plane is 0 for the min side, 1 for the max side.
+# GEO_FACE_NONE (-1) means no face was selected, which happens only when the
+# routine also returns the miss sentinel.
+#
+# OUT BLOCK: 16 bytes, two i64 slots.
+#   out[0] = the face index above
+#   out[1] = 1 when the selected extremum was achieved by MORE THAN ONE slab,
+#            i.e. the ray hit an edge or a corner exactly. `t` has a genuine kink
+#            there -- the selected face, and therefore the derivative, differs on
+#            either side -- so a differentiating caller must not read a gradient.
+#            Reported rather than resolved: picking a side would be a silent
+#            wrong answer, and the grazing-incidence convention in geo_diff.cyr
+#            is already to return the miss sentinel at a non-differentiable point.
+var GEO_FACE_NONE      = -1;
+var GEO_FACE_OUT_BYTES = 16;
+
+# THE CAPSULE reports a BRANCH, not a face: its surface is three pieces, and the
+# derivative differs per piece even though the surface itself is C1 where they
+# meet. out[1] is unused (always 0) -- a capsule has no edge, so there is no tie
+# to report. The cap/cylinder seam IS differentiable: hemisphere and cylinder are
+# tangent there, and the two branches' gradients agree in the limit, which the
+# suite asserts rather than assumes.
+var GEO_CAP_CYLINDER  = 0;
+var GEO_CAP_START_CAP = 1;
+var GEO_CAP_END_CAP   = 2;
+var GEO_CAP_SPHERE    = 3;    # degenerate capsule: start == end, a plain sphere
+
+# Axis (0/1/2) of an encoded face.
+fn geo_face_axis(face) {
+    return face / 2;
+}
+
+# 1 if the face is a max-side plane, 0 if min-side.
+fn geo_face_is_max(face) {
+    return face % 2;
+}
 
 # Ray-plane intersection
 # Returns t > 0 on hit, 0 on miss -- and a ZERO is also what a t = 0 hit returns,
@@ -280,7 +342,14 @@ fn geo_ray_sphere(ray, sphere) {
     # the same sweep only because its end-cap branches call this function.
     # Asserted by _homog_sweep / _HG_BAD in tests/modules.tcyr, oracle-free.
     var a = hvec3_dot(d, d);
-    if (f64_lt(a, EPSILON_F64) == 1) { return 0; }
+    # Reject only a genuinely zero-length direction. `a` is d.d, a SQUARED
+    # length, so the threshold is EPSILON_F64 SQUARED -- see _GEO_F64_EPS_SQ.
+    # Testing it against EPSILON_F64 directly (2.10.0) made every |d| < 1e-6 a
+    # miss, breaking the degree -1 homogeneity this same repair established:
+    # a unit sphere at (0,0,5) with d = (0,0,1e-7) has t = 4e7, and it returned 0.
+    # geo_ray_capsule inherited it through its end caps, exactly as in 2.10.0.
+    # [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
+    if (f64_lt(a, _GEO_F64_EPS_SQ) == 1) { return 0; }
     var discriminant = f64_sub(f64_mul(half_b, half_b), f64_mul(a, c));
 
     if (f64_lt(discriminant, 0) == 1) { return 0; }
@@ -296,7 +365,24 @@ fn geo_ray_sphere(ray, sphere) {
 }
 
 # Ray-AABB intersection (slab method)
-fn geo_ray_aabb(ray, aabb) {
+#
+# DEGENERATE DIRECTION, repaired 2.10.1. A slab whose direction component is
+# below EPSILON_F64 is skipped as parallel, and if ALL THREE are skipped nothing
+# ever narrows the interval: t_min stays -Inf, t_max stays +Inf, and the tail
+# below returned +Inf. That is neither the documented miss (0) nor a usable hit
+# parameter -- geo_ray_at(ray, +Inf) on a zero direction is NaN in every
+# component. Reachable through the public `GeoRay_set_direction`, exactly as the
+# 2.10.0 unit-direction defect was; `geo_ray_new` normalizes, so the intended
+# path never saw it. Four of the six geo_ray_* siblings already returned 0 here;
+# this and geo_ray_obb were the two that did not.
+#
+# The guard is a COUNT of contributing slabs rather than a `d.d < EPSILON` test
+# up front, because that test would also reject legitimate small directions --
+# (0, 0, 1e-5) has |d|^2 = 1e-10 < EPSILON_F64 but its z slab is not parallel and
+# its hit is real. Counting changes behaviour on exactly the path that produced
+# +Inf and nowhere else.
+# [measured: tests/modules.tcyr "2.10.1 degenerate-direction contract"]
+fn geo_ray_aabb_face(ray, aabb, out) {
     var ox = HVec3_x(GeoRay_origin(ray));
     var oy = HVec3_y(GeoRay_origin(ray));
     var oz = HVec3_z(GeoRay_origin(ray));
@@ -312,6 +398,15 @@ fn geo_ray_aabb(ray, aabb) {
 
     var t_min = _GEO_F64_NEG_INF;
     var t_max = _GEO_F64_POS_INF;
+    var slabs = 0;
+    var face_near = GEO_FACE_NONE;
+    var face_far  = GEO_FACE_NONE;
+    var tie_near = 0;
+    var tie_far  = 0;
+    if (out != 0) {
+        store64(out, GEO_FACE_NONE);
+        store64(out + 8, 0);
+    }
 
     # X slab
     if (f64_lt(f64_abs(dx), EPSILON_F64) == 1) {
@@ -321,11 +416,32 @@ fn geo_ray_aabb(ray, aabb) {
         var inv_d = f64_div(F64_ONE, dx);
         var t1 = f64_mul(f64_sub(bmin_x, ox), inv_d);
         var t2 = f64_mul(f64_sub(bmax_x, ox), inv_d);
+        var f1 = 0;
+        var f2 = 1;
         if (f64_gt(t1, t2) == 1) {
             var tmp = t1; t1 = t2; t2 = tmp;
+            f1 = 1; f2 = 0;
+        }
+        # Face bookkeeping, BEFORE the update so `t_min` still holds the running
+        # value: a strict increase means this slab now owns the near face and any
+        # earlier tie is void; exact equality means two slabs achieve it, which is
+        # an edge or corner hit. f64_max returns `t1` whenever t1 >= t_min, so
+        # `f64_gt(t1, t_min)` is exactly "this slab changed the answer".
+        if (out != 0) {
+            if (f64_gt(t1, t_min) == 1) {
+                face_near = f1;
+                tie_near = 0;
+            }
+            else { if (f64_eq(t1, t_min) == 1) { tie_near = 1; } }
+            if (f64_lt(t2, t_max) == 1) {
+                face_far = f2;
+                tie_far = 0;
+            }
+            else { if (f64_eq(t2, t_max) == 1) { tie_far = 1; } }
         }
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
+        slabs = slabs + 1;
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     }
 
@@ -337,11 +453,32 @@ fn geo_ray_aabb(ray, aabb) {
         var inv_d = f64_div(F64_ONE, dy);
         var t1 = f64_mul(f64_sub(bmin_y, oy), inv_d);
         var t2 = f64_mul(f64_sub(bmax_y, oy), inv_d);
+        var f1 = 2;
+        var f2 = 3;
         if (f64_gt(t1, t2) == 1) {
             var tmp = t1; t1 = t2; t2 = tmp;
+            f1 = 3; f2 = 2;
+        }
+        # Face bookkeeping, BEFORE the update so `t_min` still holds the running
+        # value: a strict increase means this slab now owns the near face and any
+        # earlier tie is void; exact equality means two slabs achieve it, which is
+        # an edge or corner hit. f64_max returns `t1` whenever t1 >= t_min, so
+        # `f64_gt(t1, t_min)` is exactly "this slab changed the answer".
+        if (out != 0) {
+            if (f64_gt(t1, t_min) == 1) {
+                face_near = f1;
+                tie_near = 0;
+            }
+            else { if (f64_eq(t1, t_min) == 1) { tie_near = 1; } }
+            if (f64_lt(t2, t_max) == 1) {
+                face_far = f2;
+                tie_far = 0;
+            }
+            else { if (f64_eq(t2, t_max) == 1) { tie_far = 1; } }
         }
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
+        slabs = slabs + 1;
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     }
 
@@ -353,17 +490,82 @@ fn geo_ray_aabb(ray, aabb) {
         var inv_d = f64_div(F64_ONE, dz);
         var t1 = f64_mul(f64_sub(bmin_z, oz), inv_d);
         var t2 = f64_mul(f64_sub(bmax_z, oz), inv_d);
+        var f1 = 4;
+        var f2 = 5;
         if (f64_gt(t1, t2) == 1) {
             var tmp = t1; t1 = t2; t2 = tmp;
+            f1 = 5; f2 = 4;
+        }
+        # Face bookkeeping, BEFORE the update so `t_min` still holds the running
+        # value: a strict increase means this slab now owns the near face and any
+        # earlier tie is void; exact equality means two slabs achieve it, which is
+        # an edge or corner hit. f64_max returns `t1` whenever t1 >= t_min, so
+        # `f64_gt(t1, t_min)` is exactly "this slab changed the answer".
+        if (out != 0) {
+            if (f64_gt(t1, t_min) == 1) {
+                face_near = f1;
+                tie_near = 0;
+            }
+            else { if (f64_eq(t1, t_min) == 1) { tie_near = 1; } }
+            if (f64_lt(t2, t_max) == 1) {
+                face_far = f2;
+                tie_far = 0;
+            }
+            else { if (f64_eq(t2, t_max) == 1) { tie_far = 1; } }
         }
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
+        slabs = slabs + 1;
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     }
 
-    if (f64_lt(t_min, 0) != 1) { return t_min; }
-    if (f64_lt(t_max, 0) != 1) { return t_max; }
+    # See the header: every slab parallel means nothing narrowed the interval and
+    # the two returns below would hand back +Inf.
+    if (slabs == 0) { return 0; }
+
+    # t_min == t_max: ONE test, TWO non-differentiable situations, both of which
+    # the per-slab tie above is blind to because it compares near against near
+    # and far against far, never t_min against t_max.
+    #
+    #   TANGENTIAL CLIP -- different slabs own the entry and the exit and they
+    #   coincide. The hit sits on the BOUNDARY of the hit set: an arbitrarily
+    #   small sideways perturbation makes it a miss.
+    #
+    #   ZERO-WIDTH SLAB -- min_k == max_k (a flat box, or a zero half-extent).
+    #   Then t1 == t2 on that axis, the swap never runs (f64_gt is false on
+    #   equality), and the face would be labelled the MIN slot unconditionally --
+    #   right only when d_k > 0. For d_k < 0 the whole gradient belongs to the MAX
+    #   slot and the jet reported it in the min one with tie = 0. Measured on the
+    #   2.10.1 draft: exactly half of all flat-box configurations.
+    #   [measured: docs/development/issues/archived/2026-08-10-jet-tie-blind-to-degenerate-slabs.md]
+    #
+    # ⚠ A SEPARATE per-slab `f64_eq(t1, t2)` guard was written for the second
+    # case and then DELETED as dead code: a zero-width slab pins both t_min and
+    # t_max to the same value, so it can never fire without this line firing too.
+    # Mutation-measured, not argued -- removing the per-slab guard changed
+    # nothing, removing this line changed both fixtures.
+    # [measured: docs/development/issues/archived/2026-08-10-jet-tie-blind-to-degenerate-slabs.md]
+    #
+    # Reported rather than relabelled: t is genuinely not two-sided differentiable
+    # at either, and for the flat box a central difference averages the two
+    # one-sided answers into a number that is neither.
+    if (f64_eq(t_min, t_max) == 1) { tie_near = 1; tie_far = 1; }
+
+    if (f64_lt(t_min, 0) != 1) {
+        if (out != 0) { store64(out, face_near); store64(out + 8, tie_near); }
+        return t_min;
+    }
+    if (f64_lt(t_max, 0) != 1) {
+        # Origin inside the box: the answer is the EXIT face, not the entry one.
+        if (out != 0) { store64(out, face_far); store64(out + 8, tie_far); }
+        return t_max;
+    }
     return 0;
+}
+
+# The plain entry point: identical t, no face bookkeeping, out = 0.
+fn geo_ray_aabb(ray, aabb) {
+    return geo_ray_aabb_face(ray, aabb, 0);
 }
 
 # Ray-triangle intersection (Moller-Trumbore algorithm)
@@ -394,13 +596,29 @@ fn geo_ray_triangle(ray, tri) {
 }
 
 # Ray-OBB intersection (slab test in OBB local space)
-fn geo_ray_obb(ray, obb) {
+#
+# DEGENERATE DIRECTION, repaired 2.10.1 -- the same defect as geo_ray_aabb above
+# and repaired the same way. When every local axis has |a_k . d| below
+# EPSILON_F64 no slab narrows the interval, and the tail returned +Inf where the
+# module contract says 0. See the geo_ray_aabb header for why the guard counts
+# contributing slabs instead of testing |d| up front.
+# [measured: tests/modules.tcyr "2.10.1 degenerate-direction contract"]
+fn geo_ray_obb_face(ray, obb, out) {
     var d = hvec3_sub(GeoObb_center(obb), GeoRay_origin(ray));
     var axes = geo_obb_axes(obb);
     var he = GeoObb_half_extents(obb);
 
     var t_min = _GEO_F64_NEG_INF;
     var t_max = _GEO_F64_POS_INF;
+    var slabs = 0;
+    var face_near = GEO_FACE_NONE;
+    var face_far  = GEO_FACE_NONE;
+    var tie_near = 0;
+    var tie_far  = 0;
+    if (out != 0) {
+        store64(out, GEO_FACE_NONE);
+        store64(out + 8, 0);
+    }
 
     # Axis 0
     var ax0 = load64(axes);
@@ -409,11 +627,32 @@ fn geo_ray_obb(ray, obb) {
     var f0 = hvec3_dot(ax0, GeoRay_direction(ray));
     if (f64_gt(f64_abs(f0), EPSILON_F64) == 1) {
         var inv_f = f64_div(F64_ONE, f0);
+        # t1 solves a.(p - c) = -he (the min-side face), t2 the +he face --
+        # before the swap, which reorders them when the ray runs down the axis.
         var t1 = f64_mul(f64_sub(e0, he0), inv_f);
         var t2 = f64_mul(f64_add(e0, he0), inv_f);
-        if (f64_gt(t1, t2) == 1) { var tmp = t1; t1 = t2; t2 = tmp; }
+        var g1 = 0;
+        var g2 = 1;
+        if (f64_gt(t1, t2) == 1) {
+            var tmp = t1; t1 = t2; t2 = tmp;
+            g1 = 1; g2 = 0;
+        }
+        # Face bookkeeping -- see geo_ray_aabb_face; identical rule, local axes.
+        if (out != 0) {
+            if (f64_gt(t1, t_min) == 1) {
+                face_near = g1;
+                tie_near = 0;
+            }
+            else { if (f64_eq(t1, t_min) == 1) { tie_near = 1; } }
+            if (f64_lt(t2, t_max) == 1) {
+                face_far = g2;
+                tie_far = 0;
+            }
+            else { if (f64_eq(t2, t_max) == 1) { tie_far = 1; } }
+        }
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
+        slabs = slabs + 1;
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     } else {
         # Ray parallel to slab -- check if origin is outside
@@ -430,11 +669,32 @@ fn geo_ray_obb(ray, obb) {
     var f1 = hvec3_dot(ax1, GeoRay_direction(ray));
     if (f64_gt(f64_abs(f1), EPSILON_F64) == 1) {
         var inv_f = f64_div(F64_ONE, f1);
+        # t1 solves a.(p - c) = -he (the min-side face), t2 the +he face --
+        # before the swap, which reorders them when the ray runs down the axis.
         var t1 = f64_mul(f64_sub(e1, he1), inv_f);
         var t2 = f64_mul(f64_add(e1, he1), inv_f);
-        if (f64_gt(t1, t2) == 1) { var tmp = t1; t1 = t2; t2 = tmp; }
+        var g1 = 2;
+        var g2 = 3;
+        if (f64_gt(t1, t2) == 1) {
+            var tmp = t1; t1 = t2; t2 = tmp;
+            g1 = 3; g2 = 2;
+        }
+        # Face bookkeeping -- see geo_ray_aabb_face; identical rule, local axes.
+        if (out != 0) {
+            if (f64_gt(t1, t_min) == 1) {
+                face_near = g1;
+                tie_near = 0;
+            }
+            else { if (f64_eq(t1, t_min) == 1) { tie_near = 1; } }
+            if (f64_lt(t2, t_max) == 1) {
+                face_far = g2;
+                tie_far = 0;
+            }
+            else { if (f64_eq(t2, t_max) == 1) { tie_far = 1; } }
+        }
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
+        slabs = slabs + 1;
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     } else {
         var neg_e1 = f64_neg(e1);
@@ -449,11 +709,32 @@ fn geo_ray_obb(ray, obb) {
     var f2 = hvec3_dot(ax2, GeoRay_direction(ray));
     if (f64_gt(f64_abs(f2), EPSILON_F64) == 1) {
         var inv_f = f64_div(F64_ONE, f2);
+        # t1 solves a.(p - c) = -he (the min-side face), t2 the +he face --
+        # before the swap, which reorders them when the ray runs down the axis.
         var t1 = f64_mul(f64_sub(e2, he2), inv_f);
         var t2 = f64_mul(f64_add(e2, he2), inv_f);
-        if (f64_gt(t1, t2) == 1) { var tmp = t1; t1 = t2; t2 = tmp; }
+        var g1 = 4;
+        var g2 = 5;
+        if (f64_gt(t1, t2) == 1) {
+            var tmp = t1; t1 = t2; t2 = tmp;
+            g1 = 5; g2 = 4;
+        }
+        # Face bookkeeping -- see geo_ray_aabb_face; identical rule, local axes.
+        if (out != 0) {
+            if (f64_gt(t1, t_min) == 1) {
+                face_near = g1;
+                tie_near = 0;
+            }
+            else { if (f64_eq(t1, t_min) == 1) { tie_near = 1; } }
+            if (f64_lt(t2, t_max) == 1) {
+                face_far = g2;
+                tie_far = 0;
+            }
+            else { if (f64_eq(t2, t_max) == 1) { tie_far = 1; } }
+        }
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
+        slabs = slabs + 1;
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     } else {
         var neg_e2 = f64_neg(e2);
@@ -461,20 +742,44 @@ fn geo_ray_obb(ray, obb) {
         if (f64_lt(f64_add(neg_e2, he2), 0) == 1) { return 0; }
     }
 
-    if (f64_lt(t_min, 0) != 1) { return t_min; }
-    if (f64_lt(t_max, 0) != 1) { return t_max; }
+    # See the header: every axis parallel means nothing narrowed the interval.
+    if (slabs == 0) { return 0; }
+
+    # Tangential clip and zero half-extent -- see geo_ray_aabb_face for both.
+    if (f64_eq(t_min, t_max) == 1) { tie_near = 1; tie_far = 1; }
+
+    if (f64_lt(t_min, 0) != 1) {
+        if (out != 0) { store64(out, face_near); store64(out + 8, tie_near); }
+        return t_min;
+    }
+    if (f64_lt(t_max, 0) != 1) {
+        # Origin inside the box: the EXIT face, not the entry one.
+        if (out != 0) { store64(out, face_far); store64(out + 8, tie_far); }
+        return t_max;
+    }
     return 0;
 }
 
+# The plain entry point: identical t, no face bookkeeping, out = 0.
+fn geo_ray_obb(ray, obb) {
+    return geo_ray_obb_face(ray, obb, 0);
+}
+
 # Ray-capsule intersection
-fn geo_ray_capsule(ray, capsule) {
+fn geo_ray_capsule_branch(ray, capsule, out) {
+    if (out != 0) {
+        store64(out, GEO_FACE_NONE);
+        store64(out + 8, 0);
+    }
     var ab = hvec3_sub(GeoCapsule_end(capsule), GeoCapsule_start(capsule));
     var ab_len_sq = hvec3_dot(ab, ab);
 
     # Degenerate capsule: just a sphere
     if (f64_lt(ab_len_sq, EPSILON_F64) == 1) {
         var sph = geo_sphere_new(GeoCapsule_start(capsule), GeoCapsule_radius(capsule));
-        return geo_ray_sphere(ray, sph);
+        var dt = geo_ray_sphere(ray, sph);
+        if (out != 0) { if (dt != 0) { store64(out, GEO_CAP_SPHERE); } }
+        return dt;
     }
 
     # Closest approach of ray to segment axis (infinite cylinder test)
@@ -500,8 +805,18 @@ fn geo_ray_capsule(ray, capsule) {
     #                satisfy `disc < 0`, so through 2.6.15 this fell through to the
     #                quadratic and computed inv_2a = 0.5/0 = +Inf, returning NaN
     #                from a function documented to return 0 on a miss.
+    #
+    # 2.10.1: the threshold is EPSILON_F64 SQUARED, because `a` is d_perp.d_perp
+    # -- a squared length. Against the unsquared EPSILON_F64 this rejected the
+    # cylinder for any perpendicular component below 1e-6 and silently answered
+    # with a CAP hit instead: measured 0.942% relative error on t, constant at
+    # every direction scale from 1e-6 down, for a ray that hits the body. Not a
+    # miss and not an Inf -- a wrong number, which is why nothing caught it.
+    # Same squared-vs-unsquared mistake 2.6.14 repaired in cx_div/cx_inv/cx_powf
+    # (see complex.cyr:58) and 2.10.1 repaired in geo_ray_sphere above.
+    # [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
     var cyl_missed = 0;
-    if (f64_lt(f64_abs(a), EPSILON_F64) == 1) { cyl_missed = 1; }
+    if (f64_lt(f64_abs(a), _GEO_F64_EPS_SQ) == 1) { cyl_missed = 1; }
     if (f64_lt(disc, 0) == 1) { cyl_missed = 1; }
 
     if (cyl_missed == 1) {
@@ -509,8 +824,18 @@ fn geo_ray_capsule(ray, capsule) {
         var s2 = geo_sphere_new(GeoCapsule_end(capsule), r);
         var t1 = geo_ray_sphere(ray, s1);
         var t2 = geo_ray_sphere(ray, s2);
-        if (t1 == 0) { return t2; }
-        if (t2 == 0) { return t1; }
+        if (t1 == 0) {
+            if (out != 0) { if (t2 != 0) { store64(out, GEO_CAP_END_CAP); } }
+            return t2;
+        }
+        if (t2 == 0) {
+            if (out != 0) { store64(out, GEO_CAP_START_CAP); }
+            return t1;
+        }
+        if (out != 0) {
+            if (f64_lt(t1, t2) == 1) { store64(out, GEO_CAP_START_CAP); }
+            else { store64(out, GEO_CAP_END_CAP); }
+        }
         return f64_min(t1, t2);
     }
 
@@ -520,6 +845,9 @@ fn geo_ray_capsule(ray, capsule) {
     var cyl_t2 = f64_mul(f64_add(f64_neg(b), sqrt_disc), inv_2a);
 
     var best = 0;
+    # Which piece of the surface produced `best`. Written only through out at the
+    # end, so a non-differentiating caller pays one i64 store per accepted branch.
+    var branch = GEO_FACE_NONE;
 
     # Check cylinder hit at cyl_t1
     if (f64_lt(cyl_t1, 0) != 1) {
@@ -528,6 +856,7 @@ fn geo_ray_capsule(ray, capsule) {
         if (f64_lt(proj, 0) != 1) {
             if (f64_gt(proj, F64_ONE) != 1) {
                 best = cyl_t1;
+                branch = GEO_CAP_CYLINDER;
             }
         }
     }
@@ -540,7 +869,17 @@ fn geo_ray_capsule(ray, capsule) {
             if (f64_gt(proj, F64_ONE) != 1) {
                 if (best == 0) {
                     best = cyl_t2;
+                    branch = GEO_CAP_CYLINDER;
                 } else {
+                    # NO branch update here, and that is measured rather than an
+                    # omission: cyl_t1 <= cyl_t2 always (a > 0 and sqrt(disc) >= 0
+                    # give t1 = (-b - s)/2a <= (-b + s)/2a = t2), so reaching this
+                    # arm means cyl_t1 already owns `best` AND already set the
+                    # branch to the cylinder. A mutant that adds an update here
+                    # cannot change any answer -- one was written, and it survived
+                    # the whole suite, which is what says the line is dead code
+                    # rather than defensive symmetry.
+                    # [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
                     best = f64_min(best, cyl_t2);
                 }
             }
@@ -559,7 +898,9 @@ fn geo_ray_capsule(ray, capsule) {
         if (f64_gt(dot_ab, 0) != 1) {
             if (best == 0) {
                 best = cap_t1;
+                branch = GEO_CAP_START_CAP;
             } else {
+                if (f64_lt(best, cap_t1) != 1) { branch = GEO_CAP_START_CAP; }
                 best = f64_min(best, cap_t1);
             }
         }
@@ -573,13 +914,21 @@ fn geo_ray_capsule(ray, capsule) {
         if (f64_lt(dot_ab, 0) != 1) {
             if (best == 0) {
                 best = cap_t2;
+                branch = GEO_CAP_END_CAP;
             } else {
+                if (f64_lt(best, cap_t2) != 1) { branch = GEO_CAP_END_CAP; }
                 best = f64_min(best, cap_t2);
             }
         }
     }
 
+    if (out != 0) { store64(out, branch); }
     return best;
+}
+
+# The plain entry point: identical t, no branch bookkeeping, out = 0.
+fn geo_ray_capsule(ray, capsule) {
+    return geo_ray_capsule_branch(ray, capsule, 0);
 }
 
 # ================================================================

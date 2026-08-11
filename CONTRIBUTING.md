@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.5.17 as of 2.10.0. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
+- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.5.18 as of 2.10.0. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work
@@ -21,7 +21,7 @@ Thank you for your interest in contributing to Hisab.
 # Build
 cyrius build src/main.cyr build/hisab
 
-# Run all five suites (3398 assertions). CI runs every tests/*.tcyr — running
+# Run all five suites (3453 assertions). CI runs every tests/*.tcyr — running
 # fewer than five locally skips a whole surface, not a handful of cases.
 cyrius test tests/hisab.tcyr
 cyrius test tests/foundation.tcyr

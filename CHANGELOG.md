@@ -2,6 +2,283 @@
 
 ## [Unreleased]
 
+## [2.10.1] - 2026-08-10 — the branchy primitives, and two more defects the design check found first
+
+The other half of 2.10.0's scope: jets for the three primitives whose answer comes from a
+**branch** — aabb, obb, capsule — so all six `geo_ray_*` are now differentiable. Each primal gains
+a face/branch-reporting variant and becomes a one-line wrapper over it, so **the value path is
+unchanged by construction**: the `f64_max`/`f64_min` calls are byte-for-byte what they were and
+every added line sits behind `if (out != 0)`. Suite **3398 → 3453**, benchmarks **64 → 70**,
+constant gate 155 → **156**, toolchain 6.5.17 → **6.5.18**. All gates green.
+
+**And for the third release running, the design check found defects in shipped code before any
+feature code was written.** The jets need to know which face the slab method selected; asking
+*"what does the primal return when there is no face?"* produced two:
+
+- `geo_ray_aabb` and `geo_ray_obb` returned **+Infinity** for a degenerate direction with the
+  origin inside the volume. Four of six siblings honoured the contract; two did not — the same
+  4-vs-2 asymmetry, on the same six functions, as 2.10.0's homogeneity finding.
+- `geo_ray_sphere` and `geo_ray_capsule` compared a **squared** length against `EPSILON_F64`, an
+  unsquared tolerance. The sphere reported a **miss for any |d| < 1e-6** where the answer is finite
+  and exactly representable; the capsule silently returned a **cap** hit instead of the cylinder
+  hit, wrong by **0.942%**. ⚠ **The sphere's guard was introduced by 2.10.0's own repair** — and
+  2.10.0's homogeneity sweep could not have caught it, because its direction scales are 2, 0.5 and
+  7, all of order 1, none within five orders of magnitude of the threshold the same commit added.
+
+### Added
+
+- **`geo_ray_aabb_face` / `geo_ray_obb_face` / `geo_ray_capsule_branch`** — the split. Each takes
+  an out-pointer and reports which face or branch produced `t`; the plain entry point passes 0.
+  Public rather than the roadmap's private `_core`, because a face query is independently useful
+  (a caller wanting the surface normal at the hit) and because a private symbol reached across
+  modules is worse than a documented one.
+
+  **Face encoding**, published in `geo.cyr`: `2 * axis + plane`, plane 0 = min side, 1 = max side;
+  `GEO_FACE_NONE` (−1) when none; `geo_face_axis` / `geo_face_is_max` to decode. Out block is 16
+  bytes: `out[0]` the face, `out[1]` a **tie flag** set when the selected extremum was achieved by
+  more than one slab — an exact edge or corner hit.
+
+  **Capsule branches**: `GEO_CAP_CYLINDER` / `START_CAP` / `END_CAP` / `SPHERE` (the degenerate
+  zero-length case). `out[1]` is unused there — a capsule has no edge.
+
+- **`geo_jet_aabb`** — 12 partials. Once the face is known the slab method reduces to a single
+  plane, `t = (b_k − o_k)/d_k`, so every gradient has support on axis `k` alone:
+  `dt/do` and `dt/dd` carry `−1/d_k` and `−t/d_k`; `dt/dmin` carries `1/d_k` on a min face and the
+  zero vector otherwise, `dt/dmax` the converse.
+
+- **`geo_jet_obb`** — 12 partials, the same reduction in the box's own frame with
+  `t = (e_k + sg·he_k)/f_k`. ⚠ **`dt/d(rotation)` is deferred with a stated reason, not omitted**:
+  the axes come from a unit quaternion, so a free perturbation of an axis leaves the rotation
+  group and a finite difference across it measures nothing a caller can use. Same objection that
+  made `dt/dd` a raw partial with `geo_jet_dt_dd_unit` offered separately.
+
+- **`geo_jet_capsule`** — 13 partials, three branches. Caps reduce to `geo_jet_sphere` on that
+  endpoint with the other endpoint's gradient identically zero. The cylinder comes from
+  `F = |q|² − r²` with `q` the component of `p − a` perpendicular to `ab`, giving
+  `dt/da = (1−s)q/den` and `dt/db = s·q/den` — the `ds·ab` term drops out of `q·dq` because
+  `q · ab = 0` by construction.
+
+- **`geo_jet_face`** and the typed accessors `geo_jet_aabb_dmin/_dmax`,
+  `geo_jet_obb_dcenter/_dhalf_extents`, `geo_jet_capsule_dstart/_dend/_dradius`. `GeoJet` grew a
+  `face` slot, 64 → **72 bytes**, appended so no existing offset moves.
+
+- **Six benchmarks**: `jet_aabb`, `jet_obb`, `jet_capsule`, plus the primal rows they need —
+  `ray_obb` (the **only** ray primitive that had no benchmark, and the most expensive of the six),
+  `ray_aabb_diag` and `ray_capsule_diag`.
+
+### Fixed
+
+- **`geo_ray_aabb` / `geo_ray_obb` returned +Infinity for a degenerate ray direction.** With every
+  slab skipped as parallel, nothing narrows the interval and the tail handed back the `+Inf` it
+  initialised `t_max` with — from functions whose contract is stated three times in `geo.cyr` as
+  *"0 on miss, positive f64 t on hit"*. `geo_ray_at(ray, +Inf)` on a zero direction is **NaN in
+  every component**, so a consumer got NaN geometry with nothing raised.
+
+  | primitive | origin INSIDE | origin OUTSIDE | |
+  |---|--:|--:|---|
+  | `geo_ray_aabb` | **inf** | 0 | ❌ |
+  | `geo_ray_obb` | **inf** | 0 | ❌ |
+  | the other four | 0 | 0 | ✅ |
+
+  ⚠ **The origin position is load-bearing**: from outside, the parallel branch's own bounds check
+  fires first and the contract is honoured by accident. A sweep firing only from outside — the
+  natural way to write one — would have reproduced nothing.
+
+  Fixed by counting contributing slabs, deliberately **not** by a `d·d < EPSILON_F64` guard up
+  front: that test is the very defect below. **Cost: not measurable** — interleaved A/B, three runs
+  each, every pair overlaps.
+  → `issues/archived/2026-08-10-aabb-obb-degenerate-direction.md`
+
+- **`geo_ray_sphere` and `geo_ray_capsule` tested a SQUARED length against an unsquared epsilon.**
+  Homogeneity sweep, relative error, `999` = a real hit turned into a miss:
+
+  | k | sphere | plane | triangle | aabb | obb | capsule |
+  |---|--:|--:|--:|--:|--:|--:|
+  | 1e-6 | 0 | 0 | 0 | 0 | 0 | **0.00942** |
+  | 1e-7 | **999** | 0 | 0 | 0 | 0 | **0.00942** |
+  | 1e-9 | **999** | 0 | 0 | 0 | 0 | **0.00942** |
+
+  A unit sphere at `(0,0,5)` with `d = (0,0,1e-7)` has `t = 4e7`; the sphere returned **0**. The
+  capsule's constant 0.942% at every scale below the threshold is the tell that it is a **branch
+  switch**, not precision loss — below 1e-6 the cylinder test is rejected and the answer comes from
+  the end-cap spheres. Fixed with `_GEO_F64_EPS_SQ` (1e-24); all six now exact to **k = 1e-11**.
+
+  Second instance of a class `complex.cyr:58` has carried since **2.6.14** (*"mixing a squared
+  quantity with an unsquared tolerance"*), with the fix idiom already in that file. **A lesson
+  recorded in one module is not a lesson applied across the tree until something greps for it** —
+  the filing carries a disposition table for all nine such sites in `src/`: two fixed, three EPA
+  ones deferred to 2.10.2 with a reason, four left as documented degeneracy policies.
+  → `issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md`
+
+- **A dead branch update in `geo_ray_capsule`, found by a mutant that SURVIVED.** Nine mutants were
+  written for the capsule jet; eight died. The ninth removed a branch assignment on the `cyl_t2`
+  path and changed nothing — because `cyl_t1 ≤ cyl_t2` always (`a > 0`, `√disc ≥ 0`), so reaching
+  that arm means `cyl_t1` already owns the answer and already set the branch. The line was
+  unreachable-as-a-difference. Removed, invariant documented, and confirmed by measurement as well
+  as on paper: **932 randomised cylinder quadratics, 0 with `t1 > t2`.** A surviving mutant is
+  evidence about the code, not only about the test.
+
+- **The jet tie flag was blind to two of the four ways a slab tie arises — found by an independent
+  derivation commissioned against 2.10.1's own finished code.** The draft compared near against
+  near and far against far, which catches an edge (two slabs achieving `t_min`) and a corner
+  (three). It could not see:
+
+  - **A zero-width slab** (`min_k == max_k`, or `he_k == 0`). Then `t1 == t2`, the primal's swap
+    never runs — `f64_gt` is false on equality — and the face is labelled the **min slot
+    unconditionally**, which is right only when `d_k > 0`. Measured, flat box, `d_x = -1`:
+
+    | | `dt/dmin_x` | `dt/dmax_x` |
+    |---|--:|--:|
+    | jet said | **−1.0** | 0.0 |
+    | one-sided truth | 0.0 | **−1.0** |
+
+    The entire nonzero gradient in the wrong slot, `tie = 0` asserting differentiability, on
+    **half** of all flat-box configurations — the mirror ray was right, so a fixture testing one
+    direction passes on the broken code. Both directions are now asserted.
+  - **A tangential clip** (`t_min == t_max`, different slabs owning the two ends). The hit sits on
+    the *boundary* of the hit set, where an arbitrarily small sideways perturbation makes it a miss.
+
+  Both are now covered by one line at the tail of each function: `if (f64_eq(t_min, t_max) == 1)`.
+  ⚠ **A separate per-slab guard was written for the zero-width case and then DELETED as dead code**
+  — a zero-width slab pins `t_min` and `t_max` to the same value, so it cannot fire without the
+  tail line firing too. Established by mutation, not argument: removing the per-slab guard changed
+  nothing; removing the tail line fails 5 assertions across both primitives.
+
+  ⚠ **The first fixture written for the tangential clip was not tangential.** `o (-1, 2, 0.5)`,
+  `d (1, -1, 0)` gives `t_min = 1, t_max = 2` — an ordinary edge hit, already covered. It passed,
+  which is exactly the failure mode: a fixture that tests something already tested and reads as
+  though it tested something new.
+  → `issues/archived/2026-08-10-jet-tie-blind-to-degenerate-slabs.md`
+
+### Changed
+
+- **Toolchain pin `6.5.17` → `6.5.18`.** Compiler-only: **all 30 vendored files are byte-identical
+  between the two pins**, so `lib sync` was a no-op and `deps --verify` stayed 30/30. Its headline
+  fix is a `cyrius fmt` bug that corrupted multi-line string literals (upstream measured it
+  rewriting 1,239 lines of cyrius's own `src/main.cyr`); hisab's 44 sources are **still fmt-clean
+  under the repaired formatter**, checked rather than assumed.
+
+  ⚠ The open **dead-function-bodies** filing was re-run on 6.5.18 from its own repro and is
+  **unchanged**: `build` and `check --with-deps` reject (exit 1), **`lint` and `vet` still exit 0**
+  on a file that does not parse. Still partial, still open.
+
+- **`geo_ray_capsule`'s cylinder rejection threshold** is now `_GEO_F64_EPS_SQ`, not `EPSILON_F64`
+  — see *Fixed* above. A near-axial ray now gets its barrel hit rather than a cap hit.
+
+### Known — inherited by the jets, scheduled for 2.10.2
+
+The jets are a post-pass on the shipped primal by design, so they are exactly as correct as it is.
+The same commissioned probe found three defects **in the primal**, all re-run on this tree before
+being written down, all left open because each changes what a hot, four-consumer function returns
+and none belongs in a release scoped to the jets:
+
+- **The slab parallel test is scale-free.** `|d_k| < EPSILON_F64` deletes that slab, which is wrong
+  whenever the ray travels far enough for a tiny component to matter. Box `[0,1]³`, origin
+  `(0.5, 0.5, -1e12)`, direction `(9e-13, 0, 1)` with **`|d| = 1.0`** returns `t = 1e12` and a hit
+  point at **x = 1.4**. `geo_ray_new` normalizes and does not protect. `geo_jet_aabb` returns
+  `tie = 0` and a full gradient on it. Also covers an 18×-too-large exit `t` from inside, an
+  AABB/OBB disagreement at exactly `EPSILON_F64`, `+Inf` from finite inputs, NaN laundered into a
+  plausible `t`, and negative half-extents making one OBB both solid and empty.
+  → `issues/2026-08-10-slab-parallel-test-is-scale-free.md`
+- **`geo_ray_capsule`'s `cyl_missed` fallback applies no hemisphere test**, so it can return a cap
+  *sphere*'s entry root that lies inside the capsule. Axial ray from inside: `t = 4`, hit point
+  distance to the segment **0.0** against `r = 1`. Plus 5.3% of random interior origins losing a
+  cap exit entirely. → `issues/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md`
+- ⚠ **Two rows of this release's own squared-epsilon disposition table were wrong**, and are
+  corrected in place. They were sorted by reading the code, not running it.
+  `geo_triangle_unit_normal` was called "a degeneracy policy"; it returns a **fabricated**
+  `(0, 1, 0)` for a well-formed right triangle with 1e-7 legs where the truth is `(0, 0, 1)`. The
+  capsule's degenerate guard was called immaterial; it is **25.6%** wrong on a 1e-7-long capsule.
+  *A filing is not evidence until something has re-run it — and a disposition is a filing.*
+
+### Performance
+
+- **`jet_obb` 1.083 µs → 872 ns (−19.5%)**, by rotating one unit vector instead of calling
+  `geo_obb_axes` (which rotates all three and allocates a 24-byte array). Bit-identical result —
+  it is the same `hquat_rotate_vec3` call the primal makes. Takes the jet from 2.2× its primal to
+  **1.8×**.
+
+- **Cost of the split, measured per primitive** (interleaved A/B, three runs each,
+  `bench_batch(2000, 200)`):
+
+  | | with the split | pre-split | |
+  |---|--:|--:|---|
+  | `ray_aabb` (axis-aligned) | 91.7 ns | 86.7 ns | **+5.7%** |
+  | `ray_aabb` (diagonal) | 113.7 ns | 107.7 ns | **+5.6%** |
+  | `ray_obb` | 464 ns | 460 ns | +0.9%, inside noise |
+  | `ray_capsule` | 968.7 ns | 977 ns | inside noise |
+
+  The AABB pays for it: it is the cheapest of the three, so the wrapper call and one i64 compare
+  per slab are visible. **Stated as real rather than dismissed as noise** — it sits near the
+  release's 3.5% median noise floor, but A was higher in 3 of 3 interleaved pairs.
+
+- **What a gradient costs**, each jet against its own primal at the same fixture:
+
+  | | primal | jet | ratio | partials |
+  |---|--:|--:|--:|--:|
+  | sphere | 97 ns | 355 ns | 3.7× | 7 |
+  | aabb | 116 ns | 354 ns | **3.1×** | 12 |
+  | triangle | 295 ns | 992 ns | 3.4× | 15 |
+  | obb | 499 ns | 868 ns | **1.7×** | 12 |
+  | capsule | 965 ns | 1.328 µs | **1.38×** | 13 |
+  | plane | — | 240 ns | — | 7 |
+
+  The branchy three are *cheaper* relative to their primals than the smooth three, because the
+  primal work they reuse is larger. Forward-mode duals would need 12–13 evaluations for these.
+
+  ⚠ **Two fixture faults were found while building this table, and both are the kind that make a
+  benchmark lie rather than fail.** `ray_aabb`'s shipped fixture fires along `(0,0,1)`, so **two of
+  its three slabs are skipped as parallel** — it has always measured the cheapest path the routine
+  has (the ear-prune mistake of 2.9.3, in a different function). And `ray_capsule` fires down the
+  capsule axis onto a **cap** while `jet_capsule` fires diagonally onto the **barrel**: dividing
+  one by the other would have reported the jet at 2.6× when it is 1.38×. Both axis-aligned rows are
+  **kept** so the CSV history stays comparable, and a diagonal row added beside each. It is the
+  pair that is honest, not either row alone.
+
+### Verification
+
+- **Suite 3398 → 3453**, 0 failures. Every jet is checked against **central differences of the
+  shipped primal**, so it is verified against the function it claims to differentiate.
+- **Twenty-five mutants written, twenty-four killed**, the survivor being the dead-code finding
+  above. Sign flips, missing `t` factors, swapped min/max and endpoint weights, wrong axis, wrong
+  cap endpoint, dropped tie checks, exit paths reporting the entry face.
+- **Fixture discrimination is asserted, not assumed.** `_JA_FACES == 0x3F` and `_JO_FACES == 0x3F`
+  prove the box sweeps hit all six faces; `_JC_BRANCH == 0x7` proves the capsule sweep hit the
+  barrel **and both caps** — the caps being where 2.10.0's defect lived. The OBB sweep uses a
+  **rotated** box, because under the identity quaternion the local axes are the world axes and an
+  axis mix-up is invisible.
+- **The capsule seam is C¹, and that is measured rather than argued.** The first seam assertion
+  used `dz = 1e-7` against a 1e-8 tolerance and **failed** — correctly: the true gap there is
+  6.7e-8. Rather than loosen the tolerance, the gap was measured at eleven offsets:
+
+  | dz | 1e-4 | 1e-6 | 1e-8 | 1e-10 | 1e-13 |
+  |---|--:|--:|--:|--:|--:|
+  | gradient gap | 1.7e-4 | 1.7e-6 | 1.7e-8 | 1.7e-10 | below print precision |
+
+  One decade per decade — linear convergence, therefore C¹. The assertion is now a **rate** check
+  (a 100× smaller offset must give a ≥50× smaller gap), which cannot be satisfied by loosening a
+  tolerance and which a merely-C⁰ surface fails. A box edge fails it, which is why the box jets
+  return the miss sentinel there and the capsule does not.
+- **Edges and corners** return the miss sentinel from the box jets, with the primal asserted to
+  still return `t = 1` so the test proves the jet is refusing a *real* hit. Those fixtures use the
+  identity rotation deliberately — an **exact** floating-point tie needs axis-aligned arithmetic;
+  a rotated box ties only approximately, which is a near-edge hit and *is* differentiable.
+- **Wrapper equivalence** asserted bit-for-bit for all three primitives.
+- **An independent derivation and adversarial probe were commissioned against the finished code**,
+  and this is what they returned. **All 37 partials agree term for term** with the shipped
+  formulas, and **0 of 24,237 finite-difference comparisons failed** — with the oracle's teeth
+  demonstrated separately by corrupting each analytic value and confirming every corruption is
+  caught. The value was **entirely in the enumeration**: the formulas were right, and the list of
+  degenerate cases was two short (above). A test written by the author of the code inherits the
+  author's list of cases. **Ask what is missing from the list, not whether the entries on it pass.**
+- **Two 2.10.0 entry points had no caller anywhere** — `geo_jet_plane_ddistance` and
+  `geo_jet_dpoint`, 2 of the 5 functions in that release's 599/604 coverage gap. Both now have
+  real finite-difference checks (`geo_jet_dpoint` against the motion of the hit **point**, on a
+  sphere rather than a plane so the `dt` term is load-bearing), plus a decode check on
+  `geo_face_axis`/`geo_face_is_max`. Coverage **599/604 (99%) → 617/620 (99%)** over 36/36 files.
+  Reference coverage is a floor, not a correctness proof — but a public entry point with no caller
+  has not cleared even the floor.
+
 ## [2.10.0] - 2026-08-10 — differentiable geometry, and the primal defect it found first
 
 The roadmap's first genuine feature line since 2.8.x: **autodiff through ray–surface intersection**,

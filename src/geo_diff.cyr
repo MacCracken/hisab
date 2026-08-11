@@ -48,7 +48,7 @@
 # repaired `geo_ray_sphere` to carry its leading coefficient: before that, `t`
 # was not degree -1 homogeneous in d and the radial part of this derivative
 # described a function the primal was not computing.
-# See issues/archived/2026-08-10-ray-sphere-capsule-assume-unit-direction.md.
+# See docs/development/issues/archived/2026-08-10-ray-sphere-capsule-assume-unit-direction.md.
 #
 # A caller whose direction is CONSTRAINED to unit length -- which is what
 # `geo_ray_new` produces -- wants only the tangential part, since a radial
@@ -61,25 +61,52 @@
 # LAYOUT
 # ================================================================
 #
-# One fixed 64-byte jet regardless of primitive, with a `kind` tag. The shape
+# One fixed 72-byte jet regardless of primitive, with a `kind` tag. The shape
 # derivative slots are typed by that tag and reached ONLY through per-primitive
 # named accessors -- reading a sphere's radius slot off a plane jet returns the
 # error sentinel rather than that plane's distance derivative. An untyped slot
 # block would make those two indistinguishable at the call site.
+#
+# 2.10.1 added the `face` slot (64 -> 72 bytes), appended so no existing offset
+# moves. It carries geo.cyr's face encoding for the branchy primitives and
+# GEO_FACE_NONE for the smooth ones, which is also what a miss carries.
 
 var GEO_JET_MISS     = 0;
 var GEO_JET_PLANE    = 1;
 var GEO_JET_SPHERE   = 2;
 var GEO_JET_TRIANGLE = 3;
+var GEO_JET_AABB     = 4;
+var GEO_JET_OBB      = 5;
+var GEO_JET_CAPSULE  = 6;
 
 #derive(accessors)
-struct GeoJet { kind; t; dt_do; dt_dd; sv; sv1; sv2; ss; }
+struct GeoJet { kind; t; dt_do; dt_dd; sv; sv1; sv2; ss; face; }
 
 # The shape-parameter slots, typed by `kind` and reachable only through the
 # per-primitive accessors below:
 #   plane     sv = dt/d(normal)   ss = dt/d(distance)
 #   sphere    sv = dt/d(center)   ss = dt/d(radius)
 #   triangle  sv = dt/d(v0)       sv1 = dt/d(v1)      sv2 = dt/d(v2)
+#   aabb      sv = dt/d(min)      sv1 = dt/d(max)     face = the selected face
+#   obb       sv = dt/d(center)   sv1 = dt/d(half_extents)             face = ditto
+#   capsule   sv = dt/d(start)    sv1 = dt/d(end)     ss = dt/d(radius)
+#                                 face = the BRANCH (GEO_CAP_*), not a face
+
+# Component k (0 = x, 1 = y, 2 = z) of an HVec3. Written as branches rather than
+# load64(v + 8*k) so it does not depend on the struct's memory layout.
+fn _geo_jet_comp(v, k) {
+    if (k == 0) { return HVec3_x(v); }
+    if (k == 1) { return HVec3_y(v); }
+    return HVec3_z(v);
+}
+
+# A vector carrying `val` in component k and zero elsewhere. The box gradients
+# are all of this shape: only the axis whose slab was selected moves t.
+fn _geo_jet_axis(k, val) {
+    if (k == 0) { return hvec3_new(val, 0, 0); }
+    if (k == 1) { return hvec3_new(0, val, 0); }
+    return hvec3_new(0, 0, val);
+}
 
 #must_use
 fn _geo_jet_miss() {
@@ -95,6 +122,7 @@ fn _geo_jet_miss() {
     GeoJet_set_sv1(j, hvec3_new(0, 0, 0));
     GeoJet_set_sv2(j, hvec3_new(0, 0, 0));
     GeoJet_set_ss(j, 0);
+    GeoJet_set_face(j, GEO_FACE_NONE);
     return j;
 }
 
@@ -145,6 +173,7 @@ fn geo_jet_sphere(ray, sphere) {
     GeoJet_set_dt_dd(j, hvec3_scale(dt_do, t));
     GeoJet_set_sv(j, hvec3_scale(g, inv));
     GeoJet_set_ss(j, f64_mul(GeoSphere_radius(sphere), inv));
+    GeoJet_set_face(j, GEO_FACE_NONE);
     return j;
 }
 
@@ -184,6 +213,7 @@ fn geo_jet_plane(ray, plane) {
     GeoJet_set_dt_dd(j, hvec3_scale(dt_do, t));
     GeoJet_set_sv(j, hvec3_scale(p, f64_neg(inv)));
     GeoJet_set_ss(j, inv);
+    GeoJet_set_face(j, GEO_FACE_NONE);
     return j;
 }
 
@@ -239,6 +269,247 @@ fn geo_jet_triangle(ray, tri) {
     GeoJet_set_sv1(j, hvec3_scale(hvec3_cross(e2, w), f64_neg(inv)));
     GeoJet_set_sv2(j, hvec3_scale(hvec3_cross(w, e1), f64_neg(inv)));
     GeoJet_set_ss(j, 0);
+    GeoJet_set_face(j, GEO_FACE_NONE);
+    return j;
+}
+
+# Ray-AABB jet. Gradients w.r.t. ray origin, ray direction, box min and box max
+# -- 12 parameters from one intersection.
+#
+# The slab method reduces, once the winning face is known, to a SINGLE plane:
+# with face = 2*k + p, the answer is
+# [measured: tests/modules.tcyr "2.10.1 geo_jet_aabb"]
+#
+#     t = (b_k - o_k) / d_k,   b = min when p = 0, max when p = 1
+#
+# and every other slab contributed only an inequality that decided WHETHER there
+# is a hit, not where. So all four gradients have support on axis k alone:
+# [measured: tests/modules.tcyr "2.10.1 geo_jet_aabb"]
+#
+#     dt/do   : component k = -1/d_k          dt/dd  : component k = -t/d_k
+#     dt/dmin : component k =  1/d_k if p = 0, else the zero vector
+#     dt/dmax : component k =  1/d_k if p = 1, else the zero vector
+#
+# Homogeneity: d . (dt/dd) = d_k * (-t/d_k) = -t, as the shared contract requires.
+#
+# ⚠ EDGES AND CORNERS ARE NOT DIFFERENTIABLE, and this is the whole reason the
+# core reports a tie rather than a face alone. When two slabs achieve the
+# selected extremum exactly, the ray strikes an edge; three, a corner. `t` has a
+# genuine kink there -- the gradient differs on either side -- so returning one
+# side's answer would be a silent wrong number. The miss sentinel comes back
+# instead, which is the same convention geo_jet_sphere uses at grazing incidence.
+#
+# Verified against central differences of the shipped `geo_ray_aabb` over
+# randomised ray/box configurations, both from outside the box and from within
+# it (the inside case returns the EXIT face, and is a different code path).
+# [measured: tests/modules.tcyr "2.10.1 geo_jet_aabb"]
+#must_use
+fn geo_jet_aabb(ray, aabb) {
+    var out = alloc(GEO_FACE_OUT_BYTES);
+    var t = geo_ray_aabb_face(ray, aabb, out);
+    if (t == 0) { return _geo_jet_miss(); }
+
+    var face = load64(out);
+    if (face == GEO_FACE_NONE) { return _geo_jet_miss(); }
+    if (load64(out + 8) == 1) { return _geo_jet_miss(); }   # edge or corner: kink
+
+    var k = geo_face_axis(face);
+    var dk = _geo_jet_comp(GeoRay_direction(ray), k);
+    # The core only assigns a face from a slab it did not skip, so |dk| is already
+    # above EPSILON_F64. Re-checked rather than assumed: this reads `dk` back
+    # through a different path than the one that set the face.
+    if (f64_lt(f64_abs(dk), EPSILON_F64) == 1) { return _geo_jet_miss(); }
+
+    var inv = f64_div(F64_ONE, dk);
+    var zero = hvec3_new(0, 0, 0);
+    var dt_db = _geo_jet_axis(k, inv);
+
+    var j = alloc(sizeof(GeoJet));
+    GeoJet_set_kind(j, GEO_JET_AABB);
+    GeoJet_set_t(j, t);
+    GeoJet_set_dt_do(j, _geo_jet_axis(k, f64_neg(inv)));
+    GeoJet_set_dt_dd(j, _geo_jet_axis(k, f64_neg(f64_mul(t, inv))));
+    if (geo_face_is_max(face) == 0) {
+        GeoJet_set_sv(j, dt_db);
+        GeoJet_set_sv1(j, zero);
+    } else {
+        GeoJet_set_sv(j, zero);
+        GeoJet_set_sv1(j, dt_db);
+    }
+    GeoJet_set_sv2(j, zero);
+    GeoJet_set_ss(j, 0);
+    GeoJet_set_face(j, face);
+    return j;
+}
+
+# ONE local axis, not all three. geo_obb_axes rotates all three unit vectors and
+# allocates a 24-byte array; the jet needs only the selected axis, and this is
+# bit-identical to the entry geo_obb_axes would have written because it is the
+# same call. Measured, bench_batch(2000, 200), mean of three runs:
+# jet_obb 1.083 us -> 872 ns, -19.5%, which takes the jet from 2.2x its primal
+# to 1.8x for all twelve partials.
+# [measured: bench-history.csv jet_obb]
+fn _geo_jet_obb_axis(obb, k) {
+    var q = GeoObb_rotation(obb);
+    if (k == 0) { return hquat_rotate_vec3(q, hvec3_unit_x()); }
+    if (k == 1) { return hquat_rotate_vec3(q, hvec3_unit_y()); }
+    return hquat_rotate_vec3(q, hvec3_unit_z());
+}
+
+# Ray-OBB jet. Gradients w.r.t. ray origin, ray direction, box centre and box
+# half-extents -- 12 parameters from one intersection.
+#
+# Same reduction as the AABB, in the box's own frame. With face = 2*k + p, local
+# axis a_k, e_k = a_k . (c - o), f_k = a_k . d and sg = -1 for p = 0 / +1 for
+# p = 1, the selected plane gives
+#
+#     t = (e_k + sg * he_k) / f_k
+#
+#     dt/do     = -a_k / f_k              dt/dd = -t * a_k / f_k
+#     dt/dcentre = +a_k / f_k             dt/dhalf_extents: component k = sg/f_k
+#
+# Homogeneity: d . (dt/dd) = -t * (a_k . d)/f_k = -t.
+#
+# ⚠ dt/d(rotation) IS DEFERRED, AND THAT IS A SCOPE DECISION, NOT AN OVERSIGHT.
+# The axes come from a unit quaternion, so a free perturbation of an axis leaves
+# the rotation group entirely -- the perturbed "OBB" is not an OBB, and a finite
+# difference of the primal across it measures nothing the caller can use. It is
+# the same objection that made dt/dd a RAW partial with geo_jet_dt_dd_unit
+# offered separately rather than projecting silently: a constrained parameter
+# needs its constraint stated at the call site, not guessed here. A quaternion
+# chain rule is well-defined and is on the roadmap; it is not free, and shipping
+# it untested alongside twelve partials that ARE tested would be the worse trade.
+#
+# Edges and corners behave exactly as for the AABB: the core reports the tie and
+# this returns the miss sentinel.
+#
+# Verified against central differences of the shipped `geo_ray_obb`, over a box
+# rotated off-axis so a mistake that only shows up under rotation cannot hide.
+# [measured: tests/modules.tcyr "2.10.1 geo_jet_obb"]
+#must_use
+fn geo_jet_obb(ray, obb) {
+    var out = alloc(GEO_FACE_OUT_BYTES);
+    var t = geo_ray_obb_face(ray, obb, out);
+    if (t == 0) { return _geo_jet_miss(); }
+
+    var face = load64(out);
+    if (face == GEO_FACE_NONE) { return _geo_jet_miss(); }
+    if (load64(out + 8) == 1) { return _geo_jet_miss(); }   # edge or corner: kink
+
+    var k = geo_face_axis(face);
+    var axis = _geo_jet_obb_axis(obb, k);
+    var fk = hvec3_dot(axis, GeoRay_direction(ray));
+    if (f64_lt(f64_abs(fk), EPSILON_F64) == 1) { return _geo_jet_miss(); }
+
+    var inv = f64_div(F64_ONE, fk);
+    var dt_dc = hvec3_scale(axis, inv);
+    var sg = f64_neg(inv);
+    if (geo_face_is_max(face) == 1) { sg = inv; }
+
+    var j = alloc(sizeof(GeoJet));
+    GeoJet_set_kind(j, GEO_JET_OBB);
+    GeoJet_set_t(j, t);
+    GeoJet_set_dt_do(j, hvec3_scale(axis, f64_neg(inv)));
+    GeoJet_set_dt_dd(j, hvec3_scale(axis, f64_neg(f64_mul(t, inv))));
+    GeoJet_set_sv(j, dt_dc);
+    GeoJet_set_sv1(j, _geo_jet_axis(k, sg));
+    GeoJet_set_sv2(j, hvec3_new(0, 0, 0));
+    GeoJet_set_ss(j, 0);
+    GeoJet_set_face(j, face);
+    return j;
+}
+
+# Ray-capsule jet. Gradients w.r.t. ray origin, ray direction, both endpoints and
+# the radius -- 13 parameters from one intersection.
+#
+# A capsule is three surfaces, and the derivative differs per piece, so the
+# primal reports which one produced the answer and this forms the matching
+# gradient. Both are post-passes on the shipped primal, as everywhere else here.
+#
+# CAPS (and the degenerate start == end case) are a sphere at that endpoint:
+# g = p - endpoint, and the gradients are geo_jet_sphere's, with the gradient
+# w.r.t. the OTHER endpoint identically zero. That is not an approximation --
+# moving the far endpoint does not move this cap.
+#
+# CYLINDER. With a = start, b = end, ab = b - a, u = p - a,
+#   s = (u . ab)/(ab . ab)   and   q = u - s*ab   (the perpendicular component),
+# the surface is F = q.q - r^2, whose gradient in p is 2q -- q is already
+# perpendicular to ab, so the projector leaves it alone. Writing den = q.d:
+#
+#     dt/do = -q/den      dt/dd = t * dt/do      dt/dr = r/den
+#     dt/da = (1 - s) * q/den                    dt/db = s * q/den
+#
+# The endpoint gradients come from dq: the `ds * ab` term drops out of q.dq
+# because q . ab = 0, leaving dF/da = 2(s-1)q and dF/db = -2s q.
+#
+# ⚠ dt/da + dt/db = q/den = -dt/do is an ALGEBRAIC identity of those two
+# expressions -- the s cancels -- so it holds for ANY shared error in them and
+# cannot verify either. Exactly the trap recorded for the triangle's translation
+# identity. It is asserted as a smoke test with that stated; finite differences
+# of the shipped primal are the only real oracle.
+#
+# ⚠ THE CAP/CYLINDER SEAM IS DIFFERENTIABLE, unlike a box edge, so no tie
+# sentinel is reported there. Hemisphere and cylinder are tangent at the seam, so
+# the two branches' gradients agree in the limit: at s = 0, u is already
+# perpendicular to ab so q = u = g, and (1-s) = 1 makes dt/da agree with the
+# cap's +g/(g.d) while dt/db = 0 agrees with the cap's zero. The suite asserts
+# that convergence across the seam rather than taking this paragraph's word.
+#
+# Verified against central differences of the shipped `geo_ray_capsule`, with the
+# fixture required to exercise ALL THREE branches -- a sweep that only ever hits
+# the barrel proves nothing about the caps, and the caps are where 2.10.0's
+# defect lived.
+# [measured: tests/modules.tcyr "2.10.1 geo_jet_capsule"]
+#must_use
+fn geo_jet_capsule(ray, capsule) {
+    var out = alloc(GEO_FACE_OUT_BYTES);
+    var t = geo_ray_capsule_branch(ray, capsule, out);
+    if (t == 0) { return _geo_jet_miss(); }
+
+    var branch = load64(out);
+    if (branch == GEO_FACE_NONE) { return _geo_jet_miss(); }
+
+    var d = GeoRay_direction(ray);
+    var p = geo_ray_at(ray, t);
+    var a = GeoCapsule_start(capsule);
+    var b = GeoCapsule_end(capsule);
+    var r = GeoCapsule_radius(capsule);
+
+    var g = hvec3_sub(p, a);
+    var wa = F64_ONE;               # weight of dt/da
+    var wb = 0;                     # weight of dt/db
+    if (branch == GEO_CAP_END_CAP) {
+        g = hvec3_sub(p, b);
+        wa = 0;
+        wb = F64_ONE;
+    }
+    if (branch == GEO_CAP_CYLINDER) {
+        var ab = hvec3_sub(b, a);
+        var sfrac = f64_div(hvec3_dot(g, ab), hvec3_dot(ab, ab));
+        g = hvec3_sub(g, hvec3_scale(ab, sfrac));
+        wa = f64_sub(F64_ONE, sfrac);
+        wb = sfrac;
+    }
+
+    var den = hvec3_dot(g, d);
+    # Grazing incidence: the ray is tangent to this piece and t is genuinely
+    # non-differentiable. Same convention as geo_jet_sphere.
+    if (f64_lt(f64_abs(den), EPSILON_F64) == 1) { return _geo_jet_miss(); }
+
+    var inv = f64_div(F64_ONE, den);
+    var dt_do = hvec3_scale(g, f64_neg(inv));
+    var back = hvec3_scale(g, inv);      # +g/den, the shared endpoint direction
+
+    var j = alloc(sizeof(GeoJet));
+    GeoJet_set_kind(j, GEO_JET_CAPSULE);
+    GeoJet_set_t(j, t);
+    GeoJet_set_dt_do(j, dt_do);
+    GeoJet_set_dt_dd(j, hvec3_scale(dt_do, t));
+    GeoJet_set_sv(j, hvec3_scale(back, wa));
+    GeoJet_set_sv1(j, hvec3_scale(back, wb));
+    GeoJet_set_sv2(j, hvec3_new(0, 0, 0));
+    GeoJet_set_ss(j, f64_mul(r, inv));
+    GeoJet_set_face(j, branch);
     return j;
 }
 
@@ -272,6 +543,60 @@ fn geo_jet_plane_dnormal(j) {
 fn geo_jet_plane_ddistance(j) {
     if (GeoJet_kind(j) != GEO_JET_PLANE) { return 0; }
     return GeoJet_ss(j);
+}
+
+#must_use
+fn geo_jet_aabb_dmin(j) {
+    if (GeoJet_kind(j) != GEO_JET_AABB) { return 0; }
+    return GeoJet_sv(j);
+}
+
+#must_use
+fn geo_jet_aabb_dmax(j) {
+    if (GeoJet_kind(j) != GEO_JET_AABB) { return 0; }
+    return GeoJet_sv1(j);
+}
+
+#must_use
+fn geo_jet_obb_dcenter(j) {
+    if (GeoJet_kind(j) != GEO_JET_OBB) { return 0; }
+    return GeoJet_sv(j);
+}
+
+# dt/d(half_extents), in the OBB's LOCAL frame -- component k is the extent along
+# local axis k, which is how GeoObb stores it. Only the selected axis is nonzero.
+#must_use
+fn geo_jet_obb_dhalf_extents(j) {
+    if (GeoJet_kind(j) != GEO_JET_OBB) { return 0; }
+    return GeoJet_sv1(j);
+}
+
+#must_use
+fn geo_jet_capsule_dstart(j) {
+    if (GeoJet_kind(j) != GEO_JET_CAPSULE) { return 0; }
+    return GeoJet_sv(j);
+}
+
+#must_use
+fn geo_jet_capsule_dend(j) {
+    if (GeoJet_kind(j) != GEO_JET_CAPSULE) { return 0; }
+    return GeoJet_sv1(j);
+}
+
+#must_use
+fn geo_jet_capsule_dradius(j) {
+    if (GeoJet_kind(j) != GEO_JET_CAPSULE) { return 0; }
+    return GeoJet_ss(j);
+}
+
+# The face the primal selected, in geo.cyr's encoding (2 * axis + plane), or
+# GEO_FACE_NONE for a miss and for the primitives that have no faces. Exposed
+# because a differentiable-rendering caller usually wants the surface normal at
+# the hit, and recomputing it from the hit point reintroduces exactly the
+# edge/corner ambiguity the jet just resolved.
+#must_use
+fn geo_jet_face(j) {
+    return GeoJet_face(j);
 }
 
 #must_use

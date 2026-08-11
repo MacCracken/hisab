@@ -1262,6 +1262,139 @@ fn _homog_bad(t_unit, t_scaled, k) {
     return 1;
 }
 
+# --- 2.10.1: the degenerate-direction contract, over ALL SIX primitives ------
+#
+# Same shape of finding as the homogeneity sweep above, and found the same way:
+# by running 2.10.1's own design requirement against the code that already
+# ships, before writing the feature. A jet needs to know WHICH face the slab
+# method selected, and on a degenerate direction there is no face -- so the
+# question "what does the primal return there?" had to be asked, and the answer
+# for two of the six was +Inf.
+#
+# `geo_ray_aabb` and `geo_ray_obb` skip any slab whose direction component is
+# below EPSILON_F64. With all three skipped, t_min stays -Inf and t_max stays
+# +Inf, and the tail `if (f64_lt(t_max, 0) != 1) { return t_max; }` handed back
+# +Inf -- from functions whose contract is stated three times in geo.cyr as
+# "0 on miss, positive f64 t on hit". geo_ray_at(ray, +Inf) is NaN in every
+# component, so a consumer got NaN geometry with no error anywhere.
+#
+# ⚠ WHY IT SHIPPED, and the reason this is a SWEEP and not two more assertions:
+# the pre-2.10.1 suite tested the zero direction on `geo_ray_sphere` and
+# `geo_ray_capsule` only (the two 2.10.0 repaired), so 4 of the 6 siblings were
+# never asked the question at all. A per-primitive assertion is exactly what
+# leaves that hole; the sweep closes it by construction and the _DD_RUN counter
+# fails if a primitive is ever silently dropped from it.
+#
+# ORACLE-FREE: it asserts against the module's own documented sentinel, not
+# against a reference implementation.
+# [measured: docs/development/issues/archived/2026-08-10-aabb-obb-degenerate-direction.md]
+# --- 2.10.1: homogeneity at SMALL direction scales ---------------------------
+#
+# ⚠ THIS EXISTS BECAUSE THE 2.10.0 SWEEP COULD NOT HAVE CAUGHT WHAT IT MISSED.
+# That sweep scales the direction by k = 2, 0.5 and 7 -- all of order 1, none
+# anywhere near the degenerate-direction guard the SAME release added. So the
+# guard's threshold was never exercised by the assertion written to protect the
+# property the guard can break.
+#
+# It was broken. 2.10.0's guard tested `a = d.d` (a SQUARED length) against
+# EPSILON_F64 (an unsquared tolerance), so every direction shorter than 1e-6 was
+# reported as a miss. A unit sphere at (0,0,5) with d = (0,0,1e-7) has t = 4e7 --
+# finite, exactly representable, and the correct answer that `geo_ray_aabb`,
+# `geo_ray_triangle` and `geo_ray_plane` all returned. `geo_ray_sphere` returned
+# 0, and `geo_ray_capsule` inherited it through its end caps: the same pair, by
+# the same mechanism, as the defect 2.10.0 was fixing.
+#
+# The comparison here is RELATIVE, not the absolute `f64_approx_eq` the
+# order-1 sweep uses -- at k = 1e-9 the t values are ~1e10 and an absolute 1e-8
+# tolerance would fail on ordinary rounding rather than on disagreement.
+# [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
+var _HS_BAD = 0;
+var _HS_RUN = 0;
+fn _homog_rel_bad(t_unit, t_scaled, k) {
+    _HS_RUN = _HS_RUN + 1;
+    if (t_unit == 0) { return 0; }          # miss at unit scale: nothing to check
+    if (t_scaled == 0) { return 1; }        # a real hit must not become a miss
+    var want = f64_div(t_unit, k);
+    var rel = f64_div(f64_abs(f64_sub(t_scaled, want)), f64_abs(want));
+    if (f64_lt(rel, LOOSE_TOL_M) == 1) { return 0; }
+    return 1;
+}
+
+fn _homog_small_sweep() {
+    var o = hvec3_new(f64_neg(f64_from(5)), f64_neg(f64_from(5)), f64_neg(f64_from(5)));
+    var sph = geo_sphere_new(hvec3_new(0, 0, 0), F64_ONE);
+    var pl  = geo_plane_from_point_normal(hvec3_new(0, 0, 0), hvec3_new(0, 0, F64_ONE));
+    var tri = geo_triangle_new(hvec3_new(f64_neg(f64_from(9)), f64_neg(f64_from(9)), 0),
+    hvec3_new(f64_from(9), f64_neg(f64_from(9)), 0), hvec3_new(0, f64_from(9), 0));
+    var ab  = geo_aabb_new(hvec3_new(f64_neg(F64_ONE), f64_neg(F64_ONE), f64_neg(F64_ONE)),
+    hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+    var ob  = geo_obb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_ONE, F64_ONE), hquat_identity());
+    var cap = geo_capsule_new(hvec3_new(0, 0, f64_neg(F64_ONE)), hvec3_new(0, 0, F64_ONE), F64_ONE);
+    # k = 1e-5, 1e-7, 1e-9. The middle one straddles the 2.10.0 guard's threshold;
+    # the outer two bracket it, so a fix that merely moved the threshold a decade
+    # would still fail here.
+    for (var ki = 0; ki < 3; ki = ki + 1) {
+        var k = F64_ONE;
+        var decades = 5;
+        if (ki == 1) { decades = 7; }
+        if (ki == 2) { decades = 9; }
+        for (var i = 0; i < decades; i = i + 1) { k = f64_div(k, f64_from(10)); }
+        var r = geo_ray_new(o, hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+        var du = GeoRay_direction(r);
+        var ts = geo_ray_sphere(r, sph);   var tp = geo_ray_plane(r, pl);
+        var tt = geo_ray_triangle(r, tri); var ta = geo_ray_aabb(r, ab);
+        var to = geo_ray_obb(r, ob);       var tc = geo_ray_capsule(r, cap);
+        GeoRay_set_direction(r, hvec3_scale(du, k));
+        _HS_BAD = _HS_BAD + _homog_rel_bad(ts, geo_ray_sphere(r, sph), k);
+        _HS_BAD = _HS_BAD + _homog_rel_bad(tp, geo_ray_plane(r, pl), k);
+        _HS_BAD = _HS_BAD + _homog_rel_bad(tt, geo_ray_triangle(r, tri), k);
+        _HS_BAD = _HS_BAD + _homog_rel_bad(ta, geo_ray_aabb(r, ab), k);
+        _HS_BAD = _HS_BAD + _homog_rel_bad(to, geo_ray_obb(r, ob), k);
+        _HS_BAD = _HS_BAD + _homog_rel_bad(tc, geo_ray_capsule(r, cap), k);
+    }
+    return 0;
+}
+
+var _DD_BAD = 0;
+var _DD_RUN = 0;
+fn _degen_bad(t) {
+    _DD_RUN = _DD_RUN + 1;
+    if (t == 0) { return 0; }
+    return 1;
+}
+
+fn _degen_sweep() {
+    var zero = hvec3_new(0, 0, 0);
+    var bmin = hvec3_new(f64_neg(F64_ONE), f64_neg(F64_ONE), f64_neg(F64_ONE));
+    var bmax = hvec3_new(F64_ONE, F64_ONE, F64_ONE);
+    var ab  = geo_aabb_new(bmin, bmax);
+    var ob  = geo_obb_new(zero, hvec3_new(F64_ONE, F64_ONE, F64_ONE), hquat_identity());
+    var sph = geo_sphere_new(zero, F64_ONE);
+    var pl  = geo_plane_from_point_normal(zero, hvec3_new(0, 0, F64_ONE));
+    var tri = geo_triangle_new(hvec3_new(f64_neg(F64_ONE), f64_neg(F64_ONE), 0),
+    hvec3_new(f64_from(3), f64_neg(F64_ONE), 0), hvec3_new(f64_neg(F64_ONE), f64_from(3), 0));
+    var cap = geo_capsule_new(hvec3_new(0, 0, f64_neg(F64_ONE)),
+    hvec3_new(0, 0, F64_ONE), F64_ONE);
+
+    # Both origin positions: the +Inf path needed the origin INSIDE (outside,
+    # the parallel-slab branch already returned 0), so a sweep that only ever
+    # fired rays from outside would have reproduced nothing.
+    for (var pi = 0; pi < 2; pi = pi + 1) {
+        var o = zero;
+        if (pi == 1) { o = hvec3_new(f64_from(9), f64_from(9), f64_from(9)); }
+        var r = alloc(sizeof(GeoRay));
+        GeoRay_set_origin(r, o);
+        GeoRay_set_direction(r, hvec3_new(0, 0, 0));
+        _DD_BAD = _DD_BAD + _degen_bad(geo_ray_aabb(r, ab));
+        _DD_BAD = _DD_BAD + _degen_bad(geo_ray_obb(r, ob));
+        _DD_BAD = _DD_BAD + _degen_bad(geo_ray_sphere(r, sph));
+        _DD_BAD = _DD_BAD + _degen_bad(geo_ray_plane(r, pl));
+        _DD_BAD = _DD_BAD + _degen_bad(geo_ray_triangle(r, tri));
+        _DD_BAD = _DD_BAD + _degen_bad(geo_ray_capsule(r, cap));
+    }
+    return 0;
+}
+
 var _HG_BAD = 0;
 var _HG_RUN = 0;
 fn _homog_sweep() {
@@ -1409,10 +1542,565 @@ fn _jt_comp(v, i) {
     return HVec3_z(v);
 }
 
+# --- 2.10.1: geo_jet_aabb against central differences of the shipped primal ---
+#
+# which: 0 = ray origin, 1 = ray direction, 2 = box min, 3 = box max.
+fn _jt_fd_aabb(o, d, bmin, bmax, which, i) {
+    var lo = 0;
+    var hi = 0;
+    for (var side = 0; side < 2; side = side + 1) {
+        var h = _JT_H;
+        if (side == 0) { h = f64_neg(_JT_H); }
+        var oo = o; var dd = d; var mn = bmin; var mx = bmax;
+        if (which == 0) { oo = _jt_bump(o, i, h); }
+        if (which == 1) { dd = _jt_bump(d, i, h); }
+        if (which == 2) { mn = _jt_bump(bmin, i, h); }
+        if (which == 3) { mx = _jt_bump(bmax, i, h); }
+        var ray = geo_ray_new(oo, dd);
+        GeoRay_set_direction(ray, dd);          # keep the perturbation unnormalised
+        # ⚠ geo_aabb_new applies hvec3_min/hvec3_max to its two corners, so
+        # perturbing "min" cannot be tested through it -- it would silently
+        # re-sort. The struct is written directly so the perturbed corner stays
+        # the corner it was.
+        var box = alloc(sizeof(GeoAabb));
+        GeoAabb_set_min(box, mn);
+        GeoAabb_set_max(box, mx);
+        var tv = geo_ray_aabb(ray, box);
+        if (side == 0) { lo = tv; } else { hi = tv; }
+    }
+    if (lo == 0) { return _GEO_JT_SKIP; }
+    if (hi == 0) { return _GEO_JT_SKIP; }
+    return f64_div(f64_sub(hi, lo), f64_mul(F64_TWO, _JT_H));
+}
+
+var _JA_FACES = 0;      # bitmask of which of the 6 faces the sweep actually hit
+var _JO_FACES = 0;      # ditto, for the OBB
+var _JC_BRANCH = 0;     # bitmask of the capsule BRANCHES the sweep exercised
+
+# which: 0 = origin, 1 = direction, 2 = start, 3 = end, 4 = radius.
+fn _jt_fd_capsule(o, d, ca, cb, r, which, i) {
+    var lo = 0;
+    var hi = 0;
+    for (var side = 0; side < 2; side = side + 1) {
+        var h = _JT_H;
+        if (side == 0) { h = f64_neg(_JT_H); }
+        var oo = o; var dd = d; var aa = ca; var bb = cb; var rr = r;
+        if (which == 0) { oo = _jt_bump(o, i, h); }
+        if (which == 1) { dd = _jt_bump(d, i, h); }
+        if (which == 2) { aa = _jt_bump(ca, i, h); }
+        if (which == 3) { bb = _jt_bump(cb, i, h); }
+        if (which == 4) { rr = f64_add(r, h); }
+        var ray = geo_ray_new(oo, dd);
+        GeoRay_set_direction(ray, dd);
+        var tv = geo_ray_capsule(ray, geo_capsule_new(aa, bb, rr));
+        if (side == 0) { lo = tv; } else { hi = tv; }
+    }
+    if (lo == 0) { return _GEO_JT_SKIP; }
+    if (hi == 0) { return _GEO_JT_SKIP; }
+    return f64_div(f64_sub(hi, lo), f64_mul(F64_TWO, _JT_H));
+}
+
+fn _jt_capsule_sweep() {
+    var ca = hvec3_new(0, 0, 0);
+    var cb = hvec3_new(0, 0, f64_from(3));
+    # ⚠ RADIUS MUST NOT BE 1 -- dt/dradius is r/den, and at r = 1 a mutant that
+    # drops the radius factor is indistinguishable. That mutant SURVIVED the
+    # first draft of the 2.10.0 sphere fixture; the lesson is applied up front here.
+    var r = f64_div(f64_from(3), F64_TWO);
+    var cap = geo_capsule_new(ca, cb, r);
+
+    # Origins chosen to reach all three branches. Barrel: side-on at mid height.
+    # Start cap: below z = 0 aiming up. End cap: above z = 3 aiming down. The
+    # branch bitmask below asserts they actually did, rather than trusting this
+    # comment -- a fixture that only ever hits the barrel proves nothing about the
+    # caps, and the caps are where 2.10.0's defect lived.
+    var oc = alloc(64);
+    store64(oc,      hvec3_new(f64_neg(f64_from(6)), f64_div(F64_ONE, f64_from(4)),
+    f64_div(f64_from(3), F64_TWO)));
+    store64(oc + 8,  hvec3_new(f64_from(5), f64_neg(F64_ONE), F64_ONE));
+    store64(oc + 16, hvec3_new(f64_div(F64_ONE, f64_from(4)), f64_div(F64_ONE, f64_from(8)),
+    f64_neg(f64_from(7))));
+    store64(oc + 24, hvec3_new(f64_neg(F64_ONE), f64_div(F64_ONE, f64_from(4)), f64_from(9)));
+    store64(oc + 32, hvec3_new(f64_from(4), f64_from(4), f64_neg(f64_from(4))));
+    var tg = alloc(64);
+    store64(tg,      hvec3_new(0, 0, f64_div(f64_from(3), F64_TWO)));
+    store64(tg + 8,  hvec3_new(0, 0, F64_TWO));
+    store64(tg + 16, hvec3_new(0, 0, f64_neg(f64_div(F64_ONE, F64_TWO))));
+    store64(tg + 24, hvec3_new(0, 0, f64_add(f64_from(3), f64_div(F64_ONE, F64_TWO))));
+    store64(tg + 32, hvec3_new(0, 0, 0));
+
+    for (var oi = 0; oi < 5; oi = oi + 1) {
+        var o = load64(oc + oi * 8);
+        var d = hvec3_sub(load64(tg + oi * 8), o);
+        var ray = geo_ray_new(o, d);
+        GeoRay_set_direction(ray, d);
+        var j = geo_jet_capsule(ray, cap);
+        if (geo_jet_hit(j) == 1) {
+            _JC_BRANCH = _JC_BRANCH | (1 << geo_jet_face(j));
+            for (var k = 0; k < 3; k = k + 1) {
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(GeoJet_dt_do(j), k),
+                _jt_fd_capsule(o, d, ca, cb, r, 0, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(GeoJet_dt_dd(j), k),
+                _jt_fd_capsule(o, d, ca, cb, r, 1, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(geo_jet_capsule_dstart(j), k),
+                _jt_fd_capsule(o, d, ca, cb, r, 2, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(geo_jet_capsule_dend(j), k),
+                _jt_fd_capsule(o, d, ca, cb, r, 3, k));
+            }
+            _JT_BAD = _JT_BAD + _jt_cmp(geo_jet_capsule_dradius(j),
+            _jt_fd_capsule(o, d, ca, cb, r, 4, 0));
+        }
+    }
+    return 0;
+}
+
+# which: 0 = ray origin, 1 = ray direction, 2 = box centre, 3 = half-extents.
+fn _jt_fd_obb(o, d, c, he, q, which, i) {
+    var lo = 0;
+    var hi = 0;
+    for (var side = 0; side < 2; side = side + 1) {
+        var h = _JT_H;
+        if (side == 0) { h = f64_neg(_JT_H); }
+        var oo = o; var dd = d; var cc = c; var hh = he;
+        if (which == 0) { oo = _jt_bump(o, i, h); }
+        if (which == 1) { dd = _jt_bump(d, i, h); }
+        if (which == 2) { cc = _jt_bump(c, i, h); }
+        if (which == 3) { hh = _jt_bump(he, i, h); }
+        var ray = geo_ray_new(oo, dd);
+        GeoRay_set_direction(ray, dd);
+        var tv = geo_ray_obb(ray, geo_obb_new(cc, hh, q));
+        if (side == 0) { lo = tv; } else { hi = tv; }
+    }
+    if (lo == 0) { return _GEO_JT_SKIP; }
+    if (hi == 0) { return _GEO_JT_SKIP; }
+    return f64_div(f64_sub(hi, lo), f64_mul(F64_TWO, _JT_H));
+}
+
+fn _jt_obb_sweep() {
+    # ⚠ THE BOX MUST BE ROTATED. Under the identity quaternion the local axes are
+    # the world axes, and an axis mix-up between the face encoding and the
+    # gradient is invisible -- the two happen to agree. Rotated about (1,1,1) by
+    # ~0.6 rad, all three local axes are distinct from all three world axes.
+    var q = hquat_from_axis_angle(hvec3_normalize(hvec3_new(F64_ONE, F64_ONE, F64_ONE)),
+    f64_div(f64_from(3), f64_from(5)));
+    var c = hvec3_new(F64_ONE, f64_neg(F64_TWO), f64_div(F64_ONE, F64_TWO));
+    # Not a cube: dt/dhalf_extents picks out one component, and equal extents
+    # would let a wrong component pass.
+    var he = hvec3_new(f64_div(f64_from(3), F64_TWO), F64_ONE, f64_from(2));
+    var obb = geo_obb_new(c, he, q);
+    var axes = geo_obb_axes(obb);
+
+    for (var oi = 0; oi < 7; oi = oi + 1) {
+        # Six origins, one beyond each LOCAL face, aimed back at the centre, so
+        # every (axis, plane) encoding is exercised. oi = 6 starts INSIDE, which
+        # returns t_max and the exit face -- the other core branch.
+        var o = c;
+        var d = hvec3_new(F64_TWO, F64_ONE, f64_div(F64_ONE, f64_from(3)));
+        if (oi < 6) {
+            var ax = load64(axes + (oi / 2) * 8);
+            var reach = f64_from(9);
+            if (oi % 2 == 0) { reach = f64_neg(reach); }
+            o = hvec3_add(c, hvec3_scale(ax, reach));
+            d = hvec3_sub(c, o);
+        }
+        var ray = geo_ray_new(o, d);
+        GeoRay_set_direction(ray, d);
+        var j = geo_jet_obb(ray, obb);
+        if (geo_jet_hit(j) == 1) {
+            _JO_FACES = _JO_FACES | (1 << geo_jet_face(j));
+            for (var k = 0; k < 3; k = k + 1) {
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(GeoJet_dt_do(j), k),
+                _jt_fd_obb(o, d, c, he, q, 0, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(GeoJet_dt_dd(j), k),
+                _jt_fd_obb(o, d, c, he, q, 1, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(geo_jet_obb_dcenter(j), k),
+                _jt_fd_obb(o, d, c, he, q, 2, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(geo_jet_obb_dhalf_extents(j), k),
+                _jt_fd_obb(o, d, c, he, q, 3, k));
+            }
+        }
+    }
+    return 0;
+}
+
+fn _jt_aabb_sweep() {
+    # A box that is NOT centred at the origin and NOT a cube, so dt/dmin and
+    # dt/dmax are numerically distinguishable and an axis mix-up cannot hide
+    # behind symmetry.
+    var bmin = hvec3_new(f64_neg(F64_ONE), f64_neg(F64_TWO), f64_div(F64_ONE, F64_TWO));
+    var bmax = hvec3_new(f64_from(3), F64_ONE, f64_from(4));
+    var box = geo_aabb_new(bmin, bmax);
+    var cen = geo_aabb_center(box);
+
+    # Six origins, one well outside each face, each aimed at the box centre so the
+    # ray enters through THAT face -- all six (axis, plane) encodings exercised.
+    # A sweep that only ever hits +x would pass with the axis mapping wrong.
+    var oc = alloc(64);
+    store64(oc,      hvec3_new(f64_neg(f64_from(9)), 0, F64_TWO));
+    store64(oc + 8,  hvec3_new(f64_from(11), 0, F64_TWO));
+    store64(oc + 16, hvec3_new(F64_ONE, f64_neg(f64_from(9)), F64_TWO));
+    store64(oc + 24, hvec3_new(F64_ONE, f64_from(9), F64_TWO));
+    store64(oc + 32, hvec3_new(F64_ONE, 0, f64_neg(f64_from(9))));
+    store64(oc + 40, hvec3_new(F64_ONE, 0, f64_from(12)));
+
+    for (var oi = 0; oi < 7; oi = oi + 1) {
+        # oi = 6 is the origin INSIDE the box: the primal then returns t_max and
+        # the EXIT face, a different branch of the core. Without it a mutant that
+        # reports the entry face on the inside path survives -- and that mutant is
+        # exactly what the two-face-register design risks.
+        var o = cen;
+        var d = hvec3_new(F64_TWO, F64_ONE, f64_div(F64_ONE, f64_from(3)));
+        if (oi < 6) {
+            o = load64(oc + oi * 8);
+            d = hvec3_sub(cen, o);
+        }
+        var ray = geo_ray_new(o, d);
+        GeoRay_set_direction(ray, d);
+        var j = geo_jet_aabb(ray, box);
+        if (geo_jet_hit(j) == 1) {
+            var f = geo_jet_face(j);
+            _JA_FACES = _JA_FACES | (1 << f);
+            for (var k = 0; k < 3; k = k + 1) {
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(GeoJet_dt_do(j), k),
+                _jt_fd_aabb(o, d, bmin, bmax, 0, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(GeoJet_dt_dd(j), k),
+                _jt_fd_aabb(o, d, bmin, bmax, 1, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(geo_jet_aabb_dmin(j), k),
+                _jt_fd_aabb(o, d, bmin, bmax, 2, k));
+                _JT_BAD = _JT_BAD + _jt_cmp(_jt_comp(geo_jet_aabb_dmax(j), k),
+                _jt_fd_aabb(o, d, bmin, bmax, 3, k));
+            }
+        }
+    }
+    return 0;
+}
+
 test_group("2.10.0 geo_jet_sphere: every gradient matches central differences of the primal");
 _jt_sphere_sweep();
 assert_gt(_JT_RUN, 40, "the sphere jet sweep actually compared a useful number of samples");
 assert_eq(_JT_BAD, 0, "geo_jet_sphere: dt/do, dt/dd, dt/dcenter, dt/dradius all match FD");
+
+test_group("2.10.1 geo_jet_aabb: every gradient matches central differences of the primal");
+_jt_aabb_sweep();
+assert_gt(_JT_RUN, 100, "the aabb jet sweep actually compared a useful number of samples");
+assert_eq(_JT_BAD, 0, "geo_jet_aabb: dt/do, dt/dd, dt/dmin, dt/dmax all match FD");
+# ⚠ FIXTURE DISCRIMINATION, asserted rather than assumed. All six (axis, plane)
+# encodings must actually occur, or a wrong axis mapping passes on the faces the
+# sweep happens to miss. 0x3F is faces 0..5.
+assert_eq(_JA_FACES, 0x3F, "the aabb jet sweep hit all six faces, not a subset");
+
+# ⚠ EDGES AND CORNERS: the primal still answers, the JET must not.
+# `t` has a genuine kink where two slabs tie -- the selected face differs on
+# either side, so the gradient does too -- and returning whichever side the
+# f64_max happened to land on would be a silent wrong number. This is the same
+# convention geo_jet_sphere uses at grazing incidence.
+#
+# Both fixtures tie EXACTLY in floating point, not approximately: the arithmetic
+# is (-1 - -2)/1 on each axis, which is 1.0 with no rounding. An approximate tie
+# is a near-edge hit, which IS differentiable and is correctly not reported.
+var jab = geo_aabb_new(hvec3_new(f64_neg(F64_ONE), f64_neg(F64_ONE), f64_neg(F64_ONE)),
+hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+var j_edge = geo_ray_new(hvec3_new(f64_neg(F64_TWO), f64_neg(F64_TWO), 0),
+hvec3_new(F64_ONE, F64_ONE, 0));
+GeoRay_set_direction(j_edge, hvec3_new(F64_ONE, F64_ONE, 0));
+assert(f64_approx_eq(geo_ray_aabb(j_edge, jab), F64_ONE, LOOSE_TOL_M),
+"aabb edge hit: the PRIMAL still returns t = 1, so the jet is refusing a real hit");
+assert_eq(geo_jet_hit(geo_jet_aabb(j_edge, jab)), 0,
+"geo_jet_aabb on an exact EDGE returns the miss sentinel, not one side's gradient");
+
+var j_corner = geo_ray_new(hvec3_new(f64_neg(F64_TWO), f64_neg(F64_TWO), f64_neg(F64_TWO)),
+hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+GeoRay_set_direction(j_corner, hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+assert(f64_approx_eq(geo_ray_aabb(j_corner, jab), F64_ONE, LOOSE_TOL_M),
+"aabb corner hit: the PRIMAL still returns t = 1");
+assert_eq(geo_jet_hit(geo_jet_aabb(j_corner, jab)), 0,
+"geo_jet_aabb on an exact CORNER returns the miss sentinel");
+
+# ⚠ TWO MORE WAYS TO TIE, and both shipped WRONG in 2.10.1's first draft. They
+# were found by an independent derivation commissioned against the finished
+# code, not by this suite -- recorded because that is the whole reason the check
+# was commissioned, and because both are ways an edge hides that "two slabs
+# achieve the extremum" does not describe.
+#
+# (1) ZERO-WIDTH SLAB. With min_k == max_k the two faces of that axis coincide,
+#     so t1 == t2 and the primal's swap never runs (f64_gt is false on equality).
+#     The face was therefore labelled the MIN slot unconditionally -- correct only
+#     when d_k > 0. MEASURED on the draft: flat box, d_x = -1, the jet reported
+#     dt/dmin_x = -1 and dt/dmax_x = 0 where the one-sided truth is the exact
+#     reverse. Half of all flat-box configurations, with tie = 0 asserting
+#     differentiability. It is reported as a tie rather than relabelled because t
+#     is genuinely not two-sided differentiable there: widening min and widening
+#     max give different answers and a central difference averages them to 0.5.
+#     ⚠ The per-slab guard first written for this was DELETED as dead code: a
+#     zero-width slab pins t_min and t_max to the same value, so the tangential
+#     guard below already covers it. Mutation-measured — removing the per-slab
+#     guard changed nothing, removing the tangential one broke both fixtures.
+#     [measured: docs/development/issues/archived/2026-08-10-jet-tie-blind-to-degenerate-slabs.md]
+var jfb = alloc(sizeof(GeoAabb));
+GeoAabb_set_min(jfb, hvec3_new(0, 0, 0));
+GeoAabb_set_max(jfb, hvec3_new(0, F64_ONE, F64_ONE));   # ZERO x extent
+for (var fs = 0; fs < 2; fs = fs + 1) {
+    var fo = hvec3_new(F64_ONE, F64_HALF, F64_HALF);
+    var fd = hvec3_new(f64_neg(F64_ONE), 0, 0);
+    if (fs == 1) {
+        fo = hvec3_new(f64_neg(F64_ONE), F64_HALF, F64_HALF);
+        fd = hvec3_new(F64_ONE, 0, 0);
+    }
+    var fr = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(fr, fo);
+    GeoRay_set_direction(fr, fd);
+    # BOTH directions asserted: the d_x > 0 case was already right by luck, so a
+    # fixture testing only that one passes on the broken code.
+    assert(f64_approx_eq(geo_ray_aabb(fr, jfb), F64_ONE, LOOSE_TOL_M),
+    "flat-box fixture: the PRIMAL returns t = 1, so the jet is refusing a real hit");
+    assert_eq(geo_jet_hit(geo_jet_aabb(fr, jfb)), 0,
+    "geo_jet_aabb on a ZERO-WIDTH slab returns the miss sentinel, either direction");
+}
+
+# (2) TANGENTIAL CLIP, t_min == t_max with DIFFERENT slabs owning the two ends.
+#     The ray grazes: entry and exit coincide and the hit sits on the BOUNDARY of
+#     the hit set, where an arbitrarily small sideways perturbation makes it a
+#     miss. The per-slab tie cannot see this -- it compares near against near and
+#     far against far, never t_min against t_max.
+#
+# ⚠ THE FIRST FIXTURE WRITTEN FOR THIS WAS NOT TANGENTIAL AT ALL. Origin
+# (-1, 2, 0.5) with direction (1, -1, 0) gives t_min = 1, t_max = 2 -- an
+# ordinary EDGE hit, already covered by the per-slab tie. It passed, which is
+# exactly the failure mode: a fixture that tests something already tested and
+# reads as though it tested something new. The fixture below is the real thing:
+# x owns t_min = 1, y owns t_max = 1, and neither slab ties against the running
+# value, so removing the t_min == t_max guard flips it to a confident gradient.
+# Measured both ways before this comment was written.
+# [measured: docs/development/issues/archived/2026-08-10-jet-tie-blind-to-degenerate-slabs.md]
+var jub = geo_aabb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+var jtc = alloc(sizeof(GeoRay));
+GeoRay_set_origin(jtc, hvec3_new(f64_neg(F64_ONE), F64_ONE, F64_HALF));
+GeoRay_set_direction(jtc, hvec3_new(F64_ONE, f64_neg(F64_ONE), 0));
+assert(f64_approx_eq(geo_ray_aabb(jtc, jub), F64_ONE, LOOSE_TOL_M),
+"tangential-clip fixture: the PRIMAL returns t = 1, so the jet is refusing a real hit");
+assert_eq(geo_jet_hit(geo_jet_aabb(jtc, jub)), 0,
+"geo_jet_aabb on a TANGENTIAL clip (t_min == t_max, different slabs) returns the miss sentinel");
+
+# The OBB carries both guards too -- he_k == 0 is its zero-width slab.
+var jfo = geo_obb_new(hvec3_new(0, 0, 0), hvec3_new(0, F64_ONE, F64_ONE), hquat_identity());
+for (var os = 0; os < 2; os = os + 1) {
+    var oo = hvec3_new(F64_TWO, 0, 0);
+    var od = hvec3_new(f64_neg(F64_ONE), 0, 0);
+    if (os == 1) { oo = hvec3_new(f64_neg(F64_TWO), 0, 0); od = hvec3_new(F64_ONE, 0, 0); }
+    var orr = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(orr, oo);
+    GeoRay_set_direction(orr, od);
+    assert(f64_approx_eq(geo_ray_obb(orr, jfo), F64_TWO, LOOSE_TOL_M),
+    "flat-OBB fixture: the PRIMAL returns t = 2");
+    assert_eq(geo_jet_hit(geo_jet_obb(orr, jfo)), 0,
+    "geo_jet_obb on a ZERO half-extent returns the miss sentinel, either direction");
+}
+
+# And the wrapper equivalence the whole split rests on: geo_ray_aabb must return
+# EXACTLY what geo_ray_aabb_face does, bit for bit, on the same input. Asserted
+# on a face-crossing ray rather than a trivial one.
+var jwo = alloc(GEO_FACE_OUT_BYTES);
+var jwr = geo_ray_new(hvec3_new(f64_neg(f64_from(4)), f64_div(F64_ONE, F64_TWO), f64_from(3)),
+hvec3_new(F64_TWO, f64_neg(F64_ONE), f64_neg(F64_TWO)));
+assert_eq(geo_ray_aabb(jwr, jab), geo_ray_aabb_face(jwr, jab, jwo),
+"geo_ray_aabb is bit-identical to geo_ray_aabb_face with out = 0");
+
+test_group("2.10.1 geo_jet_obb: every gradient matches central differences of the primal");
+_jt_obb_sweep();
+assert_eq(_JT_BAD, 0, "geo_jet_obb: dt/do, dt/dd, dt/dcenter, dt/dhalf_extents all match FD");
+assert_gt(_JT_RUN, 180, "the obb jet sweep added its own comparisons on top of the aabb ones");
+assert_eq(_JO_FACES, 0x3F, "the obb jet sweep hit all six LOCAL faces, not a subset");
+
+var jwo2 = alloc(GEO_FACE_OUT_BYTES);
+var job = geo_obb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_TWO, F64_ONE),
+hquat_from_axis_angle(hvec3_unit_y(), f64_div(F64_ONE, F64_TWO)));
+var jwr2 = geo_ray_new(hvec3_new(f64_neg(f64_from(4)), f64_div(F64_ONE, F64_TWO), f64_from(3)),
+hvec3_new(F64_TWO, f64_neg(F64_ONE), f64_neg(F64_TWO)));
+assert_eq(geo_ray_obb(jwr2, job), geo_ray_obb_face(jwr2, job, jwo2),
+"geo_ray_obb is bit-identical to geo_ray_obb_face with out = 0");
+
+# OBB edges and corners, same contract as the AABB. ⚠ THIS FIXTURE USES THE
+# IDENTITY ROTATION ON PURPOSE, which is exactly what the FD sweep above forbids
+# -- for a different reason. There the rotation must be non-trivial so an axis
+# mix-up cannot hide; here the point is an EXACT floating-point tie, and only
+# axis-aligned arithmetic ((1,0,0).(2,2,0) - 1)/1 = 1.0 gives one with no
+# rounding. A rotated box ties only approximately, which is a NEAR-edge hit --
+# differentiable, and correctly not reported. Two fixtures, two jobs.
+var job_e = geo_obb_new(hvec3_new(0, 0, 0), hvec3_new(F64_ONE, F64_ONE, F64_ONE),
+hquat_identity());
+var jer = geo_ray_new(hvec3_new(f64_neg(F64_TWO), f64_neg(F64_TWO), 0),
+hvec3_new(F64_ONE, F64_ONE, 0));
+GeoRay_set_direction(jer, hvec3_new(F64_ONE, F64_ONE, 0));
+assert(f64_approx_eq(geo_ray_obb(jer, job_e), F64_ONE, LOOSE_TOL_M),
+"obb edge hit: the PRIMAL still returns t = 1, so the jet is refusing a real hit");
+assert_eq(geo_jet_hit(geo_jet_obb(jer, job_e)), 0,
+"geo_jet_obb on an exact EDGE returns the miss sentinel, not one side's gradient");
+
+var jcr = geo_ray_new(hvec3_new(f64_neg(F64_TWO), f64_neg(F64_TWO), f64_neg(F64_TWO)),
+hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+GeoRay_set_direction(jcr, hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+assert(f64_approx_eq(geo_ray_obb(jcr, job_e), F64_ONE, LOOSE_TOL_M),
+"obb corner hit: the PRIMAL still returns t = 1");
+assert_eq(geo_jet_hit(geo_jet_obb(jcr, job_e)), 0,
+"geo_jet_obb on an exact CORNER returns the miss sentinel");
+
+test_group("2.10.1 geo_jet_capsule: every gradient matches central differences of the primal");
+_jt_capsule_sweep();
+assert_eq(_JT_BAD, 0,
+"geo_jet_capsule: dt/do, dt/dd, dt/dstart, dt/dend, dt/dradius all match FD");
+# ⚠ ALL THREE BRANCHES, asserted. 0b0111 = cylinder | start cap | end cap.
+assert_eq(_JC_BRANCH, 0x7, "the capsule jet sweep exercised the barrel AND both caps");
+
+# ⚠ Smoke test only, and labelled as one: dt/dstart + dt/dend == -dt/do holds
+# because (1-s) + s = 1 cancels algebraically, so it survives ANY shared error in
+# the two endpoint expressions. Same trap as the triangle's translation identity.
+# The FD sweep above is the oracle; this is here because a reader expects it.
+var jcap = geo_capsule_new(hvec3_new(0, 0, 0), hvec3_new(0, 0, f64_from(3)),
+f64_div(f64_from(3), F64_TWO));
+var jcray = geo_ray_new(hvec3_new(f64_neg(f64_from(6)), f64_div(F64_ONE, f64_from(4)),
+f64_div(f64_from(3), F64_TWO)), hvec3_new(F64_ONE, 0, 0));
+var jcj = geo_jet_capsule(jcray, jcap);
+assert_eq(geo_jet_hit(jcj), 1, "the capsule translation-identity fixture actually hits");
+var jcsum = hvec3_add(geo_jet_capsule_dstart(jcj), geo_jet_capsule_dend(jcj));
+assert(f64_approx_eq(hvec3_length(hvec3_add(jcsum, GeoJet_dt_do(jcj))), 0, LOOSE_TOL_M),
+"capsule: dt/dstart + dt/dend == -dt/do (translating both endpoints == translating the ray)");
+
+# THE SEAM IS DIFFERENTIABLE, and this measures the RATE at which the two
+# branches agree rather than checking one offset against one tolerance.
+#
+# Two rays either side of z = 0 land on different branches -- the barrel just
+# above, the start cap just below. A C1 surface makes the gradient gap shrink
+# LINEARLY with the offset; a merely-continuous one leaves an O(1) gap that no
+# single-offset tolerance test distinguishes from a tight one. Measured: the gap
+# falls by exactly one decade per decade of offset, from 1.7e-8 at dz = 1e-8 to
+# 1.7e-10 at 1e-10 and below print precision by 1e-13.
+# [measured: CHANGELOG.md 2.10.1, the seam convergence table]
+#
+# ⚠ The first draft of this assertion used dz = 1e-7 against LOOSE_TOL_M (1e-8)
+# and FAILED -- correctly, because the true gap there is 6.7e-8. The fixture was
+# wrong, not the code, and the way that was established was to measure the gap at
+# eleven offsets and look at the slope. A rate assertion is what should have been
+# written first: it cannot be satisfied by loosening a tolerance.
+# [measured: CHANGELOG.md 2.10.1, "the capsule seam is C1" convergence table]
+#
+# A box edge fails exactly this test, which is why the box jets return the miss
+# sentinel there and this one does not.
+fn _jc_seam_gap(dz) {
+    var dir = hvec3_new(F64_ONE, 0, 0);
+    var cp = geo_capsule_new(hvec3_new(0, 0, 0), hvec3_new(0, 0, f64_from(3)),
+    f64_div(f64_from(3), F64_TWO));
+    var ru = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(ru, hvec3_new(f64_neg(f64_from(6)), 0, dz));
+    GeoRay_set_direction(ru, dir);
+    var rd = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(rd, hvec3_new(f64_neg(f64_from(6)), 0, f64_neg(dz)));
+    GeoRay_set_direction(rd, dir);
+    var ju = geo_jet_capsule(ru, cp);
+    var jd = geo_jet_capsule(rd, cp);
+    if (geo_jet_face(ju) != GEO_CAP_CYLINDER) { return f64_neg(F64_ONE); }
+    if (geo_jet_face(jd) != GEO_CAP_START_CAP) { return f64_neg(F64_ONE); }
+    var g = hvec3_length(hvec3_sub(GeoJet_dt_do(ju), GeoJet_dt_do(jd)));
+    g = f64_add(g, hvec3_length(hvec3_sub(geo_jet_capsule_dstart(ju),
+    geo_jet_capsule_dstart(jd))));
+    g = f64_add(g, hvec3_length(hvec3_sub(geo_jet_capsule_dend(ju),
+    geo_jet_capsule_dend(jd))));
+    return f64_add(g, f64_abs(f64_sub(geo_jet_capsule_dradius(ju),
+    geo_jet_capsule_dradius(jd))));
+}
+
+var _seam_far = F64_ONE;
+for (var i = 0; i < 8; i = i + 1) { _seam_far = f64_div(_seam_far, f64_from(10)); }
+var _seam_near = _seam_far;
+for (var i = 0; i < 2; i = i + 1) { _seam_near = f64_div(_seam_near, f64_from(10)); }
+var _g_far = _jc_seam_gap(_seam_far);
+var _g_near = _jc_seam_gap(_seam_near);
+assert(f64_gt(_g_far, 0) == 1,
+"capsule seam: the two offsets land on the barrel and the cap respectively, and the gap is real");
+# A hundredfold smaller offset must give at least a fiftyfold smaller gap. C0
+# would plateau; C1 gives exactly 100x, so this passes with 2x of margin.
+# [measured: CHANGELOG.md 2.10.1, the seam convergence table]
+assert(f64_lt(f64_mul(_g_near, f64_from(50)), _g_far) == 1,
+"capsule seam: the barrel/cap gradient gap shrinks LINEARLY with the offset (the surface is C1)");
+
+var jwo3 = alloc(GEO_FACE_OUT_BYTES);
+assert_eq(geo_ray_capsule(jcray, jcap), geo_ray_capsule_branch(jcray, jcap, jwo3),
+"geo_ray_capsule is bit-identical to geo_ray_capsule_branch with out = 0");
+
+# The degenerate capsule reports its own branch rather than a cap: start == end
+# is a plain sphere, and a consumer differentiating it must know that dt/dend is
+# zero because the shipped primal attributes the whole shape to `start`.
+var jdeg = geo_capsule_new(hvec3_new(0, 0, 0), hvec3_new(0, 0, 0), F64_TWO);
+var jdray = geo_ray_new(hvec3_new(f64_neg(f64_from(6)), 0, 0), hvec3_new(F64_ONE, 0, 0));
+GeoRay_set_direction(jdray, hvec3_new(F64_ONE, 0, 0));
+var jdj = geo_jet_capsule(jdray, jdeg);
+assert_eq(geo_jet_hit(jdj), 1, "the degenerate capsule still produces a jet");
+assert_eq(geo_jet_face(jdj), GEO_CAP_SPHERE, "a zero-length capsule reports GEO_CAP_SPHERE");
+
+# The face encoding decodes back, all six. Small, but geo_face_axis /
+# geo_face_is_max are the only thing standing between a face index and a wrong
+# gradient axis, and nothing else in the suite reads them directly.
+for (var fe = 0; fe < 6; fe = fe + 1) {
+    assert_eq(geo_face_axis(fe), fe / 2, "geo_face_axis decodes the axis");
+    assert_eq(geo_face_is_max(fe), fe % 2, "geo_face_is_max decodes the plane side");
+}
+
+# --- 2.10.1: two 2.10.0 entry points that had NO caller anywhere -------------
+#
+# `geo_jet_plane_ddistance` and `geo_jet_dpoint` shipped in 2.10.0 referenced by
+# nothing -- they were 2 of the 5 functions in that release's 599/604 coverage
+# gap. Reference coverage is a floor, not a correctness proof, but a PUBLIC
+# entry point with no caller has not even cleared the floor.
+var dpn = geo_plane_from_point_normal(hvec3_new(0, 0, F64_TWO), hvec3_new(0, 0, F64_ONE));
+var dpo = hvec3_new(F64_ONE, f64_div(F64_ONE, F64_TWO), f64_neg(f64_from(4)));
+var dpd = hvec3_new(f64_div(F64_ONE, f64_from(4)), f64_div(F64_ONE, f64_from(8)), F64_ONE);
+var dpr = geo_ray_new(dpo, dpd);
+GeoRay_set_direction(dpr, dpd);
+var dpj = geo_jet_plane(dpr, dpn);
+assert_eq(geo_jet_hit(dpj), 1, "the plane-jet coverage fixture actually hits");
+
+# dt/d(distance) against a central difference of the shipped geo_ray_plane.
+var ddlo = geo_ray_plane(dpr, dpn);
+var dp_lo = alloc(sizeof(GeoPlane));
+GeoPlane_set_normal(dp_lo, GeoPlane_normal(dpn));
+GeoPlane_set_distance(dp_lo, f64_sub(GeoPlane_distance(dpn), _JT_H));
+var dp_hi = alloc(sizeof(GeoPlane));
+GeoPlane_set_normal(dp_hi, GeoPlane_normal(dpn));
+GeoPlane_set_distance(dp_hi, f64_add(GeoPlane_distance(dpn), _JT_H));
+var dd_fd = f64_div(f64_sub(geo_ray_plane(dpr, dp_hi), geo_ray_plane(dpr, dp_lo)),
+f64_mul(F64_TWO, _JT_H));
+assert(_jt_close(geo_jet_plane_ddistance(dpj), dd_fd) == 1,
+"geo_jet_plane_ddistance matches central differences of geo_ray_plane");
+
+# geo_jet_dpoint is the chain rule through geo_ray_at: for a unit perturbation of
+# the origin along axis k it must equal d(hit point)/d(o_k), which is a vector.
+# Checked on the SPHERE, whose hit point actually curves -- on a plane the answer
+# is nearly the identity and a mistake in the dt term would barely show.
+var dqs = geo_sphere_new(hvec3_new(0, 0, 0), f64_div(f64_from(3), F64_TWO));
+var dqo = hvec3_new(f64_neg(f64_from(4)), f64_div(F64_ONE, F64_TWO), f64_div(F64_ONE, f64_from(4)));
+var dqd = hvec3_new(F64_ONE, f64_div(F64_ONE, f64_from(8)), 0);
+var dqr = geo_ray_new(dqo, dqd);
+GeoRay_set_direction(dqr, dqd);
+var dqj = geo_jet_sphere(dqr, dqs);
+assert_eq(geo_jet_hit(dqj), 1, "the dpoint coverage fixture actually hits");
+var dq_bad = 0;
+for (var k = 0; k < 3; k = k + 1) {
+    var e_k = _jt_bump(hvec3_new(0, 0, 0), k, F64_ONE);
+    var got = geo_jet_dpoint(dqj, dqr, e_k, hvec3_new(0, 0, 0));
+    var rlo = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(rlo, _jt_bump(dqo, k, f64_neg(_JT_H)));
+    GeoRay_set_direction(rlo, dqd);
+    var rhi = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(rhi, _jt_bump(dqo, k, _JT_H));
+    GeoRay_set_direction(rhi, dqd);
+    var plo = geo_ray_at(rlo, geo_ray_sphere(rlo, dqs));
+    var phi = geo_ray_at(rhi, geo_ray_sphere(rhi, dqs));
+    var fdv = hvec3_scale(hvec3_sub(phi, plo), f64_div(F64_ONE, f64_mul(F64_TWO, _JT_H)));
+    for (var c = 0; c < 3; c = c + 1) {
+        if (_jt_close(_jt_comp(got, c), _jt_comp(fdv, c)) == 0) { dq_bad = dq_bad + 1; }
+    }
+}
+assert_eq(dq_bad, 0,
+"geo_jet_dpoint matches central differences of the hit POINT, all 3 axes x 3 components");
 
 # The typed accessors are the point of the `kind` tag: the same slot holds
 # dt/d(center) on a sphere jet and dt/d(normal) on a plane jet.
@@ -1573,6 +2261,27 @@ assert_eq(geo_ray_sphere(hz, hsp), 0,
 assert_eq(geo_ray_capsule(hz, geo_capsule_new(hvec3_new(0, 0, f64_neg(F64_ONE)),
 hvec3_new(0, 0, F64_ONE), F64_ONE)), 0,
 "ray-capsule with a ZERO direction likewise");
+
+# 2.10.1 widens that pair to all six. Pre-fix this sweep reported 2 bad of 12 --
+# geo_ray_aabb and geo_ray_obb, both with the origin inside, both +Inf.
+test_group("2.10.1 geo_ray_*: a degenerate direction returns the miss sentinel");
+_degen_sweep();
+assert_eq(_DD_RUN, 12, "degenerate-direction sweep ran 6 primitives x 2 origin positions");
+assert_eq(_DD_BAD, 0,
+"every geo_ray_* returns 0 for a zero-length direction (aabb+obb returned +Inf pre-2.10.1)");
+
+# Pre-fix this reported 4 bad of 18, MEASURED by reverting each guard in turn:
+# the sphere alone gives 2 and the capsule alone gives 2 (each at k = 1e-7 and
+# 1e-9; at 1e-5 neither threshold is crossed), and both reverted gives 4. The
+# two are independent defects with the same root cause, not one propagating --
+# this fixture's ray hits the capsule's cylinder BODY, so it never reaches the
+# cap branches that call the sphere.
+# [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
+test_group("2.10.1 geo_ray_*: homogeneity holds at SMALL direction scales too");
+_homog_small_sweep();
+assert_eq(_HS_RUN, 18, "small-scale homogeneity sweep ran 6 primitives x 3 tiny scales");
+assert_eq(_HS_BAD, 0,
+"t(k*d) == t(d)/k down to k = 1e-9 (sphere+capsule returned a MISS below 1e-6 pre-2.10.1)");
 
 test_group("geo: ray_at");
 

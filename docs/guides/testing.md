@@ -6,11 +6,11 @@
 # All test suites
 cyrius test tests/hisab.tcyr        # 416 smoke/integration tests
 cyrius test tests/foundation.tcyr   # 349 exhaustive foundation type tests
-cyrius test tests/modules.tcyr      # 1668 per-module tests
+cyrius test tests/modules.tcyr      # 1723 per-module tests
 cyrius test tests/edge_cases.tcyr   # 233 edge case + boundary tests
 cyrius test tests/abuse.tcyr        # 732 hostile-input tests
 
-# Benchmarks (64 operations)
+# Benchmarks (70 operations)
 cyrius bench tests/hisab.bcyr
 
 # Fuzz self-test — `cyrius fuzz` walks tests/ as of cyrius 6.5.6; before that it
@@ -26,20 +26,20 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 | Suite | Assertions | Covers |
 |-------|-----------|--------|
 | `foundation.tcyr` | 349 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
-| `modules.tcyr` | 1668 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff, interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets, added 2.10.0) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse) |
+| `modules.tcyr` | 1723 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff, interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse) |
 | `hisab.tcyr` | 416 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms), decomposition (SVD, QR, eigen), Krylov (GMRES) |
 | `edge_cases.tcyr` | 233 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11) |
 | `abuse.tcyr` | 732 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Surfaced 11 real defects on public entry points, held in a known-defect register rather than deleted |
-| **Total** | **3398** | |
+| **Total** | **3453** | |
 
-## Benchmarks (64 operations)
+## Benchmarks (70 operations)
 
 | Category | Benchmarks |
 |----------|-----------|
 | Vec/Quat/Mat | vec3_add, vec3_cross, vec3_normalize, quat_mul, quat_slerp, quat_rotate_vec3, m4_mul, m4_inverse, m4_transform_point, t3d_compose |
 | SIMD batches | vec3_dot_x64, vec4_dot_x64, m4_mul_x16, m4_transform_x64 (amplified — single-op timings sit below the harness floor) |
-| Geometry | ray_sphere, ray_aabb, ray_triangle, ray_capsule |
-| Differentiable geometry | jet_sphere, jet_plane, jet_triangle — each paired with its primal row above so the jet/primal ratio is readable straight off the CSV |
+| Geometry | ray_sphere, ray_aabb, ray_aabb_diag, ray_obb, ray_triangle, ray_capsule, ray_capsule_diag |
+| Differentiable geometry | jet_sphere, jet_plane, jet_triangle, jet_aabb, jet_obb, jet_capsule — each paired with a primal row **at the same fixture**, so the ratio is readable straight off the CSV. ⚠ 2.10.1 added `ray_aabb_diag`, `ray_obb` and `ray_capsule_diag` precisely for that: the axis-aligned `ray_aabb` row skips two of three slabs, and `ray_capsule` lands on a cap while `jet_capsule` lands on the barrel — dividing across fixtures would have reported the capsule jet at 2.6x when it is 1.38x |
 | Color | srgb_to_linear, tonemap_reinhard |
 | Calculus | calc_derivative, calc_integral_simpson |
 | Numerical | num_gcd, num_is_prime, cx_mul |

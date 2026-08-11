@@ -119,7 +119,7 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 | Metric | Value |
 |--------|-------|
 | Version | 2.10.0 |
-| Library | 35 modules, ~22,529 lines of Cyrius |
+| Library | 35 modules, ~22,707 lines of Cyrius |
 | Tests | 3398 assertions across 5 suites |
 | Benchmarks | 64 operations |
 | Fuzz targets | 5 with invariant checks |

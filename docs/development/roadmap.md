@@ -11,13 +11,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.10.1
+## Current — v2.10.2
 
-Suite **3453** across five harnesses (hisab 416, foundation 349, modules 1723, edge_cases 233,
-abuse 732), constant gate **156/156**, **70** benchmarks, **35** `[lib]` modules, toolchain
+Suite **3469** across five harnesses (hisab 416, foundation 349, modules 1739, edge_cases 233,
+abuse 732), constant gate **157/157**, **70** benchmarks, **35** `[lib]` modules, toolchain
 **6.5.18**, sakshi **2.4.10**. All gates green:
 `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps / 0 untrusted
-/ 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 617/620 (99%) functions over 36/36 files,
+/ 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 618/621 (99%) functions over 36/36 files,
 distlib in sync.
 
 **2.9.0** delivered the narrowphase release — but read its section for what that actually means: the
@@ -98,8 +98,8 @@ appear on this page at all.
 | ~~2.9.3~~ | The open filings — including the two whose own proposed fixes were wrong | **RELEASED 2026-08-10** |
 | ~~2.10.0~~ | Differentiable geometry — jets for plane, sphere, triangle | **RELEASED 2026-08-10** |
 | ~~2.10.1~~ | The branchy primitives — jets for aabb, obb, capsule | **RELEASED 2026-08-10** |
-| **2.10.2** | The deferred epsilon tier, and the OBB rotation derivative | 2.10.1 |
-| **2.11.0** | Reverse-mode autodiff (tape-based) | 2.10.0 |
+| ~~2.10.2~~ | The primal defects the jets were sitting on, and the OBB rotation derivative | **RELEASED 2026-08-11** |
+| **2.11.0** | Reverse-mode autodiff (tape-based) | 2.10.2 |
 | **3.0.0** | `Result<T,E>` API — breaking | 2.11.0 feature-complete |
 
 ---
@@ -338,12 +338,12 @@ author of the code inherits the author's list of cases.
 
 ---
 
-## 2.10.2 — the deferred epsilon tier, and the rotation derivative
+## 2.10.2 — the primal defects the jets were sitting on  **RELEASED 2026-08-11**
 
 Both items are things 2.10.1 deliberately did not do, each with a written reason rather than an
 omission.
 
-- [ ] **The slab parallel test is scale-free — CRITICAL, and the biggest item here.**
+- [x] **The slab parallel test is scale-free — CRITICAL, and the biggest item here.**
       `|d_k| < EPSILON_F64` deletes that slab, which is wrong whenever the ray travels far enough
       for a tiny component to matter: box `[0,1]³` with a **unit** direction `(9e-13, 0, 1)`
       returns a hit whose point is at x = 1.4. `geo_ray_new` normalizes and does not protect, and
@@ -353,13 +353,13 @@ omission.
       empty. Three fix directions are written up; **option 2 (never skip a slab, guard only exact
       zero) is the most likely** and needs the overflow cases answered first.
       → [`issues/2026-08-10-slab-parallel-test-is-scale-free.md`](issues/2026-08-10-slab-parallel-test-is-scale-free.md)
-- [ ] **`geo_ray_capsule`'s `cyl_missed` fallback applies no hemisphere test.** It can return a cap
+- [x] **`geo_ray_capsule`'s `cyl_missed` fallback applies no hemisphere test.** It can return a cap
       sphere's entry root that lies INSIDE the capsule — axial ray from inside gives `t = 4` with
       the hit point a full radius in. Plus 5.3% of random interior origins losing a cap exit
       entirely. ⚠ The contract decision has to be made first: every sibling returns the exit
       parameter for an interior origin and this branch returns a miss.
       → [`issues/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md`](issues/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md)
-- [ ] **The rest of the squared-epsilon tier, including two rows 2.10.1 sorted WRONG.**
+- [x] **The rest of the squared-epsilon tier, including two rows 2.10.1 sorted WRONG.**
       `geo_triangle_unit_normal` returns a fabricated `(0,1,0)` for a well-formed right triangle
       with 1e-7 legs; the capsule's degenerate guard is 25.6% wrong on a 1e-7-long capsule. Both
       were dispositioned "left, a degeneracy policy" by reading rather than running, and corrected
@@ -372,14 +372,45 @@ omission.
       live open filing (`epa-certificate`), so it needs its own before/after rather than riding
       along with a geometry release. The disposition table for all nine sites in `src/` is in
       `issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md`.
-- [ ] **`dt/d(rotation)` for `geo_jet_obb`.** The other twelve partials ship; this one needs a
+- [x] **`dt/d(rotation)` for `geo_jet_obb`.** The other twelve partials ship; this one needs a
       quaternion chain rule, because a free perturbation of a local axis leaves the rotation group
       and a finite difference across it measures nothing a caller can use. The honest shapes are
       either a 4-component quaternion gradient or a 3-component body-frame angular one; **pick by
       asking a consumer**, since the two differ in what the caller must then do with it.
-- [ ] **Decide whether the tie flag should also carry WHICH faces tied.** Today `out[1]` is a
+- [x] **Decide whether the tie flag should also carry WHICH faces tied.** **Decided: leave it a boolean.** No consumer has asked, and the subgradient case is speculative. Recorded rather than done — re-open when someone needs both faces' gradients. Today `out[1]` is a
       boolean and the jet returns the miss sentinel. A caller doing subgradient descent might
       prefer both faces' gradients over nothing. Demand-gated — no consumer has asked.
+
+### 2.10.2 — delivered  **RELEASED 2026-08-11**
+
+**One rule settled four thresholds**: *guard exactly what makes the DIVISION fail and nothing more*
+— `_GEO_F64_TINY` = DBL_MIN, the smallest magnitude whose reciprocal is finite. A threshold that
+needs a scale chosen for it is the defect.
+
+| | before | after |
+|---|--:|--:|
+| phantom hit, `\|d\| = 1.0` | `t = 1e12`, hit x = **1.4** for a box in [0,1] | **0** |
+| capsule axial from inside | `t = 4`, hit point **on the axis** | `t = 6`, residual **0.0** |
+| capsule interior origins losing their exit | 32 of 600 | **0** |
+| `geo_triangle_unit_normal`, 1e-4 legs | fabricated **(0,1,0)** | **(0,0,1)** |
+
+Plus `dt/d(rotation) = [a_k × (c − p)] / f_k`, derived by perturbing **within** the rotation group,
+36 FD comparisons at worst 1.9e-10. `geo_jet_obb` 12 → **15 partials**.
+
+⚠ Three things this release got wrong first and caught by measuring: an `is_inf` helper as a
+**function** cost +5.6% on a 90 ns routine (inlined: +1.1%); materialising a hit point per cap root
+cost **+92%** (the half-space test is algebraically scalar); and a **toolchain defect was nearly
+filed that does not exist** — `var buf[N]` needs `&buf`, which `lib/fmt.cyr` has always done.
+
+⚠ Two fixtures were caught by **counters** rather than by failing: the slab surface sweep's first
+draft was all misses, and the rotation sweep's first draft missed on 3 of 4 configurations.
+
+**Still open, with reasons**: the three EPA squared-epsilon sites (narrowphase behaviour change,
+needs its own before/after against the live `epa-certificate` filing), and NaN-in-one-axis being
+laundered into a plausible `t` (module-wide across all six primitives, so it is a contract question
+rather than an AABB defect).
+
+---
 
 ### Carried into 2.10.x from the 2.9.x arc
 
@@ -523,6 +554,7 @@ answer is a cheaper pre-filter, not reverting the correctness fix.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.10.2 | 2026-08-11 | 22,707 | 36 | **The primal defects the jets were sitting on.** All three 2.10.1 filed, plus the OBB rotation partial it deferred. **One rule settled four thresholds** — guard exactly what makes the DIVISION fail and nothing more (`_GEO_F64_TINY` = DBL_MIN); a threshold that needs a scale chosen for it IS the defect. The slab parallel test was scale-free: a box spanning [0,1] with a **unit** direction (9e-13, 0, 1) returned a hit at **x = 1.4**, and the same ray from inside a tall box gave an exit **18x too large**; `geo_ray_new` normalizes and did not protect. `geo_ray_capsule` returned a point a **full radius inside the solid** (t = 4 where the exit is 6, hit point ON THE AXIS) because `geo_ray_sphere` hands back only the FIRST root, so a cap root rejected by the half-space test meant the other was never considered — 32 of 600 interior origins also lost their exit entirely. Fixed by splitting the quadratic onto `_geo_sphere_roots` (both roots, one copy) and deleting the `cyl_missed` fallback outright. `geo_triangle_unit_normal` returned a **fabricated** (0,1,0) for a well-formed right triangle with 1e-4 legs. `dt/d(rotation) = [a_k x (c - p)]/f_k`, derived by perturbing WITHIN the rotation group rather than freely, verified over 36 FD comparisons at worst 1.9e-10 — a world-frame ANGULAR gradient, so a step along it is a valid rotation by construction. ⚠ Two repairs cost far more before being measured (an is_inf HELPER +5.6% on a 90 ns routine; materialising a hit point per cap root +92%), two fixtures were caught by COUNTERS rather than by failing, and a toolchain defect was nearly filed that does not exist — `var buf[N]` needs `&buf`. 13 mutants, 13 killed. 3469 |
 | 2.10.1 | 2026-08-10 | 22,529 | 36 | **The branchy primitives, and two more defects the design check found first.** Jets for aabb, obb and capsule — all six `geo_ray_*` are now differentiable. Each primal split onto a face/branch-reporting variant with the plain entry point a one-line wrapper, so the value path is unchanged BY CONSTRUCTION: the `f64_max`/`f64_min` calls are byte-for-byte what they were and every added line sits behind `if (out != 0)`. aabb 3.1x its primal for 12 partials, obb 1.7x for 12, capsule 1.38x for 13 — the branchy three are CHEAPER relative to their primals than the smooth three, because the primal work they reuse is larger. **Before any feature code**, asking "what does the primal return when there is no face?" found `geo_ray_aabb` and `geo_ray_obb` returning **+Inf** for a degenerate direction (4 of 6 siblings honoured the contract; the same 4-vs-2 shape as 2.10.0) and `geo_ray_sphere`/`_capsule` comparing a **squared** length against the unsquared `EPSILON_F64` — the sphere reporting a MISS for any |d| < 1e-6 where t = 4e7 is exact, the capsule silently returning a CAP hit instead of the cylinder hit, wrong by 0.942%. ⚠ **The sphere's guard was introduced by 2.10.0's own repair**, and 2.10.0's homogeneity sweep could not have caught it: its scales are 2, 0.5 and 7, none within five orders of magnitude of the threshold the same commit added. A THIRD came from an independent derivation commissioned against the finished code — the tie flag saw edges and corners but not a zero-width slab or a tangential clip, so a flat box returned the whole gradient in the WRONG SLOT with tie = 0 on half of all configurations; the derivation confirmed all 37 partials (0 of 24,237 FD comparisons failing) and its value was entirely in the ENUMERATION. Three defects in the PRIMAL are filed OPEN for 2.10.2, including a scale-free slab test that returns a hit at x = 1.4 for a box spanning [0,1] with a UNIT direction. The capsule seam is proven C1 by a CONVERGENCE-RATE assertion after a single-offset one failed on a fixture fault. 25 mutants written, 24 killed — the survivor proved a branch update was dead code (cyl_t1 <= cyl_t2 always; 932 randomised quadratics, 0 violations). jet_obb 1.083 us -> 872 ns (-19.5%). Toolchain 6.5.17 -> 6.5.18, zero stdlib delta. 3453 |
 | 2.10.0 | 2026-08-10 | 21,855 | 36 | **Differentiable geometry — and the primal defect it found first.** `src/geo_diff.cyr`: jets for plane, sphere and triangle returning the full gradient from ONE evaluation, allocation-free, as a post-pass on the shipped primal so no intersection algorithm is duplicated. Sphere 7 partials at 335 ns vs its 93 ns primal (3.6x); triangle 15 partials at 934 ns vs 280 ns (3.3x) — against the ~4,200 ns forward-mode duals would need for the same 15. **Before any autodiff was written, the design's own homogeneity check was run against the EXISTING primitives and failed**: `geo_ray_sphere` was not degree -1 in the ray direction, returning a t whose hit point sat 3.74 from the centre of a unit sphere, with `geo_ray_capsule` inheriting it through its end caps. Silent wrong output in shipped geometry, found by a check for a feature that did not exist yet. The same pass found 17 of 60 benchmarks measuring `clock_gettime` rather than the operation (ray_sphere read 1,466 ns, is 79 ns) — the fourth non-gating gate of the arc, and the only reason the repair's +17.6% was visible. Nine mutants caught across the two jets. Toolchain 6.5.16 -> 6.5.17, which fixed all three defects hisab filed upstream. 3398 |
 | 2.9.3 | 2026-08-10 | 21,498 | 35 | **The open filings, and the two whose own proposed fixes were wrong.** Five of six internal filings closed. Two real defects: `delaunay_2d` silently DROPPED input points on any set mixing scales (one vertex at ~6e5 with five inside ~5e-17 of the origin returned 4 triangles where the exact hull says 6, and used 5 of 6 points) — fixed with an adaptive exact `orient2d` on RAW coordinates, 300/300 against exact rationals where the float winding scores 0/300; and `_col_dl_incircle` answered differently depending on VERTEX ORDER, `g1` being the last helper reading the CCW storage convention instead of forming the winding. Three guards were policing nothing: the k-d balance guard had no regression assertion (deleting it broke nothing checked) and no benchmark on its own input class (now 564.8 us guarded vs 3.397 ms unguarded, 6.0x); the ear prune's only benchmark was its BEST case (reflex-heavy is 3.6x, and the small-n regression is +15% measured against the pre-prune body); and `_col_point_in_tri` documented itself as strict-interior while being boundary-inclusive. **TWO FILINGS ARGUED FOR REPAIRS THAT MEASUREMENT REFUTED** — an exact determinant of pre-differenced operands fixes nothing (the information is gone before it runs), and dropping EPA's seed test produces wrong depths at exact tangency (`_ag_baddepth` 0 -> 4). Both were implemented in full before being rejected. The EPA filing's central claim was also false: it measured one of two entry points. 3376 |

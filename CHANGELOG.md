@@ -2,6 +2,147 @@
 
 ## [Unreleased]
 
+## [2.10.2] - 2026-08-11 — the primal defects the jets were sitting on
+
+2.10.1 shipped jets for all six ray primitives and filed three defects **in the primal** that the
+jets inherit by design. This release closes all three, plus the OBB rotation derivative 2.10.1
+deferred. Suite **3453 → 3469**, constant gate 156 → **157**, `geo_jet_obb` 12 → **15 partials**.
+All gates green.
+
+**One rule settled four thresholds.** Every guard repaired here was comparing a geometric quantity
+against a tolerance chosen for a different quantity. The rule the release converged on is *guard
+exactly what makes the DIVISION fail, and nothing more* — `_GEO_F64_TINY` = DBL_MIN, the smallest
+magnitude whose reciprocal is finite. It needs no scale chosen for it, which is precisely why the
+old thresholds were wrong.
+
+### Fixed
+
+- **The slab parallel test was scale-free, and returned hits that are not there.** `|d_k| <
+  EPSILON_F64` (1e-12) deleted that slab; over `t ~ 1e12` a component of `9e-13` moves the
+  coordinate by ~0.9, most of a unit box, so the slab that would have **rejected** the ray was
+  deleted and a confident hit came back.
+
+  | | before | after |
+  |---|--:|--:|
+  | phantom hit, `\|d\| = 1.0` exactly | `t = 1e12`, hit point **x = 1.4** for a box spanning [0,1] | **0** |
+  | interior exit | `t = 1e13`, hit x = 9.5 | `5.5556e11`, hit x = **1.0** |
+  | aabb vs obb at exactly `EPSILON_F64` | `0` vs **`4.5e12`** | `0` vs `0` |
+  | `+Inf` from entirely finite inputs | **`+Inf`** | **0** |
+
+  `geo_ray_new` normalizes and did **not** protect — the phantom-hit direction is unit to 16
+  digits. The permanent assertion is a sweep over direction-component *magnitude*, 18 decades × 2
+  drift factors × 2 primitives, checking every reported hit point lies on its box.
+
+  ⚠ **The suite caught this repair overturning a considered contract decision.** The first tail
+  guard tested *finiteness*, which rejects NaN too — and `abuse.tcyr` asserts *"a NaN ray yields
+  NaN, not a fabricated hit distance"*, which 2.9.0 wrote with a reason: the miss sentinel is 0, so
+  turning NaN into 0 silently reports "no hit" while NaN is unmistakable at the call site. Narrowed
+  to `±Inf`. The remaining NaN item — a NaN in *one* axis erased by `f64_max` — is module-wide and
+  left open. → `issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md`
+
+- **`geo_ray_capsule` returned a point a full radius INSIDE the solid.** `geo_ray_sphere` returns
+  the *first* non-negative root, and that is all the cap branches ever saw — so a root rejected by
+  the half-space test meant the other root was never considered.
+
+  | | before | after |
+  |---|--:|--:|
+  | axial ray from inside, `t` | 4.0 | **6.0** |
+  | its surface residual `\|dist − r\|` | **1.0** (on the axis) | **0.0** |
+  | 600 random interior origins, exits dropped | 32 (5.3%) | **0** |
+
+  The quadratic is split onto `_geo_sphere_roots`, which writes **both** roots; `geo_ray_sphere` is
+  now the root *selection* on top of it, so there is one copy and they cannot drift. The separate
+  `cyl_missed` fallback is **deleted** — caps are evaluated on every path, filtered by half-space.
+  The assertion is a **surface-residual** sweep, not a `t` check: the broken code returned 4.0, a
+  plausible number any loose `t` assertion would accept.
+  → `issues/archived/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md`
+
+- **Four more squared-vs-unsquared guards, two of which 2.10.1 sorted WRONG by reading rather than
+  running.** Scale covariance — the same scene in different units must give the same answer:
+
+  | | broke at | now |
+  |---|--:|--:|
+  | `geo_triangle_unit_normal` | **s = 1e-4** (its `len_sq` is the squared cross product, `s⁴`) | exact to 1e-9 |
+  | `geo_segment_direction` | 1e-7 | exact to 1e-9 |
+  | `geo_segment_distance_to_point` | 1e-7 | exact to 1e-9 |
+  | `geo_ray_capsule` degenerate | 1e-7 | exact to 1e-9 |
+
+  `geo_triangle_unit_normal` returned a **fabricated** `(0,1,0)` for a well-formed right triangle
+  where the truth is `(0,0,1)`, with no error signal. ⚠ `geo_segment_closest_point` was repaired
+  **first, deliberately**: `geo_segment_distance_to_point` builds on it and is what the capsule
+  sweep above uses as its **oracle** — it was silently misleading the probe that found these
+  defects. ⚠ An x-aligned test segment does **not** discriminate for `geo_segment_direction`: its
+  fallback *is* the right answer there. The sweep uses a diagonal.
+
+### Added
+
+- **`geo_jet_obb_drotation` — dt/d(rotation), 12 → 15 partials.** 2.10.1 deferred it and its stated
+  objection was right: a **free** perturbation of an axis leaves the rotation group, so a finite
+  difference across it measures nothing. The answer is to perturb *within* the group. For a
+  world-frame angular vector `w`, `a_k → a_k + w × a_k`, and differentiating the face equation with
+  the scalar triple product gives
+
+  ```
+  dt/dw = [a_k × (c − p)] / f_k
+  ```
+
+  One cross product. It is a **world-frame angular** gradient, three components, not a
+  four-component quaternion one: that is the shape an optimiser wants — a step along it is a valid
+  rotation by construction — and it is what the derivation produces without a chain rule. Verified
+  against central differences of the shipped primal by pre-multiplying the quaternion by
+  `from_axis_angle(e_i, ±h)`: **36 comparisons, worst 1.9e-10**. Three mutants killed.
+
+### Performance
+
+- Interleaved A/B, three pairs each:
+
+  | | 2.10.2 | 2.10.1 | |
+  |---|--:|--:|---|
+  | `ray_capsule` | 627 ns | 500 ns | **+25.3%** |
+  | `ray_capsule_diag` | 858 ns | 932 ns | **−7.9%** — *faster* |
+  | `ray_sphere` | 101 ns | 96 ns | +5.5% (the two-root split) |
+  | `ray_aabb_diag` | 118 ns | 115 ns | +2.9% |
+  | `ray_aabb` | 93 ns | 92 ns | +1.1%, inside noise |
+  | `ray_obb` | 494 ns | 497 ns | −0.6% |
+
+  The `ray_capsule` fixture is the axial one that used to take the wrong-but-cheap fallback, so the
+  comparison is not like-for-like: the fast path it replaces returned a point inside the solid.
+  `ray_capsule_diag` is *faster* because the scalar half-space test replaces two point
+  materialisations.
+
+  ⚠ **Two versions of this release cost far more before being measured.** The `is_inf` tail check
+  written as a **function** cost 5 ns of a 90 ns routine (+5.6% on `ray_aabb`); inlined at its four
+  sites it is +1.1%. And the first working cap repair materialised the hit point per root —
+  `geo_ray_at` + `hvec3_sub`, both of which **allocate**, four times per query under an allocator
+  that never frees — at **+92%** on `ray_capsule`. The half-space test is algebraically scalar:
+  `(p − cap_pt)·ab == (o − cap_pt)·ab + t·(d·ab)`, so both dot products hoist.
+
+### Verification
+
+- **Suite 3453 → 3469**, 0 failures. Constant gate 156 → **157**.
+- **13 mutants written, 13 killed** across the four repairs and the new partial.
+- ⚠ **Two fixture faults caught by counters rather than by failures.** The slab surface sweep's
+  first draft was **all misses** — with a reach of `1/tiny` the drift is exactly one box-width, so
+  72 checks asserted nothing about a hit point; the `_SF_HITS` counter said so. And the rotation
+  sweep's first draft used hand-picked directions and **3 of 4 configurations missed**, leaving
+  three comparisons; aiming at an off-centre target gives 24.
+- ⚠ **A toolchain defect was nearly filed that does not exist.** `var rt[16]` passed as bare `rt`
+  SIGSEGVs on the first call — a stack array is a *value*, and its address is `&rt`. It fails so
+  totally that a minimal repro was written and characterised before `lib/fmt.cyr` was read and
+  found using `&buf` throughout. **The stdlib is the specification.**
+
+### Deferred, with reasons
+
+- **The three EPA squared-epsilon sites** (`geo_advanced.cyr:1056/1060/1067`). Same class, but
+  tightening them is a narrowphase behaviour change on a routine with a measured cost and a live
+  open filing (`epa-certificate`); it needs its own before/after rather than riding along.
+- **NaN in one axis laundered into a plausible `t`.** Real, and module-wide —
+  `geo_ray_sphere`, `_plane` and `_triangle` behave identically — so it is a contract question for
+  all six, not an AABB defect.
+- **Whether the tie flag should name *which* faces tied** rather than being a boolean. A caller
+  doing subgradient descent might prefer both faces' gradients to none. **No consumer has asked**;
+  left as a boolean and recorded.
+
 ## [2.10.1] - 2026-08-10 — the branchy primitives, and two more defects the design check found first
 
 The other half of 2.10.0's scope: jets for the three primitives whose answer comes from a

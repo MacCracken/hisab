@@ -88,7 +88,8 @@ struct GeoJet { kind; t; dt_do; dt_dd; sv; sv1; sv2; ss; face; }
 #   sphere    sv = dt/d(center)   ss = dt/d(radius)
 #   triangle  sv = dt/d(v0)       sv1 = dt/d(v1)      sv2 = dt/d(v2)
 #   aabb      sv = dt/d(min)      sv1 = dt/d(max)     face = the selected face
-#   obb       sv = dt/d(center)   sv1 = dt/d(half_extents)             face = ditto
+#   obb       sv = dt/d(center)   sv1 = dt/d(half_extents)   sv2 = dt/d(rotation)
+#                                                                  face = ditto
 #   capsule   sv = dt/d(start)    sv1 = dt/d(end)     ss = dt/d(radius)
 #                                 face = the BRANCH (GEO_CAP_*), not a face
 
@@ -370,15 +371,32 @@ fn _geo_jet_obb_axis(obb, k) {
 #
 # Homogeneity: d . (dt/dd) = -t * (a_k . d)/f_k = -t.
 #
-# ⚠ dt/d(rotation) IS DEFERRED, AND THAT IS A SCOPE DECISION, NOT AN OVERSIGHT.
-# The axes come from a unit quaternion, so a free perturbation of an axis leaves
-# the rotation group entirely -- the perturbed "OBB" is not an OBB, and a finite
-# difference of the primal across it measures nothing the caller can use. It is
-# the same objection that made dt/dd a RAW partial with geo_jet_dt_dd_unit
-# offered separately rather than projecting silently: a constrained parameter
-# needs its constraint stated at the call site, not guessed here. A quaternion
-# chain rule is well-defined and is on the roadmap; it is not free, and shipping
-# it untested alongside twelve partials that ARE tested would be the worse trade.
+# dt/d(ROTATION), added 2.10.2 -- 15 partials in total.
+#
+# 2.10.1 deferred this, and the objection it recorded was correct: a FREE
+# perturbation of an axis leaves the rotation group entirely, so the perturbed
+# "OBB" is not an OBB and a finite difference across it measures nothing. The
+# answer is to perturb WITHIN the group. For a world-frame angular vector w the
+# rotation moves every axis by a_k -> a_k + w x a_k, and differentiating the face
+# equation a_k . (p - c) = sg * he_k gives
+#
+#     (w x a_k) . (p - c) + f_k * dt = 0
+#     w . [a_k x (p - c)] + f_k * dt = 0          [scalar triple product, cyclic]
+#
+#     dt/dw = [a_k x (c - p)] / f_k
+#
+# One cross product. It is a WORLD-FRAME ANGULAR gradient, three components, not
+# a four-component quaternion one: that is the shape an optimiser wants (it lives
+# in the Lie algebra, so a step is a valid rotation by construction), and it is
+# the shape the derivation produces without a chain rule. A caller holding a
+# quaternion applies the standard so(3) -> quaternion map itself, at the call
+# site where the convention is known -- the same reasoning that left dt/dd a raw
+# partial with geo_jet_dt_dd_unit offered separately.
+#
+# Verified against central differences of the shipped `geo_ray_obb`, perturbing
+# the rotation by hquat_mul(from_axis_angle(e_i, +/-h), q): 36 comparisons over
+# 12 ray configurations, worst |analytic - FD| 1.9e-10.
+# [measured: tests/modules.tcyr "2.10.2 geo_jet_obb dt/d(rotation)"]
 #
 # Edges and corners behave exactly as for the AABB: the core reports the tie and
 # this returns the miss sentinel.
@@ -413,7 +431,8 @@ fn geo_jet_obb(ray, obb) {
     GeoJet_set_dt_dd(j, hvec3_scale(axis, f64_neg(f64_mul(t, inv))));
     GeoJet_set_sv(j, dt_dc);
     GeoJet_set_sv1(j, _geo_jet_axis(k, sg));
-    GeoJet_set_sv2(j, hvec3_new(0, 0, 0));
+    GeoJet_set_sv2(j, hvec3_scale(hvec3_cross(axis,
+    hvec3_sub(GeoObb_center(obb), geo_ray_at(ray, t))), inv));
     GeoJet_set_ss(j, 0);
     GeoJet_set_face(j, face);
     return j;
@@ -587,6 +606,15 @@ fn geo_jet_capsule_dend(j) {
 fn geo_jet_capsule_dradius(j) {
     if (GeoJet_kind(j) != GEO_JET_CAPSULE) { return 0; }
     return GeoJet_ss(j);
+}
+
+# dt/d(rotation): the WORLD-FRAME ANGULAR gradient, three components. A step
+# along it is a valid rotation by construction, which a four-component quaternion
+# gradient would not be. See the derivation in geo_jet_obb's header.
+#must_use
+fn geo_jet_obb_drotation(j) {
+    if (GeoJet_kind(j) != GEO_JET_OBB) { return 0; }
+    return GeoJet_sv2(j);
 }
 
 # The face the primal selected, in geo.cyr's encoding (2 * axis + plane), or

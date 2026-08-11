@@ -21,7 +21,7 @@ Thank you for your interest in contributing to Hisab.
 # Build
 cyrius build src/main.cyr build/hisab
 
-# Run all five suites (3453 assertions). CI runs every tests/*.tcyr — running
+# Run all five suites (3469 assertions). CI runs every tests/*.tcyr — running
 # fewer than five locally skips a whole surface, not a handful of cases.
 cyrius test tests/hisab.tcyr
 cyrius test tests/foundation.tcyr

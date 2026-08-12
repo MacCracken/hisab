@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.5.17**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
+> Written in Cyrius. Toolchain: **6.5.18**. Stdlib `ganita` (6.2.x math umbrella) provides dense decompositions + transcendentals.
 
 ## Scope
 
@@ -11,10 +11,10 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.11.0
+## Current — v2.11.1
 
-Suite **3507** across five harnesses (hisab 416, foundation 349, modules 1775, edge_cases 233,
-abuse 734), constant gate **158/158**, **72** benchmarks, **35** `[lib]` modules, toolchain
+Suite **3514** across five harnesses (hisab 416, foundation 351, modules 1775, edge_cases 233,
+abuse 739), constant gate **159/159**, **72** benchmarks, **35** `[lib]` modules, toolchain
 **6.5.18**, sakshi **2.4.10**. All gates green:
 `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps / 0 untrusted
 / 0 missing, `deps --verify` 30/30, `fuzz` 1/0, `coverage` 640/644 (99%) functions over 36/36 files,
@@ -23,7 +23,7 @@ distlib in sync.
 **Per-release detail lives in `CHANGELOG.md`**, and the one-line-per-version record is the Release
 History table at the foot of this file. What belongs *here* is the part that generalises.
 
-### The standing lesson of the 2.7.0–2.11.0 arc
+### The standing lesson of the 2.7.0–2.11.1 arc
 
 **Every defect of consequence was cheap to find and invisible because nothing looked.** The friction
 impulse had been identically zero at every mu since before the 2026-08-04 audit, surviving because
@@ -47,6 +47,7 @@ consecutive releases:
 | 2.10.1 | "what does the primal return when there is no face?" | `geo_ray_aabb`/`_obb` returning `+Inf`; a squared-vs-unsquared epsilon **2.10.0's own repair introduced** |
 | 2.10.2 | the hit point must lie on the box | a scale-free slab test hitting at x = 1.4 for a box spanning [0,1] with a **unit** direction |
 | 2.11.0 | reverse mode is validated against forward mode, so sweep forward mode first | five defects in the duals, incl. `ln(−5)` returning a NaN value beside a **confident** −0.2 derivative |
+| 2.11.1 | *(no feature — a full audit instead)* a mechanical grep for the class the last four releases kept repairing | the same guard defect at ~24 more sites, `cx_div` among them — the module whose own comment records the lesson |
 
 Three corollaries, each learned by being caught out:
 
@@ -59,6 +60,10 @@ Three corollaries, each learned by being caught out:
   while skipping exactly the five rows that mattered.
 * **A threshold that needs a scale chosen for it is the defect.** One rule — *guard exactly what
   makes the division fail and nothing more* — settled six thresholds across 2.10.2 and 2.11.0.
+* **A lesson written beside the code that taught it does not reach the other thirty-four modules.**
+  2.11.1's audit found the 2.6.14 squared-epsilon class at ~24 further sites, including `cx_div` —
+  which is *named in the comment recording the lesson* and still fabricates zero. Only a grep
+  applies a rule tree-wide; a review applies it where someone happened to look.
 
 ⚠ **Four separate measurements stated in committed text did not reproduce** during this arc, each
 caught by an adversarial reader rather than a gate, and two had already propagated into three or four
@@ -73,7 +78,8 @@ items: they are tracked in `issues/` and discharged as a **precondition** of the
 
 | Release | Deliverable | Gated on |
 |---|---|---|
-| **3.0.0** | `Result<T,E>` API — breaking | 2.11.0 feature-complete |
+| **2.12.0** | The epsilon tier — ~20 guards moved onto the quantity that actually fails, each with a scale-covariance assertion | the 28 unverified audit findings re-run first |
+| **3.0.0** | `Result<T,E>` API — breaking, plus a public/private function surface (269 `_`-prefixed fns, 17 crossing modules in 6 pairs) | 2.12.0 |
 
 ---
 
@@ -81,6 +87,43 @@ items: they are tracked in `issues/` and discharged as a **precondition** of the
 
 Everything still owed, in one place. Each carries why it has not been done, because "deferred with a
 reason" and "forgotten" are indistinguishable once the reason is lost.
+
+### The 2026-08-11 audit backlog
+
+The full P(-1) sweep of the 2.11.0 tree is
+[`audit/2026-08-11-v2.11.0-full.md`](../audit/2026-08-11-v2.11.0-full.md): 6 dimensions, 115 checks,
+**52 findings reproduced**, 21 CONFIRMED by an independent skeptic, 2 REFUTED, 1 already known. 2.11.1
+executed four repairs; the rest is here, ordered as the audit ordered it.
+
+- [ ] **Re-verify the 28 findings that were never sent to a skeptic.** The verify phase was capped at
+      24 by the harness, not by judgement, and 2 of the 24 that *were* checked came back REFUTED — so
+      the prior on an unverified finding is roughly 1-in-12 wrong. **This gates every item below it.**
+      They are reproduced, not proven.
+- [ ] **The epsilon tier (~20 sites), by mechanical grep, not review.** `eigen_qr`, `cqr_decompose`,
+      `solve_bicgstab`, `solve_gmres`, `m3_inverse`/`m4_inverse`, `cmat_inverse`, `svd_golub_kahan`,
+      `cx_div`/`cx_inv`/`cx_powf`, `hvec3_angle`, `hvec2/3/4_normalize`, `cga_blade_inverse`,
+      `m4_transform_point`, `calc_bspline`/`calc_nurbs`, `calc_monotone_cubic`, `num_newton`,
+      `num_tridiag_solve`, `geo_barycentric_coords`, `geo_ray_triangle`, `sectional_curvature`,
+      `hisab_inverse_lerp`/`hisab_remap`. Each gets a **scale-covariance** assertion bracketing every
+      threshold a repair might plausibly have chosen. ⚠ **Not one commit** — each site is a behaviour
+      change on a documented entry point, and this tree's history says these land in mutation-proven
+      bites.
+- [ ] **The allocation tier (3 remaining).** `solve_gmres` (Hessenberg is quadratic in `restart`),
+      `detect_islands`, and one more. Mechanical, low risk, identical repair to the three `num_ext`
+      sites closed in 2.11.1.
+- [ ] **The abort tier.** `halfedge_from_triangles` and three `collision_core` entry points end the
+      process on hostile input. A library must not.
+- [ ] **The suite tier — the highest-value item in the whole audit.** 836 of the 3510 assertions the audit's own scan counted (23.8%)
+      compare through `f64_to`, which **truncates**, so any error below 1.0 is invisible to a quarter
+      of the suite; 38.4% of value-changing single-operator mutants survive all five suites; 29 public
+      functions are covered only by `assert_neq(f(...), 0)`. Fixing the truncation strengthens 836
+      existing assertions at once, and it is *why* 3507 assertions and 99% coverage saw none of the
+      52 findings.
+
+⚠ The audit was correctness-shaped and did **not** reach `symbolic*`, `lie*`, `spatial`, `color`,
+`transforms`, `noise_simplex`, `einsum`, `tensor` beyond bounds-checking, `ode` beyond one stiff case,
+the SIMD `f64v_*` paths, or any cross-module interaction — and nothing in it audited **performance
+regressions** or the **benchmark harness**. That is where the next one starts.
 
 ### EPA — one routine, three entangled questions
 
@@ -130,7 +173,7 @@ All three touch `gjk_epa_*` and none should be done alone: they share a benchmar
 
 ### Toolchain, tracked upstream
 
-**Three filings are open** (`docs/development/issues/`, 20 archived beside them):
+**Three filings are open** (`docs/development/issues/`, 23 archived beside them):
 
 | filing | state |
 |---|---|
@@ -250,6 +293,7 @@ answer is a cheaper pre-filter, not reverting the correctness fix.
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.11.1 | 2026-08-11 | 23,182 | 36 | **The audit release: one rule, and the four sites that broke it.** A full P(-1) sweep of the 2.11.0 tree — 6 dimensions, 115 checks, **52 findings reproduced**, 21 CONFIRMED by an independent skeptic, 2 REFUTED, 1 already known, and **28 never verified because the harness capped the verify phase at 24** (recorded as the audit's own biggest process defect, not buried: 2 of the 24 that WERE checked came back refuted, so an unverified finding is ~1-in-12 wrong and none may be acted on until re-run). **24 of the 52 are the same defect** — a guard comparing a quantity against a threshold that is wrong for it, then FABRICATING a plausible answer: `eigen_qr` wrong eigenvalues with rc = 0, `cqr_decompose` an R that is not upper triangular with rc = 0, `hvec3_angle` 0 rad ('parallel') for exactly perpendicular vectors, `m3/m4_inverse` the identity. This is the ninth through thirty-second instance of a class first written down in `complex.cyr:58` in 2.6.14 — and `cx_div` is IN THAT COMMENT and still fabricating zero. **Writing a lesson beside the code that taught it does not fix the code and does not reach the other thirty-four modules; only a grep does.** Four repairs executed: `hquat_inverse`/`hquat_normalize` compared a SQUARED magnitude against the unsquared EPSILON_F64, returning the identity for any |q| < 1e-6 where the inverse is finite and exact; three caller-sized allocations in `num_ext` stored through `alloc`'s 0 return (**reproduced as SIGSEGV**, now HSB_ERR_ALLOC); `ad_tape_new` handed back a non-zero handle with a null body — 2.11.0's own code; and `optimize.cyr`'s ALLOC_MAX-derived ceiling was re-derived 5792 → 16384. ⚠ **A stale comment nearly buried a real defect**: the first `num_tridiag_solve` probe was sized from `optimize.cyr`'s own `ALLOC_MAX = 256 MiB`, landed EXACTLY on the limit, allocated successfully, and the finding looked refuted — cyrius 6.4.51 raised it to 2 GiB. **A constant derived from a dependency is a measurement.** ⚠ The quaternion sweep's first 12 decades killed only 1 of 3 mutants (both rejected thresholds sit BELOW where it looked; 20 decades kills all three), and asserting unit length would not have discriminated at all — the fabricated identity IS unit, so the assertion checks DIRECTION. The audit's third critical is the suite itself: **836 of the 3510 assertions its own scan counted (23.8%) compare through `f64_to`, which TRUNCATES**, and 38.4% of value-changing mutants survive all five suites — a measured reason why 3507 assertions and 99% coverage saw none of the 52. 3514 |
 | 2.11.0 | 2026-08-11 | 23,104 | 36 | **Reverse-mode autodiff, and the five forward-mode defects it found first.** Tape-based: one node per op recording both local partials and both input indices, and because inputs always have strictly smaller indices a single descending loop is a valid reverse order — no sort, no visited set. **grad_fwd_16 63.7 us -> grad_rev_16 5.70 us, 11.2x** for a 16-input gradient (not the theoretical 16x: reverse pays to RECORD the tape, and part of the rest is dual_* heap-allocating under an allocator that never frees). The pairing with optimize.cyr needed NO API change — a capturing closure holding the tape matches fncall2(grad, x, out), re-verified on 6.5.18 because that shape SIGSEGVed on 6.5.16. **Reverse mode is validated AGAINST forward mode, so autodiff.cyr was swept before a line of tape code existed**, and five defects came out: 1/1e-13 returned (0,0) where the truth is 1e13; ln(-5) returned a NaN value beside a CONFIDENT -0.2 derivative; sqrt(-4) was (NaN,NaN) because the guard ran after the sqrt; d/dx x^3 at -2 was NaN because f64_pow is exp(n*ln(base)) and rejects negative bases — the stdlib's STATED implementation, so the defect was hisab inheriting it undocumented. ⚠ **The finite-difference sweep alone found NONE of them**: at every input where a guard fires the perturbed scalar is NaN too, so the sample is skipped and the guard never asked. A guard has to be interrogated DIRECTLY. 14 mutants, 14 kills — two survived the first pass (the fixture's variables happened to BE nodes 0 and 1, so the ids indirection was untested) and one failure was the ASSERTION's fault, demanding 1e-8 where gradient descent only promises ||g|| < 1e-6. The solvers' own contract check came back CLEAN, the first time in five releases. 3507 |
 | 2.10.2 | 2026-08-11 | 22,707 | 36 | **The primal defects the jets were sitting on.** All three 2.10.1 filed, plus the OBB rotation partial it deferred. **One rule settled four thresholds** — guard exactly what makes the DIVISION fail and nothing more (`_GEO_F64_TINY` = DBL_MIN); a threshold that needs a scale chosen for it IS the defect. The slab parallel test was scale-free: a box spanning [0,1] with a **unit** direction (9e-13, 0, 1) returned a hit at **x = 1.4**, and the same ray from inside a tall box gave an exit **18x too large**; `geo_ray_new` normalizes and did not protect. `geo_ray_capsule` returned a point a **full radius inside the solid** (t = 4 where the exit is 6, hit point ON THE AXIS) because `geo_ray_sphere` hands back only the FIRST root, so a cap root rejected by the half-space test meant the other was never considered — 32 of 600 interior origins also lost their exit entirely. Fixed by splitting the quadratic onto `_geo_sphere_roots` (both roots, one copy) and deleting the `cyl_missed` fallback outright. `geo_triangle_unit_normal` returned a **fabricated** (0,1,0) for a well-formed right triangle with 1e-4 legs. `dt/d(rotation) = [a_k x (c - p)]/f_k`, derived by perturbing WITHIN the rotation group rather than freely, verified over 36 FD comparisons at worst 1.9e-10 — a world-frame ANGULAR gradient, so a step along it is a valid rotation by construction. ⚠ Two repairs cost far more before being measured (an is_inf HELPER +5.6% on a 90 ns routine; materialising a hit point per cap root +92%), two fixtures were caught by COUNTERS rather than by failing, and a toolchain defect was nearly filed that does not exist — `var buf[N]` needs `&buf`. 13 mutants, 13 killed. 3469 |
 | 2.10.1 | 2026-08-10 | 22,529 | 36 | **The branchy primitives, and two more defects the design check found first.** Jets for aabb, obb and capsule — all six `geo_ray_*` are now differentiable. Each primal split onto a face/branch-reporting variant with the plain entry point a one-line wrapper, so the value path is unchanged BY CONSTRUCTION: the `f64_max`/`f64_min` calls are byte-for-byte what they were and every added line sits behind `if (out != 0)`. aabb 3.1x its primal for 12 partials, obb 1.7x for 12, capsule 1.38x for 13 — the branchy three are CHEAPER relative to their primals than the smooth three, because the primal work they reuse is larger. **Before any feature code**, asking "what does the primal return when there is no face?" found `geo_ray_aabb` and `geo_ray_obb` returning **+Inf** for a degenerate direction (4 of 6 siblings honoured the contract; the same 4-vs-2 shape as 2.10.0) and `geo_ray_sphere`/`_capsule` comparing a **squared** length against the unsquared `EPSILON_F64` — the sphere reporting a MISS for any |d| < 1e-6 where t = 4e7 is exact, the capsule silently returning a CAP hit instead of the cylinder hit, wrong by 0.942%. ⚠ **The sphere's guard was introduced by 2.10.0's own repair**, and 2.10.0's homogeneity sweep could not have caught it: its scales are 2, 0.5 and 7, none within five orders of magnitude of the threshold the same commit added. A THIRD came from an independent derivation commissioned against the finished code — the tie flag saw edges and corners but not a zero-width slab or a tangential clip, so a flat box returned the whole gradient in the WRONG SLOT with tie = 0 on half of all configurations; the derivation confirmed all 37 partials (0 of 24,237 FD comparisons failing) and its value was entirely in the ENUMERATION. Three defects in the PRIMAL are filed OPEN for 2.10.2, including a scale-free slab test that returns a hit at x = 1.4 for a box spanning [0,1] with a UNIT direction. The capsule seam is proven C1 by a CONVERGENCE-RATE assertion after a single-offset one failed on a fixture fault. 25 mutants written, 24 killed — the survivor proved a branch update was dead code (cyl_t1 <= cyl_t2 always; 932 randomised quadratics, 0 violations). jet_obb 1.083 us -> 872 ns (-19.5%). Toolchain 6.5.17 -> 6.5.18, zero stdlib delta. 3453 |

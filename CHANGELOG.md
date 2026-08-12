@@ -2,6 +2,99 @@
 
 ## [Unreleased]
 
+## [2.11.1] - 2026-08-11 — the audit release: one rule, and the four sites that broke it
+
+A full P(-1) sweep of the v2.11.0 tree — six dimensions, 115 checks, every finding handed to an
+independent skeptic instructed to **refute** it. Suite **3507 → 3514**, constant gate 158 → **159**.
+No feature work; every change here is a repair or a correction.
+
+The full report is `docs/audit/2026-08-11-v2.11.0-full.md`. It found **52 reproduced findings, 21
+confirmed**, and they are overwhelmingly **one root cause**: a guard compares a quantity against a
+threshold that is wrong for it, then **fabricates a plausible answer** instead of reporting. This
+release fixes the four with the shortest path to a caller and schedules the rest.
+
+⚠ **28 of the 52 were reproduced but never verified** — the harness capped the verify phase at 24.
+Two of the 24 that *were* checked came back REFUTED, so roughly one in twelve unverified findings is
+wrong. They are unproven, not pending, and none was acted on. That cap is recorded in the report as
+the audit's own biggest process defect.
+
+### Fixed
+
+- **`hquat_inverse` fabricated the identity for any quaternion shorter than 1e-6.** `len_sq` is a
+  **squared** magnitude compared against the **unsquared** `EPSILON_F64`. Measured, `|q · q⁻¹ − I|`
+  jumps from 0 to **0.9999999** between `|q| = 1e-6` and `1e-7`: the returned "inverse" is the
+  identity, so the product is `q` itself. A quaternion of magnitude 1.4e-7 has an inverse of
+  magnitude 7e6 — finite, exactly representable, silently replaced by a rotation of zero.
+  `hquat_normalize` took the same rule. Both now guard at `_QUAT_F64_TINY` = DBL_MIN.
+
+  **Ninth instance of a class first written down in `complex.cyr:58` in 2.6.14.**
+  → `issues/archived/2026-08-11-quat-inverse-squared-epsilon.md`
+
+- **Three caller-sized allocations in `num_ext.cyr` stored through `alloc`'s 0 return** —
+  `num_fft_2d`, `num_ifft_2d`, `num_tridiag_solve`. Reproduced as **SIGSEGV (exit 139)** from public
+  entry points; `num_fft_2d` requires only that its dimensions be powers of two, with no upper
+  bound. All three now return `HSB_ERR_ALLOC`. Removing the guard does not fail an assertion — it
+  **crashes the suite process**. → `issues/archived/2026-08-11-caller-sized-allocs-in-num_ext.md`
+
+- **`ad_tape_new` returned a live handle whose node array was null** — ⚠ **2.11.0's own code, hours
+  old.** When `cap * 40` exceeds `ALLOC_MAX` the node allocation returns 0, but the handle was
+  already allocated, so a caller's `if (t != 0)` passed and the first `ad_var` SIGSEGVed inside
+  `_ad_push`, whose only bound is `n >= cap` — which `n = 0` satisfies. Construction is the only
+  place that can catch it, and 0 is the function's own documented reject value.
+
+  2.11.0 wrote `AD_FULL` for exactly this class three functions away, in the hot path, and missed it
+  at construction. **Handling a failure mode in the hot path is not handling it at construction.**
+  → `issues/archived/2026-08-11-ad-tape-new-null-nodes.md`
+
+- **`optimize.cyr` derived its dimension ceiling from a constant that moved.** Its comment read
+  `ALLOC_MAX (0x10000000 = 256 MB) … hard ceiling at n = 5792`. `ALLOC_MAX` has been `0x80000000`
+  = **2 GiB** since cyrius 6.4.51 — the real ceiling is **16384** — and `linalg_ext.cyr:789` had
+  already been updated while this file and `threat-model.md` had not. The policy cap of 4096 sits
+  below both, so nothing was ever unsafe, which is exactly why it survived four toolchain bumps.
+
+  ⚠ **That stale constant nearly buried the `num_ext` defect above.** The first reproduction probe
+  was sized against 256 MiB, landed *exactly* on the limit, allocated successfully, and the finding
+  looked refuted. **A constant derived from a dependency is a measurement, and it goes stale
+  silently.**
+
+### Verification
+
+- **All four repairs mutation-proven.** The `num_ext` mutant crashes the suite process; the
+  `ad_tape_new` mutant fails it; the quaternion repair kills three.
+- ⚠ **The quaternion sweep's first draft killed only one of three mutants.** Written over 12
+  decades, it bottomed out at `|q| ~ 1e-11` — **above both thresholds a repair might plausibly have
+  chosen instead** (`EPSILON_F64` at 1e-12, `_GEO_F64_EPS_SQ` at 1e-12 on the magnitude). Extended
+  to 20 decades, all three die. *A sweep must bracket every candidate threshold, not just the chosen
+  one* — the same failure 2.10.1 recorded, recurring despite being written down.
+- ⚠ A second discrimination trap avoided deliberately: asserting only that `hquat_normalize` returns
+  something of **unit length** does not discriminate, because the fabricated identity *is* unit. The
+  assertion checks the **direction**.
+- An independent probe, written from scratch after the scratchpad was lost, re-checks all four
+  repairs **without going through the suite** — including that `num_tridiag_solve` **still solves an
+  ordinary 4×4**, since a guard that rejected everything would pass the failure test and be useless.
+
+### What the audit found and this release does NOT fix
+
+Scheduled, with reasons, in the report and on the roadmap:
+
+- **~20 more sites of the same epsilon class**, including `eigen_qr` returning wrong eigenvalues with
+  `rc = 0`, `cqr_decompose` returning a non-triangular `R` with `rc = 0`, `solve_bicgstab` returning
+  the initial guess with no error channel at all, and `m3_inverse`/`m4_inverse` returning the
+  **identity** for invertible matrices. Each is a behaviour change on a documented entry point and
+  lands as its own mutation-proven bite, not one commit.
+- **Three more unchecked allocations** and four entry points that **abort the process**.
+- **The suite itself**: 836 of 3510 assertions (23.8%) compare through `f64_to`, which **truncates**
+  — 3510 being the audit's own static count of assertion sites, against the 3507 the harness reported
+  at run time; the two are counted differently and neither is wrong —
+  so any error below 1.0 is invisible to a quarter of the suite; 38.4% of value-changing mutants
+  survive all five suites. That is why 3507 assertions and 99% coverage saw none of this, and
+  repairing it strengthens 836 existing assertions at once.
+
+⚠ **`cx_div` is named in `complex.cyr:58`'s own 2.6.14 comment recording this exact lesson, and is
+still fabricating zero below 1e-12** — verified live in this release's own re-check. Writing a
+lesson beside the code that taught it neither fixes that code nor reaches the other thirty-four
+modules. Only a grep does.
+
 ## [2.11.0] - 2026-08-11 — reverse-mode autodiff, and the five forward-mode defects it found first
 
 Tape-based reverse mode: one sweep produces the gradient of an n-input scalar where forward-mode

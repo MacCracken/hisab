@@ -4,7 +4,7 @@
 > of the library's other formula families).
 >
 > hisab v2.11.1 — 35 math modules in `src/`, 23,182 lines of Cyrius (`lib/` is
-> vendored stdlib + first-party deps only). Compiled by cycc 6.5.18.
+> vendored stdlib + first-party deps only). Compiled by cycc 6.5.33.
 
 ## Module Map
 

@@ -22,13 +22,44 @@ BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
 # comment below for why that was wrong. New rows are `avg` and also carry the
 # min/max/iters they came from, so no information is discarded and the two
 # populations are never silently averaged together.
+#
+# Schema note (v2.11.2) — `regime` + `floor_ns`. `stat` says which STATISTIC the
+# number is; `regime` says what the INSTRUMENT was doing when it was taken, and
+# those are independent. cyrius 6.5.19 taught lib/bench.cyr to calibrate one
+# clock read and subtract it from every sample, and taught `bench_run` to size
+# its own batches instead of wrapping a clock pair around every iteration. Both
+# rewrite the number without touching the code being measured.
+#
+# ⚠ THIS IS THE THIRD TIME A MEASUREMENT-METHOD CHANGE HAS MOVED EVERY ROW —
+# 2.9.2 (max→avg), 2.10.0 (bench()→bench_batch() for 17 rows), and now this —
+# and the first two were each answered with a paragraph of prose in the
+# generated markdown, which the trend table itself could not read. CLAUDE.md's
+# rule is to wait for the third instance before extracting an abstraction. This
+# is the third, so the marker is now a COLUMN the trend filter enforces, not a
+# note a reader is trusted to have seen.
+#
+# ⚠ AND IT IS DERIVED, NOT DECLARED. `regime` is read from whether this run's
+# harness printed its measured timer floor — the instrument reporting on itself
+# — so it cannot go stale the way a hand-maintained constant does. `floor_ns`
+# records what that instrument cost on THIS host, this boot; upstream measured a
+# 230x spread across the four hosts its own gate runs on, so it is not a
+# property of the code and must travel with the row.
+#
+# ⚠ WHAT IT CANNOT DO, said plainly: it distinguishes "floor subtracted" from
+# "floor not subtracted" because that is what the output makes visible. A future
+# instrument change that keeps printing the floor line would NOT flip it. This
+# narrows the hole, it does not close it.
+CSV_HEADER="timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters,regime,floor_ns"
 if [ ! -f "$HISTORY_FILE" ]; then
-    echo "timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters" > "$HISTORY_FILE"
+    echo "$CSV_HEADER" > "$HISTORY_FILE"
 elif ! head -1 "$HISTORY_FILE" | grep -q ',stat,'; then
     # Widen the header in place; existing 5-field rows keep their meaning and
-    # read back as stat="" (i.e. max).
-    sed -i '1s/.*/timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters/' "$HISTORY_FILE"
+    # read back as stat="" (i.e. max) and regime="" (i.e. raw).
+    sed -i "1s/.*/${CSV_HEADER}/" "$HISTORY_FILE"
     echo "note: bench-history header widened (estimate_ns is 'avg' from this run on; earlier rows were 'max')"
+elif ! head -1 "$HISTORY_FILE" | grep -q ',regime,'; then
+    sed -i "1s/.*/${CSV_HEADER}/" "$HISTORY_FILE"
+    echo "note: bench-history header widened with regime/floor_ns; earlier rows read back as regime='raw'"
 fi
 
 echo "╔══════════════════════════════════════════╗"
@@ -72,6 +103,28 @@ normalize_to_ns() {
     esac
 }
 
+# Measurement regime, read off the harness's own output rather than declared here.
+#
+# Since cyrius 6.5.19 `bench_report` prints, once per process, the timer floor it
+# MEASURED on this host and subtracts it from every sample:
+#   [timer floor 1.349us per clock read, measured; subtracted from every sample]
+# Its presence is the regime marker. Absent → the pre-6.5.19 instrument, whose
+# numbers include the clock and whose `bench_run` paid a clock pair per iteration.
+#
+# ⚠ The floor line deliberately carries no " avg", so the benchmark parser below
+# cannot mistake it for a result row — but that is upstream's guarantee, not
+# ours, so the parser is anchored on its own field names independently.
+REGIME="raw"
+FLOOR_NS=""
+if [[ "$BENCH_OUTPUT" =~ \[timer\ floor\ ([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)\ per\ clock\ read ]]; then
+    REGIME="net"
+    FLOOR_NS=$(normalize_to_ns "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}")
+    echo "measurement regime: net (timer floor ${FLOOR_NS} ns, measured on this host, subtracted from every sample)"
+else
+    echo "measurement regime: raw (harness reported no measured timer floor — pre-6.5.19 instrument)"
+fi
+echo ""
+
 declare -a BENCH_NAMES=()
 declare -a BENCH_NS=()
 
@@ -86,7 +139,7 @@ while IFS= read -r line; do
         MIN_NS=$(normalize_to_ns "${BASH_REMATCH[5]}" "${BASH_REMATCH[7]}")
         MAX_NS=$(normalize_to_ns "${BASH_REMATCH[8]}" "${BASH_REMATCH[10]}")
         ITERS="${BASH_REMATCH[12]:-}"
-        echo "${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${AVG_NS},avg,${AVG_NS},${MIN_NS},${MAX_NS},${ITERS}" \
+        echo "${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${AVG_NS},avg,${AVG_NS},${MIN_NS},${MAX_NS},${ITERS},${REGIME},${FLOOR_NS}" \
             >> "$HISTORY_FILE"
         BENCH_NAMES+=("$BENCH_NAME")
         BENCH_NS+=("$AVG_NS")
@@ -125,13 +178,32 @@ if not rows:
 # across that boundary produces deltas of hundreds of percent that are pure
 # artefact, so the trend is built ONLY from rows whose `stat` matches the newest
 # run's. Old rows predate the column and read back as None -> "max".
+#
+# `regime` (2.11.2) is the SECOND axis and is independent of the first: it says
+# what the instrument was doing, not which statistic was taken. Rows on either
+# side of it are both "avg" and would otherwise be compared directly. Measured
+# on this tree at the 6.5.18 -> 6.5.33 bump, same source, zero code changes:
+# ease_in_out 1407ns -> 7ns, cx_mul 1459 -> 37, quat_mul 1473 -> 67,
+# perlin_2d 1461 -> 82 — and 44 of 72 rows would have printed as an improvement
+# past the 10% noise gate. Filtering on `stat` alone admitted every one of them.
 def stat_of(r):
     return (r.get("stat") or "max").strip() or "max"
 
+def regime_of(r):
+    return (r.get("regime") or "raw").strip() or "raw"
+
 current_stat = stat_of(rows[-1])
-rows = [r for r in rows if stat_of(r) == current_stat]
+current_regime = regime_of(rows[-1])
+kept = [r for r in rows if stat_of(r) == current_stat and regime_of(r) == current_regime]
+dropped = len(rows) - len(kept)
+rows = kept
 if not rows:
     sys.exit(0)
+# Never silently. A trend built on a fraction of the history must say so, or the
+# reader takes a two-point table for the whole record.
+if dropped:
+    print(f"  note: {dropped} row(s) excluded from the trend — "
+          f"not stat={current_stat} regime={current_regime} (kept {len(rows)})")
 
 timestamps = list(OrderedDict.fromkeys(r["timestamp"] for r in rows))
 if len(timestamps) >= 3:
@@ -195,6 +267,24 @@ with open(md_file, "w") as f:
     # the most recent entry here that affects it — the CSV cannot express that on
     # its own, and a silent step change reads as a win.
     f.write("> **Measurement changes** — read before comparing across a date.\n"
+            "> * **2026-08-21** (hisab 2.11.2, cyrius 6.5.18 → 6.5.33): `lib/bench.cyr` now\n"
+            ">   MEASURES one clock read on the host and subtracts it from every sample, and\n"
+            ">   `bench_run` sizes its own batches instead of wrapping a clock pair around every\n"
+            ">   iteration. **No hisab source changed.** The floor is re-measured every run and\n"
+            ">   recorded per row in `floor_ns` (~1,340–1,350 ns on this host; upstream measured a\n"
+            ">   230x spread across its four gate hosts, and it moves between reboots, so it is\n"
+            ">   not a constant and is not written down as one).\n"
+            ">   `ease_in_out` 1,407 ns → 7 ns, `cx_mul` 1,459 → 37, `quat_mul` 1,473 → 67,\n"
+            ">   `perlin_2d` 1,461 → 82 — those four were 94–100% instrument. The old numbers\n"
+            ">   also FLATTENED them: four operations spanning **149x** in reality were reported\n"
+            ">   within **1.26x** of each other, so a real regression had room to hide. 44 of 72\n"
+            ">   rows moved more than 10%; **none of it is a speedup**. Rows carry `regime=net`\n"
+            ">   from this date and the trend filter refuses to mix them with `raw` ones.\n"
+            ">   ⚠ `min_ns`/`max_ns` also changed meaning for anything `bench_run` chose to batch:\n"
+            ">   they are now per-CHUNK averages, not per-iteration extremes. That is the honest\n"
+            ">   reading — a single sub-floor iteration has no measurable duration — but it means\n"
+            ">   the spread narrows for reasons unrelated to the code. `estimate_ns` (the avg) is\n"
+            ">   unaffected and remains the column the trend is built on.\n"
             "> * **2026-08-10**: 17 sub-microsecond benchmarks moved from `bench()` to\n"
             ">   `bench_batch()`. `bench_run` wraps a `clock_gettime` PAIR around every call\n"
             ">   (~240 ns, documented in `lib/bench.cyr`), so those rows were **~95% clock\n"

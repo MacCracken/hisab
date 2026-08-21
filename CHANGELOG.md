@@ -2,6 +2,144 @@
 
 ## [Unreleased]
 
+## [2.11.2] - 2026-08-21 — the toolchain catch-up, and the three stale constants it found
+
+Fifteen toolchain releases in one bump — cyrius **6.5.18 → 6.5.33** — plus sakshi 2.4.10 → 2.4.11
+and, vendored with the toolchain, **ganita 1.0.4 → 1.1.4**. No feature work. Suite **3514 → 3526**,
+constant gate 159/159, coverage 640/644 (99%) over 36/36 files, fuzz clean.
+
+**Every finding in this release is a number that was written down once and then trusted.** Three of
+them, in three different files, all the same shape as 2.11.1's `ALLOC_MAX` finding: a constant
+derived from a dependency, correct when written, silently false afterwards. None was found by a
+failing test — all 3514 assertions passed on **both** sides of the bump.
+
+### Changed — toolchain, deps, and the vendored stdlib
+
+- **`cyrius.cyml`**: `cyrius = "6.5.18"` → `"6.5.33"`, sakshi `2.4.10` → `2.4.11`.
+- **`lib/` re-vendored from the 6.5.33 snapshot** — all 29 stdlib files now byte-identical to
+  `~/.cyrius/versions/6.5.33/lib`, verified file by file rather than assumed.
+
+  ⚠ **The tree arrived mid-sync and the half that was missing was the half that mattered.** `lib/`
+  had been synced against **≈6.5.19**, not the target pin: `alloc`, `assert`, `atomic`, `bench` and
+  `syscalls_windows` were current, while **`ganita.cyr` (1.0.4, −202 lines)**, `fmt.cyr` and three
+  more syscalls variants were behind. Comparing old-pin against new-pin would have shown a tidy
+  diff and missed it; only comparing against **the pin's own snapshot** finds it. That is the
+  third time ganita specifically has been caught stale this way.
+
+- **Code-only stdlib delta, measured rather than eyeballed.** A brace-aware extractor that strips
+  comments puts the whole 6.5.18 → 6.5.33 stdlib change at **four functions**: `ganita_f64_pow`
+  (below), `fmt_float_buf` (dropped the carry when a fraction rounded up to a full unit — `3 - 1e-7`
+  printed `2.1000000`), `assert_eq` (its two numbers went to fd 1 while the rest of the message went
+  to fd 2, so any harness capturing the streams separately saw them orphaned), and `bench.cyr`
+  (below). ⚠ A first pass keyed on `fn` alone reported **7 changed ganita bodies**; six of those were
+  the *trailing comment block* being attributed to the preceding function. The instrument was wrong
+  before the measurement was.
+
+### Fixed — `f64_pow`'s domain moved under us, and it changed a hisab public API
+
+ganita 1.1.4 fixed `ganita_f64_pow` upstream: zero base, zero exponent, and **negative base with an
+integral exponent** are special-cased instead of falling into `exp(n*ln(base))` and returning NaN.
+
+⭐ **`expr_eval` was sitting directly on it.** `src/symbolic.cyr`'s `EXPR_POW` branch calls `f64_pow`
+raw, so evaluating a negative base at an integer power returned **NaN for hisab's entire history**
+and returns a number now. `f64_pow(0,0)` was NaN and is 1; `f64_pow(0,-1)` was NaN and is +Inf.
+**No test covered any of it**, which is exactly why all 3514 assertions passed either side.
+
+- **12 assertions added** pinning the new domain as a contract, so a silent revert upstream cannot
+  reintroduce a NaN nobody is watching for. ⚠ **Discrimination measured, not asserted**: the group
+  was re-run against a checkout still holding ganita 1.0.4 and **10 of the 12 fail there**. The two
+  that pass on both sides are the two controls — `(-2)^0.5` still NaN, `_ad_pow(-2,4)` still exactly
+  16. A group where every line flipped would mean the controls were not controls.
+
+- **`_ad_pow` stays, and its stated reason was rewritten because the old one is now false.** It
+  existed to escape a *domain* restriction that no longer exists. It survives on **precision**: the
+  upstream fix takes its magnitude from `exp(n*ln|base|)` and applies the sign, so it inherits the
+  transcendental round-trip. Measured — `f64_pow(-2,3)` is `0xC01FFFFFFFFFFFFE`
+  (−7.99999999999999982) against `0xC020000000000000`, exactly −8 — and since `f64_to` **truncates**,
+  the two paths disagree by a whole integer: `(-2)^4` reads **15** through the stdlib and **16**
+  through hisab.
+
+- Stale claims corrected where they had become false rather than historical: `src/autodiff.cyr`'s
+  `_ad_pow` header, two assertion messages in `tests/modules.tcyr` that asserted something about the
+  stdlib the stdlib had stopped doing, the note block in `tests/abuse.tcyr` (moved to past tense),
+  and `docs/doc-health.md`. Historical narrative — the roadmap's per-release rows, prior CHANGELOG
+  entries — was **deliberately left alone**: a figure stamped "as of 2.11.0" is a record, not a claim.
+
+### Fixed — the benchmark instrument changed, and nothing in the harness could have said so
+
+cyrius 6.5.19 taught `lib/bench.cyr` to **calibrate one clock read on the host and subtract it from
+every sample**, and taught `bench_run` to **size its own batches** instead of wrapping a clock pair
+around every iteration. Both rewrite the number without touching the code being measured.
+
+⭐ **44 of 72 rows moved more than 10% and not one of them is a speedup.** Measured on this host
+(floor ~1,343 ns), same source, zero code changes: `ease_in_out` **1,407 ns → 7 ns**, `cx_mul`
+1,459 → 37, `quat_mul` 1,473 → 67, `perlin_2d` 1,461 → 82. Those four were **94–100% instrument**.
+
+⚠ **And the old numbers FLATTENED them.** Four operations spanning **149x** in reality were reported
+within **1.26x** of each other, because the floor dominated all four. A real regression had room to
+hide inside that — the same failure 2.10.0 recorded when triangle/sphere measured 1.19x against a
+true 3.6x. The 2.10.0 sweep moved 17 benchmarks off the floor; **these four were still on it**, and
+it took the toolchain fixing the instrument to surface them.
+
+- **`bench-history.csv` gains `regime` and `floor_ns`, and the trend filter now enforces them.**
+  Filtering on `stat` alone was not enough: rows either side of this boundary are all `avg`, so
+  every one of those 44 artefacts would have printed as an improvement. **This is the third
+  measurement-method change to move every row** (2.9.2 max→avg, 2.10.0 bench→bench_batch, now the
+  timer floor), and the first two were each answered with a paragraph of prose the trend table could
+  not read. CLAUDE.md says to wait for the third instance before extracting an abstraction — so the
+  marker is now a column, and the run reports the 1,734 rows it excluded rather than quietly
+  dropping them.
+
+  ⚠ **`regime` is DERIVED, not declared** — read from whether the harness printed its own measured
+  floor — so it cannot go stale the way the constant it replaces did. ⚠ **What it cannot do, said
+  plainly:** it separates "floor subtracted" from "floor not subtracted". A future instrument change
+  that kept printing the line would not flip it. This narrows the hole; it does not close it.
+
+- `tests/hisab.bcyr`'s `bench_batch` header cited "~240 ns of overhead per op" from `lib/bench.cyr`.
+  Upstream **retired** that figure: a clock read is 15–32 ns on macOS arm64 and ~3,550 ns on aarch64
+  Linux — a **230x spread** — so no single number belongs in a comment. Replaced with a pointer to
+  `bench_clock_overhead_ns()`.
+
+### Changed — 38 files reformatted (`cyrius fmt` fixed its own output)
+
+cyrius 6.5.28 fixed `cyrfmt`, which had never tracked parentheses: every line was indented at
+`brace_depth * 4`, so a continuation line inside an unclosed `(` came out at the enclosing
+statement's indent and `--check` then rejected the formatter's own output, **exiting 1 in complete
+silence**. Canonical is now 2 spaces per open-paren level.
+
+- **38 of 44 source files failed `fmt --check`** on arrival and are reformatted. ⚠ Proven
+  **leading-indentation-only**: stripping leading whitespace line-for-line leaves both versions
+  byte-identical, and no file changed line count. Longest line is now **119** of the 120-char lint
+  limit — tight enough to be worth knowing.
+- ⚠ **`cyrius fmt` REWRITES IN PLACE as of 6.5.28** (it was stdout-only). Anything shaped like
+  `cyrius fmt f.cyr > f.new` must move to `--dry`. Nothing in this repo did.
+
+### Fixed — the bundle-size ceiling this project has designed around does not exist any more
+
+`cyrius.cyml` documented the bundle as "~786 KB / 21,368 lines — **76.8% of cycc 6.5.16's 1 MB
+input_buf** (243,097 B headroom)", and CLAUDE.md carried the same ceiling at 85.4%.
+
+⭐ **cyrius 6.5.22 relocated `input_buf` from `0x00000` to `0x4D9D000` and raised `_SRC_CAP` from
+1 MB to 16,777,216 B** — the 1 MB cap had been refusing sigil (1,084,265 B), mabda (1,259,999 B) and
+drishti (1,403,806 B) outright. The real figures are **898,472 B / 23,311 lines = 5.4%**, with
+**15,878,744 B** of headroom.
+
+⚠ **Verified, not read off a comment**: a 1,162,472 B source — 111% of the retired cap — compiles
+clean through `cyrius check --with-deps`. The bundle-size pressure that shaped `[lib]` is gone.
+Also corrected there: the module count, which said 34 while listing 35.
+
+### Verification
+
+- Suite **3526/3526** across 5 files (hisab 416, foundation 351, modules **1787**, edge_cases 233,
+  abuse 739) · fuzz 1/1 · coverage **640/644 (99%)** over 36/36 files.
+- `cyrius lint` 44/44 files, 0 warnings · `cyrius fmt --check` 44/44 clean · `cyrius vet` clean.
+- `scripts/check-constants.sh` **159/159**, 1 skipped · `check-measurements.sh --selftest` recall
+  21/22, 0 of 15 decoys flagged.
+- `cyrius deps --verify` **30/30** · `cyrius distlib --check` no drift ·
+  `cyrius check --with-deps dist/hisab.cyr` ok · build → 224 KB static x86_64 ELF.
+- ⚠ **`bench-history.csv`'s pre-2026-08-21 rows are not comparable to this run's** and the trend
+  table no longer pretends otherwise. **No performance claim is made in 2.11.2.**
+
 ## [2.11.1] - 2026-08-11 — the audit release: one rule, and the four sites that broke it
 
 A full P(-1) sweep of the v2.11.0 tree — six dimensions, 115 checks, every finding handed to an

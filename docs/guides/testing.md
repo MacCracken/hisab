@@ -26,11 +26,11 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 | Suite | Assertions | Covers |
 |-------|-----------|--------|
 | `foundation.tcyr` | 351 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
-| `modules.tcyr` | 1775 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff (forward-mode duals AND the 2.11.0 reverse-mode tape), interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1, the OBB rotation partial in 2.10.2) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse) |
+| `modules.tcyr` | 1787 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff (forward-mode duals AND the 2.11.0 reverse-mode tape), interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1, the OBB rotation partial in 2.10.2) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse) |
 | `hisab.tcyr` | 416 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms), decomposition (SVD, QR, eigen), Krylov (GMRES) |
 | `edge_cases.tcyr` | 233 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11) |
 | `abuse.tcyr` | 739 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Surfaced 11 real defects on public entry points, held in a known-defect register rather than deleted |
-| **Total** | **3514** | |
+| **Total** | **3526** | |
 
 ## Benchmarks (72 operations)
 

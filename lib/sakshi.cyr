@@ -1,5 +1,5 @@
 # sakshi.cyr — tracing, error handling, and structured logging for Cyrius
-# Bundled distribution of sakshi v2.4.10
+# Bundled distribution of sakshi v2.4.11
 # Source: https://github.com/MacCracken/sakshi
 # License: GPL-3.0-only
 #
@@ -1512,11 +1512,39 @@ enum _SkSpanConst {
     _SK_MAX_SPANS = 16;
 }
 
+# Count of spans refused because the stack was full. Never reset — it is a
+# cumulative "how much tracing was lost" figure, not a gauge.
+var _sk_spans_dropped: i64 = 0;
+
 # Enter a span — push name + timestamp onto the stack.
 # One _sk_now_ns per call: the same reading seeds both the stack start time
 # and the emitted event's timestamp.
+#
+# Returns 0 when the span was pushed, and a NON-ZERO count when it was
+# refused because the stack was full.
+#
+# Saturation used to be completely invisible: this returned 0 either way and
+# emitted nothing, so a caller with an unbalanced enter/exit pair burned one
+# of the 16 slots permanently (the depth counter is a global and is never
+# reset) and after 16 of them ALL span tracing stopped, with no diagnostic
+# anywhere. A tracing library that stops tracing has to say so. Reported by
+# yukti 2.3.4, which had 18 unbalanced returns across 7 functions and lost
+# observability in exactly this way.
+#
+# The 0-on-success convention is preserved, matching sakshi_log_kv in 2.4.10
+# (0 = fully emitted, non-zero = what did not fit). Every existing caller
+# ignores the return, so this is additive information, not a break.
+#
+# The warning is ONE-SHOT — a saturated stack means the next call saturates
+# too, and a warning per call would be its own log storm.
 fn sakshi_span_enter(name, name_len): i64 {
-    if (_sk_span_depth >= _SK_MAX_SPANS) { return 0; }
+    if (_sk_span_depth >= _SK_MAX_SPANS) {
+        _sk_spans_dropped = _sk_spans_dropped + 1;
+        if (_sk_spans_dropped == 1) {
+            sakshi_warn("sakshi: span stack full (16) - spans dropped; check for unbalanced sakshi_span_enter", 84);
+        }
+        return _sk_spans_dropped;
+    }
     var ts = _sk_now_ns();
     var offset = _sk_span_depth * 24;
     store64(&_sk_span_stack + offset, name);
@@ -1547,6 +1575,16 @@ fn sakshi_span_exit(): i64 {
 # Get current span depth
 fn sakshi_span_depth(): i64 {
     return _sk_span_depth;
+}
+
+# Cumulative count of spans refused because the stack was full.
+#
+# Deliberately NOT prefixed as public API in the 2.4.x line: it exists so the
+# test suite can assert the drop path, and so a consumer debugging lost traces
+# can read it. Promoting it to a documented accessor is a MINOR change (new
+# public surface) and is left for 2.5.0.
+fn _sk_spans_dropped_count(): i64 {
+    return _sk_spans_dropped;
 }
 
 # Set the active (64-bit) trace ID for correlating spans and events.

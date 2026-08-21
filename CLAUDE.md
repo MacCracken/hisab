@@ -159,6 +159,17 @@ VERSION              — single source of truth for version
 
 - **Toolchain pin**: `cyrius = "6.5.33"` in `cyrius.cyml`. CI and release both grep
   the manifest; no hardcoded versions in YAML
+- **Toolchain install**: both workflows pipe the pin into the **upstream installer**
+  (`curl -sSf .../cyrius/main/scripts/install.sh | CYRIUS_VERSION="$PIN" sh`), matching patra.
+  **Never hand-roll the tarball extraction.** ⚠ The hand-rolled block this replaced laid the
+  toolchain out FLAT as `~/.cyrius/{bin,lib}` — cyrius resolves the stdlib from
+  `~/.cyrius/versions/<pin>/lib`, so it broke outright at 6.5.33 — and it also did **no checksum
+  or signature verification** and swallowed every copy error with `|| true`, so it could not fail.
+  The installer verifies the `.sha256` fail-closed (CVE-21) plus an Ed25519 signature over
+  `SHA256SUMS` (CVE-13), and errors loudly on a tarball missing `bin/` or `lib/`
+- **Toolchain-verify gate**: immediately after install, `cyrius version` must equal the manifest
+  pin and `~/.cyrius/versions/<pin>/lib` must exist. Added 2.11.2 because the install failure
+  surfaced two steps later as a path error out of `cyrius deps` — assert where it is diagnosable
 - **Tag filter**: release triggers on `tags: ['v?[0-9]+.[0-9]+.[0-9]+']` (with or without `v` prefix)
 - **Version-verify gate**: release asserts `VERSION == git tag` before building
   (cyrius.cyml auto-syncs via `${file:VERSION}`). CI's docs job additionally asserts the

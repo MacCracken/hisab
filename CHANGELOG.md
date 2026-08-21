@@ -100,6 +100,37 @@ it took the toolchain fixing the instrument to surface them.
   Linux — a **230x spread** — so no single number belongs in a comment. Replaced with a pointer to
   `bench_clock_overhead_ns()`.
 
+### Fixed — CI installed the toolchain by hand, and it broke at 6.5.33
+
+Both workflows fetched the release tarball and laid it out **flat** as
+`~/.cyrius/{bin,lib}`. cyrius resolves the stdlib snapshot from
+`~/.cyrius/versions/<pin>/lib`, so `cyrius deps` failed with *"pins version 6.5.33 but it is not
+installed at /home/runner/.cyrius/versions/6.5.33/lib"*. Both now pipe the pin into the **upstream
+installer** (`scripts/install.sh`), matching patra. The pin stays the single source of truth — no
+version is hardcoded in the YAML.
+
+⚠ **Only one of the three defects in that block was visible.** The layout was the one that failed;
+the other two had been silently true for as long as the block existed:
+
+- **No integrity check at all.** It was a bare `curl -sLO` on a release tarball, untarred. The
+  installer **requires** the published `.sha256` and fails closed when it is missing, unverifiable
+  or mismatched (CVE-21), and verifies an **Ed25519 signature** over `SHA256SUMS` where one is
+  published (CVE-13). Both were confirmed live: an end-to-end install into a scratch `CYRIUS_HOME`
+  printed `checksum verified` and `signature verified (Ed25519)`. This repo ships a `SECURITY.md`
+  and a security job and was installing an unverified binary toolchain — on the **release**
+  workflow too, which builds the artifact that ships.
+- **The step could not fail.** All three copies ended in `2>/dev/null || true`, so an empty `bin/`
+  or a missing `lib/` "installed successfully" and surfaced later as an unrelated error. The
+  installer errors loudly on a tarball missing either. **A step that cannot fail is not a step** —
+  the same shape as 2.9.2's three non-gating gates.
+
+- **New step: `Verify toolchain matches the pin`**, in both workflows. The original failure showed
+  up two steps downstream as a path error from `cyrius deps`. It is now asserted where it is
+  diagnosable: `cyrius version` must equal the manifest pin, and
+  `~/.cyrius/versions/<pin>/lib` must exist. Verified against a real install in a scratch
+  `CYRIUS_HOME` — 102 files present, both assertions pass — with the machine's own toolchain
+  untouched.
+
 ### Changed — 38 files reformatted (`cyrius fmt` fixed its own output)
 
 cyrius 6.5.28 fixed `cyrfmt`, which had never tracked parentheses: every line was indented at

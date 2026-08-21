@@ -19,18 +19,57 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Cyrius toolchain
+        # Use the UPSTREAM INSTALLER. The `cyrius.cyml [package].cyrius` pin stays
+        # the single source of truth (CLAUDE.md § CI/Release) — no version is
+        # hardcoded in this YAML; the pin is read and handed to the installer.
+        #
+        # ⚠ THIS REPLACES A HAND-ROLLED TARBALL EXTRACTION THAT BROKE AT 6.5.33,
+        # and it was wrong in three ways, only one of which was visible:
+        #
+        # 1. WRONG LAYOUT (the failure). It laid the toolchain out FLAT, as
+        #    ~/.cyrius/{bin,lib}. cyrius resolves the stdlib snapshot from
+        #    ~/.cyrius/versions/<pin>/lib, so `cyrius deps` died with
+        #    "pins version 6.5.33 but it is not installed at
+        #    /home/runner/.cyrius/versions/6.5.33/lib". The installer creates the
+        #    versioned tree, writes ~/.cyrius/current, and symlinks bin/ and lib/
+        #    at it — which is also what `cyrius lib sync` needs.
+        #
+        # 2. NO INTEGRITY CHECK AT ALL. It did `curl -sLO` on a release tarball and
+        #    untarred it. The installer REQUIRES the published `.sha256` and fails
+        #    closed if it is missing, unverifiable, or mismatched (CVE-21), and
+        #    verifies an Ed25519 signature over SHA256SUMS where one is published
+        #    (CVE-13). This repo ships a SECURITY.md and a security job; it should
+        #    not have been installing an unverified binary toolchain.
+        #
+        # 3. IT COULD NOT FAIL. Every copy ended in `2>/dev/null || true`, so an
+        #    empty bin/ or a missing lib/ installed "successfully" and the error
+        #    surfaced later as something else. The installer errors loudly on a
+        #    tarball with no bin/ or no lib/. **A step that cannot fail is not a
+        #    step** — same shape as the three non-gating gates in 2.9.2.
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          [ -n "$CYRIUS_VERSION" ] || { echo "could not read the cyrius pin from cyrius.cyml"; exit 1; }
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
-          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
-          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
-          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
-          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
-          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
-          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+          echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
+
+      - name: Verify toolchain matches the pin
+        # The install failure above surfaced two steps later, as a `cyrius deps`
+        # error about a path. Assert it HERE, where it is diagnosable: the binary
+        # on PATH must be the version cyrius.cyml pins, and the versioned stdlib
+        # snapshot the manifest resolves against must actually exist.
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          ACTUAL="$(cyrius version | head -1 | awk '{print $2}')"
+          [ "$ACTUAL" = "$CYRIUS_VERSION" ] || {
+            echo "::error::toolchain is $ACTUAL but cyrius.cyml pins $CYRIUS_VERSION"; exit 1; }
+          [ -d "$HOME/.cyrius/versions/$CYRIUS_VERSION/lib" ] || {
+            echo "::error::stdlib snapshot missing at ~/.cyrius/versions/$CYRIUS_VERSION/lib"; exit 1; }
+          echo "toolchain $ACTUAL matches the pin; stdlib snapshot present"
 
       - name: Resolve dependencies
         run: cyrius deps

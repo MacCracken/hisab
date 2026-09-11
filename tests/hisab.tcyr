@@ -3875,6 +3875,147 @@ assert_eq(_sq_n, 156, "svd subnormal sweep: all 156 (fixture, scale) pairs ran")
 # not successes. Pinned as a tracked defect so the repair has an acceptance test.
 assert_eq(_sq_ok, 94, "svd subnormal sweep: 94 of 156 report SUCCESS (most of them wrongly)");
 
+# ================================================================
+# 2.22.0 -- THE HOUSEHOLDER GATE, AND WHY THIS WAS NEVER A SUBNORMAL DEFECT
+# ================================================================
+# ⛔ The roadmap filed this as "subnormal SVD". It is not. `_lp_bidiagonalize`
+# gated its left and right Householder reflectors on `norm > EPSILON_F64` -- an
+# ABSOLUTE 1e-12 on a degree-ONE length -- and when the gate fired the reflector
+# was skipped while the extraction below it still read only the bidiagonal band,
+# so the entries that reflector would have zeroed were SILENTLY DROPPED and the
+# routine returned the factorisation of a DIFFERENT matrix with rc = HSB_ERR_NONE.
+# ⭐ The boundary is a BLOCK RATIO of ~2^-40, i.e. a condition number of ~1e12 --
+# an ordinary ill-conditioned matrix, ~982 binades above where the roadmap placed
+# it. Measured on the shipped 2.21.0 tree over a 60-scale normal-range sweep:
+# 25 of 60 silently wrong; repaired, 0.
+# ⚠ Oracle-free by construction: A = blockdiag(B, c*B) has singular values
+# {s(B)} u {c*s(B)} EXACTLY, and c is a power of two, so `c * S[k]` is exact and
+# bit equality is the right assertion -- no reference implementation is involved.
+# [measured: 60 normal + 52 subnormal block ratios, both trees, 2026-09-11]
+fn _hh_blk(i, j) {
+    if (i == 0) {
+        if (j == 0) { return 3; }
+        return 4;
+    }
+    if (j == 0) { return 2; }
+    return 3;
+}
+fn _hh_run(e, out_S) {
+    var c = (1023 - e) << 52;
+    var A = ganita_mat_new(4, 4);
+    for (var i = 0; i < 4; i = i + 1) {
+        for (var j = 0; j < 4; j = j + 1) { ganita_mat_set(A, i, j, 0); }
+    }
+    for (var p = 0; p < 2; p = p + 1) {
+        for (var q = 0; q < 2; q = q + 1) {
+            ganita_mat_set(A, p, q, f64_from(_hh_blk(p, q)));
+            ganita_mat_set(A, 2 + p, 2 + q, f64_mul(f64_from(_hh_blk(p, q)), c));
+        }
+    }
+    var U = ganita_mat_new(4, 4);
+    var Vt = ganita_mat_new(4, 4);
+    for (var k = 0; k < 4; k = k + 1) { store64(out_S + k * 8, 0); }
+    return svd_golub_kahan(A, U, out_S, Vt);
+}
+
+var _hh_S = alloc(32);
+# 2^-40 is the first scale the shipped tree got wrong. Multiplying a normal f64 by
+# 2^-40 subtracts 40 from its exponent field, so the expected bits are exactly
+# `S[k] - (40 << 52)` -- an exact identity, not a tolerance.
+assert_eq(_hh_run(40, _hh_S), HSB_ERR_NONE, "svd 2^-40 block ratio: reports success");
+assert_eq(load64(_hh_S + 16), load64(_hh_S) - (40 << 52),
+  "svd 2^-40: the small block's largest singular value is EXACTLY c times the large block's");
+assert_eq(load64(_hh_S + 24), load64(_hh_S + 8) - (40 << 52),
+  "svd 2^-40: and its smallest is too (shipped 2.21.0 returned it 9.89x too large)");
+# ⚠ A DEEPER scale, to prove the repair is not a threshold moved one binade.
+assert_eq(_hh_run(200, _hh_S), HSB_ERR_NONE, "svd 2^-200 block ratio: reports success");
+assert_eq(load64(_hh_S + 16), load64(_hh_S) - (200 << 52),
+  "svd 2^-200: still exactly c times, 160 binades below the old cliff");
+# ⚠ And a CONTROL above the old boundary, so the assertions above cannot pass by
+# the routine having become scale-free in a way that broke the easy case.
+assert_eq(_hh_run(10, _hh_S), HSB_ERR_NONE, "svd 2^-10 block ratio (control): reports success");
+assert_eq(load64(_hh_S + 16), load64(_hh_S) - (10 << 52),
+  "svd 2^-10 (control): exact, as it always was");
+
+# ⛔ THE SYMMETRIC TWIN, AND IT IS WHY THIS RELEASE COVERS TWO PUBLIC ENTRY
+# POINTS. `_lp_tridiagonalize` carries the identical gate, so `eigen_qr` returned
+# the spectrum of a DIFFERENT matrix. A = [1] (+) c*B3 with
+# B3 = [[1,1,2],[1,4,1],[2,1,1]], whose exact eigenvalues are -1, 2, 5; the
+# leading 1 pins max|A| = 1 so balancing is the IDENTITY and nothing here is
+# subnormal or scaled.
+# ⛔ Shipped 2.21.0 from c = 2^-42 down returned lambda/c = {4.5615528, 1,
+# 0.4384472} -- and those are exactly the eigenvalues of
+# tridiag(diag = (c,4c,c), offdiag = (c,c)), the matrix you get by DROPPING
+# W[3,1] = 2c. The mechanism is pinned by the values themselves.
+# ⭐ THE SMALLEST EIGENVALUE CAME BACK WITH THE WRONG SIGN (+0.438 for -1), which
+# is the most discriminating thing to assert: a tolerance-based check would have
+# passed a repair that only shrank the error.
+# [measured: 1074-scale sweep, first wrong scale 2^-42, 2026-09-11]
+fn _hh_b3(i, j) {
+    if (i == 0) {
+        if (j == 0) { return 1; }
+        if (j == 1) { return 1; }
+        return 2;
+    }
+    if (i == 1) {
+        if (j == 0) { return 1; }
+        if (j == 1) { return 4; }
+        return 1;
+    }
+    if (j == 0) { return 2; }
+    if (j == 1) { return 1; }
+    return 1;
+}
+fn _hh_eig(e, vals) {
+    var c = (1023 - e) << 52;
+    var A = ganita_mat_new(4, 4);
+    for (var i = 0; i < 4; i = i + 1) {
+        for (var j = 0; j < 4; j = j + 1) { ganita_mat_set(A, i, j, 0); }
+    }
+    ganita_mat_set(A, 0, 0, F64_ONE);
+    for (var p = 0; p < 3; p = p + 1) {
+        for (var q = 0; q < 3; q = q + 1) {
+            ganita_mat_set(A, 1 + p, 1 + q, f64_mul(f64_from(_hh_b3(p, q)), c));
+        }
+    }
+    var vecs = ganita_mat_new(4, 4);
+    for (var k = 0; k < 4; k = k + 1) { store64(vals + k * 8, 0); }
+    return eigen_qr(A, 4, 2000, vals, vecs);
+}
+
+var _hh_V = alloc(32);
+assert_eq(_hh_eig(42, _hh_V), HSB_ERR_NONE, "eigen_qr 2^-42: reports success");
+# The three small eigenvalues are c * {5, 2, -1}. Exact, since c is a power of two
+# and 5, 2, -1 are exactly representable.
+# ⚠ DIVIDED BY c, WHICH IS EXACT (a power of two), AND COMPARED AT A FEW ULP
+# RATHER THAN BIT-EXACTLY. The first draft of these four asserted bit equality and
+# all four failed BY EXACTLY ONE ULP -- the QR iteration converges to within
+# rounding, it is not scale-equivariant the way the SVD's power-of-two block is
+# (those assertions above ARE bit-exact and hold). The fixture was wrong, not the
+# code. `ULP_TOL_H` is ~1e-15, a few ulp of 1.0, and it is still enormously
+# discriminating here: the shipped tree is 8.8%, 50% and 144% out on these three.
+# [measured: these assertions run against the 2.21.0 tree, 9 of 9 fail, 2026-09-11]
+assert_eq(f64_approx_eq(f64_div(load64(_hh_V + 8), (1023 - 42) << 52),
+    f64_from(5), ULP_TOL_H), 1,
+  "eigen_qr 2^-42: largest small eigenvalue is 5c (shipped gave 4.5615528c)");
+assert_eq(f64_approx_eq(f64_div(load64(_hh_V + 16), (1023 - 42) << 52),
+    f64_from(2), ULP_TOL_H), 1,
+  "eigen_qr 2^-42: middle is 2c (shipped gave 1c)");
+assert_eq(f64_approx_eq(f64_div(load64(_hh_V + 24), (1023 - 42) << 52),
+    f64_neg(F64_ONE), ULP_TOL_H), 1,
+  "eigen_qr 2^-42: smallest is -c (shipped gave +0.4384472c)");
+# ⭐ THE SIGN, ASSERTED SEPARATELY AND BIT-EXACTLY. This is the discriminating
+# half: a repair that merely shrank the error would still pass a tolerance, and
+# the shipped tree returns this eigenvalue POSITIVE where the answer is negative.
+assert_eq(f64_lt(load64(_hh_V + 24), 0), 1,
+  "eigen_qr 2^-42: and its SIGN is negative, which the shipped tree got wrong");
+assert_eq(_hh_eig(200, _hh_V), HSB_ERR_NONE, "eigen_qr 2^-200: reports success");
+assert_eq(f64_approx_eq(f64_div(load64(_hh_V + 24), (1023 - 200) << 52),
+    f64_neg(F64_ONE), ULP_TOL_H), 1,
+  "eigen_qr 2^-200: still -c, 158 binades below the old cliff");
+assert_eq(f64_lt(load64(_hh_V + 24), 0), 1,
+  "eigen_qr 2^-200: and still negative");
+
 # ⭐ AND THE NaN CONTRACT, WHICH IS WHAT DECIDES THE SHAPE OF THAT ZERO ARM. The
 # test must be `f64_eq(|off|, 0)`, not the tempting `f64_gt(|off|, 0) == 0` —
 # the latter is TRUE for NaN as well, so a NaN off-diagonal would be declared

@@ -2,6 +2,125 @@
 
 ## [Unreleased]
 
+## [2.22.0] - 2026-09-11 — the Householder gate: a silent wrong answer at ordinary conditioning, in two public entry points
+
+The roadmap carried this as **"subnormal SVD"** for three releases. It is not a subnormal defect, and
+that is the release. Suites **3991 → 4014**.
+
+⛔ **`_lp_bidiagonalize` GATED ITS HOUSEHOLDER REFLECTORS ON AN ABSOLUTE 1e-12, AND WHEN THE GATE FIRED
+IT SILENTLY DISCARDED THE MASS IT DECLINED TO REFLECT.** `norm_l`/`norm_r` are **lengths** — degree ONE
+in the caller's units — tested against `EPSILON_F64`. Below that the reflector was skipped, while the
+extraction below it still read only the bidiagonal band, so the entries that reflector would have zeroed
+were **dropped** and the routine returned the factorisation of a **different matrix** with
+`rc = HSB_ERR_NONE`.
+
+⭐ **THE BOUNDARY IS A BLOCK RATIO OF 2^-40 — A CONDITION NUMBER OF ~1e12, NOT A SUBNORMAL.** That is an
+ordinary ill-conditioned matrix, **982 binades above** where the roadmap placed the defect. Measured
+oracle-free, on `A = blockdiag(B, c·B)` with `B = [[3,4],[2,3]]` (det B = 1), where
+`prod(singular values)` must equal `|det A| = c²` and needs no reference implementation:
+
+| block ratio | 2.21.0 `prod(S)/det` | 2.22.0 |
+|---|---|---|
+| 2^-38 | 1.000000 | 1.000000 |
+| 2^-39 | 1.000000 | 1.000000 |
+| **2^-40** | **9.000000** | 1.000000 |
+| 2^-400 | 9.000000 | 1.000000 |
+
+The smallest singular value came back **9.89× too large**, with `rc = HSB_ERR_NONE`, from 2^-40 all the
+way down. Over a 60-scale normal-range sweep: **25 of 60 silently wrong → 0**. The predicted crossing is
+`0.9014·c > 1e-12` after balancing, i.e. 2^-39.71 — and the measured boundary is exactly e = 39 → 40, so
+the mechanism is confirmed quantitatively rather than plausibly.
+
+⛔ **AND THE SYMMETRIC TWIN HAS THE SAME GATE, WHICH IS WHY THIS RELEASE COVERS TWO PUBLIC ENTRY
+POINTS.** `_lp_tridiagonalize` carries the identical absolute test, so `eigen_qr` returned the spectrum
+of a different matrix. On `A = [1] ⊕ c·B3` with `B3 = [[1,1,2],[1,4,1],[2,1,1]]` (exact eigenvalues
+**−1, 2, 5**; the leading 1 pins `max|A|` so balancing is the identity and nothing is subnormal): correct
+at 2^-41, and from **2^-42** down it returns `λ/c = {4.5615528, 1, 0.4384472}` — **the smallest
+eigenvalue comes back with the wrong sign**. ⭐ Those three numbers are exactly `(5±√17)/2` and `1`, the
+spectrum of `tridiag((c,4c,c),(c,c))` — *the matrix you get by dropping `W[3,1] = 2c`*. The mechanism is
+pinned by the values themselves, independently of the symptom.
+
+⛔ **A SECOND, SEPARABLE DEFECT: `_lp_bidiag_qr`'s ACTIVE-BLOCK SEARCH FROZE THE BLOCK AT 2×2.** `p_lo`
+walked left while the superdiagonal above it was still coupling — and tested that coupling against an
+absolute `EPSILON_F64`, while the two deflation loops fifty lines above ask the same question
+**relatively**, and the symmetric twin `_lp_tridiag_qr` has used the relative form since 2.7.0. The SVD
+half of that pair was never converted. ⚠ **A 2×2 SUB-BLOCK CANNOT EXPOSE IT**, which is why the entire
+2.20.0 acceptance family missed it: for a 2×2 the only superdiagonal `p_lo` examines is the exactly-zero
+coupling *between* blocks, so `p_lo` is right by accident. It takes a **3×3 or larger** block, whose own
+interior superdiagonal is small, to reach it. ⭐ **The two defects are perfectly complementary** — the
+reflector repair leaves the 3×3 subnormal case byte-identical, and this repo's rule says a repair that
+moves no number is pointing at a second defect.
+
+⛔ **BOTH ENTRY POINTS RETURNED SUCCESS WITH A NaN PAYLOAD.** `svd_golub_kahan([[+Inf,0],[0,1]])`
+returned `HSB_ERR_NONE` with **both singular values NaN**; `eigen_qr` on the same matrix did the same
+with its eigenvalues. −Inf and NaN behave identically. ⭐ The guard is a single *is not finite* test,
+because **every f64 comparison involving NaN returns 0** — so `f64_lt(|x|, +Inf) == 0` catches Inf and
+NaN together, and splitting it in two is what invites someone to drop the NaN arm.
+
+⛔ **THE ROADMAP'S PROPOSED REPAIR WAS AT THE WRONG PIPELINE STAGE, AND THE 2.19.0 REFUTATION THAT
+BLOCKED IT FOR THREE RELEASES IS TRUE.** The row proposed scaling the active block *inside*
+`_lp_bidiag_qr`. Measured: that converts **84 loud rows into gross silent wrong answers**, 83 of them on
+general 2×2 blocks — and it cannot recover a reflector that bidiagonalisation never applied, because the
+mass is gone before the QR sweep runs. **The refutation was right and the row it blocked was wrong; what
+was missing was the measurement that says which.**
+
+⚠ **A SEVENTH CONSECUTIVE RELEASE WHERE THE ROW WAS WRONG ABOUT SCOPE, AND THIS TIME THE GREP FOUND FIVE
+SITES IN THREE FUNCTIONS UNDER THREE PUBLIC ENTRY POINTS** — `:270` and `:341` (`_lp_bidiagonalize` →
+`svd_golub_kahan`), `:1119` (`_lp_tridiagonalize` → `eigen_qr`), `:1671` and `:1676` (`cqr_decompose`).
+The row named **none** of them; it named only `_lp_bidiag_qr`. Two were measured end-to-end and are
+confirmed defects; the other three are repaired **on the shape**, and that is stated rather than implied.
+⭐ Repairing one side of a pair is how 2.18.0's U-replay defect was created, so `:341` went with `:270`
+even though only `:270` was measured.
+
+### Changed
+- **linalg_precision** — the five Householder gates test `norm > 0` instead of `norm > EPSILON_F64`.
+  ⭐ **Guard what actually fails.** The only operation at risk is `2/vtv`, and it already has its own
+  degree-TWO `F64_TINY` test a few lines below (2.15.0) — which the absolute outer gate had made
+  **unreachable**. What is left for the outer gate to ask is *"is there anything to reflect?"*, an exact
+  zero question with no scale to choose. **A threshold that needs a scale chosen for it is the defect.**
+- **linalg_precision** — `_lp_vec_norm` scales by the largest component before squaring. ⚠ **This is the
+  one site 2.17.0's norm tier missed**: that release repaired 39 of 51 `sqrt(sum of squares)` sites, and
+  this one — which serves all three real Householder reflectors — kept the naive form. It is the *floor*
+  of the gate repair, not a separate nicety: with the gates now asking `norm > 0`, a norm that flushes to
+  zero for a non-zero vector would reinstate the exact skip they were repaired to stop.
+  ⭐ Fast path, not unconditional scaling: the naive sum announces its own failure (subnormal, zero or
+  +Inf exactly when it cannot be trusted), so it is taken when normal and rescaled only when not.
+- **linalg_precision** — `cqr_decompose`'s inlined complex norm gets the same scaling, and its phase test
+  `abs_x1 > EPSILON_F64` becomes `> 0`. ⚠ The phase fallback was `1`, so a small-but-good `x1` got the
+  **wrong phase rather than no phase** — a fabricated value, not a refusal.
+- **linalg_precision** — `_lp_bidiag_qr`'s `p_lo` search uses the relative `_lp_negligible`, matching its
+  own sibling deflation loops and the symmetric twin.
+- **linalg_precision** — `svd_golub_kahan` and `eigen_qr` reject a non-finite entry with
+  `HSB_ERR_INVALID_INPUT`, matching the `m < n` precedent already in the file: *rejecting is the honest
+  contract*, since the caller's `out_S`/`out_vals` have nowhere to put "undefined".
+
+### Removed
+- **linalg_precision** — a dead 20-line block in `_lp_bidiag_qr` computing `q` via a "force exit trick"
+  and an "undo the forced exit trick", after which `q` was **never read again** (verified by grepping
+  every `q` in the function; the comment below it begins *"Recalculate: … Simpler approach"*). ⚠ It also
+  held the file's **second** absolute `EPSILON_F64` on a superdiagonal, so a threshold census found two
+  sites here and one of them could never fire. Output is bit-identical across the deletion.
+
+### Fixed
+- **tests** — 23 assertions added (**3991 → 4014**), and **every one was run against the 2.21.0 tree to
+  prove it discriminates**: 9 of the new SVD/eigen assertions and 6 of the new non-finite assertions fail
+  there and all pass here, while the controls pass on both. ⚠ **The first draft of the eigen assertions
+  demanded bit equality and all four failed by exactly one ULP** — the QR iteration converges to within
+  rounding; it is not scale-equivariant the way the SVD's power-of-two block is. The fixture was wrong,
+  not the code, and the bound is now a few ulp with the **sign** asserted separately, because a tolerance
+  alone would pass a repair that merely shrank the error.
+
+### Performance
+- **A measured cost, stated rather than hidden behind its own spread**: `svd_golub_kahan_12` **+2.98%**
+  (113.85 → 117.24 µs) and `eigen_qr_12` **+0.75%** (86.17 → 86.82 µs), against an **untouched control of
+  +0.29% median over 23 rows, 0 past 10%**. Small, in the direction the added finiteness scan and the
+  norm's two extra branches predict, and inside that row's own historical spread.
+  ⚠ **The first draft of this claim said "no detectable cost" and was written before it was measured.**
+  ⚠ The first attempt to measure it was also wrong: a `cd` into the reference tree persisted across the
+  next command, so both "before" and "after" numbers came from the **same** tree. **Check the probe
+  before believing the probe** — the sixth release running that this was needed.
+
+
 ## [2.21.0] - 2026-09-11 — the CGA null basis: a point's nullity error becomes ulp-level and scale-free
 
 2.20.0 proved `cga_point` returned a wrong answer with **no arithmetic fix available** — at x = 2^-30

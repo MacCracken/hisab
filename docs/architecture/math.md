@@ -8,17 +8,29 @@
 > Conventions: all scalars are IEEE 754 `f64`; near-zero comparisons use
 > `EPSILON_F64 = 1e-12`. Blades/multivectors are heap arrays of `f64` components
 > indexed by blade index (see the layout table). Vector basis is `{e1, e2, e3}`
-> for 3D Euclidean and `{e1, e2, e3, ep, em}` for the 5D conformal model.
+> for 3D Euclidean and `{e1, e2, e3, n0, ninf}` — the **null basis** — for the 5D
+> conformal model. ⚠ Through 2.20.0 this was the orthonormal `{e1, e2, e3, ep, em}`
+> basis and this document described it; §1 below records both, because the change
+> of basis is how the null-basis product table is derived and verified.
 
 ---
 
 ## 1. Conformal Geometric Algebra (`geo_advanced.cyr`)
 
-The conformal model of 3D Euclidean space is the geometric algebra **Cl(4,1)**
-represented here on a 5D basis with metric
+The conformal model of 3D Euclidean space is the geometric algebra **Cl(4,1)**.
+Since 2.21.0 it is represented on the **null basis** `{e1, e2, e3, n0, ninf}`:
 
 ```
-e1² = e2² = e3² = ep² = +1,   em² = −1
+e1² = e2² = e3² = +1,   n0² = ninf² = 0,   n0·ninf = −1
+```
+
+`n0` is the point at the origin and `ninf` the point at infinity. The algebra is
+the same Cl(4,1) as before; only its coordinates moved. The change of basis from
+the orthonormal `{ep, em}` used through 2.20.0 is
+
+```
+n0 = (em − ep)/2      ninf = ep + em
+ep = (ninf − 2·n0)/2  em   = (ninf + 2·n0)/2
 ```
 
 Multivectors are 32 = 2⁵ `f64` components (256 bytes). Blade index → basis blade
@@ -27,19 +39,63 @@ Multivectors are 32 = 2⁵ `f64` components (256 bytes). Blade index → basis b
 | Grade | Indices | Blades |
 |-------|---------|--------|
 | 0 | 0 | scalar |
-| 1 | 1–5 | e1, e2, e3, ep, em |
-| 2 | 6–15 | e12, e13, e1p, e1m, e23, e2p, e2m, e3p, e3m, epm |
-| 3 | 16–25 | e123, e12p, …, e3pm |
-| 4 | 26–30 | e123p, e123m, e12pm, e13pm, e23pm |
-| 5 | 31 | e123pm = **I** (pseudoscalar) |
+| 1 | 1–5 | e1, e2, e3, n0, ninf |
+| 2 | 6–15 | e12, e13, e1n0, e1ninf, e23, e2n0, e2ninf, e3n0, e3ninf, n0ninf |
+| 3 | 16–25 | e123, e12n0, e12ninf, e13n0, e13ninf, e1n0ninf, e23n0, e23ninf, e2n0ninf, e3n0ninf |
+| 4 | 26–30 | e123n0, e123ninf, e12n0ninf, e13n0ninf, e23n0ninf |
+| 5 | 31 | e123n0ninf = **I** (pseudoscalar) |
+
+### 1.0 Why the basis changed
+
+A conformal point embeds as `P = p + (q/2)·ninf + n0` with `q = |p|²`, so **`q`
+lives in one coefficient**. In the ep/em basis it was stored as `(q−1)/2` on `ep`
+and `(q+1)/2` on `em` — the sum *and* difference of two nearly-equal numbers — and
+recovering `q` from them is catastrophic cancellation at both ends of the range.
+2.20.0 proved no arithmetic fix exists: at `x = 2^-30` the correctly-rounded
+`(q−1)/2` **is** exactly `−1/2`, so the information is gone at construction.
+
+Measured against the shipped 2.20.0 tree, 2000 random full-mantissa points per
+binade, median `|P·P| / q`:
+
+| binade | ep/em (2.20.0) | null (2.21.0) |
+|---|---|---|
+| 2^-30 | **1.0** | 4.48e-17 |
+| 2^0 | 1.05e-16 | 4.70e-17 |
+| 2^+30 | **1.0** | 4.33e-17 |
+
+A relative error of 1.0 is total loss of the value. ⚠ A conformal point is **not**
+bit-exactly null: that is reachable only by removing the Neumaier compensation in
+`_cga_scalar_of_geo`, which makes the norm repeat `cga_point`'s own rounding so
+the two cancel — and which fabricates a scalar `0` where the answer is `1`. The
+claim is the sub-ulp *residual*, not a hard zero.
 
 ### 1.1 Products
 
-For basis blades `a`, `b` with bit-masks, the **geometric product** sign is
-`(−1)^s · μ` where `s` counts the transpositions needed to merge the masks and
-`μ = −1` once for each shared `em` (metric), `+1` otherwise; the result blade is
-`bits(a) XOR bits(b)`. For general multivectors the product distributes over
-components (`cga_geometric_product`).
+⛔ **The null basis is not orthogonal, so there is no bit-XOR rule.** `n0·ninf`
+is a scalar *and* a bivector, so one basis-blade product can yield **two** terms:
+`n0*ninf = −1 + n0∧ninf`. Of the 1024 basis-blade pairs, **128 vanish, 768 give a
+single blade and 128 give two**, and **every coefficient is exactly ±1** — so the
+basis-blade product introduces no rounding of its own.
+
+The product is therefore a **table** (`_cga_null_tbl`), built once at first use by
+integer arithmetic only, via the change of basis above applied to the orthonormal
+rule (sign `(−1)^s · μ`, where `s` counts the transpositions needed to merge the
+bit-masks and `μ = −1` once for each shared `em`; result blade `bits(a) XOR
+bits(b)`). `scripts/derive-cga-null-table.sh` derives all 1024 entries
+independently in CI and the Cyrius table must reproduce its FNV-1a
+**`0xF4A98C5706D5CF5B`** over blade-index space exactly.
+
+⚠ **Two index spaces, and confusing them is the documented hazard**: the
+derivation runs in bit-mask space (bit0 = e1 … bit3 = n0, bit4 = ninf) while the
+implementation is called with blade indices, and blade index 4 is bit-mask 8.
+
+⚠ The scalar part of `a*b` no longer comes only from the diagonal. Of the 32 pairs
+that produce blade 0, **16 are `i == j` and 16 are not** — the complementary
+(n0-side, ninf-side) pairs. `_cga_scalar_of_geo` sums all pairs for that reason;
+a diagonal-only sum made every sampled point non-null.
+
+For general multivectors the product distributes over components
+(`cga_geometric_product`).
 
 Grade-selected products keep only the terms of a target grade:
 
@@ -76,10 +132,11 @@ rather than dividing by zero.
 
 ### 1.3 Dual
 
-The unit pseudoscalar is `I = e1∧e2∧e3∧ep∧em` (blade [31]). In this metric
+The unit pseudoscalar is `I = e1∧e2∧e3∧n0∧ninf` (blade [31]). It differs from the
+orthonormal `e1∧e2∧e3∧ep∧em` by a sign (`n0∧ninf = −ep∧em`), which squares away:
 
 ```
-I² = (−1)^{5·4/2} · (e1²e2²e3²ep²em²) = (+1)(−1) = −1   ⟹   I⁻¹ = −I
+I² = −1   ⟹   I⁻¹ = −I        (verified on the shipped tree, not assumed)
 ```
 
 `cga_pseudoscalar_inv` computes `I⁻¹ = ~I / ⟨I ~I⟩₀`; the denominator
@@ -99,7 +156,7 @@ dual(dual(x)) = x · I⁻² = −x
 ```
 
 **Identities** (pinned): `I·I⁻¹ = 1`; `dual(1) = −I` (0→5); `dual(I) = 1` (5→0);
-`dual(e1) = −e23pm` (1→4); `dual(dual(e1)) = −e1`.
+`dual(e1) = −e23n0ninf` (1→4); `dual(dual(e1)) = −e1`.
 
 ### 1.4 Projection and rejection
 
@@ -118,7 +175,11 @@ the outer raises it back), so the rejection-by-subtraction is grade-consistent.
 
 ### 1.5 Conformal embedding (existing constructors)
 
-A 3D point `(x,y,z)` embeds as a null vector; spheres/planes are grade-1 (dual)
+A 3D point `(x,y,z)` embeds as `P = p + (q/2)·ninf + n0`; spheres are
+`S = P − (r²/2)·ninf` and planes `π = n̂ + d·ninf` (grade-1 dual form), each
+touching **one** `ninf` slot where the ep/em basis had to spread them across a
+pair. A translator is `T = 1 − ½·t·ninf`, i.e. blades 9, 12 and 14 only.
+Spheres/planes are grade-1 (dual)
 or grade-4 (direct) blades; rigid motions are versors applied by the sandwich
 `V x ~V` (`cga_sandwich`). See `cga_point` / `cga_sphere` / `cga_plane` /
 `cga_translator` / `cga_rotor` in `geo_advanced.cyr`.

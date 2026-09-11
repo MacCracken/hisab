@@ -2,140 +2,263 @@
 
 ## [Unreleased]
 
+## [2.21.0] - 2026-09-11 — the CGA null basis: a point's nullity error becomes ulp-level and scale-free
+
+2.20.0 proved `cga_point` returned a wrong answer with **no arithmetic fix available** — at x = 2^-30
+the correctly-rounded `ep` **is** exactly −1/2, so the information is gone at construction — and filed
+the basis change as its own release. This is it. Suites **3983 → 3991**.
+
+⭐ **THE REPAIR IS THE BASIS, NOT THE ARITHMETIC, AND THE RESULT IS A SCALE-FREE ERROR FLOOR.** In the
+ep/em basis a point stores `(q−1)/2` and `(q+1)/2`, so `q` is the sum *and* difference of two
+nearly-equal numbers and is destroyed at both ends. In the null basis `P = p + (q/2)·ninf + n0`, `q`
+lives in **one** coefficient and the norm reconstructs it directly instead of recovering it from a
+cancellation. Measured against **the tree that actually shipped as 2.20.0**, 2000 random full-mantissa
+points per binade — median `|P·P| / q`:
+
+| binade | 2.20.0 | 2.21.0 |
+|---|---|---|
+| 2^-30 | **1.0** | 4.48e-17 |
+| 2^0 | 1.05e-16 | 4.70e-17 |
+| 2^+30 | **1.0** | 4.33e-17 |
+
+**A relative error of 1.0 means the entire value is lost**, so both tails went from total loss to
+sub-ulp, and the result is **flat** rather than a U centred on |x| ≈ 1. Distance recovery
+`P₁·P₂ = −d²/2` tracks it: **median 46.4× wrong at 2^-30 and 48.7× at 2^+30 → 1.76e-15 and 1.93e-15**,
+with the centre improving too (**3.8e-15 → 1.87e-15**).
+
+⛔ **"EXACTLY NULL" WAS THE HEADLINE OF THIS RELEASE UNTIL A PRE-TAG AUDIT SHOWED WHAT IT COST.**
+Bit-exact nullity *is* reachable, and this release reached it: removing 2.18.0's Neumaier compensation
+from `_cga_scalar_of_geo` makes the norm repeat `cga_point`'s own rounding of `q`, so the two cancel and
+**0 of 6800 points are non-null**. That has been **reverted**. Without the compensation,
+`M = 1 + a·e1 + a·n0 + (a/2)·ninf` — whose scalar part is exactly 1 — reads **0 for 6 of 11 magnitudes,
+every one at a ≥ 2^30**: a fabricated zero, which is the defect class this repo has been repairing since
+2.6.14, and a worse outcome than a sub-ulp residual. **An exact zero obtained by making the same
+rounding error twice is an artifact, not accuracy.** With the compensation restored, the witness is
+right at all 11 magnitudes, distance recovery is *better* (1.76e-15 against 1.85e-15), and bit-exact
+nullity reads **5194 of 6800 non-null** against 6761 on the shipped tree. The claim this release makes
+is therefore the **residual magnitude** above, which does not depend on the cancellation being exact.
+⚠ I also tried compensating `cga_point`'s `q` to match instead; it moved 5194 → 4988 and changed no
+median, so it was reverted. **Unmeasured complexity is not a fix.**
+
+⛔ **AND NO ASSERTION IN 3989 COULD SEE THAT CHANGE AT ALL.** Removing the compensation and restoring it
+both give a fully green suite — the fabricated zero is on a path nothing exercised. Two assertions now
+pin the witness (**3989 → 3991**), verified to fail with the compensation absent (2071 passed / 1 failed)
+and pass with it present. **A repair no test can distinguish from its own regression is not covered, it
+is unobserved.**
+
+⛔ **AN AUDIT BEFORE TAGGING FOUND FOUR WRONG FIGURES IN THE FIRST DRAFT OF THESE NOTES, TWO GATES THAT
+DID NOT GATE, AND A FILING THAT DESCRIBED ITS OWN BUG WRONGLY — ALL OF IT MINE.** Most of the bad
+numbers came from one mistake: measuring the "before" against a **model** rather than against the tree
+that shipped.
+- The nullity baseline read **24.8%**; that is `derive-cga-null-table.sh`'s Python *model* of ep/em
+  arithmetic. The shipped 2.20.0 tree measures **99.4% (6761 of 6800)**. The result was better than
+  claimed and the published number was still wrong.
+- A translator claim — *"exactly 1 for all 1001 binades; it failed 526 before"* — was **simply false**.
+  Measured on both trees: **485 of 2046 binades fail, first at 2^539 — identical.** The basis change did
+  nothing for the translator.
+- *"Exactly null at every magnitude"* overstated the range even before the compensation was restored:
+  **57 binades fail** — 27 where `q` is subnormal and `fl(q/2)` loses the bottom bit that doubling
+  cannot return, 30 above 2^511 where `q` overflows and the norm is NaN. Below 2^-539 nullity "returns"
+  only because `q` has flushed to zero: the conformal part is gone, not correct.
+- **`point*point` was published as 5306 → 2394 µs and re-measured at 5328 → 2404 µs — right by
+  accident.** The first probe that re-checked it read **5135 µs on the new tree**, apparently refuting
+  the speedup; the difference was a warm-up loop, and chasing it found a real cost nobody had measured
+  (below). The figure stands; the reason it stood was not the one I would have given.
+⛔ **And two gates were green while checking nothing.** `derive-cga-null-table.sh`'s claim 6 *printed*
+the table's FNV and never compared it, and claim 4's null arm tested `q + 2·(q/2)·(−1) != 0`, which is
+**identically false for every normal q** — a tautology reporting "0 non-null". Both exited 0 whatever
+the table said, while the CI step advertised *"fail-closed (verified: breaking any claim exits 1)"*.
+Both now compare, and each is verified to exit 1 when broken. Claim 4 is additionally labelled, in its
+own output, as a **model** whose ep/em figure must never be quoted as the library's — because that is
+exactly the confusion that produced the bad baseline above.
+
+⛔ **THE FIRST CGA CALL COST 2.7 ms, AND EVERY BENCHMARK WAS BLIND TO IT BECAUSE THEY ALL WARM UP.**
+The null table is built lazily at first use, and the first version of the builder called
+`_cga_expand_null`/`_cga_contract_orth` **inside** the 32×32 pair loop — 1024 evaluations for 32
+distinct answers — then scanned all 32×32 coefficient slots per pair when **at most 4×4 are ever
+occupied**. First `cga_geometric_product`: **2.68–3.00 ms against 11 µs on 2.20.0, a ~250× one-time
+regression.** It surfaced only because two probes of the same operation disagreed by 2.1× and the
+difference was a warm-up loop. Repaired by hoisting both tables and iterating occupancy lists:
+**0.72 ms**, still 65× the old first call. So the table pays for itself past **~430 products** — ~709 µs
+extra once, ~1.65 µs saved per call after (steady state **1.25 µs against 2.90 µs**). ⭐ **The rewrite
+was safe to make at tag time precisely because the FNV contract already existed**: the table is
+byte-identical across it, and `0xF4A98C5706D5CF5B` is asserted in the suite.
+
+⛔ **AND THE SPEEDUP IS SCOPED, NOT GLOBAL — IT IS A 10.9× REGRESSION FOR DENSE MULTIVECTORS.**
+`_cga_scalar_of_geo` went from 32 diagonal terms to k² all-pairs terms, so it is **quadratic in
+occupancy** where it was flat. `cga_norm_sq` over 2000 calls by occupied-blade count k, 2.20.0 vs
+2.21.0 (µs, median of 3): k=4 **5025 / 1960** (2.56× faster), k=5 5068 / 2597 (1.95×), k=8 5331 / 5121
+(parity), k=12 5031 / 9854 (**1.96× slower**), k=16 5017 / 15744 (3.14×), k=24 4971 / 31878 (6.41×),
+k=32 **4996 / 54592 (10.93× slower)**. The crossover is at **k ≈ 8**. Every conformal primitive sits
+below it — point 5, sphere 5, translator 4, rotor 2 — so the sparse win is what consumers see
+(`point*point` **5328 → 2404 µs, 2.22×**); a dense general multivector is not.
+
+⛔ **BUILDING IT FOUND A COMPILER BUG, AND MY FIRST FILING DESCRIBED IT WRONGLY.** It was filed as
+*"a firing inner `continue` exits the OUTER loop"*. **Instrumenting the loop refuted that**: the outer
+loop is not terminated and runs its full trip count. What actually happens on cycc 6.6.2, when a loop
+and a loop nested inside it both contain a `continue` **and the outer one appears lexically first**, is
+that both bind one level too far out — the inner `continue` jumps to the **outer** latch (abandoning the
+inner loop *and* the rest of the outer body), and the **outer `continue` becomes a no-op**. That second
+half was missing from the filing entirely, and it fails in the opposite direction: a `continue` that
+silently does nothing produces *more* work, so it cannot announce itself. ⚠ The decisive case has an
+outer `continue` that **never fires** — `if (c == 99) { continue; }` for c in 0..2 — yet its presence
+breaks the inner one, which rules out a misreading of the semantics; and moving it *below* the nested
+loop makes the same program correct, which isolates the trigger to lexical order. The natural sparse-skip
+idiom for a 32×32 table is both broken shapes at once and produced an **all-zero 1024-entry table while
+reporting success**. Filed upstream as `2026-09-11-nested-continue-binds-to-wrong-loop.md` with a repro
+that **proves itself** (exit 0 when correct, 1 while present) across all ten shapes plus three
+instrumentation counters. hisab works around it with if-guards and a comment saying not to tidy them back.
+
+⭐ **THE GATE CAME BEFORE THE CODE.** `scripts/derive-cga-null-table.sh` derives all 1024 entries from
+first principles in CI — at most 2 terms per product, every coefficient exactly ±1 (so the product adds
+no rounding), agreement with the orthonormal table under change of basis, the defining identities
+`n0² = 0`, `ninf² = 0`, `n0·ninf = −1`, and the contract **FNV-1a `0xF4A98C5706D5CF5B`** in
+blade-index space. The Cyrius table reproduces it exactly and a test asserts so. ⚠ **The index space is
+the hazard and it caught me**: the derivation runs in *bitmask* space and the implementation is called
+with *blade indices*, and my first spot-check read `n0² = +1` when it was really `e3² = +1` in the other
+numbering. **A table that is right in the wrong space is exactly the plausible-but-wrong artefact the
+gate exists to stop.**
+
+**No performance change is claimed from the basis flip in the tracked benchmarks, and the one large
+mover has its own control.** Against the previous run: **median −2.01%, and exactly one row past 10%** —
+`jac_rev_shared_256` at **+238%** (337–348 µs → 1175 µs). That is the tape-overflow fix from 2.20.0's
+cut finally being measured: the row had been sized `N + 4*M + 8` against `N + M*N` pushed, so it was
+reporting success while doing a fraction of the work. **`jac_rev_pertape_256` is flat across the same
+boundary** (184.8 → 183.6 µs) because its tape was correctly sized all along — if the machine or the
+basis change had slowed anything, both rows would have moved. The shared/per-tape ratio now reads
+**6.4× at m = 256**, matching the corrected standalone measurement.
+⚠ **The CGA figures do not appear in the trend table at all**, because there is no CGA row among the
+74 benchmarks — which is how the 2.7 ms first call stayed invisible. They were measured directly, and
+adding a CGA row is on the roadmap.
+
+⭐ **AND THE 2.20.0 ACCEPTANCE PINS INVERTED, EXACTLY AS DESIGNED.** That release pinned the failures at
+2^-30 and 2^+30 as KNOWN WRONG so a repair could not land quietly; this one made them correct and the
+suite failed until they were rewritten. **A pinned defect is a tripwire for its own fix**, which is
+worth more than a comment saying the fix is pending.
+
 ### Changed
 - **geo_advanced — the CGA basis is now the NULL basis {e1,e2,e3,n0,ninf}.** Blade 4 is `n0` and 5 is
-  `ninf`; they were `ep` and `em`. **A conformal point is now exactly null at every magnitude.**
-  ⭐ **The repair was the basis, not the arithmetic.** 2.20.0 measured this as a wrong answer with *no
-  arithmetic fix available*: in the ep/em basis the coefficients are `(q−1)/2` and `(q+1)/2`, so `q` is
-  stored as the sum *and* difference of two nearly-equal numbers and is destroyed at both ends — at
-  x = 2^-30 the correctly-rounded `ep` **is** exactly −1/2. In the null basis `P = p + (q/2)·ninf + n0`,
-  `q` lives in **one** coefficient, and `P·P = q + 2·(q/2)·(n0·ninf) = q − q` cancels the *same computed
-  q* against itself — 0 by construction, not by tolerance.
-  - Nullity over 6800 random full-mantissa points spanning 2^-40..2^40: **1686 non-null (24.8%) → 0**.
-  - Distance recovery `P₁·P₂ = −d²/2`: **median 46.4× wrong at 2^-30 and 48.7× at 2^+30 → ~1.9e-15,
-    flat across the whole range.** Sixteen orders of magnitude at the tails, and scale-free rather than
-    a U centred on |x| ≈ 1.
-  - `cga_norm(cga_translator(t,0,0))` is now exactly 1 for **all 1001 binades tested**; it failed 526 of
-    them before, and 2.17.0 recorded it as failing from t = 2^28.
-  ⭐ **And it is FASTER, which I did not expect and therefore measured:** `point*point` **5306 → 2394 µs
-  (2.2×)** and `cga_norm_sq(point)` **5105 → 2457 µs (2.1×)**, because a table lookup replaces the
-  inline bit-manipulation product and the zero-skip means only a point's 5 occupied slots reach the
-  inner loop.
+  `ninf`; they were `ep` and `em`. ⭐ **The repair was the basis, not the arithmetic.** 2.20.0 measured
+  this as a wrong answer with *no arithmetic fix available*: in the ep/em basis the coefficients are
+  `(q−1)/2` and `(q+1)/2`, so `q` is stored as the sum *and* difference of two nearly-equal numbers and
+  is destroyed at both ends — at x = 2^-30 the correctly-rounded `ep` **is** exactly −1/2. In the null
+  basis `P = p + (q/2)·ninf + n0`, `q` lives in **one** coefficient, so the norm reconstructs it
+  directly instead of recovering it from a cancellation.
+  - Median `|P·P| / q` over 2000 full-mantissa points per binade: **1.0 → 4.48e-17 at 2^-30**,
+    1.05e-16 → 4.70e-17 at 2^0, **1.0 → 4.33e-17 at 2^+30**. A relative error of 1.0 is total loss, so
+    both tails go from losing the value outright to sub-ulp, and the floor is flat rather than a U.
+  - Distance recovery `P₁·P₂ = −d²/2`: **median 46.4× wrong at 2^-30 and 48.7× at 2^+30 → 1.76e-15 and
+    1.93e-15**, centre 3.8e-15 → 1.87e-15.
+  - Bit-exact nullity improves but is **not** claimed as exact: **6761 of 6800 non-null → 5194**. See
+    the compensation entry below for why chasing 0 was reverted.
+  - ⛔ **A translator claim in the first draft of these notes was FALSE and an audit deleted it.** It
+    read *"`cga_norm(cga_translator(t,0,0))` is now exactly 1 for all 1001 binades; it failed 526
+    before"*. Measured against the shipped 2.20.0 tree: **both trees fail 485 of 2046 binades over the
+    full normal range, first at 2^539 — identical.** The basis change did nothing for the translator,
+    and the "526" came from the same non-shipping configuration as the bad nullity baseline.
+  - ⭐ **And it is faster for sparse operands, which is what CGA primitives are:** `point*point`
+    **5328 → 2404 µs (2.22×)**, `cga_norm_sq(point)` **5068 → 2597 µs (1.95×)**, because a table lookup
+    replaces the inline bit-manipulation product and the zero-skip means only a point's 5 occupied slots
+    reach the inner loop. ⛔ Past **k ≈ 8** occupied blades it inverts — see the k-sweep above, up to
+    **10.93× slower at k = 32**.
 - **geo_advanced** — `_cga_scalar_of_geo` sums **all pairs**, not the diagonal. In an orthonormal basis
   the scalar part of `a*b` comes only from pairs (i, i); in the null basis `n0*ninf` has one too.
   ⛔ With the basis flipped and this loop still diagonal-only, points were non-null for **6800 of
   6800** — the `−q` that cancels `+q` lives exactly in the pair it was skipping.
-- **geo_advanced** — the Neumaier compensation in `_cga_scalar_of_geo` is **removed**, and that is the
-  opposite of a regression. 2.18.0 added it to mitigate *this same symptom* in the ep/em basis
-  (`cga_norm(cga_point(x,0,0))` wrong from x = 2^-27). The null basis fixes the cause, and the
-  compensation then **actively prevents** the fix: it makes the sum strictly more accurate than the `q`
-  stored in `ninf`, so the two stop cancelling. Measured both ways: **with** it, 5194 of 6800 non-null
-  and distance median 1.76e-15; **without**, **0 non-null** and 1.85e-15. Exact nullity costs ~5% on a
-  median already at ulp level. ⚠ I first tried making `cga_point`'s `q` compensated to match instead —
-  it moved 5194 → 4988 and changed no median at all, so it was reverted. **Unmeasured complexity is not
-  a fix.**
+- **geo_advanced** — 2.18.0's Neumaier compensation in `_cga_scalar_of_geo` was **removed and then
+  restored**, and the round trip is the finding. Removing it buys bit-exact nullity (5194 of 6800
+  non-null → 0) by making the norm repeat `cga_point`'s own rounding of `q` so the two cancel. ⛔ It
+  also fabricates zeros: `M = 1 + a·e1 + a·n0 + (a/2)·ninf` has scalar part exactly 1 and read **0 for
+  6 of 11 magnitudes, all at a ≥ 2^30**. **An exact zero obtained by making the same rounding error
+  twice is an artifact, not accuracy** — and distance recovery was *worse* without the compensation
+  (1.85e-15 against 1.76e-15), so the trade bought nothing but the headline. Restored, and the witness
+  is now asserted.
+- **geo_advanced** — the null-table builder hoists `_cga_expand_null`/`_cga_contract_orth` out of the
+  pair loop and iterates occupancy lists instead of all 32 slots. **First CGA call 2.7 ms → 0.72 ms**
+  (2.20.0: 11 µs). The table is byte-identical — pinned by the FNV contract, which is what made the
+  change safe at tag time.
 
 ### Fixed
 - **tests** — the two 2.20.0 acceptance pins have **inverted, exactly as designed**. They asserted the
   failures at 2^-30 and 2^+30 as KNOWN WRONG so a repair could not land quietly; the basis change made
   them correct and the suite failed until they were rewritten. **A pinned defect is a tripwire for its
-  own fix**, which is worth more than a comment saying the fix is pending. Suites **3988 → 3989**.
-
+  own fix**, which is worth more than a comment saying the fix is pending.
+- **upstream (cyrius)** — filed `2026-09-11-nested-continue-binds-to-wrong-loop.md`: on cycc 6.6.2,
+  when a loop and a loop nested inside it **both** contain a `continue` and the outer one appears
+  lexically **before** the nested loop, both bind one level too far out — the inner `continue` jumps to
+  the **outer** loop's latch, and the **outer `continue` becomes a no-op**.
+  ⛔ **Silent wrong code, no diagnostic.** The natural sparse-skip idiom for a 32×32 table is both
+  shapes at once and produced an **all-zero 1024-entry table** while reporting success. Nothing failed;
+  the values were simply absent.
+  ⚠ **The first version of this filing had the symptom wrong and was corrected before it was acted on.**
+  It said the inner `continue` "exits the OUTER loop"; instrumented, the outer loop is **not**
+  terminated — its body is entered all 3 times while the inner body runs 3 of 9 — and the outer
+  `continue` breaking too was missing from the filing entirely. **A filing is a measurement like any
+  other.**
+  ⚠ **The decisive case has an outer `continue` that never fires**: `if (c == 99) { continue; }` for
+  `c` in 0..2 cannot execute, yet its mere presence breaks the inner one — and moving it *below* the
+  nested loop makes the same program correct, which isolates the trigger to lexical order.
+  ⚠ The repro **proves itself**: exit 0 if the compiler is correct, exit 1 while the bug is present,
+  across ten shapes plus three instrumentation counters, so a failing run also shows which shapes are
+  correct on that build. **Not bisected** — only 6.6.0–6.6.2 are installed and hisab pins 6.6.2, so
+  establishing a first-bad-version would mean repinning; stated rather than guessed, and this project's
+  own history records a first-bad-version as evidence about *visibility* rather than *origin*.
+  ⭐ hisab's table builder is written with `if`-guards and carries a comment saying **not to tidy them
+  back into `continue`** until the issue closes.
 
 ### Added
+- **tests/modules.tcyr** — a **compensated-scalar witness**: `M = 1 + a·e1 + a·n0 + (a/2)·ninf` has
+  scalar part exactly 1, and `M*M`'s scalar part is asserted across 11 magnitudes. ⛔ It exists because
+  **removing the Neumaier compensation passed all 3989 assertions** while returning 0 where the answer
+  is 1 for 6 of those magnitudes. Verified discriminating: 2071 passed / 1 failed without the
+  compensation, 2072 / 0 with it. Suites **3989 → 3991**.
 - **geo_advanced** — the **null-basis product table**, built once at first use by **integer arithmetic
   only** (no f64 touches it, so it is exact by construction rather than by tolerance) via the change of
   basis `n0 = (em − ep)/2`, `ninf = ep + em`. It **reproduces the derivation's contract exactly**:
   FNV-1a `0xF4A98C5706D5CF5B` over all 1024 blade-index entries, with `n0² = 0`, `ninf² = 0`,
   `e1² = +1`, and `n0*ninf` filling **both** term slots (scalar + bivector). Two independent
   implementations of the same algebra agreeing bit for bit is the point — either alone could be
-  confidently wrong. 5 assertions added (**3983 → 3988**), verified to fail when the metric is flipped.
-  ⚠ Not wired into `_cga_geo_blades` yet: the CGA behaviour checksum is still `ff49e7071c7f4fc`,
-  unchanged. Building the table and switching to it are separate steps on purpose.
-
-### Fixed
-- **upstream (cyrius)** — filed
-  `2026-09-11-nested-continue-exits-outer-loop.md`: on cycc 6.6.2, **a loop nest with `continue` at two
-  levels miscompiles — a firing inner `continue` exits the OUTER loop as well.**
-  ⛔ **Silent wrong code, no diagnostic.** The natural sparse-skip idiom for building a 32×32 table —
-  `if (cp == 0) { continue; }` in the outer loop and the same in the inner — produced an **all-zero
-  1024-entry table** while reporting success. Nothing failed; the values were simply absent.
-  ⚠ **The decisive case has an outer `continue` that never fires**: `if (c == 99) { continue; }` for
-  `c` in 0..2 cannot execute, yet its mere *presence* breaks the inner one. That rules out a misreading
-  of the semantics, and the same nest written with `if`-guards is correct on the same compiler — which
-  is what makes it codegen rather than a language question.
-  ⚠ The repro **proves itself**: exit 0 if the compiler is correct, exit 1 while the bug is present,
-  with the if-guard control as a third case so a failing run also shows the expected values are
-  achievable on that build. **Not bisected** — only 6.6.0–6.6.2 are installed and hisab pins 6.6.2, so
-  establishing a first-bad-version would mean repinning; stated rather than guessed, and this project's
-  own history records a first-bad-version as evidence about *visibility* rather than *origin*.
-  ⭐ hisab's table builder is written with `if`-guards and carries a comment saying **not to tidy them
-  back into `continue`** until the issue closes.
-
-
-### Added
-- **scripts/derive-cga-null-table.sh** — two more claims, so the gate now pins the *implementation
-  contract* and not just the mathematics:
+  confidently wrong.
+- **scripts/derive-cga-null-table.sh** + a CI gate — 2.21.0's basis change rests on claims about the
+  null-basis product table, and this **derives all of them from first principles** rather than asserting
+  them. ⚠ It exists as a script because 2.20.0's audit found several of that release's headline figures
+  could not be re-derived from the tree: the probes were never committed. ~200 ms, deterministic, and
+  **each of its 6 claims is verified to exit 1 when broken** — which two of them were not, see above.
+  - **At most 2 terms** per basis-blade product in the null basis — 128 of 1024 pairs vanish, 768 give
+    a single blade, 128 give two.
+  - **Every table coefficient is exactly ±1.** No halves survive the change of basis, so the
+    null-basis product introduces **no new rounding** — the property that makes this change safe.
+  - **The null table agrees with the shipped orthonormal one** under the change of basis, 0 mismatches
+    over all 1024 pairs. The algebra is unchanged; only its coordinates move.
+  - **A nullity MODEL**, labelled as such in its own output: it models ep/em and null arithmetic in
+    Python and must never be quoted as the library's behaviour. That confusion produced this release's
+    worst published figure.
   - **The defining null-basis identities**: `n0² = 0`, `ninf² = 0`, `n0·ninf = −1`, the symmetric sum
-    `n0*ninf + ninf*n0 = −2` (the bivector cancels), and `e1² = +1`. These are the cheapest possible
-    check that a future table edit is still the right algebra rather than merely self-consistent.
+    `n0*ninf + ninf*n0 = −2` (the bivector cancels), and `e1² = +1`.
   - **The table emitted in BLADE-INDEX space**, which is `_cga_geo_blades`'s actual calling convention,
     with **FNV-1a `0xF4A98C5706D5CF5B`** over all 1024 entries as the exact contract the Cyrius table
-    must reproduce.
-  ⛔ **That second claim exists because I got the index space wrong first.** The derivation works in
-  *bitmask* space (bit0 = e1 … bit3 = n0, bit4 = ninf) while the implementation is called with *blade
-  indices*, and the two are different numberings — blade index 4 is bitmask 8. My first spot-check read
-  `(4,4) → +1·scalar` and looked like `n0² = +1`, which would have been a flatly wrong table; it was
-  `e3² = +1`, correct, in the other space. **A table that is right in the wrong space is exactly the
-  plausible-but-wrong artefact this script exists to stop**, so the contract is now emitted in the
-  space the caller uses, with `n0² = 0` and `ninf² = 0` asserted *there*.
-  ⚠ Still fail-closed and deterministic; 6 claims, ~200 ms.
+    must reproduce. ⛔ **That claim exists because I got the index space wrong first** — blade index 4
+    is bitmask 8, and my first spot-check read `(4,4) → +1·scalar` as `n0² = +1` when it was `e3² = +1`
+    in the other numbering.
+  ⚠ **My first ad-hoc derivation of the term distribution was wrong** — it printed 256/448/320 against
+  the script's 128/768/128. The script carries a round-trip cross-check that the ad-hoc version had no
+  equivalent of. **A derivation without a cross-check is a guess that compiles.**
 
 ### Changed
 - **geo_advanced** — `_cga_geo_blades` now returns **two term slots** instead of one, and all five call
-  sites accumulate both. **Output is bit-identical**: a folded checksum over 300 random multivector
-  pairs through every product, contraction, sandwich, dual, reverse and norm, plus 60 magnitudes of
-  every constructor, reads `ff49e7071c7f4fc` before and after.
+  sites accumulate both. **Output was bit-identical at that step**: a folded checksum over 300 random
+  multivector pairs through every product, contraction, sandwich, dual, reverse and norm, plus 60
+  magnitudes of every constructor, read `ff49e7071c7f4fc` before and after.
   ⚠ **And the checksum was shown to detect a change before being trusted** — moving the metric from
   `em` to `ep` gives `24f3bb7be87992d4`, corrupting the blade mask gives `b817903c0089f0cf`.
   ⚠ **The new slot was shown to be live, not dead code that merely compiles**: populating slot 1 with a
   synthetic second term moves the checksum to `bdf2efa0662f3b30` and removing it restores exactly. A
   widening whose new path is never taken would have passed every test here.
-  ⚠ **This costs something and the figure is measured, not waved past**: iterating the second slot
-  unconditionally is **+4.5% on a dense product and +7.9% on `point*point`**; guarding it on
-  `sign1 != 0` brings that to **+3.1% and +6.4%** against the one-term original, three runs each with
-  <1% spread. ⚠ The *sparser* operand pays **more**, because loop overhead is a larger share of the work
-  when fewer pairs reach the arithmetic — the opposite of the intuition that sparse inputs are cheap.
-  There is no CGA row in the 74 tracked benchmarks, so this was measured directly rather than read off
-  the trend table.
-  ⚠ `_cga_scalar_of_geo` selects its scalar term by **blade == 0** rather than slot position, so it
-  keeps picking the right one once a product can return two. Its **diagonal-only loop is left alone on
-  purpose**: in an orthonormal basis the scalar part of `a*b` comes only from pairs (i, i), but in the
-  null basis `n0*ninf` has one too, so that loop must widen when the basis flips — and widening it now
-  would add pairs whose scalar part is zero and change nothing but the rounding order of a compensated
-  sum.
-
-### Added
-- **scripts/derive-cga-null-table.sh** + a CI gate — 2.21.0's basis change rests on claims about the
-  null-basis product table, and this **derives all of them from first principles** rather than asserting
-  them. ⚠ It exists as a script because 2.20.0's audit found several of that release's headline figures
-  could not be re-derived from the tree: the probes were never committed. 192 ms, deterministic,
-  verified fail-closed (breaking any claim exits 1).
-  - **At most 2 terms** per basis-blade product in the null basis — 128 of 1024 pairs vanish, 768 give
-    a single blade, 128 give two. The orthonormal basis gives exactly 1, which is why
-    `_cga_geo_blades` returns a single packed pair today; the rewrite is therefore "return up to two",
-    not a new engine.
-  - **Every table coefficient is exactly ±1.** No halves survive the change of basis, so the
-    null-basis product introduces **no new rounding** — the property that makes this change safe.
-  - **The null table agrees with the shipped orthonormal one** under the change of basis, 0 mismatches
-    over all 1024 pairs. The algebra is unchanged; only its coordinates move.
-  - **A conformal point is exactly null at every magnitude**: 0 of 25,500 full-mantissa triples over
-    2^-40..2^40 non-null, against **24.8%** in the ep/em basis. `P·P = q + 2·(q/2)·(n0·ninf)` cancels
-    the *same computed q* against itself, where the ep/em form reconstructs q by squaring and loses it.
-  ⚠ **My first ad-hoc derivation of the term distribution was wrong** — it printed 256/448/320 against
-  the script's 128/768/128. The script carries a round-trip cross-check (claim 3) that the ad-hoc
-  version had no equivalent of; the max-terms and ±1 conclusions were unaffected, but the distribution
-  was. **A derivation without a cross-check is a guess that compiles.**
+  ⚠ **This costs something and the figure is measured**: iterating the second slot unconditionally is
+  **+4.5% on a dense product and +7.9% on `point*point`**; guarding it on `sign1 != 0` brings that to
+  **+3.1% and +6.4%** against the one-term original, three runs each with <1% spread. ⚠ The *sparser*
+  operand pays **more**, because loop overhead is a larger share of the work when fewer pairs reach the
+  arithmetic — the opposite of the intuition that sparse inputs are cheap.
 
 
 ## [2.20.0] - 2026-09-10 — the four repairs 2.19.0 measured, and what measuring them again showed

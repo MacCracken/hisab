@@ -115,6 +115,12 @@ print(f"    round-trip mismatches: {bad} of 1024", "OK" if bad == 0 else "FAIL")
 fail += bad != 0
 
 print("CLAIM 4 — exact nullity of a conformal point, f64, both bases")
+print("    ⛔ THESE ARE MODEL FIGURES, NOT THE IMPLEMENTATION'S. This arm models the")
+print("    ⛔ arithmetic in Python floats; it does NOT run hisab. The ep/em number")
+print("    ⛔ below is the MODEL's and must never be quoted as the shipped tree's —")
+print("    ⛔ 2.21.0's first draft did exactly that and published 24.8% where the")
+print("    ⛔ tree that shipped as 2.20.0 measures 99.4%. To measure the LIBRARY,")
+print("    ⛔ build a probe against src/, as tests/modules.tcyr does.")
 import random, struct
 random.seed(7)
 bad_null = bad_ep = n = 0
@@ -123,7 +129,14 @@ for e in range(-40, 41, 5):
         x, y, z = (random.uniform(1, 2) * 2.0**e for _ in range(3))
         q = x * x + y * y + z * z
         n += 1
-        if q + 2.0 * (q / 2) * (-1.0) != 0.0: bad_null += 1
+        # ⛔ AN EARLIER VERSION OF THIS ARM WAS VACUOUS AND AN AUDIT CAUGHT IT.
+        # It tested `q + 2.0*(q/2)*(-1.0) != 0.0`, which is identically FALSE for
+        # every normal q (q/2 is exact, 2*(q/2) is exactly q), so it reported
+        # "0 non-null" as a TAUTOLOGY and proved nothing about the basis.
+        # The model must reconstruct q the way the implementation does: sum the
+        # three squares independently and subtract the STORED q/2 twice.
+        qs = x * x + y * y + z * z
+        if qs - (q / 2) - (q / 2) != 0.0: bad_null += 1
         ep, em = q * 0.5 - 0.5, q * 0.5 + 0.5
         if q + ep * ep - em * em != 0.0: bad_ep += 1
 print(f"    {n} full-mantissa triples over 2^-40..2^40")
@@ -185,7 +198,15 @@ for ai in range(32):
         h = ((h ^ pack(ai, bi)) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
 print(f"    packing: bits 0-1 sign0 (0 none / 1 plus / 2 minus), 2-6 blade0,")
 print(f"             bits 7-8 sign1, 9-13 blade1")
+EXPECT = 0xF4A98C5706D5CF5B
+ok6 = (h == EXPECT)
 print(f"    FNV-1a over all 1024 blade-index entries: 0x{h:016X}")
+print(f"    expected                                : 0x{EXPECT:016X}   "
+      f"{'OK' if ok6 else 'FAIL'}")
+# ⛔ AN EARLIER VERSION PRINTED THIS AND NEVER COMPARED IT, while the CI step
+# claimed the script was "fail-closed (verified: breaking any claim exits 1)".
+# Claim 6 exited 0 no matter what the table said. An audit caught it.
+fail += not ok6
 print( "    ⚠ THE CYRIUS TABLE MUST REPRODUCE THIS EXACTLY.")
 # blade index 4 = n0, 5 = ninf under the new reading
 assert pack(4, 4) == 0, "n0*n0 must vanish in blade-index space"

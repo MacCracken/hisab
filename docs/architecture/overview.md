@@ -3,7 +3,7 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v2.20.0 — 35 math modules in `src/`, 25,469 lines of Cyrius (`lib/` is
+> hisab v2.21.0 — 35 math modules in `src/`, 25,737 lines of Cyrius (`lib/` is
 > vendored stdlib + first-party deps only). Compiled by cycc 6.6.2.
 
 ## Module Map

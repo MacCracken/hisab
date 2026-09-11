@@ -2845,6 +2845,177 @@ assert_eq(LP_CB_RUN, 9, "the cqr block-ratio sweep actually ran 9 decades");
 assert_eq(LP_CB_BAD, 0,
   "cqr_decompose: |R| = {1, 5c} and R stays triangular for block ratios to 1e-10");
 
+# ================================================================
+# 2.23.0 -- THE FOURTH REFLECTOR, AND THE DEPTH THE SWEEP ABOVE NEVER REACHED
+# ================================================================
+# ⛔ The sweep above stops at a block ratio of 1e-10. `cqr_decompose`'s reflector
+# gate fired below 1e-12 and its `vhv` underflows below 2^-515 -- so that sweep
+# sat three decades above one defect and ~145 above the other, and passed
+# throughout. **Bracketing the thresholds is not reaching the floor**, which this
+# project last learned in 2.17.0 and had to learn again here.
+# ⛔ `vhv` is a naive sum of `re*re + im*im`. 2.22.1 normalised `v` in the three
+# REAL reflectors so `vtv` is 1 by construction; this complex one was left, so it
+# kept the defect -- the fourth of four. For this fixture the k=1 reflector's v is
+# (8c, 4c), giving vhv = 80c^2, which drops below DBL_MIN at c = 2^-515: measured,
+# e=514 correct and e=515 wrong, and 80*2^-1028 > DBL_MIN > 80*2^-1030 predicts
+# exactly that. Blocks with vhv = 468c^2 and 0.3125c^2 first fail at e=516 and
+# e=511, as their coefficients dictate -- causal isolation, not correlation.
+# ⛔ THE FAILURE IS INVISIBLE TO BOTH RESIDUAL TESTS A CALLER WOULD RUN. With the
+# reflector skipped, R == A and Q == I, so `max|QR - A|` and `max|Q^H Q - I|` are
+# **exactly 0** on the wrong answer. The only visible symptom is that R is not
+# upper triangular -- the one thing a QR decomposition is FOR.
+# [measured: 1075-binade sweep x 3 fixtures on 4 trees, 2026-09-11]
+fn _cq_run(e, R) {
+    var c = (1023 - e) << 52;                   # 2^-e, NORMAL form
+    var A = cmat_new(3, 3);
+    for (var i = 0; i < 3; i = i + 1) {
+        for (var j = 0; j < 3; j = j + 1) { cmat_set(A, i, j, cx_new(0, 0)); }
+    }
+    cmat_set(A, 0, 0, cx_new(F64_ONE, 0));
+    cmat_set(A, 1, 1, cx_new(f64_mul(f64_from(3), c), 0));
+    cmat_set(A, 1, 2, cx_new(c, 0));
+    cmat_set(A, 2, 1, cx_new(f64_mul(f64_from(4), c), 0));
+    cmat_set(A, 2, 2, cx_new(f64_mul(F64_TWO, c), 0));
+    var Q = cmat_new(3, 3);
+    return cqr_decompose(A, Q, R);
+}
+
+var _cq_R = cmat_new(3, 3);
+# The first scale the shipped tree got wrong. |R11| must be 5c EXACTLY: the first
+# column of the scaled block is (3c, 4c), norm 5c, and c is a power of two.
+assert_eq(_cq_run(515, _cq_R), HSB_ERR_NONE, "cqr 2^-515: reports success");
+assert_eq(cx_abs(cmat_get(_cq_R, 1, 1)), f64_mul(f64_from(5), (1023 - 515) << 52),
+  "cqr 2^-515: |R11| is EXACTLY 5c (2.22.1 returned 3c -- the reflector was skipped)");
+assert_eq(HComplex_re(cmat_get(_cq_R, 2, 1)), 0,
+  "cqr 2^-515: R is upper triangular (2.22.1 left R21 = 4c, i.e. R == A)");
+# ⚠ And far deeper, so this cannot pass by a threshold moved one binade.
+assert_eq(_cq_run(1000, _cq_R), HSB_ERR_NONE, "cqr 2^-1000: reports success");
+assert_eq(cx_abs(cmat_get(_cq_R, 1, 1)), f64_mul(f64_from(5), (1023 - 1000) << 52),
+  "cqr 2^-1000: |R11| still exactly 5c, 485 binades below the old cliff");
+assert_eq(HComplex_re(cmat_get(_cq_R, 2, 1)), 0, "cqr 2^-1000: still upper triangular");
+# ⚠ CONTROL above the boundary, so the four above cannot pass on a routine that
+# has merely become uniformly different.
+assert_eq(_cq_run(100, _cq_R), HSB_ERR_NONE, "cqr 2^-100 (control): reports success");
+assert_eq(cx_abs(cmat_get(_cq_R, 1, 1)), f64_mul(f64_from(5), (1023 - 100) << 52),
+  "cqr 2^-100 (control): exactly 5c, as it already was");
+
+# ⛔ 2.23.0 -- AND A DEFECT 2.22.0 INTRODUCED, FOUND ONLY BECAUSE THIS RELEASE
+# WENT LOOKING AT A SITE NO FIXTURE REACHED. 2.22.0 replaced an absolute gate on
+# the PHASE with `cx_div(x1, |x1|)`, which is only as good as `cx_abs(x1)` -- and
+# for a SUBNORMAL x1 that modulus is quantised onto the subnormal grid, so the
+# quotient is not a unit complex number. The Householder needs |phase| EXACTLY 1
+# and degrades in proportion to ||phase| - 1|, which reaches **+0.414** at the
+# floor. 2.21.0's phase = 1 fallback was ACCIDENTALLY EXACT in that band, so
+# 2.22.0 traded 1 row right for 38 wrong. Repaired by scaling x1 to O(1) first --
+# the phase is scale-invariant, so nothing above the subnormal band moves.
+# ⚠ THE DIRECTION IS LOAD-BEARING AND A PYTHAGOREAN TRIPLE CANNOT SEE THIS:
+# x1 = (3,4)*t is clean at every t because |x1| = 5t is exactly representable.
+# (1,1) has modulus t*sqrt(2), which is off the grid. A fixture built the obvious
+# way would have passed on the defective tree.
+# [measured: 1075-row phase sweep with an isolating revert, 2026-09-11]
+fn _cq_ph(sub, R) {
+    var A = cmat_new(3, 3);
+    for (var i = 0; i < 3; i = i + 1) {
+        for (var j = 0; j < 3; j = j + 1) { cmat_set(A, i, j, cx_new(0, 0)); }
+    }
+    # max|A| = 1 pins the balance to the identity, so this isolates the phase.
+    cmat_set(A, 0, 0, cx_new(F64_ONE, 0));
+    cmat_set(A, 1, 1, cx_new(sub, sub));
+    cmat_set(A, 1, 2, cx_new(sub, 0));
+    cmat_set(A, 2, 1, cx_new(sub, 0));
+    cmat_set(A, 2, 2, cx_new(f64_mul(F64_TWO, sub), 0));
+    var Q = cmat_new(3, 3);
+    return cqr_decompose(A, Q, R);
+}
+
+# ⚠ `1 << k` is the SUBNORMAL form and is only that for k <= 51; above it the bit
+# pattern exceeds 2^52 and is an ordinary NORMAL double. 40 gives 2^-1034.
+assert_eq(_cq_ph(1 << 40, _cq_R), HSB_ERR_NONE, "cqr phase at 2^-1034: reports success");
+assert_eq(HComplex_re(cmat_get(_cq_R, 2, 1)), 0,
+  "cqr phase at 2^-1034: R21 is 0 (2.22.0 returned it EQUAL TO A[2][1], untouched)");
+assert_eq(_cq_ph(1 << 4, _cq_R), HSB_ERR_NONE, "cqr phase at 2^-1070: reports success");
+assert_eq(HComplex_re(cmat_get(_cq_R, 2, 1)), 0,
+  "cqr phase at 2^-1070: R21 is 0, four binades off the representable floor");
+
+# ================================================================
+# 2.23.0 -- THE RIGHT HOUSEHOLDER REFLECTOR, PINNED AT LAST
+# ================================================================
+# ⛔ `_lp_bidiagonalize` applies a LEFT reflector per column and a RIGHT one per
+# row. Every fixture this suite has ever had reaches the LEFT one. 2.22.0 and
+# 2.22.1 repaired the right one **on the SHAPE** -- because repairing one side of
+# a pair is how 2.18.0's U-replay defect was created -- and the roadmap carried
+# that as unproven in both directions. It is proven now, and BOTH repairs are
+# load-bearing.
+# ⭐ A = diag(c,c,c,1) with A[0][2] = t puts a small off-diagonal where only the
+# right reflector can see it. The trailing block is [[c,t],[0,c]], whose singular
+# values are c*(sqrt(1 + (t/2c)^2) +- t/2c) -- so the spectrum has a RELATIVE
+# SPREAD of exactly t/c, in closed form, needing no reference implementation.
+# With c and t exact powers of two the whole fixture is exact.
+# ⛔ 2.21.0 returns all three small singular values IDENTICAL -- the entire spread
+# erased, relative error 2.384e-07 against the closed form. Repaired: 5.06e-17,
+# i.e. sub-ulp, with the spread reproduced to seven digits.
+# ⚠ DO NOT ACCEPT THIS WITH `prod(S) == |det A|`. That identity is ANALYTICALLY
+# BLIND here: the defect replaces {c(1+d), c, c(1-d)} with {c, c, c}, and
+# (1+d)(1-d) = 1 - d^2 differs from 1 only at second order -- measured 1.24e-15
+# while a singular value is 2.4e-7 wrong. The discriminator is the SPREAD.
+# [measured: 128-fixture sweep across 4 trees + an isolating gate revert, 2026-09-11]
+fn _rr_run(which, S) {
+    var c = (1023 - 20) << 52;               # 2^-20
+    var t = (1023 - 41) << 52;               # 2^-41, so the spread is t/c = 2^-21
+    # ⚠ The third case is NOT a deeper version of the first: it is sized so the
+    # right reflector's NORM is normal while its `vtv_r` is SUBNORMAL, which is
+    # the band the 2.22.0 gate repair cannot reach and only the 2.22.1
+    # normalisation fixes. c = 2^-500, t = 2^-515 gives vtv_r ~ 2^-1028.
+    if (which == 2) {
+        c = (1023 - 500) << 52;
+        t = (1023 - 515) << 52;
+    }
+    var A = ganita_mat_new(4, 4);
+    for (var i = 0; i < 4; i = i + 1) {
+        for (var j = 0; j < 4; j = j + 1) { ganita_mat_set(A, i, j, 0); }
+    }
+    if (which == 1) {
+        # The cyclic-shift conjugate: this reaches the k=1 call site, not k=0.
+        ganita_mat_set(A, 0, 0, F64_ONE);
+        ganita_mat_set(A, 1, 1, c);
+        ganita_mat_set(A, 2, 2, c);
+        ganita_mat_set(A, 3, 3, c);
+        ganita_mat_set(A, 1, 3, t);
+    } else {
+        ganita_mat_set(A, 0, 0, c);
+        ganita_mat_set(A, 1, 1, c);
+        ganita_mat_set(A, 2, 2, c);
+        ganita_mat_set(A, 3, 3, F64_ONE);
+        ganita_mat_set(A, 0, 2, t);
+    }
+    var U = ganita_mat_new(4, 4);
+    var Vt = ganita_mat_new(4, 4);
+    for (var k = 0; k < 4; k = k + 1) { store64(S + k * 8, 0); }
+    return svd_golub_kahan(A, U, S, Vt);
+}
+
+var _rr_S = alloc(32);
+# --- k = 0 call site
+assert_eq(_rr_run(0, _rr_S), HSB_ERR_NONE, "svd right-reflector k=0: reports success");
+assert_eq(f64_gt(load64(_rr_S + 8), load64(_rr_S + 16)), 1,
+  "svd right-reflector k=0: S1 > S2 (2.21.0 returned all three EQUAL)");
+assert_eq(f64_gt(load64(_rr_S + 16), load64(_rr_S + 24)), 1,
+  "svd right-reflector k=0: S2 > S3 -- the spread exists at all");
+# The spread is t/c = 2^-21 in closed form. 2.21.0 gives exactly 0.
+assert_eq(f64_approx_eq(f64_div(f64_div(f64_sub(load64(_rr_S + 8), load64(_rr_S + 24)),
+        load64(_rr_S + 16)), (1023 - 21) << 52), F64_ONE, LP_T_RELTOL), 1,
+  "svd right-reflector k=0: the relative spread is t/c = 2^-21, as the closed form says");
+
+# --- k = 1 call site, which a k=0 fixture does not reach
+assert_eq(_rr_run(1, _rr_S), HSB_ERR_NONE, "svd right-reflector k=1: reports success");
+assert_eq(f64_gt(load64(_rr_S + 8), load64(_rr_S + 24)), 1,
+  "svd right-reflector k=1: the spread survives at the OTHER call site too");
+
+# --- vtv_r subnormal: the band the gate repair alone cannot reach
+assert_eq(_rr_run(2, _rr_S), HSB_ERR_NONE, "svd right-reflector, vtv_r subnormal: success");
+assert_eq(f64_gt(load64(_rr_S + 8), load64(_rr_S + 24)), 1,
+  "svd right-reflector: spread survives where vtv_r is SUBNORMAL (2.22.0 lost it too)");
+
 var LP_T_BIG = 0x6974E718D7D7625A;   # 1e200
 var lpo_A = ganita_mat_new(3, 3);
 ganita_mat_set(lpo_A, 0, 0, f64_mul(F64_ONE, LP_T_BIG));

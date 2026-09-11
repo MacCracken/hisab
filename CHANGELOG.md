@@ -2,6 +2,91 @@
 
 ## [Unreleased]
 
+## [2.23.0] - 2026-09-11 — the sites no fixture reached, and a defect 2.22.0 introduced there
+
+2.22.0 repaired three Householder gates **on the shape**, because repairing one side of a pair is how
+2.18.0's U-replay defect was created — and the roadmap carried that as unproven in both directions.
+This release went and looked. All three repairs were **load-bearing**; one of them also **introduced a
+regression**; and the fourth reflector had never been repaired at all. Suites **4018 → 4039**.
+
+⭐ **THE DISCRIMINATION LADDER IS THE RESULT.** The new assertions, run against every released tree:
+
+| tree | new assertions failing |
+|---|---|
+| 2.21.0 | **12** |
+| 2.22.0 | 7 |
+| 2.22.1 | 6 |
+| **2.23.0** | **0** |
+
+Each release's repairs were real; each left something behind; and none of it was pinned until now.
+
+⛔ **THE FOURTH REFLECTOR WAS NEVER NORMALISED.** 2.22.1 gave `v` unit length in the three REAL
+reflectors so `vtv` is 1 by construction and cannot underflow. `cqr_decompose` forms `vhv` the same
+naive way and was left — three of four. For `diag(1) ⊕ c·[[3,1],[4,2]]` the k=1 reflector's `v` is
+`(8c, 4c)`, so `vhv = 80c²`, which drops below `DBL_MIN` at **c = 2^-515**: measured, e=514 correct and
+e=515 wrong, and `80·2^-1028 > DBL_MIN > 80·2^-1030` predicts exactly that. Blocks with `vhv = 468c²`
+and `0.3125c²` first fail at e=516 and e=511, **as their coefficients dictate** — causal isolation, not
+correlation.
+
+⛔ **AND THE FAILURE IS INVISIBLE TO BOTH RESIDUAL TESTS A CALLER WOULD RUN.** With the reflector
+skipped, `R == A` and `Q == I`, so `max|QR − A|` and `max|QᴴQ − I|` are **exactly 0** on the wrong
+answer. The only visible symptom is that **R is not upper triangular** — the one thing a QR
+decomposition is for. Measured: `R21` comes back *equal to the input entry* at every scale.
+
+⛔ **2.22.0's PHASE REPAIR INTRODUCED A DEFECT, AND IT TRADED 1 ROW RIGHT FOR 38 WRONG.** That release
+replaced an absolute gate with `cx_div(x1, |x1|)` — which is only as good as `cx_abs(x1)`, and for a
+subnormal `x1` that modulus has been quantised onto the subnormal grid, so the quotient is **not a unit
+complex number**. The Householder needs `|phase|` exactly 1 and degrades in proportion to `||phase| − 1|`,
+which reaches **+0.414** at the floor. 2.21.0's `phase = 1` fallback was **accidentally exact** in that
+band. Repaired by scaling `x1` to O(1) first; the phase is scale-invariant, so nothing above the
+subnormal band moves. ⚠ **A fixture built from a Pythagorean triple cannot see this**: `x1 = (3,4)·t` is
+clean at every `t` because `|x1| = 5t` is exactly representable. The acceptance test uses `(1,1)`.
+
+⛔ **THE RIGHT REFLECTOR WAS SILENTLY WRONG AND IS NOW PINNED IN BOTH ORIENTATIONS.** `A = diag(c,c,c,1)`
+with `A[0][2] = t` puts a small off-diagonal where only the right reflector can see it; the trailing
+block `[[c,t],[0,c]]` has singular values `c·(√(1+(t/2c)²) ± t/2c)`, so the spectrum has a relative
+spread of exactly `t/c` **in closed form**. With `c = 2^-20`, `t = 2^-41`: 2.21.0 returns all three
+small singular values **identical** — the entire spread erased, 2.384e-07 relative error — against
+**5.06e-17** now. ⚠ `k=0` and `k=1` are separate call sites reached by different matrices, so both are
+pinned; and a third fixture (`c = 2^-500`, `t = 2^-515`) sits where `norm_r` is normal but `vtv_r` is
+**subnormal**, which the gate repair alone cannot reach and only 2.22.1's normalisation fixes.
+⚠ **`prod(S) == |det A|` is analytically blind here** and must not be used: the defect replaces
+`{c(1+d), c, c(1−d)}` with `{c, c, c}`, and `(1+d)(1−d)` differs from 1 only at second order — measured
+1.24e-15 while a singular value is 2.4e-7 wrong. The discriminator is the **spread**.
+
+⛔ **AND A GATE THAT DOES NOT GATE, PROVEN WITH A ONE-TOKEN MUTANT.** `_cga_build_null_tbl` packs only
+each coefficient's **sign** and blade index, so the null-product table is a function of sign and
+zero-pattern alone — any positive rescaling produces a **byte-identical** table. Changing
+`co * cn * wgt` to `co * cn * wgt * 3` makes all 1024 coefficients ±3, the FNV stays bit-exact at
+`0xF4A98C5706D5CF5B`, and **all 4018 assertions pass**. The "every coefficient is exactly ±1" property —
+the invariant that *licenses* packing only the sign — was asserted only in the Python derivation, never
+on the Cyrius side, so the source's "verified two ways" transferred only the sign projection.
+`_CGA_NULL_COEF_BAD` now counts it during the build; verified to fail the mutant (`got 1024, expected 0`)
+**while the FNV still passes**.
+
+### Changed
+- **linalg_precision** — `cqr_decompose` normalises `v` before forming `vhv`, completing the set of four.
+- **linalg_precision** — `cqr_decompose` forms its phase from an `x1` scaled to O(1).
+- **linalg_precision** — `cqr_decompose` zeroes `R`'s strictly-lower triangle explicitly. ⚠ The
+  reflectors annihilate it analytically but in floating point, and through 2.22.1 that happened to
+  cancel to a bit-exact 0 **on the fixtures anyone had run**; normalising `v` adds one rounding and it
+  no longer does (measured `|R21|` ≈ 7e-16 *relative to the block*, on 5 of 9 decades). Upper
+  triangularity is the defining property of QR and the thing the tests assert, so it should be true
+  rather than nearly true. ⚠ Reconstruction verified unharmed: `max|QᴴQ − I|` = 2.22e-16 and
+  `max|QR − A|` tracks the block magnitude at every scale including 2^-1000.
+
+### Added
+- **tests** — 21 assertions (**4018 → 4039**) pinning the three previously-unreachable sites, each
+  verified against every released tree (the ladder above). Includes `_CGA_NULL_COEF_BAD`, mutation-proven.
+
+### Fixed
+- **roadmap** — the "three gates repaired on the SHAPE, no fixture reaches them" item is **closed as
+  PROVEN, not as speculation**. All three were load-bearing. ⚠ The existing `cqr` block-ratio sweep
+  stops at 1e-10 while its gate fires below 1e-12 and its `vhv` underflows below 2^-515 — **three
+  decades above one defect and ~145 above the other**, and green throughout. *Bracketing the thresholds
+  is not reaching the floor*, which this project last learned in 2.17.0 and has now learned again.
+
+
 ## [2.22.1] - 2026-09-11 — the subnormal residue 2.22.0 filed, and why it needed BOTH halves
 
 2.22.0 shipped with a known defect filed in `issues/` rather than repaired: `svd_golub_kahan`

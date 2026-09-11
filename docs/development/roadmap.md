@@ -11,9 +11,9 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.22.1
+## Current — v2.23.0
 
-Suite **4018** across five harnesses (hisab 516, foundation 413, modules 2072, edge_cases 233,
+Suite **4039** across five harnesses (hisab 536, foundation 413, modules 2073, edge_cases 233,
 abuse 784), constant gate **159/159**, **74** benchmarks, **35** `[lib]` modules, toolchain
 **6.6.2**, sakshi **2.5.1**, ganita **1.2.4**, and **zero** deprecated-alias call sites. All gates green:
 `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps / 0 untrusted
@@ -747,16 +747,39 @@ them is not a defect at all.
       See `issues/archived/2026-09-11-svd-balancing-divide-lossy-for-subnormal-blocks.md`.
       [measured: 3 fixtures x 52 scales vs a 200-digit oracle, 2026-09-11]
 
-- [ ] **[2.22.0, repaired on the SHAPE rather than on a measurement]** **Three of the five Householder
-      gates were never measured end-to-end.** `:270` (svd) and `:1119` (eigen) are confirmed defects
-      with fixtures. `:341` (`_lp_bidiagonalize`'s RIGHT reflector), `:1671` and `:1676`
-      (`cqr_decompose`) carry the identical shape and were repaired with them — because repairing one
-      side of a pair is how 2.18.0's U-replay defect was created — but **no fixture reaches them**, so
-      the repair there is unproven in both directions. ⚠ `cqr_decompose` has no in-tree caller and no
-      subnormal/ill-conditioned fixture at all. Build one, and expect it to find something: every
-      release that has gone looking at an unexercised site in this file has.
+- [x] ✅ **DONE in 2.23.0 — CLOSED AS PROVEN, AND THE ANSWER WAS NOT "they were fine".** All three
+      gates were **load-bearing**, measured across every released tree: the new assertions fail 12
+      times on 2.21.0, 7 on 2.22.0, 6 on 2.22.1 and 0 on 2.23.0. ⛔ Going to look ALSO found that
+      2.22.0's phase repair had **introduced** a defect (1 row right, 38 wrong) and that the FOURTH
+      reflector — `cqr_decompose`'s `vhv` — had never been normalised at all, failing below 2^-515
+      with `R == A`. ⚠ The existing cqr sweep stopped at a block ratio of 1e-10 while one defect
+      began below 1e-12 and the other below 2^-515: **three decades above one and ~145 above the
+      other**, green throughout. *Bracketing the thresholds is not reaching the floor.*
+      [measured: 128-fixture + 1075-binade sweeps across 4 trees, 2026-09-11]
 
-- [ ] **[2.21.0, deferred with a measurement rather than a guess]** **Cut the null-table build's
+- [ ] **[2.21.0, and 2.23.0 COSTED IT — this is now an implementation, not an investigation]**
+      ⭐ **Measured, verified, and ready to ship**: memoise `_cga_geo_bits` (32x32) and
+      `_cga_bits_blade` (32), and use occupancy lists for the mid clear, res clear, mid scan and res
+      packing scan. Isolated build-only timing, 40 repeats x 3 sessions: shipped 555,414 ns; geo_bits
+      memo alone -11%; bits_blade memo alone -28.5%; occupancy lists alone -35%; **all three
+      172,310 ns (-69%)**. End-to-end first call, paired binaries: **0.68 ms -> 0.27 ms (-59% to
+      -61%)**, moving break-even from ~392 products to **~155**. Cost: +48 module lines, +1,967 B
+      bundle (+0.18%), +1,424 B consumer code_size (+0.19%), `var_table` and `fixup_table` unchanged.
+      Table byte-identical (FNV `0xF4A98C5706D5CF5B` on the final tree and all 5 intermediates), all
+      suites green, every gate green.
+      ⚠ **Keep the `if`-guard / no-`continue` comment block verbatim** — the new nest is still three
+      loops deep and still relies on the cycc 6.6.2 workaround.
+      ⚠ **Keep a sorted insert for the `res` list** even though nothing can currently discriminate it:
+      it is the only thing making the packing order a guarantee rather than a coincidence, and at
+      <= 2 terms it costs one comparison.
+      ⛔ **The literal 1024-entry table is DECLINED on numbers, not taste**: 11.9 us first call (vs
+      2.20.0's 11 us, so it is the only option that truly closes the regression) but +748 lines,
+      +1.45% bundle and +2.93% consumer code_size, and it gives up the "built by integer arithmetic,
+      exact by construction" property the derivation gate rests on. Revisit only if the 0.27 ms
+      first call is measured to matter to a consumer.
+      [measured: 40 repeats x 3 sessions isolated + paired end-to-end, 2026-09-11]
+      ⛔ ORIGINAL ROW FOLLOWS.
+      **Cut the null-table build's
       remaining four 32-slot passes per pair.** The build is lazy and one-time, and 2.21.0 took it from
       **2.7 ms to 0.72 ms** by hoisting `_cga_expand_null`/`_cga_contract_orth` out of the pair loop
       and iterating occupancy lists — but 2.20.0's first CGA call was **11 us**, so this is still a
@@ -773,7 +796,26 @@ them is not a defect at all.
       arithmetic, exact by construction" property that is currently the design's argument.
       [measured: first-call probe, 3 runs each tree, 2026-09-11]
 
-- [ ] **[2.21.0]** **There is no CGA row among the 74 tracked benchmarks, and that is how a 2.7 ms
+- [ ] **[2.21.0, and 2.23.0 DESIGNED IT — patch-ready, five rows, registered LAST]**
+      ⭐ `cga_first_product_cold` via `bench(name, fp, 1)` — **the harness DOES express a one-shot**,
+      because `bench_run` clamps its pilot chunk to n. ⚠ Do NOT put this number in a `.tcyr`
+      assertion instead: an `alloc_used()` bound is deterministic but would NOT have caught 2.21.0's
+      2.7 ms, which was CPU work rather than allocation, and a wall-clock ceiling in a test is a
+      flaky-test generator on a shared runner. The CSV row plus an entry guard is the right home.
+      ⭐ Plus `cga_point_product` (n=2000), `cga_norm_sq_k5` (n=2000), `cga_norm_sq_k32` (n=200) —
+      **both sides of the measured crossover at k~8, because one row alone reports the opposite sign
+      of the other** — and `cga_null_tbl_build` via `bench_batch(fp, 1, 20)` as the low-variance row
+      to optimise the item above against.
+      ⚠ **Keep the `_CGA_NULL_TBL` entry guard**: it is the only thing that can tell a cold row from a
+      warm one, a cold row that was not cold reads as a **400x improvement**, and the guard is proven
+      to fire. ⚠ The one-shot is the only row with no averaging and is **8x noisier than its four
+      neighbours on a loaded box** — that belongs in the row's own comment.
+      ⚠ Register LAST, after the `jac_rev` pair: 2.20.0 measured that adding two rows moved an
+      unrelated benchmark by **31%** through heap displacement under a never-freeing allocator.
+      Controls say nothing existing moves with these five.
+      [measured: patch built and run from a tree copy, with before/after controls, 2026-09-11]
+      ⛔ ORIGINAL ROW FOLLOWS.
+      **There is no CGA row among the 74 tracked benchmarks, and that is how a 2.7 ms
       first call stayed invisible.** Every CGA figure in 2.21.0 — the 2.22x on `point*point`, the
       10.93x regression at k = 32, the table-build cost — was measured with a throwaway probe, so
       none of them is in `bench-history.csv` and none will be checked again by anything. ⚠ A CGA row
@@ -1151,6 +1193,7 @@ roadmap item** — and with ten live consumers, someone can now actually be aske
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.23.0 | 2026-09-11 | 26,243 | 36 | **The sites no fixture reached — and a defect 2.22.0 introduced there.** 2.22.0 repaired three Householder gates ON THE SHAPE and the roadmap carried that as unproven both ways. **All three were load-bearing, one ALSO introduced a regression, and the fourth reflector had never been repaired.** ⭐ The new assertions fail **12** times on 2.21.0, **7** on 2.22.0, **6** on 2.22.1 and **0** here — a discrimination ladder showing each release's repairs were real and each left something behind. ⛔ `cqr_decompose`'s `vhv` is a naive sum of squares and underflows below **2^-515** (vhv = 80c²; 80*2^-1028 > DBL_MIN > 80*2^-1030 predicts the measured e=514/515 boundary, and blocks with 468c² and 0.3125c² first fail at e=516 and e=511 as their coefficients dictate). ⛔ **The failure is invisible to both residual tests a caller would run**: R == A and Q == I, so |QR-A| and |Q^H Q - I| are EXACTLY 0 on the wrong answer — only upper-triangularity shows it. ⛔ **2.22.0's phase repair traded 1 row right for 38 wrong** (`cx_div(x1,|x1|)` on a subnormal x1 is not a unit complex number; ||phase|-1| reaches 0.414). ⚠ A Pythagorean-triple fixture cannot see it. ⛔ **The right reflector** is pinned in both orientations plus the vtv_r-subnormal band; 2.21.0 erased the entire spectral spread (2.384e-07) against 5.06e-17 now. ⚠ `prod(S) == |det A|` is ANALYTICALLY BLIND there. ⛔ **A gate that does not gate**: the CGA FNV contract cannot see magnitude — a one-token mutant makes all 1024 coefficients ±3 with the checksum bit-exact and all 4018 assertions passing; closed by `_CGA_NULL_COEF_BAD`, mutation-proven. Suites **4018 -> 4039**. |
 | 2.22.1 | 2026-09-11 | 26,116 | 36 | **The subnormal residue 2.22.0 filed — and why it needed BOTH halves.** Classified against a 200-digit oracle over 3 fixtures x 52 subnormal scales: CORRECT **23 -> 151**, LOUD **62 -> 0**, SILENT **71 -> 5**, zero regressions, zero LOUD -> SILENT. ⛔ **Half one**: the balance scale was chosen from `max|A|` alone, so a matrix spanning >1022 binades had its small block SUBNORMAL after the divide — and **a power-of-two divide is exact only while the quotient stays NORMAL**. Measured: 18 units / 8 rounds to 2, 2*8 = 16, **11% destroyed before `_lp_bidiagonalize` was called**. ⛔ **Half two, and half one alone is worse than nothing**: it converts **30 LOUD rows into SILENT wrong answers**. `vtv` is a naive sum of squares and underflows at the BOTTOM OF THE NORMAL RANGE, so the F64_TINY guard refuses to divide and the consequence is the same silent drop. ⭐ `H = I - 2vv'/v'v == I - 2uu'`, so normalising v makes `vtv` **1 by construction**; applied to all three reflectors. ⛔ **The filing's own conclusion was FALSE** — "no global scalar can work" against f64's 2045 binades vs the ~1076 needed — and a second draft's `sc > 1` guard did nothing for the inputs it was written for, turning a CORRECT row at 2^-1065 into NO_CONVERGENCE. Both corrections are inline in the archived issue. ⚠ **A process error caught by the user**: 2.22.0's residues were written into this file and called "filed" when `issues/` was empty — **a roadmap row is not a filing**. ⚠ Cost: svd_golub_kahan_12 +4.99%, eigen_qr_12 +3.56%, untouched control +0.40% median. Suites **4014 -> 4018**. |
 | 2.22.0 | 2026-09-11 | 26,004 | 36 | **The Householder gate — a silent wrong answer at ordinary conditioning, in TWO public entry points, filed for three releases as "subnormal SVD".** `_lp_bidiagonalize` gated its reflectors on an ABSOLUTE 1e-12 applied to a LENGTH; when it fired the reflector was skipped and the extraction silently DROPPED the mass it declined to reflect. ⭐ **Boundary is a block ratio of 2^-40 — condition ~1e12, 982 binades above where the roadmap put it.** Oracle-free (prod(S) = |det A|): **25 of 60 normal-range ratios silently wrong -> 0**; smallest singular value **9.89x too large -> exact**. ⛔ `_lp_tridiagonalize` has the identical gate, so **eigen_qr returned the smallest eigenvalue with the WRONG SIGN** — and the values it returned are exactly the spectrum of tridiag((c,4c,c),(c,c)), the matrix you get by dropping W[3,1], so the mechanism is pinned by the values themselves. ⛔ **Second, separable defect**: `_lp_bidiag_qr`'s `p_lo` froze the active block at 2x2 — and **a 2x2 fixture cannot expose it**, which is why the 2.20.0 acceptance family missed it; the two repairs are perfectly complementary. ⛔ **Both entry points returned SUCCESS with NaN** for non-finite input. ⛔ **The roadmap's own proposed repair was at the WRONG PIPELINE STAGE**, and the 2.19.0 refutation that blocked this release for three versions is TRUE (84 loud rows -> silent). ⚠ Seventh release running the row was wrong about scope: 5 sites, 3 functions, 3 public entry points, none named by the row. ⚠ **Cost measured, not waved past**: svd_golub_kahan_12 +2.98%, eigen_qr_12 +0.75%, untouched control +0.29% median — and the first draft said "no detectable cost" before measuring, while the first measurement was itself invalid because a `cd` persisted and both trees were the same one. Suites **3991 -> 4014**. |
 | 2.21.0 | 2026-09-11 | 25,830 | 36 | **The CGA null basis: a conformal point's nullity error becomes ulp-level and scale-free.** 2.20.0 proved no ARITHMETIC fix existed — at x = 2^-30 the correctly-rounded `ep` IS -1/2 — so this changed the BASIS. `q` now lives in one coefficient, so the norm recovers it by subtraction instead of from a cancellation. Median `|P.P| / q`: **1.0 -> 4.48e-17 at 2^-30** and **1.0 -> 4.33e-17 at 2^+30** (1.0 = the whole value lost), FLAT rather than a U; distance recovery **median 46.4x/48.7x wrong -> 1.76e-15/1.93e-15**. ⛔ **"Exactly null" was the headline until a pre-tag audit priced it**: it needs 2.18.0's Neumaier compensation DROPPED, which makes the norm repeat the constructor's rounding — and then `1 + a*e1 + a*n0 + (a/2)*ninf` reads a scalar part of **0 where the answer is 1**, 6 of 11 magnitudes. **An exact zero from making the same rounding error twice is an artifact.** Reverted; **no assertion in 3989 could tell the two trees apart** until a witness was written. ⛔ `_cga_scalar_of_geo` had to sum ALL pairs (diagonal-only left 6800 of 6800 non-null — WORSE); only 16 of the 32 scalar-producing pairs are diagonal. ⛔ **The first CGA call cost 2.7 ms and every benchmark was blind to it** (they all warm up) — found because two probes disagreed by 2.1x; repaired to 0.72 ms, table byte-identical under the FNV contract. ⚠ **2.22x on point*point, up to 10.93x SLOWER at k = 32.** ⛔ Building it found a **cycc 6.6.2 wrong-code bug** — `continue` at two nesting levels binds to the wrong loop — an all-zero table reported as success, filed upstream with a self-proving repro; ⚠ **my first filing described the symptom wrongly** and was corrected by instrumenting the loop. ⭐ The gate came BEFORE the code: 1024 entries derived in CI, FNV-1a `0xF4A98C5706D5CF5B`. ⚠ The index space caught me: a first spot-check read `n0²=+1` when it was `e3²=+1` in the other numbering. ⭐ The 2.20.0 acceptance pins INVERTED as designed. Suites **3983 -> 3991**. |

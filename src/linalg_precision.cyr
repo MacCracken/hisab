@@ -1946,22 +1946,89 @@ fn cqr_decompose(A, out_Q, out_R) {
         if (f64_gt(norm, 0) == 1) {
             # Complex sign: sign(x1) = x1 / |x1| if x1 != 0, else 1
             var x1 = cx_new(load64(v), load64(v + 8));
-            var abs_x1 = cx_abs(x1);
             var phase = cx_one();
-            # ⛔ 2.22.0 — an absolute 1e-12 deciding whether a PHASE is computed.
-            # The fallback is phase = 1, so a small-but-perfectly-good x1 got the
-            # WRONG phase rather than no phase — a fabricated value, not a refusal.
-            # `cx_div` guards its own denominator (2.15.0 gave it Smith's
-            # algorithm), so the only question left here is x1 != 0.
-            if (f64_gt(abs_x1, 0) == 1) {
-                phase = cx_div(x1, cx_real(abs_x1));
+            # ⛔ 2.22.0 — an absolute 1e-12 decided whether a PHASE was computed at
+            # all, and the fallback was phase = 1, so a small-but-perfectly-good x1
+            # got the WRONG phase rather than no phase.
+            # ⛔ 2.23.0 — AND THE REPAIR FOR THAT OPENED A SECOND DEFECT, WHICH IS
+            # WHY THE SCALING BELOW EXISTS. `cx_div(x1, |x1|)` is only as good as
+            # `cx_abs(x1)`, and for a SUBNORMAL x1 that modulus has been quantised
+            # onto the subnormal grid — so the quotient is not a unit complex
+            # number. The Householder identity needs |phase| EXACTLY 1 and degrades
+            # in proportion to ||phase| - 1|: measured, |phase| - 1 reaches
+            # **+0.414 at x1 = 2^-1074** (cx_div returns (1,1)), and the end-to-end
+            # residual ‖QR - A‖/‖A‖ tracks it — 2.3e-11 at 2^-1040, 2.4e-05 at
+            # 2^-1060, 4.7e-01 at the floor, all with rc = HSB_ERR_NONE.
+            # ⚠ 2.21.0's phase = 1 fallback was ACCIDENTALLY EXACT in that band,
+            # so 2.22.0 traded 1 row right for **38 rows wrong**. A repair measured
+            # only where it was aimed is how that shipped.
+            # ⭐ Scale x1 to O(1) by its own largest component before forming the
+            # phase. The phase is scale-INVARIANT by definition, so this changes
+            # nothing above the subnormal band and restores |phase| = 1 to 2.2e-16
+            # inside it. Powers of two are not required — any exact division by a
+            # component of x1 leaves the ratio intact.
+            # ⚠ A fixture built from an exact Pythagorean triple CANNOT see this:
+            # x1 = (3,4)*2^-e is clean at every e because |x1| = 5*2^-e is exactly
+            # representable. The direction has to be one whose modulus is off the
+            # grid — the acceptance test uses (1,1).
+            # [measured: 1075-row phase sweep, 3 trees + an isolating revert, 2026-09-11]
+            var px = f64_abs(HComplex_re(x1));
+            var py = f64_abs(HComplex_im(x1));
+            var pmx = px;
+            if (f64_gt(py, pmx) == 1) { pmx = py; }
+            if (f64_gt(pmx, 0) == 1) {
+                var xs = cx_new(f64_div(HComplex_re(x1), pmx), f64_div(HComplex_im(x1), pmx));
+                var abs_xs = cx_abs(xs);
+                if (f64_gt(abs_xs, 0) == 1) {
+                    phase = cx_div(xs, cx_real(abs_xs));
+                }
             }
+            var abs_x1 = cx_abs(x1);
 
             # v[0] += phase * ||v||
             var shift = cx_scale(phase, norm);
             var new_v0 = cx_add(x1, shift);
             store64(v, HComplex_re(new_v0));
             store64(v + 8, HComplex_im(new_v0));
+
+            # ⛔ 2.23.0 — THE FOURTH REFLECTOR, AND 2.22.1 REPAIRED ONLY THREE.
+            # That release normalised `v` in `_lp_bidiagonalize` (both sides) and
+            # `_lp_tridiagonalize` so `vtv` is 1 by construction; this complex one
+            # kept the naive sum and therefore kept the defect. For
+            # `diag(1) (+) c*[[3,1],[4,2]]` the k=1 reflector's v is (8c, 4c), so
+            # vhv = 80c², which falls below DBL_MIN at **c = 2^-515** — measured
+            # boundary e=514 correct, e=515 wrong, and the coefficient predicts it:
+            # 80*2^-1028 > DBL_MIN > 80*2^-1030. Blocks with vhv = 468c² and
+            # 0.3125c² first fail at e=516 and e=511, exactly as their coefficients
+            # dictate, which is causal isolation rather than correlation.
+            # ⛔ THE FAILURE IS INVISIBLE TO THE TWO TESTS A CALLER WOULD RUN.
+            # With the reflector skipped, R == A, so `max|QR - A|/max|A|` and
+            # `max|Q^H Q - I|` are both **exactly 0** — Q is the identity and the
+            # product is trivially A. The only visible symptom is that R is not
+            # upper triangular, which is the one thing QR is FOR.
+            # ⭐ Same repair as the other three: `H = I - 2vv^H/v^H v` is
+            # identically `I - 2uu^H` for `u = v/||v||`, and `||v||` here is the
+            # scaled norm 2.22.0 gave this routine, so nothing underflows.
+            # [measured: 1075-binade sweep x 3 fixtures, 3 trees, 2026-09-11]
+            var nv_c = f64_from(0);
+            i = 0;
+            while (i < len) {
+                var cre = f64_abs(load64(v + i * 16));
+                var cim = f64_abs(load64(v + i * 16 + 8));
+                if (f64_gt(cre, nv_c) == 1) { nv_c = cre; }
+                if (f64_gt(cim, nv_c) == 1) { nv_c = cim; }
+                i = i + 1;
+            }
+            if (f64_gt(nv_c, 0) == 1) {
+                if (f64_lt(nv_c, F64_POS_INF) == 1) {
+                    i = 0;
+                    while (i < len) {
+                        store64(v + i * 16, f64_div(load64(v + i * 16), nv_c));
+                        store64(v + i * 16 + 8, f64_div(load64(v + i * 16 + 8), nv_c));
+                        i = i + 1;
+                    }
+                }
+            }
 
             # Compute v^H * v (real, since it's a norm squared)
             var vhv = f64_from(0);
@@ -2037,6 +2104,32 @@ fn cqr_decompose(A, out_Q, out_R) {
         while (j < n) {
             cmat_set(out_R, i, j, cx_scale(cmat_get(out_R, i, j), sc));
             j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    # ⭐ 2.23.0 — R IS UPPER TRIANGULAR BY CONTRACT, NOT BY CANCELLATION. The
+    # reflectors annihilate the sub-diagonal analytically, but they do it in
+    # floating point, so what lands there is whatever the rounding leaves. Through
+    # 2.22.1 that happened to cancel to a bit-exact 0 on the fixtures anyone had
+    # run; normalising `v` (above) adds one rounding per component and it no longer
+    # does — measured, |R[2][1]| becomes ~7e-16 RELATIVE TO THE BLOCK, i.e. one ulp,
+    # on 5 of the 9 decades the existing sweep covers.
+    # ⚠ That is a rounding change, NOT a correctness regression — but "R is upper
+    # triangular" is the defining property of a QR decomposition and the thing
+    # `cqr_decompose`'s own tests assert, so it should be TRUE rather than nearly
+    # true. Zeroing the strictly-lower triangle makes it exact by construction and
+    # costs one O(m*n) pass on an O(m*n^2) routine.
+    # ⚠ It also removes a whole class of "is it exactly zero?" question from every
+    # future fixture — and this release exists because the answer to that question
+    # had been "yes, by luck" and nobody knew.
+    # [measured: 9-decade decimal sweep, |R21|/c = 6.9e-16 .. 8.5e-16, 2026-09-11]
+    i = 0;
+    while (i < m) {
+        var jz = 0;
+        while (jz < n) {
+            if (jz < i) { cmat_set(out_R, i, jz, cx_zero()); }
+            jz = jz + 1;
         }
         i = i + 1;
     }

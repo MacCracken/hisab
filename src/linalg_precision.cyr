@@ -193,6 +193,55 @@ fn _lp_cmat_max_abs(A) {
     return mx;
 }
 
+# ⛔ 2.22.1 — A BALANCE SCALE CHOSEN FROM THE LARGEST ENTRY SAYS NOTHING ABOUT
+# THE SMALLEST, AND THAT IS WHERE THE VALUE WAS BEING LOST. `pow2_floor(max|A|)`
+# puts the largest entry in [1,2); for a matrix whose entries span more than 1022
+# binades the smallest is then SUBNORMAL after the divide — and a power-of-two
+# divide is exact only while the quotient stays NORMAL, because below DBL_MIN the
+# representable grid is absolute rather than relative, so dividing walks off it.
+# ⛔ Measured on the 2.20.0 acceptance fixture at c = 2^-1073: the entry is 18
+# units of 2^-1074, `pow2_floor(9)` is 8, 18/8 = 2.25 ROUNDS TO 2, and 2*8 = 16,
+# so **11% was destroyed before `_lp_bidiagonalize` was ever called**.
+# ⭐ THE FIX IS TO CHOOSE THE SCALE FROM BOTH ENDS. Halve it — i.e. scale the
+# matrix UP — until the smallest non-zero entry is normal, stopping if the
+# largest would overflow. Still a power of two, so still exact, and when every
+# entry is already normal the loop does not execute and the behaviour is
+# unchanged.
+# ⚠ 2.22.1's issue filing first claimed "no single global scalar can work". That
+# is FALSE and measurement refuted it: f64's normal range spans 2045 binades and
+# these fixtures need ~1076, so one scalar is sufficient — the defect was WHICH
+# scalar, not how many. **A filing is a measurement like any other.**
+# ⚠ Dividing can never lift a subnormal INPUT into the normal range, so the loop
+# must be allowed past 1 into sc < 1. An earlier draft guarded `sc > 1` and
+# therefore did nothing at all for exactly the inputs it was written for —
+# measured, it turned a correct row at 2^-1065 into HSB_ERR_NO_CONVERGENCE.
+# [measured: 3 fixtures x 52 subnormal scales vs a 200-digit oracle, 2026-09-11]
+#must_use
+fn _lp_balance_scale(A, rows, cols) {
+    var hi = _lp_mat_max_abs(A);
+    var sc = _lp_pow2_floor(hi);
+    var lo = F64_POS_INF;
+    for (var bi = 0; bi < rows; bi = bi + 1) {
+        for (var bj = 0; bj < cols; bj = bj + 1) {
+            var av = f64_abs(ganita_mat_get(A, bi, bj));
+            if (f64_gt(av, 0) == 1) {
+                if (f64_lt(av, lo) == 1) { lo = av; }
+            }
+        }
+    }
+    if (f64_lt(lo, F64_POS_INF) == 0) { return sc; }
+    while (f64_lt(f64_div(lo, sc), F64_TINY) == 1) {
+        var nsc = f64_mul(sc, F64_HALF);
+        # ⚠ Both exits are required: `nsc` can reach 0 by repeated halving, and
+        # `hi / nsc` can overflow to +Inf for a matrix that genuinely spans more
+        # than f64's normal range. `f64_lt(x, +Inf) == 0` catches Inf and NaN.
+        if (f64_gt(nsc, 0) == 0) { break; }
+        if (f64_lt(f64_div(hi, nsc), F64_POS_INF) == 0) { break; }
+        sc = nsc;
+    }
+    return sc;
+}
+
 # ⛔ 2.22.0 — A NON-FINITE ENTRY MADE BOTH DECOMPOSITIONS RETURN SUCCESS WITH A
 # NaN PAYLOAD. Measured on the 2.21.0 tree: `svd_golub_kahan` on [[+Inf,0],[0,1]]
 # returns HSB_ERR_NONE with BOTH singular values NaN, and `eigen_qr` on the same
@@ -357,6 +406,30 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
             store64(v_l, f64_add(v0, f64_mul(sgn, norm_l)));
 
             # Compute vTv for normalization
+            # ⛔ 2.22.1 — NORMALISE v, SO `vtv` IS 1 BY CONSTRUCTION. `vtv` is
+            # degree TWO, and at the bottom of the NORMAL range (entries around
+            # 2^-1022) every square underflows to zero — so the `F64_TINY` guard
+            # below correctly refuses to divide, and **the consequence is exactly
+            # the silent drop the absolute gate used to cause**: the reflector is
+            # skipped and the extraction discards the mass below the diagonal.
+            # ⭐ `H = I - 2vv'/v'v` is identically `I - 2uu'` for `u = v/||v||`,
+            # and `||v||` now comes from the scale-free `_lp_vec_norm`, so there
+            # is nothing left to underflow. The guard below is kept — it is still
+            # the right test for a genuinely zero vector — but it can no longer
+            # fire for a well-formed reflector.
+            # ⚠ 2.22.1's first attempt repaired only the BALANCE and left this,
+            # which measured **30 loud rows converted into silent wrong answers**
+            # — the precise trade the 2.19.0 refutation named. Both halves are
+            # required; either alone is worse than neither.
+            # [measured: 3 fixtures x 52 scales vs a 200-digit oracle, 2026-09-11]
+            var nv_l = _lp_vec_norm(v_l, 0, len_l);
+            if (f64_gt(nv_l, 0) == 1) {
+                i = 0;
+                while (i < len_l) {
+                    store64(v_l + i * 8, f64_div(load64(v_l + i * 8), nv_l));
+                    i = i + 1;
+                }
+            }
             var vtv = f64_from(0);
             i = 0;
             while (i < len_l) {
@@ -434,6 +507,15 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
                 var sgn_r = _lp_sign(r0);
                 store64(v_r, f64_add(r0, f64_mul(sgn_r, norm_r)));
 
+                # ⭐ 2.22.1 — normalised, same as the left reflector above.
+                var nv_r = _lp_vec_norm(v_r, 0, len_r);
+                if (f64_gt(nv_r, 0) == 1) {
+                    i = 0;
+                    while (i < len_r) {
+                        store64(v_r + i * 8, f64_div(load64(v_r + i * 8), nv_r));
+                        i = i + 1;
+                    }
+                }
                 var vtv_r = f64_from(0);
                 i = 0;
                 while (i < len_r) {
@@ -1088,9 +1170,25 @@ fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     var superdiag = _lp_vec_new(n);  # n-1 used, extra slot harmless
 
     # Balance to unit max magnitude before decomposing; undo it on the singular
-    # values below. sv(c*A) = c*sv(A) for c > 0 and U/Vt are invariant, and the
-    # power-of-two divisor makes both the divide and the un-scale exact.
-    var sc = _lp_pow2_floor(_lp_mat_max_abs(A));
+    # values below. sv(c*A) = c*sv(A) for c > 0 and U/Vt are invariant.
+    # ⛔ 2.22.0 — THIS COMMENT USED TO END "and the power-of-two divisor makes both
+    # the divide and the un-scale exact." THAT IS FALSE FOR A SUBNORMAL ENTRY, and
+    # the claim is load-bearing: it is why the balancing was never suspected as a
+    # source of loss. A power of two is exact only while the quotient stays
+    # NORMAL. Below DBL_MIN the grid is absolute, not relative, so dividing walks
+    # off it. Measured on the 2.20.0 acceptance fixture [[9,1],[0,2]] at
+    # c = 2^-1073: the entry is 18 units of 2^-1074, `pow2_floor(9)` is 8,
+    # 18/8 = 2.25 ROUNDS TO 2 units, and 2*8 = 16 != 18 — **11% of the value is
+    # gone before the decomposition starts**, and no repair downstream can return
+    # it. That is why `svd_golub_kahan` still reports HSB_ERR_NONE with a
+    # fabricated ZERO smallest singular value there, and why 2.22.0's Householder
+    # and p_lo repairs both leave that row byte-identical.
+    # ⚠ Filed as `docs/development/issues/2026-09-11-svd-balancing-divide-lossy-
+    # for-subnormal-blocks.md` rather than repaired here: the fix is a scaling
+    # POLICY change (per-block, or an honest refusal), and this project's rule is
+    # that a class is sized before it is touched.
+    # [measured: balance-divide round-trip probe on the shipped tree, 2026-09-11]
+    var sc = _lp_balance_scale(A, m, n);
     var As = _lp_mat_div_scalar(A, sc);
     if (As == 0) { return HSB_ERR_ALLOC; }
 
@@ -1245,6 +1343,17 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
             store64(v, f64_add(v0, f64_mul(sgn, norm)));
 
             # Normalize: vtv
+            # ⭐ 2.22.1 — normalised, same as the two bidiagonal reflectors. The
+            # symmetric path squares the same way and loses the same value, and
+            # repairing one of a pair is how 2.18.0's U-replay defect was created.
+            var nv_t = _lp_vec_norm(v, 0, len);
+            if (f64_gt(nv_t, 0) == 1) {
+                i = 0;
+                while (i < len) {
+                    store64(v + i * 8, f64_div(load64(v + i * 8), nv_t));
+                    i = i + 1;
+                }
+            }
             var vtv = f64_from(0);
             i = 0;
             while (i < len) {
@@ -1616,7 +1725,11 @@ fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # Balance first; see svd_golub_kahan. The Wilkinson shift squares the
     # offdiagonal (e2sq = e2*e2), so this overflowed at 1e200 exactly as the
     # Householder norm did.
-    var sc = _lp_pow2_floor(_lp_mat_max_abs(A));
+    # ⭐ 2.22.1 — two-ended, matching the SVD. Repairing one of a pair is how
+    # 2.18.0's U-replay defect was created; `_lp_balance_scale` carries the
+    # reasoning and the figures.
+    # [measured: see _lp_balance_scale, 3 fixtures x 52 scales, 2026-09-11]
+    var sc = _lp_balance_scale(A, n, n);
     var As = _lp_mat_div_scalar(A, sc);
     if (As == 0) { return HSB_ERR_ALLOC; }
 

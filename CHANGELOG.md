@@ -2,6 +2,83 @@
 
 ## [Unreleased]
 
+## [2.22.1] - 2026-09-11 — the subnormal residue 2.22.0 filed, and why it needed BOTH halves
+
+2.22.0 shipped with a known defect filed in `issues/` rather than repaired: `svd_golub_kahan`
+returning `HSB_ERR_NONE` with a **fabricated ZERO** smallest singular value. This closes it.
+Classified against a 200-digit oracle over 3 fixtures × 52 subnormal scales:
+
+| | CORRECT | LOUD | SILENT |
+|---|---|---|---|
+| 2.22.0 | 23 | 62 | 71 |
+| **2.22.1** | **151** | **0** | **5** |
+
+**Zero `CORRECT → anything` regressions and zero `LOUD → SILENT`.** Suites **4014 → 4018**.
+
+⛔ **THE BALANCE SCALE WAS CHOSEN FROM ONE END, AND THAT IS WHERE THE VALUE WENT.**
+`_lp_pow2_floor(max|A|)` puts the largest entry in [1,2) and says nothing about the smallest, so a
+matrix spanning more than 1022 binades has its small block **subnormal after the divide** — and a
+power-of-two divide is exact only while the quotient stays NORMAL, because below `DBL_MIN` the grid
+is absolute rather than relative. Measured on the 2.20.0 acceptance fixture at c = 2^-1073: the entry
+is 18 units of 2^-1074, `pow2_floor(9)` is 8, `18/8 = 2.25` **rounds to 2**, and `2 × 8 = 16` —
+**11% destroyed before `_lp_bidiagonalize` was ever called.** The scale is now chosen from **both
+ends**: halve it (scale the matrix *up*) until the smallest non-zero entry is normal, stopping if the
+largest would overflow. Still a power of two, so still exact; when every entry is already normal the
+loop does not execute and behaviour is unchanged.
+
+⛔ **AND THAT REPAIR ALONE WOULD HAVE BEEN WORSE THAN NOTHING.** With only the balance fixed, the
+sweep reads CORRECT 102 / SILENT 54 — but **30 loud rows became silent wrong answers**, the precise
+trade the 2.19.0 refutation named and the reason this release could not ship in halves. The remaining
+cause was one level down: `vtv` is computed as a naive sum of squares, and at the *bottom of the
+normal range* (entries ≈ 2^-1022) every square underflows to zero, so 2.15.0's `F64_TINY` guard
+correctly refuses to divide — **and the consequence is exactly the silent drop the absolute gate used
+to cause**. The reflector is skipped and the extraction discards the mass below the diagonal.
+⭐ `H = I − 2vvᵀ/vᵀv` is identically `I − 2uuᵀ` for `u = v/‖v‖`, and `‖v‖` comes from the scale-free
+`_lp_vec_norm` 2.22.0 repaired — so normalising `v` makes `vtv` **1 by construction** and there is
+nothing left to underflow. All three reflectors (both bidiagonal, and the tridiagonal one reached by
+`eigen_qr`) get it, because repairing one of a pair is how 2.18.0's U-replay defect was created.
+
+⛔ **MY OWN FILING WAS WRONG, AND MEASUREMENT REFUTED IT WITHIN THE HOUR.** The issue said
+*"compute the dynamic range … if it exceeds f64's — which it does for these fixtures — then no global
+scalar can work."* **False.** f64's normal range spans **2045 binades** and these fixtures need
+**~1076**; a single global scalar is sufficient, and the defect was *which* scalar, not how many.
+⚠ A second draft then guarded the backoff with `sc > 1`, which does nothing at all for exactly the
+inputs it was written for — dividing cannot lift a subnormal input into the normal range — and
+measured, it turned a **correct** row at 2^-1065 into `HSB_ERR_NO_CONVERGENCE`. **A filing is a
+measurement like any other**, and this one was wrong twice before it was right.
+
+⭐ **THE FOUR 2.20.0 DEFECT PINS INVERTED, AND ONE OF THEM IS THE SUBTLEST IN THE FILE.** They
+asserted the fabricated zero, the 10.8× value, the loud arm and the `94 of 156` count as *tracked
+defects*; all four now assert the truth. The subtle one: the general 2×2 at c = 2^-1074 used to fail
+loudly and now **succeeds returning (6, 0)** — and succeeding is *correct*, because the true singular
+values there are 6.1623 and **0.16238 units** of 2^-1074, and 0.16238 of a unit is below the smallest
+representable number, so the correctly-rounded smaller value **is exactly zero**. ⚠ It is asserted
+with the *larger* value beside it, because "returns 0" is also what the fabricated-zero class
+produces — the discriminator is that a fabricating routine gets neither right.
+
+### Changed
+- **linalg_precision** — `_lp_balance_scale` replaces `_lp_pow2_floor(_lp_mat_max_abs(A))` in
+  `svd_golub_kahan` and `eigen_qr`. Two-ended, power-of-two, and a no-op when every entry is normal.
+- **linalg_precision** — all three Householder reflectors normalise `v` before forming `vtv`, so
+  `vtv` is 1 by construction and cannot underflow.
+
+### Fixed
+- **issues/** — `2026-09-11-svd-balancing-divide-lossy-for-subnormal-blocks.md` **closed and moved to
+  `issues/archived/`**, with its own wrong root-cause framing corrected in the archived copy rather
+  than quietly deleted. The 11%-loss measurement in it was right; the "no global scalar can work"
+  conclusion drawn from it was not.
+- **tests** — 4 assertions added (**4014 → 4018**) and the four 2.20.0 defect pins rewritten to assert
+  truth. Verified against the 2.21.0 tree: **17 assertions fail there and all pass here.**
+
+### Performance
+- **A measured cost, stated rather than hidden**: against the 2.21.0 released tree (i.e. 2.22.0 and
+  2.22.1 combined), `svd_golub_kahan_12` **+4.99%** (113.93 → 119.61 µs) and `eigen_qr_12` **+3.56%**
+  (85.51 → 88.55 µs), against an **untouched control of +0.40% median over 24 rows, 0 past 10%**
+  (largest untouched mover 2.65%), on a quiet box (load 0.30). The cost is real and outside the
+  control band: an O(n²) finiteness scan, an O(n²) min-magnitude scan, and one division per component
+  per reflector. **~5% to remove a class of silent wrong answers is the trade, and it is stated.**
+
+
 ## [2.22.0] - 2026-09-11 — the Householder gate: a silent wrong answer at ordinary conditioning, in two public entry points
 
 The roadmap carried this as **"subnormal SVD"** for three releases. It is not a subnormal defect, and
@@ -109,6 +186,21 @@ even though only `:270` was measured.
   rounding; it is not scale-equivariant the way the SVD's power-of-two block is. The fixture was wrong,
   not the code, and the bound is now a few ulp with the **sign** asserted separately, because a tolerance
   alone would pass a repair that merely shrank the error.
+
+### Fixed (docs)
+- **linalg_precision** — a comment asserted *"the power-of-two divisor makes both the divide and the
+  un-scale exact."* **It is false for a subnormal entry, and the claim was load-bearing**: it is why the
+  balancing was never suspected as a source of loss. A power of two is exact only while the quotient
+  stays NORMAL; below `DBL_MIN` the grid is absolute, so dividing walks off it. Measured on the 2.20.0
+  acceptance fixture: the entry is 18 units of 2^-1074, `pow2_floor(9)` is 8, `18/8 = 2.25` rounds to
+  **2** units, and `2 × 8 = 16 ≠ 18` — **11% destroyed before `_lp_bidiagonalize` is called**. Corrected
+  in place with the measurement beside it. **A comment asserting a numerical property is a claim like any
+  other.**
+- **issues/** — filed `2026-09-11-svd-balancing-divide-lossy-for-subnormal-blocks.md`. ⚠ It was first
+  written into the roadmap's "Decisions owed" and called *filed*, which it was not: `CLAUDE.md` says
+  defects are tracked in `issues/` and discharged as a precondition of the release they gate, and
+  `issues/` held nothing but `archived/`. The roadmap row is now reduced to the scaling **decision** the
+  repair needs and points at the issue. **A roadmap row is not a filing.**
 
 ### Performance
 - **A measured cost, stated rather than hidden behind its own spread**: `svd_golub_kahan_12` **+2.98%**

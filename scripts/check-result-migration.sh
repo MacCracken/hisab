@@ -73,18 +73,32 @@ def scan(fns):
             # ignored, and a gate people learn to ignore is not a gate.
             if l.lstrip().startswith("#"):
                 continue
-            for m in call.finditer(l):
+            # ⚠ Blank out string literals before matching. Assertion MESSAGES
+            # routinely name the function under test — "num_dct(n=0) still
+            # rejects" — and matching inside them produced 12 false positives out
+            # of 13 hits. A gate whose output is mostly noise gets skimmed, and a
+            # skimmed gate is the one that misses the real entry.
+            masked = re.sub(r'"(?:[^"\\]|\\.)*"', lambda mm: '"' + " " * (len(mm.group(0)) - 2) + '"', l)
+            for m in call.finditer(masked):
                 name = m.group(1)
                 # its own definition is not a call site
                 if re.match(r'^fn ' + re.escape(name) + r'\(', l):
                     continue
-                before = l[:m.start()].rstrip()
+                before = masked[:m.start()].rstrip()
                 # Accept: `var t, v = f(` / `... = f(` with a two-name bind, or `f(...)?`
                 if re.search(r'var\s+[A-Za-z_][A-Za-z_0-9]*\s*,\s*[A-Za-z_][A-Za-z_0-9]*\s*=\s*$', before):
                     continue
-                rest = l[m.end():]
+                rest = masked[m.end():]
                 # crude but adequate: a `?` right after the closing paren on this line
                 if re.search(r'\)\s*\?', rest):
+                    continue
+                # ⭐ TAIL DELEGATION is correct and must not be flagged:
+                # `return f(...);` forwards BOTH halves of the pair as this
+                # function's own return value. Verified on cycc 6.6.2 against a
+                # Result-returning callee, Ok and Err both propagating intact.
+                # Flagging it would have made the gate cry wolf on 6 correct
+                # sites, which is how a gate stops being read.
+                if re.search(r'return\s*$', before):
                     continue
                 kind = "argument-position" if before.endswith(("(", ",")) else "single-bind-or-bare"
                 bad.append((f, i, name, kind, l.strip()[:100]))

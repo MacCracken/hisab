@@ -2,6 +2,53 @@
 
 ## [Unreleased]
 
+### Changed
+- **Documentation sweep, 2026-09-11 — no behaviour change; all 4202 assertions pass on both sides.**
+- `docs/development/roadmap.md` is **future-facing only**, **1308 → 297 lines**. Removed: 38
+  completed `[x]` items, 19 struck-through release-train rows, the 70-row **Release History** table,
+  the arc-narrative sections and every closed toolchain row. **The per-version record now lives only
+  in this file** — the removed table was a third copy of it, and maintaining three copies is how the
+  `triangulate_polygon` direction stayed backwards for thirteen releases in the one copy no gate
+  could reach. ⭐ **Four open items were extracted from prose that was already in the file but was
+  not listed as work**: the struct-layout contract whose 32 assertions are all `sizeof(T) > 0` and so
+  cannot fail, the Abaco boundary table frozen at the 2.2.0 surface, getting a live consumer onto
+  3.0.0, and the `hvec3_lerp` SIMD hybrid parked under `cross` despite never being gated on lane
+  shuffles (**25 ns → 19–20 ns, bit-identical**). The 3.0.0 public/private item is re-scoped: the
+  `pub fn` half is non-breaking and belongs in a 3.x, the `private` flip is breaking and moves to
+  4.0.0, and both stay blocked on the upstream `#derive`/`public` defect.
+- ⛔ **Every line-number citation carried forward was re-derived and ALL SIX HAD DRIFTED.** The six
+  hand-rolled ordering routines are `collision_core.cyr:530`, `spatial.cyr:114`, `num_ext.cyr:309`,
+  `linalg_ext.cyr:1071`, `linalg_precision.cyr:1219` and `:1753`; the roadmap had been pointing at
+  `collision_core.cyr:466`, `linalg_ext.cyr:905`, `linalg_precision.cyr:816` and `:1265`, **none of
+  which is an ordering routine today**. A seventh drifted citation was found in the source itself —
+  `linalg_ext.cyr` cited `linalg_precision.cyr:1334` for `eigen_qr`'s sort, which is now a comment
+  about wrong-sign eigenvalues ~420 lines away — and is replaced by a citation **by block name**,
+  since a number cannot be kept true by a gate that does not exist.
+- `README.md`: the **Security** cell had accreted to **12,724 bytes** of per-release arc narrative
+  inside one table cell and is now **730 bytes** of durable posture. The 3.0.0 breaking notice moved
+  out of it into its own section above **Modules**.
+
+### Fixed
+- ⛔ **README's Quick Start still showed the PRE-3.0.0 calling idiom** — `calc_integral_simpson(...)`
+  and `num_newton(...)` with their returns discarded. That is now a `#must_use` warning, and the same
+  shape in *argument* position is the silent-tag trap this release exists to remove, so the README
+  was teaching the one mistake the migration guide leads with. Both rewritten to bind both halves.
+- ⛔ **19 doc comments still stated the pre-3.0.0 contract on functions the migration changed** —
+  `# Returns: 0 on success, HSB_ERR_X …` above functions that now return `Ok(0)` / `Err(...)`
+  (`num_fft`, `num_ifft`, `num_dct`/`idct`, `num_dst`/`idst`, `num_fft_2d`/`ifft_2d`,
+  `num_tridiag_solve`, `num_crt`, `_numx_dft`, `num_newton`, `num_bisection`,
+  `calc_integral_trapez`/`_simpson`, `svd_truncated`, `eigen_power`, `lyapunov_max`, `ad_grad`).
+  `src/error.cyr`'s module header said the same thing for the whole code set. **A doc comment stating
+  a retired contract is worse than none: it reads as current and no gate can see it.** ⚠ Classified
+  by whether the function body actually returns `Ok`/`Err` rather than by grep alone — `solve_pgs`
+  and `svd_compute` still return a plain `0` and their comments are correct, so they were left.
+- `README.md` Building block: every test count was a release stale (454/379/2041/233/775 + 72
+  benchmarks → **550/413/2086/239/914 + 78**, plus the fuzz line). The consumer manifest snippet
+  omitted `"result"` from `[deps] stdlib` and claimed **15** sidecar leaves where `dist/hisab.deps`
+  names **16**. `CLAUDE.md` and `cyrius.cyml` carried a stale bundle weight, re-derived to
+  **1,103,166 B / 26,457 lines** after this sweep's own comment edits, and `CLAUDE.md`'s
+  doc-structure line still described the roadmap as holding "completed items".
+
 ## [3.0.0] - 2026-09-11 — Result<T,E>, and two roadmap premises that measurement refuted
 
 **Breaking.** The integer-error-code convention is replaced by the Cyrius stdlib `Result<T, E>`.

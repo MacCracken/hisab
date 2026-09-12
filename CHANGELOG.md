@@ -2,6 +2,81 @@
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-09-11 — Result<T,E>, and two roadmap premises that measurement refuted
+
+**Breaking.** The integer-error-code convention is replaced by the Cyrius stdlib `Result<T, E>`.
+**48 functions change signature**; nothing else about their behaviour moves. Suites **4202**.
+Migration guide: `docs/guides/migration-3.0.md`.
+
+⛔ **THE PREMISE THIS RELEASE WAS PLANNED ON WAS FALSE.** The roadmap said `?` on a plain i64 fn
+"compiles clean and SIGSEGVs with no diagnostic" and concluded there was **no incremental path**.
+Measured on cycc 6.6.2, it fails at **compile time**: the `?` line warns with the fix named, the
+call site is a hard error (*"a `: stack` enum returns two values — bind both"*), and no binary is
+emitted. Migrating a function together with its callers is safe, because a half-migrated **binding**
+cannot ship.
+
+⛔ **BUT THE HAZARD THAT MATTERED IS ONE THE ROADMAP NEVER MENTIONED, AND IT IS SILENT.** A `Result`
+in **argument** position does not error — `rdx` never reaches a parameter, so the callee receives
+the **tag**. Measured: `Ok` tag = **0**, `Err` tag = **1**, `HSB_ERR_NONE` = **0**. So after
+migration `assert_eq(f(...), HSB_ERR_NONE, …)` becomes `assert_eq(0, 0)` and **keeps passing while
+testing nothing**, while error-path asserts fail loudly. **98 test lines** would have gone vacuous
+without a word.
+⚠ `lib/result.cyr`'s own header says the diagnostic "is the migration tool: every stale site fails
+at its own line instead of miscompiling." True for **binding** sites, **false for argument sites** —
+which is where a library's tests overwhelmingly live. ⭐ So the migration was driven by a **grep**,
+not by build errors: `scripts/check-result-migration.sh`, mutation-proven before the first function
+moved, and green at 0 bad call sites at the end with its `--selftest` still passing.
+
+⭐ **`?` REPLACED THE MANUAL CHECK CHAINS — 18 sites.** ⚠ It needs a **binding**: it cannot be used
+on a reassignment (`err = f(...)?`), which is why four sites took a second name. A tail call needs
+nothing at all — `return g(...);` already forwards both halves, verified.
+
+⛔ **THE DEPRECATION WINDOW IS DECLINED, ON THIS MIGRATION'S OWN EVIDENCE.** A dual API (`f` beside
+`f_r`) would leave every existing `assert_eq(f(...), HSB_ERR_NONE)` site **quietly passing against
+the old function forever** — the exact failure this release exists to remove. **2.24.0 stands as
+the supported 2.x line.**
+
+⛔ **AND THE PUBLIC/PRIVATE SURFACE IS BLOCKED UPSTREAM, REVERTED RATHER THAN HALF-APPLIED.**
+`private`/`public` works and **the boundary holds** — verified end to end: a consumer including
+`dist/hisab.cyr` can call the `public` API and **cannot** reach a file-private helper (build fails,
+`'_noise_fade' is private to its file`, exit 1, no binary). That check mattered, because cyrius's
+own changelog records `private` silently doing nothing for twelve releases while the guide promised
+it worked. ⛔ It cannot ship because **`#derive(...)` and `public` cannot be combined on 6.6.2** —
+a hard error with **no `private` anywhere in the file**, against a control differing by exactly one
+keyword. Without `public` on the struct its generated accessors stay file-private, and privatising
+hisab produced **1,436 errors of the form `'HVec3_x' is private to its file`** from the 18 modules
+that derive accessors. Filed upstream as `2026-09-11-derive-cannot-combine-with-public.md`,
+cross-referenced to the existing `#inline`-disarms-`#derive` filing, which produces the identical
+diagnostic and may share a root cause.
+⭐ The sizing survives and is better than the roadmap's: **939 functions, 296 underscore-prefixed,
+148 functions AND 25 globals crossing a module boundary, 31 of them underscore-named** — the row
+counted 17 and did not count globals at all.
+
+⚠ **FIVE OF MY OWN INSTRUMENTS WERE WRONG BEFORE THE CODE WAS.** The source migrator computed
+function spans **once** and then mutated the file, so every later span drifted — it swept in
+**three functions that were never fallible** (`num_halton`, `num_sobol`, `_numx_use_fft`), caught by
+diffing what is migrated against what was fallible at HEAD, and fixed by processing back to front.
+The call-site converter could not tell a **status** function from a **value** one, so
+`assert_eq(f(...), 0)` silently dropped the value check on **22 assertions**; it now classifies by
+whether every `Ok` payload is a literal `0` (34 status-style, 2 value-style). Its comma splitter
+ignored string literals and broke every message containing a comma. The gate matched function names
+**inside message strings** (12 false positives of 13) and flagged correct **tail delegations**. And
+one compile check used `cyrius build src/main.cyr`, which **does not include the library** — the
+suites failed immediately after.
+
+### Changed
+- **BREAKING** — 48 functions across 12 modules return `Result<T, E>`: `Ok(0)` for status
+  functions, `Ok(value)` for the two that return an answer (`num_modpow`,
+  `halfedge_is_boundary`), `Err(HSB_ERR_*)` throughout. Out-parameters are unchanged.
+- **cyrius.cyml** — `result` added to `[deps] stdlib`; `dist/hisab.deps` grows 15 → 16 leaves.
+
+### Added
+- **scripts/check-result-migration.sh** — guards the one failure mode the compiler cannot see.
+  Verified by `--selftest` and against a real one-function slice.
+- **docs/guides/migration-3.0.md** — the four call shapes, the `?` rules, the argument-position
+  trap, and why there is no deprecation window.
+
+
 ## [2.24.0] - 2026-09-11 — the two CGA deferrals, and a cost the plan for them did not predict
 
 2.23.0 costed both remaining CGA items and left them as implementation. This is that implementation —

@@ -11,10 +11,10 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.24.0
+## Current — v3.0.0
 
-Suite **4039** across five harnesses (hisab 536, foundation 413, modules 2073, edge_cases 233,
-abuse 784), constant gate **159/159**, **78** benchmarks, **35** `[lib]` modules, toolchain
+Suite **4202** across five harnesses (hisab 550, foundation 413, modules 2086, edge_cases 239,
+abuse 914), constant gate **159/159**, **78** benchmarks, **35** `[lib]` modules, toolchain
 **6.6.2**, sakshi **2.5.1**, ganita **1.2.4**, and **zero** deprecated-alias call sites. All gates green:
 `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps / 0 untrusted
 / 0 missing, `deps --verify` 31/31, `fuzz` 1/0, `coverage` 640/644 (99%) functions over 36/36 files,
@@ -1015,8 +1015,18 @@ a major, with a migration guide, not a 2.x patch.
 > `Result` for none of the breakage. ⚠ Caveat: it is a *compiler* warning, not a lint warning, so
 > CI's `^  warn ` grep will not gate it — wire that before relying on it.
 
-- [ ] **[3.0.0]** Wrap fallible returns in `Result<T,E>` (keep `ERR_*` codes as the `E` payload) — **value form**
-- [ ] **[3.0.0]** Adopt `?` to replace manual `-1`-return + check chains
+- [x] ✅ **DONE in 3.0.0 — 48 of 48 functions, 182 `Ok`/`Err` returns, 533 call sites, 0 bad
+      sites by the gate.** ⛔ The premise this row rested on was FALSE: `?` on a plain i64 fn does
+      NOT "compile clean and SIGSEGV", it fails at compile time with the fix named.
+      ⛔ And a hazard the row never mentioned is the one that mattered: a Result in ARGUMENT
+      position degrades silently to its tag, and `Ok` tag = 0 = `HSB_ERR_NONE`, so 98 test lines
+      would have gone VACUOUS while still green. `scripts/check-result-migration.sh` exists for
+      that class, mutation-proven, and the migration was driven by grep rather than by build
+      errors.
+      [measured: 48 fns / 533 sites; tag probe on cycc 6.6.2, 2026-09-11]
+- [x] ✅ **DONE in 3.0.0 — 18 `?` propagation sites.** ⚠ `?` needs a BINDING: it cannot be used
+      on a reassignment (`err = f(...)?`), which is why four sites took a second name. A tail call
+      needs nothing — `return g(...);` already forwards both halves, verified.
 - [x] ✅ **DONE — 44 annotations, and a GATE, because without one it was decorative.**
       ⚠ **The count is 44 functions, not 167.** 167 is the number of `return HSB_ERR` STATEMENTS;
       `#must_use` goes on functions, of which 48 can return one — and **4 of those can only ever
@@ -1036,8 +1046,31 @@ a major, with a migration guide, not a 2.x patch.
       `calc_integral_simpson` and `num_newton` and read their out-parameters **without checking
       either return**, so a failed call would have printed a confident wrong number. **An example is
       copied more often than it is read.** Repaired, output unchanged.
-- [ ] **[3.0.0]** Migration guide + deprecation window for the old integer-code API
-- [ ] **[3.0.0]** **Public / private function surface.** hisab currently signals intent by naming convention
+- [x] ✅ **DONE in 3.0.0 — `docs/guides/migration-3.0.md`.** ⛔ **The deprecation window is
+      DECLINED, on the migration's own evidence.** A dual API (`f` + `f_r`) would leave every
+      existing `assert_eq(f(...), HSB_ERR_NONE)` call site quietly passing against the old
+      function forever, because of the silent argument-position degradation — the exact failure
+      this release removes. 2.24.0 stands as the supported 2.x line instead.
+- [ ] ⛔ **[3.0.0 — BLOCKED UPSTREAM, and the block is measured, not assumed.]**
+      `private` / `public` works exactly as documented and the boundary HOLDS: verified end to end
+      on a copy of the tree — a consumer including `dist/hisab.cyr` can call the `public` API and
+      CANNOT reach a file-private helper (build fails, `'_noise_fade' is private to its file`,
+      exit 1, no binary). The bundle preserves it; `dist/hisab.deps` is unaffected.
+      ⛔ **It cannot ship because `#derive(...)` and `public` cannot be combined on cycc 6.6.2.**
+      `#derive(accessors)` above a `public struct` is a hard error — with NO `private` anywhere in
+      the file, and a control differing by exactly one keyword compiles. Without `public` on the
+      struct its generated accessors stay file-private, and privatising hisab produced **1,436
+      errors of the form `'HVec3_x' is private to its file`** from the 18 modules that derive
+      accessors — which are the foundation types every other module touches.
+      Filed upstream as `2026-09-11-derive-cannot-combine-with-public.md`, cross-referenced to the
+      existing `#inline`-disarms-`#derive` filing, which produces the identical diagnostic and may
+      share a root cause. The change is REVERTED rather than half-applied.
+      ⭐ **The sizing work stands and is better than this row's**: 939 functions, 296
+      underscore-prefixed, **148 functions AND 25 globals** crossing a module boundary, of which
+      **31 are underscore-named** — this row counted 17 and did not count globals at all.
+      [measured: full cross-module reference scan + end-to-end consumer probe, 2026-09-11]
+      ⛔ ORIGINAL ROW FOLLOWS.
+      **Public / private function surface.** hisab currently signals intent by naming convention
       alone — a leading `_` means "internal" and nothing enforces it. Two consequences already
       visible in the tree: `geo_diff.cyr` reaches `geo.cyr`'s helpers across a module boundary
       because nothing distinguishes "public API" from "implementation detail", and the 2.10.1 split
@@ -1180,6 +1213,7 @@ roadmap item** — and with ten live consumers, someone can now actually be aske
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 3.0.0 | 2026-09-11 | 26,378 | 36 | **BREAKING — `Result<T, E>` replaces the integer error codes.** 48 functions, 182 `Ok`/`Err` returns, 18 `?` sites, 533 call sites, 0 bad sites by the gate. ⛔ **The premise this was planned on was FALSE**: `?` on a plain i64 fn does NOT compile clean and SIGSEGV — it fails at compile time with the fix named. ⛔ **And the hazard that mattered was never mentioned**: a Result in ARGUMENT position degrades silently to its tag, and `Ok` tag = 0 = `HSB_ERR_NONE`, so 98 test lines would have gone VACUOUS while still green. `lib/result.cyr`'s own header claims every stale site fails at its line — true for bindings, FALSE for arguments. ⭐ Driven by a grep, with a mutation-proven gate written BEFORE the first function moved. ⛔ **Deprecation window DECLINED** on the migration's own evidence; 2.24.0 is the supported 2.x line. ⛔ **Public/private surface BLOCKED upstream and reverted**: the boundary HOLDS (a consumer cannot reach a file-private helper — build fails, exit 1) but `#derive` and `public` cannot be combined on 6.6.2, and without it privatising hisab gives **1,436 `'HVec3_x' is private to its file`** errors from 18 modules. Filed upstream. ⭐ Sizing beat the row's: 148 functions AND 25 globals cross a boundary, 31 underscore-named — the row said 17 and counted no globals. ⚠ **Five of my own instruments were wrong first**: span drift swept in 3 never-fallible functions; the converter could not tell status from value and dropped 22 value checks; its splitter ignored string literals; the gate matched names inside messages; and one check used `cyrius build src/main.cyr`, which does not include the library. Suites **4039 -> 4202**. |
 | 2.24.0 | 2026-09-11 | 26,345 | 36 | **The two CGA deferrals — and a cost their costing did not predict.** First CGA call **687 us -> 258 us (-62.4%)** via memoised `_cga_geo_bits`/`_cga_bits_blade` and occupancy lists replacing four 32-slot passes per pair; table BYTE-IDENTICAL, checkable only because 2.23.0 had closed the FNV contract's magnitude blind spot. ⛔ **But it costs +1.87% on the STEADY-STATE product, which nothing in the plan anticipated** — the builder runs ONCE and the steady path is identical machine code, yet 1176 -> 1198 ns, slower in 9 of 11 interleaved pairs. **Saves 429 us once, costs 22 ns per product: net win below ~19,500 products, net loss above.** ⚠ Ruled out by measurement: NOT heap displacement (a 9,472 B dummy reproduces 0.00%, placed either before everything or between the table build and the loop — the second placement being the one that matters) and NOT run order (+3.63% reversed vs +3.81%). Unrelated dead code reproduces +0.91%, which points at layout — and EXTRACTING the memo loops into helpers halves the penalty, +4.33% -> +2.04%, so they are helpers as a MEASURED choice. ⛔ The literal table stays declined on numbers (+748 lines, +1.45% bundle, +2.93% code_size, and it gives up exact-by-construction). ⭐ **CGA has benchmark rows at all for the first time** (74 -> 78), including a one-shot cold row with a **mutation-proven entry guard** — a cold row that is not cold reads ~400x better; pre-warming makes the run exit 1. ⚠ Registered LAST; control over 26 existing rows: median +0.05%, 0 past 10%. |
 | 2.23.0 | 2026-09-11 | 26,243 | 36 | **The sites no fixture reached — and a defect 2.22.0 introduced there.** 2.22.0 repaired three Householder gates ON THE SHAPE and the roadmap carried that as unproven both ways. **All three were load-bearing, one ALSO introduced a regression, and the fourth reflector had never been repaired.** ⭐ The new assertions fail **12** times on 2.21.0, **7** on 2.22.0, **6** on 2.22.1 and **0** here — a discrimination ladder showing each release's repairs were real and each left something behind. ⛔ `cqr_decompose`'s `vhv` is a naive sum of squares and underflows below **2^-515** (vhv = 80c²; 80*2^-1028 > DBL_MIN > 80*2^-1030 predicts the measured e=514/515 boundary, and blocks with 468c² and 0.3125c² first fail at e=516 and e=511 as their coefficients dictate). ⛔ **The failure is invisible to both residual tests a caller would run**: R == A and Q == I, so |QR-A| and |Q^H Q - I| are EXACTLY 0 on the wrong answer — only upper-triangularity shows it. ⛔ **2.22.0's phase repair traded 1 row right for 38 wrong** (`cx_div(x1,|x1|)` on a subnormal x1 is not a unit complex number; ||phase|-1| reaches 0.414). ⚠ A Pythagorean-triple fixture cannot see it. ⛔ **The right reflector** is pinned in both orientations plus the vtv_r-subnormal band; 2.21.0 erased the entire spectral spread (2.384e-07) against 5.06e-17 now. ⚠ `prod(S) == |det A|` is ANALYTICALLY BLIND there. ⛔ **A gate that does not gate**: the CGA FNV contract cannot see magnitude — a one-token mutant makes all 1024 coefficients ±3 with the checksum bit-exact and all 4018 assertions passing; closed by `_CGA_NULL_COEF_BAD`, mutation-proven. Suites **4018 -> 4039**. |
 | 2.22.1 | 2026-09-11 | 26,116 | 36 | **The subnormal residue 2.22.0 filed — and why it needed BOTH halves.** Classified against a 200-digit oracle over 3 fixtures x 52 subnormal scales: CORRECT **23 -> 151**, LOUD **62 -> 0**, SILENT **71 -> 5**, zero regressions, zero LOUD -> SILENT. ⛔ **Half one**: the balance scale was chosen from `max|A|` alone, so a matrix spanning >1022 binades had its small block SUBNORMAL after the divide — and **a power-of-two divide is exact only while the quotient stays NORMAL**. Measured: 18 units / 8 rounds to 2, 2*8 = 16, **11% destroyed before `_lp_bidiagonalize` was called**. ⛔ **Half two, and half one alone is worse than nothing**: it converts **30 LOUD rows into SILENT wrong answers**. `vtv` is a naive sum of squares and underflows at the BOTTOM OF THE NORMAL RANGE, so the F64_TINY guard refuses to divide and the consequence is the same silent drop. ⭐ `H = I - 2vv'/v'v == I - 2uu'`, so normalising v makes `vtv` **1 by construction**; applied to all three reflectors. ⛔ **The filing's own conclusion was FALSE** — "no global scalar can work" against f64's 2045 binades vs the ~1076 needed — and a second draft's `sc > 1` guard did nothing for the inputs it was written for, turning a CORRECT row at 2^-1065 into NO_CONVERGENCE. Both corrections are inline in the archived issue. ⚠ **A process error caught by the user**: 2.22.0's residues were written into this file and called "filed" when `issues/` was empty — **a roadmap row is not a filing**. ⚠ Cost: svd_golub_kahan_12 +4.99%, eigen_qr_12 +3.56%, untouched control +0.40% median. Suites **4014 -> 4018**. |

@@ -2,6 +2,79 @@
 
 ## [Unreleased]
 
+## [2.24.0] - 2026-09-11 — the two CGA deferrals, and a cost the plan for them did not predict
+
+2.23.0 costed both remaining CGA items and left them as implementation. This is that implementation —
+and measuring it end to end found a trade the costing had not: **the build cut is not free at steady
+state.** Suites unchanged at **4039**; benchmarks **74 → 78**.
+
+⭐ **THE FIRST CGA CALL: 687 µs → 258 µs (−62.4%).** Three cuts, all to code that runs exactly once:
+memoise `_cga_geo_bits` (a pure function of two 5-bit masks, called ~16k times, each walking 5 bits with
+a popcount); memoise `_cga_bits_blade` (a **linear search** over 32 blades, called up to twice per pair);
+and replace four full 32-slot passes per pair — clear `mid`, clear `res`, scan `mid`, scan `res` — with
+occupancy lists, since **at most 16 slots of 32 are ever touched** and the measured maximum is 2.
+⭐ **The table is byte-identical**, and that was checkable only because 2.23.0 had already closed the
+FNV contract's magnitude blind spot: `0xF4A98C5706D5CF5B` and `_CGA_NULL_COEF_BAD == 0` both hold.
+
+⛔ **AND IT COSTS 1.87% ON THE STEADY-STATE PRODUCT, WHICH NOTHING IN THE PLAN ANTICIPATED.** The
+builder runs **once**; the steady path executes identical machine code either way. It is nonetheless
+real and reproducible: 1176 → 1198 ns, slower in 9 of 11 interleaved pairs over a 40,000-iteration loop
+with a 2.6% spread. **So the change saves 429 µs once and costs 22 ns per product — a net win below
+~19,500 products and a net loss above it.** That crossover is the number a consumer needs, and the
+costing that preceded this release did not have it because it measured build time in isolation.
+
+⚠ **Three explanations were ruled out by measurement before settling on code layout.** It is **not**
+heap displacement: a dummy allocation of exactly the 9,472 B the memo tables add reproduces **0.00%**,
+placed either before everything **or** between the table build and the loop — and the second placement
+is the one that matters, because the first shifts the table and the loop's allocations together and
+preserves their relative offset. It is **not** run order: reversing which binary runs first gives
++3.63% against +3.81%. What does reproduce a share of it is **unrelated code growth** — a never-called
+function inserted before the builder costs +0.91% on its own.
+⭐ Acting on that: extracting the two memo loops into their own functions **halves the penalty, from
++4.33% to +2.04%**, with the first-call saving unchanged. That is why they are helpers rather than
+inline, and the comment there says so — it is a measured choice, not tidiness.
+
+⛔ **THE LITERAL 1024-ENTRY TABLE IS STILL DECLINED, ON NUMBERS.** It is the only option that truly
+closes the regression (11.9 µs, against 2.20.0's 11 µs) and it passes every gate — but it costs +748
+lines, +1.45% bundle and +2.93% consumer `code_size`, and it gives up the *built by integer arithmetic,
+exact by construction* property the derivation gate rests on. At 258 µs paid once, that is not a trade
+worth making yet.
+
+⭐ **AND CGA HAS BENCHMARK ROWS AT ALL FOR THE FIRST TIME**, which is the actual fix for how a 2.7 ms
+first call hid for three releases: there was no row, so every CGA figure in that arc lived in a
+throwaway probe and none was ever checked again.
+- `cga_first_product_cold` — **n = 1**, because a benchmark that warms up *cannot see the build cost*,
+  which is the whole reason the 2.7 ms hid. `bench_run` clamps its pilot chunk to n, so one shot really
+  is one shot. Reads **203.9 µs**.
+- ⚠ **It carries an entry guard, and the guard is mutation-proven.** A cold row that is not cold reads
+  ~400× better and would look like a spectacular improvement rather than a broken measurement;
+  pre-warming the table in a copy makes the run print `FATAL: CGA table already built` and **exit 1**.
+- `cga_point_product` (1.20 µs), `cga_norm_sq_k5` (1.29 µs) and `cga_norm_sq_k32` (27.7 µs) — **both
+  sides of the k ≈ 8 crossover**, because `_cga_scalar_of_geo` is quadratic in occupancy and a single
+  row reports the opposite sign depending on which side it sits.
+- ⚠ An `alloc_used()` bound in a `.tcyr` was considered and **rejected**: it is deterministic, but
+  2.21.0's regression was CPU work rather than allocation, so it would not have caught the thing the
+  row exists for — and a wall-clock ceiling in a test is a flaky-test generator on a shared runner.
+
+⚠ **Registered LAST, and the control says it worked.** 2.20.0 measured that adding two rows moved an
+untouched module's row by −32% to −44% through heap displacement under a never-freeing allocator.
+Across 26 existing rows: **median +0.05%, mean +0.07%, 0 past 10%**, largest mover +0.83%.
+
+### Changed
+- **geo_advanced** — `_cga_build_null_tbl` memoises `_cga_geo_bits` and `_cga_bits_blade` and iterates
+  occupancy lists instead of four 32-slot passes per pair. ⚠ `mseen`/`rseen` are load-bearing, not
+  decoration: an accumulating slot can return to zero and be written again, so testing `== 0` to decide
+  whether to append would append it twice and **double-count it in the scan**. ⚠ `rt` is kept sorted on
+  insert because the packing loop depends on ascending bitmask order — nothing in the suite can
+  currently discriminate a wrong order, so the sorted insert is what makes that ordering a guarantee
+  rather than a coincidence, and at ≤ 2 terms it costs one comparison. ⚠ The `if`-guard /
+  no-`continue` block is kept verbatim: the nest is still three loops deep and still relies on the
+  cycc 6.6.2 workaround.
+
+### Added
+- **tests/hisab.bcyr** — four CGA rows (74 → 78), registered last, with a mutation-proven cold guard.
+
+
 ## [2.23.0] - 2026-09-11 — the sites no fixture reached, and a defect 2.22.0 introduced there
 
 2.22.0 repaired three Householder gates **on the shape**, because repairing one side of a pair is how

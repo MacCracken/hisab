@@ -11,10 +11,10 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v2.23.0
+## Current — v2.24.0
 
 Suite **4039** across five harnesses (hisab 536, foundation 413, modules 2073, edge_cases 233,
-abuse 784), constant gate **159/159**, **74** benchmarks, **35** `[lib]` modules, toolchain
+abuse 784), constant gate **159/159**, **78** benchmarks, **35** `[lib]` modules, toolchain
 **6.6.2**, sakshi **2.5.1**, ganita **1.2.4**, and **zero** deprecated-alias call sites. All gates green:
 `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps / 0 untrusted
 / 0 missing, `deps --verify` 31/31, `fuzz` 1/0, `coverage` 640/644 (99%) functions over 36/36 files,
@@ -757,72 +757,24 @@ them is not a defect at all.
       other**, green throughout. *Bracketing the thresholds is not reaching the floor.*
       [measured: 128-fixture + 1075-binade sweeps across 4 trees, 2026-09-11]
 
-- [ ] **[2.21.0, and 2.23.0 COSTED IT — this is now an implementation, not an investigation]**
-      ⭐ **Measured, verified, and ready to ship**: memoise `_cga_geo_bits` (32x32) and
-      `_cga_bits_blade` (32), and use occupancy lists for the mid clear, res clear, mid scan and res
-      packing scan. Isolated build-only timing, 40 repeats x 3 sessions: shipped 555,414 ns; geo_bits
-      memo alone -11%; bits_blade memo alone -28.5%; occupancy lists alone -35%; **all three
-      172,310 ns (-69%)**. End-to-end first call, paired binaries: **0.68 ms -> 0.27 ms (-59% to
-      -61%)**, moving break-even from ~392 products to **~155**. Cost: +48 module lines, +1,967 B
-      bundle (+0.18%), +1,424 B consumer code_size (+0.19%), `var_table` and `fixup_table` unchanged.
-      Table byte-identical (FNV `0xF4A98C5706D5CF5B` on the final tree and all 5 intermediates), all
-      suites green, every gate green.
-      ⚠ **Keep the `if`-guard / no-`continue` comment block verbatim** — the new nest is still three
-      loops deep and still relies on the cycc 6.6.2 workaround.
-      ⚠ **Keep a sorted insert for the `res` list** even though nothing can currently discriminate it:
-      it is the only thing making the packing order a guarantee rather than a coincidence, and at
-      <= 2 terms it costs one comparison.
-      ⛔ **The literal 1024-entry table is DECLINED on numbers, not taste**: 11.9 us first call (vs
-      2.20.0's 11 us, so it is the only option that truly closes the regression) but +748 lines,
-      +1.45% bundle and +2.93% consumer code_size, and it gives up the "built by integer arithmetic,
-      exact by construction" property the derivation gate rests on. Revisit only if the 0.27 ms
-      first call is measured to matter to a consumer.
-      [measured: 40 repeats x 3 sessions isolated + paired end-to-end, 2026-09-11]
-      ⛔ ORIGINAL ROW FOLLOWS.
-      **Cut the null-table build's
-      remaining four 32-slot passes per pair.** The build is lazy and one-time, and 2.21.0 took it from
-      **2.7 ms to 0.72 ms** by hoisting `_cga_expand_null`/`_cga_contract_orth` out of the pair loop
-      and iterating occupancy lists — but 2.20.0's first CGA call was **11 us**, so this is still a
-      **65x one-time regression**, and it pays for itself only past **~430 products** (~709 us extra
-      once, ~1.65 us saved per call after). What remains is four full 32-slot passes per pair —
-      clearing `mid` and `res`, then scanning each — i.e. 131k iterations for at most 16 occupied
-      slots. Tracking touched indices would cut most of it. ⚠ The `res` scan must stay in ascending
-      bitmask order (the packing depends on it), so only its CLEAR can use the list.
-      ⭐ **This is safe to do whenever**: the FNV contract `0xF4A98C5706D5CF5B` is asserted in the
-      suite, so any drift in the table fails the build. **The reason to defer was that 0.72 ms is
-      already small in absolute terms and a tag was pending — not that the change is hard.**
-      ⚠ Alternative worth pricing first: emit the 1024 entries as a literal table. That makes the
-      first call free, but costs ~1024 lines in the distlib bundle and gives up the "built by integer
-      arithmetic, exact by construction" property that is currently the design's argument.
-      [measured: first-call probe, 3 runs each tree, 2026-09-11]
+- [x] ✅ **DONE in 2.24.0 — and measuring it end to end found a cost the costing had missed.**
+      First CGA call **687 us -> 258 us (-62.4%)**, table byte-identical. ⛔ **But +1.87% on the
+      STEADY-STATE product**, which the isolated build-time measurement could not see: the change
+      saves 429 us once and costs 22 ns per product, so it is a **net win below ~19,500 products and
+      a net loss above**. ⚠ Not heap displacement (a same-size dummy reproduces 0.00% in either
+      placement) and not run order (+3.63% reversed); unrelated dead code reproduces +0.91%, and
+      extracting the memo loops into helpers halves the penalty (+4.33% -> +2.04%) — so they are
+      helpers as a measured choice. ⛔ The literal table stays declined on numbers.
+      [measured: 40,000-iteration steady loop, 9-11 interleaved pairs, 4 control variants, 2026-09-11]
 
-- [ ] **[2.21.0, and 2.23.0 DESIGNED IT — patch-ready, five rows, registered LAST]**
-      ⭐ `cga_first_product_cold` via `bench(name, fp, 1)` — **the harness DOES express a one-shot**,
-      because `bench_run` clamps its pilot chunk to n. ⚠ Do NOT put this number in a `.tcyr`
-      assertion instead: an `alloc_used()` bound is deterministic but would NOT have caught 2.21.0's
-      2.7 ms, which was CPU work rather than allocation, and a wall-clock ceiling in a test is a
-      flaky-test generator on a shared runner. The CSV row plus an entry guard is the right home.
-      ⭐ Plus `cga_point_product` (n=2000), `cga_norm_sq_k5` (n=2000), `cga_norm_sq_k32` (n=200) —
-      **both sides of the measured crossover at k~8, because one row alone reports the opposite sign
-      of the other** — and `cga_null_tbl_build` via `bench_batch(fp, 1, 20)` as the low-variance row
-      to optimise the item above against.
-      ⚠ **Keep the `_CGA_NULL_TBL` entry guard**: it is the only thing that can tell a cold row from a
-      warm one, a cold row that was not cold reads as a **400x improvement**, and the guard is proven
-      to fire. ⚠ The one-shot is the only row with no averaging and is **8x noisier than its four
-      neighbours on a loaded box** — that belongs in the row's own comment.
-      ⚠ Register LAST, after the `jac_rev` pair: 2.20.0 measured that adding two rows moved an
-      unrelated benchmark by **31%** through heap displacement under a never-freeing allocator.
-      Controls say nothing existing moves with these five.
-      [measured: patch built and run from a tree copy, with before/after controls, 2026-09-11]
-      ⛔ ORIGINAL ROW FOLLOWS.
-      **There is no CGA row among the 74 tracked benchmarks, and that is how a 2.7 ms
-      first call stayed invisible.** Every CGA figure in 2.21.0 — the 2.22x on `point*point`, the
-      10.93x regression at k = 32, the table-build cost — was measured with a throwaway probe, so
-      none of them is in `bench-history.csv` and none will be checked again by anything. ⚠ A CGA row
-      has to be designed around the lazy table: a benchmark that warms up **cannot see the build
-      cost**, which is exactly the hole this release fell into, so the build wants its own one-shot
-      row rather than an average. ⭐ At minimum: `point*point`, `cga_norm_sq` at k = 5 and k = 32
-      (the two sides of the crossover), and a cold first-call measurement.
+- [x] ✅ **DONE in 2.24.0 — CGA has benchmark rows at all for the first time (74 -> 78).**
+      `cga_first_product_cold` at n = 1 (203.9 us), `cga_point_product`, `cga_norm_sq_k5` and
+      `cga_norm_sq_k32` — both sides of the k ~ 8 crossover, because `_cga_scalar_of_geo` is quadratic
+      in occupancy and one row alone reports the opposite sign. ⭐ The cold row's entry guard is
+      **mutation-proven**: pre-warming the table makes the run print `FATAL` and exit 1, which matters
+      because a cold row that is not cold reads ~400x better and looks like a triumph. ⚠ Registered
+      LAST; control over 26 existing rows median +0.05%, 0 past 10%.
+      [measured: 3x3 interleaved bench runs with a before/after control, 2026-09-11]
 
 - [x] ✅ **KEPT, REPAIRED, AND WIRED TO PUSH — and the deciding fact is that the job has never run.**
       **[2.19.0]** **`scripts/check-measurements.sh`: keep it or delete it.** The gate runs PR-only on the claims
@@ -1193,6 +1145,7 @@ roadmap item** — and with ten live consumers, someone can now actually be aske
 
 | Version | Date | Lines | Files | Highlights |
 |---------|------|-------|-------|-----------|
+| 2.24.0 | 2026-09-11 | 26,345 | 36 | **The two CGA deferrals — and a cost their costing did not predict.** First CGA call **687 us -> 258 us (-62.4%)** via memoised `_cga_geo_bits`/`_cga_bits_blade` and occupancy lists replacing four 32-slot passes per pair; table BYTE-IDENTICAL, checkable only because 2.23.0 had closed the FNV contract's magnitude blind spot. ⛔ **But it costs +1.87% on the STEADY-STATE product, which nothing in the plan anticipated** — the builder runs ONCE and the steady path is identical machine code, yet 1176 -> 1198 ns, slower in 9 of 11 interleaved pairs. **Saves 429 us once, costs 22 ns per product: net win below ~19,500 products, net loss above.** ⚠ Ruled out by measurement: NOT heap displacement (a 9,472 B dummy reproduces 0.00%, placed either before everything or between the table build and the loop — the second placement being the one that matters) and NOT run order (+3.63% reversed vs +3.81%). Unrelated dead code reproduces +0.91%, which points at layout — and EXTRACTING the memo loops into helpers halves the penalty, +4.33% -> +2.04%, so they are helpers as a MEASURED choice. ⛔ The literal table stays declined on numbers (+748 lines, +1.45% bundle, +2.93% code_size, and it gives up exact-by-construction). ⭐ **CGA has benchmark rows at all for the first time** (74 -> 78), including a one-shot cold row with a **mutation-proven entry guard** — a cold row that is not cold reads ~400x better; pre-warming makes the run exit 1. ⚠ Registered LAST; control over 26 existing rows: median +0.05%, 0 past 10%. |
 | 2.23.0 | 2026-09-11 | 26,243 | 36 | **The sites no fixture reached — and a defect 2.22.0 introduced there.** 2.22.0 repaired three Householder gates ON THE SHAPE and the roadmap carried that as unproven both ways. **All three were load-bearing, one ALSO introduced a regression, and the fourth reflector had never been repaired.** ⭐ The new assertions fail **12** times on 2.21.0, **7** on 2.22.0, **6** on 2.22.1 and **0** here — a discrimination ladder showing each release's repairs were real and each left something behind. ⛔ `cqr_decompose`'s `vhv` is a naive sum of squares and underflows below **2^-515** (vhv = 80c²; 80*2^-1028 > DBL_MIN > 80*2^-1030 predicts the measured e=514/515 boundary, and blocks with 468c² and 0.3125c² first fail at e=516 and e=511 as their coefficients dictate). ⛔ **The failure is invisible to both residual tests a caller would run**: R == A and Q == I, so |QR-A| and |Q^H Q - I| are EXACTLY 0 on the wrong answer — only upper-triangularity shows it. ⛔ **2.22.0's phase repair traded 1 row right for 38 wrong** (`cx_div(x1,|x1|)` on a subnormal x1 is not a unit complex number; ||phase|-1| reaches 0.414). ⚠ A Pythagorean-triple fixture cannot see it. ⛔ **The right reflector** is pinned in both orientations plus the vtv_r-subnormal band; 2.21.0 erased the entire spectral spread (2.384e-07) against 5.06e-17 now. ⚠ `prod(S) == |det A|` is ANALYTICALLY BLIND there. ⛔ **A gate that does not gate**: the CGA FNV contract cannot see magnitude — a one-token mutant makes all 1024 coefficients ±3 with the checksum bit-exact and all 4018 assertions passing; closed by `_CGA_NULL_COEF_BAD`, mutation-proven. Suites **4018 -> 4039**. |
 | 2.22.1 | 2026-09-11 | 26,116 | 36 | **The subnormal residue 2.22.0 filed — and why it needed BOTH halves.** Classified against a 200-digit oracle over 3 fixtures x 52 subnormal scales: CORRECT **23 -> 151**, LOUD **62 -> 0**, SILENT **71 -> 5**, zero regressions, zero LOUD -> SILENT. ⛔ **Half one**: the balance scale was chosen from `max|A|` alone, so a matrix spanning >1022 binades had its small block SUBNORMAL after the divide — and **a power-of-two divide is exact only while the quotient stays NORMAL**. Measured: 18 units / 8 rounds to 2, 2*8 = 16, **11% destroyed before `_lp_bidiagonalize` was called**. ⛔ **Half two, and half one alone is worse than nothing**: it converts **30 LOUD rows into SILENT wrong answers**. `vtv` is a naive sum of squares and underflows at the BOTTOM OF THE NORMAL RANGE, so the F64_TINY guard refuses to divide and the consequence is the same silent drop. ⭐ `H = I - 2vv'/v'v == I - 2uu'`, so normalising v makes `vtv` **1 by construction**; applied to all three reflectors. ⛔ **The filing's own conclusion was FALSE** — "no global scalar can work" against f64's 2045 binades vs the ~1076 needed — and a second draft's `sc > 1` guard did nothing for the inputs it was written for, turning a CORRECT row at 2^-1065 into NO_CONVERGENCE. Both corrections are inline in the archived issue. ⚠ **A process error caught by the user**: 2.22.0's residues were written into this file and called "filed" when `issues/` was empty — **a roadmap row is not a filing**. ⚠ Cost: svd_golub_kahan_12 +4.99%, eigen_qr_12 +3.56%, untouched control +0.40% median. Suites **4014 -> 4018**. |
 | 2.22.0 | 2026-09-11 | 26,004 | 36 | **The Householder gate — a silent wrong answer at ordinary conditioning, in TWO public entry points, filed for three releases as "subnormal SVD".** `_lp_bidiagonalize` gated its reflectors on an ABSOLUTE 1e-12 applied to a LENGTH; when it fired the reflector was skipped and the extraction silently DROPPED the mass it declined to reflect. ⭐ **Boundary is a block ratio of 2^-40 — condition ~1e12, 982 binades above where the roadmap put it.** Oracle-free (prod(S) = |det A|): **25 of 60 normal-range ratios silently wrong -> 0**; smallest singular value **9.89x too large -> exact**. ⛔ `_lp_tridiagonalize` has the identical gate, so **eigen_qr returned the smallest eigenvalue with the WRONG SIGN** — and the values it returned are exactly the spectrum of tridiag((c,4c,c),(c,c)), the matrix you get by dropping W[3,1], so the mechanism is pinned by the values themselves. ⛔ **Second, separable defect**: `_lp_bidiag_qr`'s `p_lo` froze the active block at 2x2 — and **a 2x2 fixture cannot expose it**, which is why the 2.20.0 acceptance family missed it; the two repairs are perfectly complementary. ⛔ **Both entry points returned SUCCESS with NaN** for non-finite input. ⛔ **The roadmap's own proposed repair was at the WRONG PIPELINE STAGE**, and the 2.19.0 refutation that blocked this release for three versions is TRUE (84 loud rows -> silent). ⚠ Seventh release running the row was wrong about scope: 5 sites, 3 functions, 3 public entry points, none named by the row. ⚠ **Cost measured, not waved past**: svd_golub_kahan_12 +2.98%, eigen_qr_12 +0.75%, untouched control +0.29% median — and the first draft said "no detectable cost" before measuring, while the first measurement was itself invalid because a `cd` persisted and both trees were the same one. Suites **3991 -> 4014**. |

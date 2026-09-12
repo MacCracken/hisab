@@ -67,6 +67,12 @@ def scan(fns):
         if os.path.isdir(f):
             continue
         for i, l in enumerate(open(f, errors="replace"), 1):
+            # ⚠ Skip comments. Without this the gate reports every prose mention
+            # of a migrated function — 12 of the first 17 hits were comment lines,
+            # which on a 500-site migration is enough noise to make the gate get
+            # ignored, and a gate people learn to ignore is not a gate.
+            if l.lstrip().startswith("#"):
+                continue
             for m in call.finditer(l):
                 name = m.group(1)
                 # its own definition is not a call site

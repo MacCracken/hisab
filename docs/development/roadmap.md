@@ -968,6 +968,41 @@ v5.8.28) and `?` propagation (v5.8.29). Migrating is a library-wide signature
 change — breaking for consumers (impetus, kiran, joshua, …) — so it lands as
 a major, with a migration guide, not a 2.x patch.
 
+> ⛔ **CORRECTED 2026-09-11, AFTER 2.24.0 — THE BLOCKING CLAIM BELOW IS REFUTED, AND A WORSE HAZARD
+> IT DOES NOT MENTION IS REAL.** Both measured on cycc 6.6.2, the current pin.
+>
+> ⭐ **(1) "`?` on a plain i64 fn compiles clean and SIGSEGVs with no diagnostic" IS FALSE.** It fails
+> at COMPILE TIME, at the line, with the fix named. The `?` line warns *"`f` returns a `: stack` pair
+> on another path but a SINGLE value here — the tag is dropped … Did you mean `return Err(x);`?"* and
+> the call site is a hard **error**: *"a `: stack` enum returns two values — bind both:
+> `var tag, val = f();`"*. The build FAILS (compiler exit 1) and emits no binary. So there IS a safe
+> incremental path: migrate a function together with its callers, and a half-migrated BINDING cannot
+> ship.
+>
+> ⛔ **(2) BUT THE COMPILER CANNOT SEE THE DOMINANT IDIOM IN THIS REPO'S TESTS, AND THE FAILURE THERE
+> IS SILENT.** A Result passed in ARGUMENT position — `assert_eq(f(...), HSB_ERR_NONE, "...")` — does
+> not error. `rdx` never reaches a parameter, so the callee silently receives the **TAG**. Measured:
+> `Ok` tag = **0**, `Err` tag = **1**, and **`HSB_ERR_NONE` = 0**. So after migration
+> `assert_eq(f(), HSB_ERR_NONE)` becomes `assert_eq(0, 0)` and **keeps passing while testing nothing**,
+> while `assert_eq(f(), <any other code>)` becomes `assert_eq(1, -N)` and fails loudly.
+> ⚠ `lib/result.cyr`'s own header says the diagnostic "is the migration tool: every stale site fails at
+> its own line instead of miscompiling." That is true for BINDING sites and **false for argument
+> sites**, which is where this library's tests overwhelmingly live.
+>
+> **Measured surface (grep, not estimate): 48 functions across 12 modules, 169 `return HSB_ERR`
+> statements, 533 call sites — src 93, tests 438, examples 2.** Of the test lines: **98 compare against
+> `HSB_ERR_NONE` and would go VACUOUS SILENTLY**, 100 compare against another code and fail loudly, 233
+> span lines or carry no code and need individual review.
+> ⭐ **So the migration must be driven by a GREP, not by compiler errors** — the same conclusion 2.11.1
+> reached about its own defect class: *writing a lesson beside the code does not reach the other
+> thirty-four modules; only a grep does.*
+>
+> ⭐ **Feasibility is otherwise PROVEN, end to end**: adding `"result"` to `[deps] stdlib` works,
+> `dist/hisab.deps` grows 15 -> 16 leaves automatically, one function migrated to `Ok`/`Err` compiles,
+> and `cyrius check --with-deps dist/hisab.cyr` — the way a consumer builds — returns ok.
+> [measured: toolchain probes + vertical slice on src/calc.cyr, 2026-09-11]
+>
+> ⛔ **SUPERSEDED NOTE FOLLOWS, kept because its Result-shape description is still correct.**
 > ⛔ **RE-SCOPE BEFORE PLANNING: this section was written against a `Result` that no longer exists.**
 > It cites the v5.8.28 **boxed** form. `lib/result.cyr` at the current pin is the **v6.6.0 value
 > form**: `var r = f();` is a hard compile error, `payload()` is gone, and every call site becomes

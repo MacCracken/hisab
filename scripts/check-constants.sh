@@ -51,7 +51,7 @@ verbose = sys.argv[1] == "1"
 # that way. The original class here was [0-9A-Fa-f]{1,16}, which silently did
 # not match them -- so the gate skipped a quarter of the constants while
 # printing a confident "verified" count. Found by the 2.7.0 re-audit.
-DECL = re.compile(r'^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*#\s*(.*?)\s*$')
+DECL = re.compile(r'^\s*(?:public\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*#\s*(.*?)\s*$')
 # ⛔ 2.20.0 -- THE REGEX ABOVE REQUIRES THE COMMENT TO TRAIL, AND ONE DECLARATION
 # DOCUMENTED ITSELF ON THE LINE ABOVE INSTEAD. `src/calc_ext.cyr`'s F64_1E_NEG30
 # matched neither the verified nor the skipped path: it was INVISIBLE, so the gate
@@ -62,7 +62,7 @@ DECL = re.compile(r'^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{
 # why the fallback below exists rather than a one-line fix to that declaration.
 # ⚠ The fallback is deliberately narrow: it applies ONLY when the declaration has
 # no trailing comment AND the immediately preceding line is a comment.
-DECL_NC = re.compile(r'^\s*var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*$')
+DECL_NC = re.compile(r'^\s*(?:public\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*$')
 COMMENT_ONLY = re.compile(r'^\s*#\s*(.*?)\s*$')
 # Constants whose comment is prose, not a value.
 SKIP_RE = re.compile(r'\b(nan|inf|sentinel|mask|bits? pattern|magic|seed|hash)\b', re.I)
@@ -314,6 +314,24 @@ if errors:
         print()
     print("A constant that disagrees with its own comment is a defect: the comment states")
     print("the intent and the bit pattern is what ships. Re-encode from the exact value.")
+    sys.exit(1)
+
+# ⛔ POPULATION FLOOR (3.1.0). This gate has now been caught TWICE reporting a
+# confident N/N over a population that had silently shrunk: 2.20.0 found
+# 158/158 over 159 (a comment on the line above the declaration), and the 3.1.0
+# `public var` annotation dropped it to a GREEN 143/143 from 159 — the DECL
+# regex began with `^\s*var`, so every annotated constant simply stopped being
+# a constant as far as this gate knew. A gate whose population can shrink
+# without failing is a gate that can be emptied by a mechanical edit. The floor
+# is the population at the last audit; raise it when constants are added, never
+# lower it without saying why in the commit.
+POPULATION_FLOOR = 160   # 159 verified + 1 skipped, re-derived 2026-09-13
+population = total + len(skipped)
+if population < POPULATION_FLOOR:
+    print(f"\n!! POPULATION SHRANK: {population} declarations seen, floor is {POPULATION_FLOOR}.")
+    print("   A hand-encoded constant stopped matching DECL — the gate is blind to it, not")
+    print("   the constant correct. Check the declaration shape (e.g. a new prefix) before")
+    print("   touching the floor.")
     sys.exit(1)
 
 print("All hand-encoded f64 constants match their documented values.")

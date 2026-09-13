@@ -268,6 +268,18 @@ enum JacBench { _B_JAC_N = 8; _B_JAC_M = 256 }
 var _b_jac_ids = alloc(_B_JAC_N * 8);
 var _b_jac_roots = alloc(_B_JAC_M * 8);
 var _b_jac_out = alloc(_B_JAC_N * 8);
+# ⛔ 3.1.0: THE THREE REVERSE-MODE ROWS DISCARDED A `Result`. `ad_grad` and
+# `ad_grad_into` are fallible (AD_FULL on a tape that is too small — the
+# exact defect 2.20.0's pre-tag audit found in THESE rows), and every site
+# either dropped the return or bound it and never read the tag. A row that
+# swallows an Err measures the failed operation and reports success. Found
+# when `ad_grad_into` gained the `#must_use` it always should have had.
+# Each site now counts failures here; main() refuses to exit 0 while it is
+# non-zero, the same shape as the cold-row guard below. Mutation-proven: with
+# the shared tape shrunk back to the 2.20.0 size the row reads 333 us against
+# 1,114 us and the harness exits 1.
+# [measured: undersized-tape mutant on this harness, 2026-09-13]
+var _B_AD_FAIL = 0;
 
 fn bench_grad_fwd_16() {
     for (var w = 0; w < _AD_N; w = w + 1) { var g = _b_ad_body_fwd(w); }
@@ -282,6 +294,7 @@ fn bench_grad_rev_16() {
         acc = ad_add(_b_tape, acc, ad_mul(_b_tape, ad_sin(_b_tape, xi), ad_exp(_b_tape, xi)));
     }
     var rc_t, rc_v = ad_grad(_b_tape, acc);
+    if (rc_t != 0) { _B_AD_FAIL = _B_AD_FAIL + 1; }
     return 0;
 }
 
@@ -316,7 +329,8 @@ fn _b_jac_shared() {
         store64(roots + j * 8, ad_mul(t, acc, load64(ids)));
     }
     for (var j2 = 0; j2 < _B_JAC_M; j2 = j2 + 1) {
-        ad_grad_into(t, load64(roots + j2 * 8), ids, _B_JAC_N, _b_jac_out);
+        var gt, gv = ad_grad_into(t, load64(roots + j2 * 8), ids, _B_JAC_N, _b_jac_out);
+        if (gt != 0) { _B_AD_FAIL = _B_AD_FAIL + 1; }
     }
     return 0;
 }
@@ -334,7 +348,8 @@ fn _b_jac_pertape() {
         for (var k = 1; k < _B_JAC_N; k = k + 1) {
             acc = ad_add(t, acc, load64(ids + k * 8));
         }
-        ad_grad_into(t, ad_mul(t, acc, load64(ids)), ids, _B_JAC_N, _b_jac_out);
+        var pt, pv = ad_grad_into(t, ad_mul(t, acc, load64(ids)), ids, _B_JAC_N, _b_jac_out);
+        if (pt != 0) { _B_AD_FAIL = _B_AD_FAIL + 1; }
     }
     return 0;
 }
@@ -1381,6 +1396,10 @@ fn main() {
     # [measured: with/without these two rows on one binary, 2026-09-10]
     bench_batch("jac_rev_shared_256",  &bench_jac_rev_shared_256,   5, 5);
     bench_batch("jac_rev_pertape_256", &bench_jac_rev_pertape_256,  5, 5);
+    if (_B_AD_FAIL != 0) {
+        println("FATAL: a reverse-mode row returned Err -- the tape is too small and the row measured a failed sweep");
+        return 1;
+    }
 
     # ⚠ REGISTERED LAST, AFTER the jac_rev pair, for the reason documented above
     # it: rows added earlier shift the heap for everything after them under a bump

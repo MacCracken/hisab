@@ -27,25 +27,25 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.0.1
+## Current — v3.1.0
 
-Suite **4202** across five harnesses (hisab 550, foundation 413, modules 2086, edge_cases 239,
+Suite **4214** across five harnesses (hisab 550, foundation 413, modules 2098, edge_cases 239,
 abuse 914), constant gate **159/159**, **78** benchmarks, **35** `[lib]` modules, toolchain
 **6.6.3**, sakshi **2.5.2**, ganita **1.2.5**, and **zero** deprecated-alias call sites. All gates
 green: `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps /
 0 untrusted / 0 missing, `deps --verify` 31/31, `fuzz` 1/0, `coverage` 640/644 (99%) functions over
 36/36 files, distlib in sync.
 
-3.0.1 is the toolchain catch-up onto 6.6.3 — no library source change, the suites and the CLI compile
-**byte-identical** under 6.6.2 and 6.6.3 — and it closes, in this repo's own ledger, the two upstream
-defects hisab filed on 2026-09-11 (`issues/archived/2026-09-11-cyrius-*`). 3.0.0 is the `Result<T, E>`
+3.1.0 is the `pub fn` half of the public/private surface: 729 declarations annotated, byte-identical
+binaries, and `scripts/check-public-surface.sh` proving the surface complete and exact under a full
+`private` flip on every CI run. 3.0.1 was the toolchain catch-up onto 6.6.3. 3.0.0 is the `Result<T, E>`
 migration — 48 functions, 182 `Ok`/`Err` returns, 18 `?` sites, 533 call
 sites — and it is breaking. [`../guides/migration-3.0.md`](../guides/migration-3.0.md) is the
 consumer-facing guide; **2.24.0 is the supported 2.x line**, and there is no deprecation window.
 
 ## How to read this file
 
-⭐ **Every open item carries its target version in bold brackets** — `**[3.1.0]**` — or sits in a
+⭐ **Every open item carries its target version in bold brackets** — `**[3.2.0]**` — or sits in a
 section that is deliberately unversioned. *Optional, demand-gated* and *Parked / deferred* hold work
 with **no driver yet**; nothing moves out of them without a consumer asking, and when one does it
 gets a version here first.
@@ -64,54 +64,86 @@ including a row that says something is blocked.
 
 ## Open items
 
-### Public / private function surface — **[`pub fn` half: 3.1.0 · `private` flip: 4.0.0]** ⭐ UNBLOCKED (cycc 6.6.3, verified 2026-09-13)
+### The `private` flip — **[4.0.0]** (the `pub fn` half shipped in 3.1.0)
 
-hisab signals internal-vs-public by naming convention alone: a leading `_` means "internal" and
-nothing enforces it. `geo_diff.cyr` reaches `geo.cyr`'s helpers across a module boundary because
-nothing distinguishes API from implementation, and the 2.10.1 split had to be named
-`geo_ray_aabb_face` rather than `_core` specifically so a cross-module call would not be reaching
-for an underscore.
+hisab's API is now DECLARED rather than implied: as of 3.1.0 every non-underscore top-level
+fn / struct / enum / var in `src/` carries `public` (729 declarations — 660 fn, 22 struct, 39 var,
+8 enum), and no module is `private`, so the annotation is the documented no-op — the suites compile
+**byte-identical** with and without it. `scripts/check-public-surface.sh` flips all 35 modules
+`private` in a scratch copy on every CI run and proves the surface complete and exact (five claims,
+four mutants killed). What remains is the flip itself, and **everything below is measured, not
+estimated** — this row used to say "52 `_` functions across 235 sites" and counted neither globals
+nor the benchmark harness.
 
-⭐ **The mechanism works and the boundary HOLDS — verified end to end, not assumed.** On a copy of
-the tree, a consumer including `dist/hisab.cyr` can call the `public` API and **cannot** reach a
-file-private helper: the build fails with `'_noise_fade' is private to its file`, exits 1, and emits
-no binary. `distlib` passes `private` through verbatim and `dist/hisab.deps` is unaffected.
-⚠ **Landmine**: `cyrius check --with-deps dist/hisab.cyr` stays **green** on a bundle no consumer
-can call, because it compiles the bundle rather than calling into it. **A consumer-call gate has to
-exist before the flip**, not after.
+⛔ **THE BUNDLE COLLAPSES MODULE BOUNDARIES, WHICH SPLITS THE FLIP INTO TWO DIFFERENT PROBLEMS.**
+`dist/hisab.cyr` is ONE file and `private` is per-file, so inside the bundle every "cross-module"
+call is an in-file call: the 35 `private` lines a flipped bundle would carry face only a CONSUMER,
+and for a consumer the surface is already exactly the 729 public items (the gate's claims 2–3
+prove it in both directions). The per-file boundary exists only where modules are included as
+separate files — `tests/*.tcyr`, `tests/hisab.bcyr`, `examples/*.cyr`, and any consumer that
+includes `src/` directly. **So the consumer-facing half of the flip costs nothing further; the
+whole remaining cost is hisab's own suites.** (The gate's first draft checked the flipped bundle
+and stayed green with `_perm` unmarked — it was proving nothing. Claim 1 now includes each module
+as its own file.)
 
-⭐ **The blocker is gone, and it was checked in both directions rather than read off a changelog.**
-On cycc 6.6.2 `#derive(accessors)` above a `public struct` was a hard error — with NO `private`
-anywhere in the file, and a control differing by exactly one keyword compiled — so privatising hisab
-produced **1,436 errors of the form `'HVec3_x' is private to its file`** from the 18 modules that
-derive accessors, and 3.0.0 reverted the change rather than half-apply it. cycc **6.6.3** repairs
-the parse AND propagates `public` onto the generated accessors. Verified on the 3.0.1 bump with a
-two-file probe written in hisab's own idiom (`alloc(sizeof(P))` + derived setters): 6.6.2 rejects
-it; 6.6.3 builds it, the consumer reads `P_x`/`P_y` and calls `P_set_x` cross-file with correct
-values (exit 0), and a consumer calling the file-private helper is still refused with no binary.
-Record: [`issues/archived/2026-09-11-cyrius-derive-cannot-combine-with-public.md`](issues/archived/2026-09-11-cyrius-derive-cannot-combine-with-public.md).
-⚠ Unblocked is not done: every number below still applies, and so does the landmine above.
+⛔ **What the flip breaks today, measured by compiling the suites against a fully-`private` tree**:
+**64 distinct `_` names, 387 sites** — `tests/hisab.tcyr` 14 sites / 4 names, `tests/modules.tcyr`
+372 / 59, `tests/hisab.bcyr` 1 (`_CGA_NULL_TBL`, the 2.24.0 cold-row guard); `foundation`,
+`edge_cases`, `abuse` and the fuzz harness are already flip-clean. 56 are fns, 8 are globals
+(`_SP_MAX_TREE_DEPTH`, `_SP_F64_POS_INF`, `_SH_ENTRY_SIZE`, `_GA_EPA_POLISH_COUNT`,
+`_CGA_NULL_TBL`, `_CGA_NULL_COEF_BAD`, `_COL_F64_NEG_INF`, `_GEO_F64_THIRD`). Top by sites:
+`_f64arr_set` 125, `_f64arr_alloc` 27, `_col_dl_incircle` 24, `_f64arr_get` 15, `_col_ghost_ux`/`_uy`
+15 each, `_col_dl_ic_g1` 13, `_GA_EPA_POLISH_COUNT` 12. Three families: white-box layout probes
+(spatial's 17 `_kd_node_*`/`_qt_node_*`/`_ot_node_*`/`_sh_*` accessors, `_bvh_node_*`), the
+instrumentation counters mutation-proven guards depend on (`_CGA_NULL_TBL`, `_GA_EPA_POLISH_COUNT`,
+`_CGA_NULL_COEF_BAD` — these need a public read-only getter, e.g. `cga_null_table_built()`, or
+the guards die with the flip), and the `_f64arr_*` scratch helpers. Each needs a decision:
+rewrite the test against the public API, or promote as a documented inspector.
 
-**Sizing, measured rather than estimated** (a full cross-module reference scan, 2026-09-11): 939
-functions, 296 underscore-prefixed, **148 functions AND 25 globals** crossing a module boundary, of
-which **31 are underscore-named**. ⚠ The pre-3.0.0 version of this row counted 17 and did not count
-globals at all. The tests reach **52 distinct `_` functions across 235 sites**.
+⛔ **TWO UPSTREAM HOLES MEAN THE BOUNDARY IS NOT YET ENFORCEABLE, and both are filed with
+self-proving repros** (`cyrius/docs/development/issues/2026-09-13-hisab-*`):
+- **`&_private_fn` from another file compiles and RUNS** (exit 42 via `callptr` and `fncall1`) while
+  the direct call is refused — the visibility check covers calls and var reads, not address-of.
+  Until it is fixed, `private` documents intent and does not enforce it; flipping before the fix
+  ships a boundary a consumer crosses in one token.
+- **A `public enum` leaks `public` onto the next top-level declaration** (6.6.2 and 6.6.3). hisab
+  has two `_` items in that position — `_ad_pow` after `AdPowLimit` (allowlisted in the gate, which
+  FAILS the day upstream fixes it) and `_SYM_EPS` after `ExprTag` (masked by its own marker).
+  Six other declarations follow public enums and are API anyway.
 
-**Split the work, because the halves have different blast radii:**
-- **`pub fn` everywhere — non-breaking, verified a no-op, lands in a 3.x.** It does not need the
-  major and should not wait for it. ⭐ No longer blocked: the `#derive`/`public` fix shipped in
-  6.6.3 and the pin is there as of 3.0.1.
-- **The `private` flip — breaking, so 4.0.0.** Marking a function private breaks anyone already
-  calling it, which is why it was scoped onto 3.0.0 in the first place; 3.0.0 shipped without it, so
-  it moves to the next major rather than into a minor.
-- **The escape hatch is still a decision, not a marker.** Privacy is per FILE, so each of the six
-  `X` → `X_ext` pairs forces a choice: mark the helper `pub` (promoting an implementation detail to
-  public API), merge the pair into one file, or leave `X` public. Three options, six sites.
+⭐ **The 24 cross-module `_` items now carry `public` plus a marker comment, and their 4.0.0
+dispositions were worked by a 7-reviewer / 3-refuter pass on 2026-09-13 (53 findings, 0 refuted).
+The recommendations, each grounded in the callee body and the caller sites:**
 
-Safe order, now that it is unblocked: **`pub fn` everywhere first**, then the consumer-call gate,
-then flip `private` last.
+| item(s) | defined in → reached from | disposition |
+|---|---|---|
+| `_GEO_F64_POS_INF` | geo → geo_diff | **retire the reach**: it is a pure alias of the public `F64_POS_INF`; point geo_diff's 6 reads at that and drop the marker |
+| `_noise_fade` | calc → calc_ext | **retire the reach**: bit-for-bit identical to the public `ease_in_out_smooth`; replace 5 sites, delete the helper (perlin's bit-exact tests are the acceptance test) |
+| `_COL_F64_ZERO` / `_ONE` / `_NEG_ONE` | collision_core → collision_mesh | **retire the reach**: literals; use `0`, `F64_ONE`, a local `-1.0` at the 18 sites (same bit patterns, arithmetic unchanged) |
+| `_COL_SENTINEL` | collision_core → collision_mesh (+ tests) | **promote AND relocate**: it is the half-edge data contract (`twin` of a boundary edge, `vertex_edge` of an isolated vertex), never used by collision_core itself → `public var HALFEDGE_NONE` in collision_mesh |
+| `_epa_seed_gjk` / `_epa_seed_portal` / `_epa_refine` / `_epa_touch_probe` | geo_advanced → collision_core | **merge at section level**: move the MPR section (~30 code lines) next to `gjk_epa_3d`; NOT promote — `out4` and the 0/1/2 seed codes are pipeline internals |
+| `_perm_init` / `_perm` | calc → calc_ext, noise_simplex | **promote-rename** `noise_perm_init` / `noise_perm` (Perlin's reference 512-entry table; three algorithm families in three files share it, so neither merge nor leave-open resolves it) |
+| `_num_is_pow2` | num → num_ext | **promote-rename** `num_is_pow2`: the predicate for the precondition every FFT entry point documents |
+| `_num_mulmod` | num → num_ext | **promote-rename** `num_mulmod`, and DECIDE the precondition: its own doc says `num_modpow` is the only entry point and enforces `a >= 0`; `num_pollard_rho` and `num_crt` reach it directly and `num_crt` does not |
+| `_su2_alloc` / `_su2_x` / `_su2_y` / `_su2_z` | lie → lie_ext | **promote the OPERATION, not the accessors**: `su2_rotate_vec3(g, v)` with the existing sandwich arithmetic (byte-identical results); the raw allocator exists precisely because every public constructor normalises |
+| `_lie_norm3` | lie → lie_ext | **promote-rename** `lie_norm3` (scale-safe component norm; `hvec3_length` is not a drop-in — it takes an HVec3 and moves results by an ulp in the normal band) |
+| `_SYM_2_POW_63` / `_sym_int_exact_buf` / `_sym_render_f64` (+ `RenderLayout`) | symbolic → symbolic_ext | **extract one function**: `sym_const_to_str(val)` holding `expr_to_str`'s EXPR_CONST branch; `_latex_fmt_const` calls it, and the 2.20.0 "both renderers agree at every magnitude" property becomes true by construction |
+| `_SYM_EPS` / `_sym_is_zero` | symbolic → symbolic_ext | **promote as** `sym_const_eq(a, b)` with the 1e-15 absolute tolerance stated; `_SYM_EPS` stays private |
 
-### The struct-layout contract has no gate — **[3.1.0]**
+⚠ **Five non-underscore names the review judged implementation details, now committed as API by
+the naming convention** (decide before the flip — an underscore rename breaks nobody, 0 consumer
+references measured): `EPSILON_F32` (error.cyr — its own comment says unused; retire it),
+`F64_1E_NEG30` and `F64_NINE` (calc_ext), `F64_THREE`..`F64_FIFTEEN` (calc), `F64_SIX_DG`
+(diffgeo — a copy of `F64_SIX` whose suffix only dodges the collision), `RenderLayout` (symbolic —
+scratch-buffer sizes). And `public struct GeoJet` + derive exports raw slot accessors and nine
+setters the module header says are reachable ONLY through the typed accessors: amend the header or
+wrap.
+
+**Order, unchanged:** consumer-call gate (done: `check-public-surface.sh` claim 2) → the
+dispositions above → the two upstream holes fixed and re-verified by the gate's known-leak
+inversion → flip `private` last.
+
+### The struct-layout contract has no gate — **[3.2.0]**
 
 The contract is real and documented: construct via the documented constructor, read via the
 accessors, size arrays with `sizeof(T)`; never a hardcoded byte count, never a hand-computed offset.
@@ -125,10 +157,30 @@ enforced nothing, and it has been quoted as protection for five releases. **A ga
 is not a gate.**
 
 ⭐ The repair is mechanical: an exact `assert_eq(sizeof(T), <n>)` per public struct, plus the six
-that have nothing. Verify it fires before trusting it — install a one-field change and watch the
+that have nothing. ⚠ The 3.1.0 review added a site to the list: `hvec2_new` itself constructs
+`HVec2` with a hardcoded byte count and hand-computed offsets (`alloc(16)`, `store64(v + 8, y)`),
+the exact shape the contract forbids, in the module every consumer touches first. Verify it fires before trusting it — install a one-field change and watch the
 assertion fail.
 
-### The Boundary-with-Abaco table lags the surface it describes — **[3.1.0]**
+### Public API reached by no test — **[3.2.0]**
+
+The 3.1.0 surface scan (comments and string literals stripped) found **7 public functions
+referenced by nothing** in `src/`, `tests/`, `examples/` or `dist/` beyond their own declaration:
+`ad_neg`, `ad_cos`, `ad_ln` (the tape-mode twins of tested `dual_*` — `ad_ln`'s domain guard has
+never been asked), `csr_new` (the only CSR constructor that bypasses `csr_from_dense`'s
+`|v| > 1e-12` drop), `bch_3rd_order`, and `hodge_star_2form_4d` (whose sign table was rewritten in
+2.6.15 after three contradictory descriptions and is pinned by **no assertion**); `ad_grad_write`
+was on the list and is not (reached intra-module by `ad_grad_into`). The review added constants and
+tags read by nothing: the seven `GEO_JET_*` kind tags (no test reads `GeoJet_kind`), all six
+`EulerOrder` members (the only `hquat_from_euler` test passes a literal), `Mat3Layout`/`Mat4Layout`
+(two in-tree sites hand-size the arrays instead), `CGA_NUM_BLADES`, and `hisab_is_err` (0 callers
+in src, examples, or any of the ten consumers). ⚠ The 3.1.0 review also found the one BCH test that
+did exist was passing 24-byte `HVec3` values into `Mat3` readers (a 48-byte over-read that
+"passed" on the bump allocator's next bytes) — repaired in 3.1.0 with closed-form fixtures; the
+untested twins may hide the same shape. **"99% function coverage" counts a function reached by
+anything, including a test that reads garbage.**
+
+### The Boundary-with-Abaco table lags the surface it describes — **[3.2.0]**
 
 ⚠ **It is frozen at the 2.2.0 surface.** It has no row for `expr_eval` — whose **domain changed** in
 2.11.2 (`(-2)^3` returned NaN for hisab's entire history and returns a number now), and whose named
@@ -152,14 +204,14 @@ tag, and `Ok` tag = 0 = `HSB_ERR_NONE`. A consumer whose checks look like
 `scripts/check-result-migration.sh`, which exists for exactly that class and is mutation-proven.
 **Highest-value action in this section.**
 
-### `hvec3_lerp` / `hvec2_lerp` — unpark the SIMD hybrid — **[3.1.0]**
+### `hvec3_lerp` / `hvec2_lerp` — unpark the SIMD hybrid — **[3.2.0]**
 
 ⚠ **This was parked under "SIMD `cross`" and was never gated on the same thing.** `cross` needs lane
 shuffles; `lerp` does not. Measured on 6.6.2 with the existing n=2-pair + scalar-tail hybrid the
 other `hvec3_*` arithmetic already uses: **25 ns → 19–20 ns, bit-identical results, zero shuffles.**
 ⚠ Same over-read rule as every other `f64v_*` path here — the pair plus a scalar tail, never n=3.
 
-### Consolidate onto stdlib `vec_sort_by` / `vec_select_nth` — **[3.1.0]**
+### Consolidate onto stdlib `vec_sort_by` / `vec_select_nth` — **[3.2.0]**
 
 Consolidation for consistency, **not for speed** — 2.6.15 already fixed the complexity of the two
 hot sorts.
@@ -194,13 +246,16 @@ wrong line, which is worse than giving no citation at all.
 ## Toolchain, tracked upstream
 
 ⚠ **Cyrius bugs are filed in the CYRIUS repo** — `cyrius/docs/development/issues/` is where the
-language agent reads them. Only hisab's own items, and hisab's record of a live upstream workaround,
-belong in this repo's `issues/`. **Two hisab-filed toolchain items are open:**
+language agent reads them — **and closed in THIS repo too when a bump fixes them**, because the
+cyrius agent never edits hisab (both 2026-09-11 filings were fixed in 6.6.3 and closed here in
+3.0.1: `issues/archived/2026-09-11-cyrius-*`). **Four hisab-filed toolchain items are open:**
 
-| filing (upstream) | what it costs hisab today |
+| filing (upstream, `2026-09-13-hisab-…`) | what it costs hisab today |
 |---|---|
-| `2026-09-11-derive-cannot-combine-with-public.md` | **Blocks the public/private item above outright.** `#derive(accessors)` + `public struct` is a hard error; 1,436 privacy errors from the 18 deriving modules if applied anyway. |
-| `2026-09-11-nested-continue-binds-to-wrong-loop.md` | When a loop and a loop nested inside it both contain a `continue` and the outer appears lexically FIRST, both bind one level too far out: the inner jumps to the OUTER latch, and the outer `continue` becomes a **no-op**. The natural sparse-skip idiom is both broken shapes at once and produced an **all-zero 1024-entry CGA table while reporting success**, every helper correct in isolation. ⚠ **`src/geo_advanced.cyr` is written around this** — moving a `continue` below a nested loop is what makes the same program correct. Do not "tidy" those loops until this closes. |
+| `private-fn-reachable-via-address-of.md` | **The 4.0.0 boundary is bypassable**: `&_helper` from another file compiles and runs. The public-surface gate uses calls, never `&name`, for exactly this reason. |
+| `public-enum-leaks-onto-next-declaration.md` | `_ad_pow` and `_SYM_EPS` are public regardless of their markers; `_ad_pow` is allowlisted in the gate and the gate FAILS when upstream fixes it (remove the entry then). |
+| `refresh-only-overwrites-released-snapshot.md` | `~/.cyrius/versions/<pin>/lib` is not evidence of what a pin ships; the vendoring check compares against the cyrius TAG. |
+| `deps-relocks-silently-under-unchanged-pin.md` | A bare `cyrius build` can re-vendor and re-lock a stdlib file with no diagnostic; treat any `git status` change to `lib/` or `cyrius.lock` after a build as a defect to investigate. |
 
 **`bench_run` auto-batching (6.5.19)** — already in force; it is what moved 44 benchmark rows when
 the instrument changed. The **39 `bench_batch()` call sites are deliberately unchanged**: they now

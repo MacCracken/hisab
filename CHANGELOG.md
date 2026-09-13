@@ -2,6 +2,131 @@
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-09-13 — the `pub fn` half: 729 declarations, a gate whose first draft proved nothing, and two more upstream holes
+
+**Non-breaking.** Every non-underscore top-level fn / struct / enum / var in `src/` now carries
+`public` — **729 declarations: 660 fn, 22 struct, 39 var, 8 enum** — plus the **24** underscore-named
+helpers another module reaches, each with a marker comment naming its consumers. No module is
+`private`, so the annotation is the documented no-op: `foundation` and `edge_cases` compile
+**byte-identical** to the 3.0.1 build, bundle `code_size` **768,312 B** both sides. Suites **4214**
+(modules 2086 → 2098). cycc 6.6.3 (the `#derive` + `public` fix 3.0.0 was blocked on).
+
+⭐ **THE SURFACE IS NOW PROVEN, NOT DECLARED.** `scripts/check-public-surface.sh` flips all 35 modules
+`private` in a scratch copy on every CI run and establishes five claims, fail-closed: (0) naming
+completeness, (1) per-file internal completeness, (2) a generated consumer that CALLS every public fn
+(arity read from the declaration), every derived accessor, every public var and enum member — **890
+probes, all reachable**; (3) exactness — every non-public item refused (**456 of 457**, see below);
+(4) `examples/*.cyr` clean under the flip. **Four mutants killed**: `_perm` unmarked → claim 1 (42
+sites); `hvec3_new` unmarked → claims 0, 1 (54) and 4 (20); a `_` helper placed after a `public enum`
+→ claim 3 (unexpected leak); a spacer before `_ad_pow` → claim 3 (stale allowlist).
+
+⛔ **THE GATE'S FIRST DRAFT WAS VACUOUS, AND A SURVIVING MUTANT SAID SO.** Claim 1 checked the flipped
+**bundle** — and `dist/hisab.cyr` is ONE file, `private` is per-file, so every "cross-module" call
+inside it is an in-file call that can never be refused. Dropping `public` from `_perm` left it green.
+Claim 1 now includes each module as its own file, the way the suites do. ⭐ **That vacuity is also a
+finding about the flip itself**: a flipped bundle's 35 `private` lines face only a consumer, for whom
+the surface is already exactly the 729 items — **the consumer-facing half of 4.0.0 costs nothing
+further; the entire remaining cost is hisab's own suites.** Measured: **64 distinct `_` names, 387
+sites** — `hisab.tcyr` 14/4, `modules.tcyr` 372/59, `hisab.bcyr` 1 — where the roadmap row had said
+"52 functions, 235 sites" and counted neither globals (8) nor the benchmark harness.
+
+⛔ **TWO UPSTREAM HOLES, BOTH FILED WITH SELF-PROVING REPROS** (`cyrius/docs/development/issues/2026-09-13-hisab-*`):
+1. **`&_private_fn` from another file compiles and RUNS** — exit **42** through `callptr` and
+   `fncall1` — while the direct call is refused. The check covers calls and var reads, not
+   address-of. Found because the gate's obvious design ("take `&name` of every public fn") had a
+   negative control that would not fail; the probes are calls for that reason.
+2. **A `public enum` leaks `public` onto the next top-level declaration** (6.6.2 and 6.6.3; fn or
+   var; one-line or multi-line; a non-public enum, `public var`/`fn`/`struct` do not). Found because
+   exactness read **456 of 457**: the one accepted was `_ad_pow`, the declaration after
+   `public enum AdPowLimit`. `_SYM_EPS` after `ExprTag` is the second hisab item in that position,
+   masked by its own marker. `_ad_pow` is a **known leak** in the gate keyed to the filing, and the
+   gate **fails the day upstream fixes it** (mutation-proven with a spacer declaration).
+
+⛔ **TWO GATES WENT BLIND TO THE ANNOTATION AND ONE OF THEM HAD NEVER RUN.**
+`check-constants.sh` matched `^var` and so reported a **green 143/143** over a population of 160 —
+17 constants silently dropped out of the gate the moment they became `public var`, the third
+recorded instance of this gate reporting a confident N/N over a shrunk population. It accepts the
+prefix now and carries a **population floor** (160) that fails on any shrink, verified to fire on the
+regressed regex. `check-result-migration.sh` failed in BOTH directions on `public fn` — 202 false
+positives AND 29 of 48 migrated functions missed — and **it had never been wired into CI** since
+3.0.0 shipped it mutation-proven; both regexes widened, reads 48 / 0 on the 3.0.1 tree and on this
+one, and it runs in CI now with its `--selftest`.
+
+⛔ **THE REVIEW FOUND DEFECTS THE ANNOTATION MERELY UNCOVERED.** A 7-reviewer / 3-refuter pass
+over the real diff (53 findings, 0 refuted, 3 dissenting votes in 159):
+- `#must_use` in `vec2`/`vec3`/`vec4` had sat on the private `_hvecN_len_scaled` helper **since
+  2.17.0** inserted it between the directive and `hvecN_length`; the public function carried none.
+  Moved. `ad_grad_into` is fallible (`?` plus a tail-returned `Result`) and had none. Added — which
+  surfaced that **the three reverse-mode benchmark rows discarded `ad_grad`/`ad_grad_into`'s
+  `Result`**, the exact rows whose silent tape overflow was 2.20.0's pre-tag finding. They now count
+  failures and the harness exits 1: with the tape shrunk back to the 2.20.0 size the row reads
+  **333 µs against 1,114 µs** and reports FATAL.
+- **`tests/modules.tcyr` passed 24-byte `HVec3` values into `bch_so3_2nd_order`/`_3rd_order`, which
+  read 72-byte `Mat3` operands** — a 48-byte over-read per operand that "passed" on the bump
+  allocator's next bytes, then asserted `HVec3_x` of a matrix. Rewritten with `hat(u)` operands and
+  closed forms: commuting → exactly `hat(1.5 e_x)`, bit-exact; non-commuting `a = 1/2, b = 1` →
+  `Z2 = hat(a, b, ab/2)` exact and `Z3 = hat(11/24, 47/48, 1/4)` to `ULP_TOL_M`. **Two mutants die
+  on exactly the assertions that encode the mutated coefficient** (commutator ×1: `z = 1/4` fails;
+  1/12 → 1/6: the 11/24 and 47/48 rows fail). The comment calling it "the vector one" was false.
+- Doc defects on the newly public surface: five module headers (`num`, `num_ext`, `ode`, `optimize`,
+  `linalg_precision`) still stated the pre-3.0.0 integer error-code contract; `ode_symplectic_euler`'s
+  doc block was a design monologue with four contradictory return conventions (the code has always
+  returned a 16-byte `[q, p]` block); `einsum`'s header said 8 labels a–h against a 26-label
+  constant since 2.6.12; `collision_mesh.cyr` had no file header at all since the 2.2.2 split;
+  `_lie_norm3`'s doc block opened with `su2_from_quat`'s orphaned line.
+
+⭐ **The 4.0.0 decision list is now worked, not owed.** The roadmap row carries a per-item
+disposition for all 24 cross-module helpers, each grounded in the callee body and caller sites, and
+several are not among the three options the row had offered: three families should simply **retire
+the reach** (`_GEO_F64_POS_INF` is an alias of the public `F64_POS_INF`; `_noise_fade` is
+bit-for-bit `ease_in_out_smooth`; `_COL_F64_ZERO/_ONE/_NEG_ONE` are literals), `_COL_SENTINEL`
+should be **promoted and relocated** (it is the half-edge data contract, never used by
+collision_core), the `_epa_*` quartet wants a section-level **merge**, the SU(2) accessors want the
+**operation** promoted (`su2_rotate_vec3`) rather than the raw allocator that exists precisely because
+every constructor normalises, and symbolic's five reaches collapse to **two extracted functions**.
+Five non-underscore names the review judged implementation details (`EPSILON_F32` — its own comment
+says unused; `F64_1E_NEG30`, `F64_NINE`, `F64_THREE..F64_FIFTEEN`, `F64_SIX_DG`, `RenderLayout`) are
+listed for an underscore rename before the flip. And **11 public items are reached by no test**,
+including `ad_neg`/`ad_cos`/`ad_ln`, `csr_new`, `bch_3rd_order`, `hodge_star_2form_4d` and all seven
+`GEO_JET_*` tags — a 3.2.0 row.
+
+⚠ **Instruments that were wrong first, this release**: a zsh `for m in $MODS` that never split the
+list (both "0 violations" numbers it produced were meaningless — re-run under bash); a nested `EOF`
+that ended a heredoc early; `PIPESTATUS` in zsh; a repro verdict grep that matched the routine
+"deps locked" line; a struct-literal probe that SIGSEGV'd on the control too (a value passed where an
+accessor wants a pointer — not a compiler bug, and not filed); and a `LOOSE_TOL_M` I called "not
+1e-8" in a comment when it is exactly that — corrected before it shipped.
+
+### Added
+- `public` on 729 top-level declarations across all 35 `[lib]` modules; marker comments on the 24
+  cross-module `_` helpers naming their consumers and the 4.0.0 decision owed.
+- **scripts/check-public-surface.sh** — the five-claim flip gate above; CI step *Public surface is
+  complete and exact*. Its header records why the probes are calls and why claim 1 is per-file.
+- CI step *Result migration has no vacuous call sites* — `check-result-migration.sh` +
+  `--selftest`, never wired since 3.0.0.
+- `tests/modules.tcyr` — BCH on so(3) fixture with `hat`/`vee` helpers, skew-symmetry check, and
+  closed-form expectations (+12 assertions); the over-reading fixture it replaces is described in
+  place.
+- `tests/hisab.bcyr` — `_B_AD_FAIL` counter and a FATAL exit for the three reverse-mode rows.
+
+### Changed
+- `scripts/check-constants.sh` — accepts `public var`; **population floor** 160.
+- `scripts/check-result-migration.sh` — both declaration regexes accept `public fn`.
+- `#must_use` moved onto `hvec2_length` / `hvec3_length` / `hvec4_length`; added to `ad_grad_into`.
+- Module headers of `num`, `num_ext`, `ode`, `optimize`, `linalg_precision` state the `Result` contract;
+  `ode_dopri45`'s doc says why it carries no `#must_use`; `ode_symplectic_euler`, `einsum`,
+  `collision_mesh` (new file header), `lie.cyr` doc blocks corrected as above.
+- Roadmap: the public/private row is now *The `private` flip — [4.0.0]* with the measurements and
+  dispositions; the other rows that had been targeted at 3.1.0 (struct-layout gate, Abaco table,
+  `lerp` SIMD hybrid, `vec_sort_by`) move to **3.2.0**; new row *Public API reached by no test*; the
+  *Toolchain, tracked upstream* table — which still listed the two 2026-09-11 filings as open after
+  3.0.1 closed them — now lists the six open 2026-09-13 filings and what each costs.
+
+### Performance
+No change, by construction: the library binaries are byte-identical. One bench run as a
+same-binary control against the two 3.0.1 runs: median **−0.51%**, 0 of 78 rows past 10%.
+
+
 ## [3.0.1] - 2026-09-13 — cycc 6.6.3: both 2026-09-11 filings closed, and the pin's snapshot was not the pin
 
 Toolchain **6.6.2 → 6.6.3**, sakshi **2.5.1 → 2.5.2**, ganita **1.2.4 → 1.2.5**. No library source

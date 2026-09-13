@@ -42,7 +42,7 @@ def migrated_fns(extra_src=None):
         cur = None
         body = {}
         for l in open(f, errors="replace"):
-            m = re.match(r'^fn ([A-Za-z_][A-Za-z_0-9]*)\(', l)
+            m = re.match(r'^(?:public )?fn ([A-Za-z_][A-Za-z_0-9]*)\(', l)
             if m:
                 cur = m.group(1)
                 body[cur] = []
@@ -82,7 +82,7 @@ def scan(fns):
             for m in call.finditer(masked):
                 name = m.group(1)
                 # its own definition is not a call site
-                if re.match(r'^fn ' + re.escape(name) + r'\(', l):
+                if re.match(r'^(?:public )?fn ' + re.escape(name) + r'\(', l):
                     continue
                 before = masked[:m.start()].rstrip()
                 # Accept: `var t, v = f(` / `... = f(` with a two-name bind, or `f(...)?`

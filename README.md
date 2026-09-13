@@ -146,15 +146,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.0.1 |
-| Library | 35 modules, ~26,378 lines of Cyrius |
-| Tests | 4202 assertions across 5 suites |
+| Version | 3.1.0 |
+| Library | 35 modules, ~26,400 lines of Cyrius |
+| Tests | 4214 assertions across 5 suites |
 | Benchmarks | 78 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~251 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.6.3 |
 | Dependencies | 1 (sakshi 2.5.2); no third-party, no FFI/libc |
-| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 248 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **0 open filings** in [docs/development/issues/](docs/development/issues/) (31 archived); 2 hisab-filed toolchain defects are open upstream in [cyrius](https://github.com/MacCracken/cyrius), not here — the two filed 2026-09-11 were fixed in cycc 6.6.3 and closed here in 3.0.1, and 3.0.1 filed two more (a released snapshot dir is mutable; `cyrius build` silently re-locks a stdlib file under an unchanged pin). Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
+| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 249 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared, not implied** (3.1.0): every non-underscore top-level declaration carries `public`, and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name`, because a private fn is reachable through address-of on cycc 6.6.2/6.6.3 (filed). **0 open filings** in [docs/development/issues/](docs/development/issues/) (31 archived); **4** hisab-filed toolchain defects are open upstream in [cyrius](https://github.com/MacCracken/cyrius), not here — two from 3.0.1 (a released snapshot dir is mutable; `cyrius build` silently re-locks a stdlib file under an unchanged pin) and two from 3.1.0 (the address-of hole; `public enum` leaks `public` onto the next declaration). Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
 
 ## License
 

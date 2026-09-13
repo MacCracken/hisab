@@ -4,7 +4,7 @@ Tracked dependency version constraints and upgrade paths.
 
 ## Cyrius Toolchain
 
-**Status:** Pinned to **6.6.2** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
+**Status:** Pinned to **6.6.3** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
 
 **Note:** Cyrius stdlib provides dense LU, Cholesky, QR, SVD, eigendecomposition. As of 6.2.x these live in the new **`ganita`** umbrella module (which re-exports the former `matrix`/`linalg` API in full and also hosts the transcendentals). This is a critical dependency — hisab's `linalg_ext.cyr` wraps these functions. The `[deps] stdlib` list pulls `ganita` (not `matrix`/`linalg` — listing those alongside `ganita` collides).
 
@@ -20,7 +20,53 @@ Tracked dependency version constraints and upgrade paths.
 - 6.0.2: lockfile/vendoring fix — `cyrius deps` now hashes all `.cyr` under `lib/` and writes a real lock (the empty 0-byte `cyrius.lock` bug present since 5.11.8); vendored deps are regular file-copies, not the dangling symlinks that broke CI.
 - **6.0.14**: clean build/test (901/901 as of v2.4.6). Migration was manifest-only (pin bump + sakshi resolution); the 34 math modules moved `lib/`→`src/` so the committed `lib/` no longer shadows the toolchain's version-pinned stdlib snapshot.
 - **6.2.11** (v2.6.6): stdlib math reorg. The transcendentals (`f64_acos`/`f64_asin`/`f64_atan2`/`f64_pow`/`f64_sinh`/`f64_cosh`/`f64_tanh` + hyperbolic inverses) moved out of `math` into the new **`ganita`** module, which also subsumes `matrix`/`linalg` (re-exports their full API). `math` now ships NaN-correct `f64_le`/`f64_ge` (hisab dropped its local copies). `[deps] stdlib`: `+ganita`, `−matrix`, `−linalg`. Clean build, 957/957 tests, all gates green. Tracked-issue re-verify: **3 of 5 fixed** (modules-substring, 18-arg-fn scramble, lint rc-as-count → all archived); for-empty-clauses still open. Vendored `lib/` re-resolved via `cyrius deps` (30 files — **not** the full-snapshot `cyrius lib sync`, which over-vendors unused platform variants and breaks `deps --verify` on a spurious `process_agnos.cyr` entry); `cyrius.lock` 30 deps, verify 30/30.
-- **6.6.2** (current pin, v2.11.5): **repairs the wrong-code bug hisab filed on the 6.6.1 bump.**
+- **6.6.3** (current pin, v3.0.1): **closes both defects hisab filed on 2026-09-11, and finds two
+  new ones in the toolchain's own release plumbing.** Stdlib delta is two header lines — ganita
+  **1.2.4 → 1.2.5**, sakshi **2.5.1 → 2.5.2**, each a pin-only refold — so the suites and the CLI
+  compile **byte-identical** under 6.6.2 and 6.6.3 (`foundation` 442,040 B, `edge_cases` 586,464 B,
+  `build/hisab` 257,176 B, `cmp` clean). Suite output byte-identical too, 4202/4202. Lock is now
+  written in **sorted order** (a 6.6.3 fix); 48 lines of textual churn, 3 entries order-insensitively.
+
+  ⭐ **Nested `continue` is FIXED**, verified as a pair from dirs pinned to each version: hisab's
+  filed reproducer exits **1 → 0**, the upstream gate reads **2/8 → 8/8**, and `_cga_build_null_tbl`
+  rewritten into its natural `continue` form (inner `continue` firing 1024 times) gives a wrong table
+  on 6.6.2 (FNV mismatch, 1024/1024 bad coefficients) and the exact contract table on 6.6.3. The
+  `if`-guard form is **kept** — consumers compile the bundle under their own pins and the `continue`
+  form fails silently below 6.6.3 — but its comment no longer claims to be load-bearing.
+  Record: `issues/archived/2026-09-11-cyrius-nested-continue-binds-to-wrong-loop.md`.
+
+  ⭐ **`#derive` + `public` is FIXED**, verified on hisab's own idiom in both directions: 6.6.2
+  rejects it; 6.6.3 builds it, derived getters AND setter reachable cross-file (exit 0), and a
+  consumer calling the file-private helper is still refused with no binary. The roadmap's
+  public/private row is unblocked; the work stays scheduled (3.1.0 / 4.0.0).
+  Record: `issues/archived/2026-09-11-cyrius-derive-cannot-combine-with-public.md`.
+
+  ⛔ **THE INSTALLED "6.6.2" SNAPSHOT WAS NOT 6.6.2.** `~/.cyrius/versions/6.6.2/lib` held 6.6.3's
+  twelve refolded stdlibs, byte-identical to `versions/6.6.3/lib` (ganita.cyr mtime 2026-09-12
+  08:49, two days after 6.6.2 shipped), because cyrius's dev loop (`install.sh --refresh-only`)
+  writes the repo's in-progress `lib/` into `versions/$(cat VERSION)/lib` and VERSION still named the
+  released 6.6.2. The cyrius **tag** 6.6.2 ships ganita 1.2.4 — hisab's committed `lib/` and docs
+  were right. **And a bare `cyrius build` under the unchanged 6.6.2 pin silently rewrote
+  `lib/ganita.cyr` to 1.2.5 and re-locked it**, printing exactly what a no-op prints; only
+  `git status` noticed. Both halves filed upstream with a self-proving repro
+  (`cyrius/docs/development/issues/2026-09-13-hisab-refresh-only-overwrites-released-snapshot.md`,
+  `…/2026-09-13-hisab-deps-relocks-silently-under-unchanged-pin.md`). **The vendoring check now
+  compares every `lib/` file against `git show <pin>:lib/<file>` in the cyrius repo — the tag, never
+  the install dir**: 30/30 match 6.6.3's tag, sakshi matches its 2.5.2 tag, `deps --verify` 31/31.
+
+  ⚠ **Not exposed, checked rather than assumed**: the headline `#inline`-disarms-`#derive` fix —
+  hisab has **zero** `#inline` directives (the one match is inside a comment), which is why the bundle
+  compiled on 6.6.2 despite mat4 preceding eight deriving modules in `[lib]` order. `CYRIUS_DCE` is
+  used nowhere in hisab's scripts or CI. The expanded-source (24 MiB) and token (4,194,304) caps are
+  unchanged in source between the tags (`lex.cyr` untouched; `lex_pp.cyr`'s 53 inserted lines are the
+  `public ` prefix probe), bundle 1,103,166 B = **4.38%** of the byte cap.
+
+  ⚠ **No performance change is claimed, and for once that is a fact rather than a measurement**: the
+  binaries are byte-identical, so the four bench runs (2 × 6.6.2, 2 × 6.6.3, quiet box, load
+  0.3–0.7) are a same-binary control — median **+0.68%**, 0 of 78 rows past 10%, no row past 2× its
+  own spread.
+
+- **6.6.2** (v2.11.5): **repairs the wrong-code bug hisab filed on the 6.6.1 bump.**
   Stdlib delta is `result.cyr`, `tagged.cyr` and the NEW `lib/boxed.cyr` (pulled transitively by
   `tagged`; lock 30 -> 31). ganita stays 1.2.4, sakshi stays 2.5.1. All 31 vendored files
   byte-match the **6.6.2 snapshot itself**.

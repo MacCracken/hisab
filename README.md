@@ -52,7 +52,7 @@ removes. **2.24.0 is the supported 2.x line.**
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "6.6.2"
+cyrius      = "6.6.3"
 
 [deps]
 # `ganita` (Cyrius 6.2.x) provides the transcendentals (acos/asin/atan2/pow/
@@ -65,7 +65,7 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "r
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "3.0.0"
+tag     = "3.0.1"
 modules = ["dist/hisab.cyr"]   # ~1.1 MB self-contained bundle (all 35 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
 # pulls in hisab's own 16 stdlib leaves, so the `stdlib` list above only has to
@@ -146,15 +146,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.0.0 |
+| Version | 3.0.1 |
 | Library | 35 modules, ~26,378 lines of Cyrius |
 | Tests | 4202 assertions across 5 suites |
 | Benchmarks | 78 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~251 KB static ELF (`build/hisab` — version smoke test only) |
-| Toolchain | Cyrius 6.6.2 |
-| Dependencies | 1 (sakshi 2.5.1); no third-party, no FFI/libc |
-| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 248 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **0 open filings** in [docs/development/issues/](docs/development/issues/) (29 archived); 2 hisab-filed toolchain defects are open upstream in [cyrius](https://github.com/MacCracken/cyrius), not here. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
+| Toolchain | Cyrius 6.6.3 |
+| Dependencies | 1 (sakshi 2.5.2); no third-party, no FFI/libc |
+| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 248 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **0 open filings** in [docs/development/issues/](docs/development/issues/) (31 archived); 2 hisab-filed toolchain defects are open upstream in [cyrius](https://github.com/MacCracken/cyrius), not here — the two filed 2026-09-11 were fixed in cycc 6.6.3 and closed here in 3.0.1, and 3.0.1 filed two more (a released snapshot dir is mutable; `cyrius build` silently re-locks a stdlib file under an unchanged pin). Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
 
 ## License
 

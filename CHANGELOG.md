@@ -2,7 +2,99 @@
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-09-13 — cycc 6.6.3: both 2026-09-11 filings closed, and the pin's snapshot was not the pin
+
+Toolchain **6.6.2 → 6.6.3**, sakshi **2.5.1 → 2.5.2**, ganita **1.2.4 → 1.2.5**. No library source
+behaviour change: the suites and the CLI compile **byte-identical** under both compilers (`cmp` clean
+on `foundation` 442,040 B, `edge_cases` 586,464 B, `build/hisab` 257,176 B), suite output is
+byte-identical, **4202/4202**, every gate green, lock 31/31 and now written in sorted order.
+
+⭐ **6.6.3 repairs both defects hisab filed on 2026-09-11, and each is closed HERE, not just upstream**
+— the cyrius agent never edits this repo, so a filing it fixed stays "blocked" in hisab's roadmap and
+"do not tidy" in hisab's source until hisab closes it. Both closures are recorded as
+`docs/development/issues/archived/2026-09-11-cyrius-*.md` with the paired measurement, and both were
+verified as a **pair from directories pinned to each version**, not read off the changelog:
+
+| filing | 6.6.2 | 6.6.3 |
+|---|---|---|
+| nested `continue` binds one level out — hisab's reproducer | exit **1** | exit **0** |
+| same — upstream gate `nested_continue_binds.tcyr` | **2 / 8** | 8 / 8 |
+| same — `_cga_build_null_tbl` in its natural `continue` form, inner `continue` firing **1024×** | FNV mismatch, **1024 / 1024** coefficients flagged | contract table exact, 2088 / 2088 |
+| `#derive` + `public` — hisab's idiom (`alloc(sizeof(P))` + derived setters), consumer reads getters and calls a setter cross-file | **compile error** | builds, exit **0** |
+| same — consumer calling the file-private helper | (masked by the error) | refused, `'_hidden' is private to its file`, no binary |
+
+⚠ **The first run of the `continue` pair read 8/8 on BOTH toolchains.** `~/.cyrius/versions/6.6.2/bin/cyrius`
+re-execs to the **cwd's manifest pin** (its documented contract; inside the cyrius repo it uses
+`./build/cycc`), so run from the cyrius checkout it compiled with 6.6.3. From a scratch dir pinned
+6.6.2 it read 2/8. **Check the probe before believing the probe** — `cyrius build -v` prints the
+resolved compiler and that line is the measurement.
+
+⛔ **THE INSTALLED "6.6.2" SNAPSHOT WAS NOT 6.6.2, AND A BARE `cyrius build` SILENTLY MOVED A
+VENDORED DEP ACROSS THE PIN.** hisab's docs said ganita 1.2.4 under 6.6.2; the committed
+`lib/ganita.cyr` agreed; the cyrius **tag** 6.6.2 agrees. But `~/.cyrius/versions/6.6.2/lib` held
+6.6.3's twelve refolded stdlibs, byte-identical to `versions/6.6.3/lib` (`ganita.cyr` mtime
+2026-09-12 08:49, two days after 6.6.2 shipped) — cyrius's dev loop, `install.sh --refresh-only`,
+writes the repo's in-progress `lib/` into `versions/$(cat VERSION)/lib`, and VERSION still named the
+released 6.6.2 during 6.6.3 development. The baseline build for this release, run under the
+UNCHANGED 6.6.2 pin, then rewrote `lib/ganita.cyr` 1.2.4 → 1.2.5 and re-locked its hash
+`d4aaa7da…` → `fae5a807…` while printing exactly what a no-op prints; `git status` was the only
+thing that noticed. ⭐ **Both halves are filed upstream with a self-proving repro** —
+`cyrius/docs/development/issues/2026-09-13-hisab-refresh-only-overwrites-released-snapshot.md` and
+`…/2026-09-13-hisab-deps-relocks-silently-under-unchanged-pin.md` (repro script: one comment line
+changed in a throwaway pinned snapshot → `cyrius build` re-vendors it, re-locks it, and
+`deps --verify` reports the mutation **verified**; exit 1 on 6.6.2 and 6.6.3). ⚠ **The vendoring
+check this repo has relied on since 2.6.11 — "byte-compare `lib/` against the pin's own snapshot" —
+was comparing against a mutable directory.** It now compares against `git show <pin>:lib/<file>` in
+the cyrius repo: 30/30 stdlib files match the 6.6.3 tag, `sakshi.cyr` matches its 2.5.2 tag.
+
+⚠ **Two candidate filings were checked and NOT filed, because both were my probe.** A struct
+**value** passed to a derived accessor that takes a pointer SIGSEGVs (`P_x(&p)` = 3, `P_x(p)` = 139,
+on the control too) — the language is untyped there and hisab's own idiom never does it; and the
+wrapper's pin re-exec is its contract, not a defect. A wrong filing costs the agent the same
+investigation twice.
+
 ### Changed
+- **cyrius.cyml** — `cyrius = "6.6.3"`; `[deps.sakshi] tag = "2.5.2"`.
+- **lib/** — `ganita.cyr` 1.2.4 → 1.2.5, `sakshi.cyr` 2.5.1 → 2.5.2: each diff is **one header
+  line**, which is why the compiled output is byte-identical. All 30 stdlib files byte-match the
+  cyrius 6.6.3 **tag**; sakshi byte-matches its 2.5.2 tag.
+- **cyrius.lock** — 31 entries, now in sorted order (6.6.3's `_deps_lock_dir` fix); 3 entries moved
+  order-insensitively (sakshi commit + hash, ganita hash). `deps --verify` 31/31.
+- **src/geo_advanced.cyr** — `_cga_build_null_tbl`'s `if`-guard comment no longer claims the
+  workaround is mandatory. The guard form is **kept**, for a stated reason: consumers compile
+  `dist/hisab.cyr` under their **own** pins, none had crossed 6.6.2, and the `continue` form is
+  correct only from 6.6.3 and fails **silently** below it. Same disposition as `m4_mul_vec4` in 2.11.5.
+- **docs/development/roadmap.md** — *Public / private function surface* row: ⛔ BLOCKED UPSTREAM →
+  ⭐ UNBLOCKED (cycc 6.6.3, verified 2026-09-13); target versions unchanged (`pub fn` 3.1.0,
+  `private` flip 4.0.0), and the row's own landmine (a consumer-call gate must exist before the flip)
+  still applies. Consumer row now names the reason the pin matters to a consumer.
+- **docs/development/issues/archived/** — two new hisab-side records for the closed upstream
+  filings (`2026-09-11-cyrius-nested-continue-binds-to-wrong-loop.md`,
+  `2026-09-11-cyrius-derive-cannot-combine-with-public.md`).
+- **docs/development/dependency-watch.md** — 6.6.3 block.
+- `bench-history.csv` / `benchmarks.md` — four rows per benchmark (2 × 6.6.2, 2 × 6.6.3) on the
+  3.0.0 tree, which had no baseline of its own (the last rows were from mid-migration `a6362ce`).
+
+### Not exposed — checked rather than assumed
+- 6.6.3's headline `#inline`-disarms-`#derive` fix: hisab has **zero** `#inline` directives (the one
+  grep hit is inside a comment), which is why the bundle compiled on 6.6.2 despite `mat4.cyr`
+  preceding eight deriving modules in `[lib]` order.
+- `CYRIUS_DCE` PT_LOAD fix: hisab's scripts and CI never set it.
+- `cyrius distlib` OOM fix: hisab's 35-module bundle always completed; regenerated bundle differs
+  from 3.0.0's by the version header only.
+- The expanded-source (24 MiB, `op > 25165824`) and token (`tc >= 4194304`) caps are **unchanged in
+  source** between the tags — `lex.cyr` untouched, `lex_pp.cyr`'s 53 inserted lines are the `public `
+  prefix probe. Bundle 1,103,166 B = **4.38%** of the byte cap (CLAUDE.md said ~4.2%, cyrius.cyml
+  ~4.1%; both corrected).
+
+### Performance
+**No change is claimed, and for once it is a fact rather than a measurement**: the binaries are
+byte-identical, so the four bench runs on a quiet box (load 0.3–0.7) are a same-binary control —
+median **+0.68%**, mean +0.84%, **0 of 78** rows past 10%, no row past 2× its own run-to-run spread.
+The largest movers (`spatial_hash_query_2k` −8.0%, `bvh_query_ray_200x4k` −6.3%) sit inside their own
+6.6.2-side spread (7.7%, 15.1%); `ease_in_out` +8.3% is 6 → 6.5 ns quantisation.
+
+### Changed — documentation sweep, 2026-09-11 (shipped in this release)
 - **Documentation sweep, 2026-09-11 — no behaviour change; all 4202 assertions pass on both sides.**
 - `docs/development/roadmap.md` is **future-facing only**, **1308 → 297 lines**. Removed: 38
   completed `[x]` items, 19 struck-through release-train rows, the 70-row **Release History** table,
@@ -28,7 +120,7 @@
   inside one table cell and is now **730 bytes** of durable posture. The 3.0.0 breaking notice moved
   out of it into its own section above **Modules**.
 
-### Fixed
+### Fixed — documentation sweep, 2026-09-11
 - ⛔ **README's Quick Start still showed the PRE-3.0.0 calling idiom** — `calc_integral_simpson(...)`
   and `num_newton(...)` with their returns discarded. That is now a `#must_use` warning, and the same
   shape in *argument* position is the silent-tag trap this release exists to remove, so the README

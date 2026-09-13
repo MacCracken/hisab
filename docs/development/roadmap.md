@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.6.2**. Stdlib `ganita` (6.2.x math umbrella) provides dense
+> Written in Cyrius. Toolchain: **6.6.3**. Stdlib `ganita` (6.2.x math umbrella) provides dense
 > decompositions + transcendentals.
 
 ⭐ **This file is future-facing only.** Nothing below has shipped. The record of what *has* is:
@@ -27,16 +27,19 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.0.0
+## Current — v3.0.1
 
 Suite **4202** across five harnesses (hisab 550, foundation 413, modules 2086, edge_cases 239,
 abuse 914), constant gate **159/159**, **78** benchmarks, **35** `[lib]` modules, toolchain
-**6.6.2**, sakshi **2.5.1**, ganita **1.2.4**, and **zero** deprecated-alias call sites. All gates
+**6.6.3**, sakshi **2.5.2**, ganita **1.2.5**, and **zero** deprecated-alias call sites. All gates
 green: `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps /
 0 untrusted / 0 missing, `deps --verify` 31/31, `fuzz` 1/0, `coverage` 640/644 (99%) functions over
 36/36 files, distlib in sync.
 
-3.0.0 is the `Result<T, E>` migration — 48 functions, 182 `Ok`/`Err` returns, 18 `?` sites, 533 call
+3.0.1 is the toolchain catch-up onto 6.6.3 — no library source change, the suites and the CLI compile
+**byte-identical** under 6.6.2 and 6.6.3 — and it closes, in this repo's own ledger, the two upstream
+defects hisab filed on 2026-09-11 (`issues/archived/2026-09-11-cyrius-*`). 3.0.0 is the `Result<T, E>`
+migration — 48 functions, 182 `Ok`/`Err` returns, 18 `?` sites, 533 call
 sites — and it is breaking. [`../guides/migration-3.0.md`](../guides/migration-3.0.md) is the
 consumer-facing guide; **2.24.0 is the supported 2.x line**, and there is no deprecation window.
 
@@ -61,7 +64,7 @@ including a row that says something is blocked.
 
 ## Open items
 
-### Public / private function surface — **[`pub fn` half: 3.1.0 · `private` flip: 4.0.0]** ⛔ BLOCKED UPSTREAM
+### Public / private function surface — **[`pub fn` half: 3.1.0 · `private` flip: 4.0.0]** ⭐ UNBLOCKED (cycc 6.6.3, verified 2026-09-13)
 
 hisab signals internal-vs-public by naming convention alone: a leading `_` means "internal" and
 nothing enforces it. `geo_diff.cyr` reaches `geo.cyr`'s helpers across a module boundary because
@@ -77,15 +80,17 @@ no binary. `distlib` passes `private` through verbatim and `dist/hisab.deps` is 
 can call, because it compiles the bundle rather than calling into it. **A consumer-call gate has to
 exist before the flip**, not after.
 
-⛔ **It cannot ship because `#derive(...)` and `public` cannot be combined on cycc 6.6.2.**
-`#derive(accessors)` above a `public struct` is a hard error — with NO `private` anywhere in the
-file, and a control differing by exactly one keyword compiles. Without `public` on the struct its
-generated accessors stay file-private, and privatising hisab produced **1,436 errors of the form
-`'HVec3_x' is private to its file`** from the 18 modules that derive accessors — which are the
-foundation types every other module touches. Filed upstream as
-`2026-09-11-derive-cannot-combine-with-public.md`, cross-referenced to the existing
-`#inline`-disarms-`#derive` filing, which produces the identical diagnostic and may share a root
-cause. **The change is reverted rather than half-applied.**
+⭐ **The blocker is gone, and it was checked in both directions rather than read off a changelog.**
+On cycc 6.6.2 `#derive(accessors)` above a `public struct` was a hard error — with NO `private`
+anywhere in the file, and a control differing by exactly one keyword compiled — so privatising hisab
+produced **1,436 errors of the form `'HVec3_x' is private to its file`** from the 18 modules that
+derive accessors, and 3.0.0 reverted the change rather than half-apply it. cycc **6.6.3** repairs
+the parse AND propagates `public` onto the generated accessors. Verified on the 3.0.1 bump with a
+two-file probe written in hisab's own idiom (`alloc(sizeof(P))` + derived setters): 6.6.2 rejects
+it; 6.6.3 builds it, the consumer reads `P_x`/`P_y` and calls `P_set_x` cross-file with correct
+values (exit 0), and a consumer calling the file-private helper is still refused with no binary.
+Record: [`issues/archived/2026-09-11-cyrius-derive-cannot-combine-with-public.md`](issues/archived/2026-09-11-cyrius-derive-cannot-combine-with-public.md).
+⚠ Unblocked is not done: every number below still applies, and so does the landmine above.
 
 **Sizing, measured rather than estimated** (a full cross-module reference scan, 2026-09-11): 939
 functions, 296 underscore-prefixed, **148 functions AND 25 globals** crossing a module boundary, of
@@ -94,7 +99,8 @@ globals at all. The tests reach **52 distinct `_` functions across 235 sites**.
 
 **Split the work, because the halves have different blast radii:**
 - **`pub fn` everywhere — non-breaking, verified a no-op, lands in a 3.x.** It does not need the
-  major and should not wait for it. ⛔ Still blocked on the upstream `#derive`/`public` fix.
+  major and should not wait for it. ⭐ No longer blocked: the `#derive`/`public` fix shipped in
+  6.6.3 and the pin is there as of 3.0.1.
 - **The `private` flip — breaking, so 4.0.0.** Marking a function private breaks anyone already
   calling it, which is why it was scoped onto 3.0.0 in the first place; 3.0.0 shipped without it, so
   it moves to the next major rather than into a minor.
@@ -102,8 +108,8 @@ globals at all. The tests reach **52 distinct `_` functions across 235 sites**.
   `X` → `X_ext` pairs forces a choice: mark the helper `pub` (promoting an implementation detail to
   public API), merge the pair into one file, or leave `X` public. Three options, six sites.
 
-Safe order, once unblocked: **`pub fn` everywhere first**, then the consumer-call gate, then flip
-`private` last.
+Safe order, now that it is unblocked: **`pub fn` everywhere first**, then the consumer-call gate,
+then flip `private` last.
 
 ### The struct-layout contract has no gate — **[3.1.0]**
 
@@ -130,11 +136,13 @@ consumer is abaco — and none for autodiff (forward duals + the reverse tape), 
 jets, CGA, or Lie. **A boundary table that lags the surface is how a consumer learns the boundary
 from a compile error instead.** The table itself is at the foot of this file.
 
-### Get one live consumer onto 3.0.0 — **[unversioned — external]**
+### Get one live consumer onto 3.0.x — **[unversioned — external]**
 
 ⚠ **No live consumer has built 2.11.3 or later.** All ten sit at 2.11.1/2.11.2, behind the
-6.5.33 → 6.6.2 toolchain bump, the 536-site ganita alias migration, **and now the `Result<T, E>`
-break**. `cyrius check --with-deps dist/hisab.cyr` proves the bundle compiles against **this**
+6.5.33 → 6.6.3 toolchain bump, the 536-site ganita alias migration, **and now the `Result<T, E>`
+break**. ⚠ 3.0.1 adds a reason the pin matters to THEM: `_cga_build_null_tbl` keeps its
+`if`-guard form precisely because a consumer compiles `dist/hisab.cyr` under its OWN cycc, and
+the natural `continue` form is silently wrong below 6.6.3. `cyrius check --with-deps dist/hisab.cyr` proves the bundle compiles against **this**
 manifest's ganita — not against theirs, and not against a real call graph.
 
 ⛔ **The `Result` break makes this urgent rather than merely overdue**, because of the failure mode
@@ -289,7 +297,7 @@ whether it actually bites.
 
 Hisab should never depend on abaco. Abaco may optionally depend on hisab.
 ✅ **Verified 2026-09-09**: 0 hits for `abaco` in `cyrius.cyml`, `cyrius.lock`, `dist/hisab.deps`,
-`dist/hisab.cyr` and `src/`. The only git dep is sakshi 2.5.1, and `deps --verify` already fails any
+`dist/hisab.cyr` and `src/`. The only git dep is sakshi (2.5.2 as of 3.0.1), and `deps --verify` already fails any
 unreviewed dep — **no new gate is owed here.** ⚠ The apparent contradiction between
 `eval("sin(pi/4)")` being abaco's while hisab exposes `expr_eval` is not one: `src/symbolic.cyr:324`
 takes a **tree**, not a string. hisab has no tokenizer at all.

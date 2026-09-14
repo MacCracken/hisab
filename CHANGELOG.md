@@ -168,6 +168,14 @@ objdump check: **0 unwritten destination slots** in the shipped tree.
   dispositioned "retire" in the 4.0.0 surface table, so no test pins it).
 - **dist/hisab.cyr** — regenerated; **README.md**, **docs/guides/testing.md**, **CLAUDE.md** counts
   re-summed from the integrated run.
+- **docs/development/roadmap.md — forward-facing again, 309 → 277 lines.** Removed at closeout: the
+  3.0.0/3.0.1/3.1.0 narrative under *Current*, the `pub fn`-half story and the closed upstream-holes
+  paragraph inside the `private`-flip row, the four-row table of 2026-09-13 filings closed in 3.1.1,
+  and the "lerp shipped" aside under *SIMD cross*. Kept: every open item with the measurement that
+  scoped it. ⛔ **And a false premise corrected in two files**: the roadmap and CLAUDE.md both said
+  "no live consumer has built 2.11.3 or later" — read from each consumer's `cyrius.cyml`, svara,
+  naad and goonj pin **2.22.1** (past the 6.6.x bump and the ganita migration); the other seven pin
+  2.11.2; none has crossed the `Result` break, which is the claim that still matters.
 
 ### Fixed
 - **linalg_ext** — `csr_from_dense`'s header still said "drops entries with |value| < EPSILON_F64"

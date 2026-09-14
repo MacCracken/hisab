@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.6.3**. Stdlib `ganita` (6.2.x math umbrella) provides dense
+> Written in Cyrius. Toolchain: **6.6.4**. Stdlib `ganita` (6.2.x math umbrella) provides dense
 > decompositions + transcendentals.
 
 ⭐ **This file is future-facing only.** Nothing below has shipped. The record of what *has* is:
@@ -27,25 +27,18 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.1.0
+## Current — v3.2.0
 
-Suite **4214** across five harnesses (hisab 550, foundation 413, modules 2098, edge_cases 239,
-abuse 914), constant gate **159/159**, **78** benchmarks, **35** `[lib]` modules, toolchain
-**6.6.3**, sakshi **2.5.2**, ganita **1.2.5**, and **zero** deprecated-alias call sites. All gates
-green: `lint` 0 warnings and `fmt <file> --check` 0 drift across all 44 sources, `vet` 2 deps /
-0 untrusted / 0 missing, `deps --verify` 31/31, `fuzz` 1/0, `coverage` 640/644 (99%) functions over
-36/36 files, distlib in sync.
-
-3.1.0 is the `pub fn` half of the public/private surface: 729 declarations annotated, byte-identical
-binaries, and `scripts/check-public-surface.sh` proving the surface complete and exact under a full
-`private` flip on every CI run. 3.0.1 was the toolchain catch-up onto 6.6.3. 3.0.0 is the `Result<T, E>`
-migration — 48 functions, 182 `Ok`/`Err` returns, 18 `?` sites, 533 call
-sites — and it is breaking. [`../guides/migration-3.0.md`](../guides/migration-3.0.md) is the
-consumer-facing guide; **2.24.0 is the supported 2.x line**, and there is no deprecation window.
+Suite **4429** across five harnesses (hisab 585, foundation 429, modules 2251, edge_cases 260,
+abuse 904), constant gate **159/159**, **80** benchmarks, **35** `[lib]` modules, toolchain
+**6.6.4**, sakshi **2.5.2**, ganita **1.2.5**. All gates green; per-release detail is in
+[`CHANGELOG.md`](../../CHANGELOG.md). **2.24.0 is the supported 2.x line** — 3.0.0's `Result<T, E>`
+migration is breaking, has no deprecation window, and
+[`../guides/migration-3.0.md`](../guides/migration-3.0.md) is the consumer-facing guide.
 
 ## How to read this file
 
-⭐ **Every open item carries its target version in bold brackets** — `**[3.2.0]**` — or sits in a
+⭐ **Every open item carries its target version in bold brackets** — `**[4.0.0]**` — or sits in a
 section that is deliberately unversioned. *Optional, demand-gated* and *Parked / deferred* hold work
 with **no driver yet**; nothing moves out of them without a consumer asking, and when one does it
 gets a version here first.
@@ -55,36 +48,31 @@ because a row without one is how this file repeatedly got the size of a class wr
 consecutive releases where a row named one or two sites and a tree-wide grep found five, six, or
 fifty-one. **Grep for the shape before sizing anything below.**
 
-⛔ **An open row is not a verified one.** The 2026-09-09 sweep handed every open item to a verifier
-told to *prove it already done*: 21 came back genuinely open, **15 rested on a premise that had
-become false**, and 3 were finished. Check the tree before believing a row in either direction —
-including a row that says something is blocked.
+⛔ **An open row is not a verified one.** When the open items were last handed to a verifier told to
+*prove each already done* (2026-09-09), 15 of 39 rested on a premise that had since become false.
+Check the tree before believing a row in either direction — including a row that says something is
+blocked.
 
 ---
 
 ## Open items
 
-### The `private` flip — **[4.0.0]** (the `pub fn` half shipped in 3.1.0)
+### The `private` flip — **[4.0.0]**
 
-hisab's API is now DECLARED rather than implied: as of 3.1.0 every non-underscore top-level
-fn / struct / enum / var in `src/` carries `public` (729 declarations — 660 fn, 22 struct, 39 var,
-8 enum), and no module is `private`, so the annotation is the documented no-op — the suites compile
-**byte-identical** with and without it. `scripts/check-public-surface.sh` flips all 35 modules
-`private` in a scratch copy on every CI run and proves the surface complete and exact (five claims,
-four mutants killed). What remains is the flip itself, and **everything below is measured, not
-estimated** — this row used to say "52 `_` functions across 235 sites" and counted neither globals
-nor the benchmark harness.
+The `pub fn` half shipped in 3.1.0 (729 `public` declarations, `scripts/check-public-surface.sh`
+proving the surface complete and exact under a full `private` flip on every CI run). What remains
+is the flip itself, and **everything below is measured, not estimated**.
 
 ⛔ **THE BUNDLE COLLAPSES MODULE BOUNDARIES, WHICH SPLITS THE FLIP INTO TWO DIFFERENT PROBLEMS.**
 `dist/hisab.cyr` is ONE file and `private` is per-file, so inside the bundle every "cross-module"
-call is an in-file call: the 35 `private` lines a flipped bundle would carry face only a CONSUMER,
-and for a consumer the surface is already exactly the 729 public items (the gate's claims 2–3
-prove it in both directions). The per-file boundary exists only where modules are included as
-separate files — `tests/*.tcyr`, `tests/hisab.bcyr`, `examples/*.cyr`, and any consumer that
-includes `src/` directly. **So the consumer-facing half of the flip costs nothing further; the
-whole remaining cost is hisab's own suites.** (The gate's first draft checked the flipped bundle
-and stayed green with `_perm` unmarked — it was proving nothing. Claim 1 now includes each module
-as its own file.)
+call is an in-file call: a flipped bundle faces only a CONSUMER, and for a consumer the surface is
+already exactly the 729 public items (the gate's claims 2–3 prove it in both directions). The
+per-file boundary exists only where modules are included as separate files — `tests/*.tcyr`,
+`tests/hisab.bcyr`, `examples/*.cyr`, and any consumer that includes `src/` directly. **So the
+consumer-facing half of the flip costs nothing further; the whole remaining cost is hisab's own
+suites.** ⚠ Consumers compile the bundle under their OWN pins, and the boundary is enforced by cycc
+only from **6.6.4** (below it `&_private_fn` and a `public enum`'s neighbour leak) — one more
+reason this is a 4.0.0 item.
 
 ⛔ **What the flip breaks today, measured by compiling the suites against a fully-`private` tree**:
 **64 distinct `_` names, 387 sites** — `tests/hisab.tcyr` 14 sites / 4 names, `tests/modules.tcyr`
@@ -100,17 +88,9 @@ instrumentation counters mutation-proven guards depend on (`_CGA_NULL_TBL`, `_GA
 the guards die with the flip), and the `_f64arr_*` scratch helpers. Each needs a decision:
 rewrite the test against the public API, or promote as a documented inspector.
 
-⭐ **The two upstream holes that made the boundary unenforceable are FIXED in cyrius 6.6.4**
-(hisab pinned it in 3.1.1): `&_private_fn` from another file is refused like the direct call, and a
-`public enum` no longer leaks `public` onto the next declaration — the gate's `_ad_pow` allowlist
-inverted on the pin bump exactly as designed and is now empty. ⚠ Consumers compile `dist/hisab.cyr`
-under their OWN pins; the flip is only enforced for a consumer at ≥ 6.6.4, which is one more reason
-it is a 4.0.0 item.
-
-⭐ **The 25 cross-module `_` items now carry `public` plus a marker comment** (24 at 3.1.0; 3.2.0's
-sort consolidation added `_lext_sort_desc`), **and their 4.0.0 dispositions were worked by a
-7-reviewer / 3-refuter pass on 2026-09-13 (53 findings, 0 refuted), plus one row for the newcomer.
-The recommendations, each grounded in the callee body and the caller sites:**
+⭐ **The 25 cross-module `_` items carry `public` plus a marker comment, and each has a 4.0.0
+disposition** (worked by a 7-reviewer / 3-refuter pass on 2026-09-13, 0 refuted; `_lext_sort_desc`
+added in 3.2.0). Each is grounded in the callee body and the caller sites:
 
 | item(s) | defined in → reached from | disposition |
 |---|---|---|
@@ -137,25 +117,27 @@ scratch-buffer sizes). And `public struct GeoJet` + derive exports raw slot acce
 setters the module header says are reachable ONLY through the typed accessors: amend the header or
 wrap.
 
-**Order, unchanged:** consumer-call gate (done: `check-public-surface.sh` claim 2) → the
-dispositions above → flip `private` last (the upstream holes are fixed and the gate's known-leak
-inversion has already fired).
+**Order:** the dispositions above → rewrite or promote the 64 `_` names the suites reach → flip
+`private` last. The consumer-call gate already exists (`check-public-surface.sh` claim 2).
 
 ### Get one live consumer onto 3.0.x — **[unversioned — external]**
 
-⚠ **No live consumer has built 2.11.3 or later.** All ten sit at 2.11.1/2.11.2, behind the
-6.5.33 → 6.6.3 toolchain bump, the 536-site ganita alias migration, **and now the `Result<T, E>`
-break**. ⚠ 3.0.1 adds a reason the pin matters to THEM: `_cga_build_null_tbl` keeps its
-`if`-guard form precisely because a consumer compiles `dist/hisab.cyr` under its OWN cycc, and
-the natural `continue` form is silently wrong below 6.6.3. `cyrius check --with-deps dist/hisab.cyr` proves the bundle compiles against **this**
-manifest's ganita — not against theirs, and not against a real call graph.
+**No live consumer has built a 3.x.** Measured from each manifest's `[deps.hisab] tag` on
+2026-09-14: svara, naad and goonj pin **2.22.1** (so they have crossed the 6.6.x toolchain bump and
+the 536-site ganita alias migration); dhvani, attn11, ghurni, prani, garjan, prakash and nidhi pin
+**2.11.2**. None has crossed the `Result<T, E>` break. `cyrius check --with-deps dist/hisab.cyr`
+proves the bundle compiles against **this** manifest's ganita — not against theirs, and not against
+a real call graph. ⚠ The pin matters to THEM for a second reason: `_cga_build_null_tbl` keeps its
+`if`-guard form because a consumer compiles the bundle under its OWN cycc, and the natural
+`continue` form is silently wrong below 6.6.3.
 
 ⛔ **The `Result` break makes this urgent rather than merely overdue**, because of the failure mode
 the migration guide leads with: a `Result` in *argument* position does not error, it degrades to its
 tag, and `Ok` tag = 0 = `HSB_ERR_NONE`. A consumer whose checks look like
 `assert_eq(f(...), HSB_ERR_NONE)` will **build clean and test nothing**. Hand them
 `scripts/check-result-migration.sh`, which exists for exactly that class and is mutation-proven.
-**Highest-value action in this section.**
+**Highest-value action in this section.** The reached surface is small — **35 distinct public fns
+in 8 modules** across all ten (see the Boundary table) — so a port is bounded.
 
 ---
 
@@ -163,36 +145,23 @@ tag, and `Ok` tag = 0 = `HSB_ERR_NONE`. A consumer whose checks look like
 
 ⚠ **Cyrius bugs are filed in the CYRIUS repo** — `cyrius/docs/development/issues/` is where the
 language agent reads them — **and closed in THIS repo too when a bump fixes them**, because the
-cyrius agent never edits hisab (both 2026-09-11 filings were fixed in 6.6.3 and closed here in
-3.0.1: `issues/archived/2026-09-11-cyrius-*`).
+cyrius agent never edits hisab (the pattern: a hisab-side record in `issues/archived/` carrying the
+paired measurement, written on the bump that closes it).
 
-⛔ **ONE hisab-filed toolchain item is OPEN, filed in the cyrius repo on 2026-09-14** (`cyrius/docs/development/issues/2026-09-14-hisab-simd-dst-slot-regalloc-picker.md` + repro).
-`issues/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md` (cycc **6.6.4**, wrong code): a derived
-SETTER whose value argument reads the same object through the derived GETTER, in a function that also
-expands `f64v_*` intrinsics, leaves one intrinsic's DESTINATION frame slot unwritten — the register
-picker rewrites the slot store into a register move and the inline loop still reads the slot. Silent
-`(1, 4, 3)` for `(4, 5, 3)` standalone; SIGSEGV inside hisab. The self-proving repro under
-`issues/repros/` (exit 1 stock, exit 0 with `CYRIUS_REGALLOC_PICKER_CAP=0`) is wrong on **6.6.0 through
-6.6.4** from dirs pinned to each, so it is not a 6.6.4 regression. Until it is fixed and the pin
-has crossed the fix, `m3_mul_vec3` keeps its z tail in a local and stores it through the setter
-ONCE (comment on the function); do not tidy it back to the natural form. When it closes: archive the
-filing here, and the hisab-side `m3_mul_vec3` form may be re-measured (the hoisted form is −5.4% on
-its own, so there may be nothing to change).
+⛔ **ONE hisab-filed toolchain item is OPEN** — filed 2026-09-14 as
+`cyrius/docs/development/issues/2026-09-14-hisab-simd-dst-slot-regalloc-picker.md` (+ repro),
+recorded here as `issues/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md`. cycc's register
+picker rewrites an `f64v_*` intrinsic's destination-slot store into a register move when a derived
+SETTER's value argument reads the same object through the derived GETTER; the inline loop still
+reads the slot. Silent `(1, 4, 3)` for `(4, 5, 3)` standalone, SIGSEGV inside hisab; wrong on
+**6.6.0 through 6.6.4** from dirs pinned to each. **Until a pin crosses the fix**, `m3_mul_vec3`
+keeps its z tail in a local and stores it through the setter ONCE (comment on the function) — do not
+tidy it back to the natural form. When it closes: archive the filing here, and the hoisted form may
+stay on its own merit (−6.5% measured).
 
-The four **2026-09-13 filings were repaired in cyrius 6.6.4 and closed here in 3.1.1** (2026-09-14).
-What each still means for hisab:
-
-| filing (upstream, `2026-09-13-hisab-…`, archived there) | after 6.6.4 |
-|---|---|
-| `private-fn-reachable-via-address-of.md` | Fixed: `&fn`, `s.method()` and six more resolution paths now run `_vis_check`. The public-surface gate keeps CALL probes (a consumer writes calls; a gate valid only from 6.6.4 up would be blind below it). |
-| `public-enum-leaks-onto-next-declaration.md` | Fixed. The gate's known-leak inversion fired on the pin bump (`_ad_pow` refused, 457/457); `KNOWN_LEAKS` is empty. |
-| `refresh-only-overwrites-released-snapshot.md` | Fixed upstream (`install.sh --refresh-only` refuses a released slot; `verify-store.sh`). hisab STILL byte-compares `lib/` against the cyrius TAG, never the install dir — the rule cost nothing and found this. |
-| `deps-relocks-silently-under-unchanged-pin.md` | Fixed: `cyrius.lock` carries a `cyrius\t<pin>` trailer and a stdlib leaf whose snapshot hash moves under an unchanged pin is REFUSED (`deps --relock` accepts). Any `git status` change to `lib/` or `cyrius.lock` after a build is still worth reading. |
-
-**`bench_run` auto-batching (6.5.19)** — already in force; it is what moved 44 benchmark rows when
-the instrument changed. The **39 `bench_batch()` call sites are deliberately unchanged**: they now
-buy a FIXED window rather than escape the timer floor, which is still worth having when comparing
-two runs at identical batch sizes. Re-evaluate only if a reason appears.
+**`bench_run` auto-batching (6.5.19)** — already in force. The **39 `bench_batch()` call sites are
+deliberately unchanged**: they buy a FIXED window rather than escape the timer floor, which is still
+worth having when comparing two runs at identical batch sizes. Re-evaluate only if a reason appears.
 
 ---
 
@@ -221,8 +190,8 @@ indistinguishable once the reason is gone.
 
 - **SIMD `cross`** (from 2.3.1) — needs lane shuffles; `f64v_shuffle`/`permute`/`blend`/`swap` are
   all undefined on 6.6.2 (probed), so still correctly parked. ⭐ Now with a number instead of an
-  assertion: the best shuffle-free formulation measures **38 ns vs 25 ns scalar (+52%)**.
-  ⚠ `lerp` was never gated on this at all; it shipped on the shuffle-free n=2 hybrid in 3.2.0.
+  assertion: the best shuffle-free formulation measures **38 ns vs 25 ns scalar (+52%)**. (`lerp`
+  needs no shuffle and is not gated on this.)
 - **`#pure` annotations** (from 2.3.4) — parked, but **not for the reason originally recorded**.
   ⛔ The old premise ("unsafe CSE interaction with the allocate-a-fresh-result convention") is
   refuted on 6.6.2: *there is no CSE to be unsafe*. Three identical `#pure` calls emit `calls: 3`,
@@ -240,13 +209,14 @@ indistinguishable once the reason is gone.
 
 ## Consumers
 
-**Ten repos consume `dist/hisab.cyr` today, SHA-locked**: svara, naad, goonj, dhvani, attn11,
-ghurni, prani, garjan, prakash, nidhi. svara's `cyrius.lock` pins hisab commit `1bc71e3`
-(tag **2.11.2**) and `svara/src/spectral.cyr:246` calls `num_fft`.
+**Ten repos consume `dist/hisab.cyr` today, SHA-locked**: svara, naad, goonj (tag **2.22.1**),
+dhvani, attn11, ghurni, prani, garjan, prakash, nidhi (tag **2.11.2**) — read from each
+`cyrius.cyml` on 2026-09-14. `svara/src/spectral.cyr:246` calls `num_fft`.
 
 ⛔ **impetus, kiran, joshua, aethersafha, hisab-mimamsa and kana are NOT consumers** — they have no
 `cyrius.cyml` on any branch. They are Rust repos needing a *port*, not a scheduling decision
-(verified 2026-09-09). The table below is what they *would* use, kept because it is the planning
+(verified 2026-09-09, and again 2026-09-14 for abaco: its README calls hisab a sibling, not a
+consumer). The table below is what they *would* use, kept because it is the planning
 surface; it is not a statement that anything is wired up.
 
 | Planned consumer | Domain | Surface it will use |
@@ -302,8 +272,6 @@ live consumers the whole reached surface is **35 distinct public fns in 8 module
 and calls nothing from it, nidhi names hisab only in a comment, and **0 of 10 reference `HSB_*`**.
 Eight of hisab's 35 modules have a live caller; the 27 others — everything the rows above mark
 "none" included — are reached only by hisab's own suites.
-✅ **Verified 2026-09-09**: 0 hits for `abaco` in `cyrius.cyml`, `cyrius.lock`, `dist/hisab.deps`,
-`dist/hisab.cyr` and `src/`. The only git dep is sakshi (2.5.2 as of 3.0.1), and `deps --verify` already fails any
-unreviewed dep — **no new gate is owed here.** ⚠ The apparent contradiction between
-`eval("sin(pi/4)")` being abaco's while hisab exposes `expr_eval` is not one: `src/symbolic.cyr:339`
-takes a **tree**, not a string. hisab has no tokenizer at all.
+The only git dep is sakshi, and `deps --verify` already fails any unreviewed dep — **no gate is owed
+here.** ⚠ `eval("sin(pi/4)")` being abaco's while hisab exposes `expr_eval` is not a contradiction:
+`src/symbolic.cyr` takes a **tree**, not a string. hisab has no tokenizer at all.

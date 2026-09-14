@@ -15,7 +15,7 @@ differential geometry, symbolic algebra.
 
 ## Consumers
 
-⚠ **Verified 2026-09-09 — the four named below are NOT consumers.** Ten repos consume `dist/hisab.cyr` today, SHA-locked: **svara, naad, goonj, dhvani, attn11, ghurni, prani, garjan, prakash, nidhi** (svara pins tag 2.11.2 and calls `num_fft`). ⛔ impetus (physics), kiran (engine), joshua (simulation), aethersafha (compositor), hisab-mimamsa and kana have **no `cyrius.cyml` on any branch** — they are Rust repos awaiting a port, not scheduling. ⚠ **No live consumer has built 2.11.3+**, so none has crossed the 6.5.33 → 6.6.2 bump or the 536-site ganita migration.
+⚠ **Verified 2026-09-09 — the four named below are NOT consumers.** Ten repos consume `dist/hisab.cyr` today, SHA-locked: **svara, naad, goonj** (tag **2.22.1**) and **dhvani, attn11, ghurni, prani, garjan, prakash, nidhi** (tag **2.11.2**) — read from each `cyrius.cyml` on 2026-09-14; svara calls `num_fft`. ⛔ impetus (physics), kiran (engine), joshua (simulation), aethersafha (compositor), hisab-mimamsa and kana have **no `cyrius.cyml` on any branch** — they are Rust repos awaiting a port, not scheduling; abaco's own README calls hisab a sibling, not a consumer. ⚠ **No live consumer has built a 3.x** — the three on 2.22.1 have crossed the 6.6.x bump and the ganita migration but not the `Result<T, E>` break; the seven on 2.11.2 have crossed neither. (This paragraph said "no consumer has built 2.11.3+" until 3.2.0; that was false for three of the ten.)
 
 ## Quick Start
 

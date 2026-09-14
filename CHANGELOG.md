@@ -2,6 +2,75 @@
 
 ## [Unreleased]
 
+## [3.1.1] - 2026-09-14 — cycc 6.6.4: all four 2026-09-13 filings repaired upstream, the gate inverted on its own
+
+Toolchain **6.6.3 → 6.6.4**. sakshi **2.5.2** and ganita **1.2.5** are already the latest tags
+(checked against the GitHub API, not assumed). No library source change; the five suites print
+**byte-identical** output, **4214/4214**.
+
+⭐ **6.6.4 repairs all four defects hisab filed on 2026-09-13**, and the one hisab could see from its
+own tree announced itself: `scripts/check-public-surface.sh` was built to FAIL the day the
+`public enum` leak was fixed, and on the pin bump — before any source changed — claim 3 reported
+`_ad_pow` **REFUSED** (456/457 → **457/457** non-public probes refused). The `KNOWN_LEAKS` allowlist
+is now empty. The other three (`&_private_fn` reachable via address-of, `deps` re-locking silently
+under an unchanged pin, `install.sh --refresh-only` writing a released slot) are closed upstream
+with gates; hisab's consequences are recorded below and in the roadmap, and the vendoring rule
+(byte-compare `lib/` against the cyrius **tag**, never the install dir) stays — it is what found two
+of them.
+
+### Changed
+- **cyrius.cyml** — `cyrius = "6.6.4"`.
+- **lib/** — six files move with the 6.6.4 tag, all in the syscall/io layer: `io.cyr` (+22/−13:
+  per-target `O_NOFOLLOW`/`O_EXCL` bridging on agnos, `xflock` collapsed onto `SYS_FLOCK`) and the
+  five `syscalls_*` peers (per-target `O_DIRECT`/`O_LARGEFILE`/`O_DIRECTORY`/`O_NOFOLLOW`,
+  `SYS_FLOCK`). All **30/30** stdlib files byte-match the 6.6.4 tag; `sakshi.cyr` byte-matches 2.5.2.
+- **cyrius.lock** — six hashes moved with those files, and the lock now ends with the 6.6.4
+  `cyrius	6.6.4` trailer (the pin-keyed guard against silent re-locking that hisab's filing asked
+  for). `deps --verify` 31/31.
+- **scripts/check-public-surface.sh** — `KNOWN_LEAKS=""`; the `&name` and known-leak comment blocks
+  record the 6.6.4 closure. The probes stay CALLS: a consumer writes a call, and a gate that only
+  worked from 6.6.4 up would be blind on every pin below it.
+- **docs/development/roadmap.md** — *Toolchain, tracked upstream*: the four-row open table → closed
+  in 6.6.4; the *Public / private function surface* row's two upstream holes → fixed, so the 4.0.0
+  `private` flip is gated only on hisab's own dispositions now.
+- **docs/development/dependency-watch.md** — 6.6.4 block.
+- **docs/development/issues/archived/2026-04-26-cyrius-cli-arg-clobbers-source.md** — the one archived
+  record still marked *Open* is CLOSED: the data loss has been guarded upstream since cyrius
+  **6.0.36** (`cbt/commands.cyr` refuses to write build output over a `.cyr` path — exit 1, source
+  intact, measured on 6.6.4 in a scratch dir). hisab carried "Open" through the entire 6.x line. The
+  misparse (an unknown flag before the subcommand shifts positionals) is still present and stays
+  recorded as such. `docs/development/issues/` has **0** open filings; all 33 archived records now
+  carry a closed status.
+- **dist/hisab.cyr** — regenerated; the diff is the version header alone (1,115,949 B, 4.43% of the
+  24 MiB expanded-source cap; both caps re-checked unchanged in source between the 6.6.3 and 6.6.4
+  tags — `lex.cyr` moved only for the 64 KB string-literal fix).
+
+### Not exposed — checked rather than assumed
+- The 64 KB string-literal fix: hisab's largest literal is far below it.
+- `#deprecated` now firing on tail calls: hisab declares no `#deprecated` fn and every build/check
+  is warning-free except one pre-existing line (below).
+- `public impl` now marks no method: hisab has no `impl` blocks.
+- The eight newly-checked visibility paths (`&fn`, `s.method()`, struct-returning receives): no
+  in-tree consumer crosses a module boundary through any of them — the public-surface gate's 890
+  reachability probes and 457 refusal probes are unchanged.
+- Binaries are **not** byte-identical this time (+32 B on every suite and the CLI; `abuse` +4,128 =
+  one 4 KiB alignment crossing + 32). The six `lib/` files that moved are compiled into every
+  binary, so this is expected and not claimed as anything. Suite OUTPUT is byte-identical.
+- ⚠ Pre-existing, not new: `cyrius check --with-deps tests/foundation.tcyr` prints
+  `673:69: comparison mixes f64 and integer operands` on 6.6.3 AND 6.6.4 — a raw `!=` between a
+  user fn call (return type untracked → tagged integer) and an f64 intrinsic result. The comparison
+  is the intended bit-exact one. The 3.0.1 baseline grep (`OK|error`) hid it; CI's `check` step
+  scopes to `dist/` + `examples/` and greps `must_use`, so it is not a gate failure. Left as is.
+
+### Performance
+**No change is claimed, and this run cannot support one either way.** The 3.1.1 rows in
+`bench-history.csv` were recorded with the box at load 2.8 → 3.1 (a `qemu-system-x86` and two `cycc`
+processes from an unrelated cyrius session each at 100% CPU): median **+9.84%**, mean +9.99%,
+**34 of 78** rows past 10%, every row UP including the flat numeric kernels that no toolchain change
+can touch — the same uniform shift 2.16.0 and 2.19.0 recorded under load. Treat these rows as a
+contaminated sample, not a baseline; the next quiet-box run should be compared against the
+2026-09-13 3.1.0 rows, not these.
+
 ## [3.1.0] - 2026-09-13 — the `pub fn` half: 729 declarations, a gate whose first draft proved nothing, and two more upstream holes
 
 **Non-breaking.** Every non-underscore top-level fn / struct / enum / var in `src/` now carries

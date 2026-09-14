@@ -5,7 +5,20 @@
 **Severity:** Data-loss risk — destroyed `src/main.cyr` once during normal interactive use.
 **Hisab impact:** Lost `src/main.cyr` to a `cyrius -v build src/main.cyr /tmp/test` invocation. Recovered via `git checkout HEAD --`.
 **Hisab workaround:** Use `CYRIUS_VERBOSE=1` (env var) instead of unrecognized CLI flags. Don't pass any unknown flag before a subcommand.
-**Status:** Open. cc5 5.7.7's atomic-output fix prevents destruction on compile *failure*, but a misparsed-but-successful invocation still nukes the file.
+**Status:** 🟢 **CLOSED 2026-09-14 (hisab v3.1.1, cycc 6.6.4) — the data loss is FIXED upstream, and
+has been since cyrius 6.0.36.** `cbt/commands.cyr:66` refuses to write build output over any `.cyr`
+path (`error: refusing to write build output over a .cyr source file: b.cyr`, exit **1**, source
+byte-intact — measured on 6.6.4 with the exact misparsed shape `cyrius -v build b.cyr out`, in a
+scratch dir, never in this tree). Landed in commit `8990f376` ("bug batch - tools and bigint"),
+first tag **6.0.36** — so hisab carried this as "Open" for the whole 6.x line, the same way it carried
+`for-empty-clauses` five releases past its decision. ⚠ What is NOT fixed, and is recorded rather than
+implied: the top-level parser still treats an unknown flag before the subcommand as positional
+(the probe shows the shift — `b.cyr` lands in the OUTPUT slot), and bare `cyrius -v` still exits 0
+with the usage banner. The guard closes the destructive outcome, not the misparse; a non-`.cyr`
+target in that slot would still be overwritten. Keep the flag AFTER the subcommand
+(`cyrius build -v …`, exit 0, builds).
+
+*Original status line, kept for the record:* Open. cc5 5.7.7's atomic-output fix prevents destruction on compile *failure*, but a misparsed-but-successful invocation still nukes the file.
 
 **Upstream status, checked 2026-08-09 — and it is ambiguous, which is itself the finding.** The
 upstream filing exists at

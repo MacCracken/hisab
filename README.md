@@ -52,7 +52,7 @@ removes. **2.24.0 is the supported 2.x line.**
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "6.6.3"
+cyrius      = "6.6.4"
 
 [deps]
 # `ganita` (Cyrius 6.2.x) provides the transcendentals (acos/asin/atan2/pow/
@@ -152,9 +152,9 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 | Benchmarks | 78 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~251 KB static ELF (`build/hisab` — version smoke test only) |
-| Toolchain | Cyrius 6.6.3 |
+| Toolchain | Cyrius 6.6.4 |
 | Dependencies | 1 (sakshi 2.5.2); no third-party, no FFI/libc |
-| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 249 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared, not implied** (3.1.0): every non-underscore top-level declaration carries `public`, and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name`, because a private fn is reachable through address-of on cycc 6.6.2/6.6.3 (filed). **0 open filings** in [docs/development/issues/](docs/development/issues/) (31 archived); **4** hisab-filed toolchain defects are open upstream in [cyrius](https://github.com/MacCracken/cyrius), not here — two from 3.0.1 (a released snapshot dir is mutable; `cyrius build` silently re-locks a stdlib file under an unchanged pin) and two from 3.1.0 (the address-of hole; `public enum` leaks `public` onto the next declaration). Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
+| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 249 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared, not implied** (3.1.0): every non-underscore top-level declaration carries `public`, and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **0 open filings** in [docs/development/issues/](docs/development/issues/) (31 archived); **0** hisab-filed toolchain defects open upstream in [cyrius](https://github.com/MacCracken/cyrius) — all four 2026-09-13 filings were repaired in 6.6.4 and are archived there. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
 
 ## License
 

@@ -30,15 +30,21 @@
 #      violations against the flipped bundle.
 #   3. EXACTNESS (anti-vacuous) — a second generated consumer that calls every
 #      NON-public top-level fn and reads every non-public global is refused on
-#      every probe except the KNOWN_LEAKS below, each a pinned compiler defect
-#      that FAILS this gate the day upstream fixes it.
+#      every probe. KNOWN_LEAKS (below) is the allowlist for pinned compiler
+#      defects; it is EMPTY since the 6.6.4 pin (3.1.1) and any entry added to
+#      it FAILS this gate the day upstream fixes the defect it names.
 #   4. The real consumers in examples/*.cyr compile clean under the flip.
 #
 # ⛔ WHY THE PROBES ARE CALLS AND NOT `&name`: on cycc 6.6.2 and 6.6.3 a
-# file-private fn is reachable from another file through address-of — `&_helper`
-# compiles and the pointer runs through callptr/fncallN — while a direct call is
-# refused. So `&name` proves nothing in either direction. Filed upstream as
-# cyrius/docs/development/issues/2026-09-13-hisab-private-fn-reachable-via-address-of.md.
+# file-private fn was reachable from another file through address-of — `&_helper`
+# compiled and the pointer ran through callptr/fncallN — while a direct call was
+# refused, so `&name` proved nothing in either direction. Filed upstream as
+# cyrius/docs/development/issues/2026-09-13-hisab-private-fn-reachable-via-address-of.md
+# and FIXED in 6.6.4 (eleven resolution paths now check; hisab closed it in
+# 3.1.1, see docs/development/issues/archived/2026-09-13-cyrius-private-fn-
+# reachable-via-address-of.md). The probes STAY calls: a call is the shape a
+# consumer writes, and a gate that only worked from 6.6.4 up would be blind on
+# every pin below it.
 #
 # Mutation-proven at 3.1.0 (each mutant verified installed, then restored):
 #   - drop `public` from `_perm` (calc.cyr; reached from calc_ext + noise_simplex)
@@ -48,6 +54,9 @@
 #       -> claim 3 fails: UNEXPECTED leak (the compiler defect, caught);
 #   - a public declaration inserted between `AdPowLimit` and `_ad_pow`
 #       -> claim 3 fails: known leak now REFUSED (the allowlist inverts).
+#   ⭐ 3.1.1: that inversion FIRED FOR REAL on the 6.6.4 pin bump — claim 3
+#   reported `_ad_pow` refused before any source changed, which is how the
+#   upstream fix was detected here rather than read off a changelog.
 #
 # Nothing under the repo is modified: everything happens in a mktemp copy.
 set -euo pipefail
@@ -172,14 +181,16 @@ fi
 # exactness claim expects exactly these to be accepted; if one is REFUSED the
 # upstream fix has landed and this gate FAILS until the entry is removed, so a
 # pinned defect inverts into a tripwire for its own repair (2.20.0's rule).
+#   EMPTY since 3.1.1 (cycc 6.6.4). The one entry it ever held:
 #   _ad_pow — the declaration right after `public enum AdPowLimit` in autodiff.cyr.
-#     A `public enum` leaks its marker onto the next top-level declaration
+#     A `public enum` leaked its marker onto the next top-level declaration
 #     (cycc 6.6.2 and 6.6.3). Filed as
-#     cyrius/docs/development/issues/2026-09-13-hisab-public-enum-leaks-onto-next-declaration.md
-#     ⚠ `_SYM_EPS` (symbolic.cyr, after `public enum ExprTag`) is the second
-#     hisab item in that position; it is public by its own marker (reached from
-#     symbolic_ext), so the leak is masked there and claim 3 cannot see it.
-KNOWN_LEAKS="_ad_pow"
+#     cyrius/docs/development/issues/2026-09-13-hisab-public-enum-leaks-onto-next-declaration.md,
+#     fixed in 6.6.4 (`public` arms the marker only for a token that can carry
+#     it), and this gate reported it REFUSED on the pin bump — the inversion
+#     working as designed. `_SYM_EPS` (symbolic.cyr, after `public enum ExprTag`)
+#     was the masked second instance; it is public by its own marker.
+KNOWN_LEAKS=""
 out=$(cyrius check --with-deps consumer_private.cyr 2>&1 || true)
 python3 - "$T" "$out" "$KNOWN_LEAKS" <<'EOF' > exactness_report
 import re, sys

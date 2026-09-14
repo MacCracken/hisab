@@ -100,16 +100,12 @@ instrumentation counters mutation-proven guards depend on (`_CGA_NULL_TBL`, `_GA
 the guards die with the flip), and the `_f64arr_*` scratch helpers. Each needs a decision:
 rewrite the test against the public API, or promote as a documented inspector.
 
-⛔ **TWO UPSTREAM HOLES MEAN THE BOUNDARY IS NOT YET ENFORCEABLE, and both are filed with
-self-proving repros** (`cyrius/docs/development/issues/2026-09-13-hisab-*`):
-- **`&_private_fn` from another file compiles and RUNS** (exit 42 via `callptr` and `fncall1`) while
-  the direct call is refused — the visibility check covers calls and var reads, not address-of.
-  Until it is fixed, `private` documents intent and does not enforce it; flipping before the fix
-  ships a boundary a consumer crosses in one token.
-- **A `public enum` leaks `public` onto the next top-level declaration** (6.6.2 and 6.6.3). hisab
-  has two `_` items in that position — `_ad_pow` after `AdPowLimit` (allowlisted in the gate, which
-  FAILS the day upstream fixes it) and `_SYM_EPS` after `ExprTag` (masked by its own marker).
-  Six other declarations follow public enums and are API anyway.
+⭐ **The two upstream holes that made the boundary unenforceable are FIXED in cyrius 6.6.4**
+(hisab pinned it in 3.1.1): `&_private_fn` from another file is refused like the direct call, and a
+`public enum` no longer leaks `public` onto the next declaration — the gate's `_ad_pow` allowlist
+inverted on the pin bump exactly as designed and is now empty. ⚠ Consumers compile `dist/hisab.cyr`
+under their OWN pins; the flip is only enforced for a consumer at ≥ 6.6.4, which is one more reason
+it is a 4.0.0 item.
 
 ⭐ **The 24 cross-module `_` items now carry `public` plus a marker comment, and their 4.0.0
 dispositions were worked by a 7-reviewer / 3-refuter pass on 2026-09-13 (53 findings, 0 refuted).
@@ -140,8 +136,8 @@ setters the module header says are reachable ONLY through the typed accessors: a
 wrap.
 
 **Order, unchanged:** consumer-call gate (done: `check-public-surface.sh` claim 2) → the
-dispositions above → the two upstream holes fixed and re-verified by the gate's known-leak
-inversion → flip `private` last.
+dispositions above → flip `private` last (the upstream holes are fixed and the gate's known-leak
+inversion has already fired).
 
 ### The struct-layout contract has no gate — **[3.2.0]**
 
@@ -248,14 +244,17 @@ wrong line, which is worse than giving no citation at all.
 ⚠ **Cyrius bugs are filed in the CYRIUS repo** — `cyrius/docs/development/issues/` is where the
 language agent reads them — **and closed in THIS repo too when a bump fixes them**, because the
 cyrius agent never edits hisab (both 2026-09-11 filings were fixed in 6.6.3 and closed here in
-3.0.1: `issues/archived/2026-09-11-cyrius-*`). **Four hisab-filed toolchain items are open:**
+3.0.1: `issues/archived/2026-09-11-cyrius-*`). **No hisab-filed toolchain item is open.**
 
-| filing (upstream, `2026-09-13-hisab-…`) | what it costs hisab today |
+All four were **repaired in cyrius 6.6.4 and closed here in 3.1.1** (2026-09-14). What each still
+means for hisab:
+
+| filing (upstream, `2026-09-13-hisab-…`, archived there) | after 6.6.4 |
 |---|---|
-| `private-fn-reachable-via-address-of.md` | **The 4.0.0 boundary is bypassable**: `&_helper` from another file compiles and runs. The public-surface gate uses calls, never `&name`, for exactly this reason. |
-| `public-enum-leaks-onto-next-declaration.md` | `_ad_pow` and `_SYM_EPS` are public regardless of their markers; `_ad_pow` is allowlisted in the gate and the gate FAILS when upstream fixes it (remove the entry then). |
-| `refresh-only-overwrites-released-snapshot.md` | `~/.cyrius/versions/<pin>/lib` is not evidence of what a pin ships; the vendoring check compares against the cyrius TAG. |
-| `deps-relocks-silently-under-unchanged-pin.md` | A bare `cyrius build` can re-vendor and re-lock a stdlib file with no diagnostic; treat any `git status` change to `lib/` or `cyrius.lock` after a build as a defect to investigate. |
+| `private-fn-reachable-via-address-of.md` | Fixed: `&fn`, `s.method()` and six more resolution paths now run `_vis_check`. The public-surface gate keeps CALL probes (a consumer writes calls; a gate valid only from 6.6.4 up would be blind below it). |
+| `public-enum-leaks-onto-next-declaration.md` | Fixed. The gate's known-leak inversion fired on the pin bump (`_ad_pow` refused, 457/457); `KNOWN_LEAKS` is empty. |
+| `refresh-only-overwrites-released-snapshot.md` | Fixed upstream (`install.sh --refresh-only` refuses a released slot; `verify-store.sh`). hisab STILL byte-compares `lib/` against the cyrius TAG, never the install dir — the rule cost nothing and found this. |
+| `deps-relocks-silently-under-unchanged-pin.md` | Fixed: `cyrius.lock` carries a `cyrius\t<pin>` trailer and a stdlib leaf whose snapshot hash moves under an unchanged pin is REFUSED (`deps --relock` accepts). Any `git status` change to `lib/` or `cyrius.lock` after a build is still worth reading. |
 
 **`bench_run` auto-batching (6.5.19)** — already in force; it is what moved 44 benchmark rows when
 the instrument changed. The **39 `bench_batch()` call sites are deliberately unchanged**: they now

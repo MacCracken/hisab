@@ -4,7 +4,7 @@ Tracked dependency version constraints and upgrade paths.
 
 ## Cyrius Toolchain
 
-**Status:** Pinned to **6.6.3** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
+**Status:** Pinned to **6.6.4** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
 
 **Note:** Cyrius stdlib provides dense LU, Cholesky, QR, SVD, eigendecomposition. As of 6.2.x these live in the new **`ganita`** umbrella module (which re-exports the former `matrix`/`linalg` API in full and also hosts the transcendentals). This is a critical dependency — hisab's `linalg_ext.cyr` wraps these functions. The `[deps] stdlib` list pulls `ganita` (not `matrix`/`linalg` — listing those alongside `ganita` collides).
 
@@ -20,7 +20,20 @@ Tracked dependency version constraints and upgrade paths.
 - 6.0.2: lockfile/vendoring fix — `cyrius deps` now hashes all `.cyr` under `lib/` and writes a real lock (the empty 0-byte `cyrius.lock` bug present since 5.11.8); vendored deps are regular file-copies, not the dangling symlinks that broke CI.
 - **6.0.14**: clean build/test (901/901 as of v2.4.6). Migration was manifest-only (pin bump + sakshi resolution); the 34 math modules moved `lib/`→`src/` so the committed `lib/` no longer shadows the toolchain's version-pinned stdlib snapshot.
 - **6.2.11** (v2.6.6): stdlib math reorg. The transcendentals (`f64_acos`/`f64_asin`/`f64_atan2`/`f64_pow`/`f64_sinh`/`f64_cosh`/`f64_tanh` + hyperbolic inverses) moved out of `math` into the new **`ganita`** module, which also subsumes `matrix`/`linalg` (re-exports their full API). `math` now ships NaN-correct `f64_le`/`f64_ge` (hisab dropped its local copies). `[deps] stdlib`: `+ganita`, `−matrix`, `−linalg`. Clean build, 957/957 tests, all gates green. Tracked-issue re-verify: **3 of 5 fixed** (modules-substring, 18-arg-fn scramble, lint rc-as-count → all archived); for-empty-clauses still open. Vendored `lib/` re-resolved via `cyrius deps` (30 files — **not** the full-snapshot `cyrius lib sync`, which over-vendors unused platform variants and breaks `deps --verify` on a spurious `process_agnos.cyr` entry); `cyrius.lock` 30 deps, verify 30/30.
-- **6.6.3** (current pin, v3.0.1): **closes both defects hisab filed on 2026-09-11, and finds two
+- **6.6.4** (current pin, v3.1.1): **repairs all four defects hisab filed on 2026-09-13** —
+  `&_private_fn` reachable via address-of (eleven resolution paths now run `_vis_check`),
+  `public enum` leaking `public` onto the next declaration (hisab's public-surface gate reported
+  `_ad_pow` REFUSED on the pin bump, 456/457 → 457/457; `KNOWN_LEAKS` emptied), `cyrius deps`
+  re-locking a stdlib leaf silently under an unchanged pin (`cyrius.lock` now ends with a
+  `cyrius\t<pin>` trailer; a moved leaf is refused, `deps --relock` accepts), and
+  `install.sh --refresh-only` writing a released slot (refused from a drifted tree;
+  `scripts/verify-store.sh` audits/restores). All archived upstream. Stdlib delta: six files, all in
+  the syscall/io layer (`io.cyr` + five `syscalls_*` peers — per-target `O_*` flags, `SYS_FLOCK`);
+  30/30 byte-match the 6.6.4 tag, sakshi 2.5.2 and ganita 1.2.5 unchanged and still the latest
+  tags. Suites print byte-identical output (4214/4214); binaries +32 B each (the moved `io.cyr` is
+  in every one). No `#deprecated`, no `impl`, no ≥ 64 KB literal in hisab, so the rest of 6.6.4's
+  list is not exposed.
+- **6.6.3** (v3.0.1): **closes both defects hisab filed on 2026-09-11, and finds two
   new ones in the toolchain's own release plumbing.** Stdlib delta is two header lines — ganita
   **1.2.4 → 1.2.5**, sakshi **2.5.1 → 2.5.2**, each a pin-only refold — so the suites and the CLI
   compile **byte-identical** under 6.6.2 and 6.6.3 (`foundation` 442,040 B, `edge_cases` 586,464 B,

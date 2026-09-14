@@ -4,7 +4,7 @@
 
 Higher math for the AGNOS ecosystem — linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, and more. Written in [Cyrius](https://github.com/MacCracken/cyrius), ported from Rust.
 
-Used by **svara**, **naad**, **goonj**, **dhvani**, **attn11**, **ghurni**, **prani**, **garjan**, **prakash** and **nidhi** — ten repos that pull `dist/hisab.cyr` SHA-locked (verified 2026-09-09).
+Used by **svara**, **naad**, **goonj** (tag 2.22.1), **dhvani**, **attn11**, **ghurni**, **prani**, **garjan**, **prakash** and **nidhi** (tag 2.11.2) — ten repos that pull `dist/hisab.cyr` SHA-locked (pins read from their manifests 2026-09-14). None has crossed the 3.0.0 `Result` break yet.
 
 ⚠ [impetus](https://github.com/MacCracken/impetus) (physics), [kiran](https://github.com/MacCracken/kiran) (engine), [joshua](https://github.com/MacCracken/joshua) (simulation), [aethersafha](https://github.com/MacCracken/aethersafha) (compositor), [hisab-mimamsa](https://github.com/MacCracken/hisab-mimamsa) (theoretical physics) and [kana](https://github.com/MacCracken/kana) (quantum science) are **planned** — they are Rust repos awaiting a Cyrius port and have no `cyrius.cyml` on any branch.
 
@@ -29,7 +29,7 @@ removes. **2.24.0 is the supported 2.x line.**
 
 | Module | Files | Description |
 |--------|-------|-------------|
-| **Core** | f64_util, error | f64 helpers the stdlib does not carry; the `HSB_ERR_*` code set every fallible entry point returns |
+| **Core** | f64_util, error | f64 helpers the stdlib does not carry; the `HSB_ERR_*` codes every fallible entry point carries as the `E` of its `Result<T, E>` |
 | **Foundation** | vec2, vec3, vec4, quat, mat3, mat4 | Vector/matrix/quaternion types (f64, heap-allocated; SIMD `f64v_*` hot paths) |
 | **Transforms** | transforms, color | 2D/3D affine transforms, projections, slerp/lerp, Euler angles, sRGB/HSV/HSL/Oklab, Porter-Duff compositing (8 ops), tone mapping (Reinhard, ACES), SH L2, EV/exposure |
 | **Geometry** | geo, geo_advanced, geo_diff, spatial | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, SDF+CSG, swept-AABB/TOI, conformal geometric algebra (5D CGA); spatial structures (BVH, k-d tree, octree, quadtree, spatial hash); differentiable ray/surface intersection for **all six** primitives — plane, sphere, triangle, aabb, obb and capsule jets returning the full gradient from one evaluation |
@@ -65,8 +65,8 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "r
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "3.0.1"
-modules = ["dist/hisab.cyr"]   # ~1.1 MB self-contained bundle (all 35 modules)
+tag     = "3.2.0"
+modules = ["dist/hisab.cyr"]   # ~1.12 MB self-contained bundle (all 35 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
 # pulls in hisab's own 16 stdlib leaves, so the `stdlib` list above only has to
 # name what *your* code uses.
@@ -146,15 +146,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.1.0 |
-| Library | 35 modules, ~26,400 lines of Cyrius |
+| Version | 3.2.0 |
+| Library | 35 modules, ~26,600 lines of Cyrius |
 | Tests | 4429 assertions across 5 suites |
-| Benchmarks | 78 operations |
+| Benchmarks | 80 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~251 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.6.4 |
 | Dependencies | 1 (sakshi 2.5.2); no third-party, no FFI/libc |
-| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 249 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared, not implied** (3.1.0): every non-underscore top-level declaration carries `public`, and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **0 open filings** in [docs/development/issues/](docs/development/issues/) (31 archived); **0** hisab-filed toolchain defects open upstream in [cyrius](https://github.com/MacCracken/cyrius) — all four 2026-09-13 filings were repaired in 6.6.4 and are archived there. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
+| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 249 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared, not implied** (3.1.0): every non-underscore top-level declaration carries `public`, and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **1 open filing** in [docs/development/issues/](docs/development/issues/) (31 archived) — a cycc wrong-code defect found in 3.2.0 (the register picker drops an `f64v_*` destination-slot store; wrong on 6.6.0–6.6.4), filed upstream in [cyrius](https://github.com/MacCracken/cyrius) with a self-proving repro and worked around in `m3_mul_vec3`; the four 2026-09-13 filings were repaired in 6.6.4 and are archived there. Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
 
 ## License
 

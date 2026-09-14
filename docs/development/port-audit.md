@@ -12,10 +12,17 @@
 > **full collision arc** (MPR, sequential-impulse, convex hull, triangulation,
 > Delaunay, half-edge, island detection — audited + fixed in 2.4.x), SE(3)/SO(3)
 > + adjoint + BCH (lie_ext), einsum, and symbolic integration/LaTeX/pattern
-> matching. **Genuinely still open** (tracked in the roadmap): reverse-mode
-> (tape) autodiff + differentiable rendering + GPU (2.7.0), deeper differential
-> geometry (2.6.0), and the `Result<T,E>` error migration (3.0.0). Dual
-> quaternions and convex *decomposition* remain demand-gated.
+> matching. Of the items that paragraph called open, all but two have since
+> shipped: reverse-mode (tape) autodiff (2.11.0), differentiable geometry (the
+> six `geo_jet_*` primitives, 2.10.0–2.10.2), deeper differential geometry
+> (2.6.x), and the `Result<T,E>` migration (3.0.0). **Status 2026-09-14 (v3.2.0):
+> 35 modules / 26,567 lines, 4429 assertions, 80 benchmarks.** Dual quaternions,
+> convex *decomposition*, differentiable *rendering* and GPU were never
+> scheduled and are not on the roadmap (no consumer has asked; none of the ten
+> live consumers reaches beyond 35 public fns in 8 modules) — a consumer asking
+> is what would put them there. The port is
+> complete as a parity question — this file is the historical record of the
+> 2026-04-15 snapshot and is not maintained further.
 
 ## Summary
 

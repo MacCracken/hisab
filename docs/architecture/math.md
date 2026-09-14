@@ -5,8 +5,11 @@
 > end points at where the rest of the library's formula material lives (source
 > headers, the threat-model constants table, the architecture overview).
 >
-> Conventions: all scalars are IEEE 754 `f64`; near-zero comparisons use
-> `EPSILON_F64 = 1e-12`. Blades/multivectors are heap arrays of `f64` components
+> Conventions: all scalars are IEEE 754 `f64`. There is no house tolerance:
+> since the 2.14.0–2.15.0 census, guards test exactly what makes an operation
+> fail (an exact zero, DBL_MIN for an unbounded numerator, a relative test for
+> convergence); `EPSILON_F64 = 1e-12` survives only where a 1e-12 absolute is the
+> stated contract. Blades/multivectors are heap arrays of `f64` components
 > indexed by blade index (see the layout table). Vector basis is `{e1, e2, e3}`
 > for 3D Euclidean and `{e1, e2, e3, n0, ninf}` — the **null basis** — for the 5D
 > conformal model. ⚠ Through 2.20.0 this was the orthonormal `{e1, e2, e3, ep, em}`
@@ -126,9 +129,13 @@ The **blade inverse** (`cga_blade_inverse`) is
 B⁻¹ = ~B / ⟨B ~B⟩₀
 ```
 
-with a guard: if `|⟨B ~B⟩₀| < EPSILON_F64` (a **null** blade — e.g. a conformal
-point) the inverse is undefined and the function returns the zero multivector
-rather than dividing by zero.
+with a RELATIVE null test: if `|⟨B ~B⟩₀| ≤ _CGA_NULL_TOL · Σ bᵢ²` (with
+`_CGA_NULL_TOL = 2⁻⁴⁹ ≈ 1.78e-15`, a measured floor rather than a borrowed one) the
+blade is null to working precision — e.g. a conformal point — and the function
+returns the zero multivector rather than dividing by zero. ⚠ Through 2.14.0 this
+was `|⟨B ~B⟩₀| < EPSILON_F64`, an absolute 1e-12 against a norm SQUARED — degree
+two in the blade's scale — so it was asking two different questions ("can I
+divide by this" and "is this blade null") with one wrong number.
 
 ### 1.3 Dual
 

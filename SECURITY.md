@@ -2,7 +2,7 @@
 
 ## Scope
 
-Hisab is a pure mathematics library written in Cyrius providing linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, interval arithmetic, and tensor operations. The core library performs no I/O, with one exception: `expr_eval` writes a warning to stderr on an undefined variable and on an unknown expression tag (`src/symbolic.cyr:275`, `:317`) instead of aborting — see the Symbolic eval row below. No network I/O, no filesystem access, no FFI, no libc.
+Hisab is a pure mathematics library written in Cyrius providing linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, interval arithmetic, and tensor operations. The core library performs no I/O, with one exception: `expr_eval` writes a warning to stderr on an undefined variable and on an unknown expression tag (the two `syscall(1, 2, …)` sites in `src/symbolic.cyr`'s `expr_eval`) instead of aborting — see the Symbolic eval row below. No network I/O, no filesystem access, no FFI, no libc.
 
 ## Attack Surface
 
@@ -10,16 +10,16 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 |------|------|------------|
 | Allocation overflow | Integer overflow in `rows * cols * 8` could cause undersized allocation (CWE-190) | Overflow guards on tensor, complex-matrix, diffgeo allocations; dimension caps — pinned by regression tests (2026-05-29 audit). Stdlib `mat_new` gained its own upstream guard in **ganita 1.0.4** (cyrius 6.5.6 pin, hisab **2.6.11**) — rejects non-positive dims and element counts over 33,554,430, returning null — and that contract is now pinned by regression tests. Before 2.6.11 the vendored copy was stale at 1.0.3, where `mat_new(-5, 3)` segfaulted; hisab's own usage was mitigated throughout (dims taken from already-allocated matrices), and `mat_new_guarded` is retained as the stricter 16M-element entry point for untrusted dimensions |
 | Numerical stability | Catastrophic cancellation, overflow | IEEE 754 f64 throughout; documented precision limits |
-| Matrix decompositions | Division by near-zero pivot | Partial pivoting with EPSILON_F64 threshold checks |
-| Iterative solvers | Non-convergence on adversarial input | max_iter bounds; returns ERR_NO_CONVERGENCE |
+| Matrix decompositions | Division by near-zero pivot; a guard that FABRICATES a plausible answer instead of rejecting | Partial pivoting. ⚠ The `EPSILON_F64` threshold guards this row used to name were the defect: 2.14.0's census found **136 such guards, 97 confirmed wrong** (absolute thresholds against quantities in the caller's units), repaired across 2.14.0–2.15.0 onto exact or DBL_MIN-derived tests; the SVD/eigen Householder gates followed in 2.22.0–2.23.0. `docs/audit/2026-09-09-epsilon-census.md` |
+| Iterative solvers | Non-convergence on adversarial input; a flushed norm reading as instant convergence | max_iter bounds; `Err(HSB_ERR_NO_CONVERGENCE)`. ⚠ 2.17.0 found every `norm < tol` test could fire on iteration one for a subnormal-scaled problem, returning `Ok` with `x0` — repaired with scale-safe norms |
 | FFT | Invalid input length | Requires power-of-2 |
-| Integration | Zero step count | Returns ERR_ZERO_STEPS |
+| Integration | Zero step count | `Err(HSB_ERR_ZERO_STEPS)` |
 | GJK/EPA, MPR narrowphase | Non-convergence on degenerate shapes; an iteration cap that is not a work bound because the loop allocates | 64-iteration hard limit (`_COL_MAX_ITER`). The cap alone was not enough: `mpr_penetration`'s convergence test was **unsatisfiable for a body with interior**, so it burned all 64 iterations every call, and EPA's expansion loop was O(k²) — **8,576 face evaluations and 1.24 MB of never-freed arena per call** at the 2026-08-04 audit. Both rewritten 2.8.3. A first O(k²) repair was **rejected** in 2.8.2 despite hitting 812 evaluations / 99.6 KB, because its flood-fill visible-set search under-reports when rounding splits the visible region into disconnected components (239 of 47,134 cases; a cylinder-vs-rotated-box reproducer 40.7× too small). Arena growth is now pinned per support call by `tests/modules.tcyr` rather than by an absolute bound: `mpr_penetration` **293 B/call over 572 calls** (sibling `gjk_epa_3d` 296 over 552), byte-identical across five processes, sized so an injected 80 B/face/iteration leak overshoots by **123%** where the old absolute bound cleared it by 0.22% |
 | Collision algorithms | OOB index / non-termination (convex hull, triangulation, Delaunay, half-edge) | All index access via `vec_get` (traps on OOB, no silent corruption); ear-clip `n*n` cap, half-edge one-ring 1000-step guard. Audited + covered in the 2.4.x arc |
 | Sieve of Eratosthenes | Unbounded allocation | Capped at 10M elements |
-| Division by zero | NaN/Inf propagation through complex, autodiff, transforms | Zero guards on cx_div, cx_inv, dual_div, dual_sqrt, dual_ln, f64_fmod, world_to_screen, linearize_depth_reverse_z. ⚠ **The presence of a guard is not the same as a correct one**, and 2.11.0 found four of the autodiff guards were fabricating answers rather than rejecting bad input: `dual_div` returned (0,0) for `1/1e-13` where the truth is 1e13, `dual_ln` tested `f64_abs(v)` — not ln's domain — so `ln(-5)` came back as a NaN value beside a **confident** -0.2 derivative, and `dual_sqrt` computed the root *before* its guard so a negative input was already NaN. All repaired at DBL_MIN, on the rule *guard exactly what makes the division fail and nothing more*; the same rule settled six thresholds in `geo.cyr` across 2.10.2. See `issues/archived/2026-08-11-forward-mode-dual-guards.md`. ⚠ **2.11.1's audit found the same class at ~24 further sites and `cx_div` — cited in this very row — is among them, still returning exactly zero below |z| = 1e-12**; verified live during that release. The tier is scheduled on the roadmap, so treat every guard named in this row as *present*, not as *proven correct* |
+| Division by zero | NaN/Inf propagation through complex, autodiff, transforms — and a guard that returns a fabricated finite answer instead | Guards on cx_div, cx_inv, dual_div, dual_sqrt, dual_ln, f64_fmod, world_to_screen, linearize_depth_reverse_z. ⚠ **The presence of a guard is not the same as a correct one**: 2.11.0 found four autodiff guards fabricating answers (`dual_div` returned (0,0) for `1/1e-13`; `dual_ln` tested `f64_abs(v)`, not ln's domain, so `ln(-5)` came back as NaN beside a **confident** -0.2 derivative; `dual_sqrt` took the root before its guard), repaired on the rule *guard exactly what makes the division fail and nothing more*. 2.11.1's audit then found the class at ~24 more sites, including `cx_div` returning exactly zero below \|z\| = 1e-12 — **closed 2.14.0–2.15.0**: `cx_div` is Smith's algorithm (no threshold can be right: over 401 decades 1e-12 fails 241, DBL_MIN 93, no guard at all 89, Smith 0), and the census repaired 96 more. Every guard named here has since been mutation-tested against a sweep to the arithmetic floor, not merely bracketed |
 | Modular arithmetic | Overflow in multiplication for large moduli | Russian peasant _num_mulmod avoids overflow |
-| Symbolic eval | Process abort on undefined variable | Returns 0 with warning (no longer aborts) |
+| Symbolic eval | Process abort on undefined variable or unknown tag | Returns 0 with a stderr warning (no longer aborts) |
 | Perlin noise | Global mutable state for permutation table | Single-threaded only; documented |
 | Capped constructors | A designed `0` (null) return from a dimension cap being **stored through** by the caller (CWE-476) | Closed in two passes: **2.6.14** for `cmat_new`'s four callers and the BFGS/L-BFGS working-memory allocations (`_OPT_MAX_DIM = 4096`, new `HSB_ERR_ALLOC`); **2.7.0** for `cmat_add`/`sub`/`adjoint`/`scale`/`trace`, which `cmat_commutator` feeds directly. Pre-fix mutants exit **139 (SIGSEGV)** |
 | Complex matrix multiply | Out-of-bounds read past `b`'s buffer when `cols(a) != rows(b)` (CWE-125) | Conformability check added 2.7.0 |
@@ -46,7 +46,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Version | Supported |
 |---------|-----------|
-| hisab 3.0.x (current) | Yes |
+| hisab 3.x (current: 3.2.x) | Yes |
 | hisab 2.24.x (supported 2.x line) | Yes |
 | hisab 2.0–2.23 | Best-effort |
 | Rust 1.x | Available via pre-2.0 git tags, unsupported |
@@ -60,7 +60,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 ## Design Principles
 
-- No `syscall(60, ...)` (process abort) in library code — errors via return codes
+- No `syscall(60, ...)` (process abort) in library code — errors travel as `Err(HSB_ERR_*)` in a `Result<T, E>` (3.0.0; integer return codes before that)
 - All public functions document their error conditions
 - Allocation sizes are guarded against overflow where inputs are user-controlled
 - Bump allocator (no free) — no use-after-free, no double-free
@@ -87,11 +87,14 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   deduplicated digest is exactly how the six unscheduled 2026-08-03 findings stayed invisible for
   four releases. Every dated report in docs/audit/ now records a disposition per finding
 - Public entry points are exercised under **abuse**, not only under use: `tests/abuse.tcyr` (added
-  2.9.0, **732 assertions**) drives negative indices, zero and huge dimensions, non-conformable
+  2.9.0, **904 assertions** today) drives negative indices, zero and huge dimensions, non-conformable
   operands, the designed-`0` return, degenerate geometry and heap canaries. It surfaced **11 real
   defects on public entry points**, held in a known-defect register rather than deleted. The register
   is discharged: nine repaired into live assertions, the tenth re-measured and reclassified
   `[BY DESIGN]`, and two of its own reproducers corrected in place rather than trusted
+- The struct-layout contract has a gate that can fail (3.2.0): all **22** public structs are pinned to
+  their exact measured `sizeof` in `tests/abuse.tcyr`, proven to fire on a one-field change. The 32
+  assertions that stood there since 2.9.0 (`> 0`, `% 8 == 0`) could not fail on any layout change
 - Fixes are **mutation-proven**: a repair lands only once its source file has been reverted and the
   new assertions confirmed to fail. Where a defect is a cost rather than a wrong answer, that is
   stated explicitly and a benchmark guards it instead — a passing suite is not allowed to imply a
@@ -100,7 +103,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   `scripts/check-constants.sh` (a CI gate since 2.6.12, after seven mis-transcribed tables shipped).
   The gate was itself audited: until 2.7.0 its regex rejected `_` digit separators and it silently
   skipped **35 of 145** declarations while printing "110/110 verified" — one of the skipped constants
-  encoded ~1e16 against a documented 1e15. Now **153/153 verified, 1 skipped**
+  encoded ~1e16 against a documented 1e15. Now **159/159 verified, 1 skipped**, and since 2.20.0 the gate also catches a comment on the line above its declaration (a shape that had let a mis-transcribed `F64_1E_NEG30` through as 158/158)
 - **A green gate is not evidence that it gated.** The release version check was
   `grep -q "$VERSION" CHANGELOG.md` — an unanchored regex, which `2.9.2` satisfied by matching
   `32,942,104 B` in an unrelated line, so a release could ship with no CHANGELOG entry at all.

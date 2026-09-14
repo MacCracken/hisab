@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+### Changed — documentation sweep, 2026-09-14 (post-3.2.0; no behaviour change)
+- ⛔ **18 source doc comments still stated the pre-3.0.0 contract** — `Returns: HSB_ERR_NONE on
+  success, HSB_ERR_X …` above functions that return `Ok(0)` / `Err(HSB_ERR_X)` (`calc_gradient`,
+  `calc_jacobian`, `calc_hessian`, `sequential_impulse`, `eigen_symmetric`, `_lp_bidiagonalize`,
+  `svd_golub_kahan`, `_lp_tridiagonalize`, `eigen_qr`, `cqr_decompose`, `ode_dopri45_trajectory`,
+  the five `opt_*` solvers, `quadtree_insert`, `octree_insert`) plus three `-> error code` signature
+  lines and `num_modpow`'s "a negative return is unambiguously an error code". 3.0.1 repaired 19 of
+  this class and said so; these were found by pairing every such comment with whether the function
+  below it returns `Ok(`. The two that still return a raw code (`cmat_set`, `spatial_hash_insert`)
+  are left as they are, correctly. `dist/hisab.cyr` regenerated (comments only).
+- **examples/basic_math.cyr** — the Simpson comment said failure came back "in the return code";
+  now the `Result` idiom, including the argument-position trap. ⛔ **The Euler line printed
+  `|e^(iπ) + 1| < 1e-10: yes` while the code tested `< 1`** — a label overstating its own check;
+  the test now matches the label. A reverse-mode block (`ad_tape_new` → `ad_grad` → `ad_grad_of`)
+  joins the forward-mode one, since the README headlines reverse mode and no example used it.
+- **README.md** — consumer pins per repo (2.22.1 / 2.11.2, none past the `Result` break); the Core
+  row no longer says entry points *return* `HSB_ERR_*` codes; manifest `tag` 3.0.1 → 3.2.0; Stats
+  3.1.0 → 3.2.0, ~26,600 lines, 80 benchmarks; Security cell: **1** open filing and the layout gate.
+- **CONTRIBUTING.md** — 3989 → 4429; the two gates the recipe omitted (`check-public-surface.sh`,
+  `check-result-migration.sh`); Code Style rewritten off `ERR_NONE` / `alloc(N) + store64` onto
+  `Result<T, E>` + `#must_use`, `alloc(sizeof(T))` + accessors, `public` + the cross-module marker,
+  and the cycc getter-inside-setter shape to avoid; Testing gains bit-exact compare, mutation proof
+  and the non-degenerate-fixture rule.
+- **SECURITY.md** — every retired contract in the attack-surface table rewritten: `ERR_*` returns →
+  `Err(HSB_ERR_*)`; the *Matrix decompositions* row's "`EPSILON_F64` threshold checks" WERE the
+  defect (2.14.0 census: 136 guards, 97 wrong); the *Division by zero* row still said `cx_div`
+  fabricates zero and "the tier is scheduled" — closed 2.14.0–2.15.0 (Smith's algorithm; no
+  threshold can be right); symbolic warning cited by site, not line number; supported versions 3.x;
+  constants 153 → 159/159; abuse 732 → 904; a bullet for the struct-layout gate.
+- **docs/guides/testing.md** — run-block counts; 80 benchmarks with the 8 rows the category table
+  lacked (`cga_*`, `jac_rev_*`, `vec3_lerp`/`vec2_lerp`); ⛔ **three patterns taught what the same
+  file forbids**: a bare `num_newton(...)` (a `#must_use` warning since 2.19.0), the
+  multiply-and-round idiom, and an Euler identity checked against tolerance **1** — rewritten.
+- **docs/architecture/overview.md** — sidecar 15 → **16** leaves (`result`); the per-module include
+  table re-verified by compiling all 35 modules against exactly their listed sets: `lie` gains
+  `mat3` and `linalg_precision` gains `linalg_ext` (both 3.2.0 dependencies). ⚠ The probe method has
+  a blind spot recorded in the table's note: a missing GLOBAL fails at once, a missing FUNCTION is
+  tolerated until something calls it, so the `linalg_precision` row is proven by calling `eigen_qr`.
+  Seven `_` reaches, not six; principles: no house tolerance, `Result<T, E>` not error codes,
+  `alloc(sizeof(T))`; Consumers: the ten live repos with pins and the 35-fn reached surface, svara
+  removed from *planned*, abaco marked plan-only.
+- **docs/architecture/math.md** — conventions no longer claim near-zero comparisons use
+  `EPSILON_F64`; `cga_blade_inverse`'s guard described as implemented (relative, `≤ 2⁻⁴⁹ · Σbᵢ²`).
+  ⚠ A first draft of that sentence wrote "exact zero" from the old doc rather than the code.
+- **docs/development/threat-model.md** — constants 153 → 159; Supply Chain rewritten onto the TAG
+  rule with the 3.0.1 mutable-snapshot finding and its 6.6.4 repairs; ⛔ the toolchain-bump trail had
+  stopped at 6.5.16 (2026-08-09) — a consolidated entry covers the seven bumps to 6.6.4 and names the
+  two wrong-code compiler defects hisab found, a supply-chain risk the file had not named.
+- **docs/development/port-audit.md** — status banner: the items it called open have shipped; marked
+  as a preserved snapshot. ⚠ A first draft said dual quaternions were "declined in 2.19.0"; the
+  2.19.0 decision was about dual *numbers* (`dual_*`), corrected before it landed.
+- **docs/benchmarks-rust-v-cyrius.md** — Cyrius column refreshed from the 3.2.0 quiet-box rows
+  (it was a v2.2.0 / cc3 4.10.3 run that charged a ~240 ns clock pair to every sub-µs row:
+  `ease_in_out` 403 ns for a 6 ns operation); Rust column frozen; reclassified in doc-health from
+  dated artifact, because `testing.md` linked it as the live comparison.
+- **docs/development/dependency-watch.md** — 16 declared leaves with a `result` row; lib/ arithmetic
+  27/30 → 28/31 (measured); sakshi 2.5.1 → 2.5.2 in the status line.
+- **docs/doc-health.md** — every touched row refreshed; header.
+
 ## [3.2.0] - 2026-09-14 — the five 3.2.0 roadmap items: a gate that could not fail, 165 assertions for API no test reached, six sorts asked one question, lerp on SIMD, and a cycc wrong-code defect found on the way
 
 All five **[3.2.0]** roadmap rows closed (the struct-layout gate, public API reached by no test, the

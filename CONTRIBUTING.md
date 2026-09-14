@@ -21,7 +21,7 @@ Thank you for your interest in contributing to Hisab.
 # Build
 cyrius build src/main.cyr build/hisab
 
-# Run all five suites (3989 assertions). CI runs every tests/*.tcyr — running
+# Run all five suites (4429 assertions). CI runs every tests/*.tcyr — running
 # fewer than five locally skips a whole surface, not a handful of cases.
 cyrius test tests/hisab.tcyr
 cyrius test tests/foundation.tcyr
@@ -51,6 +51,15 @@ cyrius fmt src/main.cyr --check
 # Vet include dependencies
 cyrius vet src/main.cyr
 
+# The public surface is declared, not implied (3.1.0): every non-underscore top-level
+# declaration carries `public`, and this flips every module `private` in a scratch copy
+# to prove the surface complete and exact. Adding a public fn without the keyword fails
+# claim 0; a cross-module `_` helper without the marker comment fails claim 1.
+./scripts/check-public-surface.sh
+
+# No Result-returning call may sit in ARGUMENT position (it degrades to its tag, silently)
+./scripts/check-result-migration.sh
+
 # Regenerate the distlib bundle (CI fails on drift; required after any src/ or [lib] change,
 # and on ANY version bump — the bundle header is stamped from VERSION).
 # A non-zero exit here is a real failure. ⚠ It was not always: cyrius 6.5.14–6.5.16 ran a bundle
@@ -78,14 +87,14 @@ Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never 
 ## Code Style
 
 - All f64 values stored as IEEE 754 bit patterns (use `f64_from()` / `f64_to()`)
-- Heap-allocate multi-field structs: `var v = alloc(N); store64(v, x); return v;`
-- Use `#derive(accessors)` for struct field access
-- Prefix private helpers with underscore: `fn _my_helper()`
+- Heap-allocate structs through their declared layout: `var v = alloc(sizeof(T)); T_set_x(v, x); return v;` — never a hardcoded byte count or a hand-computed offset for a type that has a `struct` (every public struct's `sizeof` is pinned exactly in `tests/abuse.tcyr` since 3.2.0). Manual `alloc(N)` + `store64` layouts are for types with no struct declaration only
+- Use `#derive(accessors)` for struct field access. ⚠ In a function that also expands `f64v_*` intrinsics, never read a derived getter of an object INSIDE the value argument of a derived setter on that same object — cycc 6.6.0–6.6.4 miscompiles that shape (open filing; see `m3_mul_vec3`)
+- Prefix private helpers with underscore: `fn _my_helper()`. Public API carries `public` (`public fn`, `public struct`, `public var`, `public enum`); a `_` helper another module reaches also carries `public` plus the `# public: cross-module helper reached from …` marker comment, and owes a 4.0.0 disposition on the roadmap
 - Comment f64 hex constants with their decimal value
 - Use `elif` not `else if`
 - No negative literals: use `(0 - N)` or `f64_neg(x)`
-- Error codes: return `ERR_NONE` (0) on success, negative `ERR_*` on failure
-- Results via out-parameter pointers: `store64(out, result_value)`
+- Fallible functions return `Result<T, E>`: `return Ok(0);` on success, `return Err(HSB_ERR_*);` on failure, with `#must_use` on the declaration. Callers bind both halves — `var t, v = f(...)` — and test `is_err_result(t)`; never pass such a call straight into another function's argument list (it compiles and hands over the tag)
+- Values via out-parameter pointers: `store64(out, result_value)`
 
 ## Testing
 
@@ -95,7 +104,9 @@ Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never 
 - Edge cases in `tests/edge_cases.tcyr` (boundary conditions, error paths)
 - Abuse tests in `tests/abuse.tcyr` (hostile input: negative indices and counts, zero/huge dimensions, non-conformable operands, the designed-0 handle every capped constructor returns, degenerate geometry, and canary blocks allocated after an out-buffer so a write past the end fails a test instead of passing by luck). Not about numerical answers — those belong in the suites above
 - Define all helper functions **before** `alloc_init()` to avoid compiler issues
-- Target: test every public function with at least one happy-path and one edge case
+- Compare floats bit-exactly (`assert_eq(x, f64_from(3), …)`) unless you can say why not; a relative comparison must reject NaN. Never through `f64_to`, which truncates
+- Every new assertion is shown to discriminate: install a one-token mutant, watch it fail, restore, prove the restore
+- Target: test every public function with at least one happy-path and one edge case — and the property, not a degenerate fixture (the identity, radius 1, `a = 0`) that a wrong implementation also satisfies
 
 ## Commits
 

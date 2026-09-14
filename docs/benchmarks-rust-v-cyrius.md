@@ -1,37 +1,50 @@
 # Benchmarks: Rust vs Cyrius
 
-> hisab v2.2.0 benchmark comparison.
+> Rust column: the pre-2.0 Rust implementation, criterion v0.5, release mode, f32 via glam SIMD
+> (final run 2026-03-31, commit 745870c). It is frozen: the Rust tree lives only in pre-2.0 tags.
 >
-> - **Rust**: criterion v0.5, release mode. Final run from bench-history.csv (2026-03-31, commit 745870c). f32 via glam SIMD.
-> - **Cyrius**: cc3 4.10.3, bench.cyr. Run 2026-04-15. f64 via SSE2/x87, heap-allocated types.
-> - **Platform**: x86_64 Linux
+> Cyrius column: **hisab 3.2.0 on cycc 6.6.4**, `tests/hisab.bcyr` run 2026-09-14 on a quiet box
+> (the `2026-09-14T16:33` rows of `bench-history.csv`), f64, heap-allocated types, x86_64 Linux.
+> ⚠ This column was a **v2.2.0 / cc3 4.10.3** measurement from 2026-04-15 until 3.2.0, and it was
+> not comparable to anything: that harness charged a `clock_gettime` pair (~240 ns) to every
+> sub-microsecond row (2.10.0 fixed the instrument; 2.11.2's toolchain subtracts the floor), so
+> `ease_in_out` read 403 ns for an operation that is 6 ns. The ratios below are the honest ones.
+> Where a Rust row has no like-for-like Cyrius row (or vice versa) the cell is `--`; the two
+> `gjk_*` Rust rows are f32 box-box, matched here against `gjk_intersect_box_hit` /
+> `gjk_epa_boxes`.
 
 ## Head-to-Head
 
-| Operation | Rust (ns) | Cyrius (ns) | Ratio | Notes |
-|-----------|-----------|-------------|-------|-------|
+| Operation | Rust f32 (ns) | Cyrius f64 (ns) | Ratio | Notes |
+|-----------|---------------|-----------------|-------|-------|
 | **Transforms** | | | | |
-| slerp | 21.1 | 680 | 32x | f32 SIMD vs f64 trig+heap |
-| mat4 inverse | 20.1 | 745 | 37x | f32 SIMD vs f64 Cramer |
-| t3d_compose | -- | 661 | -- | f64 only |
-| ease_in_out | 0.60 | 403 | 672x | f32 inline vs f64 fn call |
+| slerp | 21.1 | 258 | 12x | f32 SIMD vs f64 trig + heap result |
+| mat4 inverse | 20.1 | 261 | 13x | f32 SIMD vs f64 Cramer |
+| t3d_compose | -- | 148 | -- | f64 only |
+| ease_in_out | 0.60 | 6 | 10x | inline vs a fn call; both at the measurement floor |
 | **Geometry** | | | | |
-| ray_sphere | 2.9 | 492 | 170x | f32 SIMD vs f64 |
-| ray_aabb | 5.3 | 475 | 90x | f32 slab vs f64 slab |
-| ray_triangle | 8.0 | 698 | 87x | f32 vs f64 Moller-Trumbore |
-| gjk_intersect | 28.9 | -- | -- | f32 only |
-| gjk_epa | 155.7 | -- | -- | f32 only |
+| ray_sphere | 2.9 | 61 | 21x | f32 SIMD vs f64 (scale-free guards since 2.10.2) |
+| ray_aabb | 5.3 | 46 | 9x | f32 slab vs f64 slab |
+| ray_triangle | 8.0 | 149 | 19x | f32 vs f64 Moller-Trumbore |
+| gjk_intersect (box hit) | 28.9 | 996 | 34x | ⚠ not the same algorithm: the Cyrius one closed 134 missed interior overlaps in 2.9.0 at +57–62% on the no-hit path |
+| gjk_epa (boxes) | 155.7 | 13,298 | 85x | ⚠ the Cyrius EPA is measured against an exact reference over 862 configurations (2.8.3); the Rust one was not |
 | **Calculus** | | | | |
-| derivative | 1.2 | 459 | 383x | fncall overhead |
-| simpson_100 | 142.1 | 5,000 | 35x | fncall1 per sample |
+| derivative | 1.2 | 94 | 78x | fncall overhead per evaluation |
+| simpson_100 | 142.1 | 4,978 | 35x | `fncall1` per sample |
 | gauss_legendre_5 | 3.9 | -- | -- | |
 | **Numerical** | | | | |
-| gcd | -- | 433 | -- | integer |
-| is_prime(1M+3) | -- | 1,000 | -- | Miller-Rabin |
-| cx_mul | -- | 426 | -- | f64 |
+| gcd(1071, 462) | -- | 27 | -- | integer |
+| is_prime(1,000,003) | -- | 19,588 | -- | Miller-Rabin; the Rust set has no like row |
+| cx_mul | -- | 23 | -- | f64 |
 | **Color** | | | | |
-| srgb_to_linear | -- | 484 | -- | f64 pow |
-| tonemap_reinhard | -- | 421 | -- | f64 |
+| srgb_to_linear | -- | 101 | -- | f64 pow |
+| tonemap_reinhard | -- | 23 | -- | f64 |
+
+The gap is dominated by three things the Cyrius side pays by design: f64 rather than f32 lanes, a
+heap allocation for every returned vector/matrix/quaternion (a bump allocator that never frees), and
+a real `call` for every function pointer the calculus routines invoke per sample. The 2.11.2
+instrument change (`ease_in_out` 1,407 → 7 ns) is why no ratio in the pre-3.2.0 version of this
+table can be compared with these.
 
 ## Full Rust Benchmark Set (90 benchmarks)
 

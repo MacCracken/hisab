@@ -4,13 +4,13 @@
 
 ```bash
 # All test suites
-cyrius test tests/hisab.tcyr        # 550 smoke/integration tests
-cyrius test tests/foundation.tcyr   # 413 exhaustive foundation type tests
-cyrius test tests/modules.tcyr      # 2098 per-module tests
-cyrius test tests/edge_cases.tcyr   # 239 edge case + boundary tests
-cyrius test tests/abuse.tcyr        # 914 hostile-input tests
+cyrius test tests/hisab.tcyr        # 585 smoke/integration tests
+cyrius test tests/foundation.tcyr   # 429 exhaustive foundation type tests
+cyrius test tests/modules.tcyr      # 2251 per-module tests
+cyrius test tests/edge_cases.tcyr   # 260 edge case + boundary tests
+cyrius test tests/abuse.tcyr        # 904 hostile-input tests
 
-# Benchmarks (74 operations)
+# Benchmarks (80 operations)
 cyrius bench tests/hisab.bcyr
 
 # Fuzz self-test — `cyrius fuzz` walks tests/ as of cyrius 6.5.6; before that it
@@ -41,11 +41,11 @@ document was internally inconsistent and externally wrong at the same time.
 total**, so neither half can drift alone; verified fail-closed against a stale
 row, a total that does not sum, and a deleted row.
 
-## Benchmarks (74 operations)
+## Benchmarks (80 operations)
 
 | Category | Benchmarks |
 |----------|-----------|
-| Vec/Quat/Mat | vec3_add, vec3_cross, vec3_normalize, quat_mul, quat_slerp, quat_rotate_vec3, m4_mul, m4_inverse, m4_transform_point, t3d_compose |
+| Vec/Quat/Mat | vec3_add, vec3_cross, vec3_normalize, vec3_lerp, vec2_lerp (3.2.0 — the SIMD pair hybrid, registered last), quat_mul, quat_slerp, quat_rotate_vec3, m4_mul, m4_inverse, m4_transform_point, t3d_compose |
 | SIMD batches | vec3_dot_x64, vec4_dot_x64, m4_mul_x16, m4_transform_x64 (amplified — single-op timings sit below the harness floor) |
 | Geometry | ray_sphere, ray_aabb, ray_aabb_diag, ray_obb, ray_triangle, ray_capsule, ray_capsule_diag |
 | Scale covariance (not a benchmark — a test shape) | ⚠ 2.10.2's four threshold repairs are all asserted by *scale covariance*: the same scene in different units must give the same answer. A single-scale fixture cannot see a bad threshold however many samples it takes, and every other geometry fixture in the suite is single-scale |
@@ -54,11 +54,12 @@ row, a total that does not sum, and a deleted row.
 | Calculus | calc_derivative, calc_integral_simpson |
 | Numerical | num_gcd, num_is_prime, cx_mul |
 | Tensor | einsum_matmul_2x2, einsum_trace_2x2 |
-| Autodiff | grad_fwd_16, grad_rev_16 — the SAME 16-input gradient by n forward passes and by one reverse sweep. ⚠ The forward row computes all 16 partials; timing one dual pass against a full sweep would flatter reverse mode 16x for free |
+| Autodiff | grad_fwd_16, grad_rev_16 — the SAME 16-input gradient by n forward passes and by one reverse sweep. ⚠ The forward row computes all 16 partials; timing one dual pass against a full sweep would flatter reverse mode 16x for free. jac_rev_shared_256, jac_rev_pertape_256 — a 256-residual Jacobian through one shared tape vs one tape per residual (the `ad_grad` O(m²) trap, 2.20.0); ⚠ registered 19th/20th they shifted the heap under `kdtree_radius_4k` by 31%, which is why new rows go LAST |
 | Hull / mesh | convex_hull_2d_2k, halfedge_2k_tris, delaunay_2d_400, delaunay_2d_circle_150, triangulate_600gon, triangulate_comb_600, triangulate_hex_6 |
 | Spatial indices | bvh_degenerate_4k, bvh_scatter_4k, bvh_query_ray_200x4k, kdtree_build_4k, kdtree_build_octave_512, kdtree_radius_4k, spatial_hash_query_2k |
 | Narrowphase | gjk_epa_boxes, gjk_epa_spheres, gjk_epa_sphere_box, gjk_epa_3d_cyl_box, gjk_intersect_box_hit, gjk_intersect_box_miss, gjk_intersect_sph_miss, gjk_intersect_tangent, mpr_intersect_box_hit, mpr_intersect_box_miss, mpr_intersect_tangent, mpr_penetration_boxes |
 | Decomposition | svd_golub_kahan_12, eigen_qr_12 |
+| Conformal GA (2.24.0) | cga_point_product, cga_norm_sq_k5, cga_norm_sq_k32, cga_first_product_cold — the last runs at n = 1 because a row that warms up cannot see the lazy table build, and its cold-entry guard exits 1 if the table is already built |
 | Transforms | num_dct_1024, num_dst_1024, num_dct_1023, num_dst_1023 |
 | Other | ease_in_out, perlin_2d |
 
@@ -135,17 +136,17 @@ by re-reading the rationale beside them.
 ⚠ Related and already measured: the 2026-08-11 audit found **836 of 3510 assertions (23.8%) compare
 through `f64_to`, which TRUNCATES**. That is the same hazard at scale.
 
-### Approximate equality
+### Approximate equality — only where exactness is genuinely untrue
 
 ```cyrius
-# Check f64 values within tolerance
-var diff = f64_abs(f64_sub(actual, expected));
-assert(f64_lt(diff, tolerance) == 1, "message");
-
-# Or multiply by 1000 and round for integer comparison
-var result_1000 = f64_to(f64_round(f64_mul(value, f64_from(1000))));
-assert_eq(result_1000, 1414, "sqrt2 * 1000");
+# Every suite carries an assert_f64_eq (or _ab_f64_eq) helper: a stated tolerance,
+# a message, and a NaN arm — a bare `f64_lt(diff, tol)` is FALSE for NaN and reads
+# as a pass, which is how 2.17.0's "0 of 999 lost" figure was wrong.
+assert_f64_eq(actual, expected, tolerance, "message (say what sets the tolerance)");
 ```
+
+⚠ The old "multiply by 1000, round, compare as an integer" idiom is the truncation hazard from the
+section above in a different coat; use it only when the rounding itself is the property under test.
 
 ### Function pointer tests
 
@@ -157,16 +158,21 @@ fn _test_df(x) { return f64_mul(F64_TWO, x); }
 alloc_init();
 
 var out = alloc(8);
-num_newton(&_test_x2, &_test_df, F64_ONE, EPSILON_F64, 100, out);
+# Bind BOTH halves of the Result (3.0.0). A bare `num_newton(...)` trips #must_use;
+# `var r = num_newton(...)` is a compile error; and passing the call straight into
+# assert_eq's argument list compiles and compares the TAG (Ok = 0), testing nothing.
+var nt, nv = num_newton(&_test_x2, &_test_df, F64_ONE, EPSILON_F64, 100, out);
+assert_eq(is_err_result(nt), 0, "newton converged");
 ```
 
 ### Mathematical property tests
 
 ```cyrius
-# Euler's identity: |e^(iπ) + 1| ≈ 0
+# Euler's identity: |e^(iπ) + 1| ≈ 0. The tolerance is the claim: a bound of 1
+# here would pass for e^(iπ) = 0, so it is 1e-10 (what cx_exp's polynomial earns).
 var eipi = cx_exp(cx_new(0, F64_PI));
 var euler = cx_add(eipi, cx_one());
-assert(f64_lt(cx_abs(euler), f64_from(1)) == 1, "euler identity");
+assert(f64_lt(cx_abs(euler), f64_div(F64_ONE, f64_from(10000000000))) == 1, "euler identity");
 
 # Quaternion rotation preserves length
 var len_before = hvec3_length(v);
@@ -177,4 +183,4 @@ var len_after = hvec3_length(rotated);
 
 ## Performance Comparison
 
-See [docs/benchmarks-rust-v-cyrius.md](../benchmarks-rust-v-cyrius.md) for Rust vs Cyrius benchmark comparison with 90 Rust + 21 Cyrius data points.
+See [docs/benchmarks-rust-v-cyrius.md](../benchmarks-rust-v-cyrius.md) for the Rust-era vs Cyrius comparison: 90 Rust rows (frozen, pre-2.0 tags) against the matching rows of the current harness, refreshed 3.2.0.

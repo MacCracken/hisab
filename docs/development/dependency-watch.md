@@ -248,7 +248,7 @@ Tracked dependency version constraints and upgrade paths.
 **Watching upstream:**
 - **RISC-V rv64** — the 4th platform peer. This entry read "5.7.11" for four minors; it has slipped repeatedly since and is now re-homed to **v6.7.x / v6.8.x** (upstream `docs/development/roadmap_6.md:176`, theme set 2026-07-07). Not landed as of 6.5.18, and the cyrius CHANGELOG carries no rv64 mention newer than its 6.2.0 section. Watched, not blocking: hisab is pure math with no target-specific code, so the only expected surface is another `syscalls_*` platform variant vendored for snapshot parity.
 
-## Cyrius stdlib modules (15 declared, 31 vendored)
+## Cyrius stdlib modules (16 declared, 31 vendored)
 
 | Module | Purpose | Risk |
 |--------|---------|------|
@@ -259,16 +259,17 @@ Tracked dependency version constraints and upgrade paths.
 | math | f64 inclusive cmp (`f64_le`/`f64_ge`), clamp/lerp/min/max/sign/trunc, exp/ln polyfills, gcd/lcm | Stable |
 | ganita | 6.2.x math umbrella: transcendentals (sinh, pow, atan2, …) + dense matrix storage + decompositions (LU, QR, SVD, eigen). Subsumes the former `matrix`/`linalg` | New in 6.2.x — replaces `matrix`+`linalg` |
 | tagged | Option/Result types | Stable |
+| result | `Result<T, E>` VALUE form (`Ok`/`Err`/`is_err_result`, the v6.6.0 form); every fallible hisab entry point returns it since 3.0.0 | Stable — hisab's error contract rides on it |
 | fnptr | Function pointer calls | Stable |
 | syscalls, io, args | System interface | Stable |
 | assert, bench | Test/benchmark framework | Stable |
 | callback | Higher-order functions | Stable |
 
-The rows above are exactly the 15 names in `cyrius.cyml [deps] stdlib` (three rows group two or three names each). They expand to **27** files on disk — `syscalls` to 7 platform variants, `alloc` and `args` to 4 each — and `lib/` holds **30**: those 27 plus the transitive `result.cyr` / `atomic.cyr` and the vendored `sakshi.cyr`. `cyrius lib sync` vendors the 27; the other three are not in the declared subset and it does not touch them.
+The rows above are exactly the 16 names in `cyrius.cyml [deps] stdlib` (three rows group two or three names each). They expand to **28** files on disk — `syscalls` to 7 platform variants, `alloc` and `args` to 4 each — and `lib/` holds **31**: those 28 plus the transitive `atomic.cyr` / `boxed.cyr` and the vendored `sakshi.cyr` (measured 2026-09-14: `cyrius lib sync` reports "copied 28 .cyr files"; the other three are not in the declared subset and it does not touch them).
 
 ## sakshi (first-party dependency)
 
-**Status:** `sakshi` **2.5.1** via git, modules path `dist/sakshi.cyr` (bumped 2.4.11 → 2.5.1 in v2.11.3; commit-pinned in `cyrius.lock`, and byte-identical to what cyrius 6.6.1 folds into its own `lib/` — same SHA256, 76,277 B, so the vendored copy and the pinned dep agree rather than one shadowing the other). Its shipped surface still links only `fnptr` + `atomic`.
+**Status:** `sakshi` **2.5.2** via git, modules path `dist/sakshi.cyr` (2.5.1 → 2.5.2 in v3.0.1, a one-header-line refold; 2.4.11 → 2.5.1 in v2.11.3; commit-pinned in `cyrius.lock`, and byte-identical to what cyrius 6.6.1 folds into its own `lib/` — same SHA256, 76,277 B, so the vendored copy and the pinned dep agree rather than one shadowing the other). Its shipped surface still links only `fnptr` + `atomic`.
 
 **2.5.0 / 2.5.1 change no public surface.** Diffing the exported `fn` list across the bump shows
 only private helpers moving: `_sk_bin_read_hdr`, `_sk_bin_write_hdr`, `_sk_memset` and `_sk_ring_put`

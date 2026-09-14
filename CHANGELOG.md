@@ -2,6 +2,243 @@
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-09-14 — the five 3.2.0 roadmap items: a gate that could not fail, 165 assertions for API no test reached, six sorts asked one question, lerp on SIMD, and a cycc wrong-code defect found on the way
+
+All five **[3.2.0]** roadmap rows closed (the struct-layout gate, public API reached by no test, the
+Boundary-with-Abaco table, the `lerp` SIMD hybrid, the ordering-routine consolidation), each measured
+before it was sized and each new assertion shown to discriminate. Suites **4214 → 4429** (hisab 585,
+foundation 429, modules 2251, edge_cases 260, abuse 904), **0 failures, and not one pre-existing
+output line changed**. Benchmarks 78 → 80 rows. cycc 6.6.4 unchanged.
+
+⛔ **THE NATURAL FORM OF ONE REPAIR IS WRONG CODE ON EVERY 6.6.x COMPILER, AND IT IS FILED.**
+Rewriting `m3_mul_vec3` onto `sizeof(HVec3)` + the derived accessors — `HVec3_set_z(r,
+f64_add(HVec3_z(r), …))` between two `f64v_*` calls — makes cycc's register picker rewrite the
+third intrinsic's destination-slot store into a register move while the inline loop still reads the
+slot (`-0xe8(%rbp)` read once, written by nothing). Inside hisab it SIGSEGVs; in a 60-line program it
+exits 0 returning `(1, 4, 3)` where `(4, 5, 3)` is right — the crash is the lucky half. Each half
+alone (setter fed by a raw `load64`, or `store64` fed by the getter) is correct; with
+`CYRIUS_REGALLOC_PICKER_CAP=0` the whole thing is correct. **Placement: unpinned within 6.6.x** — the
+self-proving repro exits 1 on 6.6.0, 6.6.1, 6.6.2, 6.6.3 and 6.6.4 alike, each from a scratch dir
+pinned to that version, so the 6.6.2 `_SIMD_RESERVE` repair never covered this shape. Filed in the
+cyrius repo (`2026-09-14-hisab-simd-dst-slot-regalloc-picker.md` + repro) and recorded here as
+`docs/development/issues/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md`. `m3_mul_vec3` ships
+with its z tail accumulated in a local and stored through the setter ONCE (bit-identical values, same
+three ops in the same order); every suite binary and the bench harness were audited with the same
+objdump check: **0 unwritten destination slots** in the shipped tree.
+
+### Added
+- **tests/abuse.tcyr — the struct-layout contract has a gate.** Every one of the **22** `public struct`
+  declarations in `src/` is pinned to its exact byte count with `assert_eq(sizeof(T), N)`; the numbers
+  were MEASURED by building a probe that prints each `sizeof`, not derived by counting fields. Six had
+  no assertion at all (`HVec2`, `HVec3`, `HVec4`, `AdTape`, `GeoJet`, `HalfEdgeMesh`); `geo_diff.cyr`
+  joins the suite's include list so `GeoJet` can be named. Verified to fire: one field added to
+  `HVec3` fails the new line (`got 32, expected 24`) while the old `> 0` / `% 8` forms it replaces
+  stayed green — and so did **every other assertion in the suite**, 905 of 906. ⛔ Those old forms —
+  32 assertions of `sizeof(T) > 0` and `sizeof(T) % 8 == 0` — are REMOVED, and the block's own
+  comment had claimed since 2.9.0 that each was "AND pinned to the exact current value": there was
+  not one exact `sizeof` assertion in the tree. **A gate that cannot fail is not a gate.** abuse
+  **914 → 904** (−32 vacuous, +22 exact).
+- **tests/foundation.tcyr** — `m3_mul_vec3` against a matrix whose THIRD column is not zero, all three
+  components bit-exact. The only prior test multiplied by the identity and read only z, so a product
+  that drops the third column's contribution to x and y passed it — which is exactly what the cycc
+  defect above produces. Mutation-proven: with the accessor form installed the new pair fails
+  `(got 1, expected 4)` / `(got 4, expected 5)` while all 550 of `hisab.tcyr` pass.
+- **tests — public API reached by no test** (roadmap row of that name): 165 assertions (modules
+  2098 → 2242, edge_cases 239 → 260) for the public items the 3.1.0 scan found reached by no test,
+  each against an expected value derived independently of the implementation: `ad_neg` / `ad_cos` /
+  `ad_ln` bit-for-bit against their forward-mode twins plus a chained `d/dx ln(cos x) = -tan x`;
+  `ad_ln`'s domain guard asked directly at −5, 0, NaN (sentinel (0, 0), never a NaN value beside a
+  confident derivative) with DBL_MIN and 1e-13 as the in-domain controls; `csr_new` holding an
+  EXPLICIT zero that `csr_from_dense` cannot produce, through spmv, transpose (nnz kept) and add
+  (0 + 0 dropped); `hodge_star_2form_4d` against a hand derivation of `(*F)_{mn} = ½ ε_{mnrs} F^{rs}`
+  on all six basis 2-forms, `** = −1`, the `sign` multiplier and the (E, B) → (B, −E) duality;
+  `bch_3rd_order` on su(2) as 2×2 complex matrices (`[X(u), X(v)] = X(u × v)` checked first) against
+  the hand-written vector series at 1e-15 and against `su2_log(su2_exp(x) su2_exp(y))` at a tolerance
+  of 2e-8 derived from the omitted 4th-order term (|x|²|y|²/24 = 1.8e-8; measured 3.1e-9), with
+  `bch_2nd_order` asserted to MISS by > 1e-6 as the control that the tolerance discriminates; all six
+  `EulerOrder` members bit-for-bit against the explicit triple `hquat_mul` AND against six
+  hand-derived images of (1,2,3) at 90° each, pairwise distinct; the seven `GEO_JET_*` tags read off
+  every jet constructor, the typed accessors refusing the wrong kind, and hand-derived t / dt/dr /
+  dt/d(dist) / face on one ray; `MAT3_BYTES`, `MAT4_BYTES`, `CGA_NUM_BLADES` read by the copies and
+  the pseudoscalar they size. **16 one-token mutants installed and restored under grep proof, 16
+  killed** (3 of them — a capsule jet tagged OBB, `csr_new` dropping nnz, `MAT3_BYTES = 64` —
+  SIGSEGV earlier existing blocks in the full suite, so they were re-run against the new block
+  alone, which fails them on its own assertions). No arithmetic defect was found in the six
+  functions: every probed value matched its derivation.
+- **tests/hisab.tcyr — tie order is pinned** (`3.2.0 tie order`): `diag(2, 2, 4)` through
+  `eigen_symmetric`, `eigen_qr` and `svd_golub_kahan` gives columns / U columns / Vt rows
+  `(e3, e2, e1)`; a stable sort or a `>=` max scan gives `(e3, e1, e2)`, and that one-token mutant
+  fails exactly the 8 new tie assertions and nothing else. ⛔ **A second mutant survived all 573
+  existing assertions and became a fixture**: with `|.|` applied to the running max but not to the
+  scanned candidate, `diag(-5, 1, 3)` — the only signed fixture — is right by accident because −5 is
+  inherited in slot 0, never found; `diag(1, -5, 3)` returns `3, -5, 1` under that mutant and is now
+  asserted through both routines. ⛔ **`num_factorize`'s order had never been asserted, and a
+  fixture of small primes cannot see the sort**: trial division to 37 emits ascending by
+  construction, so `84` is ordered before the sort runs and deleting the sort call passed it. Only
+  the Pollard-rho phase emits out of order (`41 * 43` comes back `43, 41` raw), so the pins are
+  `1763` (insertion regime) and `2^9 * 41·43·47·53·59·61·67·71·73` (18 factors, quicksort regime);
+  both the deleted call and an inverted comparator fail exactly those. 7 mutants installed, 7
+  killed (one only after the new fixture), each install and restore proven by grep and `cmp`.
+- **tests/foundation.tcyr — lerp bit-exactness sweep**: 200 (a, b, t) triples × 5 lanes (1000 lanes:
+  480 NaN passthrough with random payloads in both operands, 84 ±Inf, 400 subnormal; t covers 0, 1,
+  0.5, −1, 2, the smallest subnormal, 2^1023, NaN, +Inf, random) comparing `hvec3_lerp` /
+  `hvec2_lerp` against the inline scalar expression, raw-word equal, plus exact class-count pins.
+  ⚠ The first draft's class counts were GUESSED with a `[measured]` marker before anything ran (246 /
+  163 / 127 against a real 100 / 174 / 400); the NaN-operand class was added and the counts pinned
+  from the run.
+- **tests/hisab.bcyr** — `vec3_lerp` and `vec2_lerp` rows, registered LAST (78 → 80).
+- **docs/development/issues/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md** + a self-proving
+  repro under `issues/repros/`; the upstream copy is filed in the cyrius repo.
+
+### Changed
+- **vec2 — `hvec2_new`** constructs through `sizeof(HVec2)` and the derived setters, the way
+  `hvec3_new` always has; it was `alloc(16)` + `store64(v + 8, y)`, the exact shape the contract
+  forbids, in the module every consumer touches first. ⚠ **Measured cost, stated rather than hidden**:
+  the derived setter expands to 18 more instructions than the raw store (35 → 53 in the function),
+  and a 64-call batch reads **857 → 905 ns avg (+5.6%)**, min 770 → 820 ns, slower in 3 of 3
+  interleaved pairs (a second 3-pair session read +6.8%), ≈ +0.8 ns per construction, box load
+  1.2–1.9 from an unrelated process throughout. A tree-wide grep for the shape — `alloc(<literal>)`
+  + hand-offset `store64` for a type that HAS a struct — found **3 sites in 115 literal allocs**:
+  this one, `m3_mul_vec3` and `m4_mul_vec4` (the other 112 are manual layouts for types with no
+  struct, which the contract permits). **The row named one site.**
+- **mat3 — `m3_mul_vec3`** allocates `sizeof(HVec3)` and stores its z tail through `HVec3_set_z` once,
+  from a local accumulator (see the cycc defect above); **mat4 — `m4_mul_vec4`** allocates
+  `sizeof(HVec4)` (its machine code is byte-identical, the constant folds). `m3_mul_vec3` is
+  **2.517 → 2.353 µs per 64 (−6.5%)**, faster in 3 of 3 pairs (−5.4% in a second session), fewer
+  memory round trips on z; values bit-identical. Measured with a scratch harness: there is no
+  tracked row for `hvec2_new` or `m3_mul_vec3`, and none is added because a new row shifts the heap
+  under every row after it (2.20.0).
+- **Ordering routines — consolidated per routine, results byte-identical** (roadmap row
+  *Consolidate onto stdlib `vec_sort_by` / `vec_select_nth`*, closed). The six hand-written
+  orderings were re-derived on the 3.1.1 tree — `collision_core.cyr:542`, `spatial.cyr:114`,
+  `num_ext.cyr:310`, `linalg_ext.cyr:1071`, `linalg_precision.cyr:1219`, `:1753` (the roadmap's
+  `collision_core.cyr:530` and `num_ext.cyr:309` had drifted again, by 12 and 1) — and each was
+  asked ONE question: does the stdlib routine reproduce the exact output INCLUDING ties?
+  - **`num_factorize`** (`src/num_ext.cyr`): insertion sort → stdlib `vec_sort_by` with an i64
+    comparator. Provably identical: the elements are integer VALUES, so equal factors are
+    indistinguishable and every correct sort yields the same vec.
+  - **`eigen_symmetric`, `eigen_qr`, `svd_golub_kahan`**: three near-identical descending
+    selection sorts → ONE helper, `_lext_sort_desc` (`src/linalg_ext.cyr`, the module
+    `linalg_precision` may call), carrying eigenvector columns / U columns / Vt rows with the
+    swap. **Not** the stdlib: equal eigenvalues carry distinct eigenvectors, so tie order is
+    observable, and introsort permutes ties differently from the selection sort every consumer
+    has seen. The helper is the old loop verbatim (first max, strict `f64_gt`, swap
+    `i <-> max_idx`), so the suites print byte-identical output.
+  - **`_col_sort_indices_by_xy`** (heapsort) and **`_kd_select_median`** (three-way quickselect):
+    **left**, with the reason written beside each. A scratch probe on 6.6.4 ran a capturing
+    closure over `points` through `vec_sort_by` — so the closure objection this repo carried for
+    four releases is dead — and showed the two sorts disagree on coincident points: 8 of 8 slots at
+    n = 8, 35 of 40 at n = 40, and the monotone chain then returns hull `(0 5 6 3)` where the
+    shipped code returns `(4 1 2 7)`. `vec_select_nth` also partitions a whole vec while the k-d
+    build works on sub-ranges of one shared vec (an allocation per node under a never-freeing
+    allocator) and its Hoare partition places tied axis values by a different rule.
+  - `src/autodiff.cyr` and `src/collision_core.cyr` no longer claim a closure "still blocks
+    `vec_sort_by`"; `check-public-surface.sh` passes with the new cross-module helper.
+- **vec3 / vec2 — `hvec3_lerp` / `hvec2_lerp`** moved onto the n=2-pair + scalar-z `f64v_*` hybrid
+  `hvec3_add` already uses (`hvec2_lerp` is exactly one pair, no tail). The lane sequence is
+  `f64v_sub` → `f64v_scale` → `f64v_add`, per lane `a + (b − a) * t` in the scalar form's operation
+  order, so the result is **bit-identical** to the scalar expression. ⚠ NOT `f64v_axpy` /
+  `f64v_fmadd`: both are `mulpd + addpd` on x86 but a FUSED `fmla` on aarch64, which rounds once
+  where the scalar form rounds twice. On x86 the sweep cannot tell the axpy form apart (that mutant
+  SURVIVES — equivalent on this backend), so the no-fusion rule is enforced by the source comment,
+  not by a test that runs here. Six other one-token mutants killed, one (`n = 1` for `n = 2`)
+  equivalent because the packed loop steps a full pair per iteration. The grep found 8
+  lerp-shaped functions; only these two have vector lanes to pack (`t3d_lerp` composes
+  `hvec3_lerp` and inherits the win).
+- **docs/development/roadmap.md** — the Boundary-with-Abaco table rebuilt from the 3.1.1 `^public
+  fn` surface and a measured grep of abaco + the ten live consumers (7 rows / 3 columns → 13 rows /
+  4 columns with a measured "who calls it" column): rows for `expr_eval` (domain changed in 2.11.2:
+  `(-2)^3` returned NaN for hisab's entire history and returns a number now), autodiff (forward
+  duals + the reverse tape), the six `geo_diff` jets, CGA, and Lie. ⚠ **abaco's own README says it
+  is a sibling, not a consumer**, contradicting the planned-consumer row; the Boundary section now
+  says that row is a plan on hisab's side only. ⚠ The grep's first two runs reported 0 hisab calls
+  in all 11 repos — `grep -w` needs a non-word char after the match and `num_fft(` is followed by
+  `data`; then the box's grep is ugrep and an unescaped `(` was a group-open with the parse error
+  hidden by `2>/dev/null`. The corrected probe recovers the known `svara → num_fft` call. **Check the
+  probe before believing the probe**, again. All five `[3.2.0]` sections removed.
+- **lie** — `su2_to_rotation_matrix` sized its result with a bare `alloc(72)`; it is a Mat3 and now
+  uses `MAT3_BYTES` (the second hand-sized site was `tests/hisab.fcyr`'s `m4_inverse` target, now
+  `MAT4_BYTES`). `src/color.cyr`'s `alloc(72)` is nine SH coefficients, not a matrix, and stays.
+  lie.cyr now requires mat3.cyr; `tests/hisab.tcyr` and `tests/edge_cases.tcyr` include it.
+- The *Public API reached by no test* row's list corrected by measurement (comments and strings
+  stripped, all of src/, tests/, examples/, dist/): `hisab_is_err` is NOT untested (7 assertions in
+  foundation/abuse); `csr_new` is reached by 3 intra-src sites, not "nothing"; `EULER_ZYX` is the
+  only Euler member with ZERO references anywhere (it is the dispatch fallthrough); and
+  `EPSILON_F32` — on no list — is a public constant referenced by nothing at all (already
+  dispositioned "retire" in the 4.0.0 surface table, so no test pins it).
+- **dist/hisab.cyr** — regenerated; **README.md**, **docs/guides/testing.md**, **CLAUDE.md** counts
+  re-summed from the integrated run.
+
+### Fixed
+- **linalg_ext** — `csr_from_dense`'s header still said "drops entries with |value| < EPSILON_F64"
+  (the roadmap row repeated it as "|v| > 1e-12"); the drop has been structural (`!= 0.0`) since
+  2.14.0. Corrected, and the explicit-zero role of `csr_new` documented beside it.
+- **README.md** — `modules.tcyr` count had read 2086 (3.1.0's figure) through 3.1.1, where it was
+  2098.
+
+### Performance
+Measured on a QUIET box (load 0.2–1.2, the bench itself; the first quiet window of the session),
+against the 3.1.0 rows of 2026-09-13 — not the 3.1.1 rows, which 3.1.1 recorded as a contaminated
+sample. **78 common rows: median +0.71%, mean +1.82%, 1 row past 10%.** The reproducible "before" for
+the two new rows is the 3.2.0 `tests/hisab.bcyr` built against a HEAD (3.1.1) worktree, interleaved
+head/tree × 3:
+- `vec3_lerp` **27–28 → 22 ns (−18.5% on medians)**, `vec2_lerp` **24–27 → 17–18 ns (−25%)**;
+  controls `vec3_add` 16–17 → 16, `vec3_cross` 27–28 → 27. The implementer's load-2.2–4.5 scratch
+  figures (29 → 24, 25 → 19) had the right direction and size; these replace them because they can
+  be re-derived from the tree.
+- **Sorts: no change claimed.** `eigen_qr_12` and `svd_golub_kahan_12` read **+5.5% / +8.5%** in the
+  first three tree rounds and **+0.3% / +1.0%** in the next three on the SAME binary minutes later,
+  and a build with only the sort consolidation reverted reads +1.4% / +0.2% — all inside that
+  same-binary cross-session band, which is 5–7% on these two rows even when each session's own
+  spread is under 1%. ⚠ **A same-session spread understates the spread**; the 2.19.0 lesson again.
+- ⚠ **`m4_mul` +6.7% (A/B) / +13.6% (vs the 3.1.0 row: 118 → 134 ns), `m4_mul_x16` +5–8%, source
+  UNTOUCHED** — consistent across both sessions and present in the minus-sorts build too, so it is
+  not the sorts; `hvec2_new` grew by 18 instructions and `m3_mul_vec3` changed shape ahead of it in
+  the binary, which moves every function after them (2.24.0 measured +1.9% from layout alone;
+  `m4_mul_vec4`'s own machine code is byte-identical and the function moved 0x35 bytes). Attributed
+  to layout on that evidence, not proven at the instruction level: the bench binary carries no symbol
+  table to diff `m4_mul`'s bytes. Stated rather than hidden; `quat_rotate_vec3` 38 → 41 and
+  `num_gcd` 25 → 27 are the same shape.
+- `hvec2_new` **+5.6%** and `m3_mul_vec3` **−6.5%** per the Changed entries above (scratch harness,
+  load 1.2–1.9).
+
+### Pre-tag audit — 6 reviewer lenses, 3 skeptics per finding: 19 findings, 14 confirmed, 5 refuted
+Every confirmed finding is repaired above or here; the refuted five are recorded in the review log.
+- ⛔ **The lerp sweep could not see operand order** (medium, found by two lenses independently): its
+  class schedule never puts two DIFFERENT NaN payloads on one packed lane (`ax` is NaN at i%5==4,
+  `bx` at i%5==1, t = NaN only at i%5==2 beside the scalar z tail), so a t-first packed multiply and a
+  swapped final add both survived **421/421** — while the comment beside it claimed the NaN class
+  "makes the payload rule observable". Both mutants are real (packed x returns payload 0x01 for 0xFF,
+  0x22 for 0x11). Repaired with a directed block, `_lp_pair`, four two-NaN cases on the packed x lane
+  of both functions against the scalar oracle: mutant A now fails 1, mutant B fails 2, restores
+  proven by grep. foundation 421 → **429**. **A sweep is only as good as the lanes it draws.**
+- `csr_from_dense`'s corrected header dated the structural drop to 2.14.0; the 2.14.0 tag still
+  ships the `EPSILON_F64` guard — it is **2.15.0**. Corrected against the tags.
+- `tests/modules.tcyr`: the capsule-jet branch assertion was `!= GEO_CAP_END_CAP`, which admits
+  START_CAP, SPHERE and a miss; now `== GEO_CAP_CYLINDER`, and a jet mis-tagging the barrel as
+  START_CAP fails it (`got 1, expected 0`) where the old form passed. The `su2_to_rotation_matrix`
+  pin used the identity element, which a body returning `m3_identity()` also satisfies, and its
+  comment claimed to see an alloc change that is the same number (72); now a half-turn about x
+  whose last slot reads −1, killed by the identity mutant (20 failures).
+- `hvec2_lerp` had reintroduced `alloc(16)` in the release whose gate retires that shape (the lerp
+  and layout items were implemented in parallel); now `sizeof(HVec2)`, with the comment noting the
+  n=2 lane count encodes the same layout.
+- `linalg_precision.cyr`'s `Requires:` header did not name `linalg_ext.cyr`, its new dependency —
+  a reader following the header builds a binary that traps at `ud2` when the sort is reached
+  (the toolchain calls it OK with a warning). Named now.
+- Four comments said something the code beside them did not: `m3_mul_vec3`'s said the repro "exits
+  0 with (1,4,3)" (it exits 1 by its own check) and stated the workaround rule as "one derived
+  accessor per object per intrinsic-bearing function" while the function reads three getters on `v`
+  (the hazard is a getter INSIDE a setter's value argument on the SAME object — restated);
+  `_col_sort_indices_by_xy`'s "the chain keeps the LAST duplicate" did not produce the hull indices
+  it reports (the anchor keeps the FIRST); its cross-reference sent the reader to `_col_xy_greater`,
+  whose header still claimed the `EPSILON_F64` band that 2.15.0 removed.
+- Roadmap: the disposition table said 24 cross-module helpers with no row for the 25th its own
+  comment points at (`_lext_sort_desc`, now a promote-rename row); and it said the cycc filing was
+  "not yet in the cyrius repo" after it had been filed.
+- The Performance section cited a scratch bench that is not in the tree, at a load the repo's own
+  rule declines — replaced by the HEAD-worktree procedure above and rows in `bench-history.csv`.
+
 ## [3.1.1] - 2026-09-14 — cycc 6.6.4: all four 2026-09-13 filings repaired upstream, the gate inverted on its own
 
 Toolchain **6.6.3 → 6.6.4**. sakshi **2.5.2** and ganita **1.2.5** are already the latest tags

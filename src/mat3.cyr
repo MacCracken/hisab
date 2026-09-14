@@ -81,17 +81,42 @@ public fn m3_mul(a, b) {
 }
 
 # SIMD: result = Σ_k v[k]·M_col_k (xy via n=2, z scalar tail).
+#
+# The z tail accumulates in a LOCAL and is stored through the derived setter
+# ONCE, at the end. The natural form -- `HVec3_set_z(r, f64_add(HVec3_z(r), ..))`
+# between the f64v_* calls, i.e. a derived setter whose value argument reads the
+# same object through the derived getter -- is WRONG CODE on cycc 6.6.4: the
+# register picker rewrites the third `f64v_scale`'s destination-slot store into
+# a register move, the inline loop still reads the frame slot, and the packed
+# store goes through garbage. In this tree it SIGSEGVs; a standalone program
+# of the same shape runs to completion and RETURNS (1,4,3) where (4,5,3) is
+# right, so the crash is the lucky half. `CYRIUS_REGALLOC_PICKER_CAP=0` makes
+# both correct, which isolates it to the picker. It is not a 6.6.4 regression:
+# the repro is wrong on 6.6.0 through 6.6.4 alike, each from a dir pinned to
+# that version. Filed upstream and recorded at
+# docs/development/issues/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md
+# with a repro that proves itself: it checks its own answer, so it exits 1 on
+# a stock compiler and 0 with the picker off. The setter-only and getter-only
+# halves each compile correctly; only the combination does not. THE RULE until
+# upstream closes it: in a function that expands f64v_* intrinsics, never pass
+# a derived getter of an object inside the VALUE argument of a derived setter
+# on that SAME object -- read into a local, then store once. (Getters on OTHER
+# objects, as `v` below, and a setter fed from a local are both fine.) The
+# accumulation order is unchanged (m16*vx, then +m40*vy, then +m64*vz), so the
+# value is bit-identical.
+# [measured: the repro in docs/development/issues/repros/ + objdump slot audit, cycc 6.6.0-6.6.4, 2026-09-14]
 #must_use
 public fn m3_mul_vec3(m, v) {
-    var r = alloc(24);
+    var r = alloc(sizeof(HVec3));
     var tmp = alloc(24);
     var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
     f64v_scale(r, m, vx, 2);
-    store64(r + 16, f64_mul(load64(m + 16), vx));
+    var rz = f64_mul(load64(m + 16), vx);
     f64v_scale(tmp, m + 24, vy, 2); f64v_add(r, r, tmp, 2);
-    store64(r + 16, f64_add(load64(r + 16), f64_mul(load64(m + 40), vy)));
+    rz = f64_add(rz, f64_mul(load64(m + 40), vy));
     f64v_scale(tmp, m + 48, vz, 2); f64v_add(r, r, tmp, 2);
-    store64(r + 16, f64_add(load64(r + 16), f64_mul(load64(m + 64), vz)));
+    rz = f64_add(rz, f64_mul(load64(m + 64), vz));
+    HVec3_set_z(r, rz);
     return r;
 }
 

@@ -107,8 +107,9 @@ inverted on the pin bump exactly as designed and is now empty. ⚠ Consumers com
 under their OWN pins; the flip is only enforced for a consumer at ≥ 6.6.4, which is one more reason
 it is a 4.0.0 item.
 
-⭐ **The 24 cross-module `_` items now carry `public` plus a marker comment, and their 4.0.0
-dispositions were worked by a 7-reviewer / 3-refuter pass on 2026-09-13 (53 findings, 0 refuted).
+⭐ **The 25 cross-module `_` items now carry `public` plus a marker comment** (24 at 3.1.0; 3.2.0's
+sort consolidation added `_lext_sort_desc`), **and their 4.0.0 dispositions were worked by a
+7-reviewer / 3-refuter pass on 2026-09-13 (53 findings, 0 refuted), plus one row for the newcomer.
 The recommendations, each grounded in the callee body and the caller sites:**
 
 | item(s) | defined in → reached from | disposition |
@@ -125,6 +126,7 @@ The recommendations, each grounded in the callee body and the caller sites:**
 | `_lie_norm3` | lie → lie_ext | **promote-rename** `lie_norm3` (scale-safe component norm; `hvec3_length` is not a drop-in — it takes an HVec3 and moves results by an ulp in the normal band) |
 | `_SYM_2_POW_63` / `_sym_int_exact_buf` / `_sym_render_f64` (+ `RenderLayout`) | symbolic → symbolic_ext | **extract one function**: `sym_const_to_str(val)` holding `expr_to_str`'s EXPR_CONST branch; `_latex_fmt_const` calls it, and the 2.20.0 "both renderers agree at every magnitude" property becomes true by construction |
 | `_SYM_EPS` / `_sym_is_zero` | symbolic → symbolic_ext | **promote as** `sym_const_eq(a, b)` with the 1e-15 absolute tolerance stated; `_SYM_EPS` stays private |
+| `_lext_sort_desc` (3.2.0) | linalg_ext → linalg_precision | **promote-rename** `linalg_sort_desc(vals, n, by_abs, col_mat, col_rows, row_mat, row_cols)`: it is the ONE ordering every eigen/SVD entry point returns through, its tie rule (first max, strict `>`, swap) is pinned by 8 assertions and observable to every consumer, and a private twin in each file is exactly what 3.2.0 consolidated away |
 
 ⚠ **Five non-underscore names the review judged implementation details, now committed as API by
 the naming convention** (decide before the flip — an underscore rename breaks nobody, 0 consumer
@@ -138,51 +140,6 @@ wrap.
 **Order, unchanged:** consumer-call gate (done: `check-public-surface.sh` claim 2) → the
 dispositions above → flip `private` last (the upstream holes are fixed and the gate's known-leak
 inversion has already fired).
-
-### The struct-layout contract has no gate — **[3.2.0]**
-
-The contract is real and documented: construct via the documented constructor, read via the
-accessors, size arrays with `sizeof(T)`; never a hardcoded byte count, never a hand-computed offset.
-
-⛔ **But "32 assertions … make any such change trip a gate" is FALSE.** All 32 are `sizeof(T) > 0`
-or `sizeof(T) % 8 == 0`. `ColContact` going 64 → 72 bytes passes both, **identically, on both sides
-of the change they were written to catch**. There is not one `assert_eq(sizeof(T), <n>)` anywhere in
-the tree, and six public structs carry no assertion at all — including **`HVec3`, the type live
-consumers touch most** (67 `hvec3_new` sites across 15 files in `src/`). The commit that declared the contract "now enforced"
-enforced nothing, and it has been quoted as protection for five releases. **A gate that cannot fail
-is not a gate.**
-
-⭐ The repair is mechanical: an exact `assert_eq(sizeof(T), <n>)` per public struct, plus the six
-that have nothing. ⚠ The 3.1.0 review added a site to the list: `hvec2_new` itself constructs
-`HVec2` with a hardcoded byte count and hand-computed offsets (`alloc(16)`, `store64(v + 8, y)`),
-the exact shape the contract forbids, in the module every consumer touches first. Verify it fires before trusting it — install a one-field change and watch the
-assertion fail.
-
-### Public API reached by no test — **[3.2.0]**
-
-The 3.1.0 surface scan (comments and string literals stripped) found **7 public functions
-referenced by nothing** in `src/`, `tests/`, `examples/` or `dist/` beyond their own declaration:
-`ad_neg`, `ad_cos`, `ad_ln` (the tape-mode twins of tested `dual_*` — `ad_ln`'s domain guard has
-never been asked), `csr_new` (the only CSR constructor that bypasses `csr_from_dense`'s
-`|v| > 1e-12` drop), `bch_3rd_order`, and `hodge_star_2form_4d` (whose sign table was rewritten in
-2.6.15 after three contradictory descriptions and is pinned by **no assertion**); `ad_grad_write`
-was on the list and is not (reached intra-module by `ad_grad_into`). The review added constants and
-tags read by nothing: the seven `GEO_JET_*` kind tags (no test reads `GeoJet_kind`), all six
-`EulerOrder` members (the only `hquat_from_euler` test passes a literal), `Mat3Layout`/`Mat4Layout`
-(two in-tree sites hand-size the arrays instead), `CGA_NUM_BLADES`, and `hisab_is_err` (0 callers
-in src, examples, or any of the ten consumers). ⚠ The 3.1.0 review also found the one BCH test that
-did exist was passing 24-byte `HVec3` values into `Mat3` readers (a 48-byte over-read that
-"passed" on the bump allocator's next bytes) — repaired in 3.1.0 with closed-form fixtures; the
-untested twins may hide the same shape. **"99% function coverage" counts a function reached by
-anything, including a test that reads garbage.**
-
-### The Boundary-with-Abaco table lags the surface it describes — **[3.2.0]**
-
-⚠ **It is frozen at the 2.2.0 surface.** It has no row for `expr_eval` — whose **domain changed** in
-2.11.2 (`(-2)^3` returned NaN for hisab's entire history and returns a number now), and whose named
-consumer is abaco — and none for autodiff (forward duals + the reverse tape), the six `geo_diff`
-jets, CGA, or Lie. **A boundary table that lags the surface is how a consumer learns the boundary
-from a compile error instead.** The table itself is at the foot of this file.
 
 ### Get one live consumer onto 3.0.x — **[unversioned — external]**
 
@@ -200,43 +157,6 @@ tag, and `Ok` tag = 0 = `HSB_ERR_NONE`. A consumer whose checks look like
 `scripts/check-result-migration.sh`, which exists for exactly that class and is mutation-proven.
 **Highest-value action in this section.**
 
-### `hvec3_lerp` / `hvec2_lerp` — unpark the SIMD hybrid — **[3.2.0]**
-
-⚠ **This was parked under "SIMD `cross`" and was never gated on the same thing.** `cross` needs lane
-shuffles; `lerp` does not. Measured on 6.6.2 with the existing n=2-pair + scalar-tail hybrid the
-other `hvec3_*` arithmetic already uses: **25 ns → 19–20 ns, bit-identical results, zero shuffles.**
-⚠ Same over-read rule as every other `f64v_*` path here — the pair plus a scalar tail, never n=3.
-
-### Consolidate onto stdlib `vec_sort_by` / `vec_select_nth` — **[3.2.0]**
-
-Consolidation for consistency, **not for speed** — 2.6.15 already fixed the complexity of the two
-hot sorts.
-
-⭐ **The wait-for-the-third-instance gate is DISCHARGED and was discharged twice over.** The claim
-that hisab has "exactly one hand-rolled sort" is wrong by 6x: there are **SIX ordering routines in
-five files**, re-derived against the 3.0.0 tree on 2026-09-11 — `collision_core.cyr:530`
-(`_col_sort_indices_by_xy`, heapsort), `spatial.cyr:114` (`_kd_select_median`, three-way
-quickselect), `num_ext.cyr:309` (insertion sort, prime factors), `linalg_ext.cyr:1071`
-(`eigen_symmetric`), `linalg_precision.cyr:1219` (SVD singular values) and
-`linalg_precision.cyr:1753` (`eigen_qr` step 3). **The last three are near-identical
-descending-magnitude selection sorts** whose own comments concede they have already disagreed
-once.
-
-⚠ **This entry has been wrong twice, in opposite directions, both times by not running anything.**
-It first read "and Cyrius has no closures" — false since v6.3.8, propagated to four files. It was
-then corrected to a *measured* block: on 6.5.16 a capturing closure SIGSEGVed when passed through a
-function and called there. **That was fixed in 6.5.17, re-verified on 6.5.18, and re-verified again
-on 6.6.2**, so the closure block is gone too.
-
-What actually remains is the plain API mismatch: `vec_sort_by` invokes its comparator as
-`fncall2(cmp, elem_a, elem_b)` — element *values* — whereas hisab sorts *indices* by dereferencing
-each into a separate `points` vector. A capturing comparator can now close over `points`, so this is
-doable. ⚠ **Re-derive every line number above before acting on them.** All six had drifted — the
-citations this row carried before 2026-09-11 pointed at `collision_core.cyr:466`,
-`linalg_ext.cyr:905`, `linalg_precision.cyr:816` and `:1265`, none of which is an ordering routine
-today — and a remediation instruction whose citations have drifted sends the next reader to the
-wrong line, which is worse than giving no citation at all.
-
 ---
 
 ## Toolchain, tracked upstream
@@ -244,10 +164,23 @@ wrong line, which is worse than giving no citation at all.
 ⚠ **Cyrius bugs are filed in the CYRIUS repo** — `cyrius/docs/development/issues/` is where the
 language agent reads them — **and closed in THIS repo too when a bump fixes them**, because the
 cyrius agent never edits hisab (both 2026-09-11 filings were fixed in 6.6.3 and closed here in
-3.0.1: `issues/archived/2026-09-11-cyrius-*`). **No hisab-filed toolchain item is open.**
+3.0.1: `issues/archived/2026-09-11-cyrius-*`).
 
-All four were **repaired in cyrius 6.6.4 and closed here in 3.1.1** (2026-09-14). What each still
-means for hisab:
+⛔ **ONE hisab-filed toolchain item is OPEN, filed in the cyrius repo on 2026-09-14** (`cyrius/docs/development/issues/2026-09-14-hisab-simd-dst-slot-regalloc-picker.md` + repro).
+`issues/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md` (cycc **6.6.4**, wrong code): a derived
+SETTER whose value argument reads the same object through the derived GETTER, in a function that also
+expands `f64v_*` intrinsics, leaves one intrinsic's DESTINATION frame slot unwritten — the register
+picker rewrites the slot store into a register move and the inline loop still reads the slot. Silent
+`(1, 4, 3)` for `(4, 5, 3)` standalone; SIGSEGV inside hisab. The self-proving repro under
+`issues/repros/` (exit 1 stock, exit 0 with `CYRIUS_REGALLOC_PICKER_CAP=0`) is wrong on **6.6.0 through
+6.6.4** from dirs pinned to each, so it is not a 6.6.4 regression. Until it is fixed and the pin
+has crossed the fix, `m3_mul_vec3` keeps its z tail in a local and stores it through the setter
+ONCE (comment on the function); do not tidy it back to the natural form. When it closes: archive the
+filing here, and the hisab-side `m3_mul_vec3` form may be re-measured (the hoisted form is −5.4% on
+its own, so there may be nothing to change).
+
+The four **2026-09-13 filings were repaired in cyrius 6.6.4 and closed here in 3.1.1** (2026-09-14).
+What each still means for hisab:
 
 | filing (upstream, `2026-09-13-hisab-…`, archived there) | after 6.6.4 |
 |---|---|
@@ -289,7 +222,7 @@ indistinguishable once the reason is gone.
 - **SIMD `cross`** (from 2.3.1) — needs lane shuffles; `f64v_shuffle`/`permute`/`blend`/`swap` are
   all undefined on 6.6.2 (probed), so still correctly parked. ⭐ Now with a number instead of an
   assertion: the best shuffle-free formulation measures **38 ns vs 25 ns scalar (+52%)**.
-  ⚠ `lerp` was never gated on this at all and is **unparked above**.
+  ⚠ `lerp` was never gated on this at all; it shipped on the shuffle-free n=2 hybrid in 3.2.0.
 - **`#pure` annotations** (from 2.3.4) — parked, but **not for the reason originally recorded**.
   ⛔ The old premise ("unsafe CSE interaction with the allocate-a-fresh-result convention") is
   refuted on 6.6.2: *there is no CSE to be unsafe*. Three identical `#pure` calls emit `calls: 3`,
@@ -339,21 +272,38 @@ whether it actually bites.
 
 ## Boundary with Abaco
 
-| Feature | abaco | hisab |
-|---------|-------|-------|
-| `eval("sin(pi/4)")` | parses and evaluates | -- |
-| `hvec3_cross(a, b)` | -- | vec3.cyr |
-| `geo_ray_sphere(ray, sphere)` | -- | geo.cyr |
-| `calc_integral_simpson(&f, a, b, n, out)` | -- | calc.cyr |
-| `num_newton(&f, &df, x0, tol, max, out)` | -- | num.cyr |
-| `sym_integrate(expr, var)` | -- | symbolic_ext.cyr |
-| `sym_to_latex(expr)` | -- | symbolic_ext.cyr |
+One row per surface, at the 3.1.1 surface (fn counts are `^public fn` in the module, `_` helpers
+excluded). The last column is **measured, not assumed**: every call of a hisab public fn in each
+consumer's own source (`lib/`, `dist/`, `build/` excluded), grepped 2026-09-14 across abaco and the
+ten live consumers.
 
-Hisab should never depend on abaco. Abaco may optionally depend on hisab.
+| Feature | abaco | hisab | live callers (symbols / call sites) |
+|---------|-------|-------|-------------------------------------|
+| `eval("sin(pi/4)")` — tokenize + parse a string | parses and evaluates | -- (no tokenizer) | -- |
+| `expr_eval(tree, vars)` — evaluate an expression TREE | -- | symbolic.cyr (21 fn); ⚠ domain changed 2.11.2: `(-2)^3` was NaN for hisab's whole history, is -8 since | none |
+| `sym_integrate(e, var)`, `sym_to_latex(e)`, patterns | -- | symbolic_ext.cyr (25 fn) | none |
+| `ivl_*` interval arithmetic | -- | interval.cyr (15 fn) | none |
+| `hvec3_cross(a, b)` and the vec family | -- | vec3.cyr | goonj 17/502, prakash 7/11, naad 5/47, dhvani 1/2 |
+| `geo_ray_sphere(ray, sphere)`, BVH | -- | geo.cyr, geo_advanced.cyr | goonj 4/5 (`geo_aabb_new`, `geo_ray_new`, `bvh_build`, `bvh_query_ray`) |
+| `calc_integral_simpson(&f, a, b, n, out)` -> `Result` | -- | calc.cyr, calc_ext.cyr | svara 2/11, naad 2/2, prani 1/2 (splines, `ease_in_out_smooth`) |
+| `num_newton(&f, &df, x0, tol, max, out)` -> `Result`, `num_fft` | -- | num.cyr, num_ext.cyr | naad 5/9, prakash 2/7, svara 2/2, attn11 1/1 (`num_fft` in all four) |
+| `dual_*` forward duals, `ad_*` reverse tape | -- | autodiff.cyr (15 dual + 23 tape fn) | none |
+| `geo_jet_{sphere,plane,triangle,aabb,obb,capsule}` + partial readers | -- | geo_diff.cyr (25 fn) | none |
+| `cga_*` conformal GA (null basis since 2.21.0) | -- | geo_advanced.cyr (27 of its 41 fn) | none |
+| `so3_*`/`se3_*`/`bch_*`, `u1_*`/`su2_*`/`su3`/`lorentz_*` | -- | lie.cyr (30 fn), lie_ext.cyr (26 fn) | none |
+| `f64_tan`, `f64_fmod` scalar helpers | -- | f64_util.cyr | goonj 1/3, naad 1/1, garjan 1/2 |
+
+Hisab should never depend on abaco. Abaco may optionally depend on hisab — and **today it does not**:
+abaco's `cyrius.cyml` has no `[deps.hisab]`, its 22 source files call 0 hisab symbols, and its own
+README lists hisab as a *sibling* library, "not a consumer" (measured 2026-09-14). The "abaco"
+row in the planned-consumer table above is therefore a plan on hisab's side only. Across the ten
+live consumers the whole reached surface is **35 distinct public fns in 8 modules**
+(vec3, num, num_ext, calc, calc_ext, geo, geo_advanced, f64_util); ghurni `include`s the bundle
+and calls nothing from it, nidhi names hisab only in a comment, and **0 of 10 reference `HSB_*`**.
+Eight of hisab's 35 modules have a live caller; the 27 others — everything the rows above mark
+"none" included — are reached only by hisab's own suites.
 ✅ **Verified 2026-09-09**: 0 hits for `abaco` in `cyrius.cyml`, `cyrius.lock`, `dist/hisab.deps`,
 `dist/hisab.cyr` and `src/`. The only git dep is sakshi (2.5.2 as of 3.0.1), and `deps --verify` already fails any
 unreviewed dep — **no new gate is owed here.** ⚠ The apparent contradiction between
-`eval("sin(pi/4)")` being abaco's while hisab exposes `expr_eval` is not one: `src/symbolic.cyr:324`
+`eval("sin(pi/4)")` being abaco's while hisab exposes `expr_eval` is not one: `src/symbolic.cyr:339`
 takes a **tree**, not a string. hisab has no tokenizer at all.
-
-⚠ **This table is stale and refreshing it is an open item above.**

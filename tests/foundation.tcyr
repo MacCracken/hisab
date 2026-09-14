@@ -324,6 +324,151 @@ assert_eq(HVec3_y(v3lh), f64_from(10), "v3 lerp t=0.5 .y");
 assert_eq(HVec3_z(v3lh), f64_from(15), "v3 lerp t=0.5 .z");
 
 # ================================================================
+# Vec2 / Vec3 — Lerp is bit-identical to the scalar form (3.2.0 SIMD hybrid)
+# ================================================================
+test_group("3.2.0 vec2/vec3 lerp: f64v hybrid is bit-identical to a + (b - a) * t");
+
+# ⭐ 3.2.0 moved hvec3_lerp onto the n=2 pair + scalar-z hybrid and hvec2_lerp
+# onto packed n=2. The CONTRACT is that the packed lanes compute a + (b - a) * t
+# in exactly the scalar form's operation order — sub, then mul, then add, each
+# rounded once — so every lane is bit-identical to the scalar expression, NaN
+# payloads and signed zeros included. The three fixtures above cannot see that:
+# 0, 10 and 20 at t in {0, 1/2, 1} are exact under ANY association, so a fused
+# multiply-add, an (a*(1-t) + b*t) rewrite, or a lane left unscaled at t = 1
+# all pass them. This sweep compares 200 (a, b, t) triples lane by lane on the
+# RAW WORD, against the scalar expression computed inline here, and counts the
+# classes it reached so a fixture that silently degenerates is named.
+# ⚠ The compare is on the raw word (`==`), never f64_eq: NaN != NaN through
+# f64_eq, and a NaN lane whose PAYLOAD changed is exactly the kind of drift a
+# fused or reordered sequence produces.
+var _LP_RUN = 0;
+var _LP_BAD = 0;
+var _LP_NAN = 0;      # lanes whose expected result is NaN (passthrough reached)
+var _LP_INF = 0;      # lanes whose expected result is +-Inf
+var _LP_SUB = 0;      # lanes with a subnormal operand or a subnormal result
+var _LP_SEED = 0x9E3779B97F4A7C15;
+
+# xorshift64* -- deterministic, so a failing triple is reproducible by index.
+fn _lp_rnd() {
+    var x = _LP_SEED;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    _LP_SEED = x;
+    return x * 0x2545F4914F6CDD1D;
+}
+
+# An "ordinary" f64 in about [-8, 8) with a full mantissa: 2^e * (1 + m).
+fn _lp_ordinary() {
+    var w = _lp_rnd();
+    var e = 1020 + (w & 7);                          # 2^-3 .. 2^4
+    var m = (_lp_rnd() >> 12) & 0xFFFFFFFFFFFFF;     # 52 mantissa bits
+    return ((w >> 3) & 1) << 63 | e << 52 | m;
+}
+
+# A lane value drawn by class: i % 5 selects ordinary / raw bits (any exponent)
+# / subnormal / huge / NaN with a random sign and PAYLOAD. ⚠ The class schedule
+# never puts two DIFFERENT NaN payloads on the same packed lane (ax is NaN at
+# i%5==4, bx at i%5==1, and t = NaN only at i%5==2, beside the scalar z tail),
+# so this sweep cannot observe the operand-order rule on its own: a t-first
+# packed multiply and a swapped final add both survived it (421/421) and are
+# killed only by the directed `_lp_pair` block after the sweep.
+# [measured: scratch harness, not reproducible in-tree]
+fn _lp_lane(i) {
+    var c = i % 5;
+    if (c == 1) { return _lp_rnd(); }
+    if (c == 2) { return _lp_rnd() & 0x800FFFFFFFFFFFFF; }            # exponent 0
+    if (c == 3) { return (_lp_rnd() & 0x800FFFFFFFFFFFFF) | (2040 << 52); } # ~2^1017
+    if (c == 4) { return (_lp_rnd() & 0x800FFFFFFFFFFFFF) | 0x7FF0000000000000; }
+    return _lp_ordinary();
+}
+
+fn _lp_is_nan(w) { return f64_eq(w, w) == 0; }
+fn _lp_is_inf(w) { return f64_eq(f64_abs(w), F64_POS_INF); }
+fn _lp_is_sub(w) {
+    if ((w & 0x7FF0000000000000) != 0) { return 0; }
+    return (w & 0xFFFFFFFFFFFFF) != 0;
+}
+
+# One lane: the scalar expression, computed here, is the oracle.
+fn _lp_check(got, a, b, t) {
+    var want = f64_add(a, f64_mul(f64_sub(b, a), t));
+    _LP_RUN = _LP_RUN + 1;
+    if (got != want) { _LP_BAD = _LP_BAD + 1; }
+    if (_lp_is_nan(want) == 1) { _LP_NAN = _LP_NAN + 1; }
+    if (_lp_is_inf(want) == 1) { _LP_INF = _LP_INF + 1; }
+    if (_lp_is_sub(a) == 1 || _lp_is_sub(b) == 1 || _lp_is_sub(want) == 1) { _LP_SUB = _LP_SUB + 1; }
+    return 0;
+}
+
+fn _lp_sweep() {
+    for (var i = 0; i < 200; i = i + 1) {
+        # t cycles through the named cases first, then random ordinary values.
+        var t = _lp_ordinary();
+        var k = i % 10;
+        if (k == 0) { t = 0; }
+        if (k == 1) { t = F64_ONE; }
+        if (k == 2) { t = F64_HALF; }
+        if (k == 3) { t = f64_neg(F64_ONE); }                    # extrapolate below a
+        if (k == 4) { t = F64_TWO; }                             # extrapolate past b
+        if (k == 5) { t = 1; }                                   # smallest subnormal
+        if (k == 6) { t = 0x7FE0000000000000; }                  # 2^1023
+        if (k == 7) { t = 0x7FF8000000000000; }                  # NaN
+        if (k == 8) { t = F64_POS_INF; }
+        var ax = _lp_lane(i); var ay = _lp_lane(i + 1); var az = _lp_lane(i + 2);
+        var bx = _lp_lane(i + 3); var by = _lp_lane(i + 4); var bz = _lp_lane(i + 1);
+        var r3 = hvec3_lerp(hvec3_new(ax, ay, az), hvec3_new(bx, by, bz), t);
+        _lp_check(HVec3_x(r3), ax, bx, t);
+        _lp_check(HVec3_y(r3), ay, by, t);
+        _lp_check(HVec3_z(r3), az, bz, t);
+        var r2 = hvec2_lerp(hvec2_new(ax, ay), hvec2_new(bx, by), t);
+        _lp_check(HVec2_x(r2), ax, bx, t);
+        _lp_check(HVec2_y(r2), ay, by, t);
+    }
+    return 0;
+}
+
+_lp_sweep();
+assert_eq(_LP_RUN, 1000, "the lerp sweep ran 200 triples x (3 vec3 + 2 vec2) lanes");
+assert_eq(_LP_BAD, 0,
+  "hvec3_lerp / hvec2_lerp are bit-identical to a + (b - a) * t on every lane of 200 triples");
+# The class counters, pinned EXACTLY because the generator is deterministic: a
+# sweep that silently stopped reaching a class would still pass the bit-exact
+# assertion above (there is nothing to get wrong on a lane it never drew).
+# ⚠ The first draft asserted "> 100 NaN lanes" from a count guessed before the
+# sweep ran; the measured figure was exactly 100 -- every one of them from
+# t = NaN, none from the operand classes -- which is why the NaN-payload lane
+# class exists at all. [measured: counts printed from this sweep, 2026-09-14]
+assert_eq(_LP_NAN, 480, "the lerp sweep reached NaN passthrough on 480 lanes (t = NaN and NaN operands)");
+assert_eq(_LP_INF, 84, "the lerp sweep reached +-Inf results on 84 lanes");
+assert_eq(_LP_SUB, 400, "the lerp sweep reached subnormal operands or results on 400 lanes");
+
+# ⛔ OPERAND ORDER, PINNED DIRECTLY. Two distinct NaN payloads meeting in ONE
+# packed operation is the only input on which `a + (b - a) * t` and a
+# reordered sequence differ (x86 returns the first NaN source operand,
+# quieted). The sweep above never builds that lane; these four do, on the
+# packed x lane of both functions, against the same scalar oracle. Under a
+# t-first packed multiply case A returns payload 0x01 for 0xFF; under a
+# swapped final add case B returns 0x22 for 0x11.
+# [measured: scratch harness, not reproducible in-tree]
+fn _lp_pair(a, b, t, label) {
+    var want = f64_add(a, f64_mul(f64_sub(b, a), t));
+    var r3 = hvec3_lerp(hvec3_new(a, 0, 0), hvec3_new(b, 0, 0), t);
+    var r2 = hvec2_lerp(hvec2_new(a, 0), hvec2_new(b, 0), t);
+    assert_eq(HVec3_x(r3), want, label);
+    assert_eq(HVec2_x(r2), want, label);
+    return 0;
+}
+_lp_pair(F64_ONE, 0x7FF80000000000FF, 0x7FF8000000000001,
+  "lerp packed lane: NaN(b) vs NaN(t) keeps the (b - a) payload, not t's");
+_lp_pair(0x7FF8000000000011, 0x7FF8000000000022, F64_HALF,
+  "lerp packed lane: NaN(a) vs NaN(b) keeps a's payload through the final add");
+_lp_pair(0xFFF8000000000033, 0x7FF8000000000044, F64_ONE,
+  "lerp packed lane: negative NaN(a) vs NaN(b) at t = 1 keeps a's payload");
+_lp_pair(0x7FF8000000000055, F64_TWO, 0x7FF8000000000066,
+  "lerp packed lane: NaN(a) vs NaN(t) keeps a's payload through the scale");
+
+# ================================================================
 # Vec3 — Min, Max, Abs, Reflect
 # ================================================================
 test_group("vec3 min/max/abs/reflect");
@@ -1258,6 +1403,20 @@ assert_eq(m3_get(m3_scale(c73_m3a, f64_from(3)), 2, 2), f64_from(3), "m3_scale b
 # I * v = v
 var c73_m3v = m3_mul_vec3(c73_m3a, hvec3_new(F64_ONE, F64_TWO, f64_from(3)));
 assert_eq(HVec3_z(c73_m3v), f64_from(3), "m3_mul_vec3 by identity keeps v");
+# A matrix whose THIRD column is not zero, all three components pinned. The
+# identity check above reads only z, so a product that drops the third
+# column's contribution to x and y passes it -- which is exactly what cycc
+# 6.6.4 produced for the derived-accessor form of m3_mul_vec3 (returning
+# (1,4,3) here where (4,5,3) is right; see
+# docs/development/issues/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md).
+# M = I with column 3 = (1,1,1):  M v = (x + z, y + z, z), exact in f64.
+var c73_m3b = m3_identity();
+m3_set(c73_m3b, 2, 0, F64_ONE);
+m3_set(c73_m3b, 2, 1, F64_ONE);
+var c73_m3w = m3_mul_vec3(c73_m3b, hvec3_new(F64_ONE, F64_TWO, f64_from(3)));
+assert_eq(HVec3_x(c73_m3w), f64_from(4), "m3_mul_vec3 x picks up the third column (1 + 3)");
+assert_eq(HVec3_y(c73_m3w), f64_from(5), "m3_mul_vec3 y picks up the third column (2 + 3)");
+assert_eq(HVec3_z(c73_m3w), f64_from(3), "m3_mul_vec3 z with column 3 = (1,1,1)");
 assert_eq(HVec3_x(m3_col(c73_m3a, 0)), f64_from(1), "m3_col 0 of I is (1,0,0)");
 assert_neq(m3_from_cols(hvec3_unit_x(), hvec3_unit_y(), hvec3_unit_z()), 0, "m3_from_cols builds");
 assert_neq(m3_normal_matrix(m4_identity()), 0, "m3_normal_matrix builds");

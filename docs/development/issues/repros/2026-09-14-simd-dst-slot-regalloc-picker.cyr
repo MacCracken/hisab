@@ -1,0 +1,73 @@
+# 2026-09-14 -- cycc 6.6.4: a derived SETTER whose value argument reads the
+# same object through the derived GETTER, in a function that also expands
+# f64v_* intrinsics, leaves one intrinsic's DESTINATION frame slot unwritten.
+#
+# Self-proving: exit 0 when the compiler is correct, exit 1 when it is not.
+#   cyrius build 2026-09-14-simd-dst-slot-regalloc-picker.cyr /tmp/repro && /tmp/repro
+#   CYRIUS_REGALLOC_PICKER_CAP=0 cyrius build ... && /tmp/repro   -> exit 0 (control)
+#
+# Measured on cycc 6.6.4 (x86_64): stock build prints "1 4 3" and exits 1;
+# the picker-off control prints "4 5 3" and exits 0. objdump of the stock
+# binary: the third `f64v_scale`'s inline loop reads its destination from
+# -0xe8(%rbp) and no instruction in `mulvec` writes that slot -- the picker
+# turned the store into a register move (`mov %rax,%r13`) and left the read.
+# The same shape inside hisab (`m3_mul_vec3`, 35-module tree) SIGSEGVs
+# instead, so the crash is the lucky half; this is silent wrong code.
+#
+# Each half alone is correct (verified with the same audit): the setter with
+# a raw `load64` value, or a raw `store64` fed by the getter, both write
+# every destination slot. Only the getter-inside-setter combination fails.
+
+#derive(accessors)
+struct P3 { x; y; z; }
+
+var _g_m = 0;
+var _g_v = 0;
+
+fn p3_new(x, y, z) {
+    var v = alloc(sizeof(P3));
+    P3_set_x(v, x);
+    P3_set_y(v, y);
+    P3_set_z(v, z);
+    return v;
+}
+
+# r = M v for a column-major 3x3 M: xy via packed n=2, z as a scalar tail.
+fn mulvec(m, v) {
+    var r = alloc(sizeof(P3));
+    var tmp = alloc(24);
+    var vx = P3_x(v); var vy = P3_y(v); var vz = P3_z(v);
+    f64v_scale(r, m, vx, 2);
+    P3_set_z(r, f64_mul(load64(m + 16), vx));
+    f64v_scale(tmp, m + 24, vy, 2); f64v_add(r, r, tmp, 2);
+    P3_set_z(r, f64_add(P3_z(r), f64_mul(load64(m + 40), vy)));
+    f64v_scale(tmp, m + 48, vz, 2); f64v_add(r, r, tmp, 2);
+    P3_set_z(r, f64_add(P3_z(r), f64_mul(load64(m + 64), vz)));
+    return r;
+}
+
+fn main() {
+    _g_v = p3_new(f64_from(1), f64_from(2), f64_from(3));
+    _g_m = alloc(72);
+    var k = 0;
+    while (k < 9) { store64(_g_m + k * 8, 0); k = k + 1; }
+    # M = I with column 3 = (1, 1, 1):  M v = (x + z, y + z, z) = (4, 5, 3)
+    store64(_g_m, f64_from(1)); store64(_g_m + 32, f64_from(1)); store64(_g_m + 64, f64_from(1));
+    store64(_g_m + 48, f64_from(1)); store64(_g_m + 56, f64_from(1));
+    var r = mulvec(_g_m, _g_v);
+    var rx = f64_to(P3_x(r));
+    var ry = f64_to(P3_y(r));
+    var rz = f64_to(P3_z(r));
+    print_num(rx); println(" ");
+    print_num(ry); println(" ");
+    print_num(rz); println(" ");
+    if (rx == 4 && ry == 5 && rz == 3) {
+        println("OK: (4, 5, 3)");
+        return 0;
+    }
+    println("WRONG: expected (4, 5, 3)");
+    return 1;
+}
+
+var exit_code = main();
+sys_exit_group(exit_code);

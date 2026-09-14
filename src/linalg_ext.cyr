@@ -72,7 +72,12 @@ public fn csr_col_idx(csr) { return load64(csr + 32); }
 public fn csr_values(csr)  { return load64(csr + 40); }
 
 # Convert a stdlib dense matrix (from matrix.cyr) to CSR.
-# Drops entries with |value| < EPSILON_F64.
+# Stores exactly the entries that are not 0.0. (This line still said
+# "drops |value| < EPSILON_F64" until 3.2.0; the drop became structural in 2.15.0 --
+# the 2.14.0 tag still ships the EPSILON_F64 guard.)
+# A CSR that must carry an EXPLICIT zero -- a pattern fixed ahead of its values,
+# as an assembly loop does -- is built with csr_new, the only constructor that
+# takes the arrays as given.
 # Returns pointer to CSR struct.
 public fn csr_from_dense(dense_mat) {
     var nrows = ganita_mat_rows(dense_mat);
@@ -389,6 +394,82 @@ fn _lext_copy(src, n) {
         i = i + 1;
     }
     return out;
+}
+
+# Descending selection sort of `vals[0..n)`, carrying matrix columns and/or rows
+# along with every swap so a (value, vector) pair is never broken.
+#   by_abs:   1 to order by |value| (eigenvalues), 0 to order by value (singular
+#             values, already non-negative when sorted).
+#   col_mat:  stdlib matrix whose columns i / max_idx are swapped over `col_rows`
+#             rows (0 = none) -- eigenvector columns, the U of an SVD.
+#   row_mat:  stdlib matrix whose rows i / max_idx are swapped over `row_cols`
+#             columns (0 = none) -- the Vt of an SVD.
+#
+# ONE routine for eigen_symmetric (here), eigen_qr and svd_golub_kahan
+# (src/linalg_precision.cyr). Those three carried near-identical copies of this
+# loop and had already disagreed on order once (the 2026-08-04 audit found
+# eigen_symmetric returning Jacobi's raw diagonal order while eigen_qr sorted --
+# see eigen_symmetric's ORDERING note); a single body is what makes agreement
+# structural rather than a promise in three comments.
+#
+# ⚠ TIE ORDER IS PART OF THE CONTRACT, which is why this stays a hand-written
+# selection sort rather than stdlib `vec_sort_by`. Equal eigenvalues carry
+# DISTINCT eigenvectors, so the order of tied columns is observable, and
+# `vec_sort_by` is an introsort (unstable above its 16-element insertion
+# cutoff) that permutes ties differently from this loop. The order is pinned in
+# tests/hisab.tcyr ("tie order" block): the first max is taken (strict `f64_gt`,
+# so a later equal value never displaces an earlier one) and the swap is
+# i <-> max_idx, so values (2, 2, 4) give column order (e3, e2, e1) where a
+# stable sort would give (e3, e1, e2).
+#
+# O(n^2) on an O(n^3) decomposition, so it is free at every n these are used
+# for. A NaN key never becomes the max (`f64_gt` is false either way), exactly
+# as in the three loops this replaces.
+# public: cross-module helper reached from linalg_precision.cyr — not API.
+# Disposition (promote / merge / leave the file open) is owed at the 4.0.0
+# `private` flip; see roadmap.md 'Public / private function surface'.
+public fn _lext_sort_desc(vals, n, by_abs, col_mat, col_rows, row_mat, row_cols) {
+    var i = 0;
+    while (i < n) {
+        var max_idx = i;
+        var max_key = load64(vals + i * 8);
+        if (by_abs == 1) { max_key = f64_abs(max_key); }
+        var j = i + 1;
+        while (j < n) {
+            var kj = load64(vals + j * 8);
+            if (by_abs == 1) { kj = f64_abs(kj); }
+            if (f64_gt(kj, max_key) == 1) {
+                max_key = kj;
+                max_idx = j;
+            }
+            j = j + 1;
+        }
+        if (max_idx != i) {
+            var tmp = load64(vals + i * 8);
+            store64(vals + i * 8, load64(vals + max_idx * 8));
+            store64(vals + max_idx * 8, tmp);
+            var k = 0;
+            if (col_mat != 0) {
+                while (k < col_rows) {
+                    var tc = ganita_mat_get(col_mat, k, i);
+                    ganita_mat_set(col_mat, k, i, ganita_mat_get(col_mat, k, max_idx));
+                    ganita_mat_set(col_mat, k, max_idx, tc);
+                    k = k + 1;
+                }
+            }
+            if (row_mat != 0) {
+                k = 0;
+                while (k < row_cols) {
+                    var tr = ganita_mat_get(row_mat, i, k);
+                    ganita_mat_set(row_mat, i, k, ganita_mat_get(row_mat, max_idx, k));
+                    ganita_mat_set(row_mat, max_idx, k, tr);
+                    k = k + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 # GMRES(m) iterative solver for non-symmetric systems Ax = b.
@@ -1068,42 +1149,15 @@ public fn eigen_symmetric(A, n, out_vals, out_vecs) {
     var result = ganita_mat_eigen_sym(A, out_vals, out_vecs);
     if (result < 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
 
-    # Selection sort by descending |eigenvalue|, columns of out_vecs carried
-    # along. Identical to eigen_qr's step 3 (`src/linalg_precision.cyr`, the
-    # "Step 3: Copy eigenvalues, sort by descending magnitude" block) so the two
-    # routines cannot disagree on order again. O(n^2) on an O(n^3) decomposition,
-    # so it is free at every n the Jacobi path is used for.
-    # ⚠ The line number this cited (`:1334`) had DRIFTED — that line is now inside
-    # the wrong-sign eigenvalue note, ~420 lines above the sort. Cite the block by
-    # name, not by number: a citation that drifted sends the next reader to code
-    # that has nothing to do with the claim.
-    var i = 0;
-    while (i < n) {
-        var max_idx = i;
-        var max_abs = f64_abs(load64(out_vals + i * 8));
-        var j = i + 1;
-        while (j < n) {
-            var aj = f64_abs(load64(out_vals + j * 8));
-            if (f64_gt(aj, max_abs) == 1) {
-                max_abs = aj;
-                max_idx = j;
-            }
-            j = j + 1;
-        }
-        if (max_idx != i) {
-            var tmp = load64(out_vals + i * 8);
-            store64(out_vals + i * 8, load64(out_vals + max_idx * 8));
-            store64(out_vals + max_idx * 8, tmp);
-            var k = 0;
-            while (k < n) {
-                var tv = ganita_mat_get(out_vecs, k, i);
-                ganita_mat_set(out_vecs, k, i, ganita_mat_get(out_vecs, k, max_idx));
-                ganita_mat_set(out_vecs, k, max_idx, tv);
-                k = k + 1;
-            }
-        }
-        i = i + 1;
-    }
+    # Sort by descending |eigenvalue|, columns of out_vecs carried along -- the
+    # SAME body eigen_qr's step 3 runs (`_lext_sort_desc`, above), so the two
+    # routines cannot disagree on order again. Until 3.2.0 that was two copies
+    # asserted identical in comments; it is now one function.
+    # ⚠ The line number this once cited (`:1334`) had DRIFTED — that line ended
+    # up inside the wrong-sign eigenvalue note, ~420 lines above the sort. Cite
+    # by name, not by number: a citation that drifted sends the next reader to
+    # code that has nothing to do with the claim.
+    _lext_sort_desc(out_vals, n, 1, out_vecs, n, 0, 0);
 
     return Ok(0);
 }

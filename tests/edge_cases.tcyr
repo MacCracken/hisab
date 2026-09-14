@@ -8,6 +8,7 @@ include "src/vec2.cyr"
 include "src/vec3.cyr"
 include "src/vec4.cyr"
 include "src/quat.cyr"
+include "src/mat3.cyr"
 include "src/mat4.cyr"
 include "src/transforms.cyr"
 include "src/color.cyr"
@@ -1064,6 +1065,74 @@ var xd_z = ivl_mul(ivl_point(0), xd_a);
 assert_eq(Interval_lo(xd_z), f64_from(0), "[0,0] * [1,+inf) lo = 0, not NaN");
 assert_eq(Interval_hi(xd_z), f64_from(0), "[0,0] * [1,+inf) hi = 0, not NaN");
 assert_eq(ivl_contains(xd_z, f64_from(7)), 0, "[0,0] * [1,+inf) is not a NaN catch-all");
+
+# ================================================================
+# Autodiff -- ad_ln's domain guard, asked directly (3.2.0)
+# ================================================================
+# The tape twin of dual_ln shipped in 2.11.0 with the same `f64_gt(v, 0) != 1`
+# guard and, until 3.2.0, no test reached it at all. The contract, from
+# autodiff.cyr: outside v > 0 the op pushes the miss sentinel (value 0, local
+# partial 0) -- never a NaN value beside a confident finite derivative, which is
+# what the pre-2.11.0 `f64_abs(v)` guard produced for dual_ln(-5). The reverse
+# sweep over a sentinel node must therefore hand the input an adjoint of exactly
+# 0. Each case is compared bit for bit against the forward-mode twin, which is
+# the module's stated oracle.
+test_group("edge: ad_ln domain guard (tape mode)");
+
+var eal_t = ad_tape_new(16);
+# ln(-5): outside the domain.
+var eal_n5 = ad_var(eal_t, f64_neg(f64_from(5)));
+var eal_ln_n5 = ad_ln(eal_t, eal_n5);
+assert_eq(ad_ok(eal_t, eal_ln_n5), 1, "ad_ln(-5) still pushes a node (it is a sentinel, not AD_FULL)");
+assert_eq(ad_val(eal_t, eal_ln_n5), f64_from(0), "ad_ln(-5): value is the sentinel 0, not NaN");
+var _eal1t, _eal1v = ad_grad(eal_t, eal_ln_n5);
+assert_eq(is_ok(_eal1t), 1, "ad_ln(-5): the sweep over a sentinel node succeeds");
+assert_eq(ad_grad_of(eal_t, eal_n5), f64_from(0), "ad_ln(-5): adjoint of x is 0, not a confident -0.2");
+assert_eq(ad_val(eal_t, eal_ln_n5), Dual_val(dual_ln(dual_var(f64_neg(f64_from(5))))),
+  "ad_ln(-5) value agrees with dual_ln bit for bit");
+assert_eq(ad_grad_of(eal_t, eal_n5), Dual_deriv(dual_ln(dual_var(f64_neg(f64_from(5))))),
+  "ad_ln(-5) derivative agrees with dual_ln bit for bit");
+# ln(0): the boundary is OUTSIDE the domain (ln 0 = -inf, derivative unbounded).
+var eal_z = ad_var(eal_t, 0);
+var eal_ln_z = ad_ln(eal_t, eal_z);
+assert_eq(ad_val(eal_t, eal_ln_z), f64_from(0), "ad_ln(0): value is the sentinel 0, not -inf");
+var _eal2t, _eal2v = ad_grad(eal_t, eal_ln_z);
+assert_eq(is_ok(_eal2t), 1, "ad_ln(0): sweep succeeds");
+assert_eq(ad_grad_of(eal_t, eal_z), f64_from(0), "ad_ln(0): adjoint is 0, not +inf");
+# ln(NaN): every comparison with NaN is false, so `f64_gt(v, 0) != 1` rejects it.
+var eal_nan = f64_div(0, 0);
+var eal_xn = ad_var(eal_t, eal_nan);
+var eal_ln_nan = ad_ln(eal_t, eal_xn);
+assert_eq(ad_val(eal_t, eal_ln_nan), f64_from(0), "ad_ln(NaN): value is the sentinel 0, not NaN");
+var _eal3t, _eal3v = ad_grad(eal_t, eal_ln_nan);
+assert_eq(is_ok(_eal3t), 1, "ad_ln(NaN): sweep succeeds");
+assert_eq(ad_grad_of(eal_t, eal_xn), f64_from(0), "ad_ln(NaN): adjoint is 0, not NaN");
+assert_eq(ad_val(eal_t, eal_ln_nan), Dual_val(dual_ln(dual_var(eal_nan))),
+  "ad_ln(NaN) agrees with dual_ln bit for bit");
+# ⚠ THE CONTROL: the guard must stop EXACTLY at 0. DBL_MIN is inside the domain
+# and ln is finite there (ln(DBL_MIN) = -708.4, derivative 1/DBL_MIN = 4.49e307,
+# both finite), so a guard that fired one binade early -- any threshold chosen
+# for it rather than derived from the domain -- shows up here as the sentinel.
+var eal_tiny = ad_var(eal_t, F64_TINY);
+var eal_ln_tiny = ad_ln(eal_t, eal_tiny);
+assert(f64_lt(ad_val(eal_t, eal_ln_tiny), f64_neg(f64_from(708))) == 1,
+  "ad_ln(DBL_MIN): value is below -708, not the sentinel");
+var _eal4t, _eal4v = ad_grad(eal_t, eal_ln_tiny);
+assert_eq(is_ok(_eal4t), 1, "ad_ln(DBL_MIN): sweep succeeds");
+assert(f64_gt(ad_grad_of(eal_t, eal_tiny), f64_from(0)) == 1, "ad_ln(DBL_MIN): adjoint is positive");
+assert(f64_lt(ad_grad_of(eal_t, eal_tiny), F64_POS_INF) == 1, "ad_ln(DBL_MIN): adjoint is finite");
+assert_eq(ad_grad_of(eal_t, eal_tiny), Dual_deriv(dual_ln(dual_var(F64_TINY))),
+  "ad_ln(DBL_MIN) derivative agrees with dual_ln bit for bit");
+# And 1e-13, the value 2.11.0 measured the old guard fabricating (0, 0) for.
+# [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
+var eal_e13 = F64_ONE;
+for (var eal_i = 0; eal_i < 13; eal_i = eal_i + 1) { eal_e13 = f64_div(eal_e13, f64_from(10)); }
+var eal_x13 = ad_var(eal_t, eal_e13);
+var eal_ln_13 = ad_ln(eal_t, eal_x13);
+assert_eq(ad_val(eal_t, eal_ln_13), f64_ln(eal_e13), "ad_ln(1e-13) is ln(1e-13) = -29.93, not a fabricated 0");
+var _eal5t, _eal5v = ad_grad(eal_t, eal_ln_13);
+assert_eq(is_ok(_eal5t), 1, "ad_ln(1e-13): sweep succeeds");
+assert_eq(ad_grad_of(eal_t, eal_x13), f64_div(F64_ONE, eal_e13), "ad_ln(1e-13): adjoint is exactly 1/1e-13");
 
 # ================================================================
 var r = assert_summary();

@@ -128,13 +128,13 @@ compiles, and the callee silently receives the **tag**. See
 
 ```sh
 cyrius build src/main.cyr build/hisab
-cyrius test tests/hisab.tcyr        # 550 cross-module integration assertions
-cyrius test tests/foundation.tcyr   # 413 vec/quat/mat foundation assertions
-cyrius test tests/modules.tcyr      # 2086 per-module assertions
-cyrius test tests/edge_cases.tcyr   # 239 degenerate-input assertions
-cyrius test tests/abuse.tcyr        # 914 hostile-input assertions (negative indices,
+cyrius test tests/hisab.tcyr        # 585 cross-module integration assertions
+cyrius test tests/foundation.tcyr   # 429 vec/quat/mat foundation assertions
+cyrius test tests/modules.tcyr      # 2251 per-module assertions
+cyrius test tests/edge_cases.tcyr   # 260 degenerate-input assertions
+cyrius test tests/abuse.tcyr        # 904 hostile-input assertions (negative indices,
                                     #   zero/huge dimensions, non-conformable operands, canaries)
-cyrius bench tests/hisab.bcyr       # 78 benchmarks
+cyrius bench tests/hisab.bcyr       # 80 benchmarks
 cyrius fuzz                         # 5 fuzz targets with invariant checks
 ```
 
@@ -148,7 +148,7 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 |--------|-------|
 | Version | 3.1.0 |
 | Library | 35 modules, ~26,400 lines of Cyrius |
-| Tests | 4214 assertions across 5 suites |
+| Tests | 4429 assertions across 5 suites |
 | Benchmarks | 78 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~251 KB static ELF (`build/hisab` — version smoke test only) |

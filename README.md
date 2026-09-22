@@ -4,7 +4,7 @@
 
 Higher math for the AGNOS ecosystem — linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, and more. Written in [Cyrius](https://github.com/MacCracken/cyrius), ported from Rust.
 
-Used by **svara**, **naad**, **goonj** (tag 2.22.1), **dhvani**, **attn11**, **ghurni**, **prani**, **garjan**, **prakash** and **nidhi** (tag 2.11.2) — ten repos that pull `dist/hisab.cyr` SHA-locked (pins read from their manifests 2026-09-14). None has crossed the 3.0.0 `Result` break yet.
+Used by **prakash** (tag 3.1.1 — the first consumer past the 3.0.0 `Result` break, since 2026-09-15), **svara**, **naad**, **goonj** (tag 2.22.1), **dhvani**, **attn11**, **ghurni**, **prani**, **garjan** and **nidhi** (tag 2.11.2) — ten repos that pull `dist/hisab.cyr` SHA-locked (pins read from their manifests 2026-09-21). ⚠ goonj and attn11 pin cyrius 6.6.2 and cannot take a 3.1.0+ bundle until they move it (see *Minimum toolchain* below).
 
 ⚠ [impetus](https://github.com/MacCracken/impetus) (physics), [kiran](https://github.com/MacCracken/kiran) (engine), [joshua](https://github.com/MacCracken/joshua) (simulation), [aethersafha](https://github.com/MacCracken/aethersafha) (compositor), [hisab-mimamsa](https://github.com/MacCracken/hisab-mimamsa) (theoretical physics) and [kana](https://github.com/MacCracken/kana) (quantum science) are **planned** — they are Rust repos awaiting a Cyrius port and have no `cyrius.cyml` on any branch.
 
@@ -24,6 +24,11 @@ vacuous this way. Drive your migration with a grep, not with build errors —
 There is **no deprecation window**, on this migration's own evidence: a dual API would leave exactly
 those call sites quietly passing against the old function forever, which is the failure this release
 removes. **2.24.0 is the supported 2.x line.**
+
+⚠ **Minimum toolchain: hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3.** `public struct` + `#derive` is
+refused by cycc 6.6.2; measured in 3.2.1 from a dir pinned to 6.6.2, the 3.0.1 bundle compiles and the
+3.1.0+ bundles do not, while 6.6.3 and 6.6.4 compile and run 3.2.1 correctly. Bump `cyrius` in your
+manifest before moving `[deps.hisab] tag` past 3.0.1.
 
 ## Modules
 
@@ -52,7 +57,7 @@ removes. **2.24.0 is the supported 2.x line.**
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "6.6.4"
+cyrius      = "6.6.6"
 
 [deps]
 # `ganita` (Cyrius 6.2.x) provides the transcendentals (acos/asin/atan2/pow/
@@ -65,7 +70,7 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "r
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "3.2.0"
+tag     = "3.2.1"
 modules = ["dist/hisab.cyr"]   # ~1.12 MB self-contained bundle (all 35 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
 # pulls in hisab's own 16 stdlib leaves, so the `stdlib` list above only has to
@@ -146,15 +151,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.2.0 |
+| Version | 3.2.1 |
 | Library | 35 modules, ~26,600 lines of Cyrius |
 | Tests | 4429 assertions across 5 suites |
 | Benchmarks | 80 operations |
 | Fuzz targets | 5 with invariant checks |
-| CLI binary | ~251 KB static ELF (`build/hisab` — version smoke test only) |
-| Toolchain | Cyrius 6.6.4 |
+| CLI binary | ~264 KB static ELF (`build/hisab` — version smoke test only) |
+| Toolchain | Cyrius 6.6.6 |
 | Dependencies | 1 (sakshi 2.5.2); no third-party, no FFI/libc |
-| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 249 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared, not implied** (3.1.0): every non-underscore top-level declaration carries `public`, and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **1 open filing** in [docs/development/issues/](docs/development/issues/) (31 archived) — a cycc wrong-code defect found in 3.2.0 (the register picker drops an `f64v_*` destination-slot store; wrong on 6.6.0–6.6.4), filed upstream in [cyrius](https://github.com/MacCracken/cyrius) with a self-proving repro and worked around in `m3_mul_vec3`; the four 2026-09-13 filings were repaired in 6.6.4 and are archived there. Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
+| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 249 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared, not implied** (3.1.0): every non-underscore top-level declaration carries `public`, and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **1 open filing** in [docs/development/issues/](docs/development/issues/) (32 archived), and it is a stdlib *statistic*, not a library defect: `lib/bench.cyr` 6.6.5+ prints a benchmark `min` above its own `avg` for sub-40 ns rows (filed upstream in [cyrius](https://github.com/MacCracken/cyrius) with a self-proving repro; hisab's recorded `avg` is unaffected). The cycc wrong-code defect 3.2.0 found (the register picker dropping an `f64v_*` destination-slot store, wrong on 6.6.0–6.6.4) was repaired upstream in 6.6.5 and closed here in 3.2.1 with a paired measurement; `m3_mul_vec3` keeps its hoisted form because every live consumer still compiles the bundle under a pin below the fix. Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
 
 ## License
 

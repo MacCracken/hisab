@@ -20,6 +20,14 @@ if (is_err_result(tag) == 1) { … }        # val holds the HSB_ERR_* code
 Add `"result"` to your `[deps] stdlib` list. `cyrius deps` picks it up from
 `dist/hisab.deps` automatically, which now names 16 leaves rather than 15.
 
+⚠ **Minimum toolchain: hisab ≥ 3.1.0 needs cyrius ≥ 6.6.3.** 3.1.0 put `public` on every
+declaration, and `public struct` + `#derive(accessors)` is refused by cycc 6.6.2 with
+`#derive(...) applies to a struct or an enum; the following declaration is neither`. Measured
+(3.2.1, from a dir pinned to 6.6.2): the 3.0.1 bundle compiles, the 3.1.0 and 3.2.1 bundles do not;
+under 6.6.3 and 6.6.4 the 3.2.1 bundle compiles and runs correctly. If your `cyrius.cyml` pins
+6.6.2, bump it before — not after — moving `[deps.hisab] tag` past 3.0.1. (3.0.0 and 3.0.1
+themselves build on 6.6.2.)
+
 ## ⛔ The one thing that will bite you
 
 **A `Result` in argument position does not error — it silently degrades to its tag.**

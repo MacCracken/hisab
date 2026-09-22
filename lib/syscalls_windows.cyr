@@ -49,6 +49,28 @@ enum SysNr {
     # that, defining this would have swapped a loud compile error for a runtime crash.
     # Callers already handle the failure — yukti checks `if (r < 0)` and reports it.
     SYS_IOCTL = 16;
+    # v6.6.5 — same "constant exists so cross-platform source COMPILES" contract as
+    # SYS_IOCTL above, and safe for the same reason: since v6.5.25 an unrouted literal
+    # syscall number returns -38/-ENOSYS instead of emitting a raw `0F 05` that traps as
+    # STATUS_ILLEGAL_INSTRUCTION. NOT rerouted: Windows has no sendmsg/sendto (ws2_32's
+    # WSASendMsg is a different contract and takes an OVERLAPPED), no truncate/ftruncate
+    # (SetEndOfFile needs a seek first) and no memfd (a named section object is a different
+    # object model). The stub wrappers below decline explicitly rather than issuing them.
+    # ⚠ SYS_NANOSLEEP is the exception — the PE backend HAS rerouted 35 to kernel32 Sleep
+    # since v6.1.17 (ENANOSLEEP_PE), so sys_nanosleep issues it for real.
+    SYS_SENDTO = 44;
+    SYS_SENDMSG = 46;
+    SYS_TRUNCATE = 76;
+    SYS_FTRUNCATE = 77;
+    SYS_MEMFD_CREATE = 319;
+    SYS_NANOSLEEP = 35;
+    SYS_SCHED_YIELD = 24;
+    # v6.6.6 — the statfs pair, same "the constant exists so cross-platform source COMPILES"
+    # contract, and NOT rerouted: Windows has no statfs. GetDiskFreeSpaceExW answers the same
+    # question but is a kernel32 import with a different shape (three out-params, no struct,
+    # wide path), so a row would be a lie; the stubs below decline explicitly. CHANGELOG [6.6.6]
+    SYS_STATFS = 137;
+    SYS_FSTATFS = 138;
 }
 
 # File descriptors mirror Linux convention. GetStdHandle maps
@@ -73,11 +95,46 @@ enum OFlags {
     O_EXCL = 128;       # 0200
     O_TRUNC = 512;      # 01000
     O_APPEND = 1024;    # 02000
-    # v6.6.4: defined so portable code compiles on PE. ⚠ NOT honoured: EOPEN_PE
-    # (src/backend/x86/emit.cyr) decodes only O_CREAT (0x40) and O_EXCL (0x80) — even
-    # O_TRUNC and the access mode are not decoded (GENERIC_READ|GENERIC_WRITE and
-    # FILE_ATTRIBUTE_NORMAL are hardcoded) — so these bits are ignored
-    # (FILE_FLAG_BACKUP_SEMANTICS / FILE_FLAG_OPEN_REPARSE_POINT are a follow-on port).
+    # ⛔ v6.6.6 — the note that stood here said O_TRUNC and the access mode "are not
+    # decoded", filed as a cosmetic gap alongside O_DIRECTORY/O_NOFOLLOW. It was not
+    # cosmetic: an undecoded O_TRUNC means `open(p, O_WRONLY|O_CREAT|O_TRUNC)` SUCCEEDS
+    # and then leaves the old tail of the file behind, and an undecoded O_APPEND
+    # overwrites from offset 0. Silent data loss on every Windows rewrite. EOPEN_PE now
+    # decodes the access mode, O_CREAT, O_EXCL, O_TRUNC and O_APPEND (`_pe_open_flags`,
+    # src/backend/x86/emit.cyr); pinned by tests/tcyr/crossos/open_flag_translation.tcyr
+    # on real cass. CHANGELOG [6.6.6]
+    #
+    # ⚠ TWO RESIDUAL DIVERGENCES, both from ONE Win32 rule: TRUNCATE_EXISTING is REFUSED
+    # (ERROR_INVALID_PARAMETER) unless dwDesiredAccess carries GENERIC_WRITE — measured on
+    # real cass; FILE_WRITE_DATA and FILE_APPEND_DATA do NOT satisfy it, and wine does not
+    # enforce the rule at all. `_pe_open_flags` therefore adds GENERIC_WRITE whenever it
+    # selects that disposition, which buys the POSIX-visible behaviour (the file IS
+    # truncated) at the cost of:
+    #   · `open(p, O_RDONLY|O_TRUNC)` — the Windows handle can also be written; Linux
+    #     returns EBADF for a write on it. No caller in the ecosystem passes that pair.
+    #   · `open(p, O_TRUNC|O_APPEND)` WITHOUT O_CREAT — the handle carries GENERIC_WRITE
+    #     beside FILE_APPEND_DATA, so NT writes at the file pointer rather than at EOF. The
+    #     file has just been truncated, so a single writer sees no difference; a concurrent
+    #     appender would. (With O_CREAT the disposition is CREATE_ALWAYS, which needs no
+    #     extra access, so the real append survives there.)
+    #
+    # ⚠ STILL NOT HONOURED, and deliberately so — these two are dwFlagsAndAttributes bits
+    # whose Win32 near-equivalents do NOT mean what POSIX means, so mapping them is a
+    # semantic decision, not a port: FILE_FLAG_OPEN_REPARSE_POINT opens the symlink
+    # instead of REFUSING like O_NOFOLLOW does (lib/sigil.cyr's keyfile path relies on the
+    # refusal), and a Windows directory handle cannot be ReadFile'd the way O_DIRECTORY's
+    # caller expects. Defined so portable code still compiles.
+    #
+    # ⛔ AND NAME WHAT THAT COSTS, now that O_EXCL IS honoured. `luks_write_keyfile`
+    # (lib/sigil.cyr:3857) opens `O_WRONLY|O_CREAT|O_TRUNC|O_EXCL|O_NOFOLLOW` and treats
+    # the refusal as its guarantee that it created the keyfile itself. On PE that becomes
+    # CreateFileW CREATE_NEW, which RESOLVES a final reparse point instead of refusing it:
+    # measured on real cass 2026-09-19 — CREATE_NEW over a dangling symlink SUCCEEDS and
+    # creates the symlink's TARGET, where the same flags on Linux fail (verified both ways
+    # with the same source). So on Windows an O_EXCL|O_NOFOLLOW create is NOT the Linux
+    # refusal: a pre-planted symlink at the keyfile path redirects the write. A Windows
+    # caller that needs the Linux guarantee must stat the path first (FILE_ATTRIBUTE_REPARSE_POINT)
+    # or open with FILE_FLAG_OPEN_REPARSE_POINT and check — neither is wired yet. CHANGELOG [6.6.6]
     O_DIRECTORY = 65536;
     O_NOFOLLOW = 131072;
 }
@@ -297,6 +354,22 @@ enum Stat {
     STAT_BUFSZ = 144;
 }
 
+# v6.6.6 — the statfs offsets, on exactly the Stat contract argued above and for exactly the
+# same reason: every peer that can statfs publishes a `Statfs` enum — the three Linux/macOS
+# peers share one in lib/syscalls_linux_common.cyr and agnos has its own, and this peer is
+# STANDALONE (it includes neither), so it needs a copy — and yukti's
+# `filesystem_usage` writes `var buf[STATFS_BUFSZ]` then `load64(&buf + STATFS_BLOCKS)`
+# unconditionally. Without these names a PE build of yukti fails to COMPILE. `sys_statfs`
+# below declines with -38, so no byte at these offsets is ever populated on Windows — the
+# values mirror the Linux peer only to keep the buffer-size contract identical.
+enum Statfs {
+    STATFS_BSIZE = 8;
+    STATFS_BLOCKS = 16;
+    STATFS_BFREE = 24;
+    STATFS_BAVAIL = 32;
+    STATFS_BUFSZ = 2176;
+}
+
 # access(path, mode) — 0xF019 (61465) → kernel32!GetFileAttributesW, live since v6.1.18.
 # ⚠ THE REROUTE TAKES AN ALREADY-WIDE (UTF-16) PATH, which is the one non-obvious part; the
 # widen loop below is the same shape lib/io.cyr uses for its own CreateFileW calls.
@@ -329,6 +402,40 @@ fn sys_access(path, mode): i64 {
 # stops the hard compile error, which is what blocked PE builds.
 fn sys_socketpair(domain, type, protocol, fds): i64 { return 0 - 1; }
 
+# ── v6.6.5: PE peers for the new lib/syscalls_linux_common.cyr wrappers.
+# This peer is STANDALONE (it does not include linux_common), so a PE build of any
+# consumer that NAMES one of these would fail with `undefined variable` without them —
+# the v6.5.25 SYS_IOCTL shape, one surface wider. Each returns -38/-ENOSYS so a caller's
+# `if (r < 0)` check fires; none of them fakes an emulation.
+# Send a message over a socket. Declines on Windows: ws2_32's WSASendMsg is a different
+# contract (OVERLAPPED + a WSAMSG layout), not a renumber of this one.
+fn sys_sendmsg(fd, msghdr, flags): i64 { return 0 - 38; }
+# Send a datagram to an address. Declines on Windows for the same reason as sys_sendmsg.
+fn sys_sendto(fd, buf, len, flags, dstaddr, dstaddrlen): i64 { return 0 - 38; }
+# Set a file's length by descriptor. Declines on Windows: SetEndOfFile truncates at the
+# CURRENT file pointer, so an honest peer has to seek first and restore after.
+fn sys_ftruncate(fd, length): i64 { return 0 - 38; }
+# Set a file's length by path. Declines on Windows, same reason as sys_ftruncate.
+fn sys_truncate(path, length): i64 { return 0 - 38; }
+# Filesystem statistics by path. Declines on Windows: the nearest peer is GetDiskFreeSpaceExW,
+# a kernel32 import with three out-params and a wide path — a different contract, not a
+# renumber. Callers already bail on r < 0. v6.6.6.
+fn sys_statfs(path, buf): i64 { return 0 - 38; }
+# Filesystem statistics by descriptor. Declines on Windows, same reason as sys_statfs.
+fn sys_fstatfs(fd, buf): i64 { return 0 - 38; }
+# f_bsize accessor — present so cross-platform source compiles for PE. Never reached with a
+# populated buffer, because sys_statfs above always declines.
+fn statfs_bsize(buf): i64 { return 0; }
+# Create an anonymous in-memory file. Declines on Windows: the nearest object is a named
+# section (CreateFileMappingW), a different object model with no fd.
+fn sys_memfd_create(name, flags): i64 { return 0 - 38; }
+# Sleep for a `struct timespec`. REAL on Windows — the PE backend has rerouted syscall(35)
+# to kernel32 Sleep since v6.1.17, reading tv_sec/tv_nsec and converting to flat ms.
+fn sys_nanosleep(req, rem): i64 { return syscall(SYS_NANOSLEEP, req, rem); }
+# Yield the remainder of this thread's timeslice. Declines on Windows: the peer is
+# SwitchToThread/Sleep(0), a kernel32 import this backend does not reroute.
+fn sys_sched_yield(): i64 { return 0 - 38; }
+
 # v6.4.66 — getpeername / getsockname now route to ws2_32 (was a fail-closed -ENOSYS
 # stub v6.4.64→.65). The PE syscall router maps 0xF036 → ws2_32!getpeername and
 # 0xF037 → ws2_32!getsockname (src/backend/x86/emit.cyr EGETPEERNAME_PE / EGETSOCKNAME_PE),
@@ -356,3 +463,106 @@ fn sys_getsockname(fd, addr, addrlen): i64 {
     if (r == 0) { return 0; }
     return 0 - syscall(61476);
 }
+
+# ================================================================
+# QueryPerformanceCounter / QueryPerformanceFrequency (v6.6.5)
+# ================================================================
+# 0xF038 → kernel32!QueryPerformanceCounter(LARGE_INTEGER*)
+# 0xF039 → kernel32!QueryPerformanceFrequency(LARGE_INTEGER*)
+# (src/backend/x86/emit.cyr EQPC_PE / EQPF_PE, routed in src/frontend/parse_expr.cyr.)
+#
+# ⛔ WHY: Windows had NO sub-millisecond clock in cyrius at all. `syscall(228)` reroutes
+# to kernel32!GetTickCount64, whose counter advances in **15 ms** steps (measured on
+# cass, 2026-08-11) — so lib/chrono.cyr's monotonic clock and lib/bench.cyr's timer both
+# quantized every duration under 15 ms to 0 or to one whole tick, and the bench
+# framework's floor calibrated to 0 because 1,024 GetTickCount64 calls do not move the
+# counter. QPC is the documented high-resolution source (its frequency is typically
+# 10 MHz on Win10+, i.e. a 100 ns tick) and is monotonic since system start.
+#
+# Both return BOOL (nonzero = success) and write a 64-bit count at the pointer arg.
+# Filed as part of docs/development/issues/2026-09-16-mabda-lib-bench-min-minus-mean-floor.md
+# QueryPerformanceCounter(&count): writes the current 64-bit performance count at `ptr`.
+# Returns the Win32 BOOL (nonzero = success). Monotonic since system start.
+fn sys_qpc(ptr): i64 {
+    return syscall(61496, ptr);
+}
+
+# QueryPerformanceFrequency(&hz): writes the counter's ticks-per-second at `ptr`.
+# Returns the Win32 BOOL. Fixed at boot, so one call per process is enough.
+fn sys_qpf(ptr): i64 {
+    return syscall(61497, ptr);
+}
+
+# Cached frequency. QPF is fixed at boot and documented not to change while the system
+# runs, so one call is enough; 0 means "not read yet".
+var _sys_qpf_hz = 0;
+
+# Monotonic nanoseconds from QPC. The conversion is split so it cannot overflow: a raw
+# `count * 1e9` wraps i64 after ~29 years of uptime at 10 MHz, and after ~9 seconds if a
+# machine ever reports a 1 GHz frequency.
+#
+# ⚠ Falls back to GetTickCount64 × 1e6 if QPF reports a non-positive frequency — that
+# cannot happen on any supported Windows, but returning a wrong-scaled count would be
+# silent while a 15 ms clock is merely coarse.
+fn sys_qpc_ns(): i64 {
+    var c[16];
+    if (_sys_qpf_hz == 0) {
+        store64(&c, 0);
+        sys_qpf(&c);
+        _sys_qpf_hz = load64(&c);
+    }
+    if (_sys_qpf_hz <= 0) {
+        return syscall(228, 1, &c) * 1000000;
+    }
+    store64(&c, 0);
+    sys_qpc(&c);
+    var t = load64(&c);
+    return (t / _sys_qpf_hz) * 1000000000 + ((t % _sys_qpf_hz) * 1000000000) / _sys_qpf_hz;
+}
+
+# ================================================================
+# v6.6.6 — the two raw-floor names a POSIX tool reaches for path work
+# ================================================================
+#
+# ⛔ This peer INCLUDES NOTHING, so a name missing here is missing for PE entirely, and
+# under the v6.3.2 reachable-undef hard error that is a BUILD FAILURE, not a degrade.
+# `programs/cyrius-init.cyr` named `sys_readlink` and `sys_rename` unguarded, so it did
+# not cross-compile to PE at all and `cyrius init` / `cyrius port` were absent from every
+# Windows install — the CLI answered `tool not found`. Same shape as the v6.5.25
+# getpid/getppid gap, one surface wider. See
+# docs/development/issues/archived/2026-09-18-cyrius-init-does-not-build-for-windows.md.
+#
+# ⛔ AND `sys_readlink` IS DELIBERATELY NOT ONE OF THEM. The first cut of this fix added a
+# third wrapper returning -38/ENOSYS, and it was measured to buy nothing: with the
+# scaffolder's readlink call now behind `#ifndef CYRIUS_TARGET_WIN`, deleting the stub
+# leaves the PE build byte-for-byte the same (rc=0, MZ, 155,648 B, 0 undefined fns). What
+# it cost was the diagnostic. `readlink("/proc/self/exe")` is the ONE shape this filing is
+# about, and with a -38 stub present that line COMPILES for PE and then silently falls
+# back to argv(0) — which on Windows is whatever the parent typed, so a tool that needs
+# its own install root gets the wrong directory and scaffolds nothing. That is exactly the
+# half-fix `tests/gates/toolchain/cyrius_init_builds_for_pe.sh` exists to forbid, and a
+# stub here would have made it compile. The hard error is the feature: it forces the next
+# PE consumer to pick `sys_self_exe_w` (below) or `xreadlink` (lib/io.cyr, which already
+# degrades to -1 behind its own `#ifdef`), instead of getting a silent wrong answer.
+# A REAL readlink — DeviceIoControl + FSCTL_GET_REPARSE_POINT — would be welcome; a stub
+# that only makes the wrong code build is not. CHANGELOG [6.6.6].
+
+# rename(old, new) — REAL, not a degrade: 0xF034 (61492) → kernel32!MoveFileExW with
+# MOVEFILE_REPLACE_EXISTING, live since v6.4.57 and already the Windows arm of
+# lib/io.cyr's portable `file_rename`. Returns 0 on success / -1 on failure (the BOOL is
+# folded to the POSIX contract by the emitter), which is what POSIX callers check.
+# ⚠ Unlike rename(2) this CAN move across volumes (MOVEFILE_COPY_ALLOWED is not set, so
+# it does not; a cross-volume move fails, as rename(2) does with EXDEV).
+fn sys_rename(oldpath, newpath): i64 { return syscall(61492, oldpath, newpath); }
+
+# GetModuleFileNameW(NULL, wbuf, cch) — 0xF03A (61498), the Windows source for the full
+# path of THIS executable. `cch` is the buffer capacity in WCHARs (wbuf must hold
+# cch * 2 bytes); the result is UTF-16LE, and the return value is the WCHAR count written
+# (0 on failure). NOT narrowed here — the caller converts with `_args_w2u8`
+# (lib/args.cyr), exactly as lib/args_win.cyr does for GetCommandLineW's raw LPWSTR.
+#
+# ⚠ argv(0) is NOT a substitute and that is why this reroute exists: on Windows argv[0]
+# is whatever the parent wrote on the command line, so it can be relative or a bare name,
+# and a tool that derives an install root from its own GRANDPARENT directory (the
+# scaffolder's templates dir) gets the wrong answer or none. CHANGELOG [6.6.6].
+fn sys_self_exe_w(wbuf, cch): i64 { return syscall(61498, wbuf, cch); }

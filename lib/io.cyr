@@ -8,6 +8,22 @@
 include "lib/syscalls.cyr"
 # Result-returning *_r variants below; see CHANGELOG [5.8.30].
 include "lib/result.cyr"
+# v6.6.6: SELF-SUFFICIENT. This file calls `alloc` (every heap buffer below), `strlen`/`memcpy`
+# (lib/string.cyr) and `fmt_int`/`fmt_int_buf` (lib/fmt.cyr) and included none of them, so
+# `include "lib/io.cyr"` alone compiled with five `warning: undefined function` lines on EVERY
+# target — an undefined fn is a ud2/SIGILL stub, so the first affected call traps. lib/fmt.cyr
+# pulls in string and (through vec) alloc. Include-once, so an existing caller pays nothing.
+# CHANGELOG [6.6.6]
+include "lib/fmt.cyr"
+include "lib/string.cyr"
+# agnos has no /proc/self/environ, so `getenv` below delegates to args_agnos.cyr's
+# `_agnos_getenv` (it reads the r15-parked init stack). That was a bare forward reference —
+# fine when a program happened to include lib/args.cyr, `warning: undefined function
+# '_agnos_getenv'` and a trapping getenv when it did not. The peer is included directly (not
+# lib/args.cyr, whose dispatcher pulls in the Linux/macOS/Windows arms too). CHANGELOG [6.6.6]
+#ifdef CYRIUS_TARGET_AGNOS
+include "lib/args_agnos.cyr"
+#endif
 
 # v5.8.30 — IoError variants. Bare-variant enum so each name folds
 # to a const int at compile time. Tag-name prefix `Io` keeps these
@@ -136,9 +152,13 @@ fn xunlink(path): i64 {
 # how yukti shipped `sys_rmdir(mount_point_cstr)` (v6.5.2 fold): a warning nobody read, until
 # v6.5.1 made an arity mismatch fatal.
 #
-# Windows returns -1 rather than rerouting: unlike `xunlink`'s DeleteFileW (0xF035) there is
-# no RemoveDirectoryW reroute wired, and inventing one is a COMPILER change. Same honest
-# degrade `xstat` already makes on PE. Wire the reroute when a consumer actually needs it.
+# v6.6.6 — WINDOWS NOW ROUTES, through kernel32!RemoveDirectoryW (0xF03B), exactly as
+# `xunlink` routes to DeleteFileW (0xF035). This comment used to read "Windows returns -1
+# rather than rerouting ... wire the reroute when a consumer actually needs it", and one
+# did: the CLI's private temp directory (`<TEMP>/cyrius-<pid>-t<nonce>`, created on every
+# run since v6.4.81) is removed at exit on POSIX from 6.6.6 and could not be removed at all
+# on PE, so Windows leaked one empty directory per invocation. A `-1` degrade is only honest
+# while nothing depends on the call succeeding. CHANGELOG [6.6.6].
 fn xrmdir(path): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     var rn = 0;
@@ -146,7 +166,7 @@ fn xrmdir(path): i64 {
     return sys_rmdir(path, rn);
     #endif
     #ifdef CYRIUS_TARGET_WIN
-    return -1;   # no RemoveDirectoryW reroute wired (see above)
+    return syscall(0xF03B, path);   # v6.6.6: kernel32!RemoveDirectoryW (EREMOVEDIRW_PE)
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     #ifndef CYRIUS_TARGET_WIN
@@ -163,8 +183,8 @@ fn xrmdir(path): i64 {
 # argument binding to garbage. That divergence is the whole reason this wrapper
 # exists; it is the same trap `xrmdir` was added for at v6.5.2.
 #
-# Windows DOES route here (83 is in the PE reroute set), unlike xrmdir which has no
-# RemoveDirectoryW wired. Returns 0 on success, negative errno on POSIX/agnos.
+# Windows DOES route here (83 is in the PE reroute set); so does `xrmdir` since v6.6.6
+# (0xF03B RemoveDirectoryW). Returns 0 on success, negative errno on POSIX/agnos.
 # CHANGELOG [6.5.7]
 fn xmkdir(path, mode): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
@@ -470,7 +490,15 @@ fn file_write(fd, buf, len): i64 {
     return sys_write(fd, buf, len);
 }
 
-# Read entire file into buffer. Returns bytes read.
+# Read entire file into buffer. Returns bytes read, or a negative errno.
+#
+# ⛔ A FAILED READ IS NOT END-OF-FILE. `read(2)` returning 0 means EOF; returning a negative
+# means the file could not be read (EISDIR, EIO, a revoked mount). This folded the two into
+# one `n <= 0` exit and returned the bytes read SO FAR, so a read that died half way handed
+# back a PREFIX indistinguishable from the whole file — and the caller, testing `n > 0`,
+# believed it. Open failure already surfaced as a negative here, so callers must handle one;
+# now a read failure uses the same channel instead of masquerading as a short file.
+# CHANGELOG [6.6.6]
 fn file_read_all(path, buf, maxlen): i64 {
     var fd = file_open(path, 0, 0);
     if (fd < 0) { return fd; }
@@ -478,7 +506,8 @@ fn file_read_all(path, buf, maxlen): i64 {
     var rgo: i64 = 1;
     while (rgo == 1) {
         var n = file_read(fd, buf + total, maxlen - total);
-        if (n <= 0) { rgo = 0; }
+        if (n < 0) { file_close(fd); return n; }
+        if (n == 0) { rgo = 0; }
         else {
             total = total + n;
             if (total >= maxlen) { rgo = 0; }
@@ -488,13 +517,83 @@ fn file_read_all(path, buf, maxlen): i64 {
     return total;
 }
 
-# Write buffer to file. Returns bytes written or error.
+# Write the WHOLE buffer to `fd`, looping until every byte lands. Returns `len`, or a
+# negative errno; no forward progress (a 0-byte write) is -EIO.
+#
+# ⛔ WHY THIS EXISTS: write(2) is allowed to write FEWER bytes than asked and return that
+# count as SUCCESS — a full disk, an RLIMIT_FSIZE ceiling, a signal, a pipe. Every
+# "…_all" helper below made ONE write and returned that count, so a caller testing only
+# `< 0` accepted a truncated file as a good one. Measured on this tree under `ulimit -f 2`:
+# file_write_all(p, buf, 4096) returned 1024 and left a 1024-byte file. Anything promising
+# "all" loops HERE; the fd-level file_write / file_write_r keep the raw one-shot semantics
+# and say so. CHANGELOG [6.6.6]
+fn _io_write_full(fd, buf, len): i64 {
+    var off = 0;
+    while (off < len) {
+        var w = file_write(fd, buf + off, len - off);
+        if (w < 0) { return w; }         # negative errno from the kernel
+        if (w == 0) { return -5; }       # no forward progress → -EIO
+        off = off + w;
+    }
+    return len;
+}
+
+# Write buffer to file. Returns `len` on success, or a negative errno — a SHORT write is an
+# error, never a partial success (see _io_write_full). NOT crash-safe: O_TRUNC empties the
+# target at open, so a failure leaves it truncated — use file_write_atomic /
+# file_replace_atomic for a file someone else owns. CHANGELOG [6.6.6]
 fn file_write_all(path, buf, len): i64 {
     var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
     if (fd < 0) { return fd; }
-    var written = file_write(fd, buf, len);
+    var written = _io_write_full(fd, buf, len);
     file_close(fd);
     return written;
+}
+
+# Read the WHOLE file into a fresh heap buffer, NUL-terminated. Returns the buffer and writes
+# the byte count through `len_out`; 0 when the file cannot be opened.
+#
+# ⛔ WHY: `file_read_all(path, buf, CAP)` with a hand-picked CAP returns exactly CAP on a larger
+# file and says nothing — the caller cannot tell "the whole file" from "the first CAP bytes",
+# and a tool that then writes the buffer back DESTROYS the rest. Measured before the fix:
+# `cyriusly use 9.9.9` on a 144,090-byte cyrius.cyml left a 65,535-byte file cut mid-line and
+# printed "Pinned" (its cap was 65535); `cyrius update` migrated a >32 KB cyrius.toml to a
+# truncated cyrius.cyml and then deleted the toml. The buffer here GROWS instead, so there is no
+# cap to be wrong about and no size to race against (no stat: Windows has no POSIX stat here,
+# and a stat-then-read races a writer anyway).
+#
+# ⛔ AND A FAILED READ IS NOT END-OF-FILE. The first cut exited the loop on `n <= 0`, so a read
+# that errored — immediately, or after 40 KB — returned the bytes so far as if that were the
+# file. Both callers WRITE THE BUFFER BACK (cyriusly `_write_cyml_cyrius_pin` replaces
+# cyrius.cyml with it; cbt `cmd_update` writes it as cyrius.cyml and then deletes cyrius.toml),
+# i.e. the same silently-accepted partial I/O this helper exists to end, on the read side.
+# Measured: `file_read_whole("tests", &n)` on a DIRECTORY (open succeeds, read = -EISDIR)
+# returned a non-zero buffer with len 0 — "could not read" reported as "empty". A read error is
+# now the same answer as an open error: 0, len 0. CHANGELOG [6.6.6]
+fn file_read_whole(path, len_out): i64 {
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { store64(len_out, 0); return 0; }
+    var cap = 65536;
+    var buf = alloc(cap + 1);
+    var total = 0;
+    var go = 1;
+    while (go == 1) {
+        if (total == cap) {
+            var ncap = cap + cap;
+            var nb = alloc(ncap + 1);
+            memcpy(nb, buf, total);
+            buf = nb;
+            cap = ncap;
+        }
+        var n = file_read(fd, buf + total, cap - total);
+        if (n < 0) { file_close(fd); store64(len_out, 0); return 0; }
+        if (n == 0) { go = 0; }
+        else { total = total + n; }
+    }
+    file_close(fd);
+    store8(buf + total, 0);
+    store64(len_out, total);
+    return buf;
 }
 
 # ── v6.4.57: portable crash-safe atomic write (thoth's model edit/create tools).
@@ -558,26 +657,83 @@ fn _io_tmp_name(path): i64 {
     return buf;
 }
 
+# Give the fresh temp `fd` the permission bits `path` has NOW, so an atomic replace keeps the
+# mode the user set (a 0600 file stays 0600; 0755 stays executable). A rename puts a NEW inode
+# at `path`, and the temp was created 0644 & ~umask — without this every replace reset the mode,
+# which the open(O_TRUNC) writes it replaced never did. rwx bits only: setuid/setgid are not
+# carried (a write clears them too). No existing file, or a target with no POSIX mode (Windows)
+# or no fchmod (agnos): nothing to keep, the default stands. CHANGELOG [6.6.6]
+fn _io_keep_mode(fd, path): i64 {
+    #ifndef CYRIUS_TARGET_WIN
+    #ifndef CYRIUS_TARGET_AGNOS
+    var st[144];
+    if (xstat(path, &st) != 0) { return 0; }
+    return sys_fchmod(fd, load32(&st + STAT_MODE) & 0x1FF);
+    #endif
+    #endif
+    return 0;
+}
+
+# "<dir of link>/<target>" for a RELATIVE symlink target (readlink's bytes, `tn` long), since
+# the kernel resolves one against the directory holding the link, not the cwd.
+fn _io_link_join(link, target, tn): i64 {
+    var ll = strlen(link);
+    var cut = 0;
+    var i = 0;
+    while (i < ll) {
+        if (load8(link + i) == 47) { cut = i + 1; }   # just past the last '/'
+        i = i + 1;
+    }
+    var out = alloc(cut + tn + 1);
+    memcpy(out, link, cut);
+    memcpy(out + cut, target, tn);
+    store8(out + cut + tn, 0);
+    return out;
+}
+
+# The path a REPLACE of `path` must write: `path` itself, or — when it is a symlink — the file
+# the chain finally names (40 hops, then -ELOOP (-40)). A negative errno or a NUL-terminated
+# path. Windows has no readlink route, so there it is always `path`. CHANGELOG [6.6.6]
+fn _io_replace_target(path): i64 {
+    var cur = path;
+    var lb = alloc(4097);
+    var hops = 0;
+    while (hops < 40) {
+        var n = xreadlink(cur, lb, 4096);
+        if (n <= 0) { return cur; }   # not a link (or absent: it will be created)
+        if (load8(lb) == 47) {
+            var ab = alloc(n + 1);
+            memcpy(ab, lb, n);
+            store8(ab + n, 0);
+            cur = ab;
+        } else {
+            cur = _io_link_join(cur, lb, n);
+        }
+        hops = hops + 1;
+    }
+    return 0 - 40;
+}
+
 # Crash-safe write of `len` bytes from `buf` to `path`. Writes a unique sibling
 # temp, loops the write until all bytes land (partial-write-safe), fsyncs, closes,
 # then atomically renames the temp over `path`. On ANY failure the temp is unlinked
 # and the negative errno is returned, leaving the original `path` intact. Returns
 # 0 on success. v6.4.58: the on-failure unlink is now real on EVERY target — xunlink
 # routes to DeleteFileW (0xF035) on Windows, so no rare-path temp leak lingers there.
+# v6.6.6: an existing `path` keeps its permission bits (it used to come back 0644 & ~umask).
+# A SYMLINK at `path` is replaced by the new file, not written through — the safe default for
+# a file the caller owns; for a file a USER owns (their source, their manifest) use
+# file_replace_atomic, which writes the file the link names. CHANGELOG [6.6.6]
 fn file_write_atomic(path, buf, len): i64 {
     var tmp = _io_tmp_name(path);
     var fd = file_open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
     if (fd < 0) { return fd; }
-    var off = 0;
-    while (off < len) {
-        var w = file_write(fd, buf + off, len - off);
-        if (w <= 0) {
-            file_close(fd);
-            xunlink(tmp);
-            if (w == 0) { return -5; }   # no forward progress → -EIO
-            return w;                    # negative errno from the kernel
-        }
-        off = off + w;
+    _io_keep_mode(fd, path);   # v6.6.6: an existing file keeps its permission bits
+    var wr = _io_write_full(fd, buf, len);   # loops; a short write is an error
+    if (wr < 0) {
+        file_close(fd);
+        xunlink(tmp);
+        return wr;
     }
     xfsync(fd);
     var cr = file_close(fd);
@@ -585,6 +741,19 @@ fn file_write_atomic(path, buf, len): i64 {
     var rr = file_rename(tmp, path);
     if (rr < 0) { xunlink(tmp); return rr; }
     return 0;
+}
+
+# Crash-safe REPLACE of a file someone owns — file_write_atomic with the semantics of the
+# open(O_TRUNC) write it replaces, minus the truncation: the permission bits are kept, and a
+# symlink at `path` stays a symlink while the file it names gets the bytes (a relative target
+# resolves against the link's directory; a loop is -ELOOP). A short write is still an error
+# that leaves the file as it was. What a rename CANNOT keep: other hard links (they keep the
+# old bytes), ownership when root replaces another user's file, xattrs/ACLs. For a user's
+# source (cyrfmt --write), manifest, lock or toolchain pin. CHANGELOG [6.6.6]
+fn file_replace_atomic(path, buf, len): i64 {
+    var real = _io_replace_target(path);
+    if (real < 0) { return real; }
+    return file_write_atomic(real, buf, len);
 }
 
 # Create `path` ONLY if it does not already exist (no-clobber), returning the new
@@ -652,7 +821,11 @@ fn file_append_locked(path, buf, len): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     xlseek(fd, 0, 2);                  # SEEK_END — agnos AO_APPEND is a kernel TODO
     #endif
-    var n = file_write(fd, buf, len);
+    # v6.6.6: loops until the whole record lands — one write could append a PREFIX of the
+    # record and return that count as success, so a caller testing `< 0` logged a torn line
+    # and called it written. The lock is held across the loop, so the record stays contiguous.
+    # CHANGELOG [6.6.6]
+    var n = _io_write_full(fd, buf, len);
     file_unlock(fd);
     file_close(fd);
     return n;
@@ -737,8 +910,12 @@ fn file_write_r(fd, buf, len): Result {
 
 # Result variant of file_read_all. Opens the file, reads up to
 # maxlen bytes, closes. Open failure surfaces as Err with the
-# corresponding IoError variant; read failure mid-stream returns
-# whatever was read up to that point as Ok.
+# corresponding IoError variant — and so, since v6.6.6, does a read
+# failure mid-stream. That case USED to return "whatever was read up
+# to that point as Ok", which this comment stated as the contract: a
+# truncated read reported as a successful one, with no way for the
+# caller to tell. Ok(n) now means n bytes and no error.
+# CHANGELOG [6.6.6]
 fn file_read_all_r(path, buf, maxlen): Result {
     var fd = file_open(path, 0, 0);          # via the agnos AO_*/namelen bridge
     if (fd < 0) { return Err(_io_errno_to_iorr(0 - fd)); }
@@ -746,7 +923,8 @@ fn file_read_all_r(path, buf, maxlen): Result {
     var rgo = 1;
     while (rgo == 1) {
         var n = sys_read(fd, buf + total, maxlen - total);
-        if (n <= 0) { rgo = 0; }
+        if (n < 0) { sys_close(fd); return Err(_io_errno_to_iorr(0 - n)); }
+        if (n == 0) { rgo = 0; }
         else {
             total = total + n;
             if (total >= maxlen) { rgo = 0; }
@@ -757,12 +935,15 @@ fn file_read_all_r(path, buf, maxlen): Result {
 }
 
 # Result variant of file_write_all. Opens with O_WRONLY|O_CREAT|
-# O_TRUNC, writes, closes. Open failure → Err; write failure →
-# Err with errno mapping.
+# O_TRUNC, writes ALL `len` bytes, closes. Open failure → Err; write
+# failure → Err with errno mapping. v6.6.6: a short write is an Err,
+# not Ok(partial) — it used to make ONE sys_write and return its count
+# as Ok, so `ulimit -f 2` gave Ok(1024) for a 4096-byte write over a
+# file it had already truncated. CHANGELOG [6.6.6]
 fn file_write_all_r(path, buf, len): Result {
     var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);   # via the agnos bridge
     if (fd < 0) { return Err(_io_errno_to_iorr(0 - fd)); }
-    var n = sys_write(fd, buf, len);
+    var n = _io_write_full(fd, buf, len);
     sys_close(fd);
     if (n < 0) { return Err(_io_errno_to_iorr(0 - n)); }
     return Ok(n);
@@ -875,7 +1056,12 @@ fn _env_load(): i64 {
     var done = 0;
     while (done == 0) {
         var got = file_read(fd, buf + n, cap - n);
-        if (got <= 0) { done = 1; }
+        # v6.6.6: a read ERROR is not EOF. Folding the two cached a PREFIX of the environment
+        # forever — every later getenv answering from a block that stops mid-variable, with no
+        # way to tell that from a genuinely short environ. Leave the cache unset instead, the
+        # same answer an open failure gives, so a later call retries. CHANGELOG [6.6.6]
+        if (got < 0) { file_close(fd); return 0; }
+        if (got == 0) { done = 1; }
         else {
             n = n + got;
             if (n >= cap) {

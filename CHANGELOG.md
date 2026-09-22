@@ -2,7 +2,181 @@
 
 ## [Unreleased]
 
-### Changed — documentation sweep, 2026-09-14 (post-3.2.0; no behaviour change)
+## [3.2.1] - 2026-09-21 — cycc 6.6.6: the 2026-09-14 filing repaired upstream and closed here, a consumer already on 3.x, and a benchmark harness that reports a minimum above its own mean
+
+Toolchain **6.6.4 → 6.6.6** (crossing 6.6.5), ganita **1.2.5 → 1.2.6** (`f64_cbrt`, and a
+restructured `ganita_mat_inv`), sakshi **2.5.2** unchanged (still its latest tag). No library source
+change beyond comments: **4429/4429** on both compilers with the five suites' output
+**byte-identical**, every gate green, lock **32/32** (one new vendored file, `lib/alloc_cx.cyr`,
+the cx-backend allocator arm that `alloc.cyr` now includes — ⚠ it is a NEW file and must be added
+to the commit, or CI's lock gate fails on the entry the lock already carries).
+
+⭐ **6.6.5 repairs the register-picker defect hisab filed on 2026-09-14, and it is closed HERE** —
+the cyrius agent never edits this repo, so a fixed filing stays "do not tidy" in hisab's source and
+"blocked" in its roadmap until hisab closes it. Verified as a **pair from directories pinned to each
+version** (`cyrius build -v` naming the compiler, `~/.cyrius/bin/cycc` checked byte-identical to
+`versions/6.6.6/bin/cycc` and to the 6.6.6 tag's `build/cycc`), not read off the changelog:
+
+| probe | 6.6.4 | 6.6.5 | 6.6.6 |
+|---|---|---|---|
+| hisab's self-proving repro (picker ON) | `1 4 3`, exit **1** | `4 5 3`, exit **0** | `4 5 3`, exit **0** |
+| `m3_mul_vec3` in its NATURAL accessor form, `foundation.tcyr` | **427 / 429** — x = 1 for 4, y = 4 for 5 | — | **429 / 429** |
+| same, `modules.tcyr` | — | — | **2251 / 2251** |
+
+⚠ Inside `foundation.tcyr` the natural form does **not** SIGSEGV on 6.6.4 — it returns the silent
+`(1, 4, 3)`, and the two assertions 3.2.0 added for exactly that shape are what catch it. Upstream's
+six corrections to the filing are accepted and recorded (no `#derive` needed, every batch intrinsic,
+source slots too, reachable since 6.5.63, every x86 picker target, plus two false claims found in the
+cyrius tree alongside). **The hoisted form is KEPT, on its merits and not as a workaround**: all ten
+live consumers pin cycc **6.6.2–6.6.4** (read from their manifests), every one below the fix, and they
+compile `dist/hisab.cyr` under their own pins — where the natural form is silent wrong code. That is
+the disposition `m4_mul_vec4` (2.11.5) and `_cga_build_null_tbl` (3.0.1) already carry. The comment
+on the function no longer claims the hoist is required; it says why it stays. ⚠ Its first draft
+credited the hoist with "−6.5% against the natural form"; 3.2.0 measured that against the raw
+`store64`/`load64` z tail, and the natural accessor form was never timed because it crashed.
+Corrected before it landed.
+
+⛔ **A LIVE CONSUMER HAS BUILT A 3.x, AND THREE DOCS SAID NONE HAD.** prakash pinned hisab **3.1.1**
+on 2026-09-15 — `wave_pattern.cyr` binds `var rt, rv = num_fft(...)`, the post-`Result` idiom, and
+its comment cites the 3.0.0 break — so README, CLAUDE.md and the roadmap's *Get one live consumer onto
+3.0.x* item (which called itself "the highest-value action in this section") were false for one of
+ten from 2026-09-15 on. The roadmap item is closed; the other nine pins are recorded as they are
+(three on 2.22.1, six on 2.11.2). **Read the consumers' manifests on every release, not the paragraph
+about them** — this paragraph was corrected for the same reason in 3.2.0.
+
+⛔ **THE MINIMUM CONSUMER TOOLCHAIN HAS BEEN UNDOCUMENTED SINCE 3.1.0.** Building the regenerated
+bundle from a scratch dir pinned to each consumer's cycc: **6.6.3** and **6.6.4** (eight of the ten)
+compile it and a consumer-shaped program — `m3_mul_vec3` with a non-zero third column, `hvec3_cross`,
+`num_fft` both arms — runs correctly under each; **6.6.2** (goonj, attn11) refuses it with `#derive(...)
+applies to a struct or an enum` — exactly as it refuses the **3.1.0** bundle, while the **3.0.1**
+bundle compiles there. `public struct` + `#derive` needs cycc **≥ 6.6.3**, and 3.1.0 shipped it without saying so.
+Stated now in README and the 3.0 migration guide: **hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3**; goonj and
+attn11 must move their cyrius pin before any 3.x. The roadmap's "release-ordering constraint" for this
+bump is thereby answered — the constraint was real, pre-existing, and not about 6.6.6.
+
+⛔ **THE 6.6.5 BENCHMARK HARNESS REPORTS A MINIMUM ABOVE ITS OWN MEAN, AND HISAB'S FIXED-BATCH ROWS
+ARE WHERE IT SHOWS.** `lib/bench.cyr` 6.6.5 rewrote 16 of its 25 functions (added 19): `min`/`max`
+now come only from windows that clear a resolution bar of 100 × (clock read + tick) — 68 µs on this
+box — the raw total is netted at read time, the floor is re-calibrated at report, and ns round
+half-up. hisab registers 39 rows through `bench_batch(…, 2000, 200)`, a **fixed** 2000-op window; for
+a sub-40 ns op that window nets 30–60 µs, **under the bar**, so a plain window can never resolve and
+only a window that contained something slow does — the printed `min` is the minimum OF THE SLOW
+WINDOWS: `vec3_add: 16ns avg (min=39ns max=43ns)`. Isolated with three binaries interleaved ×4 on a
+quiet box (**A** 6.6.4 compiler + 6.6.4 harness, **B** 6.6.6 compiler + 6.6.4 harness, **C** 6.6.6 +
+6.6.6): rows with `min > avg` — A **0/320**, B **0/320**, C **24/320**, all seven affected benchmarks
+sub-40 ns with a sub-bar window, and every row whose window clears the bar consistent. **Filed
+upstream** (`cyrius/docs/development/issues/2026-09-21-hisab-bench-min-above-mean-below-resolution-bar.md`)
+with a self-proving repro that makes the slow window deterministic — a spike every third window —
+exit **0 on 6.6.4, 1 on 6.6.5 and 6.6.6** (`avg 20 ns, min 6 ns` → `avg 20 ns, min 47 ns`), with a
+control at 4× the bar that is consistent on every pin. hisab's local record is
+`docs/development/issues/2026-09-21-cyrius-bench-min-above-mean-below-resolution-bar.md`. ⭐ **The
+statistic hisab records did not move**: B → C `avg` median **+0.00%** (mean +0.31%) over 80 rows, so the
+CSV's `regime` stays `net` **on that measurement** rather than on the floor line's presence — which
+`bench-history.sh` had already warned "would NOT flip it" for exactly this kind of change; the script,
+`benchmarks.md`'s preamble and the local record all say so, and the harness's new `tick` is echoed in
+the run log so the two instruments can be told apart.
+
+⚠ **Five of my own instruments were wrong before anything measured was**, each caught by a check
+rather than believed: the 6.6.3 scratch dir had **no manifest**, so 332 `undefined variable 'F64_ONE'`
+errors read like a consumer failure and were an unpinned probe compiling with no stdlib; the consumer
+probe called `m3_set(m, 0, 2, …)` with the arguments **row-major** when `m3_set(m, col, row, v)` is
+column-first, printing "m3_mul_vec3 wrong" on every pin including the ones 4429 assertions had just
+proven; the B binary's tree got the 6.6.4 `bench.cyr` copied over a 6.6.6 **lock**, and a bare
+`cyrius build` silently re-vendored it to the lock's hash — B *was* C until the harness's own
+floor-line shape said otherwise (the swap now goes through an explicit `include` with `bench` removed
+from the manifest); a bash `[[ =~ ]]` was dry-run in **zsh** and "matched" with an empty capture; and
+a `$?` after a pipe read `tail`'s exit (the fourth recorded instance). ⚠ And the roadmap's pre-bump
+section — written before this session — said **"Zero `struct` declarations in `src/`"**; there are
+**22**, all `public struct`, which a `^struct` grep misses exactly as 3.1.0's `check-constants.sh`
+`^var` regex went blind to the annotation. Its conclusion (6.6.6's struct-shape refusals do not fire
+here) held because the build was RUN, not because the grep said so.
+
+### Changed
+- **cyrius.cyml** — `cyrius = "6.6.6"`. Both compiler caps re-derived on the **tag** (`op >
+  25165824` in `lex_pp.cyr`, `tc >= 4194304` in `lex.cyr`, unchanged between 6.6.4 and 6.6.6 although
+  both files moved ~1,800 lines for the preprocessor repairs); bundle **1,123,314 B / 26,640 lines =
+  4.46%** of the expanded-source cap.
+- **lib/** — 16 stdlib files move with the 6.6.6 tag and one is new; **31/31 byte-match the tag**,
+  `sakshi.cyr` byte-matches 2.5.2. Bodies diffed with comments stripped: `bench.cyr` 16 changed / 19
+  added (above); `ganita.cyr` 5 added (`f64_cbrt` and its bisect/seed helpers, `_ganita_mat_mul_into`)
+  and 5 changed — `ganita_mat_mul` now delegates with the **same** p-ascending accumulation, and
+  `ganita_mat_inv` (hisab's `matrix_condition_number`) went from `lu_solve` per unit column to inline
+  forward/back substitution skipping the permuted vector's known zeros: checked, not assumed —
+  **bit-identical** on a full-mantissa 4×4 for all 16 entries, the Frobenius norm and `A·A⁻¹`
+  samples, across compiler AND stdlib; `io.cyr` 6 added / 8 changed (atomic replace, checked writes —
+  hisab opens no files); `assert.cyr` +`_assert_pid`, `test_scratch`; `syscalls.cyr` `signal_*`; the
+  six `syscalls_*` peers (the aarch64 `SYS_UNLINKAT` 35 → 263 renumber 6.6.5 warned about is in);
+  `alloc`/`fmt`/`string`/`vec` gained explicit `include` lines only and `fnptr` moved in comments
+  only (bodies diffed: 9 fns, 0 changed). `alloc_cx.cyr` is the new cx-backend arm `alloc.cyr` includes.
+- **cyrius.lock** — 32 entries (was 31), trailer `cyrius	6.6.6`; `deps --verify` 32/32.
+- **src/mat3.cyr** — `m3_mul_vec3`'s comment: the hoist is no longer load-bearing on the pinned
+  toolchain; it stays for the consumer-pin and round-trip reasons above, each stated.
+- **tests/foundation.tcyr** — the tripwire block's comment names the pair it measured and points at
+  the archived record.
+- **docs/development/issues/** — `2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md` → `archived/`
+  with the paired table and upstream's six corrections; its repro moved beside it
+  (`…-picker-repro.cyr`, still self-proving from the new path). New:
+  `2026-09-21-cyrius-bench-min-above-mean-below-resolution-bar.md` (hisab's exposure; upstream holds
+  the filing). Open filings: **1** (the bench one; no library impact).
+- **docs/development/roadmap.md** — header and *Current* → 3.2.1 / 6.6.6 / ganita 1.2.6; the two
+  pre-bump sections (*Moving the cyrius pin to 6.6.5* / *… 6.6.6*) removed as completed, their
+  checks recorded here; *Get one live consumer onto 3.0.x* removed (prakash is on 3.1.1); *Toolchain,
+  tracked upstream* → the picker filing closed, the bench filing open; Consumers → the ten pins as
+  read today plus the **cyrius ≥ 6.6.3** constraint on the two 6.6.2 repos.
+- **README.md** — manifest `cyrius = "6.6.6"`, `tag = "3.2.1"`, a **minimum toolchain** line under
+  the 3.0.0 notice; Stats 3.2.1 / 6.6.6; Security cell: 0 open compiler filings, 1 open stdlib
+  (bench) filing, 32 archived; consumers: nine on 2.x, prakash on 3.1.1.
+- **CLAUDE.md** — toolchain 6.6.6 throughout; the 3.2.1 paragraph; the Consumers paragraph's "no live
+  consumer has built a 3.x" corrected (false for prakash since 2026-09-15).
+- **CONTRIBUTING.md** — toolchain line; the getter-inside-setter Code Style rule rewritten from
+  "avoid, cycc defect" to "fixed in 6.6.5; hisab keeps the hoisted shape for consumers below it".
+- **docs/guides/migration-3.0.md** — the minimum-toolchain note (a consumer moving to 3.x from a
+  6.6.2 pin needs the cyrius bump first).
+- **docs/development/dependency-watch.md** — 6.6.6 block; **docs/development/threat-model.md** —
+  the bump trail gains 6.6.6 and names the bench filing; **docs/architecture/overview.md** — compiled
+  by cycc 6.6.6; **docs/doc-health.md** — every touched row.
+- **scripts/bench-history.sh** — the fourth instrument change recorded in its schema notes with the
+  measurement that keeps `regime = net`; the 6.6.5+ `tick` is parsed and echoed. **benchmarks.md**
+  gains a dated 2026-09-21 bullet (the instrument, the `min`/`max` caveat for seven rows, and the
+  reboot the 3.2.0 rows sit across).
+- **dist/hisab.cyr** — regenerated; the diff is the version header plus the `m3_mul_vec3` comment
+  (comments ship in the bundle). `dist/hisab.deps` unchanged (16 leaves).
+
+### Not exposed — checked rather than assumed
+- **Windows `O_APPEND`/`O_TRUNC` corruption (6.6.6's headline)**: hisab's `src/` opens no file — 0
+  `file_open`/`sys_open`/`O_APPEND`/`O_TRUNC` sites outside vendored `lib/`.
+- **The SIMD-returning-fn refusal**: all 41 `f64v_*`/`iv_*` sites in `src/` are the memory form
+  through pointers; no fn declares a vector return. **Struct-shape refusals**: 22 `public struct`s,
+  none copied by value, passed by value, returned, or called at top level — and the build is the proof.
+- **Top-level block `var` scoping (6.6.6 language decision)**: every `.tcyr`/`.bcyr`/`.fcyr` is a
+  top-level program and all compiled unchanged, 4429/4429; upstream's 12,604-file survey found no
+  consumer reading a block `var` after its block, and hisab is not the exception.
+- **Function-like `#define` truncating the source at 1 MB**: hisab's 1.12 MB bundle has no
+  `#define`; the stdlib has none.
+- **The installed snapshots**: all five `~/.cyrius/versions/{6.6.2…6.6.6}/lib` are byte-identical
+  to their tags (103–104 of 103–104 each) — 3.0.1's mutable-directory hazard is absent on this box
+  today, and the TAG rule stays because the reference must be immutable, not merely currently right.
+- Binaries are **not** byte-identical: +12,648 to +16,800 B on every suite AND the 257 KB CLI that
+  includes no library — uniform, so it is the stdlib growth compiled into every binary, not codegen.
+- Pre-existing, not new: `cyrius check --with-deps tests/foundation.tcyr` still prints the 3.1.1
+  `comparison mixes f64 and integer operands` note; and the consumer probe drew the same note for its
+  bit-exact `!=` compares. Left as is.
+
+### Performance
+**No change is claimed, and for the first time the claim rests on a controlled same-session pair
+rather than on the CSV.** The 6.6.4-built and 6.6.6-built benchmark binaries run interleaved ×4 on a
+quiet box (load 0.5–1.7): total C/A median **−0.33%**, mean −0.64%, **0 of 80** rows past 10%; the
+compiler half alone (B/A, same harness) median **−0.62%**, 1 row past 10% (`cx_mul` −12.7%, inside its
+own 14.5% same-binary spread); the harness half alone (C/B) median **+0.00%**. Same-binary spread over
+the three recorded 3.2.1 runs: median **1.58%** (worst `triangulate_600gon` 58% on one outlier run).
+⚠ **The CSV rows cannot support the comparison the trend table draws**: against the 3.2.0 rows of
+2026-09-14 the same rows read median −3.8% / mean +2.4% with **30 of 80 past 10% in both directions**
+— the gjk/mpr/ray/cga family +12–37%, the mat4/quat/vec/num kernels −7–11% — and the 6.6.4 binary
+run TODAY shows the same pattern against its own 2026-09-14 rows. The box rebooted twice since
+(2026-09-16 with a kernel move 7.2.3 → 7.2.6, and 2026-09-18), and `floor_ns` went **1,336 → 337**:
+host state, and `floor_ns` is the marker `benchmarks.md` now tells readers to compare within.
+
+### Changed — documentation sweep, 2026-09-14 (post-3.2.0, shipped in this release; no behaviour change)
 - ⛔ **18 source doc comments still stated the pre-3.0.0 contract** — `Returns: HSB_ERR_NONE on
   success, HSB_ERR_X …` above functions that return `Ok(0)` / `Err(HSB_ERR_X)` (`calc_gradient`,
   `calc_jacobian`, `calc_hessian`, `sequential_impulse`, `eigen_symmetric`, `_lp_bidiagonalize`,

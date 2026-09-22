@@ -14,10 +14,53 @@ derived accessors for the 3.2.0 struct-layout gate. The natural rewrite — `HVe
 f64_add(HVec3_z(r), …))` between the `f64v_*` calls — died on every call through a global-operand
 loop while passing a single local-operand call. Shipped instead with the z tail accumulated in a
 local and stored through the setter ONCE; the comment on the function names this file.
-**Status:** 🔴 **OPEN — filed upstream 2026-09-14** at
-`cyrius/docs/development/issues/2026-09-14-hisab-simd-dst-slot-regalloc-picker.md` with the repro
-beside it under `repros/`, unchanged. hisab ships `m3_mul_vec3` in the hoisted form until a pin
-crosses the fix; archive this file when it does.
+**Status:** ✅ **CLOSED 2026-09-21 (hisab 3.2.1, cycc 6.6.4 → 6.6.6) — FIXED UPSTREAM IN cycc 6.6.5**,
+bite 1 of that release; cyrius archived the filing as
+`cyrius/docs/development/issues/archived/2026-09-14-hisab-simd-dst-slot-regalloc-picker.md` with six
+corrections to it (below). Filed upstream 2026-09-14 with the repro beside it. hisab keeps
+`m3_mul_vec3` in the hoisted form **on its merits, not as a workaround** — see *Closure*.
+
+## Closure — the paired measurement, 2026-09-21
+
+Verified as a **pair from directories pinned to each version** (`cyrius build -v` naming the
+compiler), not read off the changelog:
+
+| probe | 6.6.4 | 6.6.5 | 6.6.6 |
+|---|---|---|---|
+| this repro (`…-repro.cyr` beside this file), picker ON | prints `1 4 3`, exit **1** | `4 5 3`, exit **0** | `4 5 3`, exit **0** |
+| `m3_mul_vec3` in its NATURAL accessor form, `tests/foundation.tcyr` | **427 / 429** — x = 1 for 4, y = 4 for 5, the same `(1, 4, 3)` | — | **429 / 429** |
+| same, `tests/modules.tcyr` | — | — | **2251 / 2251** |
+| shipped (hoisted) form, all five suites | 4429 / 4429 | — | 4429 / 4429, output byte-identical |
+
+⚠ Inside `foundation.tcyr` the natural form does NOT SIGSEGV on 6.6.4 — it returns the silent wrong
+answer, and the two assertions 3.2.0 added for exactly this shape are what catch it. The SIGSEGV this
+filing reported was the 35-module tree with global operands; the crash was always the lucky half.
+
+**Upstream's corrections to this filing** (all six accepted; the symptom, disassembly and picker-off
+control were right, the diagnosis stopped one stage short and the scope was far wider):
+1. No `#derive`, setter, getter or shared object is needed — the trigger is any `#inline` or derived
+   call nested in another inline call's argument, in an earlier statement, followed by a batch
+   intrinsic with no `var` declared between. A `var` in between takes the freed slot and hides it,
+   which is why "each half alone is correct" held.
+2. Not only destinations: whichever operand slot is reused goes stale, in all 33 batch spellings;
+   the scalar-return `*_dot` / `iv_dp8` lose a SOURCE slot.
+3. The picker's patch pass did what it was built to do; the fault was CLASSIFICATION in the unsafe
+   scan (`48 8B 95` — `mov rdx,[rbp+disp32]`, 55 call sites in 19 emitters — waved through without
+   reading the ModRM reg field). Fixed by one predicate, `_ra_plain_slot_mov`, shared by all three
+   stages.
+4. The window is wider than 6.6.0–6.6.4: the `#inline` route fails from 6.5.63 and the `#derive`
+   route from 6.5.71; the classifier hole is as old as the picker (v5.6.20).
+5. Every x86 target that runs the picker (ELF, PE, x86 Mach-O, agnos); aarch64 has no picker.
+6. Two false claims found alongside upstream: a v6.5.64 comment saying `48 8B 95` was already
+   marked unsafe, and the 6.6.2 gate's picker-OFF axes that never built a picker-off binary.
+
+**Why the hoisted form stays (the roadmap row allowed either):** consumers compile `dist/hisab.cyr`
+under their OWN pins, and all ten live consumers pin cycc **6.6.2–6.6.4** (read from their
+manifests 2026-09-21) — every one below the fix, where the natural form is silent wrong code. That
+is the disposition `m4_mul_vec4` (2.11.5) and `_cga_build_null_tbl` (3.0.1) already carry. And 3.2.0
+measured the hoist at −6.5% against the raw `store64`/`load64` z tail it replaced, which the natural
+accessor form round-trips the same way. The comment on the function no longer claims the hoist is
+required; it says why it is kept.
 
 ## Summary
 
@@ -37,10 +80,10 @@ store to it.
 
 ## Reproduction
 
-`docs/development/issues/repros/2026-09-14-simd-dst-slot-regalloc-picker.cyr` — self-proving:
+`docs/development/issues/archived/2026-09-14-simd-dst-slot-regalloc-picker-repro.cyr` (moved beside this record at closure) — self-proving:
 
 ```
-cyrius build docs/development/issues/repros/2026-09-14-simd-dst-slot-regalloc-picker.cyr /tmp/repro
+cyrius build docs/development/issues/archived/2026-09-14-simd-dst-slot-regalloc-picker-repro.cyr /tmp/repro
 /tmp/repro          # prints "1 4 3" / WRONG, exit 1      (stock 6.6.4)
 CYRIUS_REGALLOC_PICKER_CAP=0 cyrius build ... /tmp/repro_np
 /tmp/repro_np       # prints "4 5 3" / OK, exit 0          (control)
@@ -81,5 +124,6 @@ last intrinsic. Audit: 32 packed stores, 0 unwritten; values bit-identical to th
 column is NOT zero and pins all three components bit-exactly — the only prior `m3_mul_vec3` test
 used the identity and read only z, so it could not have seen `(1, 4, 3)`.
 
-⚠ **Do not "tidy" `m3_mul_vec3` back to the natural accessor form until this is fixed upstream and
-hisab's pin has crossed the fix.** The comment on the function says so; this file is the reason.
+~~⚠ Do not "tidy" `m3_mul_vec3` back to the natural accessor form until this is fixed upstream and
+hisab's pin has crossed the fix.~~ Both conditions met 2026-09-21 (6.6.5 fixed it; the pin is 6.6.6).
+The hoisted form is kept for the reasons under *Closure*, and the comment on the function says so.

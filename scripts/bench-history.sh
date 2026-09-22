@@ -49,6 +49,23 @@ BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
 # "floor not subtracted" because that is what the output makes visible. A future
 # instrument change that keeps printing the floor line would NOT flip it. This
 # narrows the hole, it does not close it.
+#
+# ⭐ AND THAT FUTURE CHANGE ARRIVED (3.2.1, cyrius 6.6.4 -> 6.6.6): lib/bench.cyr
+# 6.6.5 rewrote 16 of its 25 functions -- min/max only from windows that clear a
+# resolution bar, the raw total netted at read time instead of per-window clamps,
+# floor re-calibrated at report, ps accessors, ns rounded half-up rather than
+# truncated (upstream calls it "regime 5"). The floor line kept printing, so this
+# column stayed `net`. It stays `net` ON A MEASUREMENT, not on the derivation:
+# three binaries interleaved x4 on a quiet box -- 6.6.4 compiler + 6.6.4 bench.cyr,
+# 6.6.6 compiler + 6.6.4 bench.cyr, 6.6.6 compiler + 6.6.6 bench.cyr -- put the
+# instrument half of the change at median +0.00% (mean +0.31%) on `avg` over 80
+# rows, 1 row past 10% and that row inside its own 14.5% same-binary spread. The
+# `avg` this file records is comparable across it; the `min_ns`/`max_ns` columns
+# are NOT for the seven sub-40 ns rows whose fixed 2000-op window sits under the
+# bar (see docs/development/issues/2026-09-21-cyrius-bench-min-above-mean-*.md).
+# The tick the new harness prints beside the floor is captured below and echoed,
+# so a reader of the run log can tell the two instruments apart even though the
+# column does not. [measured: 2026-09-21, scratch A/B/C harness]
 CSV_HEADER="timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters,regime,floor_ns"
 if [ ! -f "$HISTORY_FILE" ]; then
     echo "$CSV_HEADER" > "$HISTORY_FILE"
@@ -116,10 +133,16 @@ normalize_to_ns() {
 # ours, so the parser is anchored on its own field names independently.
 REGIME="raw"
 FLOOR_NS=""
+TICK_NOTE=""
 if [[ "$BENCH_OUTPUT" =~ \[timer\ floor\ ([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)\ per\ clock\ read ]]; then
     REGIME="net"
     FLOOR_NS=$(normalize_to_ns "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}")
-    echo "measurement regime: net (timer floor ${FLOOR_NS} ns, measured on this host, subtracted from every sample)"
+    # 6.6.5+ appends the measured clock tick to the same line; echo it so the run
+    # log tells the resolution-rule instrument from the pre-6.6.5 one.
+    if [[ "$BENCH_OUTPUT" =~ per\ clock\ read[^]]*\;\ tick\ ([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)\] ]]; then
+        TICK_NOTE=", clock tick $(normalize_to_ns "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}") ns — 6.6.5+ resolution-rule harness"
+    fi
+    echo "measurement regime: net (timer floor ${FLOOR_NS} ns, measured on this host, subtracted from every sample${TICK_NOTE})"
 else
     echo "measurement regime: raw (harness reported no measured timer floor — pre-6.5.19 instrument)"
 fi
@@ -267,6 +290,27 @@ with open(md_file, "w") as f:
     # the most recent entry here that affects it — the CSV cannot express that on
     # its own, and a silent step change reads as a win.
     f.write("> **Measurement changes** — read before comparing across a date.\n"
+            "> * **2026-09-21** (hisab 3.2.1, cyrius 6.6.4 → 6.6.6): `lib/bench.cyr` 6.6.5 rewrote\n"
+            ">   16 of its 25 functions — `min`/`max` only from windows that clear a resolution bar\n"
+            ">   (100 × clock read + tick), the raw total netted at read time instead of per-window\n"
+            ">   clamps, the floor re-calibrated at report, ns rounded half-up instead of truncated.\n"
+            ">   **The `avg` this table trends did not move**: three binaries interleaved ×4 on a quiet\n"
+            ">   box (6.6.4 compiler + 6.6.4 harness / 6.6.6 compiler + 6.6.4 harness / 6.6.6 + 6.6.6)\n"
+            ">   put the instrument half at median **+0.00%** (mean +0.31%) and the compiler half at\n"
+            ">   median −0.62% over 80 rows, 1 row past 10% in each and that row (`cx_mul`) inside its\n"
+            ">   own 14.5% same-binary spread — so `regime` stays `net` on a measurement, not on the\n"
+            ">   floor line's presence. ⚠ `min_ns`/`max_ns` are NOT comparable across this date for\n"
+            ">   the seven sub-40 ns rows whose fixed 2000-op window sits under the bar (`vec3_add`,\n"
+            ">   `vec3_cross`, `vec3_normalize`, `vec3_lerp`, `vec2_lerp`, `tonemap_reinhard`,\n"
+            ">   `num_gcd`): under 6.6.5+ only a perturbed window resolves there, so the printed `min`\n"
+            ">   is the minimum OF THE SLOW WINDOWS and sits above `avg` (`vec3_add: 16ns avg\n"
+            ">   (min=39ns …)`). Filed upstream with a self-proving repro\n"
+            ">   (`docs/development/issues/2026-09-21-cyrius-bench-min-above-mean-*.md`).\n"
+            ">   ⚠ Separately, the rows dated 2026-09-14 and earlier were taken on a previous BOOT\n"
+            ">   (kernel 7.2.3, `floor_ns` ≈ 1,340); the box rebooted 2026-09-18 (7.2.6, tsc,\n"
+            ">   `floor_ns` ≈ 337) and the geometry/collision family reads 15–37% slower while the\n"
+            ">   dense kernels read 7–11% faster on the SAME 6.6.4 binary — host state, not code.\n"
+            ">   `floor_ns` is the marker; compare only within one boot.\n"
             "> * **2026-08-21** (hisab 2.11.2, cyrius 6.5.18 → 6.5.33): `lib/bench.cyr` now\n"
             ">   MEASURES one clock read on the host and subtracts it from every sample, and\n"
             ">   `bench_run` sizes its own batches instead of wrapping a clock pair around every\n"

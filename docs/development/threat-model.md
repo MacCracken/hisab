@@ -109,11 +109,14 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
 
 - No third-party runtime dependencies — only the cyrius stdlib and first-party
   **sakshi**. No FFI, no libc. Third-party-CVE attack surface is zero.
-- Integrity enforced by the SHA-locked `cyrius.lock`: 31 entries, 1 commit-pinned, and since
-  cyrius 6.6.4 a `cyrius\t<pin>` trailer; `cyrius deps --verify` → 31 verified / 0 failed;
-  `cyrius vet` → 2 deps, 0 untrusted, 0 missing (verified 2026-09-14 on the 6.6.4 pin).
-  All 30 vendored stdlib `lib/*.cyr` files byte-match the **cyrius git tag** for the pin
-  (`git -C ~/Repos/cyrius show 6.6.4:lib/<f>`), and `lib/sakshi.cyr` its 2.5.2 tag.
+- Integrity enforced by the SHA-locked `cyrius.lock`: 32 entries, 1 commit-pinned, and since
+  cyrius 6.6.4 a `cyrius\t<pin>` trailer; `cyrius deps --verify` → 32 verified / 0 failed;
+  `cyrius vet` → 2 deps, 0 untrusted, 0 missing (verified 2026-09-21 on the 6.6.6 pin).
+  All 31 vendored stdlib `lib/*.cyr` files byte-match the **cyrius git tag** for the pin
+  (`git -C ~/Repos/cyrius show "6.6.6:lib/<f>"` — quoted, or zsh reads `:l` as a modifier),
+  and `lib/sakshi.cyr` its 2.5.2 tag. On 2026-09-21 all five installed slots 6.6.2–6.6.6 also
+  byte-matched their tags (103–104 files each), so the 6.6.4 repairs below hold on this box;
+  the rule below stays because the reference must be immutable, not merely currently right.
   ⛔ The reference is the TAG, never `~/.cyrius/versions/<pin>/lib/`: that directory is
   mutable. First seen 2026-08-07 (the 6.5.9 slot refreshed in place after 2.9.1 shipped),
   then decisively at 3.0.1 (2026-09-13): the installed "6.6.2" slot held 6.6.3's twelve
@@ -166,7 +169,24 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
   hisab's own suites in this arc**, both filed upstream with self-proving repros: 2.11.3's
   `f64v_*` destination slot read from a stack slot nothing wrote (all 21 SIMD handlers; repaired
   in 6.6.2), and 3.2.0's register picker dropping an intrinsic's destination-slot store when a
-  derived setter's value reads the same object through its getter (wrong on 6.6.0–6.6.4; OPEN,
-  worked around in `m3_mul_vec3`). A miscompile is a supply-chain risk this threat model had not
-  named: the mitigation is that every suite binary is now audited for unwritten destination slots
-  (0 in the shipped tree) and the shape is documented in CONTRIBUTING.md's code-style rules.
+  derived setter's value reads the same object through its getter (wrong on 6.6.0–6.6.4;
+  **repaired in 6.6.5 and closed in 3.2.1** with a paired measurement, `m3_mul_vec3` keeping its
+  hoisted form because every live consumer compiles the bundle under a pin below the fix). A
+  miscompile is a supply-chain risk this threat model had not named: the mitigation is that every
+  suite binary is now audited for unwritten destination slots (0 in the shipped tree) and the shape
+  is documented in CONTRIBUTING.md's code-style rules.
+- **2026-09-21**: Cyrius 6.6.4 → **6.6.6** toolchain bump (v3.2.1), crossing 6.6.5; ganita
+  1.2.5 → 1.2.6, sakshi 2.5.2 unchanged. No library source change; 4429/4429 with byte-identical
+  suite output on both compilers. Security-relevant upstream content, checked for exposure rather
+  than assumed: 6.6.6's Windows `O_APPEND`/`O_TRUNC` silent corruption (hisab opens no files),
+  CVE-44 (installer staged its tarball and signature at fixed `/tmp` names — hisab's CI pipes the pin
+  into the upstream installer, which now stages in a private dir) and CVE-45 (an included file or
+  macro body could forge the `#@file` marker `private` visibility is enforced against — hisab has
+  no `#define` and its public-surface gate probes calls, so a forged marker would have shown up as a
+  refused public item or an accepted private one; 891 / 458 probes unchanged). One new upstream
+  filing from this bump, **not security-relevant**: `lib/bench.cyr` 6.6.5 reports a benchmark `min`
+  above its own `avg` for sub-40 ns fixed-batch rows (a statistic, not a code path; hisab's recorded
+  `avg` unmoved). ⛔ **A consumer-facing constraint found here, undocumented since 3.1.0**: cycc
+  6.6.2 refuses every 3.1.0+ bundle (`public struct` + `#derive`), so a consumer on 6.6.2 that
+  bumps `[deps.hisab]` past 3.0.1 gets a build failure, not a silent one — stated in README and the
+  migration guide.

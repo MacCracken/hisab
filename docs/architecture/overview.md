@@ -3,8 +3,9 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v3.2.0 — 35 math modules in `src/`, 26,567 lines of Cyrius (`lib/` is
-> vendored stdlib + first-party deps only). Compiled by cycc 6.6.4.
+> hisab v3.2.1 — 35 math modules in `src/`, 26,573 lines of Cyrius (`lib/` is
+> vendored stdlib + first-party deps only). Compiled by cycc 6.6.6; a consumer needs cycc ≥ 6.6.3
+> (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map
 
@@ -212,8 +213,10 @@ dy/dt = f(t, y)
 
 ## Consumers
 
-Ten repos pull `dist/hisab.cyr` SHA-locked today — svara, naad, goonj (tag 2.22.1), dhvani, attn11,
-ghurni, prani, garjan, prakash, nidhi (tag 2.11.2); pins read from their manifests 2026-09-14. The
+Ten repos pull `dist/hisab.cyr` SHA-locked today — prakash (tag 3.1.1, the first past the `Result`
+break), svara, naad, goonj (tag 2.22.1), dhvani, attn11, ghurni, prani, garjan, nidhi (tag 2.11.2);
+pins read from their manifests 2026-09-21; goonj and attn11 pin cyrius 6.6.2, below the 3.1.0+
+bundle's minimum. The
 whole surface they reach is **35 public fns in 8 modules** (vec3, num, num_ext, calc, calc_ext, geo,
 geo_advanced, f64_util) — the measured per-module column is in the roadmap's *Boundary with Abaco*
 table. The projects below are the **planned** consumers: Rust repos awaiting a Cyrius port, with no

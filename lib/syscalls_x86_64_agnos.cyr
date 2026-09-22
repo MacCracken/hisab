@@ -618,6 +618,26 @@ fn sys_chdir(path): i64 { return 0 - 38; }
 # guessing a number here is the worst available option. CHANGELOG [6.5.7]
 fn sys_fchownat(dirfd, path, uid, gid, flags): i64 { return 0 - 38; }
 
+# ── v6.6.5: agnos peers for the new lib/syscalls_linux_common.cyr wrappers.
+# ⛔ NO `SYS_*` LINUX CONSTANT IS DECLARED FOR ANY OF THESE, deliberately. agnos owns its
+# own syscall space and the Linux numbers land on live, unrelated calls here: #44 is
+# sched_yield, #46 time_unix, #47 sock_connect (which BLOCKS ~8 s), #76 blk_open and #77
+# blk_read — so minting `SYS_FTRUNCATE = 77` on this peer would make a portable
+# `sys_ftruncate(fd, len)` issue a raw block-device READ. Explicit -38/-ENOSYS stubs, the
+# same shape sys_fchownat above takes and for the same measured reason.
+# Send a message over a socket. agnos has no msghdr surface; sock_send(#48) is the peer,
+# and it takes a flat (conn_id, buf, len) — not a renumber of this call.
+fn sys_sendmsg(fd, msghdr, flags): i64 { return 0 - 38; }
+# Send a datagram to an address. agnos sockets are connection-id based (sock_connect +
+# sock_send); there is no unconnected send-to-address form.
+fn sys_sendto(fd, buf, len, flags, dstaddr, dstaddrlen): i64 { return 0 - 38; }
+# Set a file's length by descriptor. agnos has no truncate family.
+fn sys_ftruncate(fd, length): i64 { return 0 - 38; }
+# Set a file's length by path. agnos has no truncate family.
+fn sys_truncate(path, length): i64 { return 0 - 38; }
+# Create an anonymous in-memory file. agnos has no memfd; shared memory is sys_mmap.
+fn sys_memfd_create(name, flags): i64 { return 0 - 38; }
+
 # at-family constants. The Linux values, defined here so the PORTABLE surface is
 # complete: this peer is STANDALONE (it does not include syscalls_linux_common.cyr,
 # where these live for the Linux/macOS peers), so without them a consumer calling
@@ -840,20 +860,62 @@ fn sys_lstat(path, pathlen, statbuf): i64 { return syscall(SYS_LSTAT, path, path
 # ⚠ -1 is legitimate and must be passed through, not normalised: an unresolvable path is
 # refused deliberately (that refusal is the assertion catching an implementation that ignores
 # its path argument), and FAT/exFAT refuse rather than guess when a FAT or bitmap read fails.
-# ⚠ AGNOS-ONLY, AND THAT ASYMMETRY IS DELIBERATE RATHER THAN OVERLOOKED. `sys_fork` and
-# `sys_lstat` exist on the other peers already; `sys_statfs` exists NOWHERE else in this
-# repo, so a consumer that calls it builds on agnos and fails to LINK on linux / aarch64 /
-# macOS / PE. It is left that way on purpose: the filing asked for the agnos peer (crab's M6
-# VOLUMES panel targets agnos), no caller exists yet ecosystem-wide, and the alternative was
-# to invent statfs numbers for four more targets from memory. Guessing a syscall number is
-# precisely the defect class v6.5.36 and v6.5.37 spent two releases repairing — `sys_pause`
-# issuing flock, `sys_umount2` issuing getpid — so an honest gap beats a plausible wrong
-# number. A fail-closed -1 stub would be worse still on Linux and macOS, which genuinely
-# HAVE statfs: it would claim unsupported where support exists.
-# UPGRADE PATH when a cross-platform consumer appears: add the real numbers (verified against
-# each kernel's table, not from memory) to the peers that have the call, and a documented
-# fail-closed stub only where the OS truly lacks it — the shape `sys_fstat` above uses.
+# ⭐ v6.6.6 — THE UPGRADE PATH BELOW WAS TAKEN, so the "AGNOS-ONLY" note that stood here is
+# now HISTORY, not a current fact. It read: "`sys_statfs` exists NOWHERE else in this repo …
+# the alternative was to invent statfs numbers for four more targets from memory. Guessing a
+# syscall number is precisely the defect class v6.5.36 and v6.5.37 spent two releases
+# repairing … an honest gap beats a plausible wrong number." That reasoning was right, and
+# the cross-platform consumer it was waiting for turned up: yukti's `filesystem_usage`,
+# which had been hardcoding raw numbers all along and whose aarch64 arm was silently running
+# **accept(2)**. The numbers are now minted the way that note demanded — MEASURED, not
+# recalled: Linux 137/138 (x86_64) and 43/44 (aarch64) read off the host and off pi, Darwin
+# statfs64/fstatfs64 345/346 live-probed on ach and ecb against libc, and a documented
+# fail-closed -38 on Windows, which has no statfs at all.
+#
+# ⚠ THE AGNOS WRAPPER KEEPS ITS OWN SIGNATURE and a consumer must notice. agnos's #103 is
+# 3-arg `(path, pathlen, buf)` because the kernel takes an explicit path length; every other
+# peer's is 2-arg `(path, buf)` over a NUL-terminated path. Unifying them is an agnos kernel
+# ABI change, not a stdlib edit, so the divergence is recorded here rather than papered over
+# — guard the agnos call site with `#ifdef CYRIUS_TARGET_AGNOS`, as crab's VOLUMES panel does.
+# The RECORD, in contrast, is compatible enough to share accessor names: agnos's frozen
+# 32-byte layout is f_bsize@0 / f_blocks@8 / f_bfree@16 / f_bavail@24, all u64 — the same
+# four fields the `Statfs` enum below publishes on every peer. CHANGELOG [6.6.6]
 fn sys_statfs(path, pathlen, buf): i64 { return syscall(SYS_STATFS, path, pathlen, buf); }
+
+# Filesystem statistics by DESCRIPTOR — NOT IMPLEMENTED on agnos. Returns -ENOSYS (-38).
+#
+# agnos has the path-based `statfs`#103 and no fd-based peer at all — the same gap as
+# `sys_fstat` below, and for the same reason (there is no fstat-by-fd number either). The
+# stub exists so portable source that calls BOTH forms — yukti's `filesystem_usage` does —
+# compiles for agnos instead of failing to link on this one target. ⚠ It was missed when the
+# other four peers landed earlier in this same release, which is precisely the half-fix the
+# PE declines were added to prevent: a wrapper on 4 of 5 peers is a hard compile error on the
+# fifth, not a degraded answer.
+# ⛔ NO `SYS_FSTATFS` CONSTANT, on the v6.6.5 rule recorded above: agnos owns its syscall
+# space, Linux's 138 is absent from agnos's frozen contract entirely, and minting it here
+# would invite a raw `syscall(SYS_FSTATFS, …)` into an undefined kernel call AND redden
+# tests/gates/platform/agnos_abi_doc_parity.sh axis 2 ("the cyrius peer defines syscall
+# number(s) absent from the frozen contract").
+# UPGRADE PATH: if agnos ever mints an fstatfs number, add the constant WITH its contract row
+# and replace this body with `syscall(SYS_FSTATFS, fd, buf)`. CHANGELOG [6.6.6]
+fn sys_fstatfs(fd, buf): i64 { return 0 - 38; }
+
+# Field offsets into the statfs record, on the `Stat` contract: every peer publishes this
+# enum so cross-platform source can name the fields unconditionally. agnos's own values are
+# the frozen 32-byte record documented above; STATFS_BUFSZ is the ecosystem-wide max (Darwin
+# needs 2168) so one `var buf[STATFS_BUFSZ]` compiles everywhere. agnos writes only the
+# first 32 bytes — the call has no length parameter, so a larger buffer is inert, not a risk.
+enum Statfs {
+    STATFS_BSIZE = 0;
+    STATFS_BLOCKS = 8;
+    STATFS_BFREE = 16;
+    STATFS_BAVAIL = 24;
+    STATFS_BUFSZ = 2176;
+}
+
+# f_bsize at the right width for this target — u64 on agnos (see the frozen record above).
+# The macOS peer's is uint32, which is why callers must go through this rather than load64.
+fn statfs_bsize(buf): i64 { return load64(buf + STATFS_BSIZE); }
 
 # ⭐ v6.5.37 — `fork`#96: a second process resuming at the caller's own fork site. Returns the
 # child's pid to the parent and 0 to the child, -1 on failure — the POSIX shape.
@@ -1347,6 +1409,15 @@ fn sys_uptime_ms(): i64 { return syscall(SYS_UPTIME_MS); }
 # Block the caller ~ms ms (#41; halts until the 100 Hz tick, capped 1 h).
 # Returns 0. Drives chrono.cyr's agnos sleep_ms. Guard ms<=0 at call sites.
 fn sys_sleep_ms(ms): i64 { return syscall(SYS_SLEEP_MS, ms); }
+# v6.6.5 — sleep for a `struct timespec` ({tv_sec, tv_nsec} at +0/+8), the portable
+# spelling the Linux/macOS/PE peers all carry. REAL on agnos rather than a stub: #41
+# sleep_ms is the honest peer, so this converts to flat ms exactly as the PE backend's
+# ENANOSLEEP_PE reroute does. `rem` is unused — #41 does not report a short sleep.
+fn sys_nanosleep(req, rem): i64 {
+    var ms = load64(req) * 1000 + load64(req + 8) / 1000000;
+    if (ms <= 0) { return 0; }
+    return syscall(SYS_SLEEP_MS, ms);
+}
 
 # Raw TCP. sock_connect(#47) does socket()+connect() in one and BLOCKS
 # ~8s; dst_ip is the kernel ip4() form (oct1<<24)|…|oct4 (net.cyr byte-

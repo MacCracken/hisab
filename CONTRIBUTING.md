@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.6.4 as of 3.1.1. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
+- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.6.6 as of 3.2.1. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work
@@ -88,7 +88,7 @@ Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never 
 
 - All f64 values stored as IEEE 754 bit patterns (use `f64_from()` / `f64_to()`)
 - Heap-allocate structs through their declared layout: `var v = alloc(sizeof(T)); T_set_x(v, x); return v;` — never a hardcoded byte count or a hand-computed offset for a type that has a `struct` (every public struct's `sizeof` is pinned exactly in `tests/abuse.tcyr` since 3.2.0). Manual `alloc(N)` + `store64` layouts are for types with no struct declaration only
-- Use `#derive(accessors)` for struct field access. ⚠ In a function that also expands `f64v_*` intrinsics, never read a derived getter of an object INSIDE the value argument of a derived setter on that same object — cycc 6.6.0–6.6.4 miscompiles that shape (open filing; see `m3_mul_vec3`)
+- Use `#derive(accessors)` for struct field access. ⚠ In a function that also expands `f64v_*` intrinsics, accumulate in a local and store through the setter ONCE rather than reading a derived getter INSIDE the value argument of a derived setter on the same object — cycc 6.6.0–6.6.4 miscompiled that shape (fixed in 6.6.5, hisab's pin crossed it in 3.2.1), and consumers compile `dist/hisab.cyr` under their OWN pins, all of them below the fix as of 2026-09-21 (see `m3_mul_vec3`)
 - Prefix private helpers with underscore: `fn _my_helper()`. Public API carries `public` (`public fn`, `public struct`, `public var`, `public enum`); a `_` helper another module reaches also carries `public` plus the `# public: cross-module helper reached from …` marker comment, and owes a 4.0.0 disposition on the roadmap
 - Comment f64 hex constants with their decimal value
 - Use `elif` not `else if`

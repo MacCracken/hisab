@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.6.4**. Stdlib `ganita` (6.2.x math umbrella) provides dense
+> Written in Cyrius. Toolchain: **6.6.6**. Stdlib `ganita` (6.2.x math umbrella) provides dense
 > decompositions + transcendentals.
 
 ⭐ **This file is future-facing only.** Nothing below has shipped. The record of what *has* is:
@@ -27,14 +27,16 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.2.0
+## Current — v3.2.1
 
 Suite **4429** across five harnesses (hisab 585, foundation 429, modules 2251, edge_cases 260,
 abuse 904), constant gate **159/159**, **80** benchmarks, **35** `[lib]` modules, toolchain
-**6.6.4**, sakshi **2.5.2**, ganita **1.2.5**. All gates green; per-release detail is in
+**6.6.6**, sakshi **2.5.2**, ganita **1.2.6**. All gates green; per-release detail is in
 [`CHANGELOG.md`](../../CHANGELOG.md). **2.24.0 is the supported 2.x line** — 3.0.0's `Result<T, E>`
 migration is breaking, has no deprecation window, and
-[`../guides/migration-3.0.md`](../guides/migration-3.0.md) is the consumer-facing guide.
+[`../guides/migration-3.0.md`](../guides/migration-3.0.md) is the consumer-facing guide. ⚠ **hisab
+≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`; measured 3.2.1: the 3.0.1 bundle
+compiles under 6.6.2, the 3.1.0 bundle does not).
 
 ## How to read this file
 
@@ -120,25 +122,6 @@ wrap.
 **Order:** the dispositions above → rewrite or promote the 64 `_` names the suites reach → flip
 `private` last. The consumer-call gate already exists (`check-public-surface.sh` claim 2).
 
-### Get one live consumer onto 3.0.x — **[unversioned — external]**
-
-**No live consumer has built a 3.x.** Measured from each manifest's `[deps.hisab] tag` on
-2026-09-14: svara, naad and goonj pin **2.22.1** (so they have crossed the 6.6.x toolchain bump and
-the 536-site ganita alias migration); dhvani, attn11, ghurni, prani, garjan, prakash and nidhi pin
-**2.11.2**. None has crossed the `Result<T, E>` break. `cyrius check --with-deps dist/hisab.cyr`
-proves the bundle compiles against **this** manifest's ganita — not against theirs, and not against
-a real call graph. ⚠ The pin matters to THEM for a second reason: `_cga_build_null_tbl` keeps its
-`if`-guard form because a consumer compiles the bundle under its OWN cycc, and the natural
-`continue` form is silently wrong below 6.6.3.
-
-⛔ **The `Result` break makes this urgent rather than merely overdue**, because of the failure mode
-the migration guide leads with: a `Result` in *argument* position does not error, it degrades to its
-tag, and `Ok` tag = 0 = `HSB_ERR_NONE`. A consumer whose checks look like
-`assert_eq(f(...), HSB_ERR_NONE)` will **build clean and test nothing**. Hand them
-`scripts/check-result-migration.sh`, which exists for exactly that class and is mutation-proven.
-**Highest-value action in this section.** The reached surface is small — **35 distinct public fns
-in 8 modules** across all ten (see the Boundary table) — so a port is bounded.
-
 ---
 
 ## Toolchain, tracked upstream
@@ -148,16 +131,22 @@ language agent reads them — **and closed in THIS repo too when a bump fixes th
 cyrius agent never edits hisab (the pattern: a hisab-side record in `issues/archived/` carrying the
 paired measurement, written on the bump that closes it).
 
-⛔ **ONE hisab-filed toolchain item is OPEN** — filed 2026-09-14 as
-`cyrius/docs/development/issues/2026-09-14-hisab-simd-dst-slot-regalloc-picker.md` (+ repro),
-recorded here as `issues/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md`. cycc's register
-picker rewrites an `f64v_*` intrinsic's destination-slot store into a register move when a derived
-SETTER's value argument reads the same object through the derived GETTER; the inline loop still
-reads the slot. Silent `(1, 4, 3)` for `(4, 5, 3)` standalone, SIGSEGV inside hisab; wrong on
-**6.6.0 through 6.6.4** from dirs pinned to each. **Until a pin crosses the fix**, `m3_mul_vec3`
-keeps its z tail in a local and stores it through the setter ONCE (comment on the function) — do not
-tidy it back to the natural form. When it closes: archive the filing here, and the hoisted form may
-stay on its own merit (−6.5% measured).
+⭐ **The 2026-09-14 register-picker filing is CLOSED** — fixed upstream in cycc 6.6.5, hisab's pin
+crossed it in 3.2.1 with the paired measurement in
+`issues/archived/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md`. `m3_mul_vec3` keeps its hoisted
+z tail on its merits (every live consumer pins 6.6.2–6.6.4, below the fix); the comment says so.
+
+⛔ **ONE hisab-filed toolchain item is OPEN** — filed 2026-09-21 as
+`cyrius/docs/development/issues/2026-09-21-hisab-bench-min-above-mean-below-resolution-bar.md` (+
+self-proving repro: exit 0 on 6.6.4, 1 on 6.6.5/6.6.6), recorded here as
+`issues/2026-09-21-cyrius-bench-min-above-mean-below-resolution-bar.md`. `lib/bench.cyr` 6.6.5 lets a
+window into `min`/`max` only if it clears a 100 × (clock read + tick) bar; a fixed 2000-op window for
+a sub-40 ns op sits under it and resolves only when perturbed, so the printed `min` is the minimum of
+the SLOW windows and sits above `avg` (`vec3_add: 16ns avg (min=39ns …)`, 24 of 320 rows, 7
+benchmarks). **No hisab number is wrong** — the CSV records `avg`, measured unmoved (median +0.00%) —
+but `min_ns`/`max_ns` for those seven rows are not comparable across 2026-09-21. No source change:
+widening `bench_batch` is a benchmark-shape change (2.20.0). When it closes: archive the record, and
+re-check whether `bench_run_batch`'s fixed windows still need the caveat in `benchmarks.md`.
 
 **`bench_run` auto-batching (6.5.19)** — already in force. The **39 `bench_batch()` call sites are
 deliberately unchanged**: they buy a FIXED window rather than escape the timer floor, which is still
@@ -209,14 +198,32 @@ indistinguishable once the reason is gone.
 
 ## Consumers
 
-**Ten repos consume `dist/hisab.cyr` today, SHA-locked**: svara, naad, goonj (tag **2.22.1**),
-dhvani, attn11, ghurni, prani, garjan, prakash, nidhi (tag **2.11.2**) — read from each
-`cyrius.cyml` on 2026-09-14. `svara/src/spectral.cyr:246` calls `num_fft`.
+**Ten repos consume `dist/hisab.cyr` today, SHA-locked** — read from each `cyrius.cyml` on
+2026-09-21: **prakash** on hisab **3.1.1** (cyrius 6.6.4; pinned 2026-09-15, `num_fft` through the
+`var rt, rv = …` idiom — the first live consumer past the `Result` break, which closed the roadmap
+item that said none had); svara, naad, goonj on **2.22.1**; dhvani, attn11, ghurni, prani, garjan,
+nidhi on **2.11.2**. Their cyrius pins are **6.6.3** (svara, naad, dhvani, ghurni, prani, garjan,
+nidhi), **6.6.4** (prakash) and **6.6.2** (goonj, attn11). `svara/src/spectral.cyr:246` calls `num_fft`.
+
+⛔ **goonj and attn11 cannot take ANY hisab ≥ 3.1.0 until they move their cyrius pin**: `public
+struct` + `#derive` is refused by cycc 6.6.2 (`#derive(...) applies to a struct or an enum`), measured
+on the 3.1.0 and 3.2.1 bundles from a dir pinned to 6.6.2, while the 3.0.1 bundle compiles there.
+Under 6.6.3 and 6.6.4 the 3.2.1 bundle compiles and a consumer-shaped program runs correctly. ⚠ The
+pin matters to every consumer for a second reason: `_cga_build_null_tbl` keeps its `if`-guard form and
+`m3_mul_vec3` its hoisted z tail because a consumer compiles the bundle under its OWN cycc, and the
+natural forms are silently wrong below 6.6.3 and 6.6.5 respectively.
+
+⛔ **The remaining nine are still on 2.x, and the `Result` break's failure mode is silent**: a
+`Result` in *argument* position degrades to its tag, and `Ok` tag = 0 = `HSB_ERR_NONE`, so
+`assert_eq(f(...), HSB_ERR_NONE)` **builds clean and tests nothing**. Hand a migrating consumer
+`scripts/check-result-migration.sh`, which exists for exactly that class and is mutation-proven. The
+reached surface is small — **35 distinct public fns in 8 modules** (Boundary table) — so each port is
+bounded.
 
 ⛔ **impetus, kiran, joshua, aethersafha, hisab-mimamsa and kana are NOT consumers** — they have no
 `cyrius.cyml` on any branch. They are Rust repos needing a *port*, not a scheduling decision
 (verified 2026-09-09, and again 2026-09-14 for abaco: its README calls hisab a sibling, not a
-consumer). The table below is what they *would* use, kept because it is the planning
+consumer; the ten live pins re-read 2026-09-21). The table below is what they *would* use, kept because it is the planning
 surface; it is not a statement that anything is wired up.
 
 | Planned consumer | Domain | Surface it will use |
@@ -269,7 +276,9 @@ README lists hisab as a *sibling* library, "not a consumer" (measured 2026-09-14
 row in the planned-consumer table above is therefore a plan on hisab's side only. Across the ten
 live consumers the whole reached surface is **35 distinct public fns in 8 modules**
 (vec3, num, num_ext, calc, calc_ext, geo, geo_advanced, f64_util); ghurni `include`s the bundle
-and calls nothing from it, nidhi names hisab only in a comment, and **0 of 10 reference `HSB_*`**.
+and calls nothing from it, nidhi names hisab only in a comment, and **0 of 10 reference `HSB_*` in
+`src/`** — prakash's `tests/wave_pattern.tcyr` asserts `HSB_ERR_INVALID_INPUT` as the Err payload of
+`num_fft(…, 3)`, which is the correct post-3.0.0 idiom (re-read 2026-09-21).
 Eight of hisab's 35 modules have a live caller; the 27 others — everything the rows above mark
 "none" included — are reached only by hisab's own suites.
 The only git dep is sakshi, and `deps --verify` already fails any unreviewed dep — **no gate is owed

@@ -1,6 +1,6 @@
 # num_ext.cyr -- extended numerical methods for hisab
-# Usage: include "lib/num_ext.cyr"
-# Requires: alloc.cyr, vec.cyr, math.cyr, f64_util.cyr, error.cyr, num.cyr
+# Usage: shipped inside dist/hisab.cyr; in-tree, include "src/num_ext.cyr" after what it requires
+# Requires: src/error.cyr, src/num.cyr (stdlib resolves via cyrius.cyml [deps])
 #
 # Provides:
 #   Number theory:   num_extended_gcd, num_euler_totient, num_mobius,
@@ -292,24 +292,10 @@ public fn num_factorize(n) {
 
     if (n <= 1) { return factors; }
 
-    # Use a stack (vec) for recursive rho factorization
-    var stk = vec_new();
-    vec_push(stk, n);
-
-    while (vec_len(stk) > 0) {
-        var slen = vec_len(stk);
-        var m = vec_get(stk, slen - 1);
-        # Pop by creating new stack without last element
-        # (simple approach: rebuild, or use a top-index)
-        # We'll use a manual index approach
-        vec_set(stk, slen - 1, 0);
-        # Shrink: we reuse the vec but track length manually
-        # Since vec doesn't have pop, we'll use an index-based stack
-        # Re-approach: use separate index tracking
-        break;
-    }
-
-    # Simpler approach: iterative rho decomposition
+    # Iterative rho decomposition: `work` holds the cofactors still to split and
+    # `wi` the next one to take. (Through 3.3.1 an abandoned stack-based first
+    # attempt sat here: it allocated a vec, pushed n and broke out of its loop on
+    # the first pass, and nothing read it. 3.3.2 deleted it.)
     var work = vec_new();
     vec_push(work, n);
     var wi = 0;
@@ -679,8 +665,20 @@ fn _numx_log2(n) {
 # {26, 38, 39}, and nothing else moves. The bounds are load-bearing -- widening
 # the surcharge to m <= 256 drags n = 58/59/60 across a band that is currently
 # picked correctly, and raising it to 1/8 flips n = 40, where the FFT is
-# measurably faster (66486 ns vs 67340 ns). Residual: DCT n = 27 is still a 3%
-# mispick. The model is a fit, not a derivation; it does not claim to be exact.
+# measurably faster (66486 ns vs 67340 ns). Residual on cycc 6.5.6: DCT n = 27
+# was a 3% mispick. The model is a fit, not a derivation; it does not claim to be
+# exact.
+# [measured: 2.8.4 scratch harness, not reproducible in-tree, 2026-08-05; cycc 6.5.6]
+#
+# Re-timed on cycc 6.6.12 for 3.3.2, both DCT paths forced, per-call mean of 1000
+# calls, minimum of 15 rounds, in two independent harness runs (four runs, then
+# nine passes under load): n = 27's FFT pick and n = 39's direct pick (2.8.4
+# moved n = 39 to direct, when direct was 2.6% faster on 6.5.6) are each within
+# about 2% of the other path and usually the slower of the two, so both are
+# mispicks of about 1%. n = 27 changed sign in one of the nine passes; n = 39 never
+# did. The right picks at n = 26, 38 and 40 win by 3.1-10.9%.
+# The cost units above were not refit.
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30 and 2026-10-01; cycc 6.6.12]
 fn _numx_use_fft(n, len, post) {
     var direct = 2 * n * n;
     var est = 16;
@@ -1136,7 +1134,7 @@ public fn num_halton(index, base) {
 # Writes two f64 values to out_x and out_y.
 # index: positive integer
 # out_x, out_y: pointers for the two coordinates
-# Returns: 0
+# Returns: Ok(0), always -- it cannot fail.
 public fn num_halton_2d(index, out_x, out_y) {
     store64(out_x, num_halton(index, 2));
     store64(out_y, num_halton(index, 3));
@@ -1183,7 +1181,8 @@ public fn num_sobol(index) {
 #   out: pointer to n f64 values where solution is written
 #
 # Note: a, b, c, d are NOT modified. Temporary workspace is allocated.
-# Returns: Ok(0) on success, HSB_ERR_DIVISION_BY_ZERO if pivot is zero
+# Returns: Ok(0) on success, HSB_ERR_DIVISION_BY_ZERO if pivot is zero,
+#          HSB_ERR_INVALID_INPUT if n <= 0, HSB_ERR_ALLOC if a workspace allocation fails
 #
 # NOTE for anyone adding a fixture: a DIAGONAL system (a and c all zero) makes
 # c'[i] == 0, collapses denom to b[i] and multiplies both the d' recurrence and
@@ -1211,10 +1210,21 @@ public fn num_tridiag_solve(a, b, c, d, n, out) {
     }
 
     # Allocate workspace for modified c' and d'
-    # ⚠ CALLER-SIZED, CHECKED -- see num_fft_2d above. Measured, n = 300,000,000
-    # gives alloc(n*8) = 2.4 GB against an ALLOC_MAX of 2 GiB, and the forward
+    # ⚠ CALLER-SIZED. Measured, n = 300,000,000 gives alloc(n*8) = 2.4 GB against an
+    # ALLOC_MAX of 2 GiB, and until 2.11.1 added the null checks below, the forward
     # sweep's first store went through the null (exit 139).
     # [measured: docs/development/issues/archived/2026-08-11-caller-sized-allocs-in-num_ext.md]
+    # ⛔ 3.3.2 — AND UNTIL 3.3.2 NOTHING BOUNDED n BEFORE `n * 8` WAS FORMED. n need not
+    # be a power of two, so n = 2^61 + 1 (and 2^62 + 1) wrapped it to 8, alloc honoured
+    # 8 bytes, and the forward sweep wrote past both workspaces: a fresh alloc(64)
+    # after the call held 6-8 nonzero words (0 at n = 4), and with large caller arrays
+    # the process died (exit 139). With small ones it returned
+    # Err(HSB_ERR_DIVISION_BY_ZERO), only because a pivot read out of bounds fell below
+    # F64_TINY. The bound is derived and written as a division, num_fft_2d's form:
+    # ALLOC_MAX / 8 is the largest n whose `n * 8` alloc honours, so only the wrapping
+    # windows change; every larger n already returned Err(HSB_ERR_ALLOC).
+    # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+    if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }
     var cp = alloc(n * 8);    # c' (n-1 used, but allocate n for simplicity)
     var dp = alloc(n * 8);    # d'
     if (cp == 0) { return Err(HSB_ERR_ALLOC); }

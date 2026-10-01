@@ -262,7 +262,7 @@ converge), `J∥u → 0`, `|u|²` scaling, flat `0`, linear in `J`.
 ### 2.5 Parallel transport (`parallel_transport`)
 
 ```
-dV^a/dt = −Γ^a_{μν} V^μ ẋ^ν     (RK4; Γ constant per step, like geodesic_rk4)
+dV^a/dt = −Γ^a_{μν} V^μ ẋ^ν     (RK4; Γ held constant for the whole path, like geodesic_rk4)
 ```
 
 Linear in V (`dV/dt = M·V` for fixed `ẋ`). Metric-compatible: `⟨V,V⟩` is preserved.
@@ -305,12 +305,12 @@ and in the references below. This index keeps them findable from one place.
 |------|----------|-------|
 | Quaternions / rotation | slerp, axis-angle, `q v q⁻¹`, to/from matrix | `quat.cyr`, `mat3.cyr` (`m3_from_quat`) |
 | Transforms / projection | SRT compose, Euler orders, perspective/ortho, world↔screen | `transforms.cyr`, `mat4.cyr` |
-| Geometry | 6 ray tests, closest-point, GJK/EPA simplex, MPR portal refinement | `geo.cyr`, `geo_advanced.cyr`, `collision_core.cyr` |
+| Geometry | 6 ray tests, closest-point, GJK/EPA simplex, MPR portal refinement | `geo.cyr`, `geo_advanced.cyr` (MPR since 3.3.0; `collision_core.cyr` before) |
 | Collision algorithms | monotone-chain hull, ear-clipping, Bowyer-Watson in-circle predicate, sequential-impulse `Δλ = −(1+e)v_eff/m`, PGS/LCP | `collision_core.cyr`, `collision_mesh.cyr`, `linalg_ext.cyr` (`solve_pgs`) |
 | Calculus | Simpson / Gauss-Legendre nodes, Bezier/B-spline/NURBS bases, gradient/Jacobian/Hessian, Perlin/simplex | `calc.cyr`, `calc_ext.cyr`, `noise_simplex.cyr` |
 | ODE | RK4, DOPRI45 / BDF-2..5 tableaux, symplectic (Verlet/Yoshida), SDE (Euler-Maruyama/Milstein) | `ode.cyr` (BDF coefficients verified in the threat-model) |
 | Numerical LA | CSR, GMRES/BiCGSTAB, SVD (Golub-Kahan), eigen (power/Jacobi), Lyapunov, inertia | `linalg_ext.cyr`, `linalg_precision.cyr` |
-| Number theory | extended GCD, totient, Möbius, CRT, Pollard-rho, Russian-peasant `_num_mulmod` | `num.cyr`, `num_ext.cyr` |
+| Number theory | extended GCD, totient, Möbius, CRT, Pollard-rho, `num_mulmod` (public since 3.3.0): exact to m = 2^63 − 1 in three tiers — direct product to 3037000500, Russian-peasant doubling to 2^62, a non-wrapping add-mod above; through 3.2.x the doubling loop ran at every modulus and wrapped above 2^62 | `num.cyr`, `num_ext.cyr` |
 | Complex / physics | matrix exponential, Pauli/Dirac γ, einsum contraction | `complex.cyr`, `einsum.cyr` |
 | Lie groups | U(1)/SU(2)/SU(3) generators, SO(3,1), SE(3)/SO(3) exp/log, adjoint, BCH | `lie.cyr`, `lie_ext.cyr` |
 | Differential geometry | Christoffel → Riemann/Ricci/Einstein, sectional/Weyl curvature, geodesic deviation, parallel transport, exterior algebra | **§2 above** + `diffgeo.cyr` |

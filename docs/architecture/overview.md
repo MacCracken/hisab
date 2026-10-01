@@ -3,7 +3,7 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v3.3.1 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 26,756
+> hisab v3.3.2 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 26,899
 > lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.12; a
 > consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
@@ -36,7 +36,7 @@ hisab (Cyrius)
 │   └── spatial.cyr        — k-d tree, octree, quadtree, spatial hash (BVH lives in geo_advanced)
 │
 ├── Collision
-│   ├── collision_core.cyr — sequential-impulse solver + PGS/LCP, convex hull 2D
+│   ├── collision_core.cyr — sequential-impulse solver, convex hull 2D
 │   │                         (monotone chain), triangulation (ear clipping)
 │   └── collision_mesh.cyr — Delaunay (Bowyer-Watson), half-edge mesh, island detection (union-find)
 │
@@ -243,10 +243,13 @@ Ten repos pull `dist/hisab.cyr` SHA-locked today — prakash (tag 3.2.1, the fir
 break), svara, naad, goonj (tag 2.22.1), dhvani, attn11, ghurni, prani, garjan, nidhi (tag 2.11.2);
 pins read from their manifests 2026-09-30; goonj and attn11 pin cyrius 6.6.2, below the 3.1.0+
 bundle's minimum. Four more (jalwa, ranga, shabda, shabdakosh) carry a copy transitively. The
-whole surface they reach is **35 public fns in 8 modules** (vec3, num, num_ext, calc, calc_ext, geo,
-geo_advanced, f64_util) — the measured per-module column is in the roadmap's *Boundary with Abaco*
-table. The projects below are the **planned** consumers: Rust repos awaiting a Cyrius port, with no
-`cyrius.cyml` on any branch.
+whole surface they reach is **34 public fns in 8 modules** (vec3, num, num_ext, calc, calc_ext, geo,
+geo_advanced, f64_util; re-counted 2026-09-30, 35 at the 2026-09-14 count) — the measured
+per-module column is in the roadmap's *Boundary with Abaco* table. The projects below are the
+**planned** consumers. impetus, kiran, joshua, hisab-mimamsa and kana are Rust repos awaiting a
+Cyrius port. aethersafha is a Cyrius port now (`cyrius = "6.6.11"`) and abaco a Cyrius repo
+(`cyrius = "6.6.12"`), and neither declares `[deps.hisab]` (both manifests read 2026-09-30);
+abaco's README calls hisab a sibling.
 
 | Planned project | What it would use |
 |---------|-------------|

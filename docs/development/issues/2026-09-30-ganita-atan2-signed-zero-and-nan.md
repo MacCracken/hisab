@@ -30,9 +30,10 @@ quadrant with IEEE comparisons, which treat −0 and +0 as equal:
 in the same way.
 
 The two Lie-group calls are not exposed to the signed-zero rows, because their `y` is a scaled norm
-(`_lie_norm3`) and a norm is never −0. `su2_log` (`lie.cyr`) also returns before calling unless
-`y > 0`. `so3_log` (`lie_ext.cyr`) returns early only when `cos θ > 0`. It could therefore reach
-the NaN row, but only with a NaN rotation matrix whose `cos θ` term is exactly ±0.
+(`lie_norm3`, named `_lie_norm3` through 3.2.x) and a norm is never −0. `su2_log` (`lie.cyr`)
+also returns before calling unless `y > 0`. `so3_log` (`lie_ext.cyr`) returns early only when
+`cos θ > 0`. It could therefore reach the NaN row, but only with a NaN rotation matrix whose
+`cos θ` term is exactly ±0.
 
 ## Nothing changed for hisab in 3.2.2
 

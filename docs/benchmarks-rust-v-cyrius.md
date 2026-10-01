@@ -208,6 +208,11 @@ table can be compared with these.
 
 ## Full Cyrius Benchmark Set (21 benchmarks, 2026-04-15)
 
+*(Noted 2026-09-30, v3.3.2.)* These are v2.2.0 numbers from the pre-2.10.0 instrument that the
+header describes, so every sub-microsecond row carries the clock pair. They are kept as the
+2026-04-15 record. The current Cyrius figures are the head-to-head column above and
+`bench-history.csv`.
+
 | Benchmark | Avg (ns) | Min (ns) | Iterations |
 |-----------|---------|---------|------------|
 | vec3_add | 434 | 400 | 1,000,000 |
@@ -234,30 +239,58 @@ table can be compared with these.
 
 ## Analysis
 
-### Why Cyrius is 30-700x slower per-operation
+> *(Noted 2026-09-30, v3.3.2.)* This section is the 2026-04-15 (v2.2.0) analysis, kept as that
+> record, with its stale facts corrected inline. Its per-factor costs date from the same
+> pre-2.10.0 instrument as the 21-benchmark table, so they are not current measurements. The
+> refreshed head-to-head table above (3.2.0 on cycc 6.6.4) puts the ratios at **9x–85x**, not
+> 30–700x.
+
+### Why Cyrius is 30-700x slower per-operation (2026-04-15)
 
 | Factor | Cost | When |
 |--------|------|------|
 | Heap allocation | ~200-400ns per alloc+store | Every Vec3/Quat/Mat4 |
 | f64 vs f32 | ~1.5-2x | All math |
-| No SIMD | ~2-4x | Vector/matrix ops |
+| No SIMD *(stale: since 2.3.1 the vec3/vec4/mat3/mat4/quat hot paths use `f64v_*` (vec2's lerp since 3.2.0))* | ~2-4x | Vector/matrix ops |
 | fncall overhead | ~10-20ns | Integration, root finding |
 | Combined typical | 30-100x | Simple vector/matrix ops |
 | Combined worst | 400-700x | Trivial ops (ease, lerp) |
 
-### Where Cyrius wins
+### Where Cyrius wins (2026-04-15)
 
 | Metric | Rust | Cyrius |
 |--------|------|--------|
-| Binary | ~800KB dynamic | 511KB static |
+| Binary | ~800KB dynamic | 511KB static *(v2.2.0)* |
 | Build | seconds | instant |
 | Precision | f32 (1e-7) | f64 (1e-12) |
 | Dependencies | 9 crates | 1 (sakshi) |
-| Source | 33,612 lines | 15,676 lines |
+| Source | 33,612 lines | 15,676 lines *(v2.2.0)* |
 
-### Optimization vectors for future versions
+*(Noted 2026-09-30, v3.3.2.)* Both *(v2.2.0)* figures are from the 33 modules that v2.2.0's
+`src/main.cyr` included. At the 3.3.1 tag the 35 modules hold **26,743 lines**, and `dist/hisab.cyr`
+is 1,137,745 bytes. Today's `build/hisab` is a version printer with no library code in it, so the
+like-for-like binary is a version-printing `main` that includes all 35 modules. Built on cycc 6.6.12
+with the default flags, that binary is **884,216 bytes**, static. The compiler reports 1,815
+unreachable functions (775,559 bytes) in it, which `CYRIUS_DCE=1` would drop. So the binary row
+no longer favours Cyrius as built.
+[measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12, tree at tag 3.3.1]
+
+### Optimization vectors for future versions (2026-04-15)
 
 1. **Arena allocation** -- amortize alloc across batch ops
 2. **Stack structs** -- Cyrius single-field structs are stack-allocated
 3. **SIMD** -- Cyrius 5.x roadmap; would close gap 2-4x
 4. **Inline expansion** -- `#regalloc` + DCE already help; future inlining would help trivial wrappers
+
+*(Noted 2026-09-30, v3.3.2.)* Where these stand now:
+
+- **SIMD** shipped in **2.3.1**: the vec3/vec4/mat3/mat4/quat hot paths route through the
+  packed-double `f64v_*` builtins (vec2's lerp since 3.2.0). The flat-array kernels (`_opt_*`,
+  `_lext_*`) are left. They are a demand-gated roadmap row (roadmap § 3.x.x — demand-gated,
+  *SIMD the flat-array kernels*, audit D018), waiting on a consumer-sourced `n`.
+- **Arena allocation**, **stack structs** and **inline expansion** are not on hisab's roadmap.
+  None is planned unless a consumer asks. The first two cut against a cost that the head-to-head
+  paragraph above says is paid by design: a heap allocation for every returned vector, matrix or
+  quaternion. Stack structs would also change every returned handle, which is a breaking change.
+  Inline expansion is a compiler capability: cycc's `#inline` takes at most two parameters, and
+  hisab writes it only on the 18 hand-written `GeoJet` accessors in `geo_diff.cyr`.

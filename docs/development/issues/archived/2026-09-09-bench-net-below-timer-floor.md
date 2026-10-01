@@ -3,7 +3,11 @@
 **Component:** `tests/hisab.bcyr` + `scripts/bench-history.sh` (the `regime=net` instrument).
 **Severity:** Measurement — no wrong code, but **41 rows of `benchmarks.md` cannot support a
 performance claim** and one of them moved −56% this release on nothing.
-**Status:** Open. Filed rather than fixed in 2.11.3; scheduled on the roadmap.
+**Status:** 🔴 **Refuted and archived 2026-09-09 (v2.11.4)**: see the section of that name below.
+No work is owed. *Original status line, kept for the record:* "Open. Filed rather than fixed in
+2.11.3; scheduled on the roadmap." The 2.11.3 roadmap row ("Give the benchmark harness
+resolution, not just an unbiased floor") was struck as refuted in 2.11.4. As of 2026-09-30 the
+roadmap's only mention of this file was the [3.3.2] row (audit D135) that corrected this header.
 
 ## The finding
 

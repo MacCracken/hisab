@@ -16,13 +16,18 @@ cycc must accept it whole. Two caps apply, and the token cap can bind before the
 | expanded source | 25,165,824 B (24 MiB) | `src/frontend/lex_pp.cyr:4197` (`op > 25165824`; also `:4533`, `:4644`) |
 | tokens | 4,194,304 | `src/frontend/lex.cyr:273` (`tc >= 4194304`) |
 
-The bundle is 1,137,745 B at 3.3.1 (1,126,262 B at 3.3.0), 4.52% of the byte cap, so there is no size pressure. The history of
+The bundle is 1,157,699 B at 3.3.2 (1,137,745 B at 3.3.1), 4.60% of the byte cap, so there is no size pressure. The history of
 these figures is in CHANGELOG 2.11.3. That release measured both caps as a pair: a 9,002,640 B
 source was rejected by 6.5.33 and compiled on 6.6.1. It also found the token cap binding first, at
 8.2 MB. The 1 MB and 16 MB figures quoted before it both described `_SRC_CAP`, the raw read buffer,
 which is not what rejects a consumer's build. **On every toolchain bump, re-derive both caps by
 grepping the new TAG, and check which one binds.** A limit taken from a dependency is a measurement,
 and it goes stale silently.
+
+⚠ **Each bump entry below records the verdicts of its own date.** A toolchain filing an entry calls
+open or still live has since been archived: every hisab-side cyrius record is in
+[`issues/archived/`](issues/archived/); the one open record, ganita's `atan2` (stdlib), is in the
+6.6.12 entry.
 
 **Upstream notes (5.x line):**
 - 5.0+: `lib/matrix.cyr` overflow class addressed; SVD precision improvements landed.
@@ -64,8 +69,10 @@ and it goes stale silently.
     duplicate-symbol warning, 6.6.11's lint pre-pass and `cyrius test` tally rule, and `distlib`'s
     five-target verify. All pass.
   - **Consumers.** The 3.2.2 bundle runs correctly under 6.6.3, 6.6.6, 6.6.10 and 6.6.12, and is
-    refused under 6.6.2. Two results follow the consumer's pin: −0 from negation (6.6.8+), and
-    `dual_pow` within 1 ulp (6.6.10+).
+    refused under 6.6.2. Three results follow the consumer's pin: −0 from negation (6.6.8+); the
+    spatial-hash cell of a NaN coordinate, which is cell 0 from 6.6.8 (`f64_to(NaN)` is 0) and was
+    i64::MIN below it on x86, so a query at the origin returns a point inserted at NaN (CHANGELOG
+    3.2.2; the contract, *some* cell, is unchanged); and `dual_pow` within 1 ulp (6.6.10+).
   - **Caps and coverage.** Both caps are unchanged on the tag (see **Compiler limits the bundle must
     fit** above). `cyrius coverage` reads 642/643 over 35/35 files, because 6.6.11 stopped counting
     `main.cyr`.
@@ -79,7 +86,8 @@ and it goes stale silently.
   byte-match the 6.6.6 tag. `bench.cyr` 16 of 25 fns changed / 19 added (the 6.6.5 resolution rule,
   raw-total netting, floor re-check, ps accessors, half-up rounding — measured a no-op on the `avg`
   hisab records, median +0.00%, but its `min`/`max` for hisab's seven sub-40 ns fixed-batch rows come
-  from perturbed windows only and sit ABOVE `avg` → **filed upstream 2026-09-21**, open);
+  from perturbed windows only and sit ABOVE `avg` → **filed upstream 2026-09-21**; fixed in 6.6.9
+  and closed here in 3.2.2, see the 6.6.12 entry above);
   **ganita 1.2.5 → 1.2.6**: `f64_cbrt` (+ bisect/seed helpers, four new constants),
   `ganita_mat_mul` delegating to `_ganita_mat_mul_into` with the same accumulation order,
   `ganita_mat_inv` restructured (forward/back substitution on the permuted unit vector instead of
@@ -128,8 +136,9 @@ and it goes stale silently.
 
   ⭐ **`#derive` + `public` is FIXED**, verified on hisab's own idiom in both directions: 6.6.2
   rejects it; 6.6.3 builds it, derived getters AND setter reachable cross-file (exit 0), and a
-  consumer calling the file-private helper is still refused with no binary. The roadmap's
-  public/private row is unblocked; the work stays scheduled (3.1.0 / 3.3.0).
+  consumer calling the file-private helper is still refused with no binary. That unblocked the
+  roadmap's public/private row, which has since shipped: 3.1.0 declared the surface `public`, and
+  3.3.0 made the bundle `private`.
   Record: `issues/archived/2026-09-11-cyrius-derive-cannot-combine-with-public.md`.
 
   ⛔ **THE INSTALLED "6.6.2" SNAPSHOT WAS NOT 6.6.2.** `~/.cyrius/versions/6.6.2/lib` held 6.6.3's
@@ -140,8 +149,9 @@ and it goes stale silently.
   were right. **And a bare `cyrius build` under the unchanged 6.6.2 pin silently rewrote
   `lib/ganita.cyr` to 1.2.5 and re-locked it**, printing exactly what a no-op prints; only
   `git status` noticed. Both halves filed upstream with a self-proving repro
-  (`cyrius/docs/development/issues/2026-09-13-hisab-refresh-only-overwrites-released-snapshot.md`,
-  `…/2026-09-13-hisab-deps-relocks-silently-under-unchanged-pin.md`). **The vendoring check now
+  (`cyrius/docs/development/issues/archived/2026-09-13-hisab-refresh-only-overwrites-released-snapshot.md`,
+  `…/archived/2026-09-13-hisab-deps-relocks-silently-under-unchanged-pin.md`; both fixed in 6.6.4,
+  see that entry above). **The vendoring check now
   compares every `lib/` file against `git show <pin>:lib/<file>` in the cyrius repo — the tag, never
   the install dir**: 30/30 match 6.6.3's tag, sakshi matches its 2.5.2 tag, `deps --verify` 31/31.
 
@@ -198,8 +208,9 @@ and it goes stale silently.
   accessors on the inline-replay path (`callq` 7 → 3), removing the call that had incidentally
   forced the spill. Worked around in `src/mat4.cyr` by hoisting the accessors into locals (what
   `m3_mul_vec3` always did). ⛔ **SUPERSEDED 2026-09-09**: cycc 6.6.2 repairs this upstream (see the 6.6.2 entry above). The hoist is verified non-load-bearing and is retained only for consistency with `m3_mul_vec3`. **Filed in the cyrius repo** (that is where the language agent reads them):
-  `cyrius/docs/development/issues/2026-09-09-hisab-derive-accessor-simd-dst-slot.md`, with a
-  self-validating repro in `repros/` — exit 0 on 6.5.70, exit 139 on 6.6.1.
+  `cyrius/docs/development/issues/archived/2026-09-09-hisab-derive-accessor-simd-dst-slot.md`
+  (archived upstream as fixed in 6.6.2), with a self-validating repro in `issues/repros/` — exit 0
+  on 6.5.70, exit 139 on 6.6.1.
 
   ⭐ **DEPRECATED ALIASES: MIGRATED IN 2.11.4, and the estimate in this paragraph was wrong by 67x.**
   It read "hisab uses `f64_acos` 5x and `f64_atan2` 3x" and closed with "hisab calls `ganita_mat_*`
@@ -257,8 +268,13 @@ and it goes stale silently.
     sample; `bench_run` sizes its own batches. **44 of hisab's 72 rows moved >10%, none a speedup.**
     Drove the `regime`/`floor_ns` columns in `bench-history.csv`. See `benchmarks.md`.
   - **`fmt_float_buf` (6.5.30)** — emitted the integer part before rounding the fraction, so a
-    carry was lost: `3 - 1e-7` printed `2.1000000`. hisab's own `_sym_render_f64` is a hand-copy of
-    this routine and is now a redundant duplicate; filed on the roadmap, not fixed here.
+    carry was lost: `3 - 1e-7` printed `2.1000000`. hisab's own `_sym_render_f64` was a hand-copy of
+    this routine and became a redundant duplicate with this fix. It was filed on the roadmap in
+    this release (2.11.2) and scheduled for 2.20.0, which repaired the wrong output of both public
+    renderers (`expr_to_str`, `sym_to_latex`) above 2^63 but kept the helper; the row then closed
+    as shipped. **Retired in 3.3.2** (audit `D075`): `sym_const_to_str` calls `fmt_float_buf`
+    directly, after a differential over 3,538,970 inputs found 0 mismatches under each of the
+    eleven cycc releases 6.6.2 through 6.6.12 (figures in that function's comment).
   - **`assert_eq` (6.5.19)** — its two numbers went to fd 1 while the rest of the message went to
     fd 2, orphaning them under any harness that captures the streams separately.
 
@@ -283,14 +299,14 @@ and it goes stale silently.
 
   Its headline fix is a **`cyrius fmt` bug that corrupted multi-line string literals** — a continuation line was given the enclosing statement's indentation, putting spaces *inside* the string; upstream measured it rewriting **1,239 lines of cyrius's own `src/main.cyr`**. hisab's exposure was checked rather than assumed: all **44 sources are still `fmt --check` clean** under the repaired formatter, so no hisab file had been silently reformatted by the broken one.
 
-  ⚠ **The open dead-function-bodies filing was re-run on 6.5.18 from its own repro and is UNCHANGED**: `cyrius build` and `cyrius check --with-deps` reject a file that does not parse (exit 1), but **`cyrius lint` and `cyrius vet` still exit 0**. Still partial, still open, and now verified across two consecutive releases rather than assumed to have been swept up.
+  ⚠ **The open dead-function-bodies filing was re-run on 6.5.18 from its own repro and is UNCHANGED**: `cyrius build` and `cyrius check --with-deps` reject a file that does not parse (exit 1), but **`cyrius lint` and `cyrius vet` still exit 0**. Still partial, still open, and now verified across two consecutive releases rather than assumed to have been swept up. ⭐ *Later:* fixed upstream and closed here in 2.11.3 on cycc 6.6.1, where `lint` catches it too (`issues/archived/2026-08-09-cyrius-dead-fn-bodies-are-never-syntax-checked.md`).
 
 - **6.5.17** (v2.10.0): single-release bump from 6.5.16. **Compiler-only — zero stdlib delta**: all 29 vendored `.cyr` files plus `sakshi.cyr` byte-match the 6.5.17 snapshot AND are byte-identical between 6.5.16 and 6.5.17 for hisab's declared subset, so `cyrius lib sync` was a no-op and `deps --verify` stayed 30/30. Suite unchanged at 3376 across the bump itself (3398 after 2.10.0's own additions), all gates green.
 
   **This release fixes all three defects hisab filed upstream during the 2.9.2/2.9.3 work.** Each was re-verified by re-running its own filed repro on the new pin rather than read off the release note:
   - **Capturing closure SIGSEGV across a function boundary — FIXED.** The filed case-3 program returns **42** (was SIGSEGV 139) and the `fncall1` variant returns 42 too, so both dispatch paths are repaired. Archived. ⚠ **This retires the measured half of the `vec_sort_by` deferral below** — a capturing comparator now works and can close over the `points` vector, so the "shared mutable global" objection is gone. What survives is the plain API mismatch (`fncall2(cmp, elem_a, elem_b)` passes values, hisab sorts *indices*) plus CLAUDE.md's wait-for-the-third-instance rule; still one call site.
   - **`cyrius distlib` rejecting correct bundles — FIXED.** `cyrius distlib` on hisab's real bundle exits **0**, and the three-arm minimal reproducer passes on stdlib function / global var / enum constant alike. **The CI and release workaround is removed** — both workflows run a bare `cyrius distlib` again and a non-zero exit is a real failure once more. The independent `cyrius check --with-deps dist/hisab.cyr` step was kept; it is strictly stronger than the self-check ever was.
-  - ⚠ **Dead-function bodies never syntax-checked — PARTIALLY fixed, still open.** `cyrius build` and `cyrius check --with-deps` now both reject the repro (exit 1), which is the half that matters: nothing unparseable can be built or shipped. But **`cyrius lint` and `cyrius vet` still exit 0** on a file that does not parse, so the release note's "accepted by every gate" is not discharged. Measured, fed back to the upstream filing, left open.
+  - ⚠ **Dead-function bodies never syntax-checked — PARTIALLY fixed, still open.** `cyrius build` and `cyrius check --with-deps` now both reject the repro (exit 1), which is the half that matters: nothing unparseable can be built or shipped. But **`cyrius lint` and `cyrius vet` still exit 0** on a file that does not parse, so the release note's "accepted by every gate" is not discharged. Measured, fed back to the upstream filing, left open (closed in 2.11.3; see the 6.5.18 entry above).
 
 - **6.5.16** (v2.9.2): bump from 6.5.9 across **seven releases** (6.5.10–6.5.16). **No library source change** — all 34 modules compile clean; the `dist/hisab.cyr` diff is the version header and nothing else. Re-vendored via `cyrius lib sync` — all 27 declared-subset files byte-match the 6.5.16 snapshot; the transitive `lib/result.cyr` is outside the declared subset and `lib sync` does not touch it, so it was hand-refreshed (its only delta is two doc-comment paths, from 6.5.11's test-suite subfolder reorg), and `lib/atomic.cyr` was already identical. All **30** vendored files byte-match `~/.cyrius/versions/6.5.16/lib/`; `cyrius.lock` 30 deps (1 commit-pinned), verify 30/30. sakshi **2.4.8 → 2.4.10** (see the sakshi section below). Stdlib delta was **10 files** plus the transitive `result.cyr`:
   - **`alloc.cyr`** — 6.5.10 inlined the two accessor loads in `alloc_via` / `realloc_via` / `free_via` / `reset_via` (`fncall2(allocator_alloc_fn(a), allocator_state(a), size)` → `fncall2(load64(a), load64(a + 32), size)`) and removed the `_arena_alloc` / `_arena_reset` shims, pointing `allocator_new` at `&arena_alloc` / `&arena_reset` directly. **hisab never takes that path** — **zero** calls to `alloc_via` / `allocator_new` / the removed shims anywhere in `src/`, and the four functions hisab does call are **byte-identical** before and after. Cyrius's own "15.1 ns of which 5.1 ns was those two calls" is *its* measurement of a path hisab does not enter, and is not restated as a hisab number.
@@ -306,7 +322,7 @@ and it goes stale silently.
   - **`cyrius distlib` fails its own bundle self-check on a correct bundle**, and both `ci.yml` and `release.yml` were red because of it. 6.5.14 repaired a self-check that had never once run; the repaired check compiles the bundle **alone** under `_cc_allow_undef`, which is read only in the *fixup* stage and only gates `reachable undefined function(s)`. An unresolved **name** dies far earlier in the frontend (`parse_expr.cyr:585-593` → `undefined variable '…'`, immediate exit), so the suppression cannot reach it by construction. hisab's bundle reads `F64_ONE` **294 times**, first at `dist/hisab.cyr:108` (`hvec2_one`) — it is the ordinary way to write `1.0` in a language with no float literals, so this is not a removable dependency. Both workflows now tolerate a non-zero `distlib` rc **only** with that exact signature, and add `cyrius check --with-deps dist/hisab.cyr`, which compiles the bundle with the stdlib actually in scope. → [`issues/archived/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md`](issues/archived/2026-08-09-cyrius-distlib-selfcheck-rejects-stdlib-globals.md)
   - **`dist/hisab.deps` is now tracked** (removed from `.gitignore`, added to CI's drift check), so a consumer's `cyrius deps` auto-resolves hisab's stdlib leaves instead of the four consumers hand-declaring them. It was worth nothing before **6.5.10**: the sidecar was built by scanning bundled sources for literal `include "lib/X.cyr"` lines, and hisab's `[lib]` modules are self-contained, so it reported **2** leaves. 6.5.10 unions in the declared `[deps] stdlib` — hisab goes **2 → 15**.
 
-  Tracked-issue re-verification against 6.5.16 is carried separately and is **not** recorded here; the newest verdicts in this file remain the 6.5.6 ones below.
+  Tracked-issue re-verification against 6.5.16 is carried separately and is **not** recorded here. It was the roadmap's *Toolchain* paragraph at the 2.9.2 tag (`git show 2.9.2:docs/development/roadmap.md`), and the roadmap no longer carries it (gone by the 2.11.2 tag). When this entry was written the newest verdicts in this file were the 6.5.6 ones below; the 6.5.17 and 6.5.18 entries above carry later ones.
 - **6.5.9** (v2.9.1): single-release bump from 6.5.8. **No library source change.** Stdlib delta was **two files**. **`alloc.cyr`** grew an **arena exhaustion policy** — the header goes 24 → 56 bytes (`{ base, ptr, end, policy, first_chunk, cur_chunk, chunk_size }`, `base`/`end` mirroring the current chunk so the hot path stays two loads) with `ARENA_FULL_NULL` / `_GROW` / `_SPILL` / `_ABORT`. Filed upstream by agnosai (2026-08-06): the primitives already returned 0 on exhaustion, but a `Str` of 0 is indistinguishable from a valid one and there is no error channel through the `_a` families, so the 0 flowed on and faulted several layers away. **hisab links the arena** — `src/einsum.cyr` is its only user (11 `arena_alloc`, one each `arena_new` / `arena_reset`) — but the default stays `ARENA_FULL_NULL`, so every existing arena behaves exactly as before. The second file is `syscalls_x86_64_agnos.cyr` (agnos-only, never compiled here).
 - **6.5.8** (v2.9.0): bump from 6.5.6, alongside sakshi 2.4.7 → 2.4.8. **No library source change.** Stdlib delta was **11 files**, and one of them is a correctness fix hisab links directly: **`fmt.cyr`** (`fmt_int`, `fmt_int_fd`, `efmt_int`, `fmt_byte`) and **`string.cyr`** (`print_num`) rendered `i64::MIN` as a bare `"-"` — `n = 0 - n` is a no-op at the most negative two's-complement value, so `n` stayed negative, both the `n == 0` guard and the `n > 0` loop were skipped, and the sign byte was emitted with no digits after it. Fixed by keeping the sign as a *flag*, never negating `n`, and negating each extracted digit under `while (n != 0)` — the same shape `fmt_hex` had carried since 6.4.69, which the decimal siblings were never brought along for. **hisab reaches this**: `src/symbolic.cyr` calls `fmt_int` at 3 sites. **`alloc.cyr`** carries 6.5.7's fix for the default `Allocator` vtable being built inside the bump arena — `alloc_reset()` scrubbed it and the next `vec_new()` loaded a null fn pointer out of the dead vtable and jumped to 0; the vendored file credits the filing to hisab, 2026-08-05, but hisab calls neither `allocator_new` nor `alloc_reset` in `src/`, so nothing here was exposed. **`io.cyr`** gained the directory/symlink family (`xmkdir`, `xmkdir_p`, `xsymlink`, `xreadlink`, `xlink`) and **`syscalls.cyr`** gained `signal_default` — purely additive, no hisab call site. The remaining six are the `syscalls_*` platform variants (`sys_chdir`, `sys_fchownat`, and 6.5.7's Darwin `AT_*` divergence fix, which had left `xrmdir` broken on macOS-arm64 since 6.5.2).
 - **6.5.6** (v2.6.11): bump from 6.4.69 — a **minor** jump across 24 releases (6.4.70–6.4.86 + 6.5.0–6.5.6). **No executable library change** — all 34 modules compile clean; the `dist/hisab.cyr` diff is the version header plus one rewritten `mat_new_guarded` doc comment and contains zero non-comment lines (16,878 → 16,885); a consumer including the full bundle compiles + runs end-to-end (7/7 assertions, exit 0). Re-vendored via `cyrius lib sync` — all 27 declared-subset files byte-match 6.5.6; transitive `lib/result.cyr` + `lib/atomic.cyr` already identical (no hand-refresh). `cyrius.lock` 30 deps (1 commit-pinned), verify 30/30. sakshi **2.4.6 → 2.4.7** (latest tag; cyrius 6.5.6 folds the same 2.4.7 into its own `lib/`). Stdlib delta was **six files**:
@@ -324,7 +340,7 @@ and it goes stale silently.
 - **6.3.11** (v2.6.7): infrastructure-only bump from 6.2.11. **No library source change** — all 34 modules compile clean; `dist/hisab.cyr` byte-identical apart from the version header. Stdlib delta touched `assert`/`bench`/`fnptr`/`io`/`math` + the `syscalls` platform variants (`ganita` unchanged); `lib/result.cyr` (transitive dep of `io`/`tagged`) picked up the 6.3.11 `_die` agnos-portability fix (was a bare `syscall(60,1)` that no-op'd → failed-open on agnos; now target-guarded). 6.3.x CLI split: **`cyrius deps`** resolves git deps only (commit-pins sakshi in the lock), **`cyrius lib sync`** (no `--full`) vendors the declared stdlib subset — superseding the 6.2.x `cyrius deps`-does-both flow. Every vendored stdlib file byte-matches 6.3.11; `cyrius.lock` 30 deps (1 commit-pinned), verify 30/30. 957/957 tests, all gates green. Tracked-issue re-verify: for-empty-clauses **still open** on 6.3.11; no new fixes (3 prior fixes stay archived).
 
 **Watching upstream:**
-- **RISC-V rv64** — the 4th platform peer. This entry read "5.7.11" for four minors; it has slipped repeatedly since and is now re-homed to **v6.7.x / v6.8.x** (upstream `docs/development/roadmap_6.md:176`, theme set 2026-07-07). Not landed as of 6.5.18, and the cyrius CHANGELOG carries no rv64 mention newer than its 6.2.0 section. Watched, not blocking: hisab is pure math with no target-specific code, so the only expected surface is another `syscalls_*` platform variant vendored for snapshot parity.
+- **RISC-V rv64** — the 4th platform peer. This entry read "5.7.11" for four minors; it has slipped repeatedly since and is now re-homed to **v6.7.x / v6.8.x** (upstream `docs/development/roadmap_6.md`, section "v6.7.x or v6.8.x — Platform: RISC-V rv64", theme set 2026-07-07). Still not landed at **6.6.12** (re-checked 2026-09-30 at the tag: its `lib/` has the same seven `syscalls*` files hisab vendors, none for riscv64), and the tag's CHANGELOG carries no rv64 mention newer than its 6.2.0 section. Watched, not blocking: hisab is pure math with no target-specific code, so the only expected surface is the peer the upstream plan names, `lib/syscalls_riscv64_linux.cyr`, vendored for snapshot parity by the routine `cyrius lib sync` on a bump.
 
 ## Cyrius stdlib modules (16 declared, 32 vendored)
 

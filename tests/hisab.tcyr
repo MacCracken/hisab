@@ -628,8 +628,8 @@ assert(f64_lt(f64_abs(load64(dp_err)), f64_div(F64_ONE, f64_from(1000000))) == 1
 # Every integrand that reached ode_dopri45 through 2.8.2 was AUTONOMOUS:
 # _ode_exp(t, y) returns y, _ode_zero returns 0, and every symplectic fixture
 # takes q or p alone. An f(t, y) that ignores t makes the stage TIMES dead
-# inputs -- src/ode.cyr:157,162,169,177,186 compute t2..t6 from _DP_C2.._DP_C5
-# and stage 6/7 use t+dt, and the whole row could be replaced by `t` with the
+# inputs -- ode_dopri45 (src/ode.cyr) computes t2..t5 from _DP_C2.._DP_C5 and
+# stages 6/7 use t+dt, and the whole row could be replaced by `t` with the
 # assertions above still green. That is the same shape of hole that let 23
 # mis-transcribed tableau constants ship for six releases (2.6.12).
 #
@@ -1228,11 +1228,14 @@ assert(f64_lt(load64(_orl_fm), TOL_1EM12) == 1, "opt_lbfgs rosenbrock f* < 1e-12
 # returns HSB_ERR_NONE. 51 iterations measured.
 #
 # Each residual call returns a FRESH buffer on purpose: opt_levenberg_marquardt
-# keeps `r_ptr` alive across the trial evaluation (src/optimize.cyr:745-758) and
-# reads it again at the top of the next iteration to build J^T r, so a callback
+# keeps `r_ptr` alive across the trial evaluation and reads it again at the top
+# of the next iteration to build J^T r (the `residuals` contract in
+# src/optimize.cyr's header says the same), so a callback
 # that hands back one reused static buffer would feed it the residuals of a
-# REJECTED trial point. 4 f64 per call x a few hundred calls is a few KB of bump
-# arena, which is the cheaper side of that trade.
+# REJECTED trial point. 16 B (`alloc(16)` below) per call, over the 51 calls this
+# fixture makes (one up front, then one per trial step), is 816 B of bump arena,
+# which is the cheaper side of that trade.
+# [measured: scratch harness counting _lmr_res calls, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 fn _lmr_res(x_ptr) {
     var lr_out = alloc(16);
     var lrx0 = load64(x_ptr);
@@ -2539,7 +2542,8 @@ for (var lp_e = 0; lp_e < 400; lp_e = lp_e + 1) {
 }
 # ⚠ AND THIS SWEEP ALONE PROVES NOTHING — it is kept because it pins homogeneity
 # cheaply, but every one of the nine mutants SURVIVES it. `svd_golub_kahan`
-# BALANCES its input (the pow2_floor at linalg_precision.cyr:789), so a uniform
+# BALANCES its input by a power of two (`_lp_balance_scale` in
+# src/linalg_precision.cyr, built on `_lp_pow2_floor`), so a uniform
 # units change is bit-exactly invariant on the DEFECTIVE tree too. The
 # discriminating variable is the RATIO BETWEEN SUB-BLOCKS, not the units — a
 # matrix the balancing cannot normalise in one go. That sweep is below.
@@ -2690,14 +2694,16 @@ for (var lp_r = 0; lp_r < 9; lp_r = lp_r + 1) {
                 lp_err = f64_add(lp_err, f64_mul(lp_dv, lp_dv));
             }
         }
-        # ⛔ RECONSTRUCTION IS ASSERTED ONLY THROUGH 1e-5, AND THE REASON IS A
-        # SEPARATE OPEN FINDING, MEASURED HERE RATHER THAN PAPERED OVER.
-        # ||A - U S Vt||_F on this tree: EXACTLY 0 at block ratios 1e-2..1e-5,
+        # ⛔ RECONSTRUCTION IS ASSERTED ONLY THROUGH 1e-5, AND THE REASON WAS A
+        # SEPARATE FINDING, MEASURED HERE RATHER THAN PAPERED OVER (2.15.0).
+        # ||A - U S Vt||_F on that tree: EXACTLY 0 at block ratios 1e-2..1e-5,
         # then 4.17e-7 at 1e-6, 2.88e-7 at 1e-7, 2.66e-7 at 1e-8, and thereafter
         # proportional to c (2.66e-8, 2.66e-9, ...). The singular values stay
         # correct throughout, so it is U and Vt that stop reconstructing the small
-        # block — the factors, not the spectrum. That is NOT closed by the nine
-        # threshold repairs in this release and is recorded on the roadmap.
+        # block — the factors, not the spectrum. The nine threshold repairs of
+        # 2.15.0 did not close it; 2.18.0 did (the U-replay guard pair in
+        # `_lp_bidiagonalize`). Widening this gate to the whole sweep is still
+        # owed: roadmap [3.3.5], audit D005.
         # ⚠ 4.17e-7 reproduces the census's own "4.2e-7" figure for a half-repaired
         # bidiagonalisation, so this is the same phenomenon it saw, not a new one.
         # [measured: reconstruction probe over block ratios 1e-2..1e-12]
@@ -2788,20 +2794,29 @@ assert_eq(LP_EB_RUN, 9, "the eigen block-ratio sweep actually ran 9 decades");
 assert_eq(LP_EB_BAD, 0,
   "eigen_qr: eigenvalues {1, 3c, c} exact for block ratios 1e-2 to 1e-10");
 
-# ⚠ THREE LINALG_PRECISION MUTANTS SURVIVE AND ARE RECORDED. Restoring
-# `EPSILON_F64` at the TRIDIAGONAL Givens radius (:1117) or at the Wilkinson shift
-# denominator (:1103), or putting an `F64_TINY` floor on that radius, passes every
-# assertion here. `eigen_qr` balances its input like the SVD does, and the block
-# ratios that survive the balancing are absorbed again by the tridiagonal
-# reduction, so the guards see entries that are never small.
-# ⭐ The census reached the same wall from the other side and said so: for :1117
-# it could not construct a REACHABLE subnormal radius either — the block invariant
-# would need |diag[p_lo]| + |diag[p_lo+1]| <= 2.2e-296 — and recorded that `r > 0`
-# is nonetheless what the division requires and costs nothing. The repairs are
-# kept on that ground, not on the strength of these assertions.
-# ⚠ The five sites that ARE discriminated here — both bidiagonal Householders, the
-# complex one, the bidiagonal Givens radius and the deflation bound — are killed.
-# [measured: 8-mutant run over linalg_precision.cyr, 5 killed / 3 survivors]
+# ⚠ 2.15.0 RECORDED THREE LINALG_PRECISION SURVIVORS HERE; ONE IS STILL ALIVE.
+# In `_lp_tridiag_qr`: restoring `EPSILON_F64` at the TRIDIAGONAL Givens radius
+# guard (`f64_gt(r, 0)`) or at the Wilkinson shift denominator guard (now
+# `f64_eq(denom, 0)`; in 2.15.0 `f64_lt(|denom|, F64_TINY) == 0`), or putting an
+# `F64_TINY` floor on that radius, passed every assertion in 2.15.0, whose
+# explanation was that `eigen_qr` balances its input and the tridiagonal
+# reduction absorbs the block ratios that survive.
+# Later fixtures reach the first two: restoring `EPSILON_F64` at the radius now
+# fails 9 assertions and at the denominator 2, through the 998-ratio eigen sweep
+# (2.17.0) and the `eigen_qr 2^-42` / `2^-200` fixtures (2.22.0) further down this
+# file.
+# [measured: 3-mutant re-run, five suites; scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+#
+# The `F64_TINY` floor on the radius still passes all five suites.
+# ⭐ The census reached the same wall from the other side and said so: for that
+# radius it could not construct a REACHABLE subnormal radius either — the block
+# invariant would need |diag[p_lo]| + |diag[p_lo+1]| <= 2.2e-296 — and recorded
+# that `r > 0` is nonetheless what the division requires and costs nothing. The
+# repair is kept on that ground, not on the strength of these assertions.
+# ⚠ The five sites 2.15.0's run DID discriminate — both bidiagonal Householders,
+# the complex one, the bidiagonal Givens radius and the deflation bound — were
+# killed then.
+# [measured: 8-mutant run over linalg_precision.cyr in 2.15.0, 5 killed / 3 survivors then]
 
 # --- cqr_decompose: R(kA) = k*R(A) and Q does not move at all. This is the
 # complex Householder site.
@@ -3175,7 +3190,7 @@ var _rq80t, _rq80v = svd_golub_kahan(A1, U1, S1, V1);
 assert_eq(is_ok(_rq80t), 1, "svd rank-1 3x3: converges");
 assert(f64_approx_eq(load64(S1), f64_from(14), LOOSE_TOL_H) == 1, "svd rank-1 3x3: s0 == 14");
 
-# _lp_check_svd is the reconstruction helper already defined at tests/hisab.tcyr:558
+# _lp_check_svd is the reconstruction helper defined earlier in this file
 _lp_check_svd(A1, 3, 3, U1, S1, V1, "svd rank-1 3x3: A == U*S*Vt");
 assert(f64_lt(f64_abs(load64(S1 + 8)), EPSILON_F64) == 1, "svd rank-1 3x3: s1 == 0");
 assert(f64_lt(f64_abs(load64(S1 + 16)), EPSILON_F64) == 1, "svd rank-1 3x3: s2 == 0");
@@ -3969,13 +3984,14 @@ assert_eq(_EB_RUN, 998, "the eigen block-ratio sweep actually ran 998 ratios");
 assert_eq(_EB_BAD, 0,
   "eigen_qr: the small block's dominant eigenvalue is 7c, for c = 2^-3 .. 2^-1000");
 
-# ⚠ AND THE HONEST RESIDUE, RECORDED RATHER THAN HIDDEN. An ALL-SUBNORMAL matrix
-# is never balanced at all: `_lp_pow2_floor(s)` reads the exponent field, which is
-# 0 for every subnormal, and returns 1.0. So the whole routine runs unbalanced on
-# entries already below the flush floor. The repair moves the first failing
-# magnitude from 2^-1025 to 2^-1039 — 14 binades — and 22 of 1061 remain. That is
-# `_lp_pow2_floor`, not a norm site, and it is filed on the roadmap rather than
-# folded in here. This assertion pins the boundary the repair actually reached.
+# ⚠ AND THE HONEST RESIDUE, RECORDED RATHER THAN HIDDEN (2.17.0). An ALL-SUBNORMAL
+# matrix was never balanced at all: `_lp_pow2_floor(s)` read the exponent field,
+# which is 0 for every subnormal, and returned 1.0. So the whole routine ran
+# unbalanced on entries already below the flush floor. The 2.17.0 repair moved the
+# first failing magnitude from 2^-1025 to 2^-1039 — 14 binades — and 22 of 1061
+# remained. That was `_lp_pow2_floor`, not a norm site, and 2.17.0 left it for a
+# later release; 2.18.0 repaired it (the mantissa arm, next block). This assertion
+# pins the boundary the 2.17.0 repair reached.
 # [measured: 1061-magnitude uniform sweep before and after, 2026-09-10]
 var _ES_A = ganita_mat_new(2, 2);
 ganita_mat_set(_ES_A, 0, 0, f64_mul(f64_from(3), 1 << 36));      # 3 * 2^-1038
@@ -4026,16 +4042,34 @@ assert_eq(_EP_lo, 1 << 4,
 
 # ⚠ THAT PAIR STOPPED DISCRIMINATING `_lp_pow2_floor` THE MOMENT THE DEFLATION
 # TESTS WERE REPAIRED, and the mutation run said so rather than my noticing.
-# Once `_lp_negligible` divides instead of multiplying, `eigen_qr` converges on an
-# unbalanced subnormal matrix anyway — the two repairs overlap on that path — so a
-# mutant reverting the balancing survives it. The SVD path does NOT overlap:
-# `_lp_bidiagonalize` guards its Householder reflector with an ABSOLUTE
-# `norm_l > EPSILON_F64`, so for an unbalanced subnormal matrix every reflector is
-# skipped and the factorisation collapses. Measured with the balancing reverted:
-# rc = HSB_ERR_NO_CONVERGENCE and S = (0, 0) at all four depths.
+# Once `_lp_negligible` gained its exact-zero arm (2.18.0; this line said "divides
+# instead of multiplying" through 3.3.1, which it never did), `eigen_qr` converges
+# on an unbalanced subnormal matrix anyway — the two repairs overlap on that path —
+# so a mutant reverting the balancing survives it. The SVD path did NOT overlap in
+# 2.18.0: `_lp_bidiagonalize` guarded its Householder reflector with an ABSOLUTE
+# `norm_l > EPSILON_F64` (2.22.0 made it `norm_l > 0`), so for an unbalanced
+# subnormal matrix every reflector was skipped and the factorisation collapsed.
+# Measured then with the balancing reverted: rc = HSB_ERR_NO_CONVERGENCE and
+# S = (0, 0) at all four depths.
 # ⭐ A = k*[[3,4],[0,3]] has singular values 5.606k and 1.606k; at k = 16 units of
 # 2^-1074 those are 90 and 26 units, both exactly representable.
 # [measured: all-subnormal SVD probe with and without the balancing, 2026-09-10]
+#
+# ⚠ THIS FIXTURE NO LONGER DISCRIMINATES `_lp_pow2_floor` EITHER. Since 2.22.1,
+# `_lp_balance_scale` halves the scale until the smallest non-zero entry is
+# normal, which lifts an all-subnormal matrix whatever `_lp_pow2_floor` returns.
+# Measured on the 3.3.2 working tree: dropping `_lp_pow2_floor`'s mantissa arm
+# passes all five suites (585/429/2323/267/971); dropping it AND the halving loop
+# fails 13 assertions here, the three below among them. So 3.3.2 pins the helper
+# directly: the five lines that follow, which fail when the mantissa arm is dropped.
+# [measured: 2-mutant run, five suites; scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+assert_eq(_lp_pow2_floor(0x30), 0x20, "_lp_pow2_floor: 48 x 2^-1074 floors to 32 x 2^-1074 (the mantissa arm)");
+assert_eq(_lp_pow2_floor(0x000FFFFFFFFFFFFF), 0x0008000000000000,
+  "_lp_pow2_floor: the largest subnormal floors to 2^-1023");
+assert_eq(_lp_pow2_floor(1), 1, "_lp_pow2_floor: the smallest subnormal is its own power of two");
+assert_eq(_lp_pow2_floor(0x4008000000000000), 0x4000000000000000,
+  "_lp_pow2_floor: 3.0 floors to 2.0 (the exponent arm)");
+assert_eq(_lp_pow2_floor(0), F64_ONE, "_lp_pow2_floor: zero returns 1.0, the only input that does");
 var _PS_A = ganita_mat_new(2, 2);
 ganita_mat_set(_PS_A, 0, 0, f64_mul(f64_from(3), 1 << 4));     # 3 * 2^-1070
 ganita_mat_set(_PS_A, 0, 1, f64_mul(f64_from(4), 1 << 4));
@@ -4057,8 +4091,11 @@ assert_eq(load64(_PS_S + 8), 26,
 # `f64_lt(|off|, EPSILON_F64 * (|a| + |b|))` asks a RATIO question and answered it
 # by building `1e-12 * (|a| + |b|)` first — which for diagonals at 2^-1050 is
 # below the smallest subnormal, i.e. exactly 0. The test became `|off| < 0`, never
-# fired, and the block never deflated. Five sites, all now dividing.
-# Measured across the 72 subnormal block ratios: **37 failing -> 28**.
+# fired, and the block never deflated. The five sites that formed such a product
+# all go through `_lp_negligible_rel` now, whose exact-zero arm is the repair; the
+# product form stays (see that helper's comment). Through 3.3.1 this said "all
+# now dividing", which none is. Measured across the 72 subnormal block ratios:
+# **37 failing -> 28**.
 # ⛔ 2.20.0 — THE PARAGRAPH THAT USED TO SIT HERE WAS FALSE IN BOTH HALVES, AND IT
 # HAD BEEN ASSERTING SOMETHING REASSURING FOR TWO RELEASES. It read: "the
 # remaining 28 are the GRID, NOT A DEFECT ... the routine reports
@@ -4077,10 +4114,13 @@ assert_eq(load64(_PS_S + 8), 26,
 # UPPER-TRIANGULAR 2x2 blocks. Split by family, upper is 56 correct / 60 loud /
 # 92 silent, while a GENERAL 2x2 (non-zero lower-left) is **1 correct / 86 loud /
 # 121 silent** — the routine is essentially never right there.
-# ⚠ The counts below are a CHARACTERISATION of a tracked defect, not a contract.
-# The repair is an algorithm change inside `_lp_bidiag_qr` (scale the active block,
-# step, unscale) and is filed on the roadmap; these assertions exist so it has an
-# acceptance test and so any movement announces itself.
+# ⚠ 2.20.0 pinned the counts below as a CHARACTERISATION of a tracked defect, so
+# its repair would have an acceptance test and any movement would announce itself.
+# The repair it named — scale the active block inside `_lp_bidiag_qr`, step,
+# unscale — was refuted: 2.22.0 measured it (CHANGELOG [2.22.0]) converting 84
+# loud rows into silent wrong answers. 2.22.1 closed the defect another way
+# (`_lp_balance_scale` plus normalised reflectors), and the pins below were
+# inverted to assert the truth.
 # [measured: 8 fixtures x 52 subnormal scales vs a 120-digit oracle, 2026-09-10]
 var _DF_A = ganita_mat_new(4, 4);
 for (var _df_i = 0; _df_i < 4; _df_i = _df_i + 1) {
@@ -4147,10 +4187,10 @@ fn _sq_run(idx, cscale, out_S) {
 
 var _sq_S = alloc(32);
 
-# ⛔ THE SMALLEST SINGULAR VALUE IS RETURNED AS EXACTLY ZERO, WITH rc = NONE.
-# Fixture [[9,1],[0,2]] at c = 2^-1073. Truth from a 120-digit oracle over the
-# ACTUAL rounded entries: the two subnormal singular values are 18 and 4 units of
-# 2^-1074. The routine returns 16 and **0** and calls it success.
+# ⛔ 2.20.0 — THE SMALLEST SINGULAR VALUE WAS RETURNED AS EXACTLY ZERO, WITH
+# rc = NONE. Fixture [[9,1],[0,2]] at c = 2^-1073. Truth from a 120-digit oracle
+# over the ACTUAL rounded entries: the two subnormal singular values are 18 and 4
+# units of 2^-1074. The routine returned 16 and **0** and called it success.
 assert_eq(_sq_run(1, 1 << 1, _sq_S), HSB_ERR_NONE,
   "svd subnormal: upper-triangular block reports SUCCESS at c=2^-1073");
 # ⭐ 2.22.1 — INVERTED. This asserted the fabricated ZERO as a tracked defect;
@@ -4161,11 +4201,12 @@ assert_eq(load64(_sq_S + 24), 4,
 assert_eq(load64(_sq_S + 16), 18,
   "svd subnormal: ...and its largest is 18 units (was 16, an 11% loss in the balance divide)");
 
-# ⛔ A GENERAL 2x2 IS WORSE: the smallest singular value comes back 10.8x TOO
-# LARGE. Fixture [[3,4],[2,3]] at c = 2^-1070; the exact singular values are
-# 98.5964 and 2.5964 units of 2^-1074, returned are 88 and 28.
+# ⛔ 2.20.0 — A GENERAL 2x2 WAS WORSE: the smallest singular value came back 10.8x
+# TOO LARGE. Fixture [[3,4],[2,3]] at c = 2^-1070; the exact singular values are
+# 98.5964 and 2.5964 units of 2^-1074, and it returned 88 and 28.
 # ⚠ An earlier draft said "truth is 3 ... 9.3x": it ROUNDED the truth to an
 # integer and then divided by the rounded value. 28 / 2.5964 = 10.78.
+# [measured: the 2.20.0 subnormal sweep vs a 120-digit oracle, 2026-09-10]
 assert_eq(_sq_run(2, 1 << 4, _sq_S), HSB_ERR_NONE,
   "svd subnormal: general 2x2 reports SUCCESS at c=2^-1070");
 # ⭐ 2.22.1 — INVERTED. Was 28 units where the truth is 2.5964 (10.8x too large,
@@ -4203,9 +4244,10 @@ for (var _sq_f = 0; _sq_f < 3; _sq_f = _sq_f + 1) {
     }
 }
 assert_eq(_sq_n, 156, "svd subnormal sweep: all 156 (fixture, scale) pairs ran");
-# ⛔ 94 of 156 report SUCCESS. Across the full 8-fixture measurement it is 270 of
-# 416, of which only 57 are right — so most of these are confident wrong answers,
-# not successes. Pinned as a tracked defect so the repair has an acceptance test.
+# ⛔ 2.20.0 — 94 of 156 reported SUCCESS. Across the full 8-fixture measurement it
+# was 270 of 416, of which only 57 were right — so most of those were confident
+# wrong answers, not successes. Pinned then as a tracked defect so the repair had
+# an acceptance test.
 # ⭐ 2.22.1 — 94 of 156 -> 156 of 156, AND THE COUNT ALONE IS NOT THE POINT.
 # Classified against a 200-digit oracle, the sweep goes
 #   2.22.0:  CORRECT 23, LOUD 62, SILENT 71
@@ -4401,14 +4443,20 @@ assert_eq(is_ok(_nn_t), 0,
 #     itself observed, and these are inline expressions, not helpers.
 #     [measured: 11-mutant run over linalg_precision.cyr, 2026-09-10]
 #
-# (b) REMOVING THE `+Inf` ARM survives, and that one IS an equivalence today:
+# (b) REMOVING THE `+Inf` ARM survives. 2.17.0 called it an equivalence:
 #     post-balancing every bidiagonal entry is bounded by ||A_bal||_F, so the sum
-#     cannot overflow. ⚠ It is kept anyway, for one compare, because that
-#     argument rests entirely on the balancing — and `_lp_pow2_floor` measurably
-#     SKIPS balancing for an all-subnormal matrix (it reads the exponent field,
-#     which is 0 for every subnormal, and returns 1.0). An unreachability
-#     argument that depends on a step which is sometimes skipped is not one to
-#     build on.
+#     cannot overflow. It kept the arm anyway, for one compare, because
+#     `_lp_pow2_floor` then SKIPPED balancing for an all-subnormal matrix.
+#     ⚠ BOTH HALVES ARE STALE, AND THE ARM IS NOW LOAD-BEARING. 2.18.0 gave
+#     `_lp_pow2_floor` its mantissa arm, so it no longer skips; and since 2.22.1
+#     `_lp_balance_scale` scales a wide-span matrix UP until its smallest
+#     non-zero entry is normal, so the largest entry can sit far above 1. With
+#     the arm removed from both bulge-chase rotations in `_lp_bidiag_qr`, the 3x3
+#     blockdiag(2^k*[[3,4],[2,3]], 5*2^-1074) is still right at k = 460 and from
+#     k = 470 (sampled to 960) returns rc = OK with S[0] = +Inf — and that mutant
+#     passes all five suites. So this survivor is a COVERAGE GAP, not an
+#     equivalence; the fixture is roadmap [3.3.5], audit D004.
+#     [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
 #
 # (c) RESTORING THE `|delta| < EPSILON_F64` SIGN FORCING in the Wilkinson shift
 #     survives, because the regime where the two signs differ materially needs an

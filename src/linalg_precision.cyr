@@ -1,16 +1,23 @@
 # linalg_precision.cyr -- precision linear algebra algorithms
-# Usage: include "lib/linalg_precision.cyr"
-# Requires: alloc.cyr, math.cyr, matrix.cyr, linalg.cyr, complex.cyr, error.cyr,
-#           linalg_ext.cyr (since 3.2.0 its shared sort, `linalg_sort_desc` since 3.3.0,
-#           orders S / eigenvalues)
+# Usage: shipped inside dist/hisab.cyr; in-tree, include "src/linalg_precision.cyr" after what it requires
+# Requires: src/complex.cyr, src/error.cyr, src/linalg_ext.cyr (stdlib resolves via cyrius.cyml [deps]);
+#           linalg_ext since 3.2.0: its `linalg_sort_desc` (so named since 3.3.0) orders S / eigenvalues
 #
-# Higher-precision replacements for linalg.cyr's SVD and eigendecomposition:
+# Alternatives to ganita's SVD and symmetric eigendecomposition, which linalg_ext's
+# svd_compute and eigen_symmetric wrap:
 #
-#   svd_golub_kahan   -- Golub-Kahan bidiagonalization + implicit QR iteration
-#                       (replaces A^T*A eigendecomposition which squares cond #)
+#   svd_golub_kahan   -- Golub-Kahan bidiagonalization + implicit QR iteration.
+#                       Written to replace a stdlib SVD that eigendecomposed A^T*A
+#                       and so squared cond(A). ganita_mat_svd has not done that
+#                       since ganita 1.2.4 (one-sided Jacobi; cyrius 6.6.1 and up).
 #
 #   eigen_qr          -- Householder tridiagonalization + implicit symmetric QR
-#                       with Wilkinson shift, O(n^3) vs Jacobi's O(n^5)
+#                       with Wilkinson shift, O(n^3). This line used to compare it
+#                       with "Jacobi's O(n^5)". By ganita_mat_eigen_sym's own
+#                       comment that routine was O(n^4) through ganita 1.2.2; since
+#                       1.2.3 its indexed pivot search costs O(n) per rotation
+#                       (O(n^2) worst) over O(n^2) rotations, so O(n^3) typical
+#                       and O(n^4) worst.
 #
 #   cqr_decompose     -- Householder QR for complex matrices
 #
@@ -80,7 +87,6 @@ fn _lp_vec_norm(arr, start, len) {
     return f64_sqrt(sum);
 }
 
-# Allocate a zero-filled flat f64 array of length n
 # Balancing helpers (2.7.0). EVERY step of these decompositions squares matrix
 # entries -- the Householder norms in _lp_bidiagonalize/_lp_tridiagonalize, and the
 # Wilkinson shifts, which form entries of B^T*B explicitly. |x| > 1.34e154 squares
@@ -277,6 +283,7 @@ fn _lp_mat_all_finite(A, rows, cols) {
     return 1;
 }
 
+# Allocate a zero-filled flat f64 array of length n
 fn _lp_vec_new(n) {
     var v = alloc(n * 8);
     var i = 0;
@@ -297,17 +304,6 @@ fn _lp_vec_copy(dst, src, n) {
     return 0;
 }
 
-# Copy matrix data: dst = src (same dimensions assumed)
-fn _lp_mat_copy_into(dst, src) {
-    var n = ganita_mat_rows(src) * ganita_mat_cols(src);
-    var i = 0;
-    while (i < n) {
-        store64(dst + 16 + i * 8, load64(src + 16 + i * 8));
-        i = i + 1;
-    }
-    return 0;
-}
-
 # ================================================================
 # Section 1 -- Golub-Kahan SVD
 # ================================================================
@@ -318,10 +314,17 @@ fn _lp_mat_copy_into(dst, src) {
 # out_U:  stdlib matrix (m x n, caller allocates).
 # out_S:  flat f64 array of length n (caller allocates, receives singular values).
 # out_Vt: stdlib matrix (n x n, caller allocates).
-# Returns: Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if QR iteration
-#          fails, Err(HSB_ERR_ALLOC) if the balancing copy fails.
-# A is balanced to unit max magnitude before decomposing and rescaled on the way
-# out; the balance uses a power-of-two divisor, so it is exact..
+# Returns: Ok(0) on success; Err(HSB_ERR_INVALID_INPUT) for a null A, out_U,
+#          out_S or out_Vt, a non-positive dimension, m < n, or a non-finite
+#          entry of A; Err(HSB_ERR_NO_CONVERGENCE) if QR iteration fails;
+#          Err(HSB_ERR_ALLOC) if the balancing copy fails. (Through 3.3.1 this
+#          line listed only the last two.)
+# A is balanced by a power of two before decomposing and rescaled on the way
+# out (`_lp_balance_scale`). Through 3.3.1 this line called both steps exact
+# without condition. The divide is exact while every balanced entry is normal
+# (or zero), and the rescale of S while every returned singular value is normal;
+# a subnormal singular value rounds to the 2^-1074 grid on the way out (see the
+# balancing note inside svd_golub_kahan).
 #
 # Algorithm:
 #   Step 1: Householder bidiagonalization  A = U1 * B * V1^T
@@ -692,8 +695,10 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
     # ⛔ 2.18.0 — SAME PRODUCT, SAME FLUSH. `EPSILON_F64 * scale` is 0 for a block
     # at 2^-1050, so every `f64_lt(x, tol)` below became `x < 0` and neither the
     # zero-diagonal scan nor either chase could ever fire. `scale` is carried to
-    # the three comparison sites instead and each divides, via
-    # `_lp_negligible_rel`. [measured: subnormal sub-block probe, 2026-09-10]
+    # the three comparison sites instead, and each goes through
+    # `_lp_negligible_rel`, whose exact-zero arm is the repair. The product form
+    # stays (see that helper's comment); through 3.3.1 this line said each site
+    # divides, which none has. [measured: subnormal sub-block probe, 2026-09-10]
 
     var hit = (0 - 1);
     i = p_lo;
@@ -721,14 +726,16 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
         var j = hit + 1;
         while (j <= p_hi) {
             var dj = load64(diag + j * 8);
-            # ⛔ 2.17.0 — THE GIVENS RADIUS SQUARED BEFORE SUMMING. Both legs are
-            # degree ONE bidiagonal entries, so below 2^-537 both squares flush
-            # and `r` is exactly 0 — and the very next line breaks out of the
-            # chase, after :477 has ALREADY zeroed the superdiagonal entry. The
-            # mass is simply gone and `svd_golub_kahan` still returns
-            # HSB_ERR_NONE. ⚠ `tol` here is relative to the ACTIVE BLOCK, so for
-            # a block at 1e-200 the true radius is ~188 decades ABOVE tol and the
-            # break is flatly wrong.
+            # ⛔ 2.17.0 — THE GIVENS RADIUS WAS SQUARED BEFORE SUMMING. Both legs
+            # are degree ONE bidiagonal entries, so below 2^-537 both squares
+            # flushed and `r` was exactly 0, and the next line broke out of the
+            # chase after the `superdiag + hit * 8` store above had ALREADY zeroed
+            # the superdiagonal entry: the mass was gone and `svd_golub_kahan`
+            # still returned HSB_ERR_NONE. The tolerance it broke against (a `tol`
+            # variable then, `_lp_negligible_rel(r, scale)` since 2.18.0) is
+            # relative to the ACTIVE BLOCK, so for a block at 1e-200 the true
+            # radius was ~188 decades above it. The hypot fallbacks below recover
+            # `r` when the squares flush or overflow.
             var r_ss = f64_add(f64_mul(dj, dj), f64_mul(carry, carry));
             var r = f64_sqrt(r_ss);
             if (f64_lt(r_ss, F64_TINY) == 1) { r = ganita_f64_hypot(dj, carry); }
@@ -769,9 +776,9 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
         var dc = load64(diag + c * 8);
         # ⛔ 2.17.0 — the OTHER arm of the same chase, taken when the negligible
         # diagonal is the LAST in the block. ⚠ Repairing only the arm above
-        # leaves this one live on a fixture one line different: measured, the
-        # :481-only patch leaves 3 of 3 probe magnitudes byte-identical to the
-        # unpatched run.
+        # leaves this one live on a fixture one line different: measured, a
+        # patch to the arm above alone leaves 3 of 3 probe magnitudes
+        # byte-identical to the unpatched run.
         # [measured: 2-arm zero-diagonal probe on the 2.16.0 tree, 2026-09-10]
         var r2_ss = f64_add(f64_mul(dc, dc), f64_mul(ccarry, ccarry));
         var r2 = f64_sqrt(r2_ss);
@@ -962,12 +969,14 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
             # and the same two reasons it is safe: `|a12| <= |denom|` so the inner
             # quotient is bounded by 1, and `denom = sign(delta)*(|delta| + h)`
             # cannot cancel.
-            # ⚠ THIS DOES NOT MAKE THE ROUTINE SCALE-FREE. `a11`/`a22` are still
-            # built from `d*d` and `f*f` one block above, so the floor moves from
-            # the fourth root to the SQUARE root of the subnormal floor — 2^-268.5
-            # to 2^-537 — and no further. Going below that needs the entries
-            # themselves never to be squared, which is a different algorithm
-            # (dqds / Demmel-Kahan) and not this change.
+            # ⚠ THIS ALONE DOES NOT MAKE THE ROUTINE SCALE-FREE. `a11`/`a22` are
+            # still built from `d*d` and `f*f` one block above, so on its own it
+            # moves the floor from the fourth root to the SQUARE root of the
+            # subnormal floor — 2^-268.5 to 2^-537 — and no further. This comment
+            # used to say that going lower needed a different algorithm (dqds /
+            # Demmel-Kahan). It did not: the power-of-two scaling of the six
+            # operands above, in the same release, is what took the block-ratio
+            # sweep to 999 of 999, down to 2^-1000.
             # [measured: 999-ratio block-ratio classification before and after]
             var delta = f64_mul(F64_HALF, f64_sub(a11, a22));
             var h = ganita_f64_hypot(delta, a12);
@@ -997,14 +1006,24 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
                 # the true radius; when both squares flush, `r` is 0 while `y` is
                 # not, the invariant is violated, and the "only an exact zero
                 # fails" test fires on a perfectly ordinary rotation.
-                # ⚠ HONEST LIMIT, STATED SO THIS IS NOT READ AS A FULL REPAIR:
-                # `y` and `z` are themselves degree-TWO products formed at :639
-                # and :661-664, so this recovers bidiagonal entries in
-                # (2^-537, 2^-268.5] and NOTHING below — beneath 2^-537 the
-                # products have already arrived as exact zero and the sqrt is no
-                # longer where the information was lost. Reaching further needs
-                # an implicit (scaled) Wilkinson shift instead of forming B^T*B,
-                # which is an algorithm change and is on the roadmap.
+                # ⚠ 2.17.0 STATED A LIMIT HERE, AND 2.18.0 REMOVED IT. On the
+                # first rotation `y` and `z` are degree-TWO products (formed just
+                # above this loop), so this repair alone recovered bidiagonal
+                # entries in (2^-537, 2^-268.5] and nothing below, and the comment
+                # said reaching further needed an algorithm change. It did not:
+                # 2.18.0 scales the shift's operands by a power of two and forms
+                # `y` and `z` in that scaled space, and that removed the floor.
+                # ⚠ THE LIMIT THAT REMAINS IS RELATIVE, NOT ABSOLUTE.
+                # Roadmap [3.6.0], audit D001. On the unreduced graded bidiagonal
+                # [[t,t,0],[0,t,1],[0,0,1]], against a 1200-digit Decimal oracle,
+                # every singular value is right to 4.4e-16 relative through
+                # t = 2^-39. At t = 2^-40 the smallest comes back as exactly 0
+                # (true 2^-41.09) and the middle one 19% low, with rc = OK; at
+                # every t from 2^-41 to 2^-1022 two exact zeros come back. Candidate
+                # causes, unconfirmed: the EPSILON_F64 deflation and
+                # zero-diagonal snap (`_lp_negligible_rel`, `_lp_split_zero_diag`),
+                # and the lack of dqds / zero-shift QR.
+                # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
                 var r_ss = f64_add(f64_mul(y, y), f64_mul(z, z));
                 var r = f64_sqrt(r_ss);
                 if (f64_lt(r_ss, F64_TINY) == 1) { r = ganita_f64_hypot(y, z); }
@@ -1063,7 +1082,8 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
                 # sign-normalising no-op and `svd_golub_kahan` returns
                 # HSB_ERR_NO_CONVERGENCE instead of a silent spurious zero.
                 # Trading a silent wrong answer for a loud rc is the correct
-                # outcome of repairing this line.
+                # outcome of repairing this line. (2.18.0's shift scaling, above,
+                # then removed that band: its block-ratio sweep has no loud rows.)
                 var l_ss = f64_add(f64_mul(y, y), f64_mul(z, z));
                 r = f64_sqrt(l_ss);
                 if (f64_lt(l_ss, F64_TINY) == 1) { r = ganita_f64_hypot(y, z); }
@@ -1171,8 +1191,10 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     var diag = _lp_vec_new(n);
     var superdiag = _lp_vec_new(n);  # n-1 used, extra slot harmless
 
-    # Balance to unit max magnitude before decomposing; undo it on the singular
-    # values below. sv(c*A) = c*sv(A) for c > 0 and U/Vt are invariant.
+    # Balance by a power of two before decomposing (to unit max magnitude, unless
+    # `_lp_balance_scale` must scale further up to keep the smallest non-zero
+    # entry normal); undo it on the singular values below. sv(c*A) = c*sv(A) for
+    # c > 0 and U/Vt are invariant.
     # ⛔ 2.22.0 — THIS COMMENT USED TO END "and the power-of-two divisor makes both
     # the divide and the un-scale exact." THAT IS FALSE FOR A SUBNORMAL ENTRY, and
     # the claim is load-bearing: it is why the balancing was never suspected as a
@@ -1182,13 +1204,16 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     # c = 2^-1073: the entry is 18 units of 2^-1074, `pow2_floor(9)` is 8,
     # 18/8 = 2.25 ROUNDS TO 2 units, and 2*8 = 16 != 18 — **11% of the value is
     # gone before the decomposition starts**, and no repair downstream can return
-    # it. That is why `svd_golub_kahan` still reports HSB_ERR_NONE with a
-    # fabricated ZERO smallest singular value there, and why 2.22.0's Householder
-    # and p_lo repairs both leave that row byte-identical.
-    # ⚠ Filed as `docs/development/issues/2026-09-11-svd-balancing-divide-lossy-
-    # for-subnormal-blocks.md` rather than repaired here: the fix is a scaling
-    # POLICY change (per-block, or an honest refusal), and this project's rule is
-    # that a class is sized before it is touched.
+    # it. That is why `svd_golub_kahan` reported HSB_ERR_NONE with a fabricated
+    # ZERO smallest singular value there through 2.22.0, and why 2.22.0's
+    # Householder and p_lo repairs both left that row byte-identical.
+    # ⚠ 2.22.0 filed it rather than repairing it here, because the fix was a
+    # scaling POLICY change and this project's rule is that a class is sized
+    # before it is touched. 2.22.1 repaired it: `_lp_balance_scale` chooses the
+    # scale from both ends, and the reflectors normalise `v` so `vtv` cannot
+    # underflow. That row now returns the oracle's 18 and 4 units (pinned in
+    # tests/hisab.tcyr through `_sq_run`), and the filing is archived as RESOLVED:
+    # docs/development/issues/archived/2026-09-11-svd-balancing-divide-lossy-for-subnormal-blocks.md
     # [measured: balance-divide round-trip probe on the shipped tree, 2026-09-11]
     var sc = _lp_balance_scale(A, m, n);
     var As = _lp_mat_div_scalar(A, sc);
@@ -1653,7 +1678,7 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
 public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # Any of these may be the designed 0 that ganita_mat_new / mat_new_guarded returns
     # above its own element cap; ganita_mat_rows(0) is a null dereference, so guard
-    # before reading dims. This is svd_golub_kahan's idiom (:753) applied to the
+    # before reading dims. This is svd_golub_kahan's idiom (its first two `if` lines) applied to the
     # one routine in this file that still lacked it: through 2.8.4 a null A,
     # out_vals or out_vecs was stored through and SIGSEGV'd (exit 139, measured).
     if (A == 0 || out_vals == 0) { return Err(HSB_ERR_INVALID_INPUT); }
@@ -1695,9 +1720,10 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     var diag = _lp_vec_new(n);
     var offdiag = _lp_vec_new(n);
 
-    # Balance first; see svd_golub_kahan. The Wilkinson shift squares the
-    # offdiagonal (e2sq = e2*e2), so this overflowed at 1e200 exactly as the
-    # Householder norm did.
+    # Balance first; see svd_golub_kahan. Unbalanced, this overflowed at 1e200
+    # exactly as the Householder norm did, because the Wilkinson shift then
+    # squared the offdiagonal (`e2*e2`); since 2.17.0 `_lp_tridiag_qr` never
+    # forms that square.
     # ⭐ 2.22.1 — two-ended, matching the SVD. Repairing one of a pair is how
     # 2.18.0's U-replay defect was created; `_lp_balance_scale` carries the
     # reasoning and the figures.
@@ -1853,13 +1879,17 @@ public fn cqr_decompose(A, out_Q, out_R) {
         # that helper does not reach here — this is the site a repair applied only
         # where it was MEASURED would have left behind, and this project's rule is
         # that a class is sized by the grep, not by the fixtures that happened to
-        # fire. ⚠ Unlike :270/:341/:1119 this one is NOT measured end-to-end; it is
-        # repaired on the SHAPE, and that is stated rather than implied.
+        # fire. ⚠ 2.22.0 repaired this one on the SHAPE: of the five Householder
+        # gates that release changed, only `_lp_bidiagonalize`'s left gate and
+        # `_lp_tridiagonalize`'s gate were measured end-to-end. 2.23.0 reached
+        # it with the `_cq_run` fixtures in tests/hisab.tcyr (2^-515 and 2^-1000)
+        # and closed it as load-bearing, along with the `vhv` underflow that the
+        # normalisation below repairs.
         # ⭐ Scaled by the largest component first, for the same reason
         # `_lp_vec_norm` now is: `re*re + im*im` summed naively flushes to zero
         # below 2^-537 and overflows above 2^511, so the gate below would see a
         # zero norm for a perfectly good vector.
-        # [measured: shape-only; :270/:341/:1119 measured end-to-end, 2026-09-11]
+        # [measured: tests/hisab.tcyr `_cq_run` fixtures, run against every released tree in 2.23.0]
         var nrm_mx = f64_from(0);
         i = 0;
         while (i < len) {
@@ -1889,7 +1919,8 @@ public fn cqr_decompose(A, out_Q, out_R) {
         }
 
         # ⛔ 2.22.0 — was an absolute 1e-12 on a degree-ONE norm; same repair and
-        # same reason as the three real reflector gates. See :270.
+        # same reason as the three real reflector gates. See the left gate in
+        # `_lp_bidiagonalize`.
         if (f64_gt(norm, 0) == 1) {
             # Complex sign: sign(x1) = x1 / |x1| if x1 != 0, else 1
             var x1 = cx_new(load64(v), load64(v + 8));

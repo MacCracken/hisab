@@ -12,7 +12,7 @@
 ## Does this affect me?
 
 Probably not, if you use hisab through its documented API. The surface the ten live
-consumers reach (35 public functions in 8 modules) is unchanged. **No consumer's source
+consumers reach (34 public functions in 8 modules, re-counted 2026-09-30; 35 at the 2026-09-14 count) is unchanged. **No consumer's source
 references any name this release removes or hides**: all 14 repos carrying a hisab bundle
 were checked on 2026-09-30. You are affected if you:
 

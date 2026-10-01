@@ -30,7 +30,8 @@ implementation is involved.
 
 ⚠ This is the row `tests/hisab.tcyr` pins as `_sq_ok == 94` and as *"…and its smallest singular
 value is a fabricated ZERO (truth: 4 units)"*. It is a **tracked** defect with an acceptance test,
-not an unknown one.
+not an unknown one. *(That was the 2.22.0 state. 2.22.1 inverted both pins: the sweep now asserts
+`_sq_ok == 156`, and this fixture's smallest singular value is asserted to be 4 units.)*
 
 ## Root cause — measured, not inferred
 
@@ -120,8 +121,15 @@ consequence is the same silent drop the absolute gate used to cause.
 
 ## Related
 
-- `docs/development/roadmap.md` — "Decisions owed" carries the sizing question as a scheduled item
-  and points here for the defect itself.
+*(Corrected 2026-09-30, v3.3.2. Both items below were roadmap rows when this was filed, and both
+closed; completed rows are removed from the roadmap at closeout, so `CHANGELOG.md` holds them.)*
+
+- The roadmap's "Decisions owed" item that carried the sizing question was marked **DONE in
+  2.22.1**: the two-ended balance scale and the normalised reflectors described above
+  (`CHANGELOG.md` [2.22.1]). The roadmap's current *Decisions owed* section is a different list.
 - The sibling coverage gap (three Householder gates repaired on SHAPE with no fixture reaching
-  them: `_lp_bidiagonalize:341`, `cqr_decompose:1671`/`:1676`) is a **coverage** item, not a bug,
-  and stays on the roadmap.
+  them: `_lp_bidiagonalize:341`, `cqr_decompose:1671`/`:1676`, lines as of 2.21.0, the pre-repair
+  tree; at the 2.22.0 tag they are `:432`, `:1833` and `:1843`) was a **coverage** item, not a bug,
+  and **closed in 2.23.0** (`CHANGELOG.md` [2.23.0]). All three gates proved load-bearing, one
+  2.22.0 repair had introduced a regression, and the fourth reflector, `cqr_decompose`'s `vhv`, was
+  normalised.

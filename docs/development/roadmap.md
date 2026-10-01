@@ -28,13 +28,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.3.1
+## Current — v3.3.2
 
 **Status**:
-- Suite **4575** across five harnesses: hisab 585, foundation 429, modules 2323, edge_cases 267,
-  abuse 971.
-- Constant gate **163/163**.
-- Public surface **704** declarations (847 gate probes; all 511 non-public probes refused),
+- Suite **4606** across five harnesses: hisab 590, foundation 429, modules 2339, edge_cases 267,
+  abuse 981.
+- Constant gate **155/155**.
+- Public surface **704** declarations (847 gate probes; all 492 non-public probes refused),
   enforced since 3.3.0 by the bundle's `private` marker.
 - **80** benchmarks.
 - **35** math modules in `[lib]`, plus the `src/visibility.cyr` marker.
@@ -48,10 +48,12 @@ Two releases broke the API, and each has a consumer guide:
   ([`../guides/migration-3.3.md`](../guides/migration-3.3.md)).
 
 ⚠ **hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`). Measured again on the
-3.3.1 bundle from pinned dirs:
+3.3.2 bundle from pinned dirs:
 - 6.6.2 refuses it with the known `#derive` error.
 - Under 6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12 consumer-shaped programs (a geometry jet, the
-  autodiff closure recipe, a former-abort Delaunay call) run correctly. On 3.3.0, all 511
+  autodiff closure recipe, a former-abort Delaunay call, and 3.3.2's repairs: the complex NaN
+  pole, the tridiagonal wrap, the symbolic negative render, a `geodesic_rk4` closed form) run
+  correctly. On 3.3.0, all 511
   non-public probes were refused under 6.6.3, 6.6.4 and 6.6.12.
 - ⚠ On 6.6.3 a private fn is still reachable through `&name`. That is upstream, fixed in 6.6.4;
   see *Decisions owed*.
@@ -85,82 +87,6 @@ including a row that says something is blocked.
 ---
 
 ## Pinned — 3.3.x patches (no public API change)
-
-### **[3.3.2]** — stale claims, dangling pointers, dead code
-
-After this release, every comment that says "filed / recorded / on the roadmap" either points at a
-row in this file or reads as history. Comments ship in the bundle, so regenerate `dist/hisab.cyr`.
-
-**Deferral claims whose work is done but whose comment still says otherwise.**
-
-| claim | status | id |
-|---|---|---|
-| subnormal SVD balancing "filed, not repaired" | closed 2.22.1 | `D002` |
-| `_lp_pow2_floor` "filed on the roadmap" | closed 2.18.0 | `D004` |
-| SVD bidiagonal "honest limit … on the roadmap" | real limit; point it at **[3.6.0]** | `D001` |
-| the CGA occupancy-list cut "on the roadmap" | shipped 2.24.0 | `D046` |
-| `cga_norm` "filed on the roadmap" | translator fixed 2.18.0, point 2.21.0 | `D047` |
-| `se3_exp` / `se3_log` "deliberately left alone" | shipped 2.16.0 | `D094` |
-| tridiagonal survivors | two of the three are now killed | `D008` |
-| `spatial_hash_insert` "not migrated yet" | its return is deliberate | `D129` |
-| Perlin "tests skipped", and the helper-ordering rule | stale | `D124` |
-| `calc_ext` / `ode` "no Result type" | false since 3.0.0 | `D070` |
-| `expr_eval` "no NaN constant" | false | `D074` |
-| DCT "3% mispick at n = 27" | 0.3% on 6.6.12, and n = 39 flipped | `D025` |
-| `cx_div` "still an instance" of the fabricated-answer class | superseded | `D020` |
-| the rt sorted-insert note | stale | `D053` |
-| `cx_powf`'s guard "on \|a\|²" | dead since 2.17.0 | `K007` |
-| foundation's "10-decade `_sc_sweep`" | runs 80 now | `D131` |
-| the cylinder-vs-OBB "roadmap 2.8.2" figure | the figure was never the audit's | `D066` |
-| `m3_mul_vec3`'s "eight of ten consumers below the fix" | two of those cannot compile 3.x at all | `D141` |
-| archived bench-net header "Open … scheduled on the roadmap" | stale | `D135` |
-
-**Wrong line citations and stale facts in comments.**
-
-| where | id |
-|---|---|
-| `linalg_precision`, `linalg_ext`, `complex`, `num_ext` | `D033` |
-| `geo`, `geo_diff`, `geo_advanced`, `collision_*`, including a basis still called "orthonormal" and "Actually, let's return two values" | `D065` |
-| `noise_simplex` (calls itself OpenSimplex2; it is classic simplex), `calc_ext`, `optimize`, `ode`, `symbolic` | `D084` |
-| `quat`, `lie`, `lie_ext`, two scripts, `ci.yml` | `D098` |
-| `tests/modules.tcyr` lines 1–4800 and 4800–9600 | `D125`, `D126` |
-| `tests/hisab.tcyr` | `D127` |
-| the abuse KNOWN DEFECT register: 11 stale src citations, seven `[Unreleased]` labels that mean 2.9.0, and count drift | `D128` |
-| all 35 module headers' `# Usage: include "lib/<m>.cyr"`, and 26 of 35 `# Requires:` lines that disagree with `overview.md`'s compiled include table | `K002` |
-| `num_is_prime`'s "0 if composite" | `D029` |
-| `geodesic_rk4`'s doc, which never says the connection is frozen | `D092` |
-| bench comments: `jac_rev` "2×/12×" (now 5×/47×), and `triangulate_hex_6`'s "every shipped call site" (there are none) | `D078`, `D061` |
-
-**Documents.**
-
-| what | id |
-|---|---|
-| "open" / "scheduled" claims in dependency-watch, threat-model, overview, CONTRIBUTING, SECURITY and math.md | `D133` |
-| audit ledgers still marking later-closed rows OPEN/DEFERRED: annotate them, don't rewrite | `D134` |
-| SECURITY's "Known Limitations" and the threat model: `svd_compute` via AᵀA (one-sided Jacobi since ganita 1.2.4); "Jacobi O(n⁵)" (O(n³) typical, O(n⁴) worst); `_COL_MAX_ITER` named as the MPR limit, though it is a dead global | `D136`, `K003` |
-| `gjk_intersect_3d`'s "+55%" in src, the threat model and SECURITY; 6.6.12 measures +62% box / +58% sphere | `D041` |
-| the pin-dependent results list should add the spatial-hash NaN cell: cell 0 from 6.6.8, so origin queries return the NaN point | `D059` |
-| process-global mutable state beyond Perlin is undocumented: einsum arena, CGA table, simplex gradients, Delaunay scratch, EPA counter | `K005` |
-| rust-v-cyrius "Why 30–700× slower / Optimization vectors" | `D138` |
-| five closed upstream filings have no hisab-side record, and gate comments cite archive paths that never existed | `D139` |
-| the CLI-misparse archive says "still present", but it was fixed upstream in 6.6.5 | `D150` |
-| the rv64 watch note says "as of 6.5.18" | `D151` |
-| port-audit says "parity complete" on outdated premises (`thread.cyr` and `http.cyr` exist at the 6.6.12 tag), and the planning tables promise frustum, spinors and complex eigen/SVD | `D158`, `D160`, `D161` |
-| refresh the Boundary table at the 3.3.0 surface: symbolic 23, geo_diff 29, geo_advanced 43, lie 32, lie_ext 25 fns; 34 distinct fns live, not 35 | `D163` |
-
-**Dead and obsolete code.**
-- `num_factorize`'s abandoned `stk` block allocates 152 B per call that nothing reads. `D023`
-- Ten `_COL_*` globals that no code reads, plus `_COL_F64_NEG_INF`, read only by tests. They are
-  hex declarations the constant gate counts, so re-derive 163/163 and the floor afterwards. `D063`
-- Eight dead private helpers in four modules: `_vec6_set`, `_vec6_add`, `_vec6_scale`, `_unskew3`,
-  `_gjk_simplex_set_count`, `_gjk_simplex_set`, `_lp_mat_copy_into`, `_sh_cell_size`. `D095`
-- Retire `_sym_render_f64`, a hand copy of `fmt_float_buf`: 0 of 431,676 reachable inputs differ
-  under 6.6.2, 6.6.3 or 6.6.12. Its "filed on the roadmap" in dependency-watch is dangling. `D075`
-- `_perm_store_8`'s 10-argument workaround is for a cc5 bug fixed in 6.2.11. An 18-argument store
-  was probed correct on six pins from 6.6.2 to 6.6.12. `D077`
-- `_cga_build_null_tbl`'s `if`-guard form: its reason ("no consumer past 6.6.2") is void, because
-  6.6.2 cannot compile any 3.x bundle. Revert it, unless a 2.24.x backport is wanted (see
-  *Decisions owed*). `D142`
 
 ### **[3.3.3]** — silent wrong answers: linalg, num, calc
 
@@ -237,8 +163,9 @@ row in this file or reads as history. Comments ship in the bundle, so regenerate
   return the identity for NaN input. Five more `f64_gt(x, 0) == 0` guards are NaN-true. `D085`
 - **Lie axis guards** (`su2_*`, `so3_from_axis_angle`, `so3_exp`, `lorentz_boost`/`_rotate`) fire
   on non-zero subnormal norms and return the identity across 52 binades. Their "F64_TINY is
-  exactly norm == 0" comment has been false since 2.17.0. Divide directly, as `hquat_inverse`
-  does; the reciprocal-overflow route recovers only 1 of the 52. `D086`
+  exactly norm == 0" comments, false since 2.17.0, were corrected in 3.3.2; the guards remain.
+  Divide directly, as `hquat_inverse` does; the reciprocal-overflow route recovers only 1 of the
+  52. `D086`
 - **`hvec3_normalize` / `hquat_normalize`** return zero or the identity for 47 of 48 non-zero
   subnormal inputs, and `geo_segment_direction` for 44 of 48. The "documented tree-wide limit" is
   documented nowhere, and the test's companion claim is false. Same direct-division repair.
@@ -340,8 +267,9 @@ New benchmark rows register LAST (`tests/hisab.bcyr:1398-1408`).
 - **Miscompile audit**: `threat-model.md:179-181` says every suite binary "is now audited for
   unwritten destination slots". That was a one-time objdump run in 3.2.0. Script it against the
   bundle compiled under the lowest live pin, or correct the sentence. `D119`
-- **Measurement provenance**: 517 claim lines in 27 files are unmarked. `--ratchet` is red against
-  the 417 baseline, with 15 files up, and CI runs `--diff` only on pull requests. The fix needs a
+- **Measurement provenance**: 487 claim lines in 25 files are unmarked (517 in 27 before 3.3.2's
+  comment sweep). `--ratchet` is red against the 417 baseline, with 9 files up, and CI runs
+  `--diff` only on pull requests. The fix needs a
   call from the maintainer; see *Decisions owed*. `D106`
 
 ### **[3.3.7]** — performance, with before/after
@@ -382,8 +310,9 @@ Each function below returns a value that is also a legal answer when the operati
 - **`solve_bicgstab`** and the Krylov family should report breakdown and non-convergence instead
   of returning the current `x`. `D015`
 - **`calc_adaptive_simpson`, `ode_backward_euler`, `ode_bdf2`, `ode_bdf`** should report
-  non-convergence. The "no Result type" reason has been false since 3.0.0, and `ode.cyr:338`
-  documents a return value the code doesn't give. `D070`
+  non-convergence. `calc_ext`'s "no Result type" reason was false from 3.0.0, and `ode.cyr`
+  documented a return value the code doesn't give; 3.3.2 corrected both comments. The behaviour
+  is unchanged. `D070`
 - **Plausible-value fallbacks**: `hisab_inverse_lerp` (returns 0), `world_to_screen`
   (`hvec3_zero`), `calc_monotone_cubic` (0), `calc_partial_derivative`, `calc_hermite_tcb`,
   `ode_bdf`. **svara** works around `calc_monotone_cubic`'s 0 with
@@ -418,10 +347,12 @@ Each function below returns a value that is also a legal answer when the operati
 
 ### **[3.6.0]** — SVD relative accuracy
 
-- **`svd_golub_kahan` on a graded bidiagonal `[[t,t,0],[0,t,1],[0,0,1]]`**: accurate through
-  t = 2^-36. At 2^-40 it returns `rc = OK` with an exact-zero singular value where the truth is
-  2^-41.09, and ‖A − USVᵀ‖_F = 9.1e-13 (~2900 ε, so not even backward stable). From 2^-44 down,
-  two exact zeros come back. LAPACK gets all of these to full relative accuracy.
+- **`svd_golub_kahan` on a graded bidiagonal `[[t,t,0],[0,t,1],[0,0,1]]`**: every singular value
+  is right to 4.4e-16 relative through t = 2^-39 (1200-digit oracle). At 2^-40 it returns
+  `rc = OK` with an exact-zero singular value where the truth is 2^-41.09, the middle one 19% low,
+  and ‖A − USVᵀ‖_F = 9.1e-13 (~2900 ε, so not even backward stable). At every t from 2^-41 to
+  2^-1022 two exact zeros come back. LAPACK gets all of these to full relative accuracy. (Through
+  3.3.1 this row said "through 2^-36" and "from 2^-44"; 3.3.2 re-measured it.)
   - **Candidate causes**: the `EPSILON_F64 = 1e-12` deflation and zero-diagonal snap
     (`_lp_negligible_rel`, documented at `linalg_precision.cyr:687-691` as snapping values "where
     LAPACK's dbdsqr would keep it"), and the lack of dqds or zero-shift QR.
@@ -449,8 +380,9 @@ Nothing in this section is scheduled until the maintainer decides it.
 2. **Minimum cyrius 6.6.4?** On 6.6.3, `&_private_fn` still reaches private bundle functions
    (`&_num_mulmod` probed), and six direct and three transitive consumers pin 6.6.3. 3.3.0 kept
    the floor at 6.6.3 and documented the hole. `D144`
-3. **Measurement debt.** Either mark the ~100 claims added since the baseline, or run
-   `--update-baseline`, which forgives them. Then decide whether `--ratchet` runs on push.
+3. **Measurement debt.** Either mark the claims added since the baseline (net 70 at 3.3.2: 487
+   against 417), or run `--update-baseline`, which forgives them. Then decide whether `--ratchet`
+   runs on push.
    `D106`
 4. **A possible upstream defect, not filed.** A closure that ends `return ad_grad_into(...)` (the
    recipe's form through 3.3.0) draws a cycc diagnostic aimed at the ENCLOSING fn, on every pin
@@ -463,7 +395,9 @@ Nothing in this section is scheduled until the maintainer decides it.
    Language rule names only `f64v_axpy`/`f64v_fmadd`. Update the rule? An aarch64 test run is
    demand-gated below. `D120`
 6. **CLAUDE.md's Consumers bullet** cites `_cga_build_null_tbl`'s guard form as a kept workaround.
-   It changes when `D142` lands.
+   3.3.2 restated the guard's reason in the source and kept the form, pending #1: it protects no
+   consumer of a 3.1.0 or later bundle, and matters only to a 2.24.x backport. The bullet changes
+   if the guard is reverted. `D142`
 7. **CI consumer-pin matrix?** The public-surface and consumer-build gates run only under 6.6.12.
    The multi-pin build is a manual release step, which is how 3.3.0's `_SYM_EPS` leak under 6.6.3
    was caught. Automate it? `D110`
@@ -572,7 +506,8 @@ a consumer asking.
 - Atkin and segmented sieves (`num_sieve` caps at 10M)
 - spline arc length, de Casteljau split
 - sparse Cholesky/LU, SOR (a new fn: `solve_pgs` takes no ω)
-- Voronoi, Mat4 decompose, plane–plane intersection `D158`
+- Voronoi, Mat4 SRT decompose (scale recovery; `se3_from_mat4` already covers a rigid R + t),
+  plane–plane intersection `D158`
 - dual quaternions, convex decomposition, differentiable rendering
 - GPU via mabda (an opt-in include, not the Rust-era soorat) `D159`
 - frustum (planned by kiran); spinors and complex Hermitian eigen/SVD (planned by kana) `D161`
@@ -651,26 +586,31 @@ dir pinned to 6.6.2: the 3.1.0, 3.2.1, 3.2.2 and 3.3.0 bundles are refused, whil
 compiles. Under 6.6.3, 6.6.6, 6.6.10 and 6.6.12 the 3.3.0 bundle compiles and a consumer-shaped
 program runs correctly. `D146`
 
-⚠ **The pin matters to every consumer for three more reasons**, because a consumer compiles the
+⚠ **The pin matters to every consumer for four more reasons**, because a consumer compiles the
 bundle under its OWN cycc:
 - `m3_mul_vec3` keeps its hoisted z tail, because the natural form is silently wrong below 6.6.5.
-  `_cga_build_null_tbl`'s `if`-guard form (wrong below 6.6.3) protects no 3.x consumer, since
-  6.6.2 cannot compile the bundle; its revert is **[3.3.2]**.
-- A zero produced by negation is −0 from **6.6.8** and +0 below. A NaN spatial-hash coordinate
-  lands in cell 0 from 6.6.8 (**[3.3.2]** documents this).
+  `_cga_build_null_tbl`'s `if`-guard form (its `continue` form is wrong below 6.6.3) protects no
+  consumer of a 3.1.0 or later bundle, since 6.6.2 cannot compile one. It stays only for a
+  possible 2.24.x backport, which is *Decisions owed* #1 (`D142`, `D148`).
+- A zero produced by negation is −0 from **6.6.8** and +0 below.
+- A NaN spatial-hash coordinate lands in cell 0 from **6.6.8**, where `f64_to(NaN)` is 0, so
+  `spatial_hash_query_cell` and `spatial_hash_query_radius` at the origin return a point inserted
+  at NaN. Below 6.6.8 on x86 it landed in cell i64::MIN. The contract (every coordinate maps to
+  *some* cell, which one unspecified) is unchanged, and README states this. `D059`
 - `dual_pow` is within 1 ulp from **6.6.10**. Below that it takes the older ganita's `pow`: 137
   ulp at 0.9^1024 on every pin from 6.6.3 to 6.6.9.
 
 All of these were measured on the 3.2.2 bundle from pinned dirs and re-measured unchanged on
-3.3.0's.
+3.3.0's. The NaN cell was re-probed on the 3.3.1 bundle on 2026-09-30: an origin query returns the
+NaN-inserted point under 6.6.12 and does not under 6.6.6.
 
 ⛔ **The remaining nine are still on 2.x, and the `Result` break fails silently.** A `Result` in
 *argument* position degrades to its tag, and the `Ok` tag is 0, which equals `HSB_ERR_NONE`. So
 `assert_eq(f(...), HSB_ERR_NONE)` **builds clean and tests nothing**. `D147`
 - Hand a migrating consumer `scripts/check-result-migration.sh`, which exists for exactly that
   class and is mutation-proven.
-- The reached surface is small (**35 distinct public fns in 8 modules**, per the Boundary table;
-  the 2026-09-30 audit counts 34, and **[3.3.2]** refreshes it), so each port is bounded.
+- The reached surface is small (**34 distinct public fns in 8 modules**, per the Boundary table
+  below), so each port is bounded.
 
 ⛔ **impetus, kiran, joshua, hisab-mimamsa and kana are NOT consumers.** They have no
 `cyrius.cyml`; they are Rust repos needing a *port*, not a scheduling decision.
@@ -708,41 +648,48 @@ above.
 
 ## Boundary with Abaco
 
-One row per surface, at the 3.1.1 surface: fn counts are `^public fn` in the module, `_` helpers
-excluded. **[3.3.2]** refreshes the counts against 3.3.0 (`D163`).
+One row per surface, at the 3.3.1 surface: fn counts are `^public fn` in the module, `_` helpers
+excluded, re-counted 2026-09-30 (identical at the 3.3.1 tag and in the 3.3.2 tree). The 3.1.1
+counts this table carried until then were stale for five modules: symbolic 21 → 23, geo_diff
+25 → 29, geo_advanced 41 → 43 (MPR moved in at 3.3.0), lie 30 → 32, lie_ext 26 → 25. `D163`
 
-The last column is **measured, not assumed**: every call of a hisab public fn in each consumer's own
-source (`lib/`, `dist/` and `build/` excluded), grepped on 2026-09-14 across abaco and the ten live
-consumers.
+The last column is **measured, not assumed**: every call or `&` reference of a hisab public fn in
+each consumer's own source (`lib/`, `dist/` and `build/` excluded; comments and strings stripped;
+a name the consumer defines itself is not counted), re-derived on 2026-09-30 across abaco and the
+ten live consumers. The names searched are the union of the current `public fn`s and every
+non-`_` fn in the bundle the consumer actually vendors. Against the 2026-09-14 count, three cells
+moved: naad's vec3 5/47 → 5/45 and num 5/9 → 4/8 (its only `num_rk4` is in a comment), and
+prakash's num 2/7 → 2/9.
 
 | Feature | abaco | hisab | live callers (symbols / call sites) |
 |---------|-------|-------|-------------------------------------|
 | `eval("sin(pi/4)")` — tokenize + parse a string | parses and evaluates | -- (no tokenizer) | -- |
-| `expr_eval(tree, vars)` — evaluate an expression TREE | -- | symbolic.cyr (21 fn); ⚠ domain changed 2.11.2: `(-2)^3` was NaN for hisab's whole history, is -8 since | none |
+| `expr_eval(tree, vars)` — evaluate an expression TREE | -- | symbolic.cyr (23 fn); ⚠ domain changed 2.11.2: `(-2)^3` was NaN for hisab's whole history, is -8 since | none |
 | `sym_integrate(e, var)`, `sym_to_latex(e)`, patterns | -- | symbolic_ext.cyr (25 fn) | none |
 | `ivl_*` interval arithmetic | -- | interval.cyr (15 fn) | none |
-| `hvec3_cross(a, b)` and the vec family | -- | vec3.cyr | goonj 17/502, prakash 7/11, naad 5/47, dhvani 1/2 |
+| `hvec3_cross(a, b)` and the vec family | -- | vec3.cyr | goonj 17/502, prakash 7/11, naad 5/45, dhvani 1/2 |
 | `geo_ray_sphere(ray, sphere)`, BVH | -- | geo.cyr, geo_advanced.cyr | goonj 4/5 (`geo_aabb_new`, `geo_ray_new`, `bvh_build`, `bvh_query_ray`) |
 | `calc_integral_simpson(&f, a, b, n, out)` -> `Result` | -- | calc.cyr, calc_ext.cyr | svara 2/11, naad 2/2, prani 1/2 (splines, `ease_in_out_smooth`) |
-| `num_newton(&f, &df, x0, tol, max, out)` -> `Result`, `num_fft` | -- | num.cyr, num_ext.cyr | naad 5/9, prakash 2/7, svara 2/2, attn11 1/1 (`num_fft` in all four) |
+| `num_newton(&f, &df, x0, tol, max, out)` -> `Result`, `num_fft` | -- | num.cyr, num_ext.cyr | naad 4/8, prakash 2/9, svara 2/2, attn11 1/1 (`num_fft` in all four) |
 | `dual_*` forward duals, `ad_*` reverse tape | -- | autodiff.cyr (15 dual + 23 tape fn) | none |
-| `geo_jet_{sphere,plane,triangle,aabb,obb,capsule}` + partial readers | -- | geo_diff.cyr (25 fn) | none |
-| `cga_*` conformal GA (null basis since 2.21.0) | -- | geo_advanced.cyr (27 of its 41 fn) | none |
-| `so3_*`/`se3_*`/`bch_*`, `u1_*`/`su2_*`/`su3`/`lorentz_*` | -- | lie.cyr (30 fn), lie_ext.cyr (26 fn) | none |
+| `geo_jet_{sphere,plane,triangle,aabb,obb,capsule}` + partial readers | -- | geo_diff.cyr (29 fn) | none |
+| `cga_*` conformal GA (null basis since 2.21.0) | -- | geo_advanced.cyr (27 of its 43 fn) | none |
+| `so3_*`/`se3_*`/`bch_*`, `u1_*`/`su2_*`/`su3`/`lorentz_*` | -- | lie.cyr (32 fn), lie_ext.cyr (25 fn) | none |
 | `f64_tan`, `f64_fmod` scalar helpers | -- | f64_util.cyr | goonj 1/3, naad 1/1, garjan 1/2 |
 
 **Hisab should never depend on abaco.** Abaco may optionally depend on hisab, and **today it does
-not** (measured 2026-09-14):
+not** (measured 2026-09-14, re-read 2026-09-30):
 - abaco's `cyrius.cyml` has no `[deps.hisab]`, its 22 source files call 0 hisab symbols, and its
   own README lists hisab as a *sibling* library, "not a consumer". The "abaco" row in the
   planned-consumer table above is therefore a plan on hisab's side only.
 
-**The reached surface across the ten live consumers is 35 distinct public fns in 8 modules**: vec3,
-num, num_ext, calc, calc_ext, geo, geo_advanced, f64_util.
+**The reached surface across the ten live consumers is 34 distinct public fns in 8 modules**: vec3,
+num, num_ext, calc, calc_ext, geo, geo_advanced, f64_util. The 2026-09-14 count said 35, because it
+counted naad's `num_rk4`, which appears only in a comment.
 - ghurni `include`s the bundle and calls nothing from it, and nidhi names hisab only in a comment.
 - **0 of 10 reference `HSB_*` in `src/`.** prakash's `tests/wave_pattern.tcyr` asserts
   `HSB_ERR_INVALID_INPUT` as the Err payload of `num_fft(…, 3)`, which is the correct post-3.0.0
-  idiom (re-read 2026-09-21).
+  idiom (re-read 2026-09-30).
 - Eight of hisab's 35 modules have a live caller. The other 27, including everything the rows
   above mark "none", are reached only by hisab's own suites.
 

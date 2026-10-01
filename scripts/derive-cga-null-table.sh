@@ -12,7 +12,8 @@
 # THE CLAIMS:
 #   1. Every basis-blade product expands to AT MOST 2 blades in the null basis.
 #      (The orthonormal basis gives exactly 1, which is why `_cga_geo_blades`
-#      returns a single packed pair today.)
+#      returned a single (sign, blade) pair through 2.20.0. Since 2.21.0 it
+#      returns two such slots, read from the null table; sign 0 marks an empty one.)
 #   2. Every table coefficient is exactly +1 or -1 — no halves survive the change
 #      of basis — so the null-basis product introduces NO new rounding.
 #   3. The null-basis table agrees with the shipped orthonormal table under the

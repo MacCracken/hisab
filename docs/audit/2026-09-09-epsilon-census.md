@@ -66,6 +66,13 @@ exp maps divide by `theta^2` and `theta^3`, and at `theta <= 2.2e-162` both
 never on this list but have the identical shape — three more sites the census
 missed and a grep found.
 
+> **Later disposition (added 2026-09-30, v3.3.2).** The deferral closed in **2.16.0**
+> (`CHANGELOG.md` [2.16.0]), and `su2_log` needed no series after all. It and `so3_log` now take
+> the angle from `atan2` of a scaled norm instead of `acos`, which had been losing the whole
+> rotation below θ ≈ 1.5e-8. The series went to the `se3_exp` and `se3_log` coefficients below
+> θ = 0.1. Every `Open` count in the table below is therefore closed: 73 sites in 2.15.0 and
+> `su2_log` in 2.16.0. The JSON's `annotation_3_3_2` field records the same.
+
 Each entry has a verified `guarded_quantity`, a `correct_threshold` and a
 bracketing `scale_test`.
 

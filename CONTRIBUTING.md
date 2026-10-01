@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.6.12 as of 3.3.1. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
+- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.6.12 as of 3.3.2. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work
@@ -21,7 +21,7 @@ Thank you for your interest in contributing to Hisab.
 # Build
 cyrius build src/main.cyr build/hisab
 
-# Run all five suites (4575 assertions). CI runs every tests/*.tcyr — running
+# Run all five suites (4606 assertions). CI runs every tests/*.tcyr — running
 # fewer than five locally skips a whole surface, not a handful of cases.
 cyrius test tests/hisab.tcyr
 cyrius test tests/foundation.tcyr
@@ -80,7 +80,7 @@ cyrius check --with-deps dist/hisab.cyr
 
 Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never add project source there).
 
-1. Create `src/module_name.cyr` with a header comment (purpose, requires). Source files are self-contained — no `include` lines; stdlib + first-party deps resolve via `cyrius.cyml`.
+1. Create `src/module_name.cyr` with a header comment: the title, then `# Usage: shipped inside dist/hisab.cyr; in-tree, include "src/module_name.cyr" after what it requires` and `# Requires: <the hisab modules it needs, as src/<x>.cyr> (stdlib resolves via cyrius.cyml [deps])`. Take the Requires list from compiling the module alone, the procedure `docs/architecture/overview.md` describes, and add that row to its include table; never name `lib/` paths or stdlib files there. Source files are self-contained — no `include` lines; stdlib + first-party deps resolve via `cyrius.cyml`.
 2. Add it to the `[lib] modules` list in `cyrius.cyml` (this is what the distlib bundle pulls in)
 3. Add tests to the appropriate `.tcyr` file or create a new one
 4. Update the README module table, `docs/architecture/overview.md`, and `docs/doc-health.md`
@@ -90,7 +90,7 @@ Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never 
 
 - All f64 values stored as IEEE 754 bit patterns (use `f64_from()` / `f64_to()`)
 - Heap-allocate structs through their declared layout: `var v = alloc(sizeof(T)); T_set_x(v, x); return v;` — never a hardcoded byte count or a hand-computed offset for a type that has a `struct` (every public struct's `sizeof` is pinned exactly in `tests/abuse.tcyr` since 3.2.0). Manual `alloc(N)` + `store64` layouts are for types with no struct declaration only
-- Use `#derive(accessors)` for struct field access. ⚠ In a function that also expands `f64v_*` intrinsics, accumulate in a local and store through the setter ONCE rather than reading a derived getter INSIDE the value argument of a derived setter on the same object — cycc 6.6.0–6.6.4 miscompiled that shape (fixed in 6.6.5, hisab's pin crossed it in 3.2.1), and consumers compile `dist/hisab.cyr` under their OWN pins, all of them below the fix as of 2026-09-21 (see `m3_mul_vec3`)
+- Use `#derive(accessors)` for struct field access. ⚠ In a function that also expands `f64v_*` intrinsics, accumulate in a local and store through the setter ONCE rather than reading a derived getter INSIDE the value argument of a derived setter on the same object — cycc 6.6.0–6.6.4 miscompiled that shape (fixed in 6.6.5, hisab's pin crossed it in 3.2.1), and consumers compile `dist/hisab.cyr` under their OWN pins: six of the ten live consumers pin 6.6.3, which compiles a 3.x bundle but sits below the fix (pins read 2026-09-30; see `m3_mul_vec3`)
 - Prefix private helpers with underscore: `fn _my_helper()`. Public API carries `public` (`public fn`, `public struct`, `public var`, `public enum`). **No module may reach another module's `_` name** (since 3.3.0: claim 1 refuses a reach into a non-public item, and claim 0 refuses a `_` name that carries `public`): a helper two modules need is public API with a real name and a doc comment, or the code moves into one file. Members of a non-public enum are `_`-named too — enum constants carry no visibility in Cyrius, so the name is the only signal
 - Comment f64 hex constants with their decimal value
 - Use `elif` not `else if`

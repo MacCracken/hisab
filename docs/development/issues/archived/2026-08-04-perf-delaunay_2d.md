@@ -21,9 +21,11 @@ applying. NOT APPLIED. The bicgstab hoist, the only result-safe one, shipped in 
 > a genuine complexity win *and* change results on some input class — which is why it is archived
 > rather than deleted.
 >
-> Do not confuse this with `2026-08-04-incircle-precision.md`, which is about the same function and
-> is **still open**: the in-circle predicate's winding term loses its sign on inputs with a wide
-> intra-set dynamic range, and `delaunay_2d` silently drops points as a result.
+> Do not confuse this with `2026-08-04-incircle-precision.md`, which is about the same function.
+> When this header was written it was still open: the in-circle predicate's winding term lost its
+> sign on inputs with a wide intra-set dynamic range, and `delaunay_2d` silently dropped points as
+> a result. *(Corrected 2026-09-30, v3.3.2.)* It is **FIXED in 2.9.3** as well, and archived beside
+> this file: the winding term is now an adaptive exact `orient2d` over the raw coordinates.
 verdict=CONFIRMED
 
 ## MEASURED
@@ -530,3 +532,10 @@ cavity stays small — the rewrite is faster there *because* it is correct.
 delaunay_2d_400 14.54 ms -> 1.66 ms. delaunay_2d_circle_150 600 ms -> 455 us. Growth per doubling
 3.9x -> 2.1x. Still open: the adaptive in-circle predicate, and pre-existing extreme-aspect
 failures (parabola, sliver) that are byte-identical in both implementations.
+
+*(Later disposition, added 2026-09-30, v3.3.2.)* The in-circle item closed in 2.9.3: see
+`2026-08-04-incircle-precision.md`, beside this file. The parabola and sliver failures have no
+later record: neither word appears in `CHANGELOG.md`, in the in-circle record or in any `tests/`
+fixture, and neither was re-measured for this note. Whether 2.8.2's symbolic ghost vertices or
+2.9.3's exact `orient2d` closed them is unknown. (2.8.2 did take an aspect-1e6 thin strip from 0/40
+to 40/40 fully correct, `CHANGELOG.md` [2.8.2], but nothing records that strip as this "sliver".)

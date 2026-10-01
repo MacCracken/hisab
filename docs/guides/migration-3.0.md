@@ -28,12 +28,15 @@ from dirs pinned to each version: the 3.0.1 bundle compiles under 6.6.2, and the
 6.6.12. If your `cyrius.cyml` pins 6.6.2, bump it before — not after — moving `[deps.hisab] tag`
 past 3.0.1. (3.0.0 and 3.0.1 themselves build on 6.6.2.)
 
-⚠ **Two results follow your toolchain, not hisab's.** A zero produced by negation (`cx_conj(7 +
+⚠ **Three results follow your toolchain, not hisab's.** A zero produced by negation (`cx_conj(7 +
 0i)`'s imaginary part, among others) is −0 from cyrius **6.6.8**, which made `f64_neg` an IEEE
 sign flip; below that it is +0. And `dual_pow` / `ad_pow` are within 1 ulp from **6.6.10**, whose
 ganita `pow` they now use; below it, they take the older ganita's (137 ulp at 0.9^1024 on 6.6.3 and
-6.6.6). Neither changes whether your build succeeds; compare zeros with `f64_eq`, not bit patterns,
-if your pins differ.
+6.6.6). And a NaN spatial-hash coordinate lands in cell 0 from **6.6.8**, where `f64_to(NaN)` is 0,
+so `spatial_hash_query_cell` and `spatial_hash_query_radius` at the origin return a point inserted
+at NaN; below 6.6.8 on x86 it landed in cell i64::MIN. The contract (every coordinate maps to
+*some* cell, which one unspecified) is unchanged. None of these changes whether your build
+succeeds; compare zeros with `f64_eq`, not bit patterns, if your pins differ.
 
 ## ⛔ The one thing that will bite you
 

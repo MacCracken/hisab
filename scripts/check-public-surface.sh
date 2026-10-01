@@ -3,12 +3,17 @@
 # COMPLETE and EXACT surface, by flipping every module `private` in a scratch
 # copy and compiling against it the way the suites and a consumer would.
 #
-# Added 3.1.0 (the `pub fn` half of the public/private surface). In the shipped
-# tree no module is `private`, so `public` is a documented no-op — the suites
-# compile byte-identical with and without it. That is exactly why a gate is
-# needed: nothing in an ordinary build can tell a complete surface from an
-# incomplete one, and a new cross-module reference to an unannotated helper
-# would be found only at the flip, by whoever flipped it (the bundle went private in 3.3.0).
+# Added 3.1.0 (the `pub fn` half of the public/private surface). In 3.1.0 no
+# module was `private`, so `public` was a documented no-op — the suites compiled
+# byte-identical with and without it. Since 3.3.0 the shipped bundle is private
+# (src/visibility.cyr, claim 5), so `public` is the boundary a consumer sees. The
+# 35 modules themselves are still unflipped, and the suites include them one file
+# at a time, so for the suites it still changes nothing. That is exactly why a
+# gate is needed: nothing in an ordinary build can tell a complete surface from
+# an incomplete one. A new cross-module reference to an unannotated helper
+# compiles in the suites, and in the private bundle too, because the bundle is
+# one file (claim 1). This gate's naming scan and per-module flip are what
+# refuse it; nothing else in the tree flips the modules.
 #
 # Six claims, each fail-closed:
 #   0. NAMING COMPLETENESS — every top-level fn / struct / enum / var in the
@@ -58,13 +63,13 @@
 # ⛔ WHY THE PROBES ARE CALLS AND NOT `&name`: on cycc 6.6.2 and 6.6.3 a
 # file-private fn was reachable from another file through address-of — `&_helper`
 # compiled and the pointer ran through callptr/fncallN — while a direct call was
-# refused, so `&name` proved nothing in either direction. Filed upstream as
-# cyrius/docs/development/issues/2026-09-13-hisab-private-fn-reachable-via-address-of.md
-# and FIXED in 6.6.4 (eleven resolution paths now check; hisab closed it in
-# 3.1.1, see docs/development/issues/archived/2026-09-13-cyrius-private-fn-
-# reachable-via-address-of.md). The probes STAY calls: a call is the shape a
-# consumer writes, and a gate that only worked from 6.6.4 up would be blind on
-# every pin below it.
+# refused, so `&name` proved nothing in either direction. Filed upstream, now at
+# cyrius/docs/development/issues/archived/2026-09-13-hisab-private-fn-reachable-via-address-of.md,
+# and FIXED in 6.6.4 (eleven resolution paths now check). hisab took the fix in
+# 3.1.1 and has no issue file of its own for it: CHANGELOG.md [3.1.1] and the
+# 6.6.4 entry of docs/development/dependency-watch.md record it. The probes STAY
+# calls: a call is the shape a consumer writes, and a gate that only worked from
+# 6.6.4 up would be blind on every pin below it.
 #
 # Mutation-proven at 3.1.0 (each mutant verified installed, then restored):
 #   - drop `public` from `_perm` (calc.cyr; reached from calc_ext + noise_simplex)
@@ -322,7 +327,7 @@ read -r n_pub_probes n_priv_probes n_pub_fn n_pub_struct n_pub_var n_pub_enum < 
 # populations. Raise them when the surface grows; lower them only with a reason in
 # the commit, the same discipline as check-constants.sh's POPULATION_FLOOR.
 PUB_PROBE_FLOOR=847    # re-derived 2026-09-30, 3.3.1
-PRIV_PROBE_FLOOR=511   # re-derived 2026-09-30, 3.3.1
+PRIV_PROBE_FLOOR=492   # re-derived 2026-09-30, 3.3.2 - 19 dead non-public declarations removed (D063, D075, D095)
 [ "$n_pub_probes" -ge "$PUB_PROBE_FLOOR" ] || { echo "FAIL: only $n_pub_probes public probes generated, floor $PUB_PROBE_FLOOR — a declaration stopped being seen, or the generator is broken"; exit 1; }
 [ "$n_priv_probes" -ge "$PRIV_PROBE_FLOOR" ] || { echo "FAIL: only $n_priv_probes private probes generated, floor $PRIV_PROBE_FLOOR — a declaration stopped being seen, or the generator is broken"; exit 1; }
 
@@ -344,8 +349,8 @@ fi
 #   EMPTY since 3.1.1 (cycc 6.6.4). The one entry it ever held:
 #   _ad_pow — the declaration right after `public enum AdPowLimit` in autodiff.cyr.
 #     A `public enum` leaked its marker onto the next top-level declaration
-#     (cycc 6.6.2 and 6.6.3). Filed as
-#     cyrius/docs/development/issues/2026-09-13-hisab-public-enum-leaks-onto-next-declaration.md,
+#     (cycc 6.6.2 and 6.6.3). Filed upstream, now at
+#     cyrius/docs/development/issues/archived/2026-09-13-hisab-public-enum-leaks-onto-next-declaration.md,
 #     fixed in 6.6.4 (`public` arms the marker only for a token that can carry
 #     it), and this gate reported it REFUSED on the pin bump — the inversion
 #     working as designed. `_SYM_EPS` (symbolic.cyr, after `public enum ExprTag`)

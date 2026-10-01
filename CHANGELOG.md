@@ -2,6 +2,135 @@
 
 ## [Unreleased]
 
+## [3.3.2] - 2026-10-01 — three wrong answers found on the way, every stale "filed / on the roadmap" claim settled, and the dead code out
+
+The roadmap's **[3.3.2]** items (stale claims, dangling pointers, dead code), plus three defects
+found while doing them. Each defect was reproduced on the 3.3.1 bundle under cycc 6.6.12 and is
+repaired here. Every new assertion was mutation-proved in scratch copies: 17 mutants, all killed,
+each by the assertions written for it. Suites **4575 → 4606**, all passing: hisab 590, foundation
+429, modules 2339, edge_cases 267, abuse 981. Constant gate **155/155** (1 skipped). Public surface
+unchanged at 704 declarations and 847 public probes; the non-public probes fall **511 → 492**, all
+refused, because 19 dead private names are gone. Rebuilt from pinned dirs: 6.6.2 still refuses the
+bundle with the known `#derive` error. Under 6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12, a GeoJet
+program, the autodiff closure recipe, a former-abort Delaunay call and a probe of this release's
+three repairs plus a `geodesic_rk4` closed form all run correctly, and the same probe fails on the
+3.3.1 bundle.
+
+### Fixed — wrong answers
+- **num_ext**: `num_tridiag_solve` formed `n * 8` with nothing bounding `n`. n = 2^61 + 1 (and
+  2^62 + 1) wrapped it to 8, `alloc` honoured 8 bytes, and the forward sweep wrote past both
+  workspaces: a fresh `alloc(64)` after the call held 6–8 nonzero words, and with large caller
+  arrays the process died (exit 139). With small ones it returned `Err(HSB_ERR_DIVISION_BY_ZERO)`,
+  only because a pivot read out of bounds fell below `F64_TINY`. It now returns
+  `Err(HSB_ERR_ALLOC)` for `n > ALLOC_MAX / 8`, the derived bound `num_fft_2d` uses; every larger
+  n already got that code. Asserted at both wrap points, with a canary that the heap after the
+  call is untouched.
+- **complex**: `cx_div(a, NaN+0i)` and `cx_inv(NaN+0i)` returned the pole sentinel, a fabricated
+  `0+0i`, where NaN must propagate (also NaN−0i, any NaN payload). Smith's branch test is
+  unordered for a NaN, so the second branch is reached, and its pole test read only the imaginary
+  part. It now reads both parts; for a non-NaN divisor nothing else changes, since the real part is
+  already 0 there. Shipped since 2.15.0, which introduced Smith's algorithm. Seven assertions,
+  including `0+NaNi`, which kills a guard reading only the real part.
+- **symbolic**: `sym_const_to_str` tested `floor(val)` for integrality but rendered `f64_to(val)`,
+  which truncates toward zero. A negative value within `_SYM_EPS` above an integer −n rendered
+  −(n−1): 21 doubles in (−8, −1), e.g. −0.9999999999999999 rendered `"0"` and −5.999999999999999
+  `"-5"`, through `expr_to_str` and `sym_to_latex` alike. It now renders the integer it tested.
+  Positives, and every |val| ≥ 8 (where the f64 spacing exceeds `_SYM_EPS`), never could.
+
+### Fixed — stale claims (comments ship in the bundle)
+- **Deferral claims whose work was done**: the subnormal SVD balancing "filed, not repaired"
+  (closed 2.22.1), `_lp_pow2_floor` "filed on the roadmap" (2.18.0), the CGA occupancy-list cut
+  (shipped 2.24.0), `cga_norm` (2.18.0 / 2.21.0), `se3_exp` / `se3_log` "deliberately left alone"
+  (2.16.0), the tridiagonal survivors, `spatial_hash_insert` "not migrated yet", Perlin "tests
+  skipped" and the dead helpers-before-`alloc_init` rule, `calc_ext`'s "no Result type" (false since
+  3.0.0), `expr_eval` "no NaN constant", `cx_div` "still an instance" of the fabricated-answer
+  class, the rt sorted-insert note, `cx_powf`'s dead guard note, foundation's "10-decade"
+  `_sc_sweep` (80 now), the cylinder-vs-OBB figure, `m3_mul_vec3`'s consumer count, and the
+  archived bench-net header. The SVD bidiagonal limit now points at **[3.6.0]**, with figures
+  re-measured against a 1200-digit oracle: right to 4.4e-16 through t = 2^-39, first wrong at 2^-40,
+  two exact zeros from 2^-41 to 2^-1022.
+- **`_numx_use_fft`**: the "3% mispick at n = 27" residual was re-timed on 6.6.12. n = 27's FFT
+  pick and n = 39's direct pick are each within about 2% of the other path, so both are mispicks
+  of about 1%; the right picks at n = 26, 38 and 40 win by 3.1–10.9%.
+- **Wrong line citations and stale facts** across `linalg_precision`, `linalg_ext`, `complex`,
+  `num`, `num_ext`, `geo`, `geo_diff`, `geo_advanced`, `collision_*`, `noise_simplex`, `calc_ext`,
+  `optimize`, `ode`, `symbolic`, `quat`, `lie`, `lie_ext`, two scripts, all five suites, the
+  benchmarks (`jac_rev` is 5×/47× now, not 2×/12×) and the abuse KNOWN DEFECT register (its src
+  citations, seven `[Unreleased]` labels that meant 2.9.0, and the `cmat_*` call-site counts).
+  Among them:
+  - `ode.cyr`'s implicit steppers said they return `y` on non-convergence. They return the last
+    Newton iterate.
+  - `geodesic_rk4` now says its connection is frozen for the whole path.
+  - `num_is_prime` said it returns 0 "if composite"; it also returns 0 for every n < 2.
+  - `svd_golub_kahan` listed two of its three error codes.
+  - `_GA_EPA_POLISH_COUNT` counts `mpr_penetration`'s polishes too.
+  - `se3_from_mat4` assumes no scale.
+  - The Lie axis guards' "F64_TINY is exactly norm == 0" was false from 2.17.0; the guards
+    themselves are **[3.3.4]**.
+- **noise_simplex**: its header called it "OpenSimplex2 noise … NOT the patented Perlin simplex".
+  It is classic simplex noise with Gustavson's constants, and the header now lists where the code
+  departs from his paper. The "certified against Gustavson" notes in src and `tests/modules.tcyr`
+  were not true: the reference shares the code's departures, so it pins hisab's values rather
+  than certifying them. The test's continuity comment claimed simplex is C^1; it is not (below).
+- **Module headers**: all 35 said `# Usage: include "lib/<m>.cyr"`, a path that has not held
+  since the source moved to `src/`, and 26 `# Requires:` lines disagreed with the include table
+  that compilation derives. Each now says how it ships and what it requires.
+- **Documents**: "open" / "scheduled" claims in dependency-watch, threat-model, overview,
+  CONTRIBUTING, SECURITY and math.md. Audit ledgers that still marked later-closed rows open are
+  annotated, not rewritten. SECURITY's "Known Limitations" and the threat model no longer say
+  `svd_compute` goes through AᵀA or that Jacobi is O(n⁵), and no longer name a dead global as the
+  MPR iteration limit. `gjk_intersect_3d`'s tangency-probe cost is +62% box / +58% sphere on 6.6.12,
+  not "+55%". The 3.0 migration guide's pin-dependent results gain the spatial-hash NaN cell.
+  Process-global mutable state is documented. The Rust-vs-Cyrius comparison's "why slower"
+  section, citations of cyrius filings that have since moved to its archive (and a hisab archive
+  path the public-surface gate cited that never existed), the CLI-misparse archive (fixed in 6.6.5), the rv64 watch note, port-audit's "parity complete", and the Boundary table at the
+  3.3.0 surface (34 distinct fns) are all updated. The archived cc5 filing says the 18-argument
+  fix was 6.0.57 and the module `src/calc.cyr`.
+
+### Removed — dead code
+- **num**: `num_factorize`'s abandoned `stk` block allocated 152 B per call that nothing read.
+- **collision_core**: ten `_COL_*` globals that no code read, eight of them hex constants.
+  `_COL_F64_NEG_INF` stays; a test reads it.
+- Eight dead private helpers: `_vec6_set`, `_vec6_add`, `_vec6_scale`, `_unskew3`,
+  `_gjk_simplex_set_count`, `_gjk_simplex_set`, `_lp_mat_copy_into`, `_sh_cell_size`.
+- **symbolic**: `_sym_render_f64`, a hand copy of stdlib `fmt_float_buf` written while the stdlib
+  still dropped the carry. Over 3,538,970 inputs (3,203,636 of them reaching the float branch) the
+  old and new `sym_const_to_str` rendered byte-identically, 0 mismatches, under each of the eleven
+  cycc releases 6.6.2 through 6.6.12. Control (6.6.12): with the old carry mutated out, the same
+  harness counted 45,540 mismatches.
+- **geo_advanced**: `sdf_smooth_union`'s `blend` local, computed by a different formula and never
+  read.
+
+### Added — tests
+- **`_lp_pow2_floor`**: its mantissa (subnormal) arm could be dropped with all five suites green,
+  because 2.22.1's two-ended balancing compensates in the SVD and eigen paths. Five direct
+  assertions now pin each arm and the zero input.
+- **`geodesic_rk4`** had only guard assertions. Twelve now pin three closed forms at t = 1: flat
+  space (bit-exact), a single `Γ^1_00 = 1` that checks the index order (bit-exact), and the
+  one-dimensional `u' = −u²` against ln 2 and 1/2 (bits pinned, and a 1e-8 band against the
+  closed form). Six mutants of the RK4 weights, stage inputs, index order and sign are all killed.
+
+### Changed
+- **Gate floors re-derived** for the deletions, each verified to fire: `check-constants.sh`
+  `GLOBAL_FLOOR` 221 → 211 and `POPULATION_FLOOR` 164 → 156 (constant gate 163 → 155 verified);
+  `check-public-surface.sh` `PRIV_PROBE_FLOOR` 511 → 492.
+- **Bundle**: 26,868 → 27,011 lines, 1,137,745 → 1,157,699 bytes (sources 26,756 → 26,899 lines),
+  nearly all of it the headers and corrected comments.
+- **Benchmarks — no win is claimed, and no row regressed.** Same-boot interleaved A/B, the 3.3.1
+  tag against this tree, full `tests/hisab.bcyr`, four runs each: the median ratio over 80 rows is
+  1.000. One row separates beyond its spread, `cga_norm_sq_k32` −4.5%, on code this release does
+  not touch (3.3.1's A/B had the same row at +6.8%). The changed paths (`num_tridiag_solve`,
+  `cx_div`, `cx_inv`, `sym_const_to_str`, `num_factorize`) have no benchmark.
+- **docs/guides/testing.md**: published counts 4575 → 4606.
+
+### Found — not repaired (the maintainer's decision)
+- **noise_simplex**: `simplex_2d` and `simplex_3d` are discontinuous. The second and later corner
+  offsets subtract G2 / G3 where Gustavson's paper adds them, so those corners' falloff disks sit
+  off their lattice points, and both fields jump where the containing simplex changes: 0.568 (2D)
+  and 0.576 (3D) across one 1e-5 step. Shipped in every tag since 0.22.3. The repair moves the
+  point values and grid aggregates `tests/modules.tcyr` pins, and the 3D falloff constant is a
+  separate question (his 2012 note says 0.5; this file uses 0.6).
+
 ## [3.3.1] - 2026-09-30 — inputs that ended the caller's process, gates that could not fail, and two 3.3.0 safety claims that were false
 
 The roadmap's **[3.3.1]** items: inputs that ended the caller's process, gates that could not fail,

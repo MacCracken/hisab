@@ -1,6 +1,6 @@
 # complex.cyr -- complex numbers and complex matrices
-# Usage: include "lib/complex.cyr"
-# Requires: alloc.cyr, math.cyr, f64_util.cyr
+# Usage: shipped inside dist/hisab.cyr; in-tree, include "src/complex.cyr" after what it requires
+# Requires: src/error.cyr (stdlib resolves via cyrius.cyml [deps])
 #
 # Complex: { re: f64, im: f64 } = 16 bytes
 # ComplexMatrix: row-major { rows, cols, data_ptr } = 24 bytes
@@ -53,7 +53,7 @@ public fn cx_mul(a, b) {
 #must_use
 public fn cx_div(a, b) {
     # ⛔ THIS IS THE DEFECT `complex.cyr` HAS NAMED IN ITS OWN COMMENT SINCE 2.6.14
-    # AND KEPT DOING. 2.6.13 fixed the EXPONENT — squared modulus against a squared
+    # AND KEPT DOING. 2.6.14 fixed the EXPONENT — squared modulus against a squared
     # tolerance — and left the SCALE, so `cx_div` still flushed legitimate small
     # divisors to exactly 0+0i, a value bit-identical to a real zero quotient with
     # no error channel to distinguish them.
@@ -72,7 +72,8 @@ public fn cx_div(a, b) {
     # so the intermediate is |smaller/larger| <= 1 and the squaring never happens:
     # the whole dynamic range stays representable and the result is scale-covariant
     # everywhere. The only input that still fails is b = 0 exactly, which is the
-    # documented pole and keeps its `cx_zero()` sentinel.
+    # documented pole and keeps its `cx_zero()` sentinel. (Through 3.3.1 a NaN real
+    # part with a zero imaginary part reached that sentinel too; see the guard below.)
     # Threshold candidates fail 241/235/170/93/89 decades; Smith's fails none.
     # [measured: docs/audit/2026-09-09-epsilon-open.json]
     var br = HComplex_re(b); var bi = HComplex_im(b);
@@ -84,8 +85,13 @@ public fn cx_div(a, b) {
         return cx_new(f64_div(f64_add(ar, f64_mul(ai, rb)), db),
           f64_div(f64_sub(ai, f64_mul(ar, rb)), db));
     }
-    # |bi| >= |br|, so bi == 0 implies br == 0 too: the genuine pole.
-    if (f64_eq(bi, 0) == 1) { return cx_zero(); }
+    # Reached when |bi| >= |br| OR when the comparison is unordered (a NaN). So
+    # bi == 0 implies br == 0 only for a non-NaN br, and the pole test reads both.
+    # ⛔ Through 3.3.1 it read bi alone: b = NaN+0i (or NaN-0i, any NaN payload) got
+    # the pole sentinel, a fabricated 0+0i, where NaN must propagate. Testing both
+    # parts changes nothing else: for a non-NaN b, br == 0 already holds here.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    if (f64_eq(bi, 0) == 1 && f64_eq(br, 0) == 1) { return cx_zero(); }
     var ri = f64_div(br, bi);
     var di = f64_add(f64_mul(br, ri), bi);
     if (f64_eq(di, 0) == 1) { return cx_zero(); }
@@ -153,7 +159,8 @@ public fn cx_inv(a) {
         if (f64_eq(db, 0) == 1) { return cx_zero(); }
         return cx_new(f64_div(F64_ONE, db), f64_neg(f64_div(rb, db)));
     }
-    if (f64_eq(ai, 0) == 1) { return cx_zero(); }
+    # Both parts, as in cx_div: a NaN+0i argument returned 0+0i through 3.3.1.
+    if (f64_eq(ai, 0) == 1 && f64_eq(ar, 0) == 1) { return cx_zero(); }
     var ri = f64_div(ar, ai);
     var di = f64_add(f64_mul(ar, ri), ai);
     if (f64_eq(di, 0) == 1) { return cx_zero(); }
@@ -291,12 +298,18 @@ fn _cmat_data(m) { return load64(m + 16); }
 #    -- mul, add, sub, scale, adjoint, trace, mul_vec, commutator,
 #    anticommutator, kronecker, exp, inverse, identity -- rejects that 0 before
 #    it reaches an accessor, and cmat_mul additionally enforces conformability.
-#    All of that is asserted in tests/abuse.tcyr. Every in-tree call site (39
-#    cmat_get, 58 cmat_set in src/) is inside such a validated routine.
-# 3. THEY MIRROR THE STDLIB. ganita_mat_get / ganita_mat_set (lib/ganita.cyr:53
-#    and :59) are the same two-line unchecked stride computation, and the real
-#    matrix family here is built on them. Checking only the complex half would
-#    make the two families disagree about what an accessor promises.
+#    All of that is asserted in tests/abuse.tcyr. Every in-tree call site (41
+#    cmat_get, 57 cmat_set in src/, re-counted for 3.3.2; this said 39 and 58
+#    before) is inside such a validated routine, inside cqr_decompose, which
+#    rejects the same 0 and checks its out-params' shapes, or inside a fixed-size
+#    constructor (pauli_x/y/z, gamma_0, gamma_spatial, gell_mann) whose
+#    dimensions and indices are constants.
+#    [measured: grep of src/*.cyr with comments stripped, definitions excluded]
+# 3. THEY MIRROR THE STDLIB. ganita_mat_get / ganita_mat_set (lib/ganita.cyr, where
+#    both are marked UNCHECKED BY DESIGN) are the same two-line unchecked stride
+#    computation, and the real matrix family here is built on them. Checking
+#    only the complex half would make the two families disagree about what an
+#    accessor promises.
 # 4. IT IS THE INNER LOOP. Measured with the bounds tests temporarily added to
 #    both accessors, 120x120 complex matmul (1.728M inner iterations), best of
 #    5: 276 ms unguarded -> 294 ms guarded, +6.5%, for a check every legitimate

@@ -293,7 +293,7 @@ for path in sorted(glob.glob('src/*.cyr')):
 # emptied by a mechanical edit while still printing "no duplicates" is the defect
 # this block just had. Raise it when globals are added; lower it only with a
 # reason in the commit (3.3.2 deletes the dead `_COL_*` globals and will).
-GLOBAL_FLOOR = 221   # column-0 global declarations in src/, re-derived 2026-09-30
+GLOBAL_FLOOR = 211   # column-0 globals in src/; 221 -> 211 in 3.3.2: D063 deleted 10 dead _COL_* globals
 global_population = sum(len(v) for v in seen_globals.values())
 if global_population < GLOBAL_FLOOR:
     print(f"\n!! DUPLICATE-GLOBAL SCAN SHRANK: {global_population} declarations seen, floor is {GLOBAL_FLOOR}.")
@@ -358,7 +358,7 @@ if errors:
 # without failing is a gate that can be emptied by a mechanical edit. The floor
 # is the population at the last audit; raise it when constants are added, never
 # lower it without saying why in the commit.
-POPULATION_FLOOR = 164   # 163 verified + 1 skipped, re-derived 2026-09-30 (was 160 since 2026-09-13)
+POPULATION_FLOOR = 156   # 155 verified + 1 skipped; 164 -> 156 in 3.3.2: 8 of D063's 10 dead globals were hex constants
 population = total + len(skipped)
 if population < POPULATION_FLOOR:
     print(f"\n!! POPULATION SHRANK: {population} declarations seen, floor is {POPULATION_FLOOR}.")

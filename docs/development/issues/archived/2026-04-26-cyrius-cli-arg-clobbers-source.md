@@ -11,12 +11,13 @@ path (`error: refusing to write build output over a .cyr source file: b.cyr`, ex
 byte-intact — measured on 6.6.4 with the exact misparsed shape `cyrius -v build b.cyr out`, in a
 scratch dir, never in this tree). Landed in commit `8990f376` ("bug batch - tools and bigint"),
 first tag **6.0.36** — so hisab carried this as "Open" for the whole 6.x line, the same way it carried
-`for-empty-clauses` five releases past its decision. ⚠ What is NOT fixed, and is recorded rather than
-implied: the top-level parser still treats an unknown flag before the subcommand as positional
-(the probe shows the shift — `b.cyr` lands in the OUTPUT slot), and bare `cyrius -v` still exits 0
-with the usage banner. The guard closes the destructive outcome, not the misparse; a non-`.cyr`
-target in that slot would still be overwritten. Keep the flag AFTER the subcommand
-(`cyrius build -v …`, exit 0, builds).
+`for-empty-clauses` five releases past its decision. ⚠ What was NOT fixed on 6.6.4, and was
+recorded rather than implied: the top-level parser still treated a flag before the subcommand as
+positional (the probe shows the shift — `b.cyr` lands in the OUTPUT slot), and bare `cyrius -v`
+still exits 0 with the usage banner. The guard closes the destructive outcome, not the misparse; a
+non-`.cyr` target in that slot would still be overwritten. **That residual was fixed upstream in
+cyrius 6.6.5** and re-measured on 6.6.12: see the last section. Bare `cyrius -v` still exits 0, as
+bare `cyrius` does: that is the usage path, not the misparse.
 
 *Original status line, kept for the record:* Open. cc5 5.7.7's atomic-output fix prevents destruction on compile *failure*, but a misparsed-but-successful invocation still nukes the file.
 
@@ -98,6 +99,10 @@ None — this is purely a CLI hardening item. Hisab uses the `CYRIUS_VERBOSE` en
 
 This file gets removed once the CLI rejects unknown flags.
 
+*(2026-09-30, v3.3.2: that condition is met on the 6.6.12 pin. An unknown flag before the
+subcommand is refused, and since 6.6.5 a global flag there no longer shifts the positionals. The
+file is kept as the archived record rather than removed. See the last section.)*
+
 ---
 
 ## 🟢 CLOSED — ARCHIVED 2026-09-09 (v2.11.3), on cycc 6.6.1
@@ -125,3 +130,35 @@ This closes the ambiguity recorded in the 2026-08-09 note above: the upstream fi
 `archived/` with `Status: Open` and no resolution paragraph, so its location could not be read as
 evidence. It no longer has to be — the behaviour itself was measured on the current pin.
 [measured: scratch harness, not reproducible in-tree — the reproducer is destructive by construction]
+
+---
+
+## 🟢 The residual misparse — FIXED upstream in cyrius 6.6.5, re-measured 2026-09-30 (v3.3.2, cycc 6.6.12)
+
+The 3.1.1 status above recorded one thing as still live: a flag before the subcommand shifted the
+positionals, so a non-`.cyr` file could still land in the output slot. It was fixed in **6.6.5**
+(2026-09-19). The cyrius 6.6.5 CHANGELOG introduces `cbt/cli_args.cyr`, and with it arguments
+"indexed from `cmd_idx + 1`, never a literal `argv(2)`, so a global `-q`/`-v` no longer shifts
+them". A `-`-prefixed token that the verb does not declare is now an error that names the token.
+
+The probe ran in three scratch packages, each with a `cyrius.cyml` pinning the version under test,
+never in this tree. A file named `build` held a compilable program, so that the shifted parse had
+something to compile:
+
+| invocation | 6.6.4 | 6.6.5 and 6.6.12 |
+|---|---|---|
+| `cyrius -v build b.cyr out` | `refusing to write build output over a .cyr source file: b.cyr`, exit 1 — **shifted** | `compile b.cyr -> out`, exit 0; `[verbose] source: b.cyr`, `output: out` |
+| `cyrius -v build victim.dat out` | `compile build -> victim.dat`, exit 0 — **victim.dat overwritten**, 12 B → 18,472 B | source `victim.dat`, output `out`, exit 1 (`compile failed`: it is not Cyrius); victim.dat's SHA-256 unchanged |
+| `cyrius --bogus build b.cyr out` | `Unknown command: --bogus`, exit 1 | same |
+
+The second row is the overwrite this record warned about, reproduced on 6.6.4 and gone from 6.6.5.
+The third row narrows the old description. A truly unknown flag was already refused on 6.6.4; the
+shift came from the global flags the parser knew (`-v`). Bare `cyrius -v` and bare `cyrius` both
+exit 0 with the usage banner on 6.6.4 and 6.6.12, so that is the usage path, not the misparse.
+The 6.6.12 run's `compiler:` line names `~/.cyrius/bin/cycc`, which is SHA-256-identical to
+`~/.cyrius/versions/6.6.12/bin/cycc`.
+
+Nothing is owed on the hisab side. The upstream copy of this filing, at the 6.6.12 tag, still sits
+in `cyrius/docs/development/issues/archived/` with `**Status:** Open.`; correcting it is cyrius-side
+housekeeping.
+[measured: scratch harness, not reproducible in-tree, 2026-09-30; cyrius 6.6.4, 6.6.5 and 6.6.12]

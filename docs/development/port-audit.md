@@ -24,6 +24,49 @@
 > complete as a parity question — this file is the historical record of the
 > 2026-04-15 snapshot and is not maintained further.
 
+> **Status 2026-09-30 (v3.3.2): the parity claim above was wrong, and is
+> withdrawn.** A grep of `src/` at the 3.3.1 tag finds no implementation of these
+> Rust 1.4.0 capabilities. Each is named in the 2026-04-15 gap list below, in the
+> Rust benchmark set (`docs/benchmarks-rust-v-cyrius.md`), or in the Rust 1.4.0
+> CHANGELOG entry:
+>
+> - Monte Carlo integration
+> - Atkin and segmented sieves: `num_sieve` is Eratosthenes, and returns an empty
+>   vec above 10M
+> - spline arc length, and the de Casteljau split
+> - sparse Cholesky/LU, and SOR: `solve_pgs` takes no relaxation factor
+> - Voronoi diagrams: the `src/` hits for "Voronoi" are closest-point region tests
+> - Mat4 decompose: `m4_from_srt` composes; `se3_from_mat4` (lie_ext) recovers
+>   rotation + translation from a rigid 4x4, but nothing recovers scale (no SRT
+>   decompose)
+> - plane–plane intersection
+> - frustum tests (planned by kiran)
+> - spinors, and complex Hermitian eigen and complex SVD (planned by kana). The
+>   complex surface is `cx_*`, the `cmat_*` set (including `cmat_exp` and
+>   `cmat_inverse`), Pauli/Dirac/Gell-Mann and `cqr_decompose`. So the Module
+>   Coverage table's *Complete* for Complex overstated it against Rust 1.4.0. The
+>   Consumer impact table's "SVD/eigen when linalg.cyr ships" is met for the real
+>   solvers, which shipped, and not for the complex forms.
+>
+> All of these are **not ported, and demand-gated on the roadmap** (§ 3.x.x —
+> demand-gated, *Rust-era features never ported*: audit D158 and D161). The trigger
+> for each is a consumer asking. The four named in the 2026-09-14 status above
+> (dual quaternions, convex decomposition, differentiable rendering, GPU) are now
+> listed there as well (D159).
+>
+> The parallel and AI modules' premises in the gap list are outdated: the cyrius
+> 6.6.12 tag ships `lib/thread.cyr` and `lib/http.cyr`. The parallel module is on
+> the same demand-gated list (D160). The AI module would conflict with
+> SECURITY.md's "No network I/O in core library" (D160); it is not on the roadmap,
+> and whether to drop it for good is the maintainer's decision. Serialization,
+> which the Rust crate had through serde, is on the demand-gated list. The 6.6.12
+> stdlib has no JSON or serde module, but it does ship `lib/protobuf.cyr`. The
+> symbolic "bridge" (Rust 1.3.0's abaco bridge) was not ported either. It has no
+> roadmap row and no recorded disposition, so dropping it is left to the
+> maintainer. What argues against porting it: the roadmap's *Scope* assigns
+> expression parsing to abaco, and *Boundary with Abaco* says hisab should never
+> depend on abaco.
+
 ## Summary
 
 | Metric | Rust | Cyrius | Status |
@@ -98,8 +141,10 @@ These were flagged as missing but ARE in the port:
 - Symbolic: integration, LaTeX, pattern matching, bridge
 - Dual quaternions
 - Mat4 decompose/recompose
-- Parallel module (requires Cyrius threading)
-- AI module (requires Cyrius HTTP)
+- Parallel module (requires Cyrius threading) *(outdated: the cyrius 6.6.12 tag ships
+  `lib/thread.cyr`; see the 2026-09-30 status)*
+- AI module (requires Cyrius HTTP) *(outdated: the cyrius 6.6.12 tag ships `lib/http.cyr`; the
+  module is dropped, since it would conflict with SECURITY.md's "No network I/O in core library")*
 - Logging module (sakshi covers this)
 
 ## Infrastructure gaps

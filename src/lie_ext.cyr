@@ -1,12 +1,12 @@
 # lie_ext.cyr -- Lie group extensions: SE(3), SO(3) explicit, adjoint, BCH
-# Usage: include "lib/lie_ext.cyr"
-# Requires: alloc.cyr, math.cyr, f64_util.cyr, error.cyr, complex.cyr,
-#           quat.cyr, vec3.cyr, mat3.cyr, mat4.cyr, lie.cyr
+# Usage: shipped inside dist/hisab.cyr; in-tree, include "src/lie_ext.cyr" after what it requires
+# Requires: src/complex.cyr, src/error.cyr, src/f64_util.cyr, src/lie.cyr, src/mat3.cyr, src/mat4.cyr,
+#           src/quat.cyr, src/vec3.cyr, src/vec4.cyr (stdlib resolves via cyrius.cyml [deps])
 #
 # Provides:
 #   SE(3)  -- Special Euclidean group (rigid body motions)
 #   SO(3)  -- rotation group (3x3 matrix representation)
-#   Adjoint representations for SU(2), SO(3,1), SE(3)
+#   Adjoint representations for SO(3,1) and SE(3) (su2_adjoint is in lie.cyr since 3.3.0)
 #   Baker-Campbell-Hausdorff formula (2nd and 3rd order)
 #
 # SE(3) layout: { rotation: SU(2) ptr, translation: HVec3 ptr } = 16 bytes
@@ -56,25 +56,6 @@ fn _vec6_new(a, b, c, d, e, f) {
 }
 
 fn _vec6_get(v, i) { return load64(v + i * 8); }
-fn _vec6_set(v, i, val) { store64(v + i * 8, val); return 0; }
-
-fn _vec6_add(a, b) {
-    return _vec6_new(f64_add(_vec6_get(a, 0), _vec6_get(b, 0)),
-      f64_add(_vec6_get(a, 1), _vec6_get(b, 1)),
-      f64_add(_vec6_get(a, 2), _vec6_get(b, 2)),
-      f64_add(_vec6_get(a, 3), _vec6_get(b, 3)),
-      f64_add(_vec6_get(a, 4), _vec6_get(b, 4)),
-      f64_add(_vec6_get(a, 5), _vec6_get(b, 5)));
-}
-
-fn _vec6_scale(v, s) {
-    return _vec6_new(f64_mul(_vec6_get(v, 0), s),
-      f64_mul(_vec6_get(v, 1), s),
-      f64_mul(_vec6_get(v, 2), s),
-      f64_mul(_vec6_get(v, 3), s),
-      f64_mul(_vec6_get(v, 4), s),
-      f64_mul(_vec6_get(v, 5), s));
-}
 
 # Extract omega (first 3) and v (last 3) from a 6-vector twist
 fn _twist_omega(tw) {
@@ -105,11 +86,6 @@ fn _skew3(v) {
     return m;
 }
 
-# Vee map: 3x3 skew-symmetric matrix -> Vec3
-fn _unskew3(m) {
-    return hvec3_new(m3_get(m, 1, 2), m3_get(m, 2, 0), m3_get(m, 0, 1));
-}
-
 # 3x3 real matrix commutator [A, B] = AB - BA
 fn _m3_commutator(a, b) {
     return m3_add(m3_mul(a, b), m3_scale(m3_mul(b, a), f64_neg(F64_ONE)));
@@ -126,16 +102,19 @@ public fn so3_from_axis_angle(axis, angle) {
     var nx = HVec3_x(axis); var ny = HVec3_y(axis); var nz = HVec3_z(axis);
     # 2.17.0: scaled norm, shared with lie.cyr — see `lie_norm3` there.
     var norm = lie_norm3(nx, ny, nz);
-    # ⛔ `norm` is the LENGTH of the caller's axis/vector in the caller's own units,
-    # against an absolute 1e-12 — and every fallback here is a structurally valid
-    # element (identity rotation, identity boost) returned with no rc, so a caller
-    # cannot tell it from a real answer. Measured on the sibling `so3_exp`: the
-    # general Rodrigues path is exact across the whole range, so the guard is the
-    # sole cause of ~296 decades of discarded rotation.
-    # ⚠ F64_TINY is exactly equivalent to `norm == 0` here, because `norm` is a
-    # sqrt of a sum of SQUARES: the smallest non-zero value it can produce is
-    # ~2^-537, some 146 decades above DBL_MIN, so nothing can land in between.
+    # ⛔ Through 2.14.0 `norm`, the length of the caller's axis in the caller's own units,
+    # was tested against an absolute 1e-12 (`EPSILON_F64`), and the fallback here, the
+    # identity rotation, is a structurally valid element returned with no rc, so a caller
+    # cannot tell it from a real answer. Measured on the sibling `so3_exp`: the general
+    # Rodrigues path is exact across the whole range, so that guard was the sole cause of
+    # ~296 decades of discarded rotation. 2.15.0 moved it to F64_TINY.
     # [measured: docs/audit/2026-09-09-epsilon-open.json]
+    # ⚠ In 2.15.0 and 2.16.0 F64_TINY was exactly `norm == 0` here, because `norm` was a
+    # raw sqrt of a sum of SQUARES, whose smallest non-zero value is ~2^-537. Since 2.17.0
+    # it is the scaled `lie_norm3`, which returns subnormals, so this guard returns the
+    # identity for a non-zero axis whose norm is below 2^-1022: axis (2^-1023, 0, 0) at
+    # pi/2 gives R[1][1] = 1 where the answer is cos(pi/2). Open: roadmap [3.3.4], audit D086.
+    # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
     if (f64_lt(norm, F64_TINY) == 1) {
         return m3_identity();
     }
@@ -341,6 +320,9 @@ public fn se3_identity() {
 
 # Extract rotation + translation from a 4x4 homogeneous matrix.
 # Upper-left 3x3 -> quaternion via SU(2), column 3 rows 0-2 -> translation.
+# ⚠ Assumes a RIGID transform: Shepperd's method below is only meaningful when the
+# upper-left 3x3 is a rotation, and a scaled or sheared block is not detected.
+# There is no scale-recovering (SRT) decompose.
 public fn se3_from_mat4(m) {
     # Build quaternion from upper-left 3x3
     # Using Shepperd's method for robustness

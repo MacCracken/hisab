@@ -15,11 +15,17 @@
 >   boundary-INCLUSIVE, which is what ear clipping needs, so the code was right and only the contract
 >   was wrong. Five assertions pin it.
 >
-> ⚠ **Still open, carried forward and NOT fixed here:** corrections 1 and 4-cosmetic of the CORRECTED
-> section — the CHANGELOG's claim that the divergence direction is "old-partial → new-complete" is
-> backwards on at least one reproducer, and the shadowed neighbour-refresh locals at
-> `collision_core.cyr:740,742` still collide with the winding loop's `pn`/`nn`. Neither changes
+> ⚠ **Still open in 2.9.3, carried forward and NOT fixed here:** corrections 1 and 4-cosmetic of
+> the CORRECTED section — the CHANGELOG's claim that the divergence direction is "old-partial →
+> new-complete" is backwards on at least one reproducer, and the shadowed neighbour-refresh locals
+> at `collision_core.cyr:740,742` still collide with the winding loop's `pn`/`nn`. Neither changes
 > behaviour; both are recorded so closing this file does not bury them.
+>
+> *(Later disposition, added 2026-09-30, v3.3.2.)* **Both closed in 2.20.0** (`CHANGELOG.md`
+> [2.20.0], *Fixed*). The 2.7.0 and 2.7.1 entries now carry a `CORRECTION (2.20.0)` note. Measured
+> on both trees, `(0,0),(1,2),(1,1),(0,2),(2,1)` gives old 9 indices (complete) and new 6
+> (partial). The neighbour-refresh locals in `triangulate_polygon` were renamed as a pair to
+> `prev_slot`/`next_slot`. Only `pn` was a true shadow: the winding loop uses `ni`, not `nn`.
 
 <!-- 2.7.0-I performance record. Analysed and adversarially reviewed, both agents running
 real code. Each optimisation is CONFIRMED as a real complexity win, but each was also shown

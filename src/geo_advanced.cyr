@@ -1,6 +1,6 @@
 # geo_advanced.cyr -- advanced geometry: GJK/EPA 3D, BVH, SDF, swept AABB/TOI, CGA
-# Usage: include "lib/geo_advanced.cyr"
-# Requires: alloc.cyr, math.cyr, vec3.cyr, vec.cyr, fnptr.cyr, geo.cyr, error.cyr, f64_util.cyr
+# Usage: shipped inside dist/hisab.cyr; in-tree, include "src/geo_advanced.cyr" after what it requires
+# Requires: src/error.cyr, src/geo.cyr, src/quat.cyr, src/vec3.cyr (stdlib resolves via cyrius.cyml [deps])
 #
 # Ported from hisab rust-old/src/geo/{collision,spatial,sdf,cga}.rs
 #
@@ -99,11 +99,7 @@ fn _gjk_simplex_new() {
 
 fn _gjk_simplex_count(s) { return load64(s + 32); }
 
-fn _gjk_simplex_set_count(s, n) { store64(s + 32, n); return 0; }
-
 fn _gjk_simplex_get(s, i) { return load64(s + i * 8); }
-
-fn _gjk_simplex_set(s, i, v) { store64(s + i * 8, v); return 0; }
 
 fn _gjk_simplex_push(s, v) {
     var n = load64(s + 32);
@@ -386,15 +382,21 @@ fn _gjk_certifies_apart(sup_a, shape_a, sup_b, shape_b, dir) {
 # binary: box/box 531 -> 766 ns/call (+44%), sphere/sphere 901 -> 1353 (+50%),
 # sphere/box 685 -> 1039 (+52%).
 #
-# THOSE THREE RATIOS ARE UNDERSTATED, and the honest figure is +50% to +63%,
-# MEDIAN +55%. The same-binary harness above never calls alloc_reset, so the
+# THOSE THREE RATIOS ARE UNDERSTATED, and 2.9.0's corrected figure was +50% to
+# +63%, median +55%: the same-binary harness above never calls alloc_reset, so the
 # arena grows across the run and adds roughly 100 ns of soft page faults to BOTH
 # terms -- which inflates the baseline and deflates the ratio. Two independent
-# methods agree at ~1.55: two builds differing only in this file (HEAD vs working
+# methods agreed at ~1.55: two builds differing only in this file (HEAD vs working
 # tree), and a same-binary reconstruction, over nine separated fixtures in both
-# shape families. The suite's own `gjk_intersect_box_miss` row prints min=807 ns
-# against the 766 quoted here, which is the same discrepancy visible from the
-# outside. Quote +55% when quoting this change, not +44%. The OVERLAP path is
+# shape families. The suite's own `gjk_intersect_box_miss` row then printed
+# min=807 ns against the 766 quoted here, the same discrepancy seen from the
+# outside. +55% now understates it too: a same-binary ABBA re-derives the no-hit
+# cost as +62% (box) / +57% (sphere) on cycc 6.6.2 and +62% / +58% on 6.6.12.
+# Quote those, with the toolchain, not +55% or +44%.
+# [measured: same-binary ABBA; 6.6.2: docs/audit/2026-09-09-roadmap-verification.md; 6.6.12: roadmap D041, 2026-09-30]
+# Every other figure in this block is 2.9.0's, and the bench instrument changed
+# in 2.11.2 (it now subtracts a calibrated clock read), so compare today's
+# `gjk_intersect_*_miss` rows with each other, not with these. The OVERLAP path is
 # untouched (2145 -> 2197, +2.4%, one 8-byte alloc), and a near-tangent but
 # still separated pair -- the resting-contact regime a physics broadphase lives
 # in -- pays only that same one support call (1e-9 gap 3293 -> 3649, 1e-15 gap
@@ -860,8 +862,9 @@ fn _epa_polish(sup_a, shape_a, sup_b, shape_b, n0, d0, out_normal, out_depth) {
     return 0;
 }
 
-# How many times gjk_epa_3d fell back to the direction polish instead of
-# returning a CERTIFIED EPA result. Test-observability only; nothing branches on
+# How many times _epa_refine fell back to the direction polish instead of
+# returning a CERTIFIED EPA result -- from gjk_epa_3d and from mpr_penetration,
+# which both return through it. Test-observability only; nothing branches on
 # it. See the comment at the increment site for why the suite needs it.
 var _GA_EPA_POLISH_COUNT = 0;
 
@@ -1094,10 +1097,11 @@ fn _epa_degenerate_normal(sup_a, shape_a, sup_b, shape_b) {
     var e1 = hvec3_zero();
     for (var i = 1; i < n; i = i + 1) {
         # ⛔ `hvec3_length_sq(e1)` is a SQUARED length — degree two in the world
-        # units — against the unsquared 1e-12, so a small-but-real simplex edge
-        # read as "not yet found" and EPA fell back to a FABRICATED unit_x normal.
+        # units — and was compared against the unsquared 1e-12, so a small-but-real
+        # simplex edge read as "no distinct vertex" and EPA fell back to a
+        # FABRICATED unit_x normal.
         # ⭐ "Genuinely distinct from v0" is an exact question, and this file's own
-        # 2.9.0 repair at :266 already answers it that way.
+        # 2.9.0 repair in `_gjk_core_dir_3d` already answers it that way.
         # [measured: docs/audit/2026-09-09-epsilon-open.json]
         if (f64_gt(hvec3_length_sq(e1), 0) == 0) {
             e1 = hvec3_sub(_gjk_simplex_get(simplex, i), v0);
@@ -1113,8 +1117,9 @@ fn _epa_degenerate_normal(sup_a, shape_a, sup_b, shape_b) {
         var c = hvec3_cross(e1, ej);
         # ⭐ COLINEARITY IS AN ANGLE, not a magnitude. |e1 x ej| / (|e1| |ej|) is
         # sin(theta) — dimensionless and bounded — which is the form this file
-        # already uses at :530 and :682. The squared-vs-unsquared comparison here
-        # made the same three points colinear or not depending on their units.
+        # already uses in `_epa_face_set` and `_epa_seed_portal`. The
+        # squared-vs-unsquared comparison here made the same three points
+        # colinear or not depending on their units.
         if (f64_le(hvec3_length(c),
             f64_mul(EPSILON_F64, f64_mul(hvec3_length(e1), hvec3_length(ej)))) == 0) {
             return _epa_unit(c);
@@ -1854,10 +1859,8 @@ public fn sdf_subtraction(d1, d2) { return f64_max(d1, f64_neg(d2)); }
 public fn sdf_smooth_union(d1, d2, k) {
     var h = f64_clamp(f64_add(F64_HALF, f64_mul(F64_HALF, f64_div(f64_sub(d2, d1), k))),
       0, F64_ONE);
-    var blend = f64_sub(f64_mul(d2, f64_sub(F64_ONE, h)),
-      f64_sub(f64_mul(d1, h),
-        f64_mul(k, f64_mul(h, f64_sub(F64_ONE, h)))));
-    # Correction: d2*(1-h) + d1*h - k*h*(1-h)
+    # d2*(1-h) + d1*h - k*h*(1-h). (Through 3.3.1 a dead `blend` local also
+    # computed a different, wrong formula first and was never read.)
     var one_minus_h = f64_sub(F64_ONE, h);
     var r = f64_add(f64_mul(d2, one_minus_h), f64_mul(d1, h));
     r = f64_sub(r, f64_mul(k, f64_mul(h, one_minus_h)));
@@ -2215,8 +2218,10 @@ public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, m
         var d_slot = alloc(8);
         gjk_epa_3d(support_a, shape_a, support_b, shape_b, n_slot, d_slot);
         var n0 = load64(n_slot);
-        # EPA returns 0 on a degenerate polytope and left out_normal holding a
-        # NULL pointer for every caller that dereferenced it.
+        # Before 2.8.3, EPA could return 0 on a degenerate polytope and leave
+        # out_normal holding a NULL pointer for every caller that dereferenced it.
+        # Since 2.8.3 gjk_epa_3d writes a unit_x placeholder before anything
+        # else, so this guard is defensive.
         if (n0 == 0) { n0 = hvec3_unit_x(); }
         store64(out_normal, n0);
         return 1;
@@ -2315,7 +2320,8 @@ public var CGA_MV_SIZE = 256;  # 32 * 8 bytes
 # Blade-to-bitmask table (e1=bit0, e2=bit1, e3=bit2, n0=bit3, ninf=bit4).
 # ⚠ This is the NULL bitmask space. `_cga_geo_bits` works in the ORTHONORMAL
 # one, where bit3 is ep and bit4 is em; `_cga_expand_null` is the bridge.
-# Stored as a flat array of 32 bytes (one u8 per blade, packed in i64 words)
+# An if-chain over the 32 blade indices, not a stored array (since the port);
+# `_cga_build_blade_memo` inverts it into a bitmask -> blade-index table.
 fn _cga_blade_bits(idx) {
     # Inlined lookup table (each value is the bitmask for that blade index)
     if (idx == 0)  { return 0; }     # scalar
@@ -2560,14 +2566,15 @@ fn _cga_build_null_tbl() {
     # **2.7 ms on the first CGA call**, against 11 us on 2.20.0: a 250x one-time
     # regression, invisible to every benchmark because they all warm up first.
     # Hoisting both tables and iterating occupancy lists instead of all 32 slots
-    # brings that to **0.72 ms** — still 65x the old first call, so the table is
-    # only worth it past **~430 products**: it costs ~709 us extra once and saves
-    # ~1.65 us per call thereafter (steady state 1.25 us against 2.90 us).
+    # brought that to **0.72 ms** in 2.21.0 — still 65x the old first call, so the
+    # table was only worth it past **~430 products**: it cost ~709 us extra once and
+    # saved ~1.65 us per call thereafter (steady state 1.25 us against 2.90 us).
+    # These are 2.21.0's figures; the 2.24.0 cuts further down supersede them.
     # ⚠ The table is byte-identical across this rewrite — the FNV contract
     # 0xF4A98C5706D5CF5B is asserted in tests/modules.tcyr and would catch any
-    # drift, which is what made it safe to change at all. The remaining cost is
-    # the four 32-slot clear/scan passes per pair; cutting those to occupancy
-    # lists as well is on the roadmap, not folded in here unmeasured.
+    # drift, which is what made it safe to change at all. The remaining cost was
+    # then the four 32-slot clear/scan passes per pair; 2.24.0 cut those to
+    # occupancy lists too — see its `mid`/`res` block just before the pair loop.
     # [measured: first-call probe, 3 runs each tree, 2026-09-11]
     var exp_c = alloc(32 * 32 * 8);
     var exp_i = alloc(32 * 8 * 8);
@@ -2632,10 +2639,15 @@ fn _cga_build_null_tbl() {
     # return to zero and be written again, and testing `== 0` to decide whether to
     # append would then append it TWICE and double-count it in the scan.
     # ⚠ `rt` is kept SORTED on insert because the packing loop below depends on
-    # ASCENDING BITMASK ORDER — the derivation's term ordering. Nothing in the
-    # suite can currently discriminate a wrong order (both slots are filled from
-    # the same pair), so the sorted insert is what makes the ordering a guarantee
-    # rather than a coincidence; at <= 2 terms it costs one comparison.
+    # ASCENDING BITMASK ORDER — the derivation's term ordering. A WRONG order is
+    # caught: a descending insert changes the table's FNV and fails the contract
+    # assertion in tests/modules.tcyr, the only failure across the five suites.
+    # What no test can catch is DELETING the sort: on the builder's one fixed
+    # input the plain append order is already ascending, so that mutant is
+    # equivalent (every suite passes) and the sorted insert is what makes the
+    # ordering a guarantee rather than a coincidence; at <= 2 terms it costs one
+    # comparison.
+    # [measured: rt mutants, five suites in a scratch copy, 2026-09-30; cycc 6.6.12]
     # ⚠ Sized 32 against a MEASURED maximum of 2 occupied slots, i.e. 16x headroom.
     # [measured: paired end-to-end first-call probe, 5 runs per tree, 2026-09-11]
     var mt = alloc(32 * 8);
@@ -2673,9 +2685,9 @@ fn _cga_build_null_tbl() {
             # silently produced an ALL-ZERO table — no diagnostic, no crash.
             # ⚠ The outer loop is NOT terminated: instrumented, its body is
             # entered all 3 times while the inner body runs 3 of 9. Filed
-            # upstream as
-            # issues/2026-09-11-nested-continue-binds-to-wrong-loop.md with a
-            # repro that exits 0 when fixed and 1 while the bug is present.
+            # upstream with a repro that exits 0 when fixed and 1 while the bug
+            # is present, and since archived there and here; hisab's record is
+            # docs/development/issues/archived/2026-09-11-cyrius-nested-continue-binds-to-wrong-loop.md
             # [measured: 10-shape matrix + 3 counters on cycc 6.6.2, 2026-09-11]
             # ⭐ FIXED UPSTREAM IN cycc 6.6.3 (one flat 8-entry `continue` patch
             # array was reset per loop, so a nested loop overwrote its parent's
@@ -2687,11 +2699,20 @@ fn _cga_build_null_tbl() {
             # contract table on 6.6.3 (2088/2088 with the probe assertions).
             # [measured: hisab 3.0.1 bump, cycc 6.6.2 vs 6.6.3, 2026-09-13]
             # ⚠ WHY THE GUARD FORM STAYS: `dist/hisab.cyr` is compiled by each
-            # consumer under ITS OWN toolchain pin, and no live consumer had
-            # crossed 6.6.2 at the time of writing. The `if` form is correct
-            # under every cycc; the `continue` form is correct only from 6.6.3
-            # and fails SILENTLY below it. Same disposition as `m4_mul_vec4`'s
-            # hoist in 2.11.5: not mandatory, kept for a stated reason.
+            # consumer under ITS OWN toolchain pin. The reason written in 3.0.1,
+            # that no live consumer had crossed 6.6.2, is void from 3.1.0 on:
+            # since 3.1.0 the bundle needs cycc >= 6.6.3 (`public struct` +
+            # `#derive`, both in vec3, which this module requires), and 6.6.2
+            # refuses it with the `#derive` error, so no toolchain that compiles
+            # a 3.1.0-or-later bundle has the defect (3.0.0 pinned 6.6.2, and the
+            # 3.0.1 bundle still compiles there: roadmap D146). The form stays
+            # only for a possible 2.24.x backport (2.24.0 pins 6.6.2); that is
+            # the maintainer's pending decision (roadmap "Decisions owed" #1,
+            # audit D148 and D142). The `if` form is correct under every cycc;
+            # the `continue` form is correct only from 6.6.3 and fails SILENTLY
+            # below it. Same disposition as `m4_mul_vec4`'s hoist in 2.11.5: not
+            # mandatory, kept for a stated reason.
+            # [measured: pinned-dir builds, 3.3.0 bundle: 6.6.0-6.6.2 refused, 6.6.3-6.6.12 ran; audit D142, 2026-09-30]
             for (var pi = 1; pi <= na; pi = pi + 1) {
                 var p = load64(exp_i + (ai * 8 + pi) * 8);
                 var cp = load64(exp_c + (ai * 32 + p) * 8);
@@ -2781,9 +2802,9 @@ fn _cga_null_tbl() {
 }
 
 # Geometric product of two basis blades.
-# Returns sign * 256 + result_blade_index (packed).
-# Sign: 0 = zero, 1 = positive, 2 = negative (sign = 1 - (packed >> 8) * 2... etc)
-# Actually, let's return two values via a 16-byte struct: {sign_i32, blade_idx}
+# Returns a fresh 32-byte block holding up to two terms, each a (sign, blade
+# index) pair of i64s: [sign0, blade0, sign1, blade1]. A sign is +1, -1, or 0
+# for an empty slot; slot 1 is filled only where the null basis gives two terms.
 # ⭐ 2.21.0 — THE BASIS IS NOW THE NULL BASIS {e1,e2,e3,n0,ninf}. Blade index 4 is
 # n0 and 5 is ninf; they were ep and em. This reads the table built by
 # `_cga_null_tbl()` rather than computing an orthonormal product inline, because
@@ -2792,7 +2813,7 @@ fn _cga_null_tbl() {
 # ⚠ The table is verified two ways: `scripts/derive-cga-null-table.sh` derives all
 # 1024 entries independently and `tests/modules.tcyr` asserts the Cyrius table
 # reproduces its FNV-1a exactly.
-# Layout, matching the packing in `_cga_build_null_tbl`:
+# Table-entry layout, matching the packing in `_cga_build_null_tbl`:
 #   bits 0-1 sign0 (0 empty / 1 plus / 2 minus), 2-6 blade0,
 #   bits 7-8 sign1, 9-13 blade1.
 # ⚠ `sign == 0` means the slot is EMPTY; every caller must treat it that way.
@@ -2885,8 +2906,9 @@ public fn cga_mv_reverse(mv) {
 # term a_i * b_j, and these products are exactly BILINEAR, so any non-zero
 # threshold makes them non-bilinear: scale a multivector down and terms start
 # vanishing that contributed at the original scale. The coefficients carry the
-# caller's units (cga_point writes (x^2 +- 1)/2), so the threshold was scale
-# dependent as well as unnecessary.
+# caller's units (with q = |p|^2, cga_point writes q/2 on ninf since 2.21.0, and
+# wrote (q - 1)/2 and (q + 1)/2 on ep and em before it), so the threshold was
+# scale dependent as well as unnecessary.
 # ⭐ The skip exists purely to avoid work on structurally absent blades, so the
 # test is exactly `!= 0`. ⚠ Numeric, not a bit compare, so -0.0 is treated as the
 # zero it is; and NaN is KEPT rather than silently deleted from the multivector.
@@ -2902,17 +2924,19 @@ public fn cga_geometric_product(a, b) {
                 var bj = load64(b + gj * 8);
                 if (f64_eq(bj, f64_from(0)) == 0) {
                     var packed = _cga_geo_blades(gi, gj);
-                    # Both term slots; slot 1 is empty in the orthonormal basis.
+                    # Both term slots: slot 1 exists for the null basis (2.21.0);
+                    # the orthonormal ep/em basis before it never filled it.
                     # ⚠ `nt` rather than a fixed 2: slot 1 is empty for 896 of the
-                    # 1024 basis-blade pairs, and always empty while the basis is
-                    # orthonormal. Iterating it unconditionally costs **+4.5% dense
+                    # 1024 basis-blade pairs, and it was empty for all 1024 in
+                    # the ep/em basis. Iterating it unconditionally costs **+4.5% dense
                     # and +7.9% on point*point**; guarding it brings that to **+3.1%
                     # and +6.4%** against the one-term original. ⚠ The SPARSER
                     # operand pays MORE, because the loop overhead is a larger share
                     # of the work when fewer pairs reach the arithmetic — which is
                     # the opposite of the intuition that sparse inputs are cheap.
                     # ⚠ The residual is the price of the basis change, not free: it
-                    # buys exact nullity, and it is paid on every product.
+                    # buys ulp-level, not exact, nullity (see `cga_point`), and it is
+                    # paid on every product.
                     # [measured: 2000 dense + 2000 point*point products, best of 5, 3 runs, spread <1%]
                     var nt = 1;
                     if (load64(packed + 16) != 0) { nt = 2; }
@@ -2944,17 +2968,19 @@ public fn cga_outer_product(a, b) {
                 if (f64_eq(bj, f64_from(0)) == 0) {
                     var grade_sum = _cga_blade_grade(gi) + _cga_blade_grade(gj);
                     var packed = _cga_geo_blades(gi, gj);
-                    # Both term slots; slot 1 is empty in the orthonormal basis.
+                    # Both term slots: slot 1 exists for the null basis (2.21.0);
+                    # the orthonormal ep/em basis before it never filled it.
                     # ⚠ `nt` rather than a fixed 2: slot 1 is empty for 896 of the
-                    # 1024 basis-blade pairs, and always empty while the basis is
-                    # orthonormal. Iterating it unconditionally costs **+4.5% dense
+                    # 1024 basis-blade pairs, and it was empty for all 1024 in
+                    # the ep/em basis. Iterating it unconditionally costs **+4.5% dense
                     # and +7.9% on point*point**; guarding it brings that to **+3.1%
                     # and +6.4%** against the one-term original. ⚠ The SPARSER
                     # operand pays MORE, because the loop overhead is a larger share
                     # of the work when fewer pairs reach the arithmetic — which is
                     # the opposite of the intuition that sparse inputs are cheap.
                     # ⚠ The residual is the price of the basis change, not free: it
-                    # buys exact nullity, and it is paid on every product.
+                    # buys ulp-level, not exact, nullity (see `cga_point`), and it is
+                    # paid on every product.
                     # [measured: 2000 dense + 2000 point*point products, best of 5, 3 runs, spread <1%]
                     var nt = 1;
                     if (load64(packed + 16) != 0) { nt = 2; }
@@ -2991,17 +3017,19 @@ public fn cga_left_contraction(a, b) {
                 if (f64_eq(bj, f64_from(0)) == 0) {
                     var target = _cga_blade_grade(gj) - _cga_blade_grade(gi);
                     var packed = _cga_geo_blades(gi, gj);
-                    # Both term slots; slot 1 is empty in the orthonormal basis.
+                    # Both term slots: slot 1 exists for the null basis (2.21.0);
+                    # the orthonormal ep/em basis before it never filled it.
                     # ⚠ `nt` rather than a fixed 2: slot 1 is empty for 896 of the
-                    # 1024 basis-blade pairs, and always empty while the basis is
-                    # orthonormal. Iterating it unconditionally costs **+4.5% dense
+                    # 1024 basis-blade pairs, and it was empty for all 1024 in
+                    # the ep/em basis. Iterating it unconditionally costs **+4.5% dense
                     # and +7.9% on point*point**; guarding it brings that to **+3.1%
                     # and +6.4%** against the one-term original. ⚠ The SPARSER
                     # operand pays MORE, because the loop overhead is a larger share
                     # of the work when fewer pairs reach the arithmetic — which is
                     # the opposite of the intuition that sparse inputs are cheap.
                     # ⚠ The residual is the price of the basis change, not free: it
-                    # buys exact nullity, and it is paid on every product.
+                    # buys ulp-level, not exact, nullity (see `cga_point`), and it is
+                    # paid on every product.
                     # [measured: 2000 dense + 2000 point*point products, best of 5, 3 runs, spread <1%]
                     var nt = 1;
                     if (load64(packed + 16) != 0) { nt = 2; }
@@ -3037,17 +3065,19 @@ public fn cga_right_contraction(a, b) {
                 if (f64_eq(bj, f64_from(0)) == 0) {
                     var target = _cga_blade_grade(gi) - _cga_blade_grade(gj);
                     var packed = _cga_geo_blades(gi, gj);
-                    # Both term slots; slot 1 is empty in the orthonormal basis.
+                    # Both term slots: slot 1 exists for the null basis (2.21.0);
+                    # the orthonormal ep/em basis before it never filled it.
                     # ⚠ `nt` rather than a fixed 2: slot 1 is empty for 896 of the
-                    # 1024 basis-blade pairs, and always empty while the basis is
-                    # orthonormal. Iterating it unconditionally costs **+4.5% dense
+                    # 1024 basis-blade pairs, and it was empty for all 1024 in
+                    # the ep/em basis. Iterating it unconditionally costs **+4.5% dense
                     # and +7.9% on point*point**; guarding it brings that to **+3.1%
                     # and +6.4%** against the one-term original. ⚠ The SPARSER
                     # operand pays MORE, because the loop overhead is a larger share
                     # of the work when fewer pairs reach the arithmetic — which is
                     # the opposite of the intuition that sparse inputs are cheap.
                     # ⚠ The residual is the price of the basis change, not free: it
-                    # buys exact nullity, and it is paid on every product.
+                    # buys ulp-level, not exact, nullity (see `cga_point`), and it is
+                    # paid on every product.
                     # [measured: 2000 dense + 2000 point*point products, best of 5, 3 runs, spread <1%]
                     var nt = 1;
                     if (load64(packed + 16) != 0) { nt = 2; }
@@ -3081,16 +3111,16 @@ public fn cga_scalar_part(mv) { return load64(mv); }
 
 # ⛔ 2.18.0 — THIS BUILT A WHOLE 32-SLOT MULTIVECTOR TO READ ONE NUMBER OUT OF
 # IT, AND THE ACCUMULATION ORDER DESTROYED THAT NUMBER. `cga_norm_sq` is the
-# scalar part of `mv * reverse(mv)`, and the scalar part comes from exactly the
-# 32 DIAGONAL blade pairs — verified: of the 1024 pairs, 32 produce blade 0 and
-# every one of them has i == j. The other 992 iterations computed slots nobody
-# read.
+# scalar part of `mv * reverse(mv)`, and in the ep/em basis the scalar part came
+# from exactly the 32 DIAGONAL blade pairs — verified then: of the 1024 pairs, 32
+# produced blade 0 and every one of them had i == j (the null basis changed that
+# in 2.21.0; see below). The other 992 iterations computed slots nobody read.
 # ⛔ The real cost was correctness. A translator is a unit versor — `e_inf² = 0`,
 # so `T * rev(T) = 1` identically — and its scalar part accumulates
 # `1 + t²/4 - t²/4`. Once `t²/4` passes 2^53 the leading 1 is rounded away and
-# the answer comes back **0 instead of 1**: measured, `cga_norm(cga_translator(t,
-# 0, 0))` stops being 1 at **t = 2^28**, an entirely ordinary translation
-# distance. The same shape makes `cga_norm(cga_point(x, 0, 0))` — which must be
+# the answer came back **0 instead of 1**: measured, `cga_norm(cga_translator(t,
+# 0, 0))` stopped being 1 at **t = 2^28**, an entirely ordinary translation
+# distance. The same shape made `cga_norm(cga_point(x, 0, 0))` — which must be
 # exactly 0, a conformal point being null — wrong from **x = 2^-27**.
 # ⚠ THIS IS NOT THE NORM CLASS AND 2.17.0's RESCALE CANNOT TOUCH IT. A
 # power-of-two rescale is exact, so it moves every term by the same factor and
@@ -3121,7 +3151,7 @@ public fn cga_scalar_part(mv) { return load64(mv); }
 # witness is `M = 1 + a*e1 + a*n0 + (a/2)*ninf`, whose scalar part is exactly 1
 # by construction. Without compensation `M*M` reads **0 for 6 of 11 magnitudes,
 # every one at a >= 2^30** — a confident zero where the answer is one, which is
-# the class `src/complex.cyr:58` has been tracking since 2.6.14.
+# the fabricated-answer class `src/complex.cyr` has tracked since 2.6.14 (see `cx_div`).
 # ⭐ AN EXACT ZERO OBTAINED BY MAKING THE SAME ROUNDING ERROR TWICE IS AN
 # ARTIFACT, NOT ACCURACY. And it bought nothing measurable: distance recovery is
 # better WITH the compensation (median 1.76e-15 against 1.85e-15), and the
@@ -3130,10 +3160,12 @@ public fn cga_scalar_part(mv) { return load64(mv); }
 # ⛔ NO ASSERTION IN 3989 COULD SEE THE DIFFERENCE. The suite was fully green with
 # the compensation present AND absent, which is why `tests/modules.tcyr` now pins
 # the witness above; verified to fail (2071/1) without it.
-# ⚠ Kept in mind rather than assumed away: 2.18.0 added this compensation to
-# mitigate the SAME symptom in the ep/em basis (`cga_norm(cga_point(x,0,0))`
-# wrong from x = 2^-27). The basis change fixed that cause; the compensation now
-# earns its place on the fabrication witness instead.
+# ⚠ Kept in mind rather than assumed away: 2.18.0 added this compensation for
+# the translator's cancellation. It barely moved the ep/em point's nullity
+# (1010 -> 970 of 1101 positions within 1e-14, relative to the point's largest
+# coefficient), and the worst relative defect, 2^-26 at x = 2^-27, was identical
+# with and without it, per CHANGELOG 2.18.0. The basis change fixed that cause;
+# the compensation now earns its place on the fabrication witness instead.
 # [measured: 6800-pt nullity + 6000-pair distance + 11-magnitude witness, 2026-09-11]
 fn _cga_scalar_of_geo(a, b) {
     var sum = f64_from(0);
@@ -3216,13 +3248,18 @@ fn _ga_pow2_floor(s) {
 # is subnormal there, `1/s` is +Inf, and every structurally-zero slot becomes
 # `0 * Inf`. A fabricated NaN is not an improvement on a fabricated 0.
 # [measured: 2026-09-09 norm census, three independent verifiers on this site]
-# ⚠ WHAT THIS DOES NOT FIX, measured and stated so it is not read as more:
-# `cga_norm(cga_translator(t,0,0))` must be exactly 1 and stops being so at
-# t = 2^28, and `cga_norm(cga_point(x,0,0))` must be exactly 0 and stops at
-# x = 2^-27. Neither is this class — both are CATASTROPHIC CANCELLATION in the
+# ⚠ WHAT THIS DID NOT FIX in 2.17.0, measured and stated so it is not read as
+# more: `cga_norm(cga_translator(t,0,0))` must be exactly 1 and stopped being so
+# at t = 2^28, and `cga_norm(cga_point(x,0,0))` must be exactly 0 and stopped at
+# x = 2^-27. Neither is this class — both were CATASTROPHIC CANCELLATION in the
 # product's accumulation order (1 + t²/4 - t²/4 loses the 1 once t²/4 passes
 # 2^53), and a power-of-two rescale is exact, so it cannot and does not move
-# them. They are filed on the roadmap rather than folded in here.
+# them. Both have been fixed since, outside this function: 2.18.0's Neumaier sum in
+# `_cga_scalar_of_geo` keeps the translator at exactly 1 out to t = 2^538
+# (`tests/modules.tcyr` sweeps it), and 2.21.0's null basis stores q in one
+# coefficient, so the on-axis point is exactly null at x = 2^-27 (see
+# `cga_point` for the off-axis residual).
+# [measured: translator 2^28/2^30/2^538 and 1001 on-axis points, scratch probe, 2026-09-30; cycc 6.6.12]
 public fn cga_norm(mv) {
     var mx = f64_from(0);
     for (var ni = 0; ni < 32; ni = ni + 1) {

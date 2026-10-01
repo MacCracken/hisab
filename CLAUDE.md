@@ -104,7 +104,8 @@ scripts/
   check-result-migration.sh — no Result-returning call sits in argument position
   derive-cga-null-table.sh — re-derives the CGA null-basis table and its FNV
   version-bump.sh    — bump VERSION; checks src/main.cyr prints CYRIUS_PKG_VERSION;
-                       prints the remaining steps (CHANGELOG header, distlib)
+                       prints the remaining steps (CHANGELOG header, distlib). The
+                       user's tool: never run it unless the user asks
 benchmarks.md        — rendered benchmark trend table (repo root; generated)
 bench-history.csv    — benchmark regression history (repo root)
 cyrius.cyml          — package manifest (toolchain pin, [lib], [deps])
@@ -139,7 +140,10 @@ VERSION              — single source of truth for version
 8. Run benchmarks again — prove the wins
 9. If audit heavy → return to step 5
 10. Documentation — update CHANGELOG, roadmap, docs
-11. Version check — VERSION matches CHANGELOG header (cyrius.cyml auto-syncs via `${file:VERSION}`)
+11. Version check — **the user decides every release and its number.** Never edit `VERSION`, add a
+    `## [X.Y.Z]` CHANGELOG header, run `version-bump.sh` or tag on your own; record changes under
+    `## [Unreleased]` and ask if a version question comes up. Once the user has set a version, check
+    that VERSION matches the CHANGELOG header (cyrius.cyml auto-syncs via `${file:VERSION}`)
 12. Return to step 1
 
 ### Task Sizing
@@ -275,11 +279,13 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
 - **A public name whose meaning changes is retired, not redefined**, because consumers compile under
   their own pins (2.11.5).
 - **A repair that moves no number points at a second defect** (2.17.0, 2.18.0).
-- **Repair in the release that finds it.** File only what needs its own before/after or is blocked
-  upstream.
+- **Repair in the release that finds it — and the user decides anything that is not repaired.** Report
+  what needs its own before/after or is blocked upstream to the user with its evidence; whether it is
+  deferred or filed, and where, is theirs to decide. Never file or defer one on your own.
 
 **Toolchain**
-- **Bump procedure**: capture the five suites' output under the old pin first; set the pin;
+- **The user decides when the toolchain pin moves and to which version — never bump it unasked.**
+  **Bump procedure**, once asked: capture the five suites' output under the old pin first; set the pin;
   `cyrius lib sync` (the declared subset — never `--full`); `cyrius deps`; byte-compare every
   `lib/*.cyr` against the cyrius **tag** (`git -C ~/Repos/cyrius show "<pin>:lib/<f>"`) and
   `sakshi.cyr` against its tag's `dist/` — never against `~/.cyrius/versions/<pin>/lib`, which is
@@ -290,7 +296,9 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
 - **Never swap a vendored `lib/` file in place for an experiment**: a bare `cyrius build` re-vendors
   any file whose hash mismatches `cyrius.lock`, silently. Include a renamed copy explicitly and
   confirm from the instrument's own output which variant ran (3.2.1).
-- **Upstream defects are filed upstream, with a self-proving repro**: cyrius in
+- **Ask the user before filing anything.** A language, compiler, stdlib or ganita problem is reported
+  to the user with its repro first; nothing is filed — upstream or in hisab — until they approve.
+  Once approved, upstream defects are filed upstream with a self-proving repro: cyrius in
   `~/Repos/cyrius/docs/development/issues/`, ganita in `~/Repos/ganita/docs/development/issues/`.
   hisab keeps only a record of its exposure in `docs/development/issues/`. When a bump fixes one,
   close it here with a paired before/after — the upstream agents never edit hisab.
@@ -413,7 +421,7 @@ Root files (required):
 
 docs/ (required):
   doc-health.md      — living doc-currency ledger (fresh/stale/read-through/dated
-                       per file); refresh the affected row whenever a doc is touched
+                       per file); refreshed every release, not on each doc edit
   architecture/
     overview.md      — module map, data flow, consumers, dependency stack
     math.md          — (when applicable) mathematical reference for algorithms/formulas

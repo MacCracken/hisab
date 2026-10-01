@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-09-30 — inputs that ended the caller's process, gates that could not fail, and two 3.3.0 safety claims that were false
+
 The roadmap's **[3.3.1]** items: inputs that ended the caller's process, gates that could not fail,
 and two safety claims 3.3.0 shipped that were false. Every repair below was reproduced first, from
 a scratch dir pinned to cycc 6.6.12 against the shipped 3.3.0 bundle, and every new assertion was
@@ -87,6 +89,19 @@ correctly.
   the forwarded `HSB_ERR_INVALID_INPUT`.
 - **edge_cases**: the "complex div by zero" group asserted only a non-null pointer and said the
   result was "very large". It is now a bit-exact check of the documented `0+0i` pole sentinel.
+- **check-public-surface.sh — found while cutting this release.**
+  - **The defect:** its scanner blanked every `#` to end of line, so `#inline fn _GeoJet_kind(j)`
+    was a comment to it. The 18 `#inline` accessors this release added went unprobed, and claim 3
+    fell from 511 to 493 non-public probes with the gate green. Its floors (500 public / 300
+    private) could not see the drop.
+  - **The fix:** attribute tokens (`#inline`, `#naked`, `#must_use`, `#derive(...)` and the rest of
+    the guide's list) are blanked as tokens, so 511 of 511 are probed and refused again. The
+    floors are now the live populations, 847 and 511. With the old scanner restored, the gate
+    fails at the floor ("493 private probes generated, floor 511").
+- **check-result-migration.sh**: the same blind spot, latent. Its fn-header regex would have
+  missed a Result-returning `#inline fn`, and attributed its body to the previous fn. It now reads
+  the attribute. A planted `#inline` Result fn is flagged by the fixed gate and missed by the old
+  one, which reports 6 false sites instead.
 
 ### Changed
 - **Benchmarks — no win is claimed.** Same-boot interleaved A/B, the 3.3.0 tree against this one,

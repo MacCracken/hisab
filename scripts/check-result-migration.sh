@@ -47,7 +47,9 @@ def migrated_fns(extra_bodies=None):
     for f in sorted(glob.glob("src/*.cyr")):
         cur = None
         for l in open(f, errors="replace"):
-            m = re.match(r'^(?:public )?fn ([A-Za-z_][A-Za-z_0-9]*)\(', l)
+            # `#inline fn` is a declaration, not a comment (3.3.1: geo_diff's
+            # accessors; the same blind spot was fixed in check-public-surface.sh).
+            m = re.match(r'^(?:#inline\s+)?(?:public )?fn ([A-Za-z_][A-Za-z_0-9]*)\(', l)
             if m:
                 cur = m.group(1)
                 bodies[cur] = (f, [])
@@ -61,6 +63,7 @@ def migrated_fns(extra_bodies=None):
     # comments and string literals were masked here.
     def code_of(line):
         line = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line)
+        line = re.sub(r'^(\s*)#inline(?![A-Za-z0-9_])', r'\1       ', line)
         return line.split("#", 1)[0]
     texts = {name: "".join(code_of(l) for l in lines) for name, (f, lines) in bodies.items()}
     fns = {name: bodies[name][0] for name, txt in texts.items()

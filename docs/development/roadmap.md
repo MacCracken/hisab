@@ -28,14 +28,14 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.3.0
+## Current — v3.3.1
 
 **Status**:
-- Suite **4510** across five harnesses: hisab 585, foundation 429, modules 2319, edge_cases 266,
-  abuse 911.
+- Suite **4575** across five harnesses: hisab 585, foundation 429, modules 2323, edge_cases 267,
+  abuse 971.
 - Constant gate **163/163**.
-- Public surface **704** declarations (847 gate probes), enforced since 3.3.0 by the bundle's
-  `private` marker.
+- Public surface **704** declarations (847 gate probes; all 511 non-public probes refused),
+  enforced since 3.3.0 by the bundle's `private` marker.
 - **80** benchmarks.
 - **35** math modules in `[lib]`, plus the `src/visibility.cyr` marker.
 - Toolchain **6.6.12**, sakshi **2.5.6**, ganita **1.2.9**.
@@ -48,10 +48,11 @@ Two releases broke the API, and each has a consumer guide:
   ([`../guides/migration-3.3.md`](../guides/migration-3.3.md)).
 
 ⚠ **hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`). Measured again on the
-3.3.0 bundle from pinned dirs:
+3.3.1 bundle from pinned dirs:
 - 6.6.2 refuses it with the known `#derive` error.
-- Under 6.6.3, 6.6.6, 6.6.10 and 6.6.12 a consumer-shaped program runs correctly, and all 511
-  non-public probes are refused.
+- Under 6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12 consumer-shaped programs (a geometry jet, the
+  autodiff closure recipe, a former-abort Delaunay call) run correctly. On 3.3.0, all 511
+  non-public probes were refused under 6.6.3, 6.6.4 and 6.6.12.
 - ⚠ On 6.6.3 a private fn is still reachable through `&name`. That is upstream, fixed in 6.6.4;
   see *Decisions owed*.
 
@@ -84,62 +85,6 @@ including a row that says something is blocked.
 ---
 
 ## Pinned — 3.3.x patches (no public API change)
-
-### **[3.3.1]** — the caller's process, and gates that cannot fail
-
-**Inputs that end the caller's process.**
-- **`delaunay_2d`, `detect_islands`**: `n > vec_len` aborts with "vec: index out of bounds", and a
-  null vec is SIGSEGV (exit 139) in both. Their siblings (`convex_hull_2d`, `triangulate_polygon`,
-  `sequential_impulse`) got the guard in 2.12.0; these two did not. `D056`
-- **`calc_gradient` / `_jacobian` / `_hessian` / `_partial_derivative`, `opt_levenberg_marquardt`**:
-  `alloc(n * 8)` has no derived bound. `calc_gradient(n = 3e8)` exits 139, and a negative `n`
-  returns `Ok` silently, because the guards test `n == 0` only. LM has no round-trip guard on
-  `nr * np * 8`. The 2.12.0 guard shape already exists in `opt_conjugate_gradient`. `D073`
-- **`sectional_curvature`, `geodesic_deviation`**: no null or `_DG_MAX_DIM` check, so
-  `(0, buf, buf, 4)` exits 139. `christoffel_symbols` and `riemann_tensor` hard-code `16` instead
-  of the constant. Six diffgeo entry points have no abuse coverage. `D091`
-- **`num_fft_2d` / `num_ifft_2d`**: the 2.11.1 `HSB_ERR_ALLOC` repair is unasserted. Its guard sits
-  after the row loop, which is ~1.4 s per call to reach. Move the guard ahead of the loop, then
-  assert both. `D028`
-
-**Gates that cannot fail.**
-- **CI security scan**: 3 of its 6 patterns (`syscall\(\s*59`, `syscall\(\s*57`,
-  `\bsys_system\s*\(`) are invalid basic regexes. grep exits 2 into `/dev/null`, so the step never
-  fails, and a planted `syscall(59, …)` passes. Switch to `grep -E` and add a planted-defect
-  self-check. The step comment also says 34 modules; there are 35. `K001`
-- **Lock gate**: `cyrius deps --verify` runs only if `cyrius.lock` exists, and the bare
-  `cyrius deps` step before it recreates the lock from `lib/`. Deleting `cyrius.lock` turns the
-  gate green silently, in both CI and release. `D111`
-- **`check-constants.sh`** has three problems:
-  - Its duplicate-global arm matches 0 of 221 declarations: `^var [A-Z]` misses `public var` and
-    every `_` global. `D108`
-  - `POPULATION_FLOOR` is 160 against a live 164. `D109`
-  - The 8-ulp slack for comment expressions hides `_SRGB_INV_2_4 = 0x3FDAAAAAAAAAAAB0`, which is
-    5 ulp above the correctly rounded `1/2.4` (`…AAAB`). `5/12` and `1.0/2.4` agree in f64, so the
-    slack has no reason. Fix the constant and tighten the slack. `tests/modules.tcyr:7515` also
-    calls the endpoints exact, three lines above saying they are not. `D097`
-- **`check-result-migration.sh`** counts a fn as migrated only if its body contains `return Ok(`
-  or `Err(`. `ad_grad_into` forwards through `?` and a tail call, so the gate cannot see it, and
-  its Err payload is never asserted. `D122`
-- **`tests/edge_cases.tcyr:481-491`** ("complex div by zero → large result") checks only that a
-  pointer is non-zero, which cannot fail. The code returns `0+0i`, asserted at `:891`. `D130`
-
-**False safety claims shipped in 3.3.0.**
-- **`_GeoJet`**: four places say a consumer can no longer change a jet's `kind`/`t`/`ss`/`face`
-  or replace a slot: CHANGELOG 3.3.0, `threat-model.md:225-227`, `migration-3.3.md:40` and
-  `geo_diff.cyr:133-140`. That is false on every pin from 6.6.3 to 6.6.12. Type names carry no
-  visibility, so `var j: _GeoJet = …; j.kind = 77;` rewrites the field (probed).
-  - Fix: replace the named struct with offset-layout `alloc`/`load64`/`store64`, which leaves no
-    type name to leak. `_GeoJet` is not API, so this is a patch.
-  - Otherwise, correct the four documents. `D062`
-- **Tape-backed optimizer recipe**: the documented closure (`autodiff.cyr:536-548`) SIGSEGVs under
-  cycc 6.6.2–6.6.4, and six direct consumers pin 6.6.3. The cause: the `opt_*` solvers call the
-  gradient as a bare statement, `fncall2(grad, x, g);`, at 10 sites, and cycc lowered that form
-  without closure awareness before 6.6.5.
-  - Bind the result at those sites.
-  - Add a test that compiles the recipe as documented.
-  - Correct the header's "re-verified … no longer blocks anything".
-  - The recipe also draws a cycc diagnostic on every pin; see *Decisions owed*. `D082`
 
 ### **[3.3.2]** — stale claims, dangling pointers, dead code
 
@@ -423,7 +368,7 @@ New benchmark rows register LAST (`tests/hisab.bcyr:1398-1408`).
 Each function below returns a value that is also a legal answer when the operation has failed.
 - **How the break ships**: each gets a Result-returning replacement, and the old name is retired,
   not redefined. A **Breaking** CHANGELOG section and `docs/guides/migration-3.4.md` go with it.
-- **Prerequisite**: `check-result-migration.sh` must see forwarders first (`D122`, **[3.3.1]**).
+- **Prerequisite met**: `check-result-migration.sh` sees forwarders since 3.3.1 (`D122`).
 - **Before the API work, two audit tasks**:
   - Run a full multi-dimension sweep. The last one covered v2.11.0 (2026-08-11), and 3.0.0, 3.1.0
     and 3.3.0 have shipped since. Its "did NOT reach" list was never discharged, including the
@@ -507,10 +452,12 @@ Nothing in this section is scheduled until the maintainer decides it.
 3. **Measurement debt.** Either mark the ~100 claims added since the baseline, or run
    `--update-baseline`, which forgives them. Then decide whether `--ratchet` runs on push.
    `D106`
-4. **A possible upstream defect, not filed.** The documented `ad_grad_into` closure recipe draws a
-   cycc diagnostic on every pin from 6.6.3 to 6.6.12: a warning inline ("returns a `: stack` pair
-   on another path") and an error when built inside a helper fn. The likely cause is the
-   diagnostic walking into closure bodies. File it in `~/Repos/cyrius` or not? `D082`
+4. **A possible upstream defect, not filed.** A closure that ends `return ad_grad_into(...)` (the
+   recipe's form through 3.3.0) draws a cycc diagnostic aimed at the ENCLOSING fn, on every pin
+   from 6.6.3 to 6.6.12: a warning when the binding is at top level ("returns a `: stack` pair on
+   another path") and an error when it is inside a fn. The likely cause is the diagnostic walking
+   into closure bodies. 3.3.1 documents a form that builds clean, so hisab no longer needs it
+   fixed; whether to report it is yours. File it in `~/Repos/cyrius` or not? `D082`
 5. **aarch64.** `f64v_dot` is fused (`fmla`) on aarch64 and mul+add on x86. So `hvec4_dot` and
    `hquat_dot`, and through it `hquat_slerp`, give different bits on the two targets. CLAUDE.md's
    Language rule names only `f64v_axpy`/`f64v_fmadd`. Update the rule? An aarch64 test run is

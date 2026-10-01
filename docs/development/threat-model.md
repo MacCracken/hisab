@@ -34,7 +34,7 @@ Hisab does NOT trust:
 | sequential_impulse | Friction impulse identically 0 — Coulomb cone never enforced because nothing was ever clamped | Fixed in 2.9.0. The branch clamped the zero it had just loaded from its own output slot; measured 0 of 320 configs nonzero. Now `λ_t = clamp(-v_t/inv_mass, ±mu·λ_n)`, accumulate-then-clamp so the bound is on the total; `mu = 0` and `tangent_vel = 0` paths bit-identical |
 | num_newton/bisection | Non-convergence | max_iter bound; returns ERR_NO_CONVERGENCE |
 | num_modpow | Intermediate multiplication overflow; **SIGFPE at modulus 0**; silent wrong answer on a negative base | `_num_mulmod` (Russian peasant) avoids the overflow. The rest was found by `tests/abuse.tcyr` and fixed in 2.9.0: modulus 0 raised SIGFPE on the unguarded `base = base % modulus` the body opened with — a crash reachable from a public entry point — and a negative base collapsed the accumulator, three wrong answers found alongside the crash. Now guarded at `num.cyr:460-462` (`HSB_ERR_DIVISION_BY_ZERO` for modulus 0, `HSB_ERR_INVALID_INPUT` for a negative modulus, base or exponent) |
-| sectional_curvature | Division by a degenerate plane area (`⟨u,u⟩⟨v,v⟩−⟨u,v⟩² ≈ 0`) | Zero guard (`< EPSILON → 0`); pinned by the degenerate-plane test |
+| sectional_curvature | Division by a degenerate plane area (`⟨u,u⟩⟨v,v⟩−⟨u,v⟩² ≈ 0`); null or out-of-range input | Relative guard since 2.15.0 (`abs(denom) < EPSILON_F64·abs(⟨u,u⟩⟨v,v⟩)` → 0, i.e. sin² of the angle, scale-free); pinned by the degenerate-plane test. Null pointers and `dim` outside [1, 16] return 0 since 3.3.1 (they exited 139) |
 | weyl_tensor | Division by `(n−2)` for `n < 3` | Early `if (dim < 3) return zero` — the formula is undefined / identically zero there |
 | wedge_2_1 / wedge_3_1 / hodge_star_2form_4d | Fixed 4D reduced-basis layout assumed | Documented 4D contract; caller must pass 4D forms (6-/4-component) |
 | cga_blade_inverse | Division by zero on a null blade (`⟨B~B⟩₀ ≈ 0`) | Zero guard returns the zero multivector; pinned by the project-onto-null-blade test |
@@ -252,3 +252,39 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
     four dimensions. It confirmed 17 of 18 findings, and all 17 were repaired before tagging. Among
     them: the 6.6.3 leak above, a mis-encoded tolerance constant, and seven ways to pass the
     public-surface gate while a non-`_` name stayed readable from the private bundle.
+- **2026-09-30**: v3.3.1 — **inputs that ended the caller's process, gates that could not fail,
+  and two 3.3.0 safety claims that were false.** Every item was reproduced on the shipped 3.3.0
+  bundle first, from a dir pinned to cycc 6.6.12.
+  - **Process-ending inputs closed** (CWE-476 / CWE-190 / CWE-129 shapes):
+    - `delaunay_2d` and `detect_islands` aborted (`vec: index out of bounds`, exit 1) on an `n`
+      past `vec_len`, and SIGSEGVed on a null vec;
+    - `calc_gradient` / `calc_jacobian` / `calc_hessian` / `calc_partial_derivative` stored
+      through `alloc`'s designed 0 at n = 3e8;
+    - `opt_levenberg_marquardt` let `n_residuals * n_params * 8` wrap to 16 bytes;
+    - seven diffgeo entry points read null pointers.
+
+    All now return their designed error value, each asserted in `tests/abuse.tcyr`, and each
+    assertion was mutation-proved.
+  - **The CI security scan could not fire.** 3 of its 6 patterns (raw execve, raw fork,
+    `sys_system`) were invalid basic regexes, and grep's exit 2 went to `/dev/null`. A planted
+    `syscall(59, …)` in `src/` passed. The scan is ERE now, a grep error fails it, and every
+    pattern must fire on a planted file before `src/` is scanned.
+  - **The lock gate passed with no lockfile.** `cyrius deps` writes a fresh `cyrius.lock` when
+    none exists, and the verify ran only `if [ -f cyrius.lock ]`. Deleting the lock turned CI and
+    release green ("32 verified"). The committed lock is now required before `cyrius deps` runs.
+    A tampered hash in a committed lock was always caught.
+  - **3.3.0's `_GeoJet` protection did not hold** (see the 3.3.0 entry above). The struct is now
+    a manual offset layout, so typed field writes no longer compile. A raw `store64` through the
+    pointer still can write a slot.
+  - **The documented autodiff closure recipe SIGSEGVed** inside `opt_lbfgs` on cycc 6.6.3, the
+    pin of six direct consumers. A capturing closure called as a bare `fncall2(...);` statement is
+    lowered wrongly by cycc 6.6.2–6.6.4. hisab binds every such call now, and CI fails on a new
+    bare one.
+  - **Three of hisab's own gates lost coverage silently, and now have floors:**
+    - `check-constants.sh`'s duplicate-global arm matched 0 of 221 declarations;
+    - its population floor lagged by 4;
+    - `check-public-surface.sh` read `#inline fn` lines as comments, so 18 private accessors went
+      unprobed (511 → 493) with the gate green. Found during this release.
+  - Suites **4575**, constants 163/163, public surface 704 declarations / 847 probes, 511 of 511
+    non-public probes refused. 6.6.2 still refuses the bundle; 6.6.3, 6.6.6, 6.6.9, 6.6.10 and
+    6.6.12 run consumer-shaped programs correctly.

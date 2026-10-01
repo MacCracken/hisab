@@ -120,6 +120,9 @@ cd "$T"
 cat > scan.py <<'SCANEOF'
 import re, sys, json
 
+# The attribute tokens the cyrius guide lists ("A `#` is not always a comment").
+ATTR = re.compile(r'#(?:inline|naked|pure|io|alloc|must_use|regalloc|deprecated|assert|pe_import)(?![A-Za-z0-9_])|#derive\([^)\n]*\)')
+
 def strip(src):
     """Blank out comments and string-literal contents, keeping every newline."""
     out, i, n = [], 0, len(src)
@@ -133,6 +136,16 @@ def strip(src):
                 out.append('\n' if src[i] == '\n' else ' '); i += 1
             if i < n: out.append('"'); i += 1
         elif c == '#':
+            # ⛔ 3.3.1 — AN ATTRIBUTE IS NOT A COMMENT. `#inline fn f(j) { ... }` is one
+            # declaration: cycc reads `#inline` as a token and keeps lexing the line.
+            # Blanking to end of line made geo_diff's 18 `#inline` _GeoJet accessors
+            # invisible, and claim 3's non-public probe count fell 511 -> 493 with the
+            # gate green. Blank only the attribute token; the rest of the line is code.
+            # [measured: probe counts before/after this fix, 2026-09-30]
+            m = ATTR.match(src, i)
+            if m:
+                out.append(' ' * (m.end() - i)); i = m.end()
+                continue
             while i < n and src[i] != '\n':
                 out.append(' '); i += 1
         else:
@@ -304,8 +317,14 @@ emit(f'{T}/consumer_private.cyr', priv_calls, priv_reads)
 open(f'{T}/probe_counts', 'w').write(f"{len(pub_calls) + len(pub_reads)} {len(priv_calls) + len(priv_reads)} {n_pub_fn} {n_pub_struct} {n_pub_var} {n_pub_enum}\n")
 EOF
 read -r n_pub_probes n_priv_probes n_pub_fn n_pub_struct n_pub_var n_pub_enum < probe_counts
-[ "$n_pub_probes" -gt 500 ] || { echo "FAIL: only $n_pub_probes public probes generated — the generator is broken, not the surface"; exit 1; }
-[ "$n_priv_probes" -gt 300 ] || { echo "FAIL: only $n_priv_probes private probes generated — the generator is broken, not the surface"; exit 1; }
+# ⛔ 3.3.1 — THESE FLOORS WERE 500 AND 300, so the 18 probes lost to `#inline` (see
+# strip()) could not trip them: 511 -> 493 passed green. They are now the live
+# populations. Raise them when the surface grows; lower them only with a reason in
+# the commit, the same discipline as check-constants.sh's POPULATION_FLOOR.
+PUB_PROBE_FLOOR=847    # re-derived 2026-09-30, 3.3.1
+PRIV_PROBE_FLOOR=511   # re-derived 2026-09-30, 3.3.1
+[ "$n_pub_probes" -ge "$PUB_PROBE_FLOOR" ] || { echo "FAIL: only $n_pub_probes public probes generated, floor $PUB_PROBE_FLOOR — a declaration stopped being seen, or the generator is broken"; exit 1; }
+[ "$n_priv_probes" -ge "$PRIV_PROBE_FLOOR" ] || { echo "FAIL: only $n_priv_probes private probes generated, floor $PRIV_PROBE_FLOOR — a declaration stopped being seen, or the generator is broken"; exit 1; }
 
 out=$(cyrius check --with-deps consumer_public.cyr 2>&1 || true)
 v=$(echo "$out" | grep -c "is private to its file" || true)

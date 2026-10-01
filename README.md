@@ -38,8 +38,8 @@ those call sites quietly passing against the old function forever, which is the 
 removes. **2.24.0 is the supported 2.x line.**
 
 ⚠ **Minimum toolchain: hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3.** `public struct` + `#derive` is
-refused by cycc 6.6.2; measured again in 3.3.0 from dirs pinned to each version, the 3.3.0 bundle is
-refused under 6.6.2 and compiles and runs correctly under 6.6.3, 6.6.6, 6.6.10 and 6.6.12. Bump
+refused by cycc 6.6.2; measured again in 3.3.1 from dirs pinned to each version, the 3.3.1 bundle is
+refused under 6.6.2 and compiles and runs correctly under 6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12. Bump
 `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1. Two results follow your
 toolchain rather than hisab's: a zero produced by negation is −0 from cyrius **6.6.8** (IEEE sign
 flip; +0 below), and `dual_pow` is within 1 ulp from **6.6.10** (ganita 1.2.8's `pow`).
@@ -84,8 +84,8 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "r
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "3.3.0"
-modules = ["dist/hisab.cyr"]   # ~1.12 MB self-contained bundle (all 35 modules)
+tag     = "3.3.1"
+modules = ["dist/hisab.cyr"]   # ~1.14 MB self-contained bundle (all 35 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
 # pulls in hisab's own 16 stdlib leaves, so the `stdlib` list above only has to
 # name what *your* code uses.
@@ -167,9 +167,9 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.3.0 |
-| Library | 35 modules, ~26,600 lines of Cyrius |
-| Tests | 4510 assertions across 5 suites |
+| Version | 3.3.1 |
+| Library | 35 modules, ~26,800 lines of Cyrius |
+| Tests | 4575 assertions across 5 suites |
 | Benchmarks | 80 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~293 KB static ELF (`build/hisab` — version smoke test only) |

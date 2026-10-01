@@ -345,7 +345,7 @@ The other two costs are stated rather than hidden:
   - The module map follows the MPR and `su2_adjoint` moves.
   - Consumers now list the four transitive carriers.
   - aethersafha is recorded as a Cyrius port with no hisab dependency.
-  - The roadmap's `private`-flip item (which the roadmap had labelled `[4.0.0]`) is done and removed.
+  - The roadmap's `private`-flip item is done and removed.
 - **ci.yml**: the fmt-gate comment said check mode writes nothing to stdout. On 6.6.12 its short
   report goes to stdout, and the gate does not read it either way.
 
@@ -447,8 +447,8 @@ by `cyrius build -v`:
   ⚠ **The consumer's toolchain decides the accuracy.** A consumer compiles the bundle against its own
   ganita. Below cyrius 6.6.10, `dual_pow` now takes that ganita's `pow`: measured from dirs pinned to
   6.6.3 and 6.6.6, 0.9^1024 is **137 ulp** out, where the loop gave 7. `AdPowLimit` is kept as a
-  public name that is no longer consulted. Removing a public name is a breaking change, so its
-  removal is scheduled for 4.0.0.
+  public name that is no longer consulted. A patch release does not remove a public name, so it was
+  removed in 3.3.0.
 
 - **spatial — `spatial_hash_query_radius` returned the points at −inf for a radius-1 query at the
   origin.** Both query paths wrapped at the ends of the i64 cell range:
@@ -1031,7 +1031,7 @@ objdump check: **0 unwritten destination slots** in the shipped tree.
   foundation/abuse); `csr_new` is reached by 3 intra-src sites, not "nothing"; `EULER_ZYX` is the
   only Euler member with ZERO references anywhere (it is the dispatch fallthrough); and
   `EPSILON_F32` — on no list — is a public constant referenced by nothing at all (already
-  dispositioned "retire" in the 4.0.0 surface table, so no test pins it).
+  dispositioned "retire" in the `private`-flip surface table, so no test pins it).
 - **dist/hisab.cyr** — regenerated; **README.md**, **docs/guides/testing.md**, **CLAUDE.md** counts
   re-summed from the integrated run.
 - **docs/development/roadmap.md — forward-facing again, 309 → 277 lines.** Removed at closeout: the
@@ -1142,7 +1142,7 @@ of them.
   record the 6.6.4 closure. The probes stay CALLS: a consumer writes a call, and a gate that only
   worked from 6.6.4 up would be blind on every pin below it.
 - **docs/development/roadmap.md** — *Toolchain, tracked upstream*: the four-row open table → closed
-  in 6.6.4; the *Public / private function surface* row's two upstream holes → fixed, so the 4.0.0
+  in 6.6.4; the *Public / private function surface* row's two upstream holes → fixed, so the
   `private` flip is gated only on hisab's own dispositions now.
 - **docs/development/dependency-watch.md** — 6.6.4 block.
 - **docs/development/issues/archived/2026-04-26-cyrius-cli-arg-clobbers-source.md** — the one archived
@@ -1205,7 +1205,7 @@ sites); `hvec3_new` unmarked → claims 0, 1 (54) and 4 (20); a `_` helper place
 inside it is an in-file call that can never be refused. Dropping `public` from `_perm` left it green.
 Claim 1 now includes each module as its own file, the way the suites do. ⭐ **That vacuity is also a
 finding about the flip itself**: a flipped bundle's 35 `private` lines face only a consumer, for whom
-the surface is already exactly the 729 items — **the consumer-facing half of 4.0.0 costs nothing
+the surface is already exactly the 729 items — **the consumer-facing half of the `private` flip costs nothing
 further; the entire remaining cost is hisab's own suites.** Measured: **64 distinct `_` names, 387
 sites** — `hisab.tcyr` 14/4, `modules.tcyr` 372/59, `hisab.bcyr` 1 — where the roadmap row had said
 "52 functions, 235 sites" and counted neither globals (8) nor the benchmark harness.
@@ -1255,7 +1255,7 @@ over the real diff (53 findings, 0 refuted, 3 dissenting votes in 159):
   constant since 2.6.12; `collision_mesh.cyr` had no file header at all since the 2.2.2 split;
   `_lie_norm3`'s doc block opened with `su2_from_quat`'s orphaned line.
 
-⭐ **The 4.0.0 decision list is now worked, not owed.** The roadmap row carries a per-item
+⭐ **The `private`-flip decision list is now worked, not owed.** The roadmap row carries a per-item
 disposition for all 24 cross-module helpers, each grounded in the callee body and caller sites, and
 several are not among the three options the row had offered: three families should simply **retire
 the reach** (`_GEO_F64_POS_INF` is an alias of the public `F64_POS_INF`; `_noise_fade` is
@@ -1279,7 +1279,7 @@ accessor wants a pointer — not a compiler bug, and not filed); and a `LOOSE_TO
 
 ### Added
 - `public` on 729 top-level declarations across all 35 `[lib]` modules; marker comments on the 24
-  cross-module `_` helpers naming their consumers and the 4.0.0 decision owed.
+  cross-module `_` helpers naming their consumers and the `private`-flip decision owed.
 - **scripts/check-public-surface.sh** — the five-claim flip gate above; CI step *Public surface is
   complete and exact*. Its header records why the probes are calls and why claim 1 is per-file.
 - CI step *Result migration has no vacuous call sites* — `check-result-migration.sh` +
@@ -1296,7 +1296,7 @@ accessor wants a pointer — not a compiler bug, and not filed); and a `LOOSE_TO
 - Module headers of `num`, `num_ext`, `ode`, `optimize`, `linalg_precision` state the `Result` contract;
   `ode_dopri45`'s doc says why it carries no `#must_use`; `ode_symplectic_euler`, `einsum`,
   `collision_mesh` (new file header), `lie.cyr` doc blocks corrected as above.
-- Roadmap: the public/private row is now *The `private` flip — [4.0.0]* with the measurements and
+- Roadmap: the public/private row is now *The `private` flip* with the measurements and
   dispositions; the other rows that had been targeted at 3.1.0 (struct-layout gate, Abaco table,
   `lerp` SIMD hybrid, `vec_sort_by`) move to **3.2.0**; new row *Public API reached by no test*; the
   *Toolchain, tracked upstream* table — which still listed the two 2026-09-11 filings as open after
@@ -1371,7 +1371,7 @@ investigation twice.
   correct only from 6.6.3 and fails **silently** below it. Same disposition as `m4_mul_vec4` in 2.11.5.
 - **docs/development/roadmap.md** — *Public / private function surface* row: ⛔ BLOCKED UPSTREAM →
   ⭐ UNBLOCKED (cycc 6.6.3, verified 2026-09-13); target versions unchanged (`pub fn` 3.1.0,
-  `private` flip 4.0.0), and the row's own landmine (a consumer-call gate must exist before the flip)
+  `private` flip after it — shipped in 3.3.0), and the row's own landmine (a consumer-call gate must exist before the flip)
   still applies. Consumer row now names the reason the pin matters to a consumer.
 - **docs/development/issues/archived/** — two new hisab-side records for the closed upstream
   filings (`2026-09-11-cyrius-nested-continue-binds-to-wrong-loop.md`,
@@ -1411,8 +1411,8 @@ The largest movers (`spatial_hash_query_2k` −8.0%, `bvh_query_ray_200x4k` −6
   cannot fail, the Abaco boundary table frozen at the 2.2.0 surface, getting a live consumer onto
   3.0.0, and the `hvec3_lerp` SIMD hybrid parked under `cross` despite never being gated on lane
   shuffles (**25 ns → 19–20 ns, bit-identical**). The 3.0.0 public/private item is re-scoped: the
-  `pub fn` half is non-breaking and belongs in a 3.x, the `private` flip is breaking and moves to
-  4.0.0, and both stay blocked on the upstream `#derive`/`public` defect.
+  `pub fn` half and the `private` flip become separate 3.x releases (they shipped as 3.1.0 and
+  3.3.0), and both stay blocked on the upstream `#derive`/`public` defect.
 - ⛔ **Every line-number citation carried forward was re-derived and ALL SIX HAD DRIFTED.** The six
   hand-rolled ordering routines are `collision_core.cyr:530`, `spatial.cyr:114`, `num_ext.cyr:309`,
   `linalg_ext.cyr:1071`, `linalg_precision.cyr:1219` and `:1753`; the roadmap had been pointing at

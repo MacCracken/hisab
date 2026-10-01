@@ -55,6 +55,6 @@ the probe's fault. hisab's own construction idiom is the one that runs.
 
 **Consequence for hisab:** the roadmap's *Public / private function surface* row is **UNBLOCKED**.
 The work itself — 939 functions, 296 underscore-prefixed, 148 functions and 25 globals crossing a
-module boundary — stays scheduled where it was (`pub fn` half 3.1.0, `private` flip 4.0.0), and the
+module boundary — stays scheduled where it was (`pub fn` half 3.1.0, `private` flip after it — shipped in 3.3.0), and the
 row's own landmine still applies: a consumer-call gate has to exist before the flip, because
 `cyrius check --with-deps dist/hisab.cyr` stays green on a bundle no consumer can call.

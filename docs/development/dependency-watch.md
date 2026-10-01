@@ -129,7 +129,7 @@ and it goes stale silently.
   ⭐ **`#derive` + `public` is FIXED**, verified on hisab's own idiom in both directions: 6.6.2
   rejects it; 6.6.3 builds it, derived getters AND setter reachable cross-file (exit 0), and a
   consumer calling the file-private helper is still refused with no binary. The roadmap's
-  public/private row is unblocked; the work stays scheduled (3.1.0 / 4.0.0).
+  public/private row is unblocked; the work stays scheduled (3.1.0 / 3.3.0).
   Record: `issues/archived/2026-09-11-cyrius-derive-cannot-combine-with-public.md`.
 
   ⛔ **THE INSTALLED "6.6.2" SNAPSHOT WAS NOT 6.6.2.** `~/.cyrius/versions/6.6.2/lib` held 6.6.3's

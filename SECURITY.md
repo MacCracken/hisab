@@ -46,8 +46,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Version | Supported |
 |---------|-----------|
-| hisab 4.x (current: 4.0.x) | Yes |
-| hisab 3.2.x | Yes, until 4.x has a live consumer |
+| hisab 3.x (current: 3.3.x) | Yes |
 | hisab 2.24.x (supported 2.x line) | Yes |
 | hisab 2.0–2.23 | Best-effort |
 | Rust 1.x | Available via pre-2.0 git tags, unsupported |
@@ -104,8 +103,8 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   `scripts/check-constants.sh` (a CI gate since 2.6.12, after seven mis-transcribed tables shipped).
   The gate was itself audited: until 2.7.0 its regex rejected `_` digit separators and it silently
   skipped **35 of 145** declarations while printing "110/110 verified" — one of the skipped constants
-  encoded ~1e16 against a documented 1e15. Now **163/163 verified, 1 skipped** (4.0.0), and since 2.20.0 the gate also catches a comment on the line above its declaration (a shape that had let a mis-transcribed `F64_1E_NEG30` through as 158/158)
-- **The public surface is enforced (4.0.0).** `dist/hisab.cyr` is `private`, so a consumer that
+  encoded ~1e16 against a documented 1e15. Now **163/163 verified, 1 skipped** (3.3.0), and since 2.20.0 the gate also catches a comment on the line above its declaration (a shape that had let a mis-transcribed `F64_1E_NEG30` through as 158/158)
+- **The public surface is enforced (3.3.0).** `dist/hisab.cyr` is `private`, so a consumer that
   names anything not marked `public` is refused at compile time, and no binary is emitted.
   `scripts/check-public-surface.sh` proves on every CI run that the surface is complete and exact.
   It probes with calls, never `&name`: a private fn is reachable through address-of on cycc 6.6.2

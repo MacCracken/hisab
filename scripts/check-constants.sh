@@ -222,7 +222,7 @@ for path in sorted(glob.glob('src/*.cyr')):
                 skipped.append((path, lineno, name, comment, 'unparseable number')); continue
             basis = f"decimal {tok}"
             tol = max(decimal_tolerance(tok, truncated), 4 * ulp(expected))
-            # ⛔ 4.0.0 — A ONE- OR TWO-DIGIT COMMENT NAMES A ROUND VALUE, NOT A ROUNDED
+            # ⛔ 3.3.0 — A ONE- OR TWO-DIGIT COMMENT NAMES A ROUND VALUE, NOT A ROUNDED
             # DISPLAY. `_SYM_EPS` was 2^-50 = 8.88e-16 under `# 1e-15` -- 11% off -- and
             # passed, because "1e-15" read as one significant digit allows +/- 5e-16.
             # Every other constant that passed only on that slack shows 9 or more

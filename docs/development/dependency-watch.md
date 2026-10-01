@@ -16,7 +16,7 @@ cycc must accept it whole. Two caps apply, and the token cap can bind before the
 | expanded source | 25,165,824 B (24 MiB) | `src/frontend/lex_pp.cyr:4197` (`op > 25165824`; also `:4533`, `:4644`) |
 | tokens | 4,194,304 | `src/frontend/lex.cyr:273` (`tc >= 4194304`) |
 
-The bundle is 1,126,262 B at 4.0.0, 4.48% of the byte cap, so there is no size pressure. The history of
+The bundle is 1,126,262 B at 3.3.0, 4.48% of the byte cap, so there is no size pressure. The history of
 these figures is in CHANGELOG 2.11.3. That release measured both caps as a pair: a 9,002,640 B
 source was rejected by 6.5.33 and compiled on 6.6.1. It also found the token cap binding first, at
 8.2 MB. The 1 MB and 16 MB figures quoted before it both described `_SRC_CAP`, the raw read buffer,

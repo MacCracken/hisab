@@ -2,14 +2,14 @@
 
 ## [Unreleased]
 
-## [4.0.0] - 2026-09-30 — the `private` flip: the bundle enforces its public surface, the accidental public names go, and number theory above 2^62 stops answering wrong
+## [3.3.0] - 2026-09-30 — the `private` flip: the bundle enforces its public surface, the accidental public names go, and number theory above 2^62 stops answering wrong
 
 ⛔ **Breaking.** `dist/hisab.cyr` is now `private`: every name not marked `public` is refused with
 `'X' is private to its file`, and no binary is emitted. The one exception is the language's own:
 enum constants carry no visibility in Cyrius, so a non-public enum's members stay readable, and
 they are `_`-named. The release also removes the names that were public only by accident and gives
 seven internal helpers real public names.
-**[docs/guides/migration-4.0.md](docs/guides/migration-4.0.md)** has the replacement table. **No live
+**[docs/guides/migration-3.3.md](docs/guides/migration-3.3.md)** has the replacement table. **No live
 consumer references any removed or hidden name**: all 14 repos carrying a hisab bundle were checked
 (the ten direct consumers plus jalwa, ranga, shabda and shabdakosh, which carry a copy
 transitively). The minimum consumer toolchain is unchanged, **cyrius ≥ 6.6.3**. Measured on the
@@ -77,7 +77,7 @@ Both new checks were mutation-proven in scratch copies of the repo:
 
 ### Removed / renamed — every 3.x roadmap disposition, worked
 
-| 3.2.2 name(s) | 4.0.0 |
+| 3.2.2 name(s) | 3.3.0 |
 |---|---|
 | `_num_mulmod` | **`num_mulmod(a, b, m)`**, checked: `Ok(r)` in [0, m), `Err` for m ≤ 0, negative operands reduced to their residue |
 | `_num_is_pow2` | **`num_is_pow2(n)`** |
@@ -113,7 +113,7 @@ says no module may reach another's `_` name, and gate claim 1 enforces that.
 i64 and wrapped negative. Every result below was measured against 3.2.2, with expected values from
 exact arithmetic:
 
-| call | 3.2.2 | 4.0.0 |
+| call | 3.2.2 | 3.3.0 |
 |---|---|---|
 | `num_modpow(2^62, 2, 2^63 − 1)` | 0 | 2^61 |
 | `num_is_prime(2^63 − 25)` (prime) | 0 | 1 |
@@ -142,13 +142,13 @@ The shipped `_num_mulmod` has three tiers, each bound derived from what fits in 
 0 or 1. The branchless form matters: a compare-and-branch add-mod took 362 µs at 2^62 + 135 against
 208 µs. Against 3.2.2, from three interleaved runs:
 
-| `num_is_prime(n)` | 3.2.2 | add-mod at every m | 4.0.0 |
+| `num_is_prime(n)` | 3.2.2 | add-mod at every m | 3.3.0 |
 |---|---|---|---|
 | 1000003 | 19.2 µs | 42.6 µs | **1.81 µs (−90.6%)** |
 | 2^40 + 15 | 65.4 µs | 171 µs | 64.3 µs (noise) |
 | 2^62 + 135 | 0.56 µs, **wrong** | 492 µs | 212 µs, correct |
 
-A new `tests/modules.tcyr` group, "4.0.0 number theory above 2^62", has 29 assertions. 11 came with
+A new `tests/modules.tcyr` group, "3.3.0 number theory above 2^62", has 29 assertions. 11 came with
 the review's repairs below. Among the original 18:
 
 - three controls that 3.2.2 already got right (a composite, a negative-modulus refusal, a negative
@@ -179,7 +179,7 @@ float. The exact remainder, and the value the mutant printed, is −2746052118.
 `noise_perm`, `num_is_pow2`, `sym_const_eq`, `sym_const_to_str` and `linalg_sort_desc` was
 internal, so no test called them as API. Two groups now do:
 
-- **`tests/modules.tcyr` "4.0.0 the promoted helpers, called as API"**, 34 assertions. 9 came with
+- **`tests/modules.tcyr` "3.3.0 the promoted helpers, called as API"**, 34 assertions. 9 came with
   the review's repairs below. The group covers:
   - `num_is_pow2` at 0, negative values, 2^0 and 2^62;
   - `sym_const_eq` at 5e-16 and 2e-15, and at two ADJACENT doubles at 1e18, which are not equal
@@ -187,7 +187,7 @@ internal, so no test called them as API. Two groups now do:
   - `sym_const_to_str` exact at 1e19, and identical to the text both renderers emit;
   - `linalg_sort_desc` by value and by |value|, carrying columns and rows, plus the tie rule:
     (2, 2, 4) gives (e3, e2, e1), not a stable sort's (e3, e1, e2).
-- **`tests/edge_cases.tcyr` "4.0.0 noise_perm builds its table on first use"**, 4 assertions. It is
+- **`tests/edge_cases.tcyr` "3.3.0 noise_perm builds its table on first use"**, 4 assertions. It is
   the one suite with no other noise call, so the lookup really is the first touch of the table.
 
 Each was mutation-checked in a scratch copy. `noise_perm` without its self-init SIGSEGVs that suite,
@@ -201,14 +201,14 @@ A pre-tag adversarial review ran 8 agents: four reviewers, each on one dimension
 arithmetic, visibility and API changes, the public-surface gate, the documents' factual claims), and
 one skeptic per dimension told to refute every finding by reproducing it. **18 findings, 17
 confirmed, 1 refuted.** The refuted one said SECURITY.md and math.md still credit "Russian-peasant
-`_num_mulmod`" with avoiding overflow. That description is accurate of the 4.0.0 code: the top tier
+`_num_mulmod`" with avoiding overflow. That description is accurate of the 3.3.0 code: the top tier
 is the same doubling loop on an add-mod. Every confirmed finding is repaired here, with an assertion
 or a gate mutant that fails without the repair.
 
 ⛔ **The private bundle leaked `_SYM_EPS` on cycc 6.6.3, the documented floor that six consumers
 pin.** 6.6.2 and 6.6.3 hand a `public enum`'s marker to the NEXT declaration (fixed upstream in
 6.6.4). `_SYM_EPS` sat directly after `public enum ExprTag`, and while it was itself public through
-3.2.x that was invisible. 4.0.0 made it private, and a consumer on 6.6.3 could read and write it
+3.2.x that was invisible. 3.3.0 made it private, and a consumer on 6.6.3 could read and write it
 from the shipped bundle. The gate could not see it, because CI runs only the repo's pin.
 - `ExprTag` now sits directly above `public fn expr_tag`.
 - Claim 5 fails any bundle where a non-public declaration follows a `public enum`. That closes the
@@ -314,7 +314,7 @@ The other two costs are stated rather than hidden:
   moved here:
   - 2.14.0's Performance note;
   - 2.22.0's "97.9% of the silent wrong answers are at normal block ratios".
-- **New: [`docs/guides/migration-4.0.md`](docs/guides/migration-4.0.md).**
+- **New: [`docs/guides/migration-3.3.md`](docs/guides/migration-3.3.md).**
 - ⛔ **`overview.md`'s include table was wrong in five rows**, though it called itself "derived and
   verified, not hand-maintained". It is now re-derived with the compiler as the oracle:
   - compile each module alone, add the module defining each undefined name it reports, and repeat;
@@ -333,7 +333,7 @@ The other two costs are stated rather than hidden:
   all. The derivation is what caught it. The graph paragraph's list of cross-module `_` reaches
   named seven pairs where there were nine, missing `geo_diff`→`geo` and `collision_core`→`geo_advanced`.
 - **threat-model.md**: new attack-surface rows for the number-theory overflow (CWE-190, including the
-  non-terminating Pollard rho) and the `_perm` read-before-init, plus a 4.0.0 trail entry.
+  non-terminating Pollard rho) and the `_perm` read-before-init, plus a 3.3.0 trail entry.
   **SECURITY.md** gains an enforced-surface bullet. **testing.md** explains why the suites stay
   white-box.
 - **CLAUDE.md** gains three rules from this release:
@@ -341,11 +341,11 @@ The other two costs are stated rather than hidden:
   - a boundary fixture must sit on the boundary;
   - a table that says "derived" is re-derived when its inputs change.
 - **README, SECURITY, CONTRIBUTING, overview and roadmap updated:**
-  - 4.x is supported, and 3.2.x stays supported until 4.x has a live consumer.
+  - SECURITY.md's supported-versions table names 3.3.x as the current 3.x line.
   - The module map follows the MPR and `su2_adjoint` moves.
   - Consumers now list the four transitive carriers.
   - aethersafha is recorded as a Cyrius port with no hisab dependency.
-  - The 4.0.0 roadmap item is removed.
+  - The roadmap's `private`-flip item (which the roadmap had labelled `[4.0.0]`) is done and removed.
 - **ci.yml**: the fmt-gate comment said check mode writes nothing to stdout. On 6.6.12 its short
   report goes to stdout, and the gate does not read it either way.
 
@@ -1771,7 +1771,7 @@ were **dropped** and the routine returned the factorisation of a **different mat
 ⭐ **THE BOUNDARY IS A BLOCK RATIO OF 2^-40 — A CONDITION NUMBER OF ~1e12, NOT A SUBNORMAL.** That is an
 ordinary ill-conditioned matrix, **982 binades above** where the roadmap placed the defect, and
 **97.9% of the silent wrong answers are at NORMAL block ratios** — the subnormal framing captured about
-2% of the class. (This figure was recorded only in CLAUDE.md's status line until 4.0.0
+2% of the class. (This figure was recorded only in CLAUDE.md's status line until 3.3.0
 trimmed it.) Measured
 oracle-free, on `A = blockdiag(B, c·B)` with `B = [[3,4],[2,3]]` (det B = 1), where
 `prod(singular values)` must equal `|det A| = c²` and needs no reference implementation:
@@ -3080,7 +3080,7 @@ Inf or a NaN a caller could test for.
 ### Performance
 
 No performance change is claimed: guard-touched rows moved **+0.26%** median against **+0.27%**
-untouched, on a quiet box (load 0.16). (Recorded only in CLAUDE.md's status line until 4.0.0 trimmed
+untouched, on a quiet box (load 0.16). (Recorded only in CLAUDE.md's status line until 3.3.0 trimmed
 it.)
 
 ## [2.13.0] - 2026-09-09 — the suite release: the suite could not see an error of 0.9

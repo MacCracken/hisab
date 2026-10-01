@@ -1,7 +1,7 @@
-# Migrating to hisab 4.0.0
+# Migrating to hisab 3.3.0
 
-> 4.0.0 makes the **public surface enforced**. Since 3.1.0 every name meant for callers has
-> carried `public`. From 4.0.0 the bundle is `private`, so `dist/hisab.cyr` refuses every
+> 3.3.0 makes the **public surface enforced**. Since 3.1.0 every name meant for callers has
+> carried `public`. From 3.3.0 the bundle is `private`, so `dist/hisab.cyr` refuses every
 > other name: `'X' is private to its file`, and no binary. (Enum constants are the
 > language's exception: they carry no visibility, so a non-public enum's members stay
 > readable, and they are `_`-named.) The release also removes the names that were public
@@ -67,7 +67,7 @@ compiling each module against exactly its listed set.
 These were silent wrong answers on 3.2.2 for inputs above 2^62, measured against exact
 arithmetic:
 
-| call | 3.2.2 | 4.0.0 |
+| call | 3.2.2 | 3.3.0 |
 |---|---|---|
 | `num_modpow(2^62, 2, 2^63 − 1)` | 0 | 2^61 |
 | `num_is_prime(2^63 − 25)` (a prime) | 0 | 1 |

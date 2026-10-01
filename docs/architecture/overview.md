@@ -3,14 +3,14 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v4.0.0 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 26,627
+> hisab v3.3.0 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 26,627
 > lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.12; a
 > consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map
 
 `src/visibility.cyr` is not a math module: it is the single `private` line `cyrius distlib` puts
-first in `dist/hisab.cyr`, which makes the bundle refuse every name not marked `public` (4.0.0).
+first in `dist/hisab.cyr`, which makes the bundle refuse every name not marked `public` (3.3.0).
 
 ```
 hisab (Cyrius)
@@ -95,7 +95,7 @@ This table is **derived and verified, not hand-maintained**. Each row was produc
 compiler as the oracle: compile the module alone, map every undefined name it reports to its
 defining module, add that module, and repeat until the build is clean. Then each row was checked
 twice: it builds with **0 undefined names** against exactly its listed set, and dropping any ONE
-listed module breaks the build. Both checks hold for all 35 rows (re-derived 2026-09-30 on 4.0.0).
+listed module breaks the build. Both checks hold for all 35 rows (re-derived 2026-09-30 on 3.3.0).
 Undefined *functions* count even when nothing calls them. A function is only a warning until
 something reaches it, and a set that leaves one out is a trap for whoever calls it next.
 
@@ -104,10 +104,10 @@ something reaches it, and a set that leaves one out is a trap for whoever calls 
 - `f64_util` was listed as needing `error` and needs nothing;
 - `mat3` and `mat4` were missing `quat`.
 
-The other two were wrong for 3.2.2 and are changed by 4.0.0:
+The other two were wrong for 3.2.2 and are changed by 3.3.0:
 - `collision_core` was listed as `error vec3`. On 3.2.2 it really needed `error geo geo_advanced
   quat vec2 vec3`, because MPR called geo_advanced's EPA helpers.
-- `collision_mesh` inherited all of that. 4.0.0 moved MPR into `geo_advanced`, so both rows are
+- `collision_mesh` inherited all of that. 3.3.0 moved MPR into `geo_advanced`, so both rows are
   small now.
 
 The sets are minimal in the sense that they contain no module that is not reached; they are the
@@ -166,7 +166,7 @@ literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, s
 **Shape of the graph.** Five modules are fully standalone (`error`, `f64_util`, `interval`,
 `symbolic`, `tensor`); the deepest is `lie_ext` at 9. There are **no cycles**, and every edge runs
 from a derived module to its base, which is the layering the module *names* already declare.
-**Since 4.0.0 no module reaches another module's `_` internals.** Through 3.2.x nine pairs did.
+**Since 3.3.0 no module reaches another module's `_` internals.** Through 3.2.x nine pairs did.
 Eight of them now go through public names or plain literals:
 
 - `calc_ext`→`calc` and `noise_simplex`→`calc`;

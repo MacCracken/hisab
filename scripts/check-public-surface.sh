@@ -8,18 +8,18 @@
 # compile byte-identical with and without it. That is exactly why a gate is
 # needed: nothing in an ordinary build can tell a complete surface from an
 # incomplete one, and a new cross-module reference to an unannotated helper
-# would be found only at the 4.0.0 flip, by whoever flips it.
+# would be found only at the flip, by whoever flipped it (the bundle went private in 3.3.0).
 #
 # Six claims, each fail-closed:
 #   0. NAMING COMPLETENESS — every top-level fn / struct / enum / var in the
 #      real tree whose name does not start with `_` carries `public`, and no `_`
-#      name does (4.0.0: a `public _helper` reached from another module passed
+#      name does (3.3.0: a `public _helper` reached from another module passed
 #      every claim). The convention IS the surface; this is the claim a dropped
 #      marker violates. src/visibility.cyr may declare nothing at all.
 #      And every MEMBER of a non-public enum starts with `_`: in Cyrius "enum
 #      constants and type names carry no visibility; they are always public"
 #      (cyrius-guide, Visibility), so `private` cannot hide them and the name is
-#      the only signal left. Found in 4.0.0, when the tree's first non-public enum
+#      the only signal left. Found in 3.3.0, when the tree's first non-public enum
 #      (`_RenderLayout`) leaked `FLOAT_RENDER_BUF` through claim 3.
 #   1. INTERNAL COMPLETENESS — with `private` at the top of all 35 modules, a
 #      probe that `include`s each module AS ITS OWN FILE (the way tests/*.tcyr
@@ -43,12 +43,12 @@
 #      EMPTY since the 6.6.4 pin (3.1.1) and any entry added to it FAILS this
 #      gate the day upstream fixes the defect it names.
 #   4. The real consumers in examples/*.cyr compile clean under the flip.
-#   5. THE SHIPPED BUNDLE IS PRIVATE (4.0.0). `src/visibility.cyr` is the first [lib]
+#   5. THE SHIPPED BUNDLE IS PRIVATE (3.3.0). `src/visibility.cyr` is the first [lib]
 #      module and holds one `private` line, so the committed dist/hisab.cyr carries
 #      the marker ahead of every declaration, and a consumer reading a non-public
 #      global from THAT file -- not the scratch flip -- is refused. And no
 #      non-public declaration directly follows a `public enum`: cycc 6.6.2/6.6.3
-#      export it (4.0.0 shipped `_SYM_EPS` in that slot, readable under 6.6.3).
+#      export it (3.3.0 shipped `_SYM_EPS` in that slot, readable under 6.6.3).
 #      The modules themselves stay unflipped so the suites keep white-box access;
 #      claims 1-4 flip them in a scratch copy to prove the boundaries anyway.
 #   All claims read declarations through ONE scanner (scan.py, written below)
@@ -77,7 +77,7 @@
 #   ⭐ 3.1.1: that inversion FIRED FOR REAL on the 6.6.4 pin bump — claim 3
 #   reported `_ad_pow` refused before any source changed, which is how the
 #   upstream fix was detected here rather than read off a changelog.
-# Mutation-proven at 4.0.0, each in a scratch copy of the repo:
+# Mutation-proven at 3.3.0, each in a scratch copy of the repo:
 #   - `src/visibility.cyr` without its `private` line, bundle regenerated
 #       -> the bundle-marker count above fails (35 lines for 35 + 1);
 #   - `src/visibility.cyr` moved second in [lib], bundle regenerated
@@ -107,7 +107,7 @@ tar --exclude=.git --exclude=build -cf - . | tar -C "$T" -xf -
 cd "$T"
 
 # ── the shared scanner ───────────────────────────────────────────────────────
-# ⛔ 4.0.0 — EVERY CLAIM USED TO READ DECLARATIONS WITH ITS OWN LINE REGEX, and an
+# ⛔ 3.3.0 — EVERY CLAIM USED TO READ DECLARATIONS WITH ITS OWN LINE REGEX, and an
 # adversarial review planted shapes that passed all six claims: an enum member with
 # no `= value` (`enum _X { A; }`, the first form cyrius-guide shows), a `}` inside a
 # comment in an enum body, a declaration that does not start its line
@@ -218,7 +218,7 @@ echo "=== public-surface gate: $n_mod modules flipped private in $T ==="
 
 # ── 0. naming completeness (real tree, before the flip touched anything) ─────
 # Four rules over every depth-0 declaration of every [lib] module:
-#   a non-`_` name carries `public`;  a `_` name never does (4.0.0 — a
+#   a non-`_` name carries `public`;  a `_` name never does (3.3.0 — a
 #   `public _helper` reached from another module passed every claim, the exact
 #   3.x pattern); every member of a NON-public enum is `_`-named (enum constants
 #   carry no visibility in Cyrius, so the name is the only signal left); and
@@ -330,7 +330,7 @@ fi
 #     fixed in 6.6.4 (`public` arms the marker only for a token that can carry
 #     it), and this gate reported it REFUSED on the pin bump — the inversion
 #     working as designed. `_SYM_EPS` (symbolic.cyr, after `public enum ExprTag`)
-#     was the masked second instance while it was itself public. 4.0.0 made it
+#     was the masked second instance while it was itself public. 3.3.0 made it
 #     private and so, under 6.6.3, LEAKED it from the shipped bundle -- invisible
 #     here because this gate runs the repo's pin. ExprTag now sits above a public
 #     fn, and claim 5 fails any bundle where a non-public declaration follows a
@@ -382,7 +382,7 @@ done
 #   a consumer reading a non-public global from it is refused;
 #   no non-public declaration directly follows a `public enum` -- cycc 6.6.2 and
 #   6.6.3 hand a `public enum`'s marker to the next declaration, and consumers
-#   compile the bundle under their own pins (six on 6.6.3 as of 4.0.0).
+#   compile the bundle under their own pins (six on 6.6.3 as of 3.3.0).
 shipped="$REPO_ROOT/dist/hisab.cyr"
 # `grep -m1`, never `grep | head -1`: under `set -o pipefail` head closing early
 # SIGPIPEs grep and the whole gate exits 141 with no message (it did, once).

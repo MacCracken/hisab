@@ -27,21 +27,21 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v4.0.0
+## Current — v3.3.0
 
 Suite **4510** across five harnesses (hisab 585, foundation 429, modules 2319, edge_cases 266,
 abuse 911), constant gate **163/163**, public surface **704** declarations (847 gate probes),
-enforced since 4.0.0 by the bundle's `private` marker. **80** benchmarks, **35** math modules in `[lib]` plus the
+enforced since 3.3.0 by the bundle's `private` marker. **80** benchmarks, **35** math modules in `[lib]` plus the
 `src/visibility.cyr` marker, toolchain **6.6.12**, sakshi **2.5.6**, ganita **1.2.9**. All gates
 green; per-release detail is in [`CHANGELOG.md`](../../CHANGELOG.md). Two releases broke the API,
 and each has a consumer guide:
 - **3.0.0** moved to `Result<T, E>` with no deprecation window
   ([`../guides/migration-3.0.md`](../guides/migration-3.0.md)). **2.24.0 is the supported 2.x line.**
-- **4.0.0** made the bundle private and removed the accidental public names
-  ([`../guides/migration-4.0.md`](../guides/migration-4.0.md)).
+- **3.3.0** made the bundle private and removed the accidental public names
+  ([`../guides/migration-3.3.md`](../guides/migration-3.3.md)).
 
 ⚠ **hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`). Measured again on the
-4.0.0 bundle from pinned dirs: 6.6.2 refuses it with the known `#derive` error. Under 6.6.3, 6.6.6,
+3.3.0 bundle from pinned dirs: 6.6.2 refuses it with the known `#derive` error. Under 6.6.3, 6.6.6,
 6.6.10 and 6.6.12 a consumer-shaped program runs correctly, and all 511 non-public probes are
 refused. ⚠ On 6.6.3 a private fn is still reachable through `&name` (upstream, fixed in 6.6.4).
 
@@ -66,7 +66,7 @@ blocked.
 
 ## Open items
 
-No versioned item is open. 4.0.0 shipped the `private` flip; its record is in `CHANGELOG.md`.
+No versioned item is open. 3.3.0 shipped the `private` flip; its record is in `CHANGELOG.md`.
 
 ---
 
@@ -101,11 +101,11 @@ worth having when comparing two runs at identical batch sizes. Re-evaluate only 
 
 ## Optional, demand-gated
 
-- **Flip the `src/` modules `private` too, not only the bundle.** 4.0.0 made `dist/hisab.cyr`
+- **Flip the `src/` modules `private` too, not only the bundle.** 3.3.0 made `dist/hisab.cyr`
   private through `src/visibility.cyr`, which is every consumer's view. The modules themselves stay
   unflipped, so a caller that `include`s `src/*.cyr` one at a time — today only hisab's own suites —
   sees no boundary. `check-public-surface.sh` claim 1 already proves no module reaches another's
-  internals. ⚠ **Measured cost on 4.0.0**: under a full per-module flip the suites reach **68 private
+  internals. ⚠ **Measured cost on 3.3.0**: under a full per-module flip the suites reach **68 private
   names at 390 sites** — `tests/modules.tcyr` 375 / 63, `tests/hisab.tcyr` 14 / 4, `tests/hisab.bcyr`
   1 / 1. Top by sites: `_f64arr_set` 125, `_f64arr_alloc` 27, `_col_dl_incircle` 24, `_f64arr_get`
   15, `_col_ghost_ux`/`_uy` 15 each. They are almost all deliberate white-box tests: Delaunay
@@ -170,8 +170,8 @@ the ten direct ones.
 
 ⛔ **goonj and attn11 cannot take ANY hisab ≥ 3.1.0 until they move their cyrius pin**: `public
 struct` + `#derive` is refused by cycc 6.6.2 (`#derive(...) applies to a struct or an enum`), measured
-on the 3.1.0, 3.2.1, 3.2.2 and 4.0.0 bundles from a dir pinned to 6.6.2, while the 3.0.1 bundle
-compiles there. Under 6.6.3, 6.6.6, 6.6.10 and 6.6.12 the 4.0.0 bundle compiles and a
+on the 3.1.0, 3.2.1, 3.2.2 and 3.3.0 bundles from a dir pinned to 6.6.2, while the 3.0.1 bundle
+compiles there. Under 6.6.3, 6.6.6, 6.6.10 and 6.6.12 the 3.3.0 bundle compiles and a
 consumer-shaped program runs correctly. ⚠ The pin matters to every consumer for three more reasons, because a consumer
 compiles the bundle under its OWN cycc:
 - `_cga_build_null_tbl` keeps its `if`-guard form and `m3_mul_vec3` its hoisted z tail, since the
@@ -179,7 +179,7 @@ compiles the bundle under its OWN cycc:
 - A zero produced by negation is −0 from **6.6.8** and +0 below.
 - `dual_pow` is within 1 ulp from **6.6.10**. Below that it takes the older ganita's `pow`, 137 ulp
   at 0.9^1024 on 6.6.3 and 6.6.6. All of these were measured on the 3.2.2 bundle from pinned dirs,
-  and re-measured unchanged on 4.0.0's.
+  and re-measured unchanged on 3.3.0's.
 
 ⛔ **The remaining nine are still on 2.x, and the `Result` break's failure mode is silent**: a
 `Result` in *argument* position degrades to its tag, and `Ok` tag = 0 = `HSB_ERR_NONE`, so

@@ -15,7 +15,7 @@ differential geometry, symbolic algebra.
   consumer pins) live in `docs/development/roadmap.md` § Current and § Consumers, the bundle size
   and compiler limits in `docs/development/dependency-watch.md`, and what each release changed
   and why in `CHANGELOG.md`. **This file holds durable rules only** — do not grow a release
-  narrative here (its status line alone reached 95 KB and the file 117 KB before 4.0.0 trimmed it).
+  narrative here (its status line alone reached 95 KB and the file 117 KB before 3.3.0 trimmed it).
 
 ## Consumers
 
@@ -206,9 +206,9 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   benchmark last (adding one shifted another by 31%). `floor_ns` changes with a reboot or a
   clocksource change. Never compare a per-op `net` against `floor_ns` — the floor is one clock pair
   and `bench_run` sizes batches so the clock is ~1% of the window (2.11.4, 2.19.0, 2.20.0, 3.2.2).
-- **A correctness repair gets an A/B against the previous tag before release.** 4.0.0's
+- **A correctness repair gets an A/B against the previous tag before release.** 3.3.0's
   overflow-free `mulmod` made `num_is_prime` 2.2x slower, and only the 80-row A/B showed it. The
-  shipped form is faster than 3.2.2 (4.0.0).
+  shipped form is faster than 3.2.2 (3.3.0).
 - **For a quantity that diverges, report the median per bin, not the maximum**, and derive a test's
   tolerance on the exact sample sequence the test runs (2.18.0, 2.20.0).
 - **A relative comparison is not a correctness test until it rejects NaN** — every f64 comparison
@@ -233,7 +233,7 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   shapes (|(3,4)t| = 5t is exact). Build scale factors as `(1023 + e) << 52`, not `1 << k` — x86
   masks a shift count of 64 or more silently (2.20.0, 2.23.0).
 - **A boundary fixture must sit ON the boundary.** At m = 3037000501, (m − 1)(m − 2) still fits
-  in i64 and (m − 1)² does not, so a fast path one modulus too wide survived the first fixture (4.0.0).
+  in i64 and (m − 1)² does not, so a fast path one modulus too wide survived the first fixture (3.3.0).
 - **A consequence test cannot see a defect the consequence smooths over** (a Krylov solve on 2I
   converges whatever the residual norm reads); test guards and helpers directly (2.17.0).
 - **When a repair has several parts, mutate each separately**, and revert any part that moves no
@@ -316,8 +316,8 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   stale "this workaround is required" or a wrong call graph costs the next reader the same
   investigation twice.
 - **A table that says "derived and verified" is re-derived whenever its inputs change.** The
-  include table in `overview.md` was wrong in five rows when 4.0.0 re-derived it by compilation
-  (4.0.0).
+  include table in `overview.md` was wrong in five rows when 3.3.0 re-derived it by compilation
+  (3.3.0).
 - **Manifests are not ledgers, and neither is this file.** `cyrius.cyml` says what a section is and
   why its order matters; standing measurements go to `dependency-watch.md`, history to CHANGELOG.
 
@@ -350,7 +350,7 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   `_` names for the members of a non-public enum — enum constants carry no visibility in Cyrius),
   per-FILE internal completeness (not the bundle — it is one file, so `private` inside it can never
   fail), a generated consumer reaching every public item, every non-public item refused, the examples
-  clean, and (since 4.0.0) that the SHIPPED `dist/hisab.cyr` carries its `private` marker ahead of
+  clean, and (since 3.3.0) that the SHIPPED `dist/hisab.cyr` carries its `private` marker ahead of
   every declaration, refuses a private read, and never puts a non-public declaration right after a
   `public enum` (cycc 6.6.2/6.6.3 export that slot). All claims read declarations through one
   comment- and string-stripping, brace-depth scanner — a line regex was bypassed seven ways. Probes

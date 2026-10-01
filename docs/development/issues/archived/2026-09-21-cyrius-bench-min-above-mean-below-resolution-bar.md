@@ -8,11 +8,12 @@ a window enters `min`/`max` only if `net >= 100 × (clock read + tick)`), the re
 **Severity:** Medium — a printed statistic that cannot be what it says (a minimum above the mean of
 the same sample), with `bench_min_resolved()` answering 1. **No hisab answer is wrong**: hisab's
 CSV records `avg`, and `avg` is unaffected (below).
-**Status:** 🔴 **OPEN — filed upstream 2026-09-21** at
-`cyrius/docs/development/issues/2026-09-21-hisab-bench-min-above-mean-below-resolution-bar.md`, with
-a self-proving repro beside it under `repros/` (exit 0 on 6.6.4, exit 1 on 6.6.5 and 6.6.6, each from
-a dir pinned to that version). This file is hisab's record of its own exposure; archive it when a pin
-crosses the fix.
+**Status:** ✅ **CLOSED 2026-09-30 (hisab 3.2.2, cycc 6.6.6 → 6.6.12) — FIXED UPSTREAM IN cycc
+6.6.9**, bite 6: min/max are now decided for the ROW by op count (`min_k × mean` against the bar),
+never per window by its own duration, and `bench_run` books its pilot and growth chunks with the next
+sized chunk, so `min <= avg` holds on every row. cyrius archived the filing as
+`cyrius/docs/development/issues/archived/2026-09-21-hisab-bench-min-above-mean-below-resolution-bar.md`.
+Verified here as a pair rather than read off the changelog — see **Closed** at the end.
 
 ## What hisab sees
 
@@ -50,3 +51,30 @@ mean +0.31% over 80 rows — the statistic hisab records did not move.
   a **benchmark-shape change** (2.20.0: registering two rows shifted a third by 31%); the fix belongs
   in the instrument, and the proposed fix (resolve a row only when the *typical* window clears the
   bar; size `bench_run` chunks with margin) is in the upstream filing.
+
+## Closed — the paired measurement (2026-09-30)
+
+Both halves were measured from scratch dirs pinned to each version, with `cyrius build -v` naming
+`versions/<v>/bin/cycc`. Each dir's vendored `lib/bench.cyr` byte-matches its cyrius TAG, and the
+installed `versions/{6.6.6,6.6.9,6.6.12}/lib` slots match their tags 104/104.
+
+| probe | 6.6.6 | 6.6.9 | 6.6.12 |
+|---|---|---|---|
+| upstream self-proving repro (`repros/2026-09-21-hisab-bench-min-above-mean-below-resolution-bar.cyr`) | exit **1**, "MIN ABOVE MEAN" | exit **0** | exit **0** |
+
+On hisab's own suite, three binaries were run interleaved ×4 on a quiet box (max load 1.38).
+**A** is the 6.6.6 compiler with the 6.6.6 `bench.cyr`, **B** the 6.6.12 compiler with the 6.6.6
+`bench.cyr`, and **C** the 6.6.12 compiler with the 6.6.12 `bench.cyr`:
+
+| binary | rows with `min > avg` |
+|---|---|
+| A | 13 / 320 |
+| B | 8 / 320 |
+| C | **0 / 320** |
+
+The statistic hisab records did not move. C against B, the harness change alone, is median
+**+0.00%** on `avg` over 80 rows, with 1 row past 10%. So the CSV's `regime` stays `net`, and the
+`min_ns`/`max_ns` caveat in `benchmarks.md` applies only to rows written under 6.6.5–6.6.8.
+Upstream says rows under the resolution bar now print `min = max = avg`, and the new harness prints
+`E of W windows eligible` on each per-op line. `scripts/bench-history.sh` parses the row line, which
+is unchanged.

@@ -245,17 +245,13 @@ fn _xdir_exists(path): i64 {
     # directly, the same way fs_win.cyr's `is_dir` does. Without this arm `xmkdir_p`
     # loses its idempotence on Windows: CreateDirectoryW fails on an existing directory
     # and nothing else can tell "already there" from "could not create".
-    # ⚠ The 0xF019 reroute takes an ALREADY-WIDE path, unlike the mkdir/unlink reroutes
-    # which widen inline — hence the widen loop here. ASCII-only, matching `_fs_widen`.
-    var wp = alloc(1024);
-    var wi = 0;
-    while (load8(path + wi) != 0) {
-        if (wi >= 510) { break; }
-        store16(wp + wi * 2, load8(path + wi));
-        wi = wi + 1;
-    }
-    store16(wp + wi * 2, 0);
-    var attrs = syscall(61465, wp);             # GetFileAttributesW
+    # The 0xF019 reroute takes the NARROW UTF-8 path and widens it in the emitter, like the
+    # mkdir/unlink reroutes: invalid UTF-8 is "not a directory", and a path of 248+ units is
+    # `\\?\`-prefixed. ⛔ 6.6.12: the path was widened HERE with no prefix (and capped at 512
+    # units), so on real Windows an existing long directory answered 0 and `xmkdir_p` of it
+    # returned -1 — its idempotence lost exactly where CreateDirectoryW had just learned long
+    # paths (6.6.11). CHANGELOG [6.6.11], [6.6.12]
+    var attrs = syscall(61465, path);           # GetFileAttributesW
     if (attrs == 4294967295) { return 0; }      # INVALID_FILE_ATTRIBUTES
     if ((attrs & 16) != 0) { return 1; }        # FILE_ATTRIBUTE_DIRECTORY
     return 0;
@@ -280,9 +276,10 @@ fn _xdir_exists(path): i64 {
 # Create a symlink at `linkpath` pointing to `target`.
 #
 # AGNOS is 4-arg length-carrying (`target, targetlen, linkpath, linkpathlen`) where
-# POSIX is 2-arg — the same divergence class as xmkdir. Windows has no POSIX symlink
-# and no CreateSymbolicLinkW reroute wired, so it degrades to -1 the way xrmdir and
-# xstat already do; wire the reroute when a consumer needs it. CHANGELOG [6.5.7]
+# POSIX is 2-arg — the same divergence class as xmkdir. Windows goes through the
+# CreateSymbolicLinkW peer (reroute 0xF03E, since 6.6.9; it returned -1 before), which
+# needs Developer Mode or an elevated process — a Windows policy, reported as -1.
+# CHANGELOG [6.5.7], [6.6.9]
 fn xsymlink(target, linkpath): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     var tn = 0;
@@ -291,13 +288,8 @@ fn xsymlink(target, linkpath): i64 {
     while (load8(linkpath + ln) != 0) { ln = ln + 1; }
     return sys_symlink(target, tn, linkpath, ln);
     #endif
-    #ifdef CYRIUS_TARGET_WIN
-    return 0 - 1;   # no CreateSymbolicLinkW reroute wired
-    #endif
     #ifndef CYRIUS_TARGET_AGNOS
-    #ifndef CYRIUS_TARGET_WIN
     return sys_symlink(target, linkpath);
-    #endif
     #endif
 }
 
@@ -351,8 +343,9 @@ fn xlink(oldpath, newpath): i64 {
 # sys_rename(old,new) (the backend ESYSXLAT handles aarch64 82→renameat 38+AT_FDCWD
 # and macho 82→BSD 128); AGNOS is length-carrying 4-arg sys_rename(old,ol,new,nl);
 # Windows has no POSIX rename — route to a MoveFileExW(old,new,
-# MOVEFILE_REPLACE_EXISTING) reroute (syscall 0xF034; backend/x86/emit.cyr
-# EMOVEFILEEX_PE). Returns 0 on success / negative errno (POSIX/AGNOS) or -1
+# MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) reroute (syscall 0xF034;
+# backend/x86/emit.cyr EMOVEFILEEX_PE; write-through since 6.6.7, so the rename is
+# on disk when it returns). Returns 0 on success / negative errno (POSIX/AGNOS) or -1
 # (Windows BOOL fail). See issue 2026-07-12-thoth-portable-atomic-file-write.md.
 fn file_rename(oldpath, newpath): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
@@ -363,7 +356,7 @@ fn file_rename(oldpath, newpath): i64 {
     return sys_rename(oldpath, ol, newpath, nl);
     #endif
     #ifdef CYRIUS_TARGET_WIN
-    return syscall(0xF034, oldpath, newpath);   # kernel32!MoveFileExW (REPLACE_EXISTING)
+    return syscall(0xF034, oldpath, newpath);   # kernel32!MoveFileExW (REPLACE_EXISTING|WRITE_THROUGH)
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     #ifndef CYRIUS_TARGET_WIN
@@ -376,16 +369,18 @@ fn file_rename(oldpath, newpath): i64 {
 # Linux x86/aarch64 + macOS use sys_fsync (x86 #74; the backend renumbers to
 # aarch64 82 / Darwin BSD 95). AGNOS has no per-fd fsync in its AO_* syscall set,
 # so a whole-system sys_sync() is the best available approximation (documented
-# residual — coarser than fsync but honestly durable). Windows is a no-op: the
-# MoveFileExW replace after a closed handle is durable enough for the atomic-write
-# use, and there is no cheap portable FlushFileBuffers reroute wired (documented
-# choice). Returns 0 / negative errno.
+# residual — coarser than fsync but honestly durable). Windows flushes through
+# kernel32!FlushFileBuffers: the backend reroutes the literal Linux fsync number (74)
+# there, and a failure (a bad handle, or one opened without write access — Linux
+# fsyncs an O_RDONLY fd, Windows refuses it) is -1. Until 6.6.7 this arm returned 0
+# without flushing anything — even for a handle that did not exist. Returns 0 /
+# negative errno. CHANGELOG [6.6.7]
 fn xfsync(fd): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_sync();          # no per-fd fsync on agnos — whole-fs sync (residual)
     #endif
     #ifdef CYRIUS_TARGET_WIN
-    return 0;                   # MoveFileEx-after-close is durable enough (documented)
+    return syscall(74, fd);     # → FlushFileBuffers (literal: the reroute is literal-only)
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     #ifndef CYRIUS_TARGET_WIN
@@ -439,11 +434,12 @@ fn xlseek(fd, off, whence): i64 {
 }
 
 # Advisory whole-file lock (op: LOCK_SH=1 / LOCK_EX=2 / LOCK_UN=8, +LOCK_NB=4).
-# Unlike lseek, flock's number is NOT carried uniformly in the peers — the agnos peer and
-# (since v6.6.4) both Linux peers declare SYS_FLOCK; the macOS peer does not, so that arm
-# issues the x86 number 73 for ESYSXLAT to renumber — so the per-target dispatch is
-# centralized here and a caller using xflock can never hand-roll a Linux #73 that traps
-# off-Linux (the agnos-ABI footgun this wrapper set exists to end). Windows has no flock.
+# Unlike lseek, flock's number is NOT carried uniformly in the peers — the agnos peer (#59)
+# and both Linux peers declare SYS_FLOCK, and since 6.6.10 the x86-macOS peer does too (73,
+# which EMACHO_SYSXLAT renumbers to BSD 131); the macOS arm below still issues the literal 73,
+# the same number on both Macs — so the per-target dispatch is centralized here and a caller
+# using xflock can never hand-roll a Linux #73 that traps off-Linux (the agnos-ABI footgun
+# this wrapper set exists to end). Windows has no flock.
 fn xflock(fd, op): i64 {
     #ifdef CYRIUS_TARGET_AGNOS
     return sys_flock(fd, op);                  # agnos kernel #59 (inode-keyed advisory)
@@ -551,7 +547,16 @@ fn file_write_all(path, buf, len): i64 {
 }
 
 # Read the WHOLE file into a fresh heap buffer, NUL-terminated. Returns the buffer and writes
-# the byte count through `len_out`; 0 when the file cannot be opened.
+# the byte count through `len_out`; on ANY failure returns 0 with `*len_out` = a NEGATIVE errno
+# (the open's / read's own, -ENOMEM, -EFBIG — `file_read_whole_max`'s contract). The BUFFER is
+# the success test: an empty file is a non-0 buffer with length 0, a failure is 0. Use
+# `file_read_whole_max` / `_a` / `_into` below to bound the read.
+#
+# ⛔ 6.6.12 — the errno is passed through. This wrapper overwrote it with 0, so "which failure"
+# (a missing file, a directory, a refused allocation) was lost to every caller of the one form
+# that has no bound to pick; every in-tree caller (and every ecosystem one surveyed) tests the
+# buffer for 0 before it reads the length, so a negative length reaches none of them.
+# CHANGELOG [6.6.12]
 #
 # ⛔ WHY: `file_read_all(path, buf, CAP)` with a hand-picked CAP returns exactly CAP on a larger
 # file and says nothing — the caller cannot tell "the whole file" from "the first CAP bytes",
@@ -569,31 +574,108 @@ fn file_write_all(path, buf, len): i64 {
 # i.e. the same silently-accepted partial I/O this helper exists to end, on the read side.
 # Measured: `file_read_whole("tests", &n)` on a DIRECTORY (open succeeds, read = -EISDIR)
 # returned a non-zero buffer with len 0 — "could not read" reported as "empty". A read error is
-# now the same answer as an open error: 0, len 0. CHANGELOG [6.6.6]
+# now the same answer as an open error: no buffer, and the errno. CHANGELOG [6.6.6]
+#
+# ⛔ 6.6.7 — EVERY ALLOCATION IS CHECKED AND GROWTH CLAMPS TO A CEILING. The growth alloc was
+# unchecked and pure doubling from 64 KiB asked for alloc(2^31 + 1) the moment a file reached
+# 1 GiB — past ALLOC_MAX, so alloc returned 0 and the memcpy wrote through NULL: ANY regular file
+# of 1 GiB or more SIGSEGV'd the reader, on every box, with memory to spare (measured: 2^30 - 1
+# bytes read fine, 2^30 exactly rc 139). A file that never ends (/dev/zero) did the same sooner
+# under a memory limit, and an EMPTY file whose first alloc failed stored its NUL at address 0.
+# Now growth is `min(2 * cap, max)`, a file past `max` is -EFBIG rather than a crash, and the
+# first buffer is 4 KiB instead of 64 KiB (every call cost 64 KiB of never-reclaimed bump heap,
+# even for a 2-byte file — kybernet's PID 1 re-reads its config on every SIGHUP).
+# CHANGELOG [6.6.7]
 fn file_read_whole(path, len_out): i64 {
+    return file_read_whole_max(path, ALLOC_MAX - 1, len_out);
+}
+
+# Read the whole file, but never more than `max` bytes. Returns the NUL-terminated buffer and
+# the byte count through `len_out`, or 0 with `*len_out` = a NEGATIVE errno: -EFBIG (-27) when
+# the file is larger than `max`, -ENOMEM (-12) when a buffer could not be allocated, -EINVAL
+# (-22) for a negative `max`, or the open's / read's own errno. CHANGELOG [6.6.7]
+fn file_read_whole_max(path, max, len_out): i64 {
+    return file_read_whole_a(default_alloc(), path, max, len_out);
+}
+
+# `file_read_whole_max` with the buffers drawn from Allocator `a` (the `_a` convention — an
+# arena, or `fail_after_n_allocs(n)` in a test). CHANGELOG [6.6.7]
+fn file_read_whole_a(a, path, max, len_out): i64 {
+    var rb[16];
+    store64(&rb, 0);
+    store64(&rb + 8, 0);
+    var n = _io_read_whole(a, &rb, path, max);
+    if (n < 0) { store64(len_out, n); return 0; }
+    store64(len_out, n);
+    return load64(&rb);
+}
+
+# Read the whole file into a buffer the CALLER KEEPS: `rb` is a 16-byte { ptr, cap } pair, where
+# `ptr` holds `cap + 1` bytes (room for the NUL). Start it at { 0, 0 } and the first call
+# allocates; a later read that fits reuses it and allocates NOTHING (a long-lived process
+# re-reading a config pays once). A file that does not fit grows the buffer — clamped to `max`
+# — and the new { ptr, cap } is written back into `rb`, so take the pointer from `rb` AFTER the
+# call. Returns the byte count (data NUL-terminated), or a negative errno: -EFBIG when the file
+# is larger than `max`, -ENOMEM, -EINVAL, or the open's / read's errno. CHANGELOG [6.6.7]
+fn file_read_whole_into(rb, path, max): i64 {
+    return _io_read_whole(default_alloc(), rb, path, max);
+}
+
+# Close `fd` and pass `err` through — the one exit every failure path below takes.
+fn _io_rw_fail(fd, err): i64 {
+    file_close(fd);
+    return err;
+}
+
+# The one bounded reader behind every file_read_whole* entry point. See file_read_whole_into
+# for the { ptr, cap } contract.
+# ⚠ AT cap == max IT READS ONE MORE BYTE into a local — that is the only way to tell a file of
+# EXACTLY `max` bytes (EOF: success) from a larger one (a byte arrives: -EFBIG) without ever
+# growing the buffer past the ceiling.
+fn _io_read_whole(a, rb, path, max): i64 {
+    if (max < 0) { return 0 - 22; }                       # -EINVAL
     var fd = file_open(path, 0, 0);
-    if (fd < 0) { store64(len_out, 0); return 0; }
-    var cap = 65536;
-    var buf = alloc(cap + 1);
+    if (fd < 0) { return fd; }
+    if (load64(rb) == 0) {
+        var c0 = 4096;
+        if (c0 > max) { c0 = max; }
+        var b0 = alloc_via(a, c0 + 1);
+        if (b0 == 0) { return _io_rw_fail(fd, 0 - 12); }  # -ENOMEM
+        store64(rb, b0);
+        store64(rb + 8, c0);
+    }
+    var buf = load64(rb);
+    var cap = load64(rb + 8);
+    if (cap > max) { cap = max; }
     var total = 0;
-    var go = 1;
-    while (go == 1) {
+    while (1 == 1) {
         if (total == cap) {
+            if (cap == max) {
+                var one[8];
+                var m = file_read(fd, &one, 1);
+                if (m < 0) { return _io_rw_fail(fd, m); }
+                if (m > 0) { return _io_rw_fail(fd, 0 - 27); }  # -EFBIG
+                break;
+            }
             var ncap = cap + cap;
-            var nb = alloc(ncap + 1);
+            if (ncap < 4096) { ncap = 4096; }             # a caller's { ptr, 0 } must still grow
+            if (ncap > max) { ncap = max; }
+            var nb = alloc_via(a, ncap + 1);
+            if (nb == 0) { return _io_rw_fail(fd, 0 - 12); }  # -ENOMEM
             memcpy(nb, buf, total);
             buf = nb;
             cap = ncap;
+            store64(rb, nb);
+            store64(rb + 8, ncap);
         }
         var n = file_read(fd, buf + total, cap - total);
-        if (n < 0) { file_close(fd); store64(len_out, 0); return 0; }
-        if (n == 0) { go = 0; }
-        else { total = total + n; }
+        if (n < 0) { return _io_rw_fail(fd, n); }
+        if (n == 0) { break; }
+        total = total + n;
     }
     file_close(fd);
     store8(buf + total, 0);
-    store64(len_out, total);
-    return buf;
+    return total;
 }
 
 # ── v6.4.57: portable crash-safe atomic write (thoth's model edit/create tools).
@@ -645,6 +727,7 @@ fn _io_append_dec(buf, pos, val): i64 {
 fn _io_tmp_name(path): i64 {
     var plen = strlen(path);
     var buf = alloc(plen + 48);
+    if (buf == 0) { return 0; }   # v6.6.8: was memcpy'd through unchecked
     memcpy(buf, path, plen);
     memcpy(buf + plen, ".cyrtmp.", 8);
     var pos = plen + 8;
@@ -685,6 +768,7 @@ fn _io_link_join(link, target, tn): i64 {
         i = i + 1;
     }
     var out = alloc(cut + tn + 1);
+    if (out == 0) { return 0; }   # v6.6.8: was memcpy'd through unchecked
     memcpy(out, link, cut);
     memcpy(out + cut, target, tn);
     store8(out + cut + tn, 0);
@@ -694,20 +778,24 @@ fn _io_link_join(link, target, tn): i64 {
 # The path a REPLACE of `path` must write: `path` itself, or — when it is a symlink — the file
 # the chain finally names (40 hops, then -ELOOP (-40)). A negative errno or a NUL-terminated
 # path. Windows has no readlink route, so there it is always `path`. CHANGELOG [6.6.6]
+# A refused allocation is -ENOMEM (-12); all three were stored through unchecked. CHANGELOG [6.6.8]
 fn _io_replace_target(path): i64 {
     var cur = path;
     var lb = alloc(4097);
+    if (lb == 0) { return 0 - 12; }
     var hops = 0;
     while (hops < 40) {
         var n = xreadlink(cur, lb, 4096);
         if (n <= 0) { return cur; }   # not a link (or absent: it will be created)
         if (load8(lb) == 47) {
             var ab = alloc(n + 1);
+            if (ab == 0) { return 0 - 12; }
             memcpy(ab, lb, n);
             store8(ab + n, 0);
             cur = ab;
         } else {
             cur = _io_link_join(cur, lb, n);
+            if (cur == 0) { return 0 - 12; }
         }
         hops = hops + 1;
     }
@@ -726,6 +814,7 @@ fn _io_replace_target(path): i64 {
 # file_replace_atomic, which writes the file the link names. CHANGELOG [6.6.6]
 fn file_write_atomic(path, buf, len): i64 {
     var tmp = _io_tmp_name(path);
+    if (tmp == 0) { return 0 - 12; }   # -ENOMEM; `path` untouched. CHANGELOG [6.6.8]
     var fd = file_open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
     if (fd < 0) { return fd; }
     _io_keep_mode(fd, path);   # v6.6.6: an existing file keeps its permission bits
@@ -757,20 +846,58 @@ fn file_replace_atomic(path, buf, len): i64 {
 }
 
 # Create `path` ONLY if it does not already exist (no-clobber), returning the new
-# write fd or -EEXIST (-17). On Linux/macOS this is enforced atomically at the
-# kernel via O_CREAT|O_EXCL. AGNOS has no exclusive-create AO_* bit (its AO_* set
-# is RDONLY/WRONLY/RDWR/CREAT/TRUNC/APPEND/DIRECTORY only), so there it degrades to
-# a file_exists pre-check + plain O_CREAT — RESIDUAL: NOT atomic. v6.4.58: Windows is
-# now atomic too — EOPEN_PE maps O_CREAT|O_EXCL (mask 0xC0) → CREATE_NEW, so the open
-# itself fails with ERROR_FILE_EXISTS when the target already exists (no clobber, no
-# race). See issue 2026-07-12-windows-atomic-write-residuals.md (item A).
+# write fd or -EEXIST (-17). A name that exists AS ANYTHING refuses — a file, a
+# directory, or a symlink, INCLUDING one that dangles (POSIX O_CREAT|O_EXCL never
+# follows a final link). Atomic on every target — the kernel refuses, there is no
+# check-then-create window:
+#   · Linux/macOS: O_CREAT|O_EXCL.
+#   · Windows: CREATE_NEW + FILE_FLAG_OPEN_REPARSE_POINT (EOPEN_PE). 6.6.9 added the flag:
+#     before it CREATE_NEW RESOLVED a dangling symlink and created its target.
+#   · AGNOS: AO_CREAT|AO_EXCL (kernel 1.56.56; file_open maps O_EXCL since 6.6.4). 6.6.9
+#     replaced the non-atomic `file_exists` pre-check that stood here since 6.4.58.
+# Windows and agnos answer a refusal with a bare -1 (no -errno convention), so on those
+# the refusal is CLASSIFIED afterwards: if the name now exists (not following a link) the
+# answer is -17. That check only names the error; it cannot let a create through.
+# CHANGELOG [6.6.9]
 fn file_create_exclusive(path, mode): i64 {
-    #ifdef CYRIUS_TARGET_AGNOS
-    if (file_exists(path) == 1) { return -17; }   # -EEXIST (non-atomic residual)
-    return file_open(path, O_WRONLY | O_CREAT, mode);
+    var fd = file_open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+    #ifdef CYRIUS_TARGET_WIN
+    if (fd == 0 - 1) {
+        if (_io_name_exists(path) == 1) { return 0 - 17; }
+    }
     #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (fd == 0 - 1) {
+        if (_io_name_exists(path) == 1) { return 0 - 17; }
+    }
+    #endif
+    return fd;
+}
+
+# Does `path` name anything — a file, a directory or a symlink (dangling or not)? Not
+# following a final link, which is what O_EXCL's EEXIST means. Only file_create_exclusive's
+# error classification uses it, and only on the two targets whose refusal is a bare -1
+# (Windows, agnos); elsewhere it answers 0 and is never called.
+fn _io_name_exists(path): i64 {
+    #ifdef CYRIUS_TARGET_WIN
+    # GetFileAttributesW does not follow a final reparse point: a dangling link answers.
+    if (sys_access(path, 0) == 0) { return 1; }
+    return 0;
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    # lstat#102 (agnos 1.56.x+): stat that does NOT follow the final link, so a dangling one
+    # answers. (readlink cannot stand in for it: agnos refuses a buffer shorter than the
+    # target instead of truncating — measured on agnos-qemu 1.57.10.)
+    var pn = 0;
+    while (load8(path + pn) != 0) { pn = pn + 1; }
+    var st[64];
+    if (sys_lstat(path, pn, &st) >= 0) { return 1; }
+    return 0;
+    #endif
+    #ifndef CYRIUS_TARGET_WIN
     #ifndef CYRIUS_TARGET_AGNOS
-    return file_open(path, O_WRONLY | O_CREAT | O_EXCL, mode);
+    return 0;   # Linux/macOS answer -EEXIST themselves; nothing classifies there
+    #endif
     #endif
 }
 
@@ -1028,7 +1155,7 @@ fn _env_load(): i64 {
     }
     if (mtot == 0) { return 0; }
     var mbuf = alloc(mtot);
-    if (mbuf == 0) { return 0; }
+    if (mbuf == 0) { _env_len = 0 - 1; return 0; }   # unset, so a later call retries (6.6.7)
     var mo = 0;
     mi = 0;
     me = load64(menvp);
@@ -1046,12 +1173,20 @@ fn _env_load(): i64 {
     _env_len = mo;
     return 0;
     #endif
+    # ⚠ 6.6.7: EVERY failure on the /proc path — the open, either allocation, a read error —
+    # leaves the cache UNSET (`_env_len = -1`) so a later call retries. `_env_len = 0` is
+    # stored at the top, so a bare `return 0` here CACHES an empty environment for the life of
+    # the process: a PID 1 that asks before /proc is mounted would never see its env. Only a
+    # genuinely empty or unavailable environment (the macOS arm above) may cache 0. The two
+    # allocations were also unchecked, so a refused alloc() put the read (or the growth
+    # memcpy) through NULL — the same shape as file_read_whole's. CHANGELOG [6.6.7]
     var fd = file_open("/proc/self/environ", 0, 0);
-    if (fd < 0) { return 0; }
+    if (fd < 0) { _env_len = 0 - 1; return 0; }
     # Grow-and-read to EOF. /proc files are not stat-sizeable, so the only honest
     # termination is a short read. Doubling keeps this O(log n) allocations.
     var cap = 16384;
     var buf = alloc(cap);
+    if (buf == 0) { file_close(fd); _env_len = 0 - 1; return 0; }
     var n = 0;
     var done = 0;
     while (done == 0) {
@@ -1060,13 +1195,14 @@ fn _env_load(): i64 {
         # forever — every later getenv answering from a block that stops mid-variable, with no
         # way to tell that from a genuinely short environ. Leave the cache unset instead, the
         # same answer an open failure gives, so a later call retries. CHANGELOG [6.6.6]
-        if (got < 0) { file_close(fd); return 0; }
+        if (got < 0) { file_close(fd); _env_len = 0 - 1; return 0; }
         if (got == 0) { done = 1; }
         else {
             n = n + got;
             if (n >= cap) {
                 var ncap = cap * 2;
                 var nb = alloc(ncap);
+                if (nb == 0) { file_close(fd); _env_len = 0 - 1; return 0; }
                 memcpy(nb, buf, n);
                 buf = nb;
                 cap = ncap;
@@ -1079,7 +1215,8 @@ fn _env_load(): i64 {
     return 0;
 }
 
-# Read environment variable by name. Returns pointer to value or 0 if not found.
+# Read environment variable by name. Returns pointer to a heap copy of the value, or 0 if
+# not found (or if that copy could not be allocated — v6.6.8).
 # Reads from /proc/self/environ (null-separated KEY=VALUE pairs).
 fn getenv(name): i64 {
     # agnos has no /proc/self/environ; the kernel stages envp on the exec init
@@ -1132,6 +1269,7 @@ fn getenv(name): i64 {
                 var vlen = 0;
                 while (vstart + vlen < n && load8(buf + vstart + vlen) != 0) { vlen = vlen + 1; }
                 var result = alloc(vlen + 1);
+                if (result == 0) { return 0; }   # v6.6.8: a refused copy is a miss, not a store to 0
                 memcpy(result, buf + vstart, vlen);
                 store8(result + vlen, 0);
                 return result;

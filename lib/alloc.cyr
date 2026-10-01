@@ -192,26 +192,72 @@ var _heap_used = 0;         # total bytes handed out since last init/reset
 # the first chunk, so alloc_reset cleanly reuses it with no chunk leak.
 var _LINUX_CHUNK = 0x10000000;
 
+# ⛔ SMALL BOARDS (v6.6.8). The 256 MB reservation is VIRTUAL, but a plain
+# anonymous mmap is still charged against the overcommit heuristic, which
+# refuses a single mapping larger than RAM + swap. On a board (or VM) with less
+# than ~256 MB the FIRST chunk was refused, alloc_init printed "mmap failed" and
+# exited — and as PID 1 that is a kernel panic ("Attempted to kill init",
+# measured in a `qemu-system-x86_64 -m 256M` VM; recipe in
+# tests/gates/memory/alloc_first_chunk_small_board.sh). Two layers:
+#   1. a GRAIN-SIZED chunk is mapped MAP_NORESERVE (0x4000, same value on
+#      x86_64 and aarch64): it is a reservation nobody promised to touch, so the
+#      heuristic has no business sizing it. A chunk sized to a LARGER request
+#      keeps normal accounting — that caller will touch it, and an impossible
+#      request should come back 0 from alloc(), not OOM-kill later.
+#   2. if the kernel still refuses (strict overcommit mode 2 ignores NORESERVE;
+#      RLIMIT_AS counts every mapping), the grain drops to 16 MB for this and
+#      every later chunk, and the heap grows 16 MB at a time from there.
+# CHANGELOG [6.6.8]
+var _LINUX_CHUNK_SMALL = 0x1000000;
+var _linux_grain = 0;       # 0 = not yet chosen (→ _LINUX_CHUNK); lowered on refusal
+var _LINUX_MAP_NORESERVE = 0x4000;
+
 # Linux mmap flags for an anonymous private mapping: MAP_PRIVATE (0x2) |
 # MAP_ANONYMOUS (0x20). (macOS uses 0x1002 — Darwin's MAP_ANON is 0x1000.)
 var _LINUX_MAP_ANON_PRIVATE = 0x22;
 
-# Maximum single allocation size (256MB)
+# Maximum single allocation size
 var ALLOC_MAX = 0x80000000;   # 2 GiB (v6.4.51: was 256 MiB; output_buf now allocs 1 GiB off-heap)
 
-# Round `n` up to the next _LINUX_CHUNK multiple.
-fn _linux_round_chunk(n): i64 {
-    return (n + (_LINUX_CHUNK - 1)) & (0 - _LINUX_CHUNK);
+# The current chunk grain: 256 MB until the kernel refuses one, 16 MB after.
+fn _linux_chunk_grain(): i64 {
+    if (_linux_grain == 0) { _linux_grain = _LINUX_CHUNK; }
+    return _linux_grain;
+}
+
+# Round `n` up to a multiple of the grain `g` (a power of two), never below `g`.
+fn _linux_round_chunk(n, g): i64 {
+    var sz = (n + (g - 1)) & (0 - g);
+    if (sz < g) { sz = g; }
+    return sz;
+}
+
+# One anonymous mapping of `sz` bytes; NORESERVE only when it is a pure grain
+# reservation (`min` fits inside one grain). Returns the base or a negative errno.
+fn _linux_map_chunk(sz, min, g): i64 {
+    var fl = _LINUX_MAP_ANON_PRIVATE;
+    if (min <= g) { fl = fl | _LINUX_MAP_NORESERVE; }
+    return syscall(9, 0, sz, 3, fl, 0 - 1, 0);
 }
 
 # mmap a fresh anonymous chunk of at least `min` bytes (rounded to the chunk
 # grain) and make it the current chunk. Returns the base, or 0 on failure
-# (raw mmap returns a small negative -errno on error).
+# (raw mmap returns a small negative -errno on error). A refused grain-sized
+# chunk is retried ONCE at the small grain, which then sticks (see above).
 fn _linux_new_chunk(min): i64 {
-    var sz = _linux_round_chunk(min);
-    if (sz < _LINUX_CHUNK) { sz = _LINUX_CHUNK; }
-    var base = syscall(9, 0, sz, 3, _LINUX_MAP_ANON_PRIVATE, 0 - 1, 0);
-    if (base < 0) { return 0; }
+    var g = _linux_chunk_grain();
+    var sz = _linux_round_chunk(min, g);
+    var base = _linux_map_chunk(sz, min, g);
+    if (base < 0) {
+        # A chunk sized to a big REQUEST being refused is the answer to that
+        # request, not evidence of a small board — keep the grain.
+        if (min > g) { return 0; }
+        if (g == _LINUX_CHUNK_SMALL) { return 0; }
+        _linux_grain = _LINUX_CHUNK_SMALL;
+        sz = _linux_round_chunk(min, _LINUX_CHUNK_SMALL);
+        base = _linux_map_chunk(sz, min, _LINUX_CHUNK_SMALL);
+        if (base < 0) { return 0; }
+    }
     _heap_base = base;
     _heap_ptr = base;
     _heap_end = base + sz;
@@ -231,7 +277,7 @@ fn alloc_init(): i64 {
     # effectively idempotent (re-brk to current break); the v6.1.19 brk→chunk switch
     # lost that. See docs/development/issues/2026-06-09-chunked-alloc-init-not-idempotent-rechunks-on-recall.md.
     if (_heap_base != 0) { return _heap_first_base; }
-    var base = _linux_new_chunk(_LINUX_CHUNK);
+    var base = _linux_new_chunk(8);
     if (base == 0) {
         syscall(1, 2, "alloc_init: mmap failed\n", 24);
         syscall(60, 1);

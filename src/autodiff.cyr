@@ -132,107 +132,52 @@ public fn dual_sqrt(a) {
     return dual_new(s, f64_div(Dual_deriv(a), f64_mul(F64_TWO, s)));
 }
 
-# base^n for a plain f64 exponent, by repeated multiplication on the integer cases.
+# base^n for a plain f64 exponent n -- the power both dual_pow and the tape's ad_pow use,
+# for the value AND for the n * base^(n-1) derivative.
 #
-# ⚠ THE REASON THIS EXISTS CHANGED IN 2.11.2 AND THE CODE DID NOT. It was written
-# against a DOMAIN restriction: ganita 1.0.4's `f64_pow` was literally
-# `exp(exp * ln(base))`, so every non-positive base came back NaN, and dual_pow
-# inherited that without documenting it -- d/dx x^3 at -2 was NaN where the truth
-# is 12, d/dx x^1 at 0 was NaN where the truth is 1.
-# [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
+# ⭐ 3.2.2: EVERY EXPONENT BUT THREE GOES TO `ganita_f64_pow`, AND THE REPEATED-
+# MULTIPLICATION LOOP THAT USED TO BE THIS FUNCTION (2.11.0-3.2.1) IS RETIRED. Its last
+# stated reason was accuracy: ganita 1.2.4-1.2.7 raised an integral power by binary
+# exponentiation, which doubles its relative error at every squaring (0.9^1024 was 137
+# ulp out against the loop's 7). ganita 1.2.8 (cyrius 6.6.10) moved every finite case
+# onto fdlibm's e_pow core, and against an exact rational oracle over 2088 (base, n)
+# pairs -- 36 bases of both signs, integral |n| <= 1024 -- it is within 1 ulp on all of
+# them and correctly rounded on 1964, while the loop was worse on 1110 and better on 26,
+# by one ulp each. The history of the two earlier reasons is in the CHANGELOG (2.11.0,
+# 2.11.2, 2.11.4). [measured: scratch harness, not reproducible in-tree, 2026-09-30]
 #
-# ganita 1.1.4 (cyrius 6.5.33) FIXED that upstream: it now special-cases a zero
-# base, a zero exponent, and a negative base with an integral exponent, so the
-# premise above is no longer true and a reader checking it against today's stdlib
-# would find the comment lying.
+# ⛔ THE LOOP ALSO FABRICATED ZEROS. For a negative n it formed base^|n| and returned
+# the reciprocal, so wherever base^|n| overflowed while base^n is a representable
+# SUBNORMAL it returned 0: 10^-310 and 2^-1024 both read 0, 201 of 36,864 (base, n)
+# pairs over the same bases and every n in -1024..-1. ganita scales a subnormal result
+# in one rounding instead. Pinned in tests/modules.tcyr (group "3.2.2 autodiff").
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30]
 #
-# ⚠ AND THEN THE REPLACEMENT REASON DIED TOO, IN 2.11.4. 2.11.2 rewrote the
-# paragraph above onto PRECISION: ganita 1.1.4 took the magnitude from
-# `exp(n * ln|base|)` and applied the sign, so `f64_pow(-2, 3)` was
-# 0xC01FFFFFFFFFFFFE (-7.99999999999999982) against an exact 0xC020000000000000
-# here, and a caller reading (-2)^4 through the truncating `f64_to` got 15 from the
-# stdlib and 16 from this function. **ganita 1.2.4 replaced that path with BINARY
-# EXPONENTIATION for integral exponents with |n| <= 1024, and the gap is gone**:
-# 665 of 665 comparisons agree BIT FOR BIT (integral n in -12..12 over bases
-# -12..12, plus half-exponents over bases -20..19). (-2)^4 now reads 16 both ways.
-# [measured: scratch harness, not reproducible in-tree, 2026-09-09; ganita 1.2.4]
+# The three kept exponents are the ones whose C99 pow IS a single correctly-rounded
+# IEEE operation, special values included: x^1 = x, x^2 = x*x and x^-1 = 1/x give the
+# C99 answer for +-0, +-Inf and NaN too (pow(+-0, -1) = +-Inf is 1/+-0). They are as
+# accurate as ganita -- 0 ulp on all 36 bases each -- and they are the common ones: a
+# call is ~10 ns there against ~180 ns for ganita. At n = 64 the two costs meet, and at
+# n = 1024 ganita is ~12x FASTER than the loop was (188 ns vs 2.37 us).
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30]
 #
-# ⭐ A THIRD GROUND SURVIVES, AND IT IS THE OPPOSITE OF THE SECOND. Squaring
-# amplifies relative error geometrically, so binary exponentiation loses accuracy
-# exactly where it wins speed — at LARGE integral exponents. Measured against a
-# 60-digit reference:
-# [measured: scratch harness, not reproducible in-tree, 2026-09-09; ganita 1.2.4]
+# ⚠ A consumer compiles dist/hisab.cyr against ITS OWN toolchain's ganita, so outside
+# those three exponents this is that ganita's accuracy: <= 1 ulp from cyrius 6.6.10,
+# the binary-exponentiation and exp/ln paths described above below it -- the contract
+# every other transcendental in this library already has.
 #
-#     (-0.999)^1000   inside ganita's +-1024 window (binary exponentiation)
-#                     _ad_pow    4 ulp from truth      <- this function wins
-#                     ganita    58 ulp from truth
-#     (-0.999)^1101   past the window (exp/ln fallback)
-#                     _ad_pow    3 ulp from truth
-#                     ganita     1 ulp from truth      <- the stdlib wins
-#
-# ⭐ SO 2.11.4 SETTLED IT BY WIDENING THE LOOP, NOT BY DELETING IT — and the first
-# reading of the evidence pointed the other way. Swept over 9 bases, `_ad_pow` tied
-# the stdlib on every POSITIVE base at every n, which looked like proof it was
-# redundant. It was proof of nothing: the old first line was
-# `if (f64_gt(base, 0) == 1) { return ganita_f64_pow(base, n); }`, so those rows were
-# **the stdlib being compared with itself**. Running the loop on positive bases too
-# beats the stdlib on 44 of 48 of them, ties 2, and loses 2 by at most 3 ULP.
-# [measured: scratch harness, not reproducible in-tree, 2026-09-09; ganita 1.2.4]
-#
-# The delegation is therefore gone. One rule replaces it, and the bound is ganita's
-# own so no threshold here needs a scale chosen for it: an integral exponent with
-# |n| <= AD_POW_MAX_K goes through the product; everything else defers.
-#
-#   0.9^1024      loop   7 ULP    stdlib 137 ULP     (pinned in modules.tcyr)
-#   1.001^1024    loop  10 ULP    stdlib 174 ULP
-#   (-0.999)^1101 past the window: stdlib 1 ULP, loop 3 -- which is why the bound exists
-#
-# Net across the 126-row sweep: 60 rows improved, 6 lost <= 3 ULP, and against the
-# stdlib it now wins 93 / ties 26 / loses 7. The cost is O(n) multiplies against
-# O(log n), bounded at 1024 and paid only where the accuracy is bought.
-# [measured: scratch harness, not reproducible in-tree, 2026-09-09; ganita 1.2.4]
-#
-# So: integer exponents go through repeated multiplication, which is exact and has
-# no domain restriction; everything else defers to the stdlib, including its NaN for
-# cases like (-2)^0.5 where NaN is the right answer -- re-verified still NaN on
-# ganita 1.2.4, because a fix that widened the domain THERE would be a new
-# fabrication.
-#
-# ⚠ One path's behaviour did move with the stdlib, and it is the fallback below:
-# when `acc` underflows to zero for a negative exponent this hands off to
-# `ganita_f64_pow`, so `_ad_pow(0, -1)` was NaN under 1.0.4 and is +Inf from 1.1.4 on.
-# +Inf is the IEEE-754 answer for pow(0, -1); dual_pow(0, -1) is correspondingly
-# (+Inf, -Inf). Pinned in tests/modules.tcyr so it is a checked outcome rather
-# than a discovered one. [measured: 2026-08-21]
+# ⚠ `AdPowLimit` below is RETAINED BUT NO LONGER CONSULTED: it was ganita's old
+# binary-exponentiation bound, which the retired loop matched. It is a public name, and
+# removing one is a breaking change, so it goes at 4.0.0 (roadmap), not in a patch.
 public enum AdPowLimit {
-    # ganita's own binary-exponentiation window. Inside it, repeated multiplication
-    # is more accurate; outside it ganita switches to exp/ln, which beats a
-    # 1024-step product on both accuracy and cost. Matching the bound rather than
-    # inventing one means there is no threshold here that needs a scale chosen for it.
     AD_POW_MAX_K = 1024;
 }
 
 fn _ad_pow(base, n) {
-    if (f64_eq(f64_round(n), n) != 1) { return ganita_f64_pow(base, n); }
-    # ⛔ THE BOUND IS CHECKED IN f64 SPACE, BEFORE `f64_to`, AND THAT ORDER IS THE
-    # WHOLE GUARD. `f64_to` SATURATES: f64_to(1e300) is i64::MIN, and negating
-    # i64::MIN in two's complement gives i64::MIN back, so a post-truncation
-    # `k > AD_POW_MAX_K` reads FALSE, the loop `i < k` never runs, acc stays 1, and
-    # the function returns a fabricated **1.0** for (-2)^1e300 where the answer is
-    # +Inf. Reproduced before this guard existed; the same shape as the fabricated
-    # plausible answer catalogued in `complex.cyr:58`. 1e300 IS integral, so the
-    # round check above does not stop it.
-    if (f64_gt(f64_abs(n), f64_from(AD_POW_MAX_K)) == 1) { return ganita_f64_pow(base, n); }
-    var k = f64_to(n);
-    var neg = 0;
-    if (k < 0) { neg = 1; k = 0 - k; }
-    var acc = F64_ONE;
-    for (var i = 0; i < k; i = i + 1) { acc = f64_mul(acc, base); }
-    if (neg == 1) {
-        if (f64_lt(f64_abs(acc), _AD_F64_TINY) == 1) { return ganita_f64_pow(base, n); }
-        return f64_div(F64_ONE, acc);
-    }
-    return acc;
+    if (f64_eq(n, F64_TWO) == 1) { return f64_mul(base, base); }
+    if (f64_eq(n, F64_ONE) == 1) { return base; }
+    if (f64_eq(n, f64_neg(F64_ONE)) == 1) { return f64_div(F64_ONE, base); }
+    return ganita_f64_pow(base, n);
 }
 
 # [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
@@ -474,8 +419,8 @@ public fn ad_sqrt(t, a) {
     return _ad_push(t, s, f64_div(F64_ONE, f64_mul(F64_TWO, s)), a, 0, AD_NONE);
 }
 
-# n is a plain f64, not a tape node -- the same shape as dual_pow, and it uses
-# the same _ad_pow so integer exponents work on negative and zero bases.
+# n is a plain f64, not a tape node -- the same shape as dual_pow, through the same
+# _ad_pow, so the two modes agree bit for bit on every exponent.
 #must_use
 public fn ad_pow(t, a, n) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }

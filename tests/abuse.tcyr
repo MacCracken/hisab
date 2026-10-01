@@ -2156,6 +2156,29 @@ assert_eq(vec_len(spatial_hash_query_radius(ab_sh, hvec3_zero(), F64_ONE)), 0,
 assert_eq(vec_len(spatial_hash_query_cell(ab_sh, hvec3_zero())), 0,
   "spatial_hash_query_cell: cleared hash -> empty");
 
+test_group("abuse: 3.2.2 spatial hash -- extreme cells do not wrap into ordinary queries");
+# ⛔ Both radius-query paths wrapped at the ends of the i64 cell range. The flat scan
+# computed |e - c| as `d = e - c; if (d < 0) { d = 0 - d; }`, and `0 - d` is a no-op
+# at i64::MIN, so an entry in cell i64::MIN (x = -Inf, or at/below -2^63 cells)
+# matched every flat-scan query centred at cell 0. The cell walk's `cx + dx`
+# wrapped for a centre at +Inf and probed cell i64::MIN. Either way a radius-1 query
+# returned the points at -Inf. The 3.2.1 code fails the first two assertions below
+# (2 entries each), on cycc 6.6.6 and 6.6.12 alike.
+var ab_shx = spatial_hash_new(F64_ONE);
+spatial_hash_insert(ab_shx, hvec3_new(_AB_NINF, 0, 0), 3);
+spatial_hash_insert(ab_shx, hvec3_new(0xC3E0000000000001, 0, 0), 4);   # just below -2^63
+spatial_hash_insert(ab_shx, hvec3_splat(f64_from(5)), 9);
+assert_eq(vec_len(spatial_hash_query_radius(ab_shx, hvec3_zero(), F64_ONE)), 0,
+  "spatial_hash_query_radius: points at -Inf are not within 1 of the origin (flat scan)");
+# 30 more entries far away, so (2r + 1)^3 = 27 <= n and the query takes the cell walk.
+for (var shi = 0; shi < 30; shi = shi + 1) {
+    spatial_hash_insert(ab_shx, hvec3_splat(f64_from(100 + shi)), 50 + shi);
+}
+assert_eq(vec_len(spatial_hash_query_radius(ab_shx, hvec3_new(_AB_PINF, 0, 0), F64_ONE)), 0,
+  "spatial_hash_query_radius: a centre at +Inf does not wrap onto the points at -Inf (cell walk)");
+assert_eq(vec_len(spatial_hash_query_radius(ab_shx, hvec3_splat(f64_from(5)), F64_ONE)), 1,
+  "spatial_hash_query_radius: control -- the ordinary neighbour at (5,5,5) is still found");
+
 test_group("spatial: the three sibling inserts share ONE return convention");
 
 # 2026-08-04 audit, api-consistency (low). Three sibling insert routines, two
@@ -2504,7 +2527,17 @@ assert_eq(_ab_is_nan(HVec3_x(tonemap_reinhard(f64_neg(F64_ONE), 0, 0))), 0,
 assert_eq(_ab_is_nan(HVec3_x(tonemap_reinhard_extended(0, 0, 0, 0))), 1,
   "tonemap_reinhard_extended: white = 0 divides by zero -> NaN");
 
-assert_eq(_ab_is_nan(ev100_to_luminance(_AB_PINF)), 1, "ev100_to_luminance: +inf EV -> NaN");
+# ⭐ 3.2.2: THIS ASSERTED NaN, AND NaN WAS GANITA'S DEFECT, NOT THE ANSWER. Luminance is
+# 2^(EV - 3) * 12.5 / pi, which grows without bound, so +inf EV is +inf luminance.
+# ganita <= 1.2.6 answered pow(2, +inf) with NaN -- every infinite exponent that
+# missed its integral fast path did -- and 1.2.7 (cyrius 6.6.8) completed the C99
+# Annex F table: pow(x > 1, +inf) = +inf and pow(x > 1, -inf) = +0. A suite that pins
+# a dependency's defect fails on the repair, which is how this was found. Asserted
+# with -inf and NaN beside it so it discriminates rather than accepting any
+# non-NaN: a fabricated finite value fails all three.
+assert_eq(ev100_to_luminance(_AB_PINF), 0x7FF0000000000000, "ev100_to_luminance: +inf EV -> +inf");
+assert_eq(ev100_to_luminance(_AB_NINF), 0, "ev100_to_luminance: -inf EV -> +0 (2^-inf)");
+assert_eq(_ab_is_nan(ev100_to_luminance(_AB_NAN)), 1, "ev100_to_luminance: NaN EV -> NaN");
 assert_eq(_ab_is_finite(luminance_to_ev100(0)), 0,
   "luminance_to_ev100: log2(0) -> -inf, not a fabricated number");
 assert_eq(_ab_is_finite(ev100_to_exposure(0)), 1, "ev100_to_exposure: EV 0 is finite");
@@ -2743,14 +2776,13 @@ assert_eq(Dual_deriv(dual_abs(dual_var(0))), f64_from(1),
 #
 # ⚠ THE PAST TENSE IS LOAD-BEARING. ganita 1.1.4 (cyrius 6.5.33, hisab 2.11.2)
 # fixed f64_pow upstream, so the sentence above is a record of why 2.11.0 did what
-# it did, NOT a description of today's stdlib. The repeated-multiplication path
-# still earns its place, on precision rather than domain -- see the group
-# "2.11.2 stdlib: the f64_pow domain moved under us" in tests/modules.tcyr.
+# it did, NOT a description of today's stdlib. The repeated-multiplication path is
+# itself retired as of 3.2.2 (ganita 1.2.8's pow is within 1 ulp everywhere) -- see
+# the group "3.2.2 autodiff" in tests/modules.tcyr.
 assert_eq(Dual_val(dual_pow(dual_var(0), 0)), f64_from(1), "dual_pow: 0^0 -> 1, the conventional value");
 # ⚠ "(f64_pow cannot take a negative base)" was true of ganita 1.0.4 and is FALSE
 # of 1.1.4 (cyrius 6.5.33), which fixed it upstream. The assertion is unchanged and
-# still discriminating: the stdlib path now returns -7.99999999999999982, which
-# f64_to TRUNCATES to -7, so this still fails if _ad_pow's exact integer path goes.
+# still correct: -8 exactly, which ganita has returned bit-exact since 1.2.4.
 assert_eq(Dual_val(dual_pow(dual_var(f64_neg(F64_TWO)), f64_from(3))), f64_neg(f64_from(8)),
   "dual_pow: (-2)^3 -> -8 exactly");
 assert_eq(Dual_deriv(dual_pow(dual_var(f64_neg(F64_TWO)), f64_from(3))), f64_from(12),
@@ -2770,7 +2802,7 @@ assert_eq(Dual_deriv(dual_pow(dual_var(f64_neg(F64_TWO)), f64_from(3))), f64_fro
 # a tolerance and a round -- so they kept passing while the property they claimed to
 # test evaporated. **An assertion written against a defect cannot fail when the defect
 # is repaired; it just stops testing anything.** Kept as correctness checks on
-# `_ad_pow`, with the false discrimination claim removed.
+# `dual_pow`, with the false discrimination claim removed.
 # [measured: tests/modules.tcyr:4494 pins the bit-exact stdlib values]
 assert_eq(f64_to(f64_round(Dual_val(dual_pow(dual_var(F64_TWO), f64_from(3))))), 8,
   "dual_pow: 2^3 = 8 (control for the degenerate exponent above)");
@@ -2875,6 +2907,45 @@ assert_eq(expr_eval(expr_const(f64_from(3)), vec_new()), f64_from(3),
   "expr_eval: a constant needs no bindings");
 assert_eq(expr_eval(ab_xv, vec_new()), f64_from(0),
   "expr_eval: an unbound variable evaluates to 0, not a wild read");
+
+# ⭐ 3.2.2 -- THE WHOLE WARNING GOES TO fd 2. Its prefix and newline went to stderr but
+# the variable NAME went out through `str_print`, which writes fd 1, so a harness
+# capturing the streams separately got the message with the name orphaned on stdout.
+# cyrius 6.6.12's test runner interleaves the two streams differently and that moved
+# this suite's own output, which is how it was found. Pinned by capturing both fds
+# through pipes around one call; the 3.2.1 code writes "zq" to stdout and fails both.
+fn _ab_warn_streams(out) {
+    var p1[8];
+    var p2[8];
+    if (sys_pipe(&p1) < 0) { return 0 - 1; }
+    if (sys_pipe(&p2) < 0) { return 0 - 1; }
+    var r1 = load32(&p1);
+    var w1 = load32(&p1 + 4);
+    var r2 = load32(&p2);
+    var w2 = load32(&p2 + 4);
+    sys_dup2(1, 101);
+    sys_dup2(2, 102);
+    sys_dup2(w1, 1);
+    sys_dup2(w2, 2);
+    expr_eval(expr_var(str_from("zq")), vec_new());
+    sys_dup2(101, 1);
+    sys_dup2(102, 2);
+    sys_close(101);
+    sys_close(102);
+    sys_close(w1);
+    sys_close(w2);
+    store64(out, sys_read(r1, out + 16, 128));
+    store64(out + 8, sys_read(r2, out + 144, 128));
+    sys_close(r1);
+    sys_close(r2);
+    return 0;
+}
+var ab_ws = alloc(288);
+_ab_warn_streams(ab_ws);
+assert_eq(load64(ab_ws), 0, "expr_eval: the undefined-variable warning writes nothing to stdout");
+assert_eq(str_eq_cstr(str_from_buf(ab_ws + 144, load64(ab_ws + 8)),
+    "expr_eval: warning: undefined variable: zq\n"), 1,
+  "expr_eval: the whole warning, variable name included, is on stderr");
 
 # A 200-deep left spine: deep enough to catch an unbounded recursion, shallow
 # enough that a correct implementation is instant.

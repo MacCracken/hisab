@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.6.6**. Stdlib `ganita` (6.2.x math umbrella) provides dense
+> Written in Cyrius. Toolchain: **6.6.12**. Stdlib `ganita` (6.2.x math umbrella) provides dense
 > decompositions + transcendentals.
 
 ⭐ **This file is future-facing only.** Nothing below has shipped. The record of what *has* is:
@@ -27,16 +27,16 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.2.1
+## Current — v3.2.2
 
-Suite **4429** across five harnesses (hisab 585, foundation 429, modules 2251, edge_cases 260,
-abuse 904), constant gate **159/159**, **80** benchmarks, **35** `[lib]` modules, toolchain
-**6.6.6**, sakshi **2.5.2**, ganita **1.2.6**. All gates green; per-release detail is in
+Suite **4443** across five harnesses (hisab 585, foundation 429, modules 2256, edge_cases 262,
+abuse 911), constant gate **159/159**, **80** benchmarks, **35** `[lib]` modules, toolchain
+**6.6.12**, sakshi **2.5.6**, ganita **1.2.9**. All gates green; per-release detail is in
 [`CHANGELOG.md`](../../CHANGELOG.md). **2.24.0 is the supported 2.x line** — 3.0.0's `Result<T, E>`
 migration is breaking, has no deprecation window, and
 [`../guides/migration-3.0.md`](../guides/migration-3.0.md) is the consumer-facing guide. ⚠ **hisab
-≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`; measured 3.2.1: the 3.0.1 bundle
-compiles under 6.6.2, the 3.1.0 bundle does not).
+≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`; measured again in 3.2.2: the 3.2.2
+bundle is refused under 6.6.2 and runs correctly under 6.6.3, 6.6.6, 6.6.10 and 6.6.12).
 
 ## How to read this file
 
@@ -76,14 +76,15 @@ suites.** ⚠ Consumers compile the bundle under their OWN pins, and the boundar
 only from **6.6.4** (below it `&_private_fn` and a `public enum`'s neighbour leak) — one more
 reason this is a 4.0.0 item.
 
-⛔ **What the flip breaks today, measured by compiling the suites against a fully-`private` tree**:
-**64 distinct `_` names, 387 sites** — `tests/hisab.tcyr` 14 sites / 4 names, `tests/modules.tcyr`
-372 / 59, `tests/hisab.bcyr` 1 (`_CGA_NULL_TBL`, the 2.24.0 cold-row guard); `foundation`,
+⛔ **What the flip breaks today, measured by compiling the suites against a fully-`private` tree**
+(re-measured 2026-09-30 on 3.2.2; the same run put 3.2.1 at 65 / 392, and 3.2.2 retired `_ad_pow`'s
+direct calls): **64 distinct `_` names, 382 sites** — `tests/hisab.tcyr` 14 sites / 4 names,
+`tests/modules.tcyr` 367 / 59, `tests/hisab.bcyr` 1 (`_CGA_NULL_TBL`, the 2.24.0 cold-row guard); `foundation`,
 `edge_cases`, `abuse` and the fuzz harness are already flip-clean. 56 are fns, 8 are globals
 (`_SP_MAX_TREE_DEPTH`, `_SP_F64_POS_INF`, `_SH_ENTRY_SIZE`, `_GA_EPA_POLISH_COUNT`,
 `_CGA_NULL_TBL`, `_CGA_NULL_COEF_BAD`, `_COL_F64_NEG_INF`, `_GEO_F64_THIRD`). Top by sites:
 `_f64arr_set` 125, `_f64arr_alloc` 27, `_col_dl_incircle` 24, `_f64arr_get` 15, `_col_ghost_ux`/`_uy`
-15 each, `_col_dl_ic_g1` 13, `_GA_EPA_POLISH_COUNT` 12. Three families: white-box layout probes
+15 each, `_col_dl_ic_g1` 13, `_dg_idx4` 9, `_GA_EPA_POLISH_COUNT` 8. Three families: white-box layout probes
 (spatial's 17 `_kd_node_*`/`_qt_node_*`/`_ot_node_*`/`_sh_*` accessors, `_bvh_node_*`), the
 instrumentation counters mutation-proven guards depend on (`_CGA_NULL_TBL`, `_GA_EPA_POLISH_COUNT`,
 `_CGA_NULL_COEF_BAD` — these need a public read-only getter, e.g. `cga_null_table_built()`, or
@@ -115,7 +116,9 @@ the naming convention** (decide before the flip — an underscore rename breaks 
 references measured): `EPSILON_F32` (error.cyr — its own comment says unused; retire it),
 `F64_1E_NEG30` and `F64_NINE` (calc_ext), `F64_THREE`..`F64_FIFTEEN` (calc), `F64_SIX_DG`
 (diffgeo — a copy of `F64_SIX` whose suffix only dodges the collision), `RenderLayout` (symbolic —
-scratch-buffer sizes). And `public struct GeoJet` + derive exports raw slot accessors and nine
+scratch-buffer sizes). ⚠ And one retirement already decided: `AdPowLimit` / `AD_POW_MAX_K`
+(autodiff) has not been consulted since 3.2.2 retired the loop it bounded. It was kept only because
+a patch release does not remove a public name, so remove it here. And `public struct GeoJet` + derive exports raw slot accessors and nine
 setters the module header says are reachable ONLY through the typed accessors: amend the header or
 wrap.
 
@@ -131,22 +134,21 @@ language agent reads them — **and closed in THIS repo too when a bump fixes th
 cyrius agent never edits hisab (the pattern: a hisab-side record in `issues/archived/` carrying the
 paired measurement, written on the bump that closes it).
 
-⭐ **The 2026-09-14 register-picker filing is CLOSED** — fixed upstream in cycc 6.6.5, hisab's pin
-crossed it in 3.2.1 with the paired measurement in
-`issues/archived/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md`. `m3_mul_vec3` keeps its hoisted
-z tail on its merits (every live consumer pins 6.6.2–6.6.4, below the fix); the comment says so.
+**No hisab-filed cyrius item is open.** The 2026-09-14 register-picker filing closed in 3.2.1 (fixed
+in cycc 6.6.5; `m3_mul_vec3` keeps its hoisted z tail because eight of the ten live consumers still
+pin below the fix — 6.6.2 or 6.6.3 — and the comment says so). The 2026-09-21 bench filing (`min`
+printed above `avg`) closed in 3.2.2: fixed in 6.6.9, verified as a pair (repro exit 1 on 6.6.6, 0 on
+6.6.9 and 6.6.12; hisab rows with `min > avg` 13/320 → 0/320), record in `issues/archived/`.
 
-⛔ **ONE hisab-filed toolchain item is OPEN** — filed 2026-09-21 as
-`cyrius/docs/development/issues/2026-09-21-hisab-bench-min-above-mean-below-resolution-bar.md` (+
-self-proving repro: exit 0 on 6.6.4, 1 on 6.6.5/6.6.6), recorded here as
-`issues/2026-09-21-cyrius-bench-min-above-mean-below-resolution-bar.md`. `lib/bench.cyr` 6.6.5 lets a
-window into `min`/`max` only if it clears a 100 × (clock read + tick) bar; a fixed 2000-op window for
-a sub-40 ns op sits under it and resolves only when perturbed, so the printed `min` is the minimum of
-the SLOW windows and sits above `avg` (`vec3_add: 16ns avg (min=39ns …)`, 24 of 320 rows, 7
-benchmarks). **No hisab number is wrong** — the CSV records `avg`, measured unmoved (median +0.00%) —
-but `min_ns`/`max_ns` for those seven rows are not comparable across 2026-09-21. No source change:
-widening `bench_batch` is a benchmark-shape change (2.20.0). When it closes: archive the record, and
-re-check whether `bench_run_batch`'s fixed windows still need the caveat in `benchmarks.md`.
+⛔ **ONE upstream item is OPEN, in ganita** — filed 2026-09-30 as
+`ganita/docs/development/issues/2026-09-30-f64-atan2-signed-zero-and-nan.md` (+ a repro checking 12
+rows of the C99 F.10.1.4 table by bit pattern; exits 5 on ganita 1.2.10), recorded here as
+`issues/2026-09-30-ganita-atan2-signed-zero-and-nan.md`. `ganita_f64_atan2` picks its quadrant with
+IEEE compares, so `atan2(-0, -1)` is +π (C99: −π), `atan2(±0, -0)` is 0 (C99: ±π), and
+`atan2(NaN, ±0)` is −π/2. It became reachable here in 3.2.2, when cyrius 6.6.8 made `cx_conj` carry
+a −0 into `cx_arg`. It is the unfinished half of ganita's own 2026-09-07 filing, which is marked
+resolved. **When it closes**: the two `KNOWN DEFECT (ganita atan2)` tripwires in
+`tests/edge_cases.tcyr` fail — flip them to −π and NaN, and archive the record.
 
 **`bench_run` auto-batching (6.5.19)** — already in force. The **39 `bench_batch()` call sites are
 deliberately unchanged**: they buy a FIXED window rather than escape the timer floor, which is still
@@ -199,19 +201,23 @@ indistinguishable once the reason is gone.
 ## Consumers
 
 **Ten repos consume `dist/hisab.cyr` today, SHA-locked** — read from each `cyrius.cyml` on
-2026-09-21: **prakash** on hisab **3.1.1** (cyrius 6.6.4; pinned 2026-09-15, `num_fft` through the
-`var rt, rv = …` idiom — the first live consumer past the `Result` break, which closed the roadmap
-item that said none had); svara, naad, goonj on **2.22.1**; dhvani, attn11, ghurni, prani, garjan,
-nidhi on **2.11.2**. Their cyrius pins are **6.6.3** (svara, naad, dhvani, ghurni, prani, garjan,
-nidhi), **6.6.4** (prakash) and **6.6.2** (goonj, attn11). `svara/src/spectral.cyr:246` calls `num_fft`.
+2026-09-30: **prakash** on hisab **3.2.1** (cyrius 6.6.6 since 2026-09-23; first past the `Result`
+break on 2026-09-15, `num_fft` through the `var rt, rv = …` idiom); svara, naad, goonj on **2.22.1**;
+dhvani, attn11, ghurni, prani, garjan, nidhi on **2.11.2**. Their cyrius pins are **6.6.3** (svara,
+naad, ghurni, prani, garjan, nidhi), **6.6.6** (prakash), **6.6.10** (dhvani) and **6.6.2** (goonj,
+attn11). `svara/src/spectral.cyr:246` calls `num_fft`.
 
 ⛔ **goonj and attn11 cannot take ANY hisab ≥ 3.1.0 until they move their cyrius pin**: `public
 struct` + `#derive` is refused by cycc 6.6.2 (`#derive(...) applies to a struct or an enum`), measured
-on the 3.1.0 and 3.2.1 bundles from a dir pinned to 6.6.2, while the 3.0.1 bundle compiles there.
-Under 6.6.3 and 6.6.4 the 3.2.1 bundle compiles and a consumer-shaped program runs correctly. ⚠ The
-pin matters to every consumer for a second reason: `_cga_build_null_tbl` keeps its `if`-guard form and
-`m3_mul_vec3` its hoisted z tail because a consumer compiles the bundle under its OWN cycc, and the
-natural forms are silently wrong below 6.6.3 and 6.6.5 respectively.
+on the 3.1.0, 3.2.1 and 3.2.2 bundles from a dir pinned to 6.6.2, while the 3.0.1 bundle compiles
+there. Under 6.6.3, 6.6.6, 6.6.10 and 6.6.12 the 3.2.2 bundle compiles and a consumer-shaped program
+runs correctly. ⚠ The pin matters to every consumer for three more reasons, because a consumer
+compiles the bundle under its OWN cycc:
+- `_cga_build_null_tbl` keeps its `if`-guard form and `m3_mul_vec3` its hoisted z tail, since the
+  natural forms are silently wrong below 6.6.3 and 6.6.5 respectively.
+- A zero produced by negation is −0 from **6.6.8** and +0 below.
+- `dual_pow` is within 1 ulp from **6.6.10**. Below that it takes the older ganita's `pow`, 137 ulp
+  at 0.9^1024 on 6.6.3 and 6.6.6. All of these were measured on the 3.2.2 bundle from pinned dirs.
 
 ⛔ **The remaining nine are still on 2.x, and the `Result` break's failure mode is silent**: a
 `Result` in *argument* position degrades to its tag, and `Ok` tag = 0 = `HSB_ERR_NONE`, so
@@ -223,7 +229,7 @@ bounded.
 ⛔ **impetus, kiran, joshua, aethersafha, hisab-mimamsa and kana are NOT consumers** — they have no
 `cyrius.cyml` on any branch. They are Rust repos needing a *port*, not a scheduling decision
 (verified 2026-09-09, and again 2026-09-14 for abaco: its README calls hisab a sibling, not a
-consumer; the ten live pins re-read 2026-09-21). The table below is what they *would* use, kept because it is the planning
+consumer; the ten live pins re-read 2026-09-30). The table below is what they *would* use, kept because it is the planning
 surface; it is not a statement that anything is wired up.
 
 | Planned consumer | Domain | Surface it will use |

@@ -87,7 +87,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   deduplicated digest is exactly how the six unscheduled 2026-08-03 findings stayed invisible for
   four releases. Every dated report in docs/audit/ now records a disposition per finding
 - Public entry points are exercised under **abuse**, not only under use: `tests/abuse.tcyr` (added
-  2.9.0, **904 assertions** today) drives negative indices, zero and huge dimensions, non-conformable
+  2.9.0, **911 assertions** today) drives negative indices, zero and huge dimensions, non-conformable
   operands, the designed-`0` return, degenerate geometry and heap canaries. It surfaced **11 real
   defects on public entry points**, held in a known-defect register rather than deleted. The register
   is discharged: nine repaired into live assertions, the tenth re-measured and reclassified

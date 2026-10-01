@@ -23,10 +23,17 @@ Add `"result"` to your `[deps] stdlib` list. `cyrius deps` picks it up from
 ⚠ **Minimum toolchain: hisab ≥ 3.1.0 needs cyrius ≥ 6.6.3.** 3.1.0 put `public` on every
 declaration, and `public struct` + `#derive(accessors)` is refused by cycc 6.6.2 with
 `#derive(...) applies to a struct or an enum; the following declaration is neither`. Measured
-(3.2.1, from a dir pinned to 6.6.2): the 3.0.1 bundle compiles, the 3.1.0 and 3.2.1 bundles do not;
-under 6.6.3 and 6.6.4 the 3.2.1 bundle compiles and runs correctly. If your `cyrius.cyml` pins
-6.6.2, bump it before — not after — moving `[deps.hisab] tag` past 3.0.1. (3.0.0 and 3.0.1
-themselves build on 6.6.2.)
+from dirs pinned to each version: the 3.0.1 bundle compiles under 6.6.2, and the 3.1.0, 3.2.1 and
+3.2.2 bundles do not. The 3.2.2 bundle compiles and runs correctly under 6.6.3, 6.6.6, 6.6.10 and
+6.6.12. If your `cyrius.cyml` pins 6.6.2, bump it before — not after — moving `[deps.hisab] tag`
+past 3.0.1. (3.0.0 and 3.0.1 themselves build on 6.6.2.)
+
+⚠ **Two results follow your toolchain, not hisab's.** A zero produced by negation (`cx_conj(7 +
+0i)`'s imaginary part, among others) is −0 from cyrius **6.6.8**, which made `f64_neg` an IEEE
+sign flip; below that it is +0. And `dual_pow` / `ad_pow` are within 1 ulp from **6.6.10**, whose
+ganita `pow` they now use; below it, they take the older ganita's (137 ulp at 0.9^1024 on 6.6.3 and
+6.6.6). Neither changes whether your build succeeds; compare zeros with `f64_eq`, not bit patterns,
+if your pins differ.
 
 ## ⛔ The one thing that will bite you
 

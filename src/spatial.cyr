@@ -1138,12 +1138,32 @@ public fn spatial_hash_query_cell(sh, point) {
 # and every stored entry qualifies.
 var _SH_MAX_SPAN_CELLS = 1000000000000000;   # 1e15
 
-# |a - b| <= r, written as one subtraction so it carries exactly the overflow
-# exposure the `tx = cx + dx` form it replaces already had.
+# |e - c| <= r, without wrapping.
+# ⛔ 3.2.2 — THE OLD FORM WAS `d = e - c; if (d < 0) { d = 0 - d; }`, AND BOTH
+# HALVES WRAP. `e - c` overflows when e and c straddle 0 by more than 2^63, and
+# `0 - d` is a no-op at i64::MIN, so an entry in cell i64::MIN (x = -Inf, or x at or
+# below -2^63 cells) matched EVERY flat-scan query centred at cell 0: radius 1 at
+# the origin returned the points at -Inf. Measured on cycc 6.6.6 and 6.6.12 alike;
+# on 6.6.6 x86 also sent NaN and +huge coordinates to i64::MIN. A difference that
+# wraps is larger than any r, so it is out of range. Pinned in tests/abuse.tcyr.
+# [measured: tests/abuse.tcyr, group "3.2.2 spatial hash"]
 fn _sh_within(e, c, r) {
     var d = e - c;
-    if (d < 0) { d = 0 - d; }
+    if (e >= c) {
+        if (d < 0) { return 0; }
+    } else {
+        d = c - e;
+        if (d < 0) { return 0; }
+    }
     if (d <= r) { return 1; }
+    return 0;
+}
+
+# 1 when a cell coordinate lies within r of either end of the i64 range, so that
+# `c + dx` for |dx| <= r would wrap onto the other end.
+fn _sh_near_end(c, r) {
+    if (c > 0x7FFF_FFFF_FFFF_FFFF - r) { return 1; }
+    if (c < (0 - 0x7FFF_FFFF_FFFF_FFFF - 1) + r) { return 1; }
     return 0;
 }
 
@@ -1200,6 +1220,13 @@ public fn spatial_hash_query_radius(sh, point, radius) {
     } else {
         var w = 2 * cells_r + 1;
         if (w * w * w > nentries) { full_scan = 1; }
+    }
+    # ⛔ 3.2.2 — the cell walk below forms `tx = cx + dx`, which WRAPS when the centre
+    # sits within cells_r of either end of the i64 cell range (x = +-Inf, or past
+    # +-2^63 cells): a query at +Inf probed cell i64::MIN and returned the points at
+    # -Inf. The flat scan's `_sh_within` cannot wrap, so such a centre takes it.
+    if (_sh_near_end(cx, cells_r) + _sh_near_end(cy, cells_r) + _sh_near_end(cz, cells_r) > 0) {
+        full_scan = 1;
     }
 
     # FLAT SCAN over the entry list. Every entry carries its own (ix, iy, iz), so

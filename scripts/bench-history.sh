@@ -62,10 +62,15 @@ BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
 # rows, 1 row past 10% and that row inside its own 14.5% same-binary spread. The
 # `avg` this file records is comparable across it; the `min_ns`/`max_ns` columns
 # are NOT for the seven sub-40 ns rows whose fixed 2000-op window sits under the
-# bar (see docs/development/issues/2026-09-21-cyrius-bench-min-above-mean-*.md).
+# bar (see docs/development/issues/archived/2026-09-21-cyrius-bench-min-above-mean-*.md).
 # The tick the new harness prints beside the floor is captured below and echoed,
 # so a reader of the run log can tell the two instruments apart even though the
 # column does not. [measured: 2026-09-21, scratch A/B/C harness]
+#
+# 3.2.2 (cyrius 6.6.6 -> 6.6.12): 6.6.9's bench.cyr decides min/max per ROW by op
+# count ("regime 6" upstream) and fixes the min-above-avg rows above; `avg` again
+# measured unmoved (harness half median +0.00% over 80 rows, same A/B/C method), so
+# `regime` stays `net`. [measured: 2026-09-30, scratch A/B/C harness]
 CSV_HEADER="timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters,regime,floor_ns"
 if [ ! -f "$HISTORY_FILE" ]; then
     echo "$CSV_HEADER" > "$HISTORY_FILE"
@@ -290,6 +295,20 @@ with open(md_file, "w") as f:
     # the most recent entry here that affects it — the CSV cannot express that on
     # its own, and a silent step change reads as a win.
     f.write("> **Measurement changes** — read before comparing across a date.\n"
+            "> * **2026-09-30** (hisab 3.2.2, cyrius 6.6.6 → 6.6.12): `lib/bench.cyr` 6.6.9 decides\n"
+            ">   `min`/`max` for the ROW by op count rather than per window, which ends the caveat in\n"
+            ">   the next entry: rows under the resolution bar now print `min = max = avg`, and the\n"
+            ">   per-op line reports `E of W windows eligible`. **The `avg` this table trends did not\n"
+            ">   move**: three binaries interleaved ×4 on a quiet box (6.6.6 compiler + 6.6.6 harness /\n"
+            ">   6.6.12 compiler + 6.6.6 harness / 6.6.12 + 6.6.12) put the harness half at median\n"
+            ">   **+0.00%**, and the whole bump at median +0.25% over 80 rows. Rows with `min > avg`\n"
+            ">   went 13/320 → **0/320**. Two rows moved for real, and the cause is not the\n"
+            ">   instrument: `srgb_to_linear` **+96%** (ganita 1.2.8's fdlibm `pow` — within 1 ulp,\n"
+            ">   ~2× the cost) and `quat_slerp` **−29%** (6.6.9's software `sin`/`cos`, faster than\n"
+            ">   x87 `fsin` at these arguments). `regime` stays `net`. ⚠ The 2026-09-30 rows were\n"
+            ">   taken on **hpet**: the kernel marked the TSC unstable at boot (frequency skew), so\n"
+            ">   `floor_ns` is ≈ 1,328 against ≈ 337 for the 2026-09-22 rows. The same-boot A/B/C\n"
+            ">   above is the comparison; the trend columns straddle two clocksources.\n"
             "> * **2026-09-21** (hisab 3.2.1, cyrius 6.6.4 → 6.6.6): `lib/bench.cyr` 6.6.5 rewrote\n"
             ">   16 of its 25 functions — `min`/`max` only from windows that clear a resolution bar\n"
             ">   (100 × clock read + tick), the raw total netted at read time instead of per-window\n"
@@ -305,7 +324,7 @@ with open(md_file, "w") as f:
             ">   `num_gcd`): under 6.6.5+ only a perturbed window resolves there, so the printed `min`\n"
             ">   is the minimum OF THE SLOW WINDOWS and sits above `avg` (`vec3_add: 16ns avg\n"
             ">   (min=39ns …)`). Filed upstream with a self-proving repro\n"
-            ">   (`docs/development/issues/2026-09-21-cyrius-bench-min-above-mean-*.md`).\n"
+            ">   (`docs/development/issues/archived/2026-09-21-cyrius-bench-min-above-mean-*.md`).\n"
             ">   ⚠ Separately, the rows dated 2026-09-14 and earlier were taken on a previous BOOT\n"
             ">   (kernel 7.2.3, `floor_ns` ≈ 1,340); the box rebooted 2026-09-18 (7.2.6, tsc,\n"
             ">   `floor_ns` ≈ 337) and the geometry/collision family reads 15–37% slower while the\n"

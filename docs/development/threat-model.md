@@ -111,11 +111,12 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
   **sakshi**. No FFI, no libc. Third-party-CVE attack surface is zero.
 - Integrity enforced by the SHA-locked `cyrius.lock`: 32 entries, 1 commit-pinned, and since
   cyrius 6.6.4 a `cyrius\t<pin>` trailer; `cyrius deps --verify` → 32 verified / 0 failed;
-  `cyrius vet` → 2 deps, 0 untrusted, 0 missing (verified 2026-09-21 on the 6.6.6 pin).
+  `cyrius vet` → 2 deps, 0 untrusted, 0 missing (verified 2026-09-30 on the 6.6.12 pin).
   All 31 vendored stdlib `lib/*.cyr` files byte-match the **cyrius git tag** for the pin
-  (`git -C ~/Repos/cyrius show "6.6.6:lib/<f>"` — quoted, or zsh reads `:l` as a modifier),
-  and `lib/sakshi.cyr` its 2.5.2 tag. On 2026-09-21 all five installed slots 6.6.2–6.6.6 also
-  byte-matched their tags (103–104 files each), so the 6.6.4 repairs below hold on this box;
+  (`git -C ~/Repos/cyrius show "6.6.12:lib/<f>"` — quoted, or zsh reads `:l` as a modifier),
+  and `lib/sakshi.cyr` its 2.5.6 tag. On 2026-09-30 the six installed slots this bump used
+  (6.6.2, 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12) also byte-matched their tags (103–104 files each),
+  so the 6.6.4 repairs below hold on this box;
   the rule below stays because the reference must be immutable, not merely currently right.
   ⛔ The reference is the TAG, never `~/.cyrius/versions/<pin>/lib/`: that directory is
   mutable. First seen 2026-08-07 (the 6.5.9 slot refreshed in place after 2.9.1 shipped),
@@ -190,3 +191,25 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
   6.6.2 refuses every 3.1.0+ bundle (`public struct` + `#derive`), so a consumer on 6.6.2 that
   bumps `[deps.hisab]` past 3.0.1 gets a build failure, not a silent one — stated in README and the
   migration guide.
+- **2026-09-30**: Cyrius 6.6.6 → **6.6.12** toolchain bump (v3.2.2), crossing 6.6.7–6.6.11;
+  ganita 1.2.6 → 1.2.9, sakshi 2.5.2 → 2.5.6. The vendored tree byte-matches the tags, and the lock
+  is 32/32.
+  - **Security content, checked for exposure rather than assumed.** These releases fix **CVE-46 to
+    CVE-58**. hisab is not exposed to any of them:
+    - CVE-46–48, `defer`/`secret var`: none in hisab.
+    - CVE-49, `cyrius self` staging in shared `/tmp`: CI does not call it.
+    - CVE-50, 53, 54, 56, 57: http, ws, the resolver and `log_info_kv` buffers. hisab does no
+      networking or logging.
+    - CVE-51 (macOS) and CVE-58 (cxvm): targets hisab does not build.
+    - CVE-52, a stray `@` accepted: none outside comments.
+    - ⭐ **CVE-55, a visibility bypass.** A multi-line string literal shifted file attribution, so a
+      call to another file's `private` fn compiled. hisab has no multi-line string, and its
+      public-surface gate probes calls, so a bypass would show as an accepted private item. It reads
+      891 public / 458 non-public refused, unchanged.
+  - **The change that matters here is correctness.** 6.6.8's IEEE `f64_neg` and saturating `f64_to`,
+    6.6.10's float typing of builtin results, and ganita 1.2.8's `pow` changed 14 assertions'
+    results, each checked (CHANGELOG 3.2.2).
+  - **One upstream filing from this bump, not security-relevant.** ganita's `atan2` ignores a zero's
+    sign and answers NaN at x = ±0 with −π/2. It was filed in ganita with a repro and is pinned here
+    as a tripwire.
+  - **The 2026-09-21 bench filing closed.** It was fixed in 6.6.9 and verified as a pair.

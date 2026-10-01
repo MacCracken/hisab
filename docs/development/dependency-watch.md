@@ -4,9 +4,25 @@ Tracked dependency version constraints and upgrade paths.
 
 ## Cyrius Toolchain
 
-**Status:** Pinned to **6.6.6** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
+**Status:** Pinned to **6.6.12** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
 
 **Note:** Cyrius stdlib provides dense LU, Cholesky, QR, SVD, eigendecomposition. As of 6.2.x these live in the new **`ganita`** umbrella module (which re-exports the former `matrix`/`linalg` API in full and also hosts the transcendentals). This is a critical dependency — hisab's `linalg_ext.cyr` wraps these functions. The `[deps] stdlib` list pulls `ganita` (not `matrix`/`linalg` — listing those alongside `ganita` collides).
+
+**Compiler limits the bundle must fit.** `dist/hisab.cyr` is one source file, and a consumer's
+cycc must accept it whole. Two caps apply, and the token cap can bind before the byte cap:
+
+| cap | value | where (cyrius 6.6.12 tag) |
+|---|---|---|
+| expanded source | 25,165,824 B (24 MiB) | `src/frontend/lex_pp.cyr:4197` (`op > 25165824`; also `:4533`, `:4644`) |
+| tokens | 4,194,304 | `src/frontend/lex.cyr:273` (`tc >= 4194304`) |
+
+The bundle is 1,122,218 B at 3.2.2, 4.46% of the byte cap, so there is no size pressure. The history of
+these figures is in CHANGELOG 2.11.3. That release measured both caps as a pair: a 9,002,640 B
+source was rejected by 6.5.33 and compiled on 6.6.1. It also found the token cap binding first, at
+8.2 MB. The 1 MB and 16 MB figures quoted before it both described `_SRC_CAP`, the raw read buffer,
+which is not what rejects a consumer's build. **On every toolchain bump, re-derive both caps by
+grepping the new TAG, and check which one binds.** A limit taken from a dependency is a measurement,
+and it goes stale silently.
 
 **Upstream notes (5.x line):**
 - 5.0+: `lib/matrix.cyr` overflow class addressed; SVD precision improvements landed.
@@ -20,7 +36,40 @@ Tracked dependency version constraints and upgrade paths.
 - 6.0.2: lockfile/vendoring fix — `cyrius deps` now hashes all `.cyr` under `lib/` and writes a real lock (the empty 0-byte `cyrius.lock` bug present since 5.11.8); vendored deps are regular file-copies, not the dangling symlinks that broke CI.
 - **6.0.14**: clean build/test (901/901 as of v2.4.6). Migration was manifest-only (pin bump + sakshi resolution); the 34 math modules moved `lib/`→`src/` so the committed `lib/` no longer shadows the toolchain's version-pinned stdlib snapshot.
 - **6.2.11** (v2.6.6): stdlib math reorg. The transcendentals (`f64_acos`/`f64_asin`/`f64_atan2`/`f64_pow`/`f64_sinh`/`f64_cosh`/`f64_tanh` + hyperbolic inverses) moved out of `math` into the new **`ganita`** module, which also subsumes `matrix`/`linalg` (re-exports their full API). `math` now ships NaN-correct `f64_le`/`f64_ge` (hisab dropped its local copies). `[deps] stdlib`: `+ganita`, `−matrix`, `−linalg`. Clean build, 957/957 tests, all gates green. Tracked-issue re-verify: **3 of 5 fixed** (modules-substring, 18-arg-fn scramble, lint rc-as-count → all archived); for-empty-clauses still open. Vendored `lib/` re-resolved via `cyrius deps` (30 files — **not** the full-snapshot `cyrius lib sync`, which over-vendors unused platform variants and breaks `deps --verify` on a spurious `process_agnos.cyr` entry); `cyrius.lock` 30 deps, verify 30/30.
-- **6.6.6** (current pin, v3.2.1; crossed **6.6.5** in the same bump): **6.6.5 repairs the
+- **6.6.12** (current pin, v3.2.2; crossed 6.6.7–6.6.11): **the first bump that changed hisab's
+  results** — 14 assertions failed, none a hisab regression.
+  - **Float semantics.** 6.6.8 made x86 `f64_neg` an IEEE sign flip: `f64_neg(+0)` is −0, where it
+    had computed `0.0 − x`. It also made `f64_to` saturate by sign, with NaN → 0; x86 had returned
+    i64::MIN for all three cases. 6.6.10 made a float builtin's result used as a `+ − * /` operand a
+    float operation. All three were confirmed by one probe from dirs pinned to 6.6.6, 6.6.9, 6.6.10
+    and 6.6.12.
+  - **Exposure.** hisab has no typed floats, no float unary minus and no builtin-arithmetic shapes.
+    The −0 change was sized by a differential: the suites built twice, with and without the old
+    negation, with every checked value logged. The only differences are 11 zeros. The 6.6.9 x86
+    `sin`/`cos` polyfill (within 1 ulp) moved no assertion.
+  - **Stdlib.** 25 stdlib files and sakshi moved, and none were added. 31/31 byte-match the 6.6.12
+    tag and `sakshi.cyr` matches 2.5.6's `dist/`; the lock is 32/32. Comment-stripped body diffs:
+    - **ganita 1.2.6 → 1.2.9** changes only `ganita_f64_pow` (1.2.7: the C99 Annex F table; 1.2.8:
+      fdlibm `e_pow` for every finite case, within 1 ulp) and `ganita_f32_sin`/`cos`.
+    - `math.cyr` changes only its polyfills.
+    - `bench.cyr` 6.6.9 decides `min`/`max` per row, which closes hisab's 2026-09-21 filing.
+    - `alloc.cyr` maps Linux chunks `MAP_NORESERVE`, with a 16 MiB fallback grain.
+  - **Consequences in hisab.** `_ad_pow`'s loop is retired: ganita 1.2.9 is within 1 ulp on all 2,088
+    oracle pairs, and the loop fabricated 0 for subnormal results. `ev100_to_luminance(±inf)` is now
+    ±inf/+0 rather than NaN. `ganita_f64_pow(1.1, 2.5)` costs ~90 → ~174 ns, and `srgb_to_linear`
+    +96% follows from it.
+  - **Filed.** ganita's `atan2` ignores a zero's sign; see the ganita filing and
+    `issues/2026-09-30-ganita-atan2-signed-zero-and-nan.md`.
+  - **Checked, not exposed:** 6.6.7's `#derive` width rewrite, 6.6.9's undefined-call refusal and
+    duplicate-symbol warning, 6.6.11's lint pre-pass and `cyrius test` tally rule, and `distlib`'s
+    five-target verify. All pass.
+  - **Consumers.** The 3.2.2 bundle runs correctly under 6.6.3, 6.6.6, 6.6.10 and 6.6.12, and is
+    refused under 6.6.2. Two results follow the consumer's pin: −0 from negation (6.6.8+), and
+    `dual_pow` within 1 ulp (6.6.10+).
+  - **Caps and coverage.** Both caps are unchanged on the tag (see **Compiler limits the bundle must
+    fit** above). `cyrius coverage` reads 642/643 over 35/35 files, because 6.6.11 stopped counting
+    `main.cyr`.
+- **6.6.6** (v3.2.1; crossed **6.6.5** in the same bump): **6.6.5 repairs the
   register-picker wrong-code defect hisab filed on 2026-09-14** (`_ra_plain_slot_mov` — one
   predicate shared by the picker's three stages; wider than filed: every batch intrinsic, any
   `#inline`/derived call nested in another inline call's argument), closed in hisab with a paired
@@ -176,9 +225,9 @@ Tracked dependency version constraints and upgrade paths.
     buffer and caches it, instead of scanning a fixed 8 KB stack window on every call. Nothing in
     the vendored subset calls `getenv`, so hisab is unaffected either way.
   - ⚠ **Two compiler ceilings moved, and neither is the one this repo had written down.** Expanded
-    source **8 MB → 24 MB**; token count **1,048,576 → 4,194,304**. See the corrected comment in
-    `cyrius.cyml` — the retired "16 MB `input_buf`" figure described `_SRC_CAP`, which is not what
-    rejects a consumer's build.
+    source **8 MB → 24 MB**; token count **1,048,576 → 4,194,304**. See **Compiler limits the
+    bundle must fit** above (the figures lived in a `cyrius.cyml` comment until 3.2.2) — the retired
+    "16 MB `input_buf`" figure described `_SRC_CAP`, which is not what rejects a consumer's build.
 
 - **6.5.33** (v2.11.2): **fifteen-release bump from 6.5.18** — the largest gap this
   file has recorded. Not compiler-only: **ganita 1.0.4 → 1.1.4**, plus `fmt.cyr`, `assert.cyr`,
@@ -298,7 +347,7 @@ The rows above are exactly the 16 names in `cyrius.cyml [deps] stdlib` (three ro
 
 ## sakshi (first-party dependency)
 
-**Status:** `sakshi` **2.5.2** via git, modules path `dist/sakshi.cyr` (2.5.1 → 2.5.2 in v3.0.1, a one-header-line refold; 2.4.11 → 2.5.1 in v2.11.3; commit-pinned in `cyrius.lock`, and byte-identical to what cyrius 6.6.1 folds into its own `lib/` — same SHA256, 76,277 B, so the vendored copy and the pinned dep agree rather than one shadowing the other). Its shipped surface still links only `fnptr` + `atomic`.
+**Status:** `sakshi` **2.5.6** via git, modules path `dist/sakshi.cyr` (2.5.2 → 2.5.6 in v3.2.2 — `src/clock.cyr` only: 2.5.4 anchors timestamps to the reference clock so processes on one host agree, 2.5.5 stops a stalled calibration window installing a garbage rate, 2.5.3/2.5.6 are a pin bump and comments; hisab calls none of it; 2.5.1 → 2.5.2 in v3.0.1, a one-header-line refold; 2.4.11 → 2.5.1 in v2.11.3; commit-pinned in `cyrius.lock`, and byte-identical to what cyrius 6.6.1 folds into its own `lib/` — same SHA256, 76,277 B, so the vendored copy and the pinned dep agree rather than one shadowing the other). Its shipped surface still links only `fnptr` + `atomic`.
 
 **2.5.0 / 2.5.1 change no public surface.** Diffing the exported `fn` list across the bump shows
 only private helpers moving: `_sk_bin_read_hdr`, `_sk_bin_write_hdr`, `_sk_memset` and `_sk_ring_put`

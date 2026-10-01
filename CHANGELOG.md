@@ -2,6 +2,292 @@
 
 ## [Unreleased]
 
+## [3.2.2] - 2026-09-30 — cycc 6.6.12: IEEE negation reaches hisab, ganita's pow retires `_ad_pow`'s loop, and the manifest stops being a ledger
+
+Toolchain **6.6.6 → 6.6.12**, crossing 6.6.7–6.6.11. ganita moves **1.2.6 → 1.2.9** and sakshi
+**2.5.2 → 2.5.6**. All 32 vendored files byte-match their tags: 31 match cyrius 6.6.12 and
+`sakshi.cyr` matches sakshi 2.5.6's `dist/`. The lock verifies 32/32, and no file was added.
+Suites go from **4429 to 4443**, all passing.
+
+⛔ **This bump changed hisab's results, which the last three did not.** 14 assertions failed on the
+first run, in four groups. None of them was a hisab regression. Each was a correct upstream change
+meeting a test, or a code path, that had been written against the old behaviour.
+
+### What changed underneath — measured from pinned dirs, not read off the changelog
+
+One probe was compiled from scratch dirs pinned to 6.6.6, 6.6.9, 6.6.10 and 6.6.12, each confirmed
+by `cyrius build -v`:
+
+| expression | 6.6.6 | 6.6.9 | 6.6.10 and 6.6.12 |
+|---|---|---|---|
+| `f64_neg(+0)` | +0 | **−0** | −0 |
+| `f64_to(NaN)` / `f64_to(+1e300)` | i64::MIN / i64::MIN | **0 / i64::MAX** | same |
+| `f64_abs(2) + f64_abs(2)` | integer add of the bit patterns | integer add | **float add, 4.0** |
+
+- **6.6.8**: x86's `f64_neg` became a sign-bit flip. It used to compute `0.0 − x`, which gives +0 for
+  +0 and keeps a NaN's sign. `f64_to` now saturates by sign and maps NaN to 0; on x86 it had
+  returned i64::MIN for all three cases. ganita **1.2.7** made `pow` follow the C99 Annex F
+  special-value table.
+- **6.6.9**: x86 `f64_sin`/`f64_cos` now call a software polyfill (within 1 ulp) instead of x87
+  `fsin`/`fcos`. `lib/bench.cyr` decides `min`/`max` per row (below).
+- **6.6.10**: a float builtin's result used as an operand of `+ − * /` is now float arithmetic.
+  ganita **1.2.8** sends every finite `pow` through fdlibm's `e_pow` core, within 1 ulp.
+
+**hisab's exposure, checked**:
+
+- **Absent**: no unary minus on a float, no `: f64` declarations, and no vendored stdlib function
+  declared `): f64`, so no hisab local is float-typed through return inference.
+- **Absent**: no float-builtin result is used as an arithmetic operand, except `f64_to` (an integer)
+  at two benchmark sites. This was checked with a balanced-parenthesis scan. Comparisons were
+  measured and are unchanged: still bit compares on both pins.
+- **`f64_to`, 17 code sites before this release (16 after `_ad_pow`'s went with the loop)**:
+  - The renderers, `_ad_pow` and the radius query's span bound their argument before converting.
+  - The Perlin and simplex lattice sites mask with `& 255`. A lattice point's noise is 0 either way.
+  - ⚠ The spatial-hash cell index (`_sh_cell_coord`) does neither. A NaN coordinate now lands in cell
+    0 rather than i64::MIN, as it always did on aarch64. So `spatial_hash_query_cell` near the origin
+    returns an entry inserted at a NaN point: 0 → 1 entries, measured on both pins. The documented
+    contract has always been that every coordinate, NaN and ±Inf included, maps to *some* cell and
+    insertion never fails; which cell is unspecified. This is recorded, not changed. Checking it is
+    what found the wrap defect under **Fixed**.
+  - Two comments described the old x86 value as a fact (`src/symbolic.cyr`, `tests/modules.tcyr`).
+    They now say what each toolchain returns.
+- ⭐ **−0 from `f64_neg`, the one live change, sized by a differential rather than by a grep.** The
+  five suites were built twice under 6.6.12:
+  - once as shipped;
+  - once with every `f64_neg(x)` in `src/` rewritten to `f64_sub(0, x)`, which reproduces the old x86
+    semantics bit for bit.
+
+  In both builds, every value `assert`/`assert_eq` checked was logged. Across ~4,430 checks, the
+  **only** differences are the 11 zero results that became −0, plus heap addresses. No non-zero
+  value moved and no branch flipped. No integer sign or zero test in `src/` is applied to a float,
+  and the float sign helpers use IEEE compares.
+
+### Fixed
+
+- **autodiff — `dual_pow` and `ad_pow` returned a fabricated 0 for subnormal results.** `_ad_pow`'s
+  repeated-multiplication loop formed base^|n| and took its reciprocal. Wherever base^|n| overflowed
+  while base^n is a representable subnormal, it returned **0**. That happened for **201 of 36,864**
+  (base, n) pairs, over 36 bases and every n in −1024..−1: 10^−309 … 10^−323, and 2^−1024.
+
+  ⛔ **The loop's remaining reason to exist had also inverted.** 2.11.4 kept it because ganita
+  1.2.4's binary exponentiation was 137 ulp out at 0.9^1024, where the loop was 7 out. ganita 1.2.8
+  replaced that path. Against an exact rational oracle over 2,088 pairs (|n| ≤ 1024, 36 bases of
+  both signs), ganita 1.2.9 is **within 1 ulp on all of them**, correctly rounded on 1,964. The
+  loop was worse on 1,110 pairs and better on 26, by 1 ulp each.
+
+  The loop is retired, and `_ad_pow` now works in two parts:
+  - **x^2, x^1 and x^−1** stay as one IEEE operation each. Those are exactly the exponents whose C99
+    `pow` is a single correctly-rounded operation, special values included, and they are 0 ulp on
+    all 36 bases.
+  - **every other exponent** goes to `ganita_f64_pow`.
+
+  ⚠ **The cost is stated, not waved past.** Per call:
+
+  | exponent | before (loop) | after |
+  |---|---|---|
+  | x^2, x^1, x^−1 | ~10 ns | ~10 ns (unchanged) |
+  | 3 | ~11 ns | ~180 ns (ganita) |
+  | 64 | 145 ns | 187 ns |
+  | 1024 | 2.37 µs | 188 ns — **12× faster** |
+
+  No benchmark row, example or live consumer calls `dual_*` or `ad_*`.
+
+  A new 16-assertion group goes through the public entry points; it replaces 15 that called
+  `_ad_pow` directly or pinned ganita 1.2.4's error. Reinstating the 3.2.1 loop fails its 4 value
+  assertions. Three mutants of the fast path are each killed. ⚠ One of them survived the first draft
+  — nothing read x^1 or d/dx x^2 — and the block was strengthened until it died.
+
+  ⚠ **The consumer's toolchain decides the accuracy.** A consumer compiles the bundle against its own
+  ganita. Below cyrius 6.6.10, `dual_pow` now takes that ganita's `pow`: measured from dirs pinned to
+  6.6.3 and 6.6.6, 0.9^1024 is **137 ulp** out, where the loop gave 7. `AdPowLimit` is kept as a
+  public name that is no longer consulted. Removing a public name is a breaking change, so its
+  removal is scheduled for 4.0.0.
+
+- **spatial — `spatial_hash_query_radius` returned the points at −inf for a radius-1 query at the
+  origin.** Both query paths wrapped at the ends of the i64 cell range:
+  - **The flat scan** computed |e − c| as `d = e − c; if (d < 0) { d = 0 − d; }`, and `0 − d` is a
+    no-op at i64::MIN. So an entry in cell i64::MIN (x = −inf, or at or below −2^63 cells) matched
+    every flat-scan query centred at cell 0.
+  - **The cell walk** formed `tx = cx + dx`, which wraps when the centre is within `cells_r` of
+    either end, so a query at +inf probed cell i64::MIN.
+
+  The 3.2.1 code returns 2 wrong entries in each case, on 6.6.6 and 6.6.12 alike. The defect is
+  pre-existing: the source comment had accepted the "overflow exposure". It was found while checking
+  what 6.6.8's `f64_to` change did to spatial-hash cells (above).
+
+  Now `_sh_within` treats a wrapped difference as out of range, and a centre near either end takes
+  the flat scan. Three assertions pin it: one per path, plus a control. Each repair is
+  mutation-proven: the old `_sh_within` fails both path assertions, and removing the centre guard
+  fails the cell-walk one. ⚠ **Cost, measured on the same compiler** (no benchmark row covers
+  `query_radius`): the cell walk goes 1,988 → 2,000 ns per query (+0.6%), and the flat scan over 300
+  entries 4,291 → 4,439 ns (+3.4%).
+
+- **symbolic — `expr_eval`'s undefined-variable warning was split across two streams.** The prefix
+  and newline went to fd 2, but the variable name went to fd 1 through `str_print`. A harness that
+  captures the streams separately got the name orphaned on stdout. This is the shape `lib/assert.cyr`
+  repaired in its own FAIL line at 6.5.19. 6.6.12's test runner interleaves the streams differently,
+  and that moved this suite's output, which is how it was found. The whole warning now goes to fd 2.
+  It is pinned in-suite by capturing both fds through pipes, and the 3.2.1 code fails both assertions.
+
+### Changed
+
+- **tests — 11 assertions pinned a zero's sign that 6.6.8 flipped.** Ten of those signs are
+  incidental:
+  - `geodesic_deviation` ×4, `m4_inverse(I)`, `hquat_inverse` at a subnormal q, `dual_cos`'s
+    derivative at 0, the two friction clamps, `perlin_3d` at a lattice point and `cga_rotor`.
+  - They are now compared as values: `f64_eq(x, 0) == 1`, which still fails for a NaN or any residue.
+    This follows the 2.13.0 precedent at `tests/edge_cases.tcyr:116`, and each message says the value
+    is −0.0.
+  - ⛔ The friction comment asserted the old semantics as a contract ("exactly +0 (not -0:
+    f64_neg(+0) is +0)"). It now says why the zero is −0 and why the sign does not matter.
+
+  One is not incidental. `conj(7 + 0i)` is **7 − 0i** under C99 G.6, and the sign is what puts
+  `conj z` on the other side of a branch cut. It is asserted as −0.0 bits.
+
+- **tests — `ev100_to_luminance(+inf)` asserted NaN, and NaN was ganita's defect.** Luminance is
+  2^(EV − 3)·12.5/π, and ganita ≤ 1.2.6 returned NaN for `pow(2, +inf)`. It is now asserted as +inf,
+  with −inf → +0 and NaN → NaN beside it so that a fabricated finite value fails all three.
+
+- **tests — `ganita_f64_pow(0.9,1024) is >100 ulp out`** pinned ganita 1.2.4–1.2.7's inaccuracy and
+  failed when 1.2.8 repaired it. It is replaced by the `dual_pow` group above. The ganita
+  bit-exactness checks for (−2)^3, (−2)^4, (−2)^5 and 2^10 stay.
+
+- ⭐ **cyrius.cyml — the comment block is gone, and the manifest is a manifest again.** It held 44
+  lines that either went stale each release or repeated this file:
+  - a bundle size;
+  - an "all 35 modules ship (… since 2.2.2)" note;
+  - a narrative of the compiler ceilings.
+
+  What remains is four lines: what `[lib]` is, why its order is load-bearing, and a pointer to the
+  per-module dependency table in `docs/architecture/overview.md`. 124 → 80 lines, with the same keys
+  and the same lists. The standing facts — both caps, where each lives on the tag, and the rule to
+  re-derive both on every bump — are in `docs/development/dependency-watch.md` under "Compiler limits
+  the bundle must fit". Their history was already in 2.11.3 below.
+
+  Both caps were re-derived on the 6.6.12 **tag** and are unchanged: `op > 25165824` at
+  `lex_pp.cyr:4197` (also :4533 and :4644), and `tc >= 4194304` at `lex.cyr:273`. The bundle is
+  **1,122,218 B / 26,620 lines = 4.46%** of the byte cap.
+
+- **cyrius.cyml, lib/, cyrius.lock** — pin `6.6.12`, sakshi tag `2.5.6`.
+  - 25 stdlib files and `sakshi.cyr` moved. `fmt`, `fnptr` and four platform variants are unchanged.
+  - Bodies were diffed with comments stripped. `ganita.cyr` changed only `ganita_f64_pow` (plus five
+    new `_gn_pow_*` helpers) and `ganita_f32_sin`/`cos`. `math.cyr` changed only its polyfills.
+    `alloc.cyr` maps its Linux chunks `MAP_NORESERVE` and falls back to a 16 MiB grain when the
+    kernel refuses the default one; the abuse suite's allocation-refusal checks pass unchanged.
+    `io.cyr`'s 11 changed and 6 added functions are file and environment routines hisab does not
+    call. The rest add `include` lines, refused-allocation checks, or code for other platforms.
+  - The lock trailer is `cyrius 6.6.12`.
+- **dist/** — regenerated. `hisab.deps` is unchanged at 16 leaves, and `distlib`'s new five-target
+  bundle verification (6.6.9 and 6.6.11) passes.
+- **scripts/bench-history.sh**, **benchmarks.md** — a dated 2026-09-30 bullet (below). The two
+  references to the bench filing now point into `archived/`.
+- **ci.yml** — a comment said the public-surface gate reaches 890 public items. It reaches 891, and
+  has since 3.2.0.
+
+### Filed upstream
+
+- **ganita — `atan2` ignores the sign of a zero, and answers a NaN `y` at `x = ±0` with −π/2.** It
+  picks its quadrant with IEEE compares, which cannot see −0:
+
+  | call | ganita | C99 |
+  |---|---|---|
+  | `atan2(-0, -1)` | +π | −π |
+  | `atan2(±0, -0)` | 0 | ±π |
+  | `atan2(NaN, 0)` | −π/2 | NaN |
+
+  It was unreachable from hisab until 6.6.8. Now `cx_conj` carries a −0 into `cx_arg`, and
+  `cx_arg(cx_conj(-1+0i))` returns +π, not −π.
+
+  ⛔ **This is the unfinished part of ganita's own 2026-09-07 filing.** That filing named "atan2 also
+  inverts the branch cut at negative zero" and is marked "RESOLVED in 1.2.4 … all four groups
+  closed", but `ganita_f64_atan2` is byte-identical from 1.2.4 through 1.2.10.
+
+  Filed as `ganita/docs/development/issues/2026-09-30-f64-atan2-signed-zero-and-nan.md`, with a repro
+  that checks 12 rows of the C99 table by bit pattern and **exits 5** on ganita 1.2.10. hisab's
+  record is `docs/development/issues/2026-09-30-ganita-atan2-signed-zero-and-nan.md`. The two wrong
+  answers are pinned in `tests/edge_cases.tcyr` as a **tripwire** that fails when ganita repairs
+  them.
+
+### Closed
+
+- **The 2026-09-21 bench filing — `min` printed above `avg` — is fixed upstream in 6.6.9** (bite 6).
+  It was verified as a pair from pinned dirs, not read off the changelog:
+  - the self-proving repro exits **1** on 6.6.6 and **0** on 6.6.9 and 6.6.12;
+  - rows with `min > avg` on hisab's suite go **13/320 → 0/320**.
+
+  The record is archived with the measurement. No hisab-filed cyrius compiler or tooling item is
+  open; the one open upstream item is the ganita filing above.
+
+### Consumers — read from the ten manifests
+
+- **prakash** is on hisab **3.2.1** with cyrius 6.6.6. It moved from 3.1.1 / 6.6.4 on 2026-09-23.
+- **dhvani** pins cyrius **6.6.10** and is still on hisab 2.11.2.
+- svara, naad and goonj are on 2.22.1. attn11, ghurni, prani, garjan and nidhi are on 2.11.2.
+- cyrius pins: 6.6.3 for six, 6.6.2 for goonj and attn11.
+
+The 3.2.2 bundle builds and a consumer-shaped program runs correctly under 6.6.3, 6.6.6, 6.6.10 and
+6.6.12. 6.6.2 still refuses it, so the floor stays **cyrius ≥ 6.6.3**. Two results depend on the
+consumer's cycc, both measured and now documented:
+- the sign of a zero produced by negation: −0 from 6.6.8;
+- `dual_pow`'s accuracy: within 1 ulp from 6.6.10.
+
+### Performance
+
+**No hisab change is claimed.** The toolchain's effect was measured the same way 3.2.1 measured
+6.6.6: three binaries built from the same committed source, run interleaved ×4 on this boot (max
+load 1.38, same-binary spread median 2.8–3.8%):
+- **A**: 6.6.6 compiler with 6.6.6 `bench.cyr`;
+- **B**: 6.6.12 compiler with 6.6.6 `bench.cyr`, swapped in through an explicit include so the lock
+  could not re-vendor it;
+- **C**: 6.6.12 compiler with 6.6.12 `bench.cyr`.
+
+Results:
+- **C against A** (the whole bump): median **+0.25%**, mean +1.29%, **2 of 80 rows past 10%**.
+- **C against B** (the harness alone): median **+0.00%**. `avg` is unmoved, so `regime` stays `net`.
+
+The movers are upstream trades, each attributed by its own probe:
+
+| row | A | C | cause |
+|---|---|---|---|
+| `srgb_to_linear` | 96 ns | 189 ns (**+96%**) | ganita's `pow(1.1, 2.5)` went ~90 → ~174 ns (pinned-dir probe). This is the price of ≤ 1 ulp. An integral `pow(1.1, 3)` went 28 → 180 ns |
+| `quat_slerp` | 242 ns | 171 ns (**−29%**) | 6.6.9's software `sin`/`cos` is faster than x87 `fsin` at these arguments |
+| `vec4_dot_x64` | 300 ns | 329 ns (~+10%) | A spread 2.3%, C spread 1.5%. Not isolated, and no hisab code in it changed |
+
+⚠ **The CSV rows were taken on hpet.** The kernel marked the TSC unstable at boot ("frequency
+skew"), so `floor_ns` is ≈ 1,328 against ≈ 337 for the 3.2.1 rows. The trend table straddles two
+clocksources; the same-boot A/B/C above is the comparison. Binaries:
+
+| binary | 6.6.6 | 6.6.12 |
+|---|---|---|
+| CLI | 270,144 B | 300,064 B |
+| benchmark suite | 711,800 B | 737,728 B |
+
+This growth is the stdlib. The CLI links no library code.
+
+### Not exposed — checked rather than assumed
+
+- **6.6.7's `#derive` rewrite**: accessors now load and store at the field's width, with a
+  `sizeof` assert per struct. All 22 `public struct`s have untyped 8-byte fields, and the 22 exact
+  layout pins pass.
+- **6.6.9's reachable-undefined-call refusal and the duplicate-symbol warning**: the bundle checks
+  clean, and the duplicate-symbol grep finds nothing.
+- **6.6.11's `cyrius test` tally rule and lint pre-pass**: every suite, and every file CI lints, is
+  clean.
+- **6.6.12's cyrlint code-point column count**: it only relaxes the 120-column rule.
+- The six installed toolchain slots used here — 6.6.2, 6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12 —
+  byte-match their tags (103–104 files each).
+- `cyrius coverage` reads **642/643** functions over 35/35 files. That is a change of instrument:
+  6.6.11 stops counting `main.cyr`, which reproduces on the unmodified 3.2.1 source. The one
+  unreferenced function is `ad_grad_write`, reached only through `ad_grad_into`'s tail call.
+
+### Documentation
+
+- README, CLAUDE.md, CONTRIBUTING.md, `docs/guides/testing.md` (the CI-gated counts),
+  `docs/guides/migration-3.0.md`, `docs/architecture/overview.md`, `docs/development/roadmap.md`,
+  `dependency-watch.md` and `threat-model.md`: toolchain, counts, consumers and filings brought
+  current.
+- `docs/doc-health.md`: every touched row.
+
 ## [3.2.1] - 2026-09-21 — cycc 6.6.6: the 2026-09-14 filing repaired upstream and closed here, a consumer already on 3.x, and a benchmark harness that reports a minimum above its own mean
 
 Toolchain **6.6.4 → 6.6.6** (crossing 6.6.5), ganita **1.2.5 → 1.2.6** (`f64_cbrt`, and a

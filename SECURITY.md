@@ -46,7 +46,8 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Version | Supported |
 |---------|-----------|
-| hisab 3.x (current: 3.2.x) | Yes |
+| hisab 4.x (current: 4.0.x) | Yes |
+| hisab 3.2.x | Yes, until 4.x has a live consumer |
 | hisab 2.24.x (supported 2.x line) | Yes |
 | hisab 2.0–2.23 | Best-effort |
 | Rust 1.x | Available via pre-2.0 git tags, unsupported |
@@ -103,7 +104,16 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   `scripts/check-constants.sh` (a CI gate since 2.6.12, after seven mis-transcribed tables shipped).
   The gate was itself audited: until 2.7.0 its regex rejected `_` digit separators and it silently
   skipped **35 of 145** declarations while printing "110/110 verified" — one of the skipped constants
-  encoded ~1e16 against a documented 1e15. Now **159/159 verified, 1 skipped**, and since 2.20.0 the gate also catches a comment on the line above its declaration (a shape that had let a mis-transcribed `F64_1E_NEG30` through as 158/158)
+  encoded ~1e16 against a documented 1e15. Now **163/163 verified, 1 skipped** (4.0.0), and since 2.20.0 the gate also catches a comment on the line above its declaration (a shape that had let a mis-transcribed `F64_1E_NEG30` through as 158/158)
+- **The public surface is enforced (4.0.0).** `dist/hisab.cyr` is `private`, so a consumer that
+  names anything not marked `public` is refused at compile time, and no binary is emitted.
+  `scripts/check-public-surface.sh` proves on every CI run that the surface is complete and exact.
+  It probes with calls, never `&name`: a private fn is reachable through address-of on cycc 6.6.2
+  and 6.6.3, fixed upstream in 6.6.4, and six consumers still compile under 6.6.3. ⚠ Enum constants
+  carry no visibility in Cyrius, so a non-public enum's members are `_`-named instead. 6.6.2 and
+  6.6.3 also export the declaration right after a `public enum`, so the gate refuses a non-public
+  one in that slot. Individual `src/*.cyr` files carry no `private` marker. Only the bundle enforces
+  the boundary
 - **A green gate is not evidence that it gated.** The release version check was
   `grep -q "$VERSION" CHANGELOG.md` — an unanchored regex, which `2.9.2` satisfied by matching
   `32,942,104 B` in an unrelated line, so a release could ship with no CHANGELOG entry at all.

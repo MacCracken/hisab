@@ -3,11 +3,14 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v3.2.2 — 35 math modules in `src/`, 26,554 lines of Cyrius (`lib/` is
-> vendored stdlib + first-party deps only). Compiled by cycc 6.6.12; a consumer needs cycc ≥ 6.6.3
-> (`public struct` + `#derive`, since 3.1.0).
+> hisab v4.0.0 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 26,627
+> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.12; a
+> consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map
+
+`src/visibility.cyr` is not a math module: it is the single `private` line `cyrius distlib` puts
+first in `dist/hisab.cyr`, which makes the bundle refuse every name not marked `public` (4.0.0).
 
 ```
 hisab (Cyrius)
@@ -27,14 +30,14 @@ hisab (Cyrius)
 │
 ├── Geometry
 │   ├── geo.cyr            — 9 primitives, 6 ray tests, closest-point queries
-│   ├── geo_advanced.cyr   — GJK/EPA 3D, SDF+CSG, swept AABB, TOI, CGA 5D, BVH
+│   ├── geo_advanced.cyr   — GJK/EPA 3D, MPR/XenoCollide, SDF+CSG, swept AABB, TOI, CGA 5D, BVH
 │   ├── geo_diff.cyr       — Ray/surface JETS for all six primitives: t plus its full
 │   │                        gradient from one evaluation, as a post-pass on the shipped primal
 │   └── spatial.cyr        — k-d tree, octree, quadtree, spatial hash (BVH lives in geo_advanced)
 │
 ├── Collision
-│   ├── collision_core.cyr — MPR/XenoCollide narrowphase, sequential-impulse solver,
-│   │                         convex hull 2D (monotone chain), triangulation (ear clipping)
+│   ├── collision_core.cyr — sequential-impulse solver + PGS/LCP, convex hull 2D
+│   │                         (monotone chain), triangulation (ear clipping)
 │   └── collision_mesh.cyr — Delaunay (Bowyer-Watson), half-edge mesh, island detection (union-find)
 │
 ├── Calculus
@@ -54,7 +57,7 @@ hisab (Cyrius)
 │
 ├── Physics
 │   ├── complex.cyr        — Complex numbers + matrices, Pauli, Dirac gamma, matrix exp
-│   ├── lie.cyr            — U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz
+│   ├── lie.cyr            — U(1), SU(2) incl. its adjoint action, SU(3) Gell-Mann, SO(3,1) Lorentz
 │   ├── lie_ext.cyr        — SE(3)/SO(3), adjoint, exp/log maps, BCH
 │   └── diffgeo.cyr        — Christoffel→Einstein, geodesic RK4, Killing, exterior algebra
 │
@@ -88,10 +91,24 @@ bundler concatenates. That makes à-la-carte consumption possible but leaves the
 implicit, which is why the README's à-la-carte example shipped broken until 2.7.0-H (it named
 `lib/` paths and omitted two modules the example needed without ever mentioning them).
 
-This table is **derived and verified, not hand-maintained**: every symbol referenced in code (with
-comments stripped) is resolved to its defining module, closed transitively, and then each row is
-confirmed by actually compiling that module against exactly its listed set — **0 undefined symbols
-for all 34**, with a negative control (`geo` without `quat`) correctly reporting 1.
+This table is **derived and verified, not hand-maintained**. Each row was produced with the
+compiler as the oracle: compile the module alone, map every undefined name it reports to its
+defining module, add that module, and repeat until the build is clean. Then each row was checked
+twice: it builds with **0 undefined names** against exactly its listed set, and dropping any ONE
+listed module breaks the build. Both checks hold for all 35 rows (re-derived 2026-09-30 on 4.0.0).
+Undefined *functions* count even when nothing calls them. A function is only a warning until
+something reaches it, and a set that leaves one out is a trap for whoever calls it next.
+
+⚠ **Re-deriving it found the published table wrong in five rows.** Three were already wrong in
+3.2.2, which the same procedure run on that tree confirms:
+- `f64_util` was listed as needing `error` and needs nothing;
+- `mat3` and `mat4` were missing `quat`.
+
+The other two were wrong for 3.2.2 and are changed by 4.0.0:
+- `collision_core` was listed as `error vec3`. On 3.2.2 it really needed `error geo geo_advanced
+  quat vec2 vec3`, because MPR called geo_advanced's EPA helpers.
+- `collision_mesh` inherited all of that. 4.0.0 moved MPR into `geo_advanced`, so both rows are
+  small now.
 
 The sets are minimal in the sense that they contain no module that is not reached; they are the
 transitive closure, so they are what you must include, not merely what the module names directly.
@@ -111,6 +128,7 @@ literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, s
 | Module | Also include |
 |---|---|
 | `error` | *(standalone)* |
+| `f64_util` | *(standalone)* |
 | `interval` | *(standalone)* |
 | `symbolic` | *(standalone)* |
 | `tensor` | *(standalone)* |
@@ -118,45 +136,53 @@ literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, s
 | `complex` | `error` |
 | `diffgeo` | `error` |
 | `einsum` | `tensor` |
-| `f64_util` | `error` |
 | `num` | `error` |
 | `ode` | `error` |
 | `optimize` | `error` |
 | `symbolic_ext` | `symbolic` |
 | `vec2` | `error` |
 | `vec3` | `error` |
-| `collision_core` | `error` `vec3` |
+| `collision_core` | `error` `vec2` |
 | `linalg_ext` | `complex` `error` |
-| `linalg_precision` | `complex` `error` `linalg_ext` (3.2.0: `_lext_sort_desc` orders every S / eigenvalue vector) |
-| `mat3` | `error` `vec3` |
 | `num_ext` | `error` `num` |
 | `quat` | `error` `vec3` |
 | `vec4` | `error` `vec3` |
 | `calc` | `error` `vec2` `vec3` |
+| `collision_mesh` | `collision_core` `error` `vec2` |
 | `color` | `error` `vec3` `vec4` |
 | `geo` | `error` `quat` `vec3` |
+| `mat3` | `error` `quat` `vec3` |
 | `calc_ext` | `calc` `error` `vec2` `vec3` |
-| `collision_mesh` | `collision_core` `error` `vec2` `vec3` |
 | `geo_advanced` | `error` `geo` `quat` `vec3` |
 | `geo_diff` | `error` `geo` `quat` `vec3` |
-| `mat4` | `error` `f64_util` `vec3` `vec4` |
+| `linalg_precision` | `complex` `error` `linalg_ext` (`linalg_sort_desc` orders every S / eigenvalue vector) |
 | `noise_simplex` | `calc` `error` `vec2` `vec3` |
 | `spatial` | `error` `geo` `quat` `vec3` |
-| `lie` | `complex` `error` `f64_util` `mat3` (3.2.0: `MAT3_BYTES`) `mat4` `quat` `vec3` `vec4` |
+| `mat4` | `error` `f64_util` `quat` `vec3` `vec4` |
 | `transforms` | `error` `f64_util` `mat4` `quat` `vec2` `vec3` `vec4` |
+| `lie` | `complex` `error` `f64_util` `mat3` (3.2.0: `MAT3_BYTES`) `mat4` `quat` `vec3` `vec4` |
 | `lie_ext` | `complex` `error` `f64_util` `lie` `mat3` `mat4` `quat` `vec3` `vec4` |
 
-**Shape of the graph.** Four modules are fully standalone (`error`, `interval`, `symbolic`,
-`tensor`); the deepest is `lie_ext` at 9. There are **no cycles**. Seven module pairs reach into
-another module's `_`-prefixed internals — `calc_ext`→`calc`, `collision_mesh`→`collision_core`,
-`lie_ext`→`lie`, `noise_simplex`→`calc`, `num_ext`→`num`, `symbolic_ext`→`symbolic`, and since
-3.2.0 `linalg_precision`→`linalg_ext` (`_lext_sort_desc`, the one ordering all three eigen/SVD
-entry points return through) — and every one runs from a derived module to its base, which is the
-layering the module *names* already declare. Every such reach carries `public` plus a marker
-comment, and has a 4.0.0 disposition on the roadmap. ⚠ Re-verified 2026-09-14 by building each
-module against exactly its listed set: a missing global (`MAT3_BYTES`) fails at once, but a missing
-FUNCTION is tolerated until something *calls* it, so the `linalg_precision` row is proven by a
-probe that calls `eigen_qr` (undefined `_lext_sort_desc`, no binary) rather than by an empty main.
+**Shape of the graph.** Five modules are fully standalone (`error`, `f64_util`, `interval`,
+`symbolic`, `tensor`); the deepest is `lie_ext` at 9. There are **no cycles**, and every edge runs
+from a derived module to its base, which is the layering the module *names* already declare.
+**Since 4.0.0 no module reaches another module's `_` internals.** Through 3.2.x nine pairs did.
+Eight of them now go through public names or plain literals:
+
+- `calc_ext`→`calc` and `noise_simplex`→`calc`;
+- `collision_mesh`→`collision_core`;
+- `geo_diff`→`geo`;
+- `lie_ext`→`lie`;
+- `num_ext`→`num`;
+- `symbolic_ext`→`symbolic`;
+- `linalg_precision`→`linalg_ext`.
+
+The ninth, `collision_core`→`geo_advanced`, ran UP the layering: MPR called EPA's helpers. The
+paragraph that stood here listed seven pairs and missed both `geo_diff`→`geo` and this one, which
+was removed by moving MPR into `geo_advanced` beside them. `scripts/check-public-surface.sh`
+claims 0 and 1 enforce the rule: claim 0 refuses a `_` name that carries `public`, and claim 1
+flips every module `private` and includes each one as its own
+file.
 
 ## Design Principles
 
@@ -216,7 +242,7 @@ dy/dt = f(t, y)
 Ten repos pull `dist/hisab.cyr` SHA-locked today — prakash (tag 3.2.1, the first past the `Result`
 break), svara, naad, goonj (tag 2.22.1), dhvani, attn11, ghurni, prani, garjan, nidhi (tag 2.11.2);
 pins read from their manifests 2026-09-30; goonj and attn11 pin cyrius 6.6.2, below the 3.1.0+
-bundle's minimum. The
+bundle's minimum. Four more (jalwa, ranga, shabda, shabdakosh) carry a copy transitively. The
 whole surface they reach is **35 public fns in 8 modules** (vec3, num, num_ext, calc, calc_ext, geo,
 geo_advanced, f64_util) — the measured per-module column is in the roadmap's *Boundary with Abaco*
 table. The projects below are the **planned** consumers: Rust repos awaiting a Cyrius port, with no

@@ -2,6 +2,353 @@
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-09-30 — the `private` flip: the bundle enforces its public surface, the accidental public names go, and number theory above 2^62 stops answering wrong
+
+⛔ **Breaking.** `dist/hisab.cyr` is now `private`: every name not marked `public` is refused with
+`'X' is private to its file`, and no binary is emitted. The one exception is the language's own:
+enum constants carry no visibility in Cyrius, so a non-public enum's members stay readable, and
+they are `_`-named. The release also removes the names that were public only by accident and gives
+seven internal helpers real public names.
+**[docs/guides/migration-4.0.md](docs/guides/migration-4.0.md)** has the replacement table. **No live
+consumer references any removed or hidden name**: all 14 repos carrying a hisab bundle were checked
+(the ten direct consumers plus jalwa, ranga, shabda and shabdakosh, which carry a copy
+transitively). The minimum consumer toolchain is unchanged, **cyrius ≥ 6.6.3**. Measured on the
+final bundle from dirs pinned to each version, with all 511 of the gate's non-public probes:
+
+| cycc | non-public probes refused | `&_private_fn` via `fncall` |
+|---|---|---|
+| 6.6.2 | the bundle itself is refused (the known `#derive` error) | — |
+| 6.6.3 | **511 / 511** | ⚠ **still reaches it** — upstream defect, fixed in 6.6.4 |
+| 6.6.4, 6.6.12 | 511 / 511 | refused |
+
+On 6.6.3, 6.6.6, 6.6.10 and 6.6.12 a program using the public API runs correctly. ⚠ The 6.6.3 row
+was **510 / 511 in this release's first draft** — see *Fixed — found by the review*.
+
+Suites **4443 → 4510**, all passing: hisab 585, foundation 429, modules 2319, edge_cases 266,
+abuse 911. Constant gate **163/163** (1 skipped). The public surface is **704 declarations**: 654
+fn, 21 struct, 23 var and 6 enum. The gate reaches them with **847 probes**, counting each struct's
+accessors and each enum's members, and all 511 non-public probes are refused. Coverage is
+**653/654**. The one gap, `ad_grad_write`, is reached only through `ad_grad_into`, as on 3.2.2.
+
+### Changed — how the flip was done (and why not the way the roadmap row said)
+
+The row's plan was to flip all 35 modules `private` and then rewrite or promote every `_` name the
+suites reach. **Measured on this tree, that would break 68 private names at 390 sites** in hisab's own
+tests (`tests/modules.tcyr` 375 sites / 63 names, `tests/hisab.tcyr` 14 / 4, `tests/hisab.bcyr` 1 / 1),
+almost all of them deliberate white-box tests: Delaunay predicates, spatial node layouts, and the
+instrumentation counters that mutation-proven guards read. **None of that buys a consumer
+anything**: `private` is per-file, and the bundle is ONE file, so a consumer's view of hisab is
+exactly the bundle's visibility, whatever the modules say.
+
+So the bundle is flipped and the modules are not:
+
+- **`src/visibility.cyr`** holds one `private` line and is the FIRST `[lib]` module. `cyrius distlib`
+  puts it ahead of every declaration in `dist/hisab.cyr`. The suites never include it, so they keep
+  white-box access.
+- **`scripts/check-public-surface.sh` claim 5 (new)** checks the SHIPPED bundle. Three things must
+  hold in the committed `dist/hisab.cyr`:
+  - the marker precedes the first declaration;
+  - a consumer reading a non-public global from it is refused;
+  - no non-public declaration directly follows a `public enum`, the slot cycc 6.6.2 and 6.6.3 export.
+
+  Claims 1–4 still flip every module in a scratch copy on every CI run, so no module can reach
+  another's internals even though nothing in `src/` enforces it.
+- Flipping the modules too stays on the roadmap as an optional item, with this measured cost, for
+  the day a consumer includes `src/` files directly.
+
+⛔ **Enum constants cannot be hidden, and the gate had assumed they could.** Making `RenderLayout`
+non-public left `FLOAT_RENDER_BUF` readable from a consumer, and claim 3 caught it. This is the
+language's design, not a compiler defect: the cyrius guide says *"enum constants and type names
+carry no visibility; they are always public"*. The gate's model was wrong, so:
+
+- claim 3 no longer expects members of a non-public enum to be refused;
+- claim 0 now requires every member of a non-public enum to be `_`-named, because the name is the
+  only signal left.
+
+The enum is `_RenderLayout { _FLOAT_RENDER_BUF; _INT_EXACT_BUF }`.
+
+Both new checks were mutation-proven in scratch copies of the repo:
+
+- **`src/visibility.cyr` without its marker** fails the bundle's marker-count precondition. Its
+  message used to blame only `distlib`, and now names the marker too.
+- **The marker module moved second in `[lib]`** fails claim 5, with the marker at line 131 and the
+  first declaration at 47.
+- **A non-public enum with an un-`_`ed member** fails claim 0.
+
+### Removed / renamed — every 3.x roadmap disposition, worked
+
+| 3.2.2 name(s) | 4.0.0 |
+|---|---|
+| `_num_mulmod` | **`num_mulmod(a, b, m)`**, checked: `Ok(r)` in [0, m), `Err` for m ≤ 0, negative operands reduced to their residue |
+| `_num_is_pow2` | **`num_is_pow2(n)`** |
+| `_lie_norm3` | **`lie_norm3(x, y, z)`** |
+| `_lext_sort_desc` | **`linalg_sort_desc(...)`**, same arguments and tie rule. It now returns `Result`: `Err(HSB_ERR_INVALID_INPUT)` for a null `vals` or a matrix smaller than the region it swaps (see *Fixed — found by the review*) |
+| `_perm_init` + `_perm` | **`noise_perm(i)`**, which builds the table on first use, so no call order can read it unbuilt. The row proposed a public `noise_perm_init` beside it; a lookup that initialises itself needs no init API |
+| `_sym_int_exact_buf`, `_sym_render_f64`, `_SYM_2_POW_63`, `RenderLayout` | **`sym_const_to_str(val)`**: `expr_to_str`'s constant branch, extracted. `sym_to_latex` now calls it too, so 2.20.0's "both renderers agree at every magnitude" is true by construction rather than by test |
+| `_sym_is_zero`, `_SYM_EPS` | **`sym_const_eq(a, b)`**: \|a − b\| < 1e-15, absolute. ⚠ The tolerance really is 1e-15 now. Through 3.2.x it was 2^-50 = 8.88e-16, a mis-encoded constant (*Fixed — found by the review*) |
+| `_su2_alloc`, `_su2_x/_y/_z` | private to `lie.cyr`. **`su2_adjoint` moved into `lie.cyr`**, and the three se3 sites call it. The row proposed a new `su2_rotate_vec3`; `su2_adjoint` already was that operation, with the same `compose(compose(g, v), inv(g))` sequence, so it is bit-identical by construction and adds no name |
+| `_COL_SENTINEL` | **`HALFEDGE_NONE`**, moved to `collision_mesh.cyr`, which is the only module that uses it |
+| `_epa_*` (4 helpers) | private. **The MPR section (`mpr_intersect`, `mpr_penetration`) moved from `collision_core.cyr` to `geo_advanced.cyr`**, next to `gjk_epa_3d` and the helpers it calls. That took `geo`, `geo_advanced`, `quat` and `vec3` out of the include sets of `collision_core` and `collision_mesh` |
+| `_GEO_F64_POS_INF`, `_COL_F64_ZERO/_ONE/_NEG_ONE` | private; geo_diff and collision_mesh read `F64_POS_INF`, `F64_ONE` and `0` instead (same bit patterns) |
+| `_noise_fade` | deleted: it was `ease_in_out_smooth`, operation for operation. Perlin's bit-exact tests are unchanged |
+| `F64_THREE`…`F64_FIFTEEN` (calc), `F64_NINE`, `F64_1E_NEG30` (calc_ext), `F64_SIX_DG` (diffgeo) | private per-module copies (`_CALC_F64_*`, `_CALCX_F64_*`, `_DG_F64_SIX`). They squatted the stdlib's `F64_*` namespace, so a future stdlib `F64_THREE` would have collided in every consumer |
+| `EPSILON_F32` | deleted: unused (all math is f64) |
+| `AdPowLimit` / `AD_POW_MAX_K` | deleted: unused since 3.2.2 retired the loop it bounded |
+| `public struct GeoJet` (9 getters, 9 setters) | **private `_GeoJet`**, read through `geo_jet_kind`, `geo_jet_t`, `geo_jet_dorigin`, `geo_jet_ddirection` plus the existing per-primitive accessors. A caller can no longer replace a slot, or change `kind`, `t`, `ss` or `face`. ⚠ The vector slots are returned by reference, the jet's own `HVec3`s, so their components can still be changed through `HVec3_set_*` |
+
+Every cross-module `_` marker comment is gone. **59 names left the reachable surface**:
+
+- the 25 cross-module `_` items;
+- 15 accidental names;
+- 19 for `GeoJet` (the struct, 9 getters and 9 setters).
+
+A word grep of all 14 consumer repos finds none of them. Its controls: it finds `svara`'s
+`num_fft`, and the same alternation matches 389 lines of the 3.2.2 tree. `CONTRIBUTING.md` now
+says no module may reach another's `_` name, and gate claim 1 enforces that.
+
+### Fixed — number theory above 2^62
+
+⛔ **`num_modpow`, `num_is_prime`, `num_pollard_rho` and `num_crt` were silently wrong above 2^62.**
+`_num_mulmod` formed `(result + a) % m` and `(a + a) % m`. A residue at or above 2^62 doubled past
+i64 and wrapped negative. Every result below was measured against 3.2.2, with expected values from
+exact arithmetic:
+
+| call | 3.2.2 | 4.0.0 |
+|---|---|---|
+| `num_modpow(2^62, 2, 2^63 − 1)` | 0 | 2^61 |
+| `num_is_prime(2^63 − 25)` (prime) | 0 | 1 |
+| `num_is_prime(2^62 + 135)` (prime) | 0 | 1 |
+| `num_pollard_rho(3037000493 · 3037000453)` | never returned (killed at 120 s) | 3037000453, in 75 ms |
+| `num_crt`, M = 3037000493 · 3037000453 | Ok, x = 4792163105077547874 | Ok, x = 5073341950054030866 (exact) |
+| `num_crt`, three moduli near 2^22 (product ~2^66) | Ok, M = −826830265255265 | `Err(HSB_ERR_INVALID_INPUT)` |
+
+`num_crt` also refuses a non-positive modulus up front. Pollard rho and CRT now form every sum through
+an add-mod that subtracts the gap instead of adding, so nothing can wrap. Pollard rho's comment
+called its loop "Brent's improvement"; the code is Floyd's tortoise and hare, and the comment says
+so now.
+
+⭐ **The repair made `num_is_prime` 2.2× slower before it made it 10× faster**, and only the A/B
+benchmark run showed it. The first form was an overflow-free add-mod loop at every modulus.
+`num_is_prime(1000003)` went **19.5 → 43.2 µs**, the one row of 80 past 10% (spread 2.7% and 1.7%).
+The shipped `_num_mulmod` has three tiers, each bound derived from what fits in i64:
+
+| modulus | method | why it is exact |
+|---|---|---|
+| m ≤ 3037000500 | `(a * b) % m` | (m − 1)² ≤ 2^63 − 1; isqrt(2^63 − 1) = 3037000499 |
+| m ≤ 2^62 | 3.2.2's doubling loop | two residues sum to at most 2^63 − 2 |
+| above 2^62 | branchless add-mod loop | never forms a sum; the sign bit of the difference picks the correction |
+
+`>>` is a LOGICAL shift in cycc (measured: −8 >> 1 is positive), so the sign bit is `t >> 63` as
+0 or 1. The branchless form matters: a compare-and-branch add-mod took 362 µs at 2^62 + 135 against
+208 µs. Against 3.2.2, from three interleaved runs:
+
+| `num_is_prime(n)` | 3.2.2 | add-mod at every m | 4.0.0 |
+|---|---|---|---|
+| 1000003 | 19.2 µs | 42.6 µs | **1.81 µs (−90.6%)** |
+| 2^40 + 15 | 65.4 µs | 171 µs | 64.3 µs (noise) |
+| 2^62 + 135 | 0.56 µs, **wrong** | 492 µs | 212 µs, correct |
+
+A new `tests/modules.tcyr` group, "4.0.0 number theory above 2^62", has 29 assertions. 11 came with
+the review's repairs below. Among the original 18:
+
+- three controls that 3.2.2 already got right (a composite, a negative-modulus refusal, a negative
+  remainder);
+- four that pin the tier boundaries, with (m − 1)² at 3037000500 and 3037000501, and at 2^62 and
+  2^62 + 1.
+
+All six mutants are killed, each verified installed and then restored:
+
+- each threshold one modulus too wide;
+- the branchless loop with `>> 62` for `>> 63`;
+- the loop without the bit-of-b mask;
+- the loop without the doubling's correction;
+- the loop forming `a + a`.
+
+The last three of those also send Pollard rho into an endless loop, so the suite's timeout ends the
+run. They fail four assertions first.
+
+⚠ **Two of my own fixtures were wrong first.** The fast-path boundary was first pinned with
+(m − 1)(m − 2), which at m = 3037000501 still fits in i64. The mutant that widened the fast path by
+one modulus survived it, and only the square discriminates. A comment then quoted the wrapped
+product's remainder as −2746051750. That figure came from Python's `math.fmod`, which goes through a
+float. The exact remainder, and the value the mutant printed, is −2746052118.
+
+### Added — tests for the API this release created
+
+`cyrius coverage` listed five of the newly public names as unreferenced. Every existing caller of
+`noise_perm`, `num_is_pow2`, `sym_const_eq`, `sym_const_to_str` and `linalg_sort_desc` was
+internal, so no test called them as API. Two groups now do:
+
+- **`tests/modules.tcyr` "4.0.0 the promoted helpers, called as API"**, 34 assertions. 9 came with
+  the review's repairs below. The group covers:
+  - `num_is_pow2` at 0, negative values, 2^0 and 2^62;
+  - `sym_const_eq` at 5e-16 and 2e-15, and at two ADJACENT doubles at 1e18, which are not equal
+    because the tolerance is absolute, not in ulps;
+  - `sym_const_to_str` exact at 1e19, and identical to the text both renderers emit;
+  - `linalg_sort_desc` by value and by |value|, carrying columns and rows, plus the tie rule:
+    (2, 2, 4) gives (e3, e2, e1), not a stable sort's (e3, e1, e2).
+- **`tests/edge_cases.tcyr` "4.0.0 noise_perm builds its table on first use"**, 4 assertions. It is
+  the one suite with no other noise call, so the lookup really is the first touch of the table.
+
+Each was mutation-checked in a scratch copy. `noise_perm` without its self-init SIGSEGVs that suite,
+which is the 3.2.x hazard exactly. `num_is_pow2` with `n < 0` fails 1 assertion, the tie rule with
+`f64_ge` fails 2, the exact path of `sym_const_to_str` removed fails 8, and `sym_const_eq` as
+exact equality fails 1. Coverage goes **648/654 → 653/654**.
+
+### Fixed — found by the review
+
+A pre-tag adversarial review ran 8 agents: four reviewers, each on one dimension (number-theory
+arithmetic, visibility and API changes, the public-surface gate, the documents' factual claims), and
+one skeptic per dimension told to refute every finding by reproducing it. **18 findings, 17
+confirmed, 1 refuted.** The refuted one said SECURITY.md and math.md still credit "Russian-peasant
+`_num_mulmod`" with avoiding overflow. That description is accurate of the 4.0.0 code: the top tier
+is the same doubling loop on an add-mod. Every confirmed finding is repaired here, with an assertion
+or a gate mutant that fails without the repair.
+
+⛔ **The private bundle leaked `_SYM_EPS` on cycc 6.6.3, the documented floor that six consumers
+pin.** 6.6.2 and 6.6.3 hand a `public enum`'s marker to the NEXT declaration (fixed upstream in
+6.6.4). `_SYM_EPS` sat directly after `public enum ExprTag`, and while it was itself public through
+3.2.x that was invisible. 4.0.0 made it private, and a consumer on 6.6.3 could read and write it
+from the shipped bundle. The gate could not see it, because CI runs only the repo's pin.
+- `ExprTag` now sits directly above `public fn expr_tag`.
+- Claim 5 fails any bundle where a non-public declaration follows a `public enum`. That closes the
+  class statically, without needing 6.6.3 in CI. It fired on this release's first-draft bundle
+  (`ExprTag -> _SYM_EPS`) before the move.
+- Measured on the final bundle under 6.6.3: 511 / 511 non-public probes refused (the draft was
+  510 / 511). `&_private_fn` still reaches a private function there. That is the separate upstream
+  defect fixed in 6.6.4, and every 6.6.3 statement in these docs now says so.
+
+⛔ **`_SYM_EPS` was mis-encoded: `0x3CD0_0000_0000_0000` is 2^-50 = 8.88e-16, under a `# 1e-15`
+comment.** That is 11% off, so `sym_const_eq(0, 9e-16)` returned 0 though the contract says
+`|a − b| < 1e-15`. The constant gate passed it because it reads "1e-15" as one significant digit,
+±5e-16. A census of all 163 declarations found 15 that pass only on that kind of slack. 14 show 9 or
+more digits or a `...` truncation, rounded displays within 2e-16 to 3e-8 relative. The fifteenth was
+this one. **A comment of at most two significant digits now names a round value and must match to
+4 ulp.** The rule fails exactly the old bits, and the bits are now `0x3CD2_03AF_9EE7_5616`.
+
+⛔ **The overflow class this release repaired had two more members, both unchanged from 3.2.2.**
+- **`num_modinv`** normalised with `((x % m) + m) % m`, which wraps above 2^62:
+  - `num_modinv(5, 2^63−1)` returned the negative non-inverse −5534023222112865486;
+  - `num_modinv(1, 2^63−1)` returned −1, "not invertible";
+  - that −1 made `num_crt` refuse every system whose only modulus is 2^63 − 1.
+
+  A fuzz of 3,006 cases, two thirds above 2^62, now matches Python exactly.
+- **`num_divisor_sigma`** looped on `d * d <= n`, which wraps at d = 3037000500. `n = 2^63−1`
+  **never returned** (killed at 120 s), and `n = 9223372033000000000` returned 440 divisors for 400.
+  `d <= n / d` would terminate, but only after ~3·10⁹ iterations (~5 s, longer than the whole
+  modules suite). So σ_k is now computed from the factorization, the way `num_euler_totient` already
+  is. That gives 0 mismatches against Python over 90,182 values (n ≤ 30,000 at k = 0, 1, 2, plus 90
+  large n), in 0.51 s for all of them.
+- **`num_factorize`'s trial-division fallback** had the same `td * td <= mm`. It is repaired on the
+  shape and stated as such, since it runs only if Pollard rho cannot split a composite.
+
+⛔ **`linalg_sort_desc` wrote out of bounds.** As a private helper it needed no guard, because its
+three callers size every matrix. Made public, a 3×2 `col_mat` with n = 3 wrote 8 bytes past the
+matrix through the unchecked `ganita_mat_set`, then returned normally. It now refuses a null `vals`
+and any matrix smaller than the region it swaps, before the loop that writes, the way `eigen_qr`
+bounds `out_vecs`. It returns `Result`, and the three callers propagate with `?`. A canary
+allocated after the short matrix stays intact.
+
+⛔ **The public-surface gate passed seven planted bypasses**, each leaving a non-`_` name readable
+from the private bundle with every claim green:
+- an enum member written without `= value`;
+- a `}` inside a comment in an enum body;
+- a declaration that does not start its line;
+- a `[lib]` entry in a subdirectory;
+- a `[lib]` entry with a trailing comment;
+- a declaration added to `src/visibility.cyr`;
+- a `public _helper` reached from another module, which is exactly the 3.x pattern.
+
+All claims now read declarations through one scanner. It strips comments and strings (which hold
+braces, in the LaTeX renderer) and tracks brace depth. The module list is every `.cyr` path in
+`[lib]`, cross-checked against the bundle's module count. Claim 0 also refuses a `_` name that
+carries `public`. All seven bypasses fail now, and each failure names its reason. The scanner's
+counts on the real tree match the old regexes exactly: 847 probes, 511 refused.
+
+**Documents corrected by the review:**
+- "The public surface is 847 items" counted probes. The declarations sum to 704.
+- "A caller can no longer write a jet's slots" overstated it. The vector slots are returned by
+  reference, the jet's own `HVec3`s, so only `kind`, `t`, `ss` and `face` are protected. The
+  comment, this entry, the migration guide and the threat model now say so.
+- **`num_crt` changed its answers at small moduli too**, which the migration guide had denied. A
+  negative remainder now gives x in [0, M), where 3.2.2 returned the same class as a negative number:
+  `(−1, 0) mod (5, 7)` gives 14, where it gave −21. This is now pinned.
+- README's "every non-`public` name is refused" now carries the enum caveat.
+- Nine comments named identifiers that no longer exist: `_lie_norm3` ×6, `_lext_sort_desc` ×3, plus
+  a garbled `_CALCX_F64_THREE` history line, a non-existent `halfedge_mesh_*`, and the gate's
+  "public by its own marker" note on `_SYM_EPS`.
+
+### Performance
+
+Against 3.2.2: 80 rows, 4 interleaved ABBA runs per binary, same boot, on the final tree (after the
+review's repairs), load 0.32–1.04.
+
+- **`num_is_prime` 19,229 → 1,769 ns (−90.8%)**, from the three-tier `mulmod` above.
+- The other 79 rows: median **+0.04%**, mean +0.32%, **0 past 10%**, against a same-binary spread
+  of median ~2.2%.
+- `svd_golub_kahan_12` and `eigen_qr_12`, which now run `linalg_sort_desc`'s bounds guard, read
+  −0.95% and −0.02%, inside their own spreads (1.1–5.6%).
+
+The first draft's A/B, before the review, gave the same picture: −90.9%, and median +0.00% on the
+other 79.
+
+The other two costs are stated rather than hidden:
+
+- **`noise_perm`'s first-use check costs nothing measurable.** No benchmark row covers the noises
+  that call it; `perlin_2d` uses the file-local lookup. A scratch A/B over 4 interleaved runs gives
+  medians of `perlin_3d` 184.5 → 185 ns, `simplex_2d` 63 → 63 ns and `simplex_3d` 122 → 122 ns.
+- **`num_mulmod`'s checked Result**, on the Pollard rho and CRT paths, has no benchmark row.
+
+### Documentation
+
+- **CLAUDE.md trimmed 116,667 → 30,399 B**, the way 3.2.2 trimmed `cyrius.cyml`. The release-arc
+  narrative that had grown into its Status paragraph lives in this file. CLAUDE.md now keeps:
+  - identity and layout;
+  - the process;
+  - the rules learned the hard way, grouped by measuring, testing, repairing, toolchain, language
+    and documents.
+
+  ⛔ **The first draft of the trim was wrong in 35 places**, found by a four-agent review that
+  compared it against the original. It had dropped 22 durable rules and stated 13 facts wrongly.
+  All of them were restored or corrected. Two facts lived only in the old status line, so they
+  moved here:
+  - 2.14.0's Performance note;
+  - 2.22.0's "97.9% of the silent wrong answers are at normal block ratios".
+- **New: [`docs/guides/migration-4.0.md`](docs/guides/migration-4.0.md).**
+- ⛔ **`overview.md`'s include table was wrong in five rows**, though it called itself "derived and
+  verified, not hand-maintained". It is now re-derived with the compiler as the oracle:
+  - compile each module alone, add the module defining each undefined name it reports, and repeat;
+  - check that each final set builds with 0 undefined names;
+  - check that dropping any one listed module breaks the build. All 35 rows hold both ways.
+
+  The same procedure on the 3.2.2 tree shows which rows were wrong before this release:
+  - `f64_util` was listed as needing `error` and needs nothing;
+  - `mat3` and `mat4` were missing `quat`;
+  - `collision_core` was listed as `error vec3` and really needed `error geo geo_advanced quat vec2
+    vec3`, because MPR called EPA's helpers. `collision_mesh` inherited all of it.
+
+  Moving MPR cut both collision rows to `error vec2`, plus `collision_core` for collision_mesh,
+  whose island detection reads `ColContact`. ⚠ **My own first draft got that last part wrong**: the
+  migration guide and `collision_mesh.cyr`'s header said it no longer needed `collision_core` at
+  all. The derivation is what caught it. The graph paragraph's list of cross-module `_` reaches
+  named seven pairs where there were nine, missing `geo_diff`→`geo` and `collision_core`→`geo_advanced`.
+- **threat-model.md**: new attack-surface rows for the number-theory overflow (CWE-190, including the
+  non-terminating Pollard rho) and the `_perm` read-before-init, plus a 4.0.0 trail entry.
+  **SECURITY.md** gains an enforced-surface bullet. **testing.md** explains why the suites stay
+  white-box.
+- **CLAUDE.md** gains three rules from this release:
+  - an A/B against the previous tag for every correctness repair;
+  - a boundary fixture must sit on the boundary;
+  - a table that says "derived" is re-derived when its inputs change.
+- **README, SECURITY, CONTRIBUTING, overview and roadmap updated:**
+  - 4.x is supported, and 3.2.x stays supported until 4.x has a live consumer.
+  - The module map follows the MPR and `su2_adjoint` moves.
+  - Consumers now list the four transitive carriers.
+  - aethersafha is recorded as a Cyrius port with no hisab dependency.
+  - The 4.0.0 roadmap item is removed.
+- **ci.yml**: the fmt-gate comment said check mode writes nothing to stdout. On 6.6.12 its short
+  report goes to stdout, and the gate does not read it either way.
+
 ## [3.2.2] - 2026-09-30 — cycc 6.6.12: IEEE negation reaches hisab, ganita's pow retires `_ad_pow`'s loop, and the manifest stops being a ledger
 
 Toolchain **6.6.6 → 6.6.12**, crossing 6.6.7–6.6.11. ganita moves **1.2.6 → 1.2.9** and sakshi
@@ -1422,7 +1769,10 @@ were **dropped** and the routine returned the factorisation of a **different mat
 `rc = HSB_ERR_NONE`.
 
 ⭐ **THE BOUNDARY IS A BLOCK RATIO OF 2^-40 — A CONDITION NUMBER OF ~1e12, NOT A SUBNORMAL.** That is an
-ordinary ill-conditioned matrix, **982 binades above** where the roadmap placed the defect. Measured
+ordinary ill-conditioned matrix, **982 binades above** where the roadmap placed the defect, and
+**97.9% of the silent wrong answers are at NORMAL block ratios** — the subnormal framing captured about
+2% of the class. (This figure was recorded only in CLAUDE.md's status line until 4.0.0
+trimmed it.) Measured
 oracle-free, on `A = blockdiag(B, c·B)` with `B = [[3,4],[2,3]]` (det B = 1), where
 `prod(singular values)` must equal `|det A| = c²` and needs no reference implementation:
 
@@ -2726,6 +3076,12 @@ Inf or a NaN a caller could test for.
 - ⚠ **The census's own first run lost 30 of 41 agents to a session limit** and returned 11 results
   that read exactly like a complete answer. The resumed run completed 121 agents with 0 errors.
 
+
+### Performance
+
+No performance change is claimed: guard-touched rows moved **+0.26%** median against **+0.27%**
+untouched, on a quiet box (load 0.16). (Recorded only in CLAUDE.md's status line until 4.0.0 trimmed
+it.)
 
 ## [2.13.0] - 2026-09-09 — the suite release: the suite could not see an error of 0.9
 

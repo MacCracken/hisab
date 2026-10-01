@@ -6,7 +6,26 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-09-30 — **v3.2.2: cycc 6.6.12.** Toolchain 6.6.6 → **6.6.12**, ganita 1.2.6 →
+> **Last refresh**: 2026-09-30 — **v4.0.0: the `private` flip.** `dist/hisab.cyr` is `private`
+> (`src/visibility.cyr`, first in `[lib]`). The modules stay unflipped, so the suites keep white-box
+> access, and gate claim 5 checks the shipped bundle. 59 names left the reachable surface, and seven
+> helpers became public API. The enum-visibility finding: enum constants are always public, so a
+> non-public enum's members are `_`-named and claim 0 checks it. Number theory above 2^62 is
+> repaired, with a three-tier `mulmod` that makes `num_is_prime(1000003)` −90.9%. Suites
+> **4510/4510**, constants 163/163, coverage 653/654, public surface 704 declarations (847 probes). ⭐ CLAUDE.md trimmed
+> 116,667 → ~30 KB (a review found 35 errors in the first draft). The overview's include table was
+> re-derived by compilation and was wrong in five rows. New: `docs/guides/migration-4.0.md`.
+> ⛔ A pre-tag adversarial review (8 agents) confirmed 17 of 18 findings, all repaired:
+> - `_SYM_EPS` leaked from the bundle on cycc 6.6.3, sitting right after a `public enum`;
+> - `_SYM_EPS` was mis-encoded as 2^-50 under `# 1e-15`;
+> - `num_modinv` and `num_divisor_sigma` had the same overflow above 2^62;
+> - `linalg_sort_desc`, newly public, wrote out of bounds;
+> - seven planted shapes passed the gate;
+> - five doc claims were false.
+>
+> Several docs rows below were re-touched for it. Details in CHANGELOG `[4.0.0]`.
+>
+> **Previous refresh**: 2026-09-30 — **v3.2.2: cycc 6.6.12.** Toolchain 6.6.6 → **6.6.12**, ganita 1.2.6 →
 > 1.2.9, sakshi 2.5.2 → 2.5.6. **The first bump that changed hisab's results**: 6.6.8's IEEE `f64_neg`
 > (−0), saturating `f64_to` and ganita's C99/fdlibm `pow` failed 14 assertions, none a regression.
 > `_ad_pow`'s loop is retired: it fabricated 0 for subnormal results and ganita is now more accurate.
@@ -770,12 +789,12 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `README.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: manifest `cyrius = "6.6.12"`, `tag = "3.2.2"`; minimum-toolchain note re-measured on the 3.2.2 bundle (refused on 6.6.2, correct on 6.6.3/6.6.6/6.6.10/6.6.12) plus the two pin-dependent results (−0 from negation from 6.6.8, `dual_pow` ≤ 1 ulp from 6.6.10); counts 4443 (2256/262/911); Stats 3.2.2 / 6.6.12 / sakshi 2.5.6 / CLI ~293 KB; Security cell: the one open filing is ganita `atan2` (the bench one closed), 33 archived, and `m3_mul_vec3`'s hoist justified by eight of ten consumers (not "every"). |
-| `CHANGELOG.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: cycc 6.6.6 → 6.6.12 — the float-semantics table measured from pinned dirs, the −0 differential, `_ad_pow` retired (fabricated subnormal zeros; ganita 1.2.8 ≤ 1 ulp), `expr_eval` stream fix, the spatial-hash i64-wrap fix (both query paths), 11 sign-of-zero + ev100 + pow assertions re-derived, the manifest de-ledgered, ganita `atan2` filed, bench filing closed, consumers re-read, A/B/C performance with the two upstream movers attributed. |
-| `CLAUDE.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: toolchain/pin lines → 6.6.12, sakshi 2.5.6; status line → 3.2.2 / src 26,554 lines / CLI 300,064 B / bundle 1,122,218 B / 26,620 lines (4.45%) / 4443 per suite / coverage 642/643 over 35/35 (6.6.11 stopped counting `main.cyr`); a 3.2.2 paragraph; Consumers → pins read 2026-09-30 (prakash 3.2.1/6.6.6, dhvani 6.6.10) and the two pin-dependent results. |
-| `VERSION` | 2026-09-30 | ✅ Fresh | **v3.2.2**: -> `3.2.2` (`version-bump.sh`: "prints CYRIUS_PKG_VERSION (no rewrite needed)"); `build/hisab` prints `hisab 3.2.2`. |
-| `CONTRIBUTING.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: toolchain 6.6.6 → 6.6.12; 4429 → 4443 assertions. |
-| `SECURITY.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: abuse suite 904 → 911 assertions. (Previous: docs sweep post-3.2.0 — every retired contract in the table rewritten.) |
+| `README.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: a "4.0.0 enforces the public surface" notice linking the migration guide; manifest `tag = "4.0.0"`; minimum-toolchain note re-measured on the 4.0.0 bundle (6.6.2 refuses; 6.6.3/6.6.6/6.6.10/6.6.12 correct); an à-la-carte warning that individual files carry no `private` marker; consumers with the four transitive carriers; aethersafha as a port with no hisab dep; counts 4510 (2319/266); Stats 4.0.0; Security cell "declared (3.1.0) and enforced (4.0.0)", 259 `#must_use`. (Previous: v3.2.2.) |
+| `CHANGELOG.md` | 2026-09-30 | ✅ Fresh | **v4.0.0** entry: the bundle-level flip and why not per-module (68 names / 390 sites measured), the enum-visibility finding, every disposition, number theory above 2^62 with the three-tier `mulmod` and its A/B, the overview table re-derivation, the CLAUDE.md trim. Two facts that lived only in CLAUDE.md moved into 2.14.0 and 2.22.0. (Previous: v3.2.2.) |
+| `CLAUDE.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: TRIMMED 116,667 → ~30 KB. The status line is a pointer to roadmap/dependency-watch/CHANGELOG. It keeps identity, consumers (direct + transitive), layout (+ `visibility.cyr`), process, and "rules learned the hard way" grouped by measuring/testing/repairing/toolchain/language/documents. A four-agent review of the first draft found 22 dropped rules and 13 wrong facts; all were restored or fixed. Gate description → six claims. |
+| `VERSION` | 2026-09-30 | ✅ Fresh | **v4.0.0**: -> `4.0.0` (`version-bump.sh`: "prints CYRIUS_PKG_VERSION (no rewrite needed)"). |
+| `CONTRIBUTING.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: no module may reach another module's `_` name (gate claim 1); non-public enum members are `_`-named; gate comment → claims 0/1/5; 4443 → 4510 assertions. |
+| `SECURITY.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: supported versions → 4.x, 3.2.x until 4.x has a live consumer, 2.24.x; an "enforced public surface" bullet with its three caveats (enum constants, `&name` on 6.6.3, the `public enum` successor slot on 6.6.2/6.6.3); constants 159 → 163. |
 | `CODE_OF_CONDUCT.md` | 2026-03-22 | 🔵 Evergreen | Contributor Covenant. Re-read only on policy change. |
 
 ---
@@ -784,7 +803,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `overview.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: header → 3.2.2 / 26,554 lines / cycc 6.6.12; Consumers → prakash on 3.2.1, pins read 2026-09-30. The "Module dependency manifest" section is now what `cyrius.cyml`'s `[lib]` comment points at. |
+| `overview.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: header → 4.0.0 / 26,627 lines; module map follows MPR → geo_advanced and `su2_adjoint` → lie, plus a `visibility.cyr` note. ⛔ The **include table was re-derived by compilation** (all 35 rows build clean, every dep necessary). It was wrong in five rows: `f64_util`, `mat3` and `mat4` already on 3.2.2, and `collision_core`/`collision_mesh`, whose 3.2.2 sets needed geo/geo_advanced/quat. The graph paragraph's "seven `_` reaches" was nine. Consumers +4 transitive. |
 | `math.md` | 2026-09-14 | ✅ Fresh | **Docs sweep (post-3.2.0)**: conventions no longer say near-zero comparisons use `EPSILON_F64` (there is no house tolerance since the census); `cga_blade_inverse`'s guard described as implemented — relative, `|⟨B~B⟩₀| ≤ 2⁻⁴⁹·Σbᵢ²` — after a first draft of this sweep wrote "exact zero" from the doc rather than the code. Earlier, **v2.21.0**: ⛔ **§1 was the canonical CGA reference and still documented the RETIRED ep/em basis in full** — metric, blade-index table, and a bit-XOR product rule that the null basis makes false, since `n0*ninf` is a scalar AND a bivector. Rewritten to the null basis {e1,e2,e3,n0,ninf}: new metric and blade table, the change of basis, a new §1.0 on why the basis moved (with the measured residual table), the product recast as a derived TABLE with its FNV contract and the two-index-space hazard, the pseudoscalar note re-derived, and the embedding section given the null-basis forms for point/sphere/plane/translator. Earlier, Equation catalogue. §1 CGA (v2.5.4), §2 differential geometry (v2.6.5). v2.6.15: `hodge_star_2form_4d`'s `sign` corrected — it is an overall multiplier on the Lorentzian dual, **not** a Euclidean/Lorentzian selector. |
 
 ---
@@ -795,9 +814,9 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `roadmap.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: header/Current → 6.6.12, ganita 1.2.9, sakshi 2.5.6, 4443; the private-flip reach RE-MEASURED with its own method (3.2.1 was 65 / 392, not the 3.1.0 figure 64 / 387; 3.2.2 is 64 / 382 with `_ad_pow` gone); `AdPowLimit` scheduled for removal at 4.0.0; upstream section → no cyrius item open, bench filing closed, ganita `atan2` open with its tripwire; Consumers → 2026-09-30 pins and the three pin-dependent behaviours. |
-| `threat-model.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: Supply Chain facts → 6.6.12 tag / sakshi 2.5.6 / six install slots matching their tags; trail entry for 6.6.12 checking CVE-46…58 for exposure (none; CVE-55's visibility bypass needs a multi-line string hisab does not have, and the surface gate reads 891/458 unchanged). |
-| `dependency-watch.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: status → 6.6.12; a new standing **Compiler limits the bundle must fit** section (moved out of `cyrius.cyml`: both caps with their 6.6.12-tag locations, the headroom, the re-derive rule); a 6.6.12 block; the 6.6.1 entry repointed off the retired manifest comment; sakshi → 2.5.6 with what 2.5.3–2.5.6 changed. |
+| `roadmap.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: the 4.0.0 item removed; Current → 4.0.0 (4510, 163/163, surface 704 declarations / 847 probes, both migration guides, the 6.6.2-refuses / 6.6.3+-correct pair re-measured on the final bundle); an optional per-module flip row with its measured cost (68 names / 390 sites); consumers +4 transitive, aethersafha a port with no hisab dep. |
+| `threat-model.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: attack-surface rows for the number-theory i64 overflow (CWE-190, incl. a non-terminating `num_pollard_rho`) and the `_perm` read-before-init; the MPR row's line reference moved to `geo_advanced.cyr`; a trail entry: surface enforced, 59 names out (25 `_` / 15 accidental / 19 `GeoJet`), consumer grep with controls, enum constants always public. |
+| `dependency-watch.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: bundle 1,126,262 B (4.48% of the byte cap). (Previous: v3.2.2 — the Compiler-limits section moved out of `cyrius.cyml`.) |
 | `port-audit.md` | 2026-09-14 | ✅ Fresh | **Docs sweep (post-3.2.0)**: status banner: the items it called open have shipped (tape autodiff 2.11.0, jets 2.10.x, `Result` 3.0.0); 3.2.0 figures; dual quaternions / convex decomposition / rendering / GPU are unscheduled with no consumer asking (⚠ a first draft said dual quaternions were "declined in 2.19.0" — that was dual NUMBERS); marked as a preserved snapshot, not maintained. Earlier, 2026-04-15 Rust→Cyrius parity snapshot, preserved; 2026-05-29 status addendum records nearly all "P0 gaps" now ported. Don't rewrite the body. |
 
 > Removed this pass: `tool-issues.md` (deleted — ad-hoc catalog; real bugs live in `issues/`), `cyrius-linalg-proposal.md` (→ `archive/`, shipped).
@@ -808,7 +827,7 @@ the scaffold's open items rather than letting them linger.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `testing.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: run-block and table counts → modules 2256, edge_cases 262, abuse 911, total **4443** (CI's published-count gate re-run under bash: every row and the sum match the live suites). |
+| `testing.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: counts → modules 2319, edge_cases 266, total **4510** (CI's published-count gate); a "white-box on purpose" pattern explaining why the suites can read `_` names while modules cannot. |
 | `usage.md` | — | ⚪ Not yet earned (does not exist; CLAUDE.md's Documentation Structure was corrected in 2.9.2 to stop implying it does) | "When earned" patterns/examples guide (CLAUDE.md). README Quick Start covers basics today; promote if onboarding needs more. |
 
 ---
@@ -901,7 +920,7 @@ and in the CHANGELOG entry that closed it.
 
 | File | Last touched | Status | Action |
 |---|---|---|---|
-| `benchmarks.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: one run recorded (on hpet — the kernel marked the TSC unstable at boot, `floor_ns` ≈ 1,328 vs ≈ 337); a dated 2026-09-30 measurement-change bullet (6.6.9 harness ends the `min > avg` caveat; `avg` unmoved on the A/B/C; `srgb_to_linear` +96% and `quat_slerp` −29% attributed upstream). Generated by `scripts/bench-history.sh`. |
+| `benchmarks.md` | 2026-09-30 | ✅ Fresh | **v4.0.0**: one run recorded from the final tree (load 0.85, hpet, `floor_ns` 1,313). `num_is_prime` reads 1,766 ns against the 19,829 baseline column (−91%), from the three-tier `mulmod`. The claim rests on the interleaved A/B in CHANGELOG `[4.0.0]`, not on this single run. A pre-review run was discarded and re-recorded, because it described a tree that no longer exists. (Previous: v3.2.2.) |
 | `benchmarks-rust-v-cyrius.md` | 2026-09-14 | ✅ Fresh (Rust column frozen) | **Docs sweep (post-3.2.0)**: reclassified from dated artifact — `testing.md` linked it as *the* Rust-vs-Cyrius comparison while its Cyrius column was a v2.2.0 / cc3 4.10.3 run from 2026-04-15 that charged a ~240 ns clock pair to every sub-µs row (`ease_in_out` read 403 ns for a 6 ns op). The Cyrius column is now the 3.2.0 quiet-box rows of `bench-history.csv` (2026-09-14T16:33) with recomputed ratios and like-for-like notes; the Rust column stays frozen (pre-2.0 tags). Refresh the Cyrius column when the ratios are quoted, from the CSV, never by hand. |
 
 ---
@@ -959,3 +978,4 @@ Scheduled doc decisions, surfaced so they aren't forgotten when the trigger arri
 *Initial scaffold: 2026-05-29 (v2.4.6), adapted from `cyrius/docs/doc-health.md`, immediately after the post-2.4.x documentation sweep. Same-day verify-and-cleanup pass: bench re-run, `tool-issues.md` retired, linalg proposal archived, CONTRIBUTING currency fixed, all 5 toolchain issues re-verified live on 6.0.14. Refresh in place when docs are touched.*
 
 | `migration-3.0.md` | 2026-09-30 | ✅ Fresh | **v3.2.2**: the minimum-toolchain paragraph re-measured on the 3.2.2 bundle; a note that negation zeros (6.6.8+) and `dual_pow` accuracy (6.6.10+) follow the consumer's pin. |
+| `migration-4.0.md` | 2026-09-30 | ✅ Fresh | **NEW in v4.0.0**: who is affected, the removed → replacement table, what moved (with the re-derived include sets), the behaviour changes measured against 3.2.2 (six number-theory functions above 2^62; `num_crt` at small moduli; `sym_const_eq`'s true tolerance; `linalg_sort_desc`'s Result), the 6.6.3 `&name` caveat, and why the suites keep white-box access. Revised after the pre-tag review found two claims in it false. |

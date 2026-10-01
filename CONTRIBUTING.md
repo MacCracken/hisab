@@ -12,7 +12,7 @@ Thank you for your interest in contributing to Hisab.
 
 ## Prerequisites
 
-- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.6.12 as of 3.2.2. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
+- [Cyrius](https://github.com/MacCracken/cyrius), at whatever version `cyrius.cyml [package].cyrius` pins — 6.6.12 as of 4.0.0. CI greps the manifest rather than carrying a literal; match the manifest and don't hardcode a version elsewhere
 - The build tool resolves stdlib + first-party deps automatically via `cyrius.cyml` (run `cyrius deps`)
 
 ## Checking Your Work
@@ -21,7 +21,7 @@ Thank you for your interest in contributing to Hisab.
 # Build
 cyrius build src/main.cyr build/hisab
 
-# Run all five suites (4443 assertions). CI runs every tests/*.tcyr — running
+# Run all five suites (4510 assertions). CI runs every tests/*.tcyr — running
 # fewer than five locally skips a whole surface, not a handful of cases.
 cyrius test tests/hisab.tcyr
 cyrius test tests/foundation.tcyr
@@ -51,10 +51,12 @@ cyrius fmt src/main.cyr --check
 # Vet include dependencies
 cyrius vet src/main.cyr
 
-# The public surface is declared, not implied (3.1.0): every non-underscore top-level
-# declaration carries `public`, and this flips every module `private` in a scratch copy
-# to prove the surface complete and exact. Adding a public fn without the keyword fails
-# claim 0; a cross-module `_` helper without the marker comment fails claim 1.
+# The public surface is declared (3.1.0) and enforced (4.0.0): every non-underscore
+# top-level declaration carries `public`, the shipped bundle is `private`, and this flips
+# every module `private` in a scratch copy to prove the surface complete and exact.
+# Adding a public fn without the keyword fails claim 0; a module reaching another
+# module's `_` helper fails claim 1 (claim 0 if the helper was made `public`); a bundle
+# without its marker, or with a private declaration right after a `public enum`, fails claim 5.
 ./scripts/check-public-surface.sh
 
 # No Result-returning call may sit in ARGUMENT position (it degrades to its tag, silently)
@@ -89,7 +91,7 @@ Library source lives in `src/` (`lib/` is vendored stdlib + deps only — never 
 - All f64 values stored as IEEE 754 bit patterns (use `f64_from()` / `f64_to()`)
 - Heap-allocate structs through their declared layout: `var v = alloc(sizeof(T)); T_set_x(v, x); return v;` — never a hardcoded byte count or a hand-computed offset for a type that has a `struct` (every public struct's `sizeof` is pinned exactly in `tests/abuse.tcyr` since 3.2.0). Manual `alloc(N)` + `store64` layouts are for types with no struct declaration only
 - Use `#derive(accessors)` for struct field access. ⚠ In a function that also expands `f64v_*` intrinsics, accumulate in a local and store through the setter ONCE rather than reading a derived getter INSIDE the value argument of a derived setter on the same object — cycc 6.6.0–6.6.4 miscompiled that shape (fixed in 6.6.5, hisab's pin crossed it in 3.2.1), and consumers compile `dist/hisab.cyr` under their OWN pins, all of them below the fix as of 2026-09-21 (see `m3_mul_vec3`)
-- Prefix private helpers with underscore: `fn _my_helper()`. Public API carries `public` (`public fn`, `public struct`, `public var`, `public enum`); a `_` helper another module reaches also carries `public` plus the `# public: cross-module helper reached from …` marker comment, and owes a 4.0.0 disposition on the roadmap
+- Prefix private helpers with underscore: `fn _my_helper()`. Public API carries `public` (`public fn`, `public struct`, `public var`, `public enum`). **No module may reach another module's `_` name** (since 4.0.0: claim 1 refuses a reach into a non-public item, and claim 0 refuses a `_` name that carries `public`): a helper two modules need is public API with a real name and a doc comment, or the code moves into one file. Members of a non-public enum are `_`-named too — enum constants carry no visibility in Cyrius, so the name is the only signal
 - Comment f64 hex constants with their decimal value
 - Use `elif` not `else if`
 - No negative literals: use `(0 - N)` or `f64_neg(x)`

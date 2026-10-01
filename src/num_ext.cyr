@@ -92,8 +92,13 @@ public fn num_modinv(a, m) {
         return 0 - 1;
     }
     var x = load64(out_x);
-    # Normalize to [0, m)
-    var result = ((x % m) + m) % m;
+    # Normalize to [0, m) without forming x + m. 4.0.0: this was `((x % m) + m) % m`,
+    # and `x % m + m` wraps once m > 2^62 -- num_modinv(5, 2^63-1) returned a negative
+    # non-inverse and num_modinv(1, 2^63-1) returned -1, "not invertible", which made
+    # num_crt refuse every system whose only modulus is 2^63 - 1.
+    # [measured: tests/modules.tcyr, group "4.0.0 number theory above 2^62"]
+    var result = x % m;
+    if (result < 0) { result = result + m; }
     return result;
 }
 
@@ -148,27 +153,45 @@ public fn num_mobius(n) {
 
 # Divisor sigma function sigma_k(n) = sum of d^k for all divisors d of n.
 # k = 0: number of divisors. k = 1: sum of divisors.
-# n: positive integer, k: non-negative integer
-# Returns: sigma_k(n)
+# n: positive integer (n <= 0 returns 0), k: non-negative integer
+# Returns: sigma_k(n). ⚠ The products and each p^k are i64 and unchecked: the result
+# is exact only while sigma_k(n) fits in i64 (always for k = 0; for k >= 1 it can
+# wrap for large n).
+# ⛔ 4.0.0 — THIS WAS A TRIAL-DIVISION LOOP ON `d * d <= n`, AND d * d WRAPS NEGATIVE
+# AT d = 3037000500, so for every n >= 3037000499^2 the test stayed true past
+# sqrt(n): n = 2^63 - 1 never returned, and n = 9223372033000000000 returned 440
+# divisors for 400. `d <= n / d` would have terminated, but only after ~3e9
+# iterations (~5 s) -- longer than the whole modules suite. sigma_k is
+# multiplicative, so it is computed from the factorization instead, the way
+# num_euler_totient already is: the product over p^a of 1 + p^k + ... + p^(a*k).
+# [measured: tests/modules.tcyr, group "4.0.0 number theory above 2^62"]
 public fn num_divisor_sigma(n, k) {
-    if (n == 0) { return 0; }
+    if (n <= 0) { return 0; }
     if (n == 1) { return 1; }
 
-    var sum = 0;
-    var d = 1;
-    while (d * d <= n) {
-        if (n % d == 0) {
-            # d^k via integer exponentiation
-            var dk = _numx_int_pow(d, k);
-            sum = sum + dk;
-            var other = n / d;
-            if (other != d) {
-                sum = sum + _numx_int_pow(other, k);
-            }
+    var factors = num_factorize(n);   # ascending, with multiplicity
+    var flen = vec_len(factors);
+    var result = 1;
+    var i = 0;
+    while (i < flen) {
+        var p = vec_get(factors, i);
+        var a = 0;
+        while (i < flen && vec_get(factors, i) == p) {
+            a = a + 1;
+            i = i + 1;
         }
-        d = d + 1;
+        var pk = _numx_int_pow(p, k);
+        var term = 1;
+        var acc = 1;
+        var j = 0;
+        while (j < a) {
+            term = term * pk;
+            acc = acc + term;
+            j = j + 1;
+        }
+        result = result * acc;
     }
-    return sum;
+    return result;
 }
 
 # Internal: ascending i64 comparator for `vec_sort_by` (<0 / 0 / >0). Written as
@@ -204,7 +227,8 @@ public fn num_pollard_rho(n) {
     if (n % 2 == 0) { return 2; }
     if (num_is_prime(n) == 1) { return n; }
 
-    # Brent's improvement
+    # Floyd's cycle detection: x steps once, y twice. (This comment said "Brent's
+    # improvement" through 3.2.x; Brent's variant batches the gcds, and this does not.)
     var c = 1;
     while (c < n) {
         var x = 2;
@@ -212,11 +236,15 @@ public fn num_pollard_rho(n) {
         var d = 1;
 
         while (d == 1) {
-            # x = (x*x + c) % n
-            x = (_num_mulmod(x, x, n) + c) % n;
+            # x = (x*x + c) % n, without forming either sum: both overflow once
+            # n > 2^62. n > 1 here, so num_mulmod's Err arms cannot be taken.
+            var xt, xx = num_mulmod(x, x, n);
+            x = _numx_addmod(xx, c, n);
             # y = f(f(y))
-            y = (_num_mulmod(y, y, n) + c) % n;
-            y = (_num_mulmod(y, y, n) + c) % n;
+            var yt, yy = num_mulmod(y, y, n);
+            y = _numx_addmod(yy, c, n);
+            var yt2, yy2 = num_mulmod(y, y, n);
+            y = _numx_addmod(yy2, c, n);
 
             var diff = x - y;
             if (diff < 0) { diff = 0 - diff; }
@@ -300,7 +328,10 @@ public fn num_factorize(n) {
             # Could not split further; use trial division fallback
             var td = 2;
             var mm = m;
-            while (td * td <= mm) {
+            # `td <= mm / td`, not `td * td <= mm`: the product wraps for mm near 2^63
+            # (num_divisor_sigma's 4.0.0 defect). Repaired on the shape -- this fallback
+            # runs only if Pollard rho cannot split a composite.
+            while (td <= mm / td) {
                 while (mm % td == 0) {
                     vec_push(factors, td);
                     mm = mm / td;
@@ -322,30 +353,44 @@ public fn num_factorize(n) {
     # every correct sort yields the same vec and tie order cannot be observed.
     # That is not true of hisab's other orderings (indices into a points vec,
     # eigenvector columns), which is why those stay hand-written -- see
-    # `_lext_sort_desc` in src/linalg_ext.cyr and `_col_sort_indices_by_xy`
+    # `linalg_sort_desc` in src/linalg_ext.cyr and `_col_sort_indices_by_xy`
     # in src/collision_core.cyr.
     vec_sort_by(factors, &_numx_cmp_i64);
 
     return factors;
 }
 
+# (x + y) mod m for x, y in [0, m), without forming x + y (it wraps once m > 2^62).
+fn _numx_addmod(x, y, m) {
+    if (x >= m - y) { return x - (m - y); }
+    return x + y;
+}
+
 # Chinese Remainder Theorem: solves x = r_i (mod m_i) for coprime moduli.
-# remainders: vec of remainder values
-# moduli: vec of modulus values (pairwise coprime)
+# remainders: vec of remainder values (any sign; each contributes its residue)
+# moduli: vec of modulus values (pairwise coprime, each > 0, product <= 2^63 - 1)
 # count: number of congruences
-# out_x: pointer -- solution x written here
+# out_x: pointer -- solution x in [0, M) written here
 # out_m: pointer -- combined modulus M written here
-# Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT on failure
+# Returns: Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) on failure -- including a
+# non-positive modulus and a product of moduli that does not fit in i64.
+# ⛔ 4.0.0 — THE PRODUCT WAS FORMED UNCHECKED: three moduli near 2^22 (product ~2^66)
+# returned Ok with M = -826830265255265 and x = 0. And with M between 2^62 and 2^63
+# the accumulation `(x + term) % M` wrapped: M = 3037000493 * 3037000453 returned Ok
+# with a wrong x. An overflowing product is refused now, a non-positive modulus is
+# refused up front, and every product and sum is formed without wrapping.
+# [measured: tests/modules.tcyr, group "4.0.0 number theory above 2^62"]
 #must_use
 public fn num_crt(remainders, moduli, count, out_x, out_m) {
     if (count <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
-    # Compute product of all moduli
+    # Compute product of all moduli, refusing one that would overflow.
     var big_m = 1;
     var i = 0;
     while (i < count) {
         var mi = vec_get(moduli, i);
-        if (mi == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        if (mi <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        if (big_m > 0x7FFF_FFFF_FFFF_FFFF / mi) { return Err(HSB_ERR_INVALID_INPUT); }
         big_m = big_m * mi;
         i = i + 1;
     }
@@ -360,10 +405,11 @@ public fn num_crt(remainders, moduli, count, out_x, out_m) {
         var yi = num_modinv(Mi_mod_mi, mi);
         if (yi == 0 - 1) { return Err(HSB_ERR_INVALID_INPUT); }
 
-        # x = (x + ri * Mi * yi) % big_m
-        # Use _num_mulmod to avoid overflow in intermediate products
-        var term = _num_mulmod(ri, _num_mulmod(Mi, yi, big_m), big_m);
-        x = (x + term) % big_m;
+        # x = (x + ri * Mi * yi) % big_m, every product and sum without overflow.
+        # big_m > 0 here, so num_mulmod's Err arms cannot be taken.
+        var pt, pv = num_mulmod(Mi, yi, big_m);
+        var tt, term = num_mulmod(ri, pv, big_m);
+        x = _numx_addmod(x, term, big_m);
         i = i + 1;
     }
 
@@ -440,7 +486,7 @@ fn _numx_chirp_angle(j, n) {
 fn _numx_dft(data, n) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (n == 1) { return Ok(0); }
-    if (_num_is_pow2(n) == 1) { return num_fft(data, n); }
+    if (num_is_pow2(n) == 1) { return num_fft(data, n); }
     if (n > _NUMX_DFT_MAX) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var m = _numx_next_pow2(2 * n - 1);
@@ -520,7 +566,7 @@ fn _numx_dft(data, n) {
 fn _numx_idft(data, n) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (n == 1) { return Ok(0); }
-    if (_num_is_pow2(n) == 0) {
+    if (num_is_pow2(n) == 0) {
         if (n > _NUMX_DFT_MAX) { return Err(HSB_ERR_INVALID_INPUT); }
     }
 
@@ -638,7 +684,7 @@ fn _numx_log2(n) {
 fn _numx_use_fft(n, len, post) {
     var direct = 2 * n * n;
     var est = 16;
-    if (_num_is_pow2(len) == 1) {
+    if (num_is_pow2(len) == 1) {
         est = est + len * _numx_log2(len) + post * len;
     } else {
         var m = _numx_next_pow2(2 * len - 1);
@@ -926,8 +972,8 @@ fn _numx_idct_direct(data, n) {
 # Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT if dimensions not power of 2
 #must_use
 public fn num_fft_2d(data, rows, cols) {
-    if (_num_is_pow2(rows) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
-    if (_num_is_pow2(cols) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (num_is_pow2(rows) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (num_is_pow2(cols) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # FFT each row
     var r = 0;
@@ -983,8 +1029,8 @@ public fn num_fft_2d(data, rows, cols) {
 # Returns: Ok(0) on success
 #must_use
 public fn num_ifft_2d(data, rows, cols) {
-    if (_num_is_pow2(rows) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
-    if (_num_is_pow2(cols) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (num_is_pow2(rows) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (num_is_pow2(cols) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # IFFT each row
     var r = 0;

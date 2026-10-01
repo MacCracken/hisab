@@ -125,11 +125,10 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
 # data: pointer to 2*n f64 values (each 8 bytes, so 16*n bytes total)
 # n: number of complex elements (must be power of 2)
 
-# Internal: check power of two
-# public: cross-module helper reached from num_ext.cyr — not API.
-# Disposition (promote / merge / leave the file open) is owed at the 4.0.0
-# `private` flip; see roadmap.md 'Public / private function surface'.
-public fn _num_is_pow2(n) {
+# 1 when n is a positive power of two, else 0 -- the precondition every FFT entry
+# point in num.cyr and num_ext.cyr documents. (Was `_num_is_pow2` through 3.2.x.)
+#must_use
+public fn num_is_pow2(n) {
     if (n <= 0) { return 0; }
     if ((n & (n - 1)) == 0) { return 1; }
     return 0;
@@ -170,7 +169,7 @@ fn _num_cswap(data, i, j) {
 #must_use
 public fn num_fft(data, n) {
     if (n <= 1) { return Ok(0); }
-    if (_num_is_pow2(n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (num_is_pow2(n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # Bit-reversal permutation
     var j = 0;
@@ -255,7 +254,7 @@ public fn num_ifft(data, n) {
     # bit-identical; the inverse must offer the same guarantee. Guard order
     # mirrors num_fft so n <= 1 still returns HSB_ERR_NONE.
     if (n <= 1) { return Ok(0); }
-    if (_num_is_pow2(n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (num_is_pow2(n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # Conjugate all elements
     var i = 0;
@@ -421,34 +420,73 @@ public fn num_gcd(a, b) {
     return a << shift;
 }
 
-# Overflow-safe modular multiplication: (a * b) % m via Russian peasant method.
-# Internal: m must be > 0 and a, b >= 0. num_modpow below is the public entry
-# point and enforces exactly that before any call reaches here.
-#
-# (The three lines that used to sit here -- "Fast modular exponentiation ...
-# Returns: (base^exp) % modulus" -- documented num_modpow, not this helper; they
-# had drifted one function up. They now live on num_modpow itself.)
-# public: cross-module helper reached from num_ext.cyr — not API.
-# Disposition (promote / merge / leave the file open) is owed at the 4.0.0
-# `private` flip; see roadmap.md 'Public / private function surface'.
-public fn _num_mulmod(a, b, m) {
+# (a * b) mod m for a, b in [0, m) and 1 <= m <= 2^63 - 1. The internal core:
+# callers have already checked m and reduced a and b. `num_mulmod` below is the
+# checked public form.
+# ⛔ 4.0.0 — THIS WAS `(result + a) % m` AND `(a + a) % m` AT EVERY MODULUS, AND BOTH
+# OVERFLOW ONCE m > 2^62: a residue at or above 2^62 doubled past i64 and wrapped
+# negative. Every public caller inherited it as a SILENT wrong answer --
+# `num_modpow(2^62, 2, 2^63-1)` was 0 (exact 2^61), and `num_is_prime` reported the
+# primes 2^63-25 and 2^62+135 COMPOSITE, because Miller-Rabin squares through here.
+# It is the same class as the raw `(x * x) % n` the witness loop below was moved
+# off, one level down.
+# [measured: tests/modules.tcyr, group "4.0.0 number theory above 2^62"]
+# Three tiers, each bound derived from what fits in i64:
+#   m <= 3037000500  the direct product: (m - 1)^2 <= 2^63 - 1, isqrt(2^63 - 1)
+#                    being 3037000499.
+#   m <= 2^62        the old doubling loop, which is exact here: a sum of two
+#                    residues is at most 2^63 - 2.
+#   above 2^62       the same loop on a modular add that never forms the sum: it
+#                    subtracts the gap `m - a`, and a negative difference gets m back
+#                    through a mask. `>>` is a LOGICAL shift in cycc, so `t >> 63` is
+#                    the sign bit as 0 or 1. Branchless because the data-dependent
+#                    compare-and-branch form took 362 us against 208 us at 2^62 + 135.
+# Against 3.2.2: num_is_prime(1000003) 19.2 us -> 1.81 us; (2^40 + 15) 65.4 us ->
+# 64.3 us; (2^62 + 135) correct at 212 us, where 3.2.2 answered wrong. An add-mod
+# loop at EVERY modulus was 2.2x slower than 3.2.2 at 1000003 and 2.7x at 2^40.
+# [measured: scratch A/B, 3.2.2 vs 4.0.0, 3 interleaved runs each, 2026-09-30]
+fn _num_mulmod(a, b, m) {
+    if (m <= 3037000500) { return (a * b) % m; }
     var result = 0;
-    a = a % m;
-    while (b > 0) {
-        if ((b & 1) == 1) {
-            result = (result + a) % m;
+    if (m <= 0x4000_0000_0000_0000) {
+        while (b > 0) {
+            if ((b & 1) == 1) { result = (result + a) % m; }
+            a = (a + a) % m;
+            b = b >> 1;
         }
-        a = (a + a) % m;
+        return result;
+    }
+    while (b > 0) {
+        var t = result - (m - (a & (0 - (b & 1))));
+        result = t + (m & (0 - (t >> 63)));
+        var u = a - (m - a);
+        a = u + (m & (0 - (u >> 63)));
         b = b >> 1;
     }
     return result;
 }
 
-# Fast modular exponentiation: (base^exp) mod modulus.
-# All arguments must be non-negative integers, and modulus must be > 0.
-# Returns: (base^exp) % modulus in [0, modulus), or a negative code:
-#          HSB_ERR_DIVISION_BY_ZERO if modulus == 0,
-#          HSB_ERR_INVALID_INPUT    if base, exp or modulus is negative.
+# (a * b) mod m, exact for every i64 a and b and every modulus 1 <= m <= 2^63 - 1 --
+# no overflow anywhere, and a negative operand contributes its mathematical residue.
+# Returns: Ok(r) with r in [0, m); Err(HSB_ERR_DIVISION_BY_ZERO) for m == 0 and
+# Err(HSB_ERR_INVALID_INPUT) for m < 0. (Was the unchecked `_num_mulmod` through 3.2.x.)
+#must_use
+public fn num_mulmod(a, b, m) {
+    if (m == 0) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    if (m < 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    a = a % m;
+    if (a < 0) { a = a + m; }
+    b = b % m;
+    if (b < 0) { b = b + m; }
+    return Ok(_num_mulmod(a, b, m));
+}
+
+# Fast modular exponentiation: (base^exp) mod modulus, exact for every modulus up to
+# 2^63 - 1 (see `_num_mulmod`). All arguments must be non-negative integers, and
+# modulus must be > 0.
+# Returns: Ok(r) with r in [0, modulus), or
+#          Err(HSB_ERR_DIVISION_BY_ZERO) if modulus == 0,
+#          Err(HSB_ERR_INVALID_INPUT)    if base, exp or modulus is negative.
 #
 # modulus == 0 WAS A SIGFPE. `modulus == 1` was guarded and 0 was not, so the
 # very next line -- `base % modulus` -- was an integer divide by zero:

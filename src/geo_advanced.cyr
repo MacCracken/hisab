@@ -678,10 +678,7 @@ fn _epa_tetra_strict(seed) {
 # Seed from GJK's terminating simplex.
 # Returns 0 = shapes do not overlap, 1 = out4 holds a usable tetrahedron,
 # 2 = they overlap but the simplex is not a usable seed (caller should fall back).
-# public: cross-module helper reached from collision_core.cyr — not API.
-# Disposition (promote / merge / leave the file open) is owed at the 4.0.0
-# `private` flip; see roadmap.md 'Public / private function surface'.
-public fn _epa_seed_gjk(sup_a, shape_a, sup_b, shape_b, out4) {
+fn _epa_seed_gjk(sup_a, shape_a, sup_b, shape_b, out4) {
     var simplex = _gjk_core_3d(sup_a, shape_a, sup_b, shape_b);
     if (simplex == 0) { return 0; }
     if (_gjk_simplex_count(simplex) < 4) { return 2; }
@@ -696,10 +693,7 @@ public fn _epa_seed_gjk(sup_a, shape_a, sup_b, shape_b, out4) {
 # (v0, v1, v2, v3) containing the origin, where v0 is an interior point of the
 # difference and (v1, v2, v3) is a boundary triangle the ray v0 -> origin
 # crosses. Returns 1 when out4 was written, 0 otherwise.
-# public: cross-module helper reached from collision_core.cyr — not API.
-# Disposition (promote / merge / leave the file open) is owed at the 4.0.0
-# `private` flip; see roadmap.md 'Public / private function surface'.
-public fn _epa_seed_portal(sup_a, shape_a, sup_b, shape_b, out4) {
+fn _epa_seed_portal(sup_a, shape_a, sup_b, shape_b, out4) {
     var px = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_unit_x());
     var nx = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_neg(hvec3_unit_x()));
     # Midpoint of the difference's x-extent: the midpoint of two of its own
@@ -874,10 +868,7 @@ var _GA_EPA_POLISH_COUNT = 0;
 # Expand `seed` (4 HVec3 pointers, a tetrahedron containing the origin) until the
 # closest supporting plane of the Minkowski difference is pinned. Writes the unit
 # outward normal and the depth. Returns 1 on success, 0 if the seed is unusable.
-# public: cross-module helper reached from collision_core.cyr — not API.
-# Disposition (promote / merge / leave the file open) is owed at the 4.0.0
-# `private` flip; see roadmap.md 'Public / private function surface'.
-public fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
+fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
     var vmax = 4 + EPA_MAX_ITER;
     var fmax = 2 * vmax + 8;
     var verts = alloc(vmax * 8);
@@ -1195,10 +1186,7 @@ fn _epa_degenerate_normal(sup_a, shape_a, sup_b, shape_b) {
 # point v, which is what a caller tracking a pair through contact sees on
 # either side of the touch. The depth is 0, so "translate B by depth * normal"
 # holds for either sign.
-# public: cross-module helper reached from collision_core.cyr — not API.
-# Disposition (promote / merge / leave the file open) is owed at the 4.0.0
-# `private` flip; see roadmap.md 'Public / private function surface'.
-public fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
+fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
     var simplex = _gjk_simplex_new();
     if (simplex == 0) { return 0; }
     var dir_slot = alloc(8);
@@ -1343,6 +1331,161 @@ public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_dep
             store64(out_normal, _epa_degenerate_normal(support_a, shape_a, support_b, shape_b));
             store64(out_depth, 0);
             return 1;
+        }
+    }
+    return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
+}
+
+# ================================================================
+# MPR / XenoCollide (Minkowski Portal Refinement) -- 3D
+# (In collision_core.cyr through 3.2.x; moved here in 4.0.0 so that it and the
+# shared EPA seed/refine helpers it hands its portal to live in one file.)
+# ================================================================
+# Support function interface: fncall2(support_fn, shape, direction) -> HVec3
+#
+# The MPR algorithm finds whether two convex shapes overlap and, if
+# so, computes the penetration normal and depth.  It works in the
+# Minkowski difference space: support_A(d) - support_B(-d).
+
+# mpr_intersect -- returns 1 if shapes overlap, 0 otherwise
+#
+# 2.9.0 REWRITE, same root cause as mpr_penetration below. The shipped version
+# kept a "portal" of v0, v1, v2 where v0 is the INTERIOR point, so the plane it
+# refined against was a plane through the inside of the Minkowski difference and
+# its convergence test (support in the portal direction reaching that plane) is
+# unsatisfiable for a body with interior. It ran all 64 iterations and then
+# `return 1` unconditionally, which is a FALSE POSITIVE whenever the shapes are
+# separated in a direction the portal never settled on. Measured over a
+# 455-configuration sweep against an exact reference: 9 separated pairs reported
+# as overlapping (half-extents (1,10,10) against a point box 0.4 away in x, and a
+# cylinder/OBB pair), versus 0 errors for gjk_intersect_3d. The 2026-08-04 audit
+# recorded these two as agreeing everywhere, but it only swept centre-line
+# separations of axis-aligned pairs, where the portal happens to settle.
+# [measured: CHANGELOG.md 2.9.0, the 455-configuration exact-reference sweep]
+#
+# _epa_seed_portal is the real XenoCollide portal: v0 interior, (v1,v2,v3) a
+# boundary triangle the ray v0 -> origin crosses, refined until the origin is on
+# the near side. A 1 from it means the origin is provably inside the difference.
+# A 0 does NOT mean "separated" -- it also covers a degenerate tetrahedron -- so
+# GJK decides that case, which is exactly what the identically-documented
+# gjk_intersect_3d publishes.
+#
+# 2.9.1: THE FALLBACK NOW IS gjk_intersect_3d, NOT A PRIVATE COPY OF ITS OLD
+# BODY. `_epa_seed_gjk != 0` is `_gjk_core_3d != 0` -- the bare strict-enclosure
+# test that WAS gjk_intersect_3d before 2.9.0 taught it exact tangency. 2.9.0
+# repaired one call site of that logic and left this one, so the two
+# identically-documented siblings drifted apart. Measured on this tree over
+# 1,149 fixtures x 5 dyadic scales (2^-20 .. 2^20) x both operand orders,
+# classified EXACTLY in rationals from the f64 coordinates the support functions
+# actually receive:
+#   * on the 7,540 pair evaluations whose support functions are EXACT (boxes,
+#     parallelepipeds, zero-radius spheres -- a ball of radius r > 0 is only
+#     approximated, its support point carries 2 ulp of the radius, which for
+#     r = 19 is 7.1e-15 against a 3.6e-15 coordinate ulp, so no algorithm can
+#     resolve a 1-ulp tangency there), gjk_intersect_3d was wrong 0 times and
+#     mpr_intersect 50 times. Every one of the 50 was an EXACT TANGENCY reported
+#     as a miss, and every one was mpr = 0 / gjk = 1.
+#   * the 50 come from 6 distinct configurations: two coincident zero-radius
+#     spheres, two coincident point boxes, two coincident zero-extent
+#     parallelepipeds, and -- NOT self-pairs, and not previously reported -- a
+#     point resting exactly on the CORNER of a solid unit box, in both the
+#     point-box and the zero-radius-sphere flavour.
+#   * 160 tangency evaluations between two shapes that BOTH have volume: 0
+#     disagreements. That is why an earlier axis-aligned face/edge/vertex sweep
+#     saw none of this.
+#   * 10 of the 50 are an OPERAND-ORDER ASYMMETRY: mpr_intersect(box, corner
+#     point) = 0 while mpr_intersect(corner point, box) = 1. A symmetric
+#     predicate that depends on argument order is broken under any tangency
+#     contract, which is why this was repaired rather than documented as strict.
+# Both candidate repairs (this one, and appending _epa_touch_probe to the
+# existing two branches) score identically: 0 wrong, 0 asymmetric, 0 false
+# positives over the same 7,540. This one is chosen because it is cheaper --
+# same-binary batch timing, median of min over 5 runs, 2000-call batches, min of
+# 20 rounds: box miss 1.452 -> 1.698 us (+17%) here against 2.055 (+42%) for the
+# unconditional probe; sphere miss 1.975 -> 2.360 (+19%) against 2.776 (+41%);
+# 1e-9-separated box pair 1.418 -> 1.692 (+19%) against 2.040 (+44%). The hit and
+# tangency paths do not move (5.610 -> 5.614, 6.307 -> 6.252). The delegation
+# inherits 2.9.0's gate: one extra support evaluation on a separated pair, and
+# the touch probe only on a genuinely unresolved GJK exit.
+# [measured: CHANGELOG.md 2.9.1, the 7,540-evaluation exact classification and timings]
+public fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
+    var seed = alloc(32);
+    if (seed == 0) { return 0; }
+    if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) == 1) { return 1; }
+    return gjk_intersect_3d(support_a, shape_a, support_b, shape_b);
+}
+
+# mpr_penetration -- returns 1 on success, writes normal/depth to out pointers
+# out_normal: pointer to HVec3 (overwritten) -- unit outward normal of the
+#             Minkowski difference A (-) B at its closest supporting plane
+# out_depth:  pointer where the f64 depth is stored -- h_M(normal), i.e.
+#             translating B by depth * normal separates the pair
+#
+# 2.9.0 REWRITE. Two separate defects, both measured against an exact reference
+# (15-axis OBB SAT in rationals for box/box, r0+r1-|c1-c0| for sphere/sphere,
+# r-sdBox(c,h) for sphere/box) over a 455-configuration sweep.
+# [measured: CHANGELOG.md 2.9.0]
+#
+# 1. THE SHIPPED CODE MEASURED THE WRONG PLANE. It kept a "portal" of v0, v1, v2
+#    and reported dot(v1, normal-of-that-triangle) -- but v0 is the INTERIOR
+#    point, so that plane passes through the inside of the difference and its
+#    distance from the origin is not a depth at all. It can be zero, and it can
+#    be negative. Over a 455-case sweep the old code agreed with the exact MTV on
+#    66 and had the wrong SIGN on 216. Its convergence test (the support in the
+#    portal direction reaching the plane through an interior point) is
+#    unsatisfiable for a body with interior, so it also always burned all 64
+#    iterations. The real MPR portal is a triangle v1,v2,v3 on the BOUNDARY, with
+#    v0 outside it; that is what _epa_seed_portal builds.
+#    [measured: CHANGELOG.md 2.9.0, 66 of 455 agreeing with the exact MTV]
+#
+# 2. MPR'S OWN DEPTH IS NOT THE MTV, AND ITS RELATIVE ERROR IS UNBOUNDED. Even a
+#    textbook-correct MPR reports the support distance along the direction the
+#    ray v0 -> origin happens to leave through, which is *a* separating distance
+#    but not the smallest one. For two axis-aligned boxes it picks the axis
+#    maximising |c_i| / h_i while the MTV is on the axis minimising h_i - |c_i|:
+#    with half-extents (1, 10, 10) and centre offset (0.5, 9, 0) MPR says 1.0
+#    where the MTV is 0.5, and stretching the second extent makes that ratio as
+#    large as you like. Since the portal tetrahedron (v0, v1, v2, v3) already
+#    contains the origin, it is exactly what EPA needs to start from, so we hand
+#    it to the shared _epa_refine and return the true minimum. The portal
+#    construction is still MPR -- it is the depth that is no longer MPR's
+#    approximation.
+#
+# 2.9.1: "NEITHER SEED SURVIVED" IS NOT THE SAME AS "NO CONTACT". The bail below
+# was the mpr_intersect defect in its other half, and it is one case WIDER: the
+# same six configurations (see mpr_intersect above) plus two coplanar flat plates
+# came back 0 here while gjk_epa_3d -- which has certified exactly this since
+# 2.8.3, in gjk_epa_3d above -- returned 1 with depth 0. It carried the
+# same operand-order asymmetry too. Repairing only mpr_intersect would have left
+# mpr_intersect = 1 and mpr_penetration = 0 on the same input, so both halves
+# move together. The probe is the SAME certificate gjk_epa_3d runs on its own
+# no-seed path, and it writes out_normal only when it has one.
+public fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    # EVERY RETURN PATH WRITES BOTH OUT-PARAMS, the convention gjk_epa_3d has
+    # carried since 2.8.3 (gjk_epa_3d, above). This sibling never got it:
+    # every 0 return left the caller's slots untouched, so a caller who passed
+    # fresh alloc() memory -- which is zeroed -- held a NULL HVec3 that faults on
+    # the first accessor. Demonstrated, not assumed: with the pre-2.9.1 body the
+    # 2.9.1 tangency group below aborts the whole suite on exactly that read. On
+    # a 0 return the normal is a DEFINED PLACEHOLDER, not a contact normal.
+    store64(out_normal, hvec3_unit_x());
+    store64(out_depth, 0);
+
+    var seed = alloc(32);
+    if (seed == 0) { return 0; }
+    if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) == 0) {
+        # The portal degenerated -- a flat Minkowski difference, or a body whose
+        # boundary is so nearly tangent to the ray that the wedge tests cannot
+        # settle. GJK reaches the same kind of tetrahedron along a completely
+        # different direction sequence, so it usually survives where the portal
+        # does not; anything it rejects has no interior to measure -- but it may
+        # still be an exact TANGENCY, whose honest answer is depth 0, not "miss".
+        if (_epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed) != 1) {
+            if (_epa_touch_probe(support_a, shape_a, support_b, shape_b, out_normal) == 1) {
+                store64(out_depth, 0);
+                return 1;
+            }
+            return 0;
         }
     }
     return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
@@ -3269,8 +3412,8 @@ public fn cga_plane(nx, ny, nz, d) {
     # failure "carries no signal that anything went wrong"; neither did this one.
     # ⭐ Chained `ganita_f64_hypot` rather than a fourth hand-rolled scaled loop.
     # It is the stdlib's own scale-by-the-larger-leg form, and chaining it for a
-    # third leg was measured **bit-identical to `_lie_norm3` on all 2098 binades**
-    # including subnormals. ⚠ `_lie_norm3` itself is not reachable from here —
+    # third leg was measured **bit-identical to `lie_norm3` (then `_lie_norm3`) on all
+    # 2098 binades** including subnormals. ⚠ `lie_norm3` itself is not reachable here —
     # `src/lie.cyr` sits after `src/geo_advanced.cyr` in the `[lib]` order, so
     # calling it would invert the declared dependency direction.
     # [measured: 2041-binade sweep; chained-hypot equivalence over 2098 binades]
@@ -3327,7 +3470,7 @@ public fn cga_rotor(ax, ay, az, angle) {
     # scales wrong, 991 of them the fabricated identity.** Moving a threshold does
     # not help when the quantity it tests has already lost the value.
     # ⭐ Chained `ganita_f64_hypot`, as in `cga_plane` above and for the same
-    # reasons (stdlib form; `_lie_norm3` is later in the `[lib]` order).
+    # reasons (stdlib form; `lie_norm3` is later in the `[lib]` order).
     # [measured: 2041-binade two-sided sweep on the e23 component, 2026-09-10]
     var norm = ganita_f64_hypot(ganita_f64_hypot(ax, ay), az);
     # ⛔ The axis LENGTH is a unit choice — the header one line up even says the

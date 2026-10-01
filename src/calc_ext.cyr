@@ -36,8 +36,19 @@ var _CALCX_F64_1E_NEG30 = 0x39B4_484B_FEEB_C2A0;   # 1e-30
 # HELPERS: flat f64 array manipulation
 # ================================================================
 
-# Allocate a flat f64 array of n elements (zeroed by bump allocator)
+# Allocate a flat f64 array of n elements (zeroed by bump allocator), or the
+# designed 0 when no such array can exist.
+# ⛔ CALLER-SIZED, AND UNCHECKED THROUGH 3.3.0. calc_gradient, calc_jacobian,
+# calc_hessian and calc_partial_derivative passed the caller's dimension straight
+# here and stored through the result. n = 3e8 asks for 2.4 GB against ALLOC_MAX's
+# 2 GiB, `alloc` returns its designed 0, and the first copy stored to address 0:
+# all four exited 139.
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+# ⭐ The bound is derived and written as a division, so it also rejects the
+# n >= 2^61+1 whose `n * 8` wraps to a small POSITIVE size that `alloc` would
+# honour. Every caller checks for the 0.
 fn _f64arr_alloc(n) {
+    if (n > ALLOC_MAX / 8) { return 0; }
     return alloc(n * 8);
 }
 
@@ -89,6 +100,7 @@ public fn calc_partial_derivative(f, x, n, index, h) {
     # Allocate x_plus and x_minus buffers
     var x_plus = _f64arr_alloc(n);
     var x_minus = _f64arr_alloc(n);
+    if (x_plus == 0 || x_minus == 0) { return 0; }
     _f64arr_copy(x_plus, x, n);
     _f64arr_copy(x_minus, x, n);
 
@@ -108,12 +120,16 @@ public fn calc_partial_derivative(f, x, n, index, h) {
 # f: function pointer, fncall1(f, x_ptr) -> f64.
 # x: pointer to flat f64[n], n: dimension, h: step size (f64).
 # out: pointer to flat f64[n] to receive gradient components.
-# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n == 0.
+# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n <= 0,
+# Err(HSB_ERR_ALLOC) if no n-element scratch array can be allocated.
+# ⚠ Through 3.3.0 only n == 0 was rejected: a negative n skipped every loop and
+# returned Ok(0) with `out` never written.
 #must_use
 public fn calc_gradient(f, x, n, h, out) {
-    if (n == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var x_buf = _f64arr_alloc(n);
+    if (x_buf == 0) { return Err(HSB_ERR_ALLOC); }
     _f64arr_copy(x_buf, x, n);
 
     var inv_2h = f64_div(F64_ONE, f64_mul(F64_TWO, h));
@@ -143,17 +159,18 @@ public fn calc_gradient(f, x, n, h, out) {
 # x: pointer to flat f64[n_in], n_in: input dim, n_out: output dim.
 # h: step size (f64).
 # out: pointer to flat f64[n_out * n_in] (row-major: J[i][j] = out[i*n_in + j]).
-# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n_in or n_out == 0.
+# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n_in or n_out <= 0,
+# Err(HSB_ERR_ALLOC) if the scratch arrays cannot be allocated.
 #must_use
 public fn calc_jacobian(f, x, n_in, n_out, h, out) {
-    if (n_in == 0) { return Err(HSB_ERR_INVALID_INPUT); }
-    if (n_out == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n_in <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n_out <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var x_buf = _f64arr_alloc(n_in);
-    _f64arr_copy(x_buf, x, n_in);
-
     var f_plus = _f64arr_alloc(n_out);
     var f_minus = _f64arr_alloc(n_out);
+    if (x_buf == 0 || f_plus == 0 || f_minus == 0) { return Err(HSB_ERR_ALLOC); }
+    _f64arr_copy(x_buf, x, n_in);
 
     var inv_2h = f64_div(F64_ONE, f64_mul(F64_TWO, h));
 
@@ -162,12 +179,15 @@ public fn calc_jacobian(f, x, n_in, n_out, h, out) {
         var xj = _f64arr_get(x, j);
 
         # f(x + h*e_j)
+        # Bound, not a bare statement: cycc 6.6.2-6.6.4 SIGSEGVs on a bare
+        # `fncall2(closure, ...);` -- see the note at opt_gradient_descent in
+        # optimize.cyr.
         _f64arr_set(x_buf, j, f64_add(xj, h));
-        fncall2(f, x_buf, f_plus);
+        var fp_rc = fncall2(f, x_buf, f_plus);
 
         # f(x - h*e_j)
         _f64arr_set(x_buf, j, f64_sub(xj, h));
-        fncall2(f, x_buf, f_minus);
+        var fm_rc = fncall2(f, x_buf, f_minus);
 
         # Restore
         _f64arr_set(x_buf, j, xj);
@@ -190,12 +210,14 @@ public fn calc_jacobian(f, x, n_in, n_out, h, out) {
 # f: function pointer, fncall1(f, x_ptr) -> f64.
 # x: pointer to flat f64[n], n: dimension, h: step size (f64).
 # out: pointer to flat f64[n*n] (row-major: H[i][j] = out[i*n + j]).
-# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n == 0.
+# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n <= 0,
+# Err(HSB_ERR_ALLOC) if no n-element scratch array can be allocated.
 #must_use
 public fn calc_hessian(f, x, n, h, out) {
-    if (n == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var x_buf = _f64arr_alloc(n);
+    if (x_buf == 0) { return Err(HSB_ERR_ALLOC); }
     _f64arr_copy(x_buf, x, n);
 
     var f0 = fncall1(f, x);

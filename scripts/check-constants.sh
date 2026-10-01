@@ -194,12 +194,16 @@ for path in sorted(glob.glob('src/*.cyr')):
             ev = eval_exact(exact_src)
             if ev is not None and (sep or not re.fullmatch(DEC.pattern, exact_src)):
                 expected, basis = ev, f"expr {exact_src}"
-                # A comment expression is re-evaluated here in a different order
-                # than whatever produced the shipped bits (e.g. `1.0/2.4` in
-                # float vs the correctly-rounded 5/12), so allow a few ulp.
-                # Real transcription errors in this repo are >= 9e-6 relative --
-                # five orders of magnitude clear of this bound.
-                tol = 8 * ulp(expected)
+                # ⛔ 3.3.1 -- THIS WAS 8 ULP, on the theory that a comment
+                # expression re-evaluated in a different order (`1.0/2.4` in
+                # float vs the correctly-rounded 5/12) lands a few ulp away. It
+                # does not: those two give the same f64, and 8 of the 9
+                # expression constants sat at exactly 0 ulp. The ninth,
+                # color.cyr's _SRGB_INV_2_4, was a 5-ulp transcription error the
+                # slack had been passing. One ulp allows a single rounding of
+                # difference and nothing more.
+                # [measured: per-constant ulp distance over src/, 2026-09-30]
+                tol = 1 * ulp(expected)
 
         if expected is None:
             # Falling back to "pull the first decimal out of the comment" is only
@@ -268,7 +272,14 @@ for path in sorted(glob.glob('src/*.cyr')):
 # Two copies agreeing today is not safety, it is a coincidence with a deadline.
 # Column 0 ONLY. Cyrius indents function bodies, so a leading-whitespace `var`
 # is a LOCAL and shadows nothing outside its function.
-GLOBAL_DECL = re.compile(r'^var\s+([A-Z][A-Z0-9_]*)\s*=\s*(\S.*?);')
+# ⛔ 3.3.1 -- THIS ARM MATCHED NOTHING. The regex was `^var\s+([A-Z]...)`: it
+# missed every `public var` (3.1.0 annotated them all) and every `_`-prefixed
+# global, which is all 197 of the rest. 0 of 221 declarations matched, so it
+# reported "no duplicates" over an empty set. cycc warns on a duplicate with a
+# DIFFERENT value, which CI's duplicate-symbol step catches, but a same-value
+# duplicate draws no diagnostic, and that is the case this arm exists for.
+# [measured: regex replay over src/, 2026-09-30; cycc 6.6.12 duplicate probe]
+GLOBAL_DECL = re.compile(r'^(?:public\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\S.*?);')
 seen_globals = {}
 for path in sorted(glob.glob('src/*.cyr')):
     for lineno, line in enumerate(open(path, encoding='utf-8', errors='replace'), 1):
@@ -277,6 +288,18 @@ for path in sorted(glob.glob('src/*.cyr')):
             continue
         name, val = m.group(1), m.group(2).strip()
         seen_globals.setdefault(name, []).append((path, lineno, val))
+
+# The same floor discipline as the constant population below: an arm that can be
+# emptied by a mechanical edit while still printing "no duplicates" is the defect
+# this block just had. Raise it when globals are added; lower it only with a
+# reason in the commit (3.3.2 deletes the dead `_COL_*` globals and will).
+GLOBAL_FLOOR = 221   # column-0 global declarations in src/, re-derived 2026-09-30
+global_population = sum(len(v) for v in seen_globals.values())
+if global_population < GLOBAL_FLOOR:
+    print(f"\n!! DUPLICATE-GLOBAL SCAN SHRANK: {global_population} declarations seen, floor is {GLOBAL_FLOOR}.")
+    print("   A global stopped matching GLOBAL_DECL -- the scan is blind to it. Check the")
+    print("   declaration shape before touching the floor.")
+    sys.exit(1)
 
 dup_errors = []
 for name, sites in sorted(seen_globals.items()):
@@ -335,7 +358,7 @@ if errors:
 # without failing is a gate that can be emptied by a mechanical edit. The floor
 # is the population at the last audit; raise it when constants are added, never
 # lower it without saying why in the commit.
-POPULATION_FLOOR = 160   # 159 verified + 1 skipped, re-derived 2026-09-13
+POPULATION_FLOOR = 164   # 163 verified + 1 skipped, re-derived 2026-09-30 (was 160 since 2026-09-13)
 population = total + len(skipped)
 if population < POPULATION_FLOOR:
     print(f"\n!! POPULATION SHRANK: {population} declarations seen, floor is {POPULATION_FLOOR}.")

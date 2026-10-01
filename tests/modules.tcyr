@@ -4402,8 +4402,9 @@ fn _ot_drive(solver, gp, tol) {
     _OT_RUN = _OT_RUN + 1;
     if (ok != 1) { _OT_BAD = _OT_BAD + 1; return 0; }
     # THE SOLVER'S OWN CONTRACT: a 0 return claims ||grad|| < tol at out_x.
+    # Bound, not bare: `gp` may be a capturing closure (see the 3.3.1 block below).
     var g = alloc(16);
-    fncall2(gp, ox, g);
+    var g_rc = fncall2(gp, ox, g);
     var gn = f64_sqrt(f64_add(f64_mul(load64(g), load64(g)),
         f64_mul(load64(g + 8), load64(g + 8))));
     if (f64_lt(gn, tol) != 1) { _OT_BAD = _OT_BAD + 1; return 0; }
@@ -4432,6 +4433,55 @@ assert_eq(_OT_RUN, 8, "four solvers x two gradient sources");
 assert_eq(_OT_BAD, 0,
   "every solver converges to (1,2) with a REVERSE-MODE gradient, and honours ||g|| < tol there");
 
+# --- 3.3.1: the header's closure recipe, compiled as written -----------------
+#
+# The recipe in autodiff.cyr's header is a CAPTURING CLOSURE, and through 3.3.0 no
+# test compiled one: `_ot_g_tape` above is a plain fn "so the assertion does not
+# depend on closure support". That premise hid two defects. The recipe's
+# `return ad_grad_into(...)` would not compile inside a helper fn on any pin
+# 6.6.3-6.6.12. And on cycc 6.6.2-6.6.4 the solvers' bare `fncall2(grad, ...);`
+# statements SIGSEGVed with it (exit 139 under 6.6.3).
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30]
+# This builds the closure inside a helper fn, the form that failed to compile,
+# exactly as the header now writes it, and drives all four solvers with it. The
+# 6.6.2-6.6.4 half cannot be seen from this suite's 6.6.12 pin; CI's
+# bare-`fncall` step is what guards it.
+fn _ot_make_closure_grad(tape) {
+    var grad = |x, out| {
+        ad_tape_reset(tape);
+        var ids = alloc(16);
+        var i0 = ad_var(tape, load64(x));
+        var i1 = ad_var(tape, load64(x + 8));
+        store64(ids, i0);
+        store64(ids + 8, i1);
+        var a = ad_sub(tape, i0, ad_const(tape, F64_ONE));
+        var b = ad_sub(tape, i1, ad_const(tape, F64_TWO));
+        var root = ad_add(tape, ad_mul(tape, a, a), ad_mul(tape, b, b));
+        var gt, gv = ad_grad_into(tape, root, ids, 2, out);
+        return 0;
+    };
+    return grad;
+}
+
+# ⚠ The closure is built and bound INSIDE a fn, the way a consumer's main() does.
+# That placement is what makes this test able to fail: with the old recipe's
+# `return ad_grad_into(...)`, cycc reports `var g = _ot_make_closure_grad(...)`
+# inside a fn as an ERROR ("bind both"), but the same bind at top level only as a
+# WARNING, which no suite fails on. The first draft bound it at top level and the
+# reverted recipe passed all 2323 assertions.
+fn _ot_drive_closure_recipe(tol) {
+    var grad = _ot_make_closure_grad(ad_tape_new(64));
+    for (var sv = 0; sv < 4; sv = sv + 1) { _ot_drive(sv, grad, tol); }
+    return 0;
+}
+
+test_group("3.3.1 autodiff x optimize: the header's closure recipe, as written");
+_OT_RUN = 0;
+_OT_BAD = 0;
+_ot_drive_closure_recipe(ot_tol);
+assert_eq(_OT_RUN, 4, "four solvers driven by the header's closure recipe");
+assert_eq(_OT_BAD, 0, "the closure recipe converges to (1,2) in every solver and honours ||g|| < tol there");
+
 # ad_grad_write is the piece that removes a per-variable store64 from every call
 # site. Checked against reading the adjoints one at a time.
 var ow_t = ad_tape_new(16);
@@ -4442,7 +4492,12 @@ store64(ow_ids, ow_a);
 store64(ow_ids + 8, ow_b);
 var ow_root = ad_mul(ow_t, ow_a, ow_b);
 var ow_out = alloc(16);
-assert_eq(ad_grad_into(ow_t, ow_root, ow_ids, 2, ow_out), 0, "ad_grad_into succeeds");
+# ⚠ 3.3.1 — these three sites read only the TAG (Ok = 0, Err = 1) because
+# check-result-migration.sh could not see that ad_grad_into returns a Result: it
+# has no `return Ok(` of its own, only `?` and a tail call. Both halves now.
+var _owt, _owv = ad_grad_into(ow_t, ow_root, ow_ids, 2, ow_out);
+assert_eq(is_ok(_owt), 1, "ad_grad_into succeeds");
+assert_eq(_owv, 0, "ad_grad_into's Ok payload is 0");
 assert(f64_approx_eq(load64(ow_out), f64_from(5), LOOSE_TOL_M),
   "ad_grad_into wrote d(xy)/dx = y = 5 into slot 0");
 assert(f64_approx_eq(load64(ow_out + 8), f64_from(3), LOOSE_TOL_M),
@@ -4464,8 +4519,8 @@ var oz_ids = alloc(16);
 store64(oz_ids, oz_x);                          # slot 0 <- node 3
 store64(oz_ids + 8, oz_y);                      # slot 1 <- node 2
 var oz_out = alloc(16);
-assert_eq(ad_grad_into(oz_t, ad_mul(oz_t, oz_x, oz_y), oz_ids, 2, oz_out), 0,
-  "ad_grad_into on a tape whose variables are not the first nodes");
+var _ozt, _ozv = ad_grad_into(oz_t, ad_mul(oz_t, oz_x, oz_y), oz_ids, 2, oz_out);
+assert_eq(is_ok(_ozt), 1, "ad_grad_into on a tape whose variables are not the first nodes");
 assert(f64_approx_eq(load64(oz_out), f64_from(5), LOOSE_TOL_M),
   "slot 0 holds d/dx = 5, read through ids -- NOT the adjoint of node 0");
 assert(f64_approx_eq(load64(oz_out + 8), f64_from(3), LOOSE_TOL_M),
@@ -4473,13 +4528,15 @@ assert(f64_approx_eq(load64(oz_out + 8), f64_from(3), LOOSE_TOL_M),
 
 # ⚠ And ad_grad_into must PROPAGATE the sweep's error rather than writing
 # whatever adjoints happen to be lying around. Another surviving mutant: dropping
-# the `if (rc != 0) { return rc; }` changed nothing, because nothing called it
-# with a bad root.
+# the error check on the sweep (an `if (rc != 0) { return rc; }` then, the `?` on
+# `ad_grad(...)` since 3.0.0) changed nothing, because nothing called it with a
+# bad root.
 var oz_bad = alloc(16);
 store64(oz_bad, f64_from(77));
 store64(oz_bad + 8, f64_from(77));
-assert(ad_grad_into(oz_t, AD_FULL, oz_ids, 2, oz_bad) != 0,
-  "ad_grad_into on a bad root returns the sweep's error");
+var _obt, _obv = ad_grad_into(oz_t, AD_FULL, oz_ids, 2, oz_bad);
+assert_eq(is_err_result(_obt), 1, "ad_grad_into on a bad root returns the sweep's error");
+assert_eq(_obv, HSB_ERR_INVALID_INPUT, "and the payload is ad_grad's own HSB_ERR_INVALID_INPUT, forwarded intact");
 assert_eq(load64(oz_bad), f64_from(77),
   "and it wrote NOTHING -- the caller's buffer still holds its own sentinel");
 
@@ -7512,11 +7569,16 @@ assert_eq(HVec3_x(csv), srgb_to_linear(F64_HALF), "srgb_to_linear_vec3 matches t
 var cls = linear_to_srgb_vec3(csv);
 assert(f64_lt(f64_abs(f64_sub(HVec3_x(cls), F64_HALF)), LOOSE_TOL_M) == 1,
   "linear_to_srgb_vec3 round-trips 0.5");
-# lerp at the endpoints is exact.
+# lerp at the endpoints: within 1 ulp, not exact.
 var cla = hvec3_new(F64_ONE, 0, 0);
 var clb = hvec3_new(0, F64_ONE, 0);
-# Not bit-exact: lerp_srgb converts to linear, interpolates, and converts back,
-# so the endpoints come back 1 ulp low. Tolerance, not equality.
+# Not bit-exact, and NOT because of the round trip. srgb_to_linear(1.0) is exact,
+# and so is pow(1, 1/2.4). linear_to_srgb(1.0) = 1.055 - 0.055 comes back 1 ulp
+# low (0x3FEFFFFFFFFFFFFF) because neither constant is representable, so their
+# difference is 1 - 2^-53. (Through 3.3.0 this comment blamed the round trip, and
+# the line above it called the endpoints exact.)
+# [measured: f64 replay of _SRGB_1_055 and _SRGB_0_055, 2026-09-30]
+# Tolerance, not equality.
 assert(f64_lt(f64_abs(f64_sub(HVec3_x(lerp_srgb_vec3(cla, clb, 0)), F64_ONE)), LOOSE_TOL_M) == 1,
   "lerp_srgb t = 0 is a");
 assert(f64_lt(f64_abs(f64_sub(HVec3_y(lerp_srgb_vec3(cla, clb, F64_ONE)), F64_ONE)), LOOSE_TOL_M) == 1,

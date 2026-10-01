@@ -6,9 +6,9 @@
 # All test suites
 cyrius test tests/hisab.tcyr        # 585 smoke/integration tests
 cyrius test tests/foundation.tcyr   # 429 exhaustive foundation type tests
-cyrius test tests/modules.tcyr      # 2319 per-module tests
-cyrius test tests/edge_cases.tcyr   # 266 edge case + boundary tests
-cyrius test tests/abuse.tcyr        # 911 hostile-input tests
+cyrius test tests/modules.tcyr      # 2323 per-module tests
+cyrius test tests/edge_cases.tcyr   # 267 edge case + boundary tests
+cyrius test tests/abuse.tcyr        # 971 hostile-input tests
 
 # Benchmarks (80 operations)
 cyrius bench tests/hisab.bcyr
@@ -26,11 +26,11 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 | Suite | Assertions | Covers |
 |-------|-----------|--------|
 | `foundation.tcyr` | 429 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
-| `modules.tcyr` | 2319 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff (forward-mode duals AND the 2.11.0 reverse-mode tape), interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1, the OBB rotation partial in 2.10.2) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse); since 3.3.0, number theory above 2^62 (the three `mulmod` tiers and their boundaries) and the helpers 3.3.0 made public, called as API |
+| `modules.tcyr` | 2323 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff (forward-mode duals AND the 2.11.0 reverse-mode tape), interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1, the OBB rotation partial in 2.10.2) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse); since 3.3.0, number theory above 2^62 (the three `mulmod` tiers and their boundaries) and the helpers 3.3.0 made public, called as API |
 | `hisab.tcyr` | 585 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms), decomposition (SVD, QR, eigen), Krylov (GMRES) |
-| `edge_cases.tcyr` | 266 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11), and `noise_perm` building its table on first use — this is the one suite with no other noise call |
-| `abuse.tcyr` | 911 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Surfaced 11 real defects on public entry points, held in a known-defect register rather than deleted |
-| **Total** | **4510** | |
+| `edge_cases.tcyr` | 267 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11), and `noise_perm` building its table on first use — this is the one suite with no other noise call |
+| `abuse.tcyr` | 971 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Surfaced 11 real defects on public entry points, held in a known-defect register rather than deleted |
+| **Total** | **4575** | |
 
 ⛔ **2.21.0 — THREE OF THOSE FIVE ROWS HAD BEEN STALE FOR RELEASES AND THE TABLE
 COULD NOT ANNOUNCE IT.** They summed to **3574** against a published total of

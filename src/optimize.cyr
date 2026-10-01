@@ -256,7 +256,16 @@ public fn opt_gradient_descent(f, grad, x0, n, lr, tol, max_iter, out_x, out_fmi
     var iter = 0;
     while (iter < max_iter) {
         # Evaluate gradient
-        fncall2(grad, x, g);
+        # ⛔ BOUND, NOT A BARE STATEMENT -- and every gradient/Jacobian call in this
+        # file is written the same way. Consumers compile this bundle under their
+        # own cycc, and cycc 6.6.2-6.6.4 lowered a bare `fncall2(f, a, b);` without
+        # closure awareness: a capturing closure passed as `grad` (the tape recipe
+        # in autodiff.cyr) SIGSEGVed there, and binding the result fixed it. Six
+        # direct consumers pin 6.6.3. Fixed upstream in cycc 6.6.5; this stays while
+        # consumers sit below it. CI fails on any bare `fncall` statement in src/.
+        # [measured: scratch harness, not reproducible in-tree, 2026-09-30]
+        # (bare: exit 139 on 6.6.2, 6.6.3, 6.6.4; bound: 0 there; both 0 on 6.6.5, 6.6.12)
+        var g_rc = fncall2(grad, x, g);
 
         # Check convergence: ||g|| < tol
         var gnorm = _opt_norm(g, n);
@@ -342,7 +351,7 @@ public fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin)
     _opt_copy(x, x0, n);
 
     # Initial gradient and search direction d = -g
-    fncall2(grad, x, g);
+    var g_rc = fncall2(grad, x, g);
     var i = 0;
     while (i < n) {
         store64(d + i * 8, f64_neg(load64(g + i * 8)));
@@ -370,7 +379,7 @@ public fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin)
         _opt_armijo(f, x, d, g, n, f_old, x_trial);
 
         # New gradient at x_trial
-        fncall2(grad, x_trial, g_new);
+        var g_new_rc = fncall2(grad, x_trial, g_new);
         var gg_new = _opt_dot(g_new, g_new, n);
 
         # Polak-Ribiere+ beta (strictly superior to Fletcher-Reeves)
@@ -468,7 +477,7 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
     }
 
     _opt_copy(x, x0, n);
-    fncall2(grad, x, g);
+    var g_rc = fncall2(grad, x, g);
 
     var iter = 0;
     while (iter < max_iter) {
@@ -500,7 +509,7 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
         _opt_armijo(f, x, d, g, n, f_old, x_new);
 
         # Compute s = x_new - x, and new gradient
-        fncall2(grad, x_new, g_new);
+        var g_new_rc = fncall2(grad, x_new, g_new);
         i = 0;
         while (i < n) {
             store64(s + i * 8, f64_sub(load64(x_new + i * 8), load64(x + i * 8)));
@@ -633,7 +642,7 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
     var head = 0;
 
     _opt_copy(x, x0, n);
-    fncall2(grad, x, g);
+    var g_rc = fncall2(grad, x, g);
 
     var iter = 0;
     while (iter < max_iter) {
@@ -750,7 +759,7 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
         _opt_armijo(f, x, q, g, n, f_old, x_new);
 
         # Compute new gradient (g_new_buf is hoisted)
-        fncall2(grad, x_new, g_new_buf);
+        var g_new_rc = fncall2(grad, x_new, g_new_buf);
 
         # Store correction pair in ring buffer (s_k / y_k are hoisted)
         vi = 0;
@@ -818,6 +827,18 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
     var np = n_params;
     var nr = n_residuals;
 
+    # ⛔ CWE-190 -- the 2.12.0 opt_conjugate_gradient shape, missed here until 3.3.1.
+    # `nr * np * 8` sizes j_buf and nothing round-tripped it. n_params = 2 with
+    # n_residuals = 2^60+1 wraps it to 16, `alloc` honours 16 bytes, and the solver
+    # proceeds as if it held nr*np f64s: exit 139.
+    # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+    # The round-trip tests the multiply this function performs. It reports
+    # HSB_ERR_ALLOC, the code the NON-positive wrap (2^30 x 2^30) and a merely
+    # too-large product already got from the null check below, so both directions
+    # of the wrap read alike and no conforming caller is refused.
+    var nrp = nr * np;
+    if (nrp / np != nr || nrp != (nrp * 8) / 8) { return Err(HSB_ERR_ALLOC); }
+
     var x       = alloc(np * 8);
     var x_trial = alloc(np * 8);
     var jtr     = alloc(np * 8);
@@ -867,7 +888,7 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
         }
 
         # Evaluate Jacobian
-        fncall2(jacobian, x, j_buf);
+        var j_rc = fncall2(jacobian, x, j_buf);
 
         # Compute J^T * J (np x np) and J^T * r (np x 1) into the hoisted jtj.
         var pi = 0;

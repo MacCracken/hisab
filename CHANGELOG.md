@@ -2,6 +2,111 @@
 
 ## [Unreleased]
 
+The roadmap's **[3.3.1]** items: inputs that ended the caller's process, gates that could not fail,
+and two safety claims 3.3.0 shipped that were false. Every repair below was reproduced first, from
+a scratch dir pinned to cycc 6.6.12 against the shipped 3.3.0 bundle, and every new assertion was
+mutation-proved (22 mutants; 21 killed, and the one survivor is an equivalent mutant recorded in
+the source with its reason). Suites **4510 → 4575**, all passing: hisab 585, foundation 429, modules
+2323, edge_cases 267, abuse 971. Constant gate **163/163** (1 skipped). Rebuilt from pinned dirs:
+6.6.2 still refuses the bundle with the known `#derive` error, and under 6.6.3, 6.6.6, 6.6.9, 6.6.10
+and 6.6.12 a GeoJet program, the autodiff closure recipe and a former-abort Delaunay call all run
+correctly.
+
+### Fixed — inputs that ended the caller's process
+- **collision_mesh**: `delaunay_2d` with `n > vec_len(points)` exited 1 (`vec: index out of
+  bounds`), and with a null vec exited 139; `detect_islands` did the same for `n_contacts`. Both now
+  return their empty result, the guard 2.12.0 gave `convex_hull_2d` and `triangulate_polygon`.
+  `detect_islands(0, 0, n)` still returns n singleton islands.
+- **calc_ext**: `calc_gradient`, `calc_jacobian`, `calc_hessian` and `calc_partial_derivative`
+  allocated their scratch from the caller's dimension unchecked; n = 3e8 stored through `alloc`'s
+  designed 0 and exited 139. The shared allocator now refuses `n > ALLOC_MAX / 8`, which also covers
+  the `n * 8` wrap, and the four return `Err(HSB_ERR_ALLOC)` (`calc_partial_derivative`: its
+  designed 0).
+  ⚠ Behaviour change: a negative dimension now returns `Err(HSB_ERR_INVALID_INPUT)` from
+  `calc_gradient`, `calc_hessian` and `calc_jacobian`. Through 3.3.0 it returned `Ok(0)` and wrote
+  nothing.
+- **optimize**: `opt_levenberg_marquardt` did not round-trip `n_residuals * n_params * 8`.
+  n_params = 2 with n_residuals = 2^60+1 wrapped it to 16 and exited 139. It now returns
+  `Err(HSB_ERR_ALLOC)`, the code the non-positive wrap (2^30 × 2^30) already got.
+- **diffgeo**: `sectional_curvature` and `geodesic_deviation` checked neither `dim` nor a pointer.
+  `christoffel_symbols` and `riemann_tensor` hard-coded the cap and read null inputs, and so did
+  `hodge_star_2form_4d`, `wedge_2_1` and `wedge_3_1`. Every null case exited 139, and so did
+  `sectional_curvature` at dim = 1e5. All now return the module's designed 0.
+- **num_ext**: `num_fft_2d` / `num_ifft_2d` checked their column buffer after the row pass, so a
+  rejected call had already transformed every row of the caller's data, and the check was never
+  asserted. It now runs first and is asserted at rows = 2^28.
+
+### Fixed — false claims shipped in 3.3.0
+- **geo_diff — the `_GeoJet` protection did not hold.** 3.3.0 said a consumer could no longer
+  change a jet's `kind`, `t`, `ss` or `face`. Type names carry no visibility in Cyrius, so
+  `var j: _GeoJet = geo_jet_sphere(...); j.kind = 77;` rewrote the field against the 3.3.0 bundle
+  (exit 42 under 6.6.3 and 6.6.12).
+  - The struct is now a manual offset layout: that code no longer compiles ("no struct type in
+    scope"), and the private accessors are the only hisab-provided way in.
+  - A raw `store64` through the pointer still can write a slot; no bundle can stop that. The
+    threat model and `migration-3.3.md` now say so.
+  - The 18 accessors are `#inline`, because cycc auto-inlines derived getters AND setters. As plain
+    fns they cost the jet rows +3% to +29% (`jet_plane` 100 → 129 ns). Inlining only the getters
+    recovered nothing. All 18 inline measures within each row's spread of the struct, in a
+    same-boot interleaved A/B.
+- **autodiff / optimize — the closure recipe crashed on six consumers' pin.** The tape-backed
+  gradient recipe in `autodiff.cyr`'s header SIGSEGVed inside `opt_lbfgs` under cycc 6.6.3. Every
+  `opt_*` solver called its gradient as a bare statement (`fncall2(grad, x, g);`), and cycc
+  6.6.2–6.6.4 lowers that wrongly for a capturing closure (fixed upstream in 6.6.5).
+  - All ten bare call sites in src/ now bind the result, and CI fails on any new one.
+  - The recipe also ended `return ad_grad_into(...)`, which cycc rejects when the closure is built
+    in a helper fn. It now binds both halves and returns 0.
+  - `tests/modules.tcyr` compiles the recipe as written and drives all four solvers with it. Its
+    first draft bound the closure at top level, where the old form is only a warning, and passed
+    with the recipe reverted; it is now bound inside a fn, where the old form is an error.
+
+### Fixed — gates that could not fail
+- **CI security scan**: 3 of its 6 patterns (`syscall\(\s*59`, `syscall\(\s*57`,
+  `\bsys_system\s*\(`) were invalid basic regexes. grep exited 2 into `/dev/null`, so a planted
+  `syscall(59, …)` passed. The scan is now ERE, a grep error fails it, and every pattern must fire
+  on a planted file (and skip a commented copy) before `src/` is scanned.
+- **Lock gate (CI and release)**: `cyrius deps --verify` ran only if `cyrius.lock` existed, and the
+  `cyrius deps` step before it writes a fresh lock when none exists. Deleting the lock passed the
+  gate ("32 verified"). The committed lock is now required before `cyrius deps` runs, verify is
+  unconditional, and a rewrite of the committed lock fails the step. A tampered hash was always
+  caught.
+- **check-constants.sh** had three gaps:
+  - The duplicate-global arm matched 0 of 221 declarations (`^var [A-Z]` misses `public var` and
+    every `_` global). It now matches all 221 and has its own population floor.
+  - `POPULATION_FLOOR` was 160 against a live 164. A constant that stopped parsing passed green as
+    "162/162".
+  - The 8-ulp slack for comment expressions hid a 5-ulp transcription error. 8 of the 9
+    expression constants sit at 0 ulp, so the slack is now 1 ulp.
+- **color**: `_SRGB_INV_2_4` re-encoded from `0x3FDAAAAAAAAAAAB0` to the correctly rounded
+  `0x3FDAAAAAAAAAAAAB` (5/12). ⚠ `linear_to_srgb` output bits move by a few ulp for some inputs; no
+  assertion changed.
+- **check-result-migration.sh**: a function counted as migrated only if its body said
+  `return Ok(`/`Err(`, so `ad_grad_into`, which forwards a Result through `?` and a tail call, was
+  invisible. Forwarders are now found to a fixed point, with comments and strings masked first. The
+  selftest plants one. Its three test sites read only the tag; they now bind both halves and assert
+  the forwarded `HSB_ERR_INVALID_INPUT`.
+- **edge_cases**: the "complex div by zero" group asserted only a non-null pointer and said the
+  result was "very large". It is now a bit-exact check of the documented `0+0i` pole sentinel.
+
+### Changed
+- **Benchmarks — no win is claimed.** Same-boot interleaved A/B, the 3.3.0 tree against this one,
+  full `tests/hisab.bcyr`, three runs each:
+  - **Rows this change touches are flat**, inside each other's spreads: `jet_plane` +0.0%,
+    `jet_sphere` +1.0%, `delaunay_2d_400` +0.1%, `srgb_to_linear` −1.0%.
+  - **Nine rows on code this change does not touch separate beyond their spreads.** Four are
+    faster (`kdtree_build_4k` −7.1%, `quat_rotate_vec3` −4.9%, `kdtree_build_octave_512` −3.6%,
+    `einsum_trace_2x2` −3.5%). Five are slower (`cga_norm_sq_k32` +6.8%, `ray_sphere` +1.7%,
+    `num_dct_1023` +0.9%, `cga_point_product` +0.7%, `jet_obb` +0.6%).
+  - Attributed to code layout, not isolated.
+  - One single run showed `spatial_hash_query_2k` +13.9%. The A/B puts it at −6.8%, inside the
+    row's own ~14% spread.
+- **docs/guides/testing.md**: published counts 4510 → 4575.
+- **ci.yml**: the duplicate-symbol step's comment said a duplicate `var` draws no diagnostic. That
+  holds only for the same value; a conflicting value warns. Re-probed on 6.6.12.
+- Comments corrected along the way: the sRGB endpoint test blamed the round trip for a 1-ulp
+  shortfall that is `1.055 − 0.055` in f64; the abuse struct-size block counted 22 structs (21 now);
+  the `ad_grad_into` mutant note cited a removed `if (rc != 0)` chain.
+
 ## [3.3.0] - 2026-09-30 — the `private` flip: the bundle enforces its public surface, the accidental public names go, and number theory above 2^62 stops answering wrong
 
 ⛔ **Breaking.** `dist/hisab.cyr` is now `private`: every name not marked `public` is refused with

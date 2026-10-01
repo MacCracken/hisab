@@ -224,7 +224,13 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
     - 15 names that were public by accident;
     - 19 for `GeoJet`: the struct, its 9 derived getters, and 9 setters that let a caller replace
       any slot. The vector slots are still returned by reference, so their components stay
-      writable through `HVec3_set_*`. `kind`, `t`, `ss` and `face` no longer are.
+      writable through `HVec3_set_*`. 3.3.0 said `kind`, `t`, `ss` and `face` no longer were.
+      ⛔ **That was false.** Type names carry no visibility in Cyrius, so
+      `var j: _GeoJet = geo_jet_sphere(...); j.kind = 77;` compiled against the 3.3.0 bundle and
+      rewrote the field (exit 42 under 6.6.3 and 6.6.12, probed 2026-09-30). 3.3.1 replaces the
+      struct with a manual offset layout: that statement no longer compiles ("no struct type in
+      scope"). A raw `store64` through the jet pointer can still write any slot; no bundle can
+      prevent a write through a pointer the caller holds.
   - **Verified from pinned dirs on the final bundle.** Under 6.6.3, 6.6.6, 6.6.10 and 6.6.12, a
     consumer-shaped program runs correctly. All 511 non-public probes are refused under 6.6.3, 6.6.4
     and 6.6.12. 6.6.2 still refuses the bundle with the known `#derive` error. ⚠ Two 6.6.3 caveats:

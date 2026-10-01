@@ -72,17 +72,25 @@ jobs:
           echo "toolchain $ACTUAL matches the pin; stdlib snapshot present"
 
       - name: Resolve dependencies
-        run: cyrius deps
+        # ⛔ THE COMMITTED LOCK IS CHECKED BEFORE `cyrius deps` RUNS. When no lock
+        # exists, `cyrius deps` writes a fresh one from lib/, and the verify step
+        # then compares lib/ against a lock written from that same lib/. Through
+        # 3.3.0 the verify ran only `if [ -f cyrius.lock ]`, so deleting the lock
+        # turned the gate green silently ("32 verified"). A tampered hash in a
+        # committed lock was always caught; only the missing lock was a bypass.
+        # [measured: scratch copy of the tree, 2026-09-30; cycc 6.6.12]
+        run: |
+          set -e
+          git ls-files --error-unmatch cyrius.lock > /dev/null 2>&1 || {
+            echo "::error::cyrius.lock is not committed: the lock gate would verify against a lock cyrius deps wrote itself"; exit 1; }
+          [ -f cyrius.lock ] || { echo "::error::cyrius.lock is missing from the checkout"; exit 1; }
+          cyrius deps
+          git diff --quiet -- cyrius.lock || {
+            echo "::error::cyrius deps rewrote the committed cyrius.lock"; git diff -- cyrius.lock; exit 1; }
 
       - name: Verify dep hashes
-        # cyrius.lock is committed; mismatch fails the build.
-        # Skipped on first run when no lockfile exists yet.
-        run: |
-          if [ -f cyrius.lock ]; then
-            cyrius deps --verify
-          else
-            echo "::warning::no cyrius.lock committed yet — skipping verify"
-          fi
+        # cyrius.lock is committed (asserted above); a mismatch fails the build.
+        run: cyrius deps --verify
 
       - name: Lint
         # A file fails the step on either non-zero rc OR a `^  warn ` line in
@@ -186,6 +194,32 @@ jobs:
           ./scripts/check-result-migration.sh
           ./scripts/check-result-migration.sh --selftest
 
+      - name: No bare-statement fncall in src/
+        # ⛔ cycc 6.6.2-6.6.4 lowers a bare `fncall2(f, a, b);` without closure
+        # awareness: with a capturing closure as `f` it SIGSEGVs, and binding the
+        # result (`var r = fncall2(...)`) fixes it. Consumers compile the bundle
+        # under their own pins (six direct ones on 6.6.3), and every opt_* solver
+        # called its gradient that way until 3.3.1, so autodiff.cyr's closure
+        # recipe crashed inside opt_lbfgs on 6.6.3. This suite runs on 6.6.12,
+        # where both forms work, so no test here can see a regression; this step
+        # is the guard. Fixed upstream in 6.6.5.
+        # [measured: scratch harness, 2026-09-30: exit 139 bare / 0 bound on
+        # 6.6.2, 6.6.3 and 6.6.4; 0 both ways on 6.6.5 and 6.6.12]
+        run: |
+          set +e
+          bad=$(grep -nE '^[[:space:]]*fncall[0-9]+[[:space:]]*\(' src/*.cyr)
+          bound=$(cat src/*.cyr | grep -cE '=[[:space:]]*fncall[0-9]+[[:space:]]*\(')
+          if [ "$bound" -lt 10 ]; then
+            echo "::error::positive control failed: only $bound bound fncall sites in src/ (the 10 3.3.1 bound are a floor) -- the pattern may be broken"
+            exit 1
+          fi
+          if [ -n "$bad" ]; then
+            echo "::error::bare-statement fncall in src/ -- SIGSEGVs with a capturing closure on cycc 6.6.2-6.6.4; bind the result:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "no bare-statement fncall in src/ ($bound bound call sites)"
+
       - name: Verify dist bundle is in sync with lib/
         # `cyrius distlib` regenerates `dist/hisab.cyr` from the [lib]
         # modules list. Fails CI if the committed bundle drifts from
@@ -280,10 +314,15 @@ jobs:
         # ⛔ ADDED 2.19.0, AND THE MEASUREMENT IS THE WHOLE REASON IT EXISTS.
         # Converting the 12 `HSB_ERR_*` codes to an enum was justified on the roadmap
         # by "it moves them from a form cycc is SILENT about into one it DIAGNOSES by
-        # file:line". Both halves are true and measured:
-        #   duplicate `var` global   -> no diagnostic at all, last definition ships
-        #   duplicate enum member    -> warning:<source>:57:35: duplicate symbol
-        #                               'HSB_ERR_ALLOC' redefined with conflicting value
+        # file:line". Measured then, and re-probed on 6.6.12 for `var` (2026-09-30):
+        #   duplicate `var`, SAME value       -> no diagnostic; last definition ships.
+        #                                        check-constants.sh's duplicate-global
+        #                                        arm is what catches this one (it
+        #                                        matched nothing until 3.3.1)
+        #   duplicate `var`, DIFFERENT value  -> warning: duplicate symbol ... redefined
+        #                                        with conflicting value (this step)
+        #   duplicate enum member             -> warning:<source>:57:35: duplicate symbol
+        #                                        'HSB_ERR_ALLOC' redefined with conflicting value
         # ⚠ BUT THE DIAGNOSIS ALONE FAILS NOTHING. `cyrius check --with-deps` prints
         # that warning and still **exits 0**, and `cyrius lint` does not emit it at all,
         # so the `^  warn ` grep two steps up matches zero times. Verified end to end by
@@ -551,33 +590,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scan for dangerous patterns
-        # Mirrors abaco's security gate. Now that the 34 math modules live in
-        # src/, this scans the full library surface. Comment lines are ignored.
+        # Mirrors abaco's security gate, over the 35 math modules in src/. Comment
+        # lines are ignored.
+        # ⛔ THROUGH 3.3.0 HALF OF THIS GATE COULD NOT FIRE. Patterns went through
+        # plain `grep`, where `\(` opens a group, so the execve, fork and
+        # sys_system patterns were invalid: grep exited 2 into /dev/null, `hits`
+        # stayed empty, and a planted `syscall(59, ...)` passed the scan.
+        # [measured: GNU grep 3.12 on a planted file, 2026-09-30]
+        # ⭐ Now every pattern is ERE (`grep -E`), a grep error FAILS the scan
+        # instead of vanishing, and every pattern must fire on a planted file
+        # (and must skip a commented copy) before src/ is scanned. A pattern that
+        # cannot match fails this step; it is not trusted to be clean.
         run: |
+          set +e
           FAIL=0
+          # scan LABEL PATTERN DIR -> prints the non-comment hits; rc 0 none, 1 hits, 2 grep error
           scan() {
-            local label="$1"; shift
-            local pat="$1"; shift
-            local hits
-            hits=$(grep -rn "$pat" src/ 2>/dev/null | awk -F: '
-              { line=$3; for(i=4;i<=NF;i++) line=line":"$i;
+            local raw rc
+            raw=$(grep -rnE -- "$2" "$3")
+            rc=$?
+            if [ $rc -eq 2 ]; then echo "FAIL: $1: grep cannot run pattern '$2'"; return 2; fi
+            printf '%s\n' "$raw" | awk -F: '
+              NF >= 3 { line=$3; for(i=4;i<=NF;i++) line=line":"$i;
                 sub(/^[[:space:]]+/,"",line);
-                if (substr(line,1,1) != "#") print $1":"$2":"line }')
-            if [ -n "$hits" ]; then
-              echo "FAIL: $label"; echo "$hits"; FAIL=1
-            fi
+                if (substr(line,1,1) != "#") print $1":"$2":"line }' > "$RUNNER_TEMP/hits.txt"
+            [ -s "$RUNNER_TEMP/hits.txt" ] && { cat "$RUNNER_TEMP/hits.txt"; return 1; }
+            return 0
           }
-          scan "raw execve"      'syscall\(\s*59'
-          scan "raw fork"        'syscall\(\s*57'
-          scan "sys_system"      '\bsys_system\s*\('
-          scan "writes to /etc"  '"/etc/'
-          scan "writes to /bin"  '"/bin/'
-          scan "writes to /sbin" '"/sbin/'
+          LABELS=("raw execve" "raw fork" "sys_system" "writes to /etc" "writes to /bin" "writes to /sbin")
+          PATS=('syscall\(\s*59' 'syscall\(\s*57' '\bsys_system\s*\(' '"/etc/' '"/bin/' '"/sbin/')
+          PLANT="$RUNNER_TEMP/plant"; mkdir -p "$PLANT"
+          cat > "$PLANT/p.cyr" <<'CYR'
+          fn planted() {
+              syscall(59, 0, 0, 0);
+              syscall( 57);
+              sys_system("ls");
+              var a = "/etc/passwd";
+              var b = "/bin/sh";
+              var c = "/sbin/init";
+          }
+          # syscall(59, 0, 0, 0); sys_system("ls"); "/etc/x" -- a comment: never reported
+          CYR
+          for i in "${!PATS[@]}"; do
+            out=$(scan "${LABELS[$i]}" "${PATS[$i]}" "$PLANT"); rc=$?
+            n=$(printf '%s\n' "$out" | grep -c 'p.cyr:')
+            if [ $rc -ne 1 ] || [ "$n" -ne 1 ]; then
+              echo "FAIL: self-check: '${LABELS[$i]}' must report exactly the 1 planted code line (rc=$rc, hits=$n)"
+              printf '%s\n' "$out"; FAIL=1
+            fi
+          done
+          for i in "${!PATS[@]}"; do
+            out=$(scan "${LABELS[$i]}" "${PATS[$i]}" src/); rc=$?
+            if [ $rc -ne 0 ]; then echo "FAIL: ${LABELS[$i]}"; printf '%s\n' "$out"; FAIL=1; fi
+          done
           awk -F: '
             /var [A-Za-z_][A-Za-z0-9_]*\[[0-9]+\]/ {
               match($0, /\[[0-9]+\]/); s=substr($0,RSTART+1,RLENGTH-2); n=s+0;
               if (n >= 65536) print FILENAME":"NR": large stack buffer ("n" bytes): "$0
-            }' src/*.cyr | tee /tmp/bigbuf.txt
-          [ -s /tmp/bigbuf.txt ] && FAIL=1
+            }' src/*.cyr | tee "$RUNNER_TEMP/bigbuf.txt"
+          [ -s "$RUNNER_TEMP/bigbuf.txt" ] && FAIL=1
           echo "security scan complete (fail: $FAIL)"
           exit $FAIL

@@ -1934,7 +1934,10 @@ var _SRGB_12_92 = 0x4029D70A3D70A3D7;                  # 12.92
 var _SRGB_1_055 = 0x3FF0E147AE147AE1;                  # 1.055
 var _SRGB_0_055 = 0x3FAC28F5C28F5C29;                  # 0.055
 var _SRGB_2_4 = 0x4003333333333333;                     # 2.4
-var _SRGB_INV_2_4 = 0x3FDAAAAAAAAAAAB0;                # 1.0/2.4
+# ⛔ Through 3.3.0 this was 0x3FDAAAAAAAAAAAB0, five ulp above the correctly
+# rounded 5/12, and check-constants.sh's 8-ulp slack for comment expressions let
+# it through. `1.0/2.4` and `5/12` give the same f64, so the slack had no reason.
+var _SRGB_INV_2_4 = 0x3FDAAAAAAAAAAAAB;                # 1.0/2.4
 
 public fn srgb_to_linear(c) {
     if (f64_lt(c, _SRGB_THRESHOLD_TO_LINEAR) == 1) {
@@ -3666,16 +3669,29 @@ public fn ad_grad_of(t, i) {
 #         var i0 = ad_var(tape, load64(x));
 #         var i1 = ad_var(tape, load64(x + 8));
 #         ... build the objective ...
-#         return ad_grad_into(tape, root, ids, 2, out);
+#         var gt, gv = ad_grad_into(tape, root, ids, 2, out);
+#         return 0;
 #     };
-#     opt_lbfgs(&f, grad, x0, 2, m, tol, max_iter, out_x, out_fmin);
+#     var t, v = opt_lbfgs(&f, grad, x0, 2, m, tol, max_iter, out_x, out_fmin);
 #
-# ⚠ THAT THIS WORKS AT ALL IS RECENT, and it was re-run rather than taken from
-# the release note: a capturing closure passed through a function and called
-# there with fncall2 SIGSEGVed on 6.5.16. Re-verified on 6.5.18 -- 42 both
-# directly and across the boundary -- and again on 6.6.4 through `vec_sort_by`
-# itself (3.2.0), so the closure no longer blocks anything; what keeps hisab's
-# index sorts hand-written is tie ORDER, see `_col_sort_indices_by_xy`. See
+# The optimizers never read the gradient's return value, so the closure binds
+# both halves of `ad_grad_into`'s Result and returns 0.
+# ⚠ THROUGH 3.3.0 THIS RECIPE ENDED `return ad_grad_into(...)`, and it was wrong
+# on every pin from 6.6.3 to 6.6.12: cycc warned about the enclosing fn when the
+# closure was built inline, and refused to compile it inside a helper fn
+# ("a `: stack` enum returns two values"). The form above builds clean on all of
+# them. [measured: scratch harness, not reproducible in-tree, 2026-09-30]
+#
+# ⚠ AND ON A CONSUMER'S PIN IT CAN STILL CRASH IN THE CALLER'S CODE, NOT HISAB'S.
+# A capturing closure called as a BARE STATEMENT, `fncall2(grad, x, g);`, is
+# SIGSEGV on cycc 6.6.2-6.6.4 and correct from 6.6.5. Through 3.3.0 every opt_*
+# solver called its gradient exactly that way, so this recipe exited 139 inside
+# opt_lbfgs under 6.6.3, the pin of six direct consumers, while it converged
+# under 6.6.5. Since 3.3.1 hisab binds every such call (see optimize.cyr). A
+# caller on 6.6.2-6.6.4 that invokes a closure itself must bind the result too.
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30]
+# What keeps hisab's index sorts hand-written is tie ORDER, not the closure — see
+# `_col_sort_indices_by_xy` and
 # issues/archived/2026-08-10-cyrius-capturing-closure-across-fn-boundary.md.
 #
 # ⚠ NO `ad_minimize` CONVENIENCE IS SHIPPED, and that is a decision. It would put
@@ -8982,8 +8998,57 @@ public var GEO_JET_AABB     = 4;
 public var GEO_JET_OBB      = 5;
 public var GEO_JET_CAPSULE  = 6;
 
-#derive(accessors)
-struct _GeoJet { kind; t; dt_do; dt_dd; sv; sv1; sv2; ss; face; }
+# ⛔ 3.3.1 — A MANUAL LAYOUT, AND NO STRUCT, ON PURPOSE. Through 3.3.0 this was
+# `#derive(accessors) struct _GeoJet`, and 3.3.0 said a consumer could no longer
+# change a jet's kind, t, ss or face. That was false on every consumer pin from
+# 6.6.3 to 6.6.12: Cyrius type names carry no visibility, so
+# `var j: _GeoJet = geo_jet_sphere(...); j.kind = 77;` compiled against the
+# shipped bundle and rewrote the field (and `j.dt_do = v;` replaced a slot).
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.3, 6.6.12]
+# (exit 42 against the 3.3.0 bundle on both pins; a compile error against this one)
+# With no type name there is no field syntax to reach the slots through: the
+# private accessors below, which are exactly what `#derive(accessors)` generated
+# (a load64 / store64 at the field's offset), are the only way in.
+# ⚠ This closes the ordinary-syntax path, not memory. A caller holding the pointer
+# can still `store64(j + offset, v)`; nothing in a Cyrius bundle can stop a write
+# through a pointer the caller owns. The offsets below are enum members, and enum
+# members carry no visibility either, so the layout is readable by anyone.
+# ⚠ ALL 18 ACCESSORS ARE `#inline` BECAUSE THE DERIVED ONES WERE. cycc registers
+# every `#derive(accessors)` getter AND setter for auto-inlining; plain fns here put
+# a real call on every slot access and cost the jet rows +3% to +29% (jet_plane
+# 100 -> 129 ns), and inlining only the getters recovered none of it. All 18 inline:
+# within each row's own spread of the derived struct (jet_plane 106 vs 106 ns).
+# [measured: same-boot interleaved A/B over the six jet rows, 3 rounds, 2026-10-01; cycc 6.6.12]
+enum _GeoJetLayout {
+    _GJ_KIND  = 0;
+    _GJ_T     = 8;
+    _GJ_DT_DO = 16;
+    _GJ_DT_DD = 24;
+    _GJ_SV    = 32;
+    _GJ_SV1   = 40;
+    _GJ_SV2   = 48;
+    _GJ_SS    = 56;
+    _GJ_FACE  = 64;
+    _GJ_BYTES = 72
+}
+#inline fn _GeoJet_kind(j) { return load64(j + _GJ_KIND); }
+#inline fn _GeoJet_set_kind(j, v) { store64(j + _GJ_KIND, v); return 0; }
+#inline fn _GeoJet_t(j) { return load64(j + _GJ_T); }
+#inline fn _GeoJet_set_t(j, v) { store64(j + _GJ_T, v); return 0; }
+#inline fn _GeoJet_dt_do(j) { return load64(j + _GJ_DT_DO); }
+#inline fn _GeoJet_set_dt_do(j, v) { store64(j + _GJ_DT_DO, v); return 0; }
+#inline fn _GeoJet_dt_dd(j) { return load64(j + _GJ_DT_DD); }
+#inline fn _GeoJet_set_dt_dd(j, v) { store64(j + _GJ_DT_DD, v); return 0; }
+#inline fn _GeoJet_sv(j) { return load64(j + _GJ_SV); }
+#inline fn _GeoJet_set_sv(j, v) { store64(j + _GJ_SV, v); return 0; }
+#inline fn _GeoJet_sv1(j) { return load64(j + _GJ_SV1); }
+#inline fn _GeoJet_set_sv1(j, v) { store64(j + _GJ_SV1, v); return 0; }
+#inline fn _GeoJet_sv2(j) { return load64(j + _GJ_SV2); }
+#inline fn _GeoJet_set_sv2(j, v) { store64(j + _GJ_SV2, v); return 0; }
+#inline fn _GeoJet_ss(j) { return load64(j + _GJ_SS); }
+#inline fn _GeoJet_set_ss(j, v) { store64(j + _GJ_SS, v); return 0; }
+#inline fn _GeoJet_face(j) { return load64(j + _GJ_FACE); }
+#inline fn _GeoJet_set_face(j, v) { store64(j + _GJ_FACE, v); return 0; }
 
 # The shape-parameter slots, typed by `kind` and reachable only through the
 # per-primitive accessors below:
@@ -9014,7 +9079,7 @@ fn _geo_jet_axis(k, val) {
 
 #must_use
 fn _geo_jet_miss() {
-    var j = alloc(sizeof(_GeoJet));
+    var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_MISS);
     _GeoJet_set_t(j, 0);
     # A miss still returns READABLE vectors, never null. Callers branch on
@@ -9033,14 +9098,17 @@ fn _geo_jet_miss() {
 # The slots every jet carries, whatever the primitive: its kind (GEO_JET_*), the hit
 # distance t, and t's partials with respect to the ray's origin and direction (each
 # an HVec3). A miss reads kind GEO_JET_MISS, t = 0 and zero vectors, never null.
-# ⚠ 3.3.0: the struct is private (`_GeoJet`), so a jet is read only through typed
-# accessors and no caller can replace a slot. Through 3.2.x these four slots were
-# read through the derived `GeoJet_kind` / `_t` / `_dt_do` / `_dt_dd` getters, which
-# were the only way to reach them, and nine derived setters were public beside them.
+# ⚠ 3.3.0 made the layout private and removed the nine public setters, and claimed
+# that kind, t, ss and face could no longer be changed. Through 3.2.x these four
+# slots were read through the derived `GeoJet_kind` / `_t` / `_dt_do` / `_dt_dd`
+# getters, with nine derived setters public beside them.
+# ⛔ The 3.3.0 claim was false (typed field access on the struct name, see the
+# layout note above) until 3.3.1 removed the struct. What holds now: no
+# hisab-provided name or syntax writes a slot. A raw store64 through the pointer
+# still can.
 # ⚠ The vector slots (dorigin, ddirection and the per-primitive partials) are
 # returned BY REFERENCE: they are the jet's own HVec3s, and `HVec3_set_*` is public,
-# so a caller can still change their components. kind, t, ss and face cannot be
-# changed. Copy a vector before modifying it.
+# so a caller can still change their components. Copy a vector before modifying it.
 #must_use
 public fn geo_jet_kind(j) { return _GeoJet_kind(j); }
 
@@ -9109,7 +9177,7 @@ public fn geo_jet_sphere(ray, sphere) {
     if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_miss(); }
     var dt_do = hvec3_scale(g, f64_neg(inv));
 
-    var j = alloc(sizeof(_GeoJet));
+    var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_SPHERE);
     _GeoJet_set_t(j, t);
     _GeoJet_set_dt_do(j, dt_do);
@@ -9148,7 +9216,7 @@ public fn geo_jet_plane(ray, plane) {
     var p = geo_ray_at(ray, t);
     var dt_do = hvec3_scale(n, f64_neg(inv));
 
-    var j = alloc(sizeof(_GeoJet));
+    var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_PLANE);
     _GeoJet_set_t(j, t);
     _GeoJet_set_dt_do(j, dt_do);
@@ -9200,7 +9268,7 @@ public fn geo_jet_triangle(ray, tri) {
     var w = hvec3_sub(geo_ray_at(ray, t), v0);
     var dt_do = hvec3_scale(n, f64_neg(inv));
 
-    var j = alloc(sizeof(_GeoJet));
+    var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_TRIANGLE);
     _GeoJet_set_t(j, t);
     _GeoJet_set_dt_do(j, dt_do);
@@ -9264,7 +9332,7 @@ public fn geo_jet_aabb(ray, aabb) {
     var zero = hvec3_new(0, 0, 0);
     var dt_db = _geo_jet_axis(k, inv);
 
-    var j = alloc(sizeof(_GeoJet));
+    var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_AABB);
     _GeoJet_set_t(j, t);
     _GeoJet_set_dt_do(j, _geo_jet_axis(k, f64_neg(inv)));
@@ -9362,7 +9430,7 @@ public fn geo_jet_obb(ray, obb) {
     var sg = f64_neg(inv);
     if (geo_face_is_max(face) == 1) { sg = inv; }
 
-    var j = alloc(sizeof(_GeoJet));
+    var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_OBB);
     _GeoJet_set_t(j, t);
     _GeoJet_set_dt_do(j, hvec3_scale(axis, f64_neg(inv)));
@@ -9456,7 +9524,7 @@ public fn geo_jet_capsule(ray, capsule) {
     var dt_do = hvec3_scale(g, f64_neg(inv));
     var back = hvec3_scale(g, inv);      # +g/den, the shared endpoint direction
 
-    var j = alloc(sizeof(_GeoJet));
+    var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_CAPSULE);
     _GeoJet_set_t(j, t);
     _GeoJet_set_dt_do(j, dt_do);
@@ -12442,6 +12510,15 @@ fn _col_dl_locate_scan(points, nr, tris, n_slots, px, py, mode) {
 
 public fn delaunay_2d(points, n) {
     var result = vec_new();
+    # ⛔ `n` RESTATES `vec_len(points)` AND WAS NEVER CHECKED -- the guard 2.12.0
+    # gave convex_hull_2d, triangulate_polygon and sequential_impulse, missed here.
+    # Three points with n = 4 printed `vec: index out of bounds` and exited 1 (the
+    # stdlib's bounds-checked `vec_get` ends the process), and a null `points`
+    # with n = 3 exited 139. A library must not end its caller's process.
+    # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+    # Rejection returns the empty `result`, this function's convention for n < 3.
+    if (points == 0) { return result; }
+    if (n > vec_len(points)) { return result; }
     if (n < 3) { return result; }
 
     # The enclosing triangle is the three SYMBOLIC ghosts n, n+1, n+2 -- see the
@@ -13077,6 +13154,16 @@ public fn detect_islands(contacts, n_contacts, n_bodies) {
     # — the convention every `detect_islands` assertion in `tests/abuse.tcyr`
     # already reads via `vec_len`. A designed 0 here would null-deref that idiom.
     if (n_bodies > ALLOC_MAX / 8) { return result; }
+    # ⛔ `n_contacts` RESTATES `vec_len(contacts)` AND WAS NEVER CHECKED. One
+    # contact with n_contacts = 2 printed `vec: index out of bounds` and exited 1;
+    # a null `contacts` with n_contacts = 1 exited 139. Checked only when the loop
+    # below will index it, so `detect_islands(0, 0, n)` still returns n singleton
+    # islands, as it always has.
+    # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+    if (n_contacts > 0) {
+        if (contacts == 0) { return result; }
+        if (n_contacts > vec_len(contacts)) { return result; }
+    }
 
     var uf = _col_uf_new(n_bodies);
 
@@ -13711,8 +13798,19 @@ var _CALCX_F64_1E_NEG30 = 0x39B4_484B_FEEB_C2A0;   # 1e-30
 # HELPERS: flat f64 array manipulation
 # ================================================================
 
-# Allocate a flat f64 array of n elements (zeroed by bump allocator)
+# Allocate a flat f64 array of n elements (zeroed by bump allocator), or the
+# designed 0 when no such array can exist.
+# ⛔ CALLER-SIZED, AND UNCHECKED THROUGH 3.3.0. calc_gradient, calc_jacobian,
+# calc_hessian and calc_partial_derivative passed the caller's dimension straight
+# here and stored through the result. n = 3e8 asks for 2.4 GB against ALLOC_MAX's
+# 2 GiB, `alloc` returns its designed 0, and the first copy stored to address 0:
+# all four exited 139.
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+# ⭐ The bound is derived and written as a division, so it also rejects the
+# n >= 2^61+1 whose `n * 8` wraps to a small POSITIVE size that `alloc` would
+# honour. Every caller checks for the 0.
 fn _f64arr_alloc(n) {
+    if (n > ALLOC_MAX / 8) { return 0; }
     return alloc(n * 8);
 }
 
@@ -13764,6 +13862,7 @@ public fn calc_partial_derivative(f, x, n, index, h) {
     # Allocate x_plus and x_minus buffers
     var x_plus = _f64arr_alloc(n);
     var x_minus = _f64arr_alloc(n);
+    if (x_plus == 0 || x_minus == 0) { return 0; }
     _f64arr_copy(x_plus, x, n);
     _f64arr_copy(x_minus, x, n);
 
@@ -13783,12 +13882,16 @@ public fn calc_partial_derivative(f, x, n, index, h) {
 # f: function pointer, fncall1(f, x_ptr) -> f64.
 # x: pointer to flat f64[n], n: dimension, h: step size (f64).
 # out: pointer to flat f64[n] to receive gradient components.
-# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n == 0.
+# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n <= 0,
+# Err(HSB_ERR_ALLOC) if no n-element scratch array can be allocated.
+# ⚠ Through 3.3.0 only n == 0 was rejected: a negative n skipped every loop and
+# returned Ok(0) with `out` never written.
 #must_use
 public fn calc_gradient(f, x, n, h, out) {
-    if (n == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var x_buf = _f64arr_alloc(n);
+    if (x_buf == 0) { return Err(HSB_ERR_ALLOC); }
     _f64arr_copy(x_buf, x, n);
 
     var inv_2h = f64_div(F64_ONE, f64_mul(F64_TWO, h));
@@ -13818,17 +13921,18 @@ public fn calc_gradient(f, x, n, h, out) {
 # x: pointer to flat f64[n_in], n_in: input dim, n_out: output dim.
 # h: step size (f64).
 # out: pointer to flat f64[n_out * n_in] (row-major: J[i][j] = out[i*n_in + j]).
-# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n_in or n_out == 0.
+# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n_in or n_out <= 0,
+# Err(HSB_ERR_ALLOC) if the scratch arrays cannot be allocated.
 #must_use
 public fn calc_jacobian(f, x, n_in, n_out, h, out) {
-    if (n_in == 0) { return Err(HSB_ERR_INVALID_INPUT); }
-    if (n_out == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n_in <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n_out <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var x_buf = _f64arr_alloc(n_in);
-    _f64arr_copy(x_buf, x, n_in);
-
     var f_plus = _f64arr_alloc(n_out);
     var f_minus = _f64arr_alloc(n_out);
+    if (x_buf == 0 || f_plus == 0 || f_minus == 0) { return Err(HSB_ERR_ALLOC); }
+    _f64arr_copy(x_buf, x, n_in);
 
     var inv_2h = f64_div(F64_ONE, f64_mul(F64_TWO, h));
 
@@ -13837,12 +13941,15 @@ public fn calc_jacobian(f, x, n_in, n_out, h, out) {
         var xj = _f64arr_get(x, j);
 
         # f(x + h*e_j)
+        # Bound, not a bare statement: cycc 6.6.2-6.6.4 SIGSEGVs on a bare
+        # `fncall2(closure, ...);` -- see the note at opt_gradient_descent in
+        # optimize.cyr.
         _f64arr_set(x_buf, j, f64_add(xj, h));
-        fncall2(f, x_buf, f_plus);
+        var fp_rc = fncall2(f, x_buf, f_plus);
 
         # f(x - h*e_j)
         _f64arr_set(x_buf, j, f64_sub(xj, h));
-        fncall2(f, x_buf, f_minus);
+        var fm_rc = fncall2(f, x_buf, f_minus);
 
         # Restore
         _f64arr_set(x_buf, j, xj);
@@ -13865,12 +13972,14 @@ public fn calc_jacobian(f, x, n_in, n_out, h, out) {
 # f: function pointer, fncall1(f, x_ptr) -> f64.
 # x: pointer to flat f64[n], n: dimension, h: step size (f64).
 # out: pointer to flat f64[n*n] (row-major: H[i][j] = out[i*n + j]).
-# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n == 0.
+# Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n <= 0,
+# Err(HSB_ERR_ALLOC) if no n-element scratch array can be allocated.
 #must_use
 public fn calc_hessian(f, x, n, h, out) {
-    if (n == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var x_buf = _f64arr_alloc(n);
+    if (x_buf == 0) { return Err(HSB_ERR_ALLOC); }
     _f64arr_copy(x_buf, x, n);
 
     var f0 = fncall1(f, x);
@@ -16350,6 +16459,27 @@ public fn num_fft_2d(data, rows, cols) {
     if (num_is_pow2(rows) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (num_is_pow2(cols) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
+    # ⚠ CALLER-SIZED ALLOCATION, CHECKED. `rows` comes straight from the caller and
+    # is only required to be a power of two, so alloc can legitimately return its
+    # documented 0 -- measured, rows = 2^28 gives alloc(rows*16) = 4.3 GB against
+    # an ALLOC_MAX of 2 GiB, and storing through the result SIGSEGVs (exit 139).
+    # Same CWE-190 -> CWE-476 shape 2.6.14 repaired in the four optimize solvers.
+    # [measured: docs/development/issues/archived/2026-08-11-caller-sized-allocs-in-num_ext.md]
+    # ⭐ 3.3.1 — CHECKED BEFORE THE ROW PASS, NOT AFTER IT. Through 3.3.0 the check
+    # sat after the row pass, so a rejected call had already transformed every row
+    # of the caller's data in place, and reaching it in a test meant 2^28 row
+    # transforms first — which is why it was never asserted. The bound is derived
+    # and written as a division: rows = ALLOC_MAX / 16 is the largest the column
+    # buffer can hold. ⚠ Deleting this one line is an EQUIVALENT mutant, recorded
+    # rather than hidden: rows is a power of two, so every larger rows either asks
+    # alloc for more than ALLOC_MAX or wraps `rows * 16` to <= 0 (from 2^59), and
+    # alloc refuses both, so the null check alone returns the same Err. The line
+    # states the bound; the null check is what fires.
+    # [measured: scratch mutant, abuse 971/971 with the line deleted, 2026-09-30]
+    if (rows > ALLOC_MAX / 16) { return Err(HSB_ERR_ALLOC); }
+    var col_buf = alloc(rows * 16);
+    if (col_buf == 0) { return Err(HSB_ERR_ALLOC); }
+
     # FFT each row
     var r = 0;
     while (r < rows) {
@@ -16359,14 +16489,6 @@ public fn num_fft_2d(data, rows, cols) {
     }
 
     # FFT each column: extract column into temp buffer, FFT, put back
-    # ⚠ CALLER-SIZED ALLOCATION, CHECKED. `rows` comes straight from the caller and
-    # is only required to be a power of two, so alloc can legitimately return its
-    # documented 0 -- measured, rows = 2^28 gives alloc(rows*16) = 4.3 GB against
-    # an ALLOC_MAX of 2 GiB, and storing through the result SIGSEGVs (exit 139).
-    # Same CWE-190 -> CWE-476 shape 2.6.14 repaired in the four optimize solvers.
-    # [measured: docs/development/issues/archived/2026-08-11-caller-sized-allocs-in-num_ext.md]
-    var col_buf = alloc(rows * 16);
-    if (col_buf == 0) { return Err(HSB_ERR_ALLOC); }
     var c = 0;
     while (c < cols) {
         # Extract column c
@@ -16407,6 +16529,27 @@ public fn num_ifft_2d(data, rows, cols) {
     if (num_is_pow2(rows) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (num_is_pow2(cols) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
+    # ⚠ CALLER-SIZED ALLOCATION, CHECKED. `rows` comes straight from the caller and
+    # is only required to be a power of two, so alloc can legitimately return its
+    # documented 0 -- measured, rows = 2^28 gives alloc(rows*16) = 4.3 GB against
+    # an ALLOC_MAX of 2 GiB, and storing through the result SIGSEGVs (exit 139).
+    # Same CWE-190 -> CWE-476 shape 2.6.14 repaired in the four optimize solvers.
+    # [measured: docs/development/issues/archived/2026-08-11-caller-sized-allocs-in-num_ext.md]
+    # ⭐ 3.3.1 — CHECKED BEFORE THE ROW PASS, NOT AFTER IT. Through 3.3.0 the check
+    # sat after the row pass, so a rejected call had already transformed every row
+    # of the caller's data in place, and reaching it in a test meant 2^28 row
+    # transforms first — which is why it was never asserted. The bound is derived
+    # and written as a division: rows = ALLOC_MAX / 16 is the largest the column
+    # buffer can hold. ⚠ Deleting this one line is an EQUIVALENT mutant, recorded
+    # rather than hidden: rows is a power of two, so every larger rows either asks
+    # alloc for more than ALLOC_MAX or wraps `rows * 16` to <= 0 (from 2^59), and
+    # alloc refuses both, so the null check alone returns the same Err. The line
+    # states the bound; the null check is what fires.
+    # [measured: scratch mutant, abuse 971/971 with the line deleted, 2026-09-30]
+    if (rows > ALLOC_MAX / 16) { return Err(HSB_ERR_ALLOC); }
+    var col_buf = alloc(rows * 16);
+    if (col_buf == 0) { return Err(HSB_ERR_ALLOC); }
+
     # IFFT each row
     var r = 0;
     while (r < rows) {
@@ -16416,14 +16559,6 @@ public fn num_ifft_2d(data, rows, cols) {
     }
 
     # IFFT each column
-    # ⚠ CALLER-SIZED ALLOCATION, CHECKED. `rows` comes straight from the caller and
-    # is only required to be a power of two, so alloc can legitimately return its
-    # documented 0 -- measured, rows = 2^28 gives alloc(rows*16) = 4.3 GB against
-    # an ALLOC_MAX of 2 GiB, and storing through the result SIGSEGVs (exit 139).
-    # Same CWE-190 -> CWE-476 shape 2.6.14 repaired in the four optimize solvers.
-    # [measured: docs/development/issues/archived/2026-08-11-caller-sized-allocs-in-num_ext.md]
-    var col_buf = alloc(rows * 16);
-    if (col_buf == 0) { return Err(HSB_ERR_ALLOC); }
     var c = 0;
     while (c < cols) {
         var ri = 0;
@@ -17608,7 +17743,16 @@ public fn opt_gradient_descent(f, grad, x0, n, lr, tol, max_iter, out_x, out_fmi
     var iter = 0;
     while (iter < max_iter) {
         # Evaluate gradient
-        fncall2(grad, x, g);
+        # ⛔ BOUND, NOT A BARE STATEMENT -- and every gradient/Jacobian call in this
+        # file is written the same way. Consumers compile this bundle under their
+        # own cycc, and cycc 6.6.2-6.6.4 lowered a bare `fncall2(f, a, b);` without
+        # closure awareness: a capturing closure passed as `grad` (the tape recipe
+        # in autodiff.cyr) SIGSEGVed there, and binding the result fixed it. Six
+        # direct consumers pin 6.6.3. Fixed upstream in cycc 6.6.5; this stays while
+        # consumers sit below it. CI fails on any bare `fncall` statement in src/.
+        # [measured: scratch harness, not reproducible in-tree, 2026-09-30]
+        # (bare: exit 139 on 6.6.2, 6.6.3, 6.6.4; bound: 0 there; both 0 on 6.6.5, 6.6.12)
+        var g_rc = fncall2(grad, x, g);
 
         # Check convergence: ||g|| < tol
         var gnorm = _opt_norm(g, n);
@@ -17694,7 +17838,7 @@ public fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin)
     _opt_copy(x, x0, n);
 
     # Initial gradient and search direction d = -g
-    fncall2(grad, x, g);
+    var g_rc = fncall2(grad, x, g);
     var i = 0;
     while (i < n) {
         store64(d + i * 8, f64_neg(load64(g + i * 8)));
@@ -17722,7 +17866,7 @@ public fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin)
         _opt_armijo(f, x, d, g, n, f_old, x_trial);
 
         # New gradient at x_trial
-        fncall2(grad, x_trial, g_new);
+        var g_new_rc = fncall2(grad, x_trial, g_new);
         var gg_new = _opt_dot(g_new, g_new, n);
 
         # Polak-Ribiere+ beta (strictly superior to Fletcher-Reeves)
@@ -17820,7 +17964,7 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
     }
 
     _opt_copy(x, x0, n);
-    fncall2(grad, x, g);
+    var g_rc = fncall2(grad, x, g);
 
     var iter = 0;
     while (iter < max_iter) {
@@ -17852,7 +17996,7 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
         _opt_armijo(f, x, d, g, n, f_old, x_new);
 
         # Compute s = x_new - x, and new gradient
-        fncall2(grad, x_new, g_new);
+        var g_new_rc = fncall2(grad, x_new, g_new);
         i = 0;
         while (i < n) {
             store64(s + i * 8, f64_sub(load64(x_new + i * 8), load64(x + i * 8)));
@@ -17985,7 +18129,7 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
     var head = 0;
 
     _opt_copy(x, x0, n);
-    fncall2(grad, x, g);
+    var g_rc = fncall2(grad, x, g);
 
     var iter = 0;
     while (iter < max_iter) {
@@ -18102,7 +18246,7 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
         _opt_armijo(f, x, q, g, n, f_old, x_new);
 
         # Compute new gradient (g_new_buf is hoisted)
-        fncall2(grad, x_new, g_new_buf);
+        var g_new_rc = fncall2(grad, x_new, g_new_buf);
 
         # Store correction pair in ring buffer (s_k / y_k are hoisted)
         vi = 0;
@@ -18170,6 +18314,18 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
     var np = n_params;
     var nr = n_residuals;
 
+    # ⛔ CWE-190 -- the 2.12.0 opt_conjugate_gradient shape, missed here until 3.3.1.
+    # `nr * np * 8` sizes j_buf and nothing round-tripped it. n_params = 2 with
+    # n_residuals = 2^60+1 wraps it to 16, `alloc` honours 16 bytes, and the solver
+    # proceeds as if it held nr*np f64s: exit 139.
+    # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+    # The round-trip tests the multiply this function performs. It reports
+    # HSB_ERR_ALLOC, the code the NON-positive wrap (2^30 x 2^30) and a merely
+    # too-large product already got from the null check below, so both directions
+    # of the wrap read alike and no conforming caller is refused.
+    var nrp = nr * np;
+    if (nrp / np != nr || nrp != (nrp * 8) / 8) { return Err(HSB_ERR_ALLOC); }
+
     var x       = alloc(np * 8);
     var x_trial = alloc(np * 8);
     var jtr     = alloc(np * 8);
@@ -18219,7 +18375,7 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
         }
 
         # Evaluate Jacobian
-        fncall2(jacobian, x, j_buf);
+        var j_rc = fncall2(jacobian, x, j_buf);
 
         # Compute J^T * J (np x np) and J^T * r (np x 1) into the hoisted jtj.
         var pi = 0;
@@ -23988,6 +24144,13 @@ var _DG_F64_SIX = 0x4018_0000_0000_0000;  # 6.0
 # (a) dereferenced that documented 0 error signal and (b) sized their own alloc
 # from an unbounded dim. Same class as the 2.6.14 cmat_new / opt_bfgs repairs
 # (CWE-190 -> CWE-476).
+# ⛔ "Every entry point" was not true until 3.3.1. sectional_curvature and
+# geodesic_deviation checked neither dim nor a pointer, christoffel_symbols and
+# riemann_tensor hard-coded the 16 and read null inputs, and hodge_star_2form_4d,
+# wedge_2_1 and wedge_3_1 read null inputs: each null case exited 139, and so did
+# sectional_curvature at dim = 1e5. Invalid input now returns the module's
+# designed 0, as every other entry point here already did.
+# [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
 var _DG_MAX_DIM = 16;
 
 # ================================================================
@@ -24033,7 +24196,8 @@ fn _dg_idx4(a, b, c, d, dim) {
 # reference) -- keep any new fixture non-flat.
 
 public fn christoffel_symbols(metric_inv, metric_deriv, dim) {
-    if (dim <= 0 || dim > 16) { return 0; }  # Cap to prevent overflow (16^3 = 4096)
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }  # 16^3 = 4096 slots at the cap
+    if (metric_inv == 0 || metric_deriv == 0) { return 0; }
     var n3 = dim * dim * dim;
     var out = alloc(n3 * 8);
     if (out == 0) { return 0; }
@@ -24094,7 +24258,8 @@ public fn christoffel_get(christoffel, dim, a, mu, nu) {
 # Returns: pointer to allocated flat f64 array of dim^4 elements.
 
 public fn riemann_tensor(christoffel, christoffel_deriv, dim) {
-    if (dim <= 0 || dim > 16) { return 0; }  # Cap to prevent overflow (16^4 = 65536)
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }  # 16^4 = 65536 slots at the cap
+    if (christoffel == 0 || christoffel_deriv == 0) { return 0; }
     var n4 = dim * dim * dim * dim;
     var out = alloc(n4 * 8);
     if (out == 0) { return 0; }
@@ -24269,6 +24434,8 @@ fn _dg_inner(metric, a, b, dim) {
 }
 
 public fn sectional_curvature(riemann, metric, u, v, dim) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (riemann == 0 || metric == 0 || u == 0 || v == 0) { return 0; }
     # Numerator: R_{ασμν} u^α v^σ u^μ v^ν, lowering ρ with the metric per term.
     var num = 0;
     var a = 0;
@@ -24411,6 +24578,8 @@ public fn weyl_get(weyl, dim, rho, sigma, mu, nu) {
 # riemann: (1,3) R^ρ_{σμν} (flat dim⁴);  u: geodesic tangent (flat dim);
 # jac: separation field J (flat dim). Returns the acceleration A^ρ (new alloc).
 public fn geodesic_deviation(riemann, u, jac, dim) {
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
+    if (riemann == 0 || u == 0 || jac == 0) { return 0; }
     var out = alloc(dim * 8);
     if (out == 0) { return 0; }
     var rho = 0;
@@ -24874,6 +25043,7 @@ public fn wedge_1_1(alpha, beta, dim) {
 #   *(01) =  F_{23},  *(02) = -F_{13}, *(03) =  F_{12}
 #   *(12) = -F_{03},  *(13) =  F_{02}, *(23) = -F_{01}
 public fn hodge_star_2form_4d(form, sign) {
+    if (form == 0) { return 0; }
     var out = alloc(48);
     if (out == 0) { return 0; }  # 6 * 8 bytes
 
@@ -24905,6 +25075,7 @@ public fn hodge_star_2form_4d(form, sign) {
 # Wedge of a 2-form ω and a 1-form α → 3-form.
 # (ω ∧ α)_{ijk} = ω_{ij} α_k − ω_{ik} α_j + ω_{jk} α_i   (i < j < k)
 public fn wedge_2_1(omega, alpha) {
+    if (omega == 0 || alpha == 0) { return 0; }
     var out = alloc(32);
     if (out == 0) { return 0; }  # C(4,3) = 4
     var w01 = load64(omega);
@@ -24927,6 +25098,7 @@ public fn wedge_2_1(omega, alpha) {
 # Wedge of a 3-form β and a 1-form α → 4-form (the top form in 4D).
 # (β ∧ α)_{0123} = β_{012} α_3 − β_{013} α_2 + β_{023} α_1 − β_{123} α_0
 public fn wedge_3_1(beta, alpha) {
+    if (beta == 0 || alpha == 0) { return 0; }
     var out = alloc(8);
     if (out == 0) { return 0; }
     var b012 = load64(beta);

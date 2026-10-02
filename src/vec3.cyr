@@ -106,6 +106,12 @@ fn _hvec3_len_scaled(v) {
     var y = HVec3_y(v);
     var z = HVec3_z(v);
     var mx = f64_max(f64_max(f64_abs(x), f64_abs(y)), f64_abs(z));
+    # ⚠ 3.3.3 — NaN NEVER REACHES HERE, and this exit depends on that. `f64_max` drops a
+    # NaN in x or y and `f64_gt(mx, 0) == 0` is TRUE for NaN, so called directly this
+    # helper gives (NaN, 0, 0) a length of 0. It is not called: a NaN makes the caller's
+    # sum NaN, which is neither `< F64_TINY` nor `+Inf`, so `hvec3_length` returns
+    # sqrt(NaN). That routing IS the NaN guard; tests/abuse.tcyr pins it slot by slot.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
     if (f64_gt(mx, 0) == 0) { return mx; }
     # ⚠ Inf/Inf is NaN, so the infinity contract needs its own exit here.
     if (f64_eq(mx, F64_POS_INF) == 1) { return mx; }
@@ -190,18 +196,58 @@ public fn hvec3_lerp(a, b, t) {
 # Component-wise utilities
 # ================================================================
 
+# ⛔ 3.3.3 — STDLIB `f64_min` / `f64_max` ANSWER FOR THE ARGUMENT ORDER, NOT THE
+# VALUES. `f64_min(a, b)` is `a < b ? a : b`, so whenever that compare is false it
+# returns b: a NaN in a is dropped and a NaN in b is kept, and of two zeros b's sign
+# wins. Componentwise, hvec3_min((NaN,0,0), (1,0,0)).x was 1 but
+# hvec3_min((1,0,0), (NaN,0,0)).x was NaN, hvec3_max the same, and
+# hvec3_min((-0,..), (+0,..)).x was +0 but hvec3_min((+0,..), (-0,..)).x was -0.
+# geo_aabb_new applies both to its two corners, so a corner with a NaN x gave the
+# finite, degenerate slab [1, 1] in one argument order and NaN in the other.
+# [measured: scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+#
+# ⭐ These are IEEE 754-2019 minimum and maximum, which read the values alone: NaN
+# when either operand is NaN (that operand, payload and all; `a` when both are),
+# -0 below +0, otherwise the smaller or the larger. Two operands that compare equal
+# have identical bits unless they are zeros of opposite sign, so OR-ing them gives -0
+# exactly when either is -0 and AND-ing gives +0 exactly when either is +0. The
+# second compare is only an early exit: the lines after it return b for that pair too.
+#
+# ⚠ NOT FREE: a pair whose answer is the second operand now costs a second compare,
+# and equal operands a third. On 64 random pairs, 16 interleaved runs a side against
+# the tree before this change: one hvec3_min plus one hvec3_max 69.7 -> 71.8 ns
+# (+2.9%), one geo_aabb_new 83.0 -> 85.3 ns (+2.8%), its slowest old run faster than
+# its fastest new one. No tests/hisab.bcyr row reaches either: bvh_build folds its
+# bounds with stdlib f64_min / f64_max directly.
+# [measured: scratch interleaved A/B, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+fn _hvec3_min1(a, b) {
+    if (f64_lt(a, b) == 1) { return a; }
+    if (f64_lt(b, a) == 1) { return b; }
+    if (f64_eq(a, b) == 1) { return a | b; }
+    if (f64_eq(a, a) == 0) { return a; }
+    return b;
+}
+
+fn _hvec3_max1(a, b) {
+    if (f64_gt(a, b) == 1) { return a; }
+    if (f64_gt(b, a) == 1) { return b; }
+    if (f64_eq(a, b) == 1) { return a & b; }
+    if (f64_eq(a, a) == 0) { return a; }
+    return b;
+}
+
 #must_use
 public fn hvec3_min(a, b) {
-    return hvec3_new(f64_min(HVec3_x(a), HVec3_x(b)),
-      f64_min(HVec3_y(a), HVec3_y(b)),
-      f64_min(HVec3_z(a), HVec3_z(b)));
+    return hvec3_new(_hvec3_min1(HVec3_x(a), HVec3_x(b)),
+      _hvec3_min1(HVec3_y(a), HVec3_y(b)),
+      _hvec3_min1(HVec3_z(a), HVec3_z(b)));
 }
 
 #must_use
 public fn hvec3_max(a, b) {
-    return hvec3_new(f64_max(HVec3_x(a), HVec3_x(b)),
-      f64_max(HVec3_y(a), HVec3_y(b)),
-      f64_max(HVec3_z(a), HVec3_z(b)));
+    return hvec3_new(_hvec3_max1(HVec3_x(a), HVec3_x(b)),
+      _hvec3_max1(HVec3_y(a), HVec3_y(b)),
+      _hvec3_max1(HVec3_z(a), HVec3_z(b)));
 }
 
 #must_use

@@ -188,8 +188,7 @@ public fn geo_triangle_unit_normal(tri) {
     # the flushed `len_sq` still returned the fallback before the new code ran.
     # The order of the guard is the guard.
     # ⭐ `hvec3_length` (repaired earlier in this release) replaces the re-derived
-    # sqrt, and what is guarded is what actually fails: a zero or NaN length —
-    # `f64_gt(len, 0) == 0` keeps 2.10.2's NaN-to-fallback contract — and a length
+    # sqrt, and what is guarded is what actually fails: a zero length and a length
     # too small to invert.
     # ⚠ WHAT THIS DOES NOT FIX, STATED SO IT IS NOT READ AS A FULL REPAIR: the
     # residual band is now `hvec3_cross` itself. Legs at 2^-512 give cross
@@ -198,8 +197,41 @@ public fn geo_triangle_unit_normal(tri) {
     # the ceiling from 2^256 to 2^512 — 243 and 256 binades — and what remains is
     # destroyed upstream of this function. Measured after: 378 of 1401.
     # [measured: 1401-binade two-sided sweep before and after, 2026-09-10]
+    #
+    # ⛔ 3.3.3 — THE NaN HALF OF 2.10.2'S CONTRACT WAS THE FABRICATED-ANSWER CLASS.
+    # Through 3.3.2 the guard was `f64_gt(len, 0) == 0`, which is TRUE for a NaN
+    # length, so a triangle with a NaN coordinate — or an infinite one whose cross
+    # product picks up `Inf * 0` — returned (0, 1, 0): a valid-looking unit normal
+    # with nothing to say it was invented. 2.10.2 recorded that fold as closing a
+    # NaN hole; it opened one. The test is now an exact zero: a zero length still
+    # returns the documented degenerate unit_y, and a NaN length falls through to
+    # `n * (1 / NaN)`, NaN in all three components — what
+    # `hvec3_normalize(geo_triangle_normal(tri))` returns on the same input.
+    # [measured: G6 scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    #
+    # ⚠ THAT MOVES FINITE INPUT TOO, AND IT IS MEANT TO. A finite triangle whose
+    # cross product overflows in both products of one component gets `Inf - Inf`
+    # there, a NaN length, and the fold answered (0, 1, 0) for it as well:
+    # (0,0,0), (1e300,1e300,0), (1e300,1e300,1), whose unit normal is
+    # (0.7071, -0.7071, 0) — what the same triangle scaled to 1e150 returns —
+    # gave unit_y through 3.3.2 and is NaN in all three now. Not every moved answer
+    # was wrong: the fold's (0, 1, 0) was right by coincidence where the true normal
+    # is +y. (0,0,0), (1e300,0,1e300), (2e300,0,1e300) has the cross product
+    # (0, NaN, 0) and the normal +y (its 1e150 copy gives (0, 0x3FEFFFFFFFFFFFFF, 0)),
+    # and its mirror, the last two vertices swapped and the normal -y, got the same
+    # (0, 1, 0); both are NaN now, which loses the coincidence with the error.
+    # [measured: R5geo unit-normal probe, 3.3.2 and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
+    # Over 64 random finite triangles per binade, coordinates up to about 2^e for
+    # e in [400, 1023], 32636 of 39936 moved from unit_y to NaN, every one at e in
+    # [512, 1023]. The
+    # 100 that were NaN already, 50 in all three components and 50 in part (each
+    # infinite component times 1 / Inf = 0), and the 7200 finite answers did not
+    # move. NaN is the loud answer until the edges are pre-scaled (roadmap [3.3.4]
+    # D037). The 2.17.0 note above that legs at 2^512 "give +Inf" is the right
+    # triangle's case, whose (0, 0, Inf) cross product has no `Inf - Inf`.
+    # [measured: R4geo unit-normal binade sweep, 3.3.2 and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
     var len = hvec3_length(n);
-    if (f64_gt(len, 0) == 0) { return hvec3_unit_y(); }
+    if (f64_eq(len, 0) == 1) { return hvec3_unit_y(); }
     var inv = f64_div(F64_ONE, len);
     if (f64_eq(inv, F64_POS_INF) == 1) { return hvec3_unit_y(); }
     return hvec3_scale(n, inv);
@@ -268,8 +300,13 @@ public fn geo_segment_direction(seg) {
     # along +x, and the fabricated unit_x fallback IS the right answer there, so
     # it reported the low band clean. The diagonal is what discriminates.
     # [measured: 2041-binade two-sided sweep on a (3k,4k,0) segment, 2026-09-10]
+    # ⛔ 3.3.3 — and a NaN length took the zero-length fallback too: `f64_gt(NaN, 0)`
+    # is 0, so a segment with a NaN at either end returned the fabricated (1, 0, 0).
+    # The test is now an exact zero, and a NaN direction is NaN in every component,
+    # as `hvec3_normalize(end - start)` is. See geo_triangle_unit_normal.
+    # [measured: G6 scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
     var len = hvec3_length(d);
-    if (f64_gt(len, 0) == 0) { return hvec3_unit_x(); }
+    if (f64_eq(len, 0) == 1) { return hvec3_unit_x(); }
     var inv = f64_div(F64_ONE, len);
     if (f64_eq(inv, F64_POS_INF) == 1) { return hvec3_unit_x(); }
     return hvec3_scale(d, inv);
@@ -288,7 +325,15 @@ public fn geo_segment_closest_point(seg, point) {
     # immediately after, so a subnormal denominator cannot produce a bad answer —
     # only an exact zero can. Collapsing a valid short segment to its start point
     # is what 2.10.2 recorded as misleading its own capsule probe.
-    if (f64_gt(len_sq, 0) == 0) { return GeoSegment_start(seg); }
+    # ⛔ 3.3.3 — the test was `f64_gt(len_sq, 0) == 0`, TRUE for NaN, so a segment
+    # whose END was NaN collapsed to its finite start: the closest point to (1,1,1)
+    # on (0,0,0)-(NaN,0,0) came back (0,0,0) and the distance sqrt(3), both
+    # plausible. Only an exact zero is a point segment; a NaN `len_sq` now reaches
+    # the division, `f64_clamp` passes the NaN `t` through, and every component of
+    # the point, and so `geo_segment_distance_to_point`, is NaN. (A NaN START was
+    # NaN only in its own NaN coordinate: the fallback returned the start itself.)
+    # [measured: G6 scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    if (f64_eq(len_sq, 0) == 1) { return GeoSegment_start(seg); }
     var t = f64_clamp(f64_div(hvec3_dot(hvec3_sub(point, GeoSegment_start(seg)), ab), len_sq), 0, F64_ONE);
     return hvec3_add(GeoSegment_start(seg), hvec3_scale(ab, t));
 }
@@ -321,8 +366,39 @@ public fn geo_segment_distance_to_point(seg, point) {
 #
 # FACE ENCODING: 2 * axis + plane, where axis is 0/1/2 for x/y/z (for the OBB,
 # its own local axis 0/1/2) and plane is 0 for the min side, 1 for the max side.
-# GEO_FACE_NONE (-1) means no face was selected, which happens only when the
-# routine also returns the miss sentinel.
+# GEO_FACE_NONE (-1) means no face was selected.
+# ⛔ 3.3.3 — NEITHER THE SLOT NOR t SAYS ON ITS OWN THAT A NaN WAS INVOLVED. Every
+# pairing occurs, on 3.3.2 as on 3.3.3 unless marked:
+#   * GEO_FACE_NONE with the miss 0.
+#   * GEO_FACE_NONE with a NaN t: either slab routine, at the unit box, for a ray
+#     along +x with a NaN x origin, a NaN x direction or NaN in every component;
+#     geo_ray_obb_face also for the NaN origins in the two cases below (each local
+#     axis reads every origin component); since 3.3.3 geo_ray_capsule_branch for a
+#     NaN capsule axis.
+#   * GEO_FACE_NONE with a FINITE t a NaN was laundered into (roadmap [3.3.4]
+#     D034): geo_ray_aabb_face, unit box, ray from (NaN, 0.5, -4.5) along
+#     (1, 0, 1)/sqrt2, returns 4.5 * sqrt2, the z slab's entry, as geo_ray_aabb does.
+#     Since 3.3.3 a box from geo_aabb_new with a NaN corner reaches it too, its NaN
+#     slab erased by the next slab's f64_max: geo_aabb_new((NaN,0,0), (1,1,1)) and a
+#     ray from (-50, 0.5, -5) along (1, 0, 1)/sqrt2 return 5 * sqrt2, a hit point at
+#     x = -45, where 3.3.2 (which dropped the NaN corner) returned the miss.
+#   * A REAL face with a NaN t, when the NaN enters on a later slab after an earlier
+#     one set the face (f64_max hands the NaN on and the face stays): unit box, ray
+#     from (-5, 0.5, NaN) along (1, 0, 1)/sqrt2, face 0; the unit OBB with a NaN z
+#     half-extent on the same ray from (-5, 0.5, -5), face 0. The capsule tags a
+#     NaN radius or ray origin GEO_CAP_END_CAP.
+#   * A REAL face with a laundered finite t (D034), geo_ray_aabb_face only: a NaN x
+#     origin on a ray along +z returns the clean ray's t = 5 and face 4, where
+#     geo_ray_obb_face returns NaN and GEO_FACE_NONE. Since 3.3.3 a geo_aabb_new box
+#     with a NaN corner reaches it through the parallel-slab tests, both false
+#     against a NaN bound: geo_aabb_new((0,NaN,0), (1,1,1)) and a ray along +x from
+#     (-5, 0.5, 0.5), or from (-5, 5, 0.5), return t = 5, face 0, and a hit jet,
+#     where 3.3.2 returned the miss.
+# So test t for NaN and the slot for a face; neither stands in for the other. The
+# jets in src/geo_diff.cyr answer their miss for GEO_FACE_NONE and, since 3.3.3, for
+# every t that is not finite; a laundered finite t with a real face still builds a
+# hit jet (D034).
+# [measured: R5geo probes, 3.3.2, 3.3.3-base and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
 #
 # OUT BLOCK: 16 bytes, two i64 slots.
 #   out[0] = the face index above
@@ -365,6 +441,19 @@ public var GEO_CAP_SPHERE    = 3;    # degenerate capsule: start == end, a plain
 # f64_max and laundered into a plausible finite t -- is real, is module-wide
 # (geo_ray_sphere, _plane and _triangle behave the same), and is filed rather
 # than decided here.
+# ⚠ 3.3.3 — "MODULE-WIDE" WAS WRONG. With one NaN coordinate in each input of
+# each ray routine, over 2000 random rays aimed at the shape, geo_ray_sphere and
+# geo_ray_plane answer NaN for every input coordinate, on 3.3.2 too;
+# geo_ray_triangle answers NaN for a NaN origin and its miss, 0, for a NaN
+# direction or vertex (its reciprocal guard); geo_ray_capsule answers NaN for
+# every input coordinate since its 3.3.3 NaN-axis exit. Only the two slab
+# routines turn the NaN into a finite t, through f64_max / f64_min and the
+# parallel-slab branch: roadmap [3.3.4] D034. The `t < 0` tail tests of these
+# two and of geo_ray_sphere stay NaN-true on purpose: each PAIR respelled
+# NaN-false turns the NaN that reaches it into the miss 0 (every NaN-direction
+# OBB ray did); one test alone changes no t, because the other still returns the
+# NaN. tests/abuse.tcyr pins all three pairs.
+# [measured: W1 ray sweep on the 3.3.2 and 3.3.3 bundles, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 # THE INFINITY TEST, written inline at its four use sites rather than as a
 # function:
 #
@@ -563,6 +652,14 @@ public fn geo_ray_sphere(ray, sphere) {
 # checkable by reading and not only by running.
 # [measured: docs/development/issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md]
 # [measured: tests/modules.tcyr "2.10.1 degenerate-direction contract"]
+# ⚠ 3.3.3 — "ONLY AT |f| EXACTLY DBL_MIN" MISSES NaN. For a NaN `f` the `f64_gt`
+# form is 0 and sends the slab to the parallel branch, which skips it or returns
+# the miss 0; the `!= 1` form keeps the NaN in the slab arithmetic, as this
+# function's `== 1` test does for a NaN `d`. Swapped on its own, each of the
+# three OBB tests turned about half of 2000 NaN-direction rays from NaN into 0,
+# so the mutant is not equivalent once a NaN is in play. tests/abuse.tcyr pins
+# each axis with a NaN direction from outside that axis's slab.
+# [measured: W1 ray sweep, one test swapped at a time, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 public fn geo_ray_aabb_face(ray, aabb, out) {
     var ox = HVec3_x(GeoRay_origin(ray));
     var oy = HVec3_y(GeoRay_origin(ray));
@@ -768,10 +865,12 @@ public fn geo_ray_triangle(ray, tri) {
     # ⭐ AND THE THRESHOLD IS NOT THE FIX. What fails is `1 / a`, so test THAT:
     # `f64_lt(|f|, +Inf)` is 1 for every finite f and 0 for both +Inf and NaN, so
     # one comparison rejects a = 0, any `a` whose reciprocal overflows, and a NaN
-    # triangle — with no scale to choose. ⚠ NOT the `f64_gt(x, 0) == 0` form used
-    # for the `1/sqrt(x)` guards above: sqrt of any non-zero double is normal, but
-    # a RECIPROCAL overflows for subnormal a, and that form returns +Inf here on a
-    # corner-on ray where u and v are NaN and the [0,1] tests cannot reject it.
+    # triangle — with no scale to choose. ⚠ NOT an exact-zero test like the
+    # `1/sqrt(x)` guards above (spelled `f64_gt(x, 0) == 0` through 3.3.2 and
+    # `f64_eq(x, 0)` since): sqrt of any non-zero double is normal, but a
+    # RECIPROCAL overflows for subnormal a, and an exact-zero test returns +Inf
+    # here on a corner-on ray where u and v are NaN and the [0,1] tests cannot
+    # reject it.
     # [measured: 7-point bracket x 5 mutants; DBL_MIN fails 2 of 7, this fails 0]
     var f = f64_div(F64_ONE, a);
     if (f64_lt(f64_abs(f), _GEO_F64_POS_INF) == 0) { return 0; }
@@ -979,6 +1078,16 @@ public fn geo_ray_obb(ray, obb) {
 # and an hvec3_sub, both of which ALLOCATE, four times per capsule query under an
 # allocator that never frees. Measured: it was +92% on `ray_capsule`.
 # [measured: docs/development/issues/archived/2026-08-10-capsule-cyl-missed-tags-a-sphere-root-as-a-cap.md]
+#
+# ⚠ 3.3.3 — BOTH HALF-SPACE TESTS ARE NaN-TRUE ON PURPOSE. A NaN radius, ray
+# origin or ray direction makes every cap root NaN, and accepting it is what
+# carries the NaN out. Both respelled NaN-false, a ray along the axis, where the
+# cylinder is skipped and only the caps can answer, came back as the miss 0 for
+# a NaN radius or a NaN origin coordinate: capsule (0,0,0)-(3,0,0), r = 1, ray
+# from (-5,0,0) along +x. Either one alone changes no t, at most the branch label.
+# tests/abuse.tcyr pins the NaN radius. A NaN axis never reaches this: it leaves
+# right after the sphere case in geo_ray_capsule_branch.
+# [measured: W1 probe on a NaN-false variant of the 3.3.3 tree, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 fn _geo_cap_accepts(t, o_dot, d_dot, is_end) {
     if (f64_lt(t, 0) == 1) { return 0; }
     var dot_ab = f64_add(o_dot, f64_mul(t, d_dot));
@@ -1008,12 +1117,33 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
     # `dot(dir, ab) / ab_len_sq` with a unit `dir`, so |d_par| <= 1/|ab| and stays
     # finite for any non-zero ab_len_sq, subnormal included. Only an exact zero
     # makes a capsule genuinely a sphere.
-    if (f64_gt(ab_len_sq, 0) == 0) {
+    # ⛔ 3.3.3 — AND THE SPELLING OF THAT EXACT ZERO WAS NaN-TRUE. It was
+    # `f64_gt(ab_len_sq, 0) == 0`, so a capsule whose END had a NaN coordinate was
+    # taken for a sphere at its finite start and answered with a real-looking
+    # hit: the ray from (-5,0,0) along +x against (0,0,0)-(NaN,0,0), r = 1,
+    # returned t = 4 tagged GEO_CAP_SPHERE, and `geo_jet_capsule` built a full
+    # jet on it. A NaN start, radius, ray origin or ray direction already
+    # returned NaN.
+    # ⚠ THE NaN EXIT AFTER THE SPHERE CASE IS THE OTHER HALF OF THE REPAIR. With
+    # the exact zero alone the NaN reaches the body and is laundered there
+    # instead: `_geo_cap_accepts` is NaN-true as well, and `f64_min(NaN, t)`
+    # returns t. Measured with the exact zero alone: the NaN END comes out NaN but
+    # tagged GEO_CAP_END_CAP, and a NaN START, (NaN,0,0)-(3,0,0) on the same ray —
+    # NaN on 3.3.2, its sphere being centred on the NaN — becomes the end cap's
+    # t = 7, with a jet. A NaN axis poisons every quantity below this point, so
+    # it leaves with the NaN and the branch at GEO_FACE_NONE, and the jet reads
+    # that as its miss. It is a NaN test, not the non-finite one: an infinite
+    # axis is the scale class and keeps its 3.3.2 path. Propagate rather than
+    # miss, because that is what the capsule's other NaN inputs and
+    # `geo_ray_sphere` already do.
+    # [measured: G6 probe, 3.3.2 + exact-zero-only variant, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    if (f64_eq(ab_len_sq, 0) == 1) {
         var sph = geo_sphere_new(GeoCapsule_start(capsule), GeoCapsule_radius(capsule));
         var dt = geo_ray_sphere(ray, sph);
         if (out != 0) { if (dt != 0) { store64(out, GEO_CAP_SPHERE); } }
         return dt;
     }
+    if (f64_eq(ab_len_sq, ab_len_sq) == 0) { return ab_len_sq; }
 
     # Closest approach of ray to segment axis (infinite cylinder test)
     var ao = hvec3_sub(GeoRay_origin(ray), GeoCapsule_start(capsule));
@@ -1170,6 +1300,33 @@ public fn geo_ray_capsule(ray, capsule) {
 # ================================================================
 
 # AABB-AABB overlap test. Returns 1 if overlapping, 0 otherwise.
+#
+# ⚠ 3.3.3 — NaN-TRUE, UNLIKE geo_sphere_sphere BELOW, BECAUSE BOTH SPATIAL WALKERS
+# PRUNE WITH IT. Each test answers 0 only for an axis provably separated, and a
+# test that reads a NaN bound is false, so a NaN bound never separates ITS OWN SIDE
+# of its own axis; the other side and the other two axes still can. A box NaN in
+# both bounds of an axis — what geo_aabb_new((NaN,0,0), (1,1,1)) builds since 3.3.3
+# — therefore overlaps every box it does not clear on another axis: against
+# [100,101] x [0,1] x [0,1] or [-101,-100] x [0,1] x [0,1] it is 1 (3.3.2: 0, from
+# the slab [1, 1] its hvec3_min/hvec3_max built by dropping the NaN corner), and
+# against [0,1] x [100,101] x [0,1] it is still 0. A box NaN in min.x alone, built
+# with the setters, is still separated from [100,101] by its finite max.x, and
+# never from [-101,-100] (3.3.2 alike). `_bvh_query_aabb_rec` in
+# src/geo_advanced.cyr and `_ot_query_rec` in src/spatial.cyr prune their nodes
+# with this function, and since 3.3.3 a NaN box makes every BVH node above it NaN,
+# which the walk must descend. Spelled NaN-false, the root is pruned and the
+# finite box beside the NaN one is lost (tests/modules.tcyr "bvh_query_aabb: ...
+# finds box 0" gets [] for [0, 1]), and a point inserted in an octree built on a
+# NaN corner is never returned. The price of NaN-true is paid both ways, because
+# the leaf tests are NaN-true as well (the BVH's is this function): a NaN QUERY
+# box NaN in x and overlapping in y and z gets every box from bvh_query_aabb and
+# every point from octree_query (3.3.2: one box and no point, by the [1, 1] slab),
+# and a NaN BOX in the tree is returned to queries far from it: a BVH over [0,1]^3
+# and geo_aabb_new((NaN,0,0), (5,1,1)) answers the query [100,101] x [0,1] x [0,1]
+# with box 1 (3.3.2: nothing). A NaN-false spelling here first needs those walkers
+# to prune nodes NaN-true on their own.
+# [measured: R4geo probes and a NaN-false variant's suites, 3.3.2/3.3.3 bundles, not in-tree, 2026-10-01; cycc 6.6.12]
+# [measured: R5geo probe, 3.3.2, 3.3.3-base and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
 public fn geo_aabb_aabb(a, b) {
     var a_min = GeoAabb_min(a);
     var a_max = GeoAabb_max(a);
@@ -1187,11 +1344,28 @@ public fn geo_aabb_aabb(a, b) {
 }
 
 # Sphere-sphere overlap test. Returns 1 if overlapping, 0 otherwise.
+#
+# ⛔ 3.3.3 — A NaN SPHERE WAS A CONTACT. The test read "`dist_sq > (r1 + r2)^2`
+# is a miss, anything else a hit", and anything else includes NaN, so a NaN
+# centre coordinate or radius overlapped everything: a unit sphere at (NaN,0,0),
+# or one of radius NaN at the origin, touched a unit sphere at (100,0,0). It is
+# now "`dist_sq <= (r1 + r2)^2` is a hit", spelled NaN-false, so a NaN shape is a
+# miss — the rule tests/modules.tcyr pins for the collision entry points ("a NaN
+# shape is never a contact"). That includes the NaN infinite input makes: two
+# centres infinite with one sign in one slot give `Inf - Inf`, and 6562 of 20000
+# random configurations with infinite coordinates moved from 1 to 0. Finite input
+# cannot make a NaN here (a sum of squares never subtracts), and two sweeps of
+# 40000 pairs each, one at random magnitudes with DBL_MAX, -0 and subnormal
+# coordinates and one at and around exact touching, are bit-identical to 3.3.2.
+# No bench row and no caller in src/ reaches this function.
+# [measured: R4geo probes and sweeps, 3.3.2, 3.3.3-base and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
 public fn geo_sphere_sphere(a, b) {
     var r_sum = f64_add(GeoSphere_radius(a), GeoSphere_radius(b));
     var dist_sq = hvec3_length_sq(hvec3_sub(GeoSphere_center(a), GeoSphere_center(b)));
-    if (f64_gt(dist_sq, f64_mul(r_sum, r_sum)) == 1) { return 0; }
-    return 1;
+    var rr = f64_mul(r_sum, r_sum);
+    if (f64_lt(dist_sq, rr) == 1) { return 1; }
+    if (f64_eq(dist_sq, rr) == 1) { return 1; }
+    return 0;
 }
 
 # ================================================================
@@ -1229,14 +1403,52 @@ public fn geo_closest_point_on_sphere(sphere, point) {
 }
 
 # Closest point on an AABB to a given point (clamp to box). Returns HVec3.
+#
+# ⛔ 3.3.3 — A NaN BOUND WAS CLAMPED STRAIGHT PAST. `f64_clamp(x, lo, hi)` tests
+# `x < lo` and `x > hi`, both false against a NaN, so on an axis with a NaN bound
+# it returned the query's own coordinate: the box geo_aabb_new((NaN,0,0), (1,1,1))
+# and the point (-5, 0.5, 0.5) gave (-5, 0.5, 0.5), finite and with nothing to say
+# the box had no x extent. (3.3.2 got (1, 0.5, 0.5) by another route: its
+# hvec3_min/hvec3_max dropped the NaN corner and built the slab [1, 1].) A NaN
+# bound is now NaN in its own component — the bound itself — as a NaN query
+# coordinate already was; the other two components are their own clamps, which
+# do not depend on that axis. Finite and infinite bounds are bit-identical to
+# 3.3.2: 120000 random and near-boundary boxes, and 20000 with infinite bounds.
+# [measured: R4geo probes and sweeps, 3.3.2, 3.3.3-base and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
+# The six NaN tests cost about 4.6 ns of a 41 ns call against 3.3.2, +11% (41.7 ->
+# 46.2 and 41.0 -> 45.8 ns, medians of a 64-box scratch row over two interleaved
+# runs of 60 rounds at load 4-7 on 16 cores); no bench row and no caller in src/
+# reaches this function. Each bound is read once per axis.
+# [measured: R5geo interleaved micro A/B, 3.3.2, 3.3.3-base and repaired trees, not in-tree, 2026-10-01; cycc 6.6.12]
 public fn geo_closest_point_on_aabb(aabb, point) {
     var mn = GeoAabb_min(aabb);
     var mx = GeoAabb_max(aabb);
-    return hvec3_new(
-      f64_clamp(HVec3_x(point), HVec3_x(mn), HVec3_x(mx)),
-      f64_clamp(HVec3_y(point), HVec3_y(mn), HVec3_y(mx)),
-      f64_clamp(HVec3_z(point), HVec3_z(mn), HVec3_z(mx))
-      );
+    var lo = HVec3_x(mn);
+    var hi = HVec3_x(mx);
+    var cx = f64_clamp(HVec3_x(point), lo, hi);
+    if (f64_eq(lo, lo) == 0) { cx = lo; }
+    if (f64_eq(hi, hi) == 0) { cx = hi; }
+    lo = HVec3_y(mn);
+    hi = HVec3_y(mx);
+    var cy = f64_clamp(HVec3_y(point), lo, hi);
+    if (f64_eq(lo, lo) == 0) { cy = lo; }
+    if (f64_eq(hi, hi) == 0) { cy = hi; }
+    lo = HVec3_z(mn);
+    hi = HVec3_z(mx);
+    var cz = f64_clamp(HVec3_z(point), lo, hi);
+    if (f64_eq(lo, lo) == 0) { cz = lo; }
+    if (f64_eq(hi, hi) == 0) { cz = hi; }
+    return hvec3_new(cx, cy, cz);
+}
+
+# 1 when any component of `v` is NaN or +/-Inf, 0 otherwise: the house non-finite
+# test, `f64_lt(|x|, +Inf) == 0`, one comparison that catches all three. Every
+# finite value, DBL_MAX included, passes.
+fn _geo_hvec3_nonfinite(v) {
+    if (f64_lt(f64_abs(HVec3_x(v)), _GEO_F64_POS_INF) == 0) { return 1; }
+    if (f64_lt(f64_abs(HVec3_y(v)), _GEO_F64_POS_INF) == 0) { return 1; }
+    if (f64_lt(f64_abs(HVec3_z(v)), _GEO_F64_POS_INF) == 0) { return 1; }
+    return 0;
 }
 
 # Closest point on a triangle to a given point (Voronoi region test). Returns HVec3.
@@ -1244,6 +1456,79 @@ public fn geo_closest_point_on_triangle(tri, point) {
     var a = GeoTriangle_v0(tri);
     var b = GeoTriangle_v1(tri);
     var c = GeoTriangle_v2(tri);
+    # ⛔ 3.3.3 — A NaN INPUT CAME BACK AS A POINT ON THE TRIANGLE. All fifteen
+    # Voronoi tests below are spelled `f64_gt(x, y) != 1` or `f64_lt(x, y) != 1`,
+    # TRUE for NaN, so the first test a NaN reached read it as "in this region".
+    # On the triangle (0,0,0), (4,0,0), (0,4,0), 3.3.2 returned vertex A (0,0,0)
+    # for the query (NaN,NaN,NaN), (NaN,1,0) or (1,1,NaN); with C at (0,NaN,0) it
+    # returned A for (-1,1,0), B (4,0,0) for (5,1,0) and the edge-AB point (1,0,0)
+    # for (1,-1,0); with B at (NaN,0,0), A for (1,-1,0) and B itself, NaN only in
+    # x, for (-1,5,0). Over 5200 NaN inputs — 400 random triangles and queries, a
+    # NaN in each of the twelve coordinates and an all-NaN query — every answer
+    # came from vertex A (3301), vertex B (1161) or edge AB (738), and every one
+    # had a finite component. Now NaN in any coordinate is NaN in all three out.
+    # [measured: W1 probe and sweep on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    #
+    # ⭐ THE GUARD IS ON THE INPUTS, NOT ON THE FIFTEEN TESTS, AND THAT IS MEASURED.
+    # A NaN also reaches the tests from FINITE input. Scaling 24 random triangles
+    # and queries (coordinates below 8) by 2^e for every e in [-1022, 1023], the
+    # degree-four `vc`, `vb` and `va` overflow from e = 253 on, and `Inf - Inf` is
+    # NaN. There, respelling NaN-false the six tests that decide a NaN input's
+    # answer (the other nine are equivalent for it) turned 1799 bit-exact answers
+    # into NaN and 255 into a WRONG finite point (the NaN-true edge-BC test then
+    # answers; respelling it as well removes those 255), and respelling all
+    # fifteen still lost 3072 exact answers, beside the 10778 wrong ones it did
+    # turn into NaN. That is the scale class, not repaired here.
+    # [measured: W1 sweep, model checked against the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    #
+    # ⛔ 3.3.3 — AN INFINITE INPUT IS THE SAME DEFECT ONE STEP LATER, SO THE GUARD
+    # IS ON NON-FINITE INPUT, NOT ON NaN ALONE. An infinite coordinate makes its
+    # NaN inside (`0 * Inf` in a dot product, `Inf - Inf` in `vc`, `vb` and `va`),
+    # the same NaN-true tests read it as region membership, and a vertex or an
+    # edge point came back. On the triangle above, 3.3.2 returned B (4,0,0) for
+    # (0,+Inf,0), where (0,2^30,0) gives C; A for (1,1,+Inf), where (1,1,2^30)
+    # gives (1,1,0); A for (+Inf,-Inf,0), where (2^30,-2^30,0) gives B; and A for
+    # (+Inf,+Inf,0), whose finite neighbours land on edge BC: (2,2,0) for
+    # (2^30,2^30,0), B for (2^31,2^30,0), C for (2^30,2^31,0). Even (+Inf,0,0) -> B,
+    # the limit along +x, came out of that path: d4 = 0 * Inf is NaN and the
+    # vertex-B test accepts it. Over 4000 random triangles with one or two infinite
+    # query coordinates, 1221 answers were finite and away from the answer with the
+    # infinity replaced by 2^30, and none was NaN; with one infinite vertex
+    # coordinate, 1686 of 3000 were finite. A guard of `f64_eq(x, x)` leaves every
+    # one of those as it was. This one is the house non-finite test, so a NaN or an
+    # infinity in any coordinate is NaN in all three out, as a NaN vertex is in
+    # `geo_triangle_unit_normal`: the arithmetic cannot form the limit reliably, and
+    # (+Inf,+Inf,0) has none. The guard is 0 for every finite input: on a sweep of
+    # the shape above, 24 random triangles and queries by 2^e for every e in
+    # [-1022, 1023], the 49056 all-finite cases (the other 48 overflow to Inf in
+    # the scaling itself), and 39857 mixed-magnitude cases with DBL_MAX, -0 and
+    # subnormal coordinates, are bit-identical to 3.3.2.
+    # [measured: R4geo sweeps, 3.3.2, 3.3.3-base and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
+    # ⚠ THE GUARD REFUSES THE RIGHT ANSWERS WITH THE WRONG ONES. Most infinite
+    # queries came out at the limit on 3.3.2, bit-identical to the answer with each
+    # infinity replaced by 2^30 and by 2^60: with one infinite query coordinate, 3349
+    # of 4000 random triangles and queries (coordinates below 128), against 651
+    # wrong; with two, 2233 against 1767; with one infinite vertex coordinate, 1360
+    # against 76 wrong and 1859 NaN (705 more had no limit at those scales). Every
+    # one is NaN now: the price of refusing the wrong ones (16% with one infinite
+    # query coordinate, 44% with two), since nothing inside the routine tells them
+    # from the right ones. The siblings keep their 3.3.2 answers at an infinite
+    # query, which are the limit where a clamp forms it: geo_segment_closest_point
+    # of (+Inf,0,0) on (0,0,0)-(4,0,0) is (4,0,0), and geo_closest_point_on_aabb of
+    # (1,1,+Inf) on [0,4] x [0,4] x [0,0] is (1,1,0). On the triangle above, this
+    # routine answered those two queries with B (the limit) and A (wrong) on 3.3.2,
+    # and NaN now. The family is not aligned here.
+    # [measured: R5geo infinite-input sweep and probe, 3.3.2 and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
+    # THE GUARD COSTS about 29 ns a call against 3.3.2, +22% (132.9 -> 162.0 and
+    # 131.3 -> 159.9 ns, medians of a 64-input scratch row over two interleaved runs
+    # of 60 rounds at load 4-7 on 16 cores); no bench row and no caller in src/
+    # reaches this function.
+    # [measured: R5geo interleaved micro A/B, 3.3.2 vs 3.3.3 trees, not in-tree, 2026-10-01; cycc 6.6.12]
+    var nonfinite = _geo_hvec3_nonfinite(a) + _geo_hvec3_nonfinite(b) + _geo_hvec3_nonfinite(c);
+    if (nonfinite + _geo_hvec3_nonfinite(point) > 0) {
+        var nan = f64_sub(_GEO_F64_POS_INF, _GEO_F64_POS_INF);   # +Inf - +Inf: a quiet NaN
+        return hvec3_new(nan, nan, nan);
+    }
     var ab = hvec3_sub(b, a);
     var ac = hvec3_sub(c, a);
     var ap = hvec3_sub(point, a);

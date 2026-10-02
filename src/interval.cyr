@@ -15,17 +15,63 @@ public struct Interval { lo; hi; }
 # enclosure of an unbounded set is an unbounded interval.
 var _IVL_F64_POS_INF = 0x7FF0_0000_0000_0000;  # +Infinity
 var _IVL_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
+# The largest finite doubles: where ivl_new puts an INNER endpoint that overflowed.
+var _IVL_F64_MAX     = 0x7FEF_FFFF_FFFF_FFFF;  # (2 - 2^-52) * 2^1023 = 1.7976931348623157e308
+var _IVL_F64_NEG_MAX = 0xFFEF_FFFF_FFFF_FFFF;  # -(2 - 2^-52) * 2^1023 = -1.7976931348623157e308
 
+# Every interval this module returns is built here, so this is where the two
+# invariants live: lo <= hi, and lo < +Infinity and hi > -Infinity.
+#
+# ⛔ 3.3.3 — AN OVERFLOWED INNER ENDPOINT WAS STORED AS A DEGENERATE [+Inf, +Inf].
+# The endpoints are rounded to nearest, so a bound beyond the largest finite double
+# becomes Infinity, the INNER bound included: [1.23e308, 1.41e308] + [9.88e307,
+# 1.11e308] returned [+Inf, +Inf], and so did ivl_sub, ivl_mul, ivl_div (also when a
+# subnormal divisor's reciprocal overflows) and ivl_exp past 709.78. Under this
+# module's convention an infinite endpoint means "unbounded", so a lower bound of
+# +Infinity encloses no real number at all, not even the true sum 2.22e308, and
+# [1.23e-300, 1.31e-300] / [101, 2025] * 2^-1074 excluded its finite true range
+# (1.2e20 to 2.6e21). Adding [+Inf, +Inf] to its mirror [-Inf, -Inf] then formed
+# Inf - Inf, and [NaN, NaN] is a catch-all that ivl_contains accepts everything into.
+# Round-to-nearest overflows only for a value above the largest finite double, so
+# replacing that endpoint with the largest finite double is exactly what outward
+# rounding would have returned for it, and the interval stays a valid enclosure.
+# A NaN endpoint is left alone: f64_eq is false for it.
+# [measured: tests/edge_cases.tcyr, group "3.3.3 G3: an overflowed inner endpoint"]
+#
+# A sweep of 3000 random add, sub, mul, div and exp cases near the overflow
+# thresholds, checked against exact rationals, returned no degenerate interval, and
+# every INNER bound whose true value overflowed came back as exactly +/-DBL_MAX (311
+# of them). 3.3.2 returned 467 degenerate intervals on the same cases.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 Fraction oracle]
+#
+# LIMIT: no endpoint is rounded outward, so a finite endpoint can sit inside the
+# exact bound. In the same sweep 1412 of 3262 finite endpoints did, by at most half
+# an ulp for add, sub and mul, 0.67 ulp for exp and 0.99 ulp for div, which rounds
+# twice (reciprocal, product).
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 Fraction oracle]
+# ⚠ Those are the largest gaps THAT SWEEP met, not bounds. A divisor above 2^1022
+# in magnitude has a subnormal reciprocal, which carries fewer bits: the point quotient
+# 3.12e10 / 1.73e308 (0x421D0BDA51A75F88 / 0x7FEEB7102C030F84) comes back 3.6 ulp
+# below the exact value, which it therefore excludes, and [-1.12e305, -1.38e278] /
+# [-1.80e308, -1.00e-295] has a lower bound 4.1 ulp inside. f64_exp is 0.745 ulp off
+# at -702.16. And an OUTER bound that underflows rounds to 0, the mirror of the
+# overflow above: ivl_exp([-1000, -900]) and [1e-200, 2e-200] * [1e-200, 2e-200]
+# are the degenerate [0, 0], excluding true ranges that are entirely positive, where
+# outward rounding would give an upper bound of 2^-1074.
+# [measured: scratch probe against a 3.3.3 bundle, cycc 6.6.12, 2026-10-01; python3 Fraction, 80-digit Decimal]
 #must_use
 public fn ivl_new(a, b) {
-    var v = alloc(sizeof(Interval));
+    var lo = a;
+    var hi = b;
     if (f64_lt(b, a) == 1) {
-        Interval_set_lo(v, b);
-        Interval_set_hi(v, a);
-    } else {
-        Interval_set_lo(v, a);
-        Interval_set_hi(v, b);
+        lo = b;
+        hi = a;
     }
+    if (f64_eq(lo, _IVL_F64_POS_INF) == 1) { lo = _IVL_F64_MAX; }
+    if (f64_eq(hi, _IVL_F64_NEG_INF) == 1) { hi = _IVL_F64_NEG_MAX; }
+    var v = alloc(sizeof(Interval));
+    Interval_set_lo(v, lo);
+    Interval_set_hi(v, hi);
     return v;
 }
 
@@ -35,8 +81,29 @@ public fn ivl_point(x) { return ivl_new(x, x); }
 #must_use
 public fn ivl_width(iv) { return f64_sub(Interval_hi(iv), Interval_lo(iv)); }
 
+# ⛔ 3.3.3 — (lo + hi) / 2 OVERFLOWS FOR A FINITE INTERVAL NEAR THE TOP OF THE RANGE:
+# the midpoint of [1.23e308, 1.41e308] came back +Infinity, outside the interval.
+# When the sum is not finite, the halves are summed instead. That fallback fires
+# for finite endpoints only when |lo + hi| rounds past the largest finite double,
+# which needs both endpoints at least 2^970 in magnitude, so each half is exact and
+# the result is the correctly rounded midpoint. The sum form stays first because
+# halving first would lose a subnormal's last bit. With an infinite or NaN endpoint
+# the fallback returns what the sum form did (+/-Infinity, or NaN for [-Inf, +Inf]).
+# [measured: tests/edge_cases.tcyr, group "3.3.3 G3: ivl_midpoint near the top of the range"]
+# The single rounding is what separates it from lo + (hi - lo) / 2, which rounds
+# twice: for [2^970, DBL_MAX] the exact midpoint 2^1023 - 2^969 is a tie, the halves
+# form gives the even 2^1023, and the textbook form 2^1023 - 2^970, one ulp below.
+# [measured: tests/edge_cases.tcyr, group "3.3.3 R4num: ivl_midpoint's fallback rounds once"]
 #must_use
-public fn ivl_midpoint(iv) { return f64_mul(f64_add(Interval_lo(iv), Interval_hi(iv)), F64_HALF); }
+public fn ivl_midpoint(iv) {
+    var lo = Interval_lo(iv);
+    var hi = Interval_hi(iv);
+    var s = f64_add(lo, hi);
+    if (f64_lt(f64_abs(s), _IVL_F64_POS_INF) == 0) {
+        return f64_add(f64_mul(lo, F64_HALF), f64_mul(hi, F64_HALF));
+    }
+    return f64_mul(s, F64_HALF);
+}
 
 #must_use
 public fn ivl_contains(iv, x) {
@@ -127,13 +194,42 @@ public fn ivl_mul(a, b) {
 # (S really is (-inf,-1] union [1,+inf), whose hull is entire), and [0,0]/[-1,1]
 # gives [0,0] because 0/y is 0 for every admissible y.
 #
-# LIMIT: an unbounded result makes the ADDITIVE operators reachable with two
-# unbounded operands, and ivl_add/ivl_sub then compute Infinity - Infinity = NaN
-# rather than the correct "entire". ivl_mul is handled (see _ivl_mul_pt); add and
-# sub are not, because the correct fix there is an explicit entire/empty tag on
-# the type, which this struct does not have. Dividing by a zero-straddling
-# interval and then ADDING the result to another unbounded interval is therefore
-# still unsound; every other consumer of the result is now correct.
+# UNBOUNDED RESULTS ARE SAFE TO ADD. ivl_add and ivl_sub form Infinity - Infinity
+# only from an interval whose lower bound is +Infinity or whose upper bound is
+# -Infinity, and ivl_new refuses to store either (3.3.3). An unbounded result of
+# this function has its infinite bound on the OUTER side, so [1, +inf) + (-inf, -1]
+# is (-inf, +inf), as it should be. ⛔ 3.3.3 — through 3.3.2 this paragraph was a
+# LIMIT that blamed the unbounded results themselves, saying that adding one to
+# another unbounded interval formed Inf - Inf. An infinite OUTER bound never does.
+# The NaN that 3.3.2 did form came from an overflowed INNER bound, in ivl_new's
+# callers (see there) and here, in the half-line bounds 1/bl and 1/bh of a
+# zero-straddling divisor. A subnormal endpoint's reciprocal rounds to Infinity, so
+# [1.23e-300, 1.31e-300] / [0, 2025 * 2^-1074] was the degenerate [+Inf, +Inf],
+# which excluded its true range [1.2e20, +inf), its mirror over [-2025 * 2^-1074, 0]
+# was [-Inf, -Inf], and the sum of the two was [NaN, NaN], an interval ivl_contains
+# accepts every number into. Both half-line bounds are now clamped below, as
+# ivl_new clamps, and that sum is the entire line.
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
+# [measured: tests/edge_cases.tcyr, group "3.3.3 R4num: ivl_new's guard order and an unbounded sum"]
+#
+# The clamped bound is sound but loose. The quotient goes through the reciprocal,
+# so that division's lower bound is now lo(a) * DBL_MAX = 2.2e8 where the true one
+# is 1.2e20, and the same holds for a subnormal divisor that does not straddle 0.
+# Dividing the endpoints directly would keep 1.2e20, but it changes the rounding of
+# every quotient, so it is not done here.
+# [measured: tests/edge_cases.tcyr, group "3.3.3 G3: an overflowed inner endpoint"]
+#
+# An OUTER bound is not clamped, since an infinite outer bound is the honest
+# "unbounded", so when the reciprocal overflows on that side a BOUNDED quotient comes
+# back as the entire line. That needs a divisor endpoint below 1/DBL_MAX = 5.6e-309
+# in magnitude: [-1.98e-308, 5.37e-309] / [-1.22e293, -5.14e-309], whose exact range
+# is [-1.045, 3.857], returns (-inf, +inf). Sound, but no tighter than no answer.
+# [measured: scratch probe against a 3.3.3 bundle, cycc 6.6.12, 2026-10-01; python3 Fraction oracle]
+#
+# LIMIT: there is no empty interval. A [0, 0] divisor leaves S empty, and this
+# returns the entire line, which encloses the empty set vacuously. ivl_sqrt
+# returns [0, 0] for the same reason. An explicit entire/empty tag on the type
+# would say "empty" instead; it is demand-gated.
 #must_use
 public fn ivl_div(a, b) {
     var al = Interval_lo(a); var ah = Interval_hi(a);
@@ -156,6 +252,7 @@ public fn ivl_div(a, b) {
         var hi = _IVL_F64_NEG_INF;
         if (has_neg == 1) {
             var nu = f64_div(F64_ONE, bl);          # half-line [-inf, 1/bl]
+            if (f64_eq(nu, _IVL_F64_NEG_INF) == 1) { nu = _IVL_F64_NEG_MAX; }
             var n1 = _ivl_mul_pt(al, _IVL_F64_NEG_INF);
             var n2 = _ivl_mul_pt(al, nu);
             var n3 = _ivl_mul_pt(ah, _IVL_F64_NEG_INF);
@@ -165,6 +262,7 @@ public fn ivl_div(a, b) {
         }
         if (has_pos == 1) {
             var pv = f64_div(F64_ONE, bh);          # half-line [1/bh, +inf]
+            if (f64_eq(pv, _IVL_F64_POS_INF) == 1) { pv = _IVL_F64_MAX; }
             var q1 = _ivl_mul_pt(al, pv);
             var q2 = _ivl_mul_pt(al, _IVL_F64_POS_INF);
             var q3 = _ivl_mul_pt(ah, pv);

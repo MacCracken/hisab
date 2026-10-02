@@ -337,6 +337,13 @@ fn _lext_dot(a, b, n) {
 # ⚠ The `+Inf` exit is REQUIRED: without it `Inf/Inf` is NaN and an infinite
 # component would turn a well-defined +Inf norm into a NaN.
 # [measured: NaN probe on both scaled helpers, 2026-09-10]
+# ⚠ 3.3.3 — `f64_gt(mx, 0) == 0` BELOW IS THE NaN-TRUE SHAPE, AUDITED AND KEPT, for
+# the two reasons above: mx is an f64_gt max seeded with 0 and is never NaN, and
+# `_lext_norm` (this helper's only caller) never routes a NaN vector here. The exit
+# fires only for a vector of zeros, whose norm is 0. `f64_eq(mx, 0)` there is an
+# equivalent mutant; routing a NaN sum in from `_lext_norm` is not -- modules.tcyr's
+# "_lext_norm: NaN propagates" fails on it.
+# [measured: G2a mutant run, cycc 6.6.12, 2026-10-01]
 fn _lext_norm_scaled(v, n) {
     var mx = f64_from(0);
     var i = 0;
@@ -493,6 +500,15 @@ public fn linalg_sort_desc(vals, n, by_abs, col_mat, col_rows, row_mat, row_cols
 
 # GMRES(m) iterative solver for non-symmetric systems Ax = b.
 # A_fn: function pointer, called as fncall1(A_fn, x_ptr) -> Ax (flat f64 array).
+#       Its input is always storage hisab owns, and the vector it returns is read
+#       into hisab's own storage before A_fn is called again: A_fn may return one
+#       buffer it reuses on every call, or its own input pointer. hisab never writes
+#       into a buffer of A_fn's own, or keeps one. ⛔ A_fn MUST NOT WRITE INTO ITS
+#       INPUT, which is the current iterate or a Krylov basis vector: an in-place 2I
+#       (x *= 2; return x) on b = (6, 10, 8) from x0 = 0 spends GMRES(3)'s whole
+#       budget of 60 matvecs and returns about (3193, 5322, 4257) for (3, 5, 4), with
+#       no report.
+#       [measured: R4le probe, this tree, cycc 6.6.12, 2026-10-01]
 # b:    flat f64 array of length n.
 # x0:   initial guess, flat f64 array of length n.
 # n:    system dimension.
@@ -543,6 +559,32 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     # the tempting alternative and is exactly the fabricated-plausible-answer
     # class the 2026-08-11 audit filed against this very function.
     if (m + 1 > (ALLOC_MAX / 8) / m) { return 0; }
+
+    # ⛔ 3.3.3 — THE ARNOLDI VECTOR WAS THE CALLER'S OWN BUFFER. `wj = fncall1(A_fn, vj)`
+    # was orthogonalised and normalised IN PLACE and then kept as basis vector j+1: an
+    # unwritten "A_fn returns a fresh buffer" contract (audit M6, 2026-04-15). An A_fn
+    # that reuses one output buffer, the natural way to write a matvec, made every basis
+    # vector the same pointer and was handed its own output back as input. Measured on
+    # N = [[4,1,0],[-1,3,1],[0,-2,2]], b = (1.1, 2.1, 2.9), tol 1e-10, budget 60, restart
+    # 3: **60 matvecs**, the whole budget, against 4 with fresh buffers, the worst
+    # component of x off by 1.2e-4 relative, and the caller's buffer written 44 times
+    # behind its back. An A_fn that returns its input pointer (the identity) got x = x0
+    # back instead of b.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    #
+    # A_fn's result now lands in a basis slot hisab owns: the first Gram-Schmidt update
+    # below reads A_fn's vector and writes the slot. ⚠ The slots are allocated LAZILY and
+    # ONCE PER CALL, then reused by every restart cycle, so the cost is (m + k * n) * 8 B
+    # per call for the deepest Arnoldi step k reached, never m * n * 8 up front (the abuse
+    # suite's m = n = 16383 call has a 2-matvec budget). Measured with a fresh-buffer A_fn
+    # on that fixture: 376 -> 472 B at restart 3 (4 matvecs), 3112 -> 3176 B at restart 2
+    # (38 matvecs); the tests/hisab.tcyr arena bounds hold both properties. The slot
+    # allocations are most of what the repair costs in time: 770 -> 843 ns (+9.4%) on the
+    # restart-3 solve. The per-cycle buffers below are untouched by this.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    var v_own = alloc(m * 8);
+    var vo = 0;
+    while (vo < m) { store64(v_own + vo * 8, 0); vo = vo + 1; }
 
     # COUNT the matrix-vector products rather than deriving an outer-cycle bound
     # from them. Through 2.7.0 this computed
@@ -604,18 +646,30 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
             # k steps and returns the best answer available within budget.
             if (mv_used >= max_iter) { break; }
             var vj = load64(v_basis + j * 8);
-            var wj = fncall1(A_fn, vj);
+            var wj = load64(v_own + j * 8);
+            if (wj == 0) {
+                wj = alloc(n * 8);
+                store64(v_own + j * 8, wj);
+            }
+            var aw = fncall1(A_fn, vj);
             mv_used = mv_used + 1;
 
-            # Modified Gram-Schmidt
+            # Modified Gram-Schmidt. Step 0 reads A_fn's vector and writes hisab's slot,
+            # so the copy IS the first update rather than a pass of its own: the same
+            # operations in the same order, bit-identical to copying first. A separate
+            # copy pass cost a 64-dim GMRES(8) solve 6.4%; fused, 0.4%, inside 3.3.2's
+            # own spread.
+            # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
             i = 0;
             while (i <= j) {
                 var vi = load64(v_basis + i * 8);
-                var hij = _lext_dot(wj, vi, n);
+                var wsrc = wj;
+                if (i == 0) { wsrc = aw; }
+                var hij = _lext_dot(wsrc, vi, n);
                 store64(h + (i * m + j) * 8, hij);  # H[i][j]
                 var l = 0;
                 while (l < n) {
-                    store64(wj + l * 8, f64_sub(load64(wj + l * 8),
+                    store64(wj + l * 8, f64_sub(load64(wsrc + l * 8),
                         f64_mul(hij, load64(vi + l * 8))));
                     l = l + 1;
                 }
@@ -748,13 +802,26 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
 }
 
 # BiCGSTAB iterative solver for non-symmetric systems Ax = b.
-# A_fn: function pointer, called as fncall1(A_fn, x_ptr) -> Ax.
+# A_fn: function pointer, called as fncall1(A_fn, x_ptr) -> Ax. Its input is always
+#       storage hisab owns; the A p it returns is copied before the next call, and
+#       every other result is read before it, so A_fn may return one buffer it
+#       reuses on every call, or its own input pointer. hisab never writes into a
+#       buffer of A_fn's own. ⛔ A_fn MUST NOT WRITE INTO ITS INPUT, which is the
+#       current iterate, p or s: an in-place 2I (x *= 2; return x) on b = (6, 10, 8)
+#       from x0 = 0 returns (6, 10, 8) after 2 matvecs, for (3, 5, 4), with no
+#       report.
+#       [measured: R4le probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
 # b:    flat f64 array of length n.
 # x0:   initial guess, flat f64 array of length n.
 # n:    system dimension.
 # tol:  convergence tolerance on residual norm.
 # max_iter: maximum iterations.
-# Returns: flat f64 array of length n (solution).
+# Returns: flat f64 array of length n (solution). On breakdown (r_hat . r, r_hat . A p
+#          or omega exactly zero) it returns the current iterate; it does not report it.
+#          One breakdown IS reported, as NaN: a t = A s numerically orthogonal to s,
+#          where omega carries no information and 3.3.2 went on to NaN. Then x
+#          comes back all NaN, unless |s| is already at most 2^-52 of the initial
+#          residual, when the half step x + alpha p is returned (see below).
 public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
     # ⛔ IDENTICAL DEFECT TO `solve_gmres`, and found only because that one was
     # repaired and the same shape was then grepped for rather than assumed
@@ -768,7 +835,44 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
     var x = _lext_copy(x0, n);
     var ax = fncall1(A_fn, x);
     var r = _lext_sub(b, ax, n);
-    var r_hat = _lext_copy(r, n);  # Shadow residual (fixed)
+    # Shadow residual (fixed), divided by the power of two at or below max|r0_i|.
+    # ⛔ 3.3.3 — UNSCALED, `r_hat` CARRIED THE RESIDUAL'S UNITS INTO EVERY DOT AGAINST IT,
+    # so rho = r_hat . r was degree two in b and r_hat . A p degree two in b and one in A.
+    # Both reached the flush band (or overflowed) long before the vectors themselves did,
+    # and an exact-zero breakdown test then reads a zero the arithmetic made up.
+    # ⭐ BiCGSTAB is invariant under any scaling of r_hat (alpha and beta are ratios of two
+    # dots against it), and dividing by a power of two is exact, so every iterate is
+    # BIT-IDENTICAL to the unscaled form wherever that one stayed in range. Measured on the
+    # 2D sweep described at the breakdown tests: 2081 of 3281 cells without this, 3281 with.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    var r_hat = _lext_copy(r, n);
+    var rh_mx = f64_from(0);
+    var i = 0;
+    while (i < n) {
+        var rh_a = f64_abs(load64(r + i * 8));
+        if (f64_gt(rh_a, rh_mx) == 1) { rh_mx = rh_a; }
+        i = i + 1;
+    }
+    # ⚠ The `> 0` test is required: r = 0 (x0 already exact) has no leading bit, and the
+    # subnormal loop below would never end. There is deliberately no `< +Inf` test: an
+    # infinite max makes rh_p = +Inf and r_hat NaN where r is infinite, and on five Inf
+    # and overflow inputs the result is the all-NaN x 3.3.2 gives, bit for bit.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    var rh_scale = f64_from(1);   # the power of two r_hat = r0 / rh_scale was divided by
+    if (f64_gt(rh_mx, 0) == 1) {
+        var rh_p = rh_mx & 0x7FF0_0000_0000_0000;
+        if (rh_p == 0) {
+            # A subnormal max: the power of two at or below it is its own leading bit.
+            rh_p = 1 << 51;
+            while ((rh_mx & rh_p) == 0) { rh_p = rh_p >> 1; }
+        }
+        rh_scale = rh_p;
+        i = 0;
+        while (i < n) {
+            store64(r_hat + i * 8, f64_div(load64(r + i * 8), rh_p));
+            i = i + 1;
+        }
+    }
 
     var rho   = f64_from(1);
     var alpha = f64_from(1);
@@ -786,27 +890,82 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
     # Deliberately NOT zero-filled below: all n slots are overwritten at the top
     # of every iteration before any read, so reuse is bit-identical.
     var s = alloc(n * 8);
-    var i = 0;
+    i = 0;
     while (i < n) {
         store64(v + i * 8, f64_from(0));
         store64(p + i * 8, f64_from(0));
         i = i + 1;
     }
 
-    # NOT f64_from(...) — f64_from CONVERTS an integer to a double, it does not
-    # reinterpret bits. Through 2.6.11 this read `f64_from(0x3C32725DD1D243AC)`,
-    # which yielded 4.34e18 rather than 1e-18, so the very first breakdown check
-    # (`|rho| < tol`) was always true and solve_bicgstab returned the initial
-    # guess without ever iterating. The literal already IS the f64 bit pattern.
-    # (The old comment also mis-stated the value as ~1e-30.)
-    var breakdown_tol = 0x3C32725DD1D243AC;  # 1e-18
-
+    # ⛔ 3.3.3 — THE THREE BREAKDOWN TESTS COMPARED DEGREE-TWO TO DEGREE-FOUR QUANTITIES
+    # WITH AN ABSOLUTE 1e-18, written as the literal `0x3C32725DD1D243AC`, which is why the
+    # 2026-09-09 census of `EPSILON_F64` thresholds walked past them. rho = r_hat . r,
+    # r_hat . A p and t . t carry the caller's units squared or worse, so the threshold was
+    # a scale chosen for one problem. On A = k[[4,1,0],[1,3,1],[0,1,2]], b = k(6,10,8),
+    # x = (1,2,3), tol = k * 1e-10, 3.3.2 returned x0 for every k <= 1e-5, a wrong partial
+    # iterate up to k = 10^-4.4, and was right (1e-12 relative) for 81 of the 601 decades
+    # 1e-300..1e300. It also fired at UNIT scale: with tol <= 1e-17 the t . t test returned
+    # the iterate BEFORE the converging half step, x = (0.98986, 1.99766, 2.95940), where
+    # tol = 1e-16 gives (1, 2, 3) to an ulp.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    #
+    # Each test is now exact-zero, because the division it protects fails at zero and
+    # nowhere else, and the quantities it reads are formed so they cannot flush early
+    # (r_hat scaled above, omega scaled below). Measured on a 2D sweep, A = 2^ea * N and
+    # b = 2^eb * c with ea, eb in [-1000, 1000] step 25, over the 3281 cells where x and
+    # the caller's own A p are representable: 3.3.2 is right (1e-12 relative) in 483,
+    # exact-zero tests alone in 1491, the full repair in all 3281. Wherever 3.3.2 was
+    # right the answer is bit-identical. The same 601 decades, with an A_fn that forms
+    # k (M x): 81 -> 310, every decade from 1e-156 to 1e153 -- and 309, from 1e-155,
+    # with one that multiplies by pre-scaled entries, (k M) x; 3.3.2 has 81 either way.
+    # The rest is where the caller's own A p, of order k^2, leaves the f64 range.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # [measured: R4le decade probe, both matvec forms, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
+    #
+    # (Through 2.6.11 the threshold was `f64_from(0x3C32725DD1D243AC)`, a CONVERSION
+    # to 4.34e18 rather than a reinterpretation, so the first test always fired and the
+    # solver returned the initial guess without iterating. The solution asserts in
+    # tests/hisab.tcyr group "linalg_ext" are what a no-op cannot pass.)
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    #
+    # ⚠ Breakdown still returns the current `x`, the same plausible-answer contract as
+    # before. Reporting it is error-channel work ([3.4.0]), not part of this repair.
     var iter = 0;
     while (iter < max_iter) {
         var rho_new = _lext_dot(r_hat, r, n);
 
-        if (f64_lt(f64_abs(rho_new), breakdown_tol) == 1) {
-            return x;  # Breakdown
+        if (f64_eq(rho_new, 0) == 1) {
+            return x;  # Breakdown: r_hat . r is exactly zero
+        }
+        # ⛔ 3.3.3 — omega WAS NEVER TESTED, and `alpha / omega` below divides by it. When
+        # omega is exactly 0, r = s, r_hat . s is zero only up to rounding, beta is +-Inf,
+        # and every later iterate is NaN. Measured with an A_fn whose first t is the zero
+        # vector: without this test, 101 matvecs and a NaN x; with it, 3 matvecs and the
+        # half-step iterate x0 + alpha p, bit-identical to what tol = +Inf returns. On
+        # A = 2^e N, b = 2^e c it also stops 13 scales between 2^-538 and 2^-523, where
+        # the caller's own A p is subnormal, at a finite stagnation iterate instead of a
+        # 401-matvec NaN. Neither is right there, and the stop is as unreported as every
+        # other breakdown.
+        # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+        # ⚠ WHEN omega IS EXACTLY 0 HERE. When the last t = A s was exactly zero (the
+        # rescue below then leaves omega at 0), when every term of the rescue's numerator
+        # is zero or below DBL_MIN and their sum is 0, or when either path's quotient
+        # underflows. The fast path's t . s is never 0 (it needs |t . s| >= DBL_MIN), and
+        # a t NUMERICALLY ORTHOGONAL to s never reaches this test: the rescue returns
+        # first (see there). In every case here x already holds the half step
+        # x + alpha p, and that is what comes back, unreported like every breakdown.
+        # ⚠ THE HALF STEP IS NOT THE SOLUTION HERE. s = 0 never reaches this test: with
+        # tol > 0 the s-norm test returns first, and with tol <= 0, r = s = 0 makes
+        # r_hat . r = 0 and the test above returns first. So the half step's residual s
+        # is non-zero, and at least tol: the zero-t fixture in hisab.tcyr gets
+        # (1.41, 2.35, 1.88) for (1, 2, 3), where 3.3.2 returned x0. It stays
+        # finite because NaN here makes inputs worse than 3.3.2: on 3000 systems
+        # A = 2^ea M, b = 2^eb c, the 95 that stop here with t = 0 (A s underflows to
+        # exactly zero) include 9 that 3.3.2 answered to 1e-9 and the half step answers
+        # too. Reporting it is the [3.4.0] error-channel work.
+        # [measured: R5le BiCGSTAB differential, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
+        if (f64_eq(omega, 0) == 1) {
+            return x;  # Stagnation: the last step could not move along s
         }
 
         var beta = f64_mul(f64_div(rho_new, rho), f64_div(alpha, omega));
@@ -822,11 +981,26 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
             i = i + 1;
         }
 
-        v = fncall1(A_fn, p);
+        # v = A p, COPIED into hisab's own buffer.
+        # ⛔ 3.3.3 — `v` WAS THE CALLER'S BUFFER, KEPT ACROSS THE NEXT CALL. It is read
+        # again at the top of the next iteration, after `t = fncall1(A_fn, s)`, so an
+        # A_fn that reuses one output buffer handed back A s where A p belonged. Nothing
+        # faulted and nothing was reported: on the GMRES fixture above (max_iter 60) it
+        # returned after 65 matvecs against 6 with fresh buffers, at a true residual of
+        # 1.7e-9 for a tol of 1e-10, its worst component off by 1.8e-9 relative. It never
+        # wrote into that buffer; it only kept it. This `v` was allocated above but, until
+        # now, only ever held the first zero.
+        # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+        var av = fncall1(A_fn, p);
+        i = 0;
+        while (i < n) {
+            store64(v + i * 8, load64(av + i * 8));
+            i = i + 1;
+        }
 
         var r_hat_v = _lext_dot(r_hat, v, n);
-        if (f64_lt(f64_abs(r_hat_v), breakdown_tol) == 1) {
-            return x;  # Breakdown
+        if (f64_eq(r_hat_v, 0) == 1) {
+            return x;  # Breakdown: r_hat . A p is exactly zero
         }
         alpha = f64_div(rho, r_hat_v);
 
@@ -847,14 +1021,111 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
             return x;
         }
 
+        # `t` is read only before the next call to A_fn, so it needs no copy.
         var t = fncall1(A_fn, s);
 
+        # omega = (t . s) / (t . t), the minimiser of |s - omega t|.
+        # ⛔ 3.3.3 — t . t IS A NAIVE SUM OF SQUARES, degree two in t (and t . s its
+        # partner), and its 1e-18 test returned `x` WITHOUT the half step alpha p just
+        # earned. Both dots stay as the fast path, bit-identical to 3.3.2 whenever each is
+        # normal and finite. Otherwise omega is formed as ((t / |t|) . s) / |t|, with |t|
+        # from the scaled `_lext_norm`, so nothing is squared out of range. Each of the
+        # four fast-path bounds is load-bearing: dropping one costs 24 to 300 cells of the
+        # 2D sweep, and taking the fast path unconditionally costs 1650. A t that is
+        # exactly zero leaves omega = 0: x keeps the half step, and the omega test above
+        # stops the loop.
+        # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+        # ⛔ 3.3.3 — A t NUMERICALLY ORTHOGONAL TO s CAME BACK AS A FINITE, WRONG x. Then
+        # the minimiser of |s - omega t| is 0 and the stabilising step cannot move. 3.3.2
+        # formed omega = t . s / t . t = 0 exactly, went on to beta = +-Inf and returned
+        # NaN. Here the fast path refuses a t . s below DBL_MIN, and the rescue re-forms
+        # it as a sum whose terms no longer cancel exactly, so omega came out exactly 0
+        # (the stop above returned the half step) or as a rounding residue (the loop went
+        # on, to a later breakdown or, by luck, convergence). On the reviewer's fixture,
+        # an A_fn whose third call returns t = (-s1, s0, 0) on [[4,1,0],[1,3,1],[0,1,2]]
+        # for 340 random solutions (LCG seeds 99 and 7, tol 1e-10), x came back finite
+        # and wrong in 225 runs, 0.07 to 54 relative off and unreported, and right in
+        # 115; 3.3.2 returned NaN in 330 and a wrong x in 10.
+        # [measured: R5le probe, 3.3.2 bundle, the tree before this repair and this tree, cycc 6.6.12, 2026-10-01]
+        # ⭐ So the rescue asks whether its numerator is distinguishable from zero:
+        # |sum| <= n 2^-52 sum|term| bounds the rounding of an n-term dot product of
+        # exactly orthogonal vectors (each term carries at most two roundings, the sum
+        # n - 1). It is asked only when some term is at least DBL_MIN: below it a term
+        # has lost its relative precision, and a numerator whose terms are all zero is
+        # structural, not a cancellation. (A sum of |term|s that overflows makes the
+        # bound +Inf, so such a step is reported as well.) When the numerator is zero to
+        # rounding, x comes back all NaN at once, 3.3.2's loud answer, unless
+        # |s| <= 2^-52 |r0|: then the half step is already as converged as the rounding
+        # of the initial residual allows, and is returned. All 340 fixture runs now
+        # return NaN after 3 matvecs.
+        # Measured against the shipped 3.3.2 on 57800 runs of 13 families (the
+        # orthogonal-t and zero-t fakes, diagonally dominant, general, skew + 0.01 I,
+        # singular, zero-diagonal cyclic, and each scaled by 2^ea, 2^eb with ea, eb in
+        # [-1000, 1000]; tol 1e-10, 1e-9, 1e-17 and 0): this test makes no answer that
+        # 3.3.2 gave to 1e-9 come back NaN or wrong, and no NaN of 3.3.2's come back
+        # finite and wrong. Of the 2256 runs where the tree before it returned a finite,
+        # wrong x for 3.3.2's NaN, it turns 2068 back into NaN; the other 188 (scaled
+        # singular, skew and general systems) end elsewhere, bit-identical to before. Outside
+        # the fakes it changes 19 runs: 15 singular systems become NaN (3.3.2: NaN or
+        # wrong) and 4 stay right. ⚠ THE COST, as plainly: 921 fake-t runs that the tree
+        # before it answered right, because a rounding residue let the loop go on, now
+        # return NaN; 3.3.2 returned NaN or a wrong x in every one.
+        # [measured: R5le BiCGSTAB differential, 3.3.2, pre-repair and this tree, cycc 6.6.12, 2026-10-01]
+        # Both conditions are load-bearing. Without the |s| one, a skew 4x4 system
+        # (entries near 1e-36, b near 1e61, tol 0), right on 3.3.2 after 25 matvecs and
+        # on the tree before this test after 244, came back NaN at the 239th, where the
+        # stagnated iterate meets an orthogonal t. Without the DBL_MIN one,
+        # [[0,1],[3,0]] x = (5,1) at tol 0, whose second t has a zero term against every
+        # non-zero s_i, came back NaN for the right (1/3, 5).
+        # [measured: R5le BiCGSTAB differential and variant runs, cycc 6.6.12, 2026-10-01]
         var t_dot_s = _lext_dot(t, s, n);
         var t_dot_t = _lext_dot(t, t, n);
-        if (f64_lt(f64_abs(t_dot_t), breakdown_tol) == 1) {
-            return x;  # Breakdown
+        var om_fast = 0;
+        if (f64_lt(t_dot_t, F64_TINY) == 0 && f64_lt(t_dot_t, F64_POS_INF) == 1) {
+            var om_ats = f64_abs(t_dot_s);
+            if (f64_lt(om_ats, F64_TINY) == 0 && f64_lt(om_ats, F64_POS_INF) == 1) { om_fast = 1; }
         }
-        omega = f64_div(t_dot_s, t_dot_t);
+        if (om_fast == 1) {
+            omega = f64_div(t_dot_s, t_dot_t);
+        } else {
+            var t_norm = _lext_norm(t, n);
+            omega = f64_from(0);
+            if (f64_eq(t_norm, 0) == 0) {
+                var om_us = f64_from(0);
+                var om_ab = f64_from(0);   # sum of |term|: the numerator's rounding scale
+                var om_pm = f64_from(0);   # largest |term|
+                i = 0;
+                while (i < n) {
+                    var om_pr = f64_mul(f64_div(load64(t + i * 8), t_norm), load64(s + i * 8));
+                    om_us = f64_add(om_us, om_pr);
+                    var om_pa = f64_abs(om_pr);
+                    om_ab = f64_add(om_ab, om_pa);
+                    if (f64_gt(om_pa, om_pm) == 1) { om_pm = om_pa; }
+                    i = i + 1;
+                }
+                omega = f64_div(om_us, t_norm);
+                if (f64_lt(om_pm, F64_TINY) == 0) {
+                    var om_u52 = (1023 - 52) << 52;   # 2^-52
+                    if (f64_le(f64_abs(om_us), f64_mul(f64_mul(f64_from(n), om_u52), om_ab)) == 1) {
+                        # |s| <= 2^-52 |r0|, formed in r_hat's units, so neither side overflows
+                        if (f64_le(f64_div(s_norm, rh_scale), f64_mul(om_u52, _lext_norm(r_hat, n))) == 1) {
+                            i = 0;
+                            while (i < n) {
+                                store64(x + i * 8, f64_add(load64(x + i * 8), f64_mul(alpha, load64(p + i * 8))));
+                                i = i + 1;
+                            }
+                            return x;
+                        }
+                        i = 0;
+                        while (i < n) {
+                            store64(x + i * 8, 0x7FF8000000000000);   # quiet NaN
+                            i = i + 1;
+                        }
+                        return x;
+                    }
+                }
+            }
+        }
 
         # x += alpha * p + omega * s
         i = 0;
@@ -892,7 +1163,31 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
 # lo:  flat f64 array of lower bounds (length n).
 # hi:  flat f64 array of upper bounds (length n).
 # max_iter: maximum iterations.
-# Returns: 0 on success (solution written into x).
+# Returns: 0, always (solution written into x). There is no error channel: a row
+#          whose diagonal is exactly 0 (either sign) is skipped and keeps its
+#          initial x_i. A NaN in b, or anywhere in a row of A that is not skipped,
+#          reaches x rather than being reported. ⚠ NOT EVERY NON-FINITE INPUT DOES,
+#          and those that do not come back as a finite x and 0, exactly as if they
+#          were not there or had been clamped. These are the cases measured, and the
+#          list is NOT exhaustive -- a non-finite input that is clamped, skipped,
+#          divided into or overwritten before it is read does not reach x:
+#            - a skipped row is skipped whole, so a NaN or infinite b_i or a_ij in it
+#              never reaches x;
+#            - a NaN bound is ignored (f64_clamp's comparisons are false for NaN);
+#            - an infinite b_i in a row that is not skipped is clamped to that row's
+#              bound when the bound is finite;
+#            - an infinite OFF-diagonal a_ij in a row that is not skipped makes sigma
+#              +-Inf whenever x_j is non-zero, and x_i is clamped to the row's bound
+#              when the bound is finite; only while x_j is 0 is it Inf * 0 = NaN,
+#              which does reach x. In [[5,1,1],[a10,3,0],[1,0,2]] x = (11,7,9) from
+#              x = 0, bounds +-1e6: a10 = +Inf gives (222223.67, -1e6, -111107.33);
+#              a01 = +Inf gives NaN from x = 0, and (-1e6, 333335.67, 500004.5) from
+#              x = (1,1,1);
+#            - an infinite diagonal entry gives x_i = sigma / Inf, a signed zero;
+#            - a NaN in the initial x_0 is overwritten by row 0, when row 0 is not
+#              skipped, before any row reads it (a row reads every x_j but its own).
+#          [measured: R4le probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
+#          [measured: R5le pgs probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
 public fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
     var iter = 0;
     while (iter < max_iter) {
@@ -903,11 +1198,26 @@ public fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
             # ⛔ A diagonal entry in the caller's units against an absolute 1e-12,
             # so rows of a small system were silently skipped and left at their
             # initial value. `sigma/aii` gives the best available answer for any
-            # finite non-zero aii, subnormal included; a zero or NaN aii has none.
-            if (f64_gt(f64_abs(aii), 0) == 0) {
+            # finite non-zero aii, subnormal included; a zero aii has none.
+            # ⛔ 3.3.3 — A NaN DIAGONAL WAS SKIPPED TOO, AND THAT LAUNDERED IT. The
+            # test was `f64_gt(|aii|, 0) == 0`, which is true for NaN, so a NaN on the
+            # diagonal left x_i at the caller's initial guess, solved the other rows
+            # around it, and returned 0: NaN in, a finite plausible x out. On 3.3.2,
+            # a00 = NaN in [[a00,1,1],[1,3,0],[1,0,2]] x = (1,2,4) from x = 0 gave
+            # x = (0, 2/3, 2), bit-identical to a00 = 0, while a NaN at a01 or b0 gave
+            # x = (NaN, NaN, NaN). Now only an exact zero (either sign) is skipped: a
+            # NaN aii divides, x_i becomes NaN, and since 0 * NaN is NaN every other
+            # row that is not skipped reads it at its next update -- the same system
+            # now gives (NaN, NaN, NaN). solve_pgs has no error channel, so NaN in the
+            # solution IS the report, as it already was for a NaN off the diagonal.
+            # [measured: G2a probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
+            # ⚠ Only in a row that is not skipped. A skipped row is skipped whole: with
+            # a00 = 0, a NaN at a01 or b0 gives x = (0, 2/3, 2) and 0, bit-identical to
+            # the same system without it, on 3.3.2 and on this tree (see the doc above).
+            # [measured: R4le probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
+            if (f64_eq(aii, 0) == 1) {
                 i = i + 1;
-                # skip a zero or NaN diagonal (`f64_gt(|aii|, 0) == 0` is true for
-                # both; neither has an answer)
+                # skip an exactly-zero diagonal: the documented singular case
             } else {
                 var sigma = load64(b + i * 8);
                 var j = 0;
@@ -952,35 +1262,120 @@ public fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
 # Section 3 -- SVD (thin wrappers around ganita's ganita_mat_svd)
 # ================================================================
 
+# 1 when every entry of the rows x cols matrix A is finite, 0 otherwise.
+# ⛔ 3.3.3 — ganita_mat_svd DOES NOT REFUSE A NON-FINITE A, IT ANSWERS FOR IT. It
+# scales A by its largest |entry|, found with an ordered compare that never takes
+# a NaN, so an all-NaN 2x2 A has scale 0, takes ganita's all-zeros branch and
+# returns 0 with both singular values exactly 0: NaN in, success and S = 0 out.
+# [[3, NaN], [0, 2]] returned 0 with S = (3, NaN), and [[-Inf, 0], [0, 2]] returned
+# 0 with S = (NaN, NaN). A non-finite entry leaves A with no SVD at all, so
+# svd_compute and svd_truncated refuse it, as svd_golub_kahan has since 2.22.0.
+# [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+# ⭐ One `f64_lt(|x|, +Inf) == 0` catches +Inf, -Inf and NaN together. This is
+# linalg_precision's `_lp_mat_all_finite` again; that one sits later in the
+# bundle and is that module's own, so it cannot be called from here.
+#must_use
+fn _lext_mat_all_finite(A, rows, cols) {
+    var i = 0;
+    while (i < rows) {
+        var j = 0;
+        while (j < cols) {
+            if (f64_lt(f64_abs(ganita_mat_get(A, i, j)), F64_POS_INF) == 0) { return 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
 # Full SVD: A = U * diag(S) * Vt.
-# A:      stdlib matrix (m x n).
+# A:      stdlib matrix (m x n, m >= n).
 # out_U:  stdlib matrix (m x n, caller allocates via ganita_mat_new).
 # out_S:  flat f64 array of length n (caller allocates via alloc(n*8)).
 # out_Vt: stdlib matrix (n x n, caller allocates via ganita_mat_new).
-# Returns: 0 on success.
+# Returns: ganita_mat_svd's own status codes -- NOT an HsbError and NOT a Result:
+#          0 on success; -1 when one of ganita's working allocations fails or the
+#          Jacobi rotations do not converge in 60 sweeps; -2 for a null A, out_U,
+#          out_S or out_Vt, a WIDE A (m < n), an out_U / out_Vt whose shape is not
+#          exactly m x n / n x n, or a NaN or infinite entry in A. Compare it with 0
+#          and nothing else. On -2 nothing is written to out_U, out_S or out_Vt.
+# ⛔ 3.3.3 — A NON-FINITE ENTRY CAME BACK AS SUCCESS. ganita answers for one (see
+# _lext_mat_all_finite): an all-NaN 2x2 returned 0 with S = (0, 0), [[3, NaN],
+# [0, 2]] returned 0 with S = (3, NaN), and [[+-Inf, 0], [0, 2]] returned 0 with
+# S = (NaN, NaN). It is now refused with -2, the code ganita itself gives for an
+# argument it cannot decompose, before ganita is called. A null A still reaches
+# ganita, whose -2 it is.
+# [measured: scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+# ⛔ 3.3.3 — THIS SAID "Returns: 0 on success" AND error.cyr LISTED IT AMONG THE
+# FUNCTIONS THAT "CAN ONLY EVER SUCCEED". Neither was true: a 2x3 A returns -2, and
+# -1 / -2 are bit-identical to HSB_ERR_INVALID_TRANSFORM / HSB_ERR_SINGULAR_MATRIX,
+# so a caller comparing against the hisab codes reads a wide matrix as SINGULAR.
+# The signature stays (a Result here is an API change, roadmap [3.4.0]); the
+# contract is now written down, and svd_truncated below maps the codes onto Err.
+# [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
 public fn svd_compute(A, out_U, out_S, out_Vt) {
+    if (A != 0) {
+        if (_lext_mat_all_finite(A, ganita_mat_rows(A), ganita_mat_cols(A)) == 0) { return 0 - 2; }
+    }
     return ganita_mat_svd(A, out_U, out_S, out_Vt);
 }
 
 # Truncated (rank-k) SVD: keep only the top k singular values.
-# A:      stdlib matrix (m x n).
+# A:      stdlib matrix (m x n, m >= n).
 # k:      number of singular values to keep (1 <= k <= n).
 # out_U:  stdlib matrix (m x k, caller allocates).
 # out_S:  flat f64 array of length k (caller allocates).
 # out_Vt: stdlib matrix (k x n, caller allocates).
-# Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT if k is invalid.
+# Returns: Ok(0) on success;
+#          Err(HSB_ERR_INVALID_INPUT) for a null A or out-param, k outside [1, n], a
+#            WIDE A (m < n -- ganita's one-sided Jacobi needs m >= n), an out_U
+#            smaller than m x k / an out_Vt smaller than k x n, or a non-finite
+#            entry in A;
+#          Err(HSB_ERR_ALLOC) if the full-SVD temporaries cannot be allocated;
+#          Err(HSB_ERR_NO_CONVERGENCE) if ganita_mat_svd itself fails (its -1).
+# ⛔ 3.3.3 — THE DECOMPOSITION'S STATUS WAS DISCARDED. `ganita_mat_svd(...)` was a
+# bare statement, so every failure came back Ok(0) with out_S/out_U/out_Vt copied
+# out of temporaries the SVD never wrote: a 2x3 A (ganita's -2) gave Ok(0) and
+# S[0] = 0, a 3x2 A whose Jacobi sweep never ends (ganita's -1) gave Ok(0) and
+# S[0] = 0, and A = 0 or a null out-param was a null dereference (exit 139). The
+# out-params were stored through unchecked too -- a 1x1 out_U for k = 2 on a 3x3 A
+# overwrote the 3 words after it -- the class linalg_sort_desc and eigen_qr bound
+# before their write loops.
+# [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
 #must_use
 public fn svd_truncated(A, k, out_U, out_S, out_Vt) {
+    if (A == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (out_U == 0 || out_S == 0 || out_Vt == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var rows = ganita_mat_rows(A);
     var cols = ganita_mat_cols(A);
     if (k < 1) { return Err(HSB_ERR_INVALID_INPUT); }
     if (k > cols) { return Err(HSB_ERR_INVALID_INPUT); }
+    # ⚠ BEFORE THE TEMPORARIES, NOT AFTER. ganita refuses a wide A with -2, but by
+    # then full_vt -- cols x cols -- has been asked for, and for a 1 x 6000 A that is
+    # 36M elements, over ganita's 33,554,430 cap: on 3.3.2 ganita_mat_new returned 0
+    # and the copy loop read through it (exit 139). With rows >= cols,
+    # cols * cols <= rows * cols, so no temporary is larger than A itself.
+    # [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+    if (rows < cols) { return Err(HSB_ERR_INVALID_INPUT); }
+    # The copy loops below write rows x k into out_U and k x cols into out_Vt
+    # through ganita_mat_set, which is unchecked by design.
+    if (ganita_mat_rows(out_U) < rows || ganita_mat_cols(out_U) < k) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (ganita_mat_rows(out_Vt) < k || ganita_mat_cols(out_Vt) < cols) { return Err(HSB_ERR_INVALID_INPUT); }
+    # A non-finite entry: see _lext_mat_all_finite.
+    if (_lext_mat_all_finite(A, rows, cols) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
-    # Compute full SVD into temporaries
+    # Compute full SVD into temporaries. None is larger than A (see above), so
+    # ganita's element cap cannot refuse one; only an exhausted heap can.
     var full_u  = ganita_mat_new(rows, cols);
     var full_s  = alloc(cols * 8);
     var full_vt = ganita_mat_new(cols, cols);
-    ganita_mat_svd(A, full_u, full_s, full_vt);
+    if (full_u == 0 || full_s == 0 || full_vt == 0) { return Err(HSB_ERR_ALLOC); }
+    # None of ganita's -2 conditions can arise here: A is non-null and not wide,
+    # and the temporaries are non-null with exactly the shapes it demands. What
+    # remains is its -1: the rotations did not converge in 60 sweeps, or one of ITS
+    # working allocations failed. ganita does not say which; NO_CONVERGENCE names
+    # the outcome -- the decomposition did not finish.
+    if (ganita_mat_svd(A, full_u, full_s, full_vt) != 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
 
     # Copy top k singular values
     var i = 0;
@@ -1027,6 +1422,23 @@ public fn svd_truncated(A, k, out_U, out_S, out_Vt) {
 # Returns:  Ok(0) on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded,
 #           HSB_ERR_INVALID_INPUT on a null handle or a shape that does not
 #           match n, HSB_ERR_ALLOC if the working vectors cannot be allocated.
+#           Success means BOTH the eigenvalue estimate and the eigenvector (scaled
+#           so its largest component is exactly 1) stopped moving, to 1e-12
+#           relative; the eigenvector is compared up to sign, so one whose two
+#           largest components tie with opposite signs converges as well. A NaN or
+#           infinite entry in A is NO_CONVERGENCE, as are a dominant eigenvalue tied
+#           in magnitude with another (+1 and -1), a defective one ([[2,1],[0,2]]),
+#           and one whose magnitude is past DBL_MAX. Entries up to DBL_MAX do not
+#           overflow the iteration itself (see the scaled iterate in the loop).
+#           ⚠ PASSES NEEDED (3.3.3). The seed is not an eigenvector of a diagonal or
+#           triangular matrix, as 3.3.2's e_0 was, and the vector must stop moving
+#           as well, so a result needs about log(1e-12) / log|lambda_2 / lambda_1| + 2
+#           passes (a little fewer on every matrix measured): diag(4,3,2), which 3.3.2
+#           answered in 2 from e_0, now needs 92; [[3,1],[0,1]] 26 and [[10,0],[0,9]]
+#           239, where 3.3.2 needed 2. (The identity, where every vector is an
+#           eigenvector, needs 3.) A max_iter below that is NO_CONVERGENCE, and a ratio
+#           near 1 needs a large one.
+#           [measured: R5le min-max_iter probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
 #must_use
 public fn eigen_power(A, n, max_iter, out_val, out_vec) {
     # NULL HANDLES. A may be the designed 0 that mat_new_guarded returns above
@@ -1049,42 +1461,164 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
     # routine can legitimately answer for, so both are rejected.
     if (ganita_mat_rows(A) != n || ganita_mat_cols(A) != n) { return Err(HSB_ERR_INVALID_INPUT); }
 
-    # Initial guess: unit vector e_0
+    # ⛔ 3.3.3 — THE SEED WAS e_0, AND e_0 IS AN EIGENVECTOR OF EVERY MATRIX WHOSE
+    # FIRST COLUMN IS A MULTIPLE OF e_0 -- every diagonal and every upper-triangular
+    # one among them. The iteration was stationary from its first step and returned
+    # A[0][0] as "the dominant eigenvalue": diag(2,3,4), [[2,0,0],[0,3,1],[0,1,3]]
+    # and [[2,1,0],[0,3,1],[0,0,4]] all gave Ok(0) and 2, where the answer is 4.
+    # [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+    # ⭐ The seed is now SplitMix64's output stream from state 0: v_i is the double
+    # in [0.5, 1) whose 52 mantissa bits are the top 52 bits of the (i+1)-th output,
+    # so it begins 0.9416554041068212, 0.715763998524255, 0.5132168857962989.
+    #   - deterministic and formed from integer operations alone, so every result
+    #     reproduces bit for bit (abuse.tcyr pins it through the identity matrix);
+    #   - every component POSITIVE, so the seed has a non-zero component along the
+    #     dominant eigenvector of any non-negative irreducible matrix (its left and
+    #     right Perron vectors are positive);
+    #   - every component in [0.5, 1), so no larger than any later iterate's (whose
+    #     largest component is exactly 1). That keeps no matvec below DBL_MAX: until
+    #     the iterate settles, any pass's |A v|, the seed's or a later one's, can reach
+    #     n max|a_ij|. See the scaled iterate in the loop below;
+    #   - the mantissas are hash output, so no SHORT integer combination of the
+    #     components vanishes. A seed with structure satisfies one -- a ramp
+    #     (1, 2, 3) is orthogonal to (1, -2, 1) -- and so misses every eigenvector
+    #     with those coefficients.
+    # ⛔ The ALL-ONES vector, the obvious alternative, is orthogonal to every
+    # zero-sum vector, so it misses a dominant eigenvector that alternates in sign:
+    # tridiag(-1, 2, -1) 4x4 gave Ok(0) and 2.618 from it, where the answer is
+    # 2 + 2cos(pi/5) = 3.618 (e_0 and this seed both give 3.618).
+    # [measured: G2a seed-variant probes, cycc 6.6.12, 2026-10-01]
+    # ⚠ RESIDUAL RISK, which no choice removes: ANY fixed seed has zero component
+    # along the dominant eigenvector of SOME matrix -- one built so the seed lies in
+    # the span of the other eigenvectors -- and there power iteration returns the
+    # next eigenvalue down unless rounding restores the missing component before the
+    # iteration settles. For a symmetric A, eigen_qr / eigen_symmetric are the
+    # cross-check.
     var v = alloc(n * 8);
     if (v == 0) { return Err(HSB_ERR_ALLOC); }
     var i = 0;
-    while (i < n) { store64(v + i * 8, f64_from(0)); i = i + 1; }
-    store64(v, f64_from(1));
+    while (i < n) {
+        # SplitMix64 (Steele, Lea, Flood 2014): the golden-gamma increment, then its
+        # two multiply-xorshift rounds. `>>` is Cyrius's LOGICAL shift.
+        var z = (i + 1) * 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+        z = z ^ (z >> 31);
+        store64(v + i * 8, 0x3FE0000000000000 | (z >> 12));
+        i = i + 1;
+    }
 
     var w = alloc(n * 8);
     if (w == 0) { return Err(HSB_ERR_ALLOC); }
     var eigenvalue = f64_from(0);
     var tol = EPSILON_F64;
+    # The matvec reads `u`: v itself, until a pass overflows; v * 2^-sc_e after that.
+    var u = v;
+    var sc_e = 0;
 
     var iter = 0;
     while (iter < max_iter) {
-        # w = A * v
+        if (sc_e > 0) {
+            var sc_dn = (1023 - sc_e) << 52;   # 2^-sc_e
+            i = 0;
+            while (i < n) {
+                store64(u + i * 8, f64_mul(load64(v + i * 8), sc_dn));
+                i = i + 1;
+            }
+        }
+
+        # w = A * u
         i = 0;
         while (i < n) {
             var sum = f64_from(0);
             var j = 0;
             while (j < n) {
-                sum = f64_add(sum, f64_mul(ganita_mat_get(A, i, j), load64(v + j * 8)));
+                sum = f64_add(sum, f64_mul(ganita_mat_get(A, i, j), load64(u + j * 8)));
                 j = j + 1;
             }
             store64(w + i * 8, sum);
             i = i + 1;
         }
 
-        # Find component with largest absolute value
+        # ⛔ 3.3.3 — ANY PASS CAN OVERFLOW ONCE SOME |a_ij| > DBL_MAX / n, NOT ONLY THE
+        # FIRST. Every iterate's largest component is exactly 1 (the seed's is below 1),
+        # so |w_i| can reach sum_j |a_ij| on any pass until the iterate settles near the
+        # dominant eigenvector, where |A v| is about |lambda|. Which matrices hit it
+        # depends on the path the iterate takes, so 3.3.2 (from e_0) and the 3.3.3 seed
+        # hit it on different matrices. [[-3e307, 1.6e308], [0, 2e307]] (lambda =
+        # -3e307, 0.167 DBL_MAX) has a finite first pass; on a later one v is
+        # (1, -0.948) and -3e307 + 1.6e308 * -0.948 is -Inf, so it returned
+        # NO_CONVERGENCE at max_iter 1000 and 100000, where 3.3.2 returned -3e307
+        # exactly. [[1.4e308, 1.2e308], [0, 1.3e308]] (3.3.2: 1.4e308 exactly) did the
+        # same. On the 2x2 grid with entries (k/10) 1e308, k = -17..17, 53354 matrices
+        # with a dominant eigenvalue that 3.3.2 answered to 1e-9 came back
+        # NO_CONVERGENCE; round 4's redo of the FIRST pass reached none of them.
+        # [measured: R5le grid and repro probes, 3.3.2 bundle and this tree before the repair, cycc 6.6.12, 2026-10-01]
+        # ⭐ So the first pass with a non-finite component switches the iteration to a
+        # SCALED ITERATE for good, and is run again: from then on the matvec reads
+        # u = v * 2^-s, with 2^s > 2n. Every |a_ij| is at most DBL_MAX and every |u_j|
+        # at most 2^-s, so no |w_i| and no partial sum can exceed n * DBL_MAX * 2^-s,
+        # under half of DBL_MAX, on any later pass. v itself is unchanged: its largest
+        # component is still exactly 1, so the normalisation, the vector test and the
+        # returned vector never see the scale. max_val is then in units of 2^-s, and the
+        # value returned is +-max_val * 2^s, refused as NO_CONVERGENCE when that is past
+        # DBL_MAX. The estimate kept from before the switch is in the caller's units, so
+        # the pass run again cannot stop; the next compares like with like. (Rescaling
+        # it changed no result on the grid and the random sweep below, 1538625
+        # matrices, so it is not done.) Scaling by a power of two is exact away from the
+        # subnormal range, so the scaled iteration IS the unscaled one: both matrices
+        # above return what the same matrix times 2^-64 returns, times 2^64 (-3e307 to
+        # 4.0e-13 relative, 1.4e308 to 1.1e-11), and every grid matrix with a dominant
+        # eigenvalue that 3.3.2 answered is answered.
+        # [measured: R5le grid and repro probes, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
+        # A pass that does not overflow does not switch, so every matrix answered without
+        # an overflow is bit-identical to the iteration before this repair; and a pass
+        # that overflowed always ended in NO_CONVERGENCE there (its Inf or NaN reaches
+        # every component one pass later), with one exception: round 4's first-pass redo
+        # answered some. 17 of the 38000 random matrices below are those; their
+        # eigenvalue is bit-identical, and only subnormal vector components moved. A NaN
+        # or infinite entry of A is non-finite after the switch too, and fails as before;
+        # the switch happens once, so it cannot loop. The cost on every input is one
+        # finiteness test of max_val per pass; after a switch, n multiplies per pass and
+        # one n-vector allocation.
+        # [measured: R5le random sweep, the tree before this repair and this tree, cycc 6.6.12, 2026-10-01]
+        # ⚠ WHAT IS STILL REFUSED, compared with 3.3.2 matrix by matrix, max_iter 1000.
+        # On the 1500625-matrix grid every matrix 3.3.2 answered to 1e-9 is answered,
+        # except 1156 defective ones and 1190 whose two eigenvalues are +-lambda, the
+        # trades the doc names; no answer is wrong. On 38000 random matrices of 16
+        # kinds (n = 2..5: symmetric, positive, general, triangular, block, entries up
+        # to DBL_MAX, at the DBL_MAX / n threshold, near 2^-1000, mixed scales), the 388
+        # that 3.3.2 answered and this tree refuses are 163 ties, 153 defective and 72
+        # with |lambda_2 / lambda_1| between 0.969 and 0.999, every one of which is
+        # right by max_iter 100000. 23 answers are wrong on both trees, with the same
+        # eigenvalue: mixed-scale matrices (1e308 beside 1e-302) whose dominant
+        # eigenvector has components below the f64 range.
+        # [measured: R5le grid and random sweep, 3.3.2 bundle and this tree, numpy 2.5.0, cycc 6.6.12, 2026-10-01]
+
+        # Find component with largest absolute value (the first, on a tie)
         var max_val = f64_from(0);
+        var max_i = 0;
         i = 0;
         while (i < n) {
             var wi = load64(w + i * 8);
             if (f64_gt(f64_abs(wi), f64_abs(max_val)) == 1) {
                 max_val = wi;
+                max_i = i;
             }
             i = i + 1;
+        }
+
+        # The switch (see above): 2^-sc_e with 2^sc_e > 2n, and this pass run again. An
+        # overflow leaves some w_i at +-Inf, so max_val is +-Inf: for a finite A every
+        # product is finite (|u_j| <= 1), and a partial sum that overflows stays +-Inf,
+        # never NaN. A NaN in A can leave max_val finite and not switch; it fails one
+        # pass later all the same.
+        if (sc_e == 0 && f64_lt(f64_abs(max_val), F64_POS_INF) == 0) {
+            u = alloc(n * 8);
+            if (u == 0) { return Err(HSB_ERR_ALLOC); }
+            sc_e = 1;
+            while ((1 << sc_e) <= 2 * n) { sc_e = sc_e + 1; }
+            continue;
         }
 
         # ⛔ `max_val` is the largest component of A*v, in the caller's units, so
@@ -1097,16 +1631,103 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
         # Dividing directly makes the exact-zero test the correct one, because
         # every |w_i| <= |max_val| by construction.
         # [measured: docs/audit/2026-09-09-epsilon-open.json]
+        # ⚠ 3.3.3 — THE NaN-TRUE SHAPE, AUDITED AND KEPT. `f64_gt(x, 0) == 0` is true
+        # for NaN, but max_val cannot be NaN: it starts at 0 and the f64_gt max above
+        # never takes a NaN w_i. What reaches here as 0 is "every w_i is 0 or NaN",
+        # and both are the designed NO_CONVERGENCE. A NaN or Inf entry of A is never
+        # laundered: its row's w_i is NaN or Inf at once, its v_i is NaN after the
+        # first normalisation, and since 0 * NaN is NaN every w_i is NaN on the next
+        # pass -- which lands here -- while the first pass cannot satisfy the
+        # convergence test (the previous estimate is 0). NaN at [0][0], [1][0] or
+        # [0][1], +Inf or -Inf on the diagonal, and max_iter = 1: all NO_CONVERGENCE,
+        # on 3.3.2 and on this tree. `f64_eq(max_val, 0)` here is an equivalent mutant.
+        # [measured: G2a probe and mutant run, cycc 6.6.12, 2026-10-01]
         if (f64_gt(f64_abs(max_val), 0) == 0) {
             return Err(HSB_ERR_NO_CONVERGENCE);
         }
 
+        # ⛔ 3.3.3 — THE ITERATE WAS COMPARED WITH ITS OWN SIGN, AND THE ESTIMATE TOOK
+        # max_val's. When the dominant eigenvector has two largest components of equal
+        # size and OPPOSITE sign, and lambda_2 / lambda_1 < 0, the decaying lambda_2 term
+        # alternates in sign, so the lead swaps between the tied indices on every pass.
+        # v = w / max_val then flips sign each time, `moved` never cleared, and max_val,
+        # read at an index whose component in v was about -1, was always about -lambda.
+        # [[1,-3],[-3,1]] (lambda = 4, -2), [[2,-5],[-5,2]] (7, -3), [[-1,3],[3,-1]]
+        # (-4, 2) and [[1,-3,0],[-3,1,0],[0,0,1]] (4, -2, 1) returned NO_CONVERGENCE at
+        # max_iter = 1000 (the first also at 100000); 3.3.2, which judged the eigenvalue
+        # alone, returned Ok(0) with the sign wrong: -4, -7, +4 and -4. [[1,-2],[-2,1]]
+        # (3, -1) came back Ok(0) and 3, by the rounding of its ties.
+        # [measured: R4le probe, 3.3.2 bundle and this tree before the repair, cycc 6.6.12, 2026-10-01]
+        # ⭐ The iterate is now compared UP TO SIGN. When the new lead's component in
+        # the old v is negative, w / max_val points the other way, so the old v is
+        # negated before the comparison and the estimate is -max_val. The test below
+        # still demands w / max_val = s v to tol, s the sign used, which is exactly
+        # max|A v - lambda v| < tol |lambda| for lambda = s max_val: the residual test,
+        # for the eigenvalue it reports. A non-negative old v_k -- the seed's every
+        # component, every pass whose lead stays put -- is the old test and the old
+        # estimate, bit for bit. [[0,1],[1,0]] (+1 and -1) still never settles: its
+        # iterate alternates between (1, r) and (r, 1), which are not negatives.
+        # All five matrices above now return the right sign, to 2.4e-13 relative, the
+        # tied components within 4.2e-13 of -1. ⚠ The cost, stated as plainly: a
+        # matrix of this class whose lead happened to settle used to run on until it
+        # did, and came back exact -- [[1,-2],[-2,1]] gave 3 -- and it now stops at
+        # the first pass the test is met, like any other matrix: 2.9999999999993587.
+        # Across 10400 matrices of five kinds (the two of the sweep below, random real,
+        # integer triangular and integer [[a,b],[b,a]]) 62 refusals became answers and
+        # 49 answers moved, 48 of them away from the exact integer eigenvalue; all 111
+        # are within 4.6e-13 relative of numpy's eigenvalue. Every other result is
+        # bit-identical, and none is wrong.
+        # [measured: R4le eigen_power dump, this tree before and after, numpy 2.5.0, cycc 6.6.12, 2026-10-01]
+        var flip = 0;
+        if (f64_lt(load64(v + max_i * 8), 0) == 1) { flip = 1; }
         var new_eigenvalue = max_val;
+        if (flip == 1) { new_eigenvalue = f64_neg(max_val); }
 
-        # Normalize w -> v
+        # Normalize w -> v, noting whether any component moved by tol or more.
+        # ⛔ 3.3.3 — CONVERGENCE WAS JUDGED ON THE EIGENVALUE ALONE, and any seed but
+        # e_0 exposes it. The estimate is the largest component of A*v, so when that
+        # component's row has no off-diagonal entries -- a diagonal matrix, the last
+        # row of an upper-triangular one -- it is EXACT as soon as the right index
+        # leads, while the vector is still far from converged. With the new seed and
+        # the old test, diag(2,3,4) returned Ok(0), lambda = 4 and v = (0.115, 0.441, 1),
+        # whose residual max|Av - lambda v| is 0.441, and diag(4,3,2), which e_0 had
+        # got exactly right, returned v = (1, 0.321, 0.068). [[0,1],[1,0]], whose
+        # eigenvalues +1 and -1 tie in magnitude so that power iteration has no
+        # answer, returned Ok(0) and lambda = 1 with a v that is not an eigenvector
+        # (residual 0.240) -- as 3.3.2 did from e_0, with residual 1.
+        # [measured: G2a seed-variant probes, cycc 6.6.12, 2026-10-01]
+        # ⭐ So the iterate must ALSO stop moving: every |v_new_i - v_i| < tol. With
+        # lambda = max_val, v_new_i - v_i = (A v - lambda v)_i / lambda for the v that A
+        # was just applied to, so this IS the relative residual test
+        # max|A v - lambda v| < tol |lambda|, at no extra matvec. v is normalised so its
+        # largest component is exactly 1 -- dimensionless and bounded -- so an
+        # absolute tol is the right kind of number for it, the reasoning error.cyr
+        # gives for EPSILON_F64.
+        # ⚠ WHAT THE SEED AND THIS TEST COST TOGETHER, against eigen_symmetric on 4000
+        # random symmetric integer matrices (n = 2..5; the 70 with a near-tie for the
+        # dominant |lambda| set aside), max_iter = 1000: Ok(0) with lambda or the
+        # residual off by more than 1e-9 relative went 79 -> 0, and NO_CONVERGENCE went
+        # 155 -> 153. Every one of the 79 old wrong answers is now right -- 11 of them
+        # only since the up-to-sign comparison above, which the vector test alone
+        # refused -- 8 trials converge that did not, and 6 that converged correctly, all
+        # with |lambda_2/lambda_1| near 0.97, now need between 1000 and 2000 iterations.
+        # On 2000 positive non-symmetric matrices, Ok(0) with a residual over 1e-9
+        # relative went 18 -> 0. The defective [[2,1],[0,2]], which e_0 answered by the
+        # same accident as diag(4,3,2), now returns NO_CONVERGENCE: on a Jordan block
+        # power iteration converges like 1/k.
+        # [measured: G2a eigen_power sweep, re-run by R4le, 3.3.2 bundle vs this tree, cycc 6.6.12, 2026-10-01]
+        # ⚠ Written as "a component that FAILS f64_lt" rather than a running f64_gt
+        # max, so a NaN difference counts as moved. No input is known to need it: a
+        # NaN v_i makes every w_i NaN on the next pass, and the guard above returns
+        # NO_CONVERGENCE.
+        var moved = 0;
         i = 0;
         while (i < n) {
-            store64(v + i * 8, f64_div(load64(w + i * 8), max_val));
+            var vi = f64_div(load64(w + i * 8), max_val);
+            var v_old = load64(v + i * 8);
+            if (flip == 1) { v_old = f64_neg(v_old); }
+            if (f64_lt(f64_abs(f64_sub(vi, v_old)), tol) == 0) { moved = 1; }
+            store64(v + i * 8, vi);
             i = i + 1;
         }
 
@@ -1115,9 +1736,16 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
         # problem converged in one iteration or never, depending on the caller's
         # scale. `tol` is kept, now as a RELATIVE factor, which is what a caller
         # passing 1e-12 always meant.
-        if (f64_lt(f64_abs(f64_sub(new_eigenvalue, eigenvalue)),
+        if (moved == 0 && f64_lt(f64_abs(f64_sub(new_eigenvalue, eigenvalue)),
             f64_mul(tol, f64_abs(new_eigenvalue))) == 1) {
-            store64(out_val, new_eigenvalue);
+            # After a switch the estimate is in units of 2^-sc_e; one past DBL_MAX in the
+            # caller's units has no f64 answer, and out_val is left untouched.
+            var lam = new_eigenvalue;
+            if (sc_e > 0) {
+                lam = f64_mul(new_eigenvalue, (1023 + sc_e) << 52);   # times 2^sc_e
+                if (f64_lt(f64_abs(lam), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+            }
+            store64(out_val, lam);
             i = 0;
             while (i < n) {
                 store64(out_vec + i * 8, load64(v + i * 8));

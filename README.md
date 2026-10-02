@@ -38,7 +38,7 @@ those call sites quietly passing against the old function forever, which is the 
 removes. **2.24.0 is the supported 2.x line.**
 
 ⚠ **Minimum toolchain: hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3.** `public struct` + `#derive` is
-refused by cycc 6.6.2; measured again in 3.3.2 from dirs pinned to each version, the 3.3.2 bundle is
+refused by cycc 6.6.2; measured again in 3.3.3 from dirs pinned to each version, the 3.3.3 bundle is
 refused under 6.6.2 and compiles and runs correctly under 6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12. Bump
 `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1. Three results follow your
 toolchain rather than hisab's:
@@ -89,8 +89,8 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "r
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "3.3.2"
-modules = ["dist/hisab.cyr"]   # ~1.16 MB self-contained bundle (all 35 modules)
+tag     = "3.3.3"
+modules = ["dist/hisab.cyr"]   # ~1.40 MB self-contained bundle (all 35 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
 # pulls in hisab's own 16 stdlib leaves, so the `stdlib` list above only has to
 # name what *your* code uses.
@@ -154,11 +154,11 @@ compiles, and the callee silently receives the **tag**. See
 
 ```sh
 cyrius build src/main.cyr build/hisab
-cyrius test tests/hisab.tcyr        # 590 cross-module integration assertions
-cyrius test tests/foundation.tcyr   # 429 vec/quat/mat foundation assertions
-cyrius test tests/modules.tcyr      # 2339 per-module assertions
-cyrius test tests/edge_cases.tcyr   # 267 degenerate-input assertions
-cyrius test tests/abuse.tcyr        # 981 hostile-input assertions (negative indices,
+cyrius test tests/hisab.tcyr        # 735 cross-module integration assertions
+cyrius test tests/foundation.tcyr   # 453 vec/quat/mat foundation assertions
+cyrius test tests/modules.tcyr      # 3036 per-module assertions
+cyrius test tests/edge_cases.tcyr   # 383 degenerate-input assertions
+cyrius test tests/abuse.tcyr        # 1431 hostile-input assertions (negative indices,
                                     #   zero/huge dimensions, non-conformable operands, canaries)
 cyrius bench tests/hisab.bcyr       # 80 benchmarks
 cyrius fuzz                         # 5 fuzz targets with invariant checks
@@ -172,9 +172,9 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.3.2 |
-| Library | 35 modules, ~26,900 lines of Cyrius |
-| Tests | 4606 assertions across 5 suites |
+| Version | 3.3.3 |
+| Library | 35 modules, ~30,200 lines of Cyrius |
+| Tests | 6038 assertions across 5 suites |
 | Benchmarks | 80 operations |
 | Fuzz targets | 5 with invariant checks |
 | CLI binary | ~293 KB static ELF (`build/hisab` — version smoke test only) |

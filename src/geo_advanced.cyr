@@ -55,6 +55,23 @@ var _GA_2_POW_P508      = 0x5FB0_0000_0000_0000;  # 8.379879956214123e+152
 # same units, never against a hard-coded world length.
 var _GA_TOI_REL         = 0x3D719799812DEA11;     # 1e-12
 var _GA_TOI_TOL_REL     = 0x3E112E0BE826D695;     # 1e-9
+#   _GA_TOI_PROBE   the separation, in contact tolerances, at which
+#                   _toi_contact_normal reads a contact's normal. One tolerance
+#                   is too few (the floored advance can overshoot by that much)
+#                   and 2^20 too many (moving B obliquely that far turns a curved
+#                   face): both fail tests/modules.tcyr's 3.3.3 R3a fixtures.
+#                   [measured: R3a mutation runs, 2026-10-01; cycc 6.6.12]
+var _GA_TOI_PROBE       = 0x4090000000000000;     # 1024.0
+#   _GA_TOI_REFUTE  the fraction of the probe distance a probe along a contact's
+#                   own reading must separate the pair by, or that reading is
+#                   refuted. Chosen inside a measured window, as are the next two;
+#                   _toi_contact_normal gives the windows.
+#   _GA_TOI_SPREAD_T0 / _GA_TOI_SPREAD_SWEPT  how many times two probe readings'
+#                   own disagreement a reading must lie from the contact's own
+#                   reading to replace it, at t = 0 and after an advance.
+var _GA_TOI_REFUTE      = 0x3FD0000000000000;     # 0.25
+var _GA_TOI_SPREAD_T0   = 0x4010000000000000;     # 4.0
+var _GA_TOI_SPREAD_SWEPT = 0x4040000000000000;    # 32.0
 
 # GJK/EPA iteration limits
 public var GJK_MAX_ITER = 64;
@@ -521,10 +538,49 @@ var _GA_EPA_REL_TOL = 0x3DDB7CDFD9D7BDBB;  # 1e-10
 # that lands exactly on the origin.
 var _GA_F64_1EM6    = 0x3EB0C6F7A0B5ED8D;  # 1e-6
 
-# Normalise without EPSILON_F64's ABSOLUTE cutoff. hvec3_normalize returns the
-# zero vector for any |v| < 1e-12, which silently kills every direction in a
-# scene scaled to 1e-6. Here the only unusable input is a length that is zero,
-# subnormal or NaN -- all caught by requiring len > 0.
+# Normalise without EPSILON_F64's ABSOLUTE cutoff. Written when hvec3_normalize
+# returned the zero vector for any |v| < 1e-12, which silently killed every
+# direction in a scene scaled to 1e-6. It has not done that since 2.14.0 — it
+# zeroes only a length whose reciprocal overflows — but the zero vector is still
+# THIS helper's "unusable" answer, and its callers test for it.
+#
+# ⚠ 3.3.3 — `f64_gt(l, 0) == 0` IS NaN-TRUE, AND IN THIS FILE'S COLLISION CODE
+# THAT IS LOAD-BEARING. It is not the class 3.3.3 repaired in geo.cyr and
+# `cga_plane`, where the NaN came back AS the answer. Here it comes back as the
+# zero vector, the caller's own NaN-true `f64_gt(hvec3_length_sq(..), 0) == 0`
+# reads that as unusable and bails, and the public entry point ends in its
+# documented miss: 0, with the placeholder out-params. Measured over 30 NaN- and
+# Inf-shape fixtures (the non-finite value in a centre, a radius or a
+# half-extent, in either operand slot, plus support functions that are NaN in
+# only some directions): rewriting all nineteen of 3.3.2's collision-path
+# `f64_gt(x, 0) == 0` guards as exact-zero tests (the other two lines of that
+# shape, in `cga_norm` and `cga_plane`, are not collision code) turns 20 of the 26
+# `mpr_intersect` misses among them into a CONTACT, two of them for a pair 10
+# units apart, because `_epa_seed_portal` then returns a seed. Six of the
+# nineteen do it together: this line, the portal's `scale` and three `dir`
+# tests, and `_epa_tetra_ok`'s `eref`. Flipping any five of those six, or any
+# one of the nineteen alone, leaves those 20 at the `mpr_intersect` miss.
+# tests/modules.tcyr pins "a NaN centre or extent is never a contact". (3.3.3's
+# time_of_impact contact normal adds two more NaN-true lines of the kind, which that
+# probe predates: `_toi_probe_normal`'s `f64_gt(d, dmin) == 0`, dmin 0 on every probe
+# but the first along a contact's own reading, and the `mc` fallback.)
+# [measured: G6 probe, 3.3.2 sources, 1/5/6/19-guard flips, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+# ⛔ THAT COUNT IS `mpr_intersect`'s ALONE, AND IT DOES NOT MAKE A SINGLE FLIP
+# HARMLESS. `_epa_tetra_ok`'s `eref` respelled `f64_eq(eref, 0) == 1` on its own
+# passed all five suites and FABRICATED A CONTACT in the two entry points that
+# measure one: a unit sphere at the origin against a radius-1 sphere at
+# (0.5, 0, 0) whose support is (0, NaN, 0) whenever dir.y > 0, in the second
+# slot, came back gjk_epa_3d = 1 with depth 1.5 and mpr_penetration = 1 with
+# depth 1.5, where this code answers the miss for both. tests/modules.tcyr now
+# pins those two misses (its "3.3.3 R4ga" block on a support NaN in some
+# directions only). The other single flips were run against these fixtures, not
+# against every input: none of them is shown harmless.
+# [measured: V6 mutant G1 on the 3.3.3 sources and R4ga's re-run on this tree, 2026-10-01; cycc 6.6.12]
+# ⚠ AND THE CLAIM THIS NOTE USED TO MAKE, that a SUBNORMAL length is caught by
+# requiring len > 0, IS FALSE: it is > 0, its reciprocal overflows, and
+# `_epa_unit((2^-1030, 0, 0))` is (+Inf, NaN, NaN). What rejects it is again
+# the caller's NaN-true length test. That band is the scale class, not repaired.
+# [measured: G6 white-box probe on the 3.3.2 sources, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 fn _epa_unit(v) {
     var l = hvec3_length(v);
     if (f64_gt(l, 0) == 0) { return hvec3_zero(); }
@@ -1128,6 +1184,48 @@ fn _epa_degenerate_normal(sup_a, shape_a, sup_b, shape_b) {
     return _epa_unit(_epa_perp(e1));
 }
 
+# Of a unit normal n of A (-) B and -n, the OUTWARD one: the one whose supporting
+# plane is nearer the origin, h(n) <= h(-n), and n itself on a tie or a NaN.
+#
+# ⛔ 3.3.3 — gjk_epa_3d AND mpr_penetration HANDED OUT THE INWARD NORMAL ON A TOUCH.
+# Both document the outward normal of A (-) B, the one along which moving B
+# separates the pair, and write it on their penetration path, but their depth-0
+# answers come from elsewhere: _epa_touch_probe writes -n*, the inward normal on a
+# solid touch, and gjk_epa_3d's flat-simplex normal (_epa_degenerate_normal, above)
+# is a cross product's or a perpendicular's, wound however GJK's simplex was. A
+# point resting on the (1, 1, 1) corner of a box at the origin came back (0, -1, 0)
+# from both, and the same pair in the other operand order ALSO came back
+# (0, -1, 0): one of the two wrong under either convention, and time_of_impact had
+# to turn what it forwarded. Over 22,856 contacts at t = 0 (points on box corners,
+# edges and faces; box/box face, edge and corner touches; overlapping and tangent
+# spheres and boxes; flat plates, segments and coincident points; both operand
+# orders) mpr_penetration answered with an n whose opposite has the smaller support
+# value, h(-n) < h(n), on 767 and gjk_epa_3d on 866: 358 from the probe and 508
+# from the flat simplex, e.g. (0, -1, 0) with h(n) = 0.75 where h(-n) = 0.
+# [measured: R4ga sweep on the 3.3.2 bundle and the 3.3.3 base, 2026-10-01; cycc 6.6.12]
+# ⭐ Both entry points now pass every depth-0 normal through this before writing it,
+# and none of the 22,856 is inward. A tie keeps n: where A (-) B really is flat
+# (coplanar plates, collinear segments, coincident points) h(n) = h(-n) = 0, either
+# sign is outward, and the answer stays what 3.3.2 gave. Two support calls, on the
+# touch paths only.
+# [measured: R4ga sweep on this tree, 2026-10-01; cycc 6.6.12]
+# ⚠ ORIENTATION IS ALL IT REPAIRS. 120 corner touches of the 22,856 (60 of 1,000
+# with a point box on the corner, 60 of 1,000 with a zero-radius sphere) come back
+# from the flat simplex with a normal that supports nothing through the origin in
+# either sign, min(h(n), h(-n)) up to 2.83: the simplex's plane is not a face of
+# the solid difference. 110 more come from the probe with both values positive
+# but small: up to 1.6e-8 for 106 of 3,000 spheres resting on a box face, 9.4e-16
+# for 4 of 6 tangent sphere pairs. 3.3.2 gives the same counts and maxima, and
+# none of the 230 is repaired here.
+# [measured: R4ga sweep, 3.3.2 bundle and this tree; copy instrumented at both touch paths, 2026-10-01; cycc 6.6.12]
+fn _epa_outward(sup_a, shape_a, sup_b, shape_b, n) {
+    var nn = hvec3_neg(n);
+    var hp = hvec3_dot(_gjk_mink_support(sup_a, shape_a, sup_b, shape_b, n), n);
+    var hn = hvec3_dot(_gjk_mink_support(sup_a, shape_a, sup_b, shape_b, nn), nn);
+    if (f64_lt(hn, hp) == 1) { return nn; }
+    return n;
+}
+
 # EXACT TANGENCY: does the origin lie ON the boundary of the difference?
 #
 # GJK's containment test is STRICT -- it reports a hit only once a simplex
@@ -1188,9 +1286,12 @@ fn _epa_degenerate_normal(sup_a, shape_a, sup_b, shape_b) {
 # returns 0 -- leaving out_n untouched -- when they are strictly separated.
 # The direction written is -n*, n* being the minimiser: it points from the
 # origin towards M, i.e. it is the direction of the distance query's closest
-# point v, which is what a caller tracking a pair through contact sees on
-# either side of the touch. The depth is 0, so "translate B by depth * normal"
-# holds for either sign.
+# point v.
+# ⛔ 3.3.3 — ON A SOLID TOUCH THAT IS THE INWARD NORMAL, and this note called the
+# sign free because the depth is 0. It is not free: gjk_epa_3d and
+# mpr_penetration document the outward normal, so both now turn what this writes
+# with _epa_outward (above), which keeps -n* only where A (-) B is flat and either
+# sign is outward. gjk_intersect_3d discards it and pays nothing.
 fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
     var simplex = _gjk_simplex_new();
     if (simplex == 0) { return 0; }
@@ -1294,7 +1395,9 @@ fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
 # out_depth: pointer where the f64 depth will be stored
 # The normal is the outward normal of the Minkowski difference A (-) B at the
 # closest supporting plane, and the depth is h_M(normal) -- translating B by
-# depth * normal separates the pair.
+# depth * normal separates the pair. A touch (depth 0) answers with the outward
+# normal too since 3.3.3; through 3.3.2 both of its touch paths could hand back
+# the inward one (see _epa_outward).
 public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
     # EVERY RETURN PATH WRITES BOTH OUT-PARAMS, established here so no later
     # branch can forget. alloc() hands back zeroed pages, so a path that returned
@@ -1314,8 +1417,10 @@ public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_dep
         # TANGENCY, where the origin sits on the boundary of the difference and
         # the true answer is a contact of depth 0. Ask for a certificate before
         # agreeing; the probe writes out_normal only when it has one, so the
-        # placeholder above survives a genuine miss.
+        # placeholder above survives a genuine miss. Its normal is turned outward
+        # (_epa_outward) since 3.3.3.
         if (_epa_touch_probe(support_a, shape_a, support_b, shape_b, out_normal) == 1) {
+            store64(out_normal, _epa_outward(support_a, shape_a, support_b, shape_b, load64(out_normal)));
             store64(out_depth, 0);
             return 1;
         }
@@ -1333,7 +1438,8 @@ public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_dep
             # Returning 0 here left out_normal holding the NULL HVec3 for every
             # caller that trusted "returns 1 => out_normal is a normal" -- the
             # reproducer is two coplanar zero-height boxes.
-            store64(out_normal, _epa_degenerate_normal(support_a, shape_a, support_b, shape_b));
+            store64(out_normal, _epa_outward(support_a, shape_a, support_b, shape_b,
+                _epa_degenerate_normal(support_a, shape_a, support_b, shape_b)));
             store64(out_depth, 0);
             return 1;
         }
@@ -1422,7 +1528,9 @@ public fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
 
 # mpr_penetration -- returns 1 on success, writes normal/depth to out pointers
 # out_normal: pointer to HVec3 (overwritten) -- unit outward normal of the
-#             Minkowski difference A (-) B at its closest supporting plane
+#             Minkowski difference A (-) B at its closest supporting plane; on
+#             a touch too since 3.3.3, where it could be the inward one (see
+#             _epa_outward)
 # out_depth:  pointer where the f64 depth is stored -- h_M(normal), i.e.
 #             translating B by depth * normal separates the pair
 #
@@ -1487,6 +1595,8 @@ public fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, ou
         # still be an exact TANGENCY, whose honest answer is depth 0, not "miss".
         if (_epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed) != 1) {
             if (_epa_touch_probe(support_a, shape_a, support_b, shape_b, out_normal) == 1) {
+                # Turned outward since 3.3.3, as gjk_epa_3d's (see _epa_outward).
+                store64(out_normal, _epa_outward(support_a, shape_a, support_b, shape_b, load64(out_normal)));
                 store64(out_depth, 0);
                 return 1;
             }
@@ -1545,17 +1655,65 @@ fn _bvh_node_leaf_idx(n) { return load64(n + 24); }
 # 16k-primitive BVH allocated 36.6 MB of never-freed arena.
 #
 # The fold is now six f64 registers and one GeoAabb per internal node, and
-# it is bit-identical to the old one: f64_min/f64_max are exactly what
-# hvec3_min/hvec3_max apply componentwise, in the same left-to-right
+# 2.8.3 made it bit-identical to the old one: f64_min/f64_max were then exactly
+# what hvec3_min/hvec3_max applied componentwise, in the same left-to-right
 # argument order (accumulator first), and the centroid is the same
 # (min + max) * 0.5. So mid_val, the axis choice and the partition -- hence
-# the whole tree shape -- are unchanged, and the repair is checked by
+# the whole tree shape -- were unchanged, and the repair was checked by
 # comparing every node AABB against the pre-2.8.3 build, not just the query
 # answers. Measured at n = 16k uniform: 85.3 ms -> 31.2 ms and 36.6 MB ->
 # 4.14 MB of arena; at n = 8k coincident, 35.8 ms -> 8.1 ms and 16.7 MB ->
 # 2.07 MB. What remains is the one O(n log n) bounds scan a top-down binary
 # BVH inherently needs.
+#
+# ⛔ 3.3.3 — THAT EQUIVALENCE ENDED WHEN hvec3_min/hvec3_max BECAME IEEE 754-2019
+# minimum/maximum (src/vec3.cyr), and the fold kept stdlib f64_min/f64_max, which
+# answer `a < b ? a : b` and so DROP a NaN accumulator at the next box. Three boxes
+# with x-slabs [0, 1], [4, 5], [8, 9], one of them NaN in x: a NaN first box gave
+# a root slab of [4, 9], and a NaN second box gave [8, 9], which EXCLUDES the
+# finite first box, so bvh_query_ray and bvh_query_aabb both pruned it at the root
+# and returned nothing for a ray and a box that meet it. Only a NaN in the last box
+# reached the root, because nothing came after it.
+# [measured: R3a probe on the 3.3.2 bundle, 2026-10-01; cycc 6.6.12]
+# ⭐ The fold now applies the same minimum/maximum hvec3_min/hvec3_max apply
+# (_bvh_fmin/_bvh_fmax below, the scalar form, so it still allocates nothing): a
+# NaN anywhere in a range makes that component of the node NaN, and both walkers
+# already read a slab NaN on both sides (made so after the fold) as "cannot
+# exclude" -- every comparison against it is false -- so they descend instead of
+# pruning. For finite bounds the answer differs from f64_min/f64_max only in the
+# sign of a zero (of -0 and +0 the minimum is now -0 and the maximum +0, in either
+# order), which moves no comparison: the tree shape is unchanged.
 var _BVH_ITEM_SIZE = 5;  # aabb_ptr, index, centroid x, y, z
+
+# IEEE 754-2019 minimum and maximum, the scalar halves of hvec3_min/hvec3_max:
+# NaN when either operand is (the accumulator's own when both are), -0 below +0,
+# otherwise the smaller or the larger. A copy rather than a call because
+# src/vec3.cyr keeps its scalar helpers private and hvec3_min/hvec3_max would
+# allocate an HVec3 per box per level -- the cost 2.8.3 removed.
+# ⚠ The identical-bits exit is exact for every operand (a value's minimum and
+# maximum with itself is that value, a NaN's payload included) and is there for
+# the coincident partition, where every compare ties and falls to the third test:
+# without it bvh_degenerate_4k ran 1.29x its 3.3.2 time, with it 0.98x. The
+# ordinary build, bvh_scatter_4k, ran 1.02x without it and 1.03x to 1.04x with it,
+# inside that row's spread in both runs.
+# [measured: R3a interleaved A/B/C (12 rounds) and A/B (16), hisab.bcyr bvh fixtures, 2026-10-01; cycc 6.6.12]
+fn _bvh_fmin(a, b) {
+    if (a == b) { return a; }
+    if (f64_lt(a, b) == 1) { return a; }
+    if (f64_lt(b, a) == 1) { return b; }
+    if (f64_eq(a, b) == 1) { return a | b; }
+    if (f64_eq(a, a) == 0) { return a; }
+    return b;
+}
+
+fn _bvh_fmax(a, b) {
+    if (a == b) { return a; }
+    if (f64_gt(a, b) == 1) { return a; }
+    if (f64_gt(b, a) == 1) { return b; }
+    if (f64_eq(a, b) == 1) { return a & b; }
+    if (f64_eq(a, a) == 0) { return a; }
+    return b;
+}
 
 fn _bvh_item_swap(items, i, j) {
     var ib = i * _BVH_ITEM_SIZE;
@@ -1593,13 +1751,22 @@ fn _bvh_build_rec(items, start, end) {
         var box = vec_get(items, bi * _BVH_ITEM_SIZE);
         var bmin = GeoAabb_min(box);
         var bmax = GeoAabb_max(box);
-        lo_x = f64_min(lo_x, HVec3_x(bmin));
-        lo_y = f64_min(lo_y, HVec3_y(bmin));
-        lo_z = f64_min(lo_z, HVec3_z(bmin));
-        hi_x = f64_max(hi_x, HVec3_x(bmax));
-        hi_y = f64_max(hi_y, HVec3_y(bmax));
-        hi_z = f64_max(hi_z, HVec3_z(bmax));
+        lo_x = _bvh_fmin(lo_x, HVec3_x(bmin));
+        lo_y = _bvh_fmin(lo_y, HVec3_y(bmin));
+        lo_z = _bvh_fmin(lo_z, HVec3_z(bmin));
+        hi_x = _bvh_fmax(hi_x, HVec3_x(bmax));
+        hi_y = _bvh_fmax(hi_y, HVec3_y(bmax));
+        hi_z = _bvh_fmax(hi_z, HVec3_z(bmax));
     }
+    # A slab NaN on one side is made NaN on both, which is what geo_aabb_new makes
+    # of such a pair. With one side finite, _bvh_ray_hits_aabb still clips the ray
+    # at it, and from the wrong end when the ray runs backwards along that axis: a
+    # NaN min.x in the middle box above, and a ray running -x from x = 10 into the
+    # first, gave a root slab of [NaN, 9] and no hit, as [8, 9] did through 3.3.2.
+    # [measured: R3a probes, 3.3.2 bundle and this tree without these lines, 2026-10-01; cycc 6.6.12]
+    if (f64_eq(lo_x, lo_x) == 0) { hi_x = lo_x; } elif (f64_eq(hi_x, hi_x) == 0) { lo_x = hi_x; }
+    if (f64_eq(lo_y, lo_y) == 0) { hi_y = lo_y; } elif (f64_eq(hi_y, hi_y) == 0) { lo_y = hi_y; }
+    if (f64_eq(lo_z, lo_z) == 0) { hi_z = lo_z; } elif (f64_eq(hi_z, hi_z) == 0) { lo_z = hi_z; }
 
     # Find longest axis
     var sx = f64_abs(f64_sub(hi_x, lo_x));
@@ -1619,7 +1786,8 @@ fn _bvh_build_rec(items, start, end) {
 
     # One GeoAabb per node. geo_aabb_new would re-run hvec3_min/hvec3_max
     # over an already-sorted pair for two more heap blocks; lo_* <= hi_*
-    # holds by construction of the fold above.
+    # holds by construction of the fold above for sorted input boxes, and a
+    # NaN slab is NaN on both sides (above), which geo_aabb_new would keep.
     var bounds = alloc(sizeof(GeoAabb));
     GeoAabb_set_min(bounds, hvec3_new(lo_x, lo_y, lo_z));
     GeoAabb_set_max(bounds, hvec3_new(hi_x, hi_y, hi_z));
@@ -2185,6 +2353,208 @@ fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_
     return 0;
 }
 
+# The contact normal of a configuration the advance loop has declared in contact
+# (the pair at `offset`), read off that pair with B moved a distance s further
+# along the unit direction m: -v/|v|, v the closest point of A (-) B there.
+# Returns 0 unless the moved pair is apart by more than `dmin`: _toi_near_point
+# reports "inside" with v = 0, so the one length test covers that too, and a NaN
+# distance fails it.
+fn _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, m, s, dmin) {
+    var v_slot = alloc(8);
+    var lb_slot = alloc(8);
+    _toi_near_point(sup_a, shape_a, sup_b, shape_b, hvec3_add(offset, hvec3_scale(m, s)), m,
+      v_slot, lb_slot);
+    var v = load64(v_slot);
+    var d = hvec3_length(v);
+    if (f64_gt(d, dmin) == 0) { return 0; }
+    return hvec3_scale(v, f64_div(_GA_F64_NEG_ONE, d));
+}
+
+# h(m) = m . support of (A (-) B - offset) along m: the signed distance from the
+# query point to A (-) B's supporting plane with normal m. A direction with h <= 0
+# separates the pair at `offset` (moving B along it never closes the gap), and the
+# closest-approach direction is the one that minimises it.
+fn _toi_support_value(sup_a, shape_a, sup_b, shape_b, offset, m) {
+    return hvec3_dot(_toi_msup(sup_a, shape_a, sup_b, shape_b, offset, m), m);
+}
+
+# The probe chain of a contact with no reading of its own: along n_prev, else
+# along mc and again along that first answer (mc is oblique to the normal wherever
+# A (-) B is not round, and moving B across a curved face along it turns the face).
+# 0 when no probe measures a separation.
+fn _toi_chain_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s) {
+    var n = 0;
+    if (n_prev != 0) { n = _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, s, 0); }
+    if (n == 0) {
+        n = _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, mc, s, 0);
+        if (n != 0) {
+            var n2 = _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, n, s, 0);
+            if (n2 != 0) { n = n2; }
+        }
+    }
+    return n;
+}
+
+# Two probe readings, r2 taken along r1, offered against the contact's own reading
+# `vcon` (support value hv): the reading with the smaller support value, if that
+# value is below hv AND the reading lies further from vcon than `mult` times the
+# two readings' own disagreement |r1 x r2|. Otherwise 0, and vcon stands.
+fn _toi_pair_pick(sup_a, shape_a, sup_b, shape_b, offset, r1, r2, vcon, hv, mult) {
+    var h1 = _toi_support_value(sup_a, shape_a, sup_b, shape_b, offset, r1);
+    var h2 = _toi_support_value(sup_a, shape_a, sup_b, shape_b, offset, r2);
+    var best = r1;
+    var hb = h1;
+    if (f64_lt(h2, h1) == 1) {
+        best = r2;
+        hb = h2;
+    }
+    if (f64_lt(hb, hv) == 0) { return 0; }
+    var spread = hvec3_length(hvec3_cross(r1, r2));
+    if (f64_gt(hvec3_length(hvec3_cross(best, vcon)), f64_mul(spread, mult)) == 1) { return best; }
+    return 0;
+}
+
+# ⛔ 3.3.3 — THE LOOP READ ITS NORMAL OFF THE CONTACT CONFIGURATION ITSELF, where
+# there is none to read. Its last advance is floored at the contact tolerance, so
+# it can land inside; an exact one lands on the touch; either way the distance
+# query reports the origin inside with v = 0, and the loop then stored its unit_x
+# placeholder. Unit spheres 9.5 apart closing at speed 1 returned (+1, 0, 0) from
+# +x, from -x (true normal -x) and from +y (true normal +y). Where a gap was left
+# the normal came out B -> A, the opposite of gjk_epa_3d's A -> B, and a gap at
+# rounding level has no direction at all: on spheres placed within 32 ulp of
+# tangency the loop's t = 0 contacts were the placeholder for 3206 of 10374, and
+# -v/|v| was up to 3.14 rad from the line of centres for the rest.
+# [measured: R3a probes on the 3.3.2 bundle and 3.3.3 base sources, 2026-10-01; cycc 6.6.12]
+#
+# ⭐ So a first 3.3.3 repair (R3a) took the normal where it exists, on the pair moved
+# apart by s (_toi_probe_normal), and that is still the answer for a contact that
+# leaves no gap: the probe chain (_toi_chain_normal) moves B along `n_prev`, the
+# loop's own closest-approach direction from where its last advance started; with no
+# advance yet, or when that probe fails, along `mc`, from the midpoint of A (-) B's
+# two extreme points along the motion to the origin -- a member of A (-) B, interior
+# unless a shape is flat across the motion, so mc . n >= 0 for every outward normal n
+# there -- and again along that first answer; `mc` itself is the last resort. s
+# exceeds the deepest the floored advance can overshoot (one contact tolerance), so a
+# pair moved along the normal is apart by construction.
+#
+# ⛔ 3.3.3 — THAT PROBE READ THE WRONG FEATURE WHERE A CONTACT GRAZES, AND IT THREW
+# AWAY THE CONTACT'S OWN READING. Moving B along n_prev measures the pair as it was
+# before the closest feature changed: a unit box sliding along -x over another with
+# its bottom face 2^-40 above the other's top came back (+1, 2.2e-7, 0), about 90
+# degrees from the closest-approach direction (0, +1, 0); so did a point sliding over
+# a box and a point passing a point. 3.3.2 had (0, -1, 0) on all three: the right
+# line, B -> A. Over R5ga's fourteen sweeps (48,441 calls: swept, near-tangent and
+# grazing spheres, boxes, spheres onto box edges and capsule sides, points; swept and
+# at t = 0; unit, 1e-3, 1e3, 1e-6 and 2^20 scales), the probe was further than 3.3.2's
+# own -v/|v| from the exact closest-approach direction at the reported t, compared
+# without the sign, on 8,869 of the 43,528 contacts measured against a closed form.
+# On the cylinder-like regions of A (-) B (a box edge or a capsule's side swept by a
+# sphere) part of that loss is reading 1024 tolerances away rather than at the
+# contact, and part is the distance query itself, whose simplex can stall there: one
+# reading of such a region, 3.3.2's included, can be off by up to tenths of a radian
+# (0.16 at worst after this repair), and two readings of it need not agree.
+# [measured: R5ga probes and sweeps on the 3.3.2 bundle and the 3.3.3 base, 2026-10-01; cycc 6.6.12]
+#
+# ⭐ So a contact that leaves a gap keeps its own reading, `vcon` -- 3.3.2's -v/|v|
+# turned A -> B -- unless the geometry refutes it or the probes agree on a better one.
+# The certificate is the support value h (_toi_support_value):
+#   1. h(vcon) <= 0: vcon's own supporting plane separates the pair. Kept, with no
+#      query (the three grazes above give (0, +1, 0)).
+#   2. B moved s along vcon is apart by no more than s/4 (_GA_TOI_REFUTE): moving B
+#      along a unit m changes the separation by at least s (m . n), so vcon is more
+#      than 75.5 degrees from the normal, a reading of rounding noise. The probe chain
+#      answers, as on a contact with no gap.
+#   3. Otherwise two pairs of probe readings are offered against vcon: along vcon and
+#      then along that answer, and the probe chain's answer and one more along it. A
+#      pair's reading with the smaller h replaces vcon if that h is below h(vcon) and
+#      the reading lies further from vcon than 32 times (_GA_TOI_SPREAD_SWEPT) the
+#      pair's own disagreement |r1 x r2|; 4 times (_GA_TOI_SPREAD_T0) at t = 0, where
+#      3.3.2's reading came from one query seeded by the velocity rather than one
+#      seeded by the previous step's closest point.
+#   4. Otherwise vcon.
+# h alone does not order directions by angle where A (-) B has an edge: tilting along
+# the edge costs h linearly, turning about it quadratically, so a probe reading 4e-4
+# rad off can show a smaller h than 3.3.2's 1e-4. That is why the two readings of a
+# pair must agree with each other far better than either agrees with vcon.
+# Over the same 43,528 contacts: further than 3.3.2 on 17, nearer on 18,625, on the
+# wrong side on 18 (3.3.2: 34,866). Each of the 17 is a contact the distance query
+# reads as inside, where 3.3.2 wrote its unit_x placeholder and the 3.3.3 base and
+# this tree answer alike from the probe chain: 15 point pairs whose closest-approach
+# vector at the reported t is 6e-17 to 1.2e-15, below the rounding of the
+# configuration itself, and 2 cylinder contacts where the placeholder happened to lie
+# 8.3e-4 and 6.1e-3 from the normal and the chain's reading 1.4e-3 and 6.4e-3.
+# [measured: R5ga sweeps on the 3.3.2 bundle, the 3.3.3 base and this tree, 2026-10-01; cycc 6.6.12]
+# ⚠ THE FACTORS AND THE CUT ARE MEASURED WINDOWS, NOT DERIVATIONS, and the t = 0 one is
+# narrow. After an advance: 8 lets a probe reading replace a better 3.3.2 one on two
+# contacts (a capsule, 7.73e-6 against 3.52e-6; a sphere, 2.85e-8 against 2.74e-8), and
+# 64 keeps a box-edge reading 9.75e-3 off that tests/modules.tcyr pins within 1e-5; 16
+# and 32 pass both (16 is nearer than 32 on 351 contacts and further on 89). At t = 0:
+# 3 lets a capsule reading 6.49e-5 off replace 3.3.2's 1.28e-5 (spread ratio 3.45), and
+# the box edge tests/modules.tcyr pins within 1e-5 needs its chain reading taken at
+# ratio 5.41, so the window is (3.45, 5.41). The cut: 3/4 turns a point grazing a box
+# edge 90 degrees from its closest-approach direction where 3.3.2 was 45 off; 1/2, 1/10
+# and 0 are no worse than 3.3.2 anywhere, and each trades contacts with 1/4 (1/2: worse
+# on 51, better on 34; 1/10: worse on 16, better on 28; 0: worse on 108, better on 50).
+# [measured: R5ga sweeps of each mutant on this tree, 2026-10-01; cycc 6.6.12]
+# ⚠ NOT FREE, per path, against 3.3.2 and the 3.3.3 base, ns per call: a contact the
+# contact's own plane certifies costs no query (swept unit spheres 1.01x 3.3.2, 0.79x
+# base; spheres 2^-40 apart at t = 0 1.16x, 0.70x; the box graze 1.13x, 0.89x); a contact
+# with no gap takes the probe chain as before (swept unit boxes 1.34x, 1.00x); a refuted
+# reading adds its failed probe to the chain (2.02x, 1.36x); a reading the probes replace
+# or keep takes two to five more queries (the R3a swept box edge 1.31x, 1.05x; the R3a
+# t = 0 box edge 2.08x, 1.24x; the two capsule contacts above 1.54x/1.33x and 1.67x/1.30x).
+# A miss does not move.
+# [measured: R5ga interleaved A/B, 8 rounds, min of 7 batches of 200, 3.3.2/base/tree, 2026-10-01; cycc 6.6.12]
+fn _toi_contact_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s, vcon) {
+    if (vcon != 0) {
+        var hv = _toi_support_value(sup_a, shape_a, sup_b, shape_b, offset, vcon);
+        if (f64_le(hv, 0) == 1) { return vcon; }
+        var dmin = f64_mul(s, _GA_TOI_REFUTE);
+        var c1 = _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, vcon, s, dmin);
+        if (c1 != 0) {
+            var mult = _GA_TOI_SPREAD_T0;
+            if (n_prev != 0) { mult = _GA_TOI_SPREAD_SWEPT; }
+            var c2 = _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, c1, s, 0);
+            if (c2 != 0) {
+                var p = _toi_pair_pick(sup_a, shape_a, sup_b, shape_b, offset, c1, c2, vcon, hv, mult);
+                if (p != 0) { return p; }
+            }
+            var n1 = _toi_chain_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s);
+            if (n1 != 0) {
+                var n2 = _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, n1, s, 0);
+                if (n2 != 0) {
+                    var q = _toi_pair_pick(sup_a, shape_a, sup_b, shape_b, offset, n1, n2, vcon, hv, mult);
+                    if (q != 0) { return q; }
+                }
+            }
+            return vcon;
+        }
+    }
+    var n = _toi_chain_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s);
+    if (n == 0) { n = mc; }
+    return n;
+}
+
+# ⛔ 3.3.3 — gjk_epa_3d's exact-touch certificate wrote the INWARD normal (see
+# _epa_touch_probe), so time_of_impact's t = 0 path, which forwards it, was
+# B -> A on those touches and A -> B everywhere else: a box at the origin and a
+# point on its (1, 1, 1) corner, at rest, gave (0, -1, 0).
+# [measured: R3a probe on the 3.3.2 bundle, 2026-10-01; cycc 6.6.12]
+# ⭐ A first 3.3.3 repair turned it here (`_toi_orient`: negate n when
+# h(-n) < h(n)). The turn now happens where the normal is handed out, in
+# gjk_epa_3d and mpr_penetration (_epa_outward), so both answer outward
+# themselves and this path forwards gjk_epa_3d's normal as it is. Removing the
+# turn here moved no assertion in the five suites and no output over 7,200 pairs
+# at rest, 6,804 of them contacts (points on box corners, edges and faces,
+# touching boxes, overlapping spheres and boxes, flat plates and segments, both
+# operand orders). The one output it still changed is a placeholder:
+# with a support NaN in some directions only (radius-1 sphere at (0.5, 0, 0),
+# NaN for dir.y > 0, in the FIRST slot, unit sphere second), gjk_intersect_3d
+# calls the pair a contact while gjk_epa_3d answers the miss with its unit_x
+# placeholder, and the turn made that (-1, 0, 0). That pair is the open
+# partial-NaN-support disagreement, and an oriented placeholder is not a normal.
+# [measured: R4ga mutation run and time_of_impact sweep with and without the turn, 2026-10-01; cycc 6.6.12]
+
 # Compute time of impact between two moving convex shapes.
 #
 # Conservative advancement (Mirtich): at each step measure the distance d
@@ -2199,10 +2569,24 @@ fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_
 #
 # support_a/b, shape_a/b: support function pointers and shape data
 # vel_a, vel_b: HVec3 velocities
-# max_t: f64 maximum time horizon
+# max_t: f64 maximum time horizon. +Inf is unbounded; a NaN horizon bounds like a
+#        negative one (only a contact at t = 0 is reported), since 3.3.3
 # out_t: pointer where f64 time of impact will be stored
 # out_normal: pointer where the HVec3 contact normal will be stored -- always a
-#             unit vector, never 0 (the direction of closest approach at impact)
+#             unit vector, never 0. It points from A towards B, the convention
+#             gjk_epa_3d documents (moving B along it separates the pair): an
+#             outward normal of A (-) B at the contact. On an overlap at t = 0 it
+#             is gjk_epa_3d's normal, outward on its touch paths too since 3.3.3;
+#             on a contact the advance loop reports it is computed by
+#             _toi_contact_normal: where the contact leaves a gap, the contact's
+#             own reading of the closest-approach direction (3.3.2's, turned) or
+#             a probe reading that improves on it; where it leaves none, a probe
+#             reading. On an edge or a corner of A (-) B the closest-approach
+#             direction is set by gaps below the contact tolerance, and on an
+#             edge swept by a sphere a reading can be off by up to 0.16 rad (99%
+#             of R5ga's swept and t = 0 sphere/box and sphere/capsule contacts
+#             within 8.6e-3). One convention on every path since 3.3.3.
+# [measured: R5ga sweeps on this tree, 2026-10-01; cycc 6.6.12]
 # Returns 1 if collision found within max_t, 0 otherwise.
 #
 # CONTACT TOLERANCE. Impact is declared once the gap falls under
@@ -2248,11 +2632,18 @@ public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, m
     if (f64_le(gscale, 0) == 1) { gscale = hvec3_length(ext_p); }
     if (f64_le(gscale, 0) == 1) { gscale = F64_ONE; }
     var tol = f64_mul(gscale, _GA_TOI_TOL_REL);
+    # A member of A (-) B for _toi_contact_normal, interior unless a shape is flat
+    # across the motion: the midpoint of two of its members is a member, and these
+    # two are already in hand.
+    var mid = hvec3_scale(hvec3_add(ext_p, ext_n), F64_HALF);
 
     var v_slot = alloc(8);
     var lb_slot = alloc(8);
     var t = 0;
     var seed = hvec3_neg(rel_vel);
+    # The A -> B closest-approach direction where the last advance started; 0
+    # until the loop has advanced once.
+    var n_prev = 0;
 
     for (var ti = 0; ti < _GA_TOI_MAX_STEPS; ti = ti + 1) {
         var offset = hvec3_scale(rel_vel, t);
@@ -2263,9 +2654,27 @@ public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, m
 
         if (inside == 1 || f64_le(dist, tol) == 1) {
             store64(out_t, t);
-            var nrm = hvec3_unit_x();
-            if (f64_gt(dist, 0) == 1) { nrm = hvec3_scale(v, f64_div(F64_ONE, dist)); }
-            store64(out_normal, nrm);
+            var mc = _epa_unit(hvec3_sub(offset, mid));
+            # The origin AT the midpoint takes two point shapes, whose contact
+            # always follows an advance whose probe cannot fail; this keeps
+            # the never-0 contract, with the approach direction, if it ever could.
+            if (f64_gt(hvec3_length_sq(mc), 0) == 0) { mc = hvec3_neg(u0); }
+            # The contact configuration's own reading, where it left a gap:
+            # 3.3.2's -v/|v| turned A -> B, bit for bit its negation wherever 3.3.2's
+            # was finite. A gap below 2^-1024 has a reciprocal that overflows, and
+            # 3.3.2 answered (-Inf, -Inf, -Inf) there; v is then scaled by 2^508
+            # first, which is exact (every component lands in the normal range).
+            var vcon = 0;
+            if (f64_gt(dist, 0) == 1 && f64_lt(dist, _GA_F64_POS_INF) == 1) {
+                var vinv = f64_div(_GA_F64_NEG_ONE, dist);
+                if (f64_eq(f64_abs(vinv), _GA_F64_POS_INF) == 1) {
+                    v = hvec3_scale(v, _GA_2_POW_P508);
+                    vinv = f64_div(_GA_F64_NEG_ONE, hvec3_length(v));
+                }
+                vcon = hvec3_scale(v, vinv);
+            }
+            store64(out_normal, _toi_contact_normal(support_a, shape_a, support_b, shape_b,
+                offset, n_prev, mc, f64_mul(tol, _GA_TOI_PROBE), vcon));
             return 1;
         }
 
@@ -2283,7 +2692,33 @@ public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, m
         var lb = load64(lb_slot);
         if (f64_lt(lb, tol) == 1) { lb = tol; }
         t = f64_add(t, f64_div(lb, denom));
-        if (f64_gt(t, max_t) == 1) { return 0; }
+        n_prev = hvec3_neg(u);
+        # ⛔ 3.3.3 — A NaN `max_t` WAS AN UNBOUNDED HORIZON. This read
+        # `f64_gt(t, max_t) == 1`, which is false for NaN, so the advance never
+        # left the loop on the horizon and the swept hit came back as an impact:
+        # two unit spheres with centres 9.5 apart, closing at speed 1, returned 1
+        # with t = 7.5 for max_t = NaN, exactly what max_t = 10 returns.
+        # [measured: W2 probe on the 3.3.2 bundle, 2026-10-01; cycc 6.6.12]
+        # Now NaN-true, and identical to the old test for every non-NaN t and
+        # max_t, ±0 and ±Inf included: a NaN horizon leaves on the first advance
+        # with the no-impact 0 and writes neither out-param, which is what a NaN
+        # velocity already got from the `speed` guard above. +Inf stays a real
+        # unbounded horizon (the step budget still bounds the loop).
+        # ⚠ A NaN `t` REACHES THIS TEST TOO, with a finite horizon: a sphere with a
+        # NaN or infinite centre or radius, or an infinite velocity component, makes
+        # the first advance NaN (each run with max_t = 10). The old test let that
+        # `t` past, and the loop ran out its 256-step budget before returning the
+        # same 0; this one leaves on that first advance. Same answer, and neither writes an
+        # out-param; what differs is the work. One call on a NaN-centred sphere
+        # takes 43,592 bytes of arena in tests/modules.tcyr's "3.3.3 R4ga" block
+        # after the W2 group, which pins a ceiling on it, and 239,456 with the old
+        # test put back; a probe of the same call on the 3.3.2 bundle took 233,264.
+        # [measured: R4ga instrumented runs of that block, both tests, and a 3.3.2 probe, 2026-10-01; cycc 6.6.12]
+        # ⚠ A CONTACT AT t = 0 IS STILL REPORTED, because the horizon has never
+        # gated it: an overlap returns before this loop, and a gap inside `tol`
+        # returns from the first iteration, before any advance — for max_t =
+        # -Inf as for max_t = NaN. A NaN horizon answers what a negative one does.
+        if (f64_le(t, max_t) == 0) { return 0; }
         seed = hvec3_neg(v);
     }
     return 0;
@@ -3200,7 +3635,31 @@ fn _cga_scalar_of_geo(a, b) {
             }
         }
     }
-    return f64_add(sum, comp);
+    # ⛔ 3.3.3 — ONE INFINITE TERM MADE THE RESULT NaN. Once a term is infinite, `t`
+    # is too, and the correction above forms Inf - Inf: comp went NaN and so did
+    # `sum + comp`. cga_norm_sq of the multivector whose only coefficient is +Inf on
+    # e1 returned NaN, where its one term, Inf * Inf, is +Inf; with 1 added on the
+    # scalar blade, NaN again. `sum` is the plain IEEE running sum, so once it is
+    # not finite it is the answer and the correction is not applied: ±Inf for
+    # infinite terms of one sign, NaN for both signs or a NaN term -- the rule
+    # calc_integral_simpson takes since 3.3.3. While `sum` stays finite every `t`
+    # was finite, so comp is too and the result is unchanged bit for bit.
+    # [measured: tests/modules.tcyr "3.3.3 R4ga" compensated-sum block; R4ga 3.3.2 probe, 2026-10-01; cycc 6.6.12]
+    # Over 72,000 multivectors (1 to 32 occupied blades, ordinary, full-range,
+    # overflowing and special coefficients, plus conformal points, translators and
+    # spheres) every one of the 35,122 finite results is identical bit for bit,
+    # 13,378 NaN results are now ±Inf, and the other 23,500 NaN results stay NaN.
+    # cga_norm is identical on all 72,000.
+    # [measured: R4ga differential sweep, 3.3.2 bundle and 3.3.3 base against this tree, 2026-10-01; cycc 6.6.12]
+    # ⚠ An overflow of the sum itself is not repaired: finite terms whose running
+    # sum passes DBL_MAX give +Inf (3.3.2: NaN) where the exact sum may be finite.
+    # cga_norm rescales a coefficient above 2^508 before it calls this, and
+    # cga_norm_sq passes its input as it is. ⛔ cga_blade_inverse read the new ±Inf
+    # as a null blade until it got its own non-finite guard (see there).
+    # [measured: tests/modules.tcyr "3.3.3 R4ga" compensated-sum block, T = 1.125 * 2^1023, 2026-10-01; cycc 6.6.12]
+    var total = sum;
+    if (f64_lt(f64_abs(sum), _GA_F64_POS_INF) == 1) { total = f64_add(sum, comp); }
+    return total;
 }
 
 # Norm squared: scalar part of mv * reverse(mv)
@@ -3336,6 +3795,23 @@ public fn cga_blade_inverse(b) {
     # point is still not bit-exactly null in general — see `_cga_scalar_of_geo`
     # for why buying that costs a fabricated zero.
     # [measured: docs/audit/2026-09-09-epsilon-open.json; 2000 pts/binade, 2026-09-11]
+    # ⛔ 3.3.3 — A NORM² THAT IS NOT FINITE IS NOT A NULL BLADE. Through 3.3.2 it
+    # could only be NaN (see `_cga_scalar_of_geo`), which slipped past both tests
+    # below and came back NaN in every coefficient. 3.3.3's repair there leaves it
+    # ±Inf when a term is infinite, and the null test (2) then read Inf <= tol * Inf
+    # as true: 2^600 e1, whose inverse is 2^-600 e1, and +Inf e1 both came back as
+    # the zero multivector, the "no inverse" answer, and cga_project onto them as 0.
+    # Over the 72,000 multivectors of that function's differential sweep, 13,378
+    # inverses stopped being NaN, 12,908 of them the zero multivector.
+    # [measured: R4ga probes and sweep, 3.3.2, 3.3.3 base, this tree with/without the guard, 2026-10-01; cycc 6.6.12]
+    # A non-finite norm² is refused here instead, NaN in every coefficient, which is
+    # what 3.3.2 returned for all 36,878 of the sweep's; the 35,122 finite ones
+    # invert bit for bit as before. Rescaling an overflowing blade, as cga_norm
+    # does, would answer 2^600 e1; that is a capability, not this repair.
+    # [measured: R4ga differential sweep, 3.3.2 bundle against this tree, 2026-10-01; cycc 6.6.12]
+    if (f64_lt(f64_abs(nsq), _GA_F64_POS_INF) == 0) {
+        return cga_mv_scale(cga_mv_reverse(b), 0x7FF8000000000000);   # quiet NaN
+    }
     if (f64_lt(f64_abs(nsq), F64_TINY) == 1) { return cga_mv_zero(); }
     # ⭐ (2) NULLNESS is relative to the blade's own magnitude, and the bound is
     # measured (see _CGA_NULL_TOL) rather than borrowed from EPSILON_F64.
@@ -3461,7 +3937,23 @@ public fn cga_plane(nx, ny, nz, d) {
     # caller asked for and carries no signal that anything went wrong.
     # ⭐ A zero normal has no plane at all, so that is the only rejection; every
     # other normal divides.
-    if (f64_gt(norm, 0) == 0) { return cga_mv_zero(); }
+    # ⛔ 3.3.3 — "THE ONLY REJECTION" WAS NOT: `f64_gt(norm, 0) == 0` is TRUE for a
+    # NaN norm, so a NaN normal also came back as the zero multivector, the
+    # answer reserved for "no plane". 2.17.0 pinned that fold as a contract
+    # distinct from `cga_rotor`'s on purpose; it was the fabricated-answer class
+    # (a NaN normal is not a missing normal, it is an unknown one). It is now an
+    # exact zero, and a NaN normal is NaN in e1, e2, e3 and ninf — what dividing
+    # by the NaN norm gives, and what `cga_rotor`, `cga_point` and `cga_sphere`
+    # already did with NaN input. `ganita_f64_hypot` propagates a NaN leg unless
+    # another leg is infinite, where C's hypot rule returns +Inf and the Inf/Inf
+    # division was already NaN.
+    # [measured: G6 scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⚠ SO "NaN IN e1, e2, e3 AND ninf" HOLDS ONLY WHILE EVERY OTHER LEG IS FINITE.
+    # With one infinite, the norm is +Inf: the NaN leg and the infinite one divide
+    # to NaN, and every finite coefficient divides to 0. cga_plane(NaN, +Inf, 0, 1)
+    # is NaN in e1 and e2 and +0 in e3 and ninf, on 3.3.2 and now.
+    # [measured: V6 and R4ga probes on the 3.3.2 bundle and this tree, 2026-10-01; cycc 6.6.12]
+    if (f64_eq(norm, 0) == 1) { return cga_mv_zero(); }
     # ⚠ DIVIDE, NEVER MULTIPLY BY `1 / norm`. With the norm no longer flushing, a
     # subnormal norm is reachable and its reciprocal is +Inf, which would turn the
     # zero components into `0 * Inf` = NaN. Same rule as src/linalg_precision.cyr.
@@ -3513,11 +4005,12 @@ public fn cga_rotor(ax, ay, az, angle) {
     # ⛔ The axis LENGTH is a unit choice — the header one line up even says the
     # axis is normalised internally — so an absolute 1e-12 turned a real rotation
     # into the identity rotor for a short axis vector, with no error channel.
-    # ⚠ `f64_eq(norm, 0)`, NOT the `f64_gt(norm, 0) == 0` form `cga_plane` uses:
-    # `f64_gt(NaN, 0)` is 0, so that shape would fold a NaN axis into a fabricated
-    # identity rotor, and this function propagates NaN today. The two siblings
-    # differ here on purpose — `cga_plane` has always folded NaN to the null
-    # multivector and keeping each contract is the point.
+    # ⚠ `f64_eq(norm, 0)`, NOT `f64_gt(norm, 0) == 0`: `f64_gt(NaN, 0)` is 0, so
+    # that shape would fold a NaN axis into a fabricated identity rotor, and this
+    # function propagates NaN. Through 3.3.2 `cga_plane` used that shape and
+    # folded a NaN normal to the zero multivector, and this note called the
+    # difference deliberate; 3.3.3 moved `cga_plane` to this test, so the two
+    # siblings now share one NaN contract.
     if (f64_eq(norm, 0) == 1) {
         # Degenerate axis: return identity
         var mv = cga_mv_zero();

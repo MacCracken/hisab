@@ -28,13 +28,13 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.3.2
+## Current — v3.3.3
 
 **Status**:
-- Suite **4606** across five harnesses: hisab 590, foundation 429, modules 2339, edge_cases 267,
-  abuse 981.
-- Constant gate **155/155**.
-- Public surface **704** declarations (847 gate probes; all 492 non-public probes refused),
+- Suite **6038** across five harnesses: hisab 735, foundation 453, modules 3036, edge_cases 383,
+  abuse 1431.
+- Constant gate **161/161**.
+- Public surface **704** declarations (847 gate probes; all 520 non-public probes refused),
   enforced since 3.3.0 by the bundle's `private` marker.
 - **80** benchmarks.
 - **35** math modules in `[lib]`, plus the `src/visibility.cyr` marker.
@@ -48,11 +48,11 @@ Two releases broke the API, and each has a consumer guide:
   ([`../guides/migration-3.3.md`](../guides/migration-3.3.md)).
 
 ⚠ **hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`). Measured again on the
-3.3.2 bundle from pinned dirs:
+3.3.3 bundle from pinned dirs:
 - 6.6.2 refuses it with the known `#derive` error.
 - Under 6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12 consumer-shaped programs (a geometry jet, the
-  autodiff closure recipe, a former-abort Delaunay call, and 3.3.2's repairs: the complex NaN
-  pole, the tridiagonal wrap, the symbolic negative render, a `geodesic_rk4` closed form) run
+  autodiff closure recipe, a former-abort Delaunay call, and four 3.3.3 repairs: the divisor-sigma
+  overflow, the interval clamp, the gcd at i64 min, `eigen_power` on a diagonal matrix) run
   correctly. On 3.3.0, all 511
   non-public probes were refused under 6.6.3, 6.6.4 and 6.6.12.
 - ⚠ On 6.6.3 a private fn is still reachable through `&name`. That is upstream, fixed in 6.6.4;
@@ -88,47 +88,6 @@ including a row that says something is blocked.
 
 ## Pinned — 3.3.x patches (no public API change)
 
-### **[3.3.3]** — silent wrong answers: linalg, num, calc
-
-- **`cqr_decompose`** still balances one-ended (`_lp_pow2_floor(max|A|)`). 2.22.1 proved that
-  scale lossy but replaced it only in `svd_golub_kahan` and `eigen_qr`. At lead 9, `|R22| = 0`
-  where the truth is 2.4u. At lead 1000 the whole subnormal block is wiped, and `rc` is still
-  `Ok`. Use `_lp_balance_scale`. `D010`
-- **`svd_truncated`** ignores `ganita_mat_svd`'s −1/−2, reports `Ok(0)`, and never null-checks
-  `A`. `error.cyr` says `svd_compute` "can only ever succeed", but it returns −2 on a 2×3 input,
-  which aliases `HSB_ERR_SINGULAR_MATRIX`. Propagate the failure as `Err` and fix the doc. The
-  `svd_compute` signature itself is **[3.4.0]**. `D012`
-- **`eigen_power`** seeds `e_0`, so any matrix with `A·e_0 = λ·e_0` returns `A[0][0]`:
-  `diag(2,3,4)` and `[[2,0,0],[0,3,1],[0,1,3]]` both give 2. Change the seed and re-derive
-  `abuse.tcyr:991`. `D013`
-- **`solve_bicgstab`**'s breakdown guards compare degree-2 quantities against an absolute 1e-18.
-  At operator scale ≤ 1e-5 it returns `x0`; just above that, a wrong partial iterate. Make the
-  guards exact-zero or relative. The 2026-09-09 census missed them because the threshold is a hex
-  literal, not `EPSILON_F64`. The error channel is **[3.4.0]**. `D015`
-- **GMRES / BiCGSTAB `A_fn` aliasing**: GMRES modifies and keeps the vector `A_fn` returns, and
-  BiCGSTAB keeps `v` across the next call. Give them an `A_fn` that reuses one buffer and GMRES
-  burns its whole 60-matvec budget (4 with fresh buffers), while BiCGSTAB needs 29 matvecs (6 with
-  fresh buffers) and stops at a residual of ~1.1e-10 without saying so. Copy into
-  hisab-owned storage; this merges with the **[3.3.7]** restart-loop hoist. It is audit M6 from
-  2026-04-15. `D017`
-- **`ivl_*`**: round-to-nearest overflow produces a degenerate `[+Inf, +Inf]`, which then poisons
-  add/sub with NaN. The LIMIT comment blames `Inf − Inf` from `ivl_div` instead, but 0 of 32
-  add/sub pairs of its outputs give NaN. Clamp the inner endpoint and rewrite the comment. The
-  entire/empty tag stays demand-gated. `D021`
-- **`num_divisor_sigma`** wraps i64 silently for k ≥ 1: `(3·2^61, 1)` returns −4, and even
-  `sigma_4(720720)` (n < 2^20) wraps. Two of the three measured wraps come out positive, so a sign
-  check cannot catch them. Return the designed 0 on overflow, as 3.3.0 did for `num_crt`. `D022`
-- **`calc_monotone_cubic`**'s flat-segment test applies an absolute 1e-30 to a slope. Tangents go
-  to zero past an x-scale of 2^99.7, and 40 of 140 y-scales are wrong (0 of 140 with an
-  exact-zero test). The repair has two parts, because an exact-zero test alone regresses to NaN.
-  Extend sweep H past 2^100. **svara calls this function.** `D068`
-- **`calc_adaptive_simpson`** walks the full 2^50-leaf tree when `tol` is ≤ 0, NaN, or halves to
-  zero: `tol = 0` exceeded 2·10⁷ evaluations, where 1e-10 takes 257. Reject unreachable
-  tolerances with a NaN return; the Result form is **[3.4.0]**. `D071`
-- **`calc_integral_trapez` / `_simpson`** accept negative step counts and return an endpoint-only
-  estimate as `Ok`, which `abuse.tcyr:1272-1281` pins as accepted. Return `Err` and flip the pins.
-  `D072`
-
 ### **[3.3.4]** — silent wrong answers: geometry, CGA, spatial, Lie, vectors
 
 - **`geo_ray_aabb[_face]` / `geo_ray_obb[_face]`**: `f64_max`/`f64_min` erase a NaN in one slab
@@ -158,9 +117,8 @@ including a row that says something is blocked.
 - **`quadtree_insert` / `octree_insert`** store a NaN point as inside, because ordered compares are
   false for NaN. In-bounds queries then return it. It is pinned as a wrong answer at
   `abuse.tcyr:2080` and `:2096`. `D058`
-- **`lie_norm3` / `_lie_norm4`** drop NaN in every component but z, because stdlib
-  `f64_max` returns `b` when `a` is NaN. So `su2_exp`, `so3_exp`, `se3_exp` and `su2_from_quat`
-  return the identity for NaN input. Five more `f64_gt(x, 0) == 0` guards are NaN-true. `D085`
+- **`D085` (NaN half) shipped in 3.3.3**: `lie_norm3` / `_lie_norm4` and the five NaN-true Lie
+  guards now propagate NaN. What remains of the Lie rows is the subnormal class below (`D086`).
 - **Lie axis guards** (`su2_*`, `so3_from_axis_angle`, `so3_exp`, `lorentz_boost`/`_rotate`) fire
   on non-zero subnormal norms and return the identity across 52 binades. Their "F64_TINY is
   exactly norm == 0" comments, false since 2.17.0, were corrected in 3.3.2; the guards remain.
@@ -267,8 +225,8 @@ New benchmark rows register LAST (`tests/hisab.bcyr:1398-1408`).
 - **Miscompile audit**: `threat-model.md:179-181` says every suite binary "is now audited for
   unwritten destination slots". That was a one-time objdump run in 3.2.0. Script it against the
   bundle compiled under the lowest live pin, or correct the sentence. `D119`
-- **Measurement provenance**: 487 claim lines in 25 files are unmarked (517 in 27 before 3.3.2's
-  comment sweep). `--ratchet` is red against the 417 baseline, with 9 files up, and CI runs
+- **Measurement provenance**: 484 claim lines in 25 files are unmarked at 3.3.3 (487 at 3.3.2, 517
+  in 27 before 3.3.2's comment sweep). `--ratchet` is red against the 417 baseline, with 8 files up, and CI runs
   `--diff` only on pull requests. The fix needs a
   call from the maintainer; see *Decisions owed*. `D106`
 
@@ -311,8 +269,9 @@ Each function below returns a value that is also a legal answer when the operati
   of returning the current `x`. `D015`
 - **`calc_adaptive_simpson`, `ode_backward_euler`, `ode_bdf2`, `ode_bdf`** should report
   non-convergence. `calc_ext`'s "no Result type" reason was false from 3.0.0, and `ode.cyr`
-  documented a return value the code doesn't give; 3.3.2 corrected both comments. The behaviour
-  is unchanged. `D070`
+  documented a return value the code doesn't give; 3.3.2 corrected both comments. 3.3.3 made
+  `calc_adaptive_simpson` return NaN for an unreachable tolerance (`D071`); the Result form replaces
+  those NaNs. `D070`
 - **Plausible-value fallbacks**: `hisab_inverse_lerp` (returns 0), `world_to_screen`
   (`hvec3_zero`), `calc_monotone_cubic` (0), `calc_partial_derivative`, `calc_hermite_tcb`,
   `ode_bdf`. **svara** works around `calc_monotone_cubic`'s 0 with
@@ -380,7 +339,7 @@ Nothing in this section is scheduled until the maintainer decides it.
 2. **Minimum cyrius 6.6.4?** On 6.6.3, `&_private_fn` still reaches private bundle functions
    (`&_num_mulmod` probed), and six direct and three transitive consumers pin 6.6.3. 3.3.0 kept
    the floor at 6.6.3 and documented the hole. `D144`
-3. **Measurement debt.** Either mark the claims added since the baseline (net 70 at 3.3.2: 487
+3. **Measurement debt.** Either mark the claims added since the baseline (net 67 at 3.3.3: 484
    against 417), or run `--update-baseline`, which forgives them. Then decide whether `--ratchet`
    runs on push.
    `D106`

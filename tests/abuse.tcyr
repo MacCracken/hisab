@@ -522,6 +522,81 @@ assert(f64_lt(ab_cqr_worst, 0x3E45798EE2308C3A) == 1,
 assert(f64_lt(cx_abs(cmat_get(ab_cqrR2, 1, 0)), 0x3E45798EE2308C3A) == 1,
   "cqr_decompose: 2x3 R is upper trapezoidal (|R[1][0]| < 1e-8)");
 
+# === 3.3.3 G1: cqr_decompose rejects non-finite input ===
+# ⛔ 3.3.3 — A NaN ENTRY CAME BACK AS A FINITE, PLAUSIBLE R WITH rc = OK.
+# cqr_decompose never got the non-finite check svd_golub_kahan and eigen_qr got in
+# 2.22.0. A NaN makes its column's norm NaN, `f64_gt(norm, 0) == 1` is false for NaN
+# so that reflector is skipped, and the strictly-lower triangle is then zeroed by
+# contract, which erases the NaN. Measured on 3.3.2 with A = [[3,1],[NaN,2]]:
+# rc = OK, R = [[3,1],[0,-2]], Q = diag(1,-1), all finite, and Q*R is not A; the
+# same with the NaN in the IMAGINARY part. A NaN at A[0][0] stays in R00 but rc is
+# still OK, and +/-Inf (three positions probed) gives rc = OK with R NaN above the
+# diagonal.
+# ⚠ Real and imaginary parts are asserted separately, NaN and both infinities,
+# plus the finite control: a check written for one component passes the other.
+# [measured: scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+fn _g1_cqnf(a00re, a00im, a10re, a10im) {
+    var A = cmat_new(2, 2);
+    cmat_set(A, 0, 0, cx_new(a00re, a00im));
+    cmat_set(A, 0, 1, cx_new(F64_ONE, 0));
+    cmat_set(A, 1, 0, cx_new(a10re, a10im));
+    cmat_set(A, 1, 1, cx_new(F64_TWO, 0));
+    var rt, rv = cqr_decompose(A, cmat_new(2, 2), cmat_new(2, 2));
+    if (rt != 0) { return rv; }
+    return HSB_ERR_NONE;
+}
+var _g1_nan = f64_div(f64_from(0), f64_from(0));
+assert_eq(_g1_cqnf(f64_from(3), 0, _g1_nan, 0), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose: NaN below the diagonal rejected (3.3.2: OK with a finite R, NaN erased)");
+assert_eq(_g1_cqnf(f64_from(3), 0, f64_from(4), _g1_nan), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose: NaN in an IMAGINARY part rejected (3.3.2: OK with a finite R)");
+assert_eq(_g1_cqnf(_g1_nan, 0, f64_from(4), 0), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose: NaN on the diagonal rejected (3.3.2: OK)");
+assert_eq(_g1_cqnf(F64_POS_INF, 0, f64_from(4), 0), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose: +Inf real part rejected (3.3.2: OK, R NaN above the diagonal)");
+assert_eq(_g1_cqnf(f64_from(3), 0, f64_from(4), f64_neg(F64_POS_INF)), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose: -Inf imaginary part rejected (3.3.2: OK, R NaN above the diagonal)");
+assert_eq(_g1_cqnf(f64_from(3), 0, f64_from(4), 0), HSB_ERR_NONE,
+  "cqr_decompose: the same matrix, finite, is still accepted (control)");
+
+# === 3.3.3 R4lp: cqr_decompose's non-finite scan covers every row and column ===
+# The fixtures above are 2x2 with the bad value in column 0, so a scan that skipped
+# the last column, or one handed (A, m, m), passed every suite and reopened the
+# laundering: 3x2 [[0,5],[0,7],[0,NaN]] came back rc = OK with R = [[0,5],[0,7],[0,0]],
+# as on 3.3.2, and a wide 2x3 with the NaN in its last column returned NaN in R with
+# rc = OK. Each shape in each part, plus the finite control of each.
+# [measured: scratch probes on this tree and the two short-scan mutants, not reproducible in-tree, 2026-10-01]
+fn _r4lp_cqnf(m, n, part) {
+    var A = cmat_new(m, n);
+    for (var i = 0; i < m; i = i + 1) { for (var j = 0; j < n; j = j + 1) { cmat_set(A, i, j, cx_new(0, 0)); } }
+    if (m == 3) {
+        cmat_set(A, 0, 1, cx_new(f64_from(5), 0));
+        cmat_set(A, 1, 1, cx_new(f64_from(7), 0));
+    } else {
+        cmat_set(A, 0, 0, cx_new(f64_from(3), 0));
+        cmat_set(A, 0, 1, cx_new(F64_ONE, 0));
+        cmat_set(A, 0, 2, cx_new(F64_TWO, 0));
+        cmat_set(A, 1, 0, cx_new(f64_from(4), 0));
+        cmat_set(A, 1, 1, cx_new(F64_TWO, 0));
+    }
+    var nan = f64_div(f64_from(0), f64_from(0));
+    if (part == 0) { cmat_set(A, m - 1, n - 1, cx_new(nan, 0)); }
+    if (part == 1) { cmat_set(A, m - 1, n - 1, cx_new(0, nan)); }
+    var rt, rv = cqr_decompose(A, cmat_new(m, m), cmat_new(m, n));
+    if (rt != 0) { return rv; }
+    return HSB_ERR_NONE;
+}
+assert_eq(_r4lp_cqnf(3, 2, 0), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose 3x2: NaN real part at [2][1] rejected (3.3.2 and a last-column-short scan: OK, NaN erased)");
+assert_eq(_r4lp_cqnf(3, 2, 1), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose 3x2: NaN imaginary part at [2][1] rejected (3.3.2: OK, NaN erased)");
+assert_eq(_r4lp_cqnf(3, 2, 2), HSB_ERR_NONE, "cqr_decompose 3x2: the same matrix, finite, is accepted (control)");
+assert_eq(_r4lp_cqnf(2, 3, 0), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose 2x3: NaN real part at [1][2] rejected (an m x m scan: OK, NaN in R)");
+assert_eq(_r4lp_cqnf(2, 3, 1), HSB_ERR_INVALID_INPUT,
+  "cqr_decompose 2x3: NaN imaginary part at [1][2] rejected (an m x m scan: OK, NaN in R)");
+assert_eq(_r4lp_cqnf(2, 3, 2), HSB_ERR_NONE, "cqr_decompose 2x3: the same matrix, finite, is accepted (control)");
+
 test_group("abuse: non-conformable tensor operands");
 
 var ab_sh22 = alloc(16);
@@ -655,6 +730,201 @@ assert_eq(_rq2v, HSB_ERR_INVALID_INPUT, "svd_truncated: k = -1 -> HSB_ERR_INVALI
 var _rq3t, _rq3v = svd_truncated(ab_A33, 99, ganita_mat_new(3, 3), ab_S3, ganita_mat_new(3, 3));
 assert_eq(is_err_result(_rq3t), 1, "svd_truncated: k = 99 (> cols) -> HSB_ERR_INVALID_INPUT");
 assert_eq(_rq3v, HSB_ERR_INVALID_INPUT, "svd_truncated: k = 99 (> cols) -> HSB_ERR_INVALID_INPUT");
+
+# === 3.3.3 G2a: svd_truncated status, null and out-param contract ===
+# ⛔ Through 3.3.2 ganita_mat_svd's status was a bare statement and nothing else
+# was checked: a null A or out-param was exit 139, a wide A (ganita's -2) and a
+# Jacobi failure (its -1) both came back Ok(0) with S copied out of temporaries
+# the SVD never wrote, and an out_U / out_Vt smaller than the copy loops took the
+# stores past its end. Every fixture below was run against the 3.3.2 tree.
+# [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+var _g2a1t, _g2a1v = svd_truncated(0, 1, ganita_mat_new(3, 1), alloc(8), ganita_mat_new(1, 3));
+assert_eq(is_err_result(_g2a1t), 1, "svd_truncated: A = 0 -> Err (was exit 139)");
+assert_eq(_g2a1v, HSB_ERR_INVALID_INPUT, "svd_truncated: A = 0 -> HSB_ERR_INVALID_INPUT");
+var _g2a2t, _g2a2v = svd_truncated(ab_A33, 2, 0, alloc(16), ganita_mat_new(2, 3));
+assert_eq(is_err_result(_g2a2t), 1, "svd_truncated: out_U = 0 -> Err (was exit 139)");
+assert_eq(_g2a2v, HSB_ERR_INVALID_INPUT, "svd_truncated: out_U = 0 -> HSB_ERR_INVALID_INPUT");
+var _g2a3t, _g2a3v = svd_truncated(ab_A33, 2, ganita_mat_new(3, 2), 0, ganita_mat_new(2, 3));
+assert_eq(is_err_result(_g2a3t), 1, "svd_truncated: out_S = 0 -> Err (was exit 139)");
+assert_eq(_g2a3v, HSB_ERR_INVALID_INPUT, "svd_truncated: out_S = 0 -> HSB_ERR_INVALID_INPUT");
+var _g2a4t, _g2a4v = svd_truncated(ab_A33, 2, ganita_mat_new(3, 2), alloc(16), 0);
+assert_eq(is_err_result(_g2a4t), 1, "svd_truncated: out_Vt = 0 -> Err (was exit 139)");
+assert_eq(_g2a4v, HSB_ERR_INVALID_INPUT, "svd_truncated: out_Vt = 0 -> HSB_ERR_INVALID_INPUT");
+
+# A WIDE A. ganita's one-sided Jacobi needs m >= n and says so with -2, which
+# 3.3.2 discarded: Ok(0), and S[0] overwritten with 0.
+var g2a_W = ganita_mat_new(2, 3);
+ganita_mat_set(g2a_W, 0, 0, F64_ONE);        ganita_mat_set(g2a_W, 0, 1, F64_TWO);
+ganita_mat_set(g2a_W, 0, 2, f64_from(3));    ganita_mat_set(g2a_W, 1, 0, f64_from(4));
+ganita_mat_set(g2a_W, 1, 1, f64_from(5));    ganita_mat_set(g2a_W, 1, 2, f64_from(6));
+var g2a_S = alloc(3 * 8);
+store64(g2a_S, _AB_SEVEN);
+var _g2a5t, _g2a5v = svd_truncated(g2a_W, 1, ganita_mat_new(2, 1), g2a_S, ganita_mat_new(1, 3));
+assert_eq(is_err_result(_g2a5t), 1, "svd_truncated: 2x3 (m < n) -> Err (was Ok(0))");
+assert_eq(_g2a5v, HSB_ERR_INVALID_INPUT, "svd_truncated: 2x3 (m < n) -> HSB_ERR_INVALID_INPUT");
+assert_eq(load64(g2a_S), _AB_SEVEN, "svd_truncated: 2x3 leaves out_S untouched (3.3.2 wrote 0)");
+# svd_compute keeps ganita's raw status (its Result form is roadmap [3.4.0]); these
+# pin the two -2 cases its doc and error.cyr name.
+assert_eq(svd_compute(g2a_W, ganita_mat_new(2, 3), alloc(3 * 8), ganita_mat_new(3, 3)), (0 - 2),
+  "svd_compute: a 2x3 A returns ganita's -2 (not an HsbError)");
+assert_eq(svd_compute(0, ganita_mat_new(3, 3), alloc(3 * 8), ganita_mat_new(3, 3)), (0 - 2),
+  "svd_compute: A = 0 returns ganita's -2");
+# ...refused BEFORE the temporaries: full_vt is cols x cols, and 6000^2 is over
+# ganita's 33,554,430-element cap, so 3.3.2 got a 0 back and read through it.
+# [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+var g2a_wide = ganita_mat_new(1, 6000);
+ganita_mat_set(g2a_wide, 0, 0, F64_ONE);
+var _g2a6t, _g2a6v = svd_truncated(g2a_wide, 1, ganita_mat_new(1, 1), alloc(8), ganita_mat_new(1, 6000));
+assert_eq(is_err_result(_g2a6t), 1, "svd_truncated: 1x6000 -> Err (was exit 139)");
+assert_eq(_g2a6v, HSB_ERR_INVALID_INPUT, "svd_truncated: 1x6000 -> HSB_ERR_INVALID_INPUT");
+
+# OUT-PARAMS TOO SMALL FOR THE COPY LOOPS, one dimension at a time, each with a
+# guard block behind it. diag(2,3,4) with k = 2 writes 3x2 into out_U and 2x3
+# into out_Vt through ganita_mat_set, which takes its stride from the out-param.
+var g2a_u31 = ganita_mat_new(3, 1);
+var g2a_c1 = _ab_canary_new(4);
+var _g2a7t, _g2a7v = svd_truncated(ab_A33, 2, g2a_u31, alloc(16), ganita_mat_new(2, 3));
+assert_eq(_g2a7v, HSB_ERR_INVALID_INPUT, "svd_truncated: out_U 3x1 for k = 2 -> HSB_ERR_INVALID_INPUT");
+assert_eq(_ab_clob(g2a_c1, 4), 0, "svd_truncated: out_U 3x1 (one column short) -- guard intact");
+var g2a_u22 = ganita_mat_new(2, 2);
+var g2a_c2 = _ab_canary_new(4);
+var _g2a8t, _g2a8v = svd_truncated(ab_A33, 2, g2a_u22, alloc(16), ganita_mat_new(2, 3));
+assert_eq(_g2a8v, HSB_ERR_INVALID_INPUT, "svd_truncated: out_U 2x2 for m = 3 -> HSB_ERR_INVALID_INPUT");
+assert_eq(_ab_clob(g2a_c2, 4), 0, "svd_truncated: out_U 2x2 (one row short) -- guard intact");
+var g2a_v13 = ganita_mat_new(1, 3);
+var g2a_c3 = _ab_canary_new(4);
+var _g2a9t, _g2a9v = svd_truncated(ab_A33, 2, ganita_mat_new(3, 2), alloc(16), g2a_v13);
+assert_eq(_g2a9v, HSB_ERR_INVALID_INPUT, "svd_truncated: out_Vt 1x3 for k = 2 -> HSB_ERR_INVALID_INPUT");
+assert_eq(_ab_clob(g2a_c3, 4), 0, "svd_truncated: out_Vt 1x3 (one row short) -- guard intact");
+var g2a_v22 = ganita_mat_new(2, 2);
+var g2a_c4 = _ab_canary_new(4);
+var _g2a10t, _g2a10v = svd_truncated(ab_A33, 2, ganita_mat_new(3, 2), alloc(16), g2a_v22);
+assert_eq(_g2a10v, HSB_ERR_INVALID_INPUT, "svd_truncated: out_Vt 2x2 for n = 3 -> HSB_ERR_INVALID_INPUT");
+assert_eq(_ab_clob(g2a_c4, 4), 0, "svd_truncated: out_Vt 2x2 (one column short) -- guard intact");
+# ...and the EXACT sizes are still accepted: the guards are `<`, not `<=`.
+var g2a_U = ganita_mat_new(3, 2);
+var g2a_Vt = ganita_mat_new(2, 3);
+var g2a_S2 = alloc(2 * 8);
+var _g2a11t, _g2a11v = svd_truncated(ab_A33, 2, g2a_U, g2a_S2, g2a_Vt);
+assert_eq(is_ok(_g2a11t), 1, "svd_truncated: out_U 3x2 / out_Vt 2x3 for k = 2 is exactly enough");
+assert_eq(load64(g2a_S2), f64_from(4), "svd_truncated: diag(2,3,4) k = 2 -> s0 = 4");
+assert_eq(load64(g2a_S2 + 8), f64_from(3), "svd_truncated: diag(2,3,4) k = 2 -> s1 = 3");
+assert_eq(ganita_mat_get(g2a_U, 2, 0), F64_ONE, "svd_truncated: diag(2,3,4) U[2][0] = 1");
+assert_eq(ganita_mat_get(g2a_Vt, 1, 1), F64_ONE, "svd_truncated: diag(2,3,4) Vt[1][1] = 1");
+
+# A NON-FINITE ENTRY. ganita's scale is an ordered max that drops NaN, so 3.3.2
+# returned Ok(0) for these -- for an all-NaN A, with every singular value 0.
+# [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+var g2a_nf = ganita_mat_new(3, 3);
+ganita_mat_set(g2a_nf, 0, 0, F64_TWO);
+ganita_mat_set(g2a_nf, 1, 1, _AB_NAN);
+ganita_mat_set(g2a_nf, 2, 2, f64_from(4));
+var g2a_Snf = alloc(3 * 8);
+store64(g2a_Snf, _AB_SEVEN);
+var _g2a12t, _g2a12v = svd_truncated(g2a_nf, 1, ganita_mat_new(3, 1), g2a_Snf, ganita_mat_new(1, 3));
+assert_eq(is_err_result(_g2a12t), 1, "svd_truncated: NaN entry -> Err (was Ok(0))");
+assert_eq(_g2a12v, HSB_ERR_INVALID_INPUT, "svd_truncated: NaN entry -> HSB_ERR_INVALID_INPUT");
+assert_eq(load64(g2a_Snf), _AB_SEVEN, "svd_truncated: NaN entry leaves out_S untouched");
+ganita_mat_set(g2a_nf, 1, 1, _AB_PINF);
+var _g2a13t, _g2a13v = svd_truncated(g2a_nf, 1, ganita_mat_new(3, 1), g2a_Snf, ganita_mat_new(1, 3));
+assert_eq(_g2a13v, HSB_ERR_INVALID_INPUT, "svd_truncated: +Inf entry -> HSB_ERR_INVALID_INPUT (was Ok(0))");
+ganita_mat_set(g2a_nf, 1, 1, _AB_NINF);
+var _g2a14t, _g2a14v = svd_truncated(g2a_nf, 1, ganita_mat_new(3, 1), g2a_Snf, ganita_mat_new(1, 3));
+assert_eq(_g2a14v, HSB_ERR_INVALID_INPUT, "svd_truncated: -Inf entry -> HSB_ERR_INVALID_INPUT (was Ok(0))");
+# The scan covers the whole matrix, last entry included.
+ganita_mat_set(g2a_nf, 1, 1, f64_from(3));
+ganita_mat_set(g2a_nf, 2, 2, _AB_NAN);
+var _g2a15t, _g2a15v = svd_truncated(g2a_nf, 1, ganita_mat_new(3, 1), g2a_Snf, ganita_mat_new(1, 3));
+assert_eq(_g2a15v, HSB_ERR_INVALID_INPUT, "svd_truncated: NaN in the LAST entry -> HSB_ERR_INVALID_INPUT");
+
+# ganita's -1 BECOMES Err(HSB_ERR_NO_CONVERGENCE). The one input known to reach
+# it is a ganita defect: for A = [[1,t],[t,t],[t,-t]] its Jacobi parameter zeta is
+# about -1/(2t), zeta^2 overflows for t <= 2^-513, the rotation degenerates to
+# the identity and the sweep never ends. Of the scales t = 2^-1 .. 2^-1074, 562
+# fail -- every one from 2^-513 down -- and 2^-512 is the last that decomposes.
+# [measured: G2a scale scan of ganita_mat_svd on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+# ⚠ WHEN THE svd_compute ASSERTION BELOW FAILS, ganita has repaired the overflow:
+# find another input that returns -1, or retire the pair.
+var g2a_t513 = (1023 - 513) << 52;
+var g2a_J = ganita_mat_new(3, 2);
+ganita_mat_set(g2a_J, 0, 0, F64_ONE);   ganita_mat_set(g2a_J, 0, 1, g2a_t513);
+ganita_mat_set(g2a_J, 1, 0, g2a_t513);  ganita_mat_set(g2a_J, 1, 1, g2a_t513);
+ganita_mat_set(g2a_J, 2, 0, g2a_t513);  ganita_mat_set(g2a_J, 2, 1, f64_neg(g2a_t513));
+assert_eq(svd_compute(g2a_J, ganita_mat_new(3, 2), alloc(16), ganita_mat_new(2, 2)), (0 - 1),
+  "svd_compute: ganita returns -1 at t = 2^-513 (its zeta^2 overflow; see above)");
+var g2a_SJ = alloc(8);
+store64(g2a_SJ, _AB_SEVEN);
+var _g2a16t, _g2a16v = svd_truncated(g2a_J, 1, ganita_mat_new(3, 1), g2a_SJ, ganita_mat_new(1, 2));
+assert_eq(is_err_result(_g2a16t), 1, "svd_truncated: ganita -1 -> Err (was Ok(0))");
+assert_eq(_g2a16v, HSB_ERR_NO_CONVERGENCE, "svd_truncated: ganita -1 -> HSB_ERR_NO_CONVERGENCE");
+assert_eq(load64(g2a_SJ), _AB_SEVEN, "svd_truncated: ganita -1 leaves out_S untouched (3.3.2 wrote 0)");
+# One binade up the same matrix decomposes, through both wrappers.
+var g2a_t512 = (1023 - 512) << 52;
+ganita_mat_set(g2a_J, 0, 1, g2a_t512);  ganita_mat_set(g2a_J, 1, 0, g2a_t512);
+ganita_mat_set(g2a_J, 1, 1, g2a_t512);  ganita_mat_set(g2a_J, 2, 0, g2a_t512);
+ganita_mat_set(g2a_J, 2, 1, f64_neg(g2a_t512));
+assert_eq(svd_compute(g2a_J, ganita_mat_new(3, 2), alloc(16), ganita_mat_new(2, 2)), 0,
+  "svd_compute: the same matrix at t = 2^-512 decomposes");
+var _g2a17t, _g2a17v = svd_truncated(g2a_J, 1, ganita_mat_new(3, 1), g2a_SJ, ganita_mat_new(1, 2));
+assert_eq(is_ok(_g2a17t), 1, "svd_truncated: the same matrix at t = 2^-512 decomposes");
+
+# === 3.3.3 W3: svd_compute refuses a non-finite A ===
+# ⛔ 3.3.3 — ganita answers for a NaN or infinite entry and svd_compute passed the
+# answer on as success: on 3.3.2 an all-NaN 2x2 returned 0 with S = (0, 0),
+# [[3, NaN], [0, 2]] 0 with S = (3, NaN), [[-Inf, 0], [0, 2]] and [[+Inf, 0], [0, 2]]
+# 0 with S = (NaN, NaN), and a 3x2 whose LAST entry is NaN 0 with S = (1, NaN). Each
+# is now ganita's own -2, with out_S, out_U and out_Vt left exactly as they were.
+# [measured: scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+var _w3_svd_kept = 0;
+# svd_compute on A (rows x cols) into out-params stamped with 7.0; returns its status
+# and sets _w3_svd_kept to 1 when every stamp survived.
+fn _w3_svdc(A, rows, cols) {
+    var U = ganita_mat_new(rows, cols);
+    var Vt = ganita_mat_new(cols, cols);
+    var S = alloc(cols * 8);
+    _ab_fill7(S, cols);
+    ganita_mat_set(U, 0, 0, _AB_SEVEN);
+    ganita_mat_set(Vt, 0, 0, _AB_SEVEN);
+    var rc = svd_compute(A, U, S, Vt);
+    _w3_svd_kept = 0;
+    if (_ab_count7(S, cols) == cols) {
+        if (ganita_mat_get(U, 0, 0) == _AB_SEVEN && ganita_mat_get(Vt, 0, 0) == _AB_SEVEN) { _w3_svd_kept = 1; }
+    }
+    return rc;
+}
+fn _w3_m22(a, b, c, d) {
+    var M = ganita_mat_new(2, 2);
+    ganita_mat_set(M, 0, 0, a);  ganita_mat_set(M, 0, 1, b);
+    ganita_mat_set(M, 1, 0, c);  ganita_mat_set(M, 1, 1, d);
+    return M;
+}
+assert_eq(_w3_svdc(_w3_m22(_AB_NAN, _AB_NAN, _AB_NAN, _AB_NAN), 2, 2), (0 - 2),
+  "svd_compute: all-NaN 2x2 -> -2 (3.3.2: 0 with S = (0, 0))");
+assert_eq(_w3_svd_kept, 1, "svd_compute: all-NaN 2x2 leaves out_S, out_U, out_Vt untouched");
+assert_eq(_w3_svdc(_w3_m22(f64_from(3), _AB_NAN, 0, F64_TWO), 2, 2), (0 - 2),
+  "svd_compute: [[3, NaN], [0, 2]] -> -2 (3.3.2: 0 with S = (3, NaN))");
+assert_eq(_w3_svd_kept, 1, "svd_compute: [[3, NaN], [0, 2]] leaves the out-params untouched");
+assert_eq(_w3_svdc(_w3_m22(_AB_NINF, 0, 0, F64_TWO), 2, 2), (0 - 2),
+  "svd_compute: [[-Inf, 0], [0, 2]] -> -2 (3.3.2: 0 with S = (NaN, NaN))");
+assert_eq(_w3_svd_kept, 1, "svd_compute: [[-Inf, 0], [0, 2]] leaves the out-params untouched");
+assert_eq(_w3_svdc(_w3_m22(_AB_PINF, 0, 0, F64_TWO), 2, 2), (0 - 2),
+  "svd_compute: [[+Inf, 0], [0, 2]] -> -2 (3.3.2: 0 with S = (NaN, NaN))");
+assert_eq(_w3_svd_kept, 1, "svd_compute: [[+Inf, 0], [0, 2]] leaves the out-params untouched");
+# The scan reaches the last row AND the last column.
+var _w3_T = ganita_mat_new(3, 2);
+ganita_mat_set(_w3_T, 0, 0, F64_ONE);  ganita_mat_set(_w3_T, 1, 1, F64_TWO);
+ganita_mat_set(_w3_T, 2, 1, _AB_NAN);
+assert_eq(_w3_svdc(_w3_T, 3, 2), (0 - 2), "svd_compute: 3x2 with NaN at [2][1] -> -2 (3.3.2: 0, S = (1, NaN))");
+assert_eq(_w3_svd_kept, 1, "svd_compute: 3x2 with NaN at [2][1] leaves the out-params untouched");
+# ganita's own -2 writes nothing either, as svd_compute's doc now says of every -2.
+assert_eq(_w3_svdc(g2a_W, 2, 3), (0 - 2), "svd_compute: finite 2x3 (wide) -> ganita's -2");
+assert_eq(_w3_svd_kept, 1, "svd_compute: finite 2x3 (wide) leaves the out-params untouched");
+# The finite control: diag(3, 2) still decomposes, values bit-exact.
+var _w3_Sc = alloc(16);
+assert_eq(svd_compute(_w3_m22(f64_from(3), 0, 0, F64_TWO), ganita_mat_new(2, 2), _w3_Sc, ganita_mat_new(2, 2)), 0,
+  "svd_compute: diag(3, 2) -> 0 (control)");
+assert_eq(load64(_w3_Sc), f64_from(3), "svd_compute: diag(3, 2) -> S0 = 3");
+assert_eq(load64(_w3_Sc + 8), F64_TWO, "svd_compute: diag(3, 2) -> S1 = 2");
 
 # ode_bdf selects a coefficient row by `order`; a wild order is a table overrun.
 var ab_hist = vec_new();
@@ -886,6 +1156,275 @@ var _rq44t, _rq44v = svd_golub_kahan(mat_new_guarded(1000000, 1000000), ab_U34, 
 assert_eq(is_err_result(_rq44t), 1, "svd_golub_kahan: capped mat_new_guarded 0 flows through");
 assert_eq(_rq44v, HSB_ERR_INVALID_INPUT, "svd_golub_kahan: capped mat_new_guarded 0 flows through");
 
+# === 3.3.3 W3: two finite matrices balanced to the overflow line stay an error ===
+# An earlier 3.3.3 note used these two fixtures to argue that the NaN-true reflector
+# gates keep an overflow loud: on 3.3.2 (whose balance lifts h = 1.5 * 2^1000 to
+# 1.5 * 2^1023) both return NO_CONVERGENCE through a NaN reflector, and spelled
+# NaN-false each gate returned Ok with a made-up answer. The argument did not
+# generalise -- the R4lp block below holds six finite inputs that 3.3.2 answered
+# rc = OK with NaN or invented values. Since 3.3.3 a column or reflector norm that
+# is not finite returns NO_CONVERGENCE before any gate reads it, so both still
+# return NO_CONVERGENCE, from that check now, with the out array untouched. The
+# true values are S = (sqrt(2) h, u / sqrt(2)) and eigenvalues +-sqrt(2) h and 0;
+# the balance keeps 3.3.2's exit, so the routine refuses rather than answers.
+# [measured: scratch probes on 3.3.2 and this tree, not reproducible in-tree, 2026-10-01]
+var _w3_hh = 0x7E78000000000000;   # 1.5 * 2^1000
+var _w3_hA = ganita_mat_new(2, 2);
+ganita_mat_set(_w3_hA, 0, 0, _w3_hh);
+ganita_mat_set(_w3_hA, 0, 1, 0);
+ganita_mat_set(_w3_hA, 1, 0, _w3_hh);
+ganita_mat_set(_w3_hA, 1, 1, 1);    # 2^-1074
+var _w3_hS = alloc(16);
+store64(_w3_hS, 0x7777);
+store64(_w3_hS + 8, 0x7777);
+var _w3_h1t, _w3_h1v = svd_golub_kahan(_w3_hA, ganita_mat_new(2, 2), _w3_hS, ganita_mat_new(2, 2));
+assert_eq(is_err_result(_w3_h1t), 1, "svd_golub_kahan [[h,0],[h,2^-1074]]: refused, as on 3.3.2");
+assert_eq(_w3_h1v, HSB_ERR_NO_CONVERGENCE, "svd_golub_kahan [[h,0],[h,2^-1074]]: NO_CONVERGENCE, as on 3.3.2");
+assert_eq(load64(_w3_hS), 0x7777, "svd_golub_kahan [[h,0],[h,2^-1074]]: out_S left untouched");
+var _w3_hE = ganita_mat_new(3, 3);
+for (var _w3_k = 0; _w3_k < 9; _w3_k = _w3_k + 1) { ganita_mat_set(_w3_hE, _w3_k / 3, _w3_k % 3, 0); }
+ganita_mat_set(_w3_hE, 0, 0, 1);    # 2^-1074
+ganita_mat_set(_w3_hE, 0, 1, _w3_hh);  ganita_mat_set(_w3_hE, 0, 2, _w3_hh);
+ganita_mat_set(_w3_hE, 1, 0, _w3_hh);  ganita_mat_set(_w3_hE, 2, 0, _w3_hh);
+var _w3_hev = alloc(24);
+store64(_w3_hev, 0x7777);
+var _w3_h2t, _w3_h2v = eigen_qr(_w3_hE, 3, 200, _w3_hev, ganita_mat_new(3, 3));
+assert_eq(is_err_result(_w3_h2t), 1, "eigen_qr [[2^-1074,h,h],[h,0,0],[h,0,0]]: refused, as on 3.3.2");
+assert_eq(_w3_h2v, HSB_ERR_NO_CONVERGENCE, "eigen_qr [[2^-1074,h,h],[h,0,0],[h,0,0]]: NO_CONVERGENCE, as on 3.3.2");
+assert_eq(load64(_w3_hev), 0x7777, "eigen_qr [[2^-1074,h,h],[h,0,0],[h,0,0]]: out_vals left untouched");
+
+# === 3.3.3 R4lp: wide-span svd_golub_kahan / eigen_qr ===
+# (1) THE REPROS. The svd / eigen balance (2.22.1's exit, growth 1, kept: see
+# `_lp_balance_scale`) puts the largest entry anywhere in [2^1023, 2^1024), and on
+# 3.3.2 these finite inputs returned rc = OK with NaN or invented values
+# (h = 1.5 * 2^1000, u = 2^-1074): svd [h; h; u] -> NaN, [0; h; u] -> 0,
+# [[0, u], [h, 0]] -> (u, 0), [[u, 0], [0, -h], [0, 0]] -> (u, NaN); eigen_qr
+# [[u, h], [h, 0]] -> (0, 0), [[0, 0, h], [0, u, 0], [h, 0, 0]] -> (u, 0, 0). Their
+# true values are sqrt(2) h; h; (h, u); (h, u); +-h; and +-h, u. Since 3.3.3 each
+# returns NO_CONVERGENCE with the out array untouched: the overflow is caught where
+# it happens rather than answered through. (An earlier round of 3.3.3 answered them
+# with balance headroom and lifted rotations; both were withdrawn because they moved
+# results 3.3.2 got right -- see `_lp_balance_scale`.) With the reflector-norm check
+# removed [0; h; u] and [[0, u], [h, 0]] come back rc = OK with 3.3.2's values, with
+# the tridiagonal one removed [[0, 0, h], ...] does, and with the tridiagonal-QR
+# radius check removed [[u, h], [h, 0]] does.
+# [measured: scratch probes on 3.3.2, this tree and check-removed builds, not reproducible in-tree, 2026-10-01]
+var _r4lp_h = 0x7E78000000000000;    # 1.5 * 2^1000
+fn _r4lp_m(r, c) {
+    var A = ganita_mat_new(r, c);
+    for (var i = 0; i < r * c; i = i + 1) { ganita_mat_set(A, i / c, i % c, 0); }
+    return A;
+}
+# rc of svd_golub_kahan(A) into U, S, Vt (HSB_ERR_NONE on success)
+fn _r4lp_svd(A, U, S, Vt) {
+    var rt, rv = svd_golub_kahan(A, U, S, Vt);
+    if (rt != 0) { return rv; }
+    return HSB_ERR_NONE;
+}
+fn _r4lp_eig(A, n, E, V) {
+    var rt, rv = eigen_qr(A, n, 30 * n * n + 100, E, V);
+    if (rt != 0) { return rv; }
+    return HSB_ERR_NONE;
+}
+# The out arrays are refilled with the 0x7777 sentinel before every call, so each
+# "left untouched" assert reads only its own call (a refusal writes nothing).
+fn _r4lp_reset(p, k) {
+    for (var i = 0; i < k; i = i + 1) { store64(p + i * 8, 0x7777); }
+    return 0;
+}
+# 1 when the first k words at p still hold the 0x7777 sentinel
+fn _r4lp_kept(p, k) {
+    for (var i = 0; i < k; i = i + 1) {
+        if (load64(p + i * 8) != 0x7777) { return 0; }
+    }
+    return 1;
+}
+var _r4lp_S = alloc(8 * 8);
+var _r4lp_A = _r4lp_m(3, 1);
+ganita_mat_set(_r4lp_A, 0, 0, _r4lp_h); ganita_mat_set(_r4lp_A, 1, 0, _r4lp_h); ganita_mat_set(_r4lp_A, 2, 0, 1);
+_r4lp_reset(_r4lp_S, 8);
+assert_eq(_r4lp_svd(_r4lp_A, _r4lp_m(3, 1), _r4lp_S, _r4lp_m(1, 1)), HSB_ERR_NO_CONVERGENCE,
+  "svd [h; h; u]: NO_CONVERGENCE (3.3.2: rc = OK, S = NaN; true S = sqrt(2) h)");
+assert_eq(_r4lp_kept(_r4lp_S, 1), 1, "svd [h; h; u]: out_S left untouched");
+_r4lp_A = _r4lp_m(3, 1);
+ganita_mat_set(_r4lp_A, 1, 0, _r4lp_h); ganita_mat_set(_r4lp_A, 2, 0, 1);
+_r4lp_reset(_r4lp_S, 8);
+assert_eq(_r4lp_svd(_r4lp_A, _r4lp_m(3, 1), _r4lp_S, _r4lp_m(1, 1)), HSB_ERR_NO_CONVERGENCE,
+  "svd [0; h; u]: NO_CONVERGENCE (3.3.2: rc = OK, S = 0; true S = h)");
+assert_eq(_r4lp_kept(_r4lp_S, 1), 1, "svd [0; h; u]: out_S left untouched");
+_r4lp_A = _r4lp_m(2, 2);
+ganita_mat_set(_r4lp_A, 0, 1, 1); ganita_mat_set(_r4lp_A, 1, 0, _r4lp_h);
+_r4lp_reset(_r4lp_S, 8);
+assert_eq(_r4lp_svd(_r4lp_A, _r4lp_m(2, 2), _r4lp_S, _r4lp_m(2, 2)), HSB_ERR_NO_CONVERGENCE,
+  "svd [[0,u],[h,0]]: NO_CONVERGENCE (3.3.2: rc = OK, S = (u, 0); true (h, u))");
+assert_eq(_r4lp_kept(_r4lp_S, 2), 1, "svd [[0,u],[h,0]]: out_S left untouched");
+_r4lp_A = _r4lp_m(3, 2);
+ganita_mat_set(_r4lp_A, 0, 0, 1); ganita_mat_set(_r4lp_A, 1, 1, f64_neg(_r4lp_h));
+_r4lp_reset(_r4lp_S, 8);
+assert_eq(_r4lp_svd(_r4lp_A, _r4lp_m(3, 2), _r4lp_S, _r4lp_m(2, 2)), HSB_ERR_NO_CONVERGENCE,
+  "svd [[u,0],[0,-h],[0,0]]: NO_CONVERGENCE (3.3.2: rc = OK, S = (u, NaN); true (h, u))");
+assert_eq(_r4lp_kept(_r4lp_S, 2), 1, "svd [[u,0],[0,-h],[0,0]]: out_S left untouched");
+_r4lp_A = _r4lp_m(2, 2);
+ganita_mat_set(_r4lp_A, 0, 0, 1); ganita_mat_set(_r4lp_A, 0, 1, _r4lp_h); ganita_mat_set(_r4lp_A, 1, 0, _r4lp_h);
+_r4lp_reset(_r4lp_S, 8);
+assert_eq(_r4lp_eig(_r4lp_A, 2, _r4lp_S, _r4lp_m(2, 2)), HSB_ERR_NO_CONVERGENCE,
+  "eigen_qr [[u,h],[h,0]]: NO_CONVERGENCE (3.3.2: rc = OK, (0, 0); true +-h)");
+assert_eq(_r4lp_kept(_r4lp_S, 2), 1, "eigen_qr [[u,h],[h,0]]: out_vals left untouched");
+_r4lp_A = _r4lp_m(3, 3);
+ganita_mat_set(_r4lp_A, 0, 2, _r4lp_h); ganita_mat_set(_r4lp_A, 1, 1, 1); ganita_mat_set(_r4lp_A, 2, 0, _r4lp_h);
+_r4lp_reset(_r4lp_S, 8);
+assert_eq(_r4lp_eig(_r4lp_A, 3, _r4lp_S, _r4lp_m(3, 3)), HSB_ERR_NO_CONVERGENCE,
+  "eigen_qr [[0,0,h],[0,u,0],[h,0,0]]: NO_CONVERGENCE (3.3.2: rc = OK, (u, 0, 0); true +-h, u)");
+assert_eq(_r4lp_kept(_r4lp_S, 3), 1, "eigen_qr [[0,0,h],[0,u,0],[h,0,0]]: out_vals left untouched");
+
+# (2) A VALUE ABOVE DBL_MAX IS A FAILURE. With g = 1.48 * 2^1023, [g; g] has
+# sigma = sqrt(2) g and [[g, g], [g, g]] has eigenvalues 2 g and 0, both above
+# DBL_MAX; 3.3.2 returned rc = OK with +Inf for each. They return NO_CONVERGENCE
+# now with the out-array untouched; the controls at g' = 1.2 * 2^1022 are finite
+# (sqrt(2) g' correctly rounded; 2 g' less 1 ulp).
+# [measured: scratch probes on 3.3.2 and this tree, not reproducible in-tree, 2026-10-01]
+var _r4lp_g = 0x7FE7AE147AE147AE;
+var _r4lp_g2 = 0x7FD3333333333333;
+store64(_r4lp_S, 0x7777);
+_r4lp_A = _r4lp_m(2, 1);
+ganita_mat_set(_r4lp_A, 0, 0, _r4lp_g); ganita_mat_set(_r4lp_A, 1, 0, _r4lp_g);
+assert_eq(_r4lp_svd(_r4lp_A, _r4lp_m(2, 1), _r4lp_S, _r4lp_m(1, 1)), HSB_ERR_NO_CONVERGENCE,
+  "svd [g; g]: sigma above DBL_MAX -> NO_CONVERGENCE (3.3.2: OK, S = +Inf)");
+assert_eq(load64(_r4lp_S), 0x7777, "svd [g; g]: out_S is left untouched");
+ganita_mat_set(_r4lp_A, 0, 0, _r4lp_g2); ganita_mat_set(_r4lp_A, 1, 0, _r4lp_g2);
+assert_eq(_r4lp_svd(_r4lp_A, _r4lp_m(2, 1), _r4lp_S, _r4lp_m(1, 1)), HSB_ERR_NONE, "svd [g'; g'] (control): success");
+assert_eq(load64(_r4lp_S), 0x7FDB27247AFF148F, "svd [g'; g'] (control): S = sqrt(2) g', correctly rounded");
+store64(_r4lp_S, 0x7777);
+store64(_r4lp_S + 8, 0x7777);
+_r4lp_A = _r4lp_m(2, 2);
+ganita_mat_set(_r4lp_A, 0, 0, _r4lp_g); ganita_mat_set(_r4lp_A, 0, 1, _r4lp_g);
+ganita_mat_set(_r4lp_A, 1, 0, _r4lp_g); ganita_mat_set(_r4lp_A, 1, 1, _r4lp_g);
+assert_eq(_r4lp_eig(_r4lp_A, 2, _r4lp_S, _r4lp_m(2, 2)), HSB_ERR_NO_CONVERGENCE,
+  "eigen_qr [[g,g],[g,g]]: eigenvalue 2 g above DBL_MAX -> NO_CONVERGENCE (3.3.2: OK, +Inf)");
+assert_eq(load64(_r4lp_S), 0x7777, "eigen_qr [[g,g],[g,g]]: out_vals is left untouched");
+ganita_mat_set(_r4lp_A, 0, 0, _r4lp_g2); ganita_mat_set(_r4lp_A, 0, 1, _r4lp_g2);
+ganita_mat_set(_r4lp_A, 1, 0, _r4lp_g2); ganita_mat_set(_r4lp_A, 1, 1, _r4lp_g2);
+assert_eq(_r4lp_eig(_r4lp_A, 2, _r4lp_S, _r4lp_m(2, 2)), HSB_ERR_NONE, "eigen_qr [[g',g'],[g',g']] (control): success");
+assert_eq(load64(_r4lp_S), 0x7FE3333333333332, "eigen_qr [[g',g'],[g',g']] (control): lambda0 = 2 g' less 1 ulp");
+
+# (3) THE GUARDS, AT THE INPUT WHERE EACH FIRES. Through the public entry a later
+# check covers several of these (on three span probes, removing the column-norm,
+# split-radius, split-propagation or bidiagonal-QR left-radius check alone moves no
+# row), so each is called directly, with g = 1.48 * 2^1023 unbalanced. Without its
+# check each of these returns Ok and a made-up result: [0; g] and the right
+# reflector's [[0, 0, g], ...] skip their reflector (v / Inf = 0) and drop g; a NaN
+# in the column or row being reflected fails the `> 0` gate and is dropped; each
+# split arm rotates by cs = sn = 0 and reports a split, zeroing U or Vt; the
+# bidiagonal QR without the split's -1 deflates d = (0, -g); its left rotation
+# stores +Inf in diag and zeroes U; the tridiagonal QR's +Inf radius writes zeros;
+# and the deflation sum |a| + |b| = +Inf calls every off-diagonal negligible.
+# [measured: scratch builds with each check removed, not reproducible in-tree, 2026-10-01]
+var _r4lp_nan = f64_div(f64_from(0), f64_from(0));
+fn _r4lp_bid(A, m, n) {
+    var rt, rv = _lp_bidiagonalize(A, m, n, _lp_vec_new(n), _lp_vec_new(n), ganita_mat_new(m, n), ganita_mat_new(n, n));
+    if (rt != 0) { return rv; }
+    return HSB_ERR_NONE;
+}
+fn _r4lp_tri(A, n) {
+    var rt, rv = _lp_tridiagonalize(A, n, _lp_vec_new(n), _lp_vec_new(n), ganita_mat_new(n, n));
+    if (rt != 0) { return rv; }
+    return HSB_ERR_NONE;
+}
+fn _r4lp_eye(n) {
+    var M = _r4lp_m(n, n);
+    for (var i = 0; i < n; i = i + 1) { ganita_mat_set(M, i, i, F64_ONE); }
+    return M;
+}
+_r4lp_A = _r4lp_m(2, 1);
+ganita_mat_set(_r4lp_A, 1, 0, _r4lp_g);
+assert_eq(_r4lp_bid(_r4lp_A, 2, 1), HSB_ERR_NO_CONVERGENCE, "_lp_bidiagonalize [0; g]: nv_l = +Inf -> NO_CONVERGENCE");
+_r4lp_A = _r4lp_m(2, 1);
+ganita_mat_set(_r4lp_A, 0, 0, F64_ONE); ganita_mat_set(_r4lp_A, 1, 0, _r4lp_nan);
+assert_eq(_r4lp_bid(_r4lp_A, 2, 1), HSB_ERR_NO_CONVERGENCE,
+  "_lp_bidiagonalize [1; NaN]: norm_l = NaN -> NO_CONVERGENCE");
+_r4lp_A = _r4lp_m(3, 3);
+ganita_mat_set(_r4lp_A, 0, 2, _r4lp_g); ganita_mat_set(_r4lp_A, 1, 1, F64_ONE); ganita_mat_set(_r4lp_A, 2, 2, F64_ONE);
+assert_eq(_r4lp_bid(_r4lp_A, 3, 3), HSB_ERR_NO_CONVERGENCE,
+  "_lp_bidiagonalize [[0,0,g],[0,1,0],[0,0,1]]: nv_r = +Inf -> NO_CONVERGENCE");
+_r4lp_A = _r4lp_m(3, 3);
+ganita_mat_set(_r4lp_A, 0, 1, F64_ONE); ganita_mat_set(_r4lp_A, 0, 2, _r4lp_nan);
+ganita_mat_set(_r4lp_A, 1, 1, F64_ONE); ganita_mat_set(_r4lp_A, 2, 2, F64_ONE);
+assert_eq(_r4lp_bid(_r4lp_A, 3, 3), HSB_ERR_NO_CONVERGENCE,
+  "_lp_bidiagonalize [[0,1,NaN],[0,1,0],[0,0,1]]: norm_r = NaN -> NO_CONVERGENCE");
+_r4lp_A = _r4lp_m(3, 3);
+ganita_mat_set(_r4lp_A, 0, 2, _r4lp_g); ganita_mat_set(_r4lp_A, 2, 0, _r4lp_g);
+assert_eq(_r4lp_tri(_r4lp_A, 3), HSB_ERR_NO_CONVERGENCE,
+  "_lp_tridiagonalize [[0,0,g],[0,0,0],[g,0,0]]: nv_t = +Inf -> NO_CONVERGENCE");
+_r4lp_A = _r4lp_m(3, 3);
+ganita_mat_set(_r4lp_A, 0, 1, F64_ONE); ganita_mat_set(_r4lp_A, 0, 2, _r4lp_nan);
+ganita_mat_set(_r4lp_A, 1, 0, F64_ONE); ganita_mat_set(_r4lp_A, 2, 0, _r4lp_nan);
+assert_eq(_r4lp_tri(_r4lp_A, 3), HSB_ERR_NO_CONVERGENCE,
+  "_lp_tridiagonalize [[0,1,NaN],[1,0,0],[NaN,0,0]]: norm = NaN -> NO_CONVERGENCE");
+var _r4lp_d = _lp_vec_new(2);
+var _r4lp_f = _lp_vec_new(2);
+store64(_r4lp_d + 8, _r4lp_g); store64(_r4lp_f, _r4lp_g);
+assert_eq(_lp_split_zero_diag(_r4lp_d, _r4lp_f, 2, 2, _r4lp_eye(2), _r4lp_eye(2), 0, 1), 0 - 1,
+  "_lp_split_zero_diag d = (0, g), f = g: radius +Inf -> -1 (unchecked: a split, U zeroed)");
+_r4lp_d = _lp_vec_new(2);
+_r4lp_f = _lp_vec_new(2);
+store64(_r4lp_d, _r4lp_g); store64(_r4lp_f, _r4lp_g);
+assert_eq(_lp_split_zero_diag(_r4lp_d, _r4lp_f, 2, 2, _r4lp_eye(2), _r4lp_eye(2), 0, 1), 0 - 1,
+  "_lp_split_zero_diag d = (g, 0), f = g: radius +Inf -> -1 (unchecked: a split, Vt zeroed)");
+_r4lp_d = _lp_vec_new(2);
+_r4lp_f = _lp_vec_new(2);
+store64(_r4lp_d + 8, _r4lp_g); store64(_r4lp_f, _r4lp_g);
+var _r4lp_q1t, _r4lp_q1v = _lp_bidiag_qr(_r4lp_d, _r4lp_f, 2, 2, _r4lp_eye(2), _r4lp_eye(2), 120);
+assert_eq(_r4lp_q1v, HSB_ERR_NO_CONVERGENCE, "_lp_bidiag_qr d = (0, g), f = g: the split's -1 -> NO_CONVERGENCE");
+_r4lp_d = _lp_vec_new(3);
+_r4lp_f = _lp_vec_new(3);
+store64(_r4lp_d, 0x7FB849D7A22F547A); store64(_r4lp_d + 8, 0x7FEEB7D555532ECE);
+store64(_r4lp_d + 16, 0xFFD37774F28E314F);
+store64(_r4lp_f, 0x7FCBA2202BD6B111); store64(_r4lp_f + 8, 0xFFDC22299E523815);
+var _r4lp_q2t, _r4lp_q2v = _lp_bidiag_qr(_r4lp_d, _r4lp_f, 3, 3, _r4lp_eye(3), _r4lp_eye(3), 270);
+assert_eq(_r4lp_q2v, HSB_ERR_NO_CONVERGENCE,
+  "_lp_bidiag_qr near-DBL_MAX 3x3: the left rotation's +Inf radius -> NO_CONVERGENCE (unchecked: Ok, +Inf in diag)");
+_r4lp_d = _lp_vec_new(2);
+var _r4lp_e = _lp_vec_new(2);
+store64(_r4lp_e + 8, _r4lp_g);
+var _r4lp_q3t, _r4lp_q3v = _lp_tridiag_qr(_r4lp_d, _r4lp_e, 2, _r4lp_eye(2), 200);
+assert_eq(_r4lp_q3v, HSB_ERR_NO_CONVERGENCE,
+  "_lp_tridiag_qr [[0,g],[g,0]]: radius sqrt(2) g = +Inf -> NO_CONVERGENCE (unchecked: Ok, all zero)");
+assert_eq(_lp_negligible(0x7FD4A5E9F8C6A5E3, 0x7FE0E91D5A3C8F21, 0x7FE14593F0E7B2C9), 0,
+  "_lp_negligible(5.8e307 between 9.5e307 and 9.7e307): not negligible (the overflowed sum said it was)");
+assert_eq(_lp_negligible(0x7C94A5E9F8C6A5E3, 0x7FE0E91D5A3C8F21, 0x7FE14593F0E7B2C9), 1,
+  "_lp_negligible(1.29e292 beside the same pair): negligible, through the halved arm (control)");
+
+# === 3.3.3 R5lp: wide-span overflows the repros above do not reach ===
+# Two more finite inputs that 3.3.2 answered rc = OK and wrong, each reaching a check
+# no repro above reaches on its own; both return NO_CONVERGENCE now, out untouched.
+# eigen_qr on [[a, b], [b, c]] (a = 3.34e306, b = -3.79e306, c = 6.4e-313): true
+# eigenvalues 5.809e306 and -2.466e306, and with the deflation test's halved arm
+# removed (`_lp_negligible`) it comes back rc = OK with 3.3.2's 5.221e306 and
+# -1.878e306. svd_golub_kahan on a 3x3 whose largest entries sit near 2^1018 over a
+# 1.1e-314 entry: true S = (3.429e307, 1.874e307, 2.44e290), and with the right
+# reflector's nv_r check removed it comes back rc = OK with 3.3.2's
+# (3.080e307, 6.600e306, 0).
+# [measured: probes on 3.3.2, this tree and check-removed builds + 720-digit oracle, not reproducible in-tree]
+var _r5lp_S = alloc(3 * 8);
+var _r5lp_A = _r4lp_m(2, 2);
+ganita_mat_set(_r5lp_A, 0, 0, 0x7f930b4a3a128c15); ganita_mat_set(_r5lp_A, 0, 1, 0xff958f0d785fa894);
+ganita_mat_set(_r5lp_A, 1, 0, 0xff958f0d785fa894); ganita_mat_set(_r5lp_A, 1, 1, 0x0000001df7beef0c);
+_r4lp_reset(_r5lp_S, 3);
+assert_eq(_r4lp_eig(_r5lp_A, 2, _r5lp_S, _r4lp_m(2, 2)), HSB_ERR_NO_CONVERGENCE,
+  "eigen_qr [[a,b],[b,c]] across 2056 binades: NO_CONVERGENCE (3.3.2 and no halved arm: rc = OK, 10% off)");
+assert_eq(_r4lp_kept(_r5lp_S, 2), 1, "eigen_qr [[a,b],[b,c]] across 2056 binades: out_vals left untouched");
+_r5lp_A = _r4lp_m(3, 3);
+ganita_mat_set(_r5lp_A, 0, 0, 0x7f9b3297b1f44f8c); ganita_mat_set(_r5lp_A, 0, 1, 0x7fab3297b1f44f8c);
+ganita_mat_set(_r5lp_A, 0, 2, 0x7fb465f1c5773ba9);
+ganita_mat_set(_r5lp_A, 1, 0, 0xffa13f3c873dd8f5); ganita_mat_set(_r5lp_A, 1, 1, 0xffb13f3c873dd8f5);
+ganita_mat_set(_r5lp_A, 1, 2, 0xffb9dedacadcc56f);
+ganita_mat_set(_r5lp_A, 2, 0, 0x000000008961872f); ganita_mat_set(_r5lp_A, 2, 1, 0x7fc2c45c3e75e23d);
+ganita_mat_set(_r5lp_A, 2, 2, 0x80000003cd4535de);
+_r4lp_reset(_r5lp_S, 3);
+assert_eq(_r4lp_svd(_r5lp_A, _r4lp_m(3, 3), _r5lp_S, _r4lp_m(3, 3)), HSB_ERR_NO_CONVERGENCE,
+  "svd 3x3 across 2064 binades: NO_CONVERGENCE (3.3.2 and no nv_r check: rc = OK, S1 65% low)");
+assert_eq(_r4lp_kept(_r5lp_S, 3), 1, "svd 3x3 across 2064 binades: out_S left untouched");
+
 # eigen_qr validates the SAME four things svd_golub_kahan does (since 2.9.0); the
 # register entries below this line are the ones that used to exit 139.
 #
@@ -1004,15 +1543,17 @@ assert_eq(_rq11v, HSB_ERR_INVALID_INPUT,
   "eigen_power: 3x4 A with n = 3 -> HSB_ERR_INVALID_INPUT (leading-block answer refused)");
 # Still works on the documented shape.
 #
-# On diag(2, 3, 4) it returns 2, NOT the dominant 4 -- and that is the algorithm,
-# not a regression. eigen_power seeds v = e_0, which is an exact eigenvector of
-# any diagonal matrix, so the iteration is stationary at A[0][0] from the first
-# step and the |dlambda| < EPSILON test fires immediately. Pinned here so the
-# seed's consequence is documented rather than rediscovered.
+# ⛔ 3.3.3 — THIS PINNED 2, A DEFECT, AS "THE ALGORITHM". Through 3.3.2
+# eigen_power seeded v = e_0, an exact eigenvector of every diagonal matrix, so
+# the iteration sat at A[0][0] from its first step and returned 2 for
+# diag(2, 3, 4). The dominant eigenvalue of a diagonal matrix is its largest
+# entry, 4 -- and eigen_qr on this same ab_A33 above says 4 too. With the seed no
+# longer an axis vector, the iterate leads at index 2, where v_2 is exactly 1 and
+# w_2 = 4 * v_2 is exact, so the value is pinned bit for bit.
 var _rq12t, _rq12v = eigen_power(ab_A33, 3, 1000, ab_ep_val, ab_ep_vec);
 assert_eq(is_ok(_rq12t), 1, "eigen_power: diag(2,3,4) still runs after the guards");
-assert_eq(load64(ab_ep_val), F64_TWO,
-  "eigen_power: diag(2,3,4) returns A[0][0] = 2 -- e_0 is already an eigenvector");
+assert_eq(load64(ab_ep_val), f64_from(4),
+  "eigen_power: diag(2,3,4) returns the dominant 4 (3.3.2's e_0 seed returned A[0][0] = 2)");
 
 # A matrix e_0 is NOT an eigenvector of, so the iteration actually iterates:
 # [[2,1],[1,3]] has dominant eigenvalue (5 + sqrt 5) / 2 = 3.618033988749895.
@@ -1024,6 +1565,338 @@ var _rq13t, _rq13v = eigen_power(ab_ep2, 2, 1000, ab_ep_val, ab_ep2_vec);
 assert_eq(is_ok(_rq13t), 1, "eigen_power: [[2,1],[1,3]] converges after the guards");
 assert(f64_approx_eq(load64(ab_ep_val), 0x400CF1BBCDCBFA54, _AB_TOL) == 1,
   "eigen_power: [[2,1],[1,3]] dominant lambda == 3.618033988749895");
+
+# === 3.3.3 G2a: eigen_power seed and convergence test ===
+# Every expected value here is settled without eigen_power: the dominant eigenvalue
+# of a diagonal or triangular matrix is its largest diagonal entry, the rest are
+# closed forms, and eigen_qr agrees on diag(2,3,4) above. Tolerance comparisons go
+# through f64_lt(|err|, tol) == 1, which a NaN fails. 1e-11 sits above every error
+# this tree measures on these fixtures (largest: 4.0e-12, the upper-triangular
+# lambda) and far below what each mutant gives.
+# [measured: G2a probe on this tree, cycc 6.6.12, 2026-10-01]
+var g2a_tol = 0x3DA5FD7FE1796495;   # 1e-11
+var g2a_ev = alloc(8);
+var g2a_evec = alloc(4 * 8);
+fn _g2a_m3(a00, a01, a02, a10, a11, a12, a20, a21, a22) {
+    var m = ganita_mat_new(3, 3);
+    ganita_mat_set(m, 0, 0, a00); ganita_mat_set(m, 0, 1, a01); ganita_mat_set(m, 0, 2, a02);
+    ganita_mat_set(m, 1, 0, a10); ganita_mat_set(m, 1, 1, a11); ganita_mat_set(m, 1, 2, a12);
+    ganita_mat_set(m, 2, 0, a20); ganita_mat_set(m, 2, 1, a21); ganita_mat_set(m, 2, 2, a22);
+    return m;
+}
+var g2a_z = f64_from(0);
+# THE SEED, read back through the identity: every vector is an eigenvector of I,
+# so the iterate stops where it started -- the seed scaled to largest component 1.
+# Expected bits: SplitMix64 from state 0 (first output 0xE220A8397B1DCDAF, the
+# published stream), top 52 bits as mantissas of [0.5, 1) doubles, divided by the
+# largest, 0.9416554041068212 -- computed outside Cyrius.
+var _g2a20t, _g2a20v = eigen_power(_g2a_m3(F64_ONE, g2a_z, g2a_z, g2a_z, F64_ONE, g2a_z, g2a_z, g2a_z, F64_ONE),
+  3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_g2a20t), 1, "eigen_power: I3 converges");
+assert_eq(load64(g2a_ev), F64_ONE, "eigen_power: I3 lambda == 1");
+assert_eq(load64(g2a_evec), F64_ONE, "eigen_power: I3 v0 == 1 (the seed's largest component)");
+assert_eq(load64(g2a_evec + 8), 0x3FE852D75989DB24,
+  "eigen_power: I3 v1 == 0.715763998524255 / 0.9416554041068212 (the SplitMix64 seed)");
+assert_eq(load64(g2a_evec + 16), 0x3FE170C48EA50329,
+  "eigen_power: I3 v2 == 0.5132168857962989 / 0.9416554041068212 (the SplitMix64 seed)");
+
+# diag(2,3,4): the dominant pair is (4, e_2). The lambda pin above holds for the
+# eigenvalue-only stopping test too; the VECTOR is what that test got wrong
+# (v = (0.115, 0.441, 1), measured with this seed).
+# [measured: G2a seed-variant probes, cycc 6.6.12, 2026-10-01]
+var _g2a21t, _g2a21v = eigen_power(ab_A33, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_g2a21t), 1, "eigen_power: diag(2,3,4) ok");
+assert_eq(load64(g2a_ev), f64_from(4), "eigen_power: diag(2,3,4) lambda == 4");
+assert_eq(load64(g2a_evec + 16), F64_ONE, "eigen_power: diag(2,3,4) v2 == 1");
+assert_eq(f64_lt(f64_abs(load64(g2a_evec + 8)), g2a_tol), 1,
+  "eigen_power: diag(2,3,4) |v1| < 1e-11 (an eigenvalue-only test stopped at 0.441)");
+assert_eq(f64_lt(f64_abs(load64(g2a_evec)), g2a_tol), 1, "eigen_power: diag(2,3,4) |v0| < 1e-11");
+
+# diag(4,3,2): e_0 answered this one exactly; the new seed must too, to 1e-11.
+var g2a_d432 = _g2a_m3(f64_from(4), g2a_z, g2a_z, g2a_z, f64_from(3), g2a_z, g2a_z, g2a_z, F64_TWO);
+var _g2a22t, _g2a22v = eigen_power(g2a_d432, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_g2a22t), 1, "eigen_power: diag(4,3,2) ok");
+assert_eq(load64(g2a_ev), f64_from(4), "eigen_power: diag(4,3,2) lambda == 4");
+assert_eq(load64(g2a_evec), F64_ONE, "eigen_power: diag(4,3,2) v0 == 1");
+assert_eq(f64_lt(f64_abs(load64(g2a_evec + 8)), g2a_tol), 1,
+  "eigen_power: diag(4,3,2) |v1| < 1e-11 (an eigenvalue-only test stopped at 0.321)");
+
+# [[2,0,0],[0,3,1],[0,1,3]]: eigenvalues 2, 2, 4; the dominant vector is (0, 1, 1).
+# Its first column is 2 e_0, so 3.3.2 returned 2.
+var g2a_blk = _g2a_m3(F64_TWO, g2a_z, g2a_z, g2a_z, f64_from(3), F64_ONE, g2a_z, F64_ONE, f64_from(3));
+var _g2a23t, _g2a23v = eigen_power(g2a_blk, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_g2a23t), 1, "eigen_power: [[2,0,0],[0,3,1],[0,1,3]] ok");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), f64_from(4))), f64_mul(f64_from(4), g2a_tol)), 1,
+  "eigen_power: [[2,0,0],[0,3,1],[0,1,3]] lambda == 4 to 1e-11 relative (3.3.2: 2)");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_evec + 16), F64_ONE)), g2a_tol), 1,
+  "eigen_power: [[2,0,0],[0,3,1],[0,1,3]] v2 == 1 to 1e-11");
+assert_eq(f64_lt(f64_abs(load64(g2a_evec)), g2a_tol), 1, "eigen_power: [[2,0,0],[0,3,1],[0,1,3]] |v0| < 1e-11");
+
+# Upper-triangular [[2,1,0],[0,3,1],[0,0,4]]: eigenvalues 2, 3, 4. For 4,
+# (A - 4I) v = 0 gives v = (1/2, 1, 1). 3.3.2 returned 2.
+var g2a_up = _g2a_m3(F64_TWO, F64_ONE, g2a_z, g2a_z, f64_from(3), F64_ONE, g2a_z, g2a_z, f64_from(4));
+var _g2a24t, _g2a24v = eigen_power(g2a_up, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_g2a24t), 1, "eigen_power: upper-triangular ok");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), f64_from(4))), f64_mul(f64_from(4), g2a_tol)), 1,
+  "eigen_power: upper-triangular lambda == 4 to 1e-11 relative (3.3.2: 2)");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_evec), 0x3FE0000000000000)), g2a_tol), 1,
+  "eigen_power: upper-triangular v0 == 1/2 to 1e-11");
+
+# tridiag(-1, 2, -1) 4x4: eigenvalues 2 - 2cos(k pi/5), so the dominant is
+# 2 + 2cos(pi/5) = 2 + phi = (5 + sqrt 5)/2, and its eigenvector (sin(4 j pi/5))
+# sums to zero -- the ALL-ONES seed is orthogonal to it and returned 2.618.
+# [measured: G2a seed-variant probes, cycc 6.6.12, 2026-10-01]
+var g2a_T4 = ganita_mat_new(4, 4);
+for (var g2a_ti = 0; g2a_ti < 4; g2a_ti = g2a_ti + 1) {
+    ganita_mat_set(g2a_T4, g2a_ti, g2a_ti, F64_TWO);
+    if (g2a_ti > 0) {
+        ganita_mat_set(g2a_T4, g2a_ti, g2a_ti - 1, f64_neg(F64_ONE));
+        ganita_mat_set(g2a_T4, g2a_ti - 1, g2a_ti, f64_neg(F64_ONE));
+    }
+}
+var _g2a25t, _g2a25v = eigen_power(g2a_T4, 4, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_g2a25t), 1, "eigen_power: tridiag(-1,2,-1) 4x4 ok");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), 0x400CF1BBCDCBFA54)), f64_mul(f64_from(4), g2a_tol)), 1,
+  "eigen_power: tridiag(-1,2,-1) 4x4 lambda == 2 + 2cos(pi/5) = 3.618 (an all-ones seed gives 2.618)");
+
+# [[2,0,0],[0,9,-6],[0,-6,4]]: eigenvalues 2, 0 and 13, the last with vector
+# (0, 1, -2/3). From e_0 3.3.2 returned 2. 13 is reached exactly here.
+var g2a_r13 = _g2a_m3(F64_TWO, g2a_z, g2a_z, g2a_z, f64_from(9), f64_from(0 - 6), g2a_z, f64_from(0 - 6), f64_from(4));
+var _g2a26t, _g2a26v = eigen_power(g2a_r13, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_g2a26t), 1, "eigen_power: [[2,0,0],[0,9,-6],[0,-6,4]] ok");
+assert_eq(load64(g2a_ev), f64_from(13), "eigen_power: [[2,0,0],[0,9,-6],[0,-6,4]] lambda == 13 (3.3.2: 2)");
+
+# NO DOMINANT EIGENVALUE: [[0,1],[1,0]] has +1 and -1, tied in magnitude, so the
+# iterate alternates for ever. The eigenvalue-only test called it converged --
+# Ok(0), lambda = 1 and a v that is not an eigenvector (residual 1 from e_0 on
+# 3.3.2, 0.240 from this seed) -- because max|A v| is 1 on every pass.
+# [measured: G2a probe on the 3.3.2 bundle and seed-variant probes, cycc 6.6.12, 2026-10-01]
+var g2a_sw = ganita_mat_new(2, 2);
+ganita_mat_set(g2a_sw, 0, 1, F64_ONE);
+ganita_mat_set(g2a_sw, 1, 0, F64_ONE);
+store64(g2a_ev, _AB_SEVEN);
+var _g2a27t, _g2a27v = eigen_power(g2a_sw, 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_err_result(_g2a27t), 1, "eigen_power: [[0,1],[1,0]] (lambda = +-1) -> Err (3.3.2: Ok(0))");
+assert_eq(_g2a27v, HSB_ERR_NO_CONVERGENCE, "eigen_power: [[0,1],[1,0]] -> HSB_ERR_NO_CONVERGENCE");
+assert_eq(load64(g2a_ev), _AB_SEVEN, "eigen_power: [[0,1],[1,0]] leaves out_val untouched");
+
+# A NON-FINITE ENTRY is NO_CONVERGENCE, never an answer: its row of A*v is NaN or
+# Inf at once and every row is NaN one pass later (0 * NaN is NaN). This was true on
+# 3.3.2 as well; it pins the NaN-true `max_val` guard as audited, not repaired.
+# [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+var g2a_nan2 = ganita_mat_new(2, 2);
+ganita_mat_set(g2a_nan2, 0, 0, F64_TWO);   ganita_mat_set(g2a_nan2, 0, 1, F64_ONE);
+ganita_mat_set(g2a_nan2, 1, 0, _AB_NAN);   ganita_mat_set(g2a_nan2, 1, 1, f64_from(3));
+var _g2a28t, _g2a28v = eigen_power(g2a_nan2, 2, 1000, g2a_ev, g2a_evec);
+assert_eq(_g2a28v, HSB_ERR_NO_CONVERGENCE, "eigen_power: NaN at A[1][0] -> HSB_ERR_NO_CONVERGENCE");
+var _g2a29t, _g2a29v = eigen_power(_g2a_m3(F64_TWO, g2a_z, g2a_z, g2a_z, f64_from(3), g2a_z, g2a_z, g2a_z, _AB_PINF),
+  3, 1000, g2a_ev, g2a_evec);
+assert_eq(_g2a29v, HSB_ERR_NO_CONVERGENCE, "eigen_power: +Inf on the diagonal -> HSB_ERR_NO_CONVERGENCE");
+assert_eq(load64(g2a_ev), _AB_SEVEN, "eigen_power: non-finite A leaves out_val untouched");
+
+# === 3.3.3 R4le: eigen_power opposite-sign ties and the first-pass overflow ===
+# Expected values are closed forms: [[a,b],[b,a]] has eigenvalues a + b and a - b,
+# with eigenvectors (1, 1) and (1, -1), and a triangular matrix's eigenvalues are its
+# diagonal. Tolerance comparisons go through f64_lt(|err|, tol) == 1, which a NaN
+# fails; g2a_tol (1e-11) sits above every error this tree measures on them (largest:
+# 2.4e-13 relative, the -1 components within 4.2e-13).
+# [measured: R4le probe on this tree, cycc 6.6.12, 2026-10-01]
+fn _r4le_s2(a, b) {
+    var m = ganita_mat_new(2, 2);
+    ganita_mat_set(m, 0, 0, f64_from(a));  ganita_mat_set(m, 0, 1, f64_from(b));
+    ganita_mat_set(m, 1, 0, f64_from(b));  ganita_mat_set(m, 1, 1, f64_from(a));
+    return m;
+}
+# 1 when (v0, v1) is (1, -1) or (-1, 1): one component exactly 1, the other -1 to 1e-11.
+fn _r4le_opp(v) {
+    var v0 = load64(v);
+    var v1 = load64(v + 8);
+    if (v0 != F64_ONE && v1 != F64_ONE) { return 0; }
+    return f64_lt(f64_abs(f64_add(v0, v1)), g2a_tol);
+}
+# NaN into out_val and out_vec before each call that must converge, so a value left
+# over from an earlier call cannot pass for this one's. (The 7.0 stamp used for the
+# refusals equals [[2,-5],[-5,2]]'s eigenvalue: with the repair mutated out, its
+# lambda check passed on the stale stamp.)
+# [measured: R4le mutant run, this tree, cycc 6.6.12, 2026-10-01]
+fn _r4le_stamp() {
+    store64(g2a_ev, _AB_NAN);
+    for (var i = 0; i < 4; i = i + 1) { store64(g2a_evec + i * 8, _AB_NAN); }
+    return 0;
+}
+# THE DOMINANT EIGENVECTOR (1, -1) TIES ITS TWO COMPONENTS WITH OPPOSITE SIGNS, and
+# lambda_2 / lambda_1 < 0, so the lead swaps on every pass and v = w / max_val flips
+# sign: the vector test never cleared. 3.3.2 (eigenvalue test alone) returned the
+# wrong sign; before this repair, NO_CONVERGENCE at max_iter 1000 and 100000 alike.
+# [measured: R4le probe, 3.3.2 bundle and this tree before the repair, cycc 6.6.12, 2026-10-01]
+_r4le_stamp();
+var _r4le1t, _r4le1v = eigen_power(_r4le_s2(1, 0 - 3), 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r4le1t), 1, "eigen_power: [[1,-3],[-3,1]] (4, -2) converges (was NO_CONVERGENCE; 3.3.2: Ok, -4)");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), f64_from(4))), f64_mul(f64_from(4), g2a_tol)), 1,
+  "eigen_power: [[1,-3],[-3,1]] lambda == +4 to 1e-11 relative (3.3.2: -4)");
+assert_eq(_r4le_opp(g2a_evec), 1, "eigen_power: [[1,-3],[-3,1]] v == (1, -1) up to sign, the lead exactly 1");
+_r4le_stamp();
+var _r4le2t, _r4le2v = eigen_power(_r4le_s2(2, 0 - 5), 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r4le2t), 1, "eigen_power: [[2,-5],[-5,2]] (7, -3) converges (3.3.2: Ok, -7)");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), f64_from(7))), f64_mul(f64_from(7), g2a_tol)), 1,
+  "eigen_power: [[2,-5],[-5,2]] lambda == +7 to 1e-11 relative (3.3.2: -7)");
+assert_eq(_r4le_opp(g2a_evec), 1, "eigen_power: [[2,-5],[-5,2]] v == (1, -1) up to sign");
+# A NEGATIVE dominant eigenvalue in the same class: the estimate's sign is the matrix's.
+_r4le_stamp();
+var _r4le3t, _r4le3v = eigen_power(_r4le_s2(0 - 1, 3), 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r4le3t), 1, "eigen_power: [[-1,3],[3,-1]] (-4, 2) converges (3.3.2: Ok, +4)");
+assert_eq(f64_lt(f64_abs(f64_add(load64(g2a_ev), f64_from(4))), f64_mul(f64_from(4), g2a_tol)), 1,
+  "eigen_power: [[-1,3],[3,-1]] lambda == -4 to 1e-11 relative (3.3.2: +4)");
+assert_eq(_r4le_opp(g2a_evec), 1, "eigen_power: [[-1,3],[3,-1]] v == (1, -1) up to sign");
+# The one 3.3.3 answered before the repair, by the rounding of its ties: still 3.
+_r4le_stamp();
+var _r4le4t, _r4le4v = eigen_power(_r4le_s2(1, 0 - 2), 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r4le4t), 1, "eigen_power: [[1,-2],[-2,1]] (3, -1) converges");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), f64_from(3))), f64_mul(f64_from(3), g2a_tol)), 1,
+  "eigen_power: [[1,-2],[-2,1]] lambda == 3 to 1e-11 relative (3.3.2: -3)");
+assert_eq(_r4le_opp(g2a_evec), 1, "eigen_power: [[1,-2],[-2,1]] v == (1, -1) up to sign");
+# 3x3: the tie sits in a block, and the third component converges to 0.
+var _r4le_b3 = _g2a_m3(F64_ONE, f64_from(0 - 3), g2a_z, f64_from(0 - 3), F64_ONE, g2a_z, g2a_z, g2a_z, F64_ONE);
+_r4le_stamp();
+var _r4le5t, _r4le5v = eigen_power(_r4le_b3, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r4le5t), 1, "eigen_power: [[1,-3,0],[-3,1,0],[0,0,1]] (4, -2, 1) converges (3.3.2: Ok, -4)");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), f64_from(4))), f64_mul(f64_from(4), g2a_tol)), 1,
+  "eigen_power: [[1,-3,0],[-3,1,0],[0,0,1]] lambda == +4 to 1e-11 relative");
+assert_eq(_r4le_opp(g2a_evec), 1, "eigen_power: [[1,-3,0],[-3,1,0],[0,0,1]] (v0, v1) == (1, -1) up to sign");
+assert_eq(f64_lt(f64_abs(load64(g2a_evec + 16)), g2a_tol), 1,
+  "eigen_power: [[1,-3,0],[-3,1,0],[0,0,1]] |v2| < 1e-11");
+# The up-to-sign test must not make a tie converge: [[0,-1],[-1,0]] (+1, -1) never settles.
+store64(g2a_ev, _AB_SEVEN);
+var _r4le6t, _r4le6v = eigen_power(_r4le_s2(0, 0 - 1), 2, 1000, g2a_ev, g2a_evec);
+assert_eq(_r4le6v, HSB_ERR_NO_CONVERGENCE, "eigen_power: [[0,-1],[-1,0]] (+-1) is still NO_CONVERGENCE");
+assert_eq(load64(g2a_ev), _AB_SEVEN, "eigen_power: [[0,-1],[-1,0]] leaves out_val untouched");
+
+# THE SEED'S FIRST MATVEC OVERFLOWED: 1e308 * 0.94 + 1.5e308 * 0.72 is past DBL_MAX,
+# while the eigenvector e_0 gives A v = (1e308, 0). Before this repair NO_CONVERGENCE;
+# 3.3.2, seeded with e_0, returned 1e308. The first pass with a non-finite component
+# now switches the iteration to an iterate scaled by 2^-s, 2^s > 2n -- for good since
+# R5le, because a LATER pass can overflow as well (see the block after this one).
+# Oracle: both matrices' dominant eigenvalue rounds to 1e308 exactly -- the first is
+# triangular, and the second's is 1e308 + 1.5 + O(1e-308), 1.5 being far under half
+# an ulp of 1e308 -- and its eigenvector is (1, 1/(lambda - 1)), whose second
+# component rounds to the subnormal 1e-308.
+# [measured: R4le probe, 3.3.2 bundle and this tree before the repair, cycc 6.6.12, 2026-10-01]
+var _r4le_e308 = 0x7FE1CCF385EBC8A0;    # 1e308
+var _r4le_e308h = 0x7FEAB36D48E1ACF0;   # 1.5e308
+fn _r4le_m2(a, b, c, d) {
+    var m = ganita_mat_new(2, 2);
+    ganita_mat_set(m, 0, 0, a);  ganita_mat_set(m, 0, 1, b);
+    ganita_mat_set(m, 1, 0, c);  ganita_mat_set(m, 1, 1, d);
+    return m;
+}
+_r4le_stamp();
+var _r4le7t, _r4le7v = eigen_power(_r4le_m2(_r4le_e308, _r4le_e308h, g2a_z, F64_ONE), 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r4le7t), 1, "eigen_power: [[1e308,1.5e308],[0,1]] converges (was NO_CONVERGENCE: seed overflow)");
+assert_eq(load64(g2a_ev), _r4le_e308, "eigen_power: [[1e308,1.5e308],[0,1]] lambda == 1e308 exactly");
+assert_eq(load64(g2a_evec), F64_ONE, "eigen_power: [[1e308,1.5e308],[0,1]] v0 == 1");
+assert_eq(load64(g2a_evec + 8), 0, "eigen_power: [[1e308,1.5e308],[0,1]] v1 == +0 (v = e_0)");
+_r4le_stamp();
+var _r4le8t, _r4le8v = eigen_power(_r4le_m2(_r4le_e308, _r4le_e308h, F64_ONE, F64_ONE), 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r4le8t), 1, "eigen_power: [[1e308,1.5e308],[1,1]] converges (was NO_CONVERGENCE)");
+assert_eq(load64(g2a_ev), _r4le_e308, "eigen_power: [[1e308,1.5e308],[1,1]] lambda == 1e308 exactly");
+assert_eq(load64(g2a_evec), F64_ONE, "eigen_power: [[1e308,1.5e308],[1,1]] v0 == 1");
+assert_eq(load64(g2a_evec + 8), 0x000730D67819E8D2,
+  "eigen_power: [[1e308,1.5e308],[1,1]] v1 == 1/(lambda - 1), the subnormal 1e-308 correctly rounded");
+# The scale must grow with n: a row of DBL_MAX against the 3-component seed sums to
+# 2.17 DBL_MAX, still 1.09 DBL_MAX at 2^-1, and 0.27 DBL_MAX at 2^-3 (2^3 > 2n = 6).
+# Upper-triangular, so lambda = DBL_MAX exactly, with eigenvector e_0 (3.3.2's seed:
+# Ok, DBL_MAX). It is reached on the third pass: the seed pass's estimate is that row
+# sum, and the second pass's still differs from it.
+# [measured: R4le probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
+# [measured: R5le min-max_iter probe, this tree, cycc 6.6.12, 2026-10-01]
+var _r4le_dmax = 0x7FEFFFFFFFFFFFFF;
+var _r4le_b3m = _g2a_m3(_r4le_dmax, _r4le_dmax, _r4le_dmax, g2a_z, F64_ONE, g2a_z, g2a_z, g2a_z, F64_ONE);
+_r4le_stamp();
+var _r4le12t, _r4le12v = eigen_power(_r4le_b3m, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r4le12t), 1, "eigen_power: [[DMAX,DMAX,DMAX],[0,1,0],[0,0,1]] converges (was NO_CONVERGENCE)");
+assert_eq(load64(g2a_ev), _r4le_dmax, "eigen_power: [[DMAX,DMAX,DMAX],[0,1,0],[0,0,1]] lambda == DBL_MAX exactly");
+assert_eq(load64(g2a_evec), F64_ONE, "eigen_power: [[DMAX,DMAX,DMAX],[0,1,0],[0,0,1]] v0 == 1");
+assert_eq(load64(g2a_evec + 8), 0, "eigen_power: [[DMAX,DMAX,DMAX],[0,1,0],[0,0,1]] v1 == +0");
+assert_eq(load64(g2a_evec + 16), 0, "eigen_power: [[DMAX,DMAX,DMAX],[0,1,0],[0,0,1]] v2 == +0");
+# The switch answers nothing that has no answer. lambda = +-1e308 tie in magnitude
+# (3.3.2, from e_0, returned 1e308); [[1e308,1e308],[1e308,1e308]] has lambda = 2e308,
+# past DBL_MAX: its scaled estimate converges to 2.5e307, which times 2^3 is +Inf and
+# is refused, where a switch that returned the estimate in its 2^-s units would report
+# 2.5e307. (A NaN or infinite entry already takes the switch in the G2a tests above --
+# their first pass is non-finite -- and stays NO_CONVERGENCE.)
+# [measured: R4le probe and mutant run, this tree, cycc 6.6.12, 2026-10-01]
+store64(g2a_ev, _AB_SEVEN);
+var _r4le9t, _r4le9v = eigen_power(_r4le_m2(_r4le_e308, _r4le_e308h, g2a_z, f64_neg(_r4le_e308)), 2, 1000,
+  g2a_ev, g2a_evec);
+assert_eq(_r4le9v, HSB_ERR_NO_CONVERGENCE, "eigen_power: [[1e308,1.5e308],[0,-1e308]] (+-1e308) -> NO_CONVERGENCE");
+var _r4le10t, _r4le10v = eigen_power(_r4le_m2(_r4le_e308, _r4le_e308, _r4le_e308, _r4le_e308), 2, 1000,
+  g2a_ev, g2a_evec);
+assert_eq(_r4le10v, HSB_ERR_NO_CONVERGENCE, "eigen_power: lambda = 2e308 (past DBL_MAX) -> NO_CONVERGENCE");
+assert_eq(load64(g2a_ev), _AB_SEVEN, "eigen_power: the two refusals leave out_val untouched");
+
+# === 3.3.3 R5le: eigen_power, an overflow on a later pass ===
+# A pass after the first can overflow too, whenever some |a_ij| > DBL_MAX / n, at a
+# lambda far below DBL_MAX: round 4's redo of the FIRST pass never reached these. The
+# first overflowing pass now switches the iteration to u = v * 2^-s for good. Oracle:
+# the same matrix times 2^-64, which never overflows, run through the in-range
+# iteration; scaling by a power of two is exact, so its lambda times 2^64 and its v
+# must come back bit for bit. The closed form is the diagonal (both are triangular).
+# [measured: R5le repro probe, 3.3.2 bundle, the tree before this repair and this tree, cycc 6.6.12, 2026-10-01]
+fn _r5le_ep(a, b, c, d, sc) {
+    return _r4le_m2(f64_mul(a, sc), f64_mul(b, sc), f64_mul(c, sc), f64_mul(d, sc));
+}
+var _r5le_one = 0x3FF0000000000000;
+var _r5le_m64 = 0x3BF0000000000000;    # 2^-64
+var _r5le_p64 = 0x43F0000000000000;    # 2^64
+var _r5le_t12 = 0x3D719799812DEA11;    # 1e-12
+var _r5le_t10 = 0x3DDB7CDFD9D7BDBB;    # 1e-10
+var _r5le_ev2 = alloc(8);
+var _r5le_vec2 = alloc(2 * 8);
+# [[-3e307, 1.6e308], [0, 2e307]], lambda = -3e307 = 0.167 DBL_MAX. Its first pass is
+# finite; a later one meets v = (1, -0.948), and -3e307 + 1.6e308 * -0.948 is -Inf.
+# 3.3.2: Ok, -3e307 exactly. Before this repair: NO_CONVERGENCE, at max_iter 1000 and
+# 100000 alike. Now 74 passes, as the 2^-64 copy takes; 4.0e-13 relative.
+var _r5le_a = 0xFFC55C576D815726;    # -3e307
+var _r5le_b = 0x7FEC7B1F3CAC7433;    # 1.6e308
+var _r5le_d = 0x7FBC7B1F3CAC7433;    # 2e307
+store64(_r5le_ev2, _AB_NAN);
+var _r5le1t, _r5le1v = eigen_power(_r5le_ep(_r5le_a, _r5le_b, g2a_z, _r5le_d, _r5le_m64), 2, 1000,
+  _r5le_ev2, _r5le_vec2);
+assert_eq(is_ok(_r5le1t), 1, "eigen_power: [[-3e307,1.6e308],[0,2e307]] times 2^-64 converges (the oracle)");
+_r4le_stamp();
+var _r5le2t, _r5le2v = eigen_power(_r5le_ep(_r5le_a, _r5le_b, g2a_z, _r5le_d, _r5le_one), 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_r5le2t), 1,
+  "eigen_power: [[-3e307,1.6e308],[0,2e307]] converges (before: NO_CONVERGENCE, a later pass overflowed)");
+assert_eq(load64(g2a_ev), f64_mul(load64(_r5le_ev2), _r5le_p64),
+  "eigen_power: [[-3e307,1.6e308],[0,2e307]] lambda == 2^64 times the 2^-64 copy's, bit for bit");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), _r5le_a)), f64_mul(f64_abs(_r5le_a), _r5le_t12)), 1,
+  "eigen_power: [[-3e307,1.6e308],[0,2e307]] lambda == -3e307 to 1e-12 relative");
+assert_eq(load64(g2a_evec), F64_ONE, "eigen_power: [[-3e307,1.6e308],[0,2e307]] v0 == 1");
+assert_eq(load64(g2a_evec + 8), load64(_r5le_vec2 + 8),
+  "eigen_power: [[-3e307,1.6e308],[0,2e307]] v1 == the 2^-64 copy's, bit for bit");
+assert_eq(f64_lt(f64_abs(load64(g2a_evec + 8)), g2a_tol), 1,
+  "eigen_power: [[-3e307,1.6e308],[0,2e307]] |v1| < 1e-11 (the eigenvector is e_0)");
+# [[1.4e308, 1.2e308], [0, 1.3e308]], lambda = 1.4e308. 3.3.2: Ok, 1.4e308 exactly.
+# Before this repair: NO_CONVERGENCE. |lambda_2 / lambda_1| = 0.93 makes it slow (304
+# passes) and leaves 1.1e-11 relative; 1e-10 is the bound here.
+var _r5le_a2 = 0x7FE8EBBB5516E5AD;    # 1.4e308
+var _r5le_b2 = 0x7FE55C576D815726;    # 1.2e308
+var _r5le_d2 = 0x7FE72409614C1E6A;    # 1.3e308
+store64(_r5le_ev2, _AB_NAN);
+var _r5le3t, _r5le3v = eigen_power(_r5le_ep(_r5le_a2, _r5le_b2, g2a_z, _r5le_d2, _r5le_m64), 2, 1000,
+  _r5le_ev2, _r5le_vec2);
+assert_eq(is_ok(_r5le3t), 1, "eigen_power: [[1.4e308,1.2e308],[0,1.3e308]] times 2^-64 converges (the oracle)");
+_r4le_stamp();
+var _r5le4t, _r5le4v = eigen_power(_r5le_ep(_r5le_a2, _r5le_b2, g2a_z, _r5le_d2, _r5le_one), 2, 1000,
+  g2a_ev, g2a_evec);
+assert_eq(is_ok(_r5le4t), 1, "eigen_power: [[1.4e308,1.2e308],[0,1.3e308]] converges (before: NO_CONVERGENCE)");
+assert_eq(load64(g2a_ev), f64_mul(load64(_r5le_ev2), _r5le_p64),
+  "eigen_power: [[1.4e308,1.2e308],[0,1.3e308]] lambda == 2^64 times the 2^-64 copy's, bit for bit");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), _r5le_a2)), f64_mul(_r5le_a2, _r5le_t10)), 1,
+  "eigen_power: [[1.4e308,1.2e308],[0,1.3e308]] lambda == 1.4e308 to 1e-10 relative");
+assert_eq(load64(g2a_evec), F64_ONE, "eigen_power: [[1.4e308,1.2e308],[0,1.3e308]] v0 == 1");
+assert_eq(load64(g2a_evec + 8), load64(_r5le_vec2 + 8),
+  "eigen_power: [[1.4e308,1.2e308],[0,1.3e308]] v1 == the 2^-64 copy's, bit for bit");
 
 var ab_ly = alloc(8);
 var _rq14t, _rq14v = lyapunov_max(ab_A33, 0, 5, ab_ly);
@@ -1113,6 +1986,43 @@ assert_eq(solve_pgs(ab_A33, ab_b3, ab_xg, 3, ab_lo3, ab_hi3, (0 - 5)), 0,
 # A zero-diagonal system is the singular case solve_pgs documents as "skip".
 assert_eq(solve_pgs(ganita_mat_new(3, 3), ab_b3, ab_xg, 3, ab_lo3, ab_hi3, 5), 0,
   "solve_pgs: all-zero diagonal skipped, not divided by");
+
+# === 3.3.3 G2a: solve_pgs NaN diagonal ===
+# [[a00,1,1],[1,3,0],[1,0,2]] x = (1,2,4) from x = 0 inside +-1e6. With a00 = 0, row
+# 0 is skipped and keeps x0 = 0, so x1 = 2/3 (one rounding) and x2 = 4/2 = 2
+# exactly. 3.3.2 skipped a00 = NaN the same way (`f64_gt(|aii|, 0) == 0` is true for
+# NaN) and returned that finite x; the NaN now reaches the solution, as a NaN off
+# the diagonal or in b always did.
+# [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+fn _g2a_pgs(a00, x) {
+    var A = ganita_mat_new(3, 3);
+    ganita_mat_set(A, 0, 0, a00);        ganita_mat_set(A, 0, 1, F64_ONE);   ganita_mat_set(A, 0, 2, F64_ONE);
+    ganita_mat_set(A, 1, 0, F64_ONE);    ganita_mat_set(A, 1, 1, f64_from(3));
+    ganita_mat_set(A, 2, 0, F64_ONE);    ganita_mat_set(A, 2, 2, F64_TWO);
+    var b = alloc(3 * 8);
+    store64(b, F64_ONE);   store64(b + 8, F64_TWO);   store64(b + 16, f64_from(4));
+    var lo = alloc(3 * 8);
+    var hi = alloc(3 * 8);
+    for (var i = 0; i < 3; i = i + 1) {
+        store64(lo + i * 8, f64_from(0 - 1000000));
+        store64(hi + i * 8, f64_from(1000000));
+        store64(x + i * 8, 0);
+    }
+    return solve_pgs(A, b, x, 3, lo, hi, 100);
+}
+var g2a_px = alloc(3 * 8);
+assert_eq(_g2a_pgs(_AB_NAN, g2a_px), 0, "solve_pgs: NaN diagonal still returns 0 (no error channel)");
+assert_eq(f64_eq(load64(g2a_px), load64(g2a_px)), 0, "solve_pgs: a00 = NaN -> x0 is NaN (3.3.2: 0)");
+assert_eq(f64_eq(load64(g2a_px + 8), load64(g2a_px + 8)), 0, "solve_pgs: a00 = NaN -> x1 is NaN (3.3.2: 2/3)");
+assert_eq(f64_eq(load64(g2a_px + 16), load64(g2a_px + 16)), 0, "solve_pgs: a00 = NaN -> x2 is NaN (3.3.2: 2)");
+# ...and the exact-zero skip, of either sign, is unchanged.
+assert_eq(_g2a_pgs(0, g2a_px), 0, "solve_pgs: a00 = +0 returns 0");
+assert_eq(load64(g2a_px), 0, "solve_pgs: a00 = +0 -> row 0 skipped, x0 stays +0");
+assert_eq(load64(g2a_px + 8), 0x3FE5555555555555, "solve_pgs: a00 = +0 -> x1 == 2/3");
+assert_eq(load64(g2a_px + 16), F64_TWO, "solve_pgs: a00 = +0 -> x2 == 2");
+assert_eq(_g2a_pgs(0x8000000000000000, g2a_px), 0, "solve_pgs: a00 = -0 returns 0");
+assert_eq(load64(g2a_px), 0, "solve_pgs: a00 = -0 -> row 0 skipped like +0, x0 stays +0 (not -1e6)");
+assert_eq(load64(g2a_px + 16), F64_TWO, "solve_pgs: a00 = -0 -> x2 == 2");
 
 assert_neq(solve_gmres(&_ab_matvec, ab_b3, ab_xg, 3, EPSILON_F64, 0, 2), 0,
   "solve_gmres: max_iter = 0 returns a vector, not a fault");
@@ -1334,13 +2244,16 @@ assert_eq(_ab_count7(ab_j_out, 8), 8, "calc_jacobian rejected dims: out untouche
 
 # --- quadrature out-slot ---
 #
-# Note the ASYMMETRY these assertions pin down. Both quadrature entry points
-# guard `steps == 0` and return HSB_ERR_ZERO_STEPS with `out` untouched, but
-# NEITHER has a lower bound: a negative step count divides the interval by a
-# negative number, skips the summation loop entirely, and stores the resulting
-# half-endpoint estimate into `out` with HSB_ERR_NONE. That is a wrong answer
-# reported as a success, but it is memory-safe -- `out` is exactly one slot and
-# exactly one slot is written -- which is what the canary here proves.
+# Both quadrature entry points guard `steps == 0` and return HSB_ERR_ZERO_STEPS
+# with `out` untouched. ⛔ Through 3.3.2 NEITHER had a lower bound, and these
+# assertions pinned the asymmetry: a negative step count divided the interval by
+# a negative number, skipped the summation loop and stored the half-endpoint term
+# with HSB_ERR_NONE — -0.1 for trapez at -5 and -0.0833 for simpson at -4, over
+# x^2 on [0,1] whose integral is 1/3. 3.3.3 rejects it (audit D072) with
+# HSB_ERR_INVALID_INPUT, the code calc_ext returns for a negative dimension, and
+# leaves `out` untouched, so the pins below are flipped in place. The canary still
+# proves exactly one slot is ever written.
+# [measured: steps probe on the 3.3.2 bundle, 2026-10-01]
 var ab_q_out = alloc(8);
 var ab_q_can = _ab_canary_new(16);
 store64(ab_q_out, _AB_SEVEN);
@@ -1355,18 +2268,50 @@ assert_eq(ab_sz_v, HSB_ERR_ZERO_STEPS,
   "calc_integral_simpson: steps = 0 -> HSB_ERR_ZERO_STEPS in the payload");
 assert_eq(load64(ab_q_out), _AB_SEVEN, "simpson steps = 0: out untouched");
 var ab_tn_t, ab_tn_v = calc_integral_trapez(&_ab_f_x2, 0, F64_ONE, (0 - 5), ab_q_out);
-assert_eq(is_ok(ab_tn_t), 1,
-  "calc_integral_trapez: steps = -5 is ACCEPTED (no lower bound; documented asymmetry)");
-assert_eq(_ab_is_finite(load64(ab_q_out)), 1,
-  "trapez steps = -5: the value stored is finite, not a wild read");
+assert_eq(is_err_result(ab_tn_t), 1,
+  "calc_integral_trapez: steps = -5 -> Err (3.3.2 accepted it and stored -0.1)");
+assert_eq(ab_tn_v, HSB_ERR_INVALID_INPUT,
+  "calc_integral_trapez: steps = -5 -> HSB_ERR_INVALID_INPUT in the payload");
+assert_eq(load64(ab_q_out), _AB_SEVEN, "trapez steps = -5: out untouched");
 var ab_sn_t, ab_sn_v = calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, (0 - 4), ab_q_out);
-assert_eq(is_ok(ab_sn_t), 1,
-  "calc_integral_simpson: steps = -4 is ACCEPTED (no lower bound)");
-assert_eq(_ab_is_finite(load64(ab_q_out)), 1,
-  "simpson steps = -4: the value stored is finite, not a wild read");
+assert_eq(is_err_result(ab_sn_t), 1,
+  "calc_integral_simpson: steps = -4 -> Err (3.3.2 accepted it and stored -1/12)");
+assert_eq(ab_sn_v, HSB_ERR_INVALID_INPUT,
+  "calc_integral_simpson: steps = -4 -> HSB_ERR_INVALID_INPUT in the payload");
+assert_eq(load64(ab_q_out), _AB_SEVEN, "simpson steps = -4: out untouched");
 var ab_so_t, ab_so_v = calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, 3, ab_q_out);
 assert_eq(is_ok(ab_so_t), 1,
   "calc_integral_simpson: an odd step count is rounded up to even, not rejected");
+
+# === 3.3.3 G4: quadrature negative step counts (D072) ===
+# The boundaries of the new test. -1 is the first negative count, and for Simpson
+# an ODD one: Cyrius `%` truncates, so -1 % 2 is -1 and the round-up never moves it
+# into range. 2^63 - 1 is the one positive count Simpson cannot honour: its
+# round-up wraps to -2^63, which 3.3.2 then used, storing -3.6e-20 as Ok. -2^63 is
+# the far end, and even, so it is never rounded.
+# [measured: steps probe on the 3.3.2 bundle, 2026-10-01]
+store64(ab_q_out, _AB_SEVEN);
+var _g4_ab_t1, _g4_ab_v1 = calc_integral_trapez(&_ab_f_x2, 0, F64_ONE, (0 - 1), ab_q_out);
+assert_eq(is_err_result(_g4_ab_t1), 1, "calc_integral_trapez: steps = -1 -> Err");
+assert_eq(_g4_ab_v1, HSB_ERR_INVALID_INPUT, "calc_integral_trapez: steps = -1 -> HSB_ERR_INVALID_INPUT");
+var _g4_ab_t2, _g4_ab_v2 = calc_integral_trapez(&_ab_f_x2, 0, F64_ONE, (0 - 9223372036854775807) - 1, ab_q_out);
+assert_eq(_g4_ab_v2, HSB_ERR_INVALID_INPUT, "calc_integral_trapez: steps = -2^63 -> HSB_ERR_INVALID_INPUT");
+var _g4_ab_t3, _g4_ab_v3 = calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, (0 - 1), ab_q_out);
+assert_eq(is_err_result(_g4_ab_t3), 1, "calc_integral_simpson: steps = -1 (odd, never rounded) -> Err");
+assert_eq(_g4_ab_v3, HSB_ERR_INVALID_INPUT, "calc_integral_simpson: steps = -1 -> HSB_ERR_INVALID_INPUT");
+var _g4_ab_t4, _g4_ab_v4 = calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, 9223372036854775807, ab_q_out);
+assert_eq(is_err_result(_g4_ab_t4), 1, "calc_integral_simpson: steps = 2^63 - 1 (round-up wraps) -> Err");
+assert_eq(_g4_ab_v4, HSB_ERR_INVALID_INPUT,
+  "calc_integral_simpson: steps = 2^63 - 1 -> HSB_ERR_INVALID_INPUT, not -2^63 steps as Ok");
+var _g4_ab_t5, _g4_ab_v5 = calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, (0 - 9223372036854775807) - 1, ab_q_out);
+assert_eq(_g4_ab_v5, HSB_ERR_INVALID_INPUT, "calc_integral_simpson: steps = -2^63 -> HSB_ERR_INVALID_INPUT");
+assert_eq(load64(ab_q_out), _AB_SEVEN, "quadrature negative step counts: out untouched");
+# Control: the smallest positive count still integrates. Simpson's 1 rounds up to
+# 2 and gives 1/3 on x^2 over [0,1] — exact for a cubic, and h = 1/2 rounds nothing
+# before the final division by 3.
+var _g4_ab_t6, _g4_ab_v6 = calc_integral_simpson(&_ab_f_x2, 0, F64_ONE, 1, ab_q_out);
+assert_eq(is_ok(_g4_ab_t6), 1, "calc_integral_simpson: steps = 1 still integrates");
+assert_eq(load64(ab_q_out), 0x3FD5555555555555, "calc_integral_simpson: steps = 1 on x^2 is 1/3 exactly");
 assert_eq(_ab_clob(ab_q_can, 16), 0, "quadrature bad step counts: canary clean");
 
 # --- num_tridiag_solve out-buffer ---
@@ -1722,6 +2667,181 @@ assert_eq(HVec4_x(hvec4_normalize(hvec4_zero())), f64_from(0), "hvec4_normalize:
 assert_eq(HQuat_w(hquat_normalize(hquat_new(0, 0, 0, 0))), f64_from(1),
   "hquat_normalize: zero quaternion -> identity, not NaN");
 
+# === 3.3.3 W1: geo_closest_point_on_triangle at a NaN input ===
+# All fifteen Voronoi tests are NaN-true, so through 3.3.2 a NaN input was taken for
+# "in this region" by the first test it reached, and only vertex A, vertex B and edge
+# AB can be reached by one. Each message below names what 3.3.2 returned. The repair
+# is ONE guard on the inputs — `f64_lt(|x|, +Inf) == 0` on each coordinate of the three
+# vertices and the query, which catches an infinity too (next block) — so the fixtures
+# put the NaN in each of the four points, and in x, in y and in z, which is what lets
+# each part of the guard be mutated on its own.
+# THE TRUE VALUE: the closest point depends on every coordinate of all four points (a
+# NaN in A's x alone moves the plane the answer lies in), so no component is known —
+# NaN in all three, as `geo_segment_closest_point` gives for a NaN end. Checked for
+# NaN-ness, not for a payload.
+# The control is what the guard must NOT catch: a finite query. An INFINITE query is not
+# one: (+Inf,0,0) gave vertex B on 3.3.2, the limit along +x, but out of the same
+# NaN-true path (d4 = 0 * Inf is NaN, and the vertex-B test takes it), so it is pinned
+# NaN like the rest, and the infinite class has its own block below. The finite-overflow
+# class keeps its 3.3.2 path; see src/geo.cyr.
+# [measured: W1 scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+fn _w1_nan3(v) {
+    return _ab_is_nan(HVec3_x(v)) + _ab_is_nan(HVec3_y(v)) + _ab_is_nan(HVec3_z(v));
+}
+# NaN components of the closest point on triangle (a, b, c) to (px, py, pz).
+fn _w1_cp(a, b, c, px, py, pz) {
+    return _w1_nan3(geo_closest_point_on_triangle(geo_triangle_new(a, b, c), hvec3_new(px, py, pz)));
+}
+var _w1_o = hvec3_new(0, 0, 0);
+var _w1_b = hvec3_new(f64_from(4), 0, 0);
+var _w1_c = hvec3_new(0, f64_from(4), 0);
+var _w1_tri = geo_triangle_new(_w1_o, _w1_b, _w1_c);
+var _w1_m1 = f64_neg(F64_ONE);
+var _w1_5 = f64_from(5);
+var _w1_an = hvec3_new(_AB_NAN, 0, 0);
+var _w1_bn = hvec3_new(_AB_NAN, 0, 0);
+var _w1_cn = hvec3_new(0, _AB_NAN, 0);
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, _AB_NAN, _AB_NAN, _AB_NAN), 3,
+  "closest_point_on_triangle: query (NaN,NaN,NaN) is NaN in all three, not vertex A (0,0,0)");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, _AB_NAN, F64_ONE, 0), 3,
+  "closest_point_on_triangle: query (NaN,1,0) is NaN in all three, not vertex A (0,0,0)");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, F64_ONE, F64_ONE, _AB_NAN), 3,
+  "closest_point_on_triangle: query (1,1,NaN) is NaN in all three, not vertex A (0,0,0)");
+assert_eq(_w1_cp(_w1_an, _w1_b, _w1_c, F64_ONE, F64_ONE, 0), 3,
+  "closest_point_on_triangle: A = (NaN,0,0) is NaN in all three, not A itself, finite in y and z");
+assert_eq(_w1_cp(_w1_o, _w1_bn, _w1_c, F64_ONE, _w1_m1, 0), 3,
+  "closest_point_on_triangle: B = (NaN,0,0), query (1,-1,0) is NaN, not vertex A (0,0,0)");
+assert_eq(_w1_cp(_w1_o, _w1_bn, _w1_c, _w1_m1, _w1_5, 0), 3,
+  "closest_point_on_triangle: B = (NaN,0,0), query (-1,5,0) is NaN, not B itself, finite in y and z");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_cn, _w1_m1, F64_ONE, 0), 3,
+  "closest_point_on_triangle: C = (0,NaN,0), query (-1,1,0) is NaN, not vertex A (0,0,0)");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_cn, _w1_5, F64_ONE, 0), 3,
+  "closest_point_on_triangle: C = (0,NaN,0), query (5,1,0) is NaN, not vertex B (4,0,0)");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_cn, F64_ONE, _w1_m1, 0), 3,
+  "closest_point_on_triangle: C = (0,NaN,0), query (1,-1,0) is NaN, not edge-AB point (1,0,0)");
+var _w1_fin = geo_closest_point_on_triangle(_w1_tri, hvec3_new(F64_ONE, _w1_m1, 0));
+assert_eq(HVec3_x(_w1_fin), F64_ONE, "control: finite query (1,-1,0) -> edge AB at x = 1");
+assert_eq(HVec3_y(_w1_fin), 0, "control: ... y = +0 (bits)");
+assert_eq(HVec3_z(_w1_fin), 0, "control: ... z = +0 (bits)");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, _AB_PINF, 0, 0), 3,
+  "closest_point_on_triangle: query (+Inf,0,0) is NaN in all three, not vertex B (4,0,0) off a NaN d4");
+
+# === 3.3.3 R4geo: geo_closest_point_on_triangle at an infinite input ===
+# An infinite coordinate makes its NaN INSIDE — `0 * Inf` in a dot product, `Inf - Inf`
+# in `vc`, `vb`, `va` — which the same NaN-true Voronoi tests read as "in this region",
+# so a guard of `f64_eq(x, x)` alone would let every case below through unchanged. Each
+# message names what 3.3.2 returned; beside it, the answer with the infinity replaced by
+# 2^30, which is never the same point. The guard is `f64_lt(|x|, +Inf) == 0`, and:
+#   * one infinity per COMPONENT (x, y, z) and per SIGN, so each component's test and
+#     each `f64_abs` can be mutated on its own (without the abs, -Inf < +Inf passes);
+#   * one infinity in each VERTEX, so each vertex's term can be mutated on its own.
+# THE TRUE VALUE: the arithmetic cannot form the limit reliably, and (+Inf,+Inf,0) has
+# none (its finite neighbours land anywhere on edge BC), so the non-finite class is NaN
+# in all three, as NaN is. Checked for NaN-ness, not a payload. ⚠ That refuses the right
+# answers with the wrong ones: most single-infinity queries were the limit on 3.3.2 and
+# are NaN now (counts in src/geo.cyr).
+# [measured: R4geo probes on the 3.3.2 and 3.3.3-base bundles, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, 0, _AB_PINF, 0), 3,
+  "closest_point_on_triangle: query (0,+Inf,0) is NaN, not vertex B (4,0,0); (0,2^30,0) gives C");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, F64_ONE, F64_ONE, _AB_PINF), 3,
+  "closest_point_on_triangle: query (1,1,+Inf) is NaN, not vertex A; (1,1,2^30) gives (1,1,0)");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, _AB_PINF, _AB_NINF, 0), 3,
+  "closest_point_on_triangle: query (+Inf,-Inf,0) is NaN, not vertex A; (2^30,-2^30,0) gives B");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, _AB_PINF, _AB_PINF, 0), 3,
+  "closest_point_on_triangle: query (+Inf,+Inf,0) is NaN, not vertex A; 2^30/2^31 mixes give (2,2,0), B, C");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, _AB_NINF, F64_ONE, 0), 3,
+  "closest_point_on_triangle: query (-Inf,1,0) is NaN, not vertex A; (-2^30,1,0) gives (0,1,0)");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, F64_ONE, _AB_NINF, 0), 3,
+  "closest_point_on_triangle: query (1,-Inf,0) is NaN, not vertex A; (1,-2^30,0) gives (1,0,0)");
+assert_eq(_w1_cp(_w1_o, _w1_b, _w1_c, F64_ONE, F64_ONE, _AB_NINF), 3,
+  "closest_point_on_triangle: query (1,1,-Inf) is NaN, not vertex A; (1,1,-2^30) gives (1,1,0)");
+assert_eq(_w1_cp(hvec3_new(0, 0, _AB_PINF), _w1_b, _w1_c, _w1_m1, _w1_m1, 0), 3,
+  "closest_point_on_triangle: A = (0,0,+Inf), query (-1,-1,0) is NaN, not vertex B (4,0,0)");
+assert_eq(_w1_cp(_w1_o, hvec3_new(f64_from(4), 0, _AB_NINF), _w1_c, _w1_m1, _w1_m1, 0), 3,
+  "closest_point_on_triangle: B = (4,0,-Inf), query (-1,-1,0) is NaN, not vertex A (0,0,0)");
+assert_eq(_w1_cp(_w1_o, _w1_b, hvec3_new(_AB_NINF, f64_from(4), 0), F64_ONE, _w1_m1, 0), 3,
+  "closest_point_on_triangle: C = (-Inf,4,0), query (1,-1,0) is NaN, not edge-AB point (1,0,0)");
+# Control: DBL_MAX is finite and passes the guard. (0,DBL_MAX,0) still takes 3.3.2's path
+# through the finite-overflow class: vertex A, where the answer is C — not repaired here.
+var _r4g_dm = geo_closest_point_on_triangle(_w1_tri, hvec3_new(0x7FEFFFFFFFFFFFFF, 0, 0));
+assert_eq(HVec3_x(_r4g_dm), f64_from(4), "control: query (DBL_MAX,0,0) is finite, vertex B, x = 4");
+assert_eq(HVec3_y(_r4g_dm), 0, "control: ... y = +0 (bits)");
+assert_eq(HVec3_z(_r4g_dm), 0, "control: ... z = +0 (bits)");
+
+# === 3.3.3 W1: the ray tests' NaN-true spellings carry the NaN out ===
+# The `t < 0` tail tests of geo_ray_sphere and geo_ray_obb, the OBB's three
+# parallel-slab tests and the capsule's two cap half-space tests are all NaN-TRUE,
+# and there that is the contract, not the defect: it is how a NaN input leaves as
+# NaN, as it does from geo_ray_plane, instead of as the miss 0. Respelled NaN-false
+# (each OBB slab test on its own, each tail and half-space PAIR together), every pin
+# below came back 0. One of a pair alone changes no t: the other test of the pair
+# still returns, or still accepts, the NaN. The AABB's tail pair is pinned by "a NaN
+# ray yields NaN" above.
+# [measured: W1 per-site NaN-false variants of the 3.3.3 tree, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+fn _w1_ray(ox, oy, oz, dx, dy, dz) {
+    var r = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(r, hvec3_new(ox, oy, oz));
+    GeoRay_set_direction(r, hvec3_new(dx, dy, dz));
+    return r;
+}
+var _w1_h = F64_HALF;
+var _w1_ob = geo_obb_new(hvec3_splat(_w1_h), hvec3_splat(_w1_h), hquat_identity());
+var _w1_cap = geo_capsule_new(_w1_o, hvec3_new(f64_from(3), 0, 0), _AB_NAN);
+assert_eq(_ab_is_nan(geo_ray_sphere(_w1_ray(_AB_NAN, 0, 0, F64_ONE, 0, 0), geo_sphere_new(_w1_o, F64_ONE))), 1,
+  "geo_ray_sphere: a NaN origin is NaN out, not the miss 0");
+assert_eq(_ab_is_nan(geo_ray_obb(_w1_ray(_w1_m1, _w1_h, _w1_h, _AB_NAN, 0, 0), _w1_ob)), 1,
+  "geo_ray_obb: direction (NaN,0,0) from outside the x slab is NaN out, not the miss 0");
+assert_eq(_ab_is_nan(geo_ray_obb(_w1_ray(_w1_h, _w1_m1, _w1_h, 0, _AB_NAN, 0), _w1_ob)), 1,
+  "geo_ray_obb: direction (0,NaN,0) from outside the y slab is NaN out, not the miss 0");
+assert_eq(_ab_is_nan(geo_ray_obb(_w1_ray(_w1_h, _w1_h, _w1_m1, 0, 0, _AB_NAN), _w1_ob)), 1,
+  "geo_ray_obb: direction (0,0,NaN) from outside the z slab is NaN out, not the miss 0");
+assert_eq(_ab_is_nan(geo_ray_capsule(_w1_ray(f64_neg(f64_from(5)), 0, 0, F64_ONE, 0, 0), _w1_cap)), 1,
+  "geo_ray_capsule: a NaN radius on a ray along the axis is NaN out, not the miss 0");
+
+# === 3.3.3 G7: NaN routing past the scaled-norm rescues ===
+# Each scaled rescue (`_hvec3_len_scaled`, `_hvec4_len_scaled`, `_hquat_len_scaled`,
+# `_m3_frob_scaled`, `_opt_norm_scaled`) has a `f64_gt(mx, 0) == 0` exit that is TRUE
+# for NaN, behind a max that drops a NaN in every slot but the last (`f64_max`) or in
+# every slot (the `f64_gt` loops). Called directly, each gives a NaN in a slot its max
+# drops, with the rest zero, a norm of 0. They are safe ONLY because a NaN makes the
+# caller's sum NaN, which is neither `< F64_TINY` nor `+Inf`, so the fast path returns
+# sqrt(NaN). These pin that routing in every slot: the splatted-NaN `hvec3_normalize`
+# test above cannot, because `f64_max` over an all-NaN vector keeps the last slot's NaN
+# whichever way it is routed.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+var _G7_SLOTS = 0;
+for (var _g7_ka = 0; _g7_ka < 3; _g7_ka = _g7_ka + 1) {
+    var _g7_v3 = hvec3_zero();
+    store64(_g7_v3 + _g7_ka * 8, _AB_NAN);
+    assert_eq(_ab_is_nan(hvec3_length(_g7_v3)), 1, "hvec3_length: NaN in any one slot is NaN");
+    _G7_SLOTS = _G7_SLOTS + 1;
+}
+for (var _g7_kb = 0; _g7_kb < 4; _g7_kb = _g7_kb + 1) {
+    var _g7_v4 = hvec4_zero();
+    store64(_g7_v4 + _g7_kb * 8, _AB_NAN);
+    assert_eq(_ab_is_nan(hvec4_length(_g7_v4)), 1, "hvec4_length: NaN in any one slot is NaN");
+    var _g7_q = hquat_new(0, 0, 0, 0);
+    store64(_g7_q + _g7_kb * 8, _AB_NAN);
+    assert_eq(_ab_is_nan(hquat_length(_g7_q)), 1, "hquat_length: NaN in any one slot is NaN");
+    _G7_SLOTS = _G7_SLOTS + 2;
+}
+for (var _g7_kc = 0; _g7_kc < 9; _g7_kc = _g7_kc + 1) {
+    var _g7_m = m3_new();
+    store64(_g7_m + _g7_kc * 8, _AB_NAN);
+    assert_eq(_ab_is_nan(m3_frobenius(_g7_m)), 1, "m3_frobenius: NaN in any one of the nine slots is NaN");
+    _G7_SLOTS = _G7_SLOTS + 1;
+}
+for (var _g7_kd = 0; _g7_kd < 3; _g7_kd = _g7_kd + 1) {
+    var _g7_o = alloc(24);
+    store64(_g7_o, 0);
+    store64(_g7_o + 8, 0);
+    store64(_g7_o + 16, 0);
+    store64(_g7_o + _g7_kd * 8, _AB_NAN);
+    assert_eq(_ab_is_nan(_opt_norm(_g7_o, 3)), 1, "_opt_norm: NaN in any one slot is NaN");
+    _G7_SLOTS = _G7_SLOTS + 1;
+}
+assert_eq(_G7_SLOTS, 23, "the NaN slot loops ran all 3 + 4 + 4 + 9 + 3 = 23 slots");
+
 test_group("abuse/geometry: singular matrices and degenerate transforms");
 
 # m3_inverse documents identity-on-singular; m4_inverse has no such fallback but
@@ -1824,6 +2944,199 @@ assert_eq(vec_len(delaunay_2d(ab_same, 6)), 0,
 assert_eq(vec_len(delaunay_2d(ab_line, vec_len(ab_line) + 1)), 0,
   "delaunay_2d: n = vec_len + 1 -> empty, not an aborted process");
 assert_eq(vec_len(delaunay_2d(0, 3)), 0, "delaunay_2d: null points vec -> empty, not a SIGSEGV");
+
+# === 3.3.3 G7: delaunay_2d strict containment with a NaN site ===
+# `_col_dl_strict_inside` answers `f64_gt(o, 0) == 0 -> 0`, TRUE for a NaN orientation,
+# and delaunay_2d did not validate coordinates, so a NaN site reached it. There the
+# NaN-true answer is the RIGHT one: a NaN orientation does not establish "strictly
+# inside", the insertion override does not fire, and the NaN site was skipped. Flipped
+# to answer 1 for NaN, the override inserted it and the square below came back as four
+# triangles, three of which used the NaN site.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+# ⚠ Left open here: the same square with the NaN at index 0 returned NO triangles (the
+# four finite sites lost), and whether non-finite sites should be skipped or rejected
+# outright was an open decision this block did not settle.
+# ⛔ 3.3.3 W2 — FLIPPED: 6 -> 0. The decision was made in the same release: delaunay_2d
+# now rejects every non-finite site before any work, so this NaN never reaches
+# `_col_dl_strict_inside` and the square comes back EMPTY. The true value is the
+# function's contract, not a geometric quantity: no triangulation of a set holding a
+# point with no position exists, and the empty vec is delaunay_2d's answer for every
+# input it rejects (n < 3, n > vec_len, a null vec — pinned just above). The W2 block
+# after this one pins the guard at every place it fires.
+# ⛔ 3.3.3 R4sym — REMOVED: a "no triangle uses the NaN site" assertion that, after the
+# flip, counted uses in an empty vec and could not fail; the NaN reading it was kept
+# for survived a flip of `_col_dl_strict_inside` in every suite. That reading is still
+# reachable from finite sites whose orientations overflow, and is pinned there, in the
+# R4sym block after W2's.
+var _g7_dsq = vec_new();
+vec_push(_g7_dsq, hvec2_new(0, 0));
+vec_push(_g7_dsq, hvec2_new(f64_from(4), 0));
+vec_push(_g7_dsq, hvec2_new(f64_from(4), f64_from(4)));
+vec_push(_g7_dsq, hvec2_new(0, f64_from(4)));
+vec_push(_g7_dsq, hvec2_new(_AB_NAN, F64_ONE));
+var _g7_dt = delaunay_2d(_g7_dsq, 5);
+assert_eq(vec_len(_g7_dt), 0,
+  "delaunay_2d: a NaN interior site is rejected -> empty (3.3.2 skipped it: 6, the square's 2 triangles)");
+
+# === 3.3.3 W2: delaunay_2d rejects a non-finite site ===
+# ⛔ 3.3.3 — delaunay_2d read coordinates unchecked, and a non-finite site came back as
+# a plausible mesh that depended on where it sat. On the square below plus one site,
+# 3.3.2 skipped a NaN at index 1-4, returned nothing for a NaN at index 0, and
+# INSERTED an infinite site at 13 of its 20 placements, 6 of them also dropping a
+# finite corner. Every non-finite site in [0, n) is now rejected with the empty vec,
+# by one scan before any work. Each fixture below is one where 3.3.2 returned a
+# non-empty mesh, so a deleted guard fails here; the 3.3.2 length is in the message.
+# [measured: W2 probe on the 3.3.2 bundle, 6 site shapes x 5 indices, 2026-10-01; cycc 6.6.12]
+var _W2_NINF = 0xFFF0000000000000;
+var _W2_DMAX = 0x7FEFFFFFFFFFFFFF;   # the largest finite f64: the guard's boundary
+# The square (0,0), (4,0), (4,4), (0,4) in order, with (sx, sy) spliced in at `at`.
+fn _w2_dl(at, sx, sy, n) {
+    var sq = vec_new();
+    vec_push(sq, hvec2_new(0, 0));
+    vec_push(sq, hvec2_new(f64_from(4), 0));
+    vec_push(sq, hvec2_new(f64_from(4), f64_from(4)));
+    vec_push(sq, hvec2_new(0, f64_from(4)));
+    var pts = vec_new();
+    var k = 0;
+    for (var i = 0; i < 5; i = i + 1) {
+        if (i == at) {
+            vec_push(pts, hvec2_new(sx, sy));
+        } else {
+            vec_push(pts, vec_get(sq, k));
+            k = k + 1;
+        }
+    }
+    return delaunay_2d(pts, n);
+}
+# Index-by-index mismatches between a result and the triples in `want`.
+fn _w2_dl_diff(got, want) {
+    if (vec_len(got) != vec_len(want)) { return 0 - 1; }
+    var bad = 0;
+    for (var i = 0; i < vec_len(want); i = i + 1) {
+        if (vec_get(got, i) != vec_get(want, i)) { bad = bad + 1; }
+    }
+    return bad;
+}
+# One site shape per half of the guard and per infinity, at the two ends of the scan.
+assert_eq(vec_len(_w2_dl(4, F64_ONE, _AB_NAN, 5)), 0,
+  "delaunay_2d: (1, NaN) at the LAST index is rejected (3.3.2: 6, skipped)");
+assert_eq(vec_len(_w2_dl(0, _AB_PINF, F64_ONE, 5)), 0,
+  "delaunay_2d: (+Inf, 1) at index 0 is rejected (3.3.2: 9, the Inf site in a triangle)");
+assert_eq(vec_len(_w2_dl(0, _W2_NINF, F64_ONE, 5)), 0,
+  "delaunay_2d: (-Inf, 1) at index 0 is rejected (3.3.2: 6, corner (0,4) in no triangle)");
+assert_eq(vec_len(_w2_dl(1, F64_ONE, _AB_PINF, 5)), 0,
+  "delaunay_2d: (1, +Inf) at index 1 is rejected (3.3.2: 6, the Inf site in, corner (0,4) out)");
+assert_eq(vec_len(_w2_dl(1, F64_ONE, f64_neg(_AB_PINF), 5)), 0,
+  "delaunay_2d: (1, -Inf) at index 1 is rejected (3.3.2: 9, the Inf site in a triangle)");
+# ⭐ The scan covers exactly [0, n): a NaN at index n is not one of the sites.
+var _w2_dlw = vec_new();
+vec_push(_w2_dlw, 0); vec_push(_w2_dlw, 1); vec_push(_w2_dlw, 2);
+vec_push(_w2_dlw, 0); vec_push(_w2_dlw, 2); vec_push(_w2_dlw, 3);
+assert_eq(_w2_dl_diff(_w2_dl(4, _AB_NAN, F64_ONE, 4), _w2_dlw), 0,
+  "delaunay_2d: a NaN at index n is outside the sites -> the square's [0 1 2, 0 2 3]");
+# ⭐ ON the boundary: the largest finite coordinate is a site, in either half. Both
+# meshes are the square plus the one triangle joining the far site to its near edge.
+var _w2_dlx = vec_new();
+vec_push(_w2_dlx, 0); vec_push(_w2_dlx, 1); vec_push(_w2_dlx, 2);
+vec_push(_w2_dlx, 0); vec_push(_w2_dlx, 2); vec_push(_w2_dlx, 3);
+vec_push(_w2_dlx, 2); vec_push(_w2_dlx, 1); vec_push(_w2_dlx, 4);
+assert_eq(_w2_dl_diff(_w2_dl(4, _W2_DMAX, F64_ONE, 5), _w2_dlx), 0,
+  "delaunay_2d: (DBL_MAX, 1) is a site -> [0 1 2, 0 2 3, 2 1 4]");
+var _w2_dly = vec_new();
+vec_push(_w2_dly, 0); vec_push(_w2_dly, 1); vec_push(_w2_dly, 2);
+vec_push(_w2_dly, 0); vec_push(_w2_dly, 2); vec_push(_w2_dly, 3);
+vec_push(_w2_dly, 3); vec_push(_w2_dly, 2); vec_push(_w2_dly, 4);
+assert_eq(_w2_dl_diff(_w2_dl(4, F64_ONE, _W2_DMAX, 5), _w2_dly), 0,
+  "delaunay_2d: (1, DBL_MAX) is a site -> [0 1 2, 0 2 3, 3 2 4]");
+
+# === 3.3.3 R4sym: delaunay_2d at an overflowing scale ===
+test_group("3.3.3 R4sym: delaunay_2d at an overflowing scale");
+# `_col_dl_strict_inside` reads a NaN orientation as "not strictly inside". Since W2 no
+# NaN coordinate gets there, but finite sites whose orientation products overflow do,
+# from a scale of 2^513 up. The square at ±2^520 with an interior site at (2^518, 2^517)
+# is located in triangle (0, 2, 3), which does not contain it, and reaches the test
+# with orientations (+Inf, +Inf, NaN). Read as not-inside, the site is dropped and the
+# square's 2 triangles come back; flipped to inside, the site is inserted into (0, 2, 3)
+# and the mesh is [0 1 2, 2 3 4, 3 0 4, 0 2 4], overlapping, with (0, 2, 4) clockwise.
+# Both are wrong -- every scale from 2^-536 to 2^512 keeps the site -- and the drop is
+# the lesser: the scale class, reported, not repaired. Scaled back by the power of two,
+# every site here has short coordinates (±1, 1/4, 1/8, small integers), where each
+# orientation is exact, so the mesh is checked there: every triangle counter-clockwise,
+# and the square's areas summing to the hull's, 4. Both hold for the drop and for the
+# true Delaunay mesh, and fail for the flip.
+# [measured: scratch instrumented copy of the 3.3.3 tree, flipped and not, and a k = -1019..1023 sweep, 2026-10-01]
+# The orientation of triangle t of `tris`, on the sites scaled by `down`.
+fn _r4s_dl_o(pts, tris, t, down) {
+    var a = vec_get(pts, vec_get(tris, t * 3));
+    var b = vec_get(pts, vec_get(tris, t * 3 + 1));
+    var c = vec_get(pts, vec_get(tris, t * 3 + 2));
+    var ax = f64_mul(HVec2_x(a), down);
+    var ay = f64_mul(HVec2_y(a), down);
+    var abx = f64_sub(f64_mul(HVec2_x(b), down), ax);
+    var aby = f64_sub(f64_mul(HVec2_y(b), down), ay);
+    var acx = f64_sub(f64_mul(HVec2_x(c), down), ax);
+    var acy = f64_sub(f64_mul(HVec2_y(c), down), ay);
+    return f64_sub(f64_mul(abx, acy), f64_mul(acx, aby));
+}
+# How many triangles of `tris` are not counter-clockwise.
+fn _r4s_dl_cw(pts, tris, down) {
+    var bad = 0;
+    for (var t = 0; t < vec_len(tris) / 3; t = t + 1) {
+        if (f64_gt(_r4s_dl_o(pts, tris, t, down), 0) == 0) { bad = bad + 1; }
+    }
+    return bad;
+}
+# Twice the summed (unsigned) area of `tris`.
+fn _r4s_dl_area2(pts, tris, down) {
+    var sum = 0;
+    for (var t = 0; t < vec_len(tris) / 3; t = t + 1) {
+        sum = f64_add(sum, f64_abs(_r4s_dl_o(pts, tris, t, down)));
+    }
+    return sum;
+}
+# Four sites (x0, y0) .. (x3, y3), small integers, times 2^e.
+fn _r4s_dl_pts(e, x0, y0, x1, y1, x2, y2, x3, y3) {
+    var sc = (1023 + e) << 52;
+    var pts = vec_new();
+    vec_push(pts, hvec2_new(f64_mul(f64_from(x0), sc), f64_mul(f64_from(y0), sc)));
+    vec_push(pts, hvec2_new(f64_mul(f64_from(x1), sc), f64_mul(f64_from(y1), sc)));
+    vec_push(pts, hvec2_new(f64_mul(f64_from(x2), sc), f64_mul(f64_from(y2), sc)));
+    vec_push(pts, hvec2_new(f64_mul(f64_from(x3), sc), f64_mul(f64_from(y3), sc)));
+    return pts;
+}
+var _r4s_dpts = _r4s_dl_pts(520, 0 - 1, 0 - 1, 1, 0 - 1, 1, 1, 0 - 1, 1);
+vec_push(_r4s_dpts, hvec2_new((1023 + 518) << 52, (1023 + 517) << 52));
+var _r4s_dt = delaunay_2d(_r4s_dpts, 5);
+var _r4s_down = (1023 - 520) << 52;                            # 2^-520
+assert_eq(_r4s_dl_cw(_r4s_dpts, _r4s_dt, _r4s_down), 0,
+  "R4sym delaunay_2d at 2^520: every triangle counter-clockwise (flipped: (0, 2, 4) is not)");
+assert_eq(_r4s_dl_area2(_r4s_dpts, _r4s_dt, _r4s_down), f64_from(8),
+  "R4sym delaunay_2d at 2^520: the areas sum to the hull's, 4 (flipped: they overlap)");
+# ⚠ Pins the scale-class drop, a wrong answer: the interior site is in no triangle. A
+# repair of the scale class flips this to the 4-triangle fan around site 4, which
+# every scale from 2^-269 to 2^255 returns.
+var _r4s_dw = vec_new();
+vec_push(_r4s_dw, 0); vec_push(_r4s_dw, 1); vec_push(_r4s_dw, 2);
+vec_push(_r4s_dw, 0); vec_push(_r4s_dw, 2); vec_push(_r4s_dw, 3);
+assert_eq(_w2_dl_diff(_r4s_dt, _r4s_dw), 0,
+  "R4sym delaunay_2d at 2^520: [0 1 2, 0 2 3], the interior site dropped (scale class; 3.3.2 the same)");
+# The square puts the NaN on the test's third orientation, the edge v0-v1, in all 24
+# corner orders and 8 site placements tried. These two 4-site sets put it on the first
+# (v1-v2) and the second (v2-v0), each on a triangle with a ghost vertex: there a flip
+# of that one line adds a clockwise triangle. What comes back is short -- one triangle,
+# where the same sites at scale 1 give two: the scale class again -- so only the
+# orientation is pinned, and that a triangle is there.
+# [measured: scratch per-line flips of the 3.3.3 tree over 40,000 random sets at 2^513..2^520, 2026-10-01]
+var _r4s_d1 = _r4s_dl_pts(516, 2, 0 - 3, 0, 1, 0 - 3, 0 - 1, 0 - 5, 8);
+var _r4s_d1t = delaunay_2d(_r4s_d1, 4);
+assert(vec_len(_r4s_d1t) >= 3, "R4sym delaunay_2d, NaN on the first orientation: a triangle comes back");
+assert_eq(_r4s_dl_cw(_r4s_d1, _r4s_d1t, (1023 - 516) << 52), 0,
+  "R4sym delaunay_2d, NaN on the first orientation: every triangle counter-clockwise (flipped: (0, 2, 3) is not)");
+var _r4s_d2 = _r4s_dl_pts(520, 0 - 8, 0 - 1, 0 - 5, 0 - 7, 0 - 2, 0 - 8, 4, 0 - 1);
+var _r4s_d2t = delaunay_2d(_r4s_d2, 4);
+assert(vec_len(_r4s_d2t) >= 3, "R4sym delaunay_2d, NaN on the second orientation: a triangle comes back");
+assert_eq(_r4s_dl_cw(_r4s_d2, _r4s_d2t, _r4s_down), 0,
+  "R4sym delaunay_2d, NaN on the second orientation: every triangle counter-clockwise (flipped: (1, 0, 2) is not)");
 
 test_group("abuse/geometry: half-edge mesh input validation");
 
@@ -2471,15 +3784,321 @@ assert_eq(vec_len(num_continued_fraction_rational(5, 0)), 0,
 assert_eq(num_halton(5, 0), 0, "num_halton: base = 0 -> 0 (would be SIGFPE)");
 assert_eq(num_halton(5, 1), 0, "num_halton: base = 1 -> 0 (would never terminate)");
 assert_eq(num_halton(5, (0 - 2)), 0, "num_halton: base = -2 -> 0");
-assert_eq(num_halton((0 - 5), 2), 0, "num_halton: negative index -> 0");
+# ⛔ 3.3.3 — FLIPPED, BOTH. These pinned num_halton(-5, 2) == 0.0 and num_sobol(-5)
+# "stays finite" (it was 0.375). There is no sample at a negative index, and 0.0 is
+# the sample at index 0, so each pinned a plausible answer to a question with none:
+# the fabricated-answer class. Both now return a quiet NaN, which no sample equals
+# (src/num_ext.cyr; the 3.3.3 R4num block below pins the boundaries).
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
+assert_eq(num_halton((0 - 5), 2), 0x7FF8000000000000, "num_halton: negative index -> quiet NaN (3.3.2: 0.0)");
 assert_eq(num_sobol(0), 0, "num_sobol: index 0 -> 0");
-assert_eq(_ab_is_finite(num_sobol((0 - 5))), 1, "num_sobol: negative index stays finite");
+assert_eq(num_sobol((0 - 5)), 0x7FF8000000000000, "num_sobol: negative index -> quiet NaN (3.3.2: 0.375)");
 
 assert_eq(vec_len(num_sieve((0 - 10))), 0, "num_sieve: limit = -10 -> empty");
 assert_eq(vec_len(num_sieve(0)), 0, "num_sieve: limit = 0 -> empty");
 assert_eq(vec_len(num_sieve(1)), 0, "num_sieve: limit = 1 -> empty");
 assert_eq(vec_len(num_sieve(100000000)), 0, "num_sieve: limit = 1e8 (over the 10M cap) -> empty");
 assert_eq(vec_len(num_sieve(2)), 1, "num_sieve: limit = 2 -> [2]");
+
+# === 3.3.3 R3b: num_extended_gcd at i64 min ===
+test_group("3.3.3 R3b: num_extended_gcd at i64 min");
+# ⛔ `0 - a` wraps back to i64 min, so the Euclid loop divided by and into -2^63 as
+# if it were a magnitude: the gcd came back negative, or right with coefficients
+# that satisfy a*x + b*y = gcd only modulo 2^64. i64 min as a dividend is now read
+# as 2^63. A gcd of 2^63 -- both entries 0 or i64 min, not both 0 -- comes back as
+# i64 min, 2^63 read unsigned, with 3.3.2's x and y (3.3.3 R5num, below). Every
+# expected (gcd, x, y) is a python3 big-int run of the same algorithm; "3.3.2:" is
+# what 3.3.2 returned.
+# [measured: fixture probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+var _r3b_ab_x = alloc(8);
+var _r3b_ab_y = alloc(8);
+var _r3b_ab_min = 0x8000000000000000;
+var _r3b_ab_max = 0x7FFFFFFFFFFFFFFF;
+fn _r3b_ab_egcd(a, b) {
+    store64(_r3b_ab_x, 0x1111);
+    store64(_r3b_ab_y, 0x2222);
+    return num_extended_gcd(a, b, _r3b_ab_x, _r3b_ab_y);
+}
+
+# ⛔ 3.3.3 R5num — FLIPPED, ALL EIGHT. These pinned the designed 0 with x and y
+# untouched for the three gcd-2^63 pairs. That 0 made the reducing idiom `a / g`
+# divide by zero (SIGFPE) where 3.3.2's i64 min reduced correctly, so the pairs
+# return 3.3.2's results again: g = i64 min, 2^63 read unsigned (python3 math.gcd
+# gives 2^63 for all three), and x, y with a*x + b*y = 2^63 in big ints: one i64 min
+# entry times -1, the other entry times 0. The R5num block below pins the idiom.
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
+assert_eq(_r3b_ab_egcd(_r3b_ab_min, 0), _r3b_ab_min, "egcd(i64 min, 0) = i64 min, 2^63 unsigned (as in 3.3.2)");
+assert_eq(load64(_r3b_ab_x), 0 - 1, "egcd(i64 min, 0): x = -1, (-2^63)(-1) = 2^63 (as in 3.3.2)");
+assert_eq(load64(_r3b_ab_y), 0, "egcd(i64 min, 0): y = 0 (as in 3.3.2)");
+assert_eq(_r3b_ab_egcd(0, _r3b_ab_min), _r3b_ab_min, "egcd(0, i64 min) = i64 min, 2^63 unsigned (as in 3.3.2)");
+assert_eq(load64(_r3b_ab_x), 0, "egcd(0, i64 min): x = 0 (as in 3.3.2)");
+assert_eq(load64(_r3b_ab_y), 0 - 1, "egcd(0, i64 min): y = -1 (as in 3.3.2)");
+assert_eq(_r3b_ab_egcd(_r3b_ab_min, _r3b_ab_min), _r3b_ab_min,
+  "egcd(i64 min, i64 min) = i64 min, 2^63 unsigned (as in 3.3.2)");
+assert_eq(load64(_r3b_ab_x), 0, "egcd(i64 min, i64 min): x = 0 (as in 3.3.2)");
+# The neighbours: (0, 0) and i64 min + 1, whose gcds fit.
+var _r3b_ab_g00 = _r3b_ab_egcd(0, 0);
+assert_eq(load64(_r3b_ab_x), 1, "egcd(0, 0): x = 1, as in 3.3.2 (control)");
+assert_eq(load64(_r3b_ab_y), 0, "egcd(0, 0): y = 0, as in 3.3.2");
+assert_eq(_r3b_ab_egcd(_r3b_ab_min + 1, 0), _r3b_ab_max, "egcd(i64 min + 1, 0) = 2^63 - 1 (control)");
+assert_eq(load64(_r3b_ab_x), 0 - 1, "egcd(i64 min + 1, 0): x = -1");
+assert_eq(load64(_r3b_ab_y), 0, "egcd(i64 min + 1, 0): y = 0");
+assert_eq(_r3b_ab_egcd(0, _r3b_ab_min + 1), _r3b_ab_max, "egcd(0, i64 min + 1) = 2^63 - 1 (control)");
+assert_eq(load64(_r3b_ab_y), 0 - 1, "egcd(0, i64 min + 1): y = -1");
+
+assert_eq(_r3b_ab_egcd(_r3b_ab_min, 6), 2, "egcd(i64 min, 6) = 2 (3.3.2: -2)");
+assert_eq(load64(_r3b_ab_x), 0 - 1, "egcd(i64 min, 6): x = -1");
+assert_eq(load64(_r3b_ab_y), 0 - 1537228672809129301,
+  "egcd(i64 min, 6): y = -1537228672809129301 (3.3.2: +1537228672809129301)");
+assert_eq(_r3b_ab_egcd(6, _r3b_ab_min), 2, "egcd(6, i64 min) = 2: i64 min as dividend on the 2nd pass (3.3.2: -2)");
+assert_eq(load64(_r3b_ab_x), 0 - 1537228672809129301, "egcd(6, i64 min): x = -1537228672809129301");
+assert_eq(load64(_r3b_ab_y), 0 - 1, "egcd(6, i64 min): y = -1");
+# A non-negative gcd was no proof of right coefficients.
+assert_eq(_r3b_ab_egcd(_r3b_ab_min, _r3b_ab_min + 6), 2, "egcd(i64 min, i64 min + 6) = 2 (3.3.2: 2 as well)");
+assert_eq(load64(_r3b_ab_x), 1537228672809129300,
+  "egcd(i64 min, i64 min + 6): x = 1537228672809129300 (3.3.2: -1537228672809129300)");
+assert_eq(load64(_r3b_ab_y), 0 - 1537228672809129301, "egcd(i64 min, i64 min + 6): y = -1537228672809129301");
+assert_eq(_r3b_ab_egcd(_r3b_ab_min, _r3b_ab_max), 1, "egcd(i64 min, 2^63 - 1) = 1 (3.3.2: -1)");
+assert_eq(load64(_r3b_ab_x), 0 - 1, "egcd(i64 min, 2^63 - 1): x = -1");
+assert_eq(load64(_r3b_ab_y), 0 - 1, "egcd(i64 min, 2^63 - 1): y = -1 (3.3.2: 1)");
+assert_eq(_r3b_ab_egcd(_r3b_ab_max, _r3b_ab_min), 1, "egcd(2^63 - 1, i64 min) = 1 (3.3.2: -1)");
+assert_eq(load64(_r3b_ab_x), 0 - 1, "egcd(2^63 - 1, i64 min): x = -1 (3.3.2: 1)");
+assert_eq(load64(_r3b_ab_y), 0 - 1, "egcd(2^63 - 1, i64 min): y = -1");
+assert_eq(_r3b_ab_egcd(_r3b_ab_min, 0x6000000000000000), 0x2000000000000000,
+  "egcd(i64 min, 3 * 2^61) = 2^61 (3.3.2: -2^61)");
+assert_eq(load64(_r3b_ab_y), 0 - 1, "egcd(i64 min, 3 * 2^61): y = -1 (3.3.2: 1)");
+# r = 1 makes the quotient 2^63 itself, which wraps to i64 min and is absorbed.
+assert_eq(_r3b_ab_egcd(_r3b_ab_min, 1), 1, "egcd(i64 min, 1) = 1 (quotient 2^63; control, as in 3.3.2)");
+assert_eq(load64(_r3b_ab_x), 0, "egcd(i64 min, 1): x = 0");
+assert_eq(load64(_r3b_ab_y), 1, "egcd(i64 min, 1): y = 1");
+assert_eq(_r3b_ab_egcd(0 - 1, _r3b_ab_min), 1, "egcd(-1, i64 min) = 1 (control, as in 3.3.2)");
+assert_eq(load64(_r3b_ab_x), 0 - 1, "egcd(-1, i64 min): x = -1");
+assert_eq(load64(_r3b_ab_y), 0, "egcd(-1, i64 min): y = 0");
+assert_eq(_r3b_ab_egcd(_r3b_ab_min + 1, 6), 1, "egcd(i64 min + 1, 6) = 1 (control: the old path)");
+assert_eq(load64(_r3b_ab_x), 0 - 1, "egcd(i64 min + 1, 6): x = -1");
+assert_eq(load64(_r3b_ab_y), 0 - 1537228672809129301, "egcd(i64 min + 1, 6): y = -1537228672809129301");
+
+# === 3.3.3 R4num: num_gcd at i64 min ===
+test_group("3.3.3 R4num: num_gcd at i64 min");
+# The other side of the repair above. `0 - a` leaves i64 min where it is, so
+# num_gcd(i64 min, 0) and (0, i64 min) hand it back from the early returns, and
+# (i64 min, i64 min) shifts both to 1 and returns 1 << 63: all three i64 min. Their
+# gcd is 2^63, and i64 min is 2^63 read unsigned -- the reading the loop gives an
+# i64 min argument. Every other pair with an i64 min entry is right (cycc's `>>` is
+# logical, so the loop reads the pattern as 2^63); the controls below are such pairs,
+# and the neighbours of the three. Truths: python3 math.gcd.
+# ⛔ 3.3.3 R5num — FLIPPED, THE FIRST THREE. They pinned the designed 0 of an
+# earlier 3.3.3 draft, which made `a / g` divide by zero; num_gcd returns 3.3.2's
+# i64 min for them again (src/num.cyr, and the R5num block below).
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
+assert_eq(num_gcd(_r3b_ab_min, 0), _r3b_ab_min, "num_gcd(i64 min, 0) = i64 min, 2^63 unsigned (as in 3.3.2)");
+assert_eq(num_gcd(0, _r3b_ab_min), _r3b_ab_min, "num_gcd(0, i64 min) = i64 min, 2^63 unsigned (as in 3.3.2)");
+assert_eq(num_gcd(_r3b_ab_min, _r3b_ab_min), _r3b_ab_min,
+  "num_gcd(i64 min, i64 min) = 1 << 63 = i64 min, 2^63 unsigned (as in 3.3.2)");
+assert_eq(num_gcd(_r3b_ab_min + 1, 0), _r3b_ab_max, "num_gcd(i64 min + 1, 0) = 2^63 - 1 (control, as in 3.3.2)");
+assert_eq(num_gcd(0, _r3b_ab_min + 1), _r3b_ab_max, "num_gcd(0, i64 min + 1) = 2^63 - 1 (control, as in 3.3.2)");
+assert_eq(num_gcd(_r3b_ab_min, 0x4000000000000000), 0x4000000000000000,
+  "num_gcd(i64 min, 2^62) = 2^62: the shift loop runs 62 times and the result fits (control, as in 3.3.2)");
+assert_eq(num_gcd(_r3b_ab_min, _r3b_ab_min + 1), 1, "num_gcd(i64 min, i64 min + 1) = 1 (control, as in 3.3.2)");
+assert_eq(num_gcd(_r3b_ab_min, 6), 2, "num_gcd(i64 min, 6) = 2 (control, as in 3.3.2)");
+
+# === 3.3.3 R5num: gcd 2^63 as i64 min, and the reducing idiom ===
+test_group("3.3.3 R5num: gcd 2^63 as i64 min, and the reducing idiom");
+# The standard use of a gcd is to reduce: p / g, q / g. An earlier 3.3.3 draft
+# returned 0 for the three gcd-2^63 pairs, and reduce(0, i64 min) then died with
+# SIGFPE (exit 136), where 3.3.2's i64 min gave the right pair: i64 min / i64 min = 1
+# and 0 / i64 min = 0. Each division below runs only on a g that cannot trap (not 0,
+# and not -1), so a regression fails an assertion here instead of killing the suite.
+# The expected pairs are the true reductions, python3 0 // 2^63 = 0 and
+# 2^63 // 2^63 = 1, with the signs of signed division.
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01: 0/1 and 1/1]
+var r5n_min = 0x8000000000000000;
+var r5n_trap = 0x5A5A;    # what _r5n_div reports instead of dividing by 0 or -1
+fn _r5n_div(p, g) {
+    if (g == 0) { return r5n_trap; }
+    if (g == 0 - 1) { return r5n_trap; }
+    return p / g;
+}
+var r5n_g = num_gcd(0, r5n_min);
+assert_eq(_r5n_div(0, r5n_g), 0, "reduce(0, i64 min) by num_gcd: 0 / g = 0 (draft: g = 0, SIGFPE)");
+assert_eq(_r5n_div(r5n_min, r5n_g), 1, "reduce(0, i64 min) by num_gcd: i64 min / g = 1, so 0/1");
+r5n_g = num_gcd(r5n_min, r5n_min);
+assert_eq(_r5n_div(r5n_min, r5n_g), 1, "reduce(i64 min, i64 min) by num_gcd: 1/1 (draft: g = 0, SIGFPE)");
+r5n_g = num_gcd(r5n_min, 0);
+assert_eq(_r5n_div(r5n_min, r5n_g), 1, "reduce(i64 min, 0) by num_gcd: i64 min / g = 1");
+assert_eq(_r5n_div(0, r5n_g), 0, "reduce(i64 min, 0) by num_gcd: 0 / g = 0");
+var r5n_x = alloc(8);
+var r5n_y = alloc(8);
+r5n_g = num_extended_gcd(0, r5n_min, r5n_x, r5n_y);
+assert_eq(_r5n_div(0, r5n_g), 0, "reduce(0, i64 min) by num_extended_gcd: 0 / g = 0 (draft: g = 0)");
+assert_eq(_r5n_div(r5n_min, r5n_g), 1, "reduce(0, i64 min) by num_extended_gcd: i64 min / g = 1");
+r5n_g = num_extended_gcd(r5n_min, r5n_min, r5n_x, r5n_y);
+assert_eq(_r5n_div(r5n_min, r5n_g), 1, "reduce(i64 min, i64 min) by num_extended_gcd: 1/1 (draft: g = 0)");
+assert_eq(load64(r5n_y), 0 - 1, "egcd(i64 min, i64 min): y = -1, so a*x + b*y = 2^63 (as in 3.3.2)");
+r5n_g = num_extended_gcd(r5n_min, 0, r5n_x, r5n_y);
+assert_eq(_r5n_div(r5n_min, r5n_g), 1, "reduce(i64 min, 0) by num_extended_gcd: i64 min / g = 1");
+# A gcd that fits reduces as before (control).
+r5n_g = num_gcd(r5n_min, 6);
+assert_eq(_r5n_div(r5n_min, r5n_g), 0 - 0x4000000000000000, "reduce(i64 min, 6): i64 min / 2 = -2^62 (control)");
+assert_eq(_r5n_div(6, r5n_g), 3, "reduce(i64 min, 6): 6 / 2 = 3 (control)");
+
+# === 3.3.3 G3: num_divisor_sigma with k < 0 ===
+test_group("3.3.3 G3: num_divisor_sigma with k < 0");
+# p^k came out as 1 for every k < 0, so sigma_{-1}(12) returned sigma_0(12) = 6 where
+# the truth is 28/12 = 7/3. For n >= 2 a negative k is now the designed 0. n = 1 keeps
+# returning 1, which is sigma_k(1) for every k, negative ones included.
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
+assert_eq(num_divisor_sigma(12, 0 - 1), 0, "num_divisor_sigma(12, -1) -> 0 (3.3.2: 6, which is sigma_0)");
+assert_eq(num_divisor_sigma(2, 0 - 1), 0,
+  "num_divisor_sigma(2, -1) -> 0, the smallest n the refusal reaches (3.3.2: 2)");
+assert_eq(num_divisor_sigma(1, 0 - 1), 1, "num_divisor_sigma(1, -1) = 1 = sigma_{-1}(1), as in 3.3.2 (control)");
+assert_eq(num_divisor_sigma(12, 0), 6, "num_divisor_sigma(12, 0) = 6: k = 0 is still accepted (control)");
+
+# === 3.3.3 W5: totient, mobius and sobol below their domain ===
+test_group("3.3.3 W5: totient, mobius and sobol below their domain");
+# num_factorize returns an empty vec for every n <= 1, and through 3.3.2 only n == 0
+# was refused above it: phi(n < 0) came back as n itself, mu(n < 0) as 1 (an empty
+# factor list has an even count), whatever n's factors. Both now return the designed
+# 0 for every n <= 0, the n == 0 contract above. The fixtures sit on the boundary
+# (-1, next to the 0 that already returned 0), at i64 min, where 0 - n wraps, and at
+# the values 3.3.2 was measured on, so each refusal is seen where it fires.
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
+var w5_imin = 0x8000000000000000;                              # i64 min
+assert_eq(num_euler_totient(0 - 1), 0, "W5 num_euler_totient(-1) -> 0 (3.3.2: -1)");
+assert_eq(num_euler_totient(0 - 5), 0, "W5 num_euler_totient(-5) -> 0 (3.3.2: -5)");
+assert_eq(num_euler_totient(0 - 12), 0, "W5 num_euler_totient(-12) -> 0 (3.3.2: -12)");
+assert_eq(num_euler_totient(w5_imin), 0, "W5 num_euler_totient(i64 min) -> 0 (3.3.2: i64 min)");
+assert_eq(num_mobius(0 - 1), 0, "W5 num_mobius(-1) -> 0 (3.3.2: 1)");
+assert_eq(num_mobius(0 - 2), 0, "W5 num_mobius(-2) -> 0 (3.3.2: 1, an odd count read as even)");
+assert_eq(num_mobius(0 - 4), 0, "W5 num_mobius(-4) -> 0 (3.3.2: 1)");
+assert_eq(num_mobius(0 - 6), 0, "W5 num_mobius(-6) -> 0 (3.3.2: 1)");
+assert_eq(num_mobius(w5_imin), 0, "W5 num_mobius(i64 min) -> 0 (3.3.2: 1)");
+# Controls on the other side of the boundary, each a value no refusal can produce
+# (phi >= 1; mu(1) = 1 and mu(2) = -1 are not 0).
+assert_eq(num_euler_totient(1), 1, "W5 num_euler_totient(1) = 1 (control)");
+assert_eq(num_euler_totient(2), 1, "W5 num_euler_totient(2) = 1 (control)");
+assert_eq(num_mobius(1), 1, "W5 num_mobius(1) = 1 (control)");
+assert_eq(num_mobius(2), 0 - 1, "W5 num_mobius(2) = -1 (control)");
+# num_sobol: 3.3.2's bit reversal kept the low 32 Gray bits, and a negative index's set
+# high bits reach Gray bit 31 through index bit 32 (cycc's `>>` is logical), so -5
+# came out as 0.375 (and -1 as 0.0). 0.375 is not even the value of 2^32 - 5, the
+# index -5 would be modulo 2^32: that is 0.375 + 2^-32.
+# ⛔ 3.3.3 R4num — FLIPPED. These pinned the first repair's 0.0, which is index 0's
+# sample: a plausible answer where there is none. A negative index now returns a
+# quiet NaN, which no sample equals (src/num_ext.cyr, num_sobol).
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
+assert_eq(num_sobol(0 - 5), 0x7FF8000000000000, "W5 num_sobol(-5) -> quiet NaN (3.3.2: 0.375)");
+assert_eq(num_sobol(0 - 3), 0x7FF8000000000000, "W5 num_sobol(-3) -> quiet NaN (3.3.2: 0.75)");
+assert_eq(num_sobol(w5_imin), 0x7FF8000000000000,
+  "W5 num_sobol(i64 min) -> quiet NaN (3.3.2: 0.0, its low 32 Gray bits are 0)");
+assert_eq(num_sobol(0xFFFFFFFB), 0x3FD8000000400000, "W5 num_sobol(2^32 - 5) = 0.375 + 2^-32 (control)");
+assert_eq(num_sobol(1), 0x3FE0000000000000, "W5 num_sobol(1) = 0.5 (control, the first index past 0)");
+# num_continued_fraction_rational divided i64 min by -1, which x86 traps (SIGFPE,
+# exit 136 on 3.3.2) rather than wraps: (i64 min, -1) on the first pass and
+# (-1, i64 min) on the second. Their quotient, 2^63, has no i64, so both return the
+# empty vec that q = 0 returns. The neighbours that fit still expand. (Each element
+# is read only under its length, so a wrong length fails here instead of aborting
+# the suite in vec_get.)
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01: exit 136 on both]
+assert_eq(vec_len(num_continued_fraction_rational(w5_imin, 0 - 1)), 0,
+  "W5 num_continued_fraction_rational(i64 min, -1) -> empty (3.3.2: SIGFPE)");
+assert_eq(vec_len(num_continued_fraction_rational(0 - 1, w5_imin)), 0,
+  "W5 num_continued_fraction_rational(-1, i64 min) -> empty (3.3.2: SIGFPE on the second pass)");
+var w5_cf1 = num_continued_fraction_rational(w5_imin, 0 - 2);
+var w5_cf1a = 0;
+if (vec_len(w5_cf1) == 1) { w5_cf1a = vec_get(w5_cf1, 0); }
+assert_eq(vec_len(w5_cf1), 1, "W5 num_continued_fraction_rational(i64 min, -2) = [2^62] (control)");
+assert_eq(w5_cf1a, 0x4000000000000000, "W5 num_continued_fraction_rational(i64 min, -2) = [2^62] (control)");
+var w5_cf2 = num_continued_fraction_rational(1, w5_imin);
+var w5_cf2b = 0;
+if (vec_len(w5_cf2) == 2) { w5_cf2b = vec_get(w5_cf2, 1); }
+assert_eq(vec_len(w5_cf2), 2, "W5 num_continued_fraction_rational(1, i64 min) = [0, i64 min] (control)");
+assert_eq(w5_cf2b, w5_imin, "W5 num_continued_fraction_rational(1, i64 min) = [0, i64 min] (control)");
+var w5_cf3 = num_continued_fraction_rational(0 - 7, 3);
+var w5_cf3a = 0;
+var w5_cf3b = 0;
+if (vec_len(w5_cf3) == 2) {
+    w5_cf3a = vec_get(w5_cf3, 0);
+    w5_cf3b = vec_get(w5_cf3, 1);
+}
+assert_eq(vec_len(w5_cf3), 2, "W5 num_continued_fraction_rational(-7, 3) = [-2, -3], truncating (unchanged)");
+assert_eq(w5_cf3a, 0 - 2, "W5 num_continued_fraction_rational(-7, 3) = [-2, -3], truncating (unchanged)");
+assert_eq(w5_cf3b, 0 - 3, "W5 num_continued_fraction_rational(-7, 3) = [-2, -3], truncating (unchanged)");
+
+# === 3.3.3 R4num: num_sobol and num_halton refuse an out-of-domain index ===
+test_group("3.3.3 R4num: num_sobol and num_halton refuse an out-of-domain index");
+# num_sobol's bit reversal covered 32 bits, and through 3.3.2 an index at or above
+# 2^32 returned whatever its low Gray bits reversed to: 2^32 repeated the last
+# sample (2^-32), 2^32 + 1 gave 0.5 + 2^-32 (num_sobol(1) is 0.5), and 2^63 - 1 gave
+# index 0's 0.0. num_halton returned 0.0 for a negative index. A negative index has
+# no point, and both now return a quiet NaN for it, which no point equals. Each
+# boundary is asserted on both sides; "3.3.2:" is the probe of the shipped bundle.
+# ⛔ 3.3.3 R5num — FLIPPED, THREE: num_sobol(2^32), (2^32 + 1) and (2^63 - 1). They
+# pinned R4num's NaN for an index at or above 2^32, but every such index has its
+# point, and the reversal now covers 64 bits: the values are an exact python3
+# van der Corput of the Gray code (the R5num block below has the rest).
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
+var r4q_nan = 0x7FF8000000000000;
+assert_eq(num_sobol(0xFFFFFFFF), 0x3DF0000000000000, "num_sobol(2^32 - 1) = 2^-32 (control, as in 3.3.2)");
+assert_eq(num_sobol(0x100000000), 0x3DF8000000000000, "num_sobol(2^32) = 3 * 2^-33 (3.3.2: 2^-32, a repeat)");
+assert_eq(num_sobol(0x100000001), 0x3FE0000000300000,
+  "num_sobol(2^32 + 1) = 0.5 + 3 * 2^-33 (3.3.2: 0.5 + 2^-32)");
+assert_eq(num_sobol(0x7FFFFFFFFFFFFFFF), 0x3C00000000000000,
+  "num_sobol(2^63 - 1) = 2^-63: its Gray code is 2^62 (3.3.2: 0.0)");
+assert_eq(num_sobol(0 - 1), r4q_nan, "num_sobol(-1) -> quiet NaN, the first index below (3.3.2: 0.0)");
+assert_eq(num_sobol(0), 0, "num_sobol(0) = 0.0: index 0 is a sample (control)");
+assert_eq(num_halton(0 - 1, 2), r4q_nan, "num_halton(-1, 2) -> quiet NaN, the first index below (3.3.2: 0.0)");
+assert_eq(num_halton(w5_imin, 3), r4q_nan, "num_halton(i64 min, 3) -> quiet NaN (3.3.2: 0.0)");
+assert_eq(num_halton(0, 2), 0, "num_halton(0, 2) = 0.0: index 0 is a sample (control)");
+assert_eq(num_halton(1, 3), 0x3FD5555555555555, "num_halton(1, 3) = 1/3 (control)");
+var r4q_hx = alloc(8);
+var r4q_hy = alloc(8);
+var _r4q_ht, _r4q_hv = num_halton_2d(0 - 1, r4q_hx, r4q_hy);
+assert_eq(is_ok(_r4q_ht), 1, "num_halton_2d(-1): still Ok(0)");
+assert_eq(load64(r4q_hx), r4q_nan, "num_halton_2d(-1): x = quiet NaN (3.3.2: 0.0)");
+assert_eq(load64(r4q_hy), r4q_nan, "num_halton_2d(-1): y = quiet NaN (3.3.2: 0.0)");
+
+# === 3.3.3 R5num: num_sobol over 64 bits ===
+test_group("3.3.3 R5num: num_sobol over 64 bits");
+# The point at index i is the radical inverse of the Gray code i ^ (i >> 1), which
+# exists for every i >= 0. The reversal now covers all 64 bits; below 2^53 the point
+# has at most 53 significant bits and is exact, and above it the point is rounded
+# toward zero, so it stays below 1.0. Every expected value is an exact python3
+# Fraction of the radical inverse, rounded toward zero; "nearest" is its round to
+# nearest where the two differ.
+# [measured: scratch probe against a 3.3.3 R5num bundle, cycc 6.6.12, 2026-10-01; python3 Fraction oracle]
+assert_eq(num_sobol(0x1FFFFFFFFFFFFF), 0x3CA0000000000000, "num_sobol(2^53 - 1) = 2^-53, exact");
+assert_eq(num_sobol(0x20000000000000), 0x3CA8000000000000, "num_sobol(2^53) = 3 * 2^-54, exact");
+assert_eq(num_sobol(0x15555555555555), 0x3FEFFFFFFFFFFFFF,
+  "num_sobol(0x15555555555555) = 1 - 2^-53, exact: Gray code 2^53 - 1, the point nearest 1 below 2^53");
+# The first inexact index: 0.5 + 2^-53 + 2^-54 is a tie, which nearest rounds up.
+assert_eq(num_sobol(0x20000000000001), 0x3FE0000000000001,
+  "num_sobol(2^53 + 1) = 0.5 + 2^-53, toward zero (nearest: 0.5 + 2^-52)");
+# 1 - 2^-54 is a tie too, and nearest would leave [0, 1).
+assert_eq(num_sobol(0x2AAAAAAAAAAAAA), 0x3FEFFFFFFFFFFFFF,
+  "num_sobol(0x2AAAAAAAAAAAAA) = 1 - 2^-53, toward zero (nearest: 1.0)");
+# Full-mantissa points: one the add rounded up (not a tie), one it rounded down.
+assert_eq(num_sobol(0x7953A6F252E6B438), 0x3FC23BD4EF68D72F,
+  "num_sobol(0x7953A6F252E6B438), toward zero (nearest: 0x3FC23BD4EF68D730)");
+assert_eq(num_sobol(0x5DEECE66D1234567), 0x3FC5F3A6CED54ACC,
+  "num_sobol(0x5DEECE66D1234567), inexact, rounded down already: toward zero = nearest");
+assert_eq(num_sobol(0x4000000000000000), 0x3C18000000000000, "num_sobol(2^62) = 3 * 2^-63, exact");
+assert_eq(num_sobol(0x1234567), 0x3FC5F3A6C0000000, "num_sobol(0x1234567) below 2^32 (control, as in 3.3.2)");
+
+# === 3.3.3 R5num: num_halton's range and guard order ===
+test_group("3.3.3 R5num: num_halton's range and guard order");
+# The index is tested before the base, so a negative index is a quiet NaN whatever
+# the base; through the first 3.3.3 repair a base below 2 still answered 0.0 first,
+# index 0's sample. A non-negative index with a base below 2 keeps its 0.0. The range
+# is [0, 1]: the digits are summed in f64 and a run of top digits can round to 1.0.
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01: 0.0 for every (-5, b)]
+assert_eq(num_halton(0 - 5, 0), r4q_nan, "num_halton(-5, 0) -> quiet NaN: the index is tested first (3.3.2: 0.0)");
+assert_eq(num_halton(0 - 5, 1), r4q_nan, "num_halton(-5, 1) -> quiet NaN (3.3.2: 0.0)");
+assert_eq(num_halton(0 - 5, 0 - 2), r4q_nan, "num_halton(-5, -2) -> quiet NaN (3.3.2: 0.0)");
+assert_eq(num_halton(0, 1), 0, "num_halton(0, 1) = 0.0: the base refusal for index >= 0 (control)");
+assert_eq(num_halton(0x3FFFFFFFFFFFFF, 2), 0x3FF0000000000000,
+  "num_halton(2^54 - 1, 2) = 1.0: 1 - 2^-54 rounds up, so the range is [0, 1] (as in 3.3.2)");
+assert_eq(num_halton(0x1FFFFFFFFFFFFF, 2), 0x3FEFFFFFFFFFFFFF, "num_halton(2^53 - 1, 2) = 1 - 2^-53 (as in 3.3.2)");
 
 test_group("abuse: spectral transforms with non-positive or non-power-of-two lengths");
 
@@ -2551,16 +4170,161 @@ assert_eq(simplex_fbm_3d(F64_ONE, F64_ONE, F64_ONE, (0 - 3), F64_ONE, F64_ONE, F
 # returns at all rather than indexing the table wildly.
 assert_eq(_ab_is_nan(perlin_2d(_AB_NAN, _AB_NAN)), 1,
   "perlin_2d: NaN coordinate -> NaN value, table lookup still in bounds");
-# simplex_2d differs from perlin_2d here: its per-corner contributions are
-# gated by `if (t > 0)`, an ordered test that is FALSE for the NaN t a NaN
-# coordinate produces, so every corner is skipped and the sum stays 0. Not a
-# fault either way -- the point of the pair is that both terminate in bounds.
-assert_eq(_ab_is_nan(simplex_2d(_AB_NAN, _AB_NAN)), 0,
-  "simplex_2d: NaN coordinate -> 0 (all corner contributions gated out)");
+# ⛔ 3.3.3 — THIS PINNED simplex_2d(NaN, NaN) == 0 AND CALLED IT "NOT A FAULT EITHER
+# WAY". It was the fabricated-answer class: every corner's `if (t > 0)` gate is false
+# for the NaN t a NaN coordinate produces, so all three were skipped and the sum came
+# back +0, a value the field takes at every lattice point. The true answer is no
+# field value at all, which is what perlin_2d says just above (NaN), and CLAUDE.md
+# counts a guard that returns a plausible answer as the defect. simplex_2d now returns
+# a quiet NaN for a non-finite coordinate (src/noise_simplex.cyr's header); the
+# 3.3.3 W5 block below pins each coordinate of both fields and the fBm sums. Both
+# calls still terminate in bounds, the other half of what this pair checked.
+assert_eq(_ab_is_nan(simplex_2d(_AB_NAN, _AB_NAN)), 1,
+  "simplex_2d: NaN coordinate -> NaN, as perlin_2d (3.3.2: 0, every corner gated out)");
 assert_eq(_ab_is_nan(perlin_2d(F64_HALF, F64_HALF)), 0, "perlin_2d: finite input stays finite");
 assert_eq(_ab_is_nan(simplex_2d(F64_HALF, F64_HALF)), 0, "simplex_2d: finite input stays finite");
 assert_eq(_ab_is_nan(simplex_3d(F64_HALF, F64_HALF, F64_HALF)), 0,
   "simplex_3d: finite input stays finite");
+
+# === 3.3.3 W5: simplex non-finite coordinates ===
+test_group("3.3.3 W5: simplex non-finite coordinates");
+# Through 3.3.2 every one of these returned +0: a NaN or infinite coordinate makes
+# x0 NaN, every falloff t NaN and every `t > 0` gate false. Each field now returns the
+# quiet NaN 0x7FF8000000000000 when an unskewed offset x0, y0 (z0) fails the house
+# non-finite test, f64_lt(|o|, +Inf) == 0 (3.3.3 R4sym moved the test there from the
+# coordinates, below), so the direct calls are pinned on the bits. Each coordinate
+# gets NaN, +Inf and -Inf with the others finite; through the skew, each makes every
+# offset non-finite.
+# [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01: all +0]
+var w5_sx = f64_div(f64_from(3), f64_from(10));                # 0.3, the finite partner
+var w5_sy = f64_div(f64_from(7), f64_from(10));                # 0.7
+var w5_qn = 0x7FF8000000000000;                                # the guard's quiet NaN
+assert_eq(simplex_2d(_AB_NAN, w5_sy), w5_qn, "W5 simplex_2d(NaN, 0.7) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_2d(_AB_PINF, w5_sy), w5_qn, "W5 simplex_2d(+Inf, 0.7) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_2d(_AB_NINF, w5_sy), w5_qn, "W5 simplex_2d(-Inf, 0.7) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_2d(w5_sx, _AB_NAN), w5_qn, "W5 simplex_2d(0.3, NaN) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_2d(w5_sx, _AB_PINF), w5_qn, "W5 simplex_2d(0.3, +Inf) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_2d(w5_sx, _AB_NINF), w5_qn, "W5 simplex_2d(0.3, -Inf) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(_AB_NAN, w5_sy, w5_sx), w5_qn, "W5 simplex_3d(NaN, 0.7, 0.3) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(_AB_PINF, w5_sy, w5_sx), w5_qn, "W5 simplex_3d(+Inf, 0.7, 0.3) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(_AB_NINF, w5_sy, w5_sx), w5_qn, "W5 simplex_3d(-Inf, 0.7, 0.3) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(w5_sx, _AB_NAN, w5_sy), w5_qn, "W5 simplex_3d(0.3, NaN, 0.7) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(w5_sx, _AB_PINF, w5_sy), w5_qn, "W5 simplex_3d(0.3, +Inf, 0.7) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(w5_sx, _AB_NINF, w5_sy), w5_qn, "W5 simplex_3d(0.3, -Inf, 0.7) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(w5_sx, w5_sy, _AB_NAN), w5_qn, "W5 simplex_3d(0.3, 0.7, NaN) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(w5_sx, w5_sy, _AB_PINF), w5_qn, "W5 simplex_3d(0.3, 0.7, +Inf) -> quiet NaN (3.3.2: +0)");
+assert_eq(simplex_3d(w5_sx, w5_sy, _AB_NINF), w5_qn, "W5 simplex_3d(0.3, 0.7, -Inf) -> quiet NaN (3.3.2: +0)");
+# ⛔ 3.3.3 R4sym — FLIPPED: these three pinned +0. W5's guard tested the coordinates,
+# which DBL_MAX passes, and the field then returned +0 from an overflow inside the
+# skew (x + s = +Inf, so x0 is NaN), the fabricated answer the guard exists to remove.
+# The guard now tests the offsets, so these are the quiet NaN. The true value is the
+# contract's, not a field value: no cell position survives the overflow. The R4sym
+# block below pins where the guard starts to fire.
+var w5_dmax = 0x7FEFFFFFFFFFFFFF;                              # DBL_MAX
+assert_eq(simplex_2d(w5_dmax, w5_sy), w5_qn,
+  "W5 simplex_2d(DBL_MAX, 0.7): x + s overflows -> quiet NaN (3.3.2 and W5: +0)");
+assert_eq(simplex_2d(w5_sx, f64_neg(w5_dmax)), w5_qn,
+  "W5 simplex_2d(0.3, -DBL_MAX): y + s overflows -> quiet NaN (3.3.2 and W5: +0)");
+assert_eq(simplex_3d(w5_sx, w5_sy, w5_dmax), w5_qn,
+  "W5 simplex_3d(0.3, 0.7, DBL_MAX): z + s overflows -> quiet NaN (3.3.2 and W5: +0)");
+# The fBm sums carry it out. Their NaN is the guard's, propagated by multiply, add
+# and divide, so these test NaN-ness rather than a payload. 3.3.2 returned +0 for all.
+assert_eq(_ab_is_nan(simplex_fbm_2d(_AB_NAN, w5_sy, 4, F64_ONE, F64_ONE, F64_HALF)), 1,
+  "W5 simplex_fbm_2d: NaN x -> NaN (3.3.2: +0)");
+assert_eq(_ab_is_nan(simplex_fbm_2d(w5_sx, w5_sy, 4, _AB_NAN, F64_ONE, F64_HALF)), 1,
+  "W5 simplex_fbm_2d: NaN freq -> NaN (3.3.2: +0)");
+assert_eq(_ab_is_nan(simplex_fbm_2d(w5_sx, w5_sy, 4, _AB_PINF, F64_ONE, F64_HALF)), 1,
+  "W5 simplex_fbm_2d: +Inf freq -> NaN (3.3.2: +0)");
+assert_eq(_ab_is_nan(simplex_fbm_3d(w5_sx, _AB_PINF, w5_sy, 4, F64_ONE, F64_ONE, F64_HALF)), 1,
+  "W5 simplex_fbm_3d: +Inf y -> NaN (3.3.2: +0)");
+assert_eq(_ab_is_nan(simplex_fbm_3d(w5_sx, w5_sy, _AB_NAN, 4, F64_ONE, F64_ONE, F64_HALF)), 1,
+  "W5 simplex_fbm_3d: NaN z -> NaN (3.3.2: +0)");
+# ON the frequency boundary: with freq = 1 the octave frequency is 2^i, finite through
+# i = 1023 and +Inf at i = 1024, so 1024 octaves stay finite and 1025 do not. 3.3.2
+# summed the +Inf octave as 0 and returned the 1024-octave value; fbm_2d (perlin)
+# returns NaN there, as 3.3.2's did.
+assert_eq(_ab_is_nan(simplex_fbm_2d(w5_sx, w5_sy, 1024, F64_ONE, F64_ONE, F64_HALF)), 0,
+  "W5 simplex_fbm_2d: 1024 octaves at freq 1 stay finite (last octave at 2^1023)");
+assert_eq(_ab_is_nan(simplex_fbm_2d(w5_sx, w5_sy, 1025, F64_ONE, F64_ONE, F64_HALF)), 1,
+  "W5 simplex_fbm_2d: 1025 octaves at freq 1 -> NaN (octave 1024 is at +Inf; 3.3.2 summed it as 0)");
+assert_eq(_ab_is_nan(simplex_fbm_3d(w5_sx, w5_sy, w5_sx, 1025, F64_ONE, F64_ONE, F64_HALF)), 1,
+  "W5 simplex_fbm_3d: 1025 octaves at freq 1 -> NaN (3.3.2 summed the +Inf octave as 0)");
+# Unchanged, and deliberate (the guard in each fBm): weights that sum to 0 -- octaves
+# <= 0, or amp = 0 -- return +0 whatever the coordinates, NaN ones included.
+assert_eq(simplex_fbm_2d(_AB_NAN, w5_sy, 0, F64_ONE, F64_ONE, F64_HALF), 0,
+  "W5 simplex_fbm_2d: octaves = 0 with a NaN x -> +0, the zero-weight return (unchanged)");
+assert_eq(simplex_fbm_3d(_AB_NAN, w5_sy, w5_sx, 4, F64_ONE, 0, F64_HALF), 0,
+  "W5 simplex_fbm_3d: amp = 0 with a NaN x -> +0, the zero-weight return (unchanged)");
+
+# === 3.3.3 R4sym: simplex skew overflow ===
+test_group("3.3.3 R4sym: simplex skew overflow");
+# W5's guard tested the coordinates, but a FINITE coordinate can overflow the skew
+# (x + s), the unskew's i + j, or i - t, and the overflow makes the offsets NaN or
+# infinite exactly as an infinite input does: every falloff gate fails and the field
+# returned +0. The guard now tests the offsets x0, y0 (z0) after the unskew. Each
+# fixture below returned +0 on 3.3.2 and on W5's tree.
+# [measured: scratch probe against dist/hisab.cyr 3.3.2 and the W5 tree, cycc 6.6.12, 2026-10-01: all +0]
+var r4s_7 = w5_sy;                                             # 0.7
+var r4s_14e308 = 0x7FE8EBBB5516E5AD;                           # 1.4e308: x + s = +Inf
+var r4s_04max = 0x7FD9999999999999;                            # 0.4 * DBL_MAX
+assert_eq(simplex_2d(r4s_14e308, r4s_7), w5_qn, "R4sym simplex_2d(1.4e308, 0.7): x + s overflows -> quiet NaN");
+# At 0.4 DBL_MAX the 2D skew stays finite and i + j overflows (s, x + s and y + s are
+# finite, t is +Inf); in 3D the skew itself overflows (x + y + z).
+assert_eq(simplex_2d(r4s_04max, r4s_04max), w5_qn,
+  "R4sym simplex_2d(0.4 DBL_MAX, 0.4 DBL_MAX): i + j overflows -> quiet NaN");
+assert_eq(simplex_3d(r4s_04max, r4s_04max, r4s_04max), w5_qn,
+  "R4sym simplex_3d(0.4 DBL_MAX x3): the skew overflows -> quiet NaN");
+# ON the boundary. With y = 0.7, x = 0x7FE279A74590331C (1.0378986153331002e308) is the
+# first x whose i + j passes DBL_MAX, and the guard fires there and not one ulp below,
+# in either coordinate and in the negative mirror (offsets -Inf, which |o| catches).
+# What the field returns one ulp below is the precision class W5 reported, not a field
+# value (+0: every falloff is -Inf there), so only the guard's silence is pinned.
+# [measured: scratch python3 model of the unskew, bisected on the bit pattern, 2026-10-01]
+var r4s_edge = 0x7FE279A74590331C;
+var r4s_below = 0x7FE279A74590331B;
+assert_eq(simplex_2d(r4s_edge, r4s_7), w5_qn, "R4sym simplex_2d(edge x, 0.7) -> quiet NaN");
+assert_eq(_ab_is_nan(simplex_2d(r4s_below, r4s_7)), 0, "R4sym simplex_2d(edge x - 1 ulp, 0.7): guard silent");
+assert_eq(simplex_2d(r4s_7, r4s_edge), w5_qn, "R4sym simplex_2d(0.7, edge y) -> quiet NaN");
+assert_eq(_ab_is_nan(simplex_2d(r4s_7, r4s_below)), 0, "R4sym simplex_2d(0.7, edge y - 1 ulp): guard silent");
+assert_eq(simplex_2d(f64_neg(r4s_edge), f64_neg(r4s_7)), w5_qn,
+  "R4sym simplex_2d(-edge x, -0.7): offsets -Inf -> quiet NaN");
+assert_eq(_ab_is_nan(simplex_2d(f64_neg(r4s_below), f64_neg(r4s_7))), 0,
+  "R4sym simplex_2d(-(edge x - 1 ulp), -0.7): guard silent");
+# A coordinate this large whose skew stays finite is not refused: 1e308 with 0.7.
+assert_eq(_ab_is_nan(simplex_2d(0x7FE1CCF385EBC8A0, r4s_7)), 0,
+  "R4sym simplex_2d(1e308, 0.7): skew and unskew finite, guard silent");
+# 3D: one offset alone. s, i, j, k and t are all finite (t = s); i - t rounds past
+# DBL_MAX, so x0 alone is -Inf, and in the mirrors x0 alone is +Inf and y0 alone +Inf
+# or -Inf. Dropping either arm of the guard, or the |.| on it, returns +0 here.
+# Moving z from -1.6875 to -1.625 times 2^1023 keeps every offset finite (all three
+# are 0) and the guard silent.
+# [measured: scratch python3 exact-rational check of the unskew, 2026-10-01]
+var r4s_dmax = 0x7FEFFFFFFFFFFFFF;
+var r4s_a = 0x7FE2000000000000;                                # 1.125 * 2^1023
+var r4s_b = 0x7FEB000000000000;                                # 1.6875 * 2^1023
+assert_eq(simplex_3d(r4s_dmax, f64_neg(r4s_a), f64_neg(r4s_b)), w5_qn,
+  "R4sym simplex_3d(DBL_MAX, -1.125 2^1023, -1.6875 2^1023): x0 alone -Inf -> quiet NaN");
+assert_eq(simplex_3d(f64_neg(r4s_dmax), r4s_a, r4s_b), w5_qn,
+  "R4sym simplex_3d(-DBL_MAX, 1.125 2^1023, 1.6875 2^1023): x0 alone +Inf -> quiet NaN");
+assert_eq(simplex_3d(r4s_a, f64_neg(r4s_dmax), r4s_b), w5_qn,
+  "R4sym simplex_3d(1.125 2^1023, -DBL_MAX, 1.6875 2^1023): y0 alone +Inf -> quiet NaN");
+assert_eq(simplex_3d(f64_neg(r4s_a), r4s_dmax, f64_neg(r4s_b)), w5_qn,
+  "R4sym simplex_3d(-1.125 2^1023, DBL_MAX, -1.6875 2^1023): y0 alone -Inf -> quiet NaN");
+assert_eq(_ab_is_nan(simplex_3d(r4s_dmax, f64_neg(r4s_a), 0xFFEA000000000000)), 0,
+  "R4sym simplex_3d(DBL_MAX, -1.125 2^1023, -1.625 2^1023): offsets finite, guard silent");
+# The fBm sums meet the overflow one octave earlier than the +Inf frequency (W5,
+# above): at (1, 1) and freq 1, octave 1023 sits at (2^1023, 2^1023), whose x + y is
+# 2^1024, so 1024 octaves are NaN and 1023 are not. In 3D at (0.3, 0.7, 0.3) octave
+# 1023's skew stays finite and its i + j + k overflows. 3.3.2 and W5 returned the same
+# value for 1024 octaves as for 1023.
+assert_eq(_ab_is_nan(simplex_fbm_2d(F64_ONE, F64_ONE, 1023, F64_ONE, F64_ONE, F64_HALF)), 0,
+  "R4sym simplex_fbm_2d(1, 1): 1023 octaves stay finite");
+assert_eq(_ab_is_nan(simplex_fbm_2d(F64_ONE, F64_ONE, 1024, F64_ONE, F64_ONE, F64_HALF)), 1,
+  "R4sym simplex_fbm_2d(1, 1): 1024 octaves -> NaN (octave 1023's x + y overflows; 3.3.2: finite)");
+assert_eq(_ab_is_nan(simplex_fbm_3d(w5_sx, r4s_7, w5_sx, 1023, F64_ONE, F64_ONE, F64_HALF)), 0,
+  "R4sym simplex_fbm_3d(0.3, 0.7, 0.3): 1023 octaves stay finite");
+assert_eq(_ab_is_nan(simplex_fbm_3d(w5_sx, r4s_7, w5_sx, 1024, F64_ONE, F64_ONE, F64_HALF)), 1,
+  "R4sym simplex_fbm_3d(0.3, 0.7, 0.3): 1024 octaves -> NaN (3.3.2: finite)");
 
 # ================================================================
 # 9. COLOUR, f64 UTILITIES AND ERROR CODES

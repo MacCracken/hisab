@@ -327,7 +327,8 @@ read -r n_pub_probes n_priv_probes n_pub_fn n_pub_struct n_pub_var n_pub_enum < 
 # populations. Raise them when the surface grows; lower them only with a reason in
 # the commit, the same discipline as check-constants.sh's POPULATION_FLOOR.
 PUB_PROBE_FLOOR=847    # re-derived 2026-09-30, 3.3.1
-PRIV_PROBE_FLOOR=492   # re-derived 2026-09-30, 3.3.2 - 19 dead non-public declarations removed (D063, D075, D095)
+PRIV_PROBE_FLOOR=520   # re-derived 2026-09-30, 3.3.2 - 19 dead non-public declarations removed (D063, D075, D095)
+                       # 492 -> 520 in 3.3.3: the release's new private helpers and constants (re-derived 2026-10-01)
 [ "$n_pub_probes" -ge "$PUB_PROBE_FLOOR" ] || { echo "FAIL: only $n_pub_probes public probes generated, floor $PUB_PROBE_FLOOR — a declaration stopped being seen, or the generator is broken"; exit 1; }
 [ "$n_priv_probes" -ge "$PRIV_PROBE_FLOOR" ] || { echo "FAIL: only $n_priv_probes private probes generated, floor $PRIV_PROBE_FLOOR — a declaration stopped being seen, or the generator is broken"; exit 1; }
 

@@ -515,11 +515,12 @@ public fn geodesic_state_new(pos, vel, dim) {
 }
 
 # Compute geodesic acceleration: a^alpha = -Gamma^alpha_{mu nu} u^mu u^nu
-# pos_ptr, vel_ptr: pointers into the state arrays. pos_ptr is NOT read: Γ is the
-#   one array passed in, not a function of position (see geodesic_rk4).
+# vel_ptr: pointer to the dim velocity components. There is no position argument:
+#   Γ is the one array passed in, not a function of position (see geodesic_rk4).
+#   (Through 3.3.2 this took a `pos_ptr` first and never read it.)
 # christoffel: flat f64 Christoffel array (dim^3)
 # out_acc: pointer to write dim f64 acceleration values
-fn _geodesic_accel(pos_ptr, vel_ptr, christoffel, dim, out_acc) {
+fn _geodesic_accel(vel_ptr, christoffel, dim, out_acc) {
     var alpha = 0;
     while (alpha < dim) {
         var sum = 0;  # f64 0.0
@@ -544,7 +545,13 @@ fn _geodesic_accel(pos_ptr, vel_ptr, christoffel, dim, out_acc) {
 # RK4 integration of the geodesic equation.
 # ⚠ The connection is FROZEN: the one `christoffel` array is used at every RK4
 # stage of every step, for the whole `steps * dt` path, and `_geodesic_accel`
-# never reads the position. The frozen Γ is the true one only where Γ really is
+# takes no position. So the RK4 stages need no stage POSITION either: x' = u, and
+# each kNx is dt times that stage's velocity. (Through 3.3.2 the k2..k4 stages also
+# built a stage position, x + k/2 and x + k3, in a `tmp_x` array that only
+# `_geodesic_accel`'s unread `pos_ptr` received; both are gone, with no change to
+# any result: 200 random calls, dims 1-4, gave the same 1000 output words, bit for bit.)
+# [measured: scratch differential probe, 3.3.2 bundle vs 3.3.3, 2026-10-01; cycc 6.6.12]
+# The frozen Γ is the true one only where Γ really is
 # constant along the trajectory (flat space in Cartesian coordinates, where it is
 # zero, or a geodesic along a sphere's equator); wherever Γ varies along the path
 # (any curved metric off such a curve, and flat space in curvilinear coordinates
@@ -579,7 +586,6 @@ public fn geodesic_rk4(state, christoffel, dim, dt, steps) {
     var k3u = alloc(dim * 8);
     var k4x = alloc(dim * 8);
     var k4u = alloc(dim * 8);
-    var tmp_x = alloc(dim * 8);
     var tmp_u = alloc(dim * 8);
     var tmp_acc = alloc(dim * 8);
 
@@ -587,8 +593,8 @@ public fn geodesic_rk4(state, christoffel, dim, dt, steps) {
     while (step < steps) {
         # ---- k1 ----
         # k1x = dt * u
-        # k1u = dt * accel(x, u)
-        _geodesic_accel(x, u, christoffel, dim, tmp_acc);
+        # k1u = dt * accel(u)
+        _geodesic_accel(u, christoffel, dim, tmp_acc);
         i = 0;
         while (i < dim) {
             store64(k1x + i * 8, f64_mul(dt, load64(u + i * 8)));
@@ -597,16 +603,14 @@ public fn geodesic_rk4(state, christoffel, dim, dt, steps) {
         }
 
         # ---- k2 ----
-        # tmp_x = x + 0.5 * k1x, tmp_u = u + 0.5 * k1u
+        # tmp_u = u + 0.5 * k1u
         i = 0;
         while (i < dim) {
-            store64(tmp_x + i * 8, f64_add(load64(x + i * 8),
-                f64_mul(F64_HALF, load64(k1x + i * 8))));
             store64(tmp_u + i * 8, f64_add(load64(u + i * 8),
                 f64_mul(F64_HALF, load64(k1u + i * 8))));
             i = i + 1;
         }
-        _geodesic_accel(tmp_x, tmp_u, christoffel, dim, tmp_acc);
+        _geodesic_accel(tmp_u, christoffel, dim, tmp_acc);
         i = 0;
         while (i < dim) {
             store64(k2x + i * 8, f64_mul(dt, load64(tmp_u + i * 8)));
@@ -615,16 +619,14 @@ public fn geodesic_rk4(state, christoffel, dim, dt, steps) {
         }
 
         # ---- k3 ----
-        # tmp_x = x + 0.5 * k2x, tmp_u = u + 0.5 * k2u
+        # tmp_u = u + 0.5 * k2u
         i = 0;
         while (i < dim) {
-            store64(tmp_x + i * 8, f64_add(load64(x + i * 8),
-                f64_mul(F64_HALF, load64(k2x + i * 8))));
             store64(tmp_u + i * 8, f64_add(load64(u + i * 8),
                 f64_mul(F64_HALF, load64(k2u + i * 8))));
             i = i + 1;
         }
-        _geodesic_accel(tmp_x, tmp_u, christoffel, dim, tmp_acc);
+        _geodesic_accel(tmp_u, christoffel, dim, tmp_acc);
         i = 0;
         while (i < dim) {
             store64(k3x + i * 8, f64_mul(dt, load64(tmp_u + i * 8)));
@@ -633,14 +635,13 @@ public fn geodesic_rk4(state, christoffel, dim, dt, steps) {
         }
 
         # ---- k4 ----
-        # tmp_x = x + k3x, tmp_u = u + k3u
+        # tmp_u = u + k3u
         i = 0;
         while (i < dim) {
-            store64(tmp_x + i * 8, f64_add(load64(x + i * 8), load64(k3x + i * 8)));
             store64(tmp_u + i * 8, f64_add(load64(u + i * 8), load64(k3u + i * 8)));
             i = i + 1;
         }
-        _geodesic_accel(tmp_x, tmp_u, christoffel, dim, tmp_acc);
+        _geodesic_accel(tmp_u, christoffel, dim, tmp_acc);
         i = 0;
         while (i < dim) {
             store64(k4x + i * 8, f64_mul(dt, load64(tmp_u + i * 8)));

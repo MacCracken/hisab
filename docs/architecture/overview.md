@@ -3,7 +3,7 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v3.3.2 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 26,899
+> hisab v3.3.3 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 30,223
 > lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.12; a
 > consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 

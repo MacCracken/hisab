@@ -44,8 +44,9 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   ganita 1.2.4 (every cyrius pin from 6.6.1) that never forms AᵀA, so the condition number is not
   squared. This line used to say it was: through ganita 1.2.3 the stdlib SVD eigendecomposed AᵀA.
   `svd_golub_kahan` (`linalg_precision`, shipped since 2.1.0) is the hisab-owned alternative.
-  ⚠ `svd_truncated` ignores `ganita_mat_svd`'s failure return (−2 for a wide matrix) and reports
-  `Ok(0)`; that is roadmap **[3.3.3]** (audit `D012`).
+  `svd_truncated` returned `Ok(0)` with output ganita never wrote when `ganita_mat_svd` failed,
+  through 3.3.2; since 3.3.3 it returns `Err`, and `svd_compute` refuses non-finite input with −2
+  (audit `D012`).
 - PCG32 uses signed arithmetic with masking. Verified safe but not cryptographically secure.
 - `m4_get`/`m4_set` do not bounds-check col/row arguments. Caller must validate.
 
@@ -94,7 +95,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   deduplicated digest is exactly how the six unscheduled 2026-08-03 findings stayed invisible for
   four releases. Every dated report in docs/audit/ now records a disposition per finding
 - Public entry points are exercised under **abuse**, not only under use: `tests/abuse.tcyr` (added
-  2.9.0, **981 assertions** at 3.3.2) drives negative indices, zero and huge dimensions, non-conformable
+  2.9.0, **1431 assertions** at 3.3.3) drives negative indices, zero and huge dimensions, non-conformable
   operands, the designed-`0` return, degenerate geometry and heap canaries. It surfaced **11 real
   defects on public entry points**, held in a known-defect register rather than deleted. The register
   is discharged: nine repaired into live assertions, the tenth re-measured and reclassified
@@ -110,8 +111,8 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   `scripts/check-constants.sh` (a CI gate since 2.6.12, after seven mis-transcribed tables shipped).
   The gate was itself audited: until 2.7.0 its regex rejected `_` digit separators and it silently
   skipped **35 of 145** declarations while printing "110/110 verified" — one of the skipped constants
-  encoded ~1e16 against a documented 1e15. **155/155 verified, 1 skipped** at 3.3.2, which deleted
-  eight dead hex constants (163/163 at 3.3.0 and 3.3.1; the live count is in the roadmap's
+  encoded ~1e16 against a documented 1e15. **161/161 verified, 1 skipped** at 3.3.3 (155/155 at
+  3.3.2, which deleted eight dead hex constants; 163/163 at 3.3.0 and 3.3.1; the live count is in the roadmap's
   *Current* section), and since 2.20.0 the gate also catches a comment on the line above its
   declaration (a shape that had let a mis-transcribed `F64_1E_NEG30`
   through as 158/158)

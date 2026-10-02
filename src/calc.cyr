@@ -30,7 +30,26 @@ public fn calc_derivative(f, x, h) {
 # Trapezoidal rule integration.
 # f: function pointer (f64 -> f64), a/b: interval bounds (f64),
 # steps: integer count, out: pointer to store f64 result.
-# Returns Ok(0) on success, HSB_ERR_ZERO_STEPS if steps == 0.
+# Returns Ok(0) on success, HSB_ERR_ZERO_STEPS if steps == 0,
+# HSB_ERR_INVALID_INPUT if steps < 0 (`out` untouched on both). A zero-width
+# interval stores exactly +0 without calling f.
+#
+# ⛔ 3.3.3 — A NEGATIVE STEP COUNT WAS A WRONG ANSWER REPORTED AS Ok (audit D072).
+# Only `steps == 0` was refused. A negative count divided the interval by a
+# negative number, skipped the summation loop, and stored the half-endpoint
+# term: steps = -5 over x^2 on [0,1] stored -0.1 with Ok, where 1/3 is the
+# integral. The code is HSB_ERR_INVALID_INPUT, as calc_ext's calc_gradient,
+# calc_jacobian and calc_hessian return for a negative dimension; HSB_ERR_ZERO_STEPS
+# keeps its one meaning.
+# ⛔ 3.3.3 — b == a WITH AN INFINITE f(a) STORED NaN, as Ok: h = 0 and the sum
+# is Inf, so `sum * h` is 0 * Inf. The integral over a point is exactly 0. The
+# test is the width, b - a == 0, which is a == b for finite endpoints; equal
+# infinite endpoints have a NaN width and are left to the arithmetic.
+# [measured: steps and zero-width probe on the 3.3.2 bundle, 2026-10-01]
+# ⚠ ONLY AN EXACT ZERO WIDTH IS HANDLED. h is also 0 when (b - a) / steps
+# underflows at a non-zero width, and that 0 * Inf is not repaired: f = +Inf over
+# [0, 2^-1074] with 4 steps stores NaN as Ok, here and on 3.3.2.
+# [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
 # ⭐ 3.0.0 — THE ERROR CHANNEL IS NOW `Result<T, E>`, AND THE OUT-PARAMETERS STAY.
 # `Ok(0)` rather than `Ok(value)` is deliberate and mechanical: these functions
 # already deliver their result through an out-pointer, and moving it into the Ok
@@ -48,6 +67,11 @@ public fn calc_derivative(f, x, h) {
 #must_use
 public fn calc_integral_trapez(f, a, b, steps, out) {
     if (steps == 0) { return Err(HSB_ERR_ZERO_STEPS); }
+    if (steps < 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_eq(f64_sub(b, a), 0) == 1) {
+        store64(out, 0);
+        return Ok(0);
+    }
     var h = f64_div(f64_sub(b, a), f64_from(steps));
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
@@ -62,25 +86,60 @@ public fn calc_integral_trapez(f, a, b, steps, out) {
     return Ok(0);
 }
 
+# Internal: the class of a NON-FINITE sample for calc_integral_simpson's true-sum rule
+# (see the end of its body): 1 for +Inf, 2 for -Inf, 4 for NaN.
+fn _calc_nonfinite_class(v) {
+    if (f64_eq(v, F64_POS_INF) == 1) { return 1; }
+    if (f64_eq(v, 0xFFF0000000000000) == 1) { return 2; }    # -Infinity
+    return 4;
+}
+
 # Simpson's rule integration. steps is rounded up to even if odd.
 # f: function pointer (f64 -> f64), a/b: interval bounds (f64),
 # steps: integer count, out: pointer to store f64 result.
-# Returns Ok(0) on success, HSB_ERR_ZERO_STEPS if steps == 0.
+# Returns Ok(0) on success, HSB_ERR_ZERO_STEPS if steps == 0,
+# HSB_ERR_INVALID_INPUT if steps < 0 or is the one odd count, 2^63 - 1, whose
+# round-up does not fit (`out` untouched on all three). A zero-width interval
+# stores exactly +0 without calling f.
+#
+# ⛔ 3.3.3 — THE PAIR OF calc_integral_trapez's NEGATIVE-COUNT REPAIR (audit D072;
+# see there): steps = -4 stored -0.0833 and steps = -1 stored -1/3, both as Ok.
+# One test serves both cases because it sits AFTER the round-up: Cyrius `%`
+# truncates, so a negative odd count has `steps % 2 == -1` and is never rounded
+# into range, while 2^63 - 1 rounds up to -2^63 and stored -3.6e-20 as Ok.
+# The zero-width repair is trapez's too: b == a with f(a) = +Inf stored NaN.
+# [measured: steps and zero-width probe on the 3.3.2 bundle, 2026-10-01]
+# So is its limit: only an EXACT zero width is handled, and an h that underflows at
+# a non-zero width still forms 0 * Inf — f = +Inf over [0, 2^-1074] with 4 steps
+# stores NaN as Ok, here and on 3.3.2.
+# [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
+# An infinite or NaN sample stores the class of the true sum (see the end of the body):
+# ±Inf for infinite samples of one sign, NaN for both signs or a NaN sample. Finite
+# samples whose weighted sum overflows store NaN, as on 3.3.2.
 #must_use
 public fn calc_integral_simpson(f, a, b, steps, out) {
     # Round up to even
     if (steps % 2 == 1) { steps = steps + 1; }
     if (steps == 0) { return Err(HSB_ERR_ZERO_STEPS); }
+    if (steps < 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_eq(f64_sub(b, a), 0) == 1) {
+        store64(out, 0);
+        return Ok(0);
+    }
     var h = f64_div(f64_sub(b, a), f64_from(steps));
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
     var sum = f64_add(fa, fb);
     var comp = 0;  # Neumaier compensation (stored as f64 bits)
+    var spec = 0;  # classes of the non-finite samples (see the end of the body)
+    if (f64_lt(f64_abs(fa), F64_POS_INF) == 0) { spec = spec | _calc_nonfinite_class(fa); }
+    if (f64_lt(f64_abs(fb), F64_POS_INF) == 0) { spec = spec | _calc_nonfinite_class(fb); }
 
     var i = 1;
     while (i < steps) {
         var xi = f64_add(a, f64_mul(f64_from(i), h));
         var fxi = fncall1(f, xi);
+        if (f64_lt(f64_abs(fxi), F64_POS_INF) == 0) { spec = spec | _calc_nonfinite_class(fxi); }
 
         # Odd indices get coefficient 4, even indices get 2
         var coeff = F64_TWO;
@@ -99,7 +158,32 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
         i = i + 1;
     }
 
+    # ⛔ 3.3.3 — ONE INFINITE SAMPLE MADE THE RESULT NaN, where calc_integral_trapez
+    # gives +Inf. Once a term is infinite, `t` is too, and the correction above forms
+    # Inf - Inf: comp went NaN and so did `sum + comp`. f(0.5) = +Inf, else 1, on
+    # [0, 1] with 4 steps stored NaN as Ok. Once a sample is infinite the true sum of
+    # the terms does not depend on the finite ones: infinite samples of one sign make
+    # it that infinity, and both signs or a NaN sample make it NaN. `spec` collects
+    # the classes of the non-finite samples, and only infinite samples of one sign
+    # replace the result; every other result is 3.3.2's `sum + comp`, bit for bit,
+    # the NaN for both signs or a NaN sample included.
+    # [measured: tests/edge_cases.tcyr, group "3.3.3 R3b: simpson with a non-finite sample"]
+    # ⚠ FINITE SAMPLES WHOSE SUM OVERFLOWS STAY NaN, AS ON 3.3.2. One weighted sample
+    # (2f or 4f) or a running partial sum can pass DBL_MAX while the exact sum is finite
+    # and of either sign: samples [0, 0x7FCFFFFFFFFFFFFF, 0xFFE3333333333333,
+    # 0x7FCFFFFFFFFFFFFF, 0] on [0, 1] with 4 steps integrate to about +1.2e307, and
+    # the plain running sum, which an earlier form of this repair returned for every
+    # non-finite sum, gave -Inf as Ok. NaN is the loud answer; overflow is not repaired.
+    # [measured: tests/edge_cases.tcyr, group "3.3.3 R5calc: simpson, finite samples whose sum overflows"]
+    # Over 60,000 random sample tables (N = 2..64; ordinary, near-overflow, non-finite
+    # and smooth large integrands) the 51,235 with every sample finite store 3.3.2's
+    # bits (15,607 of them NaN from an overflowed sum), and each of the 8,765 with an
+    # infinite or NaN sample stores its true sum's class: +Inf on 1,550, -Inf on 1,574,
+    # NaN on 5,641. 3.3.2 stored NaN on all 8,765.
+    # [measured: 60,000-table sweep on the 3.3.2 bundle and this tree; 2026-10-01]
     var total = f64_add(sum, comp);
+    if (spec == 1) { total = F64_POS_INF; }
+    if (spec == 2) { total = 0xFFF0000000000000; }    # -Infinity
     store64(out, f64_div(f64_mul(total, h), _CALC_F64_THREE));
     return Ok(0);
 }
@@ -107,7 +191,15 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
 # 5-point Gauss-Legendre quadrature over [a, b].
 # f: function pointer (f64 -> f64), a/b: interval bounds (f64).
 # Returns f64 result directly (cannot fail).
+# ⛔ 3.3.3 — THE SAME ZERO-WIDTH 0 * Inf AS calc_integral_trapez's (see there):
+# b == a with f(a) = +Inf returned NaN, and a negative integrand -0. A zero-width
+# interval now returns exactly +0 without calling f.
+# [measured: zero-width probe on the 3.3.2 bundle, 2026-10-01]
+# ⚠ Only an EXACT zero width: the half-width (b - a) / 2 underflows to 0 at
+# b - a = 2^-1074, and f = +Inf over [0, 2^-1074] still returns NaN, as on 3.3.2.
+# [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
 public fn calc_integral_gauss5(f, a, b) {
+    if (f64_eq(f64_sub(b, a), 0) == 1) { return 0; }
     # Nodes on [-1, 1]
     var n0 = 0xBFECFF6CE0533A69;  # -0.906179845938664
     var n1 = 0xBFE13B23FD99B705;  # -0.538469310105683

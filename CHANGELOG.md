@@ -2,6 +2,210 @@
 
 ## [Unreleased]
 
+## [3.3.3] - 2026-10-01 — silent wrong answers in linalg, num and calc; the NaN-true guard class; and the 3.3.2 leftovers
+
+The roadmap's **[3.3.3]** rows (`D010`, `D012`, `D013`, `D015`, `D017`, `D021`, `D022`, `D068`, `D071`, `D072`), the 3.3.2 leftovers the maintainer approved (the simplex discontinuity, the 48 `f64_gt(x, 0) == 0` NaN-true guards, `sym_const_to_str`'s one-sided integer test, `_geodesic_accel`'s unread parameter, D139's missing records, the port-audit bridge disposition, two stale CHANGELOG figures), and the defects found while doing them.
+
+**How it was done.** File-disjoint groups in git worktrees, then two independent adversarial reviews. The reviews found defects in this release's own first repairs: an infinite-tangent shortcut in `calc_monotone_cubic`, rotation rescaling in the SVD/eigen QR, a one-pass overflow redo in `eigen_power`, and a probe normal in `time_of_impact`. Each made some input worse than 3.3.2. The last round held one criterion: **no input comes out worse than on 3.3.2**, judged by differential sweeps against the shipped bundle and exact oracles. Each claim below names its sweep. Where a repair could not meet the criterion, the path was narrowed to a loud refusal or returned to 3.3.2's behaviour, and the residual is listed under *Found — not repaired*.
+
+**Numbers.** Suites **4606 → 6038**, all passing: hisab 735, foundation 453, modules 3036, edge_cases 383, abuse 1431. Constant gate **161/161** (1 skipped). Public surface unchanged: 704 declarations and 847 public probes. All 520 non-public probes are refused. Bundle 27,011 → 30,335 lines (1,157,699 → 1,400,631 B).
+
+Rebuilt from pinned dirs: 6.6.2 refuses the bundle with the known `#derive` error. Under 6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12, a GeoJet program, the autodiff closure recipe, a former-abort Delaunay call and a probe of four 3.3.3 repairs all run correctly, and the same probe fails on the 3.3.2 bundle.
+
+### Fixed — roadmap [3.3.3]
+
+**`cqr_decompose`, two-ended balance (`D010`).** It balanced one-ended, so entries more than 1022 binades below the largest were divided off the subnormal grid with rc = OK. At lead 9, |R22| was 0 where the truth is 2.4u; at lead 1000 the whole block was 0.
+- It now uses the siblings' two-ended choice (`_lp_balance_pick`), scanning real and imaginary parts separately, with a headroom of 16·m derived from the routine's largest intermediate (at most 5.5·m·M).
+- On a 6086-row sweep against an exact rational oracle, right rows went 889 → 6005 of 6031. None went from right to wrong.
+- A NaN or ±Inf part of A now returns `Err(HSB_ERR_INVALID_INPUT)`, as `svd_golub_kahan` and `eigen_qr` do. On 3.3.2, `[[3,1],[NaN,2]]` returned Ok with a finite R that does not reproduce A.
+- Cost: +3.1% at 4×4 (scratch harness), inside the spread at 16×16 and above.
+
+**`svd_truncated` / `svd_compute` (`D012`).**
+- `svd_truncated` discarded `ganita_mat_svd`'s status and returned `Ok(0)` with S copied from temporaries the SVD never wrote. It now returns `Err(HSB_ERR_INVALID_INPUT)` for a null argument, a wide A, an undersized out-param or a non-finite entry, and `Err(HSB_ERR_NO_CONVERGENCE)` for ganita's −1. A null A and a 1×6000 A were exit 139.
+- `svd_compute` keeps its signature (the Result form is [3.4.0]) and now refuses a non-finite A with −2, ganita's bad-argument code, before calling ganita. ganita returns 0 with a fabricated S there.
+- Its doc and `error.cyr` no longer claim it "can only ever succeed".
+
+**`eigen_power` (`D013`).** It seeded e₀, an eigenvector of every diagonal and upper-triangular matrix, so `diag(2,3,4)` returned 2.
+- The seed is now SplitMix64's stream in [0.5, 1).
+- Success also requires the normalised eigenvector (largest component exactly 1) to stop moving to 1e-12, compared up to sign. Opposite-sign ties converge: `[[1,-3],[-3,1]]` gives 4, where 3.3.2 gave −4.
+- The first pass whose |A v| overflows (some |aᵢⱼ| > DBL_MAX/n) switches the iteration permanently to an exact power-of-two-scaled matvec.
+- Measured matrix by matrix against 3.3.2 at max_iter 1000:
+  - On a 1,500,625-matrix 2×2 grid, 205,526 that 3.3.2 refused or got wrong are now right, and every matrix with a dominant eigenvalue that 3.3.2 answered is still answered.
+  - On 38,000 random matrices, 4,245 are gained. The 388 that 3.3.2 answered and 3.3.3 refuses are 163 with no dominant eigenvalue, 153 defective and 72 with |λ₂/λ₁| ≥ 0.969 (each right by max_iter 100000).
+- See *Changed* for the iteration cost.
+
+**`solve_bicgstab` breakdown (`D015`).** Its three breakdown tests compared degree-2 to degree-4 dot products against an absolute 1e-18, written as a hex literal (which is why the 2026-09-09 census missed them). At operator scale ≤ 1e-5 it returned x₀.
+- They are exact-zero tests now.
+- r̂ is divided by an exact power of two.
+- ω has a rescue path for an out-of-range dot product. A t = A s numerically orthogonal to s returns NaN at once, the loud answer 3.3.2 reached.
+- Decades right to 1e-12, out of 601 from 1e-300 to 1e300: 81 → about 310. 2D scale sweep: 483 → 3281 of 3281 in-range cells.
+- Breakdown is still reported only through x; the error channel is [3.4.0].
+
+**GMRES / BiCGSTAB `A_fn` aliasing (`D017`, audit M6 from 2026-04-15).** GMRES kept the vector `A_fn` returned as a basis vector, and BiCGSTAB kept v across the next call. With a buffer-reusing `A_fn`, GMRES(3) burned its whole 60-matvec budget (4 with fresh buffers).
+- Both copy into hisab-owned storage, allocated once per call, and now match the fresh-buffer run bit for bit.
+- `A_fn` may reuse its output buffer or return its input pointer. It must not modify its input.
+- Cost (scratch harness; hisab.bcyr has no Krylov rows): GMRES 3×3 restart 3 +9.4% (770 → 843 ns), 64-dim GMRES(8) +0.4%, BiCGSTAB +0.7% to +4.0%.
+
+**Interval overflow (`D021`).** Round-to-nearest overflow of an inner endpoint gave a degenerate `[+Inf, +Inf]` (and `[NaN, NaN]` after adding it to its mirror).
+- `ivl_new` now stores ±DBL_MAX for an infinite inner bound, and `ivl_div` clamps its half-line reciprocals.
+- `ivl_midpoint` no longer overflows to +Inf for a finite interval near the top of the range.
+- Sweep of 3000 overflow-region cases against exact rationals: 467 degenerate results → 0.
+- The LIMIT comments are rewritten: 3.3.2's NaN came from an overflowed inner bound. The module still rounds to nearest, not outward; see *Found*.
+
+**`num_divisor_sigma` overflow (`D022`).** It wrapped i64 silently: `(3·2^61, 1)` gave −4 and `sigma_4(720720)` a positive wrap. Overflow now returns the designed 0, with each power, partial sum and partial product checked against a bound derived from 2^63 − 1. A big-int oracle matches on 3311 (n, k) pairs. k < 0 now returns 0 for n ≥ 2, where it returned σ₀(n).
+
+**`calc_monotone_cubic` (`D068` and the overflow class).** On 3.3.2 the absolute `|δ| < 1e-30` flat test zeroed real tangents, wrong on 13,671 of 31,006 normal (x-scale, y-scale) pairs. Overflowing midpoints, y differences and grids gave NaN or +Inf, and a subnormal-width interval lost its tangent terms.
+- For a set whose secants are all finite, 3.3.3 halves overflowing differences, uses an exact-zero flat test, takes an overflowing projection in tangent space, and evaluates a subnormal width as p·(h·m).
+- A set with a non-finite secant gets 3.3.2's computation bit for bit.
+- Against an exact Fritsch-Carlson oracle over 8,435,324 results: nothing 3.3.2 had right is wrong, nothing 3.3.2 returned finite is non-finite, and none of its NaNs became a finite wrong value. Between 33,103 and 116,700 results per sweep are now correct where 3.3.2 was wrong or non-finite.
+- svara's use is unaffected.
+
+**`calc_adaptive_simpson` (`D071`).** It walked the full 2^50-leaf tree for an unreachable tolerance (tol = 0 went past 2·10⁷ evaluations). tol ≤ 0 or NaN now returns NaN before f is called, and a positive tolerance that halves to zero returns NaN from the node about to test it. The Result form is [3.4.0].
+
+**Quadrature step counts (`D072`).** `calc_integral_trapez` and `_simpson` accepted a negative step count and stored an endpoint-only estimate as Ok. Both return `Err(HSB_ERR_INVALID_INPUT)` now; 0 keeps `HSB_ERR_ZERO_STEPS`. The pins that asserted acceptance are flipped.
+
+### Fixed — the 3.3.2 leftovers
+
+**Simplex noise is continuous.** `simplex_2d` and `simplex_3d` jumped 0.568 and 0.576 across one 1e-5 step wherever the containing simplex changed.
+- The second and later corner offsets now add G as Gustavson's paper does (13 sites).
+- The 3D falloff limit is 0.5, the least squared distance from a lattice point to any simplex that does not have it as a corner.
+- The largest step on a 1e-5 line walk is now 6.59e-5 (2D) and 4.67e-5 (3D), inside the fields' slope bound.
+- A non-finite coordinate, or one large enough that the skew overflows, returns NaN, as `perlin_2d` does; through 3.3.2 it returned +0.
+- See *Changed* for the new values and scale.
+
+**The NaN-true guard class.** `f64_gt(x, 0) == 0` is true for NaN. All 48 such sites, and the wider `!= 1` / `== 0` spelling, were audited site by site for reachability from a public entry point and for laundering. Repaired where a NaN reached a plausible answer:
+- `geo_triangle_unit_normal` (was (0,1,0)), `geo_segment_direction` (was (1,0,0)), `geo_segment_closest_point` (was the start point), `geo_ray_capsule[_branch]` (a NaN end was a hit at t = 4 with a jet built on it), and `geo_closest_point_on_triangle` (a NaN query returned a vertex). Any non-finite input is now NaN.
+- `cga_plane` (was the zero multivector) and `geo_sphere_sphere` (a NaN centre or radius was a contact).
+- `geo_closest_point_on_aabb`: a NaN bound gives NaN in its own component.
+- `lie_norm3` / `_lie_norm4`: stdlib `f64_max` drops a NaN, so `su2_exp`, `so3_exp`, `su2_from_quat` and the Lorentz builders returned the identity. Also `su2_log`, `so3_log`, `se3_exp` and `se3_log`.
+- `solve_pgs`: a NaN diagonal was skipped like a zero one.
+- `time_of_impact`: a NaN horizon was unbounded and reported an impact.
+- `delaunay_2d`: a NaN at index 0 lost every finite site. Any non-finite site now returns the empty result.
+
+Kept, with the reason documented and pinned:
+- the 19 collision-path guards in GJK/EPA/MPR, which send a NaN shape to the documented miss (flipping them fabricates contacts);
+- the scaled-norm helpers, which no NaN reaches;
+- `geo_aabb_aabb`, whose NaN-true reading `bvh_query_aabb` and octree queries depend on (see *Found*).
+
+**Symbolic rendering.**
+- `sym_const_to_str` tested one side of an integer: 6.000000000000001 rendered "6" but 5.999999999999999 "6.000000", and 1e-300 "0" but −1e-300 "-0.000000". It now tests the nearest integer; −0 and tiny negatives render "0". On 6488 doubles checked against an exact oracle, 3.3.2 rendered 3105 wrong and 3.3.3 none.
+- `sym_to_latex` now:
+  - braces a constant by its text (`{-nan}` like `{-inf}`);
+  - wraps negative constants and negations in every position where they would read as subtraction (`x \left(-3\right)`, `\left(-3\right)^{x}`);
+  - wraps a power or exponential base that would give a double superscript (`x^{2}^{3}` was invalid LaTeX);
+  - writes `\cdot` when the second factor starts with a digit, a '.' or `\frac{1}{b}`. "2 2^{x}" typeset as 22^x, and "2 \frac{1}{3}" read as the mixed number 2⅓.
+- On a 1,365,072-tree corpus, no 3.3.3 output reads as a different value under TeX's whitespace rule or the mixed-number reading. 3.3.2 had 17,173 and 184.
+- `expr_to_str` wraps a power base or negation child that starts with '-' (`(-2^x)` read as −(2^x)).
+
+**Smaller leftovers.**
+- `_geodesic_accel` drops its unread `pos_ptr`, and `geodesic_rk4` stops building the stage positions only that parameter received. Bit-identical output on 200 random calls under 6.6.12, 6.6.3 and 6.6.6.
+- `docs/development/port-audit.md` records the Rust 1.3.0 abaco bridge's `ExprValue` transport as out of scope (roadmap *Scope*). `solve_expr` and `eval_verified` are recorded as not ported, with no disposition.
+- Five hisab-side records for cyrius filings that had none (audit D139), each with a paired before/after re-run from pinned dirs: the 6.6.2 SIMD destination-slot fix and four 6.6.4 fixes.
+- `[2.20.0]` and `[2.2.2]` carry `(⚠ 3.3.3: …)` annotations correcting their figures; the history text is unchanged.
+
+### Fixed — found during 3.3.3
+
+**`svd_golub_kahan` / `eigen_qr`, wide spans.** On finite input spanning more than about 2045 binades they returned rc = OK with NaN or invented values. For example, svd `[0; h; u]` gave S = 0 where the truth is h. On three full-mantissa span probes (14,784 rows) that was 450 rows.
+- Each place the overflow reaches (column and reflector norms, split-chase and QR radii, the final rescale) now returns `Err(HSB_ERR_NO_CONVERGENCE)` with the out-params untouched: 0 silent rows, 444 now Err and 6 now right.
+- Of 49,501 in-range rows, all are byte-identical to 3.3.2 except 725 whose true largest value is above DBL_MAX: +Inf with rc = OK before, Err now.
+- Cost: +0.3% to +0.8% on the 12×12 bench fixtures.
+
+**`time_of_impact`'s normal.**
+- On every swept impact it returned the unit_x placeholder: B approaching from −x or +y gave (+1,0,0).
+- Its t = 0 paths used opposite sign conventions.
+- It now reports the outward normal of A ⊖ B, from A towards B, on every path: the swept reading where the contact leaves a gap, and a probe chain where it does not.
+- Over 48,441 calls in fourteen sweeps (spheres, boxes, capsules, points; swept and t = 0):
+  - 18 normals are on the wrong side, against 34,866 for 3.3.2;
+  - 18,625 are nearer the exact closest-approach direction;
+  - 17 are further by more than 1e-9 rad, all no-gap contacts where 3.3.2 wrote its placeholder.
+- A subnormal gap no longer gives (−Inf, −Inf, −Inf).
+- t and the return value are unchanged on every call.
+- Cost: 1.0× to 2.1× per call depending on the path (table in the source).
+
+**Other collision and geometry repairs.**
+- `gjk_epa_3d` / `mpr_penetration`: the exact-touch normal was inward (B → A) while the penetration normal was outward, so swapping operands gave the same normal. Both now write the outward A → B normal.
+- `bvh_build`'s bound fold used `f64_min`/`f64_max`, which drop a NaN, so a NaN box could exclude a finite neighbour from the root bound. It now folds with IEEE 754-2019 minimum/maximum. `bvh_degenerate_4k` is 4.3% faster beyond its spread, from an exact identical-bits early exit.
+- `hvec3_min` / `hvec3_max` answered a NaN by operand order. They now follow IEEE 754-2019 minimum/maximum (NaN wins; −0 < +0), so `geo_aabb_new` keeps a NaN corner in either order.
+- Every `geo_jet_*` builder returns its miss jet for a non-finite t. On a 181,500-case sweep, 16,919 hit jets with NaN or +Inf t (and NaN gradients) → 0. Jets whose t overflows from finite input are misses now; the primal still returns its +Inf.
+- `_cga_scalar_of_geo` (through `cga_norm_sq`) and `num_kahan_sum` / `num_neumaier_sum`: one infinite term made the compensated sum NaN (Inf − Inf).
+  - One-signed infinities now give that infinity.
+  - A NaN term or opposite infinities give NaN.
+  - Every term finite with an overflowing sum gives NaN.
+  - `calc_integral_simpson` follows the same rule for its samples.
+- `num_neumaier_sum(data, n < 0)` read `data[0]`; it returns +0.0 now.
+
+**Lie group repairs.**
+- `su2_from_quat` returned the zero quaternion for a finite quaternion whose norm overflows; it now rescales.
+- `su2_log` returned (+Inf, NaN, NaN) for a valid turn near 2π with a vector part below about 2^-1021. It is now exact along an axis and within 2 ulps elsewhere.
+- `se3_log` returns NaN, not a non-inverting twist, at that 2π singularity.
+- `so3_log` refuses non-finite input with NaN; through 3.3.2 it returned the identity's log.
+
+**Number theory.**
+- `num_extended_gcd` with an i64-min dividend gave a negative gcd or coefficients valid only modulo 2^64: egcd(i64 min, 6) was −2; it is 2 with x = −1, y = −1537228672809129301.
+- The pairs whose gcd is 2^63 return i64 min, documented as 2^63 read unsigned, in both `num_gcd` and `num_extended_gcd`, so `a / g` still reduces them.
+- `num_sobol` reversed only 32 bits, so every index ≥ 2^32 got a wrong point. It reverses 64 now; indices below 2^32 are bit-identical.
+- A negative index returns NaN in `num_sobol` and `num_halton`; both returned a sample.
+- `num_euler_totient` and `num_mobius` return the designed 0 for n < 0, where they returned −n and 1.
+- `num_continued_fraction_rational` no longer raises SIGFPE on its two trapping inputs.
+
+**Other numerics.**
+- `calc_integral_trapez`, `_simpson`, `_gauss5` and `calc_adaptive_simpson` over an exact zero width return +0 without calling f; with f(a) = +Inf they returned NaN, stored as Ok.
+- `calc_bspline` / `calc_nurbs`: a NaN t returns the documented invalid-input 0 at every degree.
+
+**The constant gate.** At ±DBL_MAX the gate's 1-ulp tolerance stepped to +Inf, so any value passed. 3.3.3 added the first constants there; planted as 1.0, the old gate printed "155/155 verified". It now takes the step below. Planted defects, 1.0 and 2 ulp below, are caught.
+
+### Changed — behaviour a caller can see
+- `cqr_decompose`: non-finite A → `Err(HSB_ERR_INVALID_INPUT)`.
+- `svd_truncated`: returns `Err`.
+- `svd_compute`: −2 for non-finite A.
+- `svd_golub_kahan` / `eigen_qr`: `HSB_ERR_NO_CONVERGENCE` now also means a value or intermediate is not finite in f64.
+- `eigen_power` needs about log(1e-12)/log|λ₂/λ₁| + 2 passes. diag(4,3,2) took 2 passes from e₀ on 3.3.2 and needs 92. Defective matrices, matrices with no dominant eigenvalue, and slow ratios at a small max_iter are `NO_CONVERGENCE`. Cost +3% to +4% per call on small matrices.
+- `calc_integral_trapez` / `_simpson`: steps < 0 → `Err(HSB_ERR_INVALID_INPUT)`.
+- `calc_adaptive_simpson`: NaN for an unreachable tolerance.
+- `ivl_new` / `ivl_point` store ±DBL_MAX for an infinite inner bound.
+- **simplex:** every value of `simplex_2d`, `simplex_3d` and both simplex fBms changes. The 3D output scale is 76.75 (was 32) because the 0.5 falloff shrinks the field. The measured maxima are 0.99789 (2D, the closed form 140/(81√3)) and 0.99830 (3D). No consumer in ~/Repos calls them.
+- **time_of_impact** normals point from A to B on every path; a consumer that read 3.3.2's t = 0 in-tolerance normal sees its sign flip. **gjk_epa_3d / mpr_penetration** exact-touch normals are outward.
+- NaN contracts reverse two documented decisions:
+  - 2.10.2's "a NaN triangle/segment folds to the degenerate fallback";
+  - 2.17.0's split between `cga_plane` and `cga_rotor`.
+  NaN now propagates in both.
+- `delaunay_2d` returns the empty result for any non-finite site.
+- `hvec3_min` / `hvec3_max` follow IEEE 754-2019, so `geo_aabb_new((-0,..),(+0,..))` is [−0, +0].
+- `geo_closest_point_on_triangle`: a ±Inf query is NaN. About 3/4 of single-infinity queries were the correct limit on 3.3.2; the other 1/4 were a fabricated vertex.
+- `geo_triangle_unit_normal` with coordinates of about 2^512 or more returns NaN where 3.3.2 returned (0,1,0). The normal is recoverable by pre-scaling ([3.3.4] D037).
+- LaTeX and `expr_to_str` output changes as listed above.
+- `num_sobol` / `num_halton`: a negative index gives NaN. `num_mobius` / `num_euler_totient`: n < 0 gives 0.
+- GMRES / BiCGSTAB: `A_fn` may reuse its output buffer.
+
+### Removed
+- `_geodesic_accel`'s `pos_ptr` parameter and `geodesic_rk4`'s dead stage-position stores.
+- A dead store in `cqr_decompose`.
+
+### Performance — costs, no wins claimed
+- Same-boot interleaved A/B, the 3.3.2 tag against this tree, full `tests/hisab.bcyr`, four runs each: the median ratio over 80 rows is 1.000, and no row is slower beyond its own spread. Two are faster beyond it: `ray_aabb` −6.2% and `bvh_degenerate_4k` −4.3%.
+- Measured costs on paths with no bench row (scratch harnesses):
+  - `simplex_2d` +12% and `simplex_3d` +11%, before the non-finite guard; more corners fall inside the falloff now.
+  - `time_of_impact` 1.0× to 2.1× by path.
+  - GMRES 3×3 +9.4%.
+  - `cqr_decompose` 4×4 +3.1%.
+  - `eigen_power` +3% to +4%.
+  - `geo_closest_point_on_triangle` about +17% (the reviewer's measurement).
+
+### Gates
+- `check-constants.sh`: `GLOBAL_FLOOR` 211 → 218 and `POPULATION_FLOOR` 156 → 162, for seven new hex globals less one deleted local constant.
+- `check-public-surface.sh`: `PRIV_PROBE_FLOOR` 492 → 520.
+- `docs/guides/testing.md`: published counts 4606 → 6038.
+
+### Found — not repaired (the maintainer's decision; evidence in the session report)
+- Interval arithmetic rounds to nearest, not outward.
+- `calc_monotone_cubic` still gives NaN or a wrong value for sets whose exact slope is past DBL_MAX or below DBL_MIN (3.3.2's behaviour, kept).
+- `geo_aabb_aabb`'s NaN reading: making it NaN-false breaks `bvh_query_aabb`'s NaN-slab design.
+- BiCGSTAB returns a finite x on 188 of 43,000 runs where 3.3.2 returned NaN (from 3.3.3's `D015` changes). It also keeps an unreported half step when t is exactly zero.
+- The SVD/eigen balance has no headroom: wide spans are now loud, not answered.
+- `delaunay_2d` silently drops sites at scales of about 2^513 and above, and returns empty for tiny inputs.
+- Simplex output above 2^63 depends on the toolchain.
+- ganita's `ganita_mat_svd` fails to converge on 3×2 inputs at 2^-513 and below, and accepts non-finite input. Not filed: the maintainer decides.
+
 ## [3.3.2] - 2026-10-01 — three wrong answers found on the way, every stale "filed / on the roadmap" claim settled, and the dead code out
 
 The roadmap's **[3.3.2]** items (stale claims, dangling pointers, dead code), plus three defects
@@ -2446,7 +2650,7 @@ satisfied by the complete answer too, which is how a backwards claim survived th
 sweep clears and scans the full tape every call, so a shared-tape driver **quadruples** per doubling of
 m (461 → 1240 → 4667 → 18398 µs) while the per-residual reset **doubles** (215 → 391 → 775 → 1474). The
 ratio is 2× at m = 256 and 12× at m = 2048 and grows without bound, so it must never be quoted as a
-constant. No code change: the scan is O(root) on its own, so halving the clear leaves it quadratic.
+constant. No code change: the scan is O(root) on its own, so halving the clear leaves it quadratic. (⚠ 3.3.3: these figures are the first probe's, whose shared-tape driver ran on a truncated tape and read about 2.6× low. This release's own *Changed — autodiff* entry has the corrected ones: shared 1214 → 4860 → 17779 → 67232 µs, per-residual 227 → 387 → 748 → 1425 µs, a ratio of 5× at m = 256 and 47× at m = 2048, as the table above `ad_grad` in `src/autodiff.cyr` and the jac_rev comment in `tests/hisab.bcyr` say. Left as history.)
 
 ⛔ **AND ADDING A BENCHMARK CHANGED A DIFFERENT BENCHMARK BY 31%.** The two new `jac_rev` rows build
 tapes under a bump allocator that **never frees**, and when they registered 19th/20th they shifted the
@@ -8774,7 +8978,7 @@ against a consumer build.
 - **`lib/num_ext.cyr`**: renamed local variable `stack` → `stk` (6 identifier sites in `_factorize_pollard_rho`). `stack` became a reserved keyword in Cyrius 5.7.x; the four mentions in comments were left intact
 - **`lib/collision_core.cyr`**: 3 empty-init / empty-step `for` loops converted to `while`. Cyrius's `for (init; cond; step)` requires *all three* clauses — `for (; cont == 1;)` and `for (; sj >= 0; sj = sj - 1)` were never valid syntax. The for-with-step variant kept its step semantics by appending `sj = sj - 1` to the loop body tail. File was never in the build chain pre-2.2.2 (orphan-include-after-syscall trick masked it), so this is the first time it actually parses
 - **`lib/collision_mesh.cyr`**: same migration — one `for (var ti = 0; ti < n_tris;)` (empty step) converted to a manual `var ti = 0; while (ti < n_tris) { ...; ti = ti + 1 (or stay) }` (loop conditionally advances based on whether the current element was removed). Plus renamed local `shared` → `is_shared` (4 identifier sites — `shared` is reserved in Cyrius 5.5+; one comment mention left intact)
-- **`lib/calc.cyr`** `_perm_init` (Perlin noise table): refactored the 18-arg `_perm_store_block(base, off, a..p)` helper into a 10-arg `_perm_store_8(base, off, a..h)` form, called 32× instead of 16×. **cc5 5.7.10 has a codegen bug at 18+ args** that scrambles register/stack params (args 1, 2, 7-12 silently read garbage values — see [`docs/development/issues/archived/2026-04-26-cc5-18-arg-fn-scrambles-params.md`](docs/development/issues/archived/2026-04-26-cc5-18-arg-fn-scrambles-params.md) for the full reproducer; the filing was archived when 6.2.11 fixed it). Pre-fix: bench segfaulted at exit 139 inside `perlin_2d` because the permutation table got written full of garbage. Post-fix: `perlin_2d` runs through 200,000 iterations cleanly
+- **`lib/calc.cyr`** `_perm_init` (Perlin noise table): refactored the 18-arg `_perm_store_block(base, off, a..p)` helper into a 10-arg `_perm_store_8(base, off, a..h)` form, called 32× instead of 16×. **cc5 5.7.10 has a codegen bug at 18+ args** that scrambles register/stack params (args 1, 2, 7-12 silently read garbage values — see [`docs/development/issues/archived/2026-04-26-cc5-18-arg-fn-scrambles-params.md`](docs/development/issues/archived/2026-04-26-cc5-18-arg-fn-scrambles-params.md) for the full reproducer; the filing was archived when 6.2.11 fixed it) (⚠ 3.3.3: the fix landed in cyrius 6.0.57, 2026-06-03 (the >16-arg ECALLPOPS disp8 wrap). 6.2.11 is the pin at which hisab first saw it fixed, on 2.6.6's 6.0.14 → 6.2.11 bump; see the archived record's status, corrected in 3.3.2. Left as history.). Pre-fix: bench segfaulted at exit 139 inside `perlin_2d` because the permutation table got written full of garbage. Post-fix: `perlin_2d` runs through 200,000 iterations cleanly
 - **`src/main.cyr`**: stripped from 30+ project-module includes down to the two stdlib includes its `fn main()` actually uses (`syscalls`, `io`). The previous form prepended every project module just to "validate the include chain" — but cc5 5.7.7's 512 KB input_buf can't fit that, and the test suites already cover include integration. Bonus: fixed three orphan `include` lines that sat *after* `syscall(SYS_EXIT, r)` (parsed but unreachable; first time any of them was scrutinized was when one tripped a parse error). CLI binary: now ~140 KB static ELF, prints the version string and exits
 - **`tests/modules.tcyr`**: stripped six "multiple consecutive blank lines" lint warnings (lines 43-45, 263-264, 390 in the pre-fix file). `cyrius lint` returns the warning count as its exit code, which the prior CI loop swallowed under GHA's `set -eo pipefail` — the loop would abort on the first non-zero rc without reporting which file tripped it
 - **`examples/basic_math.cyr` + `tests/{edge_cases,foundation,hisab,modules}.tcyr`**: applied `cyrius fmt` to flatten multi-line continuation-indent drift from the modern formatter

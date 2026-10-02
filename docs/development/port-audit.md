@@ -67,6 +67,33 @@
 > expression parsing to abaco, and *Boundary with Abaco* says hisab should never
 > depend on abaco.
 
+> **Status 2026-10-01 (v3.3.3): the symbolic bridge is recorded as not ported.**
+> Read from the Rust source rather than from the gap list's one word
+> (`src/symbolic/bridge.rs`, 473 lines, added in commit `bc09eb9` for Rust 1.3.0,
+> 2026-03-27), the "abaco bridge" was three things:
+>
+> - `ExprValue` (`Number`, `Symbol`, `Call(name, args)`, `Negate`), a serde
+>   transport form of the expression tree, with `expr_to_value` / `value_to_expr`.
+>   Its own doc comment says it exists so that abaco's `Value` can convert to and
+>   from it.
+> - `solve_expr(expr, var, opts)`: Newton–Raphson on the expression and its
+>   symbolic derivative, falling back to bisection when a bracket is given.
+> - `eval_verified(expr, vars)`: interval evaluation of a tree, one interval per
+>   variable.
+>
+> **Not ported; there is no Cyrius counterpart to any of the three** (`src/` has no
+> `ExprValue`, `solve_expr` or `eval_verified`, and no function takes an `ivl_*`
+> interval through an expression tree). The transport half is outside hisab's
+> scope as the roadmap draws it: its *Scope* section says hisab owns typed
+> mathematical operations and that expression parsing belongs to abaco, and
+> `ExprValue` existed only to carry trees to abaco. ⚠ That reasoning does not
+> settle `solve_expr` and `eval_verified`, which are operations on a tree, not
+> parsing or transport. They are not ported either, and whether they join the
+> demand-gated list or are dropped is the maintainer's decision; this note records
+> no decision about them. abaco itself declares no `[deps.hisab]` and calls no
+> hisab symbol (roadmap, *Boundary with Abaco*), so nothing consumes either half
+> today.
+
 ## Summary
 
 | Metric | Rust | Cyrius | Status |
@@ -138,13 +165,16 @@ These were flagged as missing but ARE in the port:
 
 ### Other
 - Reverse-mode autodiff (Tape)
-- Symbolic: integration, LaTeX, pattern matching, bridge
+- Symbolic: integration, LaTeX, pattern matching, bridge *(the bridge is not ported; see
+  the 2026-10-01 status)*
 - Dual quaternions
 - Mat4 decompose/recompose
 - Parallel module (requires Cyrius threading) *(outdated: the cyrius 6.6.12 tag ships
   `lib/thread.cyr`; see the 2026-09-30 status)*
-- AI module (requires Cyrius HTTP) *(outdated: the cyrius 6.6.12 tag ships `lib/http.cyr`; the
-  module is dropped, since it would conflict with SECURITY.md's "No network I/O in core library")*
+- AI module (requires Cyrius HTTP) *(outdated: the cyrius 6.6.12 tag ships `lib/http.cyr`. The
+  module would conflict with SECURITY.md's "No network I/O in core library" and is not on the
+  roadmap; whether to drop it for good is the maintainer's decision, see the 2026-09-30 status.
+  Through 3.3.2 this note said "the module is dropped", which no decision records)*
 - Logging module (sakshi covers this)
 
 ## Infrastructure gaps

@@ -52,7 +52,7 @@ Hisab does NOT trust:
 | PCG32 | Signed arithmetic for unsigned ops | Verified safe: & masks discard sign extension |
 | m4_get/m4_set | No bounds check | Contract: col/row in [0,3], caller must validate |
 | Jacobi eigensolver (`eigen_symmetric`) | Cost growth on large matrices | `eigen_symmetric` wraps ganita's `ganita_mat_eigen_sym`, a classical Jacobi bounded by ganita's own budget of 100·n² rotations (past it: `Err(HSB_ERR_NO_CONVERGENCE)`). Since ganita 1.2.3 (in every cyrius pin from 6.6.1) its pivot search is indexed, so the cost is O(n³) typical and O(n⁴) worst within that budget; ganita documents O(n⁴) through 1.2.2. This row said "O(n^5)" and "not for n > 50"; neither figure was ever measured. `eigen_qr` (`linalg_precision.cyr`) is the shipped O(n^3) alternative — Householder tridiagonalization + implicit symmetric QR with Wilkinson shift; it gained `svd_golub_kahan`'s four guards (null handles, non-positive `n`, shape) in 2.9.0, before which `eigen_qr(0, 3, …)`, `n = -3` and either null out-param all exited **139** |
-| `svd_compute` / `svd_truncated` | Precision lost to a squared condition number | **No longer applies.** Both wrap ganita's `ganita_mat_svd`, a one-sided Jacobi SVD since ganita 1.2.4 (in every cyrius pin from 6.6.1, so in every pin that compiles hisab ≥ 3.1.0) that never forms AᵀA. Through ganita 1.2.3 it eigendecomposed AᵀA and squared cond(A), which is what this row described as "SVD via A^T*A". ⚠ Open: `svd_truncated` discards `ganita_mat_svd`'s failure return (−2 for a wide matrix) and reports `Ok(0)` — roadmap **[3.3.3]**, audit `D012`. `svd_golub_kahan` (`linalg_precision.cyr`) is the hisab-owned alternative — bidiagonalization + implicit QR. Two later repairs on the replacement itself: 2.7.0 balances to unit max magnitude first, since every step squares entries and the usable band was only about 1 .. 1e23 (**40/40** failures at scale 1e-10, i.e. SI metres), and 2.8.3 rejects `m < n`, which previously returned `HSB_ERR_NONE` on numbers that are not singular values — **200 of 200** wide matrices violated `Σσᵢ² == ‖A‖_F²`, 0 of 200 tall ones did |
+| `svd_compute` / `svd_truncated` | Precision lost to a squared condition number | **No longer applies.** Both wrap ganita's `ganita_mat_svd`, a one-sided Jacobi SVD since ganita 1.2.4 (in every cyrius pin from 6.6.1, so in every pin that compiles hisab ≥ 3.1.0) that never forms AᵀA. Through ganita 1.2.3 it eigendecomposed AᵀA and squared cond(A), which is what this row described as "SVD via A^T*A". Through 3.3.2 `svd_truncated` discarded `ganita_mat_svd`'s failure return and reported `Ok(0)`; since 3.3.3 it returns `Err`, and `svd_compute` refuses non-finite input with −2 (audit `D012`). `svd_golub_kahan` (`linalg_precision.cyr`) is the hisab-owned alternative — bidiagonalization + implicit QR. Two later repairs on the replacement itself: 2.7.0 balances to unit max magnitude first, since every step squares entries and the usable band was only about 1 .. 1e23 (**40/40** failures at scale 1e-10, i.e. SI metres), and 2.8.3 rejects `m < n`, which previously returned `HSB_ERR_NONE` on numbers that are not singular values — **200 of 200** wide matrices violated `Σσᵢ² == ‖A‖_F²`, 0 of 200 tall ones did |
 
 ### Memory-safety tier — closed in v2.6.14
 
@@ -311,3 +311,24 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
   - Suites **4606**, constants 155/155, public surface 704 declarations / 847 probes, 492 of 492
     non-public probes refused (19 dead private names deleted). 6.6.2 still refuses the bundle;
     6.6.3, 6.6.6, 6.6.9, 6.6.10 and 6.6.12 run consumer-shaped programs correctly.
+- **2026-10-01**: v3.3.3 — **silent wrong answers in linalg, num and calc, and the NaN-true guard
+  class.** The [3.3.3] rows plus the 3.3.2 leftovers, under one release criterion that two
+  adversarial reviews enforced: no input comes out worse than on 3.3.2.
+  - **Silent wrong answers made right or loud** (CWE-682): `cqr_decompose` wiped subnormal blocks
+    with rc OK; `svd_golub_kahan` / `eigen_qr` returned rc OK with NaN or invented values on finite
+    wide-span input (450 rows of 14,784; now 0, loud); `eigen_power` answered A[0][0] for every
+    diagonal or triangular matrix; `svd_truncated` reported Ok on ganita's failure; BiCGSTAB's
+    breakdown tests were scale-dependent; `num_divisor_sigma`, `num_extended_gcd` and `num_sobol`
+    wrapped or truncated silently; `time_of_impact` fabricated its normal on every swept impact.
+  - **Fabricated answers for NaN input** (the class `complex.cyr` has tracked since 2.6.14): 48
+    `f64_gt(x, 0) == 0` guards and the wider `!= 1` spelling audited site by site; the reachable
+    launderings in geo, cga, lie, solve_pgs, delaunay_2d, time_of_impact and the geo_jet builders
+    now propagate NaN or refuse. Two documented contracts reversed (2.10.2, 2.17.0).
+  - **A crash removed** (CWE-369): `num_continued_fraction_rational` raised SIGFPE on two inputs.
+  - **A gate that could not fail**: `check-constants.sh` accepted any value for a constant at
+    ±DBL_MAX (tolerance +Inf); it now takes the step below.
+  - **Known, not repaired** (the maintainer's decision): interval arithmetic rounds to nearest,
+    not outward; geo_aabb_aabb's NaN reading; ganita's SVD non-convergence and non-finite input.
+  - Suites **6038**, constants 161/161, public surface 704 declarations / 847 probes, 520 of 520
+    non-public probes refused. 6.6.2 still refuses the bundle; 6.6.3, 6.6.6, 6.6.9, 6.6.10 and
+    6.6.12 run consumer-shaped programs correctly.

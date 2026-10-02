@@ -382,8 +382,23 @@ public fn pcg32_next_f64(rng) {
 # NUMBER THEORY
 # ================================================================
 
-# Binary GCD (Stein's algorithm). Operates on non-negative integers.
-# Returns: gcd of a and b
+# Binary GCD (Stein's algorithm), on the magnitudes |a| and |b|.
+# a, b: integers (may be negative; the gcd is that of |a| and |b|)
+# Returns: gcd of a and b, non-negative -- except that a gcd of 2^63 comes back as
+# i64 min, which is 2^63 read unsigned. That is (i64 min, 0), (0, i64 min) and
+# (i64 min, i64 min), the only pairs both of whose entries 2^63 divides.
+#
+# i64 min as a RESULT is the reading this function already gives i64 min as an
+# ARGUMENT: `0 - a` leaves it where it is, and cycc's `>>` is a logical shift, so the
+# loop below runs on that bit pattern as 2^63. It is also what makes the reducing
+# idiom `a / g, b / g` right for those pairs: i64 min / i64 min = 1 and 0 / i64 min
+# = 0, so (0, i64 min) reduces to 0/1 and (i64 min, i64 min) to 1/1. A caller that
+# needs a signed gcd tests `g < 0`, which holds for those three pairs and no other.
+# ⛔ 3.3.3 — AN EARLIER 3.3.3 DRAFT RETURNED 0 FOR THEM, and that 0 made the idiom
+# divide by zero: reduce(0, i64 min) died with SIGFPE (exit 136), where 3.3.2's
+# i64 min gave 0/1. 3.3.3 keeps 3.3.2's results for every pair; num_extended_gcd
+# returns the same i64 min for the same three pairs.
+# [measured: tests/abuse.tcyr, group "3.3.3 R5num: gcd 2^63 as i64 min, and the reducing idiom"]
 public fn num_gcd(a, b) {
     if (a < 0) { a = 0 - a; }
     if (b < 0) { b = 0 - b; }
@@ -417,6 +432,8 @@ public fn num_gcd(a, b) {
         b = b - a;
     }
 
+    # For (i64 min, i64 min) a = 1 and shift = 63, and 1 << 63 is i64 min: 2^63 read
+    # unsigned, as documented above. Every other gcd is below 2^63.
     return a << shift;
 }
 
@@ -652,10 +669,75 @@ public fn num_sieve(limit) {
 # COMPENSATED SUMMATION
 # ================================================================
 
+# Internal: the answer for a compensated sum of data[0..n) whose result r is not
+# finite. Both callers below send every non-finite result here, and only those, so no
+# finite result changes. The rule reads the TERMS, never the running sum:
+#
+#   A term is not finite. The true sum is the IEEE sum of the terms, which the finite
+#   ones cannot change: infinities of one sign give that infinity, and a NaN term or
+#   infinities of both signs give NaN, which r already is. So [-DBL_MAX, -DBL_MAX,
+#   +Inf] is +Inf, though its running sum reached -Inf first and -Inf + Inf is NaN.
+#
+#   Every term is finite. Then the running sum, or the compensated result, overflowed,
+#   and an infinity says nothing about the true sum, which can be finite: [DBL_MAX,
+#   DBL_MAX, -DBL_MAX] sums to DBL_MAX. The answer is NaN, loud: r when the loop
+#   formed it (3.3.2's bits), and a quiet NaN where the loop came out ±Inf.
+# ⛔ 3.3.3 — THAT ±Inf WAS RETURNED AS THE SUM in 3.3.2, and it can be wrong. Kahan
+# returns an infinity when its running sum, or its compensation, overflows at one of
+# the last two terms, and either can be wrong: num_kahan_sum([2^1023, -0.5,
+# 2^1023 - 2^970]) was +Inf, where the sum, 2^1024 - 2^970 - 0.5, lies below the
+# overflow threshold and rounds to DBL_MAX; and in [-(2^1022 + 3 * 2^970), DBL_MAX,
+# -1] the compensation term (t - sum) is exactly that threshold, rounds to +Inf, and
+# the -1 then made the sum -Inf, where it is +1.348e308. (Neumaier returned NaN and
+# that finite sum.) Neumaier returns an infinity when only its compensation carries
+# the result over: [DBL_MAX, 2^969, 2^969] was +Inf. All are now NaN, like every other
+# overflow from finite terms. The cost is stated: where that infinity was right --
+# [DBL_MAX, DBL_MAX] is 2 * DBL_MAX, whose rounding is +Inf -- the answer is NaN too.
+# [measured: tests/edge_cases.tcyr, group "3.3.3 R5num: compensated sums whose terms are all finite"]
+# Both sums over 120000 random arrays of 1 to 24 terms, 16972 with an infinite or
+# NaN term, against 3.3.2: no finite result changed; every result for an array with
+# a non-finite term is the class of its true sum, 12233 of them NaN in 3.3.2 and ±Inf
+# now; and of the all-finite arrays, 71905 NaN results keep 3.3.2's bits and 3329
+# Kahan ±Inf results are NaN now. Against the exact sum (python3 Fraction), 3321 of
+# those 3329 were its rounding (the cost) and 8 were wrong: 7 finite sums returned
+# as an infinity, and one sum that rounds to +Inf returned as -Inf.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 Fraction oracle]
+fn _num_sum_nonfinite(data, n, r) {
+    var pos = 0;
+    var neg = 0;
+    var i = 0;
+    while (i < n) {
+        var v = load64(data + i * 8);
+        if (f64_eq(v, v) == 0) { return r; }
+        if (f64_eq(v, F64_POS_INF) == 1) { pos = 1; }
+        if (f64_eq(v, 0xFFF0000000000000) == 1) { neg = 1; }    # -Infinity
+        i = i + 1;
+    }
+    if (pos == 1) {
+        if (neg == 1) { return r; }
+        return F64_POS_INF;
+    }
+    if (neg == 1) { return 0xFFF0000000000000; }    # -Infinity
+    if (f64_eq(r, r) == 0) { return r; }
+    return 0x7FF8000000000000;    # quiet NaN
+}
+
 # Kahan compensated summation.
 # data: pointer to n consecutive f64 values (each 8 bytes)
-# n: number of f64 values
-# Returns: f64 bit pattern of the sum
+# n: number of f64 values (n <= 0 is the empty sum, +0.0)
+# Returns: f64 bit pattern of the sum. A non-finite term gives the IEEE sum of the
+# terms (±Inf, or NaN); finite terms that overflow the loop give NaN
+# (_num_sum_nonfinite)
+#
+# ⛔ 3.3.3 — ONE INFINITE TERM MADE THE SUM NaN. Once a term is infinite, `t` is too,
+# and the compensation `(t - sum) - y` forms Inf - Inf: c went NaN, and with it every
+# later `y` and the sum. num_kahan_sum([1, +Inf, 1]) and ([+Inf, 1, 1]) returned NaN
+# where the IEEE sum is +Inf, and num_neumaier_sum below did the same for [1, +Inf,
+# 1], [1, -Inf, 1] and [+Inf, 1, 1]. Both loops are unchanged; a non-finite result is
+# handed to _num_sum_nonfinite above, which returns the infinity when the infinite
+# terms all have one sign and no term is NaN, NaN when the terms' sum is NaN, and NaN
+# when every term is finite.
+# [measured: tests/edge_cases.tcyr, group "3.3.3 R4num: compensated sums with an infinite term"]
 public fn num_kahan_sum(data, n) {
     var sum = _NUM_F64_ZERO;
     var c = _NUM_F64_ZERO;    # compensation
@@ -668,16 +750,23 @@ public fn num_kahan_sum(data, n) {
         sum = t;
         i = i + 1;
     }
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0) { return _num_sum_nonfinite(data, n, sum); }
     return sum;
 }
 
 # Neumaier compensated summation -- improved Kahan.
 # Handles the case where the addend is larger than the running sum.
 # data: pointer to n consecutive f64 values (each 8 bytes)
-# n: number of f64 values
-# Returns: f64 bit pattern of the sum
+# n: number of f64 values (n <= 0 is the empty sum, +0.0)
+# Returns: f64 bit pattern of the sum (a non-finite term or an overflow: see
+# num_kahan_sum and _num_sum_nonfinite, 3.3.3)
+# ⛔ 3.3.3 — A NEGATIVE n READ data[0] AND RETURNED IT. Only n == 0 was the empty sum,
+# so num_neumaier_sum(data, -3) loaded the first term, skipped the loop and returned
+# it: a NaN, +Inf or any finite value from memory the count said not to read. n <= 0
+# now returns +0.0, the empty sum, as num_kahan_sum always did.
+# [measured: tests/edge_cases.tcyr, group "3.3.3 R5num: compensated sums whose terms are all finite"]
 public fn num_neumaier_sum(data, n) {
-    if (n == 0) { return _NUM_F64_ZERO; }
+    if (n <= 0) { return _NUM_F64_ZERO; }
     var sum = load64(data);
     var c = _NUM_F64_ZERO;    # compensation
     var i = 1;
@@ -694,5 +783,7 @@ public fn num_neumaier_sum(data, n) {
         sum = t;
         i = i + 1;
     }
-    return f64_add(sum, c);
+    var r = f64_add(sum, c);
+    if (f64_lt(f64_abs(r), F64_POS_INF) == 0) { return _num_sum_nonfinite(data, n, r); }
+    return r;
 }

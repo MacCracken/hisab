@@ -70,10 +70,20 @@ SKIP_RE = re.compile(r'\b(nan|inf|sentinel|mask|bits? pattern|magic|seed|hash)\b
 def as_double(h):
     return struct.unpack('>d', struct.pack('>Q', int(h.replace('_', ''), 16) & 0xFFFFFFFFFFFFFFFF))[0]
 
+# ⛔ 3.3.3 — AT ±DBL_MAX THE STEP ABOVE IS +Inf, SO THE TOLERANCE WAS +Inf AND
+# EVERY VALUE PASSED. 3.3.3 added the first constants there (_IVL_F64_MAX and
+# _IVL_F64_NEG_MAX in interval.cyr); with _IVL_F64_MAX planted as
+# 0x3FF0_0000_0000_0000 (1.0) under its own "(2 - 2^-52) * 2^1023" comment, the
+# gate still printed "155/155 verified". At the top of the range the ulp is the
+# step BELOW; the fixed gate reports 154/155 for that plant and for 2 ulp below.
+# [measured: scratch copy of the 3.3.3 tree, 2026-10-01]
 def ulp(x):
     if x == 0 or x != x: return 5e-324
     b = struct.unpack('>Q', struct.pack('>d', abs(x)))[0]
-    return abs(struct.unpack('>d', struct.pack('>Q', b + 1))[0] - abs(x))
+    up = struct.unpack('>d', struct.pack('>Q', b + 1))[0]
+    if up == float('inf'):
+        return abs(x) - struct.unpack('>d', struct.pack('>Q', b - 1))[0]
+    return abs(up - abs(x))
 
 import math
 
@@ -293,7 +303,9 @@ for path in sorted(glob.glob('src/*.cyr')):
 # emptied by a mechanical edit while still printing "no duplicates" is the defect
 # this block just had. Raise it when globals are added; lower it only with a
 # reason in the commit (3.3.2 deletes the dead `_COL_*` globals and will).
-GLOBAL_FLOOR = 211   # column-0 globals in src/; 221 -> 211 in 3.3.2: D063 deleted 10 dead _COL_* globals
+GLOBAL_FLOOR = 218   # column-0 globals in src/; 221 -> 211 in 3.3.2: D063 deleted 10 dead _COL_* globals
+                     # 211 -> 218 in 3.3.3: _IVL_F64_MAX/_IVL_F64_NEG_MAX (D021), four _GA_TOI_* (the
+                     # time_of_impact normal), _NUMX_F64_INV_2P64 (num_sobol's 64-bit domain)
 global_population = sum(len(v) for v in seen_globals.values())
 if global_population < GLOBAL_FLOOR:
     print(f"\n!! DUPLICATE-GLOBAL SCAN SHRANK: {global_population} declarations seen, floor is {GLOBAL_FLOOR}.")
@@ -358,7 +370,8 @@ if errors:
 # without failing is a gate that can be emptied by a mechanical edit. The floor
 # is the population at the last audit; raise it when constants are added, never
 # lower it without saying why in the commit.
-POPULATION_FLOOR = 156   # 155 verified + 1 skipped; 164 -> 156 in 3.3.2: 8 of D063's 10 dead globals were hex constants
+POPULATION_FLOOR = 162   # 161 verified + 1 skipped; 164 -> 156 in 3.3.2: 8 of D063's 10 dead globals were hex constants
+# 156 -> 162 in 3.3.3: the seven hex globals above (+7); D015 deleted solve_bicgstab's breakdown_tol (-1)
 population = total + len(skipped)
 if population < POPULATION_FLOOR:
     print(f"\n!! POPULATION SHRANK: {population} declarations seen, floor is {POPULATION_FLOOR}.")

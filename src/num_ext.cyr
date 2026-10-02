@@ -25,6 +25,7 @@ var _NUMX_F64_TWO   = 0x4000000000000000;          # 2.0
 var _NUMX_F64_NEG1  = 0xBFF0000000000000;          # -1.0
 var _NUMX_F64_HALF  = 0x3FE0000000000000;          # 0.5
 var _NUMX_F64_INV_2P32 = 0x3DF0000000000000;       # 2^-32
+var _NUMX_F64_INV_2P64 = 0x3BF0000000000000;       # 2^-64
 
 # ================================================================
 # EXTENDED NUMBER THEORY
@@ -34,7 +35,34 @@ var _NUMX_F64_INV_2P32 = 0x3DF0000000000000;       # 2^-32
 # Returns gcd(a, b) and writes x, y to out_x, out_y such that ax + by = gcd.
 # a, b: integers (may be negative)
 # out_x, out_y: pointers where x and y are stored
-# Returns: gcd (non-negative)
+# Returns: gcd (non-negative) -- except that a gcd of 2^63 comes back as i64 min,
+# which is 2^63 read unsigned, as num_gcd returns it. That is (i64 min, 0),
+# (0, i64 min) and (i64 min, i64 min), the only pairs both of whose entries 2^63
+# divides; they write x, y = (-1, 0), (0, -1) and (0, -1), for which a*x + b*y is
+# 2^63 exactly (and i64 min modulo 2^64). `a / g, b / g` reduces them without a
+# divide by zero. These are 3.3.2's results for those pairs.
+# ⛔ 3.3.3 — AN EARLIER 3.3.3 DRAFT RETURNED 0 FOR THEM AND LEFT x, y UNWRITTEN, and
+# that 0 made `a / g` divide by zero (SIGFPE) where 3.3.2's i64 min reduced correctly.
+# [measured: tests/abuse.tcyr, group "3.3.3 R5num: gcd 2^63 as i64 min, and the reducing idiom"]
+#
+# ⛔ 3.3.3 — i64 min GAVE A NEGATIVE gcd OR WRONG COEFFICIENTS. `0 - old_r` wraps
+# back to i64 min, so the loop ran on -2^63 as if it were a magnitude:
+# egcd(i64 min, 6) returned -2 with x = -1, y = 1537228672809129301, for which
+# a*x + b*y is -2 only modulo 2^64, and egcd(6, i64 min) returned -2. A non-negative
+# gcd was no proof: egcd(i64 min, i64 min + 6) returned the right 2 with
+# x = -1537228672809129300, sign wrong.
+# [measured: tests/abuse.tcyr, group "3.3.3 R3b: num_extended_gcd at i64 min"]
+#
+# The bits of i64 min ARE 2^63 read unsigned, and the loop's multiplies and
+# subtracts are exact modulo 2^64, so only the division with i64 min as dividend
+# (`q` below) needs the unsigned reading; every remainder after it is below 2^63, and
+# the x and y returned fit, so their values modulo 2^64 are the integers.
+# egcd(i64 min, 6) is now 2 with x = -1, y = -1537228672809129301. Checked against
+# python3 big ints (g = math.gcd, 2^63 as i64 min, and a*x + b*y = gcd exactly) on
+# 61444 pairs (8455 with an i64 min entry, 895 with gcd 2^63): every pair is right,
+# with no |x| or |y| above 2^62 - 1. 3.3.2 was wrong on 5899 of them, all with an
+# i64 min entry, and those are the only lines that changed; num_gcd's are unchanged.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 big-int oracle]
 public fn num_extended_gcd(a, b, out_x, out_y) {
     # Iterative extended GCD to avoid stack overflow on deep recursion
     var old_r = a;
@@ -57,7 +85,16 @@ public fn num_extended_gcd(a, b, out_x, out_y) {
     }
 
     while (r != 0) {
+        # old_r == i64 min stands for 2^63 (set above from a or b == i64 min). For r in
+        # [1, 2^63 - 1], signed division truncates toward zero, so i64 min / r is
+        # -(2^63 div r) and its negation is the quotient. For r = 1 that quotient is
+        # 2^63 and wraps back to i64 min, which the exact-modulo-2^64 steps below absorb.
+        # r is i64 min too only for (i64 min, i64 min), on the first pass: q comes out
+        # -1 where 2^63 div 2^63 is 1, but r = i64 min + i64 min is 0 modulo 2^64 just
+        # as i64 min - i64 min is, so the loop ends there and returns the s and t from
+        # before q touched them -- the same i64 min, 0, -1 that q = 1 would give.
         var q = old_r / r;
+        if (old_r == 0x8000000000000000) { q = 0 - q; }
 
         var tmp = r;
         r = old_r - q * r;
@@ -103,10 +140,16 @@ public fn num_modinv(a, m) {
 }
 
 # Euler's totient function phi(n): count of integers in [1, n] coprime to n.
-# n: positive integer
+# n: positive integer (n <= 0 returns the designed 0; phi(n) >= 1 for every n >= 1)
 # Returns: phi(n)
+# ⛔ 3.3.3 — A NEGATIVE n RETURNED n ITSELF. Only n == 0 was refused, and
+# num_factorize returns an empty vec for every n <= 1, so for n < 0 the loop below
+# never ran and `result = n` came back: phi(-5) = -5, phi(-12) = -12, phi(-1) = -1,
+# phi(i64 min) = i64 min. phi is not defined below 1, and a negative count is not a
+# count; n <= 0 now returns the designed 0, which no n >= 1 can produce.
+# [measured: tests/abuse.tcyr, group "3.3.3 W5: totient, mobius and sobol below their domain"]
 public fn num_euler_totient(n) {
-    if (n == 0) { return 0; }
+    if (n <= 0) { return 0; }
     if (n == 1) { return 1; }
 
     var factors = num_factorize(n);
@@ -129,8 +172,17 @@ public fn num_euler_totient(n) {
 # Returns 1 if n is squarefree with even number of prime factors,
 # -1 if squarefree with odd number of prime factors,
 # 0 if n has a squared prime factor.
+# n: positive integer (n <= 0 returns the designed 0, as n == 0 already did)
+# ⛔ 3.3.3 — EVERY NEGATIVE n RETURNED 1. Only n == 0 was refused, and num_factorize
+# returns an empty vec for every n <= 1, so for n < 0 the repeated-factor scan saw
+# nothing and the empty count is even: mu(-6) = mu(-4) = mu(-1) = mu(-2) = 1, and
+# mu(i64 min) = 1, though -4 and i64 min carry a squared factor and -2 an odd count.
+# mu is not defined below 1; n <= 0 now returns the designed 0 that n == 0 returned.
+# ⚠ 0 is also mu of every n >= 1 with a squared factor, so the refusal is not
+# distinguishable from that answer -- the n == 0 contract this extends was already so.
+# [measured: tests/abuse.tcyr, group "3.3.3 W5: totient, mobius and sobol below their domain"]
 public fn num_mobius(n) {
-    if (n == 0) { return 0; }
+    if (n <= 0) { return 0; }
     if (n == 1) { return 1; }
 
     var factors = num_factorize(n);
@@ -153,10 +205,45 @@ public fn num_mobius(n) {
 
 # Divisor sigma function sigma_k(n) = sum of d^k for all divisors d of n.
 # k = 0: number of divisors. k = 1: sum of divisors.
-# n: positive integer (n <= 0 returns 0), k: non-negative integer
-# Returns: sigma_k(n). ⚠ The products and each p^k are i64 and unchecked: the result
-# is exact only while sigma_k(n) fits in i64 (always for k = 0; for k >= 1 it can
-# wrap for large n).
+# n: positive integer (n <= 0 returns 0), k: non-negative integer (k < 0 returns 0
+# for n >= 2)
+# Returns: sigma_k(n), or the designed 0 when sigma_k(n) does not fit in i64. 0 is
+# never a value of sigma_k for n >= 1, which is at least 1.
+# ⛔ 3.3.3 — EVERY PRODUCT AND SUM HERE WAS UNCHECKED, so sigma_k(n) wrapped for
+# k >= 1: (3 * 2^61, 1) returned -4, (720720, 4) returned 5519468047519493040 and
+# (2, 64) returned 1, where the truths are 2^64 - 4, about 2.9e23 and 2^64 + 1. Two
+# of those three wraps are positive, so no sign check on the result could see them.
+# Each step is now refused before it can wrap, against a bound derived from 2^63 - 1
+# (a division for a product, the num_crt shape from 3.3.0, and a subtraction for the
+# sum): p^k, each power p^(jk), the running sum and the product over primes.
+# [measured: tests/modules.tcyr, group "3.3.3 G3: num_divisor_sigma refuses i64 overflow"]
+#
+# Every value formed on the way (each power, partial sum and partial product) is at
+# most sigma_k(n), so a check fires exactly when sigma_k(n) exceeds 2^63 - 1, never
+# for a sigma that fits. A sweep of 3311 (n, k) pairs, 2427 of them overflowing,
+# matched a python3 big-int oracle in every case; 3.3.2 wrapped all 2427, 1389 of
+# them to a positive number.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 big-int oracle]
+#
+# The running-sum check fires for exactly two inputs, 5^27 and 13^17 with k = 1:
+# only there does a power fit while the sum through it does not. A big-int search
+# over every q = p^k <= 2^63 - 1 with p <= 2^21, and every exponent j with
+# q^j <= 2^63 - 1, found no other. For a larger p, q^3 already overflows, and
+# 1 + q + q^2 fits whenever q^2 does.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 big-int search]
+#
+# ⚠ So deleting the sum check is an EQUIVALENT mutant, recorded rather than hidden.
+# At both inputs the excess is below 2^63, so the wrapped sum is negative, and the
+# product check refuses it because (2^63 - 1) / acc is then negative. The line states
+# the bound; without it the product check is what fires, by way of a wrap.
+# [measured: scratch mutant, sum check deleted: modules 2358/2358, abuse 985/985, 2026-10-01]
+#
+# A negative k returned sigma_0(n), because p^k came out as 1, and for n >= 2 that is
+# always wrong: sigma_k(n) for k < 0 is sigma_|k|(n) / n^|k|, smaller than sigma_0(n)
+# and in general a fraction an i64 cannot carry. So for n >= 2 a negative k returns
+# the designed 0. n = 1 still returns 1, which is sigma_k(1) for every k.
+# [measured: tests/abuse.tcyr, group "3.3.3 G3: num_divisor_sigma with k < 0"]
+#
 # ⛔ 3.3.0 — THIS WAS A TRIAL-DIVISION LOOP ON `d * d <= n`, AND d * d WRAPS NEGATIVE
 # AT d = 3037000500, so for every n >= 3037000499^2 the test stayed true past
 # sqrt(n): n = 2^63 - 1 never returned, and n = 9223372033000000000 returned 440
@@ -168,6 +255,7 @@ public fn num_mobius(n) {
 public fn num_divisor_sigma(n, k) {
     if (n <= 0) { return 0; }
     if (n == 1) { return 1; }
+    if (k < 0) { return 0; }
 
     var factors = num_factorize(n);   # ascending, with multiplicity
     var flen = vec_len(factors);
@@ -181,14 +269,18 @@ public fn num_divisor_sigma(n, k) {
             i = i + 1;
         }
         var pk = _numx_int_pow(p, k);
+        if (pk == 0) { return 0; }    # p^k does not fit (and MAX / pk below would divide by 0)
         var term = 1;
         var acc = 1;
         var j = 0;
         while (j < a) {
+            if (term > 0x7FFF_FFFF_FFFF_FFFF / pk) { return 0; }
             term = term * pk;
+            if (acc > 0x7FFF_FFFF_FFFF_FFFF - term) { return 0; }
             acc = acc + term;
             j = j + 1;
         }
+        if (result > 0x7FFF_FFFF_FFFF_FFFF / acc) { return 0; }
         result = result * acc;
     }
     return result;
@@ -203,18 +295,19 @@ fn _numx_cmp_i64(a, b) {
     return 0;
 }
 
-# Internal: integer exponentiation base^exp (non-negative exp)
+# Internal: base^exp for base >= 2 and exp >= 0, or 0 when the power does not fit
+# in i64. (num_divisor_sigma, its only caller, passes a prime.) The loop is linear,
+# not square-and-multiply, on purpose: squaring forms b^2 past the last bit it needs,
+# and that square overflows on fitting powers -- 2^62 squares b up to 2^64 -- so a
+# check on every product would refuse a power that fits. base >= 2 at least doubles
+# the result every pass, so the loop ends within 63 passes whatever exp is.
 fn _numx_int_pow(base, exp) {
-    if (exp == 0) { return 1; }
     var result = 1;
-    var b = base;
-    var e = exp;
-    while (e > 0) {
-        if ((e & 1) == 1) {
-            result = result * b;
-        }
-        b = b * b;
-        e = e >> 1;
+    var j = 0;
+    while (j < exp) {
+        if (result > 0x7FFF_FFFF_FFFF_FFFF / base) { return 0; }
+        result = result * base;
+        j = j + 1;
     }
     return result;
 }
@@ -405,11 +498,22 @@ public fn num_crt(remainders, moduli, count, out_x, out_m) {
 }
 
 # Continued fraction expansion of a rational number p/q.
-# p, q: positive integers
+# p, q: positive integers (q = 0 returns an empty vec; so do (i64 min, -1) and
+# (-1, i64 min), below). Other negative arguments expand by truncating division:
+# (-7, 3) gives [-2, -3], which evaluates to -7/3 but is not the regular expansion.
 # Returns: vec of coefficients [a0, a1, a2, ...]
+# ⛔ 3.3.3 — TWO NEGATIVE PAIRS KILLED THE PROCESS. i64 min / -1 does not fit, and
+# x86 `idiv` traps on it (SIGFPE) rather than wrapping. (i64 min, -1) divides so on
+# the first pass and (-1, i64 min) on the second, after 0 is pushed; 3.3.2 died on
+# both, exit status 136. Those are the only pairs that reach it: the second pass
+# divides q0 by p0 % q0, which is -1 with q0 = i64 min only for p0 = -1, and from the
+# third pass on p is a remainder, below 2^63 in magnitude. The quotient they need is
+# 2^63, which an i64 cannot carry, so they return the empty vec q = 0 returns.
+# [measured: tests/abuse.tcyr, group "3.3.3 W5: totient, mobius and sobol below their domain"]
 public fn num_continued_fraction_rational(p, q) {
     var cf = vec_new();
     while (q != 0) {
+        if (q == 0 - 1 && p == 0x8000000000000000) { return vec_new(); }
         vec_push(cf, p / q);
         var r = p % q;
         p = q;
@@ -1106,17 +1210,33 @@ public fn num_ifft_2d(data, rows, cols) {
 # ================================================================
 
 # Halton sequence value for a given index and base.
-# Returns f64 bit pattern in [0, 1).
-# index: positive integer (1-based for non-zero result)
+# Returns f64 bit pattern in [0, 1], or a quiet NaN for a negative index. The digits
+# are summed in f64, each step rounded, and a long enough run of top digits rounds
+# up to exactly 1.0: num_halton(2^54 - 1, 2) is 1.0, as it was in 3.3.2.
+# [measured: tests/abuse.tcyr, group "3.3.3 R5num: num_halton's range and guard order"]
+# index: non-negative integer (1-based for non-zero result; index 0 is 0.0)
 # base: prime number >= 2 (2, 3, 5, 7, ...)
-# A base below 2 has no radical-inverse expansion; 0.0 is returned, which is
-# inside the documented range and is already what index 0 yields.
+# A base below 2 has no radical-inverse expansion; 0.0 is returned for a
+# non-negative index, which is inside the documented range and is already what
+# index 0 yields.
+#
+# ⛔ 3.3.3 — A NEGATIVE INDEX RETURNED 0.0, WHICH IS A SAMPLE: the one at index 0.
+# `while (i > 0)` never ran, so num_halton(-5, 2) was 0.0 and a caller could not
+# tell it from num_halton(0, 2). The radical inverse has no negative index, so it
+# now returns a quiet NaN, which no sample equals, whatever the base: the index is
+# tested first, so num_halton(-5, 0) is NaN too, not the base refusal's 0.0.
+# [measured: tests/abuse.tcyr, group "3.3.3 R4num: num_sobol and num_halton refuse an out-of-domain index"]
+# Against 3.3.2 over 102748 (index, base) pairs, bases -3 to 13: the 101635 with a
+# non-negative index return 3.3.2's bits, and the 1113 negative ones a quiet NaN
+# (334 of them with a base below 2, where 3.3.2 and the first repair gave 0.0).
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; 3.3.2 bundle differential]
 public fn num_halton(index, base) {
+    if (index < 0) { return 0x7FF8000000000000; }   # quiet NaN
     # The loop body is `i % base` and `i / base`. base == 0 is an integer divide
     # by zero -- SIGFPE, process dead, not a wrong answer. base == 1 makes
     # i / base == i, so `while (i > 0)` never advances and the function hangs
     # forever while `f` underflows to zero. base < 0 terminates but leaves the
-    # documented [0, 1) range. Reject all three at the door.
+    # documented range. Reject all three at the door.
     if (base < 2) { return _NUMX_F64_ZERO; }
     var result = _NUMX_F64_ZERO;
     var f = f64_div(_NUMX_F64_ONE, f64_from(base));
@@ -1132,7 +1252,7 @@ public fn num_halton(index, base) {
 
 # 2D Halton point at given index (bases 2 and 3).
 # Writes two f64 values to out_x and out_y.
-# index: positive integer
+# index: non-negative integer (a negative one writes a quiet NaN to both, 3.3.3)
 # out_x, out_y: pointers for the two coordinates
 # Returns: Ok(0), always -- it cannot fail.
 public fn num_halton_2d(index, out_x, out_y) {
@@ -1143,29 +1263,52 @@ public fn num_halton_2d(index, out_x, out_y) {
 
 # Sobol sequence (dimension 0) -- Van der Corput in base 2.
 # Uses Gray code then bit-reversal.
-# index: non-negative integer
-# Returns: f64 bit pattern in [0, 1)
+# index: non-negative integer (a negative one returns a quiet NaN)
+# Returns: f64 bit pattern in [0, 1): the radical inverse of the Gray code, exact
+# for index < 2^53. Above that the point can have up to 63 significant bits, and it
+# is rounded toward zero to the f64 at or below it, so it stays below 1.0: rounded to
+# nearest, the point at index 0x2AAAAAAAAAAAAA (1 - 2^-54) would be 1.0.
+# ⛔ 3.3.3 — AN INDEX AT OR ABOVE 2^32, OR BELOW 0, RETURNED A WRONG SAMPLE. The bit
+# reversal kept only the low 32 bits of the Gray code, so num_sobol(2^32) repeated
+# the last sample, 2^-32, where its point is 3 * 2^-33; num_sobol(2^32 + 1) was
+# 0.5 + 2^-32 where it is 0.5 + 3 * 2^-33; and num_sobol(2^63 - 1) was 0.0 where it is
+# 2^-63. Every index in [2^32, 2^63 - 1] has its point, and the reversal now covers
+# all 64 bits of the Gray code; indices below 2^32 return 3.3.2's bits. A negative
+# index has no point (num_sobol(-5) was 0.375), so it returns a quiet NaN, which no
+# point equals.
+# [measured: tests/abuse.tcyr, group "3.3.3 R5num: num_sobol over 64 bits"]
+# Against an exact python3 radical inverse rounded toward zero, on 600436 indices
+# (every index below 200000, 200000 random 32-bit ones, 200000 random ones up to 63
+# bits, both sides of every power of two, and Gray codes with long runs of ones that
+# put the point next to 1.0): every result matches, the 506426 below 2^32 are 3.3.2's
+# bits, and 3.3.2 was wrong on 93982 of the 94010 above.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 Fraction oracle]
 public fn num_sobol(index) {
-    var n = index;
+    if (index < 0) { return 0x7FF8000000000000; }   # quiet NaN
 
-    # Gray code: n ^= n >> 1
-    n = n ^ (n >> 1);
+    # Gray code: n ^= n >> 1 (index >= 0, so the shift brings in a 0 bit)
+    var n = index ^ (index >> 1);
 
-    # Bit-reverse (32-bit)
-    n = ((n & 0xAAAAAAAA) >> 1) | ((n & 0x55555555) << 1);
-    n = ((n & 0xCCCCCCCC) >> 2) | ((n & 0x33333333) << 2);
-    n = ((n & 0xF0F0F0F0) >> 4) | ((n & 0x0F0F0F0F) << 4);
-    n = ((n & 0xFF00FF00) >> 8) | ((n & 0x00FF00FF) << 8);
-    # Rotate left by 16 = swap upper and lower 16 bits
-    var lo16 = n & 0xFFFF;
-    var hi16 = (n >> 16) & 0xFFFF;
-    n = (lo16 << 16) | hi16;
+    # Bit-reverse all 64 bits. Each step masks after its right shift, so the
+    # result does not depend on whether `>>` is logical (it is, in cycc) or not.
+    n = ((n >> 1) & 0x5555555555555555) | ((n & 0x5555555555555555) << 1);
+    n = ((n >> 2) & 0x3333333333333333) | ((n & 0x3333333333333333) << 2);
+    n = ((n >> 4) & 0x0F0F0F0F0F0F0F0F) | ((n & 0x0F0F0F0F0F0F0F0F) << 4);
+    n = ((n >> 8) & 0x00FF00FF00FF00FF) | ((n & 0x00FF00FF00FF00FF) << 8);
+    n = ((n >> 16) & 0x0000FFFF0000FFFF) | ((n & 0x0000FFFF0000FFFF) << 16);
+    n = ((n >> 32) & 0xFFFFFFFF) | (n << 32);
 
-    # Mask to 32 bits
-    n = n & 0xFFFFFFFF;
-
-    # n / 2^32
-    return f64_div(f64_from(n), f64_from(4294967296));
+    # n / 2^64, read unsigned, as hi + lo: each part is exact (32 bits times a power
+    # of two), and the add rounds once, to nearest. For index < 2^32, lo is 0 and the
+    # result is hi, 3.3.2's n / 2^32 bit for bit.
+    var hi = f64_mul(f64_from((n >> 32) & 0xFFFFFFFF), _NUMX_F64_INV_2P32);
+    var lo = f64_mul(f64_from(n & 0xFFFFFFFF), _NUMX_F64_INV_2P64);
+    var x = f64_add(hi, lo);
+    # Toward zero: hi >= lo whenever hi != 0, so (x - hi) - lo is the add's rounding
+    # error exactly (Fast2Sum). If x rounded up, the f64 below it is the one at or
+    # below the point; x > 0 there, so that is the bit pattern minus one.
+    if (f64_gt(f64_sub(f64_sub(x, hi), lo), _NUMX_F64_ZERO) == 1) { x = x - 1; }
+    return x;
 }
 
 # ================================================================

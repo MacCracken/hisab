@@ -59,6 +59,22 @@ fn _lp_vec_norm_scaled(arr, start, len) {
         if (f64_gt(a, mx) == 1) { mx = a; }
         i = i + 1;
     }
+    # ⚠ 3.3.3 — `f64_gt(x, 0) == 0` IS TRUE FOR NaN, AND CALLED DIRECTLY THIS
+    # LAUNDERS ONE: the scan keeps only strictly greater values, so it drops a NaN
+    # component, and [NaN, 0] comes back as 0. No NaN reaches it. The one caller,
+    # `_lp_vec_norm`, comes here only when its naive sum is below DBL_MIN or exactly
+    # +Inf; a NaN component makes that sum NaN, which is neither, so `_lp_vec_norm`
+    # returns NaN itself (pinned in tests/hisab.tcyr). Instrumented on the 16,368-row
+    # svd / eigen span probe of the tree before the non-finite checks below: 470 NaN
+    # sums reached `_lp_vec_norm`, on all 176 svd rows that overflow, and none came
+    # here; this path saw 0 NaN components in its 34,886 calls. A second caller must
+    # route NaN around it the same way.
+    # [measured: instrumented scratch build + white-box call, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⚠ 3.3.3 — AND THOSE NaN SUMS NOW END THE CALL. They are overflowed columns of a
+    # matrix balanced to just under 2^1024 (svd_golub_kahan and eigen_qr keep 2.22.1's
+    # balance exit; see `_lp_balance_scale`), and every caller of `_lp_vec_norm` returns
+    # Err(HSB_ERR_NO_CONVERGENCE) on a norm that is not finite instead of reflecting
+    # with it.
     if (f64_gt(mx, 0) == 0) { return mx; }
     # ⚠ Inf/Inf is NaN, so an infinite component needs its own exit.
     if (f64_eq(mx, F64_POS_INF) == 1) { return mx; }
@@ -162,8 +178,25 @@ fn _lp_negligible_rel(x, scale) {
 }
 
 # Is `off` negligible beside the two diagonal entries it sits between?
+# ⛔ 3.3.3 — `|a| + |b|` CAN OVERFLOW, AND THEN EVERY `off` IS NEGLIGIBLE. 1e-12 *
+# +Inf is +Inf, so an off-diagonal of 5.8e307 between diagonals of 9.5e307 and
+# 9.7e307 read as negligible, was zeroed, and the QR answered without it. The
+# svd / eigen balance (2.22.1's exit, see `_lp_balance_scale`) puts the largest
+# entry of a matrix spanning more than ~2045 binades in [2^1023, 2^1024), so the
+# sum does overflow from public input. Halving is exact for every normal operand,
+# and with a threshold above 1e-12 * 2^1023 a subnormal one is negligible either
+# way, so the arm asks the same question without the overflow. Measured on three
+# full-mantissa span probes (14,784 rows, spans 1900..2097) with every other 3.3.3
+# check in place: without the arm 15 rows come back rc = OK with a wrong value;
+# with it none do, 6 of them come back right and 9 return NO_CONVERGENCE.
+# [measured: scratch builds with/without the arm + 720-digit oracle, not reproducible in-tree, 2026-10-01]
 fn _lp_negligible(off, a, b) {
-    return _lp_negligible_rel(off, f64_add(f64_abs(a), f64_abs(b)));
+    var s = f64_add(f64_abs(a), f64_abs(b));
+    if (f64_eq(s, F64_POS_INF) == 1) {
+        return _lp_negligible_rel(f64_mul(off, F64_HALF),
+          f64_add(f64_mul(f64_abs(a), F64_HALF), f64_mul(f64_abs(b), F64_HALF)));
+    }
+    return _lp_negligible_rel(off, s);
 }
 
 # Fresh copy of A with every entry divided by s (s > 0). Divide, never multiply
@@ -224,6 +257,68 @@ fn _lp_cmat_max_abs(A) {
 # therefore did nothing at all for exactly the inputs it was written for —
 # measured, it turned a correct row at 2^-1065 into HSB_ERR_NO_CONVERGENCE.
 # [measured: 3 fixtures x 52 subnormal scales vs a 200-digit oracle, 2026-09-11]
+#
+# ⭐ 3.3.3 — THE CHOICE IS SPLIT FROM THE SCAN (`hi` = largest, `lo` = smallest
+# non-zero magnitude) for `cqr_decompose`, the third caller, which 2.22.1 left on the
+# one-ended scale (see the note at its balance); it scans its complex matrix itself.
+# `svd_golub_kahan` and `eigen_qr` keep 3.3.2's loop, in `_lp_balance_scale` below.
+# ⚠ `growth` IS NEW. The overflow exit asks whether `(hi / nsc) * growth` is still
+# finite, so the balanced max can sit as high as 2^1024 / growth. `cqr_decompose`
+# passes a bound on its own largest intermediate, 16 m, derived at its call: it has
+# no convergence loop to fail, and with 1 it returned rc = OK and a non-finite R.
+# ⛔ 3.3.3 — AND THE LOOP TESTED THE ROUNDED QUOTIENT, `lo / sc < DBL_MIN`. A
+# quotient just under DBL_MIN rounds UP to DBL_MIN, the test reads false, the loop
+# stops one binade early and the divide is inexact — so the "still exact" above was
+# false on that input. diag(3, 0x001FFFFFFFFFFFFF): sc = 2, lo / 2 rounds to 2^-1022,
+# and cqr_decompose returned 0x0020000000000000 for the entry, 1 ulp high. The test
+# here is `lo < DBL_MIN * sc`, the exact question: sc is a power of two, the product
+# is exact for sc >= 2^-52, and below that it rounds to at most 2^-1074 <= lo, so the
+# test reads false exactly when lo / sc is in fact normal.
+# [measured: scratch probes on 3.3.2 and this tree, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+#must_use
+fn _lp_balance_pick(hi, lo, growth) {
+    var sc = _lp_pow2_floor(hi);
+    if (f64_lt(lo, F64_POS_INF) == 0) { return sc; }
+    while (f64_lt(lo, f64_mul(F64_TINY, sc)) == 1) {
+        var nsc = f64_mul(sc, F64_HALF);
+        # ⚠ 3.3.3 — THE FIRST EXIT CANNOT FIRE, AND THIS COMMENT USED TO SAY IT
+        # COULD ("`nsc` can reach 0 by repeated halving"). `lo` is a non-zero
+        # magnitude, so lo >= 2^-1074, and the loop runs only while lo / sc is
+        # below DBL_MIN, i.e. while sc > lo * 2^1022 >= 2^-52. `sc` is a power of
+        # two, so here nsc >= 2^-52: never 0, and never NaN either, because every
+        # caller rejects non-finite input before balancing and both scans keep
+        # only strictly greater / smaller values, which a NaN never is. So its
+        # NaN-true shape is unreachable, and it is kept as a termination backstop
+        # rather than rewritten as `f64_eq(nsc, 0)`; instrumented, it fired on 0
+        # of the 16,368 svd / eigen span rows. The second exit is the real one,
+        # and `f64_lt(x, +Inf) == 0` catches Inf and NaN. (Both hold for the copy
+        # of the two exits in `_lp_balance_scale` below.)
+        # [measured: instrumented scratch build, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+        if (f64_gt(nsc, 0) == 0) { break; }
+        if (f64_lt(f64_mul(f64_div(hi, nsc), growth), F64_POS_INF) == 0) { break; }
+        sc = nsc;
+    }
+    return sc;
+}
+
+# The scan and the loop for `svd_golub_kahan` and `eigen_qr`: 3.3.2's, bit for bit
+# (2.22.1's exit, growth 1, the rounded quotient test), and kept apart from
+# `_lp_balance_pick` on purpose. Both 3.3.3 changes to that loop were tried here and
+# taken back out, because each moved results that 3.3.2 got right:
+# ⚠ HEADROOM (growth 8 m for svd, 16 n for eigen) leaves a wide-span matrix's small
+# entries log2(growth) binades less lifted, and they come back with fewer bits:
+# eigen_qr on the 5x5 with A[0][4] = A[4][0] = 0x7FE0A4CA9A08CDEC, A[1][1] = 1889u
+# and A[2][2] = 227u (u = 2^-1074) returns 1890u and 227u here, 1920u and 256u
+# under it.
+# ⚠ THE EXACT QUOTIENT TEST moved 583 of 6000 matrices built on its boundary (an
+# entry pred(2^(k - 1022)) under a max in [2^k, 2^(k+1))), each inside 1e-11 of the
+# oracle on both sides. It stays cqr_decompose's, so svd_golub_kahan and eigen_qr
+# still return 0x0020000000000000 for the small entry of diag(3, 0x001FFFFFFFFFFFFF).
+# [measured: scratch probes + 720-digit oracle, 3.3.2 vs both variants, not reproducible in-tree, 2026-10-01]
+# ⛔ SO THIS EXIT STILL PUTS THE LARGEST ENTRY OF A MATRIX SPANNING MORE THAN ~2045
+# BINADES IN [2^1023, 2^1024), where 3.3.2 overflowed and answered anyway. Since
+# 3.3.3 every place that overflow reaches returns Err(HSB_ERR_NO_CONVERGENCE)
+# instead; svd_golub_kahan's balance note has the account.
 #must_use
 fn _lp_balance_scale(A, rows, cols) {
     var hi = _lp_mat_max_abs(A);
@@ -240,14 +335,35 @@ fn _lp_balance_scale(A, rows, cols) {
     if (f64_lt(lo, F64_POS_INF) == 0) { return sc; }
     while (f64_lt(f64_div(lo, sc), F64_TINY) == 1) {
         var nsc = f64_mul(sc, F64_HALF);
-        # ⚠ Both exits are required: `nsc` can reach 0 by repeated halving, and
-        # `hi / nsc` can overflow to +Inf for a matrix that genuinely spans more
-        # than f64's normal range. `f64_lt(x, +Inf) == 0` catches Inf and NaN.
         if (f64_gt(nsc, 0) == 0) { break; }
         if (f64_lt(f64_div(hi, nsc), F64_POS_INF) == 0) { break; }
         sc = nsc;
     }
     return sc;
+}
+
+# Smallest non-zero |re| or |im| over a complex matrix (+Inf if there is none):
+# the complex half of `_lp_balance_scale`'s scan, for `cqr_decompose`. The balance
+# divides re and im SEPARATELY, so each component is what must stay normal, not
+# the modulus.
+fn _lp_cmat_min_abs(A) {
+    var rows = cmat_rows(A);
+    var cols = cmat_cols(A);
+    var lo = F64_POS_INF;
+    for (var i = 0; i < rows; i = i + 1) {
+        for (var j = 0; j < cols; j = j + 1) {
+            var z = cmat_get(A, i, j);
+            var a = f64_abs(HComplex_re(z));
+            if (f64_gt(a, 0) == 1) {
+                if (f64_lt(a, lo) == 1) { lo = a; }
+            }
+            a = f64_abs(HComplex_im(z));
+            if (f64_gt(a, 0) == 1) {
+                if (f64_lt(a, lo) == 1) { lo = a; }
+            }
+        }
+    }
+    return lo;
 }
 
 # ⛔ 2.22.0 — A NON-FINITE ENTRY MADE BOTH DECOMPOSITIONS RETURN SUCCESS WITH A
@@ -278,6 +394,20 @@ fn _lp_mat_all_finite(A, rows, cols) {
     for (var i = 0; i < rows; i = i + 1) {
         for (var j = 0; j < cols; j = j + 1) {
             if (f64_lt(f64_abs(ganita_mat_get(A, i, j)), F64_POS_INF) == 0) { return 0; }
+        }
+    }
+    return 1;
+}
+
+# The complex third of the pair, for `cqr_decompose` (3.3.3): both components of
+# every entry, each through the one "not finite" test above.
+#must_use
+fn _lp_cmat_all_finite(A, rows, cols) {
+    for (var i = 0; i < rows; i = i + 1) {
+        for (var j = 0; j < cols; j = j + 1) {
+            var z = cmat_get(A, i, j);
+            if (f64_lt(f64_abs(HComplex_re(z)), F64_POS_INF) == 0) { return 0; }
+            if (f64_lt(f64_abs(HComplex_im(z)), F64_POS_INF) == 0) { return 0; }
         }
     }
     return 1;
@@ -316,15 +446,20 @@ fn _lp_vec_copy(dst, src, n) {
 # out_Vt: stdlib matrix (n x n, caller allocates).
 # Returns: Ok(0) on success; Err(HSB_ERR_INVALID_INPUT) for a null A, out_U,
 #          out_S or out_Vt, a non-positive dimension, m < n, or a non-finite
-#          entry of A; Err(HSB_ERR_NO_CONVERGENCE) if QR iteration fails;
-#          Err(HSB_ERR_ALLOC) if the balancing copy fails. (Through 3.3.1 this
-#          line listed only the last two.)
+#          entry of A; Err(HSB_ERR_NO_CONVERGENCE) if QR iteration fails, or
+#          (since 3.3.3) if a singular value exceeds DBL_MAX or a norm or radius
+#          on the way to one is not finite; Err(HSB_ERR_ALLOC) if the balancing
+#          copy fails. (Through 3.3.1 this line listed only the last two.)
 # A is balanced by a power of two before decomposing and rescaled on the way
 # out (`_lp_balance_scale`). Through 3.3.1 this line called both steps exact
 # without condition. The divide is exact while every balanced entry is normal
 # (or zero), and the rescale of S while every returned singular value is normal;
 # a subnormal singular value rounds to the 2^-1074 grid on the way out (see the
-# balancing note inside svd_golub_kahan).
+# balancing note inside svd_golub_kahan). For entries spanning more than about 2045
+# binades the balance leaves the largest in [2^1023, 2^1024) and the smallest
+# subnormal; where the decomposition then overflows it returns
+# Err(HSB_ERR_NO_CONVERGENCE) since 3.3.3 (through 3.3.2 it could return rc = OK with
+# NaN or invented values).
 #
 # Algorithm:
 #   Step 1: Householder bidiagonalization  A = U1 * B * V1^T
@@ -403,7 +538,25 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
         # to reflect?", which is an EXACT ZERO question — there is no scale to
         # choose here, and a threshold that needs one chosen for it is the defect.
         # [measured: block-ratio sweep through the public entry point, 2026-09-11]
+        # ⛔ 3.3.3 — AND A NON-FINITE REFLECTOR IS A FAILURE, NOT A REFLECTOR. The
+        # balance puts the largest entry of a matrix spanning more than ~2045 binades
+        # in [2^1023, 2^1024) (see `_lp_balance_scale`; h = 1.5 * 2^1000, u = 2^-1074
+        # here). For [h; h; u] this norm was +Inf, the reflector NaN, and with n = 1
+        # nothing is left to converge, so 3.3.2 returned S = NaN; for [0; h; u] the
+        # norm was finite but v0 = 0 + ||x|| doubled it, nv_l below was +Inf, v / Inf
+        # = 0, vtv = 0, the gate skipped the reflector and S came back 0 for a true h.
+        # Both with rc = OK; both return NO_CONVERGENCE now. Two checks, because they
+        # see different inputs: a +Inf norm_l makes v0 and so nv_l infinite, but a NaN
+        # norm_l (a NaN that an overflowed update left in W) fails the `norm_l > 0`
+        # gate and skips the reflector before nv_l exists. By direct call this check
+        # is all that stands between [[1], [NaN]] and an Ok bidiagonal with the NaN
+        # dropped (tests/abuse.tcyr). Through the public entry the later checks catch
+        # the same overflow: on three span probes (14,784 rows, spans 1900..2097)
+        # removing this one alone moves no row, and removing nv_l's alone lets 107
+        # rows come back rc = OK with a wrong or non-finite value.
+        # [measured: check-removed scratch builds + 720-digit oracle, not reproducible in-tree, 2026-10-01]
         var norm_l = _lp_vec_norm(v_l, 0, len_l);
+        if (f64_lt(f64_abs(norm_l), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
         if (f64_gt(norm_l, 0) == 1) {
             var v0 = load64(v_l);
             var sgn = _lp_sign(v0);
@@ -422,12 +575,19 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
             # is nothing left to underflow. The guard below is kept — it is still
             # the right test for a genuinely zero vector — but it can no longer
             # fire for a well-formed reflector.
+            # ⚠ 3.3.3 — THAT SENTENCE WAS FALSE THROUGH 3.3.2: an nv_l of +Inf
+            # made v / Inf = 0 and vtv = 0, and the guard fired and skipped the
+            # reflector (the [0; h; u] case above). It is true now: a non-finite
+            # nv_l returns Err just below, and a finite one is non-zero (|v0| is at
+            # least norm_l > 0), so u = v / nv_l has a component of at least
+            # 1 / sqrt(len) and vtv is 1 to a few ulps.
             # ⚠ 2.22.1's first attempt repaired only the BALANCE and left this,
             # which measured **30 loud rows converted into silent wrong answers**
             # — the precise trade the 2.19.0 refutation named. Both halves are
             # required; either alone is worse than neither.
             # [measured: 3 fixtures x 52 scales vs a 200-digit oracle, 2026-09-11]
             var nv_l = _lp_vec_norm(v_l, 0, len_l);
+            if (f64_lt(f64_abs(nv_l), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
             if (f64_gt(nv_l, 0) == 1) {
                 i = 0;
                 while (i < len_l) {
@@ -451,6 +611,17 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
             # quotient of a bounded pair would not. Contrast the Givens radii
             # below, where |y|/r <= 1 and an exact-zero test is the right one.
             # [measured: docs/audit/2026-09-09-epsilon-open.json]
+            # ⚠ 3.3.3 — THIS GATE IS NaN-TRUE, AND IT NO LONGER SEES A NaN. An earlier
+            # 3.3.3 note here said the NaN-true spelling "keeps an overflow loud"
+            # because the QR below then returns NO_CONVERGENCE. That held for the
+            # fixture it was measured on and is false in general: with n = 1 there is
+            # no QR to fail ([h; h; u] returned S = NaN with rc = OK), and an
+            # overflowed nv_l gives vtv = 0, not NaN, which this gate skips silently.
+            # Since 3.3.3 a non-finite norm_l or nv_l returns Err above, so vtv is 1
+            # to a few ulps whenever this line runs. tests/abuse.tcyr's W3 block
+            # holds the fixture the old note named, [[h, 0], [h, u]]: NO_CONVERGENCE,
+            # as on 3.3.2, now from the norm check rather than a NaN reflector.
+            # [measured: scratch probes on 3.3.2 and this tree, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
             if (f64_lt(vtv, F64_TINY) == 0) {
                 var two_over_vtv = f64_div(F64_TWO, vtv);
 
@@ -506,7 +677,12 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
             # left gate above: the division has its own F64_TINY test, so this asks
             # only whether there is anything to reflect.
             # [measured: block-ratio sweep through svd_golub_kahan, 2026-09-11]
+            # ⛔ 3.3.3 — the right halves of norm_l's and nv_l's non-finite checks; see
+            # the left reflector. On the span probes removing nv_r's alone lets 6 rows
+            # come back rc = OK and wrong; removing norm_r's alone moves none.
+            # [measured: check-removed scratch builds + 720-digit oracle, not reproducible in-tree, 2026-10-01]
             var norm_r = _lp_vec_norm(v_r, 0, len_r);
+            if (f64_lt(f64_abs(norm_r), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
             if (f64_gt(norm_r, 0) == 1) {
                 var r0 = load64(v_r);
                 var sgn_r = _lp_sign(r0);
@@ -514,6 +690,7 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
 
                 # ⭐ 2.22.1 — normalised, same as the left reflector above.
                 var nv_r = _lp_vec_norm(v_r, 0, len_r);
+                if (f64_lt(f64_abs(nv_r), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
                 if (f64_gt(nv_r, 0) == 1) {
                     i = 0;
                     while (i < len_r) {
@@ -532,6 +709,11 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
                 # ⛔ Same class, the RIGHT reflector. ⚠ And here `vtv_r > 0` is
                 # measurably NOT equivalent to DBL_MIN — a subnormal vtv_r makes
                 # 2/vtv_r overflow — so the constant is load-bearing, not stylistic.
+                # ⚠ 3.3.3 — NaN-true like the left gate, and like it no longer reached
+                # by a NaN: a non-finite norm_r or nv_r returns Err above. The fixture
+                # an earlier note tried here, [[2^-1074, h, h], [0, 1, 0], [0, 0, 1]],
+                # returned NO_CONVERGENCE on 3.3.2 and still does, now from the check.
+                # [measured: scratch probes on 3.3.2 and this tree, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
                 if (f64_lt(vtv_r, F64_TINY) == 0) {
                     var two_over_vtv_r = f64_div(F64_TWO, vtv_r);
 
@@ -610,6 +792,10 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
         # 2^-39 because below it the column norm itself drops under EPSILON_F64
         # and the FORWARD pass skips too, so the two agree again by accident.
         # [measured: 999-ratio reconstruction scan before and after, 2026-09-10]
+        # ⚠ 3.3.3 — NaN-true like the gate that stored `bvtv`, and it can only read a
+        # value that gate stored: 0 for a skipped reflector, otherwise vtv. Since
+        # 3.3.3 that gate never stores a NaN (a non-finite norm_l or nv_l returns Err
+        # first), so the spelling of this test is moot for NaN.
         if (f64_lt(bvtv, F64_TINY) == 0) {
             var blen = m - k;
             var btwo = f64_div(F64_TWO, bvtv);
@@ -672,7 +858,14 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
 # deflating a singular value of exactly 0. This is the zero-diagonal case of
 # Golub & Van Loan Alg. 8.6.2, omitted from the original transcription.
 #
-# Returns 1 if a split was performed (caller must restart the sweep), else 0.
+# Returns 1 if a split was performed (caller must restart the sweep), else 0;
+# since 3.3.3, -1 if a chase radius is not finite, which the caller turns into
+# Err(HSB_ERR_NO_CONVERGENCE). A radius of +Inf made cs = sn = 0, a "rotation" that
+# writes zeros. Through the public entry the reflector checks fire first: on three
+# span probes (14,784 rows, spans 1900..2097) removing either radius check, or the
+# caller's `split < 0` test, moves no row. So the two checks are pinned by direct
+# calls in tests/abuse.tcyr.
+# [measured: check-removed scratch builds + 720-digit oracle, not reproducible in-tree, 2026-10-01]
 fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
     # The zero test must be RELATIVE to the block: a bare EPSILON_F64 would call
     # every entry of a 1e-20-scaled block zero and no entry of a 1e+20 one.
@@ -740,6 +933,7 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
             var r = f64_sqrt(r_ss);
             if (f64_lt(r_ss, F64_TINY) == 1) { r = ganita_f64_hypot(dj, carry); }
             if (f64_eq(r_ss, F64_POS_INF) == 1) { r = ganita_f64_hypot(dj, carry); }
+            if (f64_lt(f64_abs(r), F64_POS_INF) == 0) { return (0 - 1); }
             if (_lp_negligible_rel(r, scale) == 1) { break; }
             var cs = f64_div(dj, r);
             var sn = f64_div(carry, r);
@@ -784,6 +978,7 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
         var r2 = f64_sqrt(r2_ss);
         if (f64_lt(r2_ss, F64_TINY) == 1) { r2 = ganita_f64_hypot(dc, ccarry); }
         if (f64_eq(r2_ss, F64_POS_INF) == 1) { r2 = ganita_f64_hypot(dc, ccarry); }
+        if (f64_lt(f64_abs(r2), F64_POS_INF) == 0) { return (0 - 1); }
         if (_lp_negligible_rel(r2, scale) == 1) { break; }
         var cs2 = f64_div(dc, r2);
         var sn2 = f64_div(f64_neg(ccarry), r2);
@@ -894,9 +1089,11 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
 
             # A zero diagonal entry inside the block makes the shifted step below
             # a no-op (see _lp_split_zero_diag), which is what rank-deficient
-            # input typically produces. Split there instead and restart.
-            if (_lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc,
-                p_lo, p_hi) == 1) {
+            # input typically produces. Split there instead and restart. (-1 since
+            # 3.3.3: a chase radius overflowed; see `_lp_split_zero_diag`.)
+            var split = _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi);
+            if (split < 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+            if (split == 1) {
                 iter = iter + 1;
                 continue;
             }
@@ -1032,6 +1229,22 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
                 # are in [-1,1] and CANNOT overflow however small r is — the only
                 # input that fails is an exact zero. That is TRUE now that `r` is
                 # the true radius; it was not before.
+                # ⚠ 3.3.3 — THE NOTE THAT STOOD HERE SAID A NaN RADIUS FROM FINITE
+                # INPUT "is not laundered" and that "no row returned OK with a
+                # non-finite value". Its probe built the large entries as exact powers
+                # of two, so the balanced max was exactly 2^1023 and only this loud NaN
+                # branch was reached. With full mantissas 3.3.2 returned rc = OK with a
+                # non-finite or wrong value on 450 of the 14,784 rows of three span
+                # probes (spans 1900..2097; see `_lp_balance_scale`), through the
+                # reflectors, the tridiagonal radius, the deflation sum and the rescale.
+                # ⚠ 3.3.3: NO non-finite check here, deliberately. A +Inf radius makes
+                # cs = sn = 0, a step that writes zeros, but `r` itself is stored as
+                # superdiag[k - 1], an infinite superdiagonal is never negligible, and
+                # the zeroed diagonal sends the block to `_lp_split_zero_diag`, whose
+                # chase radius is then +Inf: Err either way. A check here was tried and
+                # moved no rc on 400 bidiagonals with entries in [2^1020, 2^1024) and
+                # no output byte of the span probes, so it is not kept.
+                # [measured: white-box sweep + span probes, check added, not reproducible in-tree, 2026-10-01]
                 var cs = f64_div(y, r);
                 var sn = f64_div(f64_neg(z), r);
                 if (f64_gt(r, 0) == 0) {
@@ -1088,8 +1301,21 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
                 r = f64_sqrt(l_ss);
                 if (f64_lt(l_ss, F64_TINY) == 1) { r = ganita_f64_hypot(y, z); }
                 if (f64_eq(l_ss, F64_POS_INF) == 1) { r = ganita_f64_hypot(y, z); }
+                if (f64_lt(f64_abs(r), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
                 # ⭐ Same as the right rotation above: the quotients are bounded
                 # by 1, so only an exact zero fails.
+                # ⛔ 3.3.3 — a radius that is not finite returns Err. Unlike the right
+                # rotation's, this `r` is stored as diag[k], and an infinite diagonal
+                # DOES deflate (1e-12 * Inf is Inf): without the check, 19 of 400
+                # bidiagonals with entries in [2^1020, 2^1024) that return Err with it
+                # come back Ok from this function with +Inf in diag. tests/abuse.tcyr
+                # pins it by direct call. Through svd_golub_kahan the rescale check
+                # catches the same +Inf, so removing this one moves no span-probe row.
+                # ⚠ The QR's own updates (cs * d - sn * f) can still overflow on such a
+                # bidiagonal: 22 of the 400 return Ok from here with a non-finite diag
+                # even with the check, and svd_golub_kahan's rescale check is what
+                # turns those into Err.
+                # [measured: white-box sweep, check removed + span probes, not reproducible in-tree, 2026-10-01]
                 cs = f64_div(y, r);
                 sn = f64_div(f64_neg(z), r);
                 if (f64_gt(r, 0) == 0) {
@@ -1151,8 +1377,10 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
 # out_U:  stdlib matrix (m x n, caller allocates).
 # out_S:  flat f64 array of length n (caller allocates).
 # out_Vt: stdlib matrix (n x n, caller allocates).
-# Returns: Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) on failure,
-#          Err(HSB_ERR_INVALID_INPUT) if m < n or either dimension is non-positive.
+# Returns: Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) on failure (since 3.3.3
+#          including a singular value above DBL_MAX, or any intermediate norm or
+#          radius that is not finite), Err(HSB_ERR_INVALID_INPUT) if m < n or either
+#          dimension is non-positive (full list in the section header above).
 #must_use
 public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     # Any of these may be the designed 0 that ganita_mat_new returns above its own
@@ -1215,6 +1443,39 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     # tests/hisab.tcyr through `_sq_run`), and the filing is archived as RESOLVED:
     # docs/development/issues/archived/2026-09-11-svd-balancing-divide-lossy-for-subnormal-blocks.md
     # [measured: balance-divide round-trip probe on the shipped tree, 2026-09-11]
+    # ⛔ 3.3.3 — 2.22.1'S BALANCE RUNS UP TO THE OVERFLOW LINE, AND THROUGH 3.3.2 THE
+    # ROUTINE THEN OVERFLOWED AND ANSWERED ANYWAY. Its exit (growth 1, kept; see
+    # `_lp_balance_scale`) puts the largest entry of a matrix spanning more than ~2045
+    # binades anywhere in [2^1023, 2^1024), where a column norm, a reflector's v0, a
+    # deflation sum or a rescaled singular value can be +Inf. On three full-mantissa
+    # span probes (14,784 rows, spans 1900..2097; svd shapes up to 5x5 plus 8x2,
+    # 10x3, 12x2 and 16x1) 3.3.2 returned rc = OK with a non-finite S on 199 svd rows
+    # and a wrong one on 118: [h; h; u] gave S = NaN and [[0, u], [h, 0]] gave (u, 0),
+    # with h = 1.5 * 2^1000 and u = 2^-1074 (tests/abuse.tcyr has such repros).
+    # ⭐ Each place that overflow reaches now returns Err(HSB_ERR_NO_CONVERGENCE): the
+    # column and reflector norms in `_lp_bidiagonalize`, the split-chase and left
+    # bidiagonal-QR radii, and the rescale below; `_lp_negligible` asks its question
+    # without the overflow. Same probes: 0 svd rows rc = OK with a non-finite or wrong
+    # value; of 3.3.2's 317, 313 return NO_CONVERGENCE and 4 come back right; each of
+    # the 8,900 rows 3.3.2 got right is answered byte for byte as 3.3.2 answered it,
+    # and the 812 it refused are still refused. Removing one check at a time, nv_l's
+    # lets 107 rows come back rc = OK and wrong, the rescale's 29 and nv_r's 6 (and
+    # the deflation arm 15, svd and eigen together); the other checks move no row
+    # through this entry and are pinned by direct calls.
+    # ⚠ Nothing changes for a matrix whose balance loop does not run (entries within
+    # ~1022 binades): it never reaches a check but the rescale. Over 49,501 in-range
+    # svd / eigen_qr rows, shapes 1x1 to 6x6 and up, every one is byte-identical to
+    # 3.3.2 except the 725 whose true largest value is above DBL_MAX, where 3.3.2
+    # returned +Inf with rc = OK.
+    # ⚠ STILL OPEN, as on 3.3.2: a Givens radius below DBL_MIN is rounded onto the
+    # 2^-1074 grid, so its rotation is not quite orthogonal and U or Vt can come back
+    # visibly non-orthogonal with every value right (3 svd rows of the span probes;
+    # the rank-1 5x5 A[i][j] = x_i (1 + j), entries spanning 1127 binades, gives
+    # max |Vt Vt^T - I| = 0.0139). Rotations computed from a power-of-two-lifted
+    # pair were tried during 3.3.3 and withdrawn: they changed how in-range matrices
+    # converge, and a 5x5 spanning 992 binades that 3.3.2 answered returned
+    # NO_CONVERGENCE with them.
+    # [measured: span / in-range / boundary probes, 3.3.2 vs this tree + 720-digit oracle, not reproducible in-tree]
     var sc = _lp_balance_scale(A, m, n);
     var As = _lp_mat_div_scalar(A, sc);
     if (As == 0) { return Err(HSB_ERR_ALLOC); }
@@ -1251,9 +1512,19 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     var _srt = linalg_sort_desc(diag, n, 0, out_U, m, out_Vt, n)?;
 
     # Undo the balancing: sv(c*A) = c*sv(A), U and Vt are invariant.
+    # ⛔ 3.3.3 — and a singular value that is not finite after the rescale is a
+    # failure, not a value: [g; g] with g = 1.48 * 2^1023 returned rc = OK and
+    # S = +Inf on 3.3.2. out_S is left untouched. This is also the last check an
+    # overflow inside the QR meets (its updates can leave +Inf or NaN in the
+    # bidiagonal; see the left rotation). Removing it alone lets 29 span-probe rows
+    # and 588 rows of a 12,001-row in-range probe come back rc = OK with a
+    # non-finite S.
+    # [measured: check-removed scratch build + 720-digit oracle, not reproducible in-tree, 2026-10-01]
     var sv_i = 0;
     while (sv_i < n) {
-        store64(diag + sv_i * 8, f64_mul(sc, load64(diag + sv_i * 8)));
+        var sv_o = f64_mul(sc, load64(diag + sv_i * 8));
+        if (f64_lt(f64_abs(sv_o), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        store64(diag + sv_i * 8, sv_o);
         sv_i = sv_i + 1;
     }
 
@@ -1276,7 +1547,11 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
 #           SORTED BY DESCENDING |lambda| -- step 3 below).
 # out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as
 #           columns, permuted alongside out_vals).
-# Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if max_iter exceeded.
+# Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if max_iter exceeded or
+#           (since 3.3.3) an eigenvalue exceeds DBL_MAX in magnitude or a norm or
+#           radius on the way to one is not finite; Err(HSB_ERR_INVALID_INPUT) on a
+#           null handle, n <= 0, a shape that does not match n, or a non-finite
+#           entry; Err(HSB_ERR_ALLOC) if the balancing copy fails.
 #
 # The descending-|lambda| order has always been implemented here (the selection
 # sort at the end of eigen_qr) but was never stated; the 2026-08-04 audit's
@@ -1334,7 +1609,15 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
         # matrix you get by dropping W[3,1] = 2c. The mechanism is confirmed by
         # the VALUES, independently of the symptom.
         # [measured: 1074-scale sweep, first wrong scale 2^-42, 2026-09-11]
+        # ⛔ 3.3.3 — the symmetric twins of `_lp_bidiagonalize`'s non-finite norm and
+        # reflector checks, here and on nv_t below; see the left reflector there (a
+        # NaN norm would fail the `norm > 0` gate before nv_t exists). On the span
+        # probes removing nv_t's check alone lets 92 eigen_qr rows come back rc = OK
+        # with a wrong or non-finite value; removing this one alone moves none (a
+        # later check catches the same overflow), so a direct call pins it.
+        # [measured: check-removed scratch builds + 720-digit oracle, not reproducible in-tree, 2026-10-01]
         var norm = _lp_vec_norm(v, 0, len);
+        if (f64_lt(f64_abs(norm), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
         if (f64_gt(norm, 0) == 1) {
             var v0 = load64(v);
             var sgn = _lp_sign(v0);
@@ -1345,6 +1628,7 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
             # symmetric path squares the same way and loses the same value, and
             # repairing one of a pair is how 2.18.0's U-replay defect was created.
             var nv_t = _lp_vec_norm(v, 0, len);
+            if (f64_lt(f64_abs(nv_t), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
             if (f64_gt(nv_t, 0) == 1) {
                 i = 0;
                 while (i < len) {
@@ -1368,6 +1652,19 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
             # quotient of a bounded pair would not. Contrast the Givens radii
             # below, where |y|/r <= 1 and an exact-zero test is the right one.
             # [measured: docs/audit/2026-09-09-epsilon-open.json]
+            # ⚠ 3.3.3 — NaN-TRUE, AND NO LONGER REACHED BY A NaN, as in
+            # _lp_bidiagonalize's left gate. An earlier 3.3.3 note said the NaN-true
+            # spelling keeps an overflow loud because the QR then returns
+            # NO_CONVERGENCE; that was not general: on 3.3.2 eigen_qr on
+            # [[0, 0, h], [0, u, 0], [h, 0, 0]] (h = 1.5 * 2^1000, u = 2^-1074)
+            # returned rc = OK with eigenvalues (u, 0, 0), where they are +-h and u:
+            # v = (h, h) after the balance, nv_t = +Inf, v / Inf = 0, vtv = 0, this
+            # gate skipped the reflector and the extraction dropped both h entries.
+            # Since 3.3.3 a non-finite norm or nv_t returns Err above, so vtv is 1 to
+            # a few ulps here, and that matrix returns NO_CONVERGENCE. The fixture the
+            # old note named, [[u, h, h], [h, 0, 0], [h, 0, 0]], returned
+            # NO_CONVERGENCE on 3.3.2 and still does, now from the norm check.
+            # [measured: scratch probes on 3.3.2 and this tree, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
             if (f64_lt(vtv, F64_TINY) == 0) {
                 var two_over_vtv = f64_div(F64_TWO, vtv);
 
@@ -1577,10 +1874,19 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
                 # small sub-block is reachable without any exotic input; a
                 # uniform scale would be bit-exactly invariant and prove nothing.
                 # [measured: 998-ratio block sweep before and after, 2026-09-10]
+                # ⛔ 3.3.3 — A RADIUS OF +Inf WAS A ROTATION OF ZEROS. On 3.3.2 eigen_qr
+                # on [[u, h], [h, 0]] (h = 1.5 * 2^1000, u = 2^-1074) balanced h to
+                # 1.5 * 2^1023, the shift made x = d - mu = h and z = h, their radius
+                # sqrt(2) h overflowed, cs = x / Inf = sn = 0, and the step wrote zeros:
+                # rc = OK, eigenvalues (0, 0) for a true +-h. A radius that is not
+                # finite now returns Err; removing this check alone lets 26 span-probe
+                # rows come back rc = OK and wrong.
+                # [measured: 3.3.2 probes + check-removed build + 720-digit oracle, not reproducible in-tree]
                 var r_ss = f64_add(f64_mul(x, x), f64_mul(z, z));
                 var r = f64_sqrt(r_ss);
                 if (f64_lt(r_ss, F64_TINY) == 1) { r = ganita_f64_hypot(x, z); }
                 if (f64_eq(r_ss, F64_POS_INF) == 1) { r = ganita_f64_hypot(x, z); }
+                if (f64_lt(f64_abs(r), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
                 var cs = F64_ONE;
                 var sn = f64_from(0);
                 # ⭐ |x| <= r and |z| <= r, so the rotation is well defined for
@@ -1672,8 +1978,12 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
 # max_iter: maximum QR iterations.
 # out_vals: flat f64 array of length n (caller allocates).
 # out_vecs: stdlib matrix (n x n, caller allocates, eigenvectors as columns).
-# Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if max_iter exceeded,
-#           Err(HSB_ERR_INVALID_INPUT) on a null handle or a shape that does not match n.
+# Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if max_iter is exceeded or
+#           (since 3.3.3) an eigenvalue exceeds DBL_MAX in magnitude or a norm or
+#           radius on the way to one is not finite, Err(HSB_ERR_INVALID_INPUT) on a
+#           null handle, n <= 0, a shape that does not match n or a non-finite entry,
+#           Err(HSB_ERR_ALLOC) if the balancing copy fails (the section header above
+#           has the same list).
 #must_use
 public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # Any of these may be the designed 0 that ganita_mat_new / mat_new_guarded returns
@@ -1728,6 +2038,25 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # 2.18.0's U-replay defect was created; `_lp_balance_scale` carries the
     # reasoning and the figures.
     # [measured: see _lp_balance_scale, 3 fixtures x 52 scales, 2026-09-11]
+    # ⛔ 3.3.3 — AND THE SAME OVERFLOW AS THE SVD (see its balance note): on the
+    # three span probes (eigen_qr 1x1 to 6x6) 3.3.2 returned rc = OK with a
+    # non-finite eigenvalue on 5 rows and a wrong one on 128. Each place the overflow
+    # reaches now returns Err(HSB_ERR_NO_CONVERGENCE): the column and reflector norms
+    # in `_lp_tridiagonalize`, the tridiagonal-QR radius and the rescale below, with
+    # `_lp_negligible` asking its question without the overflow. Same probes: 0 eigen
+    # rows rc = OK with a non-finite or wrong value; of 3.3.2's 133, 131 return
+    # NO_CONVERGENCE and 2 come back right; each of the 4,256 rows 3.3.2 got right is
+    # answered byte for byte as 3.3.2 answered it. Removing one check at a time, nv_t's
+    # lets 92 rows come back rc = OK and wrong, the radius check's 26, the deflation
+    # arm's 15 (svd and eigen together) and the rescale's 5.
+    # ⚠ The balance itself is 3.3.2's (growth 1; see `_lp_balance_scale` for the
+    # headroom that was tried and withdrawn), and so is the tridiagonal QR's rotation:
+    # a radius below DBL_MIN still leaves V visibly non-orthogonal with every value
+    # right on 95 eigen rows of the span probes, as on 3.3.2. A lifted rotation was
+    # tried and withdrawn: a 6x6 spanning 984 binades, which never enters the balance
+    # loop and which 3.3.2 answers at max_iter 60, returned NO_CONVERGENCE with it at
+    # 60, 200 and 1180.
+    # [measured: span probes, 3.3.2 vs this tree + check-removed builds, 720-digit oracle, not reproducible in-tree]
     var sc = _lp_balance_scale(A, n, n);
     var As = _lp_mat_div_scalar(A, sc);
     if (As == 0) { return Err(HSB_ERR_ALLOC); }
@@ -1738,9 +2067,17 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     var err_qr = _lp_tridiag_qr(diag, offdiag, n, out_vecs, max_iter)?;
 
     # Undo the balancing: eig(c*A) = c*eig(A), eigenvectors invariant.
+    # ⛔ 3.3.3 — an eigenvalue that is not finite after the rescale is a failure, as
+    # in svd_golub_kahan: [[g, g], [g, g]] with g = 1.48 * 2^1023 (eigenvalues 2g and
+    # 0) returned rc = OK with +Inf on 3.3.2. out_vals is left untouched. Removing
+    # this check alone lets 5 span-probe rows and 137 rows of a 12,001-row in-range
+    # probe come back rc = OK with a non-finite eigenvalue.
+    # [measured: scratch probes, 3.3.2 vs this tree + a check-removed build, not reproducible in-tree, 2026-10-01]
     var ev_i = 0;
     while (ev_i < n) {
-        store64(diag + ev_i * 8, f64_mul(sc, load64(diag + ev_i * 8)));
+        var ev_o = f64_mul(sc, load64(diag + ev_i * 8));
+        if (f64_lt(f64_abs(ev_o), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        store64(diag + ev_i * 8, ev_o);
         ev_i = ev_i + 1;
     }
 
@@ -1767,8 +2104,12 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
 # A:     complex matrix (cmat_new, m x n). ANY m, n -- see the shape note below.
 # out_Q: complex matrix (m x m, caller allocates) -- SHAPE ENFORCED.
 # out_R: complex matrix (m x n, caller allocates) -- SHAPE ENFORCED.
-# Returns: Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) on a null handle or an
-#          out_Q / out_R that is not sized exactly m x m / m x n.
+# Returns: Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) on a null handle, an
+#          out_Q / out_R that is not sized exactly m x m / m x n, or (since
+#          3.3.3) a non-finite real or imaginary part anywhere in A.
+# A is balanced by a power of two chosen from both ends (since 3.3.3, as
+# svd_golub_kahan and eigen_qr are) and R is rescaled on the way out; Q is
+# invariant. A subnormal entry of R rounds to the 2^-1074 grid on the way out.
 #
 # Uses Householder reflectors in complex space:
 #   H = I - (2 / v^H v) * v * v^H
@@ -1808,12 +2149,78 @@ public fn cqr_decompose(A, out_Q, out_R) {
     if (cmat_rows(out_Q) != m || cmat_cols(out_Q) != m) { return Err(HSB_ERR_INVALID_INPUT); }
     if (cmat_rows(out_R) != m || cmat_cols(out_R) != n) { return Err(HSB_ERR_INVALID_INPUT); }
 
+    # ⛔ 3.3.3 — A NaN ENTRY CAME BACK AS A FINITE, PLAUSIBLE R WITH rc = OK. This
+    # routine never got the non-finite check its two siblings got in 2.22.0. A NaN
+    # makes its column's `norm` NaN, `f64_gt(norm, 0) == 1` is false for NaN, so
+    # that reflector is SKIPPED, and the strictly-lower triangle is then zeroed by
+    # contract, which erases the NaN. Measured on the 3.3.2 bundle with
+    # A = [[3,1],[NaN,2]], the NaN in the real or the imaginary part: rc = OK,
+    # R = [[3,1],[0,-2]], Q = diag(1,-1), every entry finite, and Q*R is not A. A NaN
+    # at A[0][0] stays visible in R00, still with rc = OK; +Inf or -Inf (three
+    # positions) gives rc = OK with every upper-triangle entry of R NaN.
+    # ⭐ Rejected as `svd_golub_kahan` and `eigen_qr` reject it, and BEFORE the
+    # balance reads A: its scans drop a NaN, and a +Inf max makes the scale +Inf.
+    # [measured: scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⚠ NOT FREE. This scan and the balance's new smallest-entry scan are two more
+    # O(m n) passes, each through `cmat_get`, which allocates 16 bytes per entry.
+    # Measured on dense complex matrices, 8 interleaved runs a side against 3.3.2:
+    # 4x4 +3.1% (19.78 -> 20.39 us median, every new run slower than every old one),
+    # 16x16 +1.2% and 64x64 +0.1%, both inside their own spread.
+    # [measured: scratch cqr harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    if (_lp_cmat_all_finite(A, m, n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+
     # Balance on the way into out_R; undo it on R at the end. Q is invariant under
     # a positive rescale of A. Unbalanced, ||v||^2 = Inf made cx_abs(x1) = Inf,
     # phase = cx_div(x1, Inf) = NaN and v^H v = NaN, so the f64_gt(vhv, EPSILON)
     # guard was false and EVERY reflector was skipped: at 1e200 this returned
     # HSB_ERR_NONE with Q = I and R = A -- R not even upper triangular.
-    var sc = _lp_pow2_floor(_lp_cmat_max_abs(A));
+    # ⛔ 3.3.3 — AND THROUGH 3.3.2 THE SCALE WAS STILL ONE-ENDED, `pow2_floor(max|A|)`:
+    # the form 2.22.1 proved lossy and replaced in `svd_golub_kahan` and `eigen_qr`
+    # only. With the largest entry put in [1,2), every entry more than 1022 binades
+    # below it is divided off the subnormal grid before the first reflector.
+    # diag(lead) (+) 6u * [[3,1],[4,2]] (u = 2^-1074) has |R| = {30, 13.2, 2.4} units
+    # in the block at every lead, so 30, 13 and 2 rounded: 3.3.2 returned exactly that
+    # at lead 1, but 32, 16 and **0** at lead 9, and **0, 0, 0** at lead 1000 (the
+    # block wiped), all with rc = OK.
+    # ⭐ The two-ended choice the siblings use, from the complex scans: re and im are
+    # divided separately, so each is what must stay normal. On a 6086-row sweep (that
+    # family with the lead up to 9 * 2^1020, real and imaginary blocks; a span family;
+    # a graded family; tall and wide shapes) against an exact rational oracle, 3.3.2
+    # is right on 889 of the 6031 determined rows and this on 6005, none going from
+    # right to wrong, with Q orthogonal and Q*R = A on every right row. The 26 still
+    # wrong all span at least 2080 binades and were wrong in 3.3.2 too; they are
+    # what the headroom below costs.
+    # [measured: scratch sweep vs an exact Fraction LDL^H oracle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⚠ WITH HEADROOM. An exit that keeps only max / sc finite lets the balanced max
+    # reach 2^1023, and this routine forms multiples of it with no convergence loop
+    # to fail: given growth 1 it returned rc = OK with a non-finite R on 570 rows of
+    # that sweep. (svd_golub_kahan and eigen_qr keep that exit; they have convergence
+    # loops and non-finite checks that turn the same overflow into
+    # Err(HSB_ERR_NO_CONVERGENCE), and their notes say why headroom was not kept.)
+    # The bound: unitary updates keep every column's 2-norm, so with M the balanced
+    # max component each is <= sqrt(2m) M. The largest intermediates are then the
+    # `v^H R[:, j]` partial sums, <= ||v|| sqrt(2m) M <= 2m M (v is scaled to unit
+    # max component), and the update R - coeff * v, <= (1 + 2 sqrt(2)) sqrt(2m) M.
+    # Both are <= 5.5 m M for m >= 1, and 16 m covers that by 2.9x. A derived bound,
+    # not a measured one; the margin costs a few binades of span (that sweep had 26
+    # rows wrong with 16 m, 5 and 10 with growth 4 and 8). `sc` still only ever
+    # halves from `pow2_floor(max|A|)`, so no entry is divided by more than 3.3.2
+    # divided it.
+    # [measured: the same sweep on growth 1 / 4 / 8 / 16 m builds, 2026-10-01; cycc 6.6.12]
+    # ⛔ 3.3.3 — A SMALLER GROWTH IS NOT SAFE, AND THIS NOTE USED TO READ AS IF IT
+    # WERE ("growth 4 and 8 also left 0 non-finite rows in that sweep"). No row of
+    # that sweep reached their limit. A column of m equal entries (H, H),
+    # H = 1.9 * 2^1000, with a 2^-1074 entry beside it returns rc = OK and
+    # R00 = -Inf + -Inf i with growth 4 at m = 5, and with growth 8 at m = 24;
+    # growth 2 is worse at both. A growth that scales with m is not safe below the
+    # bound either: with growth m, [[(h, h), (u, 0)]] (h = 1.5 * 2^1000, u = 2^-1074)
+    # returns every part of R NaN, and [[(h, h), 0], [(h, h), u]] R00 = -Inf - Inf i.
+    # 16 m returns all of these within 7 ulp. tests/hisab.tcyr pins the four.
+    # ⚠ NOT EVERYTHING BELOW THE BOUND IS PINNED: growth 2 m, 4 m and 8 m return the
+    # same bits as 16 m on all four and pass every suite. 8 m is covered by the 5.5 m
+    # bound; 2 m and 4 m are not, and no fixture here tells them apart from it.
+    # [measured: scratch builds, growth 2 / 4 / 8 / m / 2 m / 4 m / 8 m / 16 m, not reproducible in-tree, 2026-10-01]
+    var sc = _lp_balance_pick(_lp_cmat_max_abs(A), _lp_cmat_min_abs(A), f64_from(16 * m));
 
     # Copy A into out_R
     var i = 0;
@@ -1961,7 +2368,11 @@ public fn cqr_decompose(A, out_Q, out_R) {
                     phase = cx_div(xs, cx_real(abs_xs));
                 }
             }
-            var abs_x1 = cx_abs(x1);
+            # (Through 3.3.2 a dead `var abs_x1 = cx_abs(x1);` stood here: 2.23.0 moved
+            # the phase onto the scaled `xs` above and left the store behind. Removing it
+            # moved no bit of Q, R or rc over 400 decompositions, 1x1 to 6x6, entries
+            # from subnormal to 2^999.)
+            # [measured: scratch Q/R bit hash, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 
             # v[0] += phase * ||v||
             var shift = cx_scale(phase, norm);

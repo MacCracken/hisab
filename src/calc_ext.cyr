@@ -17,19 +17,14 @@ var _CALCX_F64_SIX     = 0x4018_0000_0000_0000;  # 6.0
 var _CALCX_F64_NINE    = 0x4022_0000_0000_0000;  # 9.0
 var _CALCX_F64_FIFTEEN = 0x402E_0000_0000_0000;  # 15.0
 
-# ⛔ 2.20.0 — MIS-TRANSCRIBED, AND INVISIBLE TO THE GATE THAT EXISTS TO CATCH THAT.
-# The bits read `0x39B4_484B_FEE9_F7CF`, which decodes to 9.99999999979426e-31,
-# not the 1e-30 the comment claims — a relative error of 2.06e-11. It shipped from
-# 2.7.x onward. ⚠ The numeric consequence is nil (it is the zero-secant threshold in
-# calc_monotone_cubic, and 2e-11 relative on a 1e-30 floor changes no branch), but the defect
-# class is exactly the seven mis-transcribed constant tables that caused the gate
-# to be written in 2.6.12.
-# ⚠ It was invisible because `check-constants.sh`'s DECL regex requires the
-# documenting comment to TRAIL the declaration, and this one sat on the line
-# above — so it was neither verified nor reported as skipped. The gate now falls
-# back to a preceding comment line; this declaration keeps its comment trailing
-# as well, so it is covered twice over.
-
+# ⛔ 3.3.3 — `_CALCX_F64_1E_NEG30` NO LONGER DECIDES A FLAT SEGMENT IN ANY SET 3.3.3
+# SPLINES ITSELF. It is calc_monotone_cubic's 3.3.2 flat-secant threshold: an absolute
+# 1e-30 compared against a SLOPE, y per x, so it has a scale baked in and zeroed real
+# tangents (audit D068; the evidence is at the flat-segment test, an exact-zero test
+# now). It is read only by the 3.3.2 computation that a set with a non-finite secant
+# still gets (see the secant loop's end). Its 2.20.0 history — bits mis-transcribed and
+# invisible to the constant gate, which is why that gate falls back to a preceding
+# comment line — is in CHANGELOG.md [2.20.0].
 var _CALCX_F64_1E_NEG30 = 0x39B4_484B_FEEB_C2A0;   # 1e-30
 
 # ================================================================
@@ -310,7 +305,8 @@ public fn calc_hessian(f, x, n, h, out) {
 # NaN `whole` beside a finite `refined` cannot reach it (at the root both are built
 # from the same samples over the same [a, b], and below it the parent whose half
 # `whole` was would have taken this exit first), so only a caller-side NaN/Inf
-# check catches it.
+# check catches it. A fourth exit, since 3.3.3, returns NaN outright: a node that
+# is about to test a tolerance that has halved to zero (see below).
 # The comment on the max-depth exit used to justify that with "cannot error in
 # Cyrius -- no Result type", which has been false since 3.0.0: Result<T, E> is in
 # [deps] and ode_dopri45_trajectory already returns HSB_ERR_NO_CONVERGENCE.
@@ -334,6 +330,29 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
     if (f64_eq(mid, a) == 1 || f64_eq(mid, b) == 1) {
         return whole;
     }
+    # ⛔ 3.3.3 — A TOLERANCE THAT HAS HALVED TO ZERO CAN NEVER BE MET (audit D071).
+    # `|error| < 0` is false for every error, exact zero included, so a node whose
+    # tolerance underflowed could stop only at the depth cap or the collision exit
+    # above, and on a wide interval that is its whole subtree: tol = 2^-1074 halves
+    # to 0 at the root's children, and x^4 over [0,1] then exceeded 2*10^7
+    # evaluations where tol = 1e-10 takes 257. The guard sits in the node about to
+    # TEST the zero: after the depth and collision exits, which return `whole`
+    # untested, and before this node's two evaluations. In the parent it also fired
+    # for children that would have left through the collision exit: a unit step at
+    # 1 + 2^-52 over [1, 1 + 2^-51] (two ulps) at tol = 2^-1074 returned NaN, where
+    # 3.3.2 and this form return 0x3CB2AAAAAAAAAAAB, both after 5 evaluations.
+    # ⚠ A zero-tolerance node that does not collide still returns NaN, however small
+    # its subtree: a step at 1 + 2^-41 over [1, 1 + 2^-40] at tol = 2^-1070 returns
+    # NaN after 21 evaluations, where 3.3.2 returned 0x3D6001AAAAAAAAAB after 529.
+    # Of 1,800 narrow-interval calls (widths 2 to 2^20 ulps of 1, tol 2^-1074 to
+    # 2^-1050 and five larger, x^4, sin and a step), the parent-side form returned
+    # NaN on 214 that 3.3.2 answered and this form on 194, which 3.3.2 answered after
+    # an upper median of 297 evaluations (at most 2,097,153); the other 1,606 are 3.3.2's
+    # value and evaluation count. It is the entry test's predicate; the entry test
+    # already refuses a NaN or negative tol, so here it is equivalent to an
+    # exact-zero test, and that mutant survives for that reason.
+    # [measured: capped x^4, step and narrow-interval probes; 3.3.2, parent-side form, this tree; 2026-10-01]
+    if (f64_gt(tol, 0) == 0) { return 0x7FF8000000000000; }  # quiet NaN
     var left_mid = f64_mul(f64_add(a, mid), F64_HALF);
     var right_mid = f64_mul(f64_add(mid, b), F64_HALF);
     var flm = fncall1(f, left_mid);
@@ -386,8 +405,46 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
 # driven by x^4 (one panel is 8.3e-3 off 1/5), sqrt (unbounded derivative at 0,
 # so the refinement must be non-uniform to reach 1e-11 at all), 1/(1+x) and a
 # narrow Lorentzian peak, each against its exact closed form, plus an
-# evaluation counter that reads 3 for x^2 and >1000 for x^4.
+# evaluation counter that reads 5 for x^2 and 1,025 for x^4 at tol = 1e-12 (this
+# line said 3 for x^2 until 3.3.3; the suite has always pinned 5).
+# [measured: tests/modules.tcyr adaptive Simpson block; x^4 count by a 3.3.2-bundle probe]
+#
+# Returns NaN, evaluating nothing, for a tolerance no node can meet: tol <= 0
+# (either zero) or NaN. b < a is the oriented integral, -(integral from b to a).
+#
+# ⛔ 3.3.3 — AN UNREACHABLE TOLERANCE WALKED THE WHOLE TREE (audit D071). The
+# tolerance test is `|error| < tol`, which no error passes when tol <= 0 or is NaN,
+# so every node recursed until the depth cap or until its midpoint collided with
+# an endpoint. Over [0,1] that is the 2^50-leaf tree: tol = 0, -1, -0, NaN and
+# 2^-1074 each exceeded 2*10^7 evaluations of x^4, where tol = 1e-10 takes 257. On
+# a narrow interval the walk ends at f64 resolution instead — sin over
+# [1, 1 + 2^-44] at tol = 0 returned 0x3D2AED548F090D78 after 513 evaluations —
+# and is refused all the same: the contract is a tolerance some node can meet, not
+# a walk short enough to finish. Rejected here before any evaluation, with a NaN
+# because the function returns a bare f64; reporting it through a Result is
+# roadmap [3.4.0], with D070. A positive tolerance that halves to zero part-way
+# down is refused by the node that would test it (see _adaptive_simpson_rec), so
+# the NaN comes after the evaluations already made. ⚠ That costs an answer low in
+# the tree: tol = 2^-1028 halves to zero three levels above the depth cap, and x^4
+# now returns NaN after 1,229,281 evaluations where 3.3.2 returned the value
+# tol = 1e-10 gives, after 1,645,921.
+# [measured: evaluation-capped x^4 and narrow-interval sin probes on the 3.3.2 bundle and this tree, 2026-10-01]
+#
+# ⛔ 3.3.3 — A ZERO-WIDTH INTERVAL RETURNED NaN WHEN f(a) WAS INFINITE. The single
+# panel is ((b - a)/6) * (fa + 4 fmid + fb), and with b == a that is 0 * Inf = NaN,
+# which the root then returned at its `mid == a` exit; a negative integrand gave
+# -0. The integral over a single point is exactly 0, so it is returned as +0
+# without calling f. The test is the WIDTH, b - a == 0, which for finite a and b is
+# exactly a == b (-0 and +0 included); equal infinite endpoints have a NaN width
+# and still return NaN.
+# [measured: zero-width probe on the 3.3.2 bundle, 2026-10-01]
+# ⚠ Only an EXACT zero width is handled. At a non-zero width a panel's width / 6
+# can underflow to 0 and form the same 0 * Inf: f = +Inf over [0, 2^-1074],
+# [0, 2^-1073] and [0, 2^-1072] still returns NaN, as on 3.3.2.
+# [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
 public fn calc_adaptive_simpson(f, a, b, tol) {
+    if (f64_gt(tol, 0) == 0) { return 0x7FF8000000000000; }  # quiet NaN; true for a NaN tol
+    if (f64_eq(f64_sub(b, a), 0) == 1) { return 0; }
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
     var mid = f64_mul(f64_add(a, b), F64_HALF);
@@ -425,6 +482,17 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
     # Check t in valid range [knots[degree], knots[n_pts]]
     var t_min = _f64arr_get(knots, degree);
     var t_max = _f64arr_get(knots, n_pts);
+    # ⛔ 3.3.3 — A NaN t PASSED BOTH RANGE TESTS (every comparison with NaN is 0), and
+    # at degree 0 nothing downstream does arithmetic on it: the span search ran to
+    # the last span and the curve was that span's control point. Measured on the
+    # 3.3.2 bundle with control points (0,0,0), (1,1,1), (2,0,0) and knots
+    # [0, 1, 2, 3]: t = NaN returned (2,0,0), a point ON the curve, where t = 0.5
+    # returns (0,0,0). At degree >= 1 the NaN reached de Boor's alpha and came back
+    # as a NaN point. Both now take the documented invalid-input 0: NaN is not in
+    # [t_min, t_max]. The knot-span test below stays NaN-true on purpose — a NaN
+    # width is computed THROUGH, so a NaN knot still propagates NaN.
+    # [measured: degree-0 and degree-1 NaN-t probe on the 3.3.2 bundle, 2026-10-01]
+    if (f64_eq(t, t) == 0) { return 0; }
     if (f64_lt(t, t_min) == 1) { return 0; }
     if (f64_lt(t_max, t) == 1) { return 0; }
 
@@ -534,6 +602,11 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
 
     var t_min = _f64arr_get(knots, degree);
     var t_max = _f64arr_get(knots, n_pts);
+    # ⛔ 3.3.3 — calc_bspline's NaN-t repair, on its pair (see there): at degree 0 a
+    # NaN t returned the last span's control point, here with weight 1 the same
+    # (2,0,0) on the same fixture; at degree >= 1 a NaN point.
+    # [measured: degree-0 and degree-1 NaN-t probe on the 3.3.2 bundle, 2026-10-01]
+    if (f64_eq(t, t) == 0) { return 0; }
     if (f64_lt(t, t_min) == 1) { return 0; }
     if (f64_lt(t_max, t) == 1) { return 0; }
 
@@ -679,6 +752,10 @@ public fn calc_hermite_tcb(times, values, n, tension, continuity, bias, t) {
     # measured 5.0 (u collapsed to 0, i.e. exactly p1) where 7.8125 is correct.
     # This one DOES protect a division, so the threshold is DBL_MIN.
     # [measured: interior query t = 1.5s, 9 scales]
+    # ⚠ 3.3.3 — TRUE FOR A NaN seg_len, ON PURPOSE: a NaN key time is divided
+    # through and comes out NaN. Spelled NaN-false it would leave u = 0 and return
+    # key 1's value, 5.0 on times [0, NaN, 2], values [0, 5, 10] at t = 0.5.
+    # [measured: NaN-key-time probe on the 3.3.2 bundle and a respelled build, 2026-10-01]
     if (f64_lt(f64_abs(seg_len), F64_TINY) == 0) {
         u = f64_div(f64_sub(t, t_seg_start), seg_len);
     }
@@ -745,6 +822,44 @@ fn _hermite_tcb_segment(p0, p1, p2, p3, u, tension, continuity, bias) {
 # 6. MONOTONE CUBIC INTERPOLATION (Fritsch-Carlson)
 # ================================================================
 
+# The secant (y_hi - y_lo) / hi of one calc_monotone_cubic interval whose naive
+# difference overflowed: hi = x_hi - x_lo is +Inf for a grid wider than DBL_MAX, or
+# y_hi - y_lo is +-Inf. Both differences are taken on HALVED operands. That is exact
+# wherever such an overflow can happen — a difference of two finite doubles rounds
+# to Inf only when both are at least 2^970 in magnitude (half an ulp of DBL_MAX), so
+# halving drops no bit — and the quotient is the naive one rounded once:
+# (dy/2) / (h/2), or (dy/2) / h doubled. An infinite ABSCISSA is not this case: its
+# halved width is still +Inf, and it keeps the naive quotient, NaN included. Nor is
+# a SLOPE past DBL_MAX: the exact quotient rounds to +-Inf all the same (see the
+# secant loop of calc_monotone_cubic, which names that class).
+fn _calcx_mc_wide_secant(x_lo, x_hi, y_lo, y_hi, hi) {
+    var dyh = f64_sub(f64_mul(y_hi, F64_HALF), f64_mul(y_lo, F64_HALF));
+    if (f64_eq(hi, F64_POS_INF) == 1) {
+        var hh = f64_sub(f64_mul(x_hi, F64_HALF), f64_mul(x_lo, F64_HALF));
+        if (f64_lt(hh, F64_POS_INF) == 1) {
+            var q = f64_div(dyh, hh);
+            # ⛔ 3.3.3 — A WIDE GRID WHOSE SLOPE UNDERFLOWS IS REFUSED, AS 3.3.2 REFUSED
+            # IT. Below DBL_MIN the halved quotient rounds to a subnormal or to 0 and keeps
+            # few or no bits: xs = [-2^1023, 2^1023], ys = [0, 2^-60] (slope 2^-1084) gave a
+            # zero secant, a flat segment, and 0x3C2B000000000000 at x = 2^1022, 0.094 of
+            # the rise from the exact 0x3C28000000000000, where 3.3.2 returned NaN. A
+            # quotient below DBL_MIN that does not multiply back to dy/2 exactly is returned
+            # as NaN, which hands the set to 3.3.2's computation (see the secant loop's end)
+            # and so returns 3.3.2's NaN; an exact one is kept: ys = [0, 1] (slope 2^-1024)
+            # gives 0.75 at x = 2^1022. Without this test, 2,052 of 670,800 results on sets
+            # aimed at the three overflows, and 1,318 of 1,171,224 on random all-finite sets,
+            # were finite and wrong where 3.3.2 returned NaN; with it, none.
+            # [measured: aimed and random sweeps; 3.3.2, this tree, no-test build; exact oracle; 2026-10-01]
+            if (f64_lt(f64_abs(q), F64_TINY) == 1 && f64_eq(f64_mul(q, hh), dyh) == 0) {
+                return 0x7FF8000000000000;  # quiet NaN
+            }
+            return q;
+        }
+        return f64_div(f64_sub(y_hi, y_lo), hi);
+    }
+    return f64_mul(f64_div(dyh, hi), F64_TWO);
+}
+
 # Monotone cubic interpolation using the Fritsch-Carlson method.
 # xs: flat f64 array of n sorted x-values, ys: flat f64 array of n y-values,
 # n: number of points (>= 2), x: query point (f64).
@@ -768,6 +883,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
     # Compute secants (deltas) and interval widths (hs)
     var deltas = _f64arr_alloc(nm1);
     var hs = _f64arr_alloc(nm1);
+    var step332 = 0;  # 1: some secant is not finite; the set is 3.3.2's (see the loop's end)
     var i = 0;
     while (i < nm1) {
         var hi = f64_sub(_f64arr_get(xs, i + 1), _f64arr_get(xs, i));
@@ -780,10 +896,121 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
         # through and returned NaN; `f64_gt(hi, 0)` is 0 for NaN and rejects it.
         # F64_TINY would add nothing here — the division fails only at hi == 0.
         # [measured: x-unit sweep 2^+90..2^-1000, plus NaN and unsorted controls]
+        # ⚠ 3.3.3 — RE-READ AS A NaN-TRUE GUARD, AND KEPT. It is TRUE for NaN on
+        # purpose: `hi` is NaN only for a NaN abscissa or a repeated infinite one
+        # (Inf - Inf), both invalid grids, and it returns the same documented
+        # rejection as an unsorted grid. A NaN QUERY and a NaN ORDINATE are not
+        # stopped here and still propagate NaN. That the rejection is a 0 — a legal
+        # y value, which svara maps to its own default — is audit D069, [3.4.0].
         if (f64_gt(hi, 0) == 0) { return 0; }  # not sorted, zero-width, or NaN
         _f64arr_set(hs, i, hi);
-        _f64arr_set(deltas, i, f64_div(f64_sub(_f64arr_get(ys, i + 1), _f64arr_get(ys, i)), hi));
+        var y_lo = _f64arr_get(ys, i);
+        var y_hi = _f64arr_get(ys, i + 1);
+        var dy = f64_sub(y_hi, y_lo);
+        var di = f64_div(dy, hi);
+        # ⛔ 3.3.3 — EITHER DIFFERENCE COULD OVERFLOW ON FINITE DATA (pre-existing,
+        # found this release). A y difference past DBL_MAX made the secant +Inf:
+        # xs = [0,4,8], ys = [-2^1023, 2^1023, 2^1023] returned +Inf at x = 2, where
+        # Fritsch-Carlson gives 2^1021. A grid wider than DBL_MAX made hi = +Inf, the
+        # secant 0 and, below, h10 = p10 * Inf: xs = [-2^1023, 2^1023], ys = [0, 1]
+        # returned NaN at x = 0, where the answer is 0.5. Both take the halved
+        # differences of _calcx_mc_wide_secant now, and a wide interval also takes the
+        # halved width in the evaluation. Gated on the overflow, so nothing in range
+        # moves: 959,445 results on 60,000 random sets (x and y scales 2^-1000 to
+        # 2^+1018, flats, extrema, signed zeros, subnormal, infinite and NaN ordinates,
+        # infinite and NaN abscissae) are the same bits with and without this repair
+        # except 46 that were NaN without it, and svara's eleven f0 contours at 1,001
+        # points each are the same 11,011 bits on 3.3.2, before and after.
+        # [measured: in-range sweep and svara contours; 3.3.2, base tree, this tree; 2026-10-01]
+        # ⭐ OFF that path the result IS the in-range algorithm's. On 4,000 sets aimed
+        # at the three overflows (39,631 results) the repair-less tree returned 16,606
+        # non-finite and 908 finite results that differ, every one of the 908 farther
+        # from an exact rational oracle than this tree's; on those sets this tree
+        # returns none non-finite, and 39,554 are bit-identical to the unchanged path
+        # run on the same set scaled into range by a power of two. The other 77 have
+        # subnormal or underflowing exact secants, which the scaled copy rounds
+        # differently. The oracle gives the two repros' 2^1021 and 0.5 exactly.
+        # [measured: extreme-set probe, scaled-copy comparison, exact oracle; 2026-10-01]
+        # ⚠ Both counts above predate two narrowings: a set whose secant is still not
+        # finite now gets 3.3.2's computation (see the end of this loop), and a wide grid
+        # whose slope underflows inexactly is refused (_calcx_mc_wide_secant). Both can
+        # only send results back to 3.3.2's. On 36,000 other sets aimed at the three
+        # overflows (670,800 results, mirror images included) this tree turns 73,551 that
+        # 3.3.2 had wrong or non-finite into correct ones, none that 3.3.2 had correct
+        # into a wrong or non-finite one, and none of 3.3.2's NaNs into a wrong value;
+        # the tree before the narrowings returned 9,154 of those NaNs finite and wrong.
+        # [measured: overflow-aimed sweep; 3.3.2, the tree before, this tree; exact oracle; 2026-10-01]
+        # ⚠ NOT REPAIRED: A SLOPE OUTSIDE THE RANGE. The halved differences recover a
+        # secant whose exact value is representable, and nothing more. When the exact
+        # slope |dy / h| is above DBL_MAX — any y difference across a narrow enough
+        # interval, whether or not the difference itself overflows — the secant is
+        # +-Inf and so are the tangents beside it: xs = [0, 1], ys = [-2^1023, 2^1023]
+        # returns NaN at x = 0.25, where the exact value is -2^1022. When it is below
+        # DBL_MIN it rounds to a subnormal or to 0, and a zero secant is a flat
+        # segment: xs = [0, 2^100], ys = [0, 2^-1000] returns 0x0144000000000000
+        # (0.625 * 2^-1002) at x = 2^98, where the exact value is 2^-1002. On 150,000
+        # random sets (1,171,224 results on all-finite inputs; x and y scales 2^-1074
+        # to 2^1023, flats, extrema, signed zeros, wide grids) every result that is
+        # non-finite while its exact value is finite — 127,692 — is on a set with an
+        # exact slope above DBL_MAX (125,028) or a grid wider than DBL_MAX whose slope
+        # underflows (2,664; see _calcx_mc_wide_secant), and 17,520 of the 17,788 finite
+        # results farther than 1e-6 of the interval's rise and 1,024 ulps from it are on
+        # a set with one below DBL_MIN (3.3.2: 139,128 non-finite, 123,052 farther).
+        # [measured: repros and random-set sweep on 3.3.2 and this tree, exact rational oracle; 2026-10-01]
+        if (f64_eq(f64_abs(dy), F64_POS_INF) == 1 || f64_eq(hi, F64_POS_INF) == 1) {
+            di = _calcx_mc_wide_secant(_f64arr_get(xs, i), _f64arr_get(xs, i + 1), y_lo, y_hi, hi);
+        }
+        # Still not finite (or an underflowed wide secant): the set is 3.3.2's (below).
+        if (f64_lt(f64_abs(di), F64_POS_INF) == 0) { step332 = 1; }
+        _f64arr_set(deltas, i, di);
         i = i + 1;
+    }
+    # ⛔ 3.3.3 — A SET WITH A NON-FINITE SECANT GETS 3.3.2's COMPUTATION, BIT FOR BIT:
+    # 3.3.2's secants (recomputed here) and tangent midpoints, its 1e-30 flat test and
+    # plain projection in the tangent loop, where an overflowed root gives its NaN
+    # tangent, and its evaluation. 3.3.3 splines a set itself only when every secant is
+    # finite. One that is not — an exact slope past DBL_MAX (the class named above), an
+    # infinite or NaN ordinate, an infinite abscissa, an underflowed wide secant — puts
+    # +-Inf or NaN tangents beside it, and Fritsch-Carlson's projection of that interval
+    # cannot run in floats. The projections run left to right, each reading the tangent
+    # the one before wrote, so the steps around it are unsettled as well, and every
+    # narrower rule measured left some input worse than 3.3.2 left it:
+    # - an infinite tangent replaced by its limit (+-1, a finite partner zeroed) gave
+    #   finite, monotone, wrong values: xs = [0, 1, 1 + 2^-52, 1 + 2^-51], ys = [0,
+    #   2^-110, 2^980, 2^1023] gave 0x38E0000000000000 at x = 0.5, where the exact value
+    #   is 0x38FFFFFFFFFFEE00 and 3.3.2 (and this tree) give 0x3900000000000000; with
+    #   ys[1] = 1 it gave 0.125 where the exact value is about 0.5 and 3.3.2 (and this
+    #   tree) return NaN. Of 2,325,562 results on an independent generator it turned 37
+    #   that 3.3.2 had right wrong, and 1,300 that 3.3.2 returned as NaN finite and wrong;
+    # - 3.3.2's step only on an interval whose own tangent pair is not finite left 61 of
+    #   those results farther from the exact value than 3.3.2's, because the next interval
+    #   then reads the +-0 that step writes where exact arithmetic has a large tangent;
+    # - 3.3.2's step from the first non-finite tangent on gave 49 results that depend on a
+    #   NaN ordinate further along the set, 4 of them where 3.3.2 returned NaN;
+    # - keeping the secant, midpoint and wide-grid overflow repairs in such a set gave 50
+    #   more of 670,800 results on sets aimed at those overflows finite and wrong where
+    #   3.3.2 returned NaN.
+    # Over five sweeps — those 2,325,562 results, 2,347,318 on sets aimed at this rule
+    # (with mirror images and infinite or NaN ordinates), 1,920,420 on subnormal-width
+    # grids, the 670,800 aimed at the overflows and 1,171,224 on random all-finite sets —
+    # no result 3.3.2 had within 1e-6 of the interval's rise or 1,024 ulps of the exact
+    # Fritsch-Carlson value is outside it here, none 3.3.2 returned finite is non-finite
+    # here, and none it returned non-finite is finite and wrong here. The 1,762,495
+    # results on the 96,879 sets of the first four that this rule hands to 3.3.2 are all
+    # 3.3.2's bits.
+    # [measured: five sweeps and four narrower builds; 3.3.2 bundle, this tree; exact rational oracle; 2026-10-01]
+    # ⚠ WHAT IT COSTS: such a set keeps 3.3.2's answers, its wrong ones and its NaNs —
+    # the ys[1] = 1 case above stays NaN, and xs = [0, 1, 1 + 2^-52], ys = [0, 1, 2^1000]
+    # returns NaN at x = 0.5, where the exact value is 0.125. Of the 2,325,562 results,
+    # the first-non-finite-tangent build turned 34,768 that 3.3.2 had wrong or non-finite
+    # into correct ones and this tree turns 33,103; of the 2,347,318, 54,470 and 53,945.
+    # [measured: the sweeps above on this tree and the first-non-finite-tangent build; 2026-10-01]
+    if (step332 == 1) {
+        i = 0;
+        while (i < nm1) {
+            _f64arr_set(deltas, i, f64_div(f64_sub(_f64arr_get(ys, i + 1), _f64arr_get(ys, i)), _f64arr_get(hs, i)));
+            i = i + 1;
+        }
     }
 
     # Initial tangents: average of adjacent secants
@@ -792,7 +1019,20 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
     _f64arr_set(ms, nm1, _f64arr_get(deltas, nm1 - 1));
     i = 1;
     while (i < nm1) {
-        var avg = f64_mul(F64_HALF, f64_add(_f64arr_get(deltas, i - 1), _f64arr_get(deltas, i)));
+        var d_lo = _f64arr_get(deltas, i - 1);
+        var d_hi = _f64arr_get(deltas, i);
+        var avg = f64_mul(F64_HALF, f64_add(d_lo, d_hi));
+        # ⛔ 3.3.3 — THE MIDPOINT OVERFLOWED: two adjacent same-sign secants above
+        # DBL_MAX/2 summed to +Inf. xs = [0,1,2], ys = [-2^1023, 0, 2^1023] is LINEAR
+        # data and returned NaN on both intervals, even at the knot x = 1, where the
+        # exact value at x = 0.5 is -2^1022. Halving each secant first is exact there
+        # (each is above 2^970, as in _calcx_mc_wide_secant), so the fallback is the
+        # same midpoint rounded once, and it runs only when the sum overflowed, and not
+        # in a set with a non-finite secant, which keeps 3.3.2's midpoint (see above).
+        # [measured: repro on the 3.3.2 bundle and the base tree, exact oracle; 2026-10-01]
+        if (step332 == 0 && f64_eq(f64_abs(avg), F64_POS_INF) == 1) {
+            avg = f64_add(f64_mul(F64_HALF, d_lo), f64_mul(F64_HALF, d_hi));
+        }
         _f64arr_set(ms, i, avg);
         i = i + 1;
     }
@@ -801,7 +1041,28 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
     i = 0;
     while (i < nm1) {
         var di = _f64arr_get(deltas, i);
-        if (f64_lt(f64_abs(di), _CALCX_F64_1E_NEG30) == 1) {
+        # ⛔ 3.3.3 — THIS WAS `|di| < 1e-30`, AN ABSOLUTE THRESHOLD ON A SLOPE (audit
+        # D068). `di` is y per x, so the threshold moved with the caller's units: on
+        # the sweep-H grid (xs = s*[0,1,2,3], ys = [0,1,4,9], f(1.5s) = 2.25) it
+        # zeroed real tangents past s = 2^+99.7 — 2.25 at 2^+99, 2.0 at 2^+100, 2.5
+        # from 2^+102. Over (x-scale 2^k, y-scale 2^j) pairs, k in [-1000, 1020] and j
+        # in [-1000, 1010] in steps of 10, it was wrong on 13,671 of the 31,006 whose
+        # three secants, x-scale and answer are all normal: exactly the pairs with
+        # j - k <= -100. This tree is exact on all 31,006. The other 10,000 pairs have
+        # a slope outside the normal range (see the secant loop): 3.3.2 is wrong on
+        # all of them, this tree on 9,510. An EXACT-ZERO test is the whole question:
+        # the alpha/beta divisions below fail only at di == 0.
+        # ⚠ IT IS HALF OF THE REPAIR. Alone it lets a subnormal `di` reach those
+        # divisions, where alpha overflows to +Inf and the projection below formed
+        # 0 * Inf: ys = [-1, 0, 2^-1074, 1] on a unit grid went from -0.375 /
+        # 0 / 0.375 at x = 0.5 / 1.5 / 2.5 to NaN at all three. The other half is
+        # the overflow branch of the projection.
+        # [measured: (k, j) step-10 grid probe and fixture; 3.3.2, this tree, part-1-only; 2026-10-01]
+        # A set with a non-finite secant keeps 3.3.2's 1e-30 test here, and 3.3.2's
+        # projection below (see the end of the secant loop).
+        var flat = f64_eq(di, 0);
+        if (step332 == 1) { flat = f64_lt(f64_abs(di), _CALCX_F64_1E_NEG30); }
+        if (flat == 1) {
             # Flat segment: zero tangents
             _f64arr_set(ms, i, 0);
             _f64arr_set(ms, i + 1, 0);
@@ -865,9 +1126,49 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
                 # [measured: 999-step secant-ratio sweep before and after]
                 var root = f64_sqrt(s);
                 if (f64_eq(s, F64_POS_INF) == 1) { root = ganita_f64_hypot(alpha, beta); }
-                var tau = f64_div(_CALCX_F64_THREE, root);
-                _f64arr_set(ms, i, f64_mul(f64_mul(tau, alpha), di));
-                _f64arr_set(ms, i + 1, f64_mul(f64_mul(tau, beta), di));
+                if (f64_lt(root, F64_POS_INF) == 1 || step332 == 1) {
+                    var tau = f64_div(_CALCX_F64_THREE, root);
+                    _f64arr_set(ms, i, f64_mul(f64_mul(tau, alpha), di));
+                    _f64arr_set(ms, i + 1, f64_mul(f64_mul(tau, beta), di));
+                } else {
+                    # ⛔ 3.3.3 — ALPHA OR BETA ITSELF OVERFLOWED (a tangent more than
+                    # 2^1024 times its own secant), so hypot is +Inf, tau is +0 and
+                    # `tau * alpha` was 0 * Inf = NaN — a NaN TANGENT, which the
+                    # neighbouring interval sharing that knot then evaluates too.
+                    # The projection is the same one, written in tangent space:
+                    # tau*alpha*di = 3|di| * m_i / hypot(m_i, m_i+1), and the ratio
+                    # m/hypot is at most 1. The sign is m_i's, which the sign
+                    # condition above made di's. Not only the exact-
+                    # zero repair's: the 1e-30 guard let it through whenever a
+                    # neighbouring secant was 2^1024 times one above that floor —
+                    # xs = [0, 2^-1000, 2^90], ys = [0, 1, 2] returned NaN on both
+                    # intervals in 3.3.2, and returns 0.625 at 2^-1001 and 1.875 at
+                    # 2^89 here. Never taken when `root` is finite, so every result
+                    # the finite branch produced is bit-identical: 350,000 results on
+                    # random full-mantissa sets are the same bits on 3.3.2 and here.
+                    # Used for every projection instead, it moves 14,322 of them, each
+                    # by under 3.5e-16 of the set's largest |y|, and is not
+                    # consistently closer to an exact oracle: of 1,500 sampled, 732
+                    # are closer as shipped, 678 in tangent space, 90 tie.
+                    # [measured: fixtures, random-set probe, oracle; 3.3.2, this tree, all-tangent build; 2026-10-01]
+                    # ⛔ 3.3.3 — ONLY FINITE TANGENTS REACH THIS BRANCH: a set with a
+                    # non-finite secant takes 3.3.2's projection above (see the end of the
+                    # secant loop). Here alpha or beta is past DBL_MAX / sqrt(2) with both
+                    # tangents finite, so |di| < sqrt(2), 3|di| cannot overflow, and the
+                    # order of the weight changes rounding only. It is applied as
+                    # (m/hypot * |di|) * 3; the order (m/hypot) * (3|di|) gives other bits
+                    # on 22 of the 2,325,562 sweep results through the m_i line (this order
+                    # closer to the exact value on 10, farther on 12) and 13 through the
+                    # m_i+1 line (closer on 3, farther on 10), by at most 517,723 ulps of a
+                    # value 3.3.2 had wrong, every one inside 1e-6 of the interval's rise.
+                    # [measured: four sweeps on this tree and per-line reverted builds, exact oracle; 2026-10-01]
+                    var mi = _f64arr_get(ms, i);
+                    var mi1 = _f64arr_get(ms, i + 1);
+                    var hm = ganita_f64_hypot(mi, mi1);
+                    var adi = f64_abs(di);
+                    _f64arr_set(ms, i, f64_mul(f64_mul(f64_div(mi, hm), adi), _CALCX_F64_THREE));
+                    _f64arr_set(ms, i + 1, f64_mul(f64_mul(f64_div(mi1, hm), adi), _CALCX_F64_THREE));
+                }
             }
         }
         i = i + 1;
@@ -888,29 +1189,73 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
 
     # Evaluate cubic Hermite on interval [xs[k], xs[k+1]]
     var h_k = _f64arr_get(hs, k);
-    var t_param = f64_div(f64_sub(x, _f64arr_get(xs, k)), h_k);
+    var x_k = _f64arr_get(xs, k);
+    var t_param = f64_div(f64_sub(x, x_k), h_k);
+    # ⛔ 3.3.3 — THE WIDE-GRID REPAIR'S OTHER HALF (see the secant loop). With
+    # h_k = +Inf, t was (x - x_k) / Inf and h10 = p10 * Inf. A grid wider than DBL_MAX
+    # with finite ends now evaluates on the halved width: t from halved operands
+    # (both ends are at least 2^970 in magnitude, as in _calcx_mc_wide_secant, so it
+    # rounds as (x - x_k) / h would), and h10, h11 as (p * h/2) * 2, which is p * h
+    # rounded once and finite (|p10|, |p11| <= 4/27). An infinite abscissa leaves
+    # hh_k infinite and takes the unchanged path, and so does every interval of a set
+    # with a non-finite secant (3.3.2's computation; see the end of the secant loop).
+    var hh_k = 0;
+    var wide = 0;
+    if (step332 == 0 && f64_eq(h_k, F64_POS_INF) == 1) {
+        hh_k = f64_sub(f64_mul(_f64arr_get(xs, k + 1), F64_HALF), f64_mul(x_k, F64_HALF));
+        if (f64_lt(hh_k, F64_POS_INF) == 1) {
+            wide = 1;
+            t_param = f64_div(f64_sub(f64_mul(x, F64_HALF), f64_mul(x_k, F64_HALF)), hh_k);
+        }
+    }
     var t2 = f64_mul(t_param, t_param);
     var t3 = f64_mul(t2, t_param);
 
     # h00 =  2t^3 - 3t^2 + 1
     var h00 = f64_add(f64_sub(f64_mul(F64_TWO, t3), f64_mul(_CALCX_F64_THREE, t2)), F64_ONE);
     # h10 = (t^3 - 2t^2 + t) * h
-    var h10 = f64_mul(f64_add(f64_sub(t3, f64_mul(F64_TWO, t2)), t_param), h_k);
+    var p10 = f64_add(f64_sub(t3, f64_mul(F64_TWO, t2)), t_param);
+    var h10 = f64_mul(p10, h_k);
     # h01 = -2t^3 + 3t^2
     var h01 = f64_add(f64_mul(f64_neg(F64_TWO), t3), f64_mul(_CALCX_F64_THREE, t2));
     # h11 = (t^3 - t^2) * h
-    var h11 = f64_mul(f64_sub(t3, t2), h_k);
+    var p11 = f64_sub(t3, t2);
+    var h11 = f64_mul(p11, h_k);
+    if (wide == 1) {
+        h10 = f64_mul(f64_mul(p10, hh_k), F64_TWO);
+        h11 = f64_mul(f64_mul(p11, hh_k), F64_TWO);
+    }
 
     var yk = _f64arr_get(ys, k);
     var yk1 = _f64arr_get(ys, k + 1);
     var mk = _f64arr_get(ms, k);
     var mk1 = _f64arr_get(ms, k + 1);
+    var t10 = f64_mul(h10, mk);
+    var t11 = f64_mul(h11, mk1);
+    # ⛔ 3.3.3 — A SUBNORMAL WIDTH LOST THE TANGENT TERMS. p10 * h rounds to a
+    # multiple of 2^-1074 when h is subnormal, and the tangent multiplies that rounding
+    # into the result: xs = [0, 5 * 2^-1074], ys = [-2^-87, 0] is linear data, and 3.3.2
+    # returned 0xBA7645A1CAC08312 at x = 2^-1074, 0.10 of the rise from the exact
+    # -0.8 * 2^-87 (0xBA7999999999999A). Where the tangent-space branch now gives a
+    # finite tangent beside such a width, the same rounding turned 3.3.2's NaN into a
+    # finite wrong value — 5 of the 2,325,562 sweep results and 32 of 1,920,420 on
+    # subnormal-width grids. A subnormal h now meets the tangent first, p * (h * m):
+    # |h * m| < 4, so nothing overflows, and the product keeps the tangent's precision;
+    # that example gives the exact value, and those sweeps have no such NaN left and
+    # 19,565 more results correct on the subnormal-width grids. A set with a non-finite
+    # secant keeps 3.3.2's order: there the new order moved 33,887 of 3.3.2's NaNs to
+    # +-Inf and 12 wrong results farther from the exact value.
+    # [measured: fixture and four sweeps; 3.3.2, this tree, no-reorder and ungated builds; exact oracle; 2026-10-01]
+    if (step332 == 0 && f64_lt(h_k, F64_TINY) == 1) {
+        t10 = f64_mul(p10, f64_mul(h_k, mk));
+        t11 = f64_mul(p11, f64_mul(h_k, mk1));
+    }
 
     return f64_add(f64_add(f64_add(
           f64_mul(h00, yk),
-          f64_mul(h10, mk)),
+          t10),
         f64_mul(h01, yk1)),
-      f64_mul(h11, mk1));
+      t11);
 }
 
 # ================================================================

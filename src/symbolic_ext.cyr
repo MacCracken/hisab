@@ -202,44 +202,176 @@ public fn sym_integrate(e, var_name) {
 # LaTeX Rendering
 # ================================================================
 
-# Internal: format a constant value for LaTeX, through sym_const_to_str: integer
-# values without decimals, other finite values with exactly 6 places, inf / NaN as
-# inf, -inf, nan, -nan (through 3.3.1 this said floats render "with up to 6 places").
-fn _latex_fmt_const(sb, val) {
-    str_builder_add(sb, sym_const_to_str(val));
+# Internal: write a constant for LaTeX. The text is sym_const_to_str's: integer values
+# without decimals, other finite values with exactly 6 places, inf / NaN as inf, -inf,
+# nan, -nan (through 3.3.1 this said floats render "with up to 6 places"). A constant
+# whose TEXT starts with a minus sign is wrapped in braces with paren == 0 (no parent
+# parens), in \left( \right) with paren == 1 (an operand position, _latex_write), and
+# written bare with paren == 2 (a product's leading factor).
+# ⛔ 3.3.3 — THE BRACE WAS KEYED ON THE VALUE, `val < 0`, NOT ON THE TEXT. Once
+# sym_const_to_str renders -1e-300 as "0" (3.3.3) that test would have written "{0}";
+# and a NaN with its sign bit set, whose text is "-nan", never compared below 0 and was
+# written bare while "-inf" got braces. 3.3.2 rendered -1e-300 as "{-0.000000}" and -nan
+# as "-nan"; both now follow the text: "0" and "{-nan}". (Through 3.3.2 this helper
+# wrote the text only, and `_latex_write` made the brace decision on the value.)
+# [measured: tests/modules.tcyr, the sym_to_latex(-1e-300) and (-nan) asserts; 3.3.2 bundle probed, 2026-10-01]
+fn _latex_fmt_const(sb, val, paren) {
+    var ctext = sym_const_to_str(val);
+    if (load8(str_data(ctext)) == 45) {   # '-'
+        if (paren == 0) {
+            str_builder_add_cstr(sb, "{");
+            str_builder_add(sb, ctext);
+            str_builder_add_cstr(sb, "}");
+            return 0;
+        }
+        if (paren == 1) {
+            str_builder_add_cstr(sb, "\\left(");
+            str_builder_add(sb, ctext);
+            str_builder_add_cstr(sb, "\\right)");
+            return 0;
+        }
+    }
+    str_builder_add(sb, ctext);
     return 0;
 }
 
-# Internal: check if explicit \cdot is needed between two factors.
-# Number * Number needs \cdot; otherwise juxtaposition suffices.
+# Internal: 1 when `e`, written as a product's second factor (_latex_write at
+# paren 1), starts with a digit or a '.', or with a fraction \frac{1}{b}, whose
+# numerator is the numeral 1. Only a constant's text or a one-character variable's
+# name can start with a digit, and a power written base^{exponent} starts with its
+# base, written the same way, so the test reads the base. A constant whose text
+# starts with '-' is wrapped in \left( there. A power written \frac{1}{b}, alone or
+# as such a base (it is not wrapped), starts with the fraction. Every other node --
+# a power written \sqrt{b}, a power base that is a power or an exponential (wrapped,
+# or \sqrt), a sum, a product, a negation and each function -- starts with '\' or,
+# an exponential, with 'e'.
+# ⛔ 3.3.3 — A NUMBER BEFORE \frac{1}{b} READ AS A MIXED NUMBER. A plain space was
+# written between the factors, and "2 \frac{1}{3}" is how LaTeX writes the mixed
+# number 2 1/3, so 2 * 3^-1 (2/3) read as 7/3; -3 * 2^-1 rendered "-3 \frac{1}{2}"
+# (-3 1/2, value -1.5), variable 7 * 3^-1 "7 \frac{1}{3}" and 2 * (3^-1)^x
+# "2 \frac{1}{3}^{x}". The fraction now counts as a leading digit, so each product
+# gets \cdot, "2 \cdot \frac{1}{3}", whatever the first factor; \sqrt{b} does not
+# ("2 \sqrt{3}" is the usual form, and no reading takes it for another value).
+# [measured: tests/modules.tcyr, group "3.3.3 R5sym: sym_to_latex \cdot before \frac{1}{b}"]
+# No other rendering changed. Over 1,365,072 trees -- every tree to depth 2 on twelve
+# leaves (x, theta, a variable named 7, 2, 0.5, -3, -1, 3, -0, 0, 1.5, -0.5) and eight
+# operators, 300,000 random trees to depth 6 on them, 100,000 to depth 5 that add -inf,
+# nan and -nan, and 200,000 to depth 5 that also add -1 + 9 * 2^-53 and
+# -1 + 10 * 2^-53 (either side of the \frac edge), 10 and y -- exactly 14,369
+# outputs changed, each only by " \frac{1}" -> " \cdot \frac{1}", and expr_to_str
+# changed none; a python3 renderer written from each rule matched the output before
+# and after on every tree, and either rule set misses the other output on all 14,369.
+# 1,382 of the old outputs put a digit before \frac; none of the new ones does. Read
+# back with a number directly before \frac{a}{b} taken as a mixed number, 147 old
+# outputs (184 on 3.3.2) read as a different value when a and b are numbers, and 340
+# (398) whatever they are; none of the new ones.
+# [measured: scratch differential harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+fn _latex_lead_digit(e) {
+    if (expr_tag(e) == EXPR_POW) {
+        var form = _latex_pow_form(e);
+        if (form == 1) { return 1; }        # \frac{1}{b}
+        if (form == 2) { return 0; }        # \sqrt{b}
+        e = expr_left(e);
+        if (expr_tag(e) == EXPR_POW) {
+            if (_latex_pow_form(e) == 1) { return 1; }   # \frac{1}{b}^{exponent}
+        }
+    }
+    var t = expr_tag(e);
+    var c = 0;
+    if (t == EXPR_CONST) {
+        c = load8(str_data(sym_const_to_str(expr_const_val(e))));
+    }
+    if (t == EXPR_VAR) {
+        var name = expr_var_name(e);
+        if (str_len(name) == 1) { c = load8(str_data(name)); }
+    }
+    if (c == 46) { return 1; }               # '.'
+    if (c >= 48) {
+        if (c <= 57) { return 1; }          # '0' to '9'
+    }
+    return 0;
+}
+
+# Internal: check if explicit \cdot is needed between two factors: a number times
+# a number, and any factor before one whose text starts with a digit, a '.' or
+# \frac{1}{b} (_latex_lead_digit). Otherwise juxtaposition suffices.
+# ⛔ 3.3.3 — TEX IGNORES SPACES IN MATH MODE, SO A SPACE DID NOT SEPARATE TWO NUMBERS.
+# \cdot was written only when both factors were constants, and a factor before a
+# power of a number got a plain space, so the digits fused: 2 * 2^x rendered
+# "2 2^{x}", which typesets as 22^x, -3 * 2^x "-3 2^{x}" (-32^x), 0.5 * 2^x
+# "0.500000 2^{x}" and 2 * 0.5^x "2 0.500000^{x}" (20.5^x); x * 2 rendered "x 2".
+# The test is now on the second factor's text, _latex_lead_digit.
+# [measured: tests/modules.tcyr, group "3.3.3 R4sym: sym_to_latex \cdot before a leading digit"]
+# No other rendering changed. Over 1,028,172 trees -- every tree to operator depth 2
+# on twelve leaves (x, theta, a variable named 7, 2, 0.5, -3, -0.5, -1, -0, -inf,
+# -nan, inf) and seven operators, 728,172, plus 300,000 seeded random trees to depth
+# 6 -- the repair changed exactly the 98,877 where a product wrote a plain space
+# before a second factor starting with a digit, each by " " -> " \cdot " alone, and
+# none of the other 929,295; a python3 renderer written from each rule matched the
+# output before and after on all of them. Read back the way TeX reads it (spaces
+# dropped, a run of digits and '.' one number), 17,173 of the old outputs read as a
+# different value and 75 held no number at all ("0.5000000.500000^{x}"); none of
+# the new ones. That reading does not take a number before \frac for a mixed number;
+# _latex_lead_digit's own 3.3.3 note covers that case. Planting a defect that drops
+# the variable arm of _latex_lead_digit moved 46,879 outputs off the rule, so the
+# comparison can fail.
+# [measured: scratch differential harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 fn _latex_needs_cdot(a, b) {
     if (expr_tag(a) == EXPR_CONST) {
         if (expr_tag(b) == EXPR_CONST) {
             return 1;
         }
     }
+    return _latex_lead_digit(b);
+}
+
+# Internal: how _latex_write writes the power `e`: 1 as \frac{1}{base} (the exponent
+# is a constant within 1e-15 of -1, sym_const_eq), 2 as \sqrt{base} (within 1e-15 of
+# 1/2), 0 as base^{exponent}. The POW arm asks it about `e` and about a power base, so
+# whether a base ends in a superscript is decided by the same test that writes it.
+fn _latex_pow_form(e) {
+    var exp = expr_right(e);
+    if (expr_tag(exp) == EXPR_CONST) {
+        var nval = expr_const_val(exp);
+        if (sym_const_eq(nval, f64_neg(F64_ONE)) == 1) { return 1; }
+        if (sym_const_eq(nval, F64_HALF) == 1) { return 2; }
+    }
     return 0;
 }
 
 # Internal: recursive LaTeX writer.
-# sb: str_builder, e: expression, paren: 1 if caller wants parens around binary ops.
+# sb: str_builder, e: expression, paren: where e sits --
+#   0  grouped already (top level, a sum's terms, an exponent, a function argument):
+#      nothing is wrapped; a constant written with a minus is braced, {-3}.
+#   1  an operand: a product's second factor, a power's base, a subtrahend, the
+#      child of a negation. A sum or product is wrapped in \left( \right), and so is
+#      a leading minus, from a constant or a negation: "x \left(-3\right)".
+#   2  a product's first factor: a sum or product is wrapped as at 1, but a leading
+#      minus is left bare, "-3 x" and "-x y", where it cannot be misread.
+# A power's base that itself ends in a superscript, a power or an exponential, is
+# not passed 1: the POW arm wraps it in \left( \right) and writes it at 0.
+# ⛔ 3.3.3 — A LEADING MINUS IN AN OPERAND POSITION WAS WRITTEN BARE, so the output
+# read as a different expression: x * -3 rendered "x -3" (x minus 3), (-2)^x "-2^{x}"
+# (minus 2^x), x * -y "x -y", (-x)^2 "-x^{2}", and x + neg(-3), neg(-3) and
+# neg(neg(y)) "x - -3", "--3" and "--y". paren was 0 or 1 and both factors of a
+# product passed 1; a constant's text was braced only at 0 and the EXPR_NEG arm
+# never looked at paren. The first factor now passes 2, which keeps "-3 x" and the
+# pinned "-x y" byte-identical, and a leading minus at 1 is wrapped the way a sum
+# already was.
+# [measured: tests/modules.tcyr, group "3.3.3 W5: sym_to_latex wraps a leading minus in an operand"]
+# No other rendering changed. Over every depth-2 tree (plus the leaves) on nine leaves
+# (x, 2, 0.5, -3, -0.5, -1, -inf, -nan, -0) and six operators, 234,369 trees, the
+# repair changed exactly the 124,353 with a leading minus in an operand position and
+# none of the other 110,016; a python3 renderer written from each rule matched the
+# old and the new output on all of them. Planting a defect that drops one wrap moved
+# 6,660 of the 110,016, so the comparison can fail.
+# [measured: scratch differential harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 fn _latex_write(sb, e, paren) {
     var t = expr_tag(e);
 
     # CONST
     if (t == EXPR_CONST) {
-        var val = expr_const_val(e);
-        # Negative constant without parent parens: wrap in braces
-        if (f64_lt(val, 0) == 1) {
-            if (paren == 0) {
-                str_builder_add_cstr(sb, "{");
-                _latex_fmt_const(sb, val);
-                str_builder_add_cstr(sb, "}");
-                return 0;
-            }
-        }
-        _latex_fmt_const(sb, val);
-        return 0;
+        return _latex_fmt_const(sb, expr_const_val(e), paren);
     }
 
     # VAR
@@ -258,7 +390,7 @@ fn _latex_write(sb, e, paren) {
 
     # ADD
     if (t == EXPR_ADD) {
-        if (paren == 1) { str_builder_add_cstr(sb, "\\left("); }
+        if (paren != 0) { str_builder_add_cstr(sb, "\\left("); }
         _latex_write(sb, expr_left(e), 0);
         # Detect subtraction: a + neg(b) -> a - b
         var rhs = expr_right(e);
@@ -269,60 +401,84 @@ fn _latex_write(sb, e, paren) {
             str_builder_add_cstr(sb, " + ");
             _latex_write(sb, rhs, 0);
         }
-        if (paren == 1) { str_builder_add_cstr(sb, "\\right)"); }
+        if (paren != 0) { str_builder_add_cstr(sb, "\\right)"); }
         return 0;
     }
 
     # MUL
     if (t == EXPR_MUL) {
-        if (paren == 1) { str_builder_add_cstr(sb, "\\left("); }
+        if (paren != 0) { str_builder_add_cstr(sb, "\\left("); }
         var a = expr_left(e);
         var b = expr_right(e);
         var needs_cdot = _latex_needs_cdot(a, b);
-        _latex_write(sb, a, 1);
+        _latex_write(sb, a, 2);
         if (needs_cdot == 1) {
             str_builder_add_cstr(sb, " \\cdot ");
         } else {
             str_builder_add_cstr(sb, " ");
         }
         _latex_write(sb, b, 1);
-        if (paren == 1) { str_builder_add_cstr(sb, "\\right)"); }
+        if (paren != 0) { str_builder_add_cstr(sb, "\\right)"); }
         return 0;
     }
 
     # POW
     if (t == EXPR_POW) {
         var base = expr_left(e);
-        var exp = expr_right(e);
+        var form = _latex_pow_form(e);
         # Special case: x^(-1) -> \frac{1}{base}
-        if (expr_tag(exp) == EXPR_CONST) {
-            var nval = expr_const_val(exp);
-            var neg_one = f64_neg(F64_ONE);
-            if (sym_const_eq(nval, neg_one) == 1) {
-                str_builder_add_cstr(sb, "\\frac{1}{");
-                _latex_write(sb, base, 0);
-                str_builder_add_cstr(sb, "}");
-                return 0;
-            }
-            # Special case: x^(0.5) -> \sqrt{x}
-            if (sym_const_eq(nval, F64_HALF) == 1) {
-                str_builder_add_cstr(sb, "\\sqrt{");
-                _latex_write(sb, base, 0);
-                str_builder_add_cstr(sb, "}");
-                return 0;
-            }
+        if (form == 1) {
+            str_builder_add_cstr(sb, "\\frac{1}{");
+            _latex_write(sb, base, 0);
+            str_builder_add_cstr(sb, "}");
+            return 0;
         }
-        _latex_write(sb, base, 1);
+        # Special case: x^(0.5) -> \sqrt{x}
+        if (form == 2) {
+            str_builder_add_cstr(sb, "\\sqrt{");
+            _latex_write(sb, base, 0);
+            str_builder_add_cstr(sb, "}");
+            return 0;
+        }
+        # ⛔ 3.3.3 — A BASE THAT ENDS IN A SUPERSCRIPT GOT A SECOND ONE, which LaTeX
+        # rejects ("Double superscript"): (x^2)^3 rendered "x^{2}^{3}" and exp(x)^2
+        # "e^{x}^{2}". A power on this general path and an exponential are the two
+        # renderings that end in one; either, as a base, is now wrapped the way a sum
+        # is, "\left(x^{2}\right)^{3}" and "\left(e^{x}\right)^{2}". A base written
+        # \frac{1}{b} or \sqrt{b} ends in a brace and is left as it was, "\sqrt{x}^{2}".
+        # No other rendering changed. Over 590,610 trees -- every tree to operator depth
+        # 2 on ten leaves (x, theta, 2, 0.5, -3, -0.5, -1, -inf, -nan, -0) and eight
+        # operators, 390,610, plus 200,000 seeded random trees to depth 6 -- the repair
+        # changed exactly the 76,847 that held a double superscript and none of the
+        # other 513,763; a python3 renderer written from each rule matched the output
+        # before and after on all of them, and found no double superscript after.
+        # Dropping the exponential's wrap moved 20,140 outputs off the rule.
+        # [measured: scratch differential harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+        var bt = expr_tag(base);
+        var sup = 0;
+        if (bt == EXPR_EXP) { sup = 1; }
+        if (bt == EXPR_POW) {
+            if (_latex_pow_form(base) == 0) { sup = 1; }
+        }
+        if (sup == 1) {
+            str_builder_add_cstr(sb, "\\left(");
+            _latex_write(sb, base, 0);
+            str_builder_add_cstr(sb, "\\right)");
+        } else {
+            _latex_write(sb, base, 1);
+        }
         str_builder_add_cstr(sb, "^{");
-        _latex_write(sb, exp, 0);
+        _latex_write(sb, expr_right(e), 0);
         str_builder_add_cstr(sb, "}");
         return 0;
     }
 
     # NEG
     if (t == EXPR_NEG) {
+        if (paren == 1) { str_builder_add_cstr(sb, "\\left("); }
         str_builder_add_cstr(sb, "-");
         _latex_write(sb, expr_child(e), 1);
+        if (paren == 1) { str_builder_add_cstr(sb, "\\right)"); }
         return 0;
     }
 

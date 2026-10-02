@@ -82,30 +82,68 @@ fn _su2_z(s) { return load64(s + 24); }
 # ⭐ Divide through by the largest component before squaring: every intermediate is
 # then O(1) and the floor becomes f64's own. Same technique as `cx_div`'s Smith's
 # algorithm (2.15.0) and the two log maps (2.16.0), now shared rather than copied.
-# ⚠ The `+Inf` exit is not optional — Inf/Inf is NaN, and without it an infinite
+# ⚠ The `+Inf` test is not optional — Inf/Inf is NaN, and without it an infinite
 # component turns a finite-looking answer into a NaN.
 # [measured: su2 round-trip exact to 2^-537, first bad at 2^-538, 2026-09-10]
 # (Was `_lie_norm3` through 3.2.x; public since 3.3.0 because lie_ext needs it and
 # `hvec3_length` is not a drop-in -- it takes an HVec3 and moves results by an ulp.)
+#
+# ⛔ 3.3.3 — A NaN COMPONENT CAME BACK AS A NORM OF EXACTLY 0. Stdlib `f64_max(a, b)`
+# returns `b` whenever `a` is NaN, so the max below dropped a NaN in x or y — only z,
+# the last operand, survived it — and the exit `f64_gt(mx, 0) == 0 -> return mx` handed
+# back that 0. lie_norm3(NaN, 0, 0) was 0, and every caller read 0 as "no rotation":
+# `su2_exp`, `so3_exp`, `su2_from_axis_angle`, `so3_from_axis_angle`, `lorentz_boost`
+# and `lorentz_rotate` returned the IDENTITY for a NaN in x or y, and `su2_from_quat`
+# (through `_lie_norm4`) for a NaN in 3 of its 4 slots. The `+Inf -> return mx` exit had
+# the same blind spot from the other side: (NaN, +Inf, 0) gave +Inf and (0, +Inf, NaN)
+# gave NaN, so the answer depended on which slot held the NaN. Audit D085.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+# ⭐ The scaled path is only wrong at the two ENDS of `mx`. For 0 < mx < +Inf a dropped
+# NaN still reaches the division and propagates. So the scaled path now runs exactly
+# there, and everything else — mx = 0, mx = +Inf, and the NaN that z does carry into
+# `mx` — returns |x| + |y| + |z|: +0 for the zero vector, +Inf for an infinite one, and
+# NaN when ANY slot is NaN. Both tests are positive, so NaN fails them and falls through.
+# ⚠ The absolute values are load-bearing: a plain sum would give -0 for (-0, -0, -0)
+# and -Inf for (-Inf, 0, 0). NaN beats +Inf here, as it does in `hvec3_length`; C99
+# `hypot` makes the opposite choice.
+# ⚠ COST: none that survives a change of harness. The finite path executes as many
+# instructions as 3.3.2's did — two compare-and-branch tests, now falling through
+# instead of jumping. Measured on lie_norm3 with finite input, interleaved against the
+# 3.3.2 bundle: -0.5% in a direct call loop, +1.3% in a mixed harness, and +6.0% through
+# stdlib `bench_run` in a binary of its own — where the 3.3.2 body ALSO costs +5.8% once
+# never-executed code moves its scaled path by the same bytes, so that number is code
+# placement, not this shape. su2/so3/se3 exp and log, su2_from_quat, su2_from_axis_angle
+# and lorentz_boost moved -4.1% .. +0.9%. No hisab.bcyr row reaches any of them:
+# tests/hisab.bcyr includes neither lie.cyr nor lie_ext.cyr.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 #must_use
 public fn lie_norm3(x, y, z) {
     var mx = f64_max(f64_abs(x), f64_max(f64_abs(y), f64_abs(z)));
-    if (f64_gt(mx, 0) == 0) { return mx; }
-    if (f64_eq(mx, F64_POS_INF) == 1) { return mx; }
-    var xs = f64_div(x, mx); var ys = f64_div(y, mx); var zs = f64_div(z, mx);
-    return f64_mul(mx, f64_sqrt(f64_add(f64_add(f64_mul(xs, xs), f64_mul(ys, ys)),
-          f64_mul(zs, zs))));
+    if (f64_gt(mx, 0) == 1) {
+        if (f64_lt(mx, F64_POS_INF) == 1) {
+            var xs = f64_div(x, mx); var ys = f64_div(y, mx); var zs = f64_div(z, mx);
+            return f64_mul(mx, f64_sqrt(f64_add(f64_add(f64_mul(xs, xs), f64_mul(ys, ys)),
+                  f64_mul(zs, zs))));
+        }
+    }
+    return f64_add(f64_add(f64_abs(x), f64_abs(y)), f64_abs(z));
 }
 
+# The quaternion form of `lie_norm3`, in the same shape for the same reason (3.3.3).
+# Its max dropped a NaN in w, x and y; only z survived it.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 fn _lie_norm4(w, x, y, z) {
     var mx = f64_max(f64_max(f64_abs(w), f64_abs(x)), f64_max(f64_abs(y), f64_abs(z)));
-    if (f64_gt(mx, 0) == 0) { return mx; }
-    if (f64_eq(mx, F64_POS_INF) == 1) { return mx; }
-    var ws = f64_div(w, mx); var xs = f64_div(x, mx);
-    var ys = f64_div(y, mx); var zs = f64_div(z, mx);
-    var acc = f64_add(f64_mul(ws, ws), f64_mul(xs, xs));
-    acc = f64_add(acc, f64_add(f64_mul(ys, ys), f64_mul(zs, zs)));
-    return f64_mul(mx, f64_sqrt(acc));
+    if (f64_gt(mx, 0) == 1) {
+        if (f64_lt(mx, F64_POS_INF) == 1) {
+            var ws = f64_div(w, mx); var xs = f64_div(x, mx);
+            var ys = f64_div(y, mx); var zs = f64_div(z, mx);
+            var acc = f64_add(f64_mul(ws, ws), f64_mul(xs, xs));
+            acc = f64_add(acc, f64_add(f64_mul(ys, ys), f64_mul(zs, zs)));
+            return f64_mul(mx, f64_sqrt(acc));
+        }
+    }
+    return f64_add(f64_add(f64_abs(w), f64_abs(x)), f64_add(f64_abs(y), f64_abs(z)));
 }
 
 # Construct from raw quaternion components (w, x, y, z). Normalizes.
@@ -128,6 +166,25 @@ public fn su2_from_quat(q) {
     # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
     if (f64_lt(norm, F64_TINY) == 1) {
         return _su2_alloc(F64_ONE, 0, 0, 0);
+    }
+    # ⛔ 3.3.3 — A FINITE QUATERNION WHOSE NORM OVERFLOWS CAME BACK AS ZERO. `_lie_norm4`
+    # is mx * sqrt(sum of (c/mx)^2), and that product passes DBL_MAX once |q| does, with
+    # every component finite: (DBL_MAX, DBL_MAX, 0, 0) has norm sqrt(2) * DBL_MAX. The norm
+    # was +Inf, inv = 1/Inf = 0, and the answer the zero quaternion, which is no element of
+    # SU(2) and which `su2_log` reads as the identity: (0, 0, 0), and `se3_log` as v = t,
+    # for a half turn about (1, 1, 0).
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⭐ Only that overflow takes the rescale: each component divided by the largest, so
+    # all are in [-1, 1] and their norm is in [1, 2], then normalized below as before. An
+    # infinite component makes the norm +Inf too, but its mx is +Inf and it runs the old
+    # lines. Every quaternion whose norm is finite or NaN runs them unchanged, bit for bit.
+    if (f64_eq(norm, F64_POS_INF) == 1) {
+        var mx = f64_max(f64_max(f64_abs(qw), f64_abs(qx)), f64_max(f64_abs(qy), f64_abs(qz)));
+        if (f64_lt(mx, F64_POS_INF) == 1) {
+            qw = f64_div(qw, mx); qx = f64_div(qx, mx);
+            qy = f64_div(qy, mx); qz = f64_div(qz, mx);
+            norm = _lie_norm4(qw, qx, qy, qz);
+        }
     }
     var inv = f64_div(F64_ONE, norm);
     return _su2_alloc(f64_mul(qw, inv), f64_mul(qx, inv),
@@ -247,7 +304,25 @@ public fn su2_exp(v) {
 # logarithm is genuinely the zero vector.
 # [measured: round-trip probe over 60 decades, 2026-09-10]
 public fn su2_log(s) {
-    var w = f64_clamp(_su2_w(s), f64_neg(F64_ONE), F64_ONE);
+    var w = _su2_w(s);
+    # ⛔ 3.3.3 — A NON-FINITE w CAME BACK AS A ROTATION. The clamp below is there for a
+    # unit element's round-off, but it passes a NaN through and turns +-Inf into +-1.
+    # With a zero vector part the exit further down returned before w was read:
+    # su2_log((NaN, 0, 0, 0)) was the zero vector, the identity's log, and `se3_log`
+    # then returned the identity rotation with v = t. Public routes reach it:
+    # su2_from_quat of (0, 0, 0, +Inf) normalizes to (NaN, 0, 0, 0), and so does
+    # `se3_from_mat4` of the identity with +Inf at [0][0]. In 3.3.2 `so3_log` of that
+    # rotation was (0, 0, 0) as well, so the two logs agreed and both were wrong; 3.3.3's
+    # tests in `so3_log` make it NaN, and this one makes su2_log agree with it. With a
+    # vector part an infinite w took the general path as +-1:
+    # (+Inf, 0.5, 0, 0) gave a rotation of 0.927 about x, (-Inf, 0.5, 0, 0) one of 5.36.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⭐ The house non-finite test on the UNCLAMPED w, before the clamp can hide it: NaN
+    # in every slot, so the zero-vector exit below is reached only with a finite w.
+    if (f64_lt(f64_abs(w), F64_POS_INF) == 0) {
+        return hvec3_new(0x7FF8000000000000, 0x7FF8000000000000, 0x7FF8000000000000);
+    }
+    w = f64_clamp(w, f64_neg(F64_ONE), F64_ONE);
     var x = _su2_x(s); var y = _su2_y(s); var z = _su2_z(s);
     # ⚠ SCALED NORM, not the naive sum of squares — the same reason `cx_div` needs
     # Smith's algorithm. Squaring first flushes to zero for components below
@@ -262,11 +337,62 @@ public fn su2_log(s) {
     # shared `lie_norm3`, so the technique has ONE implementation in this module
     # rather than one per call site.
     var sin_half = lie_norm3(x, y, z);
-    if (f64_gt(sin_half, 0) == 0) {
+    # ⛔ 3.3.3 — THIS WAS `f64_gt(sin_half, 0) == 0`, WHICH IS TRUE FOR NaN, so a NaN
+    # vector part returned the zero vector, the logarithm of the IDENTITY, and
+    # `se3_log` passed that on as a zero rotation. Measured on the element
+    # `su2_from_axis_angle((0, 0, +Inf), 1)` builds, whose z is Inf * 0 = NaN: (0, 0, 0).
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⭐ An exact-zero test is what the note above says the guard is; a NaN now goes past
+    # it to the non-finite test below. (A NaN w never gets here: see the first test in
+    # this function.)
+    if (f64_eq(sin_half, 0) == 1) {
         return hvec3_new(0, 0, 0);
+    }
+    # ⛔ 3.3.3 — AN INFINITE VECTOR PART CAME BACK AS ZEROS. This is the pair of `so3_log`'s
+    # test on `asym`. sin_half was +Inf for an infinite component, or for finite ones
+    # whose norm overflows, so sc = 2*half/sin_half was exactly 0: su2_log((1, +Inf, 0, 0))
+    # was (NaN, 0, 0), zeros beside one NaN, and (1, DBL_MAX, DBL_MAX, 0) was (0, 0, 0),
+    # the identity's log. Neither is a unit element; no public constructor builds one.
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⭐ The house non-finite test on `sin_half`, a norm, so it needs no `f64_abs`: NaN in
+    # every slot. A NaN vector part, NaN in every slot already, now returns here too. It
+    # sits after the exact-zero exit, as so3_log's does, so that exit's handling of a NaN
+    # stays testable.
+    if (f64_lt(sin_half, F64_POS_INF) == 0) {
+        return hvec3_new(0x7FF8000000000000, 0x7FF8000000000000, 0x7FF8000000000000);
     }
     var half_theta = ganita_f64_atan2(sin_half, w);
     var sc = f64_div(f64_mul(half_theta, F64_TWO), sin_half);
+    # ⛔ 3.3.3 — `sc` OVERFLOWED FOR A ROTATION BY ~2*pi WHOSE VECTOR PART IS TINY. Near
+    # w = -1 the half-angle is ~pi, so 2*half/sin_half passes DBL_MAX once sin_half is
+    # below 2*pi/DBL_MAX, about 2^-1021.4. sc was +Inf and the answer (+Inf, NaN, NaN)
+    # for a valid unit element: su2_log(su2_from_quat((2^-1054, 0, 0), w = -1)) and the
+    # DBL_MIN case both, while 2^-1021 gave exactly (2*pi, 0, 0).
+    # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⭐ Only that overflow takes the rescue below: the vector part divided by its
+    # largest component, so its direction is O(1), then scaled by the angle. The tests
+    # above leave 0 < sin_half < +Inf and a finite w, so every component is finite and
+    # mx > 0. Every input whose sc is finite runs the last line unchanged, bit for bit.
+    # ⛔ 3.3.3 — AND THE RESCUE TOOK ITS ANGLE FROM sin_half, WHICH `lie_norm3` ROUNDS ONTO
+    # THE SUBNORMAL GRID. For the element (2^-1074, 0, 2^-1074, 2^-1074) sin_half came back
+    # 2^-1074, not sqrt(2) * 2^-1074, so atan2 gave pi/4 where atan(sqrt(2)) is right, and
+    # omega was (0, 1.11, 1.11) for (0, 1.35, 1.35). Only an element with a tiny w goes
+    # wrong this way, and no unit element has one; 3.3.2 gave (NaN, +Inf, +Inf) there.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+    # ⭐ The angle comes from the scaled operands, atan2(|v/mx|, w/mx): atan2 does not
+    # depend on the common scale, and these are not rounded onto that grid. For a unit
+    # element w/mx is below -2^1021 or -Inf, and the half-angle is pi from either
+    # operand pair, so every unit element keeps the bits of the first form.
+    # ⚠ The answer is right for su2_log, a turn of up to 2*pi. `se3_log` refuses the ones
+    # past pi, every unit element among them: 3.3.2 refused them too, and the V it inverts
+    # is singular at 2*pi (lie_ext.cyr).
+    if (f64_eq(sc, F64_POS_INF) == 1) {
+        var mx = f64_max(f64_abs(x), f64_max(f64_abs(y), f64_abs(z)));
+        var xs = f64_div(x, mx); var ys = f64_div(y, mx); var zs = f64_div(z, mx);
+        var ns = f64_sqrt(f64_add(f64_add(f64_mul(xs, xs), f64_mul(ys, ys)), f64_mul(zs, zs)));
+        var k = f64_div(f64_mul(ganita_f64_atan2(ns, f64_div(w, mx)), F64_TWO), ns);
+        return hvec3_new(f64_mul(k, xs), f64_mul(k, ys), f64_mul(k, zs));
+    }
     return hvec3_new(f64_mul(sc, x), f64_mul(sc, y), f64_mul(sc, z));
 }
 

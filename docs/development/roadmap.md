@@ -132,6 +132,94 @@ including a row that says something is blocked.
   which covers 511 of 1022 normal binades. `foundation.tcyr:1503-1507` and `:1541-1542` pin it as
   "genuinely degenerate", but Cauchy-Schwarz bounds the numerator, so it is not. `D089`
 
+**Carried from 3.3.3 — found during 3.3.3 and not reached before the cut.** These were left only
+because 3.3.3's last round was cut short (session limits), not by decision. Review and repair each
+in 3.3.4; repros are as measured on the 3.3.3 tree under cycc 6.6.12. Two need the maintainer's
+answer first and say so.
+
+*Geometry, collision, spatial*
+- **`geo_aabb_aabb` reads a NaN bound as overlap.** Spelling it NaN-false breaks
+  `bvh_query_aabb`'s NaN-slab walk (a finite box beside a NaN box is lost) and an octree built on
+  a NaN corner. Repair the predicate and its two callers together: `geo_aabb_aabb(geo_aabb_new((NaN,0,0),(1,1,1)),
+  [100,101]x[0,1]x[0,1])` is 1; `bvh_query_aabb` with that query returns every box.
+- **`geo_closest_point_on_triangle` scale class**: bit-exact only for scale exponents in
+  [-258, 252]; outside, the degree-four region quantities flush or overflow (24 triangles x every
+  2^e: 13,029 wrong below, 10,785 wrong above). Pre-scale by a power of two, as `D037`/`D038`.
+- **`delaunay_2d` scale class**: from about 2^513 orientation products overflow to NaN and a real
+  site is dropped (square (+-2^520) plus (2^518, 2^517) gives 2 triangles, not 4); tiny finite
+  inputs come back empty, indistinguishable from a rejected input.
+- **`time_of_impact` impact times** are early or late near cylinder-like regions of A (-) B (box
+  edges vs spheres, capsule sides): `_toi_near_point`'s distance query does not converge there.
+  Overlaps `D045` above.
+- **Collision siblings disagree on partly-NaN and infinite shapes**: a support that is NaN only
+  for dir.y > 0 makes `gjk_intersect_3d`, `mpr_intersect` and `time_of_impact` report contact
+  while `gjk_epa_3d` and `mpr_penetration` report a miss; a box with half-extent (+Inf,1,1) vs a
+  unit box gives `gjk_intersect_3d` = 1 but `gjk_epa_3d` = 0 (and a (0,0,0) normal with the shapes
+  swapped). Choose one contract for non-finite shapes and apply it to all five.
+- **BVH**: `_bvh_ray_hits_aabb` on a leaf with one NaN corner clips from the finite side, so the
+  result depends on the ray's direction; `bvh_build` with inverted input boxes (min > max via the
+  setters) can produce unsorted internal nodes.
+- **`hquat_inverse(0)` / `hquat_normalize(0)` return the identity** (the `D088` class for
+  `m3_inverse`/`m4_inverse`; fold into that row's repair).
+
+*Linear algebra*
+- **`svd_golub_kahan` / `eigen_qr` refuse wide spans instead of answering.** 3.3.3 made the
+  overflow loud (`NO_CONVERGENCE`); a headroom balance was tried and withdrawn because it cost bits
+  on small entries (eigen diag 1889u came back 1920u). Find an answer that keeps those bits
+  (headroom applied only where the overflow would occur, or a split balance). Also: a Givens
+  radius below DBL_MIN leaves U / Vt non-orthogonal with every value right (98 span-probe rows;
+  rank-1 5x5 A[i][j] = x_i (1 + j) gives max |Vt Vt^T - I| = 0.0139).
+- **`eigen_power`**: 23 mixed-scale matrices (1e308 beside 1e-302) are wrong on 3.3.2 and 3.3.3
+  alike, because the dominant eigenvector has components below the f64 range.
+- **`solve_bicgstab`**: 188 of 43,000 runs return a finite x where 3.3.2 returned NaN (from 3.3.3's
+  `D015` changes) — check each is right or make it loud; the exact-zero-t stop returns an
+  unreported half step (9 of 3000 scaled systems need it to stay finite). Breakdown reporting is
+  [3.4.0] `D015`.
+- **`solve_pgs`**: a NaN bound is treated as no bound (`f64_clamp(x, NaN, hi)` returns x), and a
+  NaN b_i or a_ij in a row with an exactly zero diagonal disappears (the row is skipped).
+- **`opt_levenberg_marquardt`** still requires `residuals` to return a fresh buffer (documented in
+  `optimize.cyr`'s header); 3.3.3 removed the same contract from GMRES / BiCGSTAB (`D017`). With a
+  reused buffer, Rosenbrock from (-1.2, 1) needs 144 residual calls instead of 52. Copy into
+  solver-owned storage.
+
+*Numerics: interval, calc, num*
+- **Interval arithmetic rounds to nearest, not outward**: 1412 of 3262 finite endpoints sat
+  inside the exact bound (up to ~1 ulp; up to 4.1 ulp when dividing by a divisor >= 2^1022). Also
+  `ivl_div` through a subnormal reciprocal gives a loose bound (lower 2.2e8 where 1.23e20 is
+  right), and an outer bound underflowing to 0 gives a degenerate [0, 0]. Outward rounding changes
+  every result's bits and needs its own A/B.
+- **`calc_monotone_cubic` slope outside the range**: an exact slope past DBL_MAX gives NaN
+  (xs=[0,1], ys=[-2^1023,2^1023] at x=0.25, exact -2^1022) and one below DBL_MIN rounds to a flat
+  segment (xs=[0,2^100], ys=[0,2^-1000] at 2^98 gives 0x0144000000000000, exact 2^-1002). Repair:
+  hold tangents in y units (tangent x width) instead of slopes.
+- **Quadrature overflow before scaling**: `calc_integral_trapez` with f(1/4) = f(1/2) = 1.5*2^1023
+  on [0,1], 4 steps, returns +Inf where the exact value is 0x7FD8000000000000 (the weighted sum is
+  formed before h scales it); `calc_integral_simpson`'s first add fa + fb is uncompensated (f(0) =
+  2^53, f(1) = 1, else 0: 1 ulp low).
+- **`calc_adaptive_simpson`** with a tiny positive tolerance that never halves to zero is still
+  expensive (x^4 on [0,1]: 1,415,173 evaluations at tol = 1e-300); needs a relative floor
+  (`D070` / [3.4.0] for the reporting half).
+- **`calc_bspline` / `calc_nurbs` at degree 0 with a NaN interior knot** return a control point
+  (knots [0, NaN, 2, 3] give ctrl[1] at t = 0.5 and 1.5); needs a knot-vector scan.
+- **Plausible-value fallbacks of the `D069` kind not on that row**: `fbm_2d` / `fbm_3d` /
+  simplex fBm return +0 for octaves <= 0; autodiff's `dual_ln` / `dual_sqrt` / `ad_ln` / `ad_sqrt`
+  map NaN to the (0,0) miss sentinel; `num_pollard_rho(n <= 1)` returns n. Add them to `D069`.
+- **Simplex above 2^63** depends on the toolchain (`f64_to` of the cell index leaves i64).
+
+*Symbolic, gates, docs*
+- **`sym_to_latex` writes variable names unescaped**: var("%") gives "%" (a comment), var("a{b")
+  an unbalanced brace.
+- **`check-measurements.sh` recall gap**: a count claim ("Over 180000 integrations ... 23712
+  NaN results") is not flagged when its marker is removed; a time claim is. Extend the detector
+  and its selftest.
+- **Named hex thresholds never audited for degree** (the census gap that hid `D015`):
+  `_GEO_F64_EPS_SQ` (1e-24), `_SO3_ORTHO_TOL` (1e-9), `_CGA_NULL_TOL`, `_GA_F64_1EM6`.
+- **Needs the maintainer's answer**: (a) two ganita defects, not filed — `ganita_mat_svd` does not
+  converge on `[[1,t],[t,t],[t,-t]]` for t <= 2^-513 (zeta^2 overflows; 562 scales fail), and it
+  accepts non-finite input (an all-NaN 2x2 returns 0 with S = (0,0)); file in ganita or not?
+  (b) port-audit: Rust 1.3.0's `solve_expr` and `eval_verified` have no Cyrius counterpart —
+  demand-gated row, or dropped?
+
 ### **[3.3.5]** — the suites: assertions that cannot see
 
 **Sweeps sized to floors that are gone.**

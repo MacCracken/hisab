@@ -327,7 +327,7 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
   - **A crash removed** (CWE-369): `num_continued_fraction_rational` raised SIGFPE on two inputs.
   - **A gate that could not fail**: `check-constants.sh` accepted any value for a constant at
     ±DBL_MAX (tolerance +Inf); it now takes the step below.
-  - **Known, not repaired** (the maintainer's decision): interval arithmetic rounds to nearest,
+  - **Found, carried to [3.3.4]** (not reached before the cut): interval arithmetic rounds to nearest,
     not outward; geo_aabb_aabb's NaN reading; ganita's SVD non-convergence and non-finite input.
   - Suites **6038**, constants 161/161, public surface 704 declarations / 847 probes, 520 of 520
     non-public probes refused. 6.6.2 still refuses the bundle; 6.6.3, 6.6.6, 6.6.9, 6.6.10 and

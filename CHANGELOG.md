@@ -6,7 +6,7 @@
 
 The roadmap's **[3.3.3]** rows (`D010`, `D012`, `D013`, `D015`, `D017`, `D021`, `D022`, `D068`, `D071`, `D072`), the 3.3.2 leftovers the maintainer approved (the simplex discontinuity, the 48 `f64_gt(x, 0) == 0` NaN-true guards, `sym_const_to_str`'s one-sided integer test, `_geodesic_accel`'s unread parameter, D139's missing records, the port-audit bridge disposition, two stale CHANGELOG figures), and the defects found while doing them.
 
-**How it was done.** File-disjoint groups in git worktrees, then two independent adversarial reviews. The reviews found defects in this release's own first repairs: an infinite-tangent shortcut in `calc_monotone_cubic`, rotation rescaling in the SVD/eigen QR, a one-pass overflow redo in `eigen_power`, and a probe normal in `time_of_impact`. Each made some input worse than 3.3.2. The last round held one criterion: **no input comes out worse than on 3.3.2**, judged by differential sweeps against the shipped bundle and exact oracles. Each claim below names its sweep. Where a repair could not meet the criterion, the path was narrowed to a loud refusal or returned to 3.3.2's behaviour, and the residual is listed under *Found — not repaired*.
+**How it was done.** File-disjoint groups in git worktrees, then two independent adversarial reviews. The reviews found defects in this release's own first repairs: an infinite-tangent shortcut in `calc_monotone_cubic`, rotation rescaling in the SVD/eigen QR, a one-pass overflow redo in `eigen_power`, and a probe normal in `time_of_impact`. Each made some input worse than 3.3.2. The last round held one criterion: **no input comes out worse than on 3.3.2**, judged by differential sweeps against the shipped bundle and exact oracles. Each claim below names its sweep. Where a repair could not meet the criterion, the path was narrowed to a loud refusal or returned to 3.3.2's behaviour, and the residual is listed under *Found — carried to [3.3.4]*.
 
 **Numbers.** Suites **4606 → 6038**, all passing: hisab 735, foundation 453, modules 3036, edge_cases 383, abuse 1431. Constant gate **161/161** (1 skipped). Public surface unchanged: 704 declarations and 847 public probes. All 520 non-public probes are refused. Bundle 27,011 → 30,335 lines (1,157,699 → 1,400,631 B).
 
@@ -196,7 +196,9 @@ Kept, with the reason documented and pinned:
 - `check-public-surface.sh`: `PRIV_PROBE_FLOOR` 492 → 520.
 - `docs/guides/testing.md`: published counts 4606 → 6038.
 
-### Found — not repaired (the maintainer's decision; evidence in the session report)
+### Found — not reached before the cut, carried to [3.3.4]
+
+Left only because 3.3.3's last round was cut short, not by decision. Each is in the roadmap's **[3.3.4]** section (*Carried from 3.3.3*) with its repro, to be reviewed and repaired there.
 - Interval arithmetic rounds to nearest, not outward.
 - `calc_monotone_cubic` still gives NaN or a wrong value for sets whose exact slope is past DBL_MAX or below DBL_MIN (3.3.2's behaviour, kept).
 - `geo_aabb_aabb`'s NaN reading: making it NaN-false breaks `bvh_query_aabb`'s NaN-slab design.
@@ -204,7 +206,8 @@ Kept, with the reason documented and pinned:
 - The SVD/eigen balance has no headroom: wide spans are now loud, not answered.
 - `delaunay_2d` silently drops sites at scales of about 2^513 and above, and returns empty for tiny inputs.
 - Simplex output above 2^63 depends on the toolchain.
-- ganita's `ganita_mat_svd` fails to converge on 3×2 inputs at 2^-513 and below, and accepts non-finite input. Not filed: the maintainer decides.
+- ganita's `ganita_mat_svd` fails to converge on 3×2 inputs at 2^-513 and below, and accepts non-finite input. Not filed: whether to file is the maintainer's call.
+- The smaller items are in the same roadmap block: `opt_levenberg_marquardt`'s fresh-buffer contract, `solve_pgs`'s NaN bounds, one contract for non-finite collision shapes, BVH leaves with a NaN corner, the closest-point-on-triangle scale class, quadrature overflow before scaling, degree-0 B-spline NaN knots, `sym_to_latex` name escaping, the measurement detector's recall on count claims, and the unaudited named hex thresholds.
 
 ## [3.3.2] - 2026-10-01 — three wrong answers found on the way, every stale "filed / on the roadmap" claim settled, and the dead code out
 

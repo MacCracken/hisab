@@ -685,11 +685,14 @@ fn _col_dl_incircle(points, nr, ai, bi, ci, px, py) {
 #     triangles, [0 1 2, 0 2 3], where the same shape at every scale from 2^-536 to
 #     2^512 gives 4. Flipped to inside, the override inserts the site into a triangle
 #     that does not contain it: [0 1 2, 2 3 4, 3 0 4, 0 2 4], overlapping, (0, 2, 4)
-#     clockwise. This is the scale class, not repaired here; it has an underflow end
-#     too, and the in-circle test has a narrower band of its own (both in the note
-#     in delaunay_2d).
-#     [measured: tests/abuse.tcyr, group "3.3.3 R4sym: delaunay_2d at an overflowing scale"]
+#     clockwise. That was the scale class, and through 3.3.3 it was not repaired.
 #     [measured: scratch instrumented copy of the 3.3.3 tree and a k = -1019..1023 sweep, 2026-10-01; cycc 6.6.12]
+#     ⛔ 3.3.4 — delaunay_2d now scales a set outside its band into it (the note above
+#     _ColDlBand), so that square comes back as the 4-triangle fan and never gets here
+#     with a NaN. A set WIDER than the band is still run unscaled and still can: the same
+#     square plus a site at (2^-300, 0) reaches this test exactly as above, and the drop
+#     is still the lesser wrong answer there.
+#     [measured: tests/abuse.tcyr, group "3.3.3 R4sym: delaunay_2d at an overflowing scale"]
 fn _col_dl_strict_inside(points, nr, v0, v1, v2, px, py) {
     if (f64_gt(_col_dl_orient(points, nr, v1, v2, px, py), 0) == 0) { return 0; }
     if (f64_gt(_col_dl_orient(points, nr, v2, v0, px, py), 0) == 0) { return 0; }
@@ -766,6 +769,86 @@ fn _col_dl_locate_scan(points, nr, tris, n_slots, px, py, mode) {
     return 0 - 1;
 }
 
+# --- the scale band ---------------------------------------------------------
+#
+# Every predicate above is homogeneous in the coordinates -- degree 2 for an
+# orientation, 4 for the in-circle determinant, the ghost terms degree 1 or 2 -- and
+# compares only against 0 or against a quantity of its own degree. So multiplying
+# every site by the same power of two changes no decision, PROVIDED nothing
+# overflows and nothing lands below the normal range on the way. The band is where
+# that provably holds: every nonzero coordinate of magnitude in [2^-180, 2^251).
+#   * Above: differences stay under 2^252, the in-circle's degree-4 terms under 2^1010.
+#   * Below: every coordinate, and so every difference the predicates form, is a
+#     whole multiple of g = 2^-232 (52 bits under the smallest nonzero coordinate).
+#     A nonzero degree-4 term is then at least g^4 * 2^-52 = 2^-980 -- the 2^-52
+#     covers the one cancelling subtraction inside each term -- and the raw-coordinate
+#     products and error terms of `_col_o2d_exact_raw` at least 2^-464. Nothing
+#     reaches the subnormal range, so nothing rounds differently than it would at
+#     any other scale in the band.
+# These are worst-case bounds, so the band is narrower than where meshes actually
+# break: the R4sym square with its interior site (tests/abuse.tcyr) broke only from
+# 2^256 up and 2^-270 down, the 20 uniform sites of tests/modules.tcyr from 2^258 and
+# 2^-266. MID is the band's centre: a set out of the band whose nonzero magnitudes
+# span at most HI - LO = 430 binades is centred there, which puts all of it inside.
+# [measured: scratch sweep of every exact 2^e of both fixtures on the 3.3.4 base bundle, 2026-10-03; cycc 6.6.14]
+enum _ColDlBand {
+    _COL_DL_EXP_LO = -180;
+    _COL_DL_EXP_HI = 250;
+    _COL_DL_EXP_MID = 35;
+}
+
+# floor(log2 |x|) for a nonzero finite f64, from its sign-cleared bits `m`.
+fn _col_dl_ilogb(m) {
+    var be = m >> 52;
+    if (be > 0) { return be - 1023; }
+    # Subnormal: the bits are the significand itself, in units of 2^-1074.
+    var e = 0 - 1074;
+    while (m > 1) {
+        m = m >> 1;
+        e = e + 1;
+    }
+    return e;
+}
+
+# The power of two delaunay_2d multiplies every site by, from the smallest nonzero
+# and the largest sign-cleared coordinate bits. 0 -- no scaling -- for a set that is
+# all zeros, already in the band, or wider than the band. Otherwise the exponent
+# that centres the set's [emin, emax] on MID: `+ 4096 ... - 2048` keeps the halving
+# a floor for negative sums, so a set and its every power-of-two multiple are moved
+# to the same place.
+fn _col_dl_band_shift(amin, amax) {
+    if (amax == 0) { return 0; }
+    var emax = _col_dl_ilogb(amax);
+    var emin = _col_dl_ilogb(amin);
+    if (emin >= _COL_DL_EXP_LO) {
+        if (emax <= _COL_DL_EXP_HI) { return 0; }
+    }
+    if (emax - emin > _COL_DL_EXP_HI - _COL_DL_EXP_LO) { return 0; }
+    return _COL_DL_EXP_MID - ((emax + emin + 4096) / 2 - 2048);
+}
+
+# The first n sites times 2^k, as a new vec of new HVec2s; the caller's are not
+# touched. k is in [-988, 1109], so it is applied as 2^k1 * 2^k2 with both factors
+# normal. Every product is exact: the result lands in the band, and the one
+# intermediate lies between the input and the result.
+fn _col_dl_scaled(points, n, k) {
+    var k1 = k;
+    var k2 = 0;
+    if (k > 1000) {
+        k1 = 1000;
+        k2 = k - 1000;
+    }
+    var s1 = (1023 + k1) << 52;
+    var s2 = (1023 + k2) << 52;
+    var sp = vec_new();
+    for (var i = 0; i < n; i = i + 1) {
+        var p = vec_get(points, i);
+        vec_push(sp, hvec2_new(f64_mul(f64_mul(HVec2_x(p), s1), s2),
+            f64_mul(f64_mul(HVec2_y(p), s1), s2)));
+    }
+    return sp;
+}
+
 public fn delaunay_2d(points, n) {
     var result = vec_new();
     # ⛔ `n` RESTATES `vec_len(points)` AND WAS NEVER CHECKED -- the guard 2.12.0
@@ -793,23 +876,53 @@ public fn delaunay_2d(points, n) {
     # not exist, so every site in [0, n) must be finite, checked once before any
     # work, with the house test (NaN and ±Inf in one comparison). Rejection is
     # the empty `result`, this function's answer for every input it rejects.
-    # ⚠ 3.3.3 — The empty vec does not prove a rejection, nor a non-empty one a mesh
-    # of every site: a finite set at an extreme scale comes back short or empty,
-    # because the orientation products overflow or flush to zero (the scale class,
-    # not repaired here). The square at ±2^k with an interior site at
-    # (2^(k-2), 2^(k-3)) gives 4 triangles for every k from -536 to 512, but the
-    # Delaunay 4, the fan around the site, only from -269 to 255: beyond that the
-    # in-circle determinant, degree 4 in the coordinates, overflows or flushes and the
-    # non-Delaunay triangle (0, 2, 3) is kept. It loses the interior site from k = 513
-    # to 1022 (the note above _col_dl_strict_inside) and at k = -537 and -538, keeps it
-    # and loses corner 2 at k = 1023, and loses every site from k = -539 down, where
-    # the orientations it reads on the square's own edges are ±0.
+    # ⛔ 3.3.4 — THE SCALE CLASS. Through 3.3.3 a finite set at an extreme scale came
+    # back short, overlapping or empty, because its orientation products (degree 2) and
+    # in-circle determinants (degree 4) overflowed or flushed to zero. The square at ±2^k
+    # with an interior site at (2^(k-2), 2^(k-3)) gave its Delaunay fan only for k from
+    # -269 to 255; beyond, the non-Delaunay triangle (0, 2, 3) was kept, a site was lost
+    # from k = 513 up and at k = -537 and -538, and every site from k = -539 down -- an
+    # empty vec, which read exactly like a rejected input.
     # [measured: scratch instrumented copy of the 3.3.3 tree and a k = -1019..1023 sweep, 2026-10-01; cycc 6.6.12]
+    # The scan below also takes the largest and the smallest nonzero magnitude, and a set
+    # outside the band (the note above _ColDlBand) whose magnitudes span no more than the
+    # band does is triangulated on a copy scaled into it. A power of two changes no
+    # decision in the band, so the set returns the same triangles, in the same order, at
+    # every scale at which it is exactly representable; a set already in the band is not
+    # copied and runs exactly as before.
+    # [measured: scratch sweep of every exact 2^e, 25 fixtures and 2,550 random sets, 2026-10-03; cycc 6.6.14]
+    # ⚠ That includes scale 1. A set outside the band AT SCALE 1 -- a nonzero magnitude
+    # outside [2^-180, 2^251), or an aspect ratio over about 2^180 -- is scaled too, and
+    # can return a different list than 3.3.3 did. Mostly that is wrong to right (DBL_MAX
+    # and subnormal sets), but a cocircular set's correct mesh can come back reordered:
+    # the R4sym square with y times 2^-400, 2^-426 or 2^-427 gives [2 3 4, 1 2 4, 3 0 4,
+    # 0 1 4] where 3.3.3 gave [1 2 4, 0 1 4, 2 3 4, 3 0 4].
+    # [measured: R4sym square, y scaled, 3.3.4 base vs this tree, 2026-10-03; cycc 6.6.14]
+    # ⚠ A set WIDER than the band -- nonzero magnitudes more than 430 binades apart --
+    # has no scale at which every predicate is safe, and runs unscaled, as through 3.3.3.
+    # It still fails at extreme scales: the square (0,0)..(4,4) plus (DBL_MAX, 1), whose
+    # W2 mesh is right at scale 1, comes back empty from 2^-540 down. Centring wide sets
+    # as well was measured and rejected: more meshes right in all, but thousands that
+    # 3.3.3 got right came back wrong.
+    # [measured: scratch sweep, 750 random sets spanning 450-1000 binades, both policies, 2026-10-03; cycc 6.6.14]
+    var amax = 0;
+    var amin = F64_POS_INF;
     for (var fi = 0; fi < n; fi = fi + 1) {
         var fp = vec_get(points, fi);
-        if (f64_lt(f64_abs(HVec2_x(fp)), F64_POS_INF) == 0) { return result; }
-        if (f64_lt(f64_abs(HVec2_y(fp)), F64_POS_INF) == 0) { return result; }
+        var fx = f64_abs(HVec2_x(fp));
+        var fy = f64_abs(HVec2_y(fp));
+        if (f64_lt(fx, F64_POS_INF) == 0) { return result; }
+        if (f64_lt(fy, F64_POS_INF) == 0) { return result; }
+        # Finite and sign-cleared, the bits order as the magnitudes do.
+        if (fx > amax) { amax = fx; }
+        if (fy > amax) { amax = fy; }
+        if (fx != 0) { if (fx < amin) { amin = fx; } }
+        if (fy != 0) { if (fy < amin) { amin = fy; } }
     }
+    # Outside the band, the build runs on a copy scaled into it. `points` names that
+    # copy from here on; the indices returned index the caller's vec all the same.
+    var shift = _col_dl_band_shift(amin, amax);
+    if (shift != 0) { points = _col_dl_scaled(points, n, shift); }
 
     # The enclosing triangle is the three SYMBOLIC ghosts n, n+1, n+2 -- see the
     # ghost-vertex note above _col_ghost_ux. There is no bounding box to

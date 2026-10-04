@@ -59,7 +59,9 @@ compiler.
 - `m4_mul_vec4` keeps the hoist. 2.11.5 verified it is no longer load-bearing on 6.6.2 (the three
   affected suites pass with it removed: hisab 416, foundation 351, abuse 741, rc=0 each), and the
   comment on the function says it is kept for consistency with `m3_mul_vec3`, not because it is
-  required.
+  required. **3.3.4 removed it**, after re-probing the inline form on every cycc from 6.6.3 to
+  6.6.14 (bit-identical output, identical machine code, every operand slot written) and timing it
+  3.5–5% faster in a same-binary A/B.
 - hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3 (`public struct` + `#derive`), so every consumer of a 3.x
   bundle compiles past this fix.
 - The rule this filing produced is in CLAUDE.md: **a first-bad-version is evidence about

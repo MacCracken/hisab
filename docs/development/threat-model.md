@@ -44,7 +44,7 @@ Hisab does NOT trust:
 | world_to_screen | Perspective divide by w=0 | Returns hvec3_zero() |
 | linearize_depth_reverse_z | Division by ndc=0 | Returns 0 |
 | f64_fmod | Division by y=0 | Returns 0 |
-| f64_tan | cos(x)=0 at PI/2 | Returns IEEE 754 Inf (documented) |
+| m4_perspective_rh / m4_perspective_reverse_z / se3_log (the tangent) | cos(x)=0 at PI/2 | No double makes cos exactly 0: at the double nearest π/2 the sin/cos quotient is ±1.633e16, finite (cycc 6.6.14). Inlined at these three sites since 3.3.4, when hisab's public `f64_tan` was retired: ganita 1.2.11 (cyrius ≥ 6.6.13) defines its own |
 | expr_eval | Undefined variable | Returns 0 with stderr warning (no longer aborts) |
 | geo_ray_plane | Ambiguous t=0 hit vs miss | **Changed 2.7.0** — returns **0** for a miss, matching the contract stated twice in `geo.cyr`'s own headers and every sibling intersection routine. The previous `-1` was the raw i64 `0xFFFFFFFFFFFFFFFF`, i.e. a **negative NaN** as an f64: detectable only by integer comparison, and silently poisoning any float arithmetic a consumer performed on it |
 | GJK/EPA | Non-convergence on degenerate shapes; **false negative from a collision query** | 64-iteration hard limits: `GJK_MAX_ITER` for GJK and `EPA_MAX_ITER` for EPA's expansion (both `public var`; roadmap **[3.5.0]**, audit `K003`), plus at most `_EPA_POLISH_ITER` (128, private) rounds of the direction-polish fallback `_epa_polish` when EPA's expansion ends uncertified. Completeness is the sharper risk and was closed across 2.8.3/2.9.0: `gjk_epa_3d` reported "no contact" for exact tangency, partly from a **manufactured separating certificate** — GJK's search direction is unnormalised and collapses as the simplex closes on a boundary origin (5.9e-15 by the fifth iteration), and `hvec3_normalize`'s **absolute** 1e-12 floor then hands a support function back the shape's *centre*, a point that is not a support point. New `_epa_touch_probe` re-asks with unit directions and answers off an EXACT ZERO rather than a tolerance: **190/190** tangencies now report a depth-0 contact (was 114/190), 0 of 1,290 strictly separated pairs report contact. `gjk_intersect_3d` was then left disagreeing with its own sibling and missed **134 genuine interior overlaps** of 4,386 evaluations (all at scale 2⁻²⁰) — 0 after 2.9.0, sibling disagreement 390 → 0. The cost is on the no-hit path: **+62% (box) / +57% (sphere)**, re-derived by a same-binary ABBA against the pre-2.9.0 body on cycc 6.6.2 (`docs/audit/2026-09-09-roadmap-verification.md`), and +62% / +58% on 6.6.12 (audit `D041`, 2026-09-30). 2.9.0 quoted "+55% median", which understated it. No live consumer calls any `gjk_*` or `mpr_*` function, so a pre-filter stays caller-side work (roadmap *Consumers*) |
@@ -115,10 +115,10 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
   **sakshi**. No FFI, no libc. Third-party-CVE attack surface is zero.
 - Integrity enforced by the SHA-locked `cyrius.lock`: 32 entries, 1 commit-pinned, and since
   cyrius 6.6.4 a `cyrius\t<pin>` trailer; `cyrius deps --verify` → 32 verified / 0 failed;
-  `cyrius vet` → 2 deps, 0 untrusted, 0 missing (verified 2026-09-30 on the 6.6.12 pin).
+  `cyrius vet` → 2 deps, 0 untrusted, 0 missing (verified 2026-10-03 on the 6.6.14 pin).
   All 31 vendored stdlib `lib/*.cyr` files byte-match the **cyrius git tag** for the pin
-  (`git -C ~/Repos/cyrius show "6.6.12:lib/<f>"` — quoted, or zsh reads `:l` as a modifier),
-  and `lib/sakshi.cyr` its 2.5.6 tag. On 2026-09-30 the six installed slots this bump used
+  (`git -C ~/Repos/cyrius show "6.6.14:lib/<f>"` — quoted, or zsh reads `:l` as a modifier),
+  and `lib/sakshi.cyr` its 2.5.6 tag. On 2026-09-30 the six installed slots the 6.6.12 bump used
   (6.6.2, 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12) also byte-matched their tags (103–104 files each),
   so the 6.6.4 repairs below hold on this box;
   the rule below stays because the reference must be immutable, not merely currently right.
@@ -332,3 +332,32 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
   - Suites **6038**, constants 161/161, public surface 704 declarations / 847 probes, 520 of 520
     non-public probes refused. 6.6.2 still refuses the bundle; 6.6.3, 6.6.6, 6.6.9, 6.6.10 and
     6.6.12 run consumer-shaped programs correctly.
+- **2026-10-03**: v3.3.4 — cyrius 6.6.12 → **6.6.14** (ganita 1.2.9 → 1.2.11), the roadmap's [3.3.4]
+  rows, and the closure of hisab's `atan2` filing.
+  - **Supply chain.** 31/31 stdlib files byte-match the 6.6.14 tag, sakshi 2.5.6 its tag, lock 32/32.
+    6.6.13 made `f64_le`/`f64_ge`/`f64_trunc` compiler builtins (a consumer bumping must re-vendor
+    `lib/math.cyr`, or the old file is refused loudly). 6.6.13/6.6.14 fix CVE-59…CVE-67: eight in
+    the TLS/libssl layer, which hisab never vendors or calls, and CVE-62 (a `[deps.NAME]` header with
+    `/` or `..` cloned outside the dep cache), which hisab's one dependency name, `sakshi`, cannot reach.
+  - **A silent override closed.** ganita 1.2.11 added `f64_tan`; hisab's own public `f64_tan` replaced
+    it program-wide under last-definition-wins, and CI's duplicate gate (`duplicate symbol` only) could
+    not see a `duplicate fn`. hisab's is retired and the gate now fails on `duplicate fn` too.
+  - **Fabricated answers for NaN or extreme input repaired**: the ray/box slab tests laundered a NaN
+    into a finite hit with a real face (`D034`); `geo_aabb_aabb`, the quadtree/octree inserts and the
+    BVH ray leaf test turned NaN input into contacts and stored points (`D058`); inverted boxes broke
+    the BVH walk's pruning; the spatial hash put +Inf in −Inf's cell under the six consumers' 6.6.3,
+    and a NaN radius returned every entry; the Lie maps and normalize returned the identity or zero
+    for subnormal input (`D086`, `D087`); `hvec3_angle` returned 0 for perpendicular vectors
+    (`D089`); `time_of_impact` reported impacts from flushed arithmetic (`D045`); the collision entry
+    points disagreed on non-finite shapes; `cga_blade_inverse` returned zero for non-null blades
+    (`D052`); `solve_pgs` dropped NaN; interval endpoints sat inside the exact bound.
+  - **Injection**: `sym_to_latex` wrote variable names raw, so `%`, `{` or `$` broke the output and a
+    name such as `\input{f}` became a TeX command (CWE-74). The ten TeX specials are escaped.
+  - **Two cyrius and two ganita defects filed upstream** with the maintainer's approval (records in
+    `issues/`); hisab is unexposed to the cyrius pair and answers or refuses the ganita pair itself.
+  - **Carried, not repaired** (roadmap [3.3.5]): among them, finite collision shapes near DBL_MAX are
+    now misses (a right → wrong this release introduced), `ivl_sin` does not enclose below cyrius 6.6.9,
+    and Delaunay is wrong on mixed-magnitude sets at scale 1.
+  - Suites **7073**, constants 177/177, public surface 703 declarations / 846 probes, 616 of 616
+    non-public probes refused. 6.6.2 still refuses the bundle; 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12,
+    6.6.13 and 6.6.14 run a cross-module consumer program.

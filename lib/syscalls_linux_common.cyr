@@ -1197,6 +1197,39 @@ fn fd_restore_flags(fd, saved): i64 {
     return sys_fcntl(fd, 4, saved);                 # F_SETFL
 }
 
+# Wait until `fd` is readable (`want_write` == 0) or writable (`want_write` != 0), for at most
+# `timeout_ms` milliseconds. Returns 1 when it is ready — INCLUDING an error or a hang-up
+# (POLLERR / POLLHUP), so the caller's next read or write reports what happened — 0 when the
+# timeout passed first, or -errno (-4 EINTR: the caller re-checks its clock and waits again;
+# -9 EBADF for an fd that is not open, which poll reports as POLLNVAL rather than an error).
+# `timeout_ms` < 0 waits indefinitely; a value above INT_MAX is clamped to it.
+# A negative fd (a failed socket()/accept() result) or one past INT_MAX is -9 EBADF at once:
+# poll(2) IGNORES an entry whose fd is < 0 (revents 0), so passed through it would read as a
+# timeout — or, with timeout_ms < 0, never return — and store32 would truncate a wide one.
+# One raw poll(2) (7): ESYSXLAT makes it ppoll(73) with a timespec on aarch64-Linux and BSD
+# poll(230) on both Mach-O backends; POLLIN 1 / POLLOUT 4 / POLLNVAL 0x20 are the same on Linux
+# and Darwin. Literals, not names: a program-wide enum can redefine a public constant.
+# The stdlib's other waits do not fit a caller-owned fd: process.cyr's _proc_poll_in is
+# read-only and private, net.cyr's WSAPoll is the Windows connect wait, and
+# async_await_readable_ms needs a coroutine. CHANGELOG [6.6.13]
+fn fd_wait_ready(fd, want_write, timeout_ms): i64 {
+    if (fd < 0) { return 0 - 9; }                   # EBADF — poll would skip it silently
+    if (fd > 0x7FFFFFFF) { return 0 - 9; }          # not an int fd
+    var ms = timeout_ms;
+    if (ms < 0) { ms = 0 - 1; }
+    if (ms > 0x7FFFFFFF) { ms = 0x7FFFFFFF; }
+    var pfd[8];                                     # struct pollfd { int fd; short events, revents; }
+    store32(&pfd, fd);
+    if (want_write != 0) { store16(&pfd + 4, 4); }  # POLLOUT
+    else { store16(&pfd + 4, 1); }                  # POLLIN
+    store16(&pfd + 6, 0);
+    var r = syscall(7, &pfd, 1, ms);
+    if (r < 0) { return r; }
+    if (r == 0) { return 0; }
+    if ((load16(&pfd + 6) & 0x20) != 0) { return 0 - 9; }   # POLLNVAL: fd not open → -EBADF
+    return 1;
+}
+
 # Accept a connection on a listening socket; `flags` accepts
 # SOCK_CLOEXEC | SOCK_NONBLOCK to set them atomically.
 # v6.5.16: Darwin has NO accept4 — it is absent from the syscall table on both macOS

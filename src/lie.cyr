@@ -160,12 +160,23 @@ public fn su2_from_quat(q) {
     # [measured: docs/audit/2026-09-09-epsilon-open.json]
     # ⚠ In 2.15.0 and 2.16.0 F64_TINY was exactly `norm == 0` here, because `norm` was a
     # raw sqrt of a sum of SQUARES, whose smallest non-zero value is ~2^-537. Since 2.17.0
-    # it is the scaled `_lie_norm4`, which returns subnormals, so this guard returns the
-    # identity for a non-zero quaternion whose norm is below 2^-1022: x = 2^-1023 comes
-    # back as w = 1 where the answer is x = 1. Open: roadmap [3.3.4], audit D086.
+    # it is the scaled `_lie_norm4`, which returns subnormals, so through 3.3.3 this guard
+    # returned the identity for a non-zero quaternion whose norm is below 2^-1022: x = 2^-1023
+    # came back as w = 1 where the answer is x = 1. Audit D086.
     # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+    # ⭐ 3.3.4 — only norm == 0 keeps the identity. Below DBL_MIN every component is
+    # subnormal (none exceeds the norm), so q * 2^1023 is exact and in range; the lines
+    # below normalise that copy, the same direction, and return the bits they give
+    # su2_from_quat(q * 2^1023). The identity had been the answer for 52 of 52 binades of
+    # (2^-k, 0, 0, 0), k = 1023 .. 1074; on 10,912 sweep quaternions 210 answers moved,
+    # each to the bits of its scaled copy, none further from the Decimal oracle.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
     if (f64_lt(norm, F64_TINY) == 1) {
-        return _su2_alloc(F64_ONE, 0, 0, 0);
+        if (f64_eq(norm, 0) == 1) { return _su2_alloc(F64_ONE, 0, 0, 0); }
+        var up = (1023 + 1023) << 52;   # 2^1023
+        qw = f64_mul(qw, up); qx = f64_mul(qx, up);
+        qy = f64_mul(qy, up); qz = f64_mul(qz, up);
+        norm = _lie_norm4(qw, qx, qy, qz);
     }
     # ⛔ 3.3.3 — A FINITE QUATERNION WHOSE NORM OVERFLOWS CAME BACK AS ZERO. `_lie_norm4`
     # is mx * sqrt(sum of (c/mx)^2), and that product passes DBL_MAX once |q| does, with
@@ -204,10 +215,32 @@ public fn su2_from_axis_angle(axis, angle) {
     # Normalize axis
     var ax = HVec3_x(axis); var ay = HVec3_y(axis); var az = HVec3_z(axis);
     var len = lie_norm3(ax, ay, az);
+    # ⛔ 3.3.4 — BOTH ENDS OF `len` RETURNED A FABRICATION. Below DBL_MIN this guard gave
+    # the identity for a non-zero axis: (2^-k, 0, 0) at pi/2 for 52 of 52 k from 1023 to
+    # 1074 (audit D086). Past DBL_MAX `len` was +Inf for a finite axis, inv = 0, and the
+    # answer (cos(angle/2), 0, 0, 0), not a unit quaternion: (DBL_MAX, DBL_MAX, 0) at pi/2.
+    # `so3_from_axis_angle`, `lorentz_boost` and `lorentz_rotate` had the same two ends.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⭐ An axis is a direction, so an exact power-of-two copy of it is the same axis. A
+    # non-zero axis below DBL_MIN is multiplied by 2^1023 (every component is subnormal, so
+    # exactly), and one whose 1/len is 0 by 2^-600 (exactly, in every component that can
+    # reach the answer); the answer is the bits the old lines give that copy. A zero axis
+    # keeps the identity and NaN runs the old lines; an infinite component gives what it gave
+    # before, since Inf * 2^-600 is Inf and 1/len is 0 again. On 6,713 sweep axes each of
+    # the four maps moved 110 to 115 answers, every finite one to its scaled copy's bits.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
     if (f64_lt(len, F64_TINY) == 1) {
-        return _su2_alloc(F64_ONE, 0, 0, 0);
+        if (f64_eq(len, 0) == 1) { return _su2_alloc(F64_ONE, 0, 0, 0); }
+        var up = (1023 + 1023) << 52;   # 2^1023
+        ax = f64_mul(ax, up); ay = f64_mul(ay, up); az = f64_mul(az, up);
+        len = lie_norm3(ax, ay, az);
     }
     var inv = f64_div(F64_ONE, len);
+    if (f64_eq(inv, 0) == 1) {
+        var dn = (1023 - 600) << 52;    # 2^-600
+        ax = f64_mul(ax, dn); ay = f64_mul(ay, dn); az = f64_mul(az, dn);
+        inv = f64_div(F64_ONE, lie_norm3(ax, ay, az));
+    }
     return _su2_alloc(c_half,
       f64_mul(f64_mul(ax, inv), s_half),
       f64_mul(f64_mul(ay, inv), s_half),
@@ -248,6 +281,12 @@ public fn su2_adjoint(g, X) {
     return hvec3_new(_su2_x(result), _su2_y(result), _su2_z(result));
 }
 
+# |x| / 2 truncated toward zero, with x's sign, for a subnormal or zero x: its
+# mantissa shifted down one place. `su2_exp`'s answer below DBL_MIN (3.3.4).
+fn _lie_sub_half(x) {
+    return (x & 0x8000000000000000) | ((x & 0x7FFFFFFFFFFFFFFF) >> 1);
+}
+
 # Exponential map: so(3)/su(2) Lie algebra -> SU(2), in the HALF-ANGLE convention.
 # Input: 3 f64s packed as a Vec3 (omega_1, omega_2, omega_3); |omega| is the
 # rotation angle, matching so3_exp and su2_from_axis_angle.
@@ -269,8 +308,21 @@ public fn su2_adjoint(g, X) {
 public fn su2_exp(v) {
     var ox = HVec3_x(v); var oy = HVec3_y(v); var oz = HVec3_z(v);
     var norm = lie_norm3(ox, oy, oz);
+    # ⛔ 3.3.4 — THIS GUARD RETURNED THE IDENTITY FOR A NON-ZERO SUBNORMAL ROTATION.
+    # su2_exp((2^-k, 0, 0)) is (1, 2^-(k+1), 0, 0) for k = 1023 .. 1073 and it gave
+    # (1, 0, 0, 0) for all 51 (audit D086); `se3_exp` builds its rotation here.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⭐ Below DBL_MIN the exact answer is known to the last bit. cos(norm/2) is within
+    # 2^-2047 of 1, so w is 1. sin(norm/2)/norm is just under 1/2, so each |x_i| is just
+    # under |omega_i| / 2, and omega_i is subnormal (no component exceeds the norm): the
+    # nearest double is |omega_i| / 2 truncated, half its mantissa shifted down, which
+    # `_lie_sub_half` returns with omega_i's sign. f64_mul(omega_i, 1/2) would round a
+    # tie (an odd mantissa) to even, away from zero half the time; the lines below would
+    # round norm and norm/2 onto the subnormal grid first. norm == 0 keeps the identity,
+    # and NaN fails the test and runs below.
     if (f64_lt(norm, F64_TINY) == 1) {
-        return su2_identity();
+        if (f64_eq(norm, 0) == 1) { return su2_identity(); }
+        return _su2_alloc(F64_ONE, _lie_sub_half(ox), _lie_sub_half(oy), _lie_sub_half(oz));
     }
     var half = f64_mul(norm, F64_HALF);
     var c = f64_cos(half);
@@ -615,10 +667,19 @@ public fn lorentz_boost_z(eta) {
 public fn lorentz_boost(dir, eta) {
     var nx = HVec3_x(dir); var ny = HVec3_y(dir); var nz = HVec3_z(dir);
     var norm = lie_norm3(nx, ny, nz);
+    # 3.3.4: both ends of `norm`, repaired as in `su2_from_axis_angle` (audit D086).
     if (f64_lt(norm, F64_TINY) == 1) {
-        return lorentz_identity();
+        if (f64_eq(norm, 0) == 1) { return lorentz_identity(); }
+        var up = (1023 + 1023) << 52;   # 2^1023
+        nx = f64_mul(nx, up); ny = f64_mul(ny, up); nz = f64_mul(nz, up);
+        norm = lie_norm3(nx, ny, nz);
     }
     var inv = f64_div(F64_ONE, norm);
+    if (f64_eq(inv, 0) == 1) {
+        var dn = (1023 - 600) << 52;    # 2^-600
+        nx = f64_mul(nx, dn); ny = f64_mul(ny, dn); nz = f64_mul(nz, dn);
+        inv = f64_div(F64_ONE, lie_norm3(nx, ny, nz));
+    }
     nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
 
     var ch = ganita_f64_cosh(eta);
@@ -656,10 +717,19 @@ public fn lorentz_boost(dir, eta) {
 public fn lorentz_rotate(axis, angle) {
     var nx = HVec3_x(axis); var ny = HVec3_y(axis); var nz = HVec3_z(axis);
     var norm = lie_norm3(nx, ny, nz);
+    # 3.3.4: both ends of `norm`, repaired as in `su2_from_axis_angle` (audit D086).
     if (f64_lt(norm, F64_TINY) == 1) {
-        return lorentz_identity();
+        if (f64_eq(norm, 0) == 1) { return lorentz_identity(); }
+        var up = (1023 + 1023) << 52;   # 2^1023
+        nx = f64_mul(nx, up); ny = f64_mul(ny, up); nz = f64_mul(nz, up);
+        norm = lie_norm3(nx, ny, nz);
     }
     var inv = f64_div(F64_ONE, norm);
+    if (f64_eq(inv, 0) == 1) {
+        var dn = (1023 - 600) << 52;    # 2^-600
+        nx = f64_mul(nx, dn); ny = f64_mul(ny, dn); nz = f64_mul(nz, dn);
+        inv = f64_div(F64_ONE, lie_norm3(nx, ny, nz));
+    }
     nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
 
     var c = f64_cos(angle);

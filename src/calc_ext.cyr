@@ -16,13 +16,18 @@ var _CALCX_F64_FOUR    = 0x4010_0000_0000_0000;  # 4.0
 var _CALCX_F64_SIX     = 0x4018_0000_0000_0000;  # 6.0
 var _CALCX_F64_NINE    = 0x4022_0000_0000_0000;  # 9.0
 var _CALCX_F64_FIFTEEN = 0x402E_0000_0000_0000;  # 15.0
+# The floor below which _adaptive_simpson_rec tests a panel's error estimate: 2^-56 of
+# the panel's own estimate, where 15 * tol is 0.9375 m ulps of it, m its significand in
+# [1, 2) (see there).
+var _CALCX_F64_REL_FLOOR = 0x3C70_0000_0000_0000;  # 2^-56
 
 # ⛔ 3.3.3 — `_CALCX_F64_1E_NEG30` NO LONGER DECIDES A FLAT SEGMENT IN ANY SET 3.3.3
 # SPLINES ITSELF. It is calc_monotone_cubic's 3.3.2 flat-secant threshold: an absolute
 # 1e-30 compared against a SLOPE, y per x, so it has a scale baked in and zeroed real
 # tangents (audit D068; the evidence is at the flat-segment test, an exact-zero test
 # now). It is read only by the 3.3.2 computation that a set with a non-finite secant
-# still gets (see the secant loop's end). Its 2.20.0 history — bits mis-transcribed and
+# and an infinite or NaN datum still gets (see the secant loop's end; 3.3.4 splines the
+# finite ones in extended range). Its 2.20.0 history — bits mis-transcribed and
 # invisible to the constant gate, which is why that gate falls back to a preceding
 # comment line — is in CHANGELOG.md [2.20.0].
 var _CALCX_F64_1E_NEG30 = 0x39B4_484B_FEEB_C2A0;   # 1e-30
@@ -353,6 +358,50 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
     # exact-zero test, and that mutant survives for that reason.
     # [measured: capped x^4, step and narrow-interval probes; 3.3.2, parent-side form, this tree; 2026-10-01]
     if (f64_gt(tol, 0) == 0) { return 0x7FF8000000000000; }  # quiet NaN
+    # ⛔ 3.3.4 — A TOLERANCE BELOW WHAT THIS PANEL'S ESTIMATE CAN RESOLVE WAS MET ONLY BY
+    # LUCK. With tol < 2^-56 |whole|, `|error| < tol` needs |refined - whole| < 15 tol,
+    # less than 15 * 2^-56 |whole| = 0.9375 m ulps of whole (m its significand, in [1, 2)):
+    # under 1.875 ulps, and under one when m < 1.0667. The children inherit the same
+    # ratio, so the walk ended where the two estimates happened to agree. x^4
+    # over [0,1] at tol = 1e-300, which never halves to zero above the depth cap, took
+    # 1,415,173 evaluations for the value tol = 1e-10 gives after 257. The test is now
+    # against max(tol, 2^-56 |whole|), and the same call takes 408,529 for that value.
+    # The floor accepts what it raises the test to: a disagreement under 0.9375 m ulps,
+    # which is up to 1.875 ulps, and a 1-ulp one whenever m >= 1.0667.
+    # The rest of that cost is the panels at x = 0, where x^4's Simpson estimate is 4%
+    # off at every scale and no relative test can pass them: they still walk to the
+    # depth cap, and an integrand whose own rounding noise is above the floor (a
+    # polynomial evaluated with cancellation, 5x^4 - 3x^2 + x - 1/4 at tol 1e-20) still
+    # passed 3,000,000 evaluations on both trees. Bounding that needs the integral's
+    # magnitude, which this recursion does not have: [3.4.0] with D070's report.
+    # The zero guard above still reads the caller's tol: a panel whose tolerance has
+    # halved to zero is refused as in 3.3.3, but panels the floor accepts first never
+    # reach it. 78 calls of the sweep that returned NaN on 3.3.3 (13) or passed the
+    # probe's 3,000,000-evaluation cap there (65) now return a value: against each one's
+    # exact value, 65 correctly rounded and 13 within 4 ulps. No call took more
+    # evaluations than on 3.3.3 (99 passed the cap on both). No result or
+    # count moved where tol is at least 3.2e-13 of the integral (1,292 calls at 1e-2 to
+    # 1e-15); below that, peaked integrands take fewer evaluations and their values
+    # moved closer to exact (Lorentzians: 18 closer, none farther). One integral moved
+    # farther, sin 7x over [0, 2] at the ten tolerances from 1e-17 to 2^-1000: 0.46 to 2.46
+    # ulps of exact (1e-17 is 0.72 ulp of it). None went from within 4 ulps to beyond.
+    # [measured: adaptive sweep, 9 integrands x 34 tolerances, 3e6-evaluation cap; base tree, this tree; 2026-10-03]
+    # ⛔ SO THE ROOT IS NOT FLOORED (`depth < 50`; the root is called with 50). Where the
+    # five root samples miss what f does between them, whole and refined differ by
+    # rounding alone, and the floor accepted that: 1.1 + 0.5 |sin 4 pi x| over [0,1], 1.1
+    # at x = k/4, returned 1.1 (22% low) after 5 evaluations at tol = 1e-17, where 3.3.3
+    # returns 0x3FF6B165B50C0BBA (0.7 ulp from exact) after 705,025. The root reads the
+    # caller's tol alone, as in 3.3.3, and that call now returns 3.3.3's bits after 59,777.
+    # 3.3.3 is right there by a 1-ulp accident: at tol = 2e-17 it returns 1.1 after 5.
+    # ⚠ ONE LEVEL DOWN THE FLOOR STILL ALIASES. 1.1 + 0.5 |sin 8 pi x| is 1.1 at the nine
+    # samples x = k/8 of the root's two children, and at tol = 1e-17 down to 2^-1060 it
+    # returns 0x3FF199999999999B (1.1, 22% low) after 9 evaluations, where 3.3.3 returns
+    # 0x3FF4257FA752D2AB (1.259, 11% low, also wrong) after 678,729 down to 1e-300, and
+    # NaN at 2^-1028 and 2^-1060. No panel test can see a feature its samples miss.
+    # [measured: adaptive sweep plus 8 aliasing integrands; 3.3.3 bundle, this tree; Decimal oracle; 2026-10-03]
+    var tol_eff = tol;
+    var tol_floor = f64_mul(f64_abs(whole), _CALCX_F64_REL_FLOOR);
+    if (depth < 50 && f64_lt(tol_eff, tol_floor) == 1) { tol_eff = tol_floor; }
     var left_mid = f64_mul(f64_add(a, mid), F64_HALF);
     var right_mid = f64_mul(f64_add(mid, b), F64_HALF);
     var flm = fncall1(f, left_mid);
@@ -374,7 +423,7 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
     # Richardson extrapolation error estimate
     var error = f64_div(f64_sub(refined, whole), _CALCX_F64_FIFTEEN);
 
-    if (f64_lt(f64_abs(error), tol) == 1) {
+    if (f64_lt(f64_abs(error), tol_eff) == 1) {
         return f64_add(refined, error);
     }
 
@@ -426,9 +475,18 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
 # down is refused by the node that would test it (see _adaptive_simpson_rec), so
 # the NaN comes after the evaluations already made. ⚠ That costs an answer low in
 # the tree: tol = 2^-1028 halves to zero three levels above the depth cap, and x^4
-# now returns NaN after 1,229,281 evaluations where 3.3.2 returned the value
-# tol = 1e-10 gives, after 1,645,921.
-# [measured: evaluation-capped x^4 and narrow-interval sin probes on the 3.3.2 bundle and this tree, 2026-10-01]
+# returns NaN (3.3.3: after 1,229,281 evaluations; 3.3.4: after 376,645) where 3.3.2
+# returned the value tol = 1e-10 gives, after 1,645,921.
+# [measured: evaluation-capped x^4 and narrow-interval sin probes on the 3.3.2 bundle and the 3.3.3 tree, 2026-10-01]
+# [measured: the later count, adaptive sweep on the patched tree, 2026-10-03; cycc 6.6.14]
+#
+# ⛔ 3.3.4 — A POSITIVE TOLERANCE BELOW A PANEL'S RESOLUTION is raised to that
+# resolution, 2^-56 of the panel's estimate, on every panel below the root (see
+# _adaptive_simpson_rec): x^4 at tol = 1e-300 takes 408,529 evaluations, not 1,415,173,
+# for the same value. ⚠ A raised tolerance accepts an integrand that aliases on a
+# child's nine samples: 1.1 + 0.5 |sin 8 pi x| at tol = 1e-17 returns 1.1, 22% low.
+# [measured: tests/modules.tcyr, group "3.3.4: calc_adaptive_simpson, the relative floor"]
+# [measured: the sin 8 pi x row, adaptive aliasing sweep; 3.3.3 bundle, this tree; 2026-10-03]
 #
 # ⛔ 3.3.3 — A ZERO-WIDTH INTERVAL RETURNED NaN WHEN f(a) WAS INFINITE. The single
 # panel is ((b - a)/6) * (fa + 4 fmid + fb), and with b == a that is 0 * Inf = NaN,
@@ -516,6 +574,23 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
     # Undo sentinel if triggered
     if (k >= n_pts) {
         k = k - n_pts;
+    }
+    # ⛔ 3.3.4 — AT DEGREE 0 A NaN KNOT RETURNED A CONTROL POINT. A degree-0 curve is
+    # ctrl[k] on [knots[k], knots[k+1]), and nothing below does arithmetic on a knot, so
+    # a NaN bound went unseen: the span search reads `t < NaN` as false and walks past
+    # it. Knots [0, NaN, 2, 3] returned ctrl[1] at t = 0.5 and at t = 1.5, where the span
+    # holding t cannot be decided. At degree >= 1 both span bounds are among the knots
+    # de Boor's alpha reads (knots[k] at r = 1, j = degree; knots[k+1] at r = 1, j = 1),
+    # so a NaN bound already comes out NaN; this is that rule at degree 0. A NaN knot the
+    # evaluation does not read gives no NaN at any degree, as a NaN control point outside
+    # the support does not: the same knots give ctrl[2] at t = 2.5.
+    # [measured: NaN-knot probe, degrees 0-3, every knot position, 40 t each; base tree, 2026-10-03; cycc 6.6.14]
+    if (degree == 0) {
+        var kl = _f64arr_get(knots, k);
+        var kr = _f64arr_get(knots, k + 1);
+        if (f64_eq(kl, kl) == 0 || f64_eq(kr, kr) == 0) {
+            return hvec3_new(0x7FF8000000000000, 0x7FF8000000000000, 0x7FF8000000000000);
+        }
     }
 
     # De Boor's algorithm: work with (degree+1) points
@@ -623,6 +698,16 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
     }
     if (k >= n_pts) {
         k = k - n_pts;
+    }
+    # ⛔ 3.3.4 — calc_bspline's degree-0 NaN-knot repair, on its pair (see there): knots
+    # [0, NaN, 2, 3] returned ctrl[1] here too, at t = 0.5 and 1.5, with any weights.
+    # [measured: NaN-knot probe, degrees 0-3, every knot position, 40 t each; base tree, 2026-10-03; cycc 6.6.14]
+    if (degree == 0) {
+        var kl = _f64arr_get(knots, k);
+        var kr = _f64arr_get(knots, k + 1);
+        if (f64_eq(kl, kl) == 0 || f64_eq(kr, kr) == 0) {
+            return hvec3_new(0x7FF8000000000000, 0x7FF8000000000000, 0x7FF8000000000000);
+        }
     }
 
     # De Boor on homogeneous coordinates (wx, wy, wz, w)
@@ -830,8 +915,8 @@ fn _hermite_tcb_segment(p0, p1, p2, p3, u, tension, continuity, bias) {
 # halving drops no bit — and the quotient is the naive one rounded once:
 # (dy/2) / (h/2), or (dy/2) / h doubled. An infinite ABSCISSA is not this case: its
 # halved width is still +Inf, and it keeps the naive quotient, NaN included. Nor is
-# a SLOPE past DBL_MAX: the exact quotient rounds to +-Inf all the same (see the
-# secant loop of calc_monotone_cubic, which names that class).
+# a SLOPE past DBL_MAX: the exact quotient rounds to +-Inf all the same, and since
+# 3.3.4 such a set of finite data is splined in extended range (_calcx_mc_ext).
 fn _calcx_mc_wide_secant(x_lo, x_hi, y_lo, y_hi, hi) {
     var dyh = f64_sub(f64_mul(y_hi, F64_HALF), f64_mul(y_lo, F64_HALF));
     if (f64_eq(hi, F64_POS_INF) == 1) {
@@ -844,8 +929,10 @@ fn _calcx_mc_wide_secant(x_lo, x_hi, y_lo, y_hi, hi) {
             # zero secant, a flat segment, and 0x3C2B000000000000 at x = 2^1022, 0.094 of
             # the rise from the exact 0x3C28000000000000, where 3.3.2 returned NaN. A
             # quotient below DBL_MIN that does not multiply back to dy/2 exactly is returned
-            # as NaN, which hands the set to 3.3.2's computation (see the secant loop's end)
-            # and so returns 3.3.2's NaN; an exact one is kept: ys = [0, 1] (slope 2^-1024)
+            # as NaN, which handed the set to 3.3.2's computation (see the secant loop's end)
+            # and so returned 3.3.2's NaN; since 3.3.4 a set of finite data with that NaN is
+            # splined in extended range instead, and returns the exact 0x3C28000000000000.
+            # An exact one is kept: ys = [0, 1] (slope 2^-1024)
             # gives 0.75 at x = 2^1022. Without this test, 2,052 of 670,800 results on sets
             # aimed at the three overflows, and 1,318 of 1,171,224 on random all-finite sets,
             # were finite and wrong where 3.3.2 returned NaN; with it, none.
@@ -858,6 +945,239 @@ fn _calcx_mc_wide_secant(x_lo, x_hi, y_lo, y_hi, hi) {
         return f64_div(f64_sub(y_hi, y_lo), hi);
     }
     return f64_mul(f64_div(dyh, hi), F64_TWO);
+}
+
+# ---- calc_monotone_cubic's extended-range path (3.3.4) ----
+# A number here is a pair (m, e) worth m * 2^e: m is +-0 (and e 0) or 1 <= |m| < 2, and
+# e is an integer with no range limit that matters. Stored as two words, m then e. Every
+# operation below is the f64 operation on the m's, rounded once, with the exponents
+# added apart: the m's are in [1, 2), so the f64 result is normal and its rounding is
+# the one an unbounded exponent would give. They exist only for calc_monotone_cubic's
+# sets whose slopes leave the f64 range (see the end of its secant loop).
+
+# Store m * 2^e, normalized, at p. m is finite; a subnormal m is first scaled by 2^64.
+fn _calcx_xn(p, m, e) {
+    if (f64_eq(m, 0) == 1) {
+        store64(p, m);
+        store64(p + 8, 0);
+        return 0;
+    }
+    var bx = (m >> 52) & 0x7FF;
+    if (bx == 0) {
+        m = f64_mul(m, 0x43F0000000000000);    # 2^64
+        e = e - 64;
+        bx = (m >> 52) & 0x7FF;
+    }
+    store64(p, (m & 0x800FFFFFFFFFFFFF) | 0x3FF0000000000000);
+    store64(p + 8, e + bx - 1023);
+    return 0;
+}
+
+# The difference u - v of two finite doubles, rounded once, at p: halved when it
+# overflows (both are then at least 2^970 in magnitude, so halving is exact).
+fn _calcx_xdiff(p, u, v) {
+    var d = f64_sub(u, v);
+    if (f64_lt(f64_abs(d), F64_POS_INF) == 1) { return _calcx_xn(p, d, 0); }
+    return _calcx_xn(p, f64_sub(f64_mul(u, F64_HALF), f64_mul(v, F64_HALF)), 1);
+}
+
+# A zero product or quotient comes back as (+-0, 0): _calcx_xn drops the exponent.
+fn _calcx_xmul(p, ma, ea, mb, eb) {
+    return _calcx_xn(p, f64_mul(ma, mb), ea + eb);
+}
+
+# mb is not zero.
+fn _calcx_xdiv(p, ma, ea, mb, eb) {
+    return _calcx_xn(p, f64_div(ma, mb), ea - eb);
+}
+
+# The smaller operand is aligned by at most 2^-200: past that it is under a quarter of
+# an ulp of the larger one and cannot change the rounding.
+fn _calcx_xadd(p, ma, ea, mb, eb) {
+    if (f64_eq(ma, 0) == 1) {
+        if (f64_eq(mb, 0) == 1) { return _calcx_xn(p, f64_add(ma, mb), 0); }
+        return _calcx_xn(p, mb, eb);
+    }
+    if (f64_eq(mb, 0) == 1) { return _calcx_xn(p, ma, ea); }
+    if (ea >= eb) {
+        var d = eb - ea;
+        if (d < 0 - 200) { d = 0 - 200; }
+        return _calcx_xn(p, f64_add(ma, f64_mul(mb, (1023 + d) << 52)), ea);
+    }
+    var d2 = ea - eb;
+    if (d2 < 0 - 200) { d2 = 0 - 200; }
+    return _calcx_xn(p, f64_add(f64_mul(ma, (1023 + d2) << 52), mb), eb);
+}
+
+# m > 0.
+fn _calcx_xsqrt(p, m, e) {
+    if (e % 2 != 0) {
+        m = f64_mul(m, F64_TWO);
+        e = e - 1;
+    }
+    return _calcx_xn(p, f64_sqrt(m), e / 2);
+}
+
+# m * 2^e as a double, rounded once (+-Inf past DBL_MAX, +-0 below half of 2^-1074).
+fn _calcx_xf(m, e) {
+    if (f64_eq(m, 0) == 1) { return m; }
+    if (e > 1023) { return f64_mul(m, F64_POS_INF); }
+    if (e >= 0 - 1022) { return f64_mul(m, (1023 + e) << 52); }
+    if (e >= 0 - 1074) { return f64_mul(m, 1 << (e + 1074)); }      # 2^e, a subnormal
+    if (e == 0 - 1075) { return f64_mul(f64_mul(m, F64_HALF), 1); }  # (m / 2) * 2^-1074
+    return f64_mul(m, 0);
+}
+
+# One tangent term of the Hermite form, p * L, as a double: L (a tangent in y units) is
+# made a double first when it is one, so the product rounds once as the f64 form does.
+fn _calcx_xterm(pf, lm, le) {
+    if (le >= 0 - 1022 && le <= 1023) { return f64_mul(pf, _calcx_xf(lm, le)); }
+    var r[16];
+    _calcx_xn(&r, pf, 0);
+    _calcx_xmul(&r, load64(&r), load64(&r + 8), lm, le);
+    return _calcx_xf(load64(&r), load64(&r + 8));
+}
+
+# 1 when calc_monotone_cubic's projection step is about to multiply back a tangent
+# whose ratio to the secant, r = m / d, underflowed (|r| below DBL_MIN, m not 0) and so
+# lost its bits: the projection runs (s > 9). m is the tangent after the sign test, which
+# zeroes a negative ratio (and with it m). A ratio of -0 with m not 0, which that test
+# would miss, does not occur with finite secants: m is that far below d only after the
+# previous interval's projection shrank it, by tau * beta with tau >= 3 * 2^-1024 and beta
+# >= 2^-53 (or by the tangent-space branch, which then leaves m at 0).
+# [measured: 395,811 random finite-secant sets in a replica of this step, none; 2026-10-03]
+fn _calcx_mc_lost(r, m, s) {
+    if (f64_lt(f64_abs(r), F64_TINY) == 0 || f64_eq(m, 0) == 1) { return 0; }
+    if (f64_lt(_CALCX_F64_NINE, s) == 1) { return 1; }
+    return 0;
+}
+
+# 1 when every abscissa and ordinate of the set is finite.
+fn _calcx_mc_finite(xs, ys, n) {
+    var i = 0;
+    while (i < n) {
+        if (f64_lt(f64_abs(_f64arr_get(xs, i)), F64_POS_INF) == 0) { return 0; }
+        if (f64_lt(f64_abs(_f64arr_get(ys, i)), F64_POS_INF) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# calc_monotone_cubic on a set of finite doubles, sorted strictly increasing in x, with
+# the slopes and tangents held as (m, e) pairs: the same Fritsch-Carlson steps in the
+# same order, each rounded once as in f64, with no overflow or underflow between. The
+# Hermite form takes each tangent in y units, width times slope (L = h_k m_k), which
+# is at most 3 |y_k+1 - y_k| after the projection, so only that product returns to f64.
+fn _calcx_mc_ext(xs, ys, n, x) {
+    if (f64_eq(x, x) == 0) { return f64_add(x, x); }    # a NaN query stays NaN
+    # Caller-sized: n pairs of 16 bytes at most, so n * 16 must stay within ALLOC_MAX,
+    # where calc_monotone_cubic's own arrays (n * 8) reach twice as far. Past that the
+    # set gets the designed 0 its rejections return (D069), before anything is stored:
+    # `alloc` refuses with 0 and the stores below would go to address 0. The bound is
+    # derived and written as a division, as in _f64arr_alloc.
+    if (n > (ALLOC_MAX / 8) / 2) { return 0; }
+    var nm1 = n - 1;
+    var dl = alloc(nm1 * 16);    # secants
+    var hw = alloc(nm1 * 16);    # widths
+    var ms = alloc(n * 16);      # tangents
+    var r[16];
+    var a[16];
+    var b[16];
+    var i = 0;
+    while (i < nm1) {
+        _calcx_xdiff(hw + i * 16, _f64arr_get(xs, i + 1), _f64arr_get(xs, i));
+        _calcx_xdiff(&r, _f64arr_get(ys, i + 1), _f64arr_get(ys, i));
+        _calcx_xdiv(dl + i * 16, load64(&r), load64(&r + 8), load64(hw + i * 16), load64(hw + i * 16 + 8));
+        i = i + 1;
+    }
+    # Initial tangents: the end secants, and the mean of the two secants at each inner knot.
+    store64(ms, load64(dl));
+    store64(ms + 8, load64(dl + 8));
+    store64(ms + nm1 * 16, load64(dl + (nm1 - 1) * 16));
+    store64(ms + nm1 * 16 + 8, load64(dl + (nm1 - 1) * 16 + 8));
+    i = 1;
+    while (i < nm1) {
+        _calcx_xadd(ms + i * 16, load64(dl + (i - 1) * 16), load64(dl + (i - 1) * 16 + 8),
+          load64(dl + i * 16), load64(dl + i * 16 + 8));
+        if (f64_eq(load64(ms + i * 16), 0) == 0) { store64(ms + i * 16 + 8, load64(ms + i * 16 + 8) - 1); }
+        i = i + 1;
+    }
+    # Fritsch-Carlson: flat segments, the sign condition, the projection onto radius 3.
+    i = 0;
+    while (i < nm1) {
+        var dm = load64(dl + i * 16);
+        var de = load64(dl + i * 16 + 8);
+        var p0 = ms + i * 16;
+        var p1 = ms + (i + 1) * 16;
+        if (f64_eq(dm, 0) == 1) {
+            _calcx_xn(p0, 0, 0);
+            _calcx_xn(p1, 0, 0);
+        } else {
+            _calcx_xdiv(&a, load64(p0), load64(p0 + 8), dm, de);
+            _calcx_xdiv(&b, load64(p1), load64(p1 + 8), dm, de);
+            if (f64_lt(load64(&a), 0) == 1) {
+                _calcx_xn(p0, 0, 0);
+                _calcx_xn(&a, 0, 0);
+            }
+            if (f64_lt(load64(&b), 0) == 1) {
+                _calcx_xn(p1, 0, 0);
+                _calcx_xn(&b, 0, 0);
+            }
+            var am = load64(&a);
+            var ae = load64(&a + 8);
+            var bm = load64(&b);
+            var be = load64(&b + 8);
+            _calcx_xmul(&r, am, ae, am, ae);
+            var sm = load64(&r);
+            var se = load64(&r + 8);
+            _calcx_xmul(&r, bm, be, bm, be);
+            _calcx_xadd(&r, sm, se, load64(&r), load64(&r + 8));
+            sm = load64(&r);
+            se = load64(&r + 8);
+            # s > 9: s is at least 0, and 9 is 1.125 * 2^3.
+            var proj = 0;
+            if (se > 3) { proj = 1; }
+            if (se == 3 && f64_lt(0x3FF2000000000000, sm) == 1) { proj = 1; }
+            if (proj == 1) {
+                _calcx_xsqrt(&r, sm, se);
+                _calcx_xdiv(&r, _CALCX_F64_THREE, 0, load64(&r), load64(&r + 8));     # tau = 3 / root
+                var tm = load64(&r);
+                var te = load64(&r + 8);
+                _calcx_xmul(&r, tm, te, am, ae);
+                _calcx_xmul(p0, load64(&r), load64(&r + 8), dm, de);
+                _calcx_xmul(&r, tm, te, bm, be);
+                _calcx_xmul(p1, load64(&r), load64(&r + 8), dm, de);
+            }
+        }
+        i = i + 1;
+    }
+    # Find the interval, as calc_monotone_cubic does.
+    var k = 0;
+    while (k < nm1 - 1) {
+        if (f64_lt(x, _f64arr_get(xs, k + 1)) == 1) { k = k + n; }
+        if (k < nm1) { k = k + 1; }
+    }
+    if (k >= n) { k = k - n; }
+    var hm = load64(hw + k * 16);
+    var he = load64(hw + k * 16 + 8);
+    _calcx_xdiff(&r, x, _f64arr_get(xs, k));
+    _calcx_xdiv(&r, load64(&r), load64(&r + 8), hm, he);
+    var t = _calcx_xf(load64(&r), load64(&r + 8));
+    var t2 = f64_mul(t, t);
+    var t3 = f64_mul(t2, t);
+    var h00 = f64_add(f64_sub(f64_mul(F64_TWO, t3), f64_mul(_CALCX_F64_THREE, t2)), F64_ONE);
+    var p10 = f64_add(f64_sub(t3, f64_mul(F64_TWO, t2)), t);
+    var h01 = f64_add(f64_mul(f64_neg(F64_TWO), t3), f64_mul(_CALCX_F64_THREE, t2));
+    var p11 = f64_sub(t3, t2);
+    _calcx_xmul(&a, hm, he, load64(ms + k * 16), load64(ms + k * 16 + 8));
+    _calcx_xmul(&b, hm, he, load64(ms + (k + 1) * 16), load64(ms + (k + 1) * 16 + 8));
+    var t10 = _calcx_xterm(p10, load64(&a), load64(&a + 8));
+    var t11 = _calcx_xterm(p11, load64(&b), load64(&b + 8));
+    return f64_add(f64_add(f64_add(
+          f64_mul(h00, _f64arr_get(ys, k)),
+          t10),
+        f64_mul(h01, _f64arr_get(ys, k + 1))),
+      t11);
 }
 
 # Monotone cubic interpolation using the Fritsch-Carlson method.
@@ -884,6 +1204,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
     var deltas = _f64arr_alloc(nm1);
     var hs = _f64arr_alloc(nm1);
     var step332 = 0;  # 1: some secant is not finite; the set is 3.3.2's (see the loop's end)
+    var slope_oor = 0;  # 1: some secant of a non-flat interval is below DBL_MIN (see the loop's end)
     var i = 0;
     while (i < nm1) {
         var hi = f64_sub(_f64arr_get(xs, i + 1), _f64arr_get(xs, i));
@@ -940,7 +1261,8 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
         # into a wrong or non-finite one, and none of 3.3.2's NaNs into a wrong value;
         # the tree before the narrowings returned 9,154 of those NaNs finite and wrong.
         # [measured: overflow-aimed sweep; 3.3.2, the tree before, this tree; exact oracle; 2026-10-01]
-        # ⚠ NOT REPAIRED: A SLOPE OUTSIDE THE RANGE. The halved differences recover a
+        # ⚠ NOT REPAIRED BY 3.3.3: A SLOPE OUTSIDE THE RANGE (3.3.4 repairs it on finite
+        # data; see the end of this loop). The halved differences recover a
         # secant whose exact value is representable, and nothing more. When the exact
         # slope |dy / h| is above DBL_MAX — any y difference across a narrow enough
         # interval, whether or not the difference itself overflows — the secant is
@@ -960,11 +1282,34 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
         if (f64_eq(f64_abs(dy), F64_POS_INF) == 1 || f64_eq(hi, F64_POS_INF) == 1) {
             di = _calcx_mc_wide_secant(_f64arr_get(xs, i), _f64arr_get(xs, i + 1), y_lo, y_hi, hi);
         }
-        # Still not finite (or an underflowed wide secant): the set is 3.3.2's (below).
+        # Still not finite (or an underflowed wide secant), or a non-flat secant below
+        # DBL_MIN: the set leaves this path at the end of the loop.
         if (f64_lt(f64_abs(di), F64_POS_INF) == 0) { step332 = 1; }
+        if (f64_lt(f64_abs(di), F64_TINY) == 1 && f64_eq(y_hi, y_lo) == 0) { slope_oor = 1; }
         _f64arr_set(deltas, i, di);
         i = i + 1;
     }
+    # ⛔ 3.3.4 — A SLOPE OUTSIDE THE f64 RANGE, ON FINITE DATA, IS SPLINED IN EXTENDED RANGE
+    # (see _calcx_mc_ext). Both classes 3.3.3 named and left are this one: an exact slope
+    # past DBL_MAX made a +-Inf secant and NaN tangents (xs = [0, 1], ys = [-2^1023,
+    # 2^1023] returned NaN at x = 0.25, where the value is -2^1022), and one below
+    # DBL_MIN rounded to a subnormal or to 0, a flat segment (xs = [0, 2^100], ys = [0,
+    # 2^-1000] returned 0x0144000000000000 at x = 2^98, where the value is 2^-1002).
+    # A set of finite doubles with such a secant now takes the same Fritsch-Carlson steps
+    # with every slope and tangent carried as a mantissa and a separate exponent, and the
+    # Hermite form reads each tangent in y units, width times slope; the repros give
+    # -2^1022 and 2^-1002 exactly. Holding tangents in y units alone does not reach it:
+    # moving a shared tangent between its two intervals takes the width ratio, which
+    # leaves the range on its own (xs = [0, 2^-1000, 2^90]). Every other set — all
+    # secants normal or exactly 0, or any datum infinite or NaN — takes the path below,
+    # unchanged.
+    # [measured: repros and monotone sweep; base tree, this tree; exact Fritsch-Carlson oracle; 2026-10-03; cycc 6.6.14]
+    if (step332 == 1 || slope_oor == 1) {
+        if (_calcx_mc_finite(xs, ys, n) == 1) { return _calcx_mc_ext(xs, ys, n, x); }
+    }
+    # ⛔ 3.3.4 — ONLY A SET WITH AN INFINITE OR NaN DATUM REACHES WHAT FOLLOWS WITH A
+    # NON-FINITE SECANT: a finite set left above, for the extended-range path. What
+    # follows is 3.3.3's rule for the rest, unchanged.
     # ⛔ 3.3.3 — A SET WITH A NON-FINITE SECANT GETS 3.3.2's COMPUTATION, BIT FOR BIT:
     # 3.3.2's secants (recomputed here) and tangent midpoints, its 1e-30 flat test and
     # plain projection in the tangent loop, where an overflowed root gives its NaN
@@ -1103,6 +1448,28 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
             }
 
             var s = f64_add(f64_mul(alpha, alpha), f64_mul(beta, beta));
+            # ⛔ 3.3.4 — A TANGENT MORE THAN 2^1022 TIMES SMALLER THAN THIS SECANT LOST ITS
+            # RATIO, and with it the tangent: alpha = m_i / d_i underflows, and the
+            # projection below writes tau * alpha * d_i, 0 or a few bits, where exact
+            # arithmetic writes tau * m_i. That tangent is the one the interval to the left
+            # evaluates: on a unit grid, ys = [0, -0x1.f949826bcf8cbp-613, -0x1.8ab0f612ce1b0p+937,
+            # -0x1.b3ba79c6e8fbap+945] returned -0x1.f949826bcf8cbp-614 at x = 0.5, the chord's
+            # midpoint (both tangents 0), where m_1 is 0.0637 d_0 and the exact value is
+            # -0x1.f13ddd4a83580p-614 (1.4e14 ulps away). Such a set, on finite data, now
+            # takes the extended-range path, which gives that value. A lost ratio this step
+            # reads correctly — no projection, or a negative one the sign test zeroes —
+            # stays: those sets are this path's bits, two of them pinned at their exact
+            # values in tests/modules.tcyr ("the tangent-space weight's order"). Only alpha
+            # is tested: beta = m_i+1 / d_i reads the knot-(i+1) tangent before any step has
+            # moved it, the mean of d_i and d_i+1, so it is 0, negative (zeroed above) or at
+            # least 2^-54: the cancellation leaves at least an ulp of d_i, or half of one when
+            # d_i is a power of two, and the mean halves it again: 2^-53 / m for d_i's
+            # significand m above 1, 2^-54 at m = 1 — never lost.
+            # [measured: monotone sweep, 8 results on 2 sets wrong on both trees before this; exact oracle; 2026-10-03]
+            if (step332 == 0 && _calcx_mc_lost(alpha, _f64arr_get(ms, i), s) == 1) {
+                if (_calcx_mc_finite(xs, ys, n) == 1) { return _calcx_mc_ext(xs, ys, n, x); }
+            }
+
             if (f64_lt(_CALCX_F64_NINE, s) == 1) {
                 # s > 9: constrain, by projecting (alpha, beta) onto the
                 # Fritsch-Carlson circle of radius 3 — which is a norm-scaled

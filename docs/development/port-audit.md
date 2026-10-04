@@ -59,11 +59,11 @@
 > the same demand-gated list (D160). The AI module would conflict with
 > SECURITY.md's "No network I/O in core library" (D160); it is not on the roadmap,
 > and whether to drop it for good is the maintainer's decision. Serialization,
-> which the Rust crate had through serde, is on the demand-gated list. The 6.6.12
-> stdlib has no JSON or serde module, but it does ship `lib/protobuf.cyr`. The
-> symbolic "bridge" (Rust 1.3.0's abaco bridge) was not ported either. It has no
-> roadmap row and no recorded disposition, so dropping it is left to the
-> maintainer. What argues against porting it: the roadmap's *Scope* assigns
+> which the Rust crate had through serde, is on the demand-gated list. The stdlib
+> ships JSON through `lib/bayan.cyr` (bayan 1.5.9 at the 6.6.12 tag, 1.5.11 at
+> 6.6.14) and also `lib/protobuf.cyr`; there is no serde equivalent. The symbolic
+> "bridge" (Rust 1.3.0's abaco bridge) was not ported either; since 3.3.4 its
+> solver and verified evaluator are scheduled (see below). What argues against porting it: the roadmap's *Scope* assigns
 > expression parsing to abaco, and *Boundary with Abaco* says hisab should never
 > depend on abaco.
 
@@ -88,11 +88,15 @@
 > mathematical operations and that expression parsing belongs to abaco, and
 > `ExprValue` existed only to carry trees to abaco. ⚠ That reasoning does not
 > settle `solve_expr` and `eval_verified`, which are operations on a tree, not
-> parsing or transport. They are not ported either, and whether they join the
-> demand-gated list or are dropped is the maintainer's decision; this note records
-> no decision about them. abaco itself declares no `[deps.hisab]` and calls no
+> parsing or transport. abaco itself declares no `[deps.hisab]` and calls no
 > hisab symbol (roadmap, *Boundary with Abaco*), so nothing consumes either half
 > today.
+>
+> **Decided 2026-10-03 (v3.3.4): the solver and the verified evaluator are scheduled**
+> so abaco can build on hisab without having to ask. The roadmap row ("the abaco
+> bridge") ports them onto hisab's expression TREE as `sym_solve`,
+> `sym_solve_bracket` and `sym_eval_interval`, without the Rust Pow corner rule's
+> unsoundness and without `ExprValue`, which stays out of scope.
 
 ## Summary
 

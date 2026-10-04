@@ -37,6 +37,14 @@
 # is the accurate one there.
 # [measured: series-vs-closed-form comparison over theta = 1e-4 .. 1, 2026-09-10]
 var _LIE_SERIES_CUT = 0x3FB9_9999_9999_999A;  # 0.1
+# 3.3.4 — DEGREE AUDIT of `_SO3_ORTHO_TOL` (its rationale is the first paragraph above). Both
+# quantities it bounds, |(R^T R)_ij - delta_ij| and |det R - 1|, are dimensionless and of
+# degree ONE in a perturbation E of R: R^T R - I = R^T E + E^T R + E^T E, and det(R + E) - 1
+# is tr(R^T E) to first order. A degree-one 1e-9 matches them; nothing is squared against
+# an unsquared bound, and a NaN or infinite entry fails `<` and is refused. Measured edge:
+# R[0][0] of so3_exp((0.3, -0.2, 0.5)) moved by 2^-31 is accepted and by 1.5 * 2^-31
+# refused; R^100000 of that rotation, and so3_exp of a subnormal omega, are accepted.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
 var _SO3_ORTHO_TOL = 0x3E112E0BE826D695;  # 1e-9
 
 # ================================================================
@@ -111,14 +119,24 @@ public fn so3_from_axis_angle(axis, angle) {
     # [measured: docs/audit/2026-09-09-epsilon-open.json]
     # ⚠ In 2.15.0 and 2.16.0 F64_TINY was exactly `norm == 0` here, because `norm` was a
     # raw sqrt of a sum of SQUARES, whose smallest non-zero value is ~2^-537. Since 2.17.0
-    # it is the scaled `lie_norm3`, which returns subnormals, so this guard returns the
-    # identity for a non-zero axis whose norm is below 2^-1022: axis (2^-1023, 0, 0) at
-    # pi/2 gives R[1][1] = 1 where the answer is cos(pi/2). Open: roadmap [3.3.4], audit D086.
+    # it is the scaled `lie_norm3`, which returns subnormals, so through 3.3.3 this guard
+    # returned the identity for a non-zero axis whose norm is below 2^-1022: axis
+    # (2^-1023, 0, 0) at pi/2 gave R[1][1] = 1 where the answer is cos(pi/2). Audit D086.
     # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+    # ⭐ 3.3.4: both ends of `norm` now take an exact power-of-two copy of the axis, as in
+    # `su2_from_axis_angle` (lie.cyr), which says why; a zero axis keeps the identity.
     if (f64_lt(norm, F64_TINY) == 1) {
-        return m3_identity();
+        if (f64_eq(norm, 0) == 1) { return m3_identity(); }
+        var up = (1023 + 1023) << 52;   # 2^1023
+        nx = f64_mul(nx, up); ny = f64_mul(ny, up); nz = f64_mul(nz, up);
+        norm = lie_norm3(nx, ny, nz);
     }
     var inv = f64_div(F64_ONE, norm);
+    if (f64_eq(inv, 0) == 1) {
+        var dn = (1023 - 600) << 52;    # 2^-600
+        nx = f64_mul(nx, dn); ny = f64_mul(ny, dn); nz = f64_mul(nz, dn);
+        inv = f64_div(F64_ONE, lie_norm3(nx, ny, nz));
+    }
     nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
 
     var c = f64_cos(angle);
@@ -196,8 +214,26 @@ public fn so3_inverse(r) { return m3_transpose(r); }
 public fn so3_exp(omega) {
     var ox = HVec3_x(omega); var oy = HVec3_y(omega); var oz = HVec3_z(omega);
     var theta = lie_norm3(ox, oy, oz);
-    if (f64_lt(theta, F64_TINY) == 1) {
+    # ⛔ 3.3.4 — THIS WAS `theta < F64_TINY`, AND IT RETURNED THE IDENTITY FOR A NON-ZERO
+    # SUBNORMAL omega, whose rotation carries omega_k off the diagonal: 52 of 52 binades of
+    # (2^-k, 0, 0), k = 1023 .. 1074 (audit D086). Only omega = 0 has the identity for its
+    # exponential.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⭐ Below DBL_MIN the answer is I + [omega]x to the last bit: sin(theta)/theta is within
+    # 2^-2044 of 1, and (1 - cos(theta))/theta^2 * omega_i * omega_j is below 2^-2044, so an
+    # off-diagonal entry's nearest double is +-omega_k itself (a zero entry's sign aside) and a
+    # diagonal one's is 1. Through `so3_from_axis_angle` the entry is sin(theta) * n_k, rounded
+    # twice on the subnormal grid: 350 of 3,342 subnormal omegas came back one ulp off there.
+    # [measured: verify-liever scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    if (f64_eq(theta, 0) == 1) {
         return m3_identity();
+    }
+    if (f64_lt(theta, F64_TINY) == 1) {
+        var m = m3_identity();
+        m3_set(m, 0, 1, oz); m3_set(m, 1, 0, f64_neg(oz));
+        m3_set(m, 2, 0, oy); m3_set(m, 0, 2, f64_neg(oy));
+        m3_set(m, 1, 2, ox); m3_set(m, 2, 1, f64_neg(ox));
+        return m;
     }
     return so3_from_axis_angle(omega, theta);
 }
@@ -248,7 +284,8 @@ public fn so3_log(R) {
     # each laundered a NaN off-diagonal entry differently. The first returned the zero
     # vector for the identity with one NaN off the diagonal. The second sent a NaN
     # `asym` into the eigenvector branch, which scales by `theta` — and ganita's
-    # `atan2(NaN, 0)` is -pi/2, not NaN (roadmap D140) — so the EXACT quarter-turn
+    # `atan2(NaN, 0)` was -pi/2, not NaN, through ganita 1.2.10 (D140; NaN from 1.2.11,
+    # cyrius 6.6.13, and a consumer pinned below 6.6.13 still gets -pi/2) — so the EXACT quarter-turn
     # Rz(pi/2) with one NaN off the diagonal came back finite: (-0, -0, -pi/2), a
     # rotation by the right angle in the wrong direction, or (-1.11, -1.11, -0).
     # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
@@ -558,7 +595,7 @@ public fn se3_log(se) {
     # w = -1 and a vector part below 2*pi/DBL_MAX (~2^-1021.4) su2_log's sc overflowed,
     # and 3.3.2's omega was (+Inf, NaN, NaN). 3.3.3's rescue makes that omega right, a
     # turn of 2*pi, where the V inverted below is singular, and v then came from how
-    # `f64_tan` rounds at pi rather than from the element: with t = (1, 2, 3), x = 2^-1054
+    # the tangent rounds at pi rather than from the element: with t = (1, 2, 3), x = 2^-1054
     # gave v = (1, -5.1e16, -7.7e16) under cycc 6.6.12 and another v under 6.6.3, where the
     # true |v| is 2.2e318. se3_exp of that twist moved t to (1, 3.7e-16, -2.4e-16).
     # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-01; cycc 6.6.12 and 6.6.3]
@@ -600,7 +637,8 @@ public fn se3_log(se) {
     var K2 = m3_mul(K, K);
     var theta2 = f64_mul(theta, theta);
     var half_theta = f64_mul(theta, F64_HALF);
-    var tan_half = f64_tan(half_theta);
+    # The sin/cos quotient hisab's `f64_tan` computed until 3.3.4 (f64_util.cyr says why).
+    var tan_half = f64_div(f64_sin(half_theta), f64_cos(half_theta));
 
     # ⭐ THE OLD CODE ALREADY HAD A ONE-TERM SERIES — `c = 1/12` — but reached it
     # only when |tan(theta/2)| < 1e-12, i.e. theta < 2e-12, while the closed form

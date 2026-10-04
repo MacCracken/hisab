@@ -6,7 +6,21 @@ type: state
 
 # Documentation Health — hisab
 
-> **Last refresh**: 2026-10-01 — **v3.3.3: silent wrong answers in linalg, num and calc; the NaN-true
+> **Last refresh**: 2026-10-03 — **v3.3.4: toolchain 6.6.14 (ganita 1.2.11), the [3.3.4] roadmap
+> rows, the atan2 filing closed.**
+> - **Numbers**: suites **7073/7073** across six harnesses (modules split into `modules.tcyr` +
+>   `modules_b.tcyr` for the 1028 KB lint cap), constants 177/177, public surface 703 declarations
+>   (846 probes, 616/616 non-public refused). Bundle 33,862 lines, 1,608,855 B.
+> - **Docs touched**: CHANGELOG (entry), roadmap closeout (the [3.3.4] section removed; carried list
+>   at the top of [3.3.5]; [3.4.0] D015/D069/D070/D088 notes; the abaco-bridge row [3.7.0]; Decisions
+>   owed renumbered after #4 and #6 closed; Toolchain tracked upstream: four open filings),
+>   dependency-watch (6.6.14 entry, caps, math row), CLAUDE.md (pin, math line, Consumers bullet,
+>   duplicate gate, suite layout), README / CONTRIBUTING / testing counts and pins, SECURITY count,
+>   threat model (supply chain, 3.3.4 entry, f64_tan row), overview, math.md (CGA null test and q/2
+>   range), migration-3.0 (pin-dependent results) and migration-3.3 (`f64_tan`), port-audit (bayan
+>   JSON, the bridge decision), four new issue records and one archived (atan2).
+>
+> **Previous refresh**: 2026-10-01 — **v3.3.3: silent wrong answers in linalg, num and calc; the NaN-true
 > guard class; the 3.3.2 leftovers.** The ten [3.3.3] rows and the approved leftovers, by file-disjoint
 > groups, then two adversarial reviews; the last round held "no input worse than 3.3.2".
 > - **Numbers**: suites **6038/6038**, constants 161/161, public surface 704 declarations (847 probes,

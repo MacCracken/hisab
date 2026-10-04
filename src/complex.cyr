@@ -188,11 +188,179 @@ public fn cx_ln(a) {
     return cx_new(f64_ln(cx_abs(a)), cx_arg(a));
 }
 
+# cx_sqrt's rescaling. Every factor is a power of two, so scaling the input by 4^-k
+# and the result by 2^k changes no bits wherever nothing is subnormal.
+var _CX_SQRT_BIG = 0x7FC0_0000_0000_0000;      # 2^1021
+var _CX_SQRT_SMALL = 0x0020_0000_0000_0000;    # 2^-1021
+var _CX_SQRT_QUARTER = 0x3FD0_0000_0000_0000;  # 0.25
+var _CX_SQRT_UP = 0x4350_0000_0000_0000;       # 2^54
+var _CX_SQRT_UP_ROOT = 0x3E40_0000_0000_0000;  # 2^-27
+var _CX_SQRT_UP_DIV = 0x41B0_0000_0000_0000;   # 2^28
+
+# C99 G.6.4.2 for an operand with a non-finite part. The rows are tested in the
+# table's precedence: an infinite imaginary part decides the answer whatever the real
+# part is, a NaN one included, so it goes first.
+# ⚠ NaN CHOICE. C99 asks only for "a NaN"; this returns the NaN OPERAND, the real
+# part's when it has one, in every NaN slot, QUIETED: the quiet bit (bit 51) is set and
+# the payload and sign kept. Those are the bits the polar form's arithmetic handed back,
+# a signaling NaN's included -- returning the operand raw would hand a signaling NaN
+# out of an arithmetic function, which IEEE 754 forbids. For -Inf + i NaN, where C99
+# leaves the sign of the infinite imaginary part unspecified, it takes the sign BIT of
+# the NaN, so csqrt(conj z) = conj(csqrt z) holds there too.
+# [measured: scratch csqrt probe (special-value table), 2026-10-03; cycc 6.6.14]
+fn _cx_sqrt_nonfinite(x, y) {
+    var qx = x | 0x0008_0000_0000_0000;   # x with its quiet bit set; unchanged unless x is NaN
+    var qy = y | 0x0008_0000_0000_0000;
+    # csqrt(x + i Inf) = +Inf + i Inf, for EVERY x.
+    if (f64_eq(f64_abs(y), F64_POS_INF) == 1) { return cx_new(F64_POS_INF, y); }
+    # csqrt(NaN + i y) = NaN + i NaN.
+    if (f64_eq(x, x) == 0) { return cx_new(qx, qx); }
+    # A finite x reaches here only with a NaN y: NaN + i NaN.
+    if (f64_eq(f64_abs(x), F64_POS_INF) == 0) { return cx_new(qy, qy); }
+    if (f64_lt(x, 0) == 1) {
+        # csqrt(-Inf + i y) = +0 + i Inf with y's sign; for a NaN y, NaN +- i Inf.
+        if (f64_eq(y, y) == 0) { return cx_new(qy, f64_copysign(F64_POS_INF, y)); }
+        return cx_new(0, f64_copysign(F64_POS_INF, y));
+    }
+    # csqrt(+Inf + i y) = +Inf + i 0 with y's sign; for a NaN y, +Inf + i NaN.
+    if (f64_eq(y, y) == 0) { return cx_new(F64_POS_INF, qy); }
+    return cx_new(F64_POS_INF, f64_copysign(0, y));
+}
+
+# ⛔ 3.3.4 — THIS WAS `cx_from_polar(sqrt|a|, arg(a)/2)`, and the polar form cannot
+# land ON an axis: cos(fl(pi)/2) is about 6e-17, not 0, so sqrt(-4 + 0i).re came back
+# 0x3CA1A62633145C07 where C99 csqrt gives +0. Near the negative real axis the real
+# part is r*cos(theta/2) with theta/2 within an ulp of pi/2, so its RELATIVE error had
+# no bound at all: over a two-sided binade grid of 506944 points, 121520 real parts
+# were more than 2^40 ulp out or not finite. The special values were wrong too:
+# csqrt(+Inf + i y) had a NaN imaginary part (Inf * sin 0), csqrt(-Inf + i y) was
+# +Inf + i Inf for +0 + i Inf, and wherever |z| overflowed near DBL_MAX the root came
+# back infinite.
+# [measured: scratch csqrt probe (Decimal oracle, prec 110), not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+#
+# ⭐ CACM ALGORITHM 312 (Friedland 1967), the form FreeBSD msun's s_csqrt.c uses; the
+# special values follow C99 G.6.4.2 (Kahan's 1987 branch-cut rules).
+# For x >= 0, t = sqrt((x + |z|)/2) and the root is (t, y/(2t)); for x < 0,
+# t = sqrt((|z| - x)/2) and it is (|y|/(2t), copysign(t, y)). Both sums add two
+# non-negative numbers, so nothing cancels. The axes come out exact: on the real axis
+# |z| = |x|, so t is sqrt(|x|) correctly rounded and the other part an exact zero with
+# its sign; on the imaginary axis both parts are sqrt(|y|/2), so t is returned twice
+# (y/(2t) can sit an ulp away from t). The sign comes from y's sign BIT, never an
+# ordered compare, which would send sqrt(-4 - 0i) to +2i instead of -2i.
+#
+# ⭐ POWER-OF-FOUR SCALING. x + |z| overflows once max(|x|, |y|) passes
+# DBL_MAX/(1 + sqrt 2), so from 2^1021 up the input is scaled by 1/4 and the root by 2.
+# Below 2^-1021 the halving (x + |z|)/2 can go subnormal and drop a bit, so the input
+# is scaled by 2^54 and the root by 2^-27; that bound is sharp, and 2^-1022 leaves roots
+# an ulp out. The quotient part divides by the SCALED 2t instead of being scaled
+# afterwards, so a subnormal result is rounded once, not twice. Zeros take the
+# up-scaled path too and come out exact: an explicit zero row changed no bits.
+# [measured: scratch csqrt probe (mutation run), 2026-10-03; cycc 6.6.14]
+#
+# ⚠ ACCURACY, ON THE SAMPLED SETS (a two-sided binade grid, the axes, random and
+# near-axis points): every component within 2.16 ulp of the Decimal oracle and 80-82%
+# correctly rounded (glibc 2.44's csqrt on the same points: 80-82%, at most 1.95 ulp,
+# bit-identical to this on 96.7% or more); every axis point correctly rounded with the
+# C99 zero sign. It is not a bound: a targeted search on |x| << |y| finds 2.43 ulp at
+# cx_sqrt(0xBF81197459105F69 + 0xBFE03CFA7141501E i).re, where glibc is 0.43 ulp out and
+# the polar form 2.57. Nor is it closer than the polar form at every point: on 0.1-4.1%
+# of points, by component and depending on the set, the polar form had landed more than
+# 0.5 ulp closer, by at most 2 ulp.
+# [measured: scratch csqrt probe + independent check (10M-point search), 2026-10-03; cycc 6.6.14]
 #must_use
 public fn cx_sqrt(a) {
-    var r = f64_sqrt(cx_abs(a));
-    var theta = f64_mul(cx_arg(a), F64_HALF);
-    return cx_from_polar(r, theta);
+    var x = HComplex_re(a);
+    var y = HComplex_im(a);
+    var ax = f64_abs(x);
+    var ay = f64_abs(y);
+    if (f64_lt(ax, F64_POS_INF) == 0 || f64_lt(ay, F64_POS_INF) == 0) { return _cx_sqrt_nonfinite(x, y); }
+    var m = ax;
+    if (f64_lt(m, ay) == 1) { m = ay; }
+    var s = F64_ONE;    # the root's scale
+    var ds = F64_TWO;   # the divisor's: 2t comes out as t * ds, which is 2t / s
+    var r = 0;
+    if (f64_lt(m, _CX_SQRT_BIG) == 0) {
+        x = f64_mul(x, _CX_SQRT_QUARTER);
+        y = f64_mul(y, _CX_SQRT_QUARTER);
+        s = F64_TWO;
+        ds = F64_ONE;
+        r = cx_abs(cx_new(x, y));
+    } else {
+        if (f64_lt(m, _CX_SQRT_SMALL) == 1) {
+            x = f64_mul(x, _CX_SQRT_UP);
+            y = f64_mul(y, _CX_SQRT_UP);
+            s = _CX_SQRT_UP_ROOT;
+            ds = _CX_SQRT_UP_DIV;
+            r = cx_abs(cx_new(x, y));
+        } else {
+            r = cx_abs(a);
+        }
+    }
+    var t = 0;
+    if (f64_lt(x, 0) == 1) {
+        t = f64_sqrt(f64_mul(f64_sub(r, x), F64_HALF));
+        return cx_new(f64_div(f64_abs(y), f64_mul(t, ds)), f64_copysign(f64_mul(t, s), y));
+    }
+    t = f64_sqrt(f64_mul(f64_add(x, r), F64_HALF));
+    var u = f64_mul(t, s);
+    # The imaginary axis, and csqrt(+-0 + i 0) = +0 + i 0 with it: -0 + 0 is +0, so t
+    # is +0 and y's sign bit is the only sign the root of a zero carries.
+    if (f64_eq(x, 0) == 1) { return cx_new(u, f64_copysign(u, y)); }
+    return cx_new(u, f64_div(y, f64_mul(t, ds)));
+}
+
+# From here up every f64 is a whole multiple of 4.
+var _CX_POWF_WHOLE_TURNS = 0x4350_0000_0000_0000;  # 2^54
+
+# ⛔ 3.3.4 — THE POLAR FORM CANNOT LAND ON AN AXIS. arg(i) is fl(pi/2), not pi/2, so
+# cx_powf(i, 2) was -1 + 0x3CA1A62633145C07 i rather than -1 + 0i, (-4 + 0i)^0.5 had
+# the real part 0x3CA1A62633145C07 where csqrt gives +0, and cx_powf(i, 2^60) -- a
+# whole number of turns -- was 0x3FB6F22BC9948F49 + 0xBFEFDF06B916C886 i, an arbitrary
+# point on the unit circle, because 2^60 * fl(pi/2) is 70.6 radians from 2^59 * pi.
+# An overflowing r turned the stray 1e-16 into an infinity: cx_powf(1e200 i, 2) was
+# -Inf + Inf i. glibc 2.44's cpow gives the same answers on these rows, and C99 does
+# not specify cpow's accuracy, so this is an improvement, not a conformance repair.
+# [measured: scratch csqrt probe (cx_powf differential), not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+#
+# ⭐ When z is EXACTLY on the negative real or the imaginary axis -- a zero part, not
+# an angle that merely rounds to fl(pi) -- arg z is q quarter turns (q = +-2 or +-1),
+# and z^n is on an axis whenever k = n*q is a whole number: the point r * i^k. The zero
+# part takes its sign from the side n*arg(z) reaches the axis from: y's sign bit on the
+# negative real axis, x's on the imaginary one, and a negative n turns the other way.
+# Those are the signs IEEE repeated multiplication gives -- (+0 + 2i)^2 = -4 + 0i,
+# (-0 + 2i)^2 = -4 - 0i -- and on k = 1 (n = 0.5) the signs csqrt gives. Returns 0 for
+# every other input, which then takes the polar form exactly as before.
+fn _cx_powf_axis(a, n, r) {
+    var x = HComplex_re(a);
+    var y = HComplex_im(a);
+    var q = 0;
+    var dir = 0 - 1;   # -1: n*arg(z) reaches the axis from below; +1: from above
+    if (f64_eq(y, 0) == 1 && f64_lt(x, 0) == 1) { q = 2; }
+    if (f64_eq(x, 0) == 1 && f64_eq(y, y) == 1) {
+        q = 1;
+        if (((x >> 63) & 1) == 1) { dir = 1; }
+    }
+    if (q == 0) { return 0; }
+    if (((y >> 63) & 1) == 1) { q = 0 - q; dir = 0 - dir; }
+    if (((n >> 63) & 1) == 1) { dir = 0 - dir; }
+    # Only k mod 4 picks the axis. Below 2^54, n*q is exact and f64_to cannot
+    # overflow; from 2^54 up n is a multiple of 4, so k is too. An infinite n turns
+    # without end and has no axis; a NaN n fails both compares and has none either.
+    var j = 0;
+    if (f64_lt(f64_abs(n), _CX_POWF_WHOLE_TURNS) == 1) {
+        var k = f64_mul(n, f64_from(q));
+        if (f64_eq(f64_trunc(k), k) == 0) { return 0; }
+        j = f64_to(k) & 3;
+    } else {
+        if (f64_lt(f64_abs(n), F64_POS_INF) == 0) { return 0; }
+    }
+    var zs = 0;
+    if (dir < 0) { zs = 0x8000_0000_0000_0000; }
+    var zo = zs ^ 0x8000_0000_0000_0000;
+    if (j == 0) { return cx_new(r, zs); }
+    if (j == 1) { return cx_new(zo, r); }
+    if (j == 2) { return cx_new(f64_neg(r), zo); }
+    return cx_new(zs, f64_neg(r));
 }
 
 #must_use
@@ -217,6 +385,22 @@ public fn cx_powf(a, n) {
     if (f64_eq(m, 0) == 1) { return cx_zero(); }
     var r = ganita_f64_pow(m, n);
     var theta = f64_mul(cx_arg(a), n);
+    # ⛔ 3.3.4 — A ZERO ANGLE MADE A NaN FROM NON-NaN INPUT. cx_from_polar computes
+    # r * sin(0), and once r is +Inf -- cx_powf(+Inf + 0i, 2), or 2^n overflowing at
+    # cx_powf(2 + 0i, 1e300) -- that is Inf * 0 = NaN, where a power of a positive
+    # real is a positive real. ⭐ For a finite r the polar form returns (r * 1, r * +-0)
+    # = (r, theta) bit for bit, so returning that directly changes no other bits and
+    # carries the same answer up to r = +Inf.
+    # ⚠ Both new paths are taken only for a non-NaN r. Under the ganita a consumer on
+    # cyrius 6.6.3 or 6.6.6 compiles, ganita_f64_pow(+Inf, n) is NaN, and either path
+    # would turn that NaN + NaN i into a half-NaN result; a NaN r keeps the polar form,
+    # so those pins see 3.3.3's bits.
+    # [measured: scratch cx_powf differential, 2026-10-03; cycc 6.6.3, 6.6.6, 6.6.14]
+    if (f64_eq(r, r) == 1) {
+        if (f64_eq(theta, 0) == 1) { return cx_new(r, theta); }
+        var ax = _cx_powf_axis(a, n, r);
+        if (ax != 0) { return ax; }
+    }
     return cx_from_polar(r, theta);
 }
 

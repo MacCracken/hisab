@@ -9,7 +9,7 @@ differential geometry, symbolic algebra.
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (sovereign systems language, compiled by cycc)
-- **Toolchain**: Cyrius 6.6.12 (`cyrius.cyml: cyrius = "6.6.12"`)
+- **Toolchain**: Cyrius 6.6.14 (`cyrius.cyml: cyrius = "6.6.14"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
 - **Status**: kept elsewhere on purpose. Current numbers (suite counts, gates, toolchain,
   consumer pins) live in `docs/development/roadmap.md` § Current and § Consumers, the bundle size
@@ -29,8 +29,10 @@ releases running. `grep -l '^\[deps\.hisab\]' ~/Repos/*/cyrius.cyml` finds the d
   (`public struct` + `#derive`). Build the regenerated bundle and a small cross-module program from
   scratch dirs pinned to every consumer pin from 6.6.3 up, not only under hisab's pin — and confirm
   6.6.2 still refuses it with the known `#derive` error rather than something new.
-- Workarounds for compiler defects (`m3_mul_vec3`'s hoisted z tail, `_cga_build_null_tbl`'s guard
-  form) stay while consumers sit below the fix; their comments say why, not that they are required.
+- Workarounds for compiler defects (`m3_mul_vec3`'s hoisted z tail) stay while a consumer that can
+  compile the current bundle sits below the fix; their comments say why, not that they are required.
+  A workaround for a defect fixed at or below the bundle's own floor protects no one: revert it, or
+  keep it only for a reason its comment states (3.3.4 reverted `_cga_build_null_tbl`'s guard form).
 - impetus, kiran, joshua, hisab-mimamsa and kana are **not** consumers — Rust repos with no
   `cyrius.cyml`. aethersafha is a Cyrius port now, but declares no `[deps.hisab]`. abaco calls hisab
   a sibling, not a dependency.
@@ -52,8 +54,9 @@ cyrius fuzz                              # run fuzz harnesses (walks tests/, nee
   `alloc`, `str`, `fmt`, `vec`, `io`, `args`, `assert`, `math`, `ganita`, `tagged`, `result`,
   `fnptr`, `bench`, `callback`. `ganita` is the math umbrella — transcendentals plus the full
   `matrix`/`linalg` API; do **not** also list `matrix` or `linalg` (duplicate-definition
-  collisions). `math` stays for the inclusive comparisons, clamp/lerp/min/max/sign and the
-  polyfills. `result` is required since 3.0.0 (`Result<T, E>`).
+  collisions). `math` stays for clamp/lerp/min/max/sign, the polyfills and the f64 constants, and
+  supplies `f64_le`/`f64_ge`/`f64_trunc` to consumers on cyrius ≤ 6.6.12 (compiler builtins and
+  reserved names from 6.6.13). `result` is required since 3.0.0 (`Result<T, E>`).
 - **sakshi** — structured logging (first-party). Nothing in hisab calls it; keep the dependency
   anyway.
 
@@ -82,7 +85,9 @@ examples/            — small demos (basic_math.cyr)
 tests/
   hisab.tcyr         — primary assertion suite
   foundation.tcyr    — vec/quat/mat foundations
-  modules.tcyr       — per-module coverage
+  modules.tcyr       — per-module coverage (first half)
+  modules_b.tcyr     — per-module coverage (second half; split in 3.3.4 to stay under
+                       cyrlint/cyrfmt's 1028 KB input cap)
   edge_cases.tcyr    — degenerate inputs, boundary values
   abuse.tcyr         — negative indices, zero/huge dims, non-conformable
                        operands, the designed-0 return, canary checks
@@ -285,7 +290,7 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
 
 **Toolchain**
 - **The user decides when the toolchain pin moves and to which version — never bump it unasked.**
-  **Bump procedure**, once asked: capture the five suites' output under the old pin first; set the pin;
+  **Bump procedure**, once asked: capture every suite's output under the old pin first; set the pin;
   `cyrius lib sync` (the declared subset — never `--full`); `cyrius deps`; byte-compare every
   `lib/*.cyr` against the cyrius **tag** (`git -C ~/Repos/cyrius show "<pin>:lib/<f>"`) and
   `sakshi.cyr` against its tag's `dist/` — never against `~/.cyrius/versions/<pin>/lib`, which is
@@ -331,7 +336,7 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.6.12"` in `cyrius.cyml`. CI and release both grep the manifest;
+- **Toolchain pin**: `cyrius = "6.6.14"` in `cyrius.cyml`. CI and release both grep the manifest;
   no versions are hardcoded in YAML
 - **Toolchain install**: both workflows pipe the pin into the **upstream installer**
   (`curl -sSf .../cyrius/main/scripts/install.sh | CYRIUS_VERSION="$PIN" sh`), which verifies the
@@ -370,7 +375,8 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   bundle header is stamped from it)
 - **Consumer-build, `#must_use` and duplicate-symbol gates**: `cyrius check --with-deps` on the bundle
   (and the examples), failing on a compile error, a discarded `#must_use` result (a *compiler*
-  diagnostic lint cannot see) or a `duplicate symbol` warning
+  diagnostic lint cannot see) or a `duplicate symbol` / `duplicate fn` warning (a duplicate fn was
+  invisible to the gate until 3.3.4, when hisab's `f64_tan` silently replaced ganita 1.2.11's)
 - **CGA derivation gate**: `./scripts/derive-cga-null-table.sh`
 - **Measurement gates**: every push to `main` and every pull request fails on a broken
   `[measured: …]` marker; pull requests also run

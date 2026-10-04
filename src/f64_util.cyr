@@ -2,9 +2,11 @@
 # Usage: shipped inside dist/hisab.cyr; in-tree, include "src/f64_util.cyr" after what it requires
 # Requires: no other hisab module (stdlib resolves via cyrius.cyml [deps])
 #
-# Note: `f64_le` / `f64_ge` used to live here — they are now provided
-# (NaN-correctly) by the stdlib `math` module as of Cyrius 6.2.x, so the
-# local copies were removed to avoid a duplicate-definition collision.
+# Note: `f64_le` / `f64_ge` used to live here. Cyrius 6.2.x put NaN-correct copies in
+# the stdlib `math` module, so the local ones were removed to avoid a duplicate
+# definition. From cyrius 6.6.13 they (and `f64_trunc`) are compiler builtins and
+# reserved names: defining one is a compile error, not a collision. A consumer on
+# 6.6.2..6.6.12 still gets them from `math`.
 # Transcendentals (`ganita_f64_acos`, `ganita_f64_pow`, `ganita_f64_atan2`,
 # `ganita_f64_cosh`, `ganita_f64_sinh`, …) come from the stdlib `ganita` module.
 #
@@ -14,35 +16,101 @@
 # elsewhere in this tree are deliberate HISTORY -- they describe what a past ganita
 # version did, under the name it had then -- and are not call sites.
 
-# tan(x) = sin(x) / cos(x)
-public fn f64_tan(x) {
-    return f64_div(f64_sin(x), f64_cos(x));
-}
+# ⛔ 3.3.4 — `f64_tan` IS NOT DEFINED HERE ANY MORE. ganita 1.2.11 (cyrius >= 6.6.13)
+# defines its own `f64_tan`, an alias of the fdlibm `ganita_f64_tan`, and hisab's
+# sin/cos quotient beside it drew `duplicate fn 'f64_tan'` on every build. Last
+# definition wins, so hisab's replaced ganita's for the whole program, a consumer's
+# own calls included. CI's duplicate gate greps `duplicate symbol` and never saw it.
+# The three callers (m4_perspective_rh, m4_perspective_reverse_z, se3_log) inline the
+# same quotient, so their bits are unchanged on every pin. They do not call
+# `ganita_f64_tan`: it does not exist below cyrius 6.6.13, every consumer pin is below
+# that, and a consumer build reaching those three functions is then refused a binary
+# (`refusing to emit binary with 1 reachable undefined function(s)`). A consumer
+# calling `f64_tan` gets ganita's from 6.6.13. Below it, a reachable call is refused
+# the same way, and an unreachable one draws `warning: undefined function 'f64_tan'`.
+# [measured: scratch probes pinned to cycc 6.6.2..6.6.14, 2026-10-03]
 
-# fmod(x, y) = x - trunc(x/y) * y. Returns 0 if y == 0.
+# fmod(x, y) -- the C99 7.12.10.1 fmod: the remainder of TRUNCATED division, x - n*y for
+# the integer n = trunc(x/y), computed EXACTLY (it is always representable). IEEE-754's
+# `remainder` is a different operation: it rounds the quotient to nearest. The sign is
+# the sign of x, a zero result included: fmod(-6, 3) is -0.
+#   fmod(x, ±Inf) = x for finite x;  fmod(±Inf, y) = 0xFFF8000000000000, the default NaN
+#   x86-64 glibc and the 3.3.3 body return.
+#   NaN in, NaN out: x's NaN if x is one, else y's, with the quiet bit (bit 51) set and
+#   the sign and payload kept -- the operand and the bits x86-64 glibc returns.
+# Outside y = ±0, every result is glibc's bit for bit, NaNs included: no difference in
+# 279,211 pairs spanning every exponent, the subnormals, exact multiples, ±0, ±Inf and NaN
+# payloads, under cycc 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12 and 6.6.14. The 3.3.4 rows of
+# the f64_fmod group in tests/modules.tcyr pin those values.
+# [measured: scratch oracle sweep vs glibc 2.44 fmod, x86-64, 2026-10-03; not reproducible in-tree]
 #
-# TRUNC, not floor. They diverge for every non-integer negative quotient, and the
-# difference is not a rounding detail: floor gives the sign of the DIVISOR while
-# C/IEEE-754 fmod (which this function's name promises) gives the sign of the
-# DIVIDEND. fmod(-7, 3) is -1, not the +2 the floor form returned through 2.6.15.
+# ⚠ y = ±0 returns +0 for EVERY x, NaN and ±Inf included, where C returns NaN. That is
+# the contract this function has kept since the 2026-04-15 audit (H7), and it is
+# KEPT: it is a fabricated answer of the [3.4.0] D069 kind, and changing it is a
+# contract break for that row to decide. The `hy == 0` return must stay ahead of the
+# normalisation either way: on my = 0 the y-normalisation loop below would never end.
+#
+# Integer bit operations only, in fdlibm's e_fmod shape: unpack both magnitudes,
+# shift-subtract once per binade of exponent gap, renormalise. No f64 arithmetic, so the
+# bits do not depend on the consumer's cycc pin, stdlib or target. A ±Inf divisor needs
+# no branch of its own: every finite |x| is below it, so it returns x.
+#
+# History: it was x - floor(x/y)*y through 2.6.15, which takes the sign of the DIVISOR
+# (fmod(-7, 3) gave +2), and x - trunc(x/y)*y from 2.7.0. That form rounds x/y, so it
+# was not fmod either: fmod(1, 0.1) gave +0 where C gives 0x3FB9999999999996, a zero
+# result was always +0, fmod(3, +Inf) gave NaN and fmod(DBL_MAX, 3 * 2^-1074) -Inf; it
+# differed from glibc in 158,102 of the 279,211 pairs above.
+# [measured: CHANGELOG.md 2.7.0; the 3.3.3 body beside this one in that scratch sweep, 2026-10-03]
+#
+# 2.15.0 replaced the trunc form's |y| < 1e-12 zero guard, which fabricated 0 for small
+# divisors, with the exact-zero test kept below; the bit form and `f64_eq(y, 0)` are
+# equivalent, since -0.0 compares equal to +0.0.
+# [measured: docs/audit/2026-09-09-epsilon-open.json]
 public fn f64_fmod(x, y) {
-    # ⛔ The header says "Returns 0 if y == 0" and the code tested `|y| < 1e-12`.
-    # The trunc formula is bit-exact at every representable scale including the
-    # whole subnormal range, so ANY threshold above zero fabricates a 0 over a
-    # region that computes correctly — measured, 1e-12 does it over 978 scales and
-    # DBL_MIN still does it over 50. ⚠ And DBL_MIN buys nothing it claims to: it
-    # does not bound the overflow it is supposed to guard (y = 1e-300 is normal,
-    # yet x = 1e10 already gives -inf), so where it fires it only replaces a
-    # DETECTABLE -inf with an UNDETECTABLE 0 — the very class it was meant to fix.
-    # ⚠ The bit form is a STYLE choice, not a correctness one, and the mutation
-    # run said so: `f64_eq(y, 0)` is an equivalent mutant, because IEEE-754 makes
-    # -0.0 compare EQUAL to +0.0. It is kept only because it matches the shape
-    # `f64_copysign` already uses two functions down. An earlier draft of this
-    # comment claimed the bit form was needed to catch -0.0; that was wrong.
-    # [measured: docs/audit/2026-09-09-epsilon-open.json]
-    if ((y & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 0; }
-    var q = f64_trunc(f64_div(x, y));
-    return f64_sub(x, f64_mul(q, y));
+    var hy = y & 0x7FFF_FFFF_FFFF_FFFF;
+    if (hy == 0) { return 0; }
+    var sx = x & 0x8000_0000_0000_0000;
+    var hx = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (hx >= 0x7FF0_0000_0000_0000 || hy > 0x7FF0_0000_0000_0000) {
+        if (hx > 0x7FF0_0000_0000_0000) { return x | 0x0008_0000_0000_0000; }
+        if (hy > 0x7FF0_0000_0000_0000) { return y | 0x0008_0000_0000_0000; }
+        return 0xFFF8_0000_0000_0000;
+    }
+    if (hx < hy) { return x; }
+    # Each magnitude is m * 2^(e - 1075): the implicit bit joins a normal mantissa, and a
+    # subnormal takes e = 1 without it. A subnormal x needs nothing more, since |x| >= |y|
+    # makes y subnormal too. y is normalised, so the loop's mx < 2*my holds from the start.
+    var ex = hx >> 52;
+    var mx = hx & 0x000F_FFFF_FFFF_FFFF;
+    if (ex == 0) { ex = 1; } else { mx = mx | 0x0010_0000_0000_0000; }
+    var ey = hy >> 52;
+    var my = hy & 0x000F_FFFF_FFFF_FFFF;
+    if (ey == 0) {
+        ey = 1;
+        while (my < 0x0010_0000_0000_0000) { my = my << 1; ey = ey - 1; }
+    } else { my = my | 0x0010_0000_0000_0000; }
+    # One step per binade of exponent gap: subtract my when it fits, then double. The gap
+    # is at most 2097 (DBL_MAX's biased exponent 2046 less 2^-1074's normalised -51).
+    # Branchless, as `_num_mulmod` is: t's sign bit is the data-dependent choice.
+    var n = ex - ey;
+    var t = 0;
+    while (n > 0) {
+        t = mx - my;
+        mx = (t + (my & (0 - (t >> 63)))) << 1;
+        n = n - 1;
+    }
+    t = mx - my;
+    mx = t + (my & (0 - (t >> 63)));
+    # A zero remainder returns here, which also keeps the renormalisation loop finite.
+    if (mx == 0) { return sx; }
+    # Renormalise. The remainder is a whole multiple of y's quantum, so a result below
+    # the normal range drops only zero bits when it is shifted down to a subnormal.
+    while (mx < 0x0010_0000_0000_0000) { mx = mx << 1; ey = ey - 1; }
+    # `ey >= 1` and `ey > 1` are equivalent mutants: at ey = 1 the subnormal arm returns
+    # sx | mx, and mx's bit 52 is exactly the exponent field 1.
+    # [measured: scratch mutation run, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    if (ey >= 1) { return sx | (ey << 52) | (mx & 0x000F_FFFF_FFFF_FFFF); }
+    return sx | (mx >> (1 - ey));
 }
 
 # copysign(x, y) -- magnitude of x, sign of y.

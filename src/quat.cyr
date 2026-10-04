@@ -8,10 +8,10 @@
 # No module-local threshold. From 2.11.1 a `_QUAT_F64_TINY` (DBL_MIN: a literal through
 # 2.13.0, an alias of error.cyr's F64_TINY from 2.14.0) stood here, and `hquat_normalize`
 # (on |q|) and `hquat_inverse` (on |q|²) returned the identity below it; 2.17.0 removed
-# it. Now `hquat_normalize` returns the identity only where 1/|q| overflows (|q| = 0, or
-# |q| <= 2^-1024), and `hquat_length` and `hquat_inverse` use F64_TINY directly, to
-# choose between their direct and rescaled paths (`hquat_inverse` still returns the
-# identity at |q| = 0).
+# it. From 2.17.0 to 3.3.3 `hquat_normalize` returned the identity wherever 1/|q|
+# overflows (|q| = 0, or |q| <= 2^-1024); since 3.3.4 only at |q| = 0. `hquat_length`
+# and `hquat_inverse` use F64_TINY directly, to choose between their direct and
+# rescaled paths (`hquat_inverse` still returns the identity at |q| = 0).
 
 #derive(accessors)
 public struct HQuat { x; y; z; w; }
@@ -127,6 +127,15 @@ public fn hquat_length(q) {
     return f64_sqrt(ls);
 }
 
+# q * s normalised, for an exact power of two s: `hquat_normalize`'s two ends (3.3.4).
+fn _hquat_scaled_unit(q, s) {
+    var t = alloc(sizeof(HQuat));
+    f64v_scale(t, q, s, 4);
+    var r = alloc(sizeof(HQuat));
+    f64v_scale(r, t, f64_div(F64_ONE, hquat_length(t)), 4);
+    return r;
+}
+
 #must_use
 # 2.11.1: threshold was EPSILON_F64 (1e-12), which fabricated the identity for
 # any quaternion shorter than that even though the division is well-defined far
@@ -146,10 +155,22 @@ public fn hquat_length(q) {
 # ⚠ `f64_eq(|inv|, +Inf)` and not the tempting `f64_lt(|inv|, +Inf) == 0`: the
 # latter is false for NaN too, and this API's contract is NaN in, NaN out.
 # [measured: 48-binade subnormal sweep against the vec3 control, 2026-09-10]
+# ⛔ 3.3.4 — AND THE TWO THEN AGREED ON THE WRONG ANSWER: both returned their fallback,
+# here the IDENTITY, for 47 of those 48 magnitudes, every non-zero |q| <= 2^-1024. A
+# finite quaternion whose norm passes DBL_MAX came back as the ZERO quaternion
+# (inv = 1/Inf = 0), which is not a unit at all. Audit D087.
+# [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+# ⭐ The `hvec3_normalize` repair: normalise an exactly scaled copy, by 2^1023 where
+# 1/|q| overflows and by 2^-600 where it is 0, and return that copy's bits. `|q| = 0`
+# keeps the documented identity (an error channel is [3.4.0] work); NaN runs the last lines.
 public fn hquat_normalize(q) {
     var len = hquat_length(q);
     var inv = f64_div(F64_ONE, len);
-    if (f64_eq(f64_abs(inv), F64_POS_INF) == 1) { return hquat_identity(); }
+    if (f64_eq(f64_abs(inv), F64_POS_INF) == 1) {
+        if (f64_eq(len, 0) == 1) { return hquat_identity(); }
+        return _hquat_scaled_unit(q, (1023 + 1023) << 52);   # 2^1023
+    }
+    if (f64_eq(inv, 0) == 1) { return _hquat_scaled_unit(q, (1023 - 600) << 52); }   # 2^-600
     var r = alloc(sizeof(HQuat));
     f64v_scale(r, q, inv, 4);
     return r;

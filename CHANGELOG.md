@@ -2,6 +2,195 @@
 
 ## [Unreleased]
 
+## [3.3.4] - 2026-10-03 — toolchain 6.6.14 (ganita 1.2.11), the [3.3.4] roadmap rows, and the atan2 filing closes
+
+This release is the toolchain bump the maintainer asked for (cyrius 6.6.12 → 6.6.14, libraries and dependencies to their latest tags), the closure of hisab's one open filing (ganita's `atan2`, repaired in ganita 1.2.11), the removal of workarounds whose upstream defects are fixed, and the roadmap's **[3.3.4]** rows with their "carried from 3.3.3" list. Each roadmap row was repaired in its own lane against a differential sweep and an exact or high-precision oracle, then checked by an independent reviewer; the reviewers' findings (including four right → wrong regressions in the first drafts) were repaired before landing. Findings that are not on the [3.3.4] rows are not repaired here; they are carried to **[3.3.5]** with their repros.
+
+**Numbers.** Suites **6038 → 7073**, all passing, across six harnesses: hisab 752, foundation 503, modules 1931, modules_b 1562, edge_cases 603, abuse 1722. Constant gate **161 → 177/177**. Public surface 704 → **703** declarations (`f64_tan` retired), 847 → 846 public probes, all **616** non-public probes refused. `#must_use` 259 → 265. Bundle 30,335 → 33,862 lines (1,400,631 → 1,608,855 B).
+
+Rebuilt from pinned dirs: 6.6.2 refuses the bundle with the known `#derive` error. Under 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12, 6.6.13 and 6.6.14 a cross-module consumer program (perspective, `f64_fmod`, `cx_sqrt`, a ray/box hit, `cga_point`, a subnormal normalize, Delaunay, the SVD fallback on a singular 3×3) builds and runs, with identical output on every pin except the perspective focal term below 6.6.9 (x87 `sin`/`cos`, …503 against …504).
+
+### Changed — toolchain cyrius 6.6.12 → 6.6.14 (ganita 1.2.9 → 1.2.11)
+
+The pin crosses 6.6.13. **Everything this bump changes for hisab arrives in 6.6.13**; 6.6.14 is TLS-only, and all nine hisab binaries (five suites, bench, fuzz, example, CLI) build byte-identical under 6.6.13 and 6.6.14.
+- **Stdlib.** Six vendored files move: `ganita.cyr` (1.2.9 → 1.2.11), `math.cyr` and four `syscalls_*` variants. All 31 stdlib files byte-match the cyrius 6.6.14 tag, `sakshi.cyr` matches the 2.5.6 tag's `dist/` (2.5.6 is still sakshi's latest tag), and `cyrius deps --verify` passes 32/32. Comment-stripped body diffs: ganita changes `sinh`, `cosh`, `tanh`, `asin`, `atan2`, `asinh`, `acosh`, `atanh` and `binomial` and adds `tan`; hisab reaches only `sinh`, `cosh` and `atan2` (and their new private helpers). `math.cyr` changes `f64_parse` and loses `f64_le`/`f64_ge`/`f64_trunc`.
+- **6.6.13 made `f64_le`, `f64_ge` and `f64_trunc` compiler builtins and reserved names.** hisab's 58 call sites in `src/` are now inlined. A differential against the retired 6.6.12 bodies gives 0 mismatches (28 `trunc` values, 784 `le`/`ge` pairs, NaN payloads included). A consumer moving its own pin to ≥ 6.6.13 must re-vendor its `lib/math.cyr` (`cyrius lib sync`): the old file is refused ("reserved keyword 'f64_le'"), loudly.
+- **Size.** The CLI grows 300,064 → 326,248 B and each suite binary by 26–30 KB, all stdlib growth (`math.cyr` 41,220 → 63,782 B, `ganita.cyr` 143,480 → 174,231 B). On the bundle, `CYRIUS_STATS` code_size goes 835,528 → 862,576 B (+3.24%: +25,104 B from the stdlib, +1,944 B from the 6.6.13 compiler).
+- **Compiler caps unchanged** at the same lines of the 6.6.14 tag (24 MiB expanded source, 4,194,304 tokens). hisab's source runs 9.66 B per token, so the byte cap binds first.
+- **Suites under the new pin, before any 3.3.4 source change**: every assertion passed except the two `KNOWN DEFECT (ganita atan2)` tripwires, which failed as designed (next section). The ganita `sinh`/`cosh` change moved bits that no assertion could see; see *Changed — sinh and cosh*.
+
+### Fixed — closed upstream: ganita `atan2` (`D140`, `D132`)
+
+ganita 1.2.11 (folded into cyrius 6.6.13) repaired the `atan2` filing hisab made on 2026-09-30, and its abaco companion (both infinite arguments). The record is archived: `docs/development/issues/archived/2026-09-30-ganita-atan2-signed-zero-and-nan.md`, with the paired run — ganita's repro exits 5 on 6.6.3 and 6.6.12 and 0 on 6.6.13 and 6.6.14.
+- `cx_arg`, `cx_ln`, `cx_sqrt` and `cx_powf` now follow C99 on the special rows: `cx_arg(cx_conj(-1 + 0i))` is −π (was +π), `cx_arg(±0 ± 0i)` is decided by the signs, `cx_arg(0 + NaN i)` is the input's NaN (was −π/2), and `cx_arg(±∞ ± ∞i)` is ±π/4 or ±3π/4 (was NaN). Seven public functions reach `atan2`; the three Lie-group logs are bit-identical (their `y` is a norm, and `so3_log`'s non-finite exit discards a NaN angle).
+- The two tripwires are flipped to −π and NaN, and the D132 rows (`cx_sqrt`, `cx_ln`, `cx_powf` of conj(−x + 0i), `cx_arg(±0, ±0)`) and four ±∞ rows are pinned bit-exact as C99 values. Every one of them fails when built against cyrius 6.6.12.
+- The `so3_log` quarter-turn NaN fixture no longer discriminates its guard under hisab's pin; the guard is still killed by the "Inf − Inf off the diagonal" rows (through the NaN's sign bit). Its comment and `lie_ext.cyr`'s say so.
+- **Consumers below cyrius 6.6.13 keep the old answers**: each compiles the bundle against its own ganita.
+
+### Breaking — public `f64_tan` retired
+
+ganita 1.2.11 (cyrius ≥ 6.6.13) defines its own `f64_tan`, an alias of the fdlibm `ganita_f64_tan` (≤ 1 ulp). hisab's `public fn f64_tan`, a sin/cos quotient (up to 1.99 ulp), drew `duplicate fn 'f64_tan'` on every build at ≥ 6.6.13, and under last-definition-wins it silently replaced ganita's tangent for the whole program, a consumer's own calls included. CI's duplicate gate grepped `duplicate symbol` and never saw it.
+- hisab no longer defines `f64_tan`. Its three callers (`m4_perspective_rh`, `m4_perspective_reverse_z`, `se3_log`) inline the same quotient, so **their bits are unchanged on every pin** (299,999 A/B rows; probes on every pin from 6.6.3 to 6.6.14). They do not call `ganita_f64_tan`, which does not exist below 6.6.13, where every consumer pins; the floor stays cyrius 6.6.3.
+- **Migration.** On cyrius ≥ 6.6.13, `f64_tan` is ganita's: same meaning, different bits from hisab's quotient on 32% of [−π/2, π/2]. Below 6.6.13 a reachable call is refused at build time (`refusing to emit binary with 1 reachable undefined function(s)`); define a local `f64_div(f64_sin(x), f64_cos(x))` there. goonj (3 sites) and naad (1), both on hisab 2.22.1, call it today.
+- New pins: the perspective focal term bit-exact at two fovs (the second separates 1/(sin/cos), cos/sin and 1/`ganita_f64_tan`) and `se3_log`'s tangent bit-exact; each kills its mutant. They flip when the builders switch to `ganita_f64_tan`.
+
+### CI — the duplicate gate sees functions
+
+The consumer-build step now fails on `duplicate fn` as well as `duplicate symbol`. Planted check: a second `public fn f64_tan` in a scratch bundle fails it, and the shipped bundle passes.
+
+### Fixed — roadmap [3.3.4]: geometry (`D034`, `D035`, `D037`, `D038`, `D087`)
+
+- **`geo_ray_aabb[_face]` / `geo_ray_obb[_face]`: a NaN input is a NaN t with `GEO_FACE_NONE`, no tie and the jets' miss (`D034`).** `f64_max`/`f64_min` erased a NaN slab when a later slab won, a parallel slab's two tests skipped a NaN, and an early miss never read the later slabs. Over 2,500 rays and boxes per routine with a NaN in each input slot in turn, 3.3.3 returned a finite t > 0 for 11,621 of 30,000 AABB inputs (9,477 with a real face) and 3,473 of 40,000 OBB inputs; all 70,000 (and a 28,000-input differential with four payloads, an sNaN included) now give the NaN contract. Only a NaN the caller supplied is returned: a NaN the arithmetic makes from input with none (Inf − Inf, or 0 × Inf in the OBB frame) is left as in 3.3.3, so 14,235 AABB and 20,200 OBB inputs with no NaN are bit-identical to 3.3.3 apart from 10 negative half-extents.
+- **`geo_ray_obb[_face]`: a negative half-extent is its magnitude on every ray (`D035`).** Crossing slabs already sorted their planes; the parallel test read the box as empty, so an axial ray missed a box an oblique ray hit (1,040 of 17,500 now move from the miss to the |he| box's t).
+- **An AABB inverted through the setters (min > max) is read as its sorted box** (the maintainer's choice, matching `D035`): `geo_ray_aabb[_face]`'s parallel test, `geo_aabb_aabb`, `_bvh_ray_hits_aabb`, `bvh_build` (which now folds the hull before choosing the split, so an inverted input builds the sorted boxes' tree) and `bvh_query_aabb`. 19,803 inverted boxes give the sorted box's t (5 differ only in a zero's sign from an infinite direction component); 40,100 overlap pairs and 300 BVH scenes (12,000 ray and 12,000 box queries) answer as the sorted scene does. Non-inverted boxes are unchanged.
+- **`geo_triangle_unit_normal` (`D037`), `geo_barycentric_coords` (`D038`), `geo_closest_point_on_triangle` and `geo_segment_direction` (`D087`) are pre-scaled by a power of two.** Right triangles with legs 2^e: unit normal 378 of 1,401 wrong → 0, barycentric and closest point 890 of 1,401 → 0; 24 random triangles × every 2^e (50,304): 25,731 / 38,031 / 28,575 wrong → 0. Coordinates up to DBL_MAX are handled by halving every input in the top binade, and `geo_barycentric_coords` caps its scale by the query's offset so weights near 2^1023 do not overflow. Where 3.3.3 stayed in range the bits are unchanged. 35 closest-point inputs equal 3.3.3's own unit-size answer instead of a value 3.3.3 got right by a flush or overflow. Top-binade coordinates that cancel to a subnormal last bit still take the degenerate fallback, as in 3.3.3 (carried). A non-finite barycentric query is scaled with the edges (102 of 3,000 such inputs moved).
+- **`_GEO_F64_EPS_SQ` removed**: nothing has read it since 2.14.0. The named-threshold degree audit also cleared `_SO3_ORTHO_TOL` (degree one, matches), `_GA_F64_1EM6` (consistent) and re-derived `_CGA_NULL_TOL` (below).
+
+### Fixed — roadmap [3.3.4]: collision (`D045`, time-of-impact, non-finite shapes)
+
+- **`time_of_impact` is scale-free (`D045`).** Its distance query squared lengths, so a gap below ~2^-537 read as contact and lengths above ~2^511 overflowed: two unit spheres 9.5 apart closing at speed 1 (t = 7.5) came back at 7.4833 (2^-538..2^-537), 8.0 (2^-540..2^-539) and t = 0 from 2^-541 down, and a pass 3 apart was an impact. Where |v|² is normal the arithmetic is 3.3.3's bit for bit; elsewhere v and the simplex are divided by a power of two. t = 7.5 is now bit-exact from 2^-1073 to 2^1020, and a 23-fixture × 521-scale sweep goes from 8,270 wrong to 159 (all at subnormal coordinates or one box pair that overflows at 2^1020), none right → wrong.
+- **Impact times near box edges and capsule sides** (carried): on 21,000 swept pairs, wrong 2,996 → 8 (late 2,944 → 8, missed 26 → 0, early 26 → 0), box edges 1,502 → 0. A second 19,500-pair sweep with rotated boxes and scaled pairs leaves 40 late capsule-side answers (up to 2.83 tolerances) and 4 right → wrong (capsule sides now 1.11–1.33 tolerances late). Normals improve on box edges (0.088 → 2.2e-7 rad axis-aligned; 0.78 → 3.0e-4 rotated) and capsule sides (0.17 → 5.8e-4), and **get worse on box corners** (max 1.8e-6 → 1.0e-5 rad; 147 of 1,000 more than twice as far off). Carried to [3.3.5].
+- **One contract for non-finite shapes in all five entry points**: a pair is a miss if any support point taken with a finite direction has a NaN or infinite coordinate, checked through four tetrahedral directions on every contact answer. A survey of 488 pairs agrees across the five on 484 (3.3.3-base: 460). **Right → wrong**: finite shapes whose support difference overflows near DBL_MAX are now misses (boxes of half-extent (1.7e308, 1, 1) at the origin give 0 where 3.3.3 gave 1); carried to [3.3.5].
+- **`gjk_intersect_3d` / `gjk_epa_3d` missed a point inside a rotated box** (found in 3.3.4): GJK cycled without a certificate; 91 of 8,000 rotated boxes. An uncertified exit now asks the MPR portal and accepts it only when the refined depth clears `_GA_TOI_TOL_REL`, so near-tangent pairs 1e-12 apart stay misses.
+
+### Fixed — roadmap [3.3.4]: spatial structures (`D058`, `geo_aabb_aabb`, BVH, `D059`)
+
+- **`geo_aabb_aabb`: a NaN bound is no overlap.** Of 200,000 random box pairs 6,429 answers changed, every one with a NaN bound. `bvh_query_aabb` and `octree_query` prune nodes with private NaN-true copies of the old tests, so a NaN box no longer hides a finite neighbour; over 30,000 BVH queries 7,010 box answers moved wrong → right, none the other way.
+- **`bvh_query_ray`: a NaN slab is never a hit, whichever way the ray runs**, and an infinite origin on an infinite bound stays on the slab. The walk equals the per-box test in every query of a 30,000-query sweep (3.3.3 differed in 135).
+- **`quadtree_insert` / `octree_insert`: a NaN point is out of range (`D058`)** and returns `Err(HSB_ERR_OUT_OF_RANGE)`, as ±Inf already did; the two abuse pins of the old answer are flipped.
+- **Spatial hash**: below cycc 6.6.8 a coordinate at +Inf (or 2^63 cells out) shared cell i64::MIN with −Inf, so a radius query at +Inf returned the points at −Inf on the six consumers' 6.6.3; it now saturates to the +end cell on every pin. **A NaN coordinate goes into cell 0 on every pin, and a query with a NaN centre or NaN radius returns nothing** (the maintainer's choice; 3.3.3 returned every entry for a NaN radius). `D059`
+
+### Fixed — roadmap [3.3.4]: CGA (`D048`, `D052`)
+
+- **`cga_point` / `cga_sphere` (`D048`)**: q/2 overflowed past |p| ≈ 2^512 although it is finite to 2^512.5, and below 2^-510.5 it came back a subnormal step off. Outside [2^-484, 2^511) the coordinates are divided by a power of two first; inside, the bits are unchanged. Of 153,516 points, 78 overflowed and 515 were a step off on 3.3.3; a subnormal q/2 is still double-rounded (11–17 of ~3,700 per seed are a step off, some where 3.3.3 was right; carried).
+- **`cga_blade_inverse`: a covariant null test (`D052`).** The bound 2^-49·Σbᵢ² counted n0² and ninf², which no term of the null-basis norm² forms, so a unit sphere from distance ~6.9e3 and origin spheres with r < 4.2e-8 or r > 4.7e7 got the zero multivector. The bound is now 2^-49·T, T the magnitudes of exactly the terms the norm² sums; origin spheres invert at every radius whose norm² is normal, a unit sphere out to |c| = 2^24, and 10,157 zero results now invert (accurate to the norm's conditioning) with no inverse lost. Side effect accepted: a point translated close to the origin inverts like the small origin sphere its coefficients describe.
+
+### Fixed — roadmap [3.3.4]: vectors and Lie groups (`D086`, `D087`, `D089`)
+
+- **Lie maps below DBL_MIN (`D086`)**: `su2_from_quat`, `su2_from_axis_angle`, `so3_from_axis_angle`, `lorentz_boost`, `lorentz_rotate`, `su2_exp` and `so3_exp` returned the identity for every non-zero subnormal input (52 of 52 magnitudes). They now normalise an exact 2^1023 copy; an axis whose length passes DBL_MAX is scaled by 2^-600. `so3_exp` of a subnormal ω is I + [ω]× with every entry the nearest double. A zero input keeps the identity.
+- **`hvec3_normalize` / `hquat_normalize` (`D087`)** returned the zero vector / identity for 51 of 52 subnormal magnitudes and for every length past DBL_MAX; both ends now normalise an exact power-of-two copy. The test that called the low band "a documented tree-wide limit" is corrected.
+- **`hvec3_angle` (`D089`)**: below |a|·|b| = DBL_MIN it answered 0 rad for perpendicular vectors on 511 of 1,022 binades; past DBL_MAX parallel pairs gave NaN. Those inputs now take atan2(|a′×b′|, a′·b′) on scaled copies; perpendicular, parallel and opposed are π/2, 0 and π bit-exact at every scale (3.3.3 got 2,150 of 6,294 wrong). Every other input is unchanged; on a 98,000-input sweep 77 answers left 1 ulp of the oracle (none 4 ulp). The two foundation pins of the old 0 now assert π/2.
+
+### Fixed — roadmap [3.3.4]: Delaunay scale class (carried)
+
+`delaunay_2d` kept non-Delaunay triangles from scale 2^256, lost a site from 2^513 and came back empty below 2^-539. A set outside [2^-180, 2^251) whose magnitudes span at most 430 binades is now triangulated on a power-of-two copy, so it returns the same triangles in the same order at every exactly representable scale. Over 4,632,834 inputs (25 fixtures and 2,550 random sets at every 2^e) correct meshes go from 776,178 to 2,435,474; 1,593 inputs that were right only beside an overflow cliff now return their set's scale-1 mesh. A set already in the band runs exactly as before. Wider sets, and mixed-magnitude sets that are wrong at scale 1 (`D055`), are carried to [3.3.5].
+
+### Fixed — roadmap [3.3.4]: SVD and eigen wide spans, Givens radii (carried)
+
+- **`svd_golub_kahan` / `eigen_qr` answer wide spans instead of refusing them.** The balance is unchanged; an attempt that overflows is retried with one more binade of headroom at a time (bounded at about log2(growth) + 2 attempts), so headroom costs bits only on inputs that need it (the 1889u 5×5 keeps 1890u). On 43,000 probe rows every row answered before is byte-identical; 1,982 svd and 852 eigen rows that were refused now answer, worst 3,184 eps·σmax and 8.4 eps·|λ|max against 1400- and 800-digit oracles. A retry's sub-DBL_MIN rotation is applied to the bidiagonal/tridiagonal as well as the factors (without it, 282 of 22,000 sparse tridiagonals came back rc = OK and wrong). `eigen_qr`'s `max_iter` now bounds each attempt.
+- **A Givens radius below DBL_MIN no longer leaves U, Vt or V non-orthogonal**: the factors take the rotation lifted by a power of two; values and iteration counts are unchanged. The rank-1 x_i(1+j) 4×4 goes from max |VtVtᵀ − I| = 0.099 to 3.3e-16.
+
+### Fixed — roadmap [3.3.4]: linear solvers (carried)
+
+- **`eigen_power`**: when the dominant eigenvector has a component below the f64 range, the flushed iterate settled on a smaller eigenpair ([[−4.70e-303, 1.37e306], [0, −8.90e-303]] returned −4.70e-303). A converged iterate is now checked, and re-run in a wide m·2^e representation when its small components could matter, including components rounded on the subnormal grid. On a 71,000-matrix sweep 943 answers were wrong on 3.3.3 and 122 remain wrong (910 of a second 44,000-matrix sweep), none went from right to wrong, and right answers at slow ratios (|λ₂/λ₁| from about 0.9) can become NO_CONVERGENCE when max_iter is below the passes power iteration needs. The two remaining classes are carried.
+- **`solve_bicgstab`**: when every t_i was finite but |t| overflowed, the ω rescue divided by +Inf and returned the half step unreported; it now divides by a power of two (149 of 53,000 runs change: 9 right, 135 NaN, 5 still wrong). The contract for an unconverged stop stays "the last iterate" until [3.4.0] `D015` (the maintainer's decision).
+- **`solve_pgs`**: a NaN bound was no bound, and a NaN in a row with a zero diagonal was skipped; NaN now reaches x.
+- **`opt_levenberg_marquardt`**: `residuals` may reuse its output buffer (it took 144 residual calls instead of 51 on Rosenbrock); the solver copies into two owned buffers, bit-identical to the fresh-buffer run on 3,000 runs.
+
+### Fixed — roadmap [3.3.4]: interval arithmetic rounds outward (carried)
+
+Every `ivl_*` endpoint was rounded to nearest, so a bound could sit inside the exact one: 77,672 of 161,293 finite endpoints did in the sweep below. `ivl_add`, `ivl_sub`, `ivl_mul`, `ivl_div` and `ivl_sqrt` now return the tightest interval of doubles containing the exact image, moving an endpoint one double outward only when an exact test shows the rounding went inward, so `[1, 3] × [2, 4]` is still `[2, 12]`. `ivl_div` divides endpoints directly (no reciprocal: a lower bound of 2.2e8 where 1.2e20 is exact is gone), an outer bound that underflows steps to ±2^-1074, `ivl_exp`/`ivl_sin` widen by the stdlib's 1-ulp contract, and a NaN corner propagates in `ivl_mul`/`ivl_div`. On 104,529 cases every result contains the exact image and all 94,022 arithmetic results are the tightest possible; the median width ratio is 1 + 2^-52. Below cycc 6.6.9 `ivl_sin` does not enclose near multiples of π (x87 `fsin`), and `ivl_width` still rounds to nearest (both carried).
+
+### Fixed — roadmap [3.3.4]: calculus (carried)
+
+- **`calc_monotone_cubic`**: a set whose exact slope is past DBL_MAX or below DBL_MIN gave NaN or a flat segment; such sets are splined in extended range (mantissa and exponent), and both repros are exact. Over 2,539,979 results against an exact Fritsch-Carlson oracle, none went right → wrong and 561,789 went wrong → right.
+- **Quadrature overflow before scaling**: `calc_integral_trapez` stored +Inf where the rule's value is `0x7FD8000000000000`; trapez and simpson now halve a running sum that overflows. simpson's first add is compensated and the closing ·h/3 rounds once: correctly rounded on 19,993 of 20,000 finite tables (3.3.3: 11,878). Non-finite tables now get the class of the sum computed without overflow (1,189 trapez and 28 simpson results of 9,015 changed).
+- **`calc_adaptive_simpson`**: below the root, each panel tests against max(tol, 2^-56·|whole|); x^4 on [0, 1] at tol 1e-300 takes 408,529 evaluations instead of 1,415,173 with the same value, and nothing moved where tol ≥ 3.2e-13 of the integral. An aliased child panel can still be accepted (carried).
+- **`calc_bspline` / `calc_nurbs` at degree 0**: a NaN knot bounding the span gives the NaN point instead of a control point.
+
+### Fixed — roadmap [3.3.4]: simplex, LaTeX, measurement gate (carried)
+
+- **`simplex_2d` / `simplex_3d` past a cell of 2^63** gave different answers per toolchain (`f64_to` saturation from 6.6.8); a private exact cell reduction makes every pin return 6.6.3's bits (13,997 of 300,000 targeted calls disagreed between pins before, none now).
+- **`sym_to_latex` escapes variable names**: `var("%")` commented out the rest of the line, `{`/`$` broke the group or the math, and a name such as `\input{f}` became that command. The ten TeX specials are escaped in math mode; names without them render byte-identical.
+- **`check-measurements.sh` reads count and sweep claims** ("over 2000 random rays", "23712 NaN results") and observations with a direction ("137 ulp out", "exited 139"). Selftest 21/22 → 41/42 claims, 0 decoys flagged. The tree-wide unmarked count rises from 484 to 525 because older lines become visible; no line this release added is unmarked. The baseline was not rebased (Decisions owed #3).
+
+### Fixed — roadmap [3.3.4]: the maintainer's two items
+
+- **ganita's SVD defects are filed** (below), and **`svd_compute` / `svd_truncated` fall back to hisab's own `svd_golub_kahan` when ganita returns −1** (the maintainer's choice). ganita refuses ordinary rank-deficient square matrices: 2,399 of 2,400 random n×n with a zero row and [[1,2,3],[1,2,3],[4,5,6]] returned −1 / `Err(NO_CONVERGENCE)`. They now answer (S within 7.75 ε·σ₁ of an 80-digit oracle, every smallest σ exactly 0; reconstruction up to 4,820 ε‖A‖_F, which is `svd_golub_kahan`'s [3.6.0] residual). Inputs ganita answers keep their bits.
+- **Rust 1.3.0's `solve_expr` / `eval_verified`** are scheduled as the roadmap's abaco-bridge row, so abaco can build on hisab without asking.
+
+### Changed — tests
+
+`tests/modules.tcyr` (1.15 MB) passed cyrlint/cyrfmt's 1028 KB input cap, so CI could not lint or format-check it. It is split at the "2.7.3 coverage" group into `modules.tcyr` (1931) and `modules_b.tcyr` (1562), with the shared header and the helpers and fixtures the second half reuses; the assertion total is unchanged (3,493) and both files lint and format clean.
+
+### Fixed — `f64_fmod` is exact C99 `fmod`
+
+It computed `x - trunc(x/y)*y`, which rounds the quotient:
+- `fmod(1, 0.1)` returned +0 where C gives `0x3FB9999999999996`, and `fmod(10, 0x3FD3333333333333)` returned `0x3FB9999999999980` where C gives `0x3FB99999999999B4`;
+- a zero result was always +0 (`fmod(-6, 3)` is −0);
+- `fmod(3, +Inf)` gave NaN (C: 3), and `fmod(DBL_MAX, 3·2^-1074)` overflowed to −Inf (C: 2·2^-1074).
+
+The new body uses integer bit operations only, in fdlibm's `e_fmod` shape: unpack, one branchless shift-subtract step per binade of exponent gap (at most 2097), renormalise. It never touches the FPU, so its bits are the same on every pin and target.
+- Oracle sweep against glibc 2.44 `fmod` (x86-64) over 279,211 pairs — every exponent, subnormals, exact multiples, |x| < |y|, x = y, ±0, gaps up to DBL_MAX against 2^-1074, ±Inf and NaN payloads: **0 differences; the 3.3.3 body had 158,102.** An independent sweep (258,080 pairs, an exact Fraction oracle) also finds 0. Identical bits under cycc 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12 and 6.6.14.
+- NaN operands come back quieted with sign and payload kept, x's before y's, and `fmod(±Inf, y)` is `0xFFF8000000000000` — glibc's bits and 3.3.3's.
+- **Kept**: `y = ±0` returns +0 for every x, NaN and ±Inf included (C: NaN). It is a fabricated answer of the [3.4.0] `D069` kind, now listed on that row.
+- Tests: 30 bit-exact assertions in `modules.tcyr`'s `f64_fmod` group, 16 of which fail on the 3.3.3 body. 21 lane mutants and 35 independent ones are killed, except `ey > 1` for `ey >= 1`, which is equivalent and recorded at the line.
+- Only consumer caller: garjan (`f64_fmod(arg, F64_ONE)`, two sites, hisab 2.11.2). A divisibility test written `f64_fmod(a, b) == 0` compares raw bits in Cyrius and is now false for a negative exact multiple (−0); write `f64_eq(r, 0)`.
+
+### Fixed — `cx_sqrt` is C99 `csqrt`; `cx_powf` stops making NaN at a zero angle
+
+`cx_sqrt` was `cx_from_polar(sqrt|a|, arg(a)/2)`, which cannot land on an axis: `sqrt(-4 + 0i).re` was `0x3CA1A62633145C07`, not +0, and near the negative real axis the real part's relative error was unbounded (121,520 of 506,944 grid points more than 2^40 ulp out or non-finite). `csqrt(+Inf + iy)` had a NaN imaginary part, `csqrt(-Inf + iy)` was +Inf + i·Inf, and wherever |z| overflowed near DBL_MAX the root was infinite.
+- It now uses CACM Algorithm 312 (Friedland 1967, the form FreeBSD msun's `s_csqrt.c` uses) with power-of-four scaling (inputs ×1/4 from 2^1021 up, ×2^54 below 2^-1021), the full C99 G.6.4.2 special-value table (324 rows; 3.3.3 was off on 74), and signs from y's sign bit. Every axis point is correctly rounded with the C99 zero sign. It no longer calls atan2, sin or cos, so its bits are the same on every consumer pin.
+- **Accuracy, stated as a property of the samples** (a two-sided binade grid, the axes, random and near-axis points; a Decimal oracle): every component within 2.16 ulp and 80–82% correctly rounded (glibc 2.44: 80–82%, at most 1.95 ulp). It is not a bound: a targeted search finds 2.43 ulp at `cx_sqrt(0xBF81197459105F69 + 0xBFE03CFA7141501E i).re` (glibc 0.43, the polar form 2.57). On 0.1–4.1% of points, by component and set, the polar form had landed more than 0.5 ulp closer, by at most 2 ulp.
+- NaN results keep the operand's payload, quieted, exactly as before (420 of 420 NaN slots identical to 3.3.3).
+- `cx_powf` made NaN from non-NaN input at a zero angle: `cx_powf(+Inf + 0i, 2).im` was NaN (Inf · sin 0). A zero angle now returns (r, θ), bit-identical to the polar form for every finite r.
+
+### Changed — `cx_powf` lands exactly on an axis
+
+When z is exactly on the negative real or imaginary axis (a zero part) and n is a whole number of quarter turns, `cx_powf` returns the exact axis point, with the zero signs IEEE repeated multiplication gives: `i^2` = −1 + 0i (was −1 + 1.2e-16 i), `(−4 + 0i)^0.5` = +0 + 2i, `i^(2^60)` = 1 − 0i (was an arbitrary point on the unit circle), `(1e200 i)^2` = −Inf + 0i (was −Inf + Inf i). Every other input keeps the polar form bit for bit (differential over 1,114,812 rows). C99 leaves cpow's accuracy unspecified, and glibc 2.44 gives the old answers.
+- Both new `cx_powf` paths are taken only for a non-NaN r: on cyrius 6.6.3 and 6.6.6, `ganita_f64_pow(+Inf, n)` is NaN, and a NaN r keeps the polar form, so those consumers see 3.3.3's bits (568 rows checked).
+
+Tests: `edge_cases.tcyr` 395 → 484 (the C99 table, the scaling bands — including two rows in the [DBL_MAX/(1+√2), 2^1023) band the 2^1021 bound exists for — and the `cx_powf` zero-angle and axis rows). `modules.tcyr`'s `cx_sqrt(-1) re = 0` was a `LOOSE_TOL_M` comparison that read `0x3C91A62633145C07` as 0; it is bit-exact now. 31 lane mutants and 52 independent ones; the only survivors are two scaling-bound mutants that are equivalent (0 of 300,000 differences).
+
+### Changed — `sinh` and `cosh` values move with ganita 1.2.11
+
+`lorentz_boost_x/y/z`, `lorentz_boost`, `cx_sin` and `cx_cos` take `ganita_f64_sinh` / `ganita_f64_cosh`, which ganita 1.2.11 re-derived: sinh below 22 through fdlibm's `expm1` (no cancellation), cosh computed on |x| (even bit for bit), and from 709 up, where 1.2.9 rounded |x| − ln 2 (about 450–495 ulp off), 0.5·exp(|x|) to ~709.78 and exp(|x| − 2043·ln 2)·2^2042 beyond. A consumer on a pin below 6.6.13 keeps the old values.
+
+Measured on 2,000 doubles per band and their negatives (80-digit Decimal oracle, x86-64), correctly rounded fraction and max ulp, 6.6.12 → 6.6.14; maxima are "at least, on this sample":
+
+| \|x\| band | sinh(+x) | parity breaks on 6.6.12 |
+|---|---|---|
+| [2^-26, 0.3) | 1.6%, 3.9e7 ulp → 76.4%, 1.09 ulp | odd 990, even 255 → 0 |
+| [0.3, 1) | 50.6%, 1.88 → 70.6%, 1.72 | odd 570, even 302 → 0 |
+| [1, 22) | 79.5%, 1.08 → 77.2%, 1.19 | odd 531, even 527 → 0 |
+| [22, 709) | unchanged, 95.1%, 0.714 | odd 377, even 377 → 0 |
+| [709, 710.475] | 0%, 495 → 82.8%, 1.05 (cosh the same) | none |
+
+- A targeted point exceeds the table's small-band maximum: sinh(`0x3F8FF65A157BC58D`) is 1.40 ulp off on 6.6.14.
+- **Cost.** On positive arguments in [1, 22) the `expm1` form rounds sinh correctly less often: 131 inputs lost correct rounding and 86 gained it, and 18 are now over 1 ulp where 2 were (a second sample: 1176 → 1171 of 1500, 3 → 9 over 1 ulp). The band maximum did not grow: the second sample finds 1.2.9 at 1.26 ulp (`0x3FF67FE06B2772B8`). In [0.3, 1) the net is a gain (151 lost, 550 gained), with sinh still up to 1.72 ulp off. Because cosh(−x) now mirrors cosh(+x), it lost correct rounding on some negative inputs in every band below 709 (91, 77, 71, 80 and 17 of 1500 per band, against 115, 81, 147, 256 and 262 gained, on a second sample).
+- **Tests.** 23 bit-exact assertions in `modules.tcyr` ("lie: Lorentz" and beside the `cx_sin(0)`/`cx_cos(0)` checks), through `lorentz_boost_x/y/z`, `lorentz_boost`, `cx_sin` and `cx_cos`, each a correctly rounded value; parity is asserted as an identity, over a 251-rapidity sweep with its population counted. Built against cyrius 6.6.12, `modules` gives 3037 passed, 23 failed — exactly these. The cosh pins and those at |x| ≥ 22 go through the x87 `f64_exp` and were measured on x86-64 only.
+
+### Changed — `_cga_build_null_tbl` back in its natural nested-`continue` form (`D142`)
+
+From 2.21.0 it was written with `if`-guards, a workaround for cycc ≤ 6.6.2, where a `continue` in a loop nested under one with an earlier `continue` jumped to the outer loop's latch and this nest silently built a wrong table. cycc 6.6.3 fixed it, and since 3.1.0 no consumer of the bundle can be below 6.6.3 (6.6.2 refuses `public struct` + `#derive`).
+- The table is unchanged: FNV `0xF4A98C5706D5CF5B`, `_CGA_NULL_COEF_BAD` 0. The suites print exactly what they printed before.
+- The builder, copied verbatim into a stdlib-free probe, gives the contract table on every cycc from 6.6.3 to 6.6.14 (and on aarch64 under qemu on 6.6.3, 6.6.6 and 6.6.14); on 6.6.0–6.6.2 it gives FNV `0x344A3725EBC9A7EB` with 1024 bad coefficients. A consumer-shaped program rebuilding all 1024 entries through `cga_geometric_product` matches an independent Fraction-based GA oracle on every pin from 6.6.3 to 6.6.14.
+- Mutants (five suites each): the inner `continue` as `break` gives exactly 6.6.2's table and fails the FNV assertion; the skip above the accumulation fails 3 assertions; deleting the inner skip or making the packing `continue` a `break` fails 1. The outer `continue` is behaviourally inert on the builder's one input (a no-op or a `break` both pass), which the comment records.
+- 2.24.0 pins 6.6.2 and keeps the guard form; a 2.24.x backport must not take this change.
+
+### Toolchain — two cyrius defects filed upstream (maintainer-approved)
+
+- **A capturing closure called with `fncallN` at top level crashes.** A closure built and returned by a fn, called outside every fn body, exits 139 on x86-64 on every installed pin from 6.6.0 to 6.6.14 (and on aarch64 under qemu on 6.6.14); called from inside a fn it is correct. cycc's closure-aware `fncallN` lowering runs only inside a fn. Filed as `cyrius/docs/development/issues/2026-10-03-hisab-toplevel-fncall-capturing-closure-segv.md`; hisab's record is `docs/development/issues/2026-10-03-cyrius-toplevel-fncall-capturing-closure-segv.md`. hisab has no top-level indirect call; `autodiff.cyr`'s recipe now tells callers to invoke such a closure from inside a fn.
+- **`D082`: a closure's `return <: stack call>` is booked against the enclosing fn.** That fn draws a misattributed warning, and a single-variable bind of its result inside another fn is refused ("bind both") — whether a helper built the closure or it was built inline. The repro exits 3 on every pin from 6.6.0 to 6.6.14. Filed as `cyrius/docs/development/issues/2026-10-03-hisab-closure-stack-return-blamed-on-enclosing-fn.md`; record `docs/development/issues/2026-10-03-cyrius-closure-stack-return-blamed-on-enclosing-fn.md`. hisab is unaffected since 3.3.1, because its recipe binds both halves.
+- Also documented in `autodiff.cyr`, not filed (fixed upstream in 6.6.6): on cycc 6.6.0–6.6.5 a block-bodied closure in a top-level `var` is miscompiled — `var g = |x| { store64(x, k); return 0; };` builds clean and stores garbage (exit 214 on 6.6.3, 235 on 6.6.5, against 42). Six direct consumers pin 6.6.3: build the recipe inside a fn there.
+
+### Changed — `m4_mul_vec4` drops its hoist
+
+2.11.3 hoisted vx..vw into locals to dodge the 6.6.1 SIMD destination-slot miscompile, which cycc 6.6.2 fixed; since 2.11.5 the hoist was kept only to match `m3_mul_vec3`. The inline form was re-probed on every cycc from 6.6.3 to 6.6.14 in a consumer-shaped program (70,000 calls on 10,000 full-mantissa draws, bit-identical to the hoisted form; address-normalised machine code identical on every pin; every operand slot written), while `m3_mul_vec3`'s inline form, the positive control, fails on 6.6.3 and 6.6.4. `m3_mul_vec3` keeps its hoist for the six consumers on 6.6.3. Four bit-exact assertions pin a dense full-mantissa M·v, separating all 14 other summation trees.
+
+### Performance — measured (same-binary A/B, old and new body in one binary, A B A B rows, 3 runs, cycc 6.6.14, machine load ~2.8 from another session)
+
+- `m4_mul_vec4` inline form: 2.83–2.87 µs per 64 calls against 2.94–2.99 µs hoisted (−3.5% to −5%); `m4_transform_point` 98 ns against 101 ns.
+- `cx_sqrt`: 55 ns against 139 ns on general input, 60 against 188 on the negative real half-plane, 95 against 171 near DBL_MAX, 116 against 188 near the subnormals.
+- `cx_powf`: general input 410 ns against 402 (+2%); axis points 272 against 381 ns.
+- `_cga_build_null_tbl` natural form: 178.8 µs against 178.0 µs per build (median ratio 1.004, inside the spread).
+- **`f64_fmod` (cost)**: exact integer shift-subtract is slower than the trunc form it replaces: 25.6 ns against 8.9 ns at an exponent gap of 0..10 (2.9×), 110 ns at a gap of 20..63 (12×) and 3.16 µs at a gap of 1000..2045 (107×); |x| < |y| costs the same (8.8 ns). No hisab function calls `f64_fmod`; garjan, its one consumer caller, uses `fmod(arg, 1.0)` on small arguments.
+- Not timed: the geometry, collision, spatial, interval, calc, SVD/eigen and Krylov repairs. Each lane left a same-binary A/B harness; timing them is carried to [3.3.6] with the benchmark work.
+
+### Found — carried to [3.3.5]
+
+Every finding of this release that is not on the [3.3.4] rows is listed under the roadmap's [3.3.5] with its repro and next step: the sphere/capsule quadratic below 2^-511, ray slabs and subnormal direction components, the GJK/EPA/MPR scale class and the DBL_MAX right → wrong, EPA depth on concentric shapes, the time-of-impact capsule residual and box-corner normals, `cga_blade_inverse` at the norm² extremes and `cga_point`'s subnormal double rounding, both Delaunay residuals, `hvec3_angle` near 0 and π, the subnormal-reciprocal bands, `hquat_inverse`'s rescue, `hvec2/hvec4_normalize`, the SVD/eigen subnormal-grid convergence and B-side lift, two `eigen_power` classes, `perlin_*` past 2^63, `calc_integral_gauss5` and adaptive overflow, `ivl_width` and `ivl_sin` below 6.6.9, the `cx_powf` non-finite leftovers, `num_bisection`'s NaN guard, and the measurement-gate recall misses. Contract questions went to [3.4.0]: `f64_fmod(x, ±0)`, the fBm / dual / `num_pollard_rho` fallbacks (`D069`), `hquat_inverse(0)` (`D088`), BiCGSTAB's unconverged return (`D015`) and adaptive Simpson's work bound and `num_bisection`'s exhaustion `Ok` (`D070`).
+
 ## [3.3.3] - 2026-10-01 — silent wrong answers in linalg, num and calc; the NaN-true guard class; and the 3.3.2 leftovers
 
 The roadmap's **[3.3.3]** rows (`D010`, `D012`, `D013`, `D015`, `D017`, `D021`, `D022`, `D068`, `D071`, `D072`), the 3.3.2 leftovers the maintainer approved (the simplex discontinuity, the 48 `f64_gt(x, 0) == 0` NaN-true guards, `sym_const_to_str`'s one-sided integer test, `_geodesic_accel`'s unread parameter, D139's missing records, the port-audit bridge disposition, two stale CHANGELOG figures), and the defects found while doing them.

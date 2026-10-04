@@ -4,7 +4,7 @@
 > of the library's other formula families).
 >
 > hisab v3.3.3 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 30,223
-> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.12; a
+> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.14; a
 > consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map
@@ -16,7 +16,7 @@ first in `dist/hisab.cyr`, which makes the bundle refuse every name not marked `
 hisab (Cyrius)
 ├── Foundation types
 │   ├── error.cyr          — Error codes (HSB_ERR_*), epsilon constants
-│   ├── f64_util.cyr       — f64_tan/fmod/copysign/approx_eq (f64_le/f64_ge come from stdlib `math`)
+│   ├── f64_util.cyr       — fmod/copysign/approx_eq (f64_tan retired in 3.3.4: ganita has it; f64_le/f64_ge are builtins from cyrius 6.6.13)
 │   ├── vec2.cyr           — HVec2: 2D f64 vector (heap-allocated)
 │   ├── vec3.cyr           — HVec3: 3D f64 vector with cross, reflect, min/max (SIMD f64v)
 │   ├── vec4.cyr           — HVec4: 4D f64 vector, Vec3 conversion (SIMD f64v)
@@ -143,7 +143,7 @@ literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, s
 | `vec2` | `error` |
 | `vec3` | `error` |
 | `collision_core` | `error` `vec2` |
-| `linalg_ext` | `complex` `error` |
+| `linalg_ext` | `complex` `error` `linalg_precision` (3.3.4: `svd_golub_kahan` is the SVD fallback) |
 | `num_ext` | `error` `num` |
 | `quat` | `error` `vec3` |
 | `vec4` | `error` `vec3` |
@@ -164,8 +164,11 @@ literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, s
 | `lie_ext` | `complex` `error` `f64_util` `lie` `mat3` `mat4` `quat` `vec3` `vec4` |
 
 **Shape of the graph.** Five modules are fully standalone (`error`, `f64_util`, `interval`,
-`symbolic`, `tensor`); the deepest is `lie_ext` at 9. There are **no cycles**, and every edge runs
-from a derived module to its base, which is the layering the module *names* already declare.
+`symbolic`, `tensor`); the deepest is `lie_ext` at 9. Every edge but one runs from a derived module
+to its base, which is the layering the module *names* already declare. The exception, since 3.3.4,
+is `linalg_ext`→`linalg_precision` (`svd_golub_kahan`, the SVD fallback). With
+`linalg_precision`→`linalg_ext` (`linalg_sort_desc`) it makes the graph's **one cycle**, so the two
+are included together.
 **Since 3.3.0 no module reaches another module's `_` internals.** Through 3.2.x nine pairs did.
 Eight of them now go through public names or plain literals:
 

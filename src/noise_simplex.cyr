@@ -79,14 +79,29 @@
 # reported and did not repair: at the last x before the edge, 1.0378986153331e308,
 # x0 is 2.0e292, every falloff is -Inf, and the field returns +0.
 # [measured: scratch probe of the 3.3.3 bundle plus a python3 model of the unskew, 2026-10-01; cycc 6.6.12]
-# The value starts to depend on the toolchain much nearer in, once a skewed coordinate
-# x + s reaches 2^63 -- from x = 2^63/(1 + F2), about 6.75e18, with y = 0.3 -- where
-# f64_to(i_f) leaves the i64 range: cycc 6.6.3 and 6.6.6 convert it to i64 min, 6.6.10
-# and 6.6.12 to i64 max, so the corners hash differently, and simplex_2d(2^63, 0.3) is
-# 0x3FE075537237CD7E under the first two and 0xBFDF2A03931AECA7 under the others. On
-# the negative side all four agreed down to -2^66. Rounding has long since lost the
-# cell by then.
-# [measured: scratch probe of the 3.3.3 bundle, cycc 6.6.3/6.6.6/6.6.10/6.6.12, x from 2^60 to 2^66, 2026-10-01]
+#
+# ⛔ 3.3.4 — FROM A SKEWED COORDINATE OF 2^63 THE VALUE DEPENDED ON THE TOOLCHAIN.
+# Once x + s reached 2^63 -- from x = 2^63/(1 + F2), about 6.75e18, with y = 0.3 --
+# f64_to(i_f) left the i64 range, where the conversion is the toolchain's: 6.6.8 made
+# cycc's f64_to saturate, so 6.6.3 and 6.6.6 gave i64 min and 6.6.9 to 6.6.14 i64
+# max, the corners hashed through cell residue 0 or 255, and simplex_2d(2^63, 0.3)
+# was 0x3FE075537237CD7E under the first two and 0xBFDF2A03931AECA7 under the rest.
+# A cell index now reaches the hash through _simplex_cell, which reduces it mod 256
+# without converting anything past 2^63, and every pin returns the 6.6.3 bits. Over
+# 459,894 random and 300,000 targeted calls the 3.3.3 code disagreed between pins on
+# 29 and 13,997, the repaired code on none.
+# [measured: scratch probe, 3.3.4 tree before/after, cycc 6.6.3/6.6.6/6.6.9/6.6.10/6.6.12/6.6.14, 2026-10-03]
+# That makes the value the same everywhere, not right: this far out rounding has
+# usually lost the cell. Where it has not -- for example in 3D when the large
+# coordinate's significand is a multiple of 3, so the skew rounds to exactly a third
+# of it, or when large coordinates cancel so the skew stays small -- the exact residue
+# is 0, and where the offsets survive too the repaired value is the field's
+# (tests/abuse.tcyr, group "3.3.4: simplex cell index past 2^63"). Of the 13,997
+# targeted calls that changed, 440 kept every cell (all 3D); the repaired value came
+# within 1e-9 of the field, evaluated exactly, on 438 of them (the other two lost
+# their offsets to rounding) and the 3.3.3 code's under 6.6.9 and later on none.
+# Where a cell was lost, either value matching the field is a coincidence.
+# [measured: scratch python3 exact oracle, Q(sqrt 3) for 2D, rationals for 3D, 2026-10-03]
 #
 # Through 3.3.1 this header called it "OpenSimplex2 noise" and "OpenSimplex2 algorithm
 # -- NOT the patented Perlin simplex". It is not OpenSimplex2.
@@ -121,6 +136,9 @@ var _SIMPLEX_R2_3D = 0x3FE0000000000000;  # 0.5
 # 3D was the listing's 32 through 3.3.2.
 var _SIMPLEX_SCALE_2D = 0x4051800000000000;  # 70.0
 var _SIMPLEX_SCALE_3D = 0x4053300000000000;  # 76.75
+
+# The first magnitude f64_to cannot convert: |c| < 2^63 fits in i64 (_simplex_cell).
+var _SIMPLEX_2_POW_63 = 0x43E0000000000000;  # 2^63
 
 # ================================================================
 # GRADIENT TABLES
@@ -181,6 +199,19 @@ fn _grad2_simplex(hash, x, y) {
     return f64_neg(y);
 }
 
+# The lattice cell index c -- the floor of a skewed coordinate, an integer-valued
+# f64 -- reduced mod 256, the period of noise_perm's table, as an integer in
+# [0, 255]: the only form in which the cell reaches the hash. Below 2^63 in
+# magnitude f64_to(c) is exact and & 255 is c mod 256, negative c included. From
+# 2^63 up, doubles are 2^11 apart, so c is a multiple of 2048 and c mod 256 is 0
+# exactly; c is never converted there, because f64_to of a value past the i64 range
+# is the toolchain's choice (header, 3.3.4). simplex_2d and simplex_3d call it after
+# their offset guard, so c is finite.
+fn _simplex_cell(c) {
+    if (f64_lt(f64_abs(c), _SIMPLEX_2_POW_63) == 1) { return f64_to(c) & 255; }
+    return 0;
+}
+
 # ================================================================
 # 2D SIMPLEX NOISE
 # ================================================================
@@ -207,8 +238,6 @@ public fn simplex_2d(x, y) {
     var s = f64_mul(f64_add(x, y), _SIMPLEX_F2);
     var i_f = f64_floor(f64_add(x, s));
     var j_f = f64_floor(f64_add(y, s));
-    var i = f64_to(i_f);
-    var j = f64_to(j_f);
 
     # Unskew back to find the origin of the simplex cell in (x,y) space
     # t = (i + j) * G2
@@ -249,9 +278,10 @@ public fn simplex_2d(x, y) {
     var x2 = f64_add(f64_add(x0, f64_neg(F64_ONE)), g2_2);
     var y2 = f64_add(f64_add(y0, f64_neg(F64_ONE)), g2_2);
 
-    # Hash the triangle vertices to get gradient indices
-    var ii = i & 255;
-    var jj = j & 255;
+    # Hash the triangle vertices to get gradient indices. The cell index enters only
+    # through its residue mod 256 (_simplex_cell, 3.3.4).
+    var ii = _simplex_cell(i_f);
+    var jj = _simplex_cell(j_f);
     var gi0 = noise_perm(noise_perm(ii) + jj);
     var gi1 = noise_perm(noise_perm(ii + i1) + jj + j1);
     var gi2 = noise_perm(noise_perm(ii + 1) + jj + 1);
@@ -305,9 +335,6 @@ public fn simplex_3d(x, y, z) {
     var i_f = f64_floor(f64_add(x, s));
     var j_f = f64_floor(f64_add(y, s));
     var k_f = f64_floor(f64_add(z, s));
-    var i = f64_to(i_f);
-    var j = f64_to(j_f);
-    var k = f64_to(k_f);
 
     # Unskew back
     var t = f64_mul(f64_add(f64_add(i_f, j_f), k_f), _SIMPLEX_G3);
@@ -389,10 +416,10 @@ public fn simplex_3d(x, y, z) {
     var y3 = f64_add(f64_add(y0, f64_neg(F64_ONE)), g3_3);
     var z3 = f64_add(f64_add(z0, f64_neg(F64_ONE)), g3_3);
 
-    # Hash the four tetrahedron vertices
-    var ii = i & 255;
-    var jj = j & 255;
-    var kk = k & 255;
+    # Hash the four tetrahedron vertices, by cell index mod 256 as in simplex_2d
+    var ii = _simplex_cell(i_f);
+    var jj = _simplex_cell(j_f);
+    var kk = _simplex_cell(k_f);
     var gi0 = noise_perm(noise_perm(noise_perm(ii)      + jj)      + kk);
     var gi1 = noise_perm(noise_perm(noise_perm(ii + i1)  + jj + j1)  + kk + k1);
     var gi2 = noise_perm(noise_perm(noise_perm(ii + i2)  + jj + j2)  + kk + k2);

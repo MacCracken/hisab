@@ -103,3 +103,19 @@ Three changes reach ordinary inputs:
 `scripts/check-public-surface.sh` flips every module in a scratch copy on every CI run. It
 proves that no module reaches another's internals, and it checks that the shipped bundle
 carries the marker and refuses a private read.
+
+## 3.3.4: `f64_tan` is no longer hisab's
+
+cyrius 6.6.13 ships ganita 1.2.11, which defines `f64_tan` itself (an alias of the fdlibm
+`ganita_f64_tan`, within 1 ulp). hisab's own `public fn f64_tan`, a sin/cos quotient, then drew
+`duplicate fn 'f64_tan'` on every build, and the last definition (hisab's) replaced ganita's for
+the whole program. 3.3.4 removes hisab's definition. hisab's three internal callers
+(`m4_perspective_rh`, `m4_perspective_reverse_z`, `se3_log`) inline the same quotient, so their
+results do not change on any pin, and the minimum toolchain stays cyrius 6.6.3.
+
+| your pin | `f64_tan(x)` in your code |
+|---|---|
+| ≥ 6.6.13 | ganita's: same meaning, ≤ 1 ulp; bits differ from hisab's quotient on about a third of [−π/2, π/2] |
+| 6.6.3 – 6.6.12 | not defined: a reachable call is refused (`refusing to emit binary with 1 reachable undefined function(s)`). Define a local `f64_div(f64_sin(x), f64_cos(x))` |
+
+goonj and naad call it today (both on hisab 2.22.1).

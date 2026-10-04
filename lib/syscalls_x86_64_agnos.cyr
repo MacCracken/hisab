@@ -844,6 +844,10 @@ fn sys_fcntl(fd, cmd, arg): i64 { return 0 - 38; }
 fn fd_set_nonblocking(fd): i64 { return 0 - 38; }
 # Restore saved fd status flags. agnos has no fd status flags.
 fn fd_restore_flags(fd, saved): i64 { return 0 - 38; }
+# Wait for an fd to be ready. Declines (-38): agnos has no poll, and its socket reads are
+# already deadline-bounded inside the peer (_agnos_sock_recv_block / _agnos_sock_send_dl take
+# the wait in µs). CHANGELOG [6.6.13]
+fn fd_wait_ready(fd, want_write, timeout_ms): i64 { return 0 - 38; }
 
 # at-family constants. The Linux values, defined here so the PORTABLE surface is
 # complete: this peer is STANDALONE (it does not include syscalls_linux_common.cyr,
@@ -2330,7 +2334,20 @@ fn _agnos_sock_recv_block(conn_id, buf, n, tmo_us): i64 {
 # `n`, the partial count at the deadline or when the conn dies, or -1 if nothing was sent.
 # ⚠ Before v6.6.7 the 0 went straight back to the caller, and tls_native's _tn_sock_write_all
 # aborts on `w <= 0`, so a live connection that merely stalled for 8 s was torn down.
+# This is _agnos_sock_send_dl's rearm=1 form — the sys_write route, unchanged since 6.6.7.
 fn _agnos_sock_send_all(conn_id, buf, n, tmo_us): i64 {
+    return _agnos_sock_send_dl(conn_id, buf, n, tmo_us, 1);
+}
+
+# _agnos_sock_send_all with the deadline's scope chosen by `rearm`:
+#   rearm != 0 — `tmo_us` bounds a STALL: every call that moves bytes starts it again (sys_write).
+#   rearm == 0 — `tmo_us` bounds the WHOLE transfer: never re-armed, and the clock is checked
+#                after a call that moved bytes too, so a peer that keeps ACKing a trickle cannot
+#                stretch it (a caller's absolute deadline — tls_native's, with tmo_us = the time left).
+# Same returns: `n`, the partial count at the deadline or when the conn dies, -1 if nothing was
+# sent. ⚠ One sock_send#48 call is not interruptible: it can itself block ~8 s before answering 0
+# (agnos 1.57.7), so a rearm=0 deadline can overshoot by that much. CHANGELOG [6.6.13]
+fn _agnos_sock_send_dl(conn_id, buf, n, tmo_us, rearm): i64 {
     var dl[32];
     _agnos_dl_start(&dl, tmo_us);
     var sent = 0;
@@ -2339,7 +2356,11 @@ fn _agnos_sock_send_all(conn_id, buf, n, tmo_us): i64 {
         if (r < 0) { break; }               # conn gone / not ours
         if (r > 0) {
             sent = sent + r;
-            _agnos_dl_start(&dl, tmo_us);   # progress: the stall bound starts again
+            if (rearm != 0) {
+                _agnos_dl_start(&dl, tmo_us);   # progress: the stall bound starts again
+            } elif (sent < n) {
+                if (_agnos_dl_over(&dl) == 1) { break; }
+            }
         } else {
             if (_agnos_dl_over(&dl) == 1) { break; }
         }

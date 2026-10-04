@@ -19,13 +19,30 @@ var _GA_F64_QUARTER     = 0x3FD0_0000_0000_0000;  # 0.25
 var _GA_F64_NEG_HALF    = 0xBFE0_0000_0000_0000;  # -0.5
 var _GA_F64_NEG_ONE     = 0xBFF0_0000_0000_0000;  # -1.0
 var _GA_F64_TINY        = F64_TINY;      # alias of error.cyr (DBL_MIN)
-# 8 x DBL_EPSILON = 2^-49. The null-blade residual bound, MEASURED rather than
-# reused: over 3000 pseudo-random conformal points per scale, max |nsq| / sum b_i^2
-# is 2.13e-16 at coordinate scale 1 and 1.11e-16 from 1e2 to 1e8 — flat, i.e. the
-# residual really is relative. 8x is the margin over every measured null.
-# ⚠ NOT EPSILON_F64: at 1e-12 the bound is ~4500x looser than the measured noise
-# and discards resolvable geometry — a sphere of radius 10 centred at 1e4 has
-# nsq = 100 exactly (ratio 2.0e-14, 90x above the floor) and would be called null.
+# 8 x DBL_EPSILON = 2^-49 = 16 u: `cga_blade_inverse`'s null bound, relative to T,
+# the sum of the magnitudes of the terms `cga_norm_sq` adds (`_cga_null_bound`).
+# ⛔ 3.3.4 — RE-MEASURED AGAINST T. 2.14.0 measured it in the ep/em basis against
+# sum b_i^2, which in that basis IS T, and the 2.21.0 null basis made them differ
+# (see `cga_blade_inverse`). Against T, conformal points from 2^-480 to 2^480 reach
+# about 1 u and rotated points about 5 u (two samples), so 2^-49 sits at least 3x
+# above every one measured.
+# [measured: two scratch nullres samples, points and rotated points, 2026-10-03; cycc 6.6.14]
+# ⚠ A point TRANSLATED to near the origin can exceed any bound: its residual is set
+# by the translation distance, which the blade no longer carries, and its
+# coefficients are those of a small origin sphere. 2 of 4820 random same-scale
+# translations exceed 16 u, and 4475 of 4820 aimed at the origin (landing within
+# 2^-1 to 2^-39 of the distance travelled).
+# [measured: scratch nullres sweep, translated and aimed points, 2026-10-03; cycc 6.6.14]
+# ⚠ ACCEPTED SIDE EFFECT OF 3.3.4: such a point now INVERTS. Against sum b_i^2 the
+# moved point's own (q/2)^2 kept most of them null — 3.3.3 inverted 0 of 691 tiny,
+# 27 of 97 unit-scale and 6 of 717 large re-centred points. Against T, about three
+# quarters of re-centred points invert at every scale, and so do 1, 4 and 6 of 2,000
+# points moved by a random rigid motion at 2^-20, 2^0 and 2^20, with inverses around
+# 1e14 where 3.3.3 gave the zero multivector.
+# [measured: re-centred and rigid-motion point sweeps, 3.3.4 base and this tree, 2026-10-03; cycc 6.6.14]
+# ⚠ NOT EPSILON_F64: at 1e-12 the bound was ~4500x looser than the measured noise
+# and discarded resolvable geometry — against sum b_i^2, a sphere of radius 10
+# centred at 1e4 (nsq = 100 exactly, ratio 2.0e-14) was called null.
 # [measured: docs/audit/2026-09-09-epsilon-open.json]
 var _CGA_NULL_TOL       = 0x3CE0_0000_0000_0000;  # 1.7763568394002505e-15
 var _GA_F64_POS_INF = F64_POS_INF;   # alias of error.cyr
@@ -92,12 +109,73 @@ public var EPA_MAX_ITER = 64;
 # This returns the farthest point on the shape in the given direction.
 # GJK works on the Minkowski difference: support_A(d) - support_B(-d).
 
+# ⛔ 3.3.4 — THE FIVE ENTRY POINTS DISAGREED ON A NON-FINITE SHAPE. A NaN in a centre,
+# a radius or a half-extent was a miss from all of them, but a support that was NaN
+# in some directions only, or infinite, was a contact to some and a miss to others:
+# a box with half-extent (+Inf, 1, 1) against a unit box gave gjk_intersect_3d 1 and
+# gjk_epa_3d 0, swapped operands gave gjk_epa_3d 1 with the normal (0, 0, 0), and the
+# same box 10 units away was a contact to gjk_intersect_3d too. None of those answers
+# came from the geometry: one infinite coordinate makes every difference of two
+# support points along it Inf - Inf = NaN, and the NaN-true guards then decide.
+# [measured: tests/modules.tcyr "one contract" block run on the 3.3.4 base sources, 2026-10-03; cycc 6.6.14]
+# ⭐ ONE CONTRACT: a pair is a MISS if any support point evaluated for it has a NaN
+# or infinite coordinate -- 0 from gjk_intersect_3d and mpr_intersect, 0 with the
+# unit_x / depth-0 placeholders from gjk_epa_3d and mpr_penetration, and 0 with
+# neither out-param written from time_of_impact (as a NaN horizon gets). It is the
+# documented answer for a NaN shape, extended to infinite ones because no algorithm
+# here can measure a body that has no finite support point: an unbounded slab that
+# really does overlap a unit box is a miss too, and that is a domain limit, not a
+# finding. _gjk_mink_support raises this flag; each entry point clears it on entry
+# and reads it before it answers.
+# ⚠ It convicts the DIFFERENCE, so FINITE shapes near DBL_MAX are misses too: a support
+# point that overflows (a sphere of radius 9e307 centred at 1e308) or a difference that
+# does (two coincident boxes of half-extent (1.7e308, 1, 1)). Four overlapping pairs of
+# that kind went from right to wrong -- a contact to gjk_intersect_3d, mpr_intersect and
+# time_of_impact on the 3.3.4 base, a miss now -- and one separated pair (boxes of
+# half-extent 1e308, 10 apart in y) from wrong to right. Convicting on the two support
+# points instead of their difference restores only the coincident boxes, since the other
+# three overflow in a support point, and brings back that separated pair's contact.
+# [measured: probe of those pairs on the 3.3.4 base, this tree and that variant, 2026-10-03; cycc 6.6.14]
+# ⭐ AND EVERY CONTACT ASKS FOUR MORE DIRECTIONS FIRST (_gjk_contact_finite): the
+# tetrahedral ones, at least one of which lies inside any open half-space of
+# directions, for each shape. A support that is non-finite on a half-space is
+# therefore found by all five, whichever directions their own search took. One that
+# is non-finite only on a narrower cone can still be answered differently by
+# different entry points, since none of them evaluates every direction.
+var _GA_SUP_NONFINITE = 0;
+
 # Minkowski difference support: A(dir) - B(-dir)
 fn _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir) {
     var pa = fncall2(sup_a, shape_a, dir);
     var neg_dir = hvec3_neg(dir);
     var pb = fncall2(sup_b, shape_b, neg_dir);
-    return hvec3_sub(pa, pb);
+    var r = hvec3_sub(pa, pb);
+    # x - x is +0 for every finite x and NaN for +-Inf and NaN, so the sum is 0
+    # exactly when all three coordinates are finite. Only a FINITE direction can
+    # convict the shapes: a direction the algorithm itself overflowed (a cross
+    # product of two large edges) proves nothing about them.
+    if (_ga_finite3(r) == 0 && _ga_finite3(dir) == 1) { _GA_SUP_NONFINITE = 1; }
+    return r;
+}
+
+# 1 when all three coordinates of v are finite (see _gjk_mink_support).
+fn _ga_finite3(v) {
+    var x = HVec3_x(v);
+    var y = HVec3_y(v);
+    var z = HVec3_z(v);
+    return f64_eq(f64_add(f64_add(f64_sub(x, x), f64_sub(y, y)), f64_sub(z, z)), 0);
+}
+
+# 1 when the pair may be answered as a contact: the four tetrahedral directions
+# (1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1) all have finite support points
+# and no earlier one did not. They sum to zero, so any open half-space contains one.
+fn _gjk_contact_finite(sup_a, shape_a, sup_b, shape_b) {
+    var m = _GA_F64_NEG_ONE;
+    _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_new(F64_ONE, F64_ONE, F64_ONE));
+    _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_new(F64_ONE, m, m));
+    _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_new(m, F64_ONE, m));
+    _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_new(m, m, F64_ONE));
+    return 1 - _GA_SUP_NONFINITE;
 }
 
 # --- Simplex helpers (tetrahedron-based GJK in 3D) ---
@@ -429,11 +507,48 @@ fn _gjk_certifies_apart(sup_a, shape_a, sup_b, shape_b, dir) {
 # exactly the pre-2.9.0 answer -- never a false one. Measured false positives
 # against the exact reference: 0 of 2,214 separated pair evaluations
 # (sphere/sphere 0, box/box 0, sphere/box 0).
+# ⚠ Since 3.3.4 that holds for the gate only. The cycling fallback in
+# _gjk_intersect_core is a second way to a 1, on an exit with no certificate, and
+# the portal it asks is not a proof: it answers 1 only when EPA refines a depth above
+# 1e-9 of |s(x) - s(-x)| from that portal (_gjk_portal_deep).
 public fn gjk_intersect_3d(support_a, shape_a, support_b, shape_b) {
+    _GA_SUP_NONFINITE = 0;
+    var r = _gjk_intersect_core(support_a, shape_a, support_b, shape_b);
+    if (r == 1) { r = _gjk_contact_finite(support_a, shape_a, support_b, shape_b); }
+    if (_GA_SUP_NONFINITE == 1) { return 0; }
+    return r;
+}
+
+# gjk_intersect_3d without the non-finite contract around it: mpr_intersect and
+# time_of_impact call this inside their own, so the flag spans the whole query.
+fn _gjk_intersect_core(support_a, shape_a, support_b, shape_b) {
     var exit_dir = alloc(8);
     if (exit_dir == 0) { return 0; }
     var result = _gjk_core_dir_3d(support_a, shape_a, support_b, shape_b, exit_dir);
     if (result != 0) { return 1; }
+    # ⛔ 3.3.4 — GJK CAN CYCLE, AND A CYCLE WAS A MISS. A point at the exact centre of
+    # a box rotated about z is deep inside it, yet the simplex can revisit the same
+    # support points for all GJK_MAX_ITER rounds: no tetrahedron encloses the origin
+    # and no direction separates it. That exit carries no certificate (out_dir 0), the
+    # re-reading below has nothing to read, the touch probe finds no touch, and the
+    # answer was 0 -- from this and from gjk_epa_3d -- while mpr_intersect, whose
+    # portal does not cycle, answered 1. With tests/modules.tcyr's OBB support, 91 of
+    # 8,000 random rotated boxes with a point at the centre; with the rotation applied
+    # to the corner instead, 353 of 8,000.
+    # [measured: cycling sweeps on this tree with and without the fallback, 2026-10-03; cycc 6.6.14]
+    # ⭐ An exit with no certificate now asks the same portal, and runs only where GJK
+    # cycled. The portal is not a proof on its own -- near a tangency its sliver faces
+    # can enclose an origin that lies just outside -- so its 1 is taken only when the
+    # depth EPA refines from it exceeds 1e-9 of |s(x) - s(-x)|, the distance between
+    # the difference's support points along +-x (_gjk_portal_deep). Taken alone it made
+    # separated sphere/capsule pairs 1e-12 apart contacts (5 -> 50 of 466); with the
+    # depth condition the separated sweeps give the base's answers.
+    # [measured: separated near-tangent sweeps vs an exact separating plane, base and tree, 2026-10-03; cycc 6.6.14]
+    if (load64(exit_dir) == 0) {
+        var pseed = alloc(32);
+        if (pseed == 0) { return 0; }
+        if (_gjk_portal_deep(support_a, shape_a, support_b, shape_b, pseed) == 1) { return 1; }
+    }
     if (_gjk_certifies_apart(support_a, shape_a, support_b, shape_b, load64(exit_dir)) == 1) {
         return 0;
     }
@@ -444,6 +559,26 @@ public fn gjk_intersect_3d(support_a, shape_a, support_b, shape_b) {
     var touch_n = alloc(8);
     if (touch_n == 0) { return 0; }
     return _epa_touch_probe(support_a, shape_a, support_b, shape_b, touch_n);
+}
+
+# The cycling fallback's portal, accepted only when the depth EPA refines from it
+# exceeds the contact tolerance of the difference's x-extent. Near a tangency the
+# portal's sliver faces can "enclose" an origin that lies outside: sphere/capsule
+# pairs 1e-12 apart came back as contacts of depth up to 4.9e-10.
+# [measured: separated near-tangent sweep vs an exact separating plane, 2026-10-03; cycc 6.6.14]
+fn _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed) {
+    if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) != 1) { return 0; }
+    var px = _gjk_mink_support(support_a, shape_a, support_b, shape_b, hvec3_unit_x());
+    var nx = _gjk_mink_support(support_a, shape_a, support_b, shape_b, hvec3_neg(hvec3_unit_x()));
+    var lim = f64_mul(hvec3_length(hvec3_sub(px, nx)), _GA_TOI_TOL_REL);
+    var s2 = alloc(32);
+    if (s2 == 0) { return 0; }
+    for (var i = 0; i < 4; i = i + 1) { store64(s2 + i * 8, load64(seed + i * 8)); }
+    var ns = alloc(8);
+    var ds = alloc(8);
+    if (ns == 0 || ds == 0) { return 0; }
+    if (_epa_refine(support_a, shape_a, support_b, shape_b, s2, ns, ds) != 1) { return 0; }
+    return f64_gt(load64(ds), lim);
 }
 
 # --- EPA 3D (Expanding Polytope Algorithm) ---
@@ -735,10 +870,16 @@ fn _epa_tetra_strict(seed) {
 
 # Seed from GJK's terminating simplex.
 # Returns 0 = shapes do not overlap, 1 = out4 holds a usable tetrahedron,
-# 2 = they overlap but the simplex is not a usable seed (caller should fall back).
+# 2 = they overlap but the simplex is not a usable seed (caller should fall back),
+# 3 = GJK ran out of iterations with neither answer (see _gjk_intersect_core).
 fn _epa_seed_gjk(sup_a, shape_a, sup_b, shape_b, out4) {
-    var simplex = _gjk_core_3d(sup_a, shape_a, sup_b, shape_b);
-    if (simplex == 0) { return 0; }
+    var cert = alloc(8);
+    if (cert == 0) { return 0; }
+    var simplex = _gjk_core_dir_3d(sup_a, shape_a, sup_b, shape_b, cert);
+    if (simplex == 0) {
+        if (load64(cert) == 0) { return 3; }
+        return 0;
+    }
     if (_gjk_simplex_count(simplex) < 4) { return 2; }
     for (var i = 0; i < 4; i = i + 1) { store64(out4 + i * 8, _gjk_simplex_get(simplex, i)); }
     if (_epa_tetra_ok(out4) == 1) { return 1; }
@@ -1399,6 +1540,19 @@ fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
 # normal too since 3.3.3; through 3.3.2 both of its touch paths could hand back
 # the inward one (see _epa_outward).
 public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    _GA_SUP_NONFINITE = 0;
+    var r = _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth);
+    if (r == 1) { r = _gjk_contact_finite(support_a, shape_a, support_b, shape_b); }
+    if (_GA_SUP_NONFINITE == 1) {
+        store64(out_normal, hvec3_unit_x());
+        store64(out_depth, 0);
+        return 0;
+    }
+    return r;
+}
+
+# gjk_epa_3d without the non-finite contract around it (time_of_impact's t = 0 normal).
+fn _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
     # EVERY RETURN PATH WRITES BOTH OUT-PARAMS, established here so no later
     # branch can forget. alloc() hands back zeroed pages, so a path that returned
     # without writing published the NULL HVec3 into the caller's slot, and the
@@ -1412,6 +1566,13 @@ public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_dep
     var seed = alloc(32);
     if (seed == 0) { return 0; }
     var s = _epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed);
+    if (s == 3) {
+        # GJK cycled without an answer: the portal decides, as in gjk_intersect_3d.
+        if (_gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed) == 1) {
+            return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
+        }
+        s = 0;
+    }
     if (s == 0) {
         # "No simplex enclosed the origin" is also what GJK reports for an EXACT
         # TANGENCY, where the origin sits on the boundary of the difference and
@@ -1520,10 +1681,16 @@ public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_dep
 # the touch probe only on a genuinely unresolved GJK exit.
 # [measured: CHANGELOG.md 2.9.1, the 7,540-evaluation exact classification and timings]
 public fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
+    _GA_SUP_NONFINITE = 0;
     var seed = alloc(32);
     if (seed == 0) { return 0; }
-    if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) == 1) { return 1; }
-    return gjk_intersect_3d(support_a, shape_a, support_b, shape_b);
+    var r = 1;
+    if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) != 1) {
+        r = _gjk_intersect_core(support_a, shape_a, support_b, shape_b);
+    }
+    if (r == 1) { r = _gjk_contact_finite(support_a, shape_a, support_b, shape_b); }
+    if (_GA_SUP_NONFINITE == 1) { return 0; }
+    return r;
 }
 
 # mpr_penetration -- returns 1 on success, writes normal/depth to out pointers
@@ -1574,6 +1741,19 @@ public fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
 # move together. The probe is the SAME certificate gjk_epa_3d runs on its own
 # no-seed path, and it writes out_normal only when it has one.
 public fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    _GA_SUP_NONFINITE = 0;
+    var r = _mpr_penetration_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth);
+    if (r == 1) { r = _gjk_contact_finite(support_a, shape_a, support_b, shape_b); }
+    if (_GA_SUP_NONFINITE == 1) {
+        store64(out_normal, hvec3_unit_x());
+        store64(out_depth, 0);
+        return 0;
+    }
+    return r;
+}
+
+# mpr_penetration without the non-finite contract around it.
+fn _mpr_penetration_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
     # EVERY RETURN PATH WRITES BOTH OUT-PARAMS, the convention gjk_epa_3d has
     # carried since 2.8.3 (gjk_epa_3d, above). This sibling never got it:
     # every 0 return left the caller's slots untouched, so a caller who passed
@@ -1730,7 +1910,8 @@ fn _bvh_item_swap(items, i, j) {
 # items: vec of interleaved [aabb_ptr, index, cx, cy, cz, ...] -- item i
 #        occupies items[i*5 .. i*5+4]
 # start, end: half-open item range
-fn _bvh_build_rec(items, start, end) {
+# inverted: 1 when some input box has min > max on an axis (bvh_build scans for it)
+fn _bvh_build_rec(items, start, end, inverted) {
     var count = end - start;
     if (count == 1) {
         var aabb = vec_get(items, start * _BVH_ITEM_SIZE);
@@ -1759,14 +1940,51 @@ fn _bvh_build_rec(items, start, end) {
         hi_z = _bvh_fmax(hi_z, HVec3_z(bmax));
     }
     # A slab NaN on one side is made NaN on both, which is what geo_aabb_new makes
-    # of such a pair. With one side finite, _bvh_ray_hits_aabb still clips the ray
-    # at it, and from the wrong end when the ray runs backwards along that axis: a
-    # NaN min.x in the middle box above, and a ray running -x from x = 10 into the
-    # first, gave a root slab of [NaN, 9] and no hit, as [8, 9] did through 3.3.2.
+    # of such a pair. With one side finite, _bvh_ray_hits_aabb clipped the ray at it
+    # through 3.3.3, and from the wrong end when the ray runs backwards along that
+    # axis: a NaN min.x in the middle box above, and a ray running -x from x = 10
+    # into the first, gave a root slab of [NaN, 9] and no hit, as [8, 9] did through
+    # 3.3.2.
     # [measured: R3a probes, 3.3.2 bundle and this tree without these lines, 2026-10-01; cycc 6.6.12]
+    # ⚠ Since 3.3.4 the ray test skips a slab whose crossing pair holds a NaN, so
+    # neither walker needs these lines any more: without them only the bounds
+    # assertions of tests/modules.tcyr's R3a group fail, and its -x ray still finds
+    # box 0. They stay so that a node reads as geo_aabb_new would build it.
+    # [measured: spatial lane, these three lines removed, modules suite, 2026-10-03; cycc 6.6.14]
     if (f64_eq(lo_x, lo_x) == 0) { hi_x = lo_x; } elif (f64_eq(hi_x, hi_x) == 0) { lo_x = hi_x; }
     if (f64_eq(lo_y, lo_y) == 0) { hi_y = lo_y; } elif (f64_eq(hi_y, hi_y) == 0) { lo_y = hi_y; }
     if (f64_eq(lo_z, lo_z) == 0) { hi_z = lo_z; } elif (f64_eq(hi_z, hi_z) == 0) { lo_z = hi_z; }
+
+    # ⛔ 3.3.4 — AN INVERTED INPUT BOX (min > max on an axis, made with the setters)
+    # GAVE AN UNSORTED NODE. The fold above takes the least min and the greatest max,
+    # so boxes with x-slabs [5, 1] and [6, 2] made the node [5, 2]. The ray walker
+    # orders each slab's two crossings, which reads that node as [2, 5] and each leaf
+    # as [1, 5] and [2, 6], so a ray along +x from x = 5.5 pruned the node and lost
+    # the second box, which the same test on that box alone reports as hit. The node
+    # now also folds every max into lo and every min into hi -- the hull of all the
+    # bounds below it, which is the fold of the SORTED boxes. It runs before the axis
+    # and mid_val are chosen, so an inverted box is read as its sorted box throughout:
+    # the same bounds, the same partition and the same node order (the centroid
+    # (min + max) / 2 does not depend on the order either). Only a build whose input
+    # holds an inverted box runs the second pass; every other build is unchanged.
+    # [measured: spatial lane probe, 3.3.4-base and repaired bundles, not in-tree, 2026-10-03; cycc 6.6.14]
+    # 300 random scenes of 2 to 61 boxes, a third of the slabs inverted: the tree
+    # built from them answered 12000 ray and 12000 box queries as the sorted boxes'
+    # tree does, in the same order (11828 and 5560 before), each walk its leaf test.
+    # [measured: BVH differential, 3.3.4 tree before this and after, not in-tree, 2026-10-03; cycc 6.6.14]
+    if (inverted == 1) {
+        for (var ci = start; ci < end; ci = ci + 1) {
+            var cbox = vec_get(items, ci * _BVH_ITEM_SIZE);
+            var cmin = GeoAabb_min(cbox);
+            var cmax = GeoAabb_max(cbox);
+            lo_x = _bvh_fmin(lo_x, HVec3_x(cmax));
+            lo_y = _bvh_fmin(lo_y, HVec3_y(cmax));
+            lo_z = _bvh_fmin(lo_z, HVec3_z(cmax));
+            hi_x = _bvh_fmax(hi_x, HVec3_x(cmin));
+            hi_y = _bvh_fmax(hi_y, HVec3_y(cmin));
+            hi_z = _bvh_fmax(hi_z, HVec3_z(cmin));
+        }
+    }
 
     # Find longest axis
     var sx = f64_abs(f64_sub(hi_x, lo_x));
@@ -1786,8 +2004,9 @@ fn _bvh_build_rec(items, start, end) {
 
     # One GeoAabb per node. geo_aabb_new would re-run hvec3_min/hvec3_max
     # over an already-sorted pair for two more heap blocks; lo_* <= hi_*
-    # holds by construction of the fold above for sorted input boxes, and a
-    # NaN slab is NaN on both sides (above), which geo_aabb_new would keep.
+    # holds by construction of the fold above (with the hull pass for inverted
+    # input), and a NaN slab is NaN on both sides (above; the hull pass keeps a
+    # NaN, as IEEE minimum/maximum do), which geo_aabb_new would keep.
     var bounds = alloc(sizeof(GeoAabb));
     GeoAabb_set_min(bounds, hvec3_new(lo_x, lo_y, lo_z));
     GeoAabb_set_max(bounds, hvec3_new(hi_x, hi_y, hi_z));
@@ -1817,8 +2036,8 @@ fn _bvh_build_rec(items, start, end) {
     if (split <= start) { split = start + count / 2; }
     if (split >= end) { split = start + count / 2; }
 
-    var left = _bvh_build_rec(items, start, split);
-    var right = _bvh_build_rec(items, split, end);
+    var left = _bvh_build_rec(items, start, split, inverted);
+    var right = _bvh_build_rec(items, split, end, inverted);
     return _bvh_node_alloc(bounds, left, right, 0 - 1);
 }
 
@@ -1845,10 +2064,15 @@ public fn bvh_build(aabbs, count) {
     if (aabbs == 0) { return 0; }
 
     var items = vec_new();
+    var inverted = 0;
     for (var bi = 0; bi < count; bi = bi + 1) {
         var box = load64(aabbs + bi * 8);
         var bmin = GeoAabb_min(box);
         var bmax = GeoAabb_max(box);
+        # An inverted box anywhere switches on _bvh_build_rec's hull pass.
+        if (f64_lt(HVec3_x(bmax), HVec3_x(bmin)) == 1) { inverted = 1; }
+        if (f64_lt(HVec3_y(bmax), HVec3_y(bmin)) == 1) { inverted = 1; }
+        if (f64_lt(HVec3_z(bmax), HVec3_z(bmin)) == 1) { inverted = 1; }
         vec_push(items, box);
         vec_push(items, bi);
         # Centroid ONCE, here -- the same (min + max) * 0.5 geo_aabb_center
@@ -1857,10 +2081,11 @@ public fn bvh_build(aabbs, count) {
         vec_push(items, f64_mul(f64_add(HVec3_y(bmin), HVec3_y(bmax)), F64_HALF));
         vec_push(items, f64_mul(f64_add(HVec3_z(bmin), HVec3_z(bmax)), F64_HALF));
     }
-    return _bvh_build_rec(items, 0, count);
+    return _bvh_build_rec(items, 0, count, inverted);
 }
 
-# Does the ray meet the box at any t >= 0? Returns 1 or 0.
+# Does the ray meet the box at any t >= 0? Returns 1 (yes), 0 (no), or 2 (cannot
+# tell: a slab read a NaN).
 #
 # THE BVH WALKER NEEDS A PREDICATE, NOT A DISTANCE. geo_ray_aabb returns the hit
 # parameter t and uses 0 as its miss sentinel, so "miss" and "hit exactly at
@@ -1881,6 +2106,33 @@ public fn bvh_build(aabbs, count) {
 # the origin (t_max >= 0). geo_ray_aabb itself is left alone -- its 0-on-miss
 # convention is documented, shared with every other geo_ray_* function, and
 # depended on elsewhere; the defect was reading a distance as a boolean.
+#
+# ⛔ 3.3.4 — A NaN SLAB WAS READ FROM ITS FINITE SIDE. With min.x NaN and max.x = 1,
+# the crossing pair (NaN, x2) never ordered, so x2 was taken as the exit whichever
+# way the ray ran: one box hit for a +x ray from x = -5 and a -x ray from x = 5, and
+# missed by a +x ray from x = 5. A NaN origin coordinate left the decision to the
+# other slabs, and a NaN direction (geo_ray_new spreads one NaN component to all
+# three) hit every box in the tree. A slab with a NaN crossing, or a NaN in the
+# parallel test, now neither includes nor excludes: it is skipped and the answer
+# is 2. The walker descends a node on 1 or 2, because a node's slab is NaN whenever
+# any box below it is, and reports a leaf only on 1, so a NaN box is never hit --
+# the rule geo_aabb_aabb keeps for bvh_query_aabb. A skipped slab no longer resets
+# t_min and t_max either (the old fold handed them the NaN, which the next slab
+# replaced). A slab whose two crossings are not NaN makes the comparisons made
+# before. A crossing is NaN with no NaN in when an infinite origin coordinate sits ON
+# a bound of the same infinity (Inf - Inf). The origin stays on that bound for every
+# finite t, so the slab holds the ray: each slab's last three arms tell that case
+# (origin inside the slab, finite direction) from a NaN input, and pass it.
+# [measured: spatial lane probe, 3.3.4-base and repaired bundles, not in-tree, 2026-10-03; cycc 6.6.14]
+# Without those three arms that case was "cannot tell", a leaf it never reports: over
+# 30000 random rays, judged by an extended-real oracle, 44 box-ray pairs with no NaN
+# went from right to wrong against 3.3.4-base, and with them 1 does, whose direction
+# has a component below DBL_MIN that the parallel test reads as 0 (3.3.3's too).
+# [measured: BVH review sweep, extended-real oracle, 3.3.4-base vs this tree, not in-tree, 2026-10-03; cycc 6.6.14]
+# ⛔ 3.3.4 — AN INVERTED BOX IS READ SORTED, geo_ray_aabb's rule (src/geo.cyr): a
+# parallel slab misses only below both bounds or above both, so the slab [5, 1] holds
+# an axial ray at x = 3 as [1, 5] does, which the crossing slabs already did. Each
+# inner test is implied by its outer one for min <= max and false for a NaN bound.
 fn _bvh_ray_hits_aabb(ray, aabb) {
     var ox = HVec3_x(GeoRay_origin(ray));
     var oy = HVec3_y(GeoRay_origin(ray));
@@ -1893,64 +2145,120 @@ fn _bvh_ray_hits_aabb(ray, aabb) {
 
     var t_min = _GA_F64_NEG_INF;
     var t_max = _GA_F64_POS_INF;
+    var unknown = 0;
 
     # X slab
     if (f64_lt(f64_abs(dx), _GA_F64_TINY) == 1) {
-        if (f64_lt(ox, HVec3_x(bmin)) == 1) { return 0; }
-        if (f64_gt(ox, HVec3_x(bmax)) == 1) { return 0; }
+        if (f64_ge(ox, HVec3_x(bmin)) == 0) {
+            if (f64_lt(ox, HVec3_x(bmin)) == 1) {
+                if (f64_ge(ox, HVec3_x(bmax)) == 0) { return 0; }
+            } else { unknown = 1; }
+        } elif (f64_le(ox, HVec3_x(bmax)) == 0) {
+            if (f64_gt(ox, HVec3_x(bmax)) == 1) {
+                if (f64_le(ox, HVec3_x(bmin)) == 0) { return 0; }
+            } else { unknown = 1; }
+        }
     } else {
         var ix = f64_div(F64_ONE, dx);
         var x1 = f64_mul(f64_sub(HVec3_x(bmin), ox), ix);
         var x2 = f64_mul(f64_sub(HVec3_x(bmax), ox), ix);
-        if (f64_gt(x1, x2) == 1) { var xt = x1; x1 = x2; x2 = xt; }
-        t_min = f64_max(t_min, x1);
-        t_max = f64_min(t_max, x2);
+        if (f64_le(x1, x2) == 1) {
+            t_min = f64_max(t_min, x1);
+            t_max = f64_min(t_max, x2);
+        } elif (f64_gt(x1, x2) == 1) {
+            t_min = f64_max(t_min, x2);
+            t_max = f64_min(t_max, x1);
+        } elif (f64_ge(ox, HVec3_x(bmin)) == 0) {
+            unknown = 1;
+        } elif (f64_le(ox, HVec3_x(bmax)) == 0) {
+            unknown = 1;
+        } elif (f64_lt(f64_abs(dx), _GA_F64_POS_INF) == 0) {
+            unknown = 1;
+        }
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     }
 
     # Y slab
     if (f64_lt(f64_abs(dy), _GA_F64_TINY) == 1) {
-        if (f64_lt(oy, HVec3_y(bmin)) == 1) { return 0; }
-        if (f64_gt(oy, HVec3_y(bmax)) == 1) { return 0; }
+        if (f64_ge(oy, HVec3_y(bmin)) == 0) {
+            if (f64_lt(oy, HVec3_y(bmin)) == 1) {
+                if (f64_ge(oy, HVec3_y(bmax)) == 0) { return 0; }
+            } else { unknown = 1; }
+        } elif (f64_le(oy, HVec3_y(bmax)) == 0) {
+            if (f64_gt(oy, HVec3_y(bmax)) == 1) {
+                if (f64_le(oy, HVec3_y(bmin)) == 0) { return 0; }
+            } else { unknown = 1; }
+        }
     } else {
         var iy = f64_div(F64_ONE, dy);
         var y1 = f64_mul(f64_sub(HVec3_y(bmin), oy), iy);
         var y2 = f64_mul(f64_sub(HVec3_y(bmax), oy), iy);
-        if (f64_gt(y1, y2) == 1) { var yt = y1; y1 = y2; y2 = yt; }
-        t_min = f64_max(t_min, y1);
-        t_max = f64_min(t_max, y2);
+        if (f64_le(y1, y2) == 1) {
+            t_min = f64_max(t_min, y1);
+            t_max = f64_min(t_max, y2);
+        } elif (f64_gt(y1, y2) == 1) {
+            t_min = f64_max(t_min, y2);
+            t_max = f64_min(t_max, y1);
+        } elif (f64_ge(oy, HVec3_y(bmin)) == 0) {
+            unknown = 1;
+        } elif (f64_le(oy, HVec3_y(bmax)) == 0) {
+            unknown = 1;
+        } elif (f64_lt(f64_abs(dy), _GA_F64_POS_INF) == 0) {
+            unknown = 1;
+        }
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     }
 
     # Z slab
     if (f64_lt(f64_abs(dz), _GA_F64_TINY) == 1) {
-        if (f64_lt(oz, HVec3_z(bmin)) == 1) { return 0; }
-        if (f64_gt(oz, HVec3_z(bmax)) == 1) { return 0; }
+        if (f64_ge(oz, HVec3_z(bmin)) == 0) {
+            if (f64_lt(oz, HVec3_z(bmin)) == 1) {
+                if (f64_ge(oz, HVec3_z(bmax)) == 0) { return 0; }
+            } else { unknown = 1; }
+        } elif (f64_le(oz, HVec3_z(bmax)) == 0) {
+            if (f64_gt(oz, HVec3_z(bmax)) == 1) {
+                if (f64_le(oz, HVec3_z(bmin)) == 0) { return 0; }
+            } else { unknown = 1; }
+        }
     } else {
         var iz = f64_div(F64_ONE, dz);
         var z1 = f64_mul(f64_sub(HVec3_z(bmin), oz), iz);
         var z2 = f64_mul(f64_sub(HVec3_z(bmax), oz), iz);
-        if (f64_gt(z1, z2) == 1) { var zt = z1; z1 = z2; z2 = zt; }
-        t_min = f64_max(t_min, z1);
-        t_max = f64_min(t_max, z2);
+        if (f64_le(z1, z2) == 1) {
+            t_min = f64_max(t_min, z1);
+            t_max = f64_min(t_max, z2);
+        } elif (f64_gt(z1, z2) == 1) {
+            t_min = f64_max(t_min, z2);
+            t_max = f64_min(t_max, z1);
+        } elif (f64_ge(oz, HVec3_z(bmin)) == 0) {
+            unknown = 1;
+        } elif (f64_le(oz, HVec3_z(bmax)) == 0) {
+            unknown = 1;
+        } elif (f64_lt(f64_abs(dz), _GA_F64_POS_INF) == 0) {
+            unknown = 1;
+        }
         if (f64_gt(t_min, t_max) == 1) { return 0; }
     }
 
     # Behind the origin entirely -> not a forward hit, same as geo_ray_aabb.
     if (f64_lt(t_max, 0) == 1) { return 0; }
+    if (unknown == 1) { return 2; }
     return 1;
 }
 
 # Query BVH for ray hits. Returns a vec of hit primitive indices.
+# A node is descended unless the ray provably misses it (0); a leaf is reported only
+# when the ray provably meets it (1). See _bvh_ray_hits_aabb for why the two differ.
 fn _bvh_query_ray_rec(node, ray, results) {
     if (node == 0) { return 0; }
     var aabb = _bvh_node_aabb(node);
-    if (_bvh_ray_hits_aabb(ray, aabb) == 0) { return 0; }
+    var hit = _bvh_ray_hits_aabb(ray, aabb);
+    if (hit == 0) { return 0; }
 
     var leaf_idx = _bvh_node_leaf_idx(node);
     if (leaf_idx != 0 - 1) {
         # Leaf node
-        vec_push(results, leaf_idx);
+        if (hit == 1) { vec_push(results, leaf_idx); }
     } else {
         _bvh_query_ray_rec(_bvh_node_left(node), ray, results);
         _bvh_query_ray_rec(_bvh_node_right(node), ray, results);
@@ -1964,25 +2272,53 @@ public fn bvh_query_ray(bvh, ray) {
     return results;
 }
 
+# The NODE test of bvh_query_aabb: 0 only when an axis provably separates the two
+# boxes, so a NaN bound never prunes (every test that reads it is false). This is
+# what geo_aabb_aabb was through 3.3.3; 3.3.4 made that NaN-false, and a node is NaN
+# in a slab whenever any box below it is, so it cannot prune with it. Its leaves
+# still answer with geo_aabb_aabb.
+fn _bvh_aabb_may_overlap(a, b) {
+    var a_min = GeoAabb_min(a);
+    var a_max = GeoAabb_max(a);
+    var b_min = GeoAabb_min(b);
+    var b_max = GeoAabb_max(b);
+    if (f64_gt(HVec3_x(a_min), HVec3_x(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_y(a_min), HVec3_y(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_z(a_min), HVec3_z(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_x(b_min), HVec3_x(a_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_y(b_min), HVec3_y(a_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_z(b_min), HVec3_z(a_max)) == 1) { return 0; }
+    return 1;
+}
+
 # Query BVH for AABB overlaps. Returns a vec of overlapping primitive indices.
 fn _bvh_query_aabb_rec(node, query, results) {
     if (node == 0) { return 0; }
     var aabb = _bvh_node_aabb(node);
-    if (geo_aabb_aabb(aabb, query) == 0) { return 0; }
 
     var leaf_idx = _bvh_node_leaf_idx(node);
     if (leaf_idx != 0 - 1) {
-        vec_push(results, leaf_idx);
-    } else {
-        _bvh_query_aabb_rec(_bvh_node_left(node), query, results);
-        _bvh_query_aabb_rec(_bvh_node_right(node), query, results);
+        if (geo_aabb_aabb(aabb, query) == 1) { vec_push(results, leaf_idx); }
+        return 0;
     }
+    if (_bvh_aabb_may_overlap(aabb, query) == 0) { return 0; }
+    _bvh_query_aabb_rec(_bvh_node_left(node), query, results);
+    _bvh_query_aabb_rec(_bvh_node_right(node), query, results);
     return 0;
 }
 
 public fn bvh_query_aabb(bvh, aabb) {
     var results = vec_new();
-    _bvh_query_aabb_rec(bvh, aabb, results);
+    # An inverted query box (min above max on an axis) is read sorted, as its leaf
+    # test geo_aabb_aabb reads it (3.3.4). The node test reads a box as stored, so
+    # the walk takes the sorted copy; a query with min <= max is passed as it is.
+    var qmin = GeoAabb_min(aabb);
+    var qmax = GeoAabb_max(aabb);
+    var q = aabb;
+    if (f64_lt(HVec3_x(qmax), HVec3_x(qmin)) == 1) { q = geo_aabb_new(qmin, qmax); }
+    if (f64_lt(HVec3_y(qmax), HVec3_y(qmin)) == 1) { q = geo_aabb_new(qmin, qmax); }
+    if (f64_lt(HVec3_z(qmax), HVec3_z(qmin)) == 1) { q = geo_aabb_new(qmin, qmax); }
+    _bvh_query_aabb_rec(bvh, q, results);
     return results;
 }
 
@@ -2070,6 +2406,79 @@ public fn swept_aabb(aabb, velocity, dt) {
 # time remaining to contact. That cannot tunnel by construction: it never
 # advances past the first contact, so there is no window to step over.
 
+# --- Scale-free arithmetic for the distance query (3.3.4, D045) --------------
+#
+# ⛔ 3.3.4 — THE QUERY SQUARED ITS LENGTHS, SO IT WAS RIGHT ONLY IN A BAND OF SCALES.
+# Its escape tested |v|^2 <= 0, its optimality test and lower bound were built on
+# |v|^2 and v . p, and the closest-point routines below formed degree-four and
+# degree-six products of coordinates. Below the band a gap's square flushed to 0
+# and read as contact; above it a square or a product overflowed and the query
+# stopped on its seed point. These helpers keep every one of those quantities
+# near 1 by dividing by an exact power of two first. In the normal range that is
+# exact, so the scaling itself moves no bit there: rounding commutes with a
+# power-of-two scale until a value leaves the normal range, which is exactly when
+# it is needed.
+
+# The largest |component| of v; NaN when any component is NaN (stdlib f64_max
+# would drop one, and the callers must see it).
+fn _toi_vmax(v) {
+    var m = f64_abs(HVec3_x(v));
+    var ay = f64_abs(HVec3_y(v));
+    var az = f64_abs(HVec3_z(v));
+    if (f64_lt(m, ay) == 1 || f64_eq(ay, ay) == 0) { m = ay; }
+    if (f64_lt(m, az) == 1 || f64_eq(az, az) == 0) { m = az; }
+    return m;
+}
+
+# v divided componentwise by s, a power of two. Divided, never multiplied by
+# 1/s: s can be subnormal, and its reciprocal is then +Inf (see cga_norm).
+fn _toi_div(v, s) {
+    return hvec3_new(f64_div(HVec3_x(v), s), f64_div(HVec3_y(v), s), f64_div(HVec3_z(v), s));
+}
+
+# d with its largest component brought into [1, 2) by a power of two; d itself
+# when it is zero or not finite. A support function reads only a direction, so
+# this is the same request, and a support written c + r * hvec3_normalize(dir)
+# answers it bit for bit as it answers d wherever |d|^2 is normal. Outside that
+# band it is the difference between a support point and the shape's centre.
+fn _toi_dir(d) {
+    var m = _toi_vmax(d);
+    if (f64_gt(m, 0) == 1 && f64_lt(m, _GA_F64_POS_INF) == 1) { return _toi_div(d, _ga_pow2_floor(m)); }
+    return d;
+}
+
+# v / |v| at any finite scale: v * (1 / |v|) bit for bit wherever |v|^2 is normal,
+# and no overflowing reciprocal below that.
+fn _toi_unit(v) {
+    var vs = _toi_dir(v);
+    return hvec3_scale(vs, f64_div(F64_ONE, hvec3_length(vs)));
+}
+
+# q with its component along e removed (ee = e . e). q is the foot of the origin
+# on a line along e, so that component is zero in exact arithmetic; computed, it
+# carries the coordinates' rounding, ~ulp of |a| where the gap |q| may be far
+# smaller. Removing it keeps q's DIRECTION right to the rounding of q itself.
+fn _toi_foot(q, e, ee) {
+    if (f64_gt(ee, 0) == 0) { return q; }
+    return hvec3_sub(q, hvec3_scale(e, f64_div(hvec3_dot(q, e), ee)));
+}
+
+# 1 when |v| < |b|. The squares themselves where both are normal and finite,
+# which is what the loop compared through 3.3.3; otherwise both are first divided
+# by one common power of two. 0 for a NaN.
+fn _toi_shorter(v, b) {
+    var nv = hvec3_length_sq(v);
+    var nb = hvec3_length_sq(b);
+    if (f64_ge(nv, F64_TINY) == 1 && f64_lt(nv, _GA_F64_POS_INF) == 1
+      && f64_ge(nb, F64_TINY) == 1 && f64_lt(nb, _GA_F64_POS_INF) == 1) { return f64_lt(nv, nb); }
+    var m = _toi_vmax(v);
+    var mb = _toi_vmax(b);
+    if (f64_lt(m, mb) == 1 || f64_eq(mb, mb) == 0) { m = mb; }
+    if (f64_gt(m, 0) == 0 || f64_lt(m, _GA_F64_POS_INF) == 0) { return f64_lt(nv, nb); }
+    var sc = _ga_pow2_floor(m);
+    return f64_lt(hvec3_length_sq(_toi_div(v, sc)), hvec3_length_sq(_toi_div(b, sc)));
+}
+
 # Closest point of segment [a, b] to the ORIGIN.
 # out_mask receives the endpoints that span the answer: 1 = a, 2 = b, 3 = both.
 fn _toi_seg_closest(a, b, out_mask) {
@@ -2092,71 +2501,71 @@ fn _toi_seg_closest(a, b, out_mask) {
         return b;
     }
     store64(out_mask, 3);
-    return hvec3_add(a, hvec3_scale(ab, t));
+    return _toi_foot(hvec3_add(a, hvec3_scale(ab, t)), ab, d2);
 }
 
-# Closest point of triangle (a, b, c) to the ORIGIN, by Voronoi region.
+# Closest point of triangle (a, b, c) to the ORIGIN.
 # out_mask bits: 1 = a, 2 = b, 4 = c.
+#
+# ⛔ 3.3.4 — THE VORONOI TESTS LOST THE FACE OF A SLIVER. Through 3.3.3 the region was
+# chosen by Ericson's six dot products d1..d6 and the products va, vb, vc built from
+# them: every one is a coordinate times a coordinate, so a triangle with two
+# vertices delta apart and its others L away decided its face region from values
+# of size (delta L)^2 carrying errors of size ulp * L^4 -- noise once delta falls
+# near sqrt(ulp) L. That is the triangle the distance query builds where A (-) B is
+# a cylinder (a box edge or a capsule side swept by a sphere): two support points
+# a hair apart on one end circle, one on the other. Its region came out wrong,
+# the query stopped with a closest point whose direction leaned along the axis,
+# and time_of_impact read that as no lower bound, no collision, or an impact.
+# [measured: collide-lane traces of the 3.3.4 base query on box-edge and capsule pairs, 2026-10-03; cycc 6.6.14]
+# ⭐ The face now comes from its normal, a cross product of edges, and the region
+# from signed areas taken about the origin's projection p0: n . ((b - p0) x (c - p0))
+# and its two rotations, products of DIFFERENCES that stay accurate on a sliver.
+# The answer is the nearest of the three edges' closest points, or p0 -- whose
+# direction is n's -- when all three areas are positive and p0 is no farther than
+# that edge point. In exact arithmetic p0 then always is; taking the edges as a
+# floor keeps a rounding slip from returning anything worse than an edge the
+# triangle really has, among them the segment the query held a step before.
 fn _toi_tri_closest(a, b, c, out_mask) {
     var ab = hvec3_sub(b, a);
     var ac = hvec3_sub(c, a);
-    var ap = hvec3_neg(a);
-    var d1 = hvec3_dot(ab, ap);
-    var d2 = hvec3_dot(ac, ap);
-    if (f64_le(d1, 0) == 1 && f64_le(d2, 0) == 1) {
-        store64(out_mask, 1);
-        return a;
+    var nrm = hvec3_cross(ab, ac);
+    var nn = hvec3_dot(nrm, nrm);
+    var em = alloc(8);
+    var best = _toi_seg_closest(a, b, em);
+    var best2 = hvec3_length_sq(best);
+    var bm = _toi_remap(load64(em), 1, 2, 0);
+    var q = _toi_seg_closest(b, c, em);
+    var q2 = hvec3_length_sq(q);
+    if (f64_lt(q2, best2) == 1) {
+        best = q;
+        best2 = q2;
+        bm = _toi_remap(load64(em), 2, 4, 0);
     }
-
-    var bp = hvec3_neg(b);
-    var d3 = hvec3_dot(ab, bp);
-    var d4 = hvec3_dot(ac, bp);
-    if (f64_ge(d3, 0) == 1 && f64_le(d4, d3) == 1) {
-        store64(out_mask, 2);
-        return b;
+    q = _toi_seg_closest(c, a, em);
+    q2 = hvec3_length_sq(q);
+    if (f64_lt(q2, best2) == 1) {
+        best = q;
+        best2 = q2;
+        bm = _toi_remap(load64(em), 4, 1, 0);
     }
-
-    var vc = f64_sub(f64_mul(d1, d4), f64_mul(d3, d2));
-    if (f64_le(vc, 0) == 1 && f64_ge(d1, 0) == 1 && f64_le(d3, 0) == 1) {
-        store64(out_mask, 3);
-        return hvec3_add(a, hvec3_scale(ab, f64_div(d1, f64_sub(d1, d3))));
+    if (f64_gt(nn, 0) == 1) {
+        var p0 = hvec3_scale(nrm, f64_div(hvec3_dot(nrm, a), nn));
+        var pa = hvec3_sub(a, p0);
+        var pb = hvec3_sub(b, p0);
+        var pc = hvec3_sub(c, p0);
+        var wa = hvec3_dot(nrm, hvec3_cross(pb, pc));
+        var wb = hvec3_dot(nrm, hvec3_cross(pc, pa));
+        var wc = hvec3_dot(nrm, hvec3_cross(pa, pb));
+        if (f64_gt(wa, 0) == 1 && f64_gt(wb, 0) == 1 && f64_gt(wc, 0) == 1) {
+            if (f64_le(hvec3_length_sq(p0), best2) == 1) {
+                store64(out_mask, 7);
+                return p0;
+            }
+        }
     }
-
-    var cp = hvec3_neg(c);
-    var d5 = hvec3_dot(ab, cp);
-    var d6 = hvec3_dot(ac, cp);
-    if (f64_ge(d6, 0) == 1 && f64_le(d5, d6) == 1) {
-        store64(out_mask, 4);
-        return c;
-    }
-
-    var vb = f64_sub(f64_mul(d5, d2), f64_mul(d1, d6));
-    if (f64_le(vb, 0) == 1 && f64_ge(d2, 0) == 1 && f64_le(d6, 0) == 1) {
-        store64(out_mask, 5);
-        return hvec3_add(a, hvec3_scale(ac, f64_div(d2, f64_sub(d2, d6))));
-    }
-
-    var va = f64_sub(f64_mul(d3, d6), f64_mul(d5, d4));
-    var d43 = f64_sub(d4, d3);
-    var d56 = f64_sub(d5, d6);
-    if (f64_le(va, 0) == 1 && f64_ge(d43, 0) == 1 && f64_ge(d56, 0) == 1) {
-        store64(out_mask, 6);
-        return hvec3_add(b, hvec3_scale(hvec3_sub(c, b), f64_div(d43, f64_add(d43, d56))));
-    }
-
-    # Reaching here means the origin projects into the FACE region, where the
-    # three barycentric numerators are all strictly positive; den <= 0 is
-    # therefore possible only for a colinear triangle. Comparing against zero
-    # keeps the test scale-free -- va/vb/vc carry length^4, so any absolute
-    # epsilon would be wrong by twelve orders of magnitude per metre of scale.
-    var den = f64_add(f64_add(va, vb), vc);
-    if (f64_le(den, 0) == 1) {
-        return _toi_seg_closest(a, b, out_mask);
-    }
-    var inv = f64_div(F64_ONE, den);
-    store64(out_mask, 7);
-    return hvec3_add(a, hvec3_add(hvec3_scale(ab, f64_mul(vb, inv)),
-        hvec3_scale(ac, f64_mul(vc, inv))));
+    store64(out_mask, bm);
+    return best;
 }
 
 # Is the ORIGIN on the far side of plane(a, b, c) from d? Coplanar counts as
@@ -2242,19 +2651,36 @@ fn _toi_tetra_closest(a, b, c, d, out_mask) {
 
 # Reduce the simplex held in `w` (up to 4 HVec3 pointers, count at cnt_ptr) to
 # the smallest face that supports the closest point, and return that point.
+# The closest-point routines form products up to degree six in the coordinates,
+# so they run on copies divided by one power of two that brings the largest
+# coordinate into [1, 2) (see _toi_vmax): exact, and the identity when it is
+# already there. The point comes back multiplied by the same power of two.
 fn _toi_simplex_closest(w, cnt_ptr) {
     var n = load64(cnt_ptr);
     if (n <= 1) { return load64(w); }
 
     var mk = alloc(8);
     var pt = 0;
-    if (n == 2) {
-        pt = _toi_seg_closest(load64(w), load64(w + 8), mk);
-    } elif (n == 3) {
-        pt = _toi_tri_closest(load64(w), load64(w + 8), load64(w + 16), mk);
-    } else {
-        pt = _toi_tetra_closest(load64(w), load64(w + 8), load64(w + 16), load64(w + 24), mk);
+    var m = 0;
+    for (var si = 0; si < n; si = si + 1) {
+        var mi = _toi_vmax(load64(w + si * 8));
+        if (f64_lt(m, mi) == 1 || f64_eq(mi, mi) == 0) { m = mi; }
     }
+    var sc = F64_ONE;
+    if (f64_gt(m, 0) == 1 && f64_lt(m, _GA_F64_POS_INF) == 1) { sc = _ga_pow2_floor(m); }
+    var ws = w;
+    if (sc != F64_ONE) {
+        ws = alloc(32);
+        for (var sj = 0; sj < n; sj = sj + 1) { store64(ws + sj * 8, _toi_div(load64(w + sj * 8), sc)); }
+    }
+    if (n == 2) {
+        pt = _toi_seg_closest(load64(ws), load64(ws + 8), mk);
+    } elif (n == 3) {
+        pt = _toi_tri_closest(load64(ws), load64(ws + 8), load64(ws + 16), mk);
+    } else {
+        pt = _toi_tetra_closest(load64(ws), load64(ws + 8), load64(ws + 16), load64(ws + 24), mk);
+    }
+    if (sc != F64_ONE) { pt = hvec3_scale(pt, sc); }
 
     var mask = load64(mk);
     var keep = 0;
@@ -2278,50 +2704,109 @@ fn _toi_simplex_closest(w, cnt_ptr) {
 # needs re-wrapping per step (the pre-2.8.3 loop allocated a 24-byte support
 # descriptor on every one of up to 256 iterations, into a never-freeing bump
 # allocator, purely to express this subtraction).
+# The direction is handed over through _toi_dir: the same direction, sized so a
+# support function's own arithmetic (normalising it, or dotting it with a half-axis)
+# neither flushes nor overflows at the extremes of the scale range.
 fn _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, dir) {
-    return hvec3_sub(_gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir), offset);
+    return hvec3_sub(_gjk_mink_support(sup_a, shape_a, sup_b, shape_b, _toi_dir(dir)), offset);
 }
 
 # Nearest point of (A - B - offset) to the ORIGIN.
-#   out_v:  receives that point. |out_v| is an UPPER bound on the distance,
-#           because the point is a genuine member of the set.
-#   out_lb: receives a LOWER bound, valid even if the iteration is cut short --
-#           it comes from a supporting plane, which is a certificate rather than
-#           an estimate. Conservative advancement steps on this one.
+#   out_v:   receives that point. |out_v| is an UPPER bound on the distance,
+#            because the point is a genuine member of the set.
+#   out_lb:  receives a LOWER bound, valid even if the iteration is cut short --
+#            it comes from a supporting plane, which is a certificate rather than
+#            an estimate. Conservative advancement steps on this one.
+#   out_lbv: receives the point v whose direction that plane was taken along, or
+#            0 when no plane separated (out_lb = 0). A lower bound certifies a step
+#            only along its OWN direction: see time_of_impact.
 # Returns 1 if the origin is inside (the shapes overlap), 0 otherwise.
-fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_lb) {
+#
+# ⛔ 3.3.4 — WHAT CHANGED, and why each part is needed (D045 and the cylinder row):
+#   * The squares. "Exactly on the origin" was |v|^2 <= 0, true for every |v| below
+#     about 2^-537, so a gap that small read as contact; the optimality test and the
+#     bound were |v|^2 and v . p, which flush there and overflow above about 2^511.
+#     Where |v|^2 is normal and v . p finite the old arithmetic runs bit for bit;
+#     otherwise v is divided by a power of two and the same two tests are made on
+#     the support value u . p (u = v/|v|) instead, degree one in the coordinates.
+#     Repairing the escape alone would have turned false impacts into missed ones:
+#     the flushed test is what stopped the loop, and the bound beside it was 0.
+#   * The bound's direction. lb is the best support value seen, but it was handed
+#     to the caller without the direction it belongs to, and the caller stepped
+#     along the LAST v instead: a valid bound on a different plane.
+#   * "Inside" against a certificate. A positive lower bound proves the origin is
+#     outside, so a simplex that "encloses" it after one was found is rounding: the
+#     query stops on its best member. That "enclosure" of a flat tetrahedron was a
+#     capsule contact reported 0.15 short of touching.
+#   * The improvement test. Squared lengths are compared scaled, as above, and a
+#     closest point nearer than the certified bound is not a member of the set
+#     (the sub-algorithm's rounding put it there); the query stops on the best one.
+# [measured: collide-lane traces of the 3.3.4 base query; tests/modules.tcyr cylinder block, 2026-10-03; cycc 6.6.14]
+fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_lb, out_lbv) {
     var w = alloc(40);          # 4 vertex slots + count at +32, hoisted
     var v = _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, seed_dir);
     store64(w, v);
     store64(w + 32, 1);
 
     var best = v;
-    var best2 = hvec3_length_sq(v);
     var lb = 0;
+    var lbv = 0;
     store64(out_lb, 0);
+    store64(out_lbv, 0);
 
     for (var it = 0; it < GJK_MAX_ITER; it = it + 1) {
         var vv = hvec3_length_sq(v);
-        # Exactly on the origin: the sets touch. Anything larger than that is
-        # left to the CALLER's scale-relative contact tolerance -- deciding
-        # "close enough" here with an absolute length is what made this query
-        # report grazing misses as impacts on micro-scale geometry.
-        if (f64_le(vv, 0) == 1) {
-            store64(out_v, v);
-            store64(out_lb, 0);
-            return 1;
+        # sc: 0 for the old arithmetic, else the power of two v is divided by.
+        var sc = 0;
+        if (f64_lt(vv, F64_TINY) == 1 || f64_eq(vv, _GA_F64_POS_INF) == 1) {
+            var m = _toi_vmax(v);
+            # Exactly on the origin: the sets touch. Anything larger than that is
+            # left to the CALLER's scale-relative contact tolerance -- deciding
+            # "close enough" here with an absolute length is what made this query
+            # report grazing misses as impacts on micro-scale geometry.
+            if (f64_eq(m, 0) == 1) {
+                store64(out_v, v);
+                store64(out_lb, 0);
+                store64(out_lbv, 0);
+                return 1;
+            }
+            if (f64_lt(m, _GA_F64_POS_INF) == 1) { sc = _ga_pow2_floor(m); }
         }
 
-        var p = _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, hvec3_neg(v));
-        var vp = hvec3_dot(v, p);
-        if (f64_gt(vp, 0) == 1) {
-            var cand = f64_div(vp, f64_sqrt(vv));
-            if (f64_gt(cand, lb) == 1) { lb = cand; }
+        var p = 0;
+        var vp = 0;
+        if (sc == 0) {
+            p = _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, hvec3_neg(v));
+            vp = hvec3_dot(v, p);
+            if (f64_lt(f64_abs(vp), _GA_F64_POS_INF) == 0 && f64_lt(vv, _GA_F64_POS_INF) == 1) {
+                sc = _ga_pow2_floor(_toi_vmax(v));
+            }
+        } else {
+            p = _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, hvec3_neg(_toi_div(v, sc)));
         }
-
-        # Optimality: v is the projection of the origin onto the whole set once
-        # no support point lies closer to the origin along v than v itself.
-        if (f64_le(f64_sub(vv, vp), f64_mul(_GA_TOI_REL, vv)) == 1) { break; }
+        if (sc == 0) {
+            if (f64_gt(vp, 0) == 1) {
+                var cand = f64_div(vp, f64_sqrt(vv));
+                if (f64_gt(cand, lb) == 1) {
+                    lb = cand;
+                    lbv = v;
+                }
+            }
+            # Optimality: v is the projection of the origin onto the whole set once
+            # no support point lies closer to the origin along v than v itself.
+            if (f64_le(f64_sub(vv, vp), f64_mul(_GA_TOI_REL, vv)) == 1) { break; }
+        } else {
+            # The same two tests divided through by |v|: hu = u . p is the support
+            # value along u, and |v| - hu <= REL |v| is read in units of sc.
+            var vs = _toi_div(v, sc);
+            var ls = hvec3_length(vs);
+            var hu = f64_div(hvec3_dot(vs, p), ls);
+            if (f64_gt(hu, lb) == 1) {
+                lb = hu;
+                lbv = v;
+            }
+            if (f64_le(f64_sub(ls, f64_div(hu, sc)), f64_mul(_GA_TOI_REL, ls)) == 1) { break; }
+        }
 
         var cnt = load64(w + 32);
         store64(w + cnt * 8, p);
@@ -2329,16 +2814,18 @@ fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_
         v = _toi_simplex_closest(w, w + 32);
 
         if (load64(w + 32) == 4) {
-            # The reduced simplex is the full tetrahedron: the origin is in it.
+            # The reduced simplex is the full tetrahedron: the origin is in it --
+            # unless a supporting plane has already separated it.
+            if (f64_gt(lb, 0) == 1) {
+                v = best;
+                break;
+            }
             store64(out_v, hvec3_zero());
-            store64(out_lb, lb);
             return 1;
         }
 
-        var nv2 = hvec3_length_sq(v);
-        if (f64_lt(nv2, best2) == 1) {
+        if (_toi_shorter(v, best) == 1 && f64_lt(hvec3_length(v), lb) == 0) {
             best = v;
-            best2 = nv2;
         } else {
             # No improvement -- a near-degenerate simplex made the barycentric
             # solve unreliable. |v| is monotone in exact arithmetic, so this is
@@ -2350,6 +2837,7 @@ fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_
 
     store64(out_v, v);
     store64(out_lb, lb);
+    store64(out_lbv, lbv);
     return 0;
 }
 
@@ -2362,12 +2850,13 @@ fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_
 fn _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, m, s, dmin) {
     var v_slot = alloc(8);
     var lb_slot = alloc(8);
+    var lbv_slot = alloc(8);
     _toi_near_point(sup_a, shape_a, sup_b, shape_b, hvec3_add(offset, hvec3_scale(m, s)), m,
-      v_slot, lb_slot);
+      v_slot, lb_slot, lbv_slot);
     var v = load64(v_slot);
     var d = hvec3_length(v);
     if (f64_gt(d, dmin) == 0) { return 0; }
-    return hvec3_scale(v, f64_div(_GA_F64_NEG_ONE, d));
+    return hvec3_neg(_toi_unit(v));
 }
 
 # h(m) = m . support of (A (-) B - offset) along m: the signed distance from the
@@ -2470,7 +2959,10 @@ fn _toi_pair_pick(sup_a, shape_a, sup_b, shape_b, offset, r1, r2, vcon, hv, mult
 #      the reading lies further from vcon than 32 times (_GA_TOI_SPREAD_SWEPT) the
 #      pair's own disagreement |r1 x r2|; 4 times (_GA_TOI_SPREAD_T0) at t = 0, where
 #      3.3.2's reading came from one query seeded by the velocity rather than one
-#      seeded by the previous step's closest point.
+#      seeded by the previous step's closest point. Since 3.3.4 also 4 times when the
+#      contact's own query found no separating plane (`cert` 0): its v is then the
+#      point the query stopped on, not a converged one, and it earns no more trust
+#      than the t = 0 reading.
 #   4. Otherwise vcon.
 # h alone does not order directions by angle where A (-) B has an edge: tilting along
 # the edge costs h linearly, turning about it quadratically, so a probe reading 4e-4
@@ -2505,7 +2997,7 @@ fn _toi_pair_pick(sup_a, shape_a, sup_b, shape_b, offset, r1, r2, vcon, hv, mult
 # t = 0 box edge 2.08x, 1.24x; the two capsule contacts above 1.54x/1.33x and 1.67x/1.30x).
 # A miss does not move.
 # [measured: R5ga interleaved A/B, 8 rounds, min of 7 batches of 200, 3.3.2/base/tree, 2026-10-01; cycc 6.6.12]
-fn _toi_contact_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s, vcon) {
+fn _toi_contact_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s, vcon, cert) {
     if (vcon != 0) {
         var hv = _toi_support_value(sup_a, shape_a, sup_b, shape_b, offset, vcon);
         if (f64_le(hv, 0) == 1) { return vcon; }
@@ -2513,7 +3005,7 @@ fn _toi_contact_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s, vc
         var c1 = _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, vcon, s, dmin);
         if (c1 != 0) {
             var mult = _GA_TOI_SPREAD_T0;
-            if (n_prev != 0) { mult = _GA_TOI_SPREAD_SWEPT; }
+            if (n_prev != 0 && cert == 1) { mult = _GA_TOI_SPREAD_SWEPT; }
             var c2 = _toi_probe_normal(sup_a, shape_a, sup_b, shape_b, offset, c1, s, 0);
             if (c2 != 0) {
                 var p = _toi_pair_pick(sup_a, shape_a, sup_b, shape_b, offset, c1, c2, vcon, hv, mult);
@@ -2595,65 +3087,125 @@ fn _toi_contact_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s, vc
 # A pass that misses by less than that reads as a touch, which is the standard
 # and unavoidable contract for a continuous query on floating point.
 public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, out_normal) {
-    # Overlap at t = 0.
-    if (gjk_intersect_3d(support_a, shape_a, support_b, shape_b) == 1) {
-        store64(out_t, 0);
-        var n_slot = alloc(8);
-        var d_slot = alloc(8);
-        gjk_epa_3d(support_a, shape_a, support_b, shape_b, n_slot, d_slot);
-        var n0 = load64(n_slot);
-        # Before 2.8.3, EPA could return 0 on a degenerate polytope and leave
-        # out_normal holding a NULL pointer for every caller that dereferenced it.
-        # Since 2.8.3 gjk_epa_3d writes a unit_x placeholder before anything
-        # else, so this guard is defensive.
-        if (n0 == 0) { n0 = hvec3_unit_x(); }
-        store64(out_normal, n0);
-        return 1;
-    }
-
+    _GA_SUP_NONFINITE = 0;
     var rel_vel = hvec3_sub(vel_b, vel_a);
     var speed = hvec3_length(rel_vel);
     # ⛔ A relative SPEED, dimensions L/T, against an absolute 1e-12 — so whether
     # two bodies counted as "not approaching" depended on metres-per-second versus
     # kilometres-per-hour. `_epa_unit` in this same file already uses the exact
     # test; only an exactly zero relative velocity means no impact.
-    if (f64_gt(speed, 0) == 0) { return 0; }
+    var moving = f64_gt(speed, 0);
 
     # Contact tolerance from the geometry, not from the horizon: the extent of
     # the Minkowski difference along the direction of travel is exactly
     # (diameter of A + diameter of B) in that direction, independent of how far
     # apart the two shapes start.
-    var u0 = hvec3_scale(rel_vel, f64_div(F64_ONE, speed));
-    var ext_p = _gjk_mink_support(support_a, shape_a, support_b, shape_b, u0);
-    var ext_n = _gjk_mink_support(support_a, shape_a, support_b, shape_b, hvec3_neg(u0));
-    var gscale = hvec3_length(hvec3_sub(ext_p, ext_n));
-    # Two point shapes have no extent; then the only length in the problem is
-    # how far apart they are, so use that instead of a fabricated 1.0.
-    if (f64_le(gscale, 0) == 1) { gscale = hvec3_length(ext_p); }
-    if (f64_le(gscale, 0) == 1) { gscale = F64_ONE; }
-    var tol = f64_mul(gscale, _GA_TOI_TOL_REL);
+    var u0 = 0;
+    var ext_p = 0;
+    var ext_n = 0;
+    var tol = 0;
+    if (moving == 1) {
+        u0 = hvec3_scale(rel_vel, f64_div(F64_ONE, speed));
+        ext_p = _gjk_mink_support(support_a, shape_a, support_b, shape_b, u0);
+        ext_n = _gjk_mink_support(support_a, shape_a, support_b, shape_b, hvec3_neg(u0));
+        var gscale = hvec3_length(hvec3_sub(ext_p, ext_n));
+        # Two point shapes have no extent; then the only length in the problem is
+        # how far apart they are, so use that instead of a fabricated 1.0.
+        if (f64_le(gscale, 0) == 1) { gscale = hvec3_length(ext_p); }
+        if (f64_le(gscale, 0) == 1) { gscale = F64_ONE; }
+        tol = f64_mul(gscale, _GA_TOI_TOL_REL);
+    }
+    var v_slot = alloc(8);
+    var lb_slot = alloc(8);
+    var lbv_slot = alloc(8);
+    var seed = hvec3_neg(rel_vel);
+    # A distance query already made at t = 0 (by the overlap test below), which the
+    # first advance uses instead of asking again.
+    var have_q = 0;
+    var q_inside = 0;
+
+    # Overlap at t = 0.
+    # ⛔ 3.3.4 — gjk_intersect_3d IS NOT SCALE-FREE, and this test inherited it: its
+    # simplex tests multiply up to four coordinates, and above about 2^516 two
+    # separated shapes came back as an overlap at t = 0.
+    # [measured: collide-lane scale map, sphere/box-edge pairs at every 2^k, 2026-10-03; cycc 6.6.14]
+    # ⭐ A moving pair it calls overlapping is asked once more, by the distance query
+    # below: a supporting plane that separates the pair by more than the contact
+    # tolerance refutes the overlap, and the swept search starts from that query.
+    # Anywhere gjk_intersect_3d is right it never fires, since an overlap or a touch
+    # has no such plane.
+    if (_gjk_intersect_core(support_a, shape_a, support_b, shape_b) == 1) {
+        if (moving == 1) {
+            q_inside = _toi_near_point(support_a, shape_a, support_b, shape_b,
+              hvec3_scale(rel_vel, 0), seed, v_slot, lb_slot, lbv_slot);
+            have_q = 1;
+        }
+        if (_GA_SUP_NONFINITE == 0 && (have_q == 0 || f64_gt(load64(lb_slot), tol) == 0)) {
+            var n_slot = alloc(8);
+            var d_slot = alloc(8);
+            _gjk_epa_core(support_a, shape_a, support_b, shape_b, n_slot, d_slot);
+            var n0 = load64(n_slot);
+            # Before 2.8.3, EPA could return 0 on a degenerate polytope and leave
+            # out_normal holding a NULL pointer for every caller that dereferenced it.
+            # Since 2.8.3 gjk_epa_3d writes a unit_x placeholder before anything
+            # else, so this guard is defensive.
+            if (n0 == 0) { n0 = hvec3_unit_x(); }
+            if (_gjk_contact_finite(support_a, shape_a, support_b, shape_b) == 0) { return 0; }
+            store64(out_t, 0);
+            store64(out_normal, n0);
+            return 1;
+        }
+    }
+    if (moving == 0) { return 0; }
+
     # A member of A (-) B for _toi_contact_normal, interior unless a shape is flat
     # across the motion: the midpoint of two of its members is a member, and these
     # two are already in hand.
     var mid = hvec3_scale(hvec3_add(ext_p, ext_n), F64_HALF);
+    # The least advance: one contact tolerance of travel, so the pair can end up at
+    # most one tolerance inside (the signed distance is 1-Lipschitz in the query
+    # point). See the step below.
+    var floor_step = f64_div(tol, speed);
 
-    var v_slot = alloc(8);
-    var lb_slot = alloc(8);
     var t = 0;
-    var seed = hvec3_neg(rel_vel);
     # The A -> B closest-approach direction where the last advance started; 0
     # until the loop has advanced once.
     var n_prev = 0;
 
     for (var ti = 0; ti < _GA_TOI_MAX_STEPS; ti = ti + 1) {
         var offset = hvec3_scale(rel_vel, t);
-        var inside = _toi_near_point(support_a, shape_a, support_b, shape_b,
-          offset, seed, v_slot, lb_slot);
+        var inside = q_inside;
+        if (have_q == 0) {
+            inside = _toi_near_point(support_a, shape_a, support_b, shape_b,
+              offset, seed, v_slot, lb_slot, lbv_slot);
+        }
+        have_q = 0;
         var v = load64(v_slot);
         var dist = hvec3_length(v);
+        # A query that stopped short with no separating plane at all is asked once
+        # more, seeded from the last advance's own direction; its answer is kept if
+        # it is inside, nearer, or certified. This is where A (-) B is a cylinder:
+        # the query's convergence there depends on where it starts.
+        if (inside == 0 && f64_gt(dist, tol) == 1 && f64_gt(load64(lb_slot), 0) == 0 && n_prev != 0) {
+            var v2_slot = alloc(8);
+            var lb2_slot = alloc(8);
+            var lbv2_slot = alloc(8);
+            var in2 = _toi_near_point(support_a, shape_a, support_b, shape_b, offset, n_prev,
+              v2_slot, lb2_slot, lbv2_slot);
+            var d2 = hvec3_length(load64(v2_slot));
+            if (in2 == 1 || f64_lt(d2, dist) == 1 || f64_gt(load64(lb2_slot), 0) == 1) {
+                inside = in2;
+                v = load64(v2_slot);
+                dist = d2;
+                store64(lb_slot, load64(lb2_slot));
+                store64(lbv_slot, load64(lbv2_slot));
+            }
+        }
+        # A non-finite shape is the documented miss (see _GA_SUP_NONFINITE); neither
+        # out-param is written, as for a NaN horizon.
+        if (_GA_SUP_NONFINITE == 1) { return 0; }
 
         if (inside == 1 || f64_le(dist, tol) == 1) {
-            store64(out_t, t);
             var mc = _epa_unit(hvec3_sub(offset, mid));
             # The origin AT the midpoint takes two point shapes, whose contact
             # always follows an advance whose probe cannot fail; this keeps
@@ -2673,25 +3225,54 @@ public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, m
                 }
                 vcon = hvec3_scale(v, vinv);
             }
-            store64(out_normal, _toi_contact_normal(support_a, shape_a, support_b, shape_b,
-                offset, n_prev, mc, f64_mul(tol, _GA_TOI_PROBE), vcon));
+            var ncon = _toi_contact_normal(support_a, shape_a, support_b, shape_b,
+              offset, n_prev, mc, f64_mul(tol, _GA_TOI_PROBE), vcon, f64_gt(load64(lb_slot), 0));
+            if (_gjk_contact_finite(support_a, shape_a, support_b, shape_b) == 0) { return 0; }
+            store64(out_t, t);
+            store64(out_normal, ncon);
             return 1;
         }
 
-        var u = hvec3_scale(v, f64_div(F64_ONE, dist));
-        var denom = hvec3_dot(rel_vel, u);
-        if (f64_le(denom, 0) == 1) {
-            # PROOF of no collision: every point of the Minkowski difference is
-            # on the far side of the plane through v with normal u, and the
-            # query point rel_vel * t moves away from (or parallel to) that
-            # plane. No later t can put it inside. This is the branch the old
-            # sampler could never take -- it could only run out of samples.
-            return 0;
-        }
-
+        # ⛔ 3.3.4 — THE STEP AND THE "PROOF" WERE TAKEN ALONG A DIRECTION THEY DID NOT
+        # BELONG TO. The step was lb / (rel_vel . u) with u the last v's direction and
+        # lb the best bound over every direction the query tried, and rel_vel . u <= 0
+        # was taken as a proof that the pair never meets. A lower bound certifies a
+        # step only along the plane it was measured on, and where A (-) B is a cylinder
+        # the query's last v leans along the axis by more than the gap: its supporting
+        # value is negative there (no bound at all), and rel_vel . u could come out
+        # negative for a pair closing at speed 1. Box edges and capsule sides swept
+        # by a sphere came back as misses of collisions 0.5 deep, as impacts 0.15
+        # short of contact, and as impacts past contact by up to 17 tolerances.
+        # [measured: collide-lane Decimal oracle sweep, 7 x 1,000 pairs, 3.3.4 base, 2026-10-03; cycc 6.6.14]
+        # ⭐ Both now use the bound's own direction (out_lbv). Where the query found no
+        # bound, the step is the least advance and the old test along the last v stands:
+        # requiring a bound there too moved no answer over 63,000 swept pairs.
+        # [measured: collide-lane part sweep, final against each part reverted, 2026-10-03; cycc 6.6.14]
         var lb = load64(lb_slot);
-        if (f64_lt(lb, tol) == 1) { lb = tol; }
-        t = f64_add(t, f64_div(lb, denom));
+        var u = 0;
+        var step = 0;
+        if (f64_gt(lb, 0) == 1) {
+            u = _toi_unit(load64(lbv_slot));
+            var denom = hvec3_dot(rel_vel, u);
+            if (f64_le(denom, 0) == 1) {
+                # PROOF of no collision: every point of the Minkowski difference is
+                # on the far side of the plane at lb along u, and the query point
+                # rel_vel * t moves away from (or parallel to) that plane. No later t
+                # can put it inside. This is the branch the old sampler could never
+                # take -- it could only run out of samples.
+                return 0;
+            }
+            step = f64_div(lb, denom);
+        } else {
+            u = _toi_unit(v);
+            if (f64_le(hvec3_dot(rel_vel, u), 0) == 1) { return 0; }
+        }
+        # ⚠ The least advance was lb floored at tol, over rel_vel . u: with u the
+        # noisy direction above, a small rel_vel . u made it many tolerances deep.
+        # One tolerance of TRAVEL (tol / speed) bounds the overshoot by one tolerance
+        # whatever the direction.
+        if (f64_lt(step, floor_step) == 1) { step = floor_step; }
+        t = f64_add(t, step);
         n_prev = hvec3_neg(u);
         # ⛔ 3.3.3 — A NaN `max_t` WAS AN UNBOUNDED HORIZON. This read
         # `f64_gt(t, max_t) == 1`, which is false for NaN, so the advance never
@@ -2714,6 +3295,9 @@ public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, m
         # after the W2 group, which pins a ceiling on it, and 239,456 with the old
         # test put back; a probe of the same call on the 3.3.2 bundle took 233,264.
         # [measured: R4ga instrumented runs of that block, both tests, and a 3.3.2 probe, 2026-10-01; cycc 6.6.12]
+        # ⚠ 3.3.4 — a NaN or infinite SHAPE no longer gets this far: it leaves at the
+        # non-finite check above, before any advance (see _GA_SUP_NONFINITE). An
+        # infinite velocity still makes the first advance NaN and leaves here.
         # ⚠ A CONTACT AT t = 0 IS STILL REPORTED, because the horizon has never
         # gated it: an overlap returns before this loop, and a gap inside `tol`
         # returns from the first iteration, before any advance — for max_t =
@@ -3108,46 +3692,25 @@ fn _cga_build_null_tbl() {
                 store64(mseen + mdx * 8, 0);
             }
             mtn = 0;
-            # ⚠ `if`-GUARDS BELOW, NOT `continue`. This began as a compiler
-            # workaround and is NO LONGER LOAD-BEARING on the pinned toolchain;
-            # it is kept on purpose — read to the end before "tidying" it.
-            # On cycc <= 6.6.2, when a loop and a loop nested inside it BOTH
-            # contain a `continue` and the outer one appears lexically FIRST,
-            # both bind one level too far out: the inner `continue` jumps to
-            # the OUTER loop's latch (abandoning the inner loop AND the rest of
-            # the outer body), and the outer `continue` becomes a no-op. The
-            # natural sparse-skip form of this nest is both shapes at once and
-            # silently produced an ALL-ZERO table — no diagnostic, no crash.
-            # ⚠ The outer loop is NOT terminated: instrumented, its body is
-            # entered all 3 times while the inner body runs 3 of 9. Filed
-            # upstream with a repro that exits 0 when fixed and 1 while the bug
-            # is present, and since archived there and here; hisab's record is
+            # `continue` at two levels below: the `oi` loop skips a cancelled `mid`
+            # slot, and the `ci` loop nested in it skips re-listing a `res` slot.
+            # ⚠ From 2.21.0 through 3.3.3 this nest was written with `if`-guards, a
+            # workaround for cycc <= 6.6.2: there a `continue` in a loop nested
+            # under one with an earlier `continue` jumped to the OUTER loop's latch
+            # (and the outer one became a no-op), so this form silently built a
+            # wrong table. cycc 6.6.3 fixed it; record:
             # docs/development/issues/archived/2026-09-11-cyrius-nested-continue-binds-to-wrong-loop.md
-            # [measured: 10-shape matrix + 3 counters on cycc 6.6.2, 2026-09-11]
-            # ⭐ FIXED UPSTREAM IN cycc 6.6.3 (one flat 8-entry `continue` patch
-            # array was reset per loop, so a nested loop overwrote its parent's
-            # recorded jump). Verified here as a PAIR, not assumed from the
-            # changelog: this nest rewritten into its natural `continue` form,
-            # with an inner `continue` that provably fires (1024 times per
-            # build), gives a WRONG table on 6.6.2 — FNV mismatch and all 1024
-            # coefficients flagged by `_CGA_NULL_COEF_BAD` — and the byte-exact
-            # contract table on 6.6.3 (2088/2088 with the probe assertions).
-            # [measured: hisab 3.0.1 bump, cycc 6.6.2 vs 6.6.3, 2026-09-13]
-            # ⚠ WHY THE GUARD FORM STAYS: `dist/hisab.cyr` is compiled by each
-            # consumer under ITS OWN toolchain pin. The reason written in 3.0.1,
-            # that no live consumer had crossed 6.6.2, is void from 3.1.0 on:
-            # since 3.1.0 the bundle needs cycc >= 6.6.3 (`public struct` +
-            # `#derive`, both in vec3, which this module requires), and 6.6.2
-            # refuses it with the `#derive` error, so no toolchain that compiles
-            # a 3.1.0-or-later bundle has the defect (3.0.0 pinned 6.6.2, and the
-            # 3.0.1 bundle still compiles there: roadmap D146). The form stays
-            # only for a possible 2.24.x backport (2.24.0 pins 6.6.2); that is
-            # the maintainer's pending decision (roadmap "Decisions owed" #1,
-            # audit D148 and D142). The `if` form is correct under every cycc;
-            # the `continue` form is correct only from 6.6.3 and fails SILENTLY
-            # below it. Same disposition as `m4_mul_vec4`'s hoist in 2.11.5: not
-            # mandatory, kept for a stated reason.
-            # [measured: pinned-dir builds, 3.3.0 bundle: 6.6.0-6.6.2 refused, 6.6.3-6.6.12 ran; audit D142, 2026-09-30]
+            # The guard was then kept for consumers below 6.6.3, and no consumer of
+            # this bundle can be one: since 3.1.0 it needs cycc >= 6.6.3 (`public
+            # struct` + `#derive`) and 6.6.2 refuses it. The revert was checked against the derivation's
+            # FNV contract, which tests/modules.tcyr asserts: exact on every cycc
+            # from 6.6.3 to 6.6.14, while this same form on 6.6.2 builds the table
+            # an inner `break` gives (FNV 0x344A3725EBC9A7EB, `_CGA_NULL_COEF_BAD`
+            # at 1024). The OUTER `continue` is behaviourally inert on the table's one
+            # input: as a no-op or as a `break` it changes nothing, because a mid slot
+            # cancels only where both do, and no live slot follows. Only the inner one
+            # is load-bearing.
+            # [measured: scratch harness, not reproducible in-tree, 2026-10-03; cycc 6.6.2-6.6.14]
             for (var pi = 1; pi <= na; pi = pi + 1) {
                 var p = load64(exp_i + (ai * 8 + pi) * 8);
                 var cp = load64(exp_c + (ai * 32 + p) * 8);
@@ -3175,25 +3738,27 @@ fn _cga_build_null_tbl() {
             for (var oi = 0; oi < mtn; oi = oi + 1) {
                 var ob = load64(mt + oi * 8);
                 var co = load64(mid + ob * 8);
-                if (co != 0) {
-                    var wgt = 4 / load64(con_d + ob * 8);
-                    var mo = load64(con_i + ob * 8 * 8);
-                    for (var ci = 1; ci <= mo; ci = ci + 1) {
-                        var nb3 = load64(con_i + (ob * 8 + ci) * 8);
-                        var cn = load64(con_c + (ob * 32 + nb3) * 8);
-                        if (load64(rseen + nb3 * 8) == 0) {
-                            store64(rseen + nb3 * 8, 1);
-                            # Sorted insert: the packing loop needs ascending order.
-                            var ins = rtn;
-                            while (ins > 0 && load64(rt + (ins - 1) * 8) > nb3) {
-                                store64(rt + ins * 8, load64(rt + (ins - 1) * 8));
-                                ins = ins - 1;
-                            }
-                            store64(rt + ins * 8, nb3);
-                            rtn = rtn + 1;
-                        }
-                        store64(res + nb3 * 8, load64(res + nb3 * 8) + co * cn * wgt);
+                if (co == 0) { continue; }
+                var wgt = 4 / load64(con_d + ob * 8);
+                var mo = load64(con_i + ob * 8 * 8);
+                for (var ci = 1; ci <= mo; ci = ci + 1) {
+                    var nb3 = load64(con_i + (ob * 8 + ci) * 8);
+                    var cn = load64(con_c + (ob * 32 + nb3) * 8);
+                    store64(res + nb3 * 8, load64(res + nb3 * 8) + co * cn * wgt);
+                    # ⚠ The store stays ABOVE the skip, which only stops a slot
+                    # being listed twice: swapped, a listed slot drops its later
+                    # terms and the FNV and `_CGA_NULL_COEF_BAD` assertions fail.
+                    # [measured: swapped-order mutant, tests/modules.tcyr, 2026-10-03; cycc 6.6.14]
+                    if (load64(rseen + nb3 * 8) != 0) { continue; }
+                    store64(rseen + nb3 * 8, 1);
+                    # Sorted insert: the packing loop needs ascending order.
+                    var ins = rtn;
+                    while (ins > 0 && load64(rt + (ins - 1) * 8) > nb3) {
+                        store64(rt + ins * 8, load64(rt + (ins - 1) * 8));
+                        ins = ins - 1;
                     }
+                    store64(rt + ins * 8, nb3);
+                    rtn = rtn + 1;
                 }
             }
             var scale = load64(exp_d + ai * 8) * load64(exp_d + bj * 8) * 4;
@@ -3203,27 +3768,26 @@ fn _cga_build_null_tbl() {
             for (var ni = 0; ni < rtn; ni = ni + 1) {
                 var nb = load64(rt + ni * 8);
                 var v = load64(res + nb * 8);
-                if (v != 0) {
-                    var coef = v / scale;
-                    # ⛔ See `_CGA_NULL_COEF_BAD`. `coef` is used below only for
-                    # its SIGN, so without this the FNV contract is blind to any
-                    # magnitude error in the builder.
-                    if (coef != 1 && coef != 0 - 1) {
-                        _CGA_NULL_COEF_BAD = _CGA_NULL_COEF_BAD + 1;
-                    }
-                    # ⚠ And the division must be EXACT, not merely land on +-1:
-                    # an inexact `v / scale` that truncates to 1 would pass the
-                    # test above while meaning the accumulation was wrong.
-                    if (coef * scale != v) {
-                        _CGA_NULL_COEF_BAD = _CGA_NULL_COEF_BAD + 1;
-                    }
-                    var sgn = 1;
-                    if (coef < 0) { sgn = 2; }
-                    var bidx = load64(b2b + nb * 8);
-                    if (slot == 0) { packed = packed | sgn | (bidx << 2); }
-                    if (slot == 1) { packed = packed | (sgn << 7) | (bidx << 9); }
-                    slot = slot + 1;
+                if (v == 0) { continue; }
+                var coef = v / scale;
+                # ⛔ See `_CGA_NULL_COEF_BAD`. `coef` is used below only for its
+                # SIGN, so without this the FNV contract is blind to any magnitude
+                # error in the builder.
+                if (coef != 1 && coef != 0 - 1) {
+                    _CGA_NULL_COEF_BAD = _CGA_NULL_COEF_BAD + 1;
                 }
+                # ⚠ And the division must be EXACT, not merely land on +-1: an
+                # inexact `v / scale` that truncates to 1 would pass the test
+                # above while meaning the accumulation was wrong.
+                if (coef * scale != v) {
+                    _CGA_NULL_COEF_BAD = _CGA_NULL_COEF_BAD + 1;
+                }
+                var sgn = 1;
+                if (coef < 0) { sgn = 2; }
+                var bidx = load64(b2b + nb * 8);
+                if (slot == 0) { packed = packed | sgn | (bidx << 2); }
+                if (slot == 1) { packed = packed | (sgn << 7) | (bidx << 9); }
+                slot = slot + 1;
             }
             store64(tbl + (ai * 32 + bj) * 8, packed);
         }
@@ -3768,27 +4332,70 @@ public fn cga_dual(x) {
     return cga_geometric_product(x, cga_pseudoscalar_inv());
 }
 
+# For each blade index i, the index j whose geometric product e_i e_j has a scalar
+# part: the one pair each blade contributes to `cga_norm_sq`. Exactly one j per i,
+# and the map is an involution — itself for the 16 blades holding both or neither
+# of n0 and ninf, and the blade with n0 and ninf swapped for the other 16. Read
+# out of `_cga_null_tbl()` once, so it cannot drift from the product it describes.
+var _CGA_SCALAR_PARTNER = 0;
+fn _cga_scalar_partner_tbl() {
+    if (_CGA_SCALAR_PARTNER != 0) { return _CGA_SCALAR_PARTNER; }
+    var tbl = _cga_null_tbl();
+    var pt = alloc(32 * 8);
+    for (var i = 0; i < 32; i = i + 1) {
+        store64(pt + i * 8, i);
+        for (var j = 0; j < 32; j = j + 1) {
+            var e = load64(tbl + (i * 32 + j) * 8);
+            if ((e & 3) != 0 && ((e >> 2) & 31) == 0) { store64(pt + i * 8, j); }
+            if (((e >> 7) & 3) != 0 && ((e >> 9) & 31) == 0) { store64(pt + i * 8, j); }
+        }
+    }
+    _CGA_SCALAR_PARTNER = pt;
+    return pt;
+}
+
+# The null bound for `cga_blade_inverse`: _CGA_NULL_TOL times T, where T is the
+# sum of |b_i| |b_j| over each blade i and its scalar partner j — the magnitudes
+# of exactly the terms whose signed sum is `cga_norm_sq(b)`. For finite
+# coefficients each product is one `_cga_scalar_of_geo` rounds, so a finite norm²
+# means every product here is finite, and with the tolerance applied per term the
+# sum of 32 cannot overflow.
+# ⚠ An infinite coefficient whose partner is 0 is skipped by the norm² (its pair
+# never forms) but makes this bound Inf * 0 = NaN, so the blade is not called
+# null: it divides, and the inverse carries the infinity in that slot, the limit
+# as that coefficient grows. Through 3.3.3 sum b_i^2 was +Inf there and the blade
+# came back as the zero multivector: 79 of 384 non-finite blades in a sweep of
+# every slot with +-Inf and NaN, all of them this case.
+# [measured: scratch non-finite sweep, 3.3.4 base and this tree, 2026-10-03; cycc 6.6.14]
+fn _cga_null_bound(b) {
+    var pt = _cga_scalar_partner_tbl();
+    var thr = f64_from(0);
+    for (var i = 0; i < 32; i = i + 1) {
+        var bi = load64(b + i * 8);
+        if (f64_eq(bi, 0) == 0) {
+            var bj = load64(b + load64(pt + i * 8) * 8);
+            thr = f64_add(thr, f64_mul(f64_mul(f64_abs(bi), f64_abs(bj)), _CGA_NULL_TOL));
+        }
+    }
+    return thr;
+}
+
 # Blade inverse: B⁻¹ = reverse(B) / (B · reverse(B))_scalar. Returns the zero
 # multivector for a null blade (norm² ≈ 0) rather than dividing by zero — e.g.
 # conformal points are null IN EXACT ARITHMETIC, so projecting onto them is
-# undefined. ⚠ In f64 they are null only near |x| ~ 1 — see `cga_point`.
+# undefined. In f64 a point's norm² is a sub-ulp residual of its own terms, not a
+# hard zero (see `cga_point`), and the null test below is sized to that residual.
 public fn cga_blade_inverse(b) {
     var nsq = cga_norm_sq(b);
     # ⛔ ONE LINE DOING TWO DIFFERENT JOBS. `nsq` is a norm SQUARED (degree two in
     # the blade's scale) against an unsquared absolute 1e-12, and it was being
     # asked both "can I divide by this" and "is this blade null" — which need
     # different tests.
-    # ⭐ (1) THE DIVISION fails only at zero, and this case is common rather than
-    # theoretical: nsq is 0 for an exactly-null blade, and for an origin sphere of
-    # radius below ~1.05e-8 or above ~1e8.
     # ⛔ 2.20.0 — THIS READ "nsq is bit-exactly 0 for EVERY conformal point", WHICH
     # IS FALSE, and it sat 70 lines above `cga_point`, whose own comment now says
     # the opposite. Measured over 2000 random full-mantissa pairs per binade, a
     # conformal point is bit-exactly null only at |x| ~ 1; the median relative
-    # error in what should be zero is 46x at 2^-30 and 49x at 2^+30. The guard
-    # below is unaffected — it tests the value it is about to divide by, which is
-    # the right thing whether or not the blade is exactly null — but the sentence
-    # asserted a property the same release measured to be untrue.
+    # error in what should be zero is 46x at 2^-30 and 49x at 2^+30.
     # ⚠ 2.21.0 — THE FIGURES ABOVE DESCRIBE THE ep/em BASIS AND ARE HISTORY. In the
     # null basis the median |P.P| / q is ~4.5e-17 flat rather than 1.0 at the
     # tails. The SENTENCE this note corrects stays corrected, though: a conformal
@@ -3812,16 +4419,41 @@ public fn cga_blade_inverse(b) {
     if (f64_lt(f64_abs(nsq), _GA_F64_POS_INF) == 0) {
         return cga_mv_scale(cga_mv_reverse(b), 0x7FF8000000000000);   # quiet NaN
     }
+    # (1) BELOW DBL_MIN. `1 / nsq` overflows for |nsq| under 2^-1024, and the scale
+    # below would turn every empty slot into 0 * Inf. It is also the floor for a
+    # blade whose terms are subnormal, where rounding is absolute: from |p| =
+    # 2^-510.5 down a conformal point's q/2 is subnormal and its norm² residual
+    # reaches 2.2e-2 of T, far above the bound in (2). No point within 2^-500 of the
+    # origin reaches |nsq| = DBL_MIN, 0 of 4800, so every one of them stops here.
+    # [measured: scratch nullres sweeps, 2026-10-03; cycc 6.6.14]
+    # ⚠ An origin sphere does NOT stop here. Through 2.20.0 (ep/em basis) this
+    # comment said nsq was 0 for an origin sphere of radius below ~1.05e-8 or above
+    # ~1e8; in the null basis that sphere's norm² is r^2 itself, so the zero
+    # multivector those spheres got came from the null test (2), replaced in 3.3.4.
+    # ⚠ What this still costs: a non-null blade whose norm² is below DBL_MIN — an
+    # origin sphere of radius below 2^-511, any blade scaled below 2^-511 — gets the
+    # zero multivector. An origin sphere's inverse, n0 / r^2 - ninf / 2, overflows
+    # from r = 2^-512 down anyway.
     if (f64_lt(f64_abs(nsq), F64_TINY) == 1) { return cga_mv_zero(); }
-    # ⭐ (2) NULLNESS is relative to the blade's own magnitude, and the bound is
-    # measured (see _CGA_NULL_TOL) rather than borrowed from EPSILON_F64.
-    # [measured: docs/audit/2026-09-09-epsilon-open.json]
-    var magsq = f64_from(0);
-    for (var bi = 0; bi < 32; bi = bi + 1) {
-        var bc = load64(b + bi * 8);
-        magsq = f64_add(magsq, f64_mul(bc, bc));
-    }
-    if (f64_le(f64_abs(nsq), f64_mul(_CGA_NULL_TOL, magsq)) == 1) {
+    # ⭐ (2) NULLNESS is measured against the terms the norm² is summed from, T.
+    # ⛔ 3.3.4 — THROUGH 3.3.3 IT WAS MEASURED AGAINST sum b_i^2, WHICH THE NULL
+    # BASIS MADE A DIFFERENT QUANTITY. In the orthonormal ep/em basis every blade's
+    # scalar partner is itself, so sum b_i^2 WAS T. Since 2.21.0 n0 and ninf pair
+    # with each other, and sum b_i^2 counts n0^2 and ninf^2, which are in no term:
+    # for a sphere of centre c and radius r it is |c|^2 + 1 + ((|c|^2 - r^2)/2)^2,
+    # degree four in the geometry's scale where nsq = r^2 is degree two, with an
+    # absolute 1 in it. A unit sphere from distance ~6.9e3 on, and every origin
+    # sphere with r below ~4.2e-8 or above ~4.7e7, came back as the zero
+    # multivector, the "no inverse" answer, and `cga_project` onto it as 0.
+    # [measured: D052 sweep on the 3.3.4 base tree, scratch, 2026-10-03; cycc 6.6.14]
+    # ⭐ T is degree two in the blade's weight and under a dilation, so the test is
+    # covariant under both: an origin sphere has T = nsq and is never null. A
+    # translation moves T (2|c|^2 - r^2 for |c| > r), and no test here can avoid
+    # that: the sphere stores (|c|^2 - r^2)/2 in one double, whose ulp grows with
+    # |c|^2. The bound meets it at |c| = 2^24 r, where an ulp of |c|^2 is r^2 / 16;
+    # in the sweep a unit sphere last inverts at 1.49e7 and is first null at 1.85e7.
+    # [measured: D052 sweep on this tree, scratch, 2026-10-03; cycc 6.6.14]
+    if (f64_le(f64_abs(nsq), _cga_null_bound(b)) == 1) {
         return cga_mv_zero();
     }
     return cga_mv_scale(cga_mv_reverse(b), f64_div(F64_ONE, nsq));
@@ -3841,6 +4473,65 @@ public fn cga_reject(x, b) {
 }
 
 # --- Conformal model constructors ---
+
+# q/2 = (x^2 + y^2 + z^2)/2 for `cga_point`, formed in a scaled copy when the
+# plain form would lose it.
+# ⛔ 3.3.4 — THE PLAIN SUM OVERFLOWED BEFORE q/2 DID. Through 3.3.3 `cga_point`
+# halved x*x + y*y + z*z, which overflows once |p| passes ~2^512 although q/2 is
+# finite up to 2^512.5, so the ninf coefficient came back +Inf. Below 2^-510.5
+# the squares and then the halving each round on the subnormal grid, so q/2 came
+# back one subnormal step off. Of 153,516 points over every binade (1 to 3
+# full-mantissa coordinates), 78 were +Inf and 515 outside the bound below (3 u
+# of q/2 plus half a subnormal step); none now is.
+# [measured: D048 sweep vs an exact oracle, 3.3.4 base and this tree, 2026-10-03; cycc 6.6.14]
+# ⭐ Outside [2^-484, 2^511) the coordinates are divided by the power of two at
+# or below the largest, which is exact; the sum is formed there and multiplied
+# back by that power twice. The first multiply is exact whenever the result can
+# be non-zero. A normal q/2 so carries only the sum's own rounding, and a
+# subnormal one is rounded twice, the sum in the normal range and then onto the
+# subnormal grid: within half a subnormal step plus the sum's rounding. q/2 is
+# finite whenever the true value is, up to the sum's rounding at the overflow
+# edge. Inside, the plain form is kept and the bits do not change: there the
+# scaled sum is the same sum moved by a power of two. The edges are derived, not
+# chosen: below 2^511 three squares and their partial sums stay below 2^1024;
+# above 2^-484 a square below DBL_MIN is under 2^-54 of the sum, a quarter of its
+# ulp, so its subnormal rounding cannot reach the last bit, and q/2 is normal, so
+# halving it is exact. Below 2^-484 it can: tests/modules.tcyr pins points at
+# 2^-500 and 2^-484.51 whose plain sum is one ulp low.
+# ⚠ THE DOUBLE ROUNDING IS NOT CORRECT ROUNDING. Near a tie on the subnormal grid
+# the second rounding still lands one step off: 11 to 17 of about 3,700 subnormal
+# results per seed over 3 seeds, against about 300 in 3.3.3, which had 8 of those 43
+# right, e.g. x = y = 2^-512 (1 + 2^-52), z = 0: q/2 is 2^50 + 1/2 + 2^-54 steps,
+# the scaled sum drops the 2^-54 and the tie goes to even. Removing them needs an
+# error-free sum (TwoProduct and TwoSum with a sticky tie-break).
+# [measured: 3-seed cga_point sweep vs an exact oracle, 3.3.4 base and this tree, 2026-10-03; cycc 6.6.14]
+# ⚠ An infinite coordinate, or a NaN in x, takes the plain form; a NaN in y or z
+# with x out of the window takes the scaled form. Both propagate the NaN, and an
+# infinite coordinate gives +Inf, bit for bit as before: 0 of about 2,290
+# non-finite inputs changed.
+# [measured: 3-seed cga_point sweep, non-finite inputs, 3.3.4 base and this tree, 2026-10-03; cycc 6.6.14]
+var _CGA_PT_LO = 0x21B0_0000_0000_0000;  # 2^-484 = 2.002083095183101e-146
+var _CGA_PT_HI = 0x5FE0_0000_0000_0000;  # 2^511 = 6.703903964971299e+153
+fn _cga_half_sq3(x, y, z) {
+    var mx = f64_abs(x);
+    var ay = f64_abs(y);
+    var az = f64_abs(z);
+    if (f64_gt(ay, mx) == 1) { mx = ay; }
+    if (f64_gt(az, mx) == 1) { mx = az; }
+    var scaled = 0;
+    if (f64_gt(mx, 0) == 1 && f64_lt(mx, _CGA_PT_LO) == 1) { scaled = 1; }
+    if (f64_lt(mx, _CGA_PT_HI) == 0 && f64_lt(mx, _GA_F64_POS_INF) == 1) { scaled = 1; }
+    if (scaled == 0) {
+        return f64_mul(F64_HALF, f64_add(f64_add(f64_mul(x, x), f64_mul(y, y)), f64_mul(z, z)));
+    }
+    # ⚠ DIVIDE by `s`, never multiply by 1/s: for a subnormal `s` the reciprocal is +Inf.
+    var s = _ga_pow2_floor(mx);
+    var xs = f64_div(x, s);
+    var ys = f64_div(y, s);
+    var zs = f64_div(z, s);
+    var h = f64_mul(F64_HALF, f64_add(f64_add(f64_mul(xs, xs), f64_mul(ys, ys)), f64_mul(zs, zs)));
+    return f64_mul(f64_mul(h, s), s);
+}
 
 # Embed a 3D point into the conformal model.
 # P = x*e1 + y*e2 + z*e3 + n0 + (q/2)*ninf,  q = x^2 + y^2 + z^2
@@ -3886,7 +4577,6 @@ public fn cga_reject(x, b) {
 # [measured: 2000 pts/binade residual, k-sweep, witness sweep a=2^0..2^60]
 public fn cga_point(x, y, z) {
     var mv = cga_mv_zero();
-    var x2 = f64_add(f64_add(f64_mul(x, x), f64_mul(y, y)), f64_mul(z, z));
     cga_mv_set(mv, 1, x);   # e1
     cga_mv_set(mv, 2, y);   # e2
     cga_mv_set(mv, 3, z);   # e3
@@ -3898,14 +4588,18 @@ public fn cga_point(x, y, z) {
     # what dropping the Neumaier compensation in `_cga_scalar_of_geo` buys — and
     # it fabricates zeros elsewhere, so it was reverted. See that function.
     cga_mv_set(mv, 4, F64_ONE);                       # n0
-    cga_mv_set(mv, 5, f64_mul(F64_HALF, x2));         # ninf: q/2
+    cga_mv_set(mv, 5, _cga_half_sq3(x, y, z));        # ninf: q/2
     return mv;
 }
 
 # Create a conformal sphere: S = P - (r^2/2)*ninf
 public fn cga_sphere(cx, cy, cz, r) {
     var p = cga_point(cx, cy, cz);
-    var half_r2 = f64_mul(F64_HALF, f64_mul(r, r));
+    # ⭐ 3.3.4 — HALVE r BEFORE SQUARING. 0.5 * (r * r) overflowed from r = 2^512,
+    # where r^2/2 is finite up to 2^512.5, and rounded twice below r = 2^-510.5 (r * r
+    # subnormal, then halved). (0.5 * r) * r rounds r^2/2 once for every r >= 2^-1021
+    # (below that both give 0), and between those ends its bits are the old ones.
+    var half_r2 = f64_mul(f64_mul(F64_HALF, r), r);
     # ⭐ NULL BASIS: `ninf` is blade 5 alone. It used to be `ep + em`, which is why
     # this subtracted from two slots; doing that now would also corrupt n0.
     cga_mv_set(p, 5, f64_sub(cga_mv_get(p, 5), half_r2));

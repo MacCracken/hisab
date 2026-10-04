@@ -4,30 +4,36 @@ Tracked dependency version constraints and upgrade paths.
 
 ## Cyrius Toolchain
 
-**Status:** Pinned to **6.6.12** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
+**Status:** Pinned to **6.6.14** via `cyrius.cyml [package].cyrius` (legacy `.cyrius-toolchain` removed; CI/release grep the manifest directly).
 
 **Note:** Cyrius stdlib provides dense LU, Cholesky, QR, SVD, eigendecomposition. As of 6.2.x these live in the new **`ganita`** umbrella module (which re-exports the former `matrix`/`linalg` API in full and also hosts the transcendentals). This is a critical dependency — hisab's `linalg_ext.cyr` wraps these functions. The `[deps] stdlib` list pulls `ganita` (not `matrix`/`linalg` — listing those alongside `ganita` collides).
 
 **Compiler limits the bundle must fit.** `dist/hisab.cyr` is one source file, and a consumer's
-cycc must accept it whole. Two caps apply, and the token cap can bind before the byte cap:
+cycc must accept it whole. Two caps apply. For hisab's source the byte cap binds first: it averages
+9.66 B per token, so the token cap would need a ~40 MB source, and binds first only below ~6.0 B per
+token [measured: token-boundary probe on the 3.3.4 bundle, 2026-10-03; cycc 6.6.14]:
 
-| cap | value | where (cyrius 6.6.12 tag) |
+| cap | value | where (cyrius 6.6.14 tag; the same lines at 6.6.12 and 6.6.13) |
 |---|---|---|
 | expanded source | 25,165,824 B (24 MiB) | `src/frontend/lex_pp.cyr:4197` (`op > 25165824`; also `:4533`, `:4644`) |
 | tokens | 4,194,304 | `src/frontend/lex.cyr:273` (`tc >= 4194304`) |
 
-The bundle is 1,400,631 B at 3.3.3 (1,157,699 B at 3.3.2), 5.57% of the byte cap, so there is no size pressure. The history of
+The bundle is 1,608,855 B at 3.3.4 (1,400,631 B at 3.3.3, 1,157,699 B at 3.3.2), 6.39% of the byte cap raw, so there is no size pressure. Before
+the [3.3.4] rows landed it expanded with its stdlib under `cyrius check --with-deps` to 2,048,462 B (8.14% of the byte cap) and 212,094
+tokens (5.06% of the token cap) [measured: boundary probes, 2026-10-03; cycc 6.6.14]. A third limit
+with the same value fires first for a top-level file: the raw read buffer `_SRC_CAP` (`src/main.cyr`'s
+"input exceeds the 24MB source buffer"), which is what CI's consumer-build gate meets. The history of
 these figures is in CHANGELOG 2.11.3. That release measured both caps as a pair: a 9,002,640 B
 source was rejected by 6.5.33 and compiled on 6.6.1. It also found the token cap binding first, at
-8.2 MB. The 1 MB and 16 MB figures quoted before it both described `_SRC_CAP`, the raw read buffer,
+8.2 MB, under 6.5.33's caps. The 1 MB and 16 MB figures quoted before it both described `_SRC_CAP`, the raw read buffer,
 which is not what rejects a consumer's build. **On every toolchain bump, re-derive both caps by
 grepping the new TAG, and check which one binds.** A limit taken from a dependency is a measurement,
 and it goes stale silently.
 
 ⚠ **Each bump entry below records the verdicts of its own date.** A toolchain filing an entry calls
-open or still live has since been archived: every hisab-side cyrius record is in
-[`issues/archived/`](issues/archived/); the one open record, ganita's `atan2` (stdlib), is in the
-6.6.12 entry.
+open or still live has since been archived: every hisab-side cyrius and ganita record through 3.3.3
+is in [`issues/archived/`](issues/archived/). ganita's `atan2` (the 6.6.12 entry's open record)
+closed on the 6.6.14 bump.
 
 **Upstream notes (5.x line):**
 - 5.0+: `lib/matrix.cyr` overflow class addressed; SVD precision improvements landed.
@@ -41,7 +47,32 @@ open or still live has since been archived: every hisab-side cyrius record is in
 - 6.0.2: lockfile/vendoring fix — `cyrius deps` now hashes all `.cyr` under `lib/` and writes a real lock (the empty 0-byte `cyrius.lock` bug present since 5.11.8); vendored deps are regular file-copies, not the dangling symlinks that broke CI.
 - **6.0.14**: clean build/test (901/901 as of v2.4.6). Migration was manifest-only (pin bump + sakshi resolution); the 34 math modules moved `lib/`→`src/` so the committed `lib/` no longer shadows the toolchain's version-pinned stdlib snapshot.
 - **6.2.11** (v2.6.6): stdlib math reorg. The transcendentals (`f64_acos`/`f64_asin`/`f64_atan2`/`f64_pow`/`f64_sinh`/`f64_cosh`/`f64_tanh` + hyperbolic inverses) moved out of `math` into the new **`ganita`** module, which also subsumes `matrix`/`linalg` (re-exports their full API). `math` now ships NaN-correct `f64_le`/`f64_ge` (hisab dropped its local copies). `[deps] stdlib`: `+ganita`, `−matrix`, `−linalg`. Clean build, 957/957 tests, all gates green. Tracked-issue re-verify: **3 of 5 fixed** (modules-substring, 18-arg-fn scramble, lint rc-as-count → all archived); for-empty-clauses still open. Vendored `lib/` re-resolved via `cyrius deps` (30 files — **not** the full-snapshot `cyrius lib sync`, which over-vendors unused platform variants and breaks `deps --verify` on a spurious `process_agnos.cyr` entry); `cyrius.lock` 30 deps, verify 30/30.
-- **6.6.12** (current pin, v3.2.2; crossed 6.6.7–6.6.11): **the first bump that changed hisab's
+- **6.6.14** (current pin, v3.3.4; crossed 6.6.13): **everything that reaches hisab arrives in
+  6.6.13**; 6.6.14 is TLS-only, and all nine hisab binaries build byte-identical under 6.6.13 and
+  6.6.14.
+  - **Stdlib.** Six files move: `ganita.cyr` 1.2.9 → 1.2.11, `math.cyr`, and four `syscalls_*`
+    variants. 31/31 byte-match the 6.6.14 tag, `sakshi.cyr` matches 2.5.6's `dist/` (still sakshi's
+    latest tag), and the lock is 32/32. Comment-stripped body diffs: ganita changes `sinh`, `cosh`,
+    `tanh`, `asin`, `atan2`, `asinh`, `acosh`, `atanh` and `binomial` and adds `tan`/`f64_tan`;
+    `ganita_mat_svd` is unchanged. hisab reaches only `sinh`, `cosh` and `atan2`. `math.cyr` loses
+    `f64_le`/`f64_ge`/`f64_trunc` (6.6.13 made them compiler builtins and reserved names; hisab's 58
+    call sites are inlined, 0 mismatches against the old bodies) and changes `f64_parse`.
+  - **Consequences in hisab.** ganita's atan2 repair closes hisab's 2026-09-30 filing (archived with
+    its paired run). ganita's new `f64_tan` collided with hisab's public `f64_tan`, which 3.3.4
+    retires (its three callers inline the same quotient; bits unchanged on every pin). `sinh`/`cosh`
+    move `cx_sin`, `cx_cos` and the Lorentz builders (pinned by new bit-exact assertions). The 5.7.9
+    note below that hisab builds emit no `duplicate fn` warning was briefly false under this pin
+    until `f64_tan` was retired; CI's duplicate gate now greps `duplicate fn` too.
+  - **Size.** CLI 300,064 → 326,248 B; suite binaries +26–30 KB, all stdlib growth. On the bundle,
+    `CYRIUS_STATS` code_size 835,528 → 862,576 B (+25,104 B stdlib, +1,944 B compiler).
+  - **Caps** unchanged at the same lines of the tag (see the table above).
+  - **Consumers.** A consumer moving its own pin to ≥ 6.6.13 must re-vendor `lib/math.cyr`: the old
+    file is refused ("reserved keyword 'f64_le'"). No consumer is at ≥ 6.6.13 today.
+  - **Filed upstream with the maintainer's approval**, both reproducing on 6.6.14: top-level
+    `fncallN` on a capturing closure (exit 139 on 6.6.0–6.6.14), and `D082` (a closure's `return` is
+    booked against the enclosing fn). Two ganita filings on `ganita_mat_svd` too. See the roadmap's
+    *Toolchain, tracked upstream*.
+- **6.6.12** (v3.2.2; crossed 6.6.7–6.6.11): **the first bump that changed hisab's
   results** — 14 assertions failed, none a hisab regression.
   - **Float semantics.** 6.6.8 made x86 `f64_neg` an IEEE sign flip: `f64_neg(+0)` is −0, where it
     had computed `0.0 − x`. It also made `f64_to` saturate by sign, with NaN → 0; x86 had returned
@@ -175,7 +206,8 @@ open or still live has since been archived: every hisab-side cyrius record is in
   ⭐ **The SIMD destination-slot miscompile is FIXED**, verified from the consumer side: hisab's own
   filed reproducer exits **0** on 6.6.2 and **139** on 6.6.1, same binary, and the three suites that
   used to SIGSEGV pass with `m4_mul_vec4`'s hoist REMOVED. The hoist is kept for consistency with
-  `m3_mul_vec3` only, and its comment no longer claims otherwise.
+  `m3_mul_vec3` only, and its comment no longer claims otherwise. (3.3.4 removed it, after
+  re-probing the inline form on every cycc from 6.6.3 to 6.6.14; it is 3.5–5% faster.)
 
   ⛔ **hisab's filing was wrong about the scope in two ways.** It was filed as derive-specific and as
   a 6.5.71 regression and was **neither** — all 21 `f64v_*`/`f32v_*`/`f32v8_*`/`f64v256_*`/`iv_*`
@@ -340,7 +372,7 @@ open or still live has since been archived: every hisab-side cyrius record is in
 - **6.3.11** (v2.6.7): infrastructure-only bump from 6.2.11. **No library source change** — all 34 modules compile clean; `dist/hisab.cyr` byte-identical apart from the version header. Stdlib delta touched `assert`/`bench`/`fnptr`/`io`/`math` + the `syscalls` platform variants (`ganita` unchanged); `lib/result.cyr` (transitive dep of `io`/`tagged`) picked up the 6.3.11 `_die` agnos-portability fix (was a bare `syscall(60,1)` that no-op'd → failed-open on agnos; now target-guarded). 6.3.x CLI split: **`cyrius deps`** resolves git deps only (commit-pins sakshi in the lock), **`cyrius lib sync`** (no `--full`) vendors the declared stdlib subset — superseding the 6.2.x `cyrius deps`-does-both flow. Every vendored stdlib file byte-matches 6.3.11; `cyrius.lock` 30 deps (1 commit-pinned), verify 30/30. 957/957 tests, all gates green. Tracked-issue re-verify: for-empty-clauses **still open** on 6.3.11; no new fixes (3 prior fixes stay archived).
 
 **Watching upstream:**
-- **RISC-V rv64** — the 4th platform peer. This entry read "5.7.11" for four minors; it has slipped repeatedly since and is now re-homed to **v6.7.x / v6.8.x** (upstream `docs/development/roadmap_6.md`, section "v6.7.x or v6.8.x — Platform: RISC-V rv64", theme set 2026-07-07). Still not landed at **6.6.12** (re-checked 2026-09-30 at the tag: its `lib/` has the same seven `syscalls*` files hisab vendors, none for riscv64), and the tag's CHANGELOG carries no rv64 mention newer than its 6.2.0 section. Watched, not blocking: hisab is pure math with no target-specific code, so the only expected surface is the peer the upstream plan names, `lib/syscalls_riscv64_linux.cyr`, vendored for snapshot parity by the routine `cyrius lib sync` on a bump.
+- **RISC-V rv64** — the 4th platform peer. This entry read "5.7.11" for four minors; it has slipped repeatedly since and is now re-homed to **v6.7.x / v6.8.x** (upstream `docs/development/roadmap_6.md`, section "v6.7.x or v6.8.x — Platform: RISC-V rv64", theme set 2026-07-07). Still not landed at **6.6.14** (re-checked 2026-10-03 at the tag; 2026-09-30 at 6.6.12: its `lib/` has the same seven `syscalls*` files hisab vendors, none for riscv64), and the tag's CHANGELOG carries no rv64 mention newer than its 6.2.0 section. Watched, not blocking: hisab is pure math with no target-specific code, so the only expected surface is the peer the upstream plan names, `lib/syscalls_riscv64_linux.cyr`, vendored for snapshot parity by the routine `cyrius lib sync` on a bump.
 
 ## Cyrius stdlib modules (16 declared, 32 vendored)
 
@@ -350,7 +382,7 @@ open or still live has since been archived: every hisab-side cyrius record is in
 | string, str | C strings, fat strings | Stable |
 | fmt | Formatting | Stable |
 | vec | Dynamic array | Stable |
-| math | f64 inclusive cmp (`f64_le`/`f64_ge`), clamp/lerp/min/max/sign/trunc, exp/ln polyfills, gcd/lcm | Stable |
+| math | clamp/lerp/min/max/sign, exp/ln polyfills, gcd/lcm, the f64 constants (`F64_ONE`, `F64_TAU`, `F64_LN2`, …); also `f64_le`/`f64_ge`/`f64_trunc` on cyrius ≤ 6.6.12 — from 6.6.13 those three are compiler builtins and reserved names | Stable |
 | ganita | 6.2.x math umbrella: transcendentals (sinh, pow, atan2, …) + dense matrix storage + decompositions (LU, QR, SVD, eigen). Subsumes the former `matrix`/`linalg` | New in 6.2.x — replaces `matrix`+`linalg` |
 | tagged | Option/Result types | Stable |
 | result | `Result<T, E>` VALUE form (`Ok`/`Err`/`is_err_result`, the v6.6.0 form); every fallible hisab entry point returns it since 3.0.0 | Stable — hisab's error contract rides on it |

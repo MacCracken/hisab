@@ -59,8 +59,19 @@
 # claims -- and 12 of the 22 in the corpus below, re-measured here. A gate that
 # flags noise and misses claims is worse than no gate, because it is trusted. So
 # the planted corpus now lives in the script and `--selftest` re-runs it (see
-# SELFTEST below): 21 of 22 claims flagged, 0 of 15 decoys, one known miss
-# documented in place.
+# SELFTEST below): 41 of 42 claims flagged, 0 of 42 decoys, one known miss
+# documented in place. [measured: ./scripts/check-measurements.sh --selftest, 2026-10-03]
+#
+# The tree does hold one PARTIAL recall signal: a paragraph that carries a marker is
+# one its author called a measurement. Strip the markers and re-scan, and every such
+# paragraph the shapes cannot see is a miss. 3.3.4 measured its count forms that way
+# (the roadmap's case: "Over 180000 integrations ... 23712 NaN results" went
+# unflagged once its marker was removed). Of the 795 marked paragraphs, 313 showed no
+# claim with the marker gone, and the count forms below bring that to 270, losing
+# none. In a 20-paragraph sample of the 270, 15 state no measured number at all
+# ("returned NaN at all three queries") and 5 state an observed value that 'residual'
+# and 'error' do not reach ("stored -0.0833", "came back (+1, 2.2e-7, 0)").
+# [measured: marker-stripped re-scan, this script before and after 3.3.4, 2026-10-03]
 #
 # The shapes added to close that gap, and what each one exists for:
 #   time      spelled-out durations -- "0.9 seconds before, 0.4 after", "120 s"
@@ -73,7 +84,14 @@
 #                                      process", "hung forever", "never returned"
 #   arrow     the house before/after style -- "support calls 901 -> 1790"
 #   exit      "exits 0" as well as "exit 139" (the third incident above was
-#             exactly this form and the old pattern did not see it)
+#             exactly this form and the old pattern did not see it), and since
+#             3.3.4 the past tense, "exited 139"
+#   sweep     a count with no separator or unit (3.3.4) -- "over 2000 random rays",
+#             "23712 NaN results", "all 3560 assertions still passed"
+#   tally     since 3.3.4 also "81 of the 601 decades", "5899 of them", a tally
+#             broken across a line ("3321 of" / "those 3329"), and the capitals
+#             of a headline ("498 OF 1010 EXPONENTS")
+#   ulp       an error with its direction (3.3.4) -- "137 ulp out", "1 ulp high"
 #
 # Usage:
 #   ./scripts/check-measurements.sh                 full scan, report + exit 1 on any unmarked
@@ -126,6 +144,16 @@
 # 'crash' 2 of 10, 'residual' 5 of 15, and 0 of 6 across exit/ratio/time.
 # 'residual' is the loosest shape here and is the one to cut first if this ever
 # gets annoying.
+#
+# The 3.3.4 count forms, measured the same way: they add 25 unmarked lines tree-wide
+# (20 more paragraphs), every one classified, and 5 are not unbacked measurements --
+# a test describing its own sweep ("a bit-exact assertion over 500 scales"), a count
+# read off the source ("4 of the 6 siblings were never asked"), and three chosen grid
+# sizes in paragraphs that already name their test ("the L1 mass of a 1600-sample
+# grid"). The other 20 are suite counts, mutation results, exits, ulp errors and sweep
+# sizes nobody marked. They flag 127 more lines inside paragraphs that already carry
+# a marker, and drop no line the old shapes flagged.
+# [measured: full-tree scan and --list, this script before and after 3.3.4, 2026-10-03]
 #
 # The false positives are of five kinds, all previously known: derived bounds
 # ("128 MB at 8 B/elem", "+14.3%"), named IEEE-754 values ("4.94e-324, the
@@ -285,6 +313,33 @@ TIME_UNIT = r'(?:s|secs?|seconds?|ms|us|µs|ns|mins?|minutes?|hours?)'
 OBSERVED = (r'(?:instead of|rather than|off by|but got|came back|came out|summed? to|totall?ed'
             r'|drifted|overshot|undershot|returned|reported|rendered|printed|observed'
             r'|converged to|stalled at|landed at|,\s*not\b)')
+# What a sweep counts -- see 'sweep'. "4000 steps" and "1000 iterations" are a
+# method's parameters, so `steps` and `iterations` are not here: on this tree they
+# would add 3 unmarked lines, all parameters, for 1 claim line in a marked paragraph.
+# [measured: scripts/check-measurements.sh steps/iterations variant, full-tree diff, 2026-10-03]
+SWEEP_NOUN = (r'(?:inputs?|cases|pairs|triples|points|samples|trials|seeds|arrays|matrices'
+              r'|vectors|triangles|rays|queries|calls|evaluations|integrations|results|answers'
+              r'|decompositions|configurations|multivectors|quaternions|intervals|indices|scales'
+              r'|components|sets|fixtures|runs|draws|contacts|elements|entries|values|rows|lines'
+              r'|words|terms|tests|assertions|failures|mismatches|disagreements|errors|misses|hits'
+              r'|positions|sites|meshes|trees|polynomials|bases|exponents|operands|coordinates'
+              r'|parts|roots|probes|shapes|boxes|spheres|normals|nodes|edges|faces|cells)')
+# The same nouns written as the adjective of a count, "the 2041-scale sweep", "a
+# 455-configuration sweep". `step`, `decade` and `binade` are left out: "the 4000-step
+# loops" is a parameter and "the 154-decade depth" a derivation, both in this tree.
+SWEEP_UNIT = (r'(?:inputs?|cases?|pairs?|points?|samples?|trials?|seeds?|arrays?|matri(?:x|ces)'
+              r'|vectors?|triangles?|rays?|quer(?:y|ies)|calls?|evaluations?|scales?'
+              r'|configurations?|runs?|mutants?|rows?|entr(?:y|ies)|exponents?|positions?|sets?'
+              r'|sites?|box(?:es)?|spheres?)')
+# A count that is a power of two from 2^7 up is a size someone CHOSE (a table, an
+# FFT length, a histogram), not one a run produced.
+NOT_POW2 = (r'(?!(?:128|256|512|1024|2048|4096|8192|16384|32768|65536|131072|262144|524288'
+            r'|1048576)\b)')
+# A count that follows an operator is being derived ("-> 3042", "= 1800", "/ 1728");
+# one after "up to" or "at most" is a cap. Neither is an observation. The first
+# lookbehind keeps a match from starting inside a comma-grouped or decimal number:
+# "4,096-point" would read as "096-point" and walk past NOT_POW2.
+SWEEP_LEAD = r'(?<![\d,.])(?<![=/>]\s)(?<![=/>])(?<!up to )(?<!at most )'
 
 SHAPES = [
     # An explicit claim of having run something. Highest confidence by far --
@@ -356,7 +411,45 @@ SHAPES = [
     # Tallies. The word form is unambiguous; the slash form only counts when the
     # two sides are equal AND >= 2 (40/40, 1127/1127) -- 4/3 and 1/2 are
     # fractions and 0/0 is a division-by-zero being described.
-    ('tally', re.compile(r'\b\d+\s+(?:of|out of)\s+\d+\b|\b([2-9]\d*|\d{2,})/(?=\1\b)\d+')),
+    # The word form also has a determiner between its two numbers ("81 of the 601
+    # decades", "13 of its 20 placements"), a pronoun where the second number would
+    # be ("wrong on 5899 of them", "6 of those"), and a line break after `of` ("3321
+    # of" / "those 3329"); none was flagged. The line-end form needs two digits, so
+    # "row 2 of" / "the matrix" stays prose. The lookbehind keeps a number that is
+    # the tail of another -- "1.9 of the 2", "1e-15 of", "hit+2 of" -- out of all three,
+    # and none of them fires on a line that cites a publication ("the paper's Table 2
+    # lists 12 of the 16 coefficients"): that count names its source in the sentence.
+    # Case-blind, since a headline tally is written "FOR 498 OF 1010 EXPONENTS".
+    ('tally', re.compile(r'\b\d+\s+(?:of|out of)\s+\d+\b|\b([2-9]\d*|\d{2,})/(?=\1\b)\d+'
+                         r'|^(?!.*\b(?:papers?|Table\s+\d+|et al)\b).*?(?<![\w.+\-^])(?:'
+                         r'\d+\s+(?:of|out of)\s+(?:them|those|these)\b'
+                         r'|\d+\s+(?:of|out of)\s+(?:the|those|these|its|all|their)\s+\d+\b'
+                         r'|\d{2,}\s+(?:of|out of)\s*$)', re.I)),
+    # Sweeps. A count claim is usually written with no separator, no unit and no
+    # percentage -- "Over 180000 integrations ... 23712 NaN results" -- so every
+    # shape above walks past it. Three forms:
+    #   * `over`/`across`/`sweep of` a count of 100 or more -- the scope of a run,
+    #     "over 2000 random rays", "across 10400 matrices", "a sweep of 3000 random
+    #     cases". Below 100 it is a structure: "a linear search over 32 blades",
+    #     "num_sobol over 64 bits".
+    #   * a count of 1000 or more naming what it counts (SWEEP_NOUN above), up to two
+    #     words between: "23712 NaN results", "on 600436 indices", "all 3991
+    #     assertions". Three-digit counts are left out: on this tree they would add 16
+    #     unmarked lines, 10 of them chosen sizes or counts of source lines ("300
+    #     points on a unit grid", "~490 lines of solver body").
+    #     [measured: scripts/check-measurements.sh 3-digit variant, full-tree diff, 2026-10-03]
+    #   * a count of 100 or more as the adjective of what it counts (SWEEP_UNIT): "the
+    #     2041-scale sweep", "a 455-configuration sweep", "the 1500625-matrix grid".
+    # None fires on a power of two (a size someone chose: "65536 elements",
+    # "histogram over 512 cells"), on a number after an operator (a derivation:
+    # "40x40 grid -> 3042 triangles", "= 1800 probes", "1600 / 1728 samples"), or on
+    # a cap ("up to 50000 points", "at most 4000 entries"). The adjective and noun forms
+    # never start inside a comma-grouped or decimal number (SWEEP_LEAD above).
+    ('sweep', re.compile(r'\b(?:over|across|sweep of)\s+'
+                         + NOT_POW2 + r'\d{3,}\b'
+                         r'|' + SWEEP_LEAD + r'\b' + NOT_POW2 + r'\d{4,}\s+(?:[A-Za-z±][\w±+-]*\s+){0,2}?'
+                         + SWEEP_NOUN + r'\b'
+                         r'|' + SWEEP_LEAD + r'\b' + NOT_POW2 + r'\d{3,}-' + SWEEP_UNIT + r'\b', re.I)),
     # Comma-grouped magnitudes (538,608) and k/M suffixes (766k, 1.4M). A number
     # a human bothered to group is a counted quantity, not an algorithm constant.
     # Round scaled caps ("1M elements max") are excluded by the lookahead.
@@ -369,8 +462,11 @@ SHAPES = [
     # as `exit 139` -- and the THIRD non-reproducing figure in this repo's history
     # was exactly one of them (a register reproducer recorded as exit 139 that
     # re-measures as exit 0; CHANGELOG "The register's reproducer did not
-    # reproduce"), which the bare `exit \d+` form did not see.
-    ('exit',  re.compile(r'\bexits?\s+(?:code\s+|status\s+|with\s+)?\d+\b'
+    # reproduce"), which the bare `exit \d+` form did not see. The past tense is the
+    # same claim ("with n = 3 exited 139", "exited **1**"), and through 3.3.3 this
+    # read `exits?` and saw none of the 15 comment lines in this tree that use it.
+    # [measured: grep of src/ and tests/ comments, 2026-10-03]
+    ('exit',  re.compile(r'\bexit(?:s|ed)?\s+(?:code\s+|status\s+|with\s+)?\*{0,2}\d+\b'
                          r'|\bexit(?:s|ed)?\s+non-?zero\b'
                          r'|\bSIGSEGV\b|\bSIGFPE\b|\bSIGABRT\b|\bSIGBUS\b|\bSIGILL\b')),
     # A crash, a hang or a non-return is a measurement with the number left off:
@@ -397,6 +493,16 @@ SHAPES = [
     # mantissa (1.220703125e-4 = h^2/8, 7.947285970052083e-09 = 2/(15*2^24)) is
     # an exact closed form being expanded, not a measurement.
     ('error', re.compile(r'\b\d\.\d{2,6}e[-+]?\d+\b(?!\d)')),
+    # An error stated in ulps, with the direction it was off in: "137 ulp out",
+    # "1 ulp high", "0.18 ulp from the true one". The direction word is what makes it
+    # an observation; "within 0.5 ulp of" is a contract and "1 ULP apart" describes
+    # an input, and the shape fires on neither. A contract can carry a direction word
+    # too ("within 1 ulp from the true value", "never more than 0.5 ulp off"), so a
+    # count after "within", "most" or "than" is left out, and so is the tail of a
+    # decimal, where a match would otherwise start at "5 ulp off".
+    ('ulp',   re.compile(r'(?<![\d.])(?<!within )(?<!most )(?<!than )'
+                         r'\b\d+(?:\.\d+)?\s*ulps?\s+(?:out|off|low|high|wrong|worse|better|short'
+                         r'|from\s+(?:the\s+)?(?:true|exact|correct|right))\b', re.I)),
 ]
 
 # Shapes that must see the RAW comment, because the neutralisers above would
@@ -488,6 +594,30 @@ SELFTEST = [
     ('+', "solve_bicgstab crashed the process on a singular system before the tolerance fix."),
     ('+', "The old loop hung forever when any entry of m was NaN."),
     ('+', "On the 4,096-point fixture the second call is 12 percent slower."),
+    # 3.3.4 -- the count claims. The first is the roadmap's own example, which went
+    # unflagged once its marker was removed where a time claim did not. Each later
+    # line is caught by one form only, so each form is proven on its own.
+    ('+', "Over 180000 integrations of the random fixture, 23712 NaN results came back."),
+    ('+', "Against the exact slab oracle over 382 rays the hit parameter never moved."),
+    ('+', "With the guard deleted, all 3560 assertions still passed."),
+    ('+', "The compensated sum left 71905 NaN results with the old bits."),
+    ('+', "3.3.2 was wrong on 5899 of them, all with an i64 min entry."),
+    ('+', "The old guard was right for 81 of the 601 decades it was asked about."),
+    ('+', "SVD LOST THE SMALL BLOCK FOR 472 OF 999 RATIOS."),
+    ('+', "Against the exact sum (python3 Fraction), 3321 of"),
+    ('+', "A null vec with n = 3 exited 139 before the guard went in."),
+    ('+', "The repeated-multiplication loop landed 137 ulp out at 0.9^1024."),
+    ('+', "A sweep of 3000 random add, sub and mul cases returned no degenerate interval."),
+    ('+', "Both mutants SURVIVED the 2041-scale sweep and die on these two assertions."),
+    # One claim per alternative the forms above name but no line here exercised.
+    ('+', "The identical call with n = 100 exited **1**."),
+    ('+', "The fused product sat 0.18 ulp from the true one."),
+    ('+', "The old polynomial was 3 ulps off at the cut."),
+    ('+', "ALL 3955 ASSERTIONS PASSED WITH THE GUARD DELETED."),
+    ('+', "The old sum left 23712 quiet NaN results with the guard deleted."),
+    ('+', "Across 440 random seeds the old path failed."),
+    ('+', "A one-step DBL_MIN repair fails 77 of these."),
+    ('+', "An infinite site was inserted at 13 of its 20 placements."),
     # KNOWN MISS. A comparative with no quantity anywhere in it. Catching this
     # needs "doubles/halves/triples" as bare verbs, and those are ordinary math
     # prose here ("the map doubles the angle", "halves the interval each step"),
@@ -508,6 +638,38 @@ SELFTEST = [
     ('-', "The paper's Table 2 lists 12 of the 16 coefficients; the rest are zero by symmetry."),
     ('-', "alloc() returns 0 on failure, so every caller checks before storing."),
     ('-', "Rewritten three times since the first cut; the assertions below pin the shape."),
+    # 3.3.4 -- one decoy per exclusion the count forms carry, most of them lines
+    # from this tree. The ones after the 154-decade line each pin one member of an
+    # exclusion (the tally lookbehind, the citation words, the unspaced operator).
+    ('-', "A 16x16 (x) 16x16 product asks for 65536 elements, past the cap."),
+    ('-', "The certification histogram runs over 512 cells."),
+    ('-', "_cga_bits_blade is a linear search over 32 blades."),
+    ('-', "So the harness makes 6 x 300 = 1800 probes, matching the all-ghost run."),
+    ('-', "The fold puts 1600 / 1728 samples into each number."),
+    ('-', "Callers may pass up to 50000 points; past that the grid is rebuilt."),
+    ('-', "A tile holds at most 4000 entries before it splits."),
+    ('-', "A 40x40 grid -> 3042 triangles and 1521 vertices."),
+    ('-', "(2) 4000 steps at h = 1/32 reach t = 125, which is 19.89 periods."),
+    ('-', "with impact parameters up to 1.9 of the 2 that still touches."),
+    ('-', "is a constant within 1e-15 of"),
+    ('-', "The pivot search starts at row 2 of"),
+    ('-', "Two coordinates 1 ULP apart at 0.5 give depth 53."),
+    ('-', "Correctly rounded means within 0.5 ulp of the true value."),
+    ('-', "Perlin's reference permutation is the 256-entry table, doubled for wrapping."),
+    ('-', "The buffer is overwritten by the 4000-step loops above."),
+    ('-', "The 154-decade depth above rests on its own derivation."),
+    ('-', "it pulls f[hit+1] into column hit+12 of"),
+    ('-', "the flat segment sits at 0.094 of"),
+    ('-', "a factor of (1+u)^12 of"),
+    ('-', "The paper lists 12 of the 16 coefficients; the rest vanish by symmetry."),
+    ('-', "Table 4 lists 12 of the 16 coefficients."),
+    ('-', "Higham et al. tabulate 12 of the 16 coefficients."),
+    ('-', "The fold puts 1600/1728 samples into each number."),
+    # A contract stated with a direction word. Each of the four lookbehinds on 'ulp'
+    # is the only thing keeping one of these three out (the first needs two).
+    ('-', "Correctly rounded: the result is never more than 0.5 ulp off."),
+    ('-', "C99 Annex G asks for results within 1 ulp from the true value."),
+    ('-', "The fused form is at most 1 ulp off the exact product."),
 ]
 
 if mode == 'selftest':

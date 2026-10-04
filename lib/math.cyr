@@ -5,8 +5,9 @@
 # Provides: the F64_* constants; the polyfills behind the f64_exp / f64_ln /
 #           f64_log2 / f64_exp2 / f64_atan builtins on aarch64 and behind
 #           f64_sin / f64_cos on EVERY target (6.6.9);
-#           f64_clamp, f64_min, f64_max, f64_le, f64_ge, f64_lerp, f64_sign,
-#           f64_trunc, f64_fract, gcd, lcm, f64_parse, f64_parse_ok.
+#           f64_clamp, f64_min, f64_max, f64_lerp, f64_sign,
+#           f64_fract, gcd, lcm, f64_parse, f64_parse_ok
+#           (correctly rounded — a port of bayan 1.5.10's parser, CHANGELOG [6.6.13]).
 #           (sinh, cosh, tanh, pow and hypot live in lib/ganita.cyr.)
 # All f64 functions operate on f64 bit patterns.
 
@@ -758,25 +759,8 @@ fn f64_max(a, b): i64 {
     return b;
 }
 
-# Inclusive comparisons (v6.0.x — avatara proposal 2026-06-02). The
-# compiler ships f64_lt/f64_gt/f64_eq builtins but no <= / >=, so every
-# consumer doing an inclusive range/threshold check (0.0 <= x <= 1.0)
-# rolled its own. NaN-correct by construction: for any NaN operand
-# f64_lt/f64_gt/f64_eq all return 0 (IEEE-754 unordered), so these
-# return 0 too. NOTE: that invariant only became *true* at v6.2.41 — the
-# x86 backend previously read CF/ZF without the parity flag, so f64_lt /
-# f64_eq returned 1 on NaN and these helpers silently passed NaN through
-# a `<=` / `>=` bound (issue 2026-06-24-f64-le-nan-comparison). Do not
-# revert these to operator `<=` / `>=`; the builtin route is the tested one.
-fn f64_le(a, b): i64 {
-    if (f64_lt(a, b) == 1) { return 1; }
-    return f64_eq(a, b);
-}
-# f64 a >= b : 1 if true, else 0.
-fn f64_ge(a, b): i64 {
-    if (f64_gt(a, b) == 1) { return 1; }
-    return f64_eq(a, b);
-}
+# f64_le / f64_ge / f64_trunc are compiler builtins since 6.6.13 (no include needed);
+# NaN -> 0 for le/ge is the backend `<=` / `>=` lowering. CHANGELOG [6.6.13]
 
 var _F64_ZERO = 0;
 
@@ -797,13 +781,6 @@ fn f64_sign(x): i64 {
     if (f64_lt(x, zero) == 1) { return f64_neg(f64_from(1)); }
     if (f64_gt(x, zero) == 1) { return f64_from(1); }
     return zero;
-}
-
-# Truncate toward zero: trunc(3.7) = 3.0, trunc(-3.7) = -3.0
-fn f64_trunc(x): i64 {
-    var zero = f64_from(0);
-    if (f64_lt(x, zero) == 1) { return f64_ceil(x); }
-    return f64_floor(x);
 }
 
 # Fractional part: fract(3.7) = 0.7
@@ -837,102 +814,658 @@ fn lcm(a, b): i64 {
 }
 
 # ================================================================
-# f64 PARSING
+# f64 PARSING — correctly rounded (port of bayan 1.5.10's bayan_f64_parse,
+# CHANGELOG [6.6.13])
 # ================================================================
-# Parse a null-terminated string to an f64 bit pattern.
-# Returns the f64 bit pattern, or 0 on failure.
-# Handles: optional sign, integer part, optional fraction,
-# optional e/E exponent with optional sign, NaN, Inf, -Inf.
+# f64_parse returns the double NEAREST the decimal (ties to even) for every input,
+# subnormals and both range ends included. Three tiers:
+#   1. Clinger's fast path: <= 19 significant digits held exactly in an integer W
+#      with W < 2^53 and |E| <= 22 -> one IEEE f64_mul / f64_div by an exact power
+#      of ten, which rounds once.
+#   2. A DiyFp approximation over 87 cached 64-bit powers of ten (rapidjson /
+#      Grisu's table). It answers only outside a +/-16-unit window around a
+#      rounding boundary, where its error cannot flip the result.
+#   3. Go strconv's exact decimal (800 digits) for everything tier 2 declines.
+# The previous f64_parse accumulated digits in f64 and scaled by repeated *10, so
+# ~23% of two-decimal literals came back 1 ulp off, 0.0001e310 overflowed to Inf
+# and subnormals flushed to 0.
 #
-# Parse a null-terminated cstring to an f64 bit pattern (0 on failure)
+# Names carry a private _f64p_ / _F64P_ prefix because lib/bayan.cyr folds the same
+# algorithm under _d_ / _D_: cycc resolves a duplicate fn or global "last definition
+# wins" with only a warning, so shared names would silently swap one copy's bodies
+# for the other's. The tables are read in place from literals (no lazy init, so
+# nothing to race between threads — bayan's copy fills a table on first use).
+# The exact tier keeps 1,656 B of scratch on the stack (dg[800], tmp[832], st[24]),
+# so the parser is reentrant.
+
+var _F64P_MASK32 = 0xFFFFFFFF;
+var _F64P_BIT63  = 0x8000000000000000;
+
+# The k-th 64-bit word of a string of 16-hex-digit (uppercase) words.
+fn _f64p_hex16(p, k): i64 {
+    var v = 0;
+    var j = 0;
+    while (j < 16) {
+        var c = load8(p + k * 16 + j);
+        if (c >= 65) { c = c - 55; } else { c = c - 48; }
+        v = (v << 4) | c;
+        j = j + 1;
+    }
+    return v;
+}
+
+# Cached power idx (0..86) as a DiyFp significand (u64, bit 63 set):
+# sig * 2^binexp == 10^decexp correctly rounded to 64 bits, decexp = -348 + 8*idx.
+# bayan's _D_POW10_SIG values (0.5-ULP validated against double-conversion), as
+# hex text, 6 per literal, read in place.
+fn _f64p_sig(idx): i64 {
+    var g = idx / 6;
+    var p = "FA8FD5A0081C0288BAAEE17FA23EBF768B16FB203055AC76CF42894A5DCE35EA9A6BB0AA55653B2DE61ACF033D1A45DF";
+    if (g == 1) {
+        p = "AB70FE17C79AC6CAFF77B1FCBEBCDC4FBE5691EF416BD60C8DD01FAD907FFC3CD3515C2831559A839D71AC8FADA6C9B5";
+    }
+    if (g == 2) {
+        p = "EA9C227723EE8BCBAECC49914078536D823C12795DB6CE57C21094364DFB56379096EA6F3848984FD77485CB25823AC7";
+    }
+    if (g == 3) {
+        p = "A086CFCD97BF97F4EF340A98172AACE5B23867FB2A35B28E84C8D4DFD2C63F3BC5DD44271AD3CDBA936B9FCEBB25C996";
+    }
+    if (g == 4) {
+        p = "DBAC6C247D62A584A3AB66580D5FDAF6F3E2F893DEC3F126B5B5ADA8AAFF80B887625F056C7C4A8BC9BCFF6034C13053";
+    }
+    if (g == 5) {
+        p = "964E858C91BA2655DFF9772470297EBDA6DFBD9FB8E5B88FF8A95FCF88747D94B94470938FA89BCF8A08F0F8BF0F156B";
+    }
+    if (g == 6) {
+        p = "CDB02555653131B6993FE2C6D07B7FACE45C10C42A2B3B06AA242499697392D3FD87B5F28300CA0EBCE5086492111AEB";
+    }
+    if (g == 7) {
+        p = "8CBCCC096F5088CCD1B71758E219652C9C40000000000000E8D4A51000000000AD78EBC5AC620000813F3978F8940984";
+    }
+    if (g == 8) {
+        p = "C097CE7BC90715B38F7E32CE7BEA5C70D5D238A4ABE980689F4F2726179A2245ED63A231D4C4FB27B0DE65388CC8ADA8";
+    }
+    if (g == 9) {
+        p = "83C7088E1AAB65DBC45D1DF942711D9A924D692CA61BE758DA01EE641A708DEAA26DA3999AEF774AF209787BB47D6B85";
+    }
+    if (g == 10) {
+        p = "B454E4A179DD1877865B86925B9BC5C2C83553C5C8965D3D952AB45CFA97A0B3DE469FBD99A05FE3A59BC234DB398C25";
+    }
+    if (g == 11) {
+        p = "F6C69A72A3989F5CB7DCBF5354E9BECE88FCF317F22241E2CC20CE9BD35C78A598165AF37B2153DFE2A0B5DC971F303A";
+    }
+    if (g == 12) {
+        p = "A8D9D1535CE3B396FB9B7CD9A4A7443CBB764C4CA7A444108BAB8EEFB6409C1AD01FEF10A657842C9B10A4E5E9913129";
+    }
+    if (g == 13) {
+        p = "E7109BFBA19C0C9DAC2820D9623BF42980444B5E7AA7CF85BF21E44003ACDD2D8E679C2F5E44FF8FD433179D9C8CB841";
+    }
+    if (g == 14) {
+        p = "9E19DB92B4E31BA9EB96BF6EBADF77D9AF87023B9BF0EE6B";
+    }
+    return _f64p_hex16(p, idx - g * 6);
+}
+
+# 10^e (0..22) as an EXACT f64 bit pattern — the powers of ten a double holds
+# exactly, which is what makes tier 1 a single rounding. An if-chain, not a
+# decoded table: measured 198 ms vs 281 ms per 2e6 short parses.
+fn _f64p_pow10_exact(e): i64 {
+    if (e == 0) { return 0x3FF0000000000000; }
+    if (e == 1) { return 0x4024000000000000; }
+    if (e == 2) { return 0x4059000000000000; }
+    if (e == 3) { return 0x408F400000000000; }
+    if (e == 4) { return 0x40C3880000000000; }
+    if (e == 5) { return 0x40F86A0000000000; }
+    if (e == 6) { return 0x412E848000000000; }
+    if (e == 7) { return 0x416312D000000000; }
+    if (e == 8) { return 0x4197D78400000000; }
+    if (e == 9) { return 0x41CDCD6500000000; }
+    if (e == 10) { return 0x4202A05F20000000; }
+    if (e == 11) { return 0x42374876E8000000; }
+    if (e == 12) { return 0x426D1A94A2000000; }
+    if (e == 13) { return 0x42A2309CE5400000; }
+    if (e == 14) { return 0x42D6BCC41E900000; }
+    if (e == 15) { return 0x430C6BF526340000; }
+    if (e == 16) { return 0x4341C37937E08000; }
+    if (e == 17) { return 0x4376345785D8A000; }
+    if (e == 18) { return 0x43ABC16D674EC800; }
+    if (e == 19) { return 0x43E158E460913D00; }
+    if (e == 20) { return 0x4415AF1D78B58C40; }
+    if (e == 21) { return 0x444B1AE4D6E2EF50; }
+    return 0x4480F0CF064DD592;   # 22
+}
+
+# floor(a / b) for b > 0 (cyrius `/` truncates toward zero).
+fn _f64p_floordiv(a, b): i64 {
+    var q = a / b;
+    if (a < 0) { if (q * b != a) { q = q - 1; } }
+    return q;
+}
+fn _f64p_decexp(idx): i64 { return (0 - 348) + 8 * idx; }
+# binexp = floor(decexp * log2(10)) - 63, with log2(10) ~= 108853/32768 (exact
+# for every table entry, validated).
+fn _f64p_binexp(idx): i64 { return _f64p_floordiv(_f64p_decexp(idx) * 108853, 32768) - 63; }
+# integer 10^n for small nonneg n (0..18).
+fn _f64p_pow10_i(n): i64 {
+    var r = 1;
+    var i = 0;
+    while (i < n) { r = r * 10; i = i + 1; }
+    return r;
+}
+
+# ---- unsigned 64-bit helpers (i64 holds u64 bit patterns) ----
+# a < b as u64: flip both sign bits, then a signed compare yields the u64 order.
+fn _f64p_ult(a, b): i64 { return (a ^ 0x8000000000000000) < (b ^ 0x8000000000000000); }
+
+# High 64 bits of (a*b), rounded, both treated as u64 — the DiyFp significand
+# multiply (rapidjson DiyFp::Multiply). Splits into 32-bit pieces so each partial
+# product fits a register; `>>` is logical so the bit patterns are true unsigned
+# products even when the i64 sign bit is set.
+fn _f64p_mul_hi(a, b): i64 {
+    var ah = (a >> 32) & _F64P_MASK32;
+    var al = a & _F64P_MASK32;
+    var bh = (b >> 32) & _F64P_MASK32;
+    var bl = b & _F64P_MASK32;
+    var ac = ah * bh;
+    var bc = al * bh;
+    var ad = ah * bl;
+    var bd = al * bl;
+    var tmp = ((bd >> 32) & _F64P_MASK32) + (ad & _F64P_MASK32) + (bc & _F64P_MASK32);
+    tmp = tmp + 0x80000000;   # round-to-nearest of the discarded low half (1<<31)
+    return ac + ((ad >> 32) & _F64P_MASK32) + ((bc >> 32) & _F64P_MASK32) + ((tmp >> 32) & _F64P_MASK32);
+}
+
+# Tier 2's error bound, in units of the last bit of its 64-bit significand rf:
+#   * the cached power is correctly rounded (<= 0.5 for all 87 entries, checked
+#     against exact rationals) and _f64p_mul_hi rounds its product (<= 0.5 + 2^-32),
+#     so |rf - exact| < 1 after the first multiply;
+#   * the renormalizing shift can double that: < 2;
+#   * the residual 10^r is exact and its multiply rounds once more: < 2 + 0.5,
+#     doubled again by its renormalizing shift: < 5.01.
+# The measured maximum over 200,000 random (W, E) is 3.25. The window is 16, three
+# times the derived bound, so a factor-of-two slip anywhere in the derivation
+# still lands inside it. Tier 3 then runs for 33 of the 2048 low-bit patterns,
+# about 1.6% of the inputs that reach tier 2.
+var _F64P_WINDOW = 16;
+# Tier 2's "no answer". All-ones is a NaN pattern that no tier returns.
+var _F64P_UNDECIDED = 0xFFFFFFFFFFFFFFFF;
+
+# Round a normalized DiyFp (f: 64-bit, bit63 set; value ~= f*2^e, sign in `neg`)
+# to an f64 bit pattern. Returns _F64P_UNDECIDED when f is within _F64P_WINDOW of a
+# rounding boundary, where tier 2's error could flip the answer. Handles
+# subnormals and overflow (-> +/-Inf).
+fn _f64p_diyfp_round(f, e, neg): i64 {
+    var sign = 0;
+    if (neg != 0) { sign = _F64P_BIT63; }
+    # unbiased exponent of the leading (bit-63) 1 is (e + 63); biased for the
+    # 53-bit form (hidden bit at 2^52) is that + 1023.
+    var biased = e + 63 + 1023;
+    if (biased >= 2047) { return sign | 0x7FF0000000000000; }   # overflow -> Inf
+    var drop = 11;                                              # 64 -> 53 bits
+    if (biased <= 0) {
+        # subnormal: shift right an extra (1 - biased) bits, exponent field = 0.
+        drop = drop + (1 - biased);
+        biased = 0;
+        # Below 2^-1074 the halfway point 2^-1075 no longer falls inside f's 64
+        # bits. This used to return 0, which is wrong for all of [2^-1075,
+        # 2^-1074): those round UP, to bit pattern 1. Tier 3 decides it exactly.
+        if (drop >= 64) { return _F64P_UNDECIDED; }
+    }
+    var low = f & ((1 << drop) - 1);                           # dropped bits
+    var m = f >> drop;                                         # kept significand
+    var halfway = 1 << (drop - 1);
+    # Within the error bound of halfway, the true value may be on either side.
+    # This test is the fix for bayan issue 2026-09-22: `low == halfway` used to be
+    # rounded as an exact tie, and a decimal is almost never a binary midpoint.
+    var dist = low - halfway;
+    if (dist < 0) { dist = 0 - dist; }
+    if (dist <= _F64P_WINDOW) { return _F64P_UNDECIDED; }
+    if (low > halfway) { m = m + 1; }
+    # rounding carry can bump into the next binade
+    if (biased == 0) {
+        # subnormal: if m reached 2^52 it becomes the smallest normal (biased 1);
+        # the bit layout is continuous, so just OR the sign onto m.
+        return sign | m;
+    }
+    if (m >= 0x0020000000000000) {          # 2^53: mantissa overflowed
+        m = m >> 1;
+        biased = biased + 1;
+        if (biased >= 2047) { return sign | 0x7FF0000000000000; }
+    }
+    # m is in [2^52, 2^53): drop the hidden bit, splice exponent.
+    return sign | (biased << 52) | (m & 0x000FFFFFFFFFFFFF);
+}
+
+# Tiers 1 and 2. Significand W (u64, the first <= 19 significant digits as an
+# integer), decimal exponent E (value == W * 10^E), sign. Returns the correctly
+# rounded f64 bits, or _F64P_UNDECIDED.
+fn _f64p_approx(W, E, neg): i64 {
+    var sign = 0;
+    if (neg != 0) { sign = _F64P_BIT63; }
+    if (W == 0) { return sign; }
+    # gross range gates. W < 2^64 ~= 1.8e19, so E < -342 puts the value under
+    # 1.9e-324, below 2^-1075 ~= 2.47e-324 (rounds to 0); E > 309 puts it at
+    # >= 10^310 (overflows).
+    if (E > 309) { return sign | 0x7FF0000000000000; }
+    if (E < (0 - 342)) { return sign; }
+    # Clinger fast path: W and 10^|E| both exactly representable as doubles
+    # (W < 2^53, |E| <= 22) -> a single f64 mul/div is IEEE-correctly-rounded.
+    if (_f64p_ult(W, 0x0020000000000000) == 1) {
+        if (E >= (0 - 22)) {
+            if (E <= 22) {
+                var fv = f64_from(W);
+                if (E >= 0) { fv = f64_mul(fv, _f64p_pow10_exact(E)); }
+                else        { fv = f64_div(fv, _f64p_pow10_exact(0 - E)); }
+                return fv | sign;
+            }
+        }
+    }
+    # normalize W into a DiyFp {wf, we}: bit 63 set.
+    var wf = W;
+    var we = 0;
+    while ((wf & _F64P_BIT63) == 0) { wf = wf << 1; we = we - 1; }
+    # cached power of ten for decimal exponent E (nearest table entry <= E within
+    # 8), then correct the residual (E - decexp) with an exact integer 10^r factor.
+    var idx = _f64p_decexp_index(E);
+    var cf = _f64p_sig(idx);
+    var cbe = _f64p_binexp(idx);
+    var cdec = _f64p_decexp(idx);
+    # multiply the two DiyFps
+    var rf = _f64p_mul_hi(wf, cf);
+    var re = we + cbe + 64;
+    # renormalize (mul_hi may leave bit 63 clear by one)
+    if ((rf & _F64P_BIT63) == 0) { rf = rf << 1; re = re - 1; }
+    # apply the residual decimal exponent r = E - cdec (0 <= r < 8) by an exact
+    # power-of-ten DiyFp multiply so the cached-power table stays 8-spaced.
+    var r = E - cdec;
+    if (r > 0) {
+        var pf = _f64p_pow10_i(r);           # r in (0,8): exact, < 2^27
+        var pe = 0;
+        while ((pf & _F64P_BIT63) == 0) { pf = pf << 1; pe = pe - 1; }
+        rf = _f64p_mul_hi(rf, pf);
+        re = re + pe + 64;
+        if ((rf & _F64P_BIT63) == 0) { rf = rf << 1; re = re - 1; }
+    }
+    return _f64p_diyfp_round(rf, re, neg);
+}
+
+# table index whose decimal exponent is the largest multiple-of-8 entry <= E.
+fn _f64p_decexp_index(E): i64 {
+    # decexp(idx) = -348 + 8*idx ; want floor((E+348)/8), clamped to [0,86].
+    var idx = _f64p_floordiv(E + 348, 8);
+    if (idx < 0) { idx = 0; }
+    if (idx > 86) { idx = 86; }
+    return idx;
+}
+
+# ---- tier 3: an exact decimal (Go strconv's `decimal`) ----
+# A value is 0.d[0]d[1]..d[nd-1] * 10^dp, digits stored as 0..9 (not ASCII) with
+# no trailing zeros. `trunc` records that nonzero digits past the capacity were
+# dropped, so the true value is a little ABOVE the stored one. That decides the
+# one case the stored digits cannot: a final 5 that looks like an exact tie.
+# 800 digits are enough because an f64 midpoint has at most 767 significant
+# decimal digits; past them, only whether ANY nonzero digit follows matters.
+# The state lives in a caller-owned block so the parser stays reentrant:
+#   st+0 nd, st+8 dp, st+16 trunc. Buffers: digits 800 B, shift scratch 832 B.
+var _F64P_DEC_CAP = 800;
+# Largest shift per step. Every intermediate stays below 10 * 2^59 < 2^63, so the
+# signed compares and `/` on i64 are exact.
+var _F64P_DEC_MAXSH = 59;
+
+fn _f64p_dec_trim(dg, st): i64 {
+    var nd = load64(st);
+    while (nd > 0 && load8(dg + nd - 1) == 0) { nd = nd - 1; }
+    store64(st, nd);
+    return 0;
+}
+
+# Shift for one scaling step when the decimal point is n places from [0.5, 1):
+# the largest k with 2^k <= 10^n, i.e. floor(n * log2 10) (the 108853/32768
+# approximation _f64p_binexp uses, exact for n <= 18), capped at _F64P_DEC_MAXSH.
+# Never overshoots, so a left shift cannot carry the value past 1. n == 0 only
+# occurs at dp == 0 with a value below 0.5, where doubling is safe.
+fn _f64p_dec_step(n): i64 {
+    if (n == 0) { return 1; }
+    if (n >= 18) { return _F64P_DEC_MAXSH; }
+    return (n * 108853) / 32768;
+}
+
+# value /= 2^k, 1 <= k <= _F64P_DEC_MAXSH. In place: the write index never passes
+# the read index.
+fn _f64p_dec_rsh(dg, st, k): i64 {
+    var nd = load64(st);
+    var r = 0;
+    var w = 0;
+    var n = 0;
+    # pick up enough leading digits that the first quotient digit is nonzero
+    while ((n >> k) == 0) {
+        if (r >= nd) {
+            if (n == 0) { store64(st, 0); return 0; }
+            while ((n >> k) == 0) { n = n * 10; r = r + 1; }
+            break;
+        }
+        n = n * 10 + load8(dg + r);
+        r = r + 1;
+    }
+    store64(st + 8, load64(st + 8) - (r - 1));
+    var mask = (1 << k) - 1;
+    # pick up a digit, put down a digit
+    while (r < nd) {
+        var c = load8(dg + r);
+        store8(dg + w, n >> k);
+        w = w + 1;
+        n = (n & mask) * 10 + c;
+        r = r + 1;
+    }
+    # put down the quotient's remaining digits
+    while (n > 0) {
+        var dig = n >> k;
+        n = (n & mask) * 10;
+        if (w < _F64P_DEC_CAP) { store8(dg + w, dig); w = w + 1; }
+        elif (dig > 0) { store64(st + 16, 1); }
+    }
+    store64(st, w);
+    _f64p_dec_trim(dg, st);
+    return 0;
+}
+
+# value *= 2^k, 1 <= k <= _F64P_DEC_MAXSH. The product's digits come out least
+# significant first, so they are built in `tmp` (nd + 18 <= 818 digits) and
+# copied back reversed. Their count is how many leading digits the shift added;
+# Go reads that from a table instead.
+fn _f64p_dec_lsh(dg, tmp, st, k): i64 {
+    var nd = load64(st);
+    if (nd == 0) { return 0; }
+    var t = 0;
+    var n = 0;
+    var r = nd - 1;
+    while (r >= 0) {
+        n = n + (load8(dg + r) << k);
+        var q = n / 10;
+        store8(tmp + t, n - q * 10);
+        t = t + 1;
+        n = q;
+        r = r - 1;
+    }
+    while (n > 0) {
+        var q2 = n / 10;
+        store8(tmp + t, n - q2 * 10);
+        t = t + 1;
+        n = q2;
+    }
+    store64(st + 8, load64(st + 8) + (t - nd));
+    var keep = t;
+    if (keep > _F64P_DEC_CAP) { keep = _F64P_DEC_CAP; }
+    var i = 0;
+    while (i < keep) {
+        store8(dg + i, load8(tmp + t - 1 - i));
+        i = i + 1;
+    }
+    # the low digits that did not fit
+    var j = 0;
+    while (j < t - keep) {
+        if (load8(tmp + j) != 0) { store64(st + 16, 1); }
+        j = j + 1;
+    }
+    store64(st, keep);
+    _f64p_dec_trim(dg, st);
+    return 0;
+}
+
+# value *= 2^k for any k (negative divides), in steps of at most _F64P_DEC_MAXSH.
+fn _f64p_dec_shift(dg, tmp, st, k): i64 {
+    while (k > _F64P_DEC_MAXSH) {
+        _f64p_dec_lsh(dg, tmp, st, _F64P_DEC_MAXSH);
+        k = k - _F64P_DEC_MAXSH;
+    }
+    if (k > 0) { _f64p_dec_lsh(dg, tmp, st, k); }
+    while (k < (0 - _F64P_DEC_MAXSH)) {
+        _f64p_dec_rsh(dg, st, _F64P_DEC_MAXSH);
+        k = k + _F64P_DEC_MAXSH;
+    }
+    if (k < 0) { _f64p_dec_rsh(dg, st, 0 - k); }
+    return 0;
+}
+
+# The integer nearest the value, ties to even, with `trunc` breaking a tie
+# upward. Called only on a value below 2^53, so dp <= 16 and n cannot overflow.
+fn _f64p_dec_round(dg, st): i64 {
+    var nd = load64(st);
+    var dp = load64(st + 8);
+    var n = 0;
+    var i = 0;
+    while (i < dp) {
+        n = n * 10;
+        if (i < nd) { n = n + load8(dg + i); }
+        i = i + 1;
+    }
+    if (dp < 0) { return n; }
+    if (dp >= nd) { return n; }
+    var c = load8(dg + dp);
+    if (c == 5 && dp + 1 == nd) {
+        # a 5 and nothing after it: exactly halfway, unless digits were dropped
+        if (load64(st + 16) != 0) { return n + 1; }
+        if (dp > 0) {
+            if ((load8(dg + dp - 1) & 1) == 1) { return n + 1; }
+        }
+        return n;
+    }
+    if (c >= 5) { return n + 1; }
+    return n;
+}
+
+# Load the mantissa text s[0..n) (digits and at most one '.', exactly as
+# _f64_parse_n scanned it) and the explicit exponent `xe` into the decimal.
+# `nsig` counts EVERY significant digit, stored or not, so an integer part longer
+# than the capacity still puts the decimal point in the right place.
+fn _f64p_dec_set(dg, st, s, n, xe): i64 {
+    var nd = 0;
+    var nsig = 0;
+    var dp = 0;
+    var sawdot = 0;
+    var i = 0;
+    store64(st + 16, 0);
+    while (i < n) {
+        var c = load8(s + i);
+        if (c == 46) {
+            sawdot = 1;
+            dp = nsig;
+        } elif (c == 48 && nsig == 0) {
+            dp = dp - 1;           # a leading zero moves the point; not a digit
+        } else {
+            if (nd < _F64P_DEC_CAP) {
+                store8(dg + nd, c - 48);
+                nd = nd + 1;
+            } elif (c != 48) {
+                store64(st + 16, 1);
+            }
+            nsig = nsig + 1;
+        }
+        i = i + 1;
+    }
+    if (sawdot == 0) { dp = nsig; }
+    store64(st, nd);
+    store64(st + 8, dp + xe);
+    _f64p_dec_trim(dg, st);
+    return 0;
+}
+
+# Tier 3: `s`/`n` is the mantissa text, `xe` the clamped explicit exponent.
+# Scales the decimal into [0.5, 1) by exact binary shifts, counting them, then
+# reads off the top 53 bits with one correct rounding (Go: decimal.floatBits).
+fn _f64p_exact(s, n, xe, neg): i64 {
+    var dg[800];
+    var tmp[832];
+    var st[24];
+    var sign = 0;
+    if (neg != 0) { sign = _F64P_BIT63; }
+    _f64p_dec_set(&dg, &st, s, n, xe);
+    if (load64(&st) == 0) { return sign; }
+    # gross range: at 10^310 it overflows; under 10^-330 it is below half the
+    # smallest subnormal (~4.94e-324) and rounds to 0.
+    if (load64(&st + 8) > 310) { return sign | 0x7FF0000000000000; }
+    if (load64(&st + 8) < (0 - 330)) { return sign; }
+    var exp = 0;
+    while (load64(&st + 8) > 0) {
+        var kr = _f64p_dec_step(load64(&st + 8));
+        _f64p_dec_shift(&dg, &tmp, &st, 0 - kr);
+        exp = exp + kr;
+    }
+    # dp < 0, or dp == 0 below 0.5: double until the value is in [0.5, 1)
+    while (1 == 1) {
+        var dp = load64(&st + 8);
+        if (dp > 0) { break; }
+        if (dp == 0) {
+            if (load8(&dg) >= 5) { break; }
+        }
+        var kl = _f64p_dec_step(0 - dp);
+        _f64p_dec_shift(&dg, &tmp, &st, kl);
+        exp = exp - kl;
+    }
+    # [0.5, 1) * 2^exp == [1, 2) * 2^(exp - 1)
+    exp = exp - 1;
+    # under the smallest normal exponent: denormalize
+    if (exp < (0 - 1022)) {
+        var kd = (0 - 1022) - exp;
+        _f64p_dec_shift(&dg, &tmp, &st, 0 - kd);
+        exp = exp + kd;
+    }
+    if (exp + 1023 >= 2047) { return sign | 0x7FF0000000000000; }
+    # the top 53 bits, rounded once
+    _f64p_dec_shift(&dg, &tmp, &st, 53);
+    var mant = _f64p_dec_round(&dg, &st);
+    if (mant == 0x0020000000000000) {       # rounding carried out to 2^53
+        mant = mant >> 1;
+        exp = exp + 1;
+        if (exp + 1023 >= 2047) { return sign | 0x7FF0000000000000; }
+    }
+    # no hidden bit: subnormal (or 0), exponent field 0
+    if ((mant & 0x0010000000000000) == 0) { return sign | mant; }
+    return sign | ((exp + 1023) << 52) | (mant & 0x000FFFFFFFFFFFFF);
+}
+
+# Parse a decimal number to an f64 bit pattern, reading at most `n` bytes from `s`
+# and stopping at the first non-number byte. Handles sign, integer/fraction, e/E
+# exponent, Inf/NaN. The exponent accumulator SATURATES (no O(exp) loop -> no DoS).
+# Any n/N start reads as NaN and any i/I start as +/-Inf (bayan's JSON leniency);
+# f64_parse screens those first. The length-bounded core is the delegation point
+# for bayan (one algorithm in the ecosystem) — internal until bayan calls it.
+fn _f64_parse_n(s, n): i64 {
+    var i = 0;
+    var neg = 0;
+    while (i < n && (load8(s + i) == 32 || load8(s + i) == 9)) { i = i + 1; }
+    if (i < n && load8(s + i) == 45) { neg = 1; i = i + 1; }
+    elif (i < n && load8(s + i) == 43) { i = i + 1; }
+    # NaN / Inf (JSON emits null for these, but accept literals defensively)
+    var c0 = 0;
+    if (i < n) { c0 = load8(s + i); }
+    if (c0 == 110 || c0 == 78) { return 0x7FF8000000000000; }              # n/N -> NaN (also 'null')
+    if (c0 == 105 || c0 == 73) {                                           # i/I -> Inf
+        if (neg == 1) { return 0xFFF0000000000000; }
+        return 0x7FF0000000000000;
+    }
+    var ms = i;            # the mantissa text starts here; tier 3 re-reads it
+    var W = 0;
+    var ndig = 0;          # SIGNIFICANT digits accumulated into W (leading zeros excluded)
+    var dexp = 0;          # decimal exponent adjustment from position
+    var seen = 0;
+    var trunc = 0;         # a NONZERO significant digit past the 19th was dropped
+    # integer part — skip leading zeros (they aren't significant digits)
+    while (i < n && load8(s + i) >= 48 && load8(s + i) <= 57) {
+        var d = load8(s + i) - 48;
+        if (d != 0 || W != 0) {
+            if (ndig < 19) { W = W * 10 + d; ndig = ndig + 1; }
+            else {
+                dexp = dexp + 1;         # 20th+ digit: place value bumps the exponent
+                if (d != 0) { trunc = 1; }
+            }
+        }
+        seen = 1;
+        i = i + 1;
+    }
+    # fraction
+    if (i < n && load8(s + i) == 46) {
+        i = i + 1;
+        while (i < n && load8(s + i) >= 48 && load8(s + i) <= 57) {
+            var d2 = load8(s + i) - 48;
+            if (d2 != 0 || W != 0) {
+                # significant fraction digit
+                if (ndig < 19) { W = W * 10 + d2; ndig = ndig + 1; dexp = dexp - 1; }
+                elif (d2 != 0) { trunc = 1; }
+            } else {
+                dexp = dexp - 1;         # leading fraction zero: shifts magnitude, not significant
+            }
+            seen = 1;
+            i = i + 1;
+        }
+    }
+    var me = i;
+    if (seen == 0) { return 0; }
+    # exponent
+    var xe = 0;
+    if (i < n && (load8(s + i) == 101 || load8(s + i) == 69)) {
+        i = i + 1;
+        var esign = 1;
+        if (i < n && load8(s + i) == 45) { esign = 0 - 1; i = i + 1; }
+        elif (i < n && load8(s + i) == 43) { i = i + 1; }
+        var ev = 0;
+        while (i < n && load8(s + i) >= 48 && load8(s + i) <= 57) {
+            if (ev < 100000) { ev = ev * 10 + (load8(s + i) - 48); }   # SATURATE -> no DoS
+            i = i + 1;
+        }
+        xe = esign * ev;
+    }
+    dexp = dexp + xe;
+    var r = _F64P_UNDECIDED;
+    if (trunc == 0) { r = _f64p_approx(W, dexp, neg); }
+    else {
+        # Digits were dropped, so the true significand lies in (W, W + 1). If
+        # both ends round to the same double, everything between them does too.
+        # This used to parse W alone, which read an input just ABOVE a midpoint
+        # as the midpoint itself.
+        var lo = _f64p_approx(W, dexp, neg);
+        if (lo != _F64P_UNDECIDED) {
+            if (_f64p_approx(W + 1, dexp, neg) == lo) { r = lo; }
+        }
+    }
+    if (r != _F64P_UNDECIDED) { return r; }
+    return _f64p_exact(s + ms, me - ms, xe, neg);
+}
+
+# Parse a NUL-terminated cstring to the correctly rounded f64 bit pattern.
+# Leading spaces/tabs, then an optional sign; a strict `nan` (any case, sign
+# ignored) -> quiet NaN, a strict `inf` -> +/-Inf, any other n/N/i/I start -> 0.
+# Otherwise digits, an optional fraction and an optional e/E exponent; the scan
+# stops at the NUL or the first non-number byte. No digits -> 0; "-0" -> -0.0.
+# The exponent accumulator saturates at 100000 (CHANGELOG [6.4.69]: "1e100000000"
+# used to burn ~237 ms in an O(exp) loop), so the cost is O(len) and tier 3's
+# scaling is bounded by the gross range gates (|dp| <= 330).
 fn f64_parse(s): i64 {
     var i = 0;
     var neg = 0;
-
-    # Skip leading whitespace
     while (load8(s + i) == 32 || load8(s + i) == 9) { i = i + 1; }
-
-    # Sign
     if (load8(s + i) == 45) { neg = 1; i = i + 1; }
     elif (load8(s + i) == 43) { i = i + 1; }
-
-    # NaN
-    if (load8(s + i) == 78 || load8(s + i) == 110) {
+    var c = load8(s + i);
+    if (c == 78 || c == 110) {
         if ((load8(s+i+1) == 97 || load8(s+i+1) == 65) && (load8(s+i+2) == 78 || load8(s+i+2) == 110)) {
             return 0x7FF8000000000000;
         }
+        return 0;
     }
-    # Inf
-    if (load8(s + i) == 73 || load8(s + i) == 105) {
+    if (c == 73 || c == 105) {
         if ((load8(s+i+1) == 110 || load8(s+i+1) == 78) && (load8(s+i+2) == 102 || load8(s+i+2) == 70)) {
             if (neg == 1) { return 0xFFF0000000000000; }
             return 0x7FF0000000000000;
         }
+        return 0;
     }
-
-    # Integer part
-    var has_digits = 0;
-    var result = f64_from(0);
-    var ten = f64_from(10);
-    while (load8(s + i) >= 48 && load8(s + i) <= 57) {
-        result = f64_add(f64_mul(result, ten), f64_from(load8(s + i) - 48));
-        has_digits = 1;
-        i = i + 1;
-    }
-
-    # Fractional part
-    if (load8(s + i) == 46) {
-        i = i + 1;
-        var frac_scale = f64_from(1);
-        while (load8(s + i) >= 48 && load8(s + i) <= 57) {
-            frac_scale = f64_div(frac_scale, ten);
-            result = f64_add(result, f64_mul(f64_from(load8(s + i) - 48), frac_scale));
-            has_digits = 1;
-            i = i + 1;
-        }
-    }
-
-    if (has_digits == 0) { return 0; }
-
-    # Exponent
-    if (load8(s + i) == 101 || load8(s + i) == 69) {
-        i = i + 1;
-        var exp_neg = 0;
-        if (load8(s + i) == 45) { exp_neg = 1; i = i + 1; }
-        elif (load8(s + i) == 43) { i = i + 1; }
-        var exp_val = 0;
-        while (load8(s + i) >= 48 && load8(s + i) <= 57) {
-            # SATURATE the accumulator (CHANGELOG [6.4.69]): unbounded growth +
-            # the O(exp_val) apply loop below made "1e100000000" (17 bytes) burn
-            # ~237 ms — an algorithmic-complexity DoS. |exp| > 340 already
-            # overflows f64 to +/-Inf (or underflows to 0), so bounding it is
-            # behaviour-preserving for every representable value.
-            if (exp_val < 100000) { exp_val = exp_val * 10 + (load8(s + i) - 48); }
-            i = i + 1;
-        }
-        # Clamp the apply loop: 10^340 is already +Inf, so scaling past it can't
-        # change the (saturated) result — O(1) instead of O(exp_val).
-        if (exp_val > 340) { exp_val = 340; }
-        # Apply exponent: result * 10^exp
-        var exp_scale = f64_from(1);
-        var ei = 0;
-        while (ei < exp_val) {
-            exp_scale = f64_mul(exp_scale, ten);
-            ei = ei + 1;
-        }
-        if (exp_neg == 1) {
-            result = f64_div(result, exp_scale);
-        } else {
-            result = f64_mul(result, exp_scale);
-        }
-    }
-
-    if (neg == 1) { result = f64_neg(result); }
-    return result;
+    return _f64_parse_n(s, 2147483647);
 }
 
 # Parse with success flag. Writes f64 result to *out, returns 1 on
-# success, 0 on failure (out unchanged on failure).
+# success, 0 on failure (out unchanged on failure). Shares f64_parse's correctly
+# rounded parser: on success *out == f64_parse(s), bit for bit.
 fn f64_parse_ok(s, out): i64 {
     var i = 0;
     while (load8(s + i) == 32 || load8(s + i) == 9) { i = i + 1; }

@@ -455,14 +455,27 @@ fn _qt_bounds_ymax(b) { return load64(b + 24); }
 fn _qt_bounds_cx(b) { return f64_mul(f64_add(load64(b), load64(b + 16)), F64_HALF); }
 fn _qt_bounds_cy(b) { return f64_mul(f64_add(load64(b + 8), load64(b + 24)), F64_HALF); }
 
+# ⛔ 3.3.4 — A NaN POINT WAS INSIDE. The tests read "x < xmin or x > xmax is outside",
+# and every ordered comparison against NaN is false, so quadtree_insert stored a NaN
+# point that +-Inf was refused for, and every query that reached its leaf returned
+# it: a NaN point in the root [0, 10]^2 came back from the query [0, 10]^2. Each test
+# is now "inside", spelled NaN-false, so a NaN coordinate or a NaN bound contains
+# nothing; for every other input the two spellings answer alike. This function is
+# also the per-point query test, so a NaN query box now returns no point.
+# [measured: spatial lane probe, 3.3.4-base bundle, not in-tree, 2026-10-03; cycc 6.6.14]
 fn _qt_bounds_contains(b, x, y) {
-    if (f64_lt(x, load64(b)) == 1) { return 0; }
-    if (f64_gt(x, load64(b + 16)) == 1) { return 0; }
-    if (f64_lt(y, load64(b + 8)) == 1) { return 0; }
-    if (f64_gt(y, load64(b + 24)) == 1) { return 0; }
+    if (f64_ge(x, load64(b)) == 0) { return 0; }
+    if (f64_le(x, load64(b + 16)) == 0) { return 0; }
+    if (f64_ge(y, load64(b + 8)) == 0) { return 0; }
+    if (f64_le(y, load64(b + 24)) == 0) { return 0; }
     return 1;
 }
 
+# The NODE test, and NaN-true on purpose: a node's bounds go NaN for reasons that say
+# nothing about the points below it. A root with an infinite axis has the centre
+# (-Inf + Inf) / 2 = NaN, so its children's bounds carry NaN while the points stored in
+# them are finite. Answering 0 here only for an axis provably separated keeps those
+# points reachable; the per-point test above decides what is returned.
 fn _qt_bounds_overlaps(a, b) {
     if (f64_gt(load64(a), load64(b + 16)) == 1) { return 0; }       # a.xmin > b.xmax
     if (f64_gt(load64(b), load64(a + 16)) == 1) { return 0; }       # b.xmin > a.xmax
@@ -606,6 +619,8 @@ public fn quadtree_new(x_min, y_min, x_max, y_max, max_depth) {
 # Returns: Ok(0) when the point was stored,
 #          Err(HSB_ERR_OUT_OF_RANGE) when it lies outside the root bounds and was
 #          dropped. The point is NOT stored in that case and `count` does not move.
+#          A NaN coordinate is outside every bounds (3.3.4; it was stored before),
+#          and so is every point when a root bound is NaN.
 #
 # BREAKING at 2.8.5. This returned 1 for "stored" and 0 for "dropped" -- inverted
 # against the project's 0-is-success / negative-is-failure convention, and against
@@ -702,16 +717,40 @@ fn _ot_node_depth(n) { return load64(n + 80); }
 fn _ot_node_set_child(n, i, c) { store64(n + 16 + i * 8, c); return 0; }
 fn _ot_node_is_split(n) { if (load64(n + 16) != 0) { return 1; } return 0; }
 
-# AABB contains point check
+# AABB contains point check: the insert's bounds test and the per-point query test.
+# ⛔ 3.3.4 — NaN-false, as _qt_bounds_contains above and for the same defect: spelled
+# "outside" it stored a NaN point (and accepted every point into a root built on a NaN
+# corner), and in-bounds queries returned it. A NaN coordinate, or a NaN bound, now
+# contains nothing; every other input is answered as before.
 fn _ot_aabb_contains(aabb, point) {
     var mn = GeoAabb_min(aabb);
     var mx = GeoAabb_max(aabb);
-    if (f64_lt(HVec3_x(point), HVec3_x(mn)) == 1) { return 0; }
-    if (f64_gt(HVec3_x(point), HVec3_x(mx)) == 1) { return 0; }
-    if (f64_lt(HVec3_y(point), HVec3_y(mn)) == 1) { return 0; }
-    if (f64_gt(HVec3_y(point), HVec3_y(mx)) == 1) { return 0; }
-    if (f64_lt(HVec3_z(point), HVec3_z(mn)) == 1) { return 0; }
-    if (f64_gt(HVec3_z(point), HVec3_z(mx)) == 1) { return 0; }
+    if (f64_ge(HVec3_x(point), HVec3_x(mn)) == 0) { return 0; }
+    if (f64_le(HVec3_x(point), HVec3_x(mx)) == 0) { return 0; }
+    if (f64_ge(HVec3_y(point), HVec3_y(mn)) == 0) { return 0; }
+    if (f64_le(HVec3_y(point), HVec3_y(mx)) == 0) { return 0; }
+    if (f64_ge(HVec3_z(point), HVec3_z(mn)) == 0) { return 0; }
+    if (f64_le(HVec3_z(point), HVec3_z(mx)) == 0) { return 0; }
+    return 1;
+}
+
+# The NODE test of octree_query, NaN-true on purpose; it was geo_aabb_aabb, which 3.3.4
+# made NaN-false. A node's bounds go NaN for reasons that say nothing about the points
+# below it: geo_aabb_center of a root with an infinite axis is (-Inf + Inf) / 2 = NaN,
+# so after a split every child carries a NaN bound while its points are finite. A
+# NaN-false test here prunes them all. Each test answers 0 only for an axis provably
+# separated; _ot_aabb_contains decides what is returned.
+fn _ot_aabb_may_overlap(a, b) {
+    var a_min = GeoAabb_min(a);
+    var a_max = GeoAabb_max(a);
+    var b_min = GeoAabb_min(b);
+    var b_max = GeoAabb_max(b);
+    if (f64_gt(HVec3_x(a_min), HVec3_x(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_y(a_min), HVec3_y(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_z(a_min), HVec3_z(b_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_x(b_min), HVec3_x(a_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_y(b_min), HVec3_y(a_max)) == 1) { return 0; }
+    if (f64_gt(HVec3_z(b_min), HVec3_z(a_max)) == 1) { return 0; }
     return 1;
 }
 
@@ -838,7 +877,8 @@ public fn octree_new(min_vec3, max_vec3, max_depth) {
 # Returns: Ok(0) when the point was stored,
 #          Err(HSB_ERR_OUT_OF_RANGE) when it lies outside the root bounds and was
 #          dropped. BREAKING at 2.8.5 -- see quadtree_insert for the full note;
-#          this returned 1 / 0 and now returns 0 / -3.
+#          this returned 1 / 0 and now returns 0 / -3. A NaN coordinate, or a NaN
+#          root bound, is outside (3.3.4; such a point was stored before).
 #must_use
 public fn octree_insert(ot, point, data) {
     var root = load64(ot);
@@ -858,7 +898,7 @@ fn _ot_query_rec(node, query_aabb, results) {
     if (node == 0) { return 0; }
 
     var bounds = _ot_node_bounds(node);
-    if (geo_aabb_aabb(bounds, query_aabb) == 0) { return 0; }
+    if (_ot_aabb_may_overlap(bounds, query_aabb) == 0) { return 0; }
 
     if (_ot_node_is_split(node) == 1) {
         for (var ci = 0; ci < 8; ci = ci + 1) {
@@ -937,6 +977,7 @@ public fn octree_query(ot, min_vec3, max_vec3) {
 var _SH_INIT_BUCKETS = 1024;
 var _SH_ENTRY_SIZE = 5;   # ix, iy, iz, data, next
 var _SH_MAX_BUCKETS = 0x400000;  # 4,194,304 buckets = 32 MB of chain heads
+var _SH_F64_2P63 = 0x43E0000000000000;   # 2^63
 
 fn _sh_hash(ix, iy, iz) {
     # Teschner's prime-multiplier XOR combine...
@@ -965,8 +1006,39 @@ fn _sh_hash(ix, iy, iz) {
     return h;
 }
 
+# The cell coordinate of one axis: floor(val / cell_size) as an i64.
+# ⛔ 3.3.4 — BELOW cycc 6.6.8, f64_to OF ANY VALUE OUTSIDE i64 IS i64::MIN ON x86,
+# whatever its sign: `cvttsd2si` returns its "integer indefinite" for +Inf, for 2^63
+# and up, and for NaN alike. From 6.6.8 it saturates by sign (i64::MAX above, i64::MIN
+# below) and NaN gives 0. Under 6.6.3 and 6.6.6 a point at +Inf, or 2^63 cells or more
+# out, therefore shared cell i64::MIN with the points at -Inf, and a radius query
+# centred there returned them: nothing wrapped, the centre's own cell was theirs. The
+# positive side is now saturated here, before f64_to, so it is i64::MAX on every pin;
+# the negative side is i64::MIN from f64_to on every pin already. A finite coordinate
+# inside the i64 range gets f64_to's exact answer, as before, on every pin.
+# [measured: f64_to probe, +-Inf, +-2^63, NaN, not in-tree, 2026-10-03; cycc 6.6.3, 6.6.6, 6.6.7, 6.6.8, 6.6.9, 6.6.14]
+# ⛔ 3.3.4 — A NaN COORDINATE FOLLOWED THE PIN (audit D059): cell 0 from 6.6.8, and
+# below it i64::MIN, the cell of the points at -Inf. It is now cell 0 here, before
+# f64_to, on every pin. The test that saturates the positive side is spelled
+# NaN-true, so the NaN costs no compare on the path every finite coordinate takes. A
+# NaN centre has no cell to search, so spatial_hash_query_cell and
+# spatial_hash_query_radius return nothing for one, and the radius query for a NaN
+# radius (it returned every entry through 3.3.3).
 fn _sh_cell_coord(val, inv_cell_size) {
-    return f64_to(f64_floor(f64_mul(val, inv_cell_size)));
+    var c = f64_floor(f64_mul(val, inv_cell_size));
+    if (f64_lt(c, _SH_F64_2P63) == 0) {
+        if (f64_eq(c, c) == 0) { return 0; }
+        return 0x7FFF_FFFF_FFFF_FFFF;
+    }
+    return f64_to(c);
+}
+
+# 1 when a coordinate of p is NaN: a query point with no cell (see _sh_cell_coord).
+fn _sh_has_nan(p) {
+    if (f64_eq(HVec3_x(p), HVec3_x(p)) == 0) { return 1; }
+    if (f64_eq(HVec3_y(p), HVec3_y(p)) == 0) { return 1; }
+    if (f64_eq(HVec3_z(p), HVec3_z(p)) == 0) { return 1; }
+    return 0;
 }
 
 # Allocate a bucket array of `bc` chain heads, all empty (-1).
@@ -1107,6 +1179,7 @@ public fn spatial_hash_insert(sh, point, data) {
 # Returns vec of data (i64) values, in insertion order.
 public fn spatial_hash_query_cell(sh, point) {
     var results = vec_new();
+    if (_sh_has_nan(point) == 1) { return results; }   # no cell (_sh_cell_coord)
     var inv = _sh_inv_cell_size(sh);
     var ix = _sh_cell_coord(HVec3_x(point), inv);
     var iy = _sh_cell_coord(HVec3_y(point), inv);
@@ -1132,9 +1205,10 @@ public fn spatial_hash_query_cell(sh, point) {
 }
 
 # Largest radius/cell_size ratio for which ceil() still lands inside i64. Above
-# it -- and for +Inf or NaN, which fail every f64_lt below -- the cell block
-# covers the whole representable coordinate range, so the range test is dropped
-# and every stored entry qualifies.
+# it -- and for +Inf, or a NaN span from an infinite or NaN cell size, which fail
+# every f64_lt below -- the cell block covers the whole representable coordinate
+# range, so the range test is dropped and every stored entry qualifies. A NaN
+# radius never gets here (spatial_hash_query_radius returns nothing for it).
 var _SH_MAX_SPAN_CELLS = 1000000000000000;   # 1e15
 
 # |e - c| <= r, without wrapping.
@@ -1142,10 +1216,13 @@ var _SH_MAX_SPAN_CELLS = 1000000000000000;   # 1e15
 # HALVES WRAP. `e - c` overflows when e and c straddle 0 by more than 2^63, and
 # `0 - d` is a no-op at i64::MIN, so an entry in cell i64::MIN (x = -Inf, or x at or
 # below -2^63 cells) matched EVERY flat-scan query centred at cell 0: radius 1 at
-# the origin returned the points at -Inf. Measured on cycc 6.6.6 and 6.6.12 alike;
-# on 6.6.6 x86 also sent NaN and +huge coordinates to i64::MIN. A difference that
-# wraps is larger than any r, so it is out of range. Pinned in tests/abuse.tcyr.
+# the origin returned the points at -Inf. Measured on cycc 6.6.6 and 6.6.12 alike.
+# A difference that wraps is larger than any r, so it is out of range. Pinned in
+# tests/abuse.tcyr.
 # [measured: tests/abuse.tcyr, group "3.2.2 spatial hash"]
+# ⚠ This cannot separate two coordinates that share a cell. Below cycc 6.6.8 every
+# coordinate outside i64 shared i64::MIN, +Inf with -Inf and NaN, until 3.3.4
+# saturated the positive side and put a NaN in cell 0 in _sh_cell_coord (above).
 fn _sh_within(e, c, r) {
     var d = e - c;
     if (e >= c) {
@@ -1182,6 +1259,9 @@ fn _sh_near_end(c, r) {
 # differs, and only in a regime where the old code was effectively a hang.
 public fn spatial_hash_query_radius(sh, point, radius) {
     var results = vec_new();
+    # A NaN centre has no cell and a NaN radius encloses nothing (_sh_cell_coord).
+    if (_sh_has_nan(point) == 1) { return results; }
+    if (f64_eq(radius, radius) == 0) { return results; }
     var inv = _sh_inv_cell_size(sh);
     var cx = _sh_cell_coord(HVec3_x(point), inv);
     var cy = _sh_cell_coord(HVec3_y(point), inv);
@@ -1224,6 +1304,10 @@ public fn spatial_hash_query_radius(sh, point, radius) {
     # sits within cells_r of either end of the i64 cell range (x = +-Inf, or past
     # +-2^63 cells): a query at +Inf probed cell i64::MIN and returned the points at
     # -Inf. The flat scan's `_sh_within` cannot wrap, so such a centre takes it.
+    # ⚠ That repaired the wrap on cycc 6.6.8 and later only. Below 6.6.8 (six consumers
+    # pin 6.6.3) the +Inf centre's own cell WAS i64::MIN, so the flat scan matched the
+    # points at -Inf too, at distance 0; 3.3.4 saturates the cell in _sh_cell_coord.
+    # [measured: tests/abuse.tcyr "a centre at +Inf", 3.3.4-base, 2026-10-03; cycc 6.6.3, 6.6.6]
     if (_sh_near_end(cx, cells_r) + _sh_near_end(cy, cells_r) + _sh_near_end(cz, cells_r) > 0) {
         full_scan = 1;
     }

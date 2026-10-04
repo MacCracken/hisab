@@ -150,6 +150,30 @@ fn _lp_pow2_floor(s) {
     return b;
 }
 
+# ⛔ 3.3.4 — A GIVENS RADIUS BELOW DBL_MIN SITS ON THE ABSOLUTE 2^-1074 GRID, SO THE
+# ROTATION BUILT FROM IT WAS NOT ORTHOGONAL. `cs = y / r` and `sn = z / r` are each
+# correctly rounded, but `r` is rounded to a multiple of 2^-1074 and can carry only a few
+# bits: y = z = 2^-1074 gives r = 2^-1074 (truly sqrt(2) times that), cs = sn = 1, and a
+# "rotation" that scales by sqrt(2). Accumulated into U, Vt or the eigenvectors it left
+# them visibly non-orthogonal with every value right (the rank-1 4x4 in tests/abuse.tcyr,
+# A[i][j] = x_i (1 + j), came back with max |Vt Vt^T - I| = 0.099).
+# [measured: rank-1 4x4 probe, 3.3.4 base vs this tree, float residual, 2026-10-03; cycc 6.6.14]
+# ⭐ This returns the a-leg of the unit rotation of the pair (a, b) whose radius r is
+# below DBL_MIN, computed from the pair lifted by the power of two at or below r. A
+# subnormal divided by a power of two at most 1 is exact while the quotient stays
+# finite, and here the lifted legs are below 4, so the lifted pair IS (a, b), scaled,
+# and its radius has a full mantissa. Called with (y, z) and with (z, y) it gives cs
+# and sn with cs^2 + sn^2 = 1 to rounding.
+# ⚠ On a first attempt callers use it for the ACCUMULATED rotation only, and on a retry
+# (`lift` 1) for the bidiagonal or tridiagonal too; the note at `_lp_split_zero_diag`'s
+# chase says why.
+fn _lp_rot_leg(a, b, r) {
+    var p = _lp_pow2_floor(r);
+    var la = f64_div(a, p);
+    var lb = f64_div(b, p);
+    return f64_div(la, f64_sqrt(f64_add(f64_mul(la, la), f64_mul(lb, lb))));
+}
+
 # ⛔ 2.18.0 — AN EXACTLY ZERO OFF-DIAGONAL WAS NEVER DEFLATED. Every deflation
 # test in this file read `f64_lt(|off|, EPSILON_F64 * (|a| + |b|))`, and for a
 # sub-block whose diagonals sit at 2^-1050 that product is below the smallest
@@ -319,6 +343,9 @@ fn _lp_balance_pick(hi, lo, growth) {
 # BINADES IN [2^1023, 2^1024), where 3.3.2 overflowed and answered anyway. Since
 # 3.3.3 every place that overflow reaches returns Err(HSB_ERR_NO_CONVERGENCE)
 # instead; svd_golub_kahan's balance note has the account.
+# ⭐ 3.3.4 — AND SUCH A FAILURE IS RETRIED WITH MORE HEADROOM, NOT RETURNED. The
+# headroom is applied after the fact and only to an input whose attempt failed
+# (`_lp_headroom_next`), so this scale, and every result it gives, is unchanged.
 #must_use
 fn _lp_balance_scale(A, rows, cols) {
     var hi = _lp_mat_max_abs(A);
@@ -340,6 +367,27 @@ fn _lp_balance_scale(A, rows, cols) {
         sc = nsc;
     }
     return sc;
+}
+
+# ⭐ 3.3.4 — HEADROOM ONLY WHERE THE OVERFLOW OCCURS. `svd_golub_kahan` and `eigen_qr`
+# balance with `_lp_balance_scale` as before, so an input the first attempt answers
+# keeps its bits (the headroom balance withdrawn in 3.3.3 cost every wide-span matrix
+# bits on its small entries, answered or not). When an attempt fails, this gives the
+# next scale: twice the last, one binade more headroom, while the balanced largest
+# entry hi / sc times `growth` still overflows. Once it fits, this returns 0 and the
+# caller returns the Err: the routine's own failure, not an overflow. Each retry halves
+# hi / sc, so a call makes at most about log2(growth) + 2 attempts, and only when it
+# was going to fail without them. A NaN cannot reach this: both callers refuse a
+# non-finite entry first.
+# `growth` bounds the routine's largest intermediate over the balanced max|A|. svd: 4m,
+# for 2 ||A||_2 <= 2 sqrt(mn) max|A| (the reflector's v0 + ||x||, and 2 (v . w) in its
+# update; the bidiagonal QR stays within ||A||_2). eigen: 8n, for 4 ||A||_2 <= 4n max|A|
+# (the tridiagonal update v q' + q v' with ||q|| <= 2 ||A||_2, and the QR's x = d - mu
+# and its diagonal update stay within 4 ||A||_2). Each with a factor 2 to spare.
+fn _lp_headroom_next(A, sc, growth) {
+    var hi = _lp_mat_max_abs(A);
+    if (f64_lt(f64_mul(f64_div(hi, sc), growth), F64_POS_INF) == 1) { return f64_from(0); }
+    return f64_mul(sc, F64_TWO);
 }
 
 # Smallest non-zero |re| or |im| over a complex matrix (+Inf if there is none):
@@ -448,8 +496,9 @@ fn _lp_vec_copy(dst, src, n) {
 #          out_S or out_Vt, a non-positive dimension, m < n, or a non-finite
 #          entry of A; Err(HSB_ERR_NO_CONVERGENCE) if QR iteration fails, or
 #          (since 3.3.3) if a singular value exceeds DBL_MAX or a norm or radius
-#          on the way to one is not finite; Err(HSB_ERR_ALLOC) if the balancing
-#          copy fails. (Through 3.3.1 this line listed only the last two.)
+#          on the way to one is not finite (since 3.3.4, once added headroom can no
+#          longer prevent it); Err(HSB_ERR_ALLOC) if the balancing copy fails.
+#          (Through 3.3.1 this line listed only the last two.)
 # A is balanced by a power of two before decomposing and rescaled on the way
 # out (`_lp_balance_scale`). Through 3.3.1 this line called both steps exact
 # without condition. The divide is exact while every balanced entry is normal
@@ -457,9 +506,11 @@ fn _lp_vec_copy(dst, src, n) {
 # a subnormal singular value rounds to the 2^-1074 grid on the way out (see the
 # balancing note inside svd_golub_kahan). For entries spanning more than about 2045
 # binades the balance leaves the largest in [2^1023, 2^1024) and the smallest
-# subnormal; where the decomposition then overflows it returns
-# Err(HSB_ERR_NO_CONVERGENCE) since 3.3.3 (through 3.3.2 it could return rc = OK with
-# NaN or invented values).
+# subnormal; where the decomposition then overflows it returned
+# Err(HSB_ERR_NO_CONVERGENCE) in 3.3.3 (through 3.3.2 it could return rc = OK with
+# NaN or invented values). Since 3.3.4 it retries with one binade more headroom at a
+# time, which takes those binades' bits off the subnormal entries of only the inputs
+# that needed it, and returns that Err once no headroom is left to add.
 #
 # Algorithm:
 #   Step 1: Householder bidiagonalization  A = U1 * B * V1^T
@@ -858,6 +909,9 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
 # deflating a singular value of exactly 0. This is the zero-diagonal case of
 # Golub & Van Loan Alg. 8.6.2, omitted from the original transcription.
 #
+# lift: 1 on a retry, when B takes the lifted rotation of a radius below DBL_MIN too
+# (see the chase below and `_lp_rot_leg`); 0 on a first attempt.
+#
 # Returns 1 if a split was performed (caller must restart the sweep), else 0;
 # since 3.3.3, -1 if a chase radius is not finite, which the caller turns into
 # Err(HSB_ERR_NO_CONVERGENCE). A radius of +Inf made cs = sn = 0, a "rotation" that
@@ -866,7 +920,7 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
 # caller's `split < 0` test, moves no row. So the two checks are pinned by direct
 # calls in tests/abuse.tcyr.
 # [measured: check-removed scratch builds + 720-digit oracle, not reproducible in-tree, 2026-10-01]
-fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
+fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi, lift) {
     # The zero test must be RELATIVE to the block: a bare EPSILON_F64 would call
     # every entry of a 1e-20-scaled block zero and no entry of a 1e+20 one.
     var scale = f64_from(0);
@@ -937,6 +991,40 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
             if (_lp_negligible_rel(r, scale) == 1) { break; }
             var cs = f64_div(dj, r);
             var sn = f64_div(carry, r);
+            # ⛔ 3.3.4 — WHEN r IS BELOW DBL_MIN, cs AND sn ARE QUOTIENTS BY A RADIUS ROUNDED
+            # TO THE 2^-1074 GRID, and U came back non-orthogonal (see `_lp_rot_leg`). U now
+            # takes the rotation of the lifted pair. On a first attempt (`lift` 0) B keeps cs
+            # and sn exactly as before, so no value of an input 3.3.3 answered moves, and
+            # U * S * Vt is unchanged to 4 significant digits on every probe row this touches.
+            # [measured: span/in-range/rank-1 probes, base vs 2 variants + Decimal oracle, 2026-10-03; cycc 6.6.14]
+            # ⛔ ON A RETRY (`lift` 1) B TAKES THE LIFTED ROTATION TOO, here and at the other four
+            # sites. A retry's headroom pushes small entries onto the grid, and a non-unit
+            # rotation applied to B but not to U or Vt (or to T but not to Q) left them
+            # inconsistent: on 22,000 sparse tridiagonals the 3.3.4 retry without this
+            # answered 282 eigen rows rc = OK and wrong, up to 2.7e14 eps |lambda|_max
+            # (tests/abuse.tcyr has a 4x4 that came back 3.0% high). Each of the five sites
+            # moves probe rows when its own lift is removed. The four svd sites move no
+            # row's normwise error (no probe svd row was wrong without them) and trade 11
+            # bidiagonals answered only without them for 7 answered only with them, all right
+            # to 1 eps; called directly, this chase's B entries come back to rounding with the
+            # lift and 8.6e-8 off without it.
+            # [measured: S1-S6 probes + per-site builds, this tree + 800/1400-digit oracles, 2026-10-03; cycc 6.6.14]
+            # ⚠ WHETHER A FIRST ATTEMPT SHOULD LIFT B TOO IS OPEN (roadmap). On the 43,000 probe
+            # rows it moves S or the eigenvalues of 15, normwise the same on all 15. On those
+            # sparse tridiagonals 3.3.3 answers 6,818 eigen rows, 21 of them rc = OK and wrong
+            # by up to 8.1e12 eps |lambda|_max; it repairs all 21 (to 2.2 eps), refuses none and
+            # makes no row worse normwise.
+            # [measured: lift-always build vs this tree over the same probes + oracle, 2026-10-03; cycc 6.6.14]
+            var ucs = cs;
+            var usn = sn;
+            if (f64_lt(r, F64_TINY) == 1) {
+                ucs = _lp_rot_leg(dj, carry, r);
+                usn = _lp_rot_leg(carry, dj, r);
+            }
+            if (lift == 1) {
+                cs = ucs;
+                sn = usn;
+            }
             store64(diag + j * 8, r);
             if (j < p_hi) {
                 var fj = load64(superdiag + j * 8);
@@ -951,8 +1039,8 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
             while (t < m) {
                 var u0 = ganita_mat_get(U_acc, t, hit);
                 var u1 = ganita_mat_get(U_acc, t, j);
-                ganita_mat_set(U_acc, t, hit, f64_sub(f64_mul(cs, u0), f64_mul(sn, u1)));
-                ganita_mat_set(U_acc, t, j, f64_add(f64_mul(sn, u0), f64_mul(cs, u1)));
+                ganita_mat_set(U_acc, t, hit, f64_sub(f64_mul(ucs, u0), f64_mul(usn, u1)));
+                ganita_mat_set(U_acc, t, j, f64_add(f64_mul(usn, u0), f64_mul(ucs, u1)));
                 t = t + 1;
             }
             j = j + 1;
@@ -982,6 +1070,20 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
         if (_lp_negligible_rel(r2, scale) == 1) { break; }
         var cs2 = f64_div(dc, r2);
         var sn2 = f64_div(f64_neg(ccarry), r2);
+        # ⛔ 3.3.4 — the other arm's radius below DBL_MIN: Vt takes the rotation of the
+        # lifted pair, and B keeps cs2 and sn2 on a first attempt and takes the lifted pair
+        # on a retry (see the arm above and `_lp_rot_leg`). This is the arm the rank-1
+        # x_i (1 + j) fixtures reach.
+        var vcs2 = cs2;
+        var vsn2 = sn2;
+        if (f64_lt(r2, F64_TINY) == 1) {
+            vcs2 = _lp_rot_leg(dc, ccarry, r2);
+            vsn2 = _lp_rot_leg(f64_neg(ccarry), dc, r2);
+        }
+        if (lift == 1) {
+            cs2 = vcs2;
+            sn2 = vsn2;
+        }
         store64(diag + c * 8, r2);
         if (c > p_lo) {
             var fc = load64(superdiag + (c - 1) * 8);
@@ -995,8 +1097,8 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
         while (t2 < n) {
             var v0 = ganita_mat_get(Vt_acc, c, t2);
             var v1 = ganita_mat_get(Vt_acc, p_hi, t2);
-            ganita_mat_set(Vt_acc, c, t2, f64_sub(f64_mul(cs2, v0), f64_mul(sn2, v1)));
-            ganita_mat_set(Vt_acc, p_hi, t2, f64_add(f64_mul(sn2, v0), f64_mul(cs2, v1)));
+            ganita_mat_set(Vt_acc, c, t2, f64_sub(f64_mul(vcs2, v0), f64_mul(vsn2, v1)));
+            ganita_mat_set(Vt_acc, p_hi, t2, f64_add(f64_mul(vsn2, v0), f64_mul(vcs2, v1)));
             t2 = t2 + 1;
         }
         c = c - 1;
@@ -1008,8 +1110,9 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi) {
 # Operates on diag[0..n) and superdiag[0..n-1) in place.
 # Accumulates Givens rotations into U_acc (m x n) and Vt_acc (n x n).
 # max_iter: maximum total QR sweeps.
+# lift: 1 on a retry (see `_lp_split_zero_diag`), 0 on a first attempt.
 #must_use
-fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
+fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter, lift) {
     var iter = 0;
     var p_hi = n - 1;  # active submatrix upper bound
 
@@ -1091,7 +1194,7 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
             # a no-op (see _lp_split_zero_diag), which is what rank-deficient
             # input typically produces. Split there instead and restart. (-1 since
             # 3.3.3: a chase radius overflowed; see `_lp_split_zero_diag`.)
-            var split = _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi);
+            var split = _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi, lift);
             if (split < 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
             if (split == 1) {
                 iter = iter + 1;
@@ -1251,6 +1354,21 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
                     cs = F64_ONE;
                     sn = f64_from(0);
                 }
+                # ⛔ 3.3.4 — a radius below DBL_MIN: Vt takes the rotation of the lifted pair,
+                # B keeps cs and sn on a first attempt and takes the lifted pair on a retry
+                # (see `_lp_split_zero_diag`'s chase and `_lp_rot_leg`).
+                var acs = cs;
+                var asn = sn;
+                if (f64_lt(r, F64_TINY) == 1) {
+                    if (f64_gt(r, 0) == 1) {
+                        acs = _lp_rot_leg(y, z, r);
+                        asn = _lp_rot_leg(f64_neg(z), y, r);
+                    }
+                }
+                if (lift == 1) {
+                    cs = acs;
+                    sn = asn;
+                }
 
                 # Apply right rotation to B (affects columns k, k+1)
                 # Rows k-1 (if exists), k, k+1 (if exists) of bidiagonal
@@ -1277,9 +1395,9 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
                     var vk  = ganita_mat_get(Vt_acc, k, j);
                     var vk1 = ganita_mat_get(Vt_acc, k + 1, j);
                     ganita_mat_set(Vt_acc, k, j,
-                      f64_add(f64_mul(cs, vk), f64_mul(f64_neg(sn), vk1)));
+                      f64_add(f64_mul(acs, vk), f64_mul(f64_neg(asn), vk1)));
                     ganita_mat_set(Vt_acc, k + 1, j,
-                      f64_add(f64_mul(sn, vk), f64_mul(cs, vk1)));
+                      f64_add(f64_mul(asn, vk), f64_mul(acs, vk1)));
                     j = j + 1;
                 }
 
@@ -1322,6 +1440,20 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
                     cs = F64_ONE;
                     sn = f64_from(0);
                 }
+                # ⛔ 3.3.4 — the left rotation's radius below DBL_MIN: U takes the lifted
+                # rotation, B keeps cs and sn on a first attempt (as the right rotation above).
+                acs = cs;
+                asn = sn;
+                if (f64_lt(r, F64_TINY) == 1) {
+                    if (f64_gt(r, 0) == 1) {
+                        acs = _lp_rot_leg(y, z, r);
+                        asn = _lp_rot_leg(f64_neg(z), y, r);
+                    }
+                }
+                if (lift == 1) {
+                    cs = acs;
+                    sn = asn;
+                }
 
                 store64(diag + k * 8, r);
 
@@ -1352,9 +1484,9 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
                     var uk  = ganita_mat_get(U_acc, j, k);
                     var uk1 = ganita_mat_get(U_acc, j, k + 1);
                     ganita_mat_set(U_acc, j, k,
-                      f64_add(f64_mul(cs, uk), f64_mul(f64_neg(sn), uk1)));
+                      f64_add(f64_mul(acs, uk), f64_mul(f64_neg(asn), uk1)));
                     ganita_mat_set(U_acc, j, k + 1,
-                      f64_add(f64_mul(sn, uk), f64_mul(cs, uk1)));
+                      f64_add(f64_mul(asn, uk), f64_mul(acs, uk1)));
                     j = j + 1;
                 }
 
@@ -1372,6 +1504,50 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
     return Ok(0);
 }
 
+# One attempt at the SVD of A / sc (3.3.4: the body svd_golub_kahan ran once through
+# 3.3.3, moved here so a failed attempt can be retried with more headroom). Leaves the
+# balanced singular values, made non-negative and sorted, in diag; U and Vt are
+# rewritten from the identity on every attempt. `lift` is 0 on the first attempt and 1
+# on each retry (see `_lp_split_zero_diag`).
+#must_use
+fn _lp_svd_attempt(A, m, n, sc, diag, superdiag, out_U, out_Vt, max_iter, lift) {
+    var As = _lp_mat_div_scalar(A, sc);
+    if (As == 0) { return Err(HSB_ERR_ALLOC); }
+
+    var err = _lp_bidiagonalize(As, m, n, diag, superdiag, out_U, out_Vt)?;
+
+    # Step 2: QR iteration on bidiagonal
+    # ⚠ 3.0.0 — a REASSIGNMENT rather than a fresh `var`, so the mechanical pass
+    # missed it and then wrapped the forwarded code as a SUCCESS. `?` needs a
+    # binding, hence the second name. Same shape as num_ext's two.
+    var err_qr = _lp_bidiag_qr(diag, superdiag, n, m, out_U, out_Vt, max_iter, lift)?;
+
+    # Step 3: Make singular values non-negative; flip U column signs as needed
+    var i = 0;
+    while (i < n) {
+        var sv = load64(diag + i * 8);
+        if (f64_lt(sv, f64_from(0)) == 1) {
+            store64(diag + i * 8, f64_neg(sv));
+            # Flip sign of corresponding U column
+            var j = 0;
+            while (j < m) {
+                ganita_mat_set(out_U, j, i, f64_neg(ganita_mat_get(out_U, j, i)));
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    # Step 4: Sort singular values in descending order, U columns (m rows) and
+    # Vt rows (n columns) carried along -- the shared selection sort in
+    # src/linalg_ext.cyr, by value rather than |value| because step 3 has just
+    # made every entry non-negative. Tie order (equal singular values, distinct
+    # singular vectors) is pinned in tests/hisab.tcyr ("tie order" block).
+    var _srt = linalg_sort_desc(diag, n, 0, out_U, m, out_Vt, n)?;
+
+    return Ok(0);
+}
+
 # Public: Golub-Kahan SVD
 # A:      stdlib matrix (m x n, m >= n -- ENFORCED, see below).
 # out_U:  stdlib matrix (m x n, caller allocates).
@@ -1379,8 +1555,9 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter) {
 # out_Vt: stdlib matrix (n x n, caller allocates).
 # Returns: Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) on failure (since 3.3.3
 #          including a singular value above DBL_MAX, or any intermediate norm or
-#          radius that is not finite), Err(HSB_ERR_INVALID_INPUT) if m < n or either
-#          dimension is non-positive (full list in the section header above).
+#          radius that is not finite, since 3.3.4 at the most headroom tried),
+#          Err(HSB_ERR_INVALID_INPUT) if m < n or either dimension is non-positive
+#          (full list in the section header above).
 #must_use
 public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     # Any of these may be the designed 0 that ganita_mat_new returns above its own
@@ -1467,49 +1644,46 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     # svd / eigen_qr rows, shapes 1x1 to 6x6 and up, every one is byte-identical to
     # 3.3.2 except the 725 whose true largest value is above DBL_MAX, where 3.3.2
     # returned +Inf with rc = OK.
-    # ⚠ STILL OPEN, as on 3.3.2: a Givens radius below DBL_MIN is rounded onto the
-    # 2^-1074 grid, so its rotation is not quite orthogonal and U or Vt can come back
-    # visibly non-orthogonal with every value right (3 svd rows of the span probes;
-    # the rank-1 5x5 A[i][j] = x_i (1 + j), entries spanning 1127 binades, gives
-    # max |Vt Vt^T - I| = 0.0139). Rotations computed from a power-of-two-lifted
-    # pair were tried during 3.3.3 and withdrawn: they changed how in-range matrices
-    # converge, and a 5x5 spanning 992 binades that 3.3.2 answered returned
-    # NO_CONVERGENCE with them.
+    # ⚠ Through 3.3.3 a Givens radius below DBL_MIN, rounded onto the 2^-1074 grid,
+    # left U or Vt visibly non-orthogonal with every value right (the rank-1 5x5
+    # A[i][j] = x_i (1 + j), entries spanning 1127 binades, gave max |Vt Vt^T - I| =
+    # 0.0139). Rotations from a power-of-two-lifted pair were tried during 3.3.3 and
+    # withdrawn: applied to B as well, they changed how in-range matrices converge, and
+    # a 5x5 spanning 992 binades that 3.3.2 answered returned NO_CONVERGENCE with them.
     # [measured: span / in-range / boundary probes, 3.3.2 vs this tree + 720-digit oracle, not reproducible in-tree]
+    # ⭐ 3.3.4 — SINCE THEN U AND Vt TAKE THE LIFTED ROTATION AND, ON A FIRST ATTEMPT, B
+    # DOES NOT (see `_lp_rot_leg`), so no value or iteration count of an input the first
+    # attempt answers moves; a retry lifts B's rotation too. On the probe sets below
+    # (43,000 svd and eigen rows) 122 answered rows meet such a radius and the lift
+    # changes the factors of 68: each is now orthogonal to 8.9e-16 (49 were off by more
+    # than 1e-12, up to 1.0), with S and rc unchanged and U * S * Vt unchanged to 4
+    # significant digits. The other 54 rows are byte-identical.
+    # [measured: span/in-range/rank-1 probes, base vs this tree + Decimal residuals, 2026-10-03; cycc 6.6.14]
+    # ⭐ 3.3.4 — AND THE INPUTS THAT OVERFLOW ARE ANSWERED, NOT REFUSED. The balance is
+    # unchanged; an attempt that fails is retried with one binade more headroom at a
+    # time (`_lp_headroom_next`) until no intermediate can overflow. Probes: 9,000 and
+    # 4,500 rows at two and three magnitude levels spanning 1900..2097 binades, 12,000
+    # structured rows spanning 900..2097, 13,500 in-range controls and 4,000 rank-1
+    # x_i (1 + j); svd shapes 1x1 to 5x5, 8x2, 10x3, 12x2 and 16x1. Every row the first
+    # attempt answers is byte-identical in S and rc, and 1982 svd rows it refused now
+    # answer. Against a 1400-digit Decimal oracle the worst of them is off by 3180 eps
+    # sigma_max, inside the 4100 that rows answered in range reach (the 1e-12 deflation,
+    # roadmap [3.6.0]), and that row gives the in-range answer of the same matrix with
+    # its entries below 1e-300 dropped, bit for bit. Still refused: 72 rows whose
+    # largest singular value rounds past DBL_MAX, and 3 rank-1 rows spanning under 1600
+    # binades that do not converge in 30 n^2 sweeps on 3.3.4 either (and 14 with an
+    # infinite entry, INVALID_INPUT as before).
+    # [measured: probe sets above, base vs this tree + 1400-digit oracle, 2026-10-03; cycc 6.6.14 and 6.6.3]
     var sc = _lp_balance_scale(A, m, n);
-    var As = _lp_mat_div_scalar(A, sc);
-    if (As == 0) { return Err(HSB_ERR_ALLOC); }
-
-    var err = _lp_bidiagonalize(As, m, n, diag, superdiag, out_U, out_Vt)?;
-
-    # Step 2: QR iteration on bidiagonal
-    # ⚠ 3.0.0 — a REASSIGNMENT rather than a fresh `var`, so the mechanical pass
-    # missed it and then wrapped the forwarded code as a SUCCESS. `?` needs a
-    # binding, hence the second name. Same shape as num_ext's two.
-    var err_qr = _lp_bidiag_qr(diag, superdiag, n, m, out_U, out_Vt, max_iter)?;
-
-    # Step 3: Make singular values non-negative; flip U column signs as needed
-    var i = 0;
-    while (i < n) {
-        var sv = load64(diag + i * 8);
-        if (f64_lt(sv, f64_from(0)) == 1) {
-            store64(diag + i * 8, f64_neg(sv));
-            # Flip sign of corresponding U column
-            var j = 0;
-            while (j < m) {
-                ganita_mat_set(out_U, j, i, f64_neg(ganita_mat_get(out_U, j, i)));
-                j = j + 1;
-            }
-        }
-        i = i + 1;
+    var lift = 0;
+    while (1 == 1) {
+        var at, av = _lp_svd_attempt(A, m, n, sc, diag, superdiag, out_U, out_Vt, max_iter, lift);
+        if (is_ok(at) == 1) { break; }
+        if (av != HSB_ERR_NO_CONVERGENCE) { return Err(av); }
+        sc = _lp_headroom_next(A, sc, f64_from(4 * m));
+        if (f64_eq(sc, 0) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        lift = 1;
     }
-
-    # Step 4: Sort singular values in descending order, U columns (m rows) and
-    # Vt rows (n columns) carried along -- the shared selection sort in
-    # src/linalg_ext.cyr, by value rather than |value| because step 3 has just
-    # made every entry non-negative. Tie order (equal singular values, distinct
-    # singular vectors) is pinned in tests/hisab.tcyr ("tie order" block).
-    var _srt = linalg_sort_desc(diag, n, 0, out_U, m, out_Vt, n)?;
 
     # Undo the balancing: sv(c*A) = c*sv(A), U and Vt are invariant.
     # ⛔ 3.3.3 — and a singular value that is not finite after the rescale is a
@@ -1547,11 +1721,16 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
 #           SORTED BY DESCENDING |lambda| -- step 3 below).
 # out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as
 #           columns, permuted alongside out_vals).
-# Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if max_iter exceeded or
-#           (since 3.3.3) an eigenvalue exceeds DBL_MAX in magnitude or a norm or
-#           radius on the way to one is not finite; Err(HSB_ERR_INVALID_INPUT) on a
-#           null handle, n <= 0, a shape that does not match n, or a non-finite
-#           entry; Err(HSB_ERR_ALLOC) if the balancing copy fails.
+# Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if the last attempt exceeds
+#           max_iter (since 3.3.4 max_iter bounds EACH attempt, and a failed attempt is
+#           retried while max|A| / sc times 8n overflows, so a call can run about
+#           (log2(8n) + 2) * max_iter sweeps) or (since 3.3.3) an eigenvalue exceeds
+#           DBL_MAX in magnitude or a norm or radius on the way to one is not finite
+#           (since 3.3.4, once added headroom can no longer prevent it; see
+#           svd_golub_kahan's section header);
+#           Err(HSB_ERR_INVALID_INPUT) on a null handle, n <= 0, a shape that does
+#           not match n, or a non-finite entry; Err(HSB_ERR_ALLOC) if the balancing
+#           copy fails.
 #
 # The descending-|lambda| order has always been implemented here (the selection
 # sort at the end of eigen_qr) but was never stated; the 2026-08-04 audit's
@@ -1773,8 +1952,9 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
 # offdiag[0..n): sub/superdiagonal (offdiag[i] = T[i,i-1], offdiag[0] = 0).
 # Q: n x n matrix (accumulates Givens rotations).
 # max_iter: maximum iterations.
+# lift: 1 on a retry (see `_lp_split_zero_diag`), 0 on a first attempt.
 #must_use
-fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
+fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
     var iter = 0;
     var p_hi = n - 1;
 
@@ -1899,6 +2079,24 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
                     cs = f64_div(x, r);
                     sn = f64_div(z, r);
                 }
+                # ⛔ 3.3.4 — a radius below DBL_MIN: Q takes the rotation of the lifted pair,
+                # the tridiagonal keeps cs and sn on a first attempt and takes the lifted pair
+                # on a retry (see `_lp_split_zero_diag`'s chase and `_lp_rot_leg`). 3.3.3
+                # tried the lifted rotation on BOTH and withdrew it: a 6x6 it answered at
+                # max_iter 60 returned NO_CONVERGENCE. Q alone moves no value and no
+                # iteration count of a first attempt.
+                var qcs = cs;
+                var qsn = sn;
+                if (f64_lt(r, F64_TINY) == 1) {
+                    if (f64_gt(r, 0) == 1) {
+                        qcs = _lp_rot_leg(x, z, r);
+                        qsn = _lp_rot_leg(z, x, r);
+                    }
+                }
+                if (lift == 1) {
+                    cs = qcs;
+                    sn = qsn;
+                }
 
                 # Apply similarity transform to tridiagonal
                 if (k > p_lo) {
@@ -1953,9 +2151,9 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
                 while (j < n) {
                     var qk  = ganita_mat_get(Q, j, k);
                     var qk1 = ganita_mat_get(Q, j, k + 1);
-                    ganita_mat_set(Q, j, k,     f64_add(f64_mul(cs, qk), f64_mul(sn, qk1)));
-                    ganita_mat_set(Q, j, k + 1, f64_add(f64_mul(f64_neg(sn), qk),
-                        f64_mul(cs, qk1)));
+                    ganita_mat_set(Q, j, k,     f64_add(f64_mul(qcs, qk), f64_mul(qsn, qk1)));
+                    ganita_mat_set(Q, j, k + 1, f64_add(f64_mul(f64_neg(qsn), qk),
+                        f64_mul(qcs, qk1)));
                     j = j + 1;
                 }
 
@@ -1972,18 +2170,35 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter) {
     return Ok(0);
 }
 
+# One attempt at the eigendecomposition of A / sc (3.3.4; see `_lp_svd_attempt`).
+# Leaves the balanced eigenvalues in diag; out_vecs is rewritten from the identity on
+# every attempt. `lift` is 0 on the first attempt and 1 on each retry.
+#must_use
+fn _lp_eig_attempt(A, n, sc, diag, offdiag, out_vecs, max_iter, lift) {
+    var As = _lp_mat_div_scalar(A, sc);
+    if (As == 0) { return Err(HSB_ERR_ALLOC); }
+
+    var err = _lp_tridiagonalize(As, n, diag, offdiag, out_vecs)?;
+
+    # Step 2: Implicit QR iteration on tridiagonal
+    var err_qr = _lp_tridiag_qr(diag, offdiag, n, out_vecs, max_iter, lift)?;
+
+    return Ok(0);
+}
+
 # Public: QR iteration for symmetric eigendecomposition
 # A:        stdlib matrix (n x n, must be symmetric -- SHAPE ENFORCED, see below).
 # n:        matrix dimension.
 # max_iter: maximum QR iterations.
 # out_vals: flat f64 array of length n (caller allocates).
 # out_vecs: stdlib matrix (n x n, caller allocates, eigenvectors as columns).
-# Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if max_iter is exceeded or
-#           (since 3.3.3) an eigenvalue exceeds DBL_MAX in magnitude or a norm or
-#           radius on the way to one is not finite, Err(HSB_ERR_INVALID_INPUT) on a
-#           null handle, n <= 0, a shape that does not match n or a non-finite entry,
-#           Err(HSB_ERR_ALLOC) if the balancing copy fails (the section header above
-#           has the same list).
+# Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if the last attempt exceeds
+#           max_iter (since 3.3.4 max_iter bounds EACH attempt; see the section header
+#           for the retries) or (since 3.3.3) an eigenvalue exceeds DBL_MAX in magnitude
+#           or a norm or radius on the way to one is not finite (since 3.3.4 at the most
+#           headroom tried), Err(HSB_ERR_INVALID_INPUT) on a null handle, n <= 0, a
+#           shape that does not match n or a non-finite entry, Err(HSB_ERR_ALLOC) if the
+#           balancing copy fails (the section header above has the same list).
 #must_use
 public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # Any of these may be the designed 0 that ganita_mat_new / mat_new_guarded returns
@@ -2050,21 +2265,42 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # lets 92 rows come back rc = OK and wrong, the radius check's 26, the deflation
     # arm's 15 (svd and eigen together) and the rescale's 5.
     # ⚠ The balance itself is 3.3.2's (growth 1; see `_lp_balance_scale` for the
-    # headroom that was tried and withdrawn), and so is the tridiagonal QR's rotation:
-    # a radius below DBL_MIN still leaves V visibly non-orthogonal with every value
-    # right on 95 eigen rows of the span probes, as on 3.3.2. A lifted rotation was
-    # tried and withdrawn: a 6x6 spanning 984 binades, which never enters the balance
-    # loop and which 3.3.2 answers at max_iter 60, returned NO_CONVERGENCE with it at
-    # 60, 200 and 1180.
+    # headroom that was tried and withdrawn). Through 3.3.3 so was the tridiagonal QR's
+    # rotation: a radius below DBL_MIN left V visibly non-orthogonal with every value
+    # right on 95 eigen rows of the span probes. A lifted rotation was tried and
+    # withdrawn: a 6x6 spanning 984 binades, which never enters the balance loop and
+    # which 3.3.2 answers at max_iter 60, returned NO_CONVERGENCE with it at 60, 200
+    # and 1180.
     # [measured: span probes, 3.3.2 vs this tree + check-removed builds, 720-digit oracle, not reproducible in-tree]
+    # ⭐ 3.3.4 — on a first attempt Q takes the lifted rotation and the tridiagonal does
+    # not (see `_lp_rot_leg`), so no eigenvalue or iteration count moves and V is
+    # orthogonal to working precision; and an attempt that fails is retried with more
+    # headroom, as in svd_golub_kahan (whose note has the probes), each retry lifting the
+    # tridiagonal's rotation too (see `_lp_split_zero_diag`'s chase). Every eigen row the
+    # first attempt answers is byte-identical in the eigenvalues and rc. Of the rows it
+    # refused, 852 now answer, the worst 8.4 eps |lambda|_max from an 800-digit oracle,
+    # inside the 137 that rows answered in range reach; still refused are 32 whose
+    # largest eigenvalue rounds past DBL_MAX and 49 that do not converge at any headroom
+    # (nor at 100 times max_iter).
+    # [measured: probe sets as svd_golub_kahan's, base vs this tree + 800-digit oracle, 2026-10-03; cycc 6.6.14]
+    # On 22,000 sparse symmetric tridiagonals (n = 3 to 9) mixing entries near DBL_MAX
+    # with small integer multiples of 2^-1074, 12,011 rows the first attempt refuses now
+    # answer, the worst 7.2 eps |lambda|_max; retried without the tridiagonal's lift, 282
+    # rows came back rc = OK and wrong, up to 2.7e14 eps, and the lift trades 15 rows
+    # answered only without it for 14 answered only with it, all within 2.5 eps. Still
+    # refused there, as on 3.3.3: 1,364 rows whose largest eigenvalue rounds past
+    # DBL_MAX, and 1,807 whose eigenvalues fit and which no attempt converges on.
+    # [measured: S5/S6 sparse-tridiagonal probes, base vs this tree + 800-digit oracle, 2026-10-03; cycc 6.6.14]
     var sc = _lp_balance_scale(A, n, n);
-    var As = _lp_mat_div_scalar(A, sc);
-    if (As == 0) { return Err(HSB_ERR_ALLOC); }
-
-    var err = _lp_tridiagonalize(As, n, diag, offdiag, out_vecs)?;
-
-    # Step 2: Implicit QR iteration on tridiagonal
-    var err_qr = _lp_tridiag_qr(diag, offdiag, n, out_vecs, max_iter)?;
+    var lift = 0;
+    while (1 == 1) {
+        var at, av = _lp_eig_attempt(A, n, sc, diag, offdiag, out_vecs, max_iter, lift);
+        if (is_ok(at) == 1) { break; }
+        if (av != HSB_ERR_NO_CONVERGENCE) { return Err(av); }
+        sc = _lp_headroom_next(A, sc, f64_from(8 * n));
+        if (f64_eq(sc, 0) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        lift = 1;
+    }
 
     # Undo the balancing: eig(c*A) = c*eig(A), eigenvectors invariant.
     # ⛔ 3.3.3 — an eigenvalue that is not finite after the rescale is a failure, as

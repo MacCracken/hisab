@@ -106,14 +106,31 @@ public fn m4_mul(a, b) {
 
 # Mat4 * Vec4 — SIMD: result = Σ_k v[k]·M_col_k (M's columns contiguous).
 #
-# ⚠ THE HOIST OF vx..vw IS NO LONGER LOAD-BEARING — FIXED UPSTREAM IN cycc 6.6.2.
-# It is kept because `m3_mul_vec3` has always been written this way and mat4 was
-# the lone inconsistency, NOT because removing it breaks anything. Verified rather
-# than assumed: reverting to the inline `HVec4_x(v)` form passes all three suites
-# that used to SIGSEGV (hisab 416, foundation 351, abuse 741, rc=0 each) on 6.6.2.
-# [measured: scratch harness, not reproducible in-tree, 2026-09-09; cycc 6.6.2]
-# **Do not leave a comment claiming a workaround is required after it stops being
-# required** — a false alarm costs the next reader the same investigation twice.
+# Each scalar goes straight into `f64v_scale` as `HVec4_x(v)`. From 2.11.3 until
+# 3.3.4 vx..vw were hoisted into locals first, because on the 6.6.1 bump this form
+# was WRONG CODE — the SIMD destination-slot miscompile in the history below,
+# fixed upstream in cycc 6.6.2. 2.11.5 verified the inline form on 6.6.2 (hisab
+# 416, foundation 351, abuse 741, rc=0 each) and kept the hoist only to match
+# `m3_mul_vec3`. [measured: scratch harness, not reproducible in-tree, 2026-09-09; cycc 6.6.2]
+#
+# ⭐ The inline form is also clear of the LATER defect that keeps `m3_mul_vec3`
+# hoisted (through 6.6.4: the register picker leaves an `f64v_*` operand slot
+# unwritten; fixed in 6.6.5; see mat3.cyr). Re-probed on 6.6.3 through 6.6.14,
+# every cycc that compiles a 3.x bundle, with the bundle in a consumer-shaped
+# program: 70,000 calls on 10,000 full-mantissa draws of M and v, specials mixed
+# in (direct, and through m4_transform_point/_dir, world_to_screen and
+# screen_to_world_ray), are bit-identical to the hoisted form on every pin; this
+# function's machine code is the same on every pin (address-normalised); and each
+# of the 21 operand slots its seven kernels read is written. The same harness SEES
+# the defect: m3's inline form gives (1, 4, 3) for (4, 5, 3), and 10,000 of 10,000
+# mismatches, on 6.6.3 and 6.6.4, and none from 6.6.5. Here the getters are
+# arguments of a batch intrinsic, not of another inline call, which is the trigger
+# upstream diagnosed. `m3_mul_vec3` stays hoisted because six direct consumers pin
+# 6.6.3, below the fix.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-03; cycc 6.6.3-6.6.14]
+# Cost: the inline form is faster, 2.83-2.87 vs 2.94-2.99 us per 64 calls and 98 vs
+# 101 ns through m4_transform_point, in a same-binary A/B (A B A B rows, 3 runs).
+# [measured: scratch same-binary A/B harness, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
 #
 # History, kept because the shape recurs: 2.11.3 hit this as a wrong-code bug on
 # the 6.6.1 bump. The intrinsic read its destination pointer from a frame slot
@@ -132,14 +149,10 @@ public fn m4_mul(a, b) {
 public fn m4_mul_vec4(m, v) {
     var r = alloc(sizeof(HVec4));
     var tmp = alloc(32);
-    var vx = HVec4_x(v);
-    var vy = HVec4_y(v);
-    var vz = HVec4_z(v);
-    var vw = HVec4_w(v);
-    f64v_scale(r, m + 0, vx, 4);
-    f64v_scale(tmp, m + 32, vy, 4); f64v_add(r, r, tmp, 4);
-    f64v_scale(tmp, m + 64, vz, 4); f64v_add(r, r, tmp, 4);
-    f64v_scale(tmp, m + 96, vw, 4); f64v_add(r, r, tmp, 4);
+    f64v_scale(r, m + 0, HVec4_x(v), 4);
+    f64v_scale(tmp, m + 32, HVec4_y(v), 4); f64v_add(r, r, tmp, 4);
+    f64v_scale(tmp, m + 64, HVec4_z(v), 4); f64v_add(r, r, tmp, 4);
+    f64v_scale(tmp, m + 96, HVec4_w(v), 4); f64v_add(r, r, tmp, 4);
     return r;
 }
 
@@ -335,9 +348,12 @@ public fn m4_ortho_rh(left, right, bottom, top, near, far) {
 }
 
 # Perspective projection (right-handed, OpenGL)
+# The tangent is the sin/cos quotient hisab's `f64_tan` computed until 3.3.4 (see
+# f64_util.cyr for why that fn is gone and why this is not `ganita_f64_tan` yet).
 #must_use
 public fn m4_perspective_rh(fov_y, aspect, near, far) {
-    var f = f64_div(F64_ONE, f64_tan(f64_mul(fov_y, F64_HALF)));
+    var half_fov = f64_mul(fov_y, F64_HALF);
+    var f = f64_div(F64_ONE, f64_div(f64_sin(half_fov), f64_cos(half_fov)));
     var nf = f64_sub(near, far);
     var m = m4_new();
     m4_set(m, 0, 0, f64_div(f, aspect));
@@ -351,7 +367,8 @@ public fn m4_perspective_rh(fov_y, aspect, near, far) {
 # Reverse-Z infinite far-plane perspective
 #must_use
 public fn m4_perspective_reverse_z(fov_y, aspect, near) {
-    var f = f64_div(F64_ONE, f64_tan(f64_mul(fov_y, F64_HALF)));
+    var half_fov = f64_mul(fov_y, F64_HALF);
+    var f = f64_div(F64_ONE, f64_div(f64_sin(half_fov), f64_cos(half_fov)));
     return m4_from_cols(
       hvec4_new(f64_div(f, aspect), 0, 0, 0),
       hvec4_new(0, f, 0, 0),

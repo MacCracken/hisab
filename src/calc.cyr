@@ -12,6 +12,7 @@ var _CALC_F64_FIVE = 0x4014_0000_0000_0000;  # 5.0
 var _CALC_F64_SIX = 0x4018_0000_0000_0000;  # 6.0
 var _CALC_F64_TEN = 0x4024_0000_0000_0000;  # 10.0
 var _CALC_F64_FIFTEEN = 0x402E_0000_0000_0000; # 15.0
+var _CALC_F64_SPLIT = 0x41A0_0000_0200_0000;   # 134217729.0 (2^27 + 1, Dekker's split)
 
 # ================================================================
 # 1. BASIC CALCULUS
@@ -76,14 +77,60 @@ public fn calc_integral_trapez(f, a, b, steps, out) {
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
     var sum = f64_mul(F64_HALF, f64_add(fa, fb));
+    # ⛔ 3.3.4 — THE SUM OVERFLOWED BEFORE h SCALED IT. The weighted sum of finite
+    # samples can pass DBL_MAX where sum * h does not: f(1/4) = f(1/2) = 1.5 * 2^1023,
+    # else 0, on [0, 1] with 4 steps stored +Inf as Ok, where the rule's value is
+    # 1.5 * 2^1022 (0x7FD8000000000000). An add of finite operands that overflows
+    # now halves the sum and every later sample instead (`sc` counts the halvings),
+    # and the product with h is doubled back at the end, so the result is the
+    # unscaled computation's, rounded the same way, and +-Inf only when it is. The
+    # endpoint pair is the same add: two finite endpoints whose sum overflows are
+    # halved before adding. A sum that never overflows is the same bits as before. An
+    # infinite or NaN sample is never scaled, and stores +-Inf or NaN, now the class of
+    # the sum computed without overflow: where the sum overflowed before that sample,
+    # or h is infinite, 3.3.3 read the class off the overflowed partial sum.
+    # f = [0, 1.5 * 2^1023, 1.5 * 2^1023, -Inf, 0] on [0, 1] with 4 steps stored NaN
+    # (+Inf + -Inf) and stores -Inf; with an infinite h, some tables stored the
+    # wrong-signed Inf. Of 9,015 non-finite tables, 1,189 changed bits, each to the class
+    # of the sum without overflow, and 3.3.3 had the wrong class on all 1,189.
+    # [measured: repro and quadrature sweep; base tree, this tree; exact rational oracle; 2026-10-03; cycc 6.6.14]
+    # [measured: non-finite repro and 63,000-table sweep; 3.3.3 bundle, this tree; 2026-10-03; cycc 6.6.14]
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0 && _calc_finite2(fa, fb) == 1) {
+        sum = f64_add(f64_mul(F64_HALF, fa), f64_mul(F64_HALF, fb));
+    }
+    var sc = 0;          # the true sum is sum * 2^sc
+    var dn = F64_ONE;    # 2^-sc, the factor on each later sample
     var i = 1;
     while (i < steps) {
         var xi = f64_add(a, f64_mul(f64_from(i), h));
-        sum = f64_add(sum, fncall1(f, xi));
+        var fxi = fncall1(f, xi);
+        if (sc != 0) { fxi = f64_mul(fxi, dn); }
+        var t = f64_add(sum, fxi);
+        if (f64_lt(f64_abs(t), F64_POS_INF) == 0 && _calc_finite2(sum, fxi) == 1) {
+            # Two finite halves sum to at most DBL_MAX: one halving always suffices.
+            sc = sc + 1;
+            dn = (1023 - sc) << 52;
+            sum = f64_mul(sum, F64_HALF);
+            t = f64_add(sum, f64_mul(fxi, F64_HALF));
+        }
+        sum = t;
         i = i + 1;
     }
-    store64(out, f64_mul(sum, h));
+    var r = f64_mul(sum, h);
+    if (sc != 0) { r = f64_mul(r, (1023 + sc) << 52); }
+    store64(out, r);
     return Ok(0);
+}
+
+# Internal: 1 when both a and b are finite (not +-Inf, not NaN), else 0.
+fn _calc_finite2(a, b) {
+    if (f64_lt(f64_abs(a), F64_POS_INF) == 0) { return 0; }
+    # Equivalent at both trapez call sites, kept for the contract the name states: a
+    # non-finite b (a sample) makes the sum non-finite in its own class, and halving
+    # first only rescales that Inf or NaN. Without this test no output moved.
+    # [measured: the mutant without this test, 63,000-table quadrature sweep; 2026-10-03]
+    if (f64_lt(f64_abs(b), F64_POS_INF) == 0) { return 0; }
+    return 1;
 }
 
 # Internal: the class of a NON-FINITE sample for calc_integral_simpson's true-sum rule
@@ -115,7 +162,8 @@ fn _calc_nonfinite_class(v) {
 # [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
 # An infinite or NaN sample stores the class of the true sum (see the end of the body):
 # ±Inf for infinite samples of one sign, NaN for both signs or a NaN sample. Finite
-# samples whose weighted sum overflows store NaN, as on 3.3.2.
+# samples whose weighted sum overflows store the rule's value (3.3.4; through 3.3.3,
+# NaN), +-Inf only when that value is past DBL_MAX.
 #must_use
 public fn calc_integral_simpson(f, a, b, steps, out) {
     # Round up to even
@@ -134,20 +182,68 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
     var spec = 0;  # classes of the non-finite samples (see the end of the body)
     if (f64_lt(f64_abs(fa), F64_POS_INF) == 0) { spec = spec | _calc_nonfinite_class(fa); }
     if (f64_lt(f64_abs(fb), F64_POS_INF) == 0) { spec = spec | _calc_nonfinite_class(fb); }
+    var sc = 0;          # the true sum is (sum + comp) * 2^sc (see calc_integral_trapez)
+    var dn = F64_ONE;    # 2^-sc, the factor on each later sample
+    # ⛔ 3.3.4 — THE FIRST ADD WAS NOT COMPENSATED. The loop's Neumaier correction
+    # starts at 0 here, so the rounding of fa + fb was lost: f(0) = 2^53, f(1) = 1,
+    # else 0, on [0, 1] with 4 steps stored 0x4305555555555555, one ulp below the
+    # rule's value (2^53 + 1) / 12 = 0x4305555555555556. The correction now starts at
+    # that add's own error. Two finite endpoints whose sum overflows are halved first,
+    # as calc_integral_trapez halves them. With an infinite or NaN endpoint the
+    # correction stays 0, as before.
+    # [measured: repro and quadrature sweep; base tree, this tree; exact rational oracle; 2026-10-03; cycc 6.6.14]
+    if (spec == 0) {
+        if (f64_lt(f64_abs(sum), F64_POS_INF) == 0) {
+            sc = 1;
+            dn = F64_HALF;
+            fa = f64_mul(fa, F64_HALF);
+            fb = f64_mul(fb, F64_HALF);
+            sum = f64_add(fa, fb);
+        }
+        if (f64_lt(f64_abs(fa), f64_abs(fb)) == 0) {
+            comp = f64_add(f64_sub(fa, sum), fb);
+        } else {
+            comp = f64_add(f64_sub(fb, sum), fa);
+        }
+    }
 
     var i = 1;
     while (i < steps) {
         var xi = f64_add(a, f64_mul(f64_from(i), h));
         var fxi = fncall1(f, xi);
-        if (f64_lt(f64_abs(fxi), F64_POS_INF) == 0) { spec = spec | _calc_nonfinite_class(fxi); }
 
         # Odd indices get coefficient 4, even indices get 2
         var coeff = F64_TWO;
         if (i % 2 == 1) { coeff = _CALC_F64_FOUR; }
-        var val = f64_mul(coeff, fxi);
+        var fs = fxi;
+        if (sc != 0) { fs = f64_mul(fxi, dn); }
+        var val = f64_mul(coeff, fs);
 
         # Neumaier compensated add
         var t = f64_add(sum, val);
+        # A sum that is not finite has a non-finite sample in it, or overflowed. The
+        # first is classified for the true-sum rule below, as every non-finite sample
+        # was before; a finite sample reaches this test only when t is not finite, so
+        # testing t first moves no result. The second is calc_integral_trapez's
+        # overflow, halved the same way (2f and 4f can pass DBL_MAX alone, so up to
+        # three halvings).
+        if (f64_lt(f64_abs(t), F64_POS_INF) == 0) {
+            if (f64_lt(f64_abs(fxi), F64_POS_INF) == 0) {
+                spec = spec | _calc_nonfinite_class(fxi);
+            } else {
+                if (f64_lt(f64_abs(sum), F64_POS_INF) == 1) {
+                    while (f64_lt(f64_abs(t), F64_POS_INF) == 0) {
+                        sc = sc + 1;
+                        sum = f64_mul(sum, F64_HALF);
+                        comp = f64_mul(comp, F64_HALF);
+                        fs = f64_mul(fs, F64_HALF);
+                        val = f64_mul(coeff, fs);
+                        t = f64_add(sum, val);
+                    }
+                    dn = (1023 - sc) << 52;
+                }
+            }
+        }
         if (f64_lt(f64_abs(sum), f64_abs(val)) == 0) {
             comp = f64_add(comp, f64_add(f64_sub(sum, t), val));
         } else {
@@ -168,12 +264,14 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
     # replace the result; every other result is 3.3.2's `sum + comp`, bit for bit,
     # the NaN for both signs or a NaN sample included.
     # [measured: tests/edge_cases.tcyr, group "3.3.3 R3b: simpson with a non-finite sample"]
-    # ⚠ FINITE SAMPLES WHOSE SUM OVERFLOWS STAY NaN, AS ON 3.3.2. One weighted sample
-    # (2f or 4f) or a running partial sum can pass DBL_MAX while the exact sum is finite
-    # and of either sign: samples [0, 0x7FCFFFFFFFFFFFFF, 0xFFE3333333333333,
-    # 0x7FCFFFFFFFFFFFFF, 0] on [0, 1] with 4 steps integrate to about +1.2e307, and
-    # the plain running sum, which an earlier form of this repair returned for every
-    # non-finite sum, gave -Inf as Ok. NaN is the loud answer; overflow is not repaired.
+    # ⚠ FINITE SAMPLES WHOSE SUM OVERFLOWED STAYED NaN, AS ON 3.3.2, through 3.3.3. One
+    # weighted sample (2f or 4f) or a running partial sum can pass DBL_MAX while the
+    # exact sum is finite and of either sign: samples [0, 0x7FCFFFFFFFFFFFFF,
+    # 0xFFE3333333333333, 0x7FCFFFFFFFFFFFFF, 0] on [0, 1] with 4 steps integrate to
+    # about +1.2e307, and the plain running sum, which an earlier form of this repair
+    # returned for every non-finite sum, gave -Inf as Ok. 3.3.4 halves the sum as it
+    # overflows (the loop above), and that table stores its exact value,
+    # 0x7FB1111111111110; no finite table reaches this point with a non-finite sum.
     # [measured: tests/edge_cases.tcyr, group "3.3.3 R5calc: simpson, finite samples whose sum overflows"]
     # Over 60,000 random sample tables (N = 2..64; ordinary, near-overflow, non-finite
     # and smooth large integrands) the 51,235 with every sample finite store 3.3.2's
@@ -184,8 +282,115 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
     var total = f64_add(sum, comp);
     if (spec == 1) { total = F64_POS_INF; }
     if (spec == 2) { total = 0xFFF0000000000000; }    # -Infinity
+    if (spec == 0) {
+        store64(out, _calc_simpson_close(sum, comp, h, sc));
+        return Ok(0);
+    }
     store64(out, f64_div(f64_mul(total, h), _CALC_F64_THREE));
     return Ok(0);
+}
+
+# Internal: x * 2^k, in two steps, for |k| <= 2044. Exact when x * 2^(k/2) and the
+# result are normal or zero; used only to move a value into [1, 2) and its partner.
+fn _calc_scale2(x, k) {
+    var k1 = k / 2;
+    return f64_mul(f64_mul(x, (1023 + k1) << 52), (1023 + k - k1) << 52);
+}
+
+# Internal: (x + xl) * 2^k rounded once, for a normal x and xl the exact low part of a
+# rounded sum x (|xl| <= ulp(x) / 2). A normal result is x * 2^k exactly; past the
+# range it is +-Inf. A subnormal result rounds the pair on the integer grid of 2^-1074:
+# multiplying x alone by a power of two rounds a second time, and on that grid x can sit
+# exactly on a midpoint the true value is not on.
+fn _calc_round_pair(x, xl, k) {
+    var ex = ((x >> 52) & 0x7FF) - 1023;
+    if (ex + k > 1023) { return f64_mul(x, F64_POS_INF); }
+    if (ex + k >= 0 - 1022) { return _calc_scale2(x, k); }
+    var sh = 0 - (ex + k + 1022);                    # >= 1: bits of x below the grid
+    if (sh >= 54) { return f64_mul(x, 0); }          # under half of 2^-1074: +-0
+    var m = (x & 0x000FFFFFFFFFFFFF) | 0x0010000000000000;
+    var q = m >> sh;
+    var rm = m & ((1 << sh) - 1);
+    var half = 1 << (sh - 1);
+    if (rm > half) { q = q + 1; }
+    if (rm == half) {
+        if (f64_eq(xl, 0) == 1) {
+            if ((q & 1) == 1) { q = q + 1; }            # an exact tie: to even
+        } else {
+            if (f64_lt(xl, 0) == f64_lt(x, 0)) { q = q + 1; }   # past the midpoint
+        }
+    }
+    return (x & 0x8000000000000000) | q;
+}
+
+# Internal: calc_integral_simpson's closing step, (sum + comp) * 2^sc * h / 3, rounded
+# from the exact pair rather than from fl(sum + comp).
+#
+# ⛔ 3.3.4 — THE CORRECTION WAS ROUNDED AWAY BEFORE IT COULD ACT. `fl(sum + comp)` is
+# the compensated sum rounded once, and on the first-add repro above it is 2^53 again
+# (2^53 + 1 is a tie, and rounds to even), so starting the correction at the first
+# add's error moved no number by itself. The sum is now carried as the exact pair
+# hi + lo through the product with h and the division by 3, each with its rounding
+# error recovered (Dekker's split on values first moved into [1, 2), so the split
+# cannot overflow), and rounded once at the end. Every finite sum takes it: the old
+# fl(fl(total * h) / 3) rounds twice more. Of 20,000 finite sample tables (N = 2..64,
+# ordinary, cancelling, near-overflow, subnormal and smooth integrands, intervals
+# from 2^-1074 wide to 2^1000), the result is the rule's value correctly rounded on
+# 19,993, where 3.3.3 managed 11,878, and none is farther from it than 3.3.3's, save 5
+# whose exact value lies within 2^-172 ulp of a rounding midpoint: there a sample far
+# below the pair's precision decides the tie, and 3.3.3 sat half an ulp on one side,
+# this half an ulp on the other.
+# [measured: repro and 22,000-table quadrature sweep; base tree, this tree; exact rational oracle; 2026-10-03]
+fn _calc_simpson_close(sum, comp, h, sc) {
+    var hi = f64_add(sum, comp);
+    if (f64_lt(f64_abs(hi), F64_POS_INF) == 0) {     # both finite: halving makes it so
+        sum = f64_mul(sum, F64_HALF);
+        comp = f64_mul(comp, F64_HALF);
+        sc = sc + 1;
+        hi = f64_add(sum, comp);
+    }
+    var lo = 0;
+    if (f64_lt(f64_abs(sum), f64_abs(comp)) == 0) {
+        lo = f64_add(f64_sub(sum, hi), comp);
+    } else {
+        lo = f64_add(f64_sub(comp, hi), sum);
+    }
+    if (f64_eq(hi, 0) == 1 || f64_lt(f64_abs(h), F64_POS_INF) == 0 || f64_eq(h, 0) == 1) {
+        var r = f64_div(f64_mul(hi, h), _CALC_F64_THREE);
+        if (sc != 0) { r = f64_mul(r, (1023 + sc) << 52); }
+        return r;
+    }
+    # hi and h scaled by the powers of two that put a normal one in [1, 2): exact, and a
+    # subnormal one (exponent field 0, so scaled by 2^1023) lands in [2^-52, 1), which
+    # serves as well: the products and the split below stay normal.
+    var e1 = ((hi >> 52) & 0x7FF) - 1023;
+    hi = _calc_scale2(hi, 0 - e1);
+    lo = _calc_scale2(lo, 0 - e1);
+    var e2 = ((h >> 52) & 0x7FF) - 1023;
+    h = _calc_scale2(h, 0 - e2);
+    var k = sc + e1 + e2;
+    # p + plo = (hi + lo) * h: Dekker's product of hi and h, plus lo * h.
+    var p = f64_mul(hi, h);
+    var c1 = f64_mul(hi, _CALC_F64_SPLIT);
+    var a1 = f64_sub(c1, f64_sub(c1, hi));
+    var a2 = f64_sub(hi, a1);
+    var c2 = f64_mul(h, _CALC_F64_SPLIT);
+    var b1 = f64_sub(c2, f64_sub(c2, h));
+    var b2 = f64_sub(h, b1);
+    var perr = f64_add(f64_add(f64_add(f64_sub(f64_mul(a1, b1), p), f64_mul(a1, b2)), f64_mul(a2, b1)),
+      f64_mul(a2, b2));
+    var plo = f64_add(perr, f64_mul(lo, h));
+    # q = p / 3 and its exact remainder p - 3q (3 is its own high half).
+    var q = f64_div(p, _CALC_F64_THREE);
+    var c3 = f64_mul(q, _CALC_F64_SPLIT);
+    var q1 = f64_sub(c3, f64_sub(c3, q));
+    var q2 = f64_sub(q, q1);
+    var t3 = f64_mul(q, _CALC_F64_THREE);
+    var t3err = f64_add(f64_sub(f64_mul(q1, _CALC_F64_THREE), t3), f64_mul(q2, _CALC_F64_THREE));
+    var rem = f64_sub(f64_sub(p, t3), t3err);
+    var corr = f64_div(f64_add(rem, plo), _CALC_F64_THREE);
+    var r0 = f64_add(q, corr);
+    return _calc_round_pair(r0, f64_sub(corr, f64_sub(r0, q)), k);
 }
 
 # 5-point Gauss-Legendre quadrature over [a, b].

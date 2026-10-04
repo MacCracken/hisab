@@ -13,19 +13,93 @@
 var _GEO_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
 var _GEO_F64_POS_INF = F64_POS_INF;   # alias of error.cyr
 var _GEO_F64_FOUR    = 0x4010_0000_0000_0000;  # 4.0
-# EPSILON_F64 squared, for guards that test a SQUARED length. 2.10.1: the
-# degenerate-direction guard 2.10.0 added to geo_ray_sphere compared `d.d`
-# against EPSILON_F64 itself, which is an unsquared tolerance -- so it rejected
-# every direction shorter than 1e-6 as a miss, including ones whose hit is real,
-# finite and exactly representable. Same squared-vs-unsquared mistake 2.6.14
-# repaired in cx_div / cx_inv / cx_powf.
-var _GEO_F64_EPS_SQ  = 0x3AF3_57C2_99A8_8EA7;  # 1e-24
+# ⚠ 3.3.4 — `_GEO_F64_EPS_SQ` (1e-24, EPSILON_F64 squared) is GONE. 2.10.1 added
+# it for the two squared-length guards in _geo_sphere_roots and
+# geo_ray_capsule_branch, and 2.14.0 moved both onto `_GEO_F64_TINY` below; from
+# then on nothing in src/ read it, and its comment here still said guards did.
+# The degree audit (roadmap "Named hex thresholds") found no use to audit.
 # The smallest MAGNITUDE whose reciprocal is still finite (DBL_MIN). Anything at
 # or above this can be divided by; anything below it makes 1/x overflow. 2.10.2
 # uses it as the slab method's parallel test -- see geo_ray_aabb_face.
 var _GEO_F64_TINY    = F64_TINY;   # alias of error.cyr's F64_TINY (DBL_MIN)
 var _GEO_F64_THREE   = 0x4008_0000_0000_0000;  # 3.0
 var _GEO_F64_THIRD   = 0x3FD5_5555_5555_5555;  # 1.0/3.0
+
+# ================================================================
+# Power-of-two pre-scaling (3.3.4)
+# ================================================================
+# A unit normal, a direction, barycentric weights and the region of a closest
+# point do not change when every vector they are formed from is multiplied by
+# the same s > 0, but the products that form them are degree two (a cross
+# product, a dot product) or four (a Gram determinant) and flush or overflow
+# long before the inputs do. So those routines first multiply by a power of
+# two that brings the largest component near 1. A power of two changes only the
+# exponent: every product, sum and quotient after it is exactly s, s^2 or s^4
+# times the unscaled one, so wherever the unscaled arithmetic stayed in the
+# normal range the answer is bit-identical, and elsewhere it is the answer the
+# same shape gives at unit size. Roadmap [3.3.4] D037, D038, D087.
+
+# The largest |component| of v, as the bit pattern of a non-negative f64. With
+# the sign cleared, f64 order is integer order, and a NaN (0x7FF8...) sorts above
+# +Inf above every finite value, so one integer max finds all three.
+fn _geo_absmax_bits(v) {
+    var m = HVec3_x(v) & 0x7FFF_FFFF_FFFF_FFFF;
+    var y = HVec3_y(v) & 0x7FFF_FFFF_FFFF_FFFF;
+    var z = HVec3_z(v) & 0x7FFF_FFFF_FFFF_FFFF;
+    if (y > m) { m = y; }
+    if (z > m) { m = z; }
+    return m;
+}
+
+# 2^k for an integer k <= 1023, clamped below to the least normal exponent and built
+# as `(1023 + k) << 52`: never `1 << k`, which x86 masks silently from k = 64. Both
+# callers pass k in [-1023, 1023]; -1023 (a magnitude in the top binade) becomes
+# 2^-1022, which takes it to [2, 4) instead of [1, 2).
+fn _geo_pow2(k) {
+    if (k < 0 - 1022) { k = 0 - 1022; }
+    return (1023 + k) << 52;
+}
+
+# The power of two that takes a magnitude with biased exponent field `e` (the
+# bits above 52 of a non-negative f64) into [1, 4): 2^(1023 - e). A subnormal
+# (e = 0) gets 2^1023 and lands in [2^-51, 2); zero stays zero. For e = 2047, an
+# Inf or a NaN, it is 1.0, so a non-finite input meets the unscaled arithmetic.
+fn _geo_scale_for(e) {
+    if (e == 2047) { return F64_ONE; }
+    return _geo_pow2(1023 - e);
+}
+
+# v / |v| at any magnitude, or `fallback` for the zero vector. The scaled copy's
+# largest component is in [1, 4), or in [2^-51, 2) when all three are subnormal, so
+# its length is normal and well inside the range, its reciprocal finite and normal,
+# and a subnormal or overflowing |v| never meets `1 / |v|`. A NaN or infinite
+# component leaves v unscaled and takes the shipped arithmetic: NaN in, NaN out.
+fn _geo_unit_or(v, fallback) {
+    var w = hvec3_scale(v, _geo_scale_for(_geo_absmax_bits(v) >> 52));
+    var len = hvec3_length(w);
+    if (f64_eq(len, 0) == 1) { return fallback; }
+    return hvec3_scale(w, f64_div(F64_ONE, len));
+}
+
+# 1 when the largest |component| of the four vectors is in the top binade, 2^1023 to
+# DBL_MAX: every component is then finite (a NaN or an Inf has exponent field 2047)
+# and the difference of two of them can overflow, so the caller halves all four
+# first. Halving is exact there but for a subnormal component's last bit, which is
+# below 2^-2097 of the largest. Where two large coordinates cancel exactly, that bit
+# can be the whole difference: it is then halved to 0 and the caller's degenerate
+# fallback answers (the segment (2^1023, 2^-1074, 0) -> (2^1023, 0, 0) gives unit_x,
+# not (0, -1, 0)), as on 3.3.3. 0 otherwise, and the caller's arithmetic is unchanged.
+fn _geo_top_binade(a, b, c, d) {
+    var m = _geo_absmax_bits(a);
+    var t = _geo_absmax_bits(b);
+    if (t > m) { m = t; }
+    t = _geo_absmax_bits(c);
+    if (t > m) { m = t; }
+    t = _geo_absmax_bits(d);
+    if (t > m) { m = t; }
+    if ((m >> 52) == 2046) { return 1; }
+    return 0;
+}
 
 # ================================================================
 # Primitives
@@ -162,7 +236,16 @@ public fn geo_triangle_normal(tri) {
 # why the exact-zero test was not enough on its own.
 # [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
 public fn geo_triangle_unit_normal(tri) {
-    var n = geo_triangle_normal(tri);
+    var v0 = GeoTriangle_v0(tri);
+    var v1 = GeoTriangle_v1(tri);
+    var v2 = GeoTriangle_v2(tri);
+    if (_geo_top_binade(v0, v1, v2, v0) == 1) {
+        v0 = hvec3_scale(v0, F64_HALF);
+        v1 = hvec3_scale(v1, F64_HALF);
+        v2 = hvec3_scale(v2, F64_HALF);
+    }
+    var e1 = hvec3_sub(v1, v0);
+    var e2 = hvec3_sub(v2, v0);
     # ⛔ 2.10.2 MOVED THIS THRESHOLD AND LEFT THE EXPONENT WRONG. `len_sq` is a
     # cross product SQUARED — degree FOUR in the caller's units — and DBL_MIN is
     # the threshold for a degree-ONE quantity, so the guard still fired 77 decades
@@ -230,11 +313,38 @@ public fn geo_triangle_unit_normal(tri) {
     # D037). The 2.17.0 note above that legs at 2^512 "give +Inf" is the right
     # triangle's case, whose (0, 0, Inf) cross product has no `Inf - Inf`.
     # [measured: R4geo unit-normal binade sweep, 3.3.2 and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
-    var len = hvec3_length(n);
-    if (f64_eq(len, 0) == 1) { return hvec3_unit_y(); }
-    var inv = f64_div(F64_ONE, len);
-    if (f64_eq(inv, F64_POS_INF) == 1) { return hvec3_unit_y(); }
-    return hvec3_scale(n, inv);
+    #
+    # ⛔ 3.3.4 — THE EDGES ARE PRE-SCALED, SO `hvec3_cross` IS NO LONGER THE FLOOR
+    # (roadmap D037). Both edges are multiplied by the power of two that brings the
+    # larger's largest component into [1, 2) (see "Power-of-two pre-scaling" at the
+    # top), the cross product is formed there, and `_geo_unit_or` normalises it the
+    # same way, so a cross product that is subnormal relative to its own edges (a
+    # thin triangle) is not a reciprocal overflow either. The answer is the one the
+    # same triangle gives at unit size, bit for bit, except where top-binade vertices
+    # cancel to a subnormal last bit (_geo_top_binade). The right triangle with legs
+    # 2^e is right for every e in [-1074, 1023] (3.3.3: 378 wrong of the 1401 legs
+    # 2^-700 to 2^700, unit_y at or below 2^-512 and NaN from 2^512; 1075 of 2098 on
+    # the full range). 24 random triangles at every scale 2^e: 25731 wrong of 50304
+    # before, none now. Vertices more than DBL_MAX apart make b - a itself Inf, so
+    # when any coordinate is in the top binade every vertex is halved first
+    # (_geo_top_binade); 20000 triangles with coordinates up to DBL_MAX: none right
+    # before, 19878 now, and the 122 others within sin 0.13 of colinear. In
+    # 27395 mixed configurations (translated, thin, near-colinear) no answer within
+    # 4 * 2^-53 of the exact unit normal of the rounded edges left that band, and
+    # 6432 entered it. 1024 of the 24-triangle answers and 331 mixed ones are further
+    # from the exact value than 3.3.3's, at most 3.4 * 2^-53, where 3.3.3's length
+    # took `_hvec3_len_scaled`; each is the unit-size answer.
+    # [measured: georay triangle sweeps, exact oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
+    # The 3.3.3 binade sweep above, repeated (64 random triangles per binade, e in
+    # [400, 1023]): 39861 of 39936 right, against 7184 (32736 NaN). The 75 others are
+    # within sin 0.17 of colinear, wrong by the cross product's cancellation, and
+    # bit-identical to 3.3.3's answer for the same triangle at unit size.
+    # [measured: georay unit-normal binade sweep, exact oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
+    var m = _geo_absmax_bits(e1);
+    var m2 = _geo_absmax_bits(e2);
+    if (m2 > m) { m = m2; }
+    var s = _geo_scale_for(m >> 52);
+    return _geo_unit_or(hvec3_cross(hvec3_scale(e1, s), hvec3_scale(e2, s)), hvec3_unit_y());
 }
 
 public fn geo_triangle_area(tri) {
@@ -286,7 +396,13 @@ public fn geo_segment_midpoint(seg) {
 # 2.10.2: squared length against an unsquared tolerance -- see
 # geo_triangle_unit_normal. A segment shorter than 1e-6 got a fabricated unit_x.
 public fn geo_segment_direction(seg) {
-    var d = hvec3_sub(GeoSegment_end(seg), GeoSegment_start(seg));
+    var p0 = GeoSegment_start(seg);
+    var p1 = GeoSegment_end(seg);
+    if (_geo_top_binade(p0, p1, p0, p1) == 1) {
+        p0 = hvec3_scale(p0, F64_HALF);
+        p1 = hvec3_scale(p1, F64_HALF);
+    }
+    var d = hvec3_sub(p1, p0);
     # ⛔ Same shape as geo_triangle_unit_normal above: a SQUARED length against a
     # threshold meant for an unsquared one, so a valid short segment still got a
     # fabricated unit_x. `1 / sqrt(len_sq)` fails only at an exact zero.
@@ -305,11 +421,27 @@ public fn geo_segment_direction(seg) {
     # The test is now an exact zero, and a NaN direction is NaN in every component,
     # as `hvec3_normalize(end - start)` is. See geo_triangle_unit_normal.
     # [measured: G6 scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
-    var len = hvec3_length(d);
-    if (f64_eq(len, 0) == 1) { return hvec3_unit_x(); }
-    var inv = f64_div(F64_ONE, len);
-    if (f64_eq(inv, F64_POS_INF) == 1) { return hvec3_unit_x(); }
-    return hvec3_scale(d, inv);
+    # ⛔ 3.3.4 — `1 / len` OVERFLOWS FOR A SUBNORMAL LENGTH, SO THE SECOND unit_x
+    # FALLBACK WAS STILL A FABRICATION (roadmap D087). Below about 2^-1024 the
+    # reciprocal is +Inf and every such segment got unit_x. `_geo_unit_or` scales d
+    # by a power of two first, exactly, so the length it divides by is normal and the
+    # fallback is left for the zero segment, and for ends in the top binade that
+    # differ only in a subnormal last bit, which the halving below drops
+    # (_geo_top_binade). On the integer grid
+    # (i, j, l) * 2^-1074, |i|, |j| <= 6, l in {0, 1, 3}, 500 of 506 directions were
+    # wrong and none is now; over 83513 segments in all (30 directions at every
+    # 2^e, and 20000 mixed ends) 2361 moved into 4 * 2^-53 of the exact direction
+    # and none left it.
+    # ⚠ NOT DIRECT DIVISION BY `len`. A subnormal `len` is itself rounded to the
+    # subnormal grid: (-6, -6, 0) * 2^-1074 has a length of 8 * 2^-1074 there, and
+    # d / len gives (-0.75, -0.75, 0), a vector of length 1.06. That route was wrong
+    # for 452 of the 506 grid directions and 2134 of the 83513.
+    # [measured: georay segment sweep, exact oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
+    # Ends more than DBL_MAX apart overflow end - start itself, so with a coordinate
+    # in the top binade both ends are halved first (_geo_top_binade). 20000 segments
+    # with coordinates up to DBL_MAX: 14443 right before, all 20000 now.
+    # [measured: georay top-binade segment sweep, exact oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
+    return _geo_unit_or(d, hvec3_unit_x());
 }
 
 # 2.10.2, and this one is LOAD-BEARING beyond itself: geo_segment_distance_to_point
@@ -367,38 +499,57 @@ public fn geo_segment_distance_to_point(seg, point) {
 # FACE ENCODING: 2 * axis + plane, where axis is 0/1/2 for x/y/z (for the OBB,
 # its own local axis 0/1/2) and plane is 0 for the min side, 1 for the max side.
 # GEO_FACE_NONE (-1) means no face was selected.
-# ⛔ 3.3.3 — NEITHER THE SLOT NOR t SAYS ON ITS OWN THAT A NaN WAS INVOLVED. Every
-# pairing occurs, on 3.3.2 as on 3.3.3 unless marked:
-#   * GEO_FACE_NONE with the miss 0.
-#   * GEO_FACE_NONE with a NaN t: either slab routine, at the unit box, for a ray
-#     along +x with a NaN x origin, a NaN x direction or NaN in every component;
-#     geo_ray_obb_face also for the NaN origins in the two cases below (each local
-#     axis reads every origin component); since 3.3.3 geo_ray_capsule_branch for a
-#     NaN capsule axis.
-#   * GEO_FACE_NONE with a FINITE t a NaN was laundered into (roadmap [3.3.4]
-#     D034): geo_ray_aabb_face, unit box, ray from (NaN, 0.5, -4.5) along
-#     (1, 0, 1)/sqrt2, returns 4.5 * sqrt2, the z slab's entry, as geo_ray_aabb does.
-#     Since 3.3.3 a box from geo_aabb_new with a NaN corner reaches it too, its NaN
-#     slab erased by the next slab's f64_max: geo_aabb_new((NaN,0,0), (1,1,1)) and a
-#     ray from (-50, 0.5, -5) along (1, 0, 1)/sqrt2 return 5 * sqrt2, a hit point at
-#     x = -45, where 3.3.2 (which dropped the NaN corner) returned the miss.
-#   * A REAL face with a NaN t, when the NaN enters on a later slab after an earlier
-#     one set the face (f64_max hands the NaN on and the face stays): unit box, ray
-#     from (-5, 0.5, NaN) along (1, 0, 1)/sqrt2, face 0; the unit OBB with a NaN z
-#     half-extent on the same ray from (-5, 0.5, -5), face 0. The capsule tags a
-#     NaN radius or ray origin GEO_CAP_END_CAP.
-#   * A REAL face with a laundered finite t (D034), geo_ray_aabb_face only: a NaN x
-#     origin on a ray along +z returns the clean ray's t = 5 and face 4, where
-#     geo_ray_obb_face returns NaN and GEO_FACE_NONE. Since 3.3.3 a geo_aabb_new box
-#     with a NaN corner reaches it through the parallel-slab tests, both false
-#     against a NaN bound: geo_aabb_new((0,NaN,0), (1,1,1)) and a ray along +x from
-#     (-5, 0.5, 0.5), or from (-5, 5, 0.5), return t = 5, face 0, and a hit jet,
-#     where 3.3.2 returned the miss.
-# So test t for NaN and the slot for a face; neither stands in for the other. The
-# jets in src/geo_diff.cyr answer their miss for GEO_FACE_NONE and, since 3.3.3, for
-# every t that is not finite; a laundered finite t with a real face still builds a
-# hit jet (D034).
-# [measured: R5geo probes, 3.3.2, 3.3.3-base and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
+# ⛔ 3.3.4 — A NaN NO LONGER COMES BACK AS A NUMBER (roadmap D034). Through 3.3.3
+# f64_max / f64_min erased a NaN slab whenever a later slab won, and a parallel
+# slab's two tests, both false against a NaN, skipped it: a NaN input came back as
+# a finite t (with a real face or GEO_FACE_NONE), as the miss 0, or as a NaN t
+# that kept an earlier slab's real face. CHANGELOG 3.3.3 lists each pairing. Now a
+# NaN anywhere in the ray, the box or the OBB (rotation included) returns a NaN t
+# with GEO_FACE_NONE and no tie, as geo_ray_sphere, _plane and _capsule do:
+#   * a slab whose arithmetic forms a NaN returns the first NaN among the inputs
+#     (_geo_ray_aabb_nan_or_miss, _geo_ray_obb_nan). `t_min < t_max` replaces the
+#     `t_min > t_max` miss test: one compare on the hit path, as before, and only
+#     when it fails are the miss, the tie and the NaN told apart;
+#   * a parallel slab tests its own inputs for NaN, after its two miss tests;
+#   * a miss found before the last slab has read every input returns the first
+#     NaN among them instead, if there is one (_geo_ray_aabb_nan_or_miss; for the
+#     OBB only the half-extents, because local axis 0 reads every other input);
+#   * so for NaN input a real face comes back only with a finite t, and the
+#     pairings are GEO_FACE_NONE with the miss 0, GEO_FACE_NONE with a NaN t, and a
+#     face with a finite t. The jets in src/geo_diff.cyr answer their miss for the
+#     first two. A NaN made from input with none is another matter (below).
+# Over 2500 random rays and boxes per routine, aimed and not, a third along an
+# axis, with a NaN put in each input slot in turn: geo_ray_aabb_face returned a
+# finite t > 0 for 11621 of 30000 (9477 with a real face), the miss 0 for 13123
+# and a NaN t with a real face for 4163; geo_ray_obb_face (16 slots) a finite
+# t > 0 for 3473 of 40000 and the miss for 2475. All 70000 are NaN with
+# GEO_FACE_NONE, no tie and the miss jet now. The 2500 clean inputs per routine,
+# and 14400 AABB inputs with one infinite slot, are bit-identical in t, face, tie
+# and jet; for the half-extent signs see geo_ray_obb_face.
+# [measured: georay slab sweep, 3.3.3 geo.cyr vs repaired, 3.3.4 tree, not in-tree, 2026-10-03; cycc 6.6.14]
+# ⚠ ONLY A NaN THE CALLER SUPPLIED IS RETURNED. The arithmetic also makes NaN from
+# input with none: Inf - Inf where an infinite origin meets an infinite bound of the
+# same sign, and in the OBB's frame 0 * Inf where an axis's exact zero component
+# meets an infinite component of the ray or of c - o, which overflows for finite
+# ends more than DBL_MAX apart. Such a slab finds no NaN among the inputs and goes
+# on as in 3.3.3, so that NaN can still leave as t with an earlier slab's real face
+# (tests/modules.tcyr pins one per routine), and the jets' own t test answers their
+# miss for it. Returning it instead, as the first draft of D034 did, turned 1377 of
+# 6000 finite OBB inputs with an overflowing c - o (all but 4 geometric misses) and
+# 473 of 4000 AABB inputs with two infinite slots into NaN.
+# [measured: D034 review sweep, 3.3.3 geo.cyr vs 3.3.4 drafts, not in-tree, 2026-10-03; cycc 6.6.14]
+# Inputs with no NaN keep 3.3.3's bits but for the OBB's half-extent signs
+# (geo_ray_obb_face) and an inverted AABB (AN INVERTED BOX, below): over 14235 AABB
+# and 20200 OBB inputs (finite, near DBL_MAX, one or two infinite slots, +-0,
+# subnormal), t, face, tie, jet and the plain entry match 3.3.3 in all but 10 OBB
+# inputs, each with a negative half-extent. 28000 NaN inputs (four payloads, one per
+# slot) are each a NaN t, GEO_FACE_NONE, no tie, the miss jet and a NaN plain t.
+# [measured: slab differential, 3.3.4-base bundle vs this tree, not in-tree, 2026-10-03; cycc 6.6.14]
+# The siblings differ already: from (0, Inf, 1.5) and from (-Inf, 0.5, 0.5) along +x,
+# geo_ray_sphere and _capsule answer NaN, geo_ray_plane NaN and +Inf, geo_ray_aabb
+# and _triangle the miss. The family's non-finite contract is the open roadmap row
+# "Collision siblings disagree on partly-NaN and infinite shapes", not decided here.
+# [measured: georay infinite-origin probe, 3.3.4 tree before this change, not in-tree, 2026-10-03; cycc 6.6.14]
 #
 # OUT BLOCK: 16 bytes, two i64 slots.
 #   out[0] = the face index above
@@ -454,6 +605,12 @@ public var GEO_CAP_SPHERE    = 3;    # degenerate capsule: start == end, a plain
 # OBB ray did); one test alone changes no t, because the other still returns the
 # NaN. tests/abuse.tcyr pins all three pairs.
 # [measured: W1 ray sweep on the 3.3.2 and 3.3.3 bundles, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+# ⚠ 3.3.4 — D034 is repaired (see FACE ENCODING above), and no NaN INPUT reaches the
+# two slab routines' tails any more: the slab that reads it returns it. A NaN made
+# from input with none (Inf - Inf, 0 * Inf) still does, as in 3.3.3, and their
+# NaN-true tail pairs carry it out: respelled NaN-false, either pair turns it into
+# the miss 0 (tests/modules.tcyr pins both). geo_ray_sphere's pair still carries a
+# NaN input.
 # THE INFINITY TEST, written inline at its four use sites rather than as a
 # function:
 #
@@ -480,8 +637,8 @@ public fn geo_face_is_max(face) {
 # so a ray whose origin lies exactly in the plane is reported as a miss. That
 # collision is the module convention (file header, ray-section header, every
 # sibling), not an oversight: callers who must distinguish an origin-on-surface
-# hit use the dedicated boolean predicate idiom, as `_bvh_ray_hits_aabb` does for
-# AABBs.
+# hit use the dedicated predicate idiom (0 miss, 1 hit, 2 cannot tell), as
+# `_bvh_ray_hits_aabb` does for AABBs.
 #
 # WHICH zero comes back depends on the sign of `denom`, because t is 0 / denom:
 # denom < 0 gives -0.0 (0x8000000000000000) and denom > 0 gives +0.0 (0), which is
@@ -555,7 +712,7 @@ fn _geo_sphere_roots(ray, sphere, out) {
     # Asserted by _homog_sweep / _HG_BAD in tests/modules.tcyr, oracle-free.
     var a = hvec3_dot(d, d);
     # Reject only a genuinely zero-length direction. `a` is d.d, a SQUARED
-    # length, so the threshold is EPSILON_F64 SQUARED -- see _GEO_F64_EPS_SQ.
+    # length, so the threshold was EPSILON_F64 SQUARED (`_GEO_F64_EPS_SQ`, gone in 3.3.4).
     # Testing it against EPSILON_F64 directly (2.10.0) made every |d| < 1e-6 a
     # miss, breaking the degree -1 homogeneity this same repair established:
     # a unit sphere at (0,0,5) with d = (0,0,1e-7) has t = 4e7, and it returned 0.
@@ -660,6 +817,68 @@ public fn geo_ray_sphere(ray, sphere) {
 # so the mutant is not equivalent once a NaN is in play. tests/abuse.tcyr pins
 # each axis with a NaN direction from outside that axis's slab.
 # [measured: W1 ray sweep, one test swapped at a time, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+# ⚠ 3.3.4 — FOR A NaN INPUT ONLY AXIS 0's SPELLING MATTERS. f0 = a0 . d reads every
+# direction component (0 * NaN is NaN), so a NaN direction meets axis 0 first, and
+# since D034 that slab returns it: swapped on axis 1 or 2 alone the test is
+# equivalent for NaN input, and the suites pass. Swapped on axis 0 it still sends
+# the NaN to the parallel branch, whose miss tests read only e0 and he0, and the pin
+# from outside the x slab comes back 0.
+# [measured: georay mutation run, one test swapped at a time, 3.3.4 tree, not in-tree, 2026-10-03; cycc 6.6.14]
+#
+# ⛔ 3.3.4 — AN INVERTED BOX IS READ SORTED, AS geo_ray_obb READS |he|. Only the
+# setters build one (min above max on an axis; geo_aabb_new sorts its corners). A
+# slab the ray crosses has always sorted its two t, so it read the slab [5, 1] as
+# [1, 5], while the parallel test read the same slab as empty: an oblique ray hit
+# the box and an axial one missed it. Each parallel miss test now also asks that the
+# origin be outside the OTHER bound, so the slab misses only below both bounds or
+# above both. For min <= max the second test is implied by the first, and for a NaN
+# bound it is false, so it changes no answer there and only the miss path runs it.
+# The t is the sorted box's; a face names the stored slot (face 0 is the plane at
+# min.x wherever it lies), which is the plane geo_jet_aabb differentiates. Over 19803
+# random boxes with one to three axes inverted (a third with a +-0, subnormal, DBL_MAX
+# or infinite slot), t matches the sorted box's in all but 5, each a zero of the other
+# sign from an infinite direction component, and the tie, the jet and the BVH leaf
+# test in all; boxes that are not inverted keep their bits (FACE ENCODING, above).
+# [measured: inverted-AABB differential, this tree, not in-tree, 2026-10-03; cycc 6.6.14]
+#
+# 3.3.4, D034 (see FACE ENCODING): the first NaN component of v, or 0 (+0.0) when
+# it has none. A NaN's bits are never 0, so `== 0` reads "no NaN".
+fn _geo_hvec3_nan(v) {
+    if (f64_eq(HVec3_x(v), HVec3_x(v)) == 0) { return HVec3_x(v); }
+    if (f64_eq(HVec3_y(v), HVec3_y(v)) == 0) { return HVec3_y(v); }
+    if (f64_eq(HVec3_z(v), HVec3_z(v)) == 0) { return HVec3_z(v); }
+    return 0;
+}
+
+# The miss 0, or the first NaN among the ray's and the box's twelve inputs. Every
+# miss geo_ray_aabb_face finds before its last slab has read its inputs returns
+# this: a parallel slab's two tests fire before its own NaN tests, and a slab
+# later than the one that missed is never read.
+fn _geo_ray_aabb_nan_or_miss(ray, aabb) {
+    var n = _geo_hvec3_nan(GeoRay_origin(ray));
+    if (n == 0) { n = _geo_hvec3_nan(GeoRay_direction(ray)); }
+    if (n == 0) { n = _geo_hvec3_nan(GeoAabb_min(aabb)); }
+    if (n == 0) { n = _geo_hvec3_nan(GeoAabb_max(aabb)); }
+    return n;
+}
+
+# The first NaN among the ray's and the OBB's sixteen inputs, or 0. A NaN slab in
+# geo_ray_obb_face can come from FINITE input too: an axis's exact zero component
+# times a centre-to-origin offset that overflowed (0 * Inf). Only a NaN the caller
+# supplied is returned; one the arithmetic made is left to the slab test as in 3.3.3.
+fn _geo_ray_obb_nan(ray, obb) {
+    var n = _geo_hvec3_nan(GeoRay_origin(ray));
+    if (n == 0) { n = _geo_hvec3_nan(GeoRay_direction(ray)); }
+    if (n == 0) { n = _geo_hvec3_nan(GeoObb_center(obb)); }
+    if (n == 0) { n = _geo_hvec3_nan(GeoObb_half_extents(obb)); }
+    var q = GeoObb_rotation(obb);
+    if (n == 0) { if (f64_eq(HQuat_x(q), HQuat_x(q)) == 0) { n = HQuat_x(q); } }
+    if (n == 0) { if (f64_eq(HQuat_y(q), HQuat_y(q)) == 0) { n = HQuat_y(q); } }
+    if (n == 0) { if (f64_eq(HQuat_z(q), HQuat_z(q)) == 0) { n = HQuat_z(q); } }
+    if (n == 0) { if (f64_eq(HQuat_w(q), HQuat_w(q)) == 0) { n = HQuat_w(q); } }
+    return n;
+}
+
 public fn geo_ray_aabb_face(ray, aabb, out) {
     var ox = HVec3_x(GeoRay_origin(ray));
     var oy = HVec3_y(GeoRay_origin(ray));
@@ -688,8 +907,19 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
 
     # X slab
     if (f64_lt(f64_abs(dx), _GEO_F64_TINY) == 1) {
-        if (f64_lt(ox, bmin_x) == 1) { return 0; }
-        if (f64_gt(ox, bmax_x) == 1) { return 0; }
+        # Parallel: the miss tests are false for a NaN, so the slab's own inputs
+        # are tested after them (D034, header). Each reads the slab SORTED: below
+        # both bounds, or above both (AN INVERTED BOX, above). For min <= max
+        # the inner test is implied by the outer, and for a NaN bound it is false.
+        if (f64_lt(ox, bmin_x) == 1) {
+            if (f64_ge(ox, bmax_x) == 0) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
+        }
+        if (f64_gt(ox, bmax_x) == 1) {
+            if (f64_le(ox, bmin_x) == 0) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
+        }
+        if (f64_eq(ox, ox) == 0) { return ox; }
+        if (f64_eq(bmin_x, bmin_x) == 0) { return bmin_x; }
+        if (f64_eq(bmax_x, bmax_x) == 0) { return bmax_x; }
     } else {
         var inv_d = f64_div(F64_ONE, dx);
         var t1 = f64_mul(f64_sub(bmin_x, ox), inv_d);
@@ -720,13 +950,29 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
         slabs = slabs + 1;
-        if (f64_gt(t_min, t_max) == 1) { return 0; }
+        # NaN-true: t_min < t_max fails for the miss, for the tie (which falls
+        # through) and for a NaN this slab read, which leaves as t (D034, header).
+        # On the first slab the miss arm cannot fire: t1 <= t2 after the swap.
+        if (f64_lt(t_min, t_max) == 0) {
+            if (f64_gt(t_min, t_max) == 1) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
+            if (f64_eq(t_min, t_max) == 0) {
+                var nn = _geo_ray_aabb_nan_or_miss(ray, aabb);
+                if (nn != 0) { return nn; }
+            }
+        }
     }
 
     # Y slab
     if (f64_lt(f64_abs(dy), _GEO_F64_TINY) == 1) {
-        if (f64_lt(oy, bmin_y) == 1) { return 0; }
-        if (f64_gt(oy, bmax_y) == 1) { return 0; }
+        if (f64_lt(oy, bmin_y) == 1) {
+            if (f64_ge(oy, bmax_y) == 0) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
+        }
+        if (f64_gt(oy, bmax_y) == 1) {
+            if (f64_le(oy, bmin_y) == 0) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
+        }
+        if (f64_eq(oy, oy) == 0) { return oy; }
+        if (f64_eq(bmin_y, bmin_y) == 0) { return bmin_y; }
+        if (f64_eq(bmax_y, bmax_y) == 0) { return bmax_y; }
     } else {
         var inv_d = f64_div(F64_ONE, dy);
         var t1 = f64_mul(f64_sub(bmin_y, oy), inv_d);
@@ -757,13 +1003,26 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
         slabs = slabs + 1;
-        if (f64_gt(t_min, t_max) == 1) { return 0; }
+        if (f64_lt(t_min, t_max) == 0) {
+            if (f64_gt(t_min, t_max) == 1) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
+            if (f64_eq(t_min, t_max) == 0) {
+                var nn = _geo_ray_aabb_nan_or_miss(ray, aabb);
+                if (nn != 0) { return nn; }
+            }
+        }
     }
 
     # Z slab
     if (f64_lt(f64_abs(dz), _GEO_F64_TINY) == 1) {
-        if (f64_lt(oz, bmin_z) == 1) { return 0; }
-        if (f64_gt(oz, bmax_z) == 1) { return 0; }
+        if (f64_lt(oz, bmin_z) == 1) {
+            if (f64_ge(oz, bmax_z) == 0) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
+        }
+        if (f64_gt(oz, bmax_z) == 1) {
+            if (f64_le(oz, bmin_z) == 0) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
+        }
+        if (f64_eq(oz, oz) == 0) { return oz; }
+        if (f64_eq(bmin_z, bmin_z) == 0) { return bmin_z; }
+        if (f64_eq(bmax_z, bmax_z) == 0) { return bmax_z; }
     } else {
         var inv_d = f64_div(F64_ONE, dz);
         var t1 = f64_mul(f64_sub(bmin_z, oz), inv_d);
@@ -794,7 +1053,13 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
         slabs = slabs + 1;
-        if (f64_gt(t_min, t_max) == 1) { return 0; }
+        if (f64_lt(t_min, t_max) == 0) {
+            if (f64_gt(t_min, t_max) == 1) { return 0; }
+            if (f64_eq(t_min, t_max) == 0) {
+                var nn = _geo_ray_aabb_nan_or_miss(ray, aabb);
+                if (nn != 0) { return nn; }
+            }
+        }
     }
 
     # See the header: every slab parallel means nothing narrowed the interval and
@@ -899,6 +1164,28 @@ public fn geo_ray_triangle(ray, tri) {
 # module contract says 0. See the geo_ray_aabb header for why the guard counts
 # contributing slabs instead of testing |d| up front.
 # [measured: tests/modules.tcyr "2.10.1 degenerate-direction contract"]
+#
+# ⛔ 3.3.4 — A NEGATIVE HALF-EXTENT IS ITS MAGNITUDE, ON EVERY RAY (roadmap D035).
+# A slab the ray crosses solves a.(p - c) = -he and = +he and sorts the two t, so
+# it has always read he = -1 as the slab |he| = 1, while the parallel branch tested
+# -e - he > 0 and -e + he < 0 and read the same box as EMPTY: one OBB was solid to
+# an oblique ray and missed by an axial one. The parallel branch now takes |he| as
+# well. That is the reading the crossing slabs, the face labels and the jet already
+# give a signed he (face 0 is the plane a.(p - c) = -he, and dt/dhe = sign/f_k
+# differentiates exactly that plane), so only the axial rays move, and they move to
+# what an oblique ray already answered. The alternative, a negative extent as an
+# empty box, needed a test on every crossing slab of every ray. Over 2500 random
+# OBBs and rays, each with the seven sign patterns of he, t matches the |he| box in
+# 17500 of 17500 (1040 moved, every one an axial ray from the miss to the |he|
+# box's t); on the 1031 identity rotations an exact rational slab oracle of the
+# |he| box agrees with 7210 of 7217 answers, the 7 being one configuration that
+# 3.3.3 already answered 11 ulp off with he > 0, against 6174 before.
+# [measured: georay slab sweep and rational oracle, 3.3.3 geo.cyr vs repaired, not in-tree, 2026-10-03; cycc 6.6.14]
+# geo_ray_aabb_face split the same way on a box INVERTED through the setters (min
+# above max): min (1,1,1), max (0,0,0) answered 4.5 * sqrt3 to the ray from
+# (-4.5,-4.5,-4.5) along (1,1,1)/sqrt3 and the miss to (-5,0.5,0.5) along +x. It now
+# reads such a box sorted, as this reads |he| (see "AN INVERTED BOX" above it).
+# [measured: georay inverted-AABB probe, 3.3.4 tree, not in-tree, 2026-10-03; cycc 6.6.14]
 public fn geo_ray_obb_face(ray, obb, out) {
     var d = hvec3_sub(GeoObb_center(obb), GeoRay_origin(ray));
     var axes = geo_obb_axes(obb);
@@ -949,13 +1236,31 @@ public fn geo_ray_obb_face(ray, obb, out) {
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
         slabs = slabs + 1;
-        if (f64_gt(t_min, t_max) == 1) { return 0; }
+        # As in geo_ray_aabb_face. A miss before axis 2 can only have skipped a NaN
+        # in a later half-extent: e0 and f0 read every origin, centre, direction and
+        # rotation component (0 * NaN is NaN), so those are NaN here already. For the
+        # same reason each parallel e test below is masked by the others for a NaN
+        # INPUT (only all three together are not, at a zero direction). A NaN e1 or
+        # e2 made from infinite input (0 * Inf) has no NaN to find and falls through.
+        if (f64_lt(t_min, t_max) == 0) {
+            if (f64_gt(t_min, t_max) == 1) { return _geo_hvec3_nan(he); }
+            if (f64_eq(t_min, t_max) == 0) {
+                var nn = _geo_ray_obb_nan(ray, obb);
+                if (nn != 0) { return nn; }
+            }
+        }
     } else {
         # Ray parallel to slab -- check if origin is outside
-        # Rust: (-e - he) > 0 || (-e + he) < 0
+        # Rust: (-e - he) > 0 || (-e + he) < 0, with |he| since 3.3.4 (D035, header)
         var neg_e0 = f64_neg(e0);
-        if (f64_gt(f64_sub(neg_e0, he0), 0) == 1) { return 0; }
-        if (f64_lt(f64_add(neg_e0, he0), 0) == 1) { return 0; }
+        var ahe0 = f64_abs(he0);
+        if (f64_gt(f64_sub(neg_e0, ahe0), 0) == 1) { return _geo_hvec3_nan(he); }
+        if (f64_lt(f64_add(neg_e0, ahe0), 0) == 1) { return _geo_hvec3_nan(he); }
+        if (f64_eq(e0, e0) == 0) {
+            var ne0 = _geo_ray_obb_nan(ray, obb);
+            if (ne0 != 0) { return ne0; }
+        }
+        if (f64_eq(he0, he0) == 0) { return he0; }
     }
 
     # Axis 1
@@ -991,11 +1296,23 @@ public fn geo_ray_obb_face(ray, obb, out) {
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
         slabs = slabs + 1;
-        if (f64_gt(t_min, t_max) == 1) { return 0; }
+        if (f64_lt(t_min, t_max) == 0) {
+            if (f64_gt(t_min, t_max) == 1) { return _geo_hvec3_nan(he); }
+            if (f64_eq(t_min, t_max) == 0) {
+                var nn = _geo_ray_obb_nan(ray, obb);
+                if (nn != 0) { return nn; }
+            }
+        }
     } else {
         var neg_e1 = f64_neg(e1);
-        if (f64_gt(f64_sub(neg_e1, he1), 0) == 1) { return 0; }
-        if (f64_lt(f64_add(neg_e1, he1), 0) == 1) { return 0; }
+        var ahe1 = f64_abs(he1);
+        if (f64_gt(f64_sub(neg_e1, ahe1), 0) == 1) { return _geo_hvec3_nan(he); }
+        if (f64_lt(f64_add(neg_e1, ahe1), 0) == 1) { return _geo_hvec3_nan(he); }
+        if (f64_eq(e1, e1) == 0) {
+            var ne1 = _geo_ray_obb_nan(ray, obb);
+            if (ne1 != 0) { return ne1; }
+        }
+        if (f64_eq(he1, he1) == 0) { return he1; }
     }
 
     # Axis 2
@@ -1031,11 +1348,23 @@ public fn geo_ray_obb_face(ray, obb, out) {
         t_min = f64_max(t_min, t1);
         t_max = f64_min(t_max, t2);
         slabs = slabs + 1;
-        if (f64_gt(t_min, t_max) == 1) { return 0; }
+        if (f64_lt(t_min, t_max) == 0) {
+            if (f64_gt(t_min, t_max) == 1) { return 0; }
+            if (f64_eq(t_min, t_max) == 0) {
+                var nn = _geo_ray_obb_nan(ray, obb);
+                if (nn != 0) { return nn; }
+            }
+        }
     } else {
         var neg_e2 = f64_neg(e2);
-        if (f64_gt(f64_sub(neg_e2, he2), 0) == 1) { return 0; }
-        if (f64_lt(f64_add(neg_e2, he2), 0) == 1) { return 0; }
+        var ahe2 = f64_abs(he2);
+        if (f64_gt(f64_sub(neg_e2, ahe2), 0) == 1) { return 0; }
+        if (f64_lt(f64_add(neg_e2, ahe2), 0) == 1) { return 0; }
+        if (f64_eq(e2, e2) == 0) {
+            var ne2 = _geo_ray_obb_nan(ray, obb);
+            if (ne2 != 0) { return ne2; }
+        }
+        if (f64_eq(he2, he2) == 0) { return he2; }
     }
 
     # See the header: every axis parallel means nothing narrowed the interval.
@@ -1299,34 +1628,66 @@ public fn geo_ray_capsule(ray, capsule) {
 # Primitive overlap tests
 # ================================================================
 
+# 1 when the slabs [alo, ahi] and [blo, bhi], each read sorted, overlap. A NaN bound is
+# never swapped (f64_gt is false for it) and fails the test that reads it: 0.
+fn _geo_slabs_meet(alo, ahi, blo, bhi) {
+    if (f64_gt(alo, ahi) == 1) {
+        var ta = alo;
+        alo = ahi;
+        ahi = ta;
+    }
+    if (f64_gt(blo, bhi) == 1) {
+        var tb = blo;
+        blo = bhi;
+        bhi = tb;
+    }
+    if (f64_le(alo, bhi) == 0) { return 0; }
+    if (f64_le(blo, ahi) == 0) { return 0; }
+    return 1;
+}
+
+# geo_aabb_aabb for two boxes each read sorted, axis by axis.
+fn _geo_aabb_aabb_sorted(a, b) {
+    var a_min = GeoAabb_min(a);
+    var a_max = GeoAabb_max(a);
+    var b_min = GeoAabb_min(b);
+    var b_max = GeoAabb_max(b);
+    if (_geo_slabs_meet(HVec3_x(a_min), HVec3_x(a_max), HVec3_x(b_min), HVec3_x(b_max)) == 0) { return 0; }
+    if (_geo_slabs_meet(HVec3_y(a_min), HVec3_y(a_max), HVec3_y(b_min), HVec3_y(b_max)) == 0) { return 0; }
+    if (_geo_slabs_meet(HVec3_z(a_min), HVec3_z(a_max), HVec3_z(b_min), HVec3_z(b_max)) == 0) { return 0; }
+    return 1;
+}
+
 # AABB-AABB overlap test. Returns 1 if overlapping, 0 otherwise.
 #
-# ⚠ 3.3.3 — NaN-TRUE, UNLIKE geo_sphere_sphere BELOW, BECAUSE BOTH SPATIAL WALKERS
-# PRUNE WITH IT. Each test answers 0 only for an axis provably separated, and a
-# test that reads a NaN bound is false, so a NaN bound never separates ITS OWN SIDE
-# of its own axis; the other side and the other two axes still can. A box NaN in
-# both bounds of an axis — what geo_aabb_new((NaN,0,0), (1,1,1)) builds since 3.3.3
-# — therefore overlaps every box it does not clear on another axis: against
-# [100,101] x [0,1] x [0,1] or [-101,-100] x [0,1] x [0,1] it is 1 (3.3.2: 0, from
-# the slab [1, 1] its hvec3_min/hvec3_max built by dropping the NaN corner), and
-# against [0,1] x [100,101] x [0,1] it is still 0. A box NaN in min.x alone, built
-# with the setters, is still separated from [100,101] by its finite max.x, and
-# never from [-101,-100] (3.3.2 alike). `_bvh_query_aabb_rec` in
-# src/geo_advanced.cyr and `_ot_query_rec` in src/spatial.cyr prune their nodes
-# with this function, and since 3.3.3 a NaN box makes every BVH node above it NaN,
-# which the walk must descend. Spelled NaN-false, the root is pruned and the
-# finite box beside the NaN one is lost (tests/modules.tcyr "bvh_query_aabb: ...
-# finds box 0" gets [] for [0, 1]), and a point inserted in an octree built on a
-# NaN corner is never returned. The price of NaN-true is paid both ways, because
-# the leaf tests are NaN-true as well (the BVH's is this function): a NaN QUERY
-# box NaN in x and overlapping in y and z gets every box from bvh_query_aabb and
-# every point from octree_query (3.3.2: one box and no point, by the [1, 1] slab),
-# and a NaN BOX in the tree is returned to queries far from it: a BVH over [0,1]^3
-# and geo_aabb_new((NaN,0,0), (5,1,1)) answers the query [100,101] x [0,1] x [0,1]
-# with box 1 (3.3.2: nothing). A NaN-false spelling here first needs those walkers
-# to prune nodes NaN-true on their own.
-# [measured: R4geo probes and a NaN-false variant's suites, 3.3.2/3.3.3 bundles, not in-tree, 2026-10-01; cycc 6.6.12]
-# [measured: R5geo probe, 3.3.2, 3.3.3-base and repaired bundles, not in-tree, 2026-10-01; cycc 6.6.12]
+# ⛔ 3.3.4 — A NaN BOX OVERLAPPED. Each test answered 0 only for an axis provably
+# separated, and a test that reads a NaN bound is false, so a box NaN in both bounds
+# of an axis (what geo_aabb_new((NaN,0,0), (1,1,1)) builds since 3.3.3) overlapped
+# every box it did not clear on another axis: [100,101] x [0,1] x [0,1] among them.
+# Each test now asks "overlaps on this axis", spelled NaN-false, so a NaN bound in
+# either box is no overlap -- the rule geo_sphere_sphere below and the collision entry
+# points keep: a NaN shape is never a contact. For every input with no NaN the two
+# spellings give the same answer.
+# The spatial walkers prune with their own NaN-true copies of the old tests
+# (`_bvh_aabb_may_overlap` in src/geo_advanced.cyr, `_ot_aabb_may_overlap` in
+# src/spatial.cyr): a node's bounds turn NaN for reasons that say nothing about what
+# is below it (a NaN box anywhere in a BVH subtree; the centre of an octree root with
+# an infinite axis), and this test there would prune the finite boxes and points too.
+# bvh_query_aabb's leaves are this function, so a NaN box is never returned, and
+# neither is anything for a NaN query box.
+# [measured: spatial lane probe, 3.3.4-base and repaired bundles, not in-tree, 2026-10-03; cycc 6.6.14]
+# ⛔ 3.3.4 — AN INVERTED BOX (min above max on an axis, which only the setters build:
+# geo_aabb_new sorts its corners) IS READ SORTED, as geo_ray_aabb reads it and
+# geo_ray_obb reads |he|. Through 3.3.3 these tests answered the x-slab [5, 1] against
+# [0, 10], [3, 4] and [0, 2] with 1, 0, 0, which is neither the empty slab nor [1, 5],
+# while a ray crossing x read it as [1, 5]. When a test fails, _geo_aabb_aabb_sorted
+# gives the answer for the two sorted boxes. A pair that passes all six tests
+# overlaps sorted as well (sorting only widens what each test compares), and for
+# boxes with min <= max, or with a NaN bound, a failed test is the sorted answer
+# already: those answers are unchanged, and the overlap path runs no extra compare.
+# 40100 random pairs with an inverted box answer as the sorted pair, and 19900 without
+# one (NaN, +-Inf, +-0, subnormal and DBL_MAX bounds among them) as before.
+# [measured: overlap differential, 3.3.4 tree before this and after, not in-tree, 2026-10-03; cycc 6.6.14]
 public fn geo_aabb_aabb(a, b) {
     var a_min = GeoAabb_min(a);
     var a_max = GeoAabb_max(a);
@@ -1334,12 +1695,12 @@ public fn geo_aabb_aabb(a, b) {
     var b_max = GeoAabb_max(b);
 
     # a.min <= b.max && b.min <= a.max on all 3 axes
-    if (f64_gt(HVec3_x(a_min), HVec3_x(b_max)) == 1) { return 0; }
-    if (f64_gt(HVec3_y(a_min), HVec3_y(b_max)) == 1) { return 0; }
-    if (f64_gt(HVec3_z(a_min), HVec3_z(b_max)) == 1) { return 0; }
-    if (f64_gt(HVec3_x(b_min), HVec3_x(a_max)) == 1) { return 0; }
-    if (f64_gt(HVec3_y(b_min), HVec3_y(a_max)) == 1) { return 0; }
-    if (f64_gt(HVec3_z(b_min), HVec3_z(a_max)) == 1) { return 0; }
+    if (f64_le(HVec3_x(a_min), HVec3_x(b_max)) == 0) { return _geo_aabb_aabb_sorted(a, b); }
+    if (f64_le(HVec3_y(a_min), HVec3_y(b_max)) == 0) { return _geo_aabb_aabb_sorted(a, b); }
+    if (f64_le(HVec3_z(a_min), HVec3_z(b_max)) == 0) { return _geo_aabb_aabb_sorted(a, b); }
+    if (f64_le(HVec3_x(b_min), HVec3_x(a_max)) == 0) { return _geo_aabb_aabb_sorted(a, b); }
+    if (f64_le(HVec3_y(b_min), HVec3_y(a_max)) == 0) { return _geo_aabb_aabb_sorted(a, b); }
+    if (f64_le(HVec3_z(b_min), HVec3_z(a_max)) == 0) { return _geo_aabb_aabb_sorted(a, b); }
     return 1;
 }
 
@@ -1451,6 +1812,14 @@ fn _geo_hvec3_nonfinite(v) {
     return 0;
 }
 
+# v, or 2v when the closest-point query halved its inputs (`hv` = 1, see
+# _geo_top_binade). The answer lies in the triangle's bounding box, so 2v is finite
+# unless rounding carried a coordinate past DBL_MAX / 2 by an ulp.
+fn _geo_unhalve(v, hv) {
+    if (hv == 1) { return hvec3_scale(v, F64_TWO); }
+    return v;
+}
+
 # Closest point on a triangle to a given point (Voronoi region test). Returns HVec3.
 public fn geo_closest_point_on_triangle(tri, point) {
     var a = GeoTriangle_v0(tri);
@@ -1529,12 +1898,69 @@ public fn geo_closest_point_on_triangle(tri, point) {
         var nan = f64_sub(_GEO_F64_POS_INF, _GEO_F64_POS_INF);   # +Inf - +Inf: a quiet NaN
         return hvec3_new(nan, nan, nan);
     }
-    var ab = hvec3_sub(b, a);
-    var ac = hvec3_sub(c, a);
-    var ap = hvec3_sub(point, a);
+    var hv = 0;
+    var a_ = a;
+    var b_ = b;
+    var c_ = c;
+    var p_ = point;
+    if (_geo_top_binade(a, b, c, point) == 1) {
+        a_ = hvec3_scale(a, F64_HALF);
+        b_ = hvec3_scale(b, F64_HALF);
+        c_ = hvec3_scale(c, F64_HALF);
+        p_ = hvec3_scale(point, F64_HALF);
+        hv = 1;
+    }
+    var ab = hvec3_sub(b_, a_);
+    var ac = hvec3_sub(c_, a_);
+    var ap = hvec3_sub(p_, a_);
+    # ⛔ 3.3.4 — THE SCALE CLASS ABOVE, REPAIRED BY PRE-SCALING (roadmap [3.3.4],
+    # carried from 3.3.3). Every region quantity is a dot product of an edge with a
+    # point offset (d1..d6, degree two) or a product of two (va, vb, vc, degree
+    # four), and each is s^2 or s^4 times itself when all five vectors are
+    # multiplied by the same power of two s: the region tests are sign tests and the
+    # weights are ratios, so neither changes, and the answer is built from the
+    # UNSCALED a, ab, ac, b, c. s takes the larger edge's largest component into
+    # [1, 2): the edges set the scale, not the query, because d1..d6 measure the
+    # query's offset ALONG the edges, which a query far off the plane does not grow
+    # (a scale from the offset, tried first, flushed vc for a query 2^600 above a
+    # unit triangle in z = 0 where 3.3.3 is right). Only when the offset would then
+    # pass 2^1018, and a dot product with it overflow, is s held to that.
+    # 24 random triangles and queries (coordinates below 8) at every 2^e, e in
+    # [-1074, 1023]: 28575 of 50304 answers were more than 8 ulp of the triangle's
+    # largest coordinate from the exact closest point (16012 below e = 0, 12563 above) and
+    # none is now; every exactly scaled input is 2^e times its e = 0 answer, bit for
+    # bit (48999, 3.3.3: 21672). The 20 at e = 1021 have an edge past DBL_MAX, and
+    # the inputs are halved first there and the answer doubled (_geo_top_binade,
+    # _geo_unhalve); 20000 triangles with coordinates up to DBL_MAX: 3305 right
+    # before, 19960 now. The right triangle with legs 2^e: 890 of the 1401 legs
+    # 2^-700 to 2^700 wrong before, none now.
+    # [measured: georay triangle sweeps, exact Fraction oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
+    # ⚠ 35 ANSWERS GOT WORSE, AND EACH IS 3.3.3'S OWN AT UNIT SIZE. Over 27395 mixed
+    # configurations (translated, thin, near-colinear, near and far queries), 5738
+    # moved within 8 ulp of the exact point and 4 moved out, all four within a sine
+    # of 3.1e-10 of colinear. Over 14612 with the query 2^-40 to 2^1500 edges off the
+    # plane, 4631 moved in and 31 out, all 31 at least 2^100 edges off a plane in
+    # general orientation, where the offset's rounding in ab . ap swamps the
+    # in-plane part. In each, 3.3.3's d1..d6 or va..vc had flushed or overflowed
+    # into the right region (A, or edge AB) by chance, and 3.3.3 scaled to unit size
+    # answers it exactly as this does: the Voronoi tests' conditioning, not their
+    # range, and not repaired here. Here "8 ulp" is of the triangle's largest
+    # coordinate, so a far query's own size does not hide an in-plane error.
+    # [measured: georay triangle sweeps, exact Fraction oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
+    var ee = _geo_absmax_bits(ab);
+    var ec = _geo_absmax_bits(ac);
+    if (ec > ee) { ee = ec; }
+    ee = ee >> 52;
+    var ep = _geo_absmax_bits(ap) >> 52;
+    var k = 1023 - ee;
+    if (2039 - ep < k) { k = 2039 - ep; }
+    var s = _geo_pow2(k);
+    var sab = hvec3_scale(ab, s);
+    var sac = hvec3_scale(ac, s);
+    var sap = hvec3_scale(ap, s);
 
-    var d1 = hvec3_dot(ab, ap);
-    var d2 = hvec3_dot(ac, ap);
+    var d1 = hvec3_dot(sab, sap);
+    var d2 = hvec3_dot(sac, sap);
     # Vertex A region
     if (f64_gt(d1, 0) != 1) {
         if (f64_gt(d2, 0) != 1) {
@@ -1542,9 +1968,9 @@ public fn geo_closest_point_on_triangle(tri, point) {
         }
     }
 
-    var bp = hvec3_sub(point, b);
-    var d3 = hvec3_dot(ab, bp);
-    var d4 = hvec3_dot(ac, bp);
+    var bp = hvec3_scale(hvec3_sub(p_, b_), s);
+    var d3 = hvec3_dot(sab, bp);
+    var d4 = hvec3_dot(sac, bp);
     # Vertex B region
     if (f64_lt(d3, 0) != 1) {
         if (f64_gt(d4, d3) != 1) {
@@ -1558,14 +1984,14 @@ public fn geo_closest_point_on_triangle(tri, point) {
         if (f64_lt(d1, 0) != 1) {
             if (f64_gt(d3, 0) != 1) {
                 var v = f64_div(d1, f64_sub(d1, d3));
-                return hvec3_add(a, hvec3_scale(ab, v));
+                return _geo_unhalve(hvec3_add(a_, hvec3_scale(ab, v)), hv);
             }
         }
     }
 
-    var cp = hvec3_sub(point, c);
-    var d5 = hvec3_dot(ab, cp);
-    var d6 = hvec3_dot(ac, cp);
+    var cp = hvec3_scale(hvec3_sub(p_, c_), s);
+    var d5 = hvec3_dot(sab, cp);
+    var d6 = hvec3_dot(sac, cp);
     # Vertex C region
     if (f64_lt(d6, 0) != 1) {
         if (f64_gt(d5, d6) != 1) {
@@ -1579,7 +2005,7 @@ public fn geo_closest_point_on_triangle(tri, point) {
         if (f64_lt(d2, 0) != 1) {
             if (f64_gt(d6, 0) != 1) {
                 var w = f64_div(d2, f64_sub(d2, d6));
-                return hvec3_add(a, hvec3_scale(ac, w));
+                return _geo_unhalve(hvec3_add(a_, hvec3_scale(ac, w)), hv);
             }
         }
     }
@@ -1592,7 +2018,7 @@ public fn geo_closest_point_on_triangle(tri, point) {
         if (f64_lt(d4_d3, 0) != 1) {
             if (f64_lt(d5_d6, 0) != 1) {
                 var w = f64_div(d4_d3, f64_add(d4_d3, d5_d6));
-                return hvec3_add(b, hvec3_scale(hvec3_sub(c, b), w));
+                return _geo_unhalve(hvec3_add(b_, hvec3_scale(hvec3_sub(c_, b_), w)), hv);
             }
         }
     }
@@ -1601,15 +2027,51 @@ public fn geo_closest_point_on_triangle(tri, point) {
     var denom = f64_div(F64_ONE, f64_add(f64_add(va, vb), vc));
     var v = f64_mul(vb, denom);
     var w = f64_mul(vc, denom);
-    return hvec3_add(a, hvec3_add(hvec3_scale(ab, v), hvec3_scale(ac, w)));
+    return _geo_unhalve(hvec3_add(a_, hvec3_add(hvec3_scale(ab, v), hvec3_scale(ac, w))), hv);
 }
 
 # Barycentric coordinates of a point projected onto a triangle.
 # Returns an HVec3 where x=u, y=v, z=w such that point ~ u*v0 + v*v1 + w*v2.
 public fn geo_barycentric_coords(tri, point) {
-    var v0 = hvec3_sub(GeoTriangle_v1(tri), GeoTriangle_v0(tri));
-    var v1 = hvec3_sub(GeoTriangle_v2(tri), GeoTriangle_v0(tri));
-    var v2 = hvec3_sub(point, GeoTriangle_v0(tri));
+    var t0 = GeoTriangle_v0(tri);
+    var t1 = GeoTriangle_v1(tri);
+    var t2 = GeoTriangle_v2(tri);
+    var tp = point;
+    if (_geo_top_binade(t0, t1, t2, tp) == 1) {
+        t0 = hvec3_scale(t0, F64_HALF);
+        t1 = hvec3_scale(t1, F64_HALF);
+        t2 = hvec3_scale(t2, F64_HALF);
+        tp = hvec3_scale(tp, F64_HALF);
+    }
+    var v0 = hvec3_sub(t1, t0);
+    var v1 = hvec3_sub(t2, t0);
+    var v2 = hvec3_sub(tp, t0);
+    # ⛔ 3.3.4 — PRE-SCALED (roadmap D038): v0, v1 and v2 by the power of two that
+    # brings the larger edge's largest component into [1, 2). The weights are degree
+    # zero in it, so they are the unit-size answer, bit for bit; the edges set the
+    # scale and not the point, because a far point only makes the weights large.
+    # See the `denom` note below for what this repairs. ⚠ So a NON-FINITE query with
+    # finite edges is scaled too, and its answer need not be 3.3.3's: a right triangle
+    # with legs 2^-294 and the query (-Inf, 0, 0) gives NaN weights, where 3.3.3 gave
+    # the centroid (102 of 3000 such inputs moved).
+    # [measured: barycentric review sweep and probe, 3.3.4-base vs this tree, not in-tree, 2026-10-03; cycc 6.6.14]
+    var m = _geo_absmax_bits(v0);
+    var m1 = _geo_absmax_bits(v1);
+    if (m1 > m) { m = m1; }
+    var s = _geo_scale_for(m >> 52);
+    if ((m >> 52) < 2047) {
+        # As in geo_closest_point_on_triangle: held so the query's offset stays below
+        # 2^1015, where d20 * d11 and d21 * d01 cannot overflow.
+        var k = 1023 - (m >> 52);
+        var ep = _geo_absmax_bits(v2) >> 52;
+        if (ep < 2047) {
+            if (2037 - ep < k) { k = 2037 - ep; }
+        }
+        s = _geo_pow2(k);
+    }
+    v0 = hvec3_scale(v0, s);
+    v1 = hvec3_scale(v1, s);
+    v2 = hvec3_scale(v2, s);
 
     var d00 = hvec3_dot(v0, v0);
     var d01 = hvec3_dot(v0, v1);
@@ -1619,11 +2081,28 @@ public fn geo_barycentric_coords(tri, point) {
 
     var denom = f64_sub(f64_mul(d00, d11), f64_mul(d01, d01));
     # ⛔ `denom` is the Gram determinant — (2*Area)², degree FOUR in the triangle's
-    # units — against an absolute 1e-12, and the fallback is a FABRICATION that
-    # cannot be told from success: (1/3, 1/3, 1/3) sums to 1 and lies inside the
-    # triangle. Measured in 241 of 241 failing samples for a point whose true
-    # weights are (0.25, 0.25, 0.5). Only `1 / denom` can fail, at `inv_denom` below.
+    # units — and it was tested against an absolute 1e-12, with a fallback that is a
+    # FABRICATION that cannot be told from success: (1/3, 1/3, 1/3) sums to 1 and
+    # lies inside the triangle. Measured in 241 of 241 failing samples for a point
+    # whose true weights are (0.25, 0.25, 0.5). The threshold became DBL_MIN on the
+    # reasoning that only `1 / denom` can fail, at `inv_denom` below.
     # [measured: triangle-scale sweep on the shipped binary]
+    # ⛔ 3.3.4 — THAT REASONING WAS WRONG: A DEGREE-FOUR QUANTITY FAILS BEFORE ITS
+    # RECIPROCAL. Unscaled, legs at or below 2^-256 flushed d00 * d11 and returned
+    # the centroid, and legs at or above 2^256 overflowed it to NaN: 890 of the 1401
+    # right triangles with legs 2^-700 to 2^700 were wrong (1587 of 2098 from 2^-1074
+    # to 2^1023), and 38031 of 50304 random triangles across every 2^e. With the
+    # pre-scaling above none is, nor 18297 of 20000 with coordinates up to DBL_MAX
+    # (none right before; the inputs are halved first there, as in
+    # geo_triangle_unit_normal). In 27395 mixed configurations no answer within
+    # 64 * 2^-53 of the largest exact weight left that band and 9345 entered it.
+    # [measured: georay triangle sweeps, exact Fraction oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
+    # ⚠ THE GUARD STAYS, AND STILL ANSWERS FOR MORE THAN AN EXACT ZERO. After the
+    # scaling, a triangle that is not exactly colinear got the centroid in 1488 of
+    # those 27395, every one with the sine of the angle at v0 below about 2^-25.4:
+    # there |v0|²|v1|² sin² is under one rounding of d00 * d11, so the Gram form
+    # cancels to zero. That is its conditioning, not its range, and not repaired.
+    # [measured: georay triangle sweeps, exact Fraction oracle, repaired bundle, 2026-10-03; cycc 6.6.14]
     if (f64_lt(f64_abs(denom), _GEO_F64_TINY) == 1) {
         # Degenerate triangle -- return centroid weights
         return hvec3_new(_GEO_F64_THIRD, _GEO_F64_THIRD, _GEO_F64_THIRD);

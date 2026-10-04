@@ -129,13 +129,33 @@ The **blade inverse** (`cga_blade_inverse`) is
 B⁻¹ = ~B / ⟨B ~B⟩₀
 ```
 
-with a RELATIVE null test: if `|⟨B ~B⟩₀| ≤ _CGA_NULL_TOL · Σ bᵢ²` (with
-`_CGA_NULL_TOL = 2⁻⁴⁹ ≈ 1.78e-15`, a measured floor rather than a borrowed one) the
-blade is null to working precision — e.g. a conformal point — and the function
-returns the zero multivector rather than dividing by zero. ⚠ Through 2.14.0 this
-was `|⟨B ~B⟩₀| < EPSILON_F64`, an absolute 1e-12 against a norm SQUARED — degree
-two in the blade's scale — so it was asking two different questions ("can I
-divide by this" and "is this blade null") with one wrong number.
+with a RELATIVE null test: if `|⟨B ~B⟩₀| ≤ _CGA_NULL_TOL · T`, where
+`T = Σᵢ |bᵢ|·|b_π(i)|` is the sum of the magnitudes of the terms the scalar part is
+summed from (`π(i)` is the one blade whose product with blade `i` has a scalar part:
+`i` itself, or `i` with `n0` and `ninf` swapped), the blade is null to working
+precision — e.g. a conformal point — and the function returns the zero multivector
+rather than dividing by zero. `_CGA_NULL_TOL = 2⁻⁴⁹ ≈ 1.78e-15` (16 u) is measured
+against `T`: constructed conformal points reach about 1 u and rotated ones about
+5 u (two samples). A translated point can exceed any bound, and since 3.3.4 it
+then inverts where 3.3.3 mostly returned the zero multivector (see `_CGA_NULL_TOL`).
+A norm² below `DBL_MIN` also returns the zero multivector.
+
+⚠ Through 3.3.3 the test was `|⟨B ~B⟩₀| ≤ _CGA_NULL_TOL · Σ bᵢ²`. In the ep/em
+basis each blade is its own scalar partner, so `Σ bᵢ²` *was* `T`; the null basis
+pairs `n0` with `ninf`, and `Σ bᵢ²` then counts `n0²` and `ninf²`, which are in no
+term. For a sphere of centre `c` and radius `r` it is `|c|² + 1 + ((|c|² − r²)/2)²`,
+degree four in the geometry's scale against a norm² `r²` of degree two, so a unit
+sphere from distance ~6.9e3 on and every origin sphere with `r` below ~4.2e-8 or
+above ~4.7e7 was called null. `T` is degree two under a change of weight and under
+a dilation, so the test is covariant under both; under a translation it is limited
+by the representation itself, which stores `(|c|² − r²)/2` in one double: a unit
+sphere inverts out to ~2^24 and is null beyond. A point *translated* to near the
+origin can carry a residual far above `16 u · T` — its coefficients are those of a
+small origin sphere — and it inverts as the non-null blade it numerically is.
+
+⚠ Through 2.14.0 the test was `|⟨B ~B⟩₀| < EPSILON_F64`, an absolute 1e-12 against
+a norm SQUARED — degree two in the blade's scale — so it was asking two different
+questions ("can I divide by this" and "is this blade null") with one wrong number.
 
 ### 1.3 Dual
 
@@ -185,7 +205,14 @@ the outer raises it back), so the rejection-by-subtraction is grade-consistent.
 A 3D point `(x,y,z)` embeds as `P = p + (q/2)·ninf + n0`; spheres are
 `S = P − (r²/2)·ninf` and planes `π = n̂ + d·ninf` (grade-1 dual form), each
 touching **one** `ninf` slot where the ep/em basis had to spread them across a
-pair. A translator is `T = 1 − ½·t·ninf`, i.e. blades 9, 12 and 14 only.
+pair. `q/2` and `r²/2` are formed so that they are finite whenever the true value
+is (to `|p|, r < 2^512.5`), up to the sum's rounding at the overflow edge:
+`cga_point` sums the squares in a copy scaled by a power of two outside
+`[2^-484, 2^511)`, and `cga_sphere` halves `r` before squaring it (3.3.4). A
+subnormal `q/2` is the scaled sum rounded again onto the subnormal grid, within
+half a step plus the sum's rounding; that double rounding is not correct rounding,
+and near a tie it still lands one step off.
+A translator is `T = 1 − ½·t·ninf`, i.e. blades 9, 12 and 14 only.
 Spheres/planes are grade-1 (dual)
 or grade-4 (direct) blades; rigid motions are versors applied by the sandwich
 `V x ~V` (`cga_sandwich`). See `cga_point` / `cga_sphere` / `cga_plane` /

@@ -2,7 +2,8 @@
 # Usage: shipped inside dist/hisab.cyr; in-tree, include "src/interval.cyr" after what it requires
 # Requires: no other hisab module (stdlib resolves via cyrius.cyml [deps])
 #
-# Closed interval [lo, hi]. Operations propagate bounds.
+# Closed interval [lo, hi]. Operations propagate bounds, rounded outward (3.3.4): the
+# lower endpoint toward -Infinity and the upper toward +Infinity.
 # Layout: { lo: f64, hi: f64 } = 16 bytes
 
 #derive(accessors)
@@ -18,6 +19,13 @@ var _IVL_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
 # The largest finite doubles: where ivl_new puts an INNER endpoint that overflowed.
 var _IVL_F64_MAX     = 0x7FEF_FFFF_FFFF_FFFF;  # (2 - 2^-52) * 2^1023 = 1.7976931348623157e308
 var _IVL_F64_NEG_MAX = 0xFFEF_FFFF_FFFF_FFFF;  # -(2 - 2^-52) * 2^1023 = -1.7976931348623157e308
+# The outward-rounding helpers below use these: the Veltkamp split factor of Dekker's
+# product, 2^64 to lift a subnormal into the normal range, and ivl_sin's extremum-test
+# margin, (|x| + 4) * 2^-53.
+var _IVL_SPLIT       = 0x41A0_0000_0200_0000;  # 2^27 + 1 = 134217729.0
+var _IVL_TWO64       = 0x43F0_0000_0000_0000;  # 2^64
+var _IVL_TWO_M53     = 0x3CA0_0000_0000_0000;  # 2^-53
+var _IVL_FOUR        = 0x4010_0000_0000_0000;  # 4.0
 
 # Every interval this module returns is built here, so this is where the two
 # invariants live: lo <= hi, and lo < +Infinity and hi > -Infinity.
@@ -44,21 +52,36 @@ var _IVL_F64_NEG_MAX = 0xFFEF_FFFF_FFFF_FFFF;  # -(2 - 2^-52) * 2^1023 = -1.7976
 # of them). 3.3.2 returned 467 degenerate intervals on the same cases.
 # [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 Fraction oracle]
 #
-# LIMIT: no endpoint is rounded outward, so a finite endpoint can sit inside the
-# exact bound. In the same sweep 1412 of 3262 finite endpoints did, by at most half
-# an ulp for add, sub and mul, 0.67 ulp for exp and 0.99 ulp for div, which rounds
-# twice (reciprocal, product).
+# ⛔ 3.3.4 — NO ENDPOINT WAS ROUNDED OUTWARD. Through 3.3.3 every endpoint was rounded
+# to nearest, so a finite endpoint could sit inside the exact bound: in the 3.3.3
+# sweep 1412 of 3262 finite endpoints did, by up to 0.99 ulp for div, which rounded
+# twice (reciprocal, then product). ⚠ Those are the largest gaps THAT SWEEP met, not
+# bounds: od_2 in tests/edge_cases.tcyr has 3.3.3's upper bound 1.08 ulp inside the
+# exact one, with operands of order 1.
 # [measured: scratch harness, not reproducible in-tree, 2026-10-01; python3 Fraction oracle]
-# ⚠ Those are the largest gaps THAT SWEEP met, not bounds. A divisor above 2^1022
-# in magnitude has a subnormal reciprocal, which carries fewer bits: the point quotient
-# 3.12e10 / 1.73e308 (0x421D0BDA51A75F88 / 0x7FEEB7102C030F84) comes back 3.6 ulp
-# below the exact value, which it therefore excludes, and [-1.12e305, -1.38e278] /
-# [-1.80e308, -1.00e-295] has a lower bound 4.1 ulp inside. f64_exp is 0.745 ulp off
-# at -702.16. And an OUTER bound that underflows rounds to 0, the mirror of the
-# overflow above: ivl_exp([-1000, -900]) and [1e-200, 2e-200] * [1e-200, 2e-200]
-# are the degenerate [0, 0], excluding true ranges that are entirely positive, where
-# outward rounding would give an upper bound of 2^-1074.
+# A divisor above 2^1022 in magnitude has a subnormal reciprocal, which carries fewer
+# bits: the point quotient 3.12e10 / 1.73e308 (0x421D0BDA51A75F88 / 0x7FEEB7102C030F84)
+# came back 3.6 ulp below the exact value, and [-1.12e305, -1.38e278] / [-1.80e308,
+# -1.00e-295] had a lower bound 4.1 ulp inside. An OUTER bound that underflowed
+# rounded to 0, the mirror of the overflow above: ivl_exp([-1000, -900]) and
+# [1e-200, 2e-200] * [1e-200, 2e-200] were the degenerate [0, 0], excluding true
+# ranges that are entirely positive.
 # [measured: scratch probe against a 3.3.3 bundle, cycc 6.6.12, 2026-10-01; python3 Fraction, 80-digit Decimal]
+# Every operation now rounds outward (see "Outward rounding" below). The clamp here
+# stays: it guards an interval built by hand, and it agrees with the outward rounding,
+# which steps an overflowed +Infinity down to the same DBL_MAX.
+#
+# In 104,529 random cases (add, sub, mul, div, sqrt, exp, sin, neg and abs, with
+# endpoints at every exponent, subnormals, the overflow edge, signed zeros and
+# infinities, and products, quotients and sums that land on the subnormal and
+# overflow edges), checked against exact rationals: every result but the 6 with an
+# empty quotient (a [0, 0] divisor) contained the exact image, and every add, sub,
+# mul, div, sqrt, neg and abs result (94,022) was the TIGHTEST interval of doubles
+# that does, [RD(lo), RU(hi)]. The 3.3.3 bodies' results contained it in 44,553 of the
+# same cases; 77,672 of their 161,293 finite endpoints sat inside the exact bound.
+# No case contained by the 3.3.3 result is uncontained now. The add, sub, mul, div,
+# sqrt and exp results are the same bits under cycc 6.6.3.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-03; python3 Fraction oracle; cycc 6.6.14, 6.6.3]
 #must_use
 public fn ivl_new(a, b) {
     var lo = a;
@@ -120,19 +143,142 @@ public fn ivl_overlaps(a, b) {
 }
 
 # ================================================================
+# Outward rounding
+# ================================================================
+#
+# Every operation below returns [RD(lo), RU(hi)]: the exact bound rounded DOWN for the
+# lower endpoint and UP for the upper one, so the interval contains the exact image.
+# The hardware rounds to nearest, so each endpoint is computed that way first and then
+# moved one double outward when, and only when, the rounding went inward. An exact
+# result is never widened: [1, 3] * [2, 4] is still [2, 12]. Whether the rounding went
+# inward is decided exactly, from an error-free transformation: Fast2Sum for + and -,
+# and for *, / and sqrt a comparison of a product against a double that is exact over
+# the whole range, subnormals and overflow included (_ivl_cmp_prod). For add, sub, mul,
+# div and sqrt the result is therefore the TIGHTEST interval of doubles that contains
+# the exact image. exp and sin are transcendental, so they widen by the stdlib's
+# documented error bound instead (see ivl_exp).
+
+# The double just above x. Both zeros step to 2^-1074, -Inf to -DBL_MAX; +Inf and NaN
+# are returned unchanged. Integer arithmetic on the bit pattern: within one sign the
+# doubles are ordered as their bit patterns are.
+fn _ivl_up(x) {
+    var m = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (m > 0x7FF0_0000_0000_0000 || x == _IVL_F64_POS_INF) { return x; }
+    if (m == 0) { return 1; }
+    if (x < 0) { return x - 1; }
+    return x + 1;
+}
+
+# The double just below x: the mirror of _ivl_up. Both zeros step to -2^-1074, +Inf to
+# DBL_MAX; -Inf and NaN are returned unchanged.
+fn _ivl_dn(x) {
+    var m = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (m > 0x7FF0_0000_0000_0000 || x == _IVL_F64_NEG_INF) { return x; }
+    if (m == 0) { return 0x8000_0000_0000_0001; }
+    if (x < 0) { return x + 1; }
+    return x - 1;
+}
+
+# |x| = m * 2^e with m in [1, 2), for a finite nonzero x: _ivl_ilogb returns e and
+# _ivl_mant returns m. A subnormal is first scaled by 2^64, which is exact.
+fn _ivl_ilogb(x) {
+    var b = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (b < 0x0010_0000_0000_0000) { return (f64_mul(b, _IVL_TWO64) >> 52) - 1087; }
+    return (b >> 52) - 1023;
+}
+
+fn _ivl_mant(x) {
+    var b = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (b < 0x0010_0000_0000_0000) { b = f64_mul(b, _IVL_TWO64); }
+    return (b & 0x000F_FFFF_FFFF_FFFF) | 0x3FF0_0000_0000_0000;
+}
+
+# The sign of x * y - z, exactly (1, 0 or -1), for finite positive doubles x, y, z.
+# The product is never formed at its own scale, where it could overflow or lose bits
+# to underflow: each operand is split into m * 2^e, the mantissa product mx * my is
+# taken in [1, 4) as hi + lo with Dekker's algorithm (exact there), and the exponents
+# are compared as integers first. hi is within half an ulp of mx * my, so when the
+# exponents agree, a gap between hi and mz of a whole ulp decides the sign by itself,
+# and lo decides it only when hi == mz.
+fn _ivl_cmp_prod(x, y, z) {
+    var mx = _ivl_mant(x);
+    var my = _ivl_mant(y);
+    var hi = f64_mul(mx, my);
+    var e = _ivl_ilogb(x) + _ivl_ilogb(y) - _ivl_ilogb(z);
+    var h = hi;
+    if (hi >= 0x4000_0000_0000_0000) {          # hi >= 2: renormalise to [1, 2)
+        h = f64_mul(hi, F64_HALF);
+        e = e + 1;
+    }
+    if (e > 0) { return 1; }
+    if (e < 0) { return 0 - 1; }
+    var mz = _ivl_mant(z);
+    if (h > mz) { return 1; }                   # positive doubles order as integers
+    if (h < mz) { return 0 - 1; }
+    var c = f64_mul(_IVL_SPLIT, mx);
+    var xh = f64_sub(c, f64_sub(c, mx));
+    var xl = f64_sub(mx, xh);
+    c = f64_mul(_IVL_SPLIT, my);
+    var yh = f64_sub(c, f64_sub(c, my));
+    var yl = f64_sub(my, yh);
+    var lo = f64_sub(f64_mul(xh, yh), hi);
+    lo = f64_add(lo, f64_mul(xh, yl));
+    lo = f64_add(lo, f64_mul(xl, yh));
+    lo = f64_add(lo, f64_mul(xl, yl));
+    if (f64_gt(lo, 0) == 1) { return 1; }
+    if (f64_lt(lo, 0) == 1) { return 0 - 1; }
+    return 0;
+}
+
+# a + b rounded down (_ivl_add_dn) or up (_ivl_add_up). s = a + b rounded to nearest;
+# with |x| >= |y| the larger and smaller operand, Fast2Sum's err = y - (s - x) is
+# exactly a + b - s, and neither subtraction can overflow. An infinite s is either an
+# unbounded operand, which is exact, or an overflow of two finite ones, whose exact sum
+# lies beyond DBL_MAX; stepping +Inf down gives DBL_MAX and -Inf up gives -DBL_MAX,
+# which is the 3.3.3 inner-bound clamp. A NaN passes through.
+fn _ivl_add_dn(a, b) {
+    var s = f64_add(a, b);
+    if ((s & 0x7FFF_FFFF_FFFF_FFFF) >= _IVL_F64_POS_INF) { return _ivl_dn(s); }
+    var x = a;
+    var y = b;
+    if ((a & 0x7FFF_FFFF_FFFF_FFFF) < (b & 0x7FFF_FFFF_FFFF_FFFF)) {
+        x = b;
+        y = a;
+    }
+    if (f64_lt(f64_sub(y, f64_sub(s, x)), 0) == 1) { return _ivl_dn(s); }
+    return s;
+}
+
+fn _ivl_add_up(a, b) {
+    var s = f64_add(a, b);
+    if ((s & 0x7FFF_FFFF_FFFF_FFFF) >= _IVL_F64_POS_INF) { return _ivl_up(s); }
+    var x = a;
+    var y = b;
+    if ((a & 0x7FFF_FFFF_FFFF_FFFF) < (b & 0x7FFF_FFFF_FFFF_FFFF)) {
+        x = b;
+        y = a;
+    }
+    if (f64_gt(f64_sub(y, f64_sub(s, x)), 0) == 1) { return _ivl_up(s); }
+    return s;
+}
+
+# ================================================================
 # Arithmetic
 # ================================================================
 
 #must_use
 public fn ivl_add(a, b) {
-    return ivl_new(f64_add(Interval_lo(a), Interval_lo(b)),
-      f64_add(Interval_hi(a), Interval_hi(b)));
+    return ivl_new(_ivl_add_dn(Interval_lo(a), Interval_lo(b)),
+      _ivl_add_up(Interval_hi(a), Interval_hi(b)));
 }
 
+# a - b is a + (-b). The sign is flipped on the bits, which is exact for every input
+# (f64_neg(0) was +0 below cyrius 6.6.8), and IEEE 754 defines x - y as x + (-y), so
+# the rounded difference is the one f64_sub returns.
 #must_use
 public fn ivl_sub(a, b) {
-    return ivl_new(f64_sub(Interval_lo(a), Interval_hi(b)),
-      f64_sub(Interval_hi(a), Interval_lo(b)));
+    return ivl_new(_ivl_add_dn(Interval_lo(a), Interval_hi(b) ^ 0x8000_0000_0000_0000),
+      _ivl_add_up(Interval_hi(a), Interval_lo(b) ^ 0x8000_0000_0000_0000));
 }
 
 # Endpoint product with the 0 * Infinity convention interval arithmetic requires.
@@ -152,17 +298,100 @@ fn _ivl_mul_pt(x, y) {
     return f64_mul(x, y);
 }
 
-#must_use
-public fn ivl_mul(a, b) {
+# x / y for a divisor that is not zero, with the matching convention: Inf / Inf is 0.
+# Its only callers divide by an endpoint of an interval that excludes 0, or by one
+# side of it, so an unbounded numerator over an unbounded divisor stands for the
+# quotients x / y with both large, and 0 is in their closure (x fixed, y growing).
+# The other endpoint pairs already supply the infinite end of the hull, so
+# [1, +Inf) / [2, +Inf) is [0, +Inf), the hull of (0, +Inf), as the reciprocal form
+# gave through 3.3.3.
+fn _ivl_div_pt(x, y) {
+    if ((x & 0x7FFF_FFFF_FFFF_FFFF) == _IVL_F64_POS_INF && (y & 0x7FFF_FFFF_FFFF_FFFF) == _IVL_F64_POS_INF) {
+        return 0;
+    }
+    return f64_div(x, y);
+}
+
+# The sign of p - x * y (op 0) or p - x / y (op 1), where p is _ivl_mul_pt(x, y) or
+# _ivl_div_pt(x, y): 1 when p was rounded up, -1 down, 0 when it is exact. A zero or
+# unbounded operand gives an exact p under the two conventions, and a NaN is left
+# alone. Otherwise p was rounded to nearest, so the exact value lies between p and
+# the double next to it on the side this returns. An infinite p from finite operands
+# is an overflow (|p| exceeds the exact value), and a zero p an underflow. For the
+# quotient, |p| > |x / y| exactly when |p| * |y| > |x|.
+fn _ivl_dir(op, x, y, p) {
+    var ax = x & 0x7FFF_FFFF_FFFF_FFFF;
+    var ay = y & 0x7FFF_FFFF_FFFF_FFFF;
+    if (ax == 0 || ay == 0) { return 0; }
+    if (ax >= _IVL_F64_POS_INF || ay >= _IVL_F64_POS_INF) { return 0; }
+    var ap = p & 0x7FFF_FFFF_FFFF_FFFF;
+    var d = 1;
+    if (ap == 0) { d = 0 - 1; }
+    if (ap != 0 && ap < _IVL_F64_POS_INF) {
+        if (op == 0) { d = 0 - _ivl_cmp_prod(ax, ay, ap); }
+        if (op == 1) { d = _ivl_cmp_prod(ap, ay, ax); }
+    }
+    if ((x ^ y) < 0) { return 0 - d; }
+    return d;
+}
+
+# The hull of x * y (op 0) or x / y (op 1) over the four endpoint pairs of a and b,
+# rounded outward; for op 1, b must exclude 0. Rounding is monotone, so the exact
+# minimum rounds down to the least of the four rounded-down products, and a product
+# whose rounded value is above the least one rounds down to at least that value. So
+# only the products whose rounded value equals lo decide it: lo moves one double down
+# iff one of them was rounded up. hi is the mirror. Usually one product attains each,
+# so two of the four exactness tests run.
+fn _ivl_corners(op, a, b) {
     var al = Interval_lo(a); var ah = Interval_hi(a);
     var bl = Interval_lo(b); var bh = Interval_hi(b);
-    var p1 = _ivl_mul_pt(al, bl);
-    var p2 = _ivl_mul_pt(al, bh);
-    var p3 = _ivl_mul_pt(ah, bl);
-    var p4 = _ivl_mul_pt(ah, bh);
+    var p1 = 0; var p2 = 0; var p3 = 0; var p4 = 0;
+    if (op == 0) {
+        p1 = _ivl_mul_pt(al, bl);
+        p2 = _ivl_mul_pt(al, bh);
+        p3 = _ivl_mul_pt(ah, bl);
+        p4 = _ivl_mul_pt(ah, bh);
+    }
+    if (op == 1) {
+        p1 = _ivl_div_pt(al, bl);
+        p2 = _ivl_div_pt(al, bh);
+        p3 = _ivl_div_pt(ah, bl);
+        p4 = _ivl_div_pt(ah, bh);
+    }
+    # A NaN corner comes only from a NaN endpoint; f64_min/f64_max would drop it.
+    if (f64_eq(p1, p1) == 0) { return ivl_new(p1, p1); }
+    if (f64_eq(p2, p2) == 0) { return ivl_new(p2, p2); }
+    if (f64_eq(p3, p3) == 0) { return ivl_new(p3, p3); }
+    if (f64_eq(p4, p4) == 0) { return ivl_new(p4, p4); }
     var lo = f64_min(f64_min(p1, p2), f64_min(p3, p4));
     var hi = f64_max(f64_max(p1, p2), f64_max(p3, p4));
+    var dl = 0;
+    if (f64_eq(p1, lo) == 1 && _ivl_dir(op, al, bl, p1) > 0) { dl = 1; }
+    if (dl == 0 && f64_eq(p2, lo) == 1 && _ivl_dir(op, al, bh, p2) > 0) { dl = 1; }
+    if (dl == 0 && f64_eq(p3, lo) == 1 && _ivl_dir(op, ah, bl, p3) > 0) { dl = 1; }
+    if (dl == 0 && f64_eq(p4, lo) == 1 && _ivl_dir(op, ah, bh, p4) > 0) { dl = 1; }
+    if (dl == 1) { lo = _ivl_dn(lo); }
+    var du = 0;
+    if (f64_eq(p1, hi) == 1 && _ivl_dir(op, al, bl, p1) < 0) { du = 1; }
+    if (du == 0 && f64_eq(p2, hi) == 1 && _ivl_dir(op, al, bh, p2) < 0) { du = 1; }
+    if (du == 0 && f64_eq(p3, hi) == 1 && _ivl_dir(op, ah, bl, p3) < 0) { du = 1; }
+    if (du == 0 && f64_eq(p4, hi) == 1 && _ivl_dir(op, ah, bh, p4) < 0) { du = 1; }
+    if (du == 1) { hi = _ivl_up(hi); }
     return ivl_new(lo, hi);
+}
+
+#must_use
+public fn ivl_mul(a, b) {
+    return _ivl_corners(0, a, b);
+}
+
+# x / y rounded down (up = 0) or up (up = 1), for a y that is not zero.
+fn _ivl_div_rnd(x, y, up) {
+    var q = _ivl_div_pt(x, y);
+    var d = _ivl_dir(1, x, y, q);
+    if (up == 1 && d < 0) { return _ivl_up(q); }
+    if (up == 0 && d > 0) { return _ivl_dn(q); }
+    return q;
 }
 
 # Enclosure of a/b over the two intervals, excluding the divisor value 0.
@@ -188,7 +417,8 @@ public fn ivl_mul(a, b) {
 # into at most two half-lines,
 #     y in [bl, 0)  ->  1/y in (-inf, 1/bl]
 #     y in (0, bh]  ->  1/y in [1/bh, +inf)
-# and the answer is the hull of A times each present half-line. That is EXACT --
+# and the answer is the hull of A times each present half-line, whose finite corners
+# are the quotients x / bl and x / bh, formed directly (3.3.4). That is EXACT --
 # the tightest interval containing S -- not merely sound: [1,2]/[0,1] gives
 # [1, +inf), [1,2]/[-1,0] gives (-inf, -1], [1,2]/[-1,1] gives the whole line
 # (S really is (-inf,-1] union [1,+inf), whose hull is entire), and [0,0]/[-1,1]
@@ -207,24 +437,23 @@ public fn ivl_mul(a, b) {
 # [1.23e-300, 1.31e-300] / [0, 2025 * 2^-1074] was the degenerate [+Inf, +Inf],
 # which excluded its true range [1.2e20, +inf), its mirror over [-2025 * 2^-1074, 0]
 # was [-Inf, -Inf], and the sum of the two was [NaN, NaN], an interval ivl_contains
-# accepts every number into. Both half-line bounds are now clamped below, as
-# ivl_new clamps, and that sum is the entire line.
+# accepts every number into. 3.3.3 clamped both half-line bounds below, as ivl_new
+# clamps, and that sum is the entire line.
 # [measured: scratch probe against dist/hisab.cyr 3.3.2, cycc 6.6.12, 2026-10-01]
 # [measured: tests/edge_cases.tcyr, group "3.3.3 R4num: ivl_new's guard order and an unbounded sum"]
 #
-# The clamped bound is sound but loose. The quotient goes through the reciprocal,
-# so that division's lower bound is now lo(a) * DBL_MAX = 2.2e8 where the true one
-# is 1.2e20, and the same holds for a subnormal divisor that does not straddle 0.
-# Dividing the endpoints directly would keep 1.2e20, but it changes the rounding of
-# every quotient, so it is not done here.
-# [measured: tests/edge_cases.tcyr, group "3.3.3 G3: an overflowed inner endpoint"]
-#
-# An OUTER bound is not clamped, since an infinite outer bound is the honest
-# "unbounded", so when the reciprocal overflows on that side a BOUNDED quotient comes
-# back as the entire line. That needs a divisor endpoint below 1/DBL_MAX = 5.6e-309
-# in magnitude: [-1.98e-308, 5.37e-309] / [-1.22e293, -5.14e-309], whose exact range
-# is [-1.045, 3.857], returns (-inf, +inf). Sound, but no tighter than no answer.
-# [measured: scratch probe against a 3.3.3 bundle, cycc 6.6.12, 2026-10-01; python3 Fraction oracle]
+# ⛔ 3.3.4 — THE QUOTIENT WENT THROUGH THE RECIPROCAL. Through 3.3.3 a / b was
+# a * [1/bh, 1/bl], so a subnormal divisor's reciprocal overflowed: the 3.3.3 clamp
+# made the lower bound of [1.23e-300, 1.31e-300] / [101, 2025] * 2^-1074 (and of the
+# same numerator over [0, 2025 * 2^-1074]) lo(a) * DBL_MAX = 2.2e8, where the exact
+# one is 1.2e20. On the OUTER side the reciprocal's overflow was left infinite, so a
+# BOUNDED quotient came back as the entire line: [-1.98e-308, 5.37e-309] /
+# [-1.22e293, -5.14e-309], whose exact range is [-1.045, 3.852], returned
+# (-inf, +inf). Each corner is now x / y itself, rounded outward, which overflows
+# only when the quotient does: the first is [1.2339719645522959e20,
+# 2.633552440726113e21] and the second [-1.0447470817120619, 3.85214007782101], the
+# tightest double intervals around their exact ranges.
+# [measured: tests/edge_cases.tcyr, group "3.3.4 outward rounding: ivl_div"]
 #
 # LIMIT: there is no empty interval. A [0, 0] divisor leaves S empty, and this
 # returns the entire line, which encloses the empty set vacuously. ivl_sqrt
@@ -251,28 +480,22 @@ public fn ivl_div(a, b) {
         var lo = _IVL_F64_POS_INF;
         var hi = _IVL_F64_NEG_INF;
         if (has_neg == 1) {
-            var nu = f64_div(F64_ONE, bl);          # half-line [-inf, 1/bl]
-            if (f64_eq(nu, _IVL_F64_NEG_INF) == 1) { nu = _IVL_F64_NEG_MAX; }
+            # y in [bl, 0): the endpoint pairs x / bl, and x * (-Inf) for y -> 0-
             var n1 = _ivl_mul_pt(al, _IVL_F64_NEG_INF);
-            var n2 = _ivl_mul_pt(al, nu);
             var n3 = _ivl_mul_pt(ah, _IVL_F64_NEG_INF);
-            var n4 = _ivl_mul_pt(ah, nu);
-            lo = f64_min(lo, f64_min(f64_min(n1, n2), f64_min(n3, n4)));
-            hi = f64_max(hi, f64_max(f64_max(n1, n2), f64_max(n3, n4)));
+            lo = f64_min(lo, f64_min(f64_min(n1, _ivl_div_rnd(al, bl, 0)), f64_min(n3, _ivl_div_rnd(ah, bl, 0))));
+            hi = f64_max(hi, f64_max(f64_max(n1, _ivl_div_rnd(al, bl, 1)), f64_max(n3, _ivl_div_rnd(ah, bl, 1))));
         }
         if (has_pos == 1) {
-            var pv = f64_div(F64_ONE, bh);          # half-line [1/bh, +inf]
-            if (f64_eq(pv, _IVL_F64_POS_INF) == 1) { pv = _IVL_F64_MAX; }
-            var q1 = _ivl_mul_pt(al, pv);
+            # y in (0, bh]: the endpoint pairs x / bh, and x * (+Inf) for y -> 0+
             var q2 = _ivl_mul_pt(al, _IVL_F64_POS_INF);
-            var q3 = _ivl_mul_pt(ah, pv);
             var q4 = _ivl_mul_pt(ah, _IVL_F64_POS_INF);
-            lo = f64_min(lo, f64_min(f64_min(q1, q2), f64_min(q3, q4)));
-            hi = f64_max(hi, f64_max(f64_max(q1, q2), f64_max(q3, q4)));
+            lo = f64_min(lo, f64_min(f64_min(_ivl_div_rnd(al, bh, 0), q2), f64_min(_ivl_div_rnd(ah, bh, 0), q4)));
+            hi = f64_max(hi, f64_max(f64_max(_ivl_div_rnd(al, bh, 1), q2), f64_max(_ivl_div_rnd(ah, bh, 1), q4)));
         }
         return ivl_new(lo, hi);
     }
-    return ivl_mul(a, ivl_new(f64_div(F64_ONE, bh), f64_div(F64_ONE, bl)));
+    return _ivl_corners(1, a, b);
 }
 
 #must_use
@@ -290,6 +513,23 @@ public fn ivl_abs(iv) {
     return ivl_new(f64_min(al, ah), f64_max(al, ah));
 }
 
+# sqrt(x) rounded down (up = 0) or up (up = 1), for x >= 0. f64_sqrt is correctly
+# rounded (IEEE 754 requires it of the hardware instruction), so the exact root lies
+# between r and the double next to it on the side r * r - x says. ivl_sqrt's lower
+# endpoint through 3.3.3 was the rounded root itself: sqrt([2, 2]) was the point
+# 1.4142135623730951, above the exact root; it is now [0x3FF6A09E667F3BCC,
+# 0x3FF6A09E667F3BCD].
+# [measured: tests/edge_cases.tcyr, group "3.3.4 outward rounding: ivl_sqrt, ivl_exp, ivl_sin"]
+fn _ivl_sqrt_rnd(x, up) {
+    var r = f64_sqrt(x);
+    var ax = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (ax == 0 || ax >= _IVL_F64_POS_INF) { return r; }
+    var d = _ivl_cmp_prod(r, r, x);
+    if (up == 1 && d < 0) { return _ivl_up(r); }
+    if (up == 0 && d > 0) { return _ivl_dn(r); }
+    return r;
+}
+
 # Enclosure of sqrt over the interval, restricted to the non-negative part.
 #
 # The upper bound must be clamped too, not just the lower one. Through 2.6.12 only
@@ -305,12 +545,64 @@ public fn ivl_sqrt(iv) {
     var hi = Interval_hi(iv);
     if (f64_lt(lo, 0) == 1) { lo = 0; }
     if (f64_lt(hi, 0) == 1) { hi = 0; }
-    return ivl_new(f64_sqrt(lo), f64_sqrt(hi));
+    return ivl_new(_ivl_sqrt_rnd(lo, 0), _ivl_sqrt_rnd(hi, 1));
 }
 
+# A transcendental value v = f(x) widened by the stdlib's error bound, two doubles
+# down (_ivl_tr_dn) or up (_ivl_tr_up). f(+-0) and f(+-Inf) are exact and kept; no
+# other double has an exact exp or sin (e^x and sin x are irrational for rational
+# x != 0), so no other value is.
+#
+# The bound is the stdlib's contract, cyrius lib/math.cyr (CHANGELOG [6.6.8] for exp,
+# [6.6.9] for sin): finite results are within 1 ulp of the correctly rounded value, so
+# within two doubles of the exact one. Measured against 70-digit Decimal values over
+# 15,984 exp and 28,517 sin arguments (near every third binade edge of the result and
+# both overflow thresholds for exp; multiples of pi/2 and every other exponent of the
+# argument for sin), no result of the x87 exp or the sin polyfill that x86 compiles
+# to, or of the exp polyfill aarch64 calls, was more than ONE double off, so the
+# second step is the contract's margin.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-03; python3 Decimal oracle; cycc 6.6.14]
+#
+# ⚠ THE CONTRACT IS NEWER THAN SIX CONSUMER PINS. Below cyrius 6.6.9, x86 compiles
+# f64_sin to the x87 fsin, which reduces with a 66-bit pi: under 6.6.3, 1,741 of those
+# sin arguments below 2^63 came back more than two doubles off (absolute error up to
+# |x| * 2^-69.4, near multiples of pi), and |x| >= 2^63 came back unchanged. ivl_sin
+# built there is not an enclosure near those points, as it was not in 3.3.3: 1,077 of
+# the 7,500 sin cases of the sweep described at ivl_new were not contained (3.3.3
+# bodies: 4,869). exp is x87 on x86 at every pin and measured the same under 6.6.3.
+# Below 6.6.8 the aarch64 exp, and below 6.6.9 its sin, are Taylor series, and no ulp
+# bound holds.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-03; python3 Decimal oracle; cycc 6.6.3]
+fn _ivl_tr_dn(v, x) {
+    var ax = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (ax == 0 || ax == _IVL_F64_POS_INF) { return v; }
+    return _ivl_dn(_ivl_dn(v));
+}
+
+fn _ivl_tr_up(v, x) {
+    var ax = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (ax == 0 || ax == _IVL_F64_POS_INF) { return v; }
+    return _ivl_up(_ivl_up(v));
+}
+
+# exp is increasing, so [exp(lo), exp(hi)], widened. exp > 0, so a widened lower bound
+# below 0 is raised to 0, and an exp(lo) that overflowed (lo > 709.78) has an exact value
+# above DBL_MAX, so its lower bound is DBL_MAX (the 3.3.3 clamp): f64_exp returned +Inf
+# for no argument whose exact exp is DBL_MAX or below, in the measurement above and at
+# the 81 doubles around ln(DBL_MAX). An exp(hi) that underflowed to 0 is widened to
+# 2 * 2^-1074, where 3.3.3 returned the degenerate [0, 0].
+# [measured: scratch harness, not reproducible in-tree, 2026-10-03; python3 Decimal oracle; cycc 6.6.14, 6.6.3]
 #must_use
 public fn ivl_exp(iv) {
-    return ivl_new(f64_exp(Interval_lo(iv)), f64_exp(Interval_hi(iv)));
+    var lo = Interval_lo(iv);
+    var el = f64_exp(lo);
+    if (el == _IVL_F64_POS_INF) {
+        el = _IVL_F64_MAX;
+    } else {
+        el = _ivl_tr_dn(el, lo);
+        if (f64_lt(el, 0) == 1) { el = 0; }
+    }
+    return ivl_new(el, _ivl_tr_up(f64_exp(Interval_hi(iv)), Interval_hi(iv)));
 }
 
 # Enclosure of sin over the interval.
@@ -331,9 +623,27 @@ public fn ivl_exp(iv) {
 # This is both sound AND tighter than the shortcut: [0.1, 3.3] contains a maximum
 # but no minimum, so it now yields [sin(3.3), 1] instead of the whole of [-1, 1].
 #
-# Rounding note: if an extremum sits within an ulp of an endpoint the integer test
-# may not fire, but sin is flat there (its derivative is 0), so the endpoint value
-# is already within O(eps^2) of +/-1. The enclosure stays sound to that order.
+# The endpoint values are widened by the stdlib's bound (see _ivl_tr_dn) and the
+# result is clamped to [-1, 1], which sin never leaves.
+#
+# ⛔ 3.3.4 — THE INTEGER TEST RAN IN ROUNDED ARITHMETIC. Through 3.3.3 a comment here
+# said a missed extremum costs O(eps^2), because sin is flat there. That holds only
+# while the rounding error of (a - PI/2) / TAU is tiny in radians, and that error
+# grows with |a|: it is at most (|a| + 2) * 0.48 * 2^-53 in units of k (the rounding of
+# a - PI/2, of PI/2 itself, of TAU and of the quotient). An extremum between two
+# adjacent doubles near 7.7e8, [0x41C703362B11580C, 0x41C703362B11580D], fell outside
+# the test, and without the margin below its minimum -1 is excluded. Each k-bound is
+# now moved outward by mu = (max(|a|, |b|) + 4) * 2^-53, over 1.5 times the bound on
+# that error and the rounding of the subtraction of mu together, (|a| + 2) * 0.64 *
+# 2^-53, so a contained extremum is always found. The cost is a bound of +/-1 for an
+# endpoint within 1.64 * mu * TAU of an extremum that is not contained, where sin is
+# within (1.64 * mu * TAU)^2 / 2 of +/-1: under one ulp of 1 while |a| < 1.3e7. That
+# window grows with |a| (about 1.1 rad at 1e15), so an interval near an extremum at a
+# large |a| can come back with a bound of +/-1. Past about 2.8e16 every quotient is an
+# integer, and 3.3.3's test fired there for every interval, points included.
+# In 4,500 intervals placed around extrema at |x| up to 2^60, every result contained
+# the exact range; with mu = 0, 16 did not.
+# [measured: scratch harness, not reproducible in-tree, 2026-10-03; python3 Decimal oracle; cycc 6.6.14]
 #must_use
 public fn ivl_sin(iv) {
     var a = Interval_lo(iv);
@@ -343,21 +653,30 @@ public fn ivl_sin(iv) {
     if (f64_ge(w, F64_TAU) == 1) {
         return ivl_new(f64_neg(F64_ONE), F64_ONE);
     }
+    # [+Inf, +Inf] or [-Inf, -Inf], set by hand (ivl_new clamps both to a half-line,
+    # which the span test above covers): w is NaN, and so would be every k-bound.
+    # sin covers [-1, 1] there as on the clamped form. A NaN endpoint is not caught.
+    if (f64_eq(a, b) == 1 && f64_lt(f64_abs(a), _IVL_F64_POS_INF) == 0) { return ivl_new(f64_neg(F64_ONE), F64_ONE); }
     var sa = f64_sin(a);
     var sb = f64_sin(b);
-    var lo = f64_min(sa, sb);
-    var hi = f64_max(sa, sb);
+    var lo = f64_min(_ivl_tr_dn(sa, a), _ivl_tr_dn(sb, b));
+    var hi = f64_max(_ivl_tr_up(sa, a), _ivl_tr_up(sb, b));
+
+    # The k-range tests run in rounded arithmetic; each bound moves outward by mu.
+    var mu = f64_mul(f64_add(f64_max(f64_abs(a), f64_abs(b)), _IVL_FOUR), _IVL_TWO_M53);
 
     # Maximum (+1) at PI/2 + 2k*PI: contained iff some integer k satisfies
     # (a - PI/2)/TAU <= k <= (b - PI/2)/TAU.
-    var max_k_lo = f64_ceil(f64_div(f64_sub(a, F64_PI_2), F64_TAU));
-    var max_k_hi = f64_floor(f64_div(f64_sub(b, F64_PI_2), F64_TAU));
+    var max_k_lo = f64_ceil(f64_sub(f64_div(f64_sub(a, F64_PI_2), F64_TAU), mu));
+    var max_k_hi = f64_floor(f64_add(f64_div(f64_sub(b, F64_PI_2), F64_TAU), mu));
     if (f64_le(max_k_lo, max_k_hi) == 1) { hi = F64_ONE; }
 
     # Minimum (-1) at -PI/2 + 2k*PI.
-    var min_k_lo = f64_ceil(f64_div(f64_add(a, F64_PI_2), F64_TAU));
-    var min_k_hi = f64_floor(f64_div(f64_add(b, F64_PI_2), F64_TAU));
+    var min_k_lo = f64_ceil(f64_sub(f64_div(f64_add(a, F64_PI_2), F64_TAU), mu));
+    var min_k_hi = f64_floor(f64_add(f64_div(f64_add(b, F64_PI_2), F64_TAU), mu));
     if (f64_le(min_k_lo, min_k_hi) == 1) { lo = f64_neg(F64_ONE); }
 
+    if (f64_gt(hi, F64_ONE) == 1) { hi = F64_ONE; }
+    if (f64_lt(lo, f64_neg(F64_ONE)) == 1) { lo = f64_neg(F64_ONE); }
     return ivl_new(lo, hi);
 }

@@ -163,8 +163,31 @@ public fn hvec3_normalize(v) {
     # invert, while a NaN falls through and propagates as the contract requires.
     # ⚠ F64_TINY would be one binade too strict here: 1/2^-1023 is finite.
     # [measured: tests/foundation.tcyr normalize scale sweep, 2026-09-09]
+    #
+    # ⛔ 3.3.4 — AND THAT TEST'S EXIT WAS THE ZERO VECTOR FOR EVERY NON-ZERO LENGTH AT OR
+    # BELOW 2^-1024: (2^-k, 0, 0) normalised to (0, 0, 0) for 47 of the 48 subnormal k from
+    # 1023 to 1070, and only 2^-1023 to the axis. tests/foundation.tcyr called that a
+    # "documented tree-wide limit"; no document said so (audit D087). The top end had no
+    # test at all: a finite vector whose length passes DBL_MAX got len = +Inf, inv = 0 and
+    # the answer (0, 0, 0), for 1500 of 1500 random directions in a sweep.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⭐ Neither end needs a threshold, only an exact copy of v in range. Where 1/len
+    # overflows, every component is subnormal, and v * 2^1023 is exact with its largest
+    # component in [2^-51, 1/2]; where it is 0, v * 2^-600 is exact in every component
+    # that can reach the result. The answer is the bits this function gives that copy, so
+    # the same direction at an ordinary scale. Every other input, NaN included, runs the
+    # last line unchanged, and so does len = 0. An infinite component still gives NaN
+    # beside zeros: Inf * 2^-600 is Inf, and the copy's 1/len is 0 again.
     var inv = f64_div(F64_ONE, len);
-    if (f64_eq(f64_abs(inv), F64_POS_INF) == 1) { return hvec3_zero(); }
+    if (f64_eq(f64_abs(inv), F64_POS_INF) == 1) {
+        if (f64_eq(len, 0) == 1) { return hvec3_zero(); }
+        var up = hvec3_scale(v, (1023 + 1023) << 52);   # 2^1023
+        return hvec3_scale(up, f64_div(F64_ONE, hvec3_length(up)));
+    }
+    if (f64_eq(inv, 0) == 1) {
+        var dn = hvec3_scale(v, (1023 - 600) << 52);    # 2^-600
+        return hvec3_scale(dn, f64_div(F64_ONE, hvec3_length(dn)));
+    }
     return hvec3_scale(v, inv);
 }
 
@@ -274,6 +297,26 @@ public fn hvec3_reject(v, d) {
     return hvec3_sub(v, hvec3_project(v, d));
 }
 
+# v times a power of two 2^p that puts its largest |component| in [1, 2), or in
+# [2^-51, 1) when that component is subnormal: exact either way, so the direction is
+# unchanged bit for bit. v must be finite and non-zero. `mx >> 52` is mx's biased
+# exponent, 0 for a subnormal (p = 1023 then). 2^p goes on as two normal powers of two,
+# because 2^-1023 is not one. (3.3.4, for `hvec3_angle`.)
+fn _hvec3_pow2_unit(v) {
+    var mx = f64_max(f64_max(f64_abs(HVec3_x(v)), f64_abs(HVec3_y(v))), f64_abs(HVec3_z(v)));
+    var p = 1023 - (mx >> 52);
+    var h = p / 2;
+    return hvec3_scale(hvec3_scale(v, (1023 + h) << 52), (1023 + p - h) << 52);
+}
+
+# 1 when every component of v is finite: the house non-finite test, once per slot.
+fn _hvec3_finite(v) {
+    if (f64_lt(f64_abs(HVec3_x(v)), F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(f64_abs(HVec3_y(v)), F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(f64_abs(HVec3_z(v)), F64_POS_INF) == 0) { return 0; }
+    return 1;
+}
+
 # Angle between two vectors in radians
 #must_use
 public fn hvec3_angle(a, b) {
@@ -300,6 +343,50 @@ public fn hvec3_angle(a, b) {
     # undefined and this function has no error channel — but it is now
     # unreachable except for that genuinely degenerate input.
     # [measured: tests/foundation.tcyr scale-covariance sweep, 154 decades]
-    if (f64_lt(denom, F64_TINY) == 1) { return 0; }
+    #
+    # ⛔ 3.3.4 — THE PARAGRAPH ABOVE WAS WRONG ABOUT WHAT FAILS. Below DBL_MIN the division
+    # does not degenerate, its operands do: `d` and `denom` flush, and the `return 0` it
+    # kept called EXACTLY PERPENDICULAR vectors parallel on 511 of the 1022 binades below
+    # 1, and answered 0 for every pair below 2^-511 whatever the angle. tests/foundation.tcyr
+    # pinned two of those zeros as "genuinely degenerate" (audit D089). A subnormal |a|
+    # beside a normal |b| failed first: |a| is rounded onto the subnormal grid, so for
+    # (2^-1074, 2^-1074, 0) against (2^1000, 0, 0) |a| = sqrt(2) * 2^-1074 became 2^-1074,
+    # d/denom came out exactly 1, and the answer 0 for pi/4. Past DBL_MAX, (2^512, 0, 0) with itself was NaN, and
+    # (2^1000, 0, 0) against (2^23, 2^24, 0), atan(2), was pi/2: a.b finite over denom +Inf.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⭐ Exactly those inputs, with every component finite and neither length zero, now
+    # measure the angle on copies scaled by powers of two (exact, so the directions are the
+    # caller's) as atan2(|a' x b'|, a'.b'). No product flushes or overflows there; a parallel
+    # pair's cross product is exactly 0 and a perpendicular pair's dot product exactly 0, so
+    # they give 0 and pi/2 bit-exact. A finite vector whose LENGTH overflows is one of them:
+    # (DBL_MAX, DBL_MAX, DBL_MAX) with itself was NaN. Every other input runs the acos line
+    # unchanged, bit for bit: a zero-length vector still returns 0, and a NaN or infinite
+    # component still runs acos (the finite test is on the components, not the lengths).
+    # On a 38,406-input sweep against an exact atan2 oracle, 12,649 answers moved and two
+    # moved away from it: 0.47 to 0.53 ulp, and 0.05 to 1.05 ulp (that one an acos through
+    # a subnormal |a| that happened to round well). None left 4 ulp of the oracle.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⚠ That sweep under-sampled one band: a length in [2^-1074, 2^-1022) beside a normal
+    # one, with |a||b| normal. Near 2^-1022 the subnormal length keeps most of its bits and
+    # the acos line is often within 1 ulp there, while the atan2 line carries its own mid-angle
+    # error. Aimed at that band, 418 of 11,722 changed answers moved away from the oracle and
+    # 74 went from within 1 ulp to at most 1.80 ulp; none passed 4 ulp.
+    # [measured: verify-liever scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⚠ The acos line keeps its own limits, which no guard can reach: acos is
+    # ill-conditioned near 0 and pi. (1, 1, 0) with itself is 2.1e-8 rad at every scale it
+    # runs at, and 45 degrees comes back one ulp high. atan2 on every input fixes both, but
+    # moved 188 of the 38,406 from within 1 ulp to within 2.55 ulp.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    var rs = 0;
+    if (f64_lt(denom, F64_TINY) == 1 || f64_lt(la, F64_TINY) == 1 || f64_lt(lb, F64_TINY) == 1) { rs = 1; }
+    if (f64_eq(denom, F64_POS_INF) == 1 || f64_eq(f64_abs(d), F64_POS_INF) == 1) { rs = 1; }
+    if (rs == 1) {
+        if (_hvec3_finite(a) + _hvec3_finite(b) == 2) {
+            if (f64_eq(la, 0) == 1 || f64_eq(lb, 0) == 1) { return 0; }
+            var sa = _hvec3_pow2_unit(a);
+            var sb = _hvec3_pow2_unit(b);
+            return ganita_f64_atan2(hvec3_length(hvec3_cross(sa, sb)), hvec3_dot(sa, sb));
+        }
+    }
     return ganita_f64_acos(f64_clamp(f64_div(d, denom), f64_neg(F64_ONE), F64_ONE));
 }

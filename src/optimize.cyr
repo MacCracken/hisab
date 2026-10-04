@@ -21,10 +21,9 @@
 #   residuals: fncall1(fp, x_ptr)          -> pointer to residual vector
 #   jacobian:  fncall2(fp, x_ptr, out_J)   -> writes m*n f64s to out_J
 #
-# `residuals` must return a buffer it does not overwrite on the next call:
-# opt_levenberg_marquardt holds `r_ptr` across the trial evaluation and reads it
-# again at the top of the next iteration to build J^T r, so a single reused
-# static buffer would feed it the residuals of a REJECTED trial point.
+# `residuals` may return one buffer it reuses on every call, or a fresh one:
+# opt_levenberg_marquardt copies each residual vector into storage it owns before
+# it calls `residuals` again (3.3.4). It must not write into its input x_ptr.
 #
 # Coverage note (2.8.3): opt_bfgs, opt_lbfgs and opt_levenberg_marquardt were
 # reached only through their `n <= 0` / `n > _OPT_MAX_DIM` guards until 2.8.3 --
@@ -841,7 +840,8 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
 # ================================================================
 
 # Levenberg-Marquardt solver for minimizing sum(r_i(x)^2).
-# residuals: fncall1(fp, x_ptr) -> pointer to flat array of n_residuals f64s
+# residuals: fncall1(fp, x_ptr) -> pointer to flat array of n_residuals f64s. The
+#            vector is copied before the next call, so the buffer may be reused.
 # jacobian:  fncall2(fp, x_ptr, out_J) -> writes n_residuals*n_params f64s (row-major)
 # x0:        initial parameters (flat array of n_params f64s)
 # n_params:  number of parameters (integer)
@@ -888,15 +888,28 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
     var rhs = alloc(np * 8);
     var piv = alloc(np * 8);
 
+    # ⛔ 3.3.4 — `r_ptr` WAS THE CALLER'S BUFFER, KEPT ACROSS THE TRIAL EVALUATION. It is
+    # read again at the top of the next iteration to build J^T r, so a `residuals` that
+    # reused one output buffer handed back the residuals of the trial point, rejected or
+    # not, where the accepted point's belonged. Nothing was reported: Rosenbrock as least
+    # squares from (-1.2, 1), tol 1e-8, took 144 residual calls with a reused buffer and
+    # 51 with fresh ones, and stopped at a different x. (3.3.3 removed the same contract
+    # from GMRES and BiCGSTAB, D017.) Both residual vectors are now copied into these two,
+    # allocated once per call, and an accepted step swaps them, so a reused buffer gives
+    # the fresh-buffer run bit for bit. nr * 8 cannot wrap: nr * np * 8 round-tripped above.
+    # [measured: krylov LM probe, 3.3.4 tree before and after, cycc 6.6.14, 2026-10-03]
+    var r_ptr = alloc(nr * 8);
+    var r_try = alloc(nr * 8);
+
     if (x == 0 || x_trial == 0 || jtr == 0 || delta == 0 || j_buf == 0 ||
-      jtj == 0 || lu == 0 || rhs == 0 || piv == 0) {
+      jtj == 0 || lu == 0 || rhs == 0 || piv == 0 || r_ptr == 0 || r_try == 0) {
         return Err(HSB_ERR_ALLOC);
     }
 
     _opt_copy(x, x0, np);
 
     # Evaluate initial residuals and cost
-    var r_ptr = fncall1(residuals, x);
+    _opt_copy(r_ptr, fncall1(residuals, x), nr);
     var cost = _opt_dot(r_ptr, r_ptr, nr);
 
     # Initial damping parameter
@@ -989,13 +1002,15 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
         # Trial step: x_trial = x + delta
         _opt_axpy(x_trial, x, _OPT_F64_ONE, delta, np);
 
-        var r_trial = fncall1(residuals, x_trial);
-        var cost_trial = _opt_dot(r_trial, r_trial, nr);
+        _opt_copy(r_try, fncall1(residuals, x_trial), nr);
+        var cost_trial = _opt_dot(r_try, r_try, nr);
 
         if (f64_lt(cost_trial, cost) == 1) {
-            # Accept step
+            # Accept step: r_try holds the accepted residuals, so the buffers swap.
             _opt_copy(x, x_trial, np);
-            r_ptr = r_trial;
+            var r_sw = r_ptr;
+            r_ptr = r_try;
+            r_try = r_sw;
             cost = cost_trial;
             lambda = f64_mul(lambda, lambda_down);
         } else {

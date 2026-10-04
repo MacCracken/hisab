@@ -17,7 +17,7 @@ from any other file, with no diagnostic, because of what precedes it in the sour
   invisible; 3.3.0 made it private, and under 6.6.3 a consumer could read and write it from that
   draft (510 / 511 non-public probes refused). The gate missed it because CI runs only the repo's
   pin. It was caught before the tag, in 3.3.0's pre-tag review (CHANGELOG.md [3.3.0], *Fixed —
-  found by the review*), by the manual multi-pin build step (roadmap, *Decisions owed* #7).
+  found by the review*), by the manual multi-pin build step (roadmap, *Decisions owed*: "CI consumer-pin matrix?"; #7 until 3.3.4).
 **Status:** ✅ **CLOSED — FIXED UPSTREAM IN cycc 6.6.4** (`public` arms only for a token that can
 carry visibility and is consumed otherwise). Taken by hisab 3.1.1 (2026-09-14): on the pin bump,
 before any source changed, the gate reported `_ad_pow` **REFUSED** (456/457 → 457/457) and failed as

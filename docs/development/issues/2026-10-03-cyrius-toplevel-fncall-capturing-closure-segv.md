@@ -7,7 +7,7 @@ plain `fncallN` asm.
 from 6.6.0 to 6.6.14.
 **Severity:** Medium for a consumer, nil in-tree (see *Exposure*). It compiles clean and SIGSEGVs at
 run time, with no diagnostic.
-**Status:** 🟡 **OPEN UPSTREAM.** Filed 2026-10-03 with the maintainer's approval, as
+**Status:** ✅ **FIXED UPSTREAM in cyrius 6.6.16** (see *Fixed upstream* at the end); this record stays open until hisab's pin crosses 6.6.16. Was 🟡 OPEN UPSTREAM: filed 2026-10-03 with the maintainer's approval, as
 `cyrius/docs/development/issues/2026-10-03-hisab-toplevel-fncall-capturing-closure-segv.md`. Its
 self-proving repro is
 `cyrius/docs/development/issues/repros/2026-10-03-hisab-toplevel-fncall-capturing-closure-segv.cyr`.
@@ -81,3 +81,21 @@ the same result:
 - **Closes when** a cyrius release makes the repro exit 0 and hisab's pin has crossed it. Rerun
   the repro on both pins as a pair, keep the recipe note while any consumer pins below the fix,
   and move this file to `archived/`.
+
+## Fixed upstream in cyrius 6.6.16 (recorded by cyrius, 2026-10-05)
+
+⛔ Do not move hisab's pin until cyrius 6.6.16 is tagged and out.
+
+cyrius 6.6.16 (bite srca-2, CHANGELOG [6.6.16]; the cyrius issue is archived at the 6.6.16 close as
+`docs/development/issues/archived/2026-10-03-hisab-toplevel-fncall-capturing-closure-segv.md`): a
+top-level `fncallN` / `callptr` now opens its own small stack frame and takes the same closure-aware
+lowering as one inside a fn, so a capturing closure built and returned by a fn dispatches at top level
+too. The filed repro exits 0 against 6.6.16 on x86_64, aarch64, macOS (arm64 and Intel) and Windows;
+top-level `callptr` compiles.
+
+- **Nothing in hisab's tree needs to change** (all of its indirect calls are inside fns).
+- **Optional, once hisab pins cyrius ≥ 6.6.16:** the 3.3.4 recipe note in `src/autodiff.cyr`
+  ("Pairing with optimize.cyr" — invoke such a closure from inside a fn) can be relaxed. Keep it while
+  hisab or any consumer pins below 6.6.16: there the top-level `fncall2(grad, x, g)` still exits 139.
+- **To close this record:** at the 6.6.16 pin bump, run the repro on the old and new pins as a pair and
+  move this file to `archived/`.

@@ -491,6 +491,26 @@ Nothing in this section is scheduled until the maintainer decides it.
 - **When either closes**: run its repro on the old and new pins as a pair, then archive the
   record. Keep the recipe notes while any consumer pins below the fix.
 
+✅ **Both are FIXED UPSTREAM in cyrius 6.6.16** (recorded by cyrius 2026-10-05). ⛔ Do not move the
+pin until cyrius 6.6.16 is tagged and out. Neither needs an in-tree change; what hisab may adopt once
+its pin is ≥ 6.6.16 is its call:
+- **Top-level `fncallN` on a capturing closure** (cyrius bite srca-2, its H1): a top-level `fncallN` /
+  `callptr` now opens its own stack frame and takes the same closure-aware lowering as one inside a
+  fn. The filed repro exits 0 on x86_64, aarch64, macOS (arm64 and Intel) and Windows. Once pinned
+  ≥ 6.6.16, `src/autodiff.cyr`'s 3.3.4 recipe note ("invoke such a closure from inside a fn") can be
+  relaxed, and so can the "Keep those closures inside a fn" line in the `sym_eval_interval`
+  implementation notes above. Keep the note while any consumer pins below 6.6.16: there the
+  top-level `fncall2(grad, x, g)` still exits 139.
+- **Closure `: stack` return booked on the enclosing fn** (`D082`; cyrius bite srca-1, its H2): cycc's
+  post-parse pair scans now skip a closure body, so `return f(..)` inside `|x| { .. }` belongs to the
+  closure. The repro's D1–D3 rows build clean and run 0 (C1–C3 unchanged). Once pinned ≥ 6.6.16 the
+  recipe may return `ad_grad_into(...)` from the closure directly again (the pre-3.3.1 form) —
+  but return a pair on EVERY path of that closure: 6.6.16 judges a closure as its own fn and warns on
+  a closure that returns a pair on one path and a single value on another. Below 6.6.16 that form is
+  still a hard error, so the bind-both workaround stays while any consumer pins below.
+- **To close**: at the 6.6.16 pin bump, run both repros on the old and new pins as a pair, then
+  archive both records (their *Fixed upstream* sections hold the details).
+
 ⛔ **TWO hisab-filed ganita items are OPEN**, filed 2026-10-03 with the maintainer's approval (written
 to `ganita/docs/development/issues/`, not committed there): `ganita_mat_svd` returns −1 for
 rank-deficient square matrices, tiny-rotation column pairs and a rounding two-cycle

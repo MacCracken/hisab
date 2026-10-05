@@ -7,7 +7,7 @@ so a closure literal's body is scanned as the enclosing fn's.
 filing. The repro fails on every installed pin from 6.6.0 to 6.6.14.
 **Severity:** Medium upstream: correct code is refused, and the error's suggested fix reads an unset
 `rdx`. For hisab it is nil since 3.3.1 (see *Exposure*).
-**Status:** 🟡 **OPEN UPSTREAM.** This was roadmap *Decisions owed* #4 (`D082`). The maintainer
+**Status:** ✅ **FIXED UPSTREAM in cyrius 6.6.16** (see *Fixed upstream* at the end); this record stays open until hisab's pin crosses 6.6.16. Was 🟡 OPEN UPSTREAM: this was roadmap *Decisions owed* #4 (`D082`). The maintainer
 approved filing on 2026-10-03. It is filed as
 `cyrius/docs/development/issues/2026-10-03-hisab-closure-stack-return-blamed-on-enclosing-fn.md`, with
 the self-proving repro
@@ -78,3 +78,27 @@ gives the error and a warning on `run`.
 - **Closes when** a cyrius release makes the repro exit 0 and hisab's pin has crossed it. Rerun
   the repro on both pins as a pair, then move this file to `archived/`. The recipe stays in the
   bind-both form while any consumer pins below the fix.
+
+## Fixed upstream in cyrius 6.6.16 (recorded by cyrius, 2026-10-05)
+
+⛔ Do not move hisab's pin until cyrius 6.6.16 is tagged and out.
+
+cyrius 6.6.16 (bite srca-1, CHANGELOG [6.6.16]; the cyrius issue is archived at the 6.6.16 close as
+`docs/development/issues/archived/2026-10-03-hisab-closure-stack-return-blamed-on-enclosing-fn.md`):
+cycc's two post-parse pair scans now skip a closure body, so a `return f(..)` inside `|x| { .. }` /
+`|| { .. }` belongs to the closure. The filed repro exits 0 against 6.6.16: D1–D3 build clean and run 0;
+C1–C3 are unchanged.
+
+- **Nothing in hisab needs to change.** Its one closure (`tests/modules.tcyr`, `_ot_make_closure_grad`)
+  and the autodiff recipe bind both halves and return 0, which still builds clean.
+- **Optional, once hisab pins cyrius ≥ 6.6.16:** the recipe can return `ad_grad_into(...)` from the
+  closure directly again (the pre-3.3.1 form). That form now builds clean whether the closure is built
+  inline or by a helper (`_ot_make_closure_grad`'s result bound inside `_ot_drive_closure_recipe` is
+  exactly the repro's D1 row). Do NOT adopt it while pinned below 6.6.16 — there the helper's result
+  bound inside a fn is still a hard error.
+- **If adopting it, return a pair on EVERY path of that closure.** 6.6.16 judges a closure as its own fn,
+  so a closure that says `return ad_grad_into(...)` on one path and `return 0;` on another is warned
+  ("a closure in `<fn>` returns a `: stack` pair on another path but a SINGLE value here"), as a fn
+  would be.
+- **To close this record:** at the 6.6.16 pin bump, run the repro on the old and new pins as a pair and
+  move this file to `archived/`.

@@ -518,6 +518,18 @@ rank-deficient square matrices, tiny-rotation column pairs and a rounding two-cy
 its own `svd_golub_kahan` since 3.3.4), and it accepts non-finite input
 (`issues/2026-10-03-ganita-mat-svd-accepts-non-finite-input.md`; hisab refuses first).
 
+✅ **Both ganita SVD items are addressed by ganita 1.2.13, folded in cyrius 6.6.16** (recorded by cyrius
+2026-10-05, from cyrius CHANGELOG [6.6.16] *Downstream*; not re-measured against hisab's repros). ⛔ Do not
+move the pin until cyrius 6.6.16 is tagged and out. `ganita_mat_svd` is a new algorithm (one-sided Jacobi
+on a column- and row-pivoted QR — LAPACK dgejsv / dgesvj), so every SVD's bits change; it no longer refuses
+finite matrices that have an SVD (zero / repeated rows, tiny rotations, the two-cycling 5×4), and a NaN or
+infinite input is refused across ganita's linalg. **Return codes hisab can see change:** SVD
+non-convergence is **−3** (was −1), non-finite input **−2**, `rank` passes the SVD's −2 / −3 through, and
+`eigen_sym`'s allocation failure is −1 (was −2). At the 6.6.16 pin bump: re-run both repros on the old and
+new pins as a pair; re-check `svd_compute` / `svd_truncated`'s −1 → `svd_golub_kahan` fallback (above,
+`D001` / `D012`) against the new −3, and every place hisab maps ganita's integer codes; then archive both
+records.
+
 ✅ **ganita's `atan2` filing closed in 3.3.4** (ganita 1.2.11, cyrius 6.6.13): the tripwires are
 flipped, the D132 rows are pinned as C99 values, and the record is in
 `issues/archived/2026-09-30-ganita-atan2-signed-zero-and-nan.md` with its paired run. `D140`, `D132`

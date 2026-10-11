@@ -28,14 +28,14 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.3.4
+## Current — v3.3.5
 
 **Status**:
-- Suite **7073** across six harnesses: hisab 752, foundation 503, modules 1931, modules_b 1562,
-  edge_cases 603, abuse 1722. (`modules_b.tcyr` is the second half of the per-module suite, split
-  in 3.3.4 to stay under cyrlint/cyrfmt's 1028 KB input cap.)
-- Constant gate **177/177**.
-- Public surface **703** declarations (846 gate probes; all 616 non-public probes refused),
+- Suite **7978** across six harnesses: hisab 776, foundation 620, modules 2092, modules_b 2014,
+  edge_cases 656, abuse 1820. (`modules_b.tcyr` is the second half of the per-module suite, split
+  in 3.3.4 to stay under cyrlint/cyrfmt's 1028 KB input cap; it is 791 KB at 3.3.5.)
+- Constant gate **203/203** (2 skipped).
+- Public surface **703** declarations (846 gate probes; all 726 non-public probes refused),
   enforced since 3.3.0 by the bundle's `private` marker.
 - **80** benchmarks.
 - **35** math modules in `[lib]`, plus the `src/visibility.cyr` marker.
@@ -49,12 +49,15 @@ Two releases broke the API, and each has a consumer guide:
   ([`../guides/migration-3.3.md`](../guides/migration-3.3.md)).
 
 ⚠ **hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`). Measured again on the
-3.3.4 bundle from pinned dirs:
+3.3.5 bundle from pinned dirs:
 - 6.6.2 refuses it with the known `#derive` error.
 - Under 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12, 6.6.13 and 6.6.14 a cross-module consumer program
-  (perspective, `f64_fmod`, `cx_sqrt`, a ray/box hit, `cga_point`, a subnormal normalize, Delaunay
-  and the SVD fallback on a singular 3×3) builds and runs; the outputs are identical on every pin
-  except the perspective focal term below 6.6.9 (x87 `sin`/`cos`). On 3.3.0, all 511
+  (the angle and normalize repairs, `hquat_inverse`'s rescue, perlin past 2^63, quadrature
+  overflow, `ivl_width` / `ivl_sin`, `cx_powf` at ±Inf, `num_bisection` on NaN, tiny-direction and
+  subnormal-component rays, `cga_point` / `cga_blade_inverse` at the extremes, Delaunay, GJK at
+  2^600) builds and runs; the outputs are identical on every pin except `ivl_sin` below 6.6.9
+  ([−1, 1]) and `cx_powf(·, ±Inf)` on 6.6.3 / 6.6.6 (NaN, their ganita `pow`). The 3.3.4 run also
+  found the perspective focal term below 6.6.9 (x87 `sin`/`cos`). On 3.3.0, all 511
   non-public probes were refused under 6.6.3, 6.6.4 and 6.6.12.
 - ⚠ On 6.6.3 a private fn is still reachable through `&name`. That is upstream, fixed in 6.6.4;
   see *Decisions owed*.

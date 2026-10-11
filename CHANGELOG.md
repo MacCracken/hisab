@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [3.3.5] - 2026-10-11 — the [3.3.5] roadmap rows: assertions that cannot see, and the 3.3.4 findings repaired
+
 The roadmap's **[3.3.5]** rows — the suites: assertions that cannot see, and the 3.3.4 findings carried into them. Each area was repaired in its own lane against a differential sweep and an exact or high-precision oracle, then checked by an independent reviewer, and re-reviewed after its fixes. The reviews found right → wrong regressions in first drafts — a BVH walk that collapsed subnormal misses into hits, an `eigen_power` selection rule that turned 889 of 4,000 exact answers wrong, a `cga_point` integer path that was not correctly rounded, a Delaunay scratch buffer that outlived `alloc_reset()`, collision state corrupted by a nested query, a scale chosen from an unrepresentative sample, and test helpers blind to a sign flip — and each was repaired before landing. Findings that are not on the [3.3.5] rows are not repaired here; each was reproduced by an independent check and is carried to **[3.3.6]** with its repro. The toolchain pin stays at cyrius 6.6.14.
 
 **Numbers.** Suites **7073 → 7978**, all passing, across six harnesses: hisab 776, foundation 620, modules 2092, modules_b 2014, edge_cases 656, abuse 1820. Compiler warnings in the suites 1 → 0. Constant gate **177 → 203/203**. Public surface unchanged at **703** declarations (846 probes); non-public probes 616 → **726**, all refused. Bundle 33,862 → 36,793 lines (1,608,855 → 1,767,547 B); `CYRIUS_STATS` code_size 862,576 → 1,014,632 B (+17.6%).
@@ -83,6 +85,7 @@ Costs of the repairs, stated as measured. Rows marked † are inputs 3.3.4 answe
 - **Rays and BVH**: `ray_aabb` 54 → 54 ns, `ray_aabb_diag` 69 → 72 ns, `bvh_query_ray_200x4k` 1.00 → 1.11 ms (+11%: the slab divides), `bvh_query_aabb` +1%, capsule rows +2–6%, sphere rows unchanged. The roadmap's inverted-box row, timed in the same harness against 3.3.3: 3.3.4's sorted reading costs `aabb_aabb_x64` 849 → 1,863 ns (2.2×), `ray_aabb` 46 → 54 ns, `bvh_query_aabb` 134 → 143 µs.
 - **Collision**: `gjk_intersect` misses +5%, hits and tangent +1–2%; `mpr_intersect` miss +2%, hit −20%, tangent −2%; `gjk_epa` boxes −6%, spheres and capsules ±1%; `mpr_penetration` boxes −12%; `time_of_impact` +1–3%; pairs at 2^600† +43% (miss) and 2.1× (hit). Deep overlaps take +9.8% / +7.6% support calls (gjk_epa_3d / mpr_penetration), near-tangent overlaps +79% to +178% (`mpr_intersect`).
 - **Linear algebra**: `svd_golub_kahan`, `eigen_qr` unchanged (±0.7%); `eigen_power` 3×3 +4%, 2×2 wide +8%, 5×5 and 12×12 ±2%.
+- `bench-history.csv` gains this tree's 80 rows (2026-10-11, load ~1). They are labelled `e360abb`, the commit that carries 3.3.5's code while VERSION still read 3.3.4 — the labelling gap [3.3.6] `K004` already names.
 
 ### Found — carried to [3.3.6]
 

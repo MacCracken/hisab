@@ -95,7 +95,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   deduplicated digest is exactly how the six unscheduled 2026-08-03 findings stayed invisible for
   four releases. Every dated report in docs/audit/ now records a disposition per finding
 - Public entry points are exercised under **abuse**, not only under use: `tests/abuse.tcyr` (added
-  2.9.0, **1722 assertions** at 3.3.4) drives negative indices, zero and huge dimensions, non-conformable
+  2.9.0, **1820 assertions** at 3.3.5) drives negative indices, zero and huge dimensions, non-conformable
   operands, the designed-`0` return, degenerate geometry and heap canaries. It surfaced **11 real
   defects on public entry points**, held in a known-defect register rather than deleted. The register
   is discharged: nine repaired into live assertions, the tenth re-measured and reclassified
@@ -111,7 +111,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   `scripts/check-constants.sh` (a CI gate since 2.6.12, after seven mis-transcribed tables shipped).
   The gate was itself audited: until 2.7.0 its regex rejected `_` digit separators and it silently
   skipped **35 of 145** declarations while printing "110/110 verified" — one of the skipped constants
-  encoded ~1e16 against a documented 1e15. **161/161 verified, 1 skipped** at 3.3.3 (155/155 at
+  encoded ~1e16 against a documented 1e15. **203/203 verified, 2 skipped** at 3.3.5 (177/177 at 3.3.4, 161/161 at 3.3.3, 155/155 at
   3.3.2, which deleted eight dead hex constants; 163/163 at 3.3.0 and 3.3.1; the live count is in the roadmap's
   *Current* section), and since 2.20.0 the gate also catches a comment on the line above its
   declaration (a shape that had let a mis-transcribed `F64_1E_NEG30`

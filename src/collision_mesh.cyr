@@ -51,12 +51,36 @@ public var HALFEDGE_NONE = 0x7FFF_FFFF_FFFF_FFFF;   # usize::MAX sentinel
 # It is ADAPTIVE: the float value is computed first and returned whenever it
 # clears the error bound, which is every ordinary call. Only a determinant that
 # could be a sign error pays for the expansion.
+#
+# ⛔ 3.3.5 -- THE BOUND AND THE EXPANSION BOTH ASSUME NOTHING LEAVES THE NORMAL RANGE.
+# A product that rounds in the subnormal range errs by up to 2^-1075 whatever its
+# size, which no relative bound covers, so the filters add an F64_TINY term to their
+# bounds: a constant one for the orientation, dot and distance filters, F64_TINY times
+# (1 + its degree-2 values) for the in-circle (`_col_ic_sign`). The linear filter
+# needs none -- every error it carries is relative (the note on `_COL_DL_LIN_ERRB`).
+# A value under its bound is decided exactly. The expansion is exact
+# only while each raw product and its rounding error are representable, which
+# `_col_o2d_in_window` checks; outside that window -- and for every other exact
+# predicate here -- the sign comes from `_col_bi_*`, integer arithmetic that holds
+# for any finite doubles.
 var _COL_O2D_SPLITTER = 0x41A0_0000_0200_0000;   # 2^27 + 1 = 134217729.0
 var _COL_O2D_ERRBOUND = 0x3CB8_0000_0000_0004;   # (3 + 16*2^-53) * 2^-53 = 3.330669073875471e-16
-# 40 doubles: aa[4], bb[4], cc[4], ab[8], fin[12]. Allocated once, on first use
-# of the exact path -- the bump allocator never frees, so a per-call buffer in
+# Window of `_col_o2d_exact_raw`: every coordinate 0 or 2^-480 <= |x| < 2^510. Then
+# every raw product is below 2^1020 and a multiple of 2^-1064 (each factor's last bit
+# is at least 2^-532), so it, its error term and the six-term sums are all exact.
+var _COL_O2D_WIN_LO = 0x21F0_0000_0000_0000;     # 2^-480
+var _COL_O2D_WIN_HI = 0x5FD0_0000_0000_0000;     # 2^510
+# 40 doubles: aa[4], bb[4], cc[4], ab[8], fin[12]. Allocated on first use of the
+# exact path -- the bump allocator never frees, so a per-predicate buffer in
 # delaunay_2d's inner loop would be a leak.
+# ⛔ 3.3.5 -- ONCE PER delaunay_2d CALL, NOT ONCE PER PROCESS. Through 3.3.4 the
+# pointer was cached for good, so after a caller's alloc_reset() it pointed into
+# memory the allocator hands out again, and the next delaunay_2d wrote expansions
+# over its own triangle vecs. delaunay_2d now clears it, and _COL_BI_BUF, on entry.
 var _COL_O2D_BUF = 0;
+# Set when one of those buffers cannot be allocated; delaunay_2d then returns its
+# empty result instead of writing at an address near 0.
+var _COL_DL_NOMEM = 0;
 
 # Exact error terms. `a op b == f64_op(a, b) + <err>(a, b)` for each of these.
 fn _col_o2d_sum_err(a, b) {
@@ -161,6 +185,10 @@ fn _col_o2d_expsum(e, elen, f, flen, h) {
 # summation and therefore no rounding is involved in reading it.
 fn _col_o2d_exact_raw(ax, ay, bx, by, cx, cy) {
     if (_COL_O2D_BUF == 0) { _COL_O2D_BUF = alloc(40 * 8); }
+    if (_COL_O2D_BUF == 0) {
+        _COL_DL_NOMEM = 1;
+        return 0;
+    }
     var aa = _COL_O2D_BUF;
     var bb = _COL_O2D_BUF + 32;
     var cc = _COL_O2D_BUF + 64;
@@ -177,83 +205,723 @@ fn _col_o2d_exact_raw(ax, ay, bx, by, cx, cy) {
     return _col_f64_sign(load64(fin + (finlen - 1) * 8));
 }
 
+# 1 when x is 0 or inside the expansion's window (`_COL_O2D_WIN_LO` above).
+fn _col_o2d_win1(x) {
+    var m = f64_abs(x);
+    if (f64_eq(m, 0) == 1) { return 1; }
+    if (f64_lt(m, _COL_O2D_WIN_LO) == 1) { return 0; }
+    if (f64_lt(m, _COL_O2D_WIN_HI) == 1) { return 1; }
+    return 0;
+}
+
+fn _col_o2d_in_window(ax, ay, bx, by, cx, cy) {
+    if (_col_o2d_win1(ax) == 0) { return 0; }
+    if (_col_o2d_win1(ay) == 0) { return 0; }
+    if (_col_o2d_win1(bx) == 0) { return 0; }
+    if (_col_o2d_win1(by) == 0) { return 0; }
+    if (_col_o2d_win1(cx) == 0) { return 0; }
+    return _col_o2d_win1(cy);
+}
+
+# Exact sign of orient(a, b, c) for any finite coordinates: the expansion inside
+# its window, integers outside it.
+#
+# 3.3.5: inside the window a certificate comes first. There every difference of two
+# coordinates is a multiple of 2^-532 (each coordinate's last bit is at least that),
+# every product of two differences a multiple of 2^-1064 below 2^1022, so each
+# difference, each product and their error-free tails are exact. When the four
+# difference tails and both product tails are 0, l and r are the exact products of the
+# exact differences; a subtraction rounds to 0 only when its operands are equal and
+# otherwise keeps the sign of their difference, so sign(fl(l - r)) is the orientation.
+# That is the common way here: collinear lattice triples, whose float determinant is
+# exactly 0, are decided in six error-free transforms instead of the expansion's dozen
+# (all 112 such calls of the delaunay_2d_400 bench input). Removing the certificate
+# changes no answer, only the cost: the expansion behind it is exact too.
+# [measured: scratch instrumented copy on the bench input, 2026-10-11; cycc 6.6.14]
+fn _col_o2d_exact(ax, ay, bx, by, cx, cy) {
+    if (_col_o2d_in_window(ax, ay, bx, by, cx, cy) == 1) {
+        var d1 = f64_sub(bx, ax);
+        var d2 = f64_sub(cy, ay);
+        var d3 = f64_sub(cx, ax);
+        var d4 = f64_sub(by, ay);
+        var t = _col_o2d_diff_err(bx, ax) | _col_o2d_diff_err(cy, ay);
+        t = t | _col_o2d_diff_err(cx, ax) | _col_o2d_diff_err(by, ay);
+        t = t | _col_o2d_prod_err(d1, d2) | _col_o2d_prod_err(d3, d4);
+        if ((t & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+            return _col_f64_sign(f64_sub(f64_mul(d1, d2), f64_mul(d3, d4)));
+        }
+        return _col_o2d_exact_raw(ax, ay, bx, by, cx, cy);
+    }
+    return _col_bi_pp(bx, ax, cy, ay, cx, ax, by, ay, 0 - 1);
+}
+
+# The orientation filter: 1 when the float determinant `det`, formed from the
+# products l and r, has its true sign. The bound covers the rounding the two
+# subtractions and two products carried in, which is what the cancellation then
+# exposes -- so it is taken on |l| + |r|, not on |det| -- plus F64_TINY for a product
+# that rounded in the subnormal range. An overflow makes det or the bound +Inf or
+# NaN, and the comparison then fails.
+fn _col_o2d_clear(det, l, r) {
+    var errb = f64_add(f64_mul(_COL_O2D_ERRBOUND, f64_add(f64_abs(l), f64_abs(r))), F64_TINY);
+    return f64_gt(f64_abs(det), errb);
+}
+
 # -1 / 0 / +1 for the winding of triangle (a, b, c), from RAW coordinates.
 #
-# ⚠ HONEST LIMIT ON "RAW": passing raw coordinates rather than query-translated
-# ones is one fewer rounding step and is what Shewchuk's orient2d takes, so it
-# is the right default -- but NO ASSERTION IN THIS SUITE DISTINGUISHES THE TWO.
-# A mutant that feeds this function the already-translated `ax..cy` from
-# _col_in_circumcircle passes the entire suite, including the wide-dynamic-range
-# fixture, because the query translation happens to be exact there and the
-# expansion then recovers the true sign either way. Two searches for a case
-# where they diverge -- 2,000,000 mixed-magnitude triples and 3,000,000
-# near-degenerate ones at 1e15..1e17 -- found none; a uniform shift by p tends to
-# move all three vertices on the same lattice, so the roundings cancel out of the
-# determinant. Recorded rather than papered over: if someone later moves this
-# call back onto the translated operands, the suite will NOT catch them.
+# ⚠ ON "RAW": passing raw coordinates rather than query-translated ones is one fewer
+# rounding step and is what Shewchuk's orient2d takes. Through 3.3.4 no assertion
+# told the two apart (2,000,000 mixed-magnitude and 3,000,000 near-degenerate triples
+# searched, none found). One exists: (0,0), (1,0), (2, 1e-30) with p = (0.1, 0.3).
+# Translated by p, all three y coordinates round to -0.3, so the translated triple is
+# collinear while the raw one turns counter-clockwise, and `_col_in_circumcircle`
+# would read its determinant against the wrong winding. tests/modules_b.tcyr pins it
+# ("3.3.5 Delaunay predicates are exact").
 # [measured: scratch search, not reproducible in-tree]
 fn _col_orient2d_sign(ax, ay, bx, by, cx, cy) {
     var l = f64_mul(f64_sub(bx, ax), f64_sub(cy, ay));
     var r = f64_mul(f64_sub(cx, ax), f64_sub(by, ay));
     var det = f64_sub(l, r);
-    # The filter bounds the rounding the two subtractions and two products
-    # carried in, which is what the cancellation then exposes -- so it is taken
-    # on |l| + |r|, not on |det|.
-    var errb = f64_mul(_COL_O2D_ERRBOUND, f64_add(f64_abs(l), f64_abs(r)));
+    if (_col_o2d_clear(det, l, r) == 1) { return _col_f64_sign(det); }
+    return _col_o2d_exact(ax, ay, bx, by, cx, cy);
+}
+
+# --- exact signs over the whole double range (3.3.5) -----------------------
+#
+# Every predicate delaunay_2d evaluates is the sign of an integer polynomial in its
+# coordinates, of degree 1 (a ghost's leading term), 2 (an orientation, a dot
+# product, a distance comparison) or 4 (the in-circle determinant). A finite double
+# is m * 2^e with m an integer, so dividing every coordinate of one call by 2^e0,
+# e0 the lowest set bit among them, makes them integers, and the polynomial's sign
+# is that of an integer computed exactly. Expansions (above) are faster but need
+# every product and its error term representable; these hold for any finite input,
+# DBL_MAX beside 2^-1074 included. They run only when a filter cannot decide.
+#
+# A number lives in one slot: sign (-1 / 0 / +1), limb count, then base-2^30 limbs,
+# least significant first, with no leading zero limb. One call's coordinates span at
+# most 2^1024 / 2^-1074, so an integer is under 2^2098 (70 limbs), a degree-2 value
+# under 2^4199 (140) and the in-circle determinant under 2^8400 (280, and no product
+# is written wider than 140 + 140); `_COL_BI_CAP` leaves 20 limbs spare. A limb
+# product is under 2^60, so a row of the schoolbook multiply never passes 2^61.
+enum _ColBi {
+    _COL_BI_MASK = 1073741823;    # 2^30 - 1
+    _COL_BI_CAP = 300;
+    _COL_BI_SLOT = 2416;          # (2 + _COL_BI_CAP) * 8 bytes
+    _COL_BI_NSLOT = 12;
+}
+# _COL_BI_NSLOT slots, allocated on first use, once per delaunay_2d call, like
+# _COL_O2D_BUF (and cleared with it on entry).
+var _COL_BI_BUF = 0;
+
+# 1 when the slots are there, allocating them if need be; 0, with _COL_DL_NOMEM
+# set, when they cannot be. Every `_col_bi_*` entry asks before touching a slot.
+fn _col_bi_ready() {
+    if (_COL_BI_BUF == 0) { _COL_BI_BUF = alloc(_COL_BI_NSLOT * _COL_BI_SLOT); }
+    if (_COL_BI_BUF == 0) {
+        _COL_DL_NOMEM = 1;
+        return 0;
+    }
+    return 1;
+}
+
+fn _col_bi_slot(k) {
+    return _COL_BI_BUF + k * _COL_BI_SLOT;
+}
+
+# Lowest set bit of a finite double, as a power of two; 4096 for a zero, so a zero
+# never lowers a minimum. `m` and `e` give |x| = m * 2^e.
+fn _col_bi_lsb(x) {
+    var m = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (m == 0) { return 4096; }
+    var be = m >> 52;
+    var e = 0 - 1074;
+    m = m & 0x000F_FFFF_FFFF_FFFF;
+    if (be > 0) {
+        m = m | 0x0010_0000_0000_0000;
+        e = be - 1075;
+    }
+    if ((m & 0xFFFF_FFFF) == 0) { m = m >> 32; e = e + 32; }
+    if ((m & 0xFFFF) == 0) { m = m >> 16; e = e + 16; }
+    if ((m & 0xFF) == 0) { m = m >> 8; e = e + 8; }
+    if ((m & 0xF) == 0) { m = m >> 4; e = e + 4; }
+    if ((m & 0x3) == 0) { m = m >> 2; e = e + 2; }
+    if ((m & 0x1) == 0) { e = e + 1; }
+    return e;
+}
+
+fn _col_bi_min(e, x) {
+    var b = _col_bi_lsb(x);
+    if (b < e) { return b; }
+    return e;
+}
+
+# Slot r = x / 2^e0, an integer because e0 is at most x's lowest set bit.
+fn _col_bi_set(r, x, e0) {
+    var m = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if (m == 0) {
+        store64(r, 0);
+        store64(r + 8, 0);
+        return 0;
+    }
+    var be = m >> 52;
+    var e = 0 - 1074;
+    m = m & 0x000F_FFFF_FFFF_FFFF;
+    if (be > 0) {
+        m = m | 0x0010_0000_0000_0000;
+        e = be - 1075;
+    }
+    # Shift the trailing zeros out first, so the shift below is never negative.
+    var el = _col_bi_lsb(x);
+    m = m >> (el - e);
+    var sh = el - e0;
+    var q = sh / 30;
+    var rb = sh - q * 30;
+    for (var i = 0; i < q; i = i + 1) { store64(r + 16 + i * 8, 0); }
+    store64(r + 16 + q * 8, (m << rb) & _COL_BI_MASK);
+    store64(r + 24 + q * 8, (m >> (30 - rb)) & _COL_BI_MASK);
+    store64(r + 32 + q * 8, (m >> (60 - rb)) & _COL_BI_MASK);
+    var len = q + 3;
+    while (load64(r + 8 + len * 8) == 0) { len = len - 1; }
+    store64(r + 8, len);
+    if ((x >> 63) == 0) { store64(r, 1); } else { store64(r, 0 - 1); }
+    return 0;
+}
+
+# -1 / 0 / +1 comparing |a| with |b|.
+fn _col_bi_cmpmag(a, b) {
+    var la = load64(a + 8);
+    var lb = load64(b + 8);
+    if (la > lb) { return 1; }
+    if (la < lb) { return 0 - 1; }
+    var i = la - 1;
+    while (i >= 0) {
+        var va = load64(a + 16 + i * 8);
+        var vb = load64(b + 16 + i * 8);
+        if (va > vb) { return 1; }
+        if (va < vb) { return 0 - 1; }
+        i = i - 1;
+    }
+    return 0;
+}
+
+# |r| = |a| + |b|. Limb i of r is written after limb i of a and b is read, so r may be
+# a or b.
+fn _col_bi_addmag(r, a, b) {
+    var la = load64(a + 8);
+    var lb = load64(b + 8);
+    var n = la;
+    if (lb > n) { n = lb; }
+    var carry = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var s = carry;
+        if (i < la) { s = s + load64(a + 16 + i * 8); }
+        if (i < lb) { s = s + load64(b + 16 + i * 8); }
+        store64(r + 16 + i * 8, s & _COL_BI_MASK);
+        carry = s >> 30;
+    }
+    if (carry != 0) {
+        store64(r + 16 + n * 8, carry);
+        n = n + 1;
+    }
+    store64(r + 8, n);
+    return 0;
+}
+
+# |r| = |a| - |b| for |a| > |b|; r may be a or b, as above.
+fn _col_bi_submag(r, a, b) {
+    var la = load64(a + 8);
+    var lb = load64(b + 8);
+    var borrow = 0;
+    for (var i = 0; i < la; i = i + 1) {
+        var s = load64(a + 16 + i * 8) - borrow;
+        if (i < lb) { s = s - load64(b + 16 + i * 8); }
+        borrow = 0;
+        if (s < 0) {
+            s = s + 1073741824;
+            borrow = 1;
+        }
+        store64(r + 16 + i * 8, s);
+    }
+    var n = la;
+    while (load64(r + 8 + n * 8) == 0) { n = n - 1; }
+    store64(r + 8, n);
+    return 0;
+}
+
+# r = a + sb * b, sb = +1 or -1. r may be a or b.
+fn _col_bi_add(r, a, b, sb) {
+    var sa = load64(a);
+    var sbv = load64(b) * sb;
+    if (sbv == 0) {
+        if (r != a) {
+            var la = load64(a + 8);
+            for (var i = 0; i < la; i = i + 1) { store64(r + 16 + i * 8, load64(a + 16 + i * 8)); }
+            store64(r + 8, la);
+        }
+        store64(r, sa);
+        return 0;
+    }
+    if (sa == 0) {
+        if (r != b) {
+            var lb = load64(b + 8);
+            for (var i = 0; i < lb; i = i + 1) { store64(r + 16 + i * 8, load64(b + 16 + i * 8)); }
+            store64(r + 8, lb);
+        }
+        store64(r, sbv);
+        return 0;
+    }
+    if (sa == sbv) {
+        _col_bi_addmag(r, a, b);
+        store64(r, sa);
+        return 0;
+    }
+    var c = _col_bi_cmpmag(a, b);
+    if (c == 0) {
+        store64(r, 0);
+        store64(r + 8, 0);
+        return 0;
+    }
+    if (c > 0) {
+        _col_bi_submag(r, a, b);
+        store64(r, sa);
+        return 0;
+    }
+    _col_bi_submag(r, b, a);
+    store64(r, sbv);
+    return 0;
+}
+
+# r = a * b; r is neither a nor b.
+fn _col_bi_mul(r, a, b) {
+    var sa = load64(a);
+    var sb = load64(b);
+    if (sa * sb == 0) {
+        store64(r, 0);
+        store64(r + 8, 0);
+        return 0;
+    }
+    var la = load64(a + 8);
+    var lb = load64(b + 8);
+    var n = la + lb;
+    for (var k = 0; k < n; k = k + 1) { store64(r + 16 + k * 8, 0); }
+    for (var i = 0; i < la; i = i + 1) {
+        var ai = load64(a + 16 + i * 8);
+        var carry = 0;
+        for (var j = 0; j < lb; j = j + 1) {
+            var p = r + 16 + (i + j) * 8;
+            var t = load64(p) + ai * load64(b + 16 + j * 8) + carry;
+            store64(p, t & _COL_BI_MASK);
+            carry = t >> 30;
+        }
+        store64(r + 16 + (i + lb) * 8, carry);
+    }
+    while (load64(r + 8 + n * 8) == 0) { n = n - 1; }
+    store64(r + 8, n);
+    store64(r, sa * sb);
+    return 0;
+}
+
+# r = a * k for a small integer k (|k| <= 4); r may be a.
+fn _col_bi_scale(r, a, k) {
+    var sa = load64(a);
+    if (sa * k == 0) {
+        store64(r, 0);
+        store64(r + 8, 0);
+        return 0;
+    }
+    var ka = k;
+    var sk = 1;
+    if (k < 0) {
+        ka = 0 - k;
+        sk = 0 - 1;
+    }
+    var la = load64(a + 8);
+    var carry = 0;
+    for (var i = 0; i < la; i = i + 1) {
+        var t = load64(a + 16 + i * 8) * ka + carry;
+        store64(r + 16 + i * 8, t & _COL_BI_MASK);
+        carry = t >> 30;
+    }
+    if (carry != 0) {
+        store64(r + 16 + la * 8, carry);
+        la = la + 1;
+    }
+    store64(r + 8, la);
+    store64(r, sa * sk);
+    return 0;
+}
+
+# sign(k1 * (x1 - y1) + k2 * (x2 - y2)), k1 and k2 small integers.
+fn _col_bi_lin(k1, x1, y1, k2, x2, y2) {
+    if (_col_bi_ready() == 0) { return 0; }
+    var e0 = _col_bi_min(_col_bi_min(_col_bi_min(_col_bi_min(4096, x1), y1), x2), y2);
+    var s0 = _col_bi_slot(0);
+    var s1 = _col_bi_slot(1);
+    var s2 = _col_bi_slot(2);
+    var s3 = _col_bi_slot(3);
+    _col_bi_set(s0, x1, e0);
+    _col_bi_set(s1, y1, e0);
+    _col_bi_add(s0, s0, s1, 0 - 1);
+    _col_bi_scale(s0, s0, k1);
+    _col_bi_set(s2, x2, e0);
+    _col_bi_set(s3, y2, e0);
+    _col_bi_add(s2, s2, s3, 0 - 1);
+    _col_bi_scale(s2, s2, k2);
+    _col_bi_add(s0, s0, s2, 1);
+    return load64(s0);
+}
+
+# sign((x1 - y1)(x2 - y2) + sg * (x3 - y3)(x4 - y4)), sg = +1 or -1: an orientation
+# or a dot product of differences.
+fn _col_bi_pp(x1, y1, x2, y2, x3, y3, x4, y4, sg) {
+    if (_col_bi_ready() == 0) { return 0; }
+    var e0 = _col_bi_min(_col_bi_min(_col_bi_min(_col_bi_min(4096, x1), y1), x2), y2);
+    e0 = _col_bi_min(_col_bi_min(_col_bi_min(_col_bi_min(e0, x3), y3), x4), y4);
+    var s0 = _col_bi_slot(0);
+    var s1 = _col_bi_slot(1);
+    var s2 = _col_bi_slot(2);
+    var s3 = _col_bi_slot(3);
+    var s4 = _col_bi_slot(4);
+    var s5 = _col_bi_slot(5);
+    _col_bi_set(s0, x1, e0);
+    _col_bi_set(s1, y1, e0);
+    _col_bi_add(s0, s0, s1, 0 - 1);
+    _col_bi_set(s1, x2, e0);
+    _col_bi_set(s2, y2, e0);
+    _col_bi_add(s1, s1, s2, 0 - 1);
+    _col_bi_mul(s4, s0, s1);
+    _col_bi_set(s0, x3, e0);
+    _col_bi_set(s1, y3, e0);
+    _col_bi_add(s0, s0, s1, 0 - 1);
+    _col_bi_set(s1, x4, e0);
+    _col_bi_set(s2, y4, e0);
+    _col_bi_add(s1, s1, s2, 0 - 1);
+    _col_bi_mul(s5, s0, s1);
+    _col_bi_add(s4, s4, s5, sg);
+    return load64(s4);
+}
+
+# sign(|r - a|^2 - |p - a|^2).
+fn _col_bi_dist(rx, ry, ax, ay, px, py) {
+    if (_col_bi_ready() == 0) { return 0; }
+    var e0 = _col_bi_min(_col_bi_min(_col_bi_min(4096, rx), ry), ax);
+    e0 = _col_bi_min(_col_bi_min(_col_bi_min(e0, ay), px), py);
+    var s0 = _col_bi_slot(0);
+    var s1 = _col_bi_slot(1);
+    var s2 = _col_bi_slot(2);
+    var s3 = _col_bi_slot(3);
+    var s4 = _col_bi_slot(4);
+    var s5 = _col_bi_slot(5);
+    var s6 = _col_bi_slot(6);
+    _col_bi_set(s4, ax, e0);
+    _col_bi_set(s5, ay, e0);
+    _col_bi_set(s0, rx, e0);
+    _col_bi_add(s0, s0, s4, 0 - 1);
+    _col_bi_set(s1, ry, e0);
+    _col_bi_add(s1, s1, s5, 0 - 1);
+    _col_bi_set(s2, px, e0);
+    _col_bi_add(s2, s2, s4, 0 - 1);
+    _col_bi_set(s3, py, e0);
+    _col_bi_add(s3, s3, s5, 0 - 1);
+    _col_bi_mul(s4, s0, s0);
+    _col_bi_mul(s5, s1, s1);
+    _col_bi_add(s4, s4, s5, 1);
+    _col_bi_mul(s5, s2, s2);
+    _col_bi_mul(s6, s3, s3);
+    _col_bi_add(s5, s5, s6, 1);
+    _col_bi_add(s4, s4, s5, 0 - 1);
+    return load64(s4);
+}
+
+# One row of the in-circle determinant: acc += lift(u) * (v x w), with u, v, w the
+# translated points in slots (ux, uy), (vx, vy), (wx, wy).
+fn _col_bi_ic_row(acc, ux, uy, vx, vy, wx, wy) {
+    var t0 = _col_bi_slot(8);
+    var t1 = _col_bi_slot(9);
+    var t2 = _col_bi_slot(10);
+    _col_bi_mul(t0, vx, wy);
+    _col_bi_mul(t1, wx, vy);
+    _col_bi_add(t0, t0, t1, 0 - 1);
+    _col_bi_mul(t1, ux, ux);
+    _col_bi_mul(t2, uy, uy);
+    _col_bi_add(t1, t1, t2, 1);
+    _col_bi_mul(t2, t1, t0);
+    _col_bi_add(acc, acc, t2, 1);
+    return 0;
+}
+
+# Sign of the in-circle determinant of a, b, c against p -- Shewchuk's
+# incircle(a, b, c, p): positive when p is inside the circle through a, b, c taken
+# counter-clockwise.
+fn _col_bi_incircle(ax, ay, bx, by, cx, cy, px, py) {
+    if (_col_bi_ready() == 0) { return 0; }
+    var e0 = _col_bi_min(_col_bi_min(_col_bi_min(_col_bi_min(4096, ax), ay), bx), by);
+    e0 = _col_bi_min(_col_bi_min(_col_bi_min(_col_bi_min(e0, cx), cy), px), py);
+    var sax = _col_bi_slot(0);
+    var say = _col_bi_slot(1);
+    var sbx = _col_bi_slot(2);
+    var sby = _col_bi_slot(3);
+    var scx = _col_bi_slot(4);
+    var scy = _col_bi_slot(5);
+    var spx = _col_bi_slot(6);
+    var spy = _col_bi_slot(7);
+    var acc = _col_bi_slot(11);
+    _col_bi_set(spx, px, e0);
+    _col_bi_set(spy, py, e0);
+    _col_bi_set(sax, ax, e0);
+    _col_bi_add(sax, sax, spx, 0 - 1);
+    _col_bi_set(say, ay, e0);
+    _col_bi_add(say, say, spy, 0 - 1);
+    _col_bi_set(sbx, bx, e0);
+    _col_bi_add(sbx, sbx, spx, 0 - 1);
+    _col_bi_set(sby, by, e0);
+    _col_bi_add(sby, sby, spy, 0 - 1);
+    _col_bi_set(scx, cx, e0);
+    _col_bi_add(scx, scx, spx, 0 - 1);
+    _col_bi_set(scy, cy, e0);
+    _col_bi_add(scy, scy, spy, 0 - 1);
+    store64(acc, 0);
+    store64(acc + 8, 0);
+    _col_bi_ic_row(acc, sax, say, sbx, sby, scx, scy);
+    _col_bi_ic_row(acc, sbx, sby, scx, scy, sax, say);
+    _col_bi_ic_row(acc, scx, scy, sax, say, sbx, sby);
+    return load64(acc);
+}
+
+# Shewchuk's in-circle filter bound, (10 + 96e)e with e = 2^-53.
+var _COL_ICC_ERRBOUND = 0x3CD4_0000_0000_0006;   # (10 + 96*2^-53) * 2^-53 = 1.1102230246251577e-15
+
+# --- the in-circle's middle stage (3.3.5) ----------------------------------
+#
+# A failed in-circle filter is, on near-cocircular input, the common case: the
+# determinant of four sites rounded from one circle is a few ulps of the permanent.
+# Between the filter and `_col_bi_incircle` sits Shewchuk's adaptive idea in
+# double-double form, for calls whose six differences d = h + t (h = fl(x - p), t
+# its exact tail) have every nonzero |h| in [2^-240, 2^252]:
+#   * D(h), the determinant of the highs, in double-double: each degree-2 product
+#     and the lift and cross sums as error-free pairs, each row's product with its
+#     first-order correction, and the three rows summed with error-free transforms.
+#     The pairs carry 3e^2 of their sums each, a row about 23e^2 L(|p1| + |p2|) and
+#     summing the three rows about 19e^2 * perm more, so D(h) is within about
+#     42e^2 * perm of exact (e = 2^-53, perm the permanent);
+#   * T1 = sum over the six differences of dD/dd * t, in floats. Since D is a
+#     degree-4 polynomial and |t| <= e|h|, D(h + t) - D(h) - T1 is within 6.1e^2 * perm,
+#     and T1 itself (at most 4e * perm) is evaluated within about 40e^2 * perm.
+# So D(h) + T1 is within about 95e^2 * perm of D (a count re-derived by the second
+# review). The stage answers only when its value clears 2^-86 * perm (2^20 e^2, a
+# margin of four orders of magnitude). The margin comes from that derivation, not from
+# testing: 2^-106 answers wrong on a pinned witness, but 2^-100 (64e^2, under the
+# derived worst case) had no witness in 1,050,000 cases. Near-cocircular
+# sites clear it by far more: over 2,999 nondegenerate quadruples of nearby sites of the
+# delaunay_2d_circle_150 bench input, |D| / perm has median 10^-15.9 and least 10^-20.7.
+# [measured: scratch exact-rational survey of the bench input, 2026-10-11; cycc 6.6.14]
+# The window keeps every degree-2 product of highs and its error term normal and every
+# degree-4 value under 2^1012. A degree-4 product's tail (tht) can be subnormal, and is
+# exact all the same: each factor's last bit is at least 2^-532, so the product and its
+# tail lie on the 2^-1064 grid. And when every error-free tail comes out exactly 0 --
+# integer grids, the four corners of a lattice square -- nothing was rounded at all,
+# so D(h) is D and its sign is final, a tie included. Anything else goes on to the
+# integers.
+var _COL_IC_WIN_LO = 0x30F0_0000_0000_0000;      # 2^-240
+var _COL_IC_WIN_HI = 0x4FB0_0000_0000_0000;      # 2^252
+var _COL_IC_DD_ERRB = 0x3A90_0000_0000_0000;     # 2^-86
+
+# 1 when h is 0 or in the middle stage's window.
+fn _col_ic_win1(h) {
+    var m = f64_abs(h);
+    if (f64_eq(m, 0) == 1) { return 1; }
+    if (f64_lt(m, _COL_IC_WIN_LO) == 1) { return 0; }
+    if (f64_gt(m, _COL_IC_WIN_HI) == 1) { return 0; }
+    return 1;
+}
+
+# -1 / 0 / +1 for Shewchuk's incircle(a, b, c, p) when the middle stage can decide,
+# 2 when it cannot (outside its window, or too close to a tie).
+fn _col_ic_adapt(ax, ay, bx, by, cx, cy, px, py) {
+    var adx = f64_sub(ax, px);
+    var ady = f64_sub(ay, py);
+    var bdx = f64_sub(bx, px);
+    var bdy = f64_sub(by, py);
+    var cdx = f64_sub(cx, px);
+    var cdy = f64_sub(cy, py);
+    if (_col_ic_win1(adx) + _col_ic_win1(ady) + _col_ic_win1(bdx) < 3) { return 2; }
+    if (_col_ic_win1(bdy) + _col_ic_win1(cdx) + _col_ic_win1(cdy) < 3) { return 2; }
+    var adxt = _col_o2d_diff_err(ax, px);
+    var adyt = _col_o2d_diff_err(ay, py);
+    var bdxt = _col_o2d_diff_err(bx, px);
+    var bdyt = _col_o2d_diff_err(by, py);
+    var cdxt = _col_o2d_diff_err(cx, px);
+    var cdyt = _col_o2d_diff_err(cy, py);
+    # `z` ORs every error-free tail's magnitude bits: 0 means nothing was rounded.
+    # Each tail below is load-bearing except where marked. p1t and p2t are implied:
+    # for significands m1, m2, m1 * m2 <= max(m1^2, m2^2), so a rounded product of two
+    # highs means one of their squares rounds, and every high is squared in some row's
+    # lift. cht, e1, e2 and row c's tht had no witness in 1,050,000 cases -- kept, an
+    # open question rather than a proof.
+    # [measured: second-review corpus and compiled mutants, 2026-10-11; cycc 6.6.14]
+    var mag = 0x7FFF_FFFF_FFFF_FFFF;
+    var z = (adxt | adyt | bdxt | bdyt | cdxt | cdyt) & mag;
+    # Row a: lift(a) * (b x c), b x c = bdx*cdy - cdx*bdy.
+    var p1 = f64_mul(bdx, cdy);
+    var p2 = f64_mul(cdx, bdy);
+    var p1t = _col_o2d_prod_err(bdx, cdy);
+    var p2t = _col_o2d_prod_err(cdx, bdy);
+    var cha = f64_sub(p1, p2);
+    var cht = _col_o2d_diff_err(p1, p2);
+    var cla = f64_add(cht, f64_sub(p1t, p2t));
+    var pma = f64_add(f64_abs(p1), f64_abs(p2));
+    var q1 = f64_mul(adx, adx);
+    var q2 = f64_mul(ady, ady);
+    var q1t = _col_o2d_prod_err(adx, adx);
+    var q2t = _col_o2d_prod_err(ady, ady);
+    var lha = f64_add(q1, q2);
+    var lht = _col_o2d_sum_err(q1, q2);
+    var lla = f64_add(lht, f64_add(q1t, q2t));
+    var tha = f64_mul(lha, cha);
+    var tht = _col_o2d_prod_err(lha, cha);
+    var tla = f64_add(tht, f64_add(f64_mul(lha, cla), f64_mul(lla, cha)));
+    z = z | ((p1t | p2t | cht | q1t | q2t | lht | tht) & mag);
+    # Row b: lift(b) * (c x a), c x a = cdx*ady - adx*cdy.
+    p1 = f64_mul(cdx, ady);
+    p2 = f64_mul(adx, cdy);
+    p1t = _col_o2d_prod_err(cdx, ady);
+    p2t = _col_o2d_prod_err(adx, cdy);
+    var chb = f64_sub(p1, p2);
+    cht = _col_o2d_diff_err(p1, p2);
+    var clb = f64_add(cht, f64_sub(p1t, p2t));
+    var pmb = f64_add(f64_abs(p1), f64_abs(p2));
+    q1 = f64_mul(bdx, bdx);
+    q2 = f64_mul(bdy, bdy);
+    q1t = _col_o2d_prod_err(bdx, bdx);
+    q2t = _col_o2d_prod_err(bdy, bdy);
+    var lhb = f64_add(q1, q2);
+    lht = _col_o2d_sum_err(q1, q2);
+    var llb = f64_add(lht, f64_add(q1t, q2t));
+    var thb = f64_mul(lhb, chb);
+    tht = _col_o2d_prod_err(lhb, chb);
+    var tlb = f64_add(tht, f64_add(f64_mul(lhb, clb), f64_mul(llb, chb)));
+    z = z | ((p1t | p2t | cht | q1t | q2t | lht | tht) & mag);
+    # Row c: lift(c) * (a x b), a x b = adx*bdy - bdx*ady.
+    p1 = f64_mul(adx, bdy);
+    p2 = f64_mul(bdx, ady);
+    p1t = _col_o2d_prod_err(adx, bdy);
+    p2t = _col_o2d_prod_err(bdx, ady);
+    var chc = f64_sub(p1, p2);
+    cht = _col_o2d_diff_err(p1, p2);
+    var clc = f64_add(cht, f64_sub(p1t, p2t));
+    var pmc = f64_add(f64_abs(p1), f64_abs(p2));
+    q1 = f64_mul(cdx, cdx);
+    q2 = f64_mul(cdy, cdy);
+    q1t = _col_o2d_prod_err(cdx, cdx);
+    q2t = _col_o2d_prod_err(cdy, cdy);
+    var lhc = f64_add(q1, q2);
+    lht = _col_o2d_sum_err(q1, q2);
+    var llc = f64_add(lht, f64_add(q1t, q2t));
+    var thc = f64_mul(lhc, chc);
+    tht = _col_o2d_prod_err(lhc, chc);
+    var tlc = f64_add(tht, f64_add(f64_mul(lhc, clc), f64_mul(llc, chc)));
+    z = z | ((p1t | p2t | cht | q1t | q2t | lht | tht) & mag);
+    # D(h) = dh + dl.
+    var s1 = f64_add(tha, thb);
+    var e1 = _col_o2d_sum_err(tha, thb);
+    var dh = f64_add(s1, thc);
+    var e2 = _col_o2d_sum_err(s1, thc);
+    z = z | ((e1 | e2) & mag);
+    if (z == 0) { return _col_f64_sign(dh); }
+    var dl = f64_add(f64_add(e1, e2), f64_add(f64_add(tla, tlb), tlc));
+    # T1: each difference's tail times dD/dd at the highs.
+    var two = F64_TWO;
+    var g1 = f64_mul(adxt, f64_add(f64_mul(f64_mul(two, adx), cha), f64_sub(f64_mul(lhc, bdy), f64_mul(lhb, cdy))));
+    var g2 = f64_mul(adyt, f64_add(f64_mul(f64_mul(two, ady), cha), f64_sub(f64_mul(lhb, cdx), f64_mul(lhc, bdx))));
+    var g3 = f64_mul(bdxt, f64_add(f64_mul(f64_mul(two, bdx), chb), f64_sub(f64_mul(lha, cdy), f64_mul(lhc, ady))));
+    var g4 = f64_mul(bdyt, f64_add(f64_mul(f64_mul(two, bdy), chb), f64_sub(f64_mul(lhc, adx), f64_mul(lha, cdx))));
+    var g5 = f64_mul(cdxt, f64_add(f64_mul(f64_mul(two, cdx), chc), f64_sub(f64_mul(lhb, ady), f64_mul(lha, bdy))));
+    var g6 = f64_mul(cdyt, f64_add(f64_mul(f64_mul(two, cdy), chc), f64_sub(f64_mul(lha, bdx), f64_mul(lhb, adx))));
+    var t1 = f64_add(f64_add(f64_add(g1, g2), f64_add(g3, g4)), f64_add(g5, g6));
+    var v = f64_add(dh, f64_add(dl, t1));
+    var perm = f64_add(f64_add(f64_mul(pma, lha), f64_mul(pmb, lhb)), f64_mul(pmc, lhc));
+    # No F64_TINY term: a nonzero D has a monomial of four nonzero highs, each at least
+    # 2^-240, so perm is at least 2^-961 and the bound at least 2^-1047, far above the
+    # 2^-1075 each of the few dozen corrections can lose by rounding in the subnormal range.
+    if (f64_gt(f64_abs(v), f64_mul(_COL_IC_DD_ERRB, perm)) == 1) { return _col_f64_sign(v); }
+    return 2;
+}
+
+# -1 / 0 / +1: the sign of Shewchuk's incircle(a, b, c, p), from RAW coordinates --
+# positive when p is strictly inside the circle through a, b, c taken
+# counter-clockwise. The float value, on coordinates translated to p, is returned
+# whenever it clears Shewchuk's bound (which covers the rounding of that translation)
+# plus F64_TINY * (1 + every degree-2 value). A product rounded in the subnormal range
+# errs by up to 2^-1075 whatever its size: a degree-2 product's error is then
+# multiplied by a lift or a cross term, hence those values, and the three degree-4
+# products' own errors are multiplied by nothing, hence the 1 -- on four sites whose
+# lifts and cross terms are all far below DBL_MIN it is the whole bound.
+# Anything else goes to the middle stage `_col_ic_adapt`, then `_col_bi_incircle`.
+fn _col_ic_sign(ax, ay, bx, by, cx, cy, px, py) {
+    var adx = f64_sub(ax, px);
+    var ady = f64_sub(ay, py);
+    var bdx = f64_sub(bx, px);
+    var bdy = f64_sub(by, py);
+    var cdx = f64_sub(cx, px);
+    var cdy = f64_sub(cy, py);
+    var bdxcdy = f64_mul(bdx, cdy);
+    var cdxbdy = f64_mul(cdx, bdy);
+    var cdxady = f64_mul(cdx, ady);
+    var adxcdy = f64_mul(adx, cdy);
+    var adxbdy = f64_mul(adx, bdy);
+    var bdxady = f64_mul(bdx, ady);
+    var alift = f64_add(f64_mul(adx, adx), f64_mul(ady, ady));
+    var blift = f64_add(f64_mul(bdx, bdx), f64_mul(bdy, bdy));
+    var clift = f64_add(f64_mul(cdx, cdx), f64_mul(cdy, cdy));
+    var ta = f64_mul(alift, f64_sub(bdxcdy, cdxbdy));
+    var tb = f64_mul(blift, f64_sub(cdxady, adxcdy));
+    var tc = f64_mul(clift, f64_sub(adxbdy, bdxady));
+    var det = f64_add(f64_add(ta, tb), tc);
+    var pa = f64_add(f64_abs(bdxcdy), f64_abs(cdxbdy));
+    var pb = f64_add(f64_abs(cdxady), f64_abs(adxcdy));
+    var pc = f64_add(f64_abs(adxbdy), f64_abs(bdxady));
+    var perm = f64_add(f64_add(f64_mul(pa, alift), f64_mul(pb, blift)), f64_mul(pc, clift));
+    var lifts = f64_add(f64_add(alift, blift), f64_add(clift, F64_ONE));
+    var deg2 = f64_add(lifts, f64_add(f64_add(pa, pb), pc));
+    var errb = f64_add(f64_mul(_COL_ICC_ERRBOUND, perm), f64_mul(F64_TINY, deg2));
     if (f64_gt(f64_abs(det), errb) == 1) { return _col_f64_sign(det); }
-    return _col_o2d_exact_raw(ax, ay, bx, by, cx, cy);
+    var mid = _col_ic_adapt(ax, ay, bx, by, cx, cy, px, py);
+    if (mid != 2) { return mid; }
+    return _col_bi_incircle(ax, ay, bx, by, cx, cy, px, py);
 }
 
 # Check if point p is inside circumcircle of triangle (a, b, c).
 # Real vertices only -- see _col_dl_incircle for the ghost-aware entry point.
 #
-# Every coordinate is translated to the query point BEFORE anything is squared,
-# including the winding cross product. That is what keeps the determinant on the
-# scale of the triangle rather than the scale of the absolute coordinates: a
-# 1e-8-wide cluster sitting at x = 1e9 differences exactly (Sterbenz) into
-# 1e-8-scale operands, where the determinant is well conditioned. The pre-2.8.2
-# form took the cross product from absolute coordinates and lost it.
+# ⛔ 3.3.5 -- THE DETERMINANT IS EXACT (`_col_ic_sign`). Through 3.3.4 it was a float
+# determinant on coordinates translated to p, left non-adaptive because no sweep of
+# single-scale sets found it wrong (the D055 decision, archived in
+# docs/development/issues/archived/2026-08-04-incircle-precision.md). Its reopen trigger
+# was a caller passing coordinates not drawn from one scale -- and delaunay_2d is one:
+# sets mixing magnitudes came back wrong at scale 1, a 3-site triangle empty among
+# them. The translation is kept for the filter, where it keeps the determinant on the
+# scale of the triangle (a 1e-8-wide cluster at x = 1e9 differences exactly into
+# 1e-8-scale operands); the exact path reads raw coordinates.
 fn _col_in_circumcircle(points, ai, bi, ci, px, py) {
     var ap = vec_get(points, ai);
     var bp = vec_get(points, bi);
     var cp = vec_get(points, ci);
-
-    var ax = f64_sub(HVec2_x(ap), px);
-    var ay = f64_sub(HVec2_y(ap), py);
-    var bx = f64_sub(HVec2_x(bp), px);
-    var by = f64_sub(HVec2_y(bp), py);
-    var cx = f64_sub(HVec2_x(cp), px);
-    var cy = f64_sub(HVec2_y(cp), py);
-
-    var a_sq = f64_add(f64_mul(ax, ax), f64_mul(ay, ay));
-    var b_sq = f64_add(f64_mul(bx, bx), f64_mul(by, by));
-    var c_sq = f64_add(f64_mul(cx, cx), f64_mul(cy, cy));
-
-    var det = f64_sub(
-      f64_add(
-        f64_mul(ax, f64_sub(f64_mul(by, c_sq), f64_mul(cy, b_sq))),
-        f64_mul(a_sq, f64_sub(f64_mul(bx, cy), f64_mul(by, cx)))
-        ),
-      f64_mul(ay, f64_sub(f64_mul(bx, c_sq), f64_mul(cx, b_sq)))
-      );
+    var det = _col_ic_sign(HVec2_x(ap), HVec2_y(ap), HVec2_x(bp), HVec2_y(bp),
+      HVec2_x(cp), HVec2_y(cp), px, py);
 
     # Sign depends on winding of triangle.
     #
-    # 2.9.3: taken from the RAW coordinates, not from ax..cy above. Those are
-    # already differenced against the query point, and that differencing is the
-    # step that loses the sign on a mixed-scale set -- see the note on
-    # _col_orient2d_sign. `det` itself stays in floating point: attribution was
-    # established by substitution rather than assumed, and replacing only the
-    # winding repairs every measured failure.
+    # 2.9.3: taken from the RAW coordinates, not from coordinates translated to the
+    # query point. That differencing is the step that loses the sign on a
+    # mixed-scale set -- see the note on _col_orient2d_sign.
     # [measured: docs/development/issues/archived/2026-08-04-incircle-precision.md]
     var cross = _col_orient2d_sign(HVec2_x(ap), HVec2_y(ap),
       HVec2_x(bp), HVec2_y(bp), HVec2_x(cp), HVec2_y(cp));
 
     if (cross > 0) {
-        if (f64_gt(det, 0) == 1) { return 1; }
+        if (det > 0) { return 1; }
         return 0;
     }
-    if (f64_lt(det, 0) == 1) { return 1; }
+    if (det < 0) { return 1; }
     return 0;
 }
 
@@ -369,65 +1037,117 @@ fn _col_ghost_cross(j, k) {
 # directed edges have positive orientation -- which is what makes the walk in
 # _col_dl_walk directional and the flood fill in delaunay_2d local.
 
-# Twice the signed area of the triangle (p, a, b), where p = (px, py). Positive
-# when p, a, b turn counter-clockwise; negative when p lies strictly on the right
-# of the directed edge a -> b, which is the "step across edge e" test. `nr` is
-# the number of real points; an index >= nr is the ghost nr + k.
+# --- exact signs of the ghost terms (3.3.5) ---------------------------------
 #
-# ONLY THE SIGN IS MEANINGFUL. For two real vertices the return is the true
-# determinant, but a ghost branch returns whichever coefficient of the expansion
-# in M decides the sign -- or a bare +-1 when that coefficient is a constant --
-# so the magnitude carries no geometric meaning. Callers only ever compare it
-# against zero, and getting a value back rather than a -1/0/+1 keeps the
-# real-by-real path (the interior of the mesh, and so the overwhelming majority
-# of calls) exactly as cheap as it was before ghosts existed.
+# The leading coefficient of a ghost predicate is a linear form in coordinate
+# differences with small integer weights (u components 1, 2, -2, or their pairwise
+# differences, up to 4 in magnitude), and its tie-breaks are an orientation, a dot
+# product or a distance comparison. Through 3.3.4 each was a float expression on
+# coordinates translated to p and was trusted whenever it came out nonzero -- but
+# the translation rounds, so a site at 1 beside a query at 2^100 lost itself in the
+# subtraction and the sign was noise. Each now has a filter and an exact fallback.
+
+# Linear-form filter bound: 8e (e = 2^-53) times |t1| + |t2|. The two subtractions,
+# a weight of 3 (the only weight that rounds) and the sum err by at most
+# (3e + 4e^2)(|t1| + |t2|), all of it relative: a subtraction, a power-of-two weight
+# and a sum are exact whenever their result is subnormal, and 3 * d rounds only to a
+# normal result. So no F64_TINY floor is needed. Below |t1| + |t2| = 2^-1022 nothing
+# rounds at all, and above it the 5e of slack exceeds the 2^-1075 the bound's own
+# product can lose.
+var _COL_DL_LIN_ERRB = 0x3CD0_0000_0000_0000;    # 2^-50
+# Distance-comparison filter bound: 8e times the four squares, plus F64_TINY -- a
+# square, unlike a difference, can round in the subnormal range.
+var _COL_DL_SQ_ERRB = 0x3CD0_0000_0000_0000;     # 2^-50
+
+# -1 / 0 / +1 for k1 * (x1 - y1) + k2 * (x2 - y2), k1 and k2 small integers as f64.
+fn _col_dl_lin_sign(k1, x1, y1, k2, x2, y2) {
+    var t1 = f64_mul(k1, f64_sub(x1, y1));
+    var t2 = f64_mul(k2, f64_sub(x2, y2));
+    var s = f64_add(t1, t2);
+    var errb = f64_mul(_COL_DL_LIN_ERRB, f64_add(f64_abs(t1), f64_abs(t2)));
+    if (f64_gt(f64_abs(s), errb) == 1) { return _col_f64_sign(s); }
+    return _col_bi_lin(f64_to(k1), x1, y1, f64_to(k2), x2, y2);
+}
+
+# -1 / 0 / +1 for (a - p) . (b - p). The orientation bound holds for a sum of two
+# products as it does for their difference.
+fn _col_dl_dot_sign(px, py, ax, ay, bx, by) {
+    var l = f64_mul(f64_sub(ax, px), f64_sub(bx, px));
+    var r = f64_mul(f64_sub(ay, py), f64_sub(by, py));
+    var s = f64_add(l, r);
+    if (_col_o2d_clear(s, l, r) == 1) { return _col_f64_sign(s); }
+    return _col_bi_pp(ax, px, bx, px, ay, py, by, py, 1);
+}
+
+# -1 / 0 / +1 for |r - a|^2 - |a - p|^2.
+fn _col_dl_dist_sign(rx, ry, ax, ay, px, py) {
+    var e1x = f64_sub(rx, ax);
+    var e1y = f64_sub(ry, ay);
+    var e2x = f64_sub(ax, px);
+    var e2y = f64_sub(ay, py);
+    var q1 = f64_add(f64_mul(e1x, e1x), f64_mul(e1y, e1y));
+    var q2 = f64_add(f64_mul(e2x, e2x), f64_mul(e2y, e2y));
+    var v = f64_sub(q1, q2);
+    var errb = f64_add(f64_mul(_COL_DL_SQ_ERRB, f64_add(q1, q2)), F64_TINY);
+    if (f64_gt(f64_abs(v), errb) == 1) { return _col_f64_sign(v); }
+    return _col_bi_dist(rx, ry, ax, ay, px, py);
+}
+
+# -1 / 0 / +1 for the triangle (p, a, b), where p = (px, py): positive when p, a, b
+# turn counter-clockwise, negative when p lies strictly on the right of the
+# directed edge a -> b, which is the "step across edge e" test. `nr` is the number
+# of real points; an index >= nr is the ghost nr + k.
 #
-# Real coordinates are translated by p first so both products stay on the scale
-# of the edge rather than the scale of the absolute coordinates. A ghost
-# contributes M * u_k, so the determinant is linear (or, for two ghosts,
-# quadratic) in M and its sign is that of the leading nonzero coefficient. The
-# leading coefficient of the one-ghost case is a single subtraction of two EXACT
-# products -- the u components are 1, 2 and -2, all powers of two -- so its sign
-# is exact.
+# A ghost contributes M * u_k, so the determinant is linear (or, for two ghosts,
+# quadratic) in M and its sign is that of the leading nonzero coefficient. Every
+# sign here is exact (3.3.5): two real vertices take the orientation filter and
+# `_col_o2d_exact`, a ghost's leading term `_col_dl_lin_sign`, and its tie the
+# apex's orientation. Through 3.3.4 the real-by-real return was a float
+# determinant on coordinates translated to p, and the one-ghost term was trusted
+# whenever it came out nonzero.
 fn _col_dl_orient(points, nr, ai, bi, px, py) {
     if (ai >= nr) {
         if (bi >= nr) {
             # Two ghosts: M^2 (u_j x u_k), constant and never zero. The query
             # point does not enter at all.
-            if (_col_ghost_cross(ai - nr, bi - nr) > 0) { return F64_ONE; }
-            return f64_neg(F64_ONE);
+            return _col_ghost_cross(ai - nr, bi - nr);
         }
         var gj = ai - nr;
         var bpg = vec_get(points, bi);
-        var bxg = f64_sub(HVec2_x(bpg), px);
-        var byg = f64_sub(HVec2_y(bpg), py);
-        var sg = f64_sub(f64_mul(_col_ghost_ux(gj), byg),
-          f64_mul(_col_ghost_uy(gj), bxg));
-        if (_col_f64_sign(sg) != 0) { return sg; }
+        var sg = _col_dl_lin_sign(_col_ghost_ux(gj), HVec2_y(bpg), py,
+          f64_neg(_col_ghost_uy(gj)), HVec2_x(bpg), px);
+        if (sg != 0) { return sg; }
         # p lies exactly on the ghost's ray: the M^0 term decides, which is the
         # orientation of the apex A = points[0] against the same edge.
         var apg = vec_get(points, 0);
-        var axg = f64_sub(HVec2_x(apg), px);
-        var ayg = f64_sub(HVec2_y(apg), py);
-        return f64_sub(f64_mul(axg, byg), f64_mul(ayg, bxg));
+        return _col_orient2d_sign(px, py, HVec2_x(apg), HVec2_y(apg), HVec2_x(bpg), HVec2_y(bpg));
     }
     var ap = vec_get(points, ai);
-    var ax = f64_sub(HVec2_x(ap), px);
-    var ay = f64_sub(HVec2_y(ap), py);
     if (bi >= nr) {
         var gk = bi - nr;
-        var sk = f64_sub(f64_mul(ax, _col_ghost_uy(gk)),
-          f64_mul(ay, _col_ghost_ux(gk)));
-        if (_col_f64_sign(sk) != 0) { return sk; }
+        var sk = _col_dl_lin_sign(_col_ghost_uy(gk), HVec2_x(ap), px,
+          f64_neg(_col_ghost_ux(gk)), HVec2_y(ap), py);
+        if (sk != 0) { return sk; }
         var apk = vec_get(points, 0);
-        var hx = f64_sub(HVec2_x(apk), px);
-        var hy = f64_sub(HVec2_y(apk), py);
-        return f64_sub(f64_mul(ax, hy), f64_mul(ay, hx));
+        return _col_orient2d_sign(px, py, HVec2_x(ap), HVec2_y(ap), HVec2_x(apk), HVec2_y(apk));
     }
+    # Two real vertices: `_col_o2d_clear`'s filter written out (this is the walk's
+    # inner test, and a 3-argument helper cannot be inlined), translated by p so both
+    # products stay on the scale of the edge. det is nonzero once it clears the bound.
     var bp = vec_get(points, bi);
-    var bx = f64_sub(HVec2_x(bp), px);
-    var by = f64_sub(HVec2_y(bp), py);
-    return f64_sub(f64_mul(ax, by), f64_mul(ay, bx));
+    var ax = HVec2_x(ap);
+    var ay = HVec2_y(ap);
+    var bx = HVec2_x(bp);
+    var by = HVec2_y(bp);
+    var l = f64_mul(f64_sub(ax, px), f64_sub(by, py));
+    var r = f64_mul(f64_sub(ay, py), f64_sub(bx, px));
+    var det = f64_sub(l, r);
+    var errb = f64_add(f64_mul(_COL_O2D_ERRBOUND, f64_add(f64_abs(l), f64_abs(r))), F64_TINY);
+    if (f64_gt(f64_abs(det), errb) == 1) {
+        if (f64_gt(det, 0) == 1) { return 1; }
+        return 0 - 1;
+    }
+    return _col_o2d_exact(px, py, ax, ay, bx, by);
 }
 
 # In-circle test for a triangle with ONE ghost, rotated so the ghost is last.
@@ -454,18 +1174,19 @@ fn _col_dl_orient(points, nr, ai, bi, px, py) {
 # pre-2.9.3 body scores 846 of 1500 on that grid.
 # [measured: tests/modules.tcyr _dlg1_run / _DLG1_BAD, mutant = drop the `* w`]
 # See docs/development/issues/archived/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md.
+#
+# 3.3.5: every sign below is exact. Through 3.3.4 they were float expressions on
+# coordinates translated to p, and (b - a) was formed as (b - p) - (a - p), two
+# roundings where none is needed.
 fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
     var ap = vec_get(points, ai);
     var bp = vec_get(points, bi);
-    var ax = f64_sub(HVec2_x(ap), px);
-    var ay = f64_sub(HVec2_y(ap), py);
-    var bx = f64_sub(HVec2_x(bp), px);
-    var by = f64_sub(HVec2_y(bp), py);
-    # (b - a) is p-free: the two subtractions below cancel it.
-    var ex = f64_sub(bx, ax);
-    var ey = f64_sub(by, ay);
-    var w = _col_f64_sign(f64_sub(
-        f64_mul(ex, _col_ghost_uy(k)), f64_mul(ey, _col_ghost_ux(k))));
+    var ax = HVec2_x(ap);
+    var ay = HVec2_y(ap);
+    var bx = HVec2_x(bp);
+    var by = HVec2_y(bp);
+    # (b - a) x u_k = uy * (bx - ax) - ux * (by - ay): p does not enter.
+    var w = _col_dl_lin_sign(_col_ghost_uy(k), bx, ax, f64_neg(_col_ghost_ux(k)), by, ay);
     # w == 0 means the edge is PARALLEL to u_k. That is NOT degenerate, and the
     # first draft of this repair got it wrong by assuming it was. G_k is
     # A + M*u_k with A the apex, so an edge parallel to u_k leaves the triangle
@@ -477,16 +1198,14 @@ fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
     # _col_dl_ic_g2's tie branch uses.
     if (w == 0) {
         var apx = vec_get(points, 0);
-        w = _col_f64_sign(f64_sub(
-            f64_mul(ex, f64_sub(HVec2_y(apx), HVec2_y(ap))),
-            f64_mul(ey, f64_sub(HVec2_x(apx), HVec2_x(ap)))));
+        w = _col_orient2d_sign(ax, ay, bx, by, HVec2_x(apx), HVec2_y(apx));
     }
     # Both zero: the edge is parallel to u_k AND the apex is on line(a, b), so
     # all three vertices are collinear for every M and there is no circle at all.
     # 0 is a convention here rather than a derived answer -- an exact oracle has
     # nothing to say about it -- but it is order-free, which is what matters.
     if (w == 0) { return 0; }
-    var s = _col_f64_sign(f64_sub(f64_mul(ax, by), f64_mul(ay, bx)));
+    var s = _col_orient2d_sign(px, py, ax, ay, bx, by);
     if (s * w > 0) { return 1; }
     if (s != 0) { return 0; }
     # p lies exactly ON line(a, b), so the answer is "p strictly between a and b"
@@ -513,8 +1232,7 @@ fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
     #
     # The betweenness test needs no ghost direction and no magnitudes, so it is
     # both correct and strictly cheaper than what it replaces.
-    var dp = f64_add(f64_mul(ax, bx), f64_mul(ay, by));
-    if (f64_lt(dp, 0) == 1) { return 1; }
+    if (_col_dl_dot_sign(px, py, ax, ay, bx, by) < 0) { return 1; }
     return 0;
 }
 
@@ -549,14 +1267,15 @@ fn _col_dl_ic_g1(points, ai, bi, k, px, py) {
 # until 2.9.3 (now forms sign((b - a) x u_k), falling back to the apex's side
 # when the edge is parallel to u_k). Asserted at all three arities:
 # _dlg_perm_bad (two ghosts), _dlg1_run (one), _dlg3_run (all three).
+#
+# 3.3.5: both signs are exact (`_col_dl_lin_sign`, `_col_dl_dist_sign`); through
+# 3.3.4 they were float expressions on coordinates translated to p.
 fn _col_dl_ic_g2(points, ri, j, k, px, py) {
     var rp = vec_get(points, ri);
-    var rx = f64_sub(HVec2_x(rp), px);
-    var ry = f64_sub(HVec2_y(rp), py);
     var dx = f64_sub(_col_ghost_ux(j), _col_ghost_ux(k));
     var dy = f64_sub(_col_ghost_uy(j), _col_ghost_uy(k));
     var cr = _col_ghost_cross(j, k);
-    var s = _col_f64_sign(f64_sub(f64_mul(rx, dy), f64_mul(ry, dx)));
+    var s = _col_dl_lin_sign(dy, HVec2_x(rp), px, f64_neg(dx), HVec2_y(rp), py);
     if (s != 0) {
         if (s * cr > 0) { return 1; }
         return 0;
@@ -567,13 +1286,7 @@ fn _col_dl_ic_g2(points, ri, j, k, px, py) {
     # broken by which of R and p is farther from A. Both distances are on the
     # data scale, so the comparison is well conditioned.
     var apx = vec_get(points, 0);
-    var e1x = f64_sub(HVec2_x(rp), HVec2_x(apx));
-    var e1y = f64_sub(HVec2_y(rp), HVec2_y(apx));
-    var e2x = f64_sub(HVec2_x(apx), px);
-    var e2y = f64_sub(HVec2_y(apx), py);
-    var s2 = _col_f64_sign(f64_sub(
-        f64_add(f64_mul(e1x, e1x), f64_mul(e1y, e1y)),
-        f64_add(f64_mul(e2x, e2x), f64_mul(e2y, e2y))));
+    var s2 = _col_dl_dist_sign(HVec2_x(rp), HVec2_y(rp), HVec2_x(apx), HVec2_y(apx), px, py);
     # No `* cr` here, unlike the M^3 branch above: (u_j x u_k) is already a
     # factor of this coefficient, so s2 IS sign(M^2 coeff) * cr. Applying cr
     # again would square it away and invert the answer for anti-cyclic pairs.
@@ -666,8 +1379,9 @@ fn _col_dl_incircle(points, nr, ai, bi, ci, px, py) {
 
 # 1 when (px, py) is strictly inside CCW triangle (v0, v1, v2), 0 otherwise
 # (including on an edge or a vertex).
-# ⚠ 3.3.3 — `f64_gt(o, 0) == 0` is TRUE for NaN, so a NaN orientation reads as "not
-# strictly inside" and delaunay_2d's insertion override below does not fire. Two
+# ⚠ 3.3.3 — through 3.3.4 the orientation was a float, and `f64_gt(o, 0) == 0` is TRUE
+# for NaN, so a NaN orientation read as "not strictly inside" and delaunay_2d's
+# insertion override below did not fire. Two
 # inputs have produced one, and the reading means something different for each:
 #   * a NaN COORDINATE. Not-inside was the right reading: a point with no position is
 #     inside nothing. Flipped to answer 1 for NaN, the override inserted the NaN point,
@@ -693,10 +1407,13 @@ fn _col_dl_incircle(points, nr, ai, bi, ci, px, py) {
 #     square plus a site at (2^-300, 0) reaches this test exactly as above, and the drop
 #     is still the lesser wrong answer there.
 #     [measured: tests/abuse.tcyr, group "3.3.3 R4sym: delaunay_2d at an overflowing scale"]
+#     ⛔ 3.3.5 — `_col_dl_orient` is an exact -1 / 0 / +1 for any finite sites, so no
+#     set reaches this test with a NaN; that wide square now comes back as its Delaunay
+#     mesh (pinned in the same group).
 fn _col_dl_strict_inside(points, nr, v0, v1, v2, px, py) {
-    if (f64_gt(_col_dl_orient(points, nr, v1, v2, px, py), 0) == 0) { return 0; }
-    if (f64_gt(_col_dl_orient(points, nr, v2, v0, px, py), 0) == 0) { return 0; }
-    if (f64_gt(_col_dl_orient(points, nr, v0, v1, px, py), 0) == 0) { return 0; }
+    if (_col_dl_orient(points, nr, v1, v2, px, py) <= 0) { return 0; }
+    if (_col_dl_orient(points, nr, v2, v0, px, py) <= 0) { return 0; }
+    if (_col_dl_orient(points, nr, v0, v1, px, py) <= 0) { return 0; }
     return 1;
 }
 
@@ -708,9 +1425,9 @@ fn _col_dl_strict_inside(points, nr, v0, v1, v2, px, py) {
 # The first edge tried rotates with the step count. A walk that always tries
 # edge 0 first can enter a two- or three-triangle cycle when the orientation
 # determinant round-trips through zero on near-degenerate geometry; rotating
-# the entry point breaks those cycles. `budget` is the backstop for the rest --
-# the predicate is not exact, so termination cannot be assumed, and the caller
-# falls back to a linear scan.
+# the entry point breaks those cycles. `budget` is the backstop for the rest:
+# the predicate has been exact since 3.3.5, but the walk's termination is not
+# proved here, so the caller still falls back to a linear scan.
 fn _col_dl_walk(points, nr, tris, nbrs, start, px, py, budget) {
     var cur = start;
     var steps = 0;
@@ -729,7 +1446,7 @@ fn _col_dl_walk(points, nr, tris, nbrs, start, px, py, budget) {
             var e = (steps + j) % 3;
             var ea = vec_get(tris, b + (e + 1) % 3);
             var eb = vec_get(tris, b + (e + 2) % 3);
-            if (f64_lt(_col_dl_orient(points, nr, ea, eb, px, py), 0) == 1) {
+            if (_col_dl_orient(points, nr, ea, eb, px, py) < 0) {
                 outside = 1;
                 nxt = vec_get(nbrs, b + e);
                 j = 3;
@@ -757,9 +1474,9 @@ fn _col_dl_locate_scan(points, nr, tris, n_slots, px, py, mode) {
             var v2 = vec_get(tris, b + 2);
             if (mode == 0) {
                 var ok = 1;
-                if (f64_lt(_col_dl_orient(points, nr, v1, v2, px, py), 0) == 1) { ok = 0; }
-                if (f64_lt(_col_dl_orient(points, nr, v2, v0, px, py), 0) == 1) { ok = 0; }
-                if (f64_lt(_col_dl_orient(points, nr, v0, v1, px, py), 0) == 1) { ok = 0; }
+                if (_col_dl_orient(points, nr, v1, v2, px, py) < 0) { ok = 0; }
+                if (_col_dl_orient(points, nr, v2, v0, px, py) < 0) { ok = 0; }
+                if (_col_dl_orient(points, nr, v0, v1, px, py) < 0) { ok = 0; }
                 if (ok == 1) { return t; }
             } else {
                 if (_col_dl_incircle(points, nr, v0, v1, v2, px, py) == 1) { return t; }
@@ -791,6 +1508,13 @@ fn _col_dl_locate_scan(points, nr, tris, n_slots, px, py, mode) {
 # 2^-266. MID is the band's centre: a set out of the band whose nonzero magnitudes
 # span at most HI - LO = 430 binades is centred there, which puts all of it inside.
 # [measured: scratch sweep of every exact 2^e of both fixtures on the 3.3.4 base bundle, 2026-10-03; cycc 6.6.14]
+#
+# ⛔ 3.3.5 -- every predicate is exact for any finite sites (the filters above, with
+# `_col_bi_*` behind them), so no scale changes a decision, and a set returns the same
+# triangles at every scale at which it is exactly representable, wide sets included.
+# The band stays for speed: inside it the filters decide on the float value except
+# near a true tie, and the orientation expansion's window holds, where a set left at
+# an extreme scale would send most of its predicates to the integer path.
 enum _ColDlBand {
     _COL_DL_EXP_LO = -180;
     _COL_DL_EXP_HI = 250;
@@ -851,6 +1575,12 @@ fn _col_dl_scaled(points, n, k) {
 
 public fn delaunay_2d(points, n) {
     var result = vec_new();
+    # 3.3.5: the exact paths' scratch buffers belong to this call -- a pointer kept
+    # from an earlier call may point into memory a caller's alloc_reset() has handed
+    # out again (the note above _COL_O2D_BUF). Each is allocated at most once below.
+    _COL_O2D_BUF = 0;
+    _COL_BI_BUF = 0;
+    _COL_DL_NOMEM = 0;
     # ⛔ `n` RESTATES `vec_len(points)` AND WAS NEVER CHECKED -- the guard 2.12.0
     # gave convex_hull_2d, triangulate_polygon and sequential_impulse, missed here.
     # Three points with n = 4 printed `vec: index out of bounds` and exited 1 (the
@@ -899,12 +1629,16 @@ public fn delaunay_2d(points, n) {
     # 0 1 4] where 3.3.3 gave [1 2 4, 0 1 4, 2 3 4, 3 0 4].
     # [measured: R4sym square, y scaled, 3.3.4 base vs this tree, 2026-10-03; cycc 6.6.14]
     # ⚠ A set WIDER than the band -- nonzero magnitudes more than 430 binades apart --
-    # has no scale at which every predicate is safe, and runs unscaled, as through 3.3.3.
-    # It still fails at extreme scales: the square (0,0)..(4,4) plus (DBL_MAX, 1), whose
-    # W2 mesh is right at scale 1, comes back empty from 2^-540 down. Centring wide sets
-    # as well was measured and rejected: more meshes right in all, but thousands that
-    # 3.3.3 got right came back wrong.
+    # has no scale that puts it inside, and runs unscaled. Through 3.3.4 it still failed
+    # at extreme scales: the square (0,0)..(4,4) plus (DBL_MAX, 1), whose W2 mesh is right
+    # at scale 1, came back empty from 2^-540 down, and centring wide sets as well was
+    # measured and rejected (thousands that 3.3.3 got right came back wrong).
     # [measured: scratch sweep, 750 random sets spanning 450-1000 binades, both policies, 2026-10-03; cycc 6.6.14]
+    # ⛔ 3.3.5 -- the predicates are exact over the whole double range, so a wide set is
+    # triangulated exactly, unscaled: that square returns its scale-1 list at every scale
+    # from 2^-1074 to 1, and each of 65 wide sets swept over every 2^e returns one list
+    # at all its exact scales, where 3.3.4 returned between 2 and 97 different ones.
+    # [measured: scratch sweep of every 2^e, exact oracle and port, 2026-10-11; cycc 6.6.14]
     var amax = 0;
     var amin = F64_POS_INF;
     for (var fi = 0; fi < n; fi = fi + 1) {
@@ -1006,12 +1740,16 @@ public fn delaunay_2d(points, n) {
             var sv2 = vec_get(tris, sb + 2);
             var seed_bad = _col_dl_incircle(points, n, sv0, sv1, sv2, px, py);
             # A point strictly inside a triangle is strictly inside that
-            # triangle's circumcircle, so a "no" here can only be round-off in
-            # the non-adaptive determinant. Believing it would leave the point
-            # uninserted and punch a hole in the mesh, so strict containment
-            # overrides it. Containment is NOT strict when the point coincides
-            # with an existing vertex, which is exactly when an empty bad set
-            # is the right answer (a duplicate point adds nothing).
+            # triangle's circumcircle, so through 3.3.4 a "no" here could only be
+            # round-off in the non-adaptive determinant, and believing it would
+            # leave the point uninserted and punch a hole in the mesh; strict
+            # containment overrides it. Containment is NOT strict when the point
+            # coincides with an existing vertex, which is exactly when an empty
+            # bad set is the right answer (a duplicate point adds nothing).
+            # Since 3.3.5 every predicate is exact and the override cannot fire
+            # (0 times on 1,973 sets, against 50 for the 3.3.4 predicates); it
+            # stays as the guard against a hole.
+            # [measured: scratch port of delaunay_2d (python3 fractions), not reproducible in-tree, 2026-10-11]
             if (seed_bad == 0) {
                 if (_col_dl_strict_inside(points, n, sv0, sv1, sv2, px, py) == 1) {
                     seed_bad = 1;
@@ -1135,6 +1873,13 @@ public fn delaunay_2d(points, n) {
         if (m > 0) { hint = base_new; }
     }
 
+    # A predicate that could not get its scratch buffer answered 0 instead of a
+    # sign, so the mesh above cannot be trusted: the empty result, as for any input
+    # this function cannot triangulate. The compaction's winding test below runs after
+    # this check and can fail the same way; a 0 there only skips the swap, which never
+    # fires on these counter-clockwise triangles, so the list is unchanged.
+    if (_COL_DL_NOMEM != 0) { return result; }
+
     # Compact: skip tombstones, drop the ghost triangles (every one of which is
     # outside the convex hull, so nothing real is lost), and emit CCW.
     #
@@ -1160,12 +1905,16 @@ public fn delaunay_2d(points, n) {
                 var bp = vec_get(points, t1);
                 var cp = vec_get(points, t2);
 
-                var cross = f64_sub(
-                  f64_mul(f64_sub(HVec2_x(bp), HVec2_x(ap)), f64_sub(HVec2_y(cp), HVec2_y(ap))),
-                  f64_mul(f64_sub(HVec2_x(cp), HVec2_x(ap)), f64_sub(HVec2_y(bp), HVec2_y(ap)))
-                  );
+                # 3.3.5: the exact winding. 3.3.4's float one misread thin
+                # counter-clockwise triangles as clockwise and swapped them
+                # (an 18-site set emitted one). Every stored triangle is now
+                # counter-clockwise, so the swap no longer fires (0 times on
+                # 1,973 sets); it stays as the normalisation the contract names.
+                # [measured: scratch port of delaunay_2d (python3 fractions), not reproducible in-tree, 2026-10-11]
+                var cross = _col_orient2d_sign(HVec2_x(ap), HVec2_y(ap),
+                  HVec2_x(bp), HVec2_y(bp), HVec2_x(cp), HVec2_y(cp));
 
-                if (f64_lt(cross, 0) == 1) {
+                if (cross < 0) {
                     # Swap t0 and t1 for CCW
                     vec_push(result, t1);
                     vec_push(result, t0);

@@ -15,11 +15,15 @@ var _CALCX_F64_THREE   = 0x4008_0000_0000_0000;  # 3.0
 var _CALCX_F64_FOUR    = 0x4010_0000_0000_0000;  # 4.0
 var _CALCX_F64_SIX     = 0x4018_0000_0000_0000;  # 6.0
 var _CALCX_F64_NINE    = 0x4022_0000_0000_0000;  # 9.0
+var _CALCX_F64_EIGHT   = 0x4020_0000_0000_0000;  # 8.0
+var _CALCX_F64_EIGHTH  = 0x3FC0_0000_0000_0000;  # 0.125
 var _CALCX_F64_FIFTEEN = 0x402E_0000_0000_0000;  # 15.0
 # The floor below which _adaptive_simpson_rec tests a panel's error estimate: 2^-56 of
 # the panel's own estimate, where 15 * tol is 0.9375 m ulps of it, m its significand in
 # [1, 2) (see there).
 var _CALCX_F64_REL_FLOOR = 0x3C70_0000_0000_0000;  # 2^-56
+# The first magnitude f64_to cannot convert: |c| < 2^63 fits in i64 (_calcx_perlin_cell).
+var _CALCX_F64_2_POW_63 = 0x43E0_0000_0000_0000;  # 2^63
 
 # ⛔ 3.3.3 — `_CALCX_F64_1E_NEG30` NO LONGER DECIDES A FLAT SEGMENT IN ANY SET 3.3.3
 # SPLINES ITSELF. It is calc_monotone_cubic's 3.3.2 flat-secant threshold: an absolute
@@ -399,6 +403,23 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
     # 0x3FF4257FA752D2AB (1.259, 11% low, also wrong) after 678,729 down to 1e-300, and
     # NaN at 2^-1028 and 2^-1060. No panel test can see a feature its samples miss.
     # [measured: adaptive sweep plus 8 aliasing integrands; 3.3.3 bundle, this tree; Decimal oracle; 2026-10-03]
+    # ⭐ 3.3.5 — FLOORED ACCEPTANCE REQUIRES NOTHING MORE, AND THAT IS A DECISION. The alias
+    # is accepted at every tolerance, not only through the floor: from tol 1e-2 to 1e-15,
+    # 1.1 + 0.5 |sin k pi x| returns 1.1 after the root's 5 evaluations for k = 4, 8, 12,
+    # 16, 32 and 64 (the root's refined and whole agree exactly), and at tol 1e-17 k = 16 and
+    # 32 still do. Rules confined to floored acceptance were measured against this one on
+    # 20 integrands x 34 tolerances (3,000,000-evaluation cap): flooring only from the second,
+    # fourth or sixth level down, requiring the next level to agree, or requiring a 2-point
+    # Gauss estimate at the panel's irrational nodes to agree with a raised-tolerance
+    # acceptance all return 0x3FF4257FA752D2AB for the sin 8 pi x repro (1.259, 3.3.3's wrong
+    # value: its right child agrees exactly) after 59,781 to 86,853 evaluations, and put no
+    # further call within 4 ulps. Requiring that Gauss agreement for EVERY acceptance in a
+    # floored panel fixes the repro at all 17 tolerances from 1e-17 down (0.72 ulp after
+    # 186,341 evaluations at 1e-17) and nothing else in the sweep, but k = 64 then walks
+    # past 200,000,000 evaluations where it returned 1.1 after 9:
+    # its rounding noise is above the floor, which nothing but a work bound ([3.4.0], D070)
+    # can stop; it also costs x^4 at tol 1e-300 607,479 evaluations against 408,529.
+    # [measured: scratch same-binary harness (p/palias.cyr), 3.3.5 tree, Decimal oracle, 2026-10-11; cycc 6.6.14]
     var tol_eff = tol;
     var tol_floor = f64_mul(f64_abs(whole), _CALCX_F64_REL_FLOOR);
     if (depth < 50 && f64_lt(tol_eff, tol_floor) == 1) { tol_eff = tol_floor; }
@@ -410,13 +431,16 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
     var h = f64_mul(f64_sub(b, a), F64_HALF);
     var h_over_6 = f64_div(h, _CALCX_F64_SIX);
 
-    # Left Simpson: h/6 * (fa + 4*flm + fmid)
-    var left_val = f64_mul(h_over_6,
-      f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, flm)), fmid));
+    # Left Simpson: h/6 * (fa + 4*flm + fmid); a sum that overflowed is formed again
+    # without overflow (_calcx_panel_wide).
+    var lsum = f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, flm)), fmid);
+    var left_val = f64_mul(h_over_6, lsum);
+    if (f64_lt(f64_abs(lsum), F64_POS_INF) == 0) { left_val = _calcx_panel_wide(h_over_6, fa, flm, fmid); }
 
     # Right Simpson: h/6 * (fmid + 4*frm + fb)
-    var right_val = f64_mul(h_over_6,
-      f64_add(f64_add(fmid, f64_mul(_CALCX_F64_FOUR, frm)), fb));
+    var rsum = f64_add(f64_add(fmid, f64_mul(_CALCX_F64_FOUR, frm)), fb);
+    var right_val = f64_mul(h_over_6, rsum);
+    if (f64_lt(f64_abs(rsum), F64_POS_INF) == 0) { right_val = _calcx_panel_wide(h_over_6, fmid, frm, fb); }
 
     var refined = f64_add(left_val, right_val);
 
@@ -484,7 +508,9 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
 # resolution, 2^-56 of the panel's estimate, on every panel below the root (see
 # _adaptive_simpson_rec): x^4 at tol = 1e-300 takes 408,529 evaluations, not 1,415,173,
 # for the same value. ⚠ A raised tolerance accepts an integrand that aliases on a
-# child's nine samples: 1.1 + 0.5 |sin 8 pi x| at tol = 1e-17 returns 1.1, 22% low.
+# child's nine samples: 1.1 + 0.5 |sin 8 pi x| at tol = 1e-17 returns 1.1, 22% low. It is
+# kept, as the method's own aliasing (any tolerance aliases on the root's five samples);
+# the 3.3.5 decision and its A/B are at _adaptive_simpson_rec.
 # [measured: tests/modules.tcyr, group "3.3.4: calc_adaptive_simpson, the relative floor"]
 # [measured: the sin 8 pi x row, adaptive aliasing sweep; 3.3.3 bundle, this tree; 2026-10-03]
 #
@@ -509,10 +535,52 @@ public fn calc_adaptive_simpson(f, a, b, tol) {
     var fmid = fncall1(f, mid);
 
     # Initial Simpson estimate: (b-a)/6 * (fa + 4*fmid + fb)
-    var whole = f64_mul(f64_div(f64_sub(b, a), _CALCX_F64_SIX),
-      f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fmid)), fb));
+    var w6 = f64_div(f64_sub(b, a), _CALCX_F64_SIX);
+    var wsum = f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fmid)), fb);
+    var whole = f64_mul(w6, wsum);
+    if (f64_lt(f64_abs(wsum), F64_POS_INF) == 0) { whole = _calcx_panel_wide(w6, fa, fmid, fb); }
 
     return _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, 50);
+}
+
+# Internal: a Simpson panel w6 * (fa + 4 fm + fb) whose plain sum is not finite, formed
+# from an eighth of each sample and multiplied back.
+#
+# ⛔ 3.3.5 — THE PANEL SUM OVERFLOWED BEFORE THE WIDTH SCALED IT, the defect 3.3.4
+# repaired in calc_integral_trapez and _simpson: f = DBL_MAX on [0, 0.5] returned +Inf
+# (4 DBL_MAX overflows in every panel), where the integral is 0.5 DBL_MAX. Each of
+# |fa|/8, 4|fm|/8 and |fb|/8 is at most DBL_MAX/2, DBL_MAX/2 and DBL_MAX/8, so they sum
+# without overflow, and the eighths are exact: the sum is the plain one computed without
+# overflow, rounded the same way. (A sample small enough to lose bits on the subnormal
+# grid is only ever added to a partial sum of at least 2^969 when the plain sum
+# overflows, which absorbs it in both forms; and a sum of such terms that cancels is
+# exactly 0 or above 2^900, so its product with w6 is 0 or normal.) So the closing * 8
+# adds no rounding, and the panel is +-Inf only when its value is. A w6 that underflowed
+# to 0 gives the panel's value for that w6, 0, as an in-range sum does and as
+# calc_integral_trapez and _simpson give for an h of 0 since 3.3.4 (3.3.4 here: NaN). An
+# infinite or NaN sample stays one, so such a panel gets the class of the sum computed
+# without overflow, as calc_integral_trapez's does. Over 6,001 calls whose
+# panel sums overflow (constant, linear and quadratic integrands up to DBL_MAX, tol 1e300,
+# 1e295 and 1e-10), 3,913 went from +-Inf to a finite value, 3,910 of them within 4 ulps
+# of the exact integral (median 0.41 ulp), and 2,077 kept their bits; 1,052 calls on
+# ordinary integrands kept value and evaluation count.
+# [measured: scratch adaptive overflow sweep and control, 3.3.4 tree and this tree, python3 Fraction oracle, 2026-10-11]
+# ⚠ A TOLERANCE FAR BELOW SUCH AN INTEGRAL NOW WALKS, where 3.3.4 returned +-Inf after 5
+# evaluations. 11 of those calls (tol 1e-10 against integrals near 1e307, 1e-317 of the
+# integral) passed a 3,000,000-evaluation cap; an independent 6,000-call sweep that adds
+# tol 1e200 and 1e290 found 25, and with a 2,000,000,000 cap 19 finished after 4.5 to 340
+# million evaluations (up to 16.7 s) and 6 reached the cap (over 70 s each). Repro:
+# f = c + c2 x, c = -7.63789397460012e307, c2 = 9.159228204482216e307, on
+# [0, 1.02501834742558] at tol 1e-10 reaches the 2e9 cap, and so does its in-range twin
+# with c, c2 and tol scaled by 2^-600, at the same count: the walk is the one any
+# integral takes when the panels' rounding noise is above the relative floor (see
+# _adaptive_simpson_rec), and bounding it is the [3.4.0] work bound (D070). (Scaled by
+# 2^-1000 instead, the tolerance underflows as it halves and the twin ends differently.)
+# [measured: integrator's reviewer sweep, 2e9 cap, 2026-10-11; repro and 2^-600 twin rerun in scratch, 2026-10-11]
+fn _calcx_panel_wide(w6, fa, fm, fb) {
+    var t = f64_add(f64_mul(fa, _CALCX_F64_EIGHTH), f64_mul(_CALCX_F64_FOUR, f64_mul(fm, _CALCX_F64_EIGHTH)));
+    t = f64_add(t, f64_mul(fb, _CALCX_F64_EIGHTH));
+    return f64_mul(f64_mul(w6, t), _CALCX_F64_EIGHT);
 }
 
 # ================================================================
@@ -1651,21 +1719,44 @@ fn _grad3(hash, x, y, z) {
     return f64_sub(f64_neg(y), z);
 }
 
+# The lattice cell index c -- the floor of a coordinate, an integer-valued f64 --
+# reduced mod 256, the period of noise_perm's table, as an integer in [0, 255]: below
+# 2^63 in magnitude f64_to(c) & 255, exact, negative c included; from 2^63 up c is a
+# multiple of 2048, residue 0, and is never converted, because f64_to past the i64
+# range is the toolchain's. A NaN or infinite c also returns 0, as 6.6.3's i64 min
+# did; perlin_3d returns NaN there whatever the hash. The same reduction as calc.cyr's
+# _calc_perlin_cell and noise_simplex.cyr's _simplex_cell (modules keep their own `_`
+# names).
+fn _calcx_perlin_cell(c) {
+    if (f64_lt(f64_abs(c), _CALCX_F64_2_POW_63) == 1) { return f64_to(c) & 255; }
+    return 0;
+}
+
 # 3D improved Perlin noise. Returns f64 in approximately [-1, 1].
 # x, y, z: f64 coordinates.
 #
 # Certified the same way as perlin_2d (see src/calc.cyr): bit-exact point values
 # and 1728-sample L1 mass against an independent reference, plus the exact
 # multiple-of-1/8 cell-centre histogram over 512 cells.
+#
+# ⛔ 3.3.5 — PAST 2^63 THE CELL WAS THE TOOLCHAIN'S, as in perlin_2d (see there): a
+# positive coordinate of 2^63 or more hashed as cell 255 from cycc 6.6.8 and 0 under
+# 6.6.3 to 6.6.7. _calcx_perlin_cell reduces it exactly. Of 21,000 calls with a
+# coordinate in +-[2^63, 2^1021), 10,446 broke the 256-periodicity under 6.6.14 and none
+# do now; every pin returns the same value there, and a zero result can differ in sign
+# between pins (below 6.6.8 f64_neg(+0) is +0; see perlin_2d). Every call with all three
+# coordinates finite and below 2^63 keeps its bits (83,133 random calls checked); a NaN
+# or infinite one still returns NaN, whose sign bit can change.
+# [measured: scratch perlin sweep, 3.3.4 tree and this tree, cycc 6.6.3 and 6.6.14, 2026-10-11]
 public fn perlin_3d(x, y, z) {
 
-    # Grid cell coordinates (integer, masked to 0-255)
+    # Grid cell coordinates (integer, reduced mod 256 by _calcx_perlin_cell)
     var xf = f64_floor(x);
     var yf = f64_floor(y);
     var zf = f64_floor(z);
-    var xi = f64_to(xf) & 255;
-    var yi = f64_to(yf) & 255;
-    var zi = f64_to(zf) & 255;
+    var xi = _calcx_perlin_cell(xf);
+    var yi = _calcx_perlin_cell(yf);
+    var zi = _calcx_perlin_cell(zf);
 
     # Fractional position within cell
     var xfr = f64_sub(x, xf);

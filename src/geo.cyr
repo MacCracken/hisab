@@ -20,8 +20,14 @@ var _GEO_F64_FOUR    = 0x4010_0000_0000_0000;  # 4.0
 # The degree audit (roadmap "Named hex thresholds") found no use to audit.
 # The smallest MAGNITUDE whose reciprocal is still finite (DBL_MIN). Anything at
 # or above this can be divided by; anything below it makes 1/x overflow. 2.10.2
-# uses it as the slab method's parallel test -- see geo_ray_aabb_face.
+# used it as the slab method's parallel test; geo_ray_obb_face still does, and
+# geo_ray_aabb_face's is an exact zero since 3.3.5 (see there).
 var _GEO_F64_TINY    = F64_TINY;   # alias of error.cyr's F64_TINY (DBL_MIN)
+# 3.3.5: below this squared length a ray direction is pre-scaled in the sphere and
+# capsule quadratics (see _geo_sphere_roots): 54 binades above the DBL_MIN at which
+# d.d itself flushes, so a direction above 2^-484 meeting unit-scale geometry keeps
+# every product normal and runs unscaled.
+var _GEO_DIR_LO      = 0x0370_0000_0000_0000;  # 2^-968 = 4.008336720017946e-292
 var _GEO_F64_THREE   = 0x4008_0000_0000_0000;  # 3.0
 var _GEO_F64_THIRD   = 0x3FD5_5555_5555_5555;  # 1.0/3.0
 
@@ -83,12 +89,16 @@ fn _geo_unit_or(v, fallback) {
 
 # 1 when the largest |component| of the four vectors is in the top binade, 2^1023 to
 # DBL_MAX: every component is then finite (a NaN or an Inf has exponent field 2047)
-# and the difference of two of them can overflow, so the caller halves all four
-# first. Halving is exact there but for a subnormal component's last bit, which is
-# below 2^-2097 of the largest. Where two large coordinates cancel exactly, that bit
-# can be the whole difference: it is then halved to 0 and the caller's degenerate
-# fallback answers (the segment (2^1023, 2^-1074, 0) -> (2^1023, 0, 0) gives unit_x,
-# not (0, -1, 0)), as on 3.3.3. 0 otherwise, and the caller's arithmetic is unchanged.
+# and the difference of two of them can overflow, so the caller halves all four.
+# Halving is exact there but for a subnormal component's last bit, which is below
+# 2^-2097 of the largest. Where two large coordinates cancel exactly, that bit can be
+# the whole difference, and halving it to 0 hands the caller's degenerate fallback a
+# shape that is not degenerate. geo_segment_direction therefore halves only when a
+# difference has overflowed. The three triangle routines halve whenever this is 1:
+# the triangle (2^1023, 0, 0), (2^1023, 2^-1074, 0), (2^1023, 0, 2^-1074) gets the
+# unit normal (0, 1, 0) and the centroid weights, as on 3.3.3, where its 2^1022 copy
+# gets (1, 0, 0) and the exact weights. 0 otherwise, and the caller is unchanged.
+# [measured: G1 top-binade sibling probe, 3.3.4 tree and this one, not in-tree, 2026-10-11; cycc 6.6.14]
 fn _geo_top_binade(a, b, c, d) {
     var m = _geo_absmax_bits(a);
     var t = _geo_absmax_bits(b);
@@ -398,11 +408,12 @@ public fn geo_segment_midpoint(seg) {
 public fn geo_segment_direction(seg) {
     var p0 = GeoSegment_start(seg);
     var p1 = GeoSegment_end(seg);
-    if (_geo_top_binade(p0, p1, p0, p1) == 1) {
-        p0 = hvec3_scale(p0, F64_HALF);
-        p1 = hvec3_scale(p1, F64_HALF);
-    }
     var d = hvec3_sub(p1, p0);
+    if ((_geo_absmax_bits(d) >> 52) == 2047) {
+        if (_geo_top_binade(p0, p1, p0, p1) == 1) {
+            d = hvec3_sub(hvec3_scale(p1, F64_HALF), hvec3_scale(p0, F64_HALF));
+        }
+    }
     # ⛔ Same shape as geo_triangle_unit_normal above: a SQUARED length against a
     # threshold meant for an unsquared one, so a valid short segment still got a
     # fabricated unit_x. `1 / sqrt(len_sq)` fails only at an exact zero.
@@ -425,9 +436,7 @@ public fn geo_segment_direction(seg) {
     # FALLBACK WAS STILL A FABRICATION (roadmap D087). Below about 2^-1024 the
     # reciprocal is +Inf and every such segment got unit_x. `_geo_unit_or` scales d
     # by a power of two first, exactly, so the length it divides by is normal and the
-    # fallback is left for the zero segment, and for ends in the top binade that
-    # differ only in a subnormal last bit, which the halving below drops
-    # (_geo_top_binade). On the integer grid
+    # fallback is left for the zero segment. On the integer grid
     # (i, j, l) * 2^-1074, |i|, |j| <= 6, l in {0, 1, 3}, 500 of 506 directions were
     # wrong and none is now; over 83513 segments in all (30 directions at every
     # 2^e, and 20000 mixed ends) 2361 moved into 4 * 2^-53 of the exact direction
@@ -441,6 +450,19 @@ public fn geo_segment_direction(seg) {
     # in the top binade both ends are halved first (_geo_top_binade). 20000 segments
     # with coordinates up to DBL_MAX: 14443 right before, all 20000 now.
     # [measured: georay top-binade segment sweep, exact oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
+    # ⛔ 3.3.5 — HALVED ONLY WHEN THE DIFFERENCE OVERFLOWED. 3.3.4 halved whenever a
+    # coordinate was in the top binade, which drops a subnormal last bit, and where
+    # the big coordinates cancel that bit is the whole difference:
+    # (2^1023, 2^-1074, 0) -> (2^1023, 0, 0) got the unit_x fallback, not (0, -1, 0).
+    # An infinite component of d from finite ends can only be an overflow, so that is
+    # the test. 80001 segments (the repro, and 20000 each: top-binade coordinates
+    # shared by both ends, overflowing differences, random top-binade ends, none in
+    # the top binade), against the exact direction within 4 * 2^-53: 120 wrong ->
+    # right, none right -> wrong, and the 20000 without a top-binade coordinate keep
+    # their bits. 748 right answers moved, 249 closer and 102 further (at most
+    # 1.61 * 2^-53 off, from `_geo_unit_or`'s reciprocal of the exact difference's
+    # length where 3.3.4 took the halved difference's).
+    # [measured: G1 segment sweep, exact Fraction/Decimal oracle, 3.3.4 tree vs this one, 2026-10-11; cycc 6.6.14]
     return _geo_unit_or(d, hvec3_unit_x());
 }
 
@@ -723,7 +745,38 @@ fn _geo_sphere_roots(ray, sphere, out) {
     # with d = (0,0,2^-40) still returned 0. `a` only has to admit a finite
     # reciprocal (`inv_a` below), and DBL_MIN guarantees that (1/DBL_MIN = 2^1022).
     # [measured: shipped binary, hit at k = 0 and miss from k = -41]
-    if (f64_lt(a, _GEO_F64_TINY) == 1) { return 0; }
+    # ⛔ 3.3.5 — BELOW 2^-511 A RAW DIRECTION WAS STILL A MISS: `a` = d.d is under
+    # DBL_MIN there (a unit sphere at (0,0,5) with d = (0,0,2^-512), true t = 5 * 2^512,
+    # returned 0) while plane, triangle and AABB answer to about 2^-1022, and just
+    # above it half_b^2 and a * c were subnormal. A d with d.d below 2^-968
+    # (_GEO_DIR_LO) is multiplied by the power of two `sc` that takes its largest
+    # component into [1, 2) (a stack copy, no allocation), the quadratic is solved for
+    # it, and its roots, t / sc, are multiplied back by sc. Powers of two are exact, so
+    # this is the copy's answer scaled, bit for bit the unscaled one wherever that kept
+    # every product normal, and a t past DBL_MAX is +Inf as it is for a far sphere.
+    # Only a zero d is still the miss, and a NaN d (a NaN `a` fails the `<`) keeps the
+    # old arithmetic, as does every ray with d.d of 2^-968 or more.
+    # 48 rays, each at every 2^k from 2^-1074 to 2^-400 and from 2^-20 to 2^20 (34368):
+    # against an exact root, sphere answers 20229 wrong -> right and none right ->
+    # wrong, and t(2^k d) is 2^-k t(d) bit for bit in all 31853 exact scalings
+    # (3.3.4 differed in 11 at 2^-512..2^-510, from subnormal products, by up to
+    # 22.6 ulp against the copy's 8.6). The capsule (geo_ray_capsule_branch, with
+    # its barrel scaled alike) became covariant in t and branch in 20933 and lost it
+    # in none; 11 differ only past DBL_MAX, where t is +Inf and the branch arbitrary.
+    # The 6064 rays with d.d of 2^-968 or more kept their bits.
+    # [measured: G1 ray sweep, exact Fraction/Decimal roots, 3.3.4 tree vs this one, 2026-10-11; cycc 6.6.14]
+    var sc = 0;
+    var ds[24];
+    if (f64_lt(a, _GEO_DIR_LO) == 1) {
+        var m = _geo_absmax_bits(d);
+        if (m == 0) { return 0; }
+        sc = _geo_scale_for(m >> 52);
+        store64(&ds, f64_mul(HVec3_x(d), sc));
+        store64(&ds + 8, f64_mul(HVec3_y(d), sc));
+        store64(&ds + 16, f64_mul(HVec3_z(d), sc));
+        half_b = hvec3_dot(oc, &ds);
+        a = hvec3_dot(&ds, &ds);
+    }
     var discriminant = f64_sub(f64_mul(half_b, half_b), f64_mul(a, c));
 
     if (f64_lt(discriminant, 0) == 1) { return 0; }
@@ -732,6 +785,10 @@ fn _geo_sphere_roots(ray, sphere, out) {
     var inv_a = f64_div(F64_ONE, a);
     var t1 = f64_mul(f64_sub(f64_neg(half_b), sqrt_d), inv_a);
     var t2 = f64_mul(f64_add(f64_neg(half_b), sqrt_d), inv_a);
+    if (sc != 0) {
+        t1 = f64_mul(t1, sc);
+        t2 = f64_mul(t2, sc);
+    }
     store64(out, t1);
     store64(out + 8, t2);
     return 1;
@@ -806,9 +863,28 @@ public fn geo_ray_sphere(ray, sphere) {
 # slab interval is so wide it constrains nothing -- which is precisely what the
 # parallel branch also expresses. The form is chosen so the two functions'
 # tests are textually identical, because "they agree at the boundary" should be
-# checkable by reading and not only by running.
+# checkable by reading and not only by running. (Since 3.3.5 they are not: see the
+# next note.)
 # [measured: docs/development/issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md]
 # [measured: tests/modules.tcyr "2.10.1 degenerate-direction contract"]
+# ⛔ 3.3.5 — A COMPONENT BELOW DBL_MIN WAS READ AS PARALLEL, AND EVERY CROSSING
+# ROUNDED TWICE. The reciprocal needed |d_k| >= DBL_MIN, so a direction normalised
+# from (1e-310, 1, 0) had its x slab skipped: a ray that leaves that slab at a finite
+# t answered a hit, and one that enters it a miss. The slabs now divide (b - o) / d_k,
+# which needs only d_k != 0, so the parallel test is an exact zero; a crossing past
+# DBL_MAX overflows to +-Inf (an entry there is the miss, as before), and each
+# crossing is one correctly rounded quotient of the rounded b - o, not (b - o) *
+# RN(1/d). Over 90000 finite box-ray pairs (12159 with an inverted box) against an
+# exact rational oracle, 105 answers moved wrong -> right (21 with an inverted box)
+# and none right -> wrong; 3339 within 2^-48 of a tie, or at t = 0, are not scored.
+# t's bits changed in 4461, 3968 of them right before and after, no face with them;
+# correctly rounded hits went from 13650 to 17582 of 17830 and the largest error of a
+# right answer from 1.70 to 1.30 ulp. All 6000 inputs with a NaN keep D034's contract,
+# and of 6000 with an infinity 80 moved, none right -> wrong against an
+# extended-real oracle (24 of them Inf - Inf, which it cannot judge).
+# [measured: G1 slab sweep, exact Fraction oracle, 3.3.4 tree vs this one, 2026-10-11; cycc 6.6.14]
+# ⚠ geo_ray_obb_face keeps the DBL_MIN test and the reciprocal: its slabs are its own
+# copy, in the box's frame, and are reported for a later release, not repaired here.
 # ⚠ 3.3.3 — "ONLY AT |f| EXACTLY DBL_MIN" MISSES NaN. For a NaN `f` the `f64_gt`
 # form is 0 and sends the slab to the parallel branch, which skips it or returns
 # the miss 0; the `!= 1` form keeps the NaN in the slab arithmetic, as this
@@ -879,6 +955,31 @@ fn _geo_ray_obb_nan(ray, obb) {
     return n;
 }
 
+# ⛔ 3.3.5 — AN INFINITE ORIGIN WITH 0 < |d_k| < DBL_MIN TAKES THE PARALLEL BRANCH, as
+# every |d_k| below DBL_MIN did in 3.3.4. A finite origin's slab now crosses such a d_k,
+# (bound - o) / d_k; an infinite origin's crossings are only +-Inf or Inf - Inf, and the
+# parallel tests read exactly what they would say: a miss when the origin is outside
+# the slab (read sorted, AN INVERTED BOX, above), the slab skipped when the origin lies
+# on a bound of the same infinity, and the slab's own NaN first. Crossing it instead
+# gave two infinite t of one sign, which the slab's miss test reads as a tie, and a
+# later slab's Inf - Inf NaN then reported a hit: 11 hits where 3.3.4 missed, and 342
+# NaN t with another NaN's payload, in 60000 rays with one or two infinite origin
+# coordinates. Now 180000 such rays differ from 3.3.4 only in a 1-ulp t (the division).
+# [measured: second G1 review's infinite-origin sweep, seeds 61-63, 3.3.4/round 2/this tree, 2026-10-11; cycc 6.6.14]
+# ⚠ ONLY BELOW DBL_MIN, so that no answer moves from 3.3.4. Through a normal d_k the
+# Inf - Inf crossing is left to the slab arithmetic, pinned since 3.3.3 ("a NaN made
+# from input with no NaN"), which answers by the order of the stored bounds and the
+# sign of d_k: on the box [-0.16, +Inf] from x = +Inf, the y slab's hit along +x and a
+# miss along -x. Which answer that class should have is the open non-finite contract
+# row, not decided here. The test is inline with its integer half first, so a finite
+# origin pays one AND and one compare per slab and no call. _bvh_ray_hits_aabb holds
+# the slab for every finite d_k.
+# [measured: G1 review probe, 3.3.4 tree and this one, 2026-10-11; cycc 6.6.14]
+# On z, the last slab, crossing an off-bound origin or a NaN bound gives what the
+# parallel branch gives (two infinite t of one sign end in the miss, and the slab's
+# own first NaN is the first one unread), so those two mutants survive as equivalent.
+# [measured: G1 mutation run on tests/modules.tcyr, 2026-10-11; cycc 6.6.14]
+
 public fn geo_ray_aabb_face(ray, aabb, out) {
     var ox = HVec3_x(GeoRay_origin(ray));
     var oy = HVec3_y(GeoRay_origin(ray));
@@ -906,7 +1007,8 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
     }
 
     # X slab
-    if (f64_lt(f64_abs(dx), _GEO_F64_TINY) == 1) {
+    if (f64_eq(dx, 0) == 1 || ((ox & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000
+        && f64_lt(f64_abs(dx), _GEO_F64_TINY) == 1)) {
         # Parallel: the miss tests are false for a NaN, so the slab's own inputs
         # are tested after them (D034, header). Each reads the slab SORTED: below
         # both bounds, or above both (AN INVERTED BOX, above). For min <= max
@@ -921,9 +1023,8 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
         if (f64_eq(bmin_x, bmin_x) == 0) { return bmin_x; }
         if (f64_eq(bmax_x, bmax_x) == 0) { return bmax_x; }
     } else {
-        var inv_d = f64_div(F64_ONE, dx);
-        var t1 = f64_mul(f64_sub(bmin_x, ox), inv_d);
-        var t2 = f64_mul(f64_sub(bmax_x, ox), inv_d);
+        var t1 = f64_div(f64_sub(bmin_x, ox), dx);
+        var t2 = f64_div(f64_sub(bmax_x, ox), dx);
         var f1 = 0;
         var f2 = 1;
         if (f64_gt(t1, t2) == 1) {
@@ -963,7 +1064,8 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
     }
 
     # Y slab
-    if (f64_lt(f64_abs(dy), _GEO_F64_TINY) == 1) {
+    if (f64_eq(dy, 0) == 1 || ((oy & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000
+        && f64_lt(f64_abs(dy), _GEO_F64_TINY) == 1)) {
         if (f64_lt(oy, bmin_y) == 1) {
             if (f64_ge(oy, bmax_y) == 0) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
         }
@@ -974,9 +1076,8 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
         if (f64_eq(bmin_y, bmin_y) == 0) { return bmin_y; }
         if (f64_eq(bmax_y, bmax_y) == 0) { return bmax_y; }
     } else {
-        var inv_d = f64_div(F64_ONE, dy);
-        var t1 = f64_mul(f64_sub(bmin_y, oy), inv_d);
-        var t2 = f64_mul(f64_sub(bmax_y, oy), inv_d);
+        var t1 = f64_div(f64_sub(bmin_y, oy), dy);
+        var t2 = f64_div(f64_sub(bmax_y, oy), dy);
         var f1 = 2;
         var f2 = 3;
         if (f64_gt(t1, t2) == 1) {
@@ -1013,7 +1114,8 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
     }
 
     # Z slab
-    if (f64_lt(f64_abs(dz), _GEO_F64_TINY) == 1) {
+    if (f64_eq(dz, 0) == 1 || ((oz & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000
+        && f64_lt(f64_abs(dz), _GEO_F64_TINY) == 1)) {
         if (f64_lt(oz, bmin_z) == 1) {
             if (f64_ge(oz, bmax_z) == 0) { return _geo_ray_aabb_nan_or_miss(ray, aabb); }
         }
@@ -1024,9 +1126,8 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
         if (f64_eq(bmin_z, bmin_z) == 0) { return bmin_z; }
         if (f64_eq(bmax_z, bmax_z) == 0) { return bmax_z; }
     } else {
-        var inv_d = f64_div(F64_ONE, dz);
-        var t1 = f64_mul(f64_sub(bmin_z, oz), inv_d);
-        var t2 = f64_mul(f64_sub(bmax_z, oz), inv_d);
+        var t1 = f64_div(f64_sub(bmin_z, oz), dz);
+        var t2 = f64_div(f64_sub(bmax_z, oz), dz);
         var f1 = 4;
         var f2 = 5;
         if (f64_gt(t1, t2) == 1) {
@@ -1511,6 +1612,44 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
     # ⚠ 2.14.0, same correction as _geo_sphere_roots: the exponent was fixed in
     # 2.10.2, the absolute scale was not. `a` is the squared perpendicular
     # component of the direction and only needs a finite reciprocal.
+    # ⛔ 3.3.5 — AND A SMALL RAW DIRECTION FLUSHED `a` THE SAME WAY: below 2^-511 the
+    # barrel was a miss for every ray (as the caps were, in _geo_sphere_roots), and a
+    # ray just above it at an angle to the axis lost the barrel too, its |d_perp|^2
+    # under DBL_MIN. When `a` is under 2^-968 (_GEO_DIR_LO) and the largest |d_i| is
+    # below 1, so that scaling up can lift it, d is multiplied by the power of two
+    # `csc` that takes that component into [1, 2), and d_par, d_perp, a, b and disc are
+    # formed for the copy (scalars and a stack copy, no allocation); the roots,
+    # t / csc, are multiplied back. Bit for bit the unscaled answer wherever that kept
+    # every product normal. A ray parallel to the axis still has a = 0 and takes the
+    # caps; every other ray runs as before. (Measured with the sphere, in
+    # _geo_sphere_roots.) ⚠ A d with a component of 1 or more is not scaled: that would
+    # scale it down, which lifts nothing and can flush its `a`. No suite or sweep
+    # answer moves without the test; it matters only for a ray within about 2^-510 of
+    # parallel whose barrel crossing, some 2^458 or more along it, is still on the
+    # segment. A ray whose |d_perp| is under 2^-511 once its largest component is in
+    # [1, 2) still skips the barrel, as at unit size.
+    # [measured: G1 mutation run and ray sweep, 2026-10-11; cycc 6.6.14]
+    var csc = 0;
+    var dpr[24];
+    if (f64_lt(f64_abs(a), _GEO_DIR_LO) == 1) {
+        var dm = _geo_absmax_bits(GeoRay_direction(ray));
+        if (dm != 0 && (dm >> 52) < 1023) {
+            csc = _geo_scale_for(dm >> 52);
+            var dsx = f64_mul(HVec3_x(GeoRay_direction(ray)), csc);
+            var dsy = f64_mul(HVec3_y(GeoRay_direction(ray)), csc);
+            var dsz = f64_mul(HVec3_z(GeoRay_direction(ray)), csc);
+            store64(&dpr, dsx);
+            store64(&dpr + 8, dsy);
+            store64(&dpr + 16, dsz);
+            var d_par_s = f64_div(hvec3_dot(&dpr, ab), ab_len_sq);
+            store64(&dpr, f64_sub(dsx, f64_mul(HVec3_x(ab), d_par_s)));
+            store64(&dpr + 8, f64_sub(dsy, f64_mul(HVec3_y(ab), d_par_s)));
+            store64(&dpr + 16, f64_sub(dsz, f64_mul(HVec3_z(ab), d_par_s)));
+            a = hvec3_dot(&dpr, &dpr);
+            b = f64_mul(F64_TWO, hvec3_dot(&dpr, o_perp));
+            disc = f64_sub(f64_mul(b, b), f64_mul(_GEO_F64_FOUR, f64_mul(a, c)));
+        }
+    }
     if (f64_lt(f64_abs(a), _GEO_F64_TINY) == 1) { cyl_missed = 1; }
     if (f64_lt(disc, 0) == 1) { cyl_missed = 1; }
 
@@ -1524,6 +1663,10 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
         var sqrt_disc = f64_sqrt(disc);
         var cyl_t1 = f64_mul(f64_sub(f64_neg(b), sqrt_disc), inv_2a);
         var cyl_t2 = f64_mul(f64_add(f64_neg(b), sqrt_disc), inv_2a);
+        if (csc != 0) {
+            cyl_t1 = f64_mul(cyl_t1, csc);
+            cyl_t2 = f64_mul(cyl_t2, csc);
+        }
 
         # Check cylinder hit at cyl_t1
         if (f64_lt(cyl_t1, 0) != 1) {

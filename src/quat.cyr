@@ -9,9 +9,10 @@
 # 2.13.0, an alias of error.cyr's F64_TINY from 2.14.0) stood here, and `hquat_normalize`
 # (on |q|) and `hquat_inverse` (on |q|²) returned the identity below it; 2.17.0 removed
 # it. From 2.17.0 to 3.3.3 `hquat_normalize` returned the identity wherever 1/|q|
-# overflows (|q| = 0, or |q| <= 2^-1024); since 3.3.4 only at |q| = 0. `hquat_length`
-# and `hquat_inverse` use F64_TINY directly, to choose between their direct and
-# rescaled paths (`hquat_inverse` still returns the identity at |q| = 0).
+# overflows (|q| = 0, or |q| <= 2^-1024); since 3.3.4 only at |q| = 0. `hquat_length`,
+# `hquat_normalize` (since 3.3.5) and `hquat_inverse` use F64_TINY directly, to choose
+# between their direct and rescaled paths (`hquat_inverse` still returns the identity at
+# |q| = 0).
 
 #derive(accessors)
 public struct HQuat { x; y; z; w; }
@@ -163,14 +164,23 @@ fn _hquat_scaled_unit(q, s) {
 # ⭐ The `hvec3_normalize` repair: normalise an exactly scaled copy, by 2^1023 where
 # 1/|q| overflows and by 2^-600 where it is 0, and return that copy's bits. `|q| = 0`
 # keeps the documented identity (an error channel is [3.4.0] work); NaN runs the last lines.
+# ⛔ 3.3.5 — and, as there, the two bands beside those ends still carried a subnormal
+# rounding: |q| in (2^-1024, 2^-1022), where |q| itself is subnormal, and |q| in (2^1022,
+# DBL_MAX], where 1/|q| is. Up to 4.65 and 5.23 ulp on 3,000 random quaternions per band,
+# against 2.04 for the same directions at unit length. The copies now start at |q| < DBL_MIN
+# and 1/|q| < DBL_MIN: the low band's sample maximum falls to 2.07 (a reviewer's
+# independent sample found 2.51; neither is a bound), and the high band is the
+# unit-length answer bit for bit (3,000 of 3,000). 139 and 222 inputs that were within 1 ulp
+# now carry their direction's unit-length error instead.
+# [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; 2.51: the review's sample]
 public fn hquat_normalize(q) {
     var len = hquat_length(q);
-    var inv = f64_div(F64_ONE, len);
-    if (f64_eq(f64_abs(inv), F64_POS_INF) == 1) {
+    if (f64_lt(len, F64_TINY) == 1) {
         if (f64_eq(len, 0) == 1) { return hquat_identity(); }
         return _hquat_scaled_unit(q, (1023 + 1023) << 52);   # 2^1023
     }
-    if (f64_eq(inv, 0) == 1) { return _hquat_scaled_unit(q, (1023 - 600) << 52); }   # 2^-600
+    var inv = f64_div(F64_ONE, len);
+    if (f64_lt(inv, F64_TINY) == 1) { return _hquat_scaled_unit(q, (1023 - 600) << 52); }   # 2^-600
     var r = alloc(sizeof(HQuat));
     f64v_scale(r, q, inv, 4);
     return r;
@@ -222,6 +232,40 @@ public fn hquat_normalize(q) {
 # not a multiply by `1/|q|`: for a subnormal |q| the reciprocal is +Inf and the
 # zero components would come back as `0 * Inf` = NaN, the rule
 # `src/linalg_precision.cyr:78` states verbatim.
+#
+# ⛔ 3.3.5 — AND THAT RESCUE PAID FOR ITS ROUNDINGS. Two divisions by a rounded |q| (a
+# subnormal one below 2^-1022) put full-mantissa quaternions up to 4.58 ulp off in the
+# rescued bands and 48.8 ulp off for a subnormal |q|, where the fast path stays within
+# 2.75; and past DBL_MAX |q| was +Inf, so the inverse came back as the zero quaternion.
+# The 2041-binade sweep in tests/foundation.tcyr could not see any of it: its (3s, 4s,
+# 0, 0) has |q| = 5s exactly, and both forms give the same bits there.
+# [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+# ⭐ The rescue is now the fast path on an exact copy of the conjugate: t = (-x, -y, -z, w) *
+# 2^p, with p from the largest component's exponent so that component is in [1, 2) (or
+# [2^-51, 1) when subnormal), then t / |t|^2 * 2^p, both scalings as two normal powers of
+# two. That is the fast path's answer for the same direction at unit scale, bit for bit
+# wherever the result is normal, and the top band's zero quaternion becomes the inverse. On
+# a 14,629-quaternion sample (8,392 random full-mantissa ones, 4 per binade from 2^-1074
+# to 2^1023, plus the axis and (3s, 4s) shapes) the largest errors were 2.35 and 2.48 ulp in
+# the rescued bands and 1.36 for a subnormal |q| — sample maxima, not bounds: a reviewer's
+# independent sample found 2.67 for a subnormal |q|. A zero component stays zero (0 * 2^p
+# is 0, never 0 * Inf), and an overflowing inverse still overflows honestly to +-Inf.
+# ⚠ Not every rescued answer improved: of 7,472, 452 that were within 1 ulp now are not and
+# 1,894 went the other way; each now carries the error the fast path makes on the same
+# quaternion at unit scale. 32 of the 452 are single-component q, where the two divisions
+# had been exact to half an ulp and the fast path rounds three times (now within 1.57).
+# [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; 2.67: the review's sample]
+# ⚠ THE NEGATION GOES ON BEFORE THE SCALING. Below cycc 6.6.8 `f64_neg(+0)` is +0, and a
+# component far below the largest flushes to zero in the copy; negated after it, that zero
+# came back +0 where -x is -0. The first draft did that: on 30,562 random and tuple inputs
+# it changed 10,451 result slots only in a zero's sign under cycc 6.6.3 and 6.6.6, none
+# under 6.6.14. Negating first, the result differs from 3.3.4's on the same 8,127 slots under
+# 6.6.3, 6.6.6 and 6.6.14 (none in a zero's sign), and on 6.6.14 it is the first draft's to the
+# bit. An infinite component needs no branch of its own: Inf * 2^p is Inf, so |t|^2 is Inf,
+# its reciprocal 0, and the answer NaN beside signed zeros, the bits the two divisions gave,
+# under each of those three pins, on all 6,457 infinite-component inputs of that sample.
+# |q| = 0 still returns the identity.
+# [measured: scratch trees pinned to cycc 6.6.3, 6.6.6, 6.6.14, not reproducible in-tree, 2026-10-11]
 public fn hquat_inverse(q) {
     var ls = hquat_length_sq(q);
     var inv = f64_div(F64_ONE, ls);
@@ -231,12 +275,21 @@ public fn hquat_inverse(q) {
           f64_mul(f64_neg(HQuat_z(q)), inv),
           f64_mul(HQuat_w(q), inv));
     }
-    var len = hquat_length(q);
-    if (f64_eq(len, 0) == 1) { return hquat_identity(); }
-    return hquat_new(f64_div(f64_div(f64_neg(HQuat_x(q)), len), len),
-      f64_div(f64_div(f64_neg(HQuat_y(q)), len), len),
-      f64_div(f64_div(f64_neg(HQuat_z(q)), len), len),
-      f64_div(f64_div(HQuat_w(q), len), len));
+    var mx = f64_max(f64_max(f64_abs(HQuat_x(q)), f64_abs(HQuat_y(q))),
+      f64_max(f64_abs(HQuat_z(q)), f64_abs(HQuat_w(q))));
+    if (f64_eq(mx, 0) == 1) { return hquat_identity(); }
+    var p = 1023 - (mx >> 52);
+    var h = p / 2;
+    var f1 = (1023 + h) << 52;
+    var f2 = (1023 + p - h) << 52;
+    var t = hquat_new(f64_neg(HQuat_x(q)), f64_neg(HQuat_y(q)), f64_neg(HQuat_z(q)), HQuat_w(q));
+    f64v_scale(t, t, f1, 4);
+    f64v_scale(t, t, f2, 4);
+    var r = alloc(sizeof(HQuat));
+    f64v_scale(r, t, f64_div(F64_ONE, hquat_length_sq(t)), 4);
+    f64v_scale(r, r, f1, 4);
+    f64v_scale(r, r, f2, 4);
+    return r;
 }
 
 # ================================================================

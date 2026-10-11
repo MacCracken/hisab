@@ -209,9 +209,11 @@ pair. `q/2` and `r²/2` are formed so that they are finite whenever the true val
 is (to `|p|, r < 2^512.5`), up to the sum's rounding at the overflow edge:
 `cga_point` sums the squares in a copy scaled by a power of two outside
 `[2^-484, 2^511)`, and `cga_sphere` halves `r` before squaring it (3.3.4). A
-subnormal `q/2` is the scaled sum rounded again onto the subnormal grid, within
-half a step plus the sum's rounding; that double rounding is not correct rounding,
-and near a tie it still lands one step off.
+subnormal `q/2` is formed exactly — the squares summed in one fixed-point integer
+and rounded once to nearest-even — so it is correctly rounded (3.3.5; until then
+it was the scaled sum rounded again onto the subnormal grid, one step off near a
+tie). When `q/2` and `r²/2` both overflow from finite input, `cga_sphere` forms
+`ninf` on a power-of-two copy (3.3.5).
 A translator is `T = 1 − ½·t·ninf`, i.e. blades 9, 12 and 14 only.
 Spheres/planes are grade-1 (dual)
 or grade-4 (direct) blades; rigid motions are versors applied by the sandwich

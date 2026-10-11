@@ -188,7 +188,14 @@ public fn su2_from_quat(q) {
     # ⭐ Only that overflow takes the rescale: each component divided by the largest, so
     # all are in [-1, 1] and their norm is in [1, 2], then normalized below as before. An
     # infinite component makes the norm +Inf too, but its mx is +Inf and it runs the old
-    # lines. Every quaternion whose norm is finite or NaN runs them unchanged, bit for bit.
+    # lines. Through 3.3.4 every quaternion whose norm is finite or NaN ran them unchanged.
+    # ⛔ 3.3.5 — including a norm in (2^1022, DBL_MAX], where 1/norm is subnormal: up to
+    # 4.50 ulp on 3,000 random quaternions, against 3.07 for the same directions at unit
+    # length. Such a norm now normalises the exact copy q * 2^-600 (as the axis maps below
+    # do), which is the unit-length answer bit for bit (3,000 of 3,000); 305 answers that
+    # were within 1 ulp carry their direction's unit-length error instead. An infinite
+    # component still gives what it gave: Inf * 2^-600 is Inf, and 1/norm is 0 again.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
     if (f64_eq(norm, F64_POS_INF) == 1) {
         var mx = f64_max(f64_max(f64_abs(qw), f64_abs(qx)), f64_max(f64_abs(qy), f64_abs(qz)));
         if (f64_lt(mx, F64_POS_INF) == 1) {
@@ -198,6 +205,12 @@ public fn su2_from_quat(q) {
         }
     }
     var inv = f64_div(F64_ONE, norm);
+    if (f64_lt(inv, F64_TINY) == 1) {
+        var dn = (1023 - 600) << 52;    # 2^-600
+        qw = f64_mul(qw, dn); qx = f64_mul(qx, dn);
+        qy = f64_mul(qy, dn); qz = f64_mul(qz, dn);
+        inv = f64_div(F64_ONE, _lie_norm4(qw, qx, qy, qz));
+    }
     return _su2_alloc(f64_mul(qw, inv), f64_mul(qx, inv),
       f64_mul(qy, inv), f64_mul(qz, inv));
 }
@@ -229,6 +242,15 @@ public fn su2_from_axis_angle(axis, angle) {
     # before, since Inf * 2^-600 is Inf and 1/len is 0 again. On 6,713 sweep axes each of
     # the four maps moved 110 to 115 answers, every finite one to its scaled copy's bits.
     # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⛔ 3.3.5 — the 2^-600 copy began at 1/len = 0, but 1/len is already subnormal for
+    # len in (2^1022, DBL_MAX], and multiplying by it there cost up to 4.97 ulp on 3,000
+    # random axes where the same axes at unit length reach 2.93 (`so3_from_axis_angle`
+    # 7.73 against 4.46, `lorentz_boost` 13.6 against 10.8, `lorentz_rotate` 9.09 against
+    # 5.00, the matrix entries in ulps of the sum of their terms' magnitudes). The copy now
+    # starts at 1/len < DBL_MIN, in all four maps, and the band's answers are the unit-length
+    # answers bit for bit (3,000 of 3,000 each). The answers that were within 1 ulp and are
+    # now not (291 here; 186, 87 and 147) carry their axis's unit-length error instead.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
     if (f64_lt(len, F64_TINY) == 1) {
         if (f64_eq(len, 0) == 1) { return _su2_alloc(F64_ONE, 0, 0, 0); }
         var up = (1023 + 1023) << 52;   # 2^1023
@@ -236,7 +258,7 @@ public fn su2_from_axis_angle(axis, angle) {
         len = lie_norm3(ax, ay, az);
     }
     var inv = f64_div(F64_ONE, len);
-    if (f64_eq(inv, 0) == 1) {
+    if (f64_lt(inv, F64_TINY) == 1) {
         var dn = (1023 - 600) << 52;    # 2^-600
         ax = f64_mul(ax, dn); ay = f64_mul(ay, dn); az = f64_mul(az, dn);
         inv = f64_div(F64_ONE, lie_norm3(ax, ay, az));
@@ -667,7 +689,8 @@ public fn lorentz_boost_z(eta) {
 public fn lorentz_boost(dir, eta) {
     var nx = HVec3_x(dir); var ny = HVec3_y(dir); var nz = HVec3_z(dir);
     var norm = lie_norm3(nx, ny, nz);
-    # 3.3.4: both ends of `norm`, repaired as in `su2_from_axis_angle` (audit D086).
+    # 3.3.4: both ends of `norm`, repaired as in `su2_from_axis_angle` (audit D086); since
+    # 3.3.5 the top copy starts where 1/norm goes subnormal, as there.
     if (f64_lt(norm, F64_TINY) == 1) {
         if (f64_eq(norm, 0) == 1) { return lorentz_identity(); }
         var up = (1023 + 1023) << 52;   # 2^1023
@@ -675,7 +698,7 @@ public fn lorentz_boost(dir, eta) {
         norm = lie_norm3(nx, ny, nz);
     }
     var inv = f64_div(F64_ONE, norm);
-    if (f64_eq(inv, 0) == 1) {
+    if (f64_lt(inv, F64_TINY) == 1) {
         var dn = (1023 - 600) << 52;    # 2^-600
         nx = f64_mul(nx, dn); ny = f64_mul(ny, dn); nz = f64_mul(nz, dn);
         inv = f64_div(F64_ONE, lie_norm3(nx, ny, nz));
@@ -717,7 +740,8 @@ public fn lorentz_boost(dir, eta) {
 public fn lorentz_rotate(axis, angle) {
     var nx = HVec3_x(axis); var ny = HVec3_y(axis); var nz = HVec3_z(axis);
     var norm = lie_norm3(nx, ny, nz);
-    # 3.3.4: both ends of `norm`, repaired as in `su2_from_axis_angle` (audit D086).
+    # 3.3.4: both ends of `norm`, repaired as in `su2_from_axis_angle` (audit D086); since
+    # 3.3.5 the top copy starts where 1/norm goes subnormal, as there.
     if (f64_lt(norm, F64_TINY) == 1) {
         if (f64_eq(norm, 0) == 1) { return lorentz_identity(); }
         var up = (1023 + 1023) << 52;   # 2^1023
@@ -725,7 +749,7 @@ public fn lorentz_rotate(axis, angle) {
         norm = lie_norm3(nx, ny, nz);
     }
     var inv = f64_div(F64_ONE, norm);
-    if (f64_eq(inv, 0) == 1) {
+    if (f64_lt(inv, F64_TINY) == 1) {
         var dn = (1023 - 600) << 52;    # 2^-600
         nx = f64_mul(nx, dn); ny = f64_mul(ny, dn); nz = f64_mul(nz, dn);
         inv = f64_div(F64_ONE, lie_norm3(nx, ny, nz));

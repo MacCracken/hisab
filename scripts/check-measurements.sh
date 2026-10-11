@@ -59,8 +59,8 @@
 # claims -- and 12 of the 22 in the corpus below, re-measured here. A gate that
 # flags noise and misses claims is worse than no gate, because it is trusted. So
 # the planted corpus now lives in the script and `--selftest` re-runs it (see
-# SELFTEST below): 41 of 42 claims flagged, 0 of 42 decoys, one known miss
-# documented in place. [measured: ./scripts/check-measurements.sh --selftest, 2026-10-03]
+# SELFTEST below): 45 of 47 claims flagged, 0 of 56 decoys, two known misses
+# documented in place. [measured: ./scripts/check-measurements.sh --selftest, 2026-10-11]
 #
 # The tree does hold one PARTIAL recall signal: a paragraph that carries a marker is
 # one its author called a measurement. Strip the markers and re-scan, and every such
@@ -73,13 +73,23 @@
 # and 'error' do not reach ("stored -0.0833", "came back (+1, 2.2e-7, 0)").
 # [measured: marker-stripped re-scan, this script before and after 3.3.4, 2026-10-03]
 #
+# 3.3.5 reached that second kind: `stored` joined the observation verbs, and a
+# one-decimal mantissa counts within 40 characters after one. On the 3.3.5 tree the
+# marker-stripped re-scan of 946 marked paragraphs goes from 337 showing no claim to
+# 333, and all 4 it recovers state an observed value. 11 more comment lines flag: 10
+# inside marked paragraphs, every one an observed value, and 1 unmarked, a real
+# observation (src/geo_advanced.cyr's "exact depth 0.8, came back 2.2e-16"). The
+# first kind, an outcome with no number in it, is still a known miss; see the corpus.
+# [measured: marker-stripped re-scan and full-tree line diff, this script before and after 3.3.5, 2026-10-11]
+#
 # The shapes added to close that gap, and what each one exists for:
 #   time      spelled-out durations -- "0.9 seconds before, 0.4 after", "120 s"
 #   bytes     ungrouped magnitudes  -- "998400 bytes to 512000 bytes"
 #   ratio     the word forms        -- "three times faster", "twice as fast",
 #                                      "an order of magnitude slower"
 #   rate      throughput            -- "1200 ops/sec to 1900 ops/sec"
-#   residual  an observed VALUE     -- "the weights summed to 2.000492 instead of 2"
+#   residual  an observed VALUE     -- "the weights summed to 2.000492 instead of 2",
+#             and since 3.3.5 "stored -0.0833"
 #   crash     an observed OUTCOME   -- "passing a null handle here segfaults the
 #                                      process", "hung forever", "never returned"
 #   arrow     the house before/after style -- "support calls 901 -> 1790"
@@ -92,6 +102,8 @@
 #             broken across a line ("3321 of" / "those 3329"), and the capitals
 #             of a headline ("498 OF 1010 EXPONENTS")
 #   ulp       an error with its direction (3.3.4) -- "137 ulp out", "1 ulp high"
+#   error     since 3.3.5 also a one-decimal mantissa just after an observation verb --
+#             "came back (+1, 2.2e-7, 0)", "stored -3.6e-20 as Ok"
 #
 # Usage:
 #   ./scripts/check-measurements.sh                 full scan, report + exit 1 on any unmarked
@@ -310,9 +322,21 @@ TIME_UNIT = r'(?:s|secs?|seconds?|ms|us|µs|ns|mins?|minutes?|hours?)'
 # "Euler gives 2.0, RK3 8/3 = 2.6666667" -- and a derivation carries its own
 # proof; a reader re-derives it instead of re-running it. Including them cost 4
 # false positives out of 18 in the hand audit and bought one true positive.
+# `stored` (3.3.5) is the out-parameter form of the same report: "steps = -4 stored
+# -0.0833 with Ok". The list is past tense, the tense a run is reported in; "stores",
+# "returns" and "lands" are how a contract is stated. `lands` was tried in 3.3.5 and
+# taken out: it found no claim in the tree and one fixture derivation ("so q * y
+# lands a binade above"). `stored` carries `\b`, so "restored" stays prose, and it
+# does not count in the passive ("is stored", "are stored", "stored as"), which
+# describes a layout: "coefficients are stored as 1.0e-3 scaled integers".
 OBSERVED = (r'(?:instead of|rather than|off by|but got|came back|came out|summed? to|totall?ed'
             r'|drifted|overshot|undershot|returned|reported|rendered|printed|observed'
-            r'|converged to|stalled at|landed at|,\s*not\b)')
+            r'|converged to|stalled at|landed at'
+            r'|(?<!\bis )(?<!\bare )\bstored\b(?!\s+as\b)|,\s*not\b)')
+# The same list without its one non-verb, `, not`, for the one-decimal arm of
+# 'error': "n is a plain f64, not an integer -- a raw 3 is the subnormal 1.5e-323"
+# names an IEEE value, and `, not` was the only thing tying it to an observation.
+OBSERVED_VERB = OBSERVED.replace(r'|,\s*not\b', '')
 # What a sweep counts -- see 'sweep'. "4000 steps" and "1000 iterations" are a
 # method's parameters, so `steps` and `iterations` are not here: on this tree they
 # would add 3 unmarked lines, all parameters, for 1 claim line in a marked paragraph.
@@ -492,7 +516,18 @@ SHAPES = [
     # someone observed. 1e-12 is a tolerance someone chose, and a 10+ digit
     # mantissa (1.220703125e-4 = h^2/8, 7.947285970052083e-09 = 2/(15*2^24)) is
     # an exact closed form being expanded, not a measurement.
-    ('error', re.compile(r'\b\d\.\d{2,6}e[-+]?\d+\b(?!\d)')),
+    # A one-decimal mantissa (2.2e-7) is how most observed errors are actually
+    # written, and on its own it is just as often a chosen tolerance ("a tolerance
+    # between 6.5e-14 and 2.5e-13"), so since 3.3.5 it counts only within 40
+    # characters AFTER an observation verb, with no sentence break between and the
+    # verb not negated: "came back (+1, 2.2e-7, 0)", "stored -3.6e-20 as Ok", but not
+    # "the scale 1.0e+300 returned by the helper" or "stored, not returned, so 2.5e-1".
+    # The verb is matched where it stands, never through a `(?=.*...)` lookahead,
+    # which re-scans the line from every position: the first form of this arm took
+    # the full scan from 5.9 s to 20.8 s, and this one runs it in 6.5 s.
+    # [measured: alternated full scans, 3.3.4 / first form / this form, best of 5 rounds, 2026-10-11]
+    ('error', re.compile(r'\b\d\.\d{2,6}e[-+]?\d+\b(?!\d)'
+                         r'|(?<!not )(?<!never )(?i:' + OBSERVED_VERB + r')[^.;]{0,40}?\b\d\.\de[-+]?\d+\b(?!\d)')),
     # An error stated in ulps, with the direction it was off in: "137 ulp out",
     # "1 ulp high", "0.18 ulp from the true one". The direction word is what makes it
     # an observation; "within 0.5 ulp of" is a contract and "1 ULP apart" describes
@@ -618,11 +653,27 @@ SELFTEST = [
     ('+', "Across 440 random seeds the old path failed."),
     ('+', "A one-step DBL_MIN repair fails 77 of these."),
     ('+', "An infinite site was inserted at 13 of its 20 placements."),
+    # 3.3.5 -- the value shapes the 3.3.4 marker-stripped sample found unflagged. The
+    # first two are src/calc.cyr's own (stored, through 'residual' and the one-decimal
+    # 'error' arm), the third a geo_advanced.cyr one; each later line pins one more
+    # verb or arm.
+    ('+', "steps = -4 stored -0.0833 with Ok, where the integral is 1/3."),
+    ('+', "2^63 - 1 rounds up to -2^63 and stored -3.6e-20 as Ok."),
+    ('+', "A unit box sliding along -x over another came back (+1, 2.2e-7, 0)."),
+    ('+', "On the 1e-12 tangency the portal returned a depth of 4.9e-10."),
     # KNOWN MISS. A comparative with no quantity anywhere in it. Catching this
     # needs "doubles/halves/triples" as bare verbs, and those are ordinary math
     # prose here ("the map doubles the angle", "halves the interval each step"),
     # so the shape would fire on derivations rather than observations. Left open.
     ('?', "Building the mesh twice in a row doubles the arena high-water mark."),
+    # KNOWN MISS (3.3.5). An outcome with no number in it. A shape for a past-tense
+    # report verb followed by NaN / Inf / -0 / "wrong" flags 83 more comment lines on
+    # the 3.3.5 tree: 62 inside paragraphs that carry a marker, and 21 unmarked, of
+    # which 13 report an execution ("3.3.2 answered (-Inf, -Inf, -Inf) there") and 8
+    # derive one ("the span Inf - Inf is NaN, so each came back [NaN, NaN]"). At 8 of
+    # 21 it is looser than any shape here, so it is left out.
+    # [measured: scratch outcome-shape variant, full-tree line diff, 2026-10-11]
+    ('?', "The tangent-space branch returned NaN at all three queries."),
     ('-', "items_vec: vec of interleaved [point_ptr, index, point_ptr, index, ...]"),
     ('-', 'Returns 0 for an empty input; the caller must treat 0 as "no node".'),
     ('-', "_KD_MAX_DEPTH = 64 caps the recursion; deeper splits cannot separate f64 coords."),
@@ -670,6 +721,27 @@ SELFTEST = [
     ('-', "Correctly rounded: the result is never more than 0.5 ulp off."),
     ('-', "C99 Annex G asks for results within 1 ulp from the true value."),
     ('-', "The fused form is at most 1 ulp off the exact product."),
+    # 3.3.5 -- one decoy per guard on the new forms: a one-decimal mantissa with no
+    # observation verb, each new verb with no observed value, a word that contains
+    # `stored`, and `, not` (left out of OBSERVED_VERB) beside a named IEEE value.
+    ('-', "It needs a tolerance between 6.5e-14 and 2.5e-13 to separate the two paths."),
+    ('-', "The 8 coefficients are stored row-major, 3 per line."),
+    ('-', "The first step lands in the subnormal band."),
+    ('-', "The rescale restored the 2.5e-300 floor the scaled sum needs."),
+    ('-', "n is a plain f64, not an integer -- a raw 3 is the subnormal 1.5e-323."),
+    # And one decoy per guard on the one-decimal arm, each a verb beside a mantissa in a
+    # role that is not an observation (the first four are the 3.3.5 review's): the
+    # passive and `stored as`, the verb after the number, a negated verb, the word
+    # `lands` (no longer a verb here), a sentence break, and a verb past the window.
+    ('-', "The fixture is chosen so that q lands 1.5e-3 above the grid point."),
+    ('-', "Coefficients are stored as 1.0e-3 scaled integers."),
+    ('-', "The scale 1.0e+300 returned by the helper is a power of two."),
+    ('-', "The bound 4.9e-324 is the smallest subnormal; nothing lands below it."),
+    ('-', "The result is stored, not returned, so 2.5e-1 needs no copy."),
+    ('-', "Both halves are stored 6.5e-14 apart in the table."),
+    ('-', "Coefficients stored as 1.0e-3 scaled integers keep the table exact."),
+    ('-', "It returned the status code it was given; 2.5e-13 is the step."),
+    ('-', "Every path that returned early skips both cleanup passes that the default 1.5e-3 step needs."),
 ]
 
 if mode == 'selftest':

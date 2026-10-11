@@ -1530,6 +1530,17 @@ fn _lext_xld(m, e) {
     return f64_mul(f64_mul(m, (1023 + e + 1074) << 52), 1);
 }
 
+# Is |m1| 2^e1 > thr |m2| 2^e2? For wide components (0.5 <= |m| < 1, or m = 0) and 1 <= thr <= 2,
+# so an exponent gap past 60 decides it alone.
+fn _lext_wgt(m1, e1, m2, e2, thr) {
+    if ((m1 & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 0; }
+    if ((m2 & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }
+    var d = e1 - e2;
+    if (d > 60) { return 1; }
+    if (d < 0 - 60) { return 0; }
+    return f64_gt(f64_abs(m1), f64_mul(thr, _lext_xld(f64_abs(m2), 0 - d)));
+}
+
 # Power iteration with every component carried as m * 2^e (m a double, e an i64), so no
 # component of the iterate, of A v or of the estimate can leave the f64 range. The same
 # seed, max-component normalisation, up-to-sign comparison and tests as eigen_power's
@@ -1542,6 +1553,10 @@ fn _lext_xld(m, e) {
 # or below the rounding grid of A v (see there). Returns 0 with out_val / out_vec
 # written, or the error code, with neither touched.
 # [measured: krylov white-box probe, plain and wide runs side by side, cycc 6.6.14, 2026-10-03]
+# Since 3.3.5 it has eigen_power's growth test too (see `_lext_grows`), without the subnormal
+# floor (a wide component has no subnormal grid): a candidate whose components grew more than
+# twofold is held for one more pass, and returned exactly as it stood unless a flagged
+# component grows more than twofold again (so the side-by-side figure above predates it).
 fn _lext_power_wide(A, n, max_iter, out_val, out_vec) {
     var i = 0;
     var j = 0;
@@ -1557,7 +1572,12 @@ fn _lext_power_wide(A, n, max_iter, out_val, out_vec) {
     var ve = alloc(n * 8);
     var sm = alloc(n * 8);   # A v: w_i = sm_i * 2^sx_i
     var sx = alloc(n * 8);
+    var gfl = alloc(n * 8);  # the growth test's flags for a pending candidate (see below)
+    var c_vec = alloc(n * 8);
     if (vm == 0 || ve == 0 || sm == 0 || sx == 0) { return HSB_ERR_ALLOC; }
+    if (gfl == 0 || c_vec == 0) { return HSB_ERR_ALLOC; }
+    var pend = 0;
+    var c_lam = f64_from(0);
     i = 0;
     while (i < n) {
         # eigen_power's seed: SplitMix64's (i+1)-th output in [0.5, 1), which is m, e = 0.
@@ -1639,6 +1659,8 @@ fn _lext_power_wide(A, n, max_iter, out_val, out_vec) {
 
         # v = w / max, and whether any component moved by tol (compared as doubles).
         var moved = 0;
+        var grow = 0;
+        var conf = 0;
         i = 0;
         while (i < n) {
             var q = f64_div(load64(sm + i * 8), mx_m);
@@ -1647,6 +1669,14 @@ fn _lext_power_wide(A, n, max_iter, out_val, out_vec) {
             var v_old = _lext_xld(load64(vm + i * 8), load64(ve + i * 8));
             if (flip == 1) { v_old = f64_neg(v_old); }
             if (f64_lt(f64_abs(f64_sub(_lext_xld(q_m, q_e), v_old)), tol) == 0) { moved = 1; }
+            # grown more than twofold since the last pass (see eigen_power's growth test)
+            var g1 = _lext_wgt(q_m, q_e, load64(vm + i * 8), load64(ve + i * 8), F64_TWO);
+            if (pend == 0) {
+                store64(gfl + i * 8, g1);
+                if (g1 == 1) { grow = 1; }
+            } else {
+                if (g1 == 1 && load64(gfl + i * 8) == 1) { conf = 1; }
+            }
             store64(vm + i * 8, q_m);
             store64(ve + i * 8, q_e);
             i = i + 1;
@@ -1662,22 +1692,103 @@ fn _lext_power_wide(A, n, max_iter, out_val, out_vec) {
                 if (f64_lt(f64_abs(f64_sub(nw_m, old_s)), f64_mul(tol, f64_abs(nw_m))) == 1) { close = 1; }
             }
         }
-        if (close == 1) {
-            var lam = _lext_xld(nw_m, mx_e);
-            if (f64_lt(f64_abs(lam), F64_POS_INF) == 0) { return HSB_ERR_NO_CONVERGENCE; }
-            store64(out_val, lam);
-            i = 0;
-            while (i < n) {
-                store64(out_vec + i * 8, _lext_xld(load64(vm + i * 8), load64(ve + i * 8)));
-                i = i + 1;
+        if (pend == 1) {
+            # the pass after a candidate whose components grew: a flagged one grew again, or
+            # the candidate stands, exactly as it would have been returned
+            if (conf == 1) {
+                pend = 0;
+            } else {
+                store64(out_val, c_lam);
+                i = 0;
+                while (i < n) {
+                    store64(out_vec + i * 8, load64(c_vec + i * 8));
+                    i = i + 1;
+                }
+                return 0;
             }
-            return 0;
+        } else {
+            if (close == 1) {
+                var lam = _lext_xld(nw_m, mx_e);
+                if (f64_lt(f64_abs(lam), F64_POS_INF) == 0) { return HSB_ERR_NO_CONVERGENCE; }
+                if (grow == 1) {
+                    c_lam = lam;
+                    i = 0;
+                    while (i < n) {
+                        store64(c_vec + i * 8, _lext_xld(load64(vm + i * 8), load64(ve + i * 8)));
+                        i = i + 1;
+                    }
+                    pend = 1;
+                } else {
+                    store64(out_val, lam);
+                    i = 0;
+                    while (i < n) {
+                        store64(out_vec + i * 8, _lext_xld(load64(vm + i * 8), load64(ve + i * 8)));
+                        i = i + 1;
+                    }
+                    return 0;
+                }
+            }
         }
         est_m = nw_m;
         est_e = mx_e;
         iter = iter + 1;
     }
+    if (pend == 1) {
+        store64(out_val, c_lam);
+        i = 0;
+        while (i < n) {
+            store64(out_vec + i * 8, load64(c_vec + i * 8));
+            i = i + 1;
+        }
+        return 0;
+    }
     return HSB_ERR_NO_CONVERGENCE;
+}
+
+# eigen_power's growth test (3.3.5): flag the components of iterate k (v) that grew more than
+# twofold since iterate k-1 (vp); if any, run one more pass and return 1 only when a flagged
+# component grows more than twofold again. w and fl are scratch (n each); with sc_e > 0, u is
+# the scaled-input buffer and is refilled from v.
+# ⚠ No rounding floor under the flag: one (four steps of v's subnormal grid) was tried, and on
+# the 115,000 sweep matrices and 32,000 family matrices it moved only vector components below
+# 1e-150 of one matrix, so it is not kept.
+# [measured: floor / no-floor builds over the eigen_power sweeps and review families, 2026-10-11; cycc 6.6.14]
+fn _lext_grows(A, n, u, vp, v, sc_e, w, fl) {
+    var any = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        store64(fl + i * 8, 0);
+        if (f64_gt(f64_abs(load64(v + i * 8)), f64_mul(F64_TWO, f64_abs(load64(vp + i * 8)))) == 1) {
+            store64(fl + i * 8, 1);
+            any = 1;
+        }
+    }
+    if (any == 0) { return 0; }
+    # one more pass: w = A u', u' = v (times 2^-sc_e after a switch)
+    var up = v;
+    if (sc_e > 0) {
+        var dn = (1023 - sc_e) << 52;
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) { store64(u + i2 * 8, f64_mul(load64(v + i2 * 8), dn)); }
+        up = u;
+    }
+    var mx = f64_from(0);
+    for (var r = 0; r < n; r = r + 1) {
+        var sum = f64_from(0);
+        for (var c = 0; c < n; c = c + 1) {
+            sum = f64_add(sum, f64_mul(ganita_mat_get(A, r, c), load64(up + c * 8)));
+        }
+        store64(w + r * 8, sum);
+        if (f64_gt(f64_abs(sum), f64_abs(mx)) == 1) { mx = sum; }
+    }
+    # A pass that overflows or vanishes confirms nothing, with no test of its own: with mx
+    # infinite each finite w_t / mx is +-0 and an infinite one NaN, and with mx = 0 every w_t is
+    # 0 and the quotient NaN, and `>` is false for all of them.
+    for (var t = 0; t < n; t = t + 1) {
+        if (load64(fl + t * 8) == 1) {
+            var v3 = f64_div(load64(w + t * 8), mx);
+            if (f64_gt(f64_abs(v3), f64_mul(F64_TWO, f64_abs(load64(v + t * 8)))) == 1) { return 1; }
+        }
+    }
+    return 0;
 }
 
 # Power iteration for the dominant eigenvalue.
@@ -1705,6 +1816,13 @@ fn _lext_power_wide(A, n, max_iter, out_val, out_vec) {
 #           larger. That repairs a lost component only where a check sees it and the
 #           plain answer is the smaller; some mixed-scale matrices are still answered
 #           wrong (see the loop).
+#           ⚠ GROWTH BELOW tol (3.3.5). A pass that meets both tests is not taken at
+#           once if some component grew more than twofold since the pass before: one more
+#           pass is run (one matvec, not counted against max_iter), and if that component
+#           grows more than twofold again the iteration goes on, on counted passes (a
+#           larger eigenvalue's direction was still growing below tol); otherwise that
+#           pass's answer is returned unchanged. A slowly rotating complex subdominant
+#           pair can do this too, and then a right answer needs a few more passes.
 #           ⚠ PASSES NEEDED (3.3.3). The seed is not an eigenvector of a diagonal or
 #           triangular matrix, as 3.3.2's e_0 was, and the vector must stop moving
 #           as well, so a result needs about log(1e-12) / log|lambda_2 / lambda_1| + 2
@@ -1785,6 +1903,11 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
 
     var w = alloc(n * 8);
     if (w == 0) { return Err(HSB_ERR_ALLOC); }
+    # vn: the other iterate buffer (the previous iterate, after the swap below); gfl: the
+    # growth test's scratch
+    var vn = alloc(n * 8);
+    var gfl = alloc(n * 8);
+    if (vn == 0 || gfl == 0) { return Err(HSB_ERR_ALLOC); }
     var eigenvalue = f64_from(0);
     var tol = EPSILON_F64;
     # The matvec reads `u`: v itself, until a pass overflows; v * 2^-sc_e after that.
@@ -1793,6 +1916,7 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
 
     var iter = 0;
     while (iter < max_iter) {
+        if (sc_e == 0) { u = v; }
         if (sc_e > 0) {
             var sc_dn = (1023 - sc_e) << 52;   # 2^-sc_e
             i = 0;
@@ -2003,17 +2127,47 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
             var v_old = load64(v + i * 8);
             if (flip == 1) { v_old = f64_neg(v_old); }
             if (f64_lt(f64_abs(f64_sub(vi, v_old)), tol) == 0) { moved = 1; }
-            store64(v + i * 8, vi);
+            store64(vn + i * 8, vi);
             i = i + 1;
         }
+        var v_sw = v;
+        v = vn;
+        vn = v_sw;
 
         # ⛔ The convergence test compared an ABSOLUTE change in the eigenvalue
         # against `tol`, and an eigenvalue carries the matrix's units — so the same
         # problem converged in one iteration or never, depending on the caller's
         # scale. `tol` is kept, now as a RELATIVE factor, which is what a caller
         # passing 1e-12 always meant.
+        var conv = 0;
         if (moved == 0 && f64_lt(f64_abs(f64_sub(new_eigenvalue, eigenvalue)),
-            f64_mul(tol, f64_abs(new_eigenvalue))) == 1) {
+            f64_mul(tol, f64_abs(new_eigenvalue))) == 1) { conv = 1; }
+        # ⛔ 3.3.5 — AND BOTH TESTS ARE BLIND TO A DIRECTION GROWING BELOW tol. A component
+        # that is a share s of the iterate and grows by rho a pass moves by s (rho - 1), which
+        # the vector test misses while s < tol / (rho - 1): [[a, 0, b], [0, c, 0], [0, d, e]]
+        # (a = 7.03e-288, b = -2.60e188, c = 5.63e169, d = 3.82e-22, e = -2.69e168) leaves c's
+        # direction at a share of 3e-19 after one pass, growing 20.9-fold a pass, and 3.3.4
+        # stopped on e. So a pass that meets both tests is held when some component grew more
+        # than twofold since the last pass (`_lext_grows`): one more pass is run, uncounted, and
+        # only that component growing more than twofold again keeps the iteration going (on
+        # counted passes). Otherwise this pass's answer stands exactly as before. A real larger
+        # eigenvalue grows its direction by the same factor every pass. A complex or +-lambda
+        # subdominant pair can swing a small component through zero, more than twofold on one
+        # pass: the same test without its second pass refused 39 of the 71,000 sweep matrices
+        # answered right.
+        # [measured: eigen_power sweeps + fixture traces, 3.3.4 vs this tree + Aberth oracle, 2026-10-11]
+        # ⚠ AND SOMETIMES ON TWO PASSES IN A ROW. On 6,000 block-triangular matrices whose
+        # subdominant eigenvalues are a complex pair at 0.9 to 0.9999 of |lambda_1|, 23 of the
+        # 1,896 answered right keep iterating; all stay right (worst error 4.4e-10 -> 2.3e-10),
+        # but the iteration needs more passes: the 3x3 with rows (0x3FF1D409B846C0AE, 0,
+        # 0x3FC5A7B7A102A37F), (0x3F5AD138B103A727, 0xBFF29F9DD444D583, 0xC019CB8ABB14F9F4),
+        # (0xBFC5A7B7A102A37F, 0, 0x3FF1D409B846C0AE), dominant eigenvalue -1.16397, is
+        # answered at max_iter 859 by 3.3.4 and needs 860 here.
+        # [measured: complex-subdominant family F3 (6,000), 3.3.4 vs this tree, 2026-10-11; cycc 6.6.14]
+        if (conv == 1) {
+            if (_lext_grows(A, n, u, vn, v, sc_e, w, gfl) == 1) { conv = 0; }
+        }
+        if (conv == 1) {
             # After a switch the estimate is in units of 2^-sc_e; one past DBL_MAX in the
             # caller's units has no f64 answer, and out_val is left untouched.
             var lam = new_eigenvalue;
@@ -2060,12 +2214,14 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
             #       2^1000, so the product with g stays normal).
             # [measured: eigen_power probes, 44000-matrix sweep, 3.3.4 tree before/after, cycc 6.6.14, 2026-10-03]
             # The wide eigenvalue replaces the plain one only when its modulus is larger, by
-            # more than 2^-26. The checks also trip where the small component is a true zero
+            # more than 2^-26 (3.3.5 re-measured this rule; see below). The checks also trip
+            # where the small component is a true zero
             # ([[a, b], [0, d]] with |a| > |d| has the eigenvector (1, 0) exactly); there the
             # plain answer is exact and the wide run stops within about
-            # tol / (1 - |lambda_2 / lambda_1|) of it. And a wide run can settle on a smaller
-            # eigenvalue while the dominant direction is still growing from far below tol
-            # (fixture (4) in tests/abuse.tcyr). Nothing else changes: a matrix that trips
+            # tol / (1 - |lambda_2 / lambda_1|) of it. And a wide run could settle on a smaller
+            # eigenvalue while the dominant direction was still growing from far below tol
+            # (fixture (4) in tests/abuse.tcyr; 3.3.5's growth test stops that, in both runs).
+            # Nothing else changes: a matrix that trips
             # neither check is bit-identical to 3.3.3, and one that does can take up to
             # max_iter more passes, each splitting every entry and product into m * 2^e (not
             # timed: no bench row trips the check).
@@ -2098,6 +2254,28 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
             # share of the iterate is below tol and still growing when both tests pass, which
             # needs no flush at all (see the roadmap).
             # [measured: eigen_power 71000- and 44000-matrix sweeps, Aberth oracle, cycc 6.6.14, 2026-10-03]
+            # ⭐ 3.3.5 — THE GROWTH CLASS. The growth test (`_lext_grows`, and its copy in the
+            # wide run) keeps a run going while a direction grows below tol. On sweeps rebuilt
+            # to 3.3.4's descriptions (71,000 of 18 kinds, 44,000 flush-built, the same
+            # 120-digit Aberth oracle) wrong went 460 -> 57 and 549 -> 88; no right answer
+            # became wrong or NO_CONVERGENCE; 9 wrong ones became NO_CONVERGENCE (5 have no
+            # real dominant eigenvalue, 3 are answered right at max_iter 100000, one has a
+            # ratio of 1 - 8e-9). 37 right answers changed bits: 34 only in vector components
+            # a continued iteration moved, 3 in the eigenvalue (2 closer to the oracle, 1 from
+            # exact to 1.4e-16 off). The larger-block case above stays wrong (tests/abuse.tcyr
+            # pins one as a tripwire).
+            # [measured: eigen_power sweeps P1/P2, 3.3.4 vs this tree + Aberth oracle, 2026-10-11; cycc 6.6.14]
+            # ⚠ THE LARGER-ONLY RULE IS LOAD-BEARING. Taking the wide answer whenever it differs
+            # from the plain one by more than 2^-26 repairs that case (one matrix on each sweep)
+            # and breaks another: when the flush lands the plain run exactly on the dominant
+            # eigenvalue, the wide run, whose vector test compares components as doubles, cannot
+            # see components near 1e-600 move, stops on the eigenvalue test alone up to about
+            # tol / (1 - |lambda_2 / lambda_1|) short of it, and differs. On 4,000 such matrices
+            # (dominant a near 1e-300, couplings near 1e275, a second eigenvalue a (1 - 1e-4 ..
+            # 1e-9)) that rule turned 867 exact answers wrong, by 1.5e-8 to 8.4e-6; taking the
+            # wide answer whenever a check trips does the same and moves 1,664 right answers'
+            # bits on the sweeps.
+            # [measured: family F6 (4,000) + sweeps P1/P2, selection-rule variants, 2026-10-11; cycc 6.6.14]
             var low_any = 0;
             i = 0;
             while (i < n) {

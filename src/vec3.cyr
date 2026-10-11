@@ -155,13 +155,14 @@ public fn hvec3_normalize(v) {
     # ⛔ `len` is a LENGTH — degree one in the caller's units — and this tested it
     # against an absolute 1e-12, so a perfectly good short vector normalised to
     # the ZERO VECTOR: not an error value, just a wrong answer with no length.
-    # ⭐ What fails is `1 / len`, so test THAT — and test it for OVERFLOW ONLY.
-    # ⛔ The obvious `f64_lt(|inv|, F64_POS_INF) == 0` is wrong here and
-    # `tests/abuse.tcyr` says so out loud: it is false for NaN too, so it would
-    # silently zero a NaN vector, and this API's documented contract is **NaN in,
-    # NaN out**. `f64_eq(|inv|, +Inf)` catches len = 0 and any len too small to
-    # invert, while a NaN falls through and propagates as the contract requires.
-    # ⚠ F64_TINY would be one binade too strict here: 1/2^-1023 is finite.
+    # ⭐ 2.14.0 tested what fails, `1 / len`, and for OVERFLOW ONLY: `f64_eq(|inv|, +Inf)`
+    # caught len = 0 and any len too small to invert, and let a NaN fall through.
+    # ⛔ The obvious `f64_lt(|inv|, F64_POS_INF) == 0` is wrong and `tests/abuse.tcyr`
+    # says so out loud: it is false for NaN too, so it would silently zero a NaN vector,
+    # and this API's documented contract is **NaN in, NaN out**.
+    # ⚠ F64_TINY would have been one binade too strict for that zero exit: 1/2^-1023 is finite.
+    # That guard is gone since 3.3.5 (last paragraph); its replacements, `len < DBL_MIN`,
+    # `len == 0` and `1/len < DBL_MIN`, are all false for NaN, so NaN still runs the last line.
     # [measured: tests/foundation.tcyr normalize scale sweep, 2026-09-09]
     #
     # ⛔ 3.3.4 — AND THAT TEST'S EXIT WAS THE ZERO VECTOR FOR EVERY NON-ZERO LENGTH AT OR
@@ -171,20 +172,34 @@ public fn hvec3_normalize(v) {
     # test at all: a finite vector whose length passes DBL_MAX got len = +Inf, inv = 0 and
     # the answer (0, 0, 0), for 1500 of 1500 random directions in a sweep.
     # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
-    # ⭐ Neither end needs a threshold, only an exact copy of v in range. Where 1/len
-    # overflows, every component is subnormal, and v * 2^1023 is exact with its largest
-    # component in [2^-51, 1/2]; where it is 0, v * 2^-600 is exact in every component
-    # that can reach the result. The answer is the bits this function gives that copy, so
-    # the same direction at an ordinary scale. Every other input, NaN included, runs the
-    # last line unchanged, and so does len = 0. An infinite component still gives NaN
-    # beside zeros: Inf * 2^-600 is Inf, and the copy's 1/len is 0 again.
-    var inv = f64_div(F64_ONE, len);
-    if (f64_eq(f64_abs(inv), F64_POS_INF) == 1) {
+    # ⭐ Neither end needs a threshold, only an exact copy of v in range: v * 2^1023 where
+    # 1/len overflowed (every component subnormal, so exact), v * 2^-600 where it was 0
+    # (exact in every component that can reach the result). The answer is the bits this
+    # function gives that copy, so the same direction at an ordinary scale.
+    #
+    # ⛔ 3.3.5 — BETWEEN THOSE ENDS AND THE ORDINARY RANGE TWO BANDS STILL LOST BITS. For a
+    # length in (2^-1024, 2^-1022) 1/len is finite but len is rounded on the subnormal grid,
+    # and for one in (2^1022, DBL_MAX] 1/len is subnormal; v * inv carried either rounding.
+    # On 3,000 random directions per band: up to 4.84 and 5.43 ulp, where the same
+    # directions at unit length reach 2.18.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+    # ⭐ So each copy now starts where its rounding starts: len < DBL_MIN takes the 2^1023
+    # copy and 1/len < DBL_MIN (len > 2^1022, or +Inf) the 2^-600 copy. Above, the answer is
+    # the unit-length answer for the same direction, bit for bit (3,000 of 3,000), so its
+    # sample maximum is the unit-length 2.18; below, it falls to 2.13 (sample maxima, not
+    # bounds). Inputs that were within 1 ulp and now are not (183 above, 138 below) carry
+    # their direction's unit-length error.
+    # Every other input, NaN included, runs the last line unchanged; len = 0 still gives the
+    # zero vector, and an infinite component still gives NaN beside zeros: Inf * 2^-600 is
+    # Inf, and the copy's 1/len is 0 again.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+    if (f64_lt(len, F64_TINY) == 1) {
         if (f64_eq(len, 0) == 1) { return hvec3_zero(); }
         var up = hvec3_scale(v, (1023 + 1023) << 52);   # 2^1023
         return hvec3_scale(up, f64_div(F64_ONE, hvec3_length(up)));
     }
-    if (f64_eq(inv, 0) == 1) {
+    var inv = f64_div(F64_ONE, len);
+    if (f64_lt(inv, F64_TINY) == 1) {
         var dn = hvec3_scale(v, (1023 - 600) << 52);    # 2^-600
         return hvec3_scale(dn, f64_div(F64_ONE, hvec3_length(dn)));
     }
@@ -299,14 +314,180 @@ public fn hvec3_reject(v, d) {
 
 # v times a power of two 2^p that puts its largest |component| in [1, 2), or in
 # [2^-51, 1) when that component is subnormal: exact either way, so the direction is
-# unchanged bit for bit. v must be finite and non-zero. `mx >> 52` is mx's biased
-# exponent, 0 for a subnormal (p = 1023 then). 2^p goes on as two normal powers of two,
-# because 2^-1023 is not one. (3.3.4, for `hvec3_angle`.)
-fn _hvec3_pow2_unit(v) {
+# unchanged bit for bit. Written to o[0..2]; returns max |component| (0 for the zero
+# vector). v must be finite. `mx >> 52` is mx's biased exponent, 0 for a subnormal
+# (p = 1023 then). 2^p goes on as two normal powers of two, because 2^-1023 is not one.
+fn _hvec3_pow2_copy(v, o) {
     var mx = f64_max(f64_max(f64_abs(HVec3_x(v)), f64_abs(HVec3_y(v))), f64_abs(HVec3_z(v)));
     var p = 1023 - (mx >> 52);
     var h = p / 2;
-    return hvec3_scale(hvec3_scale(v, (1023 + h) << 52), (1023 + p - h) << 52);
+    var f1 = (1023 + h) << 52;
+    var f2 = (1023 + p - h) << 52;
+    store64(o, f64_mul(f64_mul(HVec3_x(v), f1), f2));
+    store64(o + 8, f64_mul(f64_mul(HVec3_y(v), f1), f2));
+    store64(o + 16, f64_mul(f64_mul(HVec3_z(v), f1), f2));
+    return mx;
+}
+
+var _HV3_SPLIT = 0x41A0000002000000;      # 2^27 + 1 = 134217729
+var _HV3_PI_LO = 0x3CA1A62633145C07;      # 1.2246467991473532e-16 (the true value minus F64_PI)
+var _HV3_PI_2_LO = 0x3C91A62633145C07;    # 6.123233995736766e-17 (the true value minus F64_PI_2)
+var _HV3_TWO52 = 0x4330000000000000;      # 2^52
+
+# The e with a * b = p + e exactly, for p = RN(a * b): Dekker's product, split at
+# 2^27 + 1 (no FMA). Exact while nothing overflows or reaches the subnormals.
+# `hvec3_angle`'s scaled copies (|component| < 2) rule out the overflow; a product below
+# about 2^-969 has a subnormal error term that loses its low bits, which matters only for
+# angles near DBL_MIN (see `hvec3_angle`).
+fn _hvec3_mul_err(a, b, p) {
+    var t = f64_mul(a, _HV3_SPLIT);
+    var ah = f64_sub(t, f64_sub(t, a));
+    var al = f64_sub(a, ah);
+    var u = f64_mul(b, _HV3_SPLIT);
+    var bh = f64_sub(u, f64_sub(u, b));
+    var bl = f64_sub(b, bh);
+    return f64_add(f64_add(f64_add(f64_sub(f64_mul(ah, bh), p), f64_mul(ah, bl)), f64_mul(al, bh)),
+      f64_mul(al, bl));
+}
+
+# The e with a + b = s + e exactly, for s = RN(a + b) (Knuth's two-sum).
+fn _hvec3_add_err(a, b, s) {
+    var bb = f64_sub(s, a);
+    return f64_add(f64_sub(a, f64_sub(s, bb)), f64_sub(b, bb));
+}
+
+# a*b - c*d as a double-double: hi to o, lo to o + 8.
+fn _hvec3_dd_dp(a, b, c, d, o) {
+    var p1 = f64_mul(a, b);
+    var p2 = f64_mul(c, d);
+    var s = f64_sub(p1, p2);
+    var lo = f64_add(_hvec3_add_err(p1, f64_neg(p2), s), f64_sub(_hvec3_mul_err(a, b, p1), _hvec3_mul_err(c, d, p2)));
+    var hi = f64_add(s, lo);
+    store64(o, hi);
+    store64(o + 8, f64_sub(lo, f64_sub(hi, s)));
+    return 0;
+}
+
+# The dot product of w[0..2] and w[3..5] as a double-double: hi to o, lo to o + 8.
+fn _hvec3_dd_dot(w, o) {
+    var a0 = load64(w); var a1 = load64(w + 8); var a2 = load64(w + 16);
+    var b0 = load64(w + 24); var b1 = load64(w + 32); var b2 = load64(w + 40);
+    var p0 = f64_mul(a0, b0);
+    var p1 = f64_mul(a1, b1);
+    var p2 = f64_mul(a2, b2);
+    var s1 = f64_add(p0, p1);
+    var s2 = f64_add(s1, p2);
+    var lo = f64_add(f64_add(_hvec3_add_err(p0, p1, s1), _hvec3_add_err(s1, p2, s2)),
+      f64_add(f64_add(_hvec3_mul_err(a0, b0, p0), _hvec3_mul_err(a1, b1, p1)), _hvec3_mul_err(a2, b2, p2)));
+    var hi = f64_add(s2, lo);
+    store64(o, hi);
+    store64(o + 8, f64_sub(lo, f64_sub(hi, s2)));
+    return 0;
+}
+
+# The length of the double-double vector at c[0..5] (hi, lo per component) as a
+# double-double at r. Scaled by a power of two first, so no square flushes however
+# small the vector (a cross product of nearly parallel vectors is), then a square root
+# with one Newton correction.
+fn _hvec3_dd_norm(c, r) {
+    var h0 = load64(c); var h1 = load64(c + 16); var h2 = load64(c + 32);
+    var mx = f64_max(f64_max(f64_abs(h0), f64_abs(h1)), f64_abs(h2));
+    if (f64_eq(mx, 0) == 1) {
+        store64(r, 0);
+        store64(r + 8, 0);
+        return 0;
+    }
+    var p = 1023 - (mx >> 52);
+    var h = p / 2;
+    var f1 = (1023 + h) << 52;
+    var f2 = (1023 + p - h) << 52;
+    h0 = f64_mul(f64_mul(h0, f1), f2); var l0 = f64_mul(f64_mul(load64(c + 8), f1), f2);
+    h1 = f64_mul(f64_mul(h1, f1), f2); var l1 = f64_mul(f64_mul(load64(c + 24), f1), f2);
+    h2 = f64_mul(f64_mul(h2, f1), f2); var l2 = f64_mul(f64_mul(load64(c + 40), f1), f2);
+    var q0 = f64_mul(h0, h0);
+    var q1 = f64_mul(h1, h1);
+    var q2 = f64_mul(h2, h2);
+    var s1 = f64_add(q0, q1);
+    var s2 = f64_add(s1, q2);
+    var lo = f64_add(f64_add(_hvec3_add_err(q0, q1, s1), _hvec3_add_err(s1, q2, s2)),
+      f64_add(f64_add(_hvec3_mul_err(h0, h0, q0), _hvec3_mul_err(h1, h1, q1)), _hvec3_mul_err(h2, h2, q2)));
+    lo = f64_add(lo, f64_mul(F64_TWO, f64_add(f64_add(f64_mul(h0, l0), f64_mul(h1, l1)), f64_mul(h2, l2))));
+    var sh = f64_add(s2, lo);
+    var sl = f64_sub(lo, f64_sub(sh, s2));
+    var yh = f64_sqrt(sh);
+    var yy = f64_mul(yh, yh);
+    var yl = f64_div(f64_add(f64_sub(f64_sub(sh, yy), _hvec3_mul_err(yh, yh, yy)), sl), f64_mul(F64_TWO, yh));
+    var g1 = (1023 - h) << 52;
+    var g2 = (1023 - p + h) << 52;
+    store64(r, f64_mul(f64_mul(yh, g1), g2));
+    store64(r + 8, f64_mul(f64_mul(yl, g1), g2));
+    return 0;
+}
+
+# (nh + nl) / (dh + dl) as a renormalised double-double at o: o holds the double
+# nearest the quotient, o + 8 the rest.
+fn _hvec3_dd_div(nh, nl, dh, dl, o) {
+    var th = f64_div(nh, dh);
+    var pp = f64_mul(th, dh);
+    var tl = f64_div(f64_sub(f64_add(f64_sub(f64_sub(nh, pp), _hvec3_mul_err(th, dh, pp)), nl), f64_mul(th, dl)), dh);
+    var t = f64_add(th, tl);
+    store64(o, t);
+    store64(o + 8, f64_sub(tl, f64_sub(t, th)));
+    return 0;
+}
+
+# atan of the double-double at o, as r + c with r = atan(o[0]) rounded and c the
+# first-order correction for o[1]; the caller adds them. Writes c to o + 8.
+fn _hvec3_dd_atan(o) {
+    var t = load64(o);
+    store64(o + 8, f64_div(load64(o + 8), f64_add(F64_ONE, f64_mul(t, t))));
+    return f64_atan(t);
+}
+
+# (hi + lo) - (r + c), rounded once: hi - r with its two-sum error, then the small terms.
+fn _hvec3_dd_sub(hi, lo, r, c) {
+    var s = f64_sub(hi, r);
+    return f64_add(s, f64_sub(f64_add(_hvec3_add_err(hi, f64_neg(r), s), lo), c));
+}
+
+# The angle between w[0..2] and w[3..5], finite and non-zero: atan2(|a x b|, a.b) with
+# both operands (y, x) as double-doubles. w has room for 18 words. Which atan:
+#   x > 0           atan(y/x), while y/x <= 2^52: atan's one rounding is then the answer's
+#   x < 0, y <= |x| pi - atan(y/|x|)
+#   otherwise       pi/2 - atan(x/y), whose atan is below pi/4 and so rounds finer than
+#                   the answer (x = 0 gives pi/2 exactly)
+# x > 0 tests the renormalised quotient, which it needs anyway: y's high word can sit an
+# ulp above x's when y = x, and pi/2 - atan(1) is an ulp off at 45 degrees. x < 0 tests the
+# high words: there the answer's ulp is at least twice atan's, and deciding on the quotient
+# instead changed none of 193,721 answers, 20,000 of them within 3 ulps of 135 degrees.
+# [measured: scratch mutant harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+fn _hvec3_angle_dd(w) {
+    var a0 = load64(w); var a1 = load64(w + 8); var a2 = load64(w + 16);
+    var b0 = load64(w + 24); var b1 = load64(w + 32); var b2 = load64(w + 40);
+    _hvec3_dd_dp(a1, b2, a2, b1, w + 48);
+    _hvec3_dd_dp(a2, b0, a0, b2, w + 64);
+    _hvec3_dd_dp(a0, b1, a1, b0, w + 80);
+    _hvec3_dd_norm(w + 48, w + 96);
+    _hvec3_dd_dot(w, w + 112);
+    var yh = load64(w + 96); var yl = load64(w + 104);
+    var xh = load64(w + 112); var xl = load64(w + 120);
+    var q = w + 128;
+    if (f64_eq(xh, 0) == 0) {
+        if (f64_gt(xh, 0) == 1) {
+            _hvec3_dd_div(yh, yl, xh, xl, q);
+            if (f64_le(load64(q), _HV3_TWO52) == 1) {
+                var r0 = _hvec3_dd_atan(q);
+                return f64_add(r0, load64(q + 8));
+            }
+        } elif (f64_le(yh, f64_neg(xh)) == 1) {
+            _hvec3_dd_div(yh, yl, f64_neg(xh), f64_neg(xl), q);
+            var r1 = _hvec3_dd_atan(q);
+            return _hvec3_dd_sub(F64_PI, _HV3_PI_LO, r1, load64(q + 8));
+        }
+    }
+    _hvec3_dd_div(xh, xl, yh, yl, q);
+    var r2 = _hvec3_dd_atan(q);
+    return _hvec3_dd_sub(F64_PI_2, _HV3_PI_2_LO, r2, load64(q + 8));
 }
 
 # 1 when every component of v is finite: the house non-finite test, once per slot.
@@ -320,10 +501,6 @@ fn _hvec3_finite(v) {
 # Angle between two vectors in radians
 #must_use
 public fn hvec3_angle(a, b) {
-    var d = hvec3_dot(a, b);
-    var la = hvec3_length(a);
-    var lb = hvec3_length(b);
-    var denom = f64_mul(la, lb);
     # ⛔ THIS GUARD READ `denom < EPSILON_F64` AND CALLED PERPENDICULAR VECTORS
     # PARALLEL. `denom` is |a|·|b| — a length SQUARED, so it scales as the square
     # of the caller's units — and it was compared against an absolute 1e-12.
@@ -354,39 +531,48 @@ public fn hvec3_angle(a, b) {
     # d/denom came out exactly 1, and the answer 0 for pi/4. Past DBL_MAX, (2^512, 0, 0) with itself was NaN, and
     # (2^1000, 0, 0) against (2^23, 2^24, 0), atan(2), was pi/2: a.b finite over denom +Inf.
     # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
-    # ⭐ Exactly those inputs, with every component finite and neither length zero, now
-    # measure the angle on copies scaled by powers of two (exact, so the directions are the
-    # caller's) as atan2(|a' x b'|, a'.b'). No product flushes or overflows there; a parallel
-    # pair's cross product is exactly 0 and a perpendicular pair's dot product exactly 0, so
-    # they give 0 and pi/2 bit-exact. A finite vector whose LENGTH overflows is one of them:
-    # (DBL_MAX, DBL_MAX, DBL_MAX) with itself was NaN. Every other input runs the acos line
-    # unchanged, bit for bit: a zero-length vector still returns 0, and a NaN or infinite
-    # component still runs acos (the finite test is on the components, not the lengths).
-    # On a 38,406-input sweep against an exact atan2 oracle, 12,649 answers moved and two
-    # moved away from it: 0.47 to 0.53 ulp, and 0.05 to 1.05 ulp (that one an acos through
-    # a subnormal |a| that happened to round well). None left 4 ulp of the oracle.
-    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
-    # ⚠ That sweep under-sampled one band: a length in [2^-1074, 2^-1022) beside a normal
-    # one, with |a||b| normal. Near 2^-1022 the subnormal length keeps most of its bits and
-    # the acos line is often within 1 ulp there, while the atan2 line carries its own mid-angle
-    # error. Aimed at that band, 418 of 11,722 changed answers moved away from the oracle and
-    # 74 went from within 1 ulp to at most 1.80 ulp; none passed 4 ulp.
-    # [measured: verify-liever scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
-    # ⚠ The acos line keeps its own limits, which no guard can reach: acos is
-    # ill-conditioned near 0 and pi. (1, 1, 0) with itself is 2.1e-8 rad at every scale it
-    # runs at, and 45 degrees comes back one ulp high. atan2 on every input fixes both, but
-    # moved 188 of the 38,406 from within 1 ulp to within 2.55 ulp.
-    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
-    var rs = 0;
-    if (f64_lt(denom, F64_TINY) == 1 || f64_lt(la, F64_TINY) == 1 || f64_lt(lb, F64_TINY) == 1) { rs = 1; }
-    if (f64_eq(denom, F64_POS_INF) == 1 || f64_eq(f64_abs(d), F64_POS_INF) == 1) { rs = 1; }
-    if (rs == 1) {
-        if (_hvec3_finite(a) + _hvec3_finite(b) == 2) {
-            if (f64_eq(la, 0) == 1 || f64_eq(lb, 0) == 1) { return 0; }
-            var sa = _hvec3_pow2_unit(a);
-            var sb = _hvec3_pow2_unit(b);
-            return ganita_f64_atan2(hvec3_length(hvec3_cross(sa, sb)), hvec3_dot(sa, sb));
-        }
+    # 3.3.4 sent exactly those inputs to atan2(|a' x b'|, a'.b') on power-of-two copies and
+    # kept the acos line for the rest.
+    #
+    # ⛔ 3.3.5 — AND THE ACOS LINE WAS THE LARGER ERROR. acos is ill-conditioned near 0 and
+    # pi: (1, 1, 0) with itself came back 2.1e-8 rad at every scale, nearly parallel pairs
+    # were up to 1.1e26 ulp off, nearly opposed ones up to 6.7e7 ulp, and (1, 1, 0)
+    # against (1, 0, 0) was one ulp above pi/4 on 64,094 of a 90,000-pair grid of scales.
+    # Of 173,721 inputs, 30,918 were more than 1 ulp from the oracle. The plain atan2 line on
+    # every input is no cure (its cross product cancels near 0; 3.3.4 measured it moving 188
+    # of 38,406 answers past 1 ulp), and neither is Kahan's 2 atan2(|lb a - la b|, |lb a +
+    # la b|), which is accurate only absolutely: 1.4e18 ulp on nearly parallel pairs and
+    # 1,711 of 10,000 exact 45-degree pairs past 1 ulp.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+    # ⭐ Every finite input now takes atan2(|a x b|, a.b) with both operands carried as
+    # double-doubles (Dekker products, two-sums, a Newton-corrected square root) on copies
+    # scaled by powers of two, so nothing overflows and the cross product keeps its last bits
+    # for nearly parallel pairs. The atan is taken of a renormalised quotient, corrected to
+    # first order, with pi and pi/2 as double-doubles (`_hvec3_angle_dd` says which quotient
+    # where). What remains is atan's own rounding and one more: on the same 173,721 inputs
+    # the largest error is 0.99 ulp, none is past 1 ulp, and 3,133 are not correctly rounded
+    # where 113,188 were not. 816 that the acos line happened to round correctly are now
+    # within 1 ulp instead, since one rounded atan cannot be correctly rounded everywhere.
+    # Parallel, perpendicular and opposed stay 0, pi/2 and pi bit-exact at every scale: their
+    # cross or dot product is exactly 0, double-double or not.
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+    # ⚠ Not past 1 ulp for an angle near DBL_MIN. When the copies' components span more than
+    # about 2^1000, an angle that small is made of products that are themselves subnormal,
+    # and the Dekker error terms lose their low bits. On 40,002 pairs sharing all but one or
+    # two tiny components, 172 results were past 1 ulp (up to 2.66), every one below 2^-1020;
+    # the 33,993 results at or above 2^-1020 were all within 0.96. (3.3.4 answered every one
+    # of those pairs 0, 1.5e-8 or 2.1e-8.)
+    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+    # ⚠ COST: several times the acos line's arithmetic, not timed here; no tests/hisab.bcyr
+    # row calls this function. A zero-length vector still returns 0, and a NaN or infinite
+    # component still runs the acos line, unchanged (the finite test is on the components).
+    if (_hvec3_finite(a) + _hvec3_finite(b) == 2) {
+        var w[144];
+        if (f64_eq(_hvec3_pow2_copy(a, &w), 0) == 1) { return 0; }
+        if (f64_eq(_hvec3_pow2_copy(b, &w + 24), 0) == 1) { return 0; }
+        return _hvec3_angle_dd(&w);
     }
+    var d = hvec3_dot(a, b);
+    var denom = f64_mul(hvec3_length(a), hvec3_length(b));
     return ganita_f64_acos(f64_clamp(f64_div(d, denom), f64_neg(F64_ONE), F64_ONE));
 }

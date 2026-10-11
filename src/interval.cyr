@@ -101,8 +101,31 @@ public fn ivl_new(a, b) {
 #must_use
 public fn ivl_point(x) { return ivl_new(x, x); }
 
+# hi - lo rounded UP, so the width is never below the exact one (see "Outward
+# rounding" below: _ivl_add_up of hi and -lo, whose rounded sum is f64_sub(hi, lo) bit
+# for bit wherever that difference is not NaN).
+# ⛔ 3.3.5 — THE WIDTH WAS ROUNDED TO NEAREST. ivl_width([-2^-60, 1]) returned 1.0,
+# below the exact 1 + 2^-60; it is now 1 + 2^-52, and an exact difference is not moved:
+# a point still has width 0 and [1, 3] width 2. An infinite or NaN endpoint makes the
+# difference exact (+-Inf) or NaN, and f64_sub's value is returned unrounded, as before:
+# only an overflow of two FINITE endpoints may step, and _ivl_add_up, which reads an
+# infinite sum as that overflow, would move the exact -Inf of an interval built by hand
+# with hi = -Inf or lo = +Inf to -DBL_MAX; a NaN's sign bit can differ between hi - lo
+# and hi + (-lo). Over 200,000 random intervals (every exponent, subnormals, the overflow
+# edge, near-equal endpoints) against an exact rational oracle, 3.3.4's width was below
+# the exact one on 84,027, and this width is RU(hi - lo) on all 200,000, the other
+# 115,973 bit-identical; on 169 pairs of special endpoints (signed zeros, 2^-1074, +-1,
+# +-DBL_MAX, +-Inf, NaNs), through ivl_new and built by hand in either order, 25 of 338
+# widths differ from 3.3.4's f64_sub, every one a finite difference stepped to its RU.
+# [measured: scratch ivl_width sweep, 3.3.4 tree and this tree, python3 Fraction oracle, 2026-10-11]
 #must_use
-public fn ivl_width(iv) { return f64_sub(Interval_hi(iv), Interval_lo(iv)); }
+public fn ivl_width(iv) {
+    var hi = Interval_hi(iv);
+    var lo = Interval_lo(iv);
+    var w = f64_sub(hi, lo);
+    if (f64_lt(f64_abs(hi), _IVL_F64_POS_INF) == 0 || f64_lt(f64_abs(lo), _IVL_F64_POS_INF) == 0) { return w; }
+    return _ivl_add_up(hi, lo ^ 0x8000_0000_0000_0000);
+}
 
 # ⛔ 3.3.3 — (lo + hi) / 2 OVERFLOWS FOR A FINITE INTERVAL NEAR THE TOP OF THE RANGE:
 # the midpoint of [1.23e308, 1.41e308] came back +Infinity, outside the interval.
@@ -567,16 +590,48 @@ public fn ivl_sqrt(iv) {
 # f64_sin to the x87 fsin, which reduces with a 66-bit pi: under 6.6.3, 1,741 of those
 # sin arguments below 2^63 came back more than two doubles off (absolute error up to
 # |x| * 2^-69.4, near multiples of pi), and |x| >= 2^63 came back unchanged. ivl_sin
-# built there is not an enclosure near those points, as it was not in 3.3.3: 1,077 of
-# the 7,500 sin cases of the sweep described at ivl_new were not contained (3.3.3
-# bodies: 4,869). exp is x87 on x86 at every pin and measured the same under 6.6.3.
-# Below 6.6.8 the aarch64 exp, and below 6.6.9 its sin, are Taylor series, and no ulp
-# bound holds.
+# built there was not an enclosure near those points through 3.3.4, as it was not in
+# 3.3.3: 1,077 of the 7,500 sin cases of the sweep described at ivl_new were not
+# contained (3.3.3 bodies: 4,869). exp is x87 on x86 at every pin and measured the same
+# under 6.6.3. Below 6.6.8 the aarch64 exp, and below 6.6.9 its sin, are Taylor series,
+# and no ulp bound holds.
 # [measured: scratch harness, not reproducible in-tree, 2026-10-03; python3 Decimal oracle; cycc 6.6.3]
+# ⭐ 3.3.5 — ivl_sin now asks (_ivl_sin_trusted) and, on such a toolchain, returns
+# [-1, 1], the one enclosure that does not read f64_sin: sound there, and no tighter.
+# Over 7,500 intervals (around multiples of pi and extrema up to 2^40 pi, ordinary and up
+# to 2^62), 3.3.4's ivl_sin built under 6.6.3 and 6.6.6 failed to enclose the exact
+# range on 2,039 and this one on none; under 6.6.9 and 6.6.14 every result is 3.3.4's
+# bits. A consumer on 6.6.3 to 6.6.8 that needs a tight sine enclosure needs 6.6.9.
+# [measured: scratch ivl_sin sweep, 3.3.4 and this tree, cycc 6.6.3/6.6.6/6.6.9/6.6.14, Decimal oracle, 2026-10-11]
 fn _ivl_tr_dn(v, x) {
     var ax = x & 0x7FFF_FFFF_FFFF_FFFF;
     if (ax == 0 || ax == _IVL_F64_POS_INF) { return v; }
     return _ivl_dn(_ivl_dn(v));
+}
+
+# 1 when this build's f64_sin meets the 1-ulp contract ivl_sin's widening relies on,
+# else 0; decided once, by one call, and remembered in _IVL_SIN_STATE (0 undecided, 1
+# trusted, 2 not). The test is sin(fl(pi)), whose value 0x3CA1A62633145C07 (1.2246e-16)
+# sits next to a multiple of pi, where both sins that predate the contract fail: the x87
+# fsin (66-bit pi) returns 0x3CA1A60000000000 under 6.6.3 and 6.6.6, and the aarch64
+# polyfill of those pins reduces with one constant, fl(pi/2), so its sin(fl(pi)) is a
+# zero: the q = 2 branch returns f64_neg of sin(0), -0 where f64_neg flips the sign bit
+# (read from its source, not run). Either sign is rejected, as is anything more than one
+# double from the value. One point cannot certify a sin; it tells these two from the
+# contract's. The verdict is formed in a local and stored once, so a reader of
+# _IVL_SIN_STATE sees 0 or the final answer, never a provisional one.
+# [measured: scratch ivl_sin probe, cycc 6.6.3, 6.6.6, 6.6.9, 6.6.14, 2026-10-11]
+var _IVL_SIN_STATE = 0;
+var _IVL_SIN_PI = 0x3CA1_A626_3314_5C07;    # sin(fl(pi)) = 1.2246467991473532e-16
+fn _ivl_sin_trusted() {
+    if (_IVL_SIN_STATE == 0) {
+        var s = f64_sin(F64_PI);
+        var verdict = 2;
+        if (s >= _IVL_SIN_PI - 1 && s <= _IVL_SIN_PI + 1) { verdict = 1; }
+        _IVL_SIN_STATE = verdict;
+    }
+    if (_IVL_SIN_STATE == 1) { return 1; }
+    return 0;
 }
 
 fn _ivl_tr_up(v, x) {
@@ -606,6 +661,11 @@ public fn ivl_exp(iv) {
 }
 
 # Enclosure of sin over the interval.
+#
+# ⚠ TOOLCHAIN: the widening below assumes f64_sin's 1-ulp contract, which cyrius meets
+# from 6.6.9. Built under 6.6.3 to 6.6.8 (the x87 fsin, or the aarch64 polyfill) every
+# interval without a NaN endpoint encloses as [-1, 1] (since 3.3.5; _ivl_sin_trusted).
+# [measured: scratch ivl_sin sweep, cycc 6.6.3, 6.6.6, 6.6.7, 6.6.8 (x87) and 6.6.9, 6.6.14, 2026-10-11]
 #
 # The result is guaranteed to CONTAIN the true range — that is the whole contract
 # of an interval type, and through 2.6.12 this function broke it. It returned only
@@ -657,6 +717,10 @@ public fn ivl_sin(iv) {
     # which the span test above covers): w is NaN, and so would be every k-bound.
     # sin covers [-1, 1] there as on the clamped form. A NaN endpoint is not caught.
     if (f64_eq(a, b) == 1 && f64_lt(f64_abs(a), _IVL_F64_POS_INF) == 0) { return ivl_new(f64_neg(F64_ONE), F64_ONE); }
+    # A toolchain whose f64_sin breaks the 1-ulp contract the widening below relies on
+    # (cyrius below 6.6.9: _ivl_sin_trusted) gets [-1, 1], the one enclosure that does not
+    # read f64_sin. A NaN endpoint still takes the arithmetic, as above.
+    if (_ivl_sin_trusted() == 0 && f64_eq(w, w) == 1) { return ivl_new(f64_neg(F64_ONE), F64_ONE); }
     var sa = f64_sin(a);
     var sb = f64_sin(b);
     var lo = f64_min(_ivl_tr_dn(sa, a), _ivl_tr_dn(sb, b));

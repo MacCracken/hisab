@@ -13,6 +13,8 @@ var _CALC_F64_SIX = 0x4018_0000_0000_0000;  # 6.0
 var _CALC_F64_TEN = 0x4024_0000_0000_0000;  # 10.0
 var _CALC_F64_FIFTEEN = 0x402E_0000_0000_0000; # 15.0
 var _CALC_F64_SPLIT = 0x41A0_0000_0200_0000;   # 134217729.0 (2^27 + 1, Dekker's split)
+# The first magnitude f64_to cannot convert: |c| < 2^63 fits in i64 (_calc_perlin_cell).
+var _CALC_F64_2_POW_63 = 0x43E0_0000_0000_0000; # 2^63
 
 # ================================================================
 # 1. BASIC CALCULUS
@@ -429,7 +431,41 @@ public fn calc_integral_gauss5(f, a, b) {
     var s4 = f64_mul(w4, fncall1(f, f64_add(mid, f64_mul(half, n4))));
 
     var sum = f64_add(f64_add(f64_add(f64_add(s0, s1), s2), s3), s4);
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0) { return _calc_gauss5_wide(s0, s1, s2, s3, s4, sum, half); }
     return f64_mul(sum, half);
+}
+
+# Internal: calc_integral_gauss5's closing sum and product when the plain sum is not
+# finite. The terms are each divided by 4 and the product with the half-width is
+# multiplied back.
+#
+# ⛔ 3.3.5 — THE WEIGHTED SUM OVERFLOWED BEFORE THE HALF-WIDTH SCALED IT, as
+# calc_integral_trapez's did through 3.3.3: f = DBL_MAX on [0, 0.5] returned +Inf, where
+# the rule's value is 0x7FDFFFFFFFFFFFFF, 0.5 DBL_MAX, and it now returns that.
+# Every |w_i f_i| is at most w_i DBL_MAX and the weights sum to 2, so a quarter of each
+# term sums without overflow, and dividing by 4 is exact: the quartered sum is the plain
+# sum computed without overflow, rounded the same way (a term that lost bits on the
+# subnormal grid is absorbed, since a sum that overflowed is still above 2^1020 after
+# every later term). Its product with the half-width is normal or, for a half-width that
+# underflowed to 0, the rule's value 0, as calc_integral_trapez and _simpson give since
+# 3.3.4; so the closing * 4 adds no rounding, and the result is +-Inf only when the rule's
+# value is. An infinite or NaN sample is not finite after the division either, so such a
+# sum gets the class of the sum computed without overflow, as calc_integral_trapez's
+# does: one sign of infinite sample gives that infinity even where the finite terms
+# overflowed the other way first. Over 100,000 sample tables (near-overflow, cancelling,
+# subnormal and non-finite samples; widths from 2^-1074 to past DBL_MAX), against the
+# plain sum carried in unbounded exponent range and rounded per operation: 975 tables
+# whose sum overflowed (34 of them with a half-width of 0, NaN before) and 27 with a
+# non-finite sample went from wrong to right, none from right to wrong, and the other
+# 98,998 kept their bits.
+# [measured: scratch gauss5 sweep, 3.3.4 tree and this tree, python3 Fraction oracle, 2026-10-11]
+fn _calc_gauss5_wide(s0, s1, s2, s3, s4, sum, half) {
+    var q = 0x3FD0000000000000;                      # 0.25
+    var t = f64_add(f64_mul(s0, q), f64_mul(s1, q));
+    t = f64_add(t, f64_mul(s2, q));
+    t = f64_add(t, f64_mul(s3, q));
+    t = f64_add(t, f64_mul(s4, q));
+    return f64_mul(f64_mul(t, half), _CALC_F64_FOUR);
 }
 
 # ================================================================
@@ -768,6 +804,22 @@ public fn noise_perm(idx) {
     return load8(_PERM_TABLE + (idx & 511));
 }
 
+# The lattice cell index c -- the floor of a coordinate, an integer-valued f64 --
+# reduced mod 256, the period of the permutation table, as an integer in [0, 255].
+# Below 2^63 in magnitude f64_to(c) is exact and & 255 is c mod 256, negative c
+# included. From 2^63 up, doubles are 2^11 apart, so c is a multiple of 2048 and
+# c mod 256 is 0 exactly; c is never converted there, because f64_to of a value past
+# the i64 range is the toolchain's choice: 6.6.3 to 6.6.7 give i64 min (residue 0), and
+# from 6.6.8, which made f64_to saturate, a positive c gives i64 max, residue 255.
+# [measured: scratch f64_to probe, cycc 6.6.3, 6.6.6, 6.6.7, 6.6.8, 6.6.9, 6.6.14, 2026-10-11]
+# A NaN or infinite c also returns 0, the residue 6.6.3's i64 min gave it; perlin_2d
+# returns NaN there whatever the hash. noise_simplex.cyr's _simplex_cell is the same
+# reduction (modules keep their own `_` names).
+fn _calc_perlin_cell(c) {
+    if (f64_lt(f64_abs(c), _CALC_F64_2_POW_63) == 1) { return f64_to(c) & 255; }
+    return 0;
+}
+
 # 2D gradient: select one of 4 gradient directions based on hash & 3
 fn _grad2(hash, x, y) {
     var h = hash & 3;
@@ -786,14 +838,29 @@ fn _grad2(hash, x, y) {
 # distribution of those 256 values fingerprints the permutation table, the corner
 # hashing and the gradient set at once). Until 2.8.3 the only assertions were
 # |v| < 1 and determinism, which `return 0;` satisfies.
+#
+# ⛔ 3.3.5 — FROM A COORDINATE OF 2^63 THE FIELD WAS NOT 256-PERIODIC. The cell went
+# through `f64_to(xf) & 255`, and past the i64 range that conversion is the
+# toolchain's (_calc_perlin_cell): from cycc 6.6.8 a positive x of 2^63 or more hashed
+# as cell 255 where its residue is 0, so perlin_2d(0x43E5EB851EB851EC, 0.3) returned
+# perlin_2d(255, 0.3), 0xBFC1869835158B81, and 6.6.3 to 6.6.7 returned perlin_2d(0, 0.3),
+# 0x3FD75FF609DCF894. The cell now reaches the hash through _calc_perlin_cell. Of 18,000
+# calls with a coordinate in +-[2^63, 2^1021), 4,964 broke the periodicity under 6.6.14
+# and none do now; every pin returns the same value there, and a zero result can differ
+# in sign between pins, as in range on 3.3.4: below 6.6.8 f64_neg(+0) is +0 (226 of 8,000
+# lattice-point calls past 2^63 differ in that sign between 6.6.3 and 6.6.14). Every call
+# with both coordinates finite and below 2^63 keeps its bits (83,133 random calls
+# checked); a NaN or infinite one still returns NaN, whose sign bit can change.
+# [measured: scratch perlin sweep, 3.3.4 tree and this tree, cycc 6.6.3 and 6.6.14, 2026-10-11]
+# [measured: scratch f64_to and lattice-zero probes, cycc 6.6.3 to 6.6.9 and 6.6.14, 2026-10-11]
 public fn perlin_2d(x, y) {
     _perm_init();
 
-    # Grid cell coordinates (integer, masked to 0-255)
+    # Grid cell coordinates (integer, reduced mod 256 by _calc_perlin_cell)
     var xf = f64_floor(x);
     var yf = f64_floor(y);
-    var xi = f64_to(xf) & 255;
-    var yi = f64_to(yf) & 255;
+    var xi = _calc_perlin_cell(xf);
+    var yi = _calc_perlin_cell(yf);
 
     # Fractional position within cell
     var xfr = f64_sub(x, xf);

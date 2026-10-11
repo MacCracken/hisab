@@ -1,5 +1,11 @@
 # hisab fuzz harness — exercises core math operations with arbitrary inputs
 # Verifies no crash on arbitrary data and checks key invariants.
+#
+# `cyrius fuzz` compiles and runs this file and hands it no input, so the harness
+# makes its own: a fixed self-test (the seven known buffers in fuzz_selftest), then
+# every target driven by a seeded SplitMix64 stream (fuzz_generated). The seed is a
+# constant, so every run sees the same cases; a failure prints the target, the
+# iteration and the exact input, which is enough to reproduce it.
 
 include "src/f64_util.cyr"
 include "src/error.cyr"
@@ -10,6 +16,8 @@ include "src/quat.cyr"
 include "src/mat4.cyr"
 include "src/geo.cyr"
 include "src/num.cyr"
+include "src/tensor.cyr"
+include "src/einsum.cyr"
 
 # ================================================================
 # Helpers
@@ -56,6 +64,153 @@ fn fuzz_approx_eq(a, b, tol) {
 }
 
 # ================================================================
+# Seeded generator
+# ================================================================
+
+# The stream's starting state. Each target re-seeds from it (fz_seed_target), so a
+# target's cases do not move when another target is added or changes how many
+# values it draws.
+var _FZ_SEED = 0x0335_D118_5EED_0001;
+var _fz_state = 0;
+# Cases whose invariant was actually checked, so a filter that let nothing through
+# shows up as a count (and fails the population floor in fz_run) rather than as a pass.
+var _fz_checked = 0;
+
+fn fz_seed_target(id) {
+    _fz_state = _FZ_SEED ^ (id * 0x9E37_79B9_7F4A_7C15);
+    return 0;
+}
+
+# SplitMix64 (Steele, Lea, Flood 2014). `>>` is Cyrius's logical shift.
+fn fz_next() {
+    _fz_state = _fz_state + 0x9E37_79B9_7F4A_7C15;
+    var z = _fz_state;
+    z = (z ^ (z >> 30)) * 0xBF58_476D_1CE4_E5B9;
+    z = (z ^ (z >> 27)) * 0x94D0_49BB_1331_11EB;
+    return z ^ (z >> 31);
+}
+
+# A non-negative integer below n (n > 0). The top bits, so a small n still sees the
+# well-mixed part of the word.
+fn fz_below(n) {
+    return (fz_next() >> 1) % n;
+}
+
+# The values a guard is written for: +-0, +-Inf, NaN, +-DBL_MAX, +-DBL_MIN, the
+# smallest subnormal, 1, 2^1023 and 2^-52, each with a random sign.
+fn fz_special() {
+    var k = fz_below(10);
+    var v = 0;
+    if (k == 1) { v = 0x7FF0000000000000; }
+    elif (k == 2) { v = 0x7FF8000000000000; }
+    elif (k == 3) { v = 0x7FEFFFFFFFFFFFFF; }
+    elif (k == 4) { v = 0x0010000000000000; }
+    elif (k == 5) { v = 1; }
+    elif (k == 6) { v = 0x3FF0000000000000; }
+    elif (k == 7) { v = 0x7FE0000000000000; }
+    elif (k == 8) { v = 0x3CB0000000000000; }
+    elif (k == 9) { v = 0x7FF0000000000001; }   # a signalling NaN
+    if ((fz_next() & 1) == 1) { v = v | 0x8000000000000000; }
+    return v;
+}
+
+# One f64 bit pattern: 1/8 a special value, 1/8 subnormal (or +-0), 1/4 any 64 bits,
+# and 1/2 a full-mantissa value of magnitude in [2^-8, 2^8) with a random sign.
+fn fz_f64() {
+    var cls = fz_next() & 7;
+    if (cls == 0) { return fz_special(); }
+    var w = fz_next();
+    if (cls == 1) { return w & 0x800FFFFFFFFFFFFF; }
+    if (cls < 4) { return w; }
+    var e = 1015 + ((w >> 52) & 15);
+    return (w & 0x800FFFFFFFFFFFFF) | (e << 52);
+}
+
+# A full-mantissa value of magnitude in [2^-8, 2^8) with a random sign.
+fn fz_moderate() {
+    var w = fz_next();
+    var e = 1015 + ((w >> 52) & 15);
+    return (w & 0x800FFFFFFFFFFFFF) | (e << 52);
+}
+
+# Fill nbytes (a multiple of 8): mode 0 draws fz_f64, 1 fz_moderate, 2 raw words.
+fn fz_fill(buf, nbytes, mode) {
+    var i = 0;
+    while (i < nbytes) {
+        var v = 0;
+        if (mode == 0) { v = fz_f64(); }
+        elif (mode == 1) { v = fz_moderate(); }
+        else { v = fz_next(); }
+        store64(buf + i, v);
+        i = i + 8;
+    }
+    return 0;
+}
+
+# The class of one input word, read off its bits rather than off the branch that drew
+# it, so a generator that stops producing a class shows up even when its branch still
+# runs: 0 +-0, 1 subnormal, 2 a named special (+-DBL_MAX, DBL_MIN, 2^-1074, 1, 2^1023,
+# 2^-52), 3 +-Inf, 4 NaN, 5 any other normal outside [2^-8, 2^8) (where raw words
+# land), 6 any other value in [2^-8, 2^8).
+var _FZ_NCLS = 7;
+var _fz_cls = 0;              # [_FZ_NCLS] the current run's tallies (see fz_tally)
+fn fz_class(x) {
+    var a = x & 0x7FFFFFFFFFFFFFFF;
+    if (a == 0) { return 0; }
+    var e = a >> 52;
+    if (e == 0) {
+        if (a == 1) { return 2; }
+        return 1;
+    }
+    if (e == 0x7FF) {
+        if (a == 0x7FF0000000000000) { return 3; }
+        return 4;
+    }
+    if (a == 0x7FEFFFFFFFFFFFFF || a == 0x0010000000000000 || a == 0x3FF0000000000000) { return 2; }
+    if (a == 0x7FE0000000000000 || a == 0x3CB0000000000000) { return 2; }
+    if (e < 1015 || e > 1030) { return 5; }
+    return 6;
+}
+
+# Tally one case's words. The finite classes count only when the case's invariant was
+# checked (checked = 1): those are the inputs the invariant has seen. Inf and NaN count
+# on every case, because the invariants screen them out by design and what they test
+# is the no-crash path.
+fn fz_tally(buf, nbytes, checked) {
+    var i = 0;
+    while (i < nbytes) {
+        var c = fz_class(load64(buf + i));
+        if (checked == 1 || c == 3 || c == 4) { store64(_fz_cls + c * 8, load64(_fz_cls + c * 8) + 1); }
+        i = i + 8;
+    }
+    return 0;
+}
+
+fn fz_print(s) {
+    print(s, strlen(s));
+    return 0;
+}
+
+# The failure report: target, iteration, seed and the exact input words.
+fn fz_report(name, iter, buf, nbytes) {
+    fz_print("fuzz: FAIL in ");
+    fz_print(name);
+    fz_print(" at iteration ");
+    print_num(iter);
+    fz_print(", seed ");
+    fmt_hex0x(_FZ_SEED);
+    println("; input words:");
+    var i = 0;
+    while (i < nbytes) {
+        fz_print("    ");
+        fmt_hex0x(load64(buf + i));
+        println("");
+        i = i + 8;
+    }
+    return 0;
+}
+
+# ================================================================
 # Fuzz target 1: vec3 operations (needs 48 bytes = 6 f64s)
 # ================================================================
 
@@ -88,6 +243,17 @@ fn fuzz_vec3_ops(data) {
                 # Should be ~1.0 or 0.0 (for zero vector)
                 if (fuzz_is_finite(nlen) == 0) {
                     println("fuzz: FAIL vec3_normalize produced non-finite length");
+                    return 1;
+                }
+                # A finite non-zero vector normalises to unit length at every scale
+                # (3.3.4's D087 repair), and the zero vector to the zero vector. The
+                # test is NaN-true: `f64_lt(d, tol) == 0` fails a NaN distance too.
+                _fz_checked = _fz_checked + 1;
+                var want = F64_ONE;
+                if (f64_eq(ax, 0) == 1 && f64_eq(ay, 0) == 1 && f64_eq(az, 0) == 1) { want = 0; }
+                # 1e-6 = 0x3EB0C6F7A0B5ED8D
+                if (f64_lt(f64_abs(f64_sub(nlen, want)), 0x3EB0C6F7A0B5ED8D) == 0) {
+                    println("fuzz: FAIL vec3_normalize is not unit (or zero for the zero vector)");
                     return 1;
                 }
             }
@@ -130,18 +296,29 @@ fn fuzz_quat_rotate(data) {
                             if (fuzz_is_finite(vz) == 1) {
                                 var input_len = hvec3_length(v);
                                 var output_len = hvec3_length(rotated);
-                                if (fuzz_is_finite(input_len) == 1) {
-                                    if (fuzz_is_finite(output_len) == 1) {
-                                        # Tolerance: 1e-6 = 0x3EB0C6F7A0B5ED8D
-                                        var tol = 0x3EB0C6F7A0B5ED8D;
-                                        # Relative check: |output - input| / max(input, 1) < tol
-                                        var diff = f64_abs(f64_sub(output_len, input_len));
-                                        var denom = f64_max(input_len, F64_ONE);
-                                        var rel = f64_div(diff, denom);
-                                        if (f64_gt(rel, tol) == 1) {
-                                            println("fuzz: FAIL quat rotation changed vector length");
-                                            return 1;
-                                        }
+                                # ⛔ THROUGH 3.3.4 THIS ALSO REQUIRED A FINITE output_len AND
+                                # FAILED ONLY ON `f64_gt(rel, tol) == 1`, WHICH IS FALSE FOR NaN:
+                                # a rotation of a finite vector that came back NaN or +Inf was
+                                # skipped, and a NaN rel passed. Only the input is screened now,
+                                # and the test is NaN-true.
+                                # ⚠ |v| at most 2^1021. In the top two binades the body's
+                                # t = 2 (q x v) and its later sums overflow although the rotated
+                                # vector is representable: q = (0, 0, 1, 0), v = (2^1023, 0, 0)
+                                # gives (-Inf, NaN, NaN) where the answer is (-2^1023, 0, 0). That
+                                # is a finding for the roadmap, not something this harness may
+                                # paper over, so the bound sits exactly where it is still overflow-
+                                # free: |t|, |w t| and |q x t| are each at most 2|v|.
+                                if (fuzz_is_finite(input_len) == 1 && f64_le(input_len, 0x7FC0000000000000) == 1) {
+                                    _fz_checked = _fz_checked + 1;
+                                    # Tolerance: 1e-6 = 0x3EB0C6F7A0B5ED8D
+                                    var tol = 0x3EB0C6F7A0B5ED8D;
+                                    # Relative check: |output - input| / max(input, 1) < tol
+                                    var diff = f64_abs(f64_sub(output_len, input_len));
+                                    var denom = f64_max(input_len, F64_ONE);
+                                    var rel = f64_div(diff, denom);
+                                    if (f64_le(rel, tol) == 0) {
+                                        println("fuzz: FAIL quat rotation changed vector length");
+                                        return 1;
                                     }
                                 }
                             }
@@ -187,6 +364,34 @@ fn fuzz_ray_intersections(data) {
     var aabb = geo_aabb_new(aabb_min, aabb_max);
     var t2 = geo_ray_aabb(ray, aabb);
 
+    # Both contracts admit 0 (a miss) or a non-negative t, and geo_ray_aabb maps an
+    # overflowed t to 0, so from finite inputs neither may be NaN or negative and the
+    # box's t is finite. `f64_ge(t, 0) == 0` is NaN-true.
+    # ⚠ The sphere is held to it only while every origin and centre coordinate is at
+    # most 2^500 in magnitude. Farther apart, |o - c|^2 and (d . (o - c))^2 both
+    # overflow and the discriminant is Inf - Inf: a ray from (0, 0, -2^600) along +z
+    # at the unit sphere about the origin returns NaN where t is 2^600 - 1. That is a
+    # finding for the roadmap; the bound keeps the rest of the contract under test.
+    var all_finite = 1;
+    var near = 1;
+    var k = 0;
+    while (k < 72) {
+        var w = load64(data + k);
+        if (fuzz_is_finite(w) == 0) { all_finite = 0; }
+        elif (k != 24 && k != 32 && k != 40 && f64_gt(f64_abs(w), 0x5F30000000000000) == 1) { near = 0; }
+        k = k + 8;
+    }
+    if (all_finite == 1) {
+        if (near == 1) { _fz_checked = _fz_checked + 1; }
+        if (near == 1 && f64_ge(t1, 0) == 0) {
+            println("fuzz: FAIL geo_ray_sphere returned NaN or a negative t for finite inputs");
+            return 1;
+        }
+        if (f64_ge(t2, 0) == 0 || fuzz_is_finite(t2) == 0) {
+            println("fuzz: FAIL geo_ray_aabb returned NaN, a negative or an infinite t for finite inputs");
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -212,6 +417,7 @@ fn fuzz_num_gcd(data) {
     if (a > 0) {
         if (b > 0) {
             if (g > 0) {
+                _fz_checked = _fz_checked + 1;
                 var rem_a = a % g;
                 var rem_b = b % g;
                 if (rem_a != 0) {
@@ -229,7 +435,7 @@ fn fuzz_num_gcd(data) {
 }
 
 # ================================================================
-# Fuzz target 5: m4_inverse — check M * M^-1 ~ I when det != 0
+# Fuzz target 5: m4_inverse — check M * M^-1 ~ I when M is well conditioned
 # (needs 128 bytes = 16 f64s for a full 4x4 matrix)
 # ================================================================
 
@@ -247,23 +453,37 @@ fn fuzz_m4_inverse(data) {
 
     # Check M * M^-1 ~ I only if all elements are finite
     var all_finite = 1;
+    var nrm = 0;
     i = 0;
     while (i < 16) {
-        if (fuzz_is_finite(load64(m + i * 8)) == 0) { all_finite = 0; }
+        var e = load64(m + i * 8);
+        if (fuzz_is_finite(e) == 0) { all_finite = 0; }
+        nrm = f64_max(nrm, f64_abs(e));
         i = i + 1;
     }
 
+    # The determinant test is RELATIVE: |det| >= 2^-10 * max|m_ij|^4. Each cofactor is
+    # six products of three entries, so every entry of M^-1 is at most 6 * 2^10 /
+    # max|m_ij| and the infinity-norm condition number at most 4 * 4 * 6144 (about
+    # 1e5), at any scale. The 1e-6 tolerance is not derived from that bound; it sits
+    # far above what the inverse does: the largest residual entry over the 5667
+    # moderate cases this seed checks is 2^-43 (512 ulps of 1), and 1.45 * 2^-48 over
+    # the 71 any-bits ones. An absolute 1e-8 determinant test admits matrices whose condition
+    # number passes 1e15 once max|m_ij| is large, where M * M^-1 is legitimately far
+    # from I. max|m_ij| stays in [2^-120, 2^120] so its fourth power and the
+    # determinant are normal numbers.
+    # [measured: scratch copy of this harness printing the largest |M M^-1 - I| entry, 2026-10-11]
     if (all_finite == 1) {
-        # Check determinant is not too small
-        var det = m4_determinant(m);
-        if (fuzz_is_finite(det) == 1) {
-            # 1e-8 = 0x3E7AD7F29ABCAF48
-            var det_tol = 0x3E7AD7F29ABCAF48;
-            if (f64_gt(f64_abs(det), det_tol) == 1) {
+        if (f64_ge(nrm, 0x3870000000000000) == 1 && f64_le(nrm, 0x4770000000000000) == 1) {
+            var det = m4_determinant(m);
+            var n2 = f64_mul(nrm, nrm);
+            var floor = f64_mul(f64_mul(n2, n2), 0x3F50000000000000);   # 2^-10
+            if (f64_ge(f64_abs(det), floor) == 1) {
+                _fz_checked = _fz_checked + 1;
                 var product = m4_mul(m, inv);
                 # Check diagonal elements ~ 1.0, off-diagonal ~ 0.0
-                # Use tolerance 1e-3 = 0x3F50624DD2F1A9FC
-                var tol = 0x3F50624DD2F1A9FC;
+                # 1e-6 = 0x3EB0C6F7A0B5ED8D, NaN-true
+                var tol = 0x3EB0C6F7A0B5ED8D;
                 var col = 0;
                 while (col < 4) {
                     var row = 0;
@@ -271,12 +491,10 @@ fn fuzz_m4_inverse(data) {
                         var expected = 0;
                         if (col == row) { expected = F64_ONE; }
                         var actual = m4_get(product, col, row);
-                        if (fuzz_is_finite(actual) == 1) {
-                            var diff = f64_abs(f64_sub(actual, expected));
-                            if (f64_gt(diff, tol) == 1) {
-                                println("fuzz: FAIL m4_inverse M*M^-1 != I");
-                                return 1;
-                            }
+                        var diff = f64_abs(f64_sub(actual, expected));
+                        if (f64_le(diff, tol) == 0) {
+                            println("fuzz: FAIL m4_inverse M*M^-1 != I");
+                            return 1;
                         }
                         row = row + 1;
                     }
@@ -286,6 +504,417 @@ fn fuzz_m4_inverse(data) {
         }
     }
     return 0;
+}
+
+# ================================================================
+# Fuzz target 6: einsum notation, malformed and well-formed
+# ================================================================
+#
+# einsum's notation parser is hisab's only string parser. Each case builds a
+# notation and the operand tensors, decides INDEPENDENTLY of src/einsum.cyr whether
+# the call is valid, and holds einsum to that: 0 for anything invalid, and for a
+# valid call a tensor equal bit for bit to a brute-force evaluation. Entries are
+# small integers, so every product and sum is exact and the order of summation
+# cannot move a bit; the zero's sign is matched by evaluating in einsum's shape (a
+# product when nothing is contracted, a sum from +0 otherwise).
+#
+# Operands are sized safely: six draws give a label a dimension of 1 to 3 and every
+# other label stays 1, so an evaluation loops at most 3^6 = 729 times, except where the
+# dimension-mismatch case rebuilds operand 0 with dimension 2 on each of its (up to 4)
+# axes: there it is at most 3^6 * 2^4 = 11664.
+
+var _EZ_MAXOPS = 12;            # operands the oracle can hold (einsum caps at 8)
+var _ez_buf = 0;                # notation bytes
+var _ez_len = 0;
+var _ez_nops = 0;               # oracle's parse: operand count,
+var _ez_rank = 0;               #   [op] label count,
+var _ez_lab = 0;                #   [op * 4 + i] label index 0..25,
+var _ez_orank = 0;              #   output label count,
+var _ez_olab = 0;               #   [i] output labels
+var _ez_dims = 0;               # [26] the case's dimension per label
+var _ez_tens = 0;               # operand tensor array handed to einsum
+var _ez_vals = 0;               # [26] label values during evaluation
+var _ez_valid = 0;              # cases the oracle called valid (checked bit for bit)
+# Variety tallies, each with a floor in fz_run_einsum, so a generator that stops making
+# a kind of case fails even though einsum still meets the oracle on the rest.
+var _ez_junk = 0;               # cases holding a stray or non-label byte
+var _ez_wide = 0;               # valid cases with some used label of dimension 2 or 3
+var _ez_over = 0;               # structured cases with 9 or 10 operands (all refused)
+var _ez_nopsv = 0;              # [9] valid cases by operand count, 1..8
+
+fn ez_init() {
+    if (_ez_buf != 0) { return 0; }
+    _ez_buf = alloc(64);
+    _ez_rank = alloc(_EZ_MAXOPS * 8);
+    _ez_lab = alloc(_EZ_MAXOPS * 4 * 8);
+    _ez_olab = alloc(4 * 8);
+    _ez_dims = alloc(26 * 8);
+    _ez_tens = alloc((_EZ_MAXOPS + 1) * 8);
+    _ez_vals = alloc(26 * 8);
+    _ez_nopsv = alloc(9 * 8);
+    return 0;
+}
+
+fn ez_put(ch) {
+    if (_ez_len < 64) { store8(_ez_buf + _ez_len, ch); _ez_len = _ez_len + 1; }
+    return 0;
+}
+
+# Parse labels in [s, e): spaces skipped, 'a'..'z' kept, anything else invalid, at
+# most 4 labels. Writes them at out and returns the count, or -1.
+fn ez_parse_spec(s, e, out) {
+    var n = 0;
+    var p = s;
+    while (p < e) {
+        var ch = load8(_ez_buf + p);
+        if (ch != 32) {
+            if (ch < 97 || ch > 122) { return 0 - 1; }
+            if (n >= 4) { return 0 - 1; }
+            store64(out + n * 8, ch - 97);
+            n = n + 1;
+        }
+        p = p + 1;
+    }
+    return n;
+}
+
+# The grammar half of the oracle: the first "->" splits inputs from output, the
+# inputs split on ',', every spec is labels and spaces with at most 4 labels, and no
+# output label repeats. Returns 1 when the notation parses, with the parse stored.
+fn ez_parse() {
+    var arrow = 0 - 1;
+    var p = 0;
+    while (p + 1 < _ez_len && arrow < 0) {
+        if (load8(_ez_buf + p) == 45 && load8(_ez_buf + p + 1) == 62) { arrow = p; }
+        p = p + 1;
+    }
+    if (arrow < 0) { return 0; }
+    _ez_nops = 0;
+    var seg = 0;
+    p = 0;
+    while (p <= arrow) {
+        if (p == arrow || load8(_ez_buf + p) == 44) {
+            if (_ez_nops >= _EZ_MAXOPS) { return 0; }
+            var r = ez_parse_spec(seg, p, _ez_lab + _ez_nops * 32);
+            if (r < 0) { return 0; }
+            store64(_ez_rank + _ez_nops * 8, r);
+            _ez_nops = _ez_nops + 1;
+            seg = p + 1;
+        }
+        p = p + 1;
+    }
+    _ez_orank = ez_parse_spec(arrow + 2, _ez_len, _ez_olab);
+    if (_ez_orank < 0) { return 0; }
+    var i = 0;
+    while (i < _ez_orank) {
+        var j = i + 1;
+        while (j < _ez_orank) {
+            if (load64(_ez_olab + i * 8) == load64(_ez_olab + j * 8)) { return 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# A tensor of the given rank whose axis i has dimension dims_of[labels[i]], or
+# (when dims_of is 0) 2 on every axis; entries are integers in [-3, 3], with an
+# occasional -0.
+fn ez_tensor(rank, labels, dims_of) {
+    var shape = alloc(4 * 8 + 8);
+    var i = 0;
+    while (i < rank) {
+        var d = 2;
+        if (dims_of != 0) { d = load64(dims_of + load64(labels + i * 8) * 8); }
+        store64(shape + i * 8, d);
+        i = i + 1;
+    }
+    var t = tensor_new(rank, shape);
+    if (t == 0) { return 0; }
+    var n = HTensor_total(t);
+    var dp = HTensor_data(t);
+    i = 0;
+    while (i < n) {
+        var v = f64_from(fz_below(7) - 3);
+        if (fz_below(16) == 0) { v = 0x8000000000000000; }
+        store64(dp + i * 8, v);
+        i = i + 1;
+    }
+    return t;
+}
+
+# Element of operand op at the current label values.
+fn ez_elem(op) {
+    var t = load64(_ez_tens + op * 8);
+    var r = load64(_ez_rank + op * 8);
+    var shape = HTensor_shape(t);
+    var idx = 0;
+    var i = 0;
+    while (i < r) {
+        idx = idx * load64(shape + i * 8) + load64(_ez_vals + load64(_ez_lab + op * 32 + i * 8) * 8);
+        i = i + 1;
+    }
+    return load64(HTensor_data(t) + idx * 8);
+}
+
+fn ez_product() {
+    var prod = F64_ONE;
+    var op = 0;
+    while (op < _ez_nops) {
+        prod = f64_mul(prod, ez_elem(op));
+        op = op + 1;
+    }
+    return prod;
+}
+
+# Sum over the contracted labels from `from` up (ascending label order); a label is
+# contracted when some operand uses it and the output does not.
+fn ez_sum_from(used, inout, from) {
+    var l = from;
+    while (l < 26) {
+        if (load8(used + l) == 1 && load8(inout + l) == 0) {
+            var s = 0;
+            var c = 0;
+            var d = load64(_ez_dims + l * 8);
+            while (c < d) {
+                store64(_ez_vals + l * 8, c);
+                s = f64_add(s, ez_sum_from(used, inout, l + 1));
+                c = c + 1;
+            }
+            return s;
+        }
+        l = l + 1;
+    }
+    return ez_product();
+}
+
+# The semantic half of the oracle and the evaluation. n_tensors is what the call
+# claims. Returns 0 when einsum must refuse the call; otherwise builds the expected
+# result and returns 1 if `got` matches it bit for bit, 2 if it does not.
+fn ez_expect(n_tensors, got, verdict_out) {
+    store64(verdict_out, 0);
+    if (n_tensors != _ez_nops || _ez_nops > 8) { return 0; }
+    var used = alloc(26);
+    var inout = alloc(26);
+    var dimseen = alloc(26 * 8);
+    var l = 0;
+    while (l < 26) { store8(used + l, 0); store8(inout + l, 0); store64(dimseen + l * 8, 0); l = l + 1; }
+    var op = 0;
+    while (op < _ez_nops) {
+        var t = load64(_ez_tens + op * 8);
+        if (t == 0) { return 0; }
+        var r = load64(_ez_rank + op * 8);
+        if (HTensor_rank(t) != r) { return 0; }
+        var i = 0;
+        while (i < r) {
+            var lb = load64(_ez_lab + op * 32 + i * 8);
+            var d = load64(HTensor_shape(t) + i * 8);
+            if (load64(dimseen + lb * 8) == 0) { store64(dimseen + lb * 8, d); }
+            elif (load64(dimseen + lb * 8) != d) { return 0; }
+            store8(used + lb, 1);
+            i = i + 1;
+        }
+        op = op + 1;
+    }
+    var i = 0;
+    while (i < _ez_orank) {
+        var lb = load64(_ez_olab + i * 8);
+        if (load8(used + lb) == 0) { return 0; }
+        store8(inout + lb, 1);
+        i = i + 1;
+    }
+    # Valid. Evaluate with the dimensions the tensors actually carry.
+    var wide = 0;
+    l = 0;
+    while (l < 26) {
+        store64(_ez_dims + l * 8, load64(dimseen + l * 8));
+        if (load8(used + l) == 1 && load64(dimseen + l * 8) > 1) { wide = 1; }
+        l = l + 1;
+    }
+    if (wide == 1) { _ez_wide = _ez_wide + 1; }
+    store64(verdict_out, 1);
+    if (got == 0) { return 2; }
+    var want_rank = _ez_orank;
+    if (want_rank == 0) { want_rank = 1; }
+    if (HTensor_rank(got) != want_rank) { return 2; }
+    var total = 1;
+    i = 0;
+    while (i < _ez_orank) {
+        var d = load64(_ez_dims + load64(_ez_olab + i * 8) * 8);
+        if (load64(HTensor_shape(got) + i * 8) != d) { return 2; }
+        total = total * d;
+        i = i + 1;
+    }
+    if (_ez_orank == 0 && load64(HTensor_shape(got)) != 1) { return 2; }
+    var flat = 0;
+    while (flat < total) {
+        var rem = flat;
+        i = _ez_orank - 1;
+        while (i >= 0) {
+            var lb = load64(_ez_olab + i * 8);
+            var d = load64(_ez_dims + lb * 8);
+            store64(_ez_vals + lb * 8, rem % d);
+            rem = rem / d;
+            i = i - 1;
+        }
+        if (load64(HTensor_data(got) + flat * 8) != ez_sum_from(used, inout, 0)) { return 2; }
+        flat = flat + 1;
+    }
+    return 1;
+}
+
+# One case. mode 0: a structured notation (well-formed, then perturbed); mode 1: a
+# random string over labels, separators, spaces and junk bytes. Returns 0 when
+# einsum met the oracle, 1 otherwise (after printing what it was given).
+var _EZ_JUNK = "AZ0.!\t~_";
+fn fuzz_einsum_case(mode) {
+    ez_init();
+    _ez_len = 0;
+    var l = 0;
+    while (l < 26) { store64(_ez_dims + l * 8, 1); l = l + 1; }
+    # Six draws give a label a dimension of 1 to 3; every other label stays 1.
+    var nbig = 0;
+    while (nbig < 6) {
+        store64(_ez_dims + fz_below(26) * 8, 1 + fz_below(3));
+        nbig = nbig + 1;
+    }
+    var claim = 0;
+    var junked = 0;
+    if (mode == 0) {
+        # 1 to 8 operands, einsum's whole range, and now and then 9 or 10, which it
+        # must refuse.
+        var nops = 1 + fz_below(8);
+        if (fz_below(16) == 0) { nops = 9 + fz_below(2); }
+        if (nops > 8) { _ez_over = _ez_over + 1; }
+        var op = 0;
+        while (op < nops) {
+            if (op > 0) { ez_put(44); }
+            var r = fz_below(5);
+            if (fz_below(64) == 0) { r = 5; }                    # one label too many
+            var i = 0;
+            while (i < r) {
+                if (fz_below(8) == 0) { ez_put(32); }
+                ez_put(97 + fz_below(6));
+                i = i + 1;
+            }
+            op = op + 1;
+        }
+        if (fz_below(32) != 0) { ez_put(45); ez_put(62); }       # the arrow, usually
+        var orank = fz_below(4);
+        var i = 0;
+        while (i < orank) {
+            if (fz_below(8) == 0) { ez_put(32); }
+            ez_put(97 + fz_below(6));                            # may repeat, or be unused
+            i = i + 1;
+        }
+        if (fz_below(32) == 0) { ez_put(97 + fz_below(26)); }    # an outside label
+        if (fz_below(16) == 0 && _ez_len < 64) {
+            # One stray byte anywhere in an otherwise well-formed notation.
+            var at = fz_below(_ez_len + 1);
+            var k = _ez_len;
+            while (k > at) { store8(_ez_buf + k, load8(_ez_buf + k - 1)); k = k - 1; }
+            var junk = load8(_EZ_JUNK + fz_below(8));
+            if (fz_below(4) == 0) { junk = 128 + fz_below(128); }
+            store8(_ez_buf + at, junk);
+            _ez_len = _ez_len + 1;
+            junked = 1;
+        }
+        claim = nops;
+        if (fz_below(16) == 0) { claim = nops + fz_below(3) - 1; }
+        # ⚠ Never 8 tensors for a 9-operand notation. einsum stops counting operands at
+        # 8, so with n_tensors = 8 it drops the rest of the notation unread:
+        # "i,i,i,i,i,i,i,i,i->" and "i,i,i,i,i,i,i,i,Q->" over eight [2] tensors both
+        # return a tensor where the documented answer is 0. That is a finding for the
+        # roadmap; 9 and 10 operands are still sent with a claim einsum must refuse.
+        if (nops > 8 && claim == 8) { claim = nops; }
+    } else {
+        var n = fz_below(17);
+        var i = 0;
+        while (i < n) {
+            var c = fz_below(16);
+            if (c < 7) { ez_put(97 + fz_below(6)); }
+            elif (c == 7) { ez_put(97 + fz_below(26)); }
+            elif (c < 10) { ez_put(44); }
+            elif (c == 10) { ez_put(45); }
+            elif (c == 11) { ez_put(62); }
+            elif (c == 12) { ez_put(45); ez_put(62); }
+            elif (c == 13) { ez_put(32); }
+            elif (c == 14) { ez_put(load8(_EZ_JUNK + fz_below(8))); junked = 1; }
+            else { ez_put(128 + fz_below(128)); junked = 1; }
+            i = i + 1;
+        }
+        claim = 1 + fz_below(3);
+    }
+    if (junked == 1) { _ez_junk = _ez_junk + 1; }
+    # Operand tensors: shaped by the oracle's parse where it parsed, else rank-2 2x2.
+    var parsed = ez_parse();
+    var ntens = _EZ_MAXOPS;
+    var op = 0;
+    while (op < ntens) {
+        var t = 0;
+        if (parsed == 1 && op < _ez_nops) {
+            t = ez_tensor(load64(_ez_rank + op * 8), _ez_lab + op * 32, _ez_dims);
+            if (fz_below(32) == 0) { t = ez_tensor(load64(_ez_rank + op * 8) + 1, _ez_lab + op * 32, 0); }
+        } else {
+            t = ez_tensor(2, 0, 0);
+        }
+        if (fz_below(128) == 0) { t = 0; }
+        store64(_ez_tens + op * 8, t);
+        op = op + 1;
+    }
+    if (parsed == 1 && mode == 1) { claim = _ez_nops; }
+    if (parsed == 1 && fz_below(32) == 0) {
+        # A dimension mismatch between two uses of one label.
+        if (_ez_nops > 0 && load64(_ez_rank) > 0 && load64(_ez_tens) != 0) {
+            store64(_ez_tens, ez_tensor(load64(_ez_rank), _ez_lab, 0));
+        }
+    }
+    var got = einsum(str_new(_ez_buf, _ez_len), _ez_tens, claim);
+    var verdict = alloc(8);
+    var ok = 1;
+    if (parsed == 0) {
+        if (got != 0) { ok = 0; }
+    } else {
+        var r = ez_expect(claim, got, verdict);
+        if (r == 1) {
+            _ez_valid = _ez_valid + 1;
+            store64(_ez_nopsv + _ez_nops * 8, load64(_ez_nopsv + _ez_nops * 8) + 1);
+        }
+        if (r == 0 && got != 0) { ok = 0; }
+        if (r == 2) { ok = 0; }
+    }
+    if (ok == 1) { return 0; }
+    fz_print("fuzz: FAIL einsum on \"");
+    var bi = 0;
+    while (bi < _ez_len) {
+        # Printable ASCII as itself, any other byte (and the backslash) as \xNN.
+        var ch = load8(_ez_buf + bi);
+        if (ch >= 32 && ch < 127 && ch != 92) { print(_ez_buf + bi, 1); }
+        else { fz_print("\\x"); fmt_hex(ch); }
+        bi = bi + 1;
+    }
+    fz_print("\" with n_tensors = ");
+    print_num(claim);
+    fz_print(": got ");
+    if (got == 0) { fz_print("0"); } else { fz_print("a tensor"); }
+    if (parsed == 0) { println(", the notation does not parse"); }
+    elif (load64(verdict) == 0) { println(", the call is invalid"); }
+    else { println(", the call is valid and the oracle disagrees"); }
+    op = 0;
+    while (op < 9) {
+        var t = load64(_ez_tens + op * 8);
+        fz_print("    operand ");
+        print_num(op);
+        fz_print(" shape");
+        if (t == 0) { fz_print(" (null)"); }
+        else {
+            var i = 0;
+            while (i < HTensor_rank(t)) { fz_print(" "); print_num(load64(HTensor_shape(t) + i * 8)); i = i + 1; }
+        }
+        println("");
+        op = op + 1;
+    }
+    return 1;
 }
 
 # ================================================================
@@ -327,12 +956,171 @@ fn fuzz_main(data, len) {
 }
 
 # ================================================================
+# Generated cases
+# ================================================================
+
+# The population floor: a target whose invariant ran on fewer than `floor` cases
+# fails, so a screening condition that stops letting cases through cannot pass by
+# checking nothing.
+fn fz_floor(name, got, floor) {
+    if (got >= floor) { return 0; }
+    fz_print("fuzz: FAIL ");
+    fz_print(name);
+    fz_print(" checked ");
+    print_num(got);
+    fz_print(" cases, under its floor of ");
+    print_num(floor);
+    println("");
+    return 1;
+}
+
+# The variety floor: each value class (fz_class) must reach `floor` words in the
+# run's tallies, so a generator that stops drawing specials, raw words or subnormals
+# fails here even though every invariant still passes.
+fn fz_cls_floor(name, floor) {
+    var bad = 0;
+    var c = 0;
+    fz_print("      value classes (zero sub named inf nan wide moderate):");
+    while (c < _FZ_NCLS) {
+        var n = load64(_fz_cls + c * 8);
+        fz_print(" ");
+        print_num(n);
+        if (n < floor) { bad = 1; }
+        c = c + 1;
+    }
+    println("");
+    if (bad == 0) { return 0; }
+    fz_print("fuzz: FAIL ");
+    fz_print(name);
+    fz_print(": a value class is under its floor of ");
+    print_num(floor);
+    println("");
+    return 1;
+}
+
+# Run one buffer target `iters` times on fresh stream values. id names the target's
+# stream; mode is fz_fill's; floor is the fewest cases its invariant must check, and
+# cls_floor (0 for none) the fewest words each value class must contribute.
+fn fz_run(id, name, nbytes, mode, iters, floor, cls_floor) {
+    fz_seed_target(id);
+    _fz_checked = 0;
+    if (_fz_cls == 0) { _fz_cls = alloc(_FZ_NCLS * 8); }
+    var c = 0;
+    while (c < _FZ_NCLS) { store64(_fz_cls + c * 8, 0); c = c + 1; }
+    var buf = alloc(nbytes);
+    var it = 0;
+    while (it < iters) {
+        fz_fill(buf, nbytes, mode);
+        var before = _fz_checked;
+        var rc = 0;
+        if (id == 1) { rc = fuzz_vec3_ops(buf); }
+        elif (id == 2) { rc = fuzz_quat_rotate(buf); }
+        elif (id == 3) { rc = fuzz_ray_intersections(buf); }
+        elif (id == 4) { rc = fuzz_num_gcd(buf); }
+        else { rc = fuzz_m4_inverse(buf); }
+        if (rc != 0) { fz_report(name, it, buf, nbytes); return 1; }
+        var seen = 0;
+        if (_fz_checked > before) { seen = 1; }
+        fz_tally(buf, nbytes, seen);
+        it = it + 1;
+    }
+    fz_print("fuzz: ");
+    fz_print(name);
+    fz_print(" ");
+    print_num(iters);
+    fz_print(" generated cases, ");
+    print_num(_fz_checked);
+    println(" checked");
+    if (fz_floor(name, _fz_checked, floor) != 0) { return 1; }
+    if (cls_floor > 0) { return fz_cls_floor(name, cls_floor); }
+    return 0;
+}
+
+# floor: the fewest valid (evaluated) cases. The variety floors, each 0 for none:
+# junk_floor cases with a stray byte, wide_floor valid cases with a dimension above 1,
+# nops_floor valid cases at EACH operand count 1..8, over_floor 9-or-10-operand cases.
+fn fz_run_einsum(id, name, mode, iters, floor, junk_floor, wide_floor, nops_floor, over_floor) {
+    fz_seed_target(id);
+    ez_init();
+    _ez_valid = 0;
+    _ez_junk = 0;
+    _ez_wide = 0;
+    _ez_over = 0;
+    var k = 0;
+    while (k < 9) { store64(_ez_nopsv + k * 8, 0); k = k + 1; }
+    var it = 0;
+    while (it < iters) {
+        if (fuzz_einsum_case(mode) != 0) {
+            fz_print("fuzz: FAIL in ");
+            fz_print(name);
+            fz_print(" at iteration ");
+            print_num(it);
+            fz_print(", seed ");
+            fmt_hex0x(_FZ_SEED);
+            println("");
+            return 1;
+        }
+        it = it + 1;
+    }
+    fz_print("fuzz: ");
+    fz_print(name);
+    fz_print(" ");
+    print_num(iters);
+    fz_print(" generated cases, ");
+    print_num(_ez_valid);
+    fz_print(" valid and evaluated, ");
+    print_num(iters - _ez_valid);
+    println(" refused");
+    fz_print("      stray-byte cases ");
+    print_num(_ez_junk);
+    fz_print(", valid with a dimension above 1 ");
+    print_num(_ez_wide);
+    fz_print(", 9-10 operands ");
+    print_num(_ez_over);
+    fz_print(", valid by operand count 1..8:");
+    var bad = 0;
+    k = 1;
+    while (k <= 8) {
+        fz_print(" ");
+        print_num(load64(_ez_nopsv + k * 8));
+        if (load64(_ez_nopsv + k * 8) < nops_floor) { bad = 1; }
+        k = k + 1;
+    }
+    println("");
+    if (_ez_junk < junk_floor || _ez_wide < wide_floor || _ez_over < over_floor) { bad = 1; }
+    if (bad == 1) {
+        fz_print("fuzz: FAIL ");
+        fz_print(name);
+        println(": a kind of case is under its variety floor");
+        return 1;
+    }
+    return fz_floor(name, _ez_valid, floor);
+}
+
+fn fuzz_generated() {
+    # Each floor is about half the count the seed gives (the summary lines print it).
+    # "any bits" matrices are rarely finite, in range and well conditioned at once, so
+    # that stream is mostly a no-crash run; "moderate" is the one that checks M M^-1.
+    # The value-class floors apply to the three streams whose invariants see the full
+    # f64 range; "any bits" matrices share their generator and the other two streams
+    # draw a single class by design. The einsum variety floors are about half the
+    # counts too.
+    if (fz_run(1, "vec3_ops", 48, 0, 100000, 40000, 3000) != 0) { return 1; }
+    if (fz_run(2, "quat_rotate", 56, 0, 100000, 30000, 3000) != 0) { return 1; }
+    if (fz_run(3, "ray_intersections", 72, 0, 100000, 15000, 2000) != 0) { return 1; }
+    if (fz_run(4, "num_gcd", 16, 2, 100000, 50000, 0) != 0) { return 1; }
+    if (fz_run(5, "m4_inverse (any bits)", 128, 0, 20000, 30, 0) != 0) { return 1; }
+    if (fz_run(6, "m4_inverse (moderate)", 128, 1, 20000, 2500, 0) != 0) { return 1; }
+    if (fz_run_einsum(7, "einsum (structured)", 0, 20000, 3500, 600, 1500, 300, 600) != 0) { return 1; }
+    if (fz_run_einsum(8, "einsum (random bytes)", 1, 50000, 300, 14000, 50, 0, 0) != 0) { return 1; }
+    return 0;
+}
+
+# ================================================================
 # Self-test with known inputs
 # ================================================================
 
-fn main() {
-    alloc_init();
-
+fn fuzz_selftest() {
     # Allocate 128 bytes for test data (enough for all targets)
     var test_data = alloc(128);
 
@@ -447,7 +1235,13 @@ fn main() {
         println("fuzz: FAIL on zero vector test");
         return 1;
     }
+    return 0;
+}
 
+fn main() {
+    alloc_init();
+    if (fuzz_selftest() != 0) { return 1; }
+    if (fuzz_generated() != 0) { return 1; }
     println("fuzz: ok");
     return 0;
 }

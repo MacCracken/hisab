@@ -229,3 +229,38 @@ each tripwire.
   (`rc != 0 - 1` passes every other code through), so its test must move to −3 as well, or the
   fallback stops running. `svd_truncated` falls back on any non-zero status and is unaffected.
 - **Consumers keep the old answer** until their own cyrius pin carries the fixed ganita.
+
+## The repro's witnesses (checked 2026-10-11, hisab 3.3.5)
+
+The repro as filed checked only 3×2 matrices (`row()` / `ortho()`), so it could not show
+mechanisms 3 and 4. The copy in the ganita repo was extended on 2026-10-04, on the ganita side:
+- `rowg()` / `orthog()` check any rows × n matrix. Vt's rows must be orthonormal to 2^-44. U's
+  columns must be unit to 2^-44 and orthogonal for every normal σ. A σ that comes back exactly 0
+  must have an all-zero U column, which is ganita's convention.
+- The rows now include Z, R = [[1, 2, 3], [1, 2, 3], [4, 5, 6]] and W54, the 5×4 two-cycle witness
+  above.
+
+Their exact σ, rounded once, as the repro carries them:
+
+| row | σ |
+|---|---|
+| Z | `0x400D3FB1257408C4`, `0x3FFC17E03945F102`, 0 |
+| R | `0x4024646BB0023E7B`, `0x3FF04ECE4EBDCE2C`, 0 |
+| W54 | `0x402A55180C7066EC`, `0x402793D5C3F35250`, `0x4023BC5D726B72E5`, `0x3FF2F035DF06D48A` |
+
+hisab re-derived each one independently with a 1400-digit Decimal one-sided Jacobi, and all of
+them match bit for bit. Z and R have rank 2, so σ₃ = 0 exactly. hisab's own fallback answers for R,
+quoted above, are 1.6 and 3.1 ulp above R's.
+
+**Paired-run recipe.** This is the run the pin-bump pairs against. It was checked under cyrius
+6.6.14 on 2026-10-11:
+1. Make a scratch dir. Its `cyrius.cyml` pins `cyrius = "6.6.14"` and declares hisab's 16 stdlib
+   leaves.
+2. Run `cyrius lib sync`. It copied 29 files, each byte-identical to hisab's lock-verified `lib/`.
+3. Copy `ganita/docs/development/issues/repros/2026-10-03-mat-svd-no-convergence-on-tiny-columns.cyr`
+   with its `include` lines dropped.
+4. Build it with `cyrius build -v`. The `compiler:` line read `versions/6.6.14/bin/cycc`.
+
+It exits **9**. A1, A4, A5, A6, B1, B2, Z, R and W54 each return rc −1. A2, A3 and C pass, so they
+work as controls. The repro's header expects 0 once ganita's repaired SVD is folded in.
+[measured: scratch dir pinned to 6.6.14, the repro built and run, 2026-10-11]

@@ -6,6 +6,12 @@ it rested on a premise that does not hold. `_col_in_circumcircle`'s winding term
 exact `orient2d` over the raw coordinates. This supersedes the *Disposition: leave it* section at
 the bottom of this file.
 
+**3.3.5:** the determinant itself is exact too (audit `D055`, reopened by sets mixing magnitudes
+at scale 1). Every sign `delaunay_2d` reads — the in-circle determinant, the walk's orientations,
+the ghost terms and the emitted winding — is a float filter with exact fallbacks (an orientation
+expansion, a double-double in-circle stage, and integer arithmetic over the whole double range).
+The CHANGELOG's 3.3.5 *Delaunay* entry holds the numbers.
+
 ⚠ **The first repair attempt was wrong and is recorded below**, because it is the attempt anyone
 would make second time round: making the determinant exact **while leaving the operands
 pre-differenced** changes nothing.

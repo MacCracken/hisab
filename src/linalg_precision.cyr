@@ -223,6 +223,58 @@ fn _lp_negligible(off, a, b) {
     return _lp_negligible_rel(off, s);
 }
 
+# ⛔ 3.3.5 — TWO KINDS OF COUPLING NO QR STEP COULD EVER REMOVE, so the routine spun to
+# max_iter and returned NO_CONVERGENCE for a matrix whose values all fit.
+# (1) A BLOCK ON THE 2^-1074 GRID. `_lp_negligible` asks |off| < 1e-12 (|a| + |b|), and
+# for two subnormal neighbours that product is 0, so only an exact zero deflates; the
+# rotations then round every entry back onto a grid of a few bits and the block cycles.
+# The rank-1 4x4 in tests/abuse.tcyr ends in [[u, -u], [0, -8u]] beside 6e78.
+# (2) A ROTATION THAT UNDERFLOWS. eigen_qr on [[0, a, 0], [a, b, H], [0, H, 0]] with |H|
+# about 2^899 and a about 2^-1017 (balanced units): the shift is about +-H, so the chase's
+# first rotation is (H, a), its sine a / H is below 2^-1074 and rounds to 0, every rotation
+# of the sweep is the identity, and a never moves. Relative to its neighbours 0 and
+# b ~ 2^-1022, a is not negligible.
+# ⭐ Both couplings are below DBL_MIN times the largest entry of the (bi/tri)diagonal: a
+# block on the grid sits far under it (balancing leaves max|A| >= 1, so that entry is at
+# least 1 / sqrt(3n)), and a sine rounds to 0 only for |z| < 2^-1075 r, with r within a
+# small multiple of that largest entry. Zeroing such an entry moves the values by at most
+# DBL_MIN times it, a normwise 2^-1022, and no more than normwise: values that far below the
+# largest keep no relative accuracy (see svd_golub_kahan and eigen_qr). It is done only on
+# one last attempt (`lift` 2), after an attempt has failed and no headroom is left to add,
+# so every input an earlier attempt answers keeps its bits.
+# [measured: regenerated 43,000 + 22,000-row probes, 3.3.4 vs this tree + Decimal oracle, 2026-10-11; cycc 6.6.14]
+# ⚠ THE FLOOR IS RELATIVE ON PURPOSE. DBL_MIN alone (absolute) answers only kind (1): on
+# the same probes it left 40 eigen rows of kind (2) refused. 2^-1074 times the largest
+# entry answered exactly the rows DBL_MIN times it does, bit for bit.
+# [measured: floor-variant builds over the same probes, 2026-10-11; cycc 6.6.14]
+
+# The floor of one last attempt: DBL_MIN times the largest |d_i| (i < n) and |f_k|
+# (lo <= k < hi). The product is exact for a largest entry of at least 1, and below that it
+# rounds onto the 2^-1074 grid, which moves the floor by at most half a step.
+fn _lp_floor_of(d, n, f, lo, hi) {
+    var mx = f64_from(0);
+    for (var i = 0; i < n; i = i + 1) {
+        var a = f64_abs(load64(d + i * 8));
+        if (f64_gt(a, mx) == 1) { mx = a; }
+    }
+    for (var k = lo; k < hi; k = k + 1) {
+        var b = f64_abs(load64(f + k * 8));
+        if (f64_gt(b, mx) == 1) { mx = b; }
+    }
+    return f64_mul(F64_TINY, mx);
+}
+
+# Zero every |arr[k]| below fl, k in [lo, hi): the last attempt's deflation. A NaN entry
+# fails `<` and stays, as in `_lp_negligible_rel`.
+fn _lp_floor_zero(arr, lo, hi, fl) {
+    var k = lo;
+    while (k < hi) {
+        if (f64_lt(f64_abs(load64(arr + k * 8)), fl) == 1) { store64(arr + k * 8, f64_from(0)); }
+        k = k + 1;
+    }
+    return 0;
+}
+
 # Fresh copy of A with every entry divided by s (s > 0). Divide, never multiply
 # by 1/s: a subnormal s makes 1/s overflow to +Inf.
 fn _lp_mat_div_scalar(A, s) {
@@ -374,10 +426,11 @@ fn _lp_balance_scale(A, rows, cols) {
 # keeps its bits (the headroom balance withdrawn in 3.3.3 cost every wide-span matrix
 # bits on its small entries, answered or not). When an attempt fails, this gives the
 # next scale: twice the last, one binade more headroom, while the balanced largest
-# entry hi / sc times `growth` still overflows. Once it fits, this returns 0 and the
-# caller returns the Err: the routine's own failure, not an overflow. Each retry halves
-# hi / sc, so a call makes at most about log2(growth) + 2 attempts, and only when it
-# was going to fail without them. A NaN cannot reach this: both callers refuse a
+# entry hi / sc times `growth` still overflows. Once it fits, this returns 0: the
+# routine's own failure, not an overflow, and (since 3.3.5) the caller makes one last
+# attempt at that scale with the floor of `_lp_floor_of`. Each retry halves hi / sc, so
+# a call makes at most about log2(growth) + 3 attempts, and only when it was going to
+# fail without them. A NaN cannot reach this: both callers refuse a
 # non-finite entry first.
 # `growth` bounds the routine's largest intermediate over the balanced max|A|. svd: 4m,
 # for 2 ||A||_2 <= 2 sqrt(mn) max|A| (the reflector's v0 + ||x||, and 2 (v . w) in its
@@ -510,7 +563,10 @@ fn _lp_vec_copy(dst, src, n) {
 # Err(HSB_ERR_NO_CONVERGENCE) in 3.3.3 (through 3.3.2 it could return rc = OK with
 # NaN or invented values). Since 3.3.4 it retries with one binade more headroom at a
 # time, which takes those binades' bits off the subnormal entries of only the inputs
-# that needed it, and returns that Err once no headroom is left to add.
+# that needed it, and returns that Err once no headroom is left to add. Since 3.3.5 a
+# failure no headroom helps gets one last attempt that also zeroes couplings below
+# DBL_MIN times the largest bidiagonal entry (see `_lp_floor_of`), and the Err is that
+# attempt's. An answer from it is accurate only normwise (see the note at the retry loop).
 #
 # Algorithm:
 #   Step 1: Householder bidiagonalization  A = U1 * B * V1^T
@@ -1110,11 +1166,18 @@ fn _lp_split_zero_diag(diag, superdiag, n, m, U_acc, Vt_acc, p_lo, p_hi, lift) {
 # Operates on diag[0..n) and superdiag[0..n-1) in place.
 # Accumulates Givens rotations into U_acc (m x n) and Vt_acc (n x n).
 # max_iter: maximum total QR sweeps.
-# lift: 1 on a retry (see `_lp_split_zero_diag`), 0 on a first attempt.
+# lift: 1 on a retry (see `_lp_split_zero_diag`), 0 on a first attempt; 2 (since 3.3.5)
+# on the last attempt, which also zeroes every superdiagonal entry below `_lp_floor_of`
+# at the top of each sweep (see that helper). B's rotations are not lifted there: lifting
+# them too moved no probe row, because no last attempt on the probes met a non-zero
+# radius below DBL_MIN (instrumented over all of them: 0).
+# [measured: lift-2-with-B-lift build + counting probe, regenerated probes, 2026-10-11; cycc 6.6.14]
 #must_use
 fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter, lift) {
     var iter = 0;
     var p_hi = n - 1;  # active submatrix upper bound
+    var fl = f64_from(0);
+    if (lift == 2) { fl = _lp_floor_of(diag, n, superdiag, 0, n - 1); }
 
     while (p_hi > 0 && iter < max_iter) {
         # Check for negligible superdiagonal entries -- deflation
@@ -1126,6 +1189,7 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter, lift) {
             }
             i = i + 1;
         }
+        if (lift == 2) { _lp_floor_zero(superdiag, 0, p_hi, fl); }
 
         # ⛔ 2.22.0 — A DEAD 20-LINE BLOCK COMPUTING `q` STOOD HERE, AND IT WAS
         # DEAD IN A WAY THAT HID A DEFECT. It scanned the superdiagonal with a
@@ -1324,6 +1388,11 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter, lift) {
                 # zero-diagonal snap (`_lp_negligible_rel`, `_lp_split_zero_diag`),
                 # and the lack of dqds / zero-shift QR.
                 # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
+                # ⚠ 3.3.5 — the `< F64_TINY` trigger, not `== 0`, matters from the second
+                # rotation of a 3x3-or-larger block on: a block at ratio ~2^-536 puts this sum
+                # on the subnormal grid (tests/hisab.tcyr pins a 6x6 that comes back up to 43%
+                # wrong with `== 0`; audit D007), and each `+Inf` arm here and below is pinned by
+                # its blockdiag(2^480 M, 5u) (audit D004).
                 var r_ss = f64_add(f64_mul(y, y), f64_mul(z, z));
                 var r = f64_sqrt(r_ss);
                 if (f64_lt(r_ss, F64_TINY) == 1) { r = ganita_f64_hypot(y, z); }
@@ -1508,7 +1577,7 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter, lift) {
 # 3.3.3, moved here so a failed attempt can be retried with more headroom). Leaves the
 # balanced singular values, made non-negative and sorted, in diag; U and Vt are
 # rewritten from the identity on every attempt. `lift` is 0 on the first attempt and 1
-# on each retry (see `_lp_split_zero_diag`).
+# on each retry (see `_lp_split_zero_diag`), 2 on the last (see `_lp_bidiag_qr`).
 #must_use
 fn _lp_svd_attempt(A, m, n, sc, diag, superdiag, out_U, out_Vt, max_iter, lift) {
     var As = _lp_mat_div_scalar(A, sc);
@@ -1674,15 +1743,41 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     # binades that do not converge in 30 n^2 sweeps on 3.3.4 either (and 14 with an
     # infinite entry, INVALID_INPUT as before).
     # [measured: probe sets above, base vs this tree + 1400-digit oracle, 2026-10-03; cycc 6.6.14 and 6.6.3]
+    # ⭐ 3.3.5 — AND A FAILURE NO HEADROOM CAN HELP GETS ONE LAST ATTEMPT, at the last
+    # scale tried, with the normwise floor (`lift` 2; see `_lp_floor_of`). Through 3.3.4
+    # the rank-1 rows above stalled on a block of the 2^-1074 grid and were refused. On
+    # the shape of those probes regenerated (43,000 rows) and 22,000 sparse tridiagonals,
+    # every row 3.3.4 answers is byte-identical in S, rc, U and Vt; 2 svd rows it refused
+    # answer, and 98 more of 40,000 further svd rows (20,000 rank-1, 20,000 sparse with
+    # entries near DBL_MAX beside small multiples of 2^-1074), the worst 2.05 eps
+    # sigma_max from a 1400-digit Decimal Jacobi oracle. The 67 still refused have a
+    # largest singular value past DBL_MAX.
+    # [measured: regenerated probes (43,000 + 22,000 + 40,000 rows), 3.3.4 vs this tree + oracle, 2026-10-11]
+    # ⚠ AN ANSWER FROM THE LAST ATTEMPT IS ACCURATE ONLY NORMWISE. Every singular value
+    # below about DBL_MIN times the largest may carry no relative accuracy at all, and not
+    # only values on the subnormal grid: a decoupled block of normal values that far down
+    # loses it too. tests/abuse.tcyr's B2, a 2x2 grid block beside H = 7.256e305, has
+    # sigma_2 and sigma_3 of 71.26u and 23.46u and comes back 42u and 40u. Normwise that is
+    # 1e-628 of sigma_1, inside the eps sigma_max contract; 3.3.4 refused these inputs.
+    # [measured: B2 fixture + block families from the lane-L review, Decimal oracle, 2026-10-11; cycc 6.6.14]
+    # ⚠ For the svd the floor's relative factor moved no row: DBL_MIN alone answers the
+    # same rows bit for bit, because `_lp_split_zero_diag`'s snap, relative to the block,
+    # catches the underflowing-rotation shape first. It is kept so both routines floor
+    # alike. [measured: floor-variant builds over the same probes, 2026-10-11; cycc 6.6.14]
     var sc = _lp_balance_scale(A, m, n);
     var lift = 0;
     while (1 == 1) {
         var at, av = _lp_svd_attempt(A, m, n, sc, diag, superdiag, out_U, out_Vt, max_iter, lift);
         if (is_ok(at) == 1) { break; }
         if (av != HSB_ERR_NO_CONVERGENCE) { return Err(av); }
-        sc = _lp_headroom_next(A, sc, f64_from(4 * m));
-        if (f64_eq(sc, 0) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
-        lift = 1;
+        if (lift == 2) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        var nsc = _lp_headroom_next(A, sc, f64_from(4 * m));
+        if (f64_eq(nsc, 0) == 1) {
+            lift = 2;
+        } else {
+            sc = nsc;
+            lift = 1;
+        }
     }
 
     # Undo the balancing: sv(c*A) = c*sv(A), U and Vt are invariant.
@@ -1723,8 +1818,9 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
 #           columns, permuted alongside out_vals).
 # Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if the last attempt exceeds
 #           max_iter (since 3.3.4 max_iter bounds EACH attempt, and a failed attempt is
-#           retried while max|A| / sc times 8n overflows, so a call can run about
-#           (log2(8n) + 2) * max_iter sweeps) or (since 3.3.3) an eigenvalue exceeds
+#           retried while max|A| / sc times 8n overflows, then (since 3.3.5) once more
+#           with the floor of `_lp_floor_of`, so a call can run about
+#           (log2(8n) + 3) * max_iter sweeps) or (since 3.3.3) an eigenvalue exceeds
 #           DBL_MAX in magnitude or a norm or radius on the way to one is not finite
 #           (since 3.3.4, once added headroom can no longer prevent it; see
 #           svd_golub_kahan's section header);
@@ -1952,13 +2048,18 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
 # offdiag[0..n): sub/superdiagonal (offdiag[i] = T[i,i-1], offdiag[0] = 0).
 # Q: n x n matrix (accumulates Givens rotations).
 # max_iter: maximum iterations.
-# lift: 1 on a retry (see `_lp_split_zero_diag`), 0 on a first attempt.
+# lift: 1 on a retry (see `_lp_split_zero_diag`), 0 on a first attempt; 2 (since 3.3.5)
+# on the last attempt, which zeroes every off-diagonal entry below `_lp_floor_of` at the
+# top of each sweep and, as in `_lp_bidiag_qr`, leaves T's rotations unlifted.
 #must_use
 fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
     var iter = 0;
     var p_hi = n - 1;
+    var fl = f64_from(0);
+    if (lift == 2) { fl = _lp_floor_of(diag, n, offdiag, 1, n); }
 
     while (p_hi > 0 && iter < max_iter) {
+        if (lift == 2) { _lp_floor_zero(offdiag, 1, p_hi + 1, fl); }
         # Deflation: check if offdiag[p_hi] is negligible
         if (_lp_negligible(load64(offdiag + p_hi * 8),
             load64(diag + p_hi * 8), load64(diag + (p_hi - 1) * 8)) == 1) {
@@ -2172,7 +2273,7 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
 
 # One attempt at the eigendecomposition of A / sc (3.3.4; see `_lp_svd_attempt`).
 # Leaves the balanced eigenvalues in diag; out_vecs is rewritten from the identity on
-# every attempt. `lift` is 0 on the first attempt and 1 on each retry.
+# every attempt. `lift` is 0 on the first attempt and 1 on each retry, 2 on the last.
 #must_use
 fn _lp_eig_attempt(A, n, sc, diag, offdiag, out_vecs, max_iter, lift) {
     var As = _lp_mat_div_scalar(A, sc);
@@ -2291,15 +2392,36 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # refused there, as on 3.3.3: 1,364 rows whose largest eigenvalue rounds past
     # DBL_MAX, and 1,807 whose eigenvalues fit and which no attempt converges on.
     # [measured: S5/S6 sparse-tridiagonal probes, base vs this tree + 800-digit oracle, 2026-10-03; cycc 6.6.14]
+    # ⭐ 3.3.5 — THOSE NON-CONVERGING ROWS GET ONE LAST ATTEMPT with the normwise floor,
+    # as in svd_golub_kahan (`lift` 2; see `_lp_floor_of` for the two kinds of stall). On
+    # the regenerated probes every row 3.3.4 answers is byte-identical in the eigenvalues,
+    # rc and V; of the rows it refused, 55 of 43,000 and 2,393 of 22,000 tridiagonals now
+    # answer, the worst 5.2 and 8.0 eps |lambda|_max from an 800-digit Decimal Jacobi
+    # oracle. Still refused: 11 and 1,231 whose largest eigenvalue is past DBL_MAX, and 22
+    # tridiagonals whose eigenvalues fit, where an attempt "converges" with an overflowed
+    # diagonal and the rescale below refuses it without a retry (not a stall).
+    # [measured: regenerated 43,000 + 22,000-row probes, 3.3.4 vs this tree + Decimal oracle, 2026-10-11]
+    # ⚠ AS THERE, AN ANSWER FROM THE LAST ATTEMPT IS ACCURATE ONLY NORMWISE: every eigenvalue
+    # below about DBL_MIN times the largest may carry no relative accuracy, its sign
+    # included. The 5x5 blockdiag([[0, a, 0], [a, b, H], [0, H, 0]], B), H = 5.7e296 and B a
+    # 2x2 of normal values near 1e-100 (eigenvalues 1.1729e-100 and -2.8306e-101), comes
+    # back with B's diagonal, 6.180e-101 and 2.718e-101 (3.3.4: NO_CONVERGENCE). Normwise
+    # that is 2e-397 of |lambda|_max, inside the eps |lambda|_max contract.
+    # [measured: review repro (max_iter 750), 3.3.4 vs this tree + 800-digit oracle, 2026-10-11; cycc 6.6.14]
     var sc = _lp_balance_scale(A, n, n);
     var lift = 0;
     while (1 == 1) {
         var at, av = _lp_eig_attempt(A, n, sc, diag, offdiag, out_vecs, max_iter, lift);
         if (is_ok(at) == 1) { break; }
         if (av != HSB_ERR_NO_CONVERGENCE) { return Err(av); }
-        sc = _lp_headroom_next(A, sc, f64_from(8 * n));
-        if (f64_eq(sc, 0) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
-        lift = 1;
+        if (lift == 2) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        var nsc = _lp_headroom_next(A, sc, f64_from(8 * n));
+        if (f64_eq(nsc, 0) == 1) {
+            lift = 2;
+        } else {
+            sc = nsc;
+            lift = 1;
+        }
     }
 
     # Undo the balancing: eig(c*A) = c*eig(A), eigenvectors invariant.

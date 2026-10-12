@@ -156,6 +156,25 @@ public fn m4_mul_vec4(m, v) {
     return r;
 }
 
+# p * 2^s for `m4_transform_point`'s finite non-zero w whose 1/w is not normal. From below
+# (|w| <= 2^-1024, 1/w overflows) the copy is p * 2^1022: w lands in [2^-52, 2^-2], scaling up
+# is exact, and an x that overflows in the copy has |x / w| past 2^1026 as well. (A copy with
+# w in [1, 2) overflowed x for quotients just under DBL_MAX: 67 sweep components came back
+# +-Inf for a finite quotient.) From above (|w| > 2^1022, 1/w subnormal) the copy is halved or
+# quartered, just enough for 1/w to be normal: x / 2 and x / 4 round only for a subnormal x,
+# whose |x / w| < 2^-2042 rounds to zero whatever they are, so every component that can reach
+# the answer is exact. A [1, 2) copy rounds every |x| < 2, and left 521 sweep components 1 ulp
+# off where this leaves 470.
+# [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+fn _m4_w_scaled(p) {
+    var e = f64_abs(HVec4_w(p)) >> 52;
+    var s = (1023 + 1022) << 52;                                          # 2^1022
+    if (e != 0) { s = (3067 - e) << 52; }                                 # 1/2, 1/4
+    var r = alloc(sizeof(HVec4));
+    f64v_scale(r, p, s, 4);
+    return r;
+}
+
 # Mat4 * Vec3 as point (w=1, perspective divide)
 #must_use
 public fn m4_transform_point(m, v) {
@@ -167,9 +186,31 @@ public fn m4_transform_point(m, v) {
     # coordinates as though they were the projected point, with no rc to say so.
     # ⭐ The divide fails exactly when its reciprocal is not finite, which is the
     # genuine w = 0 point-at-infinity case the fallback is for.
+    # ⛔ 3.3.5 — EXCEPT THAT 1/w ALSO OVERFLOWS FOR EVERY SUBNORMAL |w| <= 2^-1024, so those
+    # took the fallback too: m4_transform_point(2^-1074 I, (3, 5, 7)) returned the undivided
+    # (3, 5, 7) * 2^-1074. And above 2^1022 1/w is subnormal, so x * (1/w) carried its
+    # rounding. On a sweep of clip vectors with w at every binade, 7,292 of 7,411 answers below
+    # 2^-1024 were wrong, and 34 of 2,367 above 2^1022 were 3 or 4 ulp off the exact quotient.
+    # ⭐ Both bands now multiply a power-of-two copy by its normal 1/w (`_m4_w_scaled`), which is
+    # x * RN(1/w) as an unbounded exponent range would give it: all 7,068 finite answers of the
+    # sweep in those bands. Two roundings, so within 1.5 ulp of the exact quotient, as in the
+    # normal band: over 40,295 components of a broader family (two seeds) in these bands the
+    # largest error is 1.38 ulp (621 past 1 ulp), and 1.48 over 196,198 where 1/w is normal.
+    # Where 1/w is normal nothing changed (58,567 of 58,567 sweep answers keep their bits);
+    # w = +-0 and NaN still return the undivided coordinates (D088), and w = +-Inf still
+    # multiplies by 1/w = +-0.
+    # [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+    # [measured: C336 m4 band sweep (C2's rotm4 family, seeds 301 and 302), this tree, 2026-10-11; cycc 6.6.14]
     var inv_w = f64_div(F64_ONE, pw);
-    if (f64_lt(f64_abs(inv_w), F64_POS_INF) == 0) {
-        return hvec3_new(HVec4_x(p), HVec4_y(p), HVec4_z(p));
+    var ai = f64_abs(inv_w);
+    if (f64_lt(ai, F64_TINY) == 1 || f64_lt(ai, F64_POS_INF) == 0) {
+        if (f64_eq(pw, 0) == 0 && f64_lt(f64_abs(pw), F64_POS_INF) == 1) {
+            p = _m4_w_scaled(p);
+            inv_w = f64_div(F64_ONE, HVec4_w(p));
+        }
+        if (f64_lt(f64_abs(inv_w), F64_POS_INF) == 0) {
+            return hvec3_new(HVec4_x(p), HVec4_y(p), HVec4_z(p));
+        }
     }
     return hvec3_new(f64_mul(HVec4_x(p), inv_w),
       f64_mul(HVec4_y(p), inv_w),

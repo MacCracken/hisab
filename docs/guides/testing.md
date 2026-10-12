@@ -4,14 +4,14 @@
 
 ```bash
 # All test suites
-cyrius test tests/hisab.tcyr        # 776 smoke/integration tests
-cyrius test tests/foundation.tcyr   # 620 exhaustive foundation type tests
-cyrius test tests/modules.tcyr      # 2092 per-module tests (first half)
-cyrius test tests/modules_b.tcyr    # 2014 per-module tests (second half, split in 3.3.4)
-cyrius test tests/edge_cases.tcyr   # 656 edge case + boundary tests
-cyrius test tests/abuse.tcyr        # 1820 hostile-input tests
+cyrius test tests/hisab.tcyr        # 791 smoke/integration tests
+cyrius test tests/foundation.tcyr   # 686 exhaustive foundation type tests
+cyrius test tests/modules.tcyr      # 2197 per-module tests (first half)
+cyrius test tests/modules_b.tcyr    # 2293 per-module tests (second half, split in 3.3.4)
+cyrius test tests/edge_cases.tcyr   # 695 edge case + boundary tests
+cyrius test tests/abuse.tcyr        # 1899 hostile-input tests
 
-# Benchmarks (80 operations)
+# Benchmarks (145 operations)
 cyrius bench tests/hisab.bcyr
 
 # Fuzz self-test — `cyrius fuzz` walks tests/ as of cyrius 6.5.6; before that it
@@ -26,13 +26,13 @@ cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 
 | Suite | Assertions | Covers |
 |-------|-----------|--------|
-| `foundation.tcyr` | 620 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
-| `modules.tcyr` | 2092 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff (forward-mode duals AND the 2.11.0 reverse-mode tape), interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1, the OBB rotation partial in 2.10.2) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse); since 3.3.0, number theory above 2^62 (the three `mulmod` tiers and their boundaries) and the helpers 3.3.0 made public, called as API |
-| `modules_b.tcyr` | 2014 | The second half of the per-module suite, split from `modules.tcyr` in 3.3.4 because the single file (1.15 MB) passed `cyrius lint` / `cyrius fmt`'s 1028 KB input cap, so CI could not lint or format-check it. Same includes, tolerances and helpers; it runs every group from "2.7.3 coverage" on — Delaunay, GJK/EPA/MPR, time-of-impact, spatial hash and BVH arenas among them |
-| `hisab.tcyr` | 776 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms), decomposition (SVD, QR, eigen), Krylov (GMRES) |
-| `edge_cases.tcyr` | 656 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11), and `noise_perm` building its table on first use — this is the one suite with no other noise call |
-| `abuse.tcyr` | 1820 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Its known-defect register holds 11 entries: 10 crash-class defects in ten public functions, all repaired in 2.9.0 and asserted in the file, and `cmat_get` / `cmat_set`, a raw-accessor precondition kept unguarded by design. They are recorded rather than deleted |
-| **Total** | **7978** | |
+| `foundation.tcyr` | 686 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
+| `modules.tcyr` | 2197 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff (forward-mode duals AND the 2.11.0 reverse-mode tape), interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1, the OBB rotation partial in 2.10.2) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse); since 3.3.0, number theory above 2^62 (the three `mulmod` tiers and their boundaries) and the helpers 3.3.0 made public, called as API |
+| `modules_b.tcyr` | 2293 | The second half of the per-module suite, split from `modules.tcyr` in 3.3.4 because the single file (1.15 MB) passed `cyrius lint` / `cyrius fmt`'s 1028 KB input cap, so CI could not lint or format-check it. Same includes, tolerances and helpers; it runs every group from "2.7.3 coverage" on — Delaunay, GJK/EPA/MPR, time-of-impact, spatial hash and BVH arenas among them |
+| `hisab.tcyr` | 791 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms), decomposition (SVD, QR, eigen), Krylov (GMRES) |
+| `edge_cases.tcyr` | 695 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11), and `noise_perm` building its table on first use — this is the one suite with no other noise call |
+| `abuse.tcyr` | 1899 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Its known-defect register holds 11 entries: 10 crash-class defects in ten public functions, all repaired in 2.9.0 and asserted in the file, and `cmat_get` / `cmat_set`, a raw-accessor precondition kept unguarded by design. They are recorded rather than deleted |
+| **Total** | **8561** | |
 
 ⛔ **2.21.0 — THREE OF THOSE FIVE ROWS HAD BEEN STALE FOR RELEASES AND THE TABLE
 COULD NOT ANNOUNCE IT.** They summed to **3574** against a published total of
@@ -43,7 +43,7 @@ document was internally inconsistent and externally wrong at the same time.
 total**, so neither half can drift alone; verified fail-closed against a stale
 row, a total that does not sum, and a deleted row.
 
-## Benchmarks (80 operations)
+## Benchmarks (145 operations)
 
 | Category | Benchmarks |
 |----------|-----------|
@@ -64,6 +64,7 @@ row, a total that does not sum, and a deleted row.
 | Conformal GA (2.24.0) | cga_point_product, cga_norm_sq_k5, cga_norm_sq_k32, cga_first_product_cold — the last runs at n = 1 because a row that warms up cannot see the lazy table build, and its cold-entry guard exits 1 if the table is already built |
 | Transforms | num_dct_1024, num_dst_1024, num_dct_1023, num_dst_1023 |
 | Other | ease_in_out, perlin_2d |
+| 3.3.6 additions (65, registered last; each checks its path once before timing and exits 1 on a wrong one) | **Modules that had no row**: calc_adaptive_simpson, calc_bspline_cubic_8, calc_nurbs_cubic_8, calc_hessian_4, christoffel_symbols_4d, riemann_tensor_4d, geodesic_rk4_4d_100, ivl_mul, ivl_sin, ivl_width, su2_exp, su2_log, so3_exp, so3_log, se3_exp, se3_log, lorentz_boost, m3_mul, m3_inverse, m3_mul_vec3, simplex_2d, simplex_3d, ode_dopri45_step, ode_dopri45_trajectory, ode_bdf2_step, ode_yoshida4_step, opt_bfgs_rosenbrock, opt_lbfgs_rosenbrock, opt_lm_expfit_32, expr_eval, expr_diff_simplify, sym_integrate, sym_rewrite_default. **linalg_ext / f64_util**: solve_gmres_64, solve_bicgstab_64, csr_spmv_256, eigen_symmetric_12, eigen_power_3x3, eigen_power_12x12, eigen_power_2x2_wide, f64_fmod, f64_fmod_gap2097. **Number theory above 2^62**: num_is_prime_2e63, num_pollard_rho_2e63, num_crt_2e63, num_modinv_2e63, num_divisor_sigma0_2e63, num_divisor_sigma_720720, dual_pow_x3. **3.3.5's scratch-only costs**: hvec3_angle, perlin_2d_2e63, perlin_3d, delaunay_2d_mixed_100, bvh_query_ray_oblique_200x4k, cga_blade_inverse_sphere, cga_blade_inverse_tiny, gjk_intersect_near_tangent, mpr_intersect_near_tangent, gjk_intersect_box_hit_2e600, gjk_intersect_box_miss_2e600. **Separated pairs and time of impact**: gjk_epa_boxes_separated, gjk_epa_spheres_separated, mpr_penetration_boxes_separated, time_of_impact_box_miss, time_of_impact_sph_hit |
 
 `./scripts/bench-history.sh` appends one CSV row per benchmark to `./bench-history.csv`
 and `./benchmarks.md` renders the trend. Each harness line reads

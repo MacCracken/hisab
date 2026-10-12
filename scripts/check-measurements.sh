@@ -822,7 +822,9 @@ def check_marker(src):
     """Return (ok, note). ok=False means the marker names something absent."""
     if NOT_REPRO.search(src):
         return True, 'declared non-reproducible'
-    m = re.match(r'^([\w./-]+?\.\w+)(?::(\d+))?', src)
+    # The whole leading path, up to a delimiter: a lazy match stopped at the first dot, so
+    # docs/audit/2026-08-04-v2.8.0-full.md read as docs/audit/2026-08-04-v2.8 (3.3.6).
+    m = re.match(r'^([\w./-]*\.\w+)(?::(\d+))?(?=[\s,;:)]|$)', src)
     if m:
         path, ln = m.group(1), m.group(2)
         if not os.path.exists(path):

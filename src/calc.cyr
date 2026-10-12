@@ -15,6 +15,10 @@ var _CALC_F64_FIFTEEN = 0x402E_0000_0000_0000; # 15.0
 var _CALC_F64_SPLIT = 0x41A0_0000_0200_0000;   # 134217729.0 (2^27 + 1, Dekker's split)
 # The first magnitude f64_to cannot convert: |c| < 2^63 fits in i64 (_calc_perlin_cell).
 var _CALC_F64_2_POW_63 = 0x43E0_0000_0000_0000; # 2^63
+# The quadrature frames (_calc_frame): coordinates multiplied by 2^600 when a step
+# underflows, and the result by 2^-600 on the way back.
+var _CALC_F64_2_POW_600 = 0x6570_0000_0000_0000; # 2^600
+var _CALC_F64_2_POW_M600 = 0x1A70_0000_0000_0000; # 2^-600
 
 # ================================================================
 # 1. BASIC CALCULUS
@@ -49,10 +53,11 @@ public fn calc_derivative(f, x, h) {
 # test is the width, b - a == 0, which is a == b for finite endpoints; equal
 # infinite endpoints have a NaN width and are left to the arithmetic.
 # [measured: steps and zero-width probe on the 3.3.2 bundle, 2026-10-01]
-# ⚠ ONLY AN EXACT ZERO WIDTH IS HANDLED. h is also 0 when (b - a) / steps
-# underflows at a non-zero width, and that 0 * Inf is not repaired: f = +Inf over
-# [0, 2^-1074] with 4 steps stores NaN as Ok, here and on 3.3.2.
-# [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
+# Through 3.3.5 only that exact zero width was handled: an h that underflowed at a
+# non-zero width formed the same 0 * Inf (f = +Inf over [0, 2^-1074] with 4 steps stored
+# NaN as Ok), and its finite answers were wrong too; 3.3.6's frame (_calc_frame) repairs
+# both, and a width b - a that overflows.
+# [measured: scratch quadrature probe (p/pquad.cyr), 3.3.5 tree and this tree, 2026-10-11]
 # ⭐ 3.0.0 — THE ERROR CHANNEL IS NOW `Result<T, E>`, AND THE OUT-PARAMETERS STAY.
 # `Ok(0)` rather than `Ok(value)` is deliberate and mechanical: these functions
 # already deliver their result through an out-pointer, and moving it into the Ok
@@ -78,6 +83,15 @@ public fn calc_integral_trapez(f, a, b, steps, out) {
     var h = f64_div(f64_sub(b, a), f64_from(steps));
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
+    # The grid a + i h is laid in the frame _calc_frame picks: p = 0 is the plain
+    # arithmetic, bit for bit; otherwise origin and step are those of a * 2^p and
+    # b * 2^p, each node is mapped back by 2^-p, and so is the result (_calc_mul_scaled).
+    var p = _calc_frame(a, b, h, 0);
+    var x0 = a;
+    if (p != 0) {
+        x0 = _calc_to_frame(a, p);
+        h = f64_div(f64_sub(_calc_to_frame(b, p), x0), f64_from(steps));
+    }
     var sum = f64_mul(F64_HALF, f64_add(fa, fb));
     # ⛔ 3.3.4 — THE SUM OVERFLOWED BEFORE h SCALED IT. The weighted sum of finite
     # samples can pass DBL_MAX where sum * h does not: f(1/4) = f(1/2) = 1.5 * 2^1023,
@@ -104,7 +118,8 @@ public fn calc_integral_trapez(f, a, b, steps, out) {
     var dn = F64_ONE;    # 2^-sc, the factor on each later sample
     var i = 1;
     while (i < steps) {
-        var xi = f64_add(a, f64_mul(f64_from(i), h));
+        var xi = f64_add(x0, f64_mul(f64_from(i), h));
+        if (p != 0) { xi = _calc_from_frame(xi, p); }
         var fxi = fncall1(f, xi);
         if (sc != 0) { fxi = f64_mul(fxi, dn); }
         var t = f64_add(sum, fxi);
@@ -119,9 +134,63 @@ public fn calc_integral_trapez(f, a, b, steps, out) {
         i = i + 1;
     }
     var r = f64_mul(sum, h);
-    if (sc != 0) { r = f64_mul(r, (1023 + sc) << 52); }
+    if (p != 0) {
+        r = _calc_mul_scaled(sum, h, sc - p);       # sum * 2^sc * h * 2^-p, rounded once
+    } else {
+        if (sc != 0) { r = f64_mul(r, (1023 + sc) << 52); }
+    }
     store64(out, r);
     return Ok(0);
+}
+
+# Internal: the coordinate frame calc_integral_trapez, _simpson and _gauss5 lay their
+# nodes in, as an exponent p: the nodes are computed for [a * 2^p, b * 2^p] and mapped
+# back by 2^-p, and the result is multiplied by 2^-p. `h` is the plain step (or
+# half-width) and `mid` is 1 when the rule also forms (a + b) / 2.
+#   0    the plain arithmetic: an infinite or NaN endpoint, or a normal step.
+#   -1   finite endpoints whose width b - a (or sum a + b, with mid) overflows: the
+#        halved coordinates cannot, and doubling a node back is exact.
+#   600  a step below DBL_MIN at a non-zero width: such a width is under 2^-959 even with
+#        2^63 steps, and its endpoints under 2^-906, so in the frame the step is normal
+#        (2^600 / 2^63 times the smallest width is 2^-537) and nothing overflows; a node
+#        rounds once, onto the subnormal grid, on the way back.
+#
+# ⛔ 3.3.6 — A WIDTH THAT UNDERFLOWS OR OVERFLOWS GAVE WRONG ANSWERS, NOT JUST NaN. With
+# f = 2^52 on [0, 2^-1074] (integral DBL_MIN) trapez and simpson with 4 steps and gauss5
+# returned 0: h = 2^-1076 and the half-width 2^-1075 underflow to 0, so every node was
+# a and the product was 0. On [0, 3 * 2^-1074] they were 33% high (4 * 2^-1022 for
+# 3 * 2^-1022), the step rounding up to the next subnormal, and simpson and trapez on
+# [0, 6 * 2^-1074] the same. f = 0 on [-DBL_MAX, DBL_MAX] gave NaN from all three
+# (h infinite, 0 * Inf), and gauss5's midpoint (a + b) / 2 overflowed for same-sign
+# endpoints: f = x / DBL_MAX on [2^1023, DBL_MAX] returned +Inf, where the rule gives
+# 0x7FD7FFFFFFFFFFFF. In the 600 frame the step, the nodes and the product are formed
+# normal; in the -1 frame nothing overflows. A frame of 0 runs the 3.3.5 operations.
+# Over 109,854 trapez, simpson and gauss5 calls (subnormal and overflowing widths,
+# ordinary controls; constant and linear integrands), against the rule's exact value,
+# 9,582 went from wrong to right and none from right to wrong; every call that takes
+# the plain arithmetic (62,802) kept its bits.
+# [measured: scratch quadrature probe and sweep, 3.3.5 tree and this tree, python3 Fraction oracle, 2026-10-11]
+fn _calc_frame(a, b, h, mid) {
+    if (f64_lt(f64_abs(a), F64_POS_INF) == 0 || f64_lt(f64_abs(b), F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(f64_abs(f64_sub(b, a)), F64_POS_INF) == 0) { return 0 - 1; }
+    if (mid == 1 && f64_lt(f64_abs(f64_add(a, b)), F64_POS_INF) == 0) { return 0 - 1; }
+    if (f64_lt(f64_abs(h), F64_TINY) == 1) { return 600; }
+    return 0;
+}
+
+# Internal: x * 2^p into the frame. Exact: p = 600 meets only endpoints under 2^-906,
+# and p = -1 only endpoints of at least 2^970 in magnitude (a sum or difference of two
+# finite doubles passes DBL_MAX only when both are that large).
+fn _calc_to_frame(x, p) {
+    if (p == 600) { return f64_mul(x, _CALC_F64_2_POW_600); }
+    return f64_mul(x, F64_HALF);
+}
+
+# Internal: X * 2^-p, back out of the frame: one rounding onto the subnormal grid for
+# p = 600, exact for p = -1 (doubling a node no larger than an endpoint).
+fn _calc_from_frame(x, p) {
+    if (p == 600) { return f64_mul(x, _CALC_F64_2_POW_M600); }
+    return f64_mul(x, F64_TWO);
 }
 
 # Internal: 1 when both a and b are finite (not +-Inf, not NaN), else 0.
@@ -158,10 +227,8 @@ fn _calc_nonfinite_class(v) {
 # into range, while 2^63 - 1 rounds up to -2^63 and stored -3.6e-20 as Ok.
 # The zero-width repair is trapez's too: b == a with f(a) = +Inf stored NaN.
 # [measured: steps and zero-width probe on the 3.3.2 bundle, 2026-10-01]
-# So is its limit: only an EXACT zero width is handled, and an h that underflows at
-# a non-zero width still forms 0 * Inf — f = +Inf over [0, 2^-1074] with 4 steps
-# stores NaN as Ok, here and on 3.3.2.
-# [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
+# So was its limit through 3.3.5, an h that underflowed at a non-zero width, and so is
+# 3.3.6's frame (_calc_frame) that repairs it.
 # An infinite or NaN sample stores the class of the true sum (see the end of the body):
 # ±Inf for infinite samples of one sign, NaN for both signs or a NaN sample. Finite
 # samples whose weighted sum overflows store the rule's value (3.3.4; through 3.3.3,
@@ -179,6 +246,13 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
     var h = f64_div(f64_sub(b, a), f64_from(steps));
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
+    # The grid in calc_integral_trapez's frame (_calc_frame); 0 is the plain arithmetic.
+    var p = _calc_frame(a, b, h, 0);
+    var x0 = a;
+    if (p != 0) {
+        x0 = _calc_to_frame(a, p);
+        h = f64_div(f64_sub(_calc_to_frame(b, p), x0), f64_from(steps));
+    }
     var sum = f64_add(fa, fb);
     var comp = 0;  # Neumaier compensation (stored as f64 bits)
     var spec = 0;  # classes of the non-finite samples (see the end of the body)
@@ -211,7 +285,8 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
 
     var i = 1;
     while (i < steps) {
-        var xi = f64_add(a, f64_mul(f64_from(i), h));
+        var xi = f64_add(x0, f64_mul(f64_from(i), h));
+        if (p != 0) { xi = _calc_from_frame(xi, p); }
         var fxi = fncall1(f, xi);
 
         # Odd indices get coefficient 4, even indices get 2
@@ -285,9 +360,11 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
     if (spec == 1) { total = F64_POS_INF; }
     if (spec == 2) { total = 0xFFF0000000000000; }    # -Infinity
     if (spec == 0) {
-        store64(out, _calc_simpson_close(sum, comp, h, sc));
+        # The frame's 2^-p joins the halvings' 2^sc, and the close rounds once.
+        store64(out, _calc_simpson_close(sum, comp, h, sc - p));
         return Ok(0);
     }
+    # total is +-Inf or NaN here, which no finite power of two moves.
     store64(out, f64_div(f64_mul(total, h), _CALC_F64_THREE));
     return Ok(0);
 }
@@ -323,6 +400,31 @@ fn _calc_round_pair(x, xl, k) {
         }
     }
     return (x & 0x8000000000000000) | q;
+}
+
+# Internal: x * y * 2^k rounded once: the closing product of the
+# quadrature frames (_calc_frame). x and y are moved into [1, 2) (a subnormal into
+# [2^-52, 1)), where Dekker's split cannot overflow and their product is p + perr
+# exactly, and the pair is rounded at the final scale (_calc_round_pair): scaling the
+# rounded p alone would round a subnormal result twice. A zero or non-finite operand
+# gives x * y, whose class no finite power of two changes.
+fn _calc_mul_scaled(x, y, k) {
+    if (f64_eq(x, 0) == 1 || f64_eq(y, 0) == 1) { return f64_mul(x, y); }
+    if (f64_lt(f64_abs(x), F64_POS_INF) == 0 || f64_lt(f64_abs(y), F64_POS_INF) == 0) { return f64_mul(x, y); }
+    var e1 = ((x >> 52) & 0x7FF) - 1023;
+    var e2 = ((y >> 52) & 0x7FF) - 1023;
+    var xs = _calc_scale2(x, 0 - e1);
+    var ys = _calc_scale2(y, 0 - e2);
+    var p = f64_mul(xs, ys);
+    var c1 = f64_mul(xs, _CALC_F64_SPLIT);
+    var a1 = f64_sub(c1, f64_sub(c1, xs));
+    var a2 = f64_sub(xs, a1);
+    var c2 = f64_mul(ys, _CALC_F64_SPLIT);
+    var b1 = f64_sub(c2, f64_sub(c2, ys));
+    var b2 = f64_sub(ys, b1);
+    var perr = f64_add(f64_add(f64_add(f64_sub(f64_mul(a1, b1), p), f64_mul(a1, b2)), f64_mul(a2, b1)),
+      f64_mul(a2, b2));
+    return _calc_round_pair(p, perr, k + e1 + e2);
 }
 
 # Internal: calc_integral_simpson's closing step, (sum + comp) * 2^sc * h / 3, rounded
@@ -402,9 +504,10 @@ fn _calc_simpson_close(sum, comp, h, sc) {
 # b == a with f(a) = +Inf returned NaN, and a negative integrand -0. A zero-width
 # interval now returns exactly +0 without calling f.
 # [measured: zero-width probe on the 3.3.2 bundle, 2026-10-01]
-# ⚠ Only an EXACT zero width: the half-width (b - a) / 2 underflows to 0 at
-# b - a = 2^-1074, and f = +Inf over [0, 2^-1074] still returns NaN, as on 3.3.2.
-# [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
+# Through 3.3.5 only that exact zero width was handled: the half-width (b - a) / 2
+# underflowed to 0 at b - a = 2^-1074, and f = +Inf over [0, 2^-1074] returned NaN.
+# 3.3.6's frame (_calc_frame) repairs that, an overflowing width and an overflowing
+# midpoint (a + b) / 2.
 public fn calc_integral_gauss5(f, a, b) {
     if (f64_eq(f64_sub(b, a), 0) == 1) { return 0; }
     # Nodes on [-1, 1]
@@ -423,15 +526,36 @@ public fn calc_integral_gauss5(f, a, b) {
 
     var half = f64_mul(f64_sub(b, a), F64_HALF);
     var mid = f64_mul(f64_add(a, b), F64_HALF);
+    # Nodes and half-width in the frame _calc_frame picks; 0 is the plain arithmetic.
+    var p = _calc_frame(a, b, half, 1);
+    if (p != 0) {
+        var ta = _calc_to_frame(a, p);
+        var tb = _calc_to_frame(b, p);
+        half = f64_mul(f64_sub(tb, ta), F64_HALF);
+        mid = f64_mul(f64_add(ta, tb), F64_HALF);
+    }
 
-    var s0 = f64_mul(w0, fncall1(f, f64_add(mid, f64_mul(half, n0))));
-    var s1 = f64_mul(w1, fncall1(f, f64_add(mid, f64_mul(half, n1))));
-    var s2 = f64_mul(w2, fncall1(f, f64_add(mid, f64_mul(half, n2))));
-    var s3 = f64_mul(w3, fncall1(f, f64_add(mid, f64_mul(half, n3))));
-    var s4 = f64_mul(w4, fncall1(f, f64_add(mid, f64_mul(half, n4))));
+    var x0 = f64_add(mid, f64_mul(half, n0));
+    var x1 = f64_add(mid, f64_mul(half, n1));
+    var x2 = f64_add(mid, f64_mul(half, n2));
+    var x3 = f64_add(mid, f64_mul(half, n3));
+    var x4 = f64_add(mid, f64_mul(half, n4));
+    if (p != 0) {
+        x0 = _calc_from_frame(x0, p);
+        x1 = _calc_from_frame(x1, p);
+        x2 = _calc_from_frame(x2, p);
+        x3 = _calc_from_frame(x3, p);
+        x4 = _calc_from_frame(x4, p);
+    }
+    var s0 = f64_mul(w0, fncall1(f, x0));
+    var s1 = f64_mul(w1, fncall1(f, x1));
+    var s2 = f64_mul(w2, fncall1(f, x2));
+    var s3 = f64_mul(w3, fncall1(f, x3));
+    var s4 = f64_mul(w4, fncall1(f, x4));
 
     var sum = f64_add(f64_add(f64_add(f64_add(s0, s1), s2), s3), s4);
-    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0) { return _calc_gauss5_wide(s0, s1, s2, s3, s4, sum, half); }
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0) { return _calc_gauss5_wide(s0, s1, s2, s3, s4, half, p); }
+    if (p != 0) { return _calc_mul_scaled(sum, half, 0 - p); }     # sum * half * 2^-p, once
     return f64_mul(sum, half);
 }
 
@@ -459,13 +583,19 @@ public fn calc_integral_gauss5(f, a, b) {
 # non-finite sample went from wrong to right, none from right to wrong, and the other
 # 98,998 kept their bits.
 # [measured: scratch gauss5 sweep, 3.3.4 tree and this tree, python3 Fraction oracle, 2026-10-11]
-fn _calc_gauss5_wide(s0, s1, s2, s3, s4, sum, half) {
+# In a frame p != 0 (_calc_frame) the product is mapped back by 2^-p, exactly: t is a
+# quarter of a sum past DBL_MAX and the 600 frame's half-width at least 2^-475, so there
+# t * half * 4 is above 2^549 and its 2^-600 image normal; in the -1 frame doubling it is
+# exact, or it had already overflowed.
+fn _calc_gauss5_wide(s0, s1, s2, s3, s4, half, p) {
     var q = 0x3FD0000000000000;                      # 0.25
     var t = f64_add(f64_mul(s0, q), f64_mul(s1, q));
     t = f64_add(t, f64_mul(s2, q));
     t = f64_add(t, f64_mul(s3, q));
     t = f64_add(t, f64_mul(s4, q));
-    return f64_mul(f64_mul(t, half), _CALC_F64_FOUR);
+    var r = f64_mul(f64_mul(t, half), _CALC_F64_FOUR);
+    if (p != 0) { r = _calc_from_frame(r, p); }
+    return r;
 }
 
 # ================================================================
@@ -831,13 +961,14 @@ fn _grad2(hash, x, y) {
 
 # 2D Perlin noise. Returns f64 in approximately [-1, 1].
 #
-# Certified by tests/modules.tcyr against a reference written from Perlin's
+# Certified by tests/modules_b.tcyr against a reference written from Perlin's
 # published algorithm, not from this file: bit-exact at sample points and on the
 # L1 mass of a 1600-sample grid, plus the exact cell-centre histogram (fade(1/2)
 # is exactly 1/2, so every cell centre is an exact multiple of 1/4 and the
 # distribution of those 256 values fingerprints the permutation table, the corner
 # hashing and the gradient set at once). Until 2.8.3 the only assertions were
 # |v| < 1 and determinism, which `return 0;` satisfies.
+# [measured: tests/modules_b.tcyr, group "noise: perlin_2d / perlin_3d / simplex_2d / simplex_3d"]
 #
 # ⛔ 3.3.5 — FROM A COORDINATE OF 2^63 THE FIELD WAS NOT 256-PERIODIC. The cell went
 # through `f64_to(xf) & 255`, and past the i64 range that conversion is the

@@ -111,6 +111,7 @@ fn _lp_vec_norm(arr, start, len) {
 # scale 1e-10 on a relative reconstruction check. Balancing to unit max magnitude
 # first also converts the ABSOLUTE EpsilonF64 deflation thresholds into relative
 # ones, which is what fixes the small-magnitude half.
+# [measured: CHANGELOG.md 2.7.0, 2.7.0-D: "Measured across 440 random matrices", 40/40 failed at scale 1e-10]
 #
 # NOTE: these _lp_* internals are NOT individually overflow-safe. They are only
 # sound when reached through the balanced public entry points below.
@@ -958,6 +959,7 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
 # columns were forced dependent. The rank-1 [[1,2,3],[2,4,6],[3,6,9]] bidiagonalizes to
 # d = (-3.7417, 0, 0), f = (13.4907, 0), and one sweep drives it to
 # d = (~1e-16, 0, 0), f = (-14, 0), which then repeats forever.
+# [measured: CHANGELOG.md 2.7.0, 2.7.0-D: 104/240 against 60/60, and the rank-1 d/f trace]
 #
 # A negligible d[k] means row k (for k < p_hi) or column p_hi (for k == p_hi)
 # of the block is empty apart from one superdiagonal entry, and a chase of exact
@@ -1204,6 +1206,7 @@ fn _lp_bidiag_qr(diag, superdiag, n, m, U_acc, Vt_acc, max_iter, lift) {
         # is what makes the remaining one legible.
         # ⭐ Output is bit-identical across the deletion — verified over the
         # 12-scale determinant sweep and all 3991 assertions.
+        # [measured: CHANGELOG.md 2.22.0, Removed: "bit-identical", at suite 3991; the 12-scale sweep: scratch]
 
         # Recalculate: find the bottom block where superdiag is zero
         # Simpler approach: find p_lo and p_hi for the active unreduced block
@@ -1648,6 +1651,7 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     # reference implementation: 200 of 200 violated it, silently. The same sweep
     # on 200 tall matrices violated it 0 times. B = [[2,0,0],[0,1,0]] returned
     # (2, 2, 1) where the true spectrum is (2, 1).
+    # [measured: CHANGELOG.md 2.8.3, svd_golub_kahan wide entry (200 of 200, 0 of 200 tall); (2, 2, 1): scratch run]
     #
     # Rejecting is the honest contract: the caller's out_U/out_Vt are sized for
     # the tall case, so there is nowhere to put a wide-case answer. A caller that
@@ -2080,6 +2084,7 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
             # could contradict each other and the sweep stalled: measured
             # HSB_ERR_NO_CONVERGENCE at max_iter = 1,000,000 for a symmetric 4x4
             # of condition number only 240.
+            # [measured: tests/hisab.tcyr "eigen_qr 4x4 cond 240: converges (was NO_CONVERGENCE at max_iter 1e6)"]
             #
             # One loop now, using the SAME relative threshold as the deflation
             # test, and deflating as it scans.
@@ -2225,6 +2230,7 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
                 # The Q accumulation below (Q <- Q*G^T) is the correct companion to
                 # THIS update and needed no change; it was the pair that was
                 # inconsistent, not Q alone.
+                # [measured: CHANGELOG.md 2.6.13, eigen_qr entry: a plain symmetric 3x3, even at max_iter = 100000]
                 var cs2 = f64_mul(cs, cs);
                 var sn2 = f64_mul(sn, sn);
                 var cs_sn = f64_mul(cs, sn);
@@ -2271,6 +2277,94 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
     return Ok(0);
 }
 
+# ---- 3.3.6: an eigenvalue at the overflow line (eigen_qr) ----
+# Error-free transforms, each writing its pair to out and out + 8: a + b = s + e (Knuth's
+# TwoSum), and a b = p + e (Dekker's product on Veltkamp's split, exact while |a|, |b| <=
+# 2^995, so that (2^27 + 1) a cannot overflow, and while a b is not below about 2^-969).
+fn _lp_two_sum(a, b, out) {
+    var s = f64_add(a, b);
+    var bb = f64_sub(s, a);
+    store64(out, s);
+    store64(out + 8, f64_add(f64_sub(a, f64_sub(s, bb)), f64_sub(b, bb)));
+    return 0;
+}
+fn _lp_two_prod(a, b, out) {
+    var p = f64_mul(a, b);
+    var ca = f64_mul(0x41A0000002000000, a);   # (2^27 + 1) a
+    var ah = f64_sub(ca, f64_sub(ca, a));
+    var al = f64_sub(a, ah);
+    var cb = f64_mul(0x41A0000002000000, b);
+    var bh = f64_sub(cb, f64_sub(cb, b));
+    var bl = f64_sub(b, bh);
+    var e = f64_add(f64_add(f64_sub(f64_mul(ah, bh), p), f64_mul(ah, bl)), f64_mul(al, bh));
+    store64(out, p);
+    store64(out + 8, f64_add(e, f64_mul(al, bl)));
+    return 0;
+}
+
+# 1 when column k of V proves that A has an eigenvalue past the overflow line, on the
+# positive side (neg = 0) or the negative (neg = 1). Round to nearest takes a value to
+# +-Inf from 2^1024 - 2^970 (DBL_MAX plus half its ulp) on, and for a symmetric A every
+# Rayleigh quotient q = v' A v / v' v lies in [lambda_min, lambda_max]: q above the line
+# puts lambda_max above it, -q above it puts lambda_min below its negative. q is formed in
+# double-double on A / 2^64 (exact but for entries the scaling makes subnormal, each off by
+# under 2^-1074) against the line scaled alike, 2^960 - 2^906, and the answer is 1 only
+# when q passes it by more than a bound on that evaluation: (n^2 + 4)^2 2^-100 times
+# (1 + sum |a_ij v_i v_j| / v' v). The relative part covers the double-double sums (under
+# n^4 2^-106) and the division; the absolute part, products v_i v_j that underflow (each
+# off by under 2^-1074, times |a_ij 2^-64| <= 2^960). The quotient's error as
+# an eigenvalue does not enter (any v gives a bound on the same side), so an A whose
+# eigenvalues all fit can never be refused here; one past the line is refused when v is
+# good enough that q lands past it too, as an eigenvector from the QR is.
+# buf: 32 bytes of scratch.
+fn _lp_rq_past_max(A, n, V, k, neg, buf) {
+    var nh = f64_from(0);
+    var nl = f64_from(0);
+    var dh = f64_from(0);
+    var dl = f64_from(0);
+    var sab = f64_from(0);
+    for (var i = 0; i < n; i = i + 1) {
+        var vi = ganita_mat_get(V, i, k);
+        _lp_two_prod(vi, vi, buf);
+        _lp_two_sum(dh, load64(buf), buf + 16);
+        dh = load64(buf + 16);
+        dl = f64_add(dl, f64_add(load64(buf + 24), load64(buf + 8)));
+        for (var j = 0; j < n; j = j + 1) {
+            _lp_two_prod(vi, ganita_mat_get(V, j, k), buf);   # v_i v_j = th + tl
+            var th = load64(buf);
+            var tl = load64(buf + 8);
+            var a = f64_mul(ganita_mat_get(A, i, j), 0x3BF0000000000000);   # a_ij 2^-64
+            _lp_two_prod(a, th, buf);
+            var pl = f64_add(load64(buf + 8), f64_mul(a, tl));
+            _lp_two_sum(nh, load64(buf), buf + 16);
+            nh = load64(buf + 16);
+            nl = f64_add(nl, f64_add(load64(buf + 24), pl));
+            sab = f64_add(sab, f64_abs(load64(buf)));
+        }
+    }
+    _lp_two_sum(nh, nl, buf);
+    nh = load64(buf);
+    nl = load64(buf + 8);
+    _lp_two_sum(dh, dl, buf);
+    dh = load64(buf);
+    dl = load64(buf + 8);
+    if (f64_gt(dh, 0) == 0) { return 0; }
+    # q = q1 + q2 = (nh + nl) / (dh + dl), the remainder taken against q1 (dh + dl) exactly
+    var q1 = f64_div(nh, dh);
+    _lp_two_prod(q1, dh, buf);
+    var r = f64_sub(f64_add(f64_sub(f64_sub(nh, load64(buf)), load64(buf + 8)), nl), f64_mul(q1, dl));
+    var q2 = f64_div(r, dh);
+    if (neg == 1) {
+        q1 = f64_neg(q1);
+        q2 = f64_neg(q2);
+    }
+    # (q1 - 2^960) is exact wherever the comparison is close (Sterbenz)
+    var past = f64_add(f64_add(f64_sub(q1, 0x7BF0000000000000), q2), 0x7890000000000000);   # - 2^960, + 2^906
+    var nn = f64_add(f64_from(n * n), f64_from(4));
+    var bnd = f64_mul(f64_mul(f64_mul(nn, nn), 0x39B0000000000000), f64_add(f64_div(sab, dh), F64_ONE));   # 2^-100
+    return f64_gt(past, bnd);
+}
+
 # One attempt at the eigendecomposition of A / sc (3.3.4; see `_lp_svd_attempt`).
 # Leaves the balanced eigenvalues in diag; out_vecs is rewritten from the identity on
 # every attempt. `lift` is 0 on the first attempt and 1 on each retry, 2 on the last.
@@ -2283,6 +2377,27 @@ fn _lp_eig_attempt(A, n, sc, diag, offdiag, out_vecs, max_iter, lift) {
 
     # Step 2: Implicit QR iteration on tridiagonal
     var err_qr = _lp_tridiag_qr(diag, offdiag, n, out_vecs, max_iter, lift)?;
+
+    # ⛔ 3.3.6 — AN ATTEMPT CAN "CONVERGE" WITH AN OVERFLOWED DIAGONAL. The QR's diagonal
+    # update (cs^2 d_k + sn^2 d_k+1 + 2 cs sn e_k+1) has no check of its own, so on
+    # [[a, b, 0], [b, 0, 46u], [0, 46u, 0]] (a = 0x7FC9EDB8D873A8E9, b = 0xFFBD5FE19F6C5892,
+    # u = 2^-1074; largest eigenvalue 4.57e307) the first attempt, balanced by 1/4, deflated
+    # with +Inf on the diagonal and eigen_qr's rescale refused it, with no retry. An overflow
+    # there is the same failure as one the radius check catches, so it fails the attempt and
+    # the caller retries with more headroom. Any row it reaches was refused by the rescale
+    # before (sc times +-Inf or NaN is not finite), so no answered row can move. On the
+    # regenerated 3.3.5 probes (43,000 svd / eigen rows, 22,000 sparse tridiagonals) every
+    # answered row is byte-identical; 22 tridiagonals now answer, the worst 5.6 eps
+    # |lambda|_max from an 800-digit Decimal Jacobi oracle, and the 20 others it sends to a
+    # retry stay refused, their largest eigenvalue past DBL_MAX.
+    # [measured: probe sets S1-S4, R1, T, 3.3.5 vs this tree + Decimal oracle, 2026-10-11; cycc 6.6.14]
+    # ⚠ The same test in `_lp_svd_attempt` moved none of 61,500 svd rows (those sets plus
+    # 20,000 rank-1 and 20,000 sparse near-DBL_MAX rows), and no svd input reaching it is
+    # known, so the SVD does not have it.
+    # [measured: same probes + R2, B2, svd-check build vs this tree, 2026-10-11; cycc 6.6.14]
+    for (var fi = 0; fi < n; fi = fi + 1) {
+        if (f64_lt(f64_abs(load64(diag + fi * 8)), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+    }
 
     return Ok(0);
 }
@@ -2307,11 +2422,13 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # before reading dims. This is svd_golub_kahan's idiom (its first two `if` lines) applied to the
     # one routine in this file that still lacked it: through 2.8.4 a null A,
     # out_vals or out_vecs was stored through and SIGSEGV'd (exit 139, measured).
+    # [measured: tests/abuse.tcyr, group "abuse: svd_golub_kahan / eigen_qr shape + null contract", "(was exit 139)"]
     if (A == 0 || out_vals == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (out_vecs == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # n <= 0 was HALF-guarded: `n == 0` only, so n = -3 fell through to
     # _lp_vec_new(-3) -> alloc of a negative size and a wild store (exit 139).
+    # [measured: tests/abuse.tcyr "eigen_qr: n = -3 -> HSB_ERR_INVALID_INPUT (was exit 139)"]
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # THE n x n PRECONDITION IS NOW CHECKED, NOT JUST DOCUMENTED.
@@ -2438,6 +2555,28 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
         store64(diag + ev_i * 8, ev_o);
         ev_i = ev_i + 1;
     }
+    # ⛔ 3.3.6 — AND ONE THAT IS FINITE ONLY BY ROUNDING IS A FAILURE TOO. [[h, h], [h, h]]
+    # with h = 2^1023 has the eigenvalue 2^1024, past DBL_MAX, and came back Ok as
+    # 0x7FEFFFFFFFFFFFFE: 1 ulp low, as accurate as any eigenvalue here, and on the finite
+    # side of the line. So an eigenvalue within 2^-40 of the line is checked against it (see
+    # `_lp_rq_past_max`), and refused when its Rayleigh quotient proves it past. On 6,000
+    # symmetric matrices built with their largest eigenvalue within a few ulps of the line,
+    # on both sides, this refuses 184 that 3.3.5 answered, each past the line by the oracle,
+    # refuses none whose eigenvalues fit, and leaves every answered row byte-identical. 67
+    # answers past the line remain, each within 2^-139 relative of it (27 exactly on it),
+    # where a double-double quotient cannot decide; and eigen_qr's own few-ulp error decides
+    # those inputs before this does (on the line, a matrix whose eigenvalue fits by 2^-108 is
+    # refused at the rescale, and its neighbour past it by as little is answered).
+    # [measured: near-line sweep E (6,000) + probe sets, 3.3.5 vs this tree + Decimal oracle, 2026-10-11; cycc 6.6.14]
+    var rq_w[32];
+    for (var rq_i = 0; rq_i < n; rq_i = rq_i + 1) {
+        var rq_e = load64(diag + rq_i * 8);
+        if (f64_ge(f64_abs(rq_e), 0x7FEFFFFFFFFFE000) == 1) {   # (1 - 2^-40) 2^1024
+            if (_lp_rq_past_max(A, n, out_vecs, rq_i, f64_lt(rq_e, 0), &rq_w) == 1) {
+                return Err(HSB_ERR_NO_CONVERGENCE);
+            }
+        }
+    }
 
     # Step 3: Copy eigenvalues, sort by descending magnitude
     # First, copy raw eigenvalues
@@ -2479,6 +2618,7 @@ public fn cqr_decompose(A, out_Q, out_R) {
     # designed 0 that cmat_new returns for a non-positive dimension or above
     # _CMAT_MAX_ELEMS, so cqr_decompose(cmat_new(100000, 100000), ...) -- a call
     # that looks like it allocated -- SIGSEGV'd through 2.8.4 (exit 139, measured).
+    # [measured: tests/abuse.tcyr "cqr_decompose: capped cmat_new 0 flows through (was exit 139)"]
     if (A == 0 || out_Q == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (out_R == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
@@ -2496,6 +2636,7 @@ public fn cqr_decompose(A, out_Q, out_R) {
     # a 2x2 out_R: rc = HSB_ERR_NONE with 2 of 8 guard slots -- the 16 bytes
     # immediately after out_R's buffer -- overwritten; the square 2x2 control over
     # the same code path clobbered 0.
+    # [measured: CHANGELOG.md 2.9.0, cqr_decompose crash-tier entry: 2 of 8 guard slots, the square control 0 of 8]
     #
     # The ALGORITHM is not the problem: Householder QR is general in m and n
     # (min_mn = min(m, n) reflectors), and with out_R correctly sized m x n it is
@@ -2621,6 +2762,7 @@ public fn cqr_decompose(A, out_Q, out_R) {
     # -0.098% of the call's total, because the bulk is cx_new's 16 B per complex
     # temporary inside the O(m^2 n) reflector application -- a separate problem
     # this hoist does not claim to solve.
+    # [measured: CHANGELOG.md 2.9.0, the cqr_decompose arena row: 32,942,104 B -> 32,909,848 B (-0.098%)]
     var vbuf = alloc(m * 16);
     if (vbuf == 0) { return Err(HSB_ERR_ALLOC); }
 

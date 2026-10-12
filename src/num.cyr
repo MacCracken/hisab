@@ -69,8 +69,9 @@ public fn num_newton(f, df, x0, tol, max_iter, out) {
 # a, b, tol: f64 bit patterns
 # max_iter: integer
 # out: pointer, result f64 written here on success
-# Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT if same sign or if f(a) or f(b) is
-# NaN (`out` untouched on both)
+# Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT if same sign, if f(a) or f(b) is
+# NaN, or if f is NaN at a bisection point the bracket still needs (`out` untouched on
+# all three). An endpoint where f is exactly zero (either sign) is returned as the root.
 #
 # ⛔ 3.3.5 — A NaN ENDPOINT VALUE PASSED THE SIGN TEST. The test below is
 # `f(a) * f(b) > 0`, and every comparison with NaN is false, so f = NaN everywhere on
@@ -80,9 +81,19 @@ public fn num_newton(f, df, x0, tol, max_iter, out) {
 # refused. That also refuses a bracket the loop happened to solve: sqrt(x) - 1 on
 # [-1, 4], NaN at -1, returned 0x3FEFFFFFFFFFC000 near the root 1 on 3.3.4 and is
 # Err now. ±Inf is a sign and is kept: ln on [0, 2] still returns exactly 1, and a
-# step from -Inf to +Inf at 1 on [0, 4] 0x3FF0000000000800, as on 3.3.4. A NaN f(mid)
-# inside the loop is not tested here.
+# step from -Inf to +Inf at 1 on [0, 4] 0x3FF0000000000800, as on 3.3.4.
 # [measured: scratch num_bisection probe, 3.3.4 tree and this tree, tol 1e-12, max_iter 200, 2026-10-11]
+# ⛔ 3.3.6 — AN EXACT ROOT AT AN ENDPOINT, AND A NaN AT A BISECTION POINT, WERE READ AS
+# SIGNS. The orientation test below swaps only on f(lo) > 0, so f(a) = +-0 beside f(b) < 0
+# left the bracket the wrong way round and the walk moved away from the root: 1 - x on
+# [1, 2] returned Ok(0x3FFFFFFFFFFFF800) and -x on [0, 1] Ok(0x3FEFFFFFFFFFF000). An
+# endpoint where f is exactly zero is a root, and is now returned as one (a before b;
+# the NaN refusal above comes first). And `f(mid) < 0` is false for a NaN, so a NaN
+# f(mid) moved hi: f = x - 1.5, NaN on (1.2, 1.8), over [1, 2] returned
+# Ok(0x3FF3333333333800), where f = -0.3. A NaN f(mid) has no sign, as a NaN endpoint
+# value has none, and is refused the same way, unless the width test has already
+# accepted the bracket. ±Inf is still a sign.
+# [measured: tests/edge_cases.tcyr, group "3.3.6 num_bisection: exact endpoint roots, a NaN f(mid)"]
 #must_use
 public fn num_bisection(f, a, b, tol, max_iter, out) {
     var lo = a;
@@ -91,6 +102,14 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
     var f_hi = fncall1(f, hi);
     if (f64_eq(f_lo, f_lo) == 0 || f64_eq(f_hi, f_hi) == 0) {
         return Err(HSB_ERR_INVALID_INPUT);
+    }
+    if (f64_eq(f_lo, _NUM_F64_ZERO) == 1) {
+        store64(out, lo);
+        return Ok(0);
+    }
+    if (f64_eq(f_hi, _NUM_F64_ZERO) == 1) {
+        store64(out, hi);
+        return Ok(0);
     }
 
     # Check opposite signs: f_lo * f_hi > 0 means same sign
@@ -120,6 +139,7 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
             store64(out, mid);
             return Ok(0);
         }
+        if (f64_eq(f_mid, f_mid) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
         if (f64_lt(f_mid, _NUM_F64_ZERO) == 1) {
             lo = mid;
@@ -527,6 +547,7 @@ public fn num_mulmod(a, b, m) {
 # x mod 0 is undefined in the mathematics too, so there is no answer to return
 # here; HSB_ERR_DIVISION_BY_ZERO is the module's own code for exactly this
 # (see num_newton's zero-derivative refusal).
+# [measured: tests/abuse.tcyr "num_modpow: modulus = 0 -> HSB_ERR_DIVISION_BY_ZERO (was SIGFPE, exit 136)"]
 #
 # THE NEGATIVE ARGUMENTS ARE REJECTED, NOT COERCED. The header already said
 # "all arguments are non-negative integers" and nothing enforced it, so each
@@ -542,6 +563,7 @@ public fn num_mulmod(a, b, m) {
 # function, is what says what a negative base means; and with it enforced every
 # legal call answers Ok(v) with v in [0, modulus), and a rejected call is
 # UNAMBIGUOUSLY an Err (before 3.0.0: a negative integer return).
+# [measured: CHANGELOG.md 2.9.0, num_modpow crash-tier entry: (2, 10, -3) -> 1, (2, -1, 5) -> 1, (-2, 3, 5) -> 0]
 #must_use
 public fn num_modpow(base, exp, modulus) {
     if (modulus == 0) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
@@ -589,6 +611,7 @@ fn _num_miller_rabin_test(n, d, r, a) {
         # through to "composite". Measured before this fix: the genuine primes
         # 3037218841 and 4294967357 were both reported composite. num_modpow
         # above already routes through _num_mulmod; this loop did not.
+        # [measured: CHANGELOG.md 2.6.12, num_is_prime entry: 3037218841 and 4294967357 "both returned composite"]
         x = _num_mulmod(x, x, n);
         if (x == n - 1) { return 1; }
         i = i + 1;
@@ -640,7 +663,7 @@ public fn num_is_prime(n) {
 public fn num_sieve(limit) {
     var primes = vec_new();
     if (limit < 2) { return primes; }
-    if (limit > 10000000) { return primes; }  # Cap at 10M to prevent OOM
+    if (limit > 10000000) { return primes; }  # Cap at 10M entries to prevent memory exhaustion
 
     # Allocate boolean sieve: 1 byte per number
     var sieve_size = limit + 1;

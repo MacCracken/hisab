@@ -14,6 +14,7 @@
 # `autodiff.cyr` ships forward-mode duals, and threading them through the
 # intersection routines is the obvious construction. It was rejected on two
 # measured grounds:
+# [measured: CHANGELOG.md 2.10.0, "Not dual numbers, and that was a measured decision"; the grounds follow]
 #
 #   * Dual is a HEAP struct and every dual_* op allocates 16 bytes. Under the
 #     bump allocator -- which never frees -- one ray/sphere intersection would
@@ -21,6 +22,7 @@
 #   * Forward mode carries ONE seed direction per evaluation. A sphere jet has
 #     7 independent parameters (origin 3, direction 3, radius 1) and a triangle
 #     has 15, so a full gradient would need that many passes.
+# [measured: CHANGELOG.md 2.10.0, "a 96 ns intersection" (ray_sphere)]
 #
 # The implicit function theorem gives the whole gradient in closed form instead.
 # `t` is the root of F(o + t*d; theta) = 0, so differentiating along the surface:
@@ -190,6 +192,20 @@ fn _geo_jet_axis(k, val) {
 # while the unchanged ray_aabb_diag row moved +0.1% to +2.6% between the same
 # pairs of binaries.
 # [measured: R5geo interleaved micro A/B, three runs of 60 rounds at load 4-10, not in-tree, 2026-10-01; cycc 6.6.12]
+# ⛔ 3.3.6 — A -0.0 CONTACT WAS A HIT. The primals answer a contact at t = 0 (the origin
+# on the surface) with +0.0 or -0.0 by the sign their arithmetic gives, and both mean the
+# miss (src/geo.cyr, "A CONTACT AT t = 0"); these builders tested the integer t == 0,
+# which only +0.0 passes, so the triangle (0,0,0), (1,0,0), (0,1,0) from (0.25, 0.25, 0)
+# got the miss jet along -z (t = +0.0) and a hit jet with gradients along +z (t = -0.0),
+# and the plane and box builders likewise (tests/modules.tcyr pins each). All six test
+# f64_eq(t, 0), 1 for both zeros, so a contact is the miss jet on every primal. Of the slab sweep's
+# 235997 box rays, 2943 jets moved, every one from a hit at t = -0.0 to the miss.
+# [measured: C336 slab sweep and probes, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
+# (The sphere and capsule primals give -0.0 only for a ray tangent at its origin, whose
+# den is 0 and is the miss jet anyway: a root that underflows below zero reads -2^-1074
+# and the c = 0 contact +0. Their `t == 0` mutants survive as equivalent; the shared test
+# keeps the rule one rule.)
+# [measured: C336 mutation run on tests/modules.tcyr, 2026-10-11; cycc 6.6.14]
 #must_use
 fn _geo_jet_miss() {
     var j = alloc(_GJ_BYTES);
@@ -234,7 +250,8 @@ public fn geo_jet_dorigin(j) { return _GeoJet_dt_do(j); }
 #must_use
 public fn geo_jet_ddirection(j) { return _GeoJet_dt_dd(j); }
 
-# 1 when the jet carries a real intersection, 0 for a miss.
+# 1 when the jet carries a real intersection, 0 for a miss. A contact at t = +0 or -0
+# (the origin on the surface) is the miss jet, whichever zero the primal gives (3.3.6).
 public fn geo_jet_hit(j) {
     if (_GeoJet_kind(j) == GEO_JET_MISS) { return 0; }
     return 1;
@@ -258,7 +275,7 @@ public fn geo_jet_hit(j) {
 #must_use
 public fn geo_jet_sphere(ray, sphere) {
     var t = geo_ray_sphere(ray, sphere);
-    if (t == 0) { return _geo_jet_miss(); }
+    if (f64_eq(t, 0) == 1) { return _geo_jet_miss(); }   # +0 or -0: see _geo_jet_miss
     if (f64_lt(f64_abs(t), F64_POS_INF) == 0) { return _geo_jet_miss(); }   # see _geo_jet_miss
 
     var d = GeoRay_direction(ray);
@@ -288,16 +305,31 @@ public fn geo_jet_sphere(ray, sphere) {
     # rejecting rays its own primal accepts.
     # [measured: tests/modules.tcyr geo jet scale sweeps, 2026-09-09]
     var inv = f64_div(F64_ONE, den);
-    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_miss(); }
-    var dt_do = hvec3_scale(g, f64_neg(inv));
+    var dt_do = 0;
+    var sv = 0;
+    var ss = 0;
+    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0 || f64_eq(inv, 0) == 1) {
+        # 3.3.6: den overflowed or is too small to invert (_geo_jet_round_scaled).
+        var rp[24];
+        if (_geo_jet_round_scaled(g, d, GeoSphere_radius(sphere), &rp) == 0) { return _geo_jet_miss(); }
+        dt_do = hvec3_scale(load64(&rp), f64_neg(load64(&rp + 8)));
+        sv = hvec3_scale(load64(&rp), load64(&rp + 8));
+        ss = load64(&rp + 16);
+        if (_geo_jet_finite3(dt_do) + _geo_jet_finite3(hvec3_scale(dt_do, t)) != 2) { return _geo_jet_miss(); }
+        if (f64_lt(f64_abs(ss), F64_POS_INF) == 0) { return _geo_jet_miss(); }
+    } else {
+        dt_do = hvec3_scale(g, f64_neg(inv));
+        sv = hvec3_scale(g, inv);
+        ss = f64_mul(GeoSphere_radius(sphere), inv);
+    }
 
     var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_SPHERE);
     _GeoJet_set_t(j, t);
     _GeoJet_set_dt_do(j, dt_do);
     _GeoJet_set_dt_dd(j, hvec3_scale(dt_do, t));
-    _GeoJet_set_sv(j, hvec3_scale(g, inv));
-    _GeoJet_set_ss(j, f64_mul(GeoSphere_radius(sphere), inv));
+    _GeoJet_set_sv(j, sv);
+    _GeoJet_set_ss(j, ss);
     _GeoJet_set_face(j, GEO_FACE_NONE);
     return j;
 }
@@ -320,7 +352,7 @@ public fn geo_jet_sphere(ray, sphere) {
 #must_use
 public fn geo_jet_plane(ray, plane) {
     var t = geo_ray_plane(ray, plane);
-    if (t == 0) { return _geo_jet_miss(); }
+    if (f64_eq(t, 0) == 1) { return _geo_jet_miss(); }   # +0 or -0: see _geo_jet_miss
     if (f64_lt(f64_abs(t), F64_POS_INF) == 0) { return _geo_jet_miss(); }   # see _geo_jet_miss
 
     var d = GeoRay_direction(ray);
@@ -340,6 +372,108 @@ public fn geo_jet_plane(ray, plane) {
     _GeoJet_set_ss(j, inv);
     _GeoJet_set_face(j, GEO_FACE_NONE);
     return j;
+}
+
+# The largest |component| of v as the bits of a non-negative f64 (a NaN sorts above
+# +Inf above every finite value), and the power of two that takes such a magnitude into
+# [1, 2) -- [2^-51, 2) for a subnormal one -- held to [2^-1022, 2^1023] (3.3.6, see
+# geo_jet_triangle). geo.cyr has the same helpers; modules cannot share `_` names.
+fn _geo_jet_absmax_bits(v) {
+    var m = HVec3_x(v) & 0x7FFF_FFFF_FFFF_FFFF;
+    var y = HVec3_y(v) & 0x7FFF_FFFF_FFFF_FFFF;
+    var z = HVec3_z(v) & 0x7FFF_FFFF_FFFF_FFFF;
+    if (y > m) { m = y; }
+    if (z > m) { m = z; }
+    return m;
+}
+
+fn _geo_jet_pow2_for(m) {
+    var k = 1023 - (m >> 52);
+    if (k > 1023) { k = 1023; }
+    if (k < 0 - 1022) { k = 0 - 1022; }
+    return (1023 + k) << 52;
+}
+
+# 1 when every component of v is finite: the house test, one compare per component.
+fn _geo_jet_finite3(v) {
+    if (f64_lt(f64_abs(HVec3_x(v)), F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(f64_abs(HVec3_y(v)), F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(f64_abs(HVec3_z(v)), F64_POS_INF) == 0) { return 0; }
+    return 1;
+}
+
+# geo_jet_triangle's gradients when 1 / den overflowed: e1, e2 and w = p - v0 scaled by
+# one power of two, d by another, so that n = e1 x e2 and den = n . d are formed with
+# normal products. The quotients are degree 0 in the first scale and -1 in d's, so
+# each is multiplied back by d's. The miss jet when den is still too small to invert
+# (the ray is parallel to the plane), when an input is not finite, or when a gradient
+# overflows on the way back.
+#must_use
+fn _geo_jet_tri_scaled(ray, t, v0, e1, e2) {
+    var d = GeoRay_direction(ray);
+    var w = hvec3_sub(geo_ray_at(ray, t), v0);
+    if (_geo_jet_finite3(e1) + _geo_jet_finite3(e2) + _geo_jet_finite3(d) + _geo_jet_finite3(w) != 4) {
+        return _geo_jet_miss();
+    }
+    var me = _geo_jet_absmax_bits(e1);
+    var m2 = _geo_jet_absmax_bits(e2);
+    if (m2 > me) { me = m2; }
+    var se = _geo_jet_pow2_for(me);
+    var sd = _geo_jet_pow2_for(_geo_jet_absmax_bits(d));
+    var e1s = hvec3_scale(e1, se);
+    var e2s = hvec3_scale(e2, se);
+    var ws = hvec3_scale(w, se);
+    var n = hvec3_cross(e1s, e2s);
+    var inv = f64_div(F64_ONE, hvec3_dot(n, hvec3_scale(d, sd)));
+    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_miss(); }
+    var ninv = f64_neg(inv);
+    var dt_do = hvec3_scale(hvec3_scale(n, ninv), sd);
+    var dt_dd = hvec3_scale(dt_do, t);
+    var sv = hvec3_scale(hvec3_scale(hvec3_sub(hvec3_cross(hvec3_sub(e1s, e2s), ws), n), ninv), sd);
+    var sv1 = hvec3_scale(hvec3_scale(hvec3_cross(e2s, ws), ninv), sd);
+    var sv2 = hvec3_scale(hvec3_scale(hvec3_cross(ws, e1s), ninv), sd);
+    var ok = _geo_jet_finite3(dt_do) + _geo_jet_finite3(dt_dd) + _geo_jet_finite3(sv);
+    if (ok + _geo_jet_finite3(sv1) + _geo_jet_finite3(sv2) != 5) { return _geo_jet_miss(); }
+
+    var j = alloc(_GJ_BYTES);
+    _GeoJet_set_kind(j, GEO_JET_TRIANGLE);
+    _GeoJet_set_t(j, t);
+    _GeoJet_set_dt_do(j, dt_do);
+    _GeoJet_set_dt_dd(j, dt_dd);
+    _GeoJet_set_sv(j, sv);
+    _GeoJet_set_sv1(j, sv1);
+    _GeoJet_set_sv2(j, sv2);
+    _GeoJet_set_ss(j, 0);
+    _GeoJet_set_face(j, GEO_FACE_NONE);
+    return j;
+}
+
+# t's partials on a round surface (a sphere, or a capsule's cap or barrel) when
+# 1 / den is not a usable double (3.3.6): den = g . d, about r |d|, overflows past 2^1024
+# (a radius near DBL_MAX met by a unit direction, which 3.3.5 never reached because its
+# primal returned +Inf there) and 1 / den overflows below 2^-1024 (a radius of 2^-500 met
+# by a raw direction 2^-600 long). g / den and r / den are
+# degree 0 in g and r together and -1 in d, so g and r are multiplied by one power of
+# two and d by another, each largest component into [1, 2), and the quotients by d's.
+# p[0] = the scaled g', p[1] = m with g / den = g' * m, p[2] = r / den. 0 when den is
+# still zero (grazing) or an input is not finite: the caller's miss jet.
+fn _geo_jet_round_scaled(g, d, r, p) {
+    if (_geo_jet_finite3(g) + _geo_jet_finite3(d) != 2) { return 0; }
+    if (f64_lt(f64_abs(r), F64_POS_INF) == 0) { return 0; }
+    var mg = _geo_jet_absmax_bits(g);
+    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > mg) { mg = mr; }
+    var sg = _geo_jet_pow2_for(mg);
+    var sd = _geo_jet_pow2_for(_geo_jet_absmax_bits(d));
+    var gs = hvec3_scale(g, sg);
+    var inv = f64_div(F64_ONE, hvec3_dot(gs, hvec3_scale(d, sd)));
+    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return 0; }
+    if (f64_eq(inv, 0) == 1) { return 0; }
+    var m = f64_mul(inv, sd);
+    store64(p, gs);
+    store64(p + 8, m);
+    store64(p + 16, f64_mul(f64_mul(r, sg), m));
+    return 1;
 }
 
 # Ray-triangle jet. Gradients w.r.t. ray origin, ray direction and all three
@@ -367,10 +501,26 @@ public fn geo_jet_plane(ray, plane) {
 # an ALGEBRAIC identity of the three expressions above (the cross-product terms
 # cancel exactly, leaving n/den), so it cannot detect a shared error in them.
 # It is asserted as a smoke test only; finite differences are the real oracle.
+#
+# ⛔ 3.3.6 — THE JET REFUSED HITS ITS PRIMAL ACCEPTED. The primal tests 1 / a with
+# a = e1 . (d x e2); this tests 1 / den with den = n . d = (e1 x e2) . d, the same
+# number in exact arithmetic (-a) but rounded through other products. Where they
+# fall among the subnormals, near |a| = 2^-1024, the two roundings land on either
+# side of the reciprocal's overflow: legs of s = 0x1FF1F5FAB7CD0488 (about 2^-511)
+# give n = (0, 0, s^2), subnormal, so den lost the bits a kept, and the jet answered
+# its miss for a hit at a finite t. Every quotient below is a ratio of a degree-two
+# quantity in the triangle's size to den, and has degree -1 in d, so when 1 / den
+# overflows the gradients are formed again from copies of e1, e2 and w multiplied by
+# one power of two and of d by another (each largest component into [1, 2)), and
+# multiplied back by d's (_geo_jet_tri_scaled). Wherever den is normal the shipped
+# arithmetic runs unchanged. Over 70000 rays (triangles with legs 2^-560 to 2^-470, raw
+# directions 2^-1030 to 2^40, and 20000 straddling |a| = 2^-1024), the 52 hits the jet
+# refused are hit jets now, each dt/do within 2.1e-16 relative of the exact -n / (n . d).
+# [measured: C336 triangle-jet sweep, exact Fraction oracle, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
 #must_use
 public fn geo_jet_triangle(ray, tri) {
     var t = geo_ray_triangle(ray, tri);
-    if (t == 0) { return _geo_jet_miss(); }
+    if (f64_eq(t, 0) == 1) { return _geo_jet_miss(); }   # +0 or -0: see _geo_jet_miss
     if (f64_lt(f64_abs(t), F64_POS_INF) == 0) { return _geo_jet_miss(); }   # see _geo_jet_miss
 
     var d = GeoRay_direction(ray);
@@ -380,7 +530,15 @@ public fn geo_jet_triangle(ray, tri) {
     var n = hvec3_cross(e1, e2);
     var den = hvec3_dot(n, d);
     var inv = f64_div(F64_ONE, den);
-    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_miss(); }
+    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_tri_scaled(ray, t, v0, e1, e2); }
+    # n under 2^-1019: its products rounded among the subnormals and kept only the bits
+    # above 2^-1074, though 1 / den is finite (legs about 2^-530 with d near 2^37 gave
+    # dt/do 3.5e-5 off). The scaled copy forms n with normal products. On the sweep above
+    # this moved 4935 hit jets of triangles with legs under 2^-510: 3113 closer to the exact
+    # dt/do, 381 further, the rest no nearer or further; every one within 3.0e-15 relative
+    # (1.7e-15 before), a cross product's own rounding.
+    # [measured: C336 probe and triangle-jet sweep (seed 31), exact Fraction oracle, 2026-10-11; cycc 6.6.14]
+    if (_geo_jet_absmax_bits(n) < 0x0040_0000_0000_0000) { return _geo_jet_tri_scaled(ray, t, v0, e1, e2); }
     var w = hvec3_sub(geo_ray_at(ray, t), v0);
     var dt_do = hvec3_scale(n, f64_neg(inv));
 
@@ -432,7 +590,7 @@ public fn geo_jet_triangle(ray, tri) {
 public fn geo_jet_aabb(ray, aabb) {
     var out = alloc(GEO_FACE_OUT_BYTES);
     var t = geo_ray_aabb_face(ray, aabb, out);
-    if (t == 0) { return _geo_jet_miss(); }
+    if (f64_eq(t, 0) == 1) { return _geo_jet_miss(); }   # +0 or -0: see _geo_jet_miss
     if (f64_lt(f64_abs(t), F64_POS_INF) == 0) { return _geo_jet_miss(); }   # see _geo_jet_miss
 
     var face = load64(out);
@@ -538,7 +696,7 @@ fn _geo_jet_obb_axis(obb, k) {
 public fn geo_jet_obb(ray, obb) {
     var out = alloc(GEO_FACE_OUT_BYTES);
     var t = geo_ray_obb_face(ray, obb, out);
-    if (t == 0) { return _geo_jet_miss(); }
+    if (f64_eq(t, 0) == 1) { return _geo_jet_miss(); }   # +0 or -0: see _geo_jet_miss
     if (f64_lt(f64_abs(t), F64_POS_INF) == 0) { return _geo_jet_miss(); }   # see _geo_jet_miss
 
     var face = load64(out);
@@ -548,6 +706,9 @@ public fn geo_jet_obb(ray, obb) {
     var k = geo_face_axis(face);
     var axis = _geo_jet_obb_axis(obb, k);
     var fk = hvec3_dot(axis, GeoRay_direction(ray));
+    # Since 3.3.6 the core divides by a subnormal f_k as geo_jet_aabb's does by d_k, so a
+    # face can come from one; below 2^-1024 1 / f_k overflows and this is the miss jet,
+    # as for any gradient that overflows.
     var inv = f64_div(F64_ONE, fk);
     if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_miss(); }
     var dt_dc = hvec3_scale(axis, inv);
@@ -613,7 +774,7 @@ public fn geo_jet_obb(ray, obb) {
 public fn geo_jet_capsule(ray, capsule) {
     var out = alloc(GEO_FACE_OUT_BYTES);
     var t = geo_ray_capsule_branch(ray, capsule, out);
-    if (t == 0) { return _geo_jet_miss(); }
+    if (f64_eq(t, 0) == 1) { return _geo_jet_miss(); }   # +0 or -0: see _geo_jet_miss
     if (f64_lt(f64_abs(t), F64_POS_INF) == 0) { return _geo_jet_miss(); }   # see _geo_jet_miss
 
     var branch = load64(out);
@@ -645,9 +806,26 @@ public fn geo_jet_capsule(ray, capsule) {
     # Grazing incidence: the ray is tangent to this piece and t is genuinely
     # non-differentiable. Same convention as geo_jet_sphere.
     var inv = f64_div(F64_ONE, den);
-    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_miss(); }
-    var dt_do = hvec3_scale(g, f64_neg(inv));
-    var back = hvec3_scale(g, inv);      # +g/den, the shared endpoint direction
+    var dt_do = 0;
+    var back = 0;
+    var ss = 0;
+    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0 || f64_eq(inv, 0) == 1) {
+        # 3.3.6: den overflowed or is too small to invert (_geo_jet_round_scaled).
+        var rp[24];
+        if (_geo_jet_round_scaled(g, d, r, &rp) == 0) { return _geo_jet_miss(); }
+        dt_do = hvec3_scale(load64(&rp), f64_neg(load64(&rp + 8)));
+        back = hvec3_scale(load64(&rp), load64(&rp + 8));
+        ss = load64(&rp + 16);
+        if (_geo_jet_finite3(dt_do) + _geo_jet_finite3(hvec3_scale(dt_do, t)) != 2) { return _geo_jet_miss(); }
+        if (_geo_jet_finite3(hvec3_scale(back, wa)) + _geo_jet_finite3(hvec3_scale(back, wb)) != 2) {
+            return _geo_jet_miss();
+        }
+        if (f64_lt(f64_abs(ss), F64_POS_INF) == 0) { return _geo_jet_miss(); }
+    } else {
+        dt_do = hvec3_scale(g, f64_neg(inv));
+        back = hvec3_scale(g, inv);      # +g/den, the shared endpoint direction
+        ss = f64_mul(r, inv);
+    }
 
     var j = alloc(_GJ_BYTES);
     _GeoJet_set_kind(j, GEO_JET_CAPSULE);
@@ -657,7 +835,7 @@ public fn geo_jet_capsule(ray, capsule) {
     _GeoJet_set_sv(j, hvec3_scale(back, wa));
     _GeoJet_set_sv1(j, hvec3_scale(back, wb));
     _GeoJet_set_sv2(j, hvec3_new(0, 0, 0));
-    _GeoJet_set_ss(j, f64_mul(r, inv));
+    _GeoJet_set_ss(j, ss);
     _GeoJet_set_face(j, branch);
     return j;
 }

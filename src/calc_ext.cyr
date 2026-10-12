@@ -24,6 +24,9 @@ var _CALCX_F64_FIFTEEN = 0x402E_0000_0000_0000;  # 15.0
 var _CALCX_F64_REL_FLOOR = 0x3C70_0000_0000_0000;  # 2^-56
 # The first magnitude f64_to cannot convert: |c| < 2^63 fits in i64 (_calcx_perlin_cell).
 var _CALCX_F64_2_POW_63 = 0x43E0_0000_0000_0000;  # 2^63
+# The scale of an adaptive Simpson panel whose width / 6 underflows (_calcx_panel_tiny).
+var _CALCX_F64_2_POW_600 = 0x6570_0000_0000_0000;  # 2^600
+var _CALCX_F64_2_POW_M600 = 0x1A70_0000_0000_0000;  # 2^-600
 
 # ⛔ 3.3.3 — `_CALCX_F64_1E_NEG30` NO LONGER DECIDES A FLAT SEGMENT IN ANY SET 3.3.3
 # SPLINES ITSELF. It is calc_monotone_cubic's 3.3.2 flat-secant threshold: an absolute
@@ -321,13 +324,19 @@ public fn calc_hessian(f, x, n, h, out) {
 # [deps] and ode_dopri45_trajectory already returns HSB_ERR_NO_CONVERGENCE.
 # Reporting it changes calc_adaptive_simpson's public signature, so it is
 # roadmap [3.4.0], audit D070.
-fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
+#
+# vk is the node's value frame: whole, the panels and the returned value are in units of
+# 2^vk (0 everywhere a value fits; see _calcx_reframe), while tol stays in the caller's
+# units and is scaled only where it is compared. vlim, when not 0, is a magnitude past
+# which the node's value need not be refined (see _calcx_reframe), vdesc its children's.
+fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk, vlim, vdesc) {
     if (depth <= 0) {
         # Return the best estimate at max depth, unreported (see above).
         return whole;
     }
 
     var mid = f64_mul(f64_add(a, b), F64_HALF);
+    if (f64_lt(f64_abs(mid), F64_POS_INF) == 0) { mid = _calcx_mid_wide(a, b); }
 
     # Stop when bisection stops making progress. The depth counter bounds the
     # DEPTH of the tree, not its size: every non-converged node spawns two
@@ -421,31 +430,57 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
     # can stop; it also costs x^4 at tol 1e-300 607,479 evaluations against 408,529.
     # [measured: scratch same-binary harness (p/palias.cyr), 3.3.5 tree, Decimal oracle, 2026-10-11; cycc 6.6.14]
     var tol_eff = tol;
+    if (vk != 0) { tol_eff = _calcx_pow2_dn(tol, vk); }
     var tol_floor = f64_mul(f64_abs(whole), _CALCX_F64_REL_FLOOR);
     if (depth < 50 && f64_lt(tol_eff, tol_floor) == 1) { tol_eff = tol_floor; }
     var left_mid = f64_mul(f64_add(a, mid), F64_HALF);
+    if (f64_lt(f64_abs(left_mid), F64_POS_INF) == 0) { left_mid = _calcx_mid_wide(a, mid); }
     var right_mid = f64_mul(f64_add(mid, b), F64_HALF);
+    if (f64_lt(f64_abs(right_mid), F64_POS_INF) == 0) { right_mid = _calcx_mid_wide(mid, b); }
     var flm = fncall1(f, left_mid);
     var frm = fncall1(f, right_mid);
 
     var h = f64_mul(f64_sub(b, a), F64_HALF);
+    if (f64_lt(f64_abs(h), F64_POS_INF) == 0) { h = _calcx_half_wide(a, b); }
     var h_over_6 = f64_div(h, _CALCX_F64_SIX);
+    var h6 = h_over_6;                               # in the value frame
+    if (vk != 0) { h6 = _calcx_pow2_dn(h_over_6, vk); }
 
     # Left Simpson: h/6 * (fa + 4*flm + fmid); a sum that overflowed is formed again
     # without overflow (_calcx_panel_wide).
     var lsum = f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, flm)), fmid);
-    var left_val = f64_mul(h_over_6, lsum);
-    if (f64_lt(f64_abs(lsum), F64_POS_INF) == 0) { left_val = _calcx_panel_wide(h_over_6, fa, flm, fmid); }
+    var left_val = f64_mul(h6, lsum);
+    if (f64_lt(f64_abs(lsum), F64_POS_INF) == 0) { left_val = _calcx_panel_wide(h6, fa, flm, fmid); }
 
     # Right Simpson: h/6 * (fmid + 4*frm + fb)
     var rsum = f64_add(f64_add(fmid, f64_mul(_CALCX_F64_FOUR, frm)), fb);
-    var right_val = f64_mul(h_over_6, rsum);
-    if (f64_lt(f64_abs(rsum), F64_POS_INF) == 0) { right_val = _calcx_panel_wide(h_over_6, fmid, frm, fb); }
+    var right_val = f64_mul(h6, rsum);
+    if (f64_lt(f64_abs(rsum), F64_POS_INF) == 0) { right_val = _calcx_panel_wide(h6, fmid, frm, fb); }
+
+    # A sixth-width under DBL_MIN lost its bits; each panel is formed again from its own
+    # width, mid - a and b - mid, which are exact that small (_calcx_panel_tiny).
+    if (f64_lt(f64_abs(h_over_6), F64_TINY) == 1) {
+        left_val = _calcx_panel_tiny(f64_sub(mid, a), fa, flm, fmid);
+        right_val = _calcx_panel_tiny(f64_sub(b, mid), fmid, frm, fb);
+    }
 
     var refined = f64_add(left_val, right_val);
+    # Two panels past the frame's range with opposite signs, from finite samples: the node
+    # is formed again in a frame where nothing below it can overflow (_calcx_reframe). Past
+    # it with one sign, the value is that infinity, and is left to the arithmetic.
+    if (f64_eq(refined, refined) == 0 && _calcx_finite5(fa, flm, fmid, frm, fb) == 1) {
+        var vk2 = ((h_over_6 >> 52) & 0x7FF) - 1003;
+        if (vk2 > vk) { return _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, vk, vk2, h_over_6); }
+    }
 
     # Richardson extrapolation error estimate
     var error = f64_div(f64_sub(refined, whole), _CALCX_F64_FIFTEEN);
+    # Past vlim, with the two estimates agreeing to 10 bits, the value returns at once
+    # (_calcx_reframe): refining it further cannot change what the caller receives.
+    if (vlim != 0) {
+        var spread = f64_mul(f64_abs(f64_sub(refined, whole)), 0x4090000000000000);   # 1024
+        if (f64_lt(vlim, f64_sub(f64_abs(refined), spread)) == 1) { return f64_add(refined, error); }
+    }
 
     if (f64_lt(f64_abs(error), tol_eff) == 1) {
         return f64_add(refined, error);
@@ -461,9 +496,9 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
 
     var half_tol = f64_mul(tol, F64_HALF);
     var left_result = _adaptive_simpson_rec(f, a, mid, fa, fmid, flm,
-      left_val, half_tol, depth - 1);
+      left_val, half_tol, depth - 1, vk, vdesc, vdesc);
     var right_result = _adaptive_simpson_rec(f, mid, b, fmid, fb, frm,
-      right_val, half_tol, depth - 1);
+      right_val, half_tol, depth - 1, vk, vdesc, vdesc);
     return f64_add(left_result, right_result);
 }
 
@@ -522,25 +557,159 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth) {
 # exactly a == b (-0 and +0 included); equal infinite endpoints have a NaN width
 # and still return NaN.
 # [measured: zero-width probe on the 3.3.2 bundle, 2026-10-01]
-# ⚠ Only an EXACT zero width is handled. At a non-zero width a panel's width / 6
-# can underflow to 0 and form the same 0 * Inf: f = +Inf over [0, 2^-1074],
-# [0, 2^-1073] and [0, 2^-1072] still returns NaN, as on 3.3.2.
-# [measured: underflowing-width probe on the 3.3.2 bundle and this tree, 2026-10-01]
+# Through 3.3.5 only that exact zero width was handled: a panel's width / 6 that
+# underflowed to 0 formed the same 0 * Inf (f = +Inf over [0, 2^-1074] returned NaN),
+# and its finite answers were wrong too; 3.3.6 repairs both, and the overflows of the
+# width and the midpoints (see _calcx_mid_wide).
 public fn calc_adaptive_simpson(f, a, b, tol) {
     if (f64_gt(tol, 0) == 0) { return 0x7FF8000000000000; }  # quiet NaN; true for a NaN tol
     if (f64_eq(f64_sub(b, a), 0) == 1) { return 0; }
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
     var mid = f64_mul(f64_add(a, b), F64_HALF);
+    if (f64_lt(f64_abs(mid), F64_POS_INF) == 0) { mid = _calcx_mid_wide(a, b); }
     var fmid = fncall1(f, mid);
 
     # Initial Simpson estimate: (b-a)/6 * (fa + 4*fmid + fb)
     var w6 = f64_div(f64_sub(b, a), _CALCX_F64_SIX);
+    if (f64_lt(f64_abs(w6), F64_POS_INF) == 0) {
+        var hw = _calcx_half_wide(a, b);
+        if (f64_lt(f64_abs(hw), F64_POS_INF) == 1) { w6 = f64_div(hw, _CALCX_F64_THREE); }
+    }
     var wsum = f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fmid)), fb);
     var whole = f64_mul(w6, wsum);
     if (f64_lt(f64_abs(wsum), F64_POS_INF) == 0) { whole = _calcx_panel_wide(w6, fa, fmid, fb); }
+    if (f64_lt(f64_abs(w6), F64_TINY) == 1) { whole = _calcx_panel_tiny(f64_sub(b, a), fa, fmid, fb); }
 
-    return _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, 50);
+    return _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, 50, 0, 0, 0);
+}
+
+# Internal: (a + b) / 2 for adaptive Simpson when the plain form is not finite. For finite
+# a and b that is a sum that overflowed (same signs, both at least 2^970), and halving
+# each first is exact and cannot: the result is the plain one computed without overflow.
+# An infinite or NaN endpoint keeps the plain form.
+#
+# ⛔ 3.3.6 — THE MIDPOINTS AND THE WIDTH OVERFLOWED, AND A SIXTH-WIDTH UNDERFLOWED. With
+# same-sign endpoints near DBL_MAX, (a + b) / 2 was +-Inf: f = x / DBL_MAX on [2^1023,
+# DBL_MAX] returned +Inf, where the integral is 0x7FD7FFFFFFFFFFFF. f = 0 on [-DBL_MAX,
+# DBL_MAX] returned NaN: b - a overflows and the panel was Inf * 0. And on a tiny width
+# a panel's width / 6 lost its bits: f = 2^52 on [0, 2^-1074] (integral DBL_MIN)
+# returned 0, and on [0, 6 * 2^-1074] the children's sixth-widths rounded to 0, their
+# sum 0 left a correction of -whole / 15 that the tolerance accepted, and the result was
+# 0x8006666666666666, the wrong sign. The midpoints and half-widths are now formed
+# without overflow, and a panel whose sixth-width is below DBL_MIN is formed at 2^600
+# times its width (_calcx_panel_tiny). Every finite in-range panel runs the 3.3.5
+# operations. These numbers include the value frame (_calcx_reframe). On 12,924 calls
+# with constant and linear integrands (tol 1e-10 and 1e-26, against the exact integral)
+# 1,512 went from wrong to right and none from right to wrong; 1,250 right answers moved
+# bits, 1,187 closer to exact and 10 farther, by at most 0.75 ulp, all on widths whose
+# sixth underflowed; every call on an ordinary width kept its bits, and calls passing a
+# 3,000,000-evaluation cap went from 27 to 9 (all 9 pass it on 3.3.5 too).
+# [measured: scratch quadrature probe and sweep, 3.3.5 tree and this tree, python3 Fraction oracle, 2026-10-11]
+# On the reviewer's 15,480 calls (polynomials to degree 7, a rational and |u - 0.3|, tol
+# 1e-10, a 2,000,000-evaluation cap) 1,207 went from wrong to right and 3 from right to
+# wrong: one on an interval holding 18 doubles, where every node sits on that grid and the
+# centred panel formula meets off-centre samples (23 to 175 units of 2^-1074, on a value of
+# about 3,800), and two of the walks below. The 189 calls that moved on ordinary widths had
+# panels past DBL_MAX and were all wrong on 3.3.5 (137 NaN); 147 are right now.
+# [measured: reviewer's sweep (review-A336 p/rq.cyr, py/anq.py), 3.3.5 tree and this tree, 2026-10-11]
+# ⚠ A HUGE INTERVAL CAN NOW WALK. With its midpoints finite, a tolerance far below such an
+# integral meets the relative floor's noise as the in-range twin does. On that sweep 747
+# calls pass the cap against 523 on 3.3.5 (those 523 still do); of the 224 new ones, 220
+# have an endpoint past 2^969, 222 were wrong on 3.3.5 (55 NaN) and 2 right. f = -3.7 (x - a)
+# 2^-1020 on [0x7FE977F3CE7B76B5, 0x7FEB75541EA58CA4], tol 1e-10: 3.3.5 returned -Inf
+# after 5 evaluations (wrong; the integral is about -2.06e307), this passes 10^8, and its
+# twin at 2^-600 passes 10^8 on 3.3.5 too: the [3.4.0] work bound (D070). Kept.
+# [measured: reviewer's sweep and cap probe (review-A336 p/rq.cyr, p/pcap.cyr), 3.3.5 tree and this tree, 2026-10-11]
+fn _calcx_mid_wide(a, b) {
+    if (f64_lt(f64_abs(a), F64_POS_INF) == 0 || f64_lt(f64_abs(b), F64_POS_INF) == 0) {
+        return f64_mul(f64_add(a, b), F64_HALF);
+    }
+    return f64_add(f64_mul(a, F64_HALF), f64_mul(b, F64_HALF));
+}
+
+# Internal: (b - a) / 2 when the plain form is not finite: b/2 - a/2 for finite a and b
+# (a difference that overflowed; see _calcx_mid_wide), the plain form otherwise.
+fn _calcx_half_wide(a, b) {
+    if (f64_lt(f64_abs(a), F64_POS_INF) == 0 || f64_lt(f64_abs(b), F64_POS_INF) == 0) {
+        return f64_mul(f64_sub(b, a), F64_HALF);
+    }
+    return f64_sub(f64_mul(b, F64_HALF), f64_mul(a, F64_HALF));
+}
+
+# Internal: the Simpson panel (w / 6) (fa + 4 fm + fb) for a width whose sixth is below
+# DBL_MIN, formed at 2^600 times the width and scaled back: w is exact there (a
+# difference that small is), w * 2^600 / 6 is normal, and the product rounds once more
+# only if the panel itself is subnormal. A sum that overflowed takes _calcx_panel_wide.
+fn _calcx_panel_tiny(w, fa, fm, fb) {
+    var w6 = f64_div(f64_mul(w, _CALCX_F64_2_POW_600), _CALCX_F64_SIX);
+    var s = f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fm)), fb);
+    var v = f64_mul(w6, s);
+    if (f64_lt(f64_abs(s), F64_POS_INF) == 0) { v = _calcx_panel_wide(w6, fa, fm, fb); }
+    return f64_mul(v, _CALCX_F64_2_POW_M600);
+}
+
+# Internal: the node [a, b] of _adaptive_simpson_rec formed again in value frame vk2 > vk
+# and returned in frame vk. vk2 is ilogb(h/6) + 20: no panel below the node passes
+# 2(h/6) * 6 DBL_MAX < 2^(ilogb(h/6) + 1029) in real units, and a value is at most 17/15
+# of its panels' bound per level, 2^9 over 50 levels, so nothing in the new frame passes
+# 2^1018; a frame in which the node did overflow is below vk2 (vk < ilogb(h/6) + 6). The
+# node's sixth-width is 2 (h/6), its panel recomputed from its three samples; the two
+# inner samples are taken again, 2 evaluations. The way back is exact, or the correctly
+# signed infinity.
+# vlim is frame vk's DBL_MAX: a node value past it, its two estimates agreeing to 10 bits,
+# overflows the caller whatever refinement finds, and returns at once, as it did before
+# it was re-framed. Below the node the bound is 2^56 times that: a value there that large
+# cannot be refined to better than vlim (the relative floor is 2^-56), so no finite total
+# built from it can be trusted, and the walk such values took on their in-range twins
+# (the relative floor's [3.4.0] D070 case) buys nothing.
+#
+# ⛔ 3.3.6 — TWO PANELS PAST DBL_MAX WITH OPPOSITE SIGNS MADE NaN. Their sum Inf - Inf
+# went through the NaN-error exit: f = 2^1000 ((x - 2^1023) 2^-1023 - 0.3) on [2^1023,
+# DBL_MAX], tol 1e-10, returned NaN, where the integral (about 0.2 * 2^2023) overflows to
+# +Inf (3.3.5 had +Inf, every node at +Inf by accident of the overflowing midpoint), and
+# the same integrand on [0, 2^1023] is NaN on 3.3.5 too, where trapez, simpson and gauss5
+# give +Inf. A finite integral whose halves overflow came back NaN the same way: 2^7 (u -
+# 0.5 + 2^-8) on [0, 2^1023] is 2^1022 exactly, and is that now. On the reviewer's
+# 15,480-call sweep (2,000,000-evaluation cap) no call went from right to wrong through
+# this repair, and the 24 that 3.3.6's midpoints had turned from +-Inf to NaN are right.
+# [measured: reviewer's probe and sweep (review-A336 p/pnan.cyr, p/rq.cyr), scratch p/pfix.cyr, 2026-10-11]
+# ⚠ Halves that each overflow with one sign below a node whose own panels are finite
+# still meet as Inf - Inf: 2^10 s(t) + t^4, s = -sin(2 pi t) sin^2(4 pi t) tripled past
+# t = 1/2, on [0, 2^1023], is NaN after 17 evaluations on 3.3.5 and here, where the
+# integral is +Inf. Re-framing such a node as well changed no result on either sweep
+# (339,498 calls) and made that call walk past 300 s, as its in-range twin would: it is
+# left to the [3.4.0] work bound (D070).
+# [measured: scratch probe (p/pstep7.cyr) with and without that re-framing, both sweeps, 2026-10-11]
+fn _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, vk, vk2, h_over_6) {
+    var w6 = _calcx_pow2_dn(f64_mul(h_over_6, F64_TWO), vk2);
+    var s = f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fmid)), fb);
+    var whole = f64_mul(w6, s);
+    if (f64_lt(f64_abs(s), F64_POS_INF) == 0) { whole = _calcx_panel_wide(w6, fa, fmid, fb); }
+    var vlim = _calcx_pow2_dn(0x7FEFFFFFFFFFFFFF, vk2 - vk);    # DBL_MAX of frame vk
+    var r = _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk2, vlim,
+      f64_mul(vlim, 0x4370000000000000));                         # 2^56
+    return _calcx_pow2_up(r, vk2 - vk);
+}
+
+# Internal: 1 when all five samples are finite.
+fn _calcx_finite5(a, b, c, d, e) {
+    if (f64_lt(f64_abs(a), F64_POS_INF) == 0 || f64_lt(f64_abs(b), F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(f64_abs(c), F64_POS_INF) == 0 || f64_lt(f64_abs(d), F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(f64_abs(e), F64_POS_INF) == 0) { return 0; }
+    return 1;
+}
+
+# Internal: x * 2^-k and x * 2^k for 0 <= k <= 2044, in two steps (each factor a normal
+# power of two): exact where the result is normal, rounded once onto the subnormal grid
+# or overflowing to the correctly signed infinity otherwise.
+fn _calcx_pow2_dn(x, k) {
+    var k1 = k / 2;
+    return f64_mul(f64_mul(x, (1023 - k1) << 52), (1023 - (k - k1)) << 52);
+}
+fn _calcx_pow2_up(x, k) {
+    var k1 = k / 2;
+    return f64_mul(f64_mul(x, (1023 + k1) << 52), (1023 + (k - k1)) << 52);
 }
 
 # Internal: a Simpson panel w6 * (fa + 4 fm + fb) whose plain sum is not finite, formed
@@ -593,7 +762,7 @@ fn _calcx_panel_wide(w6, fa, fm, fb) {
 # t: parameter value (f64).
 # Returns HVec3 pointer, or 0 if inputs are invalid / t out of range.
 public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
-    if (n_pts == 0) { return 0; }
+    if (n_pts < 1) { return 0; }
     # A B-spline of degree d needs at least d+1 control points. Through 2.6.13
     # only `n_pts != 0` and the knot-count relation were checked, so an ill-formed
     # (degree >= n_pts) call fell through: the span search left k = degree, the
@@ -602,6 +771,16 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
     # out-of-bounds read resolving to a wild-pointer dereference rather than the
     # documented 0-on-invalid-input return.
     if (degree < 0) { return 0; }
+    # ⛔ 3.3.6 — THE COUNTS WRAPPED BEFORE THEY WERE COMPARED. degree = 2^63 - 1, n_pts = 1
+    # and n_knots = -2^63 + 1 passed both relations below, since degree + 1 and
+    # n_pts + degree + 1 wrap to exactly those values, and the read of knots[degree]
+    # exited 139. n_pts = 2^63 - 2 with degree = 1 and n_knots = -2^63 read t_max from the
+    # word 16 bytes before the knot array, and returned a point or exited 139 by what lay
+    # there. No knot array can hold a count that wraps, so such a call is refused before
+    # the relations are formed. A negative n_pts, which those relations refused unless
+    # degree + 1 wrapped, is refused first, so that 2^63 - 2 - n_pts cannot wrap either.
+    # [measured: scratch spline probes (p/hspl.cyr, p/hspl2.cyr), 3.3.5 tree and this tree, 2026-10-11; cycc 6.6.14]
+    if (degree > 0x7FFF_FFFF_FFFF_FFFE - n_pts) { return 0; }
     if (n_pts < degree + 1) { return 0; }
     if (n_knots != n_pts + degree + 1) { return 0; }
 
@@ -731,7 +910,7 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
 # knots: flat f64 array, n_knots: knot count, t: parameter value (f64).
 # Returns HVec3 pointer, or 0 if invalid.
 public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
-    if (n_pts == 0) { return 0; }
+    if (n_pts < 1) { return 0; }
     # A B-spline of degree d needs at least d+1 control points. Through 2.6.13
     # only `n_pts != 0` and the knot-count relation were checked, so an ill-formed
     # (degree >= n_pts) call fell through: the span search left k = degree, the
@@ -740,6 +919,10 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
     # out-of-bounds read resolving to a wild-pointer dereference rather than the
     # documented 0-on-invalid-input return.
     if (degree < 0) { return 0; }
+    # ⛔ 3.3.6 — calc_bspline's wrapping-count repair, on its pair (see there): the same
+    # degree = 2^63 - 1, n_pts = 1, n_knots = -2^63 + 1 exited 139 here too.
+    # [measured: scratch spline probes (p/hspl.cyr, p/hspl2.cyr), 3.3.5 tree and this tree, 2026-10-11; cycc 6.6.14]
+    if (degree > 0x7FFF_FFFF_FFFF_FFFE - n_pts) { return 0; }
     if (n_pts < degree + 1) { return 0; }
     if (n_knots != n_pts + degree + 1) { return 0; }
 
@@ -1492,10 +1675,11 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
             # test. That is exactly what happens at a local extremum in the data,
             # where ms[i] = (delta[i-1] + delta[i])/2 inherits the sign of the
             # LARGER neighbour and therefore opposes one of the two secants: on
-            # 60,000 random sets containing an extremum the interpolant left the
-            # [y_k, y_k+1] box on 58.6% of them, overshooting by up to 57.6 -- in
+            # 100,000 random sets containing an extremum the interpolant left the
+            # [y_k, y_k+1] box on 58,647 of them, overshooting by up to 57.6 -- in
             # the one function in this file whose entire contract is that it does
             # not do that.
+            # [measured: CHANGELOG.md 2.8.3, calc_monotone_cubic: 58,647 of 100,000 sets, overshoot up to 57.6]
             #
             # Zeroing the offending tangent is FC's own remedy and it also covers
             # the extremum pre-pass some presentations write separately: whichever
@@ -1506,6 +1690,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
             # Strictly monotone data has alpha, beta > 0 throughout, so this is a
             # no-op there -- verified bit-identical tangents on 60,000 strictly
             # monotone sets.
+            # [measured: CHANGELOG.md 2.8.3, calc_monotone_cubic entry: bit-identical on 60,000 strictly monotone sets]
             if (f64_lt(alpha, 0) == 1) {
                 _f64arr_set(ms, i, 0);
                 alpha = 0;
@@ -1738,6 +1923,7 @@ fn _calcx_perlin_cell(c) {
 # Certified the same way as perlin_2d (see src/calc.cyr): bit-exact point values
 # and 1728-sample L1 mass against an independent reference, plus the exact
 # multiple-of-1/8 cell-centre histogram over 512 cells.
+# [measured: tests/modules_b.tcyr, group "noise: perlin_2d / perlin_3d / simplex_2d / simplex_3d"]
 #
 # ⛔ 3.3.5 — PAST 2^63 THE CELL WAS THE TOOLCHAIN'S, as in perlin_2d (see there): a
 # positive coordinate of 2^63 or more hashed as cell 255 from cycc 6.6.8 and 0 under

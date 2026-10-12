@@ -186,6 +186,53 @@ fn _opt_axpy(dst, a, scale, b, n) {
     return 0;
 }
 
+# The power of two 2^m that opt_bfgs and opt_lbfgs multiply a correction pair (s, y) by
+# before its curvature test, given ns = ||s|| and ny = ||y||: m puts ns * ny in [1, 8)
+# (a subnormal norm is read as 2^-1023, below).
+# Returns 0 (leave the pair alone) when that product is already within [2^-511, 2^513),
+# and when either norm is zero, infinite or NaN, which no power of two can mend.
+#
+# ⛔ 3.3.6 — THE PAIR WAS TESTED AND INVERTED AT ITS OWN SCALE. s.y and ||s|| ||y|| go as
+# the square of the step, so near the minimum of a problem whose variables are below
+# about 2^-496 both fall under DBL_MIN: EPSILON_F64 * ||s|| ||y|| underflowed below a
+# still-positive s.y, the cosine test accepted the pair, and rho = 1 / s.y was +Inf.
+# f = (x0 - k)^2 + 1e5 (x1 - 2k)^2 from (-k/2, 5k/2), tol k * 1e-8, 400 iterations:
+# opt_bfgs returned Err(NO_CONVERGENCE) with NaN in out_x for every k = 2^-496 to
+# 2^-600, opt_lbfgs from 2^-497. At the other end opt_bfgs at k = 2^495 formed y.Hy past
+# DBL_MAX on its first update and returned NaN too. The BFGS update and the L-BFGS
+# recursion are invariant when s and y are multiplied by the same constant c (rho goes
+# as 1/c^2), so the pair is now taken at the scale where ||s|| ||y|| is about 1 when it
+# is far from it. Multiplying by a power of two is exact where nothing underflows or
+# overflows, so a pair this rescales gives the bits it gave unscaled wherever the
+# unscaled arithmetic stayed normal, and a pair in the band is not touched at all. On
+# that sweep both solvers now reach (k, 2k) for every k from 2^-1048 (below which the
+# fixture's tol underflows) to 2^520 but 2^511 (f(x0) overflows from 2^505); of 3.3.5's
+# right answers only those at k = 2^495 to 2^504 moved bits (still right), where its
+# unscaled y.y, y.Hy or ||s|| ||y|| overflowed.
+# [measured: scratch optimizer scale sweep, k = 2^-1074 to 2^520 x 3 solvers, 3.3.5 tree and this tree, 2026-10-11]
+fn _opt_pair_scale(ns, ny) {
+    if (f64_gt(ns, 0) == 0 || f64_gt(ny, 0) == 0) { return 0; }
+    if (f64_lt(ns, F64_POS_INF) == 0 || f64_lt(ny, F64_POS_INF) == 0) { return 0; }
+    # The exponent fields: a subnormal norm reads -1023, at most 51 short of its own
+    # exponent, which leaves the rescaled product at least 2^-102: normal, all it needs.
+    var e = ((ns >> 52) & 0x7FF) + ((ny >> 52) & 0x7FF) - 2046;
+    if (e >= 0 - 511 && e <= 511) { return 0; }
+    return 0 - (e - (e & 1)) / 2;              # -floor(e / 2): e + 2m is 0 or 1
+}
+
+# v *= 2^m, for |m| <= 1074, in two exact steps (each factor is a normal power of two).
+fn _opt_scale_pow2(v, n, m) {
+    var m1 = m / 2;
+    var f1 = (1023 + m1) << 52;
+    var f2 = (1023 + m - m1) << 52;
+    var i = 0;
+    while (i < n) {
+        store64(v + i * 8, f64_mul(f64_mul(load64(v + i * 8), f1), f2));
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Armijo backtracking line search.
 # Finds alpha such that f(x + alpha*d) <= f(x) + c1*alpha*(grad . d).
 # Writes x + alpha*d into x_trial.
@@ -548,6 +595,18 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
         }
 
         var sy = _opt_dot(s, y, n);
+        var ns = _opt_norm(s, n);
+        var ny = _opt_norm(y, n);
+        # A pair far from unit scale is rescaled first (_opt_pair_scale); the update below
+        # is invariant under it.
+        var pm = _opt_pair_scale(ns, ny);
+        if (pm != 0) {
+            _opt_scale_pow2(s, n, pm);
+            _opt_scale_pow2(y, n, pm);
+            sy = _opt_dot(s, y, n);
+            ns = _opt_norm(s, n);
+            ny = _opt_norm(y, n);
+        }
 
         # BFGS update of H_inv (skip if curvature condition fails)
         # ⭐ THE CURVATURE TEST IS A COSINE, SO ASK IT AS ONE. `sy` = s·y has units
@@ -562,8 +621,7 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
         # dimensionless, which is precisely the case error.cyr reserves
         # EPSILON_F64 for. The constant is unchanged; what changes is what it is
         # compared against. [measured: docs/audit/2026-09-09-epsilon-open.json]
-        if (f64_lt(f64_mul(EPSILON_F64, f64_mul(_opt_norm(s, n), _opt_norm(y, n))),
-            sy) == 1) {
+        if (f64_lt(f64_mul(EPSILON_F64, f64_mul(ns, ny)), sy) == 1) {
             var rho = f64_div(_OPT_F64_ONE, sy);
 
             # hy = H_inv * y
@@ -800,6 +858,18 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
         }
 
         var sy = _opt_dot(s_k, y_k, n);
+        var ns = _opt_norm(s_k, n);
+        var ny = _opt_norm(y_k, n);
+        # A pair far from unit scale is stored rescaled (_opt_pair_scale); the two-loop
+        # recursion is invariant under it, pair by pair.
+        var pm = _opt_pair_scale(ns, ny);
+        if (pm != 0) {
+            _opt_scale_pow2(s_k, n, pm);
+            _opt_scale_pow2(y_k, n, pm);
+            sy = _opt_dot(s_k, y_k, n);
+            ns = _opt_norm(s_k, n);
+            ny = _opt_norm(y_k, n);
+        }
 
         # ⭐ THE CURVATURE TEST IS A COSINE, SO ASK IT AS ONE. `sy` = s·y has units
         # [f], so an absolute 1e-12 rejected or accepted the same geometry
@@ -813,8 +883,7 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
         # dimensionless, which is precisely the case error.cyr reserves
         # EPSILON_F64 for. The constant is unchanged; what changes is what it is
         # compared against. [measured: docs/audit/2026-09-09-epsilon-open.json]
-        if (f64_lt(f64_mul(EPSILON_F64, f64_mul(_opt_norm(s_k, n), _opt_norm(y_k, n))),
-            sy) == 1) {
+        if (f64_lt(f64_mul(EPSILON_F64, f64_mul(ns, ny)), sy) == 1) {
             var slot_wr = hist + head * slot_size;
             _opt_copy(slot_wr, s_k, n);
             _opt_copy(slot_wr + n * 8, y_k, n);
@@ -883,6 +952,7 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
     # (jtj by the JtJ fill, rhs by the negation loop, lu/piv by ganita_mat_lu), so
     # reusing them is safe; in particular the `+lambda` added to jtj's diagonal
     # cannot accumulate because the fill rewrites every element first.
+    # [measured: docs/audit/2026-08-03.md, the src/optimize.cyr:628 Levenberg-Marquardt performance row]
     var jtj = ganita_mat_new(np, np);
     var lu  = ganita_mat_new(np, np);
     var rhs = alloc(np * 8);

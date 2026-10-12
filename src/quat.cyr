@@ -293,9 +293,130 @@ public fn hquat_inverse(q) {
 }
 
 # ================================================================
-# Rotate a Vec3: q * v * q^-1 (optimized)
+# Rotate a Vec3: v + w t + u x t with u = q.xyz and t = 2 u x v, the unit-quaternion form of
+# q v q^-1 -- a rotation only for a unit q (3.3.6: for any other q it is neither q v q^-1 nor
+# q v q* at any scale; q = (0.154, 3.32, 3.86, -15.2) takes (1, 1, -1) to (166.8, -175.0,
+# 144.2), against q v q^-1 = (1.65, 0.31, -0.43) and q v q* = (421.8, 80.0, -110.8))
 # ================================================================
 
+# x * 2^k, rounded once, for |k| <= 2096. Upward every step is exact or overflows. Downward
+# the remainder goes first, so each step before the last is exact, or is subnormal and the
+# steps after it end at a zero, as x * 2^k rounds to.
+fn _hquat_ldexp(x, k) {
+    while (k > 1023) { x = f64_mul(x, (1023 + 1023) << 52); k = k - 1023; }
+    if (k >= 0) { return f64_mul(x, (1023 + k) << 52); }
+    var m = (0 - k) / 1022;
+    x = f64_mul(x, (1023 - ((0 - k) - m * 1022)) << 52);
+    while (m > 0) { x = f64_mul(x, 0x0010000000000000); m = m - 1; }   # 2^-1022
+    return x;
+}
+
+# `hquat_rotate_vec3` after an intermediate overflowed: rotate v * 2^-k, scale back by 2^k.
+# NaN and Inf inputs return the fast path's answer, as through 3.3.5. With every |q_i| below
+# Q = 2^(eq + 1) and every |v_i| below V, each intermediate of the formula is below
+# V + 12 Q^2 V, at most 16 Q^2 V once Q >= 1/2, so V <= 2^(1017 - 2 eq) keeps all of them at
+# or under 2^1023, a factor 2 below overflow; a q whose largest component is under 1/4 is
+# bounded as eq = -2. An overflow means v broke that bound, so k >= 1 and the copy cannot
+# overflow: the call below recurses exactly once.
+# The copy is exact unless a component of v falls below 2^(k - 1022), where it loses its low
+# bits or all of them: under a half turn about z (|q| = 1, k = 7) a subnormal v.z beside
+# 2^1023 keeps its bits only with seven trailing zero bits (4 of the 11,338 sweep inputs that
+# took this path, outside the formula's own error bound; 3.3.5: NaN for all 4), and with
+# q's components spanning 2^256 or more, k passes 1022 plus the exponent of ordinary
+# components, which vanish from the copy. Only the components the fast path made non-finite
+# are taken from the copy, and only when what the copy lost cannot reach its answer (below).
+# [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+fn _hquat_rotate_wide(q, v, rx, ry, rz) {
+    var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
+    var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
+    if (f64_lt(f64_abs(qx), F64_POS_INF) == 0 || f64_lt(f64_abs(qy), F64_POS_INF) == 0
+      || f64_lt(f64_abs(qz), F64_POS_INF) == 0 || f64_lt(f64_abs(qw), F64_POS_INF) == 0
+      || f64_lt(f64_abs(vx), F64_POS_INF) == 0 || f64_lt(f64_abs(vy), F64_POS_INF) == 0
+      || f64_lt(f64_abs(vz), F64_POS_INF) == 0) {
+        return hvec3_new(rx, ry, rz);
+    }
+    var mv = f64_abs(vx);
+    if (f64_abs(vy) > mv) { mv = f64_abs(vy); }
+    if (f64_abs(vz) > mv) { mv = f64_abs(vz); }
+    var mq = f64_abs(qx);
+    if (f64_abs(qy) > mq) { mq = f64_abs(qy); }
+    if (f64_abs(qz) > mq) { mq = f64_abs(qz); }
+    if (f64_abs(qw) > mq) { mq = f64_abs(qw); }
+    var eq = (mq >> 52) - 1023;
+    if (eq < 0 - 2) { eq = 0 - 2; }
+    var k = (mv >> 52) - 1023 - 1016 + 2 * eq;
+    var wx = _hquat_ldexp(vx, 0 - k);
+    var wy = _hquat_ldexp(vy, 0 - k);
+    var wz = _hquat_ldexp(vz, 0 - k);
+    var s = hquat_rotate_vec3(q, hvec3_new(wx, wy, wz));
+    var cx = _hquat_ldexp(HVec3_x(s), k);
+    var cy = _hquat_ldexp(HVec3_y(s), k);
+    var cz = _hquat_ldexp(HVec3_z(s), k);
+    # The copy is trusted only where what it lost cannot reach its answer: l = v - (v 2^-k) 2^k,
+    # the bits of v the scaling dropped (exact), reaches at most 2^(e(max |l|) + 2 eq + 10)
+    # through the formula, and the copy's own subnormal rounding 2^(k - 1074 + eq + 4); its
+    # components are taken only when the larger of the two sits more than 56 binades below
+    # the copy's largest component. Otherwise the fast path's +-Inf stands (a NaN from it is
+    # replaced either way). Through round 2 of 3.3.6 the copy's components were taken
+    # whenever the fast path's were not finite, and on q whose components span 2^256 or more
+    # (largest nonzero over smallest nonzero) a component whose exact value overflows read
+    # finite from a copy that had lost v's smaller components, or an infinity of the wrong
+    # sign: q = (0, 1.59, -1.4e289, 0.377), v = (1.4e-226, 1, -0) has x near -2^1226, which
+    # 3.3.5 gave as -Inf and round 2 as 1.1e296. (The test is the round-2 review's, checked
+    # against its Python model on 360,000 inputs.)
+    # [measured: review rotation family (rot_T4norm), C2 seeds 301/302, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
+    var ml = f64_abs(f64_sub(vx, _hquat_ldexp(wx, k)));
+    var l2 = f64_abs(f64_sub(vy, _hquat_ldexp(wy, k)));
+    if (l2 > ml) { ml = l2; }
+    var l3 = f64_abs(f64_sub(vz, _hquat_ldexp(wz, k)));
+    if (l3 > ml) { ml = l3; }
+    var lim = k - 1074 + eq + 4;
+    if (ml != 0) {
+        var ll = (ml >> 52) - 1023 + 2 * eq + 10;
+        if (ll > lim) { lim = ll; }
+    }
+    var en = f64_abs(cx);
+    if (f64_abs(cy) > en) { en = f64_abs(cy); }
+    if (f64_abs(cz) > en) { en = f64_abs(cz); }
+    var take = 0;
+    if ((en >> 52) - 1023 - 56 > lim) { take = 1; }
+    # A component the fast path formed finite is kept: only the non-finite ones are replaced.
+    var sx = rx;
+    var sy = ry;
+    var sz = rz;
+    if (f64_lt(f64_abs(rx), F64_POS_INF) == 0) { if (take == 1 || f64_eq(rx, rx) == 0) { sx = cx; } }
+    if (f64_lt(f64_abs(ry), F64_POS_INF) == 0) { if (take == 1 || f64_eq(ry, ry) == 0) { sy = cy; } }
+    if (f64_lt(f64_abs(rz), F64_POS_INF) == 0) { if (take == 1 || f64_eq(rz, rz) == 0) { sz = cz; } }
+    return hvec3_new(sx, sy, sz);
+}
+
+# ⛔ 3.3.5 — t = 2 q x v AND THE SUMS AFTER IT OVERFLOWED FOR |v| NEAR DBL_MAX. t is about
+# 2 |q| |v| and q x t about 2 |q|^2 |v|, so the formula needs headroom its answer does not: a
+# half turn about z of (2^1023, 0, 0) came back (-Inf, NaN, NaN), not (-2^1023, 0, 0). On
+# 131,405 sweep inputs (unit, axis, near-identity and non-unit q; v at every binade, the top
+# ones densely) 3.3.5 put an Inf or NaN in 11,338 answers for finite input. 10,583 were wrong
+# and are now right; 747 overflow honestly and keep their bits; 4 had an exact component of
+# +-DBL_MAX that came back +-Inf (now 1 ulp inside); 4 are in `_hquat_rotate_wide`'s comment.
+# ⭐ Only an overflow makes an Inf or NaN from finite input, and every t component reaches
+# every answer component, so the test below sees any of them; only then does
+# `_hquat_rotate_wide` rerun the formula on v * 2^-k, and only the components that came out
+# non-finite are replaced. Every answer that was finite keeps the fast path and its bits
+# (117,067 of 117,067), NaN and Inf inputs keep theirs (3,000 of 3,000), none of the sweep's
+# inputs went from right to wrong, and a rerun gives 3.3.5's answer at v * 2^-8 times 2^8 on
+# all 29,766 sweep inputs where that answer is finite (3,154 of them overflowed at v in 3.3.5).
+# (Those counts are sub-lane A's sweep; an answer is right when each component is within 8 ulp
+# of the exact formula's largest finite component.)
+# [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+# ⚠ AND WHERE q's COMPONENTS SPAN 2^256 OR MORE (largest nonzero over smallest nonzero). On a
+# broader family (150,000 inputs per seed: unit, axis, random and non-unit q, |q| from 2^-600
+# to 2^500 times a unit one, v at every scale), with a component right when it is within 8
+# ulp of the largest finite exact component, or is the +-Inf of its sign (+-DBL_MAX within
+# 2^970) where its exact value overflows, round 2 of 3.3.6 took 1,874 answers from right to
+# wrong, every one in that class: a component whose exact value overflows read finite, or an
+# infinity of the wrong sign, from the copy that had lost v's smaller components. With the
+# trust test in `_hquat_rotate_wide` none goes from right to wrong on seeds 301 and 302,
+# against 22,591 and 22,247 wrong -> right.
+# [measured: C2 review rotation family (rotm4, rotrw), seeds 301, 302; 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
 #must_use
 public fn hquat_rotate_vec3(q, v) {
     var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
@@ -305,11 +426,17 @@ public fn hquat_rotate_vec3(q, v) {
     var ty = f64_mul(F64_TWO, f64_sub(f64_mul(qz, vx), f64_mul(qx, vz)));
     var tz = f64_mul(F64_TWO, f64_sub(f64_mul(qx, vy), f64_mul(qy, vx)));
     # result = v + w*t + cross(q.xyz, t)
-    return hvec3_new(
-      f64_add(f64_add(vx, f64_mul(qw, tx)), f64_sub(f64_mul(qy, tz), f64_mul(qz, ty))),
-      f64_add(f64_add(vy, f64_mul(qw, ty)), f64_sub(f64_mul(qz, tx), f64_mul(qx, tz))),
-      f64_add(f64_add(vz, f64_mul(qw, tz)), f64_sub(f64_mul(qx, ty), f64_mul(qy, tx)))
-      );
+    var rx = f64_add(f64_add(vx, f64_mul(qw, tx)), f64_sub(f64_mul(qy, tz), f64_mul(qz, ty)));
+    var ry = f64_add(f64_add(vy, f64_mul(qw, ty)), f64_sub(f64_mul(qz, tx), f64_mul(qx, tz)));
+    var rz = f64_add(f64_add(vz, f64_mul(qw, tz)), f64_sub(f64_mul(qx, ty), f64_mul(qy, tx)));
+    # One test on rx + ry + rz, non-finite whenever a component is (a finite sum that
+    # overflows only sends the three finite components to _hquat_rotate_wide, which keeps
+    # them), in place of a test per component on the fast path; an integer test of the bits
+    # (+-Inf and NaN are the patterns from 0x7FF0... up, sign cleared).
+    if ((f64_add(f64_add(rx, ry), rz) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) {
+        return _hquat_rotate_wide(q, v, rx, ry, rz);
+    }
+    return hvec3_new(rx, ry, rz);
 }
 
 # ================================================================

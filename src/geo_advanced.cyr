@@ -110,6 +110,20 @@ public var EPA_MAX_ITER = 64;
 #
 # This returns the farthest point on the shape in the given direction.
 # GJK works on the Minkowski difference: support_A(d) - support_B(-d).
+#
+# ⚠ ACCURACY PREMISE (since 3.3.6). Every point a support function returns is taken to lie
+# within 2^-46 of the largest |coordinate| of its shape (or 16 subnormal steps, if that
+# is more) of a true support point of the shape: a few ulp, as a support computed directly
+# from the shape's centre and extents is. gjk_intersect_3d and gjk_epa_3d (and so
+# time_of_impact's overlap test at t = 0, and mpr_intersect where its portal fails) call a
+# cycling, near-tangent pair a contact when an enclosure of the origin is proved under
+# that premise (_epa_encloses). A support noisier than that can prove an overlap that is
+# not there. A sphere support computed through an intermediate K (c + K + r n - K, an
+# absolute error of about K ulp) against 960 separated sphere pairs 1e-13 to 1e-9 of the
+# radii apart: for K = 2^8 / 2^12 / 2^16 / 2^20 / 2^26, 0 / 8 / 97 / 180 / 174 of them are
+# contacts to gjk_intersect_3d and gjk_epa_3d that 3.3.5 answered as misses; mpr_* answer
+# as in 3.3.5. Within the premise no separated pair became a contact (see _epa_encloses).
+# [measured: review-D336 sloppy.py, 960 separated pairs per K, D336 rerun on 3.3.5 and this tree, 2026-10-11]
 
 # ⛔ 3.3.4 — THE FIVE ENTRY POINTS DISAGREED ON A NON-FINITE SHAPE. A NaN in a centre,
 # a radius or a half-extent was a miss from all of them, but a support that was NaN
@@ -657,9 +671,9 @@ fn _gjk_core_3d(sup_a, shape_a, sup_b, shape_b) {
 # as the support evaluation feeding it. `support_M(n)` is computed in f64, so at
 # large coordinate magnitudes its absolute error grows with the scale -- around
 # 1e-9 at radius ~5e6 -- and a genuinely TANGENT pair can hand back a slightly
-# negative dot. Measured: 5 of 2,440 evaluations at scale 2^20 (sphere/sphere,
-# off-axis triple tangency, one operand order) are certified apart when they
-# touch. That direction is the safe one -- this gate can only ever SKIP the
+# negative dot (2.9.0 recorded such tangent pairs certified apart at scale 2^20;
+# the 2026-09-30 audit could not reproduce that count, so no count is given
+# here). That direction is the safe one -- this gate can only ever SKIP the
 # probe, so its failure mode is a MISSED touch, never a false contact -- and it
 # is the pre-2.9.0 answer for those fixtures, not a regression. But do not read
 # "exact" as "correct at every scale": it is not, and the residual is recorded
@@ -702,6 +716,7 @@ fn _gjk_certifies_apart(sup_a, shape_a, sup_b, shape_b, dir) {
 # genuine INTERIOR overlap, all of them at scale 2^-20 and all in the two
 # families whose support function normalises (see below): gjk_intersect_3d was
 # reporting "apart" for shapes that provably overlap.
+# [measured: CHANGELOG.md 2.9.0, "141 of 3,012 pair evaluations disagreed" over 1,506 configurations, 66 interior]
 #
 # THE REPAIR IS GATED, and the gate is the whole design. Running
 # _epa_touch_probe on every no-hit return -- the obvious repair -- was built and
@@ -714,6 +729,7 @@ fn _gjk_certifies_apart(sup_a, shape_a, sup_b, shape_b, dir) {
 # When it holds, the pair is apart and the probe is skipped. Same fixtures, same
 # binary: box/box 531 -> 766 ns/call (+44%), sphere/sphere 901 -> 1353 (+50%),
 # sphere/box 685 -> 1039 (+52%).
+# [measured: CHANGELOG.md 2.9.0 Performance, the same-binary batch timings, both sets of three]
 #
 # THOSE THREE RATIOS ARE UNDERSTATED, and 2.9.0's corrected figure was +50% to
 # +63%, median +55%: the same-binary harness above never calls alloc_reset, so the
@@ -748,7 +764,12 @@ fn _gjk_certifies_apart(sup_a, shape_a, sup_b, shape_b, dir) {
 # ⚠ Since 3.3.4 that holds for the gate only. The cycling fallback in
 # _gjk_intersect_core is a second way to a 1, on an exit with no certificate, and
 # the portal it asks is not a proof: it answers 1 only when EPA refines a depth above
-# 1e-9 of |s(x) - s(-x)| from that portal (_gjk_portal_deep).
+# 1e-9 of |s(x) - s(-x)| from that portal (_gjk_portal_deep), or, since 3.3.6, when an
+# enclosure of the origin is proved from support points (_epa_encloses, _ga_tetra_proves).
+# ⚠ That proof rests on the support functions' accuracy: every point they return within
+# 2^-46 of the shape's largest |coordinate| of the true set (the ACCURACY PREMISE at the
+# head of this section, with what a noisier support does to it).
+# [measured: CHANGELOG.md 2.9.0, "0 false positives across 2,214 exactly-separated evaluations"]
 public fn gjk_intersect_3d(support_a, shape_a, support_b, shape_b) {
     var k0 = _GA_SUP_NONFINITE;
     var k1 = _GA_MINK_S;
@@ -795,10 +816,14 @@ fn _gjk_intersect_core(support_a, shape_a, support_b, shape_b) {
     # separated sphere/capsule pairs 1e-12 apart contacts (5 -> 50 of 466); with the
     # depth condition the separated sweeps give the base's answers.
     # [measured: separated near-tangent sweeps vs an exact separating plane, base and tree, 2026-10-03; cycc 6.6.14]
+    # ⭐ 3.3.6 — and a portal whose depth is below that is a contact when its EPA polytope
+    # proves the origin enclosed (_gjk_portal_deep returns 2; see _epa_encloses).
+    var pd = 0;
     if (load64(exit_dir) == 0) {
         var pseed = alloc(32);
         if (pseed == 0) { return 0; }
-        if (_gjk_portal_deep(support_a, shape_a, support_b, shape_b, pseed) == 1) { return 1; }
+        pd = _gjk_portal_deep(support_a, shape_a, support_b, shape_b, pseed);
+        if (pd == 1 || pd == 2) { return 1; }
     }
     if (_gjk_certifies_apart(support_a, shape_a, support_b, shape_b, load64(exit_dir)) == 1) {
         return 0;
@@ -809,16 +834,26 @@ fn _gjk_intersect_core(support_a, shape_a, support_b, shape_b) {
     # with the same exact touch certificate gjk_epa_3d uses.
     var touch_n = alloc(8);
     if (touch_n == 0) { return 0; }
-    return _epa_touch_probe(support_a, shape_a, support_b, shape_b, touch_n);
+    if (_epa_touch_probe(support_a, shape_a, support_b, shape_b, touch_n) == 1) { return 1; }
+    # ⭐ 3.3.6 — a portal that proved nothing leaves the distance query's tetrahedron
+    # (_ga_inside_proven), the second certificate of an enclosure.
+    if (pd != 3) { return 0; }
+    var pin = alloc(32);
+    if (pin == 0) { return 0; }
+    return _ga_inside_proven(support_a, shape_a, support_b, shape_b, pin);
 }
 
-# The cycling fallback's portal, accepted only when the depth EPA refines from it
-# exceeds the contact tolerance of the difference's x-extent. Near a tangency the
-# portal's sliver faces can "enclose" an origin that lies outside: sphere/capsule
-# pairs 1e-12 apart came back as contacts of depth up to 4.9e-10.
+# The cycling fallback's portal, written to seed. Returns 0 when there is none, 1 when
+# the depth EPA refines from it exceeds the contact tolerance of the difference's
+# x-extent, 2 when it is shallower but that EPA run proved the origin enclosed
+# (_epa_encloses; not tried on a nudged portal, _GA_PORTAL_NUDGED), 3 when it is neither.
+# Near a tangency the portal's sliver faces can "enclose" an origin that lies outside:
+# sphere/capsule pairs 1e-12 apart came back as contacts of depth up to 4.9e-10, which is
+# why a depth alone is taken only above the tolerance.
 # [measured: separated near-tangent sweep vs an exact separating plane, 2026-10-03; cycc 6.6.14]
 fn _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed) {
     if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) != 1) { return 0; }
+    var nudged = _GA_PORTAL_NUDGED;
     var px = _gjk_mink_support(support_a, shape_a, support_b, shape_b, hvec3_unit_x());
     var nx = _gjk_mink_support(support_a, shape_a, support_b, shape_b, hvec3_neg(hvec3_unit_x()));
     var lim = f64_mul(hvec3_length(hvec3_sub(px, nx)), _GA_TOI_TOL_REL);
@@ -828,8 +863,14 @@ fn _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed) {
     var ns = alloc(8);
     var ds = alloc(8);
     if (ns == 0 || ds == 0) { return 0; }
-    if (_epa_refine(support_a, shape_a, support_b, shape_b, s2, ns, ds) != 1) { return 0; }
-    return f64_gt(load64(ds), lim);
+    var kp = _GA_EPA_PROVE;
+    _GA_EPA_PROVE = 1 - nudged;
+    var rr = _epa_refine(support_a, shape_a, support_b, shape_b, s2, ns, ds);
+    _GA_EPA_PROVE = kp;
+    if (rr != 1) { return 0; }
+    if (f64_gt(load64(ds), lim) == 1) { return 1; }
+    if (_GA_EPA_PROVEN == 1) { return 2; }
+    return 3;
 }
 
 # --- EPA 3D (Expanding Polytope Algorithm) ---
@@ -843,6 +884,7 @@ fn _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed) {
 # 2.9.0 REWRITE. Three defects, each measured against an exact reference
 # (15-axis OBB SAT for box/box in rationals, r0+r1-|c1-c0| for sphere/sphere,
 # r-sdBox(c,h) for sphere/box) over a 455-configuration sweep:
+# [measured: CHANGELOG.md 2.8.3, the narrowphase agreement table (before: of 455)]
 #
 #   1. THE LOOP HAD A FIXED POINT INSTEAD OF A LIMIT. `_epa_face_normal_dist`
 #      flipped a face normal whenever the plane distance came out negative, to
@@ -854,6 +896,7 @@ fn _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed) {
 #      the 64-iteration cap and still only 1.9794 at 400 -- not iteration
 #      starvation, a stall. Every face record now carries ONE oriented normal and
 #      both the min-search and the visibility test read that single field.
+#      [measured: tests/modules.tcyr "gjk_epa_3d: concentric unit spheres depth == 2.0 (was 1.8875)"]
 #
 #   2. THE CONVERGENCE TEST WAS ABSOLUTE. `|d - dist| < EPSILON_F64` (1e-12) is
 #      unreachable at scene scale 1e3 and is met far too early at 1e-3; the same
@@ -866,12 +909,14 @@ fn _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed) {
 #      and the loop stops when the gap closes to a RELATIVE tolerance. best_d is
 #      what gets returned, so the reported depth is always a translation that
 #      genuinely separates -- returning the face distance can under-separate.
+#      [measured: scratch print, 2.8.3; tests/modules.tcyr "sphere depth is scale-invariant" asserts only the repair]
 #
 #   3. A DEGENERATE GJK SIMPLEX WAS REPORTED AS "no penetration". The old code
 #      bailed with 0 once the seed tetrahedron's volume fell under 1e-12, leaving
 #      both out-params unwritten for shapes that provably overlap: box(h=1,1,1)
 #      vs sphere(c=(1.2,0,0.7), r=1), exact depth 0.8, came back 2.2e-16. A
 #      rejected seed now falls back to the Minkowski portal construction.
+#      [measured: tests/modules.tcyr "gjk_epa_3d: box vs sphere depth == 0.8 = r - sdBox (was 2.2e-16)"]
 #
 # DELIBERATELY NOT CHANGED: the visible set is still found by a FULL SCAN over
 # every live face. The 2.8.2 heap + flood-fill rewrite was rejected because the
@@ -997,7 +1042,9 @@ fn _epa_perp(v) {
 # The origin-based repair is applied only for a STRICTLY negative distance, so a
 # face that legitimately passes through the origin -- a touching contact -- keeps
 # its winding instead of being flipped on the sign of a rounding error.
-# Returns 1 for a usable plane, 0 for a zero-area triangle.
+# Returns 1 for a usable plane, 0 for a zero-area triangle, and 2 for a usable plane
+# that the repair flipped against the winding it inherited (_epa_refine then no longer
+# holds a consistently wound surface, which _epa_encloses needs).
 fn _epa_face_set(fbuf, fi, verts, i0, i1, i2, iref) {
     var base = fbuf + fi * _EPA_FACE_SIZE;
     var a = load64(verts + i0 * 8);
@@ -1034,6 +1081,7 @@ fn _epa_face_set(fbuf, fi, verts, i0, i1, i2, iref) {
     store64(base + 24, nrm);
     store64(base + 32, hvec3_dot(nrm, a));
     store64(base + 40, 1);
+    if (flip == 1 && iref < 0) { return 2; }
     return 1;
 }
 
@@ -1114,6 +1162,9 @@ fn _epa_tetra_ok(seed) {
 var _GA_TETRA_LMAX = 0;
 var _GA_TETRA_GAP = 0;
 var _GA_TETRA_NAN = 0;
+# The enclosing tetrahedron of the last _toi_near_point that reported the origin inside
+# on one, else 0 (see _toi_near_point).
+var _GA_NEAR_TETRA = 0;
 
 # The smaller of a and b, a NaN left out (the other answered).
 fn _ga_min_gap(a, b) {
@@ -1167,11 +1218,13 @@ fn _epa_seed_portal(sup_a, shape_a, sup_b, shape_b, out4) {
     var v0 = hvec3_scale(hvec3_add(px, nx), F64_HALF);
     var scale = hvec3_length(hvec3_sub(px, nx));
     if (f64_gt(scale, 0) == 0) { return 0; }
+    var nud = 0;
     if (f64_le(hvec3_length(v0), f64_mul(EPSILON_F64, scale)) == 1) {
         # v0 IS the origin, so the ray v0 -> origin has no direction. Nudge the
         # interior point rather than the ray: a millionth of the body's own
         # extent cannot leave a body whose x-midpoint is the origin.
         v0 = hvec3_new(f64_mul(_GA_F64_1EM6, scale), 0, 0);
+        nud = 1;
     }
 
     var dir = _epa_unit(hvec3_neg(v0));
@@ -1260,6 +1313,7 @@ fn _epa_seed_portal(sup_a, shape_a, sup_b, shape_b, out4) {
     # 4.0). Swapping v0 for the support point OPPOSITE the portal replaces it with
     # a fourth boundary point and puts the origin strictly inside. Kept only if it
     # really does enclose the origin; otherwise the original portal stands.
+    # [measured: scratch harness, not reproducible in-tree, 2.8.3]
     var pn = _epa_unit(hvec3_cross(hvec3_sub(v2, v1), hvec3_sub(v3, v1)));
     if (f64_gt(hvec3_length_sq(pn), 0) == 1) {
         if (f64_lt(hvec3_dot(pn, hvec3_sub(v1, v0)), 0) == 1) { pn = hvec3_neg(pn); }
@@ -1268,14 +1322,24 @@ fn _epa_seed_portal(sup_a, shape_a, sup_b, shape_b, out4) {
         store64(out4 + 8, v1);
         store64(out4 + 16, v2);
         store64(out4 + 24, v3);
-        if (_epa_tetra_strict(out4) == 1) { return 1; }
+        if (_epa_tetra_strict(out4) == 1) {
+            _GA_PORTAL_NUDGED = 0;
+            return 1;
+        }
     }
     store64(out4, v0);
     store64(out4 + 8, v1);
     store64(out4 + 16, v2);
     store64(out4 + 24, v3);
+    _GA_PORTAL_NUDGED = nud;
     return _epa_tetra_ok(out4);
 }
+
+# 1 when the portal _epa_seed_portal just returned keeps the nudged interior point as
+# its first vertex: a point placed, not a support point, so not known to lie in A (-) B,
+# and no enclosure is proved on it (_gjk_portal_deep). Written after the last support
+# call, so a support function that runs its own query cannot change it before it is read.
+var _GA_PORTAL_NUDGED = 0;
 
 # Local pattern search on the DIRECTION, run only when the expansion loop ran out
 # of iterations without closing its certificate.
@@ -1331,10 +1395,19 @@ fn _epa_polish(sup_a, shape_a, sup_b, shape_b, n0, d0, out_normal, out_depth) {
     var pk = alloc(64);
     if (pk == 0) { return 0; }
     var step = _GA_F64_QUARTER;  # start at 0.25 rad
-    for (var it = 0; it < _EPA_POLISH_ITER; it = it + 1) {
+    # cap: the round budget, doubled once (ext) when it runs out still moving; rho: 0,
+    # then the sufficient decrease of the second budget's rounds (see below); wid: the
+    # width of A (-) B along n0, taken where rho is set or after the search.
+    var cap = _EPA_POLISH_ITER;
+    var ext = 0;
+    var rho = 0;
+    var wid = 0;
+    var it = 0;
+    while (it < cap) {
         var u = _epa_perp(n);
         var v = hvec3_cross(n, u);
         var moved = 0;
+        var dst = d;
         for (var k = 0; k < 4; k = k + 1) {
             var t = u;
             if (k == 1) { t = hvec3_neg(u); }
@@ -1355,9 +1428,35 @@ fn _epa_polish(sup_a, shape_a, sup_b, shape_b, n0, d0, out_normal, out_depth) {
                 }
             }
         }
+        # A round of the second budget whose moves lowered h by less than rho step^2
+        # counts as a round that found nothing, and halves the step.
+        if (moved == 1 && ext == 1) {
+            if (f64_lt(f64_sub(dst, d), f64_mul(rho, f64_mul(step, step))) == 1) { moved = 0; }
+        }
         if (moved == 0) {
             step = f64_mul(step, F64_HALF);
             if (f64_lt(step, EPSILON_F64) == 1) { break; }
+        }
+        it = it + 1;
+        # ⛔ 3.3.6 — THE SEARCH COULD STALL WHILE STILL MOVING. u and v are rebuilt from n
+        # every round, so the four steps never lie on one lattice, and near a smooth minimum
+        # a move can lower h by ever less without the step ever halving: a small sphere
+        # deep in a large one (radii 0.49 and 8.36, centres 1.2 apart) ran out its 128
+        # rounds at step 0.125 and 0.062 rad from the minimum, mpr_penetration's depth
+        # 3.07e-4 too deep, and gjk_epa_3d's up to 6.8e-6 on that family.
+        # [measured: D336 trace of the roadmap pair, G2 wide depth family (4,000), 3.3.5 tree, 2026-10-11; cycc 6.6.14]
+        # ⭐ So a search the cap stops still moving gets a second budget in which a round
+        # must also lower h by rho step^2, rho = 2^-10 times the width of A (-) B along n0
+        # (sufficient decrease, the standard cure for a pattern search whose directions are
+        # not on a lattice). Where 3.3.5 stopped before its cap nothing changes; where it
+        # was cut off, every second-budget move lowers h further.
+        if (it == cap && moved == 1 && ext == 0) {
+            ext = 1;
+            cap = cap + _EPA_POLISH_ITER;
+            var wp0 = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, n0);
+            var wn0 = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_neg(n0));
+            wid = hvec3_length(hvec3_sub(wp0, wn0));
+            rho = f64_mul(wid, 0x3F50000000000000);  # 2^-10
         }
     }
     store64(out_normal, n);
@@ -1368,9 +1467,11 @@ fn _epa_polish(sup_a, shape_a, sup_b, shape_b, n0, d0, out_normal, out_depth) {
     # whatever the step) from a smooth patch (a move of at most the step times the width
     # w of A (-) B along n0) and stops at once on the latter.
     if (pn == 0) { pn = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, n); }
-    var wp = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, n0);
-    var wn = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_neg(n0));
-    var wid = hvec3_length(hvec3_sub(wp, wn));
+    if (ext == 0) {
+        var wp = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, n0);
+        var wn = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_neg(n0));
+        wid = hvec3_length(hvec3_sub(wp, wn));
+    }
     var jb = -1;
     var jl = 0;
     for (var j = 0; j < 4; j = j + 1) {
@@ -1530,6 +1631,192 @@ fn _epa_crease_take(br, n, d, pn) {
     return 0;
 }
 
+# --- Proving that A (-) B contains the origin ----------------------------------------
+#
+# ⛔ 3.3.6 — gjk_intersect_3d AND gjk_epa_3d MISSED SHALLOW OVERLAPS THAT mpr_* FOUND.
+# Near a tangency GJK's simplex can cycle with no tetrahedron enclosing the origin and no
+# direction separating it. That exit asks the portal (_gjk_portal_deep), whose contact was
+# taken only when the depth EPA refines from it exceeds 1e-9 of the x-span, and then the
+# touch probe, which finds no touch: the answer was a miss. Of 100 sphere pairs
+# overlapping by 1e-9 / 1e-11 / 1e-12 / 1e-13 of (ra + rb), 30 / 78 / 89 / 99 were
+# missed, and of 100 capsule/sphere pairs 3 / 10 / 28 / 39; at 1e-9 the overlap is ~5e6
+# ulp. Taking EPA's own two-sided certificate instead is no proof either: on separated
+# capsule/sphere pairs 1e-12 to 1e-14 apart its lower bound certified depths up to 4.8e-10.
+# [measured: D336 near-tangent family (fam1, 3,900 pairs) and EPA trace on the 3.3.5 tree, 2026-10-11; cycc 6.6.14]
+# ⭐ So an enclosure is PROVED where the support points allow it:
+#   * a closed surface wound outward whose every face has the origin on its inner side
+#     subtends a positive solid angle at each face, so it winds around the origin at
+#     least once, and the origin lies in the convex hull of its vertices;
+#   * each vertex is a support point and carries its support function's rounding, taken
+#     to be at most 2^-46 of the largest |coordinate| of A and B (_ga_proof_margin: the
+#     margin mpr_* already demand of a refutation), so a face counts only when its plane
+#     distance exceeds that distance's own rounding plus the most a move of every vertex
+#     by the margin can change it (_epa_face_clear).
+# The surface is EPA's polytope grown from the portal, which _epa_refine keeps track of
+# as closed and outward-wound (_epa_encloses), or else the tetrahedron the distance query
+# stops on when it reports the origin inside (_ga_tetra_proves). An overlap below the
+# margin is not proved and keeps its 3.3.5 answer, and no proof is attempted on a portal
+# built round a nudged interior point (_GA_PORTAL_NUDGED) or during an aspect
+# confirmation (_GA_MINK_AXES), whose mapped difference has no single coordinate scale.
+# Of the same pairs 0 / 0 / 2 / 5 spheres and 0 / 1 / 7 / 26 capsules are now missed (at
+# 1e-14 of the radii, under the margin, 98 and 58 of 100 still are). No separated pair
+# became a contact over those 3,900 and a further 28,800 near-tangent pairs (spheres,
+# capsules, boxes, box edges and corners, 1e-15 to 3e-9 apart or deep, offsets to 3e6,
+# scales 2^0 and 2^+-300).
+# [measured: D336 fam1 (3,900) and sound (28,800) vs the 3.3.5 tag, exact classes, 2026-10-11; cycc 6.6.14]
+# ⚠ NOT FREE, in support calls against 3.3.5 on those 28,800: separated sphere pairs
+# +0.0% at the origin, +3.4% about 1e3 and +4.5% about 3e6 away (where GJK cycles and
+# the portal is built: a proof attempt that fails); separated capsule/sphere +0.7% to
+# +3.0%, box edges +0.0% to +1.6%, boxes unchanged. Overlapping pairs pay more where a
+# proof now succeeds and EPA then measures a depth: spheres +8.7% to +10.5% (the worst
+# pair 4,820 -> 8,168), capsules +1.6% to +4.9%, box edges +1.8% to +5.8%. Pairs whose
+# GJK does not cycle (the generic survey, the bench fixtures) make the same calls.
+# [measured: D336 sound.py -calls breakdown by kind and offset, 3.3.5 tag and this tree, 2026-10-11; cycc 6.6.14]
+
+# The margin of _epa_face_clear: 2^-46 of the largest |coordinate| any point of A or B
+# has, read off their extremes along the six axes (exact for a convex set), in the call's
+# units. A difference of support points rounds with its points, not with itself: near a
+# contact it is tiny where its points are not. +Inf (no proof) during an aspect
+# confirmation, and NaN from a non-finite support, which no face clears.
+# ⛔ A RELATIVE MARGIN HAS NO FLOOR, AND SUBNORMAL ROUNDING DOES. Below about 2^-1029 a
+# support point rounds to the subnormal grid, an absolute 2^-1075, which is more than
+# 2^-46 of its coordinates: sphere pairs scaled to 2^-1040 and 2^-1050 whose exact gaps
+# were 0.01 to 0.80 of a 2^-1074 step were "proved" overlapping, 22 of 9,180, all misses
+# in 3.3.5. So the margin is at least 16 subnormal steps, taken in the shapes' own units
+# before the call's scale divides it; it moves no answer at normal scale.
+# [measured: review-D336 attack sweep at 2^-1040 and 2^-1050 (9,180 pairs) and D336 rerun, 2026-10-11; cycc 6.6.14]
+fn _ga_proof_margin(sup_a, shape_a, sup_b, shape_b) {
+    if (_GA_MINK_AXES != 0) { return _GA_F64_POS_INF; }
+    var m = 0;
+    for (var i = 0; i < 6; i = i + 1) {
+        var e = hvec3_unit_x();
+        if (i >= 2) { e = hvec3_unit_y(); }
+        if (i >= 4) { e = hvec3_unit_z(); }
+        if (i % 2 == 1) { e = hvec3_neg(e); }
+        var ma = _toi_vmax(fncall2(sup_a, shape_a, e));
+        var mb = _toi_vmax(fncall2(sup_b, shape_b, hvec3_neg(e)));
+        if (f64_lt(m, ma) == 1 || f64_eq(ma, ma) == 0) { m = ma; }
+        if (f64_lt(m, mb) == 1 || f64_eq(mb, mb) == 0) { m = mb; }
+    }
+    var dr = f64_mul(m, _GA_MPR_SEP_REL);
+    if (f64_lt(dr, 0x0000000000000010) == 1) { dr = 0x0000000000000010; }  # 16 * 2^-1074
+    var sc = _GA_MINK_S;
+    if (sc != 0 && sc != F64_ONE) { dr = f64_div(dr, sc); }
+    return dr;
+}
+
+# 1 when d lies off the plane of (a, b, c) by more than the rounding of that test, so
+# the side a face is wound away from d to is the true one. With k = |ab||ac| / |ab x ac|
+# (1 / sin of the face's angle at a), a plane distance computed from the face's cross
+# product is within 8 u |p| (1 + k) of its exact value for the point p it is taken at;
+# 2^-49 = 16 u leaves a factor of two.
+fn _epa_wound_face(a, b, c, d) {
+    var ab = hvec3_sub(b, a);
+    var ac = hvec3_sub(c, a);
+    var cr = hvec3_cross(ab, ac);
+    var ln = hvec3_length(cr);
+    if (f64_gt(ln, 0) == 0 || f64_lt(ln, _GA_F64_POS_INF) == 0) { return 0; }
+    var k = f64_add(F64_ONE, f64_div(f64_mul(hvec3_length(ab), hvec3_length(ac)), ln));
+    var ad = hvec3_sub(d, a);
+    var od = f64_div(hvec3_dot(cr, ad), ln);
+    return f64_gt(f64_abs(od), f64_mul(f64_mul(0x3CE0000000000000, hvec3_length(ad)), k));  # 2^-49
+}
+
+# 1 when every face of the seed tetrahedron is wound away from its fourth vertex
+# reliably (_epa_wound_face): the seed's surface is then outward-wound for certain.
+fn _epa_seed_wound(seed) {
+    var a = load64(seed);
+    var b = load64(seed + 8);
+    var c = load64(seed + 16);
+    var d = load64(seed + 24);
+    if (_epa_wound_face(a, b, c, d) == 0) { return 0; }
+    if (_epa_wound_face(a, b, d, c) == 0) { return 0; }
+    if (_epa_wound_face(a, c, d, b) == 0) { return 0; }
+    return _epa_wound_face(b, c, d, a);
+}
+
+# 1 when the origin lies on the inner side of face (a, b, c), whose computed plane
+# distance is g, by more than g's rounding (as in _epa_wound_face) plus the most moving
+# each vertex by dl can change det(a, b, c) = g |ab x ac|, the sign of the face's solid
+# angle, in units of distance: dl (|b x c| + |c x a| + |a x b|) to first order, plus
+# dl^2 (|a| + |b| + |c|) + dl^3, over |ab x ac|. The first-order ratio is about 1 where
+# the origin projects into the face, and grows as it projects further outside.
+fn _epa_face_clear(a, b, c, g, dl) {
+    var ab = hvec3_sub(b, a);
+    var ac = hvec3_sub(c, a);
+    var ln = hvec3_length(hvec3_cross(ab, ac));
+    if (f64_gt(ln, 0) == 0 || f64_lt(ln, _GA_F64_POS_INF) == 0) { return 0; }
+    var k = f64_add(F64_ONE, f64_div(f64_mul(hvec3_length(ab), hvec3_length(ac)), ln));
+    var e = f64_mul(f64_mul(0x3CE0000000000000, hvec3_length(a)), k);  # 2^-49
+    var bc = f64_add(f64_add(hvec3_length(hvec3_cross(b, c)), hvec3_length(hvec3_cross(c, a))),
+      hvec3_length(hvec3_cross(a, b)));
+    var r = f64_add(f64_add(f64_add(hvec3_length(a), hvec3_length(b)), hvec3_length(c)), dl);
+    bc = f64_add(bc, f64_mul(dl, r));
+    return f64_gt(g, f64_add(e, f64_mul(dl, f64_div(bc, ln))));
+}
+
+# 1 when every live face of _epa_refine's polytope clears the origin (_epa_face_clear,
+# margin dl); a zero-area face, which has no plane, fails. Called only on a surface
+# _epa_refine kept closed and outward-wound.
+fn _epa_encloses(fbuf, nf, verts, dl) {
+    for (var f = 0; f < nf; f = f + 1) {
+        var fb = fbuf + f * _EPA_FACE_SIZE;
+        var st = load64(fb + 40);
+        if (st != 0) {
+            if (st == 2) { return 0; }
+            var a = load64(verts + load64(fb) * 8);
+            var b = load64(verts + load64(fb + 8) * 8);
+            var c = load64(verts + load64(fb + 16) * 8);
+            if (_epa_face_clear(a, b, c, load64(fb + 32), dl) == 0) { return 0; }
+        }
+    }
+    return 1;
+}
+
+# A face of the distance query's tetrahedron as a certificate: wound away from its fourth
+# vertex d reliably, and clear of the origin.
+fn _ga_tetra_face(a, b, c, d, dl) {
+    if (_epa_wound_face(a, b, c, d) == 0) { return 0; }
+    var cr = hvec3_cross(hvec3_sub(b, a), hvec3_sub(c, a));
+    var nrm = hvec3_scale(cr, f64_div(F64_ONE, hvec3_length(cr)));
+    if (f64_gt(hvec3_dot(nrm, hvec3_sub(d, a)), 0) == 1) { nrm = hvec3_neg(nrm); }
+    return _epa_face_clear(a, b, c, hvec3_dot(nrm, a), dl);
+}
+
+# 1 when all four faces of the tetrahedron w (four HVec3 slots) are certificates.
+fn _ga_tetra_proves(w, dl) {
+    var p0 = load64(w);
+    var p1 = load64(w + 8);
+    var p2 = load64(w + 16);
+    var p3 = load64(w + 24);
+    if (_ga_tetra_face(p0, p1, p2, p3, dl) == 0) { return 0; }
+    if (_ga_tetra_face(p0, p1, p3, p2, dl) == 0) { return 0; }
+    if (_ga_tetra_face(p0, p2, p3, p1, dl) == 0) { return 0; }
+    return _ga_tetra_face(p1, p2, p3, p0, dl);
+}
+
+# 1 when the distance query, seeded along unit_x, reports the origin inside on a
+# tetrahedron that proves it (_ga_tetra_proves); the tetrahedron, a seed for EPA, is then
+# copied to out4.
+fn _ga_inside_proven(sup_a, shape_a, sup_b, shape_b, out4) {
+    var vs = alloc(8);
+    var lbs = alloc(8);
+    var lvs = alloc(8);
+    if (vs == 0 || lbs == 0 || lvs == 0) { return 0; }
+    if (_toi_near_point(sup_a, shape_a, sup_b, shape_b, hvec3_zero(), hvec3_unit_x(), vs, lbs, lvs) == 0) { return 0; }
+    var w = _GA_NEAR_TETRA;
+    if (w == 0) { return 0; }
+    if (_ga_tetra_proves(w, _ga_proof_margin(sup_a, shape_a, sup_b, shape_b)) == 0) { return 0; }
+    for (var i = 0; i < 4; i = i + 1) { store64(out4 + i * 8, load64(w + i * 8)); }
+    return 1;
+}
+
+# Set to 1 by _gjk_portal_deep for the one _epa_refine it asks to prove an enclosure, which
+# takes the request on entry; _GA_EPA_PROVEN is that run's verdict (_epa_encloses), read
+# straight after it returns.
+var _GA_EPA_PROVE = 0;
+var _GA_EPA_PROVEN = 0;
+
 # How many times _epa_refine fell back to the direction polish instead of
 # returning a CERTIFIED EPA result -- from gjk_epa_3d and from mpr_penetration,
 # which both return through it. Test-observability only; nothing branches on
@@ -1540,6 +1827,14 @@ var _GA_EPA_POLISH_COUNT = 0;
 # closest supporting plane of the Minkowski difference is pinned. Writes the unit
 # outward normal and the depth. Returns 1 on success, 0 if the seed is unusable.
 fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
+    # EPA_MAX_ITER is a public var, so its value is checked here, where it sizes the
+    # buffers: -1 to -3 sized the vertex buffer at 1 to 3 slots, which alloc grants, and the
+    # four seed vertices were written past it; near 2^61 the byte counts wrap to small ones
+    # (2^61 - 3 asks for 8 bytes of vertices). A value of 0 or less runs no iteration and
+    # answers 0, as 0 always did, and so does one whose face and edge buffers, each
+    # (2 EPA_MAX_ITER + 16) records of 48 bytes, would exceed ALLOC_MAX: alloc refuses those
+    # sizes anyway where they do not wrap.
+    if (EPA_MAX_ITER <= 0 || EPA_MAX_ITER > (ALLOC_MAX / _EPA_FACE_SIZE - 16) / 2) { return 0; }
     var vmax = 4 + EPA_MAX_ITER;
     var fmax = 2 * vmax + 8;
     var verts = alloc(vmax * 8);
@@ -1548,10 +1843,17 @@ fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
     if (verts == 0 || fbuf == 0 || ebuf == 0) { return 0; }
     for (var i = 0; i < 4; i = i + 1) { store64(verts + i * 8, load64(seed + i * 8)); }
     var nv = 4;
-    _epa_face_set(fbuf, 0, verts, 0, 1, 2, 3);
-    _epa_face_set(fbuf, 1, verts, 0, 1, 3, 2);
-    _epa_face_set(fbuf, 2, verts, 0, 2, 3, 1);
-    _epa_face_set(fbuf, 3, verts, 1, 2, 3, 0);
+    # topo: 1 while the faces still form one closed, consistently wound surface, as
+    # _epa_encloses needs; only a run _gjk_portal_deep asks to prove one tracks it. The
+    # request is taken here, so a query a support function runs inside this one does not
+    # see it.
+    var topo = _GA_EPA_PROVE;
+    _GA_EPA_PROVE = 0;
+    if (topo == 1 && _epa_seed_wound(seed) == 0) { topo = 0; }
+    if (_epa_face_set(fbuf, 0, verts, 0, 1, 2, 3) != 1) { topo = 0; }
+    if (_epa_face_set(fbuf, 1, verts, 0, 1, 3, 2) != 1) { topo = 0; }
+    if (_epa_face_set(fbuf, 2, verts, 0, 2, 3, 1) != 1) { topo = 0; }
+    if (_epa_face_set(fbuf, 3, verts, 1, 2, 3, 0) != 1) { topo = 0; }
     var nf = 4;
 
     var best_n = hvec3_unit_x();
@@ -1671,6 +1973,7 @@ fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
                     # out 2.0 against an exact MTV of 1.61. The test is therefore
                     # "not strictly behind the plane", with the slack scaled to
                     # the plane's own magnitude.
+                    # [measured: scratch trace, 2.8.3, not reproducible in-tree; tests/modules.tcyr pins the 1.61]
                     vis = 1;
                 }
                 if (vis == 1) {
@@ -1681,7 +1984,11 @@ fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
                 }
             }
         }
-        if (ne < 3) { break; }
+        if (ne < 3) {
+            # The visible faces are gone and nothing replaces them: the surface is open.
+            topo = 0;
+            break;
+        }
 
         # Compact the survivors to the front, then fan the horizon onto the new
         # vertex. Compaction keeps `nf` at O(V) instead of accumulating every
@@ -1705,13 +2012,21 @@ fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
         nv = nv + 1;
         for (var e = 0; e < ne; e = e + 1) {
             if (nf < fmax) {
-                _epa_face_set(fbuf, nf, verts, load64(ebuf + e * 16),
-                  load64(ebuf + e * 16 + 8), pi, 0 - 1);
+                if (_epa_face_set(fbuf, nf, verts, load64(ebuf + e * 16),
+                    load64(ebuf + e * 16 + 8), pi, 0 - 1) == 2) { topo = 0; }
                 nf = nf + 1;
+            } else {
+                topo = 0;
             }
         }
     }
 
+    # The enclosure verdict is published after the last support call of this run (the
+    # polish below makes more), so a query a support function runs cannot overwrite it.
+    var proven = 0;
+    if (topo == 1) {
+        proven = _epa_encloses(fbuf, nf, verts, _ga_proof_margin(sup_a, shape_a, sup_b, shape_b));
+    }
     if (f64_lt(best_d, _GA_F64_POS_INF) == 0) { return 0; }
     if (f64_lt(best_d, 0) == 1) { best_d = 0; }
     if (certified == 0) {
@@ -1734,10 +2049,12 @@ fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
         _GA_EPA_POLISH_COUNT = _GA_EPA_POLISH_COUNT + 1;
         _epa_polish(sup_a, shape_a, sup_b, shape_b, best_n, best_d, out_normal, out_depth);
         if (f64_lt(load64(out_depth), 0) == 1) { store64(out_depth, 0); }
+        _GA_EPA_PROVEN = proven;
         return 1;
     }
     store64(out_normal, best_n);
     store64(out_depth, best_d);
+    _GA_EPA_PROVEN = proven;
     return 1;
 }
 
@@ -1793,7 +2110,33 @@ fn _epa_degenerate_normal(sup_a, shape_a, sup_b, shape_b) {
             return _epa_unit(c);
         }
     }
-    return _epa_unit(_epa_perp(e1));
+    # ⛔ A SIMPLEX ON ONE LINE DOES NOT MAKE THE SET A SEGMENT. GJK can stop on four
+    # collinear vertices of a PLANAR difference: two zero-thickness segments crossing at
+    # the origin, (1, 0, 0) against (0, 1, 0) half-extents, gave the in-plane
+    # (-sqrt(1/2), -sqrt(1/2), 0) at depth 0, h = sqrt(2) along it, where only +-z
+    # supports the set through the origin (the other operand order found the plane).
+    # ⭐ So the perpendicular u is kept where its plane through the origin supports the set
+    # (h(u) = 0 or h(-u) = 0, the depth-0 contract _epa_outward then orients): a segment,
+    # a plane whose normal u already is (coplanar plates), a point on a solid's corner.
+    # Otherwise the support point further off the line along +-u spans the set's plane
+    # with e1, and its normal is the answer, by the same angle test. Of 3,000 depth-0
+    # contacts (points on box corners, edges and faces, coplanar plates, crossing and
+    # collinear segments, both orders) the 30 normals that supported nothing through the
+    # origin (26 points on corners, 4 crossings) now do, and every other keeps its bits.
+    # [measured: D336 degenerate-contact differential, exact supports, 3.3.5 tag and this tree, 2026-10-11; cycc 6.6.14]
+    var u = _epa_unit(_epa_perp(e1));
+    var sp = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, u);
+    var sn = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, hvec3_neg(u));
+    if (f64_eq(hvec3_dot(u, sp), 0) == 1 || f64_eq(hvec3_dot(u, sn), 0) == 1) { return u; }
+    var ep = hvec3_sub(sp, v0);
+    var en = hvec3_sub(sn, v0);
+    var er = ep;
+    if (f64_lt(f64_abs(hvec3_dot(u, ep)), f64_abs(hvec3_dot(u, en))) == 1) { er = en; }
+    var cr = hvec3_cross(e1, er);
+    if (f64_gt(hvec3_length(cr), f64_mul(EPSILON_F64, f64_mul(hvec3_length(e1), hvec3_length(er)))) == 1) {
+        return _epa_unit(cr);
+    }
+    return u;
 }
 
 # Of a unit normal n of A (-) B and -n, the OUTWARD one: the one whose supporting
@@ -1893,6 +2236,7 @@ fn _epa_outward(sup_a, shape_a, sup_b, shape_b, n) {
 # h_M comes out exactly 0 and the touch is certified. Measured over a
 # 190-configuration tangency set, the distance-query directions certify 33 of
 # them and these certify all 33 plus 42 more.
+# [measured: scratch harness, not reproducible in-tree, 2.8.3; CHANGELOG.md 2.8.3 records the 190-set totals only]
 #
 # Returns 1 and writes a unit contact direction to out_n when the shapes touch;
 # returns 0 -- leaving out_n untouched -- when they are strictly separated.
@@ -1932,6 +2276,7 @@ fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
             # a genuinely separated pair certifies as a touch -- measured on 64
             # point-vs-point cases at separations <= 1e-165. Flagged here and
             # rejected at the certificate below.
+            # [measured: CHANGELOG.md 2.8.3, "64 genuinely separated point-vs-point pairs reported contact"]
             made = 1;
             # Degenerate direction -- the repair _gjk_core_3d makes, and for the
             # same reason: only an exactly zero direction is unusable, so the
@@ -2010,6 +2355,10 @@ fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
 # depth * normal separates the pair. A touch (depth 0) answers with the outward
 # normal too since 3.3.3; through 3.3.2 both of its touch paths could hand back
 # the inward one (see _epa_outward).
+# ⚠ Since 3.3.6 a near-tangent pair on which GJK cycles is a contact when an enclosure of
+# the origin is proved from support points (_epa_encloses), which assumes every support
+# point within 2^-46 of the shape's largest |coordinate| of the true set: see the
+# ACCURACY PREMISE at the head of this section for what a noisier support does.
 public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
     var k0 = _GA_SUP_NONFINITE;
     var k1 = _GA_MINK_S;
@@ -2060,14 +2409,24 @@ fn _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth) 
     var seed = alloc(32);
     if (seed == 0) { return 0; }
     var s = _epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed);
+    var pd = 0;
     if (s == 3) {
-        # GJK cycled without an answer: the portal decides, as in gjk_intersect_3d.
-        if (_gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed) == 1) {
+        # GJK cycled without an answer: the portal decides, as in gjk_intersect_3d,
+        # deep or with its enclosure proved (pd 1 or 2), and its depth is EPA's from it.
+        pd = _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed);
+        if (pd == 1 || pd == 2) {
             return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
         }
         s = 0;
     }
     if (s == 0) {
+        # ⭐ 3.3.6 — a portal that proved nothing leaves the distance query's
+        # tetrahedron (_ga_inside_proven), as in gjk_intersect_3d, here before the
+        # touch probe: a proved enclosure has a depth to measure, from that tetrahedron,
+        # where the probe would answer 0 for it.
+        if (pd == 3 && _ga_inside_proven(support_a, shape_a, support_b, shape_b, seed) == 1) {
+            return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
+        }
         # "No simplex enclosed the origin" is also what GJK reports for an EXACT
         # TANGENCY, where the origin sits on the boundary of the difference and
         # the true answer is a contact of depth 0. Ask for a certificate before
@@ -2121,13 +2480,13 @@ fn _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth) 
 # its convergence test (support in the portal direction reaching that plane) is
 # unsatisfiable for a body with interior. It ran all 64 iterations and then
 # `return 1` unconditionally, which is a FALSE POSITIVE whenever the shapes are
-# separated in a direction the portal never settled on. Measured over a
-# 455-configuration sweep against an exact reference: 9 separated pairs reported
+# separated in a direction the portal never settled on. Measured over an
+# 862-configuration sweep against an exact reference: 9 separated pairs reported
 # as overlapping (half-extents (1,10,10) against a point box 0.4 away in x, and a
 # cylinder/OBB pair), versus 0 errors for gjk_intersect_3d. The 2026-08-04 audit
 # recorded these two as agreeing everywhere, but it only swept centre-line
 # separations of axis-aligned pairs, where the portal happens to settle.
-# [measured: CHANGELOG.md 2.9.0, the 455-configuration exact-reference sweep]
+# [measured: CHANGELOG.md 2.8.3, mpr_intersect vs exact overlap: 9 false positives / 862]
 #
 # _epa_seed_portal is the real XenoCollide portal: v0 interior, (v1,v2,v3) a
 # boundary triangle the ray v0 -> origin crosses, refined until the origin is on
@@ -2225,9 +2584,11 @@ fn _mpr_intersect_core(support_a, shape_a, support_b, shape_b) {
 # other way; 127 (122) of the 2,400 separated ones are still contacts, 83 of them
 # closer than that margin.
 # [measured: G2 tangency sweep, 3.3.4 base and this tree, 2026-10-11; cycc 6.6.14]
-# Handing such a portal to GJK instead was rejected: gjk_intersect_3d misses shallow
+# Handing such a portal to GJK instead was rejected: gjk_intersect_3d missed shallow
 # overlaps (90 of 300 sphere pairs overlapping by 1e-9 of their radii, on the 3.3.4
-# base and this tree), and MPR would then have missed them too.
+# base and 3.3.5), and MPR would then have missed them too. 3.3.6 has GJK prove the
+# enclosures it can (_epa_encloses), which is stricter than this refutation: a portal it
+# cannot prove is not a contact to GJK, where MPR keeps it unless a plane refutes it.
 # [measured: G2 shallow-overlap probe, 300 sphere pairs, 3.3.4 base, 2026-10-11; cycc 6.6.14]
 fn _mpr_portal_contact(support_a, shape_a, support_b, shape_b, seed) {
     if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) != 1) { return 2; }
@@ -2434,6 +2795,7 @@ fn _bvh_node_leaf_idx(n) { return load64(n + 24); }
 # _bvh_aabb_merge, which cost FIVE heap blocks per step (hvec3_min,
 # hvec3_max, then geo_aabb_new's own hvec3_min/hvec3_max/alloc). Building a
 # 16k-primitive BVH allocated 36.6 MB of never-freed arena.
+# [measured: docs/audit/2026-08-04-v2.8.0-full.md, the _bvh_build_rec row]
 #
 # The fold is now six f64 registers and one GeoAabb per internal node, and
 # 2.8.3 made it bit-identical to the old one: f64_min/f64_max were then exactly
@@ -2446,6 +2808,7 @@ fn _bvh_node_leaf_idx(n) { return load64(n + 24); }
 # 4.14 MB of arena; at n = 8k coincident, 35.8 ms -> 8.1 ms and 16.7 MB ->
 # 2.07 MB. What remains is the one O(n log n) bounds scan a top-down binary
 # BVH inherently needs.
+# [measured: scratch track-worktree runs, not reproducible in-tree, 2.8.3; CHANGELOG.md 2.8.3 rules them inadmissible]
 #
 # ⛔ 3.3.3 — THAT EQUIVALENCE ENDED WHEN hvec3_min/hvec3_max BECAME IEEE 754-2019
 # minimum/maximum (src/vec3.cyr), and the fold kept stdlib f64_min/f64_max, which
@@ -2632,7 +2995,7 @@ fn _bvh_build_rec(items, start, end, inverted) {
     # re-merges its whole remaining range to compute `bounds`, that made build
     # cost O(n^2) in both time and arena -- the unfixed sibling of the 2.6.14
     # kdtree_build defect. Splitting at the median restores O(n log n). See the
-    # `bvh_degenerate_4k` benchmark for the measured before/after.
+    # `bvh_degenerate_4k` benchmark for the before/after.
     var split = lo;
     if (split <= start) { split = start + count / 2; }
     if (split >= end) { split = start + count / 2; }
@@ -2661,6 +3024,7 @@ public fn bvh_build(aabbs, count) {
     # own bounds check and aborted the process ("vec: index out of bounds",
     # exit 1, measured). aabbs == 0 is the same story one level down:
     # load64(0 + bi * 8) is a null read (exit 139, measured).
+    # [measured: tests/abuse.tcyr "bvh_build: count = -1 ..." and "bvh_build: aabbs = 0 ...", each naming its old exit]
     if (count <= 0) { return 0; }
     if (aabbs == 0) { return 0; }
 
@@ -2846,7 +3210,29 @@ fn _bvh_ray_hits_aabb(ray, aabb) {
     }
 
     # Behind the origin entirely -> not a forward hit, same as geo_ray_aabb.
-    if (f64_lt(t_max, 0) == 1) { return 0; }
+    # ⛔ 3.3.6 — A CROSSING THAT UNDERFLOWED HAS LOST ITS ORDER TOO. A quotient below
+    # 2^-1075 rounds to a zero that keeps only its sign, and no f64 compare tells -0 from
+    # +0 or either from an exact zero (the origin on that plane): an exit at -2^-2074 read
+    # -0 and passed the t_max < 0 test, and an entry at +2^-2074 tied an exit at exactly 0.
+    # A crossing among the subnormals rounds on the absolute 2^-1074 grid and can tie one
+    # twice its size. So a t_max that is zero or subnormal sends the box to _bvh_far_meets
+    # as well, whose crossings have an unbounded exponent. (A small t_min needs no test of
+    # its own: against a normal t_max, positive or the miss above, its order is right.)
+    # Over the 235997 pairs of the C336 slab sweep (its underflow family among them), 5363
+    # predicate and one-box query answers went wrong -> right against the exact oracle and
+    # none right -> wrong. Non-finite input reaches _bvh_far_meets this way too: of 19659
+    # NaN-input pairs of the C1 review's sweep (two seeds), 1031 answers moved from 2 to the
+    # miss 0, each where the other slabs prove the miss (a NaN slab neither includes nor
+    # excludes); of 19880 with an infinity, 724 moved from 1 or 2 to 0: 695 wrong -> right
+    # against an extended-real oracle, 29 undecidable by it, none newly wrong.
+    # [measured: C336 slab sweep, seeds 11 and 12, exact Fraction oracle, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
+    # [measured: C1 review slab sweep + infor.py (C336 run), seeds 211, 212, 3.3.5 vs tree, 2026-10-11; cycc 6.6.14]
+    # (One integer test on the common path: t_max's bits below 2^-1022's are a negative
+    # t_max, a zero or a subnormal; NaN's negative pattern falls through as before.)
+    if (t_max < 0x0010_0000_0000_0000) {
+        if (f64_lt(t_max, 0) == 1) { return 0; }
+        if ((t_max & 0x7FFF_FFFF_FFFF_FFFF) < 0x0010_0000_0000_0000) { far = 1; }
+    }
     # ⛔ 3.3.5 — A CROSSING THAT OVERFLOWED HAS LOST ITS ORDER. Through a subnormal d_k,
     # or a b - o past DBL_MAX, it reads +-Inf: 3.3.4 read Inf <= Inf as a hit whatever
     # the true order, and an exit read +Inf lost the min to a finite exit truly later.
@@ -3545,7 +3931,11 @@ fn _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, dir) {
 #   out_lbv: receives the point v whose direction that plane was taken along, or
 #            0 when no plane separated (out_lb = 0). A lower bound certifies a step
 #            only along its OWN direction: see time_of_impact.
-# Returns 1 if the origin is inside (the shapes overlap), 0 otherwise.
+# Returns 1 if the origin is inside (the shapes overlap), 0 otherwise. When it returns
+# 1 on a tetrahedron that encloses the origin, _GA_NEAR_TETRA holds its four vertices
+# until the next query, and 0 on every other return: each return writes it after the
+# query's last support call, so a query a support function runs inside this one cannot
+# leave its own tetrahedron there. _ga_inside_proven reads it straight after.
 #
 # ⛔ 3.3.4 — WHAT CHANGED, and why each part is needed (D045 and the cylinder row):
 #   * The squares. "Exactly on the origin" was |v|^2 <= 0, true for every |v| below
@@ -3569,6 +3959,7 @@ fn _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, dir) {
 # [measured: collide-lane traces of the 3.3.4 base query; tests/modules.tcyr cylinder block, 2026-10-03; cycc 6.6.14]
 fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_lb, out_lbv) {
     var w = alloc(40);          # 4 vertex slots + count at +32, hoisted
+    _GA_NEAR_TETRA = 0;
     var v = _toi_msup(sup_a, shape_a, sup_b, shape_b, offset, seed_dir);
     store64(w, v);
     store64(w + 32, 1);
@@ -3593,6 +3984,7 @@ fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_
                 store64(out_v, v);
                 store64(out_lb, 0);
                 store64(out_lbv, 0);
+                _GA_NEAR_TETRA = 0;
                 return 1;
             }
             if (f64_lt(m, _GA_F64_POS_INF) == 1) { sc = _ga_pow2_floor(m); }
@@ -3646,6 +4038,7 @@ fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_
                 break;
             }
             store64(out_v, hvec3_zero());
+            _GA_NEAR_TETRA = w;
             return 1;
         }
 
@@ -3663,6 +4056,7 @@ fn _toi_near_point(sup_a, shape_a, sup_b, shape_b, offset, seed_dir, out_v, out_
     store64(out_v, v);
     store64(out_lb, lb);
     store64(out_lbv, lbv);
+    _GA_NEAR_TETRA = 0;
     return 0;
 }
 
@@ -3884,7 +4278,8 @@ fn _toi_contact_normal(sup_a, shape_a, sup_b, shape_b, offset, n_prev, mc, s, vc
 #   * the reported t is a lower bound on the true impact time, tight to the
 #     contact tolerance, rather than an over-estimate quantised to the step.
 #
-# support_a/b, shape_a/b: support function pointers and shape data
+# support_a/b, shape_a/b: support function pointers and shape data, under the ACCURACY
+#        PREMISE at the head of section 1 (the overlap test at t = 0 is gjk_intersect_3d's)
 # vel_a, vel_b: HVec3 velocities
 # max_t: f64 maximum time horizon. +Inf is unbounded; a NaN horizon bounds like a
 #        negative one (only a contact at t = 0 is reported), since 3.3.3
@@ -4045,9 +4440,28 @@ fn _toi_core(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t,
     # The A -> B closest-approach direction where the last advance started; 0
     # until the loop has advanced once.
     var n_prev = 0;
+    # ⛔ 3.3.6 — AN ADVANCE BELOW THE RESOLUTION OF t WAS NO ADVANCE, AND THE LOOP THEN
+    # RAN OUT ITS STEPS ON ONE QUERY. Where the time left to contact is below half an ulp
+    # of t, t + step == t: the next round asks the same query, gets the same step, and
+    # after 256 rounds the answer is a miss. Spheres of radius 2^-600 whose centres are
+    # 3 * 2^-600 apart, closing head-on at 2^480, impact at 2^-1080, which is not
+    # representable, and missed (as did every |v| from about 2^475 up); oblique
+    # approaches missed at representable times as well, 2^-1055 to 2^-1070, where a
+    # subnormal t has too few bits to take the step.
+    # [measured: D336 probe of the roadmap fixtures on the 3.3.5 tree, 2026-10-11; cycc 6.6.14]
+    # ⭐ So a stalled advance goes on by DISTANCE: from the time t0 it stalled at, the
+    # query point is base + u0 s for the length s travelled along the unit motion u0,
+    # whose steps are lengths of the geometry's own size (floored at one tolerance, as
+    # the time steps are at one tolerance of travel), and the time reported is
+    # t0 + s / speed, correctly rounded once: 0 for the impact at 2^-1080. A call that
+    # never stalls runs exactly as before. sl is 1 once it has.
+    var sl = 0;
+    var t0 = 0;
+    var base = 0;
 
     for (var ti = 0; ti < _GA_TOI_MAX_STEPS; ti = ti + 1) {
-        var offset = hvec3_scale(rel_vel, t);
+        var offset = 0;
+        if (sl == 0) { offset = hvec3_scale(rel_vel, t); } else { offset = hvec3_add(base, hvec3_scale(u0, t)); }
         var inside = q_inside;
         if (have_q == 0) {
             inside = _toi_near_point(support_a, shape_a, support_b, shape_b,
@@ -4113,6 +4527,7 @@ fn _toi_core(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t,
             var ncon = _toi_contact_normal(support_a, shape_a, support_b, shape_b,
               offset, n_prev, mc, f64_mul(tol, _GA_TOI_PROBE), vcon, f64_gt(load64(lb_slot), 0));
             if (_gjk_contact_finite(support_a, shape_a, support_b, shape_b) == 0) { return 0; }
+            if (sl == 1) { t = f64_add(t0, f64_div(t, speed)); }
             store64(out_t, t);
             store64(out_normal, ncon);
             return 1;
@@ -4136,9 +4551,17 @@ fn _toi_core(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t,
         var lb = load64(lb_slot);
         var u = 0;
         var step = 0;
+        # The motion the step is taken along: rel_vel per unit time, or u0 per unit length
+        # once the advance has stalled (sl).
+        var mdir = rel_vel;
+        var fstep = floor_step;
+        if (sl == 1) {
+            mdir = u0;
+            fstep = tol;
+        }
         if (f64_gt(lb, 0) == 1) {
             u = _toi_unit(load64(lbv_slot));
-            var denom = hvec3_dot(rel_vel, u);
+            var denom = hvec3_dot(mdir, u);
             if (f64_le(denom, 0) == 1) {
                 # PROOF of no collision: every point of the Minkowski difference is
                 # on the far side of the plane at lb along u, and the query point
@@ -4150,14 +4573,25 @@ fn _toi_core(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t,
             step = f64_div(lb, denom);
         } else {
             u = _toi_unit(v);
-            if (f64_le(hvec3_dot(rel_vel, u), 0) == 1) { return 0; }
+            if (f64_le(hvec3_dot(mdir, u), 0) == 1) { return 0; }
         }
         # ⚠ The least advance was lb floored at tol, over rel_vel . u: with u the
         # noisy direction above, a small rel_vel . u made it many tolerances deep.
         # One tolerance of TRAVEL (tol / speed) bounds the overshoot by one tolerance
         # whatever the direction.
-        if (f64_lt(step, floor_step) == 1) { step = floor_step; }
-        t = f64_add(t, step);
+        if (f64_lt(step, fstep) == 1) { step = fstep; }
+        var tn = f64_add(t, step);
+        if (sl == 0 && tn == t) {
+            # The stall (see above): the same step as a length along u0, from here.
+            sl = 1;
+            t0 = t;
+            base = offset;
+            step = 0;
+            if (f64_gt(lb, 0) == 1) { step = f64_div(lb, hvec3_dot(u0, u)); }
+            if (f64_lt(step, tol) == 1) { step = tol; }
+            tn = step;
+        }
+        t = tn;
         n_prev = hvec3_neg(u);
         # ⛔ 3.3.3 — A NaN `max_t` WAS AN UNBOUNDED HORIZON. This read
         # `f64_gt(t, max_t) == 1`, which is false for NaN, so the advance never
@@ -4187,7 +4621,9 @@ fn _toi_core(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t,
         # gated it: an overlap returns before this loop, and a gap inside `tol`
         # returns from the first iteration, before any advance — for max_t =
         # -Inf as for max_t = NaN. A NaN horizon answers what a negative one does.
-        if (f64_le(t, max_t) == 0) { return 0; }
+        var tt = t;
+        if (sl == 1) { tt = f64_add(t0, f64_div(t, speed)); }
+        if (f64_le(tt, max_t) == 0) { return 0; }
         seed = hvec3_neg(v);
     }
     return 0;

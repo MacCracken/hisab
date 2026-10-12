@@ -7,14 +7,43 @@
 #   ./scripts/bench-history.sh                      # default CSV: bench-history.csv
 #   ./scripts/bench-history.sh results.csv         # custom output
 #   ./scripts/bench-history.sh "" tests/foo.bcyr   # custom suite
+#   ./scripts/bench-history.sh t.csv "" t.md        # custom markdown (default benchmarks.md)
+#
+# Trial runs: give BOTH a scratch CSV and a scratch markdown path, or the trend table
+# in benchmarks.md is rewritten from the scratch CSV.
+#   HISAB_BENCH_REPLAY=run.log ./scripts/bench-history.sh t.csv "" t.md
+# parses a saved `cyrius bench` log instead of running the suite. It exists to test
+# this parser without timing anything. Its rows carry the replay's timestamp and the
+# tree's commit, not the run's, so it refuses the default CSV.
 set -euo pipefail
 
 HISTORY_FILE="${1:-bench-history.csv}"
 SUITE="${2:-tests/hisab.bcyr}"
-BENCHMARKS_MD="benchmarks.md"
+BENCHMARKS_MD="${3:-benchmarks.md}"
+REPLAY="${HISAB_BENCH_REPLAY:-}"
+if [ -n "$REPLAY" ] && [ "$HISTORY_FILE" = "bench-history.csv" ]; then
+    echo "ERROR: HISAB_BENCH_REPLAY refuses the default CSV -- a replay is not a run." >&2
+    exit 1
+fi
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+# K004 (3.3.6): what the row's code was, not only which commit it sat on. `version` is
+# the VERSION file as the suite was built; `dirty` is 1 when tracked files differ from
+# HEAD (untracked files are not counted), so a row taken before the release commit reads
+# "<previous commit>, <new VERSION>, dirty" instead of passing as the previous commit.
+VERSION_NOW=$(tr -d '[:space:]' < VERSION 2>/dev/null || echo "unknown")
+[ -n "$VERSION_NOW" ] || VERSION_NOW="unknown"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+    if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]; then DIRTY=1; else DIRTY=0; fi
+else
+    DIRTY=""
+fi
+# D112 (3.3.6): the toolchain that built the suite -- `cyrius version` in this
+# directory, which re-execs to the manifest's pin -- because lib/bench.cyr is vendored
+# from it, so this names the INSTRUMENT. See the 3.3.6 schema note below.
+TOOLCHAIN=$(cyrius version 2>/dev/null | awk 'NR == 1 && $1 == "cyrius" { print $2 }')
+[ -n "$TOOLCHAIN" ] || TOOLCHAIN="unknown"
 
 # Schema note (v2.9.2). The first five columns are unchanged and old rows still
 # parse positionally into them. `stat` names WHICH statistic `estimate_ns` holds:
@@ -71,7 +100,49 @@ BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
 # count ("regime 6" upstream) and fixes the min-above-avg rows above; `avg` again
 # measured unmoved (harness half median +0.00% over 80 rows, same A/B/C method), so
 # `regime` stays `net`. [measured: 2026-09-30, scratch A/B/C harness]
-CSV_HEADER="timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters,regime,floor_ns"
+#
+# Schema note (v3.3.6) -- four columns appended: `tick_ns`, `toolchain`, `version`,
+# `dirty`. Appended, so every older row still parses positionally into the columns it
+# has (5-, 10- and 12-field rows are all in the file) and reads back blank in the rest.
+#   tick_ns    the clock tick the harness prints after the floor (6.6.5+), in ns; blank
+#              when the harness printed none. That is the regime column's blind spot
+#              (D112): the 6.6.5 and 6.6.9 instrument rewrites both kept printing the
+#              floor line, so `regime` stayed `net` across them. The tick's PRESENCE
+#              marks the 6.6.5+ harness; its VALUE is the host clock's resolution (about
+#              1 us on hpet), which is a host fact like `floor_ns`, not a code fact.
+#   toolchain  `cyrius version` at run time. lib/bench.cyr is vendored from the pin, so
+#              this names the instrument outright. The tick alone cannot tell 6.6.5
+#              from 6.6.9 (both print one); the toolchain can. Within one pin the
+#              vendored bench.cyr is SHA-locked (`cyrius deps --verify`).
+#   version    the VERSION file; `dirty` 1 when tracked files differ from HEAD (K004).
+#              Through 3.3.5 a release's rows were labelled with the commit BEFORE the
+#              release commit: 3.3.0's say 1f237a8, whose VERSION is 3.2.2, and 3.3.5's
+#              say e360abb, whose VERSION is 3.3.4.
+# None of the four enters the trend filter. `stat` and `regime` split the history
+# because they change what a number MEANS; these four say where it came from, and a
+# filter on the tick or the toolchain would cut the trend at every reboot and bump.
+# The bumps are compared the way the paragraphs above did: same-boot interleaved
+# binaries, never across the CSV.
+#
+# DECLINED -- a `load` column (K004 asked for this decision to be written down here;
+# it lived only in the roadmap row 2.19.0 struck and git history, 5bfb8f4). Proposed at
+# 2.11.2 / 2.11.3 because cyrius 6.5.25 records a ~4% move in many rows at once as
+# box-wide contention, and declined in 2.19.0 together with its proposed successor, a
+# per-benchmark noise band. Why:
+#   * nothing would read it. The proposal named no rule, and upstream ships a prose
+#     heuristic, not a column (its own bench-history.csv has five fields);
+#   * /proc/loadavg read when the run STARTS does not describe load DURING it;
+#   * the guard adopted in 2.11.4 / 2.11.5 settles the cases it was meant for: re-run
+#     the identical binary and compare each row to ITS OWN spread, and compare against
+#     more than one baseline -- a single adjacent run is not one (2.19.0);
+#   * the band, measured on the CSV, is strictly worse than the global +-10%: to match
+#     its false-positive rate on clean replicate pairs (4 of 288) a per-benchmark band
+#     must widen to a median 11.1% / max 55.0%, and then flags 67 code-changed cells
+#     where the global filter flags 96. A band built from history also widens itself
+#     after a real regression.
+# [measured: CHANGELOG.md 2.19.0, "THE DECISIONS OWED WERE MEASURED"]
+# Reopen it with a rule that reads the column, not with the column.
+CSV_HEADER="timestamp,commit,branch,benchmark,estimate_ns,stat,avg_ns,min_ns,max_ns,iters,regime,floor_ns,tick_ns,toolchain,version,dirty"
 if [ ! -f "$HISTORY_FILE" ]; then
     echo "$CSV_HEADER" > "$HISTORY_FILE"
 elif ! head -1 "$HISTORY_FILE" | grep -q ',stat,'; then
@@ -82,6 +153,9 @@ elif ! head -1 "$HISTORY_FILE" | grep -q ',stat,'; then
 elif ! head -1 "$HISTORY_FILE" | grep -q ',regime,'; then
     sed -i "1s/.*/${CSV_HEADER}/" "$HISTORY_FILE"
     echo "note: bench-history header widened with regime/floor_ns; earlier rows read back as regime='raw'"
+elif ! head -1 "$HISTORY_FILE" | grep -q ',tick_ns,'; then
+    sed -i "1s/.*/${CSV_HEADER}/" "$HISTORY_FILE"
+    echo "note: bench-history header widened with tick_ns/toolchain/version/dirty; earlier rows read back blank there"
 fi
 
 echo "╔══════════════════════════════════════════╗"
@@ -89,8 +163,11 @@ echo "║         hisab benchmark suite            ║"
 echo "╠══════════════════════════════════════════╣"
 echo "║  commit: $COMMIT"
 echo "║  branch: $BRANCH"
+echo "║  version: $VERSION_NOW (dirty=${DIRTY:-?})"
+echo "║  toolchain: cyrius $TOOLCHAIN"
 echo "║  date:   $TIMESTAMP"
 echo "║  suite:  $SUITE"
+if [ -n "$REPLAY" ]; then echo "║  REPLAY of $REPLAY (no benchmark is run)"; fi
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
@@ -108,7 +185,11 @@ echo ""
 # this CSV as the proof for every performance claim, so the proof was being
 # recorded on the noisiest statistic the harness reports. Now parsed by ANCHORING
 # on the named fields rather than by scavenging tokens.
-BENCH_OUTPUT=$(cyrius bench "$SUITE" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+if [ -n "$REPLAY" ]; then
+    BENCH_OUTPUT=$(sed 's/\x1b\[[0-9;]*m//g' "$REPLAY")
+else
+    BENCH_OUTPUT=$(cyrius bench "$SUITE" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+fi
 echo "$BENCH_OUTPUT"
 echo ""
 
@@ -138,14 +219,16 @@ normalize_to_ns() {
 # ours, so the parser is anchored on its own field names independently.
 REGIME="raw"
 FLOOR_NS=""
+TICK_NS=""
 TICK_NOTE=""
 if [[ "$BENCH_OUTPUT" =~ \[timer\ floor\ ([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)\ per\ clock\ read ]]; then
     REGIME="net"
     FLOOR_NS=$(normalize_to_ns "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}")
-    # 6.6.5+ appends the measured clock tick to the same line; echo it so the run
-    # log tells the resolution-rule instrument from the pre-6.6.5 one.
+    # 6.6.5+ appends the measured clock tick to the same line. It goes to the CSV
+    # (`tick_ns`, 3.3.6) as well as the run log; see the 3.3.6 schema note.
     if [[ "$BENCH_OUTPUT" =~ per\ clock\ read[^]]*\;\ tick\ ([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)\] ]]; then
-        TICK_NOTE=", clock tick $(normalize_to_ns "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}") ns — 6.6.5+ resolution-rule harness"
+        TICK_NS=$(normalize_to_ns "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}")
+        TICK_NOTE=", clock tick ${TICK_NS} ns — 6.6.5+ resolution-rule harness"
     fi
     echo "measurement regime: net (timer floor ${FLOOR_NS} ns, measured on this host, subtracted from every sample${TICK_NOTE})"
 else
@@ -167,7 +250,7 @@ while IFS= read -r line; do
         MIN_NS=$(normalize_to_ns "${BASH_REMATCH[5]}" "${BASH_REMATCH[7]}")
         MAX_NS=$(normalize_to_ns "${BASH_REMATCH[8]}" "${BASH_REMATCH[10]}")
         ITERS="${BASH_REMATCH[12]:-}"
-        echo "${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${AVG_NS},avg,${AVG_NS},${MIN_NS},${MAX_NS},${ITERS},${REGIME},${FLOOR_NS}" \
+        echo "${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${AVG_NS},avg,${AVG_NS},${MIN_NS},${MAX_NS},${ITERS},${REGIME},${FLOOR_NS},${TICK_NS},${TOOLCHAIN},${VERSION_NOW},${DIRTY}" \
             >> "$HISTORY_FILE"
         BENCH_NAMES+=("$BENCH_NAME")
         BENCH_NS+=("$AVG_NS")
@@ -253,16 +336,25 @@ for r in rows:
             data.setdefault(r["benchmark"], {})[ts] = float(r["estimate_ns"])
         except ValueError:
             continue
-        commits[ts] = r["commit"]
+        # 3.3.6 (K004): a row that carries `version` names it beside the commit, and
+        # says so when the tree was dirty -- the commit alone named the release before.
+        # Rows written before 3.3.6 have neither and keep the bare commit.
+        label = f"`{r['commit']}`"
+        ver = (r.get("version") or "").strip()
+        if ver:
+            label += f", {ver}"
+            if (r.get("dirty") or "").strip() == "1":
+                label += " uncommitted"
+        commits[ts] = label
 
 labels = []
 for i, ts in enumerate(pick):
     if i == 0 and len(pick) > 1:
-        labels.append(f"Baseline (`{commits[ts]}`)")
+        labels.append(f"Baseline ({commits[ts]})")
     elif i == len(pick) - 1:
-        labels.append(f"Current (`{commits[ts]}`)")
+        labels.append(f"Current ({commits[ts]})")
     else:
-        labels.append(f"Mid (`{commits[ts]}`)")
+        labels.append(f"Mid ({commits[ts]})")
 
 def fmt_ns(ns):
     if ns >= 1_000_000:
@@ -358,9 +450,9 @@ with open(md_file, "w") as f:
             "> * **2026-08-09**: `estimate_ns` changed from each benchmark's MAX to its AVG.\n"
             ">   The `stat` column records which; rows with no value there are `max`.\n\n")
     ts_last = pick[-1]
-    f.write(f"Latest: **{ts_last}** — commit `{commits[ts_last]}`\n\n")
+    f.write(f"Latest: **{ts_last}** — commit {commits[ts_last]}\n\n")
     if len(pick) >= 3:
-        f.write(f"Tracking: `{commits[pick[0]]}` (baseline) → `{commits[pick[1]]}` (mid) → `{commits[pick[-1]]}` (current)\n\n")
+        f.write(f"Tracking: {commits[pick[0]]} (baseline) → {commits[pick[1]]} (mid) → {commits[pick[-1]]} (current)\n\n")
 
     groups = OrderedDict()
     for bench in data:

@@ -555,8 +555,8 @@ public fn num_continued_fraction_rational(p, q) {
 # [measured: tests/modules_b.tcyr, group "3.3.5 Bluestein: the chirp angle's (j*j) mod 2N (D026)"]
 
 # Largest DFT length Bluestein will accept. m stays <= 2^21, so the three
-# work buffers are <= 32 MB each, and j*j <= 1e12 cannot overflow i64.
-var _NUMX_DFT_MAX = 0x100000;   # 1,048,576
+# work buffers are <= 2^21 * 16 B (32 MB) each, and j*j <= 1e12 cannot overflow i64.
+var _NUMX_DFT_MAX = 0x100000;   # 1048576 = 2^20
 
 fn _numx_next_pow2(n) {
     var m = 1;
@@ -689,6 +689,7 @@ fn _numx_idft(data, n) {
 # one-DFT reduction, verified coefficient-by-coefficient against a 90-digit
 # Decimal reference for every n in {1..9, 12, 16, 17, 24, 32, 33, 48, 64,
 # 100, 127, 128, 129} -- 3,100 coefficients, max relative error 1.2e-14:
+# [measured: scratch 90-digit Decimal harness, not reproducible in-tree, 2.8.3]
 #
 #   DCT-II  X[k] = Re( e^{-i PI k/(2n)} * DFT(v)[k] ), where v is x with the
 #           even-indexed samples in order followed by the odd-indexed ones
@@ -707,6 +708,7 @@ fn _numx_idft(data, n) {
 # that worst case, against the exact closed form sin(PI*257*(k+1)/514), the
 # REDUCTION is the more accurate of the two: 8.70e-14 against the direct
 # kernel's 1.36e-13. Measured, ns per call:
+# [measured: scratch broad-n oracle, not reproducible in-tree, 2.8.3]
 #
 #            direct    reduction            direct   reduction
 #   dct n=2     195         320    dst n=2     189       7,100
@@ -714,12 +716,14 @@ fn _numx_idft(data, n) {
 #   dct n=16 11,676       3,138    dst n=32 47,870     151,268
 #   dct n=64    189k         14k   dst n=64    191k        329k
 #   dct n=128   766k         30k   dst n=128   768k        714k
+# [measured: scratch track-worktree timing, not reproducible in-tree, 2.8.3; CHANGELOG.md 2.8.3 rules it inadmissible]
 #
 # DST-I is the bad case: its DFT length is 2(n+1), which is a power of two
 # only when n = 2^k - 1, so it otherwise pays Bluestein -- three FFTs of
 # next_pow2(4n+3) -- and loses to a 16x16 double loop by 6x. Shipping the
 # reduction unconditionally would have traded a quadratic tail for a
 # small-n regression across the whole range consumers actually use.
+# [measured: the table above (dst n=16), scratch worktree timing, not reproducible in-tree, 2.8.3]
 #
 # Above the crossover the win is what the finding asked for. n = 4096:
 # dct 813.3 ms -> 1.40 ms (581x), dst 824.1 ms -> 32.7 ms (25x). Growth
@@ -729,6 +733,7 @@ fn _numx_idft(data, n) {
 # 48.4 ms -> 1.75 ms. With the dispatch in place, no size from n=2 to
 # n=4096 is slower than it was: the largest measured delta below the
 # crossover is +2.6%, inside this machine's +-4% run-to-run spread.
+# [measured: scratch track-worktree timing, not reproducible in-tree, 2.8.3; CHANGELOG.md 2.8.3 rules it inadmissible]
 
 # floor(log2(n)) for n >= 1.
 fn _numx_log2(n) {
@@ -751,6 +756,7 @@ fn _numx_log2(n) {
 # Re-measured in 2.8.4 by forcing BOTH paths at every size from 2 to 40 and at
 # 33 larger ones: 22.0-23.7 ns per unit on the direct path, so the ~46 ns
 # kernel term was and is priced correctly. Two terms were not.
+# [measured: CHANGELOG.md 2.8.4, _numx_use_fft entry (22.0-23.7 ns per unit); ~46/~22 ns: the 2.8.3 table]
 #
 # `post` (2.8.4). The old model charged every caller `2*len` for the
 # post-processing pass. That is right for DCT-II and its inverse, which walk
@@ -760,6 +766,7 @@ fn _numx_log2(n) {
 # ns/unit against the direct path's 22.0-23.7, so the reduction looked more
 # expensive than it is and n = 7 was sent to the direct path when the FFT is
 # 20.6% faster there (1738 ns vs 2189 ns, batch-timed).
+# [measured: CHANGELOG.md 2.8.4, _numx_use_fft entry and table: 17.4-18.0 vs 22.0-23.7; n = 7, 2189 -> 1738 ns]
 #
 # The small-m Bluestein surcharge (2.8.4). Measured cost per abstract unit on
 # the chirp-z path is not flat: 26.2 ns/unit at m = 512 falling to 19.9 at
@@ -767,6 +774,7 @@ fn _numx_log2(n) {
 # pointwise product -- amortises. The flat model therefore UNDER-charges small
 # m, which is exactly the band the mispicks sit in (m = 64 at n = 26/27, m = 128
 # at n = 38/39). A 10% surcharge below m = 128 corrects it.
+# [measured: CHANGELOG.md 2.8.4, _numx_use_fft entry: 26.2 ns/unit at m = 512 falling to 19.9 at m = 32768]
 #
 # Both corrections were enumerated over every n from 2 to 20000 for all three
 # callers before landing: DST changes its pick at exactly n = 7, DCT at exactly
@@ -802,6 +810,36 @@ fn _numx_use_fft(n, len, post) {
     return 0;
 }
 
+# 1 when the DFT reduction cannot take a length-`len` DFT, so the caller runs the direct
+# loop: a length that is not a power of two and passes _NUMX_DFT_MAX, the Bluestein cap.
+# A power of two never reaches Bluestein (_numx_dft and _numx_idft send it to num_fft
+# first, at any length), so the cap does not apply to it.
+#
+# ⛔ 3.3.6 — THE CALLERS APPLIED THE CAP TO EVERY LENGTH. num_dct and num_idct went
+# direct for every n > 2^20, and num_dst for every 2(n + 1) > 2^20, powers of two
+# included, and the direct loop costs about 50 ns per kernel term, n^2 terms: num_dct at
+# n = 2^21 is about 61 hours that way and 1.1 s through the reduction it now takes. A
+# length past the cap that is not a power of two still goes direct, as before: hours
+# from n = 524,288 for num_dst and n = 2^20 + 1 for num_dct (3.8 h at 524,288), about
+# 110 years at 2^28. Lifting the cap is a decision about Bluestein's memory (two work
+# buffers of next_pow2(2 len - 1) * 16 bytes), not made here. A power of two whose
+# reduction buffer (16 bytes a point) does not fit now returns Err(HSB_ERR_ALLOC), where
+# the direct loop's 8-byte one did: num_dct at n = 2^28.
+# [measured: scratch routing probe (p/proute.cyr), single runs on a shared machine, 2026-10-11; cycc 6.6.14]
+#
+# The entry guard n > ALLOC_MAX / 8 in num_dst, num_dct and num_idct (and num_idst,
+# through num_dst): every path needs an n * 8-byte buffer, so a larger n can only fail,
+# and wherever the 3.3.5 code answered such an n it returned Err(HSB_ERR_ALLOC). At
+# n = 2^61 + 1 (num_dct, num_idct) and 2^60 (num_dst, num_idst), among others, the cost
+# model's _numx_next_pow2(2 len - 1) doubled past 2^62 to 0 and never returned, and
+# num_dst(2^61 + 1) wrapped n * 8 to 8 bytes and exited 139.
+# [measured: scratch big-n probe, 16 sizes from 2^28 + 1 to 2^63 - 1 x 4 entries, 3.3.5 tree and this tree, 2026-10-11]
+fn _numx_bluestein_capped(len) {
+    if (num_is_pow2(len) == 1) { return 0; }
+    if (len > _NUMX_DFT_MAX) { return 1; }
+    return 0;
+}
+
 # Discrete Sine Transform Type I (FFTW RODFT00), in-place.
 # Kernel: X[k] = sum_i x[i] * sin(PI*(i+1)*(k+1)/(n+1)).
 # Labelled "Type II" through 2.6.14; DST-II is sin(PI*(i+0.5)*(k+1)/n), which
@@ -814,11 +852,12 @@ fn _numx_use_fft(n, len, post) {
 #must_use
 public fn num_dst(data, n) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }   # see _numx_bluestein_capped
     if (n == 1) { return Ok(0); }   # sin(PI/2) == 1 exactly
     var big_n = 2 * (n + 1);
     # post = 0: DST-I's post-pass is a negate and a halve, not a twiddle.
     if (_numx_use_fft(n, big_n, 0) == 0) { return _numx_dst_direct(data, n); }
-    if (big_n > _NUMX_DFT_MAX) { return _numx_dst_direct(data, n); }
+    if (_numx_bluestein_capped(big_n) == 1) { return _numx_dst_direct(data, n); }
 
     # Odd extension of length 2*(n+1): y[0] = y[n+1] = 0, y[j+1] = x[j],
     # y[2n+1-j] = -x[j]. Its DFT is purely imaginary and carries the DST-I
@@ -914,9 +953,10 @@ public fn num_idst(data, n) {
 #must_use
 public fn num_dct(data, n) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }   # see _numx_bluestein_capped
     if (n == 1) { return Ok(0); }   # X[0] = x[0] * cos(0)
     if (_numx_use_fft(n, n, 2) == 0) { return _numx_dct_direct(data, n); }
-    if (n > _NUMX_DFT_MAX) { return _numx_dct_direct(data, n); }
+    if (_numx_bluestein_capped(n) == 1) { return _numx_dct_direct(data, n); }
 
     # v = even-indexed samples in order, then odd-indexed samples reversed.
     var v = alloc(n * 16);
@@ -990,9 +1030,10 @@ fn _numx_dct_direct(data, n) {
 #must_use
 public fn num_idct(data, n) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }   # see _numx_bluestein_capped
     if (n == 1) { return Ok(0); }   # x[0] = X[0] / 1
     if (_numx_use_fft(n, n, 2) == 0) { return _numx_idct_direct(data, n); }
-    if (n > _NUMX_DFT_MAX) { return _numx_idct_direct(data, n); }
+    if (_numx_bluestein_capped(n) == 1) { return _numx_idct_direct(data, n); }
 
     # Z[k] = (X[k] - i X[n-k]) * e^{+i PI k / (2n)}, with X[n] taken as 0.
     # The 1/n of the (2/n) scale is supplied by the inverse DFT; the 2 is
@@ -1241,6 +1282,7 @@ public fn num_halton(index, base) {
     # i / base == i, so `while (i > 0)` never advances and the function hangs
     # forever while `f` underflows to zero. base < 0 terminates but leaves the
     # documented range. Reject all three at the door.
+    # [measured: tests/modules_b.tcyr, group "2.8.3: num_halton rejects bases below 2"]
     if (base < 2) { return _NUMX_F64_ZERO; }
     var result = _NUMX_F64_ZERO;
     var f = f64_div(_NUMX_F64_ONE, f64_from(base));
@@ -1334,7 +1376,7 @@ public fn num_sobol(index) {
 # NOTE for anyone adding a fixture: a DIAGONAL system (a and c all zero) makes
 # c'[i] == 0, collapses denom to b[i] and multiplies both the d' recurrence and
 # the back-substitution by zero -- the only fixture until 2.8.3, and it left
-# ~60 of these 70 lines uncertified. tests/modules.tcyr now solves a 1-D Poisson
+# ~60 of the function's 70 lines uncertified. tests/modules.tcyr now solves a 1-D Poisson
 # system and an asymmetric (sub != super) system whose right-hand sides were
 # built as d = A x for a chosen integer x.
 #must_use

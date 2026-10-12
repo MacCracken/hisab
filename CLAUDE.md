@@ -179,7 +179,10 @@ VERSION              — single source of truth for version
   and `code_size`, not in `var_table`). Check it with
   `CYRIUS_STATS=1 cyrius check --with-deps dist/hisab.cyr`
 - **Source files only need project includes** — stdlib + first-party deps auto-resolve from `cyrius.cyml`
-- **Every buffer is a contract**: `var buf[N]` = N bytes
+- **Every buffer is a contract**: a bare `var buf[N]` is N **bytes** in a function and N **i64 slots**
+  (N·8 bytes) at top level — the language's documented, scope-dependent meaning (cyrius guide,
+  "Arrays: byte vs slot sizing"). Say what you mean with `var a: T[N]`, exactly N·sizeof(T) in
+  every scope: `u8[N]` for bytes, `i64[N]` for slots
 - **Programs call `main()` at top level**: `var exit_code = main(); sys_exit_group(exit_code);`
   — `sys_exit_group`, never `syscall(60, …)`/`syscall(SYS_EXIT, …)`: SYS_EXIT ends only the
   *calling thread*. Test harnesses **clamp** first (`if (r > 0) { r = 1; }`) — `assert_summary()`

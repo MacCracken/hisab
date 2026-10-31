@@ -150,6 +150,12 @@ skeptic: do that before sizing a repair. Review and repair each here.
   catches 45 of 3.3.7's 263 constructed wrong answers (44 of them the diagonal floor already
   catches) for n³ multiply-adds per answer (+67% of `eigen_power_12x12`'s matvec work).
 
+- **`lyapunov_max` takes ganita QR's silent band as an answer**: for Z with a column norm in
+  the band where ganita's reflector norm overflows (all-equal 2×2 at 1.531–1.657·2^1022), QR
+  returns status 0 with R = Z, finite, and r00 = |Z₀₀| enters the average. Derived from the ganita
+  filing (2026-10-31), not yet measured through `lyapunov_max`. Measure it, then refuse or factor
+  a scaled Z.
+
 *Numerics*
 - **238 of 364 allocation sites are unchecked across 30 modules**, 63 of them sized from a variable
   (a heuristic scan: a variable assigned from `alloc` / `_f64arr_alloc` / `arena_alloc` and never
@@ -491,14 +497,16 @@ Nothing in this section is scheduled until the maintainer decides it.
   `svd_compute` / `svd_truncated` handle all three, and `_lext_mat_all_finite` stays for consumers
   whose ganita is 1.2.11 or older.
 
-⚠ **Reported to the maintainer in 3.3.7, not filed** (filing is the maintainer's call):
-- ganita 1.2.14's `ganita_mat_qr` returns status 0 with −Inf in Q and R (R00 = Q00 =
-  0xFFF0000000000000) for the finite all-equal 2×2 with a = 1.5·2^1023, under cyrius 6.6.20; at
-  a = 1.5·2^1022 its Householder overflows internally. hisab's `lyapunov_max` refuses both since
-  3.3.7.
-- ganita 1.2.14's `ganita_mat_svd` returns status 0 with σ₁ = DBL_MAX for [[h, h], [h, h]],
-  h = 2^1023, whose σ₁ = 2^1024 overflows (1.2.11 returned +Inf). hisab's wrappers certify and
-  refuse it since 3.3.7.
+🔴 **Open upstream (ganita), filed 2026-10-31**: `ganita_mat_qr` and `ganita_mat_least_squares`
+answer wrongly with status 0 once a column's norm passes about DBL_MAX/2. Q = I and R = A (every
+entry finite) for the all-equal 2×2 at 1.531–1.657·2^1022, non-finite factors above it, and
+least_squares (+∞, −∞) for a system whose solution is about (1, −1). The repro exits 6 on ganita
+1.2.5 through 1.2.15 (every fold through cyrius 6.7.18). hisab's record is
+`issues/2026-10-31-ganita-qr-householder-overflow-near-dbl-max.md`; `lyapunov_max`'s exposure is a
+[3.3.8] row.
+- **Not filed**: the σ₁ = DBL_MAX that 3.3.7 reported for [[h, h], [h, h]], h = 2^1023. ganita's σ₁
+  is 1 ulp low at every scale (0x3FFF…FF for h = 1), within its documented accuracy. hisab's
+  wrappers refuse it.
 
 ✅ **ganita's `atan2` filing closed in 3.3.4** (ganita 1.2.11, cyrius 6.6.13): the tripwires are
 flipped, the D132 rows are pinned as C99 values, and the record is in

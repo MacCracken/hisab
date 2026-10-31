@@ -1,7 +1,7 @@
 # transforms.cyr -- 2D/3D transforms, interpolation, projections
 # Usage: shipped inside dist/hisab.cyr; in-tree, include "src/transforms.cyr" after what it requires
-# Requires: src/error.cyr, src/f64_util.cyr, src/mat4.cyr, src/quat.cyr, src/vec2.cyr, src/vec3.cyr,
-#           src/vec4.cyr (stdlib resolves via cyrius.cyml [deps])
+# Requires: src/error.cyr, src/mat4.cyr, src/quat.cyr, src/vec2.cyr, src/vec3.cyr, src/vec4.cyr
+#           (stdlib resolves via cyrius.cyml [deps])
 
 # ================================================================
 # Transform2D: position (Vec2), rotation (f64 radians), scale (Vec2)
@@ -217,14 +217,44 @@ public fn world_to_screen(point, mvp, vw, vh) {
       );
 }
 
+# 1 when inv_w = 1 / w is not a normal double (it overflowed, or it is subnormal) while w
+# itself is finite and non-zero: the bands world_to_screen divides on a copy (3.3.7, for
+# screen_to_world_ray).
+fn _t3d_w_copy(p, inv_w) {
+    var ai = f64_abs(inv_w);
+    if (f64_lt(ai, F64_TINY) == 1 || f64_lt(ai, F64_POS_INF) == 0) {
+        var w = HVec4_w(p);
+        if (f64_eq(w, 0) == 0 && f64_lt(f64_abs(w), F64_POS_INF) == 1) { return 1; }
+    }
+    return 0;
+}
+
 # Returns two Vec3: origin and direction (via out params)
 public fn screen_to_world_ray(sx, sy, inv_vp, vw, vh, out_origin, out_dir) {
     var nx = f64_sub(f64_mul(f64_div(sx, vw), F64_TWO), F64_ONE);
     var ny = f64_sub(F64_ONE, f64_mul(f64_div(sy, vh), F64_TWO));
     var near = m4_mul_vec4(inv_vp, hvec4_new(nx, ny, f64_neg(F64_ONE), F64_ONE));
     var far = m4_mul_vec4(inv_vp, hvec4_new(nx, ny, F64_ONE, F64_ONE));
+    # ⛔ 3.3.7 — THE RECIPROCAL world_to_screen LOST IN 3.3.5, LOST HERE TOO. 1 / w overflows
+    # for every subnormal |w| <= 2^-1024 and is subnormal past 2^1022, so inv_vp = 2^-1074 I on
+    # 800 x 600 gave the centre's origin (NaN, NaN, -Inf) and a NaN direction, where the exact
+    # answer is the origin (nx, ny, -1) and the direction (0, 0, 1). Each point is divided on
+    # world_to_screen's power-of-two copy (_t3d_clip_w_scaled) where its 1 / w is not normal and
+    # w is finite and non-zero; w = +-0, NaN and +-Inf keep their arithmetic. Against the exact
+    # quotients of the clip vectors m4_mul_vec4 forms (3,445 points in the bands and around
+    # them), 2,399 answers went wrong -> right and none right -> wrong; the one still past 4 ulp
+    # is a direction normalised from a difference that cancels (4.6 ulp).
+    # [measured: rt337 band sweep (row6.py, seed 601), exact Fraction quotients, 3.3.6 vs this tree, 2026-10-31]
     var nw = f64_div(F64_ONE, HVec4_w(near));
+    if (_t3d_w_copy(near, nw) == 1) {
+        near = _t3d_clip_w_scaled(near);
+        nw = f64_div(F64_ONE, HVec4_w(near));
+    }
     var fw = f64_div(F64_ONE, HVec4_w(far));
+    if (_t3d_w_copy(far, fw) == 1) {
+        far = _t3d_clip_w_scaled(far);
+        fw = f64_div(F64_ONE, HVec4_w(far));
+    }
     var np = hvec3_new(f64_mul(HVec4_x(near), nw), f64_mul(HVec4_y(near), nw), f64_mul(HVec4_z(near), nw));
     var fp = hvec3_new(f64_mul(HVec4_x(far), fw), f64_mul(HVec4_y(far), fw), f64_mul(HVec4_z(far), fw));
     store64(out_origin, np);

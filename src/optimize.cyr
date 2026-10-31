@@ -233,19 +233,53 @@ fn _opt_scale_pow2(v, n, m) {
     return 0;
 }
 
+# x * 2^m, for -2044 <= m <= 2046, in two steps (each factor a normal power of two): exact
+# where the result is normal. At m = -2045 or -2046 a factor's exponent field would be 0.
+# The callers stay inside: _opt_pair_scale's power is at most 1023 in magnitude, and
+# _opt_armijo scales its decrease back by -2 times one that is negative, at most 2046.
+fn _opt_pow2(x, m) {
+    var m1 = m / 2;
+    return f64_mul(f64_mul(x, (1023 + m1) << 52), (1023 + m - m1) << 52);
+}
+
 # Armijo backtracking line search.
 # Finds alpha such that f(x + alpha*d) <= f(x) + c1*alpha*(grad . d).
 # Writes x + alpha*d into x_trial.
 # Returns the f64 step size alpha.
 fn _opt_armijo(f, x, d, grad_ptr, n, f_old, x_trial) {
     var dg = _opt_dot(d, grad_ptr, n);
+    # ⛔ 3.3.7 — d.g OVERFLOWED WHERE THE ARMIJO DECREASE DID NOT. d.g goes as the square of
+    # the gradient's scale, so from |g| near 2^512 it was +-Inf while c1 * alpha * d.g is
+    # 2^-13 of it: a descent direction's threshold was -Inf, no step passed, and after 40
+    # halvings the fallback took alpha = 2^-40. opt_conjugate_gradient, whose direction
+    # stays at the gradient's scale, made no progress on the BFGS scale fixture from
+    # k = 2^496 (see there). An infinite d.g is now formed from d and g each rescaled by the
+    # power of two _opt_pair_scale gives their norms, and the decrease is multiplied back
+    # (dsc). A finite d.g takes the 3.3.6 operations, bit for bit.
+    var dsc = 0;
+    if (f64_eq(f64_abs(dg), F64_POS_INF) == 1) {
+        var dm = _opt_pair_scale(_opt_norm(d, n), _opt_norm(grad_ptr, n));
+        if (dm != 0) {
+            var sdg = _OPT_F64_ZERO;
+            var di = 0;
+            while (di < n) {
+                var dd = _opt_pow2(load64(d + di * 8), dm);
+                sdg = f64_add(sdg, f64_mul(dd, _opt_pow2(load64(grad_ptr + di * 8), dm)));
+                di = di + 1;
+            }
+            dg = sdg;
+            dsc = 0 - 2 * dm;
+        }
+    }
     var alpha = _OPT_F64_ONE;
 
     var ls = 0;
     while (ls < _OPT_MAX_LS) {
         _opt_axpy(x_trial, x, alpha, d, n);
         var f_new = fncall1(f, x_trial);
-        var threshold = f64_add(f_old, f64_mul(_OPT_F64_C1, f64_mul(alpha, dg)));
+        var dec = f64_mul(_OPT_F64_C1, f64_mul(alpha, dg));
+        if (dsc != 0) { dec = _opt_pow2(dec, dsc); }
+        var threshold = f64_add(f_old, dec);
         if (f64_lt(f_new, threshold) == 1) {
             return alpha;
         }
@@ -268,8 +302,19 @@ fn _opt_armijo(f, x, d, grad_ptr, n, f_old, x_trial) {
         # which it rejects: CG then lands on exactly 3 at all three tolerances, and the
         # NaN-gradient runs stay NO_CONVERGENCE.
         # [measured: NaN-threshold probe, 3.3.2 and 3.3.3 bundles and an f64_le build, 2026-10-01]
+        # ⛔ 3.3.7 — AND A STEP TO f = +Inf PASSED A THRESHOLD THAT HAD OVERFLOWED. Along a
+        # direction that is not a descent one, f_old + c1 * alpha * d.g can round to +Inf (a
+        # d.g that overflowed to +Inf made it so in 3.3.6 too), and +Inf <= +Inf took the
+        # step. With the d.g repair above and not this one, opt_conjugate_gradient at
+        # k = 2^504 on the BFGS scale fixture took such a step at its second iteration and
+        # returned NaN (3.3.6 there: a finite wrong point, both NO_CONVERGENCE). A step from a
+        # finite f to +Inf is never a decrease, and is now refused; from an infinite or NaN
+        # f_old it is taken as before.
+        # [measured: scratch CG variant sweeps (pcgv2.cyr, pcgv5.cyr, pcgdbg.cyr), 2026-10-31]
         if (f64_eq(f_new, f_new) == 1 && f64_lt(threshold, f_new) == 0) {
-            return alpha;
+            if (f64_eq(f_new, F64_POS_INF) == 0 || f64_lt(f64_abs(f_old), F64_POS_INF) == 0) {
+                return alpha;
+            }
         }
         alpha = f64_mul(alpha, _OPT_F64_HALF);
         ls = ls + 1;
@@ -466,17 +511,49 @@ public fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin)
         # variables' squared, so an absolute 1e-12 silently zeroed beta — turning
         # Polak-Ribiere back into steepest descent — for any problem scaled small.
         # The only thing that fails is the division, at a zero denominator.
-        if (f64_lt(F64_TINY, gg_old) == 1) {
-            # Compute g_new - g_old dot g_new
-            var pr_dot = _OPT_F64_ZERO;
-            var bi = 0;
-            while (bi < n) {
-                var diff = f64_sub(load64(g_new + bi * 8), load64(g + bi * 8));
-                pr_dot = f64_add(pr_dot, f64_mul(load64(g_new + bi * 8), diff));
-                bi = bi + 1;
+        # ⛔ 3.3.7 — BETA WAS FORMED AT THE GRADIENTS' OWN SCALE. Its numerator and
+        # denominator go as the square of the gradient, so on the BFGS scale fixture
+        # (opt_bfgs's 3.3.6 repair) gg_old fell below DBL_MIN near the minimum from
+        # k = 2^-486 and beta was 0, a steepest-descent restart every step; from k = 2^496
+        # gg_old overflowed to +Inf and beta was -0, the same restart. beta is a ratio,
+        # invariant when g_old and g_new are multiplied by the same constant, so the pair
+        # (g_old, g_new) is taken at the scale _opt_pair_scale gives their norms, as BFGS
+        # takes (s, y); in the band it leaves alone, beta is 3.3.6's bits. Where f(x) is 0
+        # the Armijo test ties at every trial and cannot measure a step, and a rescaled beta
+        # there compounded the blind unit steps to overflow (out_x NaN from k = 2^-560 down,
+        # where 3.3.6 left a finite point; both NO_CONVERGENCE), so a zero f(x) keeps the
+        # unscaled beta.
+        # [measured: scratch CG variant sweeps (pcgv0-5.cyr, pcgdbg0.cyr), k = 2^-1022..2^504, 2026-10-31]
+        var pm = 0;
+        if (f64_eq(f_old, _OPT_F64_ZERO) == 0) { pm = _opt_pair_scale(gnorm, _opt_norm_ss(g_new, n, gg_new)); }
+        if (pm == 0) {
+            if (f64_lt(F64_TINY, gg_old) == 1) {
+                # Compute g_new - g_old dot g_new
+                var pr_dot = _OPT_F64_ZERO;
+                var bi = 0;
+                while (bi < n) {
+                    var diff = f64_sub(load64(g_new + bi * 8), load64(g + bi * 8));
+                    pr_dot = f64_add(pr_dot, f64_mul(load64(g_new + bi * 8), diff));
+                    bi = bi + 1;
+                }
+                beta = f64_div(pr_dot, gg_old);
+                if (f64_lt(beta, _OPT_F64_ZERO) == 1) { beta = _OPT_F64_ZERO; }
             }
-            beta = f64_div(pr_dot, gg_old);
-            if (f64_lt(beta, _OPT_F64_ZERO) == 1) { beta = _OPT_F64_ZERO; }
+        } else {
+            var pr_s = _OPT_F64_ZERO;
+            var gg_s = _OPT_F64_ZERO;
+            var bj = 0;
+            while (bj < n) {
+                var gn = _opt_pow2(load64(g_new + bj * 8), pm);
+                var go = _opt_pow2(load64(g + bj * 8), pm);
+                pr_s = f64_add(pr_s, f64_mul(gn, f64_sub(gn, go)));
+                gg_s = f64_add(gg_s, f64_mul(go, go));
+                bj = bj + 1;
+            }
+            if (f64_lt(_OPT_F64_ZERO, gg_s) == 1) {
+                beta = f64_div(pr_s, gg_s);
+                if (f64_lt(beta, _OPT_F64_ZERO) == 1) { beta = _OPT_F64_ZERO; }
+            }
         }
 
         # Update search direction: d = -g_new + beta * d

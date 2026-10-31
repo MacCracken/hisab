@@ -38,9 +38,9 @@ those call sites quietly passing against the old function forever, which is the 
 removes. **2.24.0 is the supported 2.x line.**
 
 ⚠ **Minimum toolchain: hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3.** `public struct` + `#derive` is
-refused by cycc 6.6.2; measured again in 3.3.6 from dirs pinned to each version, the 3.3.6 bundle is
+refused by cycc 6.6.2; measured again in 3.3.7 from dirs pinned to each version, the 3.3.7 bundle is
 refused under 6.6.2 and compiles and runs a cross-module program under 6.6.3, 6.6.6, 6.6.9, 6.6.10,
-6.6.12, 6.6.13 and 6.6.14. Bump `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1.
+6.6.12, 6.6.13, 6.6.14 and 6.6.20. Bump `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1.
 Some results follow your toolchain rather than hisab's:
 - A zero produced by negation is −0 from cyrius **6.6.8** (IEEE sign flip; +0 below).
 - `dual_pow` is within 1 ulp from **6.6.10** (ganita 1.2.8's `pow`).
@@ -48,9 +48,15 @@ Some results follow your toolchain rather than hisab's:
   branch cut for a −0 imaginary part, and `atan2` of a NaN is NaN; `sinh`/`cosh` are re-derived,
   so `cx_sin`, `cx_cos` and the Lorentz builders change bits; and `f64_tan` is ganita's (hisab's
   own was retired in 3.3.4). A consumer moving to 6.6.13 must re-vendor `lib/math.cyr`.
+- From **6.6.16** (ganita 1.2.13; 1.2.14 from 6.6.19): `ganita_mat_svd` is a new algorithm, so
+  `svd_compute` / `svd_truncated` return its bits wherever it answers.
 - Below **6.6.9** the perspective builders' focal term can differ by an ulp (x87 `sin`/`cos`), and
   `ivl_sin` returns [−1, 1] (since 3.3.5 it detects the x87 `fsin`, which does not enclose near
   multiples of π).
+
+⚠ **Since 3.3.7 `dist/hisab.deps` names only the 7 stdlib leaves the bundle needs** (math, alloc,
+vec, ganita, result, str, fmt; it listed hisab's 16 through 3.3.6). Declare any other leaf your own
+code uses (`assert`, `io`, `args`, `syscalls`, `string`, …) in your manifest.
 
 Since 3.3.4 a NaN spatial-hash coordinate goes into cell 0 on every pin, and a query with a NaN
 centre or radius returns nothing (3.3.3 returned every entry for a NaN radius).
@@ -82,7 +88,7 @@ centre or radius returns nothing (3.3.3 returned every entry for a NaN radius).
 name        = "your-project"
 version     = "${file:VERSION}"
 language    = "cyrius"
-cyrius      = "6.6.14"
+cyrius      = "6.6.20"
 
 [deps]
 # `ganita` (Cyrius 6.2.x) provides the transcendentals (acos/asin/atan2/pow/
@@ -161,14 +167,15 @@ compiles, and the callee silently receives the **tag**. See
 
 ```sh
 cyrius build src/main.cyr build/hisab
-cyrius test tests/hisab.tcyr        # 791 cross-module integration assertions
-cyrius test tests/foundation.tcyr   # 686 vec/quat/mat foundation assertions
-cyrius test tests/modules.tcyr      # 2197 per-module assertions (first half)
-cyrius test tests/modules_b.tcyr    # 2293 per-module assertions (second half)
-cyrius test tests/edge_cases.tcyr   # 695 degenerate-input assertions
-cyrius test tests/abuse.tcyr        # 1899 hostile-input assertions (negative indices,
+cyrius test tests/hisab.tcyr        # 827 cross-module integration assertions
+cyrius test tests/foundation.tcyr   # 699 vec/quat/mat foundation assertions
+cyrius test tests/modules.tcyr      # 2396 per-module assertions (first third)
+cyrius test tests/modules_b.tcyr    # 1148 per-module assertions (second third)
+cyrius test tests/modules_c.tcyr    # 1165 per-module assertions (last third)
+cyrius test tests/edge_cases.tcyr   # 777 degenerate-input assertions
+cyrius test tests/abuse.tcyr        # 2011 hostile-input assertions (negative indices,
                                     #   zero/huge dimensions, non-conformable operands, canaries)
-cyrius bench tests/hisab.bcyr       # 145 benchmarks
+cyrius bench tests/hisab.bcyr       # 156 benchmarks
 cyrius fuzz                         # 5 fuzz targets with invariant checks
 ```
 
@@ -180,15 +187,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.3.6 |
-| Library | 35 modules, ~40,100 lines of Cyrius |
-| Tests | 8561 assertions across 6 suites |
-| Benchmarks | 145 operations |
+| Version | 3.3.7 |
+| Library | 35 modules, ~42,600 lines of Cyrius |
+| Tests | 9023 assertions across 7 suites |
+| Benchmarks | 156 operations |
 | Fuzz targets | 6 seeded generators with invariant checks (vec3, quat, ray, gcd, m4_inverse, einsum notation), plus the fixed self-test buffers |
-| CLI binary | ~326 KB static ELF (`build/hisab` — version smoke test only) |
-| Toolchain | Cyrius 6.6.14 |
-| Dependencies | 1 (sakshi 2.5.6); no third-party, no FFI/libc |
-| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 271 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared (3.1.0) and enforced (3.3.0)**: every non-underscore top-level declaration carries `public`, the shipped bundle is `private` so a consumer naming anything else is refused at compile time (enum constants excepted: the language gives them no visibility, so a non-public enum's members are `_`-named), and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **4 open filings** in [docs/development/issues/](docs/development/issues/) (39 archived), all upstream and all hisab-unexposed or loud: two in cyrius (top-level `fncallN` on a capturing closure crashes; a closure's `return` of a `: stack` value is booked against the enclosing fn) and two in ganita (`ganita_mat_svd` refuses rank-deficient and tiny-rotation matrices, which hisab now answers through its own SVD; it accepts non-finite input, which hisab refuses first). ganita's `atan2` filing closed in 3.3.4 when ganita 1.2.11 repaired it. The 3.2.1 benchmark-statistic filing was repaired upstream in cyrius 6.6.9 and closed here in 3.2.2 with a paired measurement. The cycc wrong-code defect 3.2.0 found (the register picker dropping an `f64v_*` destination-slot store, wrong on 6.6.0–6.6.4) was repaired upstream in 6.6.5 and closed here in 3.2.1; `m3_mul_vec3` keeps its hoisted form because six of the ten live consumers pin cyrius 6.6.3, which compiles a 3.x bundle but sits below the fix (goonj and attn11, on 6.6.2, cannot compile 3.1.0 or later; pins read 2026-10-11). Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
+| CLI binary | ~364 KB static ELF (`build/hisab` — version smoke test only) |
+| Toolchain | Cyrius 6.6.20 |
+| Dependencies | 1 (sakshi 2.5.7); no third-party, no FFI/libc |
+| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 272 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared (3.1.0) and enforced (3.3.0)**: every non-underscore top-level declaration carries `public`, the shipped bundle is `private` so a consumer naming anything else is refused at compile time (enum constants excepted: the language gives them no visibility, so a non-public enum's members are `_`-named), and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **No open filings** in [docs/development/issues/](docs/development/issues/) (43 archived): 3.3.7 closed the last four with paired runs on cyrius 6.6.14 and 6.6.20 — two in cyrius (top-level `fncallN` on a capturing closure crashed; a closure's `return` of a `: stack` value was booked against the enclosing fn; both fixed in 6.6.16) and two in ganita (`ganita_mat_svd` refused rank-deficient and tiny-rotation matrices and accepted non-finite input; both fixed in ganita 1.2.12). ganita's `atan2` filing closed in 3.3.4 when ganita 1.2.11 repaired it. The 3.2.1 benchmark-statistic filing was repaired upstream in cyrius 6.6.9 and closed here in 3.2.2 with a paired measurement. The cycc wrong-code defect 3.2.0 found (the register picker dropping an `f64v_*` destination-slot store, wrong on 6.6.0–6.6.4) was repaired upstream in 6.6.5 and closed here in 3.2.1; `m3_mul_vec3` keeps its hoisted form because six of the ten live consumers pin cyrius 6.6.3, which compiles a 3.x bundle but sits below the fix (goonj and attn11, on 6.6.2, cannot compile 3.1.0 or later; pins read 2026-10-31). Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
 
 ## License
 

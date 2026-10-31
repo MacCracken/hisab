@@ -421,6 +421,22 @@ assert_eq(cga_mv_get(cga_q, 2), 0xBFF8000000000000, "cga point q e2 = -1.5");
 assert_eq(cga_mv_get(cga_q, 3), F64_TWO, "cga point q e3 = 2");
 assert_eq(cga_mv_get(cga_q, 4), F64_ONE, "cga point q n0 = 1");
 assert_eq(cga_mv_get(cga_q, 5), 0x400A000000000000, "cga point q ninf = 6.5/2 = 3.25");
+# ⭐ 3.3.7 — A CGA PRODUCT ALLOCATES ITS RESULT AND NOTHING ELSE. _cga_geo_blades wrote each
+# term pair into a fresh 32-byte block (D051); it now writes the caller's stack buffer. And
+# the scalar part reads the 32 blade pairs that reach blade 0 from a list built once (D050),
+# where it asked for every pair of non-zero coefficients. Both bounds are exact here (the
+# null table and the pair list are built by the products above).
+# [measured: scratch pfb/cgaprobe.cyr and cgq.cyr (alloc_used), three trees, 2026-10-31; cycc 6.6.20]
+var cga_ar0 = alloc_used();
+var cga_pq = cga_geometric_product(cga_p, cga_q);
+assert_eq(alloc_used() - cga_ar0, 256,
+  "cga product: allocates its 256 B result only (3.3.6: 1,056 B for point x point)");
+assert_eq(cga_mv_get(cga_pq, 0), 0xC01B000000000000,
+  "cga product: point x point scalar part = -(1/2)|p - q|^2 = -(1/2)(0.25 + 12.25 + 1) = -6.75");
+var cga_ar1 = alloc_used();
+assert_eq(cga_norm_sq(cga_q), 0, "cga_norm_sq(q) is exactly zero at an exact q = 6.5");
+assert_eq(alloc_used() - cga_ar1, 256, "cga_norm_sq: allocates the 256 B reverse only (3.3.6: 1,056 B)");
+assert_eq(_cga_scalar_pairs(), 32, "cga: 32 of the 1,024 blade pairs have a scalar term");
 
 # CGA contraction operators (2.5.0) — interior products. Left (a |_ b) lowers
 # grade(b) by grade(a); right (a _| b) lowers grade(a) by grade(b). Verified
@@ -454,6 +470,9 @@ assert_eq(cga_mv_get(cga_left_contraction(cga_v, cga_v), 0), f64_from(13), "cga 
 var cga_rc = cga_right_contraction(cga_e12, cga_e1);
 assert_eq(cga_mv_get(cga_rc, 2), f64_neg(f64_from(1)), "cga right_contract(e12,e1) = -e2");
 assert_eq(cga_mv_get(cga_rc, 6), f64_from(0), "cga right_contract(e12,e1) drops grade-2 part");
+# A term of sign +1: e1 _| e1 = e1 e1 = +1 (seed-336 mutant m0093 dropped every +1 term; the
+# one above is -1).
+assert_eq(cga_mv_get(cga_right_contraction(cga_e1, cga_e1), 0), F64_ONE, "cga right_contract(e1,e1) = 1");
 
 # Scalar contraction acts as scaling: 2 |_ (5*e12) = 10*e12.
 var cga_s = cga_mv_zero();
@@ -870,6 +889,12 @@ var _y4 = ode_yoshida4(&_ode_free, 0, F64_ONE, F64_ONE);   # q=0, v=1, dt=1 -> q
 assert(_y4 != 0, "yoshida4 returns result");
 assert(f64_lt(f64_abs(f64_sub(load64(_y4), F64_ONE)), f64_div(F64_ONE, f64_from(100000000))) == 1,
   "yoshida4: free particle advances exactly v*dt (sum(c) == 1)");
+# ⛔ 3.3.7 — and bit-exact: c0 + c1 + c1 + c0 in doubles, with every coefficient correctly
+# rounded, is 1 - 2^-53. 3.3.6's _Y4_C0 (1 ulp high) and _Y4_C1 (2 ulp toward zero) gave
+# 1 + 2^-52.
+# [measured: the four drifts replayed in Python doubles with each set of constants, 2026-10-31]
+assert_eq(load64(_y4), 0x3FEFFFFFFFFFFFFF,
+  "yoshida4: free particle q = 1 - 2^-53, the correctly rounded c's (3.3.6: 1 + 2^-52)");
 
 # ----------------------------------------------------------------
 # Symplectic integrators on the SHO  q'' = -q,  start (q, v) = (1, 0).
@@ -1392,6 +1417,58 @@ assert(f64_lt(f64_abs(f64_sub(load64(_lmf_x), 0x3FECCCCCCCCCCCCD)), _lmf_tol9) =
   "opt_lm line fit: intercept a == 9/10 (exact normal-equation solution)");
 assert(f64_lt(f64_abs(f64_sub(load64(_lmf_x + 8), 0x3FF6666666666666)), _lmf_tol9) == 1,
   "opt_lm line fit: slope b == 7/5 (exact normal-equation solution)");
+# ⛔ 3.3.7 — EVERY opt_levenberg_marquardt CALL IN THE SUITES HAS n_params = 2, and at
+# np = 2 a J^T r loop that runs one residual too far (`kk <= nr`, seed-336 mutant m0180)
+# adds the word past j_buf times the word past r_ptr: the next block's header (np = 2 as
+# raw bits, a denormal), so the sum does not move. From np = 3 that word is a J^T J
+# entry, and the gradient's third component is wrong whenever the stale residual past
+# r_ptr is not 0. The fixture fits y = a + b t + c t^2 to t = 0..4, y = (1, 3, 2, 6, 5):
+# J is constant, so the minimiser is the normal-equation solution a = 37/35, b = 97/70,
+# c = -1/14 with min cost 176/35 > 0, which (like the line fit above) can never reach tol,
+# so the parameters are read from the documented NO_CONVERGENCE return, bounded at 1e-9.
+# [measured: scratch python3 fractions oracle (3.3.7), exact 3x3 normal equations]
+var _mt180_t = alloc(40);
+var _mt180_y = alloc(40);
+for (var _mt180_i = 0; _mt180_i < 5; _mt180_i = _mt180_i + 1) {
+    store64(_mt180_t + _mt180_i * 8, f64_from(_mt180_i));
+}
+store64(_mt180_y, F64_ONE);
+store64(_mt180_y + 8, f64_from(3));
+store64(_mt180_y + 16, F64_TWO);
+store64(_mt180_y + 24, f64_from(6));
+store64(_mt180_y + 32, f64_from(5));
+fn _mt180_res(x_ptr) {
+    var out = alloc(40);
+    var i = 0;
+    while (i < 5) {
+        var t = load64(_mt180_t + i * 8);
+        var p = f64_add(load64(x_ptr), f64_mul(t, f64_add(load64(x_ptr + 8), f64_mul(t, load64(x_ptr + 16)))));
+        store64(out + i * 8, f64_sub(p, load64(_mt180_y + i * 8)));
+        i = i + 1;
+    }
+    return out;
+}
+fn _mt180_jac(x_ptr, out) {
+    var i = 0;
+    while (i < 5) {
+        var t = load64(_mt180_t + i * 8);
+        store64(out + (i * 3) * 8, F64_ONE);
+        store64(out + (i * 3 + 1) * 8, t);
+        store64(out + (i * 3 + 2) * 8, f64_mul(t, t));
+        i = i + 1;
+    }
+    return 0;
+}
+var _mt180_x0 = alloc(24);
+var _mt180_x = alloc(24);
+var _mt180_rt, _mt180_rv = opt_levenberg_marquardt(&_mt180_res, &_mt180_jac, _mt180_x0, 3, 5, _ob_tol8, 200, _mt180_x);
+assert_eq(_mt180_rv, HSB_ERR_NO_CONVERGENCE, "opt_lm quadratic fit: min cost 176/35 cannot reach tol");
+assert(f64_lt(f64_abs(f64_sub(load64(_mt180_x), 0x3FF0EA0EA0EA0EA1)), _lmf_tol9) == 1,
+  "opt_lm quadratic fit: a == 37/35 (exact normal-equation solution)");
+assert(f64_lt(f64_abs(f64_sub(load64(_mt180_x + 8), 0x3FF62BE2BE2BE2BE)), _lmf_tol9) == 1,
+  "opt_lm quadratic fit: b == 97/70 (exact normal-equation solution)");
+assert(f64_lt(f64_abs(f64_sub(load64(_mt180_x + 16), 0xBFB2492492492492)), _lmf_tol9) == 1,
+  "opt_lm quadratic fit: c == -1/14 (exact normal-equation solution)");
 
 # (e) _opt_armijo's BACKTRACKING, shared by BFGS, L-BFGS and CG. The two
 # problems above do not need it: disabling the halving (alpha pinned at 1) left
@@ -1426,6 +1503,142 @@ assert(f64_lt(f64_abs(load64(_oa_x)), opt_tol6) == 1, "opt_lbfgs x^4+x^2: x* == 
 var _rq68t, _rq68v = opt_conjugate_gradient(&_oa_f, &_oa_g, _oa_x0, 1, _ob_tol8, 40, _oa_x, _oa_fm);
 assert_eq(is_ok(_rq68t), 1, "opt_conjugate_gradient: x^4 + x^2 from x=3 converges");
 assert(f64_lt(f64_abs(load64(_oa_x)), opt_tol6) == 1, "opt_cg x^4+x^2: x* == 0");
+
+test_group("3.3.7 opt_conjugate_gradient / _opt_armijo: the BFGS scale fixture");
+# f = (x0 - k)^2 + 1e5 (x1 - 2k)^2 from (-k/2, 5k/2), tol k * 1e-8, 400 iterations: the
+# fixture 3.3.6 repaired opt_bfgs on. CG returned NO_CONVERGENCE from k = 2^-486 down and
+# from 2^496 up: beta's g.g fell below DBL_MIN near the minimum (beta 0, a restart every
+# step) or overflowed (beta -0, the same restart), and _opt_armijo's d.g overflowed from
+# |g| near 2^512 (a -Inf threshold, 40 halvings, the 2^-40 fallback). beta now comes from
+# the pair rescaled as BFGS's is, an infinite d.g from rescaled d and g, and a step from a
+# finite f to +Inf is refused. From 2^-490 to 2^504 the answer is the k = 1 answer times k, bit for bit (3.3.6:
+# 2^-484 to 2^495), and every k from 2^-495 converges. Below that f itself falls under
+# DBL_MIN near the minimum and Armijo cannot measure a step: the documented limit.
+# [measured: scratch optimizer sweeps (pcg.cyr, pbf.cyr, plbf.cyr), k = 2^-1022..2^504, base and this tree, 2026-10-31]
+var _CG7_K = F64_ONE;
+var _CG7_NF = 0;
+fn _cg7_f(x) {
+    _CG7_NF = _CG7_NF + 1;
+    var a = f64_sub(load64(x), _CG7_K);
+    var b = f64_sub(load64(x + 8), f64_mul(F64_TWO, _CG7_K));
+    return f64_add(f64_mul(a, a), f64_mul(0x40F86A0000000000, f64_mul(b, b)));       # 1e5
+}
+fn _cg7_g(x, out) {
+    store64(out, f64_mul(F64_TWO, f64_sub(load64(x), _CG7_K)));
+    store64(out + 8, f64_mul(0x41086A0000000000, f64_sub(load64(x + 8), f64_mul(F64_TWO, _CG7_K))));   # 2e5
+    return 0;
+}
+var _cg7_x0 = alloc(16);
+var _cg7_ox = alloc(16);
+var _cg7_of = alloc(8);
+# solver 0 CG, 1 BFGS, 2 L-BFGS on the fixture scaled by 2^e: its solution goes to _cg7_ox, its
+# evaluations of f to _CG7_NF.
+fn _cg7_run(e, solver) {
+    _CG7_K = (1023 + e) << 52;
+    store64(_cg7_x0, f64_neg(f64_mul(_CG7_K, F64_HALF)));
+    store64(_cg7_x0 + 8, f64_mul(_CG7_K, f64_div(f64_from(5), F64_TWO)));
+    var tol = f64_mul(_CG7_K, f64_div(F64_ONE, f64_from(100000000)));
+    _CG7_NF = 0;
+    var ok = 0;
+    if (solver == 0) {
+        var t0, v0 = opt_conjugate_gradient(&_cg7_f, &_cg7_g, _cg7_x0, 2, tol, 400, _cg7_ox, _cg7_of);
+        ok = is_ok(t0);
+    }
+    if (solver == 1) {
+        var t1, v1 = opt_bfgs(&_cg7_f, &_cg7_g, _cg7_x0, 2, tol, 400, _cg7_ox, _cg7_of);
+        ok = is_ok(t1);
+    }
+    if (solver == 2) {
+        var t2, v2 = opt_lbfgs(&_cg7_f, &_cg7_g, _cg7_x0, 2, 5, tol, 400, _cg7_ox, _cg7_of);
+        ok = is_ok(t2);
+    }
+    return ok;
+}
+# 1 when the answer at 2^e is the k = 1 answer (u0, u1) times 2^e exactly.
+fn _cg7_scaled(e, u0, u1) {
+    if (load64(_cg7_ox) != f64_mul(u0, (1023 + e) << 52)) { return 0; }
+    if (load64(_cg7_ox + 8) != f64_mul(u1, (1023 + e) << 52)) { return 0; }
+    return 1;
+}
+assert_eq(_cg7_run(0, 0), 1, "opt_conjugate_gradient: the scale fixture at k = 1 converges");
+var _cg7_u0 = load64(_cg7_ox);
+var _cg7_u1 = load64(_cg7_ox + 8);
+assert_eq(_cg7_run(0 - 486, 0), 1, "opt_conjugate_gradient: k = 2^-486 converges (3.3.6: NO_CONVERGENCE)");
+assert_eq(_cg7_scaled(0 - 486, _cg7_u0, _cg7_u1), 1,
+  "opt_conjugate_gradient: k = 2^-486 -> 2^-486 times the k = 1 answer");
+assert_eq(_cg7_run(0 - 490, 0), 1, "opt_conjugate_gradient: k = 2^-490 converges (3.3.6: NO_CONVERGENCE)");
+assert_eq(_cg7_scaled(0 - 490, _cg7_u0, _cg7_u1), 1,
+  "opt_conjugate_gradient: k = 2^-490 -> 2^-490 times the k = 1 answer");
+assert_eq(_cg7_run(496, 0), 1, "opt_conjugate_gradient: k = 2^496 converges (3.3.6: NO_CONVERGENCE)");
+assert_eq(_cg7_scaled(496, _cg7_u0, _cg7_u1), 1, "opt_conjugate_gradient: k = 2^496 -> 2^496 times the k = 1 answer");
+assert_eq(_cg7_run(504, 0), 1, "opt_conjugate_gradient: k = 2^504 converges (3.3.6: NO_CONVERGENCE)");
+assert_eq(_cg7_scaled(504, _cg7_u0, _cg7_u1), 1,
+  "opt_conjugate_gradient: k = 2^504 -> 2^504 times the k = 1 answer (a step to f = +Inf is refused)");
+var _CG7_BAD = 0;
+for (var _cg7_e = 0 - 495; _cg7_e <= 504; _cg7_e = _cg7_e + 1) {
+    if (_cg7_e == 0 - 484) { _cg7_e = 496; }
+    if (_cg7_run(_cg7_e, 0) != 1) { _CG7_BAD = _CG7_BAD + 1; }
+    if (f64_approx_eq(f64_div(load64(_cg7_ox), _CG7_K), F64_ONE, LOOSE_TOL_H) != 1) { _CG7_BAD = _CG7_BAD + 1; }
+    if (f64_approx_eq(f64_div(load64(_cg7_ox + 8), _CG7_K), F64_TWO, LOOSE_TOL_H) != 1) { _CG7_BAD = _CG7_BAD + 1; }
+}
+assert_eq(_CG7_BAD, 0,
+  "opt_conjugate_gradient: (k, 2k) for k = 2^-495 to 2^-485 and 2^496 to 2^504 (3.3.6: none but 2^-485)");
+assert_eq(_cg7_run(0 - 496, 0), 0,
+  "opt_conjugate_gradient: k = 2^-496 -> NO_CONVERGENCE, documented (f under DBL_MIN near the minimum)");
+# Where f(x) itself is 0 (k = 2^-600: f(x0) is about 2^-1185), every Armijo trial ties at
+# alpha = 1; a rescaled beta compounded those blind steps to overflow, so f(x) = 0 keeps
+# the unscaled beta, and the run ends at a finite point, as in 3.3.6.
+assert_eq(_cg7_run(0 - 600, 0), 0, "opt_conjugate_gradient: k = 2^-600 -> NO_CONVERGENCE");
+assert_eq(f64_lt(f64_abs(load64(_cg7_ox + 8)), F64_POS_INF), 1,
+  "opt_conjugate_gradient: k = 2^-600 -> a finite out_x, not NaN (f(x) = 0 keeps the unscaled beta)");
+# BFGS and L-BFGS reached (k, 2k) at 2^500 in 3.3.6 too, after the 40 halvings on their first
+# step: 52 and 50 evaluations of f. They now take the k = 1 path: 30 and 28.
+assert_eq(_cg7_run(500, 1), 1, "opt_bfgs: k = 2^500 converges");
+assert_eq(load64(_cg7_ox), (1023 + 500) << 52, "opt_bfgs: k = 2^500 -> x0 = k exactly");
+assert_eq(_CG7_NF, 30, "opt_bfgs: k = 2^500 evaluates f 30 times, as at k = 1 (3.3.6: 52)");
+assert_eq(_cg7_run(500, 2), 1, "opt_lbfgs: k = 2^500 converges");
+assert_eq(load64(_cg7_ox + 8), (1023 + 501) << 52, "opt_lbfgs: k = 2^500 -> x1 = 2k exactly");
+assert_eq(_CG7_NF, 28, "opt_lbfgs: k = 2^500 evaluates f 28 times, as at k = 1 (3.3.6: 50)");
+# _opt_armijo asked directly. (b) f = 2^12 x^2 at x = 2^500 along d = -g = -2^513: d.g = -2^1026
+# overflows; exact Armijo halves to alpha = 2^-13, where x + alpha d = 0, the minimiser, after 14
+# evaluations (alpha 2^-12 gives f(-2^500) = f(x), above the threshold). 3.3.6: no step
+# passed the -Inf threshold, and the fallback took 2^-40. (c) f = x at DBL_MAX along the
+# non-descent d = 2^1000: the threshold DBL_MAX + 1e-4 alpha 2^1000 rounds to +Inf, and 3.3.6
+# took alpha = 1 to f = +Inf; the first step that keeps f finite is alpha = 2^-31 (2^969 is
+# under half an ulp of DBL_MAX, 2^970 a tie that rounds up to +Inf), which then ties.
+fn _cg7_quad(x) {
+    _CG7_NF = _CG7_NF + 1;
+    var v = load64(x);
+    return f64_mul(0x40B0000000000000, f64_mul(v, v));                     # 2^12 x^2
+}
+fn _cg7_lin(x) {
+    _CG7_NF = _CG7_NF + 1;
+    return load64(x);
+}
+var _cg7_ax = alloc(8);
+var _cg7_ad = alloc(8);
+var _cg7_ag = alloc(8);
+var _cg7_at = alloc(8);
+store64(_cg7_ax, 0x5F30000000000000);                                       # 2^500
+store64(_cg7_ag, 0x6000000000000000);                                       # 2^513
+store64(_cg7_ad, 0xE000000000000000);                                       # -2^513
+_CG7_NF = 0;
+assert_eq(_opt_armijo(&_cg7_quad, _cg7_ax, _cg7_ad, _cg7_ag, 1, 0x7F30000000000000, _cg7_at), 0x3F20000000000000,
+  "_opt_armijo: d.g = -2^1026 overflows -> alpha = 2^-13 (3.3.6: the 2^-40 fallback)");
+assert_eq(load64(_cg7_at), 0, "_opt_armijo: ... and x_trial is the minimiser 0 (3.3.6: 0x5F2FFFFFFC000000)");
+assert_eq(_CG7_NF, 14, "_opt_armijo: ... after 14 evaluations of f (3.3.6: 40)");
+store64(_cg7_ax, 0x7FEFFFFFFFFFFFFF);                                       # DBL_MAX
+store64(_cg7_ag, F64_ONE);
+store64(_cg7_ad, 0x7E70000000000000);                                       # 2^1000
+_CG7_NF = 0;
+assert_eq(_opt_armijo(&_cg7_lin, _cg7_ax, _cg7_ad, _cg7_ag, 1, 0x7FEFFFFFFFFFFFFF, _cg7_at), 0x3E00000000000000,
+  "_opt_armijo: a step from f = DBL_MAX to +Inf is refused -> alpha = 2^-31 (3.3.6: 1)");
+assert_eq(load64(_cg7_at), 0x7FEFFFFFFFFFFFFF, "_opt_armijo: ... x_trial stays DBL_MAX (3.3.6: +Inf)");
+# From a NaN f_old the threshold is NaN, and the 3.3.3 rule still takes the first step whose
+# f_new is not NaN, +Inf included.
+assert_eq(_opt_armijo(&_cg7_lin, _cg7_ax, _cg7_ad, _cg7_ag, 1, 0x7FF8000000000000, _cg7_at), F64_ONE,
+  "_opt_armijo: f_old NaN -> the step to +Inf is taken, alpha = 1, as before");
+_CG7_K = F64_ONE;
 
 # ================================================================
 # Sparse / SVD / Eigen
@@ -4717,8 +4930,12 @@ for (var _g2b_q = 0; _g2b_q < 64; _g2b_q = _g2b_q + 1) {
 _G2B_DIAG = 1;
 var _g2b_ar0 = alloc_used();
 solve_gmres(&_g2b_reuse64, _g2b_b64, _g2b_x64, 64, _g2b_otol, 60, 2);
-assert_lt(alloc_used() - _g2b_ar0, 20480,
-  "gmres(2), A = diag(1..64), 60 matvecs: arena under 20 KB (14,672 B; a slot per step: 34,128)");
+# ⭐ 3.3.7 — and the restart cycle's own buffers (r, the basis pointers, H, g, the Givens
+# pairs, y) are allocated once per call too (D016): 14,672 B -> 2,208 B on this run of 20
+# cycles, so the bound moves from 20 KB to 4 KB.
+# [measured: scratch gm.cyr (alloc_used around the call), 3.3.7 integrated tree and this tree, 2026-10-31; cycc 6.6.20]
+assert_lt(alloc_used() - _g2b_ar0, 4096,
+  "gmres(2), A = diag(1..64), 60 matvecs: arena under 4 KB (2,208 B; per-cycle buffers as through 3.3.6: 14,672)");
 _G2B_DIAG = 0;
 var _g2b_ar1 = alloc_used();
 solve_gmres(&_g2b_reuse64, _g2b_b64, _g2b_x64, 64, _g2b_otol, 200, 64);

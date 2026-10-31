@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mutation-test.sh -- install single-operator mutants of src/ into scratch copies of the
-# tree, run the six suites against each, and report which mutants no suite kills.
+# tree, run the suites against each, and report which mutants no suite kills.
 #
 # WHY IT EXISTS
 # CLAUDE.md asks for every new assertion to be mutation-proven, and the 2026-08-11
@@ -81,7 +81,7 @@ trap cleanup EXIT
 cat > "$WORK/mut.py" <<'PYEOF'
 import argparse, json, math, os, queue, random, re, shutil, subprocess, sys, threading, time
 
-SUITES = ['foundation', 'edge_cases', 'hisab', 'abuse', 'modules', 'modules_b']   # cheapest first
+SUITES = ['foundation', 'edge_cases', 'hisab', 'abuse', 'modules', 'modules_c', 'modules_b']   # cheapest first
 SUMMARY = re.compile(r'^(\d+) passed, (\d+) failed', re.M)
 
 # ---- the comment / string blanker (same rules as check-public-surface.sh's scan.py)
@@ -258,7 +258,12 @@ def main():
         mu.setdefault('id', 'm%04d' % (mutants.index(mu) + 1))
         mu.setdefault('op', '?')
 
-    # which suites include which file
+    # which suites include which file. ⚠ 3.3.7 — every tests/*.tcyr must be in SUITES: the list
+    # is hand-ordered (cheapest first), and a suite added by a split and left off it would make
+    # every mutant only it kills read as a survivor.
+    have = sorted(f[:-5] for f in os.listdir(os.path.join(repo, 'tests')) if f.endswith('.tcyr'))
+    missing = [s for s in have if s not in SUITES]
+    if missing: sys.exit('mutation-test: tests/%s.tcyr is not in SUITES' % ', tests/'.join(missing))
     inc = {}
     for s in SUITES:
         t = open(os.path.join(repo, 'tests', s + '.tcyr'), encoding='utf-8', errors='replace').read()
@@ -297,8 +302,8 @@ def main():
         for r in results:
             if r[0] is not None: sys.exit('mutation-test: the unmutated tree fails suite %s: %s' % r)
             for s, dt in r[1].items(): base[s] = max(base.get(s, 0), dt)
-        print('# control: six suites pass in %d scratch trees; slowest runs %s' %
-              (len(trees), ', '.join('%s %.1fs' % (s, base[s]) for s in SUITES)), file=sys.stderr)
+        print('# control: %d suites pass in %d scratch trees; slowest runs %s' % (len(SUITES),
+              len(trees), ', '.join('%s %.1fs' % (s, base[s]) for s in SUITES)), file=sys.stderr)
 
     free = queue.Queue()
     for t in trees: free.put(t)

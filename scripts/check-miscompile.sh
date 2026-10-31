@@ -43,7 +43,7 @@
 # x86-64 only (aarch64 has no picker). It audits hisab's bundle, not a consumer's own
 # code. It is a detector for one known class, not a proof that the build is right.
 #
-# --suites also builds the six suites under the manifest pin (in the repo, output to the
+# --suites also builds every tests/*.tcyr suite under the manifest pin (in the repo, output to the
 # scratch dir) and audits each binary, which is what 3.2.0 did by hand.
 #
 # --selftest proves the gate can fail: (a) the archived 3.2.0 repro built under 6.6.4
@@ -356,7 +356,9 @@ done
 
 if [ "$SUITES" = 1 ]; then
     echo "suites under the manifest pin (cycc $MANIFEST_PIN)"
-    for s in hisab foundation modules modules_b edge_cases abuse; do
+    # Every suite, enumerated (3.3.7): the hand-written list would have skipped modules_c.tcyr.
+    for sf in "$REPO_ROOT"/tests/*.tcyr; do
+        s=$(basename "$sf" .tcyr)
         if ! build "$REPO_ROOT" "tests/$s.tcyr" "$T/suite-$s" "$MANIFEST_PIN"; then FAIL=1; continue; fi
         python3 -I "$T/audit.py" binary "$T/suite-$s" "tests/$s.tcyr" || FAIL=1
     done

@@ -7,7 +7,7 @@ so a closure literal's body is scanned as the enclosing fn's.
 filing. The repro fails on every installed pin from 6.6.0 to 6.6.14.
 **Severity:** Medium upstream: correct code is refused, and the error's suggested fix reads an unset
 `rdx`. For hisab it is nil since 3.3.1 (see *Exposure*).
-**Status:** ✅ **FIXED UPSTREAM in cyrius 6.6.16** (see *Fixed upstream* at the end); this record stays open until hisab's pin crosses 6.6.16. Was 🟡 OPEN UPSTREAM: this was roadmap *Decisions owed* #4 (`D082`). The maintainer
+**Status:** ✅ **CLOSED — FIXED UPSTREAM in cyrius 6.6.16, taken by hisab 3.3.7** on the 6.6.14 → 6.6.20 pin bump (2026-10-31); the paired run is in *Closed* at the end. Was: ✅ **FIXED UPSTREAM in cyrius 6.6.16** (see *Fixed upstream* at the end); this record stays open until hisab's pin crosses 6.6.16. Was 🟡 OPEN UPSTREAM: this was roadmap *Decisions owed* #4 (`D082`). The maintainer
 approved filing on 2026-10-03. It is filed as
 `cyrius/docs/development/issues/2026-10-03-hisab-closure-stack-return-blamed-on-enclosing-fn.md`, with
 the self-proving repro
@@ -102,3 +102,20 @@ C1–C3 are unchanged.
   would be.
 - **To close this record:** at the 6.6.16 pin bump, run the repro on the old and new pins as a pair and
   move this file to `archived/`.
+
+## Closed (hisab 3.3.7, 2026-10-31): the paired run
+
+The filed repro script (`cyrius/docs/development/issues/repros/2026-10-03-hisab-closure-stack-return-blamed-on-enclosing-fn.sh`),
+run as `sh <script> <pin>`; it builds in a throwaway project pinned to `<pin>` and prints each
+build's `compiler:` line:
+
+| pin | exit | D1 / D2 / D3 | controls C1–C3 |
+|---|---|---|---|
+| 6.6.14 | **3** | each draws the `: stack` diagnostic (D1 refused) | pass |
+| 6.6.20 | **0** | build clean, run 0 | pass (C1 still warns, C2 still refused, C3 clean) |
+
+[measured: the filed repro script under pins 6.6.14 and 6.6.20, 2026-10-31]
+
+- **In-tree:** nothing changed in code. `src/autodiff.cyr`'s recipe keeps the bind-both form,
+  because every direct consumer pins below 6.6.16, and now says that from 6.6.16 the closure may
+  return `ad_grad_into(...)` again, provided it returns a pair on every path.

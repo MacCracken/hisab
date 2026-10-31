@@ -282,6 +282,18 @@ public fn geo_jet_sphere(ray, sphere) {
     var p = geo_ray_at(ray, t);
     var g = hvec3_sub(p, GeoSphere_center(sphere));
     var den = hvec3_dot(g, d);
+    # ⛔ 3.3.7 — g = p - c IS ITS OWN ROUNDING WHEN r IS BELOW AN ULP OF THE HIT. p = o + t d
+    # carries 2^-53 of |p|, so for a unit sphere at (3.5e252, 0, 0) met from 0 along +x, g
+    # read 0, den 0, and the jet answered the miss for the primal's hit (dt/do = (-1, 0, 0),
+    # dt/dr = -1); likewise a unit sphere at 1e17. Where |o| + |t d| + |c| is over 2^12 r
+    # (_geo_jet_far), g and r are formed from the inputs instead (_geo_jet_round_g) and the
+    # gradients from them on scaled copies (_geo_jet_round_scaled).
+    # [measured: rt337 jet families (row4*.py, seeds 401-403), exact jets, 3.3.6 vs this tree, 2026-10-31]
+    var rgf = 0;
+    var gp[32];
+    if (_geo_jet_far(ray, t, GeoSphere_center(sphere), GeoSphere_radius(sphere)) == 1) {
+        rgf = _geo_jet_round_g(ray, t, GeoSphere_center(sphere), GeoSphere_radius(sphere), &gp);
+    }
 
     # Grazing incidence: the ray is tangent, the two roots have merged, and t is
     # genuinely non-differentiable there. Report the miss sentinel rather than a
@@ -308,10 +320,16 @@ public fn geo_jet_sphere(ray, sphere) {
     var dt_do = 0;
     var sv = 0;
     var ss = 0;
-    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0 || f64_eq(inv, 0) == 1) {
+    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0 || f64_eq(inv, 0) == 1 || rgf == 1) {
         # 3.3.6: den overflowed or is too small to invert (_geo_jet_round_scaled).
         var rp[24];
-        if (_geo_jet_round_scaled(g, d, GeoSphere_radius(sphere), &rp) == 0) { return _geo_jet_miss(); }
+        var gg = g;
+        var rr = GeoSphere_radius(sphere);
+        if (rgf == 1) {
+            gg = load64(&gp);
+            rr = load64(&gp + 8);
+        }
+        if (_geo_jet_round_scaled(gg, d, rr, &rp) == 0) { return _geo_jet_miss(); }
         dt_do = hvec3_scale(load64(&rp), f64_neg(load64(&rp + 8)));
         sv = hvec3_scale(load64(&rp), load64(&rp + 8));
         ss = load64(&rp + 16);
@@ -476,6 +494,266 @@ fn _geo_jet_round_scaled(g, d, r, p) {
     return 1;
 }
 
+# x * y as p[0] + p[1] exactly (Dekker; geo.cyr's _geo_two_prod, which modules cannot share).
+fn _geo_jet_two_prod(x, y, p) {
+    var sx = f64_mul(x, 0x41A0_0000_0200_0000);   # 2^27 + 1
+    var xh = f64_sub(sx, f64_sub(sx, x));
+    var xl = f64_sub(x, xh);
+    var sy = f64_mul(y, 0x41A0_0000_0200_0000);
+    var yh = f64_sub(sy, f64_sub(sy, y));
+    var yl = f64_sub(y, yh);
+    var pr = f64_mul(x, y);
+    var e = f64_add(f64_add(f64_sub(f64_mul(xh, yh), pr), f64_mul(xh, yl)), f64_mul(xl, yh));
+    store64(p, pr);
+    store64(p + 8, f64_add(e, f64_mul(xl, yl)));
+    return 0;
+}
+
+# a + b + c with the two additions' errors carried (Knuth's two-sum): within an ulp of the sum.
+fn _geo_jet_sum3(a, b, c) {
+    var s = f64_add(a, b);
+    var bb = f64_sub(s, a);
+    var er = f64_add(f64_sub(a, f64_sub(s, bb)), f64_sub(b, bb));
+    var s2 = f64_add(s, c);
+    var cc = f64_sub(s2, s);
+    var er2 = f64_add(f64_sub(s, f64_sub(s2, cc)), f64_sub(c, cc));
+    return f64_add(s2, f64_add(er, er2));
+}
+
+# w = p - v0 for the triangle jet's hit p = o + t d, formed as (o - v0) + t d with every
+# rounding but t's carried, then moved along d onto the triangle's plane (w . n = 0): t's own
+# rounding moves p along d only (3.3.7). The plain p - v0 carries 2^-53 of |o|, |p| and |v0|
+# in every direction, against a w the size of the triangle.
+fn _geo_jet_tri_w(ray, t, v0, n, den) {
+    var o = GeoRay_origin(ray);
+    var d = GeoRay_direction(ray);
+    var pp[16];
+    var w[24];
+    for (var i = 0; i < 3; i = i + 1) {
+        var oi = load64(o + i * 8);
+        var vi = load64(v0 + i * 8);
+        var di = f64_sub(oi, vi);
+        var nb = f64_neg(vi);
+        var bb = f64_sub(di, oi);
+        var er = f64_add(f64_sub(oi, f64_sub(di, bb)), f64_sub(nb, bb));
+        _geo_jet_two_prod(t, load64(d + i * 8), &pp);
+        store64(&w + i * 8, _geo_jet_sum3(di, load64(&pp), f64_add(er, load64(&pp + 8))));
+    }
+    var k = f64_div(hvec3_dot(&w, n), den);
+    return hvec3_new(f64_sub(HVec3_x(&w), f64_mul(k, HVec3_x(d))), f64_sub(HVec3_y(&w), f64_mul(k, HVec3_y(d))),
+      f64_sub(HVec3_z(&w), f64_mul(k, HVec3_z(d))));
+}
+
+# a b - c d with both products exact and their difference's error carried (geo.cyr's _geo_dpd).
+fn _geo_jet_dpd(a, b, c, d) {
+    var pp[16];
+    var qq[16];
+    _geo_jet_two_prod(a, b, &pp);
+    _geo_jet_two_prod(c, d, &qq);
+    return _geo_jet_sum3(load64(&pp), f64_neg(load64(&qq)), f64_sub(load64(&pp + 8), load64(&qq + 8)));
+}
+
+# The part of v across the line of w, (w x v) x w / (w . w), with exact products (geo.cyr's
+# _geo_perp_part): nothing is subtracted along w. w with its largest component in [1, 2).
+fn _geo_jet_perp(v, w, out) {
+    var vx = HVec3_x(v);
+    var vy = HVec3_y(v);
+    var vz = HVec3_z(v);
+    var wx = HVec3_x(w);
+    var wy = HVec3_y(w);
+    var wz = HVec3_z(w);
+    var cx = _geo_jet_dpd(wy, vz, wz, vy);
+    var cy = _geo_jet_dpd(wz, vx, wx, vz);
+    var cz = _geo_jet_dpd(wx, vy, wy, vx);
+    var ww = hvec3_dot(w, w);
+    store64(out, f64_div(_geo_jet_dpd(cy, wz, cz, wy), ww));
+    store64(out + 8, f64_div(_geo_jet_dpd(cz, wx, cx, wz), ww));
+    store64(out + 16, f64_div(_geo_jet_dpd(cx, wy, cy, wx), ww));
+    if (f64_eq(wx, 0) == 1) { store64(out, vx); }
+    if (f64_eq(wy, 0) == 1) { store64(out + 8, vy); }
+    if (f64_eq(wz, 0) == 1) { store64(out + 16, vz); }
+    return 0;
+}
+
+# h (o - c) - fl(h o - h c) per component, into lo, and h o - h c's rounded value into oc.
+fn _geo_jet_diff(o, c, oc, lo) {
+    for (var i = 0; i < 3; i = i + 1) {
+        var a = load64(o + i * 8);
+        var b = f64_neg(load64(c + i * 8));
+        var sm = f64_add(a, b);
+        var bb = f64_sub(sm, a);
+        store64(oc + i * 8, sm);
+        store64(lo + i * 8, f64_add(f64_sub(a, f64_sub(sm, bb)), f64_sub(b, bb)));
+    }
+    return 0;
+}
+
+# 1 when p - c, formed from p = o + t d, may be mostly its own rounding against r (3.3.7):
+# |o| + |t d| + |c| (largest components) more than 2^12 r, so that the plain g = p - c is off
+# by more than 2^-40 of r.
+fn _geo_jet_far(ray, t, c, r) {
+    var o = GeoRay_origin(ray);
+    var d = GeoRay_direction(ray);
+    var mo = 0;
+    var md = 0;
+    var mc = 0;
+    for (var i = 0; i < 3; i = i + 1) {
+        var x = load64(o + i * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (x > mo) { mo = x; }
+        x = load64(d + i * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (x > md) { md = x; }
+        x = load64(c + i * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (x > mc) { mc = x; }
+    }
+    var m = f64_add(f64_add(mo, f64_mul(f64_abs(t), md)), mc);
+    return f64_gt(m, f64_mul(f64_abs(r), 0x40B0_0000_0000_0000));   # 2^12
+}
+
+# -1 for the near root (t before the closest approach t_c = -(o - c) . d / d . d), +1 for the
+# far one; -1 when the two are within 2^-40 of each other (an origin far outside, whose first
+# root is the near one).
+fn _geo_jet_root_side(t, tc) {
+    var df = f64_sub(t, tc);
+    if (f64_lt(f64_abs(df), f64_mul(f64_add(f64_abs(t), f64_abs(tc)), 0x3D70_0000_0000_0000)) == 1) { return 0 - 1; }
+    if (f64_gt(df, 0) == 1) { return 1; }
+    return 0 - 1;
+}
+
+# g = p - c and r on one scale, where the plain g is its rounding (3.3.7): with f the offset of
+# c from the ray's line (_geo_jet_perp, o - c's rounding carried) and h = sqrt(r^2 - |f|^2), the
+# root's point is c + f + s h d / |d| (s from _geo_jet_root_side), so g = f + s h d / |d|, every
+# part formed from the inputs at their own scale. gp[0] = g' (an HVec3), gp[1] = r', with
+# g' / r' = g / r. 0 when an input is not finite.
+fn _geo_jet_round_g(ray, t, c, r, gp) {
+    var o = GeoRay_origin(ray);
+    var d = GeoRay_direction(ray);
+    if (_geo_jet_finite3(o) + _geo_jet_finite3(d) + _geo_jet_finite3(c) != 3) { return 0; }
+    if (f64_lt(f64_abs(r), F64_POS_INF) == 0) { return 0; }
+    var oc[24];
+    var lo[24];
+    _geo_jet_diff(o, c, &oc, &lo);
+    if (_geo_jet_finite3(&oc) == 0) { return 0; }
+    var md = _geo_jet_absmax_bits(d);
+    if (md == 0) { return 0; }
+    var ds = hvec3_scale(d, _geo_jet_pow2_for(md));
+    var mw = _geo_jet_absmax_bits(&oc);
+    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > mw) { mw = mr; }
+    var s0 = _geo_jet_pow2_for(mw);
+    var f[24];
+    var fl[24];
+    _geo_jet_perp(hvec3_scale(&oc, s0), ds, &f);
+    _geo_jet_perp(hvec3_scale(&lo, s0), ds, &fl);
+    store64(&f, f64_add(HVec3_x(&f), HVec3_x(&fl)));
+    store64(&f + 8, f64_add(HVec3_y(&f), HVec3_y(&fl)));
+    store64(&f + 16, f64_add(HVec3_z(&f), HVec3_z(&fl)));
+    var tc = f64_div(f64_neg(hvec3_dot(&oc, d)), hvec3_dot(d, d));
+    return _geo_jet_g_from(&f, f64_mul(r, s0), ds, _geo_jet_root_side(t, tc), gp);
+}
+
+# g' = f + s h e / |e| and r' for an offset f, a radius r (one scale) and a direction e across
+# which f lies, both taken to f's own scale first so that r^2 - |f|^2 does not flush.
+fn _geo_jet_g_from(f, r, e, sg, gp) {
+    var mf = _geo_jet_absmax_bits(f);
+    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > mf) { mf = mr; }
+    var s2 = _geo_jet_pow2_for(mf);
+    var fs = hvec3_scale(f, s2);
+    var rs = f64_mul(r, s2);
+    var hh = f64_sub(f64_mul(rs, rs), hvec3_dot(fs, fs));
+    if (f64_lt(hh, 0) == 1) { hh = 0; }
+    var k = f64_div(f64_sqrt(hh), hvec3_length(e));
+    if (sg < 0) { k = f64_neg(k); }
+    store64(gp, hvec3_add(fs, hvec3_scale(e, k)));
+    store64(gp + 8, rs);
+    store64(gp + 16, f64_sqrt(hh));
+    store64(gp + 24, s2);
+    return 1;
+}
+
+# geo_jet_capsule's barrel g (the part of p - a across ab) and segment coordinate s where the
+# plain ones are their rounding (3.3.7). With w the start's offset from the ray's line
+# (_geo_jet_perp, o - a's rounding carried) and n = ab x d (exact products, ab's rounding
+# carried), the offset of the ray's line from the axis is F = n (w . n) / |n|^2, and the root's
+# point lies at F + s h d_ab / |d_ab| across the axis (d_ab: d's part across ab; h as in
+# _geo_jet_round_g); along it, (p - a) . ab = (ab . w) |ab|^2 (d . d) / |n|^2 + s h (d . ab) |ab| / |n|.
+# gp[0] = g', gp[1] = r' as _geo_jet_round_g, gp[4] = s. 0 when an input is not finite or n = 0.
+fn _geo_jet_barrel_g(ray, t, a, b, r, gp) {
+    var o = GeoRay_origin(ray);
+    var d = GeoRay_direction(ray);
+    if (_geo_jet_finite3(o) + _geo_jet_finite3(d) + _geo_jet_finite3(a) + _geo_jet_finite3(b) != 4) { return 0; }
+    if (f64_lt(f64_abs(r), F64_POS_INF) == 0) { return 0; }
+    var ao[24];
+    var aol[24];
+    var ab[24];
+    var abl[24];
+    _geo_jet_diff(o, a, &ao, &aol);
+    _geo_jet_diff(b, a, &ab, &abl);
+    if (_geo_jet_finite3(&ao) + _geo_jet_finite3(&ab) != 2) { return 0; }
+    var md = _geo_jet_absmax_bits(d);
+    var mab = _geo_jet_absmax_bits(&ab);
+    if (md == 0 || mab == 0) { return 0; }
+    var ds = hvec3_scale(d, _geo_jet_pow2_for(md));
+    var sab = _geo_jet_pow2_for(mab);
+    var abs_ = hvec3_scale(&ab, sab);
+    var abls = hvec3_scale(&abl, sab);
+    var mw = _geo_jet_absmax_bits(&ao);
+    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > mw) { mw = mr; }
+    var s0 = _geo_jet_pow2_for(mw);
+    var w[24];
+    var wl[24];
+    _geo_jet_perp(hvec3_scale(&ao, s0), ds, &w);
+    _geo_jet_perp(hvec3_scale(&aol, s0), ds, &wl);
+    store64(&w, f64_add(HVec3_x(&w), HVec3_x(&wl)));
+    store64(&w + 8, f64_add(HVec3_y(&w), HVec3_y(&wl)));
+    store64(&w + 16, f64_add(HVec3_z(&w), HVec3_z(&wl)));
+    var nh[24];
+    var p1[16];
+    var dt = 0;
+    var tail = 0;
+    for (var i = 0; i < 3; i = i + 1) {
+        var j = (i + 1) % 3;
+        var k = (i + 2) % 3;
+        var nl = f64_sub(f64_mul(load64(abls + j * 8), load64(ds + k * 8)),
+          f64_mul(load64(abls + k * 8), load64(ds + j * 8)));
+        var pa[16];
+        var pb[16];
+        _geo_jet_two_prod(load64(abs_ + j * 8), load64(ds + k * 8), &pa);
+        _geo_jet_two_prod(load64(abs_ + k * 8), load64(ds + j * 8), &pb);
+        var nhi = f64_sub(load64(&pa), load64(&pb));
+        var bb = f64_sub(nhi, load64(&pa));
+        var er = f64_add(f64_sub(load64(&pa), f64_sub(nhi, bb)), f64_sub(f64_neg(load64(&pb)), bb));
+        nl = f64_add(nl, f64_add(er, f64_sub(load64(&pa + 8), load64(&pb + 8))));
+        store64(&nh + i * 8, nhi);
+        _geo_jet_two_prod(load64(&w + i * 8), nhi, &p1);
+        var s1 = f64_add(dt, load64(&p1));
+        var b1 = f64_sub(s1, dt);
+        tail = f64_add(tail, f64_add(f64_add(f64_sub(dt, f64_sub(s1, b1)), f64_sub(load64(&p1), b1)),
+            f64_add(load64(&p1 + 8), f64_mul(load64(&w + i * 8), nl))));
+        dt = s1;
+    }
+    dt = f64_add(dt, tail);
+    var nn = hvec3_dot(&nh, &nh);
+    if (f64_eq(nn, 0) == 1) { return 0; }
+    var fv = hvec3_scale(&nh, f64_div(dt, nn));
+    var dab[24];   # d's part across ab, exactly formed (it cancels for a d near the axis)
+    _geo_jet_perp(ds, abs_, &dab);
+    # the near or the far root: t against the closest approach to the axis, both plain
+    var abw = hvec3_sub(b, a);
+    var dw = hvec3_sub(d, hvec3_scale(abw, f64_div(hvec3_dot(d, abw), hvec3_dot(abw, abw))));
+    var ow = hvec3_sub(&ao, hvec3_scale(abw, f64_div(hvec3_dot(&ao, abw), hvec3_dot(abw, abw))));
+    var sg = _geo_jet_root_side(t, f64_div(f64_neg(hvec3_dot(ow, dw)), hvec3_dot(dw, dw)));
+    if (_geo_jet_g_from(fv, f64_mul(r, s0), &dab, sg, gp) == 0) { return 0; }
+    var h = f64_div(load64(gp + 16), load64(gp + 24));    # h at s0's scale
+    var aa = hvec3_dot(abs_, abs_);
+    var x1 = f64_div(f64_mul(f64_mul(hvec3_dot(abs_, &w), aa), hvec3_dot(ds, ds)), nn);
+    var x2 = f64_div(f64_mul(f64_mul(h, hvec3_dot(ds, abs_)), f64_sqrt(aa)), f64_sqrt(nn));
+    if (sg < 0) { x2 = f64_neg(x2); }
+    store64(gp + 32, f64_div(f64_mul(f64_add(x1, x2), sab), f64_mul(s0, aa)));
+    return 1;
+}
+
 # Ray-triangle jet. Gradients w.r.t. ray origin, ray direction and all three
 # vertices -- 15 parameters from one intersection.
 #
@@ -540,6 +818,18 @@ public fn geo_jet_triangle(ray, tri) {
     # [measured: C336 probe and triangle-jet sweep (seed 31), exact Fraction oracle, 2026-10-11; cycc 6.6.14]
     if (_geo_jet_absmax_bits(n) < 0x0040_0000_0000_0000) { return _geo_jet_tri_scaled(ray, t, v0, e1, e2); }
     var w = hvec3_sub(geo_ray_at(ray, t), v0);
+    var me = _geo_jet_absmax_bits(e1);
+    var me2 = _geo_jet_absmax_bits(e2);
+    if (me2 > me) { me = me2; }
+    var mo = f64_add(f64_add(_geo_jet_absmax_bits(GeoRay_origin(ray)), f64_mul(f64_abs(t), _geo_jet_absmax_bits(d))),
+      _geo_jet_absmax_bits(v0));
+    # ⛔ 3.3.7 — w = p - v0 CARRIED 2^-53 OF |o|, |p| AND |v0|, against a w the size of the
+    # triangle: for a 1e-6 triangle met from distance 1 the vertex gradients were off by a
+    # median 5e-10 and up to 1e-5 relative (dt/do, which does not read w, by 1e-16). Where
+    # |o| + |t d| + |v0| is over 2^8 times the triangle's legs, w is formed with its roundings
+    # carried and moved onto the plane (_geo_jet_tri_w).
+    # [measured: rt337 triangle-jet families (row5.py, seeds 501-504), exact jets, 3.3.6 vs this tree, 2026-10-31]
+    if (f64_gt(mo, f64_mul(me, 0x4070_0000_0000_0000)) == 1) { w = _geo_jet_tri_w(ray, t, v0, n, den); }   # 2^8
     var dt_do = hvec3_scale(n, f64_neg(inv));
 
     var j = alloc(_GJ_BYTES);
@@ -789,10 +1079,12 @@ public fn geo_jet_capsule(ray, capsule) {
     var g = hvec3_sub(p, a);
     var wa = F64_ONE;               # weight of dt/da
     var wb = 0;                     # weight of dt/db
+    var cpt = a;
     if (branch == GEO_CAP_END_CAP) {
         g = hvec3_sub(p, b);
         wa = 0;
         wb = F64_ONE;
+        cpt = b;
     }
     if (branch == GEO_CAP_CYLINDER) {
         var ab = hvec3_sub(b, a);
@@ -800,6 +1092,21 @@ public fn geo_jet_capsule(ray, capsule) {
         g = hvec3_sub(g, hvec3_scale(ab, sfrac));
         wa = f64_sub(F64_ONE, sfrac);
         wb = sfrac;
+    }
+    # 3.3.7: as geo_jet_sphere, where r is below an ulp of the hit: the caps' g from
+    # _geo_jet_round_g, the barrel's g and segment coordinate from _geo_jet_barrel_g. The
+    # roadmap's capsule (0.05 DBL_MAX, 0, 0)-(0.06 DBL_MAX, 0, 0), r = 1, met from 0 along +x
+    # at its start cap, read the miss jet.
+    var rgf = 0;
+    var gp[40];
+    if (_geo_jet_far(ray, t, cpt, r) == 1) {
+        if (branch == GEO_CAP_CYLINDER) {
+            rgf = _geo_jet_barrel_g(ray, t, a, b, r, &gp);
+            if (rgf == 1) {
+                wb = load64(&gp + 32);
+                wa = f64_sub(F64_ONE, wb);
+            }
+        } else { rgf = _geo_jet_round_g(ray, t, cpt, r, &gp); }
     }
 
     var den = hvec3_dot(g, d);
@@ -809,10 +1116,16 @@ public fn geo_jet_capsule(ray, capsule) {
     var dt_do = 0;
     var back = 0;
     var ss = 0;
-    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0 || f64_eq(inv, 0) == 1) {
+    if (f64_lt(f64_abs(inv), F64_POS_INF) == 0 || f64_eq(inv, 0) == 1 || rgf == 1) {
         # 3.3.6: den overflowed or is too small to invert (_geo_jet_round_scaled).
         var rp[24];
-        if (_geo_jet_round_scaled(g, d, r, &rp) == 0) { return _geo_jet_miss(); }
+        var gg = g;
+        var rr = r;
+        if (rgf == 1) {
+            gg = load64(&gp);
+            rr = load64(&gp + 8);
+        }
+        if (_geo_jet_round_scaled(gg, d, rr, &rp) == 0) { return _geo_jet_miss(); }
         dt_do = hvec3_scale(load64(&rp), f64_neg(load64(&rp + 8)));
         back = hvec3_scale(load64(&rp), load64(&rp + 8));
         ss = load64(&rp + 16);

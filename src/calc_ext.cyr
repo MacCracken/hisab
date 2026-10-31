@@ -54,6 +54,14 @@ var _CALCX_F64_1E_NEG30 = 0x39B4_484B_FEEB_C2A0;   # 1e-30
 # ⭐ The bound is derived and written as a division, so it also rejects the
 # n >= 2^61+1 whose `n * 8` wraps to a small POSITIVE size that `alloc` would
 # honour. Every caller checks for the 0.
+# ⛔ 3.3.7 — THAT LAST SENTENCE WAS FALSE FOR THREE OF THE SEVEN CALLERS. calc_bspline,
+# calc_nurbs and calc_monotone_cubic stored through the result unchecked, so a 0 from
+# here (the bound above, or `alloc` refusing on an exhausted heap) was a store to address
+# 0: with ALLOC_MAX = 24, calc_bspline and calc_nurbs of degree 3 on 4 points, knots
+# 0..7, at t = 3.5 asked for 4 doubles and exited 139, as did calc_monotone_cubic on 4
+# points with ALLOC_MAX = 16 or 24. Each now returns its designed 0 there. In practice the
+# bound needs a degree or a point count above 2^28, or an exhausted heap.
+# [measured: tests/abuse.tcyr, group "3.3.7 abuse: _f64arr_alloc's callers check its 0"]
 fn _f64arr_alloc(n) {
     if (n > ALLOC_MAX / 8) { return 0; }
     return alloc(n * 8);
@@ -581,7 +589,56 @@ public fn calc_adaptive_simpson(f, a, b, tol) {
     if (f64_lt(f64_abs(wsum), F64_POS_INF) == 0) { whole = _calcx_panel_wide(w6, fa, fmid, fb); }
     if (f64_lt(f64_abs(w6), F64_TINY) == 1) { whole = _calcx_panel_tiny(f64_sub(b, a), fa, fmid, fb); }
 
+    # ⭐ 3.3.7 — AN ORDINARY INTERVAL RECURSES WITHOUT THE FRAMES (_adaptive_simpson_rec0).
+    # With |a| and |b| below 2^1023 no sum or difference of two points of [a, b] overflows, and
+    # with b - a at least 2^-900 no panel 50 levels down has h / 6 below DBL_MIN, so none of
+    # 3.3.6's midpoint, half-width and tiny-panel tests can fire, and the value frame stays 0
+    # until a refined sum is NaN from finite samples, where rec0 hands over as rec does. Same
+    # operations, same order, same bits; three parameters and seven tests fewer per panel:
+    # calc_adaptive_simpson_x4 3.3.6 7,309 ns, integrated 7,379, now 6,216 (3.3.5 6,103), and
+    # sin on [0, pi] at 1e-10 29.8 -> 27.7 us (3.3.5 27.3).
+    # [measured: tests/hisab.bcyr and scratch pfb/focus.bcyr, 4-tree A/B, 2026-10-31; cycc 6.6.20]
+    var wd = f64_sub(b, a);
+    if (((a >> 52) & 0x7FF) <= 2045 && ((b >> 52) & 0x7FF) <= 2045 && ((wd >> 52) & 0x7FF) >= 123) {
+        return _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, 50);
+    }
     return _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, 50, 0, 0, 0);
+}
+
+# _adaptive_simpson_rec with vk = vlim = vdesc = 0 on an interval calc_adaptive_simpson has
+# checked (see there): the tests that cannot fire are left out, the rest kept in its order.
+fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth) {
+    if (depth <= 0) { return whole; }
+    var mid = f64_mul(f64_add(a, b), F64_HALF);
+    if (f64_eq(mid, a) == 1 || f64_eq(mid, b) == 1) { return whole; }
+    if (f64_gt(tol, 0) == 0) { return 0x7FF8000000000000; }  # quiet NaN
+    var tol_eff = tol;
+    var tol_floor = f64_mul(f64_abs(whole), _CALCX_F64_REL_FLOOR);
+    if (depth < 50 && f64_lt(tol_eff, tol_floor) == 1) { tol_eff = tol_floor; }
+    var left_mid = f64_mul(f64_add(a, mid), F64_HALF);
+    var right_mid = f64_mul(f64_add(mid, b), F64_HALF);
+    var flm = fncall1(f, left_mid);
+    var frm = fncall1(f, right_mid);
+    var h = f64_mul(f64_sub(b, a), F64_HALF);
+    var h_over_6 = f64_div(h, _CALCX_F64_SIX);
+    var lsum = f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, flm)), fmid);
+    var left_val = f64_mul(h_over_6, lsum);
+    if (f64_lt(f64_abs(lsum), F64_POS_INF) == 0) { left_val = _calcx_panel_wide(h_over_6, fa, flm, fmid); }
+    var rsum = f64_add(f64_add(fmid, f64_mul(_CALCX_F64_FOUR, frm)), fb);
+    var right_val = f64_mul(h_over_6, rsum);
+    if (f64_lt(f64_abs(rsum), F64_POS_INF) == 0) { right_val = _calcx_panel_wide(h_over_6, fmid, frm, fb); }
+    var refined = f64_add(left_val, right_val);
+    if (f64_eq(refined, refined) == 0 && _calcx_finite5(fa, flm, fmid, frm, fb) == 1) {
+        var vk2 = ((h_over_6 >> 52) & 0x7FF) - 1003;
+        if (vk2 > 0) { return _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, 0, vk2, h_over_6); }
+    }
+    var error = f64_div(f64_sub(refined, whole), _CALCX_F64_FIFTEEN);
+    if (f64_lt(f64_abs(error), tol_eff) == 1) { return f64_add(refined, error); }
+    if (f64_eq(error, error) == 0) { return refined; }
+    var half_tol = f64_mul(tol, F64_HALF);
+    var left_result = _adaptive_simpson_rec0(f, a, mid, fa, fmid, flm, left_val, half_tol, depth - 1);
+    var right_result = _adaptive_simpson_rec0(f, mid, b, fmid, fb, frm, right_val, half_tol, depth - 1);
+    return f64_add(left_result, right_result);
 }
 
 # Internal: (a + b) / 2 for adaptive Simpson when the plain form is not finite. For finite
@@ -760,7 +817,8 @@ fn _calcx_panel_wide(w6, fa, fm, fb) {
 # degree: spline degree (integer), ctrl_pts: array of HVec3 pointers (flat, 8 bytes each),
 # n_pts: number of control points, knots: flat f64 array, n_knots: knot count,
 # t: parameter value (f64).
-# Returns HVec3 pointer, or 0 if inputs are invalid / t out of range.
+# Returns HVec3 pointer, or 0 if inputs are invalid / t out of range, or if the de Boor
+# scratch (3 * (degree + 1) doubles) cannot be allocated.
 public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
     if (n_pts < 1) { return 0; }
     # A B-spline of degree d needs at least d+1 control points. Through 2.6.13
@@ -846,6 +904,7 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
     var dx = _f64arr_alloc(dp1);
     var dy = _f64arr_alloc(dp1);
     var dz = _f64arr_alloc(dp1);
+    if (dx == 0 || dy == 0 || dz == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
 
     # Initialize with control points [k-degree .. k]
     var j = 0;
@@ -908,7 +967,8 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
 # degree: spline degree, ctrl_pts: array of HVec3 pointers (flat, 8 bytes each),
 # weights: flat f64 array of per-point weights, n_pts: number of control points,
 # knots: flat f64 array, n_knots: knot count, t: parameter value (f64).
-# Returns HVec3 pointer, or 0 if invalid.
+# Returns HVec3 pointer, or 0 if invalid, or if the de Boor scratch (4 * (degree + 1)
+# doubles) cannot be allocated.
 public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
     if (n_pts < 1) { return 0; }
     # A B-spline of degree d needs at least d+1 control points. Through 2.6.13
@@ -967,6 +1027,7 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
     var pw_y = _f64arr_alloc(dp1);
     var pw_z = _f64arr_alloc(dp1);
     var pw_w = _f64arr_alloc(dp1);
+    if (pw_x == 0 || pw_y == 0 || pw_z == 0 || pw_w == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
 
     var j = 0;
     while (j <= degree) {
@@ -1434,7 +1495,8 @@ fn _calcx_mc_ext(xs, ys, n, x) {
 # Monotone cubic interpolation using the Fritsch-Carlson method.
 # xs: flat f64 array of n sorted x-values, ys: flat f64 array of n y-values,
 # n: number of points (>= 2), x: query point (f64).
-# Returns f64 interpolated value. Returns 0 if n < 2 or x out of range.
+# Returns f64 interpolated value. Returns 0 if n < 2 or x out of range, or if its scratch
+# arrays cannot be allocated.
 #
 # SHAPE-PRESERVING GUARANTEE (2.8.3): on every interval [xs[k], xs[k+1]] the
 # result stays inside [ys[k], ys[k+1]] and the segment is monotone in the same
@@ -1454,6 +1516,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
     # Compute secants (deltas) and interval widths (hs)
     var deltas = _f64arr_alloc(nm1);
     var hs = _f64arr_alloc(nm1);
+    if (deltas == 0 || hs == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
     var step332 = 0;  # 1: some secant is not finite; the set is 3.3.2's (see the loop's end)
     var slope_oor = 0;  # 1: some secant of a non-flat interval is below DBL_MIN (see the loop's end)
     var i = 0;
@@ -1611,6 +1674,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
 
     # Initial tangents: average of adjacent secants
     var ms = _f64arr_alloc(n);
+    if (ms == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
     _f64arr_set(ms, 0, _f64arr_get(deltas, 0));
     _f64arr_set(ms, nm1, _f64arr_get(deltas, nm1 - 1));
     i = 1;

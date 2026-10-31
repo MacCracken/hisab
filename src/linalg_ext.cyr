@@ -1,7 +1,7 @@
 # linalg_ext.cyr -- sparse linear algebra, iterative solvers, SVD wrappers,
 #                   eigendecomposition, Lyapunov exponents, inertia tensors
 # Usage: shipped inside dist/hisab.cyr; in-tree, include "src/linalg_ext.cyr" after what it requires
-# Requires: src/complex.cyr, src/error.cyr, src/linalg_precision.cyr (stdlib resolves via cyrius.cyml [deps]);
+# Requires: src/complex.cyr, src/error.cyr, src/f64_util.cyr, src/linalg_precision.cyr (stdlib via [deps]);
 #           linalg_precision since 3.3.4: its `svd_golub_kahan` is svd_compute's fallback
 #
 # Ported from rust-old/src/num/{sparse,solvers,svd,eigen,stability,inertia}.rs
@@ -604,12 +604,37 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     # contract, not a nicety.
     var mv_used = 0;
 
+    # ⭐ 3.3.7 — THE CYCLE'S WORK BUFFERS ARE ALLOCATED ONCE PER CALL (roadmap D016). Through
+    # 3.3.6 the restart loop allocated r, the basis pointer array, H, g, the two Givens arrays
+    # and y on every cycle, 8 (n + m^2 + 5m + 2 + k) B a cycle under a bump allocator that
+    # never frees. Each is now allocated on the first cycle that needs it and reused: every
+    # cycle writes each entry before reading it (H and g are zeroed per cycle as before, r and
+    # the basis pointers are rewritten, the Givens pairs and y are stored before they are
+    # read), so every value is the same, bit for bit. A call that converges on its first
+    # residual allocates what it did. tests/hisab.tcyr's arena bound on the gmres(2) run holds
+    # it: 14,672 -> 2,208 B over its 20 cycles. The time does not move (solve_gmres_64_m4, 40.4
+    # -> 40.2 us, inside its spread): a bump allocation is cheap, the arena it never returns is not.
+    # [measured: scratch pfb/gm.cyr (alloc_used) and tests/hisab.bcyr 4-tree A/B, 2026-10-31]
+    var r = 0;
+    var v_basis = 0;
+    var h = 0;
+    var g = 0;
+    var cs = 0;
+    var sn = 0;
+    var y = 0;
+    var ycap = 0;
+
     var outer = 0;
     while (mv_used < max_iter) {
         # r = b - A*x
         var ax = fncall1(A_fn, x);
         mv_used = mv_used + 1;
-        var r = _lext_sub(b, ax, n);
+        if (r == 0) { r = alloc(n * 8); }
+        var si = 0;
+        while (si < n) {
+            store64(r + si * 8, f64_sub(load64(b + si * 8), load64(ax + si * 8)));
+            si = si + 1;
+        }
         var r_norm = _lext_norm(r, n);
 
         if (f64_lt(r_norm, tol) == 1) { return x; }
@@ -623,23 +648,25 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
         }
 
         # v_basis: array of pointers to basis vectors (up to m+1)
-        var v_basis = alloc((m + 1) * 8);
+        if (v_basis == 0) {
+            v_basis = alloc((m + 1) * 8);
+            h = alloc((m + 1) * m * 8);
+            g = alloc((m + 1) * 8);
+            cs = alloc(m * 8);
+            sn = alloc(m * 8);
+        }
         store64(v_basis, r);
 
         # Hessenberg matrix H: (m+1) x m stored row-major
-        var h = alloc((m + 1) * m * 8);
         i = 0;
         while (i < (m + 1) * m) { store64(h + i * 8, f64_from(0)); i = i + 1; }
 
         # g vector: length m+1
-        var g = alloc((m + 1) * 8);
         i = 0;
         while (i < m + 1) { store64(g + i * 8, f64_from(0)); i = i + 1; }
         store64(g, r_norm);
 
-        # Givens rotation coefficients
-        var cs = alloc(m * 8);
-        var sn = alloc(m * 8);
+        # Givens rotation coefficients (cs, sn)
 
         var k = 0;  # number of completed Arnoldi steps
         var j = 0;
@@ -756,7 +783,10 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
         }
 
         # Back-substitution: solve upper triangular H * y = g
-        var y = alloc(k * 8);
+        if (k > ycap) {
+            y = alloc(k * 8);
+            ycap = k;
+        }
         i = k - 1;
         while (i >= 0) {
             var yi = load64(g + i * 8);
@@ -1318,7 +1348,8 @@ public fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
 
 # ================================================================
 # Section 3 -- SVD (wrappers around ganita's ganita_mat_svd; svd_golub_kahan
-#              answers when ganita returns -1, since 3.3.4)
+#              answers when ganita gives no answer: its -1 since 3.3.4, its -3
+#              and a non-finite singular value since 3.3.7)
 # ================================================================
 
 # 1 when every entry of the rows x cols matrix A is finite, 0 otherwise.
@@ -1330,6 +1361,8 @@ public fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
 # 0 with S = (NaN, NaN). A non-finite entry leaves A with no SVD at all, so
 # svd_compute and svd_truncated refuse it, as svd_golub_kahan has since 2.22.0.
 # [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
+# ⚠ ganita 1.2.12 refuses one itself (-2; cyrius 6.6.16 folds 1.2.13). The check stays:
+# a consumer compiles this bundle against its own pin's ganita, 1.2.11 or older below 6.6.16.
 # ⭐ One `f64_lt(|x|, +Inf) == 0` catches +Inf, -Inf and NaN together. This is
 # linalg_precision's `_lp_mat_all_finite` again; that one sits later in the
 # bundle and is that module's own, so it cannot be called from here.
@@ -1347,28 +1380,155 @@ fn _lext_mat_all_finite(A, rows, cols) {
     return 1;
 }
 
+# 1 when every one of v[0..n) is finite, 0 otherwise -- for ganita's singular values,
+# which 1.2.12 can return as +Inf with status 0 (see svd_compute).
+#must_use
+fn _lext_vec_all_finite(v, n) {
+    var i = 0;
+    while (i < n) {
+        if (f64_lt(f64_abs(load64(v + i * 8)), F64_POS_INF) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# dst[0..n) = src[0..n), bit for bit.
+fn _lext_vec_copy_n(dst, src, n) {
+    var i = 0;
+    while (i < n) {
+        store64(dst + i * 8, load64(src + i * 8));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---- 3.3.7: a singular value at the overflow line, in ganita's answer ----
+# These three are linalg_precision's `_lp_two_sum`, `_lp_two_prod` and `_lp_sv_past_max`,
+# copied line for line (the same reason as `_lext_mat_all_finite` above): that module sits
+# later in the bundle and its `_` names are its own, and a patch release adds no public name.
+# Keep the copies in step with the originals; `_lp_sv_past_max`'s comment has the bound.
+# a + b = s + e (Knuth's TwoSum) and a b = p + e (Dekker's product on Veltkamp's split, exact
+# while |a|, |b| <= 2^995 and a b is not below about 2^-969), each pair to out and out + 8.
+fn _lext_two_sum(a, b, out) {
+    var s = f64_add(a, b);
+    var bb = f64_sub(s, a);
+    store64(out, s);
+    store64(out + 8, f64_add(f64_sub(a, f64_sub(s, bb)), f64_sub(b, bb)));
+    return 0;
+}
+fn _lext_two_prod(a, b, out) {
+    var p = f64_mul(a, b);
+    var ca = f64_mul(0x41A0000002000000, a);   # (2^27 + 1) a
+    var ah = f64_sub(ca, f64_sub(ca, a));
+    var al = f64_sub(a, ah);
+    var cb = f64_mul(0x41A0000002000000, b);
+    var bh = f64_sub(cb, f64_sub(cb, b));
+    var bl = f64_sub(b, bh);
+    var e = f64_add(f64_add(f64_sub(f64_mul(ah, bh), p), f64_mul(ah, bl)), f64_mul(al, bh));
+    store64(out, p);
+    store64(out + 8, f64_add(e, f64_mul(al, bl)));
+    return 0;
+}
+# 1 when column k of U and row k of Vt prove that the m x n A has a singular value past the
+# overflow line 2^1024 - 2^970: the Rayleigh quotient 2 u'Av / (u'u + v'v) of
+# [[0, A], [A', 0]] is at most sigma_1 for ANY u and v, so it holds for ganita's vectors as
+# for svd_golub_kahan's. buf: 32 bytes of scratch.
+fn _lext_sv_past_max(A, m, n, U, Vt, k, buf) {
+    var nh = f64_from(0);
+    var nl = f64_from(0);
+    var dh = f64_from(0);
+    var dl = f64_from(0);
+    var sab = f64_from(0);
+    for (var i = 0; i < m + n; i = i + 1) {
+        var x = 0;
+        if (i < m) { x = ganita_mat_get(U, i, k); } else { x = ganita_mat_get(Vt, k, i - m); }
+        _lext_two_prod(x, x, buf);
+        _lext_two_sum(dh, load64(buf), buf + 16);
+        dh = load64(buf + 16);
+        dl = f64_add(dl, f64_add(load64(buf + 24), load64(buf + 8)));
+    }
+    for (var i = 0; i < m; i = i + 1) {
+        var ui = ganita_mat_get(U, i, k);
+        for (var j = 0; j < n; j = j + 1) {
+            _lext_two_prod(ui, ganita_mat_get(Vt, k, j), buf);   # u_i v_j = th + tl
+            var th = load64(buf);
+            var tl = load64(buf + 8);
+            var a = f64_mul(ganita_mat_get(A, i, j), 0x3BF0000000000000);   # a_ij 2^-64
+            _lext_two_prod(a, th, buf);
+            var pl = f64_add(load64(buf + 8), f64_mul(a, tl));
+            _lext_two_sum(nh, load64(buf), buf + 16);
+            nh = load64(buf + 16);
+            nl = f64_add(nl, f64_add(load64(buf + 24), pl));
+            sab = f64_add(sab, f64_abs(load64(buf)));
+        }
+    }
+    _lext_two_sum(nh, nl, buf);
+    nh = load64(buf);
+    nl = load64(buf + 8);
+    _lext_two_sum(dh, dl, buf);
+    dh = load64(buf);
+    dl = load64(buf + 8);
+    if (f64_gt(dh, 0) == 0) { return 0; }
+    # q / 2 = q1 + q2 = (nh + nl) / (dh + dl), the remainder taken against q1 (dh + dl) exactly
+    var q1 = f64_div(nh, dh);
+    _lext_two_prod(q1, dh, buf);
+    var r = f64_sub(f64_add(f64_sub(f64_sub(nh, load64(buf)), load64(buf + 8)), nl), f64_mul(q1, dl));
+    var q2 = f64_div(r, dh);
+    # doubling is exact: |q| <= sigma_1 2^-64 <= sqrt(mn) 2^960, and a subnormal doubles exactly
+    q1 = f64_mul(q1, F64_TWO);
+    q2 = f64_mul(q2, F64_TWO);
+    # (q1 - 2^960) is exact wherever the comparison is close (Sterbenz)
+    var past = f64_add(f64_add(f64_sub(q1, 0x7BF0000000000000), q2), 0x7890000000000000);   # - 2^960, + 2^906
+    var nn = f64_add(f64_from(m * n + m + n), f64_from(4));
+    var rel = f64_add(f64_mul(F64_TWO, f64_div(sab, dh)), F64_ONE);
+    var bnd = f64_mul(f64_mul(f64_mul(nn, nn), 0x39B0000000000000), rel);   # 2^-100
+    return f64_gt(past, bnd);
+}
+
+# 1 when ganita's answer (U m x n, S[0..n), Vt n x n) has a singular value within 2^-40 of
+# the line that its own singular pair proves past it (see svd_compute).
+fn _lext_svd_past_line(A, m, n, U, S, Vt) {
+    var w: i64[4];
+    for (var i = 0; i < n; i = i + 1) {
+        if (f64_ge(load64(S + i * 8), 0x7FEFFFFFFFFFE000) == 1) {   # (1 - 2^-40) 2^1024
+            if (_lext_sv_past_max(A, m, n, U, Vt, i, &w) == 1) { return 1; }
+        }
+    }
+    return 0;
+}
+
 # Full SVD: A = U * diag(S) * Vt.
 # A:      stdlib matrix (m x n, m >= n).
 # out_U:  stdlib matrix (m x n, caller allocates via ganita_mat_new).
 # out_S:  flat f64 array of length n (caller allocates via alloc(n*8)).
 # out_Vt: stdlib matrix (n x n, caller allocates via ganita_mat_new).
-# Returns: ganita_mat_svd's own status codes -- NOT an HsbError and NOT a Result:
-#          0 on success, with ganita's answer or, where ganita returns -1, the
-#          fallback's (below); -1 when ganita returns -1 (one of its working
-#          allocations failed, or its Jacobi rotations did not converge in 60
-#          sweeps) AND the fallback fails too: svd_golub_kahan's NO_CONVERGENCE,
-#          which includes a singular value above DBL_MAX, or its ALLOC; -2 for a
-#          null A, out_U, out_S or out_Vt, a WIDE A (m < n), an out_U / out_Vt whose
-#          shape is not exactly m x n / n x n, or a NaN or infinite entry in A.
+# Returns: ganita_mat_svd's status vocabulary -- NOT an HsbError and NOT a Result:
+#          0 on success, with ganita's answer or, where ganita gives none (below),
+#          the fallback's; -1 when ganita gives no answer AND the fallback fails
+#          too: svd_golub_kahan's NO_CONVERGENCE, which includes a singular value
+#          above DBL_MAX, or its ALLOC, or when svd_compute's own n-slot scratch
+#          cannot be allocated, or (since 3.3.7) when ganita's answer has a singular
+#          value that its own singular pair proves past the rounding line (below);
+#          -2 for a null A, out_U, out_S or out_Vt, a WIDE A
+#          (m < n), an out_U / out_Vt whose shape is not exactly m x n / n x n, or a
+#          NaN or infinite entry in A. Never -3, whatever the ganita.
 #          Compare it with 0 and nothing else. On -2 nothing is written to out_U,
 #          out_S or out_Vt; on -1 out_S is untouched, but out_U and out_Vt may hold
-#          the fallback's partial work.
+#          ganita's or the fallback's partial work.
+# "ganita gives no answer" is any of: its -1 (through ganita 1.2.11, cyrius <= 6.6.15,
+# either an allocation failure or 60 sweeps without convergence; from 1.2.12 an
+# allocation failure only), its -3 (1.2.12's non-convergence code), or a status of 0
+# with a singular value that is not finite (1.2.12 documents that a sigma_1 within a
+# few ulps of DBL_MAX can come back +Inf). A consumer compiles this bundle against its
+# own pin's ganita, so svd_compute treats both vocabularies alike and passes neither
+# -3 nor a non-finite sigma on: its codes are the same 0 / -1 / -2 under every pin.
 # ⛔ 3.3.3 — A NON-FINITE ENTRY CAME BACK AS SUCCESS. ganita answers for one (see
 # _lext_mat_all_finite): an all-NaN 2x2 returned 0 with S = (0, 0), [[3, NaN],
 # [0, 2]] returned 0 with S = (3, NaN), and [[+-Inf, 0], [0, 2]] returned 0 with
 # S = (NaN, NaN). It is now refused with -2, the code ganita itself gives for an
-# argument it cannot decompose, before ganita is called. A null A still reaches
-# ganita, whose -2 it is.
+# argument it cannot decompose, before ganita is called. ganita 1.2.12 refuses a
+# non-finite A with -2 itself; the check stays for consumers whose pins carry ganita
+# 1.2.11 or older (every direct consumer's, at cyrius 6.6.2-6.6.10).
 # [measured: scratch probe on the 3.3.2 bundle, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 # ⛔ 3.3.3 — THIS SAID "Returns: 0 on success" AND error.cyr LISTED IT AMONG THE
 # FUNCTIONS THAT "CAN ONLY EVER SUCCEED". Neither was true: a 2x3 A returns -2, and
@@ -1393,13 +1553,48 @@ fn _lext_mat_all_finite(A, rows, cols) {
 # non-negative and descending, U m x n, Vt = V^T n x n -- with one difference: for an exact
 # zero singular value ganita writes a zero U column, svd_golub_kahan a unit one.
 # [measured: fallback probe, the same rows, 2026-10-03; cycc 6.6.14]
+# ⛔ 3.3.7 — CYRIUS 6.6.16 FOLDED GANITA 1.2.13, AND THE FALLBACK ABOVE STOPPED RUNNING
+# WHERE IT IS NEEDED. Non-convergence became -3 and this wrapper fell back on -1 only.
+# No finite input is known to reach 1.2.14's -3, but its status 0 with sigma_1 = +Inf is
+# reachable: the duplicated-row witness times 2^1021 (sigma_1 = 1.27 * 2^1024) came back
+# 0 with S = (+Inf, ...), where 3.3.6 under 6.6.14 returned -1 with out_S untouched, the
+# contract above. ganita's sigmas now go to an n-slot scratch first and reach out_S only
+# when every one is finite; -1, -3 and a non-finite sigma all take the fallback.
+# [measured: tests/abuse.tcyr 3.3.4 fallback group, run under cyrius 6.6.14 and 6.6.20, 2026-10-31]
+# ⛔ 3.3.7 — AND GANITA'S FINITE ANSWER CAN BE PAST THE LINE. ganita 1.2.14 returns 0 with
+# sigma_1 = DBL_MAX for [[h, h], [h, h]], h = 2^1023, whose sigma_1 is 2^1024 and rounds to
+# +Inf, and others just past the line come back a few ulp below DBL_MAX, so both wrappers
+# answered what svd_golub_kahan refuses since 3.3.7 (under 6.6.14, ganita 1.2.11 returned
+# +Inf there and the fallback refused). When ganita answers with a singular value within
+# 2^-40 of the line, its own U column and Vt row now go through svd_golub_kahan's
+# certificate (`_lext_sv_past_max`: the quotient bounds sigma_1 for any vectors), and a
+# value proven past it is -1 at once, out_S untouched. The fallback is not tried: no finite
+# answer is right. Nor does every near-line value go to the fallback, whose own rescale
+# refuses some that fit: that turned 216 of the 3,932 fitting rows below into -1. On 8,000
+# matrices (2x1 to 8x2: uniform, rank-1-ish, graded, duplicated row) with sigma_1 within
+# 2^13 units of 2^-53 of the line, on both sides: the 159 of 4,034 past it that 3.3.6
+# answered are refused by both wrappers, none of the 3,966 that fit, and every row answered
+# is byte-identical.
+# [measured: wrapper near-line sweep, seed 3371, + route-to-fallback variant, 3.3.6 vs this tree, 2026-10-31]
 public fn svd_compute(A, out_U, out_S, out_Vt) {
-    if (A != 0) {
-        if (_lext_mat_all_finite(A, ganita_mat_rows(A), ganita_mat_cols(A)) == 0) { return 0 - 2; }
+    if (A == 0 || out_U == 0 || out_S == 0 || out_Vt == 0) { return 0 - 2; }
+    if (_lext_mat_all_finite(A, ganita_mat_rows(A), ganita_mat_cols(A)) == 0) { return 0 - 2; }
+    var n = ganita_mat_cols(A);
+    var sv = alloc(n * 8);
+    if (sv == 0) { return 0 - 1; }
+    var rc = ganita_mat_svd(A, out_U, sv, out_Vt);
+    if (rc == 0) {
+        if (_lext_vec_all_finite(sv, n) == 1) {
+            # proven past the line: no finite answer is right, so no fallback (see above)
+            if (_lext_svd_past_line(A, ganita_mat_rows(A), n, out_U, sv, out_Vt) == 1) { return 0 - 1; }
+            _lext_vec_copy_n(out_S, sv, n);
+            return 0;
+        }
+    } else {
+        if (rc != 0 - 1 && rc != 0 - 3) { return rc; }
     }
-    var rc = ganita_mat_svd(A, out_U, out_S, out_Vt);
-    if (rc != 0 - 1) { return rc; }
-    # ganita's -1 writes nothing, so the fallback starts from the caller's out-params.
+    # Whatever ganita wrote went to sv, out_U and out_Vt; the fallback rewrites all of
+    # out_U and out_Vt, and writes out_S only on success.
     var gt, gv = svd_golub_kahan(A, out_U, out_S, out_Vt);
     if (is_err_result(gt) == 1) { return 0 - 1; }
     return 0;
@@ -1418,8 +1613,12 @@ public fn svd_compute(A, out_U, out_S, out_Vt) {
 #            entry in A;
 #          Err(HSB_ERR_ALLOC) if the full-SVD temporaries cannot be allocated, or
 #            the svd_golub_kahan fallback cannot allocate its own;
-#          Err(HSB_ERR_NO_CONVERGENCE) if ganita_mat_svd fails (its -1) and the
-#            fallback does not converge either (see svd_compute; since 3.3.4).
+#          Err(HSB_ERR_NO_CONVERGENCE) if ganita_mat_svd gives no answer (its -1 or
+#            -3, or a non-finite singular value; see svd_compute) and the fallback
+#            does not converge either, which includes a singular value above
+#            DBL_MAX (since 3.3.4; -3 and the non-finite value since 3.3.7), or (since
+#            3.3.7) if ganita's answer has a singular value its own singular pair
+#            proves past the rounding line (see svd_compute); out_S untouched.
 # ⛔ 3.3.3 — THE DECOMPOSITION'S STATUS WAS DISCARDED. `ganita_mat_svd(...)` was a
 # bare statement, so every failure came back Ok(0) with out_S/out_U/out_Vt copied
 # out of temporaries the SVD never wrote: a 2x3 A (ganita's -2) gave Ok(0) and
@@ -1457,13 +1656,20 @@ public fn svd_truncated(A, k, out_U, out_S, out_Vt) {
     var full_s  = alloc(cols * 8);
     var full_vt = ganita_mat_new(cols, cols);
     if (full_u == 0 || full_s == 0 || full_vt == 0) { return Err(HSB_ERR_ALLOC); }
-    # None of ganita's -2 conditions can arise here: A is non-null and not wide,
-    # and the temporaries are non-null with exactly the shapes it demands. What
-    # remains is its -1, which writes nothing; svd_golub_kahan then decomposes A
-    # into the same temporaries (see svd_compute), and its Err is returned as is.
-    if (ganita_mat_svd(A, full_u, full_s, full_vt) != 0) {
+    # None of ganita's -2 conditions can arise here: A is non-null, finite and not
+    # wide, and the temporaries are non-null with exactly the shapes it demands. What
+    # remains is its -1 or -3, or a status of 0 with a non-finite singular value
+    # (1.2.12; see svd_compute); svd_golub_kahan then decomposes A into the same
+    # temporaries, and its Err is returned as is. out_S is written only below.
+    var g_rc = ganita_mat_svd(A, full_u, full_s, full_vt);
+    if (g_rc != 0 || _lext_vec_all_finite(full_s, cols) == 0) {
         var gt, gv = svd_golub_kahan(A, full_u, full_s, full_vt);
         if (is_err_result(gt) == 1) { return Err(gv); }
+    } else {
+        # ganita's answer proven past the line (see svd_compute): refused, no fallback
+        if (_lext_svd_past_line(A, rows, cols, full_u, full_s, full_vt) == 1) {
+            return Err(HSB_ERR_NO_CONVERGENCE);
+        }
     }
 
     # Copy top k singular values
@@ -1904,6 +2110,120 @@ fn _lext_below_rho(A, n, lam) {
     return 0;
 }
 
+# ⭐ 3.3.7 — eigen_power's exact diagonal floor. Where a_ii is a strongly connected component
+# of A's graph on its own (edges i -> j for a_ij != 0, i != j, exact zeros only), A is a
+# permutation of a block triangular matrix with a_ii as a 1 x 1 diagonal block, so a_ii IS an
+# eigenvalue and rho(A) >= |a_ii|, with no rounding anywhere. Every diagonal entry of a
+# triangular or permuted-triangular A is one. The trace floors above miss these when the other
+# eigenvalues cancel in tr A^k: [[1e-3, 0, -1e20], [0, 1.3, 0], [0, 0, -1]] has lambda_1 = 1.3
+# and both floors below 1.
+# 1 when |lam| < |d| (1 - 2^-26): the larger-only rule's margin, so an answer within 2^-26 of
+# |d| is never refused. The product rounds to nearest, so a double below the rounded product is
+# below the exact one, on the subnormal grid too (where the margin can round away, and then
+# only an answer at least one grid step below |d| is refused). A NaN on either side is false.
+fn _lext_diag_past(d, la) {
+    return f64_lt(la, f64_mul(f64_abs(d), 0x3FEFFFFFF8000000));   # 1 - 2^-26
+}
+
+# 1 when some |a_ii| is past |lam| in the sense of `_lext_diag_past`: O(n), and the only cost of
+# the floor on most answers (on a symmetric A every |a_ii| <= rho(A), and on a non-negative one
+# every a_ii <= rho(A), so a right answer never gets past this).
+fn _lext_diag_cand(A, n, lam) {
+    var la = f64_abs(lam);
+    for (var i = 0; i < n; i = i + 1) {
+        if (_lext_diag_past(ganita_mat_get(A, i, i), la) == 1) { return 1; }
+    }
+    return 0;
+}
+
+# 1 when some a_ii past |lam| is a component on its own: Tarjan's strongly connected components,
+# iterative, O(n^2) reads of A and no arithmetic. s: 6 n words of scratch (the DFS index,
+# low-link, on-stack flag, component stack, call stack and next-neighbour cursor per vertex).
+# The diagonal is read as an edge too: a self-edge finds v on the stack with idx[v] = low[v]
+# already, so it changes no low-link and no component.
+fn _lext_scc_floor(A, n, lam, s) {
+    var la = f64_abs(lam);
+    var idx = s;
+    var low = s + n * 8;
+    var onst = s + 2 * n * 8;
+    var stk = s + 3 * n * 8;
+    var cs = s + 4 * n * 8;
+    var cur = s + 5 * n * 8;
+    for (var i = 0; i < n; i = i + 1) {
+        store64(idx + i * 8, 0 - 1);
+        store64(onst + i * 8, 0);
+    }
+    var cnt = 0;
+    var sp = 0;
+    for (var r = 0; r < n; r = r + 1) {
+        if (load64(idx + r * 8) < 0) {
+            store64(idx + r * 8, cnt);
+            store64(low + r * 8, cnt);
+            cnt = cnt + 1;
+            store64(stk + sp * 8, r);
+            sp = sp + 1;
+            store64(onst + r * 8, 1);
+            store64(cur + r * 8, 0);
+            store64(cs, r);
+            var csp = 1;
+            while (csp > 0) {
+                var v = load64(cs + (csp - 1) * 8);
+                var j = load64(cur + v * 8);
+                if (j < n) {
+                    store64(cur + v * 8, j + 1);
+                    if ((ganita_mat_get(A, v, j) & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                        if (load64(idx + j * 8) < 0) {
+                            store64(idx + j * 8, cnt);
+                            store64(low + j * 8, cnt);
+                            cnt = cnt + 1;
+                            store64(stk + sp * 8, j);
+                            sp = sp + 1;
+                            store64(onst + j * 8, 1);
+                            store64(cur + j * 8, 0);
+                            store64(cs + csp * 8, j);
+                            csp = csp + 1;
+                        } else {
+                            if (load64(onst + j * 8) == 1 && load64(idx + j * 8) < load64(low + v * 8)) {
+                                store64(low + v * 8, load64(idx + j * 8));
+                            }
+                        }
+                    }
+                } else {
+                    csp = csp - 1;
+                    if (csp > 0) {
+                        var p = load64(cs + (csp - 1) * 8);
+                        if (load64(low + v * 8) < load64(low + p * 8)) { store64(low + p * 8, load64(low + v * 8)); }
+                    }
+                    if (load64(low + v * 8) == load64(idx + v * 8)) {
+                        # v roots a component: pop it; it is v alone when v is on top
+                        var single = 0;
+                        if (load64(stk + (sp - 1) * 8) == v) { single = 1; }
+                        var w = 0 - 1;
+                        while (w != v) {
+                            sp = sp - 1;
+                            w = load64(stk + sp * 8);
+                            store64(onst + w * 8, 0);
+                        }
+                        if (single == 1 && _lext_diag_past(ganita_mat_get(A, v, v), la) == 1) { return 1; }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# 1 when lam is provably not A's dominant eigenvalue (the trace floors, then the exact
+# diagonal floor), 0 when it cannot be shown, 2 when the diagonal floor's scratch cannot be
+# allocated.
+fn _lext_not_dominant(A, n, lam) {
+    if (_lext_below_rho(A, n, lam) == 1) { return 1; }
+    if (_lext_diag_cand(A, n, lam) == 0) { return 0; }
+    var s = alloc(6 * n * 8);
+    if (s == 0) { return 2; }
+    return _lext_scc_floor(A, n, lam, s);
+}
+
 # eigen_power's growth test (3.3.5): flag the components of iterate k (v) that grew more than
 # twofold since iterate k-1 (vp); if any, run one more pass and return 1 only when a flagged
 # component grows more than twofold again. w and fl are scratch (n each); with sc_e > 0, u is
@@ -1958,7 +2278,8 @@ fn _lext_grows(A, n, u, vp, v, sc_e, w, fl) {
 # out_vec:  flat f64 array of length n (caller allocates, receives eigenvector).
 # Returns:  Ok(0) on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded,
 #           HSB_ERR_INVALID_INPUT on a null handle or a shape that does not
-#           match n, HSB_ERR_ALLOC if the working vectors cannot be allocated.
+#           match n, HSB_ERR_ALLOC if the working vectors (or, since 3.3.7, the
+#           diagonal floor's scratch) cannot be allocated.
 #           Success means BOTH the eigenvalue estimate and the eigenvector (scaled
 #           so its largest component is exactly 1) stopped moving, to 1e-12
 #           relative; the eigenvector is compared up to sign, so one whose two
@@ -1976,9 +2297,12 @@ fn _lext_grows(A, n, u, vp, v, sc_e, w, fl) {
 #           plain answer is the smaller; some mixed-scale matrices are still answered
 #           wrong (see the loop).
 #           ⚠ THE SPECTRAL-RADIUS FLOOR (3.3.6). An answer whose modulus is provably below
-#           |tr A| / n or sqrt(|tr A^2| / n), both at most rho(A), is not the dominant
-#           eigenvalue: the wide iteration is run (if it has not been) and its answer taken
-#           only if larger and clear of the floor; otherwise NO_CONVERGENCE (see the loop).
+#           |tr A| / n or sqrt(|tr A^2| / n), both at most rho(A), or (since 3.3.7) below
+#           |a_ii| for a diagonal entry that is a strongly connected component of A on its
+#           own (an exact eigenvalue: every diagonal entry of a triangular A), is not the
+#           dominant eigenvalue: the wide iteration is run (if it has not been) and its answer
+#           taken only if larger and clear of the floor; otherwise NO_CONVERGENCE (see the
+#           loop).
 #           ⚠ GROWTH BELOW tol (3.3.5). A pass that meets both tests is not taken at
 #           once if some component grew more than twofold since the pass before: one more
 #           pass is run (one matvec, not counted against max_iter), and if that component
@@ -2516,10 +2840,37 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
             # of 4,000 wrong; 458 on 3.3.5), and the larger-only rule's
             # weak wide answers from above, 766 of 4,000 of their family, are unchanged).
             # [measured: exact Fraction traces over the remaining wrong rows + review families, 2026-10-11]
+            # ⛔ 3.3.7 — AND AN ANSWER BOTH TRACE FLOORS PASS COULD STILL BE NON-DOMINANT.
+            # [[1e-3, 0, -1e20], [0, 1.3, 0], [0, 0, -1]] has lambda_1 = 1.3, but the coupling
+            # leaves 1.3's direction a share of about 1e-20 of the iterate, growing 1.3-fold a
+            # pass (under the growth test's twofold), and the run stopped on -1:
+            # Ok(-1.0000000000000002), and the same times 2^558. |tr A| / 3 = 0.10 and
+            # sqrt(|tr A^2| / 3) = 0.95 sit below 1. Its 1.3 is a diagonal entry that is a strongly
+            # connected component on its own, so an exact eigenvalue (`_lext_scc_floor`): the
+            # answer is now proved non-dominant and goes the floor's way, to the wide run and
+            # then NO_CONVERGENCE. On 5,000 triangular and block-triangular matrices built for
+            # the class (n = 3..5, a second eigenvalue at 0.3 to 1 - 1e-9 of lambda_1, couplings
+            # up to 1e300 times it, half of them permuted), 247 of the 263 answers 3.3.6 returned
+            # wrong are NO_CONVERGENCE and no right answer moved; the 16 left are 8 answers whose
+            # modulus is above rho(A) (a non-normal matrix, far from its residual: no floor sees
+            # those) and 8 with a complex dominant pair. On 10,000 generic matrices (dense,
+            # sparse to 300 binades, non-negative, symmetric; n = 2..9) one answer, wrong by the
+            # same proof, became NO_CONVERGENCE and every other row is byte-identical. An
+            # independent SCC analysis agrees with the refusals row for row. The cost is the
+            # O(n) diagonal scan of `_lext_diag_cand` per floor test; Tarjan's O(n^2) reads ran
+            # on 184 of the 10,000 and on none of the three bench fixtures.
+            # [measured: families, seeds 7337/7338/9001, 3.3.6 vs this tree + Fraction oracle, SCC check, 2026-10-31]
+            # ⚠ THE |tr A^4| / n FLOOR THE ROADMAP PROPOSED WAS EVALUATED AND NOT TAKEN. It needs
+            # A^2, n^3 multiply-adds per answer: on the bench's 12x12 (18 passes of 144) that is
+            # +67% of the run's matrix-vector work, on its 3x3 (59 of 9) +5%. On the 263 wrong
+            # answers above it would catch 45, 44 of which the diagonal floor catches, and |tr A^3|
+            # / n catches 3. The irreducible part of the class (no singleton component) is left to
+            # it, and to the roadmap.
+            # [measured: same families, exact Fraction traces; pass counts, counting build, 2026-10-31; cycc 6.6.20]
             var res_lam = lam;
             var res_vec = v;
             var below = 0;
-            if (low_trip == 0) { below = _lext_below_rho(A, n, lam); }
+            if (low_trip == 0) { below = _lext_not_dominant(A, n, lam); }
             if (low_trip == 1 || below == 1) {
                 var wide_val = alloc(8);
                 var wide_vec = alloc(n * 8);
@@ -2532,9 +2883,11 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
                     res_lam = wide_lam;
                     res_vec = wide_vec;
                 }
-                below = _lext_below_rho(A, n, res_lam);
+                below = _lext_not_dominant(A, n, res_lam);
             }
-            # whichever answer stands, one the floor proves is not dominant is not returned
+            # whichever answer stands, one the floor proves is not dominant is not returned, and
+            # one it could not check (its scratch refused) is not returned either
+            if (below == 2) { return Err(HSB_ERR_ALLOC); }
             if (below == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
             store64(out_val, res_lam);
             i = 0;
@@ -2577,7 +2930,7 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
 # stands for (and n), as eigen_qr does, with eigen_qr's codes. What ganita can still
 # return is then its own failure: -1 is allocation and -3 the iteration budget, in its
 # vocabulary from ganita 1.2.5 (cyrius 6.6.3, this bundle's floor) on, and -2 can only be its
-# working copy failing, which it reported as -2 through 1.2.11 (hisab's pin 6.6.14) and
+# working copy failing, which it reported as -2 through 1.2.11 (hisab's pin to 3.3.6, 6.6.14) and
 # reports as -1 since 1.2.12. Both are HSB_ERR_ALLOC here.
 # [measured: scratch repro on the 3.3.5 tree, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
 # (ganita read at the cyrius tags 6.6.3, 6.6.14 and 6.6.16)
@@ -2639,9 +2992,11 @@ public fn eigen_symmetric(A, n, out_vals, out_vecs) {
 # n:          state dimension.
 # iterations: number of QR iterations.
 # out:        pointer to store the result (f64, allocate 8 bytes).
-# Returns:    Ok(0) on success, HSB_ERR_INVALID_INPUT on a null handle or a shape
-#             that does not match n, HSB_ERR_ALLOC if the working matrices
-#             cannot be allocated.
+# Returns:    Ok(0) on success, HSB_ERR_INVALID_INPUT on a null handle, a shape
+#             that does not match n, or a NaN or infinite entry in A (since 3.3.7),
+#             HSB_ERR_ALLOC if the working matrices cannot be allocated (ganita's
+#             QR included, since 3.3.7), HSB_ERR_NO_CONVERGENCE if A * Q overflows
+#             (since 3.3.7).
 #
 # Method: repeatedly QR-decompose A^k. The growth rate of R's diagonal
 # entries gives the Lyapunov exponent. This is the simplified discrete
@@ -2661,6 +3016,10 @@ public fn lyapunov_max(A, n, iterations, out) {
     # restatement of A's extent and ganita_mat_mul(A, Q) conforms only when A is n x n;
     # a mismatch is a caller error with no meaningful answer, so it is rejected.
     if (ganita_mat_rows(A) != n || ganita_mat_cols(A) != n) { return Err(HSB_ERR_INVALID_INPUT); }
+    # ⛔ 3.3.7 — A NON-FINITE A CAME BACK AS A NUMBER: a NaN entry made every r00 NaN, which
+    # the domain guard below skips, so out held the average of whatever was finite (0 for
+    # an all-NaN A), with Ok. Refused here, as eigen_symmetric and the SVD wrappers do.
+    if (_lext_mat_all_finite(A, n, n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # mat_new_guarded, not ganita_mat_new: it propagates the designed 0 for an n this
     # module considers unreasonable instead of allocating it.
@@ -2685,7 +3044,15 @@ public fn lyapunov_max(A, n, iterations, out) {
         if (Z == 0) { return Err(HSB_ERR_ALLOC); }
 
         # QR decompose Z -> Q, R
-        ganita_mat_qr(Z, Q, R);
+        # ⛔ 3.3.7 — ITS STATUS WAS DISCARDED. Through ganita 1.2.11 (cyrius <= 6.6.15) a
+        # non-finite Z came back 0 with R = Z; from 1.2.12 it is -2 and NOTHING is written,
+        # so R still held the previous iteration's factor and r00 counted it again. A
+        # finite A can still overflow A * Q (|Z_ij| <= n max|A|), so Z is checked here, the
+        # same on every pin, and a refused QR is an error: -1 its allocation, else -2.
+        if (_lext_mat_all_finite(Z, n, n) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        var qr_rc = ganita_mat_qr(Z, Q, R);
+        if (qr_rc == 0 - 1) { return Err(HSB_ERR_ALLOC); }
+        if (qr_rc != 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
 
         # Accumulate log of |R[0][0]| (dominant direction growth)
         var r00 = f64_abs(ganita_mat_get(R, 0, 0));

@@ -8,7 +8,7 @@ byte-identical in every cyrius tag from 6.6.1 (ganita 1.2.4) to 6.6.14.
 **Severity:** Low for hisab. ganita never returns a wrong value here; it refuses. Through 3.3.3 hisab
 reported the refusal; since 3.3.4 it answers through its own SVD (see *What hisab does*). No
 consumer calls the SVD wrappers.
-**Status:** 🟡 **OPEN UPSTREAM.** This was roadmap [3.3.4] *Needs the maintainer's answer* (a). The
+**Status:** ✅ **CLOSED — FIXED UPSTREAM in ganita 1.2.12** (folded as 1.2.13 in cyrius 6.6.16 and 1.2.14 in 6.6.19), **taken by hisab 3.3.7** on the 6.6.14 → 6.6.20 pin bump (2026-10-31); the paired run and what moved in-tree are in *Closed* at the end. Was: 🟡 **OPEN UPSTREAM.** This was roadmap [3.3.4] *Needs the maintainer's answer* (a). The
 maintainer approved filing on 2026-10-03. It is filed as
 `ganita/docs/development/issues/2026-10-03-mat-svd-no-convergence-on-tiny-columns.md`, with the
 self-proving repro `ganita/docs/development/issues/repros/2026-10-03-mat-svd-no-convergence-on-tiny-columns.cyr`.
@@ -264,3 +264,44 @@ quoted above, are 1.6 and 3.1 ulp above R's.
 It exits **9**. A1, A4, A5, A6, B1, B2, Z, R and W54 each return rc −1. A2, A3 and C pass, so they
 work as controls. The repro's header expects 0 once ganita's repaired SVD is folded in.
 [measured: scratch dir pinned to 6.6.14, the repro built and run, 2026-10-11]
+
+## Closed (hisab 3.3.7, 2026-10-31): the paired run, and what moved in-tree
+
+The paired-run recipe above, under both pins (same scratch-dir setup; every vendored file
+byte-identical to its cyrius tag):
+
+| pin | ganita | exit (rows wrong) | W54's S |
+|---|---|---|---|
+| 6.6.14 | 1.2.11 | **9** (A1, A4–A6, B1, B2, Z, R, W54 rc −1) | refused |
+| 6.6.20 | 1.2.14 | **0** | `…66ED …524E …72E5 …D489`, within the repro's tolerance of the exact `…66EC …5250 …72E5 …D48A` |
+
+[measured: the ganita repro from scratch dirs pinned to 6.6.14 and 6.6.20, 2026-10-31]
+
+**What moved in hisab (3.3.7).**
+- **The return code moved as forecast**, and `svd_compute`'s `rc != 0 - 1` fallback test stopped
+  running where it was needed. It now falls back on −1 **and** −3 (a consumer compiles the bundle
+  against its own pin's ganita, and ≤ 1.2.11 still says −1 for non-convergence). It also falls back
+  on a status of 0 with a non-finite σ, which this record did not foresee: 1.2.12 documents that a
+  σ₁ within a few ulps of DBL_MAX can come back +Inf, and the duplicated-row witness × 2^1021 came
+  back 0 with S₀ = +Inf, which 3.3.6's wrappers passed on as success. ganita's σ now goes to an
+  n-slot scratch first, so `out_S` stays untouched on −1, as documented. `svd_compute` returns
+  0 / −1 / −2 under every pin; −3 never escapes. `svd_truncated` gained the same non-finite test.
+- **The fallback could not survive the code it is now reached by.** From 1.2.12 ganita's −1 means
+  an allocation failure only, and `svd_golub_kahan` stored through a failed allocation (exit 139 on
+  a 3×3 at `ALLOC_MAX` 16). Every allocation in `src/linalg_precision.cyr` is now checked, and the
+  SVD and eigen paths return `Err(HSB_ERR_ALLOC)`.
+- **Tripwires retired, pins re-derived.** The three `ganita_mat_svd` −1 tripwires now assert 0, and
+  the wrapper pins describe ganita's answers, checked against the closed forms (120-digit Decimal):
+  R's S₀ `…3E7C` is 0.57 ulp above the exact value and S₁ `…CE2C` correctly rounded; Z's S₀ `…08C4`
+  is correctly rounded and S₁ `…F104` 1.87 ulp above; t = 2^-513 gives S₁ `…3BCD`, correctly rounded.
+  The fallback is still exercised: under `ALLOC_MAX` 256, ganita's one 552-byte working block for a
+  3×3 is refused (asserted) and the fallback's largest request is 88 bytes, so 3.3.4's fallback pins
+  (`…7D`, `…2F`, `…C6`, `…F102`, the unit null column) hold unchanged under that cap.
+- **Mutation proof** (`tests/abuse.tcyr`, in a scratch copy of the tree): 12 of 16 mutants killed.
+  Survivors, each recorded as equivalent: falling back on −1 only (no finite input is known to reach
+  1.2.14's −3), and the allocation checks on `svd_golub_kahan`'s `diag`, `eigen_qr`'s `diag` and
+  `_lp_bidiagonalize`'s `W` / `lv_store`, which no per-request cap can reach alone because the
+  attempt's scaled copy of A, the largest request, comes first. They guard a heap that runs out
+  between requests.
+
+[measured: tests/abuse.tcyr under cyrius 6.6.20 with the mutants installed in a scratch copy, 2026-10-31]

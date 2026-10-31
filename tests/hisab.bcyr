@@ -1270,10 +1270,11 @@ fn bench_eigen_power_wide() {
 fn bench_mpr_intersect_near_tangent() {
     return mpr_intersect(&_b_sup_sph, _b_np_sph_a, &_b_sup_sph, _b6_sph_nt);
 }
-# ⚠ GJK answers this overlapping pair as a MISS, after about 2.7x MPR's support calls --
-# the roadmap's open "GJK misses shallow overlaps that MPR finds" row -- so its path is
-# not checked, and this row's number moves when that is repaired.
-# [measured: scratch probe, not reproducible in-tree, 2026-10-11 (808 vs 300 calls)]
+# GJK answers this overlapping pair as a contact, as MPR does: 3.3.6 and 3.3.7 both
+# return 1 under cycc 6.6.20 (_b7_setup checks it). This comment said "a MISS, after
+# about 2.7x MPR's support calls" from a probe that predates 3.3.6's portal; the row's
+# number did not move when the comment stopped being true (3.3.6 821 us, 3.3.7 818).
+# [measured: scratch ntprobe.bcyr (verdicts) and pfb/fullF (times), 3.3.6 and 3.3.7 trees, 2026-10-31; cycc 6.6.20]
 fn bench_gjk_intersect_near_tangent() {
     return gjk_intersect_3d(&_b_sup_sph, _b_np_sph_a, &_b_sup_sph, _b6_sph_nt);
 }
@@ -1644,6 +1645,154 @@ fn _b6_rows() {
     bench("mpr_penetration_boxes_separated", &bench_mpr_penetration_boxes_separated, 20000);
     bench("time_of_impact_sph_hit",    &bench_toi_sph_hit,              2000);
     bench("time_of_impact_box_miss",   &bench_toi_box_miss,             2000);
+    return 0;
+}
+
+# ================================================================
+# 3.3.7 -- the costs roadmap [3.3.7] names that no row timed, and num_fft
+# ================================================================
+# Each 3.3.6 repair cost below was timed only in a scratch harness: quadrature's
+# power-of-two frame, a ray origin on a sphere's, an AABB's and an OBB's surface,
+# gjk_intersect_3d on a shallow separated pair, and solve_gmres across restart cycles.
+# These rows keep them in bench-history.csv. Every row is REGISTERED LAST, after the
+# 3.3.6 rows, for the heap-shift reason documented above the jac_rev pair, and the two
+# num_fft rows after the rest; _b7_setup checks each row's path once before any of them
+# is timed, as _b6_setup does.
+var _B7_FAIL = 0;
+
+fn _b7_check(ok, name) {
+    if (ok == 1) { return 0; }
+    syscall(1, 1, "FATAL: 3.3.7 row ", 17);
+    syscall(1, 1, name, strlen(name));
+    println(" does not take the path its name says");
+    _B7_FAIL = _B7_FAIL + 1;
+    return 1;
+}
+
+var _b7_out = 0;
+fn _b7_x2(x) { return f64_mul(x, x); }
+fn _b7_x2m2(x) { return f64_sub(f64_mul(x, x), F64_TWO); }
+fn bench_calc_integral_gauss5() { return calc_integral_gauss5(&_b7_x2, 0, F64_ONE); }
+fn bench_calc_integral_trapez() {
+    var t, v = calc_integral_trapez(&_b7_x2, 0, F64_ONE, 16, _b7_out);
+    return t;
+}
+fn bench_num_bisection() {
+    var t, v = num_bisection(&_b7_x2m2, 0, F64_TWO, 0x3D719799812DEA11, 200, _b7_out);   # tol 1e-12
+    return t;
+}
+
+# Rays whose origin sits on the surface: 1.78e-6 radii outside a unit sphere (c is
+# formed exactly), and on the z = -1 face of the unit AABB and of the identity OBB
+# (the underflow check of a zero crossing).
+# [measured: scratch pfb/focus.bcyr, the same three fixtures, 3.3.5 / 3.3.6 / integrated 3.3.7, 2026-10-31; cycc 6.6.20]
+var _b7_ray_near = 0;
+var _b7_ray_face = 0;
+fn bench_ray_sphere_near_surface() { return geo_ray_sphere(_b7_ray_near, _bsphere); }
+fn bench_ray_aabb_face_origin() { return geo_ray_aabb_face(_b7_ray_face, _baabb, _b7_out); }
+fn bench_ray_obb_face_origin() { return geo_ray_obb_face(_b7_ray_face, _b_obb, _b7_out); }
+
+# A capsule beside a sphere, separated by 1.02e-14 along the side (lane CO2's capsule/sphere
+# family, its 85th pair): GJK cycles, the portal's EPA run proves nothing, and the query
+# ends in the refutation along that run's normal. The supports normalize the direction, as
+# that family's harness does, so the row takes that path; _B7_SUP counts their calls.
+# [measured: scratch pfco sep.py / perq.py, lane CO2's cs family, exact gap 1.0209e-14, 2026-10-31; cycc 6.6.20]
+var _B7_SUP = 0;
+var _b7_cap = 0;
+var _b7_sph = 0;
+fn _b7_sup_cap(shape, dir) {
+    _B7_SUP = _B7_SUP + 1;
+    var u = hvec3_normalize(dir);
+    var ax = hvec3_new(load64(shape + 24), load64(shape + 32), load64(shape + 40));
+    var e = hvec3_add(hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16)), ax);
+    if (f64_lt(hvec3_dot(ax, dir), 0) == 1) {
+        e = hvec3_sub(hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16)), ax);
+    }
+    return hvec3_add(e, hvec3_scale(u, load64(shape + 48)));
+}
+fn _b7_sup_sph(shape, dir) {
+    _B7_SUP = _B7_SUP + 1;
+    var u = hvec3_normalize(dir);
+    var c = hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16));
+    return hvec3_add(c, hvec3_scale(u, load64(shape + 24)));
+}
+fn bench_gjk_intersect_sep_capsule() { return gjk_intersect_3d(&_b7_sup_cap, _b7_cap, &_b7_sup_sph, _b7_sph); }
+
+# GMRES(4) on the 3.3.6 row's tridiagonal system: several restart cycles per solve.
+var _B7_MV = 0;
+fn _b7_mv(xp) {
+    _B7_MV = _B7_MV + 1;
+    return _b6_mv(xp);
+}
+fn bench_solve_gmres_m4() { return solve_gmres(&_b7_mv, _b6_kb, _b6_kx0, 64, 0x3DDB7CDFD9D7BDBB, 200, 4); }
+
+# A dense CGA product, every one of the 32 x 32 term pairs.
+fn bench_cga_dense_product() { return cga_mv_get(cga_geometric_product(_b_cga_k32, _b_cga_k32), 0); }
+
+# num_fft over 2^8 and 2^12 points. The transform is in place, so each call first copies a
+# fixed input over the buffer (2n words): the row is that copy and the transform.
+var _b7_fft_src = 0;
+var _b7_fft_buf = 0;
+fn _b7_fft(n) {
+    for (var i = 0; i < 2 * n; i = i + 1) { store64(_b7_fft_buf + i * 8, load64(_b7_fft_src + i * 8)); }
+    var t, v = num_fft(_b7_fft_buf, n);
+    return t;
+}
+fn bench_num_fft_256() { return _b7_fft(256); }
+fn bench_num_fft_4096() { return _b7_fft(4096); }
+
+fn _b7_setup() {
+    _b7_out = alloc(16);
+    _b7_check(bench_calc_integral_gauss5() == 0x3FD5555555555554, "calc_integral_gauss5_x2");
+    _b7_check(bench_calc_integral_trapez() == 0, "calc_integral_trapez_x2_16");
+    _b7_check(bench_num_bisection() == 0, "num_bisection_x2m2");
+    _b7_ray_near = geo_ray_new(hvec3_new(0, 0, f64_neg(f64_add(F64_ONE, 0x3EBDDD8BE5F8B3CC))), hvec3_unit_z());
+    _b7_ray_face = geo_ray_new(hvec3_new(_b6_q(1, 4), F64_HALF, f64_neg(F64_ONE)),
+      hvec3_new(_b6_q(3, 10), _b6_q(2, 10), F64_ONE));
+    _b7_check(bench_ray_sphere_near_surface() == 0x3EBDDD8BE6000000, "ray_sphere_near_surface");
+    _b7_check(bench_ray_aabb_face_origin() == 0 && load64(_b7_out) == 4, "ray_aabb_face_origin");
+    _b7_check(bench_ray_obb_face_origin() == 0 && load64(_b7_out) == 4, "ray_obb_face_origin");
+    _b7_cap = alloc(56);
+    store64(_b7_cap, 0xBFCD2196D1A9D4E8);
+    store64(_b7_cap + 8, 0x3FA07F6B0CFAF2C0);
+    store64(_b7_cap + 16, 0x3FDB6F3D753D9BA0);
+    store64(_b7_cap + 24, 0x3FCF1EBDC57EBA9B);
+    store64(_b7_cap + 32, 0x3FF13FBD9BEEE3F6);
+    store64(_b7_cap + 40, 0xBFD499CC152DE61C);
+    store64(_b7_cap + 48, 0x3FE08362C88D4D52);
+    _b7_sph = alloc(32);
+    store64(_b7_sph, 0xBFFAED4932170F6C);
+    store64(_b7_sph + 8, 0x3FD57BA3DD2C3825);
+    store64(_b7_sph + 16, 0x3F635528E6FB9400);
+    store64(_b7_sph + 24, 0x3FF070C998361A79);
+    _B7_SUP = 0;
+    # The cycling path: a query GJK certifies makes about a fifth of these calls.
+    _b7_check(bench_gjk_intersect_sep_capsule() == 0 && _B7_SUP > 300, "gjk_intersect_sep_capsule_1e14");
+    _B7_MV = 0;
+    _b7_check(bench_solve_gmres_m4() != 0 && _B7_MV > 15, "solve_gmres_64_m4");
+    _b7_check(_CGA_NULL_TBL != 0 && f64_eq(bench_cga_dense_product(), 0) == 0, "cga_dense_product");
+    # A 3.3.6 row whose path no setup checked (see its comment).
+    _b7_check(bench_gjk_intersect_near_tangent() == 1, "gjk_intersect_near_tangent");
+    _b7_fft_src = _b6_fill(alloc(2 * 4096 * 8), 2 * 4096, 37);
+    _b7_fft_buf = alloc(2 * 4096 * 8);
+    _b7_check(bench_num_fft_256() == 0, "num_fft_256");
+    _b7_check(bench_num_fft_4096() == 0, "num_fft_4096");
+    return _B7_FAIL;
+}
+
+fn _b7_rows() {
+    bench("calc_integral_gauss5_x2",        &bench_calc_integral_gauss5,       400000);
+    bench("calc_integral_trapez_x2_16",     &bench_calc_integral_trapez,       200000);
+    bench("num_bisection_x2m2",             &bench_num_bisection,              100000);
+    bench("ray_sphere_near_surface",        &bench_ray_sphere_near_surface,    400000);
+    bench("ray_aabb_face_origin",           &bench_ray_aabb_face_origin,       400000);
+    bench("ray_obb_face_origin",            &bench_ray_obb_face_origin,        400000);
+    bench("gjk_intersect_sep_capsule_1e14", &bench_gjk_intersect_sep_capsule,    2000);
+    bench("solve_gmres_64_m4",              &bench_solve_gmres_m4,                200);
+    bench("cga_dense_product",              &bench_cga_dense_product,            2000);
+    # num_fft LAST of all (lane NU's review asked for a row).
+    bench("num_fft_256",                    &bench_num_fft_256,                 20000);
+    bench("num_fft_4096",                   &bench_num_fft_4096,                  500);
     return 0;
 }
 
@@ -2179,6 +2328,14 @@ fn main() {
         return 1;
     }
     _b6_rows();
+
+    # 3.3.7 -- REGISTERED LAST, after the 3.3.6 rows, their fixtures allocated in
+    # _b7_setup for the same heap-shift reason, and checked there before any is timed.
+    if (_b7_setup() != 0) {
+        println("FATAL: a 3.3.7 row would measure a different path than its name -- see above");
+        return 1;
+    }
+    _b7_rows();
 
     println("=== done ===");
     return 0;

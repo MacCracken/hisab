@@ -112,9 +112,18 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
         return Ok(0);
     }
 
-    # Check opposite signs: f_lo * f_hi > 0 means same sign
-    var product = f64_mul(f_lo, f_hi);
-    if (f64_gt(product, _NUM_F64_ZERO) == 1) {
+    # Opposite signs, read from the signs themselves: both values are non-zero numbers
+    # here (zeros and NaN returned above), so each is either below 0 or above it.
+    # ⛔ 3.3.7 — THE SIGN TEST WAS A PRODUCT, AND A PRODUCT UNDERFLOWS. `f_lo * f_hi > 0`
+    # read two same-sign values whose product is below half of 2^-1074 as a sign change:
+    # f = 0x16A8000000000000 (about 2^-661, no root) on [0, 1] squares to 0, the bracket
+    # was accepted, and the walk returned Ok(1.0) at tol 2^-1074 (f = 2^-1074 the same).
+    # Comparing each value with 0 cannot underflow, overflow or round, and needs no
+    # multiply. Only a product that underflowed to 0 changes its verdict: two non-zero
+    # same-sign values never multiply to a negative number, and opposite signs never to a
+    # positive one, so every other bracket is decided as before.
+    # [measured: tests/edge_cases.tcyr, group "3.3.7 num_bisection: a same-sign bracket whose product underflows"]
+    if (f64_lt(f_lo, _NUM_F64_ZERO) == f64_lt(f_hi, _NUM_F64_ZERO)) {
         return Err(HSB_ERR_INVALID_INPUT);
     }
 
@@ -139,11 +148,15 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
             store64(out, mid);
             return Ok(0);
         }
-        if (f64_eq(f_mid, f_mid) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
-
         if (f64_lt(f_mid, _NUM_F64_ZERO) == 1) {
             lo = mid;
         } else {
+            # ⭐ 3.3.7 — THE NaN TEST, WHERE A NaN CAN ARRIVE: `f(mid) < 0` is false for a NaN,
+            # so only this branch sees one, and it reads the bits (a NaN is past +Inf in
+            # magnitude). The verdict and its order after both width tests are 3.3.6's. x^2 - 2 on
+            # [0, 2] at 1e-12: 3.3.6 498 ns, integrated 494, now 457 (3.3.5 442).
+            # [measured: tests/hisab.bcyr num_bisection_x2m2, 4-tree A/B, 2026-10-31]
+            if ((f_mid & 0x7FFF_FFFF_FFFF_FFFF) > 0x7FF0_0000_0000_0000) { return Err(HSB_ERR_INVALID_INPUT); }
             hi = mid;
         }
         i = i + 1;
@@ -198,10 +211,34 @@ fn _num_cswap(data, i, j) {
     return 0;
 }
 
+# The twiddle stride of num_fft: every _NUM_FFT_RESEED-th twiddle of a stage is taken
+# from sin / cos instead of the recurrence (see num_fft).
+enum _NumFftReseed { _NUM_FFT_RESEED = 64; }
+
 # In-place Cooley-Tukey radix-2 FFT.
 # data: pointer to n complex numbers (2n f64 values, 16n bytes)
 # n: number of complex elements (must be power of 2)
 # Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT if n is not power of 2
+#
+# ⛔ 3.3.7 — THE TWIDDLE RECURRENCE DRIFTED WITH n. Each stage formed its twiddles as
+# w <- w * wn, k times, from a rounded wn, so twiddle k carried k roundings and wn's own
+# error k times over: the error grew linearly along a stage, to half = n / 2 steps in the last
+# one. At n = 2^20 (uniform +-0.5 complex input) max|dX| / max|X| against a radix-2 FFT
+# whose every twiddle comes from sin / cos was 1.31e-11, and the ifft round trip 3.95e-11.
+# Every _NUM_FFT_RESEED-th twiddle of a stage is now taken from sin / cos of angle * k
+# (angle = fl(-2 pi) / len divides exactly, so the product rounds once), and the
+# recurrence runs on from it, so no twiddle is more than 63 steps from an accurate one:
+# 4.31e-15 at 2^20 and 4.65e-15 at worst over n = 2..2^20, round trip 1.70e-14: the drift
+# is bounded by the 63 steps, not by n. Against an exact Decimal DFT at n = 8..2048 the
+# error is at most 2.00e-15, where the old recurrence's was 1.47e-14 and the reference's
+# is 6.05e-16, and the same under cycc 6.6.3, whose sin / cos are the x87's. The cost is
+# (log2 n - 8) * n / 128 + 1 sin / cos pairs from n = 256 (98,305 at 2^20, 0.94% of the
+# 10,485,760 butterflies) and an integer compare per butterfly.
+# ⚠ BITS: n = 2..128 are unchanged for every input (the branch needs a stage with
+# half > 64); from n = 256 the outputs move in their last bits (every random input at
+# every n from 2^8 to 2^20), and with them num_ifft, num_fft_2d, num_ifft_2d and every
+# DST / DCT whose reduction runs an FFT of 256 points or more.
+# [measured: scratch FFT probes (pfft.cyr, pfft2.cyr, pfft3.cyr), Decimal DFT oracle, base and this tree, 2026-10-31]
 #must_use
 public fn num_fft(data, n) {
     if (n <= 1) { return Ok(0); }
@@ -236,8 +273,15 @@ public fn num_fft(data, n) {
         while (start < n) {
             var w_re = _NUM_F64_ONE;
             var w_im = _NUM_F64_ZERO;
+            var kr = _NUM_FFT_RESEED;    # the next k whose twiddle is taken from sin / cos
             var k = 0;
             while (k < half) {
+                if (k == kr) {
+                    var ak = f64_mul(angle, f64_from(k));
+                    w_re = f64_cos(ak);
+                    w_im = f64_sin(ak);
+                    kr = kr + _NUM_FFT_RESEED;
+                }
                 var idx_u = start + k;
                 var idx_t = start + k + half;
 

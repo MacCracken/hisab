@@ -7,7 +7,7 @@ plain `fncallN` asm.
 from 6.6.0 to 6.6.14.
 **Severity:** Medium for a consumer, nil in-tree (see *Exposure*). It compiles clean and SIGSEGVs at
 run time, with no diagnostic.
-**Status:** ✅ **FIXED UPSTREAM in cyrius 6.6.16** (see *Fixed upstream* at the end); this record stays open until hisab's pin crosses 6.6.16. Was 🟡 OPEN UPSTREAM: filed 2026-10-03 with the maintainer's approval, as
+**Status:** ✅ **CLOSED — FIXED UPSTREAM in cyrius 6.6.16, taken by hisab 3.3.7** on the 6.6.14 → 6.6.20 pin bump (2026-10-31); the paired run is in *Closed* at the end. Was: ✅ **FIXED UPSTREAM in cyrius 6.6.16** (see *Fixed upstream* at the end); this record stays open until hisab's pin crosses 6.6.16. Was 🟡 OPEN UPSTREAM: filed 2026-10-03 with the maintainer's approval, as
 `cyrius/docs/development/issues/2026-10-03-hisab-toplevel-fncall-capturing-closure-segv.md`. Its
 self-proving repro is
 `cyrius/docs/development/issues/repros/2026-10-03-hisab-toplevel-fncall-capturing-closure-segv.cyr`.
@@ -99,3 +99,21 @@ top-level `callptr` compiles.
   hisab or any consumer pins below 6.6.16: there the top-level `fncall2(grad, x, g)` still exits 139.
 - **To close this record:** at the 6.6.16 pin bump, run the repro on the old and new pins as a pair and
   move this file to `archived/`.
+
+## Closed (hisab 3.3.7, 2026-10-31): the paired run
+
+The filed repro (`cyrius/docs/development/issues/repros/2026-10-03-hisab-toplevel-fncall-capturing-closure-segv.cyr`),
+built from two scratch dirs whose `cyrius.cyml` pins the version under test, each `cyrius build -v`
+naming `versions/<v>/bin/cycc`, every vendored `lib/*.cyr` byte-identical to that cyrius tag:
+
+| pin | exit | verdict |
+|---|---|---|
+| 6.6.14 | **139** | defect present |
+| 6.6.20 | **0** | fixed (both controls pass on both pins) |
+
+[measured: the filed repro from scratch dirs pinned to 6.6.14 and 6.6.20, 2026-10-31]
+
+- **In-tree:** nothing changed in code, as forecast. `src/autodiff.cyr`'s recipe note now says the
+  top-level restriction holds below 6.6.16 only, and why it is kept: every direct consumer pins
+  6.6.2–6.6.10.
+- **Consumers** keep the restriction until their own pin reaches 6.6.16.

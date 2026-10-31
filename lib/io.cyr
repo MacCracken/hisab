@@ -136,7 +136,7 @@ fn xunlink(path): i64 {
     return sys_unlink(path, an);
     #endif
     #ifdef CYRIUS_TARGET_WIN
-    return syscall(0xF035, path);   # v6.4.58: kernel32!DeleteFileW reroute (EDELETEFILEW_PE)
+    return syscall(0xF035, path);   # v6.4.58: kernel32!DeleteFileW reroute (EDELETEF_PE)
     #endif
     #ifndef CYRIUS_TARGET_AGNOS
     #ifndef CYRIUS_TARGET_WIN
@@ -740,6 +740,43 @@ fn _io_tmp_name(path): i64 {
     return buf;
 }
 
+# Create the sibling temp an atomic replace of `path` writes through, EXCLUSIVELY: each
+# "<path>.cyrtmp.<pid>.<ctr>" is opened O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW (0644), so a name
+# that already exists — a file, or a symlink dangling or not — is never opened, followed or
+# truncated; the counter moves on and the next name is tried, up to 64. Returns the temp name
+# and stores its fd at `fdp`, or returns 0 and stores a negative errno there: -12 (out of
+# memory), -17 (every name tried was taken), or the open's own error. ⛔ The name is
+# predictable (pid + a counter from 1), and until 6.6.20 it was opened O_WRONLY|O_CREAT|O_TRUNC:
+# a symlink planted at the next name redirected the write — file_write_atomic overwrote the file
+# the link named, then renamed the link over `path`. CHANGELOG [6.6.20]
+fn _io_tmp_open(path, fdp): i64 {
+    var tries = 0;
+    while (tries < 64) {
+        var tmp = _io_tmp_name(path);
+        if (tmp == 0) { store64(fdp, 0 - 12); return 0; }
+        var fd = file_open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0x1A4);
+        if (fd >= 0) { store64(fdp, fd); return tmp; }
+        if (_io_tmp_taken(tmp, fd) == 0) { store64(fdp, fd); return 0; }
+        tries = tries + 1;
+    }
+    store64(fdp, 0 - 17);
+    return 0;
+}
+
+# Did an exclusive create of `tmp` fail because the NAME exists? Linux and macOS answer -EEXIST
+# (17 on both); Windows (CREATE_NEW) and agnos (AO_EXCL) refuse with a bare -1, so there the name
+# is asked, not following a final link (_io_name_exists). Any other failure is not retried.
+fn _io_tmp_taken(tmp, rc): i64 {
+    if (rc == 0 - 17) { return 1; }
+    #ifdef CYRIUS_TARGET_WIN
+    if (rc == 0 - 1) { return _io_name_exists(tmp); }
+    #endif
+    #ifdef CYRIUS_TARGET_AGNOS
+    if (rc == 0 - 1) { return _io_name_exists(tmp); }
+    #endif
+    return 0;
+}
+
 # Give the fresh temp `fd` the permission bits `path` has NOW, so an atomic replace keeps the
 # mode the user set (a 0600 file stays 0600; 0755 stays executable). A rename puts a NEW inode
 # at `path`, and the temp was created 0644 & ~umask — without this every replace reset the mode,
@@ -813,10 +850,10 @@ fn _io_replace_target(path): i64 {
 # a file the caller owns; for a file a USER owns (their source, their manifest) use
 # file_replace_atomic, which writes the file the link names. CHANGELOG [6.6.6]
 fn file_write_atomic(path, buf, len): i64 {
-    var tmp = _io_tmp_name(path);
-    if (tmp == 0) { return 0 - 12; }   # -ENOMEM; `path` untouched. CHANGELOG [6.6.8]
-    var fd = file_open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
-    if (fd < 0) { return fd; }
+    var fdc = 0;
+    var tmp = _io_tmp_open(path, &fdc);   # exclusive: a planted name is skipped. CHANGELOG [6.6.20]
+    if (tmp == 0) { return fdc; }         # -ENOMEM / -EEXIST / the open's error; `path` untouched
+    var fd = fdc;
     _io_keep_mode(fd, path);   # v6.6.6: an existing file keeps its permission bits
     var wr = _io_write_full(fd, buf, len);   # loops; a short write is an error
     if (wr < 0) {
@@ -837,12 +874,301 @@ fn file_write_atomic(path, buf, len): i64 {
 # symlink at `path` stays a symlink while the file it names gets the bytes (a relative target
 # resolves against the link's directory; a loop is -ELOOP). A short write is still an error
 # that leaves the file as it was. What a rename CANNOT keep: other hard links (they keep the
-# old bytes), ownership when root replaces another user's file, xattrs/ACLs. For a user's
-# source (cyrfmt --write), manifest, lock or toolchain pin. CHANGELOG [6.6.6]
+# old bytes), ownership when root replaces another user's file, xattrs/ACLs. CHANGELOG [6.6.6]
+# ⚠ It follows a link WHEREVER it leads. A file in a tree someone else supplied — a checkout's
+# manifest, lock, toolchain pin or source — goes through _io_replace_atomic_in, which follows a
+# link only to a file inside the tree. CHANGELOG [6.6.20]
 fn file_replace_atomic(path, buf, len): i64 {
     var real = _io_replace_target(path);
     if (real < 0) { return real; }
     return file_write_atomic(real, buf, len);
+}
+
+# ⛔ 6.6.20 (CVE-98) — a REPLACE that follows a symlink only to a file INSIDE `root`.
+# The CLI rewrote a checkout's own files through file_replace_atomic / cbt's _aw_open_replace,
+# which follow a link wherever it leads — so a COMMITTED link wrote outside the project: a
+# dangling `cyrius.cyml -> ~/.ssh/authorized_keys` made `cyrius update` CREATE that file from the
+# checkout's cyrius.toml, and `cyrius.lock -> ~/.profile` made `cyrius build` (its auto-deps
+# relock) or `cyrius deps --lock` replace it. Same shape in `cyriusly use`, `cyrius fmt` and
+# `cyrius port`'s .gitignore append.
+# The rule: `root` + "/" + `rel` (just `rel` when `root` is ".") is written as named when it is
+# not a link. A link is followed only while every hop's target is RELATIVE, never climbs above
+# `root` with `..`, and never passes through a directory that is itself a link — the kernel
+# resolves `dir/..` against a linked dir's TARGET, so a lexical walk is exact only over real
+# directories; every directory it steps through or out of is checked. No hop may land in, or on,
+# `.git` — under any spelling a filesystem folds onto it (_io_path_meta_why): `.git` is inside the
+# project, and a write there is code execution (core.fsmonitor, hooks, commondir). Anything else is refused:
+# -EXDEV (-18), with the link, the target it names and why in _io_contain_*, which
+# _io_contain_refusal prints. A chain past 40 hops is -ELOOP (-40); a refused alloc -ENOMEM.
+# Windows has no readlink route, so there the named path is always the answer (MoveFileExW
+# replaces a link at the destination; it does not write through it). CHANGELOG [6.6.20]
+var _io_contain_link = 0;     # the link whose target was refused (NUL-terminated), or 0
+var _io_contain_target = 0;   # the target bytes it names (NUL-terminated)
+var _io_contain_why = 0;      # 1 absolute · 2 climbs out with .. · 3 passes a directory link · 4 too long
+# · 5 reaches into .git · 6 an 8.3 short name that can alias .git
+var _io_contain_dir = 0;      # for 3: the directory link, as a path
+var _io_contain_root = 0;
+var _io_contain_req = 0;      # the name the caller asked to write (`root` + `rel`)
+
+# `root` + "/" + the `n` bytes at `rel` (just those bytes when `root` is "."), NUL-terminated.
+fn _io_under(root, rel, n): i64 {
+    var rl = strlen(root);
+    var dot = 0;
+    if (rl == 1 && load8(root) == 46) { dot = 1; }
+    var cut = 0;
+    if (dot == 0) { cut = rl + 1; }
+    var out = alloc(cut + n + 1);
+    if (out == 0) { return 0; }
+    if (dot == 0) {
+        memcpy(out, root, rl);
+        store8(out + rl, 47);
+    }
+    memcpy(out + cut, rel, n);
+    store8(out + cut + n, 0);
+    return out;
+}
+
+# 1 when `root`/<the `n` bytes at `rel`> is a symlink (dangling or not), 0 otherwise; -12 on a
+# refused alloc. readlink, not lstat: routed on every POSIX peer and agnos (lib/fs.cyr is_symlink
+# is the same test).
+fn _io_is_link_under(root, rel, n): i64 {
+    var p = _io_under(root, rel, n);
+    if (p == 0) { return 0 - 12; }
+    var lb[8];
+    if (xreadlink(p, &lb, 8) > 0) { return 1; }
+    return 0;
+}
+
+# Why a normalised in-root path must not be written: 0 when it may, 5 when a component NAMES
+# .git, 6 when one is an 8.3 short name (`~` then a digit) that can alias it. "Names .git" the
+# way git's own protections read a name (the [embed] reads in cbt/manifest.cyr are the same
+# families): any case — APFS/HFS+ and NTFS fold it, so `.GIT/config` IS `.git/config` on ecb, ach
+# and cass —; the code points HFS+ ignores (U+200C-200F, U+202A-202E, U+206A-206F, U+FEFF:
+# git's protectHFS list) dropped; an NTFS `:stream` suffix cut (`.git::$INDEX_ALLOCATION` is the
+# directory); trailing dots and spaces dropped (Win32 strips them); the short name GIT~1.
+# CHANGELOG [6.6.20]
+fn _io_path_meta_why(p, n): i64 {
+    var short83 = 0;
+    var s = 0;
+    var i = 0;
+    while (i <= n) {
+        if (i == n || load8(p + i) == 47) {
+            # fold p[s..i) into f[0..fl): HFS-ignorables dropped, ASCII lowered, cut at ':'
+            var f[16];
+            var fl = 0;
+            var sig = 0;   # fl just past the last byte that is not a dot or a space
+            var j = s;
+            while (j < i) {
+                var c = load8(p + j);
+                var skip = 0;
+                if (j + 2 < i) {
+                    var b = load8(p + j + 1);
+                    var d = load8(p + j + 2);
+                    if (c == 0xE2 && b == 0x80 && ((d >= 0x8C && d <= 0x8F) || (d >= 0xAA && d <= 0xAE))) { skip = 1; }
+                    if (c == 0xE2 && b == 0x81 && d >= 0xAA && d <= 0xAF) { skip = 1; }
+                    if (c == 0xEF && b == 0xBB && d == 0xBF) { skip = 1; }
+                }
+                if (skip == 1) {
+                    j = j + 3;
+                } elif (c == 58) {
+                    j = i;
+                } else {
+                    if (c == 126 && j + 1 < i && load8(p + j + 1) >= 48 && load8(p + j + 1) <= 57) { short83 = 1; }
+                    if (c >= 65 && c <= 90) { c = c + 32; }
+                    if (fl < 16) { store8(&f + fl, c); }
+                    fl = fl + 1;
+                    if (c != 46 && c != 32) { sig = fl; }
+                    j = j + 1;
+                }
+            }
+            # trailing dots / spaces dropped; anything longer than 5 folded bytes is not .git
+            if (sig == 4 && memeq(&f, ".git", 4) == 1) { return 5; }
+            if (sig == 5 && memeq(&f, "git~1", 5) == 1) { return 5; }
+            s = i + 1;
+        }
+        i = i + 1;
+    }
+    if (short83 == 1) { return 6; }
+    return 0;
+}
+
+fn _io_contain_refuse(link, target, tn, why, root): i64 {
+    var t = alloc(tn + 1);
+    if (t == 0) { return 0 - 12; }
+    memcpy(t, target, tn);
+    store8(t + tn, 0);
+    _io_contain_link = link;
+    _io_contain_target = t;
+    _io_contain_why = why;
+    _io_contain_root = root;
+    return 0 - 18;
+}
+
+fn _io_replace_target_in(root, rel): i64 {
+    _io_contain_link = 0;
+    _io_contain_target = 0;
+    _io_contain_why = 0;
+    _io_contain_dir = 0;
+    _io_contain_root = 0;
+    _io_contain_req = 0;
+    if (load8(rel) == 47) { return 0 - 22; }   # `rel` is RELATIVE to `root` (-EINVAL: a misuse)
+    var lb = alloc(4097);
+    if (lb == 0) { return 0 - 12; }
+    var cur = rel;                     # the current name, relative to `root`
+    var hops = 0;
+    while (hops < 40) {
+        var full = _io_under(root, cur, strlen(cur));
+        if (full == 0) { return 0 - 12; }
+        if (hops == 0) { _io_contain_req = full; }
+        var n = xreadlink(full, lb, 4096);
+        if (n <= 0) { return full; }   # not a link (or absent: it will be created)
+        if (n >= 4096) { return _io_contain_refuse(full, lb, 4095, 4, root); }
+        if (load8(lb) == 47) { return _io_contain_refuse(full, lb, n, 1, root); }
+        # The candidate: the link's own directory (relative to root), then the target.
+        var cl = strlen(cur);
+        var dcut = 0;
+        var i = 0;
+        while (i < cl) {
+            if (load8(cur + i) == 47) { dcut = i + 1; }
+            i = i + 1;
+        }
+        var cand = alloc(dcut + n + 1);
+        if (cand == 0) { return 0 - 12; }
+        memcpy(cand, cur, dcut);
+        memcpy(cand + dcut, lb, n);
+        var cn = dcut + n;
+        store8(cand + cn, 0);
+        # Normalise it lexically into `out`, refusing a `..` above root and a `..` out of a link.
+        var out = alloc(cn + 1);
+        if (out == 0) { return 0 - 12; }
+        var ol = 0;
+        var s = 0;
+        i = 0;
+        while (i <= cn) {
+            if (i == cn || load8(cand + i) == 47) {
+                var w = i - s;
+                if (w == 2 && load8(cand + s) == 46 && load8(cand + s + 1) == 46) {
+                    if (ol == 0) { return _io_contain_refuse(full, lb, n, 2, root); }
+                    var lk = _io_is_link_under(root, out, ol);
+                    if (lk < 0) { return lk; }
+                    if (lk == 1) {
+                        _io_contain_dir = _io_under(root, out, ol);
+                        return _io_contain_refuse(full, lb, n, 3, root);
+                    }
+                    var k = ol;
+                    ol = 0;
+                    while (k > 0) {
+                        k = k - 1;
+                        if (load8(out + k) == 47) { ol = k; k = 0; }
+                    }
+                } elif (w > 0 && (w != 1 || load8(cand + s) != 46)) {
+                    if (ol > 0) { store8(out + ol, 47); ol = ol + 1; }
+                    memcpy(out + ol, cand + s, w);
+                    ol = ol + w;
+                }
+                s = i + 1;
+            }
+            i = i + 1;
+        }
+        if (ol == 0) { return 0 - 21; }   # names `root` itself: a directory (EISDIR)
+        store8(out + ol, 0);
+        # Never into the repository's own metadata, nor onto a `.git` gitfile: `cyrius.cyml ->
+        # .git/commondir` let `cyrius update` aim the repo's common dir at a checkout directory
+        # whose config ran a command on the next `git status`; `cyrius.lock -> .git/config`
+        # replaced the config with the lock. Every hop is checked, so a chain cannot hide it.
+        var mw = _io_path_meta_why(out, ol);
+        if (mw != 0) { return _io_contain_refuse(full, lb, n, mw, root); }
+        # Every directory the result sits under must be a real one.
+        i = 0;
+        while (i < ol) {
+            if (load8(out + i) == 47) {
+                var dl = _io_is_link_under(root, out, i);
+                if (dl < 0) { return dl; }
+                if (dl == 1) {
+                    _io_contain_dir = _io_under(root, out, i);
+                    return _io_contain_refuse(full, lb, n, 3, root);
+                }
+            }
+            i = i + 1;
+        }
+        cur = out;
+        hops = hops + 1;
+    }
+    return 0 - 40;
+}
+
+# file_replace_atomic, following a link only inside `root` (_io_replace_target_in). 0, or a
+# negative errno; -18 is the refusal, recorded for _io_contain_refusal. CHANGELOG [6.6.20]
+fn _io_replace_atomic_in(root, rel, buf, len): i64 {
+    var real = _io_replace_target_in(root, rel);
+    if (real < 0) { return real; }
+    return file_write_atomic(real, buf, len);
+}
+
+# A NUL-terminated string on stderr with every byte below 32 or from 127 as \xNN — the link and
+# its target come from the checkout, so they must not carry a terminal escape out.
+fn _io_ew_shown(s): i64 {
+    var hx = "0123456789abcdef";
+    var e[4];
+    var i = 0;
+    var c = load8(s);
+    while (c != 0) {
+        if (c < 32 || c >= 127) {
+            store8(&e, 92);
+            store8(&e + 1, 120);
+            store8(&e + 2, load8(hx + (c >> 4)));
+            store8(&e + 3, load8(hx + (c & 15)));
+            file_write(STDERR, &e, 4);
+        } else {
+            file_write(STDERR, s + i, 1);
+        }
+        i = i + 1;
+        c = load8(s + i);
+    }
+    return 0;
+}
+
+fn _io_ew(s): i64 { file_write(STDERR, s, strlen(s)); return 0; }
+
+# Print the refusal _io_replace_target_in recorded, BY NAME: `who` is the line's prefix
+# ("error", "cyrfmt"). Nothing when no refusal is recorded. CHANGELOG [6.6.20]
+fn _io_contain_refusal(who): i64 {
+    if (_io_contain_link == 0) { return 0; }
+    var r = _io_contain_root;
+    var dot = 0;
+    if (strlen(r) == 1 && load8(r) == 46) { dot = 1; }
+    _io_ew(who);
+    _io_ew(": refusing to write ");
+    _io_ew_shown(_io_contain_req);
+    if (streq(_io_contain_req, _io_contain_link) == 1) {
+        _io_ew(": it is a symlink to ");
+    } else {
+        _io_ew(": the link ");
+        _io_ew_shown(_io_contain_link);
+        _io_ew(" on its way is a symlink to ");
+    }
+    _io_ew_shown(_io_contain_target);
+    if (_io_contain_why == 1) { _io_ew(", an ABSOLUTE path"); }
+    if (_io_contain_why == 2) { _io_ew(", which climbs out with .."); }
+    if (_io_contain_why == 3) {
+        _io_ew(", reached through the directory link ");
+        _io_ew_shown(_io_contain_dir);
+    }
+    if (_io_contain_why == 4) { _io_ew(" (cut at 4095 bytes), which is too long"); }
+    if (_io_contain_why == 5) {
+        _io_ew(", which reaches into .git, the repository's own metadata (in any case or");
+        _io_ew(" spelling a filesystem folds onto it)");
+    }
+    if (_io_contain_why == 6) {
+        _io_ew(", which has an 8.3 short-name component (~ and a digit, like GIT~1);");
+        _io_ew(" on Windows it can alias .git");
+    }
+    _io_ew("\n  A write follows a link only to a file inside ");
+    if (dot == 1) { _io_ew("the project (the current directory)"); } else { _io_ew_shown(r); }
+    _io_ew(" and outside its .git,\n  named by a relative path through real directories. A checkout can commit a");
+    _io_ew(" link to any file you\n  can write; writing through it would replace that file. Nothing was written.\n");
+    _io_ew("  Fix: replace the link with the file itself, or point it inside with a relative link.\n");
+    return 0;
 }
 
 # Create `path` ONLY if it does not already exist (no-clobber), returning the new

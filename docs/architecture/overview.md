@@ -3,8 +3,8 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v3.3.3 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 30,223
-> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.14; a
+> hisab v3.3.7 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 42,482
+> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.20; a
 > consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map
@@ -95,7 +95,11 @@ This table is **derived and verified, not hand-maintained**. Each row was produc
 compiler as the oracle: compile the module alone, map every undefined name it reports to its
 defining module, add that module, and repeat until the build is clean. Then each row was checked
 twice: it builds with **0 undefined names** against exactly its listed set, and dropping any ONE
-listed module breaks the build. Both checks hold for all 35 rows (re-derived 2026-09-30 on 3.3.0).
+listed module breaks the build. Both checks hold for all 35 rows (re-derived 2026-09-30 on 3.3.0;
+re-checked by the same two checks 2026-10-31 on 3.3.7, which found five rows stale: `complex`, and
+through it `linalg_ext` and `linalg_precision`, need `f64_util` for `f64_copysign`, and `mat4` and
+`transforms` stopped needing it when 3.3.4 retired hisab's `f64_tan`; each module's own `# Requires`
+comment said the same and is corrected too).
 Undefined *functions* count even when nothing calls them. A function is only a warning until
 something reaches it, and a set that leaves one out is a trap for whoever calls it next.
 
@@ -117,13 +121,17 @@ Consumers pulling the whole `dist/hisab.cyr` bundle can ignore this table entire
 
 The stdlib half of the dependency set stopped being implicit in 2.9.2. `dist/hisab.deps` — the
 sidecar `cyrius distlib` writes beside the bundle, which a consumer's `cyrius deps` reads to
-auto-resolve stdlib leaves — is now **tracked** rather than gitignored, and names all 16 leaves the
-fold needs in scope: `syscalls`, `io`, `string`, `alloc`, `str`, `fmt`, `vec`, `args`, `assert`,
+auto-resolve stdlib leaves — is now **tracked** rather than gitignored. Through 3.3.6 it named all 16
+leaves the fold had in scope: `syscalls`, `io`, `string`, `alloc`, `str`, `fmt`, `vec`, `args`, `assert`,
 `math`, `ganita`, `tagged`, `result` (since 3.0.0), `fnptr`, `bench`, `callback`. It was worth
 ignoring until cyrius 6.5.10
 for the same reason this section exists: the sidecar was built by scanning bundled sources for
 literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, so it reported 2.
 6.5.10 unions in the declared `[deps] stdlib`, which is what takes it from 2 to 16.
+Since 3.3.7 (`cyrius distlib` ≥ 6.6.18) it is a **compile-verified fixpoint** instead: the 7 leaves
+the bundle actually needs (`math`, `alloc`, `vec`, `ganita`, `result`, `str`, `fmt`), also written as
+a `# Requires` block of `include "lib/<leaf>.cyr"` lines at the top of `dist/hisab.cyr`. A consumer
+that took any of the other nine through hisab's sidecar must now declare it.
 
 | Module | Also include |
 |---|---|
@@ -133,7 +141,7 @@ literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, s
 | `symbolic` | *(standalone)* |
 | `tensor` | *(standalone)* |
 | `autodiff` | `error` |
-| `complex` | `error` |
+| `complex` | `error` `f64_util` (`f64_copysign`) |
 | `diffgeo` | `error` |
 | `einsum` | `tensor` |
 | `num` | `error` |
@@ -143,7 +151,7 @@ literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, s
 | `vec2` | `error` |
 | `vec3` | `error` |
 | `collision_core` | `error` `vec2` |
-| `linalg_ext` | `complex` `error` `linalg_precision` (3.3.4: `svd_golub_kahan` is the SVD fallback) |
+| `linalg_ext` | `complex` `error` `f64_util` `linalg_precision` (3.3.4: `svd_golub_kahan` is the SVD fallback) |
 | `num_ext` | `error` `num` |
 | `quat` | `error` `vec3` |
 | `vec4` | `error` `vec3` |
@@ -155,11 +163,11 @@ literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, s
 | `calc_ext` | `calc` `error` `vec2` `vec3` |
 | `geo_advanced` | `error` `geo` `quat` `vec3` |
 | `geo_diff` | `error` `geo` `quat` `vec3` |
-| `linalg_precision` | `complex` `error` `linalg_ext` (`linalg_sort_desc` orders every S / eigenvalue vector) |
+| `linalg_precision` | `complex` `error` `f64_util` `linalg_ext` (`linalg_sort_desc` orders every S / eigenvalue vector) |
 | `noise_simplex` | `calc` `error` `vec2` `vec3` |
 | `spatial` | `error` `geo` `quat` `vec3` |
-| `mat4` | `error` `f64_util` `quat` `vec3` `vec4` |
-| `transforms` | `error` `f64_util` `mat4` `quat` `vec2` `vec3` `vec4` |
+| `mat4` | `error` `quat` `vec3` `vec4` |
+| `transforms` | `error` `mat4` `quat` `vec2` `vec3` `vec4` |
 | `lie` | `complex` `error` `f64_util` `mat3` (3.2.0: `MAT3_BYTES`) `mat4` `quat` `vec3` `vec4` |
 | `lie_ext` | `complex` `error` `f64_util` `lie` `mat3` `mat4` `quat` `vec3` `vec4` |
 

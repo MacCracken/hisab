@@ -93,14 +93,6 @@ var _AB_PINF = 0x7FF0000000000000;
 # between sites. Same value as `LOOSE_TOL_H`/`LOOSE_TOL_M` in the sibling suites.
 var _AB_TOL = 0x3E45798EE2308C3A;   # ~1e-8
 
-# ⚠ Reach for this ONLY where the value is genuinely approximate. Before 2.13.0
-# this suite compared floats through the TRUNCATING `f64_to`, which accepted an
-# absolute error of up to 1.0 — two assertions here were asserting a value that
-# was never true and passing anyway. Exact values get `assert_eq` on the bits.
-fn _ab_f64_eq(a, b, msg) {
-    assert(f64_approx_eq(a, b, _AB_TOL), msg);
-    return 0;
-}
 var _AB_NINF = 0xFFF0000000000000;
 
 # 7.0. Held as a bit pattern rather than as f64_from(7) so the "did the routine
@@ -786,6 +778,14 @@ assert_eq(svd_compute(g2a_W, ganita_mat_new(2, 3), alloc(3 * 8), ganita_mat_new(
   "svd_compute: a 2x3 A returns ganita's -2 (not an HsbError)");
 assert_eq(svd_compute(0, ganita_mat_new(3, 3), alloc(3 * 8), ganita_mat_new(3, 3)), (0 - 2),
   "svd_compute: A = 0 returns ganita's -2");
+# ...and a null out-param. Since 3.3.7 ganita's sigmas go to svd_compute's own scratch, so
+# its `out_S == 0` test is the only one between a null out_S and the final copy: without it,
+# svd_compute(diag(2,3,4), U, 0, Vt) exits 139.
+# [measured: review mutant N1 (out_S test dropped) through a probe, cyrius 6.6.20, 2026-10-31]
+assert_eq(svd_compute(ab_A33, 0, alloc(3 * 8), ganita_mat_new(3, 3)), (0 - 2), "svd_compute: out_U = 0 -> -2");
+assert_eq(svd_compute(ab_A33, ganita_mat_new(3, 3), 0, ganita_mat_new(3, 3)), (0 - 2),
+  "svd_compute: out_S = 0 -> -2 (not exit 139)");
+assert_eq(svd_compute(ab_A33, ganita_mat_new(3, 3), alloc(3 * 8), 0), (0 - 2), "svd_compute: out_Vt = 0 -> -2");
 # ...refused BEFORE the temporaries: full_vt is cols x cols, and 6000^2 is over
 # ganita's 33,554,430-element cap, so 3.3.2 got a 0 back and read through it.
 # [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
@@ -826,8 +826,16 @@ var _g2a11t, _g2a11v = svd_truncated(ab_A33, 2, g2a_U, g2a_S2, g2a_Vt);
 assert_eq(is_ok(_g2a11t), 1, "svd_truncated: out_U 3x2 / out_Vt 2x3 for k = 2 is exactly enough");
 assert_eq(load64(g2a_S2), f64_from(4), "svd_truncated: diag(2,3,4) k = 2 -> s0 = 4");
 assert_eq(load64(g2a_S2 + 8), f64_from(3), "svd_truncated: diag(2,3,4) k = 2 -> s1 = 3");
-assert_eq(ganita_mat_get(g2a_U, 2, 0), F64_ONE, "svd_truncated: diag(2,3,4) U[2][0] = 1");
-assert_eq(ganita_mat_get(g2a_Vt, 1, 1), F64_ONE, "svd_truncated: diag(2,3,4) Vt[1][1] = 1");
+# A singular pair's sign is free, so the pins read |u| and the product u * v, each exactly
+# +-1 or 1: ganita 1.2.11 (cyrius 6.6.14) gave U[2][0] = Vt[0][2] = +1 and 1.2.14 (6.6.20)
+# gives -1 for both, the same factorisation.
+# [measured: this block under cyrius 6.6.14 and 6.6.20, 2026-10-31]
+assert_eq(f64_abs(ganita_mat_get(g2a_U, 2, 0)), F64_ONE, "svd_truncated: diag(2,3,4) |U[2][0]| = 1");
+assert_eq(f64_mul(ganita_mat_get(g2a_U, 2, 0), ganita_mat_get(g2a_Vt, 0, 2)), F64_ONE,
+  "svd_truncated: diag(2,3,4) U[2][0] * Vt[0][2] = 1 (sigma 4 at (2, 2))");
+assert_eq(f64_abs(ganita_mat_get(g2a_Vt, 1, 1)), F64_ONE, "svd_truncated: diag(2,3,4) |Vt[1][1]| = 1");
+assert_eq(f64_mul(ganita_mat_get(g2a_U, 1, 1), ganita_mat_get(g2a_Vt, 1, 1)), F64_ONE,
+  "svd_truncated: diag(2,3,4) U[1][1] * Vt[1][1] = 1 (sigma 3 at (1, 1))");
 
 # A NON-FINITE ENTRY. ganita's scale is an ordered max that drops NaN, so 3.3.2
 # returned Ok(0) for these -- for an all-NaN A, with every singular value 0.
@@ -863,25 +871,30 @@ assert_eq(_g2a15v, HSB_ERR_INVALID_INPUT, "svd_truncated: NaN in the LAST entry 
 # 3.3.4 fallback group below); 3.3.3 returned -1 and Err(HSB_ERR_NO_CONVERGENCE). The
 # exact sigmas are 1 and sqrt(2) t (1 + O(t^2)), correctly rounded 1 and 0x1FE6A09E667F3BCD.
 # [measured: closed form of A^T A in 400-digit Decimal, 2026-10-03]
-# ⚠ WHEN THE ganita_mat_svd ASSERTION BELOW FAILS, ganita has repaired the overflow,
-# and the wrappers take its answer instead: re-derive the S pins, or retire the pair.
+# ⭐ 3.3.7 — GANITA 1.2.12 REPAIRED THE OVERFLOW (cyrius 6.6.16 folds 1.2.13; hisab pins
+# 6.6.20, ganita 1.2.14): it answers 0 with both sigmas correctly rounded, so the
+# tripwire is retired and the wrappers pin ganita's answer. 3.3.6's fallback gave S1
+# 1 ulp below. The fallback's own answers are pinned under a refused allocation in the
+# 3.3.4 fallback group below; the filing is archived as
+# docs/development/issues/archived/2026-10-03-ganita-mat-svd-no-convergence-on-tiny-columns.md
+# [measured: this block under cyrius 6.6.20 against the closed form above, 2026-10-31]
 var g2a_t513 = (1023 - 513) << 52;
 var g2a_J = ganita_mat_new(3, 2);
 ganita_mat_set(g2a_J, 0, 0, F64_ONE);   ganita_mat_set(g2a_J, 0, 1, g2a_t513);
 ganita_mat_set(g2a_J, 1, 0, g2a_t513);  ganita_mat_set(g2a_J, 1, 1, g2a_t513);
 ganita_mat_set(g2a_J, 2, 0, g2a_t513);  ganita_mat_set(g2a_J, 2, 1, f64_neg(g2a_t513));
-assert_eq(ganita_mat_svd(g2a_J, ganita_mat_new(3, 2), alloc(16), ganita_mat_new(2, 2)), (0 - 1),
-  "ganita_mat_svd: -1 at t = 2^-513 (its zeta^2 overflow; the tripwire)");
+assert_eq(ganita_mat_svd(g2a_J, ganita_mat_new(3, 2), alloc(16), ganita_mat_new(2, 2)), 0,
+  "ganita_mat_svd: 0 at t = 2^-513 (ganita 1.2.11: -1, its zeta^2 overflow)");
 var g2a_SJc = alloc(16);
 assert_eq(svd_compute(g2a_J, ganita_mat_new(3, 2), g2a_SJc, ganita_mat_new(2, 2)), 0,
-  "svd_compute: t = 2^-513 -> 0 through the fallback (3.3.3: ganita's -1)");
+  "svd_compute: t = 2^-513 -> 0 (3.3.3: ganita's -1; 3.3.4-3.3.6: the fallback's)");
 assert_eq(load64(g2a_SJc), F64_ONE, "svd_compute: t = 2^-513 -> S0 = 1, correctly rounded");
-assert_eq(load64(g2a_SJc + 8), 0x1FE6A09E667F3BCC,
-  "svd_compute: t = 2^-513 -> S1 = sqrt(2) t, 1 ulp below the correctly rounded ...3BCD");
+assert_eq(load64(g2a_SJc + 8), 0x1FE6A09E667F3BCD,
+  "svd_compute: t = 2^-513 -> S1 = sqrt(2) t, correctly rounded (3.3.6's fallback: ...3BCC)");
 var g2a_SJ = alloc(8);
 store64(g2a_SJ, _AB_SEVEN);
 var _g2a16t, _g2a16v = svd_truncated(g2a_J, 1, ganita_mat_new(3, 1), g2a_SJ, ganita_mat_new(1, 2));
-assert_eq(is_ok(_g2a16t), 1, "svd_truncated: t = 2^-513 -> Ok through the fallback (3.3.3: NO_CONVERGENCE)");
+assert_eq(is_ok(_g2a16t), 1, "svd_truncated: t = 2^-513 -> Ok (3.3.3: NO_CONVERGENCE)");
 assert_eq(load64(g2a_SJ), F64_ONE, "svd_truncated: t = 2^-513 -> S0 = 1");
 # One binade up the same matrix decomposes, through both wrappers.
 var g2a_t512 = (1023 - 512) << 52;
@@ -960,9 +973,18 @@ assert_eq(load64(_w3_Sc + 8), F64_TWO, "svd_compute: diag(3, 2) -> S1 = 2");
 # The closed forms: the duplicated-row witness has sigma^2 = (105 +- sqrt(10593)) / 2
 # and 0; the zero-row one the two roots of its 2 x 2 row Gram matrix, and 0.
 # [measured: closed forms in 60-digit Decimal against the bits below, 2026-10-03]
-# ⚠ THE ganita_mat_svd ASSERTIONS ARE TRIPWIRES. When ganita answers these, the
-# wrappers take ganita's answer and the S, U and residual pins describe it instead:
-# re-derive them from ganita's output, or find inputs ganita still refuses.
+# ⭐ 3.3.7 — GANITA 1.2.12 ANSWERS BOTH WITNESSES ITSELF (hisab pins cyrius 6.6.20, ganita
+# 1.2.14), so the tripwires are retired: the wrappers pass ganita's answer on, and the
+# fallback is reached here through ganita's OTHER -1, a refused allocation. With
+# ALLOC_MAX at 256 ganita's one 552-byte working block for a 3x3 is refused, while the
+# fallback's largest request is 88 bytes; the fallback pins below are 3.3.4's, unchanged.
+# Against the closed forms, re-derived in 120-digit Decimal:
+#   duplicated row: ganita S0 ...3E7C (0.57 ulp above; correctly rounded ...7B) and S1
+#     ...CE2C (correctly rounded); the fallback ...7D (1.57) and ...2F (3.14).
+#   zero row: ganita S0 ...08C4 (correctly rounded) and S1 ...F104 (1.87 ulp above); the
+#     fallback ...C6 (2.28) and ...F102 (correctly rounded).
+# max |A - U S Vt|: ganita 0.46 and 0.55 eps S0, the fallback 2.35 and 0.82.
+# [measured: ALLOC_MAX sweep 8..2048 through ganita_mat_svd and svd_golub_kahan, and this block, cyrius 6.6.20]
 fn _fb_m33(a, b, c, d, e, f, g, h, k) {
     var M = ganita_mat_new(3, 3);
     ganita_mat_set(M, 0, 0, a);  ganita_mat_set(M, 0, 1, b);  ganita_mat_set(M, 0, 2, c);
@@ -993,62 +1015,102 @@ fn _fb_resid(A, U, S, Vt, k) {
     }
     return worst;
 }
-# 4 eps S0: the bound for the residual pins below. On these exact fixtures the measured
-# max |A - U S Vt| is 2.35 eps S0 (duplicated row) and 0.82 eps S0 (zero row).
-# [measured: this block's own arithmetic on the fallback's output, 2026-10-03; cycc 6.6.14]
+# 4 eps S0: the bound for the residual pins below (the measured worst is 2.35 eps S0).
+# [measured: this block's own arithmetic on the fallback's output, 2026-10-03 and 2026-10-31; cycc 6.6.20]
 var _FB_4EPS = 0x3CD0000000000000;
+# The ALLOC_MAX that refuses ganita's working block and admits the fallback's; ganita's
+# own -1 under it is asserted first, so a ganita that needs less fails loudly, not quietly.
+var _FB_CAP = 256;
+var _fb_keep = ALLOC_MAX;
 var _fb_dup = _fb_m33(F64_ONE, F64_TWO, f64_from(3), F64_ONE, F64_TWO, f64_from(3),
   f64_from(4), f64_from(5), f64_from(6));
-assert_eq(ganita_mat_svd(_fb_dup, ganita_mat_new(3, 3), alloc(24), ganita_mat_new(3, 3)), (0 - 1),
-  "ganita_mat_svd: [[1,2,3],[1,2,3],[4,5,6]] -> -1 (the tripwire)");
+assert_eq(ganita_mat_svd(_fb_dup, ganita_mat_new(3, 3), alloc(24), ganita_mat_new(3, 3)), 0,
+  "ganita_mat_svd: [[1,2,3],[1,2,3],[4,5,6]] -> 0 (ganita 1.2.11: -1)");
 var _fb_U = ganita_mat_new(3, 3);
 var _fb_S = alloc(24);
 var _fb_Vt = ganita_mat_new(3, 3);
 _ab_fill7(_fb_S, 3);
 assert_eq(svd_compute(_fb_dup, _fb_U, _fb_S, _fb_Vt), 0,
-  "svd_compute: [[1,2,3],[1,2,3],[4,5,6]] -> 0 through the fallback (3.3.3: -1)");
-assert_eq(load64(_fb_S), 0x4024646BB0023E7D, "svd_compute: duplicated row -> S0, 1.6 ulp above the closed form");
-assert_eq(load64(_fb_S + 8), 0x3FF04ECE4EBDCE2F, "svd_compute: duplicated row -> S1, 3.1 ulp above the closed form");
+  "svd_compute: [[1,2,3],[1,2,3],[4,5,6]] -> 0 (3.3.3: -1)");
+assert_eq(load64(_fb_S), 0x4024646BB0023E7C,
+  "svd_compute: duplicated row -> ganita's S0, 0.57 ulp above the closed form");
+assert_eq(load64(_fb_S + 8), 0x3FF04ECE4EBDCE2C, "svd_compute: duplicated row -> ganita's S1, correctly rounded");
 assert_eq(load64(_fb_S + 16), 0, "svd_compute: duplicated row -> S2 = +0, the exact singular value");
 assert_eq(f64_lt(_fb_resid(_fb_dup, _fb_U, _fb_S, _fb_Vt, 3), f64_mul(load64(_fb_S), _FB_4EPS)), 1,
-  "svd_compute: duplicated row -> max |A - U S Vt| < 4 eps S0 (Vt is V^T, as ganita's)");
+  "svd_compute: duplicated row -> max |A - U S Vt| < 4 eps S0 (Vt is V^T)");
 var _fb_Ut = ganita_mat_new(3, 2);
 var _fb_St = alloc(16);
 var _fb_Vtt = ganita_mat_new(2, 3);
 var _fb1t, _fb1v = svd_truncated(_fb_dup, 2, _fb_Ut, _fb_St, _fb_Vtt);
-assert_eq(is_ok(_fb1t), 1, "svd_truncated: duplicated row, k = 2 -> Ok through the fallback (3.3.3: NO_CONVERGENCE)");
-assert_eq(load64(_fb_St), 0x4024646BB0023E7D, "svd_truncated: duplicated row, k = 2 -> S0 as svd_compute");
-assert_eq(load64(_fb_St + 8), 0x3FF04ECE4EBDCE2F, "svd_truncated: duplicated row, k = 2 -> S1 as svd_compute");
+assert_eq(is_ok(_fb1t), 1, "svd_truncated: duplicated row, k = 2 -> Ok (3.3.3: NO_CONVERGENCE)");
+assert_eq(load64(_fb_St), 0x4024646BB0023E7C, "svd_truncated: duplicated row, k = 2 -> S0 as svd_compute");
+assert_eq(load64(_fb_St + 8), 0x3FF04ECE4EBDCE2C, "svd_truncated: duplicated row, k = 2 -> S1 as svd_compute");
 assert_eq(f64_lt(_fb_resid(_fb_dup, _fb_Ut, _fb_St, _fb_Vtt, 2), f64_mul(load64(_fb_St), _FB_4EPS)), 1,
   "svd_truncated: duplicated row, rank 2 kept -> max |A - U S Vt| < 4 eps S0");
+# The same calls with ganita's working block refused take the fallback.
+ALLOC_MAX = _FB_CAP;
+var _fb_grc = ganita_mat_svd(_fb_dup, ganita_mat_new(3, 3), alloc(24), ganita_mat_new(3, 3));
+_ab_fill7(_fb_S, 3);
+var _fb_crc = svd_compute(_fb_dup, _fb_U, _fb_S, _fb_Vt);
+var _fb4t, _fb4v = svd_truncated(_fb_dup, 2, _fb_Ut, _fb_St, _fb_Vtt);
+ALLOC_MAX = _fb_keep;
+assert_eq(_fb_grc, (0 - 1), "ganita_mat_svd: ALLOC_MAX 256 refuses its 3x3 working block -> -1 (the precondition)");
+assert_eq(_fb_crc, 0, "svd_compute: duplicated row, ganita's block refused -> 0 through the fallback");
+assert_eq(load64(_fb_S), 0x4024646BB0023E7D, "svd_compute: duplicated row -> the fallback's S0, 1.57 ulp above");
+assert_eq(load64(_fb_S + 8), 0x3FF04ECE4EBDCE2F, "svd_compute: duplicated row -> the fallback's S1, 3.14 ulp above");
+assert_eq(load64(_fb_S + 16), 0, "svd_compute: duplicated row -> the fallback's S2 = +0");
+assert_eq(f64_lt(_fb_resid(_fb_dup, _fb_U, _fb_S, _fb_Vt, 3), f64_mul(load64(_fb_S), _FB_4EPS)), 1,
+  "svd_compute: duplicated row, the fallback -> max |A - U S Vt| < 4 eps S0");
+assert_eq(is_ok(_fb4t), 1, "svd_truncated: duplicated row, ganita's block refused -> Ok through the fallback");
+assert_eq(load64(_fb_St), 0x4024646BB0023E7D, "svd_truncated: duplicated row, the fallback -> S0 as svd_compute");
+assert_eq(load64(_fb_St + 8), 0x3FF04ECE4EBDCE2F, "svd_truncated: duplicated row, the fallback -> S1 as svd_compute");
 
 var _fb_zr = _fb_m33(0x3FF4CCCCCCCCCCCD, 0x400599999999999A, 0x3FD999999999999A, 0, 0, 0,
   0x3FECCCCCCCCCCCCD, 0x3FF199999999999A, 0x4002666666666666);
-assert_eq(ganita_mat_svd(_fb_zr, ganita_mat_new(3, 3), alloc(24), ganita_mat_new(3, 3)), (0 - 1),
-  "ganita_mat_svd: [[1.3,2.7,0.4],[0,0,0],[0.9,1.1,2.3]] -> -1 (the tripwire)");
+assert_eq(ganita_mat_svd(_fb_zr, ganita_mat_new(3, 3), alloc(24), ganita_mat_new(3, 3)), 0,
+  "ganita_mat_svd: [[1.3,2.7,0.4],[0,0,0],[0.9,1.1,2.3]] -> 0 (ganita 1.2.11: -1)");
 _ab_fill7(_fb_S, 3);
 assert_eq(svd_compute(_fb_zr, _fb_U, _fb_S, _fb_Vt), 0,
-  "svd_compute: [[1.3,2.7,0.4],[0,0,0],[0.9,1.1,2.3]] -> 0 through the fallback (3.3.3: -1)");
-assert_eq(load64(_fb_S), 0x400D3FB1257408C6, "svd_compute: zero row -> S0, 2.3 ulp above the closed form");
-assert_eq(load64(_fb_S + 8), 0x3FFC17E03945F102, "svd_compute: zero row -> S1, correctly rounded");
+  "svd_compute: [[1.3,2.7,0.4],[0,0,0],[0.9,1.1,2.3]] -> 0 (3.3.3: -1)");
+assert_eq(load64(_fb_S), 0x400D3FB1257408C4, "svd_compute: zero row -> ganita's S0, correctly rounded");
+assert_eq(load64(_fb_S + 8), 0x3FFC17E03945F104,
+  "svd_compute: zero row -> ganita's S1, 1.87 ulp above the closed form");
 assert_eq(load64(_fb_S + 16), 0, "svd_compute: zero row -> S2 = +0, the exact singular value");
-# The zero row's direction is U's null column, a unit vector; ganita writes a zero
-# column for an exact zero singular value.
-assert_eq(ganita_mat_get(_fb_U, 1, 2), F64_ONE, "svd_compute: zero row -> U[1][2] = 1 (a unit null column)");
+# ganita writes a zero U column for an exact zero singular value, the fallback a unit one.
+assert_eq(ganita_mat_get(_fb_U, 1, 2), 0, "svd_compute: zero row -> ganita's U[1][2] = 0 (its zero null column)");
 assert_eq(f64_lt(_fb_resid(_fb_zr, _fb_U, _fb_S, _fb_Vt, 3), f64_mul(load64(_fb_S), _FB_4EPS)), 1,
   "svd_compute: zero row -> max |A - U S Vt| < 4 eps S0");
 var _fb2t, _fb2v = svd_truncated(_fb_zr, 2, _fb_Ut, _fb_St, _fb_Vtt);
-assert_eq(is_ok(_fb2t), 1, "svd_truncated: zero row, k = 2 -> Ok through the fallback (3.3.3: NO_CONVERGENCE)");
-assert_eq(load64(_fb_St), 0x400D3FB1257408C6, "svd_truncated: zero row, k = 2 -> S0 as svd_compute");
-assert_eq(load64(_fb_St + 8), 0x3FFC17E03945F102, "svd_truncated: zero row, k = 2 -> S1 as svd_compute");
+assert_eq(is_ok(_fb2t), 1, "svd_truncated: zero row, k = 2 -> Ok (3.3.3: NO_CONVERGENCE)");
+assert_eq(load64(_fb_St), 0x400D3FB1257408C4, "svd_truncated: zero row, k = 2 -> S0 as svd_compute");
+assert_eq(load64(_fb_St + 8), 0x3FFC17E03945F104, "svd_truncated: zero row, k = 2 -> S1 as svd_compute");
 assert_eq(f64_lt(_fb_resid(_fb_zr, _fb_Ut, _fb_St, _fb_Vtt, 2), f64_mul(load64(_fb_St), _FB_4EPS)), 1,
   "svd_truncated: zero row, rank 2 kept -> max |A - U S Vt| < 4 eps S0");
+ALLOC_MAX = _FB_CAP;
+_ab_fill7(_fb_S, 3);
+var _fb_zrc = svd_compute(_fb_zr, _fb_U, _fb_S, _fb_Vt);
+var _fb5t, _fb5v = svd_truncated(_fb_zr, 2, _fb_Ut, _fb_St, _fb_Vtt);
+ALLOC_MAX = _fb_keep;
+assert_eq(_fb_zrc, 0, "svd_compute: zero row, ganita's block refused -> 0 through the fallback");
+assert_eq(load64(_fb_S), 0x400D3FB1257408C6, "svd_compute: zero row -> the fallback's S0, 2.28 ulp above");
+assert_eq(load64(_fb_S + 8), 0x3FFC17E03945F102, "svd_compute: zero row -> the fallback's S1, correctly rounded");
+assert_eq(ganita_mat_get(_fb_U, 1, 2), F64_ONE,
+  "svd_compute: zero row, the fallback -> U[1][2] = 1 (a unit null column)");
+assert_eq(f64_lt(_fb_resid(_fb_zr, _fb_U, _fb_S, _fb_Vt, 3), f64_mul(load64(_fb_S), _FB_4EPS)), 1,
+  "svd_compute: zero row, the fallback -> max |A - U S Vt| < 4 eps S0");
+assert_eq(is_ok(_fb5t), 1, "svd_truncated: zero row, ganita's block refused -> Ok through the fallback");
+assert_eq(load64(_fb_St + 8), 0x3FFC17E03945F102, "svd_truncated: zero row, the fallback -> S1 as svd_compute");
 
-# WHEN THE FALLBACK FAILS TOO. The duplicated-row witness times 2^1021: ganita sees the
-# same scaled matrix (the factor is a power of two) and returns -1, and the largest
-# singular value, 1.27 * 2^1024, is above DBL_MAX, so svd_golub_kahan returns
-# NO_CONVERGENCE. svd_compute gives -1 and svd_truncated that Err, out_S untouched.
+# WHEN THE FALLBACK FAILS TOO. The duplicated-row witness times 2^1021, whose largest
+# singular value, 1.27 * 2^1024, is above DBL_MAX. Through ganita 1.2.11 ganita returned
+# -1 and svd_golub_kahan NO_CONVERGENCE; svd_compute gave -1 and svd_truncated that Err,
+# out_S untouched.
 # [measured: fallback probe, 2026-10-03; cycc 6.6.14]
+# ⛔ 3.3.7 — ganita 1.2.12 returns 0 with S0 = +Inf (its documented edge: a sigma_1 past
+# DBL_MAX rounds to +Inf), and 3.3.6's wrappers passed that on: svd_compute 0 with
+# S0 = +Inf, svd_truncated Ok with S0 = +Inf. A non-finite sigma now takes the fallback,
+# whose refusal returns the 3.3.6 answers again.
+# [measured: this block under cyrius 6.6.14 and 6.6.20, before and after the repair, 2026-10-31]
 var _fb_big = _fb_m33(F64_ONE, F64_TWO, f64_from(3), F64_ONE, F64_TWO, f64_from(3),
   f64_from(4), f64_from(5), f64_from(6));
 var _fb_bi = 0;
@@ -1056,17 +1118,144 @@ while (_fb_bi < 9) {
     store64(_fb_big + 16 + _fb_bi * 8, f64_mul(load64(_fb_big + 16 + _fb_bi * 8), (1023 + 1021) << 52));
     _fb_bi = _fb_bi + 1;
 }
+var _fb_Sg0 = alloc(24);
+assert_eq(ganita_mat_svd(_fb_big, ganita_mat_new(3, 3), _fb_Sg0, ganita_mat_new(3, 3)), 0,
+  "ganita_mat_svd: duplicated row * 2^1021 -> 0 (the precondition: ganita answers)");
+assert_eq(load64(_fb_Sg0), _AB_PINF, "ganita_mat_svd: duplicated row * 2^1021 -> S0 = +Inf (the precondition)");
 var _fb_Sb = alloc(24);
 _ab_fill7(_fb_Sb, 3);
 assert_eq(svd_compute(_fb_big, ganita_mat_new(3, 3), _fb_Sb, ganita_mat_new(3, 3)), (0 - 1),
-  "svd_compute: duplicated row * 2^1021 (S0 above DBL_MAX) -> -1, ganita and the fallback both refuse");
+  "svd_compute: duplicated row * 2^1021 (S0 above DBL_MAX) -> -1 (3.3.6 under 6.6.20: 0, S0 = +Inf)");
 assert_eq(_ab_count7(_fb_Sb, 3), 3, "svd_compute: duplicated row * 2^1021 -> out_S untouched");
 var _fb_Sbt = alloc(8);
 store64(_fb_Sbt, _AB_SEVEN);
 var _fb3t, _fb3v = svd_truncated(_fb_big, 1, ganita_mat_new(3, 1), _fb_Sbt, ganita_mat_new(1, 3));
-assert_eq(is_err_result(_fb3t), 1, "svd_truncated: duplicated row * 2^1021 -> Err");
+assert_eq(is_err_result(_fb3t), 1, "svd_truncated: duplicated row * 2^1021 -> Err (3.3.6 under 6.6.20: Ok, +Inf)");
 assert_eq(_fb3v, HSB_ERR_NO_CONVERGENCE, "svd_truncated: duplicated row * 2^1021 -> the fallback's NO_CONVERGENCE");
 assert_eq(load64(_fb_Sbt), _AB_SEVEN, "svd_truncated: duplicated row * 2^1021 -> out_S untouched");
+
+# ⛔ 3.3.7 — AND A FINITE GANITA ANSWER PAST THE LINE IS REFUSED, as svd_golub_kahan refuses
+# it. [[h, h], [h, h]], h = 2^1023, has sigma_1 = 2^1024, which rounds to +Inf; ganita 1.2.14
+# returns 0 with S0 = DBL_MAX, and 3.3.6's wrappers passed that on (0, and Ok). Its own
+# singular pair proves sigma_1 past the line, so svd_compute is -1 and svd_truncated
+# NO_CONVERGENCE, out_S untouched, with no fallback. The 2x1 [a; b] below is past the line
+# by 0.238 units of 2^971 (2^-55.07; a plain hypot in 100-digit Decimal), and ganita gives
+# DBL_MAX for it too. h = 2^1022 (sigma_1 = 2^1023) is the control: ganita's answer,
+# 0x7FDFFFFFFFFFFFFF, still passes through both wrappers bit for bit.
+# [measured: wrapper fixtures under cyrius 6.6.20, 3.3.6 vs this tree, 2026-10-31]
+fn _ln_sq(h) {
+    var M = ganita_mat_new(2, 2);
+    ganita_mat_set(M, 0, 0, h); ganita_mat_set(M, 0, 1, h);
+    ganita_mat_set(M, 1, 0, h); ganita_mat_set(M, 1, 1, h);
+    return M;
+}
+var _ln_A = _ln_sq(0x7FE0000000000000);
+var _ln_Sg = alloc(16);
+assert_eq(ganita_mat_svd(_ln_A, ganita_mat_new(2, 2), _ln_Sg, ganita_mat_new(2, 2)), 0,
+  "ganita_mat_svd: [[h,h],[h,h]], h = 2^1023 -> 0 (the precondition: ganita answers)");
+assert_eq(load64(_ln_Sg), 0x7FEFFFFFFFFFFFFF, "ganita_mat_svd: [[h,h],[h,h]] -> S0 = DBL_MAX (the precondition)");
+var _ln_S = alloc(16);
+_ab_fill7(_ln_S, 2);
+assert_eq(svd_compute(_ln_A, ganita_mat_new(2, 2), _ln_S, ganita_mat_new(2, 2)), (0 - 1),
+  "svd_compute: [[h,h],[h,h]], sigma_1 = 2^1024 -> -1 (3.3.6: 0, S0 = DBL_MAX)");
+assert_eq(_ab_count7(_ln_S, 2), 2, "svd_compute: [[h,h],[h,h]] -> out_S untouched");
+var _ln_St = alloc(8);
+store64(_ln_St, _AB_SEVEN);
+var _ln1t, _ln1v = svd_truncated(_ln_A, 1, ganita_mat_new(2, 1), _ln_St, ganita_mat_new(1, 2));
+assert_eq(_ln1v, HSB_ERR_NO_CONVERGENCE, "svd_truncated: [[h,h],[h,h]] -> NO_CONVERGENCE (3.3.6: Ok, DBL_MAX)");
+assert_eq(load64(_ln_St), _AB_SEVEN, "svd_truncated: [[h,h],[h,h]] -> out_S untouched");
+var _ln_B = ganita_mat_new(2, 1);
+ganita_mat_set(_ln_B, 0, 0, 0xFFE005514A3CA614); ganita_mat_set(_ln_B, 1, 0, 0x7FEBB368493377D4);
+var _ln_Sb = alloc(8);
+store64(_ln_Sb, _AB_SEVEN);
+assert_eq(svd_compute(_ln_B, ganita_mat_new(2, 1), _ln_Sb, ganita_mat_new(1, 1)), (0 - 1),
+  "svd_compute: 2x1 2^-55.07 past the line -> -1 (3.3.6: 0, S0 = DBL_MAX)");
+assert_eq(load64(_ln_Sb), _AB_SEVEN, "svd_compute: 2x1 past the line -> out_S untouched");
+var _ln2t, _ln2v = svd_truncated(_ln_B, 1, ganita_mat_new(2, 1), _ln_Sb, ganita_mat_new(1, 1));
+assert_eq(_ln2v, HSB_ERR_NO_CONVERGENCE, "svd_truncated: 2x1 2^-55.07 past the line -> NO_CONVERGENCE");
+var _ln_C = _ln_sq(0x7FD0000000000000);
+var _ln_Sc = alloc(16);
+assert_eq(svd_compute(_ln_C, ganita_mat_new(2, 2), _ln_Sc, ganita_mat_new(2, 2)), 0,
+  "svd_compute: [[h/2,h/2],[h/2,h/2]], sigma_1 = 2^1023 (control) -> 0");
+assert_eq(load64(_ln_Sc), 0x7FDFFFFFFFFFFFFF, "svd_compute: control -> ganita's S0, 1 ulp below 2^1023");
+var _ln_Sct = alloc(8);
+var _ln3t, _ln3v = svd_truncated(_ln_C, 1, ganita_mat_new(2, 1), _ln_Sct, ganita_mat_new(1, 2));
+assert_eq(is_ok(_ln3t), 1, "svd_truncated: control -> Ok");
+assert_eq(load64(_ln_Sct), 0x7FDFFFFFFFFFFFFF, "svd_truncated: control -> ganita's S0");
+# Two rows of the wrapper sweep whose verdicts need the copied certificate whole. The 3x2
+# (rows 0 and 1 equal) is past the line by 2^-57.07; ganita gives DBL_MAX, and with the
+# quotient's low parts dropped, the line taken as 2^1024, q not doubled, Vt read by column or
+# m taken as n, a wrapper answers it. The 2x2 is inside by 2^-55.02 (oracle: DBL_MAX and
+# 0x7FC12D62516773E8 correctly rounded); ganita answers 1 ulp low, and with u_i v_j or the
+# denominator in plain doubles, the low part of q dropped or Vt's column read, it is refused.
+# svd_golub_kahan refuses this one at its rescale, so a wrapper that sent every near-line
+# value to the fallback would refuse it too.
+# [measured: wrapper sweep rows 686 and 1260, certificate variants + 250-digit Decimal oracle, 2026-10-31]
+var _ln_D = ganita_mat_new(3, 2);
+ganita_mat_set(_ln_D, 0, 0, 0x7FDE692E10B77A04); ganita_mat_set(_ln_D, 0, 1, 0xFFDC33FC0C106E06);
+ganita_mat_set(_ln_D, 1, 0, 0x7FDE692E10B77A04); ganita_mat_set(_ln_D, 1, 1, 0xFFDC33FC0C106E06);
+ganita_mat_set(_ln_D, 2, 0, 0xFFD06C6B331F9171); ganita_mat_set(_ln_D, 2, 1, 0x7FD3E3C66417F0BC);
+var _ln_Sd = alloc(16);
+_ab_fill7(_ln_Sd, 2);
+assert_eq(svd_compute(_ln_D, ganita_mat_new(3, 2), _ln_Sd, ganita_mat_new(2, 2)), (0 - 1),
+  "svd_compute: 3x2 2^-57.07 past the line -> -1 (3.3.6: 0, DBL_MAX)");
+assert_eq(_ab_count7(_ln_Sd, 2), 2, "svd_compute: 3x2 past the line -> out_S untouched");
+var _ln4t, _ln4v = svd_truncated(_ln_D, 1, ganita_mat_new(3, 1), _ln_Sd, ganita_mat_new(1, 2));
+assert_eq(_ln4v, HSB_ERR_NO_CONVERGENCE, "svd_truncated: 3x2 2^-57.07 past the line -> NO_CONVERGENCE");
+var _ln_E = ganita_mat_new(2, 2);
+ganita_mat_set(_ln_E, 0, 0, 0x7FC1785D17010D5B); ganita_mat_set(_ln_E, 0, 1, 0x7DB5EFF369AF770D);
+ganita_mat_set(_ln_E, 1, 0, 0xFFC71F1D339EBA93); ganita_mat_set(_ln_E, 1, 1, 0xFFEF76A90EFF265E);
+var _ln_Se = alloc(16);
+assert_eq(svd_compute(_ln_E, ganita_mat_new(2, 2), _ln_Se, ganita_mat_new(2, 2)), 0,
+  "svd_compute: 2x2 2^-55.02 inside the line -> 0");
+assert_eq(load64(_ln_Se), 0x7FEFFFFFFFFFFFFE, "svd_compute: 2^-55.02 inside the line -> ganita's S0, 1 ulp low");
+var _ln_Set = alloc(8);
+var _ln5t, _ln5v = svd_truncated(_ln_E, 1, ganita_mat_new(2, 1), _ln_Set, ganita_mat_new(1, 2));
+assert_eq(is_ok(_ln5t), 1, "svd_truncated: 2x2 2^-55.02 inside the line -> Ok");
+assert_eq(load64(_ln_Set), 0x7FEFFFFFFFFFFFFE, "svd_truncated: 2^-55.02 inside the line -> ganita's S0");
+
+# === 3.3.7 linalg_precision: a refused allocation is ALLOC, not exit 139 ===
+# ⛔ Through 3.3.6 `_lp_vec_new` stored through a failed allocation and none of its
+# callers checked, so svd_golub_kahan and eigen_qr exited 139 whenever ALLOC_MAX sat below
+# one of their requests (a 3x3 at ALLOC_MAX 16); with ganita 1.2.12's -1 meaning exactly
+# that, svd_compute's fallback would have walked into it. Every cap from 8 to 1024 bytes
+# now answers Ok or Err(HSB_ERR_ALLOC), out_S and out_vals untouched on the Err, and so
+# does svd_compute (Ok or -1) with ganita and the fallback both refused.
+# [measured: ALLOC_MAX sweep 8..2048 under cyrius 6.6.20, before and after the repair, 2026-10-31]
+var _fb_sym = _fb_m33(F64_TWO, F64_ONE, 0, F64_ONE, F64_TWO, F64_ONE, 0, F64_ONE, F64_TWO);
+var _fb_bad = 0;
+var _fb_alloc_seen = 0;
+var _fb_cap = 8;
+while (_fb_cap <= 1024) {
+    var cU = ganita_mat_new(3, 3);
+    var cS = alloc(24);
+    var cVt = ganita_mat_new(3, 3);
+    var cE = alloc(24);
+    var cV = ganita_mat_new(3, 3);
+    var cS2 = alloc(24);
+    _ab_fill7(cS, 3);
+    _ab_fill7(cE, 3);
+    _ab_fill7(cS2, 3);
+    ALLOC_MAX = _fb_cap;
+    var gt, gv = svd_golub_kahan(_fb_zr, cU, cS, cVt);
+    var et, ev = eigen_qr(_fb_sym, 3, 200, cE, cV);
+    var crc = svd_compute(_fb_zr, cU, cS2, cVt);
+    ALLOC_MAX = _fb_keep;
+    if (is_err_result(gt) == 1) {
+        _fb_alloc_seen = _fb_alloc_seen + 1;
+        if (gv != HSB_ERR_ALLOC || _ab_count7(cS, 3) != 3) { _fb_bad = _fb_bad + 1; }
+    }
+    if (is_err_result(et) == 1) {
+        if (ev != HSB_ERR_ALLOC || _ab_count7(cE, 3) != 3) { _fb_bad = _fb_bad + 1; }
+    }
+    if (crc != 0) {
+        if (crc != (0 - 1) || _ab_count7(cS2, 3) != 3) { _fb_bad = _fb_bad + 1; }
+    }
+    _fb_cap = _fb_cap + 8;
+}
+assert_eq(_fb_bad, 0,
+  "svd_golub_kahan / eigen_qr / svd_compute: ALLOC_MAX 8..1024 -> Ok, ALLOC or -1, outputs untouched");
+assert_eq(_fb_alloc_seen, 10, "svd_golub_kahan: the 10 caps below 88 bytes are refused (the sweep reaches them)");
 
 # WHAT GANITA ANSWERS PASSES THROUGH UNCHANGED. [[1,2,3],[4,5,6],[7,8,9]] (rank 2):
 # ganita returns 0 with S2 = 6.2e-16, svd_golub_kahan would give S2 = 0 and other
@@ -2391,6 +2580,98 @@ assert_eq(_r4lp_eig(_ol_A, 2, _ol_S, _r4lp_m(2, 2)), HSB_ERR_NONE,
   "eigen_qr: eigenvalue exactly on the line (tripwire): Ok");
 assert_eq(load64(_ol_S), 0x7FEFFFFFFFFFFFFE, "eigen_qr: eigenvalue exactly on the line (tripwire): 3.3.5's bits");
 
+test_group("3.3.7 abuse: svd_golub_kahan at the overflow line, as eigen_qr");
+
+# A SINGULAR VALUE FINITE ONLY BY ROUNDING IS REFUSED, as eigen_qr's eigenvalue above. With
+# h = 2^1023, [[h, h], [h, h]] (and -h) and [[h, h, 0], [h, h, 0], [0, 0, 1]] have sigma_1 =
+# 2^1024, past the line 2^1024 - 2^970; 3.3.6 returned Ok (DBL_MAX, 0) and (DBL_MAX, 1, 0).
+var _sl_S = alloc(4 * 8);
+var _sl_A = _r4lp_m(2, 2);
+ganita_mat_set(_sl_A, 0, 0, _ol_h); ganita_mat_set(_sl_A, 0, 1, _ol_h);
+ganita_mat_set(_sl_A, 1, 0, _ol_h); ganita_mat_set(_sl_A, 1, 1, _ol_h);
+_r4lp_reset(_sl_S, 4);
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(2, 2), _sl_S, _r4lp_m(2, 2)), HSB_ERR_NO_CONVERGENCE,
+  "svd_golub_kahan [[h,h],[h,h]]: sigma = 2^1024 -> NO_CONVERGENCE (3.3.6: Ok DBL_MAX)");
+assert_eq(_r4lp_kept(_sl_S, 2), 1, "svd_golub_kahan [[h,h],[h,h]]: out_S untouched");
+_sl_A = _r4lp_m(2, 2);
+ganita_mat_set(_sl_A, 0, 0, f64_neg(_ol_h)); ganita_mat_set(_sl_A, 0, 1, f64_neg(_ol_h));
+ganita_mat_set(_sl_A, 1, 0, f64_neg(_ol_h)); ganita_mat_set(_sl_A, 1, 1, f64_neg(_ol_h));
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(2, 2), _sl_S, _r4lp_m(2, 2)), HSB_ERR_NO_CONVERGENCE,
+  "svd_golub_kahan [[-h,-h],[-h,-h]]: sigma = 2^1024 -> NO_CONVERGENCE");
+_sl_A = _r4lp_m(3, 3);
+_r4lp_reset(_sl_S, 4);
+ganita_mat_set(_sl_A, 0, 0, _ol_h); ganita_mat_set(_sl_A, 0, 1, _ol_h);
+ganita_mat_set(_sl_A, 1, 0, _ol_h); ganita_mat_set(_sl_A, 1, 1, _ol_h); ganita_mat_set(_sl_A, 2, 2, F64_ONE);
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(3, 3), _sl_S, _r4lp_m(3, 3)), HSB_ERR_NO_CONVERGENCE,
+  "svd_golub_kahan [[h,h,0],[h,h,0],[0,0,1]]: NO_CONVERGENCE (3.3.6: Ok (DBL_MAX, 1, 0))");
+assert_eq(_r4lp_kept(_sl_S, 3), 1, "svd_golub_kahan [[h,h,0],[h,h,0],[0,0,1]]: out_S untouched");
+# h = 2^1022 fits (sigma_1 = 2^1023) and answers as before, 1 ulp low; never examined.
+# [measured: overflow-line probe, 3.3.6 base vs this tree, 2026-10-31; cycc 6.6.20]
+_sl_A = _r4lp_m(2, 2);
+ganita_mat_set(_sl_A, 0, 0, 0x7FD0000000000000); ganita_mat_set(_sl_A, 0, 1, 0x7FD0000000000000);
+ganita_mat_set(_sl_A, 1, 0, 0x7FD0000000000000); ganita_mat_set(_sl_A, 1, 1, 0x7FD0000000000000);
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(2, 2), _sl_S, _r4lp_m(2, 2)), HSB_ERR_NONE,
+  "svd_golub_kahan [[h/2,h/2],[h/2,h/2]]: sigma = 2^1023 answers");
+assert_eq(load64(_sl_S), 0x7FDFFFFFFFFFFFFF, "svd_golub_kahan [[h/2,h/2],[h/2,h/2]]: sigma_0 1 ulp low, as on 3.3.6");
+assert_eq(load64(_sl_S + 8), 0, "svd_golub_kahan [[h/2,h/2],[h/2,h/2]]: sigma_1 = +0");
+# On the finite side nothing changes. [[a, h], [h, a]], a = 2^1023 - 2^971, has sigma_1 =
+# DBL_MAX exactly; it is examined (within 2^-40 of the line) and answers, 1 ulp low as on 3.3.6.
+# [measured: overflow-line probe, 3.3.6 base vs this tree, 2026-10-31; cycc 6.6.20]
+_sl_A = _r4lp_m(2, 2);
+ganita_mat_set(_sl_A, 0, 0, 0x7FDFFFFFFFFFFFFE); ganita_mat_set(_sl_A, 0, 1, _ol_h);
+ganita_mat_set(_sl_A, 1, 0, _ol_h); ganita_mat_set(_sl_A, 1, 1, 0x7FDFFFFFFFFFFFFE);
+_r4lp_reset(_sl_S, 4);
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(2, 2), _sl_S, _r4lp_m(2, 2)), HSB_ERR_NONE,
+  "svd_golub_kahan: sigma_1 = DBL_MAX exactly answers");
+assert_eq(load64(_sl_S), 0x7FEFFFFFFFFFFFFE, "svd_golub_kahan: sigma_1 = DBL_MAX exactly: 1 ulp low, as on 3.3.6");
+# Two rows of the near-line sweep, whose verdicts need the quotient in double-double. The
+# first has sigma_1 inside the line by 2^-56.5 relative (oracle: DBL_MAX and
+# 0x7FC8ED373A61AE42 correctly rounded); with u_i v_j or the denominator in plain doubles,
+# the quotient's low part dropped or the denominator's left out of it, the check refuses it.
+# The second is past the line by 2^-54.95 (3.3.6: Ok 0x7FEFFFFFFFFFFFFE); with the numerator
+# or the denominator in plain doubles, the quotient's low part dropped or the denominator's
+# left out of it, or the line taken as 2^1024, the check answers it.
+# [measured: near-line svd sweep rows 878 and 1229, check variants + 200-digit Decimal oracle, 2026-10-31; cycc 6.6.20]
+_sl_A = _r4lp_m(2, 2);
+ganita_mat_set(_sl_A, 0, 0, 0x7FDC147A7A709A03); ganita_mat_set(_sl_A, 0, 1, 0xFFD564497178D874);
+ganita_mat_set(_sl_A, 1, 0, 0xFFDA0991387D9339); ganita_mat_set(_sl_A, 1, 1, 0x7FE81EFBE4690A74);
+_r4lp_reset(_sl_S, 4);
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(2, 2), _sl_S, _r4lp_m(2, 2)), HSB_ERR_NONE,
+  "svd_golub_kahan: sigma_1 2^-56.5 inside the line answers");
+assert_eq(load64(_sl_S), 0x7FEFFFFFFFFFFFFF, "svd_golub_kahan: 2^-56.5 inside the line: sigma_0 correctly rounded");
+assert_eq(load64(_sl_S + 8), 0x7FC8ED373A61AE43, "svd_golub_kahan: 2^-56.5 inside the line: sigma_1 1 ulp high");
+_sl_A = _r4lp_m(2, 2);
+ganita_mat_set(_sl_A, 0, 0, 0xFFE6FDC61236A02F); ganita_mat_set(_sl_A, 0, 1, 0x7FDCBBF0AB9CBEFE);
+ganita_mat_set(_sl_A, 1, 0, 0x7FDCD52C9840C37E); ganita_mat_set(_sl_A, 1, 1, 0xFFD2046EE28CA4D6);
+_r4lp_reset(_sl_S, 4);
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(2, 2), _sl_S, _r4lp_m(2, 2)), HSB_ERR_NO_CONVERGENCE,
+  "svd_golub_kahan: sigma_1 2^-54.95 past the line -> NO_CONVERGENCE (3.3.6: Ok 0x7FEFFFFFFFFFFFFE)");
+assert_eq(_r4lp_kept(_sl_S, 2), 1, "svd_golub_kahan: 2^-54.95 past the line: out_S untouched");
+# A 3x3 past the line by 2^-60.1 (3.3.6: Ok): v'v has to come from the row of Vt, which for a
+# 2x2 Vt holds the same magnitudes as its column, so only n >= 3 tells them apart.
+# [measured: near-line svd sweep row 74, column-read variant + 250-digit Decimal oracle, 2026-10-31; cycc 6.6.20]
+_sl_A = _r4lp_m(3, 3);
+ganita_mat_set(_sl_A, 0, 0, 0xFFD9F1F9334B83B8); ganita_mat_set(_sl_A, 0, 1, 0xFFD0D1F48B0482C5);
+ganita_mat_set(_sl_A, 0, 2, 0xFFD80CF08A297F0B); ganita_mat_set(_sl_A, 1, 0, 0xFFCF0E32725F6EA2);
+ganita_mat_set(_sl_A, 1, 1, 0xFFDAB5E5DCB57403); ganita_mat_set(_sl_A, 1, 2, 0x7FDA14EE70EBC76A);
+ganita_mat_set(_sl_A, 2, 0, 0x7FDB3A0CEC0CA803); ganita_mat_set(_sl_A, 2, 1, 0xFFE95469A20FEDA1);
+ganita_mat_set(_sl_A, 2, 2, 0xFFD71C96F714C9E1);
+_r4lp_reset(_sl_S, 4);
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(3, 3), _sl_S, _r4lp_m(3, 3)), HSB_ERR_NO_CONVERGENCE,
+  "svd_golub_kahan: a 3x3 2^-60.1 past the line -> NO_CONVERGENCE");
+assert_eq(_r4lp_kept(_sl_S, 3), 1, "svd_golub_kahan: a 3x3 2^-60.1 past the line: out_S untouched");
+# ⚠ ON THE LINE ITSELF THE CHECK CANNOT DECIDE, as eigen_qr's. [[a', h], [h, a']], a' =
+# 2^1023 - 2^970, has sigma_1 = 2^1024 - 2^970 exactly, which rounds to +Inf (ties to even);
+# the quotient of the computed pair does not pass the line, so the finite answer stands.
+# A tripwire: it moves if the check learns to decide ties.
+_sl_A = _r4lp_m(2, 2);
+ganita_mat_set(_sl_A, 0, 0, 0x7FDFFFFFFFFFFFFF); ganita_mat_set(_sl_A, 0, 1, _ol_h);
+ganita_mat_set(_sl_A, 1, 0, _ol_h); ganita_mat_set(_sl_A, 1, 1, 0x7FDFFFFFFFFFFFFF);
+_r4lp_reset(_sl_S, 4);
+assert_eq(_r4lp_svd(_sl_A, _r4lp_m(2, 2), _sl_S, _r4lp_m(2, 2)), HSB_ERR_NONE,
+  "svd_golub_kahan: sigma_1 exactly on the line (tripwire): Ok");
+assert_eq(load64(_sl_S), 0x7FEFFFFFFFFFFFFF, "svd_golub_kahan: sigma_1 exactly on the line (tripwire): 3.3.6's bits");
+
 test_group("3.3.5 abuse: svd_golub_kahan, a hand-built zero-column header");
 var _g1586_A = alloc(16);
 store64(_g1586_A, 2);
@@ -2929,6 +3210,22 @@ assert_eq(is_ok(_k4e9t), 1, "eigen_power: 4x4 with a flushed third component con
 assert_eq(load64(g2a_ev), 0x4023814C22BF68D1, "eigen_power: 4x4 with a flushed component: lambda == a22 (3.3.3: a33)");
 assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_evec + 24), 0x3FE13A453E9B4CB1)), _k4e_t2), 1,
   "eigen_power: 4x4 with a flushed component: v3 == a30 / (a22 - a33) to 2e-12 (wide vector test)");
+# (10) CHECK (b) WHERE n / |max_val| OVERFLOWS. [[a, b, 0], [0, d, 0], [0, 0, 0]], a = 1.0137e-311,
+# b = 1.0473e-298, d = 1.2346e-311: eigenvalues a, d, 0, d dominant (|a / d| = 0.821). The
+# dominant eigenvector is (1, (d - a) / b, 0) = (1, 2.1e-14, 0); on the second pass d times the
+# iterate's d / b is about 0.29 of 2^-1074, so it flushes and the plain run settles on a. Check
+# (a) cannot see it (b / a = 1.0e13 does not overflow), and |tr A| / n and |tr A^2| / n are 0.74 a
+# and 0.83 a^2, under the floor, so check (b) alone sends it to the wide run: n / a overflows and
+# its grid g = 2^-1074 (1 + n / |max_val|) is +Inf. `f64_add` -> `f64_sub` there made g -Inf, so
+# (b) never tripped and the plain a came back (seed-336 mutant m0140). The wide run stops within
+# tol / (1 - a / d) = 5.6e-12 of d; 1e-11 relative is 25 units of 2^-1074 here.
+# [measured: scratch python3 fractions (3.3.7) for the ratios; mutant run in a scratch copy of the 3.3.7 lane tree]
+_r4le_stamp();
+var _mt140t, _mt140v = eigen_power(_g2a_m3(0x000001DDB5ED82B0, 0x021188C38C25A6F3, g2a_z,
+    g2a_z, 0x00000245CF8E7744, g2a_z, g2a_z, g2a_z, g2a_z), 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_mt140t), 1, "eigen_power: subnormal [[a,b,0],[0,d,0],[0,0,0]] converges");
+assert_eq(f64_lt(f64_abs(f64_sub(load64(g2a_ev), 0x00000245CF8E7744)), f64_mul(0x00000245CF8E7744, g2a_tol)), 1,
+  "eigen_power: subnormal [[a,b,0],[0,d,0],[0,0,0]]: lambda == d to 1e-11 (check (b) blind: a)");
 
 # === 3.3.5 L: eigen_power, a dominant direction still growing below tol ===
 # The vector test is absolute: a component that is a share s of the iterate and grows by
@@ -2952,6 +3249,30 @@ var _g5e1t, _g5e1v = eigen_power(_g2a_m3(0x0451209C970FA2A6, g2a_z, 0xE70DE0ABE3
 assert_eq(is_ok(_g5e1t), 1, "eigen_power: growth class [[a,0,b],[0,c,0],[0,d,e]] converges");
 assert_eq(load64(g2a_ev), 0x632DD60516625069, "eigen_power: growth class: lambda == c exactly (3.3.4: e)");
 assert_eq(load64(g2a_evec + 8), F64_ONE, "eigen_power: growth class: v1 == 1 (c's direction leads)");
+# (1b) THE SAME CLASS AFTER THE SCALED-ITERATE SWITCH. With sc_e > 0 the confirming pass reads u,
+# refilled from the candidate v; refilling every other slot (`i2 = i2 + 2`) left u_1 at the
+# PREVIOUS iterate, so c's component grew once, not twice, and e was returned (seed-336 mutant
+# m0136; (1) never switches). The core of (1) with c = 5.649e168 (|c / e| = 2.1), beside a
+# nilpotent block [[0, h, h], [0, 0, 0], [0, 0, 0]], h = 1.618e308, whose seed pass overflows, and
+# n = 6 so that e clears the radius floor: (c^2 + e^2) / 6 = 0.90 e^2 and |c + e| / 6 = 0.18 |e|,
+# so the mutant's e was returned as it stood (1 ulp small). Eigenvalues c, e, a, 0, 0, 0; row 1
+# holds c alone, so once index 1 leads the estimate is c exactly.
+# [measured: scratch python3 fractions + IEEE emulation (3.3.7); mutant run in a scratch copy of the 3.3.7 lane tree]
+var _mt136_A = ganita_mat_new(6, 6);
+for (var _mt136_i = 0; _mt136_i < 36; _mt136_i = _mt136_i + 1) {
+    ganita_mat_set(_mt136_A, _mt136_i / 6, _mt136_i % 6, 0);
+}
+ganita_mat_set(_mt136_A, 0, 0, 0x0451209C970FA2A6); ganita_mat_set(_mt136_A, 0, 2, 0xE70DE0ABE3F0FF95);
+ganita_mat_set(_mt136_A, 1, 1, 0x62F7F30985A37DFF);
+ganita_mat_set(_mt136_A, 2, 1, 0x3B7CDCF4614984DE); ganita_mat_set(_mt136_A, 2, 2, 0xE2E6CF15424FB4B2);
+ganita_mat_set(_mt136_A, 3, 4, 0x7FECCD4D51AA243E); ganita_mat_set(_mt136_A, 3, 5, 0x7FECCD4D51AA243E);
+var _mt136_v = alloc(6 * 8);
+store64(g2a_ev, _AB_NAN);
+var _mt136t, _mt136r = eigen_power(_mt136_A, 6, 1000, g2a_ev, _mt136_v);
+assert_eq(is_ok(_mt136t), 1, "eigen_power: growth class after the switch (6x6) converges");
+assert_eq(load64(g2a_ev), 0x62F7F30985A37DFF,
+  "eigen_power: growth class after the switch: lambda == c exactly (m0136: e)");
+assert_eq(load64(_mt136_v + 8), F64_ONE, "eigen_power: growth class after the switch: v1 == 1 (c's direction leads)");
 # (2) THE WIDE RE-RUN GROWS TOO. [[a, b, 0], [0, 0, 0], [0, c, d]], a = 9.07e-304,
 # b = 6.92e-304, c = 4.90e306, d = -1.29e-304: eigenvalues a, 0, d, a dominant. The plain run's
 # (-0, -0, 1) is d's eigenvector with a's direction flushed; the check trips, and the wide
@@ -3099,6 +3420,20 @@ store64(g2a_ev, _AB_NAN);
 var _g5e9t, _g5e9v = eigen_power(_g5e_mat(4, _g5b), 4, 1000, g2a_ev, _g5w);
 assert_eq(is_ok(_g5e9t), 1, "eigen_power: wide confirms on flagged components only: 4x4 converges");
 assert_eq(load64(g2a_ev), 0xDFB20F2B4593BF52, "eigen_power: wide confirms on flagged components only: lambda == a00");
+# (9) The confirming pass after a switch to the scaled iterate reads every component of v.
+# [[s, t, 0], [t, s, 0], [p, p, r]], s = 4.06e307, t = fl(-3s), p = 1.21e308, r = 8.0e307:
+# the first pass overflows and the run switches; lambda_1 = s - t rounds to
+# 0x7FECE93BBB40654B (exact rationals) and |lambda_2 / lambda_1| = 0.5. The answer below is
+# 2.1e-13 low, inside tol. If `_lext_grows` refills the scaled buffer from v_1 on, leaving
+# u_0 a pass stale, its verdict changes and the run returns 0x7FECE93BBB4061FA (1.0e-13
+# low), one pass later: no other assertion read that loop (3.3.6's seeded mutant sample).
+# [measured: roadmap repro, loop-from-1 build vs this tree + Fraction oracle, 2026-10-31; cycc 6.6.20]
+_r4le_stamp();
+var _g5e10t, _g5e10v = eigen_power(_g2a_m3(0x7FCCE93BBB40654B, 0xFFE5AEECCC704BF8, g2a_z, 0xFFE5AEECCC704BF8,
+    0x7FCCE93BBB40654B, g2a_z, 0x7FE5845C58277F0D, 0x7FE5845C58277F0D, 0x7FDC768B2082CF59), 3, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_g5e10t), 1, "eigen_power: scaled iterate, confirming pass reads all of v: converges");
+assert_eq(load64(g2a_ev), 0x7FECE93BBB405EAA,
+  "eigen_power: scaled iterate, confirming pass reads all of v: lambda 2.1e-13 low (u_0 stale: ...61FA)");
 
 var ab_ly = alloc(8);
 var _rq14t, _rq14v = lyapunov_max(ab_A33, 0, 5, ab_ly);
@@ -3118,6 +3453,39 @@ assert_eq(_rq17v, HSB_ERR_INVALID_INPUT, "lyapunov_max: A = 0 -> HSB_ERR_INVALID
 var _rq18t, _rq18v = lyapunov_max(ab_A33, 3, 5, 0);
 assert_eq(is_err_result(_rq18t), 1, "lyapunov_max: out = 0 -> HSB_ERR_INVALID_INPUT");
 assert_eq(_rq18v, HSB_ERR_INVALID_INPUT, "lyapunov_max: out = 0 -> HSB_ERR_INVALID_INPUT");
+# ⛔ 3.3.7 — a non-finite A, or one whose A * Q overflows, came back Ok: a NaN or +-Inf
+# entry gave out = 0 (every r00 NaN, skipped by the domain guard), and the all-equal 2x2
+# a = 1.5 * 2^1023 gave out = +Inf, where its exponent is ln(3 * 2^1023) = 710.19. The
+# first is refused at entry, the second when Z = A * Q stops being finite; out untouched.
+# [measured: scratch probe through lyapunov_max before and after, cyrius 6.6.20, 2026-10-31]
+fn _ly_m22(a, b, c, d) {
+    var M = ganita_mat_new(2, 2);
+    ganita_mat_set(M, 0, 0, a);  ganita_mat_set(M, 0, 1, b);
+    ganita_mat_set(M, 1, 0, c);  ganita_mat_set(M, 1, 1, d);
+    return M;
+}
+store64(ab_ly, _AB_SEVEN);
+var _ly1t, _ly1v = lyapunov_max(_ly_m22(F64_ONE, _AB_NAN, 0, F64_TWO), 2, 10, ab_ly);
+assert_eq(_ly1v, HSB_ERR_INVALID_INPUT, "lyapunov_max: a NaN entry -> INVALID_INPUT (3.3.6: Ok, out = 0)");
+assert_eq(load64(ab_ly), _AB_SEVEN, "lyapunov_max: a NaN entry leaves out untouched");
+var _ly2t, _ly2v = lyapunov_max(_ly_m22(F64_ONE, 0, 0, _AB_PINF), 2, 10, ab_ly);
+assert_eq(_ly2v, HSB_ERR_INVALID_INPUT, "lyapunov_max: +Inf in the LAST entry -> INVALID_INPUT (3.3.6: Ok, out = 0)");
+var _ly3t, _ly3v = lyapunov_max(_ly_m22(_AB_NINF, 0, 0, F64_TWO), 2, 10, ab_ly);
+assert_eq(_ly3v, HSB_ERR_INVALID_INPUT, "lyapunov_max: -Inf entry -> INVALID_INPUT");
+var _ly_big = 0x7FE8000000000000;
+var _ly4t, _ly4v = lyapunov_max(_ly_m22(_ly_big, _ly_big, _ly_big, _ly_big), 2, 10, ab_ly);
+assert_eq(_ly4v, HSB_ERR_NO_CONVERGENCE, "lyapunov_max: A * Q overflows -> NO_CONVERGENCE (3.3.6: Ok, out = +Inf)");
+assert_eq(load64(ab_ly), _AB_SEVEN, "lyapunov_max: A * Q overflows -> out untouched");
+# The refusal starts where ganita's QR first overflows, a = 1.5 * 2^1022 (its Householder
+# vector, |x| + |x_0|, passes DBL_MAX; 3.3.6 returned +Inf there too), and at 2^1023 ganita
+# returns status 0 with -Inf in Q and R. Control: a = 1.5 * 2^1021 answers bit for bit as
+# 3.3.6 did, 708.767 = (ln(a sqrt 2) + 9 ln 2a) / 10, the 10-sample mean's first step
+# (the exponent itself is ln 2a = 708.802).
+# [measured: scale sweep a = 1.5 * 2^1010..2^1023 through lyapunov_max and ganita_mat_qr, before/after, cyrius 6.6.20]
+var _ly_mid = 0x7FC8000000000000;
+var _ly5t, _ly5v = lyapunov_max(_ly_m22(_ly_mid, _ly_mid, _ly_mid, _ly_mid), 2, 10, ab_ly);
+assert_eq(is_ok(_ly5t), 1, "lyapunov_max: a = 1.5 * 2^1021 (control) -> Ok");
+assert_eq(load64(ab_ly), 0x408626234788580C, "lyapunov_max: a = 1.5 * 2^1021 (control) -> 3.3.6's value, bit for bit");
 var _rq19t, _rq19v = lyapunov_max(ab_A34, 3, 5, ab_ly);
 assert_eq(is_err_result(_rq19t), 1, "lyapunov_max: 3x4 A with n = 3 -> HSB_ERR_INVALID_INPUT");
 assert_eq(_rq19v, HSB_ERR_INVALID_INPUT, "lyapunov_max: 3x4 A with n = 3 -> HSB_ERR_INVALID_INPUT");
@@ -3159,6 +3527,80 @@ var _fl0t, _fl0v = eigen_power(_g2a_m3(0x013A8F40B11EAB2E, 0x01340927C6833480, g
 assert_eq(_fl0v, HSB_ERR_NO_CONVERGENCE,
   "eigen_power: an answer below the floor the wide run cannot replace -> NO_CONVERGENCE (3.3.5: Ok(e))");
 assert_eq(load64(g2a_ev), _AB_NAN, "eigen_power: an answer below the floor: out_val untouched");
+
+# ⛔ 3.3.7 — THE EXACT DIAGONAL FLOOR. [[1e-3, 0, -1e20], [0, 1.3, 0], [0, 0, -1]] (the
+# roadmap repro): lambda_1 = 1.3, both trace floors below 1 (0.10 and 0.95), and 3.3.6
+# returned Ok(0xBFF0000000000001). 1.3 is a diagonal entry that is a component on its own, an
+# exact eigenvalue, so -1 is refused; the wide run stops on -1 too, so NO_CONVERGENCE. The same
+# cyclically permuted to lower triangular (Tarjan meets the vertices in another order), and
+# times 2^558, are refused alike (3.3.6: the same -1 and its scaled twin).
+# [measured: roadmap repro and its permutation, 3.3.6 base vs this tree, 2026-10-31; cycc 6.6.20]
+var _df_R = _g2a_m3(0x3F50624DD2F1A9FC, g2a_z, 0xC415AF1D78B58C40, g2a_z, 0x3FF4CCCCCCCCCCCD, g2a_z,
+  g2a_z, g2a_z, 0xBFF0000000000000);
+_r4le_stamp();
+var _df1t, _df1v = eigen_power(_df_R, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(_df1v, HSB_ERR_NO_CONVERGENCE,
+  "eigen_power: 1.3 dominant, both trace floors below 1 -> NO_CONVERGENCE (3.3.6: Ok(-1))");
+assert_eq(load64(g2a_ev), _AB_NAN, "eigen_power: 1.3 dominant, trace floors below 1: out_val untouched");
+_r4le_stamp();
+var _df2t, _df2v = eigen_power(_g2a_m3(0xBFF0000000000000, g2a_z, g2a_z, 0xC415AF1D78B58C40, 0x3F50624DD2F1A9FC,
+    g2a_z, g2a_z, g2a_z, 0x3FF4CCCCCCCCCCCD), 3, 1000, g2a_ev, g2a_evec);
+assert_eq(_df2v, HSB_ERR_NO_CONVERGENCE, "eigen_power: the repro permuted to lower triangular -> NO_CONVERGENCE");
+var _df_S = ganita_mat_new(3, 3);
+for (var _dfi = 0; _dfi < 9; _dfi = _dfi + 1) {
+    ganita_mat_set(_df_S, _dfi / 3, _dfi % 3, f64_mul(ganita_mat_get(_df_R, _dfi / 3, _dfi % 3), (1023 + 558) << 52));
+}
+_r4le_stamp();
+var _df3t, _df3v = eigen_power(_df_S, 3, 1000, g2a_ev, g2a_evec);
+assert_eq(_df3v, HSB_ERR_NO_CONVERGENCE, "eigen_power: the repro times 2^558 -> NO_CONVERGENCE (3.3.6: Ok)");
+# The floor's scratch (6 n words, 144 bytes here) is allocated only when a diagonal entry is
+# past the answer; when that fails the call is Err(HSB_ERR_ALLOC), never an answer the floor
+# did not check. Its other requests (and the wide run's) are at most 24 bytes here, so ALLOC_MAX
+# 143 refuses only the scratch and 144 admits it.
+var _df_keep = ALLOC_MAX;
+ALLOC_MAX = 143;
+_r4le_stamp();
+var _df4t, _df4v = eigen_power(_df_R, 3, 1000, g2a_ev, g2a_evec);
+ALLOC_MAX = _df_keep;
+assert_eq(_df4v, HSB_ERR_ALLOC, "eigen_power: the diagonal floor's 144-byte scratch refused (ALLOC_MAX 143) -> ALLOC");
+assert_eq(load64(g2a_ev), _AB_NAN, "eigen_power: the floor's scratch refused: out_val untouched");
+ALLOC_MAX = 144;
+var _df4bt, _df4bv = eigen_power(_df_R, 3, 1000, g2a_ev, g2a_evec);
+ALLOC_MAX = _df_keep;
+assert_eq(_df4bv, HSB_ERR_NO_CONVERGENCE, "eigen_power: ALLOC_MAX 144 admits the scratch -> the floor decides");
+# A DIAGONAL ENTRY ON A CYCLE IS NOT AN EIGENVALUE, and is not used. [[4, 1], [-6, -2]] has
+# eigenvalues 1 +- sqrt(3); |a00| = 4 is past the answer 2.732..., but 0 and 1 form one
+# component, so the answer stands: 3.3.6's bits, 1.2e-13 below 1 + sqrt(3).
+# [measured: eigen_power probe, 3.3.6 base vs this tree + Decimal 1 + sqrt(3), 2026-10-31; cycc 6.6.20]
+_r4le_stamp();
+var _df_N = ganita_mat_new(2, 2);
+ganita_mat_set(_df_N, 0, 0, f64_from(4)); ganita_mat_set(_df_N, 0, 1, F64_ONE);
+ganita_mat_set(_df_N, 1, 0, f64_from(0 - 6)); ganita_mat_set(_df_N, 1, 1, f64_from(0 - 2));
+var _df5t, _df5v = eigen_power(_df_N, 2, 1000, g2a_ev, g2a_evec);
+assert_eq(is_ok(_df5t), 1, "eigen_power: [[4,1],[-6,-2]], a00 past the answer but on a cycle: converges");
+assert_eq(load64(g2a_ev), 0x4005DB3D742C2368, "eigen_power: [[4,1],[-6,-2]]: 1 + sqrt(3), 3.3.6's bits");
+# THE FLOOR ITSELF (white-box). W1: a00 = 5 on the 3-cycle 0 -> 1 -> 2 -> 0, so not a
+# component on its own (its low-link comes back from 2 through 1). W2: a00 = 3 alone, ahead of
+# the 2-cycle {1, 2}, which Tarjan pops first. Against lam = 1 the first is 0, the second 1.
+# The scratch is filled with junk before each call: the floor must set up every word it reads
+# (eigen_power hands it a fresh block, but nothing promises that block is zero).
+fn _df_junk(p) {
+    for (var i = 0; i < 18; i = i + 1) { store64(p + i * 8, 0x7777); }
+    return p;
+}
+var _df_s = alloc(6 * 3 * 8);
+var _df_W1 = _g2a_m3(f64_from(5), F64_ONE, g2a_z, g2a_z, F64_HALF, F64_ONE, F64_ONE, g2a_z, 0x3FD0000000000000);
+assert_eq(_lext_diag_cand(_df_W1, 3, F64_ONE), 1, "_lext_diag_cand: W1, a00 = 5 is past lam = 1");
+assert_eq(_lext_scc_floor(_df_W1, 3, F64_ONE, _df_junk(_df_s)), 0, "_lext_scc_floor: W1, a00 on a 3-cycle -> 0");
+var _df_W2 = _g2a_m3(f64_from(3), F64_ONE, g2a_z, g2a_z, 0x3FB999999999999A, F64_ONE, g2a_z, F64_ONE,
+  0x3FB999999999999A);
+assert_eq(_lext_scc_floor(_df_W2, 3, F64_ONE, _df_junk(_df_s)), 1,
+  "_lext_scc_floor: W2, a00 alone after a 2-cycle -> 1");
+assert_eq(_lext_scc_floor(_df_W2, 3, f64_from(3), _df_junk(_df_s)), 0, "_lext_scc_floor: W2 against lam = 3 -> 0");
+# The margin: 1 - 2^-26 itself is not past 1, one ulp below it is.
+assert_eq(_lext_diag_past(F64_ONE, 0x3FEFFFFFF8000000), 0, "_lext_diag_past: 1 - 2^-26 against 1 -> 0");
+assert_eq(_lext_diag_past(F64_ONE, 0x3FEFFFFFF7FFFFFF), 1, "_lext_diag_past: 1 - 2^-26 - 1 ulp against 1 -> 1");
+assert_eq(_lext_diag_past(f64_from(0 - 1), 0x3FEFFFFFF7FFFFFF), 1, "_lext_diag_past: by modulus (d = -1)");
 
 # THE FLOOR ITSELF (white-box). Each of tr A and tr A^2 decides one fixture alone, and the
 # margin sits between 8 and 16 ulps below 1 - 2^-26 on the identity.
@@ -4037,6 +4479,48 @@ var _g336s_ok = calc_bspline(1, _g336s_ctrl, 2, _g336s_kn, 4, 0x3FF8000000000000
 assert_eq(HVec3_x(_g336s_ok), 0x3FF8000000000000, "calc_bspline: degree 1, two points, t = 1.5 still -> x = 1.5");
 var _g336s_okn = calc_nurbs(1, _g336s_ctrl, _g336s_w, 2, _g336s_kn, 4, 0x3FF8000000000000);
 assert_eq(HVec3_y(_g336s_okn), 0x3FF8000000000000, "calc_nurbs: degree 1, two points, t = 1.5 still -> y = 1.5");
+
+test_group("3.3.7 abuse: _f64arr_alloc's callers check its 0");
+# _f64arr_alloc returns 0 past ALLOC_MAX / 8 doubles (or when `alloc` refuses), and its
+# comment said every caller checks; calc_bspline, calc_nurbs and calc_monotone_cubic did
+# not, and stored through address 0. ALLOC_MAX is lowered around each call so that a
+# small fixture reaches the refusal: 24 bytes (3 doubles) refuses the de Boor scratch of
+# degree 3 (4 doubles) and calc_monotone_cubic's tangents (4); 16 bytes also refuses its
+# 3-double secants. Each now returns its designed 0; with ALLOC_MAX restored the same
+# calls answer (cubic B-spline weights 1/48, 23/48, 23/48, 1/48 at t = 3.5: x = 1.5; the
+# Fritsch-Carlson tangents 1, 2, 4, 5 of y = x^2 keep the Hermite cubic at 1.5^2).
+# [measured: scratch allocation-refusal probes (pbs0.cyr - pbs3.cyr), base tree exit 139 on all four, 2026-10-31]
+var _g337a_pts = alloc(32);
+var _g337a_kn = alloc(64);
+var _g337a_w = alloc(32);
+var _g337a_xs = alloc(32);
+var _g337a_ys = alloc(32);
+for (var _g337a_i = 0; _g337a_i < 4; _g337a_i = _g337a_i + 1) {
+    var _g337a_p = hvec3_new(f64_from(_g337a_i), f64_from(_g337a_i * _g337a_i), f64_from(1 - _g337a_i));
+    store64(_g337a_pts + _g337a_i * 8, _g337a_p);
+    store64(_g337a_w + _g337a_i * 8, F64_ONE);
+    store64(_g337a_xs + _g337a_i * 8, f64_from(_g337a_i));
+    store64(_g337a_ys + _g337a_i * 8, f64_from(_g337a_i * _g337a_i));
+}
+for (var _g337a_j = 0; _g337a_j < 8; _g337a_j = _g337a_j + 1) { store64(_g337a_kn + _g337a_j * 8, f64_from(_g337a_j)); }
+var _g337a_keep = ALLOC_MAX;
+ALLOC_MAX = 24;
+var _g337a_b = calc_bspline(3, _g337a_pts, 4, _g337a_kn, 8, 0x400C000000000000);
+var _g337a_n = calc_nurbs(3, _g337a_pts, _g337a_w, 4, _g337a_kn, 8, 0x400C000000000000);
+var _g337a_m24 = calc_monotone_cubic(_g337a_xs, _g337a_ys, 4, 0x3FF8000000000000);
+ALLOC_MAX = 16;
+var _g337a_m16 = calc_monotone_cubic(_g337a_xs, _g337a_ys, 4, 0x3FF8000000000000);
+ALLOC_MAX = _g337a_keep;
+assert_eq(_g337a_b, 0, "calc_bspline: de Boor scratch refused (ALLOC_MAX 24) -> 0 (3.3.6: exit 139)");
+assert_eq(_g337a_n, 0, "calc_nurbs: de Boor scratch refused (ALLOC_MAX 24) -> 0 (3.3.6: exit 139)");
+assert_eq(_g337a_m24, 0, "calc_monotone_cubic: tangents refused (ALLOC_MAX 24) -> 0 (3.3.6: exit 139)");
+assert_eq(_g337a_m16, 0, "calc_monotone_cubic: secants refused (ALLOC_MAX 16) -> 0 (3.3.6: exit 139)");
+assert_eq(HVec3_x(calc_bspline(3, _g337a_pts, 4, _g337a_kn, 8, 0x400C000000000000)), 0x3FF8000000000000,
+  "calc_bspline: the same call with ALLOC_MAX restored -> x = 1.5");
+assert_eq(HVec3_x(calc_nurbs(3, _g337a_pts, _g337a_w, 4, _g337a_kn, 8, 0x400C000000000000)), 0x3FF8000000000000,
+  "calc_nurbs: the same call with ALLOC_MAX restored -> x = 1.5");
+assert_eq(calc_monotone_cubic(_g337a_xs, _g337a_ys, 4, 0x3FF8000000000000), 0x4002000000000000,
+  "calc_monotone_cubic: the same call with ALLOC_MAX restored -> 2.25");
 
 test_group("3.3.5 abuse: num_crt with moduli that are not coprime");
 var _g485_r = vec_new();
@@ -6040,6 +6524,25 @@ assert_eq(_rq57v, HSB_ERR_INVALID_INPUT, "num_dct: n = -3 rejected");
 var _rq58t, _rq58v = num_idct(ab_spec, (0 - 3));
 assert_eq(is_err_result(_rq58t), 1, "num_idct: n = -3 rejected");
 assert_eq(_rq58v, HSB_ERR_INVALID_INPUT, "num_idct: n = -3 rejected");
+# ⛔ 3.3.7 — NOTHING LOOKED PAST num_idct's WORK BUFFER. Its reduction conjugates the buffer
+# z in _numx_idft, and `i < n` -> `i <= n` there (seed-336 mutant m0161) negates the
+# imaginary word one element past z. At n = 8 the cost model takes the reduction
+# (_numx_use_fft(8, 8, 2) == 1) and a power of two goes straight to num_fft, which
+# allocates nothing, so z is the last block handed out: the stray write leaves -0.0 in
+# the heap the NEXT alloc() returns, which alloc() promises is zeroed. Same check as
+# num_tridiag_solve's heap canary below.
+var _mt161_x = alloc(64);
+for (var _mt161_i = 0; _mt161_i < 8; _mt161_i = _mt161_i + 1) {
+    store64(_mt161_x + _mt161_i * 8, f64_div(f64_from(_mt161_i * 7 + 3), f64_from(11)));
+}
+var _mt161_t, _mt161_v = num_idct(_mt161_x, 8);
+assert_eq(is_ok(_mt161_t), 1, "num_idct: n = 8 through the reduction");
+var _mt161_after = alloc(64);
+var _mt161_dirty = 0;
+for (var _mt161_j = 0; _mt161_j < 8; _mt161_j = _mt161_j + 1) {
+    if (load64(_mt161_after + _mt161_j * 8) != 0) { _mt161_dirty = _mt161_dirty + 1; }
+}
+assert_eq(_mt161_dirty, 0, "num_idct n = 8: the heap after its work buffer is untouched");
 var _rq59t, _rq59v = num_dst(ab_spec, 1);
 assert_eq(is_ok(_rq59t), 1, "num_dst: n = 1 is exact and needs no work");
 var _rq60t, _rq60v = num_dct(ab_spec, 1);
@@ -6965,6 +7468,52 @@ assert_eq(_rq102v, HSB_ERR_ALLOC, "num_ifft_2d: rows = 2^28 -> HSB_ERR_ALLOC");
 assert_eq(load64(ab_f2d), F64_ONE, "num_fft_2d/num_ifft_2d rejected: row 0 element 0 untouched");
 assert_eq(load64(ab_f2d + 16), F64_TWO, "num_fft_2d/num_ifft_2d rejected: row 0 element 1 untouched");
 
+# ⛔ 3.3.7 — THE SUCCESS PATH OF num_fft_2d AND num_ifft_2d HAD NO ASSERTION: every call in
+# the suites is a rejection. Three seed-336 mutants survived all six suites: the column
+# gather reading the imaginary part at `src + 9` (m0169), num_fft_2d's write-back index
+# stepping `ri - 1` (m0170: it never returns), and num_ifft_2d's row pass running one row
+# past the data (`r <= rows`, m0171). A 2x2 of full-mantissa complex values sits in a
+# three-row allocation whose third row is a canary. Expected bits: the n = 2 butterfly
+# (w = 1 + 0i, so u + d and u - d) rows then columns, in the code's order; every output is
+# within a relative 2^-51 of the exact 2x2 DFT and the round trip within 2^-50 of the input.
+# [measured: scratch python3 fractions oracle (3.3.7), exact 2x2 DFT of the eight inputs below]
+fn _mt169_bad(p, w, n) {
+    var bad = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if (load64(p + i * 8) != load64(w + i * 8)) { bad = bad + 1; }
+    }
+    return bad;
+}
+var _mt169_d = alloc(6 * 16);
+store64(_mt169_d, 0x3FEAED548F090CEE); store64(_mt169_d + 8, 0xBFE14A280FB5068C);
+store64(_mt169_d + 16, 0x3FED18F6EAD1B446); store64(_mt169_d + 24, 0x3FDAA22657537205);
+store64(_mt169_d + 32, 0x3FC210386DB6D55B); store64(_mt169_d + 40, 0xBFEFAE04BE85E5D2);
+store64(_mt169_d + 48, 0xBFE837B9DDDC1EAE); store64(_mt169_d + 56, 0x3FE4EAA606DB24C1);
+var _mt169_c = alloc(4 * 8);   # the canary row, past rows * cols
+store64(_mt169_c, 0x3FBF9ADD3746F65F); store64(_mt169_c + 8, 0xBF843A2730AD044E);
+store64(_mt169_c + 16, 0x400AAAAAAAAAAAAB); store64(_mt169_c + 24, 0x3FE8E38E38E38E39);
+for (var _mt169_i = 0; _mt169_i < 4; _mt169_i = _mt169_i + 1) {
+    store64(_mt169_d + 64 + _mt169_i * 8, load64(_mt169_c + _mt169_i * 8));
+}
+var _mt169_f = alloc(8 * 8);
+store64(_mt169_f, 0x3FF2294FDBB62BEE); store64(_mt169_f + 8, 0xBFDD78E7376C1D35);
+store64(_mt169_f + 16, 0x3FEA90259D812CAD); store64(_mt169_f + 24, 0xC004CCF9802FF288);
+store64(_mt169_f + 32, 0x4002EE7DCF124AA3); store64(_mt169_f + 40, 0x3FCB29274E7DCE1E);
+store64(_mt169_f + 48, 0xBFEEE76A55127B5D); store64(_mt169_f + 56, 0x3FE5FD6F8A024B06);
+var _mt169_r = alloc(8 * 8);   # the round trip: the input, but for three last-bit roundings
+store64(_mt169_r, 0x3FEAED548F090CEE); store64(_mt169_r + 8, 0xBFE14A280FB5068C);
+store64(_mt169_r + 16, 0x3FED18F6EAD1B446); store64(_mt169_r + 24, 0x3FDAA22657537203);
+store64(_mt169_r + 32, 0x3FC210386DB6D558); store64(_mt169_r + 40, 0xBFEFAE04BE85E5D2);
+store64(_mt169_r + 48, 0xBFE837B9DDDC1EAE); store64(_mt169_r + 56, 0x3FE4EAA606DB24C1);
+var _mt169_t1, _mt169_v1 = num_fft_2d(_mt169_d, 2, 2);
+assert_eq(is_ok(_mt169_t1), 1, "num_fft_2d: a 2x2 transforms");
+assert_eq(_mt169_bad(_mt169_d, _mt169_f, 8), 0, "num_fft_2d: all eight output words of the 2x2, to the bit");
+assert_eq(_mt169_bad(_mt169_d + 64, _mt169_c, 4), 0, "num_fft_2d: the row past rows * cols is untouched");
+var _mt169_t2, _mt169_v2 = num_ifft_2d(_mt169_d, 2, 2);
+assert_eq(is_ok(_mt169_t2), 1, "num_ifft_2d: a 2x2 transforms back");
+assert_eq(_mt169_bad(_mt169_d, _mt169_r, 8), 0, "num_ifft_2d: the round trip's eight words, to the bit");
+assert_eq(_mt169_bad(_mt169_d + 64, _mt169_c, 4), 0, "num_ifft_2d: the row past rows * cols is untouched");
+
 # ⚠ SAME CLASS, IN 2.11.0's OWN NEW CODE. ad_tape_new returned a NON-ZERO handle
 # whose `nodes` array was 0 whenever cap * 40 exceeded ALLOC_MAX, so a caller's
 # `if (t != 0)` passed and the first ad_var SIGSEGVed inside _ad_push -- whose
@@ -7015,6 +7564,23 @@ var _g336d_t5, _g336d_v5 = num_dst(_g854_buf, 0x2000000000000001);
 assert_eq(_g336d_v5, HSB_ERR_ALLOC, "num_dst: n = 2^61 + 1, n * 8 wraps to 8 -> HSB_ERR_ALLOC (3.3.5: exit 139)");
 assert_eq(load64(_g854_buf), F64_ONE, "DST / DCT past ALLOC_MAX / 8: data[0] untouched");
 assert_eq(load64(_g854_buf + 8), F64_TWO, "DST / DCT past ALLOC_MAX / 8: data[1] untouched");
+# ⛔ 3.3.7 — THE BOUND ITSELF WAS NEVER REACHED: n = ALLOC_MAX / 8 asks for exactly
+# ALLOC_MAX bytes, which alloc() grants, so it must pass the entry guard, and
+# `n > ALLOC_MAX / 8` -> `>=` there (seed-336 mutant m0162) survived because at the real
+# ALLOC_MAX that n is 2^28 and the direct loop it takes runs n^2 kernel terms. With
+# ALLOC_MAX lowered to 512 (saved and restored, as the groups above do) the boundary is
+# n = 64, the direct loop's whole cost is 4096 terms, and n = 65 is the first refusal.
+var _mt162_x = alloc(65 * 8);
+for (var _mt162_i = 0; _mt162_i < 65; _mt162_i = _mt162_i + 1) {
+    store64(_mt162_x + _mt162_i * 8, f64_div(f64_from(_mt162_i + 1), f64_from(7)));
+}
+var _mt162_keep = ALLOC_MAX;
+ALLOC_MAX = 512;
+var _mt162_t1, _mt162_v1 = num_dst(_mt162_x, 64);
+var _mt162_t2, _mt162_v2 = num_dst(_mt162_x, 65);
+ALLOC_MAX = _mt162_keep;
+assert_eq(is_ok(_mt162_t1), 1, "num_dst: n = ALLOC_MAX / 8 (ALLOC_MAX 512) is ON the bound and transforms");
+assert_eq(_mt162_v2, HSB_ERR_ALLOC, "num_dst: n = ALLOC_MAX / 8 + 1 (ALLOC_MAX 512) -> HSB_ERR_ALLOC");
 
 test_group("3.3.5 abuse: ad_tape_new's adjoint-array guard");
 # cap * 40 wraps to 24 bytes at this cap, so the node array is granted and only the

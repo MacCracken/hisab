@@ -34,8 +34,8 @@ enum SysNr {
     SYS_CLOSE = 3;      # → CloseHandle
     SYS_LSEEK = 8;      # → SetFilePointerEx
     SYS_MMAP = 9;       # → VirtualAlloc(MEM_COMMIT|MEM_RESERVE)
-    SYS_BRK = 12;       # → VirtualAlloc (grow-at-end via committed pages)
-    SYS_MUNMAP = 11;    # → VirtualFree(MEM_RELEASE)
+    SYS_BRK = 12;       # NOT rerouted: -38 (-ENOSYS). The PE heap is mmap → VirtualAlloc
+    SYS_MUNMAP = 11;    # → VirtualFree(addr, 0, MEM_RELEASE) since 6.6.20 (before: unrouted, -38)
     SYS_EXIT = 60;      # → ExitProcess
     SYS_EXIT_GROUP = 231; # NOT rerouted — call sys_exit_group(), never syscall(231)
     # v6.5.25 — NOT rerouted (Windows has no ioctl; DeviceIoControl is a different
@@ -414,18 +414,24 @@ fn sys_mmap(addr, length, prot, flags, fd, offset) {
     return syscall(SYS_MMAP, addr, length, prot, flags, fd, offset);
 }
 
-# Release a VirtualAlloc'd region. Rerouted to kernel32!VirtualFree
-# with MEM_RELEASE. `length` is ignored for MEM_RELEASE per Win32
-# semantics (the whole reservation is released), but the Linux-
-# compat surface keeps it for source-level portability.
+# Release a VirtualAlloc'd region: 0, or a negative errno when VirtualFree refuses. Rerouted
+# to kernel32!VirtualFree(addr, 0, MEM_RELEASE) since 6.6.20. `length` is DROPPED — MEM_RELEASE
+# requires dwSize 0 and frees the WHOLE reservation — and kept only for source portability.
+# ⚠ So a PARTIAL or OFFSET munmap is not supported on PE: an address that is not a
+# reservation's base fails harmlessly, but the base with a SHORTER length releases all of it,
+# leaving any later use of the tail a use-after-free. Every PE-reachable caller frees a base
+# with its full length (lib/freelist.cyr's large blocks). ⛔ Until 6.6.20 this comment claimed
+# the reroute while none existed: syscall 11 returned -38 and every large fl_free on Windows
+# leaked its mapping (lib/freelist.cyr). CHANGELOG [6.6.20]
 fn sys_munmap(addr, length) {
     return syscall(SYS_MUNMAP, addr, length);
 }
 
-# brk-shaped allocator anchor. Reroutes to VirtualAlloc-based
-# growable region so lib/alloc.cyr's bump logic works unchanged.
-# See lib/alloc_windows.cyr for the Windows-specific alloc_init
-# that bootstraps the heap.
+# brk-shaped allocator anchor — NOT rerouted on PE: syscall 12 returns -38 (-ENOSYS). Nothing
+# on Windows needs it: lib/alloc_windows.cyr reserves its heap, and maps each request too large
+# for it, through mmap (syscall 9 → VirtualAlloc) — since v6.0.39 found that the brk reroute this
+# comment used to promise had never been implemented. Kept so Linux-shaped source still compiles
+# for PE. CHANGELOG [6.6.20]
 fn sys_brk(addr) {
     return syscall(SYS_BRK, addr);
 }
@@ -439,9 +445,11 @@ fn sys_brk(addr) {
 # (uninitialised buffer / clock-ns / PID-mix) — a predictable mask/TXID/key is
 # worse than a failed op (exactly what CVE-19 closed). `flags` is ignored
 # (Linux getrandom flags have no ProcessPrng analog). See
-# issues/2026-06-11-windows-entropy-primitive.md.
+# issues/archived/2026-06-11-windows-entropy-primitive.md.
+# The BOOL is masked to 32 bits: EPROCPRNG_PE defines only eax, so a failure whose upper half
+# was dirty would read as success and hand back an unfilled buffer. CHANGELOG [6.6.20]
 fn sys_getrandom(buf, len, flags): i64 {
-    if (syscall(0xF01A, buf, len) != 0) { return len; }
+    if ((syscall(0xF01A, buf, len) & 0xFFFFFFFF) != 0) { return len; }   # BOOL: only eax is defined
     return 0 - 1;
 }
 
@@ -856,6 +864,16 @@ fn sys_fcntl(fd, cmd, arg): i64 { return 0 - 38; }
 fn fd_set_nonblocking(fd): i64 { return 0 - 38; }
 # Restore saved fd status flags. Declines on Windows.
 fn fd_restore_flags(fd, saved): i64 { return 0 - 38; }
+# The calling thread's last Winsock error, negated: -WSAGetLastError (0xF024). WSAGetLastError
+# returns a C `int` and the reroute defines only eax (no extension in the emitter), so the
+# value is masked to 32 bits before it is negated. Never 0: a failure must not read as
+# success. Same contract as lib/net.cyr's _net_wsa_err, which this file cannot include.
+# CHANGELOG [6.6.16]
+fn _sw_wsa_err(): i64 {
+    var e = syscall(61476) & 0xFFFFFFFF;            # WSAGetLastError (0xF024)
+    if (e == 0) { return 0 - 1; }
+    return 0 - e;
+}
 # Wait until SOCKET `fd` is readable (`want_write` == 0) or writable (`want_write` != 0), for at
 # most `timeout_ms` ms (< 0 waits indefinitely; clamped to INT_MAX). Returns 1 ready — including
 # an error or hang-up, so the next recv/send reports it — 0 on timeout, or -WSAGetLastError
@@ -865,6 +883,8 @@ fn fd_restore_flags(fd, saved): i64 { return 0 - 38; }
 # ws2_32!WSAPoll (0xF04A, sign-extended) over one WSAPOLLFD { SOCKET; SHORT events, revents },
 # with POLLRDNORM 0x100 / POLLWRNORM 0x10 — Windows refuses POLLIN's POLLPRI half. Sockets only:
 # WSAPoll knows nothing of file or pipe HANDLEs. Same contract as the POSIX peer. CHANGELOG [6.6.13]
+# The error read goes through _sw_wsa_err: WSAGetLastError returns a C `int`, and the 0xF024
+# reroute defines only eax, so rax[63:32] is the callee's to leave dirty. CHANGELOG [6.6.16]
 fn fd_wait_ready(fd, want_write, timeout_ms): i64 {
     if (fd < 0) { return 0 - 10038; }                   # INVALID_SOCKET → -WSAENOTSOCK
     var ms = timeout_ms;
@@ -877,7 +897,7 @@ fn fd_wait_ready(fd, want_write, timeout_ms): i64 {
     store16(&pfd + 10, 0);
     store32(&pfd + 12, 0);
     var r = syscall(0xF04A, &pfd, 1, ms);               # WSAPoll
-    if (r < 0) { return 0 - syscall(61476); }           # -WSAGetLastError (0xF024)
+    if (r < 0) { return _sw_wsa_err(); }                # -WSAGetLastError (0xF024)
     if (r == 0) { return 0; }
     if ((load16(&pfd + 10) & 0x4) != 0) { return 0 - 10038; }  # POLLNVAL → -WSAENOTSOCK
     return 1;
@@ -934,25 +954,28 @@ fn sys_fdatasync(fd): i64 { return syscall(75, fd); }
 # on Windows. Winsock returns 0 on success, SOCKET_ERROR (-1) with WSAGetLastError =
 # WSAENOTCONN (10057) on an unconnected socket (NOT the POSIX errno space). Consumers
 # still treat <0 as "peer unknown" and fail open — sandhi's peer API already does.
-# Closes docs/development/issues/2026-07-14-windows-getpeername-reroute-missing.md
+# Closes docs/development/issues/archived/2026-07-14-windows-getpeername-reroute-missing.md
 #
 # Normalize to the POSIX contract consumers check (`r < 0` = failure): ws2_32
-# returns 0 on success (peer written) or SOCKET_ERROR (int -1, which cyrius sees
-# ZERO-extended as 0xFFFFFFFF — a POSITIVE value that would defeat a `< 0` check
-# and let a caller fabricate a peer, cf. sandhi_server_peer_sockaddr's
-# `if (r < 0) return 0`). On failure return `-WSAGetLastError` (negative, and it
-# carries the real Winsock error, e.g. -10057 WSAENOTCONN). WSAGetLastError is read
-# immediately, before any other call can reset the per-thread last-error.
+# returns 0 on success (peer written) or SOCKET_ERROR (int -1). These reroutes define
+# ONLY eax — the emitter does not extend the C `int` — so rax[63:32] is whatever the
+# callee left: 0xFFFFFFFF on the builds measured, a POSITIVE value that would defeat a
+# `< 0` check and let a caller fabricate a peer (cf. sandhi_server_peer_sockaddr's
+# `if (r < 0) return 0`), and in principle dirty upper bits over a 0 that would read a
+# success as a failure. So the result is tested masked to 32 bits. On failure return
+# `-WSAGetLastError` through _sw_wsa_err (negative, never 0, and it carries the real
+# Winsock error, e.g. -10057 WSAENOTCONN). WSAGetLastError is read immediately, before
+# any other call can reset the per-thread last-error. CHANGELOG [6.6.16]
 fn sys_getpeername(fd, addr, addrlen): i64 {
     var r = syscall(61494, fd, addr, addrlen);
-    if (r == 0) { return 0; }
-    return 0 - syscall(61476);      # -WSAGetLastError (0xF024)
+    if ((r & 0xFFFFFFFF) == 0) { return 0; }
+    return _sw_wsa_err();           # -WSAGetLastError (0xF024)
 }
 # getsockname (0xF037 → ws2_32!getsockname): same normalization as getpeername.
 fn sys_getsockname(fd, addr, addrlen): i64 {
     var r = syscall(61495, fd, addr, addrlen);
-    if (r == 0) { return 0; }
-    return 0 - syscall(61476);
+    if ((r & 0xFFFFFFFF) == 0) { return 0; }
+    return _sw_wsa_err();
 }
 # listen (0xF033 → ws2_32!listen): same normalization as getsockname — 0, or -WSAGetLastError.
 # 6.6.10: the reroute existed since v6.4.44 but no `sys_listen` did, so a portable caller of
@@ -961,8 +984,8 @@ fn sys_getsockname(fd, addr, addrlen): i64 {
 # returned -38 there and this comment described a socket nothing could create). CHANGELOG [6.6.10]
 fn sys_listen(fd, backlog): i64 {
     var r = syscall(0xF033, fd, backlog);
-    if (r == 0) { return 0; }
-    return 0 - syscall(61476);      # -WSAGetLastError (0xF024)
+    if ((r & 0xFFFFFFFF) == 0) { return 0; }
+    return _sw_wsa_err();           # -WSAGetLastError (0xF024)
 }
 
 # ================================================================
@@ -981,7 +1004,7 @@ fn sys_listen(fd, backlog): i64 {
 # 10 MHz on Win10+, i.e. a 100 ns tick) and is monotonic since system start.
 #
 # Both return BOOL (nonzero = success) and write a 64-bit count at the pointer arg.
-# Filed as part of docs/development/issues/2026-09-16-mabda-lib-bench-min-minus-mean-floor.md
+# Filed as part of docs/development/issues/archived/2026-09-16-mabda-lib-bench-min-minus-mean-floor.md
 # QueryPerformanceCounter(&count): writes the current 64-bit performance count at `ptr`.
 # Returns the Win32 BOOL (nonzero = success). Monotonic since system start.
 fn sys_qpc(ptr): i64 {

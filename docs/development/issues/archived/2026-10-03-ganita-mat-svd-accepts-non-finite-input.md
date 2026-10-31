@@ -9,7 +9,7 @@ are byte-identical in every cyrius tag from 6.6.1 (ganita 1.2.4) to 6.6.14. `gan
 changed at ganita 1.2.6 (cyrius 6.6.5), and the repro's output is the same on all 14 folds.
 **Severity:** Medium upstream, because it is a fabricated success. Nil for hisab ≥ 3.3.3, which
 refuses a non-finite A before calling ganita.
-**Status:** 🟡 **OPEN UPSTREAM.** This was roadmap [3.3.4] *Needs the maintainer's answer* (a). Filing
+**Status:** ✅ **CLOSED — FIXED UPSTREAM in ganita 1.2.12** (folded as 1.2.13 in cyrius 6.6.16 and 1.2.14 in 6.6.19), **taken by hisab 3.3.7** on the 6.6.14 → 6.6.20 pin bump (2026-10-31); the paired run is in *Closed* at the end. Was: 🟡 **OPEN UPSTREAM.** This was roadmap [3.3.4] *Needs the maintainer's answer* (a). Filing
 was approved by the maintainer on 2026-10-03. It is filed as
 `ganita/docs/development/issues/2026-10-03-mat-svd-accepts-non-finite-input.md`, with the
 self-proving repro `ganita/docs/development/issues/repros/2026-10-03-mat-svd-accepts-non-finite-input.cyr`.
@@ -95,3 +95,22 @@ behaviour as measured on 3.3.2; the second and fifth table rows above add cases 
 - Archive this record.
 
 The companion filing is `2026-10-03-ganita-mat-svd-no-convergence-on-tiny-columns.md`.
+
+## Closed (hisab 3.3.7, 2026-10-31): the paired run
+
+The ganita repro (`ganita/docs/development/issues/repros/2026-10-03-mat-svd-accepts-non-finite-input.cyr`)
+with its `include` lines dropped, built from two scratch dirs pinned to the version under test and
+declaring hisab's 16 stdlib leaves (`cyrius lib sync` copied 29 files, each byte-identical to that
+cyrius tag; `cyrius build -v` named `versions/<v>/bin/cycc`):
+
+| pin | ganita | exit (checks wrong) |
+|---|---|---|
+| 6.6.14 | 1.2.11 | **18** |
+| 6.6.20 | 1.2.14 | **0** |
+
+[measured: the ganita repro from scratch dirs pinned to 6.6.14 and 6.6.20, 2026-10-31]
+
+- **In-tree:** as forecast, no hisab assertion moved; the guard answers first. Both comments
+  (`src/linalg_ext.cyr`, above `_lext_mat_all_finite` and in `svd_compute`) now say ganita 1.2.12
+  refuses a non-finite A itself and that the check stays for consumers whose pins carry 1.2.11 or
+  older (every direct consumer's).

@@ -238,23 +238,51 @@ echo ""
 
 declare -a BENCH_NAMES=()
 declare -a BENCH_NS=()
+declare -a BENCH_ROWS=()
 
+# ⛔ 3.3.7 — A ROW WHOSE NAME HAD A CHARACTER OUTSIDE [A-Za-z0-9_] WAS DROPPED, SILENTLY.
+# The row parser took the name as an identifier, and the unparsed-line check below
+# selected candidate lines by THE SAME identifier shape, so a name such as
+# `vec3_cross_2e-600` failed the parser and was never a candidate either: a replayed
+# 80-row log with that one row renamed recorded 79 and exited 0. The two checks must
+# not share a shape, or the safety net has the hole the parser has.
+#   * The name is now whatever precedes the `: <time> avg (min=` tail, so any name
+#     bench_new accepts is recorded under its own spelling. The fields after it are
+#     still anchored on the harness's names.
+#   * A candidate row is selected by the harness's ROW grammar, not by the name:
+#     lib/bench.cyr guarantees its result rows match the shell pattern `*": "*" avg"*`
+#     and that its floor and per-op lines do not. The old identifier-shaped test stays
+#     beside it, for a drift that drops " avg".
+#   * A name that would corrupt what this script writes -- a `,` or `"` shifts the CSV's
+#     columns, a `|` or a backtick breaks the markdown table -- is refused by name,
+#     not quoted: no reader of the CSV has ever seen a quoted field.
+#   * Rows are written only after every line parsed, so a refused run leaves the CSV
+#     as it was (it used to append the rows before the failing one, then exit 1).
+# [measured: scratch replay (3.3.7), an 80-row log synthesized from bench-history.csv's
+#  2026-10-11T18:23:03Z rows with vec3_cross renamed vec3_cross_2e-600: 79 rows and exit 0
+#  before, 80 rows and exit 0 after]
 SKIPPED=0
+REFUSED=0
 while IFS= read -r line; do
     # Anchored on the harness's own field names. A line that does not match this
     # shape is COUNTED and reported rather than silently dropped — a format
     # change upstream must be loud, not quietly halve the recorded benchmarks.
-    if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z_0-9]*):[[:space:]]+([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)[[:space:]]+avg[[:space:]]+\(min=([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)[[:space:]]+max=([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)\)([[:space:]]+\[([0-9]+)[[:space:]]+iters\])? ]]; then
+    if [[ "$line" =~ ^[[:space:]]*([^[:space:]].*):[[:space:]]+([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)[[:space:]]+avg[[:space:]]+\(min=([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)[[:space:]]+max=([0-9]+(\.[0-9]+)?)(ps|ns|µs|us|ms|s)\)([[:space:]]+\[([0-9]+)[[:space:]]+iters\])? ]]; then
         BENCH_NAME="${BASH_REMATCH[1]}"
         AVG_NS=$(normalize_to_ns "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}")
         MIN_NS=$(normalize_to_ns "${BASH_REMATCH[5]}" "${BASH_REMATCH[7]}")
         MAX_NS=$(normalize_to_ns "${BASH_REMATCH[8]}" "${BASH_REMATCH[10]}")
         ITERS="${BASH_REMATCH[12]:-}"
-        echo "${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${AVG_NS},avg,${AVG_NS},${MIN_NS},${MAX_NS},${ITERS},${REGIME},${FLOOR_NS},${TICK_NS},${TOOLCHAIN},${VERSION_NOW},${DIRTY}" \
-            >> "$HISTORY_FILE"
+        if [[ "$BENCH_NAME" == *[,\"\|\`]* ]]; then
+            REFUSED=$((REFUSED + 1))
+            echo "::warning:: benchmark name carries a , \" | or backtick, which would corrupt the CSV or the table: $line"
+            continue
+        fi
+        BENCH_ROWS+=("${TIMESTAMP},${COMMIT},${BRANCH},${BENCH_NAME},${AVG_NS},avg,${AVG_NS},${MIN_NS},${MAX_NS},${ITERS},${REGIME},${FLOOR_NS},${TICK_NS},${TOOLCHAIN},${VERSION_NOW},${DIRTY}")
         BENCH_NAMES+=("$BENCH_NAME")
         BENCH_NS+=("$AVG_NS")
-    elif echo "$line" | grep -qE '^[[:space:]]+[A-Za-z_][A-Za-z_0-9]*:.*(ps|ns|µs|us|ms|s)'; then
+    elif [[ "$line" == *": "*" avg"* ]] \
+        || echo "$line" | grep -qE '^[[:space:]]+[A-Za-z_][A-Za-z_0-9]*:.*(ps|ns|µs|us|ms|s)'; then
         SKIPPED=$((SKIPPED + 1))
         echo "::warning:: unparsed benchmark line (format drift?): $line"
     fi
@@ -264,12 +292,19 @@ COUNT=${#BENCH_NAMES[@]}
 if [ "$SKIPPED" -gt 0 ]; then
     echo "ERROR: $SKIPPED benchmark line(s) did not match the expected format;" >&2
     echo "       lib/bench.cyr's output shape has changed — fix the parser." >&2
+    echo "       Nothing was written to $HISTORY_FILE." >&2
+    exit 1
+fi
+if [ "$REFUSED" -gt 0 ]; then
+    echo "ERROR: $REFUSED benchmark name(s) carry a , \" | or backtick (see the warnings above);" >&2
+    echo "       rename the benchmark in the suite. Nothing was written to $HISTORY_FILE." >&2
     exit 1
 fi
 if [ "$COUNT" -eq 0 ]; then
     echo "ERROR: no benchmarks parsed — refusing to write an empty history row." >&2
     exit 1
 fi
+printf '%s\n' "${BENCH_ROWS[@]}" >> "$HISTORY_FILE"
 
 # Trend table (3-point). Skip if Python missing — CSV is the primary record.
 if command -v python3 >/dev/null 2>&1; then

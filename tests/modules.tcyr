@@ -51,7 +51,6 @@ var LOOSE_TOL_M = 0x3E45798EE2308C3A;
 # still sits at or below 2^-52.
 # [measured: scratch harness, ULP_TOL_M swapped, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
 var ULP_TOL_M = 0x3CD203AF9EE75616;
-var TOL_1EM14 = 0x3D06849B86A12B9B;  # 1e-14
 var TOL_1EM12 = 0x3D719799812DEA11;  # 1e-12 (== EPSILON_F64)
 
 # ================================================================
@@ -89,8 +88,6 @@ fn _tc_ulp_gap(a, b) {
 
 fn _tc_x2(x) { return f64_mul(x, x); }
 fn _tc_sin(x) { return f64_sin(x); }
-fn _tc_cos(x) { return f64_cos(x); }
-fn _tc_exp(x) { return f64_exp(x); }
 fn _tc_const(x) { return f64_from(7); }
 fn _tc_one(x) { return F64_ONE; }
 fn _tc_linear(x) { return x; }
@@ -130,16 +127,8 @@ fn _tp_area2x(p, t) {
     return s;
 }
 
-# --- delaunay_2d completeness harness (2.8.2) ------------------------------
-# The tenfold super-triangle left HOLES in the mesh — real triangles that were never
-# created because a super-vertex sat inside their circumcircle, then silently
-# dropped with the super-triangle at compaction. Nothing in the suite noticed,
-# because every fixture was either small enough to be unaffected or checked a
-# property (empty circumcircle, manifoldness) that a mesh with a hole still
-# satisfies. What catches it is COVERAGE: a triangulation of n points tiles the
-# convex hull exactly, so the summed triangle area must equal the hull area and
-# the triangle count must be 2n - 2 - h.
-#
+# --- splitmix64 seed stream (2.8.2) -----------------------------------------
+# Written for the delaunay_2d completeness harness, which runs in modules_b.tcyr.
 # splitmix64 so a whole input class is pinned by one seed rather than by
 # hundreds of literal coordinates. Integer-only, hence bit-identical anywhere.
 var _DLR_STATE = 0;
@@ -150,65 +139,6 @@ fn _dlr_next() {
     z = (z ^ (z >> 30)) * 0xBF58_476D_1CE4_E5B9;
     z = (z ^ (z >> 27)) * 0x94D0_49BB_1331_11EB;
     return z ^ (z >> 31);
-}
-
-# Uniform in [0, 1): the top 53 bits of the state, scaled by 2^-53.
-fn _dlr_unit() {
-    return f64_mul(f64_from(_dlr_next() >> 11), 0x3CA0_0000_0000_0000);
-}
-
-# n uniform points in a box `span` wide and `span * flat` tall.
-fn _dlr_points(n, seed, span, flat) {
-    _DLR_STATE = seed;
-    var p = vec_new();
-    for (var i = 0; i < n; i = i + 1) {
-        var ux = _dlr_unit();
-        var uy = _dlr_unit();
-        vec_push(p, hvec2_new(f64_mul(span, ux),
-            f64_mul(f64_mul(span, flat), uy)));
-    }
-    return p;
-}
-
-# How many of the first n input points appear anywhere in the triangle list.
-fn _dl_used(n, t) {
-    var seen = alloc(n * 8);
-    for (var i = 0; i < n; i = i + 1) { store64(seen + i * 8, 0); }
-    for (var k = 0; k < vec_len(t); k = k + 1) {
-        store64(seen + vec_get(t, k) * 8, 1);
-    }
-    var c = 0;
-    for (var i = 0; i < n; i = i + 1) {
-        if (load64(seen + i * 8) == 1) { c = c + 1; }
-    }
-    return c;
-}
-
-# Largest number of triangles sharing any single edge. 2 for a manifold mesh,
-# 3+ for the overlapping soup a broken cavity produces.
-fn _dl_max_edge_share(t) {
-    var worst = 0;
-    var e = 0;
-    while (e < vec_len(t)) {
-        for (var s = 0; s < 3; s = s + 1) {
-            var ua = vec_get(t, e + s);
-            var ub = vec_get(t, e + (s + 1) % 3);
-            var cnt = 0;
-            var f = 0;
-            while (f < vec_len(t)) {
-                var x0 = vec_get(t, f);
-                var x1 = vec_get(t, f + 1);
-                var x2 = vec_get(t, f + 2);
-                if (x0 == ua || x1 == ua || x2 == ua) {
-                    if (x0 == ub || x1 == ub || x2 == ub) { cnt = cnt + 1; }
-                }
-                f = f + 3;
-            }
-            if (cnt > worst) { worst = cnt; }
-        }
-        e = e + 3;
-    }
-    return worst;
 }
 
 # Count points strictly inside any output triangle's circumcircle — the
@@ -239,420 +169,6 @@ fn _dl_violations(p, n, t) {
         ti = ti + 1;
     }
     return viol;
-}
-
-# --- delaunay ghost DIRECTIONS: the equal-|u_k|^2 property (2.9.0) ----------
-#
-# collision_mesh.cyr's symbolic-ghost-vertices comment says the three |u_k|^2
-# being equal is "not decoration": it is what makes the M^2 coefficient of the
-# TWO-GHOST in-circle determinant collapse to
-# (u_j x u_k) * (|R - A|^2 - |A - p|^2), the plain
-# apex-distance comparison _col_dl_ic_g2 uses to break its tie. CHANGELOG 2.8.2
-# records that the requirement "was found by measurement, not by reasoning" and
-# that the obvious set (-1,-1), (1,-1), (0,1) -- which is ALSO counter-clockwise
-# and ALSO positively spans the plane -- had its tie rule fail 1,429 of 35,968
-# exact trials.
-# [measured: CHANGELOG.md 2.8.2, the ghost-direction requirement (tie rule failed 1,429 of 35,968)]
-#
-# Nothing asserted any of it. Replacing all six constants with that documented
-# failing set leaves modules, abuse and hisab green, because no delaunay_2d
-# fixture in any suite reaches the tie branch at all.
-#
-# The helpers below pin the PROPERTY, not the six numbers. They re-derive the
-# M^3 and M^2 coefficients of the two-ghost determinant from the GENERAL
-# expansion in M -- each ghost carrying its OWN |u_k|^2, nothing factored out --
-# and check _col_dl_ic_g2 against the sign of the leading nonzero one. Any
-# equal-norm direction set passes; an unequal-norm set passes the CCW and
-# spanning checks above and fails here.
-
-# |u_k|^2.
-fn _dlg_l(k) {
-    return f64_add(f64_mul(_col_ghost_ux(k), _col_ghost_ux(k)),
-      f64_mul(_col_ghost_uy(k), _col_ghost_uy(k)));
-}
-
-# u_j x u_k as a VALUE; _col_ghost_cross returns only its sign.
-fn _dlg_crossv(j, k) {
-    return f64_sub(f64_mul(_col_ghost_ux(j), _col_ghost_uy(k)),
-      f64_mul(_col_ghost_uy(j), _col_ghost_ux(k)));
-}
-
-# M^3 coefficient of det[(r, |r|^2); (g_j, |g_j|^2); (g_k, |g_k|^2)] where
-# r = R - p and g_k = A - p + M u_k, i.e. r x (u_j |u_k|^2 - u_k |u_j|^2). With
-# the norms equal it becomes |u|^2 * (r x (u_j - u_k)) -- and THAT is the cross
-# product _col_dl_ic_g2 actually evaluates, with the positive |u|^2 dropped.
-fn _dlg_c3(rx, ry, j, k) {
-    var lj = _dlg_l(j);
-    var lk = _dlg_l(k);
-    return f64_sub(
-      f64_mul(rx, f64_sub(f64_mul(_col_ghost_uy(j), lk), f64_mul(_col_ghost_uy(k), lj))),
-      f64_mul(ry, f64_sub(f64_mul(_col_ghost_ux(j), lk), f64_mul(_col_ghost_ux(k), lj))));
-}
-
-# M^2 coefficient of the same determinant, q = A - p. The (|u_k|^2 - |u_j|^2)
-# factor multiplying q is the "query-position-dependent tail" that the same
-# collision_mesh.cyr comment says unequal norms leave behind; it is what the
-# apex-distance tie rule has no way to see.
-fn _dlg_c2(rx, ry, qx, qy, j, k) {
-    var dl = f64_sub(_dlg_l(k), _dlg_l(j));
-    var qj = f64_add(f64_mul(qx, _col_ghost_ux(j)), f64_mul(qy, _col_ghost_uy(j)));
-    var qk = f64_add(f64_mul(qx, _col_ghost_ux(k)), f64_mul(qy, _col_ghost_uy(k)));
-    var wy = f64_add(f64_mul(qy, dl),
-      f64_mul(F64_TWO, f64_sub(f64_mul(_col_ghost_uy(j), qk), f64_mul(_col_ghost_uy(k), qj))));
-    var wx = f64_add(f64_mul(qx, dl),
-      f64_mul(F64_TWO, f64_sub(f64_mul(_col_ghost_ux(j), qk), f64_mul(_col_ghost_ux(k), qj))));
-    return f64_add(f64_sub(f64_mul(rx, wy), f64_mul(ry, wx)),
-      f64_mul(f64_add(f64_mul(rx, rx), f64_mul(ry, ry)), _dlg_crossv(j, k)));
-}
-
-# The answer the determinant forces: sign of the leading nonzero coefficient,
-# read against the triangle's orientation (u_j x u_k). Returns (0 - 1) when both
-# coefficients vanish -- that probe decides nothing at this order and is skipped.
-fn _dlg_truth(rx, ry, qx, qy, j, k) {
-    var s = _col_f64_sign(_dlg_c3(rx, ry, j, k));
-    if (s == 0) { s = _col_f64_sign(_dlg_c2(rx, ry, qx, qy, j, k)); }
-    if (s == 0) { return 0 - 1; }
-    if (s * _col_ghost_cross(j, k) > 0) { return 1; }
-    return 0;
-}
-
-# The M^3 coefficient is LINEAR in r, so agreeing with |u|^2 * (r x (u_j - u_k))
-# on the two basis vectors is agreement for every r. Counts the disagreements
-# over the three cyclic pairs; 0 is the whole claim.
-fn _dlg_c3_bad() {
-    var bad = 0;
-    for (var gi = 0; gi < 3; gi = gi + 1) {
-        var j = gi;
-        var k = (gi + 1) % 3;
-        var l = _dlg_l(j);
-        var dx = f64_sub(_col_ghost_ux(j), _col_ghost_ux(k));
-        var dy = f64_sub(_col_ghost_uy(j), _col_ghost_uy(k));
-        if (f64_eq(_dlg_c3(F64_ONE, 0, j, k), f64_mul(l, dy)) == 0) { bad = bad + 1; }
-        if (f64_eq(_dlg_c3(0, F64_ONE, j, k), f64_neg(f64_mul(l, dx))) == 0) { bad = bad + 1; }
-    }
-    return bad;
-}
-
-var _DLG_PROBES = 0;
-var _DLG_DECIDED = 0;
-var _DLG_MISMATCH = 0;
-var _DLG_TIE = 0;
-var _DLG_INSIDE = 0;
-var _DLG_TAIL = 0;
-var _DLG_PERM = 0;
-
-# Answers the two-ghost in-circle question through the PUBLIC entry point for
-# all six orderings of (R, G_j, G_k) and returns how many disagree with the
-# first. "p is inside the circumcircle of these three points" is a question
-# about a SET, so the count must be 0 -- an ordering-dependent answer means the
-# predicate is not computing the geometric quantity it advertises.
-#
-# _col_dl_incircle's three rotations are even permutations, so the six orderings
-# collapse to two calls: the pair (j, k) and the pair (k, j). Exactly one of
-# those is anti-cyclic, which is why nothing else in any suite reaches the
-# anti-cyclic half of _col_dl_ic_g2's input space.
-fn _dlg_perm_bad(pts, j, k, px, py) {
-    var gj = 2 + j;
-    var gk = 2 + k;
-    var ref = _col_dl_incircle(pts, 2, 1, gj, gk, px, py);
-    var bad = 0;
-    if (_col_dl_incircle(pts, 2, gj, gk, 1, px, py) != ref) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, 2, gk, 1, gj, px, py) != ref) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, 2, 1, gk, gj, px, py) != ref) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, 2, gk, gj, 1, px, py) != ref) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, 2, gj, 1, gk, px, py) != ref) { bad = bad + 1; }
-    return bad;
-}
-
-# --- 2.9.1 the ALL-ghost in-circle answer (_col_dl_ic_g3) ------------------
-var _DLG3_PROBES = 0;
-var _DLG3_BAD_CYC = 0;
-var _DLG3_BAD_ANTI = 0;
-
-# Answers the all-ghost in-circle question through the PUBLIC entry point for
-# three of the six orderings of (G_0, G_1, G_2) -- the CYCLIC (even) three when
-# `anti` is 0, the ANTI-CYCLIC (odd) three when it is 1 -- and returns how many
-# answered anything other than 1.
-#
-# The truth is the CONSTANT 1, for every finite p and every ordering. All three
-# |u_k|^2 are equal (5), so the apex A is exactly the circumcenter of the three
-# ghosts: their circumcircle is the circle of radius M*sqrt(5) about A, which
-# swallows any finite p once M is large enough, and a ghost predicate is the
-# sign for all sufficiently large M. Equivalently, the M^4 coefficient of the
-# determinant is |u|^2 * orient(u_a, u_b, u_c) -- p cancels out of the leading
-# term -- and the ghost triangle's own orientation is M^2 * orient(u), so the
-# winding factor cancels between them instead of having to be divided out the
-# way _col_dl_ic_g2 divides it out with `cr`.
-#
-# Verified in exact rationals against the circumcircle of the three actual
-# points, sweeping M by decades to 1e40: the answer stabilises at 1 for all six
-# orderings, and the only 0s occur at M values where M*sqrt(5) is still short of
-# |p - A|, which is the pre-limit transient and not the predicate.
-#
-# Through 2.9.1 the body returned sign(orient(u_a, u_b, u_c)) > 0, i.e. the
-# WINDING of the presented triple rather than the in-circle answer, so the
-# anti-cyclic half of this helper is what caught it: 243 of 243 CW-presented
-# triples wrong, 0 of 243 cyclic.
-# [measured: CHANGELOG.md 2.9.1, _col_dl_ic_g3 against the exact-rational circumcircle oracle]
-fn _dlg3_bad(pts, nr, anti, px, py) {
-    var g0 = nr;
-    var g1 = nr + 1;
-    var g2 = nr + 2;
-    var bad = 0;
-    if (anti == 0) {
-        if (_col_dl_incircle(pts, nr, g0, g1, g2, px, py) != 1) { bad = bad + 1; }
-        if (_col_dl_incircle(pts, nr, g1, g2, g0, px, py) != 1) { bad = bad + 1; }
-        if (_col_dl_incircle(pts, nr, g2, g0, g1, px, py) != 1) { bad = bad + 1; }
-        return bad;
-    }
-    if (_col_dl_incircle(pts, nr, g0, g2, g1, px, py) != 1) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, nr, g2, g1, g0, px, py) != 1) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, nr, g1, g0, g2, px, py) != 1) { bad = bad + 1; }
-    return bad;
-}
-
-# Grid: 4 magnitude scales x 3 apexes x 25 query points x 6 orderings = 1800.
-# The scales run to 1e18 because there is NO finite bound on p here -- M is
-# symbolic and unbounded, so a query point cannot be "too far out" to be inside
-# the all-ghost circumcircle. A reimplementation that reintroduced any
-# dependence on p, or any distance comparison against a concrete multiplier,
-# would fail on the outer scales.
-fn _dlg3_run() {
-    _DLG3_PROBES = 0;
-    _DLG3_BAD_CYC = 0;
-    _DLG3_BAD_ANTI = 0;
-    var g3a = alloc(48);
-    store64(g3a, 0); store64(g3a + 8, 0);
-    store64(g3a + 16, 3); store64(g3a + 24, 0 - 7);
-    store64(g3a + 32, 0 - 1000); store64(g3a + 40, 1000);
-    var pts = vec_new();
-    vec_push(pts, hvec2_new(0, 0));
-    for (var si = 0; si < 4; si = si + 1) {
-        var scale = F64_ONE;
-        if (si == 1) { scale = f64_from(1000); }
-        if (si == 2) { scale = f64_from(1000000000); }
-        if (si == 3) { scale = f64_mul(f64_from(1000000000), f64_from(1000000000)); }
-        for (var ai = 0; ai < 3; ai = ai + 1) {
-            vec_set(pts, 0, hvec2_new(f64_from(load64(g3a + ai * 16)),
-                f64_from(load64(g3a + ai * 16 + 8))));
-            for (var gx = 0 - 2; gx < 3; gx = gx + 1) {
-                for (var gy = 0 - 2; gy < 3; gy = gy + 1) {
-                    var px = f64_mul(f64_from(gx), scale);
-                    var py = f64_mul(f64_from(gy), scale);
-                    _DLG3_BAD_CYC = _DLG3_BAD_CYC + _dlg3_bad(pts, 1, 0, px, py);
-                    _DLG3_BAD_ANTI = _DLG3_BAD_ANTI + _dlg3_bad(pts, 1, 1, px, py);
-                    _DLG3_PROBES = _DLG3_PROBES + 6;
-                }
-            }
-        }
-    }
-}
-
-# --- 2.9.3: the ONE-ghost in-circle path (_col_dl_ic_g1) ------------------
-var _DLG1_PROBES = 0;
-var _DLG1_BAD = 0;
-var _DLG1_TIE = 0;
-
-# Counts entry-point answers that disagree across the SIX orderings of a
-# one-ghost triple (a, b, G_k).
-#
-# "Is p inside the circumcircle of these three points" is a question about a
-# SET, so the answer cannot depend on the order the vertices arrive in.
-# _col_dl_incircle rotates the ghost into last place and those rotations are
-# even permutations, so the six orderings collapse to two classes -- cyclic and
-# anti-cyclic -- and any dependence on the triple's winding shows up here as the
-# anti-cyclic three disagreeing with the cyclic three.
-#
-# This is the assertion the 2026-08-06 filing said was MISSING. Its evidence for
-# the one-ghost half was a Python transcription of the Cyrius source measured
-# against an exact-rational oracle (462,846 of 463,086 CW-presented triples
-# wrong) -- literal, but weaker than a first-party assertion, and the file said
-# so.
-# [measured: docs/development/issues/archived/2026-08-06-ghost-incircle-g1-g3-assume-ccw.md]
-# This is that assertion, and it is deliberately an ORDER-CONSISTENCY test
-# rather than a comparison against a truth oracle: consistency is exactly the
-# property that was broken, and it needs no oracle to state.
-fn _dlg1_perm_bad(pts, nr, k, px, py) {
-    var g = nr + k;
-    var ref = _col_dl_incircle(pts, nr, 1, 2, g, px, py);
-    var bad = 0;
-    if (_col_dl_incircle(pts, nr, 2, g, 1, px, py) != ref) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, nr, g, 1, 2, px, py) != ref) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, nr, 1, g, 2, px, py) != ref) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, nr, g, 2, 1, px, py) != ref) { bad = bad + 1; }
-    if (_col_dl_incircle(pts, nr, 2, 1, g, px, py) != ref) { bad = bad + 1; }
-    return bad;
-}
-
-# Grid: 4 edges (a, b) x 25 query points x 3 ghost directions x 6 orderings
-# = 1800 probes, matching the all-ghost harness above.
-#
-# points[0] is the APEX and is deliberately NOT one of the triangle's vertices:
-# nr = 3, the triple is (1, 2, ghost), and the ghosts are 3, 4, 5. That layout
-# is load-bearing rather than cosmetic. When the edge is parallel to u_k the
-# ghost direction cannot supply the winding, and the repair falls back to the
-# apex's side of line(a, b) -- so an apex sitting ON the edge, or coinciding
-# with a vertex, would silently exercise only the doubly-degenerate path and
-# the fallback would never be tested. An earlier draft of this harness put the
-# apex at points[0] = a and did exactly that.
-#
-# Edges 2 and 3 are deliberately PARALLEL to u_0 = (1, 2), presented in both
-# directions: that is the configuration zeroing (b - a) x u_0, where the winding
-# has to come from the apex instead. It is also the shape of the 2.9.1
-# reproducer, so it guards that repair at the same time.
-fn _dlg1_run() {
-    _DLG1_PROBES = 0;
-    _DLG1_BAD = 0;
-    _DLG1_TIE = 0;
-    var pts = vec_new();
-    vec_push(pts, hvec2_new(f64_from(5), f64_from(1)));   # apex A, off every edge below
-    vec_push(pts, hvec2_new(0, 0));                       # a
-    vec_push(pts, hvec2_new(0, 0));                       # b
-    for (var ei = 0; ei < 4; ei = ei + 1) {
-        var axi = 0 - 2;
-        var ayi = 0;
-        var bxi = 0 - 4;
-        var byi = 0 - 4;
-        if (ei == 1) { axi = 3; ayi = 1; bxi = 1; byi = 0 - 5; }
-        # edge parallel to u_0 = (1, 2) -- winding must come from the apex
-        if (ei == 2) { axi = 0; ayi = 0; bxi = 2; byi = 4; }
-        # the same edge presented the other way round
-        if (ei == 3) { axi = 2; ayi = 4; bxi = 0; byi = 0; }
-        vec_set(pts, 1, hvec2_new(f64_from(axi), f64_from(ayi)));
-        vec_set(pts, 2, hvec2_new(f64_from(bxi), f64_from(byi)));
-        for (var gx = 0 - 3; gx < 2; gx = gx + 1) {
-            for (var gy = 0 - 3; gy < 2; gy = gy + 1) {
-                var px = f64_from(gx);
-                var py = f64_from(gy);
-                for (var k = 0; k < 3; k = k + 1) {
-                    _DLG1_BAD = _DLG1_BAD + _dlg1_perm_bad(pts, 3, k, px, py);
-                    _DLG1_PROBES = _DLG1_PROBES + 6;
-                    var abx = f64_from(bxi - axi);
-                    var aby = f64_from(byi - ayi);
-                    if (_col_f64_sign(f64_sub(f64_mul(abx, _col_ghost_uy(k)),
-                          f64_mul(aby, _col_ghost_ux(k)))) == 0) {
-                        _DLG1_TIE = _DLG1_TIE + 1;
-                    }
-                }
-            }
-        }
-    }
-}
-
-# Deterministic probe grid: three ghost pairs -- CYCLIC when `anti` is 0, the
-# ANTI-CYCLIC three when it is 1 -- times 3 apexes A, times 5 real vertices R,
-# times 10 query points p. Five p are generic; the other five are
-# p = R - t*(u_j - u_k), which zeroes the code's own M^3 cross product EXACTLY,
-# whatever the six constants happen to be, so the tie branch is reached by
-# construction rather than by luck. All coordinates are small integers or
-# halves, so every product here is exact in f64.
-#
-# The cyclic half is the only one a CCW-stored triangle can hand
-# _col_dl_ic_g2, and through 2.9.0 it was the only half any suite ran: the tie
-# branch multiplied by the winding a second time, which is the identity there
-# and a sign inversion on the anti-cyclic half.
-fn _dlg_run(anti) {
-    _DLG_PROBES = 0;
-    _DLG_DECIDED = 0;
-    _DLG_MISMATCH = 0;
-    _DLG_TIE = 0;
-    _DLG_INSIDE = 0;
-    _DLG_TAIL = 0;
-    _DLG_PERM = 0;
-    var ga = alloc(48);
-    store64(ga, 0); store64(ga + 8, 0);
-    store64(ga + 16, 1); store64(ga + 24, 0 - 2);
-    store64(ga + 32, 0 - 3); store64(ga + 40, 1);
-    var gr = alloc(80);
-    store64(gr, 2); store64(gr + 8, 1);
-    store64(gr + 16, 0 - 1); store64(gr + 24, 3);
-    store64(gr + 32, 4); store64(gr + 40, 0 - 2);
-    store64(gr + 48, 0); store64(gr + 56, 5);
-    store64(gr + 64, 0 - 4); store64(gr + 72, 0 - 4);
-    var gq = alloc(80);
-    store64(gq, 1); store64(gq + 8, 1);
-    store64(gq + 16, 0 - 2); store64(gq + 24, 3);
-    store64(gq + 32, 5); store64(gq + 40, 0);
-    store64(gq + 48, 0); store64(gq + 56, 0 - 3);
-    store64(gq + 64, 3); store64(gq + 72, 3);
-    var gt = alloc(80);
-    store64(gt, 1); store64(gt + 8, 1);
-    store64(gt + 16, 2); store64(gt + 24, 1);
-    store64(gt + 32, 0 - 1); store64(gt + 40, 1);
-    store64(gt + 48, 1); store64(gt + 56, 2);
-    store64(gt + 64, 0 - 3); store64(gt + 72, 1);
-    var pts = vec_new();
-    vec_push(pts, hvec2_new(0, 0));
-    vec_push(pts, hvec2_new(0, 0));
-    for (var gi = 0; gi < 3; gi = gi + 1) {
-        var j = gi;
-        var k = (gi + 1) % 3;
-        if (anti == 1) {
-            j = (gi + 1) % 3;
-            k = gi;
-        }
-        var dx = f64_sub(_col_ghost_ux(j), _col_ghost_ux(k));
-        var dy = f64_sub(_col_ghost_uy(j), _col_ghost_uy(k));
-        var crv = _dlg_crossv(j, k);
-        for (var ai = 0; ai < 3; ai = ai + 1) {
-            var ax = f64_from(load64(ga + ai * 16));
-            var ay = f64_from(load64(ga + ai * 16 + 8));
-            vec_set(pts, 0, hvec2_new(ax, ay));
-            for (var ri = 0; ri < 5; ri = ri + 1) {
-                var rvx = f64_from(load64(gr + ri * 16));
-                var rvy = f64_from(load64(gr + ri * 16 + 8));
-                vec_set(pts, 1, hvec2_new(rvx, rvy));
-                for (var qi = 0; qi < 10; qi = qi + 1) {
-                    var px = f64_from(load64(gq + (qi % 5) * 16));
-                    var py = f64_from(load64(gq + (qi % 5) * 16 + 8));
-                    if (qi >= 5) {
-                        var tv = f64_div(f64_from(load64(gt + (qi - 5) * 16)),
-                          f64_from(load64(gt + (qi - 5) * 16 + 8)));
-                        px = f64_sub(rvx, f64_mul(tv, dx));
-                        py = f64_sub(rvy, f64_mul(tv, dy));
-                    }
-                    var rx = f64_sub(rvx, px);
-                    var ry = f64_sub(rvy, py);
-                    var qx = f64_sub(ax, px);
-                    var qy = f64_sub(ay, py);
-                    _DLG_PROBES = _DLG_PROBES + 1;
-                    if (_col_f64_sign(f64_sub(f64_mul(rx, dy), f64_mul(ry, dx))) == 0) {
-                        _DLG_TIE = _DLG_TIE + 1;
-                    }
-                    var e1x = f64_sub(rvx, ax);
-                    var e1y = f64_sub(rvy, ay);
-                    var ref = f64_mul(crv, f64_sub(
-                        f64_add(f64_mul(e1x, e1x), f64_mul(e1y, e1y)),
-                        f64_add(f64_mul(qx, qx), f64_mul(qy, qy))));
-                    if (f64_eq(_dlg_c2(rx, ry, qx, qy, j, k), ref) == 0) {
-                        _DLG_TAIL = _DLG_TAIL + 1;
-                    }
-                    _DLG_PERM = _DLG_PERM + _dlg_perm_bad(pts, j, k, px, py);
-                    var want = _dlg_truth(rx, ry, qx, qy, j, k);
-                    if (want >= 0) {
-                        _DLG_DECIDED = _DLG_DECIDED + 1;
-                        if (want == 1) { _DLG_INSIDE = _DLG_INSIDE + 1; }
-                        if (_col_dl_ic_g2(pts, 1, j, k, px, py) != want) {
-                            _DLG_MISMATCH = _DLG_MISMATCH + 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-# _epa_tetra_ok, but safe to call on a seed buffer _epa_seed_portal never wrote:
-# alloc() hands back zeroed pages, so the raw predicate dereferences four null
-# HVec3s and takes the process down with SIGSEGV instead of printing a FAIL.
-# Verified: with the origin nudge mutated out, the unguarded form exits 139.
-# [measured: scratch mutation run (origin nudge removed), not reproducible in-tree, 2.9.0]
-fn _psd_ok(seed) {
-    for (var i = 0; i < 4; i = i + 1) {
-        if (load64(seed + i * 8) == 0) { return 0; }
-    }
-    return _epa_tetra_ok(seed);
 }
 
 # Push a triangle (index triple) onto a flat triangle vec.
@@ -702,120 +218,6 @@ fn _mpr_mkbox(cx, cy, cz, hx, hy, hz) {
     store64(s + 32, hy);
     store64(s + 40, hz);
     return s;
-}
-
-# --- 2.9.0: gjk_intersect_3d / gjk_epa_3d sibling-agreement sweep ---------
-#
-# The group below used to assert that the two agree while exercising the claim
-# only on OVERLAPPING fixtures, so it stayed green through a period when they
-# disagreed on 141 of 3,012 swept pair evaluations. These counters let the
-# assertions police the whole fixture range instead: every fixture is run
-# through BOTH entry points, in BOTH operand orders, and the aggregate is
-# asserted.
-# [measured: CHANGELOG.md 2.9.0, the gjk_intersect_3d / gjk_epa_3d sibling sweep (141 of 3,012)]
-#
-# cls is the EXACT classification of the pair, established from rational
-# arithmetic or a closed form and never from a hisab output. It is stated in
-# terms of the MINIMUM TRANSLATION that separates the pair, because that is the
-# quantity both entry points are answering about:
-#   0  disjoint                -- both must report 0
-#   1  touching, MTV exactly 0 -- the two must AGREE, and any depth reported
-#                                 with a 1 must be 0 up to rounding
-#   2  MTV strictly positive   -- both must report 1
-# Note the third class is not "the intersection has interior": a zero-radius
-# sphere strictly inside a box meets it in a single point, yet the MTV is the
-# point's distance to the nearest face, so it belongs in class 2.
-var _ag_pairs = 0;
-var _ag_mismatch = 0;
-var _ag_falsepos = 0;
-var _ag_missov = 0;
-var _ag_touch = 0;
-var _ag_baddepth = 0;
-var _ag_n_slot = 0;
-var _ag_d_slot = 0;
-# 2.9.1: the THIRD and FOURTH identically-documented entry points. The 2.9.0
-# sweep compared gjk_intersect_3d against gjk_epa_3d only, and the 2026-08-05
-# audit addendum records the consequence: mpr_intersect had drifted onto the
-# pre-2.9.0 strict-containment answer and no assertion in any suite could see it.
-# Both mpr entry points now ride the same fixtures.
-var _ag_mprmis = 0;
-var _ag_mprasym = 0;
-var _ag_mprpen = 0;
-var _ag_n_slot2 = 0;
-var _ag_d_slot2 = 0;
-# Size of the fixtures currently being swept. Set by the sweep before each
-# block; the depth bound below is relative to it, because the sweep deliberately
-# runs the same geometry at 2^-20 and 2^20 and an absolute bound would be
-# meaningless at both ends.
-var _ag_scale = 0;
-
-fn _ag_eval(fa, sa, fb, sb, cls) {
-    if (_ag_n_slot == 0) {
-        _ag_n_slot = alloc(8);
-        _ag_d_slot = alloc(8);
-    }
-    var gi = gjk_intersect_3d(fa, sa, fb, sb);
-    var ge = gjk_epa_3d(fa, sa, fb, sb, _ag_n_slot, _ag_d_slot);
-    _ag_pairs = _ag_pairs + 1;
-    if (gi != ge) { _ag_mismatch = _ag_mismatch + 1; }
-    if (cls == 0 && gi == 1) { _ag_falsepos = _ag_falsepos + 1; }
-    if (cls == 2 && gi == 0) { _ag_missov = _ag_missov + 1; }
-    if (cls == 1 && gi == 1) {
-        _ag_touch = _ag_touch + 1;
-        # The exact MTV of a class-1 pair is 0, so the reported depth must be 0
-        # up to rounding, and never negative. It is NOT always exactly 0: the
-        # touch probe writes an exact 0, but a tangency that GJK's own core
-        # happens to enclose at rounding level goes through EPA instead and
-        # comes back at 1e-20 .. 1e-24 for a unit-scale fixture. The bound below
-        # is eight orders above the worst of those and twelve orders below any
-        # real penetration, so it separates the two without excusing either.
-        var ag_d = load64(_ag_d_slot);
-        if (f64_lt(ag_d, 0) == 1) { _ag_baddepth = _ag_baddepth + 1; }
-        elif (f64_gt(ag_d, f64_mul(_ag_scale, TOL_1EM14)) == 1) {
-            _ag_baddepth = _ag_baddepth + 1;
-        }
-    }
-    # 2.9.1: the mpr siblings ride the same fixtures. mpr_intersect must equal
-    # gjk_intersect_3d and must not depend on argument order; mpr_penetration
-    # must equal gjk_epa_3d. Scored against the exact pre-2.9.1 bodies on THESE
-    # 110 evaluations (scratch harness, both bodies transcribed verbatim, run on
-    # this tree): mprmis = 9, mprasym = 2, mprpen = 13.
-    if (_ag_n_slot2 == 0) {
-        _ag_n_slot2 = alloc(8);
-        _ag_d_slot2 = alloc(8);
-    }
-    var mi = mpr_intersect(fa, sa, fb, sb);
-    if (mi != gi) { _ag_mprmis = _ag_mprmis + 1; }
-    if (mi != mpr_intersect(fb, sb, fa, sa)) { _ag_mprasym = _ag_mprasym + 1; }
-    store64(_ag_d_slot2, 0);
-    if (mpr_penetration(fa, sa, fb, sb, _ag_n_slot2, _ag_d_slot2) != ge) {
-        _ag_mprpen = _ag_mprpen + 1;
-    }
-    return 0;
-}
-
-# Both operand orders. The 2.8.3 tangency defect showed up in both, and an
-# overlap test that is not symmetric is broken whatever else it does.
-fn _ag_pair(fa, sa, fb, sb, cls) {
-    _ag_eval(fa, sa, fb, sb, cls);
-    _ag_eval(fb, sb, fa, sa, cls);
-    return 0;
-}
-
-# n sixteenths. Dyadic, so the value is exact in f64 AND exact in the rational
-# arithmetic the classifications were computed in.
-fn _ag_q(n) { return f64_div(f64_from(n), f64_from(16)); }
-
-# Same, scaled by a power of two -- still exact, and it moves a fixture to a
-# scene scale where an ABSOLUTE epsilon anywhere in the stack would show up.
-fn _ag_qs(n, p2) { return f64_mul(_ag_q(n), p2); }
-
-fn _ag_box(cx, cy, cz, hx, hy, hz) {
-    return _mpr_mkbox(_ag_q(cx), _ag_q(cy), _ag_q(cz), _ag_q(hx), _ag_q(hy), _ag_q(hz));
-}
-
-fn _ag_sph(cx, cy, cz, r) {
-    return hvec4_new(_ag_q(cx), _ag_q(cy), _ag_q(cz), _ag_q(r));
 }
 
 # Elementwise Hermiticity test: A[i][j] == conj(A[j][i]) for EVERY (i,j),
@@ -913,60 +315,6 @@ fn _cv_dydt_y(t, y) { return y; }
 # SHO acceleration for leapfrog.
 fn _cv_accel(q) { return f64_neg(q); }
 
-fn _c9_f(x) { var a = load64(x); var b = load64(x + 8); return f64_add(f64_mul(a, a), f64_mul(b, b)); }
-fn _c9_g(x, out) {
-    store64(out, f64_mul(F64_TWO, load64(x)));
-    store64(out + 8, f64_mul(F64_TWO, load64(x + 8)));
-    return 0;
-}
-fn _c9_x2(x) { return f64_mul(x, x); }
-
-# --- calc_ext: Hessian mixed partials (2.8.x test-quality repair) -----------
-# f(x, y) = x^2*y + y^3. NOT separable, so the true mixed partial d2f/dxdy = 2x
-# is nonzero -- unlike _c9_f above (x^2 + y^2), whose Hessian is 2I and whose
-# zero off-diagonal is reproduced by ANY sign arrangement of the 4-point cross
-# stencil, including deleting the block outright.
-# Total degree 3, and both a central second difference and the cross stencil are
-# exact through total degree 3, so the finite differences here are the TRUE
-# derivatives bit-for-bit at any step size.
-fn _hx_f(x) {
-    var a = load64(x);
-    var b = load64(x + 8);
-    return f64_add(f64_mul(f64_mul(a, a), b), f64_mul(f64_mul(b, b), b));
-}
-
-# --- calc_ext: adaptive Simpson integrands (2.8.x test-quality repair) ------
-# Every integrand counts its own evaluations. The count is the direct evidence
-# that the refinement machinery runs: x^2 is integrated exactly by the single
-# initial panel and stops at 3 evaluations, everything below does not.
-var _as_calls = 0;
-
-fn _as_x2(x) { _as_calls = _as_calls + 1; return f64_mul(x, x); }
-
-fn _as_x4(x) {
-    _as_calls = _as_calls + 1;
-    var x2 = f64_mul(x, x);
-    return f64_mul(x2, x2);
-}
-
-# Unbounded derivative at 0: the error concentrates in one corner, so reaching
-# 1e-11 is only possible if the subdivision is NON-UNIFORM.
-fn _as_sqrt(x) { _as_calls = _as_calls + 1; return f64_sqrt(x); }
-
-# 1/(1+x): no Simpson panel is ever exact, so every level contributes.
-fn _as_recip(x) {
-    _as_calls = _as_calls + 1;
-    return f64_div(F64_ONE, f64_add(F64_ONE, x));
-}
-
-# Lorentzian of half-width 1/20 centred in [0,1]: 1 / (1 + 400 (x - 1/2)^2).
-# Integral over [0,1] = (1/10) atan(10). One unrefined panel gives (4 + 2/101)/6 = 203/303, 4.55 times that.
-fn _as_peak(x) {
-    _as_calls = _as_calls + 1;
-    var d = f64_sub(x, F64_HALF);
-    return f64_div(F64_ONE, f64_add(F64_ONE, f64_mul(f64_from(400), f64_mul(d, d))));
-}
-
 # --- lie_ext: do two SE(3) elements act identically? ------------------------
 # Four points (the origin plus the three axes) determine a rigid motion, so
 # agreement on all four is agreement everywhere. Used to check the defining
@@ -989,32 +337,6 @@ fn _se_same(a, b) {
     return 1;
 }
 
-# --- delaunay_2d: winding (2.8.x test-quality repair) -----------------------
-# How many emitted triangles are NOT strictly counter-clockwise. delaunay_2d
-# documents CCW output and normalises for it at emit time, and every other
-# delaunay assertion in this file is orientation-blind -- |signed area| for the
-# hull-coverage harness, plus edge-share count, point usage and the
-# empty-circumcircle test, none of which a clockwise triangle violates. This is
-# the only check that can see the normalisation at all.
-fn _dl_non_ccw(p, t) {
-    var bad = 0;
-    for (var k = 0; k < vec_len(t); k = k + 3) {
-        var a = vec_get(p, vec_get(t, k));
-        var b = vec_get(p, vec_get(t, k + 1));
-        var c = vec_get(p, vec_get(t, k + 2));
-        var s = _col_triangle_area_2x(HVec2_x(a), HVec2_y(a),
-          HVec2_x(b), HVec2_y(b), HVec2_x(c), HVec2_y(c));
-        if (f64_gt(s, 0) == 0) { bad = bad + 1; }
-    }
-    return bad;
-}
-
-fn _c80_sq(x) { return f64_mul(x, x); }
-fn _c80_f(x) { var a = load64(x); return f64_mul(a, a); }
-fn _c80_g(x, out) { store64(out, f64_mul(F64_TWO, load64(x))); return 0; }
-fn _c80_sde_f(t, y) { return 0; }
-fn _c80_sde_g(t, y) { return F64_ONE; }
-
 # --- 2.8.3: support functions for the gjk_epa_3d (EPA) fixtures ---
 # Every one bumps _ga_sup_calls. EPA issues exactly one Minkowski support query
 # (= two of these) per iteration, so the counter is a direct, black-box read of
@@ -1030,30 +352,6 @@ fn _ga_sup_sphere(shape, dir) {
     return hvec3_new(f64_add(HVec4_x(shape), f64_mul(HVec3_x(dn), r)),
       f64_add(HVec4_y(shape), f64_mul(HVec3_y(dn), r)),
       f64_add(HVec4_z(shape), f64_mul(HVec3_z(dn), r)));
-}
-
-# Cylinder about +z: shape = [cx, cy, cz, radius, half_height]
-fn _ga_mkcyl(cx, cy, cz, r, hz) {
-    var s = alloc(40);
-    store64(s, cx); store64(s + 8, cy); store64(s + 16, cz);
-    store64(s + 24, r); store64(s + 32, hz);
-    return s;
-}
-fn _ga_sup_cyl(shape, dir) {
-    _ga_sup_calls = _ga_sup_calls + 1;
-    var dx = HVec3_x(dir);
-    var dy = HVec3_y(dir);
-    var rho = f64_sqrt(f64_add(f64_mul(dx, dx), f64_mul(dy, dy)));
-    var px = 0;
-    var py = 0;
-    if (f64_gt(rho, 0) == 1) {
-        px = f64_mul(load64(shape + 24), f64_div(dx, rho));
-        py = f64_mul(load64(shape + 24), f64_div(dy, rho));
-    }
-    var pz = load64(shape + 32);
-    if (f64_lt(HVec3_z(dir), 0) == 1) { pz = f64_neg(pz); }
-    return hvec3_new(f64_add(load64(shape), px), f64_add(load64(shape + 8), py),
-      f64_add(load64(shape + 16), pz));
 }
 
 # Oriented box: shape = [cx, cy, cz, hx, hy, hz, qx, qy, qz, qw]
@@ -1078,20 +376,6 @@ fn _ga_sup_obb(shape, dir) {
     return hvec3_new(f64_add(load64(shape), HVec3_x(wp)),
       f64_add(load64(shape + 8), HVec3_y(wp)),
       f64_add(load64(shape + 16), HVec3_z(wp)));
-}
-# --- 2.8.3 memory-safety helpers ---------------------------------
-# Deterministic LCG shared with the Python reference in the audit workflow record;
-# every value stays under 2^61 so the i64 multiply cannot wrap.
-var _m3_lcg = 12345;
-fn _m3_next() {
-    _m3_lcg = (_m3_lcg * 1103515245 + 12345) % 2147483648;
-    return _m3_lcg % 21 - 10;
-}
-# Cell index k -> coordinate k + 0.5, so floor() is exact for both signs.
-fn _m3_cc(k) { return f64_add(f64_from(k), F64_HALF); }
-fn _m3_shq(sh, qx, qy, qz, r) {
-    return vec_len(spatial_hash_query_radius(sh,
-        hvec3_new(_m3_cc(qx), _m3_cc(qy), _m3_cc(qz)), f64_from(r)));
 }
 # --- calc_monotone_cubic shape oracle (2.8.3) ------------------------------
 # The CONTRACT, not a reference implementation: on [xs[k], xs[k+1]] the
@@ -2447,6 +1731,19 @@ assert_eq(_d34_ok(geo_ray_obb_face(_d34_r,
       _r5g_out), _r5g_out), 1, "geo_ray_obb_face: he.y NaN, ray along +x, is NaN, NONE (3.3.3: t = 5, face 0)");
 assert_eq(_d34_ok(geo_ray_obb_face(_d34_r, _d34_onz, _r5g_out), _r5g_out), 1,
   "geo_ray_obb_face: he.z NaN, ray along +x, is NaN, NONE (3.3.3: t = 5, face 0)");
+# The same parallel tests on a box with no NaN, each where it decides. From (-5, 0, 0.5) along
+# +x the origin is ON the min-y face's plane, -e + he = +0 exactly, and a ray in a face's plane
+# lies in the closed slab: the box is entered at x = 0, t = 5 on face 0 (seed-336 mutant m0050
+# tested -e + he < 2^-1074, the bit pattern 1, which takes that +0 for the miss). From
+# (-5, 0.5, -2) axis 2 is parallel with the origin below the box, -e + he = -2: the miss
+# (seed-336 mutant m0051 never took that arm, and answered the x slab's t = 5).
+var _mt50_ob = geo_obb_new(hvec3_splat(F64_HALF), hvec3_splat(F64_HALF), hquat_identity());
+assert_eq(geo_ray_obb_face(_r5g_ray(hvec3_new(_r5g_m5, 0, F64_HALF), _d34_ux), _mt50_ob, _r5g_out),
+  0x4014000000000000, "geo_ray_obb_face: origin on the min-y plane, axis 1 parallel (-e + he = +0) -> t = 5");
+assert_eq(load64(_r5g_out), 0, "geo_ray_obb_face: ... on face 0");
+assert_eq(geo_ray_obb_face(_r5g_ray(hvec3_new(_r5g_m5, F64_HALF, _d34_m2), _d34_ux), _mt50_ob, _r5g_out), 0,
+  "geo_ray_obb_face: axis-2 miss (-e + he < 0) on a finite box -> the miss 0");
+assert_eq(load64(_r5g_out), GEO_FACE_NONE, "geo_ray_obb_face: ... with GEO_FACE_NONE");
 # a NaN half-extent on a crossing axis, laundered by a later crossing axis on 3.3.3
 assert_eq(_d34_ok(geo_ray_obb_face(_r5g_ray(hvec3_new(_r5g_m5, F64_HALF, f64_neg(0x4012000000000000)),
         hvec3_new(_d34_s, 0, _d34_s)),
@@ -3098,6 +2395,337 @@ assert_eq(HVec3_x(_g739_do), 0xBDA1C4F907981205, "geo_jet_triangle: ... dt/do.x 
 assert_eq(HVec3_y(_g739_do), 0x3D767EE213772807, "geo_jet_triangle: ... dt/do.y within an ulp");
 assert_eq(HVec3_z(_g739_do), 0x3D9F1E003DF76C4E, "geo_jet_triangle: ... dt/do.z rounded");
 
+test_group("3.3.7 geo: tiny and far capsules, the barrel's accuracy, origins within an ulp of a centre");
+# Every expected value below is the exact answer correctly rounded (exact rational roots,
+# Decimal square roots in the cancellation-free form), or within the ulp stated; "3.3.6"
+# is that tree's answer under cycc 6.6.20.
+# [measured: rt337 fixtures (fixtures.py), exact roots, 3.3.6 vs this tree, 2026-10-31]
+fn _g737_ray(ox, oy, oz, dx, dy, dz) {
+    var r = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(r, hvec3_new(ox, oy, oz));
+    GeoRay_set_direction(r, hvec3_new(dx, dy, dz));
+    return r;
+}
+var _g737_br = alloc(16);
+# A capsule 2^-600 long, r = 2^-602, met from (2^-601, 1, 0) along -y: the barrel at
+# 1 - 3 * 2^-602, which rounds to 1 (3.3.6: the miss, |ab|^2 having flushed to 0 and the
+# capsule read as its start sphere, which the ray passes beside).
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x1A60000000000000, F64_ONE, 0, 0, 0xBFF0000000000000, 0),
+    geo_capsule_new(hvec3_zero(), hvec3_new(0x1A70000000000000, 0, 0), 0x1A50000000000000), _g737_br), F64_ONE,
+  "geo_ray_capsule_branch: a capsule 2^-600 long from unit distance: its barrel at 1 (3.3.6: a miss)");
+assert_eq(load64(_g737_br), GEO_CAP_CYLINDER, "geo_ray_capsule_branch: ... on the barrel");
+# Not tiny all through (r = 1.3 * 2^-480) and not far: the scaled axis. The first hit is the
+# end cap (3.3.6: GEO_CAP_SPHERE, the right t on a capsule that is not a sphere).
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x220F333333333334, 0x21E0000000000000, 0x21D0000000000000,
+      0xBFF0000000000000, 0, 0), geo_capsule_new(hvec3_zero(), hvec3_new(0x1A70000000000000, 0x1A60000000000000,
+        0x1A50000000000000), 0x21F4CCCCCCCCCCCD), _g737_br), 0x2205CF8662EEA781,
+  "geo_ray_capsule_branch: a fat capsule 2^-600 long, three radii out: t rounded");
+assert_eq(load64(_g737_br), GEO_CAP_END_CAP, "geo_ray_capsule_branch: ... on its end cap, not GEO_CAP_SPHERE");
+# A capsule ~2^-553 long from unit distance along -3 x, solved from where the ray passes it
+# (_geo_capsule_far): its start cap, t within 0.34 ulp (3.3.6: GEO_CAP_SPHERE).
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x3FFBB7CC865D47BB, 0x9D610518E8C0D0CF, 0x9D58ACC52DF9E3D8,
+      0xC008000000000000, 0, 0), geo_capsule_new(hvec3_new(0x9D50000000000000, 0x9D68000000000000, 0),
+      hvec3_new(0x1D4B333333333334, 0x9D70CCCCCCCCCCCD, 0x1D60000000000000), 0x1D5F1B2BDD28D873), _g737_br),
+  0x3FE27A8859938527, "geo_ray_capsule_branch: a far tiny capsule: its start cap, t within an ulp");
+assert_eq(load64(_g737_br), GEO_CAP_START_CAP, "geo_ray_capsule_branch: ... on its start cap");
+# Far capsules the far copy decides (the robust tests alone answer the cap, or 4 ulp off): one
+# 2^-54 of its distance across (2^319 long, r 2^320.6), by its barrel just under 2^367 (the exact
+# root rounded); one 2^-825 long from 0.72 away (rounded).
+# [measured: rt2 far-copy hunt (mutant without the copy), exact roots, this tree, 2026-10-31]
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x53E0683E477DDC52, 0xD3CBA55D771F16E9, 0xD3CC203D3658218E,
+      0x406710FC0524E32C, 0xC0358D52838C24EA, 0x4043D34090D36CC8), geo_capsule_new(hvec3_new(0x575710FC0524E32C,
+        0xD7258D52838C24EA, 0x5733D34090D36CC8), hvec3_new(0x575710FC0524E32C, 0xD7258D52838C24E9,
+        0x5733D34090D36CC8), 0x53F8F47BDC587AFB), _g737_br), 0x56DFFFFFFFFFFFFF,
+  "geo_ray_capsule_branch: a far capsule, from where the ray passes it: t rounded");
+assert_eq(load64(_g737_br), GEO_CAP_CYLINDER, "geo_ray_capsule_branch: ... on the barrel, not the start cap");
+assert_eq(geo_ray_capsule(_g737_ray(0x3FE7304F771393C4, 0x8C3351B3EBEADE98, 0x8C1292C838482A10, 0xBFE8000000000000,
+      0, 0), geo_capsule_new(hvec3_new(0x0C40000000000000, 0x8C64000000000000, 0), hvec3_new(0x0C4B000000000000,
+        0x8C57000000000000, 0x0C60000000000000), 0x0C6679E865B62D5D)), 0x3FEEEB149EC4C505,
+  "geo_ray_capsule: a capsule 2^-825 long from 0.72: t rounded");
+# Far, with t past DBL_MAX: +Inf on the barrel (3.3.6: +Inf on the start cap, an Inf - Inf
+# NaN in a first draft of the far copy).
+assert_eq(geo_ray_capsule_branch(_g737_ray(0, 0x6BCF7A08507F8363, 0x6BC7269CDD74AF95, 0x1200000000000000, 0, 0),
+    geo_capsule_new(hvec3_new(0x6E0EDABD94077472, 0x6BC872C5BE2A7A90, 0x6BC432AB0A6FD000),
+      hvec3_new(0x6E0EDABD9404E9D5, 0xEBC4022DF8D54F68, 0x6BE92D848DE1EF3D), 0x6BCABDFF01DA1BF4), _g737_br),
+  0x7FF0000000000000, "geo_ray_capsule_branch: a far capsule met past DBL_MAX: +Inf");
+assert_eq(load64(_g737_br), GEO_CAP_CYLINDER, "geo_ray_capsule_branch: ... on its barrel");
+# Far, passing 2^90 beside a capsule 2^48 long at 2^100: the miss, answered before the copy
+# (without that test the copy is as far again, and the recursion does not end).
+assert_eq(geo_ray_capsule(_g737_ray(0, 0, 0, F64_ONE, 0x3F50000000000000, 0), geo_capsule_new(hvec3_new(
+        0x4630000000000000, 0, 0), hvec3_new(0x4630000000000001, 0, 0), F64_HALF)), 0,
+  "geo_ray_capsule: a far ray passing 2^42 lengths beside the capsule: the miss");
+# The barrel's accuracy (roadmap: 4,993 ulp at 1.6e4 radii along the axis; exact
+# 0x3FFEBDA633ED69E0, 0.502 ulp off) and a ray 1e4 radii along (3.3.6: 0x400496BD67684030,
+# 583 ulp; exact rounds to the pinned bits).
+# [measured: rt337 fixtures (fixtures.py), exact roots, 3.3.6 vs this tree, 2026-10-31]
+assert_eq(geo_ray_capsule(_g737_ray(0x40B33F8C8241857E, 0x40C11DCB5B12F347, 0x40C5E584F5870178, 0x3FEE0C4B13CD9C32,
+      0xBFDC585CFBBBDF75, 0xBFB373E859BE4F37), geo_capsule_new(hvec3_new(0xBFE4115D01803530, 0xC01042355B1B6BD0,
+        0x4011477561717E7E), hvec3_new(0x40CB8F220269B35E, 0x40D87EC08203A8B0, 0x40DF5299636F48FC), F64_ONE)),
+  0x3FFEBDA633ED69DF, "geo_ray_capsule: the roadmap's barrel ray 1.6e4 radii along: within an ulp (3.3.6: 4,993)");
+assert_eq(geo_ray_capsule(_g737_ray(0xC0BB3E0F4DDF683C, 0x40BA859F1FDFD190, 0x40A1F5E60CC663BA, 0xBFE2ECC5283EE135,
+      0x3FD1CCD8BC706129, 0xBFE83878D73BDB4E), geo_capsule_new(hvec3_new(0xBFEA310497A94544, 0x3FE5E518DBEFD3E0,
+        0x3FC9B73CFD8B5000), hvec3_new(0xC0D2AD7A8F1CBBF1, 0x40D22DA6EEAE0B45, 0x40B89890622B6F71), F64_ONE)),
+  0x400496BD67684277, "geo_ray_capsule: a barrel ray 1e4 radii along: t rounded");
+# A barrel of radius 2^-159 on a 68-unit axis, met along -x from 0.65: the offset of the ray
+# from the axis taken from the inputs (_geo_cap_axis_offset); 3.3.6 answered the miss.
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x3FE4E046F97542D8, 0xB5F94007216AA958, 0x35F81F5B51B7284C,
+      0xBFF0000000000000, 0, 0), geo_capsule_new(hvec3_new(0x4038000000000000, 0x4010000000000000,
+        0xC038000000000000), hvec3_new(0xC038000000000000, 0xC010000000000000, 0x4038000000000000),
+      0x35FA2A0DCD9358F0), _g737_br), 0x3FE4E046F97542D8,
+  "geo_ray_capsule_branch: a thin barrel: t rounded (3.3.6: miss)");
+# A capsule of radius 2^-183 on a 2.75-unit axis, met along +z from 0.52 below its end at 0:
+# its barrel, the offset and the end cap's side taken from the inputs (_geo_cap_axis_offset,
+# _geo_cap_side_exact); 3.3.6 answered 7.5e-9 later (0x3FE08E4A18B6F7F2).
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x347EF0314BF62BA3, 0xB45BEA29E2F8E19B, 0xBFE08E4A1CBDB6C4, 0, 0,
+      F64_ONE), geo_capsule_new(hvec3_new(0x3FF8000000000000, 0xBFFC000000000000, 0xBFF8000000000000),
+      hvec3_zero(), 0x348129B9A7AF3F2E), _g737_br), 0x3FE08E4A1CBDB6C4,
+  "geo_ray_capsule_branch: a thin capsule's barrel by its end: t rounded");
+assert_eq(load64(_g737_br), GEO_CAP_CYLINDER, "geo_ray_capsule_branch: ... the barrel, not its end cap");
+# A ray past the end plane of a barrel of radius 2^-164: its cylinder crossing is off the segment, and
+# the segment test is taken from where the root lies (_geo_cap_seam_proj); 3.3.6 answered
+# 0x3FC8EB88EF51E69A on the barrel.
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x3FE2B0A6B37D6CF3, 0xB5B2A43CF27250D9, 0x359A354E17FC1395,
+      0xC008000000000000, 0, 0), geo_capsule_new(hvec3_new(0x3FF8000000000000, 0x4002000000000000,
+        0xBFF0000000000000), hvec3_zero(), 0x35A7A1F2B26F259C), _g737_br), 0,
+  "geo_ray_capsule_branch: past a thin barrel's end plane: the miss (3.3.6: a barrel hit)");
+assert_eq(load64(_g737_br), GEO_FACE_NONE, "geo_ray_capsule_branch: ... with no branch");
+# Thin barrels whose ray passes within their radius of the axis: (o - start) . (ab x d)
+# formed with n = ab x d's own rounding carried (a 0.57-unit axis of full-mantissa direction,
+# r = 2^-87, the barrel at 4.59 within 0.14 ulp; without that part, the miss); with
+# o - start's (r = 2^-253 on a 14-unit axis: the miss, 3.3.6 a hit at 2.18); a ray past a
+# thin barrel's START plane (the miss, the start plane's own test); and the far root's side
+# of the end plane (a barrel of radius 2^-48: the barrel within 0.96 ulp, 3.3.6 6 ulp off).
+# [measured: rt337 fixtures (fixtures.py), exact roots, 3.3.6 vs this tree, 2026-10-31]
+assert_eq(geo_ray_capsule_branch(_g737_ray(0xBFF6082C5537FB32, 0xBA80AFEC4E5E8658, 0x3A70721AC3F1FD4C,
+      0x3FD3333333333333, 0, 0), geo_capsule_new(hvec3_new(0x3FCD82808EDBE386, 0x3FC3E23ED7D18A32,
+        0x3FAF83DBE347D2C8), hvec3_new(0xBFCD82808EDBE386, 0xBFC3E23ED7D18A32, 0xBFAF83DBE347D2C8),
+      0x3A7BA920A33F1E0D), _g737_br), 0x40125C24F1AEA6AA, "geo_ray_capsule_branch: a full-mantissa thin axis: t");
+assert_eq(geo_ray_capsule(_g737_ray(0x30216C0EEF1EA12A, 0x3FFA1A94E5EA962A, 0x3017EC43BE2C674E, 0,
+      0xBFE8000000000000, 0), geo_capsule_new(hvec3_new(0xC010000000000000, 0, 0x4018000000000000),
+      hvec3_new(0x4010000000000000, 0, 0xC018000000000000), 0x30127F6EE2C58659)), 0,
+  "geo_ray_capsule: a barrel of radius 2^-253 passed beside: the miss (3.3.6: 2.18)");
+assert_eq(geo_ray_capsule(_g737_ray(0x328E8B5A5BB6DCBA, 0xB271F30B299FE75C, 0xBFFFA38B2E6F686D, 0, 0,
+      0x3FE8000000000000), geo_capsule_new(hvec3_zero(), hvec3_new(0xBFE2000000000000, 0x3FC8000000000000,
+        0x3FB0000000000000), 0x3281091C0176C968)), 0, "geo_ray_capsule: past a thin barrel's start plane: the miss");
+assert_eq(geo_ray_capsule_branch(_g737_ray(0xBCA2692A4B723604, 0x3CE3A0B2BE12794D, 0x3FF80CE76EFE154A, 0, 0,
+      0xBFE8000000000000), geo_capsule_new(hvec3_new(0xBFE0000000000000, 0, 0x3FD4000000000000), hvec3_zero(),
+      0x3CE86EE3BC42E0AC), _g737_br), 0x4000089A49FEB8D7, "geo_ray_capsule_branch: by a thin barrel's end: t");
+assert_eq(load64(_g737_br), GEO_CAP_CYLINDER, "geo_ray_capsule_branch: ... on the barrel, not the end cap");
+# Far capsules: one 2.1e62 long at 1.7e81 whose start is under an ulp of the origin's
+# coordinates, missed (3.3.6: a hit on its end cap at 2^260; the copy needs o - start's
+# rounding); and one behind the origin (the copy would answer a negative t).
+assert_eq(geo_ray_capsule(_g737_ray(0xCD63DBF0F97E5A4A, 0x4D16DEFF92E5F9B4, 0, 0xC08C8C989FC10A98,
+      0xC051460CF8379990, 0), geo_capsule_new(hvec3_new(0xD0CC8C989FC10A98, 0xD091460CF8379990,
+        0xCCE028B3DA36C23E), hvec3_new(0xD0CC8C989FC10A98, 0xD091460CF8379990, 0), 0x4CF0B701ED772078)), 0,
+  "geo_ray_capsule: a far capsule beside the origin's own coordinates: the miss (3.3.6: 2^260)");
+assert_eq(geo_ray_capsule(_g737_ray(0, 0, 0, 0xBFF0000000000000, 0, 0), geo_capsule_new(hvec3_new(
+        0x4630000000000000, 0, 0), hvec3_new(0x4630000000001000, 0, 0), 0x4390000000000000)), 0,
+  "geo_ray_capsule: a far capsule behind the origin: the miss");
+# The decisions the review's mutants reached (each value the exact root rounded or within the
+# ulp stated, by an exact oracle; "3.3.6" that tree's answer):
+# - a far capsule ((1, 1, 1) long, r 0.1, 2^39 out) whose start's offset from the ray reads 1.18
+#   by its largest component, past |ab| + r = 1.1 though the ray meets it: the barrel (3.3.6
+#   0x4270000000000000, 803 ulp), not the passes-outside miss (its bound is 2 (|ab| + r));
+# - a barrel root at a thin barrel's end plane (r 2^-41), the segment test's window: the barrel
+#   at 1 (exact);
+# - start / end caps (r 2^-23, 2^-28, 2^-29) whose side term is within its rounding of 0, the
+#   side from where the root lies (its window, o - cap's rounding, h over |d|): exact or within
+#   0.88 ulp;
+# - the end-plane side's |ab| (r 2^-36): the barrel at 1 + 2^-51 (exact).
+# [measured: rt2 review repros (rt2e/surv.py), exact roots, 3.3.6 vs this tree, 2026-10-31]
+assert_eq(geo_ray_capsule_branch(_g737_ray(0, 0, 0, F64_HALF, F64_HALF, 0xBFE8000000000000), geo_capsule_new(
+      hvec3_new(0x425FFFFFFFFFC000, 0x425FFFFFFFFFC000, 0xC268000000002000), hvec3_new(0x4260000000000000,
+        0x4260000000000000, 0xC268000000000000), 0x3FB999999999999A), _g737_br), 0x426FFFFFFFFFFCDD,
+  "geo_ray_capsule_branch: a far capsule passed within its bound: its barrel (3.3.6: 803 ulp)");
+assert_eq(load64(_g737_br), GEO_CAP_CYLINDER, "geo_ray_capsule_branch: ... on the barrel");
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x400297D5D9866180, 0x4015784A2D174659, 0xBFF851FA115C8874,
+      0xC00F78718043ADF8, 0xC019661931021EC4, 0x4006EADC0F89C689), geo_capsule_new(hvec3_new(0xBFF9C1374D7A9384,
+        0xBFEF6E781F56CDD4, 0x3FF583BE0DB70E46), hvec3_new(0xBFEE32ED032D39AC, 0x3FE02E1D8F830968,
+        0x3FFC74A1245A0D6E), 0x3D68818AAAFC97F7), _g737_br), F64_ONE,
+  "geo_ray_capsule_branch: a thin barrel's root at its end plane: 1 (3.3.6: 0x3FEFFFFFF81170D9)");
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x41784BF0C18FD5B8, 0x416432297CFC44E1, 0xC19F510EE1F1DFB1,
+      0xC1784BF0D2FEA8ED, 0xC1643229856674B5, 0x419F510EDC8DCB08), geo_capsule_new(hvec3_new(0xBFF16ED314AC3E1C,
+        0xBFD0D45F2C157870, 0xBFF590527AFFDE98), hvec3_new(0xBFF2473789017552, 0x3FE49860B8275B3A,
+        0xC0000A5707EA3628), 0x3E8DFA039C5D37F2), _g737_br), F64_ONE,
+  "geo_ray_capsule_branch: a start cap's side within its rounding: 1 (3.3.6: 1 + 7 ulp)");
+assert_eq(load64(_g737_br), GEO_CAP_START_CAP, "geo_ray_capsule_branch: ... on the start cap");
+assert_eq(geo_ray_capsule_branch(_g737_ray(0xC046DA6B47A36BFA, 0xC042EC0FD9363B0A, 0xC0394EF7B9E31704,
+      0x4046DE864C077BF2, 0x404256ED7EC12C70, 0x4039A9F319EAFEB7), geo_capsule_new(hvec3_new(0x3FA06C11AD0C7300,
+        0xBFF2A44B4E1E8FD2, 0x3FD6BED7FF185E80), hvec3_new(0xBFDB2E94A747CDC4, 0xBF59B3D658D89000,
+        0x3FE39D3CC4725465), 0x3E342F89E8867AE0), _g737_br), F64_ONE,
+  "geo_ray_capsule_branch: ... with o - cap's rounding carried: within 0.71 ulp");
+assert_eq(load64(_g737_br), GEO_CAP_START_CAP, "geo_ray_capsule_branch: ... on the start cap, not the barrel");
+assert_eq(geo_ray_capsule_branch(_g737_ray(0x4051C19A3631215E, 0x40648BB4AE1B4F35, 0x4066A5FC1F808C97,
+      0xC0517187BDC8E0BB, 0xC064BEF1B9CCBE60, 0xC066BFDF744AB440), geo_capsule_new(hvec3_new(0x3FF7B3DBBA38004C,
+        0xBFF14AC527BDA7E8, 0xBFF82ECA5DDD008A), hvec3_new(0x3FF4049E1A118911, 0xBFF99E85D8B89FEA,
+        0xBFE9E354CA284CDA), 0x3DBC09EEB3EA8B91), _g737_br), 0x3FF0000000000002,
+  "geo_ray_capsule_branch: the end plane's side by |ab|: 1 + 2^-51 (3.3.6: 0x3FF0000002DCE713)");
+assert_eq(geo_ray_capsule_branch(_g737_ray(0xC0A57C9D323624CB, 0x40CD575F801DC093, 0xC0B7318CFC84FFD5,
+      0x40A57A2F3244F1EA, 0xC0CD5667AD6CB869, 0x40B731711D1DAE6B), geo_capsule_new(hvec3_new(0xBFE8706135D0C1E0,
+        0x3FFF885FFFC49EAC, 0xBFF1434876455F02), hvec3_new(0xBFF36FFF89087E0C, 0x3FFEFA5620C89B96,
+        0xBFBBDF674D7F4540), 0x3E24DDBD32F65981), _g737_br), 0x3FF0000000000002,
+  "geo_ray_capsule_branch: an end cap's side from a raw direction: within 0.88 ulp");
+assert_eq(load64(_g737_br), GEO_CAP_END_CAP, "geo_ray_capsule_branch: ... on the end cap");
+# Capsules past 2^511.5 long (the scaled axis), origins far along them: o_perp formed with
+# o - start's and ab's roundings carried (2^533 long: within 1.02 ulp, 3.3.6 55,061 ulp off;
+# 2^526 long with ends of both signs, so end - start rounds: exact, 3.3.6 221,714 ulp), and
+# 2^603 long, where |o_perp|^2 overflows and the gate compares exponents (2.76 ulp; 3.3.6 and
+# a first draft of this repair 362,762 ulp).
+# [measured: rt2 long-capsule families (longcap_big.py, seeds 2101-2102), exact roots, 3.3.6 vs this tree, 2026-10-31]
+assert_eq(geo_ray_capsule(_g737_ray(0x611BBD1D30B9F17D, 0xE131951E46EAE723, 0xE135FE35CD8A3965, 0xBFD30ABD3A9D21FD,
+      0x3FDCF1170231F80C, 0x3FEAE7FE12A00094), geo_capsule_new(hvec3_new(0x6134C423EE9CC3D4, 0xE12FD87297044E1C,
+        0xE1311289A36F77D4), hvec3_new(0xE12C623A3EE2C068, 0xE1341E1BD1ADDC30, 0xE13D82426AC888F6),
+      0x5FC134780CB95363)), 0x5FD6CD8A432A67FB, "geo_ray_capsule: 2^533 long, far along: within 1.02 ulp");
+assert_eq(geo_ray_capsule(_g737_ray(0x60817CBFF5B8DFF1, 0x60804C5FA5FBDD3E, 0x60829B49823F3213, 0x3FE92D11E1CDCE70,
+      0xBFC0098ABAAB3D01, 0x3FE357693B0B4A7D), geo_capsule_new(hvec3_new(0xE0BDF995DB6985CB, 0xE092E29FCA52D958,
+        0xE090C9BA6DD243FC), hvec3_new(0x60B6AAAF845EFA42, 0x60995D7D9F454D16, 0x6099EB6307CECFBE),
+      0x5F8071CB4C3D8A05)), 0x5FA3616F00ECE18C, "geo_ray_capsule: 2^526 long, ends of both signs: rounded");
+assert_eq(geo_ray_capsule(_g737_ray(0x65452124590163B4, 0x654F8CC145ADA51E, 0xE55B1EAD9C7A07AC, 0xBFEEAEB5C74B8BAF,
+      0xBFC9D8998B1A067A, 0x3FC98F9D9DACA385), geo_capsule_new(hvec3_new(0xE578C88712063936, 0xE5685D4F5D2840D0,
+        0xE58B9AD77589EE0C), hvec3_new(0x65798F400FCCCDC8, 0x65716B8AA6A5933B, 0x6580D8A1D8633F53),
+      0x642743DA8ECCCB7A)), 0x6439A0BA0B7E4A86, "geo_ray_capsule: 2^603 long, |o_perp|^2 overflowing: within 2.76 ulp");
+# A sphere of radius DBL_MAX met from -0.56 DBL_MAX, where o - c overflows and is formed halved:
+# its rounding is the halved inputs' (0.53 ulp; 3.3.6 3.5 ulp, 0x7FC2820309826057).
+assert_eq(geo_ray_sphere(_g737_ray(0xFFE1D79B3FC0E63E, 0xC9BB657C90D81E70, 0x4959E8A78915B9E8, 0x3FEFC4CA3729D3D6,
+      0x3F81204D1A559ED0, 0x3FBEA61E3101599C), geo_sphere_new(hvec3_new(0x7FE2BF1A0BF53CEF, 0x7EE37CE9DE8FD6FF,
+        0xC563D550C1BF5974), 0x7FEFFFFFFFFFFFFF)), 0x7FC282030982605B,
+  "geo_ray_sphere: o - c overflowing, its rounding from the halved inputs: within 0.53 ulp");
+# Origins under half an ulp of a centre's coordinates, where o - c rounds to -c: a unit
+# sphere 2^600 out met along its centre from (0, 2^500, 0), and 2^100 out from (0, 2^40, 0),
+# both misses by 2^500 and 2^40 (3.3.6: t = 1 for each); and a sphere 2^-60 of its distance
+# across missed by 19.5 radii (3.3.6: 2^159).
+assert_eq(geo_ray_sphere(_g737_ray(0, 0x5F30000000000000, 0, 0x6578000000000000, 0x6574000000000000, 0),
+    geo_sphere_new(hvec3_new(0x6578000000000000, 0x6574000000000000, 0), F64_ONE)), 0,
+  "geo_ray_sphere: o - c rounding to -c, 2^600 out: the miss (3.3.6: 1)");
+assert_eq(geo_ray_sphere(_g737_ray(0, 0x4270000000000000, 0, 0x4638000000000000, 0x4634000000000000, 0),
+    geo_sphere_new(hvec3_new(0x4638000000000000, 0x4634000000000000, 0), F64_ONE)), 0,
+  "geo_ray_sphere: ... 2^100 out: the miss (3.3.6: 1)");
+assert_eq(geo_ray_sphere(_g737_ray(0xC5F346995F27A474, 0x4612BEEAFB15112A, 0xC6395748685542C4, 0x3F81E3EF5C0A6D78,
+      0x3F932D0BDA696F5A, 0xBFA5D69BD9319732), geo_sphere_new(hvec3_new(0x4971E3EF5C0A6D78, 0x49832D0BDA696F5A,
+        0xC995D69BD9319732), 0x45DB210AC5BBB8AB)), 0,
+  "geo_ray_sphere: ... a small sphere's offset: the miss (3.3.6: 2^159)");
+# ... and onto the surface: c = 0 read as the contact. The sphere of radius 6.9e-34 at
+# (4.1e-34, 0, 0) from (-3.0e-50, 5.5e-34, 0), the origin under half an ulp inside: the exit
+# at 4.28e-50, within 1.09 ulp (3.3.6: the contact 0). Radius DBL_MAX, origin 3.7 outside
+# and 4.2 inside its surface (copies at unit size): the entry within 0.27 ulp and the exit
+# 2.16e-154 within 1.07 ulp (3.3.6: 0 for both).
+# [measured: rt337 fixtures (fixtures.py), exact roots, 3.3.6 vs this tree, 2026-10-31]
+assert_eq(geo_ray_sphere(_g737_ray(0xB5A649B14880E3AA, 0x3906D5FED2EF1C10, 0, 0xBFCE1344FB34C520, 0xBFE659EED8166D2F,
+      0x3FD1BC969B925386), geo_sphere_new(hvec3_new(0x3901207F1E33550C, 0, 0), 0x390C8B7E87AAE314)),
+  0x35B000E8B1D5FF94, "geo_ray_sphere: o - c rounding onto the surface: the exit (3.3.6: the contact 0)");
+assert_eq(geo_ray_sphere(_g737_ray(0x4012F1C937737E74, 0xFFEFFFFFFFFFFFFF, 0xBFE8DF040B0877A0, 0x3FE3DEA6F4E5B66A,
+      0x3FE68CE80815CD54, 0x3FB8305CB9AAA4BE), geo_sphere_new(hvec3_new(0x3FE7E2AFE5C277D8, 0x400DA6DC762DBCBC,
+        0xC01120A8C58EF035), 0xFFEFFFFFFFFFFFFF)), 0x401509E0AD60E85F,
+  "geo_ray_sphere: radius DBL_MAX, origin 3.7 outside: the entry (3.3.6: 0)");
+assert_eq(geo_ray_sphere(_g737_ray(0x7FEFFFFFFFFFFFFF, 0x4017B78BDEFC33DC, 0x4016D1C81110868C, 0xBFD198166B03709C,
+      0xFFEFFFFFFFFFFFFF, 0x3FF0BE3D3CE65FDC), geo_sphere_new(hvec3_new(0x4010B6E5E27A8614, 0x40031061792269F6,
+        0xC00A2EA000CD8A5F), 0xFFEFFFFFFFFFFFFF)), 0x20072088E89B850E,
+  "geo_ray_sphere: radius DBL_MAX, origin 4.2 inside, along its surface: the exit (3.3.6: 0)");
+
+test_group("3.3.7 geo_diff: jets whose radius is below an ulp of the hit, and a small triangle's vertex gradients");
+# Expected values: the exact jets correctly rounded (900-digit Decimal from exact roots;
+# zero components whose sign is incidental are compared with f64_eq), "3.3.6" that tree's.
+# [measured: rt337 fixtures (fixtures.py), exact jets, 3.3.6 vs this tree, 2026-10-31]
+var _g737_js = geo_jet_sphere(_g737_ray(0, 0, 0, F64_ONE, 0, 0),
+  geo_sphere_new(hvec3_new(0x745E8D87446FDE22, 0, 0), F64_ONE));
+assert_eq(geo_jet_kind(_g737_js), GEO_JET_SPHERE,
+  "geo_jet_sphere: a unit sphere at 3.5e252: a hit jet (3.3.6: the miss)");
+assert_eq(geo_jet_t(_g737_js), 0x745E8D87446FDE22, "geo_jet_sphere: ... t");
+assert_eq(HVec3_x(geo_jet_dorigin(_g737_js)), 0xBFF0000000000000, "geo_jet_sphere: ... dt/do.x = -1");
+assert(f64_eq(HVec3_y(geo_jet_dorigin(_g737_js)), 0) == 1, "geo_jet_sphere: ... dt/do.y = 0");
+assert_eq(geo_jet_sphere_dradius(_g737_js), 0xBFF0000000000000, "geo_jet_sphere: ... dt/dr = -1");
+# An origin under half an ulp of the centre's y, o - c = -c: the offset of the centre from
+# the ray is the origin's own (o - c's rounding, carried); dt/do within 2 ulp of the exact
+# (0x9A62D8A4EF122B98, 0x9A37E03708EB2A49), dt/dr likewise (0x9A6314C3D92A9E91).
+var _g737_jl = geo_jet_sphere(_g737_ray(0, 0x5F30000000000000, 0, 0x6578000000000000, 0x6574000000000000, 0),
+  geo_sphere_new(hvec3_new(0x6578000000000000, 0x6574000000000000, 0), 0x5F38000000000000));
+assert_eq(geo_jet_t(_g737_jl), F64_ONE, "geo_jet_sphere: radius 1.5 * 2^500 at 2^600, o - c rounding: t = 1");
+assert_eq(HVec3_x(geo_jet_dorigin(_g737_jl)), 0x9A62D8A4EF122B97, "geo_jet_sphere: ... dt/do.x within an ulp");
+assert_eq(HVec3_y(geo_jet_dorigin(_g737_jl)), 0x9A37E03708EB2A4B, "geo_jet_sphere: ... dt/do.y within 2 ulp");
+assert_eq(geo_jet_sphere_dradius(_g737_jl), 0x9A6314C3D92A9E8F, "geo_jet_sphere: ... dt/dr within 2 ulp");
+# An origin inside a sphere of radius 32 at 1e17: the exit, g = +32 x (the far root's side).
+var _g737_ji = geo_jet_sphere(_g737_ray(0x4376345785D8A001, 0, 0, F64_ONE, 0, 0),
+  geo_sphere_new(hvec3_new(0x4376345785D8A000, 0, 0), 0x4040000000000000));
+assert_eq(geo_jet_t(_g737_ji), 0x4030000000000000, "geo_jet_sphere: from inside a sphere at 1e17: the exit 16");
+assert_eq(HVec3_x(geo_jet_dorigin(_g737_ji)), 0xBFF0000000000000, "geo_jet_sphere: ... dt/do.x = -1");
+assert_eq(geo_jet_sphere_dradius(_g737_ji), F64_ONE, "geo_jet_sphere: ... dt/dr = +1 (the exit)");
+# The roadmap's capsule: (0.05 DBL_MAX, 0, 0)-(0.06 DBL_MAX, 0, 0), r = 1, from 0 along +x.
+var _g737_jc = geo_jet_capsule(_g737_ray(0, 0, 0, F64_ONE, 0, 0), geo_capsule_new(hvec3_new(0x7FA9999999999999, 0, 0),
+    hvec3_new(0x7FAEB851EB851EB7, 0, 0), F64_ONE));
+assert_eq(geo_jet_kind(_g737_jc), GEO_JET_CAPSULE,
+  "geo_jet_capsule: the roadmap's capsule: a hit jet (3.3.6: the miss)");
+assert_eq(geo_jet_face(_g737_jc), GEO_CAP_START_CAP, "geo_jet_capsule: ... on its start cap");
+assert_eq(HVec3_x(geo_jet_dorigin(_g737_jc)), 0xBFF0000000000000, "geo_jet_capsule: ... dt/do.x = -1");
+# (The typed accessors return 0 on another kind, so each is read only from a capsule jet.)
+var _g737_jca = hvec3_zero();
+if (geo_jet_kind(_g737_jc) == GEO_JET_CAPSULE) { _g737_jca = geo_jet_capsule_dstart(_g737_jc); }
+assert_eq(HVec3_x(_g737_jca), F64_ONE, "geo_jet_capsule: ... dt/da.x = 1");
+assert_eq(geo_jet_capsule_dradius(_g737_jc), 0xBFF0000000000000, "geo_jet_capsule: ... dt/dr = -1");
+# A barrel at 1e17, its axis (1024, 100, 0), met along +x at y = 50: every gradient rounded.
+var _g737_jb = geo_jet_capsule(_g737_ray(0, 0x4049000000000000, 0, F64_ONE, 0, 0), geo_capsule_new(
+    hvec3_new(0x4376345785D8A000, 0, 0), hvec3_new(0x4376345785D8A040, 0x4059000000000000, 0), F64_ONE));
+assert_eq(geo_jet_face(_g737_jb), GEO_CAP_CYLINDER, "geo_jet_capsule: a barrel at 1e17: on the barrel");
+assert_eq(geo_jet_t(_g737_jb), 0x4376345785D8A01F, "geo_jet_capsule: ... t");
+assert_eq(HVec3_y(geo_jet_dorigin(_g737_jb)), 0x40247AE147AE147B,
+  "geo_jet_capsule: ... dt/do.y = 10.24 (3.3.6: 1,611 ulp off)");
+var _g737_jba = hvec3_zero();
+var _g737_jbb = hvec3_zero();
+if (geo_jet_kind(_g737_jb) == GEO_JET_CAPSULE) {
+    _g737_jba = geo_jet_capsule_dstart(_g737_jb);
+    _g737_jbb = geo_jet_capsule_dend(_g737_jb);
+}
+assert_eq(HVec3_x(_g737_jba), 0x3FE051883AC845ED, "geo_jet_capsule: ... dt/da.x");
+assert_eq(HVec3_y(_g737_jba), 0xC014E33DBBE1A12F, "geo_jet_capsule: ... dt/da.y (3.3.6: 5% off)");
+assert_eq(HVec3_x(_g737_jbb), 0x3FDF5CEF8A6F7426, "geo_jet_capsule: ... dt/db.x");
+assert_eq(geo_jet_capsule_dradius(_g737_jb), 0xC02493D217F237E0,
+  "geo_jet_capsule: ... dt/dr = -10.29 (3.3.6: +6.62, the wrong sign)");
+# The jets' far path at scene scale (the review's mutants): a capsule at coordinates near 4e3,
+# r 0.075, met on its END cap from 54 away, its g formed about the end (dt/do and dt/db within
+# 1.2 ulp of the exact; about the start it is garbage); and a sphere 2^24 out of radius 1.1 met near
+# tangency (|f|/r = 0.99935), dt/do.x 377 ulp from the exact 0xBE8303D913521DBD (h =
+# sqrt(r^2 - |f|^2) magnifies f's own rounding some 770 times), where the plain g of p - c (the
+# 3.3.6 form, a gate at 2^30) is 1.3e-6 off.
+# [measured: rt2 review repros (rt2e/surv.py), exact jets, 3.3.6 vs this tree, 2026-10-31]
+var _g737_je = geo_jet_capsule(_g737_ray(0xC0A84C63A4235761, 0x409B6816C0CA576A, 0xC0B0C38E41B1573B,
+    0x3FF12FC7287A4800, 0xC00E4540F0135400, 0x40488485730FC580), geo_capsule_new(hvec3_new(0xC0A84C8FB3262984,
+      0x409B562632EF09D1, 0xC0B08DEE0F6E895C), hvec3_new(0xC0A84A407D7DAAAC, 0x409B5906EA5ECD55,
+      0xC0B09272934E2958), 0x3FB345EB0D320F39));
+assert_eq(geo_jet_face(_g737_je), GEO_CAP_END_CAP, "geo_jet_capsule: a scene-scale end cap: on the end cap");
+assert_eq(HVec3_x(geo_jet_dorigin(_g737_je)), 0x3F59D54824874293, "geo_jet_capsule: ... dt/do.x rounded");
+assert_eq(HVec3_z(geo_jet_dorigin(_g737_je)), 0xBF955548E2947615, "geo_jet_capsule: ... dt/do.z rounded");
+var _g737_jeb = hvec3_zero();
+if (geo_jet_kind(_g737_je) == GEO_JET_CAPSULE) { _g737_jeb = geo_jet_capsule_dend(_g737_je); }
+assert_eq(HVec3_x(_g737_jeb), 0xBF59D54824874293, "geo_jet_capsule: ... dt/db.x rounded");
+var _g737_jt9 = geo_jet_sphere(_g737_ray(0x41604A8F5BAD4995, 0xC1717CAA6A11FE6C, 0x4164940BF2DCB99C,
+    0xC18DE7CD1855DEBF, 0x41A00CDB48D2BF95, 0xC192E3374CFA0C6E), geo_sphere_new(hvec3_new(0x3FE06E23F7CB6858,
+      0x400AF5BCCBB6AD10, 0xBFCD08FECBC37D80), 0x3FF1E5620A841FB8));
+assert_eq(HVec3_x(geo_jet_dorigin(_g737_jt9)), 0xBE8303D913521C44,
+  "geo_jet_sphere: 2^24 out near tangency: dt/do.x 377 ulp from the exact (3.3.6 form: 1.3e-6 off)");
+
+# A 1e-6 triangle near (-0.19, -0.20, -0.012) met from distance 1: w = p - v0 formed with its
+# roundings carried (_geo_jet_tri_w). Each vertex gradient within 1.3 ulp of the exact one
+# (3.3.6: 6.2e3 to 7.7e6 ulp off, dt/do unchanged).
+var _g737_rt = alloc(sizeof(GeoRay));
+GeoRay_set_origin(_g737_rt, hvec3_new(0x3FE9184A9C517909, 0xBF92FECDBEBFD668, 0x3FC007DCEC9E0F26));
+GeoRay_set_direction(_g737_rt, hvec3_new(0xBFEF2B52E3FBBE5C, 0xBFC70DBF554E8616, 0xBFC18E28DF573B97));
+var _g737_jt = geo_jet_triangle(_g737_rt, geo_triangle_new(hvec3_new(0xBFC84C20170D6478, 0xBFC96D995D73B554,
+      0xBF8864C0831E0D4A), hvec3_new(0xBFC84C2A724D33F2, 0xBFC96D99D6B6A5E9, 0xBF8864F0FF391744),
+    hvec3_new(0xBFC84C24C312EE51, 0xBFC96D8EF2A94EF2, 0xBF886420CA35F77C)));
+assert_eq(geo_jet_kind(_g737_jt), GEO_JET_TRIANGLE, "geo_jet_triangle: a 1e-6 triangle from distance 1: a hit jet");
+var _g737_jt0 = hvec3_zero();
+var _g737_jt1 = hvec3_zero();
+var _g737_jt2 = hvec3_zero();
+if (geo_jet_kind(_g737_jt) == GEO_JET_TRIANGLE) {
+    _g737_jt0 = geo_jet_tri_dv0(_g737_jt);
+    _g737_jt1 = geo_jet_tri_dv1(_g737_jt);
+    _g737_jt2 = geo_jet_tri_dv2(_g737_jt);
+}
+assert_eq(HVec3_x(_g737_jt0), 0xBFE783AD70BE85C2, "geo_jet_triangle: ... dt/dv0.x (3.3.6: 6.2e3 ulp)");
+assert_eq(HVec3_y(_g737_jt0), 0xC009BEF315F8D9A7, "geo_jet_triangle: ... dt/dv0.y (3.3.6: 1.1e6 ulp)");
+assert_eq(HVec3_z(_g737_jt0), 0x40081D83BC7E124E, "geo_jet_triangle: ... dt/dv0.z (3.3.6: 9.2e5 ulp)");
+assert_eq(HVec3_x(_g737_jt1), 0xBFB1F12E3200B34B, "geo_jet_triangle: ... dt/dv1.x (3.3.6: 7.3e5 ulp)");
+assert_eq(HVec3_z(_g737_jt2), 0x3FBDB1AF925371CB, "geo_jet_triangle: ... dt/dv2.z (3.3.6: 1.5e6 ulp)");
+
 test_group("2.10.0 geo_ray_*: t is degree -1 homogeneous in the direction");
 _homog_sweep();
 assert_eq(_HG_RUN, 18, "homogeneity sweep ran 6 primitives x 3 direction scales");
@@ -3748,6 +3376,17 @@ assert_eq(_S6_ZBAD, 0, "exit -2^-2074 read -0: face routine, jet, BVH predicate 
 assert_eq(geo_ray_aabb(_s6_ray(0, 0, 0, 0, 0x7E70000000000000, F64_ONE, 0),
     _s6_box(0, 0xBFF0000000000000, 0xBFF0000000000000, 0xBFF0000000000000, 0x8000000000000001, F64_ONE, F64_ONE)), 0,
   "geo_ray_aabb: ... the plain t is +0, the miss (3.3.5: -0)");
+# The same -0 exit on z from an origin OFF the plane z = 0, where max.z + o.z is not max.z - o.z
+# (seed-336 mutant m0049 formed the former and saw no underflow): from (0, 0, 1) along
+# 1.5 * 2^1022 z the slab [-1, 1 - 2^-53] is entered at -2 / (1.5 * 2^1022), a normal t, and
+# left at -2^-53 / (1.5 * 2^1022), under 2^-1075 in magnitude, which reads -0. The box is
+# behind the origin: the miss 0, with no face.
+var _mt49_r = _s5_ray(0, 0, F64_ONE, 0, 0, 0x7FD8000000000000);
+var _mt49_b = _s5_box(0xBFF0000000000000, 0xBFF0000000000000, 0xBFF0000000000000, F64_ONE, F64_ONE,
+  0x3FEFFFFFFFFFFFFF);
+assert_eq(geo_ray_aabb_face(_mt49_r, _mt49_b, _s6_fo), 0,
+  "geo_ray_aabb_face: z exit -2^-53 / (1.5 * 2^1022) read -0 from o.z = 1 -> the miss 0");
+assert_eq(load64(_s6_fo), GEO_FACE_NONE, "geo_ray_aabb_face: ... with GEO_FACE_NONE");
 # An entry that underflowed to -0 with the origin inside: from x = 2^-1074 along
 # (2^60, 1, 0), [0, 1] is entered at -2^-1134 (reads -0) and left at 2^-60, which is the
 # answer, on face 1 (3.3.5: t = -0 on face 0, the entry read as the origin's own plane).
@@ -3792,6 +3431,16 @@ assert_eq(_S6_OBAD, 0, "geo_ray_obb_face: subnormal f_k divides, entry t = 2^990
 assert_eq(geo_ray_obb_face(_s5_ray(0, 0, 0, 0x7E70000000000000, F64_ONE, 0), geo_obb_new(
       hvec3_new(0x8000000000000003, 0, 0), hvec3_new(2, F64_ONE, F64_ONE), hquat_identity()), _s6_fo), 0,
   "geo_ray_obb_face: both x crossings read -0 behind the origin -> the miss 0 (3.3.5: -0)");
+assert_eq(load64(_s6_fo), GEO_FACE_NONE, "geo_ray_obb_face: ... with GEO_FACE_NONE");
+# The OBB's axis-1 exit underflowing to -0 behind a normal entry, axes 0 and 2 parallel with
+# the origin inside them (seed-336 mutant m0053 tested e - he twice and never the exit's
+# e + he): centre (0, -1, 0), he.y = 1 - 2^-53, from 0 along 1.5 * 2^1022 y. The entry
+# (e - he) / f, about -2 / (1.5 * 2^1022), is normal; the exit -2^-53 / (1.5 * 2^1022) reads
+# -0, and the box is behind the origin: the miss.
+var _mt53_b = geo_obb_new(hvec3_new(0, 0xBFF0000000000000, 0), hvec3_new(F64_ONE, 0x3FEFFFFFFFFFFFFF, F64_ONE),
+  hquat_identity());
+assert_eq(geo_ray_obb_face(_s5_ray(0, 0, 0, 0, 0x7FD8000000000000, 0), _mt53_b, _s6_fo), 0,
+  "geo_ray_obb_face: axis-1 exit read -0 behind a normal entry -> the miss 0");
 assert_eq(load64(_s6_fo), GEO_FACE_NONE, "geo_ray_obb_face: ... with GEO_FACE_NONE");
 assert_eq(geo_ray_obb_face(_s5_ray(0xFFD0000000000000, 0, 0, 0x4010000000000000, F64_ONE, 0), geo_obb_new(
       hvec3_new(0x7FD0000000000000, 0x7FD8000000000000, 0), hvec3_new(0x7FE0000000000000, 0x7FB0000000000000,
@@ -4308,6 +3957,24 @@ assert_eq(HVec3_x(g_cp_sph), f64_from(1), "closest sphere outside.x");
 # Closest on sphere (at center — returns center + (r,0,0))
 var g_cp_sph_c = geo_closest_point_on_sphere(g_s1, hvec3_zero());
 assert_eq(HVec3_x(g_cp_sph_c), f64_from(1), "closest sphere at center.x");
+# 3.3.7: point - centre that overflows (both finite) is formed from the halved inputs. The
+# point (DBL_MAX, 0, 0) against the centre (-DBL_MAX, 0, 0), radius 1: exactly -DBL_MAX + 1,
+# which rounds to -DBL_MAX (3.3.6: (NaN, 0, 0)); (DBL_MAX, DBL_MAX, 0): y = 1 / sqrt(5)
+# correctly rounded, x -DBL_MAX (3.3.6: (NaN, 0, 0)).
+# [measured: rt337 overflow sweep (row7.py, seed 701), exact Decimal points, 3.3.6 vs this tree, 2026-10-31]
+var g_cp_ov = geo_closest_point_on_sphere(geo_sphere_new(hvec3_new(0xFFEFFFFFFFFFFFFF, 0, 0), F64_ONE),
+  hvec3_new(0x7FEFFFFFFFFFFFFF, 0, 0));
+assert_eq(HVec3_x(g_cp_ov), 0xFFEFFFFFFFFFFFFF,
+  "closest sphere, point - centre overflowing: x = -DBL_MAX (3.3.6: NaN)");
+var g_cp_ov2 = geo_closest_point_on_sphere(geo_sphere_new(hvec3_new(0xFFEFFFFFFFFFFFFF, 0, 0), F64_ONE),
+  hvec3_new(0x7FEFFFFFFFFFFFFF, 0x7FEFFFFFFFFFFFFF, 0));
+assert_eq(HVec3_x(g_cp_ov2), 0xFFEFFFFFFFFFFFFF,
+  "closest sphere, ... (DBL_MAX, DBL_MAX, 0): x = -DBL_MAX (3.3.6: NaN)");
+assert_eq(HVec3_y(g_cp_ov2), 0x3FDC9F25C5BFEDD9, "closest sphere, ... y = 1 / sqrt(5) rounded");
+# An infinite radius keeps its arithmetic (the non-finite contract): x NaN, as in 3.3.6.
+var g_cp_ovi = geo_closest_point_on_sphere(geo_sphere_new(hvec3_new(0xFFEFFFFFFFFFFFFF, 0, 0), F64_POS_INF),
+  hvec3_new(0x7FEFFFFFFFFFFFFF, 0, 0));
+assert(f64_eq(HVec3_x(g_cp_ovi), HVec3_x(g_cp_ovi)) == 0, "closest sphere, ... radius +Inf: x NaN, as before");
 
 # Closest on AABB (outside)
 var g_cp_aabb = geo_closest_point_on_aabb(g_aabb1, hvec3_new(f64_from(5), 0, 0));
@@ -4858,6 +4525,47 @@ assert_eq(f64_eq(load64(n_fft_data + 8), 0), 1, "ifft[0].im = 0 (sign incidental
 assert_eq(f64_eq(load64(n_fft_data + 24), 0), 1, "ifft[1].im = 0 (sign incidental)");
 assert_eq(f64_eq(load64(n_fft_data + 40), 0), 1, "ifft[2].im = 0 (sign incidental)");
 assert_eq(f64_eq(load64(n_fft_data + 56), 0), 1, "ifft[3].im = 0 (sign incidental)");
+
+test_group("3.3.7 num_fft: every 64th twiddle of a stage from sin / cos");
+# An impulse at index 1 reads the last stage's twiddles out exactly: the odd half's
+# sub-transform is all ones and the even half's all zeros, so X[k] = w_k and
+# X[k + n/2] = -w_k. Through 3.3.6 w_k was k steps of w <- w * wn, and at n = 512 X[64]
+# was (0x3FE6A09E667F3BBB, 0xBFE6A09E667F3BBD), 18 and 15 ulps from cos and sin of
+# fl(2 pi) / 8; it is now their correctly rounded values (60-digit Decimal), the k = 64
+# twiddle taken from sin / cos. n = 128 never reseeds (a stage needs half > 64), so its
+# X[63], the 63rd recurrence step, keeps 3.3.6's bits. At n = 4096 every X[k] is within
+# 2^-48 of the stdlib's (cos, sin)(angle k), where 3.3.6 was 6.7e-14 off at k = 2041.
+# [measured: scratch impulse probe (pimp.cyr) and Decimal oracle, base tree and this tree, 2026-10-31; cycc 6.6.20]
+fn _ft7_imp(n) {
+    var d = alloc(n * 16);
+    for (var i = 0; i < 2 * n; i = i + 1) { store64(d + i * 8, 0); }
+    store64(d + 16, F64_ONE);
+    var t, v = num_fft(d, n);
+    return d;
+}
+var _ft7_a = _ft7_imp(512);
+assert_eq(load64(_ft7_a + 64 * 16), 0x3FE6A09E667F3BCD,
+  "num_fft impulse n = 512: X[64].re = RN(cos(fl(2 pi) / 8)) (3.3.6: ...3BBB)");
+assert_eq(load64(_ft7_a + 64 * 16 + 8), 0xBFE6A09E667F3BCC,
+  "num_fft impulse n = 512: X[64].im = -RN(sin(fl(2 pi) / 8)) (3.3.6: ...3BBD)");
+assert_eq(load64(_ft7_a + 320 * 16), 0xBFE6A09E667F3BCD, "num_fft impulse n = 512: X[320] = -X[64], re");
+assert_eq(load64(_ft7_a + 320 * 16 + 8), 0x3FE6A09E667F3BCC, "num_fft impulse n = 512: X[320] = -X[64], im");
+var _ft7_b = _ft7_imp(128);
+assert_eq(load64(_ft7_b + 63 * 16), 0xBFEFF621E3796D86, "num_fft impulse n = 128: X[63].re, 3.3.6's bits");
+assert_eq(load64(_ft7_b + 63 * 16 + 8), 0xBFA91F65F10DD81A, "num_fft impulse n = 128: X[63].im, 3.3.6's bits");
+var _ft7_n = 4096;
+var _ft7_c = _ft7_imp(_ft7_n);
+var _ft7_ang = f64_div(0xC01921FB54442D18, f64_from(_ft7_n));          # -2 pi / n
+var _ft7_far = 0;                 # deviations not below 2^-48, a NaN among them
+for (var _ft7_k = 0; _ft7_k < _ft7_n / 2; _ft7_k = _ft7_k + 1) {
+    var _ft7_ak = f64_mul(_ft7_ang, f64_from(_ft7_k));
+    var _ft7_dr = f64_abs(f64_sub(load64(_ft7_c + _ft7_k * 16), f64_cos(_ft7_ak)));
+    var _ft7_di = f64_abs(f64_sub(load64(_ft7_c + _ft7_k * 16 + 8), f64_sin(_ft7_ak)));
+    if (f64_lt(_ft7_dr, 0x3CF0000000000000) == 0 || f64_lt(_ft7_di, 0x3CF0000000000000) == 0) {
+        _ft7_far = _ft7_far + 1;
+    }
+}
+assert_eq(_ft7_far, 0, "num_fft impulse n = 4096: every twiddle within 2^-48 of sin / cos (3.3.6: 6.7e-14 off)");
 
 # ================================================================
 # COMPLEX — arithmetic, abs, conj, arg, euler, pauli, matrix (~20)
@@ -5646,6 +5354,13 @@ var s_xv = expr_var(str_from("x"));
 var s_zero_plus = expr_add(expr_const(0), s_xv);
 var s_sp = expr_simplify(s_zero_plus);
 assert_eq(expr_tag(s_sp), EXPR_VAR, "0+x -> var");
+# ⛔ 3.3.7 — THE RIGHT-HAND ZERO RULE AND ADD's CONSTANT FOLD WERE UNTESTED: only 0 + x was
+# simplified, so `_sym_is_zero(b) == 1` -> `!= 1` survived (seed-336 mutant m0192), which
+# keeps x + 0 as an ADD node and returns the LEFT operand of any c1 + c2, dropping c2.
+var _mt192_xz = expr_simplify(expr_add(s_xv, expr_const(0)));
+assert_eq(expr_tag(_mt192_xz), EXPR_VAR, "x+0 -> var");
+var _mt192_cc = expr_simplify(expr_add(expr_const(F64_TWO), expr_const(f64_from(3))));
+assert_eq(expr_const_val(_mt192_cc), f64_from(5), "2+3 folds to the constant 5");
 
 # 1 * x = x
 var s_one_mul = expr_mul(expr_const(F64_ONE), s_xv);
@@ -6024,10 +5739,10 @@ assert_eq(_OT_BAD, 0,
 # `return ad_grad_into(...)` would not compile once a helper fn built it and another
 # fn bound the helper's result, on any pin 6.6.3-6.6.14. And on cycc 6.6.2-6.6.4 the
 # solvers' bare `fncall2(grad, ...);` statements SIGSEGVed with it (exit 139 under 6.6.3).
-# [measured: docs/development/issues/2026-10-03-cyrius-closure-stack-return-blamed-on-enclosing-fn.md]
+# [measured: docs/development/issues/archived/2026-10-03-cyrius-closure-stack-return-blamed-on-enclosing-fn.md]
 # This builds the closure inside a helper fn, the form that failed to compile,
 # exactly as the header now writes it, and drives all four solvers with it. The
-# 6.6.2-6.6.4 half cannot be seen from this suite's 6.6.14 pin; CI's
+# 6.6.2-6.6.4 half cannot be seen from this suite's pin (6.6.20 since 3.3.7); CI's
 # bare-`fncall` step is what guards it.
 fn _ot_make_closure_grad(tape) {
     var grad = |x, out| {
@@ -6988,6 +6703,336 @@ mpr_penetration(&_mpr_sup_box, np9_bb_a, &_mpr_sup_box, np9_bb_b, np9_pn_n, np9_
 assert_lt(alloc_used() - np9_ar_before2, 25600,
   "mpr_penetration: arena per call stays under 25 KB (22,776 B)");
 
+# === 3.3.7: the collision rows (box-in-ball faces, shallow depths, end caps, corners) ===
+# Every exact value below is a closed form evaluated in 80-digit Decimal from the f64
+# inputs; every assertion fails on the 3.3.6 tree. The capsule support is the end along
+# dir plus r dir, as tests/modules_b.tcyr's; spheres use _ga_sup_sphere, which counts.
+# [measured: lane-CO co-probe t_fix.py and t_fix2.py on the 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+test_group("gjk_epa_3d / mpr_penetration: the 3.3.7 collision rows");
+fn _c37_sup_cap(shape, dir) {
+    _ga_sup_calls = _ga_sup_calls + 1;
+    var c = hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16));
+    var a = hvec3_new(load64(shape + 24), load64(shape + 32), load64(shape + 40));
+    var p = hvec3_add(c, a);
+    if (f64_lt(hvec3_dot(dir, a), 0) == 1) { p = hvec3_sub(c, a); }
+    return hvec3_add(p, hvec3_scale(hvec3_normalize(dir), load64(shape + 48)));
+}
+fn _c37_mkcap(cx, cy, cz, ax, ay, az, r) {
+    var s = alloc(56);
+    store64(s, cx); store64(s + 8, cy); store64(s + 16, cz);
+    store64(s + 24, ax); store64(s + 32, ay); store64(s + 40, az); store64(s + 48, r);
+    return s;
+}
+var _c37_n = alloc(8);
+var _c37_d = alloc(8);
+# A box concentric with a ball (the roadmap's pair): every face normal of the dilated box
+# is a local minimum of h, and 3.3.6 stopped at the second-thinnest, R + h_mid =
+# 12.906699824523578. Exact R + h_min = 12.894227117761449 (0x4029C9D82303F6AA); the
+# answer is an upper bound 17 ulp above it, along +x, the thinnest axis.
+# [measured: lane-CO co-probe t_fix.py, 80-digit Decimal oracle, 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+var _c37_bx = _ga_mkobb(0xBFE11889B3A631E6, 0x3FD9DA07E939DA64, 0xBFDAAD9503B36EF8, 0x3FAFAF24B4AE3B09,
+  0x3FB308FBA5F9E2C3, 0x401C34E4BDE10586, 0, 0, 0, F64_ONE);
+var _c37_bl = hvec4_new(0xBFE11889B3A631E6, 0x3FD9DA07E939DA64, 0xBFDAAD9503B36EF8, 0x4029AA28FE4F486F);
+assert_eq(gjk_epa_3d(&_ga_sup_obb, _c37_bx, &_ga_sup_sphere, _c37_bl, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a box concentric with a ball is a contact");
+assert_eq(load64(_c37_d), 0x4029C9D82303F6BB, "gjk_epa_3d: ... at R + h_min (3.3.6: R + h_mid, 0x4029D03AF59B3C44)");
+assert_eq(HVec3_x(load64(_c37_n)), F64_ONE, "gjk_epa_3d: ... along +x, the thinnest axis (3.3.6: y)");
+# A capsule/sphere pair 1.1995e-12 deep (the roadmap's worst): EPA's certificate closed at
+# 1e-10 of the shape, and mpr_penetration answered 5.8716e-10, 490x; the other order
+# 4.5248e-11 from gjk_epa_3d, and this order a miss.
+# [measured: lane-CO co-probe t_fix.py, 80-digit Decimal oracle, 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+var _c37_cp = _c37_mkcap(0xBFD0FBAD4706B994, 0xBFEB1D8981B21794, 0xBFB888D305897130, 0xBFEF931CE85D7103,
+  0xBFE39028303E5122, 0xBFEA53A55271639C, 0x3FEE121D8D91B466);
+var _c37_sp = hvec4_new(0x3FF2EF3E6B7D075E, 0xBFFDDB253F4663AC, 0xBFF1976CD6009E13, 0x3FF188C48375A7E4);
+assert_eq(mpr_penetration(&_c37_sup_cap, _c37_cp, &_ga_sup_sphere, _c37_sp, _c37_n, _c37_d), 1,
+  "mpr_penetration: a capsule/sphere pair 1.2e-12 deep is a contact");
+assert_eq(load64(_c37_d), 0x3D751CC000000000, "mpr_penetration: ... depth 1.20010e-12, 1.0005x (3.3.6: 490x)");
+assert_eq(gjk_epa_3d(&_ga_sup_sphere, _c37_sp, &_c37_sup_cap, _c37_cp, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: ... a contact in the other order");
+assert_eq(load64(_c37_d), 0x3D751B0000000000, "gjk_epa_3d: ... depth 1.19971e-12, 1.0002x (3.3.6: 37.7x)");
+assert_eq(gjk_epa_3d(&_c37_sup_cap, _c37_cp, &_ga_sup_sphere, _c37_sp, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: ... and in this order (3.3.6: a miss)");
+# A pair whose polytope's lower bound read above its upper one (a sliver face's rounding):
+# exact depth 1.676993e-12, 3.3.6 2.3054e-11 (13.7x).
+# [measured: lane-CO co-probe t_fix.py, 80-digit Decimal oracle, 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+var _c37_cq = _c37_mkcap(0x3FEE8809AE443320, 0x3FE5A1A5BE6F74B2, 0x3FDC89138F1A1A40, 0xBFECA66F100A8F3F,
+  0x3FE76B66FC5F8AAD, 0xBFCC09EE4577364C, 0x3FD85D7B8547C747);
+var _c37_sq = hvec4_new(0x3FF02BD53A433FD0, 0x40033D22EAFC4984, 0xBF879373E3F2B5A0, 0x3FF04558327B51F7);
+assert_eq(mpr_penetration(&_ga_sup_sphere, _c37_sq, &_c37_sup_cap, _c37_cq, _c37_n, _c37_d), 1,
+  "mpr_penetration: a sliver-bound capsule/sphere pair is a contact");
+assert_eq(load64(_c37_d), 0x3D7D813900000000, "mpr_penetration: ... depth 1.677152e-12, 1.0001x (3.3.6: 13.7x)");
+# An end-cap overlap 1.19997e-12 deep (the roadmap's sample), missed by all four entry
+# points in both orders in 3.3.6: no portal is built and the distance query's tetrahedron
+# does not clear its margins; a ring round the normal EPA finds does.
+# [measured: lane-CO co-probe t_fix.py, 80-digit Decimal oracle, 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+var _c37_cc = _c37_mkcap(0x3FDE58E76BCB5D0C, 0x3FDA1288C2129D30, 0x3FE2C4E197B5003A, 0x3FF9B7BC0A658B2F,
+  0xBFE25D1A6A71A46A, 0x3FE6F26E1A3A0A16, 0x3FF158071624A44D);
+var _c37_sc = hvec4_new(0x400955BE53E03EE1, 0x3FF30FB2A16B4BD4, 0x3FF935B51250D8BB, 0x3FE59D2FCA996935);
+assert_eq(gjk_intersect_3d(&_c37_sup_cap, _c37_cc, &_ga_sup_sphere, _c37_sc), 1,
+  "gjk_intersect_3d: an end cap 1.2e-12 into a sphere is a contact (3.3.6: a miss)");
+assert_eq(gjk_intersect_3d(&_ga_sup_sphere, _c37_sc, &_c37_sup_cap, _c37_cc), 1,
+  "gjk_intersect_3d: ... in the other order too");
+assert_eq(mpr_intersect(&_ga_sup_sphere, _c37_sc, &_c37_sup_cap, _c37_cc), 1, "mpr_intersect: ... a contact");
+assert_eq(gjk_epa_3d(&_c37_sup_cap, _c37_cc, &_ga_sup_sphere, _c37_sc, _c37_n, _c37_d), 1, "gjk_epa_3d: ... a contact");
+assert_eq(load64(_c37_d), 0x3D751BF71ACFA800, "gjk_epa_3d: ... depth 1.19992e-12, 0.99996x");
+assert_eq(mpr_penetration(&_ga_sup_sphere, _c37_sc, &_c37_sup_cap, _c37_cc, _c37_n, _c37_d), 1,
+  "mpr_penetration: ... a contact in the other order");
+assert_eq(load64(_c37_d), 0x3D751B1C9F03CD00, "mpr_penetration: ... depth 1.19973e-12, 0.9998x");
+# A separated capsule/sphere pair 2.1e-11 apart on which GJK cycles: its portal meets a
+# support value below zero, a separating plane, and no proof is attempted (340 support
+# calls; 476 when one is).
+# [measured: lane-CO co-probe, this tree and a copy without the pd 4 gate, 2026-10-31; cycc 6.6.20]
+var _c37_cs = _c37_mkcap(0x3FE6FA3204BBCC16, 0x3FE0BAD329AAA164, 0xBFEDCFBF256AB92E, 0xBFD9AD150530219C,
+  0x3FE3224F69039B49, 0xBFE3DA9AF1B4BDD8, 0x3FE5B6752A62C8FC);
+var _c37_ss = hvec4_new(0x3FF79C622B9C3750, 0xBFFAFE2695FB8046, 0xBFF9FCF21AFA7DC5, 0x3FF6E4D098546A6D);
+_ga_sup_calls = 0;
+assert_eq(gjk_intersect_3d(&_c37_sup_cap, _c37_cs, &_ga_sup_sphere, _c37_ss), 0,
+  "gjk_intersect_3d: a capsule/sphere pair 2.1e-11 apart is not a contact");
+assert_eq(_ga_sup_calls, 340, "gjk_intersect_3d: ... in 340 support calls (476 trying a proof)");
+_ga_sup_calls = 0;
+assert_eq(gjk_epa_3d(&_c37_sup_cap, _c37_cs, &_ga_sup_sphere, _c37_ss, _c37_n, _c37_d), 0,
+  "gjk_epa_3d: ... not a contact");
+assert_eq(_ga_sup_calls, 340, "gjk_epa_3d: ... in 340 support calls (476 trying a proof)");
+_ga_sup_calls = 0;
+assert_eq(mpr_penetration(&_c37_sup_cap, _c37_cs, &_ga_sup_sphere, _c37_ss, _c37_n, _c37_d), 0,
+  "mpr_penetration: ... not a contact");
+assert_eq(_ga_sup_calls, 340, "mpr_penetration: ... in 340 support calls (476 trying a proof)");
+# A capsule-side pair 1.626767e-12 deep that 3.3.6 missed in this order: proved on the ring
+# round the normal the portal's EPA run found (1.0000x the exact depth; 0.99986x from one
+# EPA finds from the distance query's tetrahedron instead).
+# [measured: lane-CO co-probe t_fix.py, 80-digit Decimal oracle, 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+var _c37_cd = _c37_mkcap(0x3FB791C3C90C4650, 0xBFEB1815E7D09098, 0xBF8AAAC064EF9C00, 0xBFC9AACEE6CA57E7,
+  0x3FC6FB1255C5CD72, 0x3FC2EB456548D9B9, 0x3FEB31C223C166A0);
+var _c37_sd = hvec4_new(0xBFD573EA1DF1CC4D, 0xBFFEE14A63E4F3E6, 0x3FE5CB0B4CE3925E, 0x3FE02EA31AE0A671);
+assert_eq(gjk_epa_3d(&_ga_sup_sphere, _c37_sd, &_c37_sup_cap, _c37_cd, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a capsule side 1.6e-12 into a sphere is a contact (3.3.6: a miss)");
+assert_eq(load64(_c37_d), 0x3D7C9DD000000000, "gjk_epa_3d: ... depth 1.62666e-12, 0.99993x");
+# An end cap 1.2443e-13 deep, 9 margins (2^-46 of the largest coordinate): a miss from all
+# four entry points in both orders in 3.3.6, a contact from all of them now.
+# [measured: lane-CO co-probe t_ovl.py, ce -1e-13 pair 0, 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+var _c37_ce = _c37_mkcap(0x3FE3A3E365679F36, 0xBFE29D8BB31DB444, 0x3FCCD4D28138BD30, 0xBFE63E847B642FAE,
+  0x3FCEFF3C8A16B2E0, 0xBFDEF34FAE0A7CE4, 0x3FCB207D5CEBF852);
+var _c37_se = hvec4_new(0x3FEDE106653DFC9A, 0xBFF79C4D39DABA3A, 0x3FFB2C2FDEDCB092, 0x3FF07E6F33E4D410);
+assert_eq(gjk_intersect_3d(&_c37_sup_cap, _c37_ce, &_ga_sup_sphere, _c37_se), 1,
+  "gjk_intersect_3d: an end cap 1.2e-13 into a sphere is a contact (3.3.6: a miss)");
+assert_eq(mpr_intersect(&_ga_sup_sphere, _c37_se, &_c37_sup_cap, _c37_ce), 1,
+  "mpr_intersect: ... in the other order too");
+assert_eq(gjk_epa_3d(&_c37_sup_cap, _c37_ce, &_ga_sup_sphere, _c37_se, _c37_n, _c37_d), 1, "gjk_epa_3d: ... a contact");
+assert_eq(load64(_c37_d), 0x3D41858D31FF4000, "gjk_epa_3d: ... depth 1.2445e-13");
+# A capsule side 2.06e-12 into a sphere proved by a ring of six supports and by no ring
+# of three of them.
+# [measured: lane-CO co-probe, cs -1.2e-12 pair 39, this tree and a three-point-ring copy, 2026-10-31; cycc 6.6.20]
+var _c37_c6 = _c37_mkcap(0xBFD7576D95588FC8, 0xBFEDC95D47253A2A, 0xBFEC95D008FA77AA, 0x3FCE2F1D0F4C2E85,
+  0xBFE5D505C5C3AE4F, 0x3FC169F9760CCC1E, 0x3FD4BFD3552EF335);
+var _c37_s6 = hvec4_new(0xBFFFAE56950F2970, 0xBFF83D135A3DDBCC, 0xBFE9A5B6950C0851, 0x3FF653D01CBCCF14);
+assert_eq(gjk_intersect_3d(&_c37_sup_cap, _c37_c6, &_ga_sup_sphere, _c37_s6), 1,
+  "gjk_intersect_3d: a capsule side 2.1e-12 into a sphere is a contact");
+# Two end caps 2.8e-13 and 1.3e-13 into spheres about 1e3 from the origin, where the margin
+# is 1.4e-11: below what any polytope of support points proves, so misses as in 3.3.6, and
+# neither the ring (522 support calls; 538 trying it) nor EPA from the distance query's
+# tetrahedron (484; 662 running it) is tried.
+# [measured: lane-CO co-probe, ce -1e-13 offset 1e3 pairs 299 and 115, no-gate copies, 2026-10-31; cycc 6.6.20]
+var _c37_cg = _c37_mkcap(0xC08682B981E2C8CD, 0xC088F06B1078B221, 0xC076A1F2EE08DF3A, 0x3FEEC799E7EE91B3,
+  0xBFCB96EC7B8FF7BB, 0x3FD12B05E274AF29, 0x3FE868F032E63A88);
+var _c37_sg = hvec4_new(0xC0867CE56F68E3D4, 0xC08902548DEDACA2, 0xC0769286B3D74224, 0x3FF63BBE6E2342A3);
+_ga_sup_calls = 0;
+assert_eq(gjk_intersect_3d(&_c37_sup_cap, _c37_cg, &_ga_sup_sphere, _c37_sg), 0,
+  "gjk_intersect_3d: an end cap 2.8e-13 into a sphere at 1e3 is below the margin, a miss");
+assert_eq(_ga_sup_calls, 522, "gjk_intersect_3d: ... in 522 support calls (538 trying the ring)");
+var _c37_ch = _c37_mkcap(0xC086BDB96E0679CB, 0x4055A06515E03B97, 0x4087D8862308B6BB, 0xBFCF92ADD703ED61,
+  0x3FDF7E0F987420C1, 0xBFC5D812B8C919A8, 0x3FD5C50A4BD5E76D);
+var _c37_sh = hvec4_new(0xC086BB795B1B4DD4, 0x4055E56EE0C6776A, 0x4087D8434D9E4B79, 0x3FDD820C8645C337);
+_ga_sup_calls = 0;
+assert_eq(gjk_intersect_3d(&_c37_sup_cap, _c37_ch, &_ga_sup_sphere, _c37_sh), 0,
+  "gjk_intersect_3d: one 1.3e-13 in at 1e3, also a miss");
+assert_eq(_ga_sup_calls, 484, "gjk_intersect_3d: ... in 484 support calls (662 running EPA first)");
+# A sphere 1e-9 into a box corner (box at a full-mantissa rotation): 3.3.6 certified at
+# 1e-10 of the shape, its normal 2.76e-5 rad from the closed form and its depth 20.7%
+# deep; now 6.2e-9 rad and within rounding of the depth (1.0000002e-9).
+# [measured: lane-CO co-probe t_fix.py, 80-digit Decimal oracle, 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+var _c37_ob = _ga_mkobb(0xBFDFD4F78D8A0DF4, 0x3FE1F34799FA56BE, 0xBFE74284B34EDF5C, 0x3FF7CD69C887A618,
+  0x3FF05A6CE9507673, 0x3FF1B7E20BFF121C, 0xBFD1532AE89A7530, 0xBFCDB44391C371A9, 0xBFBDE75BF5CAD019,
+  0x3FEDA9834ECB4ED0);
+var _c37_os = hvec4_new(0xBFF0DCC1621688E8, 0x3FEDF6022595650B, 0xC00A473890E51420, 0x3FE1519786B2C50C);
+assert_eq(gjk_epa_3d(&_ga_sup_obb, _c37_ob, &_ga_sup_sphere, _c37_os, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a sphere 1e-9 into a box corner is a contact");
+assert_eq(HVec3_x(load64(_c37_n)), 0xBFA87193310F19C7, "gjk_epa_3d: ... normal x (3.3.6: 2.76e-5 rad off)");
+assert_eq(HVec3_y(load64(_c37_n)), 0x3F95B5C82226C335, "gjk_epa_3d: ... normal y");
+assert_eq(HVec3_z(load64(_c37_n)), 0xBFEFF4D0BFC2EE35, "gjk_epa_3d: ... normal z");
+assert_eq(load64(_c37_d), 0x3E112E0B6F617252, "gjk_epa_3d: ... depth 9.9999958e-10 (3.3.6: 1.2066e-9)");
+# A sphere 1e-12 into a box corner, which 3.3.6 missed from every entry point (168 of 200
+# such pairs): a contact at depth 9.99924e-13 (exact 1.00042e-12, within the supports'
+# rounding), its normal 8.1e-9 rad from the closed form.
+# [measured: lane-CO co-probe, corner family seed 72 at 1e-12, 3.3.6 base and this tree, 2026-10-31; cycc 6.6.20]
+var _c37_qb = _ga_mkobb(0xBFEB4CFA49BE0916, 0x3FC8281A77A0AB10, 0x3FEF5319597D7966, 0x3FE6CF1A11C13BBE,
+  0x3FEE7D15BAF998F2, 0x3FE7F98424AC5B8A, 0xBFA041AF361D5FDE, 0xBFDF0F89B165D552, 0xBFE6C04187CD12FE,
+  0xBFE040D4AF4EB728);
+var _c37_qs = hvec4_new(0x3FBA95CCF2944720, 0x3FFE862C5AF1786A, 0xBFC73929BD0B2880, 0x3FECE4AF392E656C);
+assert_eq(gjk_intersect_3d(&_ga_sup_sphere, _c37_qs, &_ga_sup_obb, _c37_qb), 1,
+  "gjk_intersect_3d: a sphere 1e-12 into a box corner is a contact (3.3.6: a miss)");
+assert_eq(gjk_epa_3d(&_ga_sup_obb, _c37_qb, &_ga_sup_sphere, _c37_qs, _c37_n, _c37_d), 1, "gjk_epa_3d: ... a contact");
+assert_eq(load64(_c37_d), 0x3D719741DA077000, "gjk_epa_3d: ... depth 9.99924e-13");
+# A sphere 1e-6 into a box face: EPA's certificate leaves a gap within 2^-10 of the depth,
+# so the answer and its cost are 3.3.6's (40 support calls; 252 polishing at 2^-20).
+# [measured: lane-CO co-probe, face family seed 50 at 1e-6 pair 1, 3.3.6 base, this tree and a 2^-20 copy, 2026-10-31]
+var _c37_fb = _ga_mkobb(0x3FE929E33CDC25EC, 0xBFC235C2EBAE2C10, 0xBFEA4E8850AD46E2, 0x3FF69A6B67E8EE67,
+  0x3FD81D96F37447A8, 0x3FF0652E99FAD222, 0xBFE01F1B1BB02689, 0x3FEB8D4B2DD67261, 0x3FA1C3D781C9250C,
+  0xBFAF01A0C90C7516);
+var _c37_fs = hvec4_new(0x3F90A86E8DABF820, 0xBFFF3E76CEECE799, 0xBFEB1186EA4B4145, 0x3FE132C8B776F7EE);
+_ga_sup_calls = 0;
+assert_eq(gjk_epa_3d(&_ga_sup_obb, _c37_fb, &_ga_sup_sphere, _c37_fs, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a sphere 1e-6 into a box face is a contact");
+assert_eq(load64(_c37_d), 0x3EB0C744B2A28000, "gjk_epa_3d: ... at 3.3.6's depth");
+assert_eq(_ga_sup_calls, 40, "gjk_epa_3d: ... in 40 support calls, as 3.3.6");
+# === 3.3.7 (review): which shallow minima the polish runs on ===
+# Boxes as three axis columns (_mpr_sup_obb), counted. A shallow certificate whose gap
+# exceeds 2^-10 of the depth classifies the minimum on its first probes: a crease or a
+# face keeps EPA's answer when the gap is within 1/8 of the depth, and stops the search
+# for the walk otherwise; a round minimum is polished. Each assertion below fails under
+# a mutant of the rule (named in its message).
+# [measured: co2 fixt.py / fixt2.py on review-co families, exact oracles, 3.3.6, 3.3.7 and tree, 2026-10-31]
+fn _c37_sup_box(shape, dir) {
+    _ga_sup_calls = _ga_sup_calls + 1;
+    return _mpr_sup_obb(shape, dir);
+}
+fn _c37_mkbox(c, h, e0, e1, e2) {
+    var s = _mpr_mkobb(HVec3_x(c), HVec3_y(c), HVec3_z(c), HVec3_x(h), HVec3_y(h), HVec3_z(h));
+    store64(s + 48, HVec3_x(e0)); store64(s + 56, HVec3_y(e0)); store64(s + 64, HVec3_z(e0));
+    store64(s + 72, HVec3_x(e1)); store64(s + 80, HVec3_y(e1)); store64(s + 88, HVec3_z(e1));
+    store64(s + 96, HVec3_x(e2)); store64(s + 104, HVec3_y(e2)); store64(s + 112, HVec3_z(e2));
+    return s;
+}
+# A sphere 1e-9 into a box face whose certificate gap is 3.7e-3 of the depth: classified
+# as a face, it keeps 3.3.6's depth (1.0016e-9, exact 1.0000001e-9) in 36 calls (3.3.6 32,
+# the same with the threshold at 2^-7).
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_f1 = _c37_mkbox(hvec3_new(0x3FC3D79FED73CE90, 0xBFE5E4A362A22122, 0x3FEB349736BEC8D4),
+  hvec3_new(0x3FF6D7A1699A5D06, 0x3FFC1455986C7E5E, 0x3FF5D6AAE5587622),
+  hvec3_new(0x3FEEB2FFF4160E4F, 0x3FC1E5E0DCB6C6AD, 0x3FCF60D165AC1168),
+  hvec3_new(0xBFCB173B5AFAE92B, 0x3FEDCB496FDDEB90, 0x3FD3053258E08C39),
+  hvec3_new(0xBFC7E5612B85FE96, 0xBFD591534CDF2A31, 0x3FED87AD32FB40CA));
+var _c37_g1 = hvec4_new(0x4001CDC0B0CCC65A, 0xBFF3385F799CD79D, 0x3FEB8F62B75F73D6, 0x3FDF4CA1DFC5B668);
+_ga_sup_calls = 0;
+assert_eq(gjk_epa_3d(&_c37_sup_box, _c37_f1, &_ga_sup_sphere, _c37_g1, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a sphere 1e-9 into a box face is a contact");
+assert_eq(load64(_c37_d), 0x3E1134FA20000000, "gjk_epa_3d: ... at 3.3.6's depth");
+assert_eq(_ga_sup_calls, 36, "gjk_epa_3d: ... in 36 calls (32 with the threshold at 2^-7)");
+# One 1e-6 deep whose gap is 2.1e-4 of the depth, under 2^-10: no polish (38 calls at 2^-13).
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_f2 = _c37_mkbox(hvec3_new(0xBFDFFC2CF7099950, 0x3FE4FE03A9CED6F2, 0x3FD97C401113A338),
+  hvec3_new(0x3FFD68248D5834CD, 0x3FE9A6F816E2BAAA, 0x3FFC16F643445B6E),
+  hvec3_new(0x3FEF494787DE33FE, 0xBFC85AF04C5986E8, 0xBFB6C3AD5D01BF55),
+  hvec3_new(0xBFC44252BE3A7E6A, 0xBFD8E818F1C68CAC, 0xBFED09FB60D84FE7),
+  hvec3_new(0x3FC1AC0B106FC142, 0x3FECD7770B1B7F89, 0xBFDA474B66FC0E98));
+var _c37_g2 = hvec4_new(0xBFF13DAC42D1C66A, 0x3FEC97EC21096B5E, 0x3FFBC3D65EC1C6C8, 0x3FDA6A570CE18CF6);
+_ga_sup_calls = 0;
+assert_eq(gjk_epa_3d(&_c37_sup_box, _c37_f2, &_ga_sup_sphere, _c37_g2, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a sphere 1e-6 into a box face is a contact");
+assert_eq(load64(_c37_d), 0x3EB0C7868F000000, "gjk_epa_3d: ... at 3.3.6's depth");
+assert_eq(_ga_sup_calls, 32, "gjk_epa_3d: ... in 32 calls, as 3.3.6 (38 with the threshold at 2^-13)");
+# A face 1e-7 deep: the first probe that jumps settles it (50 calls, mpr_penetration;
+# 170 classifying only at the end of the round, 52 taking s(n0) again).
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_f5 = _c37_mkbox(hvec3_new(0x3FE91E4FD2BEDD3E, 0xBFEA3254F6521324, 0xBFE75DFAB70E8624),
+  hvec3_new(0x3FF978716C7667CD, 0x3FE2934B9B683FD2, 0x3FECCE2B8AB000D3),
+  hvec3_new(0xBFE4B314530AE0D0, 0xBFE851062F728C7A, 0xBFB077BF755C98B3),
+  hvec3_new(0xBFE7073AC635802E, 0x3FE45B53D0331673, 0xBFD1CF79218E1DEC),
+  hvec3_new(0x3FD0272949F9EF33, 0xBFC11DCA1E3CF9BC, 0xBFEEAABB01CAA4C4));
+var _c37_g5 = hvec4_new(0x3FF12035D054F39D, 0xBFFF4FDE5FD8B2F0, 0xC007B2C8854147EA, 0x3FF7692F4B38DD63);
+_ga_sup_calls = 0;
+assert_eq(mpr_penetration(&_c37_sup_box, _c37_f5, &_ga_sup_sphere, _c37_g5, _c37_n, _c37_d), 1,
+  "mpr_penetration: a sphere 1e-7 into a box face is a contact");
+assert_eq(load64(_c37_d), 0x3E7AE08256C00000, "mpr_penetration: ... at 3.3.6's depth");
+assert_eq(_ga_sup_calls, 50, "mpr_penetration: ... in 50 calls (170 classifying late, 52 asking s(n0) again)");
+# A face 1e-9 deep whose gap is above 1/8 of the depth: the polish runs, stopping the
+# search for the walk at once (152 calls; 230 halving to the floor first), and gives
+# 1.00482e-9 (exact 1.0000002e-9; 3.3.6 1.05456e-9, also kept at a 1/2 cut).
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_f6 = _c37_mkbox(hvec3_new(0x3FEA2A766BF0E30A, 0xBFECAD06BB00FB9E, 0xBFDE6C9B613D8A90),
+  hvec3_new(0x3FE8D93252E81A82, 0x3FFD482474DAFFA6, 0x3FE30F0164F406B1),
+  hvec3_new(0x3FC6ED7E5099CF4C, 0xBFC7E317A45CA7F0, 0xBFEEE92FEEEA9276),
+  hvec3_new(0x3FEE8313E77DC1AA, 0xBFCABF7F6FBD90A0, 0x3FCBCCA4F896C52C),
+  hvec3_new(0xBFCF06899552C0F0, 0xBFEEB7EAF30FB48B, 0x3FC1FC33D00034F0));
+var _c37_g6 = hvec4_new(0x3FFE55EDBD597682, 0xC0046F1692E2D10E, 0xBFDAFF4B19848D58, 0x3FE7C0DB2C5E0DEA);
+_ga_sup_calls = 0;
+assert_eq(gjk_epa_3d(&_ga_sup_sphere, _c37_g6, &_c37_sup_box, _c37_f6, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a sphere and a box face 1e-9 deep are a contact");
+assert_eq(load64(_c37_d), 0x3E11434209000000, "gjk_epa_3d: ... depth 1.00482e-9 (3.3.6, and a 1/2 cut: 1.05456e-9)");
+assert_eq(_ga_sup_calls, 152, "gjk_epa_3d: ... in 152 calls (230 halving the step first)");
+# One whose gap is between 1/32 and 1/8 of the depth keeps 3.3.6's 1.04902e-9 (exact
+# 1.0000003e-9) in 42 calls; a 1/32 cut polished it to 1.0386e-9 in 156.
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_f7 = _c37_mkbox(hvec3_new(0x3FC88D383DA8B038, 0x3FD989B195AD3158, 0x3FE0F31D76A73A2A),
+  hvec3_new(0x3FFF871B4FDA1114, 0x3FF1C35212EE6391, 0x3FF68CC6A82CC5D6),
+  hvec3_new(0xBFDC62ACB2125550, 0xBFE95094E60A3D3A, 0x3FDAF61C8AC3C528),
+  hvec3_new(0x3FE09E4EC1523D64, 0x3FC4000675BA7508, 0x3FEAE2AEA52FE348),
+  hvec3_new(0xBFE76007285A13A8, 0x3FE2ECD7F6408B00, 0x3FD5DBA0D48F651A));
+var _c37_g7 = hvec4_new(0xBFEBC1FDA4AA64E9, 0x4001DAA4FED41BAC, 0x3FFA607D06A4456F, 0x3FEA92AEB80F8E7C);
+_ga_sup_calls = 0;
+assert_eq(gjk_epa_3d(&_ga_sup_sphere, _c37_g7, &_c37_sup_box, _c37_f7, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: another face 1e-9 deep is a contact");
+assert_eq(load64(_c37_d), 0x3E1205A320000000, "gjk_epa_3d: ... at 3.3.6's depth (a 1/32 cut: 0x3E11D7D430000000)");
+assert_eq(_ga_sup_calls, 42, "gjk_epa_3d: ... in 42 calls (156 at a 1/32 cut)");
+# A sphere 1e-13 into a box edge whose ring proof needs a depth between one and two
+# margins: a contact at 1.00198e-13 (exact 9.999032e-14; 3.3.6 a miss).
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_f4 = _c37_mkbox(hvec3_new(0x3FEEC647642D7936, 0xBFD2066EDB917898, 0x3FD58C04E01D75D4),
+  hvec3_new(0x3FFBEB6F802D9ADB, 0x3FF55295DAC48D34, 0x3FEF753BEE304740),
+  hvec3_new(0xBFEE3E674227FB78, 0xBFD15A223C6D2D0F, 0x3FC7568038BF2ABE),
+  hvec3_new(0xBFD0B070ED852B5B, 0x3FD28ADA788A782C, 0xBFED7805B0DBF7E5),
+  hvec3_new(0x3FC93291FB3A3E3E, 0xBFED5F7ABF45D8F7, 0xBFD60CB4B8F36194));
+var _c37_g4 = hvec4_new(0x3FFAD03D42E7F1D8, 0x3FE79DABA2A73312, 0x400A9F247B866E7B, 0x3FF8F5354FA93E7C);
+assert_eq(gjk_epa_3d(&_c37_sup_box, _c37_f4, &_ga_sup_sphere, _c37_g4, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a sphere 1e-13 into a box edge is a contact (3.3.6: a miss; a ring gate at 2 margins: a miss)");
+assert_eq(load64(_c37_d), 0x3D3C340000000000, "gjk_epa_3d: ... at depth 1.00198e-13");
+# Spheres 1e-12 of their radii apart on which GJK cycles: the portal's support toward the
+# origin is below zero, so no proof is tried (266 calls; 396 when one is).
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_sa = hvec4_new(0x3FE3FA2383749638, 0x3FED74336DC65F74, 0x3FEF19261D53416A, 0x3FED999B4E37A920);
+var _c37_sb = hvec4_new(0xBFDD72884CE4B004, 0x3FF699287AA2B1C7, 0x3FFDA98E546ED316, 0x3FE1D20CB5735E3E);
+_ga_sup_calls = 0;
+assert_eq(gjk_epa_3d(&_ga_sup_sphere, _c37_sa, &_ga_sup_sphere, _c37_sb, _c37_n, _c37_d), 0,
+  "gjk_epa_3d: spheres 1e-12 apart are not a contact");
+assert_eq(_ga_sup_calls, 266, "gjk_epa_3d: ... in 266 calls (396 trying a proof)");
+# A ball off the centre of a thin box: the search stopped at the face opposite the thinnest
+# axis (3.3.6 and the integrated 3.3.7: 4.3249889, exact 4.31680704057); asking -n finds it.
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_f8 = _c37_mkbox(hvec3_new(0xBFCF84E7AA9FA3F0, 0xBFCF74BF6FE5B850, 0x3FC84604AD7B3830),
+  hvec3_new(0x3F8B523657B55369, 0x3FD59B5CE8D5CB11, 0x3FBDA3BD92CC68FB),
+  hvec3_new(0xBFE72AFF42F4747C, 0x3FE5F8318C5309B1, 0xBFB1220B629A8FF9),
+  hvec3_new(0xBFE5F5EAA9E317B3, 0xBFE6A07555925350, 0x3FC5D2302276FE31),
+  hvec3_new(0x3FB1D90BCB6481D1, 0x3FC5AD656A6F0B89, 0x3FEF7571487E248B));
+var _c37_g8 = hvec4_new(0xBFCF28CEB3BAE0F3, 0xBFD03EB48EE1A16A, 0x3FC199B690E487A9, 0x40113AF060BA10A0);
+assert_eq(gjk_epa_3d(&_c37_sup_box, _c37_f8, &_ga_sup_sphere, _c37_g8, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a ball off the centre of a thin box is a contact");
+assert_eq(load64(_c37_d), 0x40114469109999C4, "gjk_epa_3d: ... at 4.316807041 (3.3.6: 0x40114CC9E7323D12)");
+# A concentric pair where h(-n) ties h(n) but for a 1-ulp rounding: the tie is not taken
+# (734 calls, 0x400FBCBD8FFF3B11, exact 3.96715843675; 1,100 and 1 ulp lower taking it).
+# [measured: co2 fixt.py / fixt2.py, exact oracle, 3.3.6, 3.3.7, this tree and the named mutant, 2026-10-31]
+var _c37_f9 = _c37_mkbox(hvec3_new(0x3FC98D93E9FECDA8, 0x3FCA1CF3D94491D8, 0xBFE36B44DCEBD2BC),
+  hvec3_new(0x3FC59F978719FCEF, 0x3FAA1EC832492661, 0x3FC415FBDF9581FC),
+  hvec3_new(0xBFD4E1DEB0437ACC, 0xBFEAD7161C113012, 0x3FDBE61DAD346E0D),
+  hvec3_new(0x3FE119C20D62D48E, 0x3FCBBD62EE36575C, 0x3FEA24B3637F7211),
+  hvec3_new(0xBFE8F3733380285E, 0x3FDFF82CD413790E, 0x3FD8293276F4E81A));
+var _c37_g9 = hvec4_new(0x3FC98D93E9FECDA8, 0x3FCA1CF3D94491D8, 0xBFE36B44DCEBD2BC, 0x400F54426F36165A);
+_ga_sup_calls = 0;
+assert_eq(gjk_epa_3d(&_c37_sup_box, _c37_f9, &_ga_sup_sphere, _c37_g9, _c37_n, _c37_d), 1,
+  "gjk_epa_3d: a ball concentric with a box is a contact");
+assert_eq(load64(_c37_d), 0x400FBCBD8FFF3B11, "gjk_epa_3d: ... at 3.9671584367528063");
+assert_eq(_ga_sup_calls, 734, "gjk_epa_3d: ... in 734 calls (1,100 taking a 1-ulp tie at -n)");
+# ⭐ 3.3.7 — A SEPARATED PAIR IS REFUTED BEFORE THE ENCLOSURE PROOF. A capsule beside a sphere
+# 1.02e-14 apart (lane CO2's capsule/sphere family, its 85th pair): GJK cycles, the portal's
+# EPA run measures a depth below the tolerance and proves nothing (pd 3), and one support along
+# that run's normal comes out below zero, a separating plane, so no proof is tried.
+# [measured: scratch pfb/r2probe.cyr, these supports, four trees, 2026-10-31; cycc 6.6.20]
+var _c37_cs = _c37_mkcap(0xBFCD2196D1A9D4E8, 0x3FA07F6B0CFAF2C0, 0x3FDB6F3D753D9BA0, 0x3FCF1EBDC57EBA9B,
+  0x3FF13FBD9BEEE3F6, 0xBFD499CC152DE61C, 0x3FE08362C88D4D52);
+var _c37_ss = hvec4_new(0xBFFAED4932170F6C, 0x3FD57BA3DD2C3825, 0x3F635528E6FB9400, 0x3FF070C998361A79);
+_ga_sup_calls = 0;
+assert_eq(gjk_intersect_3d(&_c37_sup_cap, _c37_cs, &_ga_sup_sphere, _c37_ss), 0,
+  "gjk_intersect_3d: a capsule 1.02e-14 off a sphere is not a contact");
+assert_eq(_ga_sup_calls, 506, "gjk_intersect_3d: ... in 506 calls (612 trying the proof)");
+
 # sequential_impulse (2.4.5) — fixed: the normal impulse was computed with the
 # wrong sign and without folding the accumulated impulse into the effective
 # velocity, so it clamped to 0 every iteration (the solver did nothing). Now it
@@ -7481,6 +7526,20 @@ vec_push(dl_i, hvec2_new(F64_TWO, F64_TWO));
 var dl_it = delaunay_2d(dl_i, 6);
 assert_eq(_dl_violations(dl_i, 6, dl_it), 0, "delaunay_2d: irregular-6 empty-circumcircle");
 
+# ⭐ 3.3.7 — the orientation expansion's first read of its second operand had no assertion:
+# `_col_o2d_expsum` reading f[fi / 8] for f[fi * 8] (f[0] twice, f[1] never) passed every
+# suite. These near-collinear triples (exact determinants +8.770e-19 and -6.565e-18, float
+# determinants 6.9e-18 under the filter's 3.9e-17 bound) reach the expansion, and that
+# mutant flips both. The roadmap's own repro triple (determinant 3.2e-4) clears the filter,
+# so no mutant of the expansion can move it.
+# [measured: lane-CO o2dr search, 200,000 triples vs a Fraction oracle, 23,929 flipped, 2026-10-31; cycc 6.6.20]
+var _c37_o1 = _col_orient2d_sign(0x3FC2276649DF1540, 0x3FBEDA0AB43B6A00, 0x3FD74BDD42E44158, 0xBFE967890358E204,
+  0x3FCA40F714A4A19D, 0xBFC1E9038D878470);
+assert_eq(_c37_o1, 1, "_col_orient2d_sign: a near-collinear triple 8.8e-19 to the left");
+var _c37_o2 = _col_orient2d_sign(0x3FDD5E76972E6CC0, 0xBFDB24DAF641B434, 0x3FEEBB2F4895EA56, 0xBFE8719C3BE78FC4,
+  0x3FD2DBAEB156A7FD, 0xBFD405D27BA40191);
+assert_eq(_c37_o2, 0 - 1, "_col_orient2d_sign: one 6.6e-18 to the right");
+
 # Single triangle (n=3).
 var dl_t = vec_new();
 vec_push(dl_t, hvec2_new(0, 0));
@@ -7607,6 +7666,17 @@ var es_tr = einsum(str_from("ii->"), es_one, 1);
 assert_neq(es_tr, 0, "einsum: trace returns a tensor");
 assert_eq(load64(HTensor_data(es_tr)), f64_from(5), "einsum trace(A)=5");
 
+# TWO contracted labels. Every contraction above sums over one, so seed-336 mutant m0043
+# (`contracted + n_contracted / 8`: every label stored to slot 0) survived; with two it
+# sums the last label and then slot 1's unwritten 0, label 'a' of dimension 0, and returns
+# 0. ⚠ The labels must not include 'a': slot 1 reads as 'a', so "ab->" hides the mutant.
+# [measured: scratch probe under m0043, 3.3.7 tree, 2026-10-31: "ij->" returned 0, "ab->" 10]
+# sum(A) = 1+2+3+4 = 10 and <A, B>_F = 5+12+21+32 = 70, exact integers.
+var _mt43_sum = einsum(str_from("ij->"), es_one, 1);
+assert_eq(load64(HTensor_data(_mt43_sum)), f64_from(10), "einsum ij-> sums every entry of A: 10");
+var _mt43_fro = einsum(str_from("ij,ij->"), es_two, 2);
+assert_eq(load64(HTensor_data(_mt43_fro)), f64_from(70), "einsum ij,ij-> is the Frobenius product <A,B>: 70");
+
 var es_tp = einsum(str_from("ij->ji"), es_one, 1);
 assert_neq(es_tp, 0, "einsum: transpose returns a tensor");
 assert_eq(tensor_get2(es_tp, 0, 1), f64_from(3), "einsum transpose [0][1]=3");
@@ -7664,6 +7734,28 @@ assert(f64_approx_eq(m3_determinant(m3_transpose(m3a)), m3_determinant(m3a), LOO
 # from_quat(identity) is the identity rotation
 assert(f64_approx_eq(m3_trace(m3_from_quat(hquat_identity())), f64_from(3), LOOSE_TOL_M),
   "m3_from_quat(identity) trace=3");
+# ⛔ 3.3.7 — NO ASSERTION READ AN OFF-DIAGONAL ENTRY OF m3_from_quat. The identity's trace
+# is all the suites asked of it, so `m3_set(m, 1, 2, ...)` -> `(m, 1, 3, ...)` (which leaves
+# (1, 2) at 0 and writes the slot (2, 0) then overwrites) survived all six suites in 3.3.6's
+# seed-336 mutation sample. Every entry is pinned here, on a full-mantissa unit quaternion
+# whose nine entries are distinct, so a swapped index or operand cannot land on an equal
+# value. Expected bits: the documented formula evaluated in IEEE doubles in the code's
+# operation order. Independently, against the exact rotation of this q (rational Hamilton
+# products, q v q* / |q|^2; m3_get(m, col, row), column c = R e_c) every entry is within
+# 6.7 ulp and (1, 2) = R[2][1] within 1.05 ulp, which settles the layout as well as the bits.
+# q = normalize(0.31415926535897931, -0.57721566490153287, 0.69314718055994529, 0.30102999566398120).
+# [measured: scratch python3 fractions oracle (3.3.7), exact q v q* / |q|^2 against each entry]
+var m3fq = m3_from_quat(hquat_new(0x3FD4139EC5F2E88E, 0xBFE27199CFF2511C, 0x3FE625EA7B6AD8F3,
+    0x3FD33CD390022CB1));
+assert_eq(m3_get(m3fq, 0, 0), 0xBFE3EB5F538E1938, "m3_from_quat: (0, 0) = 1 - 2(yy + zz)");
+assert_eq(m3_get(m3fq, 0, 1), 0x3FABE4DA6535E0D8, "m3_from_quat: (0, 1) = 2(xy + wz)");
+assert_eq(m3_get(m3fq, 0, 2), 0x3FE8FBC9387FCA4C, "m3_from_quat: (0, 2) = 2(xz - wy)");
+assert_eq(m3_get(m3fq, 1, 0), 0xBFE8E2EBD6E6D0C4, "m3_from_quat: (1, 0) = 2(xy - wz)");
+assert_eq(m3_get(m3fq, 1, 1), 0xBFC3D39FB350F730, "m3_from_quat: (1, 1) = 1 - 2(xx + zz)");
+assert_eq(m3_get(m3fq, 1, 2), 0xBFE37F0097D210F9, "m3_from_quat: (1, 2) = 2(yz + wx), R[2][1]");
+assert_eq(m3_get(m3fq, 2, 0), 0x3FB67625853767C4, "m3_from_quat: (2, 0) = 2(xz + wy)");
+assert_eq(m3_get(m3fq, 2, 1), 0xBFEF90D062C60379, "m3_from_quat: (2, 1) = 2(yz - wx), R[1][2]");
+assert_eq(m3_get(m3fq, 2, 2), 0x3FC1C3D868DEA7A0, "m3_from_quat: (2, 2) = 1 - 2(xx + yy)");
 
 test_group("Lie: SU(2)->SO(3) double cover (half-angle convention)");
 # su2_exp used a FULL-angle convention through 2.6.12 while so3_exp,
@@ -8343,6 +8435,11 @@ assert_eq(sym_match(pat_add(pat_wildcard(str_from("a")), pat_wildcard(str_from("
 assert_eq(sym_match(pat_mul(pat_wildcard(str_from("a")), pat_wildcard(str_from("b"))),
     expr_add(se_x, expr_const(F64_ONE))), 0,
   "sym_match: (a * b) does NOT match (x + 1)");
+# ⛔ 3.3.7 — the case the comment above describes, pinned: an Expr in the pattern slot carries
+# an EXPR_* tag (0..9), no PAT_* tag (100..111) is equal to it, and _pat_match's final
+# `return 0` answers no match. `return 0` -> `return 1` there survived (seed-336 mutant m0193).
+assert_eq(sym_match(expr_var(str_from("x")), expr_var(str_from("x"))), 0,
+  "sym_match: an Expr passed as the pattern matches nothing, not even itself");
 # Bindings are returned on a successful match
 assert_neq(sym_match_bindings(pat_wildcard(str_from("a")), expr_const(F64_TWO)), 0,
   "sym_match_bindings returns bindings on match");
@@ -9520,6 +9617,33 @@ assert_eq(load64(toir + 16), 0, "toi/receding: zero false negatives");
 # 2^510 up the hit was a miss. Now t is 7.5 bit for bit from 2^-1022 to 2^1020 (9.5 s
 # overflows above that) and the pass is a miss at every scale.
 # [measured: D045 scale map, every power of two, 3.3.4 base and this tree, 2026-10-03; cycc 6.6.14]
+# === 3.3.7: a sweep onto a box corner reports the closest-approach direction ===
+# The roadmap's worst oblique sweep of a sphere onto a rotated box's corner: 3.3.6
+# reported a normal 1.94e-5 rad from the direction of closest approach at the reported t
+# (gap 4.9e-10 there); a round region's two supports now give it to 2.3e-16 rad.
+# [measured: lane-CO co-probe t_row1.py vs an OBB closest-point oracle, base and tree, 2026-10-31; cycc 6.6.20]
+test_group("time_of_impact: a corner's normal is its closest-approach direction (3.3.7)");
+var _c37_tt = alloc(8);
+var _c37_tn = alloc(8);
+var _c37_tb = _ga_mkobb(0xBFD8463D5220ABF8, 0xBFE03710941A16AA, 0xBFDFEE6BB7BEA914, 0x3FE9239026A1A6D0,
+  0x3FF601A8FA8A8A26, 0x3FF1BB8EF1294A53, 0xBFE42E23120AB4CD, 0x3FD861CD1E099C3D, 0xBFE16B0345C23B8B,
+  0xBFD9ABC7F99E7341);
+var _c37_ts = hvec4_new(0xC006AF8D81D92237, 0x3FD4B6DD6742CA98, 0x40097A5107745416, 0x3FECBE3DB985B912);
+assert_eq(time_of_impact(&_ga_sup_obb, _c37_tb, hvec3_zero(), &_ga_sup_sphere, _c37_ts,
+    hvec3_new(0x3FD4EC69052694A8, 0x3FC0EC9E0F2236C0, 0xBFF795D7F4AA6262), f64_from(10), _c37_tt, _c37_tn), 1,
+  "time_of_impact: a sphere swept onto a box corner hits");
+assert_eq(load64(_c37_tt), 0x3FF6EB6E018A2D30, "time_of_impact: ... at the same t as 3.3.6");
+assert_eq(HVec3_x(load64(_c37_tn)), 0xBFDC412393129A8D, "time_of_impact: ... normal x (3.3.6: 1.94e-5 rad off)");
+assert_eq(HVec3_y(load64(_c37_tn)), 0x3FE4378B99AF91A6, "time_of_impact: ... normal y");
+assert_eq(HVec3_z(load64(_c37_tn)), 0x3FE4637C1143341F, "time_of_impact: ... normal z");
+# The snap reuses the support the contact's own reading was taken with (486 calls; 488
+# asking it again; 3.3.6 482).
+# [measured: lane-CO co-probe, this tree and a copy without the reuse, 2026-10-31; cycc 6.6.20]
+_ga_sup_calls = 0;
+time_of_impact(&_ga_sup_obb, _c37_tb, hvec3_zero(), &_ga_sup_sphere, _c37_ts,
+  hvec3_new(0x3FD4EC69052694A8, 0x3FC0EC9E0F2236C0, 0xBFF795D7F4AA6262), f64_from(10), _c37_tt, _c37_tn);
+assert_eq(_ga_sup_calls, 486, "time_of_impact: ... in 486 support calls (488 asking s(n) again)");
+
 test_group("time_of_impact: the same motion at every scale (3.3.4 D045)");
 var _d045_t = alloc(8);
 var _d045_n = alloc(8);
@@ -9865,6 +9989,28 @@ assert_neq(kdv_tree, 0, "kdtree_build(1500 scattered) returns a tree");
 # The structural invariant, checked directly on every node.
 assert_eq(_kdv_invariant_bad(kdv_tree, kdv_pts), 0,
   "kdtree: no point sits on the wrong side of its ancestor's split plane");
+# ⛔ 3.3.7 — THE INVARIANT ABOVE READS EACH NODE THROUGH _kd_axis_val, THE CODE UNDER TEST,
+# and every query reads the stored axis the same way, so a build that cycles the axes in
+# another order is still a valid tree: nearest distances and radius sets do not move, only
+# which of several equidistant points wins and the order results come back in. Two
+# seed-336 mutants did exactly that and survived: _kd_axis_val's axis 1 returning z (m0184,
+# so a node labelled split_axis 1 = y holds a z plane, against the documented node layout)
+# and kdtree_build starting the recursion at depth 1 (m0187, a y root).
+# [measured: scratch probe (3.3.7), 3000 tie-heavy random trees x 8 queries, both mutants]
+# Four points pin the layout and the x, y, z cycle directly: x spans [1, 9], so the root
+# splits x at the midpoint 5, two a side; the left pair's y spans [10, 30], so that child
+# splits y at 20 (z would give 300, a y root 25). Every plane is an exact midpoint.
+var _mt184_p = alloc(4 * 8);
+store64(_mt184_p, hvec3_new(F64_ONE, f64_from(10), f64_from(100)));
+store64(_mt184_p + 8, hvec3_new(F64_TWO, f64_from(30), f64_from(500)));
+store64(_mt184_p + 16, hvec3_new(f64_from(8), f64_from(20), f64_from(300)));
+store64(_mt184_p + 24, hvec3_new(f64_from(9), f64_from(40), f64_from(700)));
+var _mt184_root = kdtree_build(_mt184_p, 4);
+assert_eq(_kd_node_split_axis(_mt184_root), 0, "kdtree_build: the root splits axis 0 = x");
+assert_eq(_kd_node_split_val(_mt184_root), f64_from(5), "kdtree_build: the root plane is x = 5");
+var _mt184_left = _kd_node_left(_mt184_root);
+assert_eq(_kd_node_split_axis(_mt184_left), 1, "kdtree_build: depth 1 splits axis 1 = y");
+assert_eq(_kd_node_split_val(_mt184_left), f64_from(20), "kdtree_build: the left child's plane is y = 20, not z = 300");
 
 # And the behaviour that invariant exists to protect, against brute force.
 var kdv_bad = 0;
@@ -9936,6 +10082,16 @@ assert_eq(vec_len(quadtree_query(qt, 0, 0, f64_from(100), f64_from(100))), 400,
 # Disjoint box finds nothing.
 assert_eq(vec_len(quadtree_query(qt, f64_from(200), f64_from(200), f64_from(300), f64_from(300))), 0,
   "quadtree_query outside the domain finds nothing");
+# ⛔ 3.3.7 — NO QUERY BOX TOUCHED A NODE's EDGE. Both boxes are closed, so a query whose
+# bottom edge IS the root's top edge overlaps it, and a point stored on that edge is
+# returned. `b.ymin > a.ymax` -> `>=` pruned the root there (seed-336 mutant m0188). Only
+# nodes sharing the root's top edge can hold a point at their own ymax (y == cy routes
+# north), so the fixture puts the point on the root's top edge and the query's bottom on it.
+var _mt188_qt = quadtree_new(0, 0, f64_from(100), f64_from(100), 6);
+var _mt188_t, _mt188_v = quadtree_insert(_mt188_qt, f64_from(25), f64_from(100), 7);
+var _mt188_r = quadtree_query(_mt188_qt, 0, f64_from(100), f64_from(100), f64_from(200));
+assert_eq(vec_len(_mt188_r), 1,
+  "quadtree_query: a box whose bottom edge is the root's top edge finds the point on it");
 
 # --- octree: 8x8x8 grid over [0,80]^3 ---
 var ot = octree_new(hvec3_zero(), hvec3_new(f64_from(80), f64_from(80), f64_from(80)), 5);
@@ -10391,6 +10547,22 @@ assert(f64_gt(oi_be, f64_exp(oi_dt)) == 1, "backward Euler overshoots exp(dt), a
 # BDF2 with a consistent history is at least as accurate as backward Euler here.
 var oi_bdf = ode_bdf2(&_cv_dydt_y, 0, F64_ONE, f64_div(F64_ONE, f64_exp(oi_dt)), oi_dt, EPSILON_F64);
 assert(f64_gt(oi_bdf, F64_ONE) == 1, "bdf2 advances a growing solution");
+# ⛔ 3.3.7 — THE ONLY BDF2 CALL ABOVE HAS |z| NEAR 1, where the finite-difference step
+# EPSILON * (1 + |z|) and EPSILON / (1 + |z|) are alike, so `f64_mul` -> `f64_div` there
+# survived (seed-336 mutant m0174). A stiff step (y' = -y, dt = 3, so beta * dt = 2) from a
+# state near 1234 tells them apart: the divided step falls below half an ulp of z, the
+# difference quotient reads 0, and Newton degrades to a fixed-point iteration that
+# diverges for beta * dt * |lambda| > 1. The linear implicit equation has the closed-form
+# root z* = pred / (1 + 3 beta), pred = (4/3) y - (1/3) y_prev in the code's doubles; the
+# converged z has |g(z)| < tol, so it lies within about tol / 3 of z*; the bound asserted is
+# tol itself (1e-9).
+# [measured: scratch python3 fractions oracle (3.3.7), z* = pred / (1 + 3 * fl(2/3)) rounded]
+fn _mt174_decay(t, y) { return f64_neg(y); }
+var _mt174_y = 0x40934A4584FD0FDF;   # 1234.5678901234567
+var _mt174_tol = 0x3E112E0BE826D695;   # 1e-9
+var _mt174_z = ode_bdf2(&_mt174_decay, 0, _mt174_y, _mt174_y, f64_from(3), _mt174_tol);
+assert(f64_lt(f64_abs(f64_sub(_mt174_z, 0x4079B85CB1516A7E)), _mt174_tol) == 1,
+  "bdf2: a stiff step at |y| ~ 1234 lands on the implicit root pred / (1 + 3 beta)");
 
 # Leapfrog on the SHO from (q,v) = (1,0): one step must reduce q and drive v negative.
 var oi_lf = ode_leapfrog(&_cv_accel, F64_ONE, 0, F64_HALF);

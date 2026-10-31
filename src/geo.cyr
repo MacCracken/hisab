@@ -10,27 +10,34 @@
 # Local constants
 # ================================================================
 
-var _GEO_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
-var _GEO_F64_POS_INF = F64_POS_INF;   # alias of error.cyr
-var _GEO_F64_FOUR    = 0x4010_0000_0000_0000;  # 4.0
-# ⚠ 3.3.4 — `_GEO_F64_EPS_SQ` (1e-24, EPSILON_F64 squared) is GONE. 2.10.1 added
-# it for the two squared-length guards in _geo_sphere_roots and
-# geo_ray_capsule_branch, and 2.14.0 moved both onto `_GEO_F64_TINY` below; from
-# then on nothing in src/ read it, and its comment here still said guards did.
-# The degree audit (roadmap "Named hex thresholds") found no use to audit.
-# The smallest MAGNITUDE whose reciprocal is still finite (DBL_MIN). Anything at
-# or above this can be divided by; anything below it makes 1/x overflow. 2.10.2
-# used it as the slab method's parallel test; geo_ray_aabb_face's is an exact zero
-# since 3.3.5 and geo_ray_obb_face's since 3.3.6 (see each), which keep it only for an
-# infinite origin (or e) against a subnormal direction component.
-var _GEO_F64_TINY    = F64_TINY;   # alias of error.cyr's F64_TINY (DBL_MIN)
-# 3.3.5: below this squared length a ray direction is pre-scaled in the sphere and
-# capsule quadratics (see _geo_sphere_roots): 54 binades above the DBL_MIN at which
-# d.d itself flushes, so a direction above 2^-484 meeting unit-scale geometry keeps
-# every product normal and runs unscaled.
-var _GEO_DIR_LO      = 0x0370_0000_0000_0000;  # 2^-968 = 4.008336720017946e-292
-var _GEO_F64_THREE   = 0x4008_0000_0000_0000;  # 3.0
-var _GEO_F64_THIRD   = 0x3FD5_5555_5555_5555;  # 1.0/3.0
+# ⭐ 3.3.7 — AN ENUM, NOT `var` GLOBALS. A `var` is a memory load and a relocation at every
+# reference; an enum member is an immediate (CLAUDE.md, "Enums for constants"). The two that
+# were aliases of error.cyr's public `F64_POS_INF` and `F64_TINY` hold the same literals: an
+# enum member cannot name a `var`, and those two stay `var` (public API). The constant gate
+# reads hex enum members as it reads `var` declarations (scripts/check-constants.sh).
+enum _GeoF64 {
+    _GEO_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
+    _GEO_F64_POS_INF = 0x7FF0_0000_0000_0000;  # +Infinity
+    _GEO_F64_FOUR    = 0x4010_0000_0000_0000;  # 4.0
+    # ⚠ 3.3.4 — `_GEO_F64_EPS_SQ` (1e-24, EPSILON_F64 squared) is GONE. 2.10.1 added
+    # it for the two squared-length guards in _geo_sphere_roots and
+    # geo_ray_capsule_branch, and 2.14.0 moved both onto `_GEO_F64_TINY` below; from
+    # then on nothing in src/ read it, and its comment here still said guards did.
+    # The degree audit (roadmap "Named hex thresholds") found no use to audit.
+    # The smallest MAGNITUDE whose reciprocal is still finite (DBL_MIN). Anything at
+    # or above this can be divided by; anything below it makes 1/x overflow. 2.10.2
+    # used it as the slab method's parallel test; geo_ray_aabb_face's is an exact zero
+    # since 3.3.5 and geo_ray_obb_face's since 3.3.6 (see each), which keep it only for an
+    # infinite origin (or e) against a subnormal direction component.
+    _GEO_F64_TINY    = 0x0010_0000_0000_0000;  # 2.2250738585072014e-308 (DBL_MIN)
+    # 3.3.5: below this squared length a ray direction is pre-scaled in the sphere and
+    # capsule quadratics (see _geo_sphere_roots): 54 binades above the DBL_MIN at which
+    # d.d itself flushes, so a direction above 2^-484 meeting unit-scale geometry keeps
+    # every product normal and runs unscaled.
+    _GEO_DIR_LO      = 0x0370_0000_0000_0000;  # 2^-968 = 4.008336720017946e-292
+    _GEO_F64_THREE   = 0x4008_0000_0000_0000;  # 3.0
+    _GEO_F64_THIRD   = 0x3FD5_5555_5555_5555;  # 1.0/3.0
+}
 
 # ================================================================
 # Power-of-two pre-scaling (3.3.4)
@@ -892,6 +899,59 @@ fn _geo_sphere_c_exact(oc, r) {
     return f64_add(sm, f64_add(load64(&er), tail));
 }
 
+# _geo_sphere_c_exact(oc, r) followed by _geo_c_lo with o - c's rounding (_geo_oc_lo, h = 1),
+# the same operations in the same order without their thirteen calls and five stack arrays: c
+# for an origin near a sphere's surface (_geo_sphere_roots_full).
+# ⭐ 3.3.7 — WRITTEN OUT FOR COST, BIT FOR BIT: an origin 1.78e-6 radii outside a unit sphere
+# 228 -> 208 ns (3.3.6 191, 3.3.5 57; the rest is the exact c the 3.3.6 and 3.3.7 repairs
+# form), and 40,000 rays from origins 2^-59 to 1 radii off spheres of radius 2^-600 to 2^600
+# give the same bits.
+# [measured: tests/hisab.bcyr ray_sphere_near_surface, 4-tree A/B; scratch pfb/rsweep.cyr; 2026-10-31]
+fn _geo_sphere_c_fused(o, cen, oc, r) {
+    var x = HVec3_x(oc);
+    var y = HVec3_y(oc);
+    var z = HVec3_z(oc);
+    var sp = f64_mul(x, 0x41A0_0000_0200_0000);   # 2^27 + 1
+    var hi = f64_sub(sp, f64_sub(sp, x));
+    var lo = f64_sub(x, hi);
+    var px = f64_mul(x, x);
+    var pxl = f64_add(f64_add(f64_sub(f64_mul(hi, hi), px), f64_mul(F64_TWO, f64_mul(hi, lo))), f64_mul(lo, lo));
+    sp = f64_mul(y, 0x41A0_0000_0200_0000);
+    hi = f64_sub(sp, f64_sub(sp, y));
+    lo = f64_sub(y, hi);
+    var py = f64_mul(y, y);
+    var pyl = f64_add(f64_add(f64_sub(f64_mul(hi, hi), py), f64_mul(F64_TWO, f64_mul(hi, lo))), f64_mul(lo, lo));
+    sp = f64_mul(z, 0x41A0_0000_0200_0000);
+    hi = f64_sub(sp, f64_sub(sp, z));
+    lo = f64_sub(z, hi);
+    var pz = f64_mul(z, z);
+    var pzl = f64_add(f64_add(f64_sub(f64_mul(hi, hi), pz), f64_mul(F64_TWO, f64_mul(hi, lo))), f64_mul(lo, lo));
+    sp = f64_mul(r, 0x41A0_0000_0200_0000);
+    hi = f64_sub(sp, f64_sub(sp, r));
+    lo = f64_sub(r, hi);
+    var pr = f64_mul(r, r);
+    var prl = f64_add(f64_add(f64_sub(f64_mul(hi, hi), pr), f64_mul(F64_TWO, f64_mul(hi, lo))), f64_mul(lo, lo));
+    var sm = f64_add(px, py);
+    var bb = f64_sub(sm, px);
+    var er = f64_add(0, f64_add(f64_sub(px, f64_sub(sm, bb)), f64_sub(py, bb)));
+    var s2 = f64_add(sm, pz);
+    bb = f64_sub(s2, sm);
+    er = f64_add(er, f64_add(f64_sub(sm, f64_sub(s2, bb)), f64_sub(pz, bb)));
+    var npr = f64_neg(pr);
+    var s3 = f64_add(s2, npr);
+    bb = f64_sub(s3, s2);
+    er = f64_add(er, f64_add(f64_sub(s2, f64_sub(s3, bb)), f64_sub(npr, bb)));
+    var c = f64_add(s3, f64_add(er, f64_add(f64_add(pxl, pyl), f64_sub(pzl, prl))));
+    var lov[24];
+    bb = f64_sub(x, HVec3_x(o));
+    store64(&lov, f64_add(f64_sub(HVec3_x(o), f64_sub(x, bb)), f64_sub(f64_neg(HVec3_x(cen)), bb)));
+    bb = f64_sub(y, HVec3_y(o));
+    store64(&lov + 8, f64_add(f64_sub(HVec3_y(o), f64_sub(y, bb)), f64_sub(f64_neg(HVec3_y(cen)), bb)));
+    bb = f64_sub(z, HVec3_z(o));
+    store64(&lov + 16, f64_add(f64_sub(HVec3_z(o), f64_sub(z, bb)), f64_sub(f64_neg(HVec3_z(cen)), bb)));
+    return f64_add(c, f64_mul(F64_TWO, hvec3_dot(oc, &lov)));
+}
+
 # x * y as an unevaluated sum p[0] + p[1], exactly (Dekker's two-product, the split
 # _geo_two_sq uses), for |x| and |y| below 2^995 and a product clear of the subnormals.
 fn _geo_two_prod(x, y, p) {
@@ -906,6 +966,14 @@ fn _geo_two_prod(x, y, p) {
     store64(p, pr);
     store64(p + 8, f64_add(e, f64_mul(xl, yl)));
     return 0;
+}
+
+# The rounding error of s = fl(a - b), exactly: a - b = s + the return (Knuth's two-sum),
+# for finite a and b whose difference does not overflow.
+fn _geo_diff_err(a, b, s) {
+    var nb = f64_neg(b);
+    var bb = f64_sub(s, a);
+    return f64_add(f64_sub(a, f64_sub(s, bb)), f64_sub(nb, bb));
 }
 
 # a b - c d with both products exact (_geo_two_prod) and their difference summed with
@@ -955,6 +1023,38 @@ fn _geo_perp_part(v, w, out) {
     return 0;
 }
 
+# The rounding of oc = h o - h c (h = 1, or 1/2 where o - c overflowed) into lo, so that
+# h (o - c) = oc + lo exactly (3.3.7). o and c finite; a halved subnormal component's last
+# bit, below 2^-2098 of the largest, is not carried.
+fn _geo_oc_lo(o, c, h, oc, lo) {
+    if (h == F64_ONE) {
+        store64(lo, _geo_diff_err(HVec3_x(o), HVec3_x(c), HVec3_x(oc)));
+        store64(lo + 8, _geo_diff_err(HVec3_y(o), HVec3_y(c), HVec3_y(oc)));
+        store64(lo + 16, _geo_diff_err(HVec3_z(o), HVec3_z(c), HVec3_z(oc)));
+        return 0;
+    }
+    store64(lo, _geo_diff_err(f64_mul(HVec3_x(o), h), f64_mul(HVec3_x(c), h), HVec3_x(oc)));
+    store64(lo + 8, _geo_diff_err(f64_mul(HVec3_y(o), h), f64_mul(HVec3_y(c), h), HVec3_y(oc)));
+    store64(lo + 16, _geo_diff_err(f64_mul(HVec3_z(o), h), f64_mul(HVec3_z(c), h), HVec3_z(oc)));
+    return 0;
+}
+
+# c = |oc|^2 - r^2 (formed exactly from the rounded oc) corrected to |oc + lo|^2 - r^2, lo
+# being oc's rounding: + 2 oc . lo, with |lo|^2 below 2^-104 of |oc|^2 and dropped (3.3.7).
+fn _geo_c_lo(c, oc, lo) {
+    return f64_add(c, f64_mul(F64_TWO, hvec3_dot(oc, lo)));
+}
+
+# f + lo's part across the line of w, into f (3.3.7): f being v's part (_geo_perp_part) and
+# lo the rounding of v, |lo| at most 2^-53 |v|, so its plain projection is enough.
+fn _geo_add_perp(f, lo, w) {
+    var k = f64_div(hvec3_dot(lo, w), hvec3_dot(w, w));
+    store64(f, f64_add(HVec3_x(f), f64_sub(HVec3_x(lo), f64_mul(k, HVec3_x(w)))));
+    store64(f + 8, f64_add(HVec3_y(f), f64_sub(HVec3_y(lo), f64_mul(k, HVec3_y(w)))));
+    store64(f + 16, f64_add(HVec3_z(f), f64_sub(HVec3_z(lo), f64_mul(k, HVec3_z(w)))));
+    return 0;
+}
+
 # 1 when the radius r is under 2^-4 of v's largest component, by exponent (3.3.6): the
 # capsule's test, where a square overflowed, for taking both perpendicular parts exactly
 # (geo_ray_capsule_branch). Through round 2 an overflowed square sent every ray at that
@@ -993,6 +1093,148 @@ fn _geo_perp_rescue(v, u, out) {
     return (sv >> 52) - 1023;
 }
 
+# The roundings of the capsule's two differences (3.3.7): aol with h (o - start) = ao + aol
+# exactly (h = 1/2 when oh = 1), and ul with usa h' (end - start) = u + ul exactly, u being
+# usa times the axis formed from the ends (halved first, h' = 1/2, when uh = 1). Finite
+# input; a halved subnormal component's last bit is not carried.
+fn _geo_cap_lows(ray, capsule, ao, oh, u, usa, uh, aol, ul) {
+    _geo_oc_lo(GeoRay_origin(ray), GeoCapsule_start(capsule), _geo_pow2(0 - oh), ao, aol);
+    if (usa == F64_ONE) {
+        if (uh == 0) {
+            _geo_oc_lo(GeoCapsule_end(capsule), GeoCapsule_start(capsule), F64_ONE, u, ul);
+            return 0;
+        }
+    }
+    var abh = hvec3_scale(u, f64_div(F64_ONE, usa));
+    _geo_oc_lo(GeoCapsule_end(capsule), GeoCapsule_start(capsule), _geo_pow2(0 - uh), abh, ul);
+    store64(ul, f64_mul(HVec3_x(ul), usa));
+    store64(ul + 8, f64_mul(HVec3_y(ul), usa));
+    store64(ul + 16, f64_mul(HVec3_z(ul), usa));
+    return 0;
+}
+
+# The offset of the ray's line from the capsule's axis line, as a vector across both (along
+# n = u x d) whose length is |(ao + aol) . (u + ul) x d| / |n| (3.3.7), written to out times
+# 2^e. The barrel's solver takes it (bx, _geo_sph_solve) where its own offset, formed from
+# o_perp and d_perp each rounded, may be their rounding: an origin far from a thin barrel. The
+# triple product is formed from the inputs, with n's components exact as two-term sums
+# (_geo_two_prod) and ao's rounding carried, to about 2^-104 of |ao| (exactly enough for a
+# ray along a coordinate axis, whose n has a zero component). bx holds ray, capsule, ao, oh,
+# u, usa, uh and e. 0 when an input is not finite or n is 0 (the caller keeps its own).
+fn _geo_cap_axis_offset(bx, out) {
+    var ray = load64(bx);
+    var capsule = load64(bx + 8);
+    var ao = load64(bx + 16);
+    var u = load64(bx + 32);
+    var d = GeoRay_direction(ray);
+    if (_geo_hvec3_nonfinite(ao) + _geo_hvec3_nonfinite(u) + _geo_hvec3_nonfinite(d) != 0) { return 0; }
+    var aol[24];
+    var ul[24];
+    _geo_cap_lows(ray, capsule, ao, load64(bx + 24), u, load64(bx + 40), load64(bx + 48), &aol, &ul);
+    if (_geo_hvec3_nonfinite(&aol) + _geo_hvec3_nonfinite(&ul) != 0) { return 0; }
+    var sa = _geo_scale_for(_geo_absmax_bits(ao) >> 52);
+    var su = _geo_scale_for(_geo_absmax_bits(u) >> 52);
+    var ds = hvec3_scale(d, _geo_scale_for(_geo_absmax_bits(d) >> 52));
+    var a2 = hvec3_scale(ao, sa);
+    var al = hvec3_scale(&aol, sa);
+    var u2 = hvec3_scale(u, su);
+    var ul2 = hvec3_scale(&ul, su);
+    var nh[24];
+    var nl[24];
+    var p1[16];
+    var p2[16];
+    var er[8];
+    for (var i = 0; i < 3; i = i + 1) {
+        var j = (i + 1) % 3;
+        var k = (i + 2) % 3;
+        _geo_two_prod(load64(u2 + j * 8), load64(ds + k * 8), &p1);
+        _geo_two_prod(load64(u2 + k * 8), load64(ds + j * 8), &p2);
+        store64(&er, 0);
+        var sm = _geo_two_sum(load64(&p1), f64_neg(load64(&p2)), &er);
+        var lo = f64_add(load64(&er), f64_sub(load64(&p1 + 8), load64(&p2 + 8)));
+        lo = f64_add(lo, f64_sub(f64_mul(load64(ul2 + j * 8), load64(ds + k * 8)),
+            f64_mul(load64(ul2 + k * 8), load64(ds + j * 8))));
+        store64(&nh + i * 8, sm);
+        store64(&nl + i * 8, lo);
+    }
+    var nn = hvec3_dot(&nh, &nh);
+    if (f64_eq(nn, 0) == 1) { return 0; }
+    store64(&er, 0);
+    var tail = 0;
+    var dt = 0;
+    for (var i2 = 0; i2 < 3; i2 = i2 + 1) {
+        _geo_two_prod(load64(a2 + i2 * 8), load64(&nh + i2 * 8), &p1);
+        dt = _geo_two_sum(dt, load64(&p1), &er);
+        tail = f64_add(tail, f64_add(load64(&p1 + 8), f64_add(f64_mul(load64(a2 + i2 * 8), load64(&nl + i2 * 8)),
+              f64_mul(load64(al + i2 * 8), load64(&nh + i2 * 8)))));
+    }
+    dt = f64_add(dt, f64_add(load64(&er), tail));
+    var q = f64_div(dt, nn);
+    var e = load64(bx + 56) - ((sa >> 52) - 1023);
+    store64(out, _geo_ldexp(f64_mul(HVec3_x(&nh), q), e));
+    store64(out + 8, _geo_ldexp(f64_mul(HVec3_y(&nh), q), e));
+    store64(out + 16, _geo_ldexp(f64_mul(HVec3_z(&nh), q), e));
+    return 1;
+}
+
+# The part of ao + aol (o - start exactly, as a value and its rounding) across the axis u,
+# into out: (ao + aol) - u opar with each product u_i opar exact (_geo_two_prod), then the
+# part along u that opar's own rounding left, removed by one more projection.
+fn _geo_perp_comp(ao, aol, u, ul, uu, opar, out) {
+    var pp[16];
+    _geo_two_prod(HVec3_x(u), opar, &pp);
+    var x = f64_add(f64_sub(HVec3_x(ao), load64(&pp)),
+      f64_sub(HVec3_x(aol), f64_add(load64(&pp + 8), f64_mul(HVec3_x(ul), opar))));
+    _geo_two_prod(HVec3_y(u), opar, &pp);
+    var y = f64_add(f64_sub(HVec3_y(ao), load64(&pp)),
+      f64_sub(HVec3_y(aol), f64_add(load64(&pp + 8), f64_mul(HVec3_y(ul), opar))));
+    _geo_two_prod(HVec3_z(u), opar, &pp);
+    var z = f64_add(f64_sub(HVec3_z(ao), load64(&pp)),
+      f64_sub(HVec3_z(aol), f64_add(load64(&pp + 8), f64_mul(HVec3_z(ul), opar))));
+    var k = f64_div(f64_add(f64_add(f64_mul(x, HVec3_x(u)), f64_mul(y, HVec3_y(u))), f64_mul(z, HVec3_z(u))), uu);
+    store64(out, f64_sub(x, f64_mul(HVec3_x(u), k)));
+    store64(out + 8, f64_sub(y, f64_mul(HVec3_y(u), k)));
+    store64(out + 16, f64_sub(z, f64_mul(HVec3_z(u), k)));
+    return 0;
+}
+
+# _geo_cap_lows then _geo_perp_comp for the common case (u = ab = end - start itself, nothing
+# halved), fused into one loop: the same operations in the same order, so the same bits, without
+# the eleven calls between them (3.3.7: they were most of the compensation's cost).
+fn _geo_perp_comp1(o, st, en, ao, u, uu, opar, out) {
+    var sy = f64_mul(opar, 0x41A0_0000_0200_0000);   # 2^27 + 1
+    var yh = f64_sub(sy, f64_sub(sy, opar));
+    var yl = f64_sub(opar, yh);
+    var xv[24];
+    for (var i = 0; i < 3; i = i + 1) {
+        var oi = load64(o + i * 8);
+        var si = load64(st + i * 8);
+        var ai = load64(ao + i * 8);
+        var ui = load64(u + i * 8);
+        var ei = load64(en + i * 8);
+        var nb = f64_neg(si);
+        var bb = f64_sub(ai, oi);
+        var aol = f64_add(f64_sub(oi, f64_sub(ai, bb)), f64_sub(nb, bb));
+        var bb2 = f64_sub(ui, ei);
+        var ul = f64_add(f64_sub(ei, f64_sub(ui, bb2)), f64_sub(nb, bb2));
+        var sx = f64_mul(ui, 0x41A0_0000_0200_0000);
+        var xh = f64_sub(sx, f64_sub(sx, ui));
+        var xl = f64_sub(ui, xh);
+        var pr = f64_mul(ui, opar);
+        var e = f64_add(f64_add(f64_sub(f64_mul(xh, yh), pr), f64_mul(xh, yl)), f64_mul(xl, yh));
+        e = f64_add(e, f64_mul(xl, yl));
+        store64(&xv + i * 8, f64_add(f64_sub(ai, pr), f64_sub(aol, f64_add(e, f64_mul(ul, opar)))));
+    }
+    var x = load64(&xv);
+    var y = load64(&xv + 8);
+    var z = load64(&xv + 16);
+    var k = f64_div(f64_add(f64_add(f64_mul(x, HVec3_x(u)), f64_mul(y, HVec3_y(u))), f64_mul(z, HVec3_z(u))), uu);
+    store64(out, f64_sub(x, f64_mul(HVec3_x(u), k)));
+    store64(out + 8, f64_sub(y, f64_mul(HVec3_y(u), k)));
+    store64(out + 16, f64_sub(z, f64_mul(HVec3_z(u), k)));
+    return 0;
+}
+
 # 1 when the ray's and the sphere's ten inputs are finite (_geo_hvec3_nonfinite).
 fn _geo_sphere_finite(ray, sphere) {
     if (_geo_hvec3_nonfinite(GeoRay_origin(ray)) == 1) { return 0; }
@@ -1006,8 +1248,19 @@ fn _geo_sphere_finite(ray, sphere) {
 # their largest in [1, 2) or below, dsc with its largest component in [1, 2). The sphere's
 # copy (_geo_sphere_roots_scaled) and the capsule barrel's (geo_ray_capsule_branch) are
 # solved here, in the form _geo_sphere_roots uses, so nothing in it can overflow; 0 when
-# there is no root or dsc is zero.
-fn _geo_sph_solve(ocs, dsc, rs, out) {
+# there is no root or dsc is zero. 3.3.7: lo, when not 0, is ocs's rounding (the sphere's
+# o - c, at the copy's scale), carried into c and the offset f where those are formed
+# exactly; bx, when not 0, is the barrel's (_geo_cap_axis_offset), which forms its offset f
+# from the inputs where the one formed here may be o_perp's and d_perp's rounding.
+# ⛔ 3.3.7 — THE CLASSIC DISCRIMINANT WAS REFUSED BELOW 2^-968, AND ITS STAND-IN CANCELLED. For
+# an origin just outside or inside a huge sphere moving along its surface, hb^2 - a c is a
+# normal 2^-1013 at the copy's scale while r^2 - |f|^2 cancels to its rounding: the radius
+# -DBL_MAX sphere at (-4.40, DBL_MAX, 3.28) from (1.01, -0.32, 4.67) along (-0.30, -0, 0.52),
+# a miss 0.32 below its surface, read a hit at 2.45 once c carried o - c's rounding (3.3.6
+# read the contact 0, by its rounding). A normal hb^2 - a c is formed from products whose
+# underflow costs at most 2^-1074, an ulp of it, so it is used down to DBL_MIN.
+# [measured: rt337 special-value sweep (nonfin.py, seed 1201), exact roots, 3.3.6 vs this tree, 2026-10-31]
+fn _geo_sph_solve(ocs, dsc, rs, lo, bx, out) {
     var a = hvec3_dot(dsc, dsc);
     if (f64_eq(a, 0) == 1) { return 0; }
     var hb = hvec3_dot(ocs, dsc);
@@ -1016,6 +1269,7 @@ fn _geo_sph_solve(ocs, dsc, rs, out) {
     var c = f64_sub(ococ, rr);
     if ((c & 0x7FFF_FFFF_FFFF_FFFF) < (ococ & 0x7FFF_FFFF_FFFF_FFFF) - 0x0020_0000_0000_0000) {
         c = _geo_sphere_c_exact(ocs, rs);
+        if (lo != 0) { c = _geo_c_lo(c, ocs, lo); }
     }
     var k = f64_div(hb, a);
     var fv[24];
@@ -1026,7 +1280,12 @@ fn _geo_sph_solve(ocs, dsc, rs, out) {
     var pn = f64_lt(rr, f64_mul(ococ, 0x3DF0_0000_0000_0000));   # 2^-32
     if (pn == 1) { pn = f64_lt(ff, f64_mul(ococ, 0x3AF0_0000_0000_0000)); }   # 2^-80
     if (pn == 1) {
-        _geo_perp_part(ocs, dsc, &fv);
+        var bxo = 0;
+        if (bx != 0) { bxo = _geo_cap_axis_offset(bx, &fv); }
+        if (bxo == 0) {
+            _geo_perp_part(ocs, dsc, &fv);
+            if (lo != 0) { _geo_add_perp(&fv, lo, dsc); }
+        }
         ff = hvec3_dot(&fv, &fv);
     }
     var delta = f64_sub(rr, ff);
@@ -1034,7 +1293,7 @@ fn _geo_sph_solve(ocs, dsc, rs, out) {
     var dsel = 0;
     if (f64_lt(c, ff) == 1) {
         var dc = f64_sub(f64_mul(hb, hb), f64_mul(a, c));
-        if (f64_lt(f64_abs(dc), _GEO_DIR_LO) == 0) {
+        if (f64_lt(f64_abs(dc), _GEO_F64_TINY) == 0) {
             delta = dc;
             sq = f64_sqrt(dc);
             dsel = 1;
@@ -1050,6 +1309,69 @@ fn _geo_sph_solve(ocs, dsc, rs, out) {
         }
     }
     return _geo_quad_roots(hb, a, c, delta, sq, out);
+}
+
+# _geo_sph_solve for a barrel whose o_perp, r and d_perp have their largest components between
+# 2^-100 and 2^100, written out without the copies at unit size (3.3.7): its operations in its
+# order, and powers of two being exact, the bits of the scaled solve multiplied back. It runs only
+# where that routine takes its plain branches, and hands back 2 (the caller then solves the scaled
+# copy) where c cancelled, the offset may be its rounding, or the discriminant is under 2^-600
+# (dc) or 2^-700 (r^2 - |f|^2): thresholds that, moved by at most 2^400 or 2^200 to the copy's
+# scale, still clear its DBL_MIN and 2^-968. 1 with the two roots in out, sorted; 0 for no root.
+# Handing back always (the scaled copy for every barrel) changes none of 101,000 rays: the
+# review's five capsule families, the lane's thirteen and 20,000 special-value rays. It saves the
+# copies' two scalings and multiplications back.
+# [measured: rt2 mutant M47 (always hand back) vs this tree, rt2e/evalcap.py and rtp families, 2026-10-31]
+fn _geo_barrel_fast(op, dp, rb, out) {
+    var mp = _geo_absmax_bits(op);
+    var mr = rb & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > mp) { mp = mr; }
+    var md = _geo_absmax_bits(dp);
+    if ((mp >> 52) < 923 || (mp >> 52) > 1123 || (md >> 52) < 923 || (md >> 52) > 1123) { return 2; }
+    var ox = HVec3_x(op);
+    var oy = HVec3_y(op);
+    var oz = HVec3_z(op);
+    var dx = HVec3_x(dp);
+    var dy = HVec3_y(dp);
+    var dz = HVec3_z(dp);
+    var a = f64_add(f64_add(f64_mul(dx, dx), f64_mul(dy, dy)), f64_mul(dz, dz));
+    var hb = f64_add(f64_add(f64_mul(ox, dx), f64_mul(oy, dy)), f64_mul(oz, dz));
+    var rr = f64_mul(rb, rb);
+    var ococ = f64_add(f64_add(f64_mul(ox, ox), f64_mul(oy, oy)), f64_mul(oz, oz));
+    var c = f64_sub(ococ, rr);
+    if ((c & 0x7FFF_FFFF_FFFF_FFFF) < (ococ & 0x7FFF_FFFF_FFFF_FFFF) - 0x0020_0000_0000_0000) { return 2; }
+    var k = f64_div(hb, a);
+    var fx = f64_sub(ox, f64_mul(k, dx));
+    var fy = f64_sub(oy, f64_mul(k, dy));
+    var fz = f64_sub(oz, f64_mul(k, dz));
+    var ff = f64_add(f64_add(f64_mul(fx, fx), f64_mul(fy, fy)), f64_mul(fz, fz));
+    if (f64_lt(rr, f64_mul(ococ, 0x3DF0_0000_0000_0000)) == 1) {   # 2^-32
+        if (f64_lt(ff, f64_mul(ococ, 0x3AF0_0000_0000_0000)) == 1) { return 2; }   # 2^-80
+    }
+    var sq = 0;
+    if (f64_lt(c, ff) == 1) {
+        var dc = f64_sub(f64_mul(hb, hb), f64_mul(a, c));
+        if (f64_lt(f64_abs(dc), 0x1A70_0000_0000_0000) == 1) { return 2; }   # 2^-600
+        if (f64_lt(dc, 0) == 1) { return 0; }
+        sq = f64_sqrt(dc);
+    } else {
+        var delta = f64_sub(rr, ff);
+        if (f64_lt(f64_abs(delta), 0x1430_0000_0000_0000) == 1) { return 2; }   # 2^-700
+        if (f64_lt(delta, 0) == 1) { return 0; }
+        sq = f64_sqrt(f64_mul(a, delta));
+    }
+    var q = f64_neg(f64_add(hb, sq));
+    if (f64_lt(hb, 0) == 1) { q = f64_sub(sq, hb); }
+    var t1 = f64_div(q, a);
+    var t2 = f64_div(c, q);
+    if (f64_gt(t1, t2) == 1) {
+        var tt = t1;
+        t1 = t2;
+        t2 = tt;
+    }
+    store64(out, t1);
+    store64(out + 8, t2);
+    return 1;
 }
 
 # _geo_sphere_roots for finite input whose quadratic overflowed (3.3.6): the same
@@ -1071,12 +1393,14 @@ fn _geo_sphere_roots_scaled(ray, sphere, out) {
     store64(&oc, f64_sub(HVec3_x(o), HVec3_x(cen)));
     store64(&oc + 8, f64_sub(HVec3_y(o), HVec3_y(cen)));
     store64(&oc + 16, f64_sub(HVec3_z(o), HVec3_z(cen)));
+    var ohf = F64_ONE;
     if (_geo_hvec3_nonfinite(&oc) == 1) {
         store64(&oc, f64_sub(f64_mul(HVec3_x(o), F64_HALF), f64_mul(HVec3_x(cen), F64_HALF)));
         store64(&oc + 8, f64_sub(f64_mul(HVec3_y(o), F64_HALF), f64_mul(HVec3_y(cen), F64_HALF)));
         store64(&oc + 16, f64_sub(f64_mul(HVec3_z(o), F64_HALF), f64_mul(HVec3_z(cen), F64_HALF)));
         r = f64_mul(r, F64_HALF);
         h = 1;
+        ohf = F64_HALF;
     }
     var mp = _geo_absmax_bits(&oc);
     var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
@@ -1092,7 +1416,12 @@ fn _geo_sphere_roots_scaled(ray, sphere, out) {
     store64(&dsc + 8, f64_mul(HVec3_y(d), sd));
     store64(&dsc + 16, f64_mul(HVec3_z(d), sd));
     var rs = f64_mul(r, sp);
-    if (_geo_sph_solve(&ocs, &dsc, rs, out) == 0) { return 0; }
+    var los[24];   # o - c's rounding (3.3.7, see _geo_sphere_roots_full), at the copy's scale
+    _geo_oc_lo(o, cen, ohf, &oc, &los);
+    store64(&los, f64_mul(load64(&los), sp));
+    store64(&los + 8, f64_mul(load64(&los + 8), sp));
+    store64(&los + 16, f64_mul(load64(&los + 16), sp));
+    if (_geo_sph_solve(&ocs, &dsc, rs, &los, 0, out) == 0) { return 0; }
     var e = (sd >> 52) - (sp >> 52) + h;
     store64(out, _geo_root_ldexp(load64(out), e));
     store64(out + 8, _geo_root_ldexp(load64(out + 8), e));
@@ -1272,7 +1601,7 @@ fn _geo_sphere_roots_full(ray, sphere, out) {
         store64(&ocv, ox);
         store64(&ocv + 8, oy);
         store64(&ocv + 16, oz);
-        c = _geo_sphere_c_exact(&ocv, r);
+        c = _geo_sphere_c_fused(o, cen, &ocv, r);
     }
     # f under 2^-40 of |oc| may be the rounding of oc - (hb / a) d along d, not the
     # offset, and _geo_perp_part forms it without that subtraction. For a ray along z
@@ -1300,6 +1629,13 @@ fn _geo_sphere_roots_full(ray, sphere, out) {
         store64(&ocv + 8, oy);
         store64(&ocv + 16, oz);
         _geo_perp_part(&ocv, &d2, &fv);
+        # ⛔ 3.3.7 — THE OFFSET OF A ROUNDED oc. An origin under half an ulp of a centre's
+        # coordinates has o - c = -c exactly, and a ray aimed along c then passes through the
+        # centre: a unit sphere at (1.5, 1.25, 0) 2^100 from (0, 2^40, 0) along that centre read
+        # t = 1 for a miss 2^40 wide. lo, o - c's rounding, has its own part across d added.
+        var lo2[24];
+        _geo_oc_lo(o, cen, F64_ONE, &ocv, &lo2);
+        _geo_add_perp(&fv, &lo2, &d2);
         fx = load64(&fv);
         fy = load64(&fv + 8);
         fz = load64(&fv + 16);
@@ -1350,7 +1686,7 @@ fn _geo_sphere_roots_full(ray, sphere, out) {
 # operation for operation, so the bits are its bits; every other ray is handed to it
 # (3.3.6). Written apart because cycc keeps five locals in registers, and with the general
 # routine's other cases in the same body the common ray's locals were spilled.
-# ⚠ The two copies must not drift: tests/modules_b.tcyr compares them word for word over
+# ⚠ The two copies must not drift: tests/modules_c.tcyr compares them word for word over
 # rays that take each of the hand-offs below and rays that take none.
 fn _geo_sphere_roots(ray, sphere, out) {
     var o = GeoRay_origin(ray);
@@ -2653,6 +2989,58 @@ fn _geo_cap_far_accepts(ray, sph, u, o_dot, oce, is_end, root_i) {
     return _geo_cap_accepts(_geo_ldexp(t2, oce), o_dot, hvec3_dot(GeoRay_direction(r2), u), is_end);
 }
 
+# The cap's half-space test for root root_i of its sphere, from where that root lies rather
+# than from o_dot + t d_dot (3.3.7): with f the offset of the cap's centre from the ray's line
+# (_geo_perp_part on unit-size copies, o - cap's rounding carried), the root's point is
+# cap + f -+ h d / |d|, h = sqrt(r^2 - |f|^2), so its side is f . u -+ h (d . u) / |d|. For an
+# origin far from a small cap, o_dot and t d_dot agree in all their bits and their sum is
+# their rounding; f is formed to about 2^-104 of |o - cap| (exactly for a ray along a
+# coordinate axis). 1 or 0 as _geo_cap_accepts; -1 when an input is not finite.
+fn _geo_cap_side_exact(ray, cap_pt, r, u, root_i, is_end) {
+    var o = GeoRay_origin(ray);
+    var d = GeoRay_direction(ray);
+    var csx[16];
+    store64(&csx, cap_pt);
+    store64(&csx + 8, r);
+    if (_geo_sphere_finite(ray, &csx) == 0 || _geo_hvec3_nonfinite(u) == 1) { return 0 - 1; }
+    var oc[24];
+    store64(&oc, f64_sub(HVec3_x(o), HVec3_x(cap_pt)));
+    store64(&oc + 8, f64_sub(HVec3_y(o), HVec3_y(cap_pt)));
+    store64(&oc + 16, f64_sub(HVec3_z(o), HVec3_z(cap_pt)));
+    if (_geo_hvec3_nonfinite(&oc) == 1) { return 0 - 1; }
+    var lo[24];
+    _geo_oc_lo(o, cap_pt, F64_ONE, &oc, &lo);
+    var mp = _geo_absmax_bits(&oc);
+    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > mp) { mp = mr; }
+    var sp = _geo_scale_for(mp >> 52);
+    var ds = hvec3_scale(d, _geo_scale_for(_geo_absmax_bits(d) >> 52));
+    var f[24];
+    _geo_perp_part(hvec3_scale(&oc, sp), ds, &f);
+    _geo_add_perp(&f, hvec3_scale(&lo, sp), ds);
+    # f and r at their own scale (as _geo_delta_fine takes them): a cap far below |o - cap|
+    # flushes in the copy above. The side's sign does not depend on the power of two.
+    var rs = f64_mul(r, sp);
+    var mf = _geo_absmax_bits(&f);
+    var mr2 = rs & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr2 > mf) { mf = mr2; }
+    var s2 = _geo_scale_for(mf >> 52);
+    var fs = hvec3_scale(&f, s2);
+    rs = f64_mul(rs, s2);
+    var hh = f64_sub(f64_mul(rs, rs), hvec3_dot(fs, fs));
+    if (f64_lt(hh, 0) == 1) { hh = 0; }
+    var h = f64_div(f64_sqrt(hh), hvec3_length(ds));
+    var du = f64_mul(h, hvec3_dot(ds, u));
+    if (root_i == 0) { du = f64_neg(du); }
+    var side = f64_add(hvec3_dot(fs, u), du);
+    if (is_end == 1) {
+        if (f64_lt(side, 0) == 1) { return 0; }
+        return 1;
+    }
+    if (f64_gt(side, 0) == 1) { return 0; }
+    return 1;
+}
+
 # Ray-capsule intersection
 # 1 when root `t` is a real hit on the cap whose plane term is (o_dot, d_dot).
 # A cap owns the half-space on its own side of the capsule's end plane: the START
@@ -2739,6 +3127,147 @@ fn _geo_capsule_tiny(ray, capsule, tv) {
     return (sd >> 52) - (sp >> 52);
 }
 
+# A capsule far from the ray's origin against its own size (3.3.7): |o - start| more than 2^30
+# times its length and radius. The ray is moved, in exact terms, to where it passes the
+# start: the start's offset from the ray's line, w = (o - start) minus its part along d, is
+# formed with exact cross products and o - start's rounding carried (_geo_perp_part,
+# _geo_oc_lo), and the capsule is solved from K = 8 (|ab| + r) (largest components) before
+# that point, on a copy at the capsule's own size with its start at 0. The answer is
+# t0 - K / |d| + the copy's t, t0 = -(o - start) . d / d . d being the closest approach.
+# Formed from o + t d instead, every quantity the barrel, the caps and the segment test read
+# is its own rounding, about 2^-53 |o - start|, which is more than the capsule. Returns
+# NaN(0x7FF8_0000_0000_0001) when an input is not finite or d is zero (the caller goes on).
+fn _geo_capsule_far(ray, capsule, ao, ab, out) {
+    var o = GeoRay_origin(ray);
+    var d = GeoRay_direction(ray);
+    var st = GeoCapsule_start(capsule);
+    var r = GeoCapsule_radius(capsule);
+    var nf = _geo_hvec3_nonfinite(o) + _geo_hvec3_nonfinite(d) + _geo_hvec3_nonfinite(st);
+    nf = nf + _geo_hvec3_nonfinite(GeoCapsule_end(capsule)) + _geo_hvec3_nonfinite(ab) + _geo_hvec3_nonfinite(ao);
+    if (f64_lt(f64_abs(r), _GEO_F64_POS_INF) == 0) { nf = nf + 1; }
+    var md = _geo_absmax_bits(d);
+    if (nf != 0 || md == 0) { return 0x7FF8_0000_0000_0001; }
+    var lo[24];
+    _geo_oc_lo(o, st, F64_ONE, ao, &lo);
+    var sw = _geo_scale_for(_geo_absmax_bits(ao) >> 52);
+    var sd = _geo_scale_for(md >> 52);
+    var ds = hvec3_scale(d, sd);
+    var ws = hvec3_scale(ao, sw);
+    var wp[24];
+    _geo_perp_part(ws, ds, &wp);
+    _geo_add_perp(&wp, hvec3_scale(&lo, sw), ds);
+    var ew = 0 - ((sw >> 52) - 1023);    # wp is 2^-ew times the world offset
+    var ed = (sd >> 52) - 1023;
+    var w0 = hvec3_new(_geo_ldexp(HVec3_x(&wp), ew), _geo_ldexp(HVec3_y(&wp), ew), _geo_ldexp(HVec3_z(&wp), ew));
+    var ext = f64_add(_geo_absmax_bits(ab), f64_abs(r));
+    if (f64_gt(_geo_absmax_bits(w0), f64_mul(F64_TWO, ext)) == 1) { return 0; }   # passes outside it
+    var dd = hvec3_dot(ds, ds);
+    var t0 = _geo_ldexp(f64_div(f64_neg(hvec3_dot(ws, ds)), dd), ed + ew);
+    if (f64_gt(t0, 0) == 0) { return 0; }   # the capsule is behind the origin
+    var kk = f64_mul(0x4020_0000_0000_0000, ext);   # 8 (|ab| + r)
+    var sc = _geo_scale_for(kk >> 52);
+    var dl = hvec3_length(ds);
+    var kd = f64_div(f64_mul(kk, sc), dl);   # K over |ds|, at the copy's scale
+    var cray[16];
+    var ccap[24];
+    store64(&cray, hvec3_new(f64_sub(f64_mul(HVec3_x(w0), sc), f64_mul(kd, HVec3_x(ds))),
+        f64_sub(f64_mul(HVec3_y(w0), sc), f64_mul(kd, HVec3_y(ds))),
+        f64_sub(f64_mul(HVec3_z(w0), sc), f64_mul(kd, HVec3_z(ds)))));
+    store64(&cray + 8, ds);
+    store64(&ccap, hvec3_new(0, 0, 0));
+    store64(&ccap + 8, hvec3_scale(ab, sc));
+    store64(&ccap + 16, f64_mul(r, sc));
+    var tc = geo_ray_capsule_branch(&cray, &ccap, out);
+    if (f64_eq(tc, 0) == 1) { return 0; }
+    # t = t0 + (tc - K / |ds|) sd / sc, the copy's t and K over |ds| taken at the copy's scale
+    # and then to the world's: the copy's part first, so that a t0 past DBL_MAX is +Inf, not
+    # Inf - Inf.
+    if (t0 == 0x7FF0_0000_0000_0000) { return t0; }   # past DBL_MAX: +Inf, as for a far sphere
+    var es = ed - ((sc >> 52) - 1023);
+    return f64_add(t0, _geo_ldexp(f64_sub(tc, kd), es));
+}
+
+# The plain segment test's rounding scale for geo_ray_capsule_branch's window (3.3.7):
+# returns 2^-48 (|o| + |start|), writes 2^-48 |d| to w1 and |ab| to wab (largest components,
+# the sum and products of their bit patterns read as doubles: each is a non-negative double).
+fn _geo_seam_window(ray, capsule, ab, w1, wab) {
+    var o = GeoRay_origin(ray);
+    var st = GeoCapsule_start(capsule);
+    var d = GeoRay_direction(ray);
+    store64(w1, f64_mul(_geo_absmax_bits(d), 0x3CF0_0000_0000_0000));   # 2^-48
+    store64(wab, _geo_absmax_bits(ab));
+    return f64_mul(f64_add(_geo_absmax_bits(o), _geo_absmax_bits(st)), 0x3CF0_0000_0000_0000);
+}
+
+# For a barrel root root_i whose segment coordinate proj (formed from p = o + t d) is within its
+# own rounding of 0 or 1 (the caller's window, _geo_seam_window), a stand-in that is right by
+# sign (3.3.7): -1 or 2 off the segment, 0.5 on it. p carries about 2^-53 (|o| + |t d|),
+# which is more than a thin barrel's own radius; the root's side of each end plane is taken
+# instead from where the root lies against the inputs: with w = o - end point, w_d its part
+# across d (_geo_perp_part, its rounding carried), h = sqrt(r^2 - f^2) for f the offset of the
+# ray's line from the axis (_geo_cap_axis_offset), and s = -1 for the near root, +1 for the far,
+#     (p - end point) . ab  has the sign of  (ab . w_d) |ab| (d . d) + s h (d . ab) |ab x d|.
+# Finite input whose ab and differences do not overflow only: otherwise proj is returned.
+fn _geo_cap_seam_proj(ray, capsule, ab, t, proj, root_i) {
+    var o = GeoRay_origin(ray);
+    var d = GeoRay_direction(ray);
+    var st = GeoCapsule_start(capsule);
+    var r = GeoCapsule_radius(capsule);
+    var en = GeoCapsule_end(capsule);
+    var nf = _geo_hvec3_nonfinite(o) + _geo_hvec3_nonfinite(d) + _geo_hvec3_nonfinite(st) + _geo_hvec3_nonfinite(en);
+    if (nf + _geo_hvec3_nonfinite(ab) != 0 || f64_lt(f64_abs(r), _GEO_F64_POS_INF) == 0) { return proj; }
+    var wa = hvec3_sub(o, st);
+    var wb = hvec3_sub(o, en);
+    if (_geo_hvec3_nonfinite(wa) + _geo_hvec3_nonfinite(wb) != 0) { return proj; }
+    var md = _geo_absmax_bits(d);
+    var mab = _geo_absmax_bits(ab);
+    if (md == 0 || mab == 0) { return proj; }
+    var mw = _geo_absmax_bits(wa);
+    var mb = _geo_absmax_bits(wb);
+    if (mb > mw) { mw = mb; }
+    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > mw) { mw = mr; }
+    var s0 = _geo_scale_for(mw >> 52);
+    var ds = hvec3_scale(d, _geo_scale_for(md >> 52));
+    var abs_ = hvec3_scale(ab, _geo_scale_for(mab >> 52));
+    var bx[64];
+    store64(&bx, ray);
+    store64(&bx + 8, capsule);
+    store64(&bx + 16, wa);
+    store64(&bx + 24, 0);
+    store64(&bx + 32, ab);
+    store64(&bx + 40, F64_ONE);
+    store64(&bx + 48, 0);
+    store64(&bx + 56, (s0 >> 52) - 1023);
+    var fb[24];
+    if (_geo_cap_axis_offset(&bx, &fb) == 0) { return proj; }
+    var rs = f64_mul(r, s0);
+    var mf = _geo_absmax_bits(&fb);
+    var mr2 = rs & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr2 > mf) { mf = mr2; }
+    var s2 = _geo_scale_for(mf >> 52);
+    var fs = hvec3_scale(&fb, s2);
+    var rs2 = f64_mul(rs, s2);
+    var hh = f64_sub(f64_mul(rs2, rs2), hvec3_dot(fs, fs));
+    if (f64_lt(hh, 0) == 1) { hh = 0; }
+    var h = f64_div(f64_sqrt(hh), s2);
+    var nc = hvec3_length(hvec3_cross(abs_, ds));
+    var t2 = f64_mul(f64_mul(h, hvec3_dot(ds, abs_)), nc);
+    if (root_i == 0) { t2 = f64_neg(t2); }
+    var k1 = f64_mul(hvec3_length(abs_), hvec3_dot(ds, ds));
+    var lo[24];
+    var wp[24];
+    _geo_oc_lo(o, st, F64_ONE, wa, &lo);
+    _geo_perp_part(hvec3_scale(wa, s0), ds, &wp);
+    _geo_add_perp(&wp, hvec3_scale(&lo, s0), ds);
+    if (f64_lt(f64_add(f64_mul(hvec3_dot(abs_, &wp), k1), t2), 0) == 1) { return f64_neg(F64_ONE); }
+    _geo_oc_lo(o, en, F64_ONE, wb, &lo);
+    _geo_perp_part(hvec3_scale(wb, s0), ds, &wp);
+    _geo_add_perp(&wp, hvec3_scale(&lo, s0), ds);
+    if (f64_gt(f64_add(f64_mul(hvec3_dot(abs_, &wp), k1), t2), 0) == 1) { return F64_TWO; }
+    return F64_HALF;
+}
+
 public fn geo_ray_capsule_branch(ray, capsule, out) {
     if (out != 0) {
         store64(out, GEO_FACE_NONE);
@@ -2800,7 +3329,16 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
     # miss, because that is what the capsule's other NaN inputs and
     # `geo_ray_sphere` already do.
     # [measured: G6 probe, 3.3.2 + exact-zero-only variant, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
-    if (f64_eq(ab_len_sq, 0) == 1) {
+    # ⛔ 3.3.7 — AND |ab|^2 IS 0 FOR EVERY ab UNDER 2^-537.5. Tested on the square, a capsule
+    # shorter than that was this sphere at its start: the barrel and end cap were never
+    # seen, and every hit came back GEO_CAP_SPHERE (its jet's endpoint gradients those of the
+    # start alone), or a miss where the ray passes beside the start sphere but through the
+    # barrel: (0,0,0)-(2^-600,0,0), r = 2^-602, from (2^-601, 1, 0) along -y, a barrel hit at
+    # 1 - 3 * 2^-602, read the miss. The test is now on ab itself; a non-zero ab whose square
+    # underflows takes the scaled axis below.
+    var abz = 0;
+    if (f64_eq(ab_len_sq, 0) == 1) { if (_geo_absmax_bits(ab) == 0) { abz = 1; } }
+    if (abz == 1) {
         var sph = geo_sphere_new(GeoCapsule_start(capsule), GeoCapsule_radius(capsule));
         var dt = geo_ray_sphere(ray, sph);
         if (out != 0) { if (dt != 0) { store64(out, GEO_CAP_SPHERE); } }
@@ -2815,12 +3353,15 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
     # half-space tests only need the axis's direction, so where ab . ab is +Inf from finite
     # ends they use u = 2^eu ab, ab scaled to unit size (its ends halved first when ab
     # itself overflows), and proj is multiplied back by 2^eu. Otherwise u is ab and every
-    # line below forms exactly what it did.
+    # line below forms exactly what it did. (3.3.7: likewise where ab . ab is under 2^-968
+    # and the capsule is not solved on _geo_capsule_tiny's copy, eu then being positive.)
     var u = ab;
     var uu = ab_len_sq;
     var us = 0;    # 1 when u is the multiple 2^eu * ab of the axis, not ab itself
     var eu = 0;
-    if (ab_len_sq == 0x7FF0_0000_0000_0000) {
+    var uh = 0;    # 1 when u was formed from the halved ends
+    var usa = F64_ONE;   # u's power of two over the ab (or halved ab) it was formed from
+    if (ab_len_sq == 0x7FF0_0000_0000_0000 || ab_len_sq < 0x0370_0000_0000_0000) {   # +Inf, or under 2^-968
         var ca = GeoCapsule_start(capsule);
         var cb = GeoCapsule_end(capsule);
         if (_geo_hvec3_nonfinite(ca) + _geo_hvec3_nonfinite(cb) == 0) {
@@ -2828,11 +3369,13 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
             if (_geo_hvec3_nonfinite(ab) == 1) {
                 ah = hvec3_sub(hvec3_scale(cb, F64_HALF), hvec3_scale(ca, F64_HALF));
                 eu = 0 - 1;
+                uh = 1;
             }
             var sa = _geo_scale_for(_geo_absmax_bits(ah) >> 52);
             u = hvec3_scale(ah, sa);
             uu = hvec3_dot(u, u);
             us = 1;
+            usa = sa;
             eu = eu + (sa >> 52) - 1023;
         }
     }
@@ -2866,12 +3409,30 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
             }
         }
     }
+    # A capsule far from the origin against its size is solved from where the ray passes it
+    # (_geo_capsule_far, 3.3.7).
+    # (A capsule that far has |o - start|^2 over 2^58 (|ab|^2 + r^2), so the exponents are read
+    # only past that, or where that bound overflowed: it is false for every ray nearer.)
+    var aoao = hvec3_dot(ao, ao);
+    var rcap = GeoCapsule_radius(capsule);
+    var farb = f64_mul(f64_add(ab_len_sq, f64_mul(rcap, rcap)), 0x4390_0000_0000_0000);   # 2^58
+    if (oh == 0 && uh == 0 && (f64_gt(aoao, farb) == 1 || farb == 0x7FF0_0000_0000_0000)) {
+        var mcap = _geo_absmax_bits(ab);
+        var mrr = rcap & 0x7FFF_FFFF_FFFF_FFFF;
+        if (mrr > mcap) { mcap = mrr; }
+        if (mcap != 0 && (_geo_absmax_bits(ao) >> 52) > (mcap >> 52) + 30) {
+            var tf = _geo_capsule_far(ray, capsule, ao, ab, out);
+            if (tf != 0x7FF8_0000_0000_0001) {
+                if (tiny == 1) { tf = _geo_ldexp(tf, tiny_e); }
+                return tf;
+            }
+        }
+    }
     var d_par = f64_div(hvec3_dot(GeoRay_direction(ray), u), uu);
     var o_par = f64_div(hvec3_dot(ao, u), uu);
 
     var d_perp = hvec3_sub(GeoRay_direction(ray), hvec3_scale(u, d_par));
     var o_perp = hvec3_sub(ao, hvec3_scale(u, o_par));
-
     # 3.3.6: d_perp and o_perp are the projections' remainders, which keep about 2^-52 of
     # d and ao along the axis; a part across the axis smaller than that, or a projection
     # that overflowed, is formed again from scaled copies without the subtraction
@@ -2889,7 +3450,6 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
     if (oh == 1) { rb = f64_mul(r, F64_HALF); }
     var rbb = f64_mul(rb, rb);
     var oo = hvec3_dot(o_perp, o_perp);
-    var aoao = hvec3_dot(ao, ao);
     var ddd = hvec3_dot(dir, dir);
     # A ray whose d_perp reads exactly 0 (a = 0, d . d at least 2^-968) is parallel to the
     # axis to within 7 * 2^-53 |d|, so across the segment's slab its distance from the axis
@@ -2907,6 +3467,50 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
             }
         }
     }
+    # ⛔ 3.3.7 — o_perp WITH ITS ROUNDING. ao - u o_par rounds each product u_i o_par and ao
+    # itself (o - start), and ab (end - start) rounds too: o_perp is off by about 2^-52 |ao| in
+    # every direction, which for an origin far along the axis is many ulps of r, and the barrel
+    # root with it (the roadmap's ray 1.6e4 radii along was 4,993 ulp off; a median of 994 ulp
+    # at 1e4 radii, 9.5e6 at 1e8). Where |ao| is over twice |o_perp| it is formed as
+    # (ao + aol) - (u + ul) o_par with each product u_i o_par exact and the roundings aol and ul
+    # of the two differences carried (_geo_cap_lows, _geo_perp_comp), the part along u that
+    # o_par's rounding leaves removed by one more projection: off by about an ulp of itself
+    # plus 2^-105 |ao|. (It is not needed nearer: there |ao| and |o_perp| are alike, and the
+    # projection costs 114 floating-point operations and a division.) Not for a ray `par`, whose
+    # barrel is skipped. Finite input whose magnitudes lie within 2^+-900 only; the exact cross
+    # products below rescue the rest as before.
+    # [measured: rt337 barrel families (fam2.py, seeds 201-203), exact roots, 3.3.6 vs this tree, 2026-10-31]
+    var opc[24];
+    var aol[24];
+    var cmp = 0;
+    if (oh == 0 && par == 0) {
+        var cg = f64_gt(aoao, f64_mul(oo, _GEO_F64_FOUR));
+        # (Where a square overflowed, |o - start| past 2^511, the same test by exponents.)
+        if (f64_lt(f64_add(aoao, oo), _GEO_F64_POS_INF) == 0) {
+            cg = 0;
+            if ((_geo_absmax_bits(ao) >> 52) > (_geo_absmax_bits(o_perp) >> 52)) { cg = 1; }
+        }
+        if (cg == 1) {
+            var ae = _geo_absmax_bits(ao) >> 52;
+            var ue = _geo_absmax_bits(u) >> 52;
+            if (ae > 123 && ae < 1923 && ue > 123 && ue < 1923) {
+                if (((o_par & 0x7FFF_FFFF_FFFF_FFFF) >> 52) < 1923) { cmp = 1; }
+            }
+        }
+    }
+    if (cmp == 1) {
+        if (us == 0) {
+            _geo_perp_comp1(GeoRay_origin(ray), GeoCapsule_start(capsule), GeoCapsule_end(capsule), ao, u, uu, o_par,
+              &opc);
+        } else {
+            var ulv[24];
+            _geo_cap_lows(ray, capsule, ao, 0, u, usa, uh, &aol, &ulv);
+            _geo_perp_comp(ao, &aol, u, &ulv, uu, o_par, &opc);
+        }
+        o_perp = &opc;
+        oo = hvec3_dot(o_perp, o_perp);
+    }
+
     # (_geo_perp_suspect, inline where the squares are finite: under 2^-80 of the vector's
     # squared length.) Where a square overflowed (|d| or |o - start| past 2^511) both parts are
     # also formed exactly when r is under 2^-4 of |o - start| (_geo_cap_thin): the
@@ -2927,6 +3531,7 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
         if (f64_lt(f64_add(oo, aoao), _GEO_F64_POS_INF) == 0) {
             sus = _geo_perp_suspect(o_perp, ao) | _geo_cap_thin(rb, ao);
         }
+        if (cmp == 1) { sus = 0; }   # (o_perp is already formed with its rounding)
         if (sus == 1) {
             if (_geo_hvec3_nonfinite(u) + _geo_hvec3_nonfinite(ao) == 0) {
                 var opv[24];
@@ -2937,20 +3542,12 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
             }
         }
     }
-    var b = f64_mul(F64_TWO, hvec3_dot(d_perp, o_perp));
-    var c = f64_sub(oo, rbb);
-    # c read exactly 0 with o_perp off the axis: |o_perp|^2 and r^2 rounded to the same double,
-    # and a 0 here makes a root 0, the contact (`found` below). It is formed exactly instead
-    # (_geo_sphere_c_exact; oo finite keeps |o_perp| and r under 2^512): for
-    # (3 - 1.5 * 2^-51, 4, 0) inside (0,0,0)-(0,0,-8), r = 5, c read 0 for -2.7e-15 and the
-    # contact was the answer for a hit at 2.14 / |d|. Only the exact 0: on ordinary capsules
-    # o_perp's own rounding outweighs the squares', and an exact c from it moved roots both ways.
-    # [measured: C336 review edge family and C2's seed-71 capsules, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
-    if (c == 0) {
-        if (f64_eq(oo, 0) == 0) { c = _geo_sphere_c_exact(o_perp, rb); }
-    }
-
-    var disc = f64_sub(f64_mul(b, b), f64_mul(_GEO_F64_FOUR, f64_mul(a, c)));
+    # (The classic quadratic's b, c and disc are formed below only for a non-finite input; see
+    # "THE CLASSIC QUADRATIC IS GONE". 3.3.6's two repairs of it, an exact c where |o_perp|^2 and
+    # r^2 rounded equal and a root that cancelled to 0 formed again as c / q, are the sphere
+    # form's own: _geo_sph_solve forms c exactly where it cancelled and the near root as c / q.)
+    var b = 0;
+    var disc = 0;
 
     # Two ways the infinite-cylinder test yields nothing, both answered by the caps.
     #
@@ -3012,8 +3609,6 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
             store64(&dpr + 8, f64_sub(dsy, f64_mul(HVec3_y(u), d_par_s)));
             store64(&dpr + 16, f64_sub(dsz, f64_mul(HVec3_z(u), d_par_s)));
             a = hvec3_dot(&dpr, &dpr);
-            b = f64_mul(F64_TWO, hvec3_dot(&dpr, o_perp));
-            disc = f64_sub(f64_mul(b, b), f64_mul(_GEO_F64_FOUR, f64_mul(a, c)));
             dp = &dpr;
         }
     }
@@ -3025,8 +3620,8 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
     # 1.5 * 2^511. When `a` is under 2^-968 but not 0, disc or c is not finite, or d_perp
     # was rescued above, the barrel is solved for copies of d_perp, o_perp and r scaled to
     # unit size (_geo_sph_solve, the sphere's form, so it does not cancel either), and the
-    # roots are multiplied back (_geo_ldexp). Every other ray keeps the classic quadratic
-    # and its bits; its accuracy is not repaired here.
+    # roots are multiplied back (_geo_ldexp). (Every other ray kept the classic quadratic
+    # through 3.3.6; since 3.3.7 every finite one takes this path, see below.)
     # With the caps' new quadratic (_geo_sphere_roots) and the axis and perpendicular
     # repairs above, over 160000 capsule rays (two seeds: ordinary capsules, axis-aligned
     # capsules 2^400 to 2^1021 long with near-parallel rays, general ones, raw directions
@@ -3042,44 +3637,79 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
     # non-finite input, 302 moved, each an infinite start answered through the finite end
     # cap's new root, 294 of them closer to it (at most 9.1 ulp, where 3.3.5 had 441).
     # [measured: C336 capsule sweep, seeds 51 and 52, exact Decimal roots, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
+    # ⛔ 3.3.7 — THE CLASSIC QUADRATIC IS GONE FROM EVERY FINITE BARREL. 3.3.6 kept it for the
+    # rays it did not hand to the scaled path, and it lost accuracy twice: b^2 - 4 a c cancels
+    # near tangency and (-b - sqrt) / 2a for an origin near the barrel, and with the projection's
+    # rounding of o_perp (see "o_perp WITH ITS ROUNDING" above) a ray from an origin far along
+    # the axis was off by about 0.2 |o - start| / r ulp: 4,993 ulp at 1.6e4 radii. Every barrel
+    # whose d_perp, o_perp and r are finite is now solved in the sphere's form (_geo_sph_solve:
+    # the offset f of the axis from the ray, r^2 - |f|^2, the roots q / a and c / q) on copies of
+    # d_perp, o_perp and r scaled to unit size, its roots multiplied back by 2^be; where the
+    # offset it forms is suspect (a barrel thin against o_perp) it takes the offset from the
+    # inputs (_geo_cap_axis_offset, through bx). Only a non-finite input keeps the classic
+    # quadratic below, as 3.3.5's arithmetic for the open non-finite contract.
+    # [measured: rt337 barrel families (fam2.py, seeds 201-203), exact roots, 3.3.6 vs this tree, 2026-10-31]
     var bsc = 0;
     var be = 0;
     var bhit = 0;
     var broots[16];
-    var bneed = dres;
-    if (oh == 1) { bneed = 1; }
-    # (The tiny capsule's copy, _geo_capsule_tiny, as round 2 solved such barrels: its
-    # classic quadratic, ordinary at the copy's size, loses the near root's bits.)
-    if (tiny == 1) { bneed = 1; }
-    # |o_perp| and r both under 2^-484: c is formed from squares that are subnormal or
-    # flushed, as in _geo_sphere_roots, and read 0 where they flushed, so disc = b^2 - 4 a c
-    # flushed too and a ray missing the barrel by three radii read the tangent hit -b / 2a.
-    # The copy at unit size forms them at their own scale. (Through 3.3.5 o_perp's rounding,
-    # up to 2^-52 |ao|, usually stood in for the flushed square and the ray read the miss;
-    # this tree's exact o_perp exposed the flush.) TINYCAP
-    if (f64_lt(oo, _GEO_DIR_LO) == 1 && f64_lt(rbb, _GEO_DIR_LO) == 1) { bneed = 1; }
-    if (f64_lt(f64_abs(a), _GEO_DIR_LO) == 1) { if (f64_eq(a, 0) == 0) { bneed = 1; } }
-    # (A c that is not finite makes disc +-Inf or NaN, so the disc test covers it.)
-    if (f64_lt(f64_abs(disc), _GEO_F64_POS_INF) == 0) { bneed = 1; }
-    if (bneed == 1) {
-        var bfin = _geo_hvec3_nonfinite(dp) + _geo_hvec3_nonfinite(o_perp);
+    var bfin = 0;
+    if (par == 1) { bfin = 0 - 1; }   # parallel, the barrel not crossed: the caps answer
+    else {
+        bfin = _geo_hvec3_nonfinite(dp) + _geo_hvec3_nonfinite(o_perp);
         if (f64_lt(f64_abs(r), _GEO_F64_POS_INF) == 0) { bfin = bfin + 1; }
-        if (bfin == 0) {
-            var bsd = _geo_scale_for(_geo_absmax_bits(dp) >> 52);
-            var bmp = _geo_absmax_bits(o_perp);
-            var bmr = rb & 0x7FFF_FFFF_FFFF_FFFF;
-            if (bmr > bmp) { bmp = bmr; }
-            var bsp = _geo_scale_for(bmp >> 52);
-            bhit = _geo_sph_solve(hvec3_scale(o_perp, bsp), hvec3_scale(dp, bsd), f64_mul(rb, bsp), &broots);
+    }
+    if (bfin == 0) {
+        # The common barrel, every magnitude within 2^+-100, in _geo_sph_solve's form written out
+        # (_geo_barrel_fast, which hands back 2 where that routine would take another branch).
+        bhit = _geo_barrel_fast(o_perp, dp, rb, &broots);
+        if (bhit != 2) {
             bsc = 1;
-            be = (bsd >> 52) - (bsp >> 52);
+            be = de + oh;
             if (csc != 0) { be = be + (csc >> 52) - 1023; }
-            be = be + de + oh;
         }
+    }
+    if (bfin == 0 && bsc == 0) {
+        var bsd = _geo_scale_for(_geo_absmax_bits(dp) >> 52);
+        var bmp = _geo_absmax_bits(o_perp);
+        var bmr = rb & 0x7FFF_FFFF_FFFF_FFFF;
+        if (bmr > bmp) { bmp = bmr; }
+        var bsp = _geo_scale_for(bmp >> 52);
+        var bop[24];
+        var bdp[24];
+        store64(&bop, f64_mul(HVec3_x(o_perp), bsp));
+        store64(&bop + 8, f64_mul(HVec3_y(o_perp), bsp));
+        store64(&bop + 16, f64_mul(HVec3_z(o_perp), bsp));
+        store64(&bdp, f64_mul(HVec3_x(dp), bsd));
+        store64(&bdp + 8, f64_mul(HVec3_y(dp), bsd));
+        store64(&bdp + 16, f64_mul(HVec3_z(dp), bsd));
+        var bx[64];   # what _geo_cap_axis_offset forms the offset from, at the copy's scale
+        store64(&bx, ray);
+        store64(&bx + 8, capsule);
+        store64(&bx + 16, ao);
+        store64(&bx + 24, oh);
+        store64(&bx + 32, u);
+        store64(&bx + 40, usa);
+        store64(&bx + 48, uh);
+        store64(&bx + 56, (bsp >> 52) - 1023);
+        bhit = _geo_sph_solve(&bop, &bdp, f64_mul(rb, bsp), 0, &bx, &broots);
+        bsc = 1;
+        be = (bsd >> 52) - (bsp >> 52);
+        if (csc != 0) { be = be + (csc >> 52) - 1023; }
+        be = be + de + oh;
     }
     if (bsc == 1) {
         cyl_missed = 1 - bhit;
+    } elif (bfin < 0) {
+        cyl_missed = 1;
     } else {
+        # A non-finite input: 3.3.5's classic quadratic (d_perp as the csc copy when that ran;
+        # the rescued one never reached it).
+        var cdp = d_perp;
+        if (csc != 0) { cdp = &dpr; }
+        b = f64_mul(F64_TWO, hvec3_dot(cdp, o_perp));
+        var c = f64_sub(oo, rbb);
+        disc = f64_sub(f64_mul(b, b), f64_mul(_GEO_F64_FOUR, f64_mul(a, c)));
         if (f64_lt(f64_abs(a), _GEO_F64_TINY) == 1) { cyl_missed = 1; }
         if (f64_lt(disc, 0) == 1) { cyl_missed = 1; }
     }
@@ -3098,36 +3728,33 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
     var found = 0;
 
     if (cyl_missed == 0) {
-        var inv_2a = f64_div(F64_HALF, a);
-        var sqrt_disc = f64_sqrt(disc);
-        var cyl_t1 = f64_mul(f64_sub(f64_neg(b), sqrt_disc), inv_2a);
-        var cyl_t2 = f64_mul(f64_add(f64_neg(b), sqrt_disc), inv_2a);
-        # 3.3.6: a classic root that cancelled to exactly 0 (sqrt(disc) equal to |b|, 4ac under
-        # half an ulp of b^2) is formed again as c / q, q = -(b + sign(b) sqrt(disc)) / 2, which
-        # keeps its sign: a 0 is the contact to the root selection below (`found`), and for an
-        # origin just inside the barrel near (3, 4, 0) of (0,0,0)-(0,0,-8), r = 5, the near root
-        # behind it read +0 and the contact was the answer for a hit at 2.14 / |d|. Only an
-        # origin on the barrel (c = 0) keeps the root 0. Every other root keeps its bits.
-        # [measured: C336 review edge family, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
-        if (bsc == 0 && f64_eq(c, 0) == 0) {
-            if ((cyl_t1 & 0x7FFF_FFFF_FFFF_FFFF) == 0 || (cyl_t2 & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
-                var qn = f64_mul(F64_HALF, f64_sub(sqrt_disc, b));
-                if (f64_lt(b, 0) == 0) { qn = f64_neg(f64_mul(F64_HALF, f64_add(b, sqrt_disc))); }
-                if (f64_eq(qn, 0) == 0) {
-                    if ((cyl_t1 & 0x7FFF_FFFF_FFFF_FFFF) == 0) { cyl_t1 = f64_div(c, qn); }
-                    else { cyl_t2 = f64_div(c, qn); }
-                }
-            }
+        var cyl_t1 = 0;
+        var cyl_t2 = 0;
+        if (bsc == 0) {
+            var inv_2a = f64_div(F64_HALF, a);
+            var sqrt_disc = f64_sqrt(disc);
+            cyl_t1 = f64_mul(f64_sub(f64_neg(b), sqrt_disc), inv_2a);
+            cyl_t2 = f64_mul(f64_add(f64_neg(b), sqrt_disc), inv_2a);
         }
         var cs1 = cyl_t1;   # the roots before they are multiplied back, by 2^ce
         var cs2 = cyl_t2;
         var ce = 0;
+        # The segment test's own rounding (_geo_cap_seam_proj), as a window around 0 and 1 in
+        # proj |ab|: 2^-48 (|o| + |t| |d| + |start|), largest components; formed for the first
+        # root that needs it (sw1 < 0 until then).
+        var sw0 = 0;
+        var sw1 = 0 - 1;
+        var swab = 0;
         if (bsc == 1) {
             cs1 = load64(&broots);
             cs2 = load64(&broots + 8);
             ce = be;
-            cyl_t1 = _geo_root_ldexp(cs1, be);
-            cyl_t2 = _geo_root_ldexp(cs2, be);
+            cyl_t1 = cs1;
+            cyl_t2 = cs2;
+            if (be != 0) {
+                cyl_t1 = _geo_root_ldexp(cs1, be);
+                cyl_t2 = _geo_root_ldexp(cs2, be);
+            }
         } elif (csc != 0) {
             ce = (csc >> 52) - 1023;
             cyl_t1 = f64_mul(cyl_t1, csc);
@@ -3142,6 +3769,17 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
                 var p = geo_ray_at(ray, cyl_t1);
                 if (us == 1) { proj = _geo_cap_proj_u(p, GeoCapsule_start(capsule), u, uu, eu); }
                 else { proj = f64_div(hvec3_dot(hvec3_sub(p, GeoCapsule_start(capsule)), u), uu); }
+                # (3.3.7: near an end plane, taken from where the root lies, _geo_cap_seam_proj.)
+                if (bsc == 1) {
+                    if (sw1 < 0) {
+                        sw0 = _geo_seam_window(ray, capsule, ab, &sw1, &swab);
+                    }
+                    var swm = f64_add(sw0, f64_mul(f64_abs(cyl_t1), sw1));
+                    if (f64_lt(f64_mul(f64_abs(proj), swab), swm) == 1
+                      || f64_lt(f64_mul(f64_abs(f64_sub(proj, F64_ONE)), swab), swm) == 1) {
+                        proj = _geo_cap_seam_proj(ray, capsule, ab, cyl_t1, proj, 0);
+                    }
+                }
             }
             if (f64_lt(proj, 0) != 1) {
                 if (f64_gt(proj, F64_ONE) != 1) {
@@ -3160,6 +3798,16 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
                 var p = geo_ray_at(ray, cyl_t2);
                 if (us == 1) { proj = _geo_cap_proj_u(p, GeoCapsule_start(capsule), u, uu, eu); }
                 else { proj = f64_div(hvec3_dot(hvec3_sub(p, GeoCapsule_start(capsule)), u), uu); }
+                if (bsc == 1) {
+                    if (sw1 < 0) {
+                        sw0 = _geo_seam_window(ray, capsule, ab, &sw1, &swab);
+                    }
+                    var swm = f64_add(sw0, f64_mul(f64_abs(cyl_t2), sw1));
+                    if (f64_lt(f64_mul(f64_abs(proj), swab), swm) == 1
+                      || f64_lt(f64_mul(f64_abs(f64_sub(proj, F64_ONE)), swab), swm) == 1) {
+                        proj = _geo_cap_seam_proj(ray, capsule, ab, cyl_t2, proj, 1);
+                    }
+                }
             }
             if (f64_lt(proj, 0) != 1) {
                 if (f64_gt(proj, F64_ONE) != 1) {
@@ -3260,7 +3908,20 @@ public fn geo_ray_capsule_branch(ray, capsule, out) {
                 if (tc == 0x7FF0_0000_0000_0000) {
                     acc = _geo_cap_far_accepts(ray, &csph, u, o_dot_ab, oce, cap_i, root_i);
                 }
-                if (acc == 0 - 1) { acc = _geo_cap_accepts(tcs, o_dot_ab, d_dot_ab, cap_i); }
+                if (acc == 0 - 1) {
+                    acc = _geo_cap_accepts(tcs, o_dot_ab, d_dot_ab, cap_i);
+                    # 3.3.7: a side term within its own rounding of 0, under 2^-48 of |o_dot| +
+                    # |t d_dot| (each formed from a rounded o - cap or d), is decided from where the
+                    # root lies (_geo_cap_side_exact). A negative, infinite or NaN t never is.
+                    if (oce == cape) {
+                        var tdd = f64_mul(tcs, d_dot_ab);
+                        var swm = f64_mul(f64_add(f64_abs(o_dot_ab), f64_abs(tdd)), 0x3CF0_0000_0000_0000);   # 2^-48
+                        if (f64_lt(f64_abs(f64_add(o_dot_ab, tdd)), swm) == 1 && f64_lt(tcs, 0) == 0) {
+                            var acx = _geo_cap_side_exact(ray, cap_pt, r, u, root_i, cap_i);
+                            if (acx != 0 - 1) { acc = acx; }
+                        }
+                    }
+                }
                 if (acc == 1) {
                     if (found == 0) {
                         best = tc;
@@ -3430,7 +4091,26 @@ public fn geo_closest_point_on_sphere(sphere, point) {
     # 2^1019 times 3.3.5's own unit-size answer (8.76 ulp, where centre + radius * u
     # cancels). NaN and infinite inputs keep their bits (3000 of 3000).
     # [measured: C336 row-10 sweep, exact Decimal oracle, 3.3.5 vs this tree, not in-tree, 2026-10-11; cycc 6.6.14]
-    var s = _geo_scale_for(_geo_absmax_bits(dir) >> 52);
+    # ⛔ 3.3.7 — AND point - centre THAT OVERFLOWED WAS NaN. The point (DBL_MAX, 0, 0) against
+    # the centre (-DBL_MAX, 0, 0), radius 1, made dir (+Inf, 0, 0), its copy's length +Inf and
+    # the answer (Inf * 0 = NaN, 0, 0) for the exact (-DBL_MAX, 0, 0). When dir is not finite
+    # but the point, the centre and the radius are, it is formed from the halved inputs, exact
+    # but for a subnormal component's last bit (2^-2098 of the largest), and only its direction
+    # is used. A NaN or infinite input keeps its arithmetic. Of 3,995 pairs whose difference
+    # overflows, 2,227 went wrong -> right and none right -> wrong; the 15 still past 4 ulp are
+    # each a component where centre + radius u cancels. 4,000 ordinary inputs keep their bits.
+    # [measured: rt337 overflow sweep (row7.py, seed 701), exact Decimal points, 3.3.6 vs this tree, 2026-10-31]
+    var mb = _geo_absmax_bits(dir);
+    if ((mb >> 52) == 2047) {
+        var pc = GeoSphere_center(sphere);
+        var nfr = _geo_hvec3_nonfinite(point) + _geo_hvec3_nonfinite(pc);
+        if (f64_lt(f64_abs(GeoSphere_radius(sphere)), _GEO_F64_POS_INF) == 0) { nfr = 1; }
+        if (nfr == 0) {
+            dir = hvec3_sub(hvec3_scale(point, F64_HALF), hvec3_scale(pc, F64_HALF));
+            mb = _geo_absmax_bits(dir);
+        }
+    }
+    var s = _geo_scale_for(mb >> 52);
     var w = hvec3_scale(dir, s);
     var len = hvec3_length(w);
     if (f64_eq(len, 0) == 1) {

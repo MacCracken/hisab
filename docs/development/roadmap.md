@@ -1,7 +1,7 @@
 # Roadmap
 
 > **Hisab** (Arabic: حساب -- calculation) -- higher mathematics library for the AGNOS ecosystem.
-> Written in Cyrius. Toolchain: **6.6.14**. Stdlib `ganita` (6.2.x math umbrella) provides dense
+> Written in Cyrius. Toolchain: **6.6.20**. Stdlib `ganita` (6.2.x math umbrella) provides dense
 > decompositions + transcendentals.
 
 ⭐ **This file is future-facing only.** Nothing below has shipped. The record of what *has* is:
@@ -28,20 +28,21 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.3.6
+## Current — v3.3.7
 
 **Status**:
-- Suite **8561** across six harnesses: hisab 791, foundation 686, modules 2197, modules_b 2293,
-  edge_cases 695, abuse 1899. (`modules_b.tcyr` is the second half of the per-module suite, split
-  in 3.3.4 to stay under cyrlint/cyrfmt's 1028 KB input cap; it is 908 KB at 3.3.6, see [3.3.7].)
-- Constant gate **209/209** (3 skipped).
-- Public surface **703** declarations (846 gate probes; all 802 non-public probes refused),
+- Suite **9023** across seven harnesses: hisab 827, foundation 699, modules 2396, modules_b 1148,
+  modules_c 1165, edge_cases 777, abuse 2011. (3.3.7 split `modules_b.tcyr` in two; each half is
+  about 450 KB of cyrlint/cyrfmt's 1028 KB input cap.)
+- Constant gate **211/211** (3 skipped), read exactly since 3.3.7, hex enum members included
+  (population floor 214).
+- Public surface **703** declarations (846 gate probes; all 854 non-public probes refused),
   enforced since 3.3.0 by the bundle's `private` marker.
-- **145** benchmarks.
+- **156** benchmarks.
 - **35** math modules in `[lib]`, plus the `src/visibility.cyr` marker.
 - Measurement provenance: **8** unmarked claim lines (detector false positives), the baseline;
   CI runs `--ratchet` on every push since 3.3.6.
-- Toolchain **6.6.14**, sakshi **2.5.6**, ganita **1.2.11**.
+- Toolchain **6.6.20**, sakshi **2.5.7**, ganita **1.2.14**.
 - All gates green. Per-release detail is in [`CHANGELOG.md`](../../CHANGELOG.md).
 
 Two releases broke the API, and each has a consumer guide:
@@ -51,20 +52,24 @@ Two releases broke the API, and each has a consumer guide:
   ([`../guides/migration-3.3.md`](../guides/migration-3.3.md)).
 
 ⚠ **hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`). Measured again on the
-3.3.6 bundle from pinned dirs:
+3.3.7 bundle from pinned dirs:
 - 6.6.2 refuses it with the known `#derive` error.
-- Under 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12, 6.6.13 and 6.6.14 a cross-module consumer program
-  (one call per 3.3.5 and 3.3.6 repair: the hostile-size refusals, `eigen_symmetric`'s
-  validation, quadrature on subnormal widths, `num_bisection`'s endpoint root, BFGS at 2^-520,
-  `eigen_power` / `eigen_qr` at the edges, a shallow GJK overlap, a subnormal time of impact, the
-  slab, OBB, sphere and transform repairs, and 3.3.5's set) builds and runs; every 3.3.6 line
-  gives its expected value on every pin, and the outputs are identical on every pin except
-  `ivl_sin` below 6.6.9 ([−1, 1]) and `cx_powf(·, ±Inf)` on 6.6.3 / 6.6.6 (NaN, their ganita
-  `pow`). The 3.3.4 run also
-  found the perspective focal term below 6.6.9 (x87 `sin`/`cos`). On 3.3.0, all 511
-  non-public probes were refused under 6.6.3, 6.6.4 and 6.6.12.
+- Under 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12, 6.6.13, 6.6.14 and 6.6.20 a cross-module consumer
+  program (a cross product, `num_fft`, quadrature and bisection, two sphere rays, the SVD entry
+  points on the duplicated-row, ×2^1021 and h = 2^1023 witnesses and under `ALLOC_MAX` 16,
+  `lyapunov_max` on NaN, `eigen_symmetric`, `cx_powf(2, Inf)`, `ivl_sin`, a CGA product and norm)
+  builds two ways, with the manifest's 16 stdlib leaves and with the sidecar's 7 plus `syscalls`,
+  `string` and `io`, and runs. The outputs are identical on every pin except `svd_compute`'s S₀
+  (ganita 1.2.14's last bit on 6.6.20, hisab's fallback below it) and `cx_powf(·, ±Inf)` on 6.6.3 /
+  6.6.6 (NaN, their ganita `pow`). Earlier runs also found `ivl_sin` below 6.6.9 ([−1, 1])
+  and the perspective focal term below 6.6.9 (x87 `sin`/`cos`). On 3.3.0, all 511 non-public
+  probes were refused under 6.6.3, 6.6.4 and 6.6.12.
 - ⚠ On 6.6.3 a private fn is still reachable through `&name`. That is upstream, fixed in 6.6.4;
   see *Decisions owed*.
+- ⚠ **The sidecar names 7 leaves since 3.3.7** (`cyrius distlib` ≥ 6.6.18 writes a compile-verified
+  `# Requires` block and `dist/hisab.deps`: math, alloc, vec, ganita, result, str, fmt). A consumer
+  that received `assert`, `bench`, `args`, `io`, `tagged`, `fnptr`, `callback`, `syscalls` or `string`
+  through hisab's sidecar must declare it.
 
 ## How to read this file
 
@@ -96,215 +101,150 @@ including a row that says something is blocked.
 
 ## Pinned — 3.3.x patches (no public API change)
 
-### **[3.3.7]** — performance, with before/after; the 3.3.6 findings
+### **[3.3.8]** — the 3.3.7 findings, and the costs 3.3.7 did not buy back
 
-**Carried from [3.3.6] (rows not finished there).** Both were attempted in 3.3.6 and the variants
-measured; neither landed.
-- **Box-corner contact normals** (`time_of_impact` on a quaternion box swept onto a corner, and
-  `gjk_epa_3d` on a static corner overlap): needs a contract for what a corner normal should be.
-  3.3.6's proposal: the normal is the closest-approach direction at the reported t. Re-measured on
-  the 3.3.6 tree: an oblique sweep onto 2 × 2,000 corners is off by up to 1.94e-5 (gap 4.9e-10 at
-  t; p99 5.5e-7, identical to 3.3.5), a head-on sweep by up to 2.65e-7, and `gjk_epa_3d` on 1e-9
-  static corner overlaps by up to 2.35e-5 (p99 1.25e-5; `mpr_penetration` ≤ 4.5e-8). Worst sweep:
-  box c (BFD8463D5220ABF8, BFE03710941A16AA, BFDFEE6BB7BEA914), h (3FE9239026A1A6D0,
-  3FF601A8FA8A8A26, 3FF1BB8EF1294A53), q (BFE42E23120AB4CD, 3FD861CD1E099C3D, BFE16B0345C23B8B,
-  BFD9ABC7F99E7341); sphere c (C006AF8D81D92237, 3FD4B6DD6742CA98, 40097A5107745416), r
-  3FECBE3DB985B912, vel_b (3FD4EC69052694A8, 3FC0EC9E0F2236C0, BFF795D7F4AA6262), max_t 10. A
-  variant that fixes corners (2.27e-5 → 9.0e-7) turned 18 OBB-edge and 3 capsule-side normals right
-  → wrong at 1e-6 and cost +6.5% to +13.9% support calls, so it was not applied.
-- **EPA/MPR depth on a box inside a ball, second local minima**: every face normal is a local
-  minimum of the dilated box's support (h_M(n) = R + Σ hᵢ|uᵢ·n|), and the wrong answers stop at
-  the second-thinnest face. Re-measured on the 3.3.6 tree (identical on 3.3.5): with h and R
-  log-uniform in [0.01, 10], 8–9 (`gjk_epa_3d`) and 6–7 (`mpr_penetration`) of 1,000 concentric
-  pairs; with R / h_min in [48, 520], 44–51 and 35–58 of 1,000. Repro: box c (BFE11889B3A631E6,
-  3FD9DA07E939DA64, BFDAAD9503B36EF8), h (3FAFAF24B4AE3B09, 3FB308FBA5F9E2C3, 401C34E4BDE10586),
-  sphere at the same centre, R 4029AA28FE4F486F: exact 12.894227117761449, `gjk_epa_3d`
-  12.906699824523578 (R + h_mid). A variant took the second-face answers 15 → 6 (EPA) and 14 → 7
-  (MPR) at +34.5% support calls on that family and +5.7% to +13.6% elsewhere, so it was not
-  applied; 3.3.5's 1–3 extra polish starts cost +148% to +348%.
+**Found during 3.3.7, not repaired (not on the [3.3.7] rows).** Each was found by a 3.3.7 lane or
+reviewer on the 3.3.7 tree under cycc 6.6.20 and reproduced by whoever reported it; "both trees"
+means 3.3.6 gives the same answer. Unlike 3.3.6's list, these were not re-verified by a second
+skeptic: do that before sizing a repair. Review and repair each here.
 
-**3.3.6's costs to buy back.**
-- **Quadrature's power-of-two frame on every call**: `calc_integral_gauss5` +20% (49 → 59 ns),
-  trapez +11%, simpson +7%, adaptive +9.5%, `num_bisection` +10% (CHANGELOG 3.3.6 *Performance*).
-  An ordinary-width fast path that keeps the bits is the target.
-- **`gjk_intersect_3d` on a shallow separated pair** +28%: the enclosure proof is tried and fails.
-  A cheaper refutation before the proof is the target.
-- **The ray repairs' remaining costs** (same-binary A/B against 3.3.5, CHANGELOG 3.3.6
-  *Performance*): `ray_sphere` +8% on the ordinary fixture, a near-surface origin 3.4× (the exact
-  c), an origin on an AABB face +57% and on an OBB face +10% (the underflow checks), a ±DBL_MAX world
-  box +11%, `hquat_rotate_vec3` +10% (42 → 46 ns: the overflow test spills the hot locals; cycc
-  keeps five in registers). The `_GEO_*` constants are `var` globals, a memory load per reference
-  (CLAUDE.md's enum rule).
-- **`modules_b.tcyr` is 908 KB of cyrlint/cyrfmt's 1028 KB input cap** (791 KB at 3.3.5): plan the
-  next split before a release pushes it over, as 3.3.4's did for `modules.tcyr`.
-
-**Found during 3.3.6, not repaired (not on the [3.3.6] rows).** Each was found by a 3.3.6 lane or
-its reviewers and reproduced by an independent skeptic on the 3.3.6 tree and on the 3.3.5 tag (all of
-them answer the same on 3.3.5 unless noted), under cycc 6.6.14. Review and repair each here.
+*Costs to buy back* (same-boot A/B, CHANGELOG 3.3.7 *Performance*; 3.3.5 → 3.3.6 → 3.3.7)
+- **A ray origin on an AABB or OBB face**: 78 → 117 → 117 ns and 296 → 332 → 337 ns. The underflow
+  check of a zero crossing is the whole cost (without it, 72 ns). An exponent filter in place of the
+  divisions moved nothing (106 ns), one 9-argument check without calls reached 105 but OBB 328, and
+  the check inlined with its locals reached 95 but slowed `ray_aabb_world` 51 → 61 ns and the
+  ±DBL_MAX box 74 → 79 (cycc's five-register picker reassigned the slab locals). Needs a cheaper
+  check shape.
+- **`calc_integral_trapez` / `_simpson`** keep +6% to +9% over 3.3.5 (147 vs 135 ns; 335 vs 316):
+  the per-node `if (p != 0)` and the x0 local. A build without the per-node test gave 139 / 327 ns;
+  removing it needs a second copy of each loop (simpson's carries the overflow-halving logic).
+- **3.3.7's ray repairs**: `ray_capsule_diag` 536 → 678 ns (+26.5%), `jet_capsule` 722 → 900
+  (+24.7%), `jet_sphere` 195 → 212 (+8.7%), `jet_triangle` 474 → 503 (+6.1%); a barrel ray from far
+  along the axis +57% (the compensated o_perp, ~155 ns where it fires). A near-surface sphere origin
+  is 208 ns against 57 at 3.3.5 (the exact c); a continuation that skipped the full path's recompute
+  reached 174 ns but slowed the ordinary `ray_sphere` 60 → 69 ns.
+- **3.3.7's collision repairs**: `gjk_epa_boxes` +13.1%, `mpr_penetration_boxes` +11.9%,
+  `gjk_epa_sphere_box` +8.2%, `gjk_epa_3d_cyl_box` +8.1% against 3.3.6. Faces 1e-10 and 1e-11 deep
+  still run the shallow polish when its gap exceeds 1/8 of the depth: 1.25× to 1.9× the calls for an
+  error that moves only 1.9 → 1.5 (1e-10) and 15 → 3.9 (1e-11) of the depth. A face normal is the
+  cross product of two crease jumps; snapping to it would be exact for polytope cores.
 
 *Linear algebra*
-- **`svd_golub_kahan` answers on the overflow line `eigen_qr` now refuses**: [[h, h], [h, h]] with
-  h = 2^1023 (and its negation) returns Ok σ = (DBL_MAX, 0), and [[h, h, 0], [h, h, 0], [0, 0, 1]]
-  Ok (DBL_MAX, 1, 0), where σ1 = 2^1024 overflows (both trees). 3.3.6's `eigen_qr` returns
-  Err(NO_CONVERGENCE) on the same matrices (3.3.5: Ok `0x7FEFFFFFFFFFFFFE`), so the pair now
-  disagrees. h = 2^1022 is right in both.
-- **`eigen_qr` 251 eps·|λ|max off near the overflow line** (both trees, identical bytes; documented
-  worst 8.4): 4×4 row-major 190d06ccb7341272 761b9ecd25c64fe3 0 f61104ae3d73c48f /
-  761b9ecd25c64fe3 7d58a78f89e5db7b 0 2617e3bae5272a41 / 0 0 ffdffffffffffffc ffdffffffffffffb /
-  f61104ae3d73c48f 2617e3bae5272a41 ffdffffffffffffb ffdffffffffffffc returns Ok {0xFFEFFFFFFFFFFFFC,
-  0x7D54B80000000000, 0x7D2F680000000000, 0x190D06CCB7341272}; exact {−1.797693134862315e308,
-  −9.9792e291, 1.37106e229, 6.2984336284766114e295}: 5.293e295 against 6.298e295 and 1.003e295
-  against 1.37e229.
-- **`eigen_power` accepts a non-dominant answer both trace floors pass**: [[1e-3, 0, −1e20],
-  [0, 1.3, 0], [0, 0, −1]] (0x3F50624DD2F1A9FC, 0xC415AF1D78B58C40, 0x3FF4CCCCCCCCCCCD,
-  0xBFF0000000000000) returns Ok(0xBFF0000000000001) where λ1 = 1.3 (both trees); |tr A|/n = 0.10
-  and √(|tr A²|/n) = 0.95 sit below 1, a |tr A⁴|/n floor (1.065) would catch it, at O(n³) per answer
-  (also at 1e168 scale and n = 5). The lane's families: 8 + 34 more caught by tr A³ / tr A⁴ floors;
-  complex-dominant (30 / 15), non-normal (455 / 4,000) and larger-only (766 / 4,000) remain.
+- **`eigen_power` answers above ρ(A) on non-normal triangular matrices** (8 of 1,000 in a
+  triangular family): 3×3 rows `371B5E3E602B33DF EB649BD1AEEB8399 654A5AEE5D9850EA / 0
+  B728AD3EB2747301 0 / 0 427336E7F5A31AA7 B7205AF06B3D7EB8` returns Ok(0xB728AD598B5A488C) =
+  −5.5328078e-43; the eigenvalues are the diagonal, dominant −5.5327160e-43, so the answer is 1.7e-5
+  relative off and larger in modulus than every eigenvalue. When every strongly connected component
+  is a singleton the spectrum is known exactly, so a ceiling (an answer within tol of some a_ii)
+  could refuse these; no floor can.
+- **`eigen_power` with a complex dominant pair inside a reducible matrix** (7 of 8 such rows wrong):
+  4×4 `B8350A7018574CEB 383E22F02D064C7F 0 0 / B83E22F02D064C7F B8350A7018574CEB 0 0 / 0 0
+  3831EEDF183EEFEA BB23DB28B4E134C6 / 0 0 0 3840D712CBCE1F36` returns Ok(9.8977e-38) = a33, while
+  the 2×2 block's eigenvalues are −6.18e-38 ± 8.86e-38i (modulus 1.08e-37). A 2×2 strongly connected
+  block's modulus is √det when its discriminant is negative, which the Tarjan pass could supply.
+- **`eigen_power` refuses any dominant |λ| below about 2.47e-312**: the relative test
+  `|new − old| < tol·|new|` underflows to `< 0`. [[x]] with x = 0x00000000000ABCDE (3.5e-318) at
+  max_iter 1000 and x = 0x00000000ABCDEF12 at 100,000 give Err(−8); 0x000001DDB5ED82B0 (1.01e-311)
+  gives Ok(x). The doc block does not state the limit (`src/linalg_ext.cyr`, the convergence test).
+- **`eigen_power`'s irreducible class** (no singleton component) stays open: a |tr A⁴|/n floor
+  catches 45 of 3.3.7's 263 constructed wrong answers (44 of them the diagonal floor already
+  catches) for n³ multiply-adds per answer (+67% of `eigen_power_12x12`'s matvec work).
 
 *Numerics*
-- **`num_bisection` fabricates a root from an underflowing sign test**: f ≡ 0x16A8000000000000
-  (≈2^-661, no root) on [0, 1] with tol = 2^-1074 returns Ok(1.0) (both trees; f ≡ 1 is refused).
-  f(lo)·f(hi) underflows to 0 and reads as a sign change.
-- **`calc_integral_gauss5` weights each sample before summing**, so subnormal samples round away:
-  f ≡ 2^-1074 on [0, 2] gives 2^-1074 (truth 2^-1073; simpson right). Both trees.
-- **`opt_conjugate_gradient` fails where 3.3.6's BFGS now converges**: on the BFGS scale fixture
-  (f = (x0 − k)² + 1e5(x1 − 2k)² from (−k/2, 5k/2), tol k·1e-8) it returns Err(NO_CONVERGENCE) at
-  k = 2^-486, 2^-500, 2^-600, 2^496, 2^500 and Ok at 1, 2^-485, 2^495 (both trees): an honest
-  error, but the same correction-pair rescale would carry over.
-- **`calc_bspline` / `calc_nurbs` dereference a failed de Boor allocation**: with ALLOC_MAX = 24,
-  degree 3, 4 points, knots 0..7, t = 3.5, `_f64arr_alloc(4)` returns 0 and both exit 139 (both
-  trees); `_f64arr_alloc`'s "every caller checks" comment is false. In practice it needs
-  n_pts > 2^28 or an exhausted heap.
-- **DST / DCT past the 2^20 Bluestein cap stay quadratic for lengths that are not powers of two**
-  (`num_dct(2^20 + 1)` and `num_dst` from 524,288 take the direct path; the comment at
-  `num_ext.cyr` says so). Lifting the cap is a memory-policy choice: Bluestein's buffers grow with
-  the next power of two above 2n.
-- **`num_fft`'s twiddle recurrence** loses accuracy with n: at 2^20 (uniform ±0.5 complex input,
-  against an accurate-twiddle radix-2 reference) max|ΔX| / max|X| = 1.30e-11, rms 9.1e-12 (both
-  trees).
-- **The interval module's NaN rule is not uniform**: `ivl_abs([NaN, 1])` gives [0, 1] (the NaN
-  dropped) while `ivl_abs([1, NaN])` gives [NaN, NaN]; `ivl_exp([NaN, 1])` and `ivl_sqrt([NaN, 1])`
-  give [NaN, hi]; `ivl_sin` and `ivl_mul` give [NaN, NaN] (3.3.6 made `ivl_sin` so).
+- **238 of 364 allocation sites are unchecked across 30 modules**, 63 of them sized from a variable
+  (a heuristic scan: a variable assigned from `alloc` / `_f64arr_alloc` / `arena_alloc` and never
+  compared with 0 in its function). The variable-sized ones need triage first: diffgeo
+  `geodesic_rk4` / `parallel_transport` (dim, 20), linalg_ext CSR / GMRES / BiCGSTAB (24), tensor
+  (6), collision_mesh halfedge / union-find (6), calc_ext `_calcx_mc_ext` (3, bounded against
+  `ALLOC_MAX` but not checked against a refused allocation). Fixed-size sites fail only on an
+  exhausted heap.
+- **`_toi_outside_plane`** (`src/geo_advanced.cyr`) uses the product sign test 3.3.7 removed from
+  `num_bisection`, `f64_gt(f64_mul(sp, sd), 0)`: an underflowed product reads as coplanar, which its
+  comment calls the conservative side (one extra face examined). Not probed.
+- **`opt_conjugate_gradient` below 2^-495**: f falls under DBL_MIN near the minimum and the Armijo
+  test cannot measure a step. Needs a derivative-based line search (Wolfe, or a secant on
+  g(x + αd)·d). Also: on the 1e5-conditioned fixture CG needs 300 iterations at k = 1 where BFGS
+  needs 7, and PR+ with an Armijo-only search produced a non-descent direction at k = 2^504
+  (iteration 1); a restart when d·g ≥ 0 is the standard guard (it would move in-band bits).
+- **`calc_adaptive_simpson` returns NaN for an integral past DBL_MAX**: f = x·2^1003 on
+  [−2^20, 2^21] (rule and integral 1.5·2^1043) returns NaN after 5 evaluations (3.3.6 too); the
+  symmetric [−2^20, 2^20] returns the exact 0. `calc_integral_simpson` / `_trapez` return ±Inf for
+  an overflowing true sum.
 
-*Instruments and tests*
-- **`bench-history.sh` drops a row whose name has a character outside `[A-Za-z0-9_]`, silently**:
-  a replayed 80-row log with one row renamed `vec3_cross_2e-600:` records 79 and exits 0 (the
-  unparsed-line check uses the same name shape). Latent: no current row has such a name.
-- **Mutation survivors that are real gaps** (from 3.3.6's seeded 200-mutant sample, seed 336):
-  - `src/mat3.cyr:230` `m3_set(m, 1, 2, …)` → `(m, 1, 3, …)` survives all six suites: no
-    assertion reads `m3_from_quat`'s (1, 2) entry.
-  - `src/collision_mesh.cyr:153` `load64(f + fi * 8)` → `fi / 8` survives: it flips
-    `_col_orient2d_sign` on near-collinear triples past the filter and certificate (36,281 of
-    271,152 in a model; Cyrius repro 0xBFE1149A64F3AF6C 0xBFE11FD6E2A04070 0xBFE1F2BEFD4A0E3C
-    0xBFB4AE9B8BB03850 0xBFE0939B9532AE0E 0xBFE9F1C0ABFB283A: +1, mutant −1, exact +1).
-  - `src/linalg_ext.cyr:1929` (`_lext_grows`'s rescale loop from 1, not 0) survives: A =
-    [[s, −3s, 0], [−3s, s, 0], [ps, ps, rs]] with s = 0x7FCCE93BBB40654B, ps = 0x7FE5845C58277F0D,
-    rs = 0x7FDC768B2082CF59 gives `eigen_power` 0x7FECE93BBB405EAA, the mutant 0x7FECE93BBB4061FA,
-    truth 4s = 0x7FECE93BBB40654B (15 of 6,000 in that family differ).
-  - Of the sample's other 41 survivors, 3 are recorded equivalent (m0036, m0048, m0081) and 38
-    are untriaged, among them one at `src/geo.cyr:1842` of the pre-lane-C tree
-    (`scripts/mutation-test.sh`, seed 336).
-- **`check-constants.sh` accepts a decimal comment within 4 ulp**: planting +1, +3 and +4 ulp on
-  `_SH_Y20` (comment `0.31539156525252000603`) passes; +5 fails. Expression comments are
-  evaluated in doubles. A comment carrying the correctly rounded digits should pin the last bit.
-- **69 dead test helpers**: 36 in `modules.tcyr`, 32 in `modules_b.tcyr` and `_ab_f64_eq` in
-  `abuse.tcyr` are defined and never referenced in their file (6 were dead before the 3.3.4 split).
-- **A test assigns the private `_NUMX_DFT_MAX`** (`modules_b.tcyr`, set to 16 and restored with a
-  literal), a [3.5.0] `K003` enum conversion would break it at compile time.
+*Rays*
+- **`_geo_sphere_roots`' fast path lets a·δ underflow**: in its `c >= ff` branch δ and a are each at
+  least 2^-968, so big_d can flush to 0 and the tangent point −hb/a comes back. `S 266D80528E570290
+  2640C274DD7C67D8 A63BD31CFE844670 B4CDD136A0538570 B4C1E9C95A16434E B4556284E3BE0DBB
+  264C361F40E124F8 260557CC0268B800 25F2BC5A786B3D80 2653E5D7389D1D47` (o, d, centre, r): exact
+  0x317F734637AA02EF, both trees 0x3182C719D9D92556 (19% off); scaled by 2^409 or 2^179 both are
+  right. As a capsule (start `A6624EA215115806 A660AA8F79F6B7D3 A6557376B7C23C24`, same end and ray)
+  3.3.6 answered a false barrel root 0x319009B0722EB8FC and 3.3.7 answers 0 (exact END
+  0x317F734637AA02EF). Repair suggested by the review: hand off to `_geo_sphere_roots_full` when
+  big_d < 2^-968, as the `c < ff` branch does for dc.
+- **Thin barrels beyond 2^100 radii from their start** need more than double-double: 1,037 of 2,478
+  wrong (3.3.6: 1,678). `C 35857EAD7683670C B57C831B1D037CCA 3FFE9CAF93B0BFF3 0 0 BFD3333333333333
+  BFD0D5F4A1BF108C BFDC22E7A91CD28A BFDCE33C8E195248 3FD0D5F4A1BF108C 3FDC22E7A91CD28A
+  3FDCE33C8E195248 357B598E926EB69D` (o, d, start, end, r; |o − start| = 2^168 r): an exact miss;
+  3.3.6 0x401982924B798BAA, 3.3.7 0x4019829250689FF4 (both false hits).
+- **A sphere origin on its surface with a ray grazing there** (cos(oc, d) ≤ 0.17): hb = oc·d cancels,
+  4–110 ulp (79 of a 4,000-ray family). `S 487602669DB9C14E 4BE07CD947E59420 0 BFEF8DE3667D2A6A
+  BFE6F8E578F5B885 BFD809F00CD795E2 4BD8BB45EBD85E30 0 0 4BE49C0F99DEF928`: exact
+  0x48C7CDFEAF272978, 3.3.7 0x48C7CDFEAF27296F (8.9 ulp; 3.3.6 0, the contact).
+- **A barrel origin just outside its surface**: c = |o_perp|² − r² from a rounded o_perp (it would
+  need o_perp as two doubles), 11.7 ulp on both trees: `C 925EA7EEFAD6162C 925E8890FC4203E4
+  124D7E0369DB754C AD2689EC800B377A 3FC85814D48BDA5F AD25E2A03313AF87 9268000000000000
+  1260000000000000 0 927161BED61BED62 0 922745D1745D1746 126967B9F957588B`: exact
+  0x124F5DF0E31E9F97, both 0x124F5DF0E31E9FA3. The same class gave the six verdicts of 3.3.7's
+  5,000-origin surface family that went right → wrong (origins under an ulp from the surface).
 
 *Collision*
-- **Shallow capsule/sphere depth stops at EPA's certificate**: on 600 capsule/sphere overlaps
-  ~1.2e-12 deep (exact rc + rs − dist), `mpr_penetration`'s depth is a median 1.00× but up to 490×
-  the exact one (97 more than 2×, 6 more than 64×); `gjk_epa_3d` up to 61× (25 more than 2×). The
-  absolute overshoot stays ≤ ~7e-10, the `1e-10·max(|d|, |p|)` stopping rule. Worst pair: capsule
-  c (BFD0FBAD4706B994, BFEB1D8981B21794, BFB888D305897130), a (BFEF931CE85D7103,
-  BFE39028303E5122, BFEA53A55271639C), r 3FEE121D8D91B466; sphere c (3FF2EF3E6B7D075E,
-  BFFDDB253F4663AC, BFF1976CD6009E13), r 3FF188C48375A7E4: exact 1.1995e-12, mpr_penetration
-  5.8716e-10 (both trees). Sphere/sphere at 1e-12: 64 / 44 of ~990 `gjk_epa_3d` contacts
-  overestimate by > 1e-14·(ra + rb) (worst 2.26e-10 on 1.38e-12, a 3.3.5 contact too; of the
-  contacts 3.3.6 newly proves, 47 of 901 / 27 of 912, worst 9.25e-12 on 2.39e-12).
-- **Shallow end-cap overlaps are missed by every entry point, and verdicts depend on operand
-  order**: of 200 cap/sphere overlaps 1.2e-12 deep, `mpr_*` miss 66 on both trees and `gjk_*` 67
-  (3.3.5: 160); at 1e-13 `mpr_penetration` misses 85 of 300. Sample: capsule c (3FDE58E76BCB5D0C,
-  3FDA1288C2129D30, 3FE2C4E197B5003A), a (3FF9B7BC0A658B2F, BFE25D1A6A71A46A, 3FE6F26E1A3A0A16),
-  r 3FF158071624A44D; sphere c (400955BE53E03EE1, 3FF30FB2A16B4BD4, 3FF935B51250D8BB), r
-  3FE59D2FCA996935 (exact 1.19997e-12). The worst pair above answers 0 from both `gjk_*` as
-  (capsule, sphere) and a contact of depth 4.52e-11 as (sphere, capsule). `gjk_*` still miss 113
-  of the 600 side and cap overlaps (3.3.5: 297) and answer depth 0 on 11 more.
-- **Separated pairs within half an ulp of the largest coordinate read as contacts** (both trees,
-  all four entry points; the documented within-1-ulp class): on ~30,000 separated sphere/box pairs
-  near (1000, −2000, 500) the widest gap with a false contact is 5.68e-17 relative (~0.5 ulp of
-  2000), every face-pair one being a pair whose rounded support points touch; none from 1.5e-16 to
-  1e-10. Not MPR-specific (GJK gives the same verdict on 97%).
-- **Collisions at 2^-1030**: on 2,000 sphere pairs within ±3 subnormal steps of contact, `gjk_*`
-  are wrong on ~1,003 (every overlap missed) and `mpr_*` on 102, on both trees.
-- **Out-of-contract support functions** (the premise 3.3.6 documented): with a sphere support
-  routed through 2^16 ((c + K) + r·n − K), `gjk_*` turn 99 of 960 separated near-tangent pairs
-  (gaps 1e-9 to 1e-13) into contacts 3.3.5 answered as misses (3.3.5 already had 4 such
-  contacts, `mpr_*` 47 on both trees); none at gaps of 1e-10 and wider.
+- **Separated pairs read as depth-0 touches** (both trees, all four entry points): sphere/box-edge and
+  capsule-side pairs 1e-12 of the size apart, 55 / 1,600 and 42 / 1,600 queries (5 at 1e-11) — wider
+  than the documented half-ulp class. Box c BFD61257EB6AADD8 BFDB382E360A6F08 BFE1B090E0DA5D8C, h
+  3FE10E5D921C4E9E 3FF067BEBE3E2F80 3FFBFA0DDE29B88B, e0 3FDD71EC3BC1CA08 3FEC6333A41698AC
+  3FA2E9C4C599C230, e1 BFE25D3B836AD314 3FD0FBCC7D2B148E 3FE8CAC41890BDFE, e2 3FE5ADF93F7FFD11
+  BFD82B57E862939C 3FE432AC1CEEBD8C; sphere c BFF10BAE64A09C30 3FE608C85C5CA8EF 3FD24679A7A58712, r
+  3FD782FA1BDAC874: exact gap 9.9994e-13; `gjk_intersect_3d` 1, `gjk_epa_3d` depth 0. Most of them
+  come from the GJK core itself, before any portal or proof: 10 of 13 such contacts on the
+  sphere/box-edge family 1e-14 apart, 7 of 8 on capsule/sphere 1e-14 (3.3.5 answers the same pairs 1).
+- **A small sphere on a box corner reads as a depth-0 touch** (both trees): radius 1e-6 overlapping a
+  corner by 1e-9, 1–5 of 100 per mode, normal more than 0.1 rad off. Box c 3FD7489AF806C39C
+  BFEC4084DC4F2D7A 3FD0995A0B8B02DC, h 3FF142450839E5A7 3FFADB6A606B0209 3FF793A4464D881C, e0
+  BFE55282FC826F62 3FABA2446D402F18 BFE7CC74D74BE8D4, e1 3FE7AFBEBB0DBAE0 3FC58CD492AD23FC
+  BFE4D4B22C35A3AE, e2 3FB70F46B4F3D590 BFEF7EF32CD2E9CC BFC37915E9946F70; sphere c BFD2BAF1075B81CE
+  3FCD02554AC1F5F4 4003070E125C2EBB, r 3EB0C6F7A0B5ED8D: `gjk_epa_3d(sphere, box)` depth 0 (exact
+  1.0e-9). 3.3.7 also spends 3.2× / 2.7× the calls on this family at 1e-9.
+- **Sphere-on-box-face contacts 1e-9 deep are up to 12% too deep** (3.3.6: 22%): a face normal is a
+  vertex-type minimum of h, EPA certifies at 1e-10 of the shape, and the pattern search cannot reach
+  below its floor. Box c (0x3F8E166792D29900, 0x3FE3445D3F532334, 0x3FE0C0386E64E880), h
+  (0x3FF2FD63699B3F08, 0x3FE7C7FBDA9ED738, 0x3FF111049041DCE8), q (0x3FD6C81C22CA2B18,
+  0x3FD3F882420CFAC5, 0x3FDDD94F6700C7D0, 0xBFE7E99278B4FB98), sphere c (0xBFF29FE8714B4DF3,
+  0x3F5B1DF9BD736200, 0x3FEB1E57B758C839), r 0x3FE35FA860613C3E: exact depth ~1.0000e-9, both trees
+  0x3E133057A4000000 (11.7% deep). The face snap under *Costs* would make it exact.
+- **`time_of_impact` normals on box edges and capsule sides** remain up to 1.7e-4 (oblique) and
+  5.9e-4 (head-on) rad from the closest-approach direction (p99 4.2e-5 / 1.5e-4; capsule sides
+  1.5e-4), both trees. 3.3.7 repaired corners only.
+- **At coordinates ~1e3, `gjk_*` and `mpr_*` disagree on shallow overlaps below the proof margin**:
+  200 cap pairs 1.2e-12 deep at offset 1e3, `gjk_*` miss 187 / 196 and `mpr_*` 18 / 17 (both trees):
+  MPR keeps an unrefuted portal, GJK needs a proof the margin (1.4e-11) forbids.
 
-*Rays, triangles and transforms*
-- **A capsule shorter than ~2^-537 is not solved as a capsule**: |ab|² underflows. Capsule
-  (0,0,0)–(2^-600,0,0), r = 2^-602, origin (2^-601, 2^-600, 0) along −y: exact barrel hit
-  0x1A68000000000000 (3·2^-602); 3.3.6 answers a miss, 3.3.5 2^-600 (a flushed tangent root of
-  the start sphere, which the ray also misses). On 4,000 capsules with |ab| from 2^-1000 to
-  2^-539, 3.3.6 is wrong on every barrel and end-cap hit (380 + 87) and 14 start-cap hits; 3.3.5
-  on 2,115; none right → wrong.
-- **The barrel's classic quadratic loses accuracy with distance along the axis**: at a fixed
-  perpendicular offset of 3r the median error grows as ~0.2·|o − a|/r ulp (19 ulp at 1e2, 2.2e3 at
-  1e4, 2e7 at 1e8; both trees). o = (0x40B33F8C8241857E, 0x40C11DCB5B12F347, 0x40C5E584F5870178),
-  d = (0x3FEE0C4B13CD9C32, 0xBFDC585CFBBBDF75, 0xBFB373E859BE4F37), a = (0xBFE4115D01803530,
-  0xC01042355B1B6BD0, 0x4011477561717E7E), b = (0x40CB8F220269B35E, 0x40D87EC08203A8B0,
-  0x40DF5299636F48FC), r = 1: exact 0x3FFEBDA633ED69E0, both trees 0x3FFEBDA633ED565F (4,993 ulp).
-  At ordinary scale (5,000 barrel hits per family, bit-identical on both trees): ends in [−5, 5]³,
-  origins in [−10, 10]³: median 4.8 ulp, p99 ~100, max ~1,600, 55% past 4 ulp; ends in [−1, 1]³,
-  origins in [−4, 4]³: median 1.86, p99 17.7, max 585, 21%.
-- **Rays from an origin within an ulp of a centre's coordinates read a miss as a hit, or the contact
-  at t = 0** (sphere and capsule caps; o − c rounds the origin onto the centre or the surface):
-  centre (1.5·2^600, 1.25·2^600, 0), r = 1, origin (0, 2^500, 0), raw direction = the centre gives
-  t = 1.0 (exact: a miss, the centre 2.5e150 from the line; 3.3.5 NaN); centre ~2^100 with origin
-  (0, 2^40, 0) gives t = 1 on both trees. o − c rounds to −c. The capsule's caps share the class
-  since 3.3.6 answers a capsule contact as the sphere does (64 of the 3.3.6 review's edge family,
-  where o − cap rounds the origin onto a cap sphere one ulp inside it).
-- **The sphere and capsule jets refuse hits when the radius is below an ulp of the hit
-  coordinates**: g = p − c rounds to zero and reads as grazing. Unit sphere at (3.5e252, 0, 0),
-  origin 0 along +x: primal 0x745E8D87446FDE22 (right), jet a miss (true dt/do = (−1, 0, 0),
-  dt/dr = −1; 3.3.5 primal NaN); a unit sphere at 1e17 refuses on both trees; capsule
-  (0.05·DBL_MAX, 0, 0)–(0.06·DBL_MAX, 0, 0), r = 1, from 0 along +x: start-cap hit
-  0x7FA9999999999999, jet a miss. (A power-of-two scale sweep refuses none on 3.3.6; 3.3.5 refused
-  3,339.)
-- **`geo_jet_triangle`'s vertex gradients lose ~eps·|o − v0|/size**: on a 1e-6 triangle at
-  distance 1, dt/dv0..2 have relative error median 3.6e-10, max 1.4e-5 (dt/do ~1e-16); they are
-  noise from triangle sizes ~1e-12 (tail) to 1e-14 (typical). Both trees.
-- **`screen_to_world_ray` has the reciprocal defect 3.3.6 repaired in `world_to_screen`**: with
-  inv_vp = 2^-1074·I or 2^-1024·I on 800×600, the centre gives origin (NaN, NaN, −Inf) and direction
-  NaN, the corners ±Inf / NaN (truth: origin (nx, ny, −1), direction (0, 0, 1)); 2^-1022·I is right.
-- **`geo_closest_point_on_sphere` is NaN when point − centre overflows**: point (DBL_MAX, 0, 0),
-  centre (−DBL_MAX, 0, 0), r = 1 gives (NaN, 0, 0) (truth (−DBL_MAX, 0, 0)); point
-  (DBL_MAX, DBL_MAX, 0) gives (NaN, 0, 0) (truth (−DBL_MAX, 0.447, 0)). Both trees.
-- **`geo_barycentric_coords` on an exactly colinear triangle**: the Gram determinant is 0 and the
-  centroid fallback answers (⅓, ⅓, ⅓) whatever the point; with a rounded determinant the weights do
-  not reproduce p (242 of 400 full-mantissa colinear triangles, p on the line; both trees). Needs a
-  contract for a degenerate triangle (a [3.4.0] fabricated-answer question).
-- **`hquat_rotate_vec3` for non-unit q**: it computes v + w·t + u×t (t = 2·u×v), which is a rotation
-  only for unit q, and is neither q·v·q⁻¹ nor q·v·q* otherwise; its accuracy against that formula
-  degrades with |q| for subnormal v (out of a 6u·S bound: 0 of 95 for |q| ≤ 2, 126 of 282 for
-  (2, 16], 509 of 623 for (16, 1024]; both trees). What a non-unit q should mean is a [3.4.0]
-  contract question.
-
-- **`solve_gmres`** allocates seven work buffers inside the restart loop: the six named in 2.9.0
-  plus `r`, for 8·(n + m² + 5m + 2 + k) B per cycle (computed from the alloc sizes, not measured).
-  Hoist them behind an `alloc_used()` arena
-  guard and a new GMRES row. `D016`
-- **`_cga_scalar_of_geo`** is quadratic in occupancy: dense k = 32 costs ~21× k = 5. In the null
-  basis only diagonal and (n0, n∞) pairs reach blade 0. A precomputed 32-pair list restores O(k),
-  bit-identically up to the Neumaier order; re-verify the fabrication witness. `D050`
-- **`_cga_geo_blades`** does `alloc(32)` per term pair in every CGA product: 1056 B per
-  point × point and 33,024 B per dense product, 32,768 B of it scratch. `D051`
-- **`m3_mul_vec3`**: its −6.5% was measured against the raw store tail, never against the natural
-  accessor form, which crashed then. Time that form now on ≥ 6.6.5. The hoist stays for 6.6.3
-  consumers either way. `D141`
+*Instruments and tests*
+- **`check-measurements.sh` reads a free-text marker that begins with a dotted number as a path**:
+  `[measured: 3.3.7 python3 fractions oracle (scratch)]` gives "BROKEN … names a file that does not
+  exist: 3.3.7"; `[measured: scratch … (3.3.7)]` passes. The path regex is `^([\w./-]*\.\w+)` in
+  `check_marker`.
+- **Dead code in the harnesses**: `tests/hisab.fcyr`'s `fuzz_read_int`, `fuzz_is_nan` and
+  `fuzz_approx_eq`; the globals `qt_in` (modules.tcyr, quadtree group), `IVL_TOL_M` and `_rq5_init`
+  (modules_b.tcyr).
+- **Mutation gaps**: m0157 (`_numx_dft`'s zero-fill at `bv − 8`, an out-of-bounds write that is
+  harmless mid-chunk and exits 139 when `bv` opens a fresh 256 MB chunk) is unpinned because its only
+  kill reads allocator internals;
+  `gjk_intersect_3d`'s new refutation at h ≤ 0 instead of h < 0 survives (h exactly 0 along the EPA
+  normal never occurred in 25,200 queries; a tangency is answered by the touch probe first) and is
+  not proven equivalent.
+- **`delaunay_2d` may never reach `_col_dl_locate_scan`**: an exit planted at its entry never fired
+  in any suite (positive control fired). 3.3.7 tests it directly; whether `delaunay_2d` can reach it
+  is unproven — find an input or remove the fallback.
 
 ---
 
@@ -324,8 +264,9 @@ Each function below returns a value that is also a legal answer when the operati
     `solve_bicgstab` fell between the buckets. `D103`
 
 **The functions.**
-- **`svd_compute`** passes ganita's −1/−2 through as integers that alias hisab codes. It becomes a
-  Result. `D012`
+- **`svd_compute`** returns 0 / −1 / −2 as integers that alias hisab codes. Since 3.3.7 that holds
+  under every pin (ganita 1.2.12's −3 never escapes), and −1 means an allocation failure, a fallback
+  that could not answer, or a σ proven past the overflow line. It becomes a Result. `D012`
 - **`solve_bicgstab`** and the Krylov family should report breakdown and non-convergence instead
   of returning the current `x`. Until then the contract is "an unconverged stop returns the last
   iterate" (the maintainer's 3.3.4 decision): 941 of 43,000 runs in the 3.3.4 sweep return a finite
@@ -355,14 +296,34 @@ Each function below returns a value that is also a legal answer when the operati
 - **`lyapunov_max`** returns `Ok` with exponent 0 when `iterations ≤ 0` or the Jacobian has no
   growth at all. Its doc block does not say so. `D032`
 
+**Contracts to write** (each re-measured in 3.3.7; what the right answer is needs a decision first).
+- **`geo_barycentric_coords` on an exactly colinear triangle**: the Gram determinant is 0 and the
+  centroid fallback answers (⅓, ⅓, ⅓) whatever the point. 400 full-mantissa colinear triangles with
+  p on the line: 134 exact-zero determinants answer the centroid, and none of the 400 reproduces p
+  (worst residual 3.32), both trees.
+- **`hquat_rotate_vec3` for non-unit q** computes v + w·t + u×t (t = 2·u×v), a rotation only for
+  unit q, neither q·v·q⁻¹ nor q·v·q* otherwise. Out of a 6u·S bound for subnormal v: 0 of 167 for
+  |q| ≤ 2, 108 of 288 for (2, 16], 511 of 545 for (16, 1024].
+- **Support functions noisier than 2^-46 of the coordinates** (the premise 3.3.6 documented): 1,200
+  separated pairs through K = 2^12 / 2^16 / 2^20 ((c + K) + r·n − K): 24 / 154 / 311 contacts from
+  `gjk_*`, 23 / 91 / 178 from `mpr_*`, none at gaps of 1e-10 and wider. State what a support
+  function owes.
+- **A capsule with an infinite end**: of 20,000 special-value capsule rays, 3 with an infinite start
+  moved in 3.3.7 through the finite end cap's repaired root, e.g. `C C01806A97BEF2F00
+  C022A529106B66CC FFEFFFFFFFFFFFFF BF868F7EF0F424FE 3FCA497068AC434E BFD46BD394C2B5F8
+  BFF0700D7ED5A51E BFC7FF308E5DC880 7FF0000000000000 BFF3AE4A48143454 3FFB25F992C4CB5C
+  3FE14CDA87A91BF8 FFEFFFFFFFFFFFFF` (o, d, start, end, r): 3.3.6 0 / END_CAP, 3.3.7 NaN / START_CAP.
+
 ### **[3.5.0]** — constants and conventions (breaking)
 
 - **23 `public var` constants that any consumer can write**: `GJK_MAX_ITER` and `EPA_MAX_ITER`
   (EPA sizes its buffer from the latter), `EPSILON_F64`, `F64_TINY`, `F64_POS_INF`, the
   `GEO_JET_*` / `GEO_CAP_*` / `GEO_FACE_*` tags, `AD_NONE`/`AD_FULL`, `HALFEDGE_NONE` and
   `CGA_NUM_BLADES`/`CGA_MV_SIZE`. Probed: `GJK_MAX_ITER = 0` set from a consumer takes effect.
-  Convert them to enums, per CLAUDE.md's "enums for constants". `check-constants.sh` must parse
-  enum bodies first, or three verified constants drop out of its population. `K003`
+  Convert them to enums, per CLAUDE.md's "enums for constants". `check-constants.sh` reads hex
+  members of multi-line enums since 3.3.7, so the verified constants stay in its population. The
+  `_NUMX_DFT_MAX` test in `modules_b.tcyr` lowers that cap by assignment; it needs a seam (the cap as
+  an argument) before the cap can become an enum member. `K003`
 - **`cx_powf` with a zero base**: decide hisab's 0⁰. `cx_powf` gives 0, while `num_modpow` and
   `dual_pow` give 1. `D019`
 - **`linearize_depth_reverse_z(0)`** returns 0, which means the eye, for the infinite far plane.
@@ -375,6 +336,16 @@ Each function below returns a value that is also a legal answer when the operati
   additive. `D076`
 
 ### **[3.6.0]** — SVD relative accuracy
+
+- **`eigen_qr`'s 1e-12 deflation** (`_lp_negligible`) is what puts 251 eps·|λ|max into its answer
+  on the 4×4 near the overflow line (3.3.6's row; the same matrix at 2^-100 to 2^-300 gives the same
+  bits scaled), and an in-range family of its shape reaches 711 eps (median 0.97, p99 53). A private
+  2^-52·(|d_k| + |d_k+1|) threshold takes both to ≤ 5 eps but moves the bits of 1,909 of 6,000
+  in-range rows and costs +11.7% QR sweeps; LAPACK's form moves 3,752 and makes 5 sparse rows
+  NO_CONVERGENCE. Decide it with `D001`; `eigen_qr` carries a ⚠ paragraph saying so.
+- **`svd_golub_kahan` refuses some fitting matrices near the overflow line**: 425 of 3,030 sweep
+  rows whose σ₁ fits within 9 units of 2^-53 of the line return NO_CONVERGENCE at the 3.3.3 rescale
+  (the computed σ rounds past), as on 3.3.6.
 
 - **`svd_golub_kahan` on a graded bidiagonal `[[t,t,0],[0,t,1],[0,0,1]]`**: every singular value
   is right to 4.4e-16 relative through t = 2^-39 (1200-digit oracle). At 2^-40 it returns
@@ -437,8 +408,9 @@ names, so it needs a minor. It depends on [3.4.0] `D074` (`expr_eval` reads an u
   the range is [0, 16]), and a free variable read as NaN (hisab's `expr_eval` reads 0, `D074`).
 - **Implementation notes, measured 2026-10-03**: routing through `num_newton` with the evaluator as
   capturing closures built inside the hisab fn solves x^2 - 2 from 1.5 to 0x3FF6A09E667F3BCD,
-  bit-exact under cycc 6.6.3 and 6.6.14. Keep those closures inside a fn (the filed top-level
-  `fncallN` crash) and never `return` a `: stack` value from them (`D082`). abaco 2.4.12's bundle and
+  bit-exact under cycc 6.6.3 and 6.6.14. Keep those closures inside a fn (the top-level `fncallN`
+  crash) and never `return` a `: stack` value from them (`D082`): both are fixed in cyrius 6.6.16,
+  but abaco pins 6.6.12. abaco 2.4.12's bundle and
   hisab's compile together under abaco's pin 6.6.12 with no duplicate symbol.
 - **Tests**: Rust's cases as bit-exact fixtures (√2), a bracket case that really reaches the
   fallback (x^2 - 2 from x0 = 0 on [1, 2]), the unbound-name and NaN-endpoint refusals, exhaustion,
@@ -467,7 +439,7 @@ Nothing in this section is scheduled until the maintainer decides it.
    `hquat_dot`, and through it `hquat_slerp`, give different bits on the two targets. CLAUDE.md's
    Language rule names only `f64v_axpy`/`f64v_fmadd`. Update the rule? An aarch64 test run is
    demand-gated below. `D120`
-4. **CI consumer-pin matrix?** The public-surface and consumer-build gates run only under 6.6.14.
+4. **CI consumer-pin matrix?** The public-surface and consumer-build gates run only under 6.6.20.
    The multi-pin build is a manual release step, which is how 3.3.0's `_SYM_EPS` leak under 6.6.3
    was caught. Automate it? `D110`
 5. **Missing local tags.** The CHANGELOG has releases 3.2.0, 2.11.1, 2.9.3, 2.2.2 and 2.2.1 with
@@ -481,6 +453,21 @@ Nothing in this section is scheduled until the maintainer decides it.
    - Overflowing quadrature now takes the walk its in-range twin takes: calls that returned +Inf
      after 5 evaluations can run past 2·10⁹ evaluations (> 60 s), the [3.4.0] `D070` class.
    Accept, or schedule a different outcome.
+7. **`ivl_contains` / `ivl_overlaps` on a NaN endpoint** answer 1 since 3.3.7, which [NaN, NaN]
+   already answered (cannot exclude); the answer was chosen with 3.3.7's uniform NaN rule, not by the
+   maintainer. IEEE 1788's NaI semantics would answer 0, for [NaN, NaN] too. No hisab module, example,
+   harness or consumer calls either predicate. Keep 1, or move both to 0?
+8. **The DST / DCT Bluestein cap (memory policy).** Lengths that are not powers of two stay direct
+   past 2^20. A Bluestein reduction holds 32m + 16·len bytes, at most 80 MiB under the cap;
+   `num_dct(2^20 + 1)` through Bluestein would hold 144 MiB (8 MiB direct) for about 7,700× fewer
+   operations, and the allocator's own bound would allow 5 GiB per call, never freed. Where should
+   the ceiling sit? If it moves, `modules_b.tcyr`'s three `_numx_bluestein_capped` assertions and its
+   `_NUMX_DFT_MAX = 0x100000` restore move with it.
+9. **The box-corner contact normal.** 3.3.7 adopted [3.3.6]'s proposal, "the closest-approach
+   direction at the reported t" (`time_of_impact` and `gjk_epa_3d` on corners). Confirm it as the
+   contract, or name another.
+10. **`_kd_select_median`'s tie placement** is unspecified (mutant m0185 changes which of two equal
+    keys goes left). Should the kd-tree promise a tie-break?
 
 ---
 
@@ -492,57 +479,26 @@ Nothing in this section is scheduled until the maintainer decides it.
 - hisab keeps a record of its exposure in `issues/`, and closes it in `issues/archived/` with a
   paired measurement on the bump that fixes it. The upstream agents never edit hisab.
 
-⛔ **TWO hisab-filed cyrius items are OPEN**, filed 2026-10-03 with the maintainer's approval
-(written to `cyrius/docs/development/issues/`, not yet committed there):
-- `2026-10-03-hisab-toplevel-fncall-capturing-closure-segv.md`: `fncallN` on a capturing closure
-  at true top level exits 139 on every pin from 6.6.0 to 6.6.14. hisab is not exposed in-tree; the
-  recipe note in `src/autodiff.cyr` tells callers to invoke such closures inside a fn. Record:
-  `issues/2026-10-03-cyrius-toplevel-fncall-capturing-closure-segv.md`.
-- `2026-10-03-hisab-closure-stack-return-blamed-on-enclosing-fn.md` (`D082`, until 3.3.4
-  *Decisions owed* #4): a closure's `return <: stack call>` is booked against the enclosing fn;
-  the repro exits 3 on every pin from 6.6.0 to 6.6.14. hisab is not exposed since 3.3.1. Record:
-  `issues/2026-10-03-cyrius-closure-stack-return-blamed-on-enclosing-fn.md`.
-- **When either closes**: run its repro on the old and new pins as a pair, then archive the
-  record. Keep the recipe notes while any consumer pins below the fix.
+✅ **All four hisab-filed items closed in 3.3.7** (cyrius 6.6.20, ganita 1.2.14), each archived in
+`issues/archived/` with its paired run on 6.6.14 and 6.6.20:
+- cyrius: `fncallN` on a capturing closure at top level (exit 139 → 0) and `D082`, a closure's
+  `return <: stack call>` booked against the enclosing fn (exit 3 → 0), both fixed in 6.6.16.
+  `src/autodiff.cyr`'s recipe notes stay while any consumer pins below 6.6.16, which every direct
+  consumer does.
+- ganita: `ganita_mat_svd` accepting non-finite input (exit 18 → 0) and not converging on tiny
+  columns (exit 9 → 0), both fixed in ganita 1.2.12 (folded as 1.2.13 in 6.6.16 and 1.2.14 in
+  6.6.19). Its return codes moved (−1 allocation only, −2 contract, −3 non-convergence); 3.3.7's
+  `svd_compute` / `svd_truncated` handle all three, and `_lext_mat_all_finite` stays for consumers
+  whose ganita is 1.2.11 or older.
 
-✅ **Both are FIXED UPSTREAM in cyrius 6.6.16** (recorded by cyrius 2026-10-05). ⛔ Do not move the
-pin until cyrius 6.6.16 is tagged and out. Neither needs an in-tree change; what hisab may adopt once
-its pin is ≥ 6.6.16 is its call:
-- **Top-level `fncallN` on a capturing closure** (cyrius bite srca-2, its H1): a top-level `fncallN` /
-  `callptr` now opens its own stack frame and takes the same closure-aware lowering as one inside a
-  fn. The filed repro exits 0 on x86_64, aarch64, macOS (arm64 and Intel) and Windows. Once pinned
-  ≥ 6.6.16, `src/autodiff.cyr`'s 3.3.4 recipe note ("invoke such a closure from inside a fn") can be
-  relaxed, and so can the "Keep those closures inside a fn" line in the `sym_eval_interval`
-  implementation notes above. Keep the note while any consumer pins below 6.6.16: there the
-  top-level `fncall2(grad, x, g)` still exits 139.
-- **Closure `: stack` return booked on the enclosing fn** (`D082`; cyrius bite srca-1, its H2): cycc's
-  post-parse pair scans now skip a closure body, so `return f(..)` inside `|x| { .. }` belongs to the
-  closure. The repro's D1–D3 rows build clean and run 0 (C1–C3 unchanged). Once pinned ≥ 6.6.16 the
-  recipe may return `ad_grad_into(...)` from the closure directly again (the pre-3.3.1 form) —
-  but return a pair on EVERY path of that closure: 6.6.16 judges a closure as its own fn and warns on
-  a closure that returns a pair on one path and a single value on another. Below 6.6.16 that form is
-  still a hard error, so the bind-both workaround stays while any consumer pins below.
-- **To close**: at the 6.6.16 pin bump, run both repros on the old and new pins as a pair, then
-  archive both records (their *Fixed upstream* sections hold the details).
-
-⛔ **TWO hisab-filed ganita items are OPEN**, filed 2026-10-03 with the maintainer's approval (written
-to `ganita/docs/development/issues/`, not committed there): `ganita_mat_svd` returns −1 for
-rank-deficient square matrices, tiny-rotation column pairs and a rounding two-cycle
-(`issues/2026-10-03-ganita-mat-svd-no-convergence-on-tiny-columns.md`; hisab answers these through
-its own `svd_golub_kahan` since 3.3.4), and it accepts non-finite input
-(`issues/2026-10-03-ganita-mat-svd-accepts-non-finite-input.md`; hisab refuses first).
-
-✅ **Both ganita SVD items are addressed by ganita 1.2.13, folded in cyrius 6.6.16** (recorded by cyrius
-2026-10-05, from cyrius CHANGELOG [6.6.16] *Downstream*; not re-measured against hisab's repros). ⛔ Do not
-move the pin until cyrius 6.6.16 is tagged and out. `ganita_mat_svd` is a new algorithm (one-sided Jacobi
-on a column- and row-pivoted QR — LAPACK dgejsv / dgesvj), so every SVD's bits change; it no longer refuses
-finite matrices that have an SVD (zero / repeated rows, tiny rotations, the two-cycling 5×4), and a NaN or
-infinite input is refused across ganita's linalg. **Return codes hisab can see change:** SVD
-non-convergence is **−3** (was −1), non-finite input **−2**, `rank` passes the SVD's −2 / −3 through, and
-`eigen_sym`'s allocation failure is −1 (was −2). At the 6.6.16 pin bump: re-run both repros on the old and
-new pins as a pair; re-check `svd_compute` / `svd_truncated`'s −1 → `svd_golub_kahan` fallback (above,
-`D001` / `D012`) against the new −3, and every place hisab maps ganita's integer codes; then archive both
-records.
+⚠ **Reported to the maintainer in 3.3.7, not filed** (filing is the maintainer's call):
+- ganita 1.2.14's `ganita_mat_qr` returns status 0 with −Inf in Q and R (R00 = Q00 =
+  0xFFF0000000000000) for the finite all-equal 2×2 with a = 1.5·2^1023, under cyrius 6.6.20; at
+  a = 1.5·2^1022 its Householder overflows internally. hisab's `lyapunov_max` refuses both since
+  3.3.7.
+- ganita 1.2.14's `ganita_mat_svd` returns status 0 with σ₁ = DBL_MAX for [[h, h], [h, h]],
+  h = 2^1023, whose σ₁ = 2^1024 overflows (1.2.11 returned +Inf). hisab's wrappers certify and
+  refuse it since 3.3.7.
 
 ✅ **ganita's `atan2` filing closed in 3.3.4** (ganita 1.2.11, cyrius 6.6.13): the tripwires are
 flipped, the D132 rows are pinned as C99 values, and the record is in
@@ -667,7 +623,7 @@ because once the reason is gone, "deferred with a reason" and "forgotten" look t
 ## Consumers
 
 **Ten repos consume `dist/hisab.cyr` today, SHA-locked**, read from each `cyrius.cyml` on
-2026-10-11 (unchanged since 2026-09-30):
+2026-10-31 (unchanged since 2026-09-30):
 
 | hisab tag | consumers |
 |---|---|
@@ -687,7 +643,7 @@ prakash moved to cyrius 6.6.6 on 2026-09-23. It was the first consumer past the 
 calls `num_fft`.
 
 **Four more repos carry a copy transitively.** `cyrius deps` vendors it through another dependency,
-and each compiles it under its own pin (read 2026-10-11 from each `lib/hisab.cyr` header, unchanged since 2026-09-30):
+and each compiles it under its own pin (read 2026-10-31 from each `lib/hisab.cyr` header, unchanged since 2026-09-30):
 
 | repo | hisab | via | cyrius pin |
 |---|---|---|---|

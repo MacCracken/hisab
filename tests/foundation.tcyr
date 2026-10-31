@@ -1770,6 +1770,18 @@ assert_eq(HVec2_x(c73_t2q), f64_from(3), "t2d_apply translates x by 3");
 assert_eq(HVec2_y(c73_t2q), f64_from(4), "t2d_apply translates y by 4");
 # Composing with the identity is a no-op on the translation.
 assert_eq(t2d_pos_x(t2d_compose(c73_t2, c73_t2i)), f64_from(3), "t2d_compose with identity keeps translation");
+# ⛔ 3.3.7 — NOTHING READ t2d_compose'S y TRANSLATION, and the one compose above has b at
+# the origin, so `+ t2d_pos_y(b)` -> `- t2d_pos_y(b)` survived all six suites (seed-336
+# mutant m0194). Both rotations are 0 (sin 0 = 0 and cos 0 = 1 exactly, which the identity
+# compose above already relies on), so the composed translation is a.pos * b.scale + b.pos:
+# one rounded product and one rounded sum per axis, every operand a full mantissa.
+# [measured: scratch python3 fractions oracle (3.3.7), round(round(ay * bsy) + by)]
+var _mt194_a = t2d_new(hvec2_new(0x3FF3C0CA428C59FB, 0xBFE6A09E667F3BCD), 0, hvec2_new(F64_ONE, F64_ONE));
+var _mt194_b = t2d_new(hvec2_new(0xC00921FB54442D18, 0x4005BF0A8B145769), 0,
+  hvec2_new(0x3FF6A09E667F3BCD, 0x3FFBB67AE8584CAA));
+var _mt194_c = t2d_compose(_mt194_a, _mt194_b);
+assert_eq(t2d_pos_x(_mt194_c), 0xBFF6549518167447, "t2d_compose: x = ax * bsx + bx, to the bit");
+assert_eq(t2d_pos_y(_mt194_c), 0x3FF7E587021F8DA3, "t2d_compose: y = ay * bsy + by, to the bit");
 
 # --- Transform3D accessors and matrices.
 var c73_t3 = t3d_new(hvec3_new(F64_ONE, F64_TWO, f64_from(3)), hquat_identity(), hvec3_one());
@@ -2750,6 +2762,44 @@ assert_eq(HVec3_x(_mw_tp(0x3FF4D2C3B1A59687, F64_ONE, F64_ONE, 0x7FF800000000000
   "m4_transform_point: w = NaN still returns the undivided coordinates");
 assert_eq(HVec3_y(_mw_tp(0x3FF4D2C3B1A59687, 0xBFF4D2C3B1A59687, F64_ONE, 0x7FF0000000000000)), 0x8000000000000000,
   "m4_transform_point: w = +Inf still multiplies by 1/w = 0 (y = -0)");
+
+test_group("3.3.7 screen_to_world_ray: every finite non-zero w divides, as in world_to_screen");
+# inv_vp = 2^-1074 I (_mw_g above) on 800 x 600: the centre's near and far points have
+# w = 2^-1074, whose reciprocal overflows, and 3.3.6 answered the origin (NaN, NaN, -Inf) and
+# a NaN direction for the exact (0, 0, -1) and (0, 0, 1). At the corner (0, 0) with
+# 2^-1024 I: (-1, 1, -1) and (0, 0, 1) (3.3.6: (-Inf, +Inf, -Inf) and NaN). nx and ny are
+# exact there, so every component is the exact quotient.
+# [measured: rt337 band sweep (row6.py, seed 601), exact Fraction quotients, 3.3.6 vs this tree, 2026-10-31]
+var _s2w_o = alloc(8);
+var _s2w_d = alloc(8);
+screen_to_world_ray(f64_from(400), f64_from(300), _mw_g, f64_from(800), f64_from(600), _s2w_o, _s2w_d);
+assert_eq(HVec3_x(load64(_s2w_o)), 0, "screen_to_world_ray, inv_vp = 2^-1074 I, centre: origin x = +0 (3.3.6: NaN)");
+assert_eq(HVec3_y(load64(_s2w_o)), 0, "screen_to_world_ray, inv_vp = 2^-1074 I, centre: origin y = +0 (3.3.6: NaN)");
+assert_eq(HVec3_z(load64(_s2w_o)), 0xBFF0000000000000, "screen_to_world_ray, ... origin z = -1 (3.3.6: -Inf)");
+assert_eq(HVec3_z(load64(_s2w_d)), F64_ONE, "screen_to_world_ray, ... direction z = 1 (3.3.6: NaN)");
+assert_eq(HVec3_x(load64(_s2w_d)), 0, "screen_to_world_ray, ... direction x = +0 (3.3.6: NaN)");
+var _s2w_m = m4_new();
+m4_set(_s2w_m, 0, 0, 0x0004000000000000);
+m4_set(_s2w_m, 1, 1, 0x0004000000000000);
+m4_set(_s2w_m, 2, 2, 0x0004000000000000);
+m4_set(_s2w_m, 3, 3, 0x0004000000000000);
+screen_to_world_ray(0, 0, _s2w_m, f64_from(800), f64_from(600), _s2w_o, _s2w_d);
+assert_eq(HVec3_x(load64(_s2w_o)), 0xBFF0000000000000,
+  "screen_to_world_ray, 2^-1024 I, corner: origin x = -1 (3.3.6: -Inf)");
+assert_eq(HVec3_y(load64(_s2w_o)), F64_ONE, "screen_to_world_ray, 2^-1024 I, corner: origin y = 1 (3.3.6: +Inf)");
+assert_eq(HVec3_z(load64(_s2w_d)), F64_ONE, "screen_to_world_ray, 2^-1024 I, corner: direction z = 1 (3.3.6: NaN)");
+# The upper band: inv_vp = DBL_MAX I, w = DBL_MAX, whose 1/w is subnormal: the copy's quotient is
+# the exact one at (123.25, 77.5) (3.3.6: (..A3, ..BB, BFEFFFFFFFFFFFFF), each 1 ulp off).
+# [measured: rt2 review repro, exact Fraction quotients, 3.3.6 vs this tree, 2026-10-31]
+var _s2w_dm = m4_new();
+m4_set(_s2w_dm, 0, 0, 0x7FEFFFFFFFFFFFFF);
+m4_set(_s2w_dm, 1, 1, 0x7FEFFFFFFFFFFFFF);
+m4_set(_s2w_dm, 2, 2, 0x7FEFFFFFFFFFFFFF);
+m4_set(_s2w_dm, 3, 3, 0x7FEFFFFFFFFFFFFF);
+screen_to_world_ray(0x405ED00000000000, 0x4053600000000000, _s2w_dm, f64_from(800), f64_from(600), _s2w_o, _s2w_d);
+assert_eq(HVec3_x(load64(_s2w_o)), 0xBFE623D70A3D70A4, "screen_to_world_ray, DBL_MAX I: origin x exact (3.3.6: 1 ulp)");
+assert_eq(HVec3_y(load64(_s2w_o)), 0x3FE7BBBBBBBBBBBC, "screen_to_world_ray, DBL_MAX I: origin y exact (3.3.6: 1 ulp)");
+assert_eq(HVec3_z(load64(_s2w_o)), 0xBFF0000000000000, "screen_to_world_ray, DBL_MAX I: origin z = -1 (3.3.6: 1 ulp)");
 
 assert_eq(hisab_is_err(0), 0, "hisab_is_err(0) is false");
 assert_eq(hisab_is_err(0 - 5), 1, "hisab_is_err(negative) is true");

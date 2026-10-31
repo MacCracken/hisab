@@ -1,6 +1,6 @@
 # linalg_precision.cyr -- precision linear algebra algorithms
 # Usage: shipped inside dist/hisab.cyr; in-tree, include "src/linalg_precision.cyr" after what it requires
-# Requires: src/complex.cyr, src/error.cyr, src/linalg_ext.cyr (stdlib resolves via cyrius.cyml [deps]);
+# Requires: src/complex.cyr, src/error.cyr, src/f64_util.cyr, src/linalg_ext.cyr (stdlib via [deps]);
 #           linalg_ext since 3.2.0: its `linalg_sort_desc` (so named since 3.3.0) orders S / eigenvalues
 #
 # Alternatives to ganita's SVD and symmetric eigendecomposition, which linalg_ext's
@@ -515,9 +515,14 @@ fn _lp_cmat_all_finite(A, rows, cols) {
     return 1;
 }
 
-# Allocate a zero-filled flat f64 array of length n
+# Allocate a zero-filled flat f64 array of length n, or 0 when the allocation fails.
+# ⛔ 3.3.7 — IT STORED THROUGH A FAILED ALLOCATION, and no caller checked: with ALLOC_MAX
+# below the first request, svd_golub_kahan and eigen_qr exited 139 on a 3x3. Every
+# caller now returns Err(HSB_ERR_ALLOC) on 0 (tests/abuse.tcyr, "3.3.7 linalg_precision").
+# [measured: ALLOC_MAX sweep 8..2048 through svd_golub_kahan and eigen_qr, before and after; cycc 6.6.20]
 fn _lp_vec_new(n) {
     var v = alloc(n * 8);
+    if (v == 0) { return 0; }
     var i = 0;
     while (i < n) {
         store64(v + i * 8, f64_from(0));
@@ -549,9 +554,11 @@ fn _lp_vec_copy(dst, src, n) {
 # Returns: Ok(0) on success; Err(HSB_ERR_INVALID_INPUT) for a null A, out_U,
 #          out_S or out_Vt, a non-positive dimension, m < n, or a non-finite
 #          entry of A; Err(HSB_ERR_NO_CONVERGENCE) if QR iteration fails, or
-#          (since 3.3.3) if a singular value exceeds DBL_MAX or a norm or radius
-#          on the way to one is not finite (since 3.3.4, once added headroom can no
-#          longer prevent it); Err(HSB_ERR_ALLOC) if the balancing copy fails.
+#          (since 3.3.3) if a singular value exceeds DBL_MAX (since 3.3.7 also one
+#          computed just inside it whose singular pair proves it past the rounding
+#          line; see the rescale) or a norm or radius on the way to one is not finite
+#          (since 3.3.4, once added headroom can no longer prevent it);
+#          Err(HSB_ERR_ALLOC) if the balancing copy fails.
 #          (Through 3.3.1 this line listed only the last two.)
 # A is balanced by a power of two before decomposing and rescaled on the way
 # out (`_lp_balance_scale`). Through 3.3.1 this line called both steps exact
@@ -584,6 +591,7 @@ fn _lp_vec_copy(dst, src, n) {
 fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
     # Work on a copy of A
     var W = ganita_mat_copy(A);
+    if (W == 0) { return Err(HSB_ERR_ALLOC); }
 
     # Initialize U_acc to m x n slice of identity
     var i = 0;
@@ -620,12 +628,14 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
     # reflector was skipped for that k.
     var lv_store = _lp_vec_new(m * n);
     var lv_tv = _lp_vec_new(n);
+    if (lv_store == 0 || lv_tv == 0) { return Err(HSB_ERR_ALLOC); }
 
     var k = 0;
     while (k < n) {
         # ---- Left Householder: zero out column k below diagonal ----
         var len_l = m - k;
         var v_l = _lp_vec_new(len_l);
+        if (v_l == 0) { return Err(HSB_ERR_ALLOC); }
 
         # Extract column k, rows k..m
         i = 0;
@@ -769,6 +779,7 @@ fn _lp_bidiagonalize(A, m, n, diag, superdiag, U_acc, Vt_acc) {
         if (k < n - 2) {
             var len_r = n - k - 1;
             var v_r = _lp_vec_new(len_r);
+            if (v_r == 0) { return Err(HSB_ERR_ALLOC); }
 
             # Extract row k, cols (k+1)..n
             i = 0;
@@ -1626,8 +1637,9 @@ fn _lp_svd_attempt(A, m, n, sc, diag, superdiag, out_U, out_Vt, max_iter, lift) 
 # out_S:  flat f64 array of length n (caller allocates).
 # out_Vt: stdlib matrix (n x n, caller allocates).
 # Returns: Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) on failure (since 3.3.3
-#          including a singular value above DBL_MAX, or any intermediate norm or
-#          radius that is not finite, since 3.3.4 at the most headroom tried),
+#          including a singular value above DBL_MAX, since 3.3.7 one proven past the
+#          rounding line though computed finite, or any intermediate norm or radius
+#          that is not finite, since 3.3.4 at the most headroom tried),
 #          Err(HSB_ERR_INVALID_INPUT) if m < n or either dimension is non-positive
 #          (full list in the section header above).
 #must_use
@@ -1668,6 +1680,7 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
     # Step 1: Bidiagonalize
     var diag = _lp_vec_new(n);
     var superdiag = _lp_vec_new(n);  # n-1 used, extra slot harmless
+    if (diag == 0 || superdiag == 0) { return Err(HSB_ERR_ALLOC); }
 
     # Balance by a power of two before decomposing (to unit max magnitude, unless
     # `_lp_balance_scale` must scale further up to keep the smallest non-zero
@@ -1800,6 +1813,28 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
         store64(diag + sv_i * 8, sv_o);
         sv_i = sv_i + 1;
     }
+    # ⛔ 3.3.7 — AND ONE THAT IS FINITE ONLY BY ROUNDING IS A FAILURE TOO, as eigen_qr has
+    # refused since 3.3.6. [[h, h], [h, h]] with h = 2^1023 (or -h) has sigma_1 = 2^1024, past
+    # the line 2^1024 - 2^970, and came back Ok as DBL_MAX, with [[h, h, 0], [h, h, 0],
+    # [0, 0, 1]] Ok as (DBL_MAX, 1, 0): the balanced value came back 1 ulp low (2 - 2^-52 at
+    # sc = 2^1023), and the rescale left it finite. eigen_qr refuses the same matrices, so the
+    # pair disagreed. A singular value within 2^-40 of the line is now checked against it
+    # (`_lp_sv_past_max`, the Rayleigh quotient of [[0, A], [A', 0]]) and refused when that
+    # proves it past. On 5,990 matrices (2x2 to 5x5, 8x2) built with sigma_1 within 9 units of
+    # 2^-53 of the line on both sides, this refuses the 210 that 3.3.6 answered past the line,
+    # refuses none whose singular values fit, and every row answered is byte-identical. 425
+    # that fit are refused by the rescale on both trees, the computed value rounding past: the
+    # SVD's own few-ulp error decides those inputs, as it does eigen_qr's. Exactly on the line
+    # the check cannot decide either (tests/abuse.tcyr has the tripwire).
+    # [measured: near-line svd sweep, seed 337, 3.3.6 base vs this tree + Decimal oracle, 2026-10-31; cycc 6.6.20]
+    var sv_w: i64[4];
+    for (var sq_i = 0; sq_i < n; sq_i = sq_i + 1) {
+        if (f64_ge(load64(diag + sq_i * 8), 0x7FEFFFFFFFFFE000) == 1) {   # (1 - 2^-40) 2^1024
+            if (_lp_sv_past_max(A, m, n, out_U, out_Vt, sq_i, &sv_w) == 1) {
+                return Err(HSB_ERR_NO_CONVERGENCE);
+            }
+        }
+    }
 
     # Copy singular values to output
     _lp_vec_copy(out_S, diag, n);
@@ -1853,6 +1888,7 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
 fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
     # Work on a copy
     var W = ganita_mat_copy(A);
+    if (W == 0) { return Err(HSB_ERR_ALLOC); }
 
     # Initialize Q to identity
     var i = 0;
@@ -1866,6 +1902,7 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
         # Extract column k below the subdiagonal: W[k+1..n, k]
         var len = n - k - 1;
         var v = _lp_vec_new(len);
+        if (v == 0) { return Err(HSB_ERR_ALLOC); }
         i = 0;
         while (i < len) {
             store64(v + i * 8, ganita_mat_get(W, k + 1 + i, k));
@@ -1949,6 +1986,7 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
 
                 # Compute p = (2/vtv) * W[k+1:n, k+1:n] * v
                 var p = _lp_vec_new(len);
+                if (p == 0) { return Err(HSB_ERR_ALLOC); }
                 i = 0;
                 while (i < len) {
                     var sum = f64_from(0);
@@ -1973,6 +2011,7 @@ fn _lp_tridiagonalize(A, n, diag, offdiag, Q) {
 
                 # q = p - K * v
                 var q = _lp_vec_new(len);
+                if (q == 0) { return Err(HSB_ERR_ALLOC); }
                 i = 0;
                 while (i < len) {
                     store64(q + i * 8, f64_sub(load64(p + i * 8),
@@ -2365,6 +2404,70 @@ fn _lp_rq_past_max(A, n, V, k, neg, buf) {
     return f64_gt(past, bnd);
 }
 
+# ⭐ 3.3.7 — the svd twin of `_lp_rq_past_max`: 1 when column k of U and row k of Vt prove
+# that the m x n A has a singular value past the overflow line. The Jordan-Wielandt matrix
+# M = [[0, A], [A', 0]] is symmetric with eigenvalues +-sigma_i, so for x = (u, v) its
+# Rayleigh quotient q = 2 u'Av / (u'u + v'v) lies in [-sigma_1, sigma_1]: q above the line
+# puts sigma_1 above it, for any u and v. q is formed as there, in double-double on A / 2^64
+# against the line scaled alike, and the answer is 1 only when q passes the line by more
+# than (mn + m + n + 4)^2 2^-100 (1 + 2 sum |u_i a_ij v_j| / (u'u + v'v)): the count of
+# terms in place of n^2, and |q| <= 2 sum |u_i a_ij v_j| / (u'u + v'v) in place of the
+# eigen bound's relative part. So an A whose singular values all fit can never be refused
+# here, and a singular pair from the QR, accurate to working precision, puts q within
+# O(eps^2) sigma_1 of sigma_1.
+# buf: 32 bytes of scratch.
+fn _lp_sv_past_max(A, m, n, U, Vt, k, buf) {
+    var nh = f64_from(0);
+    var nl = f64_from(0);
+    var dh = f64_from(0);
+    var dl = f64_from(0);
+    var sab = f64_from(0);
+    for (var i = 0; i < m + n; i = i + 1) {
+        var x = 0;
+        if (i < m) { x = ganita_mat_get(U, i, k); } else { x = ganita_mat_get(Vt, k, i - m); }
+        _lp_two_prod(x, x, buf);
+        _lp_two_sum(dh, load64(buf), buf + 16);
+        dh = load64(buf + 16);
+        dl = f64_add(dl, f64_add(load64(buf + 24), load64(buf + 8)));
+    }
+    for (var i = 0; i < m; i = i + 1) {
+        var ui = ganita_mat_get(U, i, k);
+        for (var j = 0; j < n; j = j + 1) {
+            _lp_two_prod(ui, ganita_mat_get(Vt, k, j), buf);   # u_i v_j = th + tl
+            var th = load64(buf);
+            var tl = load64(buf + 8);
+            var a = f64_mul(ganita_mat_get(A, i, j), 0x3BF0000000000000);   # a_ij 2^-64
+            _lp_two_prod(a, th, buf);
+            var pl = f64_add(load64(buf + 8), f64_mul(a, tl));
+            _lp_two_sum(nh, load64(buf), buf + 16);
+            nh = load64(buf + 16);
+            nl = f64_add(nl, f64_add(load64(buf + 24), pl));
+            sab = f64_add(sab, f64_abs(load64(buf)));
+        }
+    }
+    _lp_two_sum(nh, nl, buf);
+    nh = load64(buf);
+    nl = load64(buf + 8);
+    _lp_two_sum(dh, dl, buf);
+    dh = load64(buf);
+    dl = load64(buf + 8);
+    if (f64_gt(dh, 0) == 0) { return 0; }
+    # q / 2 = q1 + q2 = (nh + nl) / (dh + dl), the remainder taken against q1 (dh + dl) exactly
+    var q1 = f64_div(nh, dh);
+    _lp_two_prod(q1, dh, buf);
+    var r = f64_sub(f64_add(f64_sub(f64_sub(nh, load64(buf)), load64(buf + 8)), nl), f64_mul(q1, dl));
+    var q2 = f64_div(r, dh);
+    # doubling is exact: |q| <= sigma_1 2^-64 <= sqrt(mn) 2^960, and a subnormal doubles exactly
+    q1 = f64_mul(q1, F64_TWO);
+    q2 = f64_mul(q2, F64_TWO);
+    # (q1 - 2^960) is exact wherever the comparison is close (Sterbenz)
+    var past = f64_add(f64_add(f64_sub(q1, 0x7BF0000000000000), q2), 0x7890000000000000);   # - 2^960, + 2^906
+    var nn = f64_add(f64_from(m * n + m + n), f64_from(4));
+    var rel = f64_add(f64_mul(F64_TWO, f64_div(sab, dh)), F64_ONE);
+    var bnd = f64_mul(f64_mul(f64_mul(nn, nn), 0x39B0000000000000), rel);   # 2^-100
+    return f64_gt(past, bnd);
+}
+
 # One attempt at the eigendecomposition of A / sc (3.3.4; see `_lp_svd_attempt`).
 # Leaves the balanced eigenvalues in diag; out_vecs is rewritten from the identity on
 # every attempt. `lift` is 0 on the first attempt and 1 on each retry, 2 on the last.
@@ -2462,6 +2565,7 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # Step 1: Householder tridiagonalization
     var diag = _lp_vec_new(n);
     var offdiag = _lp_vec_new(n);
+    if (diag == 0 || offdiag == 0) { return Err(HSB_ERR_ALLOC); }
 
     # Balance first; see svd_golub_kahan. Unbalanced, this overflowed at 1e200
     # exactly as the Householder norm did, because the Wilkinson shift then
@@ -2525,6 +2629,24 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
     # back with B's diagonal, 6.180e-101 and 2.718e-101 (3.3.4: NO_CONVERGENCE). Normwise
     # that is 2e-397 of |lambda|_max, inside the eps |lambda|_max contract.
     # [measured: review repro (max_iter 750), 3.3.4 vs this tree + 800-digit oracle, 2026-10-11; cycc 6.6.14]
+    # ⚠ 3.3.7 — THE 1e-12 DEFLATION, NOT THE OVERFLOW LINE, IS WHERE A FEW HUNDRED EPS GO.
+    # `_lp_negligible` zeroes an off-diagonal e up to 1e-12 (|d_k| + |d_k+1|), which can move an
+    # eigenvalue by up to |e| (Weyl), about 9,000 eps |lambda|_max per deflation, and does when
+    # the large neighbour is not itself an eigenvalue. The 4x4 [[t, b, 0, c],
+    # [b, d, 0, f], [0, 0, -x, -y], [c, f, -y, -x]] (t = 5.2e-188, b = 8.5e260, c = -5.2e260,
+    # d = 6.298e295, f = 3.5e-125, x = 8.988e307, y one ulp less) returns 5.293e295 and
+    # 1.003e295 for 6.298e295 and -9.98e291, 251.9 eps |lambda|_max: the tridiagonal couples
+    # its last entry, 1.0e295, through an e of 6.1e295 to an unreduced 2x2 block whose small
+    # eigenvalue is near 5.3e295 and whose diagonal beside e is -8.9e307, so the test zeroes e
+    # before the first sweep. The same matrix times 2^-100, 2^-200 or 2^-300 returns the same
+    # bits scaled. On 6,000 symmetric matrices whose balance loop does not run (n = 2..6:
+    # uniform, graded over 60 binades, sparse over 1,000, and 1,500 of this 4x4 shape over 500)
+    # the shape reaches 711 eps (median 0.97, p99 53) and the others 8.8, 9.6 and 5.8. A
+    # 2^-52 (|d_k| + |d_k+1|) threshold takes the 4x4 to 0.4 eps and the shape's worst to 5.0
+    # (the others 9.9, 9.6, 5.3), but moves the bits of 1,909 of the 6,000 rows and costs 11.7%
+    # more QR sweeps (22,426 against 20,074), so it is not a patch-release change: roadmap
+    # [3.6.0], with the SVD's own 1e-12 rows.
+    # [measured: 4x4 probe, in-range eigen sweep +- a 2^-52 deflation, Decimal Jacobi oracle, 2026-10-31; cycc 6.6.20]
     var sc = _lp_balance_scale(A, n, n);
     var lift = 0;
     while (1 == 1) {

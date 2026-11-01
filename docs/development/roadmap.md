@@ -877,16 +877,14 @@ Nothing in this section is scheduled until the maintainer decides it.
    contract, or name another.
 10. **`_kd_select_median`'s tie placement** is unspecified (mutant m0185 changes which of two equal
     keys goes left). Should the kd-tree promise a tie-break?
-11. **Two upstream candidates from the 3.4.0 audits.** Filing either is the maintainer's call;
-    nothing has been filed.
-    - **ganita**: `ganita_mat_eigen_sym` stops its Jacobi sweeps at max_off ≤ 1e-12·max|a_ij|, so
-      `eigen_symmetric` is accurate only to 1e-12 of the largest entry, with Ok ([[1, 1e-13],
-      [1e-13, 1]] → λ = (1, 1) and identity vectors, 450 ulp; `eigen_qr` is bit-exact). Whether
-      hisab documents the limit or routes to `eigen_qr` follows from it ([3.4.1]). (AU2-G3-F3)
-    - **cyrius**: x86's `EMIT_F64V_DOT` starts its accumulator at +0 (`xorpd`), so `hvec3_dot`,
-      `hvec4_dot` and `hquat_dot` return +0 where IEEE gives −0 for an all-negative-zero sum (206
-      of 6,000 records for vec3, 101 for vec4 / quat). A hisab-side form is the alternative
-      ([3.4.1]). (F-S1 = AU2-G7-F10)
+11. **Two upstream candidates from the 3.4.0 audits — decided 2026-10-31.** The maintainer approved
+    filing both. Checked against each upstream's contract first:
+    - **ganita: filed** — `ganita_mat_eigen_sym`'s absolute Jacobi stop (see *Toolchain*). Whether
+      hisab routes `eigen_symmetric` to `eigen_qr` meanwhile is its [3.4.1] row. (AU2-G3-F3)
+    - **cyrius: not filed** — `f64v_dot` starts its accumulator at +0 on x86 (`xorpd`) and aarch64
+      (`eor`) alike, the same convention as reference BLAS `ddot`, so an all-(−0) dot product is
+      +0 by definition, not a compiler defect. Whether `hvec3_dot` / `hvec4_dot` / `hquat_dot`
+      should give the natural evaluation order's −0 is hisab's own [3.4.1] row. (F-S1 = AU2-G7-F10)
 12. **Three questions the audits left to the maintainer** (the rows are in [3.5.0]):
     - **(a) The symbolic simplifier's constant folding.** `sym_const_eq` folds within an absolute
       1e-15 "for the O(1) coefficients" (also `migration-3.3.md:92-94`), so `h·x`, `1e-16·1e300`
@@ -924,6 +922,12 @@ Nothing in this section is scheduled until the maintainer decides it.
 
 **Pin: cyrius 6.7.9** (ganita 1.2.15, sakshi 2.5.8) since 3.4.0. Nothing has been filed since the
 ganita QR record below; the two candidates the 3.4.0 audits found are *Decisions owed* #11.
+
+🔴 **Open upstream (ganita), filed 2026-10-31**: `ganita_mat_eigen_sym` stops its Jacobi sweep at
+an absolute 1e-12·max|a_ij|, so a pair coupled weakly against max|a| is never rotated:
+[[1, 1e-13], [1e-13, 1]] returns (1, 1) after 0 rotations (exact 1 ± 1e-13). The repro exits 2 on
+ganita 1.2.15. hisab's record is `issues/2026-10-31-ganita-eigen-sym-absolute-stop.md`;
+`eigen_symmetric` is exposed ([3.4.1]).
 
 🔴 **Open upstream (ganita), filed 2026-10-31**: `ganita_mat_qr` and `ganita_mat_least_squares`
 answer wrongly with status 0 once a column's norm passes about DBL_MAX/2. Q = I and R = A (every

@@ -12,11 +12,14 @@ the identity and qr returns status 0 with Q = I and R = A, every entry finite. A
 come back non-finite. least_squares returns (+∞, −∞) for a well-conditioned system whose solution is
 about (1, −1).
 
-**hisab's exposure.** `lyapunov_max` (`src/linalg_ext.cyr`) is the only caller. Since 3.3.7 it
-refuses a non-finite Z and a non-zero status, which covers the non-finite band. The finite band
-passes through: R = Z, so r00 = |Z₀₀| instead of the column norm, and the exponent is wrong with
-Ok. Derived from the mechanism and not yet measured through `lyapunov_max`; the repair is a
-[3.3.8] row. hisab does not call `ganita_mat_least_squares`.
+**hisab's exposure: none since 3.4.0.** `lyapunov_max` was the only caller; through 3.3.7 the
+finite band passed through it (R = Z, r00 = |Z₀₀|, a wrong exponent with Ok). 3.4.0 replaced the
+call with hisab's own Householder QR (`_lext_ly_qr` in `src/linalg_ext.cyr`), which factors
+power-of-two-scaled columns and skips a reflector only for an exactly zero subcolumn, so neither
+band reaches it; `lyapunov_max`'s doc and tests carry the repair. hisab calls neither
+`ganita_mat_qr` nor `ganita_mat_least_squares` now. The filing stays open for ganita and for
+consumers who call those functions directly; the repro still exits 6 on ganita 1.2.15 (the fold
+in cyrius 6.7.9 and 6.7.18).
 
 **Not filed: the SVD result 3.3.7 reported.** `ganita_mat_svd` returns σ₁ = DBL_MAX for
 [[h, h], [h, h]], h = 2^1023, whose σ₁ is 2^1024. The same 1-ulp-low σ₁ comes back at every scale
@@ -24,5 +27,4 @@ Ok. Derived from the mechanism and not yet measured through `lyapunov_max`; the 
 ganita documents. At h = 2^1023 that ulp lands on DBL_MAX. Not a defect; hisab's wrappers prove
 the exact σ₁ past DBL_MAX and refuse it.
 
-**Close** with a paired run of the ganita repro on the bump that fixes it, and the [3.3.8] row's
-`lyapunov_max` test.
+**Close** with a paired run of the ganita repro on the bump that fixes it.

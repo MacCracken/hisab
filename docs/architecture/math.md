@@ -335,7 +335,7 @@ and in the references below. This index keeps them findable from one place.
 | Quaternions / rotation | slerp, axis-angle, `q v q⁻¹`, to/from matrix | `quat.cyr`, `mat3.cyr` (`m3_from_quat`) |
 | Transforms / projection | SRT compose, Euler orders, perspective/ortho, world↔screen | `transforms.cyr`, `mat4.cyr` |
 | Geometry | 6 ray tests, closest-point, GJK/EPA simplex, MPR portal refinement | `geo.cyr`, `geo_advanced.cyr` (MPR since 3.3.0; `collision_core.cyr` before) |
-| Collision algorithms | monotone-chain hull, ear-clipping, Bowyer-Watson in-circle predicate, sequential-impulse `Δλ = −(1+e)v_eff/m`, PGS/LCP | `collision_core.cyr`, `collision_mesh.cyr`, `linalg_ext.cyr` (`solve_pgs`) |
+| Collision algorithms | monotone-chain hull, ear-clipping, Bowyer-Watson in-circle predicate, sequential-impulse `Δλ = −(1+e)v_eff/m`, PGS/LCP | `collision_core.cyr`, `collision_mesh.cyr`, `linalg_ext.cyr` (`solve_pgs_checked`) |
 | Calculus | Simpson / Gauss-Legendre nodes, Bezier/B-spline/NURBS bases, gradient/Jacobian/Hessian, Perlin/simplex | `calc.cyr`, `calc_ext.cyr`, `noise_simplex.cyr` |
 | ODE | RK4, DOPRI45 / BDF-2..5 tableaux, symplectic (Verlet/Yoshida), SDE (Euler-Maruyama/Milstein) | `ode.cyr` (BDF coefficients verified in the threat-model) |
 | Numerical LA | CSR, GMRES/BiCGSTAB, SVD (Golub-Kahan), eigen (power/Jacobi), Lyapunov, inertia | `linalg_ext.cyr`, `linalg_precision.cyr` |

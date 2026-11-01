@@ -12,6 +12,7 @@ public struct HComplex { re; im; }
 #must_use
 public fn cx_new(re, im) {
     var c = alloc(sizeof(HComplex));
+    if (c == 0) { return 0; }
     HComplex_set_re(c, re);
     HComplex_set_im(c, im);
     return c;
@@ -279,19 +280,26 @@ public fn cx_sqrt(a) {
     var s = F64_ONE;    # the root's scale
     var ds = F64_TWO;   # the divisor's: 2t comes out as t * ds, which is 2t / s
     var r = 0;
+    # The scaled operand is a stack HComplex (3.4.0): cx_abs only reads it, and a heap
+    # copy here was read unchecked.
+    var xy: i64[2];
     if (f64_lt(m, _CX_SQRT_BIG) == 0) {
         x = f64_mul(x, _CX_SQRT_QUARTER);
         y = f64_mul(y, _CX_SQRT_QUARTER);
         s = F64_TWO;
         ds = F64_ONE;
-        r = cx_abs(cx_new(x, y));
+        store64(&xy, x);
+        store64(&xy + 8, y);
+        r = cx_abs(&xy);
     } else {
         if (f64_lt(m, _CX_SQRT_SMALL) == 1) {
             x = f64_mul(x, _CX_SQRT_UP);
             y = f64_mul(y, _CX_SQRT_UP);
             s = _CX_SQRT_UP_ROOT;
             ds = _CX_SQRT_UP_DIV;
-            r = cx_abs(cx_new(x, y));
+            store64(&xy, x);
+            store64(&xy + 8, y);
+            r = cx_abs(&xy);
         } else {
             r = cx_abs(a);
         }
@@ -478,10 +486,12 @@ public fn cmat_new(rows, cols) {
     if (rows <= 0 || cols <= 0) { return 0; }
     if (rows > _CMAT_MAX_ELEMS / cols) { return 0; }  # Overflow guard
     var m = alloc(24);
+    if (m == 0) { return 0; }
     store64(m, rows);
     store64(m + 8, cols);
     var sz = rows * cols * 16;
     var dp = alloc(sz);
+    if (dp == 0) { return 0; }
     var i = 0;
     while (i < rows * cols * 2) {
         store64(dp + i * 8, 0);
@@ -554,6 +564,24 @@ public fn cmat_set(m, r, c, val) {
     return 0;
 }
 
+# ⛔ 3.4.0 -- THE cmat_* ROUTINES BELOW NO LONGER BUILD AN HComplex PER ELEMENT. Each read
+# went through cmat_get (a fresh cx_new) and each product or sum through cx_mul / cx_add,
+# so every term of a product made four heap temporaries, any of which could be refused and
+# then read (the review's exhaustion sweep crashed pauli_x, gamma_0, gamma_spatial and
+# cmat_mul_vec this way). They read and write the two f64 of an element directly, and form
+# each product and sum with cx_mul's and cx_add's own expressions in their order, so every
+# result bit is unchanged.
+# [measured: lane AL review sweep, then a scratch sweep of every 8-byte point on AL2, 2026-10-31; cycc 6.7.9]
+fn _cmat_re(m, r, c) { return load64(_cmat_data(m) + (r * cmat_cols(m) + c) * 16); }
+fn _cmat_im(m, r, c) { return load64(_cmat_data(m) + (r * cmat_cols(m) + c) * 16 + 8); }
+fn _cmat_put(m, r, c, re, im) {
+    var off = (r * cmat_cols(m) + c) * 16;
+    var dp = _cmat_data(m);
+    store64(dp + off, re);
+    store64(dp + off + 8, im);
+    return 0;
+}
+
 # Propagates cmat_new's documented 0-on-failure return. Every cmat_* constructor
 # below does the same: cmat_new caps at _CMAT_MAX_ELEMS and returns 0 above it, and
 # storing through that 0 turns a designed error signal into a SIGSEGV.
@@ -563,7 +591,7 @@ public fn cmat_identity(n) {
     if (m == 0) { return 0; }
     var i = 0;
     while (i < n) {
-        cmat_set(m, i, i, cx_one());
+        _cmat_put(m, i, i, F64_ONE, 0);
         i = i + 1;
     }
     return m;
@@ -588,13 +616,19 @@ public fn cmat_mul(a, b) {
     while (i < ar) {
         var j = 0;
         while (j < bc) {
-            var sum = cx_zero();
+            var sr = 0;
+            var si = 0;
             var k = 0;
             while (k < ac) {
-                sum = cx_add(sum, cx_mul(cmat_get(a, i, k), cmat_get(b, k, j)));
+                var xr = _cmat_re(a, i, k);
+                var xi = _cmat_im(a, i, k);
+                var yr = _cmat_re(b, k, j);
+                var yi = _cmat_im(b, k, j);
+                sr = f64_add(sr, f64_sub(f64_mul(xr, yr), f64_mul(xi, yi)));
+                si = f64_add(si, f64_add(f64_mul(xr, yi), f64_mul(xi, yr)));
                 k = k + 1;
             }
-            cmat_set(r, i, j, sum);
+            _cmat_put(r, i, j, sr, si);
             j = j + 1;
         }
         i = i + 1;
@@ -616,17 +650,23 @@ public fn cmat_mul_vec(m, v) {
     var n = cmat_cols(m);
     var rows = cmat_rows(m);
     var out = alloc(rows * 16);
+    if (out == 0) { return 0; }
     var i = 0;
     while (i < rows) {
-        var sum = cx_zero();
+        var sr = 0;
+        var si = 0;
         var j = 0;
         while (j < n) {
-            var vj = cx_new(load64(v + j * 16), load64(v + j * 16 + 8));
-            sum = cx_add(sum, cx_mul(cmat_get(m, i, j), vj));
+            var xr = _cmat_re(m, i, j);
+            var xi = _cmat_im(m, i, j);
+            var yr = load64(v + j * 16);
+            var yi = load64(v + j * 16 + 8);
+            sr = f64_add(sr, f64_sub(f64_mul(xr, yr), f64_mul(xi, yi)));
+            si = f64_add(si, f64_add(f64_mul(xr, yi), f64_mul(xi, yr)));
             j = j + 1;
         }
-        store64(out + i * 16, HComplex_re(sum));
-        store64(out + i * 16 + 8, HComplex_im(sum));
+        store64(out + i * 16, sr);
+        store64(out + i * 16 + 8, si);
         i = i + 1;
     }
     return out;
@@ -643,7 +683,7 @@ public fn cmat_adjoint(m) {
     while (i < rows) {
         var j = 0;
         while (j < cols) {
-            cmat_set(r, j, i, cx_conj(cmat_get(m, i, j)));
+            _cmat_put(r, j, i, _cmat_re(m, i, j), f64_neg(_cmat_im(m, i, j)));
             j = j + 1;
         }
         i = i + 1;
@@ -656,26 +696,34 @@ public fn cmat_trace(m) {
     # would make a propagated allocation failure indistinguishable from a result.
     if (m == 0) { return 0; }
     var n = cmat_rows(m);
-    var sum = cx_zero();
+    var sr = 0;
+    var si = 0;
     var i = 0;
     while (i < n) {
-        sum = cx_add(sum, cmat_get(m, i, i));
+        sr = f64_add(sr, _cmat_re(m, i, i));
+        si = f64_add(si, _cmat_im(m, i, i));
         i = i + 1;
     }
-    return sum;
+    return cx_new(sr, si);
 }
 
 public fn cmat_scale(m, s) {
     if (m == 0) { return 0; }
+    # s may be a refused cx_real / cx_i (3.4.0): HComplex_re(0) is a null read.
+    if (s == 0) { return 0; }
     var rows = cmat_rows(m);
     var cols = cmat_cols(m);
     var r = cmat_new(rows, cols);
     if (r == 0) { return 0; }
+    var sr = HComplex_re(s);
+    var si = HComplex_im(s);
     var i = 0;
     while (i < rows) {
         var j = 0;
         while (j < cols) {
-            cmat_set(r, i, j, cx_mul(cmat_get(m, i, j), s));
+            var xr = _cmat_re(m, i, j);
+            var xi = _cmat_im(m, i, j);
+            _cmat_put(r, i, j, f64_sub(f64_mul(xr, sr), f64_mul(xi, si)), f64_add(f64_mul(xr, si), f64_mul(xi, sr)));
             j = j + 1;
         }
         i = i + 1;
@@ -701,7 +749,8 @@ public fn cmat_add(a, b) {
     while (i < rows) {
         var j = 0;
         while (j < cols) {
-            cmat_set(r, i, j, cx_add(cmat_get(a, i, j), cmat_get(b, i, j)));
+            _cmat_put(r, i, j, f64_add(_cmat_re(a, i, j), _cmat_re(b, i, j)),
+              f64_add(_cmat_im(a, i, j), _cmat_im(b, i, j)));
             j = j + 1;
         }
         i = i + 1;
@@ -727,7 +776,8 @@ public fn cmat_sub(a, b) {
     while (i < rows) {
         var j = 0;
         while (j < cols) {
-            cmat_set(r, i, j, cx_sub(cmat_get(a, i, j), cmat_get(b, i, j)));
+            _cmat_put(r, i, j, f64_sub(_cmat_re(a, i, j), _cmat_re(b, i, j)),
+              f64_sub(_cmat_im(a, i, j), _cmat_im(b, i, j)));
             j = j + 1;
         }
         i = i + 1;
@@ -763,13 +813,16 @@ public fn cmat_kronecker(a, b) {
     while (i < ar) {
         var j = 0;
         while (j < ac) {
-            var aij = cmat_get(a, i, j);
+            var xr = _cmat_re(a, i, j);
+            var xi = _cmat_im(a, i, j);
             var ii = 0;
             while (ii < br) {
                 var jj = 0;
                 while (jj < bc) {
-                    cmat_set(r, i * br + ii, j * bc + jj,
-                      cx_mul(aij, cmat_get(b, ii, jj)));
+                    var yr = _cmat_re(b, ii, jj);
+                    var yi = _cmat_im(b, ii, jj);
+                    _cmat_put(r, i * br + ii, j * bc + jj, f64_sub(f64_mul(xr, yr), f64_mul(xi, yi)),
+                      f64_add(f64_mul(xr, yi), f64_mul(xi, yr)));
                     jj = jj + 1;
                 }
                 ii = ii + 1;
@@ -806,7 +859,9 @@ public fn cmat_exp(m) {
     while (i < n) {
         var j = 0;
         while (j < n) {
-            fnorm = f64_add(fnorm, cx_norm_sq(cmat_get(m, i, j)));
+            var er = _cmat_re(m, i, j);
+            var ei = _cmat_im(m, i, j);
+            fnorm = f64_add(fnorm, f64_add(f64_mul(er, er), f64_mul(ei, ei)));
             j = j + 1;
         }
         i = i + 1;
@@ -828,21 +883,33 @@ public fn cmat_exp(m) {
         scaled_norm = f64_mul(scaled_norm, F64_HALF);
     }
     # Scale matrix
+    # Every intermediate is checked (3.4.0): a refused one is the designed 0 as a whole.
     var scale_factor = cx_real(f64_div(F64_ONE, ganita_f64_pow(F64_TWO, f64_from(s))));
+    if (scale_factor == 0) { return 0; }
     var ms = cmat_scale(m, scale_factor);
+    if (ms == 0) { return 0; }
     # Taylor: sum = I + M + M^2/2! + M^3/3! + ...
     var result = cmat_identity(n);
+    if (result == 0) { return 0; }
     var term = cmat_identity(n);
+    if (term == 0) { return 0; }
     var k = 1;
     while (k <= 20) {
-        term = cmat_scale(cmat_mul(term, ms), cx_real(f64_div(F64_ONE, f64_from(k))));
+        var tm = cmat_mul(term, ms);
+        if (tm == 0) { return 0; }
+        var fk = cx_real(f64_div(F64_ONE, f64_from(k)));
+        if (fk == 0) { return 0; }
+        term = cmat_scale(tm, fk);
+        if (term == 0) { return 0; }
         result = cmat_add(result, term);
+        if (result == 0) { return 0; }
         k = k + 1;
     }
     # Square s times
     i = 0;
     while (i < s) {
         result = cmat_mul(result, result);
+        if (result == 0) { return 0; }
         i = i + 1;
     }
     return result;
@@ -856,22 +923,25 @@ public fn pauli_0() { return cmat_identity(2); }
 
 public fn pauli_x() {
     var m = cmat_new(2, 2);
-    cmat_set(m, 0, 1, cx_one());
-    cmat_set(m, 1, 0, cx_one());
+    if (m == 0) { return 0; }
+    _cmat_put(m, 0, 1, F64_ONE, 0);
+    _cmat_put(m, 1, 0, F64_ONE, 0);
     return m;
 }
 
 public fn pauli_y() {
     var m = cmat_new(2, 2);
-    cmat_set(m, 0, 1, cx_new(0, f64_neg(F64_ONE)));
-    cmat_set(m, 1, 0, cx_new(0, F64_ONE));
+    if (m == 0) { return 0; }
+    _cmat_put(m, 0, 1, 0, f64_neg(F64_ONE));
+    _cmat_put(m, 1, 0, 0, F64_ONE);
     return m;
 }
 
 public fn pauli_z() {
     var m = cmat_new(2, 2);
-    cmat_set(m, 0, 0, cx_one());
-    cmat_set(m, 1, 1, cx_new(f64_neg(F64_ONE), 0));
+    if (m == 0) { return 0; }
+    _cmat_put(m, 0, 0, F64_ONE, 0);
+    _cmat_put(m, 1, 1, f64_neg(F64_ONE), 0);
     return m;
 }
 
@@ -882,30 +952,34 @@ public fn pauli_z() {
 public fn gamma_0() {
     # gamma^0 = diag(I, -I) in Dirac representation
     var m = cmat_new(4, 4);
-    cmat_set(m, 0, 0, cx_one());
-    cmat_set(m, 1, 1, cx_one());
-    cmat_set(m, 2, 2, cx_new(f64_neg(F64_ONE), 0));
-    cmat_set(m, 3, 3, cx_new(f64_neg(F64_ONE), 0));
+    if (m == 0) { return 0; }
+    _cmat_put(m, 0, 0, F64_ONE, 0);
+    _cmat_put(m, 1, 1, F64_ONE, 0);
+    _cmat_put(m, 2, 2, f64_neg(F64_ONE), 0);
+    _cmat_put(m, 3, 3, f64_neg(F64_ONE), 0);
     return m;
 }
 
 public fn gamma_spatial(idx) {
     # gamma^i = [[0, sigma^i], [-sigma^i, 0]], idx: 0=gamma^1(sigmax), 1=gamma^2(sigmay), 2=gamma^3(sigmaz)
     if (idx < 0 || idx > 2) { return cmat_new(4, 4); }  # Invalid -> zero matrix
-    var sigma = pauli_x();
+    var sigma = 0;
+    if (idx == 0) { sigma = pauli_x(); }
     if (idx == 1) { sigma = pauli_y(); }
     if (idx == 2) { sigma = pauli_z(); }
+    if (sigma == 0) { return 0; }
     var m = cmat_new(4, 4);
+    if (m == 0) { return 0; }
     # Top-right: sigma
-    cmat_set(m, 0, 2, cmat_get(sigma, 0, 0));
-    cmat_set(m, 0, 3, cmat_get(sigma, 0, 1));
-    cmat_set(m, 1, 2, cmat_get(sigma, 1, 0));
-    cmat_set(m, 1, 3, cmat_get(sigma, 1, 1));
+    _cmat_put(m, 0, 2, _cmat_re(sigma, 0, 0), _cmat_im(sigma, 0, 0));
+    _cmat_put(m, 0, 3, _cmat_re(sigma, 0, 1), _cmat_im(sigma, 0, 1));
+    _cmat_put(m, 1, 2, _cmat_re(sigma, 1, 0), _cmat_im(sigma, 1, 0));
+    _cmat_put(m, 1, 3, _cmat_re(sigma, 1, 1), _cmat_im(sigma, 1, 1));
     # Bottom-left: -sigma
-    cmat_set(m, 2, 0, cx_neg(cmat_get(sigma, 0, 0)));
-    cmat_set(m, 2, 1, cx_neg(cmat_get(sigma, 0, 1)));
-    cmat_set(m, 3, 0, cx_neg(cmat_get(sigma, 1, 0)));
-    cmat_set(m, 3, 1, cx_neg(cmat_get(sigma, 1, 1)));
+    _cmat_put(m, 2, 0, f64_neg(_cmat_re(sigma, 0, 0)), f64_neg(_cmat_im(sigma, 0, 0)));
+    _cmat_put(m, 2, 1, f64_neg(_cmat_re(sigma, 0, 1)), f64_neg(_cmat_im(sigma, 0, 1)));
+    _cmat_put(m, 3, 0, f64_neg(_cmat_re(sigma, 1, 0)), f64_neg(_cmat_im(sigma, 1, 0)));
+    _cmat_put(m, 3, 1, f64_neg(_cmat_re(sigma, 1, 1)), f64_neg(_cmat_im(sigma, 1, 1)));
     return m;
 }
 

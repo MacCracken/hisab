@@ -14,6 +14,7 @@ include "src/geo.cyr"
 include "src/geo_advanced.cyr"
 include "src/calc.cyr"
 include "src/num.cyr"
+include "src/num_ext.cyr"
 include "src/ode.cyr"
 include "src/optimize.cyr"
 include "src/linalg_ext.cyr"
@@ -163,13 +164,13 @@ assert_eq(m4_get(mii, 0, 1), f64_from(0), "I*I[0,1]");
 
 # SRT translate
 var srt = m4_from_srt(hvec3_one(), hquat_identity(), hvec3_new(f64_from(2), f64_from(3), f64_from(4)));
-var tp = m4_transform_point(srt, hvec3_zero());
+var tp_t, tp = m4_transform_point_checked(srt, hvec3_zero());
 assert_eq(HVec3_x(tp), f64_from(2), "srt.x");
 assert_eq(HVec3_y(tp), f64_from(3), "srt.y");
 assert_eq(HVec3_z(tp), f64_from(4), "srt.z");
 
 # Inverse: M * M^-1 ≈ I
-var inv = m4_inverse(srt);
+var inv_t, inv = m4_inverse_checked(srt);
 var prod = m4_mul(srt, inv);
 # srt is a pure translation, so M * M^-1 is I exactly -- measured residual 0 on
 # every entry. The old bound of 1.0 accepted any [0][0] in [0, 2]; and a single
@@ -197,7 +198,8 @@ assert_eq(_mi_bad, 0, "M * M^-1 == I in all 16 entries (1e-15)");
 # only foundation.tcyr catches it). Repeat with a non-symmetric rotation block.
 var _rq = hquat_from_rotation_z(F64_PI_4);
 var _rm = m4_from_srt(hvec3_one(), _rq, hvec3_new(F64_TWO, f64_from(3), f64_from(4)));
-var _rp = m4_mul(_rm, m4_inverse(_rm));
+var _rm_it, _rm_inv = m4_inverse_checked(_rm);
+var _rp = m4_mul(_rm, _rm_inv);
 var _rbad = 0;
 var _rr = 0;
 while (_rr < 4) {
@@ -308,7 +310,7 @@ test_group("interpolation");
 var l = hisab_lerp(f64_from(0), f64_from(10), F64_HALF);
 assert_eq(l, f64_from(5), "lerp 0.5");
 
-var il = hisab_inverse_lerp(f64_from(0), f64_from(10), f64_from(5));
+var il_t, il = hisab_inverse_lerp_checked(f64_from(0), f64_from(10), f64_from(5));
 assert_f64_eq(il, f64_div(f64_from(5), f64_from(10)), "inv_lerp");
 
 # ================================================================
@@ -783,7 +785,20 @@ vec_push(_bdf_hist, F64_ONE);
 vec_push(_bdf_hist, F64_ONE);
 vec_push(_bdf_hist, F64_ONE);
 vec_push(_bdf_hist, F64_ONE);
-var _bdf4 = ode_bdf(&_ode_zero, 0, _bdf_hist, 4, f64_div(F64_ONE, f64_from(10)),
+# 3.4.0: ode_bdf is retired; _bdf_at reads ode_bdf_checked, and returns a signalling NaN
+# no Ok value has when it refuses, so no value assertion below can pass on a refusal.
+var _BDF_OUT = alloc(8);
+fn _bdf_at(f, t, hist, order, dt, tol) {
+    store64(_BDF_OUT, 0x7FF4000000000001);
+    var bt, bv = ode_bdf_checked(f, t, hist, order, dt, tol, _BDF_OUT);
+    return load64(_BDF_OUT);
+}
+fn _bdf_err(f, t, hist, order, dt, tol) {
+    var bt, bv = ode_bdf_checked(f, t, hist, order, dt, tol, _BDF_OUT);
+    if (is_ok(bt) == 1) { return 0; }
+    return bv;
+}
+var _bdf4 = _bdf_at(&_ode_zero, 0, _bdf_hist, 4, f64_div(F64_ONE, f64_from(10)),
   f64_div(F64_ONE, f64_from(1000000000000)));
 assert_eq(_bdf4, F64_ONE, "bdf4: constant solution is reproduced exactly, bit-exact (sum(alpha) == 1)");
 
@@ -843,7 +858,7 @@ fn _bdf_order_fails(k) {
         for (var j = 0; j < k; j = j + 1) {
             vec_push(hist, _bdf_pow(f64_add(t0, f64_mul(f64_from(j), dt)), m));
         }
-        var got = ode_bdf(&_bdf_dpdt, tn1, hist, k, dt, EPSILON_F64);
+        var got = _bdf_at(&_bdf_dpdt, tn1, hist, k, dt, EPSILON_F64);
         var want = _bdf_pow(tn1, m);
         # Relative: BDF-5 differences terms of magnitude ~214 to land on 243.
         var tolk = f64_mul(f64_div(F64_ONE, f64_from(1000000000000)),
@@ -866,19 +881,19 @@ _bdf_deg = 3;
 var _bdf_h3 = vec_new();
 vec_push(_bdf_h3, _bdf_pow(F64_HALF, 3));
 vec_push(_bdf_h3, _bdf_pow(F64_ONE, 3));
-var _bdf_p3 = ode_bdf(&_bdf_dpdt, f64_div(f64_from(3), F64_TWO), _bdf_h3, 2,
+var _bdf_p3 = _bdf_at(&_bdf_dpdt, f64_div(f64_from(3), F64_TWO), _bdf_h3, 2,
   F64_HALF, EPSILON_F64);
 # 85/24 correctly rounded is f64_div(85, 24) (python3 Fraction): bit-exact.
 assert_eq(_bdf_p3, f64_div(f64_from(85), f64_from(24)),
   "bdf2 on t^3 returns 85/24 bit-exact -- one degree past its order, exactly as it must");
 
-# Input validation, documented as "0 on invalid input".
-assert_eq(ode_bdf(&_bdf_dpdt, F64_ONE, _bdf_h3, 1, F64_HALF, EPSILON_F64), 0,
-  "ode_bdf rejects order 1");
-assert_eq(ode_bdf(&_bdf_dpdt, F64_ONE, _bdf_h3, 6, F64_HALF, EPSILON_F64), 0,
-  "ode_bdf rejects order 6");
-assert_eq(ode_bdf(&_bdf_dpdt, F64_ONE, _bdf_h3, 3, F64_HALF, EPSILON_F64), 0,
-  "ode_bdf rejects a history shorter than the order");
+# Input validation: HSB_ERR_INVALID_INPUT (3.3.7's ode_bdf documented "0 on invalid input").
+assert_eq(_bdf_err(&_bdf_dpdt, F64_ONE, _bdf_h3, 1, F64_HALF, EPSILON_F64), HSB_ERR_INVALID_INPUT,
+  "ode_bdf_checked rejects order 1");
+assert_eq(_bdf_err(&_bdf_dpdt, F64_ONE, _bdf_h3, 6, F64_HALF, EPSILON_F64), HSB_ERR_INVALID_INPUT,
+  "ode_bdf_checked rejects order 6");
+assert_eq(_bdf_err(&_bdf_dpdt, F64_ONE, _bdf_h3, 3, F64_HALF, EPSILON_F64), HSB_ERR_INVALID_INPUT,
+  "ode_bdf_checked rejects a history shorter than the order");
 
 # Yoshida-4 on a free particle (accel == 0): the drift coefficients must sum to 1,
 # so q advances by exactly v*dt. Pre-fix they summed to 0.859 and it moved 85.9%
@@ -1583,14 +1598,18 @@ for (var _cg7_e = 0 - 495; _cg7_e <= 504; _cg7_e = _cg7_e + 1) {
 }
 assert_eq(_CG7_BAD, 0,
   "opt_conjugate_gradient: (k, 2k) for k = 2^-495 to 2^-485 and 2^496 to 2^504 (3.3.6: none but 2^-485)");
-assert_eq(_cg7_run(0 - 496, 0), 0,
-  "opt_conjugate_gradient: k = 2^-496 -> NO_CONVERGENCE, documented (f under DBL_MIN near the minimum)");
-# Where f(x) itself is 0 (k = 2^-600: f(x0) is about 2^-1185), every Armijo trial ties at
-# alpha = 1; a rescaled beta compounded those blind steps to overflow, so f(x) = 0 keeps
-# the unscaled beta, and the run ends at a finite point, as in 3.3.6.
-assert_eq(_cg7_run(0 - 600, 0), 0, "opt_conjugate_gradient: k = 2^-600 -> NO_CONVERGENCE");
-assert_eq(f64_lt(f64_abs(load64(_cg7_ox + 8)), F64_POS_INF), 1,
-  "opt_conjugate_gradient: k = 2^-600 -> a finite out_x, not NaN (f(x) = 0 keeps the unscaled beta)");
+# 3.4.0: below 2^-495, where f falls under DBL_MIN near the minimum and the Armijo test
+# could not measure a step (3.3.7: NO_CONVERGENCE, documented), the slope-measuring line
+# search (_opt_wolfe_search) reaches the k = 1 answer times k as well; at k = 2^-600, where
+# f(x0) itself is 0, too (3.3.7 left a finite wrong point there).
+# [measured: scratch CG probes (NU1-work/p/pcg.cyr, pcg3.cyr), base tree and this tree, 2026-10-31]
+assert_eq(_cg7_run(0 - 496, 0), 1,
+  "opt_conjugate_gradient: k = 2^-496 converges (3.3.7: NO_CONVERGENCE, f under DBL_MIN near the minimum)");
+assert_eq(_cg7_scaled(0 - 496, _cg7_u0, _cg7_u1), 1,
+  "opt_conjugate_gradient: k = 2^-496 -> 2^-496 times the k = 1 answer");
+assert_eq(_cg7_run(0 - 600, 0), 1, "opt_conjugate_gradient: k = 2^-600 converges (3.3.7: NO_CONVERGENCE)");
+assert_eq(_cg7_scaled(0 - 600, _cg7_u0, _cg7_u1), 1,
+  "opt_conjugate_gradient: k = 2^-600 -> 2^-600 times the k = 1 answer");
 # BFGS and L-BFGS reached (k, 2k) at 2^500 in 3.3.6 too, after the 40 halvings on their first
 # step: 52 and 50 evaluations of f. They now take the k = 1 path: 30 and 28.
 assert_eq(_cg7_run(500, 1), 1, "opt_bfgs: k = 2^500 converges");
@@ -1598,7 +1617,14 @@ assert_eq(load64(_cg7_ox), (1023 + 500) << 52, "opt_bfgs: k = 2^500 -> x0 = k ex
 assert_eq(_CG7_NF, 30, "opt_bfgs: k = 2^500 evaluates f 30 times, as at k = 1 (3.3.6: 52)");
 assert_eq(_cg7_run(500, 2), 1, "opt_lbfgs: k = 2^500 converges");
 assert_eq(load64(_cg7_ox + 8), (1023 + 501) << 52, "opt_lbfgs: k = 2^500 -> x1 = 2k exactly");
-assert_eq(_CG7_NF, 28, "opt_lbfgs: k = 2^500 evaluates f 28 times, as at k = 1 (3.3.6: 50)");
+# 3.4.0: opt_lbfgs's step is _opt_wolfe_search's (the unit step first; a trial that fails
+# Armijo where f measures it costs f alone): 9 values of f and 9 gradients at 2^500, where the
+# unit step's f overflows and the slopes decide; 16 and 10 at k = 1 (3.3.7: 28 and 6 at both;
+# 3.4.0's first form: 9 and 9 at both).
+# [measured: scratch probe (NU1-work/p/plb.cyr), 3.3.7, integ-snap5 and this tree, 2026-10-31]
+assert_eq(_CG7_NF, 9, "opt_lbfgs: k = 2^500 evaluates f 9 times (3.3.7: 28; 3.3.6: 50)");
+assert_eq(_cg7_run(0, 2), 1, "opt_lbfgs: k = 1 converges");
+assert_eq(_CG7_NF, 16, "opt_lbfgs: k = 1 evaluates f 16 times (3.3.7: 28)");
 # _opt_armijo asked directly. (b) f = 2^12 x^2 at x = 2^500 along d = -g = -2^513: d.g = -2^1026
 # overflows; exact Armijo halves to alpha = 2^-13, where x + alpha d = 0, the minimiser, after 14
 # evaluations (alpha 2^-12 gives f(-2^500) = f(x), above the threshold). 3.3.6: no step
@@ -1669,9 +1695,9 @@ var _bicg_x0 = alloc(24);
 store64(_bicg_x0, 0);
 store64(_bicg_x0 + 8, 0);
 store64(_bicg_x0 + 16, 0);
-var _bicg_x = solve_bicgstab(&_bicg_matvec, _bicg_b, _bicg_x0, 3,
+var _bicg_xt, _bicg_x = solve_bicgstab_checked(&_bicg_matvec, _bicg_b, _bicg_x0, 3,
   f64_div(F64_ONE, f64_from(1000000000)), 100);
-assert(_bicg_x != 0, "bicgstab returns a solution");
+assert_eq(is_ok(_bicg_xt), 1, "bicgstab returns a solution");
 var _bicg_eps = f64_div(F64_ONE, f64_from(1000000));
 assert(f64_lt(f64_abs(f64_sub(load64(_bicg_x), F64_ONE)), _bicg_eps) == 1, "bicgstab x[0] == 1");
 assert(f64_lt(f64_abs(f64_sub(load64(_bicg_x + 8), F64_TWO)), _bicg_eps) == 1, "bicgstab x[1] == 2");
@@ -1700,14 +1726,19 @@ assert_eq(load64(_bicg_x + 16), 0x4007FFFFFFFFFFFF, "bicgstab unit scale: x[2] i
 # 1.99766, 2.95940) where the answer is (1, 2, 3). Oracle: the tol = 1e-9 solve above,
 # bit for bit. At tol = 0 the loop ends only on an exact zero, and still must not drift.
 # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
-var _g2b_x17 = solve_bicgstab(&_bicg_matvec, _bicg_b, _bicg_x0, 3, 0x3C670EF54646D497, 100);  # 1e-17
-var _g2b_xt0 = solve_bicgstab(&_bicg_matvec, _bicg_b, _bicg_x0, 3, 0, 100);
-for (var _g2b_i = 0; _g2b_i < 3; _g2b_i = _g2b_i + 1) {
-    assert_eq(load64(_g2b_x17 + _g2b_i * 8), load64(_bicg_x + _g2b_i * 8),
-      "bicgstab tol = 1e-17: the converged x, bit-identical to tol = 1e-9 (3.3.2: x[2] 1.35% off)");
-    assert_eq(load64(_g2b_xt0 + _g2b_i * 8), load64(_bicg_x + _g2b_i * 8),
-      "bicgstab tol = 0: still the converged x once an exact zero ends the loop");
-}
+# ⭐ 3.4.0 review — Ok is confirmed with the true residual b' - A' x. At 1e-17 the recurrence's
+# residual met tol while the true one did not, so the run restarted from it and ended on
+# (1, 2 - 2^-52, 3), within an ulp of (1, 2, 3) (3.3.3-3.4.0: the 1e-9 solve's bits); at tol = 0
+# no x reaches an exactly zero true residual, so it is NO_CONVERGENCE (it was Ok on the
+# recurrence's exact zero).
+# [measured: LA2 probe k2, this tree, cycc 6.7.9, 2026-10-31]
+var _g2b_x17t, _g2b_x17 = solve_bicgstab_checked(&_bicg_matvec, _bicg_b, _bicg_x0, 3, 0x3C670EF54646D497, 100);  # 1e-17
+var _g2b_xt0t, _g2b_xt0 = solve_bicgstab_checked(&_bicg_matvec, _bicg_b, _bicg_x0, 3, 0, 100);
+assert_eq(is_ok(_g2b_x17t), 1, "bicgstab tol = 1e-17: Ok (3.3.2: x[2] 1.35% off)");
+assert_eq(load64(_g2b_x17), F64_ONE, "bicgstab tol = 1e-17: x[0] = 1 exactly, confirmed on the true residual");
+assert_eq(load64(_g2b_x17 + 8), 0x3FFFFFFFFFFFFFFF, "bicgstab tol = 1e-17: x[1] = 2 - 2^-52");
+assert_eq(load64(_g2b_x17 + 16), f64_from(3), "bicgstab tol = 1e-17: x[2] = 3 exactly");
+assert_eq(_g2b_xt0, HSB_ERR_NO_CONVERGENCE, "bicgstab tol = 0: no exactly zero true residual -> NO_CONVERGENCE");
 
 # (1b) r = 0 AT THE START: x0 already solves the system exactly. r_hat is then the zero
 # vector (there is no power of two to scale it by), r_hat . r = 0, and x0 comes back
@@ -1721,8 +1752,9 @@ fn _g2b_count_bicg(xp) {
     _G2B_EX_CALLS = _G2B_EX_CALLS + 1;
     return _bicg_matvec(xp);
 }
-var _g2b_xex = solve_bicgstab(&_g2b_count_bicg, _bicg_b, _g2b_xe, 3, 0, 50);
-assert_eq(_G2B_EX_CALLS, 1, "bicgstab, x0 exact: stops after the one matvec that formed r = 0");
+var _g2b_xext, _g2b_xex = solve_bicgstab_checked(&_g2b_count_bicg, _bicg_b, _g2b_xe, 3, 0, 50);
+# (3.4.0 review: plus the scaled frame's probe, A b')
+assert_eq(_G2B_EX_CALLS, 2, "bicgstab, x0 exact: stops after the probe and the one matvec that formed r = 0");
 assert_eq(load64(_g2b_xex), F64_ONE, "bicgstab, x0 exact: x0 returned, x[0] = 1");
 assert_eq(load64(_g2b_xex + 8), F64_TWO, "bicgstab, x0 exact: x[1] = 2");
 assert_eq(load64(_g2b_xex + 16), f64_from(3), "bicgstab, x0 exact: x[2] = 3");
@@ -1737,7 +1769,7 @@ fn _g2b_2I(xp) {
     store64(o + 16, f64_mul(F64_TWO, load64(xp + 16)));
     return o;
 }
-var _g2b_x2 = solve_bicgstab(&_g2b_2I, _bicg_b, _bicg_x0, 3, 0, 50);
+var _g2b_x2t, _g2b_x2 = solve_bicgstab_checked(&_g2b_2I, _bicg_b, _bicg_x0, 3, 0, 50);
 assert_eq(load64(_g2b_x2), f64_from(3), "bicgstab 2I, tol 0: t = 0 keeps the half step, x[0] = 3 (3.3.2: 0)");
 assert_eq(load64(_g2b_x2 + 8), f64_from(5), "bicgstab 2I, tol 0: x[1] = 5 (3.3.2: 0)");
 assert_eq(load64(_g2b_x2 + 16), f64_from(4), "bicgstab 2I, tol 0: x[2] = 4 (3.3.2: 0)");
@@ -1752,7 +1784,7 @@ var _g2b_bsub = alloc(24);
 store64(_g2b_bsub, 96);          # 6 * 2^-1070
 store64(_g2b_bsub + 8, 160);     # 10 * 2^-1070
 store64(_g2b_bsub + 16, 128);    # 8 * 2^-1070
-var _g2b_xsub = solve_bicgstab(&_g2b_2I, _g2b_bsub, _bicg_x0, 3, 0, 50);
+var _g2b_xsubt, _g2b_xsub = solve_bicgstab_checked(&_g2b_2I, _g2b_bsub, _bicg_x0, 3, 0, 50);
 assert_eq(load64(_g2b_xsub), 48, "bicgstab, subnormal b: x[0] = 3 * 2^-1070 exactly (3.3.2: 0)");
 assert_eq(load64(_g2b_xsub + 8), 80, "bicgstab, subnormal b: x[1] = 5 * 2^-1070 exactly (3.3.2: 0)");
 assert_eq(load64(_g2b_xsub + 16), 64, "bicgstab, subnormal b: x[2] = 4 * 2^-1070 exactly (3.3.2: 0)");
@@ -1776,18 +1808,20 @@ fn _g2b_zt(xp) {
     }
     return _bicg_matvec(xp);
 }
+# 3.4.0: the zero-t stop is a breakdown and is reported (3.3.3-3.3.7 returned the half step
+# x0 + alpha p, unreported). tol = +Inf is refused before any matvec (3.4.0 review; through the
+# first 3.4.0 tree it accepted x0, an infinite residual included).
 _G2B_CALLS = 0;
-var _g2b_xh = solve_bicgstab(&_g2b_zt, _bicg_b, _bicg_x0, 3, F64_POS_INF, 50);
-assert_eq(_G2B_CALLS, 2, "bicgstab tol = +Inf: returns at the first half step, 2 matvecs");
+var _g2b_xht, _g2b_xh = solve_bicgstab_checked(&_g2b_zt, _bicg_b, _bicg_x0, 3, F64_POS_INF, 50);
+assert_eq(_G2B_CALLS, 0, "bicgstab tol = +Inf: no matvec (3.3.7: the half step, 2)");
+assert_eq(_g2b_xh, HSB_ERR_INVALID_INPUT, "bicgstab tol = +Inf -> INVALID_INPUT");
 _G2B_CALLS = 0;
 _G2B_ZERO_AT = 3;
-var _g2b_xz = solve_bicgstab(&_g2b_zt, _bicg_b, _bicg_x0, 3, 0x3DDB7CDFD9D7BDBB, 50);  # 1e-10
+var _g2b_xzt, _g2b_xz = solve_bicgstab_checked(&_g2b_zt, _bicg_b, _bicg_x0, 3, 0x3DDB7CDFD9D7BDBB, 50);  # 1e-10
 _G2B_ZERO_AT = 0 - 1;
 assert_eq(_G2B_CALLS, 3, "bicgstab, first t = 0: stops after 3 matvecs (without the omega test: 101)");
-for (var _g2b_j = 0; _g2b_j < 3; _g2b_j = _g2b_j + 1) {
-    assert_eq(load64(_g2b_xz + _g2b_j * 8), load64(_g2b_xh + _g2b_j * 8),
-      "bicgstab, first t = 0: x0 + alpha p, bit-identical to the half step (3.3.2: x0; NaN without the test)");
-}
+assert_eq(_g2b_xz, HSB_ERR_NO_CONVERGENCE,
+  "bicgstab, first t = 0: omega = 0 -> NO_CONVERGENCE (3.3.3-3.3.7: the half step, unreported; 3.3.2: x0)");
 
 # (4) r_hat . A p EXACTLY ZERO. A rotates (x0, x1) by 90 degrees, so with b = e0 the
 # first r_hat . A p is 0 and alpha cannot be formed: the guard returns x0 untouched.
@@ -1802,18 +1836,17 @@ var _g2b_be0 = alloc(24);
 store64(_g2b_be0, F64_ONE);
 store64(_g2b_be0 + 8, 0);
 store64(_g2b_be0 + 16, 0);
-var _g2b_xs = solve_bicgstab(&_g2b_skew, _g2b_be0, _bicg_x0, 3, 0x3DDB7CDFD9D7BDBB, 50);
-assert_eq(load64(_g2b_xs), 0, "bicgstab, r_hat . A p = 0: x0 returned, x[0] = +0 (not Inf or NaN)");
-assert_eq(load64(_g2b_xs + 8), 0, "bicgstab, r_hat . A p = 0: x[1] = +0");
-assert_eq(load64(_g2b_xs + 16), 0, "bicgstab, r_hat . A p = 0: x[2] = +0");
+var _g2b_xst, _g2b_xs = solve_bicgstab_checked(&_g2b_skew, _g2b_be0, _bicg_x0, 3, 0x3DDB7CDFD9D7BDBB, 50);
+assert_eq(is_err_result(_g2b_xst), 1, "bicgstab, r_hat . A p = 0: a breakdown -> Err (3.3.3-3.3.7: x0, unreported)");
+assert_eq(_g2b_xs, HSB_ERR_NO_CONVERGENCE, "bicgstab, r_hat . A p = 0: NO_CONVERGENCE (not Inf or NaN)");
 
 # (5) r_hat . r EXACTLY ZERO WITH r != 0 (a lucky breakdown). A = [[1,2,0],[2,1,2],
 # [1,-2,1]], b = (0,-1,0): every intermediate is a small dyadic, so the float run is
 # exact. After one iteration alpha = 1, omega = 1, x = (2,-1,-2), r = (0,0,-2), and
 # r_hat = (0,-1,0) is orthogonal to r. Oracle: the same recurrence in exact rational
-# arithmetic. ⚠ (2,-1,-2) is NOT the solution, (0.4,-0.2,-0.8): this pins the breakdown
-# contract, which returns the current iterate and does not report it. Without the
-# test the stored rho becomes 0, the next beta divides by it, and x comes back NaN.
+# arithmetic. ⚠ (2,-1,-2) is NOT the solution, (0.4,-0.2,-0.8): through 3.3.7 the breakdown
+# returned it as the answer, unreported; since 3.4.0 it is Err(HSB_ERR_NO_CONVERGENCE).
+# Without the test the stored rho becomes 0, the next beta divides by it, and x is NaN.
 fn _g2b_lucky(xp) {
     var o = alloc(24);
     var a0 = load64(xp);
@@ -1828,10 +1861,9 @@ var _g2b_bl = alloc(24);
 store64(_g2b_bl, 0);
 store64(_g2b_bl + 8, f64_neg(F64_ONE));
 store64(_g2b_bl + 16, 0);
-var _g2b_xl = solve_bicgstab(&_g2b_lucky, _g2b_bl, _bicg_x0, 3, 0x3DDB7CDFD9D7BDBB, 50);
-assert_eq(load64(_g2b_xl), F64_TWO, "bicgstab lucky breakdown: current iterate x[0] = 2");
-assert_eq(load64(_g2b_xl + 8), f64_neg(F64_ONE), "bicgstab lucky breakdown: x[1] = -1");
-assert_eq(load64(_g2b_xl + 16), f64_neg(F64_TWO), "bicgstab lucky breakdown: x[2] = -2");
+var _g2b_xlt, _g2b_xl = solve_bicgstab_checked(&_g2b_lucky, _g2b_bl, _bicg_x0, 3, 0x3DDB7CDFD9D7BDBB, 50);
+assert_eq(is_err_result(_g2b_xlt), 1, "bicgstab lucky breakdown: Err (3.3.7: the iterate (2,-1,-2), unreported)");
+assert_eq(_g2b_xl, HSB_ERR_NO_CONVERGENCE, "bicgstab lucky breakdown: NO_CONVERGENCE");
 
 # (6) THE SCALE SWEEP. A = 2^ea * N, N = [[4,1,0],[-1,3,1],[0,-2,2]], b = 2^eb * c with
 # c = (1, 2.1, 2.9), so x = 2^(eb-ea) * x1 for the unit-scale x1. ea, eb run over
@@ -1870,8 +1902,9 @@ fn _g2b_solve_scaled(ea, eb) {
     store64(x0, 0);
     store64(x0 + 8, 0);
     store64(x0 + 16, 0);
-    var xs = solve_bicgstab(&_g2b_kN, bb, x0, 3, f64_mul(kb, 0x3DDB7CDFD9D7BDBB), 200);  # kb * 1e-10
+    var xt, xs = solve_bicgstab_checked(&_g2b_kN, bb, x0, 3, 0x3DDB7CDFD9D7BDBB, 200);  # 1e-10, relative
     _G2B_KA = F64_ONE;
+    if (is_err_result(xt) == 1) { return 0; }
     return xs;
 }
 var _g2b_x1 = _g2b_solve_scaled(0, 0);
@@ -1893,7 +1926,8 @@ for (var _g2b_ea = 0 - 1000; _g2b_ea <= 1000; _g2b_ea = _g2b_ea + 25) {
         if (_g2b_dx <= 1000 && _g2b_sm <= 1000) {
             _G2B_CELLS = _G2B_CELLS + 1;
             var _g2b_xc = _g2b_solve_scaled(_g2b_ea, _g2b_eb);
-            for (var _g2b_k = 0; _g2b_k < 3; _g2b_k = _g2b_k + 1) {
+            if (_g2b_xc == 0) { _G2B_BAD = _G2B_BAD + 3; }
+            for (var _g2b_k = 0; _g2b_k < 3 && _g2b_xc != 0; _g2b_k = _g2b_k + 1) {
                 # x * 2^ea * 2^-eb, in two exact steps so neither factor leaves the range
                 var _g2b_back = f64_mul(f64_mul(load64(_g2b_xc + _g2b_k * 8), (1023 + _g2b_ea) << 52),
                   (1023 - _g2b_eb) << 52);
@@ -1936,8 +1970,9 @@ fn _r5le_orth(xp) {
 fn _r5le_solve(b, tol, at) {
     _R5LE_CALLS = 0;
     _R5LE_AT = at;
-    var x = solve_bicgstab(&_r5le_orth, b, _bicg_x0, 3, tol, 50);
+    var xt, x = solve_bicgstab_checked(&_r5le_orth, b, _bicg_x0, 3, tol, 50);
     _R5LE_AT = 0 - 1;
+    if (is_err_result(xt) == 1) { return x; }   # the Err code (negative), never a pointer
     return x;
 }
 var _R5LE_QNAN = 0x7FF8000000000000;
@@ -1948,10 +1983,8 @@ var _R5LE_QNAN = 0x7FF8000000000000;
 # [measured: R5le probe, 3.3.2 bundle, the tree before this repair and this tree, cycc 6.6.12, 2026-10-01]
 var _r5le_x1 = _r5le_solve(_bicg_b, 0x3DDB7CDFD9D7BDBB, 3);   # 1e-10
 assert_eq(_R5LE_CALLS, 3, "bicgstab, orthogonal t (sum exactly 0): stops at the 3rd matvec");
-for (var _r5le_i = 0; _r5le_i < 3; _r5le_i = _r5le_i + 1) {
-    assert_eq(load64(_r5le_x1 + _r5le_i * 8), _R5LE_QNAN,
-      "bicgstab, orthogonal t (sum exactly 0): x is NaN (before: the half step, 41% off; 3.3.2: NaN)");
-}
+assert_eq(_r5le_x1, HSB_ERR_NO_CONVERGENCE,
+  "bicgstab, orthogonal t (sum exactly 0): NO_CONVERGENCE (3.3.3-3.3.7: x NaN; before: the half step, 41% off)");
 # (2) THE NUMERATOR IS A ROUNDING RESIDUE. x* = (-5.584, 9.195, 4.456), b = N x*,
 # the same t: the rescue's sum is 1.1e-16 against a bound of 1.1e-15, so omega was
 # 2.3e-17; the loop went on, r_hat . r came out exactly 0, and that breakdown returned
@@ -1964,21 +1997,15 @@ store64(_r5le_xs + 8, 0x402263D70A3D70A4);    # 9.195
 store64(_r5le_xs + 16, 0x4011D2F1A9FBE76D);   # 4.456
 var _r5le_b2 = _bicg_matvec(_r5le_xs);
 var _r5le_x2 = _r5le_solve(_r5le_b2, 0x3DDB7CDFD9D7BDBB, 3);   # 1e-10
-for (var _r5le_j = 0; _r5le_j < 3; _r5le_j = _r5le_j + 1) {
-    assert_eq(load64(_r5le_x2 + _r5le_j * 8), _R5LE_QNAN,
-      "bicgstab, orthogonal t (rounding residue): x is NaN (before: a breakdown iterate 32% off; 3.3.2: NaN)");
-}
-# (3) THE ITERATE HAS ALREADY CONVERGED. tol 0, the orthogonal t on the 7th call,
-# where |s| is 4.0e-17 against |r0| = 14.1: the half step is as converged as r0's
-# rounding allows and comes back, bit-identical to the tol = 1e-9 solve above. The
-# tree before the repair returned the same bits after 97 matvecs; 3.3.2 returned
-# (0.98986, 1.99766, 2.95940) from its t . t test.
+assert_eq(_r5le_x2, HSB_ERR_NO_CONVERGENCE,
+  "bicgstab, orthogonal t (rounding residue): NO_CONVERGENCE (3.3.3-3.3.7: NaN; before: an iterate 32% off)");
+# (3) THE ITERATE HAS ALREADY CONVERGED, BUT NOT TO tol = 0. The orthogonal t on the 7th
+# call, where |s| is 4.0e-17 against |r0| = 14.1: 3.3.3-3.3.7 returned the half step as as
+# converged as r0's rounding allows. tol = 0 asks for a zero residual, which |s| is not, so
+# since 3.4.0 this stop is reported; any tol the half step meets accepts it (tol 1e-17 below).
 var _r5le_x3 = _r5le_solve(_bicg_b, 0, 7);
-assert_eq(_R5LE_CALLS, 7, "bicgstab, orthogonal t after convergence: returns at the 7th matvec");
-for (var _r5le_k = 0; _r5le_k < 3; _r5le_k = _r5le_k + 1) {
-    assert_eq(load64(_r5le_x3 + _r5le_k * 8), load64(_bicg_x + _r5le_k * 8),
-      "bicgstab, orthogonal t after convergence: the half step, bit-identical to the tol 1e-9 solve");
-}
+assert_eq(_R5LE_CALLS, 7, "bicgstab, orthogonal t after convergence: stops at the 7th matvec");
+assert_eq(_r5le_x3, HSB_ERR_NO_CONVERGENCE, "bicgstab, orthogonal t after convergence, tol 0: NO_CONVERGENCE");
 # (4) EVERY TERM IS ZERO: STRUCTURE, NOT CANCELLATION. [[0,1],[3,0]] x = (5,1), tol 0:
 # the second t has a zero term against every non-zero s_i, so the numerator is exactly
 # 0 with no term to cancel. That is the omega stop's half step, (1/3, 5) to 5 ulps,
@@ -1998,12 +2025,16 @@ store64(_r5le_bs + 8, F64_ONE);
 var _r5le_x0s = alloc(16);
 store64(_r5le_x0s, 0);
 store64(_r5le_x0s + 8, 0);
-var _r5le_x4 = solve_bicgstab(&_r5le_swap, _r5le_bs, _r5le_x0s, 2, 0, 50);
+var _r5le_x4t, _r5le_x4 = solve_bicgstab_checked(&_r5le_swap, _r5le_bs, _r5le_x0s, 2, 0, 50);
 assert_eq(_R5LE_SW_CALLS, 5, "bicgstab [[0,1],[3,0]], tol 0: the omega stop at the 5th matvec");
-assert_eq(load64(_r5le_x4), 0x3FD5555555555550, "bicgstab [[0,1],[3,0]]: x0 = 1/3 - 5 ulps, not NaN");
-assert_eq(load64(_r5le_x4 + 8), 0x4014000000000001, "bicgstab [[0,1],[3,0]]: x1 = 5 + 1 ulp, not NaN");
-# (5) and (6) pin the two constants from the side the in-tree fixtures above do not
-# reach, on systems from the R5le differential (A stored, A_fn = the plain row sums).
+assert_eq(_r5le_x4, HSB_ERR_NO_CONVERGENCE,
+  "bicgstab [[0,1],[3,0]], tol 0: the omega stop is reported, not NaN (3.3.3-3.3.7: (1/3, 5) to 5 ulps)");
+# (5) and (6) pinned the two constants from the side the in-tree fixtures above do not
+# reach, on systems from the R5le differential (A stored, A_fn = the plain row sums), through
+# 3.3.7. ⚠ 3.4.0 review: neither does now. (5) recovers (below), and (6) ends in the same Err
+# with or without the n (REV-LA S1: at the 115th matvec; in the scaled frame, the 101st). The
+# n is pinned in modules_b.tcyr's "3.4.0 review: the Krylov frame" group, and the DBL_MIN
+# condition is recorded there as verdict-equivalent, with its reason.
 # (5) THE |s| GATE IS 2^-52, NOT LOOSER. G2b's matrix times 2^-984, b from 7e-22 to
 # 2.8e-20 (x near 1e276), tol 1.7e-31, the orthogonal t on the 7th call: |s| / |r0| at
 # the cancellation is 9e-9, between 2^-52 and 2^-26, and the half step is not the
@@ -2050,25 +2081,39 @@ fn _r5le_setm(a00, a01, a02, a10, a11, a12, a20, a21, a22) {
 }
 _r5le_setm(0x0290000000000000, 0x0270000000000000, 0, 0x0270000000000000, 0x0288000000000000,
   0x0270000000000000, 0, 0x0270000000000000, 0x0280000000000000);
+var _r5le_b5 = _r5le_v3(0x3B89FBE76C8B4398, 0x3BAFC6A7EF9DB228, 0x3BE06E978D4FDF3B);
 _R5LE_CALLS = 0;
 _R5LE_AT = 7;
-var _r5le_x5 = solve_bicgstab(&_r5le_m3, _r5le_v3(0x3B89FBE76C8B4398, 0x3BAFC6A7EF9DB228, 0x3BE06E978D4FDF3B),
-  _bicg_x0, 3, 0x398B7CDFD9D7BDBB, 50);
+var _r5le_x5t, _r5le_x5 = solve_bicgstab_checked(&_r5le_m3, _r5le_b5, _bicg_x0, 3, 0x398B7CDFD9D7BDBB, 50);
 _R5LE_AT = 0 - 1;
-assert_eq(_R5LE_CALLS, 7, "bicgstab, |s| / |r0| between 2^-52 and 2^-26 at the cancellation: stops at the 7th matvec");
-for (var _r5le_m = 0; _r5le_m < 3; _r5le_m = _r5le_m + 1) {
-    assert_eq(load64(_r5le_x5 + _r5le_m * 8), _R5LE_QNAN,
-      "bicgstab, |s| / |r0| between 2^-52 and 2^-26: x is NaN (a 2^-26 gate returns a wrong half step)");
-}
+# 3.4.0 review: the |s| gate this fixture pinned is gone (3.4.0). The 7th call is still a
+# t = A s (the probe takes the place of 3.3.7's A x0, which x0 = 0 no longer spends), and the
+# orthogonal t there is a breakdown, reported. 3.3.3-3.3.7: NaN; a 2^-26 gate, a wrong half step.
+assert_eq(_R5LE_CALLS, 7, "bicgstab, an orthogonal t at call 7: stops there");
+assert_eq(_r5le_x5, HSB_ERR_NO_CONVERGENCE, "bicgstab, an orthogonal t at call 7: NO_CONVERGENCE (3.3.3-3.3.7: NaN)");
+# The same vector injected at call 6, an A p: nothing breaks down, but BiCGSTAB's recurrence
+# residual drifts from b - A x. The true-residual confirmation refuses it and restarts, and the
+# run returns the exact solution, correctly rounded (Fractions), after 41 matvecs (19 without
+# the injection).
+# [measured: LA2 probes k3 and r5 + exact Fractions solve, cycc 6.7.9, 2026-10-31]
+_R5LE_CALLS = 0;
+_R5LE_AT = 6;
+var _r5le_x5bt, _r5le_x5b = solve_bicgstab_checked(&_r5le_m3, _r5le_b5, _bicg_x0, 3, 0x398B7CDFD9D7BDBB, 50);
+_R5LE_AT = 0 - 1;
+assert_eq(_R5LE_CALLS, 41, "bicgstab, an orthogonal vector injected as A p at call 6: recovers, 41 matvecs");
+assert_eq(is_ok(_r5le_x5bt), 1, "bicgstab, injected A p: Ok on the true residual");
+assert_eq(load64(_r5le_x5b), 0x7919C28F5C28F5C3, "bicgstab, injected A p: x[0] is the exact solution, rounded");
+assert_eq(load64(_r5le_x5b + 8), 0xF93683126E978D50, "bicgstab, injected A p: x[1] is the exact solution, rounded");
+assert_eq(load64(_r5le_x5b + 16), 0x79533EF9DB22D0E5, "bicgstab, injected A p: x[2] is the exact solution, rounded");
 _r5le_setm(0xD6F0AD1B81E399D0, 0xD6B805C41C80A300, 0xD67B50E876FE1000, 0x56E9F8846C8735A0, 0x571034912B0EC4FC,
   0xD71E002BD6D772B0, 0, 0, 0);
 _R5LE_CALLS = 0;
-var _r5le_x6 = solve_bicgstab(&_r5le_m3, _r5le_v3(0x94BDF299C4BFD975, 0x14B3662EDF63CBA7, 0x94BC83D06697750C),
+var _r5le_x6t, _r5le_x6 = solve_bicgstab_checked(&_r5le_m3, _r5le_v3(0x94BDF299C4BFD975, 0x14B3662EDF63CBA7,
+    0x94BC83D06697750C),
   _bicg_x0, 3, 0x11370EF54646D497, 200);
-for (var _r5le_q = 0; _r5le_q < 3; _r5le_q = _r5le_q + 1) {
-    assert_eq(load64(_r5le_x6 + _r5le_q * 8), _R5LE_QNAN,
-      "bicgstab, singular, cancellation within n 2^-52: x is NaN (a bound without n goes on to a finite x)");
-}
+assert_eq(_r5le_x6, HSB_ERR_NO_CONVERGENCE,
+  "bicgstab, singular, cancellation within n 2^-52: NO_CONVERGENCE (3.3.3-3.3.7: NaN; 3.3.7 without n, a finite x)");
+assert_eq(_R5LE_CALLS, 101, "bicgstab, singular, cancellation within n 2^-52: the 101st matvec");
 
 # === 3.3.4 krylov: solve_bicgstab, a t whose norm overflows ===
 # When some |t_i| is near DBL_MAX, |t| = sqrt(sum t_i^2) passes it although every t_i is
@@ -2083,12 +2128,19 @@ for (var _r5le_q = 0; _r5le_q < 3; _r5le_q = _r5le_q + 1) {
 _r5le_setm(0xD94A87A57F197462, 0x58F967921DE73A80, 0xD9377A2A4E1476FC, 0x58EDE3C824AE8B00, 0xD93BE13D4519E5F8,
   0x59418CD8F0581632, 0x59342A712F5F4964, 0xD9107662B81096A0, 0xD923919DAAEC0A98);
 _R5LE_CALLS = 0;
-var _k4b_x1 = solve_bicgstab(&_r5le_m3, _r5le_v3(0xE64FC6E4FAA12CE0, 0x6656E94779C370E0, 0xE6838333B5CE8A96),
-  _bicg_x0, 3, 0x64B12E0BE826D695, 200);
-assert_eq(_R5LE_CALLS, 6, "bicgstab, |t| past DBL_MAX: converges after 6 matvecs (3.3.3: stopped at 3)");
-assert_eq(load64(_k4b_x1), 0xCD24F893EBFA321C, "bicgstab, |t| past DBL_MAX: x0 bits (3.3.3: +1.7e63, the half step)");
-assert_eq(load64(_k4b_x1 + 8), 0x4D402E1E14AECD32, "bicgstab, |t| past DBL_MAX: x1 bits");
-assert_eq(load64(_k4b_x1 + 16), 0x4D3C97E8EBFC2C9D, "bicgstab, |t| past DBL_MAX: x2 bits");
+# 3.4.0: tol is relative; the 3.3.4 absolute 0x64B12E0BE826D695 over ||b||
+var _k4b_b1 = _r5le_v3(0xE64FC6E4FAA12CE0, 0x6656E94779C370E0, 0xE6838333B5CE8A96);
+var _k4b_x1t, _k4b_x1 = solve_bicgstab_checked(&_r5le_m3, _k4b_b1,
+  _bicg_x0, 3, f64_div(0x64B12E0BE826D695, _lext_norm(_k4b_b1, 3)), 200);
+assert_eq(is_ok(_k4b_x1t), 1, "bicgstab, |t| past DBL_MAX: Ok");
+# (3.4.0 review: one matvec more, the true residual that confirms it; the run is in the scaled
+# frame, and the bits are 0 / 2 / 3 ulp from the exact solution below, where 3.4.0's first tree
+# gave 1 / 1 / 2)
+# [measured: these bits against the Cramer solve in python3 fractions, LA2, cycc 6.7.9, 2026-10-31]
+assert_eq(_R5LE_CALLS, 7, "bicgstab, |t| past DBL_MAX: converges after 7 matvecs (3.3.3: stopped at 3)");
+assert_eq(load64(_k4b_x1), 0xCD24F893EBFA321D, "bicgstab, |t| past DBL_MAX: x0 bits (3.3.3: +1.7e63, the half step)");
+assert_eq(load64(_k4b_x1 + 8), 0x4D402E1E14AECD33, "bicgstab, |t| past DBL_MAX: x1 bits");
+assert_eq(load64(_k4b_x1 + 16), 0x4D3C97E8EBFC2C9E, "bicgstab, |t| past DBL_MAX: x2 bits");
 var _k4b_xs = _r5le_v3(0xCD24F893EBFA321D, 0x4D402E1E14AECD31, 0x4D3C97E8EBFC2C9B);   # exact x, rounded
 for (var _k4b_i = 0; _k4b_i < 3; _k4b_i = _k4b_i + 1) {
     var _k4b_ref = load64(_k4b_xs + _k4b_i * 8);
@@ -2106,18 +2158,22 @@ for (var _k4b_i = 0; _k4b_i < 3; _k4b_i = _k4b_i + 1) {
 _r5le_setm(0x6950000000000000, 0x6930000000000000, 0, 0x6930000000000000, 0x6948000000000000,
   0x6930000000000000, 0, 0x6930000000000000, 0x6940000000000000);
 _R5LE_CALLS = 0;
-var _k4b_x2 = solve_bicgstab(&_r5le_m3, _r5le_v3(0x5657C0A31F92F5DC, 0x568CB0D38BD064D6, 0x56813F4CBB5C171A),
+var _k4b_x2t, _k4b_x2 = solve_bicgstab_checked(&_r5le_m3, _r5le_v3(0x5657C0A31F92F5DC, 0x568CB0D38BD064D6,
+    0x56813F4CBB5C171A),
   _bicg_x0, 3, 0, 200);
 var _k4b_xs2 = _r5le_v3(0xAD067AA05CEB6B79, 0x2D312D78F65A7334, 0x2D215120805DBB00);   # x*, rounded
-for (var _k4b_j = 0; _k4b_j < 3; _k4b_j = _k4b_j + 1) {
+# 3.4.0: an Err (3.3.4-3.3.7: x NaN), or Ok with x* to 1e-9; never Ok and wrong
+var _k4b_okc = 0;
+if (is_err_result(_k4b_x2t) == 1) { _k4b_okc = 3; }
+for (var _k4b_j = 0; _k4b_j < 3 && is_ok(_k4b_x2t) == 1; _k4b_j = _k4b_j + 1) {
     var _k4b_xj = load64(_k4b_x2 + _k4b_j * 8);
     var _k4b_rj = load64(_k4b_xs2 + _k4b_j * 8);
-    var _k4b_ok = 0;
-    if (f64_eq(_k4b_xj, _k4b_xj) == 0) { _k4b_ok = 1; }
-    if (f64_lt(f64_abs(f64_sub(_k4b_xj, _k4b_rj)), f64_mul(f64_abs(_k4b_rj), 0x3E112E0BE826D695)) == 1) { _k4b_ok = 1; }
-    assert_eq(_k4b_ok, 1,
-      "bicgstab, |t| past DBL_MAX, A p then out of range: x is NaN or x* to 1e-9, never finite and wrong (3.3.3: 0)");
+    if (f64_lt(f64_abs(f64_sub(_k4b_xj, _k4b_rj)), f64_mul(f64_abs(_k4b_rj), 0x3E112E0BE826D695)) == 1) {
+        _k4b_okc = _k4b_okc + 1;
+    }
 }
+assert_eq(_k4b_okc, 3,
+  "bicgstab, |t| past DBL_MAX, A p then out of range: Err, or x* to 1e-9, never Ok and wrong (3.3.3: 0)");
 
 # ================================================================
 # linalg_precision — first coverage (module shipped untested through 2.6.12)
@@ -2368,15 +2424,21 @@ for (var lx_p = 0; lx_p < 400; lx_p = lx_p + 1) {
 assert_eq(LX_EP_RUN, 400, "the eigen_power scale sweep actually ran 400 scales");
 assert_eq(LX_EP_BAD, 0,
   "eigen_power: lambda/k and the eigenvector are invariant to 2^-399");
-# ⭐ ANTI-DELETION: an exactly zero matrix has no dominant direction.
+# ⭐ ANTI-DELETION: an exactly zero matrix. Through 3.4.0's review this was NO_CONVERGENCE (no
+# dominant direction the iteration could find); its spectrum is its diagonal, every eigenvalue
+# 0, and every vector an eigenvector, so it is now answered exactly: 0, with e_1 (the last vertex
+# in Tarjan's completion order).
 var lx_z2 = ganita_mat_new(2, 2);
 ganita_mat_set(lx_z2, 0, 0, f64_from(0)); ganita_mat_set(lx_z2, 0, 1, f64_from(0));
 ganita_mat_set(lx_z2, 1, 0, f64_from(0)); ganita_mat_set(lx_z2, 1, 1, f64_from(0));
-var _rq72t, _rq72v = eigen_power(lx_z2, 2, 100, alloc(8), alloc(16));
-assert_eq(is_err_result(_rq72t), 1, "eigen_power: an exactly zero matrix still reports no convergence");
-assert_eq(_rq72v, HSB_ERR_NO_CONVERGENCE, "eigen_power: an exactly zero matrix still reports no convergence");
+var lx_z2v = alloc(8);
+var lx_z2e = alloc(16);
+var _rq72t, _rq72v = eigen_power(lx_z2, 2, 100, lx_z2v, lx_z2e);
+assert_eq(is_ok(_rq72t), 1, "eigen_power: an exactly zero matrix -> Ok, its eigenvalue 0 (3.3.7: NO_CONVERGENCE)");
+assert_eq(load64(lx_z2v), 0, "eigen_power: an exactly zero matrix -> 0");
+assert_eq(load64(lx_z2e + 8), F64_ONE, "eigen_power: an exactly zero matrix -> v = e_1");
 
-# --- solve_pgs. A x = b and (kA) x = (kb) have the SAME x, so the solution of
+# --- solve_pgs_checked. A x = b and (kA) x = (kb) have the SAME x, so the solution of
 # [[4,1],[1,3]]x = [1,2] is [1/11, 7/11] at every k. Two guards are exercised: the
 # diagonal test and the convergence test, the latter now relative to |x|.
 var LX_PG_RUN = 0;
@@ -2400,8 +2462,9 @@ for (var lx_g = 0; lx_g < 400; lx_g = lx_g + 1) {
     var lx_gx = alloc(16);
     store64(lx_gx, 0);
     store64(lx_gx + 8, 0);
-    solve_pgs(lx_gA, lx_gb, lx_gx, 2, lx_pg_lo, lx_pg_hi, 200);
+    var lx_gt, lx_gv = solve_pgs_checked(lx_gA, lx_gb, lx_gx, 2, lx_pg_lo, lx_pg_hi, 200);
     LX_PG_RUN = LX_PG_RUN + 1;
+    if (is_ok(lx_gt) != 1) { LX_PG_BAD = LX_PG_BAD + 1; }
     if (f64_approx_eq(load64(lx_gx), f64_div(F64_ONE, f64_from(11)), EP_TOL) != 1) {
         LX_PG_BAD = LX_PG_BAD + 1;
     }
@@ -2410,9 +2473,9 @@ for (var lx_g = 0; lx_g < 400; lx_g = lx_g + 1) {
         LX_PG_BAD = LX_PG_BAD + 1;
     }
 }
-assert_eq(LX_PG_RUN, 400, "the solve_pgs scale sweep actually ran 400 scales");
+assert_eq(LX_PG_RUN, 400, "the solve_pgs_checked scale sweep actually ran 400 scales");
 assert_eq(LX_PG_BAD, 0,
-  "solve_pgs: x = [1/11, 7/11] for system scales from 2^0 down to 2^-399");
+  "solve_pgs_checked: Ok, x = [1/11, 7/11] for system scales from 2^0 down to 2^-399");
 
 # --- cmat_inverse. inv(kM) = (1/k)*inv(M). M = [[1,0],[0,2]] gives inv = diag(1, 1/2).
 var LX_CI_RUN = 0;
@@ -2479,7 +2542,7 @@ assert_eq(LX_CA_RUN, 400, "the csr_add scale sweep actually ran 400 scales");
 assert_eq(LX_CA_BAD, 0,
   "csr_add: the sum keeps its 2 stored entries at every scale to 2^-399");
 
-# --- solve_pgs CONVERGENCE, which the sweep above cannot reach. There A and b
+# --- solve_pgs_checked CONVERGENCE, which the sweep above cannot reach. There A and b
 # both scale, so x stays O(1) and `max_change` never gets near 1e-12. Scaling ONLY
 # b makes the SOLUTION small, and an absolute convergence test then declares
 # victory after one sweep and returns a wrong answer.
@@ -2498,8 +2561,9 @@ for (var lx_pc = 0; lx_pc < 200; lx_pc = lx_pc + 1) {
     var lx_pcx = alloc(16);
     store64(lx_pcx, 0);
     store64(lx_pcx + 8, 0);
-    solve_pgs(lx_pcA, lx_pcb, lx_pcx, 2, lx_pg_lo, lx_pg_hi, 200);
+    var lx_pct, lx_pcv = solve_pgs_checked(lx_pcA, lx_pcb, lx_pcx, 2, lx_pg_lo, lx_pg_hi, 200);
     LX_PC_RUN = LX_PC_RUN + 1;
+    if (is_ok(lx_pct) != 1) { LX_PC_BAD = LX_PC_BAD + 1; }
     # x = k * [1/11, 7/11]; compare the RATIO, since x itself spans 200 decades.
     if (f64_approx_eq(f64_div(load64(lx_pcx), lx_pck),
         f64_div(F64_ONE, f64_from(11)), EP_TOL) != 1) {
@@ -2510,9 +2574,9 @@ for (var lx_pc = 0; lx_pc < 200; lx_pc = lx_pc + 1) {
         LX_PC_BAD = LX_PC_BAD + 1;
     }
 }
-assert_eq(LX_PC_RUN, 200, "the solve_pgs solution-scale sweep actually ran 200");
+assert_eq(LX_PC_RUN, 200, "the solve_pgs_checked solution-scale sweep actually ran 200");
 assert_eq(LX_PC_BAD, 0,
-  "solve_pgs: converges to k*[1/11, 7/11] for solution scales down to 2^-199");
+  "solve_pgs_checked: Ok, k*[1/11, 7/11] for solution scales down to 2^-199");
 
 # --- eigen_power at a SUBNORMAL dominant value, which is the only place the
 # reciprocal and the direct divide disagree. At k = 2^-1024 the eigenvalue is
@@ -2561,11 +2625,10 @@ for (var lx_gm = 0; lx_gm < 300; lx_gm = lx_gm + 1) {
     var lx_gm0 = alloc(16);
     store64(lx_gm0, 0);
     store64(lx_gm0 + 8, 0);
-    # tol is on the RESIDUAL, which carries the system's scale, so it scales too.
-    var lx_gmx = solve_gmres(&_lx_amul, lx_gmb, lx_gm0, 2,
-      f64_mul(LX_GM_K, EP_TOL), 50, 2);
+    # 3.4.0: tol is RELATIVE to ||b||, so the same tol serves every scale.
+    var lx_gmt, lx_gmx = solve_gmres_checked(&_lx_amul, lx_gmb, lx_gm0, 2, EP_TOL, 50, 2);
     LX_GM_RUN = LX_GM_RUN + 1;
-    if (lx_gmx == 0) {
+    if (is_err_result(lx_gmt) == 1) {
         LX_GM_BAD = LX_GM_BAD + 1;
     } else {
         if (f64_approx_eq(load64(lx_gmx), f64_div(F64_ONE, f64_from(11)),
@@ -2676,7 +2739,8 @@ store64(pgs_x, 0); store64(pgs_x + 8, 0);
 var big = f64_from(1000000);
 var pgs_lo = alloc(16); store64(pgs_lo, f64_neg(big)); store64(pgs_lo + 8, f64_neg(big));
 var pgs_hi = alloc(16); store64(pgs_hi, big); store64(pgs_hi + 8, big);
-solve_pgs(pgs_A, pgs_b, pgs_x, 2, pgs_lo, pgs_hi, 100);
+var _pgs1t, _pgs1v = solve_pgs_checked(pgs_A, pgs_b, pgs_x, 2, pgs_lo, pgs_hi, 100);
+assert_eq(is_ok(_pgs1t), 1, "solve_pgs_checked: [[4,1],[1,3]] x = [1,2] -> Ok");
 # Exact solution of [[4,1],[1,3]]x=[1,2]: x = [1/11, 7/11] ≈ [0.0909, 0.6364].
 # ⭐ 2.13.0 — ASSERT THE EXACT SOLUTION THE COMMENT ABOVE ALREADY NAMES. These
 # read `f64_to(f64_mul(x, f64_from(1000))) == 90` and `== 636`, i.e. they checked
@@ -2705,7 +2769,8 @@ store64(pgs2_lo + 8, 0);
 var pgs2_hi = alloc(16);
 store64(pgs2_hi, F64_TWO);
 store64(pgs2_hi + 8, F64_TWO);
-solve_pgs(pgs2_A, pgs2_b, pgs2_x, 2, pgs2_lo, pgs2_hi, 100);
+var _pgs2t, _pgs2v = solve_pgs_checked(pgs2_A, pgs2_b, pgs2_x, 2, pgs2_lo, pgs2_hi, 100);
+assert_eq(is_ok(_pgs2t), 1, "solve_pgs_checked: the bounds-active LCP -> Ok");
 assert_eq(load64(pgs2_x), f64_from(2), "pgs bounded x0 clamped to hi=2");
 assert_eq(load64(pgs2_x + 8), f64_from(2), "pgs bounded x1 clamped to hi=2");
 
@@ -3131,14 +3196,14 @@ var s3 = expr_const(f64_from(3));
 var sexpr = expr_add(symx2, s3);
 var bindings = vec_new();
 vec_push(bindings, expr_bind(str_from("x"), f64_from(2)));
-var sval = expr_eval(sexpr, bindings);
+var svalt, sval = expr_eval_checked(sexpr, bindings);
 assert_eq(sval, f64_from(7), "eval x^2+3 at 2");
 
 # Differentiate x^2 w.r.t x → should simplify to 2*x
 var sd = expr_diff(sexpr, str_from("x"));
 var sd_simple = expr_simplify(sd);
 # Evaluate derivative at x=2 → should be 4
-var dval = expr_eval(sd_simple, bindings);
+var dvalt, dval = expr_eval_checked(sd_simple, bindings);
 assert_eq(dval, f64_from(4), "diff x^2+3 at 2");
 
 # Simplify: 0 + x = x, 1 * x = x
@@ -4793,18 +4858,18 @@ var gmb_tol = 0x3C32725DD1D243AC;   # 1e-18 -- force the budget to bind
 
 # The headline case: budget 1, restart 100. Pre-fix this spent 4 products.
 _gmb_calls = 0;
-solve_gmres(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 1, 100);
+var _gmb1t, _gmb1v = solve_gmres_checked(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 1, 100);
 assert(_gmb_calls <= 1, "gmres budget=1 restart=100 spends at most 1 matvec");
 assert(_gmb_calls > 0, "gmres budget=1 still does useful work");
 
 # Restart smaller than the budget. Pre-fix: 6 products for a budget of 3.
 _gmb_calls = 0;
-solve_gmres(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 3, 2);
+var _gmb2t, _gmb2v = solve_gmres_checked(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 3, 2);
 assert(_gmb_calls <= 3, "gmres budget=3 restart=2 spends at most 3 matvecs");
 
 # And a generous budget must still be respected exactly.
 _gmb_calls = 0;
-solve_gmres(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 10, 10);
+var _gmb3t, _gmb3v = solve_gmres_checked(&_gmb_A, gmb_b, gmb_x, 3, gmb_tol, 10, 10);
 assert(_gmb_calls <= 10, "gmres budget=10 restart=10 spends at most 10 matvecs");
 
 # === 3.3.3 G2b: A_fn buffer ownership (solve_gmres, solve_bicgstab) ===
@@ -4862,30 +4927,34 @@ var _g2b_otol = 0x3DDB7CDFD9D7BDBB;         # 1e-10
 
 # GMRES, restart 3 (one cycle) and restart 2 (cycles reuse the basis slots).
 _G2B_MV = 0;
-var _g2b_gf = solve_gmres(&_g2b_fresh, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 3);
+var _g2b_gft, _g2b_gf = solve_gmres_checked(&_g2b_fresh, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 3);
 var _g2b_gf_mv = _G2B_MV;
 _g2b_reset_reuse();
-var _g2b_gr = solve_gmres(&_g2b_reuse, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 3);
-assert_eq(_g2b_gf_mv, 4, "gmres(3), fresh A_fn: 4 matvecs");
-assert_eq(_G2B_MV, _g2b_gf_mv, "gmres(3), reusing A_fn: the same 4 matvecs (3.3.2: 60, the whole budget)");
+var _g2b_grt, _g2b_gr = solve_gmres_checked(&_g2b_reuse, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 3);
+# 3.4.0: one matvec more than 3.3.2-3.3.7's 4, the true residual that confirms the Givens
+# estimate (solve_gmres_checked); and tol is relative now, 1e-10 ||b|| = 3.77e-10.
+# [measured: this group's own counts, 3.3.7 base vs this tree, cycc 6.7.9, 2026-10-31]
+assert_eq(_g2b_gf_mv, 5, "gmres(3), fresh A_fn: 5 matvecs (3.3.7: 4, without the confirming residual)");
+assert_eq(_G2B_MV, _g2b_gf_mv, "gmres(3), reusing A_fn: the same 5 matvecs (3.3.2: 60, the whole budget)");
 assert_eq(_G2B_WRITES, 0, "gmres(3): never writes into the buffer A_fn returned (3.3.2: 44 times)");
 _G2B_MV = 0;
-var _g2b_gf2 = solve_gmres(&_g2b_fresh, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 2);
+var _g2b_gf2t, _g2b_gf2 = solve_gmres_checked(&_g2b_fresh, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 2);
 var _g2b_gf2_mv = _G2B_MV;
 _g2b_reset_reuse();
-var _g2b_gr2 = solve_gmres(&_g2b_reuse, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 2);
-assert_eq(_g2b_gf2_mv, 38, "gmres(2), fresh A_fn: 38 matvecs");
-assert_eq(_G2B_MV, _g2b_gf2_mv, "gmres(2), reusing A_fn: the same 38 matvecs across restarts (3.3.2: 60)");
+var _g2b_gr2t, _g2b_gr2 = solve_gmres_checked(&_g2b_reuse, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 2);
+assert_eq(_g2b_gf2_mv, 36, "gmres(2), fresh A_fn: 36 matvecs (3.3.7: 38 at an absolute tol 3.77x tighter)");
+assert_eq(_G2B_MV, _g2b_gf2_mv, "gmres(2), reusing A_fn: the same 36 matvecs across restarts (3.3.2: 60)");
 assert_eq(_G2B_WRITES, 0, "gmres(2): never writes into the buffer A_fn returned");
 
 # BiCGSTAB.
 _G2B_MV = 0;
-var _g2b_bf = solve_bicgstab(&_g2b_fresh, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60);
+var _g2b_bft, _g2b_bf = solve_bicgstab_checked(&_g2b_fresh, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60);
 var _g2b_bf_mv = _G2B_MV;
 _g2b_reset_reuse();
-var _g2b_br = solve_bicgstab(&_g2b_reuse, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60);
-assert_eq(_g2b_bf_mv, 6, "bicgstab, fresh A_fn: 6 matvecs");
-assert_eq(_G2B_MV, _g2b_bf_mv, "bicgstab, reusing A_fn: the same 6 matvecs (3.3.2: 65)");
+var _g2b_brt, _g2b_br = solve_bicgstab_checked(&_g2b_reuse, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60);
+# (3.4.0 review: 7, the true residual that confirms the answer included)
+assert_eq(_g2b_bf_mv, 7, "bicgstab, fresh A_fn: 7 matvecs");
+assert_eq(_G2B_MV, _g2b_bf_mv, "bicgstab, reusing A_fn: the same 7 matvecs (3.3.2: 65)");
 assert_eq(_G2B_WRITES, 0, "bicgstab: never writes into the buffer A_fn returned");
 
 for (var _g2b_m = 0; _g2b_m < 3; _g2b_m = _g2b_m + 1) {
@@ -4901,7 +4970,7 @@ for (var _g2b_m = 0; _g2b_m < 3; _g2b_m = _g2b_m + 1) {
 # 3.3.2's GMRES orthogonalised that pointer in place, i.e. zeroed basis vector 0, and
 # returned x0. A = I: the answer is b, and here it comes back exactly.
 fn _g2b_ident(xp) { return xp; }
-var _g2b_gi = solve_gmres(&_g2b_ident, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 3);
+var _g2b_git, _g2b_gi = solve_gmres_checked(&_g2b_ident, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60, 3);
 for (var _g2b_n = 0; _g2b_n < 3; _g2b_n = _g2b_n + 1) {
     assert_eq(load64(_g2b_gi + _g2b_n * 8), load64(_g2b_ob + _g2b_n * 8),
       "gmres, A_fn returns its input (A = I): x = b exactly (3.3.2: x0)");
@@ -4929,7 +4998,7 @@ for (var _g2b_q = 0; _g2b_q < 64; _g2b_q = _g2b_q + 1) {
 }
 _G2B_DIAG = 1;
 var _g2b_ar0 = alloc_used();
-solve_gmres(&_g2b_reuse64, _g2b_b64, _g2b_x64, 64, _g2b_otol, 60, 2);
+var _g2b_r64t, _g2b_r64v = solve_gmres_checked(&_g2b_reuse64, _g2b_b64, _g2b_x64, 64, _g2b_otol, 60, 2);
 # ⭐ 3.3.7 — and the restart cycle's own buffers (r, the basis pointers, H, g, the Givens
 # pairs, y) are allocated once per call too (D016): 14,672 B -> 2,208 B on this run of 20
 # cycles, so the bound moves from 20 KB to 4 KB.
@@ -4938,7 +5007,7 @@ assert_lt(alloc_used() - _g2b_ar0, 4096,
   "gmres(2), A = diag(1..64), 60 matvecs: arena under 4 KB (2,208 B; per-cycle buffers as through 3.3.6: 14,672)");
 _G2B_DIAG = 0;
 var _g2b_ar1 = alloc_used();
-solve_gmres(&_g2b_reuse64, _g2b_b64, _g2b_x64, 64, _g2b_otol, 200, 64);
+var _g2b_r64bt, _g2b_r64bv = solve_gmres_checked(&_g2b_reuse64, _g2b_b64, _g2b_x64, 64, _g2b_otol, 200, 64);
 assert_lt(alloc_used() - _g2b_ar1, 49152,
   "gmres(64), A = 2I, 2 matvecs: arena under 48 KB (37,400 B; all 64 slots up front: 69,656)");
 
@@ -4956,8 +5025,8 @@ fn _r4le_ident(xp) {
     _R4LE_MV = _R4LE_MV + 1;
     return xp;
 }
-var _r4le_bi = solve_bicgstab(&_r4le_ident, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60);
-assert_eq(_R4LE_MV, 2, "bicgstab, A_fn returns its input (A = I): 2 matvecs");
+var _r4le_bit, _r4le_bi = solve_bicgstab_checked(&_r4le_ident, _g2b_ob, _g2b_o0, 3, _g2b_otol, 60);
+assert_eq(_R4LE_MV, 3, "bicgstab, A_fn returns its input (A = I): 3 matvecs (3.4.0 review: the confirming one too)");
 for (var _r4le_n = 0; _r4le_n < 3; _r4le_n = _r4le_n + 1) {
     assert_eq(load64(_r4le_bi + _r4le_n * 8), load64(_g2b_ob + _r4le_n * 8),
       "bicgstab, A_fn returns its input (A = I): x = b exactly");
@@ -6037,6 +6106,598 @@ for (var _eci = 0; _eci < _ec_n; _eci = _eci + 1) {
 assert_eq(_ec_pairs, 66, "error-code distinctness: all 66 pairs compared");
 assert_eq(_ec_dup, 0, "error codes are pairwise distinct (no two share a value)");
 assert_eq(_ec_nonneg, 0, "every failure code is negative; only HSB_ERR_NONE is not");
+
+# === 3.4.0: num_bisection reports max_iter exhaustion ===
+# Roadmap [3.4.0] D070. Through 3.3.7 the loop exit stored the midpoint and returned Ok
+# whatever the bracket was: x^2 - 2 on [0, 2] at max_iter 5 returned Ok(1.40625) from a
+# bracket 2^-4 wide, and max_iter 0 returned Ok(1.0) with no test at all. The exit now
+# accepts the final bracket only if it is narrower than tol (the loop's own width test,
+# which the last halving is not followed by) or its ends are adjacent doubles; otherwise
+# Err(HSB_ERR_NO_CONVERGENCE) with `out` untouched. The boundary fixtures sit ON the width
+# test: the bracket after 5 bisections is exactly 2^-4 wide, and |f| at the five midpoints
+# (1, 1.5, 1.25, 1.375, 1.4375) never falls below 0.0664, so only the exit can accept.
+# [measured: scratch probe2, this tree and the base tree, 2026-10-31; cycc 6.7.9]
+test_group("3.4.0: num_bisection reports max_iter exhaustion");
+fn _n4_x2m2(x) { return f64_sub(f64_mul(x, x), F64_TWO); }
+fn _n4_2mx2(x) { return f64_sub(F64_TWO, f64_mul(x, x)); }
+var _n4_out = alloc(8);
+store64(_n4_out, 0x1234);
+var _n4b1t, _n4b1v = num_bisection(&_n4_x2m2, 0, F64_TWO, 0x3FB0000000000000, 5, _n4_out);
+assert_eq(is_err_result(_n4b1t), 1,
+  "num_bisection: a 2^-4 bracket after max_iter 5 at tol 2^-4 is not converged (3.3.7: Ok)");
+assert_eq(_n4b1v, HSB_ERR_NO_CONVERGENCE, "num_bisection: max_iter exhausted -> HSB_ERR_NO_CONVERGENCE");
+assert_eq(load64(_n4_out), 0x1234, "num_bisection: an unconverged stop leaves out untouched (3.3.7: 1.40625)");
+var _n4b2t, _n4b2v = num_bisection(&_n4_x2m2, 0, F64_TWO, 0x3FB0000000000001, 5, _n4_out);
+assert_eq(is_ok(_n4b2t), 1, "num_bisection: the same bracket at tol 2^-4 + 1 ulp meets the width test at the exit");
+assert_eq(load64(_n4_out), 0x3FF6800000000000, "num_bisection: ... and answers its midpoint, 1.40625");
+store64(_n4_out, 0x1234);
+var _n4b3t, _n4b3v = num_bisection(&_n4_x2m2, 0, F64_TWO, EPSILON_F64, 0, _n4_out);
+assert_eq(_n4b3v, HSB_ERR_NO_CONVERGENCE,
+  "num_bisection: max_iter 0 on a 2-wide bracket at tol 1e-12 -> Err (3.3.7: Ok(1.0))");
+assert_eq(load64(_n4_out), 0x1234, "num_bisection: max_iter 0 leaves out untouched");
+var _n4b4t, _n4b4v = num_bisection(&_n4_x2m2, 0, F64_TWO, 0x4010000000000000, 0, _n4_out);
+assert_eq(load64(_n4_out), F64_ONE, "num_bisection: max_iter 0 at tol 4 accepts the 2-wide bracket's midpoint, 1");
+# A tol below the spacing of the doubles at the root: the bracket stops at the two
+# doubles either side of sqrt(2), 0x3FF6A09E667F3BCC and ...BCD, after 53 bisections,
+# and no tol can ask for more. x^2 - 2 keeps lo = ...BCC below the root and the tie at
+# the midpoint rounds to it; 2 - x^2 swaps the ends, so the same tie rounds to hi. One
+# fixture for each half of the adjacency test.
+store64(_n4_out, 0x1234);
+var _n4b5t, _n4b5v = num_bisection(&_n4_x2m2, 0, F64_TWO, 1, 200, _n4_out);
+assert_eq(is_ok(_n4b5t), 1, "num_bisection: tol 2^-1074 converges once the bracket's ends are adjacent doubles");
+assert_eq(load64(_n4_out), 0x3FF6A09E667F3BCC,
+  "num_bisection: x^2 - 2 at tol 2^-1074 -> 0x3FF6A09E667F3BCC (lo), as 3.3.7");
+store64(_n4_out, 0x1234);
+var _n4b6t, _n4b6v = num_bisection(&_n4_2mx2, 0, F64_TWO, 1, 200, _n4_out);
+assert_eq(is_ok(_n4b6t), 1,
+  "num_bisection: 2 - x^2 at tol 2^-1074 converges by adjacency, the midpoint rounding to hi");
+assert_eq(load64(_n4_out), 0x3FF6A09E667F3BCC, "num_bisection: 2 - x^2 at tol 2^-1074 -> 0x3FF6A09E667F3BCC (hi)");
+store64(_n4_out, 0x1234);
+var _n4b7t, _n4b7v = num_bisection(&_n4_x2m2, 0, F64_TWO, 1, 52, _n4_out);
+assert_eq(_n4b7v, HSB_ERR_NO_CONVERGENCE, "num_bisection: tol 2^-1074 and max_iter 52, one short of adjacency -> Err");
+assert_eq(load64(_n4_out), 0x1234, "num_bisection: ... out untouched");
+var _n4b8t, _n4b8v = num_bisection(&_n4_x2m2, 0, F64_TWO, 1, 53, _n4_out);
+assert_eq(load64(_n4_out), 0x3FF6A09E667F3BCC,
+  "num_bisection: tol 2^-1074 and max_iter 53, the first to reach adjacency");
+# Brackets wider than DBL_MAX. 3.3.7 formed every midpoint as lo + (hi - lo) / 2, and hi - lo
+# overflows: x - c on [-DBL_MAX, DBL_MAX] walked hi to +Inf and returned Ok(+Inf), a point
+# outside [a, b], and an infinite end made the midpoint NaN (Err). Past DBL_MAX the midpoint
+# is now the sum of the halves, an infinite end read as ±DBL_MAX. Every root below is exact
+# (x - c is exactly 0 at c and nowhere else), and the narrow brackets above keep their bits.
+# [measured: scratch bisection differential, 19,999 narrow brackets, bits as before, 2026-10-31]
+# [measured: scratch bisection oracle, 4,000 wide and 544 infinite-end brackets, 2026-10-31]
+fn _n4_xmc(x) { return f64_sub(x, 0x3FF3C0CA428C59FB); }
+fn _n4_cmx(x) { return f64_sub(0x3FF3C0CA428C59FB, x); }
+fn _n4_xmbig(x) { return f64_sub(x, 0xFFD5555555555555); }
+fn _n4_xmsub(x) { return f64_sub(x, 0x000000000ABCDEF1); }
+fn _n4_xmhuge(x) { return f64_sub(x, 0x7FE8F5C28F5C28F6); }
+fn _n4_x2s(x) { return f64_sub(f64_mul(x, f64_abs(x)), F64_TWO); }
+var _n4_nmax = 0xFFEFFFFFFFFFFFFF;
+var _n4_pmax = 0x7FEFFFFFFFFFFFFF;
+var _n4_c = 0x3FF3C0CA428C59FB;
+store64(_n4_out, 0x1234);
+var _n4w1t, _n4w1v = num_bisection(&_n4_xmc, _n4_nmax, _n4_pmax, 1, 1075, _n4_out);
+assert_eq(is_ok(_n4w1t), 1, "num_bisection: x - c on [-DBL_MAX, DBL_MAX] converges (3.3.7: Ok(+Inf))");
+assert_eq(load64(_n4_out), _n4_c, "num_bisection: x - c on [-DBL_MAX, DBL_MAX] -> c exactly, in 1075 bisections");
+store64(_n4_out, 0x1234);
+var _n4w2t, _n4w2v = num_bisection(&_n4_xmc, _n4_nmax, _n4_pmax, 1, 1074, _n4_out);
+assert_eq(_n4w2v, HSB_ERR_NO_CONVERGENCE, "num_bisection: ... and 1074 are one too few -> Err");
+assert_eq(load64(_n4_out), 0x1234, "num_bisection: ... out untouched");
+var _n4w3t, _n4w3v = num_bisection(&_n4_cmx, _n4_nmax, _n4_pmax, 1, 1100, _n4_out);
+assert_eq(load64(_n4_out), _n4_c, "num_bisection: c - x, the ends swapped and hi - lo = -Inf -> c (3.3.7: -Inf)");
+var _n4w4t, _n4w4v = num_bisection(&_n4_xmc, _n4_pmax, _n4_nmax, 1, 1100, _n4_out);
+assert_eq(load64(_n4_out), _n4_c, "num_bisection: x - c on [DBL_MAX, -DBL_MAX], a > b -> c (3.3.7: +Inf)");
+var _n4w5t, _n4w5v = num_bisection(&_n4_xmbig, 0xFFE8000000000000, 0x7FE3333333333333, 1, 1100, _n4_out);
+assert_eq(load64(_n4_out), 0xFFD5555555555555,
+  "num_bisection: a mixed-sign wide bracket, root -2^1022 * 4/3 -> exact (3.3.7: +Inf)");
+var _n4w6t, _n4w6v = num_bisection(&_n4_xmsub, _n4_nmax, _n4_pmax, 1, 2200, _n4_out);
+assert_eq(load64(_n4_out), 0x000000000ABCDEF1, "num_bisection: a subnormal root from [-DBL_MAX, DBL_MAX] -> exact");
+var _n4w7t, _n4w7v = num_bisection(&_n4_x2s, _n4_nmax, _n4_pmax, 1, 1100, _n4_out);
+assert_eq(load64(_n4_out), 0x3FF6A09E667F3BCC,
+  "num_bisection: x|x| - 2 on [-DBL_MAX, DBL_MAX] stops at the doubles beside sqrt(2), as [0, 2] does");
+var _n4w8t, _n4w8v = num_bisection(&_n4_xmhuge, 0x7FE0000000000000, _n4_pmax, 1, 100, _n4_out);
+assert_eq(load64(_n4_out), 0x7FE8F5C28F5C28F6,
+  "num_bisection: [2^1023, DBL_MAX], where a + b overflows and b - a does not -> exact, as 3.3.7");
+# Infinite ends: read as ±DBL_MAX for the midpoint (3.3.7: a NaN midpoint, refused).
+store64(_n4_out, 0x1234);
+var _n4w9t, _n4w9v = num_bisection(&_n4_xmc, 0xFFF0000000000000, 0x7FF0000000000000, 1, 1100, _n4_out);
+assert_eq(is_ok(_n4w9t), 1, "num_bisection: x - c on [-Inf, +Inf] converges (3.3.7: Err)");
+assert_eq(load64(_n4_out), _n4_c, "num_bisection: x - c on [-Inf, +Inf] -> c exactly");
+var _n4w10t, _n4w10v = num_bisection(&_n4_xmc, 0xFFF0000000000000, 0x4010000000000000, 1, 1100, _n4_out);
+assert_eq(load64(_n4_out), _n4_c, "num_bisection: x - c on [-Inf, 4] -> c exactly (3.3.7: Err)");
+var _n4w13t, _n4w13v = num_bisection(&_n4_cmx, 0xFFF0000000000000, 0x7FF0000000000000, 1, 1100, _n4_out);
+assert_eq(load64(_n4_out), _n4_c, "num_bisection: c - x on [-Inf, +Inf], lo = +Inf and hi = -Inf -> c (3.3.7: Err)");
+# A sign change between -DBL_MAX and -Inf: the halves of -DBL_MAX and its neighbour round onto
+# the neighbour, so the one double between the ends, -DBL_MAX, has to be offered itself;
+# then [-Inf, -DBL_MAX] are adjacent and -DBL_MAX is the answer (3.3.7: NaN). Mirrored at +Inf.
+fn _n4_stepn(x) {
+    if (f64_lt(x, 0xFFEFFFFFFFFFFFFF) == 1) { return f64_neg(F64_ONE); }
+    return F64_ONE;
+}
+fn _n4_stepp(x) {
+    if (f64_lt(x, 0x7FF0000000000000) == 1) { return f64_neg(F64_ONE); }
+    return F64_ONE;
+}
+var _n4w11t, _n4w11v = num_bisection(&_n4_stepn, 0xFFF0000000000000, 0, 1, 100, _n4_out);
+assert_eq(load64(_n4_out), _n4_nmax, "num_bisection: a step between -Inf and -DBL_MAX -> -DBL_MAX (3.3.7: NaN)");
+var _n4w12t, _n4w12v = num_bisection(&_n4_stepp, 0, 0x7FF0000000000000, 1, 100, _n4_out);
+assert_eq(load64(_n4_out), _n4_pmax, "num_bisection: a step between DBL_MAX and +Inf -> DBL_MAX (3.3.7: +Inf)");
+# Adjacency is read with f64_eq, so a -0 end is the double +0: [-0, 2^-1074] around a sign
+# step at 0 holds no double strictly inside, and the midpoint computes as +0. Bit equality
+# would read it as split by nothing and refuse it.
+fn _n4_step(x) {
+    if (f64_gt(x, 0) == 1) { return F64_ONE; }
+    return f64_neg(F64_ONE);
+}
+store64(_n4_out, 0x1234);
+var _n4b10t, _n4b10v = num_bisection(&_n4_step, 0x8000000000000000, 1, 0, 0, _n4_out);
+assert_eq(is_ok(_n4b10t), 1, "num_bisection: [-0, 2^-1074] at max_iter 0 is adjacent, -0 read as 0");
+assert_eq(load64(_n4_out), 0, "num_bisection: ... its midpoint, +0");
+# A NaN end is no bracket, whatever f returns there. This step answers +1 at NaN (the
+# comparison is false), so the refusal of a NaN f(a) or f(b) never fired: [NaN, 0] returned
+# Ok(NaN) at tol 2, where |f(NaN)| = 1 < tol, and kept bisecting at tol 1e-12. Both ends,
+# both tol regimes, and a negative NaN with a payload: Err(INVALID_INPUT), out untouched.
+fn _n4_stepc(x) {
+    if (f64_lt(x, 0x3FF3C0CA428C59FB) == 1) { return f64_neg(F64_ONE); }
+    return F64_ONE;
+}
+store64(_n4_out, 0x1234);
+var _n4n1t, _n4n1v = num_bisection(&_n4_stepc, 0x7FF8000000000000, 0, F64_TWO, 200, _n4_out);
+assert_eq(_n4n1v, HSB_ERR_INVALID_INPUT, "num_bisection: a = NaN, tol 2 -> INVALID_INPUT (3.3.7: Ok(NaN))");
+var _n4n2t, _n4n2v = num_bisection(&_n4_stepc, 0x7FF8000000000000, 0, EPSILON_F64, 200, _n4_out);
+assert_eq(_n4n2v, HSB_ERR_INVALID_INPUT, "num_bisection: a = NaN, tol 1e-12 -> INVALID_INPUT (3.3.7: Ok(NaN))");
+var _n4n3t, _n4n3v = num_bisection(&_n4_stepc, 0, 0x7FF8000000000000, F64_TWO, 200, _n4_out);
+assert_eq(_n4n3v, HSB_ERR_INVALID_INPUT, "num_bisection: b = NaN, tol 2 -> INVALID_INPUT (3.3.7: Ok(NaN))");
+var _n4n4t, _n4n4v = num_bisection(&_n4_stepc, 0, 0x7FF8000000000000, EPSILON_F64, 200, _n4_out);
+assert_eq(_n4n4v, HSB_ERR_INVALID_INPUT, "num_bisection: b = NaN, tol 1e-12 -> INVALID_INPUT (3.3.7: Ok(NaN))");
+var _n4n5t, _n4n5v = num_bisection(&_n4_stepc, 0xFFF8000000000123, 0x4010000000000000, F64_TWO, 0, _n4_out);
+assert_eq(_n4n5v, HSB_ERR_INVALID_INPUT, "num_bisection: a = -NaN with a payload, max_iter 0 -> INVALID_INPUT");
+assert_eq(load64(_n4_out), 0x1234, "num_bisection: every NaN-end refusal leaves out untouched");
+# An exact zero f(mid) = 0 is the root at every tol, tol <= 0 and NaN included (R2A note 6).
+# 3.3.7 and the first 3.4.0 drafts read it only through |f| < tol, which is false for 0 at
+# tol 0, -1 or NaN: x - 1 on [0, 2] at max_iter 1 evaluated f(1) = 0 and returned
+# Err(NO_CONVERGENCE); x - c on [-Inf, +Inf] at tol 0 evaluated f(c) = 0 and returned
+# Ok(c - 1 ulp) after 3002 calls. -(x - 1) gives f(1) = -0, the same zero.
+# [measured: scratch bisz probe, integ-snap9 and this tree, 2026-10-31]
+fn _n4_xm1(x) { return f64_sub(x, F64_ONE); }
+fn _n4_nxm1(x) { return f64_mul(f64_sub(x, F64_ONE), f64_neg(F64_ONE)); }
+store64(_n4_out, 0x1234);
+var _n4z1t, _n4z1v = num_bisection(&_n4_xm1, 0, F64_TWO, 0, 1, _n4_out);
+assert_eq(is_ok(_n4z1t), 1, "num_bisection: f(1) = 0 at tol 0, max_iter 1 is the root (before: Err)");
+assert_eq(load64(_n4_out), F64_ONE, "num_bisection: ... exactly 1");
+store64(_n4_out, 0x1234);
+var _n4z2t, _n4z2v = num_bisection(&_n4_nxm1, 0, F64_TWO, 0, 1, _n4_out);
+assert_eq(load64(_n4_out), F64_ONE, "num_bisection: f(1) = -0 at tol 0 is the same root, 1");
+store64(_n4_out, 0x1234);
+var _n4z3t, _n4z3v = num_bisection(&_n4_xm1, 0, F64_TWO, 0x7FF8000000000000, 1, _n4_out);
+assert_eq(load64(_n4_out), F64_ONE, "num_bisection: f(1) = 0 at tol NaN is the root, 1 (before: Err)");
+store64(_n4_out, 0x1234);
+var _n4z4t, _n4z4v = num_bisection(&_n4_xm1, 0, F64_TWO, f64_neg(F64_ONE), 1, _n4_out);
+assert_eq(load64(_n4_out), F64_ONE, "num_bisection: f(1) = 0 at tol -1 is the root, 1 (before: Err)");
+var _n4z5t, _n4z5v = num_bisection(&_n4_xmc, 0xFFF0000000000000, 0x7FF0000000000000, 0, 3000, _n4_out);
+assert_eq(load64(_n4_out), _n4_c, "num_bisection: x - c on [-Inf, +Inf] at tol 0 -> c exactly (before: c - 1 ulp)");
+# Only an exact zero: f(1) = 2^-1074, the smallest non-zero, is no root at tol 0.
+fn _n4_tiny1(x) {
+    if (f64_lt(x, F64_ONE) == 1) { return f64_neg(F64_ONE); }
+    if (f64_eq(x, F64_ONE) == 1) { return 1; }
+    return F64_ONE;
+}
+store64(_n4_out, 0x1234);
+var _n4z6t, _n4z6v = num_bisection(&_n4_tiny1, 0, F64_TWO, 0, 1, _n4_out);
+assert_eq(_n4z6v, HSB_ERR_NO_CONVERGENCE, "num_bisection: f(1) = 2^-1074 at tol 0 is not accepted -> Err");
+assert_eq(load64(_n4_out), 0x1234, "num_bisection: ... out untouched");
+
+# === 3.4.0: num_pollard_rho_checked refuses n <= 1 ===
+# Roadmap [3.4.0] D069. num_pollard_rho returned n for every n <= 1, and n is the answer
+# that means "prime": 1, 0, -15 and i64 min came back as their own prime factor. The
+# replacement refuses them with Err(HSB_ERR_INVALID_INPUT). On n > 1 its answers are the
+# retired function's: a scratch oracle (python3, deterministic Miller-Rabin and trial
+# division) checked 204,814 n up to 2^63 - 1 against both trees.
+# [measured: scratch rho oracle, 204,814 n, base tree and this tree, 2026-10-31]
+test_group("3.4.0: num_pollard_rho_checked refuses n <= 1");
+var _n4r1t, _n4r1v = num_pollard_rho_checked(1);
+assert_eq(is_err_result(_n4r1t), 1, "num_pollard_rho_checked(1) is an Err: 1 has no prime factor (3.3.7: 1)");
+assert_eq(_n4r1v, HSB_ERR_INVALID_INPUT, "num_pollard_rho_checked(1) -> HSB_ERR_INVALID_INPUT");
+var _n4r2t, _n4r2v = num_pollard_rho_checked(0x8000000000000000);
+assert_eq(_n4r2v, HSB_ERR_INVALID_INPUT, "num_pollard_rho_checked(i64 min) -> INVALID_INPUT (3.3.7: i64 min)");
+var _n4r3t, _n4r3v = num_pollard_rho_checked(0 - 15);
+assert_eq(_n4r3v, HSB_ERR_INVALID_INPUT, "num_pollard_rho_checked(-15) -> INVALID_INPUT (3.3.7: -15)");
+var _n4r4t, _n4r4v = num_pollard_rho_checked(2);
+assert_eq(is_ok(_n4r4t), 1, "num_pollard_rho_checked(2) is Ok");
+assert_eq(_n4r4v, 2, "num_pollard_rho_checked(2) = 2, the smallest prime and the domain's first n");
+var _n4r5t, _n4r5v = num_pollard_rho_checked(3);
+assert_eq(_n4r5v, 3, "num_pollard_rho_checked(3) = 3, the smallest odd prime");
+var _n4r6t, _n4r6v = num_pollard_rho_checked(9);
+assert_eq(_n4r6v, 3, "num_pollard_rho_checked(9) = 3, the smallest odd prime square");
+var _n4r7t, _n4r7v = num_pollard_rho_checked(0x7FFFFFFFFFFFFFE7);
+assert_eq(_n4r7v, 0x7FFFFFFFFFFFFFE7, "num_pollard_rho_checked(2^63 - 25) = itself, the largest prime below 2^63");
+var _n4r8t, _n4r8v = num_pollard_rho_checked(1099505336329);
+assert_eq(_n4r8v, 1048573, "num_pollard_rho_checked(1048573^2) = 1048573, a prime square");
+var _n4r9t, _n4r9v = num_pollard_rho_checked(0x7FFFFFFFFFFFFFFF);
+assert_eq(_n4r9v, 7, "num_pollard_rho_checked(2^63 - 1) = 7 (2^63 - 1 = 7^2 * 73 * 127 * 337 * 92737 * 649657)");
+var _n4r10t, _n4r10v = num_pollard_rho_checked(3825123056546413051);
+assert_eq(_n4r10v, 149491, "num_pollard_rho_checked: a Carmichael number near 2^62 -> 149491, a proper factor");
+
+# === 3.4.0: f64_fmod(x, ±0) is NaN, the rest stays exact ===
+# Roadmap [3.4.0] D069. Through 3.3.7 a zero divisor returned +0 for every x, NaN and
+# ±Inf included; C99 and IEEE 754 make it an invalid operation. Expected bits are glibc
+# 2.44's fmod: x's NaN quieted when x is one, else the default NaN 0xFFF8000000000000.
+# The smallest subnormal divisor stays an ordinary one (an exact multiple, and a non-zero
+# remainder), so `hy == 0` reads only a zero. The scratch differential (18,400 pairs, an
+# exact rational oracle and glibc) found every other result unchanged.
+# [measured: scratch differential, python3 Fraction oracle and glibc 2.44, 18,400 pairs, 2026-10-31]
+test_group("3.4.0: f64_fmod(x, ±0) is NaN, the rest stays exact");
+assert_eq(f64_fmod(0x401C000000000000, 0), 0xFFF8000000000000, "fmod(7, +0) = the default NaN (3.3.7: +0)");
+assert_eq(f64_fmod(0xC01C000000000000, 0x8000000000000000), 0xFFF8000000000000, "fmod(-7, -0) = the default NaN");
+assert_eq(f64_fmod(0, 0), 0xFFF8000000000000, "fmod(+0, +0) = the default NaN (3.3.7: +0)");
+assert_eq(f64_fmod(0x8000000000000000, 0x8000000000000000), 0xFFF8000000000000, "fmod(-0, -0) = the default NaN");
+assert_eq(f64_fmod(1, 0), 0xFFF8000000000000, "fmod(2^-1074, +0) = the default NaN");
+assert_eq(f64_fmod(0x7FEFFFFFFFFFFFFF, 0x8000000000000000), 0xFFF8000000000000, "fmod(DBL_MAX, -0) = the default NaN");
+assert_eq(f64_fmod(0xFFF0000000000000, 0), 0xFFF8000000000000, "fmod(-Inf, +0) = the default NaN (3.3.7: +0)");
+assert_eq(f64_fmod(0x7FF0000000000000, 0x8000000000000000), 0xFFF8000000000000,
+  "fmod(+Inf, -0) = the default NaN, not +Inf's bits quieted (3.3.7: +0)");
+assert_eq(f64_fmod(0x7FF8000000000005, 0x8000000000000000), 0x7FF8000000000005, "fmod(qNaN, -0) = x's NaN (3.3.7: +0)");
+assert_eq(f64_fmod(0xFFF4000000000123, 0), 0xFFFC000000000123,
+  "fmod(-sNaN, +0) = x's NaN, quieted, sign and payload kept");
+assert_eq(f64_fmod(0x7FEFFFFFFFFFFFFF, 1), 0,
+  "fmod(DBL_MAX, 2^-1074) = +0: the smallest subnormal is an ordinary divisor");
+assert_eq(f64_fmod(0x8000000000000003, 2), 0x8000000000000001,
+  "fmod(-3 * 2^-1074, 2 * 2^-1074) = -2^-1074, x's sign");
+
+# === 3.4.0: expr_eval_checked refuses a tree with no value ===
+# Roadmap [3.4.0] D074. expr_eval returned +0.0 and wrote a warning to fd 2 for an
+# unbound variable or an unknown tag: x + 1 with x unbound evaluated to 1.0. Its
+# replacement returns Err(HSB_ERR_INVALID_INPUT) and writes nothing (abuse.tcyr pins the
+# silence on both fds). expr_diff differentiated a tag it could not read to the constant
+# 0, so x + <tag 77> came back as (1 + 0); it returns 0, the failure handle, and the
+# constructors carry a 0 child to the root.
+# [measured: scratch symbase probe, base tree, 2026-10-31: 0x3FF0000000000000 and "(1 + 0)"]
+test_group("3.4.0: expr_eval_checked refuses a tree with no value");
+var _n4_x = expr_var(str_from("x"));
+var _n4_y = expr_var(str_from("y"));
+var _n4_none = vec_new();
+var _n4e1t, _n4e1v = expr_eval_checked(expr_add(_n4_x, expr_const(F64_ONE)), _n4_none);
+assert_eq(is_err_result(_n4e1t), 1, "expr_eval_checked: x + 1 with x unbound is an Err (3.3.7 expr_eval: 1.0)");
+assert_eq(_n4e1v, HSB_ERR_INVALID_INPUT, "expr_eval_checked: an unbound variable -> HSB_ERR_INVALID_INPUT");
+var _n4e2t, _n4e2v = expr_eval_checked(_n4_x, 0);
+assert_eq(_n4e2v, HSB_ERR_INVALID_INPUT,
+  "expr_eval_checked: a variable with vars = 0 -> INVALID_INPUT (3.3.7: a read through 0)");
+var _n4_bad = alloc(16);
+store64(_n4_bad, 77);
+var _n4e3t, _n4e3v = expr_eval_checked(_n4_bad, _n4_none);
+assert_eq(_n4e3v, HSB_ERR_INVALID_INPUT, "expr_eval_checked: a tag no constructor writes -> INVALID_INPUT (3.3.7: 0)");
+var _n4e4t, _n4e4v = expr_eval_checked(0, _n4_none);
+assert_eq(_n4e4v, HSB_ERR_INVALID_INPUT, "expr_eval_checked: a 0 node, the failure handle -> INVALID_INPUT");
+# A bound tree: sin(x) * exp(y) + x^y at full-mantissa x, y, against the same operations
+# composed by hand (a second code path).
+var _n4_xv = 0x3FF3C0CA428C59FB;
+var _n4_yv = 0x3FE5D1D8A3B2C6F1;
+var _n4_binds = vec_new();
+vec_push(_n4_binds, 0);
+vec_push(_n4_binds, expr_bind(str_from("y"), _n4_yv));
+vec_push(_n4_binds, expr_bind(str_from("x"), _n4_xv));
+var _n4_tree = expr_add(expr_mul(expr_sin(_n4_x), expr_exp(_n4_y)), expr_pow(_n4_x, _n4_y));
+var _n4e5t, _n4e5v = expr_eval_checked(_n4_tree, _n4_binds);
+assert_eq(is_ok(_n4e5t), 1, "expr_eval_checked: a bound tree is Ok, past a 0 pair in vars");
+assert_eq(_n4e5v, f64_add(f64_mul(f64_sin(_n4_xv), f64_exp(_n4_yv)), ganita_f64_pow(_n4_xv, _n4_yv)),
+  "expr_eval_checked: sin(x) exp(y) + x^y = the same operations composed by hand, bit for bit");
+var _n4e6t, _n4e6v = expr_eval_checked(expr_neg(expr_ln(expr_cos(_n4_y))), _n4_binds);
+assert_eq(_n4e6v, f64_neg(f64_ln(f64_cos(_n4_yv))), "expr_eval_checked: -ln(cos(y)), bit for bit");
+var _n4e7t, _n4e7v = expr_eval_checked(expr_mul(_n4_tree, expr_var(str_from("z"))), _n4_binds);
+assert_eq(_n4e7v, HSB_ERR_INVALID_INPUT, "expr_eval_checked: one unbound leaf deep in a tree refuses the whole tree");
+# expr_diff: a tag it cannot read has no derivative.
+assert_eq(expr_diff(_n4_bad, str_from("x")), 0, "expr_diff: a tag no constructor writes -> 0 (3.3.7: the constant 0)");
+assert_eq(expr_diff(expr_add(_n4_x, _n4_bad), str_from("x")), 0, "expr_diff: x + <tag 77> -> 0 (3.3.7: (1 + 0))");
+assert_eq(expr_diff(0, str_from("x")), 0, "expr_diff: a 0 node -> 0");
+assert_eq(expr_simplify(0), 0, "expr_simplify: a 0 node -> 0");
+# The constructors carry a 0 child up, from either side.
+assert_eq(expr_add(0, _n4_x), 0, "expr_add: a 0 left child -> 0");
+assert_eq(expr_add(_n4_x, 0), 0, "expr_add: a 0 right child -> 0");
+assert_eq(expr_mul(0, _n4_x), 0, "expr_mul: a 0 left child -> 0");
+assert_eq(expr_mul(_n4_x, 0), 0, "expr_mul: a 0 right child -> 0");
+assert_eq(expr_pow(0, _n4_x), 0, "expr_pow: a 0 base -> 0");
+assert_eq(expr_pow(_n4_x, 0), 0, "expr_pow: a 0 exponent -> 0");
+assert_eq(expr_neg(0), 0, "expr_neg: a 0 child -> 0");
+assert_eq(expr_sin(0), 0, "expr_sin: a 0 child -> 0");
+assert_eq(expr_cos(0), 0, "expr_cos: a 0 child -> 0");
+assert_eq(expr_exp(0), 0, "expr_exp: a 0 child -> 0");
+assert_eq(expr_ln(0), 0, "expr_ln: a 0 child -> 0");
+assert_eq(expr_var(0), 0, "expr_var: a 0 name -> 0");
+
+# === 3.4.0: dual and tape ln / sqrt / abs propagate a NaN ===
+# Roadmap [3.4.0] D069. A NaN input to dual_ln, dual_sqrt, ad_ln and ad_sqrt returned
+# the (0, 0) domain-miss sentinel, a finite value and derivative from no number at all;
+# dual_abs and ad_abs gave a NaN the derivative +1, as if it were positive. A NaN now
+# propagates through all six: value and derivative NaN, the input's payload kept (0x...5
+# below) and a signalling NaN quieted. The domain misses (v <= 0, -0 and -Inf included)
+# keep the documented sentinel, and forward and reverse mode still agree bit for bit.
+# [measured: scratch probe1 (base tree) and probe2 (this tree), 2026-10-31]
+test_group("3.4.0: dual and tape ln / sqrt / abs propagate a NaN");
+var _n4_qn = 0x7FF8000000000005;
+var _n4d1 = dual_ln(dual_new(_n4_qn, F64_ONE));
+assert_eq(Dual_val(_n4d1), _n4_qn, "dual_ln(NaN): the value is the NaN (3.3.7: 0)");
+assert_eq(Dual_deriv(_n4d1), _n4_qn, "dual_ln(NaN): the derivative is the NaN (3.3.7: 0)");
+var _n4d2 = dual_sqrt(dual_new(_n4_qn, F64_ONE));
+assert_eq(Dual_val(_n4d2), _n4_qn, "dual_sqrt(NaN): the value is the NaN (3.3.7: 0)");
+assert_eq(Dual_deriv(_n4d2), _n4_qn, "dual_sqrt(NaN): the derivative is the NaN (3.3.7: 0)");
+var _n4d3 = dual_ln(dual_new(0x7FF0000000000001, F64_ONE));
+assert_eq(Dual_val(_n4d3), 0x7FF8000000000001, "dual_ln(sNaN): the value is the NaN, quieted");
+assert_eq(Dual_deriv(_n4d3), 0x7FF8000000000001, "dual_ln(sNaN): the derivative is the NaN, quieted");
+# |x| clears the sign bit (IEEE 754 abs, and f64_abs): |-NaN| is the NaN with the sign
+# cleared, payload kept, and |-0| is +0. Through 3.3.7 both kept the input's sign.
+var _n4d4 = dual_abs(dual_new(0xFFF8000000000005, F64_ONE));
+assert_eq(Dual_val(_n4d4), 0x7FF8000000000005,
+  "dual_abs(-NaN): the value is |NaN|, sign cleared (3.3.7: the input's bits)");
+assert_eq(Dual_deriv(_n4d4), 0xFFF8000000000005, "dual_abs(-NaN): the derivative is the NaN (3.3.7: +1)");
+var _n4d5 = dual_abs(dual_new(0x7FF8000000000005, 0xC000000000000000));
+assert_eq(Dual_deriv(_n4d5), _n4_qn, "dual_abs(NaN, -2): the derivative is the NaN (3.3.7: -2)");
+# The documented domain misses keep the sentinel.
+var _n4d6 = dual_ln(dual_new(0x8000000000000000, F64_ONE));
+assert_eq(Dual_val(_n4d6) | Dual_deriv(_n4d6), 0, "dual_ln(-0): the domain-miss sentinel (0, 0), unchanged");
+var _n4d7 = dual_sqrt(dual_new(0xFFF0000000000000, F64_ONE));
+assert_eq(Dual_val(_n4d7) | Dual_deriv(_n4d7), 0, "dual_sqrt(-Inf): the domain-miss sentinel (0, 0), unchanged");
+var _n4d8 = dual_sqrt(dual_new(0, F64_ONE));
+assert_eq(Dual_val(_n4d8) | Dual_deriv(_n4d8), 0, "dual_sqrt(+0): the domain-miss sentinel (0, 0), unchanged");
+# Reverse mode, one tape: the same NaN through ad_ln, ad_sqrt and ad_abs.
+var _n4_tp = ad_tape_new(16);
+var _n4_xa = ad_var(_n4_tp, _n4_qn);
+var _n4_la = ad_ln(_n4_tp, _n4_xa);
+assert_eq(ad_val(_n4_tp, _n4_la), _n4_qn, "ad_ln(NaN): the value is the NaN (3.3.7: 0)");
+var _n4g1t, _n4g1v = ad_grad(_n4_tp, _n4_la);
+assert_eq(ad_grad_of(_n4_tp, _n4_xa), _n4_qn, "ad_ln(NaN): the adjoint is the NaN (3.3.7: 0)");
+var _n4_sa = ad_sqrt(_n4_tp, _n4_xa);
+assert_eq(ad_val(_n4_tp, _n4_sa), _n4_qn, "ad_sqrt(NaN): the value is the NaN (3.3.7: 0)");
+var _n4g2t, _n4g2v = ad_grad(_n4_tp, _n4_sa);
+assert_eq(ad_grad_of(_n4_tp, _n4_xa), _n4_qn, "ad_sqrt(NaN): the adjoint is the NaN (3.3.7: 0)");
+var _n4_xb = ad_var(_n4_tp, 0xFFF8000000000005);
+var _n4_aa = ad_abs(_n4_tp, _n4_xb);
+assert_eq(ad_val(_n4_tp, _n4_aa), 0x7FF8000000000005,
+  "ad_abs(-NaN): the value is |NaN|, sign cleared (3.3.7: the input's bits)");
+var _n4g3t, _n4g3v = ad_grad(_n4_tp, _n4_aa);
+assert_eq(ad_grad_of(_n4_tp, _n4_xb), 0xFFF8000000000005, "ad_abs(-NaN): the adjoint is the NaN (3.3.7: +1)");
+assert_eq(ad_grad_of(_n4_tp, _n4_xb), Dual_deriv(_n4d4), "ad_abs and dual_abs agree on a NaN, bit for bit");
+assert_eq(ad_val(_n4_tp, _n4_aa), Dual_val(_n4d4), "ad_abs and dual_abs agree on |NaN|, bit for bit");
+var _n4d9 = dual_abs(dual_new(0x8000000000000000, F64_ONE));
+assert_eq(Dual_val(_n4d9), 0, "dual_abs(-0): the value is +0 (3.3.7: -0)");
+assert_eq(Dual_deriv(_n4d9), F64_ONE, "dual_abs(-0): the derivative is the documented right-hand +a'");
+var _n4_tq = ad_tape_new(32);
+var _n4_xz = ad_var(_n4_tq, 0x8000000000000000);
+var _n4_az = ad_abs(_n4_tq, _n4_xz);
+var _n4g6t, _n4g6v = ad_grad(_n4_tq, _n4_az);
+assert_eq(ad_val(_n4_tq, _n4_az), 0, "ad_abs(-0): the value is +0 (3.3.7: -0)");
+assert_eq(ad_grad_of(_n4_tq, _n4_xz), F64_ONE, "ad_abs(-0): the right-hand partial +1");
+# One rule in both modes (autodiff.cyr, above dual_div). A domain miss with a NUMERIC
+# value is the constant 0, whose derivative is exactly 0 whatever tangent arrives, a NaN
+# one included: (0, 0) forward, partials 0 on the tape. A NaN VALUE is not a miss: NaN
+# value and NaN derivative in both modes, quieted (quiet bit set, sign and payload kept).
+# 3.3.7 answered a NaN numerator over |b| < DBL_MIN with the miss (0, 0).
+var _n4v1 = dual_div(dual_new(_n4_qn, F64_ONE), dual_const(0));
+assert_eq(Dual_val(_n4v1), _n4_qn, "dual_div(NaN, 0): the value is the NaN (3.3.7: 0)");
+assert_eq(Dual_deriv(_n4v1), _n4_qn, "dual_div(NaN, 0): the derivative is the NaN (3.3.7: 0)");
+var _n4v2 = dual_div(dual_new(0x7FF0000000000001, F64_ONE), dual_const(0));
+assert_eq(Dual_val(_n4v2), 0x7FF8000000000001, "dual_div(sNaN, 0): the value is the NaN, quieted, payload kept");
+assert_eq(Dual_deriv(_n4v2), 0x7FF8000000000001, "dual_div(sNaN, 0): the derivative is the same quieted NaN");
+var _n4v3 = dual_div(dual_var(F64_TWO), dual_new(0, _n4_qn));
+assert_eq(Dual_val(_n4v3), 0, "dual_div(2, (0, NaN')): a miss, the constant 0");
+assert_eq(Dual_deriv(_n4v3), 0, "dual_div(2, (0, NaN')): a constant's derivative, 0, the NaN tangent dropped");
+var _n4v4 = dual_div(dual_new(F64_TWO, 0x7FF0000000000003), dual_new(1, F64_ONE));
+assert_eq(Dual_deriv(_n4v4), 0, "dual_div((2, sNaN'), 2^-1074): a miss, derivative 0");
+var _n4v5 = dual_div(dual_var(F64_TWO), dual_new(0, 0x7FF0000000000007));
+assert_eq(Dual_deriv(_n4v5), 0, "dual_div(2, (0, sNaN')): a miss, derivative 0");
+var _n4v6 = dual_div(dual_var(F64_TWO), dual_const(0));
+assert_eq(Dual_val(_n4v6) | Dual_deriv(_n4v6), 0, "dual_div(2, 0): the documented (0, 0), unchanged");
+var _n4v7 = dual_ln(dual_new(0xBFF0000000000000, _n4_qn));
+assert_eq(Dual_val(_n4v7), 0, "dual_ln((-1, NaN')): the miss value 0");
+assert_eq(Dual_deriv(_n4v7), 0, "dual_ln((-1, NaN')): a miss, derivative 0 whatever the tangent");
+var _n4v8 = dual_sqrt(dual_new(0, _n4_qn));
+assert_eq(Dual_deriv(_n4v8), 0, "dual_sqrt((0, NaN')): a miss, derivative 0 whatever the tangent");
+var _n4_ya = ad_var(_n4_tq, _n4_qn);
+var _n4_yb = ad_var(_n4_tq, 0);
+var _n4_yq = ad_div(_n4_tq, _n4_ya, _n4_yb);
+var _n4g7t, _n4g7v = ad_grad(_n4_tq, _n4_yq);
+assert_eq(ad_val(_n4_tq, _n4_yq), _n4_qn, "ad_div(NaN, 0): the value is the NaN (3.3.7: 0)");
+assert_eq(ad_grad_of(_n4_tq, _n4_ya), _n4_qn, "ad_div(NaN, 0): d/da is the NaN (3.3.7: 0)");
+assert_eq(ad_grad_of(_n4_tq, _n4_yb), _n4_qn, "ad_div(NaN, 0): d/db is the NaN (3.3.7: 0)");
+assert_eq(ad_grad_of(_n4_tq, _n4_ya), Dual_deriv(_n4v1), "ad_div and dual_div agree on a NaN numerator, bit for bit");
+var _n4_ys = ad_var(_n4_tq, 0x7FF0000000000001);
+var _n4_ysq = ad_div(_n4_tq, _n4_ys, _n4_yb);
+assert_eq(ad_val(_n4_tq, _n4_ysq), 0x7FF8000000000001, "ad_div(sNaN, 0): the value is the NaN, quieted");
+var _n4_yc = ad_var(_n4_tq, F64_TWO);
+var _n4_ycq = ad_div(_n4_tq, _n4_yc, _n4_yb);
+var _n4g8t, _n4g8v = ad_grad(_n4_tq, _n4_ycq);
+assert_eq(ad_val(_n4_tq, _n4_ycq) | ad_grad_of(_n4_tq, _n4_yc) | ad_grad_of(_n4_tq, _n4_yb), 0,
+  "ad_div(2, 0): the documented miss, value and partials 0, unchanged");
+# A NaN operand VALUE in ad_mul / ad_div: every partial is the NaN, as forward mode's a b'
+# term (NaN * 0) makes its derivative. 3.3.7's tape answered the constant: x * 2 at x = NaN
+# had gradient 2, x / 2 had 0.5, where dual_mul and dual_div answer NaN.
+var _n4_tr = ad_tape_new(64);
+var _n4_rx = ad_var(_n4_tr, _n4_qn);
+var _n4_rm = ad_mul(_n4_tr, _n4_rx, ad_const(_n4_tr, F64_TWO));
+var _n4g9t, _n4g9v = ad_grad(_n4_tr, _n4_rm);
+assert_eq(ad_grad_of(_n4_tr, _n4_rx), _n4_qn, "ad_mul(NaN x, 2): d/dx is the NaN (3.3.7: 2)");
+assert_eq(ad_grad_of(_n4_tr, _n4_rx), Dual_deriv(dual_mul(dual_new(_n4_qn, F64_ONE), dual_const(F64_TWO))),
+  "ad_mul and dual_mul agree on a NaN operand value, bit for bit");
+var _n4_rm2 = ad_mul(_n4_tr, ad_const(_n4_tr, F64_TWO), _n4_rx);
+var _n4g10t, _n4g10v = ad_grad(_n4_tr, _n4_rm2);
+assert_eq(ad_grad_of(_n4_tr, _n4_rx), _n4_qn, "ad_mul(2, NaN x): d/dx is the NaN, the second operand (3.3.7: 2)");
+var _n4_rd = ad_div(_n4_tr, _n4_rx, ad_const(_n4_tr, F64_TWO));
+var _n4g11t, _n4g11v = ad_grad(_n4_tr, _n4_rd);
+assert_eq(ad_grad_of(_n4_tr, _n4_rx), _n4_qn, "ad_div(NaN x, 2): d/dx is the NaN (3.3.7: 0.5)");
+assert_eq(ad_grad_of(_n4_tr, _n4_rx), Dual_deriv(dual_div(dual_new(_n4_qn, F64_ONE), dual_const(F64_TWO))),
+  "ad_div and dual_div agree on a NaN numerator over 2, bit for bit");
+# A NaN tangent reaching a miss, built the same way in both modes: v + (x^0 - 1) at x = 0
+# has value v and derivative 0 * 0^-1 = NaN. At v = -1.5, ln and sqrt are misses: forward
+# (0, 0), and the tape's sweep stops at the miss's 0 partial, 0. 3.4.0's first draft gave
+# forward (0, NaN) here, disagreeing with the tape.
+var _n4_kf = dual_add(dual_const(0xBFF8000000000000), dual_sub(dual_pow(dual_var(0), 0), dual_const(F64_ONE)));
+assert_eq(f64_eq(Dual_deriv(_n4_kf), Dual_deriv(_n4_kf)), 0, "the fixture's forward tangent is NaN");
+var _n4_kl = dual_ln(_n4_kf);
+assert_eq(Dual_val(_n4_kl) | Dual_deriv(_n4_kl), 0, "dual_ln at -1.5 with a NaN tangent: (0, 0)");
+var _n4_ks = dual_sqrt(_n4_kf);
+assert_eq(Dual_val(_n4_ks) | Dual_deriv(_n4_ks), 0, "dual_sqrt at -1.5 with a NaN tangent: (0, 0)");
+var _n4_kd = dual_div(dual_const(F64_TWO), dual_add(_n4_kf, dual_const(0x3FF8000000000000)));
+assert_eq(Dual_val(_n4_kd) | Dual_deriv(_n4_kd), 0, "dual_div(2, 0 with a NaN tangent): (0, 0)");
+var _n4_kx = ad_var(_n4_tr, 0);
+var _n4_kp = ad_sub(_n4_tr, ad_pow(_n4_tr, _n4_kx, 0), ad_const(_n4_tr, F64_ONE));
+var _n4_kin = ad_add(_n4_tr, ad_const(_n4_tr, 0xBFF8000000000000), _n4_kp);
+var _n4_kr = ad_ln(_n4_tr, _n4_kin);
+var _n4g12t, _n4g12v = ad_grad(_n4_tr, _n4_kr);
+assert_eq(ad_val(_n4_tr, _n4_kr) | ad_grad_of(_n4_tr, _n4_kx), 0, "ad_ln at -1.5 with a NaN partial upstream: 0 and 0");
+assert_eq(ad_grad_of(_n4_tr, _n4_kx), Dual_deriv(_n4_kl), "ad_ln and dual_ln agree at a miss with a NaN tangent");
+var _n4_xc = ad_var(_n4_tp, 0);
+var _n4_lc = ad_ln(_n4_tp, _n4_xc);
+var _n4g4t, _n4g4v = ad_grad(_n4_tp, _n4_lc);
+assert_eq(ad_val(_n4_tp, _n4_lc) | ad_grad_of(_n4_tp, _n4_xc), 0, "ad_ln(+0): the domain-miss sentinel, unchanged");
+var _n4_sc = ad_sqrt(_n4_tp, _n4_xc);
+var _n4g5t, _n4g5v = ad_grad(_n4_tp, _n4_sc);
+assert_eq(ad_val(_n4_tp, _n4_sc) | ad_grad_of(_n4_tp, _n4_xc), 0, "ad_sqrt(+0): the domain-miss sentinel, unchanged");
+
+# === 3.4.0: a refused allocation returns the designed failure ===
+# Every allocation in num, num_ext, symbolic and autodiff that was stored through
+# unchecked now returns its function's failure handle, 0. ALLOC_MAX is lib/alloc.cyr's
+# public size cap: at 0 every alloc() refuses, which is how an exhausted heap answers, so
+# each call below takes its refusal path. On the base tree each of these calls exits 139
+# (a store through the null). num_modinv now keeps its Bezout pair on the stack and
+# answers without allocating. ALLOC_MAX is restored before any assertion runs.
+# [measured: scratch oom probes, base tree, one process per call, all exit 139, 2026-10-31]
+test_group("3.4.0: a refused allocation returns the designed failure");
+# Every operand and name is made before the cap drops, so each call meets the refusal
+# in its own allocation, not in an argument's.
+var _n4_amax = ALLOC_MAX;
+var _n4_dv = dual_var(F64_TWO);
+var _n4_wn = str_from("w");
+var _n4_xn = str_from("x");
+var _n4_sx = expr_sin(_n4_x);
+var _n4_s1 = expr_add(_n4_sx, _n4_y);
+var _n4_s2 = expr_mul(_n4_sx, _n4_y);
+var _n4_s3 = expr_pow(_n4_sx, _n4_y);
+var _n4_s4 = expr_neg(_n4_sx);
+var _n4_s5 = expr_exp(_n4_sx);
+var _n4_s6 = expr_ln(_n4_sx);
+ALLOC_MAX = 0;
+# expr_simplify rebuilds sin(x), and that refused node meets each operator's 0 test.
+var _n4z1 = expr_simplify(_n4_s1);
+var _n4z2 = expr_simplify(_n4_s2);
+var _n4z3 = expr_simplify(_n4_s3);
+var _n4z4 = expr_simplify(_n4_s4);
+var _n4z5 = expr_simplify(_n4_s5);
+var _n4z6 = expr_simplify(_n4_s6);
+# Each constructor's own allocation, with children it accepts.
+var _n4c1 = expr_mul(_n4_x, _n4_y);
+var _n4c2 = expr_pow(_n4_x, _n4_y);
+var _n4c3 = expr_neg(_n4_x);
+var _n4c4 = expr_cos(_n4_x);
+var _n4c5 = expr_exp(_n4_x);
+var _n4c6 = expr_ln(_n4_x);
+var _n4a1 = dual_new(F64_ONE, F64_ONE);
+var _n4a2 = dual_ln(_n4_dv);
+var _n4a3 = expr_const(F64_ONE);
+var _n4a4 = expr_var(_n4_wn);
+var _n4a5 = expr_add(_n4_x, _n4_y);
+var _n4a6 = expr_sin(_n4_x);
+var _n4a7 = expr_bind(_n4_wn, F64_ONE);
+var _n4a8 = sym_const_to_str(0x3FE0000000000000);
+var _n4a9 = sym_const_to_str(0x43F0000000000000);
+var _n4a10 = pcg32_new(7);
+var _n4a11 = num_sieve(100);
+var _n4a12 = num_factorize(12);
+var _n4a13 = num_continued_fraction_rational(7, 3);
+var _n4a14 = num_modinv(3, 7);
+var _n4a15 = expr_diff(_n4_tree, _n4_xn);
+ALLOC_MAX = 1000;
+var _n4a16 = num_sieve(1000);
+# 120 bytes: vec_new's 128-byte slot array is refused, the 101-byte sieve is not.
+ALLOC_MAX = 120;
+var _n4a17 = num_sieve(100);
+ALLOC_MAX = _n4_amax;
+assert_eq(_n4a1, 0, "dual_new: a refused allocation -> 0 (3.3.7: exit 139)");
+assert_eq(_n4a2, 0, "dual_ln: its result's refused allocation -> 0");
+assert_eq(_n4a3, 0, "expr_const: a refused allocation -> 0 (3.3.7: exit 139)");
+assert_eq(_n4a4, 0, "expr_var: a refused allocation -> 0");
+assert_eq(_n4a5, 0, "expr_add: a refused allocation -> 0");
+assert_eq(_n4a6, 0, "expr_sin: a refused allocation -> 0");
+assert_eq(_n4a7, 0, "expr_bind: a refused allocation -> 0 (3.3.7: exit 139)");
+assert_eq(_n4a8, 0, "sym_const_to_str(0.5): a refused buffer -> 0 (3.3.7: exit 139)");
+assert_eq(_n4a9, 0, "sym_const_to_str(2^64): a refused exact-integer buffer -> 0");
+assert_eq(_n4a10, 0, "pcg32_new: a refused allocation -> 0 (3.3.7: exit 139)");
+assert_eq(_n4a11, 0, "num_sieve: a refused vec -> 0 (3.3.7: exit 139)");
+assert_eq(_n4a12, 0, "num_factorize: a refused vec -> 0 (3.3.7: exit 139)");
+assert_eq(_n4a13, 0, "num_continued_fraction_rational: a refused vec -> 0 (3.3.7: exit 139)");
+assert_eq(_n4a14, 5, "num_modinv(3, 7) = 5 with every allocation refused: it no longer allocates (3.3.7: exit 139)");
+assert_eq(_n4a15, 0, "expr_diff: a refused node anywhere in the derivative -> 0 at its root");
+assert_eq(_n4a16, 0, "num_sieve(1000): its vec allocated, the 1001-byte sieve refused -> 0");
+assert_eq(_n4a17, 0, "num_sieve(100): its vec refused, the 101-byte sieve granted -> 0, not a push through 0");
+assert_eq(_n4z1, 0, "expr_simplify: a refused rebuild under + -> 0 (3.3.7: the tag read through 0)");
+assert_eq(_n4z2, 0, "expr_simplify: a refused rebuild under * -> 0");
+assert_eq(_n4z3, 0, "expr_simplify: a refused rebuild under ^ -> 0");
+assert_eq(_n4z4, 0, "expr_simplify: a refused rebuild under neg -> 0");
+assert_eq(_n4z5, 0, "expr_simplify: a refused rebuild under exp -> 0");
+assert_eq(_n4z6, 0, "expr_simplify: a refused rebuild under ln -> 0");
+assert_eq(_n4c1 | _n4c2 | _n4c3 | _n4c4 | _n4c5 | _n4c6, 0,
+  "expr_mul / pow / neg / cos / exp / ln: a refused allocation -> 0 (3.3.7: exit 139)");
+assert_eq(ALLOC_MAX, _n4_amax, "ALLOC_MAX restored");
+
+# === 3.4.0: _numx_dft writes nothing outside its work buffers (m0157) ===
+# KEEP THIS GROUP LAST (see the last paragraph).
+# 3.3.7's mutation sample left m0157 unpinned: the zero-fill writing `bv + i*16 - 8` for
+# `bv + i*16 + 8` stores one word below bv. The code itself writes nothing below either
+# buffer (read in 3.4.0: the zero-fill and the chirp's mirror stay in [0, m) slots of each).
+# No in-band canary can see the mutant: _numx_dft allocates av and then bv back to back,
+# so the word below bv is av's last, a zero the fill writes anyway, and nothing a caller
+# allocates can sit between them. It shows only when bv opens a fresh mapping and the word
+# below is unmapped, so this group builds that layout. WHAT IT DEPENDS ON:
+#   - lib/alloc.cyr's chunk grain, copied here as G = 256 MB (its private `_LINUX_CHUNK`;
+#     after a refused mapping the grain is 16 MB, and the sequence still works), and its
+#     bump policy: a request the current chunk cannot hold opens a fresh grain-sized chunk,
+#     and consecutive allocations are contiguous. So alloc(G - K) opens a chunk with
+#     exactly K free;
+#   - _numx_dft(data, 3) allocating exactly av and then bv, K = m * 16 = 128 bytes each,
+#     and nothing after them (num_fft / num_ifft allocate nothing): av closes that chunk and
+#     bv opens the next, and the alloc(8) after the call lands right after bv;
+#   - the kernel leaving the word below a fresh anonymous mapping unmapped.
+# Each is checked, not assumed: write(2) of a word into a pipe returns -14 (EFAULT) for an
+# unmapped one and 8 for a mapped one, so the word below bv must give -14 and the last
+# word of the chunk alloc(G - K) opened must give 8. A broken assumption fails these
+# assertions; it cannot pass silently. ADDRESS SPACE: two 256 MB chunks (512 MB; 272 MB
+# once the grain has fallen to 16 MB) are reserved and never touched. Under
+# vm.overcommit_memory 0 or 1 they are MAP_NORESERVE and cost no commit; under 2 they count
+# against CommitLimit in full. Under `ulimit -v` the whole suite passes at 560,000 KB and
+# fails at 540,000 KB, in this group only (its first draft, with a dry run, failed at
+# 1,258,291 KB). KEPT LAST because a refused mapping lowers the process's grain to 16 MB
+# for everything that runs after it.
+# [measured: scratch mutant m0157 on this tree, hisab.tcyr exit 139 with this group, 2026-10-31]
+# [measured: scratch ulimit -v runs of the hisab.tcyr binary, this tree and integ-snap2, 2026-10-31]
+test_group("3.4.0: _numx_dft writes nothing outside its work buffers (m0157)");
+var _n4_G = 0x10000000;
+var _n4_K = 8 * 16;
+var _n4_pipe: i64[1];
+var _n4_prc = sys_pipe(&_n4_pipe);
+var _n4_pw = load32(&_n4_pipe + 4);
+var _n4_d = alloc(3 * 16);
+store64(_n4_d, 0x3FF3C0CA428C59FB);
+store64(_n4_d + 8, 0xBFE5D1D8A3B2C6F1);
+store64(_n4_d + 16, 0x400921FB54442D18);
+store64(_n4_d + 24, 0x3FD5555555555555);
+store64(_n4_d + 32, 0xC00ADF85458A2BB4);
+store64(_n4_d + 40, 0x3FB999999999999A);
+var _n4_q1 = alloc(_n4_G - _n4_K);
+var _n4ft, _n4fv = _numx_dft(_n4_d, 3);
+var _n4_w = alloc(8);
+assert_eq(_n4_prc, 0, "m0157: the probe pipe opened");
+assert_eq(_n4_q1 != 0 && _n4_w != 0, 1, "m0157: the G - K block and the block after the call were granted");
+assert_eq(sys_write(_n4_pw, _n4_q1 + _n4_G - 8, 8), 8,
+  "m0157: control, the last word of the chunk alloc(G - K) opened (av's last) is mapped");
+assert_eq(sys_write(_n4_pw, _n4_w - _n4_K - 8, 8), 0 - 14,
+  "m0157: during the call bv began a fresh chunk with nothing mapped below it (EFAULT)");
+assert_eq(is_ok(_n4ft), 1, "m0157: the Bluestein DFT of 3 points is Ok");
+assert_eq(load64(_n4_d), 0x3FF045B660005CC0, "m0157: X[0].re (60-digit DFT: within 1e-15 relative)");
+assert_eq(load64(_n4_d + 8), 0xBFCFCFEB1753A438, "m0157: X[0].im");
+assert_eq(load64(_n4_d + 16), 0x3FF8BA04ACCB94C9, "m0157: X[1].re");
+assert_eq(load64(_n4_d + 24), 0xC01A1D035896FEBA, "m0157: X[1].im");
+assert_eq(load64(_n4_d + 32), 0x3FF242A3BAD91C63, "m0157: X[2].re");
+assert_eq(load64(_n4_d + 40), 0x4012ECD173EE9145, "m0157: X[2].im");
+sys_close(_n4_pw);
+sys_close(load32(&_n4_pipe));
 
 var r = assert_summary();
 # Clamp before exiting: assert_summary() returns the raw failure COUNT, and a wait

@@ -7,14 +7,36 @@
 # Layout: col0[4], col1[4], col2[4], col3[4]
 # Access: m4_get(m, col, row)
 
+# The f64 and integer constants of the inverse's and transform_point's filters and exact paths.
+enum _M4Exact {
+    _M4_PM_LO = 0x03F0_0000_0000_0000;   # 2^-960
+    _M4_PM_HI = 0x7E70_0000_0000_0000;   # 2^1000
+    _M4_CERT  = 0x4090_0000_0000_0000;   # 2^10
+    _M4_SPLIT = 0x41A0_0000_0200_0000;   # 2^27 + 1
+    _M4_TWO64 = 0x43F0_0000_0000_0000;   # 2^64
+    _M4_LIMB  = 0x7FF_FFFF;              # 2^27 - 1, an integer: `_m4_xsum`'s limb mask
+    _M4_W_LO  = 0x03F0_0000_0000_0000;   # 2^-960
+    _M4_W_CERT = 0x4130_0000_0000_0000;  # 2^20
+    _M4_QN_LO = 0x3FD0_0000_0000_0000;   # 0.25
+    _M4_QN_HI = 0x4030_0000_0000_0000;   # 16.0
+    _M4_SMALL = 0x2AB0_0000_0000_0000;   # 2^-340
+    _M4_CERT2 = 0x42A0_0000_0000_0000;   # 2^43
+    _M4_DD_LO = 0x07B0_0000_0000_0000;   # 2^-900
+}
+
 # Byte size of the column-major 4x4 grid (16 f64). Ties alloc + copy-loop
 # bounds to a single named constant instead of a repeated magic literal.
+#
+# 3.4.0 (the [3.3.8] allocation row): every function here that allocates returns the designed 0
+# when the allocation is refused (an exhausted heap), and every Result returns Err(HSB_ERR_ALLOC);
+# none stores through a 0 handle. A 0 handle passed IN is the caller's.
 public enum Mat4Layout { MAT4_BYTES = 128 }
 
 # Allocate zeroed 4x4 matrix
 #must_use
 public fn m4_new() {
     var m = alloc(MAT4_BYTES);
+    if (m == 0) { return 0; }
     var i = 0;
     while (i < 16) {
         store64(m + i * 8, 0);
@@ -26,6 +48,7 @@ public fn m4_new() {
 #must_use
 public fn m4_identity() {
     var m = m4_new();
+    if (m == 0) { return 0; }
     store64(m,       F64_ONE);  # [0][0]
     store64(m + 40,  F64_ONE);  # [1][1]
     store64(m + 80,  F64_ONE);  # [2][2]
@@ -47,6 +70,7 @@ public fn m4_set(m, col, row, val) {
 #must_use
 public fn m4_copy(src) {
     var dst = alloc(MAT4_BYTES);
+    if (dst == 0) { return 0; }
     var i = 0;
     while (i < MAT4_BYTES) {
         store64(dst + i, load64(src + i));
@@ -62,6 +86,7 @@ public fn m4_copy(src) {
 #must_use
 public fn m4_from_cols(c0, c1, c2, c3) {
     var m = alloc(MAT4_BYTES);
+    if (m == 0) { return 0; }
     store64(m,       HVec4_x(c0)); store64(m + 8,   HVec4_y(c0));
     store64(m + 16,  HVec4_z(c0)); store64(m + 24,  HVec4_w(c0));
     store64(m + 32,  HVec4_x(c1)); store64(m + 40,  HVec4_y(c1));
@@ -90,7 +115,9 @@ public fn m4_col(m, c) {
 #must_use
 public fn m4_mul(a, b) {
     var c = m4_new();
+    if (c == 0) { return 0; }
     var tmp = alloc(32);
+    if (tmp == 0) { return 0; }
     var col = 0;
     while (col < 4) {
         var cc = c + col * 32;          # dest column (contiguous)
@@ -148,7 +175,9 @@ public fn m4_mul(a, b) {
 #must_use
 public fn m4_mul_vec4(m, v) {
     var r = alloc(sizeof(HVec4));
+    if (r == 0) { return 0; }
     var tmp = alloc(32);
+    if (tmp == 0) { return 0; }
     f64v_scale(r, m + 0, HVec4_x(v), 4);
     f64v_scale(tmp, m + 32, HVec4_y(v), 4); f64v_add(r, r, tmp, 4);
     f64v_scale(tmp, m + 64, HVec4_z(v), 4); f64v_add(r, r, tmp, 4);
@@ -156,29 +185,126 @@ public fn m4_mul_vec4(m, v) {
     return r;
 }
 
-# p * 2^s for `m4_transform_point`'s finite non-zero w whose 1/w is not normal. From below
-# (|w| <= 2^-1024, 1/w overflows) the copy is p * 2^1022: w lands in [2^-52, 2^-2], scaling up
-# is exact, and an x that overflows in the copy has |x / w| past 2^1026 as well. (A copy with
-# w in [1, 2) overflowed x for quotients just under DBL_MAX: 67 sweep components came back
-# +-Inf for a finite quotient.) From above (|w| > 2^1022, 1/w subnormal) the copy is halved or
-# quartered, just enough for 1/w to be normal: x / 2 and x / 4 round only for a subnormal x,
-# whose |x / w| < 2^-2042 rounds to zero whatever they are, so every component that can reach
-# the answer is exact. A [1, 2) copy rounds every |x| < 2, and left 521 sweep components 1 ulp
-# off where this leaves 470.
+# p * 2^s for `m4_transform_point_checked`'s finite w above 2^1022, whose 1/w is subnormal:
+# the copy is halved or quartered, just enough for 1/w to be normal. x / 2 and x / 4 round only
+# for a subnormal x, whose |x / w| < 2^-2042 rounds to zero whatever they are, so every
+# component that can reach the answer is exact. A [1, 2) copy rounds every |x| < 2, and left
+# 521 sweep components 1 ulp off where this leaves 470. (Through 3.4.0's review the band below,
+# |w| <= 2^-1024, was a 2^1022 copy here; the certificate now sends every |w~| < 2^-960 to the
+# exact path.)
 # [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
 fn _m4_w_scaled(p) {
-    var e = f64_abs(HVec4_w(p)) >> 52;
-    var s = (1023 + 1022) << 52;                                          # 2^1022
-    if (e != 0) { s = (3067 - e) << 52; }                                 # 1/2, 1/4
+    var s = (3067 - (f64_abs(HVec4_w(p)) >> 52)) << 52;                   # 1/2, 1/4
     var r = alloc(sizeof(HVec4));
+    if (r == 0) { return 0; }
     f64v_scale(r, p, s, 4);
     return r;
 }
 
-# Mat4 * Vec3 as point (w=1, perspective divide)
+# `m4_transform_point_checked` where its certificate cannot vouch for the rounded clip vector:
+# decided and answered exactly. A NaN or infinite input is refused. Each coordinate of
+# M (v, 1) is summed exactly from its four products (`_m4_xsum`); w = 0 exactly is a point at
+# infinity, and otherwise each component is the quotient of its coordinate and w, each rounded
+# once, divided once and scaled by a power of two: within (3u + 3u^2) of the exact quotient,
+# relative, plus half a subnormal step where it is subnormal, and +-Inf where it overflows. An
+# exactly zero coordinate gives the zero 0 / w gives, signed as w is.
+fn _m4_point_exact(m, v) {
+    var dc: i64[80];
+    var i = 0;
+    while (i < 16) {
+        if ((load64(m + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { return Err(HSB_ERR_INVALID_INPUT); }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 3) {
+        if ((load64(v + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { return Err(HSB_ERR_INVALID_INPUT); }
+        i = i + 1;
+    }
+    # Row 3 zero: w = 0 for every point, refused without the sums.
+    if (((load64(m + 24) | load64(m + 56) | load64(m + 88) | load64(m + 120)) & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        return Err(HSB_ERR_DIVISION_BY_ZERO);
+    }
+    i = 0;
+    while (i < 16) { _m4_xdec(load64(m + i * 8), &dc + i * 32); i = i + 1; }
+    i = 0;
+    while (i < 3) { _m4_xdec(load64(v + i * 8), &dc + (16 + i) * 32); i = i + 1; }
+    _m4_xdec(F64_ONE, &dc + 19 * 32);
+    var er: i64[2];
+    _m4_xrange(&dc, 20, &er);
+    # row r of M (v, 1): the products m(r, c) v_c, entry (r, c) at index 4c + r, v_c at 16 + c
+    var tl: i64[12];
+    var od: i64[2];
+    var sw = _m4_xsum(&dc, &er, _m4_row_terms(&tl, 3), 4, 2, &od);
+    if (sw == 0) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    var q: i64[3];
+    var oc: i64[2];
+    var r = 0;
+    while (r < 3) {
+        var sc = _m4_xsum(&dc, &er, _m4_row_terms(&tl, r), 4, 2, &oc);
+        var c = 0;
+        if (sw < 0) { c = 0x8000_0000_0000_0000; }   # an exact 0 over w: IEEE's 0 / w
+        if (sc != 0) {
+            c = _m4_ldexp(f64_div(load64(&oc), load64(&od)), load64(&oc + 8) - load64(&od + 8));
+            if (sc != sw) { c = c ^ 0x8000000000000000; }   # the sign bit: f64_neg gave +0 for +0 below cycc 6.6.8
+        }
+        store64(&q + r * 8, c);
+        r = r + 1;
+    }
+    var res = hvec3_new(load64(&q), load64(&q + 8), load64(&q + 16));
+    if (res == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(res);
+}
+
+# The four terms m(r, c) v_c of row r of M (v, 1) into tl (`_m4_point_exact`); returns tl.
+fn _m4_row_terms(tl, r) {
+    var c = 0;
+    while (c < 4) {
+        store64(tl + c * 24, c * 4 + r);
+        store64(tl + c * 24 + 8, 16 + c);
+        store64(tl + c * 24 + 16, 0);
+        c = c + 1;
+    }
+    return tl;
+}
+
+# Mat4 * Vec3 as a point: M (v, 1) divided by its w, as `Ok(point)`, or
+# `Err(HSB_ERR_DIVISION_BY_ZERO)` exactly where w = 0 -- the point maps to infinity and has no
+# image in R^3 -- or `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite entry of M or v. w is
+# M's row 3 dotted with (v, 1), taken exactly: every non-zero w divides, however small, and a
+# rounded w of 0 or of the wrong sign decides nothing.
+#
+# ⛔ 3.4.0 — REPLACES `m4_transform_point`, which returned the UNDIVIDED clip coordinates at
+# w = +-0 and NaN (audit D088): a point at infinity came back as an ordinary finite point. And
+# a clip vector that overflowed from finite inputs answered wrongly: w = +-Inf multiplied by
+# 1/w = 0 (2^1000 I with (2^30, 3, 5) gave (0, 0, 0), not (2^30, 3, 5)), and an overflowing x
+# beside a finite w gave +-Inf for a finite quotient. It is retired, not redefined.
+# ⛔ 3.4.0 — AND THROUGH THE FIRST 3.4.0 REVIEW IT DECIDED w = 0 ON THE ROUNDED w: exact
+# w = 3 RN(1/3) - 1 = -2^-54 rounds to 0 and was refused, exact w = 0 rounded to -2^-104 and
+# answered (-2.03e31, -2.03e31, -1); on 3,000 points whose w nearly cancels, 1,777 were refused
+# with an exact w != 0 and 933 of the rest were more than 2^-20 off the exact quotient.
+# [measured: REV-FB t15.py, Fraction clip vectors, the first 3.4.0 review of lane FB, 2026-10-31]
+# ⭐ The rounded w is used only where it is certified (below, in the body): S <= 2^20 |w~| and
+# |w~| >= 2^-960 put w~ within 2^-30.9 of w with w's sign. Everything else goes to
+# `_m4_point_exact`, which sums each coordinate exactly, refuses exactly w = 0, and divides the
+# two rounded sums: within (3u + 3u^2) of the exact quotient, relative. Where the formula answers,
+# each component is x~ / w~ with |x~ - x| <= 4u S_x + 2^-1073 (S_x the sum of |m(0, c) v_c|,
+# and so for y and z) and w~ as above, two roundings more for the division: the 3.3.6 bands'
+# arithmetic, unchanged for every w~ the certificate passes, and the same bits there. On the
+# review's 3,000 near-cancelling points all are now answered, none past 2^-20 of the exact
+# quotient; over 3,000 matrices and points with entries anywhere from 2^-1074 to 2^1023, every
+# Err is an exact w = 0 and every Ok an exact w != 0.
+# [measured: REV-FB t15.py and scratch t_point.py, Fraction clip vectors, 3.4.0 lane FB review repairs, 2026-10-31]
+# Cost: the certificate is three products, four absolute values and four sums: 105 -> 106 ns on a
+# focused row against integ-snap7, world_to_screen 111 -> 113 (tests/hisab.bcyr's rows move
+# within their spread); a zero row 3 is refused before any sum, 328 -> 113 ns; the exact path
+# is 1.10 us where w cancels (integ-snap7 refused that point, wrongly, in 365 ns).
+# [measured: scratch pt.bcyr and tests/hisab.bcyr, integ-snap7 and this tree interleaved x 3, 2026-10-31; cycc 6.7.9]
 #must_use
-public fn m4_transform_point(m, v) {
-    var p = m4_mul_vec4(m, hvec4_from_vec3(v, F64_ONE));
+public fn m4_transform_point_checked(m, v) {
+    var hv = hvec4_from_vec3(v, F64_ONE);
+    if (hv == 0) { return Err(HSB_ERR_ALLOC); }
+    var p = m4_mul_vec4(m, hv);
+    if (p == 0) { return Err(HSB_ERR_ALLOC); }
     var pw = HVec4_w(p);
     # ⛔ `pw` is the homogeneous w of M·(v,1) and carries the matrix's own scale,
     # so an absolute 1e-12 skipped the perspective divide for whole classes of
@@ -193,34 +319,52 @@ public fn m4_transform_point(m, v) {
     # 2^-1024 were wrong, and 34 of 2,367 above 2^1022 were 3 or 4 ulp off the exact quotient.
     # ⭐ Both bands now multiply a power-of-two copy by its normal 1/w (`_m4_w_scaled`), which is
     # x * RN(1/w) as an unbounded exponent range would give it: all 7,068 finite answers of the
-    # sweep in those bands. Two roundings, so within 1.5 ulp of the exact quotient, as in the
-    # normal band: over 40,295 components of a broader family (two seeds) in these bands the
-    # largest error is 1.38 ulp (621 past 1 ulp), and 1.48 over 196,198 where 1/w is normal.
-    # Where 1/w is normal nothing changed (58,567 of 58,567 sweep answers keep their bits);
-    # w = +-0 and NaN still return the undivided coordinates (D088), and w = +-Inf still
-    # multiplies by 1/w = +-0.
+    # sweep in those bands. (3.4.0: below the certificate's 2^-960 the exact path answers
+    # instead, and the copy serves the band above 2^1022 alone.) Two roundings, so within 1.5
+    # ulp of the exact quotient, as in the normal band: over 40,295 components of a broader
+    # family (two seeds) in these bands the largest error is 1.38 ulp (621 past 1 ulp), and
+    # 1.48 over 196,198 where 1/w is normal.
+    # Where 1/w is normal nothing changed (58,567 of 58,567 sweep answers keep their bits).
     # [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
     # [measured: C336 m4 band sweep (C2's rotm4 family, seeds 301 and 302), this tree, 2026-10-11; cycc 6.6.14]
-    var inv_w = f64_div(F64_ONE, pw);
-    var ai = f64_abs(inv_w);
-    if (f64_lt(ai, F64_TINY) == 1 || f64_lt(ai, F64_POS_INF) == 0) {
-        if (f64_eq(pw, 0) == 0 && f64_lt(f64_abs(pw), F64_POS_INF) == 1) {
-            p = _m4_w_scaled(p);
-            inv_w = f64_div(F64_ONE, HVec4_w(p));
-        }
-        if (f64_lt(f64_abs(inv_w), F64_POS_INF) == 0) {
-            return hvec3_new(HVec4_x(p), HVec4_y(p), HVec4_z(p));
-        }
+    # Certified, or decided exactly: |w~ - w| <= 4u S + 4 * 2^-1075 for S the sum of |m(3, c) v_c|
+    # (four rounded products, three rounded sums; 2^-1075 per product that underflows), so
+    # S <= 2^20 |w~| with |w~| >= 2^-960 makes w~ non-zero with w's sign and within 2^-30.9 of
+    # w, relative. Anything else -- w~ = 0, |w~| within 2^20 of its rounding, a NaN -- goes to
+    # `_m4_point_exact`, which decides on the exact w. An infinite S passes only beside an
+    # infinite w~, which the tests below send there too.
+    var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
+    var sw = f64_add(f64_add(f64_add(f64_abs(f64_mul(load64(m + 24), vx)), f64_abs(f64_mul(load64(m + 56), vy))),
+        f64_abs(f64_mul(load64(m + 88), vz))), f64_abs(load64(m + 120)));
+    var aw = f64_abs(pw);
+    if (f64_ge(aw, _M4_W_LO) == 0 || f64_le(sw, f64_mul(aw, _M4_W_CERT)) == 0) {
+        return _m4_point_exact(m, v);
     }
-    return hvec3_new(f64_mul(HVec4_x(p), inv_w),
-      f64_mul(HVec4_y(p), inv_w),
-      f64_mul(HVec4_z(p), inv_w));
+    var inv_w = f64_div(F64_ONE, pw);
+    if (f64_lt(f64_abs(inv_w), F64_TINY) == 1) {
+        if (f64_lt(aw, F64_POS_INF) == 0) { return _m4_point_exact(m, v); }
+        p = _m4_w_scaled(p);
+        if (p == 0) { return Err(HSB_ERR_ALLOC); }
+        inv_w = f64_div(F64_ONE, HVec4_w(p));
+    }
+    var rx = f64_mul(HVec4_x(p), inv_w);
+    var ry = f64_mul(HVec4_y(p), inv_w);
+    var rz = f64_mul(HVec4_z(p), inv_w);
+    if ((f64_add(f64_add(rx, ry), rz) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) {
+        return _m4_point_exact(m, v);
+    }
+    var res = hvec3_new(rx, ry, rz);
+    if (res == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(res);
 }
 
 # Mat4 * Vec3 as direction (w=0)
 #must_use
 public fn m4_transform_dir(m, v) {
-    var p = m4_mul_vec4(m, hvec4_from_vec3(v, 0));
+    var hv = hvec4_from_vec3(v, 0);
+    if (hv == 0) { return 0; }
+    var p = m4_mul_vec4(m, hv);
+    if (p == 0) { return 0; }
     return hvec3_new(HVec4_x(p), HVec4_y(p), HVec4_z(p));
 }
 
@@ -231,6 +375,7 @@ public fn m4_transform_dir(m, v) {
 #must_use
 public fn m4_transpose(m) {
     var t = m4_new();
+    if (t == 0) { return 0; }
     var c = 0;
     while (c < 4) {
         var r = 0;
@@ -278,92 +423,674 @@ public fn m4_determinant(m) {
 }
 
 # ================================================================
-# Inverse (Cramer's rule)
+# Inverse (3.4.0: a Result; `m4_inverse` is retired)
 # ================================================================
 
+# x * 2^k, rounded once, for any integer k (mat3.cyr's `_m3_ldexp`).
+fn _m4_ldexp(x, k) {
+    while (k > 1023) { x = f64_mul(x, (1023 + 1023) << 52); k = k - 1023; }
+    if (k >= 0) { return f64_mul(x, (1023 + k) << 52); }
+    var m = (0 - k) / 1022;
+    x = f64_mul(x, (1023 - ((0 - k) - m * 1022)) << 52);
+    while (m > 0) { x = f64_mul(x, 0x0010_0000_0000_0000); m = m - 1; }   # 2^-1022
+    return x;
+}
+
+# ----------------------------------------------------------------
+# Exact arithmetic over the whole double range (mat3.cyr's `_m3_xsum` block, which says why).
+# ----------------------------------------------------------------
+
+# x (finite) into d[0..4): its significand n as base-2^27 limbs (low, high; 0 for +-0), its
+# exponent e (|x| = n * 2^e) and its sign bit.
+fn _m4_xdec(x, d) {
+    var b = x & 0x7FFF_FFFF_FFFF_FFFF;
+    var n = b & 0x000F_FFFF_FFFF_FFFF;
+    var e = 0 - 1074;
+    if ((b >> 52) != 0) { n = n | 0x0010_0000_0000_0000; e = (b >> 52) - 1075; }
+    store64(d, n & _M4_LIMB);
+    store64(d + 8, n >> 27);
+    store64(d + 16, e);
+    store64(d + 24, x >> 63);
+    return 0;
+}
+
+# The least and greatest exponent of the non-zero entries among dc[0..ne) into er[0], er[1]
+# (er[1] < er[0] when every one is zero): the bounds `_m4_xsum` places its terms by.
+fn _m4_xrange(dc, ne, er) {
+    var lo = 4096;
+    var hi = 0 - 4096;
+    var i = 0;
+    while (i < ne) {
+        var d = dc + i * 32;
+        if ((load64(d) | load64(d + 8)) != 0) {
+            var e = load64(d + 16);
+            if (e < lo) { lo = e; }
+            if (e > hi) { hi = e; }
+        }
+        i = i + 1;
+    }
+    store64(er, lo);
+    store64(er + 8, hi);
+    return 0;
+}
+
+# The significand product of term base's k entries (k = 2, 3, 4) as base-2^27 limbs into pr, its
+# exponent into pr[8] and its sign into pr[9]; returns the limb count, or 0 for a zero term.
+# Every limb product is below 2^54 and every column sum below 2^57.
+fn _m4_xprod(dc, base, k, pr) {
+    var da = dc + load64(base) * 32;
+    var db = dc + load64(base + 8) * 32;
+    var a0 = load64(da); var a1 = load64(da + 8);
+    var b0 = load64(db); var b1 = load64(db + 8);
+    if ((a0 | a1) == 0 || (b0 | b1) == 0) { return 0; }
+    store64(pr + 64, load64(da + 16) + load64(db + 16));
+    store64(pr + 72, load64(da + 24) ^ load64(db + 24) ^ load64(base + k * 8));
+    var t0 = a0 * b0;
+    var t1 = a0 * b1 + a1 * b0 + (t0 >> 27);
+    var t2 = a1 * b1 + (t1 >> 27);
+    var p0 = t0 & _M4_LIMB; var p1 = t1 & _M4_LIMB; var p2 = t2 & _M4_LIMB; var p3 = t2 >> 27;
+    if (k == 2) {
+        store64(pr, p0); store64(pr + 8, p1); store64(pr + 16, p2); store64(pr + 24, p3);
+        return 4;
+    }
+    var dg = dc + load64(base + 16) * 32;
+    var c0 = load64(dg); var c1 = load64(dg + 8);
+    if ((c0 | c1) == 0) { return 0; }
+    store64(pr + 64, load64(pr + 64) + load64(dg + 16));
+    store64(pr + 72, load64(pr + 72) ^ load64(dg + 24));
+    if (k == 3) {
+        var u0 = p0 * c0;
+        var u1 = p1 * c0 + p0 * c1 + (u0 >> 27);
+        var u2 = p2 * c0 + p1 * c1 + (u1 >> 27);
+        var u3 = p3 * c0 + p2 * c1 + (u2 >> 27);
+        var u4 = p3 * c1 + (u3 >> 27);
+        store64(pr, u0 & _M4_LIMB); store64(pr + 8, u1 & _M4_LIMB); store64(pr + 16, u2 & _M4_LIMB);
+        store64(pr + 24, u3 & _M4_LIMB); store64(pr + 32, u4 & _M4_LIMB); store64(pr + 40, u4 >> 27);
+        return 6;
+    }
+    var dh = dc + load64(base + 24) * 32;
+    var d0 = load64(dh); var d1 = load64(dh + 8);
+    if ((d0 | d1) == 0) { return 0; }
+    store64(pr + 64, load64(pr + 64) + load64(dh + 16));
+    store64(pr + 72, load64(pr + 72) ^ load64(dh + 24));
+    var s0 = c0 * d0;
+    var s1 = c0 * d1 + c1 * d0 + (s0 >> 27);
+    var s2 = c1 * d1 + (s1 >> 27);
+    var q0 = s0 & _M4_LIMB; var q1 = s1 & _M4_LIMB; var q2 = s2 & _M4_LIMB; var q3 = s2 >> 27;
+    var v0 = p0 * q0;
+    var v1 = p0 * q1 + p1 * q0 + (v0 >> 27);
+    var v2 = p0 * q2 + p1 * q1 + p2 * q0 + (v1 >> 27);
+    var v3 = p0 * q3 + p1 * q2 + p2 * q1 + p3 * q0 + (v2 >> 27);
+    var v4 = p1 * q3 + p2 * q2 + p3 * q1 + (v3 >> 27);
+    var v5 = p2 * q3 + p3 * q2 + (v4 >> 27);
+    var v6 = p3 * q3 + (v5 >> 27);
+    store64(pr, v0 & _M4_LIMB); store64(pr + 8, v1 & _M4_LIMB);
+    store64(pr + 16, v2 & _M4_LIMB); store64(pr + 24, v3 & _M4_LIMB);
+    store64(pr + 32, v4 & _M4_LIMB); store64(pr + 40, v5 & _M4_LIMB);
+    store64(pr + 48, v6 & _M4_LIMB); store64(pr + 56, v6 >> 27);
+    return 8;
+}
+
+# The exact sum of nt signed products of k entries each (mat3.cyr's `_m3_xsum`): term t is the
+# product of the entries dc[tl[t (k+1) + j]], j < k (four slots each, `_m4_xdec`), negated when
+# tl[t (k+1) + k] is 1; er holds the entries' exponent bounds (`_m4_xrange`). Returns the sum's
+# sign (1, -1, or 0 exactly when it is zero) and, when it is not zero, its magnitude rounded
+# once to nearest as out[0] * 2^out[1], out[0] in [1, 2^62]. At most 32 terms of at most 4
+# entries.
+fn _m4_xsum(dc, er, tl, nt, k, out) {
+    var acc: i64[320];
+    var pr: i64[10];
+    if (load64(er + 8) < load64(er)) { return 0; }   # every entry zero
+    # every term is k entries' product: below 2^(53 k) in units of 2^(its exponent), which lies
+    # in [k emin, k emax] (er: the entries' least and greatest exponents); a sum of at most 32
+    # such terms needs 5 bits more
+    var lo = k * load64(er);
+    var w = (k * (load64(er + 8) - load64(er)) + 53 * k + 5) / 27 + 2;
+    var i = 0;
+    while (i < w) { store64(&acc + i * 8, 0); i = i + 1; }
+    var t = 0;
+    while (t < nt) {
+        var n = _m4_xprod(dc, tl + t * (k + 1) * 8, k, &pr);
+        if (n != 0) {
+            var o = load64(&pr + 64) - lo;
+            var ql = o / 27;
+            var sh = o - ql * 27;
+            var a = &acc + ql * 8;
+            var pp = &pr;
+            var pe = &pr + n * 8;
+            if (load64(&pr + 72) == 0) {
+                while (pp < pe) { store64(a, load64(a) + (load64(pp) << sh)); a = a + 8; pp = pp + 8; }
+            } else {
+                while (pp < pe) { store64(a, load64(a) - (load64(pp) << sh)); a = a + 8; pp = pp + 8; }
+            }
+        }
+        t = t + 1;
+    }
+    # carries (floor, `>>>`): the top carry is 0 or -1, the sum's sign
+    var c = 0;
+    i = 0;
+    while (i < w) {
+        var v2 = load64(&acc + i * 8) + c;
+        store64(&acc + i * 8, v2 & _M4_LIMB);
+        c = v2 >>> 27;
+        i = i + 1;
+    }
+    var res = 1;
+    if (c < 0) {
+        res = 0 - 1;
+        c = 0;
+        i = 0;
+        while (i < w) {
+            var v3 = c - load64(&acc + i * 8);
+            store64(&acc + i * 8, v3 & _M4_LIMB);
+            c = v3 >>> 27;
+            i = i + 1;
+        }
+    }
+    var h = w - 1;
+    while (h >= 0 && load64(&acc + h * 8) == 0) { h = h - 1; }
+    if (h < 0) { return 0; }
+    # the top 62 bits, the rest folded into bit 0 (sticky): one rounding, to nearest
+    var x = load64(&acc + h * 8);
+    var nb = 0;
+    var tt = x;
+    while (tt != 0) { tt = tt >> 1; nb = nb + 1; }
+    var pos = h * 27;
+    var jb = h - 1;
+    while (jb >= 0 && nb + 27 <= 62) {
+        x = (x << 27) | load64(&acc + jb * 8);
+        nb = nb + 27;
+        pos = pos - 27;
+        jb = jb - 1;
+    }
+    if (jb >= 0) {
+        var take = 62 - nb;
+        var lw = load64(&acc + jb * 8);
+        x = (x << take) | (lw >> (27 - take));
+        pos = pos - take;
+        var st = lw & ((1 << (27 - take)) - 1);
+        jb = jb - 1;
+        while (jb >= 0) { st = st | load64(&acc + jb * 8); jb = jb - 1; }
+        if (st != 0) { x = x | 1; }
+    }
+    store64(out, f64_from(x));
+    store64(out + 8, pos + lo);
+    return res;
+}
+
+# The six terms of the cofactor (-1)^(r+c) minor(r, c) of a 4x4 (entry (i, j) is index 4j + i)
+# from term nt of tl on, each prefixed with the entry (r, c) itself when k is 4 (the terms of
+# det along row r). Returns nt + 6.
+fn _m4_minor_terms(tl, nt, r, c, k) {
+    var ri: i64[3];
+    var ci: i64[3];
+    var n = 0;
+    var i = 0;
+    while (i < 4) { if (i != r) { store64(&ri + n * 8, i); n = n + 1; } i = i + 1; }
+    n = 0;
+    i = 0;
+    while (i < 4) { if (i != c) { store64(&ci + n * 8, i * 4); n = n + 1; } i = i + 1; }
+    var r0 = load64(&ri); var r1 = load64(&ri + 8); var r2 = load64(&ri + 16);
+    var c0 = load64(&ci); var c1 = load64(&ci + 8); var c2 = load64(&ci + 16);
+    var s = (r + c) & 1;
+    var st = (k + 1) * 8;
+    var p = tl + nt * st;
+    var o = 0;
+    if (k == 4) {
+        o = 8;
+        var j = 0;
+        while (j < 6) { store64(p + j * st, c * 4 + r); j = j + 1; }
+    }
+    # the six permutations of (c0, c1, c2) over (r0, r1, r2), with their parities
+    var q = p + o;
+    store64(q, r0 + c0); store64(q + 8, r1 + c1); store64(q + 16, r2 + c2); store64(q + 24, s);
+    q = q + st;
+    store64(q, r0 + c0); store64(q + 8, r1 + c2); store64(q + 16, r2 + c1); store64(q + 24, 1 - s);
+    q = q + st;
+    store64(q, r0 + c1); store64(q + 8, r1 + c0); store64(q + 16, r2 + c2); store64(q + 24, 1 - s);
+    q = q + st;
+    store64(q, r0 + c1); store64(q + 8, r1 + c2); store64(q + 16, r2 + c0); store64(q + 24, s);
+    q = q + st;
+    store64(q, r0 + c2); store64(q + 8, r1 + c0); store64(q + 16, r2 + c1); store64(q + 24, s);
+    q = q + st;
+    store64(q, r0 + c2); store64(q + 8, r1 + c1); store64(q + 16, r2 + c0); store64(q + 24, 1 - s);
+    return nt + 6;
+}
+
+# 1 when a row or a column of the 4x4 m is zero (`_m4_inverse_exact`'s quick refusal: a zero scale
+# is the common singular matrix, and its exact determinant need not be summed).
+fn _m4_zero_line(m) {
+    var i = 0;
+    while (i < 4) {
+        var zr = 1;
+        var zc = 1;
+        var j = 0;
+        while (j < 4) {
+            if ((load64(m + (j * 4 + i) * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0) { zr = 0; }
+            if ((load64(m + (i * 4 + j) * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0) { zc = 0; }
+            j = j + 1;
+        }
+        if (zr == 1 || zc == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# `m4_inverse_checked` where its filters cannot certify a faster answer: decided and answered
+# exactly. Singular exactly when det, summed exactly from its 24 products, is zero (det comes
+# first, so a singular matrix costs 24 products, not 120); otherwise each entry is C_ji / det,
+# the cofactor and the determinant each summed exactly and rounded once, divided once and
+# scaled by a power of two, rounded once more only where the entry is subnormal or overflows
+# (to +-Inf, as IEEE rounds a value beyond DBL_MAX). So an entry X is within (3u + 3u^2)|X|
+# of the exact one (u = 2^-53), below 3 ulp, plus half a subnormal step there; an exact zero
+# entry is +0.
+fn _m4_inverse_exact(m) {
+    var i = 0;
+    while (i < 16) {
+        if ((load64(m + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) {
+            return Err(HSB_ERR_INVALID_INPUT);
+        }
+        i = i + 1;
+    }
+    var dc: i64[64];
+    i = 0;
+    while (i < 16) { _m4_xdec(load64(m + i * 8), &dc + i * 32); i = i + 1; }
+    if (_m4_zero_line(m) == 1) { return Err(HSB_ERR_SINGULAR_MATRIX); }
+    var er: i64[2];
+    _m4_xrange(&dc, 16, &er);
+    var tl: i64[120];
+    var nt = 0;
+    i = 0;
+    while (i < 4) { nt = _m4_minor_terms(&tl, nt, 0, i, 4); i = i + 1; }
+    var od: i64[2];
+    var sd = _m4_xsum(&dc, &er, &tl, 24, 4, &od);
+    if (sd == 0) { return Err(HSB_ERR_SINGULAR_MATRIX); }
+    var r = m4_new();
+    if (r == 0) { return Err(HSB_ERR_ALLOC); }
+    var oc: i64[2];
+    var row = 0;
+    while (row < 4) {
+        var col = 0;
+        while (col < 4) {
+            _m4_minor_terms(&tl, 0, row, col, 3);
+            var sc = _m4_xsum(&dc, &er, &tl, 6, 3, &oc);
+            var v = 0;
+            if (sc != 0) {
+                v = _m4_ldexp(f64_div(load64(&oc), load64(&od)), load64(&oc + 8) - load64(&od + 8));
+                if (sc != sd) { v = v ^ 0x8000000000000000; }   # the sign bit, as in mat3
+            }
+            # X = adj(M) / det: X(col, row) = C(row, col) / det, at index 4 row + col
+            store64(r + (row * 4 + col) * 8, v);
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    return Ok(r);
+}
+
+# M^-1 as `Ok(matrix)`, `Err(HSB_ERR_SINGULAR_MATRIX)` exactly when M (its entries taken as the
+# exact rationals they are) has determinant zero, or `Err(HSB_ERR_INVALID_INPUT)` for a NaN or
+# infinite entry, decided exactly over the whole double range; an entry whose exact value is
+# beyond DBL_MAX is +-Inf. mat3.cyr's `m3_inverse_checked` has the reasons and the three tiers;
+# here, with P the permanent of |M| (sum over the six 2x2 pairs of perm|top| * perm|bottom|):
+#  1. the cofactor formula, 3.3.7's arithmetic bit for bit, where |det - det~| <= 8u P (first
+#     order) and P <= 2^10 |det~|, P in [2^-960, 2^1000], every non-zero entry at least 2^-340
+#     (no product of up to three entries flushes; through the first 3.4.0 review a
+#     P >= 2^-1000 M^2 clause stood here, which bounded the determinant's flushes but not the
+#     cofactors'), and every entry of the answer finite;
+#  2. where 2^10 |det~| < P <= 2^43 |dd|, P >= 2^-900: the formula's cofactors over a double-double
+#     determinant dd, the six pairs' minors and products formed with Dekker's exact products and
+#     summed with TwoSum: |dd - det| <= 70 u^2 P (first order, before its rounding; the largest
+#     |dd - det| / (u^2 P) measured is 2.41), so within 2^-56.9 of det;
+#  3. everything else, `_m4_inverse_exact`, in exact integers.
+# Accuracy, derived to first order: in tiers 1 and 2 an entry X_ij = C_ji / det is within
+# (5u pC_ji + (e + 2u) |C_ji|) / |det|, pC_ji the permanent of its cofactor's 3x3 minor and e the
+# determinant's relative error (8u 2^10 = 2^-40 in tier 1, 2^-56.9 + u in tier 2); in tier 3
+# within (3u + 3u^2) |X|, under 3 ulp, plus half a subnormal step.
+# [measured: scratch t_tier2.py, Fraction determinants of the dd emulation, 3.4.0 lane FB review repairs, 2026-10-31]
+# Measured, against exact rational inverses (maxima of the stated samples, not bounds), in ulp of
+# the largest exact entry: 400 random uniform matrices 154 (tier 1) and 2.5 (the 3 in tier 2);
+# view-projections (60-degree fov, 16:9, far 1000; 60 per near / eye-distance pair) at near 1e-3
+# and 1, eye 10, 1e3 and 1e5: 348 where tier 1 answers (near 1, eye 1e3) and at most 2.9 in
+# tier 2, which takes every one with near 1e-3 or eye 1e5; rows r3 = r0 + r1 + noise 2^-k (80
+# each): 553 at k = 4 (tier 1), 2.8 .. 11.9 in tier 2, 1.6 in tier 3; 1,000 matrices with entries
+# anywhere from 2^-1074 to 2^1023 (tier 3): every entry within 2.10 ulp of its own exact value.
+# [measured: scratch t_tier2.py / t_exact.py, Fraction oracle, 3.4.0 lane FB review repairs, 2026-10-31]
+#
+# ⛔ 3.4.0 — `m4_inverse` returned the identity for a singular or NaN M (audit D088), the
+# identity for 2^-300 I (det underflows) and a signed-zero matrix for 2^300 I (det overflows).
+# It is retired, not redefined. (`t3d_inverse_matrix` inherited all three; see transforms.cyr.)
+# Cost, against integ-snap7 and 3.3.7 (focused rows, the three binaries interleaved x 3): tier 1
+# 191 -> 190 ns (3.3.7: 257; the entry screen costs what the M^2 clause's scan did); view-
+# projections whose P passes 2^10 |det| (eye 1e3 .. 1e5) and rows r3 = r0 + r1 + 2^-30, tier 2:
+# 21.5 .. 23.1 us -> 565 ns, 2.2x 3.3.7's 256 ns (which was hundreds of ulp off on these);
+# an exactly singular rank-3 matrix 7.2 -> 2.8 us (3.3.7: 136 ns, the identity). Tier 2 is
+# Dekker's products without a fused multiply-add: 30 of them and their sums are 418 of 597 ns
+# in a cut-off profile, the rest tier 1's arithmetic and the answer.
+# [measured: scratch inv_new.bcyr / inv_old.bcyr / t2cut.bcyr, 3.3.7 + integ-snap7 + this tree x 3, 2026-10-31]
 #must_use
-public fn m4_inverse(m) {
-    # Use cofactor expansion -- match glam's implementation
-    var m00 = m4_get(m, 0, 0); var m01 = m4_get(m, 0, 1);
-    var m02 = m4_get(m, 0, 2); var m03 = m4_get(m, 0, 3);
-    var m10 = m4_get(m, 1, 0); var m11 = m4_get(m, 1, 1);
-    var m12 = m4_get(m, 1, 2); var m13 = m4_get(m, 1, 3);
-    var m20 = m4_get(m, 2, 0); var m21 = m4_get(m, 2, 1);
-    var m22 = m4_get(m, 2, 2); var m23 = m4_get(m, 2, 3);
-    var m30 = m4_get(m, 3, 0); var m31 = m4_get(m, 3, 1);
-    var m32 = m4_get(m, 3, 2); var m33 = m4_get(m, 3, 3);
+public fn m4_inverse_checked(m) {
+    var m00 = load64(m);       var m01 = load64(m + 8);
+    var m02 = load64(m + 16);  var m03 = load64(m + 24);
+    var m10 = load64(m + 32);  var m11 = load64(m + 40);
+    var m12 = load64(m + 48);  var m13 = load64(m + 56);
+    var m20 = load64(m + 64);  var m21 = load64(m + 72);
+    var m22 = load64(m + 80);  var m23 = load64(m + 88);
+    var m30 = load64(m + 96);  var m31 = load64(m + 104);
+    var m32 = load64(m + 112); var m33 = load64(m + 120);
 
-    var s0 = f64_sub(f64_mul(m00, m11), f64_mul(m10, m01));
-    var s1 = f64_sub(f64_mul(m00, m12), f64_mul(m10, m02));
-    var s2 = f64_sub(f64_mul(m00, m13), f64_mul(m10, m03));
-    var s3 = f64_sub(f64_mul(m01, m12), f64_mul(m11, m02));
-    var s4 = f64_sub(f64_mul(m01, m13), f64_mul(m11, m03));
-    var s5 = f64_sub(f64_mul(m02, m13), f64_mul(m12, m03));
-
-    var c5 = f64_sub(f64_mul(m22, m33), f64_mul(m32, m23));
-    var c4 = f64_sub(f64_mul(m21, m33), f64_mul(m31, m23));
-    var c3 = f64_sub(f64_mul(m21, m32), f64_mul(m31, m22));
-    var c2 = f64_sub(f64_mul(m20, m33), f64_mul(m30, m23));
-    var c1 = f64_sub(f64_mul(m20, m32), f64_mul(m30, m22));
-    var c0 = f64_sub(f64_mul(m20, m31), f64_mul(m30, m21));
+    var a0 = f64_mul(m00, m11); var b0 = f64_mul(m10, m01);
+    var a1 = f64_mul(m00, m12); var b1 = f64_mul(m10, m02);
+    var a2 = f64_mul(m00, m13); var b2 = f64_mul(m10, m03);
+    var a3 = f64_mul(m01, m12); var b3 = f64_mul(m11, m02);
+    var a4 = f64_mul(m01, m13); var b4 = f64_mul(m11, m03);
+    var a5 = f64_mul(m02, m13); var b5 = f64_mul(m12, m03);
+    var g5 = f64_mul(m22, m33); var h5 = f64_mul(m32, m23);
+    var g4 = f64_mul(m21, m33); var h4 = f64_mul(m31, m23);
+    var g3 = f64_mul(m21, m32); var h3 = f64_mul(m31, m22);
+    var g2 = f64_mul(m20, m33); var h2 = f64_mul(m30, m23);
+    var g1 = f64_mul(m20, m32); var h1 = f64_mul(m30, m22);
+    var g0 = f64_mul(m20, m31); var h0 = f64_mul(m30, m21);
+    var s0 = f64_sub(a0, b0); var s1 = f64_sub(a1, b1); var s2 = f64_sub(a2, b2);
+    var s3 = f64_sub(a3, b3); var s4 = f64_sub(a4, b4); var s5 = f64_sub(a5, b5);
+    var c5 = f64_sub(g5, h5); var c4 = f64_sub(g4, h4); var c3 = f64_sub(g3, h3);
+    var c2 = f64_sub(g2, h2); var c1 = f64_sub(g1, h1); var c0 = f64_sub(g0, h0);
 
     var det = f64_add(f64_sub(f64_add(f64_mul(s0, c5), f64_mul(s2, c3)), f64_mul(s1, c4)),
       f64_sub(f64_add(f64_mul(s5, c0), f64_mul(s3, c2)), f64_mul(s4, c1)));
-
-    # ⛔ Same class as m3_inverse, one degree worse: `det` is degree FOUR here, so
-    # det(k·M) = k⁴·det(M), and an absolute 1e-12 declared ordinary matrices
-    # singular and handed back `m4_identity()` — well-formed, unit-determinant,
-    # no error channel. Guard the reciprocal that actually follows.
-    var inv_det = f64_div(F64_ONE, det);
-    if (f64_lt(f64_abs(inv_det), F64_POS_INF) == 0) { return m4_identity(); }
-
-    var r = m4_new();
-    m4_set(r, 0, 0, f64_mul(inv_det, f64_add(f64_sub(f64_mul(m11, c5), f64_mul(m12, c4)), f64_mul(m13, c3))));
-    m4_set(r, 0, 1, f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m01, c5), f64_mul(m02, c4)), f64_mul(m03, c3)))));
-    m4_set(r, 0, 2, f64_mul(inv_det, f64_add(f64_sub(f64_mul(m31, s5), f64_mul(m32, s4)), f64_mul(m33, s3))));
-    m4_set(r, 0, 3, f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m21, s5), f64_mul(m22, s4)), f64_mul(m23, s3)))));
-
-    m4_set(r, 1, 0, f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m10, c5), f64_mul(m12, c2)), f64_mul(m13, c1)))));
-    m4_set(r, 1, 1, f64_mul(inv_det, f64_add(f64_sub(f64_mul(m00, c5), f64_mul(m02, c2)), f64_mul(m03, c1))));
-    m4_set(r, 1, 2, f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m30, s5), f64_mul(m32, s2)), f64_mul(m33, s1)))));
-    m4_set(r, 1, 3, f64_mul(inv_det, f64_add(f64_sub(f64_mul(m20, s5), f64_mul(m22, s2)), f64_mul(m23, s1))));
-
-    m4_set(r, 2, 0, f64_mul(inv_det, f64_add(f64_sub(f64_mul(m10, c4), f64_mul(m11, c2)), f64_mul(m13, c0))));
-    m4_set(r, 2, 1, f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m00, c4), f64_mul(m01, c2)), f64_mul(m03, c0)))));
-    m4_set(r, 2, 2, f64_mul(inv_det, f64_add(f64_sub(f64_mul(m30, s4), f64_mul(m31, s2)), f64_mul(m33, s0))));
-    m4_set(r, 2, 3, f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m20, s4), f64_mul(m21, s2)), f64_mul(m23, s0)))));
-
-    m4_set(r, 3, 0, f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m10, c3), f64_mul(m11, c1)), f64_mul(m12, c0)))));
-    m4_set(r, 3, 1, f64_mul(inv_det, f64_add(f64_sub(f64_mul(m00, c3), f64_mul(m01, c1)), f64_mul(m02, c0))));
-    m4_set(r, 3, 2, f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m30, s3), f64_mul(m31, s1)), f64_mul(m32, s0)))));
-    m4_set(r, 3, 3, f64_mul(inv_det, f64_add(f64_sub(f64_mul(m20, s3), f64_mul(m21, s1)), f64_mul(m22, s0))));
-    return r;
+    var pm = f64_add(f64_add(
+        f64_add(f64_mul(f64_add(f64_abs(a0), f64_abs(b0)), f64_add(f64_abs(g5), f64_abs(h5))),
+          f64_mul(f64_add(f64_abs(a1), f64_abs(b1)), f64_add(f64_abs(g4), f64_abs(h4)))),
+        f64_add(f64_mul(f64_add(f64_abs(a2), f64_abs(b2)), f64_add(f64_abs(g3), f64_abs(h3))),
+          f64_mul(f64_add(f64_abs(a3), f64_abs(b3)), f64_add(f64_abs(g2), f64_abs(h2))))),
+      f64_add(f64_mul(f64_add(f64_abs(a4), f64_abs(b4)), f64_add(f64_abs(g1), f64_abs(h1))),
+        f64_mul(f64_add(f64_abs(a5), f64_abs(b5)), f64_add(f64_abs(g0), f64_abs(h0)))));
+    # No product that reaches an entry flushes: every non-zero |entry| is at least 2^-340, since a
+    # product of three entries flushes only if one of them is smaller. On the bits, written out
+    # (16 nested tests cost 13 ns where a branch-free form cost 23).
+    # [measured: scratch scr.bcyr, this tree, 2026-10-31; cycc 6.7.9]
+    var small = 0;
+    var st = 0;
+    st = m00 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m01 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m02 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m03 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m10 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m11 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m12 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m13 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m20 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m21 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m22 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m23 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m30 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m31 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m32 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    st = m33 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M4_SMALL) { if (st != 0) { small = 1; } }
+    var certified = 0;
+    if (small == 0 && f64_ge(pm, _M4_PM_LO) == 1 && f64_le(pm, _M4_PM_HI) == 1) {
+        if (f64_le(pm, f64_mul(f64_abs(det), _M4_CERT)) == 1) {
+            certified = 1;
+        }
+        if (certified == 0 && f64_ge(pm, _M4_DD_LO) == 1) {
+            # Every entry split into halves of at most 26 significant bits (Dekker), x = xh + xl.
+            var t00 = f64_mul(m00, _M4_SPLIT); var h00 = f64_sub(t00, f64_sub(t00, m00)); var l00 = f64_sub(m00, h00);
+            var t01 = f64_mul(m01, _M4_SPLIT); var h01 = f64_sub(t01, f64_sub(t01, m01)); var l01 = f64_sub(m01, h01);
+            var t02 = f64_mul(m02, _M4_SPLIT); var h02 = f64_sub(t02, f64_sub(t02, m02)); var l02 = f64_sub(m02, h02);
+            var t03 = f64_mul(m03, _M4_SPLIT); var h03 = f64_sub(t03, f64_sub(t03, m03)); var l03 = f64_sub(m03, h03);
+            var t10 = f64_mul(m10, _M4_SPLIT); var h10 = f64_sub(t10, f64_sub(t10, m10)); var l10 = f64_sub(m10, h10);
+            var t11 = f64_mul(m11, _M4_SPLIT); var h11 = f64_sub(t11, f64_sub(t11, m11)); var l11 = f64_sub(m11, h11);
+            var t12 = f64_mul(m12, _M4_SPLIT); var h12 = f64_sub(t12, f64_sub(t12, m12)); var l12 = f64_sub(m12, h12);
+            var t13 = f64_mul(m13, _M4_SPLIT); var h13 = f64_sub(t13, f64_sub(t13, m13)); var l13 = f64_sub(m13, h13);
+            var t20 = f64_mul(m20, _M4_SPLIT); var h20 = f64_sub(t20, f64_sub(t20, m20)); var l20 = f64_sub(m20, h20);
+            var t21 = f64_mul(m21, _M4_SPLIT); var h21 = f64_sub(t21, f64_sub(t21, m21)); var l21 = f64_sub(m21, h21);
+            var t22 = f64_mul(m22, _M4_SPLIT); var h22 = f64_sub(t22, f64_sub(t22, m22)); var l22 = f64_sub(m22, h22);
+            var t23 = f64_mul(m23, _M4_SPLIT); var h23 = f64_sub(t23, f64_sub(t23, m23)); var l23 = f64_sub(m23, h23);
+            var t30 = f64_mul(m30, _M4_SPLIT); var h30 = f64_sub(t30, f64_sub(t30, m30)); var l30 = f64_sub(m30, h30);
+            var t31 = f64_mul(m31, _M4_SPLIT); var h31 = f64_sub(t31, f64_sub(t31, m31)); var l31 = f64_sub(m31, h31);
+            var t32 = f64_mul(m32, _M4_SPLIT); var h32 = f64_sub(t32, f64_sub(t32, m32)); var l32 = f64_sub(m32, h32);
+            var t33 = f64_mul(m33, _M4_SPLIT); var h33 = f64_sub(t33, f64_sub(t33, m33)); var l33 = f64_sub(m33, h33);
+            # The 24 products' rounding errors, exactly: x y = p + e.
+            var ea0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h11), a0), f64_mul(h00, l11)),
+                f64_mul(l00, h11)), f64_mul(l00, l11));
+            var eb0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h01), b0), f64_mul(h10, l01)),
+                f64_mul(l10, h01)), f64_mul(l10, l01));
+            var ea1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h12), a1), f64_mul(h00, l12)),
+                f64_mul(l00, h12)), f64_mul(l00, l12));
+            var eb1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h02), b1), f64_mul(h10, l02)),
+                f64_mul(l10, h02)), f64_mul(l10, l02));
+            var ea2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h13), a2), f64_mul(h00, l13)),
+                f64_mul(l00, h13)), f64_mul(l00, l13));
+            var eb2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h03), b2), f64_mul(h10, l03)),
+                f64_mul(l10, h03)), f64_mul(l10, l03));
+            var ea3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h01, h12), a3), f64_mul(h01, l12)),
+                f64_mul(l01, h12)), f64_mul(l01, l12));
+            var eb3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h11, h02), b3), f64_mul(h11, l02)),
+                f64_mul(l11, h02)), f64_mul(l11, l02));
+            var ea4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h01, h13), a4), f64_mul(h01, l13)),
+                f64_mul(l01, h13)), f64_mul(l01, l13));
+            var eb4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h11, h03), b4), f64_mul(h11, l03)),
+                f64_mul(l11, h03)), f64_mul(l11, l03));
+            var ea5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h02, h13), a5), f64_mul(h02, l13)),
+                f64_mul(l02, h13)), f64_mul(l02, l13));
+            var eb5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h12, h03), b5), f64_mul(h12, l03)),
+                f64_mul(l12, h03)), f64_mul(l12, l03));
+            var eg5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h22, h33), g5), f64_mul(h22, l33)),
+                f64_mul(l22, h33)), f64_mul(l22, l33));
+            var eh5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h32, h23), h5), f64_mul(h32, l23)),
+                f64_mul(l32, h23)), f64_mul(l32, l23));
+            var eg4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h21, h33), g4), f64_mul(h21, l33)),
+                f64_mul(l21, h33)), f64_mul(l21, l33));
+            var eh4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h31, h23), h4), f64_mul(h31, l23)),
+                f64_mul(l31, h23)), f64_mul(l31, l23));
+            var eg3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h21, h32), g3), f64_mul(h21, l32)),
+                f64_mul(l21, h32)), f64_mul(l21, l32));
+            var eh3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h31, h22), h3), f64_mul(h31, l22)),
+                f64_mul(l31, h22)), f64_mul(l31, l22));
+            var eg2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h33), g2), f64_mul(h20, l33)),
+                f64_mul(l20, h33)), f64_mul(l20, l33));
+            var eh2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h30, h23), h2), f64_mul(h30, l23)),
+                f64_mul(l30, h23)), f64_mul(l30, l23));
+            var eg1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h32), g1), f64_mul(h20, l32)),
+                f64_mul(l20, h32)), f64_mul(l20, l32));
+            var eh1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h30, h22), h1), f64_mul(h30, l22)),
+                f64_mul(l30, h22)), f64_mul(l30, l22));
+            var eg0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h31), g0), f64_mul(h20, l31)),
+                f64_mul(l20, h31)), f64_mul(l20, l31));
+            var eh0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h30, h21), h0), f64_mul(h30, l21)),
+                f64_mul(l30, h21)), f64_mul(l30, l21));
+            # Each 2x2 minor as hi + lo: hi the rounded difference, lo its TwoSum error plus the
+            # products' errors (rounded twice, within 3u^2 of the minor's permanent).
+            var zs0 = f64_sub(s0, a0);
+            var xs0 = f64_add(f64_sub(f64_sub(a0, f64_sub(s0, zs0)), f64_add(b0, zs0)), f64_sub(ea0, eb0));
+            var zs1 = f64_sub(s1, a1);
+            var xs1 = f64_add(f64_sub(f64_sub(a1, f64_sub(s1, zs1)), f64_add(b1, zs1)), f64_sub(ea1, eb1));
+            var zs2 = f64_sub(s2, a2);
+            var xs2 = f64_add(f64_sub(f64_sub(a2, f64_sub(s2, zs2)), f64_add(b2, zs2)), f64_sub(ea2, eb2));
+            var zs3 = f64_sub(s3, a3);
+            var xs3 = f64_add(f64_sub(f64_sub(a3, f64_sub(s3, zs3)), f64_add(b3, zs3)), f64_sub(ea3, eb3));
+            var zs4 = f64_sub(s4, a4);
+            var xs4 = f64_add(f64_sub(f64_sub(a4, f64_sub(s4, zs4)), f64_add(b4, zs4)), f64_sub(ea4, eb4));
+            var zs5 = f64_sub(s5, a5);
+            var xs5 = f64_add(f64_sub(f64_sub(a5, f64_sub(s5, zs5)), f64_add(b5, zs5)), f64_sub(ea5, eb5));
+            var zc0 = f64_sub(c0, g0);
+            var xc0 = f64_add(f64_sub(f64_sub(g0, f64_sub(c0, zc0)), f64_add(h0, zc0)), f64_sub(eg0, eh0));
+            var zc1 = f64_sub(c1, g1);
+            var xc1 = f64_add(f64_sub(f64_sub(g1, f64_sub(c1, zc1)), f64_add(h1, zc1)), f64_sub(eg1, eh1));
+            var zc2 = f64_sub(c2, g2);
+            var xc2 = f64_add(f64_sub(f64_sub(g2, f64_sub(c2, zc2)), f64_add(h2, zc2)), f64_sub(eg2, eh2));
+            var zc3 = f64_sub(c3, g3);
+            var xc3 = f64_add(f64_sub(f64_sub(g3, f64_sub(c3, zc3)), f64_add(h3, zc3)), f64_sub(eg3, eh3));
+            var zc4 = f64_sub(c4, g4);
+            var xc4 = f64_add(f64_sub(f64_sub(g4, f64_sub(c4, zc4)), f64_add(h4, zc4)), f64_sub(eg4, eh4));
+            var zc5 = f64_sub(c5, g5);
+            var xc5 = f64_add(f64_sub(f64_sub(g5, f64_sub(c5, zc5)), f64_add(h5, zc5)), f64_sub(eg5, eh5));
+            # The six products s c of the expansion, each as q + r: q rounded, r its exact error plus the
+            # cross terms s.lo c + s c.lo.
+            var vs0 = f64_mul(s0, _M4_SPLIT); var ys0 = f64_sub(vs0, f64_sub(vs0, s0)); var ws0 = f64_sub(s0, ys0);
+            var vs1 = f64_mul(s1, _M4_SPLIT); var ys1 = f64_sub(vs1, f64_sub(vs1, s1)); var ws1 = f64_sub(s1, ys1);
+            var vs2 = f64_mul(s2, _M4_SPLIT); var ys2 = f64_sub(vs2, f64_sub(vs2, s2)); var ws2 = f64_sub(s2, ys2);
+            var vs3 = f64_mul(s3, _M4_SPLIT); var ys3 = f64_sub(vs3, f64_sub(vs3, s3)); var ws3 = f64_sub(s3, ys3);
+            var vs4 = f64_mul(s4, _M4_SPLIT); var ys4 = f64_sub(vs4, f64_sub(vs4, s4)); var ws4 = f64_sub(s4, ys4);
+            var vs5 = f64_mul(s5, _M4_SPLIT); var ys5 = f64_sub(vs5, f64_sub(vs5, s5)); var ws5 = f64_sub(s5, ys5);
+            var vc0 = f64_mul(c0, _M4_SPLIT); var yc0 = f64_sub(vc0, f64_sub(vc0, c0)); var wc0 = f64_sub(c0, yc0);
+            var vc1 = f64_mul(c1, _M4_SPLIT); var yc1 = f64_sub(vc1, f64_sub(vc1, c1)); var wc1 = f64_sub(c1, yc1);
+            var vc2 = f64_mul(c2, _M4_SPLIT); var yc2 = f64_sub(vc2, f64_sub(vc2, c2)); var wc2 = f64_sub(c2, yc2);
+            var vc3 = f64_mul(c3, _M4_SPLIT); var yc3 = f64_sub(vc3, f64_sub(vc3, c3)); var wc3 = f64_sub(c3, yc3);
+            var vc4 = f64_mul(c4, _M4_SPLIT); var yc4 = f64_sub(vc4, f64_sub(vc4, c4)); var wc4 = f64_sub(c4, yc4);
+            var vc5 = f64_mul(c5, _M4_SPLIT); var yc5 = f64_sub(vc5, f64_sub(vc5, c5)); var wc5 = f64_sub(c5, yc5);
+            var qs0c5 = f64_mul(s0, c5);
+            var rs0c5 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(ys0, yc5), qs0c5), f64_mul(ys0, wc5)),
+                  f64_mul(ws0, yc5)), f64_mul(ws0, wc5)), f64_add(f64_mul(s0, xc5), f64_mul(xs0, c5)));
+            var qs2c3 = f64_mul(s2, c3);
+            var rs2c3 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(ys2, yc3), qs2c3), f64_mul(ys2, wc3)),
+                  f64_mul(ws2, yc3)), f64_mul(ws2, wc3)), f64_add(f64_mul(s2, xc3), f64_mul(xs2, c3)));
+            var qs1c4 = f64_mul(s1, c4);
+            var rs1c4 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(ys1, yc4), qs1c4), f64_mul(ys1, wc4)),
+                  f64_mul(ws1, yc4)), f64_mul(ws1, wc4)), f64_add(f64_mul(s1, xc4), f64_mul(xs1, c4)));
+            var qs5c0 = f64_mul(s5, c0);
+            var rs5c0 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(ys5, yc0), qs5c0), f64_mul(ys5, wc0)),
+                  f64_mul(ws5, yc0)), f64_mul(ws5, wc0)), f64_add(f64_mul(s5, xc0), f64_mul(xs5, c0)));
+            var qs3c2 = f64_mul(s3, c2);
+            var rs3c2 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(ys3, yc2), qs3c2), f64_mul(ys3, wc2)),
+                  f64_mul(ws3, yc2)), f64_mul(ws3, wc2)), f64_add(f64_mul(s3, xc2), f64_mul(xs3, c2)));
+            var qs4c1 = f64_mul(s4, c1);
+            var rs4c1 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(ys4, yc1), qs4c1), f64_mul(ys4, wc1)),
+                  f64_mul(ws4, yc1)), f64_mul(ws4, wc1)), f64_add(f64_mul(s4, xc1), f64_mul(xs4, c1)));
+            # det = q0 + q1 - q2 + q3 + q4 - q5 (as det~ orders them): the q summed by TwoSum, their
+            # errors and the r in plain arithmetic, then the two rounded together.
+            var dh = qs0c5;
+            var dl = rs0c5;
+            var ns2c3 = f64_add(dh, qs2c3);
+            var os2c3 = f64_sub(ns2c3, dh);
+            dl = f64_add(f64_add(dl, f64_add(f64_sub(dh, f64_sub(ns2c3, os2c3)), f64_sub(qs2c3, os2c3))), rs2c3);
+            dh = ns2c3;
+            var ns1c4 = f64_sub(dh, qs1c4);
+            var os1c4 = f64_sub(ns1c4, dh);
+            dl = f64_sub(f64_add(dl, f64_sub(f64_sub(dh, f64_sub(ns1c4, os1c4)), f64_add(qs1c4, os1c4))), rs1c4);
+            dh = ns1c4;
+            var ns5c0 = f64_add(dh, qs5c0);
+            var os5c0 = f64_sub(ns5c0, dh);
+            dl = f64_add(f64_add(dl, f64_add(f64_sub(dh, f64_sub(ns5c0, os5c0)), f64_sub(qs5c0, os5c0))), rs5c0);
+            dh = ns5c0;
+            var ns3c2 = f64_add(dh, qs3c2);
+            var os3c2 = f64_sub(ns3c2, dh);
+            dl = f64_add(f64_add(dl, f64_add(f64_sub(dh, f64_sub(ns3c2, os3c2)), f64_sub(qs3c2, os3c2))), rs3c2);
+            dh = ns3c2;
+            var ns4c1 = f64_sub(dh, qs4c1);
+            var os4c1 = f64_sub(ns4c1, dh);
+            dl = f64_sub(f64_add(dl, f64_sub(f64_sub(dh, f64_sub(ns4c1, os4c1)), f64_add(qs4c1, os4c1))), rs4c1);
+            dh = ns4c1;
+            var dd = f64_add(dh, dl);
+            # |dd - det| <= 70 u^2 P (the derivation is in the comment above), so P <= 2^43 |dd| puts
+            # dd within 2^-56.9 of det, relative, before its own rounding.
+            if (f64_le(pm, f64_mul(f64_abs(dd), _M4_CERT2)) == 1) {
+                det = dd;
+                certified = 1;
+            }
+        }
+    }
+    if (certified == 1) {
+        var inv_det = f64_div(F64_ONE, det);
+        var r = alloc(MAT4_BYTES);
+        if (r == 0) { return Err(HSB_ERR_ALLOC); }
+        var e0 = f64_mul(inv_det, f64_add(f64_sub(f64_mul(m11, c5), f64_mul(m12, c4)), f64_mul(m13, c3)));
+        var e1 = f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m01, c5), f64_mul(m02, c4)), f64_mul(m03, c3))));
+        var e2 = f64_mul(inv_det, f64_add(f64_sub(f64_mul(m31, s5), f64_mul(m32, s4)), f64_mul(m33, s3)));
+        var e3 = f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m21, s5), f64_mul(m22, s4)), f64_mul(m23, s3))));
+        var e4 = f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m10, c5), f64_mul(m12, c2)), f64_mul(m13, c1))));
+        var e5 = f64_mul(inv_det, f64_add(f64_sub(f64_mul(m00, c5), f64_mul(m02, c2)), f64_mul(m03, c1)));
+        var e6 = f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m30, s5), f64_mul(m32, s2)), f64_mul(m33, s1))));
+        var e7 = f64_mul(inv_det, f64_add(f64_sub(f64_mul(m20, s5), f64_mul(m22, s2)), f64_mul(m23, s1)));
+        var e8 = f64_mul(inv_det, f64_add(f64_sub(f64_mul(m10, c4), f64_mul(m11, c2)), f64_mul(m13, c0)));
+        var e9 = f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m00, c4), f64_mul(m01, c2)), f64_mul(m03, c0))));
+        var e10 = f64_mul(inv_det, f64_add(f64_sub(f64_mul(m30, s4), f64_mul(m31, s2)), f64_mul(m33, s0)));
+        var e11 = f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m20, s4), f64_mul(m21, s2)), f64_mul(m23, s0))));
+        var e12 = f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m10, c3), f64_mul(m11, c1)), f64_mul(m12, c0))));
+        var e13 = f64_mul(inv_det, f64_add(f64_sub(f64_mul(m00, c3), f64_mul(m01, c1)), f64_mul(m02, c0)));
+        var e14 = f64_mul(inv_det, f64_neg(f64_add(f64_sub(f64_mul(m30, s3), f64_mul(m31, s1)), f64_mul(m32, s0))));
+        var e15 = f64_mul(inv_det, f64_add(f64_sub(f64_mul(m20, s3), f64_mul(m21, s1)), f64_mul(m22, s0)));
+        store64(r, e0);        store64(r + 8, e1);    store64(r + 16, e2);   store64(r + 24, e3);
+        store64(r + 32, e4);   store64(r + 40, e5);   store64(r + 48, e6);   store64(r + 56, e7);
+        store64(r + 64, e8);   store64(r + 72, e9);   store64(r + 80, e10);  store64(r + 88, e11);
+        store64(r + 96, e12);  store64(r + 104, e13); store64(r + 112, e14); store64(r + 120, e15);
+        # One test on the sum, non-finite whenever an entry is (mat3.cyr).
+        var sm = f64_add(f64_add(f64_add(f64_add(e0, e1), f64_add(e2, e3)),
+            f64_add(f64_add(e4, e5), f64_add(e6, e7))),
+          f64_add(f64_add(f64_add(e8, e9), f64_add(e10, e11)),
+            f64_add(f64_add(e12, e13), f64_add(e14, e15))));
+        if ((sm & 0x7FFF_FFFF_FFFF_FFFF) < 0x7FF0_0000_0000_0000) { return Ok(r); }
+    }
+    return _m4_inverse_exact(m);
 }
 
 # ================================================================
 # Construction helpers
 # ================================================================
 
-# From scale (Vec3), rotation (Quat), translation (Vec3)
+# From scale (Vec3), rotation (Quat), translation (Vec3): T R S with R the rotation q
+# represents, R(q / |q|) for every finite non-zero q, as `m3_from_quat` (mat3.cyr says why) and
+# `hquat_rotate_vec3` give it. Where |q|^2 = 1.0 exactly the arithmetic is 3.3.7's, bit for
+# bit. A zero or non-finite q has no rotation: its 3x3 block is NaN (2 / 0 = Inf times 0).
 #must_use
 public fn m4_from_srt(scale, rotation, translation) {
     var qx = HQuat_x(rotation); var qy = HQuat_y(rotation);
     var qz = HQuat_z(rotation); var qw = HQuat_w(rotation);
+    var n = f64_add(f64_add(f64_mul(qx, qx), f64_mul(qy, qy)), f64_add(f64_mul(qz, qz), f64_mul(qw, qw)));
+    # n is +0, positive or NaN, so its bits order as it does (quat.cyr's range test)
+    if (n < _M4_QN_LO || n > _M4_QN_HI) {
+        var mq = qx & 0x7FFF_FFFF_FFFF_FFFF;
+        if ((qy & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qy & 0x7FFF_FFFF_FFFF_FFFF; }
+        if ((qz & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qz & 0x7FFF_FFFF_FFFF_FFFF; }
+        if ((qw & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qw & 0x7FFF_FFFF_FFFF_FFFF; }
+        # A non-finite component: no rotation, so every entry is NaN. Without this an infinite
+        # q gave n = +Inf, 2 / n = 0, and the diagonal entry whose products held no infinity
+        # came back 1.0 (q = (Inf, 0, 0, 1): entry (0, 0)).
+        if (mq >= 0x7FF0_0000_0000_0000) { n = 0x7FF8_0000_0000_0000; }
+        if (mq != 0 && mq < 0x7FF0_0000_0000_0000) {
+            # q 2^-e, its largest component in [1, 2): the same rotation, n in [1, 16)
+            var e = (mq >> 52) - 1023;
+            if ((mq >> 52) == 0) { e = ((f64_mul(mq, _M4_TWO64) >> 52) - 1023) - 64; }
+            qx = _m4_ldexp(qx, 0 - e); qy = _m4_ldexp(qy, 0 - e);
+            qz = _m4_ldexp(qz, 0 - e); qw = _m4_ldexp(qw, 0 - e);
+            n = f64_add(f64_add(f64_mul(qx, qx), f64_mul(qy, qy)), f64_add(f64_mul(qz, qz), f64_mul(qw, qw)));
+        }
+    }
+    # 2 / n in place of the unit formula's 2; skipped at n = 1.0, where it is 2 exactly
+    var tw = F64_TWO;
+    if (n != 0x3FF0_0000_0000_0000) { tw = f64_div(F64_TWO, n); }
     var xx = f64_mul(qx, qx); var yy = f64_mul(qy, qy); var zz = f64_mul(qz, qz);
     var xy = f64_mul(qx, qy); var xz = f64_mul(qx, qz); var yz = f64_mul(qy, qz);
     var wx = f64_mul(qw, qx); var wy = f64_mul(qw, qy); var wz = f64_mul(qw, qz);
     var sx = HVec3_x(scale); var sy = HVec3_y(scale); var sz = HVec3_z(scale);
 
     var m = m4_new();
-    m4_set(m, 0, 0, f64_mul(f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(yy, zz))), sx));
-    m4_set(m, 0, 1, f64_mul(f64_mul(F64_TWO, f64_add(xy, wz)), sx));
-    m4_set(m, 0, 2, f64_mul(f64_mul(F64_TWO, f64_sub(xz, wy)), sx));
-    m4_set(m, 1, 0, f64_mul(f64_mul(F64_TWO, f64_sub(xy, wz)), sy));
-    m4_set(m, 1, 1, f64_mul(f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(xx, zz))), sy));
-    m4_set(m, 1, 2, f64_mul(f64_mul(F64_TWO, f64_add(yz, wx)), sy));
-    m4_set(m, 2, 0, f64_mul(f64_mul(F64_TWO, f64_add(xz, wy)), sz));
-    m4_set(m, 2, 1, f64_mul(f64_mul(F64_TWO, f64_sub(yz, wx)), sz));
-    m4_set(m, 2, 2, f64_mul(f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(xx, yy))), sz));
+    if (m == 0) { return 0; }
+    m4_set(m, 0, 0, f64_mul(f64_sub(F64_ONE, f64_mul(tw, f64_add(yy, zz))), sx));
+    m4_set(m, 0, 1, f64_mul(f64_mul(tw, f64_add(xy, wz)), sx));
+    m4_set(m, 0, 2, f64_mul(f64_mul(tw, f64_sub(xz, wy)), sx));
+    m4_set(m, 1, 0, f64_mul(f64_mul(tw, f64_sub(xy, wz)), sy));
+    m4_set(m, 1, 1, f64_mul(f64_sub(F64_ONE, f64_mul(tw, f64_add(xx, zz))), sy));
+    m4_set(m, 1, 2, f64_mul(f64_mul(tw, f64_add(yz, wx)), sy));
+    m4_set(m, 2, 0, f64_mul(f64_mul(tw, f64_add(xz, wy)), sz));
+    m4_set(m, 2, 1, f64_mul(f64_mul(tw, f64_sub(yz, wx)), sz));
+    m4_set(m, 2, 2, f64_mul(f64_sub(F64_ONE, f64_mul(tw, f64_add(xx, yy))), sz));
     m4_set(m, 3, 0, HVec3_x(translation));
     m4_set(m, 3, 1, HVec3_y(translation));
     m4_set(m, 3, 2, HVec3_z(translation));
@@ -375,6 +1102,7 @@ public fn m4_from_srt(scale, rotation, translation) {
 #must_use
 public fn m4_ortho_rh(left, right, bottom, top, near, far) {
     var m = m4_new();
+    if (m == 0) { return 0; }
     var rl = f64_sub(right, left);
     var tb = f64_sub(top, bottom);
     var fn_ = f64_sub(far, near);
@@ -397,6 +1125,7 @@ public fn m4_perspective_rh(fov_y, aspect, near, far) {
     var f = f64_div(F64_ONE, f64_div(f64_sin(half_fov), f64_cos(half_fov)));
     var nf = f64_sub(near, far);
     var m = m4_new();
+    if (m == 0) { return 0; }
     m4_set(m, 0, 0, f64_div(f, aspect));
     m4_set(m, 1, 1, f);
     m4_set(m, 2, 2, f64_div(f64_add(far, near), nf));
@@ -410,21 +1139,30 @@ public fn m4_perspective_rh(fov_y, aspect, near, far) {
 public fn m4_perspective_reverse_z(fov_y, aspect, near) {
     var half_fov = f64_mul(fov_y, F64_HALF);
     var f = f64_div(F64_ONE, f64_div(f64_sin(half_fov), f64_cos(half_fov)));
-    return m4_from_cols(
-      hvec4_new(f64_div(f, aspect), 0, 0, 0),
-      hvec4_new(0, f, 0, 0),
-      hvec4_new(0, 0, 0, f64_neg(F64_ONE)),
-      hvec4_new(0, 0, near, 0)
-      );
+    var m = m4_new();
+    if (m == 0) { return 0; }
+    m4_set(m, 0, 0, f64_div(f, aspect));
+    m4_set(m, 1, 1, f);
+    m4_set(m, 2, 3, f64_neg(F64_ONE));
+    m4_set(m, 3, 2, near);
+    return m;
 }
 
 # Look-at (right-handed)
 #must_use
 public fn m4_look_at_rh(eye, target, up) {
-    var f = hvec3_normalize(hvec3_sub(target, eye));
-    var s = hvec3_normalize(hvec3_cross(f, up));
+    var d = hvec3_sub(target, eye);
+    if (d == 0) { return 0; }
+    var f = hvec3_normalize(d);
+    if (f == 0) { return 0; }
+    var sc = hvec3_cross(f, up);
+    if (sc == 0) { return 0; }
+    var s = hvec3_normalize(sc);
+    if (s == 0) { return 0; }
     var u = hvec3_cross(s, f);
+    if (u == 0) { return 0; }
     var m = m4_new();
+    if (m == 0) { return 0; }
     m4_set(m, 0, 0, HVec3_x(s)); m4_set(m, 1, 0, HVec3_y(s)); m4_set(m, 2, 0, HVec3_z(s));
     m4_set(m, 0, 1, HVec3_x(u)); m4_set(m, 1, 1, HVec3_y(u)); m4_set(m, 2, 1, HVec3_z(u));
     m4_set(m, 0, 2, f64_neg(HVec3_x(f))); m4_set(m, 1, 2, f64_neg(HVec3_y(f))); m4_set(m, 2, 2, f64_neg(HVec3_z(f)));

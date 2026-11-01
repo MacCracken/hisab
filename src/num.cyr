@@ -64,21 +64,85 @@ public fn num_newton(f, df, x0, tol, max_iter, out) {
     return Err(HSB_ERR_NO_CONVERGENCE);
 }
 
+# Internal: the bisection midpoint of a bracket whose width hi - lo is not finite --
+# its ends more than DBL_MAX apart, or one of them infinite. Neither end is NaN here:
+# num_bisection refuses a NaN a or b before it evaluates anything. Each infinite end is read as
+# ±DBL_MAX, the double next to it, and the halves are added: two finite ends that far apart
+# have opposite signs and magnitudes of at least 2^970, so both halvings are exact and the
+# sum rounds once, strictly between them. An infinite end gives a finite point strictly
+# inside the bracket, with one more step: on [-Inf, x], x the double next to -DBL_MAX, the
+# halves of -DBL_MAX and x tie and round onto x (DBL_MAX's mantissa is odd), and the one
+# double strictly between the ends is -DBL_MAX itself, which is returned. Only when the
+# finite end IS ±DBL_MAX ([-Inf, -DBL_MAX]) does the midpoint land on an end, which is
+# what adjacency means there. Called only off the finite-width path, so no bracket
+# narrower than DBL_MAX moves.
+fn _num_bisect_mid_wide(lo, hi) {
+    var l = lo;
+    var h = hi;
+    if (l == 0x7FF0_0000_0000_0000) { l = 0x7FEF_FFFF_FFFF_FFFF; }
+    if (l == 0xFFF0_0000_0000_0000) { l = 0xFFEF_FFFF_FFFF_FFFF; }
+    if (h == 0x7FF0_0000_0000_0000) { h = 0x7FEF_FFFF_FFFF_FFFF; }
+    if (h == 0xFFF0_0000_0000_0000) { h = 0xFFEF_FFFF_FFFF_FFFF; }
+    var m = f64_add(f64_mul(l, _NUM_F64_HALF), f64_mul(h, _NUM_F64_HALF));
+    if (l != lo) {
+        if (f64_eq(m, hi) == 1) { return l; }
+    }
+    if (h != hi) {
+        if (f64_eq(m, lo) == 1) { return h; }
+    }
+    return m;
+}
+
 # Bisection root finding.
 # f: function pointer (f64) -> f64
 # a, b, tol: f64 bit patterns
-# max_iter: integer
+# max_iter: integer, the most bisection points f is evaluated at
 # out: pointer, result f64 written here on success
-# Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT if same sign, if f(a) or f(b) is
-# NaN, or if f is NaN at a bisection point the bracket still needs (`out` untouched on
-# all three). An endpoint where f is exactly zero (either sign) is returned as the root.
+# Returns: Ok(0) with x in `out` when one of these holds:
+#   - f(a) or f(b) is exactly zero (either sign): x is that endpoint, a before b;
+#   - f(x) is exactly zero (either sign), or |f(x)| < tol, at a bisection point x -- an
+#     exact zero at every tol, tol <= 0 and NaN included;
+#   - the bracket [lo, hi], which holds a sign change of f, is narrower than tol: x is
+#     its midpoint, within tol / 2 of the sign change;
+#   - no double lies strictly between lo and hi: x is the midpoint as the format rounds
+#     it (lo or hi), within one ulp of the sign change -- the best any tol can ask for, so
+#     a tol below the spacing of the doubles at the root still converges.
+# Err(HSB_ERR_NO_CONVERGENCE) when max_iter bisections leave a bracket at least tol wide
+# whose ends are not adjacent doubles; HSB_ERR_INVALID_INPUT if a or b is NaN, if same sign,
+# if f(a) or f(b) is NaN, or if f is NaN at a bisection point the bracket still needs. `out`
+# is untouched on every Err.
+#
+# ⛔ 3.4.0 — max_iter EXHAUSTED RETURNED Ok WITH THE MIDPOINT, MET OR NOT (roadmap [3.4.0]
+# D070). x^2 - 2 on [0, 2] at tol 1e-12 and max_iter 5 returned Ok(0x3FF6800000000000) =
+# 1.40625, a bracket 2^-4 wide, 6.25e10 times the tolerance asked for; max_iter 0 returned
+# Ok(1.0), the midpoint of [0, 2], with no test at all. That was an answer that had not been
+# found, reported as one. The loop exit now applies the loop's own width test to the final
+# bracket (the last bisection halves it after the test), and accepts a bracket whose ends
+# are adjacent doubles, which no tol can narrow: x^2 - 2 at tol 2^-1074 keeps its
+# 0x3FF6A09E667F3BCC (the root sqrt(2) lies between it and ...BCD, one ulp up). Both are
+# read at the exit only.
+# ⛔ 3.4.0 — AND THE MIDPOINT OVERFLOWED PAST DBL_MAX. lo + (hi - lo) / 2 is +-Inf once
+# hi - lo is: x - c on [-DBL_MAX, DBL_MAX] walked hi to +Inf and returned Ok(+Inf), a point
+# outside [a, b], and an infinite end made the midpoint NaN, refused as a NaN f(mid). Where
+# hi - lo is not finite the midpoint is now the sum of the halves, an infinite end read as
+# the double next to it (_num_bisect_mid_wide): x - c on [-DBL_MAX, DBL_MAX] returns c
+# exactly after 1075 bisections, a subnormal root after 2099, and [-Inf, 4] and
+# [-Inf, +Inf] find their roots. Every bracket narrower than DBL_MAX keeps the 3.3.7
+# formula and its bits: 19,999 random narrow brackets, bit-identical before and after. On
+# 4,000 wide brackets every answer is a sign change of the evaluated f (x - c: exactly c),
+# and on 544 brackets with an infinite end and a step at the top of the range every answer
+# is one of the two doubles beside the step.
+# [measured: scratch bisection differential and oracle, python3, 2026-10-31]
+# [measured: tests/hisab.tcyr, group "3.4.0: num_bisection reports max_iter exhaustion"]
 #
 # ⛔ 3.3.5 — A NaN ENDPOINT VALUE PASSED THE SIGN TEST. The test below is
 # `f(a) * f(b) > 0`, and every comparison with NaN is false, so f = NaN everywhere on
 # [1, 2] bisected toward 1 and returned Ok(0x3FF0000000000800) at tol 1e-12, a root
 # fabricated from nothing; num_bisection(f, NaN, 2, ...) returned Ok(NaN). A NaN has no
 # sign, so the bracket cannot be checked, and either endpoint value being NaN is now
-# refused. That also refuses a bracket the loop happened to solve: sqrt(x) - 1 on
+# refused. (That reads f(a) and f(b), so it caught a NaN a or b only where f maps NaN to
+# NaN; since 3.4.0 a NaN a or b is refused before f is called, above.) That also refuses
+# a bracket the loop happened to solve: sqrt(x) - 1 on
 # [-1, 4], NaN at -1, returned 0x3FEFFFFFFFFFC000 near the root 1 on 3.3.4 and is
 # Err now. ±Inf is a sign and is kept: ln on [0, 2] still returns exactly 1, and a
 # step from -Inf to +Inf at 1 on [0, 4] 0x3FF0000000000800, as on 3.3.4.
@@ -96,6 +160,14 @@ public fn num_newton(f, df, x0, tol, max_iter, out) {
 # [measured: tests/edge_cases.tcyr, group "3.3.6 num_bisection: exact endpoint roots, a NaN f(mid)"]
 #must_use
 public fn num_bisection(f, a, b, tol, max_iter, out) {
+    # ⛔ 3.4.0 — A NaN ENDPOINT IS NOT A BRACKET, WHATEVER f RETURNS THERE. The 3.3.5 refusal
+    # below reads f(a) and f(b), so it caught only an f that maps NaN to NaN; a step f answers
+    # a comparison against NaN with one of its branches, and the NaN end then bisected:
+    # f = -1 below 1.2349... and +1 above, on [NaN, 0], returned Ok(NaN) at tol 2 (3.3.7 and
+    # the first 3.4.0 draft alike) and, in that draft, Err(NO_CONVERGENCE) at tol 1e-12 (3.3.7:
+    # Ok(NaN)). Refused here, before f is called.
+    # [measured: tests/hisab.tcyr, group "3.4.0: num_bisection reports max_iter exhaustion"]
+    if (f64_eq(a, a) == 0 || f64_eq(b, b) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var lo = a;
     var hi = b;
     var f_lo = fncall1(f, lo);
@@ -134,17 +206,41 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
         hi = tmp;
     }
 
+    # The |f(mid)| test's bound: tol itself when tol > 0, else 2^-1074, the bound below
+    # which only a zero is (see the 3.4.0 note in the loop). Set once, so the loop's test
+    # is the one compare it always was.
+    var ftol = tol;
+    if (f64_gt(tol, _NUM_F64_ZERO) == 0) { ftol = 1; }
+
     var i = 0;
     while (i < max_iter) {
-        var mid = f64_add(lo, f64_mul(f64_sub(hi, lo), _NUM_F64_HALF));
+        # lo + (hi - lo) / 2 wherever hi - lo is finite (every bracket narrower than DBL_MAX,
+        # whose bits this keeps); past that, the halves (see _num_bisect_mid_wide).
+        var w = f64_sub(hi, lo);
+        var mid = 0;
+        if ((w & 0x7FFF_FFFF_FFFF_FFFF) < 0x7FF0_0000_0000_0000) {
+            mid = f64_add(lo, f64_mul(w, _NUM_F64_HALF));
+        } else {
+            mid = _num_bisect_mid_wide(lo, hi);
+        }
         var f_mid = fncall1(f, mid);
 
-        # Converged if |f(mid)| < tol or |hi - lo| < tol
-        if (f64_lt(f64_abs(f_mid), tol) == 1) {
+        # Converged if f(mid) is exactly zero, |f(mid)| < tol, or |hi - lo| < tol.
+        # ⛔ 3.4.0 — AN EXACT ZERO WAS AN ANSWER ONLY WHEN tol > 0: `|f| < tol` is false for
+        # f = 0 at tol 0 (or a negative or NaN tol), and the zero was filed as hi. x - c on
+        # [-Inf, +Inf] at tol 0 evaluated f(c) = 0 and went on to return Ok(c - 1 ulp) after
+        # 3002 calls; x - 1 on [0, 2] at tol 0, max_iter 1 met f(1) = 0 and returned Err. A
+        # zero is the root, as it already is at an endpoint (R2A note 6). With tol > 0 the
+        # bound is tol, which a zero always meets; otherwise it is 2^-1074 (ftol, above),
+        # which only ±0 meets. Testing f(mid) == 0 beside |f(mid)| < tol in the loop instead
+        # cost 17% to 19% on the num_bisection rows.
+        # [measured: tests/hisab.tcyr, group "3.4.0: num_bisection reports max_iter exhaustion"]
+        # [measured: tests/hisab.bcyr num_bisection rows, both forms vs integ-snap9, 3 interleaved runs, 2026-10-31]
+        if (f64_lt(f64_abs(f_mid), ftol) == 1) {
             store64(out, mid);
             return Ok(0);
         }
-        if (f64_lt(f64_abs(f64_sub(hi, lo)), tol) == 1) {
+        if (f64_lt(f64_abs(w), tol) == 1) {
             store64(out, mid);
             return Ok(0);
         }
@@ -162,9 +258,30 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
         i = i + 1;
     }
 
-    # Return best estimate
-    store64(out, f64_add(lo, f64_mul(f64_sub(hi, lo), _NUM_F64_HALF)));
-    return Ok(0);
+    # max_iter is spent. The midpoint is an answer only if the final bracket meets the
+    # loop's width test, or cannot be split: the midpoint, formed as in the loop, lands on
+    # an end exactly when no double lies strictly between lo and hi (one that did would be
+    # nearer the true midpoint than either end). Checked on 800,000 bracket ends 1 to 6 ulps
+    # apart, both orders, across binade edges, subnormals and zero (0 mismatches); a wide or
+    # infinite bracket's midpoint is strictly inside it unless its ends are adjacent. No end
+    # is NaN (refused on entry), so no midpoint is.
+    # [measured: scratch adjacency check, python3 IEEE doubles, 800,000 pairs, 0 mismatches, 2026-10-31]
+    var lw = f64_sub(hi, lo);
+    var last = 0;
+    if ((lw & 0x7FFF_FFFF_FFFF_FFFF) < 0x7FF0_0000_0000_0000) {
+        last = f64_add(lo, f64_mul(lw, _NUM_F64_HALF));
+    } else {
+        last = _num_bisect_mid_wide(lo, hi);
+    }
+    if (f64_lt(f64_abs(lw), tol) == 1) {
+        store64(out, last);
+        return Ok(0);
+    }
+    if (f64_eq(last, lo) == 1 || f64_eq(last, hi) == 1) {
+        store64(out, last);
+        return Ok(0);
+    }
+    return Err(HSB_ERR_NO_CONVERGENCE);
 }
 
 # ================================================================
@@ -398,9 +515,11 @@ var _PCG32_MULT = 6364136223846793005;
 
 # Create a new PCG32 RNG with given seed.
 # Uses stream=1 (inc = (1 << 1) | 1 = 3).
-# Returns: pointer to PCG32 state (16 bytes)
+# Returns: pointer to PCG32 state (16 bytes), or 0 when it cannot be allocated (3.4.0;
+# the stores went through the null before).
 public fn pcg32_new(seed) {
     var rng = alloc(16);
+    if (rng == 0) { return 0; }
     # state = 0, inc = 3
     store64(rng, 0);
     store64(rng + 8, 3);
@@ -703,15 +822,18 @@ public fn num_is_prime(n) {
 }
 
 # Sieve of Eratosthenes: returns a vec of all primes up to and including limit.
-# Returns: vec (dynamic array) of prime integers
+# Returns: vec (dynamic array) of prime integers, or 0 when the vec or the limit + 1 byte
+# sieve cannot be allocated (3.4.0; both were stored through unchecked before).
 public fn num_sieve(limit) {
     var primes = vec_new();
+    if (primes == 0) { return 0; }
     if (limit < 2) { return primes; }
     if (limit > 10000000) { return primes; }  # Cap at 10M entries to prevent memory exhaustion
 
     # Allocate boolean sieve: 1 byte per number
     var sieve_size = limit + 1;
     var sieve = alloc(sieve_size);
+    if (sieve == 0) { return 0; }
 
     # Initialize: 0 = not prime, 1 = prime candidate
     # Set all to 1 first

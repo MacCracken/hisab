@@ -81,20 +81,26 @@ public fn calc_integral_trapez(f, a, b, steps, out) {
         return Ok(0);
     }
     var h = f64_div(f64_sub(b, a), f64_from(steps));
-    var fa = fncall1(f, a);
-    var fb = fncall1(f, b);
     # The grid a + i h is laid in the frame _calc_frame picks: p = 0 is the plain
     # arithmetic, bit for bit; otherwise origin and step are those of a * 2^p and
     # b * 2^p, each node is mapped back by 2^-p, and so is the result (_calc_mul_scaled).
     # (3.3.7: _calc_frame is asked only where it can answer other than 0; see calc_integral_gauss5.)
-    var p = 0;
+    # ⭐ 3.4.0 — A FRAME OTHER THAN 0 TAKES ITS OWN COPY OF THE LOOP (_calc_trapez_framed), so
+    # the plain loop is 3.3.5's again: no per-node frame test and no origin local. 3.3.7's
+    # single loop cost x^2 on [0, 1] with 16 steps 159 ns against 3.3.5's 147 (medians of 9,
+    # interleaved); this one 151 (146 to 155), and sin on [0, pi] with 100 steps 4.574 us
+    # against 3.3.5's 4.576 and 3.3.7's 4.709.
+    # [measured: scratch bench (NU1-work/bq.bcyr), 3.3.5 tag, base and this tree, cycc 6.7.9, 2026-10-31]
     var eh = (h >> 52) & 0x7FF;
-    if (eh == 0 || eh == 0x7FF) { p = _calc_frame(a, b, h, 0); }
-    var x0 = a;
-    if (p != 0) {
-        x0 = _calc_to_frame(a, p);
-        h = f64_div(f64_sub(_calc_to_frame(b, p), x0), f64_from(steps));
+    if (eh == 0 || eh == 0x7FF) {
+        var p = _calc_frame(a, b, h, 0);
+        if (p != 0) {
+            _calc_trapez_framed(f, a, b, steps, out, p);
+            return Ok(0);
+        }
     }
+    var fa = fncall1(f, a);
+    var fb = fncall1(f, b);
     var sum = f64_mul(F64_HALF, f64_add(fa, fb));
     # ⛔ 3.3.4 — THE SUM OVERFLOWED BEFORE h SCALED IT. The weighted sum of finite
     # samples can pass DBL_MAX where sum * h does not: f(1/4) = f(1/2) = 1.5 * 2^1023,
@@ -121,8 +127,7 @@ public fn calc_integral_trapez(f, a, b, steps, out) {
     var dn = F64_ONE;    # 2^-sc, the factor on each later sample
     var i = 1;
     while (i < steps) {
-        var xi = f64_add(x0, f64_mul(f64_from(i), h));
-        if (p != 0) { xi = _calc_from_frame(xi, p); }
+        var xi = f64_add(a, f64_mul(f64_from(i), h));
         var fxi = fncall1(f, xi);
         if (sc != 0) { fxi = f64_mul(fxi, dn); }
         var t = f64_add(sum, fxi);
@@ -137,13 +142,42 @@ public fn calc_integral_trapez(f, a, b, steps, out) {
         i = i + 1;
     }
     var r = f64_mul(sum, h);
-    if (p != 0) {
-        r = _calc_mul_scaled(sum, h, sc - p);       # sum * 2^sc * h * 2^-p, rounded once
-    } else {
-        if (sc != 0) { r = f64_mul(r, (1023 + sc) << 52); }
-    }
+    if (sc != 0) { r = f64_mul(r, (1023 + sc) << 52); }
     store64(out, r);
     return Ok(0);
+}
+
+# Internal: calc_integral_trapez in frame p != 0 (_calc_frame): its loop with the grid laid
+# at a * 2^p and b * 2^p, each node mapped back by 2^-p and the result rounded once at
+# sum * 2^sc * h * 2^-p. A copy, so that the plain loop carries no frame (3.4.0).
+fn _calc_trapez_framed(f, a, b, steps, out, p) {
+    var fa = fncall1(f, a);
+    var fb = fncall1(f, b);
+    var x0 = _calc_to_frame(a, p);
+    var h = f64_div(f64_sub(_calc_to_frame(b, p), x0), f64_from(steps));
+    var sum = f64_mul(F64_HALF, f64_add(fa, fb));
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0 && _calc_finite2(fa, fb) == 1) {
+        sum = f64_add(f64_mul(F64_HALF, fa), f64_mul(F64_HALF, fb));
+    }
+    var sc = 0;
+    var dn = F64_ONE;
+    var i = 1;
+    while (i < steps) {
+        var xi = _calc_from_frame(f64_add(x0, f64_mul(f64_from(i), h)), p);
+        var fxi = fncall1(f, xi);
+        if (sc != 0) { fxi = f64_mul(fxi, dn); }
+        var t = f64_add(sum, fxi);
+        if (f64_lt(f64_abs(t), F64_POS_INF) == 0 && _calc_finite2(sum, fxi) == 1) {
+            sc = sc + 1;
+            dn = (1023 - sc) << 52;
+            sum = f64_mul(sum, F64_HALF);
+            t = f64_add(sum, f64_mul(fxi, F64_HALF));
+        }
+        sum = t;
+        i = i + 1;
+    }
+    store64(out, _calc_mul_scaled(sum, h, sc - p));       # sum * 2^sc * h * 2^-p, rounded once
+    return 0;
 }
 
 # Internal: the coordinate frame calc_integral_trapez, _simpson and _gauss5 lay their
@@ -247,18 +281,22 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
         return Ok(0);
     }
     var h = f64_div(f64_sub(b, a), f64_from(steps));
-    var fa = fncall1(f, a);
-    var fb = fncall1(f, b);
     # The grid in calc_integral_trapez's frame (_calc_frame); 0 is the plain arithmetic.
     # (3.3.7: _calc_frame is asked only where it can answer other than 0; see calc_integral_gauss5.)
-    var p = 0;
+    # A frame other than 0 takes its own copy of the loop (_calc_simpson_framed), as in
+    # calc_integral_trapez (3.4.0): x^2 on [0, 1] with 16 steps 3.3.5 346 ns, 3.3.7 365, this 347;
+    # sin on [0, pi] with 100 steps 5.48 us, 5.66, 5.47 (medians of 9, interleaved).
+    # [measured: scratch bench (NU1-work/bq.bcyr), 3.3.5 tag, base and this tree, cycc 6.7.9, 2026-10-31]
     var eh = (h >> 52) & 0x7FF;
-    if (eh == 0 || eh == 0x7FF) { p = _calc_frame(a, b, h, 0); }
-    var x0 = a;
-    if (p != 0) {
-        x0 = _calc_to_frame(a, p);
-        h = f64_div(f64_sub(_calc_to_frame(b, p), x0), f64_from(steps));
+    if (eh == 0 || eh == 0x7FF) {
+        var p = _calc_frame(a, b, h, 0);
+        if (p != 0) {
+            _calc_simpson_framed(f, a, b, steps, out, p);
+            return Ok(0);
+        }
     }
+    var fa = fncall1(f, a);
+    var fb = fncall1(f, b);
     var sum = f64_add(fa, fb);
     var comp = 0;  # Neumaier compensation (stored as f64 bits)
     var spec = 0;  # classes of the non-finite samples (see the end of the body)
@@ -291,8 +329,7 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
 
     var i = 1;
     while (i < steps) {
-        var xi = f64_add(x0, f64_mul(f64_from(i), h));
-        if (p != 0) { xi = _calc_from_frame(xi, p); }
+        var xi = f64_add(a, f64_mul(f64_from(i), h));
         var fxi = fncall1(f, xi);
 
         # Odd indices get coefficient 4, even indices get 2
@@ -366,13 +403,93 @@ public fn calc_integral_simpson(f, a, b, steps, out) {
     if (spec == 1) { total = F64_POS_INF; }
     if (spec == 2) { total = 0xFFF0000000000000; }    # -Infinity
     if (spec == 0) {
-        # The frame's 2^-p joins the halvings' 2^sc, and the close rounds once.
-        store64(out, _calc_simpson_close(sum, comp, h, sc - p));
+        store64(out, _calc_simpson_close(sum, comp, h, sc));
         return Ok(0);
     }
     # total is +-Inf or NaN here, which no finite power of two moves.
     store64(out, f64_div(f64_mul(total, h), _CALC_F64_THREE));
     return Ok(0);
+}
+
+# Internal: calc_integral_simpson in frame p != 0 (_calc_frame): its body, comments in
+# calc_integral_simpson, with the grid laid at a * 2^p and b * 2^p, each node mapped back by
+# 2^-p, and the frame's 2^-p joined to the halvings' 2^sc in the close, which rounds once.
+# A copy, so that the plain loop carries no frame (3.4.0).
+fn _calc_simpson_framed(f, a, b, steps, out, p) {
+    var fa = fncall1(f, a);
+    var fb = fncall1(f, b);
+    var x0 = _calc_to_frame(a, p);
+    var h = f64_div(f64_sub(_calc_to_frame(b, p), x0), f64_from(steps));
+    var sum = f64_add(fa, fb);
+    var comp = 0;  # Neumaier compensation (stored as f64 bits)
+    var spec = 0;  # classes of the non-finite samples (see the end of the body)
+    if (f64_lt(f64_abs(fa), F64_POS_INF) == 0) { spec = spec | _calc_nonfinite_class(fa); }
+    if (f64_lt(f64_abs(fb), F64_POS_INF) == 0) { spec = spec | _calc_nonfinite_class(fb); }
+    var sc = 0;          # the true sum is (sum + comp) * 2^sc (see calc_integral_trapez)
+    var dn = F64_ONE;    # 2^-sc, the factor on each later sample
+    if (spec == 0) {
+        if (f64_lt(f64_abs(sum), F64_POS_INF) == 0) {
+            sc = 1;
+            dn = F64_HALF;
+            fa = f64_mul(fa, F64_HALF);
+            fb = f64_mul(fb, F64_HALF);
+            sum = f64_add(fa, fb);
+        }
+        if (f64_lt(f64_abs(fa), f64_abs(fb)) == 0) {
+            comp = f64_add(f64_sub(fa, sum), fb);
+        } else {
+            comp = f64_add(f64_sub(fb, sum), fa);
+        }
+    }
+
+    var i = 1;
+    while (i < steps) {
+        var xi = _calc_from_frame(f64_add(x0, f64_mul(f64_from(i), h)), p);
+        var fxi = fncall1(f, xi);
+
+        var coeff = F64_TWO;
+        if (i % 2 == 1) { coeff = _CALC_F64_FOUR; }
+        var fs = fxi;
+        if (sc != 0) { fs = f64_mul(fxi, dn); }
+        var val = f64_mul(coeff, fs);
+
+        var t = f64_add(sum, val);
+        if (f64_lt(f64_abs(t), F64_POS_INF) == 0) {
+            if (f64_lt(f64_abs(fxi), F64_POS_INF) == 0) {
+                spec = spec | _calc_nonfinite_class(fxi);
+            } else {
+                if (f64_lt(f64_abs(sum), F64_POS_INF) == 1) {
+                    while (f64_lt(f64_abs(t), F64_POS_INF) == 0) {
+                        sc = sc + 1;
+                        sum = f64_mul(sum, F64_HALF);
+                        comp = f64_mul(comp, F64_HALF);
+                        fs = f64_mul(fs, F64_HALF);
+                        val = f64_mul(coeff, fs);
+                        t = f64_add(sum, val);
+                    }
+                    dn = (1023 - sc) << 52;
+                }
+            }
+        }
+        if (f64_lt(f64_abs(sum), f64_abs(val)) == 0) {
+            comp = f64_add(comp, f64_add(f64_sub(sum, t), val));
+        } else {
+            comp = f64_add(comp, f64_add(f64_sub(val, t), sum));
+        }
+        sum = t;
+
+        i = i + 1;
+    }
+
+    var total = f64_add(sum, comp);
+    if (spec == 1) { total = F64_POS_INF; }
+    if (spec == 2) { total = 0xFFF0000000000000; }    # -Infinity
+    if (spec == 0) {
+        store64(out, _calc_simpson_close(sum, comp, h, sc - p));
+        return 0;
+    }
+    store64(out, f64_div(f64_mul(total, h), _CALC_F64_THREE));
+    return 0;
 }
 
 # Internal: x * 2^k, in two steps, for |k| <= 2044. Exact when x * 2^(k/2) and the
@@ -1066,13 +1183,21 @@ public fn cubic_bezier_ease(x1, y1, x2, y2, x) {
 # 4. NOISE
 # ================================================================
 
-# Perlin permutation table (256 entries, doubled for wrapping).
-# Stored as a flat allocation of 512 bytes (u8 values).
+# Perlin permutation table (256 entries, doubled for wrapping), 512 bytes (u8 values).
+# ⛔ 3.4.0 — THE TABLE WAS TWO UNCHECKED ALLOCATIONS (roadmap [3.3.8], the allocation
+# census): alloc(512) for the table and alloc(256) for its first half, both stored
+# through without a test, so a refused allocation (an exhausted heap, or ALLOC_MAX
+# lowered below 512) wrote the table to address 0 on the first noise call. It is now
+# static storage, which cannot be refused, and the half is written in place: no
+# allocation is left in this module. _PERM_READY is the built flag.
+# [measured: tests/edge_cases.tcyr, group "3.4.0: allocation sites in calc, calc_ext, ode, optimize"]
+var _PERM_BUF: u8[512];
 var _PERM_TABLE = 0;
+var _PERM_READY = 0;
 
 fn _perm_init() {
-    if (_PERM_TABLE != 0) { return 0; }
-    _PERM_TABLE = alloc(512);
+    if (_PERM_READY != 0) { return 0; }
+    _PERM_TABLE = &_PERM_BUF;
 
     # The standard Perlin permutation (Ken Perlin's reference table).
     # Stored through the 10-arg `_perm_store_8` (base + off + 8 bytes), 32 calls.
@@ -1086,7 +1211,7 @@ fn _perm_init() {
     # The 10-arg form stays on purpose: it is correct on every toolchain pin, this
     # table is built once per process (see the guard above), and a revert would
     # change code for no gain.
-    var base = alloc(256);
+    var base = _PERM_TABLE;
     _perm_store_8(base,   0, 151, 160, 137,  91,  90,  15, 131,  13);
     _perm_store_8(base,   8, 201,  95,  96,  53, 194, 233,   7, 225);
     _perm_store_8(base,  16, 140,  36, 103,  30,  69, 142,   8,  99);
@@ -1120,12 +1245,13 @@ fn _perm_init() {
     _perm_store_8(base, 240, 222, 114,  67,  29,  24,  72, 243, 141);
     _perm_store_8(base, 248, 128, 195,  78,  66, 215,  61, 156, 180);
 
-    # Double the table for wrapping: perm[i] = base[i & 255]
-    var i = 0;
+    # Double the table for wrapping: perm[i] = perm[i - 256]
+    var i = 256;
     while (i < 512) {
         store8(_PERM_TABLE + i, load8(base + (i & 255)));
         i = i + 1;
     }
+    _PERM_READY = 1;
     return 0;
 }
 
@@ -1153,7 +1279,7 @@ fn _perm(idx) {
 # reached across files and unsafe before the init.)
 #must_use
 public fn noise_perm(idx) {
-    if (_PERM_TABLE == 0) { _perm_init(); }
+    if (_PERM_READY == 0) { _perm_init(); }
     return load8(_PERM_TABLE + (idx & 511));
 }
 
@@ -1238,12 +1364,66 @@ public fn perlin_2d(x, y) {
     return calc_lerp(x1, x2, v);
 }
 
+# Internal: fbm_2d_checked's octaves again with the weights p^i, amp-free, for an amp whose
+# own weights left the range: w and the sums are taken by one power of two (two normal
+# factors) to |w| in [1/2, 1) whenever w reaches 1 in magnitude, so that no weight overflows
+# and every ratio of weights is kept. Writes the sum and the weight sum to acc.
+fn _calc_fbm_2d_pass(acc, x, y, octaves, freq, persistence) {
+    var sum = 0;
+    var wsum = 0;
+    var w = F64_ONE;
+    var cur_freq = freq;
+    var i = 0;
+    while (i < octaves) {
+        var nx = f64_mul(x, cur_freq);
+        var ny = f64_mul(y, cur_freq);
+        sum = f64_add(sum, f64_mul(w, perlin_2d(nx, ny)));
+        wsum = f64_add(wsum, w);
+        w = f64_mul(w, persistence);
+        if (f64_le(F64_ONE, f64_abs(w)) == 1 && f64_lt(f64_abs(w), F64_POS_INF) == 1) {
+            var k = ((w >> 52) & 0x7FF) - 1022;
+            var f1 = (1023 - k / 2) << 52;
+            var f2 = (1023 - (k - k / 2)) << 52;
+            w = f64_mul(f64_mul(w, f1), f2);
+            sum = f64_mul(f64_mul(sum, f1), f2);
+            wsum = f64_mul(f64_mul(wsum, f1), f2);
+        }
+        cur_freq = f64_mul(cur_freq, F64_TWO);
+        i = i + 1;
+    }
+    store64(acc, sum);
+    store64(acc + 8, wsum);
+    return 0;
+}
+
 # Fractional Brownian Motion (fBm) using 2D Perlin noise.
 # x, y: coordinates (f64), octaves: integer count,
 # freq: initial frequency (f64), amp: initial amplitude (f64),
-# persistence: amplitude multiplier per octave (f64, typically 0.5).
-# Returns: f64 noise value normalized to approximately [-1, 1].
-public fn fbm_2d(x, y, octaves, freq, amp, persistence) {
+# persistence: amplitude multiplier per octave (f64, typically 0.5),
+# out: pointer, the noise value (f64) written here.
+# Returns Ok(0) with the octaves' weighted mean, sum(a_i n_i) / sum(a_i), a_i = amp p^i:
+# approximately [-1, 1]. Err(HSB_ERR_INVALID_INPUT) for octaves <= 0 (no octave, no
+# mean); Err(HSB_ERR_DIVISION_BY_ZERO) when the weights sum to 0 (persistence = -1 with
+# an even count): the mean is a division by 0. `out` is untouched on both.
+# ⭐ 3.4.0 — REPLACES fbm_2d, which returned 0, a legal noise value, for octaves <= 0,
+# for weights summing to 0 and for amp = 0 (audit D069). amp = 0 is not a failure: the mean does not
+# depend on amp (it cancels), so its value at amp = 0 is the one at every other amp, and
+# that is computed, at amp = 1; every amp other than +-0 keeps its bits.
+# [measured: tests/edge_cases.tcyr, group "3.4.0: fbm_2d_checked / fbm_3d_checked"]
+# ⛔ 3.4.0 (review) — THAT HELD ONLY WHILE amp's WEIGHTS STAYED IN RANGE. At (0.37, 1.91), 4
+# octaves: amp = +-Inf gave NaN (Inf * 0.5^i * n summed with weights Inf); amp = 2^-1074 with
+# persistence 0 gave -1, the sign of n_0 (amp * n_0 rounds to the smallest subnormal), where
+# the mean is n_0 = 0xBFE0E635CCBCCFDC; amp = 2^1023 with persistence 2 gave NaN (the weights
+# overflow), and so did amp = 1 with persistence 2^600 over 3 octaves. Where amp's pass ends
+# with a sum that is not finite or a weight sum under 2^-969 (the test after its loop), it is formed
+# again from the weights p^i, rescaled by powers of two so that none overflows: each of those
+# is now the amp = 1 mean (0xBFD994F85152B429, n_0, 0xBF98D89689B0CFEF) or, for 2^600, n_2.
+# A NaN amp still gives NaN. Every amp whose pass stays in range keeps its bits.
+# [measured: scratch probe NU1-work/c/f1.cyr, integ-snap5 and this tree, 2026-10-31]
+#must_use
+public fn fbm_2d_checked(x, y, octaves, freq, amp, persistence, out) {
+    if (octaves <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_eq(amp, 0) == 1) { amp = F64_ONE; }
     var sum = 0;          # f64 accumulator (starts at 0.0)
     var max_amp = 0;      # f64 normalization
     var cur_freq = freq;
@@ -1260,10 +1440,24 @@ public fn fbm_2d(x, y, octaves, freq, amp, persistence) {
         i = i + 1;
     }
 
-    # Guard the normalisation divide. `max_amp` only accumulates inside the octave
-    # loop, so it is still exactly 0 when octaves <= 0 (or when amp is 0), and the
-    # unguarded divide returned NaN — for a function documenting an approximately
-    # [-1, 1] range. NaN then propagates silently through every downstream sample.
-    if (f64_eq(max_amp, 0) == 1) { return 0; }
-    return f64_div(sum, max_amp);
+    # The mean does not depend on amp. Where amp's weights leave the range -- a sum that is
+    # not finite, or a weight sum under 2^-969, where rounding below DBL_MIN moves the mean
+    # (amp +-Inf or subnormal, amp p^i overflowing) -- it is formed again without amp
+    # (_calc_fbm_2d_pass). A NaN amp keeps its NaN.
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0 || f64_lt(f64_abs(max_amp), F64_POS_INF) == 0 ||
+      ((max_amp >> 52) & 0x7FF) < 54) {
+        if (f64_eq(amp, amp) == 1) {
+            var acc: i64[2];
+            _calc_fbm_2d_pass(&acc, x, y, octaves, freq, persistence);
+            sum = load64(&acc);
+            max_amp = load64(&acc + 8);
+        }
+    }
+
+    # Guard the normalisation divide. Through 2.x it returned NaN when max_amp was 0
+    # (octaves <= 0, amp = 0, or weights that cancel), and through 3.3.7 the designed 0.
+    # Here max_amp is 0 only for weights that cancel, which have no mean.
+    if (f64_eq(max_amp, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    store64(out, f64_div(sum, max_amp));
+    return Ok(0);
 }

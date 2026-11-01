@@ -4,8 +4,8 @@
 #
 # Provides:
 #   Adaptive:     ode_dopri45, ode_dopri45_trajectory
-#   Implicit:     ode_backward_euler
-#   Stiff (BDF):  ode_bdf2, ode_bdf
+#   Implicit:     ode_backward_euler_checked
+#   Stiff (BDF):  ode_bdf2_checked, ode_bdf_checked
 #   Stochastic:   ode_euler_maruyama, ode_milstein
 #   Symplectic:   ode_symplectic_euler, ode_verlet, ode_leapfrog, ode_yoshida4
 #
@@ -26,6 +26,10 @@ var _ODE_F64_SIX      = 0x4018000000000000;          # 6.0
 var _ODE_F64_THREE    = 0x4008000000000000;          # 3.0
 var _ODE_F64_FOUR     = 0x4010000000000000;          # 4.0
 var _ODE_F64_FIVE     = 0x4014000000000000;          # 5.0
+# The implicit steps' Newton slope (_ode_newton_gp): the difference step, relative to the
+# state, and the margin below which the slope is not resolved from 0.
+var _ODE_F64_2_POW_M26 = 0x3E50000000000000;         # 2^-26
+var _ODE_F64_2_POW_M24 = 0x3E70000000000000;         # 2^-24
 
 # Safety factor for adaptive step control: 0.9
 var _ODE_SAFETY       = 0x3FECCCCCCCCCCCCD;          # 0.9
@@ -37,6 +41,8 @@ var _ODE_MAX_FACTOR   = 0x4014000000000000;          # 5.0
 var _ODE_EXP_NEG_0P2  = 0xBFC999999999999A;         # -0.2
 # Max steps for trajectory integration
 var _ODE_MAX_STEPS    = 100000;
+# Newton updates per BDF step (_ode_bdf_newton): 50, as ode_bdf2 and ode_bdf always took.
+enum _OdeBdf { _ODE_BDF_NEWTON = 50; }
 
 # ================================================================
 # Dormand-Prince RK4(5) Butcher tableau coefficients (f64 hex)
@@ -255,8 +261,12 @@ public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
     vec_push(out_ts, t);
     vec_push(out_ys, y);
 
-    var out_y_buf = alloc(8);
-    var out_err_buf = alloc(8);
+    # ⛔ 3.4.0 — TWO UNCHECKED alloc(8)s, ONE PAIR PER CALL: a refused allocation made
+    # ode_dopri45 store to address 0, and every call left 16 bytes on the bump heap. The
+    # step's two outputs are locals now.
+    var out_bufs: i64[2];
+    var out_y_buf = &out_bufs;
+    var out_err_buf = &out_bufs + 8;
 
     var steps = 0;
     while (steps < _ODE_MAX_STEPS) {
@@ -343,50 +353,59 @@ public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
 # t: current time (f64) -- the step targets t+dt
 # y: current state (f64)
 # dt: time step (f64)
-# tol: Newton convergence tolerance (f64)
-# max_newton: max Newton iterations (integer)
-# Returns: new y value (f64). ⚠ Non-convergence is NOT reported: when max_newton
-# iterations run out, or |g'(z)| falls below EPSILON_F64, it returns the last
-# Newton iterate z -- the forward-Euler predictor if no iteration ran -- not y.
-# (This line said "or y on non-convergence" through 3.3.1.) A Result-returning
-# form changes the public signature: roadmap [3.4.0], audit D070.
+# tol: Newton convergence tolerance (f64), on the residual |g(z)|
+# max_newton: max Newton updates (integer)
+# out: pointer, y_new (f64) written here on success
+# Returns: Ok(0) when an iterate's residual |g(z)| is below tol (the forward-Euler
+# predictor is tested first); Err(HSB_ERR_NO_CONVERGENCE) when max_newton updates do
+# not get there; Err(HSB_ERR_SINGULAR_MATRIX) when g'(z) is not resolved from 0
+# (_ode_newton_gp: the step's equation is singular and no Newton step can be taken); `out`
+# untouched on both; Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN (no residual meets it)
+# or max_newton < 0, before f is called.
+# ⭐ 3.4.0 — REPLACES ode_backward_euler, WHICH DID NOT REPORT NON-CONVERGENCE (audit
+# D070). It returned the last Newton iterate z in both failures above, and never tested
+# the residual of the iterate its last update made, so y' = -y with dt = 1 from y = 1,
+# tol 1e-12, max_newton 0 returned the predictor 0, where the step's value is 0.5; it
+# now reports NO_CONVERGENCE, and max_newton = 1 is Ok(0.5) (the one update lands on
+# the linear equation's root, and its residual is tested). (Through 3.3.1 the doc said
+# "or y on non-convergence".) Two more it returned as values: y' = y with dt = 1, whose
+# step 1 / (1 - dt) does not exist, gave 0x4127901A8CFCEE13 (773,325, a diverged iterate),
+# and y' = y + 1 - t from y = -1/2 at t = 0, dt = 1, where g'(z) = 0 exactly and the step's
+# equation z = -1/2 + z has no root, gave the predictor 0; both are SINGULAR_MATRIX (3.4.0's
+# first form: NO_CONVERGENCE, after 102 evaluations).
+# [measured: scratch probes (NU1-work/p/p5.cyr, p8.cyr, p8b.cyr), base tree and this tree, 2026-10-31]
 #
 # Solves: y_new = y + dt * f(t + dt, y_new)
 # Newton: g(z) = z - y - dt * f(t+dt, z) = 0
 # Update: z -= g(z) / g'(z)
 # g'(z) approx 1 - dt * df/dy, approximated via finite difference
-public fn ode_backward_euler(f, t, y, dt, tol, max_newton) {
+#must_use
+public fn ode_backward_euler_checked(f, t, y, dt, tol, max_newton, out) {
+    if (f64_gt(tol, 0) == 0 || max_newton < 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var t_next = f64_add(t, dt);
     # Initial guess: forward Euler
     var z = f64_add(y, f64_mul(dt, fncall2(f, t, y)));
-
     var iter = 0;
-    while (iter < max_newton) {
+    while (1 == 1) {
         var fz = fncall2(f, t_next, z);
         var g = f64_sub(z, f64_add(y, f64_mul(dt, fz)));
 
         # Check convergence
         if (f64_lt(f64_abs(g), tol) == 1) {
-            return z;
+            store64(out, z);
+            return Ok(0);
         }
+        if (iter >= max_newton) { return Err(HSB_ERR_NO_CONVERGENCE); }
 
-        # Approximate Jacobian via finite difference
-        var eps = f64_mul(EPSILON_F64, f64_add(_ODE_F64_ONE, f64_abs(z)));
-        var fz_eps = fncall2(f, t_next, f64_add(z, eps));
-        var dfdy = f64_div(f64_sub(fz_eps, fz), eps);
-
-        # g'(z) = 1 - dt * df/dy
-        var gp = f64_sub(_ODE_F64_ONE, f64_mul(dt, dfdy));
-
-        # Guard against zero derivative
-        if (f64_lt(f64_abs(gp), EPSILON_F64) == 1) {
-            return z;
-        }
+        # g'(z) = 1 - dt df/dy, df/dy by a forward difference (_ode_newton_gp)
+        var gp = _ode_newton_gp(f, t_next, z, fz, dt, g);
+        if (f64_eq(gp, 0) == 1) { return Err(HSB_ERR_SINGULAR_MATRIX); }
+        if (f64_eq(gp, gp) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }  # no finite slope
 
         z = f64_sub(z, f64_div(g, gp));
         iter = iter + 1;
     }
-    return z;
+    return Err(HSB_ERR_NO_CONVERGENCE);
 }
 
 # ================================================================
@@ -399,42 +418,108 @@ public fn ode_backward_euler(f, t, y, dt, tol, max_newton) {
 # y: current state y_n (f64)
 # y_prev: previous state y_{n-1} (f64)
 # dt: time step (f64)
-# tol: Newton convergence tolerance (f64)
-# Returns: y_{n+1} (f64). ⚠ Non-convergence is NOT reported: after 50 Newton
-# iterations, or when |g'(z)| falls below EPSILON_F64, it returns the last iterate z
-# (roadmap [3.4.0], audit D070).
+# tol: Newton convergence tolerance (f64), on the residual |g(z)|
+# out: pointer, y_{n+1} (f64) written here on success
+# Returns: Ok(0) when an iterate's residual is below tol (the predictor is tested
+# first); Err(HSB_ERR_NO_CONVERGENCE) after 50 Newton updates without that;
+# Err(HSB_ERR_SINGULAR_MATRIX) when g'(z) is not resolved from 0 (_ode_newton_gp); `out`
+# untouched on both; Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN, before f is called.
+# ⭐ 3.4.0 — REPLACES ode_bdf2, which returned the last iterate z on both failures
+# (audit D070) and never tested the residual of its 50th update.
 #
 # BDF-2: y_{n+1} = (4/3)*y_n - (1/3)*y_{n-1} + (2/3)*h*f(t_{n+1}, y_{n+1})
-public fn ode_bdf2(f, t, y, y_prev, dt, tol) {
-    var max_iter = 50;
+#must_use
+public fn ode_bdf2_checked(f, t, y, y_prev, dt, tol, out) {
+    if (f64_gt(tol, 0) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     # Predictor
     var pred = f64_add(f64_mul(_BDF2_A0, y), f64_mul(_BDF2_A1, y_prev));
+    return _ode_bdf_newton(f, t, pred, _BDF2_BETA, dt, tol, out);
+}
+
+# Internal: the Newton slope g'(z) = 1 - c f_y(t, z) of an implicit step's equation
+# z = s + c f(t, z) (c = dt for backward Euler, beta dt for BDF), fz = f(t, z), g its residual
+# at z, with f_y the forward difference over the step 2^-26 |z| (2^-26 |g| at z = 0: a
+# residual of 0 has already passed the caller's tol), taken as the difference of the two
+# doubles it spans; a difference that is not finite is taken again over a step 2^-26, then
+# 2^-52, times smaller.
+# 0 when |g'| is at most 2^-24 (1 + |c f_y|): the difference resolves f_y to about 2^-26 of
+# it, and a slope that small is not told apart from 0, so the step's equation is taken as
+# singular. NaN when there is no finite slope (fz, or every difference, not finite).
+#
+# ⛔ 3.4.0 (review) — THE STEP WAS ABSOLUTE AND THE SINGULAR TEST RARELY FIRED. The step was
+# EPSILON_F64 (1 + |z|), 1e-12 below |z| = 1, so a state below about 1e-12 was differenced
+# over a step larger than itself: backward Euler on y' = -y^2 / s from y = s, dt = 1, tol
+# s 1e-12 (the step's value s (sqrt 5 - 1) / 2) returned the same bits times s only by luck
+# and, from s = 2^-50, NO_CONVERGENCE after 102 evaluations of f. And the test |g'| <
+# EPSILON_F64 read a slope whose difference noise was about 2^-52 / 1e-12, 2e-4: y' = lambda y
+# with dt = 1 / lambda, whose step equation is singular for every lambda, spent its 50
+# updates (102 evaluations) at lambda = 2^-40 to 2^40 and reported NO_CONVERGENCE. The step
+# now scales with z, and the singular test with the slope's resolution: every s from 1 to
+# 2^-70 gives 0x3FE3C6EF372FECB2 times s, bit for bit (9.6e-14 relative from the exact value,
+# within the residual tol), after 12 evaluations, and the singular equations report
+# SINGULAR_MATRIX at the first update (backward Euler after 3 evaluations, BDF-2 after 2).
+# [measured: scratch probe NU1-work/c/o1.cyr, integ-snap5 and this tree, 2026-10-31]
+# ⛔ 3.4.0 (second review) — AT A ZERO STATE THE STEP WAS STILL ABSOLUTE, AND AN INFINITE SLOPE
+# PASSED AS SINGULAR. From rest (BDF from y = y_prev = 0) z and s are 0 and the step was 2^-26:
+# f = s (cos t - (y/s)^2) at dt = 1/2 was Ok at every s down to 2^-500 and SINGULAR_MATRIX from
+# 2^-600, where 2^-26 is 2^574 in units of s. And |g'| <= 2^-24 (1 + |c f_y|) read Inf <= Inf as
+# true: f = cos t - exp(1e12 y) from rest at dt = 1e-3 differenced over 2^-26, exp overflowed,
+# and the step was SINGULAR_MATRIX after 2 evaluations, where 3.3.7 converged in 34. The
+# residual sets the step at z = 0 (in place of the state, then 1), and a slope that is not
+# finite is never singular:
+# the first is s 0x3FD12F0F22AE92A8 at every s from 1 to 2^-1000 (9 evaluations), the second
+# Ok in 9 evaluations, 2.4e-11 relative off the root (3.3.7: 1.0e-6); k = 1e10 is Ok in 7,
+# 6.0e-9 off (the first form: NO_CONVERGENCE after 101; 3.3.7: 1.6e-8 off). k = 2.5e13 is
+# still NO_CONVERGENCE (its first update takes a slope 5e11 times too steep, and the next
+# iterate's step, 2^-26 of 9.3e-27, sees no change in f), as on 3.3.7. The reviewer's 1,600
+# stiff steps and 2,290 scaled copies keep every status, bit and count.
+# [measured: review R2B scratch probes z0/z1_lane/ode_lane and NU1 z2 (.cyr), mpmath roots, 2026-10-31]
+fn _ode_newton_gp(f, t, z, fz, c, g) {
+    if (f64_lt(f64_abs(fz), F64_POS_INF) == 0) { return 0x7FF8000000000000; }   # no slope at z
+    var h = f64_abs(z);
+    if (f64_eq(h, 0) == 1) { h = f64_abs(g); }
+    h = f64_mul(h, _ODE_F64_2_POW_M26);
+    var dfdy = 0x7FF8000000000000;
+    var k = 0;
+    while (k < 3) {
+        var zh = f64_add(z, h);
+        dfdy = f64_div(f64_sub(fncall2(f, t, zh), fz), f64_sub(zh, z));
+        if (f64_lt(f64_abs(dfdy), F64_POS_INF) == 1) { k = 3; }
+        h = f64_mul(h, _ODE_F64_2_POW_M26);
+        k = k + 1;
+    }
+    var cd = f64_mul(c, dfdy);
+    if (f64_lt(f64_abs(cd), F64_POS_INF) == 0) { return 0x7FF8000000000000; }
+    var gp = f64_sub(_ODE_F64_ONE, cd);
+    if (f64_le(f64_abs(gp), f64_mul(_ODE_F64_2_POW_M24, f64_add(_ODE_F64_ONE, f64_abs(cd)))) == 1) { return 0; }
+    return gp;
+}
+
+# Internal: the Newton solve of a BDF step, z = pred + beta * dt * f(t, z), from z =
+# pred, for ode_bdf2_checked and ode_bdf_checked: at most _ODE_BDF_NEWTON updates, the
+# residual tested before each and after the last. Ok(0) with z in `out`, or
+# Err(HSB_ERR_NO_CONVERGENCE) or Err(HSB_ERR_SINGULAR_MATRIX) with `out` untouched.
+fn _ode_bdf_newton(f, t, pred, beta, dt, tol, out) {
     var z = pred;
-
     var iter = 0;
-    while (iter < max_iter) {
+    while (1 == 1) {
         var fz = fncall2(f, t, z);
-        # Residual: g = z - (4/3)*y + (1/3)*y_prev - (2/3)*h*f(t, z)
-        var g = f64_sub(z, f64_add(pred, f64_mul(_BDF2_BETA, f64_mul(dt, fz))));
-
+        # Residual: g = z - pred - beta * h * f(t, z)
+        var g = f64_sub(z, f64_add(pred, f64_mul(beta, f64_mul(dt, fz))));
         if (f64_lt(f64_abs(g), tol) == 1) {
-            return z;
+            store64(out, z);
+            return Ok(0);
         }
+        if (iter >= _ODE_BDF_NEWTON) { return Err(HSB_ERR_NO_CONVERGENCE); }
 
-        # Finite-difference Jacobian
-        var eps = f64_mul(EPSILON_F64, f64_add(_ODE_F64_ONE, f64_abs(z)));
-        var fz_eps = fncall2(f, t, f64_add(z, eps));
-        var dfdy = f64_div(f64_sub(fz_eps, fz), eps);
-        var gp = f64_sub(_ODE_F64_ONE, f64_mul(_BDF2_BETA, f64_mul(dt, dfdy)));
-
-        if (f64_lt(f64_abs(gp), EPSILON_F64) == 1) {
-            return z;
-        }
+        var gp = _ode_newton_gp(f, t, z, fz, f64_mul(beta, dt), g);
+        if (f64_eq(gp, 0) == 1) { return Err(HSB_ERR_SINGULAR_MATRIX); }
+        if (f64_eq(gp, gp) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }  # no finite slope
 
         z = f64_sub(z, f64_div(g, gp));
         iter = iter + 1;
     }
-    return z;
+    return Err(HSB_ERR_NO_CONVERGENCE);
 }
 
 # ================================================================
@@ -448,9 +533,15 @@ public fn ode_bdf2(f, t, y, y_prev, dt, tol) {
 # order: BDF order (2, 3, 4, or 5, integer)
 # dt: time step (f64)
 # tol: Newton convergence tolerance (f64)
-# Returns: y_{n+1} (f64), or 0 on invalid input. ⚠ Non-convergence is NOT
-# reported: after 50 Newton iterations, or when |g'(z)| falls below EPSILON_F64, it
-# returns the last iterate z (roadmap [3.4.0], audit D070).
+# out: pointer, y_{n+1} (f64) written here on success
+# Returns: Ok(0) when an iterate's residual is below tol; Err(HSB_ERR_NO_CONVERGENCE)
+# after 50 Newton updates without that; Err(HSB_ERR_SINGULAR_MATRIX) when g'(z) is not
+# resolved from 0 (_ode_newton_gp);
+# Err(HSB_ERR_INVALID_INPUT) for an order outside 2..5, a history shorter than the
+# order, or tol <= 0 or NaN, before f is called. `out` is untouched on every Err.
+# ⭐ 3.4.0 — REPLACES ode_bdf (audit D069, D070). It returned 0, a legal y, for an
+# invalid order or a short history, and the last iterate z on both Newton failures. No
+# value is right for an order the method does not have or a history it cannot read.
 #
 # Through 2.8.2 the only call reaching this function was order 4 with f == 0 and
 # a constant history. That pins sum(alpha) == 1 -- the invariant the 2.6.12
@@ -461,15 +552,14 @@ public fn ode_bdf2(f, t, y, y_prev, dt, tol) {
 # order k over the monomials t^0..t^k is the complete order-condition set, so
 # the k alphas and beta are jointly determined -- no coefficient can be wrong
 # and still pass. See tests/hisab.tcyr "ode_bdf: the full order-condition set".
-public fn ode_bdf(f, t, history, order, dt, tol) {
-    var max_iter = 50;
+#must_use
+public fn ode_bdf_checked(f, t, history, order, dt, tol, out) {
     var hlen = vec_len(history);
 
-    if (hlen < order) {
-        return _ODE_F64_ZERO;
-    }
-    if (order < 2) { return _ODE_F64_ZERO; }
-    if (order > 5) { return _ODE_F64_ZERO; }
+    if (hlen < order) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (order < 2) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (order > 5) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_gt(tol, 0) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # Select coefficients based on order
     # alphas[k] multiplies y_{n-k}, beta multiplies h*f
@@ -518,30 +608,7 @@ public fn ode_bdf(f, t, history, order, dt, tol) {
     }
 
     # Newton iteration
-    var z = pred;
-    var iter = 0;
-    while (iter < max_iter) {
-        var fz = fncall2(f, t, z);
-        var g = f64_sub(z, f64_add(pred, f64_mul(beta, f64_mul(dt, fz))));
-
-        if (f64_lt(f64_abs(g), tol) == 1) {
-            return z;
-        }
-
-        # Finite-difference Jacobian
-        var eps = f64_mul(EPSILON_F64, f64_add(_ODE_F64_ONE, f64_abs(z)));
-        var fz_eps = fncall2(f, t, f64_add(z, eps));
-        var dfdy = f64_div(f64_sub(fz_eps, fz), eps);
-        var gp = f64_sub(_ODE_F64_ONE, f64_mul(beta, f64_mul(dt, dfdy)));
-
-        if (f64_lt(f64_abs(gp), EPSILON_F64) == 1) {
-            return z;
-        }
-
-        z = f64_sub(z, f64_div(g, gp));
-        iter = iter + 1;
-    }
-    return z;
+    return _ode_bdf_newton(f, t, pred, beta, dt, tol, out);
 }
 
 # ================================================================
@@ -608,7 +675,8 @@ public fn ode_milstein(f, g, dg_dy, t, y, dt, dW) {
 # p: current momentum (f64)
 # dt: time step (f64)
 # Returns: pointer to a 16-byte block [q_new, p_new] (load64(r), load64(r + 8)),
-#   the same contract as ode_verlet / ode_leapfrog / ode_yoshida4 below.
+#   the same contract as ode_verlet / ode_leapfrog / ode_yoshida4 below: 0 when the
+#   block cannot be allocated (3.4.0; through 3.3.7 the four stored through it unchecked).
 #   ⚠ Until 3.1.0 this doc block was a design monologue stating four
 #   contradictory conventions; the code has always returned the block.
 public fn ode_symplectic_euler(dq_dp, dp_dq, q, p, dt) {
@@ -621,6 +689,7 @@ public fn ode_symplectic_euler(dq_dp, dp_dq, q, p, dt) {
     var q_new = f64_add(q, f64_mul(dt, vel));
 
     var result = alloc(16);
+    if (result == 0) { return 0; }    # refused: the designed 0, not a store to 0 (3.4.0)
     store64(result, q_new);
     store64(result + 8, p_new);
     return result;
@@ -635,7 +704,7 @@ public fn ode_symplectic_euler(dq_dp, dp_dq, q, p, dt) {
 # q: current position (f64)
 # v: current velocity (f64)
 # dt: time step (f64)
-# Returns: pointer to 16-byte block [q_new, v_new]
+# Returns: pointer to 16-byte block [q_new, v_new], or 0 when it cannot be allocated
 public fn ode_verlet(accel_fn, q, v, dt) {
     var half_dt = f64_mul(_ODE_F64_HALF, dt);
     var a = fncall1(accel_fn, q);
@@ -652,6 +721,7 @@ public fn ode_verlet(accel_fn, q, v, dt) {
     var v_new = f64_add(v, f64_mul(half_dt, f64_add(a, a_new)));
 
     var result = alloc(16);
+    if (result == 0) { return 0; }    # refused: the designed 0, not a store to 0 (3.4.0)
     store64(result, q_new);
     store64(result + 8, v_new);
     return result;
@@ -666,7 +736,7 @@ public fn ode_verlet(accel_fn, q, v, dt) {
 # q: current position (f64)
 # v: current velocity at half-step t - dt/2 (f64)
 # dt: time step (f64)
-# Returns: pointer to 16-byte block [q_new, v_half_new]
+# Returns: pointer to 16-byte block [q_new, v_half_new], or 0 when it cannot be allocated
 #   q_new = position at t+dt
 #   v_half_new = velocity at t+dt/2
 public fn ode_leapfrog(accel_fn, q, v, dt) {
@@ -679,6 +749,7 @@ public fn ode_leapfrog(accel_fn, q, v, dt) {
     var q_new = f64_add(q, f64_mul(dt, v_new));
 
     var result = alloc(16);
+    if (result == 0) { return 0; }    # refused: the designed 0, not a store to 0 (3.4.0)
     store64(result, q_new);
     store64(result + 8, v_new);
     return result;
@@ -694,7 +765,7 @@ public fn ode_leapfrog(accel_fn, q, v, dt) {
 # q: current position (f64)
 # v: current velocity (f64)
 # dt: time step (f64)
-# Returns: pointer to 16-byte block [q_new, v_new]
+# Returns: pointer to 16-byte block [q_new, v_new], or 0 when it cannot be allocated
 public fn ode_yoshida4(accel_fn, q, v, dt) {
     # Yoshida coefficients
     # c = [c0, c1, c1, c0], d = [w1, w0, w1]
@@ -728,6 +799,7 @@ public fn ode_yoshida4(accel_fn, q, v, dt) {
     qi = f64_add(qi, f64_mul(f64_mul(c0, dt), vi));
 
     var result = alloc(16);
+    if (result == 0) { return 0; }    # refused: the designed 0, not a store to 0 (3.4.0)
     store64(result, qi);
     store64(result + 8, vi);
     return result;

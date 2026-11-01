@@ -2,7 +2,7 @@
 #                   eigendecomposition, Lyapunov exponents, inertia tensors
 # Usage: shipped inside dist/hisab.cyr; in-tree, include "src/linalg_ext.cyr" after what it requires
 # Requires: src/complex.cyr, src/error.cyr, src/f64_util.cyr, src/linalg_precision.cyr (stdlib via [deps]);
-#           linalg_precision since 3.3.4: its `svd_golub_kahan` is svd_compute's fallback
+#           linalg_precision since 3.3.4: its `svd_golub_kahan` is svd_compute_checked's fallback
 #
 # Ported from rust-old/src/num/{sparse,solvers,svd,eigen,stability,inertia}.rs
 #
@@ -53,9 +53,16 @@ public fn mat_new_guarded(rows, cols) {
 # row_ptr: flat i64 array (nrows+1 entries)
 # col_idx: flat i64 array (nnz entries)
 # values:  flat f64 array (nnz entries)
-# Returns pointer to CSR struct (48 bytes).
+# Returns pointer to CSR struct (48 bytes), or 0 when it cannot be allocated (3.4.0: the
+# header was stored through a refused allocation).
+#
+# ⛔ 3.4.0 — THE CSR SECTION STORED THROUGH EVERY ALLOCATION UNCHECKED (roadmap [3.3.8],
+# "linalg_ext CSR / GMRES / BiCGSTAB"). Each routine below now returns its designed 0 when an
+# allocation is refused, and the ones that size an array from a CSR header (a struct the
+# caller built, so any i64) first refuse a negative count or one past ALLOC_MAX / 8 words.
 public fn csr_new(nrows, ncols, nnz, row_ptr, col_idx, values) {
     var csr = alloc(48);
+    if (csr == 0) { return 0; }
     store64(csr,      nrows);
     store64(csr + 8,  ncols);
     store64(csr + 16, nnz);
@@ -73,7 +80,9 @@ public fn csr_row_ptr(csr) { return load64(csr + 24); }
 public fn csr_col_idx(csr) { return load64(csr + 32); }
 public fn csr_values(csr)  { return load64(csr + 40); }
 
-# Convert a stdlib dense matrix (from matrix.cyr) to CSR.
+# Convert a stdlib dense matrix (from matrix.cyr) to CSR. Returns 0 when an array cannot be
+# allocated (3.4.0). Its counts come from an allocated ganita matrix, at most
+# GANITA_MAT_MAX_ELEMS entries, so no size here can overflow.
 # Stores exactly the entries that are not 0.0. (This line still said
 # "drops |value| < EPSILON_F64" until 3.2.0; the drop became structural in 2.15.0 --
 # the 2.14.0 tag still ships the EPSILON_F64 guard.)
@@ -81,7 +90,14 @@ public fn csr_values(csr)  { return load64(csr + 40); }
 # as an assembly loop does -- is built with csr_new, the only constructor that
 # takes the arrays as given.
 # Returns pointer to CSR struct.
+#
+# ⛔ 3.4.0 — THE LIBRARY'S OWN DESIGNED 0 CRASHED THE CSR SECTION (D102 audit, AU2-G3-F2):
+# csr_from_dense(mat_new_guarded(0, 3)), csr_spmv / csr_transpose of csr_add's mismatch 0, and
+# csr_add(0, b) each read through the null handle (exit 139). A null handle is now refused with
+# the same designed 0 each routine already returns.
+# [measured: D102 audit AU2 G3-F2 repros, re-run on 3.3.7 base (LA probes pd_1..pd_5), cycc 6.7.9, 2026-10-31]
 public fn csr_from_dense(dense_mat) {
+    if (dense_mat == 0) { return 0; }
     var nrows = ganita_mat_rows(dense_mat);
     var ncols = ganita_mat_cols(dense_mat);
 
@@ -110,6 +126,9 @@ public fn csr_from_dense(dense_mat) {
     var row_ptr = alloc((nrows + 1) * 8);
     var col_idx = alloc(count * 8);
     var values  = alloc(count * 8);
+    # alloc(0) is the designed 0 too, and an all-zero matrix is the empty CSR (nnz 0, null data
+    # arrays), so only a request of some size is refused
+    if (row_ptr == 0 || (count > 0 && (col_idx == 0 || values == 0))) { return 0; }
 
     var pos = 0;
     store64(row_ptr, 0);
@@ -135,14 +154,18 @@ public fn csr_from_dense(dense_mat) {
 
 # Sparse matrix-vector multiply: y = CSR * x.
 # x: flat f64 array of length ncols.
-# Returns: flat f64 array of length nrows.
+# Returns: flat f64 array of length nrows, or 0 for a null csr, a negative nrows or one past
+# ALLOC_MAX / 8, or a refused allocation (3.4.0).
 public fn csr_spmv(csr, x) {
+    if (csr == 0) { return 0; }
     var nrows   = load64(csr);
     var row_ptr = load64(csr + 24);
     var col_idx = load64(csr + 32);
     var vals    = load64(csr + 40);
 
+    if (nrows < 0 || nrows > ALLOC_MAX / 8) { return 0; }
     var y = alloc(nrows * 8);
+    if (y == 0) { return 0; }   # nrows = 0 included: alloc(0) is 0, as through 3.3.7
     var i = 0;
     while (i < nrows) {
         var sum = f64_from(0);
@@ -163,8 +186,10 @@ public fn csr_spmv(csr, x) {
 
 # Sparse matrix addition: C = A + B (both CSR, same dimensions).
 # Uses sorted merge of each row. Drops zeros.
-# Returns new CSR struct, or 0 on dimension mismatch.
+# Returns new CSR struct, or 0 on dimension mismatch, a null operand, a negative count or
+# counts whose arrays would pass ALLOC_MAX / 8 words, or a refused allocation (3.4.0).
 public fn csr_add(a, b) {
+    if (a == 0 || b == 0) { return 0; }
     var nrows_a = load64(a);
     var ncols_a = load64(a + 8);
     var nrows_b = load64(b);
@@ -181,11 +206,17 @@ public fn csr_add(a, b) {
     var b_ci = load64(b + 32);
     var b_v  = load64(b + 40);
 
-    # Upper bound on nnz: sum of both nnz counts
-    var max_nnz = load64(a + 16) + load64(b + 16);
+    # Upper bound on nnz: sum of both nnz counts, bounded before it is formed
+    var nnz_a = load64(a + 16);
+    var nnz_b = load64(b + 16);
+    var cap = ALLOC_MAX / 8;
+    if (nrows < 0 || nrows >= cap || nnz_a < 0 || nnz_b < 0) { return 0; }
+    if (nnz_a > cap || nnz_b > cap - nnz_a) { return 0; }
+    var max_nnz = nnz_a + nnz_b;
     var out_rp = alloc((nrows + 1) * 8);
     var out_ci = alloc(max_nnz * 8);
     var out_v  = alloc(max_nnz * 8);
+    if (out_rp == 0 || (max_nnz > 0 && (out_ci == 0 || out_v == 0))) { return 0; }   # empty: null arrays
 
     var pos = 0;
     store64(out_rp, 0);
@@ -249,17 +280,22 @@ public fn csr_add(a, b) {
     return csr_new(nrows, ncols, pos, out_rp, out_ci, out_v);
 }
 
-# Transpose a CSR matrix. Returns new CSR struct.
+# Transpose a CSR matrix. Returns new CSR struct, or 0 for a null csr, a negative count or
+# one whose array would pass ALLOC_MAX / 8 words, or a refused allocation (3.4.0).
 public fn csr_transpose(csr) {
+    if (csr == 0) { return 0; }
     var nrows   = load64(csr);
     var ncols   = load64(csr + 8);
     var nnz     = load64(csr + 16);
     var row_ptr = load64(csr + 24);
     var col_idx = load64(csr + 32);
     var vals    = load64(csr + 40);
+    var cap = ALLOC_MAX / 8;
+    if (nrows < 0 || ncols < 0 || nnz < 0 || ncols >= cap || nnz > cap) { return 0; }
 
     # Count entries per column (= rows of transposed)
     var row_counts = alloc(ncols * 8);
+    if (ncols > 0 && row_counts == 0) { return 0; }
     var k = 0;
     while (k < ncols) { store64(row_counts + k * 8, 0); k = k + 1; }
 
@@ -272,6 +308,7 @@ public fn csr_transpose(csr) {
 
     # Build new row_ptr from counts
     var new_rp = alloc((ncols + 1) * 8);
+    if (new_rp == 0) { return 0; }
     var cum = 0;
     store64(new_rp, 0);
     k = 0;
@@ -286,6 +323,7 @@ public fn csr_transpose(csr) {
     var new_v  = alloc(nnz * 8);
     # cursor tracks current write position per row of transposed
     var cursor = alloc(ncols * 8);
+    if ((nnz > 0 && (new_ci == 0 || new_v == 0)) || (ncols > 0 && cursor == 0)) { return 0; }
     k = 0;
     while (k < ncols) {
         store64(cursor + k * 8, load64(new_rp + k * 8));
@@ -383,9 +421,11 @@ fn _lext_norm(v, n) {
     return f64_sqrt(ss);
 }
 
-# Helper: y = a - b, flat f64 arrays of length n. Returns new array.
+# Helper: y = a - b, flat f64 arrays of length n. Returns new array, or 0 when it cannot be
+# allocated (3.4.0: it stored through the refused allocation before its callers could look).
 fn _lext_sub(a, b, n) {
     var out = alloc(n * 8);
+    if (out == 0) { return 0; }
     var i = 0;
     while (i < n) {
         store64(out + i * 8, f64_sub(load64(a + i * 8), load64(b + i * 8)));
@@ -394,9 +434,11 @@ fn _lext_sub(a, b, n) {
     return out;
 }
 
-# Helper: copy flat f64 array of length n. Returns new array.
+# Helper: copy flat f64 array of length n. Returns new array, or 0 when it cannot be
+# allocated (3.4.0, as _lext_sub).
 fn _lext_copy(src, n) {
     var out = alloc(n * 8);
+    if (out == 0) { return 0; }
     var i = 0;
     while (i < n) {
         store64(out + i * 8, load64(src + i * 8));
@@ -500,6 +542,131 @@ public fn linalg_sort_desc(vals, n, by_abs, col_mat, col_rows, row_mat, row_cols
     return Ok(0);
 }
 
+# ---- 3.4.0: the Krylov solvers' common entry checks ----
+# The arguments solve_gmres_checked and solve_bicgstab_checked refuse before any work:
+# HSB_ERR_INVALID_INPUT for a null A_fn, b or x0, n <= 0, max_iter <= 0, a tol that is
+# negative, NaN or infinite, or a NaN or infinite entry in b or x0 (such a system has no finite
+# solution to iterate towards, and a NaN iterate would only spend the budget);
+# HSB_ERR_ALLOC for an n whose n-word vectors are past ALLOC_MAX. 0 when they pass.
+fn _lext_krylov_args(A_fn, b, x0, n, tol, max_iter) {
+    if (A_fn == 0 || b == 0 || x0 == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (n <= 0 || max_iter <= 0) { return HSB_ERR_INVALID_INPUT; }
+    # 3.4.0 review: +Inf as well (a tolerance every residual meets, an infinite one included)
+    if (f64_ge(tol, 0) == 0 || f64_lt(tol, F64_POS_INF) == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (n > ALLOC_MAX / 8) { return HSB_ERR_ALLOC; }
+    if (_lext_vec_all_finite(b, n) == 0 || _lext_vec_all_finite(x0, n) == 0) { return HSB_ERR_INVALID_INPUT; }
+    return 0;
+}
+
+# ---- 3.4.0 review: the Krylov solvers' scaled frame ----
+# Both solvers solve A' x' = b' with b' = b 2^-eb (largest |b'_i| in [1, 2)) and A' = A 2^-ea,
+# applied as A'(v) = A_fn(v 2^-ea): ea is read off a probe A_fn(b') (`_lext_kprobe`). Then
+# x = x' 2^(eb - ea). Every operation inside is homogeneous, so a system and its copy scaled by
+# powers of two run the same arithmetic in this frame and their answers differ by that power of
+# two exactly, wherever it is representable; and ||b'|| is finite whenever b is.
+#
+# v 2^e for an exact power of two, rounded once (`_lext_xld`) where the result leaves the
+# normal range. n words from v to out.
+fn _lext_kscale(v, n, e, out) {
+    if (e >= 0 - 1022 && e <= 1023) {
+        var p = (1023 + e) << 52;
+        for (var i = 0; i < n; i = i + 1) { store64(out + i * 8, f64_mul(load64(v + i * 8), p)); }
+        return out;
+    }
+    for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+        var x = load64(v + i2 * 8);
+        store64(out + i2 * 8, _lext_xld(_lext_xman(x), _lext_xexp(x) + e));
+    }
+    return out;
+}
+
+# A'(v) = A_fn(v 2^-ea): A_fn's input is sc, hisab's own storage, except when ea = 0. sc holds
+# 2n words.
+# ⛔ 3.4.0 second review (R2A note 1, SF5) — THE INPUT v 2^-ea HAD NO HEADROOM. For a small A
+# (ea near -1020) an iterate of 2^4 already overflowed it: A = 2^-1020 [[1, 0.99], [0.99, 1]],
+# b = (2^-720, 0) was NO_CONVERGENCE though x = (1.0236e92, -1.0134e92) is representable; and
+# for a large A (ea near 1010) the input went subnormal and rounded, so the scaled solve stopped
+# being bit for bit the unit one. Where |ea| > 800, so that it can matter, A_fn now gets
+# v 2^(c - ea) with c the power of two that keeps the input's largest |entry| in
+# [2^-960, 2^1000], and its product, times 2^-c, lands in sc's second half: still A' v, from
+# products A_fn forms as it does at unit scale.
+# [measured: LA3 probes kh.py (R2A note 1 and kbit.py rows) and ksw (the 2D sweep), integ-snap9 vs LA3, 2026-10-31]
+fn _lext_kmv(A_fn, v, n, ea, sc) {
+    if (ea == 0) { return fncall1(A_fn, v); }
+    if (ea >= 0 - 800 && ea <= 800) { return fncall1(A_fn, _lext_kscale(v, n, 0 - ea, sc)); }
+    var vm = f64_from(0);
+    for (var i = 0; i < n; i = i + 1) {
+        var a = f64_abs(load64(v + i * 8));
+        if (f64_gt(a, vm) == 1) { vm = a; }
+    }
+    var c = 0;
+    if ((vm & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+        var t = _lext_xexp(vm) - ea;
+        if (t > 1000) { c = 1000 - t; }
+        if (t < 0 - 960) { c = 0 - 960 - t; }
+    }
+    if (c == 0) { return fncall1(A_fn, _lext_kscale(v, n, 0 - ea, sc)); }
+    var w = fncall1(A_fn, _lext_kscale(v, n, c - ea, sc));
+    return _lext_kscale(w, n, 0 - c, sc + n * 8);
+}
+
+# The probe: ea such that A_fn(b') 2^-ea has largest |entry| in [1, 2). res[0] = ea, res[1] = the
+# matvecs spent (1, or 2 when A_fn(b') overflowed and b' 2^-600 is tried). Returns 0, or 1 when
+# A_fn gives a non-finite product even at b' 2^-600 (A_fn is not a finite linear map there). A
+# zero product (b' in A's null space) leaves ea = 0. An A_fn(b') below 2^-1022 (an A whose
+# entries are all subnormal) gives an ea below -1022, and `_lext_kmv` keeps A_fn's input
+# representable there (since the second review): 2^-1030 I x = 2^-100 (1, 1) and
+# 2^-1060 I x = 2^-1060 (1, 1), Errs through the first review, are answered (x = 2^930 (1, 1) and
+# (1, 1), the GMRES ones 1 ulp above).
+# [measured: LA2 probe k5 on integ-snap5, LA2 and LA3, cycc 6.7.9, 2026-10-31]
+fn _lext_kprobe(A_fn, bs, n, sc, res) {
+    var w = fncall1(A_fn, bs);
+    var calls = 1;
+    var off = 0;
+    var wm = f64_from(0);
+    var fin = 1;
+    for (var i = 0; i < n; i = i + 1) {
+        var a = f64_abs(load64(w + i * 8));
+        if (f64_lt(a, F64_POS_INF) == 0) { fin = 0; }
+        if (f64_gt(a, wm) == 1) { wm = a; }
+    }
+    if (fin == 0) {
+        off = 0 - 600;
+        w = fncall1(A_fn, _lext_kscale(bs, n, off, sc));
+        calls = 2;
+        wm = f64_from(0);
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+            var a2 = f64_abs(load64(w + i2 * 8));
+            if (f64_lt(a2, F64_POS_INF) == 0) {
+                store64(res + 8, calls);
+                return 1;
+            }
+            if (f64_gt(a2, wm) == 1) { wm = a2; }
+        }
+    }
+    var ea = 0;
+    if ((wm & 0x7FFF_FFFF_FFFF_FFFF) != 0) { ea = _lext_xexp(wm) - 1 - off; }
+    store64(res, ea);
+    store64(res + 8, calls);
+    return 0;
+}
+
+# 1 when every entry of v[0..n) is a zero of either sign.
+fn _lext_kzero(v, n) {
+    for (var i = 0; i < n; i = i + 1) {
+        if ((load64(v + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 0; }
+    }
+    return 1;
+}
+
+# x' 2^(eb - ea) back into x, in place. 0, or 1 when an entry overflows: the solution of the
+# caller's system is past DBL_MAX.
+fn _lext_kunscale(x, n, e) {
+    _lext_kscale(x, n, e, x);
+    if (_lext_vec_all_finite(x, n) == 0) { return 1; }
+    return 0;
+}
+
 # GMRES(m) iterative solver for non-symmetric systems Ax = b.
 # A_fn: function pointer, called as fncall1(A_fn, x_ptr) -> Ax (flat f64 array).
 #       Its input is always storage hisab owns, and the vector it returns is read
@@ -514,11 +681,53 @@ public fn linalg_sort_desc(vals, n, by_abs, col_mat, col_rows, row_mat, row_cols
 # b:    flat f64 array of length n.
 # x0:   initial guess, flat f64 array of length n.
 # n:    system dimension.
-# tol:  convergence tolerance on residual norm.
-# max_iter: maximum total matrix-vector products. COUNTED, not estimated.
-# restart:  restart dimension (Krylov subspace size per cycle).
-# Returns: flat f64 array of length n (solution).
-public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
+# tol:  RELATIVE tolerance, finite and >= 0: x is accepted when ||b - A x||_2 <= tol ||b||_2
+#       (since 3.4.0), both sides formed in the scaled frame below, so ||b|| never overflows.
+#       ⚠ The test is normwise: a row of b far larger than the others decides it, and the
+#       other rows' residuals can be far above tol of their own size. R2A note 2: A = [[3 2^400,
+#       2^400, 0], [1, 3.5, 1], [0, 2^-400, 2^-399]], b = (2^401, 1.5, 3 2^-400), tol 1e-10 is Ok
+#       from both solvers with x = (0.667, 1.9e-121, 1.5e-241), for (0.75, -0.25, 1.625). Scale
+#       the rows first when each must meet tol.
+#       [measured: review R2A note 2; LA3 probe n2, cycc 6.7.9, 2026-10-31]
+# max_iter: maximum total matrix-vector products. COUNTED, not estimated: the probe that
+#       fixes the frame is one of them, and x0 = 0 spends none on b - A x0.
+# restart:  restart dimension (Krylov subspace size per cycle), clamped to [1, n].
+# Returns: Ok(x), x a fresh flat f64 array of length n, when the TRUE residual b - A x,
+#          formed with A_fn, meets tol; x = 0 at once for b = 0, the exact solution.
+#          ⚠ "Meets" is in f64: at a tol near n 2^-52 cond(A) the exact residual can be over
+#          it by the rounding of b - A x itself (2 of 23 Ok answers at tol 1e-15 on 30 random
+#          12 x 12, worst 1.67 tol ||b||; none at 1e-14; seeds 2 and 3).
+#          Err(HSB_ERR_NO_CONVERGENCE) when the budget ends first, when a restart cycle
+#          leaves x bit for bit as it was (a breakdown it cannot move from), when a
+#          residual stops being finite (A_fn returned a NaN or an overflow), when the
+#          probe's A_fn(b) is not finite even at b 2^-600, or when the solution is past
+#          DBL_MAX (it is finite in the frame, and overflows on the way out);
+#          Err(HSB_ERR_INVALID_INPUT) / Err(HSB_ERR_ALLOC) for the arguments
+#          `_lext_krylov_args` refuses, and Err(HSB_ERR_ALLOC) when a working buffer
+#          cannot be allocated (the Hessenberg's (m + 1) m words included).
+# ⛔ 3.4.0 — RETIRED `solve_gmres`, WHICH RETURNED THE CURRENT x WHATEVER HAPPENED: at the end of
+# the budget, after a breakdown, and on its Givens estimate of the residual alone, so an
+# unconverged or broken-down solve looked exactly like a converged one (roadmap D015). Its tol
+# was ABSOLUTE, so a system and its 2^k-scaled copy stopped on different passes and gave
+# different x. solve_gmres_checked reports every exit that is not a solution, measures tol
+# against ||b||, and verifies with the true residual: the Givens estimate meeting tol ends a
+# cycle, and the next cycle's b - A x decides (one more matvec than the estimate alone).
+# Every operation is homogeneous in A and b and runs in a frame fixed by powers of two (3.4.0
+# review), so (2^i A, 2^j b, 2^(j-i) x0) gives 2^(j-i) times the x of (A, b, x0), bit for bit.
+# Measured on a 3 x 3 for both solvers: all 7303 cells of i, j in [-1020, 1020] step 20 with
+# |j - i| <= 900. ⛔ Second review (R2A SF5): until A_fn's input was kept in [2^-960, 2^1000]
+# (`_lext_kmv`), the claim read "wherever x and A_fn's products are representable" and was false
+# above about 2^1010, where the input went subnormal: 46 of the 7303 cells differed from the
+# unit solve for each solver on integ-snap9 (all at i = 1020), and near 2^-1020 an iterate
+# overflowed the input (R2A's 2^-1020 [[1, 0.99], [0.99, 1]]). Outside the measured range,
+# where A_fn's own products leave the normal range, it is not claimed.
+# [measured: LA2 probe sw; LA3 probe ksw (2D sweep, step 20), integ-snap9 vs LA3, cycc 6.7.9, 2026-10-31]
+# [measured: review REV-LA S3 (kr2.py, seeds 2 and 3, true residual in Fractions) on LA2, cycc 6.7.9, 2026-10-31]
+# A caller of solve_gmres writes `var t, x = solve_gmres_checked(...)`, tests `is_ok(t)`,
+# and passes a relative tol.
+#must_use
+public fn solve_gmres_checked(A_fn, b, x0, n, tol, max_iter, restart) {
+    # (3.4.0 review: the arguments, then the scaled frame -- see `_lext_kprobe`)
     # ⛔ `n` SIZES THE VERY FIRST ALLOCATION AND WAS UNCHECKED. `_lext_copy(x0, n)`
     # does `alloc(n * 8)` and stores through it; past ALLOC_MAX that is the
     # designed 0 and the copy loop writes to address 0. Measured: n = 268,435,457
@@ -531,8 +740,10 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     # It is — because THIS allocation fails first on any `n` large enough to
     # overflow it. The surviving mutant was pointing at a second defect, not at a
     # redundant guard.
-    if (n > ALLOC_MAX / 8) { return 0; }
-    var x = _lext_copy(x0, n);
+    var ka = _lext_krylov_args(A_fn, b, x0, n, tol, max_iter);
+    if (ka != 0) { return Err(ka); }
+    var x = alloc(n * 8);
+    if (x == 0) { return Err(HSB_ERR_ALLOC); }
     var m = restart;
     if (m > n) { m = n; }
     if (m < 1) { m = 1; }
@@ -555,12 +766,10 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     # (2,147,352,576 B, fits) and m = 16384 is rejected (2,147,614,720 B).
     # [measured: scratch harness, not reproducible in-tree, 2026-09-09; cycc 6.6.2]
     #
-    # ⚠ Returns a designed 0. This function hands back the solution ARRAY and has
-    # no rc, and `tests/abuse.tcyr` already reads its failure channel as
-    # `assert_neq(..., 0)`. ⛔ Returning `x` — the untouched initial guess — was
-    # the tempting alternative and is exactly the fabricated-plausible-answer
-    # class the 2026-08-11 audit filed against this very function.
-    if (m + 1 > (ALLOC_MAX / 8) / m) { return 0; }
+    # ⚠ Through 3.3.7 this returned a designed 0 pointer (the old function had no rc);
+    # ⛔ returning `x`, the untouched initial guess, was the tempting alternative and is
+    # exactly the fabricated-plausible-answer class the 2026-08-11 audit filed against it.
+    if (m + 1 > (ALLOC_MAX / 8) / m) { return Err(HSB_ERR_ALLOC); }
 
     # ⛔ 3.3.3 — THE ARNOLDI VECTOR WAS THE CALLER'S OWN BUFFER. `wj = fncall1(A_fn, vj)`
     # was orthogonalised and normalised IN PLACE and then kept as basis vector j+1: an
@@ -585,8 +794,37 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     # restart-3 solve. The per-cycle buffers below are untouched by this.
     # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
     var v_own = alloc(m * 8);
+    if (v_own == 0) { return Err(HSB_ERR_ALLOC); }
     var vo = 0;
     while (vo < m) { store64(v_own + vo * 8, 0); vo = vo + 1; }
+
+    # ⭐ 3.4.0 review — THE SCALED FRAME. ||b||_2 overflowed for a finite b (two entries of
+    # 1.5e308), made the threshold +Inf, and every x0 came back Ok after one matvec, the right x
+    # being b itself for A = I; and a system scaled by 2^600 (both A and b) was answered but no
+    # longer bit for bit. Now b' = b 2^-eb, A' = A 2^-ea from a probe, x' = x0 2^(ea - eb), and x =
+    # x' 2^(eb - ea) at the end (`_lext_kprobe`). The probe is one matvec of the budget; when x0
+    # is all zeros the first residual is b' itself, which saves the A x0 matvec 3.3.7 spent.
+    # [measured: review REV-LA M1 (kr1.py) and note 2 (kr3.py); LA2 probe k1, cycc 6.7.9, 2026-10-31]
+    var bm = f64_from(0);
+    for (var bi = 0; bi < n; bi = bi + 1) {
+        var ba = f64_abs(load64(b + bi * 8));
+        if (f64_gt(ba, bm) == 1) { bm = ba; }
+    }
+    if ((bm & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        var zi = 0;
+        while (zi < n) { store64(x + zi * 8, f64_from(0)); zi = zi + 1; }
+        return Ok(x);
+    }
+    var bs = alloc(n * 8);
+    var sc = alloc(2 * n * 8);
+    if (bs == 0 || sc == 0) { return Err(HSB_ERR_ALLOC); }
+    var eb = _lext_xexp(bm) - 1;
+    _lext_kscale(b, n, 0 - eb, bs);
+    var pr: i64[2];
+    if (_lext_kprobe(A_fn, bs, n, sc, &pr) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+    var ea = load64(&pr);
+    _lext_kscale(x0, n, ea - eb, x);
+    var x0z = _lext_kzero(x0, n);
 
     # COUNT the matrix-vector products rather than deriving an outer-cycle bound
     # from them. Through 2.7.0 this computed
@@ -602,7 +840,7 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     # The caller's budget is a resource limit: A_fn may be arbitrarily expensive,
     # which is the whole reason it is a callback. Honouring it exactly is the
     # contract, not a nicety.
-    var mv_used = 0;
+    var mv_used = load64(&pr + 8);
 
     # ⭐ 3.3.7 — THE CYCLE'S WORK BUFFERS ARE ALLOCATED ONCE PER CALL (roadmap D016). Through
     # 3.3.6 the restart loop allocated r, the basis pointer array, H, g, the two Givens arrays
@@ -624,20 +862,37 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
     var y = 0;
     var ycap = 0;
 
+    # 3.4.0: the acceptance threshold, tol ||b'||, finite (||b'|| <= 2 sqrt n); b = 0 answered above
+    var thr = f64_mul(tol, _lext_norm(bs, n));
+
     var outer = 0;
-    while (mv_used < max_iter) {
-        # r = b - A*x
-        var ax = fncall1(A_fn, x);
-        mv_used = mv_used + 1;
-        if (r == 0) { r = alloc(n * 8); }
+    while (mv_used < max_iter || x0z == 1) {
+        if (r == 0) {
+            r = alloc(n * 8);
+            if (r == 0) { return Err(HSB_ERR_ALLOC); }
+        }
         var si = 0;
-        while (si < n) {
-            store64(r + si * 8, f64_sub(load64(b + si * 8), load64(ax + si * 8)));
-            si = si + 1;
+        if (x0z == 1) {
+            # x0 = 0: r = b' exactly, as b' - A' 0 would give, without the matvec
+            while (si < n) { store64(r + si * 8, load64(bs + si * 8)); si = si + 1; }
+            x0z = 0;
+        } else {
+            # r = b' - A' x
+            var ax = _lext_kmv(A_fn, x, n, ea, sc);
+            mv_used = mv_used + 1;
+            while (si < n) {
+                store64(r + si * 8, f64_sub(load64(bs + si * 8), load64(ax + si * 8)));
+                si = si + 1;
+            }
         }
         var r_norm = _lext_norm(r, n);
 
-        if (f64_lt(r_norm, tol) == 1) { return x; }
+        # a residual that is not finite first (3.4.0 review: tested after thr, it could pass)
+        if (f64_lt(r_norm, F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        if (f64_le(r_norm, thr) == 1) {
+            if (_lext_kunscale(x, n, eb - ea) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+            return Ok(x);
+        }
 
         # Normalize r -> v[0]
         var inv_r = f64_div(f64_from(1), r_norm);
@@ -654,6 +909,7 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
             g = alloc((m + 1) * 8);
             cs = alloc(m * 8);
             sn = alloc(m * 8);
+            if (v_basis == 0 || h == 0 || g == 0 || cs == 0 || sn == 0) { return Err(HSB_ERR_ALLOC); }
         }
         store64(v_basis, r);
 
@@ -679,9 +935,10 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
             var wj = load64(v_own + j * 8);
             if (wj == 0) {
                 wj = alloc(n * 8);
+                if (wj == 0) { return Err(HSB_ERR_ALLOC); }
                 store64(v_own + j * 8, wj);
             }
-            var aw = fncall1(A_fn, vj);
+            var aw = _lext_kmv(A_fn, vj, n, ea, sc);
             mv_used = mv_used + 1;
 
             # Modified Gram-Schmidt. Step 0 reads A_fn's vector and writes hisab's slot,
@@ -775,7 +1032,8 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
 
             k = j + 1;
 
-            if (f64_lt(f64_abs(load64(g + k * 8)), tol) == 1) {
+            # the estimate meeting tol ends the cycle; the next cycle's true residual decides
+            if (f64_le(f64_abs(load64(g + k * 8)), thr) == 1) {
                 j = m;  # break
             } else {
                 j = j + 1;
@@ -785,6 +1043,7 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
         # Back-substitution: solve upper triangular H * y = g
         if (k > ycap) {
             y = alloc(k * 8);
+            if (y == 0) { return Err(HSB_ERR_ALLOC); }
             ycap = k;
         }
         i = k - 1;
@@ -811,27 +1070,59 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
         }
 
         # Update x: x += V * y
+        var moved = 0;
         i = 0;
         while (i < n) {
             var xi = load64(x + i * 8);
+            var xi0 = xi;
             var jj = 0;
             while (jj < k) {
                 var vj_ptr = load64(v_basis + jj * 8);
                 xi = f64_add(xi, f64_mul(load64(y + jj * 8), load64(vj_ptr + i * 8)));
                 jj = jj + 1;
             }
+            if (xi != xi0) { moved = 1; }
             store64(x + i * 8, xi);
             i = i + 1;
         }
-
-        if (f64_lt(f64_abs(load64(g + k * 8)), tol) == 1) {
-            return x;
-        }
+        # A cycle that moves no component of x will be repeated exactly by the next one (the
+        # same x, the same residual, the same Krylov space): a breakdown, reported (3.4.0).
+        # [[0, 0], [0, 0]] x = (1, 1) ends here after 2 matvecs, where 3.3.7 returned x0 as
+        # converged on the Givens estimate of its singular Hessenberg, g = -0 * g_0.
+        if (moved == 0 && k > 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
 
         outer = outer + 1;
     }
 
-    return x;
+    return Err(HSB_ERR_NO_CONVERGENCE);
+}
+
+# BiCGSTAB's shadow residual: r_hat = r divided by the power of two at or below max|r_i| (exact;
+# see solve_bicgstab_checked), r_hat = r when r = 0.
+fn _lext_bicg_rhat(r, r_hat, n) {
+    _lext_vec_copy_n(r_hat, r, n);
+    var rh_mx = f64_from(0);
+    for (var i = 0; i < n; i = i + 1) {
+        var rh_a = f64_abs(load64(r + i * 8));
+        if (f64_gt(rh_a, rh_mx) == 1) { rh_mx = rh_a; }
+    }
+    if (f64_gt(rh_mx, 0) == 1) {
+        var rh_p = rh_mx & 0x7FF0_0000_0000_0000;
+        if (rh_p == 0) {
+            # A subnormal max: the power of two at or below it is its own leading bit.
+            rh_p = 1 << 51;
+            while ((rh_mx & rh_p) == 0) { rh_p = rh_p >> 1; }
+        }
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) { store64(r_hat + i2 * 8, f64_div(load64(r + i2 * 8), rh_p)); }
+    }
+    return 0;
+}
+
+# The true residual of the frame: rt = b' - A' x, and its norm (one matvec).
+fn _lext_kresid(A_fn, x, bs, n, ea, sc, rt) {
+    var ax = _lext_kmv(A_fn, x, n, ea, sc);
+    for (var i = 0; i < n; i = i + 1) { store64(rt + i * 8, f64_sub(load64(bs + i * 8), load64(ax + i * 8))); }
+    return _lext_norm(rt, n);
 }
 
 # BiCGSTAB iterative solver for non-symmetric systems Ax = b.
@@ -847,18 +1138,43 @@ public fn solve_gmres(A_fn, b, x0, n, tol, max_iter, restart) {
 # b:    flat f64 array of length n.
 # x0:   initial guess, flat f64 array of length n.
 # n:    system dimension.
-# tol:  convergence tolerance on residual norm.
-# max_iter: maximum iterations.
-# Returns: flat f64 array of length n (solution). On breakdown (r_hat . r, r_hat . A p
-#          or omega exactly zero) it returns the current iterate; it does not report it.
-#          One breakdown IS reported, as NaN: a t = A s numerically orthogonal to s,
-#          where omega carries no information and 3.3.2 went on to NaN. Then x
-#          comes back all NaN, unless |s| is already at most 2^-52 of the initial
-#          residual, when the half step x + alpha p is returned (see below).
-#          ⚠ A stop at max_iter without |r| < tol returns the last iterate, unreported,
-#          as the unreported breakdowns do. That current-iterate contract for an
-#          unconverged stop is kept until the [3.4.0] error channel (D015) can report it.
-public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
+# tol:  RELATIVE tolerance, finite and >= 0: x is accepted when the residual BiCGSTAB
+#       carries, r or the half step's s, has ||.||_2 <= tol ||b||_2 (since 3.4.0) AND the true
+#       residual b - A x, formed with A_fn, meets it too (3.4.0 review); when only the first
+#       does, the run restarts from the true one. The initial b - A x0 is tested too. Both
+#       sides are formed in the scaled frame below, so ||b|| never overflows. ⚠ Normwise, as
+#       solve_gmres_checked's (see there: a dominant row of b decides it).
+# max_iter: maximum iterations (each two matvecs). Not counted against it: the probe that fixes
+#       the frame, the initial b - A x0 (none when x0 = 0) and each confirmation; a
+#       confirmation that fails ends its iteration.
+# Returns: Ok(x), x a fresh flat f64 array of length n, when both tests pass; x = 0 at
+#          once for b = 0, the exact solution. ⚠ As GMRES's: the true residual is formed
+#          in f64 (at tol 1e-15 on 30 random 12 x 12, seed 2, 8 of 29 Ok answers sit over
+#          tol ||b|| by its rounding, worst 2.61 times; at 1e-14, 1 at 1.34; the recurrence
+#          alone gave 15 of 30 at up to 1780 times, and 6 at up to 178).
+#          Err(HSB_ERR_NO_CONVERGENCE) on every other exit: max_iter spent; a breakdown
+#          (r_hat . r, r_hat . A p or omega exactly zero, or a t = A s numerically
+#          orthogonal to s, where omega carries no information); a residual that stops
+#          being finite; a probe A_fn(b) that is not finite even at b 2^-600; a solution
+#          past DBL_MAX;
+#          Err(HSB_ERR_INVALID_INPUT) / Err(HSB_ERR_ALLOC) for the arguments
+#          `_lext_krylov_args` refuses, and Err(HSB_ERR_ALLOC) when a working vector
+#          cannot be allocated.
+# ⛔ 3.4.0 — RETIRED `solve_bicgstab`, WHICH RETURNED THE CURRENT x ON EVERY EXIT: a breakdown
+# returned the iterate (or, for an orthogonal t, an all-NaN x or the half step), and a stop at
+# max_iter the last iterate, all unreported (roadmap D015: 941 of 43,000 runs in the 3.3.4
+# sweep returned a finite wrong iterate, and the exact-zero-t stop a half step, 36 wrong of
+# 549). Its tol was ABSOLUTE. solve_bicgstab_checked reports each, and measures tol against
+# ||b||: every operation is homogeneous in A and b (r_hat is scaled by a power of two, the
+# breakdown tests are exact zeros, omega's rescue is a ratio) and, since the 3.4.0 review,
+# runs in a frame fixed by powers of two, so (2^i A, 2^j b, 2^(j-i) x0) gives 2^(j-i) times
+# the x of (A, b, x0), bit for bit, for i, j in [-1020, 1020] (the 7303-cell sweep in
+# solve_gmres_checked's doc; the first 3.4.0 tree excused 110 of 435 cells in [-500, 500]).
+# [measured: review REV-LA S3 kr2.py, seeds 2 and 3, on integ-snap5 and LA2, cycc 6.7.9, 2026-10-31]
+# A caller of solve_bicgstab writes `var t, x = solve_bicgstab_checked(...)`, tests `is_ok(t)`,
+# and passes a relative tol.
+#must_use
+public fn solve_bicgstab_checked(A_fn, b, x0, n, tol, max_iter) {
     # ⛔ IDENTICAL DEFECT TO `solve_gmres`, and found only because that one was
     # repaired and the same shape was then grepped for rather than assumed
     # absent. `_lext_copy(x0, n)` is an unchecked `alloc(n * 8)`; past ALLOC_MAX
@@ -867,10 +1183,52 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
     # (`tests/abuse.tcyr` already reads this function's failures as
     # `assert_neq(..., 0)`).
     # [measured: scratch harness, not reproducible in-tree, 2026-09-09; cycc 6.6.2]
-    if (n > ALLOC_MAX / 8) { return 0; }
-    var x = _lext_copy(x0, n);
-    var ax = fncall1(A_fn, x);
-    var r = _lext_sub(b, ax, n);
+    var ka = _lext_krylov_args(A_fn, b, x0, n, tol, max_iter);
+    if (ka != 0) { return Err(ka); }
+    var x = alloc(n * 8);
+    if (x == 0) { return Err(HSB_ERR_ALLOC); }
+    # ⭐ 3.4.0 review — THE SCALED FRAME, as solve_gmres_checked's (`_lext_kprobe`): b = 0 is
+    # x = 0; otherwise b' = b 2^-eb, A' = A 2^-ea from a probe (not counted against max_iter,
+    # which counts iterations), x' = x0 2^(ea - eb). (2^600 A, 2^600 b) was NO_CONVERGENCE on 8
+    # of 8 well-conditioned 8 x 8 (A p overflowed), and A = I with b = 7.5e307 (1, 1) too.
+    # [measured: review REV-LA note 2 (kr3.py); LA2 probe k1, cycc 6.7.9, 2026-10-31]
+    var bm = f64_from(0);
+    for (var bi = 0; bi < n; bi = bi + 1) {
+        var ba = f64_abs(load64(b + bi * 8));
+        if (f64_gt(ba, bm) == 1) { bm = ba; }
+    }
+    if ((bm & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        var zi = 0;
+        while (zi < n) { store64(x + zi * 8, f64_from(0)); zi = zi + 1; }
+        return Ok(x);
+    }
+    var bs = alloc(n * 8);
+    var sc = alloc(2 * n * 8);
+    var r = alloc(n * 8);
+    var rt = alloc(n * 8);
+    if (bs == 0 || sc == 0 || r == 0 || rt == 0) { return Err(HSB_ERR_ALLOC); }
+    var eb = _lext_xexp(bm) - 1;
+    _lext_kscale(b, n, 0 - eb, bs);
+    var pr: i64[2];
+    if (_lext_kprobe(A_fn, bs, n, sc, &pr) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+    var ea = load64(&pr);
+    _lext_kscale(x0, n, ea - eb, x);
+    var thr = f64_mul(tol, _lext_norm(bs, n));   # finite: ||b'|| <= 2 sqrt n
+    if (_lext_kzero(x0, n) == 1) {
+        _lext_vec_copy_n(r, bs, n);   # b' - A' 0, without the matvec
+    } else {
+        var ax = _lext_kmv(A_fn, x, n, ea, sc);
+        for (var ri = 0; ri < n; ri = ri + 1) {
+            store64(r + ri * 8, f64_sub(load64(bs + ri * 8), load64(ax + ri * 8)));
+        }
+    }
+    var r0n = _lext_norm(r, n);
+    # a residual that is not finite first (3.4.0 review: tested after thr, it could pass)
+    if (f64_lt(r0n, F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+    if (f64_le(r0n, thr) == 1) {
+        if (_lext_kunscale(x, n, eb - ea) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        return Ok(x);
+    }
     # Shadow residual (fixed), divided by the power of two at or below max|r0_i|.
     # ⛔ 3.3.3 — UNSCALED, `r_hat` CARRIED THE RESIDUAL'S UNITS INTO EVERY DOT AGAINST IT,
     # so rho = r_hat . r was degree two in b and r_hat . A p degree two in b and one in A.
@@ -881,34 +1239,15 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
     # BIT-IDENTICAL to the unscaled form wherever that one stayed in range. Measured on the
     # 2D sweep described at the breakdown tests: 2081 of 3281 cells without this, 3281 with.
     # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
-    var r_hat = _lext_copy(r, n);
-    var rh_mx = f64_from(0);
-    var i = 0;
-    while (i < n) {
-        var rh_a = f64_abs(load64(r + i * 8));
-        if (f64_gt(rh_a, rh_mx) == 1) { rh_mx = rh_a; }
-        i = i + 1;
-    }
+    var r_hat = alloc(n * 8);
+    if (r_hat == 0) { return Err(HSB_ERR_ALLOC); }
     # ⚠ The `> 0` test is required: r = 0 (x0 already exact) has no leading bit, and the
     # subnormal loop below would never end. There is deliberately no `< +Inf` test: an
     # infinite max makes rh_p = +Inf and r_hat NaN where r is infinite, and on five Inf
     # and overflow inputs the result is the all-NaN x 3.3.2 gives, bit for bit.
     # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
-    var rh_scale = f64_from(1);   # the power of two r_hat = r0 / rh_scale was divided by
-    if (f64_gt(rh_mx, 0) == 1) {
-        var rh_p = rh_mx & 0x7FF0_0000_0000_0000;
-        if (rh_p == 0) {
-            # A subnormal max: the power of two at or below it is its own leading bit.
-            rh_p = 1 << 51;
-            while ((rh_mx & rh_p) == 0) { rh_p = rh_p >> 1; }
-        }
-        rh_scale = rh_p;
-        i = 0;
-        while (i < n) {
-            store64(r_hat + i * 8, f64_div(load64(r + i * 8), rh_p));
-            i = i + 1;
-        }
-    }
+    _lext_bicg_rhat(r, r_hat, n);
+    var i = 0;
 
     var rho   = f64_from(1);
     var alpha = f64_from(1);
@@ -927,6 +1266,7 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
     # Deliberately NOT zero-filled below: all n slots are overwritten at the top
     # of every iteration before any read, so reuse is bit-identical.
     var s = alloc(n * 8);
+    if (v == 0 || p == 0 || s == 0) { return Err(HSB_ERR_ALLOC); }
     i = 0;
     while (i < n) {
         store64(v + i * 8, f64_from(0));
@@ -965,14 +1305,14 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
     # tests/hisab.tcyr group "linalg_ext" are what a no-op cannot pass.)
     # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
     #
-    # ⚠ Breakdown still returns the current `x`, the same plausible-answer contract as
-    # before. Reporting it is error-channel work ([3.4.0]), not part of this repair.
+    # ⭐ 3.4.0 — every breakdown below is Err(HSB_ERR_NO_CONVERGENCE): the iterate it used to
+    # return is not a solution to tol (a solution would have passed a residual test first).
     var iter = 0;
     while (iter < max_iter) {
         var rho_new = _lext_dot(r_hat, r, n);
 
         if (f64_eq(rho_new, 0) == 1) {
-            return x;  # Breakdown: r_hat . r is exactly zero
+            return Err(HSB_ERR_NO_CONVERGENCE);  # Breakdown: r_hat . r is exactly zero
         }
         # ⛔ 3.3.3 — omega WAS NEVER TESTED, and `alpha / omega` below divides by it. When
         # omega is exactly 0, r = s, r_hat . s is zero only up to rounding, beta is +-Inf,
@@ -990,7 +1330,7 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
         # underflows. The fast path's t . s is never 0 (it needs |t . s| >= DBL_MIN), and
         # a t NUMERICALLY ORTHOGONAL to s never reaches this test: the rescue returns
         # first (see there). In every case here x already holds the half step
-        # x + alpha p, and that is what comes back, unreported like every breakdown.
+        # x + alpha p; through 3.3.7 that came back unreported, and since 3.4.0 it is an Err.
         # ⚠ THE HALF STEP IS NOT THE SOLUTION HERE. s = 0 never reaches this test: with
         # tol > 0 the s-norm test returns first, and with tol <= 0, r = s = 0 makes
         # r_hat . r = 0 and the test above returns first. So the half step's residual s
@@ -999,10 +1339,10 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
         # finite because NaN here makes inputs worse than 3.3.2: on 3000 systems
         # A = 2^ea M, b = 2^eb c, the 95 that stop here with t = 0 (A s underflows to
         # exactly zero) include 9 that 3.3.2 answered to 1e-9 and the half step answers
-        # too. Reporting it is the [3.4.0] error-channel work.
+        # too. 3.4.0 reports it (Err(HSB_ERR_NO_CONVERGENCE)).
         # [measured: R5le BiCGSTAB differential, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
         if (f64_eq(omega, 0) == 1) {
-            return x;  # Stagnation: the last step could not move along s
+            return Err(HSB_ERR_NO_CONVERGENCE);  # Stagnation: the last step could not move along s
         }
 
         var beta = f64_mul(f64_div(rho_new, rho), f64_div(alpha, omega));
@@ -1028,7 +1368,7 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
         # wrote into that buffer; it only kept it. This `v` was allocated above but, until
         # now, only ever held the first zero.
         # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
-        var av = fncall1(A_fn, p);
+        var av = _lext_kmv(A_fn, p, n, ea, sc);
         i = 0;
         while (i < n) {
             store64(v + i * 8, load64(av + i * 8));
@@ -1037,7 +1377,7 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
 
         var r_hat_v = _lext_dot(r_hat, v, n);
         if (f64_eq(r_hat_v, 0) == 1) {
-            return x;  # Breakdown: r_hat . A p is exactly zero
+            return Err(HSB_ERR_NO_CONVERGENCE);  # Breakdown: r_hat . A p is exactly zero
         }
         alpha = f64_div(rho, r_hat_v);
 
@@ -1049,17 +1389,42 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
         }
 
         var s_norm = _lext_norm(s, n);
-        if (f64_lt(s_norm, tol) == 1) {
+        if (f64_lt(s_norm, F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        var conf = 0;
+        if (f64_le(s_norm, thr) == 1) {
             i = 0;
             while (i < n) {
                 store64(x + i * 8, f64_add(load64(x + i * 8), f64_mul(alpha, load64(p + i * 8))));
                 i = i + 1;
             }
-            return x;
+            conf = 1;
+        }
+        if (conf == 1) {
+            # ⭐ 3.4.0 review — CONFIRMED WITH THE TRUE RESIDUAL (see the r test below)
+            var hrn = _lext_kresid(A_fn, x, bs, n, ea, sc, rt);
+            if (f64_lt(hrn, F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+            if (f64_le(hrn, thr) == 1) {
+                if (_lext_kunscale(x, n, eb - ea) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+                return Ok(x);
+            }
+            # restart from it: the recurrence had drifted from b' - A' x
+            _lext_vec_copy_n(r, rt, n);
+            _lext_bicg_rhat(r, r_hat, n);
+            rho = F64_ONE;
+            alpha = F64_ONE;
+            omega = F64_ONE;
+            i = 0;
+            while (i < n) {
+                store64(v + i * 8, f64_from(0));
+                store64(p + i * 8, f64_from(0));
+                i = i + 1;
+            }
+            iter = iter + 1;
+            continue;
         }
 
         # `t` is read only before the next call to A_fn, so it needs no copy.
-        var t = fncall1(A_fn, s);
+        var t = _lext_kmv(A_fn, s, n, ea, sc);
 
         # omega = (t . s) / (t . t), the minimiser of |s - omega t|.
         # ⛔ 3.3.3 — t . t IS A NAIVE SUM OF SQUARES, degree two in t (and t . s its
@@ -1091,10 +1456,9 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
         # has lost its relative precision, and a numerator whose terms are all zero is
         # structural, not a cancellation. (A sum of |term|s that overflows makes the
         # bound +Inf, so such a step is reported as well.) When the numerator is zero to
-        # rounding, x comes back all NaN at once, 3.3.2's loud answer, unless
-        # |s| <= 2^-52 |r0|: then the half step is already as converged as the rounding
-        # of the initial residual allows, and is returned. All 340 fixture runs now
-        # return NaN after 3 matvecs.
+        # rounding the step is a breakdown: 3.3.3-3.3.7 returned an all-NaN x, 3.3.2's loud
+        # answer (or, with |s| <= 2^-52 |r0|, the half step), and 3.4.0 returns
+        # Err(HSB_ERR_NO_CONVERGENCE). All 340 fixture runs stop there after 3 matvecs.
         # Measured against the shipped 3.3.2 on 57800 runs of 13 families (the
         # orthogonal-t and zero-t fakes, diagonally dominant, general, skew + 0.01 I,
         # singular, zero-diagonal cyclic, and each scaled by 2^ea, 2^eb with ea, eb in
@@ -1108,13 +1472,23 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
         # before it answered right, because a rounding residue let the loop go on, now
         # return NaN; 3.3.2 returned NaN or a wrong x in every one.
         # [measured: R5le BiCGSTAB differential, 3.3.2, pre-repair and this tree, cycc 6.6.12, 2026-10-01]
-        # Both conditions are load-bearing. Without the |s| one, a skew 4x4 system
+        # (3.3.3-3.3.7) Both conditions were load-bearing. Without the |s| one (gone in 3.4.0,
+        # where a stop that does not meet tol is reported whatever |s| is), a skew 4x4 system
         # (entries near 1e-36, b near 1e61, tol 0), right on 3.3.2 after 25 matvecs and
         # on the tree before this test after 244, came back NaN at the 239th, where the
         # stagnated iterate meets an orthogonal t. Without the DBL_MIN one,
         # [[0,1],[3,0]] x = (5,1) at tol 0, whose second t has a zero term against every
         # non-zero s_i, came back NaN for the right (1/3, 5).
         # [measured: R5le BiCGSTAB differential and variant runs, cycc 6.6.12, 2026-10-01]
+        # ⚠ 3.4.0 review — NEITHER FIXTURE DISTINGUISHES THEM NOW (REV-LA S1): each ends in an
+        # Err either way. The n is pinned again by a fixture where it decides Ok against Err (a
+        # t . s at 2^-51 of its term sum: n 2^-52 refuses at the 3rd matvec, 2^-52 goes on and
+        # converges at the 9th; modules_b.tcyr, "3.4.0 review: the Krylov frame"). On 40,000
+        # runs of that injected-t family dropping n changes 117: 107 end in the same Err later,
+        # 10 are answered to tol, a cost of the bound being a rounding bound. The DBL_MIN
+        # condition changed none (tol 0 included) and is verdict-equivalent here: every term
+        # below DBL_MIN needs |s| under about 2^-1022 in a frame where max|b'_i| is in [1, 2).
+        # [measured: LA2 probe s1f, 40,000 injected-t runs with and without each, cycc 6.7.9, 2026-10-31]
         var t_dot_s = _lext_dot(t, s, n);
         var t_dot_t = _lext_dot(t, t, n);
         var om_fast = 0;
@@ -1173,21 +1547,10 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
                 if (f64_lt(om_pm, F64_TINY) == 0) {
                     var om_u52 = (1023 - 52) << 52;   # 2^-52
                     if (f64_le(f64_abs(om_us), f64_mul(f64_mul(f64_from(n), om_u52), om_ab)) == 1) {
-                        # |s| <= 2^-52 |r0|, formed in r_hat's units, so neither side overflows
-                        if (f64_le(f64_div(s_norm, rh_scale), f64_mul(om_u52, _lext_norm(r_hat, n))) == 1) {
-                            i = 0;
-                            while (i < n) {
-                                store64(x + i * 8, f64_add(load64(x + i * 8), f64_mul(alpha, load64(p + i * 8))));
-                                i = i + 1;
-                            }
-                            return x;
-                        }
-                        i = 0;
-                        while (i < n) {
-                            store64(x + i * 8, 0x7FF8000000000000);   # quiet NaN
-                            i = i + 1;
-                        }
-                        return x;
+                        # ⭐ 3.4.0 — a breakdown, reported. Through 3.3.7 this returned the half
+                        # step x + alpha p when |s| <= 2^-52 |r0| and an all-NaN x otherwise; the
+                        # half step meeting tol has already returned Ok above.
+                        return Err(HSB_ERR_NO_CONVERGENCE);
                     }
                 }
             }
@@ -1210,118 +1573,123 @@ public fn solve_bicgstab(A_fn, b, x0, n, tol, max_iter) {
         }
 
         var r_norm = _lext_norm(r, n);
-        if (f64_lt(r_norm, tol) == 1) {
-            return x;
+        if (f64_lt(r_norm, F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        if (f64_le(r_norm, thr) == 1) {
+            # ⭐ 3.4.0 review — CONFIRMED WITH THE TRUE RESIDUAL b' - A' x (one matvec, not an
+            # iteration), as GMRES confirms its Givens estimate. The recurrence's r can sit orders
+            # of magnitude under it at a small tol: on 30 random 12 x 12 at tol 1e-14, 6 answers came
+            # back Ok with a true residual up to 178 tol ||b||, 16 at 1e-15. When it fails the run
+            # restarts from it (a fresh r_hat), on the iterations left.
+            # [measured: review REV-LA S3 (kr2.py: true residual in Fractions); LA2 probe k2, cycc 6.7.9, 2026-10-31]
+            var crn = _lext_kresid(A_fn, x, bs, n, ea, sc, rt);
+            if (f64_lt(crn, F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+            if (f64_le(crn, thr) == 1) {
+                if (_lext_kunscale(x, n, eb - ea) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+                return Ok(x);
+            }
+            _lext_vec_copy_n(r, rt, n);
+            _lext_bicg_rhat(r, r_hat, n);
+            rho = F64_ONE;
+            alpha = F64_ONE;
+            omega = F64_ONE;
+            i = 0;
+            while (i < n) {
+                store64(v + i * 8, f64_from(0));
+                store64(p + i * 8, f64_from(0));
+                i = i + 1;
+            }
         }
 
         iter = iter + 1;
     }
 
-    return x;
+    return Err(HSB_ERR_NO_CONVERGENCE);
 }
 
 # Projected Gauss-Seidel (PGS) for contact/constraint solvers.
 # Solves A*x = b subject to lo[i] <= x[i] <= hi[i].
-# A:   stdlib matrix (n x n, via ganita_mat_get/ganita_mat_set).
+# A:   stdlib matrix (at least n x n, via ganita_mat_get); x must not overlap its storage.
 # b:   flat f64 array of length n.
 # x:   flat f64 array of length n (initial guess, modified in place).
 # n:   system dimension.
-# lo:  flat f64 array of lower bounds (length n).
-# hi:  flat f64 array of upper bounds (length n).
-# max_iter: maximum iterations.
-# Returns: 0, always (solution written into x). There is no error channel: a row
-#          whose diagonal is exactly 0 (either sign) is skipped and keeps its
-#          initial x_i. A NaN in b, or anywhere in a row of A that is not skipped,
-#          reaches x rather than being reported. ⚠ NOT EVERY NON-FINITE INPUT DOES,
-#          and those that do not come back as a finite x and 0, exactly as if they
-#          were not there or had been clamped. These are the cases measured, and the
-#          list is NOT exhaustive -- a non-finite input that is clamped, skipped,
-#          divided into or overwritten before it is read does not reach x:
-#            - a skipped row is skipped whole, so an infinite b_i or a_ij in it never
-#              reaches x (a NaN in it does, since 3.3.4: see below);
-#            - an infinite b_i in a row that is not skipped is clamped to that row's
-#              bound when the bound is finite;
-#            - an infinite OFF-diagonal a_ij in a row that is not skipped makes sigma
-#              +-Inf whenever x_j is non-zero, and x_i is clamped to the row's bound
-#              when the bound is finite; only while x_j is 0 is it Inf * 0 = NaN,
-#              which does reach x. In [[5,1,1],[a10,3,0],[1,0,2]] x = (11,7,9) from
-#              x = 0, bounds +-1e6: a10 = +Inf gives (222223.67, -1e6, -111107.33);
-#              a01 = +Inf gives NaN from x = 0, and (-1e6, 333335.67, 500004.5) from
-#              x = (1,1,1);
-#            - an infinite diagonal entry gives x_i = sigma / Inf, a signed zero;
-#            - a NaN in the initial x_0 is overwritten by row 0, when row 0 is not
-#              skipped, before any row reads it (a row reads every x_j but its own).
-#          [measured: R4le probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
-#          [measured: R5le pgs probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
-#          ⛔ 3.3.4 — TWO NaN INPUTS DISAPPEARED. A NaN bound was no bound, because
-#          f64_clamp(x, NaN, hi) and f64_clamp(x, lo, NaN) return x (both compares are
-#          false), and a NaN b_i or a_ij in a row whose diagonal is exactly 0 was skipped
-#          with the row. Either way the solve returned 0 and a finite x, as if the NaN
-#          were not there. Now a NaN in b_i, in row i of A, in lo_i or in hi_i makes x_i
-#          NaN, skipped row or not, and every row that is not skipped reads it.
-#          [measured: krylov PGS probe, 3.3.4 tree before and after, cycc 6.6.14, 2026-10-03]
-public fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
+# lo:  flat f64 array of lower bounds (length n); -Inf for none.
+# hi:  flat f64 array of upper bounds (length n); +Inf for none.
+# max_iter: maximum sweeps.
+# Returns: Ok(0) when a sweep moves no x_i by 1e-12 of max|x| (DBL_MIN when x is 0): the
+#            solution is in x, and every x_i is finite.
+#          Err(HSB_ERR_INVALID_INPUT), before anything is written, for a null A, b, x, lo or
+#            hi, n <= 0, max_iter <= 0, an A smaller than n x n, a NaN or infinite entry in
+#            A's n x n block, in b or in x, a NaN bound, lo_i = +Inf, hi_i = -Inf, or
+#            lo_i > hi_i (an empty box: no solution);
+#          Err(HSB_ERR_SINGULAR_PIVOT), before anything is written, for a diagonal entry that
+#            is exactly 0 (either sign): Gauss-Seidel cannot solve that row for x_i;
+#          Err(HSB_ERR_NO_CONVERGENCE) when max_iter sweeps end without the stopping test (x
+#            then holds the last sweep, which is not a solution);
+#          Err(HSB_ERR_ALLOC) when the private copies of b, lo and hi cannot be allocated.
+#          x may be the same storage as b, lo or hi, whole or in part: they are copied before
+#          x is written.
+# ⛔ 3.4.0 review — RETIRED `solve_pgs`, WHICH RETURNED 0 FOR EVERY OUTCOME: an unconverged
+# stop (the fabricated answer the 2026-08-11 audit lists), a skipped zero-diagonal row whose
+# x_i kept the caller's guess, non-finite input that reached x or was clamped away (its doc
+# listed six such cases and said the list was not exhaustive), and an x passed as b, which it
+# overwrote while still reading it every sweep: A = [[5,1,1],[1,3,0],[1,0,2]], b = (11, 7, 9),
+# bounds +-1000, max_iter 50, x = b returned 0 and about (-3.7e-8, 2.4e-8, 6.7e-8), and x = lo
+# returned 0 and (402.2, -131.7, -196.6), where the solution is (1, 2, 4); max_iter 1 returned
+# 0 and (-1, 2.67, 5). Each aliased call now matches the same call on separate storage bit for
+# bit, and max_iter 1 is NO_CONVERGENCE. The first 3.4.0 tree also returned a raw -10 for a
+# null handle, from a function documented as returning 0. A caller writes
+# `var t, e = solve_pgs_checked(...)` and tests `is_ok(t)`.
+# [measured: LA2 probe p1g, the AU1 F-A1 repro on integ-snap5 and on LA2, cycc 6.7.9, 2026-10-31]
+#must_use
+public fn solve_pgs_checked(A, b, x, n, lo, hi, max_iter) {
+    if (A == 0 || b == 0 || x == 0 || lo == 0 || hi == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n <= 0 || max_iter <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (ganita_mat_rows(A) < n || ganita_mat_cols(A) < n) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }
+    var zp = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if (f64_lt(f64_abs(load64(b + i * 8)), F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        if (f64_lt(f64_abs(load64(x + i * 8)), F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        var l = load64(lo + i * 8);
+        var h = load64(hi + i * 8);
+        # a NaN bound fails every compare, so each test below refuses it too
+        if (f64_lt(l, F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        if (f64_lt(f64_sub(0, h), F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        if (f64_le(l, h) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        for (var j = 0; j < n; j = j + 1) {
+            if (f64_lt(f64_abs(ganita_mat_get(A, i, j)), F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        }
+        if (f64_eq(ganita_mat_get(A, i, i), 0) == 1) { zp = 1; }
+    }
+    if (zp == 1) { return Err(HSB_ERR_SINGULAR_PIVOT); }
+    var bb = alloc(n * 8);
+    var ll = alloc(n * 8);
+    var hh = alloc(n * 8);
+    if (bb == 0 || ll == 0 || hh == 0) { return Err(HSB_ERR_ALLOC); }
+    _lext_vec_copy_n(bb, b, n);
+    _lext_vec_copy_n(ll, lo, n);
+    _lext_vec_copy_n(hh, hi, n);
     var iter = 0;
     while (iter < max_iter) {
         var max_change = f64_from(0);
-        var i = 0;
-        while (i < n) {
-            var aii = ganita_mat_get(A, i, i);
-            # ⛔ A diagonal entry in the caller's units against an absolute 1e-12,
-            # so rows of a small system were silently skipped and left at their
-            # initial value. `sigma/aii` gives the best available answer for any
-            # finite non-zero aii, subnormal included; a zero aii has none.
-            # ⛔ 3.3.3 — A NaN DIAGONAL WAS SKIPPED TOO, AND THAT LAUNDERED IT. The
-            # test was `f64_gt(|aii|, 0) == 0`, which is true for NaN, so a NaN on the
-            # diagonal left x_i at the caller's initial guess, solved the other rows
-            # around it, and returned 0: NaN in, a finite plausible x out. On 3.3.2,
-            # a00 = NaN in [[a00,1,1],[1,3,0],[1,0,2]] x = (1,2,4) from x = 0 gave
-            # x = (0, 2/3, 2), bit-identical to a00 = 0, while a NaN at a01 or b0 gave
-            # x = (NaN, NaN, NaN). Now only an exact zero (either sign) is skipped: a
-            # NaN aii divides, x_i becomes NaN, and since 0 * NaN is NaN every other
-            # row that is not skipped reads it at its next update -- the same system
-            # now gives (NaN, NaN, NaN). solve_pgs has no error channel, so NaN in the
-            # solution IS the report, as it already was for a NaN off the diagonal.
-            # [measured: G2a probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
-            # ⚠ Through 3.3.3, only in a row that is not skipped: with a00 = 0, a NaN at
-            # a01 or b0 gave x = (0, 2/3, 2) and 0, bit-identical to the same system
-            # without it. Since 3.3.4 the skipped row's x_i is that NaN (below).
-            # [measured: R4le probe, 3.3.2 bundle and this tree, cycc 6.6.12, 2026-10-01]
-            if (f64_eq(aii, 0) == 1) {
-                # Skip an exactly-zero diagonal: the documented singular case. Its x_i
-                # keeps the caller's value unless a NaN sits in its row, b_i or bounds
-                # (3.3.4: the row used to be skipped whole, NaN and all).
-                var pg_nan = load64(b + i * 8);
-                if (f64_eq(pg_nan, pg_nan) == 1) { pg_nan = load64(lo + i * 8); }
-                if (f64_eq(pg_nan, pg_nan) == 1) { pg_nan = load64(hi + i * 8); }
-                var pg_j = 0;
-                while (pg_j < n && f64_eq(pg_nan, pg_nan) == 1) {
-                    pg_nan = ganita_mat_get(A, i, pg_j);
-                    pg_j = pg_j + 1;
+        var r = 0;
+        while (r < n) {
+            var sigma = load64(bb + r * 8);
+            var c = 0;
+            while (c < n) {
+                if (c != r) {
+                    sigma = f64_sub(sigma, f64_mul(ganita_mat_get(A, r, c), load64(x + c * 8)));
                 }
-                if (f64_eq(pg_nan, pg_nan) == 0) { store64(x + i * 8, pg_nan); }
-                i = i + 1;
-            } else {
-                var sigma = load64(b + i * 8);
-                var j = 0;
-                while (j < n) {
-                    if (j != i) {
-                        sigma = f64_sub(sigma, f64_mul(ganita_mat_get(A, i, j), load64(x + j * 8)));
-                    }
-                    j = j + 1;
-                }
-                var gs_x = f64_div(sigma, aii);
-                var pg_lo = load64(lo + i * 8);
-                var pg_hi = load64(hi + i * 8);
-                var new_x = f64_clamp(gs_x, pg_lo, pg_hi);
-                # f64_clamp drops a NaN bound (3.3.4, see the doc), so x_i takes it instead.
-                if (f64_eq(pg_lo, pg_lo) == 0) { new_x = pg_lo; }
-                if (f64_eq(pg_hi, pg_hi) == 0) { new_x = pg_hi; }
-                var change = f64_abs(f64_sub(new_x, load64(x + i * 8)));
-                if (f64_gt(change, max_change) == 1) { max_change = change; }
-                store64(x + i * 8, new_x);
-                i = i + 1;
+                c = c + 1;
             }
+            var gs_x = f64_div(sigma, ganita_mat_get(A, r, r));
+            var new_x = f64_clamp(gs_x, load64(ll + r * 8), load64(hh + r * 8));
+            var change = f64_abs(f64_sub(new_x, load64(x + r * 8)));
+            # A finite input can still overflow (a divergent sweep): a NaN change is
+            # kept, so the stopping test below never passes on it.
+            if (f64_gt(change, max_change) == 1 || f64_eq(change, change) == 0) { max_change = change; }
+            store64(x + r * 8, new_x);
+            r = r + 1;
         }
         # ⛔ `max_change` is a change in the SOLUTION, in the caller's units — an
         # impulse in a contact solver — so an absolute 1e-12 declared convergence
@@ -1338,12 +1706,10 @@ public fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
         }
         var pgs_tol = f64_mul(EPSILON_F64, x_mag);
         if (f64_lt(pgs_tol, F64_TINY) == 1) { pgs_tol = F64_TINY; }
-        if (f64_lt(max_change, pgs_tol) == 1) {
-            return 0;
-        }
+        if (f64_lt(max_change, pgs_tol) == 1) { return Ok(0); }
         iter = iter + 1;
     }
-    return 0;
+    return Err(HSB_ERR_NO_CONVERGENCE);
 }
 
 # ================================================================
@@ -1359,7 +1725,7 @@ public fn solve_pgs(A, b, x, n, lo, hi, max_iter) {
 # returns 0 with both singular values exactly 0: NaN in, success and S = 0 out.
 # [[3, NaN], [0, 2]] returned 0 with S = (3, NaN), and [[-Inf, 0], [0, 2]] returned
 # 0 with S = (NaN, NaN). A non-finite entry leaves A with no SVD at all, so
-# svd_compute and svd_truncated refuse it, as svd_golub_kahan has since 2.22.0.
+# svd_compute_checked and svd_truncated refuse it, as svd_golub_kahan has since 2.22.0.
 # [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
 # ⚠ ganita 1.2.12 refuses one itself (-2; cyrius 6.6.16 folds 1.2.13). The check stays:
 # a consumer compiles this bundle against its own pin's ganita, 1.2.11 or older below 6.6.16.
@@ -1381,7 +1747,7 @@ fn _lext_mat_all_finite(A, rows, cols) {
 }
 
 # 1 when every one of v[0..n) is finite, 0 otherwise -- for ganita's singular values,
-# which 1.2.12 can return as +Inf with status 0 (see svd_compute).
+# which 1.2.12 can return as +Inf with status 0 (see svd_compute_checked).
 #must_use
 fn _lext_vec_all_finite(v, n) {
     var i = 0;
@@ -1486,7 +1852,7 @@ fn _lext_sv_past_max(A, m, n, U, Vt, k, buf) {
 }
 
 # 1 when ganita's answer (U m x n, S[0..n), Vt n x n) has a singular value within 2^-40 of
-# the line that its own singular pair proves past it (see svd_compute).
+# the line that its own singular pair proves past it (see svd_compute_checked).
 fn _lext_svd_past_line(A, m, n, U, S, Vt) {
     var w: i64[4];
     for (var i = 0; i < n; i = i + 1) {
@@ -1502,26 +1868,34 @@ fn _lext_svd_past_line(A, m, n, U, S, Vt) {
 # out_U:  stdlib matrix (m x n, caller allocates via ganita_mat_new).
 # out_S:  flat f64 array of length n (caller allocates via alloc(n*8)).
 # out_Vt: stdlib matrix (n x n, caller allocates via ganita_mat_new).
-# Returns: ganita_mat_svd's status vocabulary -- NOT an HsbError and NOT a Result:
-#          0 on success, with ganita's answer or, where ganita gives none (below),
-#          the fallback's; -1 when ganita gives no answer AND the fallback fails
-#          too: svd_golub_kahan's NO_CONVERGENCE, which includes a singular value
-#          above DBL_MAX, or its ALLOC, or when svd_compute's own n-slot scratch
-#          cannot be allocated, or (since 3.3.7) when ganita's answer has a singular
-#          value that its own singular pair proves past the rounding line (below);
-#          -2 for a null A, out_U, out_S or out_Vt, a WIDE A
-#          (m < n), an out_U / out_Vt whose shape is not exactly m x n / n x n, or a
-#          NaN or infinite entry in A. Never -3, whatever the ganita.
-#          Compare it with 0 and nothing else. On -2 nothing is written to out_U,
-#          out_S or out_Vt; on -1 out_S is untouched, but out_U and out_Vt may hold
-#          ganita's or the fallback's partial work.
+# Returns: Ok(0) on success, with ganita's answer or, where ganita gives none (below),
+#            svd_golub_kahan's;
+#          Err(HSB_ERR_INVALID_INPUT) for a null A or out-param, a WIDE A (m < n), an
+#            out_U / out_Vt whose shape is not exactly m x n / n x n, or a NaN or
+#            infinite entry in A, all refused before anything is written;
+#          Err(HSB_ERR_ALLOC) when its n-slot scratch cannot be allocated, or ganita
+#            gives no answer and svd_golub_kahan cannot allocate either;
+#          Err(HSB_ERR_NO_CONVERGENCE) when ganita gives no answer and svd_golub_kahan
+#            does not converge (which includes a singular value above DBL_MAX), or when
+#            ganita's answer has a singular value its own singular pair proves past the
+#            rounding line (since 3.3.7; no fallback is tried, see below).
+#          On any Err out_S is untouched; on ALLOC and NO_CONVERGENCE out_U and out_Vt may
+#          hold ganita's or the fallback's partial work.
+# ⛔ 3.4.0 — RETIRED `svd_compute`, WHICH RETURNED ganita_mat_svd's STATUS VOCABULARY:
+# 0, -1 or -2 as bare integers, bit-identical to HSB_ERR_INVALID_TRANSFORM and
+# HSB_ERR_SINGULAR_MATRIX, and -1 for an allocation failure, a fallback that did not
+# converge and a sigma proven past the line alike. svd_compute_checked returns the hisab
+# codes svd_truncated already used for the same failures (roadmap [3.4.0], D012); its -2
+# conditions are now checked here, so no ganita vocabulary reaches the caller. A caller of
+# svd_compute writes `var t, v = svd_compute_checked(...)` and tests `is_ok(t)`.
 # "ganita gives no answer" is any of: its -1 (through ganita 1.2.11, cyrius <= 6.6.15,
 # either an allocation failure or 60 sweeps without convergence; from 1.2.12 an
 # allocation failure only), its -3 (1.2.12's non-convergence code), or a status of 0
 # with a singular value that is not finite (1.2.12 documents that a sigma_1 within a
 # few ulps of DBL_MAX can come back +Inf). A consumer compiles this bundle against its
-# own pin's ganita, so svd_compute treats both vocabularies alike and passes neither
-# -3 nor a non-finite sigma on: its codes are the same 0 / -1 / -2 under every pin.
+# own pin's ganita, so svd_compute treated both vocabularies alike and passed neither
+# -3 nor a non-finite sigma on: its codes were the same 0 / -1 / -2 under every pin, as
+# svd_compute_checked's Errs are now.
 # ⛔ 3.3.3 — A NON-FINITE ENTRY CAME BACK AS SUCCESS. ganita answers for one (see
 # _lext_mat_all_finite): an all-NaN 2x2 returned 0 with S = (0, 0), [[3, NaN],
 # [0, 2]] returned 0 with S = (3, NaN), and [[+-Inf, 0], [0, 2]] returned 0 with
@@ -1534,8 +1908,7 @@ fn _lext_svd_past_line(A, m, n, U, S, Vt) {
 # FUNCTIONS THAT "CAN ONLY EVER SUCCEED". Neither was true: a 2x3 A returns -2, and
 # -1 / -2 are bit-identical to HSB_ERR_INVALID_TRANSFORM / HSB_ERR_SINGULAR_MATRIX,
 # so a caller comparing against the hisab codes reads a wide matrix as SINGULAR.
-# The signature stays (a Result here is an API change, roadmap [3.4.0]); the
-# contract is now written down, and svd_truncated below maps the codes onto Err.
+# 3.3.3 kept the signature and wrote the contract down; 3.4.0 retired the name (below).
 # [measured: G2a probe on the 3.3.2 bundle, cycc 6.6.12, 2026-10-01]
 # ⭐ 3.3.4 — GANITA'S -1 FALLS BACK TO svd_golub_kahan (src/linalg_precision.cyr). Through
 # 3.3.3 both wrappers refused whatever ganita refused, and ganita refuses ordinary
@@ -1576,28 +1949,35 @@ fn _lext_svd_past_line(A, m, n, U, S, Vt) {
 # answered are refused by both wrappers, none of the 3,966 that fit, and every row answered
 # is byte-identical.
 # [measured: wrapper near-line sweep, seed 3371, + route-to-fallback variant, 3.3.6 vs this tree, 2026-10-31]
-public fn svd_compute(A, out_U, out_S, out_Vt) {
-    if (A == 0 || out_U == 0 || out_S == 0 || out_Vt == 0) { return 0 - 2; }
-    if (_lext_mat_all_finite(A, ganita_mat_rows(A), ganita_mat_cols(A)) == 0) { return 0 - 2; }
+#must_use
+public fn svd_compute_checked(A, out_U, out_S, out_Vt) {
+    if (A == 0 || out_U == 0 || out_S == 0 || out_Vt == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var m = ganita_mat_rows(A);
     var n = ganita_mat_cols(A);
+    if (m <= 0 || n <= 0 || m < n) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (ganita_mat_rows(out_U) != m || ganita_mat_cols(out_U) != n) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (ganita_mat_rows(out_Vt) != n || ganita_mat_cols(out_Vt) != n) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_lext_mat_all_finite(A, m, n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var sv = alloc(n * 8);
-    if (sv == 0) { return 0 - 1; }
+    if (sv == 0) { return Err(HSB_ERR_ALLOC); }
     var rc = ganita_mat_svd(A, out_U, sv, out_Vt);
     if (rc == 0) {
         if (_lext_vec_all_finite(sv, n) == 1) {
             # proven past the line: no finite answer is right, so no fallback (see above)
-            if (_lext_svd_past_line(A, ganita_mat_rows(A), n, out_U, sv, out_Vt) == 1) { return 0 - 1; }
+            if (_lext_svd_past_line(A, m, n, out_U, sv, out_Vt) == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
             _lext_vec_copy_n(out_S, sv, n);
-            return 0;
+            return Ok(0);
         }
     } else {
-        if (rc != 0 - 1 && rc != 0 - 3) { return rc; }
+        # ganita's -2 conditions are all refused above, so its -2 cannot come back; any
+        # code but -1 and -3 is refused rather than fallen back on
+        if (rc != 0 - 1 && rc != 0 - 3) { return Err(HSB_ERR_INVALID_INPUT); }
     }
     # Whatever ganita wrote went to sv, out_U and out_Vt; the fallback rewrites all of
     # out_U and out_Vt, and writes out_S only on success.
     var gt, gv = svd_golub_kahan(A, out_U, out_S, out_Vt);
-    if (is_err_result(gt) == 1) { return 0 - 1; }
-    return 0;
+    if (is_err_result(gt) == 1) { return Err(gv); }
+    return Ok(0);
 }
 
 # Truncated (rank-k) SVD: keep only the top k singular values.
@@ -1614,11 +1994,11 @@ public fn svd_compute(A, out_U, out_S, out_Vt) {
 #          Err(HSB_ERR_ALLOC) if the full-SVD temporaries cannot be allocated, or
 #            the svd_golub_kahan fallback cannot allocate its own;
 #          Err(HSB_ERR_NO_CONVERGENCE) if ganita_mat_svd gives no answer (its -1 or
-#            -3, or a non-finite singular value; see svd_compute) and the fallback
+#            -3, or a non-finite singular value; see svd_compute_checked) and the fallback
 #            does not converge either, which includes a singular value above
 #            DBL_MAX (since 3.3.4; -3 and the non-finite value since 3.3.7), or (since
 #            3.3.7) if ganita's answer has a singular value its own singular pair
-#            proves past the rounding line (see svd_compute); out_S untouched.
+#            proves past the rounding line (see svd_compute_checked); out_S untouched.
 # ⛔ 3.3.3 — THE DECOMPOSITION'S STATUS WAS DISCARDED. `ganita_mat_svd(...)` was a
 # bare statement, so every failure came back Ok(0) with out_S/out_U/out_Vt copied
 # out of temporaries the SVD never wrote: a 2x3 A (ganita's -2) gave Ok(0) and
@@ -1659,14 +2039,14 @@ public fn svd_truncated(A, k, out_U, out_S, out_Vt) {
     # None of ganita's -2 conditions can arise here: A is non-null, finite and not
     # wide, and the temporaries are non-null with exactly the shapes it demands. What
     # remains is its -1 or -3, or a status of 0 with a non-finite singular value
-    # (1.2.12; see svd_compute); svd_golub_kahan then decomposes A into the same
+    # (1.2.12; see svd_compute_checked); svd_golub_kahan then decomposes A into the same
     # temporaries, and its Err is returned as is. out_S is written only below.
     var g_rc = ganita_mat_svd(A, full_u, full_s, full_vt);
     if (g_rc != 0 || _lext_vec_all_finite(full_s, cols) == 0) {
         var gt, gv = svd_golub_kahan(A, full_u, full_s, full_vt);
         if (is_err_result(gt) == 1) { return Err(gv); }
     } else {
-        # ganita's answer proven past the line (see svd_compute): refused, no fallback
+        # ganita's answer proven past the line (see svd_compute_checked): refused, no fallback
         if (_lext_svd_past_line(A, rows, cols, full_u, full_s, full_vt) == 1) {
             return Err(HSB_ERR_NO_CONVERGENCE);
         }
@@ -2125,13 +2505,81 @@ fn _lext_diag_past(d, la) {
     return f64_lt(la, f64_mul(f64_abs(d), 0x3FEFFFFFF8000000));   # 1 - 2^-26
 }
 
-# 1 when some |a_ii| is past |lam| in the sense of `_lext_diag_past`: O(n), and the only cost of
-# the floor on most answers (on a symmetric A every |a_ii| <= rho(A), and on a non-negative one
-# every a_ii <= rho(A), so a right answer never gets past this).
-fn _lext_diag_cand(A, n, lam) {
-    var la = f64_abs(lam);
-    for (var i = 0; i < n; i = i + 1) {
-        if (_lext_diag_past(ganita_mat_get(A, i, i), la) == 1) { return 1; }
+# ⭐ 3.4.0 — the same floor for a component of two vertices p, q: B = [[a, b], [c, d]] (a = a_pp,
+# b = a_pq, c = a_qp, d = a_qq) is a diagonal block of a permutation of A, so its eigenvalues are
+# A's, and rho(A) >= rho(B) >= max(|a + d| / 2, sqrt |ad - bc|): the mean of B's two eigenvalues
+# and the geometric mean of their moduli. When B's pair is complex the second IS its modulus.
+# 1 when |lam| is below either by the margin of `_lext_diag_past`. Each is formed so it cannot
+# exceed its exact value: |a + d| / 2 from halves (exact above 2^-1021), and used only above
+# 2^-1000, where the rounding of a subnormal half is far inside the margin; ad and bc as m * 2^e
+# products (`_lext_xman` / `_lext_xexp`), so neither overflows or flushes, their difference taken
+# at the larger exponent with a bound on every rounding (3 2^-53 (|ad| + |bc|) + 2^-1072) taken
+# off before the square root.
+fn _lext_blk2_past(A, p, q, la) {
+    var a = ganita_mat_get(A, p, p);
+    var b = ganita_mat_get(A, p, q);
+    var c = ganita_mat_get(A, q, p);
+    var d = ganita_mat_get(A, q, q);
+    var mg = 0x3FEFFFFFF8000000;   # 1 - 2^-26
+    var th = f64_abs(f64_add(f64_mul(a, 0x3FE0000000000000), f64_mul(d, 0x3FE0000000000000)));   # |a/2 + d/2|
+    if (f64_ge(th, 0x0170000000000000) == 1) {   # 2^-1000
+        if (f64_lt(la, f64_mul(th, mg)) == 1) { return 1; }
+    }
+    # ad and bc as m * 2^e (a zero factor gives the zero product, exponent ignored)
+    var pm = f64_mul(_lext_xman(a), _lext_xman(d));
+    var pe = _lext_xexp(pm) + _lext_xexp(a) + _lext_xexp(d);
+    pm = _lext_xman(pm);
+    var qm = f64_mul(_lext_xman(b), _lext_xman(c));
+    var qe = _lext_xexp(qm) + _lext_xexp(b) + _lext_xexp(c);
+    qm = _lext_xman(qm);
+    var top = pe;
+    if ((pm & 0x7FFF_FFFF_FFFF_FFFF) == 0 || ((qm & 0x7FFF_FFFF_FFFF_FFFF) != 0 && qe > pe)) { top = qe; }
+    var x = _lext_xld(pm, pe - top);
+    var y = _lext_xld(qm, qe - top);
+    if ((pm & 0x7FFF_FFFF_FFFF_FFFF) == 0) { x = f64_from(0); }
+    if ((qm & 0x7FFF_FFFF_FFFF_FFFF) == 0) { y = f64_from(0); }
+    # 3 2^-53 (|x| + |y|) + 2^-1072
+    var err = f64_add(f64_mul(0x3CB8000000000000, f64_add(f64_abs(x), f64_abs(y))), 4);
+    var lo = f64_sub(f64_abs(f64_sub(x, y)), err);
+    if (f64_gt(lo, 0) == 0) { return 0; }
+    # sqrt(lo 2^top) = sqrt(lo 2^r) 2^h, top = 2h + r, r in {0, 1}
+    var h = top >> 1;
+    if (top < 0) { h = 0 - ((1 - top) >> 1); }
+    var rr = top - 2 * h;
+    if (rr == 1) { lo = f64_mul(lo, F64_TWO); }
+    var sq = f64_sqrt(lo);
+    # |lam| 2^-h, rounded once: a quotient that flushes is far below sq, one that overflows above
+    var las = la;
+    if ((la & 0x7FFF_FFFF_FFFF_FFFF) != 0) { las = _lext_xld(_lext_xman(la), _lext_xexp(la) - h); }
+    return f64_lt(las, f64_mul(sq, mg));
+}
+
+# 1 when A's graph is not strongly connected (some vertex is not reached from vertex 0, or does
+# not reach it), 0 when it is. A breadth-first search each way that stops once every vertex is
+# reached, so a dense row 0 and column 0 settle it in 2n reads. s: 2 n words of scratch.
+fn _lext_reducible(A, n, s) {
+    var seen = s;
+    var qu = s + n * 8;
+    for (var dir = 0; dir < 2; dir = dir + 1) {
+        for (var i = 0; i < n; i = i + 1) { store64(seen + i * 8, 0); }
+        store64(seen, 1);
+        store64(qu, 0);
+        var qh = 0;
+        var qt = 1;
+        while (qh < qt && qt < n) {
+            var v = load64(qu + qh * 8);
+            qh = qh + 1;
+            for (var j = 0; j < n && qt < n; j = j + 1) {
+                var e = 0;
+                if (dir == 0) { e = ganita_mat_get(A, v, j); } else { e = ganita_mat_get(A, j, v); }
+                if ((e & 0x7FFF_FFFF_FFFF_FFFF) != 0 && load64(seen + j * 8) == 0) {
+                    store64(seen + j * 8, 1);
+                    store64(qu + qt * 8, j);
+                    qt = qt + 1;
+                }
+            }
+        }
+        if (qt < n) { return 1; }
     }
     return 0;
 }
@@ -2195,16 +2643,20 @@ fn _lext_scc_floor(A, n, lam, s) {
                         if (load64(low + v * 8) < load64(low + p * 8)) { store64(low + p * 8, load64(low + v * 8)); }
                     }
                     if (load64(low + v * 8) == load64(idx + v * 8)) {
-                        # v roots a component: pop it; it is v alone when v is on top
-                        var single = 0;
-                        if (load64(stk + (sp - 1) * 8) == v) { single = 1; }
+                        # v roots a component: pop it, counting its vertices (w1: the other one
+                        # of a pair)
+                        var csz = 0;
+                        var w1 = v;
                         var w = 0 - 1;
                         while (w != v) {
                             sp = sp - 1;
                             w = load64(stk + sp * 8);
                             store64(onst + w * 8, 0);
+                            if (w != v) { w1 = w; }
+                            csz = csz + 1;
                         }
-                        if (single == 1 && _lext_diag_past(ganita_mat_get(A, v, v), la) == 1) { return 1; }
+                        if (csz == 1 && _lext_diag_past(ganita_mat_get(A, v, v), la) == 1) { return 1; }
+                        if (csz == 2 && _lext_blk2_past(A, v, w1, la) == 1) { return 1; }
                     }
                 }
             }
@@ -2213,15 +2665,287 @@ fn _lext_scc_floor(A, n, lam, s) {
     return 0;
 }
 
-# 1 when lam is provably not A's dominant eigenvalue (the trace floors, then the exact
-# diagonal floor), 0 when it cannot be shown, 2 when the diagonal floor's scratch cannot be
-# allocated.
+# 1 when lam is provably not A's dominant eigenvalue (the trace floors, then the floors of the
+# components of one and two vertices), 0 when it cannot be shown, 2 when the components'
+# scratch cannot be allocated. Those components exist only in a reducible A (or one of n = 2),
+# so Tarjan runs only there (3.4.0: through 3.3.7 it ran when some |a_ii| was past |lam|, a
+# test a pair's floor does not pass through).
 fn _lext_not_dominant(A, n, lam) {
     if (_lext_below_rho(A, n, lam) == 1) { return 1; }
-    if (_lext_diag_cand(A, n, lam) == 0) { return 0; }
+    if (n < 2) { return 0; }
     var s = alloc(6 * n * 8);
     if (s == 0) { return 2; }
+    if (n > 2 && _lext_reducible(A, n, s) == 0) { return 0; }
     return _lext_scc_floor(A, n, lam, s);
+}
+
+# ---- 3.4.0 review: eigen_power's dominance certificate (Gelfand) ----
+# log2 |x| for a finite non-zero double x.
+fn _lext_log2abs(x) {
+    return f64_add(f64_from(_lext_xexp(x)), f64_div(f64_ln(f64_abs(_lext_xman(x))), F64_LN2));
+}
+
+# x 2^e for an exact power of two and any i64 e, as one or more exact multiplies (a result below
+# the normal range is rounded there, once per multiply).
+fn _lext_pow2mul(x, e) {
+    var y = x;
+    var r = e;
+    while (r > 1000) { y = f64_mul(y, (1023 + 1000) << 52); r = r - 1000; }
+    while (r < 0 - 1000) { y = f64_mul(y, (1023 - 1000) << 52); r = r + 1000; }
+    return f64_mul(y, (1023 + r) << 52);
+}
+
+# The inertia certificate for an exactly symmetric A (3.4.0, third review): every eigenvalue of
+# A lies in (-mu - eps, mu + eps) when both mu I - A and mu I + A have Cholesky factors, and
+# lam is then certified because mu + eps < 1.001 |lam|. T holds A row-major (it is rescaled in
+# place), W is n x n scratch. 1 certified, 0 refused, -1 undecided (n so large that the rounding
+# slack could pass 2^-12 |lam|; the caller falls back to Gelfand's squarings).
+# Rigour. In units where |lam| = ls is in [1, 2), mu = ls (1 + 2^-11) rounded. The factored matrix
+# is C = fl(mu -+ a_ii) on the diagonal and -+a_ij off it, so mu I -+ A = C - diag(rho) with
+# |rho_i| <= 2u c_ii (u = 2^-53). A Cholesky factorization of C that runs to completion gives
+# R^T R = C + dC with |dC| <= gamma_(n+1) |R^T| |R| (Higham, Accuracy and Stability, Thm 10.3);
+# since (R^T R)_ii <= c_ii / (1 - gamma) and by Cauchy-Schwarz, |dC_ij| <= gamma / (1 - gamma)
+# sqrt(c_ii c_jj), so ||dC||_2 <= gamma / (1 - gamma) tr(C) (the bound of Rump's isspd). R^T R is
+# positive semidefinite, so the smallest eigenvalue of mu I -+ A is at least
+# -(gamma / (1 - gamma) + 2u) tr(C) >= -2 (n + 2) u tr(C) for (n + 1) u <= 1/4: that is eps, with
+# tr(C) <= (1 + 2^-20) sum_i (mu + |a_ii|) and n^2 2^-1000 more for anything that underflows
+# (every |entry| is at most 4 here, so nothing overflows). It is used only while eps <= 2^-12 ls,
+# which holds to n of about 7e5; then every eigenvalue is within ls (1 + 2^-11 + 2^-12) <
+# 1.001 ls. A factorization that fails refuses the answer: some eigenvalue is then within the
+# factorization's rounding of mu or beyond, about 1.0005 |lam|, so the answer is short of rho(A).
+fn _lext_sym_cert(T, W, n, la) {
+    var mx = f64_from(0);
+    for (var q = 0; q < n * n; q = q + 1) {
+        var aq = f64_abs(load64(T + q * 8));
+        if (f64_gt(aq, mx) == 1) { mx = aq; }
+    }
+    # |a_ij| <= ||A||_2 = rho(A) for a symmetric A: an entry past 2 |lam| refutes it at once
+    if (f64_gt(f64_mul(mx, F64_HALF), la) == 1) { return 0; }
+    var k = 1 - _lext_xexp(la);
+    for (var q1 = 0; q1 < n * n; q1 = q1 + 1) { store64(T + q1 * 8, _lext_pow2mul(load64(T + q1 * 8), k)); }
+    var ls = _lext_pow2mul(la, k);
+    var mu = f64_mul(ls, 0x3FF0020000000000);   # 1 + 2^-11 = 1.00048828125
+    var tr = f64_from(0);
+    for (var i = 0; i < n; i = i + 1) { tr = f64_add(tr, f64_add(mu, f64_abs(load64(T + (i * n + i) * 8)))); }
+    tr = f64_mul(tr, 0x3FF0000100000000);   # 1 + 2^-20 = 1.00000095367431640625
+    var g2 = f64_mul(f64_from(2 * (n + 2)), 0x3CA0000000000000);   # 2^-53
+    var eps = f64_add(f64_mul(g2, tr), f64_mul(f64_from(n * n), 0x0170000000000000));   # 2^-1000
+    if (f64_le(eps, f64_mul(ls, 0x3F30000000000000)) == 0) { return 0 - 1; }   # 2^-12
+    for (var sg = 0; sg < 2; sg = sg + 1) {
+        # W = mu I - A (sg = 0) or mu I + A (sg = 1), lower triangle, factored in place
+        for (var r = 0; r < n; r = r + 1) {
+            for (var c = 0; c <= r; c = c + 1) {
+                var a = load64(T + (r * n + c) * 8);
+                if (sg == 0) { a = f64_neg(a); }
+                if (r == c) { a = f64_add(mu, a); }
+                store64(W + (r * n + c) * 8, a);
+            }
+        }
+        for (var j = 0; j < n; j = j + 1) {
+            var wj = W + j * n * 8;
+            var s = load64(wj + j * 8);
+            for (var k2 = 0; k2 < j; k2 = k2 + 1) {
+                var lj = load64(wj + k2 * 8);
+                s = f64_sub(s, f64_mul(lj, lj));
+            }
+            # written as "not above", so a NaN pivot fails too
+            if (f64_gt(s, 0) == 0) { return 0; }
+            var ljj = f64_sqrt(s);
+            store64(wj + j * 8, ljj);
+            for (var i2 = j + 1; i2 < n; i2 = i2 + 1) {
+                var wi = W + i2 * n * 8;
+                var t = load64(wi + j * 8);
+                for (var k3 = 0; k3 < j; k3 = k3 + 1) {
+                    t = f64_sub(t, f64_mul(load64(wi + k3 * 8), load64(wj + k3 * 8)));
+                }
+                store64(wi + j * 8, f64_div(t, ljj));
+            }
+        }
+    }
+    return 1;
+}
+
+# Gelfand's bound, on every answer of eigen_power's iteration (3.4.0 review: through the first
+# review only where a normality gate fired, which let short answers through). For B = A / |lam|,
+# any positive diagonal D, any submultiplicative norm and any m,
+# rho(A) / |lam| = rho(B) <= ||B^m||^(1/m) = ||D^-1 B^m D||^(1/m).
+# D is |v| (the answer's vector, its largest |entry| 1), each entry kept at or above 2^-60: any
+# positive D gives a valid bound, and this one makes the m = 1 infinity-norm bound the
+# Collatz-Wielandt ratio max_i (|B| |v|)_i / |v_i|, which is 1 to rounding for a non-negative A
+# (or any A whose signs match its Perron vector's): those are certified in the one pass over A
+# that forms B' = D^-1 B D. An exactly symmetric A that pass does not certify goes to
+# `_lext_sym_cert` (two Cholesky factorizations) instead (3.4.0, third review). Otherwise B' is
+# squared (m = 2, 4, ...), renormalised by a power of
+# two each time with the exponent carried as an integer, and after each squaring the bound is the
+# smaller of ||B'^m||_inf and ||B^m||_F = ||D B'^m D^-1||_F (both n^2 from the product just
+# formed). It is 1 as soon as the bound is at most 1.001 (no eigenvalue is larger than
+# 1.001 |lam| in modulus), 0 when 24 squarings leave it above, 2 when the scratch cannot be
+# allocated. A right answer's bound falls to 1 like C^(1/m): for a symmetric A the Frobenius
+# bound is (1 + sum_i>1 (lambda_i / lam)^(2m))^(1/2m), so a few squarings; for a non-normal A,
+# C is the dominant eigenvalue's condition (||x y^T|| for its right and left eigenvectors) and
+# the squarings needed grow like log2(log2 C / 0.00144). An answer short of rho never falls below
+# rho(B). Each squaring is n^3 multiply-adds. lam = 0 (or not finite) is never certified: no
+# finite bound shows rho(A) <= 0.
+fn _lext_gelfand(A, n, lam, v) {
+    var la = f64_abs(lam);
+    if (f64_eq(la, 0) == 1 || f64_lt(la, F64_POS_INF) == 0) { return 0; }
+    var M = alloc(n * n * 8);
+    var T = alloc(n * n * 8);
+    var d = alloc(n * 8);
+    var di = alloc(n * 8);
+    if (M == 0 || T == 0 || d == 0 || di == 0) { return 2; }
+    var mv = f64_from(0);
+    for (var i = 0; i < n; i = i + 1) {
+        var va = f64_abs(load64(v + i * 8));
+        if (f64_gt(va, mv) == 1) { mv = va; }
+    }
+    var dfl = (1023 - 60) << 52;   # 2^-60
+    var usev = 0;
+    if (f64_lt(mv, F64_POS_INF) == 1 && f64_gt(mv, 0) == 1) { usev = 1; }
+    for (var i1 = 0; i1 < n; i1 = i1 + 1) {
+        var dv = F64_ONE;
+        if (usev == 1) { dv = f64_div(f64_abs(load64(v + i1 * 8)), mv); }
+        # written as "not at or above", so a NaN entry takes the floor too
+        if (f64_ge(dv, dfl) == 0) { dv = dfl; }
+        store64(d + i1 * 8, dv);
+        store64(di + i1 * 8, f64_div(F64_ONE, dv));
+    }
+    var thr = 0x3F57A013FACA6C6B;   # ln(1.001)/ln(2) = 0.00144197417390648...
+    # B' into M with both m = 1 bounds in the same pass. With |lam| in [2^-900, 2^900] each factor
+    # d_c / (d_r |lam|) is a normal double; an overflow sends the matrix to the wide form below.
+    # An entry of B' that underflows is below 2^-1022, against a largest row sum of at least
+    # rho(B'), which is 1 for a right answer.
+    var e0 = 0;
+    var wide = 1;
+    var lmin = (1023 - 900) << 52;   # 2^-900
+    var lmax = (1023 + 900) << 52;   # 2^900
+    if (f64_ge(la, lmin) == 1 && f64_le(la, lmax) == 1) {
+        var il = f64_div(F64_ONE, la);
+        var bm = f64_from(0);
+        var rs1 = f64_from(0);
+        var ss1 = f64_from(0);
+        for (var r = 0; r < n; r = r + 1) {
+            var ri = f64_mul(load64(di + r * 8), il);
+            var s1 = f64_from(0);
+            for (var c = 0; c < n; c = c + 1) {
+                var a = ganita_mat_get(A, r, c);
+                store64(T + (r * n + c) * 8, a);
+                var bv = f64_mul(a, f64_mul(load64(d + c * 8), ri));
+                store64(M + (r * n + c) * 8, bv);
+                var ba = f64_abs(bv);
+                if (f64_gt(ba, bm) == 1) { bm = ba; }
+                s1 = f64_add(s1, ba);
+                var b0 = f64_mul(a, il);
+                ss1 = f64_add(ss1, f64_mul(b0, b0));
+            }
+            if (f64_gt(s1, rs1) == 1 || f64_eq(s1, s1) == 0) { rs1 = s1; }
+        }
+        if (f64_lt(rs1, F64_POS_INF) == 1) {
+            if ((bm & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }   # A = 0: rho(A) = 0
+            if (f64_le(_lext_log2abs(rs1), thr) == 1) { return 1; }
+            if (f64_gt(ss1, 0) == 1 && f64_lt(ss1, F64_POS_INF) == 1) {
+                if (f64_le(f64_mul(F64_HALF, _lext_log2abs(ss1)), thr) == 1) { return 1; }
+            }
+            e0 = _lext_xexp(bm);
+            if (e0 >= 0 - 1022 && e0 <= 1022) {
+                var p0 = (1023 - e0) << 52;
+                for (var q0 = 0; q0 < n * n; q0 = q0 + 1) { store64(M + q0 * 8, f64_mul(load64(M + q0 * 8), p0)); }
+            } else {
+                for (var q1 = 0; q1 < n * n; q1 = q1 + 1) {
+                    store64(M + q1 * 8, _lext_pow2mul(load64(M + q1 * 8), 0 - e0));
+                }
+            }
+            wide = 0;
+        }
+    }
+    if (wide == 1) {
+        # far from the normal range: each entry as w 2^e, w = m_a / m_lam * d_c / d_r, then one
+        # rounding into M at the common exponent (the m = 1 bounds are left to the squarings)
+        var emax = 0 - 1000000;
+        for (var r2 = 0; r2 < n; r2 = r2 + 1) {
+            for (var c2 = 0; c2 < n; c2 = c2 + 1) {
+                var aw = ganita_mat_get(A, r2, c2);
+                if ((aw & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    var dd2 = f64_mul(load64(d + c2 * 8), load64(di + r2 * 8));
+                    var w2 = f64_mul(f64_div(_lext_xman(aw), _lext_xman(la)), dd2);
+                    var ew = _lext_xexp(w2) + _lext_xexp(aw) - _lext_xexp(la);
+                    if (ew > emax) { emax = ew; }
+                }
+            }
+        }
+        if (emax == 0 - 1000000) { return 1; }   # A = 0
+        for (var r3 = 0; r3 < n; r3 = r3 + 1) {
+            for (var c3 = 0; c3 < n; c3 = c3 + 1) {
+                var a3 = ganita_mat_get(A, r3, c3);
+                store64(T + (r3 * n + c3) * 8, a3);
+                var w3 = f64_from(0);
+                if ((a3 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    var dd3 = f64_mul(load64(d + c3 * 8), load64(di + r3 * 8));
+                    w3 = f64_mul(f64_div(_lext_xman(a3), _lext_xman(la)), dd3);
+                    w3 = _lext_xld(_lext_xman(w3), _lext_xexp(w3) + _lext_xexp(a3) - _lext_xexp(la) - emax);
+                }
+                store64(M + (r3 * n + c3) * 8, w3);
+            }
+        }
+        e0 = emax;
+    }
+    # An exactly symmetric A (T holds it, from the pass above) is certified by its inertia: two
+    # Cholesky factorizations, n^3 / 3 multiply-adds in all, where the squarings cost n^3 each.
+    var sym = 1;
+    for (var r6 = 0; r6 < n && sym == 1; r6 = r6 + 1) {
+        for (var c6 = r6 + 1; c6 < n; c6 = c6 + 1) {
+            if (load64(T + (r6 * n + c6) * 8) != load64(T + (c6 * n + r6) * 8)) { sym = 0; }
+        }
+    }
+    if (sym == 1) {
+        # -1 (undecided) is decided before M is touched, and T is the squarings' scratch
+        var scr = _lext_sym_cert(T, M, n, la);
+        if (scr >= 0) { return scr; }
+    }
+    var e_int = e0;
+    var m = 1;
+    for (var k = 1; k <= 24; k = k + 1) {
+        # T = M M; the largest row sum of |T|, and the sum of squares of D T D^-1
+        var rs = f64_from(0);
+        var ss = f64_from(0);
+        for (var r5 = 0; r5 < n; r5 = r5 + 1) {
+            var s5 = f64_from(0);
+            var mr = M + r5 * n * 8;
+            var dr = load64(d + r5 * 8);
+            for (var c5 = 0; c5 < n; c5 = c5 + 1) {
+                var sum = f64_from(0);
+                for (var l = 0; l < n; l = l + 1) {
+                    sum = f64_add(sum, f64_mul(load64(mr + l * 8), load64(M + (l * n + c5) * 8)));
+                }
+                store64(T + (r5 * n + c5) * 8, sum);
+                s5 = f64_add(s5, f64_abs(sum));
+                var u5 = f64_mul(sum, f64_mul(dr, load64(di + c5 * 8)));
+                ss = f64_add(ss, f64_mul(u5, u5));
+            }
+            if (f64_gt(s5, rs) == 1) { rs = s5; }
+        }
+        if ((rs & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }   # B'^m = 0 here: rho(B) = 0
+        m = 2 * m;
+        # log2 of the bound: (log2 min(||T||_inf, ||D T D^-1||_F) + 2 e_int) / m
+        var ln = _lext_log2abs(rs);
+        if (f64_gt(ss, 0) == 1 && f64_lt(ss, F64_POS_INF) == 1) {
+            var lf = f64_mul(F64_HALF, _lext_log2abs(ss));
+            if (f64_lt(lf, ln) == 1) { ln = lf; }
+        }
+        var lb = f64_div(f64_add(ln, f64_from(2 * e_int)), f64_from(m));
+        if (f64_le(lb, thr) == 1) { return 1; }
+        var ex = _lext_xexp(rs);
+        if (ex >= 0 - 1022 && ex <= 1022) {
+            var p6 = (1023 - ex) << 52;
+            for (var q6 = 0; q6 < n * n; q6 = q6 + 1) { store64(M + q6 * 8, f64_mul(load64(T + q6 * 8), p6)); }
+        } else {
+            for (var q7 = 0; q7 < n * n; q7 = q7 + 1) {
+                store64(M + q7 * 8, _lext_pow2mul(load64(T + q7 * 8), 0 - ex));
+            }
+        }
+        e_int = 2 * e_int + ex;
+    }
+    return 0;
 }
 
 # eigen_power's growth test (3.3.5): flag the components of iterate k (v) that grew more than
@@ -2244,7 +2968,7 @@ fn _lext_grows(A, n, u, vp, v, sc_e, w, fl) {
     if (any == 0) { return 0; }
     # one more pass: w = A u', u' = v (times 2^-sc_e after a switch)
     var up = v;
-    if (sc_e > 0) {
+    if (sc_e != 0) {
         var dn = (1023 - sc_e) << 52;
         for (var i2 = 0; i2 < n; i2 = i2 + 1) { store64(u + i2 * 8, f64_mul(load64(v + i2 * 8), dn)); }
         up = u;
@@ -2270,6 +2994,221 @@ fn _lext_grows(A, n, u, vp, v, sc_e, w, fl) {
     return 0;
 }
 
+# ---- 3.4.0: eigen_power's exact spectrum ----
+# When every strongly connected component of A's graph is a single vertex, A is a permutation of
+# a triangular matrix and its eigenvalues are exactly its diagonal entries. Then the dominant
+# eigenvalue needs no iteration, and an iteration on a non-normal A of this kind could stop above
+# rho(A) (see eigen_power).
+
+# Tarjan's strongly connected components, the traversal of `_lext_scc_floor`: 1 when every
+# component is a single vertex, with ord[0..n) the vertices in the order Tarjan completes them,
+# every vertex after all the vertices it reaches (an edge i -> j for a_ij != 0, i != j); 0 at the
+# first component that is not. s: 6 n words of scratch.
+fn _lext_scc_order(A, n, s, ord) {
+    var idx = s;
+    var low = s + n * 8;
+    var onst = s + 2 * n * 8;
+    var stk = s + 3 * n * 8;
+    var cs = s + 4 * n * 8;
+    var cur = s + 5 * n * 8;
+    for (var i = 0; i < n; i = i + 1) {
+        store64(idx + i * 8, 0 - 1);
+        store64(onst + i * 8, 0);
+    }
+    var cnt = 0;
+    var sp = 0;
+    var no = 0;
+    for (var r = 0; r < n; r = r + 1) {
+        if (load64(idx + r * 8) < 0) {
+            store64(idx + r * 8, cnt);
+            store64(low + r * 8, cnt);
+            cnt = cnt + 1;
+            store64(stk + sp * 8, r);
+            sp = sp + 1;
+            store64(onst + r * 8, 1);
+            store64(cur + r * 8, 0);
+            store64(cs, r);
+            var csp = 1;
+            while (csp > 0) {
+                var v = load64(cs + (csp - 1) * 8);
+                var j = load64(cur + v * 8);
+                if (j < n) {
+                    store64(cur + v * 8, j + 1);
+                    if ((ganita_mat_get(A, v, j) & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                        if (load64(idx + j * 8) < 0) {
+                            store64(idx + j * 8, cnt);
+                            store64(low + j * 8, cnt);
+                            cnt = cnt + 1;
+                            store64(stk + sp * 8, j);
+                            sp = sp + 1;
+                            store64(onst + j * 8, 1);
+                            store64(cur + j * 8, 0);
+                            store64(cs + csp * 8, j);
+                            csp = csp + 1;
+                        } else {
+                            if (load64(onst + j * 8) == 1 && load64(idx + j * 8) < load64(low + v * 8)) {
+                                store64(low + v * 8, load64(idx + j * 8));
+                            }
+                        }
+                    }
+                } else {
+                    csp = csp - 1;
+                    if (csp > 0) {
+                        var p = load64(cs + (csp - 1) * 8);
+                        if (load64(low + v * 8) < load64(low + p * 8)) { store64(low + p * 8, load64(low + v * 8)); }
+                    }
+                    if (load64(low + v * 8) == load64(idx + v * 8)) {
+                        # v roots a component: a single vertex only when v is on top of the stack
+                        if (load64(stk + (sp - 1) * 8) != v) { return 0; }
+                        sp = sp - 1;
+                        store64(onst + v * 8, 0);
+                        store64(ord + no * 8, v);
+                        no = no + 1;
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+# eigen_power's answer when A's spectrum is its diagonal. Returns
+#   0  answered: out_val = the dominant a_kk, out_vec its eigenvector (largest component +1);
+#   1  not this case (a component of two or more vertices, or a NaN or infinite entry), nothing
+#      written;
+#   HSB_ERR_NO_CONVERGENCE when the dominant |a_kk| is shared by entries of both signs (no real
+#      dominant eigenvalue), HSB_ERR_ALLOC when the scratch cannot be allocated; nothing written.
+# The eigenvector solves (A - lambda I) v = 0 by substitution in Tarjan's completion order, so
+# every vertex is solved after the ones it reaches: v_k = 1, and every other
+# v_i = sum_j a_ij v_j / (lambda - a_ii). A vertex that does not reach k gets 0 (its sum is 0).
+# ⭐ 3.4.0 review — k is the LAST vertex in completion order with a_kk = lambda, so a REPEATED
+# dominant value (defective, non-defective, or 0 in a nilpotent A) is answered too: a vertex
+# that reaches k completes after it, so its a_ii is not lambda and the division is defined;
+# every other lambda-vertex gets 0. diag(1, 1, 1 - 2^-30), [[2, 1], [0, 2]] and the zero 2 x 2
+# were NO_CONVERGENCE (the iteration's) and now come back exactly: e_1 (the last of the
+# repeated 1s), e_0, e_1. Every component is carried as m * 2^e (`_lext_power_wide`'s
+# representation), so a chain of large couplings cannot overflow it or flush it, and the
+# largest component is divided out last.
+fn _lext_power_exact(A, n, out_val, out_vec) {
+    # A sink, a row with nothing off the diagonal, exists whenever every component is a single
+    # vertex. A dense row leaves this scan at its first off-diagonal entry, so a matrix with no
+    # sink costs O(n) reads here.
+    var sink = 0;
+    for (var i = 0; i < n && sink == 0; i = i + 1) {
+        var ho = 0;
+        for (var j = 0; j < n && ho == 0; j = j + 1) {
+            if (j != i && (ganita_mat_get(A, i, j) & 0x7FFF_FFFF_FFFF_FFFF) != 0) { ho = 1; }
+        }
+        if (ho == 0) { sink = 1; }
+    }
+    if (sink == 0) { return 1; }
+    if (_lext_mat_all_finite(A, n, n) == 0) { return 1; }
+    var s = alloc(6 * n * 8);
+    var ord = alloc(n * 8);
+    var vm = alloc(n * 8);
+    var ve = alloc(n * 8);
+    if (s == 0 || ord == 0 || vm == 0 || ve == 0) { return HSB_ERR_ALLOC; }
+    if (_lext_scc_order(A, n, s, ord) == 0) { return 1; }
+
+    # The dominant modulus; a tie of opposite signs has no real dominant eigenvalue.
+    var dmax = f64_from(0);
+    for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+        var da = f64_abs(ganita_mat_get(A, i2, i2));
+        if (f64_gt(da, dmax) == 1) { dmax = da; }
+    }
+    var lam = 0 - 1;
+    var k = 0 - 1;
+    for (var t3 = 0; t3 < n; t3 = t3 + 1) {
+        var r3 = load64(ord + t3 * 8);
+        var d3 = ganita_mat_get(A, r3, r3);
+        if (f64_eq(f64_abs(d3), dmax) == 1) {
+            if (k >= 0 && f64_eq(d3, lam) == 0) { return HSB_ERR_NO_CONVERGENCE; }
+            lam = d3;
+            k = r3;   # the last in completion order
+        }
+    }
+
+    for (var i4 = 0; i4 < n; i4 = i4 + 1) {
+        store64(vm + i4 * 8, 0);
+        store64(ve + i4 * 8, 0);
+    }
+    # lambda - a_ii without overflow: halved when |lambda| >= 2^1022 (exact, since then
+    # lambda is normal and an a_ii that rounds is below every rounding of the difference)
+    var big_l = 0;
+    if (f64_ge(dmax, 0x7FD0000000000000) == 1) { big_l = 1; }   # 2^1022
+    for (var t = 0; t < n; t = t + 1) {
+        var r = load64(ord + t * 8);
+        if (r == k) {
+            store64(vm + r * 8, 0x3FE0000000000000);   # 1 = 0.5 * 2^1
+            store64(ve + r * 8, 1);
+        } else {
+            var top = 0;
+            var have = 0;
+            for (var c = 0; c < n; c = c + 1) {
+                var a = ganita_mat_get(A, r, c);
+                if (c != r && (a & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (load64(vm + c * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    var te = _lext_xexp(a) + load64(ve + c * 8);
+                    if (have == 0 || te > top) { top = te; }
+                    have = 1;
+                }
+            }
+            if (have == 1) {
+                var acc = f64_from(0);
+                for (var c2 = 0; c2 < n; c2 = c2 + 1) {
+                    var a2 = ganita_mat_get(A, r, c2);
+                    var m2 = load64(vm + c2 * 8);
+                    if (c2 != r && (a2 & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (m2 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                        var tm = f64_mul(_lext_xman(a2), m2);
+                        var te2 = _lext_xexp(tm) + _lext_xexp(a2) + load64(ve + c2 * 8) - top;
+                        acc = f64_add(acc, _lext_xld(_lext_xman(tm), te2));
+                    }
+                }
+                if ((acc & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    var arr = ganita_mat_get(A, r, r);
+                    var dd = 0;
+                    var de = 0;
+                    if (big_l == 1) {
+                        dd = f64_sub(f64_mul(lam, 0x3FE0000000000000), f64_mul(arr, 0x3FE0000000000000));   # halves
+                        de = 1;
+                    } else {
+                        dd = f64_sub(lam, arr);
+                    }
+                    var q = f64_div(acc, _lext_xman(dd));
+                    store64(vm + r * 8, _lext_xman(q));
+                    store64(ve + r * 8, _lext_xexp(q) + top - _lext_xexp(dd) - de);
+                }
+            }
+        }
+    }
+    # Divide out the largest component (the first, on a tie), compared by exponent, then mantissa.
+    var mi = 0 - 1;
+    for (var i5 = 0; i5 < n; i5 = i5 + 1) {
+        var m5 = load64(vm + i5 * 8);
+        if ((m5 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            if (mi < 0) {
+                mi = i5;
+            } else {
+                var e5 = load64(ve + i5 * 8);
+                var eb = load64(ve + mi * 8);
+                if (e5 > eb || (e5 == eb && f64_gt(f64_abs(m5), f64_abs(load64(vm + mi * 8))) == 1)) { mi = i5; }
+            }
+        }
+    }
+    var mm = load64(vm + mi * 8);
+    var me = load64(ve + mi * 8);
+    for (var i6 = 0; i6 < n; i6 = i6 + 1) {
+        var m6 = load64(vm + i6 * 8);
+        if ((m6 & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+            store64(out_vec + i6 * 8, f64_from(0));
+        } else {
+            var q6 = f64_div(m6, mm);
+            store64(out_vec + i6 * 8, _lext_xld(_lext_xman(q6), _lext_xexp(q6) + load64(ve + i6 * 8) - me));
+        }
+    }
+    store64(out_val, lam);
+    return 0;
+}
+
 # Power iteration for the dominant eigenvalue.
 # A:        stdlib matrix (n x n -- SHAPE ENFORCED, see below).
 # n:        matrix dimension.
@@ -2277,16 +3216,30 @@ fn _lext_grows(A, n, u, vp, v, sc_e, w, fl) {
 # out_val:  pointer to store eigenvalue (f64, allocate 8 bytes).
 # out_vec:  flat f64 array of length n (caller allocates, receives eigenvector).
 # Returns:  Ok(0) on success, HSB_ERR_NO_CONVERGENCE if max_iter exceeded,
-#           HSB_ERR_INVALID_INPUT on a null handle or a shape that does not
-#           match n, HSB_ERR_ALLOC if the working vectors (or, since 3.3.7, the
-#           diagonal floor's scratch) cannot be allocated.
+#           HSB_ERR_INVALID_INPUT on a null handle, a shape that does not
+#           match n, or (since 3.4.0) max_iter <= 0, HSB_ERR_ALLOC if the working vectors (or, since 3.3.7, the
+#           diagonal floor's scratch, or since 3.4.0 the exact path's) cannot be allocated.
+#           ⭐ A SPECTRUM THAT IS THE DIAGONAL (3.4.0). When every strongly connected
+#           component of A's graph is one vertex (every triangular or permuted-triangular
+#           A), the answer is read off the diagonal without iterating: a dominant a_kk
+#           unique in modulus comes back exactly, with the eigenvector solved by
+#           substitution (carried as m * 2^e, so no chain of couplings overflows it); a
+#           modulus shared by entries of both signs is NO_CONVERGENCE at once; one shared by
+#           equal entries (a repeated eigenvalue, defective or not, 0 in a nilpotent A) is
+#           answered exactly too, with the eigenvector of the last such vertex in Tarjan's
+#           completion order. max_iter must be positive (INVALID_INPUT otherwise, on every
+#           path) but does not bound the exact path.
+#           ⚠ BELOW 2^-511 (3.4.0). A matrix whose largest |a_ij| is under 2^-511 is iterated
+#           as A 2^s (exact), and lambda rounded once on the way back, so a dominant |lambda|
+#           down to the subnormal range is answered (3.3.7 refused below about 2.47e-312).
 #           Success means BOTH the eigenvalue estimate and the eigenvector (scaled
 #           so its largest component is exactly 1) stopped moving, to 1e-12
 #           relative; the eigenvector is compared up to sign, so one whose two
 #           largest components tie with opposite signs converges as well. A NaN or
 #           infinite entry in A is NO_CONVERGENCE, as are a dominant eigenvalue tied
-#           in magnitude with another (+1 and -1), a defective one ([[2,1],[0,2]]),
-#           and one whose magnitude is past DBL_MAX. Entries up to DBL_MAX do not
+#           in magnitude with another (+1 and -1), a defective one the iteration meets
+#           (one not read off a diagonal, which [[2,1],[0,2]] now is), and one whose
+#           magnitude is past DBL_MAX. Entries up to DBL_MAX do not
 #           overflow the iteration itself (see the scaled iterate in the loop).
 #           ⚠ COMPONENTS THE ARITHMETIC CAN LOSE (3.3.4). When a converged iterate has
 #           components below DBL_MIN, or below the rounding grid of A v in A's units,
@@ -2299,10 +3252,21 @@ fn _lext_grows(A, n, u, vp, v, sc_e, w, fl) {
 #           ⚠ THE SPECTRAL-RADIUS FLOOR (3.3.6). An answer whose modulus is provably below
 #           |tr A| / n or sqrt(|tr A^2| / n), both at most rho(A), or (since 3.3.7) below
 #           |a_ii| for a diagonal entry that is a strongly connected component of A on its
-#           own (an exact eigenvalue: every diagonal entry of a triangular A), is not the
-#           dominant eigenvalue: the wide iteration is run (if it has not been) and its answer
-#           taken only if larger and clear of the floor; otherwise NO_CONVERGENCE (see the
-#           loop).
+#           own (an exact eigenvalue), or (since 3.4.0) below max(|a + d| / 2, sqrt |ad - bc|)
+#           for a component of two vertices (its eigenvalues are A's; the second is a complex
+#           pair's modulus), is not the dominant eigenvalue: the wide iteration is run (if it
+#           has not been) and its answer taken only if larger and clear of the floor; otherwise
+#           NO_CONVERGENCE (see the loop). A complex dominant pair has no real dominant
+#           eigenvalue, so NO_CONVERGENCE is its answer.
+#           ⭐ EVERY ANSWER OF THE ITERATION IS CERTIFIED (3.4.0): it is returned only when a
+#           Gelfand bound shows no eigenvalue larger than 1.001 |lambda| in modulus
+#           (`_lext_gelfand`), otherwise NO_CONVERGENCE. That catches an answer short of
+#           rho(A) by more than 0.1% whatever the cause, including a dominant LEFT eigenvector
+#           orthogonal to the fixed seed, which no number of passes reaches. It does not see
+#           an answer above rho(A). Where the first pass over A does not certify the answer, an
+#           exactly symmetric A costs two Cholesky factorizations (n^3 / 3 multiply-adds in
+#           all), and any other A n^3 per squaring: at n = 100 a strongly non-normal A costs
+#           about 6.3 times the uncertified run (see the loop for the measured costs).
 #           ⚠ GROWTH BELOW tol (3.3.5). A pass that meets both tests is not taken at
 #           once if some component grew more than twofold since the pass before: one more
 #           pass is run (one matvec, not counted against max_iter), and if that component
@@ -2341,6 +3305,18 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
     # eigenvalue of a matrix the caller did not pass. Neither is a shape this
     # routine can legitimately answer for, so both are rejected.
     if (ganita_mat_rows(A) != n || ganita_mat_cols(A) != n) { return Err(HSB_ERR_INVALID_INPUT); }
+    # 3.4.0 — a budget of no passes is refused on every path, the exact one included (through
+    # 3.3.7 the loop ran zero times and answered NO_CONVERGENCE), as lyapunov_max refuses its own.
+    if (max_iter <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+
+    # ⭐ 3.4.0 — A SPECTRUM THAT IS THE DIAGONAL IS ANSWERED EXACTLY (`_lext_power_exact`).
+    var ex_buf: i64[1];
+    var ex_rc = _lext_power_exact(A, n, &ex_buf, out_vec);
+    if (ex_rc == 0) {
+        store64(out_val, load64(&ex_buf));
+        return Ok(0);
+    }
+    if (ex_rc < 0) { return Err(ex_rc); }
 
     # ⛔ 3.3.3 — THE SEED WAS e_0, AND e_0 IS AN EIGENVECTOR OF EVERY MATRIX WHOSE
     # FIRST COLUMN IS A MULTIPLE OF e_0 -- every diagonal and every upper-triangular
@@ -2405,7 +3381,7 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
     var iter = 0;
     while (iter < max_iter) {
         if (sc_e == 0) { u = v; }
-        if (sc_e > 0) {
+        if (sc_e != 0) {
             var sc_dn = (1023 - sc_e) << 52;   # 2^-sc_e
             i = 0;
             while (i < n) {
@@ -2494,6 +3470,35 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
                 max_i = i;
             }
             i = i + 1;
+        }
+
+        # ⛔ 3.4.0 — A DOMINANT |lambda| BELOW ABOUT 2.47e-312 WAS REFUSED. The relative test below,
+        # |new - old| < tol |new|, needs tol |new| above zero, and tol |new| < 2^-1075 rounds to 0:
+        # [[x]] for x = 0x00000000000ABCDE (3.5e-318) at max_iter 1000, or 0x00000000ABCDEF12 at
+        # 100,000, gave NO_CONVERGENCE, and the matvec itself rounds on the subnormal grid long
+        # before that. So when the first pass shows |A v| below n 2^-511, which A's largest |a_ij|,
+        # M, must then be too (|v_j| <= 1), M is read, and if it is below 2^-511 the iteration
+        # switches to u = v 2^s (sc_e = -s, M 2^s in [1, 2), s at most 1023) and runs the pass
+        # again. Scaling up is exact, so where the unscaled iteration stays normal the scaled one
+        # IS it, bit for bit, and the eigenvalue max_val 2^-s is rounded once at the end.
+        # [measured: LA probe p1, 3.3.7 base and this tree, cycc 6.7.9, 2026-10-31]
+        var up_lim = f64_mul(f64_from(n), 0x2000000000000000);   # n 2^-511
+        if (iter == 0 && sc_e == 0 && f64_lt(f64_abs(max_val), up_lim) == 1) {
+            var am = f64_from(0);
+            for (var ai = 0; ai < n; ai = ai + 1) {
+                for (var aj = 0; aj < n; aj = aj + 1) {
+                    var aa = f64_abs(ganita_mat_get(A, ai, aj));
+                    if (f64_gt(aa, am) == 1) { am = aa; }
+                }
+            }
+            if (f64_gt(am, 0) == 1 && f64_lt(am, 0x2000000000000000) == 1) {   # 2^-511
+                var up = 1 - _lext_xexp(am);
+                if (up > 1023) { up = 1023; }
+                u = alloc(n * 8);
+                if (u == 0) { return Err(HSB_ERR_ALLOC); }
+                sc_e = 0 - up;
+                continue;
+            }
         }
 
         # The switch (see above): 2^-sc_e with 2^sc_e > 2n, and this pass run again. An
@@ -2663,6 +3668,17 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
                 lam = f64_mul(new_eigenvalue, (1023 + sc_e) << 52);   # times 2^sc_e
                 if (f64_lt(f64_abs(lam), F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
             }
+            # the scaled-up frame (3.4.0): one rounding, into the subnormal range too
+            if (sc_e < 0) { lam = _lext_xld(_lext_xman(new_eigenvalue), _lext_xexp(new_eigenvalue) + sc_e); }
+            # (a) and (b) read |a_ij| / |lambda| in the frame the matvec ran in: after a switch up
+            # (sc_e < 0) lambda can be subnormal in the caller's units, and the ratio is formed from
+            # a_ij 2^-sc_e and max_val there; otherwise from a_ij and lam, as through 3.3.7.
+            var lam_c = lam;
+            var a_up = F64_ONE;
+            if (sc_e < 0) {
+                lam_c = new_eigenvalue;
+                a_up = (1023 - sc_e) << 52;
+            }
             # ⛔ 3.3.4 — A COMPONENT BELOW DBL_MIN CAN CARRY THE DOMINANT EIGENVECTOR AWAY.
             # On [[a, b], [0, d]] with |d| > |a| and |b| / |d - a| above about 2^1074, the
             # dominant eigenvector, scaled so its largest component is 1, is (1, (d - a) / b),
@@ -2782,7 +3798,8 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
                         var low_j = 0;
                         while (low_j < n) {
                             if (f64_lt(f64_abs(load64(v + low_j * 8)), F64_TINY) == 1) {
-                                low_s = f64_add(low_s, f64_div(f64_abs(ganita_mat_get(A, i, low_j)), f64_abs(lam)));
+                                var low_a = f64_abs(f64_mul(ganita_mat_get(A, i, low_j), a_up));
+                                low_s = f64_add(low_s, f64_div(low_a, f64_abs(lam_c)));
                             }
                             low_j = low_j + 1;
                         }
@@ -2807,7 +3824,8 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
                         var g2_j = 0;
                         while (g2_j < n) {
                             if (f64_lt(f64_abs(load64(v + g2_j * 8)), g2_lim) == 1) {
-                                g2_s = f64_add(g2_s, f64_div(f64_abs(ganita_mat_get(A, i, g2_j)), f64_abs(lam)));
+                                var g2_a = f64_abs(f64_mul(ganita_mat_get(A, i, g2_j), a_up));
+                                g2_s = f64_add(g2_s, f64_div(g2_a, f64_abs(lam_c)));
                             }
                             g2_j = g2_j + 1;
                         }
@@ -2856,9 +3874,12 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
             # those) and 8 with a complex dominant pair. On 10,000 generic matrices (dense,
             # sparse to 300 binades, non-negative, symmetric; n = 2..9) one answer, wrong by the
             # same proof, became NO_CONVERGENCE and every other row is byte-identical. An
-            # independent SCC analysis agrees with the refusals row for row. The cost is the
-            # O(n) diagonal scan of `_lext_diag_cand` per floor test; Tarjan's O(n^2) reads ran
-            # on 184 of the 10,000 and on none of the three bench fixtures.
+            # independent SCC analysis agrees with the refusals row for row. The cost was the
+            # O(n) diagonal scan of a `_lext_diag_cand` per floor test; Tarjan's O(n^2) reads ran
+            # on 184 of the 10,000 and on none of the three bench fixtures. (3.4.0: the gate is
+            # `_lext_reducible`, O(n) for a dense A, since a pair's floor needs no diagonal
+            # entry past the answer; and a matrix whose components are all single vertices no
+            # longer reaches this point at all: `_lext_power_exact` answers it.)
             # [measured: families, seeds 7337/7338/9001, 3.3.6 vs this tree + Fraction oracle, SCC check, 2026-10-31]
             # ⚠ THE |tr A^4| / n FLOOR THE ROADMAP PROPOSED WAS EVALUATED AND NOT TAKEN. It needs
             # A^2, n^3 multiply-adds per answer: on the bench's 12x12 (18 passes of 144) that is
@@ -2867,6 +3888,20 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
             # / n catches 3. The irreducible part of the class (no singleton component) is left to
             # it, and to the roadmap.
             # [measured: same families, exact Fraction traces; pass counts, counting build, 2026-10-31; cycc 6.6.20]
+            # ⚠ 3.4.0 — THE IRREDUCIBLE CLASS, MEASURED (the first 3.4.0 tree took no acceptance
+            # test for it; the review's certificate below does). On 3,000
+            # irreducible 3 x 3 / 4 x 4 (triangular cores with couplings up to 1e20 lambda_1, closed
+            # into one component by an entry of 1e-40 to 1e-22; oracle: the characteristic
+            # polynomial in Fractions, roots to 70 digits), 2,332 answers are right, 657
+            # NO_CONVERGENCE and 11 wrong: each the second real eigenvalue, |lambda_2 / lambda_1|
+            # 0.85 to 0.994, the dominant direction growing 1.006 to 1.18-fold a pass, under the
+            # growth test's twofold. |tr A^3| / n and |tr A^4| / n floors catch none of the 11; the
+            # same iteration on A^T (a second run) catches 1 and refuses 3 right answers; the answer's
+            # vector perturbed by 2^-20 and run on catches all 11 in 8 passes but refuses 98% of the
+            # right answers, and 3 of 11 in 64 passes refusing 55%. A growth threshold of 1.1 for 2
+            # repairs 3 of the 11 and moved nothing else in those 3,000 or in 700 control matrices,
+            # but it was not run on the 3.3.5 sweeps the twofold constant was chosen on.
+            # [measured: LA-work/r4 drive.py families R (seeds 1-3), G, C + probe, this tree, cycc 6.7.9, 2026-10-31]
             var res_lam = lam;
             var res_vec = v;
             var below = 0;
@@ -2889,6 +3924,64 @@ public fn eigen_power(A, n, max_iter, out_val, out_vec) {
             # one it could not check (its scratch refused) is not returned either
             if (below == 2) { return Err(HSB_ERR_ALLOC); }
             if (below == 1) { return Err(HSB_ERR_NO_CONVERGENCE); }
+            # ⭐ 3.4.0 review — THE DOMINANCE CERTIFICATE (row 4). The answer must pass Gelfand's
+            # bound (`_lext_gelfand`): rho(A) <= 1.001 |lambda|, or it is not returned.
+            # ⛔ SECOND REVIEW (R2A SF1, SF4) — ON EVERY ANSWER, NOT BEHIND A GATE. The first review
+            # asked for the bound only when ||A||_F^2 > n lambda^2 and said that gate fired on
+            # "a non-normal A, the only kind on which a dominant direction can sit below tol, or
+            # on an answer short of rho". Both halves were false: a dominant LEFT eigenvector
+            # orthogonal to the fixed seed hides the dominant direction on any A, and a short
+            # answer passes the gate whenever ||A||_F^2 <= n lambda^2. On 240 such matrices
+            # (n = 3..8, lambda_2 / lambda_1 = 0.9 to 0.999, half symmetric) integ-snap9 returned
+            # 139 short answers (116 of the 120 symmetric ones, which the gate never asked); all
+            # 139 are NO_CONVERGENCE now and the 9 right answers stay. R2A's 12 seed-orthogonal
+            # non-normal 4 x 4: Ok(0.99) for rho = 1 in 6, now 0. The row-4 family (drive.py R,
+            # seeds 1-3 x 1,000): 10 wrong answers of the first 3.4.0 tree NO_CONVERGENCE and the
+            # 2,351 right ones unchanged; 2,100 ordinary matrices (Gaussian, non-negative,
+            # Hessenberg, symmetric, companion, tridiagonal, S J S^-1, graded, sparse; n = 2..20):
+            # every answer and error identical to integ-snap9, no right answer refused.
+            # COST, against the same tree without the certificate (same boot, interleaved, best of
+            # 5 x 100 calls, median of 3): one pass over A where the first bound certifies (a
+            # non-negative A, or signs matching its Perron vector): eigen_power_3x3 +6.0%,
+            # eigen_power_12x12 +11.5%, 2x2_wide +10.5%, tiny2 +14.7%, wide3 +1.9%; and squarings
+            # (n^3 each) where it does not: R2A's non-normal fixtures (dominant 2 on a triangular
+            # 3 triu(randn) + 0.01 tril(randn)) +9% to +47% at n = 3, +31% to +68% at n = 6,
+            # +35% to +47% at n = 12, +20% to +26% at n = 20. integ-snap9's gated version is 8% to
+            # 56% slower than this one on 10 of the 11 answered (its squarings were n max|B^m|);
+            # this one is 39% slower on the eleventh, where that gate did not fire. At n = 30 /
+            # 60 / 100 the squarings cost a symmetric A +119% / +191% / +412% and a
+            # triangular-dominant one +143% / +252% / +536%, where a non-negative one costs +7% to
+            # +11%.
+            # ⭐ THIRD REVIEW — A SYMMETRIC A IS CERTIFIED BY ITS INERTIA (`_lext_sym_cert`): two
+            # Cholesky factorizations, of mu I - A and mu I + A with mu = |lambda| (1 + 2^-11), with
+            # a rigorous rounding slack, in place of the squarings. Against the same tree without a
+            # certificate: n = 30 / 60 / 100 symmetric (dominant entry boosted) +29% / +40% / +56%
+            # (the squarings: +104% / +204% / +479% on the same matrices), Gaussian symmetric +9% /
+            # +5% / +4% (squarings +51% / +57% / +60%), n = 3 and 12 +0.5% to +33% (squarings +8%
+            # to +37%). A non-symmetric A keeps the squarings: at n = 30 / 60 / 100 a
+            # triangular-dominant one costs +147% / +250% / +528% (unchanged). Seed-orthogonal
+            # symmetric matrices with dominant +1 or -1 (n = 3 to 8): 307 short answers without a
+            # certificate, all NO_CONVERGENCE, as through the squarings; 1,200 symmetric matrices
+            # (Gaussian, prescribed spectra with gaps to 0.999, non-negative, graded, at 2^+-600 and
+            # 2^+-1000): every answer identical to integ-snap12, none refused. The inertia
+            # certificate refuses an answer with an eigenvalue at or past about 1.0005 |lambda|
+            # (the squarings: past 1.001 |lambda|), so an answer 0.05% to 0.1% short of rho is
+            # NO_CONVERGENCE now where it was Ok.
+            # [measured: LA4 probes tim2.py, tim3.py; LA4 with and without the certificate, integ-snap12, 2026-10-31]
+            # [measured: LA4 probes so.py (seeds 1, 2 + a dominant -1 set), symfam.py (seeds 1, 2), 2026-10-31]
+            # ⚠ It cannot see an answer ABOVE rho (Gelfand bounds rho from above), nor one less
+            # than 0.1% below it. An irreducible 2 x 2 with a01 near DBL_MAX and a subnormal a10
+            # (the dominant eigenvector's second component on the subnormal grid) can stall the
+            # plain run with that component off: 19 of 60 such matrices come back Ok more than
+            # 1e-9 off (17 above rho, 2 below), the worst 1.5e-3, as on 3.3.7 (not repaired here;
+            # see the 3.4.0 review notes).
+            # [measured: LA2 r4 drive.py, R seeds 1-3 x 1000, G and C x 1000, integ-snap5 vs LA2, 2026-10-31]
+            # [measured: LA3 probes so.py, adv.py, fam.py (seeds 1-3) and r4 drive.py, integ-snap9 vs LA3, 2026-10-31]
+            # [measured: LA3 probes tim.py and tim2.py, LA3 with and without the certificate, cycc 6.7.9, 2026-10-31]
+            # [measured: LA2 probe w4 + w4an.py (60-digit Decimal), 3.3.7, integ-snap5, LA2, 2026-10-31]
+            var gc = _lext_gelfand(A, n, res_lam, res_vec);
+            if (gc == 2) { return Err(HSB_ERR_ALLOC); }
+            if (gc == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
             store64(out_val, res_lam);
             i = 0;
             while (i < n) {
@@ -2987,20 +4080,240 @@ public fn eigen_symmetric(A, n, out_vals, out_vecs) {
 # Section 5 -- Lyapunov Exponent
 # ================================================================
 
-# Compute the maximal Lyapunov exponent via QR method.
+# ---- lyapunov_max's step (3.4.0) ----
+# af: A (times lyapunov_max's 2^s), row-major, n x n words; Q, Z: n x n words, row-major; qc: n
+# words of scratch for Q's column. Z <- A Q, one column at a time, each entry summed in order
+# (k = 0..n-1 from +0), then every column scaled by the nearest power of two to its largest
+# |entry| (which then lies in [2^-1/2, 2^1/2)). out_e[j] receives that power's exponent, so
+# column j of A Q is 2^out_e[j] times column j of Z. A column with a non-finite entry is formed
+# again from 2^-64 q_j and its exponent raised by 64: A and Q are finite and |q_kj| <= 1, so only
+# a sum can overflow, and 2^-64 n DBL_MAX cannot. A zero column is left as it is, exponent 0.
+fn _lext_ly_step(af, Q, Z, n, qc, out_e) {
+    for (var j = 0; j < n; j = j + 1) {
+        for (var c = 0; c < n; c = c + 1) { store64(qc + c * 8, load64(Q + (c * n + j) * 8)); }
+        var fin = 1;
+        for (var i = 0; i < n; i = i + 1) {
+            var sum = f64_from(0);
+            var ar = af + i * n * 8;
+            for (var k = 0; k < n; k = k + 1) {
+                sum = f64_add(sum, f64_mul(load64(ar + k * 8), load64(qc + k * 8)));
+            }
+            if (f64_lt(f64_abs(sum), F64_POS_INF) == 0) { fin = 0; }
+            store64(Z + (i * n + j) * 8, sum);
+        }
+        var ex = 0;
+        if (fin == 0) {
+            ex = 64;
+            for (var c2 = 0; c2 < n; c2 = c2 + 1) {
+                store64(qc + c2 * 8, f64_mul(load64(qc + c2 * 8), 0x3BF0000000000000));   # 2^-64
+            }
+            for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+                var s2 = f64_from(0);
+                var ar2 = af + i2 * n * 8;
+                for (var k2 = 0; k2 < n; k2 = k2 + 1) {
+                    s2 = f64_add(s2, f64_mul(load64(ar2 + k2 * 8), load64(qc + k2 * 8)));
+                }
+                store64(Z + (i2 * n + j) * 8, s2);
+            }
+        }
+        var mx = f64_from(0);
+        for (var i3 = 0; i3 < n; i3 = i3 + 1) {
+            var za = f64_abs(load64(Z + (i3 * n + j) * 8));
+            if (f64_gt(za, mx) == 1) { mx = za; }
+        }
+        if ((mx & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            # mx = m 2^x with 0.5 <= m < 1: scaled by the NEAREST power of two, so the largest
+            # |entry| lands in [2^-1/2, 2^1/2), and a column already there (sh = 0) is not touched.
+            # ⚠ Nearest, not floor: a growth factor near 1 then keeps sh = 0 and its logarithm
+            # whole. Scaling a column of (0.6, 0.8) by 2 and adding -ln 2 back cost a rotation's
+            # 100-step exponent its accuracy: 1.0e-15 where the unscaled sum gives 4.2e-17 (the
+            # exponent itself is ln sqrt(det) = 2.2e-17 for the rounded entries).
+            # [measured: LA probe p7 + orc.py, floor vs nearest, cycc 6.7.9, 2026-10-31]
+            # ⛔ 3.4.0 second review (R2A SF3) — THE LARGEST |ENTRY| NOW LANDS NEAR 2^1000, NOT 1.
+            # Scaled to 1, an entry below 2^-1074 of its column's largest was flushed, though the
+            # caller's units held it: [[1.3 2^-80, 1.7e308], [0, 1.7 2^-60]] gave ln a00 = -55.19 at
+            # k = 20, where every k's exact value is ln a11 = -41.06 (column 1 was (1, 0) after
+            # scaling, so r11 = 0). Near 2^1000 a column keeps entries down to 2^-2074 of its
+            # largest. Every operation of the QR that follows is homogeneous, so its r_jj is the
+            # old one times 2^1000 exactly wherever the old one was normal, and lyapunov_max takes
+            # that 2^1000 back out (see there): every result that did not lose an entry is bit for
+            # bit what it was.
+            # [measured: LA3 probe ly.py (R2A ly2.py rows + 80 random, exact oracle), integ-snap9 vs LA3, 2026-10-31]
+            var sh = _lext_xexp(mx);
+            if (f64_lt(_lext_xman(mx), F64_FRAC_1_SQRT2) == 1) { sh = sh - 1; }
+            var up = 1000 - sh;
+            if (up >= 0 - 1022 && up <= 1023) {
+                var pu = (1023 + up) << 52;
+                for (var i4 = 0; i4 < n; i4 = i4 + 1) {
+                    store64(Z + (i4 * n + j) * 8, f64_mul(load64(Z + (i4 * n + j) * 8), pu));
+                }
+            } else {
+                for (var i5 = 0; i5 < n; i5 = i5 + 1) {
+                    store64(Z + (i5 * n + j) * 8, _lext_pow2mul(load64(Z + (i5 * n + j) * 8), up));
+                }
+            }
+            ex = ex + sh - 1000;
+        }
+        store64(out_e + j * 8, ex);
+    }
+    return 0;
+}
+
+# The Euclidean norm of the n - k entries W[k..n-1][k] of the row-major n x n W (column k from
+# row k down), scaled by their largest |entry| so no square under- or overflows. 0 for all zero.
+fn _lext_ly_colnorm(W, n, k) {
+    var mx = f64_from(0);
+    for (var i = k; i < n; i = i + 1) {
+        var a = f64_abs(load64(W + (i * n + k) * 8));
+        if (f64_gt(a, mx) == 1) { mx = a; }
+    }
+    if ((mx & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return mx; }
+    var s = f64_from(0);
+    for (var i2 = k; i2 < n; i2 = i2 + 1) {
+        var q = f64_div(load64(W + (i2 * n + k) * 8), mx);
+        s = f64_add(s, f64_mul(q, q));
+    }
+    return f64_mul(mx, f64_sqrt(s));
+}
+
+# Householder QR of the row-major n x n W, in place: W becomes R above the diagonal (its
+# diagonal's moduli go to rd), and Q (n x n, row-major) becomes the orthogonal factor, W = Q R.
+# u: n words of scratch. ⭐ A reflector is skipped ONLY for a column that is exactly zero from
+# the diagonal down (then r_kk = 0 and H = I). ganita_mat_qr skipped one whose column was at most
+# 1e-12 of W's largest entry and read r_kk off the diagonal, which held the flag fixed for ever
+# on some matrices (see lyapunov_max). The reflector u = x - alpha e_0 is divided by its largest
+# |entry| before u.u is formed, so a tiny column neither underflows nor loses its direction.
+fn _lext_ly_qr(W, Q, n, rd, u) {
+    for (var i = 0; i < n * n; i = i + 1) { store64(Q + i * 8, f64_from(0)); }
+    for (var d = 0; d < n; d = d + 1) { store64(Q + (d * n + d) * 8, F64_ONE); }
+    for (var k = 0; k < n; k = k + 1) {
+        var nrm = _lext_ly_colnorm(W, n, k);
+        store64(rd + k * 8, nrm);
+        if ((nrm & 0x7FFF_FFFF_FFFF_FFFF) != 0 && k < n - 1) {
+            var x0 = load64(W + (k * n + k) * 8);
+            var alpha = f64_neg(nrm);
+            if (f64_lt(x0, 0) == 1) { alpha = nrm; }
+            # u = (x - alpha e_0) / max|.|, no cancellation in u_0 (alpha has x0's opposite sign)
+            store64(u, f64_sub(x0, alpha));
+            for (var i2 = k + 1; i2 < n; i2 = i2 + 1) { store64(u + (i2 - k) * 8, load64(W + (i2 * n + k) * 8)); }
+            var um = f64_from(0);
+            for (var i3 = 0; i3 < n - k; i3 = i3 + 1) {
+                var ua = f64_abs(load64(u + i3 * 8));
+                if (f64_gt(ua, um) == 1) { um = ua; }
+            }
+            var beta = f64_from(0);
+            for (var i4 = 0; i4 < n - k; i4 = i4 + 1) {
+                var q4 = f64_div(load64(u + i4 * 8), um);
+                store64(u + i4 * 8, q4);
+                beta = f64_add(beta, f64_mul(q4, q4));
+            }
+            var tb = f64_div(F64_TWO, beta);
+            # W[k.., k..] <- H W[k.., k..]; column k becomes (alpha, 0, ..., 0)
+            store64(W + (k * n + k) * 8, alpha);
+            for (var i5 = k + 1; i5 < n; i5 = i5 + 1) { store64(W + (i5 * n + k) * 8, f64_from(0)); }
+            for (var j = k + 1; j < n; j = j + 1) {
+                var s = f64_from(0);
+                for (var i6 = k; i6 < n; i6 = i6 + 1) {
+                    s = f64_add(s, f64_mul(load64(u + (i6 - k) * 8), load64(W + (i6 * n + j) * 8)));
+                }
+                var f = f64_mul(tb, s);
+                for (var i7 = k; i7 < n; i7 = i7 + 1) {
+                    var wv = load64(W + (i7 * n + j) * 8);
+                    store64(W + (i7 * n + j) * 8, f64_sub(wv, f64_mul(f, load64(u + (i7 - k) * 8))));
+                }
+            }
+            # Q <- Q H (columns k.. of every row)
+            for (var r = 0; r < n; r = r + 1) {
+                var s2 = f64_from(0);
+                for (var c = k; c < n; c = c + 1) {
+                    s2 = f64_add(s2, f64_mul(load64(Q + (r * n + c) * 8), load64(u + (c - k) * 8)));
+                }
+                var f2 = f64_mul(tb, s2);
+                for (var c2 = k; c2 < n; c2 = c2 + 1) {
+                    var qv = load64(Q + (r * n + c2) * 8);
+                    store64(Q + (r * n + c2) * 8, f64_sub(qv, f64_mul(f2, load64(u + (c2 - k) * 8))));
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# Compute the maximal Lyapunov exponent of the linear map x -> A x by the QR method.
 # A:          stdlib matrix (n x n -- SHAPE ENFORCED), the Jacobian of the system.
 # n:          state dimension.
-# iterations: number of QR iterations.
+# iterations: number of QR steps k, at least 1.
 # out:        pointer to store the result (f64, allocate 8 bytes).
-# Returns:    Ok(0) on success, HSB_ERR_INVALID_INPUT on a null handle, a shape
-#             that does not match n, or a NaN or infinite entry in A (since 3.3.7),
-#             HSB_ERR_ALLOC if the working matrices cannot be allocated (ganita's
-#             QR included, since 3.3.7), HSB_ERR_NO_CONVERGENCE if A * Q overflows
-#             (since 3.3.7).
+# Returns:    Ok(0) on success, with out the largest of the n column averages
+#             (1/k) sum_t ln |r_jj(t)| (see Method); -Inf only when the arithmetic itself
+#             annihilates every column (exact zeros: a strictly triangular A, or one whose
+#             nilpotency survives rounding). ⚠ A dense A that is exactly nilpotent gives a
+#             finite value at the rounding level instead: rounding makes A Q non-nilpotent
+#             (R2A: an integer S J S^-1 with A^3 = 0 gave -10.48 / -10.03 / -11.72 at k = 3 / 10
+#             / 50, [[1, 1], [-1, -1]] -24.1 to -35.7, where the exact method gives -Inf).
+#             HSB_ERR_INVALID_INPUT on a null handle, a shape that
+#             does not match n, a NaN or infinite entry in A (since 3.3.7), or (since 3.4.0)
+#             iterations <= 0; HSB_ERR_ALLOC if the working storage cannot be allocated. out is
+#             written only on Ok.
 #
-# Method: repeatedly QR-decompose A^k. The growth rate of R's diagonal
-# entries gives the Lyapunov exponent. This is the simplified discrete
-# version: repeatedly multiply A, QR-factor, and track log growth.
+# Method. Q_0 = I; each step forms Z = A Q_(t-1), factors Z = Q_t R_t, and adds ln |r_jj| to
+# column j's sum. The column sums are logarithms of volume growth: over k steps, the first j + 1
+# of them add up to ln of the (j + 1)-dimensional volume A^k stretches span(e_0 .. e_j) by. For a
+# flag in general position the averages are the Lyapunov exponents in decreasing order, the
+# first the largest. Q_0 = I is not in general position for every A, and then the averages are
+# the same exponents in another order, a column whose space A annihilates averaging -Inf; so the
+# answer is the LARGEST average, not the first. For x -> A x the exponents are ln |lambda_i|,
+# and the largest is ln rho(A). Each average converges like 1 / k. That holds for the exact QR
+# factor of each Z, which is why the QR is hisab's own (below).
+#
+# ⛔ 3.4.0 — ONLY COLUMN 0 WAS READ, AND e_0 IS NOT IN GENERAL POSITION FOR EVERY A. An
+# upper-triangular A keeps e_0 an eigenvector, so r00 is |a00| on every step: diag(1, 2) and
+# [[1, 1], [0, 2]] returned Ok(0) for ln 2, and diag(0, 2), whose A e_0 is 0, gave r00 = 0 on
+# every step, which the domain guard skipped, so count stayed 0 and Ok(0) came back for ln 2.
+# A nilpotent [[0, 1], [0, 0]] gave Ok(0) as well, where the exponent is -Inf; and
+# iterations <= 0 returned Ok(0) as an exponent averaged over no samples.
+# [measured: LA probe p2, 3.3.7 base and this tree, cycc 6.7.9, 2026-10-31]
+#
+# ⛔ 3.4.0 — ganita_mat_qr WAS HANDED Z IN THE CALLER'S UNITS, and its Householder vector
+# overflows for a column norm in about (DBL_MAX / 2.61, DBL_MAX / 2.41]: it then returns 0 with
+# Q = I and R = Z, finite and wrong, and above that band non-finite factors. The all-equal 2 x 2
+# a = 1.6 * 2^1022 returned Ok(ln a) = 708.866 for 10 steps, where the exponent is ln 2a and the
+# 10-step answer (ln(a sqrt 2) + 9 ln 2a) / 10 = 709.525; at a = 1.5 * 2^1022 and above, where
+# A Q (or the reflector) overflows, it returned NO_CONVERGENCE for a finite A.
+# [measured: LA probe p2, 3.3.7 base and this tree, cycc 6.7.9, 2026-10-31]
+# ⭐ So every column of Z is scaled by a power of two first (`_lext_ly_step`): Z D = Q (R D) for
+# a diagonal D, so the QR of the scaled Z has the same Q and r_jj scaled by D's entry, whose
+# exponent goes into the column's sum as an integer and is multiplied by ln 2 once, at the end.
+# The QR then sees columns with largest |entry| in [2^999.5, 2^1000.5) (in [2^-1/2, 2^1/2) until
+# the second review), whatever A's scale, and a column of A Q that overflows is formed from
+# 2^-64 q_j instead. Every finite A is answered. ⚠ What it cannot keep: an entry of a column of
+# A Q below about 2^-2074 of that column's largest, and a direction the orthogonal Q itself
+# cannot hold. R2A's [[1.7 2^-60, 0], [1.7e308, 1.3 2^-80]]: the first q_0 = (a/c, 1) has
+# a/c = 8.6e-327, which flushes, and from then on the method runs on ln |a11|: k = 20 gives
+# -16.94 where the exact finite-k value is -3.519. Dense 2 x 2 and 3 x 3 whose entries span
+# 10^-150 to 10^150 come back up to 9 times off in 3 of 12 (the same bits through the first
+# review); the rest are within 1e-16.
+# [measured: LA3 probe ly.py (exact finite-k oracle), integ-snap9 vs LA3, cycc 6.7.9, 2026-10-31]
+# [measured: review R2A notes 3 and 4 (ly2.py), cycc 6.7.9, 2026-10-31]
+#
+# ⛔ 3.4.0 review — AND ganita_mat_qr's SKIP WAS NOT HARMLESS. It skips a reflector whose column,
+# below the diagonal, is at most 1e-12 of Z's largest entry, reads r_kk off the diagonal, and
+# leaves that column of Q unrotated, so the dominant direction can stay out of the flag at every
+# k. A = [[1, 1, 0], [0, 0, 3e13], [0, 1e-13, 0.5]] (eigenvalues 1, 2, -1.5) returned 0 at k = 10,
+# 100 and 1000 where the exact QR method gives 0.6156573381623287 (k = 10) and 0.6846742019560775
+# (k = 100); the comment here called the skip harmless. The QR is now `_lext_ly_qr`, which skips
+# only an exactly zero column, and lyapunov_max no longer calls ganita's QR at all.
+# [measured: review REV-LA M2 (t1.py, ly5.py: Fractions + mpmath oracle) and LA2 probe y1, cycc 6.7.9, 2026-10-31]
+#
+# ⛔ 3.4.0 review — A WITH SUBNORMAL ENTRIES LOST DIGITS: A Q was formed in the caller's units, so
+# its products rounded on the subnormal grid before any column scaling (2.8e-7 relative at
+# 2^-1065, 4.1e-8 at 2^-1060). A whose largest |a_ij| is below 1 is now scaled up by the power of
+# two 2^s that puts it in [1, 2), exactly, and s k is taken off the exponent sums at the end.
+# [measured: review REV-LA S4 (t3.py) and LA2 probe y1, cycc 6.7.9, 2026-10-31]
+#
+# Working storage is allocated once per call (A's scaled copy, Q, Z, five n-word arrays): through
+# 3.3.7 ganita_mat_mul allocated a new n x n matrix per step that the bump allocator never
+# returned.
 #must_use
 public fn lyapunov_max(A, n, iterations, out) {
     # NULL HANDLES. A may be the designed 0 from mat_new_guarded's cap.
@@ -3013,67 +4326,98 @@ public fn lyapunov_max(A, n, iterations, out) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # THE n x n PRECONDITION IS NOW CHECKED, NOT JUST DOCUMENTED. n is a
-    # restatement of A's extent and ganita_mat_mul(A, Q) conforms only when A is n x n;
+    # restatement of A's extent and A * Q conforms only when A is n x n;
     # a mismatch is a caller error with no meaningful answer, so it is rejected.
     if (ganita_mat_rows(A) != n || ganita_mat_cols(A) != n) { return Err(HSB_ERR_INVALID_INPUT); }
     # ⛔ 3.3.7 — A NON-FINITE A CAME BACK AS A NUMBER: a NaN entry made every r00 NaN, which
-    # the domain guard below skips, so out held the average of whatever was finite (0 for
+    # the domain guard skipped, so out held the average of whatever was finite (0 for
     # an all-NaN A), with Ok. Refused here, as eigen_symmetric and the SVD wrappers do.
     if (_lext_mat_all_finite(A, n, n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    # An average over no steps has no value (3.4.0: Ok(0) through 3.3.7).
+    if (iterations <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
-    # mat_new_guarded, not ganita_mat_new: it propagates the designed 0 for an n this
-    # module considers unreasonable instead of allocating it.
-    var Q = mat_new_guarded(n, n);
-    if (Q == 0) { return Err(HSB_ERR_ALLOC); }
-    var R = mat_new_guarded(n, n);
-    if (R == 0) { return Err(HSB_ERR_ALLOC); }
-
-    # Initialize Q to identity
+    # A ganita matrix of n x n exists, so n n is at most GANITA_MAT_MAX_ELEMS and
+    # n n 8 cannot overflow; the allocations below are checked.
+    var af = alloc(n * n * 8);   # A 2^s, row-major
+    var Q = alloc(n * n * 8);
+    var Z = alloc(n * n * 8);
+    var sl = alloc(n * 8);   # column j's sum of ln |r_jj| in the scaled frame
+    var se = alloc(n * 8);   # ... and of its scale exponents (an integer)
+    var ze = alloc(n * 8);   # this step's scale exponents
+    var qc = alloc(n * 8);   # Q's column j
+    var rd = alloc(n * 8);   # |r_jj| of this step
+    var u = alloc(n * 8);    # the reflector
+    if (af == 0 || Q == 0 || Z == 0 || sl == 0 || se == 0) { return Err(HSB_ERR_ALLOC); }
+    if (ze == 0 || qc == 0 || rd == 0 || u == 0) { return Err(HSB_ERR_ALLOC); }
+    # 2^s with max|a_ij| 2^s in [1, 2) when max|a_ij| < 1 (exact, going up), else s = 0
+    var amx = f64_from(0);
+    for (var ai = 0; ai < n; ai = ai + 1) {
+        for (var aj = 0; aj < n; aj = aj + 1) {
+            var aa = f64_abs(ganita_mat_get(A, ai, aj));
+            if (f64_gt(aa, amx) == 1) { amx = aa; }
+        }
+    }
+    var s = 0;
+    if ((amx & 0x7FFF_FFFF_FFFF_FFFF) != 0 && f64_lt(amx, F64_ONE) == 1) { s = 1 - _lext_xexp(amx); }
+    for (var bi = 0; bi < n; bi = bi + 1) {
+        for (var bj = 0; bj < n; bj = bj + 1) {
+            var a = ganita_mat_get(A, bi, bj);
+            if (s != 0) { a = _lext_xld(_lext_xman(a), _lext_xexp(a) + s); }
+            store64(af + (bi * n + bj) * 8, a);
+        }
+    }
     var i = 0;
-    while (i < n) { ganita_mat_set(Q, i, i, f64_from(1)); i = i + 1; }
-
-    var sum_log = f64_from(0);
-    var count = 0;
+    while (i < n * n) {
+        store64(Q + i * 8, f64_from(0));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n) {
+        store64(Q + (i * n + i) * 8, F64_ONE);
+        store64(sl + i * 8, f64_from(0));
+        store64(se + i * 8, 0);
+        i = i + 1;
+    }
 
     var iter = 0;
     while (iter < iterations) {
-        # Z = A * Q
-        var Z = ganita_mat_mul(A, Q);
-        # ganita_mat_mul allocates; a failed allocation is a 0 that ganita_mat_qr would read
-        # through. Bail with the allocation code rather than store into address 0.
-        if (Z == 0) { return Err(HSB_ERR_ALLOC); }
-
-        # QR decompose Z -> Q, R
-        # ⛔ 3.3.7 — ITS STATUS WAS DISCARDED. Through ganita 1.2.11 (cyrius <= 6.6.15) a
-        # non-finite Z came back 0 with R = Z; from 1.2.12 it is -2 and NOTHING is written,
-        # so R still held the previous iteration's factor and r00 counted it again. A
-        # finite A can still overflow A * Q (|Z_ij| <= n max|A|), so Z is checked here, the
-        # same on every pin, and a refused QR is an error: -1 its allocation, else -2.
-        if (_lext_mat_all_finite(Z, n, n) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
-        var qr_rc = ganita_mat_qr(Z, Q, R);
-        if (qr_rc == 0 - 1) { return Err(HSB_ERR_ALLOC); }
-        if (qr_rc != 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
-
-        # Accumulate log of |R[0][0]| (dominant direction growth)
-        var r00 = f64_abs(ganita_mat_get(R, 0, 0));
-        # ⛔ `r00` is a growth factor in the matrix's units against an absolute
-        # 1e-12, so genuine contraction was silently excluded from the average and
-        # the exponent came back biased. ⚠ NOT DBL_MIN: `ln` is defined for every
-        # positive double including subnormals, so a floor there would still drop
-        # samples the logarithm handles. Guard the domain, nothing more.
-        if (f64_gt(r00, 0) == 1) {
-            sum_log = f64_add(sum_log, f64_ln(r00));
-            count = count + 1;
+        _lext_ly_step(af, Q, Z, n, qc, ze);
+        _lext_ly_qr(Z, Q, n, rd, u);
+        i = 0;
+        while (i < n) {
+            # r_jj is in units of 2^1000 (see _lext_ly_step). Where r_jj 2^-1000 is a normal
+            # double its logarithm is taken there, as through the first review; below that, as
+            # ln m + e ln 2 for r_jj = m 2^e, m in [1/2, 1), with e carried exactly.
+            # ln 0 = -Inf: a column the arithmetic annihilates stays at -Inf.
+            var rj = load64(rd + i * 8);
+            var ej = load64(ze + i * 8) + 1000;
+            if (f64_ge(rj, 0x3E90000000000000) == 1 || f64_eq(rj, 0) == 1) {   # 2^-22
+                store64(sl + i * 8, f64_add(load64(sl + i * 8), f64_ln(_lext_pow2mul(rj, 0 - 1000))));
+            } else {
+                store64(sl + i * 8, f64_add(load64(sl + i * 8), f64_ln(_lext_xman(rj))));
+                ej = ej + _lext_xexp(rj) - 1000;
+            }
+            store64(se + i * 8, load64(se + i * 8) + ej);
+            i = i + 1;
         }
-
         iter = iter + 1;
     }
 
-    if (count == 0) {
-        store64(out, f64_from(0));
-    } else {
-        store64(out, f64_div(sum_log, f64_from(count)));
+    # (L + S ln 2) / k per column, S less s k for the prescaling, with ln 2 split so S ln2_hi is
+    # exact for |S| < 2^21
+    var ln2_hi = 0x3FE62E42FEE00000;   # 0.69314718036912381649017333984375 (ln 2, high 32 bits)
+    var ln2_lo = 0x3DEA39EF35793C76;   # ln(2) - 0.69314718036912381649017333984375
+    var kf = f64_from(iterations);
+    var best = 0xFFF0000000000000;   # -Inf
+    i = 0;
+    while (i < n) {
+        var sf = f64_from(load64(se + i * 8) - s * iterations);
+        var tot = f64_add(f64_mul(sf, ln2_hi), f64_add(load64(sl + i * 8), f64_mul(sf, ln2_lo)));
+        var avg = f64_div(tot, kf);
+        if (f64_gt(avg, best) == 1) { best = avg; }
+        i = i + 1;
     }
+    store64(out, best);
     return Ok(0);
 }
 
@@ -3082,10 +4426,11 @@ public fn lyapunov_max(A, n, iterations, out) {
 # ================================================================
 
 # Inertia tensor of a solid sphere.
-# Returns: 3x3 stdlib matrix.
+# Returns: 3x3 stdlib matrix, or 0 when it cannot be allocated (3.4.0: stored through it).
 public fn inertia_sphere(mass, radius) {
     var I = f64_mul(f64_div(f64_from(2), f64_from(5)), f64_mul(mass, f64_mul(radius, radius)));
     var m = ganita_mat_new(3, 3);
+    if (m == 0) { return 0; }
     ganita_mat_set(m, 0, 0, I);
     ganita_mat_set(m, 1, 1, I);
     ganita_mat_set(m, 2, 2, I);
@@ -3094,7 +4439,7 @@ public fn inertia_sphere(mass, radius) {
 
 # Inertia tensor of a solid box (cuboid).
 # hx, hy, hz are half-extents.
-# Returns: 3x3 stdlib matrix.
+# Returns: 3x3 stdlib matrix, or 0 when it cannot be allocated (3.4.0, as inertia_sphere).
 public fn inertia_box(mass, hx, hy, hz) {
     var w = f64_mul(f64_from(2), hx);
     var h = f64_mul(f64_from(2), hy);
@@ -3102,6 +4447,7 @@ public fn inertia_box(mass, hx, hy, hz) {
     var c = f64_div(mass, f64_from(12));
 
     var m = ganita_mat_new(3, 3);
+    if (m == 0) { return 0; }
     ganita_mat_set(m, 0, 0, f64_mul(c, f64_add(f64_mul(h, h), f64_mul(d, d))));
     ganita_mat_set(m, 1, 1, f64_mul(c, f64_add(f64_mul(w, w), f64_mul(d, d))));
     ganita_mat_set(m, 2, 2, f64_mul(c, f64_add(f64_mul(w, w), f64_mul(h, h))));
@@ -3113,8 +4459,11 @@ public fn inertia_box(mass, hx, hy, hz) {
 # ================================================================
 
 # Condition number of a square matrix: cond(A) = ||A|| * ||A^-1||
-# Uses Frobenius norm. Returns f64. Returns -1 if singular.
+# Uses Frobenius norm. Returns f64. Returns -1 if singular, or (since 3.4.0) for a null A: the
+# designed 0 of mat_new_guarded was read through (exit 139; D102 audit, AU2-G3-F2).
+# [measured: D102 audit AU2 G3-F2 repro, re-run on 3.3.7 base (LA probe pd_1), cycc 6.7.9, 2026-10-31]
 public fn matrix_condition_number(A) {
+    if (A == 0) { return f64_neg(F64_ONE); }
     var n = ganita_mat_rows(A);
     var norm_a = ganita_mat_frobenius(A);
     var inv_a = ganita_mat_inv(A);
@@ -3245,8 +4594,9 @@ public fn cmat_inverse(m) {
         }
         col = col + 1;
     }
-    # Extract right half
+    # Extract right half (3.4.0: a refused result is the designed 0, not stored through)
     var result = cmat_new(n, n);
+    if (result == 0) { return 0; }
     i = 0;
     while (i < n) {
         var j = 0;

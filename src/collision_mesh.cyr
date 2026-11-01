@@ -1423,16 +1423,47 @@ fn _col_dl_strict_inside(points, nr, v0, v1, v2, px, py) {
 }
 
 # Locate the triangle containing (px, py) by walking the adjacency graph from
-# `start`, stepping across whichever edge the point is outside of. Returns the
-# triangle index, or (0 - 1) if the walk exceeded `budget` or fell off the
-# boundary.
+# `start`, stepping across whichever edge the point is strictly outside of.
+# Returns the triangle index, or (0 - 1) if the walk exceeded `budget`, fell off
+# the boundary or met a tombstone.
 #
-# The first edge tried rotates with the step count. A walk that always tries
-# edge 0 first can enter a two- or three-triangle cycle when the orientation
-# determinant round-trips through zero on near-degenerate geometry; rotating
-# the entry point breaks those cycles. `budget` is the backstop for the rest:
-# the predicate has been exact since 3.3.5, but the walk's termination is not
-# proved here, so the caller still falls back to a linear scan.
+# The first edge tried rotates with the step count, which broke the two- and
+# three-triangle cycles the float orientation of 3.3.4 and earlier could enter.
+#
+# ⛔ 3.4.0 -- FROM delaunay_2d THE WALK CANNOT RETURN (0 - 1), so its linear-scan
+# fallback, `_col_dl_locate_scan`, was removed. The proof:
+#   1. Every predicate is the exact sign at one finite M (the ghost note above
+#      _col_ghost_ux), so the build is Bowyer-Watson with exact predicates on a real
+#      set, the inserted sites plus the three ghosts A + M u_k, and every finite
+#      query lies strictly inside the ghost triangle.
+#   2. After each insertion the live triangles are a Delaunay triangulation of that
+#      set (no site strictly inside a circumcircle), all counter-clockwise, with
+#      consistent `nbrs`: the conflict region of a site is star-shaped from it with
+#      the site in its interior (or empty, for a duplicate), so its boundary is one
+#      simple cycle, every fan lookup and back-pointer is found, and the only (0 - 1)
+#      neighbours are the three ghost-ghost edges. Those keep the cyclic direction of
+#      the ghost triangle, whose orientation is the positive constant
+#      `_col_ghost_cross`, so no query is ever strictly outside one: the walk never
+#      steps off the boundary.
+#   3. `start` is a triangle of the latest fan (or unchanged when a duplicate built
+#      none), and nothing is tombstoned until after the walk: it never meets a
+#      tombstone.
+#   4. It never visits a triangle twice. For neighbours t, t' sharing the chord e,
+#      pow(p, circ t) - pow(p, circ t') is affine in p, zero on line(e), and >= 0 at
+#      the apex of t' (Delaunay), so it is >= 0 everywhere strictly beyond e: the
+#      power of p never rises along the walk and falls unless circ t = circ t'. A
+#      cycle would lie in one cocircular cluster, whose triangles triangulate a
+#      convex polygon (a tree in the dual), and crossing a diagonal with p strictly
+#      beyond it cannot be undone.
+# So the walk visits distinct live triangles, at most n_slots of them, inside the
+# n_slots + 16 budget, and stops where p is outside no edge: in the triangle that
+# contains it. The (0 - 1) paths stay as the backstop, and delaunay_2d answers a
+# failure with its empty result. 112,474 walks over 4,144 adversarial sets (lattice
+# grids, every integer point on x^2 + y^2 = 25 ... 32045, colinear runs, duplicates,
+# nested edge midpoints, sites on the ghost rays, random bit patterns over the whole
+# double range, at scales 2^-500 to 2^900) failed 0 times, at most 32 steps; capped
+# at a budget of 1, the same probe failed 1,105 times.
+# [measured: scratch instrumented copy of the 3.4.0 base, walk-failure counters, 2026-10-31; cycc 6.7.9]
 fn _col_dl_walk(points, nr, tris, nbrs, start, px, py, budget) {
     var cur = start;
     var steps = 0;
@@ -1441,8 +1472,9 @@ fn _col_dl_walk(points, nr, tris, nbrs, start, px, py, budget) {
         # Liveness guard. Every back-pointer into the cavity is rewired when
         # the fan is built, so a tombstone should be unreachable -- but a
         # vertex index of (0 - 1) reaches vec_get, which aborts the process
-        # rather than returning an error. Bail to the caller's linear scan
-        # instead of trusting the invariant.
+        # rather than returning an error. Answer (0 - 1) instead of trusting the
+        # invariant; delaunay_2d answers that with its empty result (3.4.0, which
+        # removed the linear scan this used to bail to).
         if (vec_get(tris, b) < 0) { return 0 - 1; }
         var nxt = 0 - 1;
         var outside = 0;
@@ -1463,30 +1495,6 @@ fn _col_dl_walk(points, nr, tris, nbrs, start, px, py, budget) {
         if (nxt < 0) { return 0 - 1; }
         cur = nxt;
         steps = steps + 1;
-    }
-    return 0 - 1;
-}
-
-# Fallback for _col_dl_walk: scan every live slot for one containing the point.
-# `mode` 0 tests containment, mode 1 tests the circumcircle (the last resort,
-# used only when no triangle claims to contain the point at all).
-fn _col_dl_locate_scan(points, nr, tris, n_slots, px, py, mode) {
-    for (var t = 0; t < n_slots; t = t + 1) {
-        var b = t * 3;
-        var v0 = vec_get(tris, b);
-        if (v0 >= 0) {
-            var v1 = vec_get(tris, b + 1);
-            var v2 = vec_get(tris, b + 2);
-            if (mode == 0) {
-                var ok = 1;
-                if (_col_dl_orient(points, nr, v1, v2, px, py) < 0) { ok = 0; }
-                if (_col_dl_orient(points, nr, v2, v0, px, py) < 0) { ok = 0; }
-                if (_col_dl_orient(points, nr, v0, v1, px, py) < 0) { ok = 0; }
-                if (ok == 1) { return t; }
-            } else {
-                if (_col_dl_incircle(points, nr, v0, v1, v2, px, py) == 1) { return t; }
-            }
-        }
     }
     return 0 - 1;
 }
@@ -1570,16 +1578,20 @@ fn _col_dl_scaled(points, n, k) {
     var s1 = (1023 + k1) << 52;
     var s2 = (1023 + k2) << 52;
     var sp = vec_new();
+    if (sp == 0) { return 0; }
     for (var i = 0; i < n; i = i + 1) {
         var p = vec_get(points, i);
-        vec_push(sp, hvec2_new(f64_mul(f64_mul(HVec2_x(p), s1), s2),
-            f64_mul(f64_mul(HVec2_y(p), s1), s2)));
+        var q = hvec2_new(f64_mul(f64_mul(HVec2_x(p), s1), s2),
+          f64_mul(f64_mul(HVec2_y(p), s1), s2));
+        if (q == 0) { return 0; }
+        vec_push(sp, q);
     }
     return sp;
 }
 
 public fn delaunay_2d(points, n) {
     var result = vec_new();
+    if (result == 0) { return 0; }
     # 3.3.5: the exact paths' scratch buffers belong to this call -- a pointer kept
     # from an earlier call may point into memory a caller's alloc_reset() has handed
     # out again (the note above _COL_O2D_BUF). Each is allocated at most once below.
@@ -1661,7 +1673,10 @@ public fn delaunay_2d(points, n) {
     # Outside the band, the build runs on a copy scaled into it. `points` names that
     # copy from here on; the indices returned index the caller's vec all the same.
     var shift = _col_dl_band_shift(amin, amax);
-    if (shift != 0) { points = _col_dl_scaled(points, n, shift); }
+    if (shift != 0) {
+        points = _col_dl_scaled(points, n, shift);
+        if (points == 0) { return result; }
+    }
 
     # The enclosing triangle is the three SYMBOLIC ghosts n, n+1, n+2 -- see the
     # ghost-vertex note above _col_ghost_ux. There is no bounding box to
@@ -1679,6 +1694,7 @@ public fn delaunay_2d(points, n) {
     var tris = vec_new();
     var nbrs = vec_new();
     var tstamp = vec_new();
+    if (tris == 0 || nbrs == 0 || tstamp == 0) { return result; }
     vec_push(tris, st_a);
     vec_push(tris, st_b);
     vec_push(tris, st_c);
@@ -1700,6 +1716,8 @@ public fn delaunay_2d(points, n) {
     var ep_v = vec_new();       # cavity boundary edge, second vertex
     var ep_nb = vec_new();      # triangle outside that edge, or (0 - 1)
     var ep_ne = vec_new();      # which edge of ep_nb faces back into the cavity
+    if (bad == 0 || pending == 0 || ep_u == 0 || ep_v == 0) { return result; }
+    if (ep_nb == 0 || ep_ne == 0) { return result; }
 
     # vertex -> new triangle maps, used to stitch the fan created around each
     # point in O(boundary) instead of the O(boundary^2) pairwise edge match.
@@ -1708,6 +1726,7 @@ public fn delaunay_2d(points, n) {
     # cavity boundary.
     var first_of = vec_new();
     var second_of = vec_new();
+    if (first_of == 0 || second_of == 0) { return result; }
     for (var i = 0; i < n + 3; i = i + 1) {
         vec_push(first_of, 0 - 1);
         vec_push(second_of, 0 - 1);
@@ -1727,10 +1746,12 @@ public fn delaunay_2d(points, n) {
 
         # 1. LOCATE the containing triangle, walking from the fan created for
         #    the previous point. Consecutive points are usually close, so this
-        #    is a few steps; the linear scans are the degenerate-input paths.
+        #    is a few steps. The walk cannot fail here (the proof is above
+        #    _col_dl_walk), so the linear-scan fallback it used to have is gone;
+        #    a failure would mean the mesh's invariants are broken, and the
+        #    answer is then the empty result, as for any set this cannot mesh.
         var seed = _col_dl_walk(points, n, tris, nbrs, hint, px, py, n_slots + 16);
-        if (seed < 0) { seed = _col_dl_locate_scan(points, n, tris, n_slots, px, py, 0); }
-        if (seed < 0) { seed = _col_dl_locate_scan(points, n, tris, n_slots, px, py, 1); }
+        if (seed < 0) { return result; }
 
         # 2. FLOOD-FILL the bad set across shared edges. Only triangles
         #    reachable from the containing one can have the point in their
@@ -1738,35 +1759,33 @@ public fn delaunay_2d(points, n) {
         #    triangles) -- the whole point of carrying adjacency.
         vec_truncate(bad, 0);
         vec_truncate(pending, 0);
-        if (seed >= 0) {
-            var sb = seed * 3;
-            var sv0 = vec_get(tris, sb);
-            var sv1 = vec_get(tris, sb + 1);
-            var sv2 = vec_get(tris, sb + 2);
-            var seed_bad = _col_dl_incircle(points, n, sv0, sv1, sv2, px, py);
-            # A point strictly inside a triangle is strictly inside that
-            # triangle's circumcircle, so through 3.3.4 a "no" here could only be
-            # round-off in the non-adaptive determinant, and believing it would
-            # leave the point uninserted and punch a hole in the mesh; strict
-            # containment overrides it. Containment is NOT strict when the point
-            # coincides with an existing vertex, which is exactly when an empty
-            # bad set is the right answer (a duplicate point adds nothing).
-            # Since 3.3.5 every predicate is exact and the override cannot fire
-            # (0 times on 1,973 sets, against 50 for the 3.3.4 predicates); it
-            # stays as the guard against a hole.
-            # [measured: scratch port of delaunay_2d (python3 fractions), not reproducible in-tree, 2026-10-11]
-            if (seed_bad == 0) {
-                if (_col_dl_strict_inside(points, n, sv0, sv1, sv2, px, py) == 1) {
-                    seed_bad = 1;
-                }
+        var sb = seed * 3;
+        var sv0 = vec_get(tris, sb);
+        var sv1 = vec_get(tris, sb + 1);
+        var sv2 = vec_get(tris, sb + 2);
+        var seed_bad = _col_dl_incircle(points, n, sv0, sv1, sv2, px, py);
+        # A point strictly inside a triangle is strictly inside that
+        # triangle's circumcircle, so through 3.3.4 a "no" here could only be
+        # round-off in the non-adaptive determinant, and believing it would
+        # leave the point uninserted and punch a hole in the mesh; strict
+        # containment overrides it. Containment is NOT strict when the point
+        # coincides with an existing vertex, which is exactly when an empty
+        # bad set is the right answer (a duplicate point adds nothing).
+        # Since 3.3.5 every predicate is exact and the override cannot fire
+        # (0 times on 1,973 sets, against 50 for the 3.3.4 predicates); it
+        # stays as the guard against a hole.
+        # [measured: scratch port of delaunay_2d (python3 fractions), not reproducible in-tree, 2026-10-11]
+        if (seed_bad == 0) {
+            if (_col_dl_strict_inside(points, n, sv0, sv1, sv2, px, py) == 1) {
+                seed_bad = 1;
             }
-            if (seed_bad == 1) {
-                vec_set(tstamp, seed, mark + 2);
-                vec_push(bad, seed);
-                vec_push(pending, seed);
-            } else {
-                vec_set(tstamp, seed, mark + 1);
-            }
+        }
+        if (seed_bad == 1) {
+            vec_set(tstamp, seed, mark + 2);
+            vec_push(bad, seed);
+            vec_push(pending, seed);
+        } else {
+            vec_set(tstamp, seed, mark + 1);
         }
         while (vec_len(pending) > 0) {
             var t = vec_pop(pending);
@@ -1955,6 +1974,7 @@ public struct HalfEdgeMesh { half_edges; vertex_edge; face_edge; }
 
 fn _col_he_new(vertex, face, next, twin) {
     var he = alloc(sizeof(HalfEdge));
+    if (he == 0) { return 0; }
     HalfEdge_set_vertex(he, vertex);
     HalfEdge_set_face(he, face);
     HalfEdge_set_next(he, next);
@@ -1983,7 +2003,12 @@ public fn halfedge_from_triangles(triangles, n_tris, n_verts) {
     if (triangles == 0) { return 0; }
     if (n_tris < 1) { return 0; }
     if (n_verts < 1) { return 0; }
-    if (vec_len(triangles) < n_tris * 3) { return 0; }
+    # ⛔ 3.4.0 -- AS A DIVISION. `vec_len(triangles) < n_tris * 3` wrapped: n_tris =
+    # 0x5555555555555556 makes n_tris * 3 exactly 2, a 3-entry vec passed, and the index scan
+    # below read past it ("vec: index out of bounds", exit 1). vec_len / 3 is the largest
+    # n_tris the vec can describe, so nothing below multiplies a larger one.
+    # [measured: lane AL review (N8) repro on the 3.4.0 base, 2026-10-31; cycc 6.7.9]
+    if (n_tris > vec_len(triangles) / 3) { return 0; }
     # ⛔ THE ONE ABORT PATH THE 2.9.x GUARDS ABOVE DID NOT CLOSE. `n_verts` sizes
     # the `vertex_edge` vec directly, one `vec_push` per vertex, and nothing
     # bounded it from ABOVE — the index check below only proves each index is
@@ -2006,9 +2031,21 @@ public fn halfedge_from_triangles(triangles, n_tris, n_verts) {
     }
 
     var n_he = n_tris * 3;
+    # The twin table's size, taken here so the bound is checked before anything is
+    # built. ⛔ 3.4.0 -- n_tris is bounded only by the triangle vec (3 * n_tris <=
+    # VEC_CAP_MAX = 2^28), and `_he_cap`, the power of two at or above 6 * n_tris,
+    # passes ALLOC_MAX / 8 = 2^28 from n_tris = 44,739,243 on. Its three `_he_cap * 8`
+    # arrays were then refused, unchecked, and the first store into `_he_src` went to
+    # address 0. The bound is ALLOC_MAX / 8, exactly the largest slot count `alloc`
+    # honours.
+    # [measured: arithmetic on the _he_cap loop and ALLOC_MAX, not run (the half-edges first take ~4 GiB)]
+    var _he_cap = 1;
+    while (_he_cap < n_he * 2) { _he_cap = _he_cap * 2; }
+    if (_he_cap > ALLOC_MAX / 8) { return 0; }
     var half_edges = vec_new();
     var vertex_edge = vec_new();
     var face_edge = vec_new();
+    if (half_edges == 0 || vertex_edge == 0 || face_edge == 0) { return 0; }
 
     # Initialize vertex_edge to sentinel
     for (var vi = 0; vi < n_verts; vi = vi + 1) {
@@ -2031,6 +2068,7 @@ public fn halfedge_from_triangles(triangles, n_tris, n_verts) {
             var next_he = base + next_k;
 
             var he = _col_he_new(dst_idx, f, next_he, HALFEDGE_NONE);
+            if (he == 0) { return 0; }
             vec_push(half_edges, he);
 
             # Record one outgoing half-edge per vertex
@@ -2054,12 +2092,12 @@ public fn halfedge_from_triangles(triangles, n_tris, n_verts) {
     # power of two so the mask is a single AND. Slots hold (src, dst, index) and
     # an empty slot is marked by src == HALFEDGE_NONE. Keys are compared exactly,
     # so a hash collision costs a probe, never a wrong pairing.
-    var _he_cap = 1;
-    while (_he_cap < n_he * 2) { _he_cap = _he_cap * 2; }
+    # `_he_cap` was sized and bounded at the top.
     var _he_mask = _he_cap - 1;
     var _he_src = alloc(_he_cap * 8);
     var _he_dst = alloc(_he_cap * 8);
     var _he_idx = alloc(_he_cap * 8);
+    if (_he_src == 0 || _he_dst == 0 || _he_idx == 0) { return 0; }
     for (var s = 0; s < _he_cap; s = s + 1) {
         store64(_he_src + s * 8, HALFEDGE_NONE);
     }
@@ -2119,6 +2157,7 @@ public fn halfedge_from_triangles(triangles, n_tris, n_verts) {
 
     # Build mesh handle
     var mesh = alloc(sizeof(HalfEdgeMesh));
+    if (mesh == 0) { return 0; }
     HalfEdgeMesh_set_half_edges(mesh, half_edges);
     HalfEdgeMesh_set_vertex_edge(mesh, vertex_edge);
     HalfEdgeMesh_set_face_edge(mesh, face_edge);
@@ -2149,6 +2188,7 @@ public fn halfedge_adjacent_faces(mesh, face) {
     if (mesh == 0) { return 0; }
     if (face < 0) { return 0; }
     var result = vec_new();
+    if (result == 0) { return 0; }
     var half_edges = HalfEdgeMesh_half_edges(mesh);
     var face_edge_vec = HalfEdgeMesh_face_edge(mesh);
     if (face >= vec_len(face_edge_vec)) { return 0; }
@@ -2243,8 +2283,11 @@ public fn halfedge_is_boundary(mesh, vertex) {
 
 fn _col_uf_new(n) {
     var uf = alloc(16);
+    if (uf == 0) { return 0; }
     var parent = alloc(n * 8);
+    if (parent == 0) { return 0; }
     var rank = alloc(n * 8);
+    if (rank == 0) { return 0; }
     for (var i = 0; i < n; i = i + 1) {
         store64(parent + i * 8, i);
         store64(rank + i * 8, 0);
@@ -2292,6 +2335,7 @@ fn _col_uf_union(uf, a, b) {
 
 public fn detect_islands(contacts, n_contacts, n_bodies) {
     var result = vec_new();  # vec of vecs
+    if (result == 0) { return 0; }
     if (n_bodies == 0) { return result; }
     # ⛔ CALLER-SIZED ALLOCATION STORED THROUGH UNCHECKED — reproduced as SIGSEGV.
     # `n_bodies` sizes three allocations that nothing bounded: `_col_uf_new`'s
@@ -2326,6 +2370,7 @@ public fn detect_islands(contacts, n_contacts, n_bodies) {
     }
 
     var uf = _col_uf_new(n_bodies);
+    if (uf == 0) { return result; }
 
     # Build forest from contact edges
     for (var ci = 0; ci < n_contacts; ci = ci + 1) {
@@ -2351,6 +2396,7 @@ public fn detect_islands(contacts, n_contacts, n_bodies) {
     # Collect components: map root -> component index
     # Use a flat array of size n_bodies for the mapping
     var comp_index = alloc(n_bodies * 8);
+    if (comp_index == 0) { return result; }
     for (var i = 0; i < n_bodies; i = i + 1) {
         store64(comp_index + i * 8, HALFEDGE_NONE);
     }
@@ -2362,7 +2408,14 @@ public fn detect_islands(contacts, n_contacts, n_bodies) {
         if (idx == HALFEDGE_NONE) {
             idx = n_comp;
             store64(comp_index + root * 8, idx);
-            vec_push(result, vec_new());
+            var isl = vec_new();
+            if (isl == 0) {
+                # A partial island list is a wrong answer: the empty result instead,
+                # this function's answer for every input it cannot serve.
+                vec_truncate(result, 0);
+                return result;
+            }
+            vec_push(result, isl);
             n_comp = n_comp + 1;
         }
         var island = vec_get(result, idx);

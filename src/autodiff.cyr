@@ -19,9 +19,14 @@ var _AD_F64_TINY = F64_TINY;   # alias of error.cyr's F64_TINY (DBL_MIN)
 #derive(accessors)
 public struct Dual { val; deriv; }
 
+# A new dual, or 0 when its 16 bytes cannot be allocated (3.4.0; through 3.3.7 the two
+# stores went through the null). Every dual_* op returns what dual_new returns, so each
+# reports its own failed allocation the same way; a 0 handed to one as an operand is a
+# caller's unchecked failure, which it does not test for.
 #must_use
 public fn dual_new(val, deriv) {
     var d = alloc(sizeof(Dual));
+    if (d == 0) { return 0; }
     Dual_set_val(d, val);
     Dual_set_deriv(d, deriv);
     return d;
@@ -59,16 +64,49 @@ public fn dual_mul(a, b) {
         f64_mul(Dual_val(a), Dual_deriv(b))));
 }
 
+# ⭐ 3.4.0 — ONE RULE FOR A DOMAIN MISS AND FOR A NaN, IN BOTH MODES (dual_* and ad_*).
+#   - A domain miss -- div by |b| < DBL_MIN, ln or sqrt of v <= 0, with a NUMERIC input
+#     value -- is the constant 0. A constant's derivative is exactly 0, whatever tangent
+#     arrives, a NaN one included: forward mode answers (0, 0), and the tape records
+#     partials 0, so its sweep gives 0 too.
+#   - A NaN VALUE is not a miss. It gives a NaN value and a NaN derivative in both modes:
+#     ln, sqrt and div test the value before the miss, and ad_mul / ad_div give a NaN
+#     partial to every operand when an operand's value is NaN, which is what dual_mul's
+#     and dual_div's a*b' terms (NaN * 0) give forward.
+# Forward and reverse then agree on every miss and every NaN-value case. They still differ
+# where forward mode forms 0 * Inf or 0 * NaN (Inf * a zero tangent, a NaN tangent through
+# a zero partial) and the sweep never multiplies, because ad_grad skips a node whose
+# adjoint is +0; and on the sign of a zero, because adjoints accumulate from +0. That skip
+# is unchanged. Over 1,440 op x input cases (12 unary ops, add/sub/mul/div against six
+# constants on either side; 12 input values from NaNs to subnormals; tangent 1 or NaN) the
+# two modes disagreed on 232 before this rule and on 124 after, none a miss or a NaN value:
+# 74 a NaN tangent through a zero partial, 39 an infinite value times a zero tangent (or
+# Inf / Inf) in a forward formula, 11 the sign of a zero.
+# [measured: scratch forward/reverse sweep (R2A's ad1.py), integ-snap9 and this tree, 2026-10-31]
+
 # 2.11.0: the guard was `|b| < EPSILON_F64` (1e-12) returning (0, 0) -- it
 # fabricated BOTH a value and a derivative where the answer is exactly
 # representable. Measured: 1/1e-13 returned 0.0 where the truth is 1e13, and the
 # derivative 0.0 where the truth is -1e26. The guard's real job is to avoid a
 # division that produces no usable answer, so the threshold is DBL_MIN.
 # [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
+# ⛔ 3.4.0 — THE MISS SWALLOWED A NaN VALUE (review of roadmap [3.4.0] D069, dual_ln's
+# class). A NaN b fails the |b| < DBL_MIN test and propagates, but a NaN numerator over
+# |b| < DBL_MIN returned the sentinel: (NaN, 1) / (0, 0) came back (0, 0). It now gives
+# (a, a), quieted (quiet bit set, sign and payload kept). A numeric a over |b| < DBL_MIN
+# is the documented miss, (0, 0), whatever its tangents (the rule above).
+# [measured: tests/hisab.tcyr, group "3.4.0: dual and tape ln / sqrt / abs propagate a NaN"]
 #must_use
 public fn dual_div(a, b) {
     var bv = Dual_val(b);
-    if (f64_lt(f64_abs(bv), _AD_F64_TINY) == 1) { return dual_new(0, 0); }
+    if (f64_lt(f64_abs(bv), _AD_F64_TINY) == 1) {
+        var av = Dual_val(a);
+        if (f64_eq(av, av) == 0) {
+            var qa = av | 0x0008_0000_0000_0000;
+            return dual_new(qa, qa);
+        }
+        return dual_new(0, 0);
+    }
     var bv2 = f64_mul(bv, bv);
     return dual_new(f64_div(Dual_val(a), bv),
       f64_div(f64_sub(f64_mul(Dual_deriv(a), bv),
@@ -109,12 +147,21 @@ public fn dual_exp(a) {
 #     checking only the derivative sees nothing wrong.
 #   * dual_ln(1e-13) returned (0, 0) where the truth is (-29.9336, 1e13).
 # The domain of ln is v > 0, and inside it ln is fine all the way to DBL_MIN
-# (ln(5e-324) = -744). `f64_gt(v, 0) != 1` rejects negatives, zero AND NaN.
+# (ln(5e-324) = -744). v <= 0 (-0 and -Inf included) is the documented domain miss,
+# the (0, 0) sentinel.
 # [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
+# ⛔ 3.4.0 — A NaN v WAS A DOMAIN MISS TOO (roadmap [3.4.0] D069). The guard was
+# `f64_gt(v, 0) != 1`, which a NaN passes, so dual_ln(NaN) returned the sentinel (0, 0):
+# a finite value and derivative from no number at all, and indistinguishable from
+# ln(-5)'s miss. A NaN is not an input outside ln's domain; it is the absence of an
+# input, and it propagates like every other dual op's: ln(NaN) and a' / NaN, a NaN
+# value and a NaN derivative. The guard is `f64_le(v, 0)`, false for a NaN. A miss with
+# a NaN tangent is still (0, 0): the miss is the constant 0 (the rule above dual_div).
+# [measured: tests/hisab.tcyr, group "3.4.0: dual and tape ln / sqrt / abs propagate a NaN"]
 #must_use
 public fn dual_ln(a) {
     var v = Dual_val(a);
-    if (f64_gt(v, 0) != 1) { return dual_new(0, 0); }
+    if (f64_le(v, 0) == 1) { return dual_new(0, 0); }
     return dual_new(f64_ln(v), f64_div(Dual_deriv(a), v));
 }
 
@@ -124,10 +171,14 @@ public fn dual_ln(a) {
 # miss too; above it, sqrt is fine to DBL_MIN (sqrt(1e-300) = 1e-150, derivative
 # 5e149, both finite).
 # [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
+# ⛔ 3.4.0 — A NaN v PROPAGATES (roadmap [3.4.0] D069), as in dual_ln: the guard is
+# `f64_le(v, 0)`, the (0, 0) sentinel is for v <= 0 only, and a NaN v gives
+# (sqrt(NaN), a' / (2 sqrt(NaN))), both NaN.
+# [measured: tests/hisab.tcyr, group "3.4.0: dual and tape ln / sqrt / abs propagate a NaN"]
 #must_use
 public fn dual_sqrt(a) {
     var v = Dual_val(a);
-    if (f64_gt(v, 0) != 1) { return dual_new(0, 0); }
+    if (f64_le(v, 0) == 1) { return dual_new(0, 0); }
     var s = f64_sqrt(v);
     return dual_new(s, f64_div(Dual_deriv(a), f64_mul(F64_TWO, s)));
 }
@@ -192,13 +243,24 @@ public fn dual_pow(a, n) {
 # library -- geo_diff.cyr's jets at an edge or at grazing incidence -- return a
 # miss sentinel instead, but Dual has no such sentinel and adding one would
 # change every arithmetic op's signature.
+# ⛔ 3.4.0 — AT A NaN v THE DERIVATIVE WAS a', AS IF v > 0. `v < 0` is false for a NaN, so
+# dual_abs(NaN, 1) returned (NaN, 1): a confident finite derivative beside a NaN value,
+# the pairing 2.11.0 called worse than either alone. The derivative of |x| is sign(x) a',
+# and a NaN has no sign: a NaN v now gives (|v|, a' * v), a NaN derivative (roadmap
+# [3.4.0] D069, the NaN class of dual_ln's row).
+# ⛔ 3.4.0 — AND THE VALUE KEPT A SIGN BIT |x| DOES NOT HAVE. Every v not below 0 came back
+# as its own bits, so |-0| was -0 and |-NaN| a negative NaN; IEEE 754's abs clears the sign
+# bit, as f64_abs does, and the value is now f64_abs(v). The derivative at -0 is the
+# documented right-hand +a'.
+# [measured: tests/hisab.tcyr, group "3.4.0: dual and tape ln / sqrt / abs propagate a NaN"]
 #must_use
 public fn dual_abs(a) {
     var v = Dual_val(a);
     if (f64_lt(v, 0) == 1) {
         return dual_new(f64_neg(v), f64_neg(Dual_deriv(a)));
     }
-    return dual_new(v, Dual_deriv(a));
+    if (f64_eq(v, v) == 0) { return dual_new(f64_abs(v), f64_mul(Dual_deriv(a), v)); }
+    return dual_new(f64_abs(v), Dual_deriv(a));
 }
 
 # ================================================================
@@ -359,20 +421,33 @@ public fn ad_sub(t, a, b) {
 }
 
 #must_use
+# A NaN operand value makes both partials that NaN (3.4.0, the rule above dual_div):
+# forward mode's a'b + ab' is NaN there through the NaN * b' term, so a partial of plain
+# bv (or av) let the tape answer b where dual_mul answered NaN.
 public fn ad_mul(t, a, b) {
     if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
     var av = ad_val(t, a);
     var bv = ad_val(t, b);
-    return _ad_push(t, f64_mul(av, bv), bv, a, av, b);
+    var p = f64_mul(av, bv);
+    if (f64_eq(av, av) == 0 || f64_eq(bv, bv) == 0) { return _ad_push(t, p, p, a, p, b); }
+    return _ad_push(t, p, bv, a, av, b);
 }
 
 # d(a/b)/da = 1/b,  d(a/b)/db = -a/b^2. Guard as dual_div does: DBL_MIN, because
-# the only thing that fails is the division.
+# the only thing that fails is the division. A NaN a gives a NaN value and both partials
+# that NaN, quieted, over any b (3.4.0, the rule above dual_div): over |b| < DBL_MIN it
+# was the (0, 0) miss through 3.3.7, and over any other b d/da = 1/b answered where
+# dual_div's derivative is NaN. A NaN b needs nothing: 1/b is NaN. A numeric a over
+# |b| < DBL_MIN is the miss, value and partials 0.
 #must_use
 public fn ad_div(t, a, b) {
     if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
     var av = ad_val(t, a);
     var bv = ad_val(t, b);
+    if (f64_eq(av, av) == 0) {
+        var qa = av | 0x0008_0000_0000_0000;
+        return _ad_push(t, qa, qa, a, qa, b);
+    }
     if (f64_lt(f64_abs(bv), _AD_F64_TINY) == 1) { return _ad_push(t, 0, 0, a, 0, b); }
     var inv = f64_div(F64_ONE, bv);
     return _ad_push(t, f64_mul(av, inv), inv, a,
@@ -406,21 +481,22 @@ public fn ad_exp(t, a) {
     return _ad_push(t, e, e, a, 0, AD_NONE);
 }
 
-# Domain is v > 0 -- the same test dual_ln uses, which rejects negatives, zero
-# and NaN alike.
+# Domain is v > 0 -- the same test dual_ln uses: v <= 0 is the (0, 0) miss, and a NaN
+# propagates (3.4.0; through 3.3.7 a NaN was a miss here too, value 0 and partial 0).
 #must_use
 public fn ad_ln(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
     var av = ad_val(t, a);
-    if (f64_gt(av, 0) != 1) { return _ad_push(t, 0, 0, a, 0, AD_NONE); }
+    if (f64_le(av, 0) == 1) { return _ad_push(t, 0, 0, a, 0, AD_NONE); }
     return _ad_push(t, f64_ln(av), f64_div(F64_ONE, av), a, 0, AD_NONE);
 }
 
+# Domain is v > 0, as dual_sqrt's: v <= 0 is the miss, a NaN propagates (3.4.0).
 #must_use
 public fn ad_sqrt(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
     var av = ad_val(t, a);
-    if (f64_gt(av, 0) != 1) { return _ad_push(t, 0, 0, a, 0, AD_NONE); }
+    if (f64_le(av, 0) == 1) { return _ad_push(t, 0, 0, a, 0, AD_NONE); }
     var s = f64_sqrt(av);
     return _ad_push(t, s, f64_div(F64_ONE, f64_mul(F64_TWO, s)), a, 0, AD_NONE);
 }
@@ -436,13 +512,15 @@ public fn ad_pow(t, a, n) {
 }
 
 # ⚠ At 0 the derivative does not exist; this takes the RIGHT-hand one, matching
-# dual_abs. See the note there.
+# dual_abs. See the note there. A NaN has no sign, so its partial is the NaN itself
+# (3.4.0, as dual_abs; through 3.3.7 it was 1), and the value is f64_abs(v): |-0| = +0.
 #must_use
 public fn ad_abs(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
     var av = ad_val(t, a);
     if (f64_lt(av, 0) == 1) { return _ad_push(t, f64_neg(av), f64_neg(F64_ONE), a, 0, AD_NONE); }
-    return _ad_push(t, av, F64_ONE, a, 0, AD_NONE);
+    if (f64_eq(av, av) == 0) { return _ad_push(t, f64_abs(av), av, a, 0, AD_NONE); }
+    return _ad_push(t, f64_abs(av), F64_ONE, a, 0, AD_NONE);
 }
 
 # ================================================================

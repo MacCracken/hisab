@@ -4,7 +4,7 @@
 #
 # Provides:
 #   Number theory:   num_extended_gcd, num_euler_totient, num_mobius,
-#                    num_divisor_sigma, num_pollard_rho, num_factorize,
+#                    num_divisor_sigma, num_pollard_rho_checked, num_factorize,
 #                    num_crt, num_continued_fraction_rational, num_modinv
 #   DST/DCT:         num_dst, num_idst, num_dct, num_idct
 #   2D FFT:          num_fft_2d, num_ifft_2d
@@ -118,17 +118,20 @@ public fn num_extended_gcd(a, b, out_x, out_y) {
 # Modular inverse: returns a^(-1) mod m, or -1 if gcd(a, m) != 1.
 # a, m: positive integers
 # Returns: modular inverse, or -1 if not invertible
+# 3.4.0: the Bezout coefficients land in two stack slots. They were two alloc(8) calls,
+# unchecked (a null was written through on an exhausted heap) and never released, so every
+# call grew the bump heap by 16 bytes.
 public fn num_modinv(a, m) {
     if (m <= 0) { return 0 - 1; }
     if (a < 0) { a = a % m + m; }
 
-    var out_x = alloc(8);
-    var out_y = alloc(8);
-    var g = num_extended_gcd(a, m, out_x, out_y);
+    var xy: i64[2];
+    var xp = &xy;
+    var g = num_extended_gcd(a, m, xp, xp + 8);
     if (g != 1) {
         return 0 - 1;
     }
-    var x = load64(out_x);
+    var x = load64(xp);
     # Normalize to [0, m) without forming x + m. 3.3.0: this was `((x % m) + m) % m`,
     # and `x % m + m` wraps once m > 2^62 -- num_modinv(5, 2^63-1) returned a negative
     # non-inverse and num_modinv(1, 2^63-1) returned -1, "not invertible", which made
@@ -313,12 +316,30 @@ fn _numx_int_pow(base, exp) {
 }
 
 # Pollard's rho algorithm: finds a non-trivial factor of n.
-# Returns a factor of n, or n itself if n is prime.
 # n: integer > 1
-public fn num_pollard_rho(n) {
-    if (n <= 1) { return n; }
-    if (n % 2 == 0) { return 2; }
-    if (num_is_prime(n) == 1) { return n; }
+# Returns: Ok(d) with 1 < d < n and d | n for a composite n, Ok(n) exactly when n is
+# prime (a prime's only factor above 1); Err(HSB_ERR_INVALID_INPUT) for n <= 1, and
+# Err(HSB_ERR_NO_CONVERGENCE) if every rho sequence (c = 1 .. n - 1) fails to split a
+# composite -- which no odd composite measured reaches.
+# ⛔ 3.4.0 — RETIRES `num_pollard_rho`, WHICH RETURNED n FOR EVERY n <= 1 (roadmap [3.4.0]
+# D069). n itself is the answer that means "n is prime", so 1 (no prime factor at all),
+# 0 and every negative n (outside the domain, i64 min included) came back reading as
+# primes. No integer answer is right for them, so the replacement returns a Result and
+# they are Err; the fallback after the c loop, which returned n for a composite it could
+# not split, is Err too, so Ok(n) now holds only for a prime. On n > 1 the answers are
+# the retired function's, bit for bit: against an exact factorisation (python3, a
+# deterministic Miller-Rabin and trial division) it was right on every n from 2 to
+# 200,000 and on 4,815 n up to 2^63 - 1 (primes and 2^63 - j near the top, prime powers,
+# 60 squares of primes near sqrt(2^63), cubes, balanced and unbalanced semiprimes,
+# Carmichael numbers, 500 random n), slowest 333 ms (3036999209^2), and never
+# non-terminating.
+# [measured: scratch rho oracle, 204,814 n, base tree (3.3.7 source, cycc 6.7.9), 2026-10-31]
+# [measured: tests/hisab.tcyr, group "3.4.0: num_pollard_rho_checked refuses n <= 1"]
+#must_use
+public fn num_pollard_rho_checked(n) {
+    if (n <= 1) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n % 2 == 0) { return Ok(2); }
+    if (num_is_prime(n) == 1) { return Ok(n); }
 
     # Floyd's cycle detection: x steps once, y twice. (This comment said "Brent's
     # improvement" through 3.2.x; Brent's variant batches the gcds, and this does not.)
@@ -345,20 +366,23 @@ public fn num_pollard_rho(n) {
         }
 
         if (d != n) {
-            return d;
+            return Ok(d);
         }
         c = c + 1;
     }
 
-    # Fallback: return n (could not find factor)
-    return n;
+    # Every c failed to split this composite. Through 3.3.7 this returned n, the prime
+    # answer; num_factorize's trial-division fallback is the caller that handles it.
+    return Err(HSB_ERR_NO_CONVERGENCE);
 }
 
 # Full integer factorization using Pollard's rho with trial division.
-# Returns a vec of prime factors with multiplicity, sorted ascending.
+# Returns a vec of prime factors with multiplicity, sorted ascending, or 0 when a vec
+# cannot be allocated (3.4.0; vec_new's 0 was pushed through before).
 # n: integer > 0
 public fn num_factorize(n) {
     var factors = vec_new();
+    if (factors == 0) { return 0; }
     if (n <= 1) { return factors; }
 
     # Trial division for small primes
@@ -390,6 +414,7 @@ public fn num_factorize(n) {
     # attempt sat here: it allocated a vec, pushed n and broke out of its loop on
     # the first pass, and nothing read it. 3.3.2 deleted it.)
     var work = vec_new();
+    if (work == 0) { return 0; }
     vec_push(work, n);
     var wi = 0;
     while (wi < vec_len(work)) {
@@ -402,8 +427,9 @@ public fn num_factorize(n) {
             continue;
         }
 
-        var d = num_pollard_rho(m);
-        if (d == m) {
+        # m > 1 and composite here, so only the no-convergence Err can come back.
+        var dt, d = num_pollard_rho_checked(m);
+        if (is_err_result(dt) == 1) {
             # Could not split further; use trial division fallback
             var td = 2;
             var mm = m;
@@ -501,7 +527,8 @@ public fn num_crt(remainders, moduli, count, out_x, out_m) {
 # p, q: positive integers (q = 0 returns an empty vec; so do (i64 min, -1) and
 # (-1, i64 min), below). Other negative arguments expand by truncating division:
 # (-7, 3) gives [-2, -3], which evaluates to -7/3 but is not the regular expansion.
-# Returns: vec of coefficients [a0, a1, a2, ...]
+# Returns: vec of coefficients [a0, a1, a2, ...], or 0 when the vec cannot be allocated
+# (3.4.0; vec_new's 0 was pushed through before).
 # ⛔ 3.3.3 — TWO NEGATIVE PAIRS KILLED THE PROCESS. i64 min / -1 does not fit, and
 # x86 `idiv` traps on it (SIGFPE) rather than wrapping. (i64 min, -1) divides so on
 # the first pass and (-1, i64 min) on the second, after 0 is pushed; 3.3.2 died on
@@ -512,6 +539,7 @@ public fn num_crt(remainders, moduli, count, out_x, out_m) {
 # [measured: tests/abuse.tcyr, group "3.3.3 W5: totient, mobius and sobol below their domain"]
 public fn num_continued_fraction_rational(p, q) {
     var cf = vec_new();
+    if (cf == 0) { return 0; }
     while (q != 0) {
         if (q == 0 - 1 && p == 0x8000000000000000) { return vec_new(); }
         vec_push(cf, p / q);

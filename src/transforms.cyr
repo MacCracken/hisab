@@ -6,10 +6,16 @@
 # ================================================================
 # Transform2D: position (Vec2), rotation (f64 radians), scale (Vec2)
 # Layout: { pos_x, pos_y, rotation, scale_x, scale_y } = 40 bytes
+#
+# 3.4.0 (the [3.3.8] allocation row): every constructor in this file returns the designed 0
+# when an allocation it needs is refused (an exhausted heap), and every Result returns
+# Err(HSB_ERR_ALLOC); none stores through or reads a 0 handle. A 0 handle passed IN is the
+# caller's (t2d_new, t3d_new and the accessors read their arguments as given).
 # ================================================================
 
 public fn t2d_new(pos, rotation, scale) {
     var t = alloc(40);
+    if (t == 0) { return 0; }
     store64(t, HVec2_x(pos));
     store64(t + 8, HVec2_y(pos));
     store64(t + 16, rotation);
@@ -19,7 +25,14 @@ public fn t2d_new(pos, rotation, scale) {
 }
 
 public fn t2d_identity() {
-    return t2d_new(hvec2_zero(), 0, hvec2_one());
+    var t = alloc(40);
+    if (t == 0) { return 0; }
+    store64(t, 0);
+    store64(t + 8, 0);
+    store64(t + 16, 0);
+    store64(t + 24, F64_ONE);
+    store64(t + 32, F64_ONE);
+    return t;
 }
 
 public fn t2d_pos_x(t) { return load64(t); }
@@ -47,11 +60,14 @@ public fn t2d_compose(a, b) {
     var ax = t2d_pos_x(a); var ay = t2d_pos_y(a);
     var rx = f64_add(f64_sub(f64_mul(c, f64_mul(ax, bsx)), f64_mul(s, f64_mul(ay, bsy))), t2d_pos_x(b));
     var ry = f64_add(f64_add(f64_mul(s, f64_mul(ax, bsx)), f64_mul(c, f64_mul(ay, bsy))), t2d_pos_y(b));
-    return t2d_new(
-      hvec2_new(rx, ry),
-      f64_add(t2d_rotation(a), t2d_rotation(b)),
-      hvec2_new(f64_mul(t2d_scale_x(a), bsx), f64_mul(t2d_scale_y(a), bsy))
-      );
+    var t = alloc(40);
+    if (t == 0) { return 0; }
+    store64(t, rx);
+    store64(t + 8, ry);
+    store64(t + 16, f64_add(t2d_rotation(a), t2d_rotation(b)));
+    store64(t + 24, f64_mul(t2d_scale_x(a), bsx));
+    store64(t + 32, f64_mul(t2d_scale_y(a), bsy));
+    return t;
 }
 
 # ================================================================
@@ -62,14 +78,21 @@ public fn t2d_compose(a, b) {
 
 public fn t3d_new(pos, rotation, scale) {
     var t = alloc(24);
+    if (t == 0) { return 0; }
     store64(t, pos);
     store64(t + 8, rotation);
     store64(t + 16, scale);
     return t;
 }
 
+# A transform made of the three handles, or 0 if any is 0 (a part whose allocation was refused).
+fn _t3d_of(pos, rotation, scale) {
+    if (pos == 0 || rotation == 0 || scale == 0) { return 0; }
+    return t3d_new(pos, rotation, scale);
+}
+
 public fn t3d_identity() {
-    return t3d_new(hvec3_zero(), hquat_identity(), hvec3_one());
+    return _t3d_of(hvec3_zero(), hquat_identity(), hvec3_one());
 }
 
 public fn t3d_pos(t) { return load64(t); }
@@ -82,18 +105,35 @@ public fn t3d_to_matrix(t) {
 
 public fn t3d_apply(t, point) {
     var scaled = hvec3_mul(t3d_scale(t), point);
+    if (scaled == 0) { return 0; }
     var rotated = hquat_rotate_vec3(t3d_rot(t), scaled);
+    if (rotated == 0) { return 0; }
     return hvec3_add(rotated, t3d_pos(t));
 }
 
-public fn t3d_inverse_matrix(t) {
-    return m4_inverse(t3d_to_matrix(t));
+# The inverse of t's matrix, `m4_inverse_checked`'s Result: `Err(HSB_ERR_SINGULAR_MATRIX)` for a
+# zero scale component, `Err(HSB_ERR_INVALID_INPUT)` for a zero rotation quaternion or a NaN or
+# infinite component. A zero q is not a singular rotation but no rotation at all: every path
+# from q to a rotation gives NaN for it (`hquat_rotate_vec3`, `m3_from_quat`, `m4_from_srt`'s
+# 3x3 block), and a NaN entry is invalid input. 3.4.0: replaces `t3d_inverse_matrix`, which
+# returned the identity for a zero scale, and for a zero q the inverse of the translation and
+# scale alone (3.3.7's unit-q formula read q = 0 as no rotation). (Through the first 3.4.0
+# review this comment promised SINGULAR for q = 0 while `m4_from_srt` made q = 0 the identity
+# rotation, and it returned Ok.)
+# [measured: REV-FB harness/t3d2.cyr and scratch t_mf4.py, the first 3.4.0 review and this tree, 2026-10-31]
+#must_use
+public fn t3d_inverse_matrix_checked(t) {
+    var m = t3d_to_matrix(t);
+    if (m == 0) { return Err(HSB_ERR_ALLOC); }
+    return m4_inverse_checked(m);
 }
 
 public fn t3d_compose(a, b) {
     var scaled_pos = hvec3_mul(t3d_scale(b), t3d_pos(a));
+    if (scaled_pos == 0) { return 0; }
     var rotated_pos = hquat_rotate_vec3(t3d_rot(b), scaled_pos);
-    return t3d_new(
+    if (rotated_pos == 0) { return 0; }
+    return _t3d_of(
       hvec3_add(rotated_pos, t3d_pos(b)),
       hquat_mul(t3d_rot(b), t3d_rot(a)),
       hvec3_mul(t3d_scale(b), t3d_scale(a))
@@ -102,7 +142,7 @@ public fn t3d_compose(a, b) {
 
 # Interpolate between two 3D transforms
 public fn t3d_lerp(a, b, t) {
-    return t3d_new(
+    return _t3d_of(
       hvec3_lerp(t3d_pos(a), t3d_pos(b), t),
       hquat_slerp(t3d_rot(a), t3d_rot(b), t),
       hvec3_lerp(t3d_scale(a), t3d_scale(b), t)
@@ -117,21 +157,54 @@ public fn hisab_lerp(a, b, t) {
     return f64_add(a, f64_mul(f64_sub(b, a), t));
 }
 
-public fn hisab_inverse_lerp(a, b, value) {
+# The t with hisab_lerp(a, b, t) = value, (value - a) / (b - a), as `Ok(t)`;
+# `Err(HSB_ERR_DIVISION_BY_ZERO)` for a == b, where no t or every t solves it, and
+# `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite input.
+# ⛔ `denom` is the WIDTH of the caller's interval, in the caller's own units —
+# metres, seconds, kelvin, pixels — and through 2.14 it was tested against an absolute 1e-12.
+# ⛔ 3.4.0 — AND THE DBL_MIN GUARD THAT REPLACED IT STILL RETURNED 0 (audit D069): for a == b,
+# where 0 is also the right answer for value == a, so a caller could not tell a refusal from a
+# result, and for every subnormal width, where the division is exact IEEE arithmetic with a
+# right answer: (0, 2^-1074, 2^-1074) is 1 and (0, 2^-1030, 2^-1031) is 0.5, and both gave 0.
+# A width or offset that overflowed gave 0 or +-Inf for a finite t ((-DBL_MAX, DBL_MAX, 0) is
+# 0.5): those divide halved copies, exact for every input that can overflow them. The old
+# name is retired, not redefined.
+#must_use
+public fn hisab_inverse_lerp_checked(a, b, value) {
     var denom = f64_sub(b, a);
-    # ⛔ `denom` is the WIDTH of the caller's interval, in the caller's own units —
-    # metres, seconds, kelvin, pixels — tested against an absolute 1e-12. And the
-    # fallback is indistinguishable from success: 0.0 is also the correct answer
-    # for `value == a`, so a caller cannot tell a refusal from a result.
-    # ⚠ The division is by `denom` directly with an unbounded numerator, so the
-    # reciprocal test used elsewhere in this release does not apply — the guard is
-    # DBL_MIN, the point below which the division itself is undefined.
-    if (f64_lt(f64_abs(denom), F64_TINY) == 1) { return 0; }
-    return f64_div(f64_sub(value, a), denom);
+    var num = f64_sub(value, a);
+    # denom finite and non-zero and num finite: then a, b and value are all finite.
+    if (f64_eq(denom, 0) == 0 && (denom & 0x7FF0_0000_0000_0000) != 0x7FF0_0000_0000_0000
+      && (num & 0x7FF0_0000_0000_0000) != 0x7FF0_0000_0000_0000) {
+        return Ok(f64_div(num, denom));
+    }
+    if (((a & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000)
+      || ((b & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000)
+      || ((value & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000)) {
+        return Err(HSB_ERR_INVALID_INPUT);
+    }
+    if (f64_eq(denom, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    # b - a or value - a overflowed: the halves cannot, and halving is exact for every finite
+    # input big enough to cause it (a lost low bit of a subnormal half moves nothing past
+    # DBL_MAX / 2).
+    var ha = f64_mul(a, F64_HALF);
+    return Ok(f64_div(f64_sub(f64_mul(value, F64_HALF), ha), f64_sub(f64_mul(b, F64_HALF), ha)));
 }
 
-public fn hisab_remap(value, in_lo, in_hi, out_lo, out_hi) {
-    return hisab_lerp(out_lo, out_hi, hisab_inverse_lerp(in_lo, in_hi, value));
+# value mapped from [in_lo, in_hi] onto [out_lo, out_hi] by the affine map between them, as
+# `Ok(x)`, with `hisab_inverse_lerp_checked`'s Err cases. For in_lo == in_hi the map is not
+# determined, except that value == in_lo with out_lo == out_hi has the one answer out_lo.
+# 3.4.0: replaces `hisab_remap`, which returned out_lo for in_lo == in_hi (audit D069).
+#must_use
+public fn hisab_remap_checked(value, in_lo, in_hi, out_lo, out_hi) {
+    var tt, tv = hisab_inverse_lerp_checked(in_lo, in_hi, value);
+    if (is_err_result(tt) == 1) {
+        if (tv == HSB_ERR_DIVISION_BY_ZERO && f64_eq(value, in_lo) == 1 && f64_eq(out_lo, out_hi) == 1) {
+            return Ok(out_lo);
+        }
+        return Err(tv);
+    }
+    return Ok(hisab_lerp(out_lo, out_hi, tv));
 }
 
 # ================================================================
@@ -144,12 +217,18 @@ public fn hquat_from_euler(x, y, z, order) {
     var qx = hquat_from_rotation_x(x);
     var qy = hquat_from_rotation_y(y);
     var qz = hquat_from_rotation_z(z);
-    if (order == EULER_XYZ) { return hquat_mul(hquat_mul(qx, qy), qz); }
-    if (order == EULER_XZY) { return hquat_mul(hquat_mul(qx, qz), qy); }
-    if (order == EULER_YXZ) { return hquat_mul(hquat_mul(qy, qx), qz); }
-    if (order == EULER_YZX) { return hquat_mul(hquat_mul(qy, qz), qx); }
-    if (order == EULER_ZXY) { return hquat_mul(hquat_mul(qz, qx), qy); }
-    return hquat_mul(hquat_mul(qz, qy), qx);
+    if (qx == 0 || qy == 0 || qz == 0) { return 0; }
+    var a = qz;
+    var b = qy;
+    var c = qx;
+    if (order == EULER_XYZ) { a = qx; b = qy; c = qz; }
+    if (order == EULER_XZY) { a = qx; b = qz; c = qy; }
+    if (order == EULER_YXZ) { a = qy; b = qx; c = qz; }
+    if (order == EULER_YZX) { a = qy; b = qz; c = qx; }
+    if (order == EULER_ZXY) { a = qz; b = qx; c = qy; }
+    var ab = hquat_mul(a, b);
+    if (ab == 0) { return 0; }
+    return hquat_mul(ab, c);
 }
 
 # ================================================================
@@ -158,6 +237,7 @@ public fn hquat_from_euler(x, y, z, order) {
 
 public fn m4_flip_handedness_z(m) {
     var r = m4_copy(m);
+    if (r == 0) { return 0; }
     # Negate column 2
     m4_set(r, 2, 0, f64_neg(m4_get(m, 2, 0)));
     m4_set(r, 2, 1, f64_neg(m4_get(m, 2, 1)));
@@ -170,6 +250,12 @@ public fn m4_flip_handedness_z(m) {
 # Screen/world projection
 # ================================================================
 
+# `world_to_screen_checked`'s certificate on w: mat4.cyr's `_M4_W_LO` and `_M4_W_CERT`.
+enum _T3dW {
+    _T3D_W_LO   = 0x03F0_0000_0000_0000;   # 2^-960
+    _T3D_W_CERT = 0x4130_0000_0000_0000;   # 2^20
+}
+
 # clip * 2^s for `world_to_screen`'s finite non-zero w whose 1/w is not normal: mat4.cyr's
 # `_m4_w_scaled` copy, whose comment gives the reasons (a module cannot call another's `_` fn).
 fn _t3d_clip_w_scaled(clip) {
@@ -177,44 +263,80 @@ fn _t3d_clip_w_scaled(clip) {
     var s = (1023 + 1022) << 52;                                          # 2^1022
     if (e != 0) { s = (3067 - e) << 52; }                                 # 1/2, 1/4
     var r = alloc(sizeof(HVec4));
+    if (r == 0) { return 0; }
     f64v_scale(r, clip, s, 4);
     return r;
 }
 
-# Returns Vec3: (screen_x, screen_y, depth)
-public fn world_to_screen(point, mvp, vw, vh) {
-    var clip = m4_mul_vec4(mvp, hvec4_from_vec3(point, F64_ONE));
+# The screen position of `point` through `mvp` on a vw x vh viewport, (screen_x, screen_y,
+# depth), as `Ok(vec3)`; `Err(HSB_ERR_DIVISION_BY_ZERO)` where the clip w is 0 (the point maps
+# to infinity, the camera plane), `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite entry of
+# mvp or point. The normalised device coordinates are `m4_transform_point_checked(mvp, point)`
+# bit for bit: the same arithmetic is written out here, and the cases it cannot answer (w = +-0,
+# NaN or +-Inf, or a quotient that is not finite) are that function's.
+# ⛔ `cw` carries the MVP's own scale, so the absolute 1e-12 this tested through 2.14 refused
+# ordinary projections and returned `hvec3_zero()`.
+# ⛔ 3.3.5 — the reciprocal test that replaced it also fired for every subnormal |w| <= 2^-1024,
+# where 1/w overflows (MVP = 2^-1074 I put (3, 5, 7) at (0, 0, 0), not (1600, -1200, 4) on
+# 800 x 600), and above 2^1022 the subnormal 1/w moved the point. Both bands divide the
+# power-of-two copy m4_transform_point uses (its comment has the sweep).
+# [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+# ⛔ 3.4.0 — REPLACES `world_to_screen`, WHICH STILL RETURNED `hvec3_zero()` for w = +-0 and
+# for a NaN w (audit D069): (0, 0, 0) is the top-left corner on the near plane, a legal answer.
+# A w of +-Inf put the point at the screen centre (1/w = 0), and an overflowing clip vector
+# from finite input did the same or gave +-Inf. It is retired, not redefined.
+#must_use
+public fn world_to_screen_checked(point, mvp, vw, vh) {
+    var hp = hvec4_from_vec3(point, F64_ONE);
+    if (hp == 0) { return Err(HSB_ERR_ALLOC); }
+    var clip = m4_mul_vec4(mvp, hp);
+    if (clip == 0) { return Err(HSB_ERR_ALLOC); }
     var cw = HVec4_w(clip);
-    # ⛔ `cw` is the homogeneous scale of the clip vector and carries the MVP's own
-    # scale, so an absolute 1e-12 refused ordinary projections — and returned
-    # `hvec3_zero()`, which is a perfectly legitimate screen position (left edge,
-    # top edge, near plane). Guard the reciprocal that is formed on the next line.
-    # ⛔ 3.3.5 — THAT GUARD ALSO FIRED FOR EVERY SUBNORMAL |w| <= 2^-1024, where 1/w overflows:
-    # MVP = 2^-1074 I put (3, 5, 7) at (0, 0, 0), not (1600, -1200, 4) on 800 x 600. Above
-    # 2^1022 the subnormal 1/w moved the point. Both bands now divide the power-of-two copy
-    # m4_transform_point uses (its comment has the sweep), and every sweep answer is that
-    # function's quotient mapped to the screen, bit for bit, in 3.3.5 and here alike.
-    # w = +-0 and NaN still return (0, 0, 0) (D069) and w = +-Inf still maps 1/w = +-0. The
-    # copy is taken only for a finite non-zero w; for the others the exit below would discard
-    # it anyway (removing the test moved none of 70,065 sweep answers).
-    # [measured: scratch harness and Fraction oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
-    var inv_w = f64_div(F64_ONE, cw);
-    var ai = f64_abs(inv_w);
-    if (f64_lt(ai, F64_TINY) == 1 || f64_lt(ai, F64_POS_INF) == 0) {
-        if (f64_eq(cw, 0) == 0 && f64_lt(f64_abs(cw), F64_POS_INF) == 1) {
-            clip = _t3d_clip_w_scaled(clip);
-            inv_w = f64_div(F64_ONE, HVec4_w(clip));
+    var nx = 0;
+    var ny = 0;
+    var nz = 0;
+    var edge = 0;
+    var inv_w = 0;
+    # `m4_transform_point_checked`'s certificate on w, the same arithmetic (mat4.cyr says why):
+    # where it fails that function decides on the exact w.
+    var sw = f64_add(f64_add(f64_add(f64_abs(f64_mul(load64(mvp + 24), HVec3_x(point))),
+          f64_abs(f64_mul(load64(mvp + 56), HVec3_y(point)))),
+        f64_abs(f64_mul(load64(mvp + 88), HVec3_z(point)))), f64_abs(load64(mvp + 120)));
+    var aw = f64_abs(cw);
+    if (f64_ge(aw, _T3D_W_LO) == 0 || f64_le(sw, f64_mul(aw, _T3D_W_CERT)) == 0) {
+        edge = 1;
+    } else {
+        inv_w = f64_div(F64_ONE, cw);
+        if (f64_lt(f64_abs(inv_w), F64_TINY) == 1) {
+            if (f64_lt(aw, F64_POS_INF) == 0) {
+                edge = 1;
+            } else {
+                clip = _t3d_clip_w_scaled(clip);
+                if (clip == 0) { return Err(HSB_ERR_ALLOC); }
+                inv_w = f64_div(F64_ONE, HVec4_w(clip));
+            }
         }
-        if (f64_lt(f64_abs(inv_w), F64_POS_INF) == 0) { return hvec3_zero(); }  # at camera
     }
-    var nx = f64_mul(HVec4_x(clip), inv_w);
-    var ny = f64_mul(HVec4_y(clip), inv_w);
-    var nz = f64_mul(HVec4_z(clip), inv_w);
-    return hvec3_new(
+    if (edge == 0) {
+        nx = f64_mul(HVec4_x(clip), inv_w);
+        ny = f64_mul(HVec4_y(clip), inv_w);
+        nz = f64_mul(HVec4_z(clip), inv_w);
+        if ((f64_add(f64_add(nx, ny), nz) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { edge = 1; }
+    }
+    if (edge == 1) {
+        var pt, ndc = m4_transform_point_checked(mvp, point);
+        if (is_err_result(pt) == 1) { return Err(ndc); }
+        nx = HVec3_x(ndc);
+        ny = HVec3_y(ndc);
+        nz = HVec3_z(ndc);
+    }
+    var sp = hvec3_new(
       f64_mul(f64_add(f64_mul(nx, F64_HALF), F64_HALF), vw),
       f64_mul(f64_sub(F64_ONE, f64_add(f64_mul(ny, F64_HALF), F64_HALF)), vh),
       f64_add(f64_mul(nz, F64_HALF), F64_HALF)
       );
+    if (sp == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(sp);
 }
 
 # 1 when inv_w = 1 / w is not a normal double (it overflowed, or it is subnormal) while w
@@ -229,12 +351,19 @@ fn _t3d_w_copy(p, inv_w) {
     return 0;
 }
 
-# Returns two Vec3: origin and direction (via out params)
+# Returns two Vec3: origin and direction (via out params), and 0; HSB_ERR_ALLOC (out params
+# untouched) where an allocation is refused (3.4.0).
 public fn screen_to_world_ray(sx, sy, inv_vp, vw, vh, out_origin, out_dir) {
     var nx = f64_sub(f64_mul(f64_div(sx, vw), F64_TWO), F64_ONE);
     var ny = f64_sub(F64_ONE, f64_mul(f64_div(sy, vh), F64_TWO));
-    var near = m4_mul_vec4(inv_vp, hvec4_new(nx, ny, f64_neg(F64_ONE), F64_ONE));
-    var far = m4_mul_vec4(inv_vp, hvec4_new(nx, ny, F64_ONE, F64_ONE));
+    var hn = hvec4_new(nx, ny, f64_neg(F64_ONE), F64_ONE);
+    if (hn == 0) { return HSB_ERR_ALLOC; }
+    var near = m4_mul_vec4(inv_vp, hn);
+    if (near == 0) { return HSB_ERR_ALLOC; }
+    var hf = hvec4_new(nx, ny, F64_ONE, F64_ONE);
+    if (hf == 0) { return HSB_ERR_ALLOC; }
+    var far = m4_mul_vec4(inv_vp, hf);
+    if (far == 0) { return HSB_ERR_ALLOC; }
     # ⛔ 3.3.7 — THE RECIPROCAL world_to_screen LOST IN 3.3.5, LOST HERE TOO. 1 / w overflows
     # for every subnormal |w| <= 2^-1024 and is subnormal past 2^1022, so inv_vp = 2^-1074 I on
     # 800 x 600 gave the centre's origin (NaN, NaN, -Inf) and a NaN direction, where the exact
@@ -248,16 +377,24 @@ public fn screen_to_world_ray(sx, sy, inv_vp, vw, vh, out_origin, out_dir) {
     var nw = f64_div(F64_ONE, HVec4_w(near));
     if (_t3d_w_copy(near, nw) == 1) {
         near = _t3d_clip_w_scaled(near);
+        if (near == 0) { return HSB_ERR_ALLOC; }
         nw = f64_div(F64_ONE, HVec4_w(near));
     }
     var fw = f64_div(F64_ONE, HVec4_w(far));
     if (_t3d_w_copy(far, fw) == 1) {
         far = _t3d_clip_w_scaled(far);
+        if (far == 0) { return HSB_ERR_ALLOC; }
         fw = f64_div(F64_ONE, HVec4_w(far));
     }
     var np = hvec3_new(f64_mul(HVec4_x(near), nw), f64_mul(HVec4_y(near), nw), f64_mul(HVec4_z(near), nw));
+    if (np == 0) { return HSB_ERR_ALLOC; }
     var fp = hvec3_new(f64_mul(HVec4_x(far), fw), f64_mul(HVec4_y(far), fw), f64_mul(HVec4_z(far), fw));
+    if (fp == 0) { return HSB_ERR_ALLOC; }
+    var dv = hvec3_sub(fp, np);
+    if (dv == 0) { return HSB_ERR_ALLOC; }
+    var dn = hvec3_normalize(dv);
+    if (dn == 0) { return HSB_ERR_ALLOC; }
     store64(out_origin, np);
-    store64(out_dir, hvec3_normalize(hvec3_sub(fp, np)));
+    store64(out_dir, dn);
     return 0;
 }

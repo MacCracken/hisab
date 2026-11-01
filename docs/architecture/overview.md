@@ -3,8 +3,8 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v3.3.7 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 42,482
-> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.6.20; a
+> hisab v3.4.0 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 52,483
+> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.7.9; a
 > consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map
@@ -30,7 +30,7 @@ hisab (Cyrius)
 │
 ├── Geometry
 │   ├── geo.cyr            — 9 primitives, 6 ray tests, closest-point queries
-│   ├── geo_advanced.cyr   — GJK/EPA 3D, MPR/XenoCollide, SDF+CSG, swept AABB, TOI, CGA 5D, BVH
+│   ├── geo_advanced.cyr   — GJK/EPA 3D, MPR (penetration; intersect via GJK), SDF+CSG, swept AABB, TOI, CGA 5D, BVH
 │   ├── geo_diff.cyr       — Ray/surface JETS for all six primitives: t plus its full
 │   │                        gradient from one evaluation, as a post-pass on the shipped primal
 │   └── spatial.cyr        — k-d tree, octree, quadtree, spatial hash (BVH lives in geo_advanced)
@@ -99,7 +99,8 @@ listed module breaks the build. Both checks hold for all 35 rows (re-derived 202
 re-checked by the same two checks 2026-10-31 on 3.3.7, which found five rows stale: `complex`, and
 through it `linalg_ext` and `linalg_precision`, need `f64_util` for `f64_copysign`, and `mat4` and
 `transforms` stopped needing it when 3.3.4 retired hisab's `f64_tan`; each module's own `# Requires`
-comment said the same and is corrected too).
+comment said the same and is corrected too; re-checked again 2026-10-31 on 3.4.0, which found
+`symbolic` needing `error` for `expr_eval_checked`'s codes, and `symbolic_ext` through it).
 Undefined *functions* count even when nothing calls them. A function is only a warning until
 something reaches it, and a set that leaves one out is a trap for whoever calls it next.
 
@@ -138,7 +139,7 @@ that took any of the other nine through hisab's sidecar must now declare it.
 | `error` | *(standalone)* |
 | `f64_util` | *(standalone)* |
 | `interval` | *(standalone)* |
-| `symbolic` | *(standalone)* |
+| `symbolic` | `error` |
 | `tensor` | *(standalone)* |
 | `autodiff` | `error` |
 | `complex` | `error` `f64_util` (`f64_copysign`) |
@@ -147,7 +148,7 @@ that took any of the other nine through hisab's sidecar must now declare it.
 | `num` | `error` |
 | `ode` | `error` |
 | `optimize` | `error` |
-| `symbolic_ext` | `symbolic` |
+| `symbolic_ext` | `error`, `symbolic` |
 | `vec2` | `error` |
 | `vec3` | `error` |
 | `collision_core` | `error` `vec2` |
@@ -230,7 +231,7 @@ Penetration { normal, depth }  →  contact_new()
      ▼
 ┌──────────────────────────────┐
 │  Constraint solve:           │  sequential_impulse()  (accumulate-clamp impulses)
-│  sequential_impulse / PGS    │  solve_pgs()           (projected Gauss-Seidel LCP)
+│  sequential_impulse / PGS    │  solve_pgs_checked()   (projected Gauss-Seidel LCP)
 └──────────────────────────────┘
      │
      ▼

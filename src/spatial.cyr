@@ -71,6 +71,7 @@ var _SP_MAX_TREE_DEPTH = 1075;
 
 fn _kd_node_alloc(point_idx, split_axis, split_val, left, right) {
     var n = alloc(40);
+    if (n == 0) { return 0; }
     store64(n, point_idx);
     store64(n + 8, split_axis);
     store64(n + 16, split_val);
@@ -273,8 +274,12 @@ fn _kd_build_rec(items, points, start, end, depth, plane_out) {
     # Read BEFORE recursing: the children reuse this same slot.
     var split_val = load64(plane_out);
 
+    # A subtree that could not get its nodes is 0, and a split node holding a 0 child
+    # would answer queries with that half of the points missing: refuse the whole tree.
     var left = _kd_build_rec(items, points, start, split, depth + 1, plane_out);
+    if (left == 0) { return 0; }
     var right = _kd_build_rec(items, points, split, end, depth + 1, plane_out);
+    if (right == 0) { return 0; }
 
     return _kd_node_alloc(0 - 1, axis, split_val, left, right);
 }
@@ -299,6 +304,7 @@ public fn kdtree_build(points, count) {
 
     # Build index list
     var items = vec_new();
+    if (items == 0) { return 0; }
     for (var i = 0; i < count; i = i + 1) {
         vec_push(items, i);
     }
@@ -321,8 +327,12 @@ fn _kd_nearest_rec(node, points, query, best_out) {
     if (pidx >= 0) {
         # Leaf node
         var pt = load64(points + pidx * 8);
-        var diff = hvec3_sub(pt, query);
-        var dist_sq = hvec3_dot(diff, diff);
+        # The difference is a stack HVec3 formed as hvec3_sub forms it (3.4.0): the
+        # query returns an index, with no value left for a refused allocation.
+        var diff: i64[3];
+        f64v_sub(&diff, pt, query, 2);
+        HVec3_set_z(&diff, f64_sub(HVec3_z(pt), HVec3_z(query)));
+        var dist_sq = hvec3_dot(&diff, &diff);
         if (f64_lt(dist_sq, load64(best_out + 8)) == 1) {
             store64(best_out, pidx);
             store64(best_out + 8, dist_sq);
@@ -363,7 +373,11 @@ fn _kd_nearest_rec(node, points, query, best_out) {
 public fn kdtree_nearest(root, points, query) {
     if (root == 0) { return 0 - 1; }
 
-    var best_out = alloc(16);
+    # A stack slot pair (3.4.0): this returns an index, and its one sentinel, -1, already
+    # means "empty tree", so there is no answer left for a refused allocation; through
+    # 3.3.7 an unchecked 16-byte heap block was stored through on every query.
+    var best_buf: i64[2];
+    var best_out = &best_buf;
     store64(best_out, 0 - 1);          # best_idx
     store64(best_out + 8, _SP_F64_POS_INF);  # best_dist_sq
 
@@ -382,8 +396,10 @@ fn _kd_radius_rec(node, points, query, radius_sq, results) {
     if (pidx >= 0) {
         # Leaf node
         var pt = load64(points + pidx * 8);
-        var diff = hvec3_sub(pt, query);
-        var dist_sq = hvec3_dot(diff, diff);
+        var diff: i64[3];    # stack, as in _kd_nearest_rec
+        f64v_sub(&diff, pt, query, 2);
+        HVec3_set_z(&diff, f64_sub(HVec3_z(pt), HVec3_z(query)));
+        var dist_sq = hvec3_dot(&diff, &diff);
         if (f64_le(dist_sq, radius_sq) == 1) {
             vec_push(results, pidx);
         }
@@ -420,6 +436,7 @@ fn _kd_radius_rec(node, points, query, radius_sq, results) {
 # Returns vec of point indices.
 public fn kdtree_within_radius(root, points, query, radius) {
     var results = vec_new();
+    if (results == 0) { return 0; }
     if (root == 0) { return results; }
 
     var radius_sq = f64_mul(radius, radius);
@@ -449,6 +466,7 @@ public fn kdtree_within_radius(root, points, query, radius) {
 
 fn _qt_bounds_new(x_min, y_min, x_max, y_max) {
     var b = alloc(32);
+    if (b == 0) { return 0; }
     store64(b, x_min);
     store64(b + 8, y_min);
     store64(b + 16, x_max);
@@ -495,8 +513,11 @@ fn _qt_bounds_overlaps(a, b) {
 
 fn _qt_node_new(bounds, depth) {
     var n = alloc(56);
+    if (n == 0) { return 0; }
     store64(n, bounds);
-    store64(n + 8, vec_new());   # points vec (interleaved x, y, data)
+    var pts = vec_new();
+    if (pts == 0) { return 0; }
+    store64(n + 8, pts);         # points vec (interleaved x, y, data)
     store64(n + 16, 0);          # child_0 NW
     store64(n + 24, 0);          # child_1 NE
     store64(n + 32, 0);          # child_2 SW
@@ -546,10 +567,21 @@ fn _qt_split(node, max_depth) {
     var pts = _qt_node_points(node);
     var depth = _qt_node_depth(node);
 
-    # Create children
+    # Create children. All four are built before any is attached: a split that cannot
+    # get them leaves the node a leaf one point over capacity, which every query still
+    # reads in full (the split is a speed-up, not part of the answer), and the next
+    # insert into it tries again. Attaching some would lose the points routed to a
+    # missing child.
+    var kids: i64[4];
     for (var ci = 0; ci < 4; ci = ci + 1) {
         var cb = _qt_child_bounds(bounds, ci);
-        _qt_node_set_child(node, ci, _qt_node_new(cb, depth + 1));
+        if (cb == 0) { return 1; }
+        var kid = _qt_node_new(cb, depth + 1);
+        if (kid == 0) { return 1; }
+        store64(&kids + ci * 8, kid);
+    }
+    for (var ci = 0; ci < 4; ci = ci + 1) {
+        _qt_node_set_child(node, ci, load64(&kids + ci * 8));
     }
 
     # Redistribute existing points
@@ -617,10 +649,14 @@ public fn quadtree_new(x_min, y_min, x_max, y_max, max_depth) {
 
     # Wrap in a handle: { root_node, max_depth, count }
     var qt = alloc(24);
-    var bounds = _qt_bounds_new(x_min, y_min, x_max, y_max);
-    store64(qt, _qt_node_new(bounds, 0));
+    if (qt == 0) { return 0; }
     store64(qt + 8, max_depth);
     store64(qt + 16, 0);  # count
+    var bounds = _qt_bounds_new(x_min, y_min, x_max, y_max);
+    if (bounds == 0) { return 0; }
+    var qroot = _qt_node_new(bounds, 0);
+    if (qroot == 0) { return 0; }
+    store64(qt, qroot);
     return qt;
 }
 
@@ -688,8 +724,10 @@ fn _qt_query_rec(node, query_bounds, results) {
 # Returns vec of data (i64) values.
 public fn quadtree_query(qt, qx_min, qy_min, qx_max, qy_max) {
     var results = vec_new();
+    if (results == 0) { return 0; }
     var root = load64(qt);
     var query_bounds = _qt_bounds_new(qx_min, qy_min, qx_max, qy_max);
+    if (query_bounds == 0) { return 0; }
     _qt_query_rec(root, query_bounds, results);
     return results;
 }
@@ -710,8 +748,11 @@ var _OT_MAX_PER_NODE = 8;
 
 fn _ot_node_new(bounds, depth) {
     var n = alloc(88);
+    if (n == 0) { return 0; }
     store64(n, bounds);
-    store64(n + 8, vec_new());   # points vec (interleaved point_ptr, data)
+    var pts = vec_new();
+    if (pts == 0) { return 0; }
+    store64(n + 8, pts);         # points vec (interleaved point_ptr, data)
     for (var ci = 0; ci < 8; ci = ci + 1) {
         store64(n + 16 + ci * 8, 0);
     }
@@ -775,14 +816,30 @@ fn _ot_octant(point, center) {
 }
 
 # Get child bounds for an octant
+# The centre of an octree box into the three slots at `out`: geo_aabb_center's
+# (min + max) * 0.5, formed with the same packed xy and scalar z operations, but on the
+# stack (3.4.0). Routing a point must not allocate: a split node that could not compute
+# its centre could not place the point, and a split's redistribution would lose points.
+# The child boxes use the same centre, so routing and boxes stay consistent.
+fn _ot_center_into(aabb, out) {
+    var mn = GeoAabb_min(aabb);
+    var mx = GeoAabb_max(aabb);
+    f64v_add(out, mn, mx, 2);
+    HVec3_set_z(out, f64_add(HVec3_z(mn), HVec3_z(mx)));
+    f64v_scale(out, out, F64_HALF, 2);
+    HVec3_set_z(out, f64_mul(HVec3_z(out), F64_HALF));
+    return 0;
+}
+
 fn _ot_child_bounds(parent_aabb, octant) {
     var mn = GeoAabb_min(parent_aabb);
     var mx = GeoAabb_max(parent_aabb);
-    var center = geo_aabb_center(parent_aabb);
+    var center: i64[3];
+    _ot_center_into(parent_aabb, &center);
 
-    var cx = HVec3_x(center);
-    var cy = HVec3_y(center);
-    var cz = HVec3_z(center);
+    var cx = HVec3_x(&center);
+    var cy = HVec3_y(&center);
+    var cz = HVec3_z(&center);
     var mnx = HVec3_x(mn);
     var mny = HVec3_y(mn);
     var mnz = HVec3_z(mn);
@@ -803,8 +860,11 @@ fn _ot_child_bounds(parent_aabb, octant) {
     var new_mxz = cz;
     if ((octant & 4) != 0) { new_mnz = cz; new_mxz = mxz; }
 
-    return geo_aabb_new(hvec3_new(new_mnx, new_mny, new_mnz),
-      hvec3_new(new_mxx, new_mxy, new_mxz));
+    var lo = hvec3_new(new_mnx, new_mny, new_mnz);
+    if (lo == 0) { return 0; }
+    var hi = hvec3_new(new_mxx, new_mxy, new_mxz);
+    if (hi == 0) { return 0; }
+    return geo_aabb_new(lo, hi);
 }
 
 # Split an octree leaf node into 8 children
@@ -812,12 +872,20 @@ fn _ot_split(node, max_depth) {
     var bounds = _ot_node_bounds(node);
     var pts = _ot_node_points(node);
     var depth = _ot_node_depth(node);
-    var center = geo_aabb_center(bounds);
+    var center: i64[3];
+    _ot_center_into(bounds, &center);
 
-    # Create children
+    # Create children, all eight before any is attached (see _qt_split).
+    var kids: i64[8];
     for (var ci = 0; ci < 8; ci = ci + 1) {
         var cb = _ot_child_bounds(bounds, ci);
-        _ot_node_set_child(node, ci, _ot_node_new(cb, depth + 1));
+        if (cb == 0) { return 1; }
+        var kid = _ot_node_new(cb, depth + 1);
+        if (kid == 0) { return 1; }
+        store64(&kids + ci * 8, kid);
+    }
+    for (var ci = 0; ci < 8; ci = ci + 1) {
+        _ot_node_set_child(node, ci, load64(&kids + ci * 8));
     }
 
     # Redistribute existing points (interleaved: point_ptr, data)
@@ -825,7 +893,7 @@ fn _ot_split(node, max_depth) {
     for (var pi = 0; pi < count; pi = pi + 1) {
         var pt = vec_get(pts, pi * 2);
         var pd = vec_get(pts, pi * 2 + 1);
-        var oct = _ot_octant(pt, center);
+        var oct = _ot_octant(pt, &center);
         var child = _ot_node_child(node, oct);
         _ot_insert_rec(child, pt, pd, max_depth);
     }
@@ -839,8 +907,9 @@ fn _ot_split(node, max_depth) {
 fn _ot_insert_rec(node, point, data, max_depth) {
     if (_ot_node_is_split(node) == 1) {
         var bounds = _ot_node_bounds(node);
-        var center = geo_aabb_center(bounds);
-        var oct = _ot_octant(point, center);
+        var center: i64[3];
+        _ot_center_into(bounds, &center);
+        var oct = _ot_octant(point, &center);
         var child = _ot_node_child(node, oct);
         return _ot_insert_rec(child, point, data, max_depth);
     }
@@ -875,10 +944,14 @@ public fn octree_new(min_vec3, max_vec3, max_depth) {
     if (max_depth > _SP_MAX_TREE_DEPTH) { max_depth = _SP_MAX_TREE_DEPTH; }
 
     var ot = alloc(24);
-    var bounds = geo_aabb_new(min_vec3, max_vec3);
-    store64(ot, _ot_node_new(bounds, 0));
+    if (ot == 0) { return 0; }
     store64(ot + 8, max_depth);
     store64(ot + 16, 0);  # count
+    var bounds = geo_aabb_new(min_vec3, max_vec3);
+    if (bounds == 0) { return 0; }
+    var oroot = _ot_node_new(bounds, 0);
+    if (oroot == 0) { return 0; }
+    store64(ot, oroot);
     return ot;
 }
 
@@ -935,8 +1008,10 @@ fn _ot_query_rec(node, query_aabb, results) {
 # Returns vec of data (i64) values.
 public fn octree_query(ot, min_vec3, max_vec3) {
     var results = vec_new();
+    if (results == 0) { return 0; }
     var root = load64(ot);
     var query_aabb = geo_aabb_new(min_vec3, max_vec3);
+    if (query_aabb == 0) { return 0; }
     _ot_query_rec(root, query_aabb, results);
     return results;
 }
@@ -1057,6 +1132,7 @@ fn _sh_has_nan(p) {
 # Allocate a bucket array of `bc` chain heads, all empty (-1).
 fn _sh_buckets_new(bc) {
     var b = alloc(bc * 8);
+    if (b == 0) { return 0; }
     for (var bi = 0; bi < bc; bi = bi + 1) {
         store64(b + bi * 8, 0 - 1);
     }
@@ -1068,11 +1144,16 @@ fn _sh_buckets_new(bc) {
 # Returns: spatial hash handle pointer
 public fn spatial_hash_new(cell_size) {
     var sh = alloc(48);
+    if (sh == 0) { return 0; }
     store64(sh, cell_size);
     store64(sh + 8, f64_div(F64_ONE, cell_size));
-    store64(sh + 16, _sh_buckets_new(_SH_INIT_BUCKETS));
+    var buckets = _sh_buckets_new(_SH_INIT_BUCKETS);
+    if (buckets == 0) { return 0; }
+    store64(sh + 16, buckets);
     store64(sh + 24, _SH_INIT_BUCKETS);
-    store64(sh + 32, vec_new());
+    var entries = vec_new();
+    if (entries == 0) { return 0; }
+    store64(sh + 32, entries);
     store64(sh + 40, 0);
     return sh;
 }
@@ -1134,7 +1215,11 @@ fn _sh_reverse_from(results, from) {
 fn _sh_grow(sh) {
     var bc = _sh_bucket_count(sh);
     if (bc >= _SH_MAX_BUCKETS) { return 0; }
-    store64(sh + 16, _sh_buckets_new(bc * 2));
+    # A table that cannot get its doubled bucket array keeps the one it has: every
+    # chain stays intact and every query exact, only longer (3.4.0; this stored the 0).
+    var nb = _sh_buckets_new(bc * 2);
+    if (nb == 0) { return 0; }
+    store64(sh + 16, nb);
     store64(sh + 24, bc * 2);
     var entries = _sh_entries(sh);
     var n = vec_len(entries) / _SH_ENTRY_SIZE;
@@ -1193,6 +1278,7 @@ public fn spatial_hash_insert(sh, point, data) {
 # Returns vec of data (i64) values, in insertion order.
 public fn spatial_hash_query_cell(sh, point) {
     var results = vec_new();
+    if (results == 0) { return 0; }
     if (_sh_has_nan(point) == 1) { return results; }   # no cell (_sh_cell_coord)
     var inv = _sh_inv_cell_size(sh);
     var ix = _sh_cell_coord(HVec3_x(point), inv);
@@ -1273,6 +1359,7 @@ fn _sh_near_end(c, r) {
 # differs, and only in a regime where the old code was effectively a hang.
 public fn spatial_hash_query_radius(sh, point, radius) {
     var results = vec_new();
+    if (results == 0) { return 0; }
     # A NaN centre has no cell and a NaN radius encloses nothing (_sh_cell_coord).
     if (_sh_has_nan(point) == 1) { return results; }
     if (f64_eq(radius, radius) == 0) { return results; }

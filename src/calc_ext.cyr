@@ -27,6 +27,13 @@ var _CALCX_F64_2_POW_63 = 0x43E0_0000_0000_0000;  # 2^63
 # The scale of an adaptive Simpson panel whose width / 6 underflows (_calcx_panel_tiny).
 var _CALCX_F64_2_POW_600 = 0x6570_0000_0000_0000;  # 2^600
 var _CALCX_F64_2_POW_M600 = 0x1A70_0000_0000_0000;  # 2^-600
+# The second pass's tolerance, relative to the first pass's magnitude, when the work bound
+# cut the first (calc_adaptive_simpson_checked).
+var _CALCX_F64_2_POW_M40 = 0x3D70_0000_0000_0000;  # 2^-40
+# The adaptive noise floor's scale, per unit of half-width, and the two-level stall ratio
+# (_calcx_as_floor).
+var _CALCX_F64_2_POW_M47 = 0x3D00_0000_0000_0000;  # 2^-47
+var _CALCX_F64_2_POW_M6 = 0x3F90_0000_0000_0000;  # 2^-6
 
 # ⛔ 3.3.3 — `_CALCX_F64_1E_NEG30` NO LONGER DECIDES A FLAT SEGMENT IN ANY SET 3.3.3
 # SPLINES ITSELF. It is calc_monotone_cubic's 3.3.2 flat-secant threshold: an absolute
@@ -96,9 +103,16 @@ fn _f64arr_set(arr, i, val) {
 # f: function pointer, fncall1(f, x_ptr) -> f64 (scalar).
 # x: pointer to flat f64 array of n values.
 # n: dimension count (must be > 0), index: variable index in [0, n),
-# h: step size (f64).
-# Returns f64 (the partial derivative), or 0 on error.
-public fn calc_partial_derivative(f, x, n, index, h) {
+# h: step size (f64), out: pointer, the partial derivative (f64) written here.
+# Returns Ok(0); Err(HSB_ERR_INVALID_INPUT) for n <= 0 or an index outside [0, n);
+# Err(HSB_ERR_ALLOC) when its two n-element scratch arrays cannot be allocated. `out`
+# is untouched on every Err, and f is not called.
+# ⭐ 3.4.0 — REPLACES calc_partial_derivative, which returned 0 for all three (audit
+# D069): a legal derivative, the one every constant direction has. There is no
+# derivative with respect to a variable the function does not have.
+# [measured: tests/edge_cases.tcyr, group "3.4.0: the interpolators and the partial derivative refuse, not 0"]
+#must_use
+public fn calc_partial_derivative_checked(f, x, n, index, h, out) {
     # BOTH bounds, not just the upper one -- the same half-guard 2.7.0-C closed in
     # detect_islands. `index` is a raw f64-array subscript: _f64arr_get(x, -1)
     # reads the 8 bytes BEFORE the caller's buffer, and the two _f64arr_set calls
@@ -109,13 +123,13 @@ public fn calc_partial_derivative(f, x, n, index, h) {
     # number back. n <= 0 is rejected for the same reason: it makes both
     # _f64arr_alloc calls alloc(0) or alloc(negative), after which every
     # subscript is out of bounds.
-    if (n <= 0) { return 0; }
-    if (index < 0 || index >= n) { return 0; }
+    if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (index < 0 || index >= n) { return Err(HSB_ERR_INVALID_INPUT); }
 
     # Allocate x_plus and x_minus buffers
     var x_plus = _f64arr_alloc(n);
     var x_minus = _f64arr_alloc(n);
-    if (x_plus == 0 || x_minus == 0) { return 0; }
+    if (x_plus == 0 || x_minus == 0) { return Err(HSB_ERR_ALLOC); }
     _f64arr_copy(x_plus, x, n);
     _f64arr_copy(x_minus, x, n);
 
@@ -128,7 +142,8 @@ public fn calc_partial_derivative(f, x, n, index, h) {
     var f_minus = fncall1(f, x_minus);
 
     # Central difference: (f(x+h*e_i) - f(x-h*e_i)) / (2h)
-    return f64_div(f64_sub(f_plus, f_minus), f64_mul(F64_TWO, h));
+    store64(out, f64_div(f64_sub(f_plus, f_minus), f64_mul(F64_TWO, h)));
+    return Ok(0);
 }
 
 # Gradient of f:R^n -> R at x.
@@ -313,72 +328,47 @@ public fn calc_hessian(f, x, n, h, out) {
 # 2. ADAPTIVE SIMPSON INTEGRATION
 # ================================================================
 
-# Recursive helper for adaptive Simpson's rule.
+# Recursive helper for adaptive Simpson's rule (calc_adaptive_simpson_checked).
 # f: function pointer, a/b: interval (f64), fa/fb/fmid: endpoint+midpoint values,
-# whole: Simpson estimate over [a,b], tol: tolerance (f64), depth: max recursion.
-# Returns f64 result. On max-depth exhaustion returns best estimate.
+# whole: Simpson estimate over [a,b], tol: tolerance (f64), depth: the levels left,
+# at least 1 (the root is called with 50), cx: the call's accounting block (_CalcxAs).
+# Returns the node's estimate, and adds its error estimate to cx.
 #
-# ⚠ NON-CONVERGENCE IS NOT REPORTED. Three exits return an estimate that has not
-# met `tol` -- max depth here, a midpoint that collides with an endpoint, and a
-# NaN error estimate -- and none returns a status. The first two return `whole`.
-# The NaN exit returns `refined`, which is non-finite whenever that exit fires: a
-# NaN `whole` beside a finite `refined` cannot reach it (at the root both are built
-# from the same samples over the same [a, b], and below it the parent whose half
-# `whole` was would have taken this exit first), so only a caller-side NaN/Inf
-# check catches it. A fourth exit, since 3.3.3, returns NaN outright: a node that
-# is about to test a tolerance that has halved to zero (see below).
-# The comment on the max-depth exit used to justify that with "cannot error in
-# Cyrius -- no Result type", which has been false since 3.0.0: Result<T, E> is in
-# [deps] and ode_dopri45_trajectory already returns HSB_ERR_NO_CONVERGENCE.
-# Reporting it changes calc_adaptive_simpson's public signature, so it is
-# roadmap [3.4.0], audit D070.
+# ⭐ 3.4.0 — NON-CONVERGENCE IS REPORTED (audit D070). Through 3.3.7 three exits
+# returned an estimate that had not met `tol` -- the depth cap, a midpoint that collides
+# with an endpoint, and a NaN error estimate -- with no status, and a fourth, since 3.3.3,
+# returned NaN for a node about to test a tolerance that had halved to zero. Now every
+# node that stops adds its error estimate to cx (_calcx_as_add), and
+# calc_adaptive_simpson_checked compares their sum with tol:
+#   - a node that meets its test adds |error|, the Richardson estimate it was tested on;
+#   - a node whose children cannot be refined (the depth cap, a child's midpoint on an
+#     end, a tolerance halved to zero, the work bound; _calcx_as_cut) returns refined,
+#     the sum of its two panels, as 3.3.7 did, and adds |refined - whole|: the error of
+#     refined when the integrand converges only as h, as at a jump or in evaluation
+#     noise, where Richardson's /15 (an h^4 rate) would understate it;
+#   - a NaN estimate fails the call (two estimates of the same infinity from finite
+#     samples are that value: a finite sum past DBL_MAX).
+# The depth, collision and zero-tolerance tests that sat at a child's entry are made by
+# the parent before it recurses, on the same values (a child's midpoint is the parent's
+# left_mid or right_mid, formed the same way), so every value and evaluation count is
+# 3.3.7's except where 3.3.7 returned NaN for a zero tolerance (now the panels' sum,
+# reported) and where the work bound stops a walk.
+# ⚠ WHAT THE ACCOUNTING COSTS: calc_adaptive_simpson's bench row (x^4 on [0, 1] at 1e-10, 257
+# evaluations) 6,793 -> 7,504 ns (+10.5%, medians of 3 interleaved runs of tests/hisab.bcyr,
+# spreads 6,721-7,025 and 7,459-7,670); sin on [0, pi] at 1e-10 30.3 -> 31.1 us (+2.5%).
+# Writing _calcx_as_cut out in the frame-free recursion bought back 0.2 us of it; a global
+# block pointer in place of the parameter, and each piece of the account removed in turn,
+# moved nothing outside the spread.
+# [measured: tests/hisab.bcyr and scratch NU1-work/ba_*.bcyr, base and this tree, 2026-10-31]
 #
 # vk is the node's value frame: whole, the panels and the returned value are in units of
 # 2^vk (0 everywhere a value fits; see _calcx_reframe), while tol stays in the caller's
 # units and is scaled only where it is compared. vlim, when not 0, is a magnitude past
 # which the node's value need not be refined (see _calcx_reframe), vdesc its children's.
-fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk, vlim, vdesc) {
-    if (depth <= 0) {
-        # Return the best estimate at max depth, unreported (see above).
-        return whole;
-    }
-
+fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk, vlim, vdesc, cx) {
     var mid = f64_mul(f64_add(a, b), F64_HALF);
     if (f64_lt(f64_abs(mid), F64_POS_INF) == 0) { mid = _calcx_mid_wide(a, b); }
 
-    # Stop when bisection stops making progress. The depth counter bounds the
-    # DEPTH of the tree, not its size: every non-converged node spawns two
-    # children, so a cap of 50 permits 2^50 (~1e15) integrand evaluations, and a
-    # NaN integrand never converges (see the error test below) and so takes that
-    # path. Once mid coincides with an endpoint in f64, further subdivision
-    # cannot refine anything, which bounds the real work by f64 resolution
-    # (~50 bisections of any finite interval) rather than by the counter.
-    if (f64_eq(mid, a) == 1 || f64_eq(mid, b) == 1) {
-        return whole;
-    }
-    # ⛔ 3.3.3 — A TOLERANCE THAT HAS HALVED TO ZERO CAN NEVER BE MET (audit D071).
-    # `|error| < 0` is false for every error, exact zero included, so a node whose
-    # tolerance underflowed could stop only at the depth cap or the collision exit
-    # above, and on a wide interval that is its whole subtree: tol = 2^-1074 halves
-    # to 0 at the root's children, and x^4 over [0,1] then exceeded 2*10^7
-    # evaluations where tol = 1e-10 takes 257. The guard sits in the node about to
-    # TEST the zero: after the depth and collision exits, which return `whole`
-    # untested, and before this node's two evaluations. In the parent it also fired
-    # for children that would have left through the collision exit: a unit step at
-    # 1 + 2^-52 over [1, 1 + 2^-51] (two ulps) at tol = 2^-1074 returned NaN, where
-    # 3.3.2 and this form return 0x3CB2AAAAAAAAAAAB, both after 5 evaluations.
-    # ⚠ A zero-tolerance node that does not collide still returns NaN, however small
-    # its subtree: a step at 1 + 2^-41 over [1, 1 + 2^-40] at tol = 2^-1070 returns
-    # NaN after 21 evaluations, where 3.3.2 returned 0x3D6001AAAAAAAAAB after 529.
-    # Of 1,800 narrow-interval calls (widths 2 to 2^20 ulps of 1, tol 2^-1074 to
-    # 2^-1050 and five larger, x^4, sin and a step), the parent-side form returned
-    # NaN on 214 that 3.3.2 answered and this form on 194, which 3.3.2 answered after
-    # an upper median of 297 evaluations (at most 2,097,153); the other 1,606 are 3.3.2's
-    # value and evaluation count. It is the entry test's predicate; the entry test
-    # already refuses a NaN or negative tol, so here it is equivalent to an
-    # exact-zero test, and that mutant survives for that reason.
-    # [measured: capped x^4, step and narrow-interval probes; 3.3.2, parent-side form, this tree; 2026-10-01]
-    if (f64_gt(tol, 0) == 0) { return 0x7FF8000000000000; }  # quiet NaN
     # ⛔ 3.3.4 — A TOLERANCE BELOW WHAT THIS PANEL'S ESTIMATE CAN RESOLVE WAS MET ONLY BY
     # LUCK. With tol < 2^-56 |whole|, `|error| < tol` needs |refined - whole| < 15 tol,
     # less than 15 * 2^-56 |whole| = 0.9375 m ulps of whole (m its significand, in [1, 2)):
@@ -395,9 +385,9 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk, vlim, vde
     # polynomial evaluated with cancellation, 5x^4 - 3x^2 + x - 1/4 at tol 1e-20) still
     # passed 3,000,000 evaluations on both trees. Bounding that needs the integral's
     # magnitude, which this recursion does not have: [3.4.0] with D070's report.
-    # The zero guard above still reads the caller's tol: a panel whose tolerance has
-    # halved to zero is refused as in 3.3.3, but panels the floor accepts first never
-    # reach it. 78 calls of the sweep that returned NaN on 3.3.3 (13) or passed the
+    # The zero-tolerance test (_calcx_as_cut since 3.4.0) still reads the caller's tol: a
+    # panel whose tolerance has halved to zero is refused as in 3.3.3, but panels the floor
+    # accepts first never reach it. 78 calls of the sweep that returned NaN on 3.3.3 (13) or passed the
     # probe's 3,000,000-evaluation cap there (65) now return a value: against each one's
     # exact value, 65 correctly rounded and 13 within 4 ulps. No call took more
     # evaluations than on 3.3.3 (99 passed the cap on both). No result or
@@ -475,44 +465,150 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk, vlim, vde
     var refined = f64_add(left_val, right_val);
     # Two panels past the frame's range with opposite signs, from finite samples: the node
     # is formed again in a frame where nothing below it can overflow (_calcx_reframe). Past
-    # it with one sign, the value is that infinity, and is left to the arithmetic.
-    if (f64_eq(refined, refined) == 0 && _calcx_finite5(fa, flm, fmid, frm, fb) == 1) {
-        var vk2 = ((h_over_6 >> 52) & 0x7FF) - 1003;
-        if (vk2 > vk) { return _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, vk, vk2, h_over_6); }
+    # it with one sign, the value is that infinity, and is left to the arithmetic. With a
+    # sample that is not finite, the sum takes that sample's class (_calcx_inf_pick).
+    if (f64_eq(refined, refined) == 0) {
+        if (_calcx_finite5(fa, flm, fmid, frm, fb) == 1) {
+            var vk2 = ((h_over_6 >> 52) & 0x7FF) - 1003;
+            if (vk2 > vk) { return _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, vk, vk2, h_over_6, cx); }
+        } else {
+            refined = f64_add(left_val, right_val);          # NaN: no class in a value frame
+            if (vk == 0) { refined = _calcx_inf_pick(left_val, right_val, fa, flm, fmid, frm, fb, h_over_6); }
+        }
     }
 
     # Richardson extrapolation error estimate
     var error = f64_div(f64_sub(refined, whole), _CALCX_F64_FIFTEEN);
+    var aerr = f64_abs(error);
     # Past vlim, with the two estimates agreeing to 10 bits, the value returns at once
     # (_calcx_reframe): refining it further cannot change what the caller receives.
     if (vlim != 0) {
         var spread = f64_mul(f64_abs(f64_sub(refined, whole)), 0x4090000000000000);   # 1024
-        if (f64_lt(vlim, f64_sub(f64_abs(refined), spread)) == 1) { return f64_add(refined, error); }
+        if (f64_lt(vlim, f64_sub(f64_abs(refined), spread)) == 1) {
+            _calcx_as_add(cx, aerr, vk);
+            return f64_add(refined, error);
+        }
     }
 
-    if (f64_lt(f64_abs(error), tol_eff) == 1) {
+    if (f64_lt(aerr, tol_eff) == 1) {
+        _calcx_as_add(cx, aerr, vk);
         return f64_add(refined, error);
     }
 
     # A non-finite estimate can never satisfy the tolerance test above: every f64
     # comparison involving NaN returns 0, so `|error| < tol` is false forever and
     # the recursion runs to the full depth on BOTH branches. Detect it explicitly
-    # (NaN is the only value that compares unequal to itself) and stop.
+    # (NaN is the only value that compares unequal to itself) and stop. Two estimates
+    # of the same infinity from five finite samples are that value: a sum of finite
+    # numbers past DBL_MAX, which no refinement changes. Anything else here has no
+    # estimate and fails the call, an infinite sample included: the closed rule makes a
+    # panel holding one infinite at every level, the integral of 1 / sqrt(x) on [0, 1]
+    # with f(0) = +Inf as much as one that overflows, and nothing here can tell them apart.
     if (f64_eq(error, error) == 0) {
+        if (f64_eq(refined, whole) == 0 || _calcx_finite5(fa, flm, fmid, frm, fb) == 0) {
+            store64(cx + _CALCX_AS_BAD, 1);
+        }
         return refined;
     }
 
+    # ⛔ 3.4.0 (review) — A PANEL'S `whole` IS ITS PARENT'S, FORMED WITH THE PARENT'S HALF-WIDTH.
+    # Where mid was rounded the two differ by up to half an ulp of x, and |refined - whole|
+    # carries up to |f| ulp(x) / 2 that no refinement removes: near a narrow peak every panel
+    # fails by it. A panel that fails its test is tested again against its own whole, (2h / 6)
+    # (fa + 4 fmid + fb), and passing returns refined + its own error: the Lorentzian
+    # 1/(1e-6 + (x - c)^2) at tol 1e-7 (see _calcx_as_charge) ends after 12,301 evaluations
+    # (3.3.7: 162,885), Ok and 5.1e-11 off. Then the noise floor (_calcx_as_floor), in the
+    # caller's frame only.
+    # [measured: scratch probe NU1-work/c/a1.cyr, this tree and integ-snap5, mpmath oracle, 2026-10-31]
+    var dabs = f64_abs(f64_sub(refined, whole));
+    var pd = load64(cx + _CALCX_AS_PD);
+    if (vk == 0 && f64_le(F64_TINY, f64_abs(h_over_6)) == 1) {
+        var wown = f64_mul(f64_add(h_over_6, h_over_6), f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fmid)), fb));
+        var down = f64_sub(refined, wown);
+        dabs = f64_abs(down);
+        if (f64_lt(dabs, f64_mul(tol_eff, _CALCX_F64_FIFTEEN)) == 1) {
+            var eown = f64_div(down, _CALCX_F64_FIFTEEN);
+            store64(cx, f64_add(load64(cx), f64_abs(eown)));
+            return f64_add(refined, eown);
+        }
+        if (_calcx_as_stall(cx, pd, dabs) == 1) {
+            if (f64_le(dabs, _calcx_as_floor(h, fa, fmid, fb)) == 1) {
+                store64(cx, f64_add(load64(cx), dabs));
+                return f64_add(refined, f64_div(down, _CALCX_F64_FIFTEEN));
+            }
+        }
+    }
+
     var half_tol = f64_mul(tol, F64_HALF);
-    var left_result = _adaptive_simpson_rec(f, a, mid, fa, fmid, flm,
-      left_val, half_tol, depth - 1, vk, vdesc, vdesc);
-    var right_result = _adaptive_simpson_rec(f, mid, b, fmid, fb, frm,
-      right_val, half_tol, depth - 1, vk, vdesc, vdesc);
+    var cut = _calcx_as_cut(cx, depth, half_tol);
+    var own = 0;
+    if (vk == 0 && f64_le(F64_TINY, f64_abs(h_over_6)) == 1) { own = 1; }
+    var lc = cut;
+    var left_result = left_val;
+    if (lc == 0 && (f64_eq(left_mid, a) == 1 || f64_eq(left_mid, mid) == 1)) {
+        lc = 1;
+        if (own == 1) { left_result = _calcx_as_side(a, mid, lsum, left_val); }
+    }
+    if (lc == 0) {
+        store64(cx + _CALCX_AS_N, load64(cx + _CALCX_AS_N) + 2);
+        store64(cx + _CALCX_AS_PD, dabs);
+        store64(cx + _CALCX_AS_PD2, pd);
+        left_result = _adaptive_simpson_rec(f, a, mid, fa, fmid, flm,
+          left_val, half_tol, depth - 1, vk, vdesc, vdesc, cx);
+    }
+    var rc = cut;
+    var right_result = right_val;
+    if (rc == 0 && (f64_eq(right_mid, mid) == 1 || f64_eq(right_mid, b) == 1)) {
+        rc = 1;
+        if (own == 1) { right_result = _calcx_as_side(mid, b, rsum, right_val); }
+    }
+    if (rc == 0) {
+        store64(cx + _CALCX_AS_N, load64(cx + _CALCX_AS_N) + 2);
+        store64(cx + _CALCX_AS_PD, dabs);
+        store64(cx + _CALCX_AS_PD2, pd);
+        right_result = _adaptive_simpson_rec(f, mid, b, fmid, fb, frm,
+          right_val, half_tol, depth - 1, vk, vdesc, vdesc, cx);
+    }
+    if (lc == 1 || rc == 1) { _calcx_as_charge(cx, refined, whole, h, fa, flm, fmid, frm, fb, vk); }
     return f64_add(left_result, right_result);
 }
 
 # Adaptive Simpson's rule for numerical integration.
-# f: function pointer (f64 -> f64), a/b: interval bounds (f64), tol: tolerance (f64).
-# Returns f64 result. Recursively bisects until error < tol (max depth 50).
+# f: function pointer (f64 -> f64), a/b: interval bounds (f64), tol: tolerance (f64),
+# out: pointer, the integral (f64) written here.
+# Returns Ok(0) when the estimate is within tol by the walk's own account: E, the sum of the
+# error estimates of the panels it is built from (see _adaptive_simpson_rec), plus half an
+# ulp of the double reported, is at most tol; or the integral is +-Inf from finite samples.
+# Err(HSB_ERR_NO_CONVERGENCE) otherwise, with `out` holding the best estimate found: E plus
+# that half ulp passed tol, some panel could not be refined to its share of tol (the depth
+# cap of 50 levels, a width too narrow to bisect, a tolerance that halves to zero, or the
+# backstop of _CALCX_AS_MAX_EVAL evaluations), or a sample was infinite or NaN.
+# Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN, before f is called, `out` untouched.
+# Recursively bisects until each panel's error < its share of tol. Replaces
+# calc_adaptive_simpson, retired in 3.4.0 (it returned the estimate, or NaN for such a
+# tolerance, with no status).
+#
+# ⚠ Ok RESTS ON ESTIMATES, NOT ON A BOUND. A panel's term is Richardson's |refined - whole|
+# / 15 from its nine samples, which assumes the h^4 convergence of an integrand smooth on the
+# panel; where the samples miss what lies between them, or the integrand is not smooth there,
+# the true error can exceed it. Of the reviewer's 6,000 randomised calls 286 were Ok with the
+# true error above tol: cos(kx) over whole periods, whose root samples agree exactly (138 of
+# 526 Ok, the worst 2e15 tol), sin(kx) (48 of 469, up to 6.5e6 tol), A sin(kx) + eps (13 of
+# 311), 1/sqrt|x - c| with c between samples (16 of 162, up to 175 tol), sqrt(x) at 0 (22 of
+# 493, up to 3.6 tol), |x - c| (20 of 519, up to 6.8 tol), exp(-x^2) on [0, 10] (15 of 470,
+# up to 12 tol), a step (5 of 518), a cubic about c (6 of 323) and the Lorentzian (3 of 350).
+# Rounding is counted once, for the double reported: x^4 on [0, 1] at tol 2e-17 is Ok with
+# 0.2 - 1 ulp, 2.8e-17 off, the rounding of the panel sums.
+# [measured: reviewer's 6,000-call sweep (NU1-work/rv/asw_lane.cyr), this tree, integ-snap5, mpmath, 2026-10-31]
+#
+# ⭐ 3.4.0 (review) — A TOLERANCE BELOW HALF AN ULP OF THE RESULT IS REFUSED AS QUADPACK
+# REFUSES ONE (ier = 2, roundoff detected): the best value is written to `out` and the call
+# reports NO_CONVERGENCE. No double is within such a tol of an integral that is not itself
+# a double, and nothing in the walk can prove that the one it reports is: x on [0, 2^20] at
+# tol 1e-6 writes 2^39 exactly (half an ulp of it is 2^-14) and x^4 on [0, 10] at 1e-15 writes
+# 20000, both NO_CONVERGENCE. Of the reviewer's calls that 3.3.7 answered within tol, 62 had
+# such a tolerance (x^4 39, sqrt(x) 10, a cubic 5, the Lorentzian 4, |x - c| 4).
+# [measured: reviewer's 6,000-call sweep (NU1-work/rv/asw_lane.cyr), this tree, integ-snap5, mpmath, 2026-10-31]
 #
 # Through 2.8.2 the only integrand ever passed here was x^2, for which the
 # INITIAL unrefined panel below is already exact -- Simpson integrates cubics
@@ -525,8 +621,9 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk, vlim, vde
 # line said 3 for x^2 until 3.3.3; the suite has always pinned 5).
 # [measured: tests/modules.tcyr adaptive Simpson block; x^4 count by a 3.3.2-bundle probe]
 #
-# Returns NaN, evaluating nothing, for a tolerance no node can meet: tol <= 0
-# (either zero) or NaN. b < a is the oriented integral, -(integral from b to a).
+# Refuses, evaluating nothing, a tolerance no node can meet: tol <= 0 (either zero) or
+# NaN (through 3.3.7 that refusal was a NaN return). b < a is the oriented integral,
+# -(integral from b to a).
 #
 # ⛔ 3.3.3 — AN UNREACHABLE TOLERANCE WALKED THE WHOLE TREE (audit D071). The
 # tolerance test is `|error| < tol`, which no error passes when tol <= 0 or is NaN,
@@ -569,9 +666,13 @@ fn _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk, vlim, vde
 # underflowed to 0 formed the same 0 * Inf (f = +Inf over [0, 2^-1074] returned NaN),
 # and its finite answers were wrong too; 3.3.6 repairs both, and the overflows of the
 # width and the midpoints (see _calcx_mid_wide).
-public fn calc_adaptive_simpson(f, a, b, tol) {
-    if (f64_gt(tol, 0) == 0) { return 0x7FF8000000000000; }  # quiet NaN; true for a NaN tol
-    if (f64_eq(f64_sub(b, a), 0) == 1) { return 0; }
+#must_use
+public fn calc_adaptive_simpson_checked(f, a, b, tol, out) {
+    if (f64_gt(tol, 0) == 0) { return Err(HSB_ERR_INVALID_INPUT); }  # true for a NaN tol
+    if (f64_eq(f64_sub(b, a), 0) == 1) {
+        store64(out, 0);
+        return Ok(0);
+    }
     var fa = fncall1(f, a);
     var fb = fncall1(f, b);
     var mid = f64_mul(f64_add(a, b), F64_HALF);
@@ -598,20 +699,63 @@ public fn calc_adaptive_simpson(f, a, b, tol) {
     # calc_adaptive_simpson_x4 3.3.6 7,309 ns, integrated 7,379, now 6,216 (3.3.5 6,103), and
     # sin on [0, pi] at 1e-10 29.8 -> 27.7 us (3.3.5 27.3).
     # [measured: tests/hisab.bcyr and scratch pfb/focus.bcyr, 4-tree A/B, 2026-10-31; cycc 6.6.20]
-    var wd = f64_sub(b, a);
-    if (((a >> 52) & 0x7FF) <= 2045 && ((b >> 52) & 0x7FF) <= 2045 && ((wd >> 52) & 0x7FF) >= 123) {
-        return _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, 50);
+    var cx: i64[6];
+    var r = whole;
+    if (f64_eq(mid, a) == 1 || f64_eq(mid, b) == 1) {
+        # No point of the interval lies strictly inside it (one or two doubles wide): the
+        # panel is the answer, 3.3.7's, with no second estimate to test it against.
+        store64(&cx + _CALCX_AS_E, 0);
+        store64(&cx + _CALCX_AS_BAD, 1);
+    } else {
+        r = _calcx_as_run(f, a, b, fa, fb, fmid, whole, tol, &cx);
+        # The backstop (_calcx_as_cut) only stops a walk that neither converges nor reaches
+        # the noise floor. A walk cut there returns the panels it had not refined at their own
+        # level, which depth first can be the whole right half, so the estimate is taken again
+        # at a tolerance raised to 2^-40 of the first pass's magnitude, within the same bound.
+        if (load64(&cx + _CALCX_AS_CUT) == 1) {
+            var tol2 = f64_mul(f64_abs(r), _CALCX_F64_2_POW_M40);
+            if (f64_lt(tol, tol2) == 1 && f64_lt(tol2, F64_POS_INF) == 1) {
+                r = _calcx_as_run(f, a, b, fa, fb, fmid, whole, tol2, &cx);
+            }
+            store64(&cx + _CALCX_AS_BAD, 1);    # tol was not met: the first pass could not
+        }
     }
-    return _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, 50, 0, 0, 0);
+    store64(out, r);
+    if (load64(&cx + _CALCX_AS_BAD) == 1 || f64_eq(r, r) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+    # A finite estimate is within tol when its panels' error estimates and its own rounding
+    # to a double, half an ulp of r, are: no tolerance below that half ulp can be met by any
+    # double, and Richardson's estimates do not see it (x^4 on [0, 1] at tol 1e-18 sums them
+    # to 1e-18 and returns 0.2 - 1 ulp, 2.8e-17 off). An infinite one is the class of an
+    # integral past the range, which no tolerance measures.
+    if (f64_lt(f64_abs(r), F64_POS_INF) == 1) {
+        var ebound = f64_add(load64(&cx + _CALCX_AS_E), _calcx_half_ulp(r));
+        if (f64_le(ebound, tol) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+    }
+    return Ok(0);
 }
 
-# _adaptive_simpson_rec with vk = vlim = vdesc = 0 on an interval calc_adaptive_simpson has
-# checked (see there): the tests that cannot fire are left out, the rest kept in its order.
-fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth) {
-    if (depth <= 0) { return whole; }
+# Internal: one pass of calc_adaptive_simpson_checked over [a, b], tol, with cx reset: the
+# frame-free recursion on an ordinary interval, the framed one otherwise.
+# ⭐ 3.3.7 — AN ORDINARY INTERVAL RECURSES WITHOUT THE FRAMES (_adaptive_simpson_rec0); see
+# calc_adaptive_simpson_checked.
+fn _calcx_as_run(f, a, b, fa, fb, fmid, whole, tol, cx) {
+    store64(cx + _CALCX_AS_E, 0);
+    store64(cx + _CALCX_AS_N, 5);
+    store64(cx + _CALCX_AS_BAD, 0);
+    store64(cx + _CALCX_AS_CUT, 0);
+    store64(cx + _CALCX_AS_PD, F64_POS_INF);     # the root has no parent: never at the floor
+    store64(cx + _CALCX_AS_PD2, F64_POS_INF);
+    var wd = f64_sub(b, a);
+    if (((a >> 52) & 0x7FF) <= 2045 && ((b >> 52) & 0x7FF) <= 2045 && ((wd >> 52) & 0x7FF) >= 123) {
+        return _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, 50, cx);
+    }
+    return _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, 50, 0, 0, 0, cx);
+}
+
+# _adaptive_simpson_rec with vk = vlim = vdesc = 0 on an interval calc_adaptive_simpson_checked
+# has checked (see there): the tests that cannot fire are left out, the rest kept in its order.
+fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth, cx) {
     var mid = f64_mul(f64_add(a, b), F64_HALF);
-    if (f64_eq(mid, a) == 1 || f64_eq(mid, b) == 1) { return whole; }
-    if (f64_gt(tol, 0) == 0) { return 0x7FF8000000000000; }  # quiet NaN
     var tol_eff = tol;
     var tol_floor = f64_mul(f64_abs(whole), _CALCX_F64_REL_FLOOR);
     if (depth < 50 && f64_lt(tol_eff, tol_floor) == 1) { tol_eff = tol_floor; }
@@ -628,16 +772,83 @@ fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth) {
     var right_val = f64_mul(h_over_6, rsum);
     if (f64_lt(f64_abs(rsum), F64_POS_INF) == 0) { right_val = _calcx_panel_wide(h_over_6, fmid, frm, fb); }
     var refined = f64_add(left_val, right_val);
-    if (f64_eq(refined, refined) == 0 && _calcx_finite5(fa, flm, fmid, frm, fb) == 1) {
-        var vk2 = ((h_over_6 >> 52) & 0x7FF) - 1003;
-        if (vk2 > 0) { return _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, 0, vk2, h_over_6); }
+    if (f64_eq(refined, refined) == 0) {
+        if (_calcx_finite5(fa, flm, fmid, frm, fb) == 1) {
+            var vk2 = ((h_over_6 >> 52) & 0x7FF) - 1003;
+            if (vk2 > 0) { return _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, 0, vk2, h_over_6, cx); }
+        } else {
+            refined = _calcx_inf_pick(left_val, right_val, fa, flm, fmid, frm, fb, h_over_6);
+        }
     }
     var error = f64_div(f64_sub(refined, whole), _CALCX_F64_FIFTEEN);
-    if (f64_lt(f64_abs(error), tol_eff) == 1) { return f64_add(refined, error); }
-    if (f64_eq(error, error) == 0) { return refined; }
+    if (f64_lt(f64_abs(error), tol_eff) == 1) {
+        store64(cx, f64_add(load64(cx), f64_abs(error)));
+        return f64_add(refined, error);
+    }
+    if (f64_eq(error, error) == 0) {
+        if (f64_eq(refined, whole) == 0 || _calcx_finite5(fa, flm, fmid, frm, fb) == 0) {
+            store64(cx + _CALCX_AS_BAD, 1);
+        }
+        return refined;
+    }
+    # The panel's own estimates (see _adaptive_simpson_rec), then the noise floor
+    # (_calcx_as_floor): refining cannot resolve this panel further.
+    var wown = f64_mul(f64_add(h_over_6, h_over_6), f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fmid)), fb));
+    var down = f64_sub(refined, wown);
+    var dabs = f64_abs(down);
+    if (f64_lt(dabs, f64_mul(tol_eff, _CALCX_F64_FIFTEEN)) == 1) {
+        var eown = f64_div(down, _CALCX_F64_FIFTEEN);
+        store64(cx, f64_add(load64(cx), f64_abs(eown)));
+        return f64_add(refined, eown);
+    }
+    var pd = load64(cx + _CALCX_AS_PD);
+    var st = 0;
+    if (f64_le(f64_mul(pd, _CALCX_F64_EIGHTH), dabs) == 1) { st = 1; }
+    if (f64_le(f64_mul(load64(cx + _CALCX_AS_PD2), _CALCX_F64_2_POW_M6), dabs) == 1) { st = 1; }
+    if (st == 1) {
+        if (f64_le(dabs, _calcx_as_floor(h, fa, fmid, fb)) == 1) {
+            store64(cx, f64_add(load64(cx), dabs));
+            return f64_add(refined, f64_div(down, _CALCX_F64_FIFTEEN));
+        }
+    }
+    # _calcx_as_cut, written out on this path (a call per failing panel cost the frame-free
+    # recursion more than the rest of the accounting).
     var half_tol = f64_mul(tol, F64_HALF);
-    var left_result = _adaptive_simpson_rec0(f, a, mid, fa, fmid, flm, left_val, half_tol, depth - 1);
-    var right_result = _adaptive_simpson_rec0(f, mid, b, fmid, fb, frm, right_val, half_tol, depth - 1);
+    var lc = 0;
+    if (depth <= 1 || f64_eq(half_tol, 0) == 1) {
+        lc = 1;
+    } else {
+        if (load64(cx + _CALCX_AS_N) > _CALCX_AS_MAX_EVAL) {
+            store64(cx + _CALCX_AS_CUT, 1);
+            lc = 1;
+        }
+    }
+    var rc = lc;
+    var left_result = left_val;
+    if (lc == 0) {
+        if (f64_eq(left_mid, a) == 1 || f64_eq(left_mid, mid) == 1) {
+            lc = 1;
+            left_result = _calcx_as_side(a, mid, lsum, left_val);
+        } else {
+            store64(cx + _CALCX_AS_N, load64(cx + _CALCX_AS_N) + 2);
+            store64(cx + _CALCX_AS_PD, dabs);
+            store64(cx + _CALCX_AS_PD2, pd);
+            left_result = _adaptive_simpson_rec0(f, a, mid, fa, fmid, flm, left_val, half_tol, depth - 1, cx);
+        }
+    }
+    var right_result = right_val;
+    if (rc == 0) {
+        if (f64_eq(right_mid, mid) == 1 || f64_eq(right_mid, b) == 1) {
+            rc = 1;
+            right_result = _calcx_as_side(mid, b, rsum, right_val);
+        } else {
+            store64(cx + _CALCX_AS_N, load64(cx + _CALCX_AS_N) + 2);
+            store64(cx + _CALCX_AS_PD, dabs);
+            store64(cx + _CALCX_AS_PD2, pd);
+            right_result = _adaptive_simpson_rec0(f, mid, b, fmid, fb, frm, right_val, half_tol, depth - 1, cx);
+        }
+    }
+    if (lc + rc != 0) { _calcx_as_charge(cx, refined, whole, h, fa, flm, fmid, frm, fb, 0); }
     return f64_add(left_result, right_result);
 }
 
@@ -738,14 +949,14 @@ fn _calcx_panel_tiny(w, fa, fm, fb) {
 # (339,498 calls) and made that call walk past 300 s, as its in-range twin would: it is
 # left to the [3.4.0] work bound (D070).
 # [measured: scratch probe (p/pstep7.cyr) with and without that re-framing, both sweeps, 2026-10-11]
-fn _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, vk, vk2, h_over_6) {
+fn _calcx_reframe(f, a, b, fa, fb, fmid, tol, depth, vk, vk2, h_over_6, cx) {
     var w6 = _calcx_pow2_dn(f64_mul(h_over_6, F64_TWO), vk2);
     var s = f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fmid)), fb);
     var whole = f64_mul(w6, s);
     if (f64_lt(f64_abs(s), F64_POS_INF) == 0) { whole = _calcx_panel_wide(w6, fa, fmid, fb); }
     var vlim = _calcx_pow2_dn(0x7FEFFFFFFFFFFFFF, vk2 - vk);    # DBL_MAX of frame vk
     var r = _adaptive_simpson_rec(f, a, b, fa, fb, fmid, whole, tol, depth, vk2, vlim,
-      f64_mul(vlim, 0x4370000000000000));                         # 2^56
+      f64_mul(vlim, 0x4370000000000000), cx);                     # 2^56
     return _calcx_pow2_up(r, vk2 - vk);
 }
 
@@ -755,6 +966,303 @@ fn _calcx_finite5(a, b, c, d, e) {
     if (f64_lt(f64_abs(c), F64_POS_INF) == 0 || f64_lt(f64_abs(d), F64_POS_INF) == 0) { return 0; }
     if (f64_lt(f64_abs(e), F64_POS_INF) == 0) { return 0; }
     return 1;
+}
+
+# Internal: 1 when all three samples of a panel are finite.
+fn _calcx_finite3(a, b, c) {
+    if (f64_lt(f64_abs(a), F64_POS_INF) == 0 || f64_lt(f64_abs(b), F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(f64_abs(c), F64_POS_INF) == 0) { return 0; }
+    return 1;
+}
+
+# Internal: a node's refined sum lv + rv when it came out NaN with a sample that is not
+# finite (h6 its sixth-width, in the caller's units). One panel's three samples are finite, so
+# it holds a finite real number even where its value overflowed; the other holds an infinite
+# sample, which is either a true infinity or a finite value past DBL_MAX that f overflowed. The
+# sum's class is the infinite sample's only if it is in both cases: when that panel, with each
+# infinite sample replaced by the least a past-DBL_MAX value can be (+-DBL_MAX), added to the
+# finite panel, already overflows with the infinite sample's sign (a larger sample only moves
+# the sum further that way). Both panels are summed in extended range (_calcx_x*). Otherwise,
+# with a NaN sample, or with a non-finite sample in both panels, the class is not known: NaN.
+#
+# ⛔ 3.4.0 — AN OVERFLOWED PANEL BESIDE AN INFINITE SAMPLE MADE NaN. f = x 2^1003 on
+# [-2^20, 2^21]: f(2^21) = 2^1024 is +Inf, so the right panel is +Inf, while the left
+# panel, from finite samples, is -1.5 * 2^1041, past DBL_MAX: -Inf. Their sum was NaN, the
+# NaN-error exit returned it after 5 evaluations, and the integral, 1.5 * 2^1043, is past
+# DBL_MAX: correctly rounded, +Inf, which calc_integral_simpson and _trapez give. It is
+# +Inf now, after the same 5 evaluations: the right panel at its least, 1.875 * 2^1043, already
+# outweighs the left. The call reports NO_CONVERGENCE with it, as for any infinite sample
+# (_adaptive_simpson_rec); its twin x 2^1002 on [-2^20, 2^21], whose samples are all
+# finite, is Ok(+Inf).
+# [measured: scratch probes (NU1-work/p/p1.cyr base, p5.cyr this tree), 2026-10-31]
+# ⛔ 3.4.0 (review) — THAT PICK ASSUMED THE INFINITE SAMPLE WAS A TRUE INFINITY. On
+# [-(2^21 - 2^-32), 2^21] the same f's halves nearly cancel and the integral is about 2^992,
+# but f(2^21) = 2^1024 overflowed and the first form returned +Inf. With f(2^21) at its least,
+# DBL_MAX, the sum is finite, so the class is not known: NaN, with NO_CONVERGENCE, after the
+# same 5 evaluations.
+# [measured: scratch probe NU1-work/c/a1.cyr, this tree and integ-snap5, 2026-10-31]
+fn _calcx_inf_pick(lv, rv, fa, flm, fmid, frm, fb, h6) {
+    var nan = f64_add(lv, rv);
+    var lfin = _calcx_finite3(fa, flm, fmid);
+    var rfin = _calcx_finite3(fmid, frm, fb);
+    if (lfin == rfin) { return nan; }
+    var g1 = fmid;                       # the infinite side's samples, in rule order
+    var g2 = frm;
+    var g3 = fb;
+    var inf = rv;
+    var fs = f64_add(f64_add(f64_mul(fa, _CALCX_F64_EIGHTH), f64_mul(_CALCX_F64_FOUR, f64_mul(flm, _CALCX_F64_EIGHTH))),
+      f64_mul(fmid, _CALCX_F64_EIGHTH));
+    if (lfin == 0) {
+        g1 = fa;
+        g2 = flm;
+        g3 = fmid;
+        inf = lv;
+        var fs4 = f64_mul(_CALCX_F64_FOUR, f64_mul(frm, _CALCX_F64_EIGHTH));
+        fs = f64_add(f64_add(f64_mul(fmid, _CALCX_F64_EIGHTH), fs4), f64_mul(fb, _CALCX_F64_EIGHTH));
+    }
+    if (f64_eq(inf, inf) == 0) { return nan; }        # a NaN sample, or both signs
+    g1 = _calcx_inf_least(g1);
+    g2 = _calcx_inf_least(g2);
+    g3 = _calcx_inf_least(g3);
+    var gs = f64_add(f64_add(f64_mul(g1, _CALCX_F64_EIGHTH), f64_mul(_CALCX_F64_FOUR, f64_mul(g2, _CALCX_F64_EIGHTH))),
+      f64_mul(g3, _CALCX_F64_EIGHTH));
+    # (fs + gs) * 8 * h6 in extended range: each sum of eighths is finite.
+    var t: i64[2];
+    var u: i64[2];
+    _calcx_xn(&t, fs, 3);
+    _calcx_xn(&u, gs, 3);
+    _calcx_xadd(&t, load64(&t), load64(&t + 8), load64(&u), load64(&u + 8));
+    _calcx_xn(&u, h6, 0);
+    _calcx_xmul(&t, load64(&t), load64(&t + 8), load64(&u), load64(&u + 8));
+    if (load64(&t + 8) <= 1023) { return nan; }     # finite at the least: not known
+    if (f64_lt(load64(&t), 0) != f64_lt(inf, 0)) { return nan; }
+    return inf;
+}
+
+# Internal: an infinite sample at the least magnitude a finite value past DBL_MAX has.
+fn _calcx_inf_least(v) {
+    if (f64_eq(v, F64_POS_INF) == 1) { return 0x7FEFFFFFFFFFFFFF; }
+    if (f64_eq(v, 0xFFF0000000000000) == 1) { return 0xFFEFFFFFFFFFFFFF; }
+    return v;
+}
+
+# Internal: calc_adaptive_simpson_checked's accounting block, cx (byte offsets), and its
+# work bound. E is the sum of the error estimates of the panels the result is built from,
+# in the caller's units; N counts evaluations of f; BAD is 1 once a panel has no usable
+# estimate (a NaN), which fails the call whatever E is; CUT is 1 once the work bound has
+# stopped a walk.
+enum _CalcxAs {
+    _CALCX_AS_E = 0;
+    _CALCX_AS_N = 8;
+    _CALCX_AS_BAD = 16;
+    _CALCX_AS_CUT = 24;             # 1 once the backstop has stopped a walk
+    _CALCX_AS_PD = 32;              # the parent's |refined - whole|, for the child's stall test
+    _CALCX_AS_PD2 = 40;             # the grandparent's, likewise
+    _CALCX_AS_MAX_EVAL = 33554432;  # 2^25 evaluations of f per pass: a backstop; see _calcx_as_cut
+}
+
+# Internal: add a stopped node's error estimate e, in frame vk's units, to cx's E.
+fn _calcx_as_add(cx, e, vk) {
+    if (vk != 0) { e = _calcx_pow2_up(e, vk); }
+    store64(cx, f64_add(load64(cx), e));
+    return 0;
+}
+
+# Internal: 1 when a node that failed its test cannot hand its children their own
+# tests, so that each is returned as its panel (see _adaptive_simpson_rec): the children
+# would be past the depth cap (depth is this node's), their tolerance half_tol has halved
+# to zero, or the call has spent its work bound. Otherwise counts their 4 evaluations.
+# (A child whose midpoint lies on one of its ends is the parent's own test.)
+#
+# ⛔ 3.3.3 — A TOLERANCE THAT HAS HALVED TO ZERO CAN NEVER BE MET (audit D071).
+# `|error| < 0` is false for every error, exact zero included, so a node whose
+# tolerance underflowed could stop only at the depth cap or the collision exit
+# above, and on a wide interval that is its whole subtree: tol = 2^-1074 halves
+# to 0 at the root's children, and x^4 over [0,1] then exceeded 2*10^7
+# evaluations where tol = 1e-10 takes 257. The guard sits in the node about to
+# TEST the zero: after the depth and collision exits, which return `whole`
+# untested, and before this node's two evaluations. In the parent it also fired
+# for children that would have left through the collision exit: a unit step at
+# 1 + 2^-52 over [1, 1 + 2^-51] (two ulps) at tol = 2^-1074 returned NaN, where
+# 3.3.2 and this form return 0x3CB2AAAAAAAAAAAB, both after 5 evaluations.
+# ⚠ A zero-tolerance node that does not collide still returns NaN, however small
+# its subtree: a step at 1 + 2^-41 over [1, 1 + 2^-40] at tol = 2^-1070 returns
+# NaN after 21 evaluations, where 3.3.2 returned 0x3D6001AAAAAAAAAB after 529.
+# Of 1,800 narrow-interval calls (widths 2 to 2^20 ulps of 1, tol 2^-1074 to
+# 2^-1050 and five larger, x^4, sin and a step), the parent-side form returned
+# NaN on 214 that 3.3.2 answered and this form on 194, which 3.3.2 answered after
+# an upper median of 297 evaluations (at most 2,097,153); the other 1,606 are 3.3.2's
+# value and evaluation count. It is the entry test's predicate; the entry test
+# already refuses a NaN or negative tol, so here it is equivalent to an
+# exact-zero test, and that mutant survives for that reason.
+# [measured: capped x^4, step and narrow-interval probes; 3.3.2, parent-side form, this tree; 2026-10-01]
+# ⭐ 3.4.0 — THE TEST MOVED TO THE PARENT, AND THE NaN IS GONE. A node whose children
+# would get a tolerance of 0 returns its two panels and adds |refined - whole| to E; no
+# positive tolerance below that is met, so the call reports NO_CONVERGENCE with that
+# estimate in `out`. The evaluation counts above are unchanged (the children never
+# evaluated), and so is every value where 3.3.7 did not return NaN.
+#
+# ⛔ 3.4.0 — A WALK THE TOLERANCE COULD NOT END WAS BOUNDED ONLY BY THE DEPTH CAP (audit
+# D070). A node that fails its test splits in two, so the depth cap of 50 bounds the
+# depth of the tree, not its size, and an integrand whose evaluation noise is above both
+# its share of tol and the relative floor (_adaptive_simpson_rec) fails at every scale:
+# halving a panel halves its noise and its tolerance together. 5x^4 - 3x^2 + x - 1/4 on
+# [0, 1] at tol 1e-20, and exp(-x^2) on [-10, 10] there, each passed 3,000,000 evaluations
+# on 3.3.7 (a probe's cap: the walk had not ended). Such a walk now ends where its noise can
+# be read off the panel's own samples (the noise floor, _calcx_as_floor): exp(-x^2) after
+# 166,809 evaluations. Where it cannot, a backstop does: past _CALCX_AS_MAX_EVAL evaluations
+# no panel recurses, each returns its two panels and adds |refined - whole|, and the call
+# reports NO_CONVERGENCE (with a second pass for its estimate; see
+# calc_adaptive_simpson_checked). The polynomial is noisy where its terms cancel, which its
+# values do not show, and ends there: 1/4 exactly after 33,556,523 evaluations, 2^25 and the
+# second pass's 2,091, in 1.7 s. 3.4.0's first form had only a count, 2^19 evaluations a
+# pass, and it cut convergent integrals (see _calcx_as_floor).
+# [measured: scratch probes (NU1-work/p/p2.cyr, NU1-work/c/a1.cyr, NU1-work/d/pp.cyr), 3.3.7 and this tree, 2026-10-31]
+fn _calcx_as_cut(cx, depth, half_tol) {
+    if (depth <= 1 || f64_eq(half_tol, 0) == 1) { return 1; }
+    if (load64(cx + _CALCX_AS_N) > _CALCX_AS_MAX_EVAL) {
+        store64(cx + _CALCX_AS_CUT, 1);
+        return 1;
+    }
+    return 0;
+}
+
+# Internal: the noise floor of a panel of calc_adaptive_simpson_checked of half-width h:
+# 2^-47 h M, M the largest magnitude among the panel's samples at a, (a + b)/2 and b (its
+# other two moved no result in 10,750 calls of the sweeps below). A replay of the
+# panel arithmetic in IEEE doubles (refined and its own whole as _adaptive_simpson_rec0 forms
+# them, 200,000 panels a mode, widths 1e-8 to 10, M 2^-20 to 2^20) puts the largest
+# |refined - whole| at 2^-49.78 h M with samples off by up to half an ulp of M and 2^-49.08 h M
+# off by up to 2 ulps, none above the floor: the panel sums' own rounding, not the samples',
+# sets it, and 2^-47 sits 4.5 to 7 times above.
+# [measured: review R2B scratch harness (R2B-work/py/floor_replay.py), re-run 2026-10-31]
+#
+# ⛔ 3.4.0 (review) — THE WORK BOUND WAS A COUNT, AND IT CUT CONVERGENT INTEGRALS. A cap of
+# 2^19 evaluations a pass stopped walks that were only long: sin(150x) on [0, 10] at tol
+# 1e-12 needs 954,853 evaluations (3.3.7's, within tol: 0x3F7E5154E8EB25A8, 1.4e-17 from
+# 0.0074017826834248750), both passes were cut, and the estimate was -1.7029; 46 of the
+# reviewer's 6,000 calls that 3.3.7 answered within tol were Err through it. What makes a
+# walk endless is a panel whose estimates disagree by noise: halving it halves the noise and
+# its share of tol together. Such a panel now returns refined + its error and adds
+# |refined - whole| to E where both hold:
+#   - |refined - whole| is at most the floor, the scale at which its samples are rounded;
+#   - it has stopped shrinking as a resolving panel's does (1/32 a level at h^4): at least 1/8
+#     of its parent's or 1/64 of its grandparent's (_calcx_as_stall). Noise shrinks by about
+#     1/2 a level; with the parent's test alone too many noisy panels split, and the walk of
+#     A sin(kx) + eps lived on.
+# A panel that fails its test has |refined - whole| >= 15 tol 2h / (b - a), so the stop can
+# fire only for tol below 2^-47 (b - a) M / 30. sin(150x) there is Ok again, 3.3.7's value
+# after 3.3.7's 954,853 evaluations; 45 of the 46 are Ok (24 with 3.3.7's bits and count, 21
+# within tol in 4.7 to 97 times fewer evaluations; the 46th, 1/sqrt|x - c| at 1e-8, holds its
+# singularity in a depth-capped panel: see _calcx_as_charge).
+# ⛔ 3.4.0 (second review) — M ALSO TOOK THE ROOT'S THREE SAMPLES, AND THAT STOPPED CONVERGENT
+# WALKS. A large f at a, b or (a + b)/2 gave every panel a floor far above its own rounding,
+# and stalled panels under it were stopped and charged their whole |refined - whole|:
+# 7.94e10 exp(-((x - 1/2)/3.22e-4)^2) + sin(2433.85 x) on [0, 1] at tol 2.0e-8 was Err, 1.9e-3
+# off, where 3.3.7 was within tol (1.5e-11 off); exp(-124.12 x) on [0, 1] at 6.9e-17 was Err,
+# 8.7e-17 off (3.3.7: 4.9e-19). 291 of 1,200 such peak-plus-sine calls and 12 of 70 such
+# decays were Err where 3.3.7 was within tol. M now comes from the panel's own samples, and
+# those two are Ok with 3.3.7's bits (157,257 and 17,609 evaluations); the peak set keeps 1
+# such call, the decays none, a 1,600-call attack set 2 (20 before), and the 6,000-call sweep
+# its 78 (62 of them a tol under half an ulp). No call of these sets is Ok outside tol where
+# 3.3.7 was within it. The cost: noise in cancelling terms is not read, so 5x^4 - 3x^2 + x - 1/4 at
+# 1e-20 runs to the backstop (33,556,523 evaluations, Err as before), and 266 of the 6,000
+# calls pass 4,000,000 evaluations (with the root's samples 182; 3.3.7 383).
+# Noise the samples' magnitudes do not show is not read either. f(kx) rounds kx first, and
+# A sin(kx) + eps at kx ~ 1000 is noisy at 2^-42 A. A floor from the samples' differences,
+# 4 ulp(x) max |f(x_i+1) - f(x_i)|, stopped those walks, and also panels beside a singularity
+# or on the flanks of a narrow peak, whose errors are not noise: 1/sqrt|x - c| came back Ok
+# 2.2 tol off. Such walks end at the backstop (_CALCX_AS_MAX_EVAL): A sin(kx) + eps on
+# [0, 10] at 1e-14, k = 84.5, takes 34,055,987 evaluations and 3.5 s.
+# [measured: reviewer's sweep (NU1-work/rv/asw_lane.cyr), R2B-work/p/att*, dec*, this tree, 2026-10-31]
+# [measured: scratch probes NU1-work/c/a1.cyr, a7.cyr and NU1-work/d/rp.cyr, this tree, 3.3.7, 2026-10-31]
+fn _calcx_as_floor(h, fa, fmid, fb) {
+    return f64_mul(f64_mul(_calcx_as_mag(fa, fmid, fb), _CALCX_F64_2_POW_M47), h);
+}
+
+# Internal: the Simpson value of a side returned at a collision, formed from its own width
+# hi - lo; v, the parent's form, where that is not finite.
+#
+# ⛔ 3.4.0 (review) — A SIDE RETURNED AT A COLLISION KEPT THE PARENT'S HALF-WIDTH. On a panel
+# an odd number of ulps wide the rounded mid is off centre, and a side whose own midpoint
+# lands on one of its ends is returned as its panel; 3.3.7 formed it with h = (b - a) / 2,
+# not its width. exp(100x) on [1, 1 + 3u] (u = 2^-52) returned 0x45D0E02147B43913, 1/6 above
+# the integral 0x45CCEDEFE8A2AAFE, and x^4 there 0x3CCC00000000000A (exact 0x3CC8000000000009);
+# now 0x45CCEDEFE8A2AAE8 (2.7e-15 off) and 0x3CC8000000000008, both NO_CONVERGENCE. At the
+# end of a long walk the error adds up: a Lorentzian of width 1e-4 at tol 1e-9 came back Ok,
+# 3.8e-5 off, from 6,375 such sides.
+# [measured: scratch probes NU1-work/c/b1.cyr (integ-snap5, this tree) and a6.cyr, mpmath oracle, 2026-10-31]
+fn _calcx_as_side(lo, hi, sum, v) {
+    var w = f64_mul(f64_div(f64_sub(hi, lo), _CALCX_F64_SIX), sum);
+    if (f64_lt(f64_abs(w), F64_POS_INF) == 1) { return w; }
+    return v;
+}
+
+# Internal: 1 when a panel's estimate has stopped shrinking as a resolving panel's does.
+fn _calcx_as_stall(cx, pd, d) {
+    if (f64_le(f64_mul(pd, _CALCX_F64_EIGHTH), d) == 1) { return 1; }
+    if (f64_le(f64_mul(load64(cx + _CALCX_AS_PD2), _CALCX_F64_2_POW_M6), d) == 1) { return 1; }
+    return 0;
+}
+
+# Internal: the largest of |x|, |y|, |z|, and 0 when that is not finite.
+fn _calcx_as_mag(x, y, z) {
+    var m = f64_abs(x);
+    if (f64_lt(m, f64_abs(y)) == 1) { m = f64_abs(y); }
+    if (f64_lt(m, f64_abs(z)) == 1) { m = f64_abs(z); }
+    if (f64_lt(m, F64_POS_INF) == 0) { return 0; }
+    return m;
+}
+
+# Internal: add the error estimate of a node whose children could not be refined (the
+# depth cap, a child's midpoint on an end, a tolerance halved to zero, the backstop) to cx's
+# E, and mark the call failed when its value is not finite with a sample that is not.
+# The estimate is |refined - whole| (an h-convergent panel's error), or 2h times the range of
+# its five samples where that is smaller: Simpson's value is a positively weighted mean of
+# the samples times the width, so it differs from the integral by at most that when f stays
+# within its samples' range.
+#
+# ⛔ 3.4.0 (review) — AN INFINITE SAMPLE AT A CUT NODE GAVE Ok(+Inf). 1/sqrt|x - c| with
+# f(c) = +Inf, c = 0x3FC34EC6522D7610 on [0, 1] at tol 1e-2 (integral 2.6197623237537160):
+# c is first sampled by a node at depth 1, whose refined is +Inf and error +Inf, not NaN, so
+# the NaN exit never ran; the node was cut and the infinite result skipped the E test.
+# ⛔ 3.4.0 (review) — A DEPTH-CAPPED PANEL A FEW ULPS WIDE WAS OVER-CHARGED. Its rounded
+# midpoints are not equally spaced, and |refined - whole| reads that, not error: a Lorentzian
+# 1/(1e-6 + (x - c)^2) on [0x3FF6FD7676FFBBB7, 0x40135A1DA704E71B], c = 0x400691BCD038B4D8, at
+# tol 1e-7 summed 1.18e-7 over 1,268 such nodes, for a result 5.1e-11 from the integral (Err).
+# Each charge is now |refined - whole| or the samples' range times the width, the smaller,
+# and the call is Ok, 5.1e-11 off, after 12,301 evaluations (see the own-width test,
+# _adaptive_simpson_rec). The infinite sample above reports NO_CONVERGENCE with +Inf after
+# 3.3.7's 1,661 evaluations.
+# [measured: scratch probe NU1-work/c/a1.cyr, instrumented replay, this tree, integ-snap5, mpmath, 2026-10-31]
+fn _calcx_as_charge(cx, refined, whole, h, fa, flm, fmid, frm, fb, vk) {
+    if (f64_lt(f64_abs(refined), F64_POS_INF) == 0 && _calcx_finite5(fa, flm, fmid, frm, fb) == 0) {
+        store64(cx + _CALCX_AS_BAD, 1);
+    }
+    var c = f64_abs(f64_sub(refined, whole));
+    if (vk != 0) { c = _calcx_pow2_up(c, vk); }
+    var lo = fa;
+    var hi = fa;
+    if (f64_lt(flm, lo) == 1) { lo = flm; }
+    if (f64_lt(hi, flm) == 1) { hi = flm; }
+    if (f64_lt(fmid, lo) == 1) { lo = fmid; }
+    if (f64_lt(hi, fmid) == 1) { hi = fmid; }
+    if (f64_lt(frm, lo) == 1) { lo = frm; }
+    if (f64_lt(hi, frm) == 1) { hi = frm; }
+    if (f64_lt(fb, lo) == 1) { lo = fb; }
+    if (f64_lt(hi, fb) == 1) { hi = fb; }
+    var cw = f64_mul(f64_sub(hi, lo), f64_mul(h, F64_TWO));       # caller's units
+    if (f64_lt(cw, c) == 1) { c = cw; }                            # false for a NaN
+    store64(cx, f64_add(load64(cx), c));
+    return 0;
+}
+
+# Internal: half an ulp of a finite r, 2^(ilogb(r) - 53), and 0 where that is below the
+# subnormal grid (|r| < 2^-1021).
+fn _calcx_half_ulp(r) {
+    var e = (r >> 52) & 0x7FF;
+    if (e <= 53) { return 0; }
+    return (e - 53) << 52;
 }
 
 # Internal: x * 2^-k and x * 2^k for 0 <= k <= 2044, in two steps (each factor a normal
@@ -1103,17 +1611,33 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
 
 # Evaluate a Kochanek-Bartels (TCB) Hermite spline at parameter t.
 # times: flat f64 array of n key times (sorted), values: flat f64 array of n key values,
-# n: number of keys, tension/continuity/bias: f64 TCB parameters, t: f64 parameter.
-# Returns f64 interpolated value. If t <= times[0] returns values[0],
-# if t >= times[n-1] returns values[n-1]. Requires n >= 2.
-public fn calc_hermite_tcb(times, values, n, tension, continuity, bias, t) {
-    if (n < 2) { return 0; }
+# n: number of keys, tension/continuity/bias: f64 TCB parameters, t: f64 parameter,
+# out: pointer, the interpolated value (f64) written here.
+# Returns Ok(0) with the value: values[0] for t <= times[0], values[n-1] for
+# t >= times[n-1]; so one key (n = 1) is the constant values[0]. Err(HSB_ERR_INVALID_INPUT)
+# for n < 1, `out` untouched.
+# ⭐ 3.4.0 — REPLACES calc_hermite_tcb, which returned 0, a legal value, for n < 2
+# (audit D069). One key has a right answer, the clamp at both ends; no keys have none.
+# [measured: tests/edge_cases.tcyr, group "3.4.0: the interpolators and the partial derivative refuse, not 0"]
+#must_use
+public fn calc_hermite_tcb_checked(times, values, n, tension, continuity, bias, t, out) {
+    if (n < 1) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n == 1) {
+        store64(out, _f64arr_get(values, 0));
+        return Ok(0);
+    }
 
     # Clamp to range
     var t0 = _f64arr_get(times, 0);
     var tn = _f64arr_get(times, n - 1);
-    if (f64_lt(t, t0) == 1) { return _f64arr_get(values, 0); }
-    if (f64_lt(tn, t) == 1) { return _f64arr_get(values, n - 1); }
+    if (f64_lt(t, t0) == 1) {
+        store64(out, _f64arr_get(values, 0));
+        return Ok(0);
+    }
+    if (f64_lt(tn, t) == 1) {
+        store64(out, _f64arr_get(values, n - 1));
+        return Ok(0);
+    }
     # ⛔ `|t - tn|` is a key-TIME distance — the same animation in milliseconds
     # moves it by 1000x — and it was tested against an absolute 1e-12, so a query
     # ON key 1 of 3 returned the LAST key's value once the times were fine enough
@@ -1123,7 +1647,10 @@ public fn calc_hermite_tcb(times, values, n, tension, continuity, bias, t) {
     # tangent. Deletion is mutation-refuted twice (see the sweep's controls C/D).
     # Exact equality is what the clamp always meant, and it is scale-free.
     # [measured: key-time sweep, 9 scales to 2^-1000, plus an overflow control]
-    if (f64_eq(t, tn) == 1) { return _f64arr_get(values, n - 1); }
+    if (f64_eq(t, tn) == 1) {
+        store64(out, _f64arr_get(values, n - 1));
+        return Ok(0);
+    }
 
     # Find segment: largest k such that times[k] <= t and k < n-1
     var seg = 0;
@@ -1153,7 +1680,17 @@ public fn calc_hermite_tcb(times, values, n, tension, continuity, bias, t) {
     # through and comes out NaN. Spelled NaN-false it would leave u = 0 and return
     # key 1's value, 5.0 on times [0, NaN, 2], values [0, 5, 10] at t = 0.5.
     # [measured: NaN-key-time probe on the 3.3.2 bundle and a respelled build, 2026-10-01]
-    if (f64_lt(f64_abs(seg_len), F64_TINY) == 0) {
+    # ⛔ 3.4.0 — DBL_MIN WAS STILL A THRESHOLD ON A WIDTH, AND IT FABRICATED p1. A division
+    # (t - t_k) / seg_len fails only at seg_len = 0, and both are exact differences when
+    # they are subnormal: key times [0, 2^-1028, 2^-1027] (subnormal widths), values
+    # [0, 5, 10], returned 5 (p1) at the middle of key 1's segment and 0 (p1) at the middle
+    # of key 0's, where u is exactly 1/2 and the values are 7.8125 and 2.1875, as on a unit
+    # grid. The test is now the exact zero, NaN-true as before (f64_eq(NaN, 0) is 0). A
+    # zero width cannot be reached here with sorted keys: the search above steps past a
+    # repeated key time (t >= times[seg + 1] moves it on), and a repeat at the end is the
+    # t == tn clamp.
+    # [measured: scratch probes (NU1-work/p/p4b.cyr base, p5.cyr this tree), 2026-10-31]
+    if (f64_eq(seg_len, 0) == 0) {
         u = f64_div(f64_sub(t, t_seg_start), seg_len);
     }
 
@@ -1169,7 +1706,8 @@ public fn calc_hermite_tcb(times, values, n, tension, continuity, bias, t) {
     if (seg + 2 < n) { p3 = _f64arr_get(values, seg + 2); }
 
     # TCB tangent computation
-    return _hermite_tcb_segment(p0, p1, p2, p3, u, tension, continuity, bias);
+    store64(out, _hermite_tcb_segment(p0, p1, p2, p3, u, tension, continuity, bias));
+    return Ok(0);
 }
 
 # Internal: evaluate a single TCB Hermite segment for scalar values.
@@ -1219,7 +1757,7 @@ fn _hermite_tcb_segment(p0, p1, p2, p3, u, tension, continuity, bias) {
 # 6. MONOTONE CUBIC INTERPOLATION (Fritsch-Carlson)
 # ================================================================
 
-# The secant (y_hi - y_lo) / hi of one calc_monotone_cubic interval whose naive
+# The secant (y_hi - y_lo) / hi of one calc_monotone_cubic_checked interval whose naive
 # difference overflowed: hi = x_hi - x_lo is +Inf for a grid wider than DBL_MAX, or
 # y_hi - y_lo is +-Inf. Both differences are taken on HALVED operands. That is exact
 # wherever such an overflow can happen — a difference of two finite doubles rounds
@@ -1264,7 +1802,7 @@ fn _calcx_mc_wide_secant(x_lo, x_hi, y_lo, y_hi, hi) {
 # e is an integer with no range limit that matters. Stored as two words, m then e. Every
 # operation below is the f64 operation on the m's, rounded once, with the exponents
 # added apart: the m's are in [1, 2), so the f64 result is normal and its rounding is
-# the one an unbounded exponent would give. They exist only for calc_monotone_cubic's
+# the one an unbounded exponent would give. They exist only for calc_monotone_cubic_checked's
 # sets whose slopes leave the f64 range (see the end of its secant loop).
 
 # Store m * 2^e, normalized, at p. m is finite; a subnormal m is first scaled by 2^64.
@@ -1350,7 +1888,7 @@ fn _calcx_xterm(pf, lm, le) {
     return _calcx_xf(load64(&r), load64(&r + 8));
 }
 
-# 1 when calc_monotone_cubic's projection step is about to multiply back a tangent
+# 1 when calc_monotone_cubic_checked's projection step is about to multiply back a tangent
 # whose ratio to the secant, r = m / d, underflowed (|r| below DBL_MIN, m not 0) and so
 # lost its bits: the projection runs (s > 9). m is the tangent after the sign test, which
 # zeroes a negative ratio (and with it m). A ratio of -0 with m not 0, which that test
@@ -1375,23 +1913,32 @@ fn _calcx_mc_finite(xs, ys, n) {
     return 1;
 }
 
-# calc_monotone_cubic on a set of finite doubles, sorted strictly increasing in x, with
+# calc_monotone_cubic_checked on a set of finite doubles, sorted strictly increasing in x, with
 # the slopes and tangents held as (m, e) pairs: the same Fritsch-Carlson steps in the
 # same order, each rounded once as in f64, with no overflow or underflow between. The
 # Hermite form takes each tangent in y units, width times slope (L = h_k m_k), which
 # is at most 3 |y_k+1 - y_k| after the projection, so only that product returns to f64.
-fn _calcx_mc_ext(xs, ys, n, x) {
-    if (f64_eq(x, x) == 0) { return f64_add(x, x); }    # a NaN query stays NaN
+# Writes the value to `out` and returns 0, or HSB_ERR_ALLOC with `out` untouched.
+fn _calcx_mc_ext(xs, ys, n, x, out) {
+    if (f64_eq(x, x) == 0) {                             # a NaN query stays NaN
+        store64(out, f64_add(x, x));
+        return 0;
+    }
     # Caller-sized: n pairs of 16 bytes at most, so n * 16 must stay within ALLOC_MAX,
-    # where calc_monotone_cubic's own arrays (n * 8) reach twice as far. Past that the
-    # set gets the designed 0 its rejections return (D069), before anything is stored:
-    # `alloc` refuses with 0 and the stores below would go to address 0. The bound is
-    # derived and written as a division, as in _f64arr_alloc.
-    if (n > (ALLOC_MAX / 8) / 2) { return 0; }
+    # where calc_monotone_cubic_checked's own arrays (n * 8) reach twice as far. Past
+    # that, or when `alloc` refuses (an exhausted heap), the set is refused before
+    # anything is stored: the stores below would go to address 0. The bound is derived
+    # and written as a division, as in _f64arr_alloc.
+    # ⛔ 3.4.0 — THE THREE ALLOCATIONS WERE NOT CHECKED (the roadmap's "bounded against
+    # ALLOC_MAX but not checked against a refused allocation"), and the bound returned
+    # the designed 0, a legal y (D069). Both now report HSB_ERR_ALLOC.
+    # [measured: tests/edge_cases.tcyr, group "3.4.0: the interpolators and the partial derivative refuse, not 0"]
+    if (n > (ALLOC_MAX / 8) / 2) { return HSB_ERR_ALLOC; }
     var nm1 = n - 1;
     var dl = alloc(nm1 * 16);    # secants
     var hw = alloc(nm1 * 16);    # widths
     var ms = alloc(n * 16);      # tangents
+    if (dl == 0 || hw == 0 || ms == 0) { return HSB_ERR_ALLOC; }
     var r[16];
     var a[16];
     var b[16];
@@ -1463,7 +2010,7 @@ fn _calcx_mc_ext(xs, ys, n, x) {
         }
         i = i + 1;
     }
-    # Find the interval, as calc_monotone_cubic does.
+    # Find the interval, as calc_monotone_cubic_checked does.
     var k = 0;
     while (k < nm1 - 1) {
         if (f64_lt(x, _f64arr_get(xs, k + 1)) == 1) { k = k + n; }
@@ -1485,38 +2032,60 @@ fn _calcx_mc_ext(xs, ys, n, x) {
     _calcx_xmul(&b, hm, he, load64(ms + (k + 1) * 16), load64(ms + (k + 1) * 16 + 8));
     var t10 = _calcx_xterm(p10, load64(&a), load64(&a + 8));
     var t11 = _calcx_xterm(p11, load64(&b), load64(&b + 8));
-    return f64_add(f64_add(f64_add(
-          f64_mul(h00, _f64arr_get(ys, k)),
-          t10),
-        f64_mul(h01, _f64arr_get(ys, k + 1))),
-      t11);
+    store64(out, f64_add(f64_add(f64_add(
+            f64_mul(h00, _f64arr_get(ys, k)),
+            t10),
+          f64_mul(h01, _f64arr_get(ys, k + 1))),
+        t11));
+    return 0;
 }
 
 # Monotone cubic interpolation using the Fritsch-Carlson method.
-# xs: flat f64 array of n sorted x-values, ys: flat f64 array of n y-values,
-# n: number of points (>= 2), x: query point (f64).
-# Returns f64 interpolated value. Returns 0 if n < 2 or x out of range, or if its scratch
-# arrays cannot be allocated.
+# xs: flat f64 array of n x-values, strictly increasing, ys: flat f64 array of n
+# y-values, n: number of points (>= 1), x: query point (f64), out: pointer, the
+# interpolated value (f64) written here on success.
+# Returns Ok(0); Err(HSB_ERR_OUT_OF_RANGE) for x outside [xs[0], xs[n-1]] (the
+# interpolant is not defined there); Err(HSB_ERR_INVALID_INPUT) for n < 1, or abscissae
+# that are not strictly increasing (a NaN or a repeated infinite one included);
+# Err(HSB_ERR_ALLOC) when its scratch arrays cannot be allocated. `out` is untouched
+# on every Err. A NaN query or ordinate still gives NaN, as Ok. One point (n = 1) is
+# the constant ys[0] on [xs[0], xs[0]].
+# ⭐ 3.4.0 — REPLACES calc_monotone_cubic, which returned 0, a legal y, for each of
+# those Errs and for n = 1 (audit D069): svara maps that 0 to 1.0 itself
+# (`if (r == 0) return F64_ONE;`), so a set whose interpolant is 0 at x read as a
+# rejection there, and every other caller could not tell an answer from a refusal.
+# [measured: tests/edge_cases.tcyr, group "3.4.0: the interpolators and the partial derivative refuse, not 0"]
 #
 # SHAPE-PRESERVING GUARANTEE (2.8.3): on every interval [xs[k], xs[k+1]] the
 # result stays inside [ys[k], ys[k+1]] and the segment is monotone in the same
 # direction as its own secant. Both halves of the Fritsch-Carlson constraint are
 # needed for that -- the sign condition as well as the alpha^2 + beta^2 <= 9
 # circle; see the block below.
-public fn calc_monotone_cubic(xs, ys, n, x) {
-    if (n < 2) { return 0; }
+#must_use
+public fn calc_monotone_cubic_checked(xs, ys, n, x, out) {
+    if (n < 1) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var x0 = _f64arr_get(xs, 0);
     var xn = _f64arr_get(xs, n - 1);
-    if (f64_lt(x, x0) == 1) { return 0; }
-    if (f64_lt(xn, x) == 1) { return 0; }
+    if (n == 1) {
+        if (f64_eq(x0, x0) == 0) { return Err(HSB_ERR_INVALID_INPUT); }   # a NaN abscissa
+        if (f64_eq(x, x) == 0) {                                          # a NaN query
+            store64(out, f64_add(x, x));
+            return Ok(0);
+        }
+        if (f64_eq(x, x0) == 0) { return Err(HSB_ERR_OUT_OF_RANGE); }
+        store64(out, _f64arr_get(ys, 0));
+        return Ok(0);
+    }
+    if (f64_lt(x, x0) == 1) { return Err(HSB_ERR_OUT_OF_RANGE); }
+    if (f64_lt(xn, x) == 1) { return Err(HSB_ERR_OUT_OF_RANGE); }
 
     var nm1 = n - 1;
 
     # Compute secants (deltas) and interval widths (hs)
     var deltas = _f64arr_alloc(nm1);
     var hs = _f64arr_alloc(nm1);
-    if (deltas == 0 || hs == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
+    if (deltas == 0 || hs == 0) { return Err(HSB_ERR_ALLOC); }    # see _f64arr_alloc (3.3.7)
     var step332 = 0;  # 1: some secant is not finite; the set is 3.3.2's (see the loop's end)
     var slope_oor = 0;  # 1: some secant of a non-flat interval is below DBL_MIN (see the loop's end)
     var i = 0;
@@ -1537,7 +2106,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
         # rejection as an unsorted grid. A NaN QUERY and a NaN ORDINATE are not
         # stopped here and still propagate NaN. That the rejection is a 0 — a legal
         # y value, which svara maps to its own default — is audit D069, [3.4.0].
-        if (f64_gt(hi, 0) == 0) { return 0; }  # not sorted, zero-width, or NaN
+        if (f64_gt(hi, 0) == 0) { return Err(HSB_ERR_INVALID_INPUT); }  # not sorted, zero-width, or NaN
         _f64arr_set(hs, i, hi);
         var y_lo = _f64arr_get(ys, i);
         var y_hi = _f64arr_get(ys, i + 1);
@@ -1619,7 +2188,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
     # unchanged.
     # [measured: repros and monotone sweep; base tree, this tree; exact Fritsch-Carlson oracle; 2026-10-03; cycc 6.6.14]
     if (step332 == 1 || slope_oor == 1) {
-        if (_calcx_mc_finite(xs, ys, n) == 1) { return _calcx_mc_ext(xs, ys, n, x); }
+        if (_calcx_mc_finite(xs, ys, n) == 1) { return _calcx_mc_ext_r(xs, ys, n, x, out); }
     }
     # ⛔ 3.3.4 — ONLY A SET WITH AN INFINITE OR NaN DATUM REACHES WHAT FOLLOWS WITH A
     # NON-FINITE SECANT: a finite set left above, for the extended-range path. What
@@ -1674,7 +2243,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
 
     # Initial tangents: average of adjacent secants
     var ms = _f64arr_alloc(n);
-    if (ms == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
+    if (ms == 0) { return Err(HSB_ERR_ALLOC); }    # see _f64arr_alloc (3.3.7)
     _f64arr_set(ms, 0, _f64arr_get(deltas, 0));
     _f64arr_set(ms, nm1, _f64arr_get(deltas, nm1 - 1));
     i = 1;
@@ -1784,7 +2353,7 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
             # significand m above 1, 2^-54 at m = 1 — never lost.
             # [measured: monotone sweep, 8 results on 2 sets wrong on both trees before this; exact oracle; 2026-10-03]
             if (step332 == 0 && _calcx_mc_lost(alpha, _f64arr_get(ms, i), s) == 1) {
-                if (_calcx_mc_finite(xs, ys, n) == 1) { return _calcx_mc_ext(xs, ys, n, x); }
+                if (_calcx_mc_finite(xs, ys, n) == 1) { return _calcx_mc_ext_r(xs, ys, n, x, out); }
             }
 
             if (f64_lt(_CALCX_F64_NINE, s) == 1) {
@@ -1935,11 +2504,19 @@ public fn calc_monotone_cubic(xs, ys, n, x) {
         t11 = f64_mul(p11, f64_mul(h_k, mk1));
     }
 
-    return f64_add(f64_add(f64_add(
-          f64_mul(h00, yk),
-          t10),
-        f64_mul(h01, yk1)),
-      t11);
+    store64(out, f64_add(f64_add(f64_add(
+            f64_mul(h00, yk),
+            t10),
+          f64_mul(h01, yk1)),
+        t11));
+    return Ok(0);
+}
+
+# Internal: _calcx_mc_ext as calc_monotone_cubic_checked's Result.
+fn _calcx_mc_ext_r(xs, ys, n, x, out) {
+    var st = _calcx_mc_ext(xs, ys, n, x, out);
+    if (st != 0) { return Err(st); }
+    return Ok(0);
 }
 
 # ================================================================
@@ -2054,14 +2631,56 @@ public fn perlin_3d(x, y, z) {
     return calc_lerp(y0, y1, w);
 }
 
+# Internal: fbm_3d_checked's octaves again with the weights p^i, amp-free, for an amp whose
+# own weights left the range: w and the sums are taken by one power of two (two normal
+# factors) to |w| in [1/2, 1) whenever w reaches 1 in magnitude, so that no weight overflows
+# and every ratio of weights is kept. Writes the sum and the weight sum to acc.
+fn _calcx_fbm_3d_pass(acc, x, y, z, octaves, freq, persistence) {
+    var sum = 0;
+    var wsum = 0;
+    var w = F64_ONE;
+    var cur_freq = freq;
+    var i = 0;
+    while (i < octaves) {
+        var nx = f64_mul(x, cur_freq);
+        var ny = f64_mul(y, cur_freq);
+        var nz = f64_mul(z, cur_freq);
+        sum = f64_add(sum, f64_mul(w, perlin_3d(nx, ny, nz)));
+        wsum = f64_add(wsum, w);
+        w = f64_mul(w, persistence);
+        if (f64_le(F64_ONE, f64_abs(w)) == 1 && f64_lt(f64_abs(w), F64_POS_INF) == 1) {
+            var k = ((w >> 52) & 0x7FF) - 1022;
+            var f1 = (1023 - k / 2) << 52;
+            var f2 = (1023 - (k - k / 2)) << 52;
+            w = f64_mul(f64_mul(w, f1), f2);
+            sum = f64_mul(f64_mul(sum, f1), f2);
+            wsum = f64_mul(f64_mul(wsum, f1), f2);
+        }
+        cur_freq = f64_mul(cur_freq, F64_TWO);
+        i = i + 1;
+    }
+    store64(acc, sum);
+    store64(acc + 8, wsum);
+    return 0;
+}
+
 # Fractional Brownian Motion (fBm) using 3D Perlin noise.
 # x, y, z: coordinates (f64), octaves: integer count,
 # freq: initial frequency (f64), amp: initial amplitude (f64),
-# persistence: amplitude multiplier per octave (f64, typically 0.5).
-# Returns: f64 noise value normalized to approximately [-1, 1].
-public fn fbm_3d(x, y, z, octaves, freq, amp, persistence) {
-    var sum = 0;
-    var max_amp = 0;
+# persistence: amplitude multiplier per octave (f64, typically 0.5),
+# out: pointer, the noise value (f64) written here.
+# Returns as fbm_2d_checked (calc.cyr): Ok(0) with the octaves' weighted mean,
+# Err(HSB_ERR_INVALID_INPUT) for octaves <= 0, Err(HSB_ERR_DIVISION_BY_ZERO) when the
+# weights sum to 0, `out` untouched on both; amp = 0 is the mean at amp = 1, and so is any amp
+# whose weights leave the range (+-Inf, subnormal, overflowing: see fbm_2d_checked).
+# ⭐ 3.4.0 — REPLACES fbm_3d, which returned 0 for those (audit D069).
+# [measured: tests/edge_cases.tcyr, group "3.4.0: fbm_2d_checked / fbm_3d_checked"]
+#must_use
+public fn fbm_3d_checked(x, y, z, octaves, freq, amp, persistence, out) {
+    if (octaves <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_eq(amp, 0) == 1) { amp = F64_ONE; }
+    var sum = 0;          # f64 accumulator (starts at 0.0)
+    var max_amp = 0;      # f64 normalization
     var cur_freq = freq;
     var cur_amp = amp;
 
@@ -2077,10 +2696,24 @@ public fn fbm_3d(x, y, z, octaves, freq, amp, persistence) {
         i = i + 1;
     }
 
-    # Guard the normalisation divide. `max_amp` only accumulates inside the octave
-    # loop, so it is still exactly 0 when octaves <= 0 (or when amp is 0), and the
-    # unguarded divide returned NaN — for a function documenting an approximately
-    # [-1, 1] range. NaN then propagates silently through every downstream sample.
-    if (f64_eq(max_amp, 0) == 1) { return 0; }
-    return f64_div(sum, max_amp);
+    # The mean does not depend on amp. Where amp's weights leave the range -- a sum that is
+    # not finite, or a weight sum under 2^-969, where rounding below DBL_MIN moves the mean
+    # (amp +-Inf or subnormal, amp p^i overflowing) -- it is formed again without amp
+    # (_calcx_fbm_3d_pass). A NaN amp keeps its NaN.
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0 || f64_lt(f64_abs(max_amp), F64_POS_INF) == 0 ||
+      ((max_amp >> 52) & 0x7FF) < 54) {
+        if (f64_eq(amp, amp) == 1) {
+            var acc: i64[2];
+            _calcx_fbm_3d_pass(&acc, x, y, z, octaves, freq, persistence);
+            sum = load64(&acc);
+            max_amp = load64(&acc + 8);
+        }
+    }
+
+    # Guard the normalisation divide. Through 2.x it returned NaN when max_amp was 0
+    # (octaves <= 0, amp = 0, or weights that cancel), and through 3.3.7 the designed 0.
+    # Here max_amp is 0 only for weights that cancel, which have no mean.
+    if (f64_eq(max_amp, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    store64(out, f64_div(sum, max_amp));
+    return Ok(0);
 }

@@ -587,6 +587,97 @@ def shapes_in(comment):
     return sorted(found)
 
 # ---------------------------------------------------------------------------
+# 5. MARKER PROVENANCE
+#
+# The marker names a source; check that the source EXISTS. A marker pointing at
+# a deleted test is exactly the state the gate is meant to prevent.
+BENCH_CSV = 'bench-history.csv'
+_bench_names = None
+def bench_names():
+    global _bench_names
+    if _bench_names is None:
+        _bench_names = set()
+        if os.path.exists(BENCH_CSV):
+            with open(BENCH_CSV, encoding='utf-8', errors='replace') as fh:
+                for row in fh:
+                    f = row.split(',')
+                    if len(f) >= 4: _bench_names.add(f[3].strip().rstrip(':'))
+    return _bench_names
+
+NOT_REPRO = re.compile(r'\bnot reproducible in-tree\b|\bno longer reproducible\b', re.I)
+# A dotted token, then an optional :line, up to a delimiter.
+PATH_TOKEN = re.compile(r'([\w./-]*\.\w+)(?::(\d+))?(?=[\s,;:)]|$)')
+# A version, or a version wildcard: 3.3.7, 6.6.20, v2.8.0, 3.x, 6.6.x, v3.x.
+VERSION_TOKEN = re.compile(r'^v?\d+(?:\.(?:\d+|[xX*]))+$')
+# A token whose first component is a number: 0.1ulp, 2.5e3, 1.5e-3.
+NUMBER_LED = re.compile(r'^v?\d+\.')
+# The extensions of the files markers cite (the same list as the path shape above), plus the
+# usual data and archive ones.
+FILE_EXT = {'cyr', 'tcyr', 'bcyr', 'fcyr', 'cyml', 'toml', 'sh', 'md', 'csv', 'yml', 'yaml',
+            'txt', 'py', 'json', 'lock', 'patch', 'diff', 'tsv', 'log', 'html', 'svg', 'png',
+            'pdf', 'gz', 'tar', 'zip', 'bin'}
+
+def names_file(tok):
+    """Is this dotted token a file name (so it must exist), or free text?"""
+    if '/' in tok:
+        return True                  # tests/abuse.tcyr, docs/audit/2026-08-04-v2.8.0-full.md
+    ext = tok.rsplit('.', 1)[1]
+    if ext.lower() in FILE_EXT:
+        return True                  # CHANGELOG.md, bench-history.csv
+    if NUMBER_LED.match(tok):
+        return False                 # 3.3.7, 6.6.x, v2.8.0, 0.1ulp, 2.5e3
+    if ext[:1].isdigit():
+        return True                  # archive.7z, hisab.1, libx.so.6
+    return False                     # mpmath.mpf, numpy.linalg.eig, python3.fractions, a.out, i.e
+
+def check_path(src, m):
+    path, ln = m.group(1), m.group(2)
+    if not os.path.exists(path):
+        return False, f'names a file that does not exist: {path}'
+    if ln:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            total = sum(1 for _ in fh)
+        if int(ln) > total:
+            return False, f'{path} has {total} lines, marker cites line {ln}'
+    if os.path.basename(path) == BENCH_CSV:
+        rest = src[m.end():].strip()
+        if rest and rest.split()[0] not in bench_names():
+            return False, f'no benchmark named {rest.split()[0]!r} in {BENCH_CSV}'
+    return True, f'resolves to {path}'
+
+def check_marker(src):
+    """Return (ok, note). ok=False means the marker names something absent."""
+    if NOT_REPRO.search(src):
+        return True, 'declared non-reproducible'
+    # The whole leading path, up to a delimiter: a lazy match stopped at the first dot, so
+    # docs/audit/2026-08-04-v2.8.0-full.md read as docs/audit/2026-08-04-v2.8 (3.3.6).
+    # ⛔ 3.4.0 -- A DOTTED TOKEN IS A FILE ONLY WHEN IT LOOKS LIKE ONE (names_file). Through
+    # 3.3.7 any leading `\w.\w` token was a path, so `3.3.7 python3 fractions oracle` failed
+    # as "names a file that does not exist: 3.3.7". A version or a version wildcard (3.3.7,
+    # 6.6.x), a number (0.1ulp) and a dotted module name (mpmath.mpf, numpy.linalg.eig) are
+    # free text; a token with a slash, a known file extension, or a digit-led extension on a
+    # name (archive.7z, hisab.1) is a path and must exist. And a marker that OPENS with a
+    # version is not let off: every file it then names is checked (`3.3.7 tests/x.tcyr`).
+    # MARKER_SELFTEST below pins each shape.
+    m = PATH_TOKEN.match(src)
+    if m and names_file(m.group(1)):
+        return check_path(src, m)
+    if m and VERSION_TOKEN.match(m.group(1)):
+        named = None
+        for t in PATH_TOKEN.finditer(src, m.end()):
+            if t.start() > 0 and not re.match(r'[\s,;:(]', src[t.start() - 1]):
+                continue             # inside a longer token
+            if not names_file(t.group(1)):
+                continue
+            ok, note = check_path(src, t)
+            if not ok:
+                return ok, note
+            named = note
+        if named:
+            return True, named
+    return True, 'free-text provenance (not machine-locatable)'
+
+# ---------------------------------------------------------------------------
 # 3b. RECALL CORPUS  (`--selftest`)
 #
 # The false-positive rate of this detector can be audited from the tree itself:
@@ -744,6 +835,38 @@ SELFTEST = [
     ('-', "Every path that returned early skips both cleanup passes that the default 1.5e-3 step needs."),
 ]
 
+# (label, marker source, text the note must contain). Paths that resolve are files
+# this script cannot run without (it lives in scripts/, the suites in tests/).
+MARKER_SELFTEST = [
+    ('free',   "3.3.7 python3 fractions oracle (scratch)", ''),
+    ('free',   "6.6.20 cycc, ALLOC_MAX sweep 8..2048", ''),
+    ('free',   "v2.8.0 audit tables", ''),
+    ('free',   "0.1ulp floor, scratch sweep", ''),
+    ('free',   "scratch probe, 4,000 rays (3.3.7)", ''),
+    ('path',   "scripts/check-measurements.sh --selftest", ''),
+    ('path',   "tests/abuse.tcyr, group \"abuse/canary\"", ''),
+    ('path',   "scripts/check-measurements.sh:1", ''),
+    ('broken', "tests/no-such-suite.tcyr, group x", 'does not exist: tests/no-such-suite.tcyr'),
+    ('broken', "docs/audit/2026-08-04-v2.8.0-no-such.md", 'does not exist: docs/audit/2026-08-04-v2.8.0-no-such.md'),
+    ('broken', "NO-SUCH-FILE.md 2.9.0, Changed", 'does not exist: NO-SUCH-FILE.md'),
+    ('broken', "scripts/check-measurements.sh:99999999", 'marker cites line 99999999'),
+    ('free',   "3.x scratch harness", ''),
+    ('free',   "6.6.x pins, scratch probe", ''),
+    ('free',   "v3.x tables", ''),
+    ('free',   "mpmath.mpf at 60 digits", ''),
+    ('free',   "numpy.linalg.eig cross-check", ''),
+    ('free',   "python3.fractions oracle", ''),
+    ('free',   "a.out from the scratch probe", ''),
+    ('free',   "i.e, the scratch run", ''),
+    ('broken', "archive.7z of the sweep", 'does not exist: archive.7z'),
+    ('broken', "hisab.1 man page", 'does not exist: hisab.1'),
+    ('broken', "libx.so.6 build", 'does not exist: libx.so.6'),
+    ('broken', "3.3.7 tests/no_such.tcyr", 'does not exist: tests/no_such.tcyr'),
+    ('broken', "6.7.9 cycc, scripts/check-measurements.sh:99999999", 'marker cites line 99999999'),
+    ('path',   "6.7.9 cycc, scripts/check-measurements.sh --selftest", ''),
+    ('broken', "docs/no_such.xyz listing", 'does not exist: docs/no_such.xyz'),
+]
+
 if mode == 'selftest':
     want_hit = [t for lab, t in SELFTEST if lab == '+']
     known    = [t for lab, t in SELFTEST if lab == '?']
@@ -763,7 +886,23 @@ if mode == 'selftest':
         print(f"  FALSE ALARM [{','.join(k)}]: {t}")
     for t, k in still:
         print(f"  known miss now CAUGHT [{','.join(k)}] -- promote it to '+': {t}")
-    if missed or alarms:
+    # The provenance half: each marker below must classify as labelled. 'path' must
+    # resolve, 'broken' must fail naming `want` in its note, 'free' must read as free
+    # text. Both sides of the 3.4.0 repair sit here, so neither can regress silently:
+    # a version-led marker is free text, and a real path that is absent still fails.
+    mk_bad = []
+    for lab, src, want in MARKER_SELFTEST:
+        ok, note = check_marker(src)
+        if lab == 'path':     good = ok and note.startswith('resolves to ')
+        elif lab == 'free':   good = ok and note.startswith('free-text')
+        else:                 good = (not ok) and want in note
+        if not good:
+            mk_bad.append((lab, src, note))
+    print(f"=== selftest: provenance {len(MARKER_SELFTEST) - len(mk_bad)}/{len(MARKER_SELFTEST)} "
+          f"marker(s) classified as labelled ===")
+    for lab, src, note in mk_bad:
+        print(f"  MISCLASSIFIED (want {lab}): [measured: {src}] -> {note}")
+    if missed or alarms or mk_bad:
         sys.exit(1)
     print("Every planted claim is flagged and no decoy is.")
     sys.exit(0)
@@ -797,49 +936,6 @@ def paragraphs(path):
             if m: cur.markers.append((no, m.group(1).strip()))
             prev_no = no
     return out
-
-# ---------------------------------------------------------------------------
-# 5. MARKER PROVENANCE
-#
-# The marker names a source; check that the source EXISTS. A marker pointing at
-# a deleted test is exactly the state the gate is meant to prevent.
-BENCH_CSV = 'bench-history.csv'
-_bench_names = None
-def bench_names():
-    global _bench_names
-    if _bench_names is None:
-        _bench_names = set()
-        if os.path.exists(BENCH_CSV):
-            with open(BENCH_CSV, encoding='utf-8', errors='replace') as fh:
-                for row in fh:
-                    f = row.split(',')
-                    if len(f) >= 4: _bench_names.add(f[3].strip().rstrip(':'))
-    return _bench_names
-
-NOT_REPRO = re.compile(r'\bnot reproducible in-tree\b|\bno longer reproducible\b', re.I)
-
-def check_marker(src):
-    """Return (ok, note). ok=False means the marker names something absent."""
-    if NOT_REPRO.search(src):
-        return True, 'declared non-reproducible'
-    # The whole leading path, up to a delimiter: a lazy match stopped at the first dot, so
-    # docs/audit/2026-08-04-v2.8.0-full.md read as docs/audit/2026-08-04-v2.8 (3.3.6).
-    m = re.match(r'^([\w./-]*\.\w+)(?::(\d+))?(?=[\s,;:)]|$)', src)
-    if m:
-        path, ln = m.group(1), m.group(2)
-        if not os.path.exists(path):
-            return False, f'names a file that does not exist: {path}'
-        if ln:
-            with open(path, encoding='utf-8', errors='replace') as fh:
-                total = sum(1 for _ in fh)
-            if int(ln) > total:
-                return False, f'{path} has {total} lines, marker cites line {ln}'
-        if os.path.basename(path) == BENCH_CSV:
-            rest = src[m.end():].strip()
-            if rest and rest.split()[0] not in bench_names():
-                return False, f'no benchmark named {rest.split()[0]!r} in {BENCH_CSV}'
-        return True, f'resolves to {path}'
-    return True, 'free-text provenance (not machine-locatable)'
 
 # ---------------------------------------------------------------------------
 # 6. SCAN

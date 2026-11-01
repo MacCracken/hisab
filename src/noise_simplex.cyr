@@ -144,13 +144,15 @@ var _SIMPLEX_2_POW_63 = 0x43E0000000000000;  # 2^63
 # GRADIENT TABLES
 # ================================================================
 
-# 3D gradient table: 12 edge directions of a cube.
-# Stored as flat allocation: 12 * 3 f64 values = 288 bytes.
-var _GRAD3_TABLE = 0;
+# 3D gradient table: 12 edge directions of a cube, 12 * 3 f64 values.
+# ⛔ 3.4.0 -- A STATIC TABLE, NOT A HEAP ONE. It was `alloc(288)` on first use, stored
+# through unchecked, and the functions that read it return a noise VALUE: there is no
+# answer left to report a refused allocation with, so the table no longer needs one.
+var _GRAD3_TABLE: i64[36];
+var _GRAD3_READY = 0;
 
 fn _grad3_init() {
-    if (_GRAD3_TABLE != 0) { return 0; }
-    _GRAD3_TABLE = alloc(12 * 3 * 8);
+    if (_GRAD3_READY != 0) { return 0; }
 
     # 12 gradient directions (edges of cube)
     _grad3_set(0,   F64_ONE,  F64_ONE,  0);
@@ -165,11 +167,12 @@ fn _grad3_init() {
     _grad3_set(9,   0,  f64_neg(F64_ONE),  F64_ONE);
     _grad3_set(10,  0,  F64_ONE,  f64_neg(F64_ONE));
     _grad3_set(11,  0,  f64_neg(F64_ONE),  f64_neg(F64_ONE));
+    _GRAD3_READY = 1;
     return 0;
 }
 
 fn _grad3_set(idx, gx, gy, gz) {
-    var base = _GRAD3_TABLE + idx * 24;
+    var base = &_GRAD3_TABLE + idx * 24;
     store64(base,      gx);
     store64(base + 8,  gy);
     store64(base + 16, gz);
@@ -179,9 +182,9 @@ fn _grad3_set(idx, gx, gy, gz) {
 # Dot product of gradient[idx % 12] with (x, y, z)
 fn _grad3_dot(hash, x, y, z) {
     var idx = (hash % 12) * 24;
-    var gx = load64(_GRAD3_TABLE + idx);
-    var gy = load64(_GRAD3_TABLE + idx + 8);
-    var gz = load64(_GRAD3_TABLE + idx + 16);
+    var gx = load64(&_GRAD3_TABLE + idx);
+    var gy = load64(&_GRAD3_TABLE + idx + 8);
+    var gz = load64(&_GRAD3_TABLE + idx + 16);
     return f64_add(f64_add(f64_mul(gx, x), f64_mul(gy, y)), f64_mul(gz, z));
 }
 
@@ -463,22 +466,66 @@ public fn simplex_3d(x, y, z) {
 # FRACTIONAL BROWNIAN MOTION (fBm)
 # ================================================================
 
-# simplex_fbm_2d(x, y, octaves, freq, amp, persistence) -> f64
-# Layers multiple octaves of 2D simplex noise.
-# persistence: amplitude multiplier per octave (typically 0.5).
-# Returns normalized f64 in approximately [-1, 1]; NaN when an octave's scaled
-# coordinates are past simplex_2d's reach (header, 3.3.3): a NaN or infinite x, y or
-# freq, an octave frequency freq * 2^i, or x times it, that overflows -- with freq = 1,
-# 1025 or more octaves reach 2^1024 = +Inf -- or finite coordinates whose skew or
-# unskew overflows: at (1, 1) and freq = 1, 1024 octaves already give NaN, the last
-# at (2^1023, 2^1023), whose x + y is 2^1024. (3.3.2 summed such an octave as 0;
-# fbm_2d's perlin_2d already gave NaN at 1025.) Unless the weights sum to 0 (e.g.
-# octaves <= 0, amp = 0, or persistence = -1 with an even octave count), which
-# returns 0 whatever the coordinates (the guard below).
-# [measured: tests/abuse.tcyr, groups "3.3.3 W5: simplex non-finite coordinates", "3.3.3 R4sym: simplex skew overflow"]
-public fn simplex_fbm_2d(x, y, octaves, freq, amp, persistence) {
+# Internal: simplex_fbm_2d_checked's octaves again with the weights p^i, amp-free, for an amp whose
+# own weights left the range: w and the sums are taken by one power of two (two normal
+# factors) to |w| in [1/2, 1) whenever w reaches 1 in magnitude, so that no weight overflows
+# and every ratio of weights is kept. Writes the sum and the weight sum to acc.
+fn _simplex_fbm_2d_pass(acc, x, y, octaves, freq, persistence) {
     var sum = 0;
-    var max_amp = 0;
+    var wsum = 0;
+    var w = F64_ONE;
+    var cur_freq = freq;
+    var i = 0;
+    while (i < octaves) {
+        var nx = f64_mul(x, cur_freq);
+        var ny = f64_mul(y, cur_freq);
+        sum = f64_add(sum, f64_mul(w, simplex_2d(nx, ny)));
+        wsum = f64_add(wsum, w);
+        w = f64_mul(w, persistence);
+        if (f64_le(F64_ONE, f64_abs(w)) == 1 && f64_lt(f64_abs(w), F64_POS_INF) == 1) {
+            var k = ((w >> 52) & 0x7FF) - 1022;
+            var f1 = (1023 - k / 2) << 52;
+            var f2 = (1023 - (k - k / 2)) << 52;
+            w = f64_mul(f64_mul(w, f1), f2);
+            sum = f64_mul(f64_mul(sum, f1), f2);
+            wsum = f64_mul(f64_mul(wsum, f1), f2);
+        }
+        cur_freq = f64_mul(cur_freq, F64_TWO);
+        i = i + 1;
+    }
+    store64(acc, sum);
+    store64(acc + 8, wsum);
+    return 0;
+}
+
+# simplex_fbm_2d_checked(x, y, octaves, freq, amp, persistence, out) -> Result
+# Layers multiple octaves of 2D simplex noise.
+# persistence: amplitude multiplier per octave (typically 0.5); out: pointer, the noise
+# value (f64) written here.
+# Returns Ok(0) with the octaves' weighted mean, sum(a_i n_i) / sum(a_i), a_i = amp p^i,
+# approximately [-1, 1]; NaN, as Ok, when an octave's scaled coordinates are past
+# simplex_2d's reach (header, 3.3.3): a NaN or infinite x, y or freq, an octave frequency
+# freq * 2^i, or x times it, that overflows -- with freq = 1, 1025 or more octaves reach
+# 2^1024 = +Inf -- or finite coordinates whose skew or unskew overflows: at (1, 1) and
+# freq = 1, 1024 octaves already give NaN, the last at (2^1023, 2^1023), whose x + y is
+# 2^1024. (3.3.2 summed such an octave as 0; fbm_2d's perlin_2d already gave NaN at 1025.)
+# Err(HSB_ERR_INVALID_INPUT) for octaves <= 0 (no octave, no mean), and
+# Err(HSB_ERR_DIVISION_BY_ZERO) when the weights sum to 0 (persistence = -1 with an even
+# octave count): `out` untouched on both. amp = 0 is the mean at amp = 1 (it cancels).
+# [measured: tests/abuse.tcyr, groups "3.3.3 W5: simplex non-finite coordinates", "3.3.3 R4sym: simplex skew overflow"]
+# ⭐ 3.4.0 — REPLACES simplex_fbm_2d, which returned 0, a legal noise value, whatever the
+# coordinates, for octaves <= 0, for amp = 0 and for weights summing to 0 (audit D069),
+# as calc.cyr's fbm_2d did (fbm_2d_checked has the reasoning). The mean does not depend on
+# amp, so amp = 0 is computed at amp = 1, and so is any amp whose weights leave the range
+# (+-Inf, subnormal, or overflowing: 3.4.0's first form gave NaN or the sign of n_0 there;
+# fbm_2d_checked has the measurements); every other amp keeps its bits.
+# [measured: tests/edge_cases.tcyr, group "3.4.0: simplex_fbm_2d_checked / simplex_fbm_3d_checked"]
+#must_use
+public fn simplex_fbm_2d_checked(x, y, octaves, freq, amp, persistence, out) {
+    if (octaves <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_eq(amp, 0) == 1) { amp = F64_ONE; }
+    var sum = 0;          # f64 accumulator (starts at 0.0)
+    var max_amp = 0;      # f64 normalization
     var cur_freq = freq;
     var cur_amp = amp;
 
@@ -493,25 +540,76 @@ public fn simplex_fbm_2d(x, y, octaves, freq, amp, persistence) {
         i = i + 1;
     }
 
-    # Guard the normalisation divide. `max_amp` only accumulates inside the octave
-    # loop, so it is still exactly 0 when octaves <= 0 (or when amp is 0, or the
-    # weights cancel: persistence = -1 over an even count), and the
-    # unguarded divide returned NaN — for a function documenting an approximately
-    # [-1, 1] range. NaN then propagates silently through every downstream sample.
-    if (f64_eq(max_amp, 0) == 1) { return 0; }
-    return f64_div(sum, max_amp);
+    # The mean does not depend on amp. Where amp's weights leave the range -- a sum that is
+    # not finite, or a weight sum under 2^-969, where rounding below DBL_MIN moves the mean
+    # (amp +-Inf or subnormal, amp p^i overflowing) -- it is formed again without amp
+    # (_simplex_fbm_2d_pass). A NaN amp keeps its NaN.
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0 || f64_lt(f64_abs(max_amp), F64_POS_INF) == 0 ||
+      ((max_amp >> 52) & 0x7FF) < 54) {
+        if (f64_eq(amp, amp) == 1) {
+            var acc: i64[2];
+            _simplex_fbm_2d_pass(&acc, x, y, octaves, freq, persistence);
+            sum = load64(&acc);
+            max_amp = load64(&acc + 8);
+        }
+    }
+
+    # Guard the normalisation divide. Through 2.x it returned NaN when max_amp was 0
+    # (octaves <= 0, amp = 0, or weights that cancel), and through 3.3.7 the designed 0.
+    # Here max_amp is 0 only for weights that cancel, which have no mean.
+    if (f64_eq(max_amp, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    store64(out, f64_div(sum, max_amp));
+    return Ok(0);
 }
 
-# simplex_fbm_3d(x, y, z, octaves, freq, amp, persistence) -> f64
-# Layers multiple octaves of 3D simplex noise.
-# persistence: amplitude multiplier per octave (typically 0.5).
-# Returns normalized f64 in approximately [-1, 1]; NaN when an octave's scaled
-# coordinates are past simplex_3d's reach, as in simplex_fbm_2d -- unless the weights
-# sum to 0 (e.g. octaves <= 0, amp = 0, or persistence = -1 with an even octave
-# count), which returns 0 whatever the coordinates.
-public fn simplex_fbm_3d(x, y, z, octaves, freq, amp, persistence) {
+# Internal: simplex_fbm_3d_checked's octaves again with the weights p^i, amp-free, for an amp whose
+# own weights left the range: w and the sums are taken by one power of two (two normal
+# factors) to |w| in [1/2, 1) whenever w reaches 1 in magnitude, so that no weight overflows
+# and every ratio of weights is kept. Writes the sum and the weight sum to acc.
+fn _simplex_fbm_3d_pass(acc, x, y, z, octaves, freq, persistence) {
     var sum = 0;
-    var max_amp = 0;
+    var wsum = 0;
+    var w = F64_ONE;
+    var cur_freq = freq;
+    var i = 0;
+    while (i < octaves) {
+        var nx = f64_mul(x, cur_freq);
+        var ny = f64_mul(y, cur_freq);
+        var nz = f64_mul(z, cur_freq);
+        sum = f64_add(sum, f64_mul(w, simplex_3d(nx, ny, nz)));
+        wsum = f64_add(wsum, w);
+        w = f64_mul(w, persistence);
+        if (f64_le(F64_ONE, f64_abs(w)) == 1 && f64_lt(f64_abs(w), F64_POS_INF) == 1) {
+            var k = ((w >> 52) & 0x7FF) - 1022;
+            var f1 = (1023 - k / 2) << 52;
+            var f2 = (1023 - (k - k / 2)) << 52;
+            w = f64_mul(f64_mul(w, f1), f2);
+            sum = f64_mul(f64_mul(sum, f1), f2);
+            wsum = f64_mul(f64_mul(wsum, f1), f2);
+        }
+        cur_freq = f64_mul(cur_freq, F64_TWO);
+        i = i + 1;
+    }
+    store64(acc, sum);
+    store64(acc + 8, wsum);
+    return 0;
+}
+
+# simplex_fbm_3d_checked(x, y, z, octaves, freq, amp, persistence, out) -> Result
+# Layers multiple octaves of 3D simplex noise; out: pointer, the noise value (f64).
+# Returns as simplex_fbm_2d_checked: Ok(0) with the octaves' weighted mean (NaN when an
+# octave's scaled coordinates are past simplex_3d's reach), Err(HSB_ERR_INVALID_INPUT)
+# for octaves <= 0, Err(HSB_ERR_DIVISION_BY_ZERO) when the weights sum to 0, `out`
+# untouched on both; amp = 0 is the mean at amp = 1, as is an amp whose weights leave the
+# range (simplex_fbm_2d_checked).
+# ⭐ 3.4.0 — REPLACES simplex_fbm_3d, which returned 0 for those (audit D069).
+# [measured: tests/edge_cases.tcyr, group "3.4.0: simplex_fbm_2d_checked / simplex_fbm_3d_checked"]
+#must_use
+public fn simplex_fbm_3d_checked(x, y, z, octaves, freq, amp, persistence, out) {
+    if (octaves <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_eq(amp, 0) == 1) { amp = F64_ONE; }
+    var sum = 0;          # f64 accumulator (starts at 0.0)
+    var max_amp = 0;      # f64 normalization
     var cur_freq = freq;
     var cur_amp = amp;
 
@@ -527,11 +625,24 @@ public fn simplex_fbm_3d(x, y, z, octaves, freq, amp, persistence) {
         i = i + 1;
     }
 
-    # Guard the normalisation divide. `max_amp` only accumulates inside the octave
-    # loop, so it is still exactly 0 when octaves <= 0 (or when amp is 0, or the
-    # weights cancel: persistence = -1 over an even count), and the
-    # unguarded divide returned NaN — for a function documenting an approximately
-    # [-1, 1] range. NaN then propagates silently through every downstream sample.
-    if (f64_eq(max_amp, 0) == 1) { return 0; }
-    return f64_div(sum, max_amp);
+    # The mean does not depend on amp. Where amp's weights leave the range -- a sum that is
+    # not finite, or a weight sum under 2^-969, where rounding below DBL_MIN moves the mean
+    # (amp +-Inf or subnormal, amp p^i overflowing) -- it is formed again without amp
+    # (_simplex_fbm_3d_pass). A NaN amp keeps its NaN.
+    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0 || f64_lt(f64_abs(max_amp), F64_POS_INF) == 0 ||
+      ((max_amp >> 52) & 0x7FF) < 54) {
+        if (f64_eq(amp, amp) == 1) {
+            var acc: i64[2];
+            _simplex_fbm_3d_pass(&acc, x, y, z, octaves, freq, persistence);
+            sum = load64(&acc);
+            max_amp = load64(&acc + 8);
+        }
+    }
+
+    # Guard the normalisation divide. Through 2.x it returned NaN when max_amp was 0
+    # (octaves <= 0, amp = 0, or weights that cancel), and through 3.3.7 the designed 0.
+    # Here max_amp is 0 only for weights that cancel, which have no mean.
+    if (f64_eq(max_amp, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    store64(out, f64_div(sum, max_amp));
+    return Ok(0);
 }

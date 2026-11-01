@@ -7,11 +7,16 @@
 
 # Byte size of the column-major 3x3 grid (9 f64). Ties alloc + copy-loop
 # bounds to a single named constant instead of a repeated magic literal.
+#
+# 3.4.0 (the [3.3.8] allocation row): every function here that allocates returns the designed 0
+# when the allocation is refused (an exhausted heap), and every Result returns Err(HSB_ERR_ALLOC);
+# none stores through a 0 handle. A 0 handle passed IN is the caller's.
 public enum Mat3Layout { MAT3_BYTES = 72 }
 
 #must_use
 public fn m3_new() {
     var m = alloc(MAT3_BYTES);
+    if (m == 0) { return 0; }
     var i = 0;
     while (i < 9) { store64(m + i * 8, 0); i = i + 1; }
     return m;
@@ -20,6 +25,7 @@ public fn m3_new() {
 #must_use
 public fn m3_identity() {
     var m = m3_new();
+    if (m == 0) { return 0; }
     store64(m, F64_ONE);       # [0][0]
     store64(m + 32, F64_ONE);  # [1][1]
     store64(m + 64, F64_ONE);  # [2][2]
@@ -33,6 +39,7 @@ public fn m3_set(m, col, row, val) { store64(m + (col * 3 + row) * 8, val); retu
 #must_use
 public fn m3_copy(src) {
     var dst = alloc(MAT3_BYTES);
+    if (dst == 0) { return 0; }
     var i = 0;
     while (i < MAT3_BYTES) { store64(dst + i, load64(src + i)); i = i + 8; }
     return dst;
@@ -41,6 +48,7 @@ public fn m3_copy(src) {
 #must_use
 public fn m3_from_cols(c0, c1, c2) {
     var m = alloc(MAT3_BYTES);
+    if (m == 0) { return 0; }
     store64(m,      HVec3_x(c0)); store64(m + 8,  HVec3_y(c0)); store64(m + 16, HVec3_z(c0));
     store64(m + 24, HVec3_x(c1)); store64(m + 32, HVec3_y(c1)); store64(m + 40, HVec3_z(c1));
     store64(m + 48, HVec3_x(c2)); store64(m + 56, HVec3_y(c2)); store64(m + 64, HVec3_z(c2));
@@ -63,7 +71,9 @@ public fn m3_col(m, c) {
 #must_use
 public fn m3_mul(a, b) {
     var c = m3_new();
+    if (c == 0) { return 0; }
     var tmp = alloc(24);
+    if (tmp == 0) { return 0; }
     var col = 0;
     while (col < 3) {
         var cc = c + col * 24;          # dest column (3 f64)
@@ -128,7 +138,9 @@ public fn m3_mul(a, b) {
 #must_use
 public fn m3_mul_vec3(m, v) {
     var r = alloc(sizeof(HVec3));
+    if (r == 0) { return 0; }
     var tmp = alloc(24);
+    if (tmp == 0) { return 0; }
     var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
     f64v_scale(r, m, vx, 2);
     var rz = f64_mul(load64(m + 16), vx);
@@ -143,6 +155,7 @@ public fn m3_mul_vec3(m, v) {
 #must_use
 public fn m3_transpose(m) {
     var t = m3_new();
+    if (t == 0) { return 0; }
     var c = 0;
     while (c < 3) {
         var r = 0;
@@ -162,40 +175,518 @@ public fn m3_determinant(m) {
       f64_mul(m20, f64_sub(f64_mul(m01, m12), f64_mul(m11, m02))));
 }
 
-#must_use
-public fn m3_inverse(m) {
-    var det = m3_determinant(m);
-    # ⛔ `det` is a degree-THREE form in the matrix entries — det(k·M) = k³·det(M)
-    # — and this compared it against an absolute 1e-12, so a well-conditioned
-    # matrix in small units was declared singular. The fallback makes it worse:
-    # `m3_identity()` is full-rank, orthogonal and unit-determinant, returned
-    # through a bare pointer with no rc, so the caller cannot tell "here is your
-    # inverse" from "I could not compute one". ⚠ m3_normal_matrix inherits it.
-    # ⭐ The operation is the RECIPROCAL on the next line, so test that: it is
-    # finite for every det whose inverse exists — subnormal included — and the
-    # comparison also rejects a NaN determinant, which `f64_lt` let through.
-    # [measured: tests/modules.tcyr matrix-scale sweep, 2026-09-10]
-    var inv_det = f64_div(F64_ONE, det);
-    if (f64_lt(f64_abs(inv_det), F64_POS_INF) == 0) { return m3_identity(); }
-    var m00 = m3_get(m, 0, 0); var m01 = m3_get(m, 0, 1); var m02 = m3_get(m, 0, 2);
-    var m10 = m3_get(m, 1, 0); var m11 = m3_get(m, 1, 1); var m12 = m3_get(m, 1, 2);
-    var m20 = m3_get(m, 2, 0); var m21 = m3_get(m, 2, 1); var m22 = m3_get(m, 2, 2);
+# ================================================================
+# Inverse (3.4.0: a Result; `m3_inverse` is retired)
+# ================================================================
+
+enum _M3Exact {
+    _M3_PM_LO = 0x03F0_0000_0000_0000;   # 2^-960
+    _M3_PM_HI = 0x7E70_0000_0000_0000;   # 2^1000
+    _M3_CERT  = 0x4090_0000_0000_0000;   # 2^10
+    _M3_SIGN  = 0x3CE0_0000_0000_0000;   # 2^-49
+    _M3_TWO64 = 0x43F0_0000_0000_0000;   # 2^64
+    _M3_FLOOR = 0x0360_0000_0000_0000;   # 2^-969
+    _M3_QN_LO = 0x3FD0_0000_0000_0000;   # 0.25
+    _M3_QN_HI = 0x4030_0000_0000_0000;   # 16.0
+    _M3_LIMB  = 0x7FF_FFFF;              # 2^27 - 1, an integer: `_m3_xsum`'s limb mask
+    _M3_SMALL = 0x2000_0000_0000_0000;   # 2^-511
+    _M3_SPLIT = 0x41A0_0000_0200_0000;   # 2^27 + 1
+    _M3_CERT2 = 0x42A0_0000_0000_0000;   # 2^43
+    _M3_DD_LO = 0x07B0_0000_0000_0000;   # 2^-900
+    _M3_UFL   = 0x0210_0000_0000_0000;   # 2^-990
+}
+
+# x * 2^k, rounded once, for any integer k. Upward every step is exact or overflows; downward
+# the remainder goes first, so each step before the last is exact, or is subnormal and the
+# steps after it end at a zero, as x * 2^k rounds to.
+fn _m3_ldexp(x, k) {
+    while (k > 1023) { x = f64_mul(x, (1023 + 1023) << 52); k = k - 1023; }
+    if (k >= 0) { return f64_mul(x, (1023 + k) << 52); }
+    var m = (0 - k) / 1022;
+    x = f64_mul(x, (1023 - ((0 - k) - m * 1022)) << 52);
+    while (m > 0) { x = f64_mul(x, 0x0010_0000_0000_0000); m = m - 1; }   # 2^-1022
+    return x;
+}
+
+# floor(log2 |x|) for a finite non-zero x, subnormals included.
+fn _m3_expo(x) {
+    var b = x & 0x7FFF_FFFF_FFFF_FFFF;
+    if ((b >> 52) != 0) { return (b >> 52) - 1023; }
+    return ((f64_mul(b, _M3_TWO64) >> 52) - 1023) - 64;
+}
+
+# ----------------------------------------------------------------
+# Exact arithmetic over the whole double range (3.4.0)
+# ----------------------------------------------------------------
+# Every finite double is +-n * 2^e, n an integer below 2^53 and e in [-1074, 971], so a product
+# of k entries is an integer below 2^(53 k) times 2^(e_1 + .. + e_k): no rounding, no range
+# limit. `_m3_xsum` adds such products, signed, in base-2^27 integer limbs placed from k times
+# the entries' least exponent up, so it decides zero exactly and rounds the sum once, to
+# nearest with a sticky bit, for every finite input from the subnormals to DBL_MAX. (Through 3.4.0's review this was a
+# double-precision expansion on a copy of m scaled row by row and column by column: the scaling
+# rounded entries more than 2^1021 below their row's largest, and Dekker's product is inexact
+# below 2^-969, so it answered Ok for matrices with two identical rows and refused invertible
+# ones.) The engine is the inverse's third tier and the normal matrix's exact sign; its costs
+# are theirs (the 4x4 determinant's 24 products of four entries: 1.8 us of mat4.cyr's 2.8 us
+# singular refusal).
+# [measured: scratch xs.bcyr, this tree, 2026-10-31; cycc 6.7.9]
+
+# x (finite) into d[0..4): its significand n as base-2^27 limbs (low, high; 0 for +-0), its
+# exponent e (|x| = n * 2^e) and its sign bit.
+fn _m3_xdec(x, d) {
+    var b = x & 0x7FFF_FFFF_FFFF_FFFF;
+    var n = b & 0x000F_FFFF_FFFF_FFFF;
+    var e = 0 - 1074;
+    if ((b >> 52) != 0) { n = n | 0x0010_0000_0000_0000; e = (b >> 52) - 1075; }
+    store64(d, n & _M3_LIMB);
+    store64(d + 8, n >> 27);
+    store64(d + 16, e);
+    store64(d + 24, x >> 63);
+    return 0;
+}
+
+# The least and greatest exponent of the non-zero entries among dc[0..ne) into er[0], er[1]
+# (er[1] < er[0] when every one is zero): the bounds `_m3_xsum` places its terms by.
+fn _m3_xrange(dc, ne, er) {
+    var lo = 4096;
+    var hi = 0 - 4096;
+    var i = 0;
+    while (i < ne) {
+        var d = dc + i * 32;
+        if ((load64(d) | load64(d + 8)) != 0) {
+            var e = load64(d + 16);
+            if (e < lo) { lo = e; }
+            if (e > hi) { hi = e; }
+        }
+        i = i + 1;
+    }
+    store64(er, lo);
+    store64(er + 8, hi);
+    return 0;
+}
+
+# The significand product of term base's k entries (k = 2, 3) as base-2^27 limbs into pr, its
+# exponent into pr[8] and its sign into pr[9]; returns the limb count, or 0 for a zero term.
+# Every limb product is below 2^54 and every column sum below 2^57.
+fn _m3_xprod(dc, base, k, pr) {
+    var da = dc + load64(base) * 32;
+    var db = dc + load64(base + 8) * 32;
+    var a0 = load64(da); var a1 = load64(da + 8);
+    var b0 = load64(db); var b1 = load64(db + 8);
+    if ((a0 | a1) == 0 || (b0 | b1) == 0) { return 0; }
+    store64(pr + 64, load64(da + 16) + load64(db + 16));
+    store64(pr + 72, load64(da + 24) ^ load64(db + 24) ^ load64(base + k * 8));
+    var t0 = a0 * b0;
+    var t1 = a0 * b1 + a1 * b0 + (t0 >> 27);
+    var t2 = a1 * b1 + (t1 >> 27);
+    var p0 = t0 & _M3_LIMB; var p1 = t1 & _M3_LIMB; var p2 = t2 & _M3_LIMB; var p3 = t2 >> 27;
+    if (k == 2) {
+        store64(pr, p0); store64(pr + 8, p1); store64(pr + 16, p2); store64(pr + 24, p3);
+        return 4;
+    }
+    var dg = dc + load64(base + 16) * 32;
+    var c0 = load64(dg); var c1 = load64(dg + 8);
+    if ((c0 | c1) == 0) { return 0; }
+    store64(pr + 64, load64(pr + 64) + load64(dg + 16));
+    store64(pr + 72, load64(pr + 72) ^ load64(dg + 24));
+    {
+        var u0 = p0 * c0;
+        var u1 = p1 * c0 + p0 * c1 + (u0 >> 27);
+        var u2 = p2 * c0 + p1 * c1 + (u1 >> 27);
+        var u3 = p3 * c0 + p2 * c1 + (u2 >> 27);
+        var u4 = p3 * c1 + (u3 >> 27);
+        store64(pr, u0 & _M3_LIMB); store64(pr + 8, u1 & _M3_LIMB); store64(pr + 16, u2 & _M3_LIMB);
+        store64(pr + 24, u3 & _M3_LIMB); store64(pr + 32, u4 & _M3_LIMB); store64(pr + 40, u4 >> 27);
+        return 6;
+    }
+}
+
+# The exact sum of nt signed products of k entries each: term t is the product of the entries
+# dc[tl[t (k+1) + j]], j < k (four slots each, `_m3_xdec`), negated when tl[t (k+1) + k] is 1;
+# er holds the entries' exponent bounds (`_m3_xrange`).
+# Returns the sum's sign (1, -1, or 0 exactly when it is zero) and, when it is not zero, its
+# magnitude rounded once to nearest as out[0] * 2^out[1], out[0] in [1, 2^62]. At most 32
+# terms of at most 4 entries.
+fn _m3_xsum(dc, er, tl, nt, k, out) {
+    var acc: i64[320];
+    var pr: i64[10];
+    if (load64(er + 8) < load64(er)) { return 0; }   # every entry zero
+    # every term is k entries' product: below 2^(53 k) in units of 2^(its exponent), which lies
+    # in [k emin, k emax] (er: the entries' least and greatest exponents); a sum of at most 32
+    # such terms needs 5 bits more
+    var lo = k * load64(er);
+    var w = (k * (load64(er + 8) - load64(er)) + 53 * k + 5) / 27 + 2;
+    var i = 0;
+    while (i < w) { store64(&acc + i * 8, 0); i = i + 1; }
+    var t = 0;
+    while (t < nt) {
+        var n = _m3_xprod(dc, tl + t * (k + 1) * 8, k, &pr);
+        if (n != 0) {
+            var o = load64(&pr + 64) - lo;
+            var ql = o / 27;
+            var sh = o - ql * 27;
+            var a = &acc + ql * 8;
+            var pp = &pr;
+            var pe = &pr + n * 8;
+            if (load64(&pr + 72) == 0) {
+                while (pp < pe) { store64(a, load64(a) + (load64(pp) << sh)); a = a + 8; pp = pp + 8; }
+            } else {
+                while (pp < pe) { store64(a, load64(a) - (load64(pp) << sh)); a = a + 8; pp = pp + 8; }
+            }
+        }
+        t = t + 1;
+    }
+    # carries (floor, `>>>`): the top carry is 0 or -1, the sum's sign
+    var c = 0;
+    i = 0;
+    while (i < w) {
+        var v2 = load64(&acc + i * 8) + c;
+        store64(&acc + i * 8, v2 & _M3_LIMB);
+        c = v2 >>> 27;
+        i = i + 1;
+    }
+    var res = 1;
+    if (c < 0) {
+        res = 0 - 1;
+        c = 0;
+        i = 0;
+        while (i < w) {
+            var v3 = c - load64(&acc + i * 8);
+            store64(&acc + i * 8, v3 & _M3_LIMB);
+            c = v3 >>> 27;
+            i = i + 1;
+        }
+    }
+    var h = w - 1;
+    while (h >= 0 && load64(&acc + h * 8) == 0) { h = h - 1; }
+    if (h < 0) { return 0; }
+    # the top 62 bits, the rest folded into bit 0 (sticky): one rounding, to nearest
+    var x = load64(&acc + h * 8);
+    var nb = 0;
+    var tt = x;
+    while (tt != 0) { tt = tt >> 1; nb = nb + 1; }
+    var pos = h * 27;
+    var jb = h - 1;
+    while (jb >= 0 && nb + 27 <= 62) {
+        x = (x << 27) | load64(&acc + jb * 8);
+        nb = nb + 27;
+        pos = pos - 27;
+        jb = jb - 1;
+    }
+    if (jb >= 0) {
+        var take = 62 - nb;
+        var lw = load64(&acc + jb * 8);
+        x = (x << take) | (lw >> (27 - take));
+        pos = pos - take;
+        var st = lw & ((1 << (27 - take)) - 1);
+        jb = jb - 1;
+        while (jb >= 0) { st = st | load64(&acc + jb * 8); jb = jb - 1; }
+        if (st != 0) { x = x | 1; }
+    }
+    store64(out, f64_from(x));
+    store64(out + 8, pos + lo);
+    return res;
+}
+
+# The two terms of the cofactor (-1)^(r+c) minor(r, c) of a 3x3 (entry (i, j) is index 3j + i)
+# from term nt of tl on, each prefixed with the entry (r, c) itself when k is 3 (the terms of
+# det along row r). Returns nt + 2.
+fn _m3_minor_terms(tl, nt, r, c, k) {
+    var r0 = 0;
+    if (r == 0) { r0 = 1; }
+    var r1 = 2;
+    if (r == 2) { r1 = 1; }
+    var c0 = 0;
+    if (c == 0) { c0 = 1; }
+    var c1 = 2;
+    if (c == 2) { c1 = 1; }
+    var s = (r + c) & 1;
+    var p = tl + nt * (k + 1) * 8;
+    if (k == 3) { store64(p, c * 3 + r); p = p + 8; }
+    store64(p, c0 * 3 + r0);
+    store64(p + 8, c1 * 3 + r1);
+    store64(p + 16, s);
+    p = p + 24;
+    if (k == 3) { store64(p, c * 3 + r); p = p + 8; }
+    store64(p, c1 * 3 + r0);
+    store64(p + 8, c0 * 3 + r1);
+    store64(p + 16, 1 - s);
+    return nt + 2;
+}
+
+# det m's six terms (row 0's cofactor expansion) into tl; returns tl.
+fn _m3_det_terms(tl) {
+    _m3_minor_terms(tl, 0, 0, 0, 3);
+    _m3_minor_terms(tl, 2, 0, 1, 3);
+    _m3_minor_terms(tl, 4, 0, 2, 3);
+    return tl;
+}
+
+# m's nine entries into dc (`_m3_xdec`) and their exponent bounds after them (`_m3_xrange`); 1
+# when one is NaN or infinite (dc is then partial).
+fn _m3_xload(m, dc) {
+    var i = 0;
+    while (i < 9) {
+        var x = load64(m + i * 8);
+        if ((x & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { return 1; }
+        _m3_xdec(x, dc + i * 32);
+        i = i + 1;
+    }
+    _m3_xrange(dc, 9, dc + 9 * 32);
+    return 0;
+}
+
+# The sign of det m, exactly: 1, -1, or 0 for a singular m; 1 for a NaN or infinite entry
+# (`m3_normal_matrix_cof`'s orientation where its filter cannot certify one).
+fn _m3_det_sign_exact(m) {
+    var dc: i64[38];
+    if (_m3_xload(m, &dc) == 1) { return 1; }
+    var tl: i64[24];
+    var od: i64[2];
+    return _m3_xsum(&dc, &dc + 288, _m3_det_terms(&tl), 6, 3, &od);
+}
+
+# 1 when a row or a column of the 3x3 m is zero (`_m3_inverse_exact`'s quick refusal: a zero scale
+# is the common singular matrix, and its exact determinant need not be summed).
+fn _m3_zero_line(m) {
+    var i = 0;
+    while (i < 3) {
+        var zr = 1;
+        var zc = 1;
+        var j = 0;
+        while (j < 3) {
+            if ((load64(m + (j * 3 + i) * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0) { zr = 0; }
+            if ((load64(m + (i * 3 + j) * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0) { zc = 0; }
+            j = j + 1;
+        }
+        if (zr == 1 || zc == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# `m3_inverse_checked` where its filter cannot certify the cofactor formula: decided and
+# answered exactly. Singular exactly when det, summed exactly from its six products, is zero;
+# otherwise each entry is C_ji / det, the cofactor and the determinant each summed exactly and
+# rounded once, divided once and scaled by a power of two, rounded once more only where the
+# entry is subnormal or overflows (to +-Inf, as IEEE rounds a value beyond DBL_MAX). So an
+# entry X is within (3u + 3u^2)|X| of the exact one (u = 2^-53), under 3 ulp, plus half a
+# subnormal step where it is subnormal; an exact zero entry is +0.
+fn _m3_inverse_exact(m) {
+    var dc: i64[38];
+    if (_m3_xload(m, &dc) == 1) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_m3_zero_line(m) == 1) { return Err(HSB_ERR_SINGULAR_MATRIX); }
+    var tl: i64[24];
+    var od: i64[2];
+    var sd = _m3_xsum(&dc, &dc + 288, _m3_det_terms(&tl), 6, 3, &od);
+    if (sd == 0) { return Err(HSB_ERR_SINGULAR_MATRIX); }
     var r = m3_new();
-    m3_set(r, 0, 0, f64_mul(inv_det, f64_sub(f64_mul(m11, m22), f64_mul(m21, m12))));
-    m3_set(r, 0, 1, f64_mul(inv_det, f64_sub(f64_mul(m21, m02), f64_mul(m01, m22))));
-    m3_set(r, 0, 2, f64_mul(inv_det, f64_sub(f64_mul(m01, m12), f64_mul(m11, m02))));
-    m3_set(r, 1, 0, f64_mul(inv_det, f64_sub(f64_mul(m20, m12), f64_mul(m10, m22))));
-    m3_set(r, 1, 1, f64_mul(inv_det, f64_sub(f64_mul(m00, m22), f64_mul(m20, m02))));
-    m3_set(r, 1, 2, f64_mul(inv_det, f64_sub(f64_mul(m10, m02), f64_mul(m00, m12))));
-    m3_set(r, 2, 0, f64_mul(inv_det, f64_sub(f64_mul(m10, m21), f64_mul(m20, m11))));
-    m3_set(r, 2, 1, f64_mul(inv_det, f64_sub(f64_mul(m20, m01), f64_mul(m00, m21))));
-    m3_set(r, 2, 2, f64_mul(inv_det, f64_sub(f64_mul(m00, m11), f64_mul(m10, m01))));
-    return r;
+    if (r == 0) { return Err(HSB_ERR_ALLOC); }
+    var oc: i64[2];
+    var row = 0;
+    while (row < 3) {
+        var col = 0;
+        while (col < 3) {
+            _m3_minor_terms(&tl, 0, row, col, 2);
+            var sc = _m3_xsum(&dc, &dc + 288, &tl, 2, 2, &oc);
+            var v = 0;
+            if (sc != 0) {
+                v = _m3_ldexp(f64_div(load64(&oc), load64(&od)), load64(&oc + 8) - load64(&od + 8));
+                if (sc != sd) { v = v ^ 0x8000000000000000; }   # the sign bit: f64_neg gave +0 for +0 below cycc 6.6.8
+            }
+            # X = adj(m) / det: X(col, row) = C(row, col) / det, at index 3 row + col
+            store64(r + (row * 3 + col) * 8, v);
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    return Ok(r);
+}
+
+# M^-1 as `Ok(matrix)`, or `Err(HSB_ERR_SINGULAR_MATRIX)` exactly when M -- its nine entries
+# taken as the exact rationals they are -- has determinant zero, or `Err(HSB_ERR_INVALID_INPUT)`
+# for a NaN or infinite entry: decided exactly over the whole double range, subnormal to
+# DBL_MAX. An entry whose exact value lies beyond DBL_MAX comes back +-Inf, IEEE's rounding of
+# it, not an error: the matrix has an inverse, the other entries are right, and an Err would
+# discard them.
+#
+# ⛔ 3.4.0 — `m3_inverse` RETURNED THE IDENTITY for a singular or NaN matrix, a full-rank,
+# unit-determinant answer with no error channel (audit D088), and the reciprocal test that
+# chose it (2.15.0) also misfired on ranges: 2^-400 I got the identity, not 2^400 I, because
+# det = 2^-1200 underflows; 2^400 I got the ZERO matrix (det overflows, 1/det = 0). It is
+# retired, not redefined.
+# ⭐ Singular is decided EXACTLY, never by a threshold on det: no tolerance, absolute or
+# relative, separates a singular matrix from a non-singular one ([[1, 1], [1, 1 + 2^-52]] has
+# an exactly representable inverse and det/permanent = 2^-53). Three tiers answer, each where
+# it is certified, the cheapest first (u = 2^-53, P the permanent of |M|: the expansion's
+# products in absolute value):
+#  1. The cofactor formula, 3.3.7's arithmetic bit for bit, where its determinant is good to
+#     2^-40.7: |det - det~| <= 5u P (first order), and P <= 2^10 |det~|. With it, P in
+#     [2^-960, 2^1000] and every non-zero entry at least 2^-511 (no product of two entries
+#     flushes), and an answer whose entries are all finite.
+#  2. Where 2^10 |det~| < P <= 2^43 |dd|: the formula's cofactors over a double-double
+#     determinant dd (Dekker's exact products, TwoSum), within 30 u^2 P of det, so within
+#     2^-58 of it before its own rounding. P >= 2^-900 and P >= 2^-960 max|row 0| keep the
+#     products' error terms exact.
+#  3. Everything else -- |det| below 2^-43 P (singular included), a small entry, a range the
+#     products cannot hold, a non-finite answer -- `_m3_inverse_exact`, in exact integers.
+# 2^10 and 2^43 are not tolerances; they only choose which tier answers. (Through the first
+# 3.4.0 review there was no tier 2, tier 3 was a double-precision expansion that was not exact
+# outside a range the contract never stated, and a row-0 clause let diag(2^-600, 2^1000,
+# 2^-600) answer diag(2^600, 0, 2^600).)
+# Accuracy, derived to first order: in tiers 1 and 2 an entry X_ij = C_ji / det is within
+# (2u pC_ji + (e + 2u) |C_ji|) / |det|, pC_ji the permanent of its cofactor's minor and e the
+# determinant's relative error (2^-40.7 in tier 1, 2^-58 + u in tier 2): the cofactors carry
+# the formula's error relative to their permanents, which only a cancelling cofactor makes
+# large beside the entry. In tier 3 X is within (3u + 3u^2) |X| (under 3 ulp), plus half a
+# subnormal step where it is subnormal.
+# Measured, against exact rational inverses (maxima of the stated samples, not bounds), in ulp of
+# the largest exact entry: 2,000 random uniform matrices 230; r2 = r0 + r1 + noise 2^-k (200
+# each) 434 at k = 4, 387 at k = 10, 6.1 .. 1.7 for k = 20 .. 50; 3,000 matrices with entries
+# anywhere from 2^-1074 to 2^1023 (tier 3), every entry within 2.45 ulp of its own exact value.
+# [measured: scratch t_m3acc.py / t_exact.py, Fraction oracle, 3.4.0 lane FB review repairs, 2026-10-31]
+# Cost, against integ-snap7 and 3.3.7 (focused rows, the three binaries interleaved x 3): tier 1
+# 79 -> 82 ns (3.3.7: 173); rows r2 = r0 + r1 + 2^-30 (tier 2) 2.39 us -> 231 ns (3.3.7: 174,
+# with no correct digit); an exactly singular matrix 1.91 us -> 799 ns (3.3.7: 176, the identity).
+# [measured: scratch inv_new.bcyr / inv_old.bcyr, 3.3.7 + integ-snap7 + this tree x 3, 2026-10-31; cycc 6.7.9]
+#must_use
+public fn m3_inverse_checked(m) {
+    var m00 = load64(m);      var m01 = load64(m + 8);  var m02 = load64(m + 16);
+    var m10 = load64(m + 24); var m11 = load64(m + 32); var m12 = load64(m + 40);
+    var m20 = load64(m + 48); var m21 = load64(m + 56); var m22 = load64(m + 64);
+    var p0 = f64_mul(m11, m22); var p1 = f64_mul(m21, m12);
+    var p2 = f64_mul(m01, m22); var p3 = f64_mul(m21, m02);
+    var p4 = f64_mul(m01, m12); var p5 = f64_mul(m11, m02);
+    var a0 = f64_sub(p0, p1);
+    var a2 = f64_sub(p4, p5);
+    var det = f64_add(f64_sub(f64_mul(m00, a0), f64_mul(m10, f64_sub(p2, p3))), f64_mul(m20, a2));
+    var pm = f64_add(f64_add(f64_mul(f64_abs(m00), f64_add(f64_abs(p0), f64_abs(p1))),
+        f64_mul(f64_abs(m10), f64_add(f64_abs(p2), f64_abs(p3)))),
+      f64_mul(f64_abs(m20), f64_add(f64_abs(p4), f64_abs(p5))));
+    # Every non-zero |entry| at least 2^-511, so no product of two entries flushes; on the bits.
+    var small = 0;
+    var st = 0;
+    st = m00 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    st = m01 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    st = m02 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    st = m10 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    st = m11 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    st = m12 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    st = m20 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    st = m21 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    st = m22 & 0x7FFF_FFFF_FFFF_FFFF;
+    if (st < _M3_SMALL) { if (st != 0) { small = 1; } }
+    var certified = 0;
+    if (small == 0 && f64_ge(pm, _M3_PM_LO) == 1 && f64_le(pm, _M3_PM_HI) == 1) {
+        if (f64_le(pm, f64_mul(f64_abs(det), _M3_CERT)) == 1) {
+            certified = 1;
+        }
+        if (certified == 0 && f64_ge(pm, _M3_DD_LO) == 1
+          && f64_ge(pm, f64_mul(f64_max(f64_max(f64_abs(m00), f64_abs(m10)), f64_abs(m20)), _M3_PM_LO)) == 1) {
+            # Every entry split into halves of at most 26 significant bits (Dekker), x = xh + xl.
+            var t00 = f64_mul(m00, _M3_SPLIT); var h00 = f64_sub(t00, f64_sub(t00, m00)); var l00 = f64_sub(m00, h00);
+            var t01 = f64_mul(m01, _M3_SPLIT); var h01 = f64_sub(t01, f64_sub(t01, m01)); var l01 = f64_sub(m01, h01);
+            var t02 = f64_mul(m02, _M3_SPLIT); var h02 = f64_sub(t02, f64_sub(t02, m02)); var l02 = f64_sub(m02, h02);
+            var t10 = f64_mul(m10, _M3_SPLIT); var h10 = f64_sub(t10, f64_sub(t10, m10)); var l10 = f64_sub(m10, h10);
+            var t11 = f64_mul(m11, _M3_SPLIT); var h11 = f64_sub(t11, f64_sub(t11, m11)); var l11 = f64_sub(m11, h11);
+            var t12 = f64_mul(m12, _M3_SPLIT); var h12 = f64_sub(t12, f64_sub(t12, m12)); var l12 = f64_sub(m12, h12);
+            var t20 = f64_mul(m20, _M3_SPLIT); var h20 = f64_sub(t20, f64_sub(t20, m20)); var l20 = f64_sub(m20, h20);
+            var t21 = f64_mul(m21, _M3_SPLIT); var h21 = f64_sub(t21, f64_sub(t21, m21)); var l21 = f64_sub(m21, h21);
+            var t22 = f64_mul(m22, _M3_SPLIT); var h22 = f64_sub(t22, f64_sub(t22, m22)); var l22 = f64_sub(m22, h22);
+            # The six products' rounding errors, exactly: x y = p + e.
+            var ep0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h11, h22), p0), f64_mul(h11, l22)),
+                f64_mul(l11, h22)), f64_mul(l11, l22));
+            var ep1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h21, h12), p1), f64_mul(h21, l12)),
+                f64_mul(l21, h12)), f64_mul(l21, l12));
+            var ep2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h01, h22), p2), f64_mul(h01, l22)),
+                f64_mul(l01, h22)), f64_mul(l01, l22));
+            var ep3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h21, h02), p3), f64_mul(h21, l02)),
+                f64_mul(l21, h02)), f64_mul(l21, l02));
+            var ep4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h01, h12), p4), f64_mul(h01, l12)),
+                f64_mul(l01, h12)), f64_mul(l01, l12));
+            var ep5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h11, h02), p5), f64_mul(h11, l02)),
+                f64_mul(l11, h02)), f64_mul(l11, l02));
+            # Each 2x2 minor as hi + lo: hi the rounded difference, lo its TwoSum error plus the
+            # products' errors.
+            var a1 = f64_sub(p2, p3);
+            var za0 = f64_sub(a0, p0);
+            var xa0 = f64_add(f64_sub(f64_sub(p0, f64_sub(a0, za0)), f64_add(p1, za0)), f64_sub(ep0, ep1));
+            var za1 = f64_sub(a1, p2);
+            var xa1 = f64_add(f64_sub(f64_sub(p2, f64_sub(a1, za1)), f64_add(p3, za1)), f64_sub(ep2, ep3));
+            var za2 = f64_sub(a2, p4);
+            var xa2 = f64_add(f64_sub(f64_sub(p4, f64_sub(a2, za2)), f64_add(p5, za2)), f64_sub(ep4, ep5));
+            # The three products m a of the expansion, each as q + r: q rounded, r its exact error plus
+            # m a.lo.
+            var va0 = f64_mul(a0, _M3_SPLIT); var ya0 = f64_sub(va0, f64_sub(va0, a0)); var wa0 = f64_sub(a0, ya0);
+            var qa0 = f64_mul(m00, a0);
+            var ra0 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, ya0), qa0), f64_mul(h00, wa0)),
+                  f64_mul(l00, ya0)), f64_mul(l00, wa0)), f64_mul(m00, xa0));
+            var va1 = f64_mul(a1, _M3_SPLIT); var ya1 = f64_sub(va1, f64_sub(va1, a1)); var wa1 = f64_sub(a1, ya1);
+            var qa1 = f64_mul(m10, a1);
+            var ra1 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, ya1), qa1), f64_mul(h10, wa1)),
+                  f64_mul(l10, ya1)), f64_mul(l10, wa1)), f64_mul(m10, xa1));
+            var va2 = f64_mul(a2, _M3_SPLIT); var ya2 = f64_sub(va2, f64_sub(va2, a2)); var wa2 = f64_sub(a2, ya2);
+            var qa2 = f64_mul(m20, a2);
+            var ra2 = f64_add(f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, ya2), qa2), f64_mul(h20, wa2)),
+                  f64_mul(l20, ya2)), f64_mul(l20, wa2)), f64_mul(m20, xa2));
+            # det = q0 - q1 + q2 (as det~ orders them): the q summed by TwoSum, their errors and the r
+            # in plain arithmetic, then the two rounded together.
+            var dh = qa0;
+            var dl = ra0;
+            var na1 = f64_sub(dh, qa1);
+            var oa1 = f64_sub(na1, dh);
+            dl = f64_sub(f64_add(dl, f64_sub(f64_sub(dh, f64_sub(na1, oa1)), f64_add(qa1, oa1))), ra1);
+            dh = na1;
+            var na2 = f64_add(dh, qa2);
+            var oa2 = f64_sub(na2, dh);
+            dl = f64_add(f64_add(dl, f64_add(f64_sub(dh, f64_sub(na2, oa2)), f64_sub(qa2, oa2))), ra2);
+            dh = na2;
+            var dd = f64_add(dh, dl);
+            # |dd - det| <= 30 u^2 P (the derivation is in the comment above), so P <= 2^43 |dd| puts
+            # dd within 2^-58 of det, relative, before its own rounding.
+            if (f64_le(pm, f64_mul(f64_abs(dd), _M3_CERT2)) == 1) {
+                det = dd;
+                certified = 1;
+            }
+        }
+    }
+    if (certified == 1) {
+        var inv_det = f64_div(F64_ONE, det);
+        var r = alloc(MAT3_BYTES);
+        if (r == 0) { return Err(HSB_ERR_ALLOC); }
+        var r0 = f64_mul(inv_det, a0);
+        var r1 = f64_mul(inv_det, f64_sub(p3, p2));
+        var r2 = f64_mul(inv_det, a2);
+        var r3 = f64_mul(inv_det, f64_sub(f64_mul(m20, m12), f64_mul(m10, m22)));
+        var r4 = f64_mul(inv_det, f64_sub(f64_mul(m00, m22), f64_mul(m20, m02)));
+        var r5 = f64_mul(inv_det, f64_sub(f64_mul(m10, m02), f64_mul(m00, m12)));
+        var r6 = f64_mul(inv_det, f64_sub(f64_mul(m10, m21), f64_mul(m20, m11)));
+        var r7 = f64_mul(inv_det, f64_sub(f64_mul(m20, m01), f64_mul(m00, m21)));
+        var r8 = f64_mul(inv_det, f64_sub(f64_mul(m00, m11), f64_mul(m10, m01)));
+        store64(r, r0); store64(r + 8, r1); store64(r + 16, r2);
+        store64(r + 24, r3); store64(r + 32, r4); store64(r + 40, r5);
+        store64(r + 48, r6); store64(r + 56, r7); store64(r + 64, r8);
+        # One test on the sum, non-finite whenever an entry is (an overflowing finite sum only
+        # sends a finite answer to the exact path, which gives it again).
+        var sm = f64_add(f64_add(f64_add(r0, r1), f64_add(r2, r3)),
+          f64_add(f64_add(r4, r5), f64_add(f64_add(r6, r7), r8)));
+        if ((sm & 0x7FFF_FFFF_FFFF_FFFF) < 0x7FF0_0000_0000_0000) { return Ok(r); }
+    }
+    return _m3_inverse_exact(m);
 }
 
 #must_use
 public fn m3_add(a, b) {
     var r = m3_new();
+    if (r == 0) { return 0; }
     var i = 0;
     while (i < 9) {
         store64(r + i * 8, f64_add(load64(a + i * 8), load64(b + i * 8)));
@@ -207,6 +698,7 @@ public fn m3_add(a, b) {
 #must_use
 public fn m3_scale(m, s) {
     var r = m3_new();
+    if (r == 0) { return 0; }
     var i = 0;
     while (i < 9) {
         store64(r + i * 8, f64_mul(load64(m + i * 8), s));
@@ -215,30 +707,176 @@ public fn m3_scale(m, s) {
     return r;
 }
 
-# Build rotation matrix from quaternion
+# The rotation matrix of q: R(q / |q|), the rotation q represents (q v q^-1), for every finite
+# non-zero q, as `hquat_rotate_vec3` rotates by it. With s = 2 / |q|^2 the entries are the unit
+# formula's with s for its 2 (1 - s (y^2 + z^2), s (xy + wz), ...), the standard form for a
+# non-unit q. |q|^2 is used directly in [1/4, 16]; any other finite non-zero q is first scaled
+# by a power of two to put its largest component in [1, 2) (the same rotation), so neither
+# |q|^2 nor s can overflow or flush because of |q|. Where |q|^2 = 1.0 exactly, s = 2 and the
+# arithmetic is 3.3.7's, bit for bit. A zero or non-finite q represents no rotation: the matrix
+# is NaN (s = 2 / 0 = Inf, times 0), as `hquat_rotate_vec3` gives NaN.
+# ⛔ 3.4.0 — THROUGH THE FIRST 3.4.0 REVIEW THIS WAS THE UNIT FORMULA FOR EVERY q, after
+# `hquat_rotate_vec3` had moved to q / |q|: q = (0.154, 3.32, 3.86, -15.2) took (1, 1, -1) to
+# (167.26, -175.48, 144.16) here and in `m4_from_srt` (so `t3d_to_matrix`) where `t3d_apply`
+# gave (1.647, 0.313, -0.435), and q = 0 gave the identity, a rotation by nothing.
 #must_use
 public fn m3_from_quat(q) {
     var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
+    var n = f64_add(f64_add(f64_mul(qx, qx), f64_mul(qy, qy)), f64_add(f64_mul(qz, qz), f64_mul(qw, qw)));
+    # n is +0, positive or NaN, so its bits order as it does (quat.cyr's range test)
+    if (n < _M3_QN_LO || n > _M3_QN_HI) {
+        var mq = qx & 0x7FFF_FFFF_FFFF_FFFF;
+        if ((qy & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qy & 0x7FFF_FFFF_FFFF_FFFF; }
+        if ((qz & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qz & 0x7FFF_FFFF_FFFF_FFFF; }
+        if ((qw & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qw & 0x7FFF_FFFF_FFFF_FFFF; }
+        # A non-finite component: no rotation, so every entry is NaN. Without this an infinite
+        # q gave n = +Inf, 2 / n = 0, and the diagonal entry whose products held no infinity
+        # came back 1.0 (q = (Inf, 0, 0, 1): entry (0, 0)).
+        if (mq >= 0x7FF0_0000_0000_0000) { n = 0x7FF8_0000_0000_0000; }
+        if (mq != 0 && mq < 0x7FF0_0000_0000_0000) {
+            var e = _m3_expo(mq);
+            qx = _m3_ldexp(qx, 0 - e); qy = _m3_ldexp(qy, 0 - e);
+            qz = _m3_ldexp(qz, 0 - e); qw = _m3_ldexp(qw, 0 - e);
+            n = f64_add(f64_add(f64_mul(qx, qx), f64_mul(qy, qy)), f64_add(f64_mul(qz, qz), f64_mul(qw, qw)));
+        }
+    }
+    var tw = F64_TWO;
+    if (n != 0x3FF0_0000_0000_0000) { tw = f64_div(F64_TWO, n); }
     var xx = f64_mul(qx, qx); var yy = f64_mul(qy, qy); var zz = f64_mul(qz, qz);
     var xy = f64_mul(qx, qy); var xz = f64_mul(qx, qz); var yz = f64_mul(qy, qz);
     var wx = f64_mul(qw, qx); var wy = f64_mul(qw, qy); var wz = f64_mul(qw, qz);
     var m = m3_new();
-    m3_set(m, 0, 0, f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(yy, zz))));
-    m3_set(m, 0, 1, f64_mul(F64_TWO, f64_add(xy, wz)));
-    m3_set(m, 0, 2, f64_mul(F64_TWO, f64_sub(xz, wy)));
-    m3_set(m, 1, 0, f64_mul(F64_TWO, f64_sub(xy, wz)));
-    m3_set(m, 1, 1, f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(xx, zz))));
-    m3_set(m, 1, 2, f64_mul(F64_TWO, f64_add(yz, wx)));
-    m3_set(m, 2, 0, f64_mul(F64_TWO, f64_add(xz, wy)));
-    m3_set(m, 2, 1, f64_mul(F64_TWO, f64_sub(yz, wx)));
-    m3_set(m, 2, 2, f64_sub(F64_ONE, f64_mul(F64_TWO, f64_add(xx, yy))));
+    if (m == 0) { return 0; }
+    m3_set(m, 0, 0, f64_sub(F64_ONE, f64_mul(tw, f64_add(yy, zz))));
+    m3_set(m, 0, 1, f64_mul(tw, f64_add(xy, wz)));
+    m3_set(m, 0, 2, f64_mul(tw, f64_sub(xz, wy)));
+    m3_set(m, 1, 0, f64_mul(tw, f64_sub(xy, wz)));
+    m3_set(m, 1, 1, f64_sub(F64_ONE, f64_mul(tw, f64_add(xx, zz))));
+    m3_set(m, 1, 2, f64_mul(tw, f64_add(yz, wx)));
+    m3_set(m, 2, 0, f64_mul(tw, f64_add(xz, wy)));
+    m3_set(m, 2, 1, f64_mul(tw, f64_sub(yz, wx)));
+    m3_set(m, 2, 2, f64_sub(F64_ONE, f64_mul(tw, f64_add(xx, yy))));
     return m;
 }
 
-# Normal matrix: transpose of inverse (for transforming normals)
+# The signed cofactor matrix of m (`m3_normal_matrix_cof`'s body without its range rescue),
+# negated when sg < 0, into a new matrix; returns it.
+fn _m3_cof_signed(m, sg) {
+    var m00 = load64(m);      var m01 = load64(m + 8);  var m02 = load64(m + 16);
+    var m10 = load64(m + 24); var m11 = load64(m + 32); var m12 = load64(m + 40);
+    var m20 = load64(m + 48); var m21 = load64(m + 56); var m22 = load64(m + 64);
+    var r = alloc(MAT3_BYTES);
+    if (r == 0) { return 0; }
+    # N[i][j] = C[i][j], the (i, j) cofactor; column-major, so N at (col j, row i).
+    store64(r,      f64_sub(f64_mul(m11, m22), f64_mul(m21, m12)));
+    store64(r + 24, f64_sub(f64_mul(m21, m02), f64_mul(m01, m22)));
+    store64(r + 48, f64_sub(f64_mul(m01, m12), f64_mul(m11, m02)));
+    store64(r + 8,  f64_sub(f64_mul(m20, m12), f64_mul(m10, m22)));
+    store64(r + 32, f64_sub(f64_mul(m00, m22), f64_mul(m20, m02)));
+    store64(r + 56, f64_sub(f64_mul(m10, m02), f64_mul(m00, m12)));
+    store64(r + 16, f64_sub(f64_mul(m10, m21), f64_mul(m20, m11)));
+    store64(r + 40, f64_sub(f64_mul(m20, m01), f64_mul(m00, m21)));
+    store64(r + 64, f64_sub(f64_mul(m00, m11), f64_mul(m10, m01)));
+    if (sg < 0) {
+        var i = 0;
+        while (i < 9) { store64(r + i * 8, load64(r + i * 8) ^ 0x8000000000000000); i = i + 1; }
+    }
+    return r;
+}
+
+# The normal matrix of m: sign(det m) * cof(m), the cofactor matrix with its orientation
+# fixed, which is |det m| * m^-T wherever m is invertible. It carries a surface normal
+# n = t1 x t2 to (m t1) x (m t2) times sign(det m): the normal of the image, pointing to the
+# same side of it as n did (outward stays outward through a mirror). It exists for EVERY m:
+# a singular m that flattens a surface onto a plane sends its normals to that plane's normal
+# (with det m = 0 the sign is +1), and an m of rank 1 or 0 has the zero matrix, because its
+# image has no normal. Callers renormalise. A NaN or infinite entry propagates.
+# Where an entry overflows, or the largest falls below 2^-969 (products of two entries flushed
+# to the subnormals), the result is the cofactor matrix of m * 2^-e, e the exponent of m's
+# largest entry: the same directions times a power of two.
+#
+# ⛔ 3.4.0 — REPLACES `m3_normal_matrix`, which was `m3_transpose(m3_inverse(m))`: it
+# inherited the inverse's IDENTITY for every singular m (diag(1, 1, 0) kept normals along x,
+# where its image, the plane z = 0, has the normal z alone) and so for every m with an exactly
+# singular minor structure, and m^-T itself overflows where m is merely small along one axis
+# (diag(1, 1, 2^-1074) sends (0, 0, 1) to (0, 0, +Inf)). The magnitude changes from m^-T to
+# |det m| m^-T, so the name is retired, not redefined.
+# ⭐ The orientation is exact over the whole double range: a filter certifies sign(det~) where
+# |det~| > 2^-49 P (|det - det~| <= 5u P) with P in [2^-960, 2^1000] and P >= 2^-990 max|row 0|,
+# and the exact determinant (`_m3_det_sign_exact`, integers) decides everything else, singular
+# included.
+# ⛔ 3.4.0 — THROUGH THE FIRST 3.4.0 REVIEW THE FILTER HAD NO UNDERFLOW CLAUSE AND THE EXACT
+# SIGN WAS NOT EXACT: with entries of 2^600 and about 2^-537, two subnormal products' errors
+# times 2^600 outweighed 2^-49 P and the filter certified +1 where sign(det) is -1 (3 of 129
+# such matrices), turning an outward normal inward; and the expansion behind it inherited the
+# inverse's range defect (29 wrong signs in 4,000 wide-range matrices, -1 for some singular ones).
+# [measured: REV-FB t27.py / t8.py / t8b.py, Fraction determinants, the first 3.4.0 review of lane FB, 2026-10-31]
+# ⚠ The entries themselves are the plain formula's 2x2 minors, each within 2u of its own
+# permanent (|ad| + |bc|): where m is near rank 1 every minor cancels and the directions carry
+# that error (no certificate covers them; the review found 1 of 40,000 transformed normals on the
+# wrong side for near-rank-1 m). And the range rescue holds a cofactor matrix spanning at most
+# about 2^2098: past that its smallest entries flush.
+# [measured: REV-FB t18.py / t18b.py / t8c.py, Fraction cofactors, the first 3.4.0 review of lane FB, 2026-10-31]
+# Cost: the underflow clause, 83 -> 89 ns against integ-snap7 on a random matrix; a singular
+# matrix of tiny entries (the exact sign) 1.12 us -> 972 ns.
+# [measured: scratch misc.bcyr, integ-snap7 and this tree interleaved x 3, 2026-10-31; cycc 6.7.9]
 #must_use
-public fn m3_normal_matrix(m) {
-    return m3_transpose(m3_inverse(m));
+public fn m3_normal_matrix_cof(m) {
+    var m00 = load64(m);      var m01 = load64(m + 8);  var m02 = load64(m + 16);
+    var m10 = load64(m + 24); var m11 = load64(m + 32); var m12 = load64(m + 40);
+    var m20 = load64(m + 48); var m21 = load64(m + 56); var m22 = load64(m + 64);
+    var p0 = f64_mul(m11, m22); var p1 = f64_mul(m21, m12);
+    var p2 = f64_mul(m01, m22); var p3 = f64_mul(m21, m02);
+    var p4 = f64_mul(m01, m12); var p5 = f64_mul(m11, m02);
+    var det = f64_add(f64_sub(f64_mul(m00, f64_sub(p0, p1)), f64_mul(m10, f64_sub(p2, p3))),
+      f64_mul(m20, f64_sub(p4, p5)));
+    var pm = f64_add(f64_add(f64_mul(f64_abs(m00), f64_add(f64_abs(p0), f64_abs(p1))),
+        f64_mul(f64_abs(m10), f64_add(f64_abs(p2), f64_abs(p3)))),
+      f64_mul(f64_abs(m20), f64_add(f64_abs(p4), f64_abs(p5))));
+    # A product that flushes is off by at most 2^-1075 and reaches det multiplied by a row-0
+    # entry: P >= 2^-990 max|row 0| keeps the six of them under 2^-82 P, far below the filter's
+    # 2^-49 P (the first 3.4.0 review's clause; the inverse's screen of every entry cost 13 ns
+    # here, and only the determinant's sign is at stake).
+    # [measured: scratch misc.bcyr, integ-snap7 and this tree interleaved x 3, 2026-10-31; cycc 6.7.9]
+    var mrow = f64_max(f64_max(f64_abs(m00), f64_abs(m10)), f64_abs(m20));
+    var sg = 0;
+    if (f64_ge(pm, _M3_PM_LO) == 1 && f64_le(pm, _M3_PM_HI) == 1 && f64_ge(pm, f64_mul(mrow, _M3_UFL)) == 1
+      && f64_gt(f64_abs(det), f64_mul(pm, _M3_SIGN)) == 1) {
+        sg = 1;
+        if (f64_lt(det, 0) == 1) { sg = 0 - 1; }
+    } else {
+        sg = _m3_det_sign_exact(m);
+    }
+    var r = _m3_cof_signed(m, sg);
+    if (r == 0) { return 0; }
+    # Range: the entries are degree two in m. Every entry finite with the largest at or above
+    # 2^-969 means no product that reaches the directions flushed (their sum's rounding is
+    # relative); otherwise (all of them flushed to 0 included) rescale m, unless an entry of m
+    # is not finite or every entry is zero. A rank-1 m keeps its zero cofactors through the
+    # rescale.
+    var mx = 0;
+    var i = 0;
+    while (i < 9) {
+        var a = load64(r + i * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (a > mx) { mx = a; }
+        i = i + 1;
+    }
+    if (mx < 0x7FF0_0000_0000_0000 && mx >= _M3_FLOOR) { return r; }
+    var me = 0;
+    i = 0;
+    while (i < 9) {
+        var b = load64(m + i * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (b >= 0x7FF0_0000_0000_0000) { return r; }
+        if (b > me) { me = b; }
+        i = i + 1;
+    }
+    if (me == 0) { return r; }
+    var e = _m3_expo(me);
+    var t = alloc(MAT3_BYTES);
+    if (t == 0) { return 0; }
+    i = 0;
+    while (i < 9) { store64(t + i * 8, _m3_ldexp(load64(m + i * 8), 0 - e)); i = i + 1; }
+    return _m3_cof_signed(t, sg);
 }
 
 # Trace

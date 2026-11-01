@@ -9,7 +9,7 @@ differential geometry, symbolic algebra.
 - **Type**: Cyrius library + CLI (math toolkit)
 - **License**: GPL-3.0-only
 - **Language**: Cyrius (sovereign systems language, compiled by cycc)
-- **Toolchain**: Cyrius 6.6.20 (`cyrius.cyml: cyrius = "6.6.20"`)
+- **Toolchain**: Cyrius 6.7.9 (`cyrius.cyml: cyrius = "6.7.9"`)
 - **Version**: SemVer, version file at `VERSION` (manifest pulls via `${file:VERSION}`)
 - **Status**: kept elsewhere on purpose. Current numbers (suite counts, gates, toolchain,
   consumer pins) live in `docs/development/roadmap.md` § Current and § Consumers, the bundle size
@@ -342,7 +342,7 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
 
 ## CI / Release
 
-- **Toolchain pin**: `cyrius = "6.6.20"` in `cyrius.cyml`. CI and release both grep the manifest;
+- **Toolchain pin**: `cyrius = "6.7.9"` in `cyrius.cyml`. CI and release both grep the manifest;
   no versions are hardcoded in YAML
 - **Toolchain install**: both workflows pipe the pin into the **upstream installer**
   (`curl -sSf .../cyrius/main/scripts/install.sh | CYRIUS_VERSION="$PIN" sh`), which verifies the

@@ -34,7 +34,7 @@
 > - Atkin and segmented sieves: `num_sieve` is Eratosthenes, and returns an empty
 >   vec above 10M
 > - spline arc length, and the de Casteljau split
-> - sparse Cholesky/LU, and SOR: `solve_pgs` takes no relaxation factor
+> - sparse Cholesky/LU, and SOR: `solve_pgs_checked` takes no relaxation factor
 > - Voronoi diagrams: the `src/` hits for "Voronoi" are closest-point region tests
 > - Mat4 decompose: `m4_from_srt` composes; `se3_from_mat4` (lie_ext) recovers
 >   rotation + translation from a rigid 4x4, but nothing recovers scale (no SRT

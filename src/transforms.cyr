@@ -13,6 +13,10 @@
 # caller's (t2d_new, t3d_new and the accessors read their arguments as given).
 # ================================================================
 
+# A new Transform2D from an HVec2 position, a rotation in radians (counterclockwise) and an
+# HVec2 scale, their values copied (40 bytes). Applied to a point p it is R(rotation) (S p) +
+# pos: scale, then rotate, then translate. Returns the designed 0 where the allocation is
+# refused; the identity below too.
 public fn t2d_new(pos, rotation, scale) {
     var t = alloc(40);
     if (t == 0) { return 0; }
@@ -24,6 +28,7 @@ public fn t2d_new(pos, rotation, scale) {
     return t;
 }
 
+# Position (0, 0), rotation 0, scale (1, 1).
 public fn t2d_identity() {
     var t = alloc(40);
     if (t == 0) { return 0; }
@@ -35,12 +40,23 @@ public fn t2d_identity() {
     return t;
 }
 
+# The stored fields, bit for bit: position x and y, rotation (radians), scale x and y.
 public fn t2d_pos_x(t) { return load64(t); }
+# The position's y.
 public fn t2d_pos_y(t) { return load64(t + 8); }
+# The rotation, radians.
 public fn t2d_rotation(t) { return load64(t + 16); }
+# The scale's x.
 public fn t2d_scale_x(t) { return load64(t + 24); }
+# The scale's y.
 public fn t2d_scale_y(t) { return load64(t + 32); }
 
+# The HVec2 point mapped by t: (c sx px - s sy py + tx, s sx px + c sy py + ty) with c, s the
+# cosine and sine of t's rotation, each component a few roundings (within about 4u of the sum of
+# its terms' magnitudes, u = 2^-53, plus sin's and cos's own errors). ⚠ It returns an HVec3,
+# (x, y, 1), the homogeneous point, not an HVec2: its x and y read through the HVec2 accessors
+# too, since an HVec2 is an HVec3's first 16 bytes (the [3.5.0] roadmap row on this, D090).
+# Returns the designed 0 where the allocation is refused.
 public fn t2d_apply(t, point) {
     var s = f64_sin(t2d_rotation(t));
     var c = f64_cos(t2d_rotation(t));
@@ -53,6 +69,16 @@ public fn t2d_apply(t, point) {
       );
 }
 
+# The transform "a, then b": position R_b (S_b pos_a) + pos_b, rotation rot_a + rot_b, scale
+# S_a S_b (componentwise). ⚠ PRECONDITION: that is a then b only when b's scale commutes with
+# a's rotation, so b's scale is uniform (sx = sy) or a's rotation is a multiple of pi. A rotation
+# followed by a non-uniform scale is a shear, which no position-rotation-scale triple holds, and
+# outside the precondition the composite is not the two applied in turn (a: pos (0.3, -0.2),
+# rotation 0.7; then b: pos (0.5, 0.1), scale (2, 0.5): (1, 0) goes to y = 0.32 in turn and
+# 1.29 through the composite; audit F-X2, refusing or a new representation is the [3.5.0]
+# row). Within it, the composite agrees with applying a then b to rounding. Returns the
+# designed 0 where the allocation is refused.
+# [measured: docs/audit/2026-10-31-v3.4.0-full.md, F-X2]
 public fn t2d_compose(a, b) {
     var s = f64_sin(t2d_rotation(b));
     var c = f64_cos(t2d_rotation(b));
@@ -76,6 +102,11 @@ public fn t2d_compose(a, b) {
 # Layout: { pos_ptr, rot_ptr, scale_ptr } = 24 bytes
 # ================================================================
 
+# A new Transform3D holding the HVec3 position, HQuat rotation and HVec3 scale HANDLES, not
+# copies (24 bytes): changing one of them changes the transform. Applied to a point p it is
+# R (S p) + pos, R the rotation the quaternion represents (q / |q|, `hquat_rotate_vec3`) and S
+# the componentwise scale. Returns the designed 0 where the allocation is refused (a 0 handle
+# passed in is stored as given).
 public fn t3d_new(pos, rotation, scale) {
     var t = alloc(24);
     if (t == 0) { return 0; }
@@ -91,18 +122,28 @@ fn _t3d_of(pos, rotation, scale) {
     return t3d_new(pos, rotation, scale);
 }
 
+# Position (0, 0, 0), the identity rotation, scale (1, 1, 1), each a new object; the designed 0
+# where any allocation is refused.
 public fn t3d_identity() {
     return _t3d_of(hvec3_zero(), hquat_identity(), hvec3_one());
 }
 
+# The position handle (an HVec3) t holds.
 public fn t3d_pos(t) { return load64(t); }
+# The rotation handle (an HQuat).
 public fn t3d_rot(t) { return load64(t + 8); }
+# The scale handle (an HVec3).
 public fn t3d_scale(t) { return load64(t + 16); }
 
+# t as a 4x4 matrix, T R S (`m4_from_srt`, which has the rotation's contract: a zero or
+# non-finite quaternion gives a NaN 3x3 block); the designed 0 where the allocation is refused.
 public fn t3d_to_matrix(t) {
     return m4_from_srt(t3d_scale(t), t3d_rot(t), t3d_pos(t));
 }
 
+# The point mapped by t: R (S p) + pos, the scale `hvec3_mul`, the rotation
+# `hquat_rotate_vec3` (its contract and its 22u |S p| bound per component), the translation
+# `hvec3_add`. Returns the designed 0 where an allocation is refused.
 public fn t3d_apply(t, point) {
     var scaled = hvec3_mul(t3d_scale(t), point);
     if (scaled == 0) { return 0; }
@@ -128,6 +169,17 @@ public fn t3d_inverse_matrix_checked(t) {
     return m4_inverse_checked(m);
 }
 
+# The transform "a, then b": position R_b (S_b pos_a) + pos_b, rotation q_b q_a (`hquat_mul`:
+# a's rotation first), scale S_b S_a (componentwise), new objects. ⚠ PRECONDITION: that is a
+# then b only when b's scale commutes with a's rotation: b's scale uniform, or a's rotation the
+# identity, a half turn about a coordinate axis, or a rotation about a coordinate axis along
+# which b's scale is the odd one out (about z with b's scale (s, s, t)). A rotation followed by
+# a non-uniform scale is a shear, which no position-rotation-scale triple holds: outside the
+# precondition the composite is not the two applied in turn (audit F-X2: 50 random pairs up to
+# 2.84 off, where uniform scales stayed within 3.6e-15; `m4_mul` of the two matrices is right
+# there; refusing or a new representation is the [3.5.0] row). Within it the composite agrees
+# with applying a then b to rounding. Returns the designed 0 where an allocation is refused.
+# [measured: docs/audit/2026-10-31-v3.4.0-full.md, F-X2]
 public fn t3d_compose(a, b) {
     var scaled_pos = hvec3_mul(t3d_scale(b), t3d_pos(a));
     if (scaled_pos == 0) { return 0; }
@@ -140,7 +192,12 @@ public fn t3d_compose(a, b) {
       );
 }
 
-# Interpolate between two 3D transforms
+# Interpolate between two 3D transforms: positions and scales by `hvec3_lerp` (finite wherever
+# the formula's value is, since 3.4.1), rotations by `hquat_slerp` (unit quaternions, the
+# shorter arc; the rotation is its answer bit for bit, and its doc gives the accuracy measured
+# for it, a maximum on samples rather than a bound), each a new object. Returns the designed 0
+# where any allocation is refused.
+# [measured: scratch t3dcmp.sh, 5,000,000 pairs, rotation bits identical to hquat_slerp, 2026-10-31; cycc 6.7.18]
 public fn t3d_lerp(a, b, t) {
     return _t3d_of(
       hvec3_lerp(t3d_pos(a), t3d_pos(b), t),
@@ -153,8 +210,19 @@ public fn t3d_lerp(a, b, t) {
 # Interpolation helpers
 # ================================================================
 
+# a + (b - a) t, any real t (t outside [0, 1] extrapolates): `hvec2_lerp`'s contract and
+# accuracy for one component, three roundings. 3.4.1: where that form overflows for finite a,
+# b and t (b - a past DBL_MAX, or its product with t), the formula is evaluated at half scale
+# and doubled (`_hvec2_lerp_wide` in vec2.cyr has the reasons), so the answer is finite
+# wherever the formula's value is: (-DBL_MAX, DBL_MAX, 1/2) gave +Inf, exact 0. Every input
+# whose fast form is finite, and every NaN or infinite input, keeps the fast form's bits (vec2.cyr
+# says why only t needs a test).
 public fn hisab_lerp(a, b, t) {
-    return f64_add(a, f64_mul(f64_sub(b, a), t));
+    var r = f64_add(a, f64_mul(f64_sub(b, a), t));
+    if ((r & 0x7FF0_0000_0000_0000) != 0x7FF0_0000_0000_0000) { return r; }
+    if ((t & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000) { return r; }
+    var ha = f64_mul(a, F64_HALF);
+    return f64_mul(f64_add(ha, f64_mul(f64_sub(f64_mul(b, F64_HALF), ha), t)), F64_TWO);
 }
 
 # The t with hisab_lerp(a, b, t) = value, (value - a) / (b - a), as `Ok(t)`;
@@ -213,7 +281,21 @@ public fn hisab_remap_checked(value, in_lo, in_hi, out_lo, out_hi) {
 
 public enum EulerOrder { EULER_XYZ = 0; EULER_XZY = 1; EULER_YXZ = 2; EULER_YZX = 3; EULER_ZXY = 4; EULER_ZYX = 5; }
 
+# The unit quaternion of three rotations by x, y and z radians about the X, Y and Z axes
+# (each right-handed, `hquat_from_rotation_x` / `_y` / `_z`), composed in `order`. THE
+# CONVENTION: the order names the Hamilton product left to right, so EULER_XYZ is
+# qx * qy * qz, the matrix Rx Ry Rz acting on column vectors: v is rotated about Z first, then
+# Y, then X, all fixed axes (extrinsic Z-Y-X), which is the same rotation as X, then the new Y,
+# then the newest Z (intrinsic X-Y'-Z''). In general order ABC is qA * qB * qC = RA RB RC:
+# extrinsic C-B-A, intrinsic A-B'-C''; EULER_ZYX is the aerospace yaw-pitch-roll (z yaw, y
+# pitch, x roll). Two Hamilton products of rounded unit quaternions, so each component is
+# within a few u (u = 2^-53) of the exact rotation's, absolutely, plus sin's and cos's own
+# errors; the result is unit to the same order.
+# Returns the designed 0 where an allocation is refused, and (3.4.1) for an `order` outside
+# EulerOrder, before allocating anything: no rotation has that order. Through 3.4.0 such an
+# order (7, -1) was read as EULER_ZYX, bit for bit, an answer to a question not asked.
 public fn hquat_from_euler(x, y, z, order) {
+    if (order < EULER_XYZ || order > EULER_ZYX) { return 0; }
     var qx = hquat_from_rotation_x(x);
     var qy = hquat_from_rotation_y(y);
     var qz = hquat_from_rotation_z(z);
@@ -235,6 +317,10 @@ public fn hquat_from_euler(x, y, z, order) {
 # Flip handedness
 # ================================================================
 
+# m with its column 2 negated, m diag(1, 1, -1, 1): the same map with the input's z axis
+# reversed, which converts between right- and left-handed coordinates. Exact, a sign flip per
+# entry (`f64_neg`; below cycc 6.6.8 it gave +0 for +0). Returns the designed 0 where the
+# allocation is refused.
 public fn m4_flip_handedness_z(m) {
     var r = m4_copy(m);
     if (r == 0) { return 0; }
@@ -285,6 +371,23 @@ fn _t3d_clip_w_scaled(clip) {
 # for a NaN w (audit D069): (0, 0, 0) is the top-left corner on the near plane, a legal answer.
 # A w of +-Inf put the point at the screen centre (1/w = 0), and an overflowing clip vector
 # from finite input did the same or gave +-Inf. It is retired, not redefined.
+#
+# THE SCREEN CONVENTION (stated 3.4.1; audit F-X1): screen_x = (nx / 2 + 1/2) vw and
+# screen_y = (1 - (ny / 2 + 1/2)) vh (y down, (0, 0) the top-left corner), and depth =
+# nz / 2 + 1/2: GL's window transform with glDepthRange(0, 1), for an mvp whose NDC z runs from
+# -1 (near) to +1 (far), as `m4_perspective_rh` and `m4_ortho_rh` make it. That depth is what
+# `linearize_depth(depth, near, far)` reads: through `m4_perspective_rh` it returns the eye
+# distance. ⚠ It is NOT the depth of a [0, 1] NDC-z projection (Direct3D, Vulkan, and this
+# library's own `m4_perspective_reverse_z`, near at 1 and the infinite far plane at 0), whose
+# depth-buffer value is nz itself: for those, take nz from `m4_transform_point_checked(mvp,
+# point)`, whose components are this function's NDC bit for bit, and give it to
+# `linearize_depth_reverse_z`. Through this function's depth a reverse-Z point 5 away (near
+# 0.1) reads back as 0.196, not 5. Nor is 2 depth - 1 a way back: the + 1/2 rounds depth to
+# within 2^-54, so 2 depth - 1 is off by up to 2^-53 absolute, 2^-13 relative at nz = 2^-40
+# and all of nz below 2^-54, where reverse-Z keeps its far depths. Changing the depth this
+# function returns would redefine a public name (a depth-range parameter is the [3.5.0] row),
+# so the convention is documented, not changed.
+# [measured: tests/foundation.tcyr, group "3.4.1: world_to_screen_checked's depth convention"]
 #must_use
 public fn world_to_screen_checked(point, mvp, vw, vh) {
     var hp = hvec4_from_vec3(point, F64_ONE);
@@ -351,8 +454,22 @@ fn _t3d_w_copy(p, inv_w) {
     return 0;
 }
 
-# Returns two Vec3: origin and direction (via out params), and 0; HSB_ERR_ALLOC (out params
-# untouched) where an allocation is refused (3.4.0).
+# The world-space ray through screen pixel (sx, sy) of a vw x vh viewport, for inv_vp the
+# inverse of a view-projection matrix whose NDC z runs from -1 (near) to +1 (far), GL's
+# convention: the pixel maps to NDC (2 sx / vw - 1, 1 - 2 sy / vh), and the ray runs from that
+# point on the near plane (z = -1) through the one on the far plane (z = +1), each unprojected
+# by inv_vp and divided by its w. Writes the origin (the near-plane point, an HVec3) to
+# *out_origin and the unit direction (`hvec3_normalize` of far - near) to *out_dir, and
+# returns 0. Returns HSB_ERR_ALLOC where an allocation is refused (3.4.0), and
+# HSB_ERR_DEGENERATE (3.4.1) where the two unprojected points come out equal, far - near
+# exactly zero, so no direction can be formed (inv_vp sends z = -1 and z = +1 to one point,
+# e.g. a projection with near = far); the out params are untouched on both. ⚠ Points that are
+# distinct but round to nearly the same values (a depth range far below the world's magnitude)
+# still give rc 0, with a direction made of their rounding. ⛔ Through 3.4.0 the equal case
+# returned 0 with the zero vector as the direction (`hvec3_normalize(0)`): inv_vp = I with
+# (2, 2) = 0 gave the origin (-0.75, 0.833, 0) and direction (0, 0, 0) for (100, 50) on
+# 800 x 600, a ray that goes nowhere, reported as success. ⚠ A w of 0 at either point still
+# gives rc 0 with a NaN direction (the [3.5.0] roadmap row).
 public fn screen_to_world_ray(sx, sy, inv_vp, vw, vh, out_origin, out_dir) {
     var nx = f64_sub(f64_mul(f64_div(sx, vw), F64_TWO), F64_ONE);
     var ny = f64_sub(F64_ONE, f64_mul(f64_div(sy, vh), F64_TWO));
@@ -392,6 +509,7 @@ public fn screen_to_world_ray(sx, sy, inv_vp, vw, vh, out_origin, out_dir) {
     if (fp == 0) { return HSB_ERR_ALLOC; }
     var dv = hvec3_sub(fp, np);
     if (dv == 0) { return HSB_ERR_ALLOC; }
+    if (((HVec3_x(dv) | HVec3_y(dv) | HVec3_z(dv)) & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return HSB_ERR_DEGENERATE; }
     var dn = hvec3_normalize(dv);
     if (dn == 0) { return HSB_ERR_ALLOC; }
     store64(out_origin, np);

@@ -13,6 +13,9 @@
 # none stores through a 0 handle. A 0 handle passed IN is the caller's.
 public enum Mat3Layout { MAT3_BYTES = 72 }
 
+# A new 3x3 zero matrix (72 bytes from the heap, every entry +0), column-major. Returns the
+# designed 0 where the allocation is refused (3.4.0); so does every function here that returns
+# a matrix or vector.
 #must_use
 public fn m3_new() {
     var m = alloc(MAT3_BYTES);
@@ -22,6 +25,7 @@ public fn m3_new() {
     return m;
 }
 
+# The 3x3 identity.
 #must_use
 public fn m3_identity() {
     var m = m3_new();
@@ -32,10 +36,15 @@ public fn m3_identity() {
     return m;
 }
 
+# The entry at (col, row), column-major. RAW ACCESSOR, PRECONDITION NOT GUARD: col and row must
+# be in [0, 2]; anything else reads outside the matrix (undefined), and a 0 handle faults.
 #must_use
 public fn m3_get(m, col, row) { return load64(m + (col * 3 + row) * 8); }
+# Stores val at (col, row) and returns 0: `m3_get`'s precondition, and outside [0, 2] it writes
+# outside the matrix.
 public fn m3_set(m, col, row, val) { store64(m + (col * 3 + row) * 8, val); return 0; }
 
+# A new matrix with src's nine entries, bit for bit.
 #must_use
 public fn m3_copy(src) {
     var dst = alloc(MAT3_BYTES);
@@ -45,6 +54,7 @@ public fn m3_copy(src) {
     return dst;
 }
 
+# The matrix whose columns are the HVec3s c0, c1, c2 (bits copied).
 #must_use
 public fn m3_from_cols(c0, c1, c2) {
     var m = alloc(MAT3_BYTES);
@@ -55,6 +65,7 @@ public fn m3_from_cols(c0, c1, c2) {
     return m;
 }
 
+# Column c (0, 1 or 2; unchecked, `m3_get`'s precondition) as a new HVec3.
 #must_use
 public fn m3_col(m, c) {
     var off = c * 24;
@@ -152,6 +163,7 @@ public fn m3_mul_vec3(m, v) {
     return r;
 }
 
+# The transpose, a new matrix, exact.
 #must_use
 public fn m3_transpose(m) {
     var t = m3_new();
@@ -165,6 +177,12 @@ public fn m3_transpose(m) {
     return t;
 }
 
+# det m by the cofactor expansion along row 0 (the entries m(0, 0), m(1, 0), m(2, 0) as
+# (col, row)), in plain double arithmetic: within 5u P of the exact determinant to first
+# order (u = 2^-53, P the permanent of |m|, the sum of the six products' magnitudes), so it can
+# be far off relative to det for a nearly singular m, and its sign need not be det's.
+# Overflow, underflow and NaN follow IEEE. `m3_inverse_checked` decides singularity exactly
+# instead; this is the plain value.
 #must_use
 public fn m3_determinant(m) {
     var m00 = m3_get(m, 0, 0); var m01 = m3_get(m, 0, 1); var m02 = m3_get(m, 0, 2);
@@ -194,6 +212,16 @@ enum _M3Exact {
     _M3_CERT2 = 0x42A0_0000_0000_0000;   # 2^43
     _M3_DD_LO = 0x07B0_0000_0000_0000;   # 2^-900
     _M3_UFL   = 0x0210_0000_0000_0000;   # 2^-990
+    _M3_NCERT = 0x4020_0000_0000_0000;   # 2^3
+    _M3_DDCERT = 0x4350_0000_0000_0000;  # 2^54
+    _M3_WENT  = 0x7E3F_FFFF_FC00_0000;   # 2^997 - 2^970
+    _M3_WPRD  = 0x7FE0_0000_0000_0000;   # 2^1023
+    _M3_W51   = 0x3CC0_0000_0000_0000;   # 2^-51
+    _M3_WT    = 508;                     # an integer: `_m3_cof_wequil`'s target exponent
+    # An integer, -100000: below every exponent, "no entry". Written in hex because an enum
+    # expression needs cycc >= 6.7.2 and the bundle compiles from 6.6.3.
+    _M3_WNONE = 0xFFFF_FFFF_FFFE_7960;   # an integer sentinel
+    _M3_WBAD  = 0x7FFF_FFFF_FFFF_FFFF;   # a NaN's bits, never a result of `_m3_wscale`
 }
 
 # x * 2^k, rounded once, for any integer k. Upward every step is exact or overflows; downward
@@ -538,8 +566,11 @@ fn _m3_inverse_exact(m) {
 # (2u pC_ji + (e + 2u) |C_ji|) / |det|, pC_ji the permanent of its cofactor's minor and e the
 # determinant's relative error (2^-40.7 in tier 1, 2^-58 + u in tier 2): the cofactors carry
 # the formula's error relative to their permanents, which only a cancelling cofactor makes
-# large beside the entry. In tier 3 X is within (3u + 3u^2) |X| (under 3 ulp), plus half a
-# subnormal step where it is subnormal.
+# large beside the entry. Add half a subnormal step (2^-1075) where X_ij is below DBL_MIN: 1/det
+# is normal (|det| <= P <= 2^1000) and every product of two entries is at least 2^-1022, so
+# only the last product, 1/det times C, rounds on the subnormal grid (3.4.1: this term was not
+# stated). In tier 3 X is within (3u + 3u^2) |X| (under 3 ulp), plus half a subnormal step
+# where it is subnormal.
 # Measured, against exact rational inverses (maxima of the stated samples, not bounds), in ulp of
 # the largest exact entry: 2,000 random uniform matrices 230; r2 = r0 + r1 + noise 2^-k (200
 # each) 434 at k = 4, 387 at k = 10, 6.1 .. 1.7 for k = 20 .. 50; 3,000 matrices with entries
@@ -549,6 +580,12 @@ fn _m3_inverse_exact(m) {
 # 79 -> 82 ns (3.3.7: 173); rows r2 = r0 + r1 + 2^-30 (tier 2) 2.39 us -> 231 ns (3.3.7: 174,
 # with no correct digit); an exactly singular matrix 1.91 us -> 799 ns (3.3.7: 176, the identity).
 # [measured: scratch inv_new.bcyr / inv_old.bcyr, 3.3.7 + integ-snap7 + this tree x 3, 2026-10-31; cycc 6.7.9]
+# Tier 3 is the slow one, and its cost grows with the range the entries span (its exact sums
+# work in 27-bit limbs across it): 13.3-13.7 us medians (runs 12.8-14.1) on a 3x3 whose
+# exponents are drawn from 2^-1074 to 2^1023, a fifth of them subnormal (3.4.1; the [3.4.1]
+# roadmap row quoted 15.3 us from another session). mat4.cyr's `m4_inverse_checked` states the
+# 4x4's.
+# [measured: scratch MAT4-i7 bv_same*.bcyr, 3 x 4 runs, load 2.2-2.7, 2026-11-01; cycc 6.7.18]
 #must_use
 public fn m3_inverse_checked(m) {
     var m00 = load64(m);      var m01 = load64(m + 8);  var m02 = load64(m + 16);
@@ -683,6 +720,7 @@ public fn m3_inverse_checked(m) {
     return _m3_inverse_exact(m);
 }
 
+# a + b, entrywise, each entry correctly rounded.
 #must_use
 public fn m3_add(a, b) {
     var r = m3_new();
@@ -695,6 +733,7 @@ public fn m3_add(a, b) {
     return r;
 }
 
+# m times the scalar s, each entry correctly rounded.
 #must_use
 public fn m3_scale(m, s) {
     var r = m3_new();
@@ -784,6 +823,606 @@ fn _m3_cof_signed(m, sg) {
     return r;
 }
 
+# The larger of a b, a c and b c for a, b, c >= 0 (as bits): the product of the two largest.
+fn _m3_top2(a, b, c) {
+    if (a < b) { var t = a; a = b; b = t; }
+    if (b < c) { b = c; }
+    return f64_mul(a, b);
+}
+
+# 1 when m's cofactor matrix r (computed, its largest |entry| mx as bits) is certified within
+# 17u max of the exact one (u = 2^-53), replacing r by compensated minors where the plain ones
+# are not: each plain minor a d - b c is within u (|a d| + |b c|) + u |c_ij| <= 2u G + u |c_ij|
+# of its own value, G the largest |product| in any minor, so G <= 8 mx suffices. Every product
+# in a minor takes its two entries from two different columns and two different rows, so G is
+# at most the product of the two largest column maxima, and of the two largest row maxima:
+# `m3_normal_matrix_cof` tries the columns (a matrix times a scale, R S) before calling this;
+# here the rows (S R), then `_m3_cof_comp` forms G itself and, past 8 mx, the compensated
+# minors. With mx at or above 2^-969, a subnormal product's 2^-1075 is below 2^-105 mx.
+fn _m3_cof_certified(m, mx, sg, r) {
+    var lim = f64_mul(mx, _M3_NCERT);
+    var r0 = 0; var r1 = 0; var r2 = 0;
+    var j = 0;
+    while (j < 3) {
+        var x0 = load64(m + j * 24) & 0x7FFF_FFFF_FFFF_FFFF;
+        var x1 = load64(m + j * 24 + 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        var x2 = load64(m + j * 24 + 16) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (x0 > r0) { r0 = x0; }
+        if (x1 > r1) { r1 = x1; }
+        if (x2 > r2) { r2 = x2; }
+        j = j + 1;
+    }
+    if (f64_le(_m3_top2(r0, r1, r2), lim) == 1) { return 1; }
+    if (r1 > r0) { r0 = r1; }
+    if (r2 > r0) { r0 = r2; }
+    return _m3_cof_comp(m, sg, r, mx, r0);
+}
+
+# The products' half of `_m3_cof_certified` and `m3_normal_matrix_cof`'s middle tier (3.4.1
+# review M1). G, the largest |product| of the eighteen in the nine minors a d - b c (rounded,
+# as bits), first decides the plain minors in r: certified when G <= 8 mx (mx the largest
+# |plain entry|). Otherwise every minor is recomputed compensated, both products split exactly
+# (Dekker: x y = p + e, no FMA) and the difference summed with TwoSum, c~ = s + ((p - (s - z))
+# - (q + z) + (ep - eq)) with s = p - q rounded: within u |c~| + 6u^2 G of the exact minor
+# (first order). So G <= 2^54 max|c~| puts the matrix within 13u max|c~| of the exact one,
+# normwise (15u with the subnormal losses below), inside the 17u the plain tier promises; it is
+# written into r with sg applied (as `_m3_cof_signed` does). Returns 1 when r is certified, 0
+# when the caller must take the exact path. me is m's largest |entry| (as bits).
+# Its own steps overflow exactly where an entry is at or above 2^997 - 2^970 (x (2^27 + 1) past
+# DBL_MAX) or where a product of two splits, which round up by up to 2^-26 of the entry, passes
+# DBL_MAX (only for a product at or above 2^1023, `_m3_cof_hhovf`): those m go to
+# `_m3_cof_wide` (3.4.1 round-2 review S1; the first form made such minors non-finite and
+# declined them, so the exact path answered, at 50 to 94 times 3.4.0's time). Everywhere else
+# nothing here overflows: |s| < 2^1021 past G > 8 mx. An error term of a product below 2^-969
+# can lose bits, at most 2^-1072 a minor; this tier runs only past G > 8 mx >= 2^-966 (the
+# callers' floor on mx) and certifies only max|c~| >= 2^-54 G > 2^-1020, so those losses add
+# under 2u. (A floor test on max|c~| moved no answer under mutation and was dropped.)
+fn _m3_cof_comp(m, sg, r, mx, me) {
+    var m00 = load64(m + 0);
+    var m01 = load64(m + 8);
+    var m02 = load64(m + 16);
+    var m10 = load64(m + 24);
+    var m11 = load64(m + 32);
+    var m12 = load64(m + 40);
+    var m20 = load64(m + 48);
+    var m21 = load64(m + 56);
+    var m22 = load64(m + 64);
+    var p0 = f64_mul(m11, m22); var q0 = f64_mul(m21, m12);
+    var p1 = f64_mul(m21, m02); var q1 = f64_mul(m01, m22);
+    var p2 = f64_mul(m01, m12); var q2 = f64_mul(m11, m02);
+    var p3 = f64_mul(m20, m12); var q3 = f64_mul(m10, m22);
+    var p4 = f64_mul(m00, m22); var q4 = f64_mul(m20, m02);
+    var p5 = f64_mul(m10, m02); var q5 = f64_mul(m00, m12);
+    var p6 = f64_mul(m10, m21); var q6 = f64_mul(m20, m11);
+    var p7 = f64_mul(m20, m01); var q7 = f64_mul(m00, m21);
+    var p8 = f64_mul(m00, m11); var q8 = f64_mul(m10, m01);
+    var g = p0 & 0x7FFF_FFFF_FFFF_FFFF;
+    var gq0 = q0 & 0x7FFF_FFFF_FFFF_FFFF; if (gq0 > g) { g = gq0; }
+    var gp1 = p1 & 0x7FFF_FFFF_FFFF_FFFF; if (gp1 > g) { g = gp1; }
+    var gq1 = q1 & 0x7FFF_FFFF_FFFF_FFFF; if (gq1 > g) { g = gq1; }
+    var gp2 = p2 & 0x7FFF_FFFF_FFFF_FFFF; if (gp2 > g) { g = gp2; }
+    var gq2 = q2 & 0x7FFF_FFFF_FFFF_FFFF; if (gq2 > g) { g = gq2; }
+    var gp3 = p3 & 0x7FFF_FFFF_FFFF_FFFF; if (gp3 > g) { g = gp3; }
+    var gq3 = q3 & 0x7FFF_FFFF_FFFF_FFFF; if (gq3 > g) { g = gq3; }
+    var gp4 = p4 & 0x7FFF_FFFF_FFFF_FFFF; if (gp4 > g) { g = gp4; }
+    var gq4 = q4 & 0x7FFF_FFFF_FFFF_FFFF; if (gq4 > g) { g = gq4; }
+    var gp5 = p5 & 0x7FFF_FFFF_FFFF_FFFF; if (gp5 > g) { g = gp5; }
+    var gq5 = q5 & 0x7FFF_FFFF_FFFF_FFFF; if (gq5 > g) { g = gq5; }
+    var gp6 = p6 & 0x7FFF_FFFF_FFFF_FFFF; if (gp6 > g) { g = gp6; }
+    var gq6 = q6 & 0x7FFF_FFFF_FFFF_FFFF; if (gq6 > g) { g = gq6; }
+    var gp7 = p7 & 0x7FFF_FFFF_FFFF_FFFF; if (gp7 > g) { g = gp7; }
+    var gq7 = q7 & 0x7FFF_FFFF_FFFF_FFFF; if (gq7 > g) { g = gq7; }
+    var gp8 = p8 & 0x7FFF_FFFF_FFFF_FFFF; if (gp8 > g) { g = gp8; }
+    var gq8 = q8 & 0x7FFF_FFFF_FFFF_FFFF; if (gq8 > g) { g = gq8; }
+    if (f64_le(g, f64_mul(mx, _M3_NCERT)) == 1) { return 1; }
+    if (me >= _M3_WENT) { return _m3_cof_wide(m, sg, r); }
+    if (g >= _M3_WPRD) {
+        if (_m3_cof_hhovf(m) == 1) { return _m3_cof_wide(m, sg, r); }
+    }
+    var t00 = f64_mul(m00, _M3_SPLIT); var h00 = f64_sub(t00, f64_sub(t00, m00)); var l00 = f64_sub(m00, h00);
+    var t01 = f64_mul(m01, _M3_SPLIT); var h01 = f64_sub(t01, f64_sub(t01, m01)); var l01 = f64_sub(m01, h01);
+    var t02 = f64_mul(m02, _M3_SPLIT); var h02 = f64_sub(t02, f64_sub(t02, m02)); var l02 = f64_sub(m02, h02);
+    var t10 = f64_mul(m10, _M3_SPLIT); var h10 = f64_sub(t10, f64_sub(t10, m10)); var l10 = f64_sub(m10, h10);
+    var t11 = f64_mul(m11, _M3_SPLIT); var h11 = f64_sub(t11, f64_sub(t11, m11)); var l11 = f64_sub(m11, h11);
+    var t12 = f64_mul(m12, _M3_SPLIT); var h12 = f64_sub(t12, f64_sub(t12, m12)); var l12 = f64_sub(m12, h12);
+    var t20 = f64_mul(m20, _M3_SPLIT); var h20 = f64_sub(t20, f64_sub(t20, m20)); var l20 = f64_sub(m20, h20);
+    var t21 = f64_mul(m21, _M3_SPLIT); var h21 = f64_sub(t21, f64_sub(t21, m21)); var l21 = f64_sub(m21, h21);
+    var t22 = f64_mul(m22, _M3_SPLIT); var h22 = f64_sub(t22, f64_sub(t22, m22)); var l22 = f64_sub(m22, h22);
+    var cm = 0;
+    var ep0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h11, h22), p0), f64_mul(h11, l22)), f64_mul(l11, h22)),
+      f64_mul(l11, l22));
+    var eq0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h21, h12), q0), f64_mul(h21, l12)), f64_mul(l21, h12)),
+      f64_mul(l21, l12));
+    var s0 = f64_sub(p0, q0); var z0 = f64_sub(s0, p0);
+    var c0 = f64_add(s0, f64_add(f64_sub(f64_sub(p0, f64_sub(s0, z0)), f64_add(q0, z0)), f64_sub(ep0, eq0)));
+    if ((c0 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c0 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 0, c0);
+    var ep1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h21, h02), p1), f64_mul(h21, l02)), f64_mul(l21, h02)),
+      f64_mul(l21, l02));
+    var eq1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h01, h22), q1), f64_mul(h01, l22)), f64_mul(l01, h22)),
+      f64_mul(l01, l22));
+    var s1 = f64_sub(p1, q1); var z1 = f64_sub(s1, p1);
+    var c1 = f64_add(s1, f64_add(f64_sub(f64_sub(p1, f64_sub(s1, z1)), f64_add(q1, z1)), f64_sub(ep1, eq1)));
+    if ((c1 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c1 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 24, c1);
+    var ep2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h01, h12), p2), f64_mul(h01, l12)), f64_mul(l01, h12)),
+      f64_mul(l01, l12));
+    var eq2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h11, h02), q2), f64_mul(h11, l02)), f64_mul(l11, h02)),
+      f64_mul(l11, l02));
+    var s2 = f64_sub(p2, q2); var z2 = f64_sub(s2, p2);
+    var c2 = f64_add(s2, f64_add(f64_sub(f64_sub(p2, f64_sub(s2, z2)), f64_add(q2, z2)), f64_sub(ep2, eq2)));
+    if ((c2 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c2 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 48, c2);
+    var ep3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h12), p3), f64_mul(h20, l12)), f64_mul(l20, h12)),
+      f64_mul(l20, l12));
+    var eq3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h22), q3), f64_mul(h10, l22)), f64_mul(l10, h22)),
+      f64_mul(l10, l22));
+    var s3 = f64_sub(p3, q3); var z3 = f64_sub(s3, p3);
+    var c3 = f64_add(s3, f64_add(f64_sub(f64_sub(p3, f64_sub(s3, z3)), f64_add(q3, z3)), f64_sub(ep3, eq3)));
+    if ((c3 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c3 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 8, c3);
+    var ep4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h22), p4), f64_mul(h00, l22)), f64_mul(l00, h22)),
+      f64_mul(l00, l22));
+    var eq4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h02), q4), f64_mul(h20, l02)), f64_mul(l20, h02)),
+      f64_mul(l20, l02));
+    var s4 = f64_sub(p4, q4); var z4 = f64_sub(s4, p4);
+    var c4 = f64_add(s4, f64_add(f64_sub(f64_sub(p4, f64_sub(s4, z4)), f64_add(q4, z4)), f64_sub(ep4, eq4)));
+    if ((c4 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c4 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 32, c4);
+    var ep5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h02), p5), f64_mul(h10, l02)), f64_mul(l10, h02)),
+      f64_mul(l10, l02));
+    var eq5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h12), q5), f64_mul(h00, l12)), f64_mul(l00, h12)),
+      f64_mul(l00, l12));
+    var s5 = f64_sub(p5, q5); var z5 = f64_sub(s5, p5);
+    var c5 = f64_add(s5, f64_add(f64_sub(f64_sub(p5, f64_sub(s5, z5)), f64_add(q5, z5)), f64_sub(ep5, eq5)));
+    if ((c5 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c5 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 56, c5);
+    var ep6 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h21), p6), f64_mul(h10, l21)), f64_mul(l10, h21)),
+      f64_mul(l10, l21));
+    var eq6 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h11), q6), f64_mul(h20, l11)), f64_mul(l20, h11)),
+      f64_mul(l20, l11));
+    var s6 = f64_sub(p6, q6); var z6 = f64_sub(s6, p6);
+    var c6 = f64_add(s6, f64_add(f64_sub(f64_sub(p6, f64_sub(s6, z6)), f64_add(q6, z6)), f64_sub(ep6, eq6)));
+    if ((c6 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c6 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 16, c6);
+    var ep7 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h01), p7), f64_mul(h20, l01)), f64_mul(l20, h01)),
+      f64_mul(l20, l01));
+    var eq7 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h21), q7), f64_mul(h00, l21)), f64_mul(l00, h21)),
+      f64_mul(l00, l21));
+    var s7 = f64_sub(p7, q7); var z7 = f64_sub(s7, p7);
+    var c7 = f64_add(s7, f64_add(f64_sub(f64_sub(p7, f64_sub(s7, z7)), f64_add(q7, z7)), f64_sub(ep7, eq7)));
+    if ((c7 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c7 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 40, c7);
+    var ep8 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h11), p8), f64_mul(h00, l11)), f64_mul(l00, h11)),
+      f64_mul(l00, l11));
+    var eq8 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h01), q8), f64_mul(h10, l01)), f64_mul(l10, h01)),
+      f64_mul(l10, l01));
+    var s8 = f64_sub(p8, q8); var z8 = f64_sub(s8, p8);
+    var c8 = f64_add(s8, f64_add(f64_sub(f64_sub(p8, f64_sub(s8, z8)), f64_add(q8, z8)), f64_sub(ep8, eq8)));
+    if ((c8 & 0x7FFF_FFFF_FFFF_FFFF) > cm) { cm = c8 & 0x7FFF_FFFF_FFFF_FFFF; }
+    store64(r + 64, c8);
+    if (f64_le(g, f64_mul(cm, _M3_DDCERT)) == 0) { return 0; }
+    if (sg < 0) {
+        var i = 0;
+        while (i < 9) { store64(r + i * 8, load64(r + i * 8) ^ 0x8000000000000000); i = i + 1; }
+    }
+    return 1;
+}
+
+# True where some product x y of two entries of m in the minors (different rows and columns),
+# at or above 2^1023, has a product of `_m3_cof_comp`'s splits that overflows (the splits round up
+# by up to 2^-26 of the entry). Every entry below 2^997 - 2^970 (the caller's test), so each
+# split is finite.
+fn _m3_cof_hhovf(m) {
+    var r1 = 0;
+    while (r1 < 2) {
+        var r2 = r1 + 1;
+        while (r2 < 3) {
+            var c1 = 0;
+            while (c1 < 3) {
+                var x = load64(m + (r1 * 3 + c1) * 8);
+                var c2 = 0;
+                while (c2 < 3) {
+                    if (c2 != c1) {
+                        var y = load64(m + (r2 * 3 + c2) * 8);
+                        if ((f64_mul(x, y) & 0x7FFF_FFFF_FFFF_FFFF) >= _M3_WPRD) {
+                            var tx = f64_mul(x, _M3_SPLIT);
+                            var ty = f64_mul(y, _M3_SPLIT);
+                            var hh = f64_mul(f64_sub(tx, f64_sub(tx, x)), f64_sub(ty, f64_sub(ty, y)));
+                            if ((hh & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { return 1; }
+                        }
+                    }
+                    c2 = c2 + 1;
+                }
+                c1 = c1 + 1;
+            }
+            r2 = r2 + 1;
+        }
+        r1 = r1 + 1;
+    }
+    return 0;
+}
+
+# `_m3_cof_comp`'s compensated tier where its own steps overflow (3.4.1 round-2 review S1): an
+# entry at or above 2^997 - 2^970, whose split x (2^27 + 1) passes DBL_MAX, or a product within
+# about 2^-25 of DBL_MAX whose splits' product does (`_m3_cof_hhovf`). The first 3.4.1 form made
+# those minors non-finite and declined, so the exact path answered, at 50 to 94 times 3.4.0's
+# time; an answer is therefore kept here only where every entry is PROVED the exact cofactor's
+# nearest double, which is the exact path's answer bit for bit.
+# Two scalings, each by exact powers of two (3.4.1 round-3 review S1): the uniform m 2^-28, and
+# where that pass declines for range (returns 2) `_m3_cof_wequil`'s, which puts every group's and
+# then every position's largest entry at exponent 508. The second is what lets m with a row at
+# 2^1000 and another at 2^-430 through: under the uniform scaling alone a product of two entries
+# fell below the error-term floor and the exact path answered, at 92 to 109 times 3.4.0's time.
+# Where a pass declines any other way the other cannot help: the same arithmetic on the same
+# numbers. Returns 1 when r holds the answer, 0 when the caller must take the exact path.
+fn _m3_cof_wide(m, sg, r) {
+    var kv: i64[10];
+    var i = 0;
+    while (i < 9) { store64(&kv + i * 8, 0 - 28); i = i + 1; }
+    store64(&kv + 72, 0 - 84);
+    var rc = _m3_cof_wpass(m, sg, r, &kv);
+    if (rc != 2) { return rc; }
+    _m3_cof_wequil(m, &kv);
+    return _m3_cof_wpass(m, sg, r, &kv) & 1;
+}
+
+# kv[i] = g(i / 3) + h(i % 3), the exponents of m's equilibrating powers of two, and kv[9] their
+# sum over the three groups and three positions: g(X) puts group X's largest entry at exponent
+# `_M3_WT`, then h(Y) does the same for position Y of the scaled matrix (0 for an all-zero group
+# or position). Every h is then at least 0 and every scaled entry below 2^(`_M3_WT` + 1).
+fn _m3_cof_wequil(m, kv) {
+    var e: i64[9];
+    var g: i64[3];
+    var k = 0;
+    var i = 0;
+    while (i < 3) {
+        var top = _M3_WNONE;
+        var j = 0;
+        while (j < 3) {
+            var b = load64(m + (i * 3 + j) * 8);
+            var ex = _M3_WNONE;
+            if ((b & 0x7FFF_FFFF_FFFF_FFFF) != 0) { ex = _m3_expo(b); }
+            store64(&e + (i * 3 + j) * 8, ex);
+            if (ex > top) { top = ex; }
+            j = j + 1;
+        }
+        var gi = 0;
+        if (top != _M3_WNONE) { gi = _M3_WT - top; }
+        store64(&g + i * 8, gi);
+        k = k + gi;
+        i = i + 1;
+    }
+    var y = 0;
+    while (y < 3) {
+        var ty = _M3_WNONE;
+        var x = 0;
+        while (x < 3) {
+            var v = load64(&e + (x * 3 + y) * 8);
+            if (v != _M3_WNONE) {
+                v = v + load64(&g + x * 8);
+                if (v > ty) { ty = v; }
+            }
+            x = x + 1;
+        }
+        var hy = 0;
+        if (ty != _M3_WNONE) { hy = _M3_WT - ty; }
+        k = k + hy;
+        x = 0;
+        while (x < 3) {
+            store64(kv + (x * 3 + y) * 8, load64(&g + x * 8) + hy);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    store64(kv + 72, k);
+    return 0;
+}
+
+# x 2^k where a double holds it exactly, `_M3_WBAD` otherwise (x finite, k >= -515, so 2^(ne - 1)
+# and 2^(1 - ne) below are normal). Never rounds: a result that lands below DBL_MIN is formed
+# by one multiplication and read back.
+fn _m3_wscale(x, k) {
+    if ((x & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return x; }
+    var b = x;
+    var e = (x & 0x7FFF_FFFF_FFFF_FFFF) >> 52;
+    if (e == 0) {
+        b = f64_mul(x, _M3_TWO64);
+        e = (b & 0x7FFF_FFFF_FFFF_FFFF) >> 52;
+        k = k - 64;
+    }
+    var ne = e + k;
+    if (ne >= 1) { return b + (k << 52); }
+    var c = b + ((1 - e) << 52);
+    var t = f64_mul(c, (1022 + ne) << 52);
+    if (f64_mul(t, (1024 - ne) << 52) != c) { return _M3_WBAD; }
+    return t;
+}
+
+# c 2^s rounded once (c finite, the result at most DBL_MAX). Below DBL_MIN the multiplication by
+# 2^(ne - 1) is that one rounding; past 2^-64 the factor stays 2^-64, whose product with a value
+# below 2^-1021 already rounds to a zero of c's sign.
+fn _m3_wout(c, s) {
+    if ((c & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return c; }
+    var b = c;
+    var e = (c & 0x7FFF_FFFF_FFFF_FFFF) >> 52;
+    if (e == 0) {
+        b = f64_mul(c, _M3_TWO64);
+        e = (b & 0x7FFF_FFFF_FFFF_FFFF) >> 52;
+        s = s - 64;
+    }
+    var ne = e + s;
+    if (ne >= 1) { return b + (s << 52); }
+    var sh = ne - 1;
+    if (sh < 0 - 64) { sh = 0 - 64; }
+    return f64_mul(b + ((1 - e) << 52), (1023 + sh) << 52);
+}
+
+# One pass of `_m3_cof_wide`: t, each entry of m scaled by its own kv[i] (i in memory order), so
+# that t's cofactor at slot i is m's times 2^(kv[9] - kv[i]) (cof(D1 m D2) is cof(m) with each
+# entry scaled by the other two groups' and positions' powers). kv[i] is g(X) + h(Y) with sum
+# kv[9], and t's entries are below 2^509 (`_m3_cof_wequil`) or 2^996 (the uniform 2^-28): neither
+# a split nor a product of splits can overflow. It returns 2 (the range declined it) where t is
+# not m's scaling exactly, or where a product of two non-zero entries of t falls below 2^-969,
+# whose error term can lose bits (Dekker's product is exact when the exponents sum to -970 or
+# more); otherwise every error term is exact and the exact minor is c = s + es + ep - eq, a
+# multiple of 2^-1074, so a c below 2^-1021 is exact in a double. With w = ep - eq and u = es + w
+# rounded, c = s + u + e where e, the two roundings' error, is at most 2^-53 (|u| + |w|) (each is
+# 0 where its result is below 2^-1021: such a sum is exact). With d = 2^-51 (|u| + |w|), rounded,
+# u + d and u - d rounded still bracket u + e; so where s + (u + d) and s + (u - d) both round to
+# c~ = s + u rounded, every value between them does (rounding is monotone), c included: c~ is c
+# rounded to 53 bits. Then the answer is c~ 2^(kv[i] - kv[9]) rounded once (`_m3_wout`), with sg
+# applied, and it is the exact path's bits in every entry: that path rounds each cofactor to 53
+# bits and then once more into range. c~ is never -0 (its last sum is -0 only from two -0, and
+# Dekker's error of a product never is: hh - p is +0 where both are zeros of one sign). The exact
+# path's own scaling cannot apply. It scales where the largest cofactor passes 2^1023, but the
+# caller is past G > 8 mx, so every plain minor is below 2^1021 and every c within 2^-52 G of its
+# plain minor. And it scales where the largest is below 2^-969, but m holds a large entry (at
+# or above 2^997 - 2^970, or the larger factor, at least 2^511, of a product at or above 2^1023),
+# and each of the four minors holding it is a multiple of its grid (at least 2^459) times 2^-1074:
+# 0 or at least 2^-615; and where all four are 0 the matrix has rank 1, every cofactor 0.
+# It returns 0 where the bracket fails.
+fn _m3_cof_wpass(m, sg, r, kv) {
+    var x00 = _m3_wscale(load64(m + 0), load64(kv + 0));
+    if (x00 == _M3_WBAD) { return 2; }
+    var x01 = _m3_wscale(load64(m + 8), load64(kv + 8));
+    if (x01 == _M3_WBAD) { return 2; }
+    var x02 = _m3_wscale(load64(m + 16), load64(kv + 16));
+    if (x02 == _M3_WBAD) { return 2; }
+    var x10 = _m3_wscale(load64(m + 24), load64(kv + 24));
+    if (x10 == _M3_WBAD) { return 2; }
+    var x11 = _m3_wscale(load64(m + 32), load64(kv + 32));
+    if (x11 == _M3_WBAD) { return 2; }
+    var x12 = _m3_wscale(load64(m + 40), load64(kv + 40));
+    if (x12 == _M3_WBAD) { return 2; }
+    var x20 = _m3_wscale(load64(m + 48), load64(kv + 48));
+    if (x20 == _M3_WBAD) { return 2; }
+    var x21 = _m3_wscale(load64(m + 56), load64(kv + 56));
+    if (x21 == _M3_WBAD) { return 2; }
+    var x22 = _m3_wscale(load64(m + 64), load64(kv + 64));
+    if (x22 == _M3_WBAD) { return 2; }
+    var t00 = f64_mul(x00, _M3_SPLIT); var h00 = f64_sub(t00, f64_sub(t00, x00)); var l00 = f64_sub(x00, h00);
+    var t01 = f64_mul(x01, _M3_SPLIT); var h01 = f64_sub(t01, f64_sub(t01, x01)); var l01 = f64_sub(x01, h01);
+    var t02 = f64_mul(x02, _M3_SPLIT); var h02 = f64_sub(t02, f64_sub(t02, x02)); var l02 = f64_sub(x02, h02);
+    var t10 = f64_mul(x10, _M3_SPLIT); var h10 = f64_sub(t10, f64_sub(t10, x10)); var l10 = f64_sub(x10, h10);
+    var t11 = f64_mul(x11, _M3_SPLIT); var h11 = f64_sub(t11, f64_sub(t11, x11)); var l11 = f64_sub(x11, h11);
+    var t12 = f64_mul(x12, _M3_SPLIT); var h12 = f64_sub(t12, f64_sub(t12, x12)); var l12 = f64_sub(x12, h12);
+    var t20 = f64_mul(x20, _M3_SPLIT); var h20 = f64_sub(t20, f64_sub(t20, x20)); var l20 = f64_sub(x20, h20);
+    var t21 = f64_mul(x21, _M3_SPLIT); var h21 = f64_sub(t21, f64_sub(t21, x21)); var l21 = f64_sub(x21, h21);
+    var t22 = f64_mul(x22, _M3_SPLIT); var h22 = f64_sub(t22, f64_sub(t22, x22)); var l22 = f64_sub(x22, h22);
+    var ok = 1;
+    var p0 = f64_mul(x11, x22); var q0 = f64_mul(x21, x12);
+    if ((p0 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x11 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x22 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q0 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x21 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x12 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h11, h22), p0), f64_mul(h11, l22)), f64_mul(l11, h22)),
+      f64_mul(l11, l22));
+    var eq0 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h21, h12), q0), f64_mul(h21, l12)), f64_mul(l21, h12)),
+      f64_mul(l21, l12));
+    var s0 = f64_sub(p0, q0); var z0 = f64_sub(s0, p0); var w0 = f64_sub(ep0, eq0);
+    var u0 = f64_add(f64_sub(f64_sub(p0, f64_sub(s0, z0)), f64_add(q0, z0)), w0);
+    var c0 = f64_add(s0, u0);
+    var d0 = f64_mul(f64_add(u0 & 0x7FFF_FFFF_FFFF_FFFF, w0 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s0, f64_add(u0, d0)) != c0 || f64_add(s0, f64_sub(u0, d0)) != c0) { ok = 0; }
+    store64(r + 0, c0);
+    var p1 = f64_mul(x21, x02); var q1 = f64_mul(x01, x22);
+    if ((p1 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x21 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x02 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q1 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x01 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x22 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h21, h02), p1), f64_mul(h21, l02)), f64_mul(l21, h02)),
+      f64_mul(l21, l02));
+    var eq1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h01, h22), q1), f64_mul(h01, l22)), f64_mul(l01, h22)),
+      f64_mul(l01, l22));
+    var s1 = f64_sub(p1, q1); var z1 = f64_sub(s1, p1); var w1 = f64_sub(ep1, eq1);
+    var u1 = f64_add(f64_sub(f64_sub(p1, f64_sub(s1, z1)), f64_add(q1, z1)), w1);
+    var c1 = f64_add(s1, u1);
+    var d1 = f64_mul(f64_add(u1 & 0x7FFF_FFFF_FFFF_FFFF, w1 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s1, f64_add(u1, d1)) != c1 || f64_add(s1, f64_sub(u1, d1)) != c1) { ok = 0; }
+    store64(r + 24, c1);
+    var p2 = f64_mul(x01, x12); var q2 = f64_mul(x11, x02);
+    if ((p2 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x01 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x12 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q2 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x11 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x02 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h01, h12), p2), f64_mul(h01, l12)), f64_mul(l01, h12)),
+      f64_mul(l01, l12));
+    var eq2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h11, h02), q2), f64_mul(h11, l02)), f64_mul(l11, h02)),
+      f64_mul(l11, l02));
+    var s2 = f64_sub(p2, q2); var z2 = f64_sub(s2, p2); var w2 = f64_sub(ep2, eq2);
+    var u2 = f64_add(f64_sub(f64_sub(p2, f64_sub(s2, z2)), f64_add(q2, z2)), w2);
+    var c2 = f64_add(s2, u2);
+    var d2 = f64_mul(f64_add(u2 & 0x7FFF_FFFF_FFFF_FFFF, w2 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s2, f64_add(u2, d2)) != c2 || f64_add(s2, f64_sub(u2, d2)) != c2) { ok = 0; }
+    store64(r + 48, c2);
+    var p3 = f64_mul(x20, x12); var q3 = f64_mul(x10, x22);
+    if ((p3 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x20 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x12 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q3 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x10 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x22 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h12), p3), f64_mul(h20, l12)), f64_mul(l20, h12)),
+      f64_mul(l20, l12));
+    var eq3 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h22), q3), f64_mul(h10, l22)), f64_mul(l10, h22)),
+      f64_mul(l10, l22));
+    var s3 = f64_sub(p3, q3); var z3 = f64_sub(s3, p3); var w3 = f64_sub(ep3, eq3);
+    var u3 = f64_add(f64_sub(f64_sub(p3, f64_sub(s3, z3)), f64_add(q3, z3)), w3);
+    var c3 = f64_add(s3, u3);
+    var d3 = f64_mul(f64_add(u3 & 0x7FFF_FFFF_FFFF_FFFF, w3 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s3, f64_add(u3, d3)) != c3 || f64_add(s3, f64_sub(u3, d3)) != c3) { ok = 0; }
+    store64(r + 8, c3);
+    var p4 = f64_mul(x00, x22); var q4 = f64_mul(x20, x02);
+    if ((p4 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x00 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x22 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q4 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x20 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x02 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h22), p4), f64_mul(h00, l22)), f64_mul(l00, h22)),
+      f64_mul(l00, l22));
+    var eq4 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h02), q4), f64_mul(h20, l02)), f64_mul(l20, h02)),
+      f64_mul(l20, l02));
+    var s4 = f64_sub(p4, q4); var z4 = f64_sub(s4, p4); var w4 = f64_sub(ep4, eq4);
+    var u4 = f64_add(f64_sub(f64_sub(p4, f64_sub(s4, z4)), f64_add(q4, z4)), w4);
+    var c4 = f64_add(s4, u4);
+    var d4 = f64_mul(f64_add(u4 & 0x7FFF_FFFF_FFFF_FFFF, w4 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s4, f64_add(u4, d4)) != c4 || f64_add(s4, f64_sub(u4, d4)) != c4) { ok = 0; }
+    store64(r + 32, c4);
+    var p5 = f64_mul(x10, x02); var q5 = f64_mul(x00, x12);
+    if ((p5 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x10 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x02 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q5 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x00 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x12 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h02), p5), f64_mul(h10, l02)), f64_mul(l10, h02)),
+      f64_mul(l10, l02));
+    var eq5 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h12), q5), f64_mul(h00, l12)), f64_mul(l00, h12)),
+      f64_mul(l00, l12));
+    var s5 = f64_sub(p5, q5); var z5 = f64_sub(s5, p5); var w5 = f64_sub(ep5, eq5);
+    var u5 = f64_add(f64_sub(f64_sub(p5, f64_sub(s5, z5)), f64_add(q5, z5)), w5);
+    var c5 = f64_add(s5, u5);
+    var d5 = f64_mul(f64_add(u5 & 0x7FFF_FFFF_FFFF_FFFF, w5 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s5, f64_add(u5, d5)) != c5 || f64_add(s5, f64_sub(u5, d5)) != c5) { ok = 0; }
+    store64(r + 56, c5);
+    var p6 = f64_mul(x10, x21); var q6 = f64_mul(x20, x11);
+    if ((p6 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x10 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x21 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q6 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x20 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x11 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep6 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h21), p6), f64_mul(h10, l21)), f64_mul(l10, h21)),
+      f64_mul(l10, l21));
+    var eq6 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h11), q6), f64_mul(h20, l11)), f64_mul(l20, h11)),
+      f64_mul(l20, l11));
+    var s6 = f64_sub(p6, q6); var z6 = f64_sub(s6, p6); var w6 = f64_sub(ep6, eq6);
+    var u6 = f64_add(f64_sub(f64_sub(p6, f64_sub(s6, z6)), f64_add(q6, z6)), w6);
+    var c6 = f64_add(s6, u6);
+    var d6 = f64_mul(f64_add(u6 & 0x7FFF_FFFF_FFFF_FFFF, w6 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s6, f64_add(u6, d6)) != c6 || f64_add(s6, f64_sub(u6, d6)) != c6) { ok = 0; }
+    store64(r + 16, c6);
+    var p7 = f64_mul(x20, x01); var q7 = f64_mul(x00, x21);
+    if ((p7 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x20 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x01 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q7 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x00 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x21 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep7 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h20, h01), p7), f64_mul(h20, l01)), f64_mul(l20, h01)),
+      f64_mul(l20, l01));
+    var eq7 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h21), q7), f64_mul(h00, l21)), f64_mul(l00, h21)),
+      f64_mul(l00, l21));
+    var s7 = f64_sub(p7, q7); var z7 = f64_sub(s7, p7); var w7 = f64_sub(ep7, eq7);
+    var u7 = f64_add(f64_sub(f64_sub(p7, f64_sub(s7, z7)), f64_add(q7, z7)), w7);
+    var c7 = f64_add(s7, u7);
+    var d7 = f64_mul(f64_add(u7 & 0x7FFF_FFFF_FFFF_FFFF, w7 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s7, f64_add(u7, d7)) != c7 || f64_add(s7, f64_sub(u7, d7)) != c7) { ok = 0; }
+    store64(r + 40, c7);
+    var p8 = f64_mul(x00, x11); var q8 = f64_mul(x10, x01);
+    if ((p8 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x00 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x11 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    if ((q8 & 0x7FFF_FFFF_FFFF_FFFF) < _M3_FLOOR && (x10 & 0x7FFF_FFFF_FFFF_FFFF) != 0
+      && (x01 & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return 2; }
+    var ep8 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h00, h11), p8), f64_mul(h00, l11)), f64_mul(l00, h11)),
+      f64_mul(l00, l11));
+    var eq8 = f64_add(f64_add(f64_add(f64_sub(f64_mul(h10, h01), q8), f64_mul(h10, l01)), f64_mul(l10, h01)),
+      f64_mul(l10, l01));
+    var s8 = f64_sub(p8, q8); var z8 = f64_sub(s8, p8); var w8 = f64_sub(ep8, eq8);
+    var u8 = f64_add(f64_sub(f64_sub(p8, f64_sub(s8, z8)), f64_add(q8, z8)), w8);
+    var c8 = f64_add(s8, u8);
+    var d8 = f64_mul(f64_add(u8 & 0x7FFF_FFFF_FFFF_FFFF, w8 & 0x7FFF_FFFF_FFFF_FFFF), _M3_W51);
+    if (f64_add(s8, f64_add(u8, d8)) != c8 || f64_add(s8, f64_sub(u8, d8)) != c8) { ok = 0; }
+    store64(r + 64, c8);
+    if (ok == 0) { return 0; }
+    var k = load64(kv + 72);
+    var i = 0;
+    while (i < 9) {
+        var v = load64(r + i * 8);
+        var sh = load64(kv + i * 8) - k;
+        var e = (v & 0x7FFF_FFFF_FFFF_FFFF) >> 52;
+        if (e != 0 && e + sh >= 1) { v = v + (sh << 52); } else { v = _m3_wout(v, sh); }
+        if (sg < 0) { v = v ^ 0x8000000000000000; }
+        store64(r + i * 8, v);
+        i = i + 1;
+    }
+    return 1;
+}
+
+# The columns' half of `_m3_cof_certified`, which the caller tries first (m's entries as
+# loaded, column-major: c0 = (m00, m01, m02) and so on).
+fn _m3_cof_colcert(m00, m01, m02, m10, m11, m12, m20, m21, m22, mx) {
+    var c0 = m00 & 0x7FFF_FFFF_FFFF_FFFF;
+    var t = m01 & 0x7FFF_FFFF_FFFF_FFFF; if (t > c0) { c0 = t; }
+    t = m02 & 0x7FFF_FFFF_FFFF_FFFF; if (t > c0) { c0 = t; }
+    var c1 = m10 & 0x7FFF_FFFF_FFFF_FFFF;
+    t = m11 & 0x7FFF_FFFF_FFFF_FFFF; if (t > c1) { c1 = t; }
+    t = m12 & 0x7FFF_FFFF_FFFF_FFFF; if (t > c1) { c1 = t; }
+    var c2 = m20 & 0x7FFF_FFFF_FFFF_FFFF;
+    t = m21 & 0x7FFF_FFFF_FFFF_FFFF; if (t > c2) { c2 = t; }
+    t = m22 & 0x7FFF_FFFF_FFFF_FFFF; if (t > c2) { c2 = t; }
+    if (f64_le(_m3_top2(c0, c1, c2), f64_mul(mx, _M3_NCERT)) == 1) { return 1; }
+    return 0;
+}
+
+# sign(det) times m's cofactor matrix, each cofactor summed exactly (`_m3_xsum`) and rounded
+# once, scaled by 2^-h where h is the exponent of the largest when that lies above 1023 or
+# below -969 (the range `m3_normal_matrix_cof` keeps), otherwise unscaled. m finite and not
+# all zero. `m3_normal_matrix_cof`'s answer where its certificate fails (3.4.1).
+fn _m3_cof_exact(m, sg) {
+    var dc: i64[38];
+    if (_m3_xload(m, &dc) == 1) { return 0; }
+    var tl: i64[6];
+    var oc: i64[2];
+    var ex: i64[27];
+    var hi = 0 - 100000;
+    var i = 0;
+    while (i < 3) {
+        var j = 0;
+        while (j < 3) {
+            _m3_minor_terms(&tl, 0, i, j, 2);
+            var k = (j * 3 + i) * 24;
+            var sc = _m3_xsum(&dc, &dc + 288, &tl, 2, 2, &oc);
+            store64(&ex + k, sc);
+            store64(&ex + k + 8, load64(&oc));
+            store64(&ex + k + 16, load64(&oc + 8));
+            if (sc != 0) {
+                var e = load64(&oc + 8) + (load64(&oc) >> 52) - 1023;
+                if (e > hi) { hi = e; }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    var sh = 0;
+    if (hi > 1023 || hi < 0 - 969) { sh = 0 - hi; }
+    var r = alloc(MAT3_BYTES);
+    if (r == 0) { return 0; }
+    i = 0;
+    while (i < 9) {
+        var v = 0;
+        var s3 = load64(&ex + i * 24);
+        if (s3 != 0) { v = _m3_ldexp(load64(&ex + i * 24 + 8), load64(&ex + i * 24 + 16) + sh); }
+        if (s3 < 0) { v = v ^ 0x8000000000000000; }
+        if (sg < 0) { v = v ^ 0x8000000000000000; }
+        store64(r + i * 8, v);
+        i = i + 1;
+    }
+    return r;
+}
+
 # The normal matrix of m: sign(det m) * cof(m), the cofactor matrix with its orientation
 # fixed, which is |det m| * m^-T wherever m is invertible. It carries a surface normal
 # n = t1 x t2 to (m t1) x (m t2) times sign(det m): the normal of the image, pointing to the
@@ -792,8 +1431,13 @@ fn _m3_cof_signed(m, sg) {
 # (with det m = 0 the sign is +1), and an m of rank 1 or 0 has the zero matrix, because its
 # image has no normal. Callers renormalise. A NaN or infinite entry propagates.
 # Where an entry overflows, or the largest falls below 2^-969 (products of two entries flushed
-# to the subnormals), the result is the cofactor matrix of m * 2^-e, e the exponent of m's
-# largest entry: the same directions times a power of two.
+# to the subnormals), the result is a power of two times sign(det m) cof(m), the same
+# directions: the cofactor matrix of m * 2^-e (e the exponent of m's largest entry) where that
+# copy's minors are certified, otherwise the exact cofactors, scaled by a power of two only
+# where the largest would leave [2^-969, DBL_MAX] (into [1, 2)). Accuracy (3.4.1): within 17u
+# of the largest entry (u = 2^-53), normwise, where the plain or the compensated minors are
+# certified, otherwise each entry the exact cofactor rounded once. Returns the designed 0 where
+# an allocation is refused.
 #
 # ⛔ 3.4.0 — REPLACES `m3_normal_matrix`, which was `m3_transpose(m3_inverse(m))`: it
 # inherited the inverse's IDENTITY for every singular m (diag(1, 1, 0) kept normals along x,
@@ -811,15 +1455,88 @@ fn _m3_cof_signed(m, sg) {
 # such matrices), turning an outward normal inward; and the expansion behind it inherited the
 # inverse's range defect (29 wrong signs in 4,000 wide-range matrices, -1 for some singular ones).
 # [measured: REV-FB t27.py / t8.py / t8b.py, Fraction determinants, the first 3.4.0 review of lane FB, 2026-10-31]
-# ⚠ The entries themselves are the plain formula's 2x2 minors, each within 2u of its own
-# permanent (|ad| + |bc|): where m is near rank 1 every minor cancels and the directions carry
-# that error (no certificate covers them; the review found 1 of 40,000 transformed normals on the
-# wrong side for near-rank-1 m). And the range rescue holds a cofactor matrix spanning at most
-# about 2^2098: past that its smallest entries flush.
-# [measured: REV-FB t18.py / t18b.py / t8c.py, Fraction cofactors, the first 3.4.0 review of lane FB, 2026-10-31]
+# ⛔ 3.4.1 — THROUGH 3.4.0 THE ENTRIES WERE THE PLAIN FORMULA'S 2x2 MINORS WITH NO CERTIFICATE,
+# each within 2u of its own permanent (|ad| + |bc|): where m is near rank 1 every minor cancels
+# and the directions carried that error (the first 3.4.0 review found 1 of 40,000 transformed
+# normals on the wrong side). On 3,000 matrices, a third near rank 1, the matrix was up to 0.535
+# of its largest entry off (166 past 2^-10), and on 500 near-rank-1 ones scaled anywhere in
+# 2^-1000 .. 2^900, 0.288 (385 past 2^-40).
+# [measured: scratch nm_t.py / nm_t2.py, Fraction cofactors, 3.4.0 and this tree, 2026-10-31; cycc 6.7.18]
+# ⭐ Now the plain minors are kept only where they are certified (`_m3_cof_certified`): the
+# largest product G in any minor at most 8 times the largest computed entry, which puts the
+# matrix within 17u of its largest entry (u = 2^-53), normwise. G is bounded first by the two
+# largest column maxima of m (so R S, a rotation times any scale, passes on the bits), then by
+# the two largest row maxima (S R), then formed. Past that the minors are recomputed with
+# exact products and TwoSum (`_m3_cof_comp`), certified while G <= 2^54 times their largest:
+# within 13u. Where those steps would overflow (an entry at or above 2^997 - 2^970, or a product
+# of splits past DBL_MAX) the same minors are taken on m scaled by powers of two, row and column
+# first and uniformly 2^-28 where that loses bits, and kept only where every entry is proved the
+# exact cofactor's nearest (`_m3_cof_wide`). Each cofactor is summed exactly and rounded once
+# (`_m3_cof_exact`) only beyond those: minors cancelling past 2^54 of G (every m of rank 1 among
+# them, whose plain minors are exactly 0 and whose rescue reaches this; the zero matrix never
+# does, it is returned first), a `_m3_cof_wide` m that neither scaling can hold (under both, a
+# product of two non-zero entries in different rows and columns below 2^-969, or an entry the
+# scaling would round) or whose rounding the bracket cannot pin, and a rescued copy whose largest
+# plain entry falls under 2^-969 or whose own minors are not certified: within half an ulp, plus
+# half a subnormal step below DBL_MIN. On
+# the same 3,000 matrices the largest error is 7.45e-16 of
+# the largest entry, and 7.68e-16 on the scaled 500; random, rotation-times-anisotropic-scale,
+# exactly rank-1 and rank-2 and wide-range matrices keep their maxima. The plain certificate
+# fails on none of 10,000 uniform random matrices.
+# [measured: scratch nm_t.py / nm_t2.py and a certificate count, Fraction cofactors, this tree, 2026-10-31; cycc 6.7.18]
+# ⛔ 3.4.1 REVIEW (M1) — THE FIRST 3.4.1 FORM HAD NO MIDDLE TIER, and an ordinary R1 S R2 (a
+# rotation, a non-uniform scale, a rotation, as a scene graph composes them) whose two largest
+# singular values differ by more than about 20 to 40 failed the plain certificate and paid the
+# exact path: (9.07, 0.21, 0.12) took 2.4 us where 3.4.0 took 91 ns (26x), on answers 3.4.0 had
+# within 12u to 40u. On 1,000 R1 diag(s) R2 per k, s_i = 10^U(-k, k), the plain tier certifies
+# 993 / 796 / 631 / 482 / 353 / 295 for k = 1, 2, 3, 4, 6, 8, and 122 of 1,000 R1 diag(100, 1, 1)
+# R2; every other one is now certified by the compensated tier and none reaches the exact path.
+# Every compensated answer in that sweep and on the 3,000 matrices (3,328 and 997) is the
+# exact cofactors' nearest, entry by entry; the largest error overall is 10.97u (a
+# plain-certified matrix).
+# [measured: scratch nmrun.py (seed 23), Fraction cofactors, a Python emulation of each tier, 2026-10-31; cycc 6.7.18]
+# The range rescue holds a cofactor matrix spanning at most about 2^2098, the double range
+# itself: past that its smallest entries flush under any power of two. Its scaled copy is
+# certified the same way, plain or compensated; the exact path picks its own power of two
+# (the largest entry in [1, 2) where it would leave [2^-969, DBL_MAX]).
 # Cost: the underflow clause, 83 -> 89 ns against integ-snap7 on a random matrix; a singular
 # matrix of tiny entries (the exact sign) 1.12 us -> 972 ns.
 # [measured: scratch misc.bcyr, integ-snap7 and this tree interleaved x 3, 2026-10-31; cycc 6.7.9]
+# 3.4.1 cost, against 3.4.0 (same boot, the binaries interleaved, 6 runs a side): a random matrix
+# 91 -> 107 ns (the column certificate, +18%); the M1 R1 S R2 91 -> 418 ns (the compensated
+# tier, 4.6x; the first 3.4.1 form's exact path took 2.31 us); a near-rank-1 m 0.77 -> 1.09 us
+# (3.4.0 took the exact determinant sign there too, then answered from the plain minors); the
+# exact path (minors cancelling past 2^54, rank 1 included) 0.55 -> 1.57 us for
+# diag(2, 0, 0) and 0.75 -> 2.95 us for a near-rank-1 m whose minors cancel past 2^54.
+# [measured: scratch nmb2.bcyr, 3.4.0, the first 3.4.1 form and this tree interleaved, 2026-10-31; cycc 6.7.18]
+# ⛔ 3.4.1 ROUND-2 REVIEW (S1) — THE COMPENSATED TIER'S OWN SPLITS OVERFLOWED, for an entry at
+# or above 2^997 - 2^970 and for a product within about 2^-25 of DBL_MAX: the minor came out
+# non-finite and was declined, so ordinary non-degenerate m at the top of the range paid the
+# exact path, 50 to 94 times 3.4.0's time, while this text said only degenerate ones did. The
+# review's M1 with its row 0 at 2^998 now takes 558 to 603 ns against 3.4.0's 87 to 94 (6.4x;
+# the first form 7.2 to 7.7 us), R1 S R2 lifted the same way 554 to 597 ns (6.4x; the first form
+# 90x), the products-near-DBL_MAX fixture 603 to 651 ns against 85 to 95 (7.0x; 50x), with the
+# same bits: on 167,287 matrices (the review's families and range constructions, and lifted,
+# overflowing, strongly cancelling and lossy ones) not one answer changes, and every one of the
+# 59,112 that `_m3_cof_wide` keeps is the exact cofactors' nearest (Fraction). The proof is 40
+# to 45 ns of that (514 to 563 ns without it).
+# [measured: scratch nm3.bcyr x 6 interleaved, sweeps, Fraction oracle, 2026-10-31; cycc 6.7.18]
+# ⛔ 3.4.1 ROUND-3 REVIEW (S1) — THAT REPAIR LEFT PART OF ITS CLASS ON THE EXACT PATH: a product of
+# two entries below 2^-913 or an entry m 2^-28 rounds, 92 to 109 times 3.4.0's time, on matrices
+# 3.4.0 could answer right (0.516u on the fixture `lossy_baseok`). `_m3_cof_wide` now tries row and
+# column powers of two after the uniform 2^-28, with no answer moved: of 99,270 matrices of the
+# round-3 families and two adversarial ones (entries not explained by row and column factors)
+# none changes a bit, 6,995 that took the exact path are now certified and equal it entry for
+# entry (Fraction), and 2,452 of the wide tier's still decline. Same boot, 3.4.0 / the last form
+# / this one interleaved, 3 runs x 3 rounds, medians: `lossy_baseok` 112 ns / 10.2 us / 962 ns,
+# the product-lossy ones 95 and 113 ns / 10.2 and 10.6 us / 1.06 and 1.09 us (where 3.4.0 was
+# 8e7 u and 375u off), an entry m 2^-28 rounds 1.93 / 13.2 / 2.78 us.
+# The cost: a wide-tier answer through the uniform pass takes 603 -> 692 ns on row 0 at 2^998
+# and 659 -> 743 on products near DBL_MAX (+13 to +15%, 3.4.0: 94), the exact scalings against a
+# multiplication. What stays on the exact path pays 9.3 to 13.7 us, unchanged, 5 to 7 times 3.4.0:
+# an entry the bracket cannot pin (nearly all of the 2,452; 2,449 in those families), or a product
+# no power-of-two scaling can hold (3).
+# [measured: scratch MAT4-work ab1.log, g1 / g2, py/cmpb.py, load 1.5-3.1, 2026-11-01; cycc 6.7.18]
 #must_use
 public fn m3_normal_matrix_cof(m) {
     var m00 = load64(m);      var m01 = load64(m + 8);  var m02 = load64(m + 16);
@@ -861,7 +1578,26 @@ public fn m3_normal_matrix_cof(m) {
         if (a > mx) { mx = a; }
         i = i + 1;
     }
-    if (mx < 0x7FF0_0000_0000_0000 && mx >= _M3_FLOOR) { return r; }
+    if (mx < 0x7FF0_0000_0000_0000 && mx >= _M3_FLOOR) {
+        # Certified within 17u max|N~| (`_m3_cof_certified`), its column test first, written out
+        # on the entries already loaded (`_m3_cof_colcert` as a call cost 3 to 6 ns more); or
+        # the minors cancelled and are summed exactly (3.4.1).
+        # [measured: scratch fnm.bcyr, the called and the written-out forms, 2026-10-31; cycc 6.7.18]
+        var c0 = m00 & 0x7FFF_FFFF_FFFF_FFFF;
+        var ct = m01 & 0x7FFF_FFFF_FFFF_FFFF; if (ct > c0) { c0 = ct; }
+        ct = m02 & 0x7FFF_FFFF_FFFF_FFFF; if (ct > c0) { c0 = ct; }
+        var c1 = m10 & 0x7FFF_FFFF_FFFF_FFFF;
+        ct = m11 & 0x7FFF_FFFF_FFFF_FFFF; if (ct > c1) { c1 = ct; }
+        ct = m12 & 0x7FFF_FFFF_FFFF_FFFF; if (ct > c1) { c1 = ct; }
+        var c2 = m20 & 0x7FFF_FFFF_FFFF_FFFF;
+        ct = m21 & 0x7FFF_FFFF_FFFF_FFFF; if (ct > c2) { c2 = ct; }
+        ct = m22 & 0x7FFF_FFFF_FFFF_FFFF; if (ct > c2) { c2 = ct; }
+        if (c0 < c1) { ct = c0; c0 = c1; c1 = ct; }
+        if (c1 < c2) { c1 = c2; }
+        if (f64_le(f64_mul(c0, c1), f64_mul(mx, _M3_NCERT)) == 1) { return r; }
+        if (_m3_cof_certified(m, mx, sg, r) == 1) { return r; }
+        return _m3_cof_exact(m, sg);
+    }
     var me = 0;
     i = 0;
     while (i < 9) {
@@ -876,7 +1612,21 @@ public fn m3_normal_matrix_cof(m) {
     if (t == 0) { return 0; }
     i = 0;
     while (i < 9) { store64(t + i * 8, _m3_ldexp(load64(m + i * 8), 0 - e)); i = i + 1; }
-    return _m3_cof_signed(t, sg);
+    var rt = _m3_cof_signed(t, sg);
+    if (rt == 0) { return 0; }
+    var mt = 0;
+    i = 0;
+    while (i < 9) {
+        var at = load64(rt + i * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (at > mt) { mt = at; }
+        i = i + 1;
+    }
+    if (mt >= _M3_FLOOR) {
+        if (_m3_cof_colcert(load64(t), load64(t + 8), load64(t + 16), load64(t + 24), load64(t + 32),
+            load64(t + 40), load64(t + 48), load64(t + 56), load64(t + 64), mt) == 1) { return rt; }
+        if (_m3_cof_certified(t, mt, sg, rt) == 1) { return rt; }
+    }
+    return _m3_cof_exact(m, sg);
 }
 
 # Trace

@@ -212,18 +212,18 @@ fn _geo_jet_miss() {
     # refused one makes the whole miss jet the designed 0. Through 3.3.7 the jet was
     # allocated first and a refused vector was stored into it, so a miss could come back
     # with a 0 where this contract promises a readable zero vector.
-    var z0 = hvec3_new(0, 0, 0);
-    if (z0 == 0) { return 0; }
-    var z1 = hvec3_new(0, 0, 0);
-    if (z1 == 0) { return 0; }
-    var z2 = hvec3_new(0, 0, 0);
-    if (z2 == 0) { return 0; }
-    var z3 = hvec3_new(0, 0, 0);
-    if (z3 == 0) { return 0; }
-    var z4 = hvec3_new(0, 0, 0);
-    if (z4 == 0) { return 0; }
-    var j = alloc(_GJ_BYTES);
+    # (3.4.1: the jet and its five zero vectors are one allocation, 72 + 5 * 24 bytes, where 3.4.0
+    # made six; each vector is still its own HVec3, never shared, and a refusal is still the whole
+    # miss jet's designed 0. jet_plane's bench row is this path: its ray is parallel to the plane.)
+    # [measured: GEO 3.4.1 fb.bcyr jet_plane, 3.4.0 vs this tree, not in-tree, 2026-10-31]
+    var j = alloc(_GJ_BYTES + 120);
     if (j == 0) { return 0; }
+    for (var zi = 0; zi < 15; zi = zi + 1) { store64(j + _GJ_BYTES + zi * 8, 0); }
+    var z0 = j + _GJ_BYTES;
+    var z1 = z0 + 24;
+    var z2 = z0 + 48;
+    var z3 = z0 + 72;
+    var z4 = z0 + 96;
     _GeoJet_set_kind(j, GEO_JET_MISS);
     _GeoJet_set_t(j, 0);
     # A miss still returns READABLE vectors, never null. Callers branch on
@@ -256,12 +256,16 @@ fn _geo_jet_miss() {
 #must_use
 public fn geo_jet_kind(j) { return _GeoJet_kind(j); }
 
+# The hit distance t of the primal the jet was built from; 0 on a miss jet.
 #must_use
 public fn geo_jet_t(j) { return _GeoJet_t(j); }
 
+# dt/d(origin), the jet's own HVec3 (by reference, see above); (0, 0, 0) on a miss jet.
 #must_use
 public fn geo_jet_dorigin(j) { return _GeoJet_dt_do(j); }
 
+# dt/d(direction), the RAW partial for a free direction (see the scaling note in the module
+# header; geo_jet_dt_dd_unit projects it); (0, 0, 0) on a miss jet.
 #must_use
 public fn geo_jet_ddirection(j) { return _GeoJet_dt_dd(j); }
 
@@ -289,6 +293,11 @@ public fn geo_jet_hit(j) {
 # [measured: tests/modules.tcyr "2.10.0 geo_jet_sphere"]
 #must_use
 public fn geo_jet_sphere(ray, sphere) {
+    var mr = GeoSphere_radius(sphere) & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr < 0x0370_0000_0000_0000 && mr != 0) {   # 2^-968: see _geo_jet_sphere_up (3.4.1)
+        var ju = _geo_jet_sphere_up(ray, sphere);
+        if (ju != 1) { return ju; }
+    }
     var t = geo_ray_sphere(ray, sphere);
     if (f64_eq(t, 0) == 1) { return _geo_jet_miss(); }   # +0 or -0: see _geo_jet_miss
     if (f64_lt(f64_abs(t), F64_POS_INF) == 0) { return _geo_jet_miss(); }   # see _geo_jet_miss
@@ -407,14 +416,31 @@ public fn geo_jet_plane(ray, plane) {
     var den = hvec3_dot(n, d);
     var inv = f64_div(F64_ONE, den);
     if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_miss(); }
-    var p = geo_ray_at(ray, t);
-    if (p == 0) { return 0; }
+    # (3.4.1: the hit point on the stack, geo_ray_at's operations, so the same bits and one allocation
+    # fewer.)
+    var o = GeoRay_origin(ray);
+    var p: i64[3];
+    store64(&p, f64_add(HVec3_x(o), f64_mul(HVec3_x(d), t)));
+    store64(&p + 8, f64_add(HVec3_y(o), f64_mul(HVec3_y(d), t)));
+    store64(&p + 16, f64_add(HVec3_z(o), f64_mul(HVec3_z(d), t)));
     var dt_do = hvec3_scale(n, f64_neg(inv));
     if (dt_do == 0) { return 0; }
     var dt_dd = hvec3_scale(dt_do, t);
     if (dt_dd == 0) { return 0; }
-    var sv = hvec3_scale(p, f64_neg(inv));
+    var sv = hvec3_scale(&p, f64_neg(inv));
     if (sv == 0) { return 0; }
+    # ⛔ 3.4.1 — A PARTIAL PAST DBL_MAX IS THE MISS JET, as the sphere, capsule and triangle jets
+    # answer it (AU2-G2-F10): o (0, 0, 1) along (1, 0, -2^-600) meets z = 0 at t = 2^600, right,
+    # and dt/dd_z = dt/dn_x = 2^1200 came back as +Inf in a hit jet. inv is finite here, so dt/ddist
+    # is; dt/do, dt/dd and dt/dn are tested, nine exponent fields in one pass.
+    # [measured: GEO 3.4.1 AU2-G2-F10 repro; fb.bcyr jet_plane_hit, 3.4.0 vs this tree, 2026-10-31]
+    var mf = 0;
+    for (var fi = 0; fi < 3; fi = fi + 1) {
+        mf = mf | ((load64(dt_dd + fi * 8) & 0x7FF0_0000_0000_0000) + 0x0010_0000_0000_0000);
+        mf = mf | ((load64(dt_do + fi * 8) & 0x7FF0_0000_0000_0000) + 0x0010_0000_0000_0000);
+        mf = mf | ((load64(sv + fi * 8) & 0x7FF0_0000_0000_0000) + 0x0010_0000_0000_0000);
+    }
+    if (mf < 0) { return _geo_jet_miss(); }   # (an exponent field of 2047 carries into the sign bit)
 
     var j = alloc(_GJ_BYTES);
     if (j == 0) { return 0; }
@@ -659,6 +685,155 @@ fn _geo_jet_diff(o, c, oc, lo) {
         store64(lo + i * 8, f64_add(f64_sub(a, f64_sub(sm, bb)), f64_sub(b, bb)));
     }
     return 0;
+}
+
+# x * 2^e with one rounding, for a finite x and any integer e (3.4.1): geo.cyr's _geo_ldexp, which
+# modules cannot share (no module reaches another's `_` name).
+fn _geo_jet_ldexp(x, e) {
+    if (e > 1023) {
+        x = f64_mul(x, 0x7FE0_0000_0000_0000);   # 2^1023
+        e = e - 1023;
+        if (e > 1023) {
+            x = f64_mul(x, 0x7FE0_0000_0000_0000);
+            e = e - 1023;
+        }
+    }
+    if (e < 0 - 1022) {
+        var ex = ((x >> 52) & 0x7FF) - 1023;
+        if (ex == 1024) { return x; }
+        if (ex > 0) {
+            x = f64_mul(x, (1023 - ex) << 52);
+            e = e + ex;
+            ex = 0;
+        }
+        var k = 0 - 1022 - ex;
+        if (k > 0) { k = 0; }
+        if (k < e) { k = e; }
+        x = f64_mul(x, (1023 + k) << 52);
+        e = e - k;
+        if (e < 0 - 1022) {
+            if (e < 0 - 1074) { e = 0 - 1074; }
+            return f64_mul(x, 1 << (e + 1074));
+        }
+    }
+    return f64_mul(x, (1023 + e) << 52);
+}
+
+# (g . ab) / (ab . ab) where ab . ab flushes or overflows (3.4.1, AU2-G2-F8): the barrel weight of a
+# capsule hit. Through 3.4.0 it was the plain quotient, so a capsule 2^-550 across (or 2^512) got
+# 0 / 0 or x / Inf and answered its miss jet, or a wrong one, for a barrel hit the primal answered:
+# hit jets for scenes 2^-536..2^512 only. ab and g are each taken near 1 by a power of two, the
+# quotient formed there and multiplied back exactly (_geo_ldexp). A non-finite input keeps the
+# plain quotient.
+# [measured: GEO 3.4.1 jet_sweep.py, 22600 capsule jets x2 seeds, 3.4.0 vs this tree, not in-tree, 2026-10-31]
+fn _geo_jet_sfrac(g, ab) {
+    if (_geo_jet_finite3(g) + _geo_jet_finite3(ab) != 2) {
+        return f64_div(hvec3_dot(g, ab), hvec3_dot(ab, ab));
+    }
+    var sa = _geo_jet_pow2_for(_geo_jet_absmax_bits(ab));
+    var sg = _geo_jet_pow2_for(_geo_jet_absmax_bits(g));
+    var abs_: i64[3];
+    var gs: i64[3];
+    for (var i = 0; i < 3; i = i + 1) {
+        store64(&abs_ + i * 8, f64_mul(load64(ab + i * 8), sa));
+        store64(&gs + i * 8, f64_mul(load64(g + i * 8), sg));
+    }
+    return _geo_jet_ldexp(f64_div(hvec3_dot(&gs, &abs_), hvec3_dot(&abs_, &abs_)), (sa >> 52) - (sg >> 52));
+}
+
+# The jet of a sphere whose radius is below 2^-968 (3.4.1, AU2-G2-F9), formed on a copy at unit
+# size: origin, centre and radius each multiplied by the power of two s that takes r near 1. Below
+# 2^-969 the hit point's rounding to the subnormal grid (t itself is rounded there) is a large part
+# of g = p - c, and dt/do came back 2.9e-3 relative off with t exact. Every partial but dt/dd is of
+# degree 0 in the scene's size, so the copy's are the answer; t and dt/dd = t dt/do are taken back
+# from the primal's own t. ⚠ THE COPY IS SCALED, NOT TRANSLATED (review RV-GEO M2): multiplying by
+# s is exact, so the copy is the same scene, and the jet's own arithmetic forms o - c there with
+# whatever care it takes at unit size; a copy translated first (o - c, then scaled) carried the
+# rounding of o - c, which a thin capsule amplifies by |ab| / r. 1 (the caller goes on) where the
+# copy cannot be made exactly (a non-finite input, a coordinate that overflows at the copy's
+# scale) or where its primal is not a hit: the shipped arithmetic answers those. 0 when an
+# allocation is refused.
+# [measured: GEO2 3.4.1 jets.py (RV-GEO), 3 seeds, and jet_subcap.py, 3.4.0 vs this tree, 2026-10-31]
+fn _geo_jet_sphere_up(ray, sphere) {
+    var o = GeoRay_origin(ray);
+    var c = GeoSphere_center(sphere);
+    var r = GeoSphere_radius(sphere);
+    if (_geo_jet_finite3(o) + _geo_jet_finite3(c) + _geo_jet_finite3(GeoRay_direction(ray)) != 3) { return 1; }
+    var t = geo_ray_sphere(ray, sphere);
+    if (f64_eq(t, 0) == 1 || f64_lt(f64_abs(t), F64_POS_INF) == 0) { return 1; }
+    var s = _geo_jet_pow2_for((r & 0x7FFF_FFFF_FFFF_FFFF));
+    var os: i64[3];
+    var cs: i64[3];
+    for (var i = 0; i < 3; i = i + 1) {
+        store64(&os + i * 8, f64_mul(load64(o + i * 8), s));
+        store64(&cs + i * 8, f64_mul(load64(c + i * 8), s));
+    }
+    if (_geo_jet_finite3(&os) + _geo_jet_finite3(&cs) != 2) { return 1; }
+    var rc[16];
+    var sc[16];
+    store64(&rc, &os);
+    store64(&rc + 8, GeoRay_direction(ray));
+    store64(&sc, &cs);
+    store64(&sc + 8, f64_mul(r, s));
+    var j = geo_jet_sphere(&rc, &sc);
+    if (j == 0) { return 0; }
+    if (_GeoJet_kind(j) != GEO_JET_SPHERE) { return 1; }
+    return _geo_jet_retime(j, t);
+}
+
+# The capsule's _geo_jet_sphere_up (3.4.1): origin, start, end and radius each multiplied by the
+# power of two k that takes the larger of |e - s| and r near 1 (exact: the copy is the same scene),
+# so that the copy's radius is normal; the copy's branch must be the primal's.
+fn _geo_jet_capsule_up(ray, capsule) {
+    var o = GeoRay_origin(ray);
+    var a = GeoCapsule_start(capsule);
+    var b = GeoCapsule_end(capsule);
+    var r = GeoCapsule_radius(capsule);
+    var nfin = _geo_jet_finite3(o) + _geo_jet_finite3(a) + _geo_jet_finite3(b);
+    if (nfin + _geo_jet_finite3(GeoRay_direction(ray)) != 4) { return 1; }
+    var ob: i64[2];
+    var t = geo_ray_capsule_branch(ray, capsule, &ob);
+    if (f64_eq(t, 0) == 1 || f64_lt(f64_abs(t), F64_POS_INF) == 0) { return 1; }
+    var ab: i64[3];
+    for (var i = 0; i < 3; i = i + 1) {
+        store64(&ab + i * 8, f64_sub(load64(b + i * 8), load64(a + i * 8)));
+    }
+    var m = _geo_jet_absmax_bits(&ab);
+    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > m) { m = mr; }
+    var s = _geo_jet_pow2_for(m);
+    if ((f64_mul(r, s) & 0x7FFF_FFFF_FFFF_FFFF) < 0x0370_0000_0000_0000) { return 1; }   # (still tiny: no gain)
+    var os: i64[3];
+    var as_: i64[3];
+    var bs: i64[3];
+    for (var k = 0; k < 3; k = k + 1) {
+        store64(&os + k * 8, f64_mul(load64(o + k * 8), s));
+        store64(&as_ + k * 8, f64_mul(load64(a + k * 8), s));
+        store64(&bs + k * 8, f64_mul(load64(b + k * 8), s));
+    }
+    if (_geo_jet_finite3(&os) + _geo_jet_finite3(&as_) + _geo_jet_finite3(&bs) != 3) { return 1; }
+    var rc[16];
+    var cc[24];
+    store64(&rc, &os);
+    store64(&rc + 8, GeoRay_direction(ray));
+    store64(&cc, &as_);
+    store64(&cc + 8, &bs);
+    store64(&cc + 16, f64_mul(r, s));
+    var j = geo_jet_capsule(&rc, &cc);
+    if (j == 0) { return 0; }
+    if (_GeoJet_kind(j) != GEO_JET_CAPSULE || _GeoJet_face(j) != load64(&ob)) { return 1; }
+    return _geo_jet_retime(j, t);
+}
+
+# The jet j with t replaced and dt/dd = t dt/do formed again from it (3.4.1, the up-scaled jets).
+fn _geo_jet_retime(j, t) {
+    _GeoJet_set_t(j, t);
+    var dd = _GeoJet_dt_dd(j);
+    var dn = _GeoJet_dt_do(j);
+    HVec3_set_x(dd, f64_mul(HVec3_x(dn), t));
+    HVec3_set_y(dd, f64_mul(HVec3_y(dn), t));
+    HVec3_set_z(dd, f64_mul(HVec3_z(dn), t));
+    return j;
 }
 
 # 1 when p - c, formed from p = o + t d, may be mostly its own rounding against r (3.3.7):
@@ -1059,9 +1234,10 @@ public fn geo_jet_aabb(ray, aabb) {
 # ONE local axis, not all three. geo_obb_axes rotates all three unit vectors and
 # allocates a 24-byte array; the jet needs only the selected axis, and this is
 # bit-identical to the entry geo_obb_axes would have written because it is the
-# same call. Measured, bench_batch(2000, 200), mean of three runs:
-# jet_obb 1.083 us -> 872 ns, -19.5%, which takes the jet from 2.2x its primal
-# to 1.8x for all twelve partials.
+# same call. 2.10.1 measured it at 1.083 us -> 872 ns (-19.5%) on a jet of twelve partials; that
+# configuration predates 2.10.2's rotation partial, and the jet carries fifteen now. The 3.4.0
+# rows read jet_obb 571 ns against ray_obb 281 ns, 2.0x its primal (3.4.1: this comment still
+# quoted the 2.10.1 figures as current).
 # [measured: bench-history.csv jet_obb]
 fn _geo_jet_obb_axis(obb, k) {
     var q = GeoObb_rotation(obb);
@@ -1126,7 +1302,11 @@ fn _geo_jet_obb_axis(obb, k) {
 public fn geo_jet_obb(ray, obb) {
     var out = alloc(GEO_FACE_OUT_BYTES);
     if (out == 0) { return 0; }
+    # geo_ray_obb_face's NaN for a refused rotation comes before it writes `out`, and only then
+    # is this word left: the designed 0, where a NaN from a NaN input is the miss jet (3.4.1).
+    store64(out, 0 - 1000);
     var t = geo_ray_obb_face(ray, obb, out);
+    if (load64(out) == 0 - 1000) { return 0; }
     if (f64_eq(t, 0) == 1) { return _geo_jet_miss(); }   # +0 or -0: see _geo_jet_miss
     if (f64_lt(f64_abs(t), F64_POS_INF) == 0) { return _geo_jet_miss(); }   # see _geo_jet_miss
 
@@ -1251,6 +1431,11 @@ fn _geo_jet_cap_axis(capsule, ax) {
 # [measured: tests/modules.tcyr "2.10.1 geo_jet_capsule"]
 #must_use
 public fn geo_jet_capsule(ray, capsule) {
+    var mcr = GeoCapsule_radius(capsule) & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mcr < 0x0370_0000_0000_0000 && mcr != 0) {   # 2^-968: see _geo_jet_sphere_up (3.4.1)
+        var ju = _geo_jet_capsule_up(ray, capsule);
+        if (ju != 1) { return ju; }
+    }
     var out = alloc(GEO_FACE_OUT_BYTES);
     if (out == 0) { return 0; }
     var t = geo_ray_capsule_branch(ray, capsule, out);
@@ -1312,7 +1497,11 @@ public fn geo_jet_capsule(ray, capsule) {
     if (branch == GEO_CAP_CYLINDER) {
         var ab = hvec3_sub(b, a);
         if (ab == 0) { return 0; }
-        var sfrac = f64_div(hvec3_dot(g, ab), hvec3_dot(ab, ab));
+        var abab = hvec3_dot(ab, ab);
+        var sfrac = 0;
+        if ((abab & 0x7FFF_FFFF_FFFF_FFFF) < 0x0370_0000_0000_0000 || abab >= 0x7FF0_0000_0000_0000) {
+            sfrac = _geo_jet_sfrac(g, ab);   # (3.4.1: |ab|^2 below 2^-968 or past DBL_MAX)
+        } else { sfrac = f64_div(hvec3_dot(g, ab), abab); }
         var abs_ = hvec3_scale(ab, sfrac);
         if (abs_ == 0) { return 0; }
         g = hvec3_sub(g, abs_);
@@ -1441,42 +1630,53 @@ public fn geo_jet_capsule(ray, capsule) {
 # point of the tag: `sv` holds dt/d(center) on a sphere jet and dt/d(normal) on
 # a plane jet, and those are different quantities in the same slot.
 
+# dt/d(center) of a sphere jet (an HVec3, by reference); 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_sphere_dcenter(j) {
     if (_GeoJet_kind(j) != GEO_JET_SPHERE) { return 0; }
     return _GeoJet_sv(j);
 }
 
+# dt/d(radius) of a sphere jet, an f64; 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_sphere_dradius(j) {
     if (_GeoJet_kind(j) != GEO_JET_SPHERE) { return 0; }
     return _GeoJet_ss(j);
 }
 
+# dt/d(normal) of a plane jet (an HVec3, by reference), the partial with respect to the stored
+# normal treated as a free vector; 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_plane_dnormal(j) {
     if (_GeoJet_kind(j) != GEO_JET_PLANE) { return 0; }
     return _GeoJet_sv(j);
 }
 
+# dt/d(distance) of a plane jet, an f64 (1 / (n . d)); 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_plane_ddistance(j) {
     if (_GeoJet_kind(j) != GEO_JET_PLANE) { return 0; }
     return _GeoJet_ss(j);
 }
 
+# dt/d(min corner) of an AABB jet (an HVec3, by reference): non-zero only on the axis of the
+# face hit when that face is a min plane; 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_aabb_dmin(j) {
     if (_GeoJet_kind(j) != GEO_JET_AABB) { return 0; }
     return _GeoJet_sv(j);
 }
 
+# dt/d(max corner) of an AABB jet (an HVec3, by reference): non-zero only on the axis of the
+# face hit when that face is a max plane; 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_aabb_dmax(j) {
     if (_GeoJet_kind(j) != GEO_JET_AABB) { return 0; }
     return _GeoJet_sv1(j);
 }
 
+# dt/d(center) of an OBB jet (an HVec3, by reference, world frame); 0 for any other kind, a miss
+# included.
 #must_use
 public fn geo_jet_obb_dcenter(j) {
     if (_GeoJet_kind(j) != GEO_JET_OBB) { return 0; }
@@ -1491,18 +1691,21 @@ public fn geo_jet_obb_dhalf_extents(j) {
     return _GeoJet_sv1(j);
 }
 
+# dt/d(start) of a capsule jet (an HVec3, by reference); 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_capsule_dstart(j) {
     if (_GeoJet_kind(j) != GEO_JET_CAPSULE) { return 0; }
     return _GeoJet_sv(j);
 }
 
+# dt/d(end) of a capsule jet (an HVec3, by reference); 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_capsule_dend(j) {
     if (_GeoJet_kind(j) != GEO_JET_CAPSULE) { return 0; }
     return _GeoJet_sv1(j);
 }
 
+# dt/d(radius) of a capsule jet, an f64; 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_capsule_dradius(j) {
     if (_GeoJet_kind(j) != GEO_JET_CAPSULE) { return 0; }
@@ -1528,18 +1731,21 @@ public fn geo_jet_face(j) {
     return _GeoJet_face(j);
 }
 
+# dt/d(v0) of a triangle jet (an HVec3, by reference); 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_tri_dv0(j) {
     if (_GeoJet_kind(j) != GEO_JET_TRIANGLE) { return 0; }
     return _GeoJet_sv(j);
 }
 
+# dt/d(v1) of a triangle jet (an HVec3, by reference); 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_tri_dv1(j) {
     if (_GeoJet_kind(j) != GEO_JET_TRIANGLE) { return 0; }
     return _GeoJet_sv1(j);
 }
 
+# dt/d(v2) of a triangle jet (an HVec3, by reference); 0 for any other kind, a miss included.
 #must_use
 public fn geo_jet_tri_dv2(j) {
     if (_GeoJet_kind(j) != GEO_JET_TRIANGLE) { return 0; }
@@ -1563,7 +1769,9 @@ public fn geo_jet_dt_dd_unit(v, dir) {
 #     dp = do + t*dd + d*(dt/do . do + dt/dd . dd)
 #
 # which is the chain rule through geo_ray_at. Returned for a caller that wants
-# the surface point's motion rather than the parameter's.
+# the surface point's motion rather than the parameter's. A new HVec3, or 0 when an allocation
+# is refused. ON A MISS JET there is no hit point and the answer is (0, 0, 0), as the miss jet's
+# own partials are: test geo_jet_hit first (3.4.1: this was not stated).
 #must_use
 public fn geo_jet_dpoint(j, ray, d_origin, d_dir) {
     if (geo_jet_hit(j) == 0) { return hvec3_new(0, 0, 0); }

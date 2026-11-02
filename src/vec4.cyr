@@ -20,6 +20,9 @@
 #derive(accessors)
 public struct HVec4 { x; y; z; w; }
 
+# A new HVec4 (x, y, z, w): 32 bytes from the heap, the components stored as given. Returns
+# the designed 0 where the allocation is refused (3.4.0); so does every function in this file
+# that returns an HVec4 or HVec3.
 #must_use
 public fn hvec4_new(x, y, z, w) {
     var v = alloc(sizeof(HVec4));
@@ -31,18 +34,27 @@ public fn hvec4_new(x, y, z, w) {
     return v;
 }
 
+# A new HVec4 holding (+0, +0, +0, +0), each component the all-zero bit pattern. Exact, no
+# input to refuse; the designed 0 where the allocation is refused, as hvec4_new.
 #must_use
 public fn hvec4_zero() { return hvec4_new(0, 0, 0, 0); }
+# A new HVec4 holding (1.0, 1.0, 1.0, 1.0), exact, with no input to refuse; the designed 0 where
+# the allocation is refused, as hvec4_new.
 #must_use
 public fn hvec4_one() { return hvec4_new(F64_ONE, F64_ONE, F64_ONE, F64_ONE); }
+# A new HVec4 holding (s, s, s, s). Any 64-bit s: it is stored as given, with no arithmetic, so a
+# NaN, an infinity or a -0 is copied bit for bit. The designed 0 where the allocation is refused,
+# as hvec4_new.
 #must_use
 public fn hvec4_splat(s) { return hvec4_new(s, s, s, s); }
 
+# (v.x, v.y, v.z, w): an HVec3 extended by w (w = 1 a point, w = 0 a direction), bits copied.
 #must_use
 public fn hvec4_from_vec3(v, w) {
     return hvec4_new(HVec3_x(v), HVec3_y(v), HVec3_z(v), w);
 }
 
+# (x, y, z) of v as a new HVec3, w dropped (no division by w), bits copied.
 #must_use
 public fn hvec4_xyz(v) {
     return hvec3_new(HVec4_x(v), HVec4_y(v), HVec4_z(v));
@@ -53,6 +65,8 @@ public fn hvec4_xyz(v) {
 # ================================================================
 
 # SIMD: packed add/sub over all 4 lanes (n=4, no over-read).
+# a + b, componentwise, each component one IEEE addition, correctly rounded, the same bits on
+# x86 and aarch64.
 #must_use
 public fn hvec4_add(a, b) {
     var r = alloc(sizeof(HVec4));
@@ -61,6 +75,7 @@ public fn hvec4_add(a, b) {
     return r;
 }
 
+# a - b, componentwise, each component correctly rounded.
 #must_use
 public fn hvec4_sub(a, b) {
     var r = alloc(sizeof(HVec4));
@@ -70,6 +85,7 @@ public fn hvec4_sub(a, b) {
 }
 
 # SIMD: packed scale by scalar s (f64 bit pattern) over 4 lanes.
+# v times s, each component correctly rounded.
 #must_use
 public fn hvec4_scale(v, s) {
     var r = alloc(sizeof(HVec4));
@@ -78,6 +94,7 @@ public fn hvec4_scale(v, s) {
     return r;
 }
 
+# -v, each component's sign flipped (`f64_neg`; below cycc 6.6.8 it gave +0 for +0).
 #must_use
 public fn hvec4_neg(v) {
     return hvec4_new(f64_neg(HVec4_x(v)),
@@ -91,11 +108,28 @@ public fn hvec4_neg(v) {
 # ================================================================
 
 # SIMD: packed dot over all 4 lanes (no alloc — the biggest win).
+#
+# a . b, summed as the packed dot sums it: on x86 (ax bx + az bz) + (ay by + aw bw), each
+# product and each sum rounded (within 3u of the sum of |a_i b_i| to first order, u = 2^-53).
+# ⚠ NOT BIT-IDENTICAL ACROSS TARGETS: on aarch64 `f64v_dot` accumulates with a fused `fmla`,
+# so each lane's second product is fused into its sum, fma(az, bz, ax bx) rounded once where
+# x86 rounds the product first; the same bound holds and the last bits can differ. (CLAUDE.md's
+# Language rule names `f64v_axpy` / `f64v_fmadd`; this is the same mechanism in `f64v_dot`,
+# from the 6.7.18 emitters, and no test here runs on aarch64.) `hvec4_length_sq` and
+# `hvec4_length` inherit it.
+# ⚠ A ZERO IS +0 WHEREVER EVERY PRODUCT IS A ZERO, -0 included: `f64v_dot`'s accumulator
+# starts at +0 (BLAS ddot's convention), so (-0, -0, -0, -0) . (1, 1, 1, 1) is 0x0 where the
+# IEEE sum of the products is -0. Documented, not changed (3.4.1): the fix cost 8 to 11% on the
+# dot rows; vec3.cyr's `hvec3_dot` has the reasons.
+# [measured: scratch flerp.bcyr and tests/hisab.bcyr, 3.4.0 and the fixed form, 2026-10-31; cycc 6.7.18]
 #must_use
 public fn hvec4_dot(a, b) {
     return f64v_dot(a, b, 4);
 }
 
+# |v|^2 (`hvec4_dot(v, v)`, its summation order and its aarch64 caveat): +Inf once a square
+# passes DBL_MAX (|component| >= 2^512), subnormal and losing bits once every component is
+# below 2^-511; use `hvec4_length` for the magnitude across the whole range.
 #must_use
 public fn hvec4_length_sq(v) { return hvec4_dot(v, v); }
 fn _hvec4_len_scaled(v) {
@@ -148,6 +182,11 @@ public fn hvec4_length(v) {
     return f64_sqrt(ls);
 }
 
+# v / |v|, the unit vector along v, for every finite non-zero v from the subnormals to DBL_MAX
+# (the scaled copies below; the comment has the sample maxima, about 2 ulp per component). The
+# zero vector gives the zero vector, a sentinel with |v| = 0 (it has no direction). A NaN
+# component gives NaN components; an infinite one gives NaN in its own slot and zeros in the
+# finite ones. Returns the designed 0 where an allocation is refused.
 #must_use
 public fn hvec4_normalize(v) {
     var len = hvec4_length(v);

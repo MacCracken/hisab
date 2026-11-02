@@ -30,6 +30,12 @@ var _ODE_F64_FIVE     = 0x4014000000000000;          # 5.0
 # state, and the margin below which the slope is not resolved from 0.
 var _ODE_F64_2_POW_M26 = 0x3E50000000000000;         # 2^-26
 var _ODE_F64_2_POW_M24 = 0x3E70000000000000;         # 2^-24
+# The continuation of a failed implicit step (_ode_continue): a corrector's point is accepted
+# once its last update is a 1024th of the increment's move; the contraction the increments aim
+# for; the midpoint test's accuracy margin.
+var _ODE_F64_2_POW_M10 = 0x3F50000000000000;         # 2^-10
+var _ODE_F64_QUARTER   = 0x3FD0000000000000;         # 0.25
+var _ODE_F64_EIGHT     = 0x4020000000000000;         # 8.0
 
 # Safety factor for adaptive step control: 0.9
 var _ODE_SAFETY       = 0x3FECCCCCCCCCCCCD;          # 0.9
@@ -43,6 +49,16 @@ var _ODE_EXP_NEG_0P2  = 0xBFC999999999999A;         # -0.2
 var _ODE_MAX_STEPS    = 100000;
 # Newton updates per BDF step (_ode_bdf_newton): 50, as ode_bdf2 and ode_bdf always took.
 enum _OdeBdf { _ODE_BDF_NEWTON = 50; }
+# Chord updates per continuation increment (_ode_continue): past six an increment is too long.
+# Its final certificate (_ode_on_branch): the cells it cuts the whole move into, one sample in each
+# but the first; the multiplier that places a sample off its cell's edge, 2^16 / phi; and the
+# fixed-point unit of a sample's position.
+enum _OdeCont {
+    _ODE_CONT_KMAX = 6;
+    _ODE_CONT_SCAN = 64;
+    _ODE_CONT_GOLD = 40503;
+    _ODE_CONT_TAU = 0x4160000000000000;        # 2^23
+}
 
 # ================================================================
 # Dormand-Prince RK4(5) Butcher tableau coefficients (f64 hex)
@@ -242,24 +258,64 @@ public fn ode_dopri45(f, t, y, dt, out_y, out_err) {
     return Ok(0);
 }
 
-# Full DOPRI45 trajectory with adaptive stepping (scalar ODE).
+# 1 when a push onto the caller's vec v would need a doubling past VEC_CAP_MAX, which ends the
+# process (vec_push_a's "capacity overflow"), read off its length and capacity (3.4.1).
+fn _ode_full(v) {
+    if (load64(v + 8) < load64(v + 16)) { return 0; }
+    if (load64(v + 16) > VEC_CAP_MAX / 2) { return 1; }
+    return 0;
+}
+
+# Full DOPRI45 trajectory with adaptive stepping (scalar ODE), from t0 to tf.
 # f: function pointer, fncall2(f, t, y) -> dy/dt
-# t0: initial time (f64)
-# y0: initial state (f64)
-# tf: final time (f64)
-# dt0: initial step size (f64)
-# tol: error tolerance (f64)
-# out_ts: vec -- time values pushed here
-# out_ys: vec -- state values pushed here
-# Returns: Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if max steps exceeded
+# t0: initial time (f64), y0: initial state (f64)
+# tf: final time (f64), above or below t0: the run steps toward it, backward in time when
+#     tf < t0; tf = t0 is Ok with the one initial point.
+# dt0: initial step size (f64), a magnitude: its sign is ignored, and the steps point from
+#     t0 toward tf (MATLAB's and SciPy's convention for an initial step).
+# tol: error tolerance (f64) >= 0, mixed absolute / relative: a step is accepted when its
+#     error estimate is at most max(tol, tol |y_new|). tol = 0 accepts only an exact step
+#     (error estimate 0), and +Inf every step whose estimate is a number.
+# out_ts: vec -- time values pushed here, out_ys: vec -- state values pushed here (the
+#     initial point first, then every accepted step; on Ok the last time is tf exactly: the step
+#     that covers the remaining span is recorded at tf, 3.4.1 review; the y there is the
+#     integration to t + (tf - t), which can differ from tf by an ulp of it).
+# Returns: Ok(0) on reaching tf; Err(HSB_ERR_INVALID_INPUT) for tol < 0 or NaN, or a t0,
+# tf or dt0 that is NaN or infinite (t0 and tf) before anything is pushed or f is called;
+# Err(HSB_ERR_NO_CONVERGENCE) when the step can no longer move t (dt0 = 0 at the first
+# step, or a step shrunk below t's spacing) or after _ODE_MAX_STEPS steps; Err(HSB_ERR_ALLOC) when a
+# vec cannot grow. On the last two the vecs hold the points accepted so far.
+#
+# ⛔ 3.4.1 — THREE RUNS THAT DID NOT INTEGRATE RETURNED Ok (roadmap [3.4.1], AU2-G4-F3, F4, F5).
+# (1) A negative, NaN or -Inf tol made the scale max(tol, tol |y|) negative or NaN, and every
+# error ratio passed `err_norm > 1` as false: y' = -10y over [0, 1], dt0 0.1, tol -1e-8, took
+# every step unchecked and returned y(1) = 0x4030A0FA309355A0 (16.63; exact e^-10). Refused
+# now. (2) A NaN error estimate was accepted the same way: y' = -sqrt(y) from 1 to t = 1.9 with
+# dt0 1.9 overshoots the domain inside the step and returned a NaN trajectory with Ok. A step
+# whose estimate is NaN is rejected now, and shrunk by the controller's floor 0.2: the run
+# reaches y(1.9) near the exact 0.0025. (3) tf < t0 returned Ok with the single initial point,
+# though the solution exists there (y' = y from y(1) = 1 has y(0) = e^-1); it integrates
+# backward now. So does a negative dt0 with tf > t0, which walked AWAY from tf for 100,000
+# steps before its NO_CONVERGENCE: dt0 is the initial step's size, and the direction is
+# tf's. For tf > t0, tol > 0 and dt0 > 0 every operation is 3.4.0's, bit for bit.
+# [measured: tests/edge_cases.tcyr, group "3.4.1: ode_dopri45_trajectory integrates or refuses"]
 #must_use
 public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
+    if (f64_lt(tol, 0) == 1 || f64_eq(tol, tol) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_lt(f64_abs(t0), F64_POS_INF) == 0 || f64_lt(f64_abs(tf), F64_POS_INF) == 0) {
+        return Err(HSB_ERR_INVALID_INPUT);
+    }
+    if (f64_eq(dt0, dt0) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var t = t0;
     var y = y0;
-    var h = dt0;
+    var back = f64_lt(tf, t0);              # 1: integrate backward in time
+    var h = f64_abs(dt0);
+    if (back == 1) { h = f64_neg(h); }
 
-    vec_push(out_ts, t);
-    vec_push(out_ys, y);
+    var va = default_alloc();
+    if (_ode_full(out_ts) == 1 || _ode_full(out_ys) == 1) { return Err(HSB_ERR_ALLOC); }
+    if (vec_push_a(va, out_ts, t) < 0) { return Err(HSB_ERR_ALLOC); }
+    if (vec_push_a(va, out_ys, y) < 0) { return Err(HSB_ERR_ALLOC); }
 
     # ⛔ 3.4.0 — TWO UNCHECKED alloc(8)s, ONE PAIR PER CALL: a refused allocation made
     # ode_dopri45 store to address 0, and every call left 16 bytes on the bump heap. The
@@ -275,15 +331,21 @@ public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
         # span returned rc = 0 and a plausible SHORT trajectory, having silently
         # stopped early. Arrival is not a question of tolerance: it is whether any
         # span remains at all, and `<= 0` also subsumes the overshoot test below it.
-        if (f64_le(f64_sub(tf, t), 0) == 1) {
-            return Ok(0);
-        }
-
-        # Clamp step to not overshoot tf
+        # (Backward, the span is at most 0 and arrival is `>= 0`.)
         var remaining = f64_sub(tf, t);
-        if (f64_gt(h, remaining) == 1) {
-            h = remaining;
+        if (back == 0) {
+            if (f64_le(remaining, 0) == 1) { return Ok(0); }
+            # Clamp step to not overshoot tf
+            if (f64_gt(h, remaining) == 1) { h = remaining; }
+        } else {
+            if (f64_le(0, remaining) == 1) { return Ok(0); }
+            if (f64_lt(h, remaining) == 1) { h = remaining; }
         }
+        # The step that reaches tf lands on it: t + (tf - t) is rounded twice and can miss tf by
+        # an ulp either way (3.4.1 review, S5), so an accepted step of exactly the remaining span
+        # sets t = tf.
+        var to_tf = 0;
+        if (h == remaining) { to_tf = 1; }
         # ⭐ With arrival now testing `<= 0`, the loop needs the one thing the old
         # tolerance was accidentally providing: a NON-ADVANCEMENT check. If the
         # step is too small to move `t` at all, no threshold can say so — only the
@@ -309,20 +371,25 @@ public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
             scale = tol_scaled;
         }
         var err_norm = f64_div(err, scale);
+        # An exact step (err = 0) meets every tol >= 0, tol = 0 too, where err / scale is 0 / 0.
+        if (f64_eq(err, 0) == 1) { err_norm = 0; }
 
-        if (f64_gt(err_norm, _ODE_F64_ONE) == 1) {
-            # Reject step -- shrink h
+        # `<= 1` is false for a NaN ratio, so a NaN estimate is a rejection (3.4.1).
+        if (f64_le(err_norm, _ODE_F64_ONE) == 0) {
+            # Reject step -- shrink h (by the floor 0.2 when the estimate says nothing)
             var factor = f64_mul(_ODE_SAFETY, ganita_f64_pow(err_norm, _ODE_EXP_NEG_0P2));
-            if (f64_lt(factor, _ODE_MIN_FACTOR) == 1) {
+            if (f64_lt(factor, _ODE_MIN_FACTOR) == 1 || f64_eq(factor, factor) == 0) {
                 factor = _ODE_MIN_FACTOR;
             }
             h = f64_mul(h, factor);
         } else {
             # Accept step
             t = f64_add(t, h);
+            if (to_tf == 1) { t = tf; }
             y = y_new;
-            vec_push(out_ts, t);
-            vec_push(out_ys, y);
+            if (_ode_full(out_ts) == 1 || _ode_full(out_ys) == 1) { return Err(HSB_ERR_ALLOC); }
+            if (vec_push_a(va, out_ts, t) < 0) { return Err(HSB_ERR_ALLOC); }
+            if (vec_push_a(va, out_ys, y) < 0) { return Err(HSB_ERR_ALLOC); }
 
             # Grow h
             var factor = _ODE_MAX_FACTOR;
@@ -356,12 +423,27 @@ public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
 # tol: Newton convergence tolerance (f64), on the residual |g(z)|
 # max_newton: max Newton updates (integer)
 # out: pointer, y_new (f64) written here on success
-# Returns: Ok(0) when an iterate's residual |g(z)| is below tol (the forward-Euler
-# predictor is tested first); Err(HSB_ERR_NO_CONVERGENCE) when max_newton updates do
-# not get there; Err(HSB_ERR_SINGULAR_MATRIX) when g'(z) is not resolved from 0
-# (_ode_newton_gp: the step's equation is singular and no Newton step can be taken); `out`
-# untouched on both; Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN (no residual meets it)
-# or max_newton < 0, before f is called.
+# Returns: Ok(0) when an iterate's residual |g(z)| is below tol: first Newton's, 3.4.0's to
+# the bit (the forward-Euler predictor is tested first); where max_newton updates do not get
+# there, the step's own continuation (_ode_continue: the root of g reached from z = y as dt
+# grows from 0, with at most max_newton increments, none when max_newton is 0).
+# Err(HSB_ERR_NO_CONVERGENCE) or Err(HSB_ERR_SINGULAR_MATRIX) when both fail, with Newton's
+# code (SINGULAR_MATRIX: g'(z) was not resolved from 0 at an iterate, _ode_newton_gp);
+# `out` untouched on both; Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN (no residual meets
+# it) or max_newton < 0, before f is called. Every continuation answer carries a certificate, read at
+# 63 points between y and the answer (_ode_on_branch): sigma(z) = (z - y) / (dt f(t + dt, z)) rises
+# from 0 and stays below 1, which is what it is to lie on the branch through (dt = 0, y) with no fold
+# before the full dt, at every point that does not already meet |g| < tol as the answer does.
+# Without it the step fails, also where the root it found is the equation's only one. What it cannot
+# see: a fold or a pair of roots narrower than the gap between samples, at most 1/48 of the move, or
+# inside |g| < tol, which the step's own test does not tell apart; no finite sample of f is a proof.
+# Newton's answer is the root its iterates reach, which is not always that one (3.4.0, kept).
+# A failing step evaluates f at most 16 + 11 max_newton times more than 3.4.0's did (the
+# continuation's bound), 62 on top where the certificate is what refuses it, and a step the
+# continuation solves 63 more for the certificate;
+# measured on 11,755 review steps: at most 22 more at max_newton 1 (3.4.0's failing step: 4), 37 at 3
+# (8), 349 at 50 (102).
+# [measured: R2-NUM review cases py/ode_in.txt, 3.4.0 and the NUM3 tree, 2026-10-31]
 # ⭐ 3.4.0 — REPLACES ode_backward_euler, WHICH DID NOT REPORT NON-CONVERGENCE (audit
 # D070). It returned the last Newton iterate z in both failures above, and never tested
 # the residual of the iterate its last update made, so y' = -y with dt = 1 from y = 1,
@@ -385,27 +467,29 @@ public fn ode_backward_euler_checked(f, t, y, dt, tol, max_newton, out) {
     var t_next = f64_add(t, dt);
     # Initial guess: forward Euler
     var z = f64_add(y, f64_mul(dt, fncall2(f, t, y)));
+    # Newton exactly as 3.4.0 (same operations, same evaluations); only where it fails does the
+    # step's own continuation run (_ode_continue, beta = 1).
+    var rc = HSB_ERR_NO_CONVERGENCE;
     var iter = 0;
     while (1 == 1) {
         var fz = fncall2(f, t_next, z);
         var g = f64_sub(z, f64_add(y, f64_mul(dt, fz)));
-
-        # Check convergence
         if (f64_lt(f64_abs(g), tol) == 1) {
             store64(out, z);
             return Ok(0);
         }
-        if (iter >= max_newton) { return Err(HSB_ERR_NO_CONVERGENCE); }
-
+        if (iter >= max_newton) { break; }
         # g'(z) = 1 - dt df/dy, df/dy by a forward difference (_ode_newton_gp)
         var gp = _ode_newton_gp(f, t_next, z, fz, dt, g);
-        if (f64_eq(gp, 0) == 1) { return Err(HSB_ERR_SINGULAR_MATRIX); }
-        if (f64_eq(gp, gp) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }  # no finite slope
-
+        if (f64_eq(gp, 0) == 1) {
+            rc = HSB_ERR_SINGULAR_MATRIX;
+            break;
+        }
+        if (f64_eq(gp, gp) == 0) { break; }                      # no finite slope
         z = f64_sub(z, f64_div(g, gp));
         iter = iter + 1;
     }
-    return Err(HSB_ERR_NO_CONVERGENCE);
+    return _ode_be_cont(f, t_next, y, dt, tol, max_newton, rc, out);
 }
 
 # ================================================================
@@ -420,10 +504,21 @@ public fn ode_backward_euler_checked(f, t, y, dt, tol, max_newton, out) {
 # dt: time step (f64)
 # tol: Newton convergence tolerance (f64), on the residual |g(z)|
 # out: pointer, y_{n+1} (f64) written here on success
-# Returns: Ok(0) when an iterate's residual is below tol (the predictor is tested
-# first); Err(HSB_ERR_NO_CONVERGENCE) after 50 Newton updates without that;
-# Err(HSB_ERR_SINGULAR_MATRIX) when g'(z) is not resolved from 0 (_ode_newton_gp); `out`
-# untouched on both; Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN, before f is called.
+# Returns: Ok(0) when an iterate's residual is below tol: first Newton's from the predictor,
+# 3.4.0's to the bit, at most 50 updates; where they do not get there, the step's own
+# continuation (_ode_continue: the root of g reached from the predictor as dt grows from 0,
+# at most 50 increments). Err(HSB_ERR_NO_CONVERGENCE) or Err(HSB_ERR_SINGULAR_MATRIX) when both
+# fail, with Newton's code (SINGULAR_MATRIX: g'(z) was not resolved from 0, _ode_newton_gp);
+# `out` untouched on both; Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN, before f is called.
+# Every continuation answer carries a certificate, as ode_backward_euler_checked's, with its limits:
+# at 63 points from the predictor to the answer sigma(z) rises from 0 and stays below 1, at every
+# point that does not already meet |g| < tol (_ode_on_branch), so that it lies on the branch
+# through (dt = 0, predictor) with no fold before the full dt; without it the step fails.
+# Newton's answer is the root its iterates reach, which is not always that one
+# (3.4.0, kept). A failing step evaluates f at most 565 times more than 3.4.0's 101, 62 on top where
+# the certificate is what refuses it, measured on 11,755 review steps at most 343 more; a step the
+# continuation solves, 63 more.
+# [measured: R2-NUM review cases py/ode_in.txt, 3.4.0 and the NUM3 tree, 2026-10-31]
 # ⭐ 3.4.0 — REPLACES ode_bdf2, which returned the last iterate z on both failures
 # (audit D070) and never tested the residual of its 50th update.
 #
@@ -469,9 +564,10 @@ public fn ode_bdf2_checked(f, t, y, y_prev, dt, tol, out) {
 # finite is never singular:
 # the first is s 0x3FD12F0F22AE92A8 at every s from 1 to 2^-1000 (9 evaluations), the second
 # Ok in 9 evaluations, 2.4e-11 relative off the root (3.3.7: 1.0e-6); k = 1e10 is Ok in 7,
-# 6.0e-9 off (the first form: NO_CONVERGENCE after 101; 3.3.7: 1.6e-8 off). k = 2.5e13 is
+# 6.0e-9 off (the first form: NO_CONVERGENCE after 101; 3.3.7: 1.6e-8 off). k = 2.5e13 was
 # still NO_CONVERGENCE (its first update takes a slope 5e11 times too steep, and the next
-# iterate's step, 2^-26 of 9.3e-27, sees no change in f), as on 3.3.7. The reviewer's 1,600
+# iterate's step, 2^-26 of 9.3e-27, sees no change in f), as on 3.3.7; since 3.4.1 the step's
+# continuation (_ode_continue) solves it (152 evaluations). The reviewer's 1,600
 # stiff steps and 2,290 scaled copies keep every status, bit and count.
 # [measured: review R2B scratch probes z0/z1_lane/ode_lane and NU1 z2 (.cyr), mpmath roots, 2026-10-31]
 fn _ode_newton_gp(f, t, z, fz, c, g) {
@@ -495,31 +591,344 @@ fn _ode_newton_gp(f, t, z, fz, c, g) {
     return gp;
 }
 
-# Internal: the Newton solve of a BDF step, z = pred + beta * dt * f(t, z), from z =
-# pred, for ode_bdf2_checked and ode_bdf_checked: at most _ODE_BDF_NEWTON updates, the
-# residual tested before each and after the last. Ok(0) with z in `out`, or
-# Err(HSB_ERR_NO_CONVERGENCE) or Err(HSB_ERR_SINGULAR_MATRIX) with `out` untouched.
+# Internal: the Newton solve of a BDF step, z = pred + beta * dt * f(t, z), from z = pred, for
+# ode_bdf2_checked and ode_bdf_checked: Newton exactly as through 3.4.0 (at most _ODE_BDF_NEWTON
+# updates, the residual tested before each and after the last; the slope g'(z) = 1 - beta dt f_y
+# from _ode_newton_gp, SINGULAR_MATRIX where it is not resolved from 0, NO_CONVERGENCE where it is
+# not finite or the updates run out). Only where that fails does the step's own continuation run
+# (_ode_continue), answering with Newton's code where it fails too: every step the 3.4.0 Newton
+# solved keeps its value and its evaluations. Ok(0) with z in `out`, or Err with `out` untouched.
 fn _ode_bdf_newton(f, t, pred, beta, dt, tol, out) {
     var z = pred;
+    var rc = HSB_ERR_NO_CONVERGENCE;
+    var fs = 0;
     var iter = 0;
     while (1 == 1) {
         var fz = fncall2(f, t, z);
+        if (iter == 0) { fs = fz; }
         # Residual: g = z - pred - beta * h * f(t, z)
         var g = f64_sub(z, f64_add(pred, f64_mul(beta, f64_mul(dt, fz))));
         if (f64_lt(f64_abs(g), tol) == 1) {
             store64(out, z);
             return Ok(0);
         }
-        if (iter >= _ODE_BDF_NEWTON) { return Err(HSB_ERR_NO_CONVERGENCE); }
-
+        if (iter >= _ODE_BDF_NEWTON) { break; }
         var gp = _ode_newton_gp(f, t, z, fz, f64_mul(beta, dt), g);
-        if (f64_eq(gp, 0) == 1) { return Err(HSB_ERR_SINGULAR_MATRIX); }
-        if (f64_eq(gp, gp) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }  # no finite slope
-
+        if (f64_eq(gp, 0) == 1) {
+            rc = HSB_ERR_SINGULAR_MATRIX;
+            break;
+        }
+        if (f64_eq(gp, gp) == 0) { break; }                      # no finite slope
         z = f64_sub(z, f64_div(g, gp));
         iter = iter + 1;
     }
-    return Err(HSB_ERR_NO_CONVERGENCE);
+    return _ode_bdf_cont(f, t, pred, beta, dt, tol, rc, fs, out);
+}
+
+# Internal: the continuation of a failed BDF step, its budget _ODE_BDF_NEWTON increments and
+# fs = f(t, s) from Newton's first evaluation (as _ode_be_cont, a short call keeps the converging
+# step's time).
+fn _ode_bdf_cont(f, t, s, beta, dt, tol, rc, fs, out) {
+    return _ode_continue(f, t, s, beta, dt, tol, _ODE_BDF_NEWTON, rc, fs, out);
+}
+
+# Internal: the continuation of a failed backward Euler step (beta = 1; Newton never evaluated f(t, y)).
+# Calls with more than eight arguments cost the converging step that holds them: through
+# _ode_continue directly backward Euler took 66 to 70 ns where 3.4.0 took 59 to 63; through
+# this wrapper, 3.4.0's time.
+# [measured: scratch focus bench fbo3.bcyr, 3.4.0, the s6 tree and this tree, interleaved, 2026-10-31]
+fn _ode_be_cont(f, t, y, dt, tol, mn, rc, out) {
+    return _ode_continue(f, t, y, _ODE_F64_ONE, dt, tol, mn, rc, 0x7FF8000000000000, out);
+}
+
+# Internal: f_y(t, z) by a forward difference over h, taken again over h 2^-26 and h 2^-52 where
+# the difference is not finite (as _ode_newton_gp takes it); NaN when none is.
+fn _ode_fy(f, t, z, fz, h) {
+    var k = 0;
+    while (k < 3) {
+        var zh = f64_add(z, h);
+        var d = f64_div(f64_sub(fncall2(f, t, zh), fz), f64_sub(zh, z));
+        if (f64_lt(f64_abs(d), F64_POS_INF) == 1) { return d; }
+        h = f64_mul(h, _ODE_F64_2_POW_M26);
+        k = k + 1;
+    }
+    return 0x7FF8000000000000;
+}
+
+# Internal: the difference step for f_y at a point z of _ode_continue: 2^-26 |z|, or 2^-26 of the
+# increment's move mv at z = 0.
+fn _ode_dh(z, mv) {
+    var a = f64_abs(z);
+    if (f64_eq(a, 0) == 1) { a = f64_abs(mv); }
+    return f64_mul(a, _ODE_F64_2_POW_M26);
+}
+
+# Internal: 1 when g' = 1 - cd is positive and resolved from 0 (above 2^-24 (1 + |cd|), the
+# margin _ode_newton_gp reads as singular); 0 otherwise, NaN included.
+fn _ode_gpos(gp, cd) {
+    return f64_lt(f64_mul(_ODE_F64_2_POW_M24, f64_add(_ODE_F64_ONE, f64_abs(cd))), gp);
+}
+
+# Internal: 2^-j as a double, j = 0 .. 1074.
+fn _ode_p2m(j) {
+    if (j <= 1022) { return (1023 - j) << 52; }
+    return 1 << (1074 - j);
+}
+
+# Internal: 1 when the forward-Euler move s + ds cf (cf = beta dt f(t, s)) of _ode_continue's first
+# increment leaves f finite and within half of fs = f(t, s) (one evaluation of f).
+fn _ode_cfirst(f, t, s, fs, cf, ds) {
+    var fp = fncall2(f, t, f64_add(s, f64_mul(ds, cf)));
+    if (f64_lt(f64_abs(fp), F64_POS_INF) == 0) { return 0; }
+    return f64_le(f64_abs(f64_sub(fp, fs)), f64_mul(_ODE_F64_HALF, f64_abs(fs)));
+}
+
+# Internal: the certificate of a continuation's answer z. With c = beta dt, sigma(p) = (p - s) / (c f(t, p))
+# and g(p) = p - s - c f(t, p): 1 when each of the _ODE_CONT_SCAN - 1 samples p from s to z either continues
+# sigma's rise from 0, below 1, or already meets |g| < tol as z does, and no sample past the root, sigma >= 1
+# or < 0, is followed by one back below it; 0 otherwise, NaN included (a NaN or infinite f at a sample fails
+# both tests). Sample i lies at (i + xi) / _ODE_CONT_SCAN of the move,
+# xi = ((i _ODE_CONT_GOLD mod 2^16) - 2^15) / 2^17, so |xi| < 1/4 and the gaps are 0.78 to 1.31 cells: at
+# most 1/48 of the move. Exactly _ODE_CONT_SCAN - 1 evaluations of f on a pass, fewer where it stops early.
+#
+# Below sigma = 1 with sigma rising is the sign of g being the one it has at s, with no fold: a sample past
+# the branch's root has sigma >= 1, or sigma < 0 once f has changed sign, and past a fold sigma falls. The
+# second test is the step's own, so it needs no estimate of the answer's accuracy: a sample that fails the
+# first is as good an answer as z. But a sample back on s's side after one past the root has crossed the
+# root twice, so that z is on another root inside tol.
+#
+# What this cannot see. (1) A fold, or a pair of roots, narrower than the gap between samples: on the
+# review's sets dips of sigma 1e-10 to 3e-10 deep (one real root each, so the value is right), and on a fresh
+# triangle-wave set of 12,116 Oks at tol 1e-1 to 1e-12, 8 on the next root of a close pair, 0.2 to 8% of
+# the move past the branch's, at tol 1e-3 and 0.1, where |g| passes tol only between samples. (2) Roots
+# inside |g| < tol, which the step's own test does not tell apart (10 more of those 12,116). A wrong
+# answer either way is one the tolerance or the sampling could not exclude: no finite sample of a
+# black-box f is a proof. (3) It can refuse a right answer: past a fold with one real root (below), or
+# where samples round onto the ends of a move of a few ulps of s (2 of 6,408 on a stress set).
+# [measured: scratch harness (NUM5-work py/cls.py, py/gx.py, py/off.py), 2026-11-01]
+#
+# ⛔ 3.4.1 (fourth review) — THE CERTIFICATE WAS SKIPPED, AND EVENLY SPACED SAMPLES ALIAS. A gate ran it only
+# where 8 times the update just taken was below 1/64 of the move, but by then the residual test had passed,
+# so that update says nothing of the point's accuracy: a piecewise-linear f lands in one chord update at any
+# tol. 3,978 of 12,564 Oks at tol 1e-1 to 1e-5 and 4,134 of 13,980 on a triangle wave at tol 1e-8 to 1e-12
+# had no certificate, 132 and 191 of them off the branch: BDF-2 on -4.47 tri(3.74 y) - 7.97 returned Ok at
+# 12.54 where the branch root is 13.40 and 3.4.0 refused. The gate protected right answers at a loose tol:
+# with it gone and only the first test, 157 of 8,801 answers just past their root are refused, because such a
+# sample has sigma >= 1 by less than tol; the second test keeps them all, at no evaluation. And a period of f
+# that divides the sample spacing shows sigma one phase: Ok at -84.7, 64.2 periods of sin from s, 377 real
+# roots. Set up on purpose, with s on a crest of sin or of a triangle wave, even spacing passed 759 such among
+# 14,986 Oks and these offsets none, again at no evaluation. On the review's three sets (seeds 8, 9, 7,
+# 200,000 steps each) against a dense scan of sigma, of 39,961 Oks the 39,643 on the branch stand, the 221 on
+# another root of several are gone, 92 with one real root are refused, and 5 with one real root stay.
+# [measured: scratch harness (NUM5-work p/god2.py seeds, py/cls.py, py/tab.py, py/ga.py), s24, 3.4.0, 2026-11-01]
+#
+# ⛔ 3.4.1 (third review) — "NEVER ANOTHER ROOT" WAS FALSE, AND NO GUARD AT THE ENDS OF AN INCREMENT
+# CAN MAKE IT TRUE. Solving g = z - s - sigma c f(z) for sigma gives the branch outright: sigma(z), a
+# function of z that one evaluation of f reads anywhere. The root at sigma = 1 is on the branch from
+# (0, s), with no fold, exactly when sigma(z) rises from 0 to 1 on the way from s to it. The tracker's
+# guards read g' at the ends of an increment and G at one midpoint, and where s sits on a flat
+# stretch of f the first increment can cross a fold or a whole period in one chord: of the 15,960 steps
+# the continuation solved on the review's two seeds, 73 were on another root and 121 past a fold, 79
+# of those 194 silent wrong roots of an equation with several (BDF-2, y' = A sin(B y) + D: Ok at 137.50
+# where the branch root is 16.375, 13 real roots). So the tracker reads its answer, once, at the end.
+# Against the review's 60-digit oracle, with evenly spaced samples: 15,766 Oks on the branch kept, all 194
+# others refused (8 points left 51, 16 left 19, 32 left 2, 64 none; 64 on two more seeds: 15,659 on the
+# branch, 0 on another root, 3 past a fold of depth 5e-7 to 2e-5 with one real root).
+#   A FOLD WITH ONE REAL ROOT IS REFUSED TOO, and that is a decision. There the root is the step
+# equation's only solution, so an Ok would be right; 110 of the review's 121 folds are such. But the
+# step cannot show it: only a scan of all of f could, and 11 of the 121 have several roots. The fold
+# itself is a fact about dt: the step's value jumps there as dt grows, so the answer is no small
+# perturbation of the state, and the caller's remedy, a smaller dt, then follows the branch. 3.4.0
+# refused these steps as well.
+#   Against the 16 + 11 maxit of the tracker this adds 63 evaluations to a step that reaches sigma = 1 and
+# passes, at most 63 to one it refuses, and none to one that does not reach sigma = 1; every step of the
+# review's 11,755 that Ok'd keeps its bits.
+# [measured: scratch harness (NUM4-work k/odeh3.cyr, py/gen_ode3.py, py/oo.py, py/ana_ode3.py), 2026-11-01]
+# [measured: scratch harness (NUM5-work p/odv.cyr, py/cls.py, py/tab.py, py/gx.py, py/ga.py), 2026-11-01]
+fn _ode_on_branch(f, t, s, beta, dt, z, tol) {
+    var dz = f64_sub(z, s);
+    var sp = 0;
+    var past = 0;
+    var i = 1;
+    while (i < _ODE_CONT_SCAN) {
+        var n = (i << 17) + ((i * _ODE_CONT_GOLD) & 65535) - 32768;     # (i + xi) 2^17, |xi| < 1/4
+        var u = f64_mul(dz, f64_div(f64_from(n), _ODE_CONT_TAU));
+        var cf = f64_mul(beta, f64_mul(dt, fncall2(f, t, f64_add(s, u))));
+        var si = f64_div(u, cf);
+        var near = f64_lt(si, _ODE_F64_ONE) & f64_le(0, si);            # g has its sign at s
+        if (near == 0) {
+            past = 1;
+        } elif (past == 1) {
+            return 0;
+        }
+        if (near == 1 && f64_lt(sp, si) == 1) {
+            sp = si;
+        } elif (f64_lt(f64_abs(f64_sub(u, cf)), tol) == 0) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Internal: the second phase of an implicit step whose Newton failed with code rc (fs = f(t, s)
+# when Newton evaluated it, NaN otherwise): homotopy continuation on the step's own equation.
+# With c = beta dt, G_sigma(z) = z - (s + sigma c f(t, z)) is followed from its root z = s at
+# sigma = 0 to sigma = 1, where it is the step's g (bit for bit:
+# sigma c f is computed as sigma (beta (dt f)), and 1 x = x), with t fixed at the step's time. The
+# root it reaches is the one on the branch through (0, s): the step's value as dt grows from 0.
+# On that branch g' = 1 - sigma c f_y stays positive and z moves monotonically from s in the
+# direction of c f(t, s); where g' reaches 0 (a fold) the branch ends before sigma = 1, no root of
+# the step continues it, and the step fails with rc, as Newton did. rc is the failure either way:
+# the root may exist, on another branch or as the far side of a fold (_ode_on_branch).
+# - The first increment is the largest 2^-j (j = 0 .. 1074, by bisection on j) whose forward-Euler
+#   move s + 2^-j c f(s) leaves f within half of f(s), shortened to 1 / (2 |c f_y(s)|) where the
+#   slope at s says the linear model fails sooner.
+# - Each increment: the tangent predictor z + d_sigma c f(z) / g'(z); a chord corrector (the slope
+#   at the predictor, as _ode_newton_gp forms it) of at most _ODE_CONT_KMAX updates, each required
+#   to halve the residual. A point is accepted below sigma = 1 when |G_sigma| < sigma tol or its
+#   last update is at most 2^-10 of the move; at sigma = 1 only when |g| < tol, the step's own
+#   test.
+# - The branch guards, which steer the increments and prove nothing (the certificate below does). A
+#   slope at the predictor that is not positive and resolved, or that has fallen below half of g' at
+#   the old point, rejects the increment; so does a midpoint of the old and the new point that lies
+#   past the new root (G_sigma there of the new point's sign, not the old one's), tested where the
+#   two are farther apart than 8 times their accuracy. A rejected increment is halved.
+# - An accepted point's slope (the corrector's, or a fresh one at the predictor) must be positive
+#   and resolved: otherwise the branch has folded, and the step returns Err(rc).
+# - The certificate: every answer at sigma = 1 must pass _ode_on_branch, or the step returns Err(rc).
+#   [measured: tests/edge_cases.tcyr, group "3.4.1 NUM5: every continuation answer is certified"]
+# - The next increment is the last times sqrt(1/4 / theta), theta the corrector's first contraction
+#   (the chord contracts in proportion to the predictor's error, which grows as the increment
+#   squared), held to [1/4, 4]; 4 when the predictor met the tolerance unaided.
+# - Err(rc) when the increment underflows (sigma + d_sigma == sigma) or after maxit increments,
+#   accepted or rejected (none when maxit is 0): at most 16 + 11 maxit evaluations of f (the
+#   first increment 16: f(s), the bisection's 12, a slope's 3; an increment 11: the predictor, a
+#   slope's 3, six chord updates and the midpoint), and the certificate's 63.
+fn _ode_continue(f, t, s, beta, dt, tol, maxit, rc, fs, out) {
+    if (maxit <= 0) { return Err(rc); }
+    var c = f64_mul(beta, dt);
+    var fz = fs;
+    if (f64_eq(fz, fz) == 0) { fz = fncall2(f, t, s); }
+    if (f64_lt(f64_abs(fz), F64_POS_INF) == 0) { return Err(rc); }
+    var cf = f64_mul(beta, f64_mul(dt, fz));
+    var ds = _ODE_F64_ONE;
+    if (_ode_cfirst(f, t, s, fz, cf, ds) == 0) {
+        var lo = 0;
+        var hi = 1074;
+        while (hi - lo > 1) {
+            var mid = (lo + hi) / 2;
+            if (_ode_cfirst(f, t, s, fz, cf, _ode_p2m(mid)) == 1) { hi = mid; } else { lo = mid; }
+        }
+        ds = _ode_p2m(hi);
+    }
+    var hs = f64_abs(s);
+    if (f64_eq(hs, 0) == 1) { hs = f64_mul(ds, f64_abs(cf)); }
+    var fyk = _ode_fy(f, t, s, fz, f64_mul(hs, _ODE_F64_2_POW_M26));
+    if (f64_lt(f64_abs(fyk), F64_POS_INF) == 0) { fyk = 0; }
+    var cy = f64_abs(f64_mul(c, fyk));
+    if (f64_lt(_ODE_F64_HALF, f64_mul(cy, ds)) == 1) { ds = f64_div(_ODE_F64_HALF, cy); }
+    var sig = 0;
+    var z = s;
+    var gp = _ODE_F64_ONE;
+    var ek = 0;
+    var inc = 0;
+    while (inc < maxit) {
+        inc = inc + 1;
+        var sn = f64_add(sig, ds);
+        if (f64_lt(_ODE_F64_ONE, sn) == 1) { sn = _ODE_F64_ONE; }
+        ds = f64_sub(sn, sig);
+        if (f64_le(ds, 0) == 1) { return Err(rc); }                # the increment underflowed
+        var last = f64_eq(sn, _ODE_F64_ONE);
+        var mv = f64_div(f64_mul(ds, f64_mul(beta, f64_mul(dt, fz))), gp);
+        var zp = f64_add(z, mv);
+        var ts = f64_mul(sn, tol);                                   # tol at sigma = 1
+        # The chord corrector from the predictor.
+        var zc = zp;
+        var fc = 0;
+        var nup = 0;
+        var hasg = 0;
+        var gc = _ODE_F64_ONE;
+        var fyc = 0;
+        var r0 = 0;
+        var r = 0;
+        var th = 0;
+        var rp = F64_POS_INF;
+        var dl = 0;
+        var ok = 0;
+        while (1 == 1) {
+            fc = fncall2(f, t, zc);
+            var g = f64_sub(zc, f64_add(s, f64_mul(sn, f64_mul(beta, f64_mul(dt, fc)))));
+            r = f64_abs(g);
+            if (nup == 0) { r0 = r; }
+            if (nup == 1 && f64_lt(0, r0) == 1) { th = f64_div(r, r0); }
+            if (f64_lt(r, ts) == 1) {
+                ok = 1;
+                break;
+            }
+            if (last == 0 && nup >= 1 &&
+              f64_le(f64_abs(dl), f64_mul(_ODE_F64_2_POW_M10, f64_abs(mv))) == 1) {
+                ok = 1;
+                break;
+            }
+            if (f64_lt(r, F64_POS_INF) == 0 || nup == _ODE_CONT_KMAX) { break; }
+            if (f64_lt(f64_mul(_ODE_F64_HALF, rp), r) == 1) { break; }   # the chord does not contract
+            rp = r;
+            if (hasg == 0) {
+                fyc = _ode_fy(f, t, zc, fc, _ode_dh(zc, mv));
+                var cd = f64_mul(sn, f64_mul(c, fyc));
+                gc = f64_sub(_ODE_F64_ONE, cd);
+                if (_ode_gpos(gc, cd) == 0) { break; }                  # g' is not positive here
+                var gk = f64_sub(_ODE_F64_ONE, f64_mul(sn, f64_mul(c, fyk)));
+                if (f64_lt(gc, f64_mul(_ODE_F64_HALF, gk)) == 1) { break; }   # g' more than halved
+                hasg = 1;
+            }
+            dl = f64_div(g, gc);
+            zc = f64_sub(zc, dl);
+            nup = nup + 1;
+        }
+        # The branch guard: where the two points are farther apart than 8 times their accuracy, the
+        # midpoint lies behind the new root (G at the new sigma has the sign of the old point's).
+        var ec = r;
+        if (nup > 0) { ec = f64_abs(dl); }
+        if (ok == 1 && f64_lt(f64_mul(_ODE_F64_EIGHT, f64_add(ek, ec)), f64_abs(f64_sub(zc, z))) == 1) {
+            var zm = f64_mul(_ODE_F64_HALF, f64_add(z, zc));
+            var gm = f64_sub(zm, f64_add(s, f64_mul(sn, f64_mul(beta, f64_mul(dt, fncall2(f, t, zm))))));
+            if (f64_lt(z, zc) == 1) {
+                if (f64_lt(gm, 0) == 0) { ok = 0; }               # the midpoint is past the new root
+            } elif (f64_lt(0, gm) == 0) { ok = 0; }
+        }
+        if (ok == 0) {
+            ds = f64_mul(ds, _ODE_F64_HALF);
+        } else {
+            if (last == 1) {
+                # The certificate, on every answer.
+                if (_ode_on_branch(f, t, s, beta, dt, zc, tol) == 0) { return Err(rc); }
+                store64(out, zc);
+                return Ok(0);
+            }
+            if (hasg == 0) {
+                fyc = _ode_fy(f, t, zc, fc, _ode_dh(zc, mv));
+                var cd2 = f64_mul(sn, f64_mul(c, fyc));
+                gc = f64_sub(_ODE_F64_ONE, cd2);
+                if (_ode_gpos(gc, cd2) == 0) { return Err(rc); }            # the branch folded
+            }
+            sig = sn;
+            z = zc;
+            fz = fc;
+            gp = gc;
+            fyk = fyc;
+            ek = ec;
+            var q = _ODE_F64_FOUR;
+            if (nup > 0 && f64_lt(0, th) == 1) {
+                q = f64_sqrt(f64_div(_ODE_F64_QUARTER, th));
+                if (f64_lt(_ODE_F64_FOUR, q) == 1) { q = _ODE_F64_FOUR; }
+                if (f64_lt(q, _ODE_F64_QUARTER) == 1) { q = _ODE_F64_QUARTER; }
+            }
+            ds = f64_mul(ds, q);
+        }
+    }
+    return Err(rc);
 }
 
 # ================================================================
@@ -534,9 +943,10 @@ fn _ode_bdf_newton(f, t, pred, beta, dt, tol, out) {
 # dt: time step (f64)
 # tol: Newton convergence tolerance (f64)
 # out: pointer, y_{n+1} (f64) written here on success
-# Returns: Ok(0) when an iterate's residual is below tol; Err(HSB_ERR_NO_CONVERGENCE)
-# after 50 Newton updates without that; Err(HSB_ERR_SINGULAR_MATRIX) when g'(z) is not
-# resolved from 0 (_ode_newton_gp);
+# Returns: Ok(0) when an iterate's residual is below tol, Newton's (50 updates, 3.4.0's to
+# the bit) or else the step's own continuation's (_ode_continue, 50 increments; as
+# ode_bdf2_checked: certified on the branch through dt = 0, _ode_on_branch); Err(HSB_ERR_NO_CONVERGENCE) or
+# Err(HSB_ERR_SINGULAR_MATRIX) when both fail, with Newton's code;
 # Err(HSB_ERR_INVALID_INPUT) for an order outside 2..5, a history shorter than the
 # order, or tol <= 0 or NaN, before f is called. `out` is untouched on every Err.
 # ⭐ 3.4.0 — REPLACES ode_bdf (audit D069, D070). It returned 0, a legal y, for an

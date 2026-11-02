@@ -606,16 +606,56 @@ def bench_names():
 
 NOT_REPRO = re.compile(r'\bnot reproducible in-tree\b|\bno longer reproducible\b', re.I)
 # A dotted token, then an optional :line, up to a delimiter.
-PATH_TOKEN = re.compile(r'([\w./-]*\.\w+)(?::(\d+))?(?=[\s,;:)]|$)')
+# 3.4.1 review: the closers of every opener check_marker skips (`) ] } ` " '`), and a period
+# that ends a sentence (`tests/x.tcyr.`), end a token too; through the first 3.4.1 form only
+# `)` did, so a backquoted or quoted path never matched.
+PATH_TOKEN = re.compile(r'([\w./-]*\.\w+)(?::(\d+))?(?=[\s,;:)\]}`"\']|\.(?:\s|$)|$)')
+# What may precede a token that starts mid-marker: a space, a separator or an opener.
+TOKEN_START = re.compile(r'[\s,;:(\[{`"\']')
 # A version, or a version wildcard: 3.3.7, 6.6.20, v2.8.0, 3.x, 6.6.x, v3.x.
 VERSION_TOKEN = re.compile(r'^v?\d+(?:\.(?:\d+|[xX*]))+$')
 # A token whose first component is a number: 0.1ulp, 2.5e3, 1.5e-3.
 NUMBER_LED = re.compile(r'^v?\d+\.')
 # The extensions of the files markers cite (the same list as the path shape above), plus the
 # usual data and archive ones.
+# ⛔ 3.4.1 -- THIS LIST IS THE CLASS BOUNDARY, so a source file in another language read as
+# free text: `[measured: foo.c]`, `main.rs` and `Makefile.am` passed with no such file (R2C n5).
+# A dotted token with no slash is a file only by its extension -- `foo.c` and `mpmath.mpf` have
+# the same shape -- so the common source, build, config and data extensions are named here.
+# Single letters that end an abbreviation (`i.e`, `e.g`) stay out; so do `.o` / `.a`, and
+# `a.out`, which the selftest pins as free text. An extension missing here is still free text.
 FILE_EXT = {'cyr', 'tcyr', 'bcyr', 'fcyr', 'cyml', 'toml', 'sh', 'md', 'csv', 'yml', 'yaml',
             'txt', 'py', 'json', 'lock', 'patch', 'diff', 'tsv', 'log', 'html', 'svg', 'png',
-            'pdf', 'gz', 'tar', 'zip', 'bin'}
+            'pdf', 'gz', 'tar', 'zip', 'bin',
+            'c', 'h', 'cc', 'cpp', 'cxx', 'hpp', 'hh', 'rs', 'go', 'java', 'js', 'mjs', 'ts',
+            'rb', 'pl', 'lua', 's', 'asm', 'am', 'ac', 'in', 'mk', 'cmake', 'ini', 'cfg',
+            'conf', 'xml', 'rst', 'tex', 'el', 'zsh', 'bash', 'awk', 'jl', 'hs', 'ml', 'zig',
+            'swift', 'sql', 'dat', 'npy', 'npz', 'ipynb', 'xz', 'bz2', 'zst', 'tgz', 'so', 'elf'}
+# The repo's tracked top-level directories. A path into one of them names a tree file wherever
+# a marker writes it; a scratch path (p/pquad.cyr, NU1-work/c/a1.cyr) never starts with one.
+TREE_DIRS = {'src', 'tests', 'scripts', 'docs', 'lib', 'examples', 'dist', '.github'}
+# Another repository's file is written with an explicit owner: `<repo>'s <path>`,
+# `<repo> <version>'s <path>` (also `<repo>@<version>'s`), or `<repo>:<path>` with no space
+# -- `ganita 1.2.15's src/linalg.cyr:120`, `cyrius's docs/development/issues/x.md`,
+# `ganita:src/linalg.cyr`. Such a path is not checked against this tree. Everything else
+# that names a tree directory is hisab's and must exist, whatever precedes it: `under cyrius
+# 6.7.18 tests/x.tcyr` (hisab's suite under that toolchain, the house register), `cyrius
+# check --with-deps dist/hisab.cyr`, `ganita 1.2.15 src/x.cyr` (write the possessive). The
+# repos are those hisab cites files of: its toolchain and its two first-party dependencies.
+# ⛔ 3.4.1 second review -- the INS2 form exempted any path written right after a repo name
+# and a version, so `cyrius 6.7.18 tests/no_such.tcyr` went unchecked while `ganita
+# 1.2.15's src/linalg.cyr:120`, a correct citation, failed. The owner is now the possessive
+# or the colon, never proximity.
+# ⛔ 3.4.1 third review -- AND ONLY THE WRITTEN FORM. The second-review form matched the repo
+# name in any case and took a curly apostrophe, two exemptions no selftest row pinned: each
+# could be dropped with the selftest still passing. An exemption is a hole the gate does not
+# look through, so it is exactly as wide as the rule above, the lowercase repo name and an
+# ASCII `'s`: `Ganita 1.2.15's src/x.cyr` and `ganita’s src/x.cyr` are hisab paths and must
+# exist. MARKER_SELFTEST pins both.
+OTHER_REPOS = re.compile(r"(?<![\w-])(?:cyrius|ganita|sakshi)"
+                         r"(?:(?:@|\s+)v?\d+(?:\.(?:\d+|[xX*]))+)?(?:'s\s+|:)$")
+# A version with a suffix word glued on -- `6.6.x-pinned`, `6.7.9's` -- leads like a version.
+VERSION_WORD = re.compile(r'v?\d+(?:\.(?:\d+|[xX*]))+(?=[-\'’]\w)')
 
 def names_file(tok):
     """Is this dotted token a file name (so it must exist), or free text?"""
@@ -645,6 +685,15 @@ def check_path(src, m):
             return False, f'no benchmark named {rest.split()[0]!r} in {BENCH_CSV}'
     return True, f'resolves to {path}'
 
+def in_tree(tok):
+    """Does this path token point into one of the repo's own directories? (`./` allowed)"""
+    t = re.sub(r'^(?:\./)+', '', tok)
+    return '/' in t and t.split('/', 1)[0] in TREE_DIRS
+
+def other_repo(src, pos):
+    """Is the token at pos owned by another repository (OTHER_REPOS)?"""
+    return OTHER_REPOS.search(src[:pos]) is not None
+
 def check_marker(src):
     """Return (ok, note). ok=False means the marker names something absent."""
     if NOT_REPRO.search(src):
@@ -658,23 +707,41 @@ def check_marker(src):
     # free text; a token with a slash, a known file extension, or a digit-led extension on a
     # name (archive.7z, hisab.1) is a path and must exist. And a marker that OPENS with a
     # version is not let off: every file it then names is checked (`3.3.7 tests/x.tcyr`).
+    # ⛔ 3.4.1 -- TWO OPENINGS STILL LET A MISSING PATH THROUGH (R2C n5). `(tests/no_such.tcyr)`
+    # opened with "(", so no leading token matched; `6.6.x-pinned run, tests/no_such.tcyr`
+    # opened with a version that is not a bare version token. Opening punctuation is skipped
+    # now, a version with a suffix word leads like a version, and -- whatever the opening --
+    # every path into the tree's own directories (TREE_DIRS) must exist. A free-text marker
+    # may still name scratch files (`scratch probe p/pquad.cyr`): that is the convention for
+    # a harness kept outside the tree, and nothing distinguishes a scratch name from a typo.
+    # ⛔ 3.4.1 REVIEW -- "opening punctuation is skipped" held only for "(": the token's
+    # lookahead had no closer for a backquote, a quote or a brace, so `tests/x.tcyr` in
+    # backquotes still passed. Every opener now has its closer, a sentence-ending period ends
+    # a token, `./tests/x` is a tree path, and a path another repo owns by the possessive
+    # or a colon (OTHER_REPOS) is not checked here.
     # MARKER_SELFTEST below pins each shape.
-    m = PATH_TOKEN.match(src)
+    off = len(src) - len(src.lstrip('([{"\'`'))
+    m = PATH_TOKEN.match(src, off)
     if m and names_file(m.group(1)):
         return check_path(src, m)
-    if m and VERSION_TOKEN.match(m.group(1)):
-        named = None
-        for t in PATH_TOKEN.finditer(src, m.end()):
-            if t.start() > 0 and not re.match(r'[\s,;:(]', src[t.start() - 1]):
-                continue             # inside a longer token
-            if not names_file(t.group(1)):
-                continue
-            ok, note = check_path(src, t)
-            if not ok:
-                return ok, note
-            named = note
-        if named:
-            return True, named
+    version_led = bool(m and VERSION_TOKEN.match(m.group(1))) or bool(VERSION_WORD.match(src, off))
+    start = m.end() if (m and VERSION_TOKEN.match(m.group(1))) else off
+    named = None
+    for t in PATH_TOKEN.finditer(src, start):
+        if t.start() > 0 and not TOKEN_START.match(src[t.start() - 1]):
+            continue                 # inside a longer token
+        if not names_file(t.group(1)):
+            continue
+        if not version_led and not in_tree(t.group(1)):
+            continue                 # a scratch name in a free-text marker
+        if other_repo(src, t.start()):
+            continue                 # another repository's file (OTHER_REPOS)
+        ok, note = check_path(src, t)
+        if not ok:
+            return ok, note
+        named = note
+    if named:
+        return True, named
     return True, 'free-text provenance (not machine-locatable)'
 
 # ---------------------------------------------------------------------------
@@ -865,6 +932,51 @@ MARKER_SELFTEST = [
     ('broken', "6.7.9 cycc, scripts/check-measurements.sh:99999999", 'marker cites line 99999999'),
     ('path',   "6.7.9 cycc, scripts/check-measurements.sh --selftest", ''),
     ('broken', "docs/no_such.xyz listing", 'does not exist: docs/no_such.xyz'),
+    # 3.4.1 (R2C n5): an opening "(" or a suffixed version hid a missing path, and a source
+    # file outside FILE_EXT read as free text.
+    ('broken', "(tests/no_such.tcyr)", 'does not exist: tests/no_such.tcyr'),
+    ('broken', "(no_such_probe.py, 2026-10-31)", 'does not exist: no_such_probe.py'),
+    ('broken', "6.6.x-pinned run, tests/no_such.tcyr", 'does not exist: tests/no_such.tcyr'),
+    ('broken', "6.6.x-pinned run, no_such_probe.py", 'does not exist: no_such_probe.py'),
+    ('broken', "6.7.9's cycc, scripts/check-measurements.sh:99999999", 'marker cites line 99999999'),
+    ('broken', "pinned run, tests/no_such.tcyr", 'does not exist: tests/no_such.tcyr'),
+    ('broken', "scratch rerun of scripts/check-measurements.sh:99999999", 'marker cites line 99999999'),
+    ('broken', "foo.c", 'does not exist: foo.c'),
+    ('broken', "main.rs", 'does not exist: main.rs'),
+    ('broken', "Makefile.am", 'does not exist: Makefile.am'),
+    ('path',   "(scripts/check-measurements.sh --selftest)", ''),
+    ('path',   "scratch rerun of tests/abuse.tcyr", ''),
+    ('free',   "scratch probe p/pquad.cyr, 2026-10-11", ''),
+    ('free',   "scratch sweep.py and mpmath oracle", ''),
+    # 3.4.1 review (S3, N2): every opener with its closer, `./`, a sentence-ending period,
+    # and another repository's path.
+    ('broken', "`tests/no_such_b.tcyr`", 'does not exist: tests/no_such_b.tcyr'),
+    ('broken', "scratch rerun of \"tests/no_such_c.tcyr\", 2026-10-31", 'does not exist: tests/no_such_c.tcyr'),
+    ('broken', "{tests/no_such_d.tcyr}", 'does not exist: tests/no_such_d.tcyr'),
+    ('broken', "'tests/no_such_e.tcyr' rerun", 'does not exist: tests/no_such_e.tcyr'),
+    ('broken', "scratch rerun of ./tests/no_such_f.tcyr", 'does not exist: ./tests/no_such_f.tcyr'),
+    ('broken', "scratch rerun of tests/no_such_g.tcyr.", 'does not exist: tests/no_such_g.tcyr'),
+    ('broken', "ganita 1.2.15 probe, tests/no_such_h.tcyr", 'does not exist: tests/no_such_h.tcyr'),
+    ('path',   "`scripts/check-measurements.sh` --selftest", ''),
+    ('path',   "scratch rerun of ./tests/abuse.tcyr", ''),
+    ('path',   "scratch rerun of tests/abuse.tcyr.", ''),
+    ('free',   "ganita 1.2.15's src/eigen_no_such.cyr:120", ''),
+    ('free',   "cyrius's docs/development/issues/no_such.md", ''),
+    ('free',   "upstream repro in sakshi 2.5.10's dist/no_such.cyr", ''),
+    ('free',   "ganita@1.2.15's src/no_such.cyr", ''),
+    ('free',   "ganita:src/no_such.cyr at 1.2.15", ''),
+    ('broken', "cyrius check --with-deps dist/no_such.cyr on both trees", 'does not exist: dist/no_such.cyr'),
+    # 3.4.1 second review: proximity is not ownership; a toolchain version before a hisab
+    # path is how this tree names the pin a suite ran under.
+    ('broken', "rerun under cyrius 6.7.18 tests/no_such_r2a.tcyr:40", 'does not exist: tests/no_such_r2a.tcyr'),
+    ('broken', "cyrius 6.7.18: tests/no_such_r2b.tcyr", 'does not exist: tests/no_such_r2b.tcyr'),
+    ('broken', "sakshi 2.5.10 lib/no_such.cyr", 'does not exist: lib/no_such.cyr'),
+    ('broken', "ganita 1.2.15 src/eigen_no_such.cyr:120", 'does not exist: src/eigen_no_such.cyr'),
+    ('broken', "ganita 1.2.15, src/eigen_no_such.cyr:120", 'does not exist: src/eigen_no_such.cyr'),
+    # 3.4.1 third review: the owner is the lowercase repo name and an ASCII `'s` or `:`.
+    ('broken', "Ganita 1.2.15's src/no_such_r3a.cyr", 'does not exist: src/no_such_r3a.cyr'),
+    ('broken', "CYRIUS:tests/no_such_r3b.tcyr", 'does not exist: tests/no_such_r3b.tcyr'),
+    ('broken', "ganita\u2019s src/no_such_r3c.cyr", 'does not exist: src/no_such_r3c.cyr'),
 ]
 
 if mode == 'selftest':

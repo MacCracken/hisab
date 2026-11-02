@@ -19,6 +19,7 @@ enum _QuatF64 {
     _QUAT_NAN  = 0x7FF8_0000_0000_0000;   # NaN: `hquat_slerp` where its interpolant has no direction
     _QUAT_N_LO = 0x3FD0_0000_0000_0000;   # 0.25
     _QUAT_N_HI = 0x4030_0000_0000_0000;   # 16.0
+    _QUAT_D_HI = 0x3FEF_FBE7_6C8B_4396;   # 0.9995
 }
 
 #derive(accessors)
@@ -28,6 +29,8 @@ public struct HQuat { x; y; z; w; }
 # when the allocation is refused (an exhausted heap), and every Result returns Err(HSB_ERR_ALLOC);
 # none stores through a 0 handle. A 0 handle passed IN is the caller's.
 
+# A new HQuat (x, y, z, w), w the scalar part: 32 bytes from the heap, the components stored
+# as given. Returns the designed 0 where the allocation is refused (3.4.0).
 #must_use
 public fn hquat_new(x, y, z, w) {
     var q = alloc(sizeof(HQuat));
@@ -39,9 +42,17 @@ public fn hquat_new(x, y, z, w) {
     return q;
 }
 
+# (0, 0, 0, 1), the rotation by nothing.
 #must_use
 public fn hquat_identity() { return hquat_new(0, 0, 0, F64_ONE); }
 
+# The quaternion (axis sin(angle / 2), cos(angle / 2)) of the right-handed rotation by `angle`
+# radians about `axis` (counterclockwise seen from the axis tip), angle / 2 exact (a halving)
+# and its sine and cosine as `f64_sin` / `f64_cos` round them, each product rounded once.
+# `axis` must be a unit vector for q to be the rotation by `angle`: otherwise q is not unit, and
+# the rotation it represents (q / |q|, as `hquat_rotate_vec3` applies it) is about axis's
+# direction by 2 atan2(|axis| sin(angle / 2), cos(angle / 2)), not by `angle`; a zero axis gives
+# (0, 0, 0, cos(angle / 2)). Returns the designed 0 where the allocation is refused.
 #must_use
 public fn hquat_from_axis_angle(axis, angle) {
     var half = f64_mul(angle, F64_HALF);
@@ -52,18 +63,24 @@ public fn hquat_from_axis_angle(axis, angle) {
       f64_mul(HVec3_z(axis), s), c);
 }
 
+# The unit quaternion (sin(angle / 2), 0, 0, cos(angle / 2)) of the right-handed rotation by
+# `angle` radians about X; `_y` and `_z` below likewise about Y and Z. angle / 2 is exact and its
+# sine and cosine are `f64_sin` / `f64_cos`'s. Returns the designed 0 where the allocation is
+# refused.
 #must_use
 public fn hquat_from_rotation_x(angle) {
     var half = f64_mul(angle, F64_HALF);
     return hquat_new(f64_sin(half), 0, 0, f64_cos(half));
 }
 
+# (0, sin(angle / 2), 0, cos(angle / 2)): the rotation by `angle` radians about Y.
 #must_use
 public fn hquat_from_rotation_y(angle) {
     var half = f64_mul(angle, F64_HALF);
     return hquat_new(0, f64_sin(half), 0, f64_cos(half));
 }
 
+# (0, 0, sin(angle / 2), cos(angle / 2)): the rotation by `angle` radians about Z.
 #must_use
 public fn hquat_from_rotation_z(angle) {
     var half = f64_mul(angle, F64_HALF);
@@ -74,6 +91,11 @@ public fn hquat_from_rotation_z(angle) {
 # Arithmetic -- Hamilton product: q * r
 # ================================================================
 
+# The Hamilton product q r (w the scalar part). As rotations q r applies r first, then q:
+# rotating v by q r is rotating it by r and the result by q. Each component is a sum of four
+# products, within 4u of the sum of their magnitudes to first order (u = 2^-53); |q r| = |q| |r|
+# in exact arithmetic, so unit inputs give a product unit to a few u. Overflow and NaN follow
+# IEEE. Returns the designed 0 where the allocation is refused.
 #must_use
 public fn hquat_mul(q, r) {
     var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
@@ -90,6 +112,9 @@ public fn hquat_mul(q, r) {
       );
 }
 
+# The conjugate (-x, -y, -z, w), exact (`f64_neg`; below cycc 6.6.8 it gave +0 for +0): the
+# inverse of a unit q, the reverse rotation. Returns the designed 0 where the allocation is
+# refused.
 #must_use
 public fn hquat_conjugate(q) {
     return hquat_new(f64_neg(HQuat_x(q)), f64_neg(HQuat_y(q)),
@@ -97,11 +122,22 @@ public fn hquat_conjugate(q) {
 }
 
 # SIMD: quat is 4 contiguous f64 (32 bytes), packed dot at n=4 (no over-read).
+#
+# The 4-vector dot product of a and b (x, y, z, w), summed as `hvec4_dot` sums it, with its
+# accuracy and its zero convention (+0 wherever every product is a zero, -0 included; vec3.cyr's
+# `hvec3_dot` says why that is documented rather than changed).
+# ⚠ NOT BIT-IDENTICAL ACROSS TARGETS (vec4.cyr's `hvec4_dot` says why: aarch64 fuses each
+# lane's second product), and through it `hquat_length_sq`, `hquat_length`,
+# `hquat_normalize_checked`, `hquat_inverse_checked` and `hquat_slerp` may differ in their
+# last bits between x86 and aarch64.
 #must_use
 public fn hquat_dot(a, b) {
     return f64v_dot(a, b, 4);
 }
 
+# |q|^2 (`hquat_dot(q, q)`, its summation order and its aarch64 caveat): +Inf once a square
+# passes DBL_MAX (|component| >= 2^512), subnormal and losing bits once every component is
+# below 2^-511; `hquat_length` holds the whole range.
 #must_use
 public fn hquat_length_sq(q) { return hquat_dot(q, q); }
 #must_use
@@ -223,6 +259,13 @@ fn _hquat_finite(q) {
         i = i + 1;
     }
     return 1;
+}
+
+# 1 when every component of q is a zero of either sign.
+fn _hquat_is_zero(q) {
+    var o = HQuat_x(q) | HQuat_y(q) | HQuat_z(q) | HQuat_w(q);
+    if ((o & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }
+    return 0;
 }
 
 #must_use
@@ -504,6 +547,14 @@ fn _hquat_rotate_wide(q, v, rx, ry, rz) {
 # For subnormal v the products' own rounding adds absolute error on the 2^-1074 grid (within
 # 4.69 units of it on the review's family).
 # [measured: REV-FB t11.py / t11b.py / t11c.py, exact Fraction rotation, the first 3.4.0 review of lane FB, 2026-10-31]
+# ⚠ The bound is absolute, the same 22 u |v| for every component, and that is the contract: a
+# component the rotation makes far smaller than |v| keeps no relative accuracy. With v the
+# exact inverse image of (1, 0, 0) rounded to doubles, under 2,000 random unit q, 4,000 of the
+# 6,000 answer components were more than 8 ulp from their own exact values (up to 5.9e20 ulp:
+# 2^-54 for an exact 4.58e-22), while all 6,000 were within 7.39 u |v|. A componentwise answer
+# would need every product and sum compensated (the arithmetic of `m3_normal_matrix_cof`'s
+# compensated tier, whose cost mat3.cyr states); it is not done here.
+# [measured: scratch rot.py / ord.in, exact Fraction rotation, lane MAT4, 2026-11-01; cycc 6.7.18]
 # On 3,000 normalised q the p99 falls from 3.6 to 2.7 u|v|, and the 1,681 whose |q|^2 is 1.0
 # keep 3.3.7's bits.
 # [measured: scratch rot_acc.py, exact Fraction rotation, 3.3.7 and lane FB, 2026-10-31; cycc 6.7.9]
@@ -552,7 +603,12 @@ public fn hquat_rotate_vec3(q, v) {
 # `hquat_rotate_vec3` for a finite non-zero q with |q|^2 outside [1/4, 16]: q * 2^-e, e the
 # exponent of its largest component mq (bits), which is the same rotation with that component
 # in [1, 2) and so |q|^2 in [1, 16). Exact unless a component lies more than 2^1021 below the
-# largest, where it flushes: it moves the rotation by under 2^-1000 radians.
+# largest, where it flushes: it moves the rotation by under 2^-1000 radians, so the answer by
+# under 2^-1000 |v|, normwise. A component that the flushed one dominates is lost with it:
+# q = (2^-1024, about 2^497, about -1.2, about -2^-803) and v about (2^1004, -2^-71, -2^-400)
+# give z = -v.z, about 2^-400, where the exact z is 1.62e-89, almost all of it w's term
+# (2^-1299 |v|; tests/modules_c.tcyr `_r3_qc` pins it as the normwise contract's answer).
+# [measured: scratch rot.py, exact Fraction rotation q v q* / |q|^2, 3.4.1 lane MAT4, 2026-11-01; cycc 6.7.18]
 fn _hquat_rotate_qscaled(q, v, mq) {
     var e = (mq >> 52) - 1023;
     if ((mq >> 52) == 0) { e = ((f64_mul(mq, 0x43F0_0000_0000_0000) >> 52) - 1023) - 64; }   # 2^64
@@ -566,6 +622,48 @@ fn _hquat_rotate_qscaled(q, v, mq) {
 # Spherical linear interpolation
 # ================================================================
 
+# Spherical linear interpolation from a (t = 0) to b (t = 1) along the shorter arc: with b' = b
+# or -b, whichever has d = a . b' >= 0 (the same rotation), and theta the angle between a and
+# b', the answer is (sin((1 - t) theta) a + sin(t theta) b') / sin(theta), for any real t
+# (outside [0, 1] it extrapolates along the same great circle). theta is acos(d) for d <= 0.9995
+# and 2 atan2(|a - b'|, |a + b'|) above, which keeps its relative accuracy at any small angle;
+# where d >= 1 (theta below about 2^-26) or |a - b'| is 0 (or below 2^-537, where its squares
+# flush) the answer is the normalised lerp of a and b', whose angle error, at most about
+# theta^3 / 62 for t in [0, 1], is far below rounding there. a and b must be unit quaternions:
+# for others the answer is the formula's, neither unit nor an interpolation of their rotations
+# (a non-unit pair with d >= 1 takes the normalised lerp, as through 3.4.0). A zero quaternion,
+# a or b, gives NaN (it represents no rotation, `_QUAT_NAN`), as does a NaN or infinite
+# component; the designed 0 where an allocation is refused. ⚠ Through `hquat_dot` the last
+# bits can differ on aarch64.
+# [measured: theta^3 / 62, the 3.4.1 review (RV-MAT S2(d)), mpmath over t in [0, 1], 2026-10-31]
+# Accuracy, the largest error MEASURED on random unit pairs, not a bound: normwise, in ulp of
+# the largest component, against a binary128 slerp of the exact inputs (theta = 2 atan2(|a -
+# b'|, |a + b'|); it agrees with a 60-digit mpmath one to 5e-7 ulp on 64,590 of the pairs),
+# 1,000,000 pairs per band of theta (log-uniform over [1e-9, 1e-6), [1e-6, 1e-3), [1e-3,
+# 0.0316), [0.025, 0.0316), [0.0316, 0.04), [0.0316, 0.1) and [0.1, pi/2], and over [1e-9,
+# 0.0316) and [0.0316, pi/2] once more through `t3d_lerp`): for t in [0, 1], 3.73 ulp for theta
+# below 0.0316 (the atan2 form) and 4.0 above (acos); for t in [-1.5, 2.5], 9.33 below and 18.13
+# above, the acos form's own extrapolation error, unchanged since 3.4.0; for identical or
+# antipodal pairs, 4 ulp of a for t in [0, 1], -1 and 2, and 8.5 at t = 10 and -9. The error
+# grows with |t| outside [0, 1]. Those pairs were normalised by a division; pairs built as cos
+# theta a + sin theta w with b not renormalised (|b|^2 - 1 up to 54 2^-53) reach 25.15 ulp in the
+# acos band (theta = 0.396, t = -1.18) and 9.58 below the switch.
+# [measured: scratch slgen.c / slorc.c (binary128) / mpval.py, 25,000,000 pairs, 2026-10-31; cycc 6.7.18]
+# [measured: round-3 review sl/bands1.log, binary128 oracle, 300,000 pairs, 2026-10-31; cycc 6.7.18]
+# ⛔ 3.4.1 — FOR d ABOVE 0.9995 THIS WAS THE NORMALISED LERP, whose angle error grows as theta^3
+# (at most about theta^3 / 62 for t in [0, 1]): the audit's pair at d = 0.99975, t = 1/4, was
+# 3.7e-7 off (1.7e9 ulp) against a 60-digit slerp, and on 4,000 pairs the band theta in
+# [1e-5, 0.032) was up to 5.3e10 ulp off. The first 3.4.1 repair kept acos(d) up to d < 1, which
+# put a spurious theta of about 2^-26 on a pair whose d rounding alone left a few ulp below 1:
+# slerp(a, a, 10) came back 244 ulp off a (review S2). The atan2 form has neither defect; every
+# pair with d <= 0.9995 keeps its 3.4.0 bits (50,057 of 50,057 random pairs, t extrapolating
+# included). And 3.4.0 gave the zero quaternion with itself (0, 0, 0, 0) from the formula, where
+# the lerp branch gives a zero interpolant NaN (REV-FB N4).
+# [measured: scratch slerp_orc.py / sl3.py, Decimal slerp, 3.4.0, first repair, this tree, 2026-10-31; cycc 6.7.18]
+# Cost: a pair above 0.9995 now pays the formula and the atan2, 79 -> 193 ns for the audit's
+# pair (3.4.0's normalised lerp; acos's form read 174); the ordinary pair 175 -> 181 ns medians
+# against the first repair, the same arithmetic behind one more branch.
+# [measured: scratch fm4.bcyr, the first repair and this tree interleaved x 6, 2026-10-31; cycc 6.7.18]
 #must_use
 public fn hquat_slerp(a, b, t) {
     var d = hquat_dot(a, b);
@@ -576,30 +674,56 @@ public fn hquat_slerp(a, b, t) {
         bz = f64_neg(bz); bw = f64_neg(bw);
         d = f64_neg(d);
     }
-    # If very close, lerp
-    var threshold = 0x3FEFFBE76C8B4396;  # 0.9995
-    if (f64_gt(d, threshold) == 1) {
-        var omt = f64_sub(F64_ONE, t);
-        # ⛔ 3.4.0 — `hquat_normalize` gave the IDENTITY for a zero interpolant. For unit a and
-        # b it cannot be zero: |(1 - t) a + t b|^2 = 1 - 2 t (1 - t)(1 - d) >= 1 - (1 - d) / 2
-        # for every real t, and d > 0.9995 here. A non-unit pair can reach it (b = 2a at
-        # t = -1), and a NaN or infinite component cannot be normalised: neither has a
-        # direction, and the answer is NaN, not a rotation.
-        var lq = hquat_new(
-          f64_add(f64_mul(HQuat_x(a), omt), f64_mul(bx, t)),
-          f64_add(f64_mul(HQuat_y(a), omt), f64_mul(by, t)),
-          f64_add(f64_mul(HQuat_z(a), omt), f64_mul(bz, t)),
-          f64_add(f64_mul(HQuat_w(a), omt), f64_mul(bw, t))
-          );
-        if (lq == 0) { return 0; }
-        var nt, nq = hquat_normalize_checked(lq);
-        if (is_err_result(nt) == 1) {
-            if (nq == HSB_ERR_ALLOC) { return 0; }
+    # A zero quaternion represents no rotation and has no direction to interpolate from or to:
+    # NaN. Its dot with anything is a zero, so the test costs the ordinary path one compare.
+    if ((d & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        if (_hquat_is_zero(a) == 1 || _hquat_is_zero(b) == 1) {
             return hquat_new(_QUAT_NAN, _QUAT_NAN, _QUAT_NAN, _QUAT_NAN);
         }
-        return nq;
     }
-    var theta = ganita_f64_acos(d);
+    # Above d = 0.9995 theta is 2 atan2(|a - b'|, |a + b'|): each difference is one rounding, so
+    # theta keeps its relative accuracy however small it is, where acos(d) reads a d that
+    # rounding alone put a few ulp below 1 as an angle of about 2^-26 (3.4.1 review S2). d >= 1,
+    # and |a - b'| = 0 (or below 2^-537), take the normalised lerp, as d >= 0.9995 did through
+    # 3.4.0: no arc, or theta at most about 2^-26 where its error is under 2^-69 at |t| = 10.
+    # d <= 0.9995 keeps the acos form, bit for bit.
+    var theta = 0;
+    if (f64_gt(d, _QUAT_D_HI) == 1) {
+        var ux = f64_sub(HQuat_x(a), bx); var uy = f64_sub(HQuat_y(a), by);
+        var uz = f64_sub(HQuat_z(a), bz); var uw = f64_sub(HQuat_w(a), bw);
+        var nm = f64_sqrt(f64_add(f64_add(f64_mul(ux, ux), f64_mul(uy, uy)),
+            f64_add(f64_mul(uz, uz), f64_mul(uw, uw))));
+        if (f64_lt(d, F64_ONE) == 0 || f64_eq(nm, 0) == 1) {
+            var omt = f64_sub(F64_ONE, t);
+            # ⛔ 3.4.0 — `hquat_normalize` gave the IDENTITY for a zero interpolant. For unit a
+            # and b it cannot be zero in exact arithmetic: |(1 - t) a + t b|^2 = 1 - 2 t (1 - t)
+            # (1 - d) >= 1 - (1 - d) / 2 for every real t, and d >= 1 or a = b' here. A non-unit
+            # pair can reach it (b = 2a at t = -1), and a NaN or infinite component cannot be
+            # normalised: neither has a direction, and the answer is NaN, not a rotation. In
+            # floating point an identical pair past |t| = 2^53 cancels too: t = 2^54 gives NaN
+            # and t = 2^53 what the last bits left, where the answer is a.
+            var lq = hquat_new(
+              f64_add(f64_mul(HQuat_x(a), omt), f64_mul(bx, t)),
+              f64_add(f64_mul(HQuat_y(a), omt), f64_mul(by, t)),
+              f64_add(f64_mul(HQuat_z(a), omt), f64_mul(bz, t)),
+              f64_add(f64_mul(HQuat_w(a), omt), f64_mul(bw, t))
+              );
+            if (lq == 0) { return 0; }
+            var nt, nq = hquat_normalize_checked(lq);
+            if (is_err_result(nt) == 1) {
+                if (nq == HSB_ERR_ALLOC) { return 0; }
+                return hquat_new(_QUAT_NAN, _QUAT_NAN, _QUAT_NAN, _QUAT_NAN);
+            }
+            return nq;
+        }
+        var vx = f64_add(HQuat_x(a), bx); var vy = f64_add(HQuat_y(a), by);
+        var vz = f64_add(HQuat_z(a), bz); var vw = f64_add(HQuat_w(a), bw);
+        var np = f64_sqrt(f64_add(f64_add(f64_mul(vx, vx), f64_mul(vy, vy)),
+            f64_add(f64_mul(vz, vz), f64_mul(vw, vw))));
+        theta = f64_mul(F64_TWO, ganita_f64_atan2(nm, np));
+    } else {
+        theta = ganita_f64_acos(d);
+    }
     var sin_theta = f64_sin(theta);
     var inv_sin = f64_div(F64_ONE, sin_theta);
     var s0 = f64_mul(f64_sin(f64_mul(f64_sub(F64_ONE, t), theta)), inv_sin);

@@ -66,7 +66,8 @@ fn _dg_idx4(a, b, c, d, dim) {
 # metric_inv: flat f64 array (dim*dim) -- g^{ij}
 # metric_deriv: flat f64 array (dim*dim*dim) -- d_k g_{ij}
 #   indexed as metric_deriv[(i*dim + j)*dim + k] = partial_k g_{ij}
-# Returns: pointer to allocated flat f64 array of dim^3 elements.
+# Returns: pointer to allocated flat f64 array of dim^3 elements, or the designed 0 for a
+#   null pointer, a dim outside 1..16 or a refused allocation.
 #
 # NOTE for anyone adding a fixture: an all-zero metric_deriv makes the bracket
 # below identically zero, so the lambda contraction, the three derivative
@@ -136,7 +137,8 @@ public fn christoffel_get(christoffel, dim, a, mu, nu) {
 # christoffel: flat f64 array (dim^3) -- Gamma^a_{mu nu}
 # christoffel_deriv: flat f64 array (dim^4) -- d_k Gamma^a_{mu nu}
 #   indexed as christoffel_deriv[(((a*dim + mu)*dim + nu)*dim + k)] = d_k Gamma^a_{mu nu}
-# Returns: pointer to allocated flat f64 array of dim^4 elements.
+# Returns: pointer to allocated flat f64 array of dim^4 elements, or the designed 0 for a
+#   null pointer, a dim outside 1..16 or a refused allocation.
 
 public fn riemann_tensor(christoffel, christoffel_deriv, dim) {
     if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }  # 16^4 = 65536 slots at the cap
@@ -200,7 +202,8 @@ public fn riemann_get(riemann, dim, rho, sigma, mu, nu) {
 # R_{mu nu} = R^lambda_{mu lambda nu}   (contract 1st and 3rd indices)
 #
 # riemann: flat f64 array (dim^4)
-# Returns: pointer to allocated flat f64 array of dim^2 elements.
+# Returns: pointer to allocated flat f64 array of dim^2 elements, or the designed 0 for a
+#   null pointer, a dim outside 1..16 or a refused allocation.
 
 public fn ricci_tensor(riemann, dim) {
     if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
@@ -236,6 +239,8 @@ public fn ricci_get(ricci, dim, mu, nu) {
 # ================================================================
 # 4. RICCI SCALAR  R = g^{mu nu} R_{mu nu}
 # ================================================================
+# ricci: R_{mu nu} (flat dim^2); metric_inv: g^{mu nu} (flat dim^2). Returns the scalar
+# as f64, summed in index order; the designed 0 for a null pointer or a dim outside 1..16.
 
 public fn ricci_scalar(ricci, metric_inv, dim) {
     if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
@@ -258,6 +263,9 @@ public fn ricci_scalar(ricci, metric_inv, dim) {
 # ================================================================
 # 5. EINSTEIN TENSOR  G_{mu nu} = R_{mu nu} - 1/2 R g_{mu nu}
 # ================================================================
+# ricci: R_{mu nu}; metric: g_{mu nu}; metric_inv: g^{mu nu} (each flat dim^2). Returns a
+# fresh flat dim^2 array, or the designed 0 for a null pointer, a dim outside 1..16 or a
+# refused allocation.
 
 public fn einstein_tensor(ricci, metric, metric_inv, dim) {
     if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
@@ -285,20 +293,8 @@ public fn einstein_tensor(ricci, metric, metric_inv, dim) {
     return out;
 }
 
-# ================================================================
-# 5b. SECTIONAL CURVATURE  K(u,v)
-# ================================================================
-# K(u,v) = R(u,v,v,u) / (⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩²)
-# with R(u,v,v,u) = R_{ασμν} u^α v^σ u^μ v^ν and the first Riemann index lowered
-# by the metric: R_{ασμν} = g_{αρ} R^ρ_{σμν}. Positive for a sphere (verified
-# against hisab's Riemann convention at the equator: R^θ_{φθφ} = +1).
-#
-# riemann: (1,3) tensor R^ρ_{σμν} (flat dim⁴, from riemann_tensor)
-# metric:  covariant g_{ij} (flat dim², for the index lowering + inner products)
-# u, v:    contravariant vectors (flat dim)
-# Returns: the sectional curvature; 0 for a degenerate plane (u ∥ v).
-
-# Metric inner product ⟨a,b⟩ = g_{ij} a^i b^j.
+# Metric inner product ⟨a,b⟩ = g_{ij} a^i b^j. (sectional_curvature stopped using it in
+# 3.4.1; tests/hisab.tcyr's parallel-transport check still measures lengths with it.)
 fn _dg_inner(metric, a, b, dim) {
     var sum = 0;
     var i = 0;
@@ -314,59 +310,204 @@ fn _dg_inner(metric, a, b, dim) {
     return sum;
 }
 
+# The exponent e of a finite nonzero x, x in [2^e, 2^(e+1)), subnormals included.
+fn _dg_exp2(x) {
+    var b = (x >> 52) & 0x7FF;
+    if (b != 0) { return b - 1023; }
+    var m = x & 0xFFFFFFFFFFFFF;
+    var p = 0;
+    while (m > 1) { m = m >> 1; p = p + 1; }
+    return p - 1074;
+}
+
+# x * 2^k, in exact steps of 2^+-1000 and one last that may round (k any i64 in range).
+fn _dg_ldexp(x, k) {
+    while (k > 1000) { x = f64_mul(x, (1023 + 1000) << 52); k = k - 1000; }
+    while (k < 0 - 1000) { x = f64_mul(x, (1023 - 1000) << 52); k = k + 1000; }
+    return f64_mul(x, (1023 + k) << 52);
+}
+
+# -e for the largest |entry| of n f64s at p (so that p * 2^-e has its largest in [1, 2)),
+# or 0 when that largest is 0 or not finite (no scaling; the zero or the NaN / Inf then
+# answers for itself). A NaN entry is skipped here and propagates through the arithmetic.
+fn _dg_unit_shift(p, n) {
+    var mx = 0;
+    var i = 0;
+    while (i < n) {
+        var a = f64_abs(load64(p + i * 8));
+        if (f64_gt(a, mx) == 1) { mx = a; }
+        i = i + 1;
+    }
+    if (f64_gt(mx, 0) == 0 || f64_lt(mx, F64_POS_INF) == 0) { return 0; }
+    return 0 - _dg_exp2(mx);
+}
+
+# u^a v^s - u^s v^a with both products exact (Dekker's two-product, |entries| < 2^995) and
+# their difference carried: within an ulp or two of the exact determinant.
+fn _dg_det2(a, b, c, d) {
+    var sa = f64_mul(a, 0x41A0_0000_0200_0000);   # 2^27 + 1
+    var ah = f64_sub(sa, f64_sub(sa, a)); var al = f64_sub(a, ah);
+    var sb = f64_mul(b, 0x41A0_0000_0200_0000);
+    var bh = f64_sub(sb, f64_sub(sb, b)); var bl = f64_sub(b, bh);
+    var sc = f64_mul(c, 0x41A0_0000_0200_0000);
+    var ch = f64_sub(sc, f64_sub(sc, c)); var cl = f64_sub(c, ch);
+    var sd = f64_mul(d, 0x41A0_0000_0200_0000);
+    var dh = f64_sub(sd, f64_sub(sd, d)); var dl = f64_sub(d, dh);
+    var p = f64_mul(a, b);
+    var pe = f64_add(f64_add(f64_add(f64_sub(f64_mul(ah, bh), p), f64_mul(ah, bl)), f64_mul(al, bh)),
+      f64_mul(al, bl));
+    var q = f64_mul(c, d);
+    var qe = f64_add(f64_add(f64_add(f64_sub(f64_mul(ch, dh), q), f64_mul(ch, dl)), f64_mul(cl, dh)),
+      f64_mul(cl, dl));
+    return f64_add(f64_sub(p, q), f64_sub(pe, qe));
+}
+
+# ================================================================
+# 5b. SECTIONAL CURVATURE  K(u,v)
+# ================================================================
+# K(u,v) = R(u,v,v,u) / (⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩²)
+# with R(u,v,v,u) = R_{ασμν} u^α v^σ u^μ v^ν and the first Riemann index lowered
+# by the metric: R_{ασμν} = g_{αρ} R^ρ_{σμν}. Positive for a sphere (verified
+# against hisab's Riemann convention at the equator: R^θ_{φθφ} = +1).
+#
+# riemann: (1,3) tensor R^ρ_{σμν} (flat dim⁴, from riemann_tensor)
+# metric:  covariant g_{ij} (flat dim², for the index lowering + inner products)
+# u, v:    contravariant vectors (flat dim)
+# Returns: the sectional curvature, a function of the plane u∧v alone; 0 for a
+#   degenerate plane: u ∥ v exactly (u∧v = 0, the zero vector included), or a plane the
+#   metric is null on (|u∧v|² = 0, possible only in indefinite signature). NaN in an input
+#   it reads propagates. The designed 0 also answers a null pointer or a dim outside 1..16.
+# Accuracy (3.4.1): u∧v is formed componentwise to an ulp or two, so planes any angle
+#   apart are answered; the result is backward stable (the rounding of R's and g's
+#   contractions, a few ulp of their terms), and range-free in every input: u, v, u∧v, g
+#   and R are each scaled by a power of two before anything is squared.
 public fn sectional_curvature(riemann, metric, u, v, dim) {
     if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
     if (riemann == 0 || metric == 0 || u == 0 || v == 0) { return 0; }
-    # Numerator: R_{ασμν} u^α v^σ u^μ v^ν, lowering ρ with the metric per term.
-    var num = 0;
+    # ⛔ 3.4.0 AND EARLIER — THE PLANE'S AREA WAS FORMED AS <u,u><v,v> - <u,v>^2, and
+    # the numerator as the four-fold sum over u^a v^s u^m v^n, both of which cancel to
+    # sin^2(angle) of their terms: planes 1e-6 rad apart read sin^2 < 1e-12, which the
+    # degeneracy test then called a degenerate plane, and the answer was 0, "flat"
+    # (exact 1). And both are degree four in u and v and two in g: spanning vectors at
+    # 2^-256 gave 0 (an absolute DBL_MIN backstop on the area), at 2^256 NaN, and the
+    # metric 2^-600 I gave 0, exact 2^600.
+    # [measured: tests/abuse.tcyr "3.4.1: sectional_curvature", baseline 3.4.0]
+    # ⭐ 3.4.1 — on the bivector B = u∧v, B^{as} = u^a v^s - u^s v^a, formed exactly enough
+    # (_dg_det2) that it keeps the angle to the last bits, with K = R(B, B) / |B|^2:
+    #   R(B, B) = 1/4 sum R_{asmn} B^{as} B^{mn},  |B|^2 = 1/2 sum g_am g_sn B^{as} B^{mn}
+    # (the old two quantities exactly, for a curvature tensor and a symmetric g; for a
+    # tensor with a rounding-level symmetric part in (a, s) or (m, n), its projection onto
+    # the antisymmetric part, which is the part a plane can see). u, v, B, g and R are each
+    # scaled by a power of two (exact) to put their largest entry in [1, 2): K does not see
+    # the scale of u, v or B, and R's and g's come back as one power of two at the end.
+    # u∧v = 0 exactly gives |B|^2 = 0, the degenerate plane, as does a null plane; both
+    # return 0 at the one test below.
+    # Contracting R with B first is O(dim^4), where the old loop was O(dim^5).
+    var nb = dim * dim;
+    var uh: i64[16];
+    var vh: i64[16];
+    var su = _dg_unit_shift(u, dim);
+    var sv = _dg_unit_shift(v, dim);
+    var i = 0;
+    while (i < dim) {
+        store64(&uh + i * 8, _dg_ldexp(load64(u + i * 8), su));
+        store64(&vh + i * 8, _dg_ldexp(load64(v + i * 8), sv));
+        i = i + 1;
+    }
+    # B, full and antisymmetric, row-major dim x dim.
+    var bf: i64[256];
     var a = 0;
     while (a < dim) {
-        var s = 0;
+        store64(&bf + _dg_idx2(a, a, dim), 0);
+        var s = a + 1;
         while (s < dim) {
-            var m = 0;
-            while (m < dim) {
-                var n = 0;
-                while (n < dim) {
-                    var rcov = 0;
-                    var rho = 0;
-                    while (rho < dim) {
-                        var g_ar = load64(metric + _dg_idx2(a, rho, dim));
-                        rcov = f64_add(rcov, f64_mul(g_ar, riemann_get(riemann, dim, rho, s, m, n)));
-                        rho = rho + 1;
-                    }
-                    var w = f64_mul(f64_mul(load64(u + a * 8), load64(v + s * 8)),
-                      f64_mul(load64(u + m * 8), load64(v + n * 8)));
-                    num = f64_add(num, f64_mul(rcov, w));
-                    n = n + 1;
-                }
-                m = m + 1;
-            }
+            var bv = _dg_det2(load64(&uh + a * 8), load64(&vh + s * 8), load64(&uh + s * 8), load64(&vh + a * 8));
+            store64(&bf + _dg_idx2(a, s, dim), bv);
+            store64(&bf + _dg_idx2(s, a, dim), f64_neg(bv));
             s = s + 1;
         }
         a = a + 1;
     }
-    # Denominator: |u∧v|² = ⟨u,u⟩⟨v,v⟩ − ⟨u,v⟩².
-    var uu = _dg_inner(metric, u, u, dim);
-    var vv = _dg_inner(metric, v, v, dim);
-    var uv = _dg_inner(metric, u, v, dim);
-    var denom = f64_sub(f64_mul(uu, vv), f64_mul(uv, uv));
-    # ⛔ ONE LINE DOING TWO JOBS, AND FAILING BOTH. `denom` = |u∧v|² is degree
-    # FOUR in the vectors and degree TWO in the metric, so an absolute 1e-12 called
-    # ordinary planes degenerate — and it returned exactly 0.0, which is the value
-    # meaning FLAT SPACE, through a bare f64 with no error channel.
-    # ⭐ (1) DEGENERACY is a question about the ANGLE, so ask it as one: the ratio
-    # denom/(uu*vv) is sin²(angle), dimensionless and scale-free by construction,
-    # because both sides carry identical dimensions and cancel.
-    if (f64_lt(f64_abs(denom), f64_mul(EPSILON_F64, f64_abs(f64_mul(uu, vv)))) == 1) {
-        return 0;
+    var sb = _dg_unit_shift(&bf, nb);
+    var sg = _dg_unit_shift(metric, nb);
+    var sr = _dg_unit_shift(riemann, nb * nb);
+    i = 0;
+    while (i < nb) { store64(&bf + i * 8, _dg_ldexp(load64(&bf + i * 8), sb)); i = i + 1; }
+    # T^rho_s = sum_mn Rh^rho_{s m n} B^{mn}, then L_as = sum_rho gh_{a rho} T^rho_s.
+    var tt: i64[256];
+    var rho = 0;
+    while (rho < dim) {
+        var s2 = 0;
+        while (s2 < dim) {
+            var acc = 0;
+            var m = 0;
+            while (m < dim) {
+                var n = 0;
+                while (n < dim) {
+                    if (m != n) {
+                        var rv = _dg_ldexp(riemann_get(riemann, dim, rho, s2, m, n), sr);
+                        acc = f64_add(acc, f64_mul(rv, load64(&bf + _dg_idx2(m, n, dim))));
+                    }
+                    n = n + 1;
+                }
+                m = m + 1;
+            }
+            store64(&tt + _dg_idx2(rho, s2, dim), acc);
+            s2 = s2 + 1;
+        }
+        rho = rho + 1;
     }
-    # ⚠ (2) AND THE BACKSTOP IS LOAD-BEARING, not belt-and-braces. In LORENTZIAN
-    # signature a null vector makes uu = vv = uv = 0, so denom = 0 AND uu*vv = 0 —
-    # the relative test above asks `0 < 0`, which is false, and the division would
-    # be 0/0. This is a metric-signature case, not a rounding case.
-    # [measured: g = diag(-1,1), u = v = (1,1) — docs/audit/2026-09-09-epsilon-open.json]
-    if (f64_lt(f64_abs(denom), F64_TINY) == 1) { return 0; }
-    return f64_div(num, denom);
+    var ll: i64[256];
+    var gb: i64[256];
+    a = 0;
+    while (a < dim) {
+        var c = 0;
+        while (c < dim) {
+            var lacc = 0;
+            var gacc = 0;
+            var k = 0;
+            while (k < dim) {
+                var gak = _dg_ldexp(load64(metric + _dg_idx2(a, k, dim)), sg);
+                lacc = f64_add(lacc, f64_mul(gak, load64(&tt + _dg_idx2(k, c, dim))));
+                gacc = f64_add(gacc, f64_mul(gak, load64(&bf + _dg_idx2(k, c, dim))));
+                k = k + 1;
+            }
+            store64(&ll + _dg_idx2(a, c, dim), lacc);
+            store64(&gb + _dg_idx2(a, c, dim), gacc);
+            c = c + 1;
+        }
+        a = a + 1;
+    }
+    # num = sum_{a<s} B^{as} (L_as - L_sa);  den = sum_{a<s} B^{as} (C_as - C_sa), with
+    # C = (g B) g^T. K = (num / 2) / den: 1/4 and 1/2 of the full sums above.
+    var num = 0;
+    var den = 0;
+    a = 0;
+    while (a < dim) {
+        var s3 = a + 1;
+        while (s3 < dim) {
+            var bas = load64(&bf + _dg_idx2(a, s3, dim));
+            var cas = 0;
+            var csa = 0;
+            var k2 = 0;
+            while (k2 < dim) {
+                cas = f64_add(cas, f64_mul(load64(&gb + _dg_idx2(a, k2, dim)),
+                    _dg_ldexp(load64(metric + _dg_idx2(s3, k2, dim)), sg)));
+                csa = f64_add(csa, f64_mul(load64(&gb + _dg_idx2(s3, k2, dim)),
+                    _dg_ldexp(load64(metric + _dg_idx2(a, k2, dim)), sg)));
+                k2 = k2 + 1;
+            }
+            num = f64_add(num, f64_mul(bas, f64_sub(load64(&ll + _dg_idx2(a, s3, dim)),
+                  load64(&ll + _dg_idx2(s3, a, dim)))));
+            den = f64_add(den, f64_mul(bas, f64_sub(cas, csa)));
+            s3 = s3 + 1;
+        }
+        a = a + 1;
+    }
+    if (f64_eq(den, 0) == 1) { return 0; }   # u ∥ v, or a null plane
+    # K = Kh * 2^(sg - sr): Rh = R 2^sr and gh = g 2^sg make num scale as 2^(sg + sr) and
+    # den as 2^(2 sg).
+    return _dg_ldexp(f64_div(f64_mul(num, F64_HALF), den), sg - sr);
 }
 
 # ================================================================
@@ -688,24 +829,6 @@ public fn geodesic_rk4(state, christoffel, dim, dt, steps) {
     return result;
 }
 
-# ================================================================
-# 6b. PARALLEL TRANSPORT along a curve
-# ================================================================
-# Transport a vector V along a curve with coordinate velocity ẋ:
-#   dV^a/dt = −Γ^a_{μν}(x) V^μ ẋ^ν
-# The one Christoffel array is held constant for the whole path, every stage of
-# every step (same convention as geodesic_rk4) — the true connection only on
-# constant-connection curves (flat space in Cartesian coordinates, or a
-# fixed-latitude circle on a sphere), an approximation otherwise that degrades
-# as Γ varies along the path. The Levi-Civita connection is metric-compatible,
-# so exact transport preserves ⟨V,V⟩; this RK4 form does so only up to its
-# truncation error, and only where the frozen connection is the true one.
-#
-# v0:        contravariant vector to transport (flat dim)
-# curve_vel: ẋ^ν, the curve's coordinate velocity (flat dim), held constant
-# christoffel: Γ^a_{μν} (flat dim³), evaluated on the curve
-# Returns: the transported vector (new alloc, flat dim)
-
 # RHS of the transport ODE: out^a = −Γ^a_{μν} v^μ ẋ^ν
 fn _pt_deriv(v, curve_vel, christoffel, dim, out) {
     var a = 0;
@@ -728,6 +851,24 @@ fn _pt_deriv(v, curve_vel, christoffel, dim, out) {
     return 0;
 }
 
+# ================================================================
+# 6b. PARALLEL TRANSPORT along a curve
+# ================================================================
+# Transport a vector V along a curve with coordinate velocity ẋ:
+#   dV^a/dt = −Γ^a_{μν}(x) V^μ ẋ^ν
+# The one Christoffel array is held constant for the whole path, every stage of
+# every step (same convention as geodesic_rk4) — the true connection only on
+# constant-connection curves (flat space in Cartesian coordinates, or a
+# fixed-latitude circle on a sphere), an approximation otherwise that degrades
+# as Γ varies along the path. The Levi-Civita connection is metric-compatible,
+# so exact transport preserves ⟨V,V⟩; this RK4 form does so only up to its
+# truncation error, and only where the frozen connection is the true one.
+#
+# v0:        contravariant vector to transport (flat dim)
+# curve_vel: ẋ^ν, the curve's coordinate velocity (flat dim), held constant
+# christoffel: Γ^a_{μν} (flat dim³), evaluated on the curve
+# Returns: the transported vector (new alloc, flat dim), or the designed 0 for a null
+#   pointer, a dim outside 1..16 or a refused allocation. steps <= 0 returns a copy of v0.
 public fn parallel_transport(v0, curve_vel, christoffel, dim, dt, steps) {
     if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
     if (v0 == 0 || curve_vel == 0 || christoffel == 0) { return 0; }
@@ -808,7 +949,10 @@ public fn parallel_transport(v0, curve_vel, christoffel, dim, dt, steps) {
 #   metric: flat f64 array (dim*dim) -- g_{ij}
 #   christoffel: flat f64 array (dim^3) -- Gamma^a_{mu nu}
 #
-# Returns: f64 -- maximum absolute residual of nabla_mu xi_nu + nabla_nu xi_mu
+# Returns: f64 -- maximum absolute residual of nabla_mu xi_nu + nabla_nu xi_mu, over
+#   mu <= nu; 0 means the field satisfies Killing's equation to the last bit. A NaN
+#   residual returns NaN (3.4.1). The designed 0 also answers a null pointer or a dim
+#   outside 1..16, as everywhere in this module.
 
 public fn killing_residual(field, metric, christoffel, dim) {
     if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
@@ -873,6 +1017,11 @@ public fn killing_residual(field, metric, christoffel, dim) {
             }
 
             var residual = f64_abs(f64_add(nabla_mu_xi_nu, nabla_nu_xi_mu));
+            # ⛔ 3.4.0 AND EARLIER — `residual > max_res` is false for a NaN, so a NaN residual
+            # was dropped and a field with a NaN derivative reported 0.0, "exactly Killing":
+            # dim 2, d xi = [[0, NaN], [3, 0]] -> 0. ⭐ 3.4.1: a NaN residual is the answer.
+            # [measured: tests/abuse.tcyr "3.4.1: killing_residual", baseline 3.4.0]
+            if (f64_eq(residual, residual) == 0) { return residual; }
             if (f64_gt(residual, max_res) == 1) {
                 max_res = residual;
             }
@@ -891,7 +1040,12 @@ public fn killing_residual(field, metric, christoffel, dim) {
 
 # Wedge product of two 1-forms: (alpha ^ beta)_{ij} = alpha_i * beta_j - alpha_j * beta_i
 # alpha, beta: pointers to f64 arrays of length dim
-# Returns: pointer to allocated f64 array of C(dim, 2) = dim*(dim-1)/2 elements
+# Returns: pointer to allocated f64 array of C(dim, 2) = dim*(dim-1)/2 elements -- for dim = 1
+#   an empty array (Lambda^2 of R^1 has no components): a valid pointer with nothing to read --
+#   or the designed 0 for a null pointer, a dim outside 1..16, or a refused allocation.
+# Each component is fl(fl(alpha_i beta_j) - fl(alpha_j beta_i)): exact when both products are,
+#   otherwise within u (|alpha_i beta_j| + |alpha_j beta_i|) + u |result| of the exact value
+#   (u = 2^-53; a product that underflows adds up to 2^-1075, one that overflows gives +-Inf/NaN).
 # Stored in strictly-increasing index order: (0,1), (0,2), ..., (0,dim-1), (1,2), ...
 
 public fn wedge_1_1(alpha, beta, dim) {
@@ -902,7 +1056,12 @@ public fn wedge_1_1(alpha, beta, dim) {
     if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
     if (alpha == 0 || beta == 0) { return 0; }
     var n2 = dim * (dim - 1) / 2;
-    var out = alloc(n2 * 8);
+    # ⛔ 3.4.0 AND EARLIER -- dim = 1 asked alloc for 0 bytes, which answers 0, so a valid input
+    # read as a refusal. ⭐ 3.4.1: the empty array is 8 reserved bytes, never read, and 0 stays
+    # the refusal. [measured: tests/modules_c.tcyr "3.4.1 LIE3: wedge_1_1", baseline 3.4.0]
+    var nbytes = n2 * 8;
+    if (nbytes == 0) { nbytes = 8; }
+    var out = alloc(nbytes);
     if (out == 0) { return 0; }
 
     var pos = 0;

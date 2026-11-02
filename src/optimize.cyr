@@ -5,7 +5,7 @@
 # Provides:
 #   opt_gradient_descent      -- steepest descent with fixed learning rate
 #   opt_conjugate_gradient    -- Polak-Ribiere+ conjugate gradient, strong-Wolfe line search
-#   opt_bfgs                  -- BFGS quasi-Newton with Armijo line search
+#   opt_bfgs                  -- BFGS quasi-Newton, strong-Wolfe line search
 #   opt_lbfgs                 -- limited-memory BFGS (two-loop recursion)
 #   opt_levenberg_marquardt   -- nonlinear least squares (damped Gauss-Newton)
 #
@@ -29,7 +29,7 @@
 # reached only through their `n <= 0` / `n > _OPT_MAX_DIM` guards until 2.8.3 --
 # every one returned before its first alloc, leaving ~490 lines of solver body
 # unexecuted by any suite. tests/hisab.tcyr now drives all three (and the shared
-# Armijo backtrack) to closed-form minimisers on a quadratic bowl, Rosenbrock,
+# Armijo backtrack, removed in 3.4.1) to closed-form minimisers on a quadratic bowl, Rosenbrock,
 # x^4 + x^2 and an over-determined line fit.
 
 # ================================================================
@@ -42,7 +42,6 @@ var _OPT_F64_HALF  = 0x3FE0000000000000;          # 0.5
 var _OPT_F64_C1    = 0x3F1A36E2EB1C432D;          # 1e-4 (Armijo constant)
 # _opt_wolfe_search: the backtracking step's lower hold.
 var _OPT_LS_TENTH  = 0x3FB999999999999A;          # 0.1
-var _OPT_MAX_LS    = 40;                           # max line search iterations
 
 # Dimension cap for the solvers whose allocation is a product of caller-supplied
 # sizes -- n*n for opt_bfgs' inverse Hessian, m*(2n+1) for opt_lbfgs' history
@@ -149,6 +148,9 @@ fn _opt_norm_scaled(v, n) {
 # step falls below the ULP of x and the solver stalls for a reason that is not
 # this defect — the trap 2.15.0's optimizer sweep already fell into.
 # [measured: 1001-scale objective sweep on opt_conjugate_gradient, 2026-09-10]
+# (3.4.1: an objective-scaled sweep can show a solver's own scale defect too: LM's absolute
+# damping refused every residual scale below 2^-34, and opt_bfgs's unit first step 182 of 201
+# objective scales; both are repaired, at opt_levenberg_marquardt and opt_bfgs.)
 #
 # ⭐ SUM-AWARE, because two of the three call sites ALREADY HAVE the sum. `gg_old`
 # in conjugate-gradient and `cost` in Levenberg-Marquardt are carried across
@@ -238,105 +240,35 @@ fn _opt_scale_pow2(v, n, m) {
 # x * 2^m, for -2044 <= m <= 2046, in two steps (each factor a normal power of two): exact
 # where the result is normal. At m = -2045 or -2046 a factor's exponent field would be 0.
 # The callers stay inside: _opt_pair_scale's power is at most 1023 in magnitude, and
-# _opt_armijo scales its decrease back by -2 times one that is negative, at most 2046.
+# _opt_wolfe_search scales its decrease back by -2 times one, at most 2046.
 fn _opt_pow2(x, m) {
     var m1 = m / 2;
     return f64_mul(f64_mul(x, (1023 + m1) << 52), (1023 + m - m1) << 52);
 }
 
-# Armijo backtracking line search.
-# Finds alpha such that f(x + alpha*d) <= f(x) + c1*alpha*(grad . d).
-# Writes x + alpha*d into x_trial.
-# Returns the f64 step size alpha.
-fn _opt_armijo(f, x, d, grad_ptr, n, f_old, x_trial) {
-    var dg = _opt_dot(d, grad_ptr, n);
-    # ⛔ 3.3.7 — d.g OVERFLOWED WHERE THE ARMIJO DECREASE DID NOT. d.g goes as the square of
-    # the gradient's scale, so from |g| near 2^512 it was +-Inf while c1 * alpha * d.g is
-    # 2^-13 of it: a descent direction's threshold was -Inf, no step passed, and after 40
-    # halvings the fallback took alpha = 2^-40. opt_conjugate_gradient, whose direction
-    # stays at the gradient's scale, made no progress on the BFGS scale fixture from
-    # k = 2^496 (see there). An infinite d.g is now formed from d and g each rescaled by the
-    # power of two _opt_pair_scale gives their norms, and the decrease is multiplied back
-    # (dsc). A finite d.g takes the 3.3.6 operations, bit for bit.
-    var dsc = 0;
-    if (f64_eq(f64_abs(dg), F64_POS_INF) == 1) {
-        var dm = _opt_pair_scale(_opt_norm(d, n), _opt_norm(grad_ptr, n));
-        if (dm != 0) {
-            var sdg = _OPT_F64_ZERO;
-            var di = 0;
-            while (di < n) {
-                var dd = _opt_pow2(load64(d + di * 8), dm);
-                sdg = f64_add(sdg, f64_mul(dd, _opt_pow2(load64(grad_ptr + di * 8), dm)));
-                di = di + 1;
-            }
-            dg = sdg;
-            dsc = 0 - 2 * dm;
-        }
-    }
-    var alpha = _OPT_F64_ONE;
-
-    var ls = 0;
-    while (ls < _OPT_MAX_LS) {
-        _opt_axpy(x_trial, x, alpha, d, n);
-        var f_new = fncall1(f, x_trial);
-        var dec = f64_mul(_OPT_F64_C1, f64_mul(alpha, dg));
-        if (dsc != 0) { dec = _opt_pow2(dec, dsc); }
-        var threshold = f64_add(f_old, dec);
-        if (f64_lt(f_new, threshold) == 1) {
-            return alpha;
-        }
-        # The second test is where NaN has to be handled, because every f64 comparison
-        # involving NaN returns 0. The old `f64_lt(threshold, f_new) == 0` alone also
-        # accepted a NaN objective, taking the step and poisoning x for BFGS, L-BFGS and
-        # CG; requiring f_new to compare equal to itself rejects a NaN f_new. What it
-        # accepts is a number f_new with f_new <= threshold (the tie, as the first test
-        # took the rest) or beside a NaN `threshold`, where `f64_lt(NaN, f_new)` is 0.
-        # ⚠ 3.3.3 — THAT NaN-`threshold` CASE IS KEPT. f(x) NaN at the iterate, or a
-        # NaN in grad . d, makes the first step whose f_new is a number pass. No public
-        # result is fabricated by it: CG, BFGS and L-BFGS return Ok only once the
-        # gradient-norm test passes at a finite gradient, and every other exit is
-        # NO_CONVERGENCE. With f = (x-3)^2 made NaN at x0 = 0 (n = 1, max_iter 200,
-        # L-BFGS m = 5), all three return Ok at the minimiser: BFGS and L-BFGS at
-        # exactly 3 for tol 1e-6, 1e-8 and 1e-12; CG 5.5e-12 off 3 for tol 1e-6 and
-        # 1e-8, and exactly 3 for tol 1e-12. With a NaN gradient component f ignores
-        # (n = 2), all three return NO_CONVERGENCE with the NaN in out_x. `f64_le(f_new,
-        # threshold)` differs from this test only for a NaN threshold beside a number,
-        # which it rejects: CG then lands on exactly 3 at all three tolerances, and the
-        # NaN-gradient runs stay NO_CONVERGENCE.
-        # [measured: NaN-threshold probe, 3.3.2 and 3.3.3 bundles and an f64_le build, 2026-10-01]
-        # ⛔ 3.3.7 — AND A STEP TO f = +Inf PASSED A THRESHOLD THAT HAD OVERFLOWED. Along a
-        # direction that is not a descent one, f_old + c1 * alpha * d.g can round to +Inf (a
-        # d.g that overflowed to +Inf made it so in 3.3.6 too), and +Inf <= +Inf took the
-        # step. With the d.g repair above and not this one, opt_conjugate_gradient at
-        # k = 2^504 on the BFGS scale fixture took such a step at its second iteration and
-        # returned NaN (3.3.6 there: a finite wrong point, both NO_CONVERGENCE). A step from a
-        # finite f to +Inf is never a decrease, and is now refused; from an infinite or NaN
-        # f_old it is taken as before.
-        # [measured: scratch CG variant sweeps (pcgv2.cyr, pcgv5.cyr, pcgdbg.cyr), 2026-10-31]
-        if (f64_eq(f_new, f_new) == 1 && f64_lt(threshold, f_new) == 0) {
-            if (f64_eq(f_new, F64_POS_INF) == 0 || f64_lt(f64_abs(f_old), F64_POS_INF) == 0) {
-                return alpha;
-            }
-        }
-        alpha = f64_mul(alpha, _OPT_F64_HALF);
-        ls = ls + 1;
-    }
-    # Fallback: use the last alpha
-    _opt_axpy(x_trial, x, alpha, d, n);
-    return alpha;
-}
+# ⛔ 3.4.1 — _opt_armijo, THE ARMIJO BACKTRACK, IS GONE. CG and L-BFGS left it for
+# _opt_wolfe_search in 3.4.0 and opt_bfgs in 3.4.1, which leaves no caller. Its 40-halving
+# fallback took the untested step 2^-40, uphill or not (roadmap [3.4.1], AU2-G4-F7); its 3.3.3
+# NaN rule and its 3.3.7 d.g and +Inf repairs are in CHANGELOG.md, and _opt_wolfe_search has
+# the same rules: a NaN f is never accepted, and a step from a finite f to +Inf is not a
+# decrease.
 
 # The line search constants of opt_conjugate_gradient and opt_lbfgs (_opt_wolfe_search):
 # the curvature constants of the strong Wolfe conditions, 0.1 for conjugate gradients and
 # 0.9 for a quasi-Newton step (Nocedal & Wright's values), the relative allowance on f
 # where the Armijo decrease cannot be measured (Hager & Zhang's approximate Wolfe
-# conditions use 1e-6; 2^-20 here), and the trial cap.
+# conditions use 1e-6; 2^-20 here), and the trial cap. For the quasi-Newton search: the curvature
+# constant of a first trial from _opt_qn_first, the refused trials after which its back-off speeds
+# up (_opt_wolfe_search), and the multiple of |x| that is one of that trial's lengths (_opt_qn_first).
 # [measured: tests/edge_cases.tcyr, group "3.4.0: opt_conjugate_gradient, a line search on the slope"]
 enum _OptCg {
     _OPT_CG_SIGMA = 0x3FB999999999999A;    # 0.1
     _OPT_QN_SIGMA = 0x3FECCCCCCCCCCCCD;    # 0.9
+    _OPT_QN_SIGMA1 = 0x3FD0000000000000;   # 0.25
     _OPT_CG_EPS = 0x3EB0000000000000;      # 2^-20
     _OPT_CG_MAX_LS = 40;
+    _OPT_QN_CUT = 8;
+    _OPT_QN_XLEN = 0x3FF4000000000000;     # 1.25
 }
 
 # Internal: the slope d.g with d and g each multiplied by 2^m first (m = 0: the plain
@@ -370,6 +302,8 @@ fn _opt_cg_first(a_prev, s_prev, m_prev, s, m) {
 #   |phi'(alpha)| <= sigma |phi'(0)|                       (curvature, strong Wolfe)
 #   phi(alpha) <= phi(0) + c1 alpha phi'(0)                 (Armijo, where measurable)
 # for phi(alpha) = f(x + alpha d), phi'(alpha) = g(x + alpha d).d, from the trial a0.
+# a1 (0: none) is a longer trial for a search from _opt_qn_first and tol the caller's convergence
+# test, both read by the quasi-Newton search only: opt_conjugate_gradient passes 0 for them.
 # f0 = phi(0); dg0 = phi'(0) < 0 at scale 2^(2m) (_opt_cg_slope). A trial point
 # that brackets the minimum along d -- its slope is not negative, or f rose past the
 # allowance -- becomes the bracket's high end, one with a negative slope and an
@@ -383,6 +317,22 @@ fn _opt_cg_first(a_prev, s_prev, m_prev, s, m) {
 # or the bracket holds no double between its ends, it returns the bracket's low end (a
 # step that descends, with an acceptable f, 0 when there is none) and sets st[2] to 1:
 # x_trial, g_new and st[0] then hold the last trial's, and the caller re-evaluates.
+# The quasi-Newton search differs in five places (3.4.1, third review, below):
+# - With no step taken yet (lo = 0) it does not stop at _OPT_CG_MAX_LS. From the _OPT_QN_CUT-th
+#   refused trial each next trial is cut by a further 2^-1, 2^-2, ..., until one is taken or
+#   underflows: from any a0 at most about 73 trials, which reach every length a double can hold, and
+#   a trial that rounds back to x is a low end the solvers' stall rule reads (_opt_same). So 0 is
+#   returned only when no trial down to underflow was acceptable. The factors are powers of two, so
+#   the path still scales exactly.
+# - The second non-finite f in a row costs no gradient: its slope says nothing the first did not.
+# - a0 from _opt_qn_first (a1 > 0) is taken only within |phi'| <= 1/4 |phi'(0)|: past that, the secant
+#   through its slope gives the line's minimum (exact on a quadratic), and a first pair that a step
+#   past the minimum spoils is what an ill-conditioned problem pays for. Later trials keep sigma.
+# - An extrapolation the secant would take past 16 times the step goes to a1, the longer length, if
+#   that is further.
+# - A trial that meets both conditions with |g| < tol is one the caller would return Ok on, so its slope
+#   is first compared with phi's slope just behind it (_opt_ls_peak). Where phi curves down into the
+#   trial it is a high end, as an Armijo failure is.
 #
 # ⛔ 3.4.0 — THE ARMIJO BACKTRACK COULD NOT FIND A CONJUGATE GRADIENT STEP. CG's directions
 # are conjugate only when each step reaches the minimum along its line, and halving from
@@ -433,7 +383,7 @@ fn _opt_cg_first(a_prev, s_prev, m_prev, s, m) {
 # before, so opt_lbfgs's path is no longer the same at every power-of-two scale (the 1e5
 # quadratic: 16 / 10 at scale 1, 9 / 9 at 2^500 and 2^-600). CG and BFGS are unchanged.
 # [measured: the reviewer's optimizer set (NU1-work/o/opt.cyr), this tree, integ-snap5 and 3.3.7, 2026-10-31]
-fn _opt_wolfe_search(f, grad, x, d, n, f0, dg0, m, a0, sigma, x_trial, g_new, st) {
+fn _opt_wolfe_search(f, grad, x, d, n, f0, dg0, m, a0, a1, sigma, tol, x_trial, g_new, st) {
     var fcap = f64_add(f0, f64_mul(_OPT_CG_EPS, f64_abs(f0)));    # f0 + 2^-20 |f0|
     var f0fin = f64_lt(f64_abs(f0), F64_POS_INF);
     var curv = f64_mul(sigma, f64_abs(dg0));
@@ -454,7 +404,9 @@ fn _opt_wolfe_search(f, grad, x, d, n, f0, dg0, m, a0, sigma, x_trial, g_new, st
     var last = 0;       # the end the last trial replaced: 1 low, 2 high
     var alpha = a0;
     var ls = 0;
-    while (ls < _OPT_CG_MAX_LS) {
+    var stop = 0;
+    var hi_nf = 0;
+    while (stop == 0 && (ls < _OPT_CG_MAX_LS || (qn == 1 && lo == 0 && have_hi == 1))) {
         _opt_axpy(x_trial, x, alpha, d, n);
         var fa = fncall1(f, x_trial);
         # fok: f is acceptable here. fbad: f says the line's minimum is behind alpha.
@@ -469,6 +421,14 @@ fn _opt_wolfe_search(f, grad, x, d, n, f0, dg0, m, a0, sigma, x_trial, g_new, st
             fbad = 1 - fok;
         } else {
             if (f64_le(fa, fcap) == 0) { fbad = 1; }            # true for a NaN fa
+            # ⛔ 3.4.1 (review) — AND FOR +Inf WHERE fcap ROUNDS TO +Inf. f0 + 2^-20 |f0| overflows
+            # for f0 above DBL_MAX / (1 + 2^-20), and +Inf <= +Inf then let a step from a finite f
+            # to +Inf through the approximate-Wolfe branch: f = C - DBL_MIN x below x = 1 (C 255
+            # ulps under DBL_MAX) and +Inf above, from 0 along +1 with a constant slope, extrapolated
+            # to alpha = 2^157 and handed that +Inf point back. A step from a finite f to +Inf is
+            # never a decrease (_opt_armijo's 3.3.7 rule, carried here).
+            # [measured: tests/edge_cases.tcyr, group "3.4.1 (review): the line search's +Inf and NaN rules"]
+            if (fa == F64_POS_INF) { fbad = 1; }
             var dec = f64_mul(_OPT_F64_C1, f64_mul(alpha, dg0));
             if (m != 0) { dec = _opt_pow2(dec, 0 - 2 * m); }
             var thr = f64_add(f0, dec);
@@ -480,7 +440,12 @@ fn _opt_wolfe_search(f, grad, x, d, n, f0, dg0, m, a0, sigma, x_trial, g_new, st
             }
         }
         var next = 0;
-        if (qn == 1 && meas == 1 && fok == 0 && f64_lt(f64_abs(fa), F64_POS_INF) == 1) {
+        var fin = f64_lt(f64_abs(fa), F64_POS_INF);
+        if (qn == 1 && f0fin == 1 && fin == 0 && hi_nf == 1) {
+            # A second trial in a row past the range of f: only the midpoint is left to try.
+            hi = alpha;
+            next = f64_mul(f64_add(lo, hi), F64_HALF);
+        } elif (qn == 1 && meas == 1 && fok == 0 && fin == 1) {
             # Armijo fails where it is measurable: f alone puts the minimum behind alpha, and
             # the gradient here is not needed. The next trial minimises the quadratic through
             # phi(lo), phi'(lo) and phi(alpha), held to [0.1, 0.5] of the way from lo.
@@ -489,18 +454,36 @@ fn _opt_wolfe_search(f, grad, x, d, n, f0, dg0, m, a0, sigma, x_trial, g_new, st
             have_hi = 1;
             hi_sec = 0;
             hi_f = 1;
+            hi_nf = 0;
             last = 0;           # no secant end was kept: the Illinois rule starts afresh
             next = _opt_ls_quad(lo, flo, dlo, hi, fhi, m);
         } else {
             var g_rc = fncall2(grad, x_trial, g_new);
             var da = _opt_cg_slope(d, g_new, n, m);
-            if (fok == 1 && f64_le(f64_abs(da), curv) == 1) {
-                store64(st, fa);
-                store64(st + 8, da);
-                store64(st + 16, 0);
-                return alpha;
+            hi_nf = 1 - fin;
+            var peak = 0;
+            var cv = curv;
+            if (ls == 0 && f64_gt(a1, 0) == 1) { cv = f64_mul(_OPT_QN_SIGMA1, f64_abs(dg0)); }
+            if (fok == 1 && f64_le(f64_abs(da), cv) == 1) {
+                if (qn == 1 && f64_lt(_opt_norm(g_new, n), tol) == 1) {
+                    var flat = f64_le(flo, fa) & f64_le(f64_abs(da), f64_mul(_OPT_CG_EPS, f64_abs(dlo)));
+                    peak = _opt_ls_peak(grad, x, d, n, alpha, f64_sub(alpha, lo), da, m, flat, x_trial, g_new);
+                }
+                if (peak == 0) {
+                    store64(st, fa);
+                    store64(st + 8, da);
+                    store64(st + 16, 0);
+                    return alpha;
+                }
             }
-            if (fbad == 1 || fok == 0 || f64_lt(da, 0) == 0) {
+            if (peak == 1) {
+                hi = alpha;
+                fhi = fa;
+                have_hi = 1;
+                hi_sec = 0;
+                hi_f = 1;
+                last = 0;
+            } elif (fbad == 1 || fok == 0 || f64_lt(da, 0) == 0) {
                 hi = alpha;
                 dhi = da;
                 fhi = fa;
@@ -532,6 +515,7 @@ fn _opt_wolfe_search(f, grad, x, d, n, f0, dg0, m, a0, sigma, x_trial, g_new, st
                 }
                 var lo2 = f64_mul(lo, F64_TWO);
                 if (f64_lt(next, lo2) == 1) { next = lo2; }
+                if (f64_lt(next, a1) == 1 && f64_eq(next, f64_mul(lo, 0x4030000000000000)) == 1) { next = a1; }
             } else {
                 if (hi_f == 1) {
                     next = _opt_ls_quad(lo, flo, dlo, hi, fhi, m);
@@ -544,15 +528,88 @@ fn _opt_wolfe_search(f, grad, x, d, n, f0, dg0, m, a0, sigma, x_trial, g_new, st
                 }
             }
         }
-        if (have_hi == 1) {
-            if (f64_le(next, lo) == 1 || f64_le(hi, next) == 1) { ls = _OPT_CG_MAX_LS; }   # no double between
+        if (qn == 1 && lo == 0 && ls >= _OPT_QN_CUT) {
+            next = f64_mul(next, (1022 - (ls - _OPT_QN_CUT)) << 52);    # 2^-(ls - _OPT_QN_CUT + 1)
         }
-        if (f64_lt(next, F64_POS_INF) == 0) { ls = _OPT_CG_MAX_LS; }
+        if (have_hi == 1) {
+            if (f64_le(next, lo) == 1 || f64_le(hi, next) == 1) { stop = 1; }   # no double between
+        }
+        if (f64_lt(next, F64_POS_INF) == 0) { stop = 1; }
         alpha = next;
         ls = ls + 1;
     }
     store64(st + 16, 1);
     return lo;
+}
+
+# Internal: the test a trial with |g| < tol passes before the solvers can return Ok on it. 1 when the slope of
+# phi at alpha - h is above the trial's slope da, so that phi curves down into alpha, or when the two are
+# equal and flat is 1 (f no lower than the low end, and the slope all but vanished against the low end's);
+# 0 otherwise. h is the shortest of 2^-20 w, 2^-17 w, ..., 2^-5 w (w the step from the search's low end) that
+# moves x. Where none does, a step under about 16 ulps of x, it returns 0 unread. One gradient and no value
+# of f, and a 2 n allocation; x_trial and g_new hold alpha's point and gradient when it returns 0.
+#
+# WHAT IT SHOWS AND WHAT IT CANNOT. A 1 shows that alpha is no minimum of phi: the search then goes on, with
+# alpha as a high end, as after an Armijo failure. A 0 shows only that phi does not curve down into alpha over
+# that one interval, and first-order information cannot prove a minimum. These stay Ok: a stationary inflection
+# reached from above (f = x^3 - 1/4 from 1, a first trial on x = 0, where phi falls on past it); a saddle
+# reached along a stable direction, since one line is all it reads (x^2 - y^2 from (1, 0)); a maximum whose
+# slope turns back inside h, 2^-20 of the step or longer; and a step too short to read. A start with
+# |g| < tol takes no step and is not asked, and neither is a step the search falls back on (st[2]).
+#
+# ⛔ 3.4.1 (fourth review) — A FIRST SCREEN ON THE STEP'S ENDS LET MAXIMA THROUGH. The test ran only where the
+# cubic through phi and phi' at the step's two ends curved down at alpha, to save its gradients on the rest,
+# and that screen is false wherever f fell by more than 1/3 of the linear prediction, however sharply phi
+# then rises to a stationary maximum: on A cos(w (x - m)) + b (x - m)^2 with the first trial on m, Ok at the
+# maximum in 5,310 of 6,710 runs (3.4.0: none, 108 Err; this form: none, none). No test on the ends can do
+# better: phi and phi' at two points fit a cubic and any higher feature, so only a third point separates a
+# rise to a maximum from a line minimum past alpha. Every trial with |g| < tol now pays one gradient (g at
+# alpha is kept, not taken again). On nine standard problems that is 362 -> 370 gradients for BFGS and 1,001
+# -> 1,010 for L-BFGS, the same values of f; on 12 perturbed starts 2,269 -> 2,342 and 2,575 -> 2,641, with
+# values of f 2,462 -> 2,471 and 3,080 -> 3,085, the difference from one a run being a slope difference
+# of rounding read as a maximum, which costs a few gradients.
+#   At a tol under g's resolution such a reading can cost an Ok, and the rungs set how often: 2^-26, 2^-13 and
+# 2^-3 w lost 6 of 1,680 runs at a true minimum; these lose 2, both L-BFGS on Wood at tol 1e-15 and 1e-16.
+# Six rungs from 2^-26 w lose none of them, but take 379 gradients on the nine where these take 370 and leave
+# Ok at the maximum on 84 of 6,000 short landings near 2^42. A top rung of 2^-8 w loses none and leaves 2 of
+# those, steps of 140 ulps; 2^-2 w loses 4 more of the 1,680. flat's
+# second clause is the same care: exp(x) - x near 0 has a g quantised to 2^-52 and an f rounded to 1, so
+# equal slopes and no fall say nothing unless the slope has vanished.
+# [measured: scratch harness (NUM5-work p/op.cyr, py/gm.py, py/gm2.py, py4/tight.py), s24, 3.4.0, this tree, 2026-11-01]
+#
+# ⛔ 3.4.1 (third review) — Ok WAS RETURNED ON A STATIONARY POINT OF phi THAT IS NOT A MINIMUM. The
+# Wolfe conditions cannot tell a maximum of phi from a minimum: a slope of 0 meets the curvature
+# condition, and f below f(x0) meets Armijo. Where a trial lands on the maximum of an even objective
+# (the second review's first trial of length |x|: (|x|^2 - 1)^2 from any |x| >= 1.5, 4,000 of 4,000
+# runs, Ok at the maximum) the convergence test then passes on the next line. Slopes decide and not f:
+# near a minimum of ln(1 + d^2), f's rounding is 2e-16 absolute (1 + d^2 rounds to 1), which an f test reads
+# as a rise and the slopes do not. A trial phi curves down into, or is flat at and no lower, is a high
+# end: a maximum, or a flat tail above the start the approximate Wolfe allowance let through
+# (1e12 + 1 - exp(-x^2) from 1.5 with a longer first trial: Ok at x = 21).
+# [measured: tests/edge_cases.tcyr, group "3.4.1 NUM4: Ok is refused where the line's slope reads a maximum"]
+# [measured: tests/edge_cases.tcyr, group "3.4.1 NUM5: the slope test on every landing"]
+fn _opt_ls_peak(grad, x, d, n, alpha, w, da, m, flat, x_trial, g_new) {
+    var xa = alloc(n * 16);
+    if (xa == 0) { return 0; }
+    var ga = xa + n * 8;
+    _opt_copy(xa, x_trial, n);
+    _opt_copy(ga, g_new, n);
+    var h = f64_mul(w, 0x3EB0000000000000);                                    # 2^-20
+    var k = 0;
+    while (k < 6) {
+        _opt_axpy(x_trial, x, f64_sub(alpha, h), d, n);
+        if (_opt_same(x_trial, xa, n) == 0) { break; }
+        h = f64_mul(h, 0x4020000000000000);                                    # 8
+        k = k + 1;
+    }
+    if (k == 6) { return 0; }
+    var g_rc = fncall2(grad, x_trial, g_new);
+    var dh = _opt_cg_slope(d, g_new, n, m);
+    if (f64_lt(da, dh) == 1) { return 1; }
+    if (flat == 1 && f64_eq(da, dh) == 1) { return 1; }
+    _opt_copy(x_trial, xa, n);
+    _opt_copy(g_new, ga, n);
+    return 0;
 }
 
 # Internal: the next trial of _opt_wolfe_search after an Armijo failure at hi: the minimiser
@@ -774,7 +831,7 @@ public fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin)
         # read at its own scale.
         var a0 = F64_ONE;
         if (iter > 0) { a0 = _opt_cg_first(a_prev, s_prev, m_prev, dg, m); }
-        var alpha = _opt_wolfe_search(f, grad, x, d, n, f_old, dg, m, a0, _OPT_CG_SIGMA, x_trial, g_new, st);
+        var alpha = _opt_wolfe_search(f, grad, x, d, n, f_old, dg, m, a0, 0, _OPT_CG_SIGMA, 0, x_trial, g_new, st);
         if (load64(st + 16) == 1) {
             # No step met both conditions: take the last one that descends with an
             # acceptable f, or stop, at x, unconverged, when there is none.
@@ -874,7 +931,10 @@ public fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin)
 # 3. BFGS (Broyden-Fletcher-Goldfarb-Shanno)
 # ================================================================
 
-# BFGS quasi-Newton minimization with Armijo backtracking line search.
+# BFGS quasi-Newton minimization with a strong-Wolfe line search (_opt_wolfe_search, 3.4.1).
+# The first trial of a search along -g is _opt_qn_first's and H is scaled by eq. 6.20 before its
+# first update, so a problem scaled by a power of two in f or in x takes the unscaled path, scaled,
+# bit for bit, while the run's arithmetic stays inside the double range (_opt_qn_first states it).
 # f:        function pointer, fncall1(f, x_ptr) -> f64 value
 # grad:     function pointer, fncall2(grad, x_ptr, out_grad) -> writes gradient
 # x0:       initial point (flat array of n f64s)
@@ -883,7 +943,14 @@ public fn opt_conjugate_gradient(f, grad, x0, n, tol, max_iter, out_x, out_fmin)
 # max_iter: maximum iterations (integer)
 # out_x:    pointer where optimal x is written (n f64s, caller allocates)
 # out_fmin: pointer where minimum f value is written (1 f64, caller allocates)
-# Returns:  Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) or Err(HSB_ERR_NO_CONVERGENCE)
+# Returns:  Ok(0) on success: |g| < tol at out_x, either at x0 or at a point the search reached by
+#           descent where the slope just behind it does not show the line curving down into it
+#           (_opt_ls_peak, which states what that can and cannot show: first-order information cannot
+#           prove a minimum). Err(HSB_ERR_INVALID_INPUT)
+#           (n <= 0 or past _OPT_MAX_DIM), Err(HSB_ERR_ALLOC), or Err(HSB_ERR_NO_CONVERGENCE) after
+#           max_iter, where a search backed off until its trial underflowed and found no step, or
+#           where a step from -g rounds back to x (a fixed point of the iteration); out_x / out_fmin then
+#           hold the last point and its f.
 #must_use
 public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
@@ -900,30 +967,23 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
     var s       = alloc(n * 8);
     var y       = alloc(n * 8);
     var hy      = alloc(n * 8);
+    var st      = alloc(32);    # _opt_wolfe_search's out: f, the scaled slope, the step; its a1
 
     # Inverse Hessian approximation H_inv stored as flat n*n f64 array (row-major)
     var nn = n * n;
     var h_inv = alloc(nn * 8);
 
     if (x == 0 || g == 0 || d == 0 || x_new == 0 || g_new == 0 ||
-      s == 0 || y == 0 || hy == 0 || h_inv == 0) {
+      s == 0 || y == 0 || hy == 0 || h_inv == 0 || st == 0) {
         return Err(HSB_ERR_ALLOC);
     }
 
-    # Initialize H_inv = I
-    var idx = 0;
-    while (idx < nn) {
-        store64(h_inv + idx * 8, _OPT_F64_ZERO);
-        idx = idx + 1;
-    }
-    idx = 0;
-    while (idx < n) {
-        store64(h_inv + (idx * n + idx) * 8, _OPT_F64_ONE);
-        idx = idx + 1;
-    }
+    _opt_bfgs_identity(h_inv, n);
 
     _opt_copy(x, x0, n);
     var g_rc = fncall2(grad, x, g);
+    var f_old = fncall1(f, x);
+    var nupd = 0;                 # BFGS updates made (the first is preceded by eq. 6.20)
 
     var iter = 0;
     while (iter < max_iter) {
@@ -931,7 +991,7 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
         var gnorm = _opt_norm(g, n);
         if (f64_lt(gnorm, tol) == 1) {
             _opt_copy(out_x, x, n);
-            store64(out_fmin, fncall1(f, x));
+            store64(out_fmin, f_old);
             return Ok(0);
         }
 
@@ -950,12 +1010,88 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
             i = i + 1;
         }
 
-        # Armijo backtracking line search
-        var f_old = fncall1(f, x);
-        _opt_armijo(f, x, d, g, n, f_old, x_new);
+        # ⛔ 3.4.1 — THE LINE SEARCH WAS _opt_armijo's BACKTRACK, whose fallback after 40 halvings
+        # took the untested alpha = 2^-40, uphill or not (roadmap [3.4.1], AU2-G4-F7: CG, on it
+        # until 3.4.0, went from f = 8.2e13 to 2.9e16 and to NaN on the scaled quadratic at
+        # 2^40), and whose f-only test cannot measure a step where f(x) - f* is below ulp(f):
+        # on 1 + 2^-80 |x - 0.3|^2 BFGS returned NO_CONVERGENCE 0.7 off the minimiser, which CG
+        # and L-BFGS solve since 3.4.0. The step is _opt_wolfe_search's now, as L-BFGS's (the
+        # quasi-Newton curvature constant 0.9, the unit step first), which also returns the new
+        # gradient; a direction that does not descend (rounding in H) restarts from -g with
+        # H = I; where the search backs off to underflow with no step, BFGS stops at x, NO_CONVERGENCE.
+        # The strong Wolfe conditions also keep s.y > 0, the curvature BFGS needs. With the first
+        # step's length and H's first scale set from the problem (below, and before the first
+        # update), the objective-scaled quadratic c ((x0 - 1.3)^2 + 10 (x1 - 2.7)^2) from (0, 0),
+        # tol c 1e-10, is solved at all 201 scales c = 2^-1000, 2^-990, ..., 2^1000 (3.4.0: 19,
+        # refusing 182; the strong-Wolfe search alone: 52), with no false success.
+        # Gradients / values of f against 3.4.0 on the reviewer's set, tol 1e-8 (3.4.1, third
+        # review: the first trial _opt_qn_first's, H scaled by eq. 6.20 before every first update):
+        # Rosenbrock from (-1.2, 1) 47 / 51 (36 / 90), extended Rosenbrock 10-D 47 / 51 (101 / 272),
+        # Beale from (1, 1) 19 / 19 (16 / 39), Wood from (-3, -1, -3, -1) 43 / 44 (29 / 92), Powell
+        # singular from (3, -1, 0, 1) 60 / 59 (54 / 129), Freudenstein-Roth 21 / 20 (13 / 35), Brown
+        # badly scaled 17 / 21 (13 / 68), diagonal quadratics of condition 1e4 / 1e8 from the origin
+        # 45 / 45 and 71 / 71 (13 / 66, 13 / 109): 370 gradients where 3.4.0 took 288 (+28%; the
+        # two quadratics 26 -> 116, where eq. 6.20 starts H at the stiffest direction's scale),
+        # 381 values of f where it took 900; 12 perturbed starts of five of them 2,342 gradients
+        # (3.4.0: 1,752, +34%) and 2,471 values of f (4,944). On the variable-scaled quadratic of
+        # the 3.3.7 scale fixture (tests/hisab.tcyr), k = 2^-1050 .. 2^520 in steps of 2^10, 1,570
+        # gradients and 1,517 values of f where 3.4.0 took 2,194 and 52,795, with the same 155 of
+        # 158 solved (the other three have tol k 1e-8 under 2^-1074); from the origin 1,592
+        # gradients (3.4.0: 2,136).
+        # [measured: tests/edge_cases.tcyr, group "3.4.1: opt_bfgs on the strong-Wolfe search"]
+        # [measured: scratch optimizer harness (RV-NUM rv_op.cyr, rv_xs.cyr), 3.4.0 and this tree, 2026-11-01]
+        var lm = _opt_pair_scale(_opt_norm(d, n), gnorm);
+        var ldg = _opt_cg_slope(d, g, n, lm);
+        if (f64_lt(ldg, 0) == 0) {
+            _opt_bfgs_identity(h_inv, n);
+            nupd = 0;           # H is I again: eq. 6.20 and the first-trial rule apply anew (3.4.1 review)
+            i = 0;
+            while (i < n) {
+                store64(d + i * 8, f64_neg(load64(g + i * 8)));
+                i = i + 1;
+            }
+            lm = _opt_pair_scale(gnorm, gnorm);
+            ldg = _opt_cg_slope(d, g, n, lm);
+        }
+        # The first trial: the unit step, which the quasi-Newton H makes the right length once it
+        # has a pair. Until then H is the identity, d = -g carries the gradient's units, and the
+        # trial is _opt_qn_first's, a length read from x, f and g that scales with the problem, with
+        # the longer of its two lengths (a1) for an extrapolation.
+        var a0 = _OPT_F64_ONE;
+        var a1 = 0;
+        if (nupd == 0) {
+            a0 = _opt_qn_first(x, f_old, d, n, st + 24);
+            a1 = load64(st + 24);
+        }
+        var lalpha = _opt_wolfe_search(f, grad, x, d, n, f_old, ldg, lm, a0, a1, _OPT_QN_SIGMA, tol, x_new, g_new, st);
+        if (load64(st + 16) == 1) {
+            # No step met both conditions: take the last one that descends with an acceptable
+            # f, or stop, at x, unconverged, when the search backed off to underflow with none.
+            if (f64_gt(lalpha, 0) == 0) {
+                _opt_copy(out_x, x, n);
+                store64(out_fmin, f_old);
+                return Err(HSB_ERR_NO_CONVERGENCE);
+            }
+            _opt_axpy(x_new, x, lalpha, d, n);
+            store64(st, fncall1(f, x_new));
+            var gl_rc = fncall2(grad, x_new, g_new);
+        }
+        # A step that moves no coordinate leaves every quantity as it was: H is not updated (s = 0)
+        # and the next iteration would repeat this one exactly. With a pair behind H that is H's
+        # failure, and BFGS restarts from -g with H = I; with H = I already it is a fixed point of
+        # the iteration, and BFGS stops at x, unconverged (_opt_same).
+        if (_opt_same(x_new, x, n) == 1) {
+            if (nupd == 0) {
+                _opt_copy(out_x, x, n);
+                store64(out_fmin, f_old);
+                return Err(HSB_ERR_NO_CONVERGENCE);
+            }
+            _opt_bfgs_identity(h_inv, n);
+            nupd = 0;
+        }
+        f_old = load64(st);
 
-        # Compute s = x_new - x, and new gradient
-        var g_new_rc = fncall2(grad, x_new, g_new);
+        # s = x_new - x, y = g_new - g
         i = 0;
         while (i < n) {
             store64(s + i * 8, f64_sub(load64(x_new + i * 8), load64(x + i * 8)));
@@ -992,6 +1128,28 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
         # compared against. [measured: docs/audit/2026-09-09-epsilon-open.json]
         if (f64_lt(f64_mul(EPSILON_F64, f64_mul(ns, ny)), sy) == 1) {
             var rho = f64_div(_OPT_F64_ONE, sy);
+            # Before the first update H = I is replaced by (s.y / y.y) I (Nocedal & Wright,
+            # Numerical Optimization, eq. 6.20; 3.4.1), the scale the pair measures, so the
+            # update starts from the problem's units and not from 1. Invariant under the pair's
+            # rescale above, as the update is, and under any scaling of f or of x.
+            # ⛔ 3.4.1 (second review) — A [2^-30, 2^30] BAND ON THIS SCALING WAS A SCALE CHOSEN FOR THE
+            # TEST SET. Applied only outside it (to keep 3.4.0's 13 gradients on unit-scale diagonal
+            # quadratics of condition 1e4 / 1e8), H started at I for every problem whose s.y / y.y
+            # fell inside, and extended Rosenbrock 10-D with f scaled by 2^-35 returned NO_CONVERGENCE
+            # after 54,608 gradients (3.4.0: 59), with x scaled by 2^17.5 after 79,483 (3.4.0: 60).
+            # Applied always, as here, those quadratics take 45 and 71 gradients from the origin
+            # (3.4.0: 13 and 13) -- the cost of a first H set by the stiffest direction (s.y / y.y is
+            # about 1 / lambda_max after a step along -g) -- and no run of the reviewer's sweeps fails.
+            # [measured: scratch optimizer harnesses (R2-NUM opth.cyr, RV-NUM rv_op.cyr), 3.4.0 and here, 2026-11-01]
+            var gam = f64_div(sy, _opt_dot(y, y, n));
+            if (nupd == 0) {
+                var gi = 0;
+                while (gi < n) {
+                    store64(h_inv + (gi * n + gi) * 8, gam);
+                    gi = gi + 1;
+                }
+            }
+            nupd = nupd + 1;
 
             # hy = H_inv * y
             i = 0;
@@ -1042,15 +1200,175 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
     }
 
     _opt_copy(out_x, x, n);
-    store64(out_fmin, fncall1(f, x));
+    store64(out_fmin, f_old);
     return Err(HSB_ERR_NO_CONVERGENCE);
+}
+
+# Internal: the power of two 2^e that opt_levenberg_marquardt multiplies a vector of n doubles
+# by: e puts its largest finite magnitude in [1, 2). 0 when that magnitude is already in
+# [2^-500, 2^500) (the vector is left alone, its bits and sums as before), or is 0; capped so
+# that e stays within what _opt_pow2 / _opt_scale_pow2 take.
+fn _opt_lm_exp(v, n) {
+    var mx = _OPT_F64_ZERO;
+    var i = 0;
+    while (i < n) {
+        var a = f64_abs(load64(v + i * 8));
+        if (f64_lt(mx, a) == 1 && f64_lt(a, F64_POS_INF) == 1) { mx = a; }
+        i = i + 1;
+    }
+    if (f64_eq(mx, 0) == 1) { return 0; }
+    var ex = (mx >> 52) & 0x7FF;
+    if (ex >= 523 && ex < 1523) { return 0; }
+    if (ex == 0) {
+        var m = mx;
+        ex = 1;
+        while (m < 0x0010_0000_0000_0000) { m = m << 1; ex = ex - 1; }
+    }
+    return 1023 - ex;
+}
+
+# Internal: the first trial step of opt_bfgs and opt_lbfgs along d = -g, before any pair has
+# scaled H: L / |d|, for L the shorter of the lengths 1.25 |x| and 4 |f| / |d|. The longer one's
+# trial goes to `out` (0 where there is none, or it overflows), for the search's extrapolation.
+# A length that is 0, not finite or NaN does not count; the other stands alone. 1 where neither
+# gives a positive finite trial (x = 0 and f = 0: no length to read, or L / |d| past DBL_MAX).
+#
+# ⛔ 3.4.1 (second review) — THE FIRST TRIAL MUST SCALE AS THE PROBLEM DOES, AND A BAND CANNOT DO
+# IT. Under f -> c f and x -> a x (about the origin) d = -g goes as c / a, so a trial a0 d that
+# lands at the same point of the scaled problem needs a0 to go as a^2 / c. The unit trial (3.4.0)
+# does not: opt_lbfgs solved the objective-scaled quadratic c ((x0 - 1.3)^2 + 10 (x1 - 2.7)^2)
+# from (0, 0), tol c 1e-10, at 54 of the 201 scales c = 2^-1000 .. 2^1000. A unit-LENGTH trial
+# (L = 1, as L-BFGS-B, or max(1, |x|)) fixes c but not a: from the origin it is 1 on a problem that
+# lives at a, and the second 3.4.1 form, which took it where |g| > 2^30 max(1, |x|), failed a 6-D
+# quadratic of condition 2e6 with x scaled by 2^-27.5 that 3.4.0 solved in 451 gradients (L = 1
+# everywhere fails 74 and 42 of the 158 runs of the variable-scaled 3.3.7 fixture, k = 2^-1050 ..
+# 2^520, from its two starts). The lengths x, f and g give that go as a, independently of c, are
+# |x| (when x is not 0) and |f| / |g| (when f is not 0); both are exact under a power of two.
+#   Why 4 |f| / |g|: 2 |f| / |g| is the distance to the minimiser along -g of the quadratic with
+# phi(0) = f, phi'(0) = -|g|^2 and least value 0 (Nocedal & Wright's section 3.5 estimate
+# 2 (f_k - f_{k-1}) / phi'(0), with the decrease to 0 for the last one). On a convex quadratic whose
+# least value is 0 it is never short of the line minimum (f = e.Ae / 2, g = Ae: the ratio is
+# (e.Ae)(e.A^3 e) / |Ae|^4 >= 1 by Cauchy-Schwarz), so twice it is at least twice the line minimum,
+# where phi is back at phi(0) or above: the Armijo test refuses that trial, and the quadratic through
+# phi(0), phi'(0) and the refused value (_opt_ls_quad) is phi itself, whose minimiser lies at half
+# the trial or nearer, inside [0.1, 0.5] up to ten times the line minimum: the next trial is the exact
+# line minimum, at the cost of that one value of f.
+# [measured: scratch optimizer harnesses (R2-NUM opth.cyr sweeps, RV-NUM rv_op.cyr, rv_xs.cyr), 2026-11-01]
+#
+# ⛔ 3.4.1 (third review) — THE LONGER LENGTH FAILED CONVEX PROBLEMS, AND |x| ITSELF LANDED ON THE
+# ORIGIN. The second review's max(|x|, 4 |f| / |g|) is long wherever either length is: |f| / |g| on
+# any problem started near its minimiser or with an offset in f (not an offset the scale argument
+# sees), |x| on any problem far from the origin. cosh(x) from 1e-13, tol 1e-15 tried 4e13 past the
+# minimum, 2^88 times the right step; the search then had 40 trials, each moving back by at most 1/2
+# where f overflows, and stopped at lo = 0, which the solvers read as "no step descends": both
+# returned NO_CONVERGENCE at x0, at iteration 0, on nine convex problems 3.4.0 and 3.3.7 solve (1e14
+# + cosh(x) from 1, cosh(x - 2^46), the barrier x - ln x from 2^41 + 3), and on a Poisson regression
+# restarted from its own answer. And where -g is parallel to x (every 1-D or radial objective) a
+# trial of length exactly |x| lands on the origin, which an even objective has as a stationary point
+# (Ok at the maximum on 4,000 of 4,000 double-well runs).
+# [measured: third review R3-NUM M1, M2 tables, reproduced by NUM4-work py/rep.py and py/fam.py, 2026-11-01]
+#   So L is the SHORTER length: an offset in f or a far origin must now make both long. |x| is taken
+# 1.25 times, a dimensionless factor that is not a power of two (the trial and its halvings never
+# land on the origin); 1.125 to 1.75 are within 2% on every total below. A trial the shorter
+# length leaves too long is recovered by the search's back-off, which now reaches underflow at any
+# ratio; one it leaves too short goes to the longer length, instead of growing by 16 per gradient
+# (the trial's own secant still decides when it is under 16 times the step). The shorter length may
+# be accepted past the line minimum, so the first trial answers to
+# curvature 1/4, not 0.9: the 6-D quadratic of condition 1e6 in tests/edge_cases.tcyr took 423
+# gradients at 0.9, 21 at 1/4 (1/8 to 1/2 agree there; 3.4.0: 21).
+#   The cost, in gradients / values of f on nine standard problems, the Ok test's gradient included:
+# BFGS 370 / 381 (the max form: 376 / 404; 3.4.0: 288 / 900), L-BFGS 1,010 / 1,165 (991 / 1,163; 3.4.0:
+# 1,161 / 1,397); 12 perturbed starts BFGS 2,342 (2,226; 1,752), L-BFGS 2,641 (2,396; 2,738). The
+# reviewer's three sweeps (4,464, 17,316 and 644 runs; f scaled up to 2^+-300, x up to 2^+-100) are solved
+# without a failure by either solver (3.4.0: 3,865 failures), the objective-scaled quadratic at all
+# 201 scales (BFGS 1,797 gradients, L-BFGS 1,896), the variable-scaled fixture at 155 of 158 from either
+# start, the other three having tol k 1e-8 below 2^-1074. On 15 standard problems x 2 solvers, offset by 1e12 or 1e15
+# 30 of 30 and translated by 2^40 and 2^44 22 and 21 of 30 (3.4.0: 30, 21 and 16; the max form 26 to
+# 28, 19 and 12); the failures left there have tol below the spacing of x, where only the exact double
+# passes.
+#   THE RANGE OF THE SCALE PROPERTY. With eq. 6.20 / 7.20 for H's first scale, the whole path of a
+# problem scaled by 2^e in f or in x is the unscaled one times 2^e: bit for bit, in the same numbers
+# of values of f and gradients. That needs every quantity of the run to stay a normal double, and a
+# scaled problem leaves the range before its own numbers do, because a0 goes as a^2 / c. On those 15
+# problems x 2 solvers: 0 of 60 moved with x scaled through 2^+-200 and f through 2^+-400, or both by
+# the same power through 2^+-400. 22 of 60 moved (0 Err) with x at 2^+-300, 30 with f at 2^+-600,
+# and with x at 2^+-600 all 60 Err: a^2 / c is past 2^1024 and a0 is not representable, so the trial is
+# the unit fallback. On the 3.3.7 scale fixture the path is exact for k = 2^-514 .. 2^495; past
+# that f(x0) is subnormal (below) or trials overflow f (above). Inside the range, on nine problems at
+# each power 2^-60 .. 2^60 in f and in x, 0 of 4,356 runs move (3.4.0: 4,318).
+# [measured: scratch optimizer harnesses (R2-NUM opth.cyr sweeps, RV-NUM rv_op.cyr, rv_xs.cyr), 2026-11-01]
+# [measured: scratch harness NUM4-work/k/opt4.cyr, py/fam.py, py/n1.py, 3.3.7, 3.4.0 and this tree, 2026-11-01]
+fn _opt_qn_first(x, f, d, n, out) {
+    var dn = _opt_norm(d, n);
+    var xl = f64_mul(_opt_norm(x, n), _OPT_QN_XLEN);                   # 1.25 |x|
+    var fl = f64_mul(f64_div(f64_abs(f), dn), 0x4010000000000000);     # 4 |f| / |d|
+    if (f64_gt(xl, 0) == 0 || f64_lt(xl, F64_POS_INF) == 0) { xl = fl; }
+    if (f64_gt(fl, 0) == 0 || f64_lt(fl, F64_POS_INF) == 0) { fl = xl; }
+    var sh = xl;
+    var lg = fl;
+    if (f64_lt(fl, xl) == 1) {
+        sh = fl;
+        lg = xl;
+    }
+    var al = f64_div(lg, dn);
+    if (f64_lt(al, F64_POS_INF) == 0) { al = 0; }
+    store64(out, al);
+    var a = f64_div(sh, dn);
+    if (f64_gt(a, 0) == 0 || f64_lt(a, F64_POS_INF) == 0) { return _OPT_F64_ONE; }
+    return a;
+}
+
+# Internal: 1 when the n doubles at a and b have the same bits, else 0. opt_bfgs and opt_lbfgs ask
+# it of the accepted point and the current one.
+#
+# ⛔ 3.4.1 (second review) — A STEP THAT ROUNDS BACK TO x WAS TAKEN UNTIL max_iter. Near a minimiser
+# where the tolerance asks for the last bit, a quasi-Newton direction whose curvature is wrong in
+# the stiff coordinate can give a line search that finds no step meeting the Wolfe conditions, and
+# the step it falls back to (the last that descends) can round to x itself. Nothing then changes --
+# no pair (s = 0), the same g, the same direction -- and the run repeated that iteration until
+# max_iter: the 6-D quadratic of condition 2e6 from the origin, x scaled by 2^-27.46875, tol
+# 1e-8 / k, returned NO_CONVERGENCE after 18,390 gradients and 183,142 values of f, one ulp from the
+# minimiser in the 1e8 coordinate. A step that moves no coordinate now discards the curvature that
+# produced it (BFGS: H = I; L-BFGS: the history), and the next search starts from -g with
+# _opt_qn_first's trial, which reaches the minimiser there in 622 gradients (3.4.0: 701). A stall
+# with no curvature behind it is a fixed point -- the next iteration would repeat it bit for bit --
+# and the solver stops there with NO_CONVERGENCE instead of repeating it to max_iter (a gradient
+# biased by 2^-60 past a tol of 2^-80: 67 values of f where it took 2,000 iterations' worth).
+# [measured: tests/edge_cases.tcyr, group "3.4.1 NUM3: the quasi-Newton first trial and stall"]
+fn _opt_same(a, b, n) {
+    var i = 0;
+    while (i < n) {
+        if (load64(a + i * 8) != load64(b + i * 8)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Internal: H = I, the n x n identity, in opt_bfgs's row-major inverse Hessian.
+fn _opt_bfgs_identity(h_inv, n) {
+    var nn = n * n;
+    var idx = 0;
+    while (idx < nn) {
+        store64(h_inv + idx * 8, _OPT_F64_ZERO);
+        idx = idx + 1;
+    }
+    idx = 0;
+    while (idx < n) {
+        store64(h_inv + (idx * n + idx) * 8, _OPT_F64_ONE);
+        idx = idx + 1;
+    }
+    return 0;
 }
 
 # ================================================================
 # 4. L-BFGS (Limited-memory BFGS)
 # ================================================================
 
-# L-BFGS minimization with two-loop recursion and Armijo line search.
+# L-BFGS minimization with two-loop recursion and a strong-Wolfe line search (_opt_wolfe_search;
+# the Armijo backtrack until 3.4.0). With no pair stored the first trial is _opt_qn_first's, and
+# the recursion scales by eq. 7.20 after, so a problem scaled by a power of two in f or in x takes
+# the unscaled path, scaled, bit for bit, while the run's arithmetic stays inside the double range
+# (_opt_qn_first states it).
 # f:        function pointer, fncall1(f, x_ptr) -> f64 value
 # grad:     function pointer, fncall2(grad, x_ptr, out_grad) -> writes gradient
 # x0:       initial point (flat array of n f64s)
@@ -1060,7 +1378,14 @@ public fn opt_bfgs(f, grad, x0, n, tol, max_iter, out_x, out_fmin) {
 # max_iter: maximum iterations (integer)
 # out_x:    pointer where optimal x is written (n f64s, caller allocates)
 # out_fmin: pointer where minimum f value is written (1 f64, caller allocates)
-# Returns:  Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) or Err(HSB_ERR_NO_CONVERGENCE)
+# Returns:  Ok(0) on success: |g| < tol at out_x, either at x0 or at a point the search reached by
+#           descent where the slope just behind it does not show the line curving down into it
+#           (_opt_ls_peak, which states what that can and cannot show: first-order information cannot
+#           prove a minimum). Err(HSB_ERR_INVALID_INPUT)
+#           (n or m <= 0 or past _OPT_MAX_DIM), Err(HSB_ERR_ALLOC), or Err(HSB_ERR_NO_CONVERGENCE) after
+#           max_iter, where a search backed off until its trial underflowed and found no step, or
+#           where a step from -g rounds back to x (a fixed point of the iteration); out_x / out_fmin then
+#           hold the last point and its f.
 #must_use
 public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
@@ -1101,7 +1426,7 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
     _opt_copy(x, x0, n);
     var g_rc = fncall2(grad, x, g);
     var f_old = fncall1(f, x);
-    var st = alloc(24);    # _opt_wolfe_search's out
+    var st = alloc(32);    # _opt_wolfe_search's out, and its a1
     if (st == 0) { return Err(HSB_ERR_ALLOC); }
 
     var iter = 0;
@@ -1227,6 +1552,9 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
         # (3.3.7: 674 gradients and 1,375 values of f), the 1e5-conditioned quadratic 10 and 16
         # (3.3.7: 6 and 28), and a saddle start (modules_c, D031) 41 and 55 (3.3.7: 32 and 68).
         # (3.4.0's first form, a gradient at every trial: 12, 77, 9 and 84 of each.)
+        # (3.4.1, third review, from _opt_qn_first's first trial: the quadratic in 12 gradients,
+        # Rosenbrock 44 and 52, the saddle 38; each one gradient more with the Ok test, _opt_ls_peak.)
+        # [measured: scratch probes (NUM3-work lbc.cyr, cg7inv.cyr, NUM4-work rvop0.cyr), this tree, 2026-11-01]
         # [measured: scratch probes (NU1-work/p/pq3.cyr, plb.cyr), 3.3.7, integ-snap5 and this tree, 2026-10-31]
         var lm = _opt_pair_scale(_opt_norm(q, n), gnorm);
         var ldg = _opt_cg_slope(q, g, n, lm);
@@ -1241,11 +1569,19 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
             lm = _opt_pair_scale(gnorm, gnorm);
             ldg = _opt_cg_slope(q, g, n, lm);
         }
-        var lalpha = _opt_wolfe_search(f, grad, x, q, n, f_old, ldg, lm, _OPT_F64_ONE, _OPT_QN_SIGMA, x_new, g_new_buf,
-          st);
+        # The first trial: the unit step once a pair scales q (eq. 7.20 above); with no pair stored
+        # q = g carries the gradient's units, and the trial is _opt_qn_first's, as opt_bfgs's.
+        var la0 = _OPT_F64_ONE;
+        var la1 = 0;
+        if (k == 0) {
+            la0 = _opt_qn_first(x, f_old, q, n, st + 24);
+            la1 = load64(st + 24);
+        }
+        var lalpha = _opt_wolfe_search(f, grad, x, q, n, f_old, ldg, lm, la0, la1, _OPT_QN_SIGMA, tol, x_new,
+          g_new_buf, st);
         if (load64(st + 16) == 1) {
             # No step met both conditions: take the last one that descends with an acceptable
-            # f, or stop, at x, unconverged, when there is none.
+            # f, or stop, at x, unconverged, when the search backed off to underflow with none.
             if (f64_gt(lalpha, 0) == 0) {
                 _opt_copy(out_x, x, n);
                 store64(out_fmin, f_old);
@@ -1254,6 +1590,19 @@ public fn opt_lbfgs(f, grad, x0, n, m, tol, max_iter, out_x, out_fmin) {
             _opt_axpy(x_new, x, lalpha, q, n);
             store64(st, fncall1(f, x_new));
             var gl_rc = fncall2(grad, x_new, g_new_buf);
+        }
+        # A step that moves no coordinate stores no pair and leaves every quantity as it was, so the
+        # next iteration would repeat this one exactly (_opt_same): with pairs stored the
+        # history is cleared and the search restarts from -g; with none, x is a fixed point of the
+        # iteration and L-BFGS stops there, unconverged.
+        if (_opt_same(x_new, x, n) == 1) {
+            if (k == 0) {
+                _opt_copy(out_x, x, n);
+                store64(out_fmin, f_old);
+                return Err(HSB_ERR_NO_CONVERGENCE);
+            }
+            k = 0;
+            head = 0;
         }
         f_old = load64(st);
 
@@ -1387,11 +1736,36 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
     _opt_copy(x, x0, np);
 
     # Evaluate initial residuals and cost
-    _opt_copy(r_ptr, fncall1(residuals, x), nr);
+    # (0 from residuals is its own refused allocation (3.4.1).)
+    var r0 = fncall1(residuals, x);
+    if (r0 == 0) { return Err(HSB_ERR_ALLOC); }
+    _opt_copy(r_ptr, r0, nr);
     var cost = _opt_dot(r_ptr, r_ptr, nr);
 
-    # Initial damping parameter
-    var lambda = f64_div(f64_from(1), f64_from(1000));  # 1e-3
+    # ⛔ 3.4.1 — THE DAMPING WAS AN ABSOLUTE lambda0 = 1e-3, AND THE ACCEPT TEST COMPARED SUMS OF
+    # SQUARES (roadmap [3.4.1], AU2-G4-F6). lambda is added to J^T J, which goes as the square of
+    # the residuals' scale, so the same problem scaled by c met a damping 1e-3 / c^2 times as
+    # strong: r_i = c (p0 + p1 i - (1.3 + 2.7 i)), i = 0..3, from (0, 0), tol c 1e-10, refused
+    # every c <= 2^-34 (c = 2^-40: Err with x = (0, 0)); and from 2^510 J^T J and the cost
+    # sum r^2 overflowed. Right at 271 of 1,046 scales, never Ok and wrong. Now:
+    #  - the damping is relative, lambda = mu max_i (J^T J)_ii with the dimensionless mu
+    #    starting at 1e-3 (Madsen, Nielsen & Tingleff's tau, 2004), times 10 on a rejection
+    #    and 1/10 on an acceptance as before;
+    #  - where max |J_ij| lies outside [2^-500, 2^500), J and r enter the normal equations
+    #    multiplied by the power of two that puts it in [1, 2) (_opt_lm_exp): delta is unchanged
+    #    by it, and J^T J and J^T r neither overflow nor flush;
+    #  - where max |r_i| lies outside that band, a trial's sum of squares and the current one
+    #    are compared at the power of two that puts it in [1, 2): exact, so the verdict is the
+    #    plain sums' wherever they neither overflow nor underflow. Inside the band both are the
+    #    3.4.0 operations.
+    # The convergence test, ||r|| < tol, is unchanged. Of the 2,098 powers of two c = 2^-1074 ..
+    # 2^1023 that fixture is now solved at 2,062 (3.4.0: 543), with no false success: all but
+    # those where tol = c 1e-10 rounds to 0 (c <= 2^-1042) and where the residuals overflow
+    # (c >= 2^1021); 15,285 residual calls in all, where 3.4.0 made 211,425. The paths of
+    # ordinary problems move with the relative damping (Rosenbrock as least squares from
+    # (-1.2, 1): see tests/hisab.tcyr).
+    # [measured: tests/edge_cases.tcyr, group "3.4.1: opt_levenberg_marquardt at every scale"]
+    var mu = f64_div(f64_from(1), f64_from(1000));        # 1e-3
     var lambda_up   = f64_from(10);
     var lambda_down = f64_div(_OPT_F64_ONE, f64_from(10));  # 0.1
 
@@ -1411,6 +1785,9 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
 
         # Evaluate Jacobian
         var j_rc = fncall2(jacobian, x, j_buf);
+        # The power of two for J and r (j_buf is this call's own; scaling it is exact).
+        var je = _opt_lm_exp(j_buf, nr * np);
+        if (je != 0) { _opt_scale_pow2(j_buf, nr * np, je); }
 
         # Compute J^T * J (np x np) and J^T * r (np x 1) into the hoisted jtj.
         var pi = 0;
@@ -1421,6 +1798,7 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
             while (kk < nr) {
                 var j_kpi = load64(j_buf + (kk * np + pi) * 8);
                 var r_kk  = load64(r_ptr + kk * 8);
+                if (je != 0) { r_kk = _opt_pow2(r_kk, je); }
                 sum_r = f64_add(sum_r, f64_mul(j_kpi, r_kk));
                 kk = kk + 1;
             }
@@ -1449,8 +1827,16 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
             pi = pi + 1;
         }
 
-        # Damped normal equations: (J^T J + lambda * I) delta = -J^T r
-        # Add lambda to diagonal
+        # Damped normal equations: (J^T J + lambda * I) delta = -J^T r, lambda = mu max diag
+        var dmax = _OPT_F64_ZERO;
+        pi = 0;
+        while (pi < np) {
+            var dg = ganita_mat_get(jtj, pi, pi);
+            if (f64_lt(dmax, dg) == 1) { dmax = dg; }
+            pi = pi + 1;
+        }
+        var lambda = mu;
+        if (f64_lt(0, dmax) == 1 && f64_lt(dmax, F64_POS_INF) == 1) { lambda = f64_mul(mu, dmax); }
         pi = 0;
         while (pi < np) {
             var diag = ganita_mat_get(jtj, pi, pi);
@@ -1470,30 +1856,50 @@ public fn opt_levenberg_marquardt(residuals, jacobian, x0, n_params, n_residuals
 
         if (sign == 0) {
             # Singular -- increase damping and retry
-            lambda = f64_mul(lambda, lambda_up);
+            mu = f64_mul(mu, lambda_up);
             iter = iter + 1;
             continue;
         }
 
-        ganita_mat_lu_solve(lu, piv, rhs, delta);
+        # (-1 is its scratch refused: delta was not written, and the step would be the last one's.)
+        if (ganita_mat_lu_solve(lu, piv, rhs, delta) == 0 - 1) { return Err(HSB_ERR_ALLOC); }
 
         # Trial step: x_trial = x + delta
         _opt_axpy(x_trial, x, _OPT_F64_ONE, delta, np);
 
-        _opt_copy(r_try, fncall1(residuals, x_trial), nr);
+        var r1 = fncall1(residuals, x_trial);
+        if (r1 == 0) { return Err(HSB_ERR_ALLOC); }
+        _opt_copy(r_try, r1, nr);
         var cost_trial = _opt_dot(r_try, r_try, nr);
 
-        if (f64_lt(cost_trial, cost) == 1) {
+        # Both sums at the scale of the current residuals (3.4.1, above).
+        var re = _opt_lm_exp(r_ptr, nr);
+        var better = f64_lt(cost_trial, cost);
+        if (re != 0) {
+            var cs = _OPT_F64_ZERO;
+            var ts = _OPT_F64_ZERO;
+            var rk = 0;
+            while (rk < nr) {
+                var a = _opt_pow2(load64(r_ptr + rk * 8), re);
+                var b = _opt_pow2(load64(r_try + rk * 8), re);
+                cs = f64_add(cs, f64_mul(a, a));
+                ts = f64_add(ts, f64_mul(b, b));
+                rk = rk + 1;
+            }
+            better = f64_lt(ts, cs);
+        }
+
+        if (better == 1) {
             # Accept step: r_try holds the accepted residuals, so the buffers swap.
             _opt_copy(x, x_trial, np);
             var r_sw = r_ptr;
             r_ptr = r_try;
             r_try = r_sw;
             cost = cost_trial;
-            lambda = f64_mul(lambda, lambda_down);
+            mu = f64_mul(mu, lambda_down);
         } else {
             # Reject step -- increase damping
-            lambda = f64_mul(lambda, lambda_up);
+            mu = f64_mul(mu, lambda_up);
         }
 
         iter = iter + 1;

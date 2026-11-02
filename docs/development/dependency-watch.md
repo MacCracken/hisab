@@ -18,7 +18,7 @@ token [measured: token-boundary probe on the 3.3.4 bundle, 2026-10-03; cycc 6.6.
 | expanded source | 25,165,824 B (24 MiB) | `src/frontend/lex/pp/pass.cyr:736` (`op > 25165824`; also `:1138`, `:1218`, and the read limits at `:643` and `:1083`) |
 | tokens | 4,194,304 | `src/frontend/lex/lex.cyr:287` (`tc >= 4194304`) |
 
-The bundle is 2,640,509 B at 3.4.0 (2,103,516 B at 3.3.7, 1,965,162 B at 3.3.6, 1,767,547 B at 3.3.5, 1,608,855 B at 3.3.4, 1,400,631 B at 3.3.3, 1,157,699 B at 3.3.2), 10.49% of the byte cap raw, so there is no size pressure. Before
+The bundle is 3,660,265 B at 3.4.1 (2,640,509 B at 3.4.0, 2,103,516 B at 3.3.7, 1,965,162 B at 3.3.6, 1,767,547 B at 3.3.5, 1,608,855 B at 3.3.4, 1,400,631 B at 3.3.3, 1,157,699 B at 3.3.2), 10.49% of the byte cap raw, so there is no size pressure. Before
 the [3.3.4] rows landed it expanded with its stdlib under `cyrius check --with-deps` to 2,048,462 B (8.14% of the byte cap) and 212,094
 tokens (5.06% of the token cap) [measured: boundary probes, 2026-10-03; cycc 6.6.14]. A third limit
 with the same value fires first for a top-level file: the raw read buffer `_SRC_CAP` (`src/main.cyr`'s

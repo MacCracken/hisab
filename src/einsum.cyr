@@ -19,41 +19,55 @@
 # "i,j->ij" all use i/j/k (105-107), outside the accepted range. Worse, the parser
 # silently SKIPPED unrecognised characters, so those notations parsed to zero
 # labels and einsum returned a wrong scalar instead of an error. Widening to the
-# full lowercase alphabet costs 3 x 144 bytes of arena (well inside the 8192 cap).
+# full lowercase alphabet took 3 x 144 more bytes of scratch.
 var _EINSUM_MAX_LABELS = 26;   # a through z
 var _EINSUM_MAX_RANK   = 4;    # max tensor rank
 
-# --- Scratch arena (bounded memory across repeated calls) ---
-# Every einsum call needs ~KB of parse/contraction scratch (op specs,
-# label dims, per-element index buffers). Previously each call leaked
-# that to the never-freeing global bump allocator — unbounded growth for
-# long-running consumers. einsum is non-reentrant and single-threaded, so
-# a module-global arena reset at entry reuses one fixed region for all
-# calls. `tensor_new` copies the shape, so no scratch escapes into the
-# returned tensor (verified). label_vals/indices are fixed-size buffers
-# reused across every element/product instead of re-allocated per element.
-var _EINSUM_ARENA_CAP  = 8192;
-var _einsum_arena      = 0;
+# --- Scratch (bounded memory across repeated calls, none of it on the heap) ---
+# Every einsum call needs about a KB of parse/contraction scratch (op specs, label dims,
+# per-element index buffers). Through 2.3.1 each call leaked that to the
+# never-freeing bump allocator. einsum is non-reentrant and single-threaded (it runs no
+# callback), so one fixed region serves every call. `tensor_new` copies the shape, so no
+# scratch escapes into the returned tensor (verified). label_vals/indices are reused across
+# every element/product instead of re-allocated per element.
+# ⛔ 3.4.1 (lane INS6) — THE REGION WAS A HEAP ARENA AND ITS ADDRESS WAS KEPT FOR GOOD.
+# `_einsum_arena` held an arena_new(8192) made on the first call. A caller's alloc_reset()
+# (lib/alloc.cyr) zeroes that memory and hands it out again, so the next einsum read a zeroed
+# or caller-filled header: `first` (a + 32) zero took arena_reset's short path, every
+# arena_alloc then answered 0 and the first store went to address 0; a filled header wrote
+# into the caller's data and followed its bytes as a pointer. hisab's rule since 3.3.5 (the
+# note above `_COL_O2D_BUF` in collision_mesh.cyr) is that no heap pointer is kept across
+# calls.
+# [measured: lane INS6 probes on 3.4.1-dev: einsum, alloc_reset, 16 KB pattern or none, einsum: SIGSEGV; 2026-11-01]
+# ⭐ So the region is static storage alloc_reset() cannot reach, and it cannot be refused.
+# Its size is what one call takes, not the old 8,192-byte cap: 26 + 4 slots here, then
+# 8 + 8 + 32 + 8 + 4 + 26 + 26 + 26 + 5 in `einsum`, 173 slots = 1,384 bytes of the program
+# image. Every call that reaches the output tensor takes all of them, whatever its notation:
+# the sizes are the module's limits (8 operands, _EINSUM_MAX_RANK, _EINSUM_MAX_LABELS), never
+# an input's. The literal is 173 because consumers compile this under their own pins, and
+# cycc 6.6.x reads only a number between the brackets (see `_col_scratch_call`).
+# tests/modules_c.tcyr ("INS6: einsum's scratch") pins the sum to the literal: a change that
+# grows a buffer fails there.
+# [measured: src/einsum.cyr, the _einsum_take sizes in _einsum_scratch_begin and einsum]
+var _EINSUM_SCRATCH: i64[173];
+var _einsum_top        = 0;    # bytes of _EINSUM_SCRATCH taken by this call
 var _einsum_label_vals = 0;    # [_EINSUM_MAX_LABELS], reused across elements
 var _einsum_indices    = 0;    # [_EINSUM_MAX_RANK], reused across products
 
-# Reset the scratch arena for a fresh einsum call and re-reserve the two
-# persistent reused buffers at the base (stable pointers each call).
-# Returns 0, or 1 when the arena could not be created. ⛔ 3.4.0 -- through 3.3.7 a
-# refused `arena_new` was kept as 0, every `arena_alloc` on it then answered 0 too,
-# and einsum's first store into `op_starts` wrote to address 0. One call takes 173
-# slots of the 1,024 at most -- 26 + 4 here, then 8 + 8 + 32 + 8 + 4 + 26 + 26 + 26
-# + 5 in `einsum` -- so with the arena in hand no `arena_alloc` can be refused, and
-# they are not checked: checking all eleven cost einsum_trace_2x2 about 7%, for
-# branches no input can take. A change that grows them must keep the sum under 1,024.
-# [measured: src/einsum.cyr, the arena_alloc sizes in _einsum_scratch_begin and einsum]
-# [measured: tests/hisab.bcyr einsum_trace_2x2, five interleaved A/B runs with the checks, 2026-10-31; cycc 6.7.9]
+# `nbytes` of the scratch, in the order a call asks for them. Not checked against the end:
+# the sizes are the fixed ones above, and the test named there holds their sum to 173 slots.
+fn _einsum_take(nbytes) {
+    var p = &_EINSUM_SCRATCH + _einsum_top;
+    _einsum_top = _einsum_top + nbytes;
+    return p;
+}
+
+# Start a fresh einsum call: the scratch from its base, and the two persistent reused
+# buffers first (the same addresses in every call).
 fn _einsum_scratch_begin() {
-    if (_einsum_arena == 0) { _einsum_arena = arena_new(_EINSUM_ARENA_CAP); }
-    if (_einsum_arena == 0) { return 1; }
-    arena_reset(_einsum_arena);
-    _einsum_label_vals = arena_alloc(_einsum_arena, _EINSUM_MAX_LABELS * 8);
-    _einsum_indices = arena_alloc(_einsum_arena, _EINSUM_MAX_RANK * 8);
+    _einsum_top = 0;
+    _einsum_label_vals = _einsum_take(_EINSUM_MAX_LABELS * 8);
+    _einsum_indices = _einsum_take(_EINSUM_MAX_RANK * 8);
     return 0;
 }
 
@@ -118,7 +132,7 @@ public fn einsum(notation, tensors, n_tensors) {
     # see the per-operand check in Step 3.
     if (notation == 0 || tensors == 0) { return 0; }
 
-    if (_einsum_scratch_begin() != 0) { return 0; }
+    _einsum_scratch_begin();
     var ndata = str_data(notation);
     var nlen = str_len(notation);
 
@@ -140,8 +154,8 @@ public fn einsum(notation, tensors, n_tensors) {
     # --- Step 2: Split input spec on "," to get per-tensor specs ---
     # Find comma positions to delineate operands
     # operand_starts[i], operand_ends[i] for up to 8 operands
-    var op_starts = arena_alloc(_einsum_arena, 8 * 8);
-    var op_ends   = arena_alloc(_einsum_arena, 8 * 8);
+    var op_starts = _einsum_take(8 * 8);
+    var op_ends   = _einsum_take(8 * 8);
     var n_ops = 0;
     var seg_start = 0;
 
@@ -170,8 +184,8 @@ public fn einsum(notation, tensors, n_tensors) {
     # --- Step 3: Parse each operand's label indices ---
     # op_labels[op][rank_pos] = label_index (0-7)
     # op_ranks[op] = number of indices for this operand
-    var op_labels = arena_alloc(_einsum_arena, 8 * _EINSUM_MAX_RANK * 8);  # 8 operands * 4 indices
-    var op_ranks  = arena_alloc(_einsum_arena, 8 * 8);
+    var op_labels = _einsum_take(8 * _EINSUM_MAX_RANK * 8);  # 8 operands * 4 indices
+    var op_ranks  = _einsum_take(8 * 8);
 
     var oi = 0;
     while (oi < n_ops) {
@@ -199,7 +213,7 @@ public fn einsum(notation, tensors, n_tensors) {
     }
 
     # --- Step 4: Parse output labels ---
-    var out_labels = arena_alloc(_einsum_arena, _EINSUM_MAX_RANK * 8);
+    var out_labels = _einsum_take(_EINSUM_MAX_RANK * 8);
     var out_rank = _einsum_parse_operand(ndata, output_start, nlen, out_labels);
     if (out_rank < 0) { return 0; }               # malformed output spec
 
@@ -231,7 +245,7 @@ public fn einsum(notation, tensors, n_tensors) {
 
     # --- Step 5: Determine dimension for each label ---
     # label_dims[label_idx] = dimension size (0 = unused)
-    var label_dims = arena_alloc(_einsum_arena, _EINSUM_MAX_LABELS * 8);
+    var label_dims = _einsum_take(_EINSUM_MAX_LABELS * 8);
     var li = 0;
     while (li < _EINSUM_MAX_LABELS) {
         store64(label_dims + li * 8, 0);
@@ -262,11 +276,11 @@ public fn einsum(notation, tensors, n_tensors) {
     # --- Step 6: Identify which labels are contracted (summed over) ---
     # A label is contracted if it appears in inputs but NOT in output.
     # contracted_labels: list of label indices to sum over
-    var contracted = arena_alloc(_einsum_arena, _EINSUM_MAX_LABELS * 8);
+    var contracted = _einsum_take(_EINSUM_MAX_LABELS * 8);
     var n_contracted = 0;
 
     # Track which labels appear in output
-    var in_output = arena_alloc(_einsum_arena, _EINSUM_MAX_LABELS * 8);
+    var in_output = _einsum_take(_EINSUM_MAX_LABELS * 8);
     li = 0;
     while (li < _EINSUM_MAX_LABELS) {
         store64(in_output + li * 8, 0);
@@ -290,7 +304,7 @@ public fn einsum(notation, tensors, n_tensors) {
     }
 
     # --- Step 7: Build output tensor ---
-    var out_shape = arena_alloc(_einsum_arena, (_EINSUM_MAX_RANK + 1) * 8);  # +1 for scalar case
+    var out_shape = _einsum_take((_EINSUM_MAX_RANK + 1) * 8);  # +1 for scalar case
     if (out_rank == 0) {
         # Scalar result -- use rank 1, shape [1]
         store64(out_shape, 1);

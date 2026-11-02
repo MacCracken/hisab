@@ -502,8 +502,11 @@ fn _simplex_fbm_2d_pass(acc, x, y, octaves, freq, persistence) {
 # Layers multiple octaves of 2D simplex noise.
 # persistence: amplitude multiplier per octave (typically 0.5); out: pointer, the noise
 # value (f64) written here.
-# Returns Ok(0) with the octaves' weighted mean, sum(a_i n_i) / sum(a_i), a_i = amp p^i,
-# approximately [-1, 1]; NaN, as Ok, when an octave's scaled coordinates are past
+# Returns Ok(0) with the octaves' weighted mean, sum(a_i n_i) / sum(a_i), a_i = amp p^i:
+# within the octaves' range, approximately [-1, 1], for persistence >= 0, and bounded only by
+# sum|a_i| / |sum a_i| for a negative one (fbm_2d_checked in calc.cyr has the range, 3.4.1:
+# here p = -1/2 at (0x404F6D245415BABD, 0x4047EBB17CCF4E41), 2 octaves, gives 2.897); NaN,
+# as Ok, when an octave's scaled coordinates are past
 # simplex_2d's reach (header, 3.3.3): a NaN or infinite x, y or freq, an octave frequency
 # freq * 2^i, or x times it, that overflows -- with freq = 1, 1025 or more octaves reach
 # 2^1024 = +Inf -- or finite coordinates whose skew or unskew overflows: at (1, 1) and
@@ -543,20 +546,43 @@ public fn simplex_fbm_2d_checked(x, y, octaves, freq, amp, persistence, out) {
     # The mean does not depend on amp. Where amp's weights leave the range -- a sum that is
     # not finite, or a weight sum under 2^-969, where rounding below DBL_MIN moves the mean
     # (amp +-Inf or subnormal, amp p^i overflowing) -- it is formed again without amp
-    # (_simplex_fbm_2d_pass). A NaN amp keeps its NaN.
-    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0 || f64_lt(f64_abs(max_amp), F64_POS_INF) == 0 ||
-      ((max_amp >> 52) & 0x7FF) < 54) {
-        if (f64_eq(amp, amp) == 1) {
-            var acc: i64[2];
-            _simplex_fbm_2d_pass(&acc, x, y, octaves, freq, persistence);
-            sum = load64(&acc);
-            max_amp = load64(&acc + 8);
-        }
+    # (_simplex_fbm_2d_redo). A NaN amp keeps its NaN. The test reads exponent fields: an
+    # all-ones field is exactly a value that is not finite (_simplex_fbm_2d_redo has the cost).
+    var em = (max_amp >> 52) & 0x7FF;
+    if (((sum >> 52) & 0x7FF) == 0x7FF || em == 0x7FF || em < 54) {
+        return _simplex_fbm_2d_redo(x, y, octaves, freq, amp, persistence, sum, max_amp, out);
     }
 
     # Guard the normalisation divide. Through 2.x it returned NaN when max_amp was 0
     # (octaves <= 0, amp = 0, or weights that cancel), and through 3.3.7 the designed 0.
     # Here max_amp is 0 only for weights that cancel, which have no mean.
+    if (f64_eq(max_amp, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    store64(out, f64_div(sum, max_amp));
+    return Ok(0);
+}
+
+# Internal: simplex_fbm_2d_checked's ending where amp's weights left the range: the octaves again
+# without amp (_simplex_fbm_2d_pass) unless amp is NaN, then the mean or its refusal.
+#
+# ⚠ 3.4.1 — THE CHECKED FORM COST 4.7% OVER simplex_fbm_2d AT 4 OCTAVES (404 -> 423 ns), put down
+# to its seventh parameter without an ablation. Ablated in one binary (300,000 calls a row, the
+# median of 6 runs, in each of two builds): the 3.3.7 body 376 / 399 ns; + the out parameter and
+# the Result 387 / 413; + the octaves and amp guards 389 / 414; + this range test 395 / 424; the
+# shipped function 401 / 421. So about 10 to 14 ns are the parameter and the Result, which are the
+# API, and 5 to 10 the range test, which was three float tests and a two-double stack array in
+# the caller's frame. Read off the exponent fields, with this ending moved out of the frame, it
+# measured 417 in the second build (-7 ns); between builds, the bench row's median over 7
+# interleaved runs moved 425 -> 421 ns, inside the runs' spread (3.3.7's simplex_fbm_2d: 405).
+# Every result bit is unchanged: 12,800 calls of both checked forms against the previous tree,
+# guard cases and sums that overflow alone included, hash for hash.
+# [measured: scratch fBm ablation, A/B and differential (NUM3-work/cost fb_abl.bcyr, fa.bcyr, dfbm.cyr), 2026-11-01]
+fn _simplex_fbm_2d_redo(x, y, octaves, freq, amp, persistence, sum, max_amp, out) {
+    if (f64_eq(amp, amp) == 1) {
+        var acc: i64[2];
+        _simplex_fbm_2d_pass(&acc, x, y, octaves, freq, persistence);
+        sum = load64(&acc);
+        max_amp = load64(&acc + 8);
+    }
     if (f64_eq(max_amp, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
     store64(out, f64_div(sum, max_amp));
     return Ok(0);
@@ -597,7 +623,8 @@ fn _simplex_fbm_3d_pass(acc, x, y, z, octaves, freq, persistence) {
 
 # simplex_fbm_3d_checked(x, y, z, octaves, freq, amp, persistence, out) -> Result
 # Layers multiple octaves of 3D simplex noise; out: pointer, the noise value (f64).
-# Returns as simplex_fbm_2d_checked: Ok(0) with the octaves' weighted mean (NaN when an
+# Returns as simplex_fbm_2d_checked: Ok(0) with the octaves' weighted mean (in the octaves'
+# range for persistence >= 0 only; NaN when an
 # octave's scaled coordinates are past simplex_3d's reach), Err(HSB_ERR_INVALID_INPUT)
 # for octaves <= 0, Err(HSB_ERR_DIVISION_BY_ZERO) when the weights sum to 0, `out`
 # untouched on both; amp = 0 is the mean at amp = 1, as is an amp whose weights leave the
@@ -628,20 +655,30 @@ public fn simplex_fbm_3d_checked(x, y, z, octaves, freq, amp, persistence, out) 
     # The mean does not depend on amp. Where amp's weights leave the range -- a sum that is
     # not finite, or a weight sum under 2^-969, where rounding below DBL_MIN moves the mean
     # (amp +-Inf or subnormal, amp p^i overflowing) -- it is formed again without amp
-    # (_simplex_fbm_3d_pass). A NaN amp keeps its NaN.
-    if (f64_lt(f64_abs(sum), F64_POS_INF) == 0 || f64_lt(f64_abs(max_amp), F64_POS_INF) == 0 ||
-      ((max_amp >> 52) & 0x7FF) < 54) {
-        if (f64_eq(amp, amp) == 1) {
-            var acc: i64[2];
-            _simplex_fbm_3d_pass(&acc, x, y, z, octaves, freq, persistence);
-            sum = load64(&acc);
-            max_amp = load64(&acc + 8);
-        }
+    # (_simplex_fbm_3d_redo). A NaN amp keeps its NaN. The test reads exponent fields, as
+    # simplex_fbm_2d_checked's does.
+    var em = (max_amp >> 52) & 0x7FF;
+    if (((sum >> 52) & 0x7FF) == 0x7FF || em == 0x7FF || em < 54) {
+        return _simplex_fbm_3d_redo(x, y, z, octaves, freq, amp, persistence, sum, max_amp, out);
     }
 
     # Guard the normalisation divide. Through 2.x it returned NaN when max_amp was 0
     # (octaves <= 0, amp = 0, or weights that cancel), and through 3.3.7 the designed 0.
     # Here max_amp is 0 only for weights that cancel, which have no mean.
+    if (f64_eq(max_amp, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    store64(out, f64_div(sum, max_amp));
+    return Ok(0);
+}
+
+# Internal: simplex_fbm_3d_checked's ending where amp's weights left the range, as
+# _simplex_fbm_2d_redo's.
+fn _simplex_fbm_3d_redo(x, y, z, octaves, freq, amp, persistence, sum, max_amp, out) {
+    if (f64_eq(amp, amp) == 1) {
+        var acc: i64[2];
+        _simplex_fbm_3d_pass(&acc, x, y, z, octaves, freq, persistence);
+        sum = load64(&acc);
+        max_amp = load64(&acc + 8);
+    }
     if (f64_eq(max_amp, 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
     store64(out, f64_div(sum, max_amp));
     return Ok(0);

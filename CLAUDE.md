@@ -110,6 +110,14 @@ scripts/
   check-public-surface.sh — flips every module `private` in a scratch copy and
                        proves the `public` annotations complete and exact
   check-result-migration.sh — no Result-returning call sits in argument position
+  check-doc-blocks.sh — every public fn has a comment block (doc-blocks-baseline.txt
+                       is the ratchet floor, and names no file since 3.4.1)
+  check-heap-globals.sh — no module global keeps a pointer into the heap across calls;
+                       its ALLOW table says why each kept value is safe
+  check-miscompile.sh — compiles the bundle under consumer pins and disassembles it for
+                       a frame slot read and never written (not in CI yet)
+  mutation-test.sh   — single-operator mutants of src/ in scratch copies; reports
+                       survivors (not in CI)
   derive-cga-null-table.sh — re-derives the CGA null-basis table and its FNV
   version-bump.sh    — bump VERSION; checks src/main.cyr prints CYRIUS_PKG_VERSION;
                        prints the remaining steps (CHANGELOG header, distlib). The
@@ -362,8 +370,8 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
 - **Fmt gate**: `cyrius fmt <file> --check` over the same set — drift is signalled by the exit code
   (the report goes to stdout); the file is not rewritten
 - **Vet gate**: `cyrius vet src/main.cyr`
-- **Constant gate**: `./scripts/check-constants.sh` decodes every hand-encoded hex f64 declaration
-  in `src/` and checks it against its own comment. Run it after touching ANY constant
+- **Constant gate**: `./scripts/check-constants.sh` (+ `--selftest`) decodes every hand-encoded hex
+  f64 declaration in `src/` and checks it against its own comment. Run it after touching ANY constant
 - **Public-surface gate**: `./scripts/check-public-surface.sh` flips all 35 modules `private` in a
   scratch copy and proves naming completeness (every non-`_` declaration `public`, no `_` one, and
   `_` names for the members of a non-public enum — enum constants carry no visibility in Cyrius),
@@ -376,6 +384,12 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   are calls, never `&name`. **No module may reach another's `_` name** — a cross-module helper is
   public API with a real name
 - **Result-migration gate**: `./scripts/check-result-migration.sh` (+ `--selftest`)
+- **Doc-block gate**: `./scripts/check-doc-blocks.sh --ratchet` (+ `--selftest`): every public fn
+  has a comment block directly above it. It reads presence, not accuracy
+- **Heap-pointer gate**: `./scripts/check-heap-globals.sh` (+ `--selftest`): a caller's `alloc_reset()`
+  hands the first chunk out again, so no module global keeps a pointer into it across calls. A new
+  global written a pointer, or a new reader of an allowed one, fails until its ALLOW entry is
+  reasoned out
 - **Distlib gate**: `cyrius distlib` regenerates `dist/hisab.cyr` **and** `dist/hisab.deps`; CI fails
   on drift in either. Run it after changing any `[lib]` module, `[lib]` itself, or `VERSION` (the
   bundle header is stamped from it)

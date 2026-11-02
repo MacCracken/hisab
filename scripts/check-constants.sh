@@ -27,7 +27,9 @@
 #   # 2^-32                        expression
 #   # 1e-12 as f64 bits            decimal + trailing prose
 #   # 0.67560359...                truncated decimal: within its last digit (cannot pin)
-#   # ... nan / inf / sentinel     skipped (see SKIP_RE)
+#   # 2.0, the scale it leaves     a value at the head of a longer comment: that value is checked
+#   # the sign-bit mask            prose, no number in it: skipped (see SKIP_RE); a number beside
+#                                  those words is a value, and is checked or fails
 #
 # When both an exact form and a decimal appear, the EXACT form is authoritative
 # and the decimal is additionally cross-checked for self-consistency. A decimal
@@ -35,20 +37,113 @@
 # form when there is one.
 #
 # Usage:  ./scripts/check-constants.sh [--verbose]
+#         ./scripts/check-constants.sh --selftest     plant every shape below, check each verdict
+#         ./scripts/check-constants.sh --root DIR     check DIR/src/*.cyr with no floors (selftest)
 # Exit:   0 = all constants verified; 1 = at least one mismatch
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SELF="$REPO_ROOT/scripts/check-constants.sh"
 cd "$REPO_ROOT"
 
 VERBOSE=0
-[ "${1:-}" = "--verbose" ] && VERBOSE=1
+FLOORS=1
+case "${1:-}" in
+    --verbose) VERBOSE=1 ;;
+    --root) cd "$2"; FLOORS=0 ;;
+    --selftest)
+        # ⭐ 3.4.1 SYM4 -- A GATE THAT CANNOT FAIL IS NOT A GATE, AND THIS ONE HAS BEEN GREEN OVER A
+        # WRONG CONSTANT FOUR TIMES. Every shape it reads, and every shape it refuses, is planted
+        # here, wrong and right, and each verdict is checked. 2.0 + 1 ulp under a `# 2.0` comment.
+        exec python3 - "$SELF" <<'SELFEOF'
+import os, subprocess, sys, tempfile
+gate = sys.argv[1]
+BAD = '0x4000_0000_0000_0001'
+OK = '0x4000_0000_0000_0000'
+# (name, source with %s for the hex literal, wrong plant fires, right plant passes)
+SHAPES = [
+    ('`;` member',                'enum _ZA {\n    _ZA_X = %s;   # 2.0\n}\n', 1, 1),
+    ('`,` member',                'enum _ZA {\n    _ZA_X = %s,   # 2.0\n    _ZA_Y = 1\n}\n', 1, 1),
+    ('last member, no `;`',       'enum _ZA {\n    _ZA_X = %s   # 2.0\n}\n', 1, 1),
+    ('one-line enum',             'enum _ZA { _ZA_X = %s; }   # 2.0\n', 1, 1),
+    ('member on the `{` line',    'enum _ZA { _ZA_X = %s;   # 2.0\n    _ZA_Y = 1;\n}\n', 1, 1),
+    ('member on the `}` line',    'enum _ZA {\n    _ZA_Y = 1;\n    _ZA_X = %s; }   # 2.0\n', 1, 1),
+    ('comment on the line above', 'enum _ZA {\n    # 2.0\n    _ZA_X = %s;\n}\n', 1, 1),
+    ('public enum',               'public enum _ZA {\n    _ZA_X = %s;   # 2.0\n}\n', 1, 1),
+    ('`{` on the next line',      'enum _ZA\n{\n    _ZA_X = %s;   # 2.0\n}\n', 1, 1),
+    ('`{` next line, typed',      'enum _ZA: i64\n{\n    _ZA_X = %s;   # 2.0\n}\n', 1, 1),
+    ('a comment before `{`',      'enum _ZA   # the scale\n{\n    _ZA_X = %s;   # 2.0\n}\n', 1, 1),
+    ('value on the next line',    'enum _ZA {\n    _ZA_X =\n      %s;   # 2.0\n}\n', 1, 1),
+    ('`{` inside a comment',      'enum _ZA {  # { open\n    _ZA_X = %s;   # 2.0\n}\n', 1, 1),
+    ('`}` inside a comment',      'enum _ZA {\n    _ZA_Y = 1;   # } not the end\n    _ZA_X = %s;   # 2.0\n}\n', 1, 1),
+    ('enum inside a fn',          'fn _zf() {\n    enum _ZA {\n        _ZA_X = %s;   # 2.0\n    }\n    return _ZA_X;\n}\n', 1, 1),
+    ('second enum on the line',   'enum _ZB { _ZB_Y = 1; } enum _ZA { _ZA_X = %s; }   # 2.0\n', 1, 0),
+    ('two hex members, one line', 'enum _ZA { _ZA_X = %s, _ZA_Y = 0x4000_0000_0000_0000 }   # 2.0\n', 1, 0),
+    ('value is an expression',    'enum _ZA {\n    _ZA_X = %s | 1;   # 2.0\n}\n', 1, 0),
+    ('no comment',                'enum _ZA {\n    _ZA_X = %s;\n}\n', 1, 0),
+    ('comment with no value',     'enum _ZA {\n    _ZA_X = %s;   # the scale\n}\n', 1, 0),
+    ('value, the word mask',      'enum _ZA {\n    _ZA_X = %s;   # 2.0, the scale the mask leaves\n}\n', 1, 1),
+    ('value, the word inf',       'enum _ZA {\n    _ZA_X = %s;   # 2.0, finite (not inf)\n}\n', 1, 1),
+    ('value, the word sentinel',  'enum _ZA {\n    _ZA_X = %s;   # 2.0: a sentinel\n}\n', 1, 1),
+    ('a number past the head',    'enum _ZA {\n    _ZA_X = %s;   # the mask for the scale 2.0\n}\n', 1, 0),
+    ('var, the word mask',        'var _ZA_X = %s;   # 2.0, the scale the mask leaves\n', 1, 1),
+    ('var, the word hash',        'var _ZA_X = %s;   # 2.0 (the hash seed)\n', 1, 1),
+]
+# Prose: bits, not a value, in a comment with no value: skipped, whatever the bits.
+PROSE = [
+    ('a mask',            'enum _ZA {\n    _ZA_X = %s;   # the sign-bit mask\n}\n'),
+    ('an integer',        'enum _ZA {\n    _ZA_X = %s;   # an integer sentinel\n}\n'),
+    ('a NaN, with `_m3`', 'enum _ZA {\n    _ZA_X = %s;   # a NaN\'s bits, never a result of `_m3_wscale`\n}\n'),
+]
+def gate_rc(src):
+    with tempfile.TemporaryDirectory() as d:
+        os.mkdir(d + '/src')
+        with open(d + '/src/zz.cyr', 'w') as f: f.write(src)
+        r = subprocess.run(['bash', gate, '--root', d], capture_output=True, text=True)
+        return r.returncode, r.stdout
+bad = 0
+n = 0
+for name, src, fires, passes in SHAPES:
+    rc, out = gate_rc(src % BAD)
+    n += 1
+    if (rc != 0) != bool(fires):
+        print('  selftest: %s: the wrong constant %s' % (name, 'passed' if rc == 0 else 'fired unexpectedly'))
+        bad += 1
+    rc, out = gate_rc(src % OK)
+    n += 1
+    if (rc == 0) != bool(passes):
+        print('  selftest: %s: the right constant gave rc %d' % (name, rc))
+        bad += 1
+for name, src in PROSE:
+    rc, out = gate_rc(src % BAD)
+    n += 1
+    if rc != 0 or ' 1 skipped' not in out:
+        print('  selftest: %s: not skipped as prose (rc %d)' % (name, rc))
+        bad += 1
+# An `enum` the parser cannot open fails the gate whatever follows it.
+rc, out = gate_rc('enum _ZA\nvar _ZB = 1;\n')
+n += 1
+if rc == 0:
+    print('  selftest: an `enum` with no body passed')
+    bad += 1
+# A word in a comment or a string is not an enum.
+rc, out = gate_rc('# enum in a comment\nfn _zf() { return "enum"; }\n')
+n += 1
+if rc != 0:
+    print('  selftest: an `enum` in a comment or string fired')
+    bad += 1
+print('  selftest: %d verdicts, %d wrong: %s' % (n, bad, 'PASS' if bad == 0 else 'FAIL'))
+sys.exit(1 if bad else 0)
+SELFEOF
+        ;;
+esac
 
-python3 - "$VERBOSE" <<'PYEOF'
+python3 - "$VERBOSE" "$FLOORS" <<'PYEOF'
 import glob, re, struct, sys
 from fractions import Fraction
 
 verbose = sys.argv[1] == "1"
+floors = sys.argv[2] == "1"
 
 # var NAME = 0xHEX;  # comment
 # The hex class MUST allow `_` digit separators: Cyrius accepts
@@ -72,12 +167,48 @@ COMMENT_ONLY = re.compile(r'^\s*#\s*(.*?)\s*$')
 # ⭐ 3.3.7 -- AND THE HEX MEMBERS OF A MULTI-LINE ENUM. An enum member is an immediate where
 # a `var` is a load (CLAUDE.md, "Enums for constants"), and 3.3.7 moved geo.cyr's `_GEO_*`
 # constants and calc_integral_gauss5's nodes and weights into enums. A member is read only
-# between an `enum NAME {` line and its closing `}`: the same `NAME = 0xHEX;  # comment`
-# shape is an ordinary assignment in a function body.
-ENUM_OPEN = re.compile(r'^\s*(?:public\s+)?enum\s+[A-Za-z_][A-Za-z0-9_]*\s*\{\s*(?:#.*)?$')
-ENUM_DECL = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*#\s*(.*?)\s*$')
-# Constants whose comment is prose, not a value.
+# between an `enum NAME {` and its closing `}`: the same `NAME = 0xHEX;  # comment` shape is
+# an ordinary assignment in a function body.
+# ⛔ 3.4.1 SYM3 -- AND IT READ ONE SHAPE OF MEMBER, SO THE OTHERS WERE INVISIBLE. The member
+# regex wanted `NAME = 0xHEX;  # comment` on a line of its own between an `enum NAME {` line
+# and a `}` line. cycc also takes a member closed by `,`, the last member with no separator,
+# and members on the `{` or `}` line -- a one-line enum among them -- and none of those was
+# seen: complex.cyr's _CX_DIV_FOUR (the last member, no `;`) and autodiff.cyr's _AD_UNSEEN
+# (`enum _AdSweep { _AD_UNSEEN = 0x7FF4_0000_0000_0A0D }`) were neither verified nor skipped,
+# and the count stayed green. An enum body is now read from `{` to `}`, across lines, split
+# into members at `;` and `,` (but see ⛔ 3.4.1 SYM4 below: not yet as cycc reads it).
+# Every member whose value holds a hex
+# literal of 12 digits or more is an f64 constant, and it must be verified against its
+# comment -- the comment after it on its line when it is the line's only member, else the
+# comment line just above -- or carry a comment SKIP_RE names as prose (a mask, a NaN, a
+# sentinel). Any other such member FAILS the gate: one sharing its line with another member
+# (a trailing comment cannot say whose it is), a value that is not a bare hex literal, no
+# comment, or a comment with no value in it. A var that cannot be read is still skipped, as
+# before; an enum member is not.
+# [measured: scratch copy of the 3.4.1 SYM3 tree, a wrong constant planted in each shape, 2026-10-31]
+# ⛔ 3.4.1 SYM4 -- AND "AS cycc READS IT" WAS FALSE, THREE WAYS, AND A WRONG _CX_DIV_SAFE PASSED. The
+# scan was line by line, so `{` on the line after `enum NAME` opened nothing and a second enum on a
+# line was read as the first's trailing text: cycc takes both, and the members were invisible, a
+# population short of its floor by less than the floor's slack. And a comment was prose by its
+# WORDS, so `# 2^1022, the scale the mask leaves` skipped a wrong value. With the braces moved down
+# for _CxDivWide and _CxExt and _CX_DIV_SAFE planted as 2^1023 under `# 2^1022`, the gate reported
+# 299/299 verified. Now the file is read as tokens, comments and strings out: EVERY `enum` token must
+# open a body the parser reads (it fails otherwise, which closes the class and not the instances),
+# wherever its `{` is, and each member takes the comment of the line it ends on, shared with
+# nothing else on that line. A comment is prose only when it holds NO VALUE: the words no longer
+# exempt anything beside a number, and a value at the head of a longer comment is verified (see
+# value_head). [measured: ./scripts/check-constants.sh --selftest, and the two plants on the tree]
+ENUM_OPEN = re.compile(r'enum\s+[A-Za-z_][A-Za-z0-9_]*\s*(?::\s*[A-Za-z_][A-Za-z0-9_]*\s*)?\{')
+ENUM_TOKEN = re.compile(r'(?<![A-Za-z0-9_])enum(?![A-Za-z0-9_])')
+ENUM_MEMBER = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*(?:=\s*(.*?))?$', re.S)
+HEX_BARE = re.compile(r'^0[xX][0-9A-Fa-f_]{1,25}$')
+HEX_ANY = re.compile(r'0[xX][0-9A-Fa-f_]+')
+# Constants whose comment is prose, not a value: one of these words and no number standing on its
+# own. A digit inside a name (`_m3_wscale`) is not a number.
 SKIP_RE = re.compile(r'\b(nan|inf|sentinel|mask|bits? pattern|magic|seed|hash)\b', re.I)
+NUMBER = re.compile(r'(?<![A-Za-z0-9_.])[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?(?![A-Za-z0-9_])')
+# Where a value at the head of a longer comment ends: "2.0, the scale", "2^1022: the bound".
+HEAD_END = re.compile(r'\s*[,:;]|\s+\(|\s+--+\s|\s+—\s')
 
 def as_double(h):
     return struct.unpack('>d', struct.pack('>Q', int(h.replace('_', ''), 16) & 0xFFFFFFFFFFFFFFFF))[0]
@@ -316,20 +447,238 @@ def decimal_step(tok):
     return Fraction(10) ** (exp - frac)
 
 results, errors, skipped = [], [], []
+# 3.4.1 SYM3: enum members whose hex f64 the gate could not read -- each one fails it.
+undecodable = []
+enum_seen = 0
+
+def hex_payload(h):
+    """A hex literal long enough to be an f64 payload, not a short mask or flag."""
+    return len(h.replace('_', '')) - 2 >= 12
+
+def value_head(comment):
+    """The value a comment opens with, when it opens with one and has more to say: `2.0` from
+    "2.0, the scale the mask leaves", `inf` from "inf: the exponent field". None when it does not
+    (the comment's own grammar above then reads it whole, an `=` included)."""
+    text = comment.strip()
+    if '=' in text:
+        return None
+    m = HEAD_END.search(text)
+    h = text[:m.start()].strip() if m else text
+    if h.lower().lstrip('+-') in ('inf', 'infinity'):
+        return h
+    if h and '...' not in h and '…' not in h and eval_exact(h) is not None:
+        return h
+    return None
+
+def check_one(path, lineno, name, hexlit, comment, in_enum):
+    """Verify one hex declaration against its comment: into results / errors / skipped, or,
+    for an enum member whose comment holds no value, into undecodable."""
+    actual = as_double(hexlit)
+    site = f"{path}:{lineno} {name}"
+
+    def skip(why):
+        if in_enum and why != 'prose comment':
+            undecodable.append((path, lineno, name, f"its comment has no value to check ({why}): # {comment}"))
+        else:
+            skipped.append((path, lineno, name, comment, why))
+
+    # +/-Infinity is checkable exactly, so verify rather than skip. These are
+    # real sentinel values used by the geometry and spatial modules and a
+    # wrong one would silently break every min/max seed that starts from them.
+    head = value_head(comment)
+    cl = (head if head is not None else comment).strip().lower().lstrip('+')
+    if cl in ('infinity', 'inf', '-infinity', '-inf'):
+        want = float('-inf') if cl.startswith('-') else float('inf')
+        ok = (actual == want)
+        results.append(ok)
+        if not ok:
+            errors.append((site, comment, actual, want, 'infinity literal', 'exact', None))
+        elif verbose:
+            print(f"  ok   {site:52s} = {actual!r} (infinity literal)")
+        return
+
+    if head is not None and head != comment.strip():
+        comment = head
+    elif SKIP_RE.search(comment) and not NUMBER.search(comment):
+        skip('prose comment'); return
+
+    # Split "EXACT = DECIMAL" if present; prefer the exact form.
+    head, sep, tail = comment.partition('=')
+    exact_src = head.strip() if sep else comment.strip()
+    dec_src = tail.strip() if sep else comment.strip()
+    truncated = '...' in comment or '…' in comment
+    exact_src = exact_src.rstrip('.').strip()
+    dec_src_clean = dec_src.replace('...', '').replace('…', '').strip()
+
+    expected, basis, value, rule = None, None, None, None
+
+    fr = exact_fraction(exact_src)
+    if fr is not None:
+        value, basis = fr, f"exact {exact_src}"
+    else:
+        ev = eval_exact(exact_src)
+        if ev is not None and (sep or not re.fullmatch(DEC.pattern, exact_src)):
+            value, basis = ev, f"expr {exact_src}"
+    if value is not None:
+        # ⛔ 3.3.1 -- THIS WAS 8 ULP, on the theory that a comment expression
+        # re-evaluated in a different order (`1.0/2.4` in float vs the
+        # correctly-rounded 5/12) lands a few ulp away. 8 of the 9 expression
+        # constants sat at exactly 0 ulp; the ninth, color.cyr's _SRGB_INV_2_4,
+        # was a 5-ulp transcription error the slack had been passing. 3.3.1 cut it
+        # to 1 ulp, and 3.3.7 to none: the value is now exact, so the encoded
+        # double must be its correctly rounded value.
+        # [measured: per-constant ulp distance over src/, 2026-09-30 and 3.3.7]
+        expected, rule = round_exact(value), 'correctly rounded'
+        ok = expected is not None and _bits(actual) == _bits(expected)
+    else:
+        # Falling back to "pull the first decimal out of the comment" is only
+        # safe when the comment is not an unevaluated symbolic expression --
+        # otherwise `# -2*pi` would silently compare against -2.
+        src_for_decimal = dec_src_clean if sep else comment
+        # Strip trailing/parenthetical prose: "# 1e-4 (Armijo constant)",
+        # "# 1e-12 as f64 bits". What remains must be a bare number.
+        probe = re.sub(r'\([^)]*\)', ' ', src_for_decimal)
+        probe = re.sub(r'\b(as f64 bits?|approx|approximately|about|~)\b', ' ', probe, flags=re.I)
+        if has_unknown_symbol(probe):
+            skip('symbolic expression not evaluable -- verify by hand'); return
+        d = DEC.search(dec_src_clean) or DEC.search(comment)
+        if not d:
+            skip('no parseable value'); return
+        tok = d.group(0)
+        try: value = Fraction(tok)
+        except ValueError:
+            skip('unparseable number'); return
+        basis, expected = f"decimal {tok}", round_exact(value)
+        # ⛔ 3.3.0 — A ONE- OR TWO-DIGIT COMMENT NAMES A ROUND VALUE, NOT A ROUNDED
+        # DISPLAY: `_SYM_EPS` was 2^-50 = 8.88e-16 under `# 1e-15` and passed. 3.3.0
+        # held short tokens to 4 ulp; 3.3.7 holds every untruncated token to its
+        # nearest double (see the ⛔ 3.3.7 paragraph at eval_exact).
+        if truncated:
+            rule = 'inside its truncation (cannot pin the bit)'
+            ok = abs(Fraction(actual) - value) <= decimal_step(tok) + half_gap(actual)
+        else:
+            rule = 'decoded exactly'
+            ok = expected is not None and _bits(actual) == _bits(expected)
+
+    results.append(ok)
+    if not ok:
+        errors.append((site, comment, actual, expected, basis, rule, value))
+    elif verbose:
+        print(f"  ok   {site:52s} = {actual!r} ({basis}; {rule})")
+
+    # Cross-check: when the comment gives BOTH an exact form and a decimal,
+    # the decimal must also agree with the exact value it claims to expand:
+    # within one unit of its last digit when it says `...`, else a correctly
+    # rounded display of the value, or the digits of the encoded double itself.
+    if sep and basis and not basis.startswith('decimal'):
+        d = DEC.search(dec_src_clean)
+        if d:
+            shown, step = Fraction(d.group(0)), decimal_step(d.group(0))
+            if truncated:
+                cok = abs(shown - value) < step
+            else:
+                rs = round_exact(shown)
+                cok = abs(shown - value) <= step / 2 or (rs is not None and _bits(rs) == _bits(actual))
+            if not cok:
+                errors.append((site + " [comment self-inconsistent]", comment, round_exact(shown),
+                               expected, basis, 'the decimal must display the exact value', value))
+                results.append(False)
+
+def split_code(lines):
+    """(code, comments): one string of the file's code, its comments and strings blanked and its
+    newlines kept, and each line's comment. A `#` in a string or a character literal is neither."""
+    out, cmts = [], []
+    for line in lines:
+        code, i, n, q = [], 0, len(line), None
+        cmt = None
+        while i < n:
+            c = line[i]
+            if q:
+                if c == '\\':
+                    code.append('  '); i += 2; continue
+                if c == q: q = None
+                code.append(' ')
+            elif c == '"' or c == "'":
+                q = c
+                code.append(' ')
+            elif c == '#':
+                cmt = line[i + 1:].strip()
+                break
+            else:
+                code.append(c)
+            i += 1
+        out.append(''.join(code).rstrip('\n'))
+        cmts.append(cmt)
+    return '\n'.join(out), cmts
+
+def scan_enums(path, lines):
+    """Read every enum as cycc does, and return the line numbers (1-based) they cover."""
+    global enum_seen
+    code, cmts = split_code(lines)
+    covered = set()
+    def line_at(pos):
+        return code.count('\n', 0, pos) + 1
+    at = 0
+    members = []
+    while True:
+        t = ENUM_TOKEN.search(code, at)
+        if not t:
+            break
+        m = ENUM_OPEN.match(code, t.start())
+        if not m:
+            undecodable.append((path, line_at(t.start()), 'enum',
+                                "an `enum` this gate could not open: nothing in it is checked"))
+            at = t.end()
+            continue
+        close = code.find('}', m.end())
+        if close < 0:
+            undecodable.append((path, line_at(t.start()), 'enum', "an enum with no closing `}`"))
+            break
+        covered.update(range(line_at(t.start()), line_at(close) + 1))
+        pos = m.end()
+        for piece in re.split(r'([;,])', code[m.end():close]):
+            start = pos
+            pos += len(piece)
+            if piece in (';', ',') or not piece.strip():
+                continue
+            lead = len(piece) - len(piece.lstrip())
+            q = ' '.join(piece.split())
+            members.append((line_at(start + lead), line_at(start + len(piece.rstrip()) - 1), q))
+        at = close + 1
+    by_line = {}
+    for first, last, q in members:
+        by_line.setdefault(last, []).append(q)
+    for first, last, q in members:
+        if not any(hex_payload(h) for h in HEX_ANY.findall(q)):
+            continue
+        enum_seen += 1
+        mm = ENUM_MEMBER.match(q)
+        name = mm.group(1) if mm else q
+        if not mm or mm.group(2) is None or not HEX_BARE.match(mm.group(2)):
+            undecodable.append((path, last, name, f"its value is not a bare hex literal: {q}"))
+            continue
+        if len(by_line[last]) > 1:
+            undecodable.append((path, last, name, "it shares its line with another member, so the "
+                                "line's comment cannot say which one it documents: give it a line of its own"))
+            continue
+        cmt = cmts[last - 1]
+        if not cmt and first >= 2 and not lines[first - 2].split('#')[0].strip():
+            cmt = cmts[first - 2]
+        if not cmt:
+            undecodable.append((path, last, name, "it has no comment, on its line or the line above"))
+            continue
+        check_one(path, last, name, mm.group(2), cmt, True)
+    return covered
 
 for path in sorted(glob.glob('src/*.cyr')):
     prev_comment = None
-    in_enum = False
-    for lineno, line in enumerate(open(path, encoding='utf-8', errors='replace'), 1):
-        if ENUM_OPEN.match(line):
-            in_enum = True
-            continue
-        if in_enum and re.match(r'^\s*\}', line):
-            in_enum = False
+    lines = open(path, encoding='utf-8', errors='replace').readlines()
+    in_enum = scan_enums(path, lines)
+    for lineno, line in enumerate(lines, 1):
+        if lineno in in_enum:
+            prev_comment = None
             continue
         m = DECL.match(line)
-        if not m and in_enum:
-            m = ENUM_DECL.match(line)
         if not m:
             # Fallback: a declaration documented on the line ABOVE. See DECL_NC.
             mn = DECL_NC.match(line)
@@ -343,110 +692,9 @@ for path in sorted(glob.glob('src/*.cyr')):
         else:
             name, hexlit, comment = m.group(1), m.group(2), m.group(3)
         prev_comment = None
-        if len(hexlit.replace('_', '')) - 2 < 12:   # short masks/flags, not f64 payloads
+        if not hex_payload(hexlit):   # short masks/flags, not f64 payloads
             continue
-        actual = as_double(hexlit)
-        site = f"{path}:{lineno} {name}"
-
-        # +/-Infinity is checkable exactly, so verify rather than skip. These are
-        # real sentinel values used by the geometry and spatial modules and a
-        # wrong one would silently break every min/max seed that starts from them.
-        cl = comment.strip().lower().lstrip('+')
-        if cl in ('infinity', 'inf', '-infinity', '-inf'):
-            want = float('-inf') if cl.startswith('-') else float('inf')
-            ok = (actual == want)
-            results.append(ok)
-            if not ok:
-                errors.append((site, comment, actual, want, 'infinity literal', 'exact', None))
-            elif verbose:
-                print(f"  ok   {site:52s} = {actual!r} (infinity literal)")
-            continue
-
-        if SKIP_RE.search(comment):
-            skipped.append((path, lineno, name, comment, 'prose comment')); continue
-
-        # Split "EXACT = DECIMAL" if present; prefer the exact form.
-        head, sep, tail = comment.partition('=')
-        exact_src = head.strip() if sep else comment.strip()
-        dec_src = tail.strip() if sep else comment.strip()
-        truncated = '...' in comment or '…' in comment
-        exact_src = exact_src.rstrip('.').strip()
-        dec_src_clean = dec_src.replace('...', '').replace('…', '').strip()
-
-        expected, basis, value, rule = None, None, None, None
-
-        fr = exact_fraction(exact_src)
-        if fr is not None:
-            value, basis = fr, f"exact {exact_src}"
-        else:
-            ev = eval_exact(exact_src)
-            if ev is not None and (sep or not re.fullmatch(DEC.pattern, exact_src)):
-                value, basis = ev, f"expr {exact_src}"
-        if value is not None:
-            # ⛔ 3.3.1 -- THIS WAS 8 ULP, on the theory that a comment expression
-            # re-evaluated in a different order (`1.0/2.4` in float vs the
-            # correctly-rounded 5/12) lands a few ulp away. 8 of the 9 expression
-            # constants sat at exactly 0 ulp; the ninth, color.cyr's _SRGB_INV_2_4,
-            # was a 5-ulp transcription error the slack had been passing. 3.3.1 cut it
-            # to 1 ulp, and 3.3.7 to none: the value is now exact, so the encoded
-            # double must be its correctly rounded value.
-            # [measured: per-constant ulp distance over src/, 2026-09-30 and 3.3.7]
-            expected, rule = round_exact(value), 'correctly rounded'
-            ok = expected is not None and _bits(actual) == _bits(expected)
-        else:
-            # Falling back to "pull the first decimal out of the comment" is only
-            # safe when the comment is not an unevaluated symbolic expression --
-            # otherwise `# -2*pi` would silently compare against -2.
-            src_for_decimal = dec_src_clean if sep else comment
-            # Strip trailing/parenthetical prose: "# 1e-4 (Armijo constant)",
-            # "# 1e-12 as f64 bits". What remains must be a bare number.
-            probe = re.sub(r'\([^)]*\)', ' ', src_for_decimal)
-            probe = re.sub(r'\b(as f64 bits?|approx|approximately|about|~)\b', ' ', probe, flags=re.I)
-            if has_unknown_symbol(probe):
-                skipped.append((path, lineno, name, comment,
-                                'symbolic expression not evaluable -- verify by hand')); continue
-            d = DEC.search(dec_src_clean) or DEC.search(comment)
-            if not d:
-                skipped.append((path, lineno, name, comment, 'no parseable value')); continue
-            tok = d.group(0)
-            try: value = Fraction(tok)
-            except ValueError:
-                skipped.append((path, lineno, name, comment, 'unparseable number')); continue
-            basis, expected = f"decimal {tok}", round_exact(value)
-            # ⛔ 3.3.0 — A ONE- OR TWO-DIGIT COMMENT NAMES A ROUND VALUE, NOT A ROUNDED
-            # DISPLAY: `_SYM_EPS` was 2^-50 = 8.88e-16 under `# 1e-15` and passed. 3.3.0
-            # held short tokens to 4 ulp; 3.3.7 holds every untruncated token to its
-            # nearest double (see the ⛔ 3.3.7 paragraph at eval_exact).
-            if truncated:
-                rule = 'inside its truncation (cannot pin the bit)'
-                ok = abs(Fraction(actual) - value) <= decimal_step(tok) + half_gap(actual)
-            else:
-                rule = 'decoded exactly'
-                ok = expected is not None and _bits(actual) == _bits(expected)
-
-        results.append(ok)
-        if not ok:
-            errors.append((site, comment, actual, expected, basis, rule, value))
-        elif verbose:
-            print(f"  ok   {site:52s} = {actual!r} ({basis}; {rule})")
-
-        # Cross-check: when the comment gives BOTH an exact form and a decimal,
-        # the decimal must also agree with the exact value it claims to expand:
-        # within one unit of its last digit when it says `...`, else a correctly
-        # rounded display of the value, or the digits of the encoded double itself.
-        if sep and basis and not basis.startswith('decimal'):
-            d = DEC.search(dec_src_clean)
-            if d:
-                shown, step = Fraction(d.group(0)), decimal_step(d.group(0))
-                if truncated:
-                    cok = abs(shown - value) < step
-                else:
-                    rs = round_exact(shown)
-                    cok = abs(shown - value) <= step / 2 or (rs is not None and _bits(rs) == _bits(actual))
-                if not cok:
-                    errors.append((site + " [comment self-inconsistent]", comment, round_exact(shown),
-                                   expected, basis, 'the decimal must display the exact value', value))
-                    results.append(False)
+        check_one(path, lineno, name, hexlit, comment, False)
 
 # ---------------------------------------------------------------------------
 # DUPLICATE GLOBALS. Cyrius has ONE flat namespace and last-definition-wins, so
@@ -480,11 +728,17 @@ for path in sorted(glob.glob('src/*.cyr')):
 # emptied by a mechanical edit while still printing "no duplicates" is the defect
 # this block just had. Raise it when globals are added; lower it only with a
 # reason in the commit (3.3.2 deletes the dead `_COL_*` globals and will).
-GLOBAL_FLOOR = 218   # column-0 globals in src/; 221 -> 211 in 3.3.2: D063 deleted 10 dead _COL_* globals
+GLOBAL_FLOOR = 327   # column-0 globals in src/; 221 -> 211 in 3.3.2: D063 deleted 10 dead _COL_* globals
                      # 211 -> 218 in 3.3.3: _IVL_F64_MAX/_IVL_F64_NEG_MAX (D021), four _GA_TOI_* (the
                      # time_of_impact normal), _NUMX_F64_INV_2P64 (num_sobol's 64-bit domain)
+                     # 218 -> 321 in 3.4.1 SYM4: the floor had not followed the population, this
+                     # script's own count on the merged 3.4.1 tree [measured: 2026-11-01]
+                     # 321 -> 320 in 3.4.1 INS6: einsum's static scratch retired _EINSUM_ARENA_CAP and
+                     # _einsum_arena for _einsum_top (an array has no `=`, so _EINSUM_SCRATCH is not counted)
+                     # 320 -> 327 at the 3.4.1 close: the last passes' new globals (_GA_REFUSED and the
+                     # ball-by-the-rim reading), this script's own count on the merged tree [measured: 2026-11-01]
 global_population = sum(len(v) for v in seen_globals.values())
-if global_population < GLOBAL_FLOOR:
+if floors and global_population < GLOBAL_FLOOR:
     print(f"\n!! DUPLICATE-GLOBAL SCAN SHRANK: {global_population} declarations seen, floor is {GLOBAL_FLOOR}.")
     print("   A global stopped matching GLOBAL_DECL -- the scan is blind to it. Check the")
     print("   declaration shape before touching the floor.")
@@ -513,7 +767,16 @@ if dup_errors:
 
 total = len(results)
 bad = len(errors)
-print(f"=== constant check: {total - bad}/{total} verified, {len(skipped)} skipped ===")
+print(f"=== constant check: {total - bad}/{total} verified, {len(skipped)} skipped "
+      f"({enum_seen} hex enum members read, {len(undecodable)} unreadable) ===")
+
+if undecodable:
+    print(f"\n!! {len(undecodable)} ENUM MEMBER(S) HOLD A HEX f64 THIS GATE CANNOT CHECK\n")
+    for p, l, n, why in undecodable:
+        print(f"  {p}:{l} {n}: {why}")
+    print("\nAn enum member is checked or the gate fails (3.4.1 SYM3): write it as `NAME = 0xHEX;  # value`")
+    print("on a line of its own (the `;` is optional on the last member), or name it prose in its comment")
+    print("(a mask, a NaN, a sentinel) when it holds bits rather than a value.")
 
 if skipped and verbose:
     print("\n-- skipped (no machine-checkable value in comment) --")
@@ -537,6 +800,8 @@ if errors:
     print("A constant that disagrees with its own comment is a defect: the comment states")
     print("the intent and the bit pattern is what ships. Re-encode from the exact value.")
     sys.exit(1)
+if undecodable:
+    sys.exit(1)
 
 # ⛔ POPULATION FLOOR (3.1.0). This gate has now been caught TWICE reporting a
 # confident N/N over a population that had silently shrunk: 2.20.0 found
@@ -553,12 +818,34 @@ POPULATION_FLOOR = 214   # 161 verified + 1 skipped; 164 -> 156 in 3.3.2: 8 of D
 # _GEO_* constants and gauss5's nodes and weights became enum members (14 hex declarations out,
 # 16 hex members in: two of them were aliases of error.cyr's public vars) [measured: this script's
 # own count on the 3.3.7 tree, 211 verified + 3 skipped, 2026-10-31]
+# 214 -> 305 in 3.4.1 SYM3, and two more floors beside it: the VERIFIED count, so a constant
+# cannot move from verified to skipped (a comment edited into prose) unnoticed, and the count
+# of hex enum members read, so the enum parser cannot lose a shape the way the member regex did
+# (see the ⛔ 3.4.1 SYM3 paragraph at ENUM_START). [measured: this script's own count on the 3.4.1
+# SYM3 tree, 294 verified + 11 skipped, 80 hex enum members, 2026-11-01]
+# 305 -> 340, 294 -> 321, 80 -> 105 in 3.4.1 SYM4: the floors had fallen 10 enum members behind the
+# tree, room for the 7 a plant hid, so each is the count again. [measured: this script's own count
+# on the merged 3.4.1 tree, 321 verified + 19 skipped, 105 hex enum members, 2026-11-01]
+POPULATION_FLOOR = 346
+VERIFIED_FLOOR = 324
+ENUM_MEMBER_FLOOR = 108
 population = total + len(skipped)
+if not floors:
+    sys.exit(0)
 if population < POPULATION_FLOOR:
     print(f"\n!! POPULATION SHRANK: {population} declarations seen, floor is {POPULATION_FLOOR}.")
     print("   A hand-encoded constant stopped matching DECL — the gate is blind to it, not")
     print("   the constant correct. Check the declaration shape (e.g. a new prefix) before")
     print("   touching the floor.")
+    sys.exit(1)
+if total - bad < VERIFIED_FLOOR:
+    print(f"\n!! VERIFIED COUNT SHRANK: {total - bad} constants verified, floor is {VERIFIED_FLOOR}.")
+    print("   A constant the gate used to check is now skipped or unseen. Restore a comment that")
+    print("   states its value before touching the floor.")
+    sys.exit(1)
+if enum_seen < ENUM_MEMBER_FLOOR:
+    print(f"\n!! ENUM MEMBERS SHRANK: {enum_seen} hex enum members read, floor is {ENUM_MEMBER_FLOOR}.")
+    print("   An enum member stopped being read -- check the enum's shape before touching the floor.")
     sys.exit(1)
 
 print("All hand-encoded f64 constants match their documented values.")

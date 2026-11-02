@@ -3,8 +3,8 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v3.4.0 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 52,483
-> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.7.9; a
+> hisab v3.4.1 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 70,576
+> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.7.18; a
 > consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map
@@ -36,9 +36,9 @@ hisab (Cyrius)
 │   └── spatial.cyr        — k-d tree, octree, quadtree, spatial hash (BVH lives in geo_advanced)
 │
 ├── Collision
-│   ├── collision_core.cyr — sequential-impulse solver, convex hull 2D
-│   │                         (monotone chain), triangulation (ear clipping)
-│   └── collision_mesh.cyr — Delaunay (Bowyer-Watson), half-edge mesh, island detection (union-find)
+│   ├── collision_core.cyr — sequential-impulse solver
+│   └── collision_mesh.cyr — convex hull 2D (monotone chain), triangulation (ear clipping), Delaunay
+│                             (Bowyer-Watson), half-edge mesh, island detection (union-find)
 │
 ├── Calculus
 │   ├── calc.cyr           — Derivative, Simpson/Gauss-Legendre, Bezier, easing, Perlin 2D
@@ -70,7 +70,7 @@ hisab (Cyrius)
     │                        for an n-input gradient where forward needs n passes
     ├── interval.cyr       — Interval arithmetic
     ├── tensor.cyr         — N-D dense tensor, Kronecker/Minkowski/Levi-Civita
-    └── einsum.cyr         — Einstein-summation contraction (bounded reused arena)
+    └── einsum.cyr         — Einstein-summation contraction (static per-call scratch)
 ```
 
 ## Dependencies
@@ -100,7 +100,9 @@ re-checked by the same two checks 2026-10-31 on 3.3.7, which found five rows sta
 through it `linalg_ext` and `linalg_precision`, need `f64_util` for `f64_copysign`, and `mat4` and
 `transforms` stopped needing it when 3.3.4 retired hisab's `f64_tan`; each module's own `# Requires`
 comment said the same and is corrected too; re-checked again 2026-10-31 on 3.4.0, which found
-`symbolic` needing `error` for `expr_eval_checked`'s codes, and `symbolic_ext` through it).
+`symbolic` needing `error` for `expr_eval_checked`'s codes, and `symbolic_ext` through it; re-derived
+2026-11-01 on 3.4.1, which found `collision_core` no longer needing `vec2` now that the hull and the
+ear clipping live in `collision_mesh`, and `linalg_ext`, and `linalg_precision` through it, needing `num`).
 Undefined *functions* count even when nothing calls them. A function is only a warning until
 something reaches it, and a set that leaves one out is a trap for whoever calls it next.
 
@@ -151,8 +153,8 @@ that took any of the other nine through hisab's sidecar must now declare it.
 | `symbolic_ext` | `error`, `symbolic` |
 | `vec2` | `error` |
 | `vec3` | `error` |
-| `collision_core` | `error` `vec2` |
-| `linalg_ext` | `complex` `error` `f64_util` `linalg_precision` (3.3.4: `svd_golub_kahan` is the SVD fallback) |
+| `collision_core` | `error` |
+| `linalg_ext` | `complex` `error` `f64_util` `linalg_precision` `num` (3.3.4: `svd_golub_kahan` is the SVD fallback) |
 | `num_ext` | `error` `num` |
 | `quat` | `error` `vec3` |
 | `vec4` | `error` `vec3` |
@@ -164,7 +166,7 @@ that took any of the other nine through hisab's sidecar must now declare it.
 | `calc_ext` | `calc` `error` `vec2` `vec3` |
 | `geo_advanced` | `error` `geo` `quat` `vec3` |
 | `geo_diff` | `error` `geo` `quat` `vec3` |
-| `linalg_precision` | `complex` `error` `f64_util` `linalg_ext` (`linalg_sort_desc` orders every S / eigenvalue vector) |
+| `linalg_precision` | `complex` `error` `f64_util` `linalg_ext` `num` (`linalg_sort_desc` orders every S / eigenvalue vector) |
 | `noise_simplex` | `calc` `error` `vec2` `vec3` |
 | `spatial` | `error` `geo` `quat` `vec3` |
 | `mat4` | `error` `quat` `vec3` `vec4` |

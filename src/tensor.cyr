@@ -10,6 +10,10 @@ public struct HTensor { rank; shape; data; total; }
 
 var _TENSOR_MAX_ELEMS = 1048576;  # 1M elements max (8MB)
 
+# A zero-filled dense tensor of the given rank (0..8) and shape (rank i64 extents, each
+# >= 1, read from `shape` and copied), row-major. Returns the handle, or the designed 0
+# for a rank outside 0..8, an extent <= 0, more than _TENSOR_MAX_ELEMS (2^20) elements in
+# all, or a refused allocation. A rank-0 tensor holds one element and has no shape array.
 public fn tensor_new(rank, shape) {
     if (rank < 0 || rank > 8) { return 0; }  # Sanity cap
     var t = alloc(sizeof(HTensor));
@@ -58,11 +62,17 @@ fn _tensor_flat_idx(t, indices) {
     return idx;
 }
 
+# The element at the multi-index `indices` (rank i64s, row-major), as f64 bits.
+# ⚠ UNCHECKED, by design of a raw accessor: neither t nor the indices are validated, and
+# an index outside its extent reads outside the tensor's data (a 0 t faults). The
+# bounds contract is a [3.5.0] question (an f64 return has no failure value).
 public fn tensor_get(t, indices) {
     var flat = _tensor_flat_idx(t, indices);
     return load64(HTensor_data(t) + flat * 8);
 }
 
+# Store the f64 bits `val` at the multi-index `indices`. Returns 0. ⚠ UNCHECKED, as
+# tensor_get: an out-of-range index writes outside the tensor's data.
 public fn tensor_set(t, indices, val) {
     var flat = _tensor_flat_idx(t, indices);
     store64(HTensor_data(t) + flat * 8, val);
@@ -73,11 +83,15 @@ public fn tensor_set(t, indices, val) {
 # 2D convenience (matrix-like access)
 # ================================================================
 
+# The element (i, j) of a rank-2 tensor (row i, column j), as f64 bits. ⚠ UNCHECKED, as
+# tensor_get, and the rank is not checked: below rank 2 the column count is read past
+# the shape array.
 public fn tensor_get2(t, i, j) {
     var cols = load64(HTensor_shape(t) + 8);
     return load64(HTensor_data(t) + (i * cols + j) * 8);
 }
 
+# Store `val` at (i, j) of a rank-2 tensor. Returns 0. ⚠ UNCHECKED, as tensor_get2.
 public fn tensor_set2(t, i, j, val) {
     var cols = load64(HTensor_shape(t) + 8);
     store64(HTensor_data(t) + (i * cols + j) * 8, val);
@@ -144,7 +158,9 @@ public fn tensor_scale(t, s) {
 
 # Contract indices idx_i and idx_j of a rank-N tensor (trace over those two indices).
 # The two indices must be distinct, in [0, rank), and have the same dimension.
-# Returns a fresh rank-(N-2) tensor, or 0 if t is null or the indices are invalid.
+# Returns a fresh rank-(N-2) tensor for N >= 3. A rank-2 input (a full trace) returns a
+# rank-1 tensor of shape [1] holding the scalar, not a rank-0 tensor (3.4.1: this said
+# rank N-2 for every N). Returns 0 if t is null or the indices are invalid.
 public fn tensor_contract(t, idx_i, idx_j) {
     # t may be the designed 0 that tensor_new or einsum returns on failure;
     # HTensor_rank(0) is a null dereference, so guard before reading metadata.
@@ -269,13 +285,18 @@ public fn tensor_contract(t, idx_i, idx_j) {
 # Standard physics tensors
 # ================================================================
 
-# Kronecker delta delta_ij
+# Kronecker delta delta_ij, as f64 bits (+1.0 / 0.0), for any integer indices.
 public fn kronecker_delta(i, j) {
     if (i == j) { return F64_ONE; }
     return 0;
 }
 
-# Minkowski metric eta_munu = diag(+1, -1, -1, -1) [particle physics convention]
+# Minkowski metric eta_munu = diag(+1, -1, -1, -1) [particle physics convention], as f64
+# bits. For mu, nu in 0..3 it is that matrix. Any other integers get the same rule, not a
+# refusal: 0 off the diagonal (mu != nu), +1.0 at (0, 0), -1.0 at every other diagonal
+# index, negative ones included (minkowski(9, 9) = minkowski(-1, -1) = -1.0) -- the metric
+# of R^{1,n} for indices 0..n, as kronecker_delta extends to any integers.
+# [measured: tests/modules_c.tcyr "3.4.1 LIE2: tensor symbols", baseline 3.4.0]
 public fn minkowski(i, j) {
     if (i != j) { return 0; }
     if (i == 0) { return F64_ONE; }
@@ -294,17 +315,29 @@ public fn minkowski(i, j) {
 #
 # The `return 0` branches are deliberately left alone: integer 0 and f64 +0.0 are
 # the same 64-bit word, so they already satisfy the contract.
+#
+# For indices 0..2 it is the symbol. Any other integers get levi_civita_4's rule, the one
+# rule for both symbols: 0 for a repeated index, else the sign of the permutation that
+# sorts the three (levi_civita_3(0, 1, 3) = +1.0, levi_civita_3(9, 5, -1) = -1.0).
+# ⛔ 3.4.0 AND EARLIER — any distinct triple other than the six permutations of 0..2 fell
+# through to the odd-permutation return: levi_civita_3(0, 1, 3) was -1.0 (and (-1, 5, 9)
+# too), the wrong sign -- the permutation that sorts it is the identity, which is even.
+# [measured: tests/modules_c.tcyr "3.4.1 LIE2: tensor symbols", baseline 3.4.0]
 public fn levi_civita_3(i, j, k) {
     if (i == j || j == k || i == k) { return 0; }
-    # Even permutations of (0,1,2): +1
-    if (i == 0 && j == 1 && k == 2) { return F64_ONE; }
-    if (i == 1 && j == 2 && k == 0) { return F64_ONE; }
-    if (i == 2 && j == 0 && k == 1) { return F64_ONE; }
-    # Odd permutations: -1
+    # Inversions of (i, j, k): an even count is an even permutation of the sorted triple.
+    var inv = 0;
+    if (i > j) { inv = inv + 1; }
+    if (i > k) { inv = inv + 1; }
+    if (j > k) { inv = inv + 1; }
+    if (inv % 2 == 0) { return F64_ONE; }
     return f64_neg(F64_ONE);
 }
 
-# 4D Levi-Civita. Same f64-bit-pattern contract as levi_civita_3.
+# 4D Levi-Civita. Same f64-bit-pattern contract as levi_civita_3, for indices 0..3. Any
+# other integers are answered by the same rule as levi_civita_3, not refused: 0 for a
+# repeated index, else the sign of the permutation that sorts the four
+# (levi_civita_4(-1, 5, 9, 12) = +1.0).
 public fn levi_civita_4(i, j, k, l) {
     # Check for repeated indices
     if (i == j || i == k || i == l || j == k || j == l || k == l) { return 0; }

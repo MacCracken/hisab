@@ -30,12 +30,28 @@ var _NUM_F64_INV_2P32 = 0x3DF0000000000000;          # 2^-32 = 2.328306436538696
 # ROOT FINDING
 # ================================================================
 
-# Newton-Raphson root finding.
-# f, df: function pointers (f64) -> f64
+# Newton-Raphson root finding: x <- x - f(x) / f'(x) from x0.
+# f, df: function pointers (f64) -> f64, f and its derivative
 # x0, tol: f64 bit patterns
-# max_iter: integer
+# max_iter: integer, the most Newton updates taken
 # out: pointer, result f64 written here on success
-# Returns: Ok(0) on success, HSB_ERR_NO_CONVERGENCE or HSB_ERR_DIVISION_BY_ZERO on failure
+# Returns: Ok(0) with x in `out` at the first iterate (x0 included) where |f(x)| < tol --
+# a residual test, so tol <= 0 or NaN is never met; Err(HSB_ERR_DIVISION_BY_ZERO) when
+# f'(x) is below DBL_MIN in magnitude and f(x) / f'(x) is not finite (the step does not exist
+# as a double; a zero f', either sign, always so); Err(HSB_ERR_NO_CONVERGENCE) when max_iter updates
+# do not meet tol (a NaN or infinite iterate ends there too). `out` is untouched on every Err.
+#
+# ⛔ THE DERIVATIVE TEST WAS AN ABSOLUTE 1e-12 (the epsilon census). f'(x) has dimensions [f]/[x], so
+# Newton gave up on any problem whose units made the derivative small, a scale the caller
+# chooses, not a property of the root. It returned HSB_ERR_DIVISION_BY_ZERO with `out`
+# unwritten: a false refusal, not a fabricated answer. The census moved the cut to DBL_MIN.
+# [measured: docs/audit/2026-09-09-epsilon-open.json]
+# ⛔ 3.4.1 — AND DBL_MIN STILL REFUSED A SUBNORMAL DERIVATIVE WHOSE STEP EXISTS. f = c (x - 1.5)
+# with c = 0x0008000000000000 (2^-1023) from x0 = 1 was Err(DIVISION_BY_ZERO); one step gives
+# exactly 1.5 (roadmap [3.4.1], AU2-G4-F9). What fails is the division, and only when f'(x)
+# is zero or the quotient overflows, so that is what is refused now; every derivative at or
+# above DBL_MIN takes the 3.4.0 path, bit for bit.
+# [measured: tests/edge_cases.tcyr, group "3.4.1: num_newton takes a subnormal derivative"]
 #must_use
 public fn num_newton(f, df, x0, tol, max_iter, out) {
     var x = x0;
@@ -48,17 +64,14 @@ public fn num_newton(f, df, x0, tol, max_iter, out) {
             return Ok(0);
         }
         var dfx = fncall1(df, x);
-        # ⛔ `f'(x)` has dimensions [f]/[x], so an absolute 1e-12 made Newton give
-        # up on any problem whose units happen to make the derivative small — a
-        # scale the caller chooses, not a property of the root. ⚠ Unlike most of
-        # this class it does NOT fabricate: it returns HSB_ERR_DIVISION_BY_ZERO and
-        # leaves `out` unwritten, so the defect is a false refusal, not a wrong
-        # answer. That still makes it wrong, and it is a public entry point.
-        if (f64_lt(f64_abs(dfx), F64_TINY) == 1) {
+        # x = x - f(x)/f'(x)
+        var step = f64_div(fx, dfx);
+        # Below DBL_MIN, a zero f' included (f / 0 is +-Inf or NaN), the division fails
+        # exactly when its quotient is not finite.
+        if (f64_lt(f64_abs(dfx), F64_TINY) == 1 && f64_lt(f64_abs(step), F64_POS_INF) == 0) {
             return Err(HSB_ERR_DIVISION_BY_ZERO);
         }
-        # x = x - f(x)/f'(x)
-        x = f64_sub(x, f64_div(fx, dfx));
+        x = f64_sub(x, step);
         i = i + 1;
     }
     return Err(HSB_ERR_NO_CONVERGENCE);
@@ -244,7 +257,21 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
             store64(out, mid);
             return Ok(0);
         }
+        # ⭐ 3.4.1 — A CLOSED BRACKET ENDS THE LOOP. When no double lies strictly between lo
+        # and hi the midpoint lands on an end, the bracket can never move again, and every
+        # later pass evaluated f at the same point until max_iter ran out, to return this
+        # midpoint at the exit's adjacency test: 147 wasted calls in the stall row, about 950
+        # at max_iter 1000 (roadmap [3.4.1], REV-NU2 N2). A midpoint that lands on the end its
+        # f(mid) would replace returns now, with that value. The test reads the bits, one
+        # compare on each branch: a midpoint equal to an end only in value (+0 beside -0) is
+        # not that end. f(mid) is the end's own value there, evaluated before, so nothing the
+        # remaining passes would have returned changes.
+        # [measured: tests/edge_cases.tcyr, group "3.4.1: num_bisection stops when the bracket closes"]
         if (f64_lt(f_mid, _NUM_F64_ZERO) == 1) {
+            if (mid == lo) {
+                store64(out, mid);
+                return Ok(0);
+            }
             lo = mid;
         } else {
             # ⭐ 3.3.7 — THE NaN TEST, WHERE A NaN CAN ARRIVE: `f(mid) < 0` is false for a NaN,
@@ -253,6 +280,10 @@ public fn num_bisection(f, a, b, tol, max_iter, out) {
             # [0, 2] at 1e-12: 3.3.6 498 ns, integrated 494, now 457 (3.3.5 442).
             # [measured: tests/hisab.bcyr num_bisection_x2m2, 4-tree A/B, 2026-10-31]
             if ((f_mid & 0x7FFF_FFFF_FFFF_FFFF) > 0x7FF0_0000_0000_0000) { return Err(HSB_ERR_INVALID_INPUT); }
+            if (mid == hi) {
+                store64(out, mid);
+                return Ok(0);
+            }
             hi = mid;
         }
         i = i + 1;
@@ -334,8 +365,17 @@ enum _NumFftReseed { _NUM_FFT_RESEED = 64; }
 
 # In-place Cooley-Tukey radix-2 FFT.
 # data: pointer to n complex numbers (2n f64 values, 16n bytes)
-# n: number of complex elements (must be power of 2)
-# Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT if n is not power of 2
+# n: number of complex elements: a power of 2, or 0
+# Returns: Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n is negative or a positive
+# non-power of 2, with `data` untouched. n = 0 (the empty transform) and n = 1 (a point
+# is its own transform) are Ok and write nothing.
+# ⛔ 3.4.1 — A NEGATIVE n RETURNED Ok. `n <= 1 -> Ok(0)` ran before the power-of-two
+# test, so num_fft(buf, -4) and num_ifft(buf, -4) reported success having transformed
+# nothing, where the doc promised INVALID_INPUT for any n that is not a power of two, and
+# num_dst / _idst / _dct / _idct and the 2-D FFTs answer Err(-10). A negative length has
+# no transform. n = 0 stays Ok: the empty sequence is its own DFT, and a consumer (naad's
+# spectral code) passes it for empty input (roadmap [3.4.1], AU3-F25 = AU2-G4-F13).
+# [measured: tests/edge_cases.tcyr, group "3.4.1: num_fft / num_ifft refuse a negative n"]
 #
 # ⛔ 3.3.7 — THE TWIDDLE RECURRENCE DRIFTED WITH n. Each stage formed its twiddles as
 # w <- w * wn, k times, from a rounded wn, so twiddle k carried k roundings and wn's own
@@ -358,6 +398,7 @@ enum _NumFftReseed { _NUM_FFT_RESEED = 64; }
 # [measured: scratch FFT probes (pfft.cyr, pfft2.cyr, pfft3.cyr), Decimal DFT oracle, base and this tree, 2026-10-31]
 #must_use
 public fn num_fft(data, n) {
+    if (n < 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (n <= 1) { return Ok(0); }
     if (num_is_pow2(n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
@@ -437,10 +478,11 @@ public fn num_fft(data, n) {
     return Ok(0);
 }
 
-# In-place inverse FFT.
+# In-place inverse FFT, scaled by 1/n.
 # data: pointer to n complex numbers (2n f64 values)
-# n: number of complex elements (must be power of 2)
-# Returns: Ok(0) on success, HSB_ERR_INVALID_INPUT if n is not power of 2
+# n: number of complex elements: a power of 2, or 0
+# Returns: Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n is negative or a positive
+# non-power of 2, with `data` untouched; n = 0 and n = 1 are Ok and write nothing (num_fft).
 #must_use
 public fn num_ifft(data, n) {
     # Validate BEFORE touching the caller's buffer. The conjugate pass below
@@ -449,7 +491,8 @@ public fn num_ifft(data, n) {
     # imaginary part already negated: the caller saw a failure code AND a
     # silently conjugated input. num_fft rejects the same n with `data`
     # bit-identical; the inverse must offer the same guarantee. Guard order
-    # mirrors num_fft so n <= 1 still returns HSB_ERR_NONE.
+    # mirrors num_fft: a negative n is refused (3.4.1), n = 0 and 1 return HSB_ERR_NONE.
+    if (n < 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (n <= 1) { return Ok(0); }
     if (num_is_pow2(n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
@@ -537,8 +580,10 @@ public fn pcg32_new(seed) {
     return rng;
 }
 
-# Generate next u32 from PCG32 state.
-# Returns: u32 value (in lower 32 bits of i64)
+# Generate next u32 from PCG32 state (PCG-XSH-RR 64/32, O'Neill 2014): advances the 64-bit
+# LCG state and returns the permuted output of the OLD state.
+# rng: a handle from pcg32_new (not checked: 0 faults). Returns: u32 value (in the lower 32
+# bits of the i64, upper bits 0). Cannot fail.
 public fn pcg32_next(rng) {
     var old_state = load64(rng);
     var inc = load64(rng + 8);
@@ -565,8 +610,9 @@ public fn pcg32_next(rng) {
     return result;
 }
 
-# Generate next f64 in [0, 1).
-# Returns: f64 bit pattern
+# Generate next f64 in [0, 1): pcg32_next / 2^32, exact (a multiple of 2^-32), so only 2^32
+# values are reachable and the low 21 mantissa bits are always 0.
+# rng: a handle from pcg32_new. Returns: f64 bit pattern. Cannot fail.
 public fn pcg32_next_f64(rng) {
     var u = pcg32_next(rng);
     # f64 = u32_val / (2^32)
@@ -821,14 +867,21 @@ public fn num_is_prime(n) {
     return 1;
 }
 
-# Sieve of Eratosthenes: returns a vec of all primes up to and including limit.
-# Returns: vec (dynamic array) of prime integers, or 0 when the vec or the limit + 1 byte
-# sieve cannot be allocated (3.4.0; both were stored through unchecked before).
+# Sieve of Eratosthenes: returns a vec of all primes up to and including limit, ascending.
+# limit: integer, at most 10^7 (the sieve takes limit + 1 bytes). Below 2 the vec is empty (there
+# is no prime).
+# Returns: vec (dynamic array) of prime integers, or the designed 0 for limit > 10^7, and when
+# the vec or the sieve cannot be allocated or the vec cannot grow (3.4.0; 3.4.1: a refused grow
+# ended the process in vec_push).
+# ⛔ 3.4.1 — ABOVE THE CAP THE VEC WAS EMPTY, "NO PRIMES UP TO limit" (there are 664,579 below
+# 10^7): a fabricated answer, the one limit < 2 gives. The cap is a refusal, and returns the
+# designed 0 this function already has (roadmap [3.4.1] conventions row; review S4).
+# [measured: tests/edge_cases.tcyr, group "3.4.1: a refused grow is the designed failure, and the stated conventions"]
 public fn num_sieve(limit) {
+    if (limit > 10000000) { return 0; }  # the cap: refused, not "no primes" (3.4.1)
     var primes = vec_new();
     if (primes == 0) { return 0; }
     if (limit < 2) { return primes; }
-    if (limit > 10000000) { return primes; }  # Cap at 10M entries to prevent memory exhaustion
 
     # Allocate boolean sieve: 1 byte per number
     var sieve_size = limit + 1;
@@ -859,10 +912,11 @@ public fn num_sieve(limit) {
     }
 
     # Collect primes into vec
+    var va = default_alloc();
     var k = 2;
     while (k <= limit) {
         if (load8(sieve + k) == 1) {
-            vec_push(primes, k);
+            if (vec_push_a(va, primes, k) < 0) { return 0; }
         }
         k = k + 1;
     }

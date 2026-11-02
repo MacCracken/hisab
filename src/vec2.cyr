@@ -7,6 +7,8 @@
 #derive(accessors)
 public struct HVec2 { x; y; }
 
+# A new HVec2 (x, y): 16 bytes from the heap, the components stored as given (any doubles).
+# Returns the designed 0 where the allocation is refused (3.4.0); every constructor below too.
 #must_use
 public fn hvec2_new(x, y) {
     var v = alloc(sizeof(HVec2));
@@ -16,10 +18,14 @@ public fn hvec2_new(x, y) {
     return v;
 }
 
+# A new zero vector (+0, +0), exact; the designed 0 where the allocation is refused.
 #must_use
 public fn hvec2_zero() { return hvec2_new(0, 0); }
+# A new vector (1, 1), exact; the designed 0 where the allocation is refused.
 #must_use
 public fn hvec2_one() { return hvec2_new(F64_ONE, F64_ONE); }
+# A new vector (s, s), s stored as given (any double, NaN and -0 kept bit for bit); the
+# designed 0 where the allocation is refused.
 #must_use
 public fn hvec2_splat(s) { return hvec2_new(s, s); }
 
@@ -27,26 +33,33 @@ public fn hvec2_splat(s) { return hvec2_new(s, s); }
 # Arithmetic
 # ================================================================
 
+# a + b, componentwise: each component one IEEE addition, correctly rounded (overflow to
+# +-Inf and NaN as IEEE gives them). Returns a new HVec2, or the designed 0 where the
+# allocation is refused; so do `hvec2_sub`, `_mul`, `_scale` and `_neg`.
 #must_use
 public fn hvec2_add(a, b) {
     return hvec2_new(f64_add(HVec2_x(a), HVec2_x(b)), f64_add(HVec2_y(a), HVec2_y(b)));
 }
 
+# a - b, componentwise, each component correctly rounded.
 #must_use
 public fn hvec2_sub(a, b) {
     return hvec2_new(f64_sub(HVec2_x(a), HVec2_x(b)), f64_sub(HVec2_y(a), HVec2_y(b)));
 }
 
+# The componentwise (Hadamard) product (ax bx, ay by), each component correctly rounded.
 #must_use
 public fn hvec2_mul(a, b) {
     return hvec2_new(f64_mul(HVec2_x(a), HVec2_x(b)), f64_mul(HVec2_y(a), HVec2_y(b)));
 }
 
+# v times the scalar s, each component correctly rounded.
 #must_use
 public fn hvec2_scale(v, s) {
     return hvec2_new(f64_mul(HVec2_x(v), s), f64_mul(HVec2_y(v), s));
 }
 
+# -v, each component's sign flipped (`f64_neg`; below cycc 6.6.8 it gave +0 for +0).
 #must_use
 public fn hvec2_neg(v) {
     return hvec2_new(f64_neg(HVec2_x(v)), f64_neg(HVec2_y(v)));
@@ -56,11 +69,17 @@ public fn hvec2_neg(v) {
 # Products and norms
 # ================================================================
 
+# a . b = ax bx + ay by: two products and one sum, within 2u (|ax bx| + |ay by|) of the exact
+# value to first order (u = 2^-53); IEEE's zero sign (-0 exactly when both products are -0).
+# Overflow and NaN follow IEEE (a product past DBL_MAX is +-Inf).
 #must_use
 public fn hvec2_dot(a, b) {
     return f64_add(f64_mul(HVec2_x(a), HVec2_x(b)), f64_mul(HVec2_y(a), HVec2_y(b)));
 }
 
+# |v|^2 = x^2 + y^2 (`hvec2_dot(v, v)`): +Inf once a square passes DBL_MAX (|x| >= 2^512), and
+# subnormal, losing bits, once both |x| and |y| are below 2^-511 (0 below about 2^-537); use
+# `hvec2_length` for the magnitude across the whole range.
 #must_use
 public fn hvec2_length_sq(v) { return hvec2_dot(v, v); }
 
@@ -107,6 +126,11 @@ public fn hvec2_length(v) {
     return f64_sqrt(ls);
 }
 
+# v / |v|, the unit vector along v, for every finite non-zero v from the subnormals to DBL_MAX
+# (the scaled copies below), within a few ulp per component (the comment below has the sample
+# maxima). The zero vector gives the zero vector (it has no direction: a sentinel, |v| = 0, not
+# a unit vector). A NaN component gives NaN components; an infinite one gives NaN in its own
+# slot and zeros in the finite ones. Returns the designed 0 where an allocation is refused.
 #must_use
 public fn hvec2_normalize(v) {
     var len = hvec2_length(v);
@@ -149,6 +173,11 @@ public fn hvec2_normalize(v) {
     return hvec2_scale(v, inv);
 }
 
+# |a - b|: `hvec2_length` of the difference, formed as `hvec2_sub` forms it (on the stack), so
+# its error is the difference's rounding (u relative per component, u = 2^-53) and then the
+# length's; +Inf where |a - b| rounds past DBL_MAX (IEEE's rounding: (DBL_MAX, 2^500) from 0 is
+# DBL_MAX though its exact length exceeds it, and (DBL_MAX, DBL_MAX) from 0
+# is +Inf with no component of the difference overflowing), and where a component overflows.
 #must_use
 public fn hvec2_distance(a, b) {
     # The difference is a stack HVec2 (3.4.0): this returns a length, with no value
@@ -163,18 +192,69 @@ public fn hvec2_distance(a, b) {
 # Interpolation
 # ================================================================
 
-# SIMD: HVec2 is exactly 16 bytes = 2 doubles (pinned in tests/abuse.tcyr), so
-# packed n=2 covers the whole allocation with no over-read and no scalar tail;
-# the n=2 lane count and sizeof(HVec2) encode the same layout, and a field added
-# to HVec2 must change BOTH. Lane sequence sub -> scale
-# -> add is per lane a + (b - a) * t in the scalar form's order, so the result
-# is bit-identical to the scalar expression (see hvec3_lerp for why not axpy).
+# a + (b - a) t per component, any real t (t outside [0, 1] extrapolates): three roundings,
+# within u |a + (b - a) t| + 2u |(b - a) t| of the exact value to first order (u = 2^-53);
+# t = 0 gives a (a -0 may come back +0), and t = 1 gives b only where b - a is exact.
+# 3.4.1: where that form overflows for finite input (b - a past DBL_MAX, or its product with
+# t), the component is computed at half scale (`_hvec2_lerp_wide`), so it is finite wherever
+# the formula's value is: (-DBL_MAX, DBL_MAX) at 1/2 gave +Inf, exact 0. Every other component
+# keeps the fast form's bits. Returns the designed 0 where the allocation is refused.
+# 3.4.1 — SCALAR PER COMPONENT, the 3.4.0 packed form's operations in its order (sub, scale,
+# add per lane), so the same bits; the result is then in hand and one exponent test per
+# component sends a non-finite one to the helper. (cycc fuses no scalar f64_mul + f64_add on
+# either target; `hvec3_lerp`'s z tail has always relied on that.) It replaced a first 3.4.1
+# form that tested the inputs after the packed ops (3.4.1 review S1): identical bits on
+# 30,002 random triples (huge, subnormal and ordinary components; t random, extrapolating,
+# subnormal and powers of two), 3,375 special-value triples and 100,000 ordinary ones, at
+# about half the overhead: against 3.4.0's packed form, vec2 19 -> 22 ns (+16%; the input test
+# read 23 to 24, +23%), vec3 23 -> 26 ns (+13%; 28, +22%), 64 varying vec3 calls 1.44 ->
+# 1.54 us (+7%; 1.69, +17%). Reading the packed result back costs a store-forwarding stall.
+# [measured: scratch lerp sweep and fl2.bcyr, both trees, 3.4.0's form in each binary, 2026-10-31; cycc 6.7.18]
 #must_use
 public fn hvec2_lerp(a, b, t) {
     var r = alloc(sizeof(HVec2));
     if (r == 0) { return 0; }
-    f64v_sub(r, b, a, 2);
-    f64v_scale(r, r, t, 2);
-    f64v_add(r, a, r, 2);
+    var ax = load64(a);                                              # x, at offset 0
+    var ay = load64(a + 8);                                          # y, at offset 8
+    var rx = f64_add(ax, f64_mul(f64_sub(load64(b), ax), t));
+    var ry = f64_add(ay, f64_mul(f64_sub(load64(b + 8), ay), t));
+    store64(r, rx);
+    store64(r + 8, ry);
+    if ((rx & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000) { return _hvec2_lerp_fix(r, a, b, t); }
+    if ((ry & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000) { return _hvec2_lerp_fix(r, a, b, t); }
     return r;
+}
+
+# `hvec2_lerp`'s components through `_hvec2_lerp_wide` (each finite one kept); returns r.
+fn _hvec2_lerp_fix(r, a, b, t) {
+    HVec2_set_x(r, _hvec2_lerp_wide(HVec2_x(a), HVec2_x(b), t, HVec2_x(r)));
+    HVec2_set_y(r, _hvec2_lerp_wide(HVec2_y(a), HVec2_y(b), t, HVec2_y(r)));
+    return r;
+}
+
+# One component of a lerp whose fast form a + (b - a) t gave r. Where r is not finite while a,
+# b and t are, b - a, its product with t or the sum overflowed, and the same formula on a / 2
+# and b / 2, doubled, is that formula evaluated in an unbounded exponent range: the halves
+# are exact wherever they can reach the answer (|a| and |b| are at least 2^970 when b - a
+# overflows; a subnormal beside an overflowing (b - a) t is below half an ulp of the other
+# operand), and every non-zero half-scale intermediate is at least 2^-51 in magnitude, so
+# nothing rounds on the subnormal grid. The answer is finite wherever that evaluation is:
+# (-DBL_MAX, DBL_MAX, 1/2) gives 0, where the fast form gave +Inf, and (DBL_MAX, 0, 3/2) gives
+# -2^1023 + 2^971 (the exact -DBL_MAX / 2 is one ulp away: the product rounds), where it gave
+# -Inf; it is +-Inf, IEEE's rounding, where the value is beyond DBL_MAX. A finite r is returned
+# unchanged (a subnormal beside an overflowing component would not halve exactly), and so is
+# the r of a NaN or infinite t (a subnormal halved to 0 times Inf is NaN, where the fast form's
+# Inf is IEEE's answer). A NaN or infinite a or b needs no test: halving and doubling leave it
+# as it is and a finite partner meets it only in a sum, so the half form gives the fast form's
+# bits: on all 3,375 triples of 15 special values (zeros, subnormals, +-1, +-DBL_MAX, +-Inf,
+# NaNs) the three functions give the bits that also testing a and b gave, while with no test
+# at all 20 move, each with an infinite t.
+# transforms.cyr's `hisab_lerp` and vec3.cyr's `_hvec3_lerp_wide` hold the same lines (a
+# module cannot call another's `_` fn).
+# [measured: scratch special-value sweep, guarded and unguarded builds, lane MAT, 2026-10-31; cycc 6.7.18]
+fn _hvec2_lerp_wide(a, b, t, r) {
+    if ((r & 0x7FF0_0000_0000_0000) != 0x7FF0_0000_0000_0000) { return r; }
+    if ((t & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000) { return r; }
+    var ha = f64_mul(a, F64_HALF);
+    return f64_mul(f64_add(ha, f64_mul(f64_sub(f64_mul(b, F64_HALF), ha), t)), F64_TWO);
 }

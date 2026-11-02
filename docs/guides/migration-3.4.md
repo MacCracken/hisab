@@ -786,6 +786,11 @@ There are two documented exceptions:
 - einsum's arena requests are left unchecked because they fit the arena by construction.
   `einsum` itself returns 0 when the arena cannot be created.
 
+  **Since 3.4.1** einsum has no arena: its scratch is static, nothing but the result is asked of the
+  heap, and the call survives a caller's `alloc_reset()`. A limit too small for the old 8,208-byte
+  arena now answers. The same release takes the refusal path to every public entry: a refused
+  allocation no longer faults or exits, and the five collision entries answer their designed 0.
+
 `halfedge_from_triangles` has two new guards, both checked before anything is built:
 
 - a twin table past `ALLOC_MAX / 8` slots returns 0;

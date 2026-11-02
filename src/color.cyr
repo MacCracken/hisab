@@ -17,26 +17,43 @@ var _SRGB_2_4 = 0x4003333333333333;                     # 2.4
 # it through. `1.0/2.4` and `5/12` give the same f64, so the slack had no reason.
 var _SRGB_INV_2_4 = 0x3FDAAAAAAAAAAAAB;                # 1.0/2.4
 
+# The IEC 61966-2-1 sRGB decoding of one channel: c / 12.92 for c <= 0.04045, else
+# ((c + 0.055) / 1.055)^2.4 (ganita_f64_pow). Any f64 is accepted: a negative c takes the
+# linear segment, NaN propagates, +Inf gives +Inf. No failure value.
+# ⛔ 3.4.0 AND EARLIER — the test was `<` against the stored 0.04045, which is the nearest
+# double and lies BELOW 0.04045: that double, which the standard puts on the linear
+# segment, took the power branch (3F69A5C75C81E0EB where c / 12.92 is 3F69A5C61C57A062).
+# ⭐ 3.4.1: `<=`. Every double at or below the stored one is <= 0.04045 and every double
+# above it is above, so the branch is now the standard's for every input.
+# [measured: tests/abuse.tcyr "3.4.1: sRGB breakpoints"; threshold vs Fraction(0.04045)]
 public fn srgb_to_linear(c) {
-    if (f64_lt(c, _SRGB_THRESHOLD_TO_LINEAR) == 1) {
+    if (f64_le(c, _SRGB_THRESHOLD_TO_LINEAR) == 1) {
         return f64_div(c, _SRGB_12_92);
     }
     return ganita_f64_pow(f64_div(f64_add(c, _SRGB_0_055), _SRGB_1_055), _SRGB_2_4);
 }
 
+# The IEC 61966-2-1 sRGB encoding of one linear channel: 12.92 c for c <= 0.0031308, else
+# 1.055 c^(1/2.4) - 0.055. Same domain and channel as srgb_to_linear; the breakpoint test
+# is `<=` since 3.4.1, for the same reason (the stored 0.0031308 is below 0.0031308).
+# [measured: Fraction comparison of both stored thresholds, LIE lane 2026-10-31]
 public fn linear_to_srgb(c) {
-    if (f64_lt(c, _SRGB_THRESHOLD_TO_SRGB) == 1) {
+    if (f64_le(c, _SRGB_THRESHOLD_TO_SRGB) == 1) {
         return f64_mul(c, _SRGB_12_92);
     }
     return f64_sub(f64_mul(_SRGB_1_055, ganita_f64_pow(c, _SRGB_INV_2_4)), _SRGB_0_055);
 }
 
+# srgb_to_linear on each channel of an HVec3. Returns a fresh HVec3, or 0 when it cannot
+# be allocated.
 public fn srgb_to_linear_vec3(color) {
     return hvec3_new(srgb_to_linear(HVec3_x(color)),
       srgb_to_linear(HVec3_y(color)),
       srgb_to_linear(HVec3_z(color)));
 }
 
+# linear_to_srgb on each channel of an HVec3. Returns a fresh HVec3, or 0 when it cannot
+# be allocated.
 public fn linear_to_srgb_vec3(color) {
     return hvec3_new(linear_to_srgb(HVec3_x(color)),
       linear_to_srgb(HVec3_y(color)),
@@ -47,24 +64,39 @@ public fn linear_to_srgb_vec3(color) {
 # Premultiplied alpha -- returns Vec4 (r, g, b, a)
 # ================================================================
 
+# (r a, g a, b a, a) as a fresh HVec4 (0 when it cannot be allocated). No range check.
 public fn premultiply_alpha(r, g, b, a) {
     return hvec4_new(f64_mul(r, a), f64_mul(g, a), f64_mul(b, a), a);
 }
 
+# (r / a, g / a, b / a, a) as a fresh HVec4: the colour of a premultiplied tuple, each
+# channel correctly rounded. a = +-0 (no coverage, so no colour to recover) returns
+# transparent black (0, 0, 0, 0) by design; a NaN alpha gives NaN in every channel.
+# Returns 0 when the HVec4 cannot be allocated.
 public fn unpremultiply_alpha(r, g, b, a) {
     # ⛔ `a` is the homogeneous weight of a premultiplied tuple, and an absolute
     # 1e-12 discarded genuinely faint coverage as fully transparent black — losing
     # the caller's alpha too, since the live path returns `a` in w.
-    var inv_a = f64_div(F64_ONE, a);
-    if (f64_lt(f64_abs(inv_a), F64_POS_INF) == 0) { return hvec4_zero(); }
-    return hvec4_new(f64_mul(r, inv_a), f64_mul(g, inv_a), f64_mul(b, inv_a), a);
+    # ⛔ 3.4.0 AND EARLIER — the repair of that only moved the threshold: r * (1/a), with
+    # 1/a tested for overflow, still zeroed every alpha at or below 2^-1024 (where 1/a
+    # is not finite though r/a is: (1, 0, 0, 1) * 2^-1074 came back (0, 0, 0, 0), not
+    # (1, 0, 0, 2^-1074)), and a NaN alpha, whose 1/a is NaN, the same way.
+    # ⭐ 3.4.1 — the division itself, each channel once: exact a = 0 is the only alpha with
+    # no answer. [measured: tests/abuse.tcyr "3.4.1: unpremultiply_alpha", baseline 3.4.0]
+    if (f64_eq(a, 0) == 1) { return hvec4_zero(); }
+    return hvec4_new(f64_div(r, a), f64_div(g, a), f64_div(b, a), a);
 }
 
 # ================================================================
 # Porter-Duff compositing (premultiplied alpha)
 # All take (sr, sg, sb, sa, dr, dg, db, da) -> Vec4
 # ================================================================
+# Each returns a fresh HVec4 (0 when it cannot be allocated), formed by the operator's
+# formula in plain f64 arithmetic with no range checks: inputs are premultiplied and
+# meant to lie in [0, 1], and anything else is carried through the formula as is (NaN
+# propagates).
 
+# Source over destination: s + d (1 - sa), per channel.
 public fn composite_src_over(sr, sg, sb, sa, dr, dg, db, da) {
     var inv_sa = f64_sub(F64_ONE, sa);
     return hvec4_new(f64_add(sr, f64_mul(dr, inv_sa)),
@@ -73,6 +105,7 @@ public fn composite_src_over(sr, sg, sb, sa, dr, dg, db, da) {
       f64_add(sa, f64_mul(da, inv_sa)));
 }
 
+# Destination over source: d + s (1 - da), per channel.
 public fn composite_dst_over(sr, sg, sb, sa, dr, dg, db, da) {
     var inv_da = f64_sub(F64_ONE, da);
     return hvec4_new(f64_add(dr, f64_mul(sr, inv_da)),
@@ -81,26 +114,31 @@ public fn composite_dst_over(sr, sg, sb, sa, dr, dg, db, da) {
       f64_add(da, f64_mul(sa, inv_da)));
 }
 
+# Source in destination: s da, per channel.
 public fn composite_src_in(sr, sg, sb, sa, dr, dg, db, da) {
     return hvec4_new(f64_mul(sr, da), f64_mul(sg, da), f64_mul(sb, da), f64_mul(sa, da));
 }
 
+# Destination in source: d sa, per channel.
 public fn composite_dst_in(sr, sg, sb, sa, dr, dg, db, da) {
     return hvec4_new(f64_mul(dr, sa), f64_mul(dg, sa), f64_mul(db, sa), f64_mul(da, sa));
 }
 
+# Source out of destination: s (1 - da), per channel.
 public fn composite_src_out(sr, sg, sb, sa, dr, dg, db, da) {
     var inv_da = f64_sub(F64_ONE, da);
     return hvec4_new(f64_mul(sr, inv_da), f64_mul(sg, inv_da),
       f64_mul(sb, inv_da), f64_mul(sa, inv_da));
 }
 
+# Destination out of source: d (1 - sa), per channel.
 public fn composite_dst_out(sr, sg, sb, sa, dr, dg, db, da) {
     var inv_sa = f64_sub(F64_ONE, sa);
     return hvec4_new(f64_mul(dr, inv_sa), f64_mul(dg, inv_sa),
       f64_mul(db, inv_sa), f64_mul(da, inv_sa));
 }
 
+# Exclusive or: s (1 - da) + d (1 - sa), per channel.
 public fn composite_xor(sr, sg, sb, sa, dr, dg, db, da) {
     var inv_sa = f64_sub(F64_ONE, sa);
     var inv_da = f64_sub(F64_ONE, da);
@@ -110,29 +148,87 @@ public fn composite_xor(sr, sg, sb, sa, dr, dg, db, da) {
       f64_add(f64_mul(sa, inv_da), f64_mul(da, inv_sa)));
 }
 
+# min(x, 1) that keeps a NaN (stdlib f64_min(NaN, 1) is 1).
+fn _color_sat1(x) {
+    if (f64_gt(x, F64_ONE) == 1) { return F64_ONE; }
+    return x;
+}
+
+# Plus (additive): s + d per channel, saturated at 1. A NaN sum stays NaN.
+# ⛔ 3.4.0 AND EARLIER — the saturation was stdlib f64_min(sum, 1), which returns its
+# second operand whenever the first is NaN: a NaN channel came back as 1.0, full
+# intensity. [measured: tests/abuse.tcyr "3.4.1: composite_plus", baseline 3.4.0]
 public fn composite_plus(sr, sg, sb, sa, dr, dg, db, da) {
-    return hvec4_new(f64_min(f64_add(sr, dr), F64_ONE),
-      f64_min(f64_add(sg, dg), F64_ONE),
-      f64_min(f64_add(sb, db), F64_ONE),
-      f64_min(f64_add(sa, da), F64_ONE));
+    return hvec4_new(_color_sat1(f64_add(sr, dr)), _color_sat1(f64_add(sg, dg)),
+      _color_sat1(f64_add(sb, db)), _color_sat1(f64_add(sa, da)));
 }
 
 # ================================================================
 # Tone mapping -- returns Vec3
 # ================================================================
 
+# Reinhard: x / (1 + x) per channel, as a fresh HVec3 (0 when it cannot be allocated).
+# Meant for x >= 0; x = -1 is the formula's pole (a signed infinity), NaN propagates,
+# +Inf gives NaN (Inf / Inf).
 public fn tonemap_reinhard(r, g, b) {
     return hvec3_new(f64_div(r, f64_add(F64_ONE, r)),
       f64_div(g, f64_add(F64_ONE, g)),
       f64_div(b, f64_add(F64_ONE, b)));
 }
 
+# x (1 + x / white^2) / (1 + x), formed as t + (x / white) (t / white) with t = x / (1 + x).
+# ⛔ 3.4.0 AND EARLIER — x (1 + x / w^2) / (1 + x) as written: x * (1 + x / w^2) overflowed
+# for x past ~1e154 at white 1 (1e200 gave +Inf, exact ~1e200), and white^2 under- or
+# overflowed on its own (white = 1e-160 made x / w^2 = x / 0).
+# [measured: tests/abuse.tcyr "3.4.1: tone maps", baseline 3.4.0]
+#
+# ⛔ 3.4.1's first form, t + ((t / w) x) / w, underflowed (t / w) x where the x^2 / w^2
+# term was the whole answer: x = 5.06e-237 at white 7.02e-134 returned x, 1e30 times low
+# (exact 5.20e-207, which 3.4.0 had).
+# [measured: tests/modules_c.tcyr "3.4.1 LIE2: tonemap_reinhard_extended", review RV-LIE M1]
+#
+# ⭐ The form above has a proved bound. With t^ = t (1 + a), |a| <= 2u (1 + x and the
+# division), and the second term m = x t / w^2 formed with three more roundings
+# (|b| <= 3u), the result is (1 + a)(t + m (1 + b))(1 + e), |e| <= u: a relative error
+# of at most (3 + 3 k) u, k = |m / (t + m)| = |x| / |w^2 + x| (u = 2^-53). For x >= 0,
+# k <= 1: under 6 ulps (where m is subnormal its rounding adds at most 2^-1075). For
+# x < 0, k grows without bound at the formula's zero x = -w^2, as its conditioning does.
+# Range, for x >= 0: t <= x and t <= 1, so x / w and t / w can overflow only when both
+# are >= 1, and then each is at most m; one underflows only where m is below 2^-968 of t
+# and cannot reach the result's last bit. So no intermediate overflows unless the exact
+# result is within 6 ulps of overflowing.
+# [measured: proof in the LIE2 report; tests/modules_c.tcyr "3.4.1 LIE2: tonemap_reinhard_extended"]
+#
+# ⛔ 3.4.1's second form returned the sum alone, and x = -0 came back +0: t = -0 and the two
+# zero quotients multiply to m = +0, whose sum with -0 is +0 in rounding to nearest. The map
+# is x (1 + x / w^2) / (1 + x) = x + O(x^2) at 0, so its zero carries x's sign, as 3.4.0's
+# product did and as tonemap_reinhard's quotient does.
+# [measured: tests/modules_c.tcyr "3.4.1 LIE4: tonemap_reinhard_extended -0", baseline 3.4.0]
+# ⭐ t = -0 only at x = -0, so a sum of +0 beside it is that lost sign and nothing else: the
+# bits test moves no other answer, and a NaN m (white = 0 or NaN) stays NaN.
+# ⚠ COST: 8.25-8.29 ns a channel to 8.70-8.76 (+5.7%) with the sum's compare first; f64_eq(m, 0)
+# on the term cost +20%.
+# [measured: LIE4 lane rht.cyr direct loop, same boot, interleaved against 3.4.1's second form, 2026-11-01]
+fn _reinhard_ext(x, white) {
+    var t = f64_div(x, f64_add(F64_ONE, x));
+    var r = f64_add(t, f64_mul(f64_div(x, white), f64_div(t, white)));
+    if (r != 0) { return r; }
+    if (t == 0x8000000000000000) { return t; }
+    return r;
+}
+
+# Extended Reinhard with a white point: x (1 + x / white^2) / (1 + x) per channel, as a
+# fresh HVec3 (0 when it cannot be allocated); a channel equal to white maps to 1. Meant
+# for x >= 0, where it is within 6 ulps for every finite white != 0 (the bound is proved
+# above; measured at most 2.96 ulps over 200,000 x in [0, 20), white in [0.5, 10.5)).
+# Only white^2 matters, so -white gives the same answer. A zero x keeps its sign: -0 gives -0
+# for every white but 0 and NaN. white = 0 (either sign): x > 0
+# gives +Inf, the limit as white -> 0; x = 0 gives NaN (0 / 0: the limit at (0, 0)
+# depends on the path). white = +-Inf gives x / (1 + x), Reinhard's map. x = +Inf gives
+# NaN (Inf / Inf, as tonemap_reinhard), x = -1 is the pole, NaN propagates.
+# [measured: tests/modules_c.tcyr "3.4.1 LIE2: tonemap_reinhard_extended"; LIE2 Fraction sweep, 2026-10-31]
 public fn tonemap_reinhard_extended(r, g, b, white) {
-    var w2 = f64_mul(white, white);
-    var mr = f64_div(f64_mul(r, f64_add(F64_ONE, f64_div(r, w2))), f64_add(F64_ONE, r));
-    var mg = f64_div(f64_mul(g, f64_add(F64_ONE, f64_div(g, w2))), f64_add(F64_ONE, g));
-    var mb = f64_div(f64_mul(b, f64_add(F64_ONE, f64_div(b, w2))), f64_add(F64_ONE, b));
-    return hvec3_new(mr, mg, mb);
+    return hvec3_new(_reinhard_ext(r, white), _reinhard_ext(g, white), _reinhard_ext(b, white));
 }
 
 fn _aces_map(x) {
@@ -144,9 +240,21 @@ fn _aces_map(x) {
     var e = f64_div(f64_from(14), a100);  # 0.14
     var num = f64_mul(x, f64_add(f64_mul(a, x), b));
     var den = f64_add(f64_mul(x, f64_add(f64_mul(c, x), d)), e);
+    # ⛔ 3.4.0 AND EARLIER — past |x| ~ 1.3e154 both quadratics overflow and their quotient
+    # was Inf / Inf = NaN, where the map's value is 2.51 / 2.43 > 1, clamped to 1. ⭐ 3.4.1:
+    # above 2^500 the same quotient divided through by x^2, (a + b/x) / (c + (d + e/x)/x).
+    # [measured: tests/abuse.tcyr "3.4.1: tone maps", baseline 3.4.0]
+    var ax = f64_abs(x);
+    if (f64_gt(ax, (1023 + 500) << 52) == 1 && f64_lt(ax, F64_POS_INF) == 1) {
+        num = f64_add(a, f64_div(b, x));
+        den = f64_add(c, f64_div(f64_add(d, f64_div(e, x)), x));
+    }
     return f64_clamp(f64_div(num, den), 0, F64_ONE);
 }
 
+# The Narkowicz ACES filmic fit x (2.51 x + 0.03) / (x (2.43 x + 0.59) + 0.14) per channel,
+# clamped to [0, 1], as a fresh HVec3 (0 when it cannot be allocated). Finite input of any
+# size is answered; +Inf gives NaN (Inf / Inf, then the clamp passes it), as does NaN.
 public fn tonemap_aces(r, g, b) {
     return hvec3_new(_aces_map(r), _aces_map(g), _aces_map(b));
 }
@@ -155,10 +263,27 @@ public fn tonemap_aces(r, g, b) {
 # Depth linearization
 # ================================================================
 
+# Linear (view-space) depth from a [0, 1] depth-buffer value for a projection with planes
+# near and far: near far / (far - ndc (far - near)), so ndc = 0 gives near and 1 gives far.
+# Formed as near / ((1 - ndc) + ndc (near / far)) (3.4.1), the same function for every
+# far != 0. far = +Inf (an infinite far plane) gives near / (1 - ndc); near = far = 0 gives
+# NaN (0/0). No failure value. For ndc in [0, 1] and near, far > 0 (near / far normal) its
+# relative error is at most 4 * 2^-53, so under 4 ulps: both terms of the denominator are
+# positive and within 2 * 2^-53, their sum and the quotient round once each. Measured: at
+# most 2.08 ulps over 300,000 inputs (a third within 1e-3 of the far plane).
+# [measured: tests/abuse.tcyr "3.4.1: linearize_depth"; LIE2 lane Fraction sweep, 2026-10-31]
+# ⛔ 3.4.0 AND EARLIER — near * far formed first: +Inf for (0.5, 1e200, 1.002e201) where
+# the depth is 1.8e200, and NaN (Inf / (Inf - Inf)) for an infinite far plane, where it is
+# 2 near at ndc 0.5; and far - ndc (far - near) cancels to near at ndc = 1, keeping
+# far's rounding. [measured: tests/abuse.tcyr "3.4.1: linearize_depth", baseline 3.4.0]
 public fn linearize_depth(ndc, near, far) {
-    return f64_div(f64_mul(near, far), f64_sub(far, f64_mul(ndc, f64_sub(far, near))));
+    var den = f64_add(f64_sub(F64_ONE, ndc), f64_mul(ndc, f64_div(near, far)));
+    return f64_div(near, den);
 }
 
+# Linear depth for a reverse-Z projection with an infinite far plane: near / ndc. ndc = 0
+# exactly (the far plane at infinity) returns 0 by design; every other ndc, subnormal
+# included, is divided.
 public fn linearize_depth_reverse_z(ndc, near) {
     # ⛔ TWO DEFECTS ON ONE LINE. (1) `ndc` was tested against an absolute 1e-12
     # and the fallback fabricated 0.0. ⚠ Not F64_TINY either, and that is measured
@@ -177,18 +302,25 @@ public fn linearize_depth_reverse_z(ndc, near) {
 # EV / Exposure
 # ================================================================
 
+# Scene luminance (cd/m^2) for an EV100 exposure value: 2^(ev - 3) * 12.5 / pi, the
+# reflected-light meter form with K = 12.5 and the 1/pi factor (the convention is a
+# [3.5.0] question: SPC-F5). +Inf EV gives +Inf, -Inf gives +0, NaN propagates.
 public fn ev100_to_luminance(ev) {
     var three = f64_from(3);
     var twelve_five = f64_div(f64_from(125), f64_from(10));
     return f64_div(f64_mul(ganita_f64_pow(F64_TWO, f64_sub(ev, three)), twelve_five), F64_PI);
 }
 
+# The inverse of ev100_to_luminance: log2(luminance * pi / 12.5) + 3. Luminance 0 gives
+# -Inf, a negative one NaN.
 public fn luminance_to_ev100(luminance) {
     var twelve_five = f64_div(f64_from(125), f64_from(10));
     var three = f64_from(3);
     return f64_add(f64_div(f64_ln(f64_div(f64_mul(luminance, F64_PI), twelve_five)), F64_LN2), three);
 }
 
+# The exposure multiplier for an EV100 value: 1 / (1.2 * 2^ev) (the saturation-based
+# form, maximum luminance 1.2 * 2^ev). EV 0 gives 5/6 to within 1 ulp.
 public fn ev100_to_exposure(ev) {
     var one_two = f64_div(f64_from(12), f64_from(10));
     return f64_div(F64_ONE, f64_mul(one_two, ganita_f64_pow(F64_TWO, ev)));

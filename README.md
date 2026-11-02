@@ -51,10 +51,11 @@ those call sites quietly passing against the old function forever, which is the 
 removes. **2.24.0 is the supported 2.x line.**
 
 ⚠ **Minimum toolchain: hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3.** `public struct` + `#derive` is
-refused by cycc 6.6.2; measured again in 3.4.0 from dirs pinned to each version, the 3.4.0 bundle is
+refused by cycc 6.6.2; measured again in 3.4.1 from dirs pinned to each version, the 3.4.1 bundle is
 refused under 6.6.2 and compiles and runs a cross-module program under 6.6.3, 6.6.6, 6.6.9, 6.6.10,
-6.6.12, 6.6.13, 6.6.14, 6.6.20 and 6.7.9, with bit-identical output except `cx_powf(·, ±Inf)` on
-6.6.3 / 6.6.6. Bump `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1.
+6.6.12, 6.6.13, 6.6.14, 6.6.20, 6.7.9 and 6.7.18, with bit-identical output except SVD's singular
+values, at most 2 ulp from 6.6.16 with the pin's ganita (3.4.0 also found `cx_powf(·, ±Inf)` NaN on
+6.6.3 / 6.6.6). Bump `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1.
 Some results follow your toolchain rather than hisab's:
 - A zero produced by negation is −0 from cyrius **6.6.8** (IEEE sign flip; +0 below).
 - `dual_pow` is within 1 ulp from **6.6.10** (ganita 1.2.8's `pow`).
@@ -181,15 +182,15 @@ compiles, and the callee silently receives the **tag**. See
 
 ```sh
 cyrius build src/main.cyr build/hisab
-cyrius test tests/hisab.tcyr        # 1010 cross-module integration assertions
-cyrius test tests/foundation.tcyr   # 856 vec/quat/mat foundation assertions
-cyrius test tests/modules.tcyr      # 2642 per-module assertions (first third)
-cyrius test tests/modules_b.tcyr    # 1425 per-module assertions (second third)
-cyrius test tests/modules_c.tcyr    # 1329 per-module assertions (last third)
-cyrius test tests/edge_cases.tcyr   # 1000 degenerate-input assertions
-cyrius test tests/abuse.tcyr        # 2331 hostile-input assertions (negative indices,
+cyrius test tests/hisab.tcyr        # 1350 cross-module integration assertions
+cyrius test tests/foundation.tcyr   # 1094 vec/quat/mat foundation assertions
+cyrius test tests/modules.tcyr      # 3002 per-module assertions (first third)
+cyrius test tests/modules_b.tcyr    # 1843 per-module assertions (second third)
+cyrius test tests/modules_c.tcyr    # 2055 per-module assertions (last third)
+cyrius test tests/edge_cases.tcyr   # 2044 degenerate-input assertions
+cyrius test tests/abuse.tcyr        # 2764 hostile-input assertions (negative indices,
                                     #   zero/huge dimensions, non-conformable operands, canaries)
-cyrius bench tests/hisab.bcyr       # 209 benchmarks
+cyrius bench tests/hisab.bcyr       # 375 benchmarks
 cyrius fuzz                         # 5 fuzz targets with invariant checks
 ```
 
@@ -201,12 +202,12 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.4.0 |
-| Library | 35 modules, ~52,600 lines of Cyrius |
-| Tests | 10593 assertions across 7 suites |
-| Benchmarks | 156 operations |
+| Version | 3.4.1 |
+| Library | 35 modules, ~70,600 lines of Cyrius |
+| Tests | 14152 assertions across 7 suites |
+| Benchmarks | 375 operations |
 | Fuzz targets | 6 seeded generators with invariant checks (vec3, quat, ray, gcd, m4_inverse, einsum notation), plus the fixed self-test buffers |
-| CLI binary | ~364 KB static ELF (`build/hisab` — version smoke test only) |
+| CLI binary | ~307 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.7.18 |
 | Dependencies | 1 (sakshi 2.5.10); no third-party, no FFI/libc |
 | Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 290 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared (3.1.0) and enforced (3.3.0)**: every non-underscore top-level declaration carries `public`, the shipped bundle is `private` so a consumer naming anything else is refused at compile time (enum constants excepted: the language gives them no visibility, so a non-public enum's members are `_`-named), and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **Two open filings** in [docs/development/issues/](docs/development/issues/) (43 archived): ganita's symmetric eigensolver stops at an absolute 1e-12·max|a| (filed 2026-10-31; `eigen_symmetric` is exposed), and ganita's QR and least squares answer wrongly, with status 0, near DBL_MAX (filed 2026-10-31; still open on ganita 1.2.15, and hisab no longer calls either since 3.4.0). 3.3.7 closed the previous four with paired runs on cyrius 6.6.14 and 6.6.20 — two in cyrius (top-level `fncallN` on a capturing closure crashed; a closure's `return` of a `: stack` value was booked against the enclosing fn; both fixed in 6.6.16) and two in ganita (`ganita_mat_svd` refused rank-deficient and tiny-rotation matrices and accepted non-finite input; both fixed in ganita 1.2.12). ganita's `atan2` filing closed in 3.3.4 when ganita 1.2.11 repaired it. The 3.2.1 benchmark-statistic filing was repaired upstream in cyrius 6.6.9 and closed here in 3.2.2 with a paired measurement. The cycc wrong-code defect 3.2.0 found (the register picker dropping an `f64v_*` destination-slot store, wrong on 6.6.0–6.6.4) was repaired upstream in 6.6.5 and closed here in 3.2.1; `m3_mul_vec3` keeps its hoisted form because six of the ten live consumers pin cyrius 6.6.3, which compiles a 3.x bundle but sits below the fix (goonj and attn11, on 6.6.2, cannot compile 3.1.0 or later; pins read 2026-10-31). Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |

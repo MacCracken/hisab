@@ -55,6 +55,30 @@ var _SP_QUADTREE_MAX_PER_NODE = 8;             # items before split
 # [measured: CHANGELOG.md 2.9.0, 1,311,304 B / 6,606,992 B (tests/modules.tcyr bounds them); stack unrecorded]
 var _SP_MAX_TREE_DEPTH = 1075;
 
+# 1 when k more pushes (k <= 16, the least capacity a vec has) cannot end the process: the
+# vec has room, or its one doubling stays within VEC_CAP_MAX. vec_push_a returns -1 for a
+# refused allocation but ENDS THE PROCESS ("vec: capacity overflow", exit 1) when a full vec's
+# doubling would pass VEC_CAP_MAX; this is that condition (len + k > cap and 2 cap >
+# VEC_CAP_MAX, written as a division), read off the vec's length and capacity at offsets 8
+# and 16 as this file's other raw vec accesses do. Every push in this file is behind it: the
+# inserts check a whole record once, the queries inline the k = 1 test before each push.
+# ⛔ 3.4.1's first form guarded only kdtree_build, by its count: with VEC_CAP_MAX set to 16,
+# spatial_hash_insert and quadtree_insert still ended the process, and with a cap that is
+# not a power of two (20) so did kdtree_build, whose count passed its test.
+# [measured: tests/modules_c.tcyr "3.4.1 LIE2: spatial structures at VEC_CAP_MAX", review RV-LIE S5]
+fn _sp_room(v, k) {
+    if (load64(v + 8) + k <= load64(v + 16)) { return 1; }
+    if (load64(v + 16) > VEC_CAP_MAX / 2) { return 0; }
+    return 1;
+}
+
+# Push val onto v: 0, or -1 when v cannot take it (no room within VEC_CAP_MAX, or a refused
+# allocation).
+fn _sp_push(v, val) {
+    if (_sp_room(v, 1) == 0) { return 0 - 1; }
+    return vec_push_a(default_alloc(), v, val);
+}
+
 # ================================================================
 # 1. KdTree -- k-d tree for 3D point queries
 # ================================================================
@@ -284,13 +308,28 @@ fn _kd_build_rec(items, points, start, end, depth, plane_out) {
     return _kd_node_alloc(0 - 1, axis, split_val, left, right);
 }
 
+# 1 when a coordinate of the HVec3 p is NaN.
+fn _kd_point_has_nan(p) {
+    if (f64_eq(HVec3_x(p), HVec3_x(p)) == 0) { return 1; }
+    if (f64_eq(HVec3_y(p), HVec3_y(p)) == 0) { return 1; }
+    if (f64_eq(HVec3_z(p), HVec3_z(p)) == 0) { return 1; }
+    return 0;
+}
+
 # Build a k-d tree from an array of HVec3 pointers.
 # points: pointer to array of HVec3 ptrs (points[i] = load64(points + i*8))
 # count: number of points (must be >= 0; a negative count is rejected)
 # Returns: root node pointer, or 0 for an empty / rejected input. This routine
 #          returns a HANDLE, not an error code, so 0 -- the documented empty
 #          tree -- is the failure value; there is no negative HSB_ERR_* to
-#          return through an i64 that is otherwise a pointer.
+#          return through an i64 that is otherwise a pointer. Rejected (3.4.1): a
+#          0 entry in `points`, a count past VEC_CAP_MAX (or an index list that could
+#          not grow within it), a refused allocation.
+#          A point with a NaN coordinate is left out of the tree (3.4.1): no query
+#          can return it (its distance to every point is NaN, which is never the
+#          nearest nor within a radius), and a tree of only such points is empty.
+#          The tree indexes `points` in place; it copies nothing, so the array and
+#          its HVec3s must outlive it and be passed again, unchanged, to queries.
 public fn kdtree_build(points, count) {
     # `count == 0` was a HALF-GUARD. A negative count fell through to
     # _kd_build_rec(items, points, 0, -1), whose `count = end - start` is -1, so
@@ -301,23 +340,311 @@ public fn kdtree_build(points, count) {
     # [measured: tests/abuse.tcyr "kdtree_build: count = -1 -> 0 (was 'vec: index out of bounds', exit 1)"]
     if (count <= 0) { return 0; }
     if (points == 0) { return 0; }
+    # No index list past VEC_CAP_MAX entries (decided before any point is read; _sp_push
+    # also refuses each push that would pass it, for a VEC_CAP_MAX that is not a power of 2).
+    if (count > VEC_CAP_MAX) { return 0; }
 
-    # Build index list
+    # ⛔ 3.4.0 AND EARLIER — A NaN POINT TOOK FINITE POINTS OUT OF REACH. It sat in the
+    # partition's equal band, and when the exact median landed on it the node's plane was
+    # NaN: every query's distance to that plane is NaN, which compares false, so the far
+    # side was never visited. Eight points with one (NaN, 0, 0): kdtree_nearest((8, 2, 0))
+    # = 3 where (8, 2, 0) is point 0, at distance 0, and the radius query found 1 of 4.
+    # The quadtree and octree have refused NaN points since 3.3.4.
+    # [measured: tests/abuse.tcyr "3.4.1: kd-tree NaN point", baseline 3.4.0]
+    # ⭐ 3.4.1 — such a point is never an answer (brute force over the same points never
+    # returns it either), so it is left out of the tree, and every plane is a number.
+    # Build index list. vec_push ended the process on a refused growth (3.4.1: _sp_push,
+    # and the tree's 0).
     var items = vec_new();
     if (items == 0) { return 0; }
     for (var i = 0; i < count; i = i + 1) {
-        vec_push(items, i);
+        var pt = load64(points + i * 8);
+        if (pt == 0) { return 0; }
+        if (_kd_point_has_nan(pt) == 0) {
+            if (_sp_push(items, i) < 0) { return 0; }
+        }
     }
+    var kept = vec_len(items);
+    if (kept == 0) { return 0; }
 
     # One shared split-plane slot for the whole recursion; see _kd_build_rec.
     var plane_out = alloc(8);
     if (plane_out == 0) { return 0; }
 
-    return _kd_build_rec(items, points, 0, count, 0, plane_out);
+    return _kd_build_rec(items, points, 0, kept, 0, plane_out);
+}
+
+# ---- Distance comparisons over the whole double range (3.4.1, lane LIE3) ----
+# ⛔ 3.4.0 AND EARLIER -- the queries compared naive squared distances, fl(|p - q|^2): past
+# 2^512 they overflow and below 2^-537 they flush, so two points near 2^512 queried from 0
+# answered -1, "empty" (every distance +Inf, none below the +Inf start); 133 of 200 nearest
+# answers were wrong at 2^-545; kdtree_within_radius took a point 3r away past 2^516 (r^2 =
+# +Inf) and below 2^-536 (r^2 = 0). Near a tie the rounding could also pick a farther point.
+# [measured: tests/modules_c.tcyr "3.4.1 LIE3: kd-tree", baseline 3.4.0; audit SPC-F2 / AU2-G5-F6]
+# ⭐ 3.4.1 -- each comparison is decided by the float value only where its error bound
+# certifies the answer: a computed |p - q|^2, D^ = fl(fl(dx^2 + dy^2) + dz^2) from rounded
+# differences, is within 5.02 u D^ + 3.02 2^-1075 of the exact D (u = 2^-53; the second term
+# for squares that underflow), and +Inf only when D passes 2^1023. Two distances or a distance
+# and r^2 that the bound cannot order go to a scaled comparison (each difference scaled by a
+# power of two, so nothing overflows or flushes) and, if that cannot order them either, to an
+# exact one. Ordinary queries keep the float comparison, one test per leaf as before.
+enum _KdCert {
+    _KD_TRUST_LO = 0x0170000000000000;   # 2^-1000
+    _KD_TRUST    = 0x7E70000000000000;   # 2^1000
+    _KD_M_LO     = 0x3FEFFFFFFFFFFFC0;   # 1 - 2^-47
+    _KD_M_HI     = 0x3FF0000000000020;   # 1 + 2^-47
+    _KD_R_K      = 0x3FF0000000000004;   # 1 + 2^-50
+}
+
+# The exponent e of a finite nonzero |x| (2^e <= |x| < 2^(e + 1)), subnormals included.
+fn _kd_expo(xb) {
+    var ab = xb & 0x7FFFFFFFFFFFFFFF;
+    if ((ab >> 52) != 0) { return (ab >> 52) - 1023; }
+    return ((f64_mul(ab, 0x6570000000000000) >> 52) & 0x7FF) - 1023 - 600;   # x 2^600
+}
+
+# x 2^-e for |e| <= 1100, in two exact power-of-two steps (each factor a normal double).
+fn _kd_scale(x, e) {
+    var e1 = e / 2;
+    var e2 = e - e1;
+    return f64_mul(f64_mul(x, (1023 - e1) << 52), (1023 - e2) << 52);
+}
+
+# |p - q|^2 scaled: returns D' with |p - q|^2 = D' 4^K, K stored at kout, D' in [1, 12) within
+# 5.1 u of exact (the largest difference scaled into [1, 2), the others with it: one that
+# flushes there is under 2^-1074 of the largest). A difference that overflows is formed from
+# p/2 - q/2 (both coordinates are then at least 2^971, so the halving is exact) and K counts
+# it. p = q: 0 (K 0). An infinite coordinate: +Inf; NaN: NaN.
+fn _kd_sdist(p, q, kout) {
+    store64(kout, 0);
+    var dx = f64_sub(HVec3_x(p), HVec3_x(q));
+    var dy = f64_sub(HVec3_y(p), HVec3_y(q));
+    var dz = f64_sub(HVec3_z(p), HVec3_z(q));
+    var sig = 0;
+    if ((dx & 0x7FFFFFFFFFFFFFFF) >= 0x7FF0000000000000 || (dy & 0x7FFFFFFFFFFFFFFF) >= 0x7FF0000000000000
+      || (dz & 0x7FFFFFFFFFFFFFFF) >= 0x7FF0000000000000) {
+        if (f64_eq(dx, dx) == 0 || f64_eq(dy, dy) == 0 || f64_eq(dz, dz) == 0) { return 0x7FF8000000000000; }
+        if (_kd_has_inf(p) == 1 || _kd_has_inf(q) == 1) { return 0x7FF0000000000000; }   # Inf - finite
+        dx = f64_sub(f64_mul(HVec3_x(p), F64_HALF), f64_mul(HVec3_x(q), F64_HALF));
+        dy = f64_sub(f64_mul(HVec3_y(p), F64_HALF), f64_mul(HVec3_y(q), F64_HALF));
+        dz = f64_sub(f64_mul(HVec3_z(p), F64_HALF), f64_mul(HVec3_z(q), F64_HALF));
+        sig = 1;
+    }
+    var m = dx & 0x7FFFFFFFFFFFFFFF;
+    if ((dy & 0x7FFFFFFFFFFFFFFF) > m) { m = dy & 0x7FFFFFFFFFFFFFFF; }
+    if ((dz & 0x7FFFFFFFFFFFFFFF) > m) { m = dz & 0x7FFFFFFFFFFFFFFF; }
+    if (m == 0) { return 0; }
+    var e = _kd_expo(m);
+    store64(kout, e + sig);
+    var sx = _kd_scale(dx, e);
+    var sy = _kd_scale(dy, e);
+    var sz = _kd_scale(dz, e);
+    return f64_add(f64_add(f64_mul(sx, sx), f64_mul(sy, sy)), f64_mul(sz, sz));
+}
+
+# 1 when the point has an infinite coordinate.
+fn _kd_has_inf(p) {
+    if ((HVec3_x(p) & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) { return 1; }
+    if ((HVec3_y(p) & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) { return 1; }
+    if ((HVec3_z(p) & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) { return 1; }
+    return 0;
+}
+
+# The sign (-1, 0, +1) of sum_k sg_k x_k y_k 2^sh_k, exactly, for the n terms at tb (4 slots
+# each: x, y finite doubles, sh >= 0, sg = +-1). Each x = mx 2^qx (mx < 2^53), so the sum
+# times 2^-qbase is an integer, summed in 32-bit limbs (each mx my as three pieces below 2^54).
+fn _kd_xsign(tb, n) {
+    var qbase = 1 << 30;
+    var qtop = 0 - (1 << 30);
+    var i = 0;
+    while (i < n) {
+        var x = load64(tb + i * 32) & 0x7FFFFFFFFFFFFFFF;
+        var y = load64(tb + i * 32 + 8) & 0x7FFFFFFFFFFFFFFF;
+        if (x != 0 && y != 0) {
+            var qx = (x >> 52) - 1075;
+            if ((x >> 52) == 0) { qx = 0 - 1074; }
+            var qy = (y >> 52) - 1075;
+            if ((y >> 52) == 0) { qy = 0 - 1074; }
+            var qq = qx + qy + load64(tb + i * 32 + 16);
+            if (qq < qbase) { qbase = qq; }
+            if (qq > qtop) { qtop = qq; }
+        }
+        i = i + 1;
+    }
+    if (qtop < qbase) { return 0; }
+    var nl = (qtop - qbase + 112) / 32 + 2;
+    var acc: i64[150];
+    var k = 0;
+    while (k < nl + 3) { store64(&acc + k * 8, 0); k = k + 1; }
+    i = 0;
+    while (i < n) {
+        var xb = load64(tb + i * 32);
+        var yb = load64(tb + i * 32 + 8);
+        var x2 = xb & 0x7FFFFFFFFFFFFFFF;
+        var y2 = yb & 0x7FFFFFFFFFFFFFFF;
+        if (x2 != 0 && y2 != 0) {
+            var mx = x2 & 0x000FFFFFFFFFFFFF;
+            var qx2 = 0 - 1074;
+            if ((x2 >> 52) != 0) { mx = mx | 0x0010000000000000; qx2 = (x2 >> 52) - 1075; }
+            var my = y2 & 0x000FFFFFFFFFFFFF;
+            var qy2 = 0 - 1074;
+            if ((y2 >> 52) != 0) { my = my | 0x0010000000000000; qy2 = (y2 >> 52) - 1075; }
+            var sg = load64(tb + i * 32 + 24);
+            if (((xb ^ yb) >> 63) != 0) { sg = 0 - sg; }
+            var pos = qx2 + qy2 + load64(tb + i * 32 + 16) - qbase;
+            var x1 = mx >> 27;
+            var x0 = mx & 0x7FFFFFF;
+            var y1 = my >> 27;
+            var y0 = my & 0x7FFFFFF;
+            var pc = 0;
+            while (pc < 3) {
+                var pv = x0 * y0;
+                var ps = pos;
+                if (pc == 0) { pv = x1 * y1; ps = pos + 54; } elif (pc == 1) { pv = x1 * y0 + x0 * y1; ps = pos + 27; }
+                var pj = &acc + (ps >> 5) * 8;
+                var sh = ps & 31;
+                var w0 = (pv & 0xFFFFFFFF) << sh;
+                var w1 = (pv >> 32) << sh;
+                store64(pj, load64(pj) + sg * (w0 & 0xFFFFFFFF));
+                store64(pj + 8, load64(pj + 8) + sg * ((w0 >> 32) + (w1 & 0xFFFFFFFF)));
+                store64(pj + 16, load64(pj + 16) + sg * (w1 >> 32));
+                pc = pc + 1;
+            }
+        }
+        i = i + 1;
+    }
+    var carry = 0;
+    var nz = 0;
+    k = 0;
+    while (k < nl) {
+        var w = load64(&acc + k * 8) + carry;
+        nz = nz | (w & 0xFFFFFFFF);
+        carry = w >>> 32;
+        k = k + 1;
+    }
+    if (carry < 0) { return 0 - 1; }
+    if (nz != 0) { return 1; }
+    return 0;
+}
+
+# Appends to tb (from term n) the nine terms of sg |p - q|^2: per axis the difference a - b is
+# s + e exactly (TwoSum; from a/2 - b/2, both then at least 2^971, when a - b overflows, the
+# shift counting it), and (s + e)^2 = s*s + 2*s*e + e*e. Returns the new term count.
+fn _kd_xterms(tb, n, p, q, sg) {
+    var ax = 0;
+    while (ax < 3) {
+        var a = _kd_axis_val(p, ax);
+        var b = _kd_axis_val(q, ax);
+        var sh = 0;
+        var s = f64_sub(a, b);
+        if ((s & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) {
+            a = f64_mul(a, F64_HALF);
+            b = f64_mul(b, F64_HALF);
+            s = f64_sub(a, b);
+            sh = 2;
+        }
+        var bb = f64_sub(s, a);
+        var e = f64_sub(f64_sub(a, f64_sub(s, bb)), f64_add(b, bb));
+        var t = tb + n * 32;
+        store64(t, s); store64(t + 8, s); store64(t + 16, sh); store64(t + 24, sg);
+        store64(t + 32, s); store64(t + 40, e); store64(t + 48, sh + 1); store64(t + 56, sg);
+        store64(t + 64, e); store64(t + 72, e); store64(t + 80, sh); store64(t + 88, sg);
+        n = n + 3;
+        ax = ax + 1;
+    }
+    return n;
+}
+
+# The sign of D1 - D2 for two scaled distances (D' 4^K, as _kd_sdist gives): -1 or +1 where
+# their bounds (5.1 u each) order them, 0 where they cannot (or both are 0 / both +Inf).
+fn _kd_scmp(d1, k1, d2, k2) {
+    if (f64_eq(d1, 0) == 1 || f64_eq(d2, 0) == 1) {
+        if (f64_eq(d1, 0) == 1 && f64_eq(d2, 0) == 1) { return 0; }
+        if (f64_eq(d1, 0) == 1) { return 0 - 1; }
+        return 1;
+    }
+    if (d1 == 0x7FF0000000000000 || d2 == 0x7FF0000000000000) {
+        if (d1 == d2) { return 0; }
+        if (d1 == 0x7FF0000000000000) { return 1; }
+        return 0 - 1;
+    }
+    if (k1 > k2 + 2) { return 1; }
+    if (k2 > k1 + 2) { return 0 - 1; }
+    var x = f64_mul(d1, (1023 + 2 * (k1 - k2)) << 52);   # D'1 4^(k1 - k2), exact
+    if (f64_lt(x, f64_mul(d2, _KD_M_LO)) == 1) { return 0 - 1; }
+    if (f64_gt(x, f64_mul(d2, _KD_M_HI)) == 1) { return 1; }
+    return 0;
+}
+
+# 1 when point c is strictly nearer to q than point b (b < 0: no best yet, so any c whose
+# distance is not NaN), exactly.
+fn _kd_nearer(points, c, b, q) {
+    var pc = load64(points + c * 8);
+    var kk: i64[2];
+    var dc = _kd_sdist(pc, q, &kk);
+    if (f64_eq(dc, dc) == 0) { return 0; }
+    if (b < 0) { return 1; }
+    var pb = load64(points + b * 8);
+    var db = _kd_sdist(pb, q, &kk + 8);
+    if (f64_eq(db, db) == 0) { return 1; }
+    var sc = _kd_scmp(dc, load64(&kk), db, load64(&kk + 8));
+    if (sc != 0) { return sc < 0; }
+    if (dc == 0x7FF0000000000000 || f64_eq(dc, 0) == 1) { return 0; }   # both +Inf / both 0
+    var tb: i64[72];
+    var n = _kd_xterms(&tb, 0, pc, q, 1);
+    n = _kd_xterms(&tb, n, pb, q, 0 - 1);
+    return _kd_xsign(&tb, n) < 0;
+}
+
+# 1 when the splitting plane (query axis value qv, plane sv) is certainly no nearer than the
+# best point b: then nothing behind it can be strictly nearer. For a best whose float distance
+# is not trusted (hi NaN, see _kd_nearest_rec); 0 when it cannot tell. |qv - sv| is taken
+# from qv/2 - sv/2 when it overflows (both then at least 2^1022, the halving exact). The factor
+# 1 - 2^-50 below is not load-bearing: _kd_scmp's margin of 2^-47 (64 u) already covers the
+# rounding of d and both squares (about 8 u), so removing it moves no answer.
+fn _kd_plane_past(points, b, q, qv, sv) {
+    var d = f64_sub(qv, sv);
+    if (f64_eq(d, d) == 0) { return 1; }
+    var sig = 0;
+    var pinf = 0;   # a plane at an infinite coordinate (qv is finite)
+    if ((d & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) {
+        if ((sv & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) { pinf = 1; }
+        d = f64_sub(f64_mul(qv, F64_HALF), f64_mul(sv, F64_HALF));
+        sig = 1;
+    }
+    var kk: i64[1];
+    var db = _kd_sdist(load64(points + b * 8), q, &kk);
+    if (f64_eq(db, db) == 0 || db == 0x7FF0000000000000) { return 0; }
+    if (pinf == 1) { return 1; }   # only infinite points lie past it, and the best is finite
+    var ad = f64_mul(f64_abs(d), 0x3FEFFFFFFFFFFFF8);   # (1 - 2^-50): below |d_exact| / 2^sig
+    if (ad == 0) { return 0; }
+    var e = _kd_expo(ad);
+    var sd = _kd_scale(ad, e);
+    return _kd_scmp(f64_mul(sd, sd), e + sig, db, load64(&kk)) > 0;
+}
+
+# 1 when |p - q| <= r exactly, for r finite and >= 0. An infinite distance or none (NaN) is the
+# first test's 0, at any r: the one way r = +Inf gets here.
+fn _kd_within(p, q, r) {
+    var kk: i64[1];
+    var dp = _kd_sdist(p, q, &kk);
+    if (f64_eq(dp, dp) == 0 || dp == 0x7FF0000000000000) { return 0; }
+    if (f64_eq(dp, 0) == 1) { return 1; }
+    if (f64_eq(r, 0) == 1) { return 0; }
+    var er = _kd_expo(r);
+    var rs = _kd_scale(r, er);
+    var sc = _kd_scmp(dp, load64(&kk), f64_mul(rs, rs), er);
+    if (sc != 0) { return sc < 0; }
+    var tb: i64[40];
+    var n = _kd_xterms(&tb, 0, p, q, 1);
+    store64(&tb + n * 32, r); store64(&tb + n * 32 + 8, r); store64(&tb + n * 32 + 16, 0);
+    store64(&tb + n * 32 + 24, 0 - 1);
+    return _kd_xsign(&tb, n + 1) <= 0;
 }
 
 # --- Nearest neighbor search ---
-# best_out: pointer to 16-byte block { best_idx (i64), best_dist_sq (f64) }
+# best_out: pointer to a 32-byte block { best_idx (i64), its float distance, lo, hi }: a leaf's
+# float distance below lo is certainly nearer, at or above hi certainly no nearer (see the leaf).
 
 fn _kd_nearest_rec(node, points, query, best_out) {
     if (node == 0) { return 0; }
@@ -333,9 +660,28 @@ fn _kd_nearest_rec(node, points, query, best_out) {
         f64v_sub(&diff, pt, query, 2);
         HVec3_set_z(&diff, f64_sub(HVec3_z(pt), HVec3_z(query)));
         var dist_sq = hvec3_dot(&diff, &diff);
-        if (f64_lt(dist_sq, load64(best_out + 8)) == 1) {
-            store64(best_out, pidx);
-            store64(best_out + 8, dist_sq);
+        # Certainly no nearer (the common case, one test as before), certainly nearer, or
+        # decided by _kd_nearer.
+        if (f64_ge(dist_sq, load64(best_out + 24)) == 1) { return 0; }
+        if (f64_lt(dist_sq, load64(best_out + 16)) == 0) {
+            if (_kd_nearer(points, pidx, load64(best_out), query) == 0) { return 0; }
+        }
+        store64(best_out, pidx);
+        store64(best_out + 8, dist_sq);
+        # The bounds a later float distance (a leaf's, or a plane's squared) is certified
+        # against: dist_sq is within 5.02 u of the exact distance when it lies in [2^-1000,
+        # 2^1000] (the underflow terms are then under 2^-73 of it), and 64 ulps either side is
+        # more than 2^-48 of it. Elsewhere: lo -Inf, hi NaN, so every later comparison is
+        # _kd_nearer's -- except an exact 0 (the query is this point), which nothing beats.
+        if (dist_sq >= _KD_TRUST_LO && dist_sq <= _KD_TRUST) {   # bit patterns of doubles >= 0
+            store64(best_out + 16, dist_sq - 64);
+            store64(best_out + 24, dist_sq + 64);
+        } elif (dist_sq == 0 && ((HVec3_x(&diff) | HVec3_y(&diff) | HVec3_z(&diff)) & 0x7FFFFFFFFFFFFFFF) == 0) {
+            store64(best_out + 16, 0xFFF0000000000000);
+            store64(best_out + 24, 0);
+        } else {
+            store64(best_out + 16, 0xFFF0000000000000);
+            store64(best_out + 24, 0x7FF8000000000000);
         }
         return 0;
     }
@@ -359,27 +705,47 @@ fn _kd_nearest_rec(node, points, query, best_out) {
 
     _kd_nearest_rec(near, points, query, best_out);
 
-    # Only visit far side if splitting plane is closer than current best
+    # Visit the far side unless the splitting plane is certainly no nearer than the best: by
+    # the float bound (hi), or, for a best that bound does not cover (hi NaN), by _kd_plane_past.
     var d_sq = f64_mul(d, d);
-    if (f64_lt(d_sq, load64(best_out + 8)) == 1) {
+    if (f64_lt(d_sq, load64(best_out + 24)) == 1) {
         _kd_nearest_rec(far, points, query, best_out);
+    } elif (load64(best_out + 24) == 0x7FF8000000000000) {
+        if (load64(best_out) < 0 || _kd_plane_past(points, load64(best_out), query, query_val, split_val) == 0) {
+            _kd_nearest_rec(far, points, query, best_out);
+        }
     }
 
     return 0;
 }
 
 # Find nearest neighbor to query point.
-# Returns index of nearest point, or -1 if tree is empty.
+# Returns index of nearest point, or -1 if tree is empty. -1 also answers a 0 `points`
+# or `query` (3.4.1: both were dereferenced, exit 139): a query with no point set or no
+# query point has no nearest point. `points` must be the array the tree was built on.
+# Nearest by the exact Euclidean distance, over the whole double range (3.4.1; see the
+# comparisons above): no distance overflows or flushes, and two the float values cannot order
+# are compared exactly. Among exactly tied points, the first the traversal reaches. A point with
+# an infinite coordinate is at +Inf (returned only when no finite point exists); a query with a
+# NaN or infinite coordinate has no nearest point: -1.
+# [measured: tests/abuse.tcyr "3.4.1: null handles in the spatial structures", baseline 3.4.0]
 public fn kdtree_nearest(root, points, query) {
     if (root == 0) { return 0 - 1; }
+    if (points == 0 || query == 0) { return 0 - 1; }
 
     # A stack slot pair (3.4.0): this returns an index, and its one sentinel, -1, already
     # means "empty tree", so there is no answer left for a refused allocation; through
     # 3.3.7 an unchecked 16-byte heap block was stored through on every query.
-    var best_buf: i64[2];
+    # A query with a NaN or infinite coordinate has no nearest point (-1, as 3.4.0 answered).
+    if ((HVec3_x(query) & 0x7FF0000000000000) == 0x7FF0000000000000) { return 0 - 1; }
+    if ((HVec3_y(query) & 0x7FF0000000000000) == 0x7FF0000000000000) { return 0 - 1; }
+    if ((HVec3_z(query) & 0x7FF0000000000000) == 0x7FF0000000000000) { return 0 - 1; }
+    var best_buf: i64[4];
     var best_out = &best_buf;
-    store64(best_out, 0 - 1);          # best_idx
-    store64(best_out + 8, _SP_F64_POS_INF);  # best_dist_sq
+    store64(best_out, 0 - 1);                     # best_idx: none yet
+    store64(best_out + 8, _SP_F64_POS_INF);       # its float distance
+    store64(best_out + 16, _SP_F64_POS_INF);      # lo: any finite distance is nearer than none
+    store64(best_out + 24, 0x7FF8000000000000);   # hi: NaN, nothing is certainly no nearer
 
     _kd_nearest_rec(root, points, query, best_out);
 
@@ -388,7 +754,11 @@ public fn kdtree_nearest(root, points, query) {
 
 # --- Radius search ---
 
-fn _kd_radius_rec(node, points, query, radius_sq, results) {
+# rb: { lo, hi, rp, r } from kdtree_within_radius -- a leaf's float distance at most lo is
+# certainly inside, above hi certainly outside, otherwise _kd_within decides; a plane with
+# |d| > rp is certainly beyond r, and every other plane is crossed. That includes a NaN d: at
+# r = +Inf the query can sit on the plane's own infinity, with finite points behind it.
+fn _kd_radius_rec(node, points, query, rb, results) {
     if (node == 0) { return 0; }
 
     var pidx = _kd_node_point_idx(node);
@@ -400,9 +770,13 @@ fn _kd_radius_rec(node, points, query, radius_sq, results) {
         f64v_sub(&diff, pt, query, 2);
         HVec3_set_z(&diff, f64_sub(HVec3_z(pt), HVec3_z(query)));
         var dist_sq = hvec3_dot(&diff, &diff);
-        if (f64_le(dist_sq, radius_sq) == 1) {
-            vec_push(results, pidx);
+        if (f64_gt(dist_sq, load64(rb + 8)) == 1) { return 0; }
+        if (f64_le(dist_sq, load64(rb)) == 1) {
+            return _sp_push(results, pidx);   # -1: a refused growth
         }
+        # Between the bounds (or no bounds: hi NaN). r = +Inf (lo = hi) gets here only with a NaN
+        # distance, a point that has none, which _kd_within refuses.
+        if (_kd_within(pt, query, load64(rb + 24)) == 1) { return _sp_push(results, pidx); }
         return 0;
     }
 
@@ -422,25 +796,65 @@ fn _kd_radius_rec(node, points, query, radius_sq, results) {
         far = _kd_node_left(node);
     }
 
-    _kd_radius_rec(near, points, query, radius_sq, results);
+    if (_kd_radius_rec(near, points, query, rb, results) < 0) { return 0 - 1; }
 
-    var d_sq = f64_mul(d, d);
-    if (f64_le(d_sq, radius_sq) == 1) {
-        _kd_radius_rec(far, points, query, radius_sq, results);
+    if (f64_gt(f64_abs(d), load64(rb + 16)) == 0) {
+        return _kd_radius_rec(far, points, query, rb, results);
     }
 
     return 0;
 }
 
 # Find all points within radius of query.
-# Returns vec of point indices.
+# Returns vec of point indices (an empty vec for an empty tree, root 0, whatever the
+# other arguments, and for a radius below 0, which encloses nothing): exactly the points
+# with |p - q| <= radius in real arithmetic, over the whole double range (3.4.1). An infinite
+# coordinate on either side makes the distance +Inf, so that point is within a radius of +Inf
+# and of no finite radius: a finite radius around an infinite query encloses nothing. The same
+# infinity on the same axis of p and of q is Inf - Inf, which has no value (its limits
+# fill the extended reals), and neither then does |p - q|, whatever the other axes hold: that
+# point is within no radius, +Inf included, as a query with a NaN coordinate, which has no
+# distance to anything, encloses nothing. Returns 0, no vec,
+# for a 0 `points` or `query` with a non-empty tree (3.4.1: both were dereferenced), and
+# when the result vec or a growth of it is refused, by the allocator or because the
+# results would pass VEC_CAP_MAX (3.4.1: both ended the process). A NaN radius encloses
+# nothing.
 public fn kdtree_within_radius(root, points, query, radius) {
     var results = vec_new();
     if (results == 0) { return 0; }
     if (root == 0) { return results; }
+    if (points == 0 || query == 0) { return 0; }
+    # ⛔ 3.4.0 AND EARLIER — a negative radius was squared, so -0.3 found the points within
+    # 0.3, where spatial_hash_query_radius found none. A ball of negative radius is empty.
+    # [measured: tests/abuse.tcyr "3.4.1: spatial extents", baseline 3.4.0]
+    if (f64_lt(radius, 0) == 1) { return results; }
 
-    var radius_sq = f64_mul(radius, radius);
-    _kd_radius_rec(root, points, query, radius_sq, results);
+    if (f64_eq(radius, radius) == 0) { return results; }   # a NaN radius encloses nothing
+
+    var r2 = f64_mul(radius, radius);
+    var rb: i64[4];
+    store64(&rb + 16, f64_mul(radius, _KD_R_K));   # r (1 + 2^-50): |d| above it is beyond r
+    store64(&rb + 24, radius);
+    # ⛔ 3.4.0 AND EARLIER -- r^2 overflowing to +Inf let the leaf's Inf <= Inf through, so every
+    # r >= 2^512 around an infinite query took every point, each +Inf away. 3.4.1's first form
+    # kept that leaf test for such a query beside a plane test in r, and answered an arbitrary
+    # subset ((+Inf, 0, 0), r = 2^600, points (i, 0, 0): [2, 3, 4]). In both, at r = +Inf, a
+    # plane at the query's own infinity gave a NaN d and lost the far side.
+    # [measured: tests/modules_c.tcyr "3.4.1 LIE4: kdtree_within_radius, infinite query", baseline 3.4.0]
+    # ⭐ 3.4.1 -- only r = +Inf takes the float comparison, where it is the exact answer: +Inf <=
+    # +Inf for a point at +Inf, false for one at no distance, with every plane crossed. A finite
+    # r treats a non-finite query as any other, and _kd_within refuses its distances.
+    if (radius == 0x7FF0000000000000) {
+        store64(&rb, r2); store64(&rb + 8, r2);
+    } elif (r2 >= _KD_TRUST_LO && r2 <= _KD_TRUST) {
+        # r^2 in [2^-1000, 2^1000]: within u of r^2, so 64 ulps either side certify (as nearest's)
+        store64(&rb, r2 - 64);
+        store64(&rb + 8, r2 + 64);
+    } else {
+        store64(&rb, 0xFFF0000000000000);   # r^2 outside it: every leaf to _kd_within
+        store64(&rb + 8, 0x7FF8000000000000);
+    }
+    if (_kd_radius_rec(root, points, query, &rb, results) < 0) { return 0; }
 
     return results;
 }
@@ -584,7 +998,9 @@ fn _qt_split(node, max_depth) {
         _qt_node_set_child(node, ci, load64(&kids + ci * 8));
     }
 
-    # Redistribute existing points
+    # Redistribute existing points. A child that cannot take its point (a refused growth
+    # of its vec, 3.4.1) abandons the split: the children are detached, and the node is a
+    # leaf again with every point still in its own vec, which is cleared only below.
     var cx = _qt_bounds_cx(bounds);
     var cy = _qt_bounds_cy(bounds);
     var count = vec_len(pts) / 3;  # 3 entries per point: x, y, data
@@ -594,7 +1010,10 @@ fn _qt_split(node, max_depth) {
         var pd = vec_get(pts, pi * 3 + 2);
         var q = _qt_quadrant(px, py, cx, cy);
         var child = _qt_node_child(node, q);
-        _qt_insert_rec(child, px, py, pd, max_depth);
+        if (_qt_insert_rec(child, px, py, pd, max_depth) < 0) {
+            for (var ci = 0; ci < 4; ci = ci + 1) { _qt_node_set_child(node, ci, 0); }
+            return 1;
+        }
     }
 
     # Clear the points vec (node is now a split node, points live in children)
@@ -615,11 +1034,17 @@ fn _qt_insert_rec(node, x, y, data, max_depth) {
         return _qt_insert_rec(child, x, y, data, max_depth);
     }
 
-    # Leaf node: add point
+    # Leaf node: add point. vec_push ended the process on a refused growth; 3.4.1 checks
+    # room for the whole triple (_sp_room), pushes with vec_push_a, and returns -1 with the
+    # leaf's vec as it was (a partial triple would misalign every point after it).
     var pts = _qt_node_points(node);
-    vec_push(pts, x);
-    vec_push(pts, y);
-    vec_push(pts, data);
+    var n0 = vec_len(pts);
+    if (_sp_room(pts, 3) == 0) { return 0 - 1; }
+    var va = default_alloc();
+    var rc = vec_push_a(va, pts, x);
+    if (rc == 0) { rc = vec_push_a(va, pts, y); }
+    if (rc == 0) { rc = vec_push_a(va, pts, data); }
+    if (rc < 0) { vec_truncate(pts, n0); return 0 - 1; }
 
     var count = vec_len(pts) / 3;
     var depth = _qt_node_depth(node);
@@ -635,11 +1060,18 @@ fn _qt_insert_rec(node, x, y, data, max_depth) {
 }
 
 # Create an empty quadtree.
-# x_min, y_min, x_max, y_max: bounds (f64)
+# x_min, y_min, x_max, y_max: bounds (f64); a swapped pair is put in order (3.4.1), as
+#            octree_new does. A NaN bound contains nothing.
 # max_depth: maximum subdivision depth (integer), CLAMPED to
 #            [0, _SP_MAX_TREE_DEPTH]. See that constant for the reason and its evidence.
-# Returns: root node pointer
+# Returns: root node pointer, or 0 when an allocation is refused
 public fn quadtree_new(x_min, y_min, x_max, y_max, max_depth) {
+    # ⛔ 3.4.0 AND EARLIER — swapped corners were stored as given, so the root contained
+    # nothing: quadtree_new(10, 10, 0, 0, 8) then insert (5, 5) -> Err(-3), where the
+    # octree, through geo_aabb_new, orders its corners.
+    # [measured: tests/abuse.tcyr "3.4.1: spatial extents", baseline 3.4.0]
+    if (f64_gt(x_min, x_max) == 1) { var tx = x_min; x_min = x_max; x_max = tx; }
+    if (f64_gt(y_min, y_max) == 1) { var ty = y_min; y_min = y_max; y_max = ty; }
     # Clamp before storing: this value is the ONLY bound on _qt_insert_rec's
     # recursion, and a coincident-point insert runs the whole of it.
     # A negative max_depth already meant "never split" (`depth < max_depth` is
@@ -666,6 +1098,10 @@ public fn quadtree_new(x_min, y_min, x_max, y_max, max_depth) {
 #          dropped. The point is NOT stored in that case and `count` does not move.
 #          A NaN coordinate is outside every bounds (3.3.4; it was stored before),
 #          and so is every point when a root bound is NaN.
+#          Err(HSB_ERR_INVALID_INPUT) for a 0 handle (3.4.1: it was dereferenced),
+#          Err(HSB_ERR_ALLOC) when the leaf's vec cannot grow -- the allocator refuses,
+#          or it would pass VEC_CAP_MAX slots, three per point (3.4.1: both ended the
+#          process); the point is not stored and `count` does not move.
 #
 # BREAKING at 2.8.5. This returned 1 for "stored" and 0 for "dropped" -- inverted
 # against the project's 0-is-success / negative-is-failure convention, and against
@@ -679,6 +1115,7 @@ public fn quadtree_new(x_min, y_min, x_max, y_max, max_depth) {
 # asserting on it.
 #must_use
 public fn quadtree_insert(qt, x, y, data) {
+    if (qt == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var root = load64(qt);
     var max_depth = load64(qt + 8);
     var bounds = _qt_node_bounds(root);
@@ -686,7 +1123,7 @@ public fn quadtree_insert(qt, x, y, data) {
     # Ignore out-of-bounds points
     if (_qt_bounds_contains(bounds, x, y) == 0) { return Err(HSB_ERR_OUT_OF_RANGE); }
 
-    _qt_insert_rec(root, x, y, data, max_depth);
+    if (_qt_insert_rec(root, x, y, data, max_depth) < 0) { return Err(HSB_ERR_ALLOC); }
     store64(qt + 16, load64(qt + 16) + 1);
     return Ok(0);
 }
@@ -701,7 +1138,7 @@ fn _qt_query_rec(node, query_bounds, results) {
 
     if (_qt_node_is_split(node) == 1) {
         for (var ci = 0; ci < 4; ci = ci + 1) {
-            _qt_query_rec(_qt_node_child(node, ci), query_bounds, results);
+            if (_qt_query_rec(_qt_node_child(node, ci), query_bounds, results) < 0) { return 0 - 1; }
         }
         return 0;
     }
@@ -714,21 +1151,30 @@ fn _qt_query_rec(node, query_bounds, results) {
         var py = vec_get(pts, pi * 3 + 1);
         var pd = vec_get(pts, pi * 3 + 2);
         if (_qt_bounds_contains(query_bounds, px, py) == 1) {
-            vec_push(results, pd);
+            if (load64(results + 8) >= load64(results + 16)) {   # _sp_room(results, 1), inline
+                if (load64(results + 16) > VEC_CAP_MAX / 2) { return 0 - 1; }
+            }
+            if (vec_push_a(default_alloc(), results, pd) < 0) { return 0 - 1; }
         }
     }
     return 0;
 }
 
-# Query all data values within the given rectangle.
-# Returns vec of data (i64) values.
+# Query all data values within the given rectangle (a swapped pair of corners is put in
+# order, 3.4.1).
+# Returns vec of data (i64) values, or 0, no vec, for a 0 handle (3.4.1: dereferenced) or
+# when the result vec or a growth of it is refused, by the allocator or because the
+# results would pass VEC_CAP_MAX (3.4.1: both ended the process).
 public fn quadtree_query(qt, qx_min, qy_min, qx_max, qy_max) {
+    if (qt == 0) { return 0; }
+    if (f64_gt(qx_min, qx_max) == 1) { var tx = qx_min; qx_min = qx_max; qx_max = tx; }
+    if (f64_gt(qy_min, qy_max) == 1) { var ty = qy_min; qy_min = qy_max; qy_max = ty; }
     var results = vec_new();
     if (results == 0) { return 0; }
     var root = load64(qt);
     var query_bounds = _qt_bounds_new(qx_min, qy_min, qx_max, qy_max);
     if (query_bounds == 0) { return 0; }
-    _qt_query_rec(root, query_bounds, results);
+    if (_qt_query_rec(root, query_bounds, results) < 0) { return 0; }
     return results;
 }
 
@@ -817,17 +1263,31 @@ fn _ot_octant(point, center) {
 
 # Get child bounds for an octant
 # The centre of an octree box into the three slots at `out`: geo_aabb_center's
-# (min + max) * 0.5, formed with the same packed xy and scalar z operations, but on the
-# stack (3.4.0). Routing a point must not allocate: a split node that could not compute
-# its centre could not place the point, and a split's redistribution would lose points.
-# The child boxes use the same centre, so routing and boxes stay consistent.
+# (min + max) * 0.5 on the stack (3.4.0). Routing a point must not allocate: a split node
+# that could not compute its centre could not place the point, and a split's
+# redistribution would lose points. The child boxes use the same centre, so routing and
+# boxes stay consistent.
+# ⛔ 3.4.0 -- THIS WAS f64v_add(out, mn, mx, 2) ... f64v_scale(out, out, F64_HALF, 2), AND
+# CYCC 6.6.0 - 6.6.4 MISCOMPILE IT. Consumers compile dist/hisab.cyr under their own pins,
+# six of them on 6.6.3, inside the register picker's window
+# (docs/development/issues/archived/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md):
+# the destination-slot stores became register moves while the packed loop still read the
+# frame slots (-0x90 / -0x88), which nothing wrote, so the octree routed points through
+# garbage pointers. A consumer program built under 6.6.3 that inserts 40 points into an
+# octree and queries it ended with exit 139; hisab's own suites, built under 6.7.18, could
+# not see it. scripts/check-miscompile.sh --pin 6.6.3 flagged this function alone in the
+# bundle: 2 unwritten slots, 2 packed operands loaded from them.
+# [measured: LIE2 lane, cyrius distlib + check-miscompile.sh --pin 6.6.3 and a pinned consumer, 2026-10-31]
+# ⭐ 3.4.1 -- plain scalar operations, (min + max) * 0.5 per component: the same IEEE add and
+# multiply each packed lane performed, so the centre is bit-identical (all 100,000+ boxes
+# compared, signed zeros, subnormals, DBL_MAX and NaN/Inf included).
+# [measured: tests/modules_c.tcyr "3.4.1 LIE2: _ot_center_into"; LIE2 lane comparison, cycc 6.7.18]
 fn _ot_center_into(aabb, out) {
     var mn = GeoAabb_min(aabb);
     var mx = GeoAabb_max(aabb);
-    f64v_add(out, mn, mx, 2);
-    HVec3_set_z(out, f64_add(HVec3_z(mn), HVec3_z(mx)));
-    f64v_scale(out, out, F64_HALF, 2);
-    HVec3_set_z(out, f64_mul(HVec3_z(out), F64_HALF));
+    HVec3_set_x(out, f64_mul(f64_add(HVec3_x(mn), HVec3_x(mx)), F64_HALF));
+    HVec3_set_y(out, f64_mul(f64_add(HVec3_y(mn), HVec3_y(mx)), F64_HALF));
+    HVec3_set_z(out, f64_mul(f64_add(HVec3_z(mn), HVec3_z(mx)), F64_HALF));
     return 0;
 }
 
@@ -888,14 +1348,18 @@ fn _ot_split(node, max_depth) {
         _ot_node_set_child(node, ci, load64(&kids + ci * 8));
     }
 
-    # Redistribute existing points (interleaved: point_ptr, data)
+    # Redistribute existing points (interleaved: point_ptr, data). A refused growth
+    # abandons the split, as in _qt_split (3.4.1).
     var count = vec_len(pts) / 2;
     for (var pi = 0; pi < count; pi = pi + 1) {
         var pt = vec_get(pts, pi * 2);
         var pd = vec_get(pts, pi * 2 + 1);
         var oct = _ot_octant(pt, &center);
         var child = _ot_node_child(node, oct);
-        _ot_insert_rec(child, pt, pd, max_depth);
+        if (_ot_insert_rec(child, pt, pd, max_depth) < 0) {
+            for (var ci = 0; ci < 8; ci = ci + 1) { _ot_node_set_child(node, ci, 0); }
+            return 1;
+        }
     }
 
     # Clear points (they now live in children)
@@ -914,10 +1378,15 @@ fn _ot_insert_rec(node, point, data, max_depth) {
         return _ot_insert_rec(child, point, data, max_depth);
     }
 
-    # Leaf node: add point
+    # Leaf node: add point (_sp_room for the pair, vec_push_a, and -1 on a refused growth, the vec as it was:
+    # 3.4.1, as _qt_insert_rec)
     var pts = _ot_node_points(node);
-    vec_push(pts, point);
-    vec_push(pts, data);
+    var n0 = vec_len(pts);
+    if (_sp_room(pts, 2) == 0) { return 0 - 1; }
+    var va = default_alloc();
+    var rc = vec_push_a(va, pts, point);
+    if (rc == 0) { rc = vec_push_a(va, pts, data); }
+    if (rc < 0) { vec_truncate(pts, n0); return 0 - 1; }
 
     var count = vec_len(pts) / 2;
     var depth = _ot_node_depth(node);
@@ -938,8 +1407,10 @@ fn _ot_insert_rec(node, point, data, max_depth) {
 #            the octree is the worse of the two, at 6,144 B of never-freed arena
 #            per level of a coincident-point split chain.
 #            [measured: CHANGELOG.md 2.9.0, "6,144 B per octree level"]
-# Returns: octree handle pointer
+# Returns: octree handle pointer, or 0 for a 0 corner (3.4.1: dereferenced) or a refused
+#          allocation. The corners are put in order per axis (geo_aabb_new).
 public fn octree_new(min_vec3, max_vec3, max_depth) {
+    if (min_vec3 == 0 || max_vec3 == 0) { return 0; }
     if (max_depth < 0) { max_depth = 0; }
     if (max_depth > _SP_MAX_TREE_DEPTH) { max_depth = _SP_MAX_TREE_DEPTH; }
 
@@ -962,15 +1433,21 @@ public fn octree_new(min_vec3, max_vec3, max_depth) {
 #          dropped. BREAKING at 2.8.5 -- see quadtree_insert for the full note;
 #          this returned 1 / 0 and now returns 0 / -3. A NaN coordinate, or a NaN
 #          root bound, is outside (3.3.4; such a point was stored before).
+#          Err(HSB_ERR_INVALID_INPUT) for a 0 handle or a 0 point (3.4.1: both were
+#          dereferenced); Err(HSB_ERR_ALLOC) when the leaf's vec cannot grow -- the
+#          allocator refuses, or it would pass VEC_CAP_MAX slots, two per point (3.4.1:
+#          both ended the process); the point is not stored and `count` does not move.
+#          The octree stores the point's HANDLE, not a copy.
 #must_use
 public fn octree_insert(ot, point, data) {
+    if (ot == 0 || point == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var root = load64(ot);
     var max_depth = load64(ot + 8);
     var bounds = _ot_node_bounds(root);
 
     if (_ot_aabb_contains(bounds, point) == 0) { return Err(HSB_ERR_OUT_OF_RANGE); }
 
-    _ot_insert_rec(root, point, data, max_depth);
+    if (_ot_insert_rec(root, point, data, max_depth) < 0) { return Err(HSB_ERR_ALLOC); }
     store64(ot + 16, load64(ot + 16) + 1);
     return Ok(0);
 }
@@ -985,7 +1462,7 @@ fn _ot_query_rec(node, query_aabb, results) {
 
     if (_ot_node_is_split(node) == 1) {
         for (var ci = 0; ci < 8; ci = ci + 1) {
-            _ot_query_rec(_ot_node_child(node, ci), query_aabb, results);
+            if (_ot_query_rec(_ot_node_child(node, ci), query_aabb, results) < 0) { return 0 - 1; }
         }
         return 0;
     }
@@ -997,22 +1474,28 @@ fn _ot_query_rec(node, query_aabb, results) {
         var pt = vec_get(pts, pi * 2);
         var pd = vec_get(pts, pi * 2 + 1);
         if (_ot_aabb_contains(query_aabb, pt) == 1) {
-            vec_push(results, pd);
+            if (load64(results + 8) >= load64(results + 16)) {   # _sp_room(results, 1), inline
+                if (load64(results + 16) > VEC_CAP_MAX / 2) { return 0 - 1; }
+            }
+            if (vec_push_a(default_alloc(), results, pd) < 0) { return 0 - 1; }
         }
     }
     return 0;
 }
 
 # Query all data values within the given AABB.
-# min_vec3, max_vec3: query box corners (HVec3 pointers)
-# Returns vec of data (i64) values.
+# min_vec3, max_vec3: query box corners (HVec3 pointers), put in order per axis
+# Returns vec of data (i64) values, or 0, no vec, for a 0 handle or corner (3.4.1:
+# dereferenced) or when the result vec or a growth of it is refused, by the allocator or
+# because the results would pass VEC_CAP_MAX (3.4.1: both ended the process).
 public fn octree_query(ot, min_vec3, max_vec3) {
+    if (ot == 0 || min_vec3 == 0 || max_vec3 == 0) { return 0; }
     var results = vec_new();
     if (results == 0) { return 0; }
     var root = load64(ot);
     var query_aabb = geo_aabb_new(min_vec3, max_vec3);
     if (query_aabb == 0) { return 0; }
-    _ot_query_rec(root, query_aabb, results);
+    if (_ot_query_rec(root, query_aabb, results) < 0) { return 0; }
     return results;
 }
 
@@ -1094,7 +1577,12 @@ fn _sh_hash(ix, iy, iz) {
     return h;
 }
 
-# The cell coordinate of one axis: floor(val / cell_size) as an i64.
+# The cell coordinate of one axis: floor(val * inv_cell_size) as an i64, with
+# inv_cell_size = fl(1 / cell_size). ⚠ That is the grid's definition of a cell, not
+# floor(val / cell_size): the two differ by one at some cell boundaries (6.7 at cell 0.1
+# is cell 67 here and 66 by division). Insert and every query use this one function,
+# and it is monotone in val, which is what the radius query's block relies on (3.4.1;
+# this line said floor(val / cell_size) through 3.4.0).
 # ⛔ 3.3.4 — BELOW cycc 6.6.8, f64_to OF ANY VALUE OUTSIDE i64 IS i64::MIN ON x86,
 # whatever its sign: `cvttsd2si` returns its "integer indefinite" for +Inf, for 2^63
 # and up, and for NaN alike. From 6.6.8 it saturates by sign (i64::MAX above, i64::MIN
@@ -1140,13 +1628,22 @@ fn _sh_buckets_new(bc) {
 }
 
 # Create a new spatial hash grid.
-# cell_size: size of each grid cell (f64)
-# Returns: spatial hash handle pointer
+# cell_size: size of each grid cell (f64), finite and > 0, with 1/cell_size finite
+#            (cell_size above about 5.6e-309, 1/DBL_MAX)
+# Returns: spatial hash handle pointer, or the designed 0 for any other cell_size and for
+#          a refused allocation.
 public fn spatial_hash_new(cell_size) {
+    # ⛔ 3.4.0 AND EARLIER — every cell_size was accepted. -1 or -0.0 built a grid on which
+    # every radius query returned nothing while spatial_hash_query_cell found the point,
+    # and 0, NaN, +Inf or a cell_size whose reciprocal overflows a grid whose cells are
+    # all one cell or none. [measured: tests/abuse.tcyr "3.4.1: spatial extents", baseline 3.4.0]
+    var inv_cs = f64_div(F64_ONE, cell_size);
+    if (f64_gt(cell_size, 0) == 0 || f64_lt(cell_size, F64_POS_INF) == 0) { return 0; }
+    if (f64_lt(inv_cs, F64_POS_INF) == 0) { return 0; }
     var sh = alloc(48);
     if (sh == 0) { return 0; }
     store64(sh, cell_size);
-    store64(sh + 8, f64_div(F64_ONE, cell_size));
+    store64(sh + 8, inv_cs);
     var buckets = _sh_buckets_new(_SH_INIT_BUCKETS);
     if (buckets == 0) { return 0; }
     store64(sh + 16, buckets);
@@ -1239,27 +1736,42 @@ fn _sh_grow(sh) {
 # Insert a point with associated data into the spatial hash.
 # point: HVec3 pointer
 # data: i64 value
-# Returns: HSB_ERR_NONE (0), always. A spatial hash has no bounds to fall outside
-#          of -- every coordinate maps to some cell, including NaN and +-Inf -- so
-#          there is no rejection path and no failure to report. The return was
+# Returns: HSB_ERR_NONE (0) when the point was stored. A spatial hash has no bounds to
+#          fall outside of -- every coordinate maps to some cell, including NaN and
+#          +-Inf -- so a point is never rejected for where it is. The return was
 #          undocumented before 2.8.5; it is stated here because this routine is
 #          the one whose convention its two siblings were moved onto, and a
 #          contract nobody wrote down is what let them drift apart in the first
 #          place (2026-08-04 audit, api-consistency).
+#          3.4.1: HSB_ERR_INVALID_INPUT (-10) for a 0 handle or point (both were
+#          dereferenced, exit 139), and HSB_ERR_ALLOC (-11) when the entry list cannot
+#          grow -- the allocator refuses, or it would pass VEC_CAP_MAX slots, five per
+#          point (vec_push ended the process); the point is NOT stored and the hash is
+#          exactly as it was. Through 3.4.0 this returned 0 or did not return; a caller
+#          that stores points it must find again checks for a negative return.
+#          [measured: tests/abuse.tcyr "3.4.1: null handles in the spatial structures", baseline 3.4.0]
 public fn spatial_hash_insert(sh, point, data) {
+    if (sh == 0 || point == 0) { return HSB_ERR_INVALID_INPUT; }
     var inv = _sh_inv_cell_size(sh);
     var ix = _sh_cell_coord(HVec3_x(point), inv);
     var iy = _sh_cell_coord(HVec3_y(point), inv);
     var iz = _sh_cell_coord(HVec3_z(point), inv);
 
     var entries = _sh_entries(sh);
-    var e = vec_len(entries) / _SH_ENTRY_SIZE;
-    var old = _sh_chain_push(sh, _sh_bucket_of(sh, ix, iy, iz), e);
-    vec_push(entries, ix);
-    vec_push(entries, iy);
-    vec_push(entries, iz);
-    vec_push(entries, data);
-    vec_push(entries, old);
+    var n0 = vec_len(entries);
+    var e = n0 / _SH_ENTRY_SIZE;
+    var b = _sh_bucket_of(sh, ix, iy, iz);
+    # The record first, the chain head after it: a refused growth leaves both as they were.
+    var old = load64(_sh_buckets(sh) + b * 8);
+    if (_sp_room(entries, _SH_ENTRY_SIZE) == 0) { return HSB_ERR_ALLOC; }
+    var va = default_alloc();
+    var rc = vec_push_a(va, entries, ix);
+    if (rc == 0) { rc = vec_push_a(va, entries, iy); }
+    if (rc == 0) { rc = vec_push_a(va, entries, iz); }
+    if (rc == 0) { rc = vec_push_a(va, entries, data); }
+    if (rc == 0) { rc = vec_push_a(va, entries, old); }
+    if (rc < 0) { vec_truncate(entries, n0); return HSB_ERR_ALLOC; }
+    _sh_chain_push(sh, b, e);
 
     var occ = _sh_occupied(sh);
     if (old < 0) {
@@ -1275,8 +1787,11 @@ public fn spatial_hash_insert(sh, point, data) {
 }
 
 # Query all data values in the same cell as the given point.
-# Returns vec of data (i64) values, in insertion order.
+# Returns vec of data (i64) values, in insertion order, or 0, no vec, for a 0 handle or
+# point (3.4.1: dereferenced) or when the result vec or a growth of it is refused, by the
+# allocator or because the results would pass VEC_CAP_MAX (3.4.1: both ended the process).
 public fn spatial_hash_query_cell(sh, point) {
+    if (sh == 0 || point == 0) { return 0; }
     var results = vec_new();
     if (results == 0) { return 0; }
     if (_sh_has_nan(point) == 1) { return results; }   # no cell (_sh_cell_coord)
@@ -1293,7 +1808,10 @@ public fn spatial_hash_query_cell(sh, point) {
         if (vec_get(entries, base) == ix) {
             if (vec_get(entries, base + 1) == iy) {
                 if (vec_get(entries, base + 2) == iz) {
-                    vec_push(results, vec_get(entries, base + 3));
+                    if (load64(results + 8) >= load64(results + 16)) {   # _sp_room(results, 1), inline
+                        if (load64(results + 16) > VEC_CAP_MAX / 2) { return 0; }
+                    }
+                    if (vec_push_a(default_alloc(), results, vec_get(entries, base + 3)) < 0) { return 0; }
                 }
             }
         }
@@ -1304,112 +1822,99 @@ public fn spatial_hash_query_cell(sh, point) {
     return results;
 }
 
-# Largest radius/cell_size ratio for which ceil() still lands inside i64. Above
-# it -- and for +Inf, or a NaN span from an infinite or NaN cell size, which fail
-# every f64_lt below -- the cell block covers the whole representable coordinate
-# range, so the range test is dropped and every stored entry qualifies. A NaN
-# radius never gets here (spatial_hash_query_radius returns nothing for it).
-var _SH_MAX_SPAN_CELLS = 1000000000000000;   # 1e15
-
-# |e - c| <= r, without wrapping.
-# ⛔ 3.2.2 — THE OLD FORM WAS `d = e - c; if (d < 0) { d = 0 - d; }`, AND BOTH
-# HALVES WRAP. `e - c` overflows when e and c straddle 0 by more than 2^63, and
-# `0 - d` is a no-op at i64::MIN, so an entry in cell i64::MIN (x = -Inf, or x at or
-# below -2^63 cells) matched EVERY flat-scan query centred at cell 0: radius 1 at
-# the origin returned the points at -Inf. Measured on cycc 6.6.6 and 6.6.12 alike.
-# A difference that wraps is larger than any r, so it is out of range. Pinned in
-# tests/abuse.tcyr.
-# [measured: tests/abuse.tcyr, group "3.2.2 spatial hash"]
-# ⚠ This cannot separate two coordinates that share a cell. Below cycc 6.6.8 every
-# coordinate outside i64 shared i64::MIN, +Inf with -Inf and NaN, until 3.3.4
-# saturated the positive side and put a NaN in cell 0 in _sh_cell_coord (above).
-fn _sh_within(e, c, r) {
-    var d = e - c;
-    if (e >= c) {
-        if (d < 0) { return 0; }
-    } else {
-        d = c - e;
-        if (d < 0) { return 0; }
-    }
-    if (d <= r) { return 1; }
-    return 0;
+# The width hi - lo + 1 of a cell range, lo <= hi, or _SH_WIDE for one wider than
+# _SH_WALK_MAX cells (and for one whose width does not fit an i64, which overflows here).
+enum _ShWalk {
+    _SH_WALK_MAX = 2048;
+    _SH_WIDE = 2049;
 }
-
-# 1 when a cell coordinate lies within r of either end of the i64 range, so that
-# `c + dx` for |dx| <= r would wrap onto the other end.
-fn _sh_near_end(c, r) {
-    if (c > 0x7FFF_FFFF_FFFF_FFFF - r) { return 1; }
-    if (c < (0 - 0x7FFF_FFFF_FFFF_FFFF - 1) + r) { return 1; }
-    return 0;
+fn _sh_width(lo, hi) {
+    var d = hi - lo;
+    if (d < 0 || d >= _SH_WALK_MAX) { return _SH_WIDE; }
+    return d + 1;
 }
 
 # Query all data values within radius of the given point.
 # Checks all cells that could contain points within radius.
 # Returns vec of candidate data (i64) values (broadphase -- caller should
-# perform exact distance checks).
+# perform exact distance checks): every entry whose point lies within `radius` of
+# `point` is in it, with entries of nearby cells beside them. An empty vec for a NaN
+# centre or radius and for a radius below 0; every entry for radius +Inf. 0, no vec,
+# for a 0 handle or point (3.4.1: dereferenced) and when the result vec or a growth of
+# it is refused, by the allocator or because the results would pass VEC_CAP_MAX (3.4.1:
+# both ended the process).
 #
 # COST IS BOUNDED BY THE GRID, NOT BY THE RADIUS. The cell-block walk below is
-# (2*radius/cell_size + 1)^3 probes, which is unbounded in the caller's radius:
+# one probe per cell of the block, which is unbounded in the caller's radius:
 # radius 1e4 on a unit grid asks for 8e12 probes and radius 1e6 for 8e18, i.e.
-# the call never returns. Once the block exceeds the bucket count there is a
-# strictly cheaper plan that returns the IDENTICAL multiset -- walk each of the
-# bucket once and apply the same per-entry cell-range test.
+# the call never returns. Once the block exceeds the entry count there is a
+# strictly cheaper plan that returns the IDENTICAL multiset -- walk the entry list
+# once and apply the same per-entry cell-range test.
 # The membership predicate is unchanged (an entry is emitted iff its cell lies in
 # the block, and it can match at most one cell either way); only the visit ORDER
 # differs, and only in a regime where the old code was effectively a hang.
+#
+# ⛔ 3.4.0 AND EARLIER — THE BLOCK WAS THE CENTRE'S CELL +- ceil(radius / cell), and the
+# three were rounded separately: cell 0.1, a point at 6.7 (x = 401ACCCCCCCCCCCC), a
+# centre at 6.4 (4019999999999999), radius 0.3 (3FD3333333333333) -- the point 1.67e-16
+# INSIDE -- gave cells 63 +- 3 while the point's own cell is 67, and nothing came back.
+# [measured: tests/abuse.tcyr "3.4.1: spatial_hash_query_radius block", baseline 3.4.0]
+# ⭐ 3.4.1 — the block is the cells of the box's own corners, cell(fl(c - r)) ..
+# cell(fl(c + r)) per axis, through the same monotone cell function insert uses. A point
+# within r of c has each coordinate in [c - r, c + r]; as a double it is >= fl(c - r) (no
+# double lies between c - r and its nearest double) and <= fl(c + r), so its cell is in
+# the block whatever the roundings. The walk counts cells from lo rather than forming
+# c + dx, so nothing wraps at the ends of the i64 range (the 3.2.2 wrap and its
+# _sh_near_end / _sh_within guards are gone with it), and _SH_MAX_SPAN_CELLS, whose
+# comment misplaced where ceil leaves i64, with the ceil.
 public fn spatial_hash_query_radius(sh, point, radius) {
+    if (sh == 0 || point == 0) { return 0; }
     var results = vec_new();
     if (results == 0) { return 0; }
     # A NaN centre has no cell and a NaN radius encloses nothing (_sh_cell_coord).
     if (_sh_has_nan(point) == 1) { return results; }
     if (f64_eq(radius, radius) == 0) { return results; }
+    # A negative radius encloses nothing.
+    if (f64_lt(radius, 0) == 1) { return results; }
     var inv = _sh_inv_cell_size(sh);
-    var cx = _sh_cell_coord(HVec3_x(point), inv);
-    var cy = _sh_cell_coord(HVec3_y(point), inv);
-    var cz = _sh_cell_coord(HVec3_z(point), inv);
+    var entries = _sh_entries(sh);
+    var va = default_alloc();
 
-    # Number of cells to search in each direction
-    var span = f64_mul(radius, inv);
-    # A negative radius encloses nothing. Unchanged behaviour -- the old loop's
-    # `dx = -cells_r; while (dx <= cells_r)` was already empty for cells_r < 0 --
-    # but stated, because f64_to of a negative NaN-ish span is not a bound.
-    if (f64_lt(span, 0) == 1) { return results; }
-    var ranged = 1;
-    var cells_r = 0;
-    if (f64_lt(span, f64_from(_SH_MAX_SPAN_CELLS)) == 1) {
-        cells_r = f64_to(f64_ceil(span));
-    } else {
-        ranged = 0;   # +Inf, NaN, or past i64: every cell is in range
+    # radius +Inf: every entry (c - r would be NaN for an infinite centre).
+    if (f64_lt(radius, F64_POS_INF) == 0) {
+        var alen = vec_len(entries);
+        var aei = 0;
+        while (aei < alen) {
+            if (load64(results + 8) >= load64(results + 16)) {   # _sp_room(results, 1), inline
+                if (load64(results + 16) > VEC_CAP_MAX / 2) { return 0; }
+            }
+            if (vec_push_a(va, results, vec_get(entries, aei + 3)) < 0) { return 0; }
+            aei = aei + _SH_ENTRY_SIZE;
+        }
+        return results;
     }
+
+    var px = HVec3_x(point); var py = HVec3_y(point); var pz = HVec3_z(point);
+    var lox = _sh_cell_coord(f64_sub(px, radius), inv);
+    var hix = _sh_cell_coord(f64_add(px, radius), inv);
+    var loy = _sh_cell_coord(f64_sub(py, radius), inv);
+    var hiy = _sh_cell_coord(f64_add(py, radius), inv);
+    var loz = _sh_cell_coord(f64_sub(pz, radius), inv);
+    var hiz = _sh_cell_coord(f64_add(pz, radius), inv);
+    var wx = _sh_width(lox, hix);
+    var wy = _sh_width(loy, hiy);
+    var wz = _sh_width(loz, hiz);
 
     # WHICH PLAN IS CHEAPER, weighed against what each one actually costs. The
-    # per-cell walk costs (2*cells_r + 1)^3 bucket probes; the flat scan below
-    # costs one visit per STORED ENTRY. Through 2.8.2 the table was a fixed 1024
-    # buckets and this was the constant `cells_r >= 5` (11^3 = 1331 > 1024); the
-    # table now grows, and the entry count is the honest bound on the scan, so
-    # the two are compared directly. Below cells_r = 1024 the cube stays under
-    # 8.6e9 and cannot overflow i64; at or above it the walk is hopeless against
-    # any population.
-    var entries = _sh_entries(sh);
+    # per-cell walk costs wx * wy * wz bucket probes; the flat scan below costs one
+    # visit per STORED ENTRY. A side wider than 2048 cells is never walked (the
+    # cube would pass 8.6e9 and the walk is hopeless against any population), and
+    # below that the product cannot overflow.
     var nentries = vec_len(entries) / _SH_ENTRY_SIZE;
     var full_scan = 0;
-    if (ranged == 0) {
+    if (wx == _SH_WIDE || wy == _SH_WIDE || wz == _SH_WIDE) {
         full_scan = 1;
-    } elif (cells_r >= 1024) {
-        full_scan = 1;
-    } else {
-        var w = 2 * cells_r + 1;
-        if (w * w * w > nentries) { full_scan = 1; }
-    }
-    # ⛔ 3.2.2 — the cell walk below forms `tx = cx + dx`, which WRAPS when the centre
-    # sits within cells_r of either end of the i64 cell range (x = +-Inf, or past
-    # +-2^63 cells): a query at +Inf probed cell i64::MIN and returned the points at
-    # -Inf. The flat scan's `_sh_within` cannot wrap, so such a centre takes it.
-    # ⚠ That repaired the wrap on cycc 6.6.8 and later only. Below 6.6.8 (six consumers
-    # pin 6.6.3) the +Inf centre's own cell WAS i64::MIN, so the flat scan matched the
-    # points at -Inf too, at distance 0; 3.3.4 saturates the cell in _sh_cell_coord.
-    # [measured: tests/abuse.tcyr "a centre at +Inf", 3.3.4-base, 2026-10-03; cycc 6.6.3, 6.6.6]
-    if (_sh_near_end(cx, cells_r) + _sh_near_end(cy, cells_r) + _sh_near_end(cz, cells_r) > 0) {
+    } elif (wx * wy * wz > nentries) {
         full_scan = 1;
     }
 
@@ -1424,27 +1929,29 @@ public fn spatial_hash_query_radius(sh, point, radius) {
         var flen = vec_len(entries);
         var fei = 0;
         while (fei < flen) {
-            var keep = 1;
-            if (ranged == 1) {
-                keep = _sh_within(vec_get(entries, fei), cx, cells_r);
-                if (keep == 1) { keep = _sh_within(vec_get(entries, fei + 1), cy, cells_r); }
-                if (keep == 1) { keep = _sh_within(vec_get(entries, fei + 2), cz, cells_r); }
+            var ex = vec_get(entries, fei);
+            var ey = vec_get(entries, fei + 1);
+            var ez = vec_get(entries, fei + 2);
+            if (ex >= lox && ex <= hix && ey >= loy && ey <= hiy && ez >= loz && ez <= hiz) {
+                if (load64(results + 8) >= load64(results + 16)) {   # _sp_room(results, 1), inline
+                    if (load64(results + 16) > VEC_CAP_MAX / 2) { return 0; }
+                }
+                if (vec_push_a(va, results, vec_get(entries, fei + 3)) < 0) { return 0; }
             }
-            if (keep == 1) { vec_push(results, vec_get(entries, fei + 3)); }
             fei = fei + _SH_ENTRY_SIZE;
         }
         return results;
     }
 
-    var dx = 0 - cells_r;
-    while (dx <= cells_r) {
-        var dy = 0 - cells_r;
-        while (dy <= cells_r) {
-            var dz = 0 - cells_r;
-            while (dz <= cells_r) {
-                var tx = cx + dx;
-                var ty = cy + dy;
-                var tz = cz + dz;
+    var kx = 0;
+    while (kx < wx) {
+        var tx = lox + kx;
+        var ky = 0;
+        while (ky < wy) {
+            var ty = loy + ky;
+            var kz = 0;
+            while (kz < wz) {
+                var tz = loz + kz;
                 var run = vec_len(results);
                 var e = _sh_chain_head(sh, tx, ty, tz);
                 while (e >= 0) {
@@ -1453,7 +1960,10 @@ public fn spatial_hash_query_radius(sh, point, radius) {
                     if (vec_get(entries, base) == tx) {
                         if (vec_get(entries, base + 1) == ty) {
                             if (vec_get(entries, base + 2) == tz) {
-                                vec_push(results, vec_get(entries, base + 3));
+                                if (load64(results + 8) >= load64(results + 16)) {   # _sp_room(results, 1), inline
+                                    if (load64(results + 16) > VEC_CAP_MAX / 2) { return 0; }
+                                }
+                                if (vec_push_a(va, results, vec_get(entries, base + 3)) < 0) { return 0; }
                             }
                         }
                     }
@@ -1461,18 +1971,22 @@ public fn spatial_hash_query_radius(sh, point, radius) {
                 }
                 # This cell's run only -- cells stay in their scan order.
                 _sh_reverse_from(results, run);
-                dz = dz + 1;
+                kz = kz + 1;
             }
-            dy = dy + 1;
+            ky = ky + 1;
         }
-        dx = dx + 1;
+        kx = kx + 1;
     }
 
     return results;
 }
 
-# Remove all entries from the spatial hash.
+# Remove all entries from the spatial hash (the table keeps its size). Returns 0, or
+# HSB_ERR_INVALID_INPUT (-10) for a 0 handle (3.4.1: it was dereferenced, exit 139;
+# through 3.4.0 the return was always 0).
+# [measured: tests/abuse.tcyr "3.4.1: null handles in the spatial structures", baseline 3.4.0]
 public fn spatial_hash_clear(sh) {
+    if (sh == 0) { return HSB_ERR_INVALID_INPUT; }
     var buckets = _sh_buckets(sh);
     var bc = _sh_bucket_count(sh);
     for (var bi = 0; bi < bc; bi = bi + 1) {

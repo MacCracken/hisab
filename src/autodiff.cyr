@@ -23,6 +23,14 @@ public struct Dual { val; deriv; }
 # stores went through the null). Every dual_* op returns what dual_new returns, so each
 # reports its own failed allocation the same way; a 0 handed to one as an operand is a
 # caller's unchecked failure, which it does not test for.
+# ⚠ THE deriv ARGUMENT IS READ, NOT JUST STORED: +0 MARKS A CONSTANT. Every op reads a tangent of
+# bits 0 as "this dual does not move" and a moving zero as -0 (the marks below), so a caller
+# computing its own tangent can launder a moving zero into a constant: dual_new(k * v, k * t)
+# with k < 0 and t = -0 stores +0, and so does f64_abs(t). (-x^2)^(1/3) at 0, written that way,
+# has the tangent +0, where dual_mul(u, dual_const(-1)) keeps the -0 and the derivative's NaN.
+# 16 bytes hold no third state, so the contract is the caller's: to scale a dual use dual_mul,
+# or store _AD_SIGN for a zero tangent that moves.
+# [measured: scratch probe r2user.cyr on s19, 3.4.0 and the 3.4.1 SYM4 tree, 2026-11-01]
 #must_use
 public fn dual_new(val, deriv) {
     var d = alloc(sizeof(Dual));
@@ -40,49 +48,227 @@ public fn dual_var(val) { return dual_new(val, F64_ONE); }
 #must_use
 public fn dual_const(val) { return dual_new(val, 0); }
 
+# The two tangent marks, and the sign bit (3.4.1 SYM2; the rule above dual_div says why).
+# A tangent of +0 -- bits 0, what dual_const and dual_new(v, 0) store -- marks a CONSTANT:
+# a dual that does not move with the seed. Every other tangent moves, and a moving dual
+# whose tangent is zero stores -0, so a zero that a moving input produced (3x^2 at x = 0)
+# can never pass for a constant's. Every negation that can meet a zero flips _AD_SIGN with
+# an XOR, which is IEEE 754's negate on every pin: f64_neg(+-0) returned +0 below cyrius 6.6.8
+# (the one f64_neg left here negates the constant 1). _AD_NAN is a moving miss's tangent and
+# partial (the rule above dual_div); _AD_EXP to _AD_TWOM300 are dual_div's far path's.
+enum _AdBits {
+    _AD_SIGN = 0x8000_0000_0000_0000;   # the sign-bit mask
+    _AD_NAN = 0x7FF8_0000_0000_0A0D;    # the quiet NaN a moving domain miss carries: bits, not a value
+    _AD_EXP = 0x7FF0_0000_0000_0000;    # the exponent-field mask
+    _AD_EXP_ULP = 0x0010_0000_0000_0000;   # the exponent field's low bit (a mask)
+    _AD_TWO64 = 0x43F0_0000_0000_0000;  # 2^64
+    _AD_TWOM300 = 0x2D30_0000_0000_0000;   # 2^-300
+}
+
+# 1 when the tangent t is a moving miss's NaN, on either sign (dual_neg flips it). An op on one
+# NaN keeps its payload; of two NaNs the hardware keeps the first operand's, ordinary or not, so a
+# binary op asks _ad_keep_mark.
+fn _ad_missed(t) {
+    if ((t << 1) == (_AD_NAN << 1)) { return 1; }
+    return 0;
+}
+
+# Internal: the tangent of a binary op whose result t is NaN: the mark when either operand's
+# tangent carries it, else t (3.4.1 SYM5). Only a NaN result comes here: an ordinary one costs one
+# test. Through SYM4 two NaNs kept the first operand's bits, so o + m, o an ordinary NaN (x^0.5 -
+# x^(1/3) at 0, Inf - Inf) and m a miss, dropped the mark and m + o kept it: 0 * (o + m) and
+# (o + m)^0 answered +0, 0 * (m + o) NaN, and the tape NaN.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 SYM5: the mark survives an ordinary NaN"]
+fn _ad_keep_mark(t, ta, tb) {
+    if (_ad_missed(ta) == 1) { return ta; }
+    if (_ad_missed(tb) == 1) { return tb; }
+    return t;
+}
+
+# Negative when x's exponent field is 0 (a zero or subnormal) or all ones (an infinity or
+# NaN): x is out of the range where a product or quotient keeps its bits.
+#inline fn _ad_off(x) { return ((x & _AD_EXP) - 1) | ((x & _AD_EXP) + _AD_EXP_ULP); }
+
 # ================================================================
 # Arithmetic (chain rule propagation)
 # ================================================================
 
+# a + b: the value's sum and the tangents' sum, both IEEE; two constants give a constant
+# (tangent +0), and a moving sum whose tangent is zero stores -0 (the marks above). Returns
+# 0 when the dual cannot be allocated; an operand of 0 is the caller's unchecked failure,
+# not tested.
 #must_use
 public fn dual_add(a, b) {
-    return dual_new(f64_add(Dual_val(a), Dual_val(b)),
-      f64_add(Dual_deriv(a), Dual_deriv(b)));
+    var ta = Dual_deriv(a);
+    var tb = Dual_deriv(b);
+    var v = f64_add(Dual_val(a), Dual_val(b));
+    if ((ta | tb) == 0) { return dual_new(v, 0); }
+    var t = f64_add(ta, tb);
+    if ((t << 1) == 0) { t = _AD_SIGN; }
+    if (f64_eq(t, t) == 0) { t = _ad_keep_mark(t, ta, tb); }
+    return dual_new(v, t);
 }
 
+# a - b, as dual_add: value and tangent differences, IEEE. a - a of one dual, at a finite
+# a, is the constant 0 (3.4.1 SYM4), unless a is a moving miss. 0 when the dual cannot be
+# allocated.
 #must_use
 public fn dual_sub(a, b) {
-    return dual_new(f64_sub(Dual_val(a), Dual_val(b)),
-      f64_sub(Dual_deriv(a), Dual_deriv(b)));
+    var ta = Dual_deriv(a);
+    var tb = Dual_deriv(b);
+    var v = f64_sub(Dual_val(a), Dual_val(b));
+    if ((ta | tb) == 0) { return dual_new(v, 0); }
+    if (a == b && (v << 1) == 0 && _ad_missed(ta) == 0) { return dual_new(v, 0); }
+    var t = f64_sub(ta, tb);
+    if ((t << 1) == 0) { t = _AD_SIGN; }
+    if (f64_eq(t, t) == 0) { t = _ad_keep_mark(t, ta, tb); }
+    return dual_new(v, t);
 }
 
+# a * b: value av * bv, tangent a' bv + av b' (product rule) under the rule below: two
+# constants give a constant; a NaN value has a NaN tangent; a CONSTANT ZERO (a constant
+# operand whose value is +-0) times a finite operand is the constant 0, whatever that
+# operand's tangent (0 * g(x) = 0 wherever g(x) is finite); a constant operand's term is
+# dropped (its tangent is exactly 0); every other product and sum is IEEE. A moving miss
+# keeps its NaN, even beside a constant zero (3.4.1 SYM4). 0 when the dual cannot be allocated.
 #must_use
 public fn dual_mul(a, b) {
-    # (a + a'eps)(b + b'eps) = ab + (a'b + ab')eps
-    return dual_new(f64_mul(Dual_val(a), Dual_val(b)),
-      f64_add(f64_mul(Dual_deriv(a), Dual_val(b)),
-        f64_mul(Dual_val(a), Dual_deriv(b))));
+    var av = Dual_val(a);
+    var bv = Dual_val(b);
+    var ta = Dual_deriv(a);
+    var tb = Dual_deriv(b);
+    var p = f64_mul(av, bv);
+    if ((ta | tb) == 0) { return dual_new(p, 0); }
+    if (f64_eq(p, p) == 0) { return dual_new(p, _ad_keep_mark(p, ta, tb)); }
+    var t = 0;
+    if (ta == 0) {
+        if ((av << 1) == 0) {
+            if (_ad_missed(tb) == 1) { return dual_new(p, tb); }
+            return dual_new(p, 0);
+        }
+        t = f64_mul(av, tb);
+    } elif (tb == 0) {
+        if ((bv << 1) == 0) {
+            if (_ad_missed(ta) == 1) { return dual_new(p, ta); }
+            return dual_new(p, 0);
+        }
+        t = f64_mul(ta, bv);
+    } else {
+        # (a + a'eps)(b + b'eps) = ab + (a'b + ab')eps
+        t = f64_add(f64_mul(ta, bv), f64_mul(av, tb));
+        if (f64_eq(t, t) == 0) { t = _ad_keep_mark(t, ta, tb); }
+    }
+    if ((t << 1) == 0) { t = _AD_SIGN; }
+    return dual_new(p, t);
 }
 
 # ⭐ 3.4.0 — ONE RULE FOR A DOMAIN MISS AND FOR A NaN, IN BOTH MODES (dual_* and ad_*).
 #   - A domain miss -- div by |b| < DBL_MIN, ln or sqrt of v <= 0, with a NUMERIC input
-#     value -- is the constant 0. A constant's derivative is exactly 0, whatever tangent
-#     arrives, a NaN one included: forward mode answers (0, 0), and the tape records
-#     partials 0, so its sweep gives 0 too.
+#     value -- has the value 0. On inputs that do not move it is the constant 0: forward mode
+#     answers (0, +0), and the tape records a constant node (3.4.1: no inputs), so its sweep
+#     gives 0 too. On a moving input it is not a constant (⛔ 3.4.1 SYM4, below).
 #   - A NaN VALUE is not a miss. It gives a NaN value and a NaN derivative in both modes:
 #     ln, sqrt and div test the value before the miss, and ad_mul / ad_div give a NaN
-#     partial to every operand when an operand's value is NaN, which is what dual_mul's
-#     and dual_div's a*b' terms (NaN * 0) give forward.
-# Forward and reverse then agree on every miss and every NaN-value case. They still differ
-# where forward mode forms 0 * Inf or 0 * NaN (Inf * a zero tangent, a NaN tangent through
-# a zero partial) and the sweep never multiplies, because ad_grad skips a node whose
-# adjoint is +0; and on the sign of a zero, because adjoints accumulate from +0. That skip
-# is unchanged. Over 1,440 op x input cases (12 unary ops, add/sub/mul/div against six
-# constants on either side; 12 input values from NaNs to subnormals; tangent 1 or NaN) the
-# two modes disagreed on 232 before this rule and on 124 after, none a miss or a NaN value:
-# 74 a NaN tangent through a zero partial, 39 an infinite value times a zero tangent (or
-# Inf / Inf) in a forward formula, 11 the sign of a zero.
-# [measured: scratch forward/reverse sweep (R2A's ad1.py), integ-snap9 and this tree, 2026-10-31]
+#     partial to every moving operand when their value is NaN (3.4.1: an operand's NaN,
+#     0 * Inf, Inf / Inf), which is what dual_mul and dual_div answer forward.
+# ⛔ 3.4.1 SYM4 — A MISS WHOSE INPUT MOVES STAYS MOVING: A NaN TANGENT, NEVER A FABRICATED 0.
+# Through the first drafts of 3.4.1 every miss answered the tangent +0, the constant mark, and
+# the tape recorded a constant, so the rule below read it as one. sqrt(x) x^0.5 at 0 is x, right
+# derivative +1: the miss was a "constant zero", which annihilates, and both modes answered 0
+# (3.4.0's tape too; its forward mode said NaN). ln(x) x^0.5 at 0 (slope -Inf), sqrt(x) x^(1/3)
+# (+Inf), (1/x) x^0.5 (a pole) and sqrt(x)^0.5 = x^0.25 (+Inf) went the same way. There is no
+# derivative to report at a miss -- ln and sqrt have no value below 0, 1/x has a pole, sqrt's
+# slope is unbounded at 0 -- so a miss with a moving input keeps the value 0 and carries a NaN,
+# _AD_NAN: the tangent forward, the partial on an edge to each moving input on the tape.
+# THE NaN IS ALSO A MARK, because two ops can cut a derivative off, a constant zero (0 * g is
+# the constant 0 for a g that has a value) and x^0: neither cuts off a moving miss, nor does
+# x - x below, in either mode. Forward mode reads the payload (_ad_missed). The tape keeps the
+# NaN on the miss's own edges, which is what its adjoints need, and carries the mark on each
+# node above in a word the sweep ignores (_ad_tainted), so an input the miss does not depend on
+# keeps its derivative (3.4.1 SYM5). Over 30,000 random
+# programs against one-sided differences of the real function at 4,000 bits, no finite answer
+# comes out of a moving miss any more; 1,574 did in each mode. THE COST IS STATED: on 232 of
+# those programs the finite answer happened to be right, and each is NaN now. x sqrt(x) at 0
+# (derivative 0) is NaN, as x x^0.5 already was, and x / x at 0 has no value to differentiate.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 SYM4: a moving miss stays moving"]
+# [measured: scratch oracle judge.py on programs p1.txt, 3.4.1 SYM4 tree, 2026-11-01; cycc 6.7.18]
+# ⭐ 3.4.1 — AND ONE RULE FOR A ZERO, SO THE TWO MODES AGREE. Through 3.4.0 they disagreed
+# on 124 of 1,440 single-op cases (12 unary ops, add / sub / mul / div against six
+# constants on either side; 12 input values from NaNs to subnormals; tangent 1 or NaN), none
+# a miss or a NaN value: 74 a NaN tangent through a zero partial, which forward mode
+# multiplied (0 * NaN) and ad_grad skipped (it passed over a node whose adjoint was +0); 39
+# an infinite value times a CONSTANT's zero tangent (x * 2 at x = +Inf: forward
+# a' 2 + Inf * 0 = NaN, the tape 2) or Inf / Inf in dual_div's (a' b - a b') / b^2; 11 the
+# sign of a zero. The rule, which every op in both modes follows:
+#   - A STRUCTURAL ZERO IS EXACT. A constant (dual_const, dual_new(v, +0), ad_const), and
+#     anything computed from constants alone, does not move with the seed: its derivative is
+#     exactly 0, so forward mode drops a product term whose tangent is a constant's, and an op
+#     none of whose inputs moves is a constant itself, whatever its value (an infinite or NaN
+#     one included). Likewise a CONSTANT ZERO annihilates: 0 * g(x), and 0 / g(x), is the
+#     constant 0 wherever its value is not NaN, so its derivative is exactly 0 whatever g'
+#     is (0 * x^0.5 at x = 0: 0, where the IEEE product rule forms 0 * Inf). The tape needs
+#     the same rule in the same places: a constant has no edge to the seed, an op on
+#     constants records a constant node, and a constant zero times a finite operand records
+#     the constant it is.
+#   - AN OPERAND MINUS ITSELF IS A CONSTANT, AND SO IS ONE OVER ITSELF (3.4.1 SYM4). a - a with one
+#     dual or one tape node is the constant 0 wherever a is finite, and a / a the constant 1
+#     wherever it is not a miss: their derivative is exactly 0 for every seed, and both modes see
+#     the same operand. It keeps sqrt(x - x) at the 0 it is and (x - x) x^0.5 at 0 at its true 0,
+#     which the tangent's bits alone could not. The rule is the operand's identity and no more:
+#     x + (-x), or two handles to equal values, are ordinary operands, and are the moving zero
+#     of the next point. (Over 30,000 programs it keeps 259 forward and 261 tape answers from
+#     going NaN.)
+#   - A ZERO THAT A MOVING INPUT PRODUCED IS NOT STRUCTURAL, and everything else is IEEE
+#     754 in both modes. (x^3)^(1/3) at x = 0 has the inner tangent 3 * 0^2 = 0, and the outer
+#     partial (1/3) 0^(-2/3) = +Inf: forward forms 0 * Inf = NaN, and so does the tape, top
+#     down. The true right derivative is 1, but x * x^0.5 (derivative 0 at 0) and
+#     x^0.5 * x^0.5 (derivative 1) meet exactly the same 0 * Inf, so no local rule can tell
+#     them apart: NaN is the honest answer, and the decided one. (The first 3.4.1 rule, "a
+#     zero tangent is exact", dropped this term too and answered a confident 0 there, the
+#     fabricated-answer class.) Forward mode can only see the difference through the
+#     tangent's bits, so a moving dual's zero tangent is stored as -0 (_AD_SIGN, above).
+#     Reverse mode propagates every node the root reaches, a zero adjoint included
+#     (0 * NaN is NaN), and an adjoint is the IEEE sum of its contributions with no +0
+#     start. A node the root does not reach -- a constant among them -- reads +0.
+#   - x^0 IS THE CONSTANT 1 (pow(v, 0) = 1 for every v), so dual_pow / ad_pow at n = 0
+#     answer the tangent +0 and record a constant; through 3.4.0 their n * v^(n-1) was
+#     0 * Inf = NaN at a zero or subnormal base (AU2-G6-F8).
+# [measured: tests/edge_cases.tcyr, group "3.4.1 SYM2: structural zeros, in both modes"]
+# ⚠ WHAT IT DOES NOT MAKE EQUAL. (1) THE SIGN OF A ZERO DERIVATIVE: the exact derivative
+# is an unsigned 0, and the two modes may give it different signs -- forward mode stores
+# every moving zero as -0 (the mark), the tape keeps IEEE's sign (x * x at 0: forward -0,
+# tape +0; x / x at x < 0 the same). Compare a zero derivative with f64_eq, not its bits.
+# (2) Over several ops the two modes group the same path products and sums differently --
+# forward from the seed up, reverse from the root down -- so on ordinary inputs they agree
+# to rounding, not bit for bit, and where an intermediate overflows one grouping can reach
+# +-Inf (or Inf - Inf = NaN) where the other stays finite. (3) Forward mode reads an input
+# seeded with +0 as a constant (that is what a zero seed means: it does not move along the
+# direction taken), while the tape treats every ad_var alike: y * x^0.5 at y = 0, x = 0 is
+# 0 forward along x and NaN on the tape. A zero from a moving miss is the one zero the tape can
+# read as forward does, since it is marked: such a zero times, or over, an operand that does not
+# descend from a miss gives that operand no edge, because along an input the miss does not depend
+# on it is a constant zero (3.4.1 SYM5, ad_mul). Two marked operands keep both edges, so that each
+# can carry its miss's NaN, and there the zero meets a slope as any moving zero does:
+# sqrt(y) (sqrt(y) + x)^(2/3) at (0, 0) is NaN along x on the tape and 0 forward.
+# (4) RANGE: EACH MODE CARRIES A QUANTITY THAT CAN LEAVE THE DOUBLES WHERE THE DERIVATIVE
+# DOES NOT. Forward mode carries every intermediate's own derivative du/dx, the tape every
+# intermediate's adjoint d(root)/du and its partials, among them ad_div's -q / b, and any of
+# them can under- or overflow while d(root)/dx is an ordinary number. dual_div alone does not:
+# where its q leaves the doubles it forms the derivative with exponents kept apart (below), so
+# on those inputs forward mode is right where the tape's partial -a / b^2 itself cannot be held.
+# ln(5e-324 cos(e^x)) at x = -1 has the derivative -tan(1/e)/e = -0.1323:
+# forward forms u' = 5e-324 (-sin(1/e)/e), about -6.5e-325, which rounds to -0, and answers
+# -0; the tape forms d ln(u)/du = 1/u = 2^1074, which overflows, and answers -Inf (3.4.0: +0
+# and -Inf). A constant factor near either end of the range is where this shows, and scaling
+# it into range first avoids it. Tangents and adjoints that keep their exponents apart, as
+# cx_div's _cx_div_x does, would remove it at a cost on every op: a [3.5.0] row.
+# (5) The tape's adjoints are compensated sums (ad_grad, 3.4.1 SYM3; from a root below 4,096),
+# so a small contribution is no longer absorbed by a large one that cancels later; but each
+# product still rounds, and where rounded contributions cancel, the tape keeps their rounding:
+# 3x - x/(3x) at x = 1e-300 is -3.7e283 on the tape for the derivative 3, which forward mode
+# gives exactly. Above the 4,096th node the sweep is uncompensated, a visible step: 2x -
+# x/(2x) at 1e-300 is 2 from a root at index 4,095 and +0 from one at 4,096.
+# [measured: scratch probes adfu.cyr and ad3x.cyr on 3.4.0, s11 and the 3.4.1 SYM3 tree, 2026-11-01]
 
 # 2.11.0: the guard was `|b| < EPSILON_F64` (1e-12) returning (0, 0) -- it
 # fabricated BOTH a value and a derivative where the answer is exactly
@@ -94,50 +280,200 @@ public fn dual_mul(a, b) {
 # class). A NaN b fails the |b| < DBL_MIN test and propagates, but a NaN numerator over
 # |b| < DBL_MIN returned the sentinel: (NaN, 1) / (0, 0) came back (0, 0). It now gives
 # (a, a), quieted (quiet bit set, sign and payload kept). A numeric a over |b| < DBL_MIN
-# is the documented miss, (0, 0), whatever its tangents (the rule above).
+# is the documented miss: (0, 0) on constants, the value 0 and a NaN tangent where a or b
+# moves (3.4.1 SYM4, the rule above).
 # [measured: tests/hisab.tcyr, group "3.4.0: dual and tape ln / sqrt / abs propagate a NaN"]
+# ⛔ 3.4.1 — THE DERIVATIVE WENT THROUGH b^2 (AU2-G6-F7). (a' b - a b') / b^2 overflows to
+# +Inf once |b| passes 2^512 and underflows below 2^-537, so dual_div(var b, const b) had
+# the derivative 0 at b = 1e200 (exact 1/b = 1e-200), +Inf at 1.785e-200 and was 2.4e9
+# ulp off at 1EF6E0C2B9F0C1D5. It is now the quotient rule with no square, q = a / b.
+# [measured: tests/hisab.tcyr, group "3.4.1: dual_div / ad_div without b^2, ad_div's value"]
+# ⛔ 3.4.1 SYM2 — AND ITS b' TERM FORMED q b' BEFORE DIVIDING (RV-SYM S3). -(q b') / b
+# overflowed where the tape's (-q / b) b' does not: 1e300 / (1e150 x) at x = 1e-50 was
+# -Inf forward and -1e250 on the tape (exact -1.0000000000000001e250). Where one operand
+# moves, the derivative is now the tape's partial times its tangent: (-q / b) b' (a a
+# constant), the tape's bits, or a' / b (b a constant), correctly rounded. Where both move,
+# it is (a' - q b') / b while q b' is finite -- its one subtraction cancels exactly where the
+# two terms are equal, as the tape's sum at a shared node does -- and a' / b + (-q / b) b'
+# only where q b' overflows ((1e308 x) / (x x) at 1.5: -4.44e307, was -Inf). The review's
+# a' / b + (-q / b) b' throughout turns an exact cancellation into the rounding of two
+# separately rounded terms: (1000 x) / (1000 x) at x = 1e-300, derivative 0, gave
+# -1.49e284 (the tape: 0), a fabricated finite derivative.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 SYM2: dual_div's b' term, as the tape forms it"]
+# ⛔ 3.4.1 SYM4 — AND EVERY FORM WENT THROUGH q, SO WHERE q LEFT THE DOUBLES THE b' TERM WENT WITH
+# IT, AND THE TEST LOOKED AT q b', NOT AT a' - q b'. 5e-324 / ln(x) at x = 1e-300 was -0 for
+# -1.0354e-29; a = 2.8e-320, a' = -5.9e-210 over b = 3.8e37, b' = -1.5e236 was -1.5e-247 for
+# 2.9e-159, 88 orders of magnitude and the wrong sign; a constant a = -7.2e261 over b = -2.2e-64,
+# b' = 2.4e-157 was +Inf for 3.5e232, and a' - q b' overflowed with q b' finite, so (1 + 1.5e308 u)
+# / (4 - 1.7e308 u) was +Inf for 4.8125e307. Where q, q b' or -q / b is zero, subnormal or
+# infinite, or a' - q b' overflows, and all four parts are finite, the same formula is taken with
+# exponents kept apart (_ad_div_x), which only the final result's own range can limit. A zero a
+# or b' takes no such path (_ad_div_far says why), and a' - q b' that cancels exactly is a zero
+# that has lost nothing. Of 200,000 full-range quotients, none is non-finite or a wrong sign where the exact
+# value is finite (3.4.0: 79,419 non-finite), and every one is within 4 ulp x its cancellation;
+# where q left the doubles forward mode differs from the tape, whose partial cannot hold it.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 SYM4: dual_div where q leaves the doubles"]
+# [measured: scratch exact-rational sweep divtr3.py / divfar.py, 3.4.0, s23 and the SYM4 tree, 2026-11-01]
 #must_use
 public fn dual_div(a, b) {
+    var av = Dual_val(a);
     var bv = Dual_val(b);
+    var ta = Dual_deriv(a);
+    var tb = Dual_deriv(b);
+    var q = 0;
     if (f64_lt(f64_abs(bv), _AD_F64_TINY) == 1) {
-        var av = Dual_val(a);
-        if (f64_eq(av, av) == 0) {
-            var qa = av | 0x0008_0000_0000_0000;
-            return dual_new(qa, qa);
+        if (f64_eq(av, av) == 1) {
+            if ((ta | tb) == 0) { return dual_new(0, 0); }
+            return dual_new(0, _AD_NAN);
         }
-        return dual_new(0, 0);
+        q = av | 0x0008_0000_0000_0000;
+    } else {
+        q = f64_div(av, bv);
     }
-    var bv2 = f64_mul(bv, bv);
-    return dual_new(f64_div(Dual_val(a), bv),
-      f64_div(f64_sub(f64_mul(Dual_deriv(a), bv),
-          f64_mul(Dual_val(a), Dual_deriv(b))), bv2));
+    if ((ta | tb) == 0) { return dual_new(q, 0); }
+    if (f64_eq(q, q) == 0) { return dual_new(q, _ad_keep_mark(q, ta, tb)); }
+    if (a == b && _ad_missed(ta) == 0) { return dual_new(q, 0); }
+    var t = 0;
+    if (ta == 0) {
+        if ((av << 1) == 0) {
+            if (_ad_missed(tb) == 1) { return dual_new(q, tb); }
+            return dual_new(q, 0);
+        }
+        var r = f64_div(q ^ _AD_SIGN, bv);
+        t = f64_mul(r, tb);
+        if ((_ad_off(q) | _ad_off(r)) < 0) { t = _ad_div_far(av, ta, bv, tb, q, t); }
+    } elif (tb == 0) {
+        t = f64_div(ta, bv);
+    } else {
+        var qt = f64_mul(q, tb);
+        var d = f64_sub(ta, qt);
+        t = f64_div(d, bv);
+        if ((_ad_off(q) | _ad_off(qt) | ((d & _AD_EXP) + _AD_EXP_ULP)) < 0) { t = _ad_div_far(av, ta, bv, tb, q, t); }
+    }
+    if ((t << 1) == 0) { t = _AD_SIGN; }
+    if (f64_eq(t, t) == 0) { t = _ad_keep_mark(t, ta, tb); }
+    return dual_new(q, t);
 }
 
+# Internal: dual_div's derivative where q, q b' (or -q / b) or a' - q b' left the range; t is
+# what the ordinary form gave. An infinite a or b has the split form, as IEEE takes it, and every
+# form below keeps a NaN tangent's NaN. From there a and b are finite. A zero b' leaves t as it
+# is, a NaN from q * 0 included: a moving zero may be an underflow, so it is no exact zero (1 /
+# (1 / x) at x = 1e300 has b' = -1e-600 = -0 for the derivative 1, and an a' / b here read 0). A
+# zero a makes q exact, so t stands too. A non-finite tangent keeps its term's sign: b' infinite
+# is -sign(q) Inf / b even where q underflowed (0 * Inf would be NaN), and a' infinite beside a
+# finite b' is a' / b even where the other term overflowed against it. All four finite and
+# neither zero, the derivative is ordinary whatever q did, and _ad_div_x forms it.
+fn _ad_div_far(av, ta, bv, tb, q, t) {
+    if (f64_lt(f64_abs(av), F64_POS_INF) == 0 || f64_lt(f64_abs(bv), F64_POS_INF) == 0) {
+        return f64_add(f64_div(ta, bv), f64_mul(f64_div(q ^ _AD_SIGN, bv), tb));
+    }
+    if ((tb << 1) == 0) { return t; }
+    if ((av << 1) == 0) { return t; }
+    if (f64_lt(f64_abs(tb), F64_POS_INF) == 0) {
+        return f64_div(f64_sub(ta, f64_mul(((av ^ bv) & _AD_SIGN) | F64_ONE, tb)), bv);
+    }
+    if (f64_lt(f64_abs(ta), F64_POS_INF) == 0) { return f64_div(ta, bv); }
+    return _ad_div_x(av, ta, bv, tb);
+}
+
+# Internal: the exponent e of a finite x != 0, 2^e <= |x| < 2^(e + 1), subnormals included.
+fn _ad_xe(x) {
+    var f = (x >> 52) & 0x7FF;
+    if (f != 0) { return f - 1023; }
+    return (((f64_mul(x, _AD_TWO64) >> 52) & 0x7FF) - 1023) - 64;
+}
+
+# Internal: x's significand with x's sign: |.| in [1, 2), x = it * 2^_ad_xe(x).
+fn _ad_xm(x) {
+    var y = x;
+    if (((x >> 52) & 0x7FF) == 0) { y = f64_mul(x, _AD_TWO64); }
+    return (y & 0x800F_FFFF_FFFF_FFFF) | (1023 << 52);
+}
+
+# Internal: (a' - (a / b) b') / b for finite a, a', b, b', a, b, b' not zero, as dual_div's form
+# computes it where it fits, with exponents kept apart (3.4.1 SYM4): each of a / b, its product
+# with b', the difference and the last quotient rounds once on significands near 1, nothing
+# under- or overflows on the way, and the one result is put in place at the end.
+fn _ad_div_x(av, ta, bv, tb) {
+    var mb = _ad_xm(bv);
+    var eb = _ad_xe(bv);
+    var p = f64_mul(f64_div(_ad_xm(av), mb), _ad_xm(tb));
+    var e = _ad_xe(av) - eb + _ad_xe(tb);
+    var m = p ^ _AD_SIGN;
+    if ((ta << 1) != 0) {
+        var s = _ad_xe(ta) - e;
+        if (s >= 0) {
+            if (s > 200) { s = 200; }
+            m = f64_sub(_ad_xm(ta), f64_mul(p, (1023 - s) << 52));
+            e = _ad_xe(ta);
+        } else {
+            s = 0 - s;
+            if (s > 200) { s = 200; }
+            m = f64_sub(f64_mul(_ad_xm(ta), (1023 - s) << 52), p);
+        }
+    }
+    if ((m << 1) == 0) { return 0; }
+    var r = f64_div(m, mb);
+    e = e - eb + _ad_xe(r);
+    r = _ad_xm(r);
+    if (e > 1023) { return (r & _AD_SIGN) | F64_POS_INF; }
+    if (e >= 0 - 1022) { return (r & 0x800F_FFFF_FFFF_FFFF) | ((e + 1023) << 52); }
+    if (e < 0 - 1130) { return r & _AD_SIGN; }
+    return f64_mul((r & 0x800F_FFFF_FFFF_FFFF) | ((e + 1323) << 52), _AD_TWOM300);
+}
+
+# -a: value and tangent negated (sign-bit flips); a constant stays a constant (+0), and a
+# moving zero stays -0 (the marks above dual_add). 0 when the dual cannot be allocated.
 #must_use
 public fn dual_neg(a) {
-    return dual_new(f64_neg(Dual_val(a)), f64_neg(Dual_deriv(a)));
+    var t = Dual_deriv(a);
+    var v = Dual_val(a) ^ _AD_SIGN;
+    if (t == 0) { return dual_new(v, 0); }
+    if ((t << 1) == 0) { return dual_new(v, _AD_SIGN); }
+    return dual_new(v, t ^ _AD_SIGN);
 }
 
 # ================================================================
 # Elementary functions
 # ================================================================
 
+# sin a: (sin v, a' cos v), with ganita's sin and cos; a constant gives a constant (+0),
+# so a constant at +-Inf is (NaN, +0) and a moving one (NaN, NaN). 0 when the dual cannot
+# be allocated.
 #must_use
 public fn dual_sin(a) {
-    return dual_new(f64_sin(Dual_val(a)),
-      f64_mul(Dual_deriv(a), f64_cos(Dual_val(a))));
+    var t = Dual_deriv(a);
+    var v = Dual_val(a);
+    if (t == 0) { return dual_new(f64_sin(v), 0); }
+    var d = f64_mul(t, f64_cos(v));
+    if ((d << 1) == 0) { d = _AD_SIGN; }
+    return dual_new(f64_sin(v), d);
 }
 
+# cos a: (cos v, -(a' sin v)); a constant gives a constant. 0 when the dual cannot be
+# allocated.
 #must_use
 public fn dual_cos(a) {
-    return dual_new(f64_cos(Dual_val(a)),
-      f64_neg(f64_mul(Dual_deriv(a), f64_sin(Dual_val(a)))));
+    var t = Dual_deriv(a);
+    var v = Dual_val(a);
+    if (t == 0) { return dual_new(f64_cos(v), 0); }
+    var d = f64_mul(t, f64_sin(v)) ^ _AD_SIGN;
+    if ((d << 1) == 0) { d = _AD_SIGN; }
+    return dual_new(f64_cos(v), d);
 }
 
+# exp a: (e, a' e) with e = exp v, which overflows to +Inf above about 709.78; a constant
+# gives a constant, (+Inf, +0) there, and a moving zero tangent meets it as IEEE does:
+# -0 * Inf = NaN. 0 when the dual cannot be allocated.
 #must_use
 public fn dual_exp(a) {
     var e = f64_exp(Dual_val(a));
-    return dual_new(e, f64_mul(Dual_deriv(a), e));
+    var t = Dual_deriv(a);
+    if (t == 0) { return dual_new(e, 0); }
+    var d = f64_mul(t, e);
+    if ((d << 1) == 0) { d = _AD_SIGN; }
+    return dual_new(e, d);
 }
 
 # 2.11.0: the guard tested `f64_abs(v)`, which is not the domain of ln. Two
@@ -147,40 +483,55 @@ public fn dual_exp(a) {
 #     checking only the derivative sees nothing wrong.
 #   * dual_ln(1e-13) returned (0, 0) where the truth is (-29.9336, 1e13).
 # The domain of ln is v > 0, and inside it ln is fine all the way to DBL_MIN
-# (ln(5e-324) = -744). v <= 0 (-0 and -Inf included) is the documented domain miss,
-# the (0, 0) sentinel.
+# (ln(5e-324) = -744). v <= 0 (-0 and -Inf included) is the documented domain miss: the
+# value 0, and the tangent +0 on a constant, a NaN on a moving input (3.4.1 SYM4, the rule
+# above dual_div).
 # [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
 # ⛔ 3.4.0 — A NaN v WAS A DOMAIN MISS TOO (roadmap [3.4.0] D069). The guard was
 # `f64_gt(v, 0) != 1`, which a NaN passes, so dual_ln(NaN) returned the sentinel (0, 0):
 # a finite value and derivative from no number at all, and indistinguishable from
 # ln(-5)'s miss. A NaN is not an input outside ln's domain; it is the absence of an
 # input, and it propagates like every other dual op's: ln(NaN) and a' / NaN, a NaN
-# value and a NaN derivative. The guard is `f64_le(v, 0)`, false for a NaN. A miss with
-# a NaN tangent is still (0, 0): the miss is the constant 0 (the rule above dual_div).
+# value and a NaN derivative. The guard is `f64_le(v, 0)`, false for a NaN.
 # [measured: tests/hisab.tcyr, group "3.4.0: dual and tape ln / sqrt / abs propagate a NaN"]
 #must_use
 public fn dual_ln(a) {
     var v = Dual_val(a);
-    if (f64_le(v, 0) == 1) { return dual_new(0, 0); }
-    return dual_new(f64_ln(v), f64_div(Dual_deriv(a), v));
+    var t = Dual_deriv(a);
+    if (f64_le(v, 0) == 1) {
+        if (t == 0) { return dual_new(0, 0); }
+        return dual_new(0, _AD_NAN);
+    }
+    if (t == 0) { return dual_new(f64_ln(v), 0); }
+    var d = f64_div(t, v);
+    if ((d << 1) == 0) { d = _AD_SIGN; }
+    return dual_new(f64_ln(v), d);
 }
 
 # 2.11.0: the guard ran AFTER `s = f64_sqrt(v)`, so a negative input was already
 # NaN before anything checked it -- dual_sqrt(-4) returned (NaN, NaN). The domain
 # test belongs on the INPUT. At v == 0 the derivative is unbounded, so that is a
-# miss too; above it, sqrt is fine to DBL_MIN (sqrt(1e-300) = 1e-150, derivative
-# 5e149, both finite).
+# miss too, with the value 0, which is right there, and the tangent of the rule above
+# dual_div; above it, sqrt is fine to DBL_MIN (sqrt(1e-300) = 1e-150, derivative 5e149,
+# both finite).
 # [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
 # ⛔ 3.4.0 — A NaN v PROPAGATES (roadmap [3.4.0] D069), as in dual_ln: the guard is
-# `f64_le(v, 0)`, the (0, 0) sentinel is for v <= 0 only, and a NaN v gives
-# (sqrt(NaN), a' / (2 sqrt(NaN))), both NaN.
+# `f64_le(v, 0)`, the miss is for v <= 0 only, and a NaN v gives (sqrt(NaN),
+# a' / (2 sqrt(NaN))), both NaN.
 # [measured: tests/hisab.tcyr, group "3.4.0: dual and tape ln / sqrt / abs propagate a NaN"]
 #must_use
 public fn dual_sqrt(a) {
     var v = Dual_val(a);
-    if (f64_le(v, 0) == 1) { return dual_new(0, 0); }
+    var t = Dual_deriv(a);
+    if (f64_le(v, 0) == 1) {
+        if (t == 0) { return dual_new(0, 0); }
+        return dual_new(0, _AD_NAN);
+    }
     var s = f64_sqrt(v);
-    return dual_new(s, f64_div(Dual_deriv(a), f64_mul(F64_TWO, s)));
+    if (t == 0) { return dual_new(s, 0); }
+    var d = f64_div(t, f64_mul(F64_TWO, s));
+    if ((d << 1) == 0) { d = _AD_SIGN; }
+    return dual_new(s, d);
 }
 
 # base^n for a plain f64 exponent n -- the power both dual_pow and the tape's ad_pow use,
@@ -227,13 +578,30 @@ fn _ad_pow(base, n) {
     return ganita_f64_pow(base, n);
 }
 
+# a^n for a plain f64 exponent n: (v^n, a' n v^(n-1)), both through _ad_pow below. A
+# constant a, or n = 0, gives a constant (but a moving miss to the power 0 keeps its NaN,
+# 3.4.1 SYM4). A moving a meets the partial as IEEE does, so
+# (x^3)^(1/3) at x = 0 -- a moving zero tangent times (1/3) 0^(-2/3) = +Inf -- is NaN, in
+# both modes (3.4.1 SYM2: the first 3.4.1 rule answered a confident 0 there, where the
+# right derivative is 1). 0 when the dual cannot be allocated.
 # [measured: docs/development/issues/archived/2026-08-11-forward-mode-dual-guards.md]
+# ⛔ 3.4.1 — AT n = 0 THE DERIVATIVE WAS n * v^(n-1) = 0 * Inf = NaN at a zero or subnormal
+# base, a constant's included: dual_pow(dual_const(0), 0) was (1, NaN). v^0 is 1 for every
+# v, so it is the constant 1, tangent +0 (the zero rule above dual_div).
+# [measured: tests/hisab.tcyr, group "3.4.1: dual_pow / ad_pow at n = 0 are the constant 1"]
 #must_use
 public fn dual_pow(a, n) {
     # a^n, where n is a plain f64 (not dual)
     var v = _ad_pow(Dual_val(a), n);
-    return dual_new(v, f64_mul(Dual_deriv(a),
-        f64_mul(n, _ad_pow(Dual_val(a), f64_sub(n, F64_ONE)))));
+    var t = Dual_deriv(a);
+    if (t == 0) { return dual_new(v, 0); }
+    if (f64_eq(n, 0) == 1) {
+        if (_ad_missed(t) == 1) { return dual_new(v, t); }
+        return dual_new(v, 0);
+    }
+    var d = f64_mul(t, f64_mul(n, _ad_pow(Dual_val(a), f64_sub(n, F64_ONE))));
+    if ((d << 1) == 0) { d = _AD_SIGN; }
+    return dual_new(v, d);
 }
 
 # ⚠ AT v == 0 THE DERIVATIVE DOES NOT EXIST, and this returns the RIGHT-hand one
@@ -256,11 +624,15 @@ public fn dual_pow(a, n) {
 #must_use
 public fn dual_abs(a) {
     var v = Dual_val(a);
+    var t = Dual_deriv(a);
+    if (t == 0) { return dual_new(f64_abs(v), 0); }
     if (f64_lt(v, 0) == 1) {
-        return dual_new(f64_neg(v), f64_neg(Dual_deriv(a)));
+        var d = t ^ _AD_SIGN;
+        if ((d << 1) == 0) { d = _AD_SIGN; }
+        return dual_new(v ^ _AD_SIGN, d);
     }
-    if (f64_eq(v, v) == 0) { return dual_new(f64_abs(v), f64_mul(Dual_deriv(a), v)); }
-    return dual_new(f64_abs(v), Dual_deriv(a));
+    if (f64_eq(v, v) == 0) { return dual_new(f64_abs(v), f64_mul(t, v)); }
+    return dual_new(f64_abs(v), t);
 }
 
 # ================================================================
@@ -281,11 +653,13 @@ public fn dual_abs(a) {
 # against the forward PROPAGATION; finite differences remain the independent
 # oracle, and the suite checks both modes against them.
 #
-# TAPE LAYOUT. One node per operation:
+# TAPE LAYOUT. One node per operation (i1 is written _AD_MARK - i1 on a node that descends from
+# a moving miss, 3.4.1 SYM5, see _ad_tainted):
 #   val   the value produced
 #   d1    d(this) / d(input 1)          i1  index of input 1, or AD_NONE
 #   d2    d(this) / d(input 2)          i2  index of input 2, or AD_NONE
-# A variable or constant is a node with no inputs. Because every node's inputs
+# A variable or constant is a node with no inputs (a constant's i2 is _AD_CONST_NODE,
+# 3.4.1). Because every node's inputs
 # have STRICTLY SMALLER indices, a single descending loop is a valid reverse
 # topological order -- no sort, no visited set.
 
@@ -297,6 +671,22 @@ public struct AdTape { nodes; adj; n; cap; }
 
 # 40 bytes per node: val, d1, d2, i1, i2
 var _AD_NODE_BYTES = 40;
+
+# ad_grad's mark for an adjoint with no contribution yet (3.4.1): a signaling NaN, which
+# no IEEE operation returns, so no contribution can equal it.
+enum _AdSweep { _AD_UNSEEN = 0x7FF4_0000_0000_0A0D }   # a signaling-NaN sentinel: bits, not a value
+
+# The i2 of a constant node (3.4.1 SYM2): ad_const, a domain miss, x^0, and every op whose
+# inputs are all constants. It is negative, so the sweep gives such a node no edge, and it is
+# not AD_NONE, so an op can tell a constant from an ad_var.
+enum _AdNode {
+    _AD_CONST_NODE = -3;
+    _AD_MARK = -2;      # i1 of a node that descends from a moving miss is _AD_MARK - i1 (_ad_tainted)
+}
+
+# The compensated sweep's buffer, in words (3.4.1 SYM3, see ad_grad): a root below it is swept
+# with the compensation terms in _ad_sweep_lo's frame (32 KB), whose array is this literal.
+enum _AdLo { _AD_LO_SLOTS = 4096 }
 
 # ⚠ BOTH BODY ALLOCATIONS ARE CHECKED, and 0 is returned if either fails.
 #
@@ -352,29 +742,40 @@ public fn ad_tape_reset(t) {
 fn _ad_node(t, i) { return AdTape_nodes(t) + i * _AD_NODE_BYTES; }
 
 # Append a node. Returns its index, or AD_FULL if the tape is full -- checkable,
-# never a silently dropped operation.
+# never a silently dropped operation. A node with an input that descends from a moving miss
+# descends from it too, and is marked in its i1 (3.4.1 SYM5, see _ad_tainted); its partials are
+# stored as they are. A moving miss passes its i1 marked already.
 fn _ad_push(t, val, d1, i1, d2, i2) {
     var n = AdTape_n(t);
     if (n >= AdTape_cap(t)) { return AD_FULL; }
-    var p = _ad_node(t, n);
+    var b = AdTape_nodes(t);
+    var p = b + n * _AD_NODE_BYTES;
     store64(p, val);
     store64(p + 8, d1);
     store64(p + 16, d2);
-    store64(p + 24, i1);
     store64(p + 32, i2);
+    if (i1 >= 0) {
+        if (load64(b + i1 * _AD_NODE_BYTES + 24) <= _AD_MARK) { i1 = _AD_MARK - i1; }
+        elif (i2 >= 0) {
+            if (load64(b + i2 * _AD_NODE_BYTES + 24) <= _AD_MARK) { i1 = _AD_MARK - i1; }
+        }
+    }
+    store64(p + 24, i1);
     AdTape_set_n(t, n + 1);
     return n;
 }
 
 # An independent variable: no inputs, so the reverse sweep stops here and its
-# accumulated adjoint IS the gradient component.
+# accumulated adjoint IS the gradient component. Its index, or AD_FULL when t is full.
 #must_use
 public fn ad_var(t, val) { return _ad_push(t, val, 0, AD_NONE, 0, AD_NONE); }
 
-# A constant: identical shape, named separately so a reader can tell which
-# entries of the gradient are meaningful.
+# A constant: no inputs, like a variable, and marked as a constant (3.4.1 SYM2), so every
+# op on it alone records a constant and no op gives it an edge: its adjoint reads +0 after
+# any sweep (through 3.4.1's first draft it read d(root)/d(constant), never part of a
+# gradient). Its index, or AD_FULL when t is full.
 #must_use
-public fn ad_const(t, val) { return _ad_push(t, val, 0, AD_NONE, 0, AD_NONE); }
+public fn ad_const(t, val) { return _ad_k(t, val); }
 
 # The value at a node, or 0 for an invalid index.
 public fn ad_val(t, i) {
@@ -407,118 +808,283 @@ fn _ad_bad2(t, a, b) {
     return 0;
 }
 
+# 1 when the node record p descends from a moving miss, the tape's copy of forward mode's mark:
+# an annihilator (a constant zero, x^0) and the self rule (x - x, x / x) read it, and do not cut a
+# marked operand. The mark is its i1, written _AD_MARK - i1, negative so that it cannot be an
+# index; the sweep alone reads it back. It is never a partial, because a partial is a chain-rule
+# factor. The NaN of a miss sits on the miss's own edges, so it reaches the inputs the miss
+# depends on and no others: x + sqrt(y) has the partials 1 and 1, and at (1, 0) df/dx stays 1.
+# ⛔ 3.4.1 SYM5 — THROUGH SYM4 THE MARK WAS A NaN PARTIAL, _ad_push WRITING d1 = _AD_NAN ON EVERY
+# NODE ABOVE A MISS, ON THE CLAIM THAT THE SWEEP WOULD MEET THAT NaN FURTHER DOWN. It did, on the
+# missed input, and on every other input joined to it: the node's adjoint went NaN, and its other
+# edges carried that to inputs the miss had nothing to do with. sin(x + sqrt(y)) at (1, 0) had
+# df/dx = NaN for cos(1) (3.4.0, s23 and forward mode: cos(1)), and x + sqrt(y) + 1 NaN for 1.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 SYM5: a miss reaches its own inputs and no others"]
+# [measured: scratch three-input oracle judge3.py, 3.4.0, s24 and the SYM5 tree, 2026-11-01]
+fn _ad_tainted(p) {
+    if (load64(p + 24) <= _AD_MARK) { return 1; }
+    return 0;
+}
+
+# 1 when the node record p is a constant node, the tape's structural zero (3.4.1 SYM2).
+fn _ad_isk(p) {
+    if (load64(p + 32) == _AD_CONST_NODE) { return 1; }
+    return 0;
+}
+
+# Record the constant v: a node with no inputs and the constant mark (3.4.1 SYM2).
+fn _ad_k(t, v) { return _ad_push(t, v, 0, AD_NONE, 0, _AD_CONST_NODE); }
+
+# An op with ONE moving input records one edge (i1) and i2 = AD_NONE: its other input, if
+# any, is a constant, and a constant's term is exactly 0 (the rule above dual_div).
+
+# a + b on the tape: value av + bv, partials 1 and 1; an op on two constants is a constant,
+# and a constant operand gets no edge (3.4.1 SYM2). AD_FULL when a or b is not a node of t
+# (AD_FULL included) or t is full.
 #must_use
 public fn ad_add(t, a, b) {
     if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
-    return _ad_push(t, f64_add(ad_val(t, a), ad_val(t, b)), F64_ONE, a, F64_ONE, b);
+    var pa = _ad_node(t, a);
+    var pb = _ad_node(t, b);
+    var v = f64_add(load64(pa), load64(pb));
+    var ka = _ad_isk(pa);
+    var kb = _ad_isk(pb);
+    if (ka == 1 && kb == 1) { return _ad_k(t, v); }
+    if (ka == 1) { return _ad_push(t, v, F64_ONE, b, 0, AD_NONE); }
+    if (kb == 1) { return _ad_push(t, v, F64_ONE, a, 0, AD_NONE); }
+    return _ad_push(t, v, F64_ONE, a, F64_ONE, b);
 }
 
+# a - b on the tape: value av - bv, partials 1 and -1, constants as ad_add. a - a of one
+# node, at a finite a, records the constant 0 (3.4.1 SYM4), unless a descends from a moving
+# miss. AD_FULL as ad_add.
 #must_use
 public fn ad_sub(t, a, b) {
     if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
-    return _ad_push(t, f64_sub(ad_val(t, a), ad_val(t, b)), F64_ONE, a,
-      f64_neg(F64_ONE), b);
+    var pa = _ad_node(t, a);
+    var pb = _ad_node(t, b);
+    var v = f64_sub(load64(pa), load64(pb));
+    var ka = _ad_isk(pa);
+    var kb = _ad_isk(pb);
+    if (ka == 1 && kb == 1) { return _ad_k(t, v); }
+    if (a == b && (v << 1) == 0 && _ad_tainted(pa) == 0) { return _ad_k(t, v); }
+    if (ka == 1) { return _ad_push(t, v, F64_ONE ^ _AD_SIGN, b, 0, AD_NONE); }
+    if (kb == 1) { return _ad_push(t, v, F64_ONE, a, 0, AD_NONE); }
+    return _ad_push(t, v, F64_ONE, a, F64_ONE ^ _AD_SIGN, b);
 }
 
+# a * b on the tape: value av * bv, partials bv and av, under the rule above dual_div, in
+# dual_mul's order: two constants record a constant; a NaN value gives every moving operand
+# the partial NaN (3.4.0: an operand's NaN, whose a'b + ab' is NaN forward; 3.4.1: 0 * Inf
+# too -- x * 0 at x = +Inf was NaN forward and 0 on the tape); a CONSTANT ZERO times a
+# finite operand records the constant 0 (3.4.1 SYM2: 0 * x^0.5 at 0 was 0 * Inf = NaN) unless
+# it descends from a moving miss; a constant operand gets no edge, and neither does an operand
+# with no mark beside a marked zero (3.4.1 SYM5, the rule above dual_div: the term a b' with a = 0
+# is exactly 0 along an input the miss does not depend on, and along one it does the edge to a
+# carries the slope). AD_FULL as ad_add.
 #must_use
-# A NaN operand value makes both partials that NaN (3.4.0, the rule above dual_div):
-# forward mode's a'b + ab' is NaN there through the NaN * b' term, so a partial of plain
-# bv (or av) let the tape answer b where dual_mul answered NaN.
 public fn ad_mul(t, a, b) {
     if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
-    var av = ad_val(t, a);
-    var bv = ad_val(t, b);
+    var pa = _ad_node(t, a);
+    var pb = _ad_node(t, b);
+    var av = load64(pa);
+    var bv = load64(pb);
     var p = f64_mul(av, bv);
-    if (f64_eq(av, av) == 0 || f64_eq(bv, bv) == 0) { return _ad_push(t, p, p, a, p, b); }
+    var ka = _ad_isk(pa);
+    var kb = _ad_isk(pb);
+    if (ka == 1 && kb == 1) { return _ad_k(t, p); }
+    if (f64_eq(p, p) == 0) {
+        if (ka == 1) { return _ad_push(t, p, p, b, 0, AD_NONE); }
+        if (kb == 1) { return _ad_push(t, p, p, a, 0, AD_NONE); }
+        return _ad_push(t, p, p, a, p, b);
+    }
+    if (ka == 1) {
+        if ((av << 1) == 0 && _ad_tainted(pb) == 0) { return _ad_k(t, p); }
+        return _ad_push(t, p, av, b, 0, AD_NONE);
+    }
+    if (kb == 1) {
+        if ((bv << 1) == 0 && _ad_tainted(pa) == 0) { return _ad_k(t, p); }
+        return _ad_push(t, p, bv, a, 0, AD_NONE);
+    }
+    if ((av << 1) == 0 && _ad_tainted(pa) == 1 && _ad_tainted(pb) == 0) { return _ad_push(t, p, bv, a, 0, AD_NONE); }
+    if ((bv << 1) == 0 && _ad_tainted(pb) == 1 && _ad_tainted(pa) == 0) { return _ad_push(t, p, av, b, 0, AD_NONE); }
     return _ad_push(t, p, bv, a, av, b);
 }
 
-# d(a/b)/da = 1/b,  d(a/b)/db = -a/b^2. Guard as dual_div does: DBL_MIN, because
-# the only thing that fails is the division. A NaN a gives a NaN value and both partials
-# that NaN, quieted, over any b (3.4.0, the rule above dual_div): over |b| < DBL_MIN it
-# was the (0, 0) miss through 3.3.7, and over any other b d/da = 1/b answered where
-# dual_div's derivative is NaN. A NaN b needs nothing: 1/b is NaN. A numeric a over
-# |b| < DBL_MIN is the miss, value and partials 0.
+# Internal: ad_div's d/db where q left the doubles: -a / b^2, from a and b and not from q, for
+# finite a != 0 and b; db, the plain -q / b, otherwise. _ad_div_x forms it as dual_div's far path
+# does, with a' = 0 and b' = 1, and only the partial's own range limits it.
+fn _ad_div_db(av, bv, db) {
+    if ((av << 1) == 0) { return db; }
+    if (f64_lt(f64_abs(av), F64_POS_INF) == 0 || f64_lt(f64_abs(bv), F64_POS_INF) == 0) { return db; }
+    return _ad_div_x(av, 0, bv, F64_ONE);
+}
+
+# a / b on the tape: value q = av / bv, partials d/da = 1/b, d/db = -q/b, in dual_div's
+# order. Guard as dual_div does: DBL_MIN, because the only thing that fails is the division.
+# A numeric a over |b| < DBL_MIN is the miss: the constant 0 on constants, the value 0 with
+# a NaN partial to each moving operand otherwise (3.4.1 SYM4). A NaN a over |b| < DBL_MIN is
+# that NaN, quieted (3.4.0: the (0, 0) miss through 3.3.7). Two constants record a constant,
+# and so does a / a of one node (3.4.1 SYM4); a NaN quotient (a NaN operand, Inf / Inf) gives every moving
+# operand the partial NaN (3.4.0 / 3.4.1: d/da = 1/b answered where dual_div's derivative is
+# NaN); a CONSTANT ZERO dividend records the constant 0 (3.4.1 SYM2); a constant operand gets
+# no edge, and neither does an unmarked divisor under a marked zero (3.4.1 SYM5, as ad_mul). AD_FULL
+# as ad_add.
+# ⛔ 3.4.1 — THE VALUE WAS a * (1/b), TWO ROUNDINGS, AND d/db WAS -a * (1/b) * (1/b)
+# (AU2-G6-F13, F7). The value was an ulp off the correctly rounded quotient dual_div gives
+# (01A56E1FC2F8F359 / 1675DD6DD21D2E61: 2B1F5D1A1DC73DFE for ...DFD), and (1/b)^2 underflows
+# to 0 from |b| = 2^512 and overflows below 2^-512, so d/db was 0 or -Inf there. The value
+# is av / bv now, and d/db = -q / b, which over- or underflows only where -a / b^2 does.
+# [measured: tests/hisab.tcyr, group "3.4.1: dual_div / ad_div without b^2, ad_div's value"]
+# ⛔ 3.4.1 SYM4 — BUT A SUBNORMAL q HAD ALREADY LOST BITS, so that repair took 7 of 200,000
+# quotients from within 1 ulp to past 4: -5e-324 / 2.03e-8 has q = -2.4e-316 with 28 bits, and the
+# derivative was 8.3e-9 relative off. Where q is zero, subnormal or infinite the partial comes
+# from a and b (_ad_div_db), so it is right wherever it fits; those 7 are within 1 ulp now.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 SYM4: ad_div's partial where q leaves the doubles"]
 #must_use
 public fn ad_div(t, a, b) {
     if (_ad_bad2(t, a, b) == 1) { return AD_FULL; }
-    var av = ad_val(t, a);
-    var bv = ad_val(t, b);
-    if (f64_eq(av, av) == 0) {
-        var qa = av | 0x0008_0000_0000_0000;
-        return _ad_push(t, qa, qa, a, qa, b);
+    var pa = _ad_node(t, a);
+    var pb = _ad_node(t, b);
+    var av = load64(pa);
+    var bv = load64(pb);
+    var q = 0;
+    var ka = _ad_isk(pa);
+    var kb = _ad_isk(pb);
+    if (f64_lt(f64_abs(bv), _AD_F64_TINY) == 1) {
+        if (f64_eq(av, av) == 1) {
+            if (ka == 1 && kb == 1) { return _ad_k(t, 0); }
+            if (ka == 1) { return _ad_push(t, 0, _AD_NAN, _AD_MARK - b, 0, AD_NONE); }
+            if (kb == 1) { return _ad_push(t, 0, _AD_NAN, _AD_MARK - a, 0, AD_NONE); }
+            return _ad_push(t, 0, _AD_NAN, _AD_MARK - a, _AD_NAN, b);
+        }
+        q = av | 0x0008_0000_0000_0000;
+    } else {
+        q = f64_div(av, bv);
     }
-    if (f64_lt(f64_abs(bv), _AD_F64_TINY) == 1) { return _ad_push(t, 0, 0, a, 0, b); }
-    var inv = f64_div(F64_ONE, bv);
-    return _ad_push(t, f64_mul(av, inv), inv, a,
-      f64_neg(f64_mul(av, f64_mul(inv, inv))), b);
+    if (ka == 1 && kb == 1) { return _ad_k(t, q); }
+    if (f64_eq(q, q) == 0) {
+        if (ka == 1) { return _ad_push(t, q, q, b, 0, AD_NONE); }
+        if (kb == 1) { return _ad_push(t, q, q, a, 0, AD_NONE); }
+        return _ad_push(t, q, q, a, q, b);
+    }
+    if (a == b && _ad_tainted(pa) == 0) { return _ad_k(t, q); }
+    if (ka == 1 && (av << 1) == 0 && _ad_tainted(pb) == 0) { return _ad_k(t, q); }
+    if (kb == 1) { return _ad_push(t, q, f64_div(F64_ONE, bv), a, 0, AD_NONE); }
+    if ((av << 1) == 0 && _ad_tainted(pa) == 1 && _ad_tainted(pb) == 0) {
+        return _ad_push(t, q, f64_div(F64_ONE, bv), a, 0, AD_NONE);
+    }
+    var db = f64_div(q ^ _AD_SIGN, bv);
+    if (_ad_off(q) < 0) { db = _ad_div_db(av, bv, db); }
+    if (ka == 1) { return _ad_push(t, q, db, b, 0, AD_NONE); }
+    return _ad_push(t, q, f64_div(F64_ONE, bv), a, db, b);
 }
 
+# -a on the tape: value -av (a sign-bit flip), partial -1; a constant gives a constant.
+# AD_FULL when a is not a node of t or t is full.
 #must_use
 public fn ad_neg(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
-    return _ad_push(t, f64_neg(ad_val(t, a)), f64_neg(F64_ONE), a, 0, AD_NONE);
+    var pa = _ad_node(t, a);
+    var v = load64(pa) ^ _AD_SIGN;
+    if (_ad_isk(pa) == 1) { return _ad_k(t, v); }
+    return _ad_push(t, v, F64_ONE ^ _AD_SIGN, a, 0, AD_NONE);
 }
 
+# sin a on the tape: value sin av, partial cos av; a constant gives a constant. AD_FULL as
+# ad_neg.
 #must_use
 public fn ad_sin(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
-    var av = ad_val(t, a);
+    var pa = _ad_node(t, a);
+    var av = load64(pa);
+    if (_ad_isk(pa) == 1) { return _ad_k(t, f64_sin(av)); }
     return _ad_push(t, f64_sin(av), f64_cos(av), a, 0, AD_NONE);
 }
 
+# cos a on the tape: value cos av, partial -sin av (a sign-bit flip, so -sin(+0) is -0 on
+# every pin); a constant gives a constant. AD_FULL as ad_neg.
 #must_use
 public fn ad_cos(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
-    var av = ad_val(t, a);
-    return _ad_push(t, f64_cos(av), f64_neg(f64_sin(av)), a, 0, AD_NONE);
+    var pa = _ad_node(t, a);
+    var av = load64(pa);
+    if (_ad_isk(pa) == 1) { return _ad_k(t, f64_cos(av)); }
+    return _ad_push(t, f64_cos(av), f64_sin(av) ^ _AD_SIGN, a, 0, AD_NONE);
 }
 
+# exp a on the tape: value and partial e = exp av (+Inf above about 709.78); a constant
+# gives a constant. AD_FULL as ad_neg.
 #must_use
 public fn ad_exp(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
-    var e = f64_exp(ad_val(t, a));
+    var pa = _ad_node(t, a);
+    var e = f64_exp(load64(pa));
+    if (_ad_isk(pa) == 1) { return _ad_k(t, e); }
     return _ad_push(t, e, e, a, 0, AD_NONE);
 }
 
-# Domain is v > 0 -- the same test dual_ln uses: v <= 0 is the (0, 0) miss, and a NaN
-# propagates (3.4.0; through 3.3.7 a NaN was a miss here too, value 0 and partial 0).
+# Domain is v > 0 -- the same test dual_ln uses: v <= 0 is the miss, and a NaN
+# propagates (3.4.0; through 3.3.7 a NaN was a miss here too, value 0 and partial 0). A
+# miss on a constant is the constant 0; a miss on a moving a is the value 0 with the partial
+# NaN (3.4.1 SYM4). A constant a gives a constant.
 #must_use
 public fn ad_ln(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
-    var av = ad_val(t, a);
-    if (f64_le(av, 0) == 1) { return _ad_push(t, 0, 0, a, 0, AD_NONE); }
+    var pa = _ad_node(t, a);
+    var av = load64(pa);
+    if (f64_le(av, 0) == 1) {
+        if (_ad_isk(pa) == 1) { return _ad_k(t, 0); }
+        return _ad_push(t, 0, _AD_NAN, _AD_MARK - a, 0, AD_NONE);
+    }
+    if (_ad_isk(pa) == 1) { return _ad_k(t, f64_ln(av)); }
     return _ad_push(t, f64_ln(av), f64_div(F64_ONE, av), a, 0, AD_NONE);
 }
 
-# Domain is v > 0, as dual_sqrt's: v <= 0 is the miss, a NaN propagates (3.4.0).
+# Domain is v > 0, as dual_sqrt's: v <= 0 is the miss, as ad_ln's, and a NaN propagates
+# (3.4.0). A constant a gives a constant.
 #must_use
 public fn ad_sqrt(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
-    var av = ad_val(t, a);
-    if (f64_le(av, 0) == 1) { return _ad_push(t, 0, 0, a, 0, AD_NONE); }
+    var pa = _ad_node(t, a);
+    var av = load64(pa);
+    if (f64_le(av, 0) == 1) {
+        if (_ad_isk(pa) == 1) { return _ad_k(t, 0); }
+        return _ad_push(t, 0, _AD_NAN, _AD_MARK - a, 0, AD_NONE);
+    }
     var s = f64_sqrt(av);
+    if (_ad_isk(pa) == 1) { return _ad_k(t, s); }
     return _ad_push(t, s, f64_div(F64_ONE, f64_mul(F64_TWO, s)), a, 0, AD_NONE);
 }
 
 # n is a plain f64, not a tape node -- the same shape as dual_pow, through the same
-# _ad_pow, so the two modes agree bit for bit on every exponent.
+# _ad_pow, so the two modes agree bit for bit on every exponent. n = 0 records the
+# constant 1 (3.4.1, as dual_pow: its partial was 0 * Inf = NaN at a zero base), unless a
+# descends from a moving miss, and so does a constant a's power.
 #must_use
 public fn ad_pow(t, a, n) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
-    var av = ad_val(t, a);
-    return _ad_push(t, _ad_pow(av, n),
-      f64_mul(n, _ad_pow(av, f64_sub(n, F64_ONE))), a, 0, AD_NONE);
+    var pa = _ad_node(t, a);
+    var av = load64(pa);
+    if (_ad_isk(pa) == 1) { return _ad_k(t, _ad_pow(av, n)); }
+    if (f64_eq(n, 0) == 1) {
+        if (_ad_tainted(pa) == 0) { return _ad_k(t, _ad_pow(av, n)); }
+        return _ad_push(t, _ad_pow(av, n), 0, a, 0, AD_NONE);
+    }
+    return _ad_push(t, _ad_pow(av, n), f64_mul(n, _ad_pow(av, f64_sub(n, F64_ONE))), a, 0, AD_NONE);
 }
 
 # ⚠ At 0 the derivative does not exist; this takes the RIGHT-hand one, matching
 # dual_abs. See the note there. A NaN has no sign, so its partial is the NaN itself
 # (3.4.0, as dual_abs; through 3.3.7 it was 1), and the value is f64_abs(v): |-0| = +0.
+# A constant a gives a constant.
 #must_use
 public fn ad_abs(t, a) {
     if (ad_ok(t, a) == 0) { return AD_FULL; }
-    var av = ad_val(t, a);
-    if (f64_lt(av, 0) == 1) { return _ad_push(t, f64_neg(av), f64_neg(F64_ONE), a, 0, AD_NONE); }
+    var pa = _ad_node(t, a);
+    var av = load64(pa);
+    if (_ad_isk(pa) == 1) { return _ad_k(t, f64_abs(av)); }
+    if (f64_lt(av, 0) == 1) { return _ad_push(t, av ^ _AD_SIGN, F64_ONE ^ _AD_SIGN, a, 0, AD_NONE); }
     if (f64_eq(av, av) == 0) { return _ad_push(t, f64_abs(av), av, a, 0, AD_NONE); }
     return _ad_push(t, f64_abs(av), F64_ONE, a, 0, AD_NONE);
 }
@@ -584,29 +1150,156 @@ public fn ad_grad(t, root) {
     # ⚠ Clear the WHOLE tape, not just up to `root`. A caller taking a second
     # gradient from a shorter root would otherwise read the previous sweep's
     # adjoints on every node above it.
-    for (var i = 0; i < n; i = i + 1) { store64(adj + i * 8, 0); }
+    # ⛔ 3.4.1 — EVERY NODE THE ROOT REACHES IS PROPAGATED, AND AN ADJOINT STARTS FROM ITS
+    # FIRST CONTRIBUTION, NOT FROM +0 (the zero rule above dual_div). Through 3.4.0 a node
+    # whose adjoint was +0 was skipped "as an optimisation, not a correctness condition --
+    # adding 0 * d would be a no-op": it is not one when d is NaN or infinite (0 * NaN is
+    # NaN), which is 74 of the 124 cases the modes disagreed on; and +0 + (-0) is +0, so a
+    # -0 gradient (d cos x / dx at +0) came back +0, 11 more. Nodes at or below the root
+    # start as _AD_UNSEEN, a signaling-NaN pattern no IEEE operation produces (every
+    # contribution is a product, and a product's NaN is quiet): the first contribution is
+    # stored, the next ones added, and a node still unseen when the sweep reaches it has
+    # no path to the root and is set to +0 there, so no _AD_UNSEEN outlives the sweep.
+    # ⛔ 3.4.1 SYM3 — AND A SMALL CONTRIBUTION ADDED TO A LARGE ADJOINT WAS LOST, EVEN WHERE THE
+    # LARGE ONES CANCELLED AFTER (SYM2's double-path sweep). At x = 1e-300, 2x - x/(2x) has the
+    # derivative 2: the node 2x collects 1 and 1/(4x) = 2.5e299, rounds the 1 away, and hands
+    # 2.5e299 twice to x, where -1/(2x) = -5e299 cancels it exactly, so the tape answered 0;
+    # |x - x/x| answered 0 for -1 the same way (forward mode was right on both). Each adjoint
+    # is now a pair: the double that every earlier sweep kept, and a compensation term that
+    # collects each addition's exact rounding error (TwoSum, _ad_acc) -- and the pair is what
+    # a node hands on: its contribution to an input is (adjoint) * d plus (term) * d, so the 1
+    # lost at 2x reaches x. A node's adjoint is folded to their sum when the sweep reaches it.
+    # Folding at each node and handing on the double alone is not enough: the first program's
+    # 1 is lost at 2x, a node above x, and would be rounded away again there. The terms live in
+    # a buffer of _AD_LO_SLOTS words in the sweep's own frame (_ad_sweep_lo), never in the
+    # tape: a tape owns cap words of adjoints, built by ad_tape_new or by hand through the
+    # public setters, and the sweep reads and writes no more of it than 3.4.0 did. A heap
+    # block per sweep would grow without bound over repeated sweeps; one kept across sweeps
+    # would point, after a caller's alloc_reset(), into memory handed out again; a static
+    # array would add its size to every consumer's binary (collision_mesh.cyr's buffers made
+    # the same choice). ⚠ So the terms cover a sweep from a root below _AD_LO_SLOTS = 4,096;
+    # from a root at 4,096 or above the sweep is the uncompensated one of 3.4.1's first draft.
+    # The sweep allocates nothing: heap use is unchanged over 100,000 sweeps. ⚠ What remains is
+    # each product's own rounding: where the contributions that cancel are not exact, the
+    # result carries their rounding -- 3x - x/(3x) at x = 1e-300 gives -3.7e283 for 3 on the
+    # tape, where forward mode's (a' - q b') / b cancels exactly and gives 3. An infinite or
+    # NaN sum keeps no term, and neither does a sum whose TwoSum overflowed (_ad_acc).
+    # ⚠ A term can also make an answer worse where the plain sum was right by luck: x reaches
+    # (1e308 x, -1e308 x) under adjoints 1e300 + 10 - 1e300 each; the terms are rightly 10 and 10,
+    # and 10 * 1e308 - 10 * 1e308 is then Inf - Inf, NaN, for the exact 0 the absorbed sum gave.
+    # Cost against the uncompensated sweep, same boot, six interleaved rounds, of a row that
+    # builds the tape and sweeps it: grad_rev_16 +19%, jac_rev_pertape_256 +19%,
+    # jac_rev_shared_256 +11%, ad_div_grad +14%. Of the sweep alone it is about x2.4 per node:
+    # 140 us over a chain of 4,000 nodes, 58 us over the uncompensated 4,200 (load about 4).
+    # [measured: scratch tape bench and SYM2's 30,000-program double-path sweep, 3.4.1 SYM3 tree, 2026-11-01]
+    # [measured: sweep-only probe r2b.cyr, 3.4.1 SYM4 tree, three rounds, 2026-11-01]
+    # [measured: tests/edge_cases.tcyr, group "3.4.1 SYM3: the reverse sweep's compensated adjoints"]
+    # [measured: tests/hisab.tcyr, group "3.4.1: forward and reverse agree on special values"]
+    for (var i = 0; i <= root; i = i + 1) { store64(adj + i * 8, _AD_UNSEEN); }
+    for (var i = root + 1; i < n; i = i + 1) { store64(adj + i * 8, 0); }
     store64(adj + root * 8, F64_ONE);
+    if (root < _AD_LO_SLOTS) {
+        _ad_sweep_lo(t, adj, root);
+        return Ok(0);
+    }
     var k = root;
     while (k >= 0) {
         var a = load64(adj + k * 8);
-        # Skip nodes the root does not depend on. This is an optimisation, not a
-        # correctness condition -- adding 0 * d would be a no-op anyway.
-        if (a != 0) {
+        if (a == _AD_UNSEEN) {
+            store64(adj + k * 8, 0);
+        } else {
             var p = _ad_node(t, k);
             var i1 = load64(p + 24);
             var i2 = load64(p + 32);
+            if (i1 <= _AD_MARK) { i1 = _AD_MARK - i1; }
+            # Each contribution is stored as is when it is the slot's first, else added.
             if (i1 >= 0) {
-                store64(adj + i1 * 8,
-                  f64_add(load64(adj + i1 * 8), f64_mul(a, load64(p + 8))));
+                var c1 = f64_mul(a, load64(p + 8));
+                var s1 = load64(adj + i1 * 8);
+                if (s1 == _AD_UNSEEN) { store64(adj + i1 * 8, c1); } else { store64(adj + i1 * 8, f64_add(s1, c1)); }
             }
             if (i2 >= 0) {
-                store64(adj + i2 * 8,
-                  f64_add(load64(adj + i2 * 8), f64_mul(a, load64(p + 16))));
+                var c2 = f64_mul(a, load64(p + 16));
+                var s2 = load64(adj + i2 * 8);
+                if (s2 == _AD_UNSEEN) { store64(adj + i2 * 8, c2); } else { store64(adj + i2 * 8, f64_add(s2, c2)); }
             }
         }
         k = k - 1;
     }
     return Ok(0);
+}
+
+# Internal: ad_grad's sweep from a root below _AD_LO_SLOTS, each adjoint's compensation term
+# in lo[] here, indexed by node (3.4.1 SYM3). A node's inputs have smaller indices on every
+# tape ad_* builds; an edge that does not (a tape corrupted by hand) is added plainly, so
+# lo[] is never indexed at or above the node being swept, and so never past the root.
+fn _ad_sweep_lo(t, adj, root) {
+    var lo: i64[4096];
+    var lb = &lo;
+    store64(lb + root * 8, 0);
+    var k = root;
+    while (k >= 0) {
+        var a = load64(adj + k * 8);
+        if (a == _AD_UNSEEN) {
+            store64(adj + k * 8, 0);
+        } else {
+            var e = load64(lb + k * 8);
+            var p = _ad_node(t, k);
+            var i1 = load64(p + 24);
+            var i2 = load64(p + 32);
+            if (i1 <= _AD_MARK) { i1 = _AD_MARK - i1; }
+            if (i1 >= 0) {
+                if (i1 < k) { _ad_acc(adj, lb, i1, a, e, load64(p + 8)); }
+                else { _ad_add_plain(adj, i1, f64_mul(a, load64(p + 8))); }
+            }
+            if (i2 >= 0) {
+                if (i2 < k) { _ad_acc(adj, lb, i2, a, e, load64(p + 16)); }
+                else { _ad_add_plain(adj, i2, f64_mul(a, load64(p + 16))); }
+            }
+            if ((e << 1) != 0) { store64(adj + k * 8, f64_add(a, e)); }
+        }
+        k = k - 1;
+    }
+    return 0;
+}
+
+# Internal: node i's adjoint takes c, stored as is when it is the slot's first, else added.
+fn _ad_add_plain(adj, i, c) {
+    var s = load64(adj + i * 8);
+    if (s == _AD_UNSEEN) { store64(adj + i * 8, c); } else { store64(adj + i * 8, f64_add(s, c)); }
+    return 0;
+}
+
+# Internal: hand (a + e) * d to node i, whose adjoint is adj[i] with the compensation term
+# lo[i] (3.4.1 SYM3). The first contribution is stored as it is (a + 0 would lose a -0);
+# a later one is added, and TwoSum's exact error of that addition joins lo[i] with e * d.
+# e * d is taken only beside a finite a * d, and the error only of a finite sum: next to an
+# infinity or a NaN no term means anything (Inf - Inf would make one NaN). ⛔ 3.4.1 SYM4 — NOR OF
+# A SUM WHOSE u - s OVERFLOWED. TwoSum's middle step can pass DBL_MAX though u is finite, for a
+# contribution of exactly +-DBL_MAX (Boldo, Graillat and Muller), and the term came out NaN:
+# DBL_MAX x - 3 * 2^970 x at 1 had the gradient NaN for 7FEFFFFFFFFFFFFE. Such a term is
+# dropped, and the adjoint is the plain sum, as it was through 3.4.0.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 SYM4: the sweep's TwoSum at DBL_MAX"]
+fn _ad_acc(adj, lo, i, a, e, d) {
+    var c = f64_mul(a, d);
+    var ce = 0;
+    if ((e << 1) != 0 && f64_lt(f64_abs(c), F64_POS_INF) == 1) { ce = f64_mul(e, d); }
+    var s = load64(adj + i * 8);
+    if (s == _AD_UNSEEN) {
+        store64(adj + i * 8, c);
+        store64(lo + i * 8, ce);
+        return 0;
+    }
+    var u = f64_add(s, c);
+    store64(adj + i * 8, u);
+    if (f64_lt(f64_abs(u), F64_POS_INF) == 1) {
+        var bp = f64_sub(u, s);
+        if (f64_lt(f64_abs(bp), F64_POS_INF) == 1) {
+            var err = f64_add(f64_sub(s, f64_sub(u, bp)), f64_sub(c, bp));
+            store64(lo + i * 8, f64_add(load64(lo + i * 8), f64_add(err, ce)));
+        }
+    }
+    return 0;
 }
 
 # d(root)/d(node i), valid after ad_grad. Returns 0 for an invalid index, which
@@ -645,11 +1338,20 @@ public fn ad_grad_of(t, i) {
 # whether a helper built the closure or it was built inline. The form above builds
 # clean on all of them. Filed upstream and fixed in cyrius 6.6.16, where a closure's
 # `return` is its own: from 6.6.16 `return ad_grad_into(...)` builds clean, provided the
-# closure returns a pair on EVERY path (6.6.16 warns on one that mixes). Keep the form
-# above while a consumer pins below 6.6.16, which all ten direct consumers do. The
-# record, with the paired 6.6.14 / 6.6.20 run, is
+# closure returns a pair on EVERY path (6.6.16 warns on one that mixes). The record, with
+# the paired 6.6.14 / 6.6.20 run, is
 # docs/development/issues/archived/2026-10-03-cyrius-closure-stack-return-blamed-on-enclosing-fn.md
 # [measured: docs/development/issues/archived/2026-10-03-cyrius-closure-stack-return-blamed-on-enclosing-fn.md]
+# ⛔ 3.4.1 -- BUILDING CLEAN IS NOT RECEIVING THE PAIR, so `return ad_grad_into(...)` is
+# wrong on EVERY pin, 6.6.16 and later included. The solver calls the closure through a
+# variable, `fncall2(grad, ..)`, and a callee held in a variable returns one word, so the
+# Result reaches it as its tag alone: with the closure returning Err(x + 200), the
+# solver's bound word is 1 on every pin from 6.6.3 to 6.7.18, the payload gone (and a
+# helper-built closure is refused through 6.6.14). The form above reads both halves
+# inside the closure and is the only one that keeps them, on every pin; through 3.4.0
+# this note said to keep it only while a consumer pinned below 6.6.16.
+# scripts/check-result-migration.sh refuses a closure that returns a Result.
+# [measured: lane INS4 forms_ad probes, dirs pinned to cycc 6.6.3 6.6.10 6.6.14 6.6.16 6.6.20 6.7.18, 2026-10-31]
 #
 # ⚠ AND ON A CONSUMER'S PIN IT CAN STILL CRASH IN THE CALLER'S CODE, NOT HISAB'S.
 # A capturing closure called as a BARE STATEMENT, `fncall2(grad, x, g);`, is

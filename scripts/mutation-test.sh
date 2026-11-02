@@ -50,6 +50,27 @@
 # Wilson 95% interval. It counts EQUIVALENT mutants as survivors (no tool here can tell
 # a mutant that changes nothing from one the suites miss), so it is an upper bound on
 # the suites' blind rate; read the survivor list before quoting it.
+#
+# MASKED -- a survivor class this script does not assign; it is decided by hand, and it is
+# recorded, not reverted. A deleted allocation check (`if (p == 0) { return 0; }`) is
+# MASKED when it survives every suite AND an exhaustion sweep of its function at every
+# 8-byte point (tests/abuse.tcyr's `_al_exhaust_after`): a later check, or a later request
+# at least as large, returns before the 0 is read. Both in-process instruments refuse by
+# size alone -- ALLOC_MAX by the request, the sweep by the bytes left in a chunk no new
+# chunk can follow -- so under them a refused request stays refused for every later one
+# as large, and the deleted check never fires first. lib/alloc.cyr in production does not
+# promise that: a request past the chunk is an mmap, the kernel answers each one afresh
+# (strict overcommit, RLIMIT_AS, other processes' memory), and `alloc`'s contract is that
+# any call may answer 0. A masked check is therefore live code no in-process instrument
+# can reach, not dead code, and CLAUDE.md's "revert any part that moves no number" does
+# not apply to it: the number it moves is behind a refusal order the instruments cannot
+# produce. Reverting one would also make its function correct only by an argument about
+# the sizes and order of the requests after it, which the next edit breaks silently.
+# 3.4.0's lane AL classified 268 of its 470 allocation-check mutants this way (geo_diff 90,
+# symbolic_ext 61, lie_ext 48, collision_mesh 19, diffgeo 14, complex 11, lie 10, spatial
+# 8, color 4, vec3 2, collision_core 1); 3.4.1 re-ran one (hvec3_reflect's `nd == 0`,
+# abuse.tcyr 2385 of 2385 with it deleted). Its row list was a scratch table, not kept.
+# [measured: lane AL2 mutation campaign, scratch AL2-mutants.tsv, not reproducible in-tree]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,7 +81,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --work) WORK="$2"; shift 2 ;;
         --keep) KEEP=1; ARGS+=("$1"); shift ;;
-        -h|--help) sed -n '2,52p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,73p' "$0"; exit 0 ;;
         *) ARGS+=("$1"); shift ;;
     esac
 done

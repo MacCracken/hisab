@@ -19,9 +19,9 @@
 # For each pin (default: 6.6.3, the lowest pin that compiles a 3.x bundle and the lowest
 # live consumer pin, plus the manifest's own): a scratch project pinned to it, the
 # declared stdlib leaves vendored from that toolchain with `cyrius lib sync` (what a
-# consumer's build does), and a program that includes the bundle. The build must name
-# versions/<pin>/bin/cycc on its `compiler:` line, or the run is refused (CLAUDE.md,
-# "Check the probe"). cycc emits every function unless CYRIUS_DCE=1, which is unset here,
+# consumer's build does), and a program that includes the bundle. The build's `compiler:`
+# line must name versions/<pin>/bin/cycc or a byte-identical binary (the installed default
+# when the pin is also the default), or the run is refused (CLAUDE.md, "Check the probe"). cycc emits every function unless CYRIUS_DCE=1, which is unset here,
 # so every bundle function is in the binary whether or not the program calls it. Then,
 # over `objdump -d` of the binary, function by function (a function starts at
 # `push %rbp; mov %rsp,%rbp`):
@@ -305,8 +305,14 @@ mkpin() {
 build() {
     local dir="$1" src="$2" out="$3" pin="$4" log
     log="$(cd "$dir" && env -u CYRIUS_DCE cyrius build -v "$src" "$out" 2>&1)" || { echo "$log" | tail -5; return 1; }
-    if ! printf '%s\n' "$log" | grep -F 'compiler:' | grep -F -q "/versions/${pin}/bin/cycc"; then
-        echo "  REFUSED: the build did not run versions/${pin}/bin/cycc:"
+    # The compiler: line names the binary that ran. When the pin is also the installed
+    # default, cyrius runs ~/.cyrius/bin/cycc rather than versions/<pin>/bin/cycc (seen on
+    # 6.7.18), so a path match alone refuses a build the pin's compiler did make: accept a
+    # named binary that is byte-identical to versions/<pin>/bin/cycc, and nothing else.
+    local cc
+    cc="$(printf '%s\n' "$log" | sed -n 's/.*compiler:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)"
+    if [ -z "$cc" ] || { [ "$cc" != "$VERSIONS/${pin}/bin/cycc" ] && ! cmp -s "$cc" "$VERSIONS/${pin}/bin/cycc"; }; then
+        echo "  REFUSED: the build did not run versions/${pin}/bin/cycc or a byte-identical copy:"
         printf '%s\n' "$log" | grep -F 'compiler:' || echo "  (no compiler: line)"
         return 1
     fi

@@ -1,6 +1,6 @@
-# collision_core.cyr -- narrowphase, contact solving, hull and triangulation
+# collision_core.cyr -- contact solving
 # Usage: shipped inside dist/hisab.cyr; in-tree, include "src/collision_core.cyr" after what it requires
-# Requires: src/error.cyr, src/vec2.cyr (stdlib resolves via cyrius.cyml [deps])
+# Requires: src/error.cyr (stdlib resolves via cyrius.cyml [deps])
 #
 # MPR/XenoCollide (mpr_intersect, mpr_penetration) lived here through 3.2.x and
 # reached into geo_advanced.cyr's EPA helpers; 3.3.0 moved it into geo_advanced.cyr
@@ -8,16 +8,19 @@
 # include set, and out of collision_mesh's.
 #
 # Provides:
-#   Sequential impulse solver
-#   Convex hull 2D (Andrew's monotone chain, heapsort pre-pass)
-#   Polygon triangulation (ear clipping)
+#   Sequential impulse solver (ColContact, contact_new, contact_new_fric, sequential_impulse)
+#
+# 3.4.1 moved the 2D convex hull (convex_hull_2d) and polygon triangulation
+# (triangulate_polygon) to collision_mesh.cyr, beside delaunay_2d's exact orientation
+# predicate, which both now use; that took vec2 out of this file's include set.
 #
 # From 2.6.15 through 3.3.1 this list also said "+ PGS/LCP". No PGS solver was
 # ever in this file: it is in linalg_ext.cyr -- `solve_pgs` from 2.0.0 through 3.3.7, and
 # since 3.4.0 `solve_pgs_checked`, which retired it.
 #
 # NOT here -- Delaunay triangulation, half-edge mesh and island detection moved
-# to collision_mesh.cyr when this file was split at 2.2.2. Through 2.6.14 the
+# to collision_mesh.cyr when this file was split at 2.2.2 (the hull and the
+# triangulation followed in 3.4.1). Through 2.6.14 the
 # header still named the pre-split file (`collision.cyr`, which does not exist)
 # and still advertised all three.
 
@@ -34,6 +37,30 @@
 var _COL_F64_ZERO     = 0;
 # Nothing in src/ reads this one; tests/modules.tcyr's `_np9_depth` does.
 var _COL_F64_NEG_INF  = 0xFFF0_0000_0000_0000;  # -Infinity
+
+# sequential_impulse's closed form (3.4.1, lane CO2; `_col_si_closed`): the gate on |pen|
+# (below 2^-969 the closed form answers), the exponent field, and the exact powers of two
+# its scalings multiply by. NORM_LO and NEG_INF bound the bit patterns the sweep sorts a
+# normal impulse by (lane CO4): as signed integers, a positive normal is in [NORM_LO, EXP),
+# +Inf and +NaN at or above EXP, a negative finite value or -0 below NEG_INF, and -Inf,
+# -NaN, +0 and the positive subnormals between NEG_INF and NORM_LO. NORM_LO is also the
+# bound of the inverse-mass test (as F64_TINY was).
+enum _ColSi {
+    _COL_SI_PEN_LO = 0x0360_0000_0000_0000;     # 2^-969
+    _COL_SI_EXP = 0x7FF0_0000_0000_0000;        # inf: the exponent field, all ones for Inf and NaN
+    _COL_SI_NORM_LO = 0x0010_0000_0000_0000;    # 2^-1022
+    _COL_SI_NEG_INF = 0xFFF0_0000_0000_0000;    # -inf
+    _COL_SI_P2_64 = 0x43F0_0000_0000_0000;      # 2^64
+    _COL_SI_P2_1000 = 0x7E70_0000_0000_0000;    # 2^1000
+    _COL_SI_P2_M1000 = 0x0170_0000_0000_0000;   # 2^-1000
+    _COL_SI_P2_M1022 = 0x0010_0000_0000_0000;   # 2^-1022
+    _COL_SI_TOP = 0x7FE0_0000_0000_0000;        # 2^1023
+    _COL_SI_DBL_MAX = 0x7FEF_FFFF_FFFF_FFFF;    # 1.7976931348623157e308
+    # Dekker's splitter, 2^27 + 1.
+    _COL_SI_SPLIT = 0x41A0_0000_0200_0000;      # 134217729.0
+    _COL_SI_P2_M99 = 0x39C0_0000_0000_0000;     # 2^-99
+    _COL_SI_SIGN = 0x8000_0000_0000_0000;       # the sign-bit mask
+}
 
 # ================================================================
 # 1. Sequential Impulse Solver
@@ -70,6 +97,10 @@ public struct ColContact {
     inv_mass_a; inv_mass_b; tangent_vel;
 }
 
+# A contact for sequential_impulse, with every field of the layout above as given
+# (nothing is checked or normalised here: the solver reads the masses, penetration,
+# friction, restitution and tangent_vel; `normal` is carried for the caller). Returns the
+# ColContact pointer, or 0 when its allocation is refused.
 public fn contact_new_fric(body_a, body_b, normal, penetration, friction, restitution,
   inv_mass_a, inv_mass_b, tangent_vel) {
     var c = alloc(sizeof(ColContact));
@@ -102,10 +133,57 @@ public fn contact_new(body_a, body_b, normal, penetration, friction, restitution
 #   Layout: [n0, f0, n1, f1, ...] -- total 16*n bytes
 #   n_i is the normal impulse, >= 0. f_i is the SIGNED friction impulse along the
 #   caller's tangent t^ (the one ColContact.tangent_vel was taken along), so it
-#   is negative for a positive tangent_vel; |f_i| <= friction * n_i always.
+#   is negative for a positive tangent_vel; |f_i| <= friction * n_i for the EXACT n_i (the
+#   cone is friction times the exact impulse, so where n_i is subnormal or rounds to 0, |f_i|
+#   can exceed friction times the n_i returned: pen 7 2^-900 over 5 2^174 with friction 2^100
+#   gives n_i = 2^-1074 and f_i = -1.4 2^-974, the exact answer).
 # Returns: Ok(0) on success and for n <= 0 (a no-op frame, which was the
 #   incumbent behaviour and is now contracted); Err(HSB_ERR_INVALID_INPUT) if
 #   `contacts` is null or `n` exceeds `vec_len(contacts)`.
+# The contacts do not couple, so each one's exact answer is the closed form
+#   n_i = max(0, (1 + e) pen / (ima + imb)),  f_i = clamp(-tangent_vel / (ima + imb), +-friction * n_i),
+#   and one sweep computes it. n_i rounds four times (e pen, the sum, ima + imb, the quotient), and
+#   a cone f_i a fifth, the last of them half an ulp of the result and each other at most one:
+#   within 3.5 ulp (n_i) and 4.5 ulp (f_i) to first order. A further sweep swaps the quotient for
+#   the product and the sum it re-reads, which weigh e / (1 + e) more, so for every finite input with
+#   e >= 0 and any sweep count n_i is within 5 ulp and f_i within 6. Those bounds hold on every
+#   sample; the largest errors measured are 3.24 ulp (n_i) and 3.23 ulp (f_i) over 1,200,000 plain
+#   random contacts (every mass, e to 2^900, 1 to 200 sweeps, half with the cone active; 1,199,927
+#   n_i and 600,214 f_i compared), and 3.82 ulp (f_i) from a hill-climb on a bit-exact replica.
+#   [measured: review pass CO8 gsi2.py and asi.py seeds 1, 2, 3, 7, 3.4.1-dev (Fraction oracle); cycc 6.7.18]
+#   [measured: lane CO7 3.4.1 si_ulp2.py seeds 1-2 (Fraction oracle, e to 2^20, 1-7 sweeps); cycc 6.7.18]
+#   +Inf (f_i +-Inf) comes exactly where the value reaches DBL_MAX + ulp/2, the point IEEE rounds
+#   to +Inf: an impulse in the top binade, a cone that clamps an infinite -v_t / M there, and an
+#   unclamped -v_t / M there have that decided on the exact sum ima + imb (_col_si_top, review
+#   passes CO6 and CO7), so no rounding carries one past it or back (pen 0x7E7F1446BFAEDA86 over
+#   3/4 with friction 0x4158B607D79F8B9F and tangent_vel DBL_MAX: f_i was -Inf through CO5, exact
+#   -DBL_MAX; pen 2^60, friction 2^1000, ima 0x3FE0D97EDE28CA10, imb 0x3C87178DD38DA17F,
+#   tangent_vel 0xFFE0D97EDE28CA10: f_i +Inf through CO6, exact DBL_MAX).
+#   The cone is friction times the exact n_i: a contact whose n_i is subnormal, or positive
+#   and rounded to 0, is solved in closed form from the impulse before its last rounding (3.4.1,
+#   lane CO4). Through lane CO2 the cone was friction times the n_i returned, and the subnormal
+#   grid's rounding put f_i up to friction/2 units of 2^-1074 off: 3,555 of 14,000 contacts
+#   with friction 2^4..2^600 beyond 2 ulp, as in 3.4.0, and every one of 14,000 whose n_i
+#   underflowed. e < 0 is outside the physical domain (same formula; 1 + e near 0 cancels).
+#   ⚠ The iteration count moves the BITS, not the value. Later sweeps re-round the accumulated
+#   impulse: over 20,000 ordinary contacts (masses 0.01-10, |pen| up to 0.1 with a third 0,
+#   e, mu and tangent_vel mixed) 1,798 differ between 1 and 4 sweeps, by at most 2 ulp, and
+#   every sweep count stays within 2 ulp of the exact value. (The first 3.4.1 draft said any
+#   iterations >= 1 gives the same impulses; that was false.) A contact the sweep would lose
+#   (the gate in the loop) is re-solved in closed form each sweep, so an impulse past DBL_MAX
+#   is +Inf at every count, where through 3.4.0 and the first 3.4.1 draft it was NaN from the
+#   second. Over the 248,279 contacts of 18 families built round those edges (CO2's 12 -- overflow,
+#   subnormal, wide -- and 6 of subnormal and underflowed impulses under friction up to 2^1023),
+#   0 beyond 2 ulp; that is those families, not a bound (see the 3.24 above).
+#   [measured: lane CO2 3.4.1 si_ord.py seeds 1-2 and si2.py seeds 1-7 (Fraction oracle); cycc 6.7.18]
+#   [measured: lane CO4 3.4.1 si4.py seeds 1-7 (Fraction oracle, CO2's families + 6), CO2 tree and this; cycc 6.7.18]
+#   Edge cases, as the code delivers them:
+#   - iterations <= 0 runs no sweep: every slot of the first n contacts is +0.0, with Ok(0).
+#   - ima + imb <= 0 (both static) leaves the contact's slots at +0.0. A NaN in any field the
+#     answer reads gives NaN there. A positive sum below DBL_MIN, or one past DBL_MAX from
+#     finite masses, is solved like any other (3.4.1).
+#   - friction <= 1e-12 or NaN (EPSILON_F64; mu is dimensionless, so an absolute bound is a
+#     legitimate one) skips the friction update: f_i stays +0.0 whatever tangent_vel is.
 #must_use
 public fn sequential_impulse(contacts, n, iterations, out_impulses) {
     # ⛔ THE ZEROING LOOP BELOW RUNS BEFORE THE FIRST `vec_get`, SO WITHOUT THIS
@@ -156,9 +234,15 @@ public fn sequential_impulse(contacts, n, iterations, out_impulses) {
         store64(out_impulses + zi * 16 + 8, _COL_F64_ZERO);
     }
 
+    # The contacts vec's data pointer, read once: its first word, the stdlib's documented
+    # layout (lib/vec.cyr: a vec's first 16 bytes are the slice {data, len}). Every index
+    # below is under n <= vec_len(contacts), checked above, so `vec_get`'s two bound tests
+    # and its call were spent on every contact of every sweep for nothing.
+    # [measured: lane CO2 3.4.1 sivar4.bcyr, 3.4.0's sweep with this read: 16x4 -7%, 64x8 -11%; cycc 6.7.18]
+    var cdata = load64(contacts);
     for (var it = 0; it < iterations; it = it + 1) {
         for (var ci = 0; ci < n; ci = ci + 1) {
-            var c = vec_get(contacts, ci);
+            var c = load64(cdata + ci * 8);
             var inv_mass = f64_add(ColContact_inv_mass_a(c), ColContact_inv_mass_b(c));
 
             # ⛔ `inv_mass` is a sum of INVERSE MASSES — units 1/mass — against an
@@ -167,105 +251,203 @@ public fn sequential_impulse(contacts, n, iterations, out_impulses) {
             # but genuinely dynamic bodies were skipped, and the contact's two
             # output slots kept the zeros the entry loop wrote: impulse exactly
             # +0.0, indistinguishable from a real zero-impulse contact.
-            # ⭐ The division is by `inv_mass`, so DBL_MIN is the test: below it
-            # there is no finite impulse to compute, and at 0 both really are
-            # static, which is the documented case this branch is for.
+            # ⭐ The division is by `inv_mass`, so the test is against 0, not against a
+            # length: at 0 (or below, which no body has) both really are static, which
+            # is the documented case this branch is for.
             # [measured: docs/audit/2026-09-09-epsilon-open.json]
-            if (f64_lt(inv_mass, F64_TINY) == 1) {
-                # Both bodies are static -- skip
+            # ⛔ 3.4.1 -- THROUGH 3.4.0 THE TEST WAS `inv_mass < DBL_MIN`, on the premise
+            # that below it "there is no finite impulse to compute". There is: lambda =
+            # pen / inv_mass is a ratio, and pen 0000000300000000 with inverse masses
+            # 0000000400000000 x 2 has lambda = 3/8 exactly (the x 2^1000 twin answers
+            # it), where the solver skipped the contact and answered 0 with Ok; pen 2^-100
+            # with inverse masses 2^-1027 likewise (exact 2^926).
+            # [measured: AU2-G5-F10 repros, the 3.4.0 base and this tree, lane CO 3.4.1; cycc 6.7.18]
+            # ⛔ 3.4.1 (lane CO2) -- THE SWEEP LOSES THREE MORE CLASSES OF FINITE INPUT, all
+            # older than 3.4.1: an impulse past DBL_MAX is +Inf after one sweep and NaN after
+            # two (Inf - Inf in the accumulation); a (1 + e) pen past DBL_MAX is +Inf where the
+            # impulse is finite (pen 1.5e308, e 0.98, inverse masses 3.2e4) and NaN after; and
+            # inverse masses whose sum overflows give NaN at once (0 * Inf). On the Fraction
+            # oracle 1,582, 812 and 2,000 of 2,000 such contacts were wrong (all but 159 NaN).
+            # And a pen below 2^-969 with a restitution lost up to 2,370 ulp (e pen rounds on
+            # the subnormal grid; 52 of 2,000), which a caller whose length and inverse-mass
+            # units are both tiny meets with ordinary numbers: lambda is scale-free there.
+            # [measured: lane CO2 3.4.1 si2.py seeds 1, 5 (Fraction oracle), 3.4.0 and the first draft; cycc 6.7.18]
+            # ⭐ The sweep keeps every contact it computes right, bit for bit, and hands the
+            # rest to `_col_si_closed`, the closed form on power-of-two-scaled operands:
+            # a positive inverse-mass sum below DBL_MIN (here) and a nonzero |pen| below
+            # 2^-969 (the exponent test below) before the sweep; after it, a normal or a
+            # friction impulse that is not finite (Inf, or NaN -- a NaN field reaches it so
+            # too, and comes out NaN), tested BEFORE its clamp, which would turn -Inf into 0.
+            # The first 3.4.1 draft solved the subnormal sum in "impulse units" inside the
+            # sweep, which put three branches on every contact's path (8-16% slower); these
+            # tests cost about what the data-pointer read above saves.
+            # [measured: lane RV-CO 3.4.1 rvbsi.bcyr 7 paired rounds, and lane CO2 3.4.1 sib.bcyr A/B; cycc 6.7.18]
+            # 3.4.1 (lane CO4): the test is an integer comparison on the sum's bits, which takes
+            # the same branch as the f64 one for every value but a negative NaN (its bits are
+            # negative); f64_le, false for NaN, then sends that to the closed form, which is where
+            # its NaN impulse came from before (the not-finite test below). Every contact pays
+            # this comparison, and its saving against the f64 one is half of what buys back the
+            # routing below (the doc block there).
+            if (inv_mass < _COL_SI_NORM_LO) {
+                if (f64_le(inv_mass, 0) == 0) {
+                    _col_si_closed(c, out_impulses + ci * 16);
+                }
+                # else both bodies are static (or the sum is -0 or negative) -- skip
             } else {
-                var normal = ColContact_normal(c);
                 var rest = ColContact_restitution(c);
                 var fric = ColContact_friction(c);
                 var pen = ColContact_penetration(c);
+                if ((pen & _COL_SI_EXP) < _COL_SI_PEN_LO && f64_eq(pen, 0) == 0) {
+                    _col_si_closed(c, out_impulses + ci * 16);
+                } else {
+                    # Relative velocity along normal (simplified -- use penetration as
+                    # proxy). In a full solver the caller supplies rel_velocities; here a
+                    # penetration-based approaching velocity (negative) drives separation.
+                    var v_n = pen ^ _COL_SI_SIGN;
 
-                # Relative velocity along normal (simplified -- use penetration as
-                # proxy). In a full solver the caller supplies rel_velocities; here a
-                # penetration-based approaching velocity (negative) drives separation.
-                var v_n = f64_neg(pen);
+                    # RESTITUTION IS A BIAS ON THE TARGET VELOCITY, APPLIED ONCE.
+                    #
+                    # Through 2.8.2 the (1 + e) factor multiplied the *effective* velocity
+                    # -- the one that already carries the accumulated impulse -- so it was
+                    # re-applied on every sweep. That turns the update into the affine map
+                    # λ_{k+1} = -e·λ_k + (1+e)·pen/inv_mass, whose fixed point is only
+                    # reached when |e| < 1. At e = 1 it is a period-2 orbit: λ alternates
+                    # 0, 2·pen/inv_mass, 0, ... so an EVEN `iterations` returned 0 (no
+                    # impulse at all) and an ODD one returned twice the correct value. The
+                    # answer depended on the parity of a convergence parameter, and e > 1
+                    # diverged before the >= 0 clamp folded it back to the same orbit.
+                    #
+                    # The textbook formulation biases the TARGET velocity by -e times the
+                    # INITIAL approach velocity and drives the effective velocity to that
+                    # target, so e enters exactly once no matter how many sweeps run:
+                    #   v_bias = -e·v_n      (the separating speed we want after impact)
+                    #   Δλ     = -(v_eff - v_bias) / inv_mass
+                    # The update is now idempotent in exact arithmetic -- λ = (1 + e)·pen /
+                    # inv_mass after the first sweep, for every e >= 0 and every iteration
+                    # count; in floating point later sweeps re-round it (the doc block above).
+                    var v_bias = f64_mul(rest, v_n) ^ _COL_SI_SIGN;
 
-                # RESTITUTION IS A BIAS ON THE TARGET VELOCITY, APPLIED ONCE.
-                #
-                # Through 2.8.2 the (1 + e) factor multiplied the *effective* velocity
-                # -- the one that already carries the accumulated impulse -- so it was
-                # re-applied on every sweep. That turns the update into the affine map
-                # λ_{k+1} = -e·λ_k + (1+e)·pen/inv_mass, whose fixed point is only
-                # reached when |e| < 1. At e = 1 it is a period-2 orbit: λ alternates
-                # 0, 2·pen/inv_mass, 0, ... so an EVEN `iterations` returned 0 (no
-                # impulse at all) and an ODD one returned twice the correct value. The
-                # answer depended on the parity of a convergence parameter, and e > 1
-                # diverged before the >= 0 clamp folded it back to the same orbit.
-                #
-                # The textbook formulation biases the TARGET velocity by -e times the
-                # INITIAL approach velocity and drives the effective velocity to that
-                # target, so e enters exactly once no matter how many sweeps run:
-                #   v_bias = -e·v_n      (the separating speed we want after impact)
-                #   Δλ     = -(v_eff - v_bias) / inv_mass
-                # The update is now idempotent -- λ = (1 + e)·pen / inv_mass after the
-                # first sweep, for every e >= 0 and every iteration count.
-                var v_bias = f64_neg(f64_mul(rest, v_n));
+                    var old_impulse = load64(out_impulses + ci * 16);
+                    var v_n_eff = f64_add(v_n, f64_mul(old_impulse, inv_mass));
 
-                var old_impulse = load64(out_impulses + ci * 16);
-                var v_n_eff = f64_add(v_n, f64_mul(old_impulse, inv_mass));
+                    # Δλ = -(v_eff - v_bias) / inv_mass  (positive while still approaching)
+                    var delta = f64_div(f64_sub(v_n_eff, v_bias), inv_mass) ^ _COL_SI_SIGN;
 
-                # Δλ = -(v_eff - v_bias) / inv_mass  (positive while still approaching)
-                var delta = f64_neg(f64_div(f64_sub(v_n_eff, v_bias), inv_mass));
-
-                # Accumulate and clamp the *total* impulse >= 0
-                var new_impulse = f64_add(old_impulse, delta);
-                if (f64_lt(new_impulse, _COL_F64_ZERO) == 1) {
-                    new_impulse = _COL_F64_ZERO;
-                }
-                store64(out_impulses + ci * 16, new_impulse);
-
-                # FRICTION IS A COULOMB-CLAMPED ACCUMULATED IMPULSE.
-                #
-                # Through 2.8.4 this block LOADED the friction slot it had itself
-                # zeroed at entry, clamped that zero, and stored it back -- there
-                # was no update between the load and the clamp. |0| > mu*lambda_n
-                # is never true for a non-negative bound, so the friction impulse
-                # was identically 0 for every contact, at every mu, at every
-                # iteration count (measured: 0 of 320 sampled configs nonzero) and
-                # `friction` was a silently ignored parameter. It survived because
-                # every solver fixture used friction = 0, so the branch was never
-                # even entered.
-                # [measured: CHANGELOG.md 2.9.0, 0 of 320 sampled (mu, penetration, iteration) configurations]
-                #
-                # The tangential constraint drives the relative sliding speed to
-                # zero, using the same effective-velocity convention as the normal
-                # path above (the accumulated impulse folded back into the
-                # velocity it already produced):
-                #   v_t_eff = v_t + lambda_t * inv_mass
-                #   dlambda = -(v_t_eff - 0) / inv_mass
-                #   lambda_t = clamp(lambda_t + dlambda, -mu*lambda_n, +mu*lambda_n)
-                # The accumulate-then-clamp order is what makes it Coulomb rather
-                # than a per-sweep cap: the clamp bounds the TOTAL tangential
-                # impulse, so a contact that saturates stays saturated instead of
-                # gaining another mu*lambda_n on the next sweep.
-                #
-                # The unclamped update telescopes to lambda_t = -v_t / inv_mass --
-                # reached in ONE sweep and idempotent thereafter, so the answer
-                # does not depend on `iterations`, exactly like the 2.8.3
-                # restitution repair. Clamped, the closed form is
-                #   lambda_t = clamp(-v_t / inv_mass, +/- mu * lambda_n)
-                # and the sign always opposes v_t, since -v_t/inv_mass and the
-                # saturated bound -sign(v_t)*mu*lambda_n both do.
-                if (f64_gt(fric, EPSILON_F64) == 1) {
-                    var v_t = ColContact_tangent_vel(c);
-                    # Cone half-width: mu times the normal impulse just solved.
-                    var max_fric = f64_mul(fric, new_impulse);
-                    var old_fric = load64(out_impulses + ci * 16 + 8);
-                    var v_t_eff = f64_add(v_t, f64_mul(old_fric, inv_mass));
-                    var new_fric = f64_sub(old_fric, f64_div(v_t_eff, inv_mass));
-                    # Clamp the TOTAL tangential impulse into the Coulomb cone.
-                    if (f64_gt(f64_abs(new_fric), max_fric) == 1) {
-                        if (f64_lt(new_fric, _COL_F64_ZERO) == 1) {
-                            new_fric = f64_neg(max_fric);
+                    # Accumulate and clamp the *total* impulse >= 0 -- once it is known to be
+                    # finite (a second sweep whose old impulse times inv_mass overflows
+                    # reaches -Inf here: pen 1.5e308, e 0.98, inv_mass 3.2e4 stored 0 where
+                    # the impulse is 9.4e303).
+                    # [measured: lane CO2 3.4.1 si2.py seed 1, num_overflow, the check after the clamp; cycc 6.7.18]
+                    var new_impulse = f64_add(old_impulse, delta);
+                    # ⛔ 3.4.1 (lane CO4) -- A SUBNORMAL IMPULSE PUT THE CONE OFF BY UP TO
+                    # friction/2 UNITS OF 2^-1074, and one that underflowed to 0 lost the cone
+                    # outright. The cone below is friction times the n_i just ROUNDED, and on the
+                    # subnormal grid that rounding is up to 2^-1075 absolute: pen 7 2^-900 over
+                    # 5 2^174 has n = 1.4 2^-1074, rounded to 2^-1074, so with friction 2^100 the
+                    # friction came back -2^-974 where it is -1.4 2^-974; pen 2^-900 over 2^200
+                    # (n = 2^-1100, rounded to 0) with friction 2^300 gave -0 for -2^-800. On the
+                    # Fraction oracle 525 of 2,000 contacts with friction 2^4..2^600 were wrong.
+                    # [measured: lane CO4 3.4.1 si4.py seed 1 on the CO2 tree (s6); cycc 6.7.18]
+                    # ⭐ Those contacts go to the closed form, whose cone is friction times the
+                    # EXACT impulse; it writes both slots, the store below writes its n_i back,
+                    # and fric = 0 skips the friction update. One integer test on the bits sorts
+                    # out a positive normal impulse below 2^1023 -- as an unsigned number b - DBL_MIN
+                    # is below 2^1023 - DBL_MIN exactly then, and its top 12 bits below 2045 -- and
+                    # nothing else is asked of it. The rest: a negative finite value (or -0) is
+                    # clamped to +0, as before; a positive value in the top binade (its overflow is
+                    # decided there, lane CO6), -Inf, -NaN, +Inf, +NaN (the sweep has lost them; a
+                    # check after the clamp would store 0 for -Inf), a positive subnormal, and +0
+                    # from a positive pen (the exact impulse is positive and underflowed) go to the
+                    # closed form; +0 from pen <= 0 is the sweep's own answer.
+                    # ⚠ In this codegen every comparison on the per-contact path costs: one test
+                    # that is never true put the 64-contact mixed fixture 4-5% slower, and eight
+                    # earlier routing forms cost it 1-7%. This form replaces the f64
+                    # clamp and the Inf/NaN test by the integer tests above, and the inverse-mass
+                    # test by an integer one. Same-binary variants against the CO2 form: 16
+                    # ordinary contacts 0.90-0.92x its time, 16 separating 0.91-0.93x, 16 at pen
+                    # 0 0.95-0.96x, the 64 mixed 0.99-1.00x; tree against tree, the 64 mixed
+                    # 0.98-1.03x a round. A routed contact pays the closed form, 4-5x a sweep.
+                    # [measured: lane CO4 3.4.1 sib11/sib15 same-binary variants, hisab.bcyr A/B x4; cycc 6.7.18]
+                    if (((new_impulse - _COL_SI_NORM_LO) >> 52) >= 2045) {
+                        if (new_impulse < _COL_SI_NEG_INF) {
+                            # Negative and finite (or -0): clamp the total impulse at +0.
+                            new_impulse = _COL_F64_ZERO;
                         } else {
-                            new_fric = max_fric;
+                            if ((new_impulse | (pen > 0)) != 0) {
+                                _col_si_closed(c, out_impulses + ci * 16);
+                                new_impulse = load64(out_impulses + ci * 16);
+                                fric = 0;
+                            }
                         }
                     }
-                    store64(out_impulses + ci * 16 + 8, new_fric);
+                    store64(out_impulses + ci * 16, new_impulse);
+
+                    # FRICTION IS A COULOMB-CLAMPED ACCUMULATED IMPULSE.
+                    #
+                    # Through 2.8.4 this block LOADED the friction slot it had itself
+                    # zeroed at entry, clamped that zero, and stored it back -- there
+                    # was no update between the load and the clamp. |0| > mu*lambda_n
+                    # is never true for a non-negative bound, so the friction impulse
+                    # was identically 0 for every contact, at every mu, at every
+                    # iteration count (measured: 0 of 320 sampled configs nonzero) and
+                    # `friction` was a silently ignored parameter. It survived because
+                    # every solver fixture used friction = 0, so the branch was never
+                    # even entered.
+                    # [measured: CHANGELOG.md 2.9.0, 0 of 320 sampled (mu, penetration, iteration) configurations]
+                    #
+                    # The tangential constraint drives the relative sliding speed to
+                    # zero, using the same effective-velocity convention as the normal
+                    # path above (the accumulated impulse folded back into the
+                    # velocity it already produced):
+                    #   v_t_eff = v_t + lambda_t * inv_mass
+                    #   dlambda = -(v_t_eff - 0) / inv_mass
+                    #   lambda_t = clamp(lambda_t + dlambda, -mu*lambda_n, +mu*lambda_n)
+                    # The accumulate-then-clamp order is what makes it Coulomb rather
+                    # than a per-sweep cap: the clamp bounds the TOTAL tangential
+                    # impulse, so a contact that saturates stays saturated instead of
+                    # gaining another mu*lambda_n on the next sweep.
+                    #
+                    # The unclamped update telescopes to lambda_t = -v_t / inv_mass --
+                    # reached in ONE sweep and idempotent thereafter (in exact
+                    # arithmetic), so the answer does not depend on `iterations`,
+                    # exactly like the 2.8.3 restitution repair. Clamped, the closed
+                    # form is
+                    #   lambda_t = clamp(-v_t / inv_mass, +/- mu * lambda_n)
+                    # and the sign always opposes v_t, since -v_t/inv_mass and the
+                    # saturated bound -sign(v_t)*mu*lambda_n both do.
+                    if (f64_gt(fric, EPSILON_F64) == 1) {
+                        var v_t = ColContact_tangent_vel(c);
+                        # Cone half-width: mu times the normal impulse just solved.
+                        var max_fric = f64_mul(fric, new_impulse);
+                        var old_fric = load64(out_impulses + ci * 16 + 8);
+                        var v_t_eff = f64_add(v_t, f64_mul(old_fric, inv_mass));
+                        var new_fric = f64_sub(old_fric, f64_div(v_t_eff, inv_mass));
+                        # Not finite: the closed form. A -v_t / inv_mass past DBL_MAX is
+                        # +-Inf on the first sweep; under a finite cone the clamp would
+                        # place it right, but under an infinite one (mu lambda_n past
+                        # DBL_MAX) it was kept, and the next sweep made NaN of it (Inf -
+                        # Inf): pen 2^1000 over 2^-10 with mu 2^20, v_t 2^1020. A finite
+                        # quotient needs no such care. This one divides by the rounded sum,
+                        # which can carry it past DBL_MAX + ulp/2 but never back: v_t / fl(M)
+                        # below T = 2^1024 - 2^970 puts v_t a grid step under 2^1024 fl(M), which
+                        # is on v_t's grid, and M, within half an ulp, cannot bring T M to it.
+                        # Over 1,500,000 contacts none was finite here and past T, and 26,370 infinite
+                        # here and below it.
+                        # [measured: lane CO7 sweep.py on the Fraction oracle, cycc 6.7.18; 2026-11-01]
+                        if ((new_fric & _COL_SI_EXP) == _COL_SI_EXP) {
+                            _col_si_closed(c, out_impulses + ci * 16);
+                        } else {
+                            # Clamp the TOTAL tangential impulse into the Coulomb cone.
+                            if (f64_gt(f64_abs(new_fric), max_fric) == 1) {
+                                if (f64_lt(new_fric, _COL_F64_ZERO) == 1) {
+                                    new_fric = max_fric ^ _COL_SI_SIGN;
+                                } else {
+                                    new_fric = max_fric;
+                                }
+                            }
+                            store64(out_impulses + ci * 16 + 8, new_fric);
+                        }
+                    }
                 }
             }
         }
@@ -273,518 +455,309 @@ public fn sequential_impulse(contacts, n, iterations, out_impulses) {
     return Ok(0);
 }
 
-# ================================================================
-# 2. Convex Hull 2D -- Andrew's Monotone Chain
-# ================================================================
-# Input: points = vec of HVec2 pointers, n = vec_len(points)
-# Returns: vec of indices into the original points array (CCW order)
-
-# 2D cross product of vectors OA and OB: (A-O) x (B-O)
-fn _col_cross2d(ox, oy, ax, ay, bx, by) {
-    return f64_sub(f64_mul(f64_sub(ax, ox), f64_sub(by, oy)),
-      f64_mul(f64_sub(ay, oy), f64_sub(bx, ox)));
+# floor(log2 |x|) for a finite nonzero x, subnormals included.
+fn _col_si_ilogb(x) {
+    var b = (x >> 52) & 0x7FF;
+    if (b != 0) { return b - 1023; }
+    return ((f64_mul(x, _COL_SI_P2_64) >> 52) & 0x7FF) - 1087;
 }
 
-# Order predicate for the hull pre-sort: is the point at index `ia` strictly
-# after the point at index `ib` in (x, then y) ascending order?
-#
-# x-equality is EXACT since 2.15.0 (it used the insertion sort's EPSILON_F64
-# band from 2.6.15 to 2.14.0; see the comment inside for why a tolerance is
-# not an order), so the ordering is the pre-2.6.15 one with exact ties.
-fn _col_xy_greater(points, ia, ib) {
-    var pa = vec_get(points, ia);
-    var pb = vec_get(points, ib);
-    var ax = HVec2_x(pa);
-    var bx = HVec2_x(pb);
-    # ⛔ A SORT COMPARATOR WITH A TOLERANCE IS NOT AN ORDER. `|ax - bx|` is a
-    # LENGTH in the caller's units, so which points compared "equal" changed with
-    # the unit — and an epsilon-equality is not transitive, so the relation this
-    # produced was not a total order at all. A sort driven by a non-order does not
-    # merely mis-rank: it can drop or duplicate elements, and the hull built on it
-    # inherits that silently, with no error channel.
-    # ⭐ Exact lexicographic comparison. It is total, transitive and scale-free by
-    # construction, and it is what the neighbouring `_col_point_in_tri` already
-    # does with the same kind of quantity.
-    # [measured: docs/audit/2026-09-09-epsilon-open.json]
-    if (f64_gt(ax, bx) == 1) { return 1; }
-    if (f64_eq(ax, bx) == 1) {
-        if (f64_gt(HVec2_y(pa), HVec2_y(pb)) == 1) { return 1; }
+# x 2^k for a finite x and any k: exact when the result is normal, rounded once when it is
+# subnormal, +-Inf past DBL_MAX and +-0 far below 2^-1074. Each step below is a product by
+# a normal power of two that keeps the value normal, so only the last can round.
+fn _col_si_ldexp(x, k) {
+    if (f64_eq(x, 0) == 1) { return x; }
+    var e = _col_si_ilogb(x);
+    var t = e + k;
+    if (t > 1023) { return f64_mul(x, F64_POS_INF); }
+    if (t < 0 - 1080) { return f64_mul(x, 0); }
+    # x to [1, 2): by 2^-e, in two steps when e is outside a power's normal range.
+    if (e > 1022) {
+        x = f64_mul(x, _COL_SI_P2_M1022);
+        e = e - 1022;
     }
+    if (e < 0 - 1000) {
+        x = f64_mul(x, _COL_SI_P2_1000);           # exact: x was below 2^-1000
+        e = e + 1000;
+    }
+    x = f64_mul(x, (1023 - e) << 52);
+    if (t < 0 - 1022) {
+        x = f64_mul(x, _COL_SI_P2_M1000);          # into [2^-1000, 2^-999): exact
+        t = t + 1000;
+    }
+    return f64_mul(x, (1023 + t) << 52);
+}
+
+# (n / d) 2^k for a finite nonzero n and d in [1, 2), rounded ONCE: the quotient scaled
+# exactly when the result is normal; when it is subnormal, one division of exactly scaled
+# operands -- n 2^a in [2^-1020, 2^-1019) over d 2^(a - k), whose exponent a - k is then
+# between 1 and 61 -- so a subnormal result is the correctly rounded quotient, as the
+# sweep's own division gives it. Below 2^-1080 the result is +-0.
+fn _col_si_quot(n, d, k) {
+    var q = f64_div(n, d);
+    var t = _col_si_ilogb(q) + k;
+    if (t < 0 - 1022 && t >= 0 - 1080) {
+        var a = 0 - 1020 - _col_si_ilogb(n);
+        return f64_div(_col_si_ldexp(n, a), _col_si_ldexp(d, a - k));
+    }
+    return _col_si_ldexp(q, k);
+}
+
+# x y as p[0] + p[1] exactly (Dekker's two-product), for |x| and |y| below 2^995 with every
+# partial product clear of the subnormals (3.4.1, review pass CO6: _col_si_top keeps its
+# operands in [2^-160, 4]).
+fn _col_si_tp(x, y, p) {
+    var sx = f64_mul(x, _COL_SI_SPLIT);
+    var xh = f64_sub(sx, f64_sub(sx, x));
+    var xl = f64_sub(x, xh);
+    var sy = f64_mul(y, _COL_SI_SPLIT);
+    var yh = f64_sub(sy, f64_sub(sy, y));
+    var yl = f64_sub(y, yh);
+    var pr = f64_mul(x, y);
+    store64(p, pr);
+    store64(p + 8, f64_add(f64_add(f64_add(f64_sub(f64_mul(xh, yh), pr), f64_mul(xh, yl)), f64_mul(xl, yh)),
+        f64_mul(xl, yl)));
     return 0;
 }
 
-# Sift `root` down through a max-heap of size `n` held in `indices`.
-fn _col_sift_down(indices, points, root, n) {
-    var r = root;
-    var sifting = 1;
-    while (sifting == 1) {
-        var child = r * 2 + 1;
-        if (child >= n) {
-            sifting = 0;
+# b added EXACTLY into the expansion e[0..n) (non-overlapping, smallest first; Shewchuk's
+# GROW-EXPANSION with zero elimination). Returns the new length; the expansion's sign is its
+# last component's, and it is zero exactly when its length is 0.
+fn _col_si_grow(e, n, b) {
+    if (f64_eq(b, 0) == 1) { return n; }
+    var q = b;
+    var k = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var a = load64(e + i * 8);
+        var s = f64_add(q, a);
+        var bb = f64_sub(s, q);
+        var h = f64_add(f64_sub(q, f64_sub(s, bb)), f64_sub(a, bb));
+        if (f64_eq(h, 0) == 0) {
+            store64(e + k * 8, h);
+            k = k + 1;
+        }
+        q = s;
+    }
+    if (f64_eq(q, 0) == 0) {
+        store64(e + k * 8, q);
+        k = k + 1;
+    }
+    return k;
+}
+
+# mu ps (1 + rest) / (ms + msl) 2^k rounded to nearest with the OVERFLOW DECIDED EXACTLY (3.4.1,
+# review passes CO6 and CO7): the impulse (mu = 1), the friction cone (mu the friction's
+# significand) or -v_t / M (mu = 1, rest = 0) of _col_si_closed where its float value reached
+# the top binade, the one place where the closed form's roundings (of ima + imb among them) can
+# carry a value across DBL_MAX + ulp/2 (or back): pen 0x7E7F1446BFAEDA86 over 3/4 with friction
+# 0x4158B607D79F8B9F has the cone 1.8e-17 below that threshold, and mu times the rounded
+# impulse passed it (f -Inf; exact -DBL_MAX). Operands: ps in [1/4, 1/2), mu in [1, 2), rest
+# finite with 1 + rest > 0, and M = ia + ib as given (m = fl(ia + ib), ms = m 2^-em in [1, 2)):
+# TwoSum's error err makes ms + msl = ms + err 2^-em that sum exactly. The value is formed in
+# double-double -- ps rest split exact with rest on its own power of two, the quotient
+# corrected by its exact remainder, the product by mu split exact -- within 2^-100 of itself,
+# so below the top binade it is the correctly rounded value but within 2^-100 of a rounding
+# boundary. In the top binade, +Inf or DBL_MAX is decided against the threshold T = 2^1024 -
+# 2^970 (the rounding boundary IEEE overflows at; T itself rounds to +Inf, ties to even): at
+# 2^1025 and past it +Inf at once; by the double-double where it is more than 2^-99 of the
+# value away from T; and otherwise by the exact sign of
+#   S = mu ps (1 + rest) 2^-E - T 2^-K (ms + err 2^-em),
+# a non-overlapping expansion of the split products (_col_si_grow) held on ONE scale, 2^900
+# above the value: every term of the numerator is then exact on it (mu ps 2^-E down to 2^-1125
+# with E <= 1023, mu ps rest below 2^-1074 with its 159 bits, both above 2^-300 of 2^900 x 1).
+# Only err's two terms can fall off the normal range, and only where |err 2^-em T 2^-K| is
+# below 2^-1868 of the value; err is then under an M of 2^734 or more, which the impulse only
+# reaches with rest past 2^733, whose 1 + rest is inexact: mu ps then lies below every bit of
+# mu ps rest and of T M, so the rest of S is not 0, and no smaller than 2^-1233 of the value:
+# err's rounded terms cannot change its sign. (The cone asks this only under an infinite
+# -v_t / M, so M below 1, and -v_t / M has rest 0 and its v_t below 2^1024, so M below 2^1.)
+fn _col_si_top(ps, rest, ms, ia, ib, m, em, mu, k) {
+    var pr: i64[2];
+    # err = ia + ib - m, TwoSum's.
+    var zm = f64_sub(m, ia);
+    var err = f64_add(f64_sub(ia, f64_sub(m, zm)), f64_sub(ib, zm));
+    var msl = _col_si_ldexp(err, 0 - em);
+    # num = ps + ps rest on the scale 2^E of its larger term (rest = rs 2^er).
+    var a = 0;
+    var b = 0;
+    var er = 0;
+    var ee = 0;
+    if (f64_eq(rest, 0) == 0) {
+        er = _col_si_ilogb(rest);
+        _col_si_tp(ps, _col_si_ldexp(rest, 0 - er), &pr);
+        a = load64(&pr);
+        b = load64(&pr + 8);
+        if (er > 0) { ee = er; }
+    }
+    var u1 = _col_si_ldexp(ps, 0 - ee);
+    var u2 = _col_si_ldexp(a, er - ee);
+    var nh = f64_add(u1, u2);
+    var z = f64_sub(nh, u1);
+    var nl = f64_add(f64_add(f64_sub(u1, f64_sub(nh, z)), f64_sub(u2, z)), _col_si_ldexp(b, er - ee));
+    # q = (nh + nl) / (ms + msl): qh, then the exact remainder's correction.
+    var qh = f64_div(nh, ms);
+    _col_si_tp(qh, ms, &pr);
+    var rho = f64_add(f64_sub(f64_sub(nh, load64(&pr)), load64(&pr + 8)), nl);
+    var ql = f64_div(f64_sub(rho, f64_mul(qh, msl)), ms);
+    # x = mu q.
+    _col_si_tp(mu, qh, &pr);
+    var xh = load64(&pr);
+    var xl = f64_add(load64(&pr + 8), f64_mul(mu, ql));
+    var xs = f64_add(xh, xl);
+    var xt = f64_sub(xl, f64_sub(xs, xh));
+    var kt = k + ee;
+    var v = _col_si_ldexp(xs, kt);
+    if (v < _COL_SI_DBL_MAX) { return v; }
+    # At 2^1025 and past it: +Inf, wherever the scale has gone (kt reaches 4145 for a cone).
+    if (_col_si_ilogb(xs) + kt > 1024) { return _COL_SI_EXP; }
+    # The top: +Inf exactly when x >= T 2^-kt = P - P 2^-54, P = 2^(1024 - kt) (within a factor
+    # of two of xs, itself in [2^-60, 8]: the sum in num cancels by 53 bits at most).
+    var pp = (2047 - kt) << 52;
+    var g = f64_add(f64_add(f64_sub(xs, pp), f64_mul(pp, 0x3C90000000000000)), xt);  # 2^-54
+    var sg = 0;
+    if (f64_gt(f64_abs(g), f64_mul(xs, _COL_SI_P2_M99)) == 1) {
+        sg = 1;
+        if (f64_lt(g, 0) == 1) { sg = 0 - 1; }
+    } else {
+        # The exact sign of S (above), all of it times 2^900.
+        var ex: i64[12];
+        var n = 0;
+        _col_si_tp(mu, ps, &pr);
+        n = _col_si_grow(&ex, n, _col_si_ldexp(load64(&pr + 8), 900 - ee));
+        n = _col_si_grow(&ex, n, _col_si_ldexp(load64(&pr), 900 - ee));
+        if (f64_eq(rest, 0) == 0) {
+            _col_si_tp(mu, b, &pr);
+            n = _col_si_grow(&ex, n, _col_si_ldexp(load64(&pr + 8), 900 + er - ee));
+            n = _col_si_grow(&ex, n, _col_si_ldexp(load64(&pr), 900 + er - ee));
+            _col_si_tp(mu, a, &pr);
+            n = _col_si_grow(&ex, n, _col_si_ldexp(load64(&pr + 8), 900 + er - ee));
+            n = _col_si_grow(&ex, n, _col_si_ldexp(load64(&pr), 900 + er - ee));
+        }
+        n = _col_si_grow(&ex, n, _col_si_ldexp(err, 1870 - kt - em));
+        n = _col_si_grow(&ex, n, _col_si_ldexp(err, 1924 - kt - em) ^ _COL_SI_SIGN);
+        n = _col_si_grow(&ex, n, _col_si_ldexp(ms, 1870 - kt));
+        n = _col_si_grow(&ex, n, _col_si_ldexp(ms, 1924 - kt) ^ _COL_SI_SIGN);
+        if (n > 0) {
+            sg = 1;
+            if (f64_lt(load64(&ex + (n - 1) * 8), 0) == 1) { sg = 0 - 1; }
+        }
+    }
+    if (sg >= 0) { return _COL_SI_EXP; }   # +Inf: at or past T
+    return _COL_SI_DBL_MAX;
+}
+
+# One contact's closed form (the doc block of sequential_impulse), written to slot[0] and,
+# when friction > EPSILON_F64, slot[1]: n = max(0, (1 + e) pen / M), f = clamp(-v_t / M,
+# +-mu n), M = ima + imb > 0. Every operand is first brought to [1/4, 2) by a power of two,
+# so nothing overflows or flushes before the one scaling at the end (`_col_si_quot`): the
+# normal impulse is pen' + e pen' over M' and the friction v_t' over M', each then times 2^k.
+# The cone is mu times the n returned, as in the sweep, where that n is normal; otherwise it
+# is mu' q' times 2^k, from the impulse before its last rounding: where n rounds to +Inf, so
+# a cone under DBL_MAX still clamps the friction (pen 2^1000 over 2^-30 with mu 2^-30: n
+# +Inf, f -2^1000), and where n is subnormal or underflowed to 0 (lane CO4), whose rounding
+# on the subnormal grid is up to 2^-1075 absolute, which mu then multiplies (pen 2^-900 over
+# 2^200 with mu 2^300: n 0, f -2^-800). Where -v_t / M reaches the top binade _col_si_top
+# decides it on the exact sum, and the cone that clamps an infinite one. Inside the normal range the
+# impulses are the sweep's first-pass values (powers of two commute with rounding there,
+# except that e pen' does not round on the subnormal grid where e pen would); outside it each
+# is its closed form rounded about three times, or +-Inf past DBL_MAX. A NaN in any field it
+# reads gives NaN; an infinite one gives what the formula's arithmetic gives.
+fn _col_si_closed(c, slot) {
+    var ima = ColContact_inv_mass_a(c);
+    var imb = ColContact_inv_mass_b(c);
+    var pen = ColContact_penetration(c);
+    var rest = ColContact_restitution(c);
+    var fric = ColContact_friction(c);
+    var m = f64_add(ima, imb);
+    var mk = 0;
+    var ia = ima;
+    var ib = imb;
+    if (f64_eq(m, F64_POS_INF) == 1) {
+        # Finite masses whose sum overflowed (each is then >= 2^970, so halving is exact).
+        if (f64_lt(f64_abs(ima), F64_POS_INF) == 1 && f64_lt(f64_abs(imb), F64_POS_INF) == 1) {
+            ia = f64_mul(ima, F64_HALF);
+            ib = f64_mul(imb, F64_HALF);
+            m = f64_add(ia, ib);
+            mk = 1;
+        }
+    }
+    var fon = f64_gt(fric, EPSILON_F64);
+    var finite = 1;
+    if ((m & _COL_SI_EXP) == _COL_SI_EXP) { finite = 0; }
+    if ((pen & _COL_SI_EXP) == _COL_SI_EXP) { finite = 0; }
+    if ((rest & _COL_SI_EXP) == _COL_SI_EXP) { finite = 0; }
+    var lam = 0;
+    var bound = 0;
+    var bset = 0;
+    var em = 0;
+    var ms = m;
+    var ep = 0;
+    var ps = 0;
+    var num = 0;
+    if (finite == 1) {
+        em = _col_si_ilogb(m);
+        ms = _col_si_ldexp(m, 0 - em);
+        em = em + mk;
+        if (f64_eq(pen, 0) == 0) {
+            ep = _col_si_ilogb(pen) + 2;
+            ps = _col_si_ldexp(pen, 0 - ep);
+            num = f64_add(ps, f64_mul(rest, ps));
+            lam = _col_si_quot(num, ms, ep - em);
+            # In the top binade (or +Inf) the impulse's overflow is decided exactly (lane CO6).
+            if (lam >= _COL_SI_TOP && f64_gt(num, 0) == 1) {
+                lam = _col_si_top(ps, rest, ms, ia, ib, m, em - mk, F64_ONE, ep - em);
+            }
+            # Where n rounds to +Inf or a positive n is below DBL_MIN, the cone is taken from
+            # the impulse before its last rounding, mu' q' 2^(k + e_mu + e_q) with q = num / M'
+            # (normal, so it keeps the 53 bits the subnormal grid drops); elsewhere it is mu
+            # times the n returned, as the sweep takes it.
+            if (fon == 1 && f64_gt(num, 0) == 1 && f64_lt(fric, F64_POS_INF) == 1
+              && (f64_eq(lam, F64_POS_INF) == 1 || f64_lt(lam, F64_TINY) == 1)) {
+                var q = f64_div(num, ms);
+                var eq = _col_si_ilogb(q);
+                var ef = _col_si_ilogb(fric);
+                bound = _col_si_ldexp(f64_mul(_col_si_ldexp(fric, 0 - ef), _col_si_ldexp(q, 0 - eq)),
+                  ep - em + eq + ef);
+                bset = 1;
+            }
+        }
+    } else {
+        lam = f64_div(f64_add(pen, f64_mul(rest, pen)), m);
+    }
+    # +0 for a negative or zero impulse, as the sweep's 0 + delta and clamp give it.
+    if (f64_lt(lam, 0) == 1 || f64_eq(lam, 0) == 1) { lam = 0; }
+    store64(slot, lam);
+    if (fon == 1) {
+        var vt = ColContact_tangent_vel(c);
+        var f = 0;
+        if (finite == 1 && (vt & _COL_SI_EXP) != _COL_SI_EXP) {
+            if (f64_eq(vt, 0) == 0) {
+                var ev = _col_si_ilogb(vt);
+                var fq = _col_si_quot(_col_si_ldexp(vt, 0 - ev), ms, ev - em);
+                # In the top binade (or past it) the overflow is decided on M's exact sum, not
+                # the rounded one this quotient divides by (review pass CO7).
+                if ((fq & 0x7FFF_FFFF_FFFF_FFFF) >= _COL_SI_TOP) {
+                    fq = _col_si_top(_col_si_ldexp(f64_abs(vt), 0 - ev - 2), 0, ms, ia, ib, m, em - mk, F64_ONE,
+                      ev + 2 - em) | (vt & _COL_SI_SIGN);
+                }
+                f = f64_sub(0, fq);
+            }
         } else {
-            # pick the larger child
-            if (child + 1 < n) {
-                if (_col_xy_greater(points, vec_get(indices, child + 1),
-                    vec_get(indices, child)) == 1) {
-                    child = child + 1;
-                }
-            }
-            if (_col_xy_greater(points, vec_get(indices, child),
-                vec_get(indices, r)) == 1) {
-                var tmp = vec_get(indices, r);
-                vec_set(indices, r, vec_get(indices, child));
-                vec_set(indices, child, tmp);
-                r = child;
-            } else {
-                sifting = 0;
-            }
+            f = f64_sub(0, f64_div(vt, m));
         }
+        if (bset == 0) { bound = f64_mul(fric, lam); }
+        # 3.4.1 (review pass CO6): where f is +-Inf (|v_t / M| past the overflow threshold) and
+        # the cone reached the top binade, the clamp decides between +-Inf and a finite cone, so
+        # the cone's overflow is decided exactly (_col_si_top) rather than by its roundings.
+        if ((f & 0x7FFF_FFFF_FFFF_FFFF) == _COL_SI_EXP && bound >= _COL_SI_TOP && f64_gt(num, 0) == 1
+          && f64_lt(fric, F64_POS_INF) == 1) {
+            var ef2 = _col_si_ilogb(fric);
+            bound = _col_si_top(ps, rest, ms, ia, ib, m, em - mk, _col_si_ldexp(fric, 0 - ef2), ep - em + ef2);
+        }
+        if (f64_gt(f64_abs(f), bound) == 1) {
+            if (f64_lt(f, 0) == 1) { f = bound ^ _COL_SI_SIGN; } else { f = bound; }
+        }
+        store64(slot + 8, f);
     }
     return 0;
 }
-
-# Sort indices by (x, then y ascending) — heapsort, O(n log n) worst case and
-# O(1) extra memory.
-#
-# This was an insertion sort, the only super-linear step in convex_hull_2d (the
-# monotone chain itself is O(n)) and unbounded because the public entry point
-# caps nothing: the 2026-08-03 audit measured 690 ms on 8,000 points, and the
-# in-repo benchmark 21.7 ms on 2,000.
-# [measured: docs/audit/2026-08-03.md, the convex_hull_2d row; bench-history.csv's 2.6.15 before-row is 22.1 ms]
-#
-# Heapsort rather than merge sort deliberately: merge sort's n-slot scratch would
-# be LEAKED on every call under the never-freeing bump allocator, which is the
-# same reasoning cyrius stdlib gives for `vec_sort_by`.
-#
-# ⚠ 2.9.3 CORRECTION: this used to say "and Cyrius has no closures". **That is
-# false and has been for a while** — Cyrius has capturing closures (`|x| base + x`,
-# captured by value into a heap environment, guide §Closures, v6.3.8). The claim
-# was inherited and repeated across four files without anyone running it. A
-# second reason then took its place — on 6.5.16 a capturing closure SIGSEGVed
-# when passed through a function and called there — and that one is gone too,
-# fixed in 6.5.17 (issues/archived/2026-08-10-cyrius-capturing-closure-across-
-# fn-boundary.md): a closure over `points` runs through `vec_sort_by` on 6.6.4.
-#
-# ⛔ WHY IT STAYS HAND-WRITTEN ANYWAY: THE OUTPUT ORDER OF TIES IS OBSERVABLE.
-# This sorts INDICES, and coincident points are equal keys with distinct
-# indices. `vec_sort_by` is an introsort, heapsort is not, and unstable sorts
-# permute equal keys differently: on a unit square with each corner listed
-# twice this loop yields 4 0 7 3 5 1 6 2 and `vec_sort_by` yields 0 4 3 7 1 5
-# 2 6; the monotone chain's cross-product ties then select a different member
-# of each coincident pair depending on which came first, so the hull comes back
-# as (4 1 2 7) here and (0 5 6 3) through the stdlib -- the same polygon,
-# different indices, which a caller keying on indices would see. (Which member
-# survives is not a one-line rule: the anchor keeps the FIRST of its pair and
-# the lower chain the LAST; the indices above are the measurement.)
-# The introsort's pure-insertion regime below 17 elements is STABLE and still
-# differs on 8 of 8 slots; at n = 40 (quicksort regime) the two diverge on
-# 35 of 40. Swapping the algorithm is therefore a behaviour change, not a
-# consolidation.
-# [measured: scratch probe on the 3.1.1 tree, cycc 6.6.4, 2026-09-14, not reproducible in-tree]
-#
-# Ordering is identical to the insertion sort this replaced in 2.6.15, except
-# that the x-equality band is exact rather than EPSILON_F64 since 2.15.0 (see
-# `_col_xy_greater`).
-fn _col_sort_indices_by_xy(indices, points, n) {
-    if (n < 2) { return 0; }
-
-    # Build a max-heap.
-    var h = n / 2 - 1;
-    while (h >= 0) {
-        _col_sift_down(indices, points, h, n);
-        h = h - 1;
-    }
-
-    # Repeatedly move the max to the back and restore the heap.
-    var end = n - 1;
-    while (end > 0) {
-        var tmp2 = vec_get(indices, 0);
-        vec_set(indices, 0, vec_get(indices, end));
-        vec_set(indices, end, tmp2);
-        _col_sift_down(indices, points, 0, end);
-        end = end - 1;
-    }
-    return 0;
-}
-
-public fn convex_hull_2d(points, n) {
-    var result = vec_new();
-    if (result == 0) { return 0; }
-    # ⛔ `n` IS A RESTATEMENT OF `vec_len(points)` AND WAS NEVER CHECKED, so a
-    # caller passing a larger `n` did not get a wrong answer — it lost its
-    # PROCESS. The stdlib's `vec_get` is bounds-checked and calls `_vec_die()`
-    # -> `syscall(60, 1)`. Reproduced: 3 points with n = 100 prints
-    # `vec: index out of bounds` and exits 1; the same call with n = 3 exits 0.
-    # [measured: scratch harness, not reproducible in-tree, 2026-09-09; cycc 6.6.2]
-    # **A library must not end its caller's process.**
-    #
-    # Rejection returns the empty `result` vec, which is this function's
-    # established convention for degenerate input (n < 2) and what every
-    # assertion in `tests/abuse.tcyr` calls `vec_len` on — returning a designed 0
-    # here would null-deref in the suite's own idiom.
-    if (points == 0) { return result; }
-    if (n > vec_len(points)) { return result; }
-
-    if (n < 2) {
-        for (var i = 0; i < n; i = i + 1) {
-            vec_push(result, i);
-        }
-        return result;
-    }
-
-    # Build sorted index array
-    var sorted = vec_new();
-    if (sorted == 0) { return result; }
-    for (var i = 0; i < n; i = i + 1) {
-        vec_push(sorted, i);
-    }
-    _col_sort_indices_by_xy(sorted, points, n);
-
-    # Lower hull
-    var hull = vec_new();
-    if (hull == 0) { return result; }
-    for (var i = 0; i < n; i = i + 1) {
-        var pi = vec_get(sorted, i);
-        var pp = vec_get(points, pi);
-        var px = HVec2_x(pp);
-        var py = HVec2_y(pp);
-        var hlen = vec_len(hull);
-        var cont = 1;
-        while (cont == 1) {
-            hlen = vec_len(hull);
-            if (hlen < 2) { cont = 0; } else {
-                var h1i = vec_get(hull, hlen - 1);
-                var h2i = vec_get(hull, hlen - 2);
-                var h1p = vec_get(points, h1i);
-                var h2p = vec_get(points, h2i);
-                var c = _col_cross2d(HVec2_x(h2p), HVec2_y(h2p),
-                  HVec2_x(h1p), HVec2_y(h1p),
-                  px, py);
-                if (f64_le(c, _COL_F64_ZERO) == 1) {
-                    vec_pop(hull);
-                } else {
-                    cont = 0;
-                }
-            }
-        }
-        vec_push(hull, pi);
-    }
-
-    # Upper hull
-    var lower_len = vec_len(hull) + 1;
-    for (var i = n - 1; i >= 0; i = i - 1) {
-        var pi = vec_get(sorted, i);
-        var pp = vec_get(points, pi);
-        var px = HVec2_x(pp);
-        var py = HVec2_y(pp);
-        var cont = 1;
-        while (cont == 1) {
-            var hlen = vec_len(hull);
-            if (hlen < lower_len) { cont = 0; } else {
-                var h1i = vec_get(hull, hlen - 1);
-                var h2i = vec_get(hull, hlen - 2);
-                var h1p = vec_get(points, h1i);
-                var h2p = vec_get(points, h2i);
-                var c = _col_cross2d(HVec2_x(h2p), HVec2_y(h2p),
-                  HVec2_x(h1p), HVec2_y(h1p),
-                  px, py);
-                if (f64_le(c, _COL_F64_ZERO) == 1) {
-                    vec_pop(hull);
-                } else {
-                    cont = 0;
-                }
-            }
-        }
-        vec_push(hull, pi);
-    }
-
-    # Remove last (duplicate of first)
-    vec_pop(hull);
-
-    # Copy to result
-    var hull_len = vec_len(hull);
-    for (var i = 0; i < hull_len; i = i + 1) {
-        vec_push(result, vec_get(hull, i));
-    }
-    return result;
-}
-
-# ================================================================
-# 3. Polygon Triangulation -- Ear Clipping
-# ================================================================
-# Input: vertices = vec of HVec2 pointers, n = number of vertices
-#
-# Returns: vec of index triples [i0, i1, i2, ...], flat.
-#
-#   length == 3*(n-2)  -- COMPLETE triangulation
-#   length <  3*(n-2)  -- PARTIAL. The ear-clipping pass found no ear among the
-#                         remaining vertices and stopped; what is returned is a
-#                         valid triangulation of the part that WAS clipped.
-#   length == 0        -- no ear found on the very first pass.
-#
-# Through 2.7.0 this comment stated `length = 3*(n-2)` unconditionally, which is
-# false: the `if (ear_found == 0) { return result; }` bail below returns early on
-# degenerate or self-intersecting input, with no error signal. The information to
-# detect that was always present but never documented, so callers could not tell
-# a complete triangulation from a truncated one.
-#
-# CHECK `vec_len(result) == 3*(n-2)` before trusting the output. Ear clipping is
-# only defined for SIMPLE polygons; a self-intersecting input has no ear
-# decomposition and a short return is the honest answer, not a failure to fix.
-
-# Sign of 2D cross product for winding test
-fn _col_triangle_area_2x(ax, ay, bx, by, cx, cy) {
-    return f64_sub(f64_mul(f64_sub(bx, ax), f64_sub(cy, ay)),
-      f64_mul(f64_sub(cx, ax), f64_sub(by, ay)));
-}
-
-# Point-in-triangle test (2D, BOUNDARY-INCLUSIVE).
-#
-# 2.9.3: this comment read "(2D, strict interior)" and was false. A point on an
-# edge makes that edge's signed area exactly 0, which sets NEITHER has_neg nor
-# has_pos, so the "all signs agree" test below passes and the function returns 1.
-# Vertices are included for the same reason (two of the three areas vanish). The
-# closed test is the correct one for the ear-clipping caller -- an ear must not
-# be cut when another vertex lies ON its boundary, only when it lies strictly
-# outside -- so the CODE was right and only the contract was mis-stated.
-fn _col_point_in_tri(px, py, ax, ay, bx, by, cx, cy) {
-    var d1 = _col_triangle_area_2x(px, py, ax, ay, bx, by);
-    var d2 = _col_triangle_area_2x(px, py, bx, by, cx, cy);
-    var d3 = _col_triangle_area_2x(px, py, cx, cy, ax, ay);
-
-    var has_neg = 0;
-    var has_pos = 0;
-    if (f64_lt(d1, _COL_F64_ZERO) == 1) { has_neg = 1; }
-    if (f64_gt(d1, _COL_F64_ZERO) == 1) { has_pos = 1; }
-    if (f64_lt(d2, _COL_F64_ZERO) == 1) { has_neg = 1; }
-    if (f64_gt(d2, _COL_F64_ZERO) == 1) { has_pos = 1; }
-    if (f64_lt(d3, _COL_F64_ZERO) == 1) { has_neg = 1; }
-    if (f64_gt(d3, _COL_F64_ZERO) == 1) { has_pos = 1; }
-
-    # Point is inside if all signs are the same
-    if (has_neg == 1) {
-        if (has_pos == 1) { return 0; }
-    }
-    return 1;
-}
-
-# Convexity of the ring vertex at position p, using the SAME predicate as the
-# ear gate in triangulate_polygon below, so "not convex here" is exactly "would
-# be rejected as an ear tip there". Both are sign-only since 2.15.0; through
-# 2.14.x both compared against the same EPSILON_F64 threshold.
-fn _col_ring_is_convex(vertices, idx, remaining, p, ccw) {
-    var pv = p - 1;
-    if (pv < 0) { pv = remaining - 1; }
-    var nx = p + 1;
-    if (nx >= remaining) { nx = 0; }
-    var ap = vec_get(vertices, vec_get(idx, pv));
-    var bp = vec_get(vertices, vec_get(idx, p));
-    var cp = vec_get(vertices, vec_get(idx, nx));
-    var cross = _col_triangle_area_2x(HVec2_x(ap), HVec2_y(ap),
-      HVec2_x(bp), HVec2_y(bp),
-      HVec2_x(cp), HVec2_y(cp));
-    # ⛔ `cross` is TWICE THE SIGNED AREA — degree TWO in the caller's coordinates
-    # — and through 2.14.x it was compared against an absolute 1e-12, so a strictly
-    # convex vertex of a small polygon was classified "not convex". That is not a
-    # plausible number, it is a plausible DIAGNOSIS, which is worse: the vertex is
-    # marked blocked and the triangulation quietly comes back short or empty.
-    # ⭐ Convexity is the SIGN of the determinant and nothing else. That is exactly
-    # what `_col_point_in_tri`, the function directly above, already does to this
-    # same quantity, so this is consistency, not a new rule.
-    # ⚠ All four sites move together (the two comparisons below and the two in
-    # triangulate_polygon's convexity check) or the ear test and the ring test disagree.
-    # [measured: unit square at 2^-20 returned an EMPTY triangulation]
-    if (ccw == 1) {
-        if (f64_gt(cross, _COL_F64_ZERO) == 1) { return 1; }
-        return 0;
-    }
-    if (f64_lt(cross, _COL_F64_ZERO) == 1) { return 1; }
-    return 0;
-}
-
-# ⚠ RETURN-LENGTH CONTRACT, and the one place it is stated in the SOURCE.
-# `3*(n-2)` indices means a COMPLETE triangulation; fewer means PARTIAL, and
-# partial is inside the contract rather than a failure. Ear clipping is defined
-# only for SIMPLE polygons; on self-intersecting input the output length is not
-# specified and callers must not assume completeness.
-# ⛔ 2.20.0 — 2.7.1's reflex-only prune DOES change that length on
-# self-intersecting input, and for thirteen releases the CHANGELOG recorded the
-# direction BACKWARDS, twice. It read "old-partial -> new-complete, the new code
-# succeeds where the old bailed". Measured by building the 2.7.0 tree and this
-# one side by side on cyrius 6.6.2 and running both on
-# `(0,0),(1,2),(1,1),(0,2),(2,1)`: **old returns 9 indices (COMPLETE), this code
-# returns 6 (PARTIAL)** — old `[0 1 2 4 0 2 4 2 3]`, new `[4 0 1 1 2 3]`. The new
-# code BAILS WHERE THE OLD SUCCEEDED. The decision is unchanged (the divergence
-# is confined to input ear clipping does not define) but the sentence was wrong,
-# and it was wrong in the CHANGELOG where no gate could reach it. It is stated
-# here now, beside the code it describes.
-# ⚠ The marker below deliberately does not START with "2.7.0": through 3.3.7 the
-# provenance gate parsed a leading token containing a dot as a FILE PATH, and
-# reported a version number there as a file that does not exist. Since 3.4.0 a
-# token whose last dot is followed by a digit reads as free text.
-# [measured: the 2.7.0 tree vs HEAD, both built on cyrius 6.6.2, 2026-09-10]
-public fn triangulate_polygon(vertices, n) {
-    var result = vec_new();
-    if (result == 0) { return 0; }
-    # ⛔ `n` IS A RESTATEMENT OF `vec_len(vertices)` AND WAS NEVER CHECKED, so a
-    # caller passing a larger `n` did not get a wrong answer — it lost its
-    # PROCESS. The stdlib's `vec_get` is bounds-checked and calls `_vec_die()`
-    # -> `syscall(60, 1)`. Reproduced: 3 vertices with n = 100 prints
-    # `vec: index out of bounds` and exits 1; the same call with n = 3 exits 0.
-    # [measured: scratch harness, not reproducible in-tree, 2026-09-09; cycc 6.6.2]
-    # **A library must not end its caller's process.**
-    #
-    # Rejection returns the empty `result` vec, which is this function's
-    # established convention for degenerate input (n < 3) and what every
-    # assertion in `tests/abuse.tcyr` calls `vec_len` on — returning a designed 0
-    # here would null-deref in the suite's own idiom.
-    if (vertices == 0) { return result; }
-    if (n > vec_len(vertices)) { return result; }
-
-    if (n < 3) { return result; }
-
-    # Build index list (will shrink as ears are clipped)
-    var idx = vec_new();
-    if (idx == 0) { return result; }
-    for (var i = 0; i < n; i = i + 1) {
-        vec_push(idx, i);
-    }
-
-    # Determine winding: sum of signed areas
-    var total_area = _COL_F64_ZERO;
-    for (var i = 0; i < n; i = i + 1) {
-        var ni = i + 1;
-        if (ni >= n) { ni = 0; }
-        var pi = vec_get(vertices, i);
-        var pn = vec_get(vertices, ni);
-        total_area = f64_add(total_area,
-          f64_sub(f64_mul(HVec2_x(pi), HVec2_y(pn)),
-            f64_mul(HVec2_x(pn), HVec2_y(pi))));
-    }
-    # ccw = 1 if total_area > 0 (standard CCW winding)
-    var ccw = 1;
-    if (f64_lt(total_area, _COL_F64_ZERO) == 1) { ccw = 0; }
-
-    # Blocker cache, keyed by ORIGINAL vertex index (never shifts as idx
-    # shrinks). blocked[v] = 1 iff v is NOT strictly convex -- i.e. reflex or
-    # collinear. Only such a vertex can sit inside a candidate ear of a simple
-    # polygon, so every 0 here is a point-in-triangle test we can skip. Built
-    # in O(n); a clip changes the ring only at the two neighbours of the
-    # removed vertex, so each clip refreshes exactly 2 entries.
-    var blocked = alloc(n * 8);
-    if (blocked == 0) { return result; }
-    for (var i = 0; i < n; i = i + 1) {
-        store64(blocked + i * 8, 1 - _col_ring_is_convex(vertices, idx, n, i, ccw));
-    }
-
-    var remaining = n;
-    var max_iters = n * n;  # Safety bound
-    var iter_count = 0;
-
-    while (remaining > 2) {
-        iter_count = iter_count + 1;
-        if (iter_count > max_iters) { return result; }  # Degenerate -- bail
-
-        var ear_found = 0;
-        for (var i = 0; i < remaining; i = i + 1) {
-            var prev = i - 1;
-            if (prev < 0) { prev = remaining - 1; }
-            var next = i + 1;
-            if (next >= remaining) { next = 0; }
-
-            var ai = vec_get(idx, prev);
-            var bi = vec_get(idx, i);
-            var ci = vec_get(idx, next);
-
-            var ap = vec_get(vertices, ai);
-            var bp = vec_get(vertices, bi);
-            var cp = vec_get(vertices, ci);
-
-            var ax = HVec2_x(ap);
-            var ay = HVec2_y(ap);
-            var bx = HVec2_x(bp);
-            var by = HVec2_y(bp);
-            var cx = HVec2_x(cp);
-            var cy = HVec2_y(cp);
-
-            var cross = _col_triangle_area_2x(ax, ay, bx, by, cx, cy);
-
-            # Check convexity: for CCW polygon, ear has positive cross
-            var convex = 0;
-            # ⛔ Same quantity, same class, and it must match `_col_ring_is_convex`
-            # above exactly — an ear accepted by one and rejected by the other
-            # stalls the triangulation.
-            if (ccw == 1) {
-                if (f64_gt(cross, _COL_F64_ZERO) == 1) { convex = 1; }
-            } else {
-                if (f64_lt(cross, _COL_F64_ZERO) == 1) { convex = 1; }
-            }
-
-            if (convex == 1) {
-                # Check no other BLOCKING vertex inside this triangle
-                var has_point = 0;
-                for (var j = 0; j < remaining; j = j + 1) {
-                    if (j != prev) {
-                        if (j != i) {
-                            if (j != next) {
-                                var ji = vec_get(idx, j);
-                                if (load64(blocked + ji * 8) == 1) {
-                                    var jp = vec_get(vertices, ji);
-                                    var inside = _col_point_in_tri(
-                                      HVec2_x(jp), HVec2_y(jp),
-                                      ax, ay, bx, by, cx, cy);
-                                    if (inside == 1) { has_point = 1; break; }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (has_point == 0) {
-                    # Clip this ear
-                    vec_push(result, ai);
-                    vec_push(result, bi);
-                    vec_push(result, ci);
-                    vec_remove(idx, i);
-                    remaining = remaining - 1;
-                    ear_found = 1;
-                    # Removing position i leaves the old prev at i-1 and pulls
-                    # the old next down into slot i; only those two vertices
-                    # changed neighbours, so only those two flags are stale.
-                    # ⚠ `prev_slot`/`next_slot`, not `pn`/`nn`: the winding loop at the
-                    # top of THIS SAME FUNCTION already binds `pn`, and there it is an
-                    # HVec2 POINTER while here it is a ring INDEX. Nothing broke — that
-                    # loop finishes long before this runs — but two unrelated quantities
-                    # under one name inside one function is how a later edit picks the
-                    # wrong one. ⚠ The filing that recorded this also claimed `nn`
-                    # shadowed something. It does not: the winding loop uses `ni`, so
-                    # `pn` was the only true shadow. Renamed as a pair anyway.
-                    # ⚠ Inertness is CHECKED, and so is the check: a folded checksum over
-                    # every index tuple on a 3x3 grid for n=4 and n=5 (65,610 calls) is
-                    # bit-identical across the rename — and the same checksum MOVES when
-                    # the refresh is disabled or the prev flag is forced, so it can see a
-                    # change. ⚠ `prev_slot = i - 2` does NOT move it: an equivalence on
-                    # this family, not evidence the probe is blind.
-                    # [measured: 65,610-case checksum, inert across rename, 2 of 3 mutants move it]
-                    if (remaining > 2) {
-                        var prev_slot = i - 1;
-                        if (prev_slot < 0) { prev_slot = remaining - 1; }
-                        var next_slot = i;
-                        if (next_slot >= remaining) { next_slot = 0; }
-                        store64(blocked + vec_get(idx, prev_slot) * 8,
-                          1 - _col_ring_is_convex(vertices, idx, remaining, prev_slot, ccw));
-                        store64(blocked + vec_get(idx, next_slot) * 8,
-                          1 - _col_ring_is_convex(vertices, idx, remaining, next_slot, ccw));
-                    }
-                    break;
-                }
-            }
-        }
-
-        # If no ear found this pass, polygon may be degenerate
-        if (ear_found == 0) { return result; }
-    }
-    return result;
-}
-
-# ================================================================

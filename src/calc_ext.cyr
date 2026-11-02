@@ -99,14 +99,34 @@ fn _f64arr_set(arr, i, val) {
 # 1. MULTIVARIATE CALCULUS
 # ================================================================
 
-# Partial derivative of f:R^n -> R with respect to variable at index.
-# f: function pointer, fncall1(f, x_ptr) -> f64 (scalar).
+# Internal: d / (2h), the central difference's quotient, rounded once while 2h is finite;
+# for |h| >= 2^1023, where 2h overflows, (d / 2) / h. (3.4.1: the gradient, Jacobian and
+# Hessian multiplied by a reciprocal 1 / (2h), which overflows below h = 2^-1024.)
+fn _calcx_over_2h(d, h) {
+    var h2 = f64_mul(F64_TWO, h);
+    if (f64_lt(f64_abs(h2), F64_POS_INF) == 1) { return f64_div(d, h2); }
+    return f64_div(f64_mul(d, F64_HALF), h);
+}
+
+# Internal: an n-element scratch array for the multivariate differences: `sbuf`, the
+# caller's stack array of _CALCX_DIFF_STACK doubles (declared `var sbuf: i64[48]`), when n
+# fits there, else _f64arr_alloc's (0 when refused).
+enum _CalcxDiff { _CALCX_DIFF_STACK = 48; }
+fn _calcx_diff_scratch(sbuf, n) {
+    if (n <= _CALCX_DIFF_STACK) { return sbuf; }
+    return _f64arr_alloc(n);
+}
+
+# Partial derivative of f:R^n -> R with respect to variable at index, by the central
+# difference (f(x + h e_i) - f(x - h e_i)) / (2h): exact for a quadratic in x_i, error
+# O(h^2) otherwise, plus the rounding of f over 2h.
+# f: function pointer, fncall1(f, x_ptr) -> f64 (scalar), called with a private copy of x.
 # x: pointer to flat f64 array of n values.
 # n: dimension count (must be > 0), index: variable index in [0, n),
 # h: step size (f64), out: pointer, the partial derivative (f64) written here.
 # Returns Ok(0); Err(HSB_ERR_INVALID_INPUT) for n <= 0 or an index outside [0, n);
-# Err(HSB_ERR_ALLOC) when its two n-element scratch arrays cannot be allocated. `out`
-# is untouched on every Err, and f is not called.
+# Err(HSB_ERR_ALLOC) when its two n-element scratch arrays cannot be allocated (n above 24;
+# up to 24 they are on the stack). `out` is untouched on every Err, and f is not called.
 # ⭐ 3.4.0 — REPLACES calc_partial_derivative, which returned 0 for all three (audit
 # D069): a legal derivative, the one every constant direction has. There is no
 # derivative with respect to a variable the function does not have.
@@ -126,10 +146,16 @@ public fn calc_partial_derivative_checked(f, x, n, index, h, out) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (index < 0 || index >= n) { return Err(HSB_ERR_INVALID_INPUT); }
 
-    # Allocate x_plus and x_minus buffers
-    var x_plus = _f64arr_alloc(n);
-    var x_minus = _f64arr_alloc(n);
-    if (x_plus == 0 || x_minus == 0) { return Err(HSB_ERR_ALLOC); }
+    # x_plus and x_minus: on the stack up to n = 24 (3.4.1; every call took 2n doubles
+    # from the bump heap, which a hot loop grew without bound).
+    var sbuf: i64[48];
+    var x_plus = &sbuf;
+    var x_minus = &sbuf + n * 8;
+    if (n > _CALCX_DIFF_STACK / 2) {
+        x_plus = _f64arr_alloc(n);
+        x_minus = _f64arr_alloc(n);
+        if (x_plus == 0 || x_minus == 0) { return Err(HSB_ERR_ALLOC); }
+    }
     _f64arr_copy(x_plus, x, n);
     _f64arr_copy(x_minus, x, n);
 
@@ -142,30 +168,51 @@ public fn calc_partial_derivative_checked(f, x, n, index, h, out) {
     var f_minus = fncall1(f, x_minus);
 
     # Central difference: (f(x+h*e_i) - f(x-h*e_i)) / (2h)
-    store64(out, f64_div(f64_sub(f_plus, f_minus), f64_mul(F64_TWO, h)));
+    store64(out, _calcx_over_2h(f64_sub(f_plus, f_minus), h));
     return Ok(0);
 }
 
-# Gradient of f:R^n -> R at x.
-# f: function pointer, fncall1(f, x_ptr) -> f64.
+# ⛔ 3.4.1 — THE GRADIENT, JACOBIAN AND HESSIAN MULTIPLIED BY 1 / (2h) AND 1 / (4h^2), which
+# overflow (roadmap [3.4.1], AU2-G4-F11): x + y at 0 with h = 2^-1074 gave a gradient of
+# (+Inf, +Inf) with Ok, where calc_partial_derivative_checked divides and gives the exact
+# (1, 1); the Hessian's off-diagonal was +Inf for h <= 2^-513 and its diagonal NaN below
+# 2^-537, where h^2 underflows. Each now divides once (_calcx_over_2h; the Hessian by h^2 or
+# 4h^2 while that is a normal double, and by h, or 2h, twice where it is not), so a
+# gradient entry is calc_partial_derivative_checked's bits, and every quotient is rounded
+# once where it was rounded twice: at a step that is not a power of two the gradient and
+# Jacobian move by at most 1 ulp from 3.4.0's, toward the correctly rounded quotient.
+# ⛔ 3.4.1 — AND x WAS READ AFTER out WAS WRITTEN (F-A2). calc_hessian(f, x, n, h, out = x)
+# put H[0][0] into x[0] before the off-diagonals read it: f = x0^2 x1 + x1^3 + x0 x2 at
+# (2, 3, 5) gave H[0][1] = 12, exact 4. All three read x once, into their private copy, before
+# anything is written, so an `out` that overlaps x in any way gets the derivatives at the x
+# passed. (`out` then overwrites the caller's x, which is what the alias asks for.)
+# ⛔ 3.4.1 — AND EVERY CALL TOOK ITS SCRATCH FROM THE BUMP HEAP, which a hot loop grew without
+# bound (n to 2 n_out + n_in doubles per call). It is on the stack now, 48 doubles: the
+# gradient and Hessian to n = 48, the Jacobian while n_in and n_out are both at most 16, and
+# calc_partial_derivative_checked to n = 24. Past that each call still allocates.
+# [measured: tests/edge_cases.tcyr, group "3.4.1: the multivariate differences at the ends of h"]
+
+# Gradient of f:R^n -> R at x, by central differences (calc_partial_derivative_checked for
+# each i, bit for bit).
+# f: function pointer, fncall1(f, x_ptr) -> f64, called with a private copy of x.
 # x: pointer to flat f64[n], n: dimension, h: step size (f64).
-# out: pointer to flat f64[n] to receive gradient components.
+# out: pointer to flat f64[n] to receive gradient components; it may overlap x.
 # Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n <= 0,
-# Err(HSB_ERR_ALLOC) if no n-element scratch array can be allocated.
+# Err(HSB_ERR_ALLOC) if no n-element scratch array can be allocated (n above 48).
 # ⚠ Through 3.3.0 only n == 0 was rejected: a negative n skipped every loop and
 # returned Ok(0) with `out` never written.
 #must_use
 public fn calc_gradient(f, x, n, h, out) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
-    var x_buf = _f64arr_alloc(n);
+    var sbuf: i64[48];
+    var x_buf = _calcx_diff_scratch(&sbuf, n);
     if (x_buf == 0) { return Err(HSB_ERR_ALLOC); }
     _f64arr_copy(x_buf, x, n);
 
-    var inv_2h = f64_div(F64_ONE, f64_mul(F64_TWO, h));
     var i = 0;
     while (i < n) {
-        var xi = _f64arr_get(x, i);
+        var xi = _f64arr_get(x_buf, i);
 
         # f(x + h*e_i)
         _f64arr_set(x_buf, i, f64_add(xi, h));
@@ -178,35 +225,45 @@ public fn calc_gradient(f, x, n, h, out) {
         # Restore
         _f64arr_set(x_buf, i, xi);
 
-        _f64arr_set(out, i, f64_mul(f64_sub(f_plus, f_minus), inv_2h));
+        _f64arr_set(out, i, _calcx_over_2h(f64_sub(f_plus, f_minus), h));
         i = i + 1;
     }
     return Ok(0);
 }
 
-# Jacobian matrix of f:R^n_in -> R^n_out at x.
-# f: function pointer, fncall2(f, x_ptr, out_ptr) -- f writes n_out f64 values to out_ptr.
+# Jacobian matrix of f:R^n_in -> R^n_out at x, by central differences.
+# f: function pointer, fncall2(f, x_ptr, out_ptr) -- f writes n_out f64 values to out_ptr;
+# it is called with a private copy of x.
 # x: pointer to flat f64[n_in], n_in: input dim, n_out: output dim.
 # h: step size (f64).
-# out: pointer to flat f64[n_out * n_in] (row-major: J[i][j] = out[i*n_in + j]).
+# out: pointer to flat f64[n_out * n_in] (row-major: J[i][j] = out[i*n_in + j]); it may
+# overlap x.
 # Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n_in or n_out <= 0,
-# Err(HSB_ERR_ALLOC) if the scratch arrays cannot be allocated.
+# Err(HSB_ERR_ALLOC) if the scratch arrays cannot be allocated (past the stack's 48 doubles).
 #must_use
 public fn calc_jacobian(f, x, n_in, n_out, h, out) {
     if (n_in <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (n_out <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
-    var x_buf = _f64arr_alloc(n_in);
-    var f_plus = _f64arr_alloc(n_out);
-    var f_minus = _f64arr_alloc(n_out);
+    var sbuf: i64[48];
+    var x_buf = 0;
+    var f_plus = 0;
+    var f_minus = 0;
+    if (n_in <= 16 && n_out <= 16) {
+        x_buf = &sbuf;
+        f_plus = &sbuf + 128;
+        f_minus = &sbuf + 256;
+    } else {
+        x_buf = _f64arr_alloc(n_in);
+        f_plus = _f64arr_alloc(n_out);
+        f_minus = _f64arr_alloc(n_out);
+    }
     if (x_buf == 0 || f_plus == 0 || f_minus == 0) { return Err(HSB_ERR_ALLOC); }
     _f64arr_copy(x_buf, x, n_in);
 
-    var inv_2h = f64_div(F64_ONE, f64_mul(F64_TWO, h));
-
     var j = 0;
     while (j < n_in) {
-        var xj = _f64arr_get(x, j);
+        var xj = _f64arr_get(x_buf, j);
 
         # f(x + h*e_j)
         # Bound, not a bare statement: cycc 6.6.2-6.6.4 SIGSEGVs on a bare
@@ -228,7 +285,7 @@ public fn calc_jacobian(f, x, n_in, n_out, h, out) {
             var fp_i = _f64arr_get(f_plus, i);
             var fm_i = _f64arr_get(f_minus, i);
             # J[i][j] = (f_plus[i] - f_minus[i]) / (2h)
-            _f64arr_set(out, i * n_in + j, f64_mul(f64_sub(fp_i, fm_i), inv_2h));
+            _f64arr_set(out, i * n_in + j, _calcx_over_2h(f64_sub(fp_i, fm_i), h));
             i = i + 1;
         }
         j = j + 1;
@@ -236,27 +293,38 @@ public fn calc_jacobian(f, x, n_in, n_out, h, out) {
     return Ok(0);
 }
 
-# Hessian matrix of f:R^n -> R at x.
-# f: function pointer, fncall1(f, x_ptr) -> f64.
+# Hessian matrix of f:R^n -> R at x: the diagonal by the central second difference
+# (f(x + h e_i) - 2 f(x) + f(x - h e_i)) / h^2, the off-diagonal by the four-point cross
+# (f(+,+) - f(+,-) - f(-,+) + f(-,-)) / (4h^2), stored symmetric. Both are exact for a
+# polynomial of total degree <= 3.
+# f: function pointer, fncall1(f, x_ptr) -> f64, called with a private copy of x.
 # x: pointer to flat f64[n], n: dimension, h: step size (f64).
-# out: pointer to flat f64[n*n] (row-major: H[i][j] = out[i*n + j]).
+# out: pointer to flat f64[n*n] (row-major: H[i][j] = out[i*n + j]); it may overlap x.
 # Returns Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) if n <= 0,
-# Err(HSB_ERR_ALLOC) if no n-element scratch array can be allocated.
+# Err(HSB_ERR_ALLOC) if no n-element scratch array can be allocated (n above 48).
 #must_use
 public fn calc_hessian(f, x, n, h, out) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
 
-    var x_buf = _f64arr_alloc(n);
+    var sbuf: i64[48];
+    var x_buf = _calcx_diff_scratch(&sbuf, n);
     if (x_buf == 0) { return Err(HSB_ERR_ALLOC); }
     _f64arr_copy(x_buf, x, n);
 
-    var f0 = fncall1(f, x);
+    var f0 = fncall1(f, x_buf);
     var h2 = f64_mul(h, h);
+    # h^2 and 4h^2 as divisors while they are normal doubles (3.4.0's diagonal bits); where
+    # they are not, the quotient is taken by h (or 2h) twice (3.4.1).
+    var h2ok = 0;
+    if (f64_le(F64_TINY, h2) == 1 && f64_lt(h2, F64_POS_INF) == 1) { h2ok = 1; }
+    var h4 = f64_mul(_CALCX_F64_FOUR, h2);
+    var h4ok = 0;
+    if (f64_le(F64_TINY, h4) == 1 && f64_lt(h4, F64_POS_INF) == 1) { h4ok = 1; }
 
     # Diagonal: d^2f/dx_i^2 = (f(x+h*e_i) - 2*f(x) + f(x-h*e_i)) / h^2
     var i = 0;
     while (i < n) {
-        var xi = _f64arr_get(x, i);
+        var xi = _f64arr_get(x_buf, i);
 
         _f64arr_set(x_buf, i, f64_add(xi, h));
         var fp = fncall1(f, x_buf);
@@ -267,7 +335,9 @@ public fn calc_hessian(f, x, n, h, out) {
         _f64arr_set(x_buf, i, xi);
 
         # (fp - 2*f0 + fm) / h^2
-        var diag = f64_div(f64_add(f64_sub(fp, f64_mul(F64_TWO, f0)), fm), h2);
+        var num = f64_add(f64_sub(fp, f64_mul(F64_TWO, f0)), fm);
+        var diag = 0;
+        if (h2ok == 1) { diag = f64_div(num, h2); } else { diag = f64_div(f64_div(num, h), h); }
         _f64arr_set(out, i * n + i, diag);
         i = i + 1;
     }
@@ -283,14 +353,12 @@ public fn calc_hessian(f, x, n, h, out) {
     # partial 2x is nonzero and which BOTH stencils reproduce exactly (a central
     # second difference and this 4-point cross are exact for total degree <= 3),
     # so the assertion is an exact equality rather than a tolerance.
-    var inv_4h2 = f64_div(F64_ONE, f64_mul(_CALCX_F64_FOUR, h2));
-
     i = 0;
     while (i < n) {
         var j = i + 1;
         while (j < n) {
-            var xi = _f64arr_get(x, i);
-            var xj = _f64arr_get(x, j);
+            var xi = _f64arr_get(x_buf, i);
+            var xj = _f64arr_get(x_buf, j);
 
             # f(x + h*e_i + h*e_j)
             _f64arr_set(x_buf, i, f64_add(xi, h));
@@ -313,7 +381,9 @@ public fn calc_hessian(f, x, n, h, out) {
             _f64arr_set(x_buf, i, xi);
             _f64arr_set(x_buf, j, xj);
 
-            var val = f64_mul(f64_add(f64_sub(fpp, fpm), f64_sub(fmm, fmp)), inv_4h2);
+            var num = f64_add(f64_sub(fpp, fpm), f64_sub(fmm, fmp));
+            var val = 0;
+            if (h4ok == 1) { val = f64_div(num, h4); } else { val = _calcx_over_2h(_calcx_over_2h(num, h), h); }
             _f64arr_set(out, i * n + j, val);
             _f64arr_set(out, j * n + i, val);
 
@@ -754,11 +824,28 @@ fn _calcx_as_run(f, a, b, fa, fb, fmid, whole, tol, cx) {
 
 # _adaptive_simpson_rec with vk = vlim = vdesc = 0 on an interval calc_adaptive_simpson_checked
 # has checked (see there): the tests that cannot fire are left out, the rest kept in its order.
+#
+# ⚠ 3.4.1 — WHAT THE 3.4.0 ACCOUNTING COSTS ON THIS PATH, AND THE PART BOUGHT BACK. x^4 on [0, 1] at
+# 1e-10 (257 evaluations; 63 panels fail their first test) took 8.7 us where 3.3.7's recursion
+# takes 6.9 (+26%). Removed one at a time from a copy of this function in one binary: the
+# own-width retest 0.26 to 0.33 us, the noise floor's stall test 0.22 to 0.29, the children's N,
+# PD and PD2 stores 0.27 to 0.30, the E sum under 0.07, the tenth parameter nothing measurable;
+# with all four parts out it still took 7.5 to 7.7, the parent-side cut and collision tests. Each
+# part decides an answer (the Lorentzian repair, the noise floor, the backstop, Ok against Err),
+# and copies that handed each child its panel sum through cx, took |error| once, or ended a cut
+# panel at once saved nothing measurable. What came back is code generation: the comparisons here
+# are used as the 0 / 1 they are, not tested `== 1`, which cycc spends seven instructions on per
+# condition.
+# The bench row's median over 7 interleaved runs moved 8.71 -> 8.51 us (-2.3%; 3.3.7 6.89); every
+# value, Err and evaluation count is unchanged on 5,207 calls (21 integrands; tolerances 2^-1074
+# to 1e300, 0, -1, NaN; reversed, zero-width, narrow, huge and subnormal intervals; 744,399,901
+# evaluations; a stall-test mutant moves the hash).
+# [measured: scratch ablation, A/B and differential (NUM3-work/cost fa_abl2.bcyr, fa.bcyr, dasimp.cyr), 2026-11-01]
 fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth, cx) {
     var mid = f64_mul(f64_add(a, b), F64_HALF);
     var tol_eff = tol;
     var tol_floor = f64_mul(f64_abs(whole), _CALCX_F64_REL_FLOOR);
-    if (depth < 50 && f64_lt(tol_eff, tol_floor) == 1) { tol_eff = tol_floor; }
+    if (depth < 50 && f64_lt(tol_eff, tol_floor)) { tol_eff = tol_floor; }
     var left_mid = f64_mul(f64_add(a, mid), F64_HALF);
     var right_mid = f64_mul(f64_add(mid, b), F64_HALF);
     var flm = fncall1(f, left_mid);
@@ -781,7 +868,7 @@ fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth, cx) {
         }
     }
     var error = f64_div(f64_sub(refined, whole), _CALCX_F64_FIFTEEN);
-    if (f64_lt(f64_abs(error), tol_eff) == 1) {
+    if (f64_lt(f64_abs(error), tol_eff)) {
         store64(cx, f64_add(load64(cx), f64_abs(error)));
         return f64_add(refined, error);
     }
@@ -796,17 +883,17 @@ fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth, cx) {
     var wown = f64_mul(f64_add(h_over_6, h_over_6), f64_add(f64_add(fa, f64_mul(_CALCX_F64_FOUR, fmid)), fb));
     var down = f64_sub(refined, wown);
     var dabs = f64_abs(down);
-    if (f64_lt(dabs, f64_mul(tol_eff, _CALCX_F64_FIFTEEN)) == 1) {
+    if (f64_lt(dabs, f64_mul(tol_eff, _CALCX_F64_FIFTEEN))) {
         var eown = f64_div(down, _CALCX_F64_FIFTEEN);
         store64(cx, f64_add(load64(cx), f64_abs(eown)));
         return f64_add(refined, eown);
     }
     var pd = load64(cx + _CALCX_AS_PD);
     var st = 0;
-    if (f64_le(f64_mul(pd, _CALCX_F64_EIGHTH), dabs) == 1) { st = 1; }
-    if (f64_le(f64_mul(load64(cx + _CALCX_AS_PD2), _CALCX_F64_2_POW_M6), dabs) == 1) { st = 1; }
+    if (f64_le(f64_mul(pd, _CALCX_F64_EIGHTH), dabs)) { st = 1; }
+    if (f64_le(f64_mul(load64(cx + _CALCX_AS_PD2), _CALCX_F64_2_POW_M6), dabs)) { st = 1; }
     if (st == 1) {
-        if (f64_le(dabs, _calcx_as_floor(h, fa, fmid, fb)) == 1) {
+        if (f64_le(dabs, _calcx_as_floor(h, fa, fmid, fb))) {
             store64(cx, f64_add(load64(cx), dabs));
             return f64_add(refined, f64_div(down, _CALCX_F64_FIFTEEN));
         }
@@ -815,7 +902,7 @@ fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth, cx) {
     # recursion more than the rest of the accounting).
     var half_tol = f64_mul(tol, F64_HALF);
     var lc = 0;
-    if (depth <= 1 || f64_eq(half_tol, 0) == 1) {
+    if (depth <= 1 || f64_eq(half_tol, 0)) {
         lc = 1;
     } else {
         if (load64(cx + _CALCX_AS_N) > _CALCX_AS_MAX_EVAL) {
@@ -826,7 +913,7 @@ fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth, cx) {
     var rc = lc;
     var left_result = left_val;
     if (lc == 0) {
-        if (f64_eq(left_mid, a) == 1 || f64_eq(left_mid, mid) == 1) {
+        if (f64_eq(left_mid, a) || f64_eq(left_mid, mid)) {
             lc = 1;
             left_result = _calcx_as_side(a, mid, lsum, left_val);
         } else {
@@ -838,7 +925,7 @@ fn _adaptive_simpson_rec0(f, a, b, fa, fb, fmid, whole, tol, depth, cx) {
     }
     var right_result = right_val;
     if (rc == 0) {
-        if (f64_eq(right_mid, mid) == 1 || f64_eq(right_mid, b) == 1) {
+        if (f64_eq(right_mid, mid) || f64_eq(right_mid, b)) {
             rc = 1;
             right_result = _calcx_as_side(mid, b, rsum, right_val);
         } else {
@@ -1440,9 +1527,17 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
             # 1e-12, so the same curve in different units takes a different branch.
             # ⭐ By the span search's own invariant knots[idx] <= t <= knots[idx+d+1-r],
             # so alpha is in [0,1] BY CONSTRUCTION and the division cannot overflow for
-            # any non-zero denom. Only denom == 0 can fail it; F64_TINY is that test.
+            # any non-zero denom. Only denom == 0 can fail it.
             # [measured: knot-scale sweep, fabricates P_last from s = 2^-40 down]
-            if (f64_lt(f64_abs(denom), F64_TINY) == 0) {
+            # ⛔ 3.4.1 — AND F64_TINY WAS NOT THAT TEST: it skipped a SUBNORMAL width as if it
+            # were zero (roadmap [3.4.1], AU2-G4-F10). Knots [0,0,0,0,1,2,3,3,3,3] times
+            # 2^-1064 at t = 1.5 times 2^-1064 returned the last control point; the curve's
+            # point is (0x3FFC5FFDD5155555, 0x3FFE6591AAAAAAAB, 0x3FD94584A92AAAAB), which the
+            # unit knots give. A difference of two subnormals is exact, as t - ki is, so alpha
+            # is the unit grid's to the bit; the test is the exact zero now (NaN-true as
+            # before: f64_eq(NaN, 0) is 0, and a NaN width is computed through).
+            # [measured: tests/edge_cases.tcyr, group "3.4.1: calc_bspline / calc_nurbs at subnormal scale"]
+            if (f64_eq(denom, 0) == 0) {
                 var alpha = f64_div(f64_sub(t, ki), denom);
                 var one_minus = f64_sub(F64_ONE, alpha);
 
@@ -1471,12 +1566,208 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
 # 4. NURBS EVALUATION
 # ================================================================
 
-# Evaluate a NURBS (Non-Uniform Rational B-Spline) curve at parameter t.
+# Internal: calc_nurbs' homogeneous inputs on span k: its d + 1 control points times their
+# weights, each weight times 2^wsc first when wsc != 0 (exact while the scaled weight is
+# normal; _calcx_nurbs_gauge picks wsc so that it is), into pw_x..pw_w[0..d]. Returns 1 when
+# every nonzero one of them lies in [2^-511, 2^511) -- the band where a product of two of them
+# is normal and finite, so the triangle cannot overflow and a blend underflows only for an
+# alpha below 2^-511 -- else 0.
+fn _calcx_nurbs_load(degree, ctrl_pts, weights, k, wsc, pw_x, pw_y, pw_z, pw_w) {
+    # 2^wsc as one factor where it is a double, else as two (wsc is within [-1535, 1610]).
+    var s1 = (1023 + wsc) << 52;
+    var s2 = 0;
+    if (wsc < 0 - 1022 || wsc > 1023) {
+        var m1 = wsc / 2;
+        s1 = (1023 + m1) << 52;
+        s2 = (1023 + wsc - m1) << 52;
+    }
+    var inb = 1;
+    var j = 0;
+    while (j <= degree) {
+        var idx = k - degree + j;
+        var cp = load64(ctrl_pts + idx * 8);
+        var w = _f64arr_get(weights, idx);
+        if (wsc != 0) {
+            w = f64_mul(w, s1);
+            if (s2 != 0) { w = f64_mul(w, s2); }
+        }
+        var px = HVec3_x(cp);
+        var py = HVec3_y(cp);
+        var pz = HVec3_z(cp);
+        var qx = f64_mul(px, w);
+        var qy = f64_mul(py, w);
+        var qz = f64_mul(pz, w);
+        _f64arr_set(pw_x, j, qx);
+        _f64arr_set(pw_y, j, qy);
+        _f64arr_set(pw_z, j, qz);
+        _f64arr_set(pw_w, j, w);
+        # The band, on biased exponents: [512, 1533] is [2^-511, 2^511). A zero weight is in
+        # it, and so is a zero product of a zero coordinate -- not one that underflowed.
+        var wa = w & 0x7FFF_FFFF_FFFF_FFFF;
+        var b = wa >> 52;
+        if (b < 512 || b > 1533) { if (wa != 0) { inb = 0; } }
+        if (wa != 0) {
+            b = (qx >> 52) & 0x7FF;
+            if (b < 512 || b > 1533) { if ((px & 0x7FFF_FFFF_FFFF_FFFF) != 0) { inb = 0; } }
+            b = (qy >> 52) & 0x7FF;
+            if (b < 512 || b > 1533) { if ((py & 0x7FFF_FFFF_FFFF_FFFF) != 0) { inb = 0; } }
+            b = (qz >> 52) & 0x7FF;
+            if (b < 512 || b > 1533) { if ((pz & 0x7FFF_FFFF_FFFF_FFFF) != 0) { inb = 0; } }
+        }
+        j = j + 1;
+    }
+    return inb;
+}
+
+# Internal: calc_nurbs' de Boor triangle on span k over the homogeneous inputs in
+# pw_x..pw_w[0..d] (_calcx_nurbs_load); the results are left in pw_x..pw_w[degree].
+fn _calcx_nurbs_tri(degree, knots, k, t, pw_x, pw_y, pw_z, pw_w) {
+    var j = 0;
+    # De Boor triangular computation on 4-component homogeneous coords
+    var r = 1;
+    while (r <= degree) {
+        j = degree;
+        while (j >= r) {
+            var idx = k - degree + j;
+            var ki = _f64arr_get(knots, idx);
+            var ki_dr = _f64arr_get(knots, idx + degree + 1 - r);
+            var denom = f64_sub(ki_dr, ki);
+
+            # ⛔ THIS READ `< EPSILON_F64`. `denom` is a de Boor knot-span WIDTH —
+            # degree 1 in the caller's parameterisation — tested against an absolute
+            # 1e-12, so the same curve in different units takes a different branch.
+            # ⭐ By the span search's own invariant knots[idx] <= t <= knots[idx+d+1-r],
+            # so alpha is in [0,1] BY CONSTRUCTION and the division cannot overflow for
+            # any non-zero denom. Only denom == 0 can fail it: the exact zero since 3.4.1,
+            # where F64_TINY skipped a subnormal width (calc_bspline's repair, on its pair).
+            # [measured: knot-scale sweep, fabricates P_last from s = 2^-40 down]
+            if (f64_eq(denom, 0) == 0) {
+                var alpha = f64_div(f64_sub(t, ki), denom);
+                var one_minus = f64_sub(F64_ONE, alpha);
+
+                var px = f64_add(f64_mul(one_minus, _f64arr_get(pw_x, j - 1)),
+                  f64_mul(alpha, _f64arr_get(pw_x, j)));
+                var py = f64_add(f64_mul(one_minus, _f64arr_get(pw_y, j - 1)),
+                  f64_mul(alpha, _f64arr_get(pw_y, j)));
+                var pz = f64_add(f64_mul(one_minus, _f64arr_get(pw_z, j - 1)),
+                  f64_mul(alpha, _f64arr_get(pw_z, j)));
+                var pw = f64_add(f64_mul(one_minus, _f64arr_get(pw_w, j - 1)),
+                  f64_mul(alpha, _f64arr_get(pw_w, j)));
+
+                _f64arr_set(pw_x, j, px);
+                _f64arr_set(pw_y, j, py);
+                _f64arr_set(pw_z, j, pz);
+                _f64arr_set(pw_w, j, pw);
+            }
+
+            j = j - 1;
+        }
+        r = r + 1;
+    }
+    return 0;
+}
+
+# Internal: floor(log2 |x|) of a finite nonzero double, from its magnitude bits ab (a
+# subnormal by its leading bit: 2^-1074 gives -1074).
+fn _calcx_ilogb(ab) {
+    var ex = (ab >> 52) & 0x7FF;
+    if (ex != 0) { return ex - 1023; }
+    var m = ab;
+    ex = 0 - 1022;
+    while (m < 0x0010_0000_0000_0000) { m = m << 1; ex = ex - 1; }
+    return ex;
+}
+
+# Internal: the exponent e of the power of two calc_nurbs multiplies span k's d + 1 weights by
+# (a gauge: w and 2^e w draw the same curve, and the scaling is exact while it stays normal).
+# The span's homogeneous inputs are its weights w_j and the products P_j,c w_j; with
+# 2^lo <= |each nonzero finite one| < 2^hi (read from exponents, so nothing overflows here),
+# e centres [2^lo, 2^hi) on 1 (to within a factor 2), lowered where that would put the largest
+# at or above 2^1023 (the de Boor blends are convex combinations, which grow by at most a few
+# ulps). e depends on the gauge only through lo and hi, which a power of two 2^E moves by E, so
+# every gauge of the same weights is brought to the same values. Those are normal and finite
+# throughout the triangle while hi - lo stays well inside 2046; past that the smallest
+# products lose bits, as they must in any gauge. Zero, infinite and NaN inputs are not read: a
+# zero product is exact, a non-finite one propagates as before. calc_nurbs asks for e only
+# where _calcx_nurbs_load found a value outside [2^-511, 2^511).
+fn _calcx_nurbs_gauge(ctrl_pts, weights, k, degree) {
+    var lo = 0x7FFF;
+    var hi = 0 - 0x7FFF;
+    var j = 0;
+    while (j <= degree) {
+        var idx = k - degree + j;
+        var wa = _f64arr_get(weights, idx) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (wa != 0 && wa < 0x7FF0_0000_0000_0000) {
+            var ew = ((wa >> 52) & 0x7FF) - 1023;
+            if (ew == 0 - 1023) { ew = _calcx_ilogb(wa); }
+            if (ew < lo) { lo = ew; }
+            if (ew + 1 > hi) { hi = ew + 1; }
+            # The coordinates' magnitudes, smallest nonzero and largest finite: 2^(ep + ew) <=
+            # |P w| < 2^(ep + ew + 2) for each.
+            var cp = load64(ctrl_pts + idx * 8);
+            var pmn = 0x7FF0_0000_0000_0000;
+            var pmx = 0;
+            var pa = HVec3_x(cp) & 0x7FFF_FFFF_FFFF_FFFF;
+            if (pa < 0x7FF0_0000_0000_0000) {
+                if (pa > pmx) { pmx = pa; }
+                if (pa != 0 && pa < pmn) { pmn = pa; }
+            }
+            pa = HVec3_y(cp) & 0x7FFF_FFFF_FFFF_FFFF;
+            if (pa < 0x7FF0_0000_0000_0000) {
+                if (pa > pmx) { pmx = pa; }
+                if (pa != 0 && pa < pmn) { pmn = pa; }
+            }
+            pa = HVec3_z(cp) & 0x7FFF_FFFF_FFFF_FFFF;
+            if (pa < 0x7FF0_0000_0000_0000) {
+                if (pa > pmx) { pmx = pa; }
+                if (pa != 0 && pa < pmn) { pmn = pa; }
+            }
+            if (pmx != 0) {
+                var ep = ((pmx >> 52) & 0x7FF) - 1023;
+                if (ep == 0 - 1023) { ep = _calcx_ilogb(pmx); }
+                if (ep + ew + 2 > hi) { hi = ep + ew + 2; }
+                ep = ((pmn >> 52) & 0x7FF) - 1023;
+                if (ep == 0 - 1023) { ep = _calcx_ilogb(pmn); }
+                if (ep + ew < lo) { lo = ep + ew; }
+            }
+        }
+        j = j + 1;
+    }
+    if (hi < lo) { return 0; }                             # no nonzero finite weight
+    # Every weight and coordinate read is at least 2^-1074 and below 2^1024, so -1073 <= hi <=
+    # 2048 and -2148 <= lo <= 1023: e lies in [-1535, 1610] (_calcx_nurbs_load's two factors).
+    var e = 0 - (lo + hi) / 2;
+    if (hi + e > 1023) { e = 1023 - hi; }
+    return e;
+}
+
+# Evaluate a NURBS (Non-Uniform Rational B-Spline) curve at parameter t:
+# C(t) = sum N_j(t) w_j P_j / sum N_j(t) w_j, by de Boor's algorithm on the homogeneous points
+# (w_j P_j, w_j) of the span holding t, then one divide per coordinate.
 # degree: spline degree, ctrl_pts: array of HVec3 pointers (flat, 8 bytes each),
 # weights: flat f64 array of per-point weights, n_pts: number of control points,
-# knots: flat f64 array, n_knots: knot count, t: parameter value (f64).
-# Returns HVec3 pointer, or 0 if invalid, or if the de Boor scratch (4 * (degree + 1)
-# doubles) cannot be allocated.
+# knots: flat f64 array (non-decreasing), n_knots: knot count, t: parameter value (f64).
+# Domain: degree >= 0, n_pts >= degree + 1, n_knots = n_pts + degree + 1, t in
+# [knots[degree], knots[n_pts]]. Returns an HVec3 pointer, or the designed 0 for an input
+# outside that domain, a NaN t, a span whose weight blend sum N_j w_j computes to 0 (a pole),
+# or a refused allocation (the de Boor scratch, 4 (degree + 1) doubles, and the result).
+# The weights are a gauge, and the result does not depend on it: a span whose homogeneous
+# values (|w_j|, |P_j,c w_j|) all lie in [2^-511, 2^511) takes 3.4.0's operations; any other
+# has its weights multiplied by the power of two that centres those values on 1
+# (_calcx_nurbs_gauge). A power of two commutes with every rounding while the values stay
+# normal, so weights times any 2^E give the same point bit for bit, until the span's values
+# range over about 2^2000: past that the smallest products round on the subnormal grid in every
+# gauge (weights 2^-1074 beside 2^1000, the one case no gauge repairs). Inside the band a t
+# within 2^-511 of a knot can round a blend on the subnormal grid, as 3.4.0, leaving a coordinate
+# one unit of 2^-1074 from its correctly rounded value (which matters only where the coordinate
+# is itself that small). Accuracy: each
+# coordinate within 20 units of u sum N_j |w_j P_j,c| / |sum N_j w_j|, u = 2^-53, on 72,560
+# degree-3 calls (random weights from 2^-1074 to 2^1023; control points from 1e-300 to 1e300
+# under weight gauges 2^-1018 .. 2^1019): within 4 ulps of the exact point on 19,981 of 20,000
+# random calls, up to 62 ulps where weights many orders apart make the point sensitive to the
+# rounding of the basis functions, and more in a coordinate whose terms cancel (415 ulps where
+# it is 2e-4 of their size).
+# [measured: degree-3 sweeps against a Fraction Cox-de Boor oracle (20,000 random calls, 52,560 gauged), 2026-10-31]
 public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
     if (n_pts < 1) { return 0; }
     # A B-spline of degree d needs at least d+1 control points. Through 2.6.13
@@ -1537,58 +1828,40 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
     var pw_w = _f64arr_alloc(dp1);
     if (pw_x == 0 || pw_y == 0 || pw_z == 0 || pw_w == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
 
-    var j = 0;
-    while (j <= degree) {
-        var idx = k - degree + j;
-        var cp = load64(ctrl_pts + idx * 8);
-        var w = _f64arr_get(weights, idx);
-        _f64arr_set(pw_x, j, f64_mul(HVec3_x(cp), w));
-        _f64arr_set(pw_y, j, f64_mul(HVec3_y(cp), w));
-        _f64arr_set(pw_z, j, f64_mul(HVec3_z(cp), w));
-        _f64arr_set(pw_w, j, w);
-        j = j + 1;
+    # ⛔ 3.4.1 — A SUBNORMAL GAUGE WAS READ AS A POLE. The weights are a gauge: w and c w give
+    # the same curve. Weights times 2^-1023 lost their bits in P w and left final_w below
+    # DBL_MIN, which the divide refused: the documented invalid 0 for a curve the unit weights
+    # draw (roadmap [3.4.1], AU2-G4-F10); weights times 2^1020 overflowed P w (x = +Inf).
+    # ⛔ 3.4.1 (review) — TWO RESCALE RULES FAILED, EACH ON ONE SIDE. Weights scaled to [1, 2)
+    # whenever the largest lay outside [2^-500, 2^500] flushed a small weight the 3.4.0
+    # operations keep (degree 1, P0 = (1, 2, 3), P1 = (4, 5, 6), weights [2^-600, 2^600] at t = 0:
+    # the invalid 0, where 3.4.0 returns P0 exactly), and in-band weights met control points far
+    # from 1 unscaled (P = 1e300, weights 2^32: P w = +Inf). Rescaling only where final_w was
+    # unusable kept 3.4.0's lost numerators (P = 1e-100, 2e-100, weights 2^-1018, t = 1/2: (0, 0,
+    # 0), exact 1.5e-100). Both read the weights alone, where the numerators are the products P w.
+    # ⭐ The gauge is now read from every homogeneous input of the span, the weights AND the
+    # products P_j,c w_j. The 3.4.0 operations run where all of them lie in [2^-511, 2^511)
+    # (_calcx_nurbs_load's test, made as they are computed); otherwise the weights are taken
+    # again times the power of two that centres the inputs' range on 1 (_calcx_nurbs_gauge). A
+    # power of two commutes with every rounding while the values stay normal, so the result is
+    # the one the centred gauge gives from ANY gauge of the same weights: on degree-3 curves with
+    # control points of size 1e-300 .. 1e300 and weights times 2^E, E = -1018 .. 1019, every
+    # result is the unit-weight result bit for bit (3.4.0: 2,840 of 5,840 more than 4 ulps off at
+    # 1e-300 and at 1e300), and the three repros above return P0, 1.5e-100 and 1e300 exactly.
+    # ⚠ Inside the band a blend still underflows where alpha is below 2^-511 / |input|, which a
+    # t within 2^-511 of a knot (relative to the span) can make: there the 3.4.0 operations round
+    # it onto the subnormal grid, and a coordinate that is itself that small can end 1 unit of
+    # 2^-1074 from the correctly rounded value (a control point near 2^-490 at t near 2^-580:
+    # 2,033 of 20,000 such degree-1 points, exact 1.447 units -> 2). Always centring rounds each
+    # of those correctly, but scans every ordinary span: calc_nurbs_cubic_8 702-704 ns against
+    # this form's 607-610 (+16%); not taken.
+    # [measured: tests/edge_cases.tcyr, group "3.4.1 NUM3: calc_nurbs gauge at every magnitude"]
+    # [measured: degree-1 and degree-3 gauge sweeps, Fraction Cox-de Boor oracle, 3.4.0 and the 3.4.1 forms, 2026-10-31]
+    if (_calcx_nurbs_load(degree, ctrl_pts, weights, k, 0, pw_x, pw_y, pw_z, pw_w) == 0) {
+        var wsc = _calcx_nurbs_gauge(ctrl_pts, weights, k, degree);
+        if (wsc != 0) { _calcx_nurbs_load(degree, ctrl_pts, weights, k, wsc, pw_x, pw_y, pw_z, pw_w); }
     }
-
-    # De Boor triangular computation on 4-component homogeneous coords
-    var r = 1;
-    while (r <= degree) {
-        j = degree;
-        while (j >= r) {
-            var idx = k - degree + j;
-            var ki = _f64arr_get(knots, idx);
-            var ki_dr = _f64arr_get(knots, idx + degree + 1 - r);
-            var denom = f64_sub(ki_dr, ki);
-
-            # ⛔ THIS READ `< EPSILON_F64`. `denom` is a de Boor knot-span WIDTH —
-            # degree 1 in the caller's parameterisation — tested against an absolute
-            # 1e-12, so the same curve in different units takes a different branch.
-            # ⭐ By the span search's own invariant knots[idx] <= t <= knots[idx+d+1-r],
-            # so alpha is in [0,1] BY CONSTRUCTION and the division cannot overflow for
-            # any non-zero denom. Only denom == 0 can fail it; F64_TINY is that test.
-            # [measured: knot-scale sweep, fabricates P_last from s = 2^-40 down]
-            if (f64_lt(f64_abs(denom), F64_TINY) == 0) {
-                var alpha = f64_div(f64_sub(t, ki), denom);
-                var one_minus = f64_sub(F64_ONE, alpha);
-
-                var px = f64_add(f64_mul(one_minus, _f64arr_get(pw_x, j - 1)),
-                  f64_mul(alpha, _f64arr_get(pw_x, j)));
-                var py = f64_add(f64_mul(one_minus, _f64arr_get(pw_y, j - 1)),
-                  f64_mul(alpha, _f64arr_get(pw_y, j)));
-                var pz = f64_add(f64_mul(one_minus, _f64arr_get(pw_z, j - 1)),
-                  f64_mul(alpha, _f64arr_get(pw_z, j)));
-                var pw = f64_add(f64_mul(one_minus, _f64arr_get(pw_w, j - 1)),
-                  f64_mul(alpha, _f64arr_get(pw_w, j)));
-
-                _f64arr_set(pw_x, j, px);
-                _f64arr_set(pw_y, j, py);
-                _f64arr_set(pw_z, j, pz);
-                _f64arr_set(pw_w, j, pw);
-            }
-
-            j = j - 1;
-        }
-        r = r + 1;
-    }
+    _calcx_nurbs_tri(degree, knots, k, t, pw_x, pw_y, pw_z, pw_w);
 
     # Perspective divide
     var final_w = _f64arr_get(pw_w, degree);
@@ -1597,7 +1870,9 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
     # an absolute 1e-12 this rejected a valid curve as a pole purely for being
     # written in a small gauge, returning the invalid-input 0 for a curve it
     # accepts in another. The divide fails only at zero. [measured: gauge sweep]
-    if (f64_lt(f64_abs(final_w), F64_TINY) == 1) { return 0; }
+    # (3.4.1: and the test is that zero, as the comment always said; F64_TINY refused a
+    # subnormal blend, which a span of weights far apart can leave: [1, 2^-1060] at t = 0 is P0.)
+    if (f64_eq(final_w, 0) == 1) { return 0; }
 
     return hvec3_new(
       f64_div(_f64arr_get(pw_x, degree), final_w),
@@ -1615,13 +1890,31 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
 # out: pointer, the interpolated value (f64) written here.
 # Returns Ok(0) with the value: values[0] for t <= times[0], values[n-1] for
 # t >= times[n-1]; so one key (n = 1) is the constant values[0]. Err(HSB_ERR_INVALID_INPUT)
-# for n < 1, `out` untouched.
+# for n < 1, and for key times that are not in non-decreasing order (a key time below the
+# one before it); `out` untouched. Repeated key times are accepted. Neighbours are what is
+# compared, and a NaN compares with nothing, so a NaN key time is not refused (it is divided
+# through and the value is NaN where its segments are used, below) and hides the order
+# across it.
 # ⭐ 3.4.0 — REPLACES calc_hermite_tcb, which returned 0, a legal value, for n < 2
 # (audit D069). One key has a right answer, the clamp at both ends; no keys have none.
 # [measured: tests/edge_cases.tcyr, group "3.4.0: the interpolators and the partial derivative refuse, not 0"]
+# ⛔ 3.4.1 — THE KEY ORDER WAS NOT CHECKED. Only n < 1 and the end clamps were tested, so
+# times [0, 2, 1], values [0, 5, 10] at t = 1.5 returned Ok(10.0), the end clamp's value,
+# though t lies between keys 0 and 1 (roadmap [3.4.1], NU1); the segment search assumes the
+# order and read whatever its walk met. A grid out of order defines no spline: refused, as
+# calc_monotone_cubic_checked refuses one. The scan costs n - 1 comparisons per call.
+# [measured: tests/edge_cases.tcyr, group "3.4.1: calc_hermite_tcb_checked refuses unsorted keys"]
 #must_use
 public fn calc_hermite_tcb_checked(times, values, n, tension, continuity, bias, t, out) {
     if (n < 1) { return Err(HSB_ERR_INVALID_INPUT); }
+    var kprev = load64(times);
+    var ki = 1;
+    while (ki < n) {
+        var kt = load64(times + ki * 8);
+        if (f64_lt(kt, kprev) == 1) { return Err(HSB_ERR_INVALID_INPUT); }
+        kprev = kt;
+        ki = ki + 1;
+    }
     if (n == 1) {
         store64(out, _f64arr_get(values, 0));
         return Ok(0);
@@ -2083,9 +2376,19 @@ public fn calc_monotone_cubic_checked(xs, ys, n, x, out) {
     var nm1 = n - 1;
 
     # Compute secants (deltas) and interval widths (hs)
-    var deltas = _f64arr_alloc(nm1);
-    var hs = _f64arr_alloc(nm1);
-    if (deltas == 0 || hs == 0) { return Err(HSB_ERR_ALLOC); }    # see _f64arr_alloc (3.3.7)
+    # ⛔ 3.4.1 — EVERY CALL TOOK 3n - 2 DOUBLES FROM THE BUMP HEAP, which a hot loop grew
+    # without bound (roadmap [3.4.1], AU2-G4-F11's heap note). Up to n = 16 the three arrays
+    # are this stack array's thirds; past that each call still allocates.
+    var sbuf: i64[48];
+    var deltas = &sbuf;
+    var hs = &sbuf + 128;
+    var ms = &sbuf + 256;
+    if (n > 16) {
+        deltas = _f64arr_alloc(nm1);
+        hs = _f64arr_alloc(nm1);
+        ms = 0;
+        if (deltas == 0 || hs == 0) { return Err(HSB_ERR_ALLOC); }    # see _f64arr_alloc (3.3.7)
+    }
     var step332 = 0;  # 1: some secant is not finite; the set is 3.3.2's (see the loop's end)
     var slope_oor = 0;  # 1: some secant of a non-flat interval is below DBL_MIN (see the loop's end)
     var i = 0;
@@ -2242,7 +2545,7 @@ public fn calc_monotone_cubic_checked(xs, ys, n, x, out) {
     }
 
     # Initial tangents: average of adjacent secants
-    var ms = _f64arr_alloc(n);
+    if (ms == 0) { ms = _f64arr_alloc(n); }
     if (ms == 0) { return Err(HSB_ERR_ALLOC); }    # see _f64arr_alloc (3.3.7)
     _f64arr_set(ms, 0, _f64arr_get(deltas, 0));
     _f64arr_set(ms, nm1, _f64arr_get(deltas, nm1 - 1));
@@ -2669,7 +2972,8 @@ fn _calcx_fbm_3d_pass(acc, x, y, z, octaves, freq, persistence) {
 # freq: initial frequency (f64), amp: initial amplitude (f64),
 # persistence: amplitude multiplier per octave (f64, typically 0.5),
 # out: pointer, the noise value (f64) written here.
-# Returns as fbm_2d_checked (calc.cyr): Ok(0) with the octaves' weighted mean,
+# Returns as fbm_2d_checked (calc.cyr): Ok(0) with the octaves' weighted mean (in the
+# octaves' range, approximately [-1, 1], for persistence >= 0 only: see fbm_2d_checked),
 # Err(HSB_ERR_INVALID_INPUT) for octaves <= 0, Err(HSB_ERR_DIVISION_BY_ZERO) when the
 # weights sum to 0, `out` untouched on both; amp = 0 is the mean at amp = 1, and so is any amp
 # whose weights leave the range (+-Inf, subnormal, overflowing: see fbm_2d_checked).

@@ -9,6 +9,10 @@
 #derive(accessors)
 public struct HComplex { re; im; }
 
+# A complex number re + i im, an HComplex holding the two f64 as given, or 0 when its 16
+# bytes cannot be allocated (3.4.0). Every cx_* below returns what cx_new returns, so each
+# reports its own refused allocation the same way; an operand of 0 (a refusal the caller
+# did not check) is not tested for, and is read through.
 #must_use
 public fn cx_new(re, im) {
     var c = alloc(sizeof(HComplex));
@@ -18,31 +22,68 @@ public fn cx_new(re, im) {
     return c;
 }
 
+# 0 + 0i (cx_new: 0 when it cannot be allocated).
 #must_use
 public fn cx_zero() { return cx_new(0, 0); }
+# 1 + 0i (cx_new: 0 when it cannot be allocated).
 #must_use
 public fn cx_one() { return cx_new(F64_ONE, 0); }
+# 0 + 1i, the imaginary unit (cx_new: 0 when it cannot be allocated).
 #must_use
 public fn cx_i() { return cx_new(0, F64_ONE); }
+# r + 0i (cx_new: 0 when it cannot be allocated).
 #must_use
 public fn cx_real(r) { return cx_new(r, 0); }
+
+# The sign bit (3.4.1 SYM2): every negation that can meet a zero flips it with an XOR, which
+# is IEEE 754's negate on every pin (a few left here negate the constant 1). f64_neg(+-0)
+# returned +0 below cyrius 6.6.8 (six direct consumers pin 6.6.3), so there cx_conj(1 + 0i)
+# was 1 + 0i and cx_inv(Inf + 1i) lost Smith's -0.
+enum _CxBits {
+    _CX_SIGN = 0x8000_0000_0000_0000;   # the sign-bit mask
+}
+
+# _cx_div_wide's scaling (3.4.1): from 2^1021 a divisor part takes the quarter scale.
+# _CX_DIV_SAFE is cx_div's fast-path bound (3.4.1 SYM2): below it no Smith sum overflows.
+enum _CxDivWide {
+    _CX_DIV_WIDE = 0x7FC0_0000_0000_0000;      # 2^1021
+    _CX_DIV_QUARTER = 0x3FD0_0000_0000_0000;   # 0.25
+    _CX_DIV_FOUR = 0x4010_0000_0000_0000;      # 4
+    _CX_DIV_SAFE = 0x7FD0_0000_0000_0000;      # 2^1022
+}
+
+# The extended-exponent quotient's bits (3.4.1 SYM3): _CX_EXP picks the exponent field, zero
+# exactly for a subnormal or zero; _CX_TWO64 lifts a subnormal to read its exponent, and
+# _CX_TWOM1000 is where _cx_xd puts a numerator to divide straight into the subnormals.
+enum _CxExt {
+    _CX_EXP = 0x7FF0_0000_0000_0000;       # the exponent-field mask: bits, not a value
+    _CX_TWO64 = 0x43F0_0000_0000_0000;     # 2^64
+    _CX_TWOM1000 = 0x0170_0000_0000_0000;  # 2^-1000
+}
 
 # ================================================================
 # Arithmetic
 # ================================================================
 
+# a + b, each part one IEEE addition (correctly rounded). 0 when not allocated.
 #must_use
 public fn cx_add(a, b) {
     return cx_new(f64_add(HComplex_re(a), HComplex_re(b)),
       f64_add(HComplex_im(a), HComplex_im(b)));
 }
 
+# a - b, each part one IEEE subtraction (correctly rounded). 0 when not allocated.
 #must_use
 public fn cx_sub(a, b) {
     return cx_new(f64_sub(HComplex_re(a), HComplex_re(b)),
       f64_sub(HComplex_im(a), HComplex_im(b)));
 }
 
+# a * b = (ar br - ai bi) + i (ar bi + ai br), the textbook form with no compensated or
+# fused products: each part is within a few ulp of |a| |b| (normwise), but a part whose two
+# products cancel can lose its relative accuracy, and a product that passes DBL_MAX makes
+# its part +-Inf or NaN (Inf - Inf) even where the exact part fits: (1e300 + 1e300 i) *
+# (1e10 - 1e10 i) is (+Inf, NaN) for (2e310, 0). 0 when not allocated.
 #must_use
 public fn cx_mul(a, b) {
     var ar = HComplex_re(a); var ai = HComplex_im(a);
@@ -51,6 +92,14 @@ public fn cx_mul(a, b) {
       f64_add(f64_mul(ar, bi), f64_mul(ai, br)));
 }
 
+# a / b. Smith's algorithm (below), so the quotient is scale-covariant over the whole
+# range: no |b|^2 is formed. Accuracy: a few ulp normwise; a component of the quotient
+# that cancels (|re| or |im| << |a / b|) carries the rounding of the larger one. The
+# pole b = 0 + 0i exactly (either zero's sign) answers cx_zero(), 0 + 0i, the sentinel
+# 2.6.14 documented (a [3.5.0] row); a NaN part anywhere gives NaN parts; a finite a
+# over a b with an infinite part is 0 (C99 G.5.1, its signs from the reference
+# _Cdivd). Returns 0 when the result cannot be allocated; an operand of 0 (a refused
+# cx_*) is the caller's unchecked failure and is not tested.
 #must_use
 public fn cx_div(a, b) {
     # ⛔ THIS IS THE DEFECT `complex.cyr` HAS NAMED IN ITS OWN COMMENT SINCE 2.6.14
@@ -72,19 +121,88 @@ public fn cx_div(a, b) {
     # ⭐ SMITH'S ALGORITHM IS 0/401. Divide through by the LARGER component first,
     # so the intermediate is |smaller/larger| <= 1 and the squaring never happens:
     # the whole dynamic range stays representable and the result is scale-covariant
-    # everywhere. The only input that still fails is b = 0 exactly, which is the
-    # documented pole and keeps its `cx_zero()` sentinel. (Through 3.3.1 a NaN real
-    # part with a zero imaginary part reached that sentinel too; see the guard below.)
-    # Threshold candidates fail 241/235/170/93/89 decades; Smith's fails none.
+    # everywhere. Threshold candidates fail 241/235/170/93/89 decades; Smith's fails
+    # none. (Through 3.3.1 a NaN real part with a zero imaginary part reached the pole
+    # sentinel too; see the guard below.)
     # [measured: docs/audit/2026-09-09-epsilon-open.json]
+    # ⛔ 3.4.1 — "THE ONLY INPUT THAT STILL FAILS IS b = 0 EXACTLY" WAS FALSE AT THE TOP
+    # OF THE RANGE. Smith's denominator br + bi*rb is up to twice max|b|, and its
+    # numerators up to twice max|a|, so either one overflowed from about DBL_MAX / 2 and
+    # the quotient came back 0 (x / Inf) or +-Inf or NaN (Inf / Inf) where it is an
+    # ordinary number: cx_div(2^1023 + 0i, 7FE8F0A3D70A3D71 + 7FE724C3FA1D5B7A i) was
+    # (0, -0) for 0.3447 - 0.3199i, cx_div(DBL_MAX(1 + i), 2 + 1.9i) had the real part
+    # +Inf for 7FE06643F3E3BE10. When the sum or a numerator is not finite and every part
+    # of b is, the quotient is taken again on operands scaled by 1/4 (_cx_div_wide); the
+    # fast path is the 3.4.0 arithmetic, bit for bit. And a finite a over an infinite b, NaN
+    # through 3.4.0 when both of b's parts were infinite, is 0 (C99 G.5.1).
+    # [measured: tests/hisab.tcyr, group "3.4.1: cx_div / cx_inv near DBL_MAX and over an infinite divisor"]
+    # The rescue also runs for an INFINITE dividend over a finite b (3.4.1 SYM2, RV-SYM N3):
+    # an infinite part of a passes the 1/4 scaling unchanged, so where Smith's unscaled sum
+    # made Inf / Inf = NaN, the scaled one is Inf / (a finite denominator): (Inf + 0i) /
+    # (2^1023 (1 + i)) is Inf - Inf i (3.4.0: NaN + NaN i). Each part is what Smith's formula
+    # gives on the scaled operands -- a signed infinity, or a NaN where the formula itself
+    # forms Inf - Inf or Inf * 0, as 3.4.0's did away from DBL_MAX: (Inf + 0i) / (2 + 0i) is
+    # Inf + NaN i in both. It is not C99's recovery for an infinite dividend.
+    # ⭐ 3.4.1 SYM2 — ONE TEST ON THE INPUTS INSTEAD OF THREE ON THE SUMS (RV-SYM S4). When
+    # |ar| + |ai| + |b's larger part| < 2^1022 no sum can overflow -- |db| <= 2 max|b| <
+    # 2^1023 and |nr|, |ni| <= |ar| + |ai| < 2^1022, each within a few roundings of those
+    # bounds -- and a NaN or infinite part fails the test, so the three finiteness tests run
+    # only where it fails: the same quotient bit for bit, on one test in the common case.
+    # [measured: scratch bit-identity probe, 3.4.1 SYM2 tree, 400,000 inputs, 2026-10-31; cycc 6.7.18]
+    # ⛔ 3.4.1 SYM3 — AND AT THE BOTTOM OF THE RANGE SMITH'S INTERMEDIATES UNDERFLOWED. Its
+    # ratio rb = bi / br is subnormal or 0 when |bi| < 2^-1022 |br|, and the ai * rb term went
+    # with it: cx_div(0 + 2^1000 i, 2^100 + 2^-1000 i) had the real part 0 for 2^-200. A
+    # subnormal denominator (b itself subnormal) and a subnormal numerator over a |b| below 1
+    # (which the division then scales up) lost bits the same way: of 200,000 quotients with
+    # every part on every binade, 3,656 had a part off by more than 4 ulp times its
+    # cancellation, up to 9.1e15 ulp. When the ratio or the denominator is subnormal or zero,
+    # or a numerator is subnormal, or zero where its plain term is too (one integer test on
+    # their exponent fields, then _cx_lost), and b's smaller part is not 0, the same Smith's
+    # formula is evaluated again on numbers that keep their exponent apart (_cx_div_x), every
+    # operation rounded to 53 bits as here and none underflowing, and each part rounded once
+    # into place: Smith's quotient as if the exponent range had no floor. Of the 200,000
+    # quotients none is now outside the bound, and the worst part that does not cancel in that
+    # sample is 2.6 ulp off, as on ordinary inputs (2.8; a sample's worst, not a bound: 2.9 at
+    # cancellation 1.71 over subnormal divisors). Every quotient whose Smith
+    # intermediates are all normal is the arithmetic below, bit for bit (0 of 341,795 such
+    # among 400,000 inputs changed), and the new path gives those same bits wherever its own
+    # intermediates are normal: of the 6,929 parts that changed, 3,778 were outside the bound,
+    # 3,135 moved closer or kept their error (most a zero that now has the sign of the value
+    # it rounds), and 16 moved away by at most 1 ulp, inside it. Cost: the fast path's one
+    # extra integer test; a quotient that takes the new path costs about 250 ns, and on most
+    # of them it returns Smith's own bits (a subnormal may have lost nothing): 88% of those in
+    # a full-range sample, 82% where the ratio is subnormal.
+    # ⛔ 3.4.1 SYM4 — AND THAT TEST FIRED ON EXACT ZEROS. A zero's exponent field is 0 as a
+    # subnormal's is, and nr or ni is exactly 0 on ordinary inputs: 0 / b, z / z, a real or an
+    # imaginary quotient took the path and got Smith's bits back, at ×6.7 to ×9.5 of 3.4.0. A
+    # zero numerator can have lost bits only where its plain term is itself zero or subnormal
+    # while the other part is not (_cx_lost); those are all the path takes now, and the second
+    # test sits inside the rare branch, so the fast path pays nothing: bit-identical on 360,000
+    # rows, and an exact zero costs ×1.6 to ×1.8 of 3.4.0 (45 to 50 ns), the price of that test.
+    # [measured: scratch exact-rational sweeps cxora.py / cxbit.py / cxchg.py, 3.4.0, s11 and the SYM3 tree, 2026-11-01]
+    # [measured: scratch exact-rational sweep (cxora.py), 3.4.0 / s11 / SYM3 trees, 2026-10-31; cycc 6.7.18]
+    # [measured: scratch probes r2cnt2.cyr and r2b.cyr, 3.4.0, s23 and the SYM4 tree, 2026-11-01]
     var br = HComplex_re(b); var bi = HComplex_im(b);
     var ar = HComplex_re(a); var ai = HComplex_im(a);
     if (f64_lt(f64_abs(bi), f64_abs(br)) == 1) {
         var rb = f64_div(bi, br);
         var db = f64_add(br, f64_mul(bi, rb));
         if (f64_eq(db, 0) == 1) { return cx_zero(); }
-        return cx_new(f64_div(f64_add(ar, f64_mul(ai, rb)), db),
-          f64_div(f64_sub(ai, f64_mul(ar, rb)), db));
+        var nr = f64_add(ar, f64_mul(ai, rb));
+        var ni = f64_sub(ai, f64_mul(ar, rb));
+        if (f64_lt(f64_add(f64_add(f64_abs(ar), f64_abs(ai)), f64_abs(br)), _CX_DIV_SAFE) == 0) {
+            if (f64_lt(f64_abs(db), F64_POS_INF) == 0 || f64_lt(f64_abs(nr), F64_POS_INF) == 0
+              || f64_lt(f64_abs(ni), F64_POS_INF) == 0) {
+                return _cx_div_wide(ar, ai, br, bi, f64_div(nr, db), f64_div(ni, db));
+            }
+        }
+        var lb = ((rb & _CX_EXP) - 1) | ((db & _CX_EXP) - 1);
+        if ((lb | ((nr & _CX_EXP) - 1) | ((ni & _CX_EXP) - 1)) < 0 && (bi << 1) != 0) {
+            if (lb < 0 || _cx_lost(nr, ar, ai) == 1 || _cx_lost(ni, ai, ar) == 1) {
+                return _cx_div_x(ar, ai, br, bi);
+            }
+        }
+        return cx_new(f64_div(nr, db), f64_div(ni, db));
     }
     # Reached when |bi| >= |br| OR when the comparison is unordered (a NaN). So
     # bi == 0 implies br == 0 only for a non-NaN br, and the pole test reads both.
@@ -96,20 +214,248 @@ public fn cx_div(a, b) {
     var ri = f64_div(br, bi);
     var di = f64_add(f64_mul(br, ri), bi);
     if (f64_eq(di, 0) == 1) { return cx_zero(); }
-    return cx_new(f64_div(f64_add(f64_mul(ar, ri), ai), di),
-      f64_div(f64_sub(f64_mul(ai, ri), ar), di));
+    var nr2 = f64_add(f64_mul(ar, ri), ai);
+    var ni2 = f64_sub(f64_mul(ai, ri), ar);
+    if (f64_lt(f64_add(f64_add(f64_abs(ar), f64_abs(ai)), f64_abs(bi)), _CX_DIV_SAFE) == 0) {
+        if (f64_lt(f64_abs(di), F64_POS_INF) == 0 || f64_lt(f64_abs(nr2), F64_POS_INF) == 0
+          || f64_lt(f64_abs(ni2), F64_POS_INF) == 0) {
+            return _cx_div_wide(ar, ai, br, bi, f64_div(nr2, di), f64_div(ni2, di));
+        }
+    }
+    var li = ((ri & _CX_EXP) - 1) | ((di & _CX_EXP) - 1);
+    if ((li | ((nr2 & _CX_EXP) - 1) | ((ni2 & _CX_EXP) - 1)) < 0 && (br << 1) != 0) {
+        if (li < 0 || _cx_lost(nr2, ai, ar) == 1 || _cx_lost(ni2, ar, ai) == 1) {
+            return _cx_div_x(ar, ai, br, bi);
+        }
+    }
+    return cx_new(f64_div(nr2, di), f64_div(ni2, di));
 }
 
-#must_use
-public fn cx_conj(a) { return cx_new(HComplex_re(a), f64_neg(HComplex_im(a))); }
-#must_use
-public fn cx_neg(a) { return cx_new(f64_neg(HComplex_re(a)), f64_neg(HComplex_im(a))); }
+# Internal: 1 when the numerator n = p + m * ratio (either sign) may have lost bits below the
+# range, 0 when it has not. A normal n has not. A subnormal n has. A ZERO n has only where its
+# plain term p is itself zero or subnormal while m is not, so that the m * ratio term may have
+# underflowed; a zero beside a normal p is an exact cancellation, and 0 / b has nothing to lose.
+fn _cx_lost(n, p, m) {
+    if ((n & _CX_EXP) != 0) { return 0; }
+    if ((n << 1) != 0) { return 1; }
+    if ((p & _CX_EXP) == 0 && (m << 1) != 0) { return 1; }
+    return 0;
+}
 
+# Internal: the exponent e of a finite x != 0, 2^e <= |x| < 2^(e + 1), subnormals included.
+fn _cx_xe(x) {
+    var f = (x >> 52) & 0x7FF;
+    if (f != 0) { return f - 1023; }
+    return (((f64_mul(x, _CX_TWO64) >> 52) & 0x7FF) - 1023) - 64;
+}
+
+# Internal: the significand of a finite x != 0 with x's sign, |.| in [1, 2): x = it * 2^_cx_xe(x).
+fn _cx_xm(x) {
+    var y = x;
+    if (((x >> 52) & 0x7FF) == 0) { y = f64_mul(x, _CX_TWO64); }
+    return (y & 0x800F_FFFF_FFFF_FFFF) | 0x3FF0_0000_0000_0000;
+}
+
+# Internal: m * 2^e for a finite m and an integer e whose product is 2^-1022 or more in
+# magnitude, or +-Inf past DBL_MAX: exact, a power-of-two scaling of a normal result. Its two
+# callers never ask for less (_cx_xs scales by at most 2^-60, _cx_xd only quotients of
+# 2^-1022 or more).
+fn _cx_xl(m, e) {
+    if ((m << 1) == 0) { return m; }
+    var k = _cx_xe(m) + e;
+    if (k > 1023) { return (m & _CX_SIGN) | 0x7FF0_0000_0000_0000; }
+    return f64_mul(_cx_xm(m), (k + 1023) << 52);
+}
+
+# The extended numbers of _cx_div_x and _cx_inv_x (3.4.1 SYM3): an i64[2] block { m, e } for
+# m * 2^e, m a double with |m| in [1, 2) or a signed zero (e is then 0), e any integer. Each
+# operation rounds its significand once, as the double operation would, and keeps the exponent
+# apart, so none under- or overflows; on values whose double results are normal each gives the
+# double result's bits exactly, since a rounding to 53 bits does not depend on the scale.
+
+# Internal: o = m * 2^e, normalised.
+fn _cx_xn(m, e, o) {
+    if ((m << 1) == 0) {
+        store64(o, m);
+        store64(o + 8, 0);
+        return 0;
+    }
+    store64(o, _cx_xm(m));
+    store64(o + 8, e + _cx_xe(m));
+    return 0;
+}
+
+# Internal: o = a * b, o = a / b, o = a + b and o = -a for extended a, b; o may be a or b.
+fn _cx_xp(a, b, o) { return _cx_xn(f64_mul(load64(a), load64(b)), load64(a + 8) + load64(b + 8), o); }
+fn _cx_xq(a, b, o) { return _cx_xn(f64_div(load64(a), load64(b)), load64(a + 8) - load64(b + 8), o); }
+fn _cx_xg(a, o) {
+    store64(o, load64(a) ^ _CX_SIGN);
+    store64(o + 8, load64(a + 8));
+    return 0;
+}
+# A term more than 2^60 below the other is below a quarter of its last bit, so the double
+# sum rounds it away too and so does this; zeros add with their IEEE signs.
+fn _cx_xs(a, b, o) {
+    var ma = load64(a);
+    var ea = load64(a + 8);
+    var mb = load64(b);
+    var eb = load64(b + 8);
+    if ((mb << 1) == 0) {
+        if ((ma << 1) == 0) { ma = f64_add(ma, mb); }
+        return _cx_xn(ma, ea, o);
+    }
+    if ((ma << 1) == 0) { return _cx_xn(mb, eb, o); }
+    if (ea < eb) {
+        var tm = ma;
+        var te = ea;
+        ma = mb;
+        ea = eb;
+        mb = tm;
+        eb = te;
+    }
+    if (ea - eb > 60) { return _cx_xn(ma, ea, o); }
+    return _cx_xn(f64_add(ma, _cx_xl(mb, eb - ea)), ea, o);
+}
+
+# Internal: the double nearest n / d for extended n, d (d not 0), one rounding: a quotient of
+# 2^-1022 or more is the significands' quotient scaled exactly (or +-Inf past DBL_MAX); a
+# smaller one is one IEEE division of n's significand at 2^-1000 by d's scaled to match, so
+# it rounds once into the subnormals, as a double division would.
+fn _cx_xd(n, d) {
+    var mn = load64(n);
+    var md = load64(d);
+    if ((mn << 1) == 0) { return f64_div(mn, md); }
+    var e = load64(n + 8) - load64(d + 8);
+    if (e >= 0 - 1021) { return _cx_xl(f64_div(mn, md), e); }
+    if (e < 0 - 1130) { return f64_div(mn, md) & _CX_SIGN; }
+    return f64_div(f64_mul(mn, _CX_TWOM1000), f64_mul(md, (23 - e) << 52));
+}
+
+# Internal: cx_div's quotient for finite a, b with b's smaller part not 0, when Smith's ratio,
+# denominator or a numerator came out subnormal or zero (3.4.1 SYM3): the same Smith's
+# formula, branch for branch and operation for operation, on extended numbers, rounded once
+# into place (_cx_xd). It is the quotient Smith's algorithm gives where no intermediate
+# underflows, and where cx_div's doubles underflowed it keeps the bits they lost.
+fn _cx_div_x(ar, ai, br, bi) {
+    var xr: i64[2];
+    var xi: i64[2];
+    var yr: i64[2];
+    var yi: i64[2];
+    var r: i64[2];
+    var d: i64[2];
+    var n1: i64[2];
+    var n2: i64[2];
+    var t: i64[2];
+    _cx_xn(ar, 0, &xr);
+    _cx_xn(ai, 0, &xi);
+    _cx_xn(br, 0, &yr);
+    _cx_xn(bi, 0, &yi);
+    if (f64_lt(f64_abs(bi), f64_abs(br)) == 1) {
+        _cx_xq(&yi, &yr, &r);
+        _cx_xp(&yi, &r, &t);
+        _cx_xs(&yr, &t, &d);
+        _cx_xp(&xi, &r, &t);
+        _cx_xs(&xr, &t, &n1);
+        _cx_xp(&xr, &r, &t);
+        _cx_xg(&t, &t);
+        _cx_xs(&xi, &t, &n2);
+    } else {
+        _cx_xq(&yr, &yi, &r);
+        _cx_xp(&yr, &r, &t);
+        _cx_xs(&t, &yi, &d);
+        _cx_xp(&xr, &r, &t);
+        _cx_xs(&t, &xi, &n1);
+        _cx_xp(&xi, &r, &t);
+        _cx_xg(&xr, &n2);
+        _cx_xs(&t, &n2, &n2);
+    }
+    return cx_new(_cx_xd(&n1, &d), _cx_xd(&n2, &d));
+}
+
+# Smith's quotient (ar + i ai) / (br + i bi), both branches of cx_div, into out[0], out[1].
+# _cx_div_wide calls it on scaled operands that are finite with b != 0 and every part at
+# most 2^1022, so no sum below can overflow.
+fn _cx_smith_into(ar, ai, br, bi, out) {
+    if (f64_lt(f64_abs(bi), f64_abs(br)) == 1) {
+        var rb = f64_div(bi, br);
+        var db = f64_add(br, f64_mul(bi, rb));
+        store64(out, f64_div(f64_add(ar, f64_mul(ai, rb)), db));
+        store64(out + 8, f64_div(f64_sub(ai, f64_mul(ar, rb)), db));
+        return 0;
+    }
+    var ri = f64_div(br, bi);
+    var di = f64_add(f64_mul(br, ri), bi);
+    store64(out, f64_div(f64_add(f64_mul(ar, ri), ai), di));
+    store64(out + 8, f64_div(f64_sub(f64_mul(ai, ri), ar), di));
+    return 0;
+}
+
+# cx_div / cx_inv's quotient when Smith's sum or a numerator came out non-finite; qr, qi
+# are the quotient that arithmetic gave, returned unchanged unless a rule below applies.
+#   - every part of b finite: a sum passes DBL_MAX only from a part of 2^1022 or more.
+#     When b's larger part is 2^1021 or more, a and b are both scaled by 1/4,
+#     which leaves the quotient unchanged and every sum below 2^1023; otherwise it was
+#     a numerator, so a alone is scaled and the quotient multiplied by 4 after, exact
+#     unless the quotient itself overflows. A power-of-two scaling is exact, except that
+#     a subnormal part of a scaled operand loses its two lowest bits, which is below
+#     the quotient's own rounding: wherever a sum of finite parts overflows, Smith's ratio
+#     is at least 2^-53, so _cx_div_lo's subnormal ratio cannot arise here (3.4.1 SYM3). An infinite
+#     or NaN part of a passes through the scaling unchanged, so an
+#     infinite a over a b of 2^1023 is the infinity it is, (Inf + 0i) / (2^1023 (1 + i))
+#     = Inf - Inf i, where the unscaled Inf / Inf made it NaN + NaN i.
+#   - b infinite (a part +-Inf, the other anything), where Smith's gave a NaN (Inf / Inf
+#     in its ratio): 0 * (ar c + ai d) + i 0 * (ai c - ar d), c and d each +-1 for an
+#     infinite part and +-0 otherwise, with the part's sign -- the recovery the reference
+#     _Cdivd runs on the same NaN. For a finite a it is C99 G.5.1's zero; for an a with an
+#     infinite or NaN part each sum is infinite or NaN, so both parts are NaN, as they
+#     were. Where Smith's already gave zeros (one infinite part: x / Inf), they are kept.
+#   - otherwise (b has a NaN part and no infinite one): qr + i qi, Smith's own NaN.
+fn _cx_div_wide(ar, ai, br, bi, qr, qi) {
+    var fb = 0;
+    if (f64_lt(f64_abs(br), F64_POS_INF) == 1 && f64_lt(f64_abs(bi), F64_POS_INF) == 1) { fb = 1; }
+    if (fb == 1) {
+        var q: i64[2];
+        var mb = f64_abs(br);
+        if (f64_lt(mb, f64_abs(bi)) == 1) { mb = f64_abs(bi); }
+        if (f64_lt(mb, _CX_DIV_WIDE) == 0) {
+            _cx_smith_into(f64_mul(ar, _CX_DIV_QUARTER), f64_mul(ai, _CX_DIV_QUARTER),
+              f64_mul(br, _CX_DIV_QUARTER), f64_mul(bi, _CX_DIV_QUARTER), &q);
+            return cx_new(load64(&q), load64(&q + 8));
+        }
+        _cx_smith_into(f64_mul(ar, _CX_DIV_QUARTER), f64_mul(ai, _CX_DIV_QUARTER), br, bi, &q);
+        return cx_new(f64_mul(load64(&q), _CX_DIV_FOUR), f64_mul(load64(&q + 8), _CX_DIV_FOUR));
+    }
+    var binf = 0;
+    if (f64_eq(f64_abs(br), F64_POS_INF) == 1 || f64_eq(f64_abs(bi), F64_POS_INF) == 1) { binf = 1; }
+    var qnan = 0;
+    if (f64_eq(qr, qr) == 0 || f64_eq(qi, qi) == 0) { qnan = 1; }
+    if (binf == 1 && qnan == 1) {
+        var c = br & 0x8000_0000_0000_0000;
+        if (f64_eq(f64_abs(br), F64_POS_INF) == 1) { c = c | F64_ONE; }
+        var d = bi & 0x8000_0000_0000_0000;
+        if (f64_eq(f64_abs(bi), F64_POS_INF) == 1) { d = d | F64_ONE; }
+        return cx_new(f64_mul(0, f64_add(f64_mul(ar, c), f64_mul(ai, d))),
+          f64_mul(0, f64_sub(f64_mul(ai, c), f64_mul(ar, d))));
+    }
+    return cx_new(qr, qi);
+}
+
+# The conjugate re - i im, exact (the sign bit of im flipped). 0 when not allocated.
+#must_use
+public fn cx_conj(a) { return cx_new(HComplex_re(a), HComplex_im(a) ^ _CX_SIGN); }
+# -a, exact (both sign bits flipped). 0 when not allocated.
+#must_use
+public fn cx_neg(a) { return cx_new(HComplex_re(a) ^ _CX_SIGN, HComplex_im(a) ^ _CX_SIGN); }
+
+# a * s for a real f64 s, each part one IEEE product. 0 when not allocated.
 #must_use
 public fn cx_scale(a, s) {
     return cx_new(f64_mul(HComplex_re(a), s), f64_mul(HComplex_im(a), s));
 }
 
+# |a|^2 = re^2 + im^2, the plain sum of squares (three roundings): it overflows to +Inf
+# once |a| passes about 2^512 and flushes toward 0 below about 2^-537, where |a|^2 itself is
+# out of range. cx_abs does not go through it there.
 #must_use
 public fn cx_norm_sq(a) {
     return f64_add(f64_mul(HComplex_re(a), HComplex_re(a)),
@@ -144,30 +490,90 @@ public fn cx_abs(a) {
     return f64_sqrt(ns);
 }
 
+# arg a = ganita_f64_atan2(im, re), in [-pi, pi], with ganita's accuracy and its signed
+# zero and infinity cases: arg(-0 - 0i) = -pi.
 #must_use
 public fn cx_arg(a) { return ganita_f64_atan2(HComplex_im(a), HComplex_re(a)); }
 
+# 1 / a: cx_div(1 + 0i, a) specialised, the same Smith's form and the same answers at
+# the edges -- a = 0 + 0i exactly answers the cx_zero() sentinel, a NaN part NaN parts,
+# an infinite a 0 (C99 G.5.1), and parts near DBL_MAX are rescaled (3.4.1). Returns 0
+# when the result cannot be allocated.
 #must_use
 public fn cx_inv(a) {
     # ⭐ Smith's, specialised to a numerator of 1+0i — same reason as `cx_div`, and
     # deliberately the same shape so the two cannot drift apart. `cx_norm_sq` was
     # the whole problem here: it squares before anything else, so |a|² was already
     # 0 or +Inf outside ~1e±154 and no threshold could see past it.
+    # ⛔ 3.4.1 — AND ITS DENOMINATOR OVERFLOWED FROM ABOUT DBL_MAX / 2, as cx_div's did:
+    # cx_inv(DBL_MAX(1 + i)) was (0, -0) for (0002000000000000, 8002000000000000). The
+    # same rescue, _cx_div_wide, with the numerator 1 + 0i.
+    # [measured: tests/hisab.tcyr, group "3.4.1: cx_div / cx_inv near DBL_MAX and over an infinite divisor"]
+    # ⛔ 3.4.1 SYM3 — AND AT THE BOTTOM, AS cx_div's: a subnormal ratio kept only the bits
+    # above 2^-1074, and dividing it by a denominator below 1 scaled that rounding up into a
+    # normal part: cx_inv(1.25 * 2^-40 + 2^-1074 i).im was 1,311 ulp off. A subnormal
+    # denominator lost both parts. Of 200,000 inverses with every part on every binade, 104
+    # were off by more than 4 ulp, up to 1.0e7 ulp. When the ratio or the denominator is
+    # subnormal or zero and the smaller part is not 0, the same Smith's formula is evaluated
+    # on cx_div's extended numbers (_cx_inv_x): none of the 200,000 is off by more than 2.0
+    # ulp now, and every inverse whose Smith intermediates are normal is the arithmetic below,
+    # bit for bit.
+    # [measured: scratch exact-rational sweeps cxora.py / cxbit.py, 3.4.0, s11 and the SYM3 tree, 2026-11-01]
     var ar = HComplex_re(a); var ai = HComplex_im(a);
     if (f64_lt(f64_abs(ai), f64_abs(ar)) == 1) {
         var rb = f64_div(ai, ar);
         var db = f64_add(ar, f64_mul(ai, rb));
         if (f64_eq(db, 0) == 1) { return cx_zero(); }
-        return cx_new(f64_div(F64_ONE, db), f64_neg(f64_div(rb, db)));
+        if (f64_lt(f64_abs(db), F64_POS_INF) == 0) {
+            return _cx_div_wide(F64_ONE, 0, ar, ai, f64_div(F64_ONE, db), f64_div(rb, db) ^ _CX_SIGN);
+        }
+        if (((((rb & _CX_EXP) - 1) | ((db & _CX_EXP) - 1)) < 0) && (ai << 1) != 0) {
+            return _cx_inv_x(ar, ai);
+        }
+        return cx_new(f64_div(F64_ONE, db), f64_div(rb, db) ^ _CX_SIGN);
     }
     # Both parts, as in cx_div: a NaN+0i argument returned 0+0i through 3.3.1.
     if (f64_eq(ai, 0) == 1 && f64_eq(ar, 0) == 1) { return cx_zero(); }
     var ri = f64_div(ar, ai);
     var di = f64_add(f64_mul(ar, ri), ai);
     if (f64_eq(di, 0) == 1) { return cx_zero(); }
-    return cx_new(f64_div(ri, di), f64_neg(f64_div(F64_ONE, di)));
+    if (f64_lt(f64_abs(di), F64_POS_INF) == 0) {
+        return _cx_div_wide(F64_ONE, 0, ar, ai, f64_div(ri, di), f64_div(F64_ONE, di) ^ _CX_SIGN);
+    }
+    if (((((ri & _CX_EXP) - 1) | ((di & _CX_EXP) - 1)) < 0) && (ar << 1) != 0) {
+        return _cx_inv_x(ar, ai);
+    }
+    return cx_new(f64_div(ri, di), f64_div(F64_ONE, di) ^ _CX_SIGN);
 }
 
+# Internal: cx_inv's inverse for finite a with its smaller part not 0, when Smith's ratio or
+# denominator came out subnormal or zero (3.4.1 SYM3): cx_inv's Smith's formula, branch for
+# branch, on _cx_div_x's extended numbers, each part rounded once into place.
+fn _cx_inv_x(ar, ai) {
+    var yr: i64[2];
+    var yi: i64[2];
+    var one: i64[2];
+    var r: i64[2];
+    var d: i64[2];
+    var t: i64[2];
+    _cx_xn(ar, 0, &yr);
+    _cx_xn(ai, 0, &yi);
+    _cx_xn(F64_ONE, 0, &one);
+    if (f64_lt(f64_abs(ai), f64_abs(ar)) == 1) {
+        _cx_xq(&yi, &yr, &r);
+        _cx_xp(&yi, &r, &t);
+        _cx_xs(&yr, &t, &d);
+        return cx_new(_cx_xd(&one, &d), _cx_xd(&r, &d) ^ _CX_SIGN);
+    }
+    _cx_xq(&yr, &yi, &r);
+    _cx_xp(&yr, &r, &t);
+    _cx_xs(&t, &yi, &d);
+    return cx_new(_cx_xd(&r, &d), _cx_xd(&one, &d) ^ _CX_SIGN);
+}
+
+# r (cos theta + i sin theta), ganita's cos and sin times r. It cannot land on an axis
+# (cos(fl(pi / 2)) is about 6e-17, not 0), and an infinite r beside a zero sine or cosine
+# gives a NaN part: cx_from_polar(+Inf, 0) is (+Inf, NaN). 0 when not allocated.
 #must_use
 public fn cx_from_polar(r, theta) {
     return cx_new(f64_mul(r, f64_cos(theta)), f64_mul(r, f64_sin(theta)));
@@ -177,6 +583,10 @@ public fn cx_from_polar(r, theta) {
 # Elementary functions
 # ================================================================
 
+# e^a = e^re (cos im + i sin im). e^re overflows to +Inf above re = 709.78 even where the
+# product with a cosine or sine below 1 fits, and then a zero sine or cosine gives a NaN
+# part: cx_exp(710 + 0i) is (+Inf, NaN), where C99 cexp gives (+Inf, +0). 0 when not
+# allocated.
 #must_use
 public fn cx_exp(a) {
     var r = f64_exp(HComplex_re(a));
@@ -184,6 +594,10 @@ public fn cx_exp(a) {
       f64_mul(r, f64_sin(HComplex_im(a))));
 }
 
+# ln a = ln|a| + i arg a, the principal branch, with cx_abs's rescaled modulus and ganita's
+# ln and atan2. ln 0 is (-Inf, arg 0). The real part is ln of a rounded modulus, so it
+# loses its relative accuracy as |a| nears 1: cx_ln(1 + 1e-10 i).re is 0, exact 5e-21.
+# 0 when not allocated.
 #must_use
 public fn cx_ln(a) {
     return cx_new(f64_ln(cx_abs(a)), cx_arg(a));
@@ -336,8 +750,10 @@ var _CX_POWF_WHOLE_TURNS = 0x4350_0000_0000_0000;  # 2^54
 # part takes its sign from the side n*arg(z) reaches the axis from: y's sign bit on the
 # negative real axis, x's on the imaginary one, and a negative n turns the other way.
 # Those are the signs IEEE repeated multiplication gives -- (+0 + 2i)^2 = -4 + 0i,
-# (-0 + 2i)^2 = -4 - 0i -- and on k = 1 (n = 0.5) the signs csqrt gives. Returns 0 for
-# every other input, which then takes the polar form exactly as before.
+# (-0 + 2i)^2 = -4 - 0i -- and on k = 1 (n = 0.5) the signs csqrt gives. Returns 1 for
+# every other input, which then takes the polar form exactly as before; 0 is a refused
+# allocation (3.4.1), the caller's answer, where it used to fall through to the polar form and
+# come back with an ulp-sized part in place of the exact zero.
 fn _cx_powf_axis(a, n, r) {
     var x = HComplex_re(a);
     var y = HComplex_im(a);
@@ -348,7 +764,7 @@ fn _cx_powf_axis(a, n, r) {
         q = 1;
         if (((x >> 63) & 1) == 1) { dir = 1; }
     }
-    if (q == 0) { return 0; }
+    if (q == 0) { return 1; }
     if (((y >> 63) & 1) == 1) { q = 0 - q; dir = 0 - dir; }
     if (((n >> 63) & 1) == 1) { dir = 0 - dir; }
     # Only k mod 4 picks the axis. Below 2^54, n*q is exact and f64_to cannot
@@ -357,20 +773,25 @@ fn _cx_powf_axis(a, n, r) {
     var j = 0;
     if (f64_lt(f64_abs(n), _CX_POWF_WHOLE_TURNS) == 1) {
         var k = f64_mul(n, f64_from(q));
-        if (f64_eq(f64_trunc(k), k) == 0) { return 0; }
+        if (f64_eq(f64_trunc(k), k) == 0) { return 1; }
         j = f64_to(k) & 3;
     } else {
-        if (f64_lt(f64_abs(n), F64_POS_INF) == 0) { return 0; }
+        if (f64_lt(f64_abs(n), F64_POS_INF) == 0) { return 1; }
     }
     var zs = 0;
     if (dir < 0) { zs = 0x8000_0000_0000_0000; }
     var zo = zs ^ 0x8000_0000_0000_0000;
     if (j == 0) { return cx_new(r, zs); }
     if (j == 1) { return cx_new(zo, r); }
-    if (j == 2) { return cx_new(f64_neg(r), zo); }
-    return cx_new(zs, f64_neg(r));
+    if (j == 2) { return cx_new(r ^ _CX_SIGN, zo); }
+    return cx_new(zs, r ^ _CX_SIGN);
 }
 
+# a^n for a real n: |a|^n cis(n arg a) through ganita_f64_pow, exact on the axes (see the
+# notes in the body: a point on the negative real or imaginary axis raised to a whole
+# number of quarter turns lands on an axis exactly), and C99's cexp rows for an angle with
+# no direction. a = 0 + 0i returns 0 + 0i for every n -- 0^0 and n < 0 included, a [3.5.0]
+# row (num_modpow and dual_pow give 1 for 0^0, C99 +Inf for n < 0). 0 when not allocated.
 #must_use
 public fn cx_powf(a, n) {
     # ⛔ 2.17.0 — THIS GUARDED THE SQUARE. The 2.15.0 note it replaces argued a
@@ -420,7 +841,7 @@ public fn cx_powf(a, n) {
     if (f64_eq(r, r) == 1) {
         if (f64_eq(theta, 0) == 1) { return cx_new(r, theta); }
         var ax = _cx_powf_axis(a, n, r);
-        if (ax != 0) { return ax; }
+        if (ax != 1) { return ax; }
         # ⛔ 3.3.5 — AN ANGLE WITH NO DIRECTION MADE r * cis(theta) NaN WHATEVER r WAS.
         # theta is +-Inf when arg * n overflows (cx_powf(-0.5 + 0.1i, DBL_MAX)) or as set
         # above, and cos/sin of it are NaN. ⭐ Where r = 0 the point is 0 whatever the
@@ -444,18 +865,25 @@ public fn cx_powf(a, n) {
     return cx_from_polar(r, theta);
 }
 
+# sin a = sin re cosh im + i cos re sinh im, the textbook form with ganita's functions:
+# cosh and sinh overflow to +Inf above |im| = 710.5, and then a zero sine or cosine gives a
+# NaN part: cx_sin(0 + 800i) is (NaN, +Inf), exact (0, +Inf). 0 when not allocated.
 #must_use
 public fn cx_sin(a) {
     return cx_new(f64_mul(f64_sin(HComplex_re(a)), ganita_f64_cosh(HComplex_im(a))),
       f64_mul(f64_cos(HComplex_re(a)), ganita_f64_sinh(HComplex_im(a))));
 }
 
+# cos a = cos re cosh im - i sin re sinh im, as cx_sin: cx_cos(0 + 800i) is (+Inf, NaN),
+# exact (+Inf, -0). 0 when not allocated.
 #must_use
 public fn cx_cos(a) {
     return cx_new(f64_mul(f64_cos(HComplex_re(a)), ganita_f64_cosh(HComplex_im(a))),
-      f64_neg(f64_mul(f64_sin(HComplex_re(a)), ganita_f64_sinh(HComplex_im(a)))));
+      f64_mul(f64_sin(HComplex_re(a)), ganita_f64_sinh(HComplex_im(a))) ^ _CX_SIGN);
 }
 
+# 1 when |a| < tol, comparing cx_abs (rescaled, so it neither overflows nor flushes) with
+# the caller's tol; 0 otherwise, a NaN modulus or tol included.
 #must_use
 public fn cx_is_zero(a, tol) {
     # ⛔ 2.17.0 — THIS SQUARED BOTH SIDES: `cx_norm_sq(a) < tol*tol`. It is
@@ -482,6 +910,9 @@ public fn cx_is_zero(a, tol) {
 
 var _CMAT_MAX_ELEMS = 65536;  # 64K elements max (1MB)
 
+# A rows x cols complex matrix of zeros, row-major { rows, cols, data }, or 0 -- the designed
+# failure every cmat_* passes on -- when a dimension is <= 0, rows * cols exceeds
+# _CMAT_MAX_ELEMS (its element cap, above), or an allocation is refused.
 public fn cmat_new(rows, cols) {
     if (rows <= 0 || cols <= 0) { return 0; }
     if (rows > _CMAT_MAX_ELEMS / cols) { return 0; }  # Overflow guard
@@ -501,7 +932,9 @@ public fn cmat_new(rows, cols) {
     return m;
 }
 
+# The number of rows of m. A raw read: m must not be 0 (cmat_get's precondition).
 public fn cmat_rows(m) { return load64(m); }
+# The number of columns of m. A raw read: m must not be 0 (cmat_get's precondition).
 public fn cmat_cols(m) { return load64(m + 8); }
 fn _cmat_data(m) { return load64(m + 16); }
 
@@ -597,6 +1030,9 @@ public fn cmat_identity(n) {
     return m;
 }
 
+# The product a b, a new rows(a) x cols(b) matrix: each entry a plain left-to-right sum of
+# cx_mul's products, not compensated. 0 when a or b is 0, cols(a) != rows(b), the product
+# would exceed _CMAT_MAX_ELEMS, or an allocation is refused.
 public fn cmat_mul(a, b) {
     if (a == 0) { return 0; }
     if (b == 0) { return 0; }
@@ -672,6 +1108,8 @@ public fn cmat_mul_vec(m, v) {
     return out;
 }
 
+# The conjugate transpose m^H, a new cols x rows matrix (exact: entries are moved and
+# their imaginary parts negated). 0 when m is 0 or the matrix cannot be allocated.
 public fn cmat_adjoint(m) {
     if (m == 0) { return 0; }
     # Conjugate transpose
@@ -683,7 +1121,7 @@ public fn cmat_adjoint(m) {
     while (i < rows) {
         var j = 0;
         while (j < cols) {
-            _cmat_put(r, j, i, _cmat_re(m, i, j), f64_neg(_cmat_im(m, i, j)));
+            _cmat_put(r, j, i, _cmat_re(m, i, j), _cmat_im(m, i, j) ^ _CX_SIGN);
             j = j + 1;
         }
         i = i + 1;
@@ -691,11 +1129,20 @@ public fn cmat_adjoint(m) {
     return r;
 }
 
+# The trace of a square complex matrix, sum of m[i][i], as a new HComplex (each part a
+# plain left-to-right f64 sum, so not compensated). 0 -- not cx_zero(), since zero is a
+# valid trace -- when m is 0, when m is not square, or when the result cannot be
+# allocated.
+# ⛔ 3.4.1 — A NON-SQUARE m WAS READ PAST ITS BUFFER. The loop ran i to rows(m) and read
+# m[i][i], which for a tall matrix walks off the end of the data: cmat_new(3, 1) holding
+# 1, 2, 3 gave 6 + 0i (the 2.0 past the end was the next heap object), and a 65536 x 1 at
+# a heap-chunk edge exited 139. A trace is defined for square matrices only, and
+# threat-model.md has claimed a shape guard here since 2.9.0; there is one now.
+# [measured: tests/hisab.tcyr, group "3.4.1: cmat_trace refuses a non-square matrix"]
 public fn cmat_trace(m) {
-    # 0, not cx_zero(): zero is a perfectly valid trace, so returning it here
-    # would make a propagated allocation failure indistinguishable from a result.
     if (m == 0) { return 0; }
     var n = cmat_rows(m);
+    if (n != cmat_cols(m)) { return 0; }
     var sr = 0;
     var si = 0;
     var i = 0;
@@ -707,6 +1154,8 @@ public fn cmat_trace(m) {
     return cx_new(sr, si);
 }
 
+# s m for a complex scalar s (an HComplex): every entry times s, cx_mul's form. 0 when m or
+# s is 0 or the matrix cannot be allocated.
 public fn cmat_scale(m, s) {
     if (m == 0) { return 0; }
     # s may be a refused cx_real / cx_i (3.4.0): HComplex_re(0) is a null read.
@@ -731,6 +1180,8 @@ public fn cmat_scale(m, s) {
     return r;
 }
 
+# a + b entry by entry, each part one IEEE addition. 0 when a or b is 0, their shapes
+# differ, or the matrix cannot be allocated.
 public fn cmat_add(a, b) {
     # Either operand may be the designed 0 that cmat_new and cmat_mul return when
     # a dimension cap or conformability check fails; cmat_commutator feeds exactly
@@ -758,6 +1209,8 @@ public fn cmat_add(a, b) {
     return r;
 }
 
+# a - b entry by entry, each part one IEEE subtraction. 0 when a or b is 0, their shapes
+# differ, or the matrix cannot be allocated.
 public fn cmat_sub(a, b) {
     # Either operand may be the designed 0 that cmat_new and cmat_mul return when
     # a dimension cap or conformability check fails; cmat_commutator feeds exactly
@@ -919,8 +1372,10 @@ public fn cmat_exp(m) {
 # Pauli matrices (2x2)
 # ================================================================
 
+# sigma_0, the 2 x 2 identity. 0 when it cannot be allocated.
 public fn pauli_0() { return cmat_identity(2); }
 
+# sigma_x = [[0, 1], [1, 0]]. 0 when it cannot be allocated.
 public fn pauli_x() {
     var m = cmat_new(2, 2);
     if (m == 0) { return 0; }
@@ -929,6 +1384,7 @@ public fn pauli_x() {
     return m;
 }
 
+# sigma_y = [[0, -i], [i, 0]]. 0 when it cannot be allocated.
 public fn pauli_y() {
     var m = cmat_new(2, 2);
     if (m == 0) { return 0; }
@@ -937,6 +1393,7 @@ public fn pauli_y() {
     return m;
 }
 
+# sigma_z = [[1, 0], [0, -1]]. 0 when it cannot be allocated.
 public fn pauli_z() {
     var m = cmat_new(2, 2);
     if (m == 0) { return 0; }
@@ -949,6 +1406,7 @@ public fn pauli_z() {
 # Dirac gamma matrices (4x4)
 # ================================================================
 
+# The Dirac matrix gamma^0 = diag(1, 1, -1, -1), Dirac representation. 0 when it cannot be allocated.
 public fn gamma_0() {
     # gamma^0 = diag(I, -I) in Dirac representation
     var m = cmat_new(4, 4);
@@ -960,6 +1418,9 @@ public fn gamma_0() {
     return m;
 }
 
+# The Dirac matrix gamma^k = [[0, sigma_k], [-sigma_k, 0]] for idx = k - 1 (0: sigma_x,
+# 1: sigma_y, 2: sigma_z), Dirac representation. An idx outside 0..2 returns the 4 x 4 zero
+# matrix, a documented sentinel ([3.5.0]); 0 when a matrix cannot be allocated.
 public fn gamma_spatial(idx) {
     # gamma^i = [[0, sigma^i], [-sigma^i, 0]], idx: 0=gamma^1(sigmax), 1=gamma^2(sigmay), 2=gamma^3(sigmaz)
     if (idx < 0 || idx > 2) { return cmat_new(4, 4); }  # Invalid -> zero matrix
@@ -976,13 +1437,15 @@ public fn gamma_spatial(idx) {
     _cmat_put(m, 1, 2, _cmat_re(sigma, 1, 0), _cmat_im(sigma, 1, 0));
     _cmat_put(m, 1, 3, _cmat_re(sigma, 1, 1), _cmat_im(sigma, 1, 1));
     # Bottom-left: -sigma
-    _cmat_put(m, 2, 0, f64_neg(_cmat_re(sigma, 0, 0)), f64_neg(_cmat_im(sigma, 0, 0)));
-    _cmat_put(m, 2, 1, f64_neg(_cmat_re(sigma, 0, 1)), f64_neg(_cmat_im(sigma, 0, 1)));
-    _cmat_put(m, 3, 0, f64_neg(_cmat_re(sigma, 1, 0)), f64_neg(_cmat_im(sigma, 1, 0)));
-    _cmat_put(m, 3, 1, f64_neg(_cmat_re(sigma, 1, 1)), f64_neg(_cmat_im(sigma, 1, 1)));
+    _cmat_put(m, 2, 0, _cmat_re(sigma, 0, 0) ^ _CX_SIGN, _cmat_im(sigma, 0, 0) ^ _CX_SIGN);
+    _cmat_put(m, 2, 1, _cmat_re(sigma, 0, 1) ^ _CX_SIGN, _cmat_im(sigma, 0, 1) ^ _CX_SIGN);
+    _cmat_put(m, 3, 0, _cmat_re(sigma, 1, 0) ^ _CX_SIGN, _cmat_im(sigma, 1, 0) ^ _CX_SIGN);
+    _cmat_put(m, 3, 1, _cmat_re(sigma, 1, 1) ^ _CX_SIGN, _cmat_im(sigma, 1, 1) ^ _CX_SIGN);
     return m;
 }
 
+# gamma^5 = i gamma^0 gamma^1 gamma^2 gamma^3, exact (every product and sum is of 0, +-1 and
+# +-i): [[0, I], [I, 0]]. 0 when an allocation is refused.
 public fn gamma_5() {
     # gamma^5 = igamma^0gamma^1gamma^2gamma^3
     var g0 = gamma_0();

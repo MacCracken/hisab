@@ -3492,33 +3492,67 @@ test_group("3.4.0: mat3 / mat4 / quat / transforms under a refused allocation");
 # Requests in vec2/vec3/vec4 are not refused here: those modules are lane AL's.
 # ⚠ It sets lib/alloc.cyr's Linux internals (_heap_ptr, _heap_end, _linux_grain,
 # _LINUX_CHUNK_SMALL): a stdlib that renames them fails this suite at compile time.
+# ⛔ 3.4.1 third review -- THE OLD SHAPE COST 4.5 GB OF ADDRESS SPACE. Through 3.4.1's second
+# review a point with too little room mapped a fresh 16 MB chunk, and _fb_exhaust_end put the
+# 256 MB grain back, so the next ordinary allocation that missed the spent chunk mapped a fresh
+# 256 MB one: the suite peaked at 4.5 GB and ended with SIGSEGV in this group under `ulimit -v`
+# 300,000 KB to 3,500,000 KB. Now each point takes its k bytes from the heap with the heap open
+# (fresh bump memory, never handed out again), keeps the heap's own _heap_ptr / _heap_end, and
+# leaves exactly that block as the room; _fb_exhaust_end puts every pointer it saved back
+# (tests/abuse.tcyr's form). The suite now peaks at 0.27 GB and passes under 300,000 KB, and
+# every point leaves the same room and gets the same answer as before.
+# [measured: foundation binaries VmPeak and ulimit -v runs, merged tree s5 and this one, lane INS4; 2026-10-31]
 var _fb_grain_keep = 0;
 var _fb_small_keep = 0;
-var _fb_sink = 0;
+var _fb_ptr_keep = 0;
+var _fb_end_keep = 0;
 fn _fb_exhaust_after(k) {
+    var blk = 0;
+    if (k > 0) { blk = alloc(k); }
     _fb_grain_keep = _linux_grain;
     _fb_small_keep = _LINUX_CHUNK_SMALL;
-    if (_heap_end - _heap_ptr < k + 8) {
-        _linux_grain = _LINUX_CHUNK_SMALL;
-        _fb_sink = alloc(_heap_end - _heap_ptr + 8);
+    _fb_ptr_keep = _heap_ptr;
+    _fb_end_keep = _heap_end;
+    if (blk != 0) {
+        _heap_ptr = blk;
+        _heap_end = blk + k;
+    } else {
+        _heap_end = _heap_ptr;
     }
-    var room = _heap_end - _heap_ptr;
-    if (room > k) { _fb_sink = alloc(room - k); }
+    # A grain of 2^62 bytes is past every address space, so the new-chunk mmap fails;
+    # with the small grain equal to it, alloc takes no retry and answers 0.
     _linux_grain = 0x4000_0000_0000_0000;
     _LINUX_CHUNK_SMALL = 0x4000_0000_0000_0000;
     return _heap_end - _heap_ptr;
 }
 fn _fb_exhaust_end() {
+    var left = _heap_end - _heap_ptr;   # the room the call left unused
+    _heap_ptr = _fb_ptr_keep;
+    _heap_end = _fb_end_keep;
     _linux_grain = _fb_grain_keep;
     _LINUX_CHUNK_SMALL = _fb_small_keep;
-    return 0;
+    return left;
 }
+# The grains as they stand before the instrument runs: a point's own saved copy cannot pin
+# them, since a point that left them unrestored hands the next point its 2^62 to save.
+var _fb_g0 = _linux_grain;
+var _fb_s0 = _LINUX_CHUNK_SMALL;
 var _fb_room = _fb_exhaust_after(72);
 var _fb_pc1 = alloc(72);
 var _fb_pc2 = alloc(8);
 _fb_exhaust_end();
+# The restore, on a room left half spent (a spent room would hide a _heap_ptr left behind):
+# every pointer the instrument saved is back, and the heap resumes in its own chunk where it
+# left off.
+_fb_exhaust_after(72);
+var _fb_pc4 = alloc(32);
+var _fb_left = _fb_exhaust_end();
+var _fb_rs = (_heap_ptr == _fb_ptr_keep && _heap_end == _fb_end_keep && _linux_grain == _fb_g0
+  && _LINUX_CHUNK_SMALL == _fb_s0 && _fb_left == 40);
+var _fb_pc3 = alloc(8);
 assert_eq(_fb_room, 72, "exhaust instrument: exactly 72 bytes left");
-assert_eq(_fb_pc1 != 0 && _fb_pc2 == 0, 1, "exhaust instrument: a request that fits succeeds, the next is refused");
+assert_eq(_fb_pc1 != 0 && _fb_pc2 == 0 && _fb_pc4 != 0 && _fb_rs == 1 && _fb_pc3 == _fb_ptr_keep, 1,
+  "exhaust instrument: a request that fits succeeds, the next is refused, the heap resumes where it left off");
 # Fixtures, allocated with the heap open.
 var _fb_A3 = _fb_m3w(F64_TWO, F64_ONE, 0, F64_ONE, 0x4008000000000000, F64_ONE, 0, F64_ONE, F64_TWO);
 var _fb_A4 = m4_from_srt(hvec3_one(), hquat_from_rotation_y(F64_HALF), hvec3_new(F64_ONE, F64_TWO, 0x4008000000000000));
@@ -3607,7 +3641,11 @@ _fb_exhaust_after(0); _fb_al0(hquat_rotate_vec3(_fb_q06, _fb_vbig)); _FB_ALN = _
 var _fb_q1000 = hquat_new(0, 0x408F400000000000, 0, 0x408F400000000000);
 _fb_exhaust_after(0); _fb_al0(hquat_rotate_vec3(_fb_q1000, _fb_V3)); _FB_ALN = _FB_ALN + 1;
 _fb_exhaust_after(0); _fb_al0(hquat_slerp(_fb_Q, _fb_Q, F64_HALF)); _FB_ALN = _FB_ALN + 1;
-_fb_exhaust_after(32); _fb_al0(hquat_slerp(_fb_Q, _fb_Q, F64_HALF)); _FB_ALN = _FB_ALN + 1;
+# The normalised-lerp branch's second request (its normalised copy, after the lerp's 32): since
+# 3.4.1 that branch is d >= 1 only, so the pair is the identity with itself (d = 1 exactly);
+# _fb_Q with itself has d = |q|^2 below 1 and takes the slerp formula, one request.
+var _fb_Qi = hquat_identity();
+_fb_exhaust_after(32); _fb_al0(hquat_slerp(_fb_Qi, _fb_Qi, F64_HALF)); _FB_ALN = _FB_ALN + 1;
 # transforms
 var _fb_V2z = hvec2_zero();
 var _fb_V2o = hvec2_one();
@@ -3721,6 +3759,962 @@ assert_eq(_fq_nan_count4(m4_from_srt(hvec3_one(), _fq_inf, hvec3_zero())), 9,
   "m4_from_srt with q = (Inf, 0, 0, 1): the 3x3 rotation-scale block is all NaN");
 assert_eq(_fq_nan_count4(m4_from_srt(hvec3_one(), _fq_nan, hvec3_zero())), 9,
   "m4_from_srt with q = (0, NaN, 0, 1): the 3x3 rotation-scale block is all NaN");
+
+# === 3.4.1: hisab_lerp / hvec2_lerp / hvec3_lerp are finite where the formula's value is ===
+# a + (b - a) t overflowed in b - a or its product with t for finite input; 3.4.1 evaluates the
+# formula at half scale there. Every expected value is the formula evaluated in exact rational
+# arithmetic with each operation rounded to nearest in an unbounded exponent range (scratch
+# lerp_t.py, which matched all three functions on 30,002 inputs, 3,349 of them rescued).
+# [measured: scratch lerp_t.py, lane MAT 3.4.1, 2026-10-31; cycc 6.7.18]
+test_group("3.4.1: lerp family finite where the formula is");
+var _l1_max = 0x7FEFFFFFFFFFFFFF;
+var _l1_nmax = 0xFFEFFFFFFFFFFFFF;
+assert_eq(hisab_lerp(_l1_nmax, _l1_max, F64_HALF), 0, "hisab_lerp(-DBL_MAX, DBL_MAX, 1/2) = +0 (3.4.0: +Inf)");
+assert_eq(hisab_lerp(_l1_max, 0, 0x3FF8000000000000), 0xFFDFFFFFFFFFFFFE,
+  "hisab_lerp(DBL_MAX, 0, 3/2) = -2^1023 + 2^971, the formula's rounding (3.4.0: -Inf)");
+assert_eq(hisab_lerp(_l1_nmax, _l1_max, 0), _l1_nmax, "hisab_lerp(-DBL_MAX, DBL_MAX, 0) = a (3.4.0: NaN, Inf * 0)");
+assert_eq(hisab_lerp(0, _l1_max, F64_TWO), 0x7FF0000000000000,
+  "hisab_lerp(0, DBL_MAX, 2) = +Inf: the value is 2 DBL_MAX");
+assert_eq(f64_eq(hisab_lerp(0x7FF8000000000000, F64_ONE, F64_HALF), 0), 0, "hisab_lerp(NaN, 1, 1/2) is NaN");
+assert_eq(hisab_lerp(0x4008000000000000, 0x401C000000000000, 0x3FD0000000000000), 0x4010000000000000,
+  "hisab_lerp(3, 7, 1/4) = 4, the fast form's bits");
+assert_eq(hisab_lerp(0, 1, 0x7FF0000000000000), 0x7FF0000000000000,
+  "hisab_lerp(0, 2^-1074, +Inf) = +Inf, IEEE's (the half form would give 0 * Inf = NaN)");
+var _l1_v2s = hvec2_lerp(hvec2_new(1, _l1_nmax), hvec2_new(0, _l1_max), F64_HALF);
+assert_eq(HVec2_x(_l1_v2s), 1, "hvec2_lerp: a subnormal x beside a rescued y keeps the fast form's 2^-1074");
+assert_eq(HVec2_y(_l1_v2s), 0, "... and y is +0");
+var _l1_v2i = hvec2_lerp(hvec2_new(0, 0), hvec2_new(1, F64_ONE), 0x7FF0000000000000);
+assert_eq(HVec2_x(_l1_v2i), 0x7FF0000000000000, "hvec2_lerp: (0 .. 2^-1074) at t = +Inf is +Inf, IEEE's");
+var _l1_v3i = hvec3_lerp(hvec3_new(0, 0, 0), hvec3_new(1, F64_ONE, 1), 0x7FF0000000000000);
+assert_eq(HVec3_x(_l1_v3i) == 0x7FF0000000000000 && HVec3_z(_l1_v3i) == 0x7FF0000000000000, 1,
+  "hvec3_lerp: (0 .. 2^-1074) at t = +Inf is +Inf in x and z, IEEE's");
+var _l1_v2 = hvec2_lerp(hvec2_new(_l1_nmax, _l1_max), hvec2_new(_l1_max, _l1_nmax), F64_HALF);
+assert_eq(HVec2_x(_l1_v2), 0, "hvec2_lerp: x of (-DBL_MAX .. DBL_MAX) at 1/2 = +0 (3.4.0: +Inf)");
+assert_eq(HVec2_y(_l1_v2), 0, "hvec2_lerp: y of (DBL_MAX .. -DBL_MAX) at 1/2 = +0 (3.4.0: -Inf)");
+var _l1_v2b = hvec2_lerp(hvec2_new(F64_ONE, _l1_max), hvec2_new(0x4008000000000000, 0), 0x3FF8000000000000);
+assert_eq(HVec2_x(_l1_v2b), 0x4010000000000000, "hvec2_lerp: an ordinary x beside a rescued y keeps its bits (4)");
+assert_eq(HVec2_y(_l1_v2b), 0xFFDFFFFFFFFFFFFE, "hvec2_lerp: ... y of (DBL_MAX .. 0) at 3/2 (3.4.0: -Inf)");
+var _l1_v3 = hvec3_lerp(hvec3_new(_l1_nmax, F64_ONE, _l1_max), hvec3_new(_l1_max, 0x4008000000000000, 0),
+  0x3FF8000000000000);
+assert_eq(HVec3_x(_l1_v3), 0x7FF0000000000000, "hvec3_lerp: x of (-DBL_MAX .. DBL_MAX) at 3/2 = +Inf, its value");
+assert_eq(HVec3_y(_l1_v3), 0x4010000000000000, "hvec3_lerp: y (1 .. 3 at 3/2) = 4, the fast form's bits");
+assert_eq(HVec3_z(_l1_v3), 0xFFDFFFFFFFFFFFFE, "hvec3_lerp: z of (DBL_MAX .. 0) at 3/2 (the scalar tail, 3.4.0: -Inf)");
+var _l1_v3b = hvec3_lerp(hvec3_new(_l1_max, _l1_nmax, F64_ONE), hvec3_new(_l1_nmax, _l1_max, F64_ONE), F64_HALF);
+assert_eq(HVec3_x(_l1_v3b), 0, "hvec3_lerp: x of (DBL_MAX .. -DBL_MAX) at 1/2 = +0 (the packed pair)");
+assert_eq(HVec3_y(_l1_v3b), 0, "hvec3_lerp: y of (-DBL_MAX .. DBL_MAX) at 1/2 = +0 (the packed pair)");
+# The certificate's inputs, each alone: a large t (2^1019 to 0 at t = 32: -31 * 2^1019, where
+# (b - a) t overflows), a huge b.y beside a large a.y ((DBL_MAX - 2^1019) / 2 rounded, where b - a
+# overflows), z alone in hvec3_lerp, and a.y alone with a large t.
+var _l1_c1 = hvec2_lerp(hvec2_new(0x7FA0000000000000, F64_ONE), hvec2_new(0, F64_ONE), 0x4040000000000000);
+assert_eq(HVec2_x(_l1_c1), 0xFFEF000000000000, "hvec2_lerp: (2^1019 .. 0) at t = 32 = -31 * 2^1019 (3.4.0: -Inf)");
+var _l1_c2 = hvec2_lerp(hvec2_new(F64_ONE, 0xFFA0000000000000), hvec2_new(F64_ONE, _l1_max), F64_HALF);
+assert_eq(HVec2_y(_l1_c2), 0x7FDF000000000000, "hvec2_lerp: (-2^1019 .. DBL_MAX) at 1/2, the formula's (3.4.0: +Inf)");
+var _l1_c3 = hvec3_lerp(hvec3_new(F64_ONE, F64_TWO, _l1_nmax), hvec3_new(0x4008000000000000, 0x4010000000000000,
+    _l1_max), F64_HALF);
+assert_eq(HVec3_z(_l1_c3) == 0 && HVec3_x(_l1_c3) == F64_TWO && HVec3_y(_l1_c3) == 0x4008000000000000, 1,
+  "hvec3_lerp: z of (-DBL_MAX .. DBL_MAX) at 1/2 = 0 beside ordinary x and y (2, 3)");
+var _l1_c4 = hvec3_lerp(hvec3_new(0, 0x7FA0000000000000, 0), hvec3_zero(), 0x4040000000000000);
+assert_eq(HVec3_y(_l1_c4), 0xFFEF000000000000, "hvec3_lerp: y of (2^1019 .. 0) at t = 32 = -31 * 2^1019");
+var _l1_c5 = hvec3_lerp(hvec3_new(F64_ONE, 0xFFA0000000000000, 0), hvec3_new(F64_ONE, _l1_max, 0), F64_HALF);
+assert_eq(HVec3_y(_l1_c5), 0x7FDF000000000000, "hvec3_lerp: y of (-2^1019 .. DBL_MAX) at 1/2, the formula's");
+var _l1_ta = t3d_new(hvec3_new(_l1_nmax, 0, 0), hquat_identity(), hvec3_one());
+var _l1_tb = t3d_new(hvec3_new(_l1_max, 0, 0), hquat_identity(), hvec3_one());
+assert_eq(HVec3_x(t3d_pos(t3d_lerp(_l1_ta, _l1_tb, F64_HALF))), 0, "t3d_lerp inherits: the midpoint of +-DBL_MAX is 0");
+
+# === 3.4.1: the dot products' zero convention (documented, not changed) ===
+# `f64v_dot` starts its accumulator at +0, so hvec3_dot / hvec4_dot / hquat_dot give +0 for an
+# exactly zero result even where every product is -0 (the IEEE natural-order sum's -0);
+# `hvec2_dot`, all scalar, gives that -0. vec3.cyr's `hvec3_dot` says why (a fix measured 5 to
+# 11% on the dot rows). These pin the stated convention, and that non-zero results are unchanged.
+# [measured: scratch flerp.bcyr and tests/hisab.bcyr, 3.4.0 and the fixed form, 2026-10-31; cycc 6.7.18]
+test_group("3.4.1: the dot products' zero convention");
+var _d1_z3 = hvec3_zero();
+var _d1_m3 = hvec3_new(0xBFF0000000000000, 0xBFF0000000000000, 0xBFF0000000000000);
+assert_eq(hvec3_dot(_d1_z3, _d1_m3), 0, "hvec3_dot((0,0,0), (-1,-1,-1)) = +0, the documented convention");
+var _d1_n0 = 0x8000000000000000;
+assert_eq(hvec4_dot(hvec4_new(_d1_n0, _d1_n0, _d1_n0, _d1_n0), hvec4_one()), 0,
+  "hvec4_dot((-0)x4, (1)x4) = +0, the documented convention");
+assert_eq(hquat_dot(hquat_new(_d1_n0, _d1_n0, _d1_n0, _d1_n0), hquat_new(F64_ONE, F64_ONE, F64_ONE, F64_ONE)), 0,
+  "hquat_dot((-0)x4, (1)x4) = +0, the documented convention");
+assert_eq(hvec2_dot(hvec2_zero(), hvec2_new(0xBFF0000000000000, 0xBFF0000000000000)), 0x8000000000000000,
+  "hvec2_dot((0,0), (-1,-1)) = -0, IEEE's natural order (scalar)");
+assert_eq(hvec3_dot(hvec3_new(F64_ONE, F64_TWO, 0x4008000000000000), hvec3_new(0x4010000000000000, 0x4014000000000000,
+      0x4018000000000000)), 0x4040000000000000, "hvec3_dot((1,2,3), (4,5,6)) = 32");
+
+# === 3.4.1: hquat_slerp at rounding level up to a . b < 1 ===
+# The oracle is a 90-digit Decimal slerp (theta = 2 atan(|a - b| / |a + b|) on the exact inputs,
+# scratch slerp_orc.py); it reproduces the audit's 60-digit values bit for bit. Through 3.4.0
+# every pair with a . b > 0.9995 took the normalised lerp.
+test_group("3.4.1: hquat_slerp near d = 1");
+fn _s1_dist(a, b) {
+    if (a > b) { return a - b; }
+    return b - a;
+}
+var _s1_a = hquat_new(0xBFE04A4C889F6E96, 0xBFD5A140623E6B4E, 0xBFE10349AA9E8E68, 0xBFE2C48B76ED4185);
+var _s1_b = hquat_new(0xBFDF4EE910381FE8, 0xBFD728158CABD4DB, 0xBFE0EBCF95D91B30, 0xBFE2EF94958681D5);
+var _s1_r = hquat_slerp(_s1_a, _s1_b, 0x3FD0000000000000);
+assert_eq(HQuat_x(_s1_r), 0xBFE021F902855583,
+  "slerp, the audit's pair (d = 0.99975), t = 1/4: x, the oracle's nearest");
+assert_eq(HQuat_y(_s1_r), 0xBFD6037E80A7CE65, "... y, the oracle's nearest (3.4.0: 3.7e-7 off)");
+assert_eq(HQuat_z(_s1_r), 0xBFE0FDD37514ACDC, "... z, the oracle's nearest");
+assert_eq(HQuat_w(_s1_r), 0xBFE2CFC181464D89, "... w, the oracle's nearest");
+var _s1_h = hquat_new(F64_HALF, F64_HALF, F64_HALF, F64_HALF);
+# b = cos(0.01) a + sin(0.01) (1/2, -1/2, 1/2, -1/2), rounded: d = cos(0.01)
+var _s1_c = hquat_new(0x3FE028C12828F7A5, 0x3FDFADABF909400A, 0x3FE028C12828F7A5, 0x3FDFADABF909400A);
+var _s1_r2 = hquat_slerp(_s1_h, _s1_c, 0x3FE8000000000000);
+assert_eq(_s1_dist(HQuat_x(_s1_r2), 0x3FE01E9AC15578CC) <= 1 && _s1_dist(HQuat_y(_s1_r2), 0x3FDFC254867C2986) <= 1, 1,
+  "slerp, theta = 0.01, t = 3/4: x and y within 1 ulp of the oracle (3.4.0: 7e7 ulp)");
+var _s1_r3 = hquat_slerp(_s1_h, _s1_c, 0xBFE0000000000000);
+assert_eq(_s1_dist(HQuat_x(_s1_r3), 0x3FDFD6F011C09BD3) <= 1 && _s1_dist(HQuat_y(_s1_r3), 0x3FE0146DC0405B3D) <= 1, 1,
+  "slerp, theta = 0.01, t = -1/2 (extrapolating): within 1 ulp of the oracle");
+# Rotation-y(1/2) to rotation-x(1), d about 0.85: the formula as through 3.4.0, within 2 ulp.
+var _s1_o = hquat_slerp(hquat_from_rotation_y(F64_HALF), hquat_from_rotation_x(F64_ONE), F64_HALF);
+assert_eq(_s1_dist(HQuat_x(_s1_o), 0x3FCFE67B1DACBBCB) <= 2 && _s1_dist(HQuat_w(_s1_o), 0x3FEEB73F471A8AF8) <= 2, 1,
+  "slerp, an ordinary pair (d = 0.85): within 2 ulp of the oracle");
+var _s1_i = hquat_slerp(hquat_identity(), hquat_identity(), 0x3FD3333333333333);
+assert_eq(HQuat_w(_s1_i) == F64_ONE && HQuat_x(_s1_i) == 0, 1, "slerp(I, I, 0.3) = I (d = 1: the normalised lerp)");
+var _s1_zz = hquat_slerp(hquat_new(0, 0, 0, 0), hquat_new(0, 0, 0, 0), F64_HALF);
+assert_eq(f64_eq(HQuat_w(_s1_zz), HQuat_w(_s1_zz)), 0, "slerp(0, 0, 1/2): NaN, no rotation (3.4.0: (0, 0, 0, 0))");
+var _s1_za = hquat_slerp(hquat_new(0, 0, 0, 0), _s1_h, F64_HALF);
+assert_eq(f64_eq(HQuat_x(_s1_za), HQuat_x(_s1_za)), 0, "slerp(0, b, 1/2): NaN (3.4.0: sin(pi/4) b)");
+var _s1_q90 = hquat_slerp(hquat_identity(), hquat_new(F64_ONE, 0, 0, 0), F64_HALF);
+assert_eq(_s1_dist(HQuat_x(_s1_q90), 0x3FE6A09E667F3BCD) <= 1 && _s1_dist(HQuat_w(_s1_q90), 0x3FE6A09E667F3BCD) <= 1, 1,
+  "slerp(I, (1, 0, 0, 0), 1/2): d = 0 but neither is zero: (sqrt(1/2), 0, 0, sqrt(1/2)) within 1 ulp");
+var _s1_zb = hquat_slerp(_s1_h, hquat_new(0x8000000000000000, 0, 0, 0), F64_HALF);
+assert_eq(f64_eq(HQuat_y(_s1_zb), HQuat_y(_s1_zb)), 0, "slerp(a, -0, 1/2): NaN");
+# 3.4.1 review S2: an identical pair whose d rounding alone leaves 3 ulp below 1 (d =
+# 0x3FEFFFFFFFFFFFFD) at t = 10: acos(d) gave a spurious theta of about 2^-26 and the first 3.4.1
+# form came back 244 ulp off a; now d > 0.9995 reads theta from |a - b'| = 0, the normalised lerp,
+# within 2^-52 (2 ulp of the largest component) of a in every component.
+# [measured: the 3.4.1 review (RV-MAT S2) and scratch sl3.py, 2026-10-31; cycc 6.7.18]
+var _s1_sa = hquat_new(0xBFC25B170BA51EEC, 0xBFB17D888C3A9918, 0x3FEF6FABB8854E44, 0x3FB9345AC3DD7140);
+var _s1_s10 = hquat_slerp(_s1_sa, _s1_sa, 0x4024000000000000);
+assert_eq(f64_le(f64_abs(f64_sub(HQuat_x(_s1_s10), HQuat_x(_s1_sa))), 0x3CB0000000000000)
+  + f64_le(f64_abs(f64_sub(HQuat_y(_s1_s10), HQuat_y(_s1_sa))), 0x3CB0000000000000)
+  + f64_le(f64_abs(f64_sub(HQuat_z(_s1_s10), HQuat_z(_s1_sa))), 0x3CB0000000000000)
+  + f64_le(f64_abs(f64_sub(HQuat_w(_s1_s10), HQuat_w(_s1_sa))), 0x3CB0000000000000), 4,
+  "slerp(a, a, 10), d 3 ulp below 1: a within 2^-52 (the first 3.4.1 form: 244 ulp)");
+var _s1_tr = t3d_lerp(t3d_new(hvec3_zero(), _s1_a, hvec3_one()), t3d_new(hvec3_zero(), _s1_b, hvec3_one()),
+  0x3FD0000000000000);
+assert_eq(HQuat_y(t3d_rot(_s1_tr)), 0xBFD6037E80A7CE65, "t3d_lerp inherits the slerp: the audit pair's y");
+
+# === 3.4.1: hquat_from_euler's order and convention ===
+test_group("3.4.1: hquat_from_euler");
+var _e1_x = F64_HALF;
+var _e1_y = 0x3FC0000000000000;
+var _e1_z = 0x3FD0000000000000;
+assert_eq(hquat_from_euler(_e1_x, _e1_y, _e1_z, 7), 0, "hquat_from_euler, order 7: the designed 0 (3.4.0: ZYX)");
+assert_eq(hquat_from_euler(_e1_x, _e1_y, _e1_z, 0 - 1), 0, "hquat_from_euler, order -1: the designed 0 (3.4.0: ZYX)");
+assert_eq(hquat_from_euler(_e1_x, _e1_y, _e1_z, 6), 0, "hquat_from_euler, order 6: the designed 0");
+var _e1_qx = hquat_from_rotation_x(_e1_x);
+var _e1_qy = hquat_from_rotation_y(_e1_y);
+var _e1_qz = hquat_from_rotation_z(_e1_z);
+var _e1_xyz = hquat_from_euler(_e1_x, _e1_y, _e1_z, EULER_XYZ);
+var _e1_ref = hquat_mul(hquat_mul(_e1_qx, _e1_qy), _e1_qz);
+assert_eq(HQuat_x(_e1_xyz) == HQuat_x(_e1_ref) && HQuat_y(_e1_xyz) == HQuat_y(_e1_ref)
+  && HQuat_z(_e1_xyz) == HQuat_z(_e1_ref) && HQuat_w(_e1_xyz) == HQuat_w(_e1_ref), 1,
+  "EULER_XYZ is qx * qy * qz, bit for bit");
+var _e1_zyx = hquat_from_euler(_e1_x, _e1_y, _e1_z, EULER_ZYX);
+var _e1_rz = hquat_mul(hquat_mul(_e1_qz, _e1_qy), _e1_qx);
+assert_eq(HQuat_x(_e1_zyx) == HQuat_x(_e1_rz) && HQuat_w(_e1_zyx) == HQuat_w(_e1_rz), 1,
+  "EULER_ZYX is qz * qy * qx, bit for bit");
+# The convention: EULER_XYZ rotates v about Z first, then Y, then X, all fixed axes. The bound,
+# 2^-44 for |v| = 3.74, is four rotations' 22u |v| (`hquat_rotate_vec3`); a wrong order is off
+# by more than 0.1.
+var _e1_v = hvec3_new(F64_ONE, F64_TWO, 0x4008000000000000);
+var _e1_once = hquat_rotate_vec3(_e1_xyz, _e1_v);
+var _e1_seq = hquat_rotate_vec3(_e1_qx, hquat_rotate_vec3(_e1_qy, hquat_rotate_vec3(_e1_qz, _e1_v)));
+assert_eq(f64_lt(f64_abs(f64_sub(HVec3_x(_e1_once), HVec3_x(_e1_seq))), 0x3D30000000000000) == 1
+  && f64_lt(f64_abs(f64_sub(HVec3_y(_e1_once), HVec3_y(_e1_seq))), 0x3D30000000000000) == 1
+  && f64_lt(f64_abs(f64_sub(HVec3_z(_e1_once), HVec3_z(_e1_seq))), 0x3D30000000000000) == 1, 1,
+  "EULER_XYZ applied to (1, 2, 3) = Z, then Y, then X about fixed axes, within 2^-44");
+
+# === 3.4.1: screen_to_world_ray refuses near = far ===
+test_group("3.4.1: screen_to_world_ray near = far");
+var _r1_inv = m4_identity();
+m4_set(_r1_inv, 2, 2, 0);
+var _r1_o = alloc(8);
+var _r1_d = alloc(8);
+store64(_r1_o, 0x1234);
+store64(_r1_d, 0x5678);
+assert_eq(screen_to_world_ray(f64_from(100), f64_from(50), _r1_inv, f64_from(800), f64_from(600), _r1_o, _r1_d),
+  HSB_ERR_DEGENERATE, "inv_vp = I with (2, 2) = 0: HSB_ERR_DEGENERATE (3.4.0: 0, direction (0, 0, 0))");
+assert_eq(load64(_r1_o) == 0x1234 && load64(_r1_d) == 0x5678, 1, "... the out params untouched");
+assert_eq(screen_to_world_ray(f64_from(100), f64_from(50), m4_identity(), f64_from(800), f64_from(600), _r1_o, _r1_d),
+  0, "inv_vp = I: a ray, rc 0");
+assert_eq(HVec3_z(load64(_r1_d)), F64_ONE, "... direction (0, 0, 1)");
+
+# === 3.4.1: world_to_screen_checked's depth convention ===
+# depth = nz / 2 + 1/2 (GL's window depth) with nz `m4_transform_point_checked`'s z, bit for bit;
+# through m4_perspective_rh, `linearize_depth` reads it back as the eye distance; a reverse-Z
+# matrix's depth-buffer value is nz itself (transforms.cyr states the convention).
+test_group("3.4.1: world_to_screen_checked's depth convention");
+var _w1_p = hvec3_new(0, 0, 0xC014000000000000);
+var _w1_gl = m4_perspective_rh(0x3FF0C152382D7365, 0x3FF5555555555555, 0x3FB999999999999A, f64_from(100));
+var _w1_t, _w1_s = world_to_screen_checked(_w1_p, _w1_gl, f64_from(800), f64_from(600));
+var _w1_nt, _w1_n = m4_transform_point_checked(_w1_gl, _w1_p);
+assert_eq(HVec3_z(_w1_s), f64_add(f64_mul(HVec3_z(_w1_n), F64_HALF), F64_HALF),
+  "GL: depth = nz / 2 + 1/2, bit for bit");
+# linearize_depth's slope at distance 5 is n f (f - n) / 4 = 250 per unit of depth, and depth
+# carries up to 2^-52 (nz's rounding and the + 1/2's), so 2^-43 bounds it: 3.4.1 reads 40 ulp.
+assert_eq(f64_lt(f64_abs(f64_sub(linearize_depth(HVec3_z(_w1_s), 0x3FB999999999999A, f64_from(100)),
+        0x4014000000000000)), 0x3D40000000000000), 1, "GL: linearize_depth(depth) = 5 within 2^-43 (the eye distance)");
+var _w1_rz = m4_perspective_reverse_z(0x3FF0C152382D7365, 0x3FF5555555555555, 0x3FB999999999999A);
+var _w1_t2, _w1_s2 = world_to_screen_checked(_w1_p, _w1_rz, f64_from(800), f64_from(600));
+var _w1_nt2, _w1_n2 = m4_transform_point_checked(_w1_rz, _w1_p);
+assert_eq(HVec3_z(_w1_s2), f64_add(f64_mul(HVec3_z(_w1_n2), F64_HALF), F64_HALF), "reverse-Z: the same GL map of nz");
+assert_eq(_s1_dist(HVec3_z(_w1_n2), 0x3F947AE147AE147B) <= 1, 1, "reverse-Z: nz = near / 5 = 0.02 within 1 ulp");
+assert_eq(_s1_dist(linearize_depth_reverse_z(HVec3_z(_w1_n2), 0x3FB999999999999A), 0x4014000000000000) <= 1, 1,
+  "reverse-Z: linearize_depth_reverse_z(nz) = 5 within 1 ulp (of depth: 0.196)");
+
+# === 3.4.1: m3_normal_matrix_cof is certified, or exact ===
+# Expected values are the exact cofactors (Fraction) times sign(det), rounded to nearest
+# (scratch nmfix.py). Through 3.4.0 the plain minors answered every m, up to 0.535 of the largest
+# entry off near rank 1.
+test_group("3.4.1: m3_normal_matrix_cof near rank 1");
+fn _n1_m(a, b, c, d, e, f, g, h, i) {
+    var m = m3_new();
+    store64(m, a); store64(m + 8, b); store64(m + 16, c); store64(m + 24, d); store64(m + 32, e);
+    store64(m + 40, f); store64(m + 48, g); store64(m + 56, h); store64(m + 64, i);
+    return m;
+}
+fn _n1_eq(r, a, b, c, d, e, f, g, h, i) {
+    var x: i64[9];
+    store64(&x, a); store64(&x + 8, b); store64(&x + 16, c); store64(&x + 24, d); store64(&x + 32, e);
+    store64(&x + 40, f); store64(&x + 48, g); store64(&x + 56, h); store64(&x + 64, i);
+    var bad = 0;
+    for (var k = 0; k < 9; k = k + 1) { if (load64(r + k * 8) != load64(&x + k * 8)) { bad = bad + 1; } }
+    return bad;
+}
+# Near rank 1 (cofactors about 1e-16 of entries about 0.5, G about 2^52 of them): the compensated
+# tier certifies it (3.4.1 review M1; the first 3.4.1 form took the exact path), every entry the
+# exact cofactor's nearest double.
+var _n1_a = _n1_m(0xBFB80492A60367AE, 0x3FB1CBFA586F8908, 0x3FA5C7FF740FA7BF, 0x3FE2DC2EF07220E4, 0xBFDBF3301417425C,
+  0xBFD11A913B728E68, 0x3FE5490059B87D1C, 0xBFDF8B378B11D2B8, 0xBFD34D929F74A944);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_a), 0x3C90428AAE58D394, 0x3C9431311CBC8D68, 0x3C66E62CC051F740,
+    0xBC988B99B20F18E8, 0xBC980E58A164ACC5, 0xBC8DA427EAB55116, 0x3C980AD034A5DD7F, 0x3C9829D0D84695C9,
+    0x3C8B1254C02EFEF7), 0, "near rank 1: all nine entries the exact cofactors' nearest (3.4.0: 0.535 off)");
+# The same m times 2^-600 (exact): cofactors near 2^-1254, under the range floor, so the rescue
+# scales m by 2^601 (its largest entry into [1, 2)) and the compensated tier certifies that copy:
+# the exact cofactors times 2^1202, each the nearest (re-derived in the 3.4.1 review: the first
+# 3.4.1 form took the exact path, which scales the largest cofactor into [1, 2), 2^1254; both
+# are a power of two times sign(det) cof(m), the documented contract).
+var _n1_s = m3_scale(_n1_a, 0x1A70000000000000);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_s), 0x3CB0428AAE58D394, 0x3CB431311CBC8D68, 0x3C86E62CC051F740,
+    0xBCB88B99B20F18E8, 0xBCB80E58A164ACC5, 0xBCADA427EAB55116, 0x3CB80AD034A5DD7F, 0x3CB829D0D84695C9,
+    0x3CAB1254C02EFEF7), 0, "near rank 1 at 2^-600: the rescued copy's cofactors (x 2^1202), each the nearest");
+# 3.4.1 review M1: R1 S R2 with singular values (9.07, 0.21, 0.12), the review's repro: the plain
+# certificate fails (G about 10.2 times the largest entry) and the compensated tier answers, the
+# exact cofactors' nearest in every entry (the first 3.4.1 form's exact path took 26x 3.4.0's
+# time for the same bits), and `_m3_cof_comp` is what certified it.
+# [measured: the 3.4.1 review (RV-MAT M1, nmb.bcyr) and scratch nmb2.bcyr, 2026-10-31; cycc 6.7.18]
+var _n1_r = _n1_m(0xBFFEBBD831964DB8, 0x400BE915AFE8024E, 0xBFECE8572210EA7D, 0x40062EB71F6291C2, 0xC015D22A358093FF,
+  0x3FF80EDDDE9364BF, 0xC0012F0D426C7F1A, 0x40120AEAE2959C7C, 0xBFF0490CF9279743);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_r), 0xBFF3AD652EBEC848, 0xBFDA1468C6B138B0, 0x3FE943890ECFAB39,
+    0xBFE0C25F5F5DDDCC, 0x3F8E258F4166DE21, 0x3FF2BA43C60C0B3E, 0x3FD4573B5D8562B1, 0x3FD889D0C8F9D070,
+    0x3FE9C2174CE3F04D), 0, "R1 S R2 (9.07, 0.21, 0.12): the compensated minors, each the exact cofactor's nearest");
+fn _n1_pmx(p) {
+    var x = 0;
+    for (var k = 0; k < 9; k = k + 1) {
+        var v = load64(p + k * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (v > x) { x = v; }
+    }
+    return x;
+}
+var _n1_rp = _m3_cof_signed(_n1_r, 1);
+assert_eq(_m3_cof_comp(_n1_r, 1, _n1_rp, _n1_pmx(_n1_rp), _n1_pmx(_n1_r)), 1,
+  "... certified by the compensated tier, not the exact path");
+# Minors that cancel past 2^54 (a rounded u v^T, G = 2^56.2 of the largest cofactor, det < 0):
+# beyond the double-double's certificate, so the exact path answers, sign(det) cof(m) rounded.
+var _n1_b = _n1_m(0xBFD9F44CB5E3E698, 0x3FE4302582313088, 0x3F89B65B9C937D26, 0x3FD44E44CEBF4701, 0xBFDF96C1828586CE,
+  0xBF841DCEC3EF98F4, 0x3FDC887A4A043A0F, 0xBFE631A7654383CC, 0xBF8C4461A0BC880D);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_b), 0x3C37117CE2381A35, 0x3C2F5A30CD561B3F, 0xBC454B6AAC5B13D0,
+    0x3C3109D59B5C7560, 0x3C286DD3E0E37B82, 0xBC4FB51F59D1ED80, 0x3C21B741E2676AAC, 0x3C16446E8CCE0374,
+    0x3C198EFCCBACB000), 0, "minors cancelling past 2^54, det < 0: the exact path, each the nearest");
+var _n1_bp = _m3_cof_signed(_n1_b, 1);
+assert_eq(_m3_cof_comp(_n1_b, 1, _n1_bp, _n1_pmx(_n1_bp), _n1_pmx(_n1_b)), 0,
+  "... which the compensated tier declines");
+# Products within 2^-26 of DBL_MAX: m11 = m22 = 2^512 (1 - 2^-53) splits UP to 2^512, so the split
+# product overflows and `_m3_cof_comp`'s minor m11 m22 - m21 m12 would be +Inf (m21 = m12 = 2^512
+# (1 - 2^-20) split exactly). The first 3.4.1 form declined that non-finite minor and the exact
+# path gave the finite 2^1005-scale cofactor; since the round-2 review `_m3_cof_hhovf` sends m to
+# `_m3_cof_wide`, which proves every entry the exact cofactor's nearest: the same bits.
+var _n1_o = _n1_m(F64_ONE, 0, 0, 0, 0x5FEFFFFFFFFFFFFF, 0x5FEFFFFE00000000, 0, 0x5FEFFFFE00000000, 0x5FEFFFFFFFFFFFFF);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_o), 0x7EBFFFFEFFF00000, 0, 0, 0, 0x5FEFFFFFFFFFFFFF, 0xDFEFFFFE00000000, 0,
+    0xDFEFFFFE00000000, 0x5FEFFFFFFFFFFFFF), 0,
+  "products near DBL_MAX: the exact cofactors' nearest (the first form's exact path, the same bits)");
+# A well-conditioned m keeps the plain minors (certified): six of its nine entries are not the
+# exact cofactors' nearest (each within 2 ulp), so these are the 3.4.0 formula's own bits.
+var _n1_c = _n1_m(0xBFFCC71EDFADE7BA, 0xBFF2D80ECA8605A8, 0x3FE8DD1B36D2CA76, 0xBFF71DFFDAD78537, 0x3FE48496CAADF792,
+  0xBFE6CE60E88B451A, 0x3FF64A5CA4F25315, 0xBFFF2778C85BE66A, 0x3FF6F4804F0B8544);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_c), 0xBFDDF08A37B8BB24, 0x3FF147A0C606C64F, 0x3FFEB851AB20F678,
+    0x3FC6A16533E86E88, 0xC00D4DABE8FE3EC6, 0xC014925CC8788032, 0x3FD5D5DBF5620989, 0xC0033C5C79886454,
+    0xC006D6CD3CF34896), 0, "certified: the plain minors' bits, as through 3.4.0");
+# S R with S = (100, 1, 0.01): the column bound fails, the row bound certifies: plain bits.
+var _n1_sr = _n1_m(0xC0563EEB3A93D9E3, 0x3FD941E64E43D810, 0x3F62C315C0B0A84F, 0xC0464A7B9B1AD828, 0xBFEB7BDF28ECFED6,
+  0xBF64A83B57FEFD24, 0x4023702F04D95956, 0xBFD4E52BE087A314, 0x3F83414F7C224DE4);
+var _n1_srp = _m3_cof_signed(_n1_sr, _m3_det_sign_exact(_n1_sr));
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_sr), load64(_n1_srp), load64(_n1_srp + 8), load64(_n1_srp + 16),
+    load64(_n1_srp + 24), load64(_n1_srp + 32), load64(_n1_srp + 40), load64(_n1_srp + 48), load64(_n1_srp + 56),
+    load64(_n1_srp + 64)), 0, "S R, anisotropic rows: certified, the plain minors' bits");
+# Anisotropic on both sides, S1 R S2: the row and column bounds fail and the products certify:
+# the plain minors' bits (two of them are not the exact cofactors' nearest).
+var _n1_gm = _n1_m(0xC05EE00CF2B6A00D, 0xBFD6AC0AE9469CD0, 0xBFC46DA01FA8C0EC, 0x3F8C91F21305D1AD, 0x3F18D31B02ECD5FC,
+  0xBEDDCA739690014D, 0x3FB8E48A97CEA574, 0xBEF72CBB3AAE33D2, 0xBEB991866F4BABE3);
+var _n1_gmp = _m3_cof_signed(_n1_gm, _m3_det_sign_exact(_n1_gm));
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_gm), load64(_n1_gmp), load64(_n1_gmp + 8), load64(_n1_gmp + 16),
+    load64(_n1_gmp + 24), load64(_n1_gmp + 32), load64(_n1_gmp + 40), load64(_n1_gmp + 48), load64(_n1_gmp + 56),
+    load64(_n1_gmp + 64)), 0, "S1 R S2: certified by its products, the plain minors' bits");
+# diag(1, 3 * 2^-1000, 5 * 2^-1000): its cofactors (15 * 2^-2000, 5 * 2^-1000, 3 * 2^-1000) are
+# below 2^-969, the first far below DBL_MIN: the exact path scales them by 2^998, keeping all three
+# (3.4.0's rescue gave the plain diag(0, 5 * 2^-1000, 3 * 2^-1000), 15 * 2^-2000 flushed).
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_m(F64_ONE, 0, 0, 0, 0x0188000000000000, 0, 0, 0, 0x0194000000000000)),
+    0x018E000000000000, 0, 0, 0, 0x3FF4000000000000, 0, 0, 0, 0x3FE8000000000000), 0,
+  "diag(1, 3 2^-1000, 5 2^-1000): the exact cofactors times 2^998");
+# The minor m00 m11 - m10 m01 cancels: m10 m01 is the largest product, 8.6 times the largest
+# entry, and its partner m00 m11 is within 8 of it. Every plain bound fails and the compensated tier answers:
+# the exact cofactors' nearest (the plain (2, 2) is 54 ulp off, (0, 1) one).
+# [measured: scratch nmfix.py, Fraction cofactors, lane MAT 3.4.1, 2026-10-31]
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_m(0x40085C7306C2338E, 0x400823ED4F5AC190, 0xBF3CAE3B8FE7FFC6,
+        0x40086D410AC8433B, 0x4007DFF37560BF0D, 0x3F4448BA565EAE90, 0xBF43B1D5BCC0E5AC, 0x3F4952B6354A8B18,
+        0x3FD7D66D4687007C)), 0xBFF1C8F1AF886A56, 0x3FF232353092E70C, 0xBF7103124E7D5A68, 0x3FF1FB959E69B0A6,
+    0xBFF225AFD8163E30, 0x3F7111572BD70F59, 0xBF6A004B52EB6FF5, 0x3F6A6371FB574329, 0x3FC01B49C7B7F5F6), 0,
+  "a cancelling minor whose largest product is m10 m01: the exact cofactors' nearest");
+# Rank 1 exactly: every cofactor 0.
+assert_eq(_n1_eq(m3_normal_matrix_cof(_n1_m(F64_TWO, 0, 0, 0, 0, 0, 0, 0, 0)), 0, 0, 0, 0, 0, 0, 0, 0, 0), 0,
+  "diag(2, 0, 0): the zero matrix");
+
+# === 3.4.1: m4_inverse_checked's negated zero entries are the sign bit's, on every pin ===
+# The identity's inverse through the formula: the eight negated cofactors are +0, flipped to -0
+# (f64_neg gave +0 below cycc 6.6.8); the other off-diagonal entries are +0.
+test_group("3.4.1: m4_inverse_checked zero signs");
+var _z1_t, _z1_i = m4_inverse_checked(m4_identity());
+var _z1_neg = 0;
+var _z1_pos = 0;
+for (var _z1_k = 0; _z1_k < 16; _z1_k = _z1_k + 1) {
+    var _z1_e = load64(_z1_i + _z1_k * 8);
+    if (_z1_k == 1 || _z1_k == 3 || _z1_k == 4 || _z1_k == 6 || _z1_k == 9 || _z1_k == 11 || _z1_k == 12
+      || _z1_k == 14) {
+        if (_z1_e == 0x8000000000000000) { _z1_neg = _z1_neg + 1; }
+    } elif (_z1_k != 0 && _z1_k != 5 && _z1_k != 10 && _z1_k != 15) {
+        if (_z1_e == 0) { _z1_pos = _z1_pos + 1; }
+    }
+}
+assert_eq(_z1_neg, 8, "m4_inverse_checked(I): the eight negated-cofactor entries are -0");
+assert_eq(_z1_pos, 4, "m4_inverse_checked(I): the other four off-diagonal entries are +0");
+
+# === 3.4.1: t2d / t3d composition with rotated and non-uniform-scale transforms ===
+# Within the documented precondition (b's scale commutes with a's rotation), compose(a, b)
+# applied to a point equals a then b; a has both a rotation and a non-uniform scale. The bound,
+# 2^-40 of the point's magnitude, is above what rounding can move either side (two rotations at
+# 22u |v| each, `hquat_rotate_vec3`, plus a few u for the scales and sums) and some 2^39 times
+# below what a wrong composite gives: the precondition's own counterexample is off by 0.97.
+test_group("3.4.1: t2d / t3d composition, rotated and non-uniform");
+fn _c1_close(x, y) {
+    var tol = f64_mul(f64_max(F64_ONE, f64_abs(y)), 0x3D70000000000000);   # 2^-40
+    return f64_lt(f64_abs(f64_sub(x, y)), tol);
+}
+var _c1_a2 = t2d_new(hvec2_new(0x3FD3333333333333, 0xBFC999999999999A), 0x3FE6666666666666,
+  hvec2_new(F64_TWO, F64_HALF));
+var _c1_b2 = t2d_new(hvec2_new(F64_HALF, 0x3FB999999999999A), 0xBFF199999999999A,
+  hvec2_new(0x3FF8000000000000, 0x3FF8000000000000));
+var _c1_p2 = hvec2_new(F64_ONE, 0xBFE8000000000000);
+var _c1_in2 = t2d_apply(_c1_b2, t2d_apply(_c1_a2, _c1_p2));
+var _c1_cp2 = t2d_apply(t2d_compose(_c1_a2, _c1_b2), _c1_p2);
+assert_eq(_c1_close(HVec2_x(_c1_cp2), HVec2_x(_c1_in2)) + _c1_close(HVec2_y(_c1_cp2), HVec2_y(_c1_in2)), 2,
+  "t2d: a rotated by 0.7 with scale (2, 1/2), then b uniform: compose = in turn, x and y");
+var _c1_qa = _fd_qnorm(hquat_new(0x3FC999999999999A, 0xBFD999999999999A, 0x3FE3333333333333,
+    0x3FE999999999999A));
+var _c1_qb = hquat_from_axis_angle(hvec3_normalize(hvec3_new(F64_ONE, F64_TWO, 0xC008000000000000)),
+  0x3FF4CCCCCCCCCCCD);
+var _c1_a3 = t3d_new(hvec3_new(F64_ONE, 0xBFE0000000000000, 0x4000000000000000), _c1_qa,
+  hvec3_new(F64_TWO, F64_HALF, 0x4008000000000000));
+var _c1_b3 = t3d_new(hvec3_new(0xBFF8000000000000, F64_ONE, 0x3FD0000000000000), _c1_qb,
+  hvec3_new(0x3FF4000000000000, 0x3FF4000000000000, 0x3FF4000000000000));
+var _c1_p3 = hvec3_new(0x3FE6666666666666, 0xBFF3333333333333, 0x4004000000000000);
+var _c1_in3 = t3d_apply(_c1_b3, t3d_apply(_c1_a3, _c1_p3));
+var _c1_cp3 = t3d_apply(t3d_compose(_c1_a3, _c1_b3), _c1_p3);
+assert_eq(_c1_close(HVec3_x(_c1_cp3), HVec3_x(_c1_in3)) + _c1_close(HVec3_y(_c1_cp3), HVec3_y(_c1_in3))
+  + _c1_close(HVec3_z(_c1_cp3), HVec3_z(_c1_in3)), 3,
+  "t3d: a rotated with scale (2, 1/2, 3), then b rotated, uniform 1.25: compose = in turn");
+# A rotation about z, then the non-uniform scale (2, 2, 1/2): they commute, so compose holds.
+var _c1_a4 = t3d_new(hvec3_new(0x3FD0000000000000, F64_ONE, 0xBFF0000000000000),
+  hquat_from_rotation_z(0x3FE6666666666666),
+  hvec3_new(0x3FF8000000000000, F64_HALF, F64_TWO));
+var _c1_b4 = t3d_new(hvec3_new(F64_ONE, 0, F64_HALF), hquat_identity(), hvec3_new(F64_TWO, F64_TWO, F64_HALF));
+var _c1_in4 = t3d_apply(_c1_b4, t3d_apply(_c1_a4, _c1_p3));
+var _c1_cp4 = t3d_apply(t3d_compose(_c1_a4, _c1_b4), _c1_p3);
+assert_eq(_c1_close(HVec3_x(_c1_cp4), HVec3_x(_c1_in4)) + _c1_close(HVec3_y(_c1_cp4), HVec3_y(_c1_in4))
+  + _c1_close(HVec3_z(_c1_cp4), HVec3_z(_c1_in4)), 3,
+  "t3d: a rotated about z with scale (1.5, 1/2, 2), then b scale (2, 2, 1/2): compose = in turn");
+
+# === 3.4.1 MAT3: m3_normal_matrix_cof past the compensated tier's own range ===
+# Round-2 review S1. `_m3_cof_comp`'s splits overflow for an entry at or above 2^997 - 2^970
+# (x (2^27 + 1) past DBL_MAX) and its products of splits for a product within about 2^-25 of
+# DBL_MAX; the first 3.4.1 form then declined, and the exact path answered at 50 to 94 times
+# 3.4.0's time. Such m now go to `_m3_cof_wide`, which keeps an answer only where every entry is
+# proved the exact cofactor's nearest: the exact path's bits. Every expected value below is the
+# exact cofactors times sign(det), rounded to nearest (Fraction, scratch orc7.py / cmp_s1.py), and
+# the first form's (MAT2's) answer bit for bit; `_m3_cof_comp` returning 1 is the tier's own
+# certificate (0: the exact path answered).
+# [measured: scratch fx.in / fxb.in, Fraction oracle and MAT2 bits, 2026-10-31; cycc 6.7.18]
+test_group("3.4.1 MAT3: m3_normal_matrix_cof past the compensated tier's own range");
+fn _mt_wb(m) {
+    var p = _m3_cof_signed(m, 1);
+    return _m3_cof_comp(m, 1, p, _n1_pmx(p), _n1_pmx(m));
+}
+# The wide tier's uniform pass alone (3.4.1 MAT4: `_m3_cof_wide` tries the equilibrated one first):
+# 1 certified, 0 declined, 2 declined for range.
+fn _mt_wu(m) {
+    var kv: i64[10];
+    for (var i = 0; i < 9; i = i + 1) { store64(&kv + i * 8, 0 - 28); }
+    store64(&kv + 72, 0 - 84);
+    return _m3_cof_wpass(m, 1, m3_new(), &kv);
+}
+var _mt_r1 = _n1_m(0xFE4EBBD831964DB8, 0x3FCBE915AFE8024E, 0xBFACE8572210EA7D, 0x7E562EB71F6291C2,
+  0xBFD5D22A358093FF, 0x3FB80EDDDE9364BF, 0xFE512F0D426C7F1A, 0x3FD20AEAE2959C7C, 0xBFB0490CF9279743);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_r1), 0xBF73AD652EBEC848, 0xFDEA1468C6B138B0, 0x7DF943890ECFAB39,
+    0xBF60C25F5F5DDDCC, 0x7D9E258F4166DE21, 0x7E02BA43C60C0B3E, 0x3F54573B5D8562B1,
+    0x7DE889D0C8F9D070, 0x7DF9C2174CE3F04D), 0,
+  "the review's M1 with row 0 at 2^998 (splits overflow): the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_r1), 1, "... certified by the wide tier (the first form: the exact path, 81x 3.4.0)");
+# The largest entry exactly 2^997 - 2^970, where x (2^27 + 1) first overflows: the wide tier (the
+# first form declined); one double below it, `_m3_cof_comp` itself certifies (both: Fraction nearest).
+var _mt_on = _n1_m(0x7E3FFFFFFC000000, 0x7E1DE3C2DA6DE7B4, 0x7E2D66BB71C64AB1, 0xBFFB15AB54E23B5C,
+  0xBFD94C69EC6EDB95, 0xBFE8E29701F3BBC1, 0xBFFC2B194E54119C, 0xBFDA4F8C35C882A1, 0xBFE9E17D534A55AE);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_on), 0x3E1B6F8EB4EBA72D, 0xBE1B658F10D5F5FB, 0xBE26E5D5C71B0FE7,
+    0x7C5DD696134B0B7A, 0x7C596AA48A078CB0, 0xFC7377B607875E8D, 0x7C23D1E7057B15EA,
+    0xFC6BC7F3CB27B061, 0x7C56D97F9A13EA3B), 0,
+  "near rank 1, largest entry ON 2^997 - 2^970: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_on), 1, "... certified by the wide tier (an entry at the threshold routes there)");
+var _mt_bl = _n1_m(0x7E3FFFFFFBFFFFFF, 0x7E1DE3C2DA6DE7B3, 0x7E2D66BB71C64AB0, 0xBFFB15AB54BE3CED,
+  0xBFD94C69EBC92AE2, 0xBFE8E29701A4987D, 0xBFFC2B194D5D7FA5, 0xBFDA4F8C334DDA1F, 0xBFE9E17D538258B0);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_bl), 0xBDDDEB53318AD163, 0x3E2543D5F89AFDBA, 0xBE118C39E041967A,
+    0xFC43C0C6F1A3067C, 0x7C7803971A061713, 0xFC5B53AFFFE7FEFF, 0x7C3D7D29188A4BBB,
+    0xFC6605CF9CAB970E, 0x7C395D074D9CAB7D), 0,
+  "the same one double below the threshold: `_m3_cof_comp`'s own minors, the nearest");
+assert_eq(_mt_wb(_mt_bl), 1, "... certified (its splits are finite there)");
+var _mt_rs = _n1_m(0x7E4F90B49758188B, 0xBFDE43EB7B5BF4CB, 0xBFDDE6556B99C69A, 0x7E50000000000000,
+  0xBFDD52E9B891E6DA, 0xBFDCBBC05AAAEA90, 0x7E15B3C04ABD24C8, 0xBFB056E0640466FF, 0xBFAAD8BABAAB2DDD);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_rs), 0xBF72F72F408B7F8C, 0x7DED70766646D471, 0xFDF9953ECB227619,
+    0x3F74921194FC0F36, 0xFDE8D0FE1BB0582C, 0x7DF76B0979A76A8A, 0xBF5C9A925571B13B,
+    0xFDF8E840A2D26372, 0x7DF56FE77BD65051), 0,
+  "R1 S R2 with row 0 lifted to 2^998 (the review's 94x case): the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_rs), 1, "... certified by the wide tier");
+# Products within 2^-26 of DBL_MAX (the `_n1_o` block turned so the overflowing minor is c8): m22 =
+# 2^-30, and m22 = 2^460, where c0 and c4 are near 2^972 and c8 alone is 2^1005.
+var _mt_o2 = _n1_m(0x5FEFFFFFFFFFFFFF, 0x5FEFFFFE00000000, 0, 0x5FEFFFFE00000000,
+  0x5FEFFFFFFFFFFFFF, 0, 0, 0, 0x3E10000000000000);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_o2), 0x5E0FFFFFFFFFFFFF, 0xDE0FFFFE00000000, 0,
+    0xDE0FFFFE00000000, 0x5E0FFFFFFFFFFFFF, 0, 0,
+    0, 0x7EBFFFFEFFF00000), 0,
+  "products near DBL_MAX, m22 = 2^-30: the exact cofactors (the first form: 50x 3.4.0)");
+assert_eq(_m3_cof_hhovf(_mt_o2), 1, "... a product of `_m3_cof_comp`'s splits there overflows");
+assert_eq(_mt_wb(_mt_o2), 1, "... certified by the wide tier");
+var _mt_o8 = _n1_m(0x5FEFFFFFFFFFFFFF, 0x5FEFFFFE00000000, 0, 0x5FEFFFFE00000000,
+  0x5FEFFFFFFFFFFFFF, 0, 0, 0, 0x5CB0000000000000);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_o8), 0x7CAFFFFFFFFFFFFF, 0xFCAFFFFE00000000, 0,
+    0xFCAFFFFE00000000, 0x7CAFFFFFFFFFFFFF, 0, 0,
+    0, 0x7EBFFFFEFFF00000), 0,
+  "products near DBL_MAX, m22 = 2^460: slot 8 the exact 2^1005-scale cofactor, not +Inf");
+# `_m3_cof_hhovf` counts only the products the minors form (different rows and columns): the
+# same two near-2^512 entries in one row, or in one column, multiply in no minor.
+assert_eq(_m3_cof_hhovf(_n1_m(0x5FEFFFFFFFFFFFFF, 0x5FEFFFFFFFFFFFFF, 0, 0, F64_ONE, 0, 0, 0, F64_ONE)), 0,
+  "hhovf: an overflowing pair in one row (m00 m01) is no minor's product");
+assert_eq(_m3_cof_hhovf(_n1_m(0x5FEFFFFFFFFFFFFF, 0, 0, 0x5FEFFFFFFFFFFFFF, F64_ONE, 0, 0, 0, F64_ONE)), 0,
+  "hhovf: an overflowing pair in one column (m00 m10) is no minor's product");
+# Declines of the uniform pass (`_mt_wu` returns 2). Through MAT3 the exact path then answered;
+# since MAT4 the equilibrated pass certifies every fixture here but the two bracket ones, the same
+# bits. A product of two non-zero entries of m 2^-28
+# under 2^-969 has an error term that loses bits: without that test the tier certified 1,821 of
+# 18,954 near-rank-1 matrices with a row near 2^-1000 with wrong bits, and with the test at
+# 2^-990, 2,033 of 18,871 with a row near 2^-920. An entry below 2^-994 that m 2^-28 does not hold
+# exactly (2^-1000 (1.07), beside the products near DBL_MAX; in m20, m21, m22) gave the cofactors
+# of another matrix, four entries off. And an entry whose rounding the bracket cannot pin, one
+# fixture per side of it (each side alone let 762 and 789 of 58,932 through).
+# [measured: scratch s1c.in / s1d.in / s1f.in / fxe.op / fxg.op against mutant probes, 2026-10-31; cycc 6.7.18]
+var _mt_ls = _n1_m(0xC001E5336186845F, 0xC000FB3930C395E7, 0xBFEA2AE8AAC5277B, 0x01D8EDAD7F259FCE,
+  0x01D7A7BE77358893, 0x01C239D66FAB1076, 0x7EA1DFD867B2405E, 0x7EA0F6243C258C2A, 0x7E8A2313F1752BE9);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_ls), 0xBE332DC1CEC34233, 0xBE389EE403CFD024, 0x3E5D17E0C97546AA,
+    0x7C30A1A1D9275C36, 0xFC5FCA14D16A5B4C, 0x7C71C93F622FFD48, 0x80001619BD19C2EB,
+    0x8000027B66E74DD3, 0x000042E60E21AFE7), 0,
+  "a row near 2^-1000 with a row past 2^997: the exact path's bits");
+assert_eq(_mt_wu(_mt_ls), 2, "... the uniform pass declines (a product under 2^-969)");
+assert_eq(_mt_wb(_mt_ls), 1, "... the equilibrated pass certifies it");
+var _mt_lb = _n1_m(0x066EEC65A5B14477, 0x867610FB1643DA19, 0x068AE7816790BC91, 0x3FE0AA0E961FE668,
+  0xBFE7C8580BE304DF, 0x3FFCFF32A6C0614A, 0x7FC09A465854DF5A, 0xFFC7B1D1FA361D42, 0x7FDCE3BC62E7F8C7);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_lb), 0xFD25B90C20E93429, 0xFD3C782C3767DA1A, 0xFD211BA721569ED9,
+    0xC3FDA5F06AB3BD4B, 0xC3DB94B90DFB987A, 0x43D6C43D2C62EA17, 0x041F05CD9E54119C,
+    0x0404784DCE830F8C, 0x83F2DE358264D04B), 0,
+  "a row near 2^-920 with a row past 2^997 (products of m 2^-28 just under 2^-969): exact path");
+assert_eq(_mt_wu(_mt_lb), 2, "... the uniform pass declines (a product in [2^-990, 2^-969))");
+assert_eq(_mt_wb(_mt_lb), 1, "... the equilibrated pass certifies it");
+var _mt_sx = _n1_m(0, 0x5FEFFFFFFFFFFFFF, 0x5FEFFFFE00000000, 0,
+  0x5FEFFFFE00000000, 0x5FEFFFFFFFFFFFFF, 0x0171234567890ABC, 0x3FF0000000000000, 0x3FF0000000000000);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_sx), 0xDEAFFFFFFFF00000, 0x2171234567890ABB, 0xA17123445554B443,
+    0xDEAFFFFFFFF00000, 0xA17123445554B443, 0x2171234567890ABB, 0x7EBFFFFEFFF00000,
+    0, 0), 0,
+  "products near DBL_MAX and an entry 2^-1000 (1.07): the exact path's bits");
+assert_eq(_mt_wu(_mt_sx), 2, "... the uniform pass declines (m 2^-28 would round that entry)");
+assert_eq(_mt_wb(_mt_sx), 1, "... the equilibrated pass certifies it");
+var _mt_sy = _n1_m(0x5FEFFFFFFFFFFFFF, 0, 0x5FEFFFFE00000000, 0x5FEFFFFE00000000,
+  0, 0x5FEFFFFFFFFFFFFF, 0x3FF0000000000000, 0x0171234567890ABC, 0x3FF0000000000000);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_sy), 0x2171234567890ABB, 0xDEAFFFFFFFF00000, 0xA17123445554B443,
+    0xA17123445554B443, 0xDEAFFFFFFFF00000, 0x2171234567890ABB, 0x8000000000000000,
+    0x7EBFFFFEFFF00000, 0x8000000000000000), 0,
+  "the same with that entry in m21: the exact path's bits");
+assert_eq(_mt_wu(_mt_sy), 2, "... the uniform pass declines (m21 not held exactly)");
+assert_eq(_mt_wb(_mt_sy), 1, "... the equilibrated pass certifies it");
+var _mt_sz = _n1_m(0x5FEFFFFFFFFFFFFF, 0x5FEFFFFE00000000, 0, 0x5FEFFFFE00000000,
+  0x5FEFFFFFFFFFFFFF, 0, 0x3FF0000000000000, 0x3FF0000000000000, 0x0171234567890ABC);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_sz), 0x2171234567890ABB, 0xA17123445554B443, 0xDEAFFFFFFFF00000,
+    0xA17123445554B443, 0x2171234567890ABB, 0xDEAFFFFFFFF00000, 0,
+    0, 0x7EBFFFFEFFF00000), 0,
+  "the same with that entry in m22: the exact path's bits");
+assert_eq(_mt_wu(_mt_sz), 2, "... the uniform pass declines (m22 not held exactly)");
+assert_eq(_mt_wb(_mt_sz), 1, "... the equilibrated pass certifies it");
+var _mt_bk = _n1_m(0xBFB11D6151263DE4, 0xBF99E02B3D723ED1, 0x3F6917CC835204BB, 0xBFFCCA06B50094BB,
+  0xBFE5C3567FBBCEC2, 0x3FB51AD071C5B68A, 0x7F76B62B39CB5557, 0x7F612B31CFE8C3DD, 0xFF30A63F4EC3BA3A);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_bk), 0x7C3EEA43314E10C7, 0xFC5530E25BA59ED6, 0xFC388471E3799440,
+    0xFC40A27A9043DB12, 0x7C55F615B34A1C15, 0xFBF7291CB9766298, 0xBCC45BA9F6E6508C,
+    0x3CDAD70A085AEFAB, 0xBC87EABB90E37F23), 0,
+  "near rank 1 lifted past 2^997: the exact path's bits");
+assert_eq(_mt_wb(_mt_bk), 0, "... declined: s + (u - d) leaves c~ (the bracket's lower side)");
+var _mt_bu = _n1_m(0xBFBF291A9D49C603, 0x3FA27CA366694A5D, 0xBF969ABB9042360A, 0xFF472D8A34D4F080,
+  0x7F2B80796F2635D1, 0xFF20D04B87A2648A, 0xBFEF4C8650C2A8F7, 0x3FD291A710B8B51D, 0xBFC6B46D6F45A419);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_bu), 0x7C0777B5CA91A1D1, 0x7C2A1A4F5128FF5B, 0x7C14B0DE762C2686,
+    0x3C9056E3CB33A168, 0x3CB9AD911CD81EE3, 0x3CB37A1BF75968EA, 0xFBF1F0DB3FEED2B8,
+    0xFC198322E6FC10F7, 0xFC10FF8F88CC2AEB), 0,
+  "another near rank 1 lifted past 2^997: the exact path's bits");
+assert_eq(_mt_wb(_mt_bu), 0, "... declined: s + (u + d) leaves c~ (the bracket's upper side)");
+
+# === 3.4.1 MAT3: each of the wide tier's per-minor and per-product tests ===
+# Each line of `_m3_cof_wide`'s bracket (nine minors) and of its product test (eighteen
+# products) is pinned alone: a matrix where only that minor's rounding cannot be pinned (found
+# among 99,597 near-rank-1 and overflowing ones, each declined by exactly one of the nine), and
+# the products-near-DBL_MAX block with s = 2^-500 (1.14) and y = 2^-500 (1.2) placed so that s y
+# is the one product under 2^-913 (2^-969 in m 2^-28), its rows and columns permuted onto each of
+# the eighteen products. The bracket fixtures go to the exact path (`_m3_cof_comp` returns 0, the
+# first form's bits); the product fixtures are refused by the uniform pass (`_mt_wu`, both passes
+# run these same lines) and the equilibrated pass does not reach them; with its own line deleted
+# the pass certified each one.
+# [measured: scratch fxk.op / fxp.op against the 27 single-line mutant probes, 2026-10-31; cycc 6.7.18]
+test_group("3.4.1 MAT3: each wide-tier bracket and product test");
+fn _mt_pm(r0, r1, r2, c0, c1, c2) {
+    var b: i64[9];
+    store64(&b, 0x20B23456789ABCDE); store64(&b + 8, 0x5FEFFFFFFFFFFFFF); store64(&b + 16, 0x5FEFFFFE00000000);
+    store64(&b + 24, 0); store64(&b + 32, 0x5FEFFFFE00000000); store64(&b + 40, 0x5FEFFFFFFFFFFFFF);
+    store64(&b + 48, F64_ONE); store64(&b + 56, 0x20B3456789ABCDEF); store64(&b + 64, F64_ONE);
+    var rs: i64[3];
+    var cs: i64[3];
+    store64(&rs, r0); store64(&rs + 8, r1); store64(&rs + 16, r2);
+    store64(&cs, c0); store64(&cs + 8, c1); store64(&cs + 16, c2);
+    var m = m3_new();
+    for (var i = 0; i < 3; i = i + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            store64(m + (load64(&rs + i * 8) * 3 + load64(&cs + j * 8)) * 8, load64(&b + (i * 3 + j) * 8));
+        }
+    }
+    return m;
+}
+assert_eq(_mt_wb(_n1_m(0x3FD68E508A55D72D, 0xBFEE25BB9C4AD4FE, 0x3FBEAEB381428CBE, 0xFE7726D7E6DCDA8F,
+      0x7E8EF198DA50880F, 0xFE5F7E2EF61DF963, 0xBFABF9CD5692158F, 0x3FC2B2192E1AB572, 0xBF930709CF74B587)), 0,
+  "bracket of minor c0 alone: declined");
+assert_eq(_mt_wb(_n1_m(0xBFA369EE8AEBA59A, 0x3F97E3B51ED16B3D, 0x3FA8E24C1D0E0719, 0xFEAA76691B50226A,
+      0x7EA04818C6CCD62D, 0x7EB0F59C1D59BBD6, 0xBFE7C480B01A1617, 0x3FDD3F3BB6EA8398, 0x3FEE76EB08E9FA78)), 0,
+  "bracket of minor c1 alone: declined");
+assert_eq(_mt_wb(_n1_m(0x7F624F41A867C10E, 0xFF624CEDE01CD3C2, 0x7F60553886E4BD40, 0x3FF9A4F181D7885B,
+      0xBFF9A1AF0ED50FD8, 0x3FF6E0315F21C488, 0xBF9926B7E5C6EA84, 0x3F9923857E0CA030, 0xBF966F9855E6AD8A)), 0,
+  "bracket of minor c2 alone: declined");
+assert_eq(_mt_wb(_n1_m(0x3FBA75F7E1BAE4CC, 0xBF70C7FF5EE965DC, 0xBFDDB10441CD960E, 0xBFDB3131B9ABBCE3,
+      0x3F913EBC19F9B738, 0x3FFE8319F547BD44, 0x7E308A34D10F0A37, 0xFDE4FA99D146687D, 0xFE528F2B6EDD72AC)), 0,
+  "bracket of minor c3 alone: declined");
+assert_eq(_mt_wb(_n1_m(0x7EA39F2E905EF99C, 0xFE863667804C22F0, 0x7E9A8C607920AEA3, 0x3FBB74DE61405D30,
+      0xBF9F14E815C4C446, 0x3FB29309B2553771, 0xBFEB7644EA2F8BED, 0x3FCF167DF5481E4A, 0xBFE293FC3EF2C52D)), 0,
+  "bracket of minor c4 alone: declined");
+assert_eq(_mt_wb(_n1_m(0x3FCF75F40883C5F0, 0x3FB8ED76D60A47C0, 0x3FCAFC5AE3648A94, 0xFF1CC3DD59652FC8,
+      0xFF06CAAE098B2D92, 0xFF18AC6CCA48F936, 0x3FC70D28576E51DC, 0x3FB243B82DDD2288, 0x3FC3C5C62901AA0E)), 0,
+  "bracket of minor c5 alone: declined");
+assert_eq(_mt_wb(_n1_m(0xBFBF291A9D49C603, 0x3FA27CA366694A5D, 0xBF969ABB9042360A, 0xFF472D8A34D4F080,
+      0x7F2B80796F2635D1, 0xFF20D04B87A2648A, 0xBFEF4C8650C2A8F7, 0x3FD291A710B8B51D, 0xBFC6B46D6F45A419)), 0,
+  "bracket of minor c6 alone: declined");
+assert_eq(_mt_wb(_n1_m(0x3FEB802865D4E27D, 0x3FE54377D4C1ECA6, 0x3FDE111AD325CBF3, 0x3FDB94F78599EC06,
+      0x3FD5538EC6F1185F, 0x3FCE27DB0BA1C50D, 0x7F156CFE6538175A, 0x7F109102E06A1F36, 0x7F076CD25EB8C25B)), 0,
+  "bracket of minor c7 alone: declined");
+assert_eq(_mt_wb(_n1_m(0x3FBCC46258C35BDC, 0x3F9A96AF44A2590A, 0xBF72836668F258A6, 0x7ECD5BA5E8AA9AB8,
+      0x7EAB227E529A35BB, 0xFE82E4BF3976441A, 0x3FDE2FEB3E5B4C5C, 0x3FBBE6B06D58315D, 0xBF936D5AF6BF818E)), 0,
+  "bracket of minor c8 alone: declined");
+assert_eq(_mt_wu(_mt_pm(1, 0, 2, 1, 2, 0)), 2, "product p0 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 1, 2, 2, 1, 0)), 2, "product p1 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 2, 1, 1, 2, 0)), 2, "product p2 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(1, 0, 2, 2, 0, 1)), 2, "product p3 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 1, 2, 0, 2, 1)), 2, "product p4 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 2, 1, 2, 0, 1)), 2, "product p5 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(1, 0, 2, 0, 1, 2)), 2, "product p6 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 1, 2, 1, 0, 2)), 2, "product p7 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 2, 1, 0, 1, 2)), 2, "product p8 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(1, 0, 2, 2, 1, 0)), 2, "product q0 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 1, 2, 1, 2, 0)), 2, "product q1 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 2, 1, 2, 1, 0)), 2, "product q2 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(1, 0, 2, 0, 2, 1)), 2, "product q3 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 1, 2, 2, 0, 1)), 2, "product q4 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 2, 1, 0, 2, 1)), 2, "product q5 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(1, 0, 2, 1, 0, 2)), 2, "product q6 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 1, 2, 0, 1, 2)), 2, "product q7 alone under 2^-969: declined for range");
+assert_eq(_mt_wu(_mt_pm(0, 2, 1, 1, 0, 2)), 2, "product q8 alone under 2^-969: declined for range");
+
+# === 3.4.1 MAT3: the compensated tier's TwoSum error and per-minor maxima ===
+# Round-2 review S4(a): dropping the TwoSum error from c4 alone changed 55 of 11,337 compensated
+# R S R answers, each to a non-nearest entry; this one is the review's kill fixture (rsr1, seed
+# 101), every entry the exact cofactor's nearest (Fraction). S4(c): each of the nine minors'
+# max|c~| updates is what certifies a matrix whose one large minor sits in that slot: a 2x2 block
+# (1.118, sqrt 2; sqrt 3, a d cancelling to 2^-40) in the other rows and columns and 1.05e-21 in
+# the slot's own place, so the other eight cofactors are 1e-9 of it and G is about 2^70 times them.
+# [measured: the round-2 review (R2-MAT S4), scratch fxc.in, Fraction, 2026-10-31; cycc 6.7.18]
+test_group("3.4.1 MAT3: compensated-tier TwoSum error and per-minor maxima");
+var _mt_c4 = _n1_m(0xBF897C39303FEE7A, 0xBFF67F2C4B278468, 0xC006F0B90211DA0C, 0x3F7E1C2D1D1619CE,
+  0xC001477E17E8F741, 0xC00F85CBC856D6E1, 0xBFD076120C42C1C6, 0xC00076979F308E57, 0xC00FE6A5E9ED7459);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_c4), 0x3FE0214F8A015396, 0x3FF0AF46544C0A4D, 0xBFE242EE40820605,
+    0x3FD2D681F352C025, 0xBFE60381B09BAE12, 0x3FD5819DA4A1E5D8, 0xBFE4E816A52D1966,
+    0xBFB1F2EB1ACF9645, 0x3FA30DB08DD0FDB0), 0,
+  "R S R (the review's rsr1 kill fixture): compensated, each entry the exact cofactor's nearest");
+fn _mt_slot(s) {
+    var m = m3_new();
+    var bk: i64[4];
+    store64(&bk, 0x3FF1E3779B97F4A8);
+    store64(&bk + 8, 0x3FF6A09E667F3BCD);
+    store64(&bk + 16, 0x3FFBB67AE8584CAA);
+    store64(&bk + 24, 0x400186F174F895FA);
+    var i = s / 3;
+    var j = s % 3;
+    var x = 0;
+    for (var a = 0; a < 3; a = a + 1) {
+        if (a != i) {
+            var y = 0;
+            for (var b = 0; b < 3; b = b + 1) {
+                if (b != j) {
+                    store64(m + (a * 3 + b) * 8, load64(&bk + (x * 2 + y) * 8));
+                    y = y + 1;
+                }
+            }
+            x = x + 1;
+        }
+    }
+    store64(m + s * 8, 0x3B93C6EF372FE950);
+    return m;
+}
+var _mt_s0 = _mt_slot(0);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s0), 0x3D83998DCF7702F7, 0, 0,
+    0, 0x3BA5AA2AB319D396, 0xBBA120A13D232885, 0,
+    0xBB9BF8120F357ADA, 0x3B961C8864680B59), 0,
+  "large minor in slot 0: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s0), 1, "... certified by the compensated tier through slot 0's own maximum");
+var _mt_s1 = _mt_slot(1);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s1), 0x8000000000000000, 0x3D83998DCF7702F7, 0x8000000000000000,
+    0x3BA5AA2AB319D396, 0x8000000000000000, 0xBBA120A13D232885, 0xBB9BF8120F357ADA,
+    0x8000000000000000, 0x3B961C8864680B59), 0,
+  "large minor in slot 1: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s1), 1, "... certified by the compensated tier through slot 1's own maximum");
+var _mt_s2 = _mt_slot(2);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s2), 0, 0, 0x3D83998DCF7702F7,
+    0x3BA5AA2AB319D396, 0xBBA120A13D232885, 0, 0xBB9BF8120F357ADA,
+    0x3B961C8864680B59, 0), 0,
+  "large minor in slot 2: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s2), 1, "... certified by the compensated tier through slot 2's own maximum");
+var _mt_s3 = _mt_slot(3);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s3), 0x8000000000000000, 0x3BA5AA2AB319D396, 0xBBA120A13D232885,
+    0x3D83998DCF7702F7, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000,
+    0xBB9BF8120F357ADA, 0x3B961C8864680B59), 0,
+  "large minor in slot 3: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s3), 1, "... certified by the compensated tier through slot 3's own maximum");
+var _mt_s4 = _mt_slot(4);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s4), 0x3BA5AA2AB319D396, 0, 0xBBA120A13D232885,
+    0, 0x3D83998DCF7702F7, 0, 0xBB9BF8120F357ADA,
+    0, 0x3B961C8864680B59), 0,
+  "large minor in slot 4: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s4), 1, "... certified by the compensated tier through slot 4's own maximum");
+var _mt_s5 = _mt_slot(5);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s5), 0x3BA5AA2AB319D396, 0xBBA120A13D232885, 0x8000000000000000,
+    0x8000000000000000, 0x8000000000000000, 0x3D83998DCF7702F7, 0xBB9BF8120F357ADA,
+    0x3B961C8864680B59, 0x8000000000000000), 0,
+  "large minor in slot 5: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s5), 1, "... certified by the compensated tier through slot 5's own maximum");
+var _mt_s6 = _mt_slot(6);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s6), 0, 0x3BA5AA2AB319D396, 0xBBA120A13D232885,
+    0, 0xBB9BF8120F357ADA, 0x3B961C8864680B59, 0x3D83998DCF7702F7,
+    0, 0), 0,
+  "large minor in slot 6: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s6), 1, "... certified by the compensated tier through slot 6's own maximum");
+var _mt_s7 = _mt_slot(7);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s7), 0x3BA5AA2AB319D396, 0x8000000000000000, 0xBBA120A13D232885,
+    0xBB9BF8120F357ADA, 0x8000000000000000, 0x3B961C8864680B59, 0x8000000000000000,
+    0x3D83998DCF7702F7, 0x8000000000000000), 0,
+  "large minor in slot 7: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s7), 1, "... certified by the compensated tier through slot 7's own maximum");
+var _mt_s8 = _mt_slot(8);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mt_s8), 0x3BA5AA2AB319D396, 0xBBA120A13D232885, 0,
+    0xBB9BF8120F357ADA, 0x3B961C8864680B59, 0, 0,
+    0, 0x3D83998DCF7702F7), 0,
+  "large minor in slot 8: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mt_s8), 1, "... certified by the compensated tier through slot 8's own maximum");
+
+# === 3.4.1 MAT3: hquat_slerp on both sides of its d = 0.9995 switch ===
+# Round-2 review S4(b). Above the switch (theta = 0.00254, d = 0.9999968, t = 10) the atan2 form
+# is within 1.62 ulp of each component of a 60-digit slerp; acos(d) there (the switch moved to
+# 1 - 1e-8) reads theta about 2e-13 off and the answer comes back 160 to 272 ulp of each
+# component off, 2^-45 of the largest. Tolerance 2^-49 (16 ulp of the largest component).
+# Below it (theta = 0.0666, d = 0.99778, t = 0.366) the acos form is kept bit for bit as 3.4.0,
+# each component within 0.22 ulp of the oracle but the smallest (5.4 ulp of its own 0.0023);
+# the switch moved to 0.99 moves all four components.
+# [measured: scratch cA / cB candidates, mpmath 60 digits, the switch mutants built, 2026-10-31; cycc 6.7.18]
+test_group("3.4.1 MAT3: hquat_slerp on both sides of the d = 0.9995 switch");
+fn _mt_close(x, y) { return f64_le(f64_abs(f64_sub(x, y)), 0x3CE0000000000000); }   # 2^-49
+var _mt_qa = hquat_new(0x3FC2CFD699DDEB84, 0x3FB7C68EF6930425, 0x3FEF2090DC5270FB, 0xBFC3A7D451E487AC);
+var _mt_qb = hquat_new(0x3FC28C1881685D7B, 0x3FB7A3B9E3997E4D, 0x3FEF25212A385056, 0xBFC37EE056890178);
+var _mt_sa = hquat_slerp(_mt_qa, _mt_qb, 0x4024000000000000);
+assert_eq(_mt_close(HQuat_x(_mt_sa), 0x3FC02917671CB1C7) + _mt_close(HQuat_y(_mt_sa), 0x3FB66882F07865CE)
+  + _mt_close(HQuat_z(_mt_sa), 0x3FEF4BE48D0A6441) + _mt_close(HQuat_w(_mt_sa), 0xBFC20CE2FD1E2F70), 4,
+  "slerp above the switch (d = 0.9999968), t = 10: within 2^-49 of the oracle (acos(d): 2^-45)");
+var _mt_qc = hquat_new(0xBFC7729671C02F9E, 0x3FBCC5D8250FDB03, 0xBFEF3F56F91DE008, 0xBF91902E7EB1306A);
+var _mt_qd = hquat_new(0x3FC65AE9F8505ADE, 0xBFAF0BC6C9CE1685, 0x3FEF707DC378B61A, 0xBF9804CE2F5E4921);
+var _mt_sb = hquat_slerp(_mt_qc, _mt_qd, 0x3FD76C803CF9E53A);
+assert_eq(HQuat_x(_mt_sb) == 0xBFC70F412AAD89B6 && HQuat_y(_mt_sb) == 0x3FB7EF65724427A9
+  && HQuat_z(_mt_sb) == 0xBFEF55762B5FEBE8 && HQuat_w(_mt_sb) == 0xBF62BFB551DF1F14, 1,
+  "slerp below the switch (d = 0.99778, b antipodal): the acos form's bits, as 3.4.0");
+
+# === 3.4.1 MAT4: the wide tier's equilibrated pass ===
+# Round-3 review S1. A top-of-range m with a product of two entries below 2^-913, or an entry below
+# 2^-994, went past the wide tier's uniform 2^-28 to the exact path, 92 to 109 times 3.4.0's time
+# (3.4.0 was right on `lossy_baseok`, at 0.516u). Where the uniform pass declines for range,
+# `_m3_cof_wide` now tries row and column powers of two (`_m3_cof_wequil`). Every expected word
+# is the exact cofactors times sign(det), rounded
+# as the exact path rounds them (Fraction); `_mt_wu` is the uniform pass alone, 2 where the range
+# declines it: the fixtures it declines are the ones the exact path used to answer.
+# [measured: scratch MAT4-work rows.in, orc2.py and wemu4.py against the binary, 2026-11-01; cycc 6.7.18]
+test_group("3.4.1 MAT4: the wide tier's equilibrated pass");
+fn _mt_we(m) {
+    var kv: i64[10];
+    _m3_cof_wequil(m, &kv);
+    return _m3_cof_wpass(m, 1, m3_new(), &kv);
+}
+var _mf_lb = _n1_m(0x7F35A1435B4E56D8, 0x7F2075B5326F5F9C, 0xFEE787C4BB50630A, 0x24EFDD16955A47FE, 0x24D9A6E3445A50D0,
+  0xA4A76FD0BBF8B406, 0xA5FCFB2ED0C2BC3A, 0xA5E6296330263A05, 0x21E01187D58530F2);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_lb),
+    0x0AA03B2F69DD5054, 0x8AB539CDFB5D7F01, 0x8AA2A2BDA21BFD81, 0xE4E04BC62447A993, 0x64F54F7F7FB012B8,
+    0xE4B2A6128C2C5C82, 0x63B4FDCAC3808AC1, 0xE3D081C1DB8AAD85, 0xE3DE61571D231FBE), 0,
+  "a row near 2^1000 and rows near 2^-430 (3.4.0 right at 0.516u): the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_lb), 1, "... certified by the wide tier");
+assert_eq(_mt_wu(_mf_lb), 2, "... the uniform pass alone: 2");
+var _mf_hl = _n1_m(0x5FE81B003EF4E7D9, 0x5FE81B003AF88FBA, 0x491D7E823FA8BC9A, 0x5FF53D70016A7414, 0x5FF53D6FFF9E4EC6,
+  0x9D939875C886563C, 0x279CEDBBC42C5234, 0x37BE2C0CE8DF4E40, 0x06A899869D29B654);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_hl),
+    0x26B053FB18CB039F, 0xA6B053FB1A2CBF3B, 0x57C406D60CF163D9, 0x40EBCF33F4D992BC, 0xB0CAA9CFFC73FA3B,
+    0xD7B6BA7F14E83A9A, 0xE92393A5DC7DE967, 0x692393A5DE26065A, 0x7E34AA092318FB0B), 0,
+  "splits overflow by product, one product lossy: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_hl), 1, "... certified by the wide tier");
+assert_eq(_mt_wu(_mf_hl), 2, "... the uniform pass alone: 2");
+var _mf_tl = _n1_m(0xFE46FC4D308BEA69, 0x7E667D36C10CE63B, 0x7E69952CF07C5E2E, 0x2503A3DA0FE2CA90, 0xA52332FD551CB053,
+  0xA525DBE49DDCCCE5, 0xA1A76C42ABE7360A, 0x22E537003624EAB2, 0x22E819A646727EF8);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_tl),
+    0x87907D09FC369109, 0x07FD953B36FCCC57, 0x87FA0A8AAE197FF0, 0xE0C7B93EE52E477E, 0x61414FA1C1B02B6D,
+    0xE13E7A20ABCCAAAC, 0x62FAF9E0498F12C4, 0xE276A2FB6D1AC204, 0x62D88C6310DEAEE9), 0,
+  "a product of two entries of m 2^-28 lossy (3.4.0 375u off): the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_tl), 1, "... certified by the wide tier");
+assert_eq(_mt_wu(_mf_tl), 2, "... the uniform pass alone: 2");
+var _mf_dl = _n1_m(0x7FEFFFFFFFAF9313, 0x03D7CF190ADE1235, 0x03EE03E74CE34390, 0x7E379A96590DC43A, 0x02218FDE852A24A0,
+  0x023623CE0E009B2A, 0x7F8D3CDC1836E8D0, 0x0375C0F6C25F7A20, 0x038B6C9F60B6A4FE);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_dl),
+    0x8000000000000000, 0x3FCAD8D537CBDD6A, 0x3F7F15F10D85A66D, 0x0000000000000000, 0x41AE41934A4A1EA9,
+    0xC19D4ADA33412690, 0x8000000000000000, 0xC05C1955811B113D, 0x404761D6A82A04AF), 0,
+  "lossy near DBL_MAX: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_dl), 1, "... certified by the wide tier");
+assert_eq(_mt_wu(_mf_dl), 2, "... the uniform pass alone: 2");
+var _mf_ts = _n1_m(0xFE75687C52031CE0, 0x0000000000000000, 0xBFE4F0A5222E280F, 0xCAF078052C901570, 0x0000000000000000,
+  0x8C601BD454CFF2B1, 0x40699D7E2CD2C8F8, 0x0000000000000000, 0x01B000B14E73E8EA);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_ts),
+    0x0000000000000000, 0x8CD5ABDCF50B9098, 0x0000000000000000, 0x0000000000000000, 0x405C2BC617CEDD11,
+    0x0000000000000000, 0x0000000000000000, 0x490F3ABA98A8DD6D, 0x0000000000000000), 0,
+  "an entry m 2^-28 would round (3.4.0 4.2e8 u off): the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_ts), 1, "... certified by the wide tier");
+assert_eq(_mt_wu(_mf_ts), 2, "... the uniform pass alone: 2");
+var _mf_ws = _n1_m(0x7FEFFFFFFFFFFFFF, 0x832660D32B407868, 0x0290ACCFAA179227, 0x7CA551F92382B081, 0x8001E65AE589E777,
+  0x000000B52764D02E, 0x7F33A08C2956C20E, 0x826BFDAF69DBECFC, 0x01D4DF33EACAF21D);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_ws),
+    0x0000000000000000, 0x3DF1A510CDF7C99B, 0x3E64E1E105CD43AC, 0x8000000000000000, 0xC17AAAC83EEE5312,
+    0xC211450BB8B53C00, 0x8000000000000000, 0x3EEB2B6245EDDEAB, 0x3F827E51C9BF4D3A), 0,
+  "the same with 3.4.0 right: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_ws), 1, "... certified by the wide tier");
+assert_eq(_mt_wu(_mf_ws), 2, "... the uniform pass alone: 2");
+# Equilibration cannot hold every m: here the uniform pass, which runs first, is what certifies.
+var _mf_uo = _n1_m(0xBCAB972954C6ED82, 0xFDF5A9F18CACC5AC, 0xBB22F4B3E3B0E5FC, 0xBEA4B1E14608E659, 0xFFEFFFFFFFFFFFFF,
+  0xBD1C000108C6DC2E, 0x38EE28247271AD5E, 0x8000000000000000, 0x3763A2E5FFF8653F);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_uo),
+    0x7763A2E5FFF8653E, 0x35CFA65A93BCFB35, 0xF8EE28247271AD5D, 0xF56A965EEFA37A5F, 0xB3DDDF806C43B3A9,
+    0x76F46A7F8E7BF18B, 0xF9B553782CE031E8, 0xB978166E118AA90B, 0x7C4B8767F7663079), 0,
+  "an entry equilibration cannot hold exactly: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_uo), 1, "... certified by the wide tier");
+assert_eq(_mt_wu(_mf_uo), 1, "... the uniform pass alone: 1");
+assert_eq(_mt_we(_mf_uo), 2, "... the equilibrated pass: 2");
+# Both passes decline for range: the exact path.
+var _mf_ul = _n1_m(0x5FE9D97D32B2295D, 0x5FE9D97D33B2CE90, 0xCCBEB89CDF50DCF4, 0x5FF3CE9188E2B34E, 0x5FF3CE918DAB23D5,
+  0x227F4BA25F140298, 0x1F49A15711E53618, 0x9A77CF2B36699B80, 0x5B63223D989B0A5D);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_ul),
+    0x7B67AFB00DFD870E, 0xFB67AFB008454514, 0xBF4FBA7DCF5B9E89, 0xFB5EE9965B2C2772, 0x7B5EE99659F93E0A,
+    0x3F44B43E6410E42C, 0x6CC303ED52FE2FCA, 0xECC303ED4E66AE52, 0x7E49F1F871010770), 0,
+  "a lossy product under both scalings: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_ul), 0, "... the wide tier declines");
+assert_eq(_mt_wu(_mf_ul), 2, "... the uniform pass alone: 2");
+assert_eq(_mt_we(_mf_ul), 2, "... the equilibrated pass: 2");
+# The bracket declines: the second pass cannot help, the same arithmetic on the same numbers.
+var _mf_bk = _n1_m(0xFE3FFFFFFC000000, 0x40028744A4BAC5C0, 0x3FFBBF4471B38707, 0x7E37F796314CBF00, 0xBFFD13E26F2EB52A,
+  0xBFF5C5C8A4A8F120, 0x7E09977BE8D56098, 0xBFCF0C76CE016154, 0xBFC73F997F13304A);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_bk),
+    0xBCD067576472B003, 0xFAFE9CA75DAB7EA0, 0xFAFF5873159E0B62, 0xBCD0ECB1E2EBB512, 0x7DD0ED2074BAA53F,
+    0xFDD69AF73692C862, 0xBCDDD24DE035B576, 0xFDFFB41B9329738A, 0x7E052B99DD60F071), 0,
+  "the bracket cannot pin an entry: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_bk), 0, "... the wide tier declines");
+assert_eq(_mt_wu(_mf_bk), 0, "... the uniform pass alone: 0");
+assert_eq(_mt_we(_mf_bk), 0, "... the equilibrated pass: 0");
+# Each of the nine entries' own test: `_mt_sx`'s entry m 2^-28 would round, moved to (r, c).
+fn _mf_sub(r, c) {
+    var m = m3_new();
+    for (var i = 0; i < 3; i = i + 1) {
+        for (var j = 0; j < 3; j = j + 1) {
+            var x = F64_ONE;
+            if (i != 2) {
+                x = 0;
+                if (j == 1) { if (i == 0) { x = 0x5FEFFFFFFFFFFFFF; } else { x = 0x5FEFFFFE00000000; } }
+                if (j == 2) { if (i == 0) { x = 0x5FEFFFFE00000000; } else { x = 0x5FEFFFFFFFFFFFFF; } }
+            }
+            if (i == 2 && j == 0) { x = 0x0171234567890ABC; }
+            store64(m + (((i + r + 1) % 3) * 3 + ((j + c) % 3)) * 8, x);
+        }
+    }
+    return m;
+}
+for (var _mf_i = 0; _mf_i < 9; _mf_i = _mf_i + 1) {
+    assert_eq(_mt_wu(_mf_sub(_mf_i / 3, _mf_i % 3)), 2, "wpass: this entry is not m 2^-28 exactly");
+}
+# `_m3_cof_wequil`: each group's then each position's largest entry at exponent 508, and their sum.
+fn _mf_kv(m, a, b, c, d, e, f, g, h, i, k) {
+    var kv: i64[10];
+    _m3_cof_wequil(m, &kv);
+    var x: i64[10];
+    store64(&x, a); store64(&x + 8, b); store64(&x + 16, c); store64(&x + 24, d); store64(&x + 32, e);
+    store64(&x + 40, f); store64(&x + 48, g); store64(&x + 56, h); store64(&x + 64, i); store64(&x + 72, k);
+    var bad = 0;
+    for (var t = 0; t < 10; t = t + 1) { if (load64(&kv + t * 8) != load64(&x + t * 8)) { bad = bad + 1; } }
+    return bad;
+}
+var _mf_q0 = _n1_m(0x7F35A1435B4E56D8, 0x7F2075B5326F5F9C, 0xFEE787C4BB50630A, 0x24EFDD16955A47FE,
+  0x24D9A6E3445A50D0, 0xA4A76FD0BBF8B406, 0xA5FCFB2ED0C2BC3A, 0xA5E6296330263A05,
+  0x21E01187D58530F2);
+assert_eq(_mf_kv(_mf_q0, 0 - 504, 0 - 503, 0 - 500, 941, 942, 945, 924, 925, 928, 1366), 0,
+  "wequil: lossy_baseok");
+var _mf_q1 = _n1_m(0x7FE0000000000000, 0x0000000000000000, 0x3FF8000000000000, 0x0000000000000000,
+  0x0000000000000000, 0x0000000000000000, 0x0000000000000001, 0x0000000000000000,
+  0x8000000000000000);
+assert_eq(_mf_kv(_mf_q1, 0 - 515, 0 - 515, 508, 0, 0, 1023, 1582, 1582, 2605, 2090), 0,
+  "wequil: DBL range, a subnormal, a zero group and a zero position");
+var _mf_kv0: i64[10];
+_m3_cof_wequil(_n1_m(0, 0, 0, 0, 0, 0, 0, 0, 0), &_mf_kv0);
+assert_eq(load64(&_mf_kv0 + 72), 0, "wequil: all zero, nothing scales");
+# `_m3_wscale`: exact or `_M3_WBAD`, never rounded. `_m3_wout`: one rounding, a zero's sign kept.
+assert_eq(_m3_wscale(0, 1000), 0, "wscale +0");
+assert_eq(_m3_wscale(0x8000000000000000, 1000), 0x8000000000000000, "wscale -0");
+assert_eq(_m3_wscale(0xBFF8000000000000, 508), 0xDFB8000000000000, "wscale up");
+assert_eq(_m3_wscale(0x0000000000000003, 1074), 0x4008000000000000, "wscale a subnormal up");
+assert_eq(_m3_wscale(0x3FF8000000000000, 0 - 515), 0x1FC8000000000000, "wscale down, normal");
+assert_eq(_m3_wscale(0x0010000000000000, 0 - 1), 0x0008000000000000, "wscale to a subnormal, exact");
+assert_eq(_m3_wscale(0x8018000000000000, 0 - 2), 0x8006000000000000, "wscale to a subnormal, exact, negative");
+assert_eq(_m3_wscale(0x0010000000000001, 0 - 1), _M3_WBAD, "wscale: the last bit would go");
+assert_eq(_m3_wscale(0x0000000000000003, 0 - 1), _M3_WBAD, "wscale: a subnormal's last bit would go");
+assert_eq(_m3_wscale(0x0010000000000000, 0 - 52), 0x0000000000000001, "wscale to the last subnormal");
+assert_eq(_m3_wscale(0x0010000000000000, 0 - 53), _M3_WBAD, "wscale: 2^-1075 is no double");
+assert_eq(_m3_wout(0, 0 - 2000), 0, "wout +0");
+assert_eq(_m3_wout(0x8000000000000000, 2000), 0x8000000000000000, "wout -0");
+assert_eq(_m3_wout(0xBFF8000000000000, 1000), 0xFE78000000000000, "wout up");
+assert_eq(_m3_wout(0x0000000000000003, 1074), 0x4008000000000000, "wout a subnormal up");
+assert_eq(_m3_wout(0x3FF0000000000000, 0 - 1022), 0x0010000000000000, "wout to DBL_MIN");
+assert_eq(_m3_wout(0x3FF4000000000001, 0 - 1073), 0x0000000000000003, "wout rounds once, past the tie");
+assert_eq(_m3_wout(0x3FF4000000000000, 0 - 1073), 0x0000000000000002, "wout on the tie, to even");
+assert_eq(_m3_wout(0xBFF8000000000000, 0 - 1074), 0x8000000000000002, "wout a tie, to even");
+assert_eq(_m3_wout(0x3FF0000000000000, 0 - 1075), 0, "wout half the last subnormal, to even");
+assert_eq(_m3_wout(0x3FF0000000000001, 0 - 1075), 1, "wout just past it");
+assert_eq(_m3_wout(0x3FFFFFFFFFFFFFFF, 0 - 1076), 0, "wout just under half the last subnormal: 0");
+assert_eq(_m3_wout(0xBFF8000000000000, 0 - 1100), 0x8000000000000000, "wout far below: a zero of c's sign");
+assert_eq(_m3_wout(0x3FF8000000000000, 0 - 3000), 0, "wout the factor stays 2^-64 (2^(ne - 1) is no double here)");
+# Rank 1 with an entry past 2^997: every cofactor exact 0, so the largest is no floor case.
+var _mf_r1 = _n1_m(0x7E70000000000000, 0x7E68000000000000, 0x7E60000000000000, 0x4010000000000000,
+  0x4008000000000000, 0x4000000000000000, 0x3FF0000000000000, 0x3FE8000000000000, 0x3FE0000000000000);
+var _mf_r1r = m3_new();
+assert_eq(_m3_cof_wide(_mf_r1, 1, _mf_r1r), 1, "wide: rank 1 certified");
+assert_eq(_n1_eq(_mf_r1r, 0, 0, 0, 0, 0, 0, 0, 0, 0), 0, "... every cofactor +0");
+
+# === 3.4.1 MAT4: the wide tier's product test on its 2^-969 boundary ===
+# Round-3 review S2. The product test's floor is the point where Dekker's error term stops being
+# exact. Its repro: the pass loosened to 2^-970 certifies this matrix with slot 7 16 ulp off
+# (0x834342CEC1832E80 for 0x834342CEC1832E90): a cofactor subnormal in m 2^-28, rounded on 2^-1074
+# there and scaled back by 2^56. The bracket then declines it in the equilibrated pass, so the
+# uniform pass is what the fixture reaches: the answer's bits are the exact path's, the pass is
+# refused for range. On the boundary itself, a product exactly 2^-969 passes and one ulp below it
+# does not.
+# [measured: scratch MAT4-work py/s2.py, Fraction oracle and wemu4.py, 2026-11-01; cycc 6.7.18]
+test_group("3.4.1 MAT4: the wide tier's product test on its 2^-969 boundary");
+fn _mf_fb(s, y) {
+    return _n1_m(s, 0x5FEFFFFFFFFFFFFF, 0x5FEFFFFE00000000, 0, 0x5FEFFFFE00000000, 0x5FEFFFFFFFFFFFFF,
+      F64_ONE, y, F64_ONE);
+}
+var _mf_s2 = _n1_m(0xA44FFFFFFFF472F3, 0x8000000000000000, 0x8656A1A2057DB117, 0x40729A2D4F330E02, 0xC0AA2E3EC5BA0BC7,
+  0x227A4FEA1449B6E7, 0x7E164069D8AD5597, 0xFE4F51147BB27EA0, 0xC971E4406A71BDE2);
+assert_eq(_n1_eq(m3_normal_matrix_cof(_mf_s2),
+    0xE0D9C015E3D300D7, 0xE0A24BE7CA7D4631, 0xFD67685586B13D1C, 0xC4B625EC93F0708D, 0xC47F795B06D5464F,
+    0x62AF51147BA730B7, 0x07128408625E9079, 0x834342CEC1832E90, 0xA50A2E3EC5B0987B), 0,
+  "round-3 S2's repro: the exact cofactors' nearest");
+assert_eq(_mt_wb(_mf_s2), 0, "... the wide tier declines");
+assert_eq(_mt_wu(_mf_s2), 2, "... the uniform pass alone: 2");
+assert_eq(_mt_we(_mf_s2), 0, "... the equilibrated pass: 0");
+assert_eq(_mt_wu(_mf_fb(0x2370000000000000, 0x2360000000000000)) != 2, 1,
+  "a product of m 2^-28 exactly 2^-969 is past the test");
+assert_eq(_mt_wu(_mf_fb(0x236FFFFFFFFFFFFF, 0x2360000000000000)), 2,
+  "one ulp below 2^-969 is refused for range");
+
+# === 3.4.1 MAT4: the routing input me, every row position ===
+# Round-3 review S3. `_m3_cof_certified` builds me from its three position maxima; the bit
+# assertions cannot see which tier answered and `_mt_wb` passes its own me. Dropping the r1 or r2
+# line sends an entry there to `_m3_cof_comp`, whose split is Inf - Inf, and it declines.
+test_group("3.4.1 MAT4: the routing input me, every row position");
+fn _mf_cc(a, b, c, d, e, f, g, h, i) {
+    var m = _n1_m(a, b, c, d, e, f, g, h, i);
+    var r = _m3_cof_signed(m, 1);
+    return _m3_cof_certified(m, _n1_pmx(r), 1, r);
+}
+assert_eq(_mf_cc(0x7E4F90B49758188B, 0xBFDE43EB7B5BF4CB, 0xBFDDE6556B99C69A, 0x7E50000000000000,
+    0xBFDD52E9B891E6DA, 0xBFDCBBC05AAAEA90, 0x7E15B3C04ABD24C8, 0xBFB056E0640466FF, 0xBFAAD8BABAAB2DDD), 1,
+  "me: the large entries in position 0");
+assert_eq(_mf_cc(0xBFDE43EB7B5BF4CB, 0x7E4F90B49758188B, 0xBFDDE6556B99C69A, 0xBFDD52E9B891E6DA,
+    0x7E50000000000000, 0xBFDCBBC05AAAEA90, 0xBFB056E0640466FF, 0x7E15B3C04ABD24C8, 0xBFAAD8BABAAB2DDD), 1,
+  "me: the large entries in position 1");
+assert_eq(_mf_cc(0xBFDE43EB7B5BF4CB, 0xBFDDE6556B99C69A, 0x7E4F90B49758188B, 0xBFDD52E9B891E6DA,
+    0xBFDCBBC05AAAEA90, 0x7E50000000000000, 0xBFB056E0640466FF, 0xBFAAD8BABAAB2DDD, 0x7E15B3C04ABD24C8), 1,
+  "me: the large entries in position 2");
+
+# === 3.4.1 MAT4: hquat_slerp just either side of the d = 0.9995 switch ===
+# Round-3 review S4. d = 0.99949990 keeps the acos form's bits, 3.4.0's (0.56 ulp of the largest
+# component's unit from a 70-digit slerp); with the switch at 0.999 its z moves one ulp.
+# d = 0.99950010 takes the atan2 form (0.67); with the switch at 0.9999 its x moves one ulp.
+# [measured: scratch MAT4-work py/sl1.py, decimal oracle, the switch mutants built, 2026-11-01; cycc 6.7.18]
+test_group("3.4.1 MAT4: hquat_slerp just either side of the d = 0.9995 switch");
+var _mf_sb = hquat_slerp(hquat_new(0x3FEB2C4050176D12, 0x3FD46F40C6A0E6F9, 0x3FD93A5F2BBA4AF7, 0xBFC2D11E561E672F),
+  hquat_new(0x3FEADDA335A5210F, 0x3FD45098C04756B5, 0x3FD9E4A9399602EA, 0xBFC66DF46031B8C5), 0x3FE6666666666666);
+assert_eq(HQuat_x(_mf_sb) == 0x3FEAF5F29939AC1C && HQuat_y(_mf_sb) == 0x3FD45A575C8C3074
+  && HQuat_z(_mf_sb) == 0x3FD9B2434571ED52 && HQuat_w(_mf_sb) == 0xBFC55910971A94BC, 1,
+  "slerp just below the switch: the acos form's bits, as 3.4.0");
+var _mf_sa = hquat_slerp(hquat_new(0x3FED1A0B5885AE35, 0xBFD17A7D46C01074, 0xBFCDE9C47F4E0537, 0x3FCAC525D22E2216),
+  hquat_new(0x3FECFE09922B1B6A, 0xBFD33359BB7FCAE0, 0xBFCCFB53BFE893A4, 0x3FC8E9077E84E827), 0x3FD0000000000000);
+assert_eq(HQuat_x(_mf_sa) == 0x3FED13BD6B7F0FC8 && HQuat_y(_mf_sa) == 0xBFD1E9242F503568
+  && HQuat_z(_mf_sa) == 0xBFCDAEDDB58A0D18 && HQuat_w(_mf_sa) == 0x3FCA4EBDF365EBB6, 1,
+  "slerp just above the switch: the atan2 form's bits");
 
 var r = assert_summary();
 # Clamp before exiting: assert_summary() returns the raw failure COUNT, and a wait

@@ -51,6 +51,11 @@ enum _RenderLayout { _FLOAT_RENDER_BUF = 64; _INT_EXACT_BUF = 352 }
 # two significant digits now has to match to 4 ulp. Values in [8.88e-16, 1e-15) now
 # fold as the documentation always said they did.
 # [measured: tests/modules.tcyr, group "3.3.0 the promoted helpers, called as API"]
+# The sign bit (3.4.1 SYM2): a negation here flips it with an XOR, IEEE 754's negate on every
+# pin (f64_neg(+-0) returned +0 below cyrius 6.6.8), so -(x) at x = 0 evaluates to -0 there too.
+enum _SymBits {
+    _SYM_SIGN = 0x8000_0000_0000_0000;   # the sign-bit mask
+}
 var _SYM_EPS = 0x3CD2_03AF_9EE7_5616;   # 1e-15
 
 # 2^63 = 9223372036854775808 -- the first magnitude `f64_to` cannot represent.
@@ -313,6 +318,94 @@ public fn expr_child(e) {
 }
 
 # ================================================================
+# Walk stacks (3.4.1)
+# ================================================================
+# ⛔ 3.4.1 — EVERY WALKER RECURSED ONCE PER LEVEL OF THE TREE, so a deep tree overflowed
+# the native stack and killed the process, SIGSEGV, exit 139: a left-folded sum of
+# 100,000 terms through expr_eval under `ulimit -s 8192` (AU1 SYM-F3; the sub-auditor's
+# depths: eval about 65,500 levels, simplify 40,000, diff, LaTeX and integrate 47,500,
+# rewrite 87,000). The constructors build such a tree bottom-up without recursing, so it
+# is an ordinary input, and it has an answer. Every walk here and in symbolic_ext.cyr now
+# recurses at most _SYM_REC_DEPTH (256) levels, as through 3.4.0 for an ordinary tree,
+# and hands a deeper subtree to an iterative form that keeps its own stack of pending
+# work: 64 words of the native stack, then a heap block that doubles (expr_to_str is
+# iterative throughout). A deep tree costs heap, not native stack, and a block that cannot
+# grow is a refused allocation, answered through the walk's own failure channel
+# (expr_eval_checked's Err, the 0 node, the 0 Str). A pending node is one word, the node's
+# address with the walk's state for it in the low three bits: every node is a pointer
+# from alloc, which is 8-byte aligned. symbolic_ext.cyr carries the same helpers under its
+# own names (a module does not reach another's private names). The recursive forms read a
+# node's fields directly (load64 at the offsets of "Expression node layout"): the
+# accessors are calls, and they made the walks slower than 3.4.0's.
+# The two forms of each walk give the same answer: with both depths set to 0, every walk
+# iterative, 24,000 random trees render, evaluate, differentiate, simplify, integrate,
+# match and rewrite byte for byte as with 256, and the suites pass.
+# [measured: scratch differential harness (diffh, diffhf), lane SYM tree at depth 256 and at 0, 2026-10-31]
+# ⚠ A DEEP TREE GETS ITS ANSWER, BUT A WALK'S TIME AND MEMORY SCALE WITH THE TREE IT WALKS
+# COUNTED AS A TREE -- a shared subtree once per use -- not with the nodes allocated
+# (RV-SYM N6). expr_diff shares subtrees (it builds a DAG), so the derivative of a deep chain
+# is quadratic as a tree: expr_simplify(expr_diff(e)) on a 100,000-deep (x^1)^1... chain took
+# 519 s and 536 MB, and on a 100,000-deep sin chain more than 11.7 GB (3.4.0 exited 139 on
+# both). Expression sharing (hash-consing the walkers) is a [3.5.0] row.
+# [measured: review RV-SYM N6 on the lane SYM tree, 2026-10-31; SYM2 tree at 2,000 to 16,000 levels the same day]
+# [measured: tests/hisab.tcyr, group "3.4.1: the symbolic walkers on a 200,000-deep tree"]
+enum _SymWalk { _SYM_STK = 64; _SYM_ST_MASK = 7; _SYM_REC_DEPTH = 256 }
+
+# Start a walk stack: st is a 3-word block { buf, len, cap } the caller owns, buf its
+# local i64[64].
+fn _sym_stk_init(st, buf) {
+    store64(st, buf);
+    store64(st + 8, 0);
+    store64(st + 16, _SYM_STK);
+    return 0;
+}
+
+# A walk stack's block doubled: a new heap block of 2 * cap words holding buf's cap words,
+# or 0 when it cannot be allocated (cap past ALLOC_MAX / 16, or alloc refuses). buf is the
+# caller's local or a heap block nothing else holds; the bump heap does not reuse it.
+fn _sym_stk_grow(buf, cap) {
+    if (cap > ALLOC_MAX / 16) { return 0; }
+    var nb = alloc(cap * 16);
+    if (nb == 0) { return 0; }
+    for (var i = 0; i < cap; i = i + 1) { store64(nb + i * 8, load64(buf + i * 8)); }
+    return nb;
+}
+
+# Push v: 0, or -1 when the stack is full and cannot double (cap past ALLOC_MAX / 16, or
+# alloc refuses). The doubling copies the words into the new block; the old block is the
+# caller's local or a heap block nothing else holds.
+fn _sym_stk_push(st, v) {
+    var n = load64(st + 8);
+    var cap = load64(st + 16);
+    if (n == cap) {
+        if (cap > ALLOC_MAX / 16) { return 0 - 1; }
+        var nb = alloc(cap * 16);
+        if (nb == 0) { return 0 - 1; }
+        var ob = load64(st);
+        for (var i = 0; i < cap; i = i + 1) { store64(nb + i * 8, load64(ob + i * 8)); }
+        store64(st, nb);
+        store64(st + 16, cap * 2);
+    }
+    store64(load64(st) + n * 8, v);
+    store64(st + 8, n + 1);
+    return 0;
+}
+
+# Pop the top word (a walk pops only what it pushed).
+fn _sym_stk_pop(st) {
+    var n = load64(st + 8) - 1;
+    store64(st + 8, n);
+    return load64(load64(st) + n * 8);
+}
+
+# The top word, and the top word replaced (the walk moving a pending node to its next state).
+fn _sym_stk_top(st) { return load64(load64(st) + (load64(st + 8) - 1) * 8); }
+fn _sym_stk_retop(st, v) {
+    store64(load64(st) + (load64(st + 8) - 1) * 8, v);
+    return 0;
+}
+
+# ================================================================
 # Evaluate
 # ================================================================
 
@@ -335,89 +428,183 @@ public fn expr_child(e) {
 public fn expr_eval_checked(e, vars) {
     var bad: i64[1];
     store64(&bad, 0);
-    var v = _sym_eval(e, vars, &bad);
+    var v = _sym_eval(e, vars, &bad, 0);
     if (load64(&bad) != 0) { return Err(HSB_ERR_INVALID_INPUT); }
     return Ok(v);
 }
 
-# Internal: the evaluation itself. It returns the value and sets *bad to 1 at a node with
-# no value, and then goes on: what it returns past that point is never read. A flag
-# rather than a Result per node: the pair and its test at every node cost 40 to 56 ns
-# over 3.3.7's expr_eval on tests/hisab.bcyr's expr_eval row (about 550 ns), the flag 10
-# to 25 ns.
-# [measured: tests/hisab.bcyr expr_eval, both forms against the base tree, interleaved runs, 2026-10-31]
-fn _sym_eval(e, vars, bad) {
+# Internal: the evaluation itself, recursive to _SYM_REC_DEPTH levels and iterative below
+# them (3.4.1). It returns the value and sets *bad to 1 at a node with no value -- a 0
+# node, a variable with no binding, a tag no constructor writes -- and then goes on: what
+# it returns past that point is never read. The recursion is the 3.4.0 evaluator with a
+# depth count; an operand at depth _SYM_REC_DEPTH is handed to _sym_eval_deep, which
+# needs no native stack, so a deep tree never overflows it. Both evaluate the same
+# operations in the same order, so a tree's value does not depend on which one ran.
+# ⚠ COST. The iterative walk alone made tests/hisab.bcyr's expr_eval row +103% and,
+# with its stack written out in place, still +17 to +20%; the depth count costs the
+# recursion one compare per node.
+# [measured: tests/hisab.bcyr expr_eval rows, lane SYM vs the 3.4.1 baseline, 2026-10-31]
+fn _sym_eval(e, vars, bad, depth) {
+    if (depth >= _SYM_REC_DEPTH) { return _sym_eval_deep(e, vars, bad); }
     if (e == 0) {
         store64(bad, 1);
         return 0;
     }
-    var t = expr_tag(e);
-
-    if (t == EXPR_CONST) {
-        return expr_const_val(e);
-    }
-
+    var t = load64(e);
+    var d = depth + 1;
+    if (t == EXPR_CONST) { return load64(e + 8); }
     if (t == EXPR_VAR) {
-        if (vars == 0) {
+        var pair = _sym_lookup(load64(e + 8), vars);
+        if (pair == 0) {
             store64(bad, 1);
             return 0;
         }
-        var name = expr_var_name(e);
-        var vi = 0;
-        var vlen = vec_len(vars);
-        while (vi < vlen) {
-            var pair = vec_get(vars, vi);
-            if (pair != 0) {
-                if (str_eq(name, load64(pair)) == 1) {
-                    return load64(pair + 8);
-                }
-            }
-            vi = vi + 1;
-        }
-        store64(bad, 1);
-        return 0;
+        return load64(pair + 8);
     }
-
     if (t == EXPR_ADD) {
-        return f64_add(_sym_eval(expr_left(e), vars, bad), _sym_eval(expr_right(e), vars, bad));
+        return f64_add(_sym_eval(load64(e + 8), vars, bad, d), _sym_eval(load64(e + 16), vars, bad, d));
     }
-
     if (t == EXPR_MUL) {
-        return f64_mul(_sym_eval(expr_left(e), vars, bad), _sym_eval(expr_right(e), vars, bad));
+        return f64_mul(_sym_eval(load64(e + 8), vars, bad, d), _sym_eval(load64(e + 16), vars, bad, d));
     }
-
     if (t == EXPR_POW) {
-        return ganita_f64_pow(_sym_eval(expr_left(e), vars, bad), _sym_eval(expr_right(e), vars, bad));
+        return ganita_f64_pow(_sym_eval(load64(e + 8), vars, bad, d), _sym_eval(load64(e + 16), vars, bad, d));
     }
-
-    if (t == EXPR_NEG) {
-        return f64_neg(_sym_eval(expr_child(e), vars, bad));
-    }
-
-    if (t == EXPR_SIN) {
-        return f64_sin(_sym_eval(expr_child(e), vars, bad));
-    }
-
-    if (t == EXPR_COS) {
-        return f64_cos(_sym_eval(expr_child(e), vars, bad));
-    }
-
-    if (t == EXPR_EXP) {
-        return f64_exp(_sym_eval(expr_child(e), vars, bad));
-    }
-
-    if (t == EXPR_LN) {
-        return f64_ln(_sym_eval(expr_child(e), vars, bad));
-    }
-
+    if (t == EXPR_NEG) { return _sym_eval(load64(e + 8), vars, bad, d) ^ _SYM_SIGN; }
+    if (t == EXPR_SIN) { return f64_sin(_sym_eval(load64(e + 8), vars, bad, d)); }
+    if (t == EXPR_COS) { return f64_cos(_sym_eval(load64(e + 8), vars, bad, d)); }
+    if (t == EXPR_EXP) { return f64_exp(_sym_eval(load64(e + 8), vars, bad, d)); }
+    if (t == EXPR_LN) { return f64_ln(_sym_eval(load64(e + 8), vars, bad, d)); }
     # A tag no constructor writes.
     store64(bad, 1);
     return 0;
 }
 
+# Internal: _sym_eval's walk below _SYM_REC_DEPTH. It returns the value, or sets *bad to 1
+# and returns 0 at the first node with no value or when its walk stack cannot grow.
+# Iterative (see "Walk stacks"): a sum,
+# product or power pushes itself to be combined, then its right operand, then its left, so
+# the left is evaluated first, as the recursion did, and a bound tree's value is the same
+# operations in the same order, bit for bit. The stack operations are written out in place
+# (a call per push costs this walk most of its time).
+# A flag rather than a Result per node: the pair and its test at every node cost 40 to 56
+# ns over 3.3.7's expr_eval on tests/hisab.bcyr's expr_eval row (about 550 ns), the flag
+# 10 to 25 ns.
+# [measured: tests/hisab.bcyr expr_eval, both forms against the base tree, interleaved runs, 2026-10-31]
+fn _sym_eval_deep(e, vars, bad) {
+    var fl: i64[64];
+    var vl: i64[64];
+    var fb = &fl;
+    var fc = 64;
+    var fp = 1;
+    var vb = &vl;
+    var vc = 64;
+    var vp = 0;
+    var w = 0;
+    var n = 0;
+    var t = 0;
+    var r = 0;
+    var x = 0;
+    store64(fb, e);
+    while (fp > 0) {
+        fp = fp - 1;
+        w = load64(fb + fp * 8);
+        n = w & (0 - 8);
+        if (n == 0) {
+            store64(bad, 1);
+            return 0;
+        }
+        t = load64(n);
+        if ((w & _SYM_ST_MASK) == 0 && t >= EXPR_ADD && t <= EXPR_LN) {
+            # First visit of an operator: itself (to combine), then its operands, the
+            # left one on top.
+            if (fp + 3 > fc) {
+                fb = _sym_stk_grow(fb, fc);
+                if (fb == 0) {
+                    store64(bad, 1);
+                    return 0;
+                }
+                fc = fc * 2;
+            }
+            store64(fb + fp * 8, n | 1);
+            fp = fp + 1;
+            if (t <= EXPR_POW) {
+                store64(fb + fp * 8, load64(n + 16));
+                fp = fp + 1;
+            }
+            store64(fb + fp * 8, load64(n + 8));
+            fp = fp + 1;
+        } else {
+            if (t == EXPR_CONST) {
+                r = load64(n + 8);
+            } elif (t == EXPR_VAR) {
+                x = _sym_lookup(load64(n + 8), vars);
+                if (x == 0) {
+                    store64(bad, 1);
+                    return 0;
+                }
+                r = load64(x + 8);
+            } elif (t <= EXPR_POW && t >= EXPR_ADD) {
+                vp = vp - 1;
+                x = load64(vb + vp * 8);
+                r = load64(vb + (vp - 1) * 8);
+                vp = vp - 1;
+                if (t == EXPR_ADD) { r = f64_add(r, x); }
+                elif (t == EXPR_MUL) { r = f64_mul(r, x); }
+                else { r = ganita_f64_pow(r, x); }
+            } elif (t >= EXPR_NEG && t <= EXPR_LN) {
+                vp = vp - 1;
+                x = load64(vb + vp * 8);
+                if (t == EXPR_NEG) { r = x ^ _SYM_SIGN; }
+                elif (t == EXPR_SIN) { r = f64_sin(x); }
+                elif (t == EXPR_COS) { r = f64_cos(x); }
+                elif (t == EXPR_EXP) { r = f64_exp(x); }
+                else { r = f64_ln(x); }
+            } else {
+                # A tag no constructor writes.
+                store64(bad, 1);
+                return 0;
+            }
+            if (vp == vc) {
+                vb = _sym_stk_grow(vb, vc);
+                if (vb == 0) {
+                    store64(bad, 1);
+                    return 0;
+                }
+                vc = vc * 2;
+            }
+            store64(vb + vp * 8, r);
+            vp = vp + 1;
+        }
+    }
+    return load64(vb);
+}
+
+# Internal: the pair in vars that binds `name`, or 0 when there is none (vars is 0, name is
+# 0, or no pair names it). A 0 pair, or a pair whose name is 0 (expr_bind refuses one since
+# 3.4.1, but vars is the caller's vec), binds nothing and is skipped.
+fn _sym_lookup(name, vars) {
+    if (vars == 0 || name == 0) { return 0; }
+    var vi = 0;
+    var vlen = vec_len(vars);
+    var pair = 0;
+    while (vi < vlen) {
+        pair = vec_get(vars, vi);
+        if (pair != 0) {
+            if (load64(pair) != 0) {
+                if (str_eq(name, load64(pair)) == 1) { return pair; }
+            }
+        }
+        vi = vi + 1;
+    }
+    return 0;
+}
+
 # Helper: create a variable binding pair (for use with expr_eval_checked), or 0 when the
-# pair cannot be allocated (expr_eval_checked skips a 0 pair).
+# pair cannot be allocated or name is 0 (expr_eval_checked skips a 0 pair). (3.4.1: a 0
+# name made a pair that expr_eval_checked read through, in str_eq.)
 public fn expr_bind(name, value) {
+    if (name == 0) { return 0; }
     var pair = alloc(16);
     if (pair == 0) { return 0; }
     store64(pair, name);
@@ -431,8 +618,19 @@ public fn expr_bind(name, value) {
 
 # Symbolic differentiation of expr with respect to var_name (a Str).
 # Returns a new expression tree representing the derivative, or 0 when there is none to
-# build: e is 0, a node in it carries a tag no constructor writes, or a node of the
-# derivative cannot be allocated.
+# build: e or var_name is 0, a node in e is 0 or carries a tag no constructor writes (or
+# a variable's name is 0), or a node of the derivative or of the walk's stack cannot be
+# allocated. Any depth since 3.4.1 (see "Walk stacks").
+# A factor that does not depend on var_name differentiates to the constant 0, and a
+# product or chain-rule term carrying that 0 is left out (3.4.1, below): d/dx(2 exp x) is
+# 2 * (exp(x) * 1), not (0 * exp(x)) + (2 * (exp(x) * 1)). A power whose exponent does not
+# depend on var_name takes the power rule, n * f^(n - 1) * f', the exponent as a
+# constant node or as the expression; the exponent 0 differentiates to 0 (f^0 is 1). Only
+# an exponent that depends on var_name takes the general rule, f^g (g' ln f + g f' / f),
+# without its f' term when f does not depend on var_name.
+# ⚠ AT A POINT WHERE A NON-CONSTANT EXPONENT EVALUATES TO 0 AND ITS BASE TO 0, n f^(n - 1)
+# is 0 * Inf = NaN, where the derivative of f^0 is 0: the node set has no conditional
+# that could say "0 when n is 0". A constant exponent 0 is exact.
 # ⛔ 3.4.0 — A TAG IT COULD NOT READ DIFFERENTIATED TO THE CONSTANT 0 (roadmap [3.4.0]
 # D074, the same fabricated answer as expr_eval's): d/dx of a node with tag 77 came back
 # as expr_const(0), a legal derivative, and inside a sum it vanished into one, so
@@ -440,104 +638,188 @@ public fn expr_bind(name, value) {
 # "unsupported", and the constructors carry that 0 to the root. Well-formed trees, which
 # are all the constructors can build, differentiate exactly as before.
 # [measured: tests/hisab.tcyr, group "3.4.0: expr_eval_checked refuses a tree with no value"]
+# ⛔ 3.4.1 — THE POWER RULE NEEDED A CONST NODE (AU1 SYM-F1). An exponent with no x that
+# was any other node (a variable y, 2 * 3) took the general rule, whose g' ln f term is
+# 0 * ln f, NaN for f <= 0: d/dx x^y at x = BFFBB303EC100C7C, y = 3 evaluated to NaN for
+# 3x^2 = 4021FB800DAD62C2, and at x = 0 to NaN for 0 (168 of 22,526 random trees). The
+# power rule, which the CONST case already took, gives both.
+# ⛔ 3.4.1 — AND THE UNSIMPLIFIED DERIVATIVE FORMED 0 * Inf (AU1 SYM-F6). Every rule
+# multiplied by a factor's derivative even where it was the constant 0, so d/dx(2 exp x)
+# at x = 710 evaluated (0 * exp(710)) + ... = 0 * Inf = NaN, where expr_simplify's tree
+# gave +Inf, and d/dx(x^0) at x = 0 was (0 * x^-1) * 1 = NaN for 0. A derivative that is
+# the constant 0 is exact, not a number to multiply by: its term is left out, as
+# expr_simplify would fold it, so the simplified derivative of every tree is unchanged.
+# [measured: tests/hisab.tcyr, group "3.4.1: expr_diff's power rule and its zero terms"]
 public fn expr_diff(e, var_name) {
+    if (e == 0 || var_name == 0) { return 0; }
+    return _sym_diff_rec(e, var_name, 0);
+}
+
+# Internal: expr_diff to _SYM_REC_DEPTH levels by recursion, and from there by
+# _sym_diff_deep, which needs no native stack (see "Walk stacks"); 0 for a 0 node, a 0
+# name, a tag no constructor writes or a refused allocation.
+fn _sym_diff_rec(e, var_name, depth) {
+    if (depth >= _SYM_REC_DEPTH) { return _sym_diff_deep(e, var_name); }
     if (e == 0) { return 0; }
-    var t = expr_tag(e);
-
-    # d/dx(c) = 0
-    if (t == EXPR_CONST) {
-        return expr_const(0);
-    }
-
-    # d/dx(x) = 1, d/dx(y) = 0
+    var t = load64(e);
+    if (t == EXPR_CONST) { return expr_const(0); }
     if (t == EXPR_VAR) {
-        if (str_eq(expr_var_name(e), var_name) == 1) {
-            return expr_const(F64_ONE);
-        }
+        if (load64(e + 8) == 0) { return 0; }
+        if (str_eq(load64(e + 8), var_name) == 1) { return expr_const(F64_ONE); }
         return expr_const(0);
     }
-
-    # d/dx(a + b) = a' + b'
-    if (t == EXPR_ADD) {
-        return expr_add(expr_diff(expr_left(e), var_name),
-          expr_diff(expr_right(e), var_name));
+    if (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
+        var dl = _sym_diff_rec(load64(e + 8), var_name, depth + 1);
+        if (dl == 0) { return 0; }
+        var dr = _sym_diff_rec(load64(e + 16), var_name, depth + 1);
+        if (dr == 0) { return 0; }
+        return _sym_diff_bin(e, dl, dr);
     }
-
-    # d/dx(a * b) = a'*b + a*b'  (product rule)
-    if (t == EXPR_MUL) {
-        var a = expr_left(e);
-        var b = expr_right(e);
-        return expr_add(
-          expr_mul(expr_diff(a, var_name), b),
-          expr_mul(a, expr_diff(b, var_name))
-          );
+    if (t >= EXPR_NEG && t <= EXPR_LN) {
+        var dc = _sym_diff_rec(load64(e + 8), var_name, depth + 1);
+        if (dc == 0) { return 0; }
+        return _sym_diff_un(e, dc);
     }
-
-    # d/dx(base ^ exp)
-    if (t == EXPR_POW) {
-        var base = expr_left(e);
-        var exp = expr_right(e);
-        # If exponent is a constant: d/dx(f^n) = n * f^(n-1) * f'
-        if (expr_tag(exp) == EXPR_CONST) {
-            var n = expr_const_val(exp);
-            return expr_mul(
-              expr_mul(
-                expr_const(n),
-                expr_pow(base, expr_const(f64_sub(n, F64_ONE)))
-                ),
-              expr_diff(base, var_name)
-              );
-        }
-        # General case: d/dx(f^g) = f^g * (g'*ln(f) + g*f'/f)
-        var ln_f = expr_ln(base);
-        var f_prime = expr_diff(base, var_name);
-        var g_prime = expr_diff(exp, var_name);
-        return expr_mul(
-          expr_pow(base, exp),
-          expr_add(
-            expr_mul(g_prime, ln_f),
-            expr_mul(
-              exp,
-              expr_mul(f_prime, expr_pow(base, expr_const(f64_neg(F64_ONE))))
-              )
-            )
-          );
-    }
-
-    # d/dx(-f) = -f'
-    if (t == EXPR_NEG) {
-        return expr_neg(expr_diff(expr_child(e), var_name));
-    }
-
-    # d/dx(sin(f)) = cos(f) * f'
-    if (t == EXPR_SIN) {
-        var a = expr_child(e);
-        return expr_mul(expr_cos(a), expr_diff(a, var_name));
-    }
-
-    # d/dx(cos(f)) = -sin(f) * f'
-    if (t == EXPR_COS) {
-        var a = expr_child(e);
-        return expr_neg(expr_mul(expr_sin(a), expr_diff(a, var_name)));
-    }
-
-    # d/dx(exp(f)) = exp(f) * f'
-    if (t == EXPR_EXP) {
-        var a = expr_child(e);
-        return expr_mul(expr_exp(a), expr_diff(a, var_name));
-    }
-
-    # d/dx(ln(f)) = f' / f  (represented as f' * f^(-1))
-    if (t == EXPR_LN) {
-        var a = expr_child(e);
-        return expr_mul(
-          expr_diff(a, var_name),
-          expr_pow(a, expr_const(f64_neg(F64_ONE)))
-          );
-    }
-
     # A tag no constructor writes has no derivative: the failure handle, not a constant.
     return 0;
+}
+
+# Internal: expr_diff's walk below _SYM_REC_DEPTH: a node waits on its own stack until its
+# children's derivatives are on a second one. 0 as expr_diff, and when a stack cannot grow.
+fn _sym_diff_deep(e, var_name) {
+    var fbuf: i64[64];
+    var rbuf: i64[64];
+    var fs: i64[3];
+    var rs: i64[3];
+    var w = 0;
+    var n = 0;
+    var st = 0;
+    var t = 0;
+    var d = 0;
+    var c = 0;
+    var k = 0;
+    var dl = 0;
+    var name = 0;
+    _sym_stk_init(&fs, &fbuf);
+    _sym_stk_init(&rs, &rbuf);
+    if (_sym_stk_push(&fs, e) < 0) { return 0; }
+    while (load64(&fs + 8) > 0) {
+        w = _sym_stk_top(&fs);
+        n = w & (0 - 8);
+        st = w & _SYM_ST_MASK;
+        k = 0;
+        if (n == 0) { return 0; }
+        t = expr_tag(n);
+        if (t == EXPR_CONST) {
+            # d/dx(c) = 0
+            d = expr_const(0);
+        } elif (t == EXPR_VAR) {
+            # d/dx(x) = 1, d/dx(y) = 0
+            name = expr_var_name(n);
+            if (name == 0) { return 0; }
+            if (str_eq(name, var_name) == 1) { d = expr_const(F64_ONE); } else { d = expr_const(0); }
+        } elif (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
+            if (st == 0) {
+                c = expr_left(n);
+                k = 1;
+            } elif (st == 1) {
+                c = expr_right(n);
+                k = 1;
+            } else {
+                d = _sym_stk_pop(&rs);
+                dl = _sym_stk_pop(&rs);
+                d = _sym_diff_bin(n, dl, d);
+            }
+        } elif (t >= EXPR_NEG && t <= EXPR_LN) {
+            if (st == 0) {
+                c = expr_child(n);
+                k = 1;
+            } else {
+                d = _sym_diff_un(n, _sym_stk_pop(&rs));
+            }
+        } else {
+            # A tag no constructor writes has no derivative: the failure handle, not a constant.
+            return 0;
+        }
+        if (k == 1) {
+            _sym_stk_retop(&fs, n | (st + 1));
+            if (_sym_stk_push(&fs, c) < 0) { return 0; }
+        } else {
+            if (d == 0) { return 0; }
+            _sym_stk_pop(&fs);
+            if (_sym_stk_push(&rs, d) < 0) { return 0; }
+        }
+    }
+    return _sym_stk_pop(&rs);
+}
+
+# Internal: 1 when d, a derivative expr_diff built, is the constant 0 -- the derivative of
+# a subtree that does not depend on the variable. expr_diff makes a CONST node only for a
+# leaf's derivative (+0 or 1) and for this 0, so the test is exact.
+fn _sym_dz(d) {
+    if (load64(d) == EXPR_CONST) {
+        if (load64(d + 8) == 0) { return 1; }
+    }
+    return 0;
+}
+
+# Internal: the derivative of the sum, product or power n from its children's
+# derivatives dl (left) and dr (right), leaving out a term whose derivative factor is
+# the constant 0 (expr_diff's notes). 0 when a node cannot be allocated.
+fn _sym_diff_bin(n, dl, dr) {
+    var t = load64(n);
+    var a = load64(n + 8);
+    var b = load64(n + 16);
+    var za = _sym_dz(dl);
+    var zb = _sym_dz(dr);
+    var nv = 0;
+    # d/dx(a + b) = a' + b'
+    if (t == EXPR_ADD) {
+        if (za == 1) { return dr; }
+        if (zb == 1) { return dl; }
+        return expr_add(dl, dr);
+    }
+    # d/dx(a * b) = a'*b + a*b'  (product rule)
+    if (t == EXPR_MUL) {
+        if (za == 1 && zb == 1) { return dl; }
+        if (za == 1) { return expr_mul(a, dr); }
+        if (zb == 1) { return expr_mul(dl, b); }
+        return expr_add(expr_mul(dl, b), expr_mul(a, dr));
+    }
+    # d/dx(f ^ g), f = a, g = b
+    if (zb == 1) {
+        # g does not depend on x: d/dx(f^g) = g * f^(g-1) * f'
+        if (za == 1) { return dl; }
+        if (load64(b) == EXPR_CONST) {
+            nv = load64(b + 8);
+            # f^0 is 1 for every f: its derivative is the constant 0.
+            if (f64_eq(nv, 0) == 1) { return expr_const(0); }
+            return expr_mul(expr_mul(expr_const(nv), expr_pow(a, expr_const(f64_sub(nv, F64_ONE)))), dl);
+        }
+        return expr_mul(expr_mul(b, expr_pow(a, expr_add(b, expr_const(f64_neg(F64_ONE))))), dl);
+    }
+    # General case: d/dx(f^g) = f^g * (g'*ln(f) + g*f'/f), without g*f'/f when f' is 0.
+    if (za == 1) { return expr_mul(expr_pow(a, b), expr_mul(dr, expr_ln(a))); }
+    return expr_mul(expr_pow(a, b), expr_add(expr_mul(dr, expr_ln(a)),
+        expr_mul(b, expr_mul(dl, expr_pow(a, expr_const(f64_neg(F64_ONE)))))));
+}
+
+# Internal: the derivative of the negation or function n from its child's derivative d;
+# the constant 0 when d is (no term to keep). 0 when a node cannot be allocated.
+fn _sym_diff_un(n, d) {
+    if (_sym_dz(d) == 1) { return d; }
+    var t = load64(n);
+    var a = load64(n + 8);
+    # d/dx(-f) = -f'
+    if (t == EXPR_NEG) { return expr_neg(d); }
+    # d/dx(sin(f)) = cos(f) * f'
+    if (t == EXPR_SIN) { return expr_mul(expr_cos(a), d); }
+    # d/dx(cos(f)) = -sin(f) * f'
+    if (t == EXPR_COS) { return expr_neg(expr_mul(expr_sin(a), d)); }
+    # d/dx(exp(f)) = exp(f) * f'
+    if (t == EXPR_EXP) { return expr_mul(expr_exp(a), d); }
+    # d/dx(ln(f)) = f' / f  (represented as f' * f^(-1))
+    return expr_mul(d, expr_pow(a, expr_const(f64_neg(F64_ONE))));
 }
 
 # ================================================================
@@ -547,148 +829,210 @@ public fn expr_diff(e, var_name) {
 # Simplify an expression using basic algebraic rules.
 # Rules: 0+x=x, x+0=x, 0*x=0, 1*x=x, x*1=x, x^0=1, x^1=x,
 #        const folding, double negation, neg(0)=0.
-# Returns a new (simplified) expression tree, or 0 when e is 0 or a node of the result
-# cannot be allocated (3.4.0: a 0 from a child's simplification passes up, where its tag
-# was read through the null).
+# Returns a new (simplified) expression tree, or 0 when e is 0, a node in it is 0, or a
+# node of the result or of the walk's stack cannot be allocated (3.4.0: a 0 from a
+# child's simplification passes up, where its tag was read through the null). A tag no
+# constructor writes is returned as it is. Any depth since 3.4.1 (see "Walk stacks"),
+# the same rules in the same order at every node.
 public fn expr_simplify(e) {
+    return _sym_simp_rec(e, 0);
+}
+
+# Internal: expr_simplify to _SYM_REC_DEPTH levels by recursion, and from there by
+# _sym_simp_deep (see "Walk stacks").
+fn _sym_simp_rec(e, depth) {
+    if (depth >= _SYM_REC_DEPTH) { return _sym_simp_deep(e); }
     if (e == 0) { return 0; }
-    var t = expr_tag(e);
+    var t = load64(e);
+    if (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
+        var a = _sym_simp_rec(load64(e + 8), depth + 1);
+        if (a == 0) { return 0; }
+        var b = _sym_simp_rec(load64(e + 16), depth + 1);
+        if (b == 0) { return 0; }
+        return _sym_simp_bin(t, a, b);
+    }
+    if (t >= EXPR_NEG && t <= EXPR_LN) {
+        var c = _sym_simp_rec(load64(e + 8), depth + 1);
+        if (c == 0) { return 0; }
+        # --x = x: the simplified child is a negation, so this node's result is its
+        # child simplified once more.
+        if (t == EXPR_NEG && load64(c) == EXPR_NEG) { return _sym_simp_rec(load64(c + 8), depth + 1); }
+        return _sym_simp_un(t, c);
+    }
+    # Leaves: constants and variables are already simplified; a tag no constructor writes
+    # is returned as it is.
+    return e;
+}
 
-    # Leaves: constants and variables are already simplified
-    if (t == EXPR_CONST) { return e; }
-    if (t == EXPR_VAR) { return e; }
+# Internal: expr_simplify's walk below _SYM_REC_DEPTH: a node waits on its own stack until
+# its children's simplifications are on a second one; 0 as expr_simplify, and when a stack
+# cannot grow.
+fn _sym_simp_deep(e) {
+    if (e == 0) { return 0; }
+    var fbuf: i64[64];
+    var rbuf: i64[64];
+    var fs: i64[3];
+    var rs: i64[3];
+    var w = 0;
+    var n = 0;
+    var st = 0;
+    var t = 0;
+    var r = 0;
+    var c = 0;
+    var k = 0;
+    var a = 0;
+    _sym_stk_init(&fs, &fbuf);
+    _sym_stk_init(&rs, &rbuf);
+    if (_sym_stk_push(&fs, e) < 0) { return 0; }
+    while (load64(&fs + 8) > 0) {
+        w = _sym_stk_top(&fs);
+        n = w & (0 - 8);
+        st = w & _SYM_ST_MASK;
+        k = 0;
+        if (n == 0) { return 0; }
+        t = expr_tag(n);
+        if (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
+            if (st == 0) {
+                c = expr_left(n);
+                k = 1;
+            } elif (st == 1) {
+                c = expr_right(n);
+                k = 1;
+            } else {
+                r = _sym_stk_pop(&rs);
+                a = _sym_stk_pop(&rs);
+                r = _sym_simp_bin(t, a, r);
+            }
+        } elif (t >= EXPR_NEG && t <= EXPR_LN) {
+            if (st == 0) {
+                c = expr_child(n);
+                k = 1;
+            } else {
+                a = _sym_stk_pop(&rs);
+                # --x = x: the simplified child is a negation, so this node's result is its
+                # child simplified once more (the recursion's tail call): the pending
+                # negation is replaced by that child.
+                if (t == EXPR_NEG && expr_tag(a) == EXPR_NEG) {
+                    _sym_stk_retop(&fs, expr_child(a));
+                    k = 2;
+                } else {
+                    r = _sym_simp_un(t, a);
+                }
+            }
+        } else {
+            # Leaves: constants and variables are already simplified; a tag no
+            # constructor writes is returned as it is.
+            r = n;
+        }
+        if (k == 1) {
+            _sym_stk_retop(&fs, n | (st + 1));
+            if (_sym_stk_push(&fs, c) < 0) { return 0; }
+        } elif (k == 0) {
+            if (r == 0) { return 0; }
+            _sym_stk_pop(&fs);
+            if (_sym_stk_push(&rs, r) < 0) { return 0; }
+        }
+    }
+    return _sym_stk_pop(&rs);
+}
 
+# Internal: the simplification of the sum, product or power with simplified children a
+# and b (neither 0), or 0 when a node cannot be allocated.
+fn _sym_simp_bin(t, a, b) {
+    var ta = load64(a);
+    var tb = load64(b);
     # ADD
     if (t == EXPR_ADD) {
-        var a = expr_simplify(expr_left(e));
-        var b = expr_simplify(expr_right(e));
-        if (a == 0 || b == 0) { return 0; }
-        var ta = expr_tag(a);
-        var tb = expr_tag(b);
         # 0 + b = b
         if (ta == EXPR_CONST) {
-            if (_sym_is_zero(expr_const_val(a)) == 1) { return b; }
+            if (_sym_is_zero(load64(a + 8)) == 1) { return b; }
         }
         # a + 0 = a
         if (tb == EXPR_CONST) {
-            if (_sym_is_zero(expr_const_val(b)) == 1) { return a; }
+            if (_sym_is_zero(load64(b + 8)) == 1) { return a; }
         }
         # const + const = const
         if (ta == EXPR_CONST) {
             if (tb == EXPR_CONST) {
-                return expr_const(f64_add(expr_const_val(a), expr_const_val(b)));
+                return expr_const(f64_add(load64(a + 8), load64(b + 8)));
             }
         }
         return expr_add(a, b);
     }
-
     # MUL
     if (t == EXPR_MUL) {
-        var a = expr_simplify(expr_left(e));
-        var b = expr_simplify(expr_right(e));
-        if (a == 0 || b == 0) { return 0; }
-        var ta = expr_tag(a);
-        var tb = expr_tag(b);
         # 0 * b = 0
         if (ta == EXPR_CONST) {
-            if (_sym_is_zero(expr_const_val(a)) == 1) { return expr_const(0); }
+            if (_sym_is_zero(load64(a + 8)) == 1) { return expr_const(0); }
         }
         # a * 0 = 0
         if (tb == EXPR_CONST) {
-            if (_sym_is_zero(expr_const_val(b)) == 1) { return expr_const(0); }
+            if (_sym_is_zero(load64(b + 8)) == 1) { return expr_const(0); }
         }
         # 1 * b = b
         if (ta == EXPR_CONST) {
-            if (_sym_is_one(expr_const_val(a)) == 1) { return b; }
+            if (_sym_is_one(load64(a + 8)) == 1) { return b; }
         }
         # a * 1 = a
         if (tb == EXPR_CONST) {
-            if (_sym_is_one(expr_const_val(b)) == 1) { return a; }
+            if (_sym_is_one(load64(b + 8)) == 1) { return a; }
         }
         # const * const = const
         if (ta == EXPR_CONST) {
             if (tb == EXPR_CONST) {
-                return expr_const(f64_mul(expr_const_val(a), expr_const_val(b)));
+                return expr_const(f64_mul(load64(a + 8), load64(b + 8)));
             }
         }
         return expr_mul(a, b);
     }
-
-    # POW
-    if (t == EXPR_POW) {
-        var base = expr_simplify(expr_left(e));
-        var exp = expr_simplify(expr_right(e));
-        if (base == 0 || exp == 0) { return 0; }
-        var tb = expr_tag(base);
-        var te = expr_tag(exp);
-        # x^0 = 1
-        if (te == EXPR_CONST) {
-            if (_sym_is_zero(expr_const_val(exp)) == 1) { return expr_const(F64_ONE); }
-        }
-        # x^1 = x
-        if (te == EXPR_CONST) {
-            if (_sym_is_one(expr_const_val(exp)) == 1) { return base; }
-        }
-        # const ^ const = const
-        if (tb == EXPR_CONST) {
-            if (te == EXPR_CONST) {
-                return expr_const(ganita_f64_pow(expr_const_val(base), expr_const_val(exp)));
-            }
-        }
-        return expr_pow(base, exp);
+    # POW: a is the base, b the exponent
+    # x^0 = 1
+    if (tb == EXPR_CONST) {
+        if (_sym_is_zero(load64(b + 8)) == 1) { return expr_const(F64_ONE); }
     }
+    # x^1 = x
+    if (tb == EXPR_CONST) {
+        if (_sym_is_one(load64(b + 8)) == 1) { return a; }
+    }
+    # const ^ const = const
+    if (ta == EXPR_CONST) {
+        if (tb == EXPR_CONST) {
+            return expr_const(ganita_f64_pow(load64(a + 8), load64(b + 8)));
+        }
+    }
+    return expr_pow(a, b);
+}
 
-    # NEG
+# Internal: the simplification of the negation or function with simplified child a (not
+# 0, and for a negation not itself a negation), or 0 when a node cannot be allocated.
+fn _sym_simp_un(t, a) {
+    var ta = load64(a);
     if (t == EXPR_NEG) {
-        var a = expr_simplify(expr_child(e));
-        if (a == 0) { return 0; }
-        var ta = expr_tag(a);
         # -0 = 0
         if (ta == EXPR_CONST) {
-            if (_sym_is_zero(expr_const_val(a)) == 1) { return expr_const(0); }
+            if (_sym_is_zero(load64(a + 8)) == 1) { return expr_const(0); }
         }
         # -c = const(-c)
         if (ta == EXPR_CONST) {
-            return expr_const(f64_neg(expr_const_val(a)));
-        }
-        # --x = x
-        if (ta == EXPR_NEG) {
-            return expr_simplify(expr_child(a));
+            return expr_const(load64(a + 8) ^ _SYM_SIGN);
         }
         return expr_neg(a);
     }
-
-    # SIN
-    if (t == EXPR_SIN) {
-        return expr_sin(expr_simplify(expr_child(e)));
-    }
-
-    # COS
-    if (t == EXPR_COS) {
-        return expr_cos(expr_simplify(expr_child(e)));
-    }
-
+    # SIN, COS
+    if (t == EXPR_SIN) { return expr_sin(a); }
+    if (t == EXPR_COS) { return expr_cos(a); }
     # EXP -- fold exp(const)
     if (t == EXPR_EXP) {
-        var a = expr_simplify(expr_child(e));
-        if (a == 0) { return 0; }
-        if (expr_tag(a) == EXPR_CONST) {
-            return expr_const(f64_exp(expr_const_val(a)));
+        if (ta == EXPR_CONST) {
+            return expr_const(f64_exp(load64(a + 8)));
         }
         return expr_exp(a);
     }
-
     # LN -- fold ln(const)
-    if (t == EXPR_LN) {
-        var a = expr_simplify(expr_child(e));
-        if (a == 0) { return 0; }
-        if (expr_tag(a) == EXPR_CONST) {
-            return expr_const(f64_ln(expr_const_val(a)));
-        }
-        return expr_ln(a);
+    if (ta == EXPR_CONST) {
+        return expr_const(f64_ln(load64(a + 8)));
     }
-
-    return e;
+    return expr_ln(a);
 }
 
 # ================================================================
@@ -766,30 +1110,30 @@ public fn sym_const_to_str(val) {
     return str_from_buf(buf, len);
 }
 
-# Internal: append an operand's text to sb, wrapped in "( )" when the text starts
-# with a minus sign: a power's base and a negation's child. A sum, product or power
-# already brings its own parentheses, and a constant or a negation is the only text
-# that starts with '-' (a variable named so would too). The test is on the TEXT, as
-# sym_to_latex's is (symbolic_ext.cyr, `_latex_fmt_const`): -0, whose text is "0",
-# is not wrapped. A zero-length text starts with nothing, so it is never read.
-fn _sym_str_add_operand(sb, s) {
-    if (str_len(s) > 0) {
-        if (load8(str_data(s)) == 45) {   # '-'
-            str_builder_add_cstr(sb, "(");
-            str_builder_add(sb, s);
-            str_builder_add_cstr(sb, ")");
-            return 0;
-        }
-    }
-    str_builder_add(sb, s);
-    return 0;
+# Internal: the fixed pieces of expr_to_str's text, by number (a pending piece is pushed
+# on its walk stack as (id << 3) | 1, beside nodes, which are 8-byte aligned).
+fn _sym_str_piece(id) {
+    if (id == 1) { return "("; }
+    if (id == 2) { return ")"; }
+    if (id == 3) { return " + "; }
+    if (id == 4) { return " * "; }
+    if (id == 5) { return "^"; }
+    if (id == 6) { return "sin("; }
+    if (id == 7) { return "cos("; }
+    if (id == 8) { return "exp("; }
+    return "ln(";
 }
 
 # Convert an expression tree to a human-readable Str.
-# Returns a Str (fat pointer). A sum, product or power is written in parentheses,
+# Returns a Str (fat pointer), or 0 when e is 0, a node in it is 0 (or a variable's name
+# is), or the text cannot be allocated (3.4.1: through 3.4.0 each of these was a read
+# through the null, and str_builder_add ended the process on a refused grow). A tree that
+# is one variable returns that variable's name, the same Str. A sum, product or power is
+# written in parentheses,
 # "(a + b)", "(a * b)", "(a^b)"; a negation as "-a"; a function as "sin(a)". A
 # power's base and a negation's child are wrapped once more when their text starts
-# with a minus sign: (-2)^x is "((-2)^x)" and neg(-3) is "-(-3)".
+# with a minus sign: (-2)^x is "((-2)^x)" and neg(-3) is "-(-3)". A tag no constructor
+# writes is "?".
 # ⛔ 3.3.3 — A LEADING MINUS IN A POWER'S BASE OR A NEGATION'S CHILD WAS WRITTEN
 # BARE. In a power's base the text read as another expression: (-2)^x rendered
 # "(-2^x)" (minus 2^x), neg(x)^2 "(-x^2)" and (-3)^(-1) "(-3^-1)". In a negation's
@@ -808,85 +1152,85 @@ fn _sym_str_add_operand(sb, s) {
 # other 390,283; a python3 renderer written from each rule matched the output before
 # and after on all of them. Dropping the negation's wrap moved 44,226 outputs off the rule.
 # [measured: scratch differential harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
+# ⛔ 3.4.1 — QUADRATIC MEMORY, AND RECURSION (AU1 SYM-F4, SYM-F3). Each node rendered its
+# children to Strs of their own and copied them into a builder of its own, so every
+# level copied the text below it again: a 20,000-node sum peaked at 2.3 GB, and a deep
+# tree overflowed the native stack. The text is now written once, front to back, into one
+# builder, by a walk with its own stack (see "Walk stacks"); the operand wrap reads the
+# node (a negation; a constant whose text, or a variable whose name, starts with '-'),
+# which is what the text starts with. Every tree renders to the same bytes.
+# [measured: tests/hisab.tcyr, group "3.4.1: the symbolic walkers on a 200,000-deep tree"]
 public fn expr_to_str(e) {
+    if (e == 0) { return 0; }
     var t = expr_tag(e);
-
-    if (t == EXPR_CONST) {
-        return sym_const_to_str(expr_const_val(e));
+    if (t == EXPR_CONST) { return sym_const_to_str(expr_const_val(e)); }
+    if (t == EXPR_VAR) { return expr_var_name(e); }
+    if (t < EXPR_ADD || t > EXPR_LN) { return str_from("?"); }
+    var al = default_alloc();
+    var sb = str_builder_new_a(al);
+    if (sb == 0) { return 0; }
+    var sbuf: i64[64];
+    var ss: i64[3];
+    var w = 0;
+    var n = 0;
+    var opnd = 0;
+    var s = 0;
+    var wrap = 0;
+    _sym_stk_init(&ss, &sbuf);
+    if (_sym_stk_push(&ss, e) < 0) { return 0; }
+    while (load64(&ss + 8) > 0) {
+        w = _sym_stk_pop(&ss);
+        if ((w & 1) == 1) {
+            if (str_builder_add_cstr_a(al, sb, _sym_str_piece(w >> 3)) < 0) { return 0; }
+        } else {
+            n = w & (0 - 8);
+            opnd = w & 2;
+            if (n == 0) { return 0; }
+            t = expr_tag(n);
+            if (t == EXPR_CONST || t == EXPR_VAR) {
+                if (t == EXPR_CONST) { s = sym_const_to_str(expr_const_val(n)); } else { s = expr_var_name(n); }
+                if (s == 0) { return 0; }
+                wrap = 0;
+                if (opnd != 0 && str_len(s) > 0) {
+                    if (load8(str_data(s)) == 45) { wrap = 1; }   # '-'
+                }
+                if (wrap == 1) {
+                    if (str_builder_add_cstr_a(al, sb, "(") < 0) { return 0; }
+                }
+                if (str_builder_add_a(al, sb, s) < 0) { return 0; }
+                if (wrap == 1) {
+                    if (str_builder_add_cstr_a(al, sb, ")") < 0) { return 0; }
+                }
+            } elif (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
+                # "(" left op right ")", the pieces pushed last first. A power's base is
+                # an operand (2), wrapped when its text starts with '-'.
+                if (str_builder_add_cstr_a(al, sb, "(") < 0) { return 0; }
+                if (_sym_stk_push(&ss, (2 << 3) | 1) < 0) { return 0; }
+                if (_sym_stk_push(&ss, expr_right(n)) < 0) { return 0; }
+                if (t == EXPR_POW) {
+                    if (_sym_stk_push(&ss, (5 << 3) | 1) < 0) { return 0; }
+                    if (_sym_stk_push(&ss, expr_left(n) | 2) < 0) { return 0; }
+                } else {
+                    if (_sym_stk_push(&ss, ((t + 1) << 3) | 1) < 0) { return 0; }
+                    if (_sym_stk_push(&ss, expr_left(n)) < 0) { return 0; }
+                }
+            } elif (t == EXPR_NEG) {
+                # "-" and the child as an operand; as an operand itself, "(-...)".
+                if (opnd != 0) {
+                    if (str_builder_add_cstr_a(al, sb, "(-") < 0) { return 0; }
+                    if (_sym_stk_push(&ss, (2 << 3) | 1) < 0) { return 0; }
+                } else {
+                    if (str_builder_add_cstr_a(al, sb, "-") < 0) { return 0; }
+                }
+                if (_sym_stk_push(&ss, expr_child(n) | 2) < 0) { return 0; }
+            } elif (t >= EXPR_SIN && t <= EXPR_LN) {
+                if (str_builder_add_cstr_a(al, sb, _sym_str_piece(t)) < 0) { return 0; }
+                if (_sym_stk_push(&ss, (2 << 3) | 1) < 0) { return 0; }
+                if (_sym_stk_push(&ss, expr_child(n)) < 0) { return 0; }
+            } else {
+                if (str_builder_add_cstr_a(al, sb, "?") < 0) { return 0; }
+            }
+        }
     }
-
-    if (t == EXPR_VAR) {
-        return expr_var_name(e);
-    }
-
-    if (t == EXPR_ADD) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "(");
-        str_builder_add(sb, expr_to_str(expr_left(e)));
-        str_builder_add_cstr(sb, " + ");
-        str_builder_add(sb, expr_to_str(expr_right(e)));
-        str_builder_add_cstr(sb, ")");
-        return str_builder_build(sb);
-    }
-
-    if (t == EXPR_MUL) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "(");
-        str_builder_add(sb, expr_to_str(expr_left(e)));
-        str_builder_add_cstr(sb, " * ");
-        str_builder_add(sb, expr_to_str(expr_right(e)));
-        str_builder_add_cstr(sb, ")");
-        return str_builder_build(sb);
-    }
-
-    if (t == EXPR_POW) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "(");
-        _sym_str_add_operand(sb, expr_to_str(expr_left(e)));
-        str_builder_add_cstr(sb, "^");
-        str_builder_add(sb, expr_to_str(expr_right(e)));
-        str_builder_add_cstr(sb, ")");
-        return str_builder_build(sb);
-    }
-
-    if (t == EXPR_NEG) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "-");
-        _sym_str_add_operand(sb, expr_to_str(expr_child(e)));
-        return str_builder_build(sb);
-    }
-
-    if (t == EXPR_SIN) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "sin(");
-        str_builder_add(sb, expr_to_str(expr_child(e)));
-        str_builder_add_cstr(sb, ")");
-        return str_builder_build(sb);
-    }
-
-    if (t == EXPR_COS) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "cos(");
-        str_builder_add(sb, expr_to_str(expr_child(e)));
-        str_builder_add_cstr(sb, ")");
-        return str_builder_build(sb);
-    }
-
-    if (t == EXPR_EXP) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "exp(");
-        str_builder_add(sb, expr_to_str(expr_child(e)));
-        str_builder_add_cstr(sb, ")");
-        return str_builder_build(sb);
-    }
-
-    if (t == EXPR_LN) {
-        var sb = str_builder_new();
-        str_builder_add_cstr(sb, "ln(");
-        str_builder_add(sb, expr_to_str(expr_child(e)));
-        str_builder_add_cstr(sb, ")");
-        return str_builder_build(sb);
-    }
-
-    return str_from("?");
+    return str_builder_build_a(al, sb);
 }

@@ -12,12 +12,21 @@
 # Lorentz layout: 4x4 f64, column-major (128 bytes), reuses mat4 infrastructure.
 # SU(2) layout: { w, x, y, z } = 32 bytes (same as HQuat but w-first).
 
+# Correctly rounded constants (3.4.1). λ8 formed 1/sqrt(3) as f64_div(1, f64_sqrt(3)), two
+# roundings that land on ...331D, one ulp above the correctly rounded ...331C; 2/sqrt(3) is
+# that double times 2, exactly.
+enum _LieF64 {
+    _LIE_INV_SQRT3     = 0x3FE279A74590331C;   # 1/sqrt(3) = 0.57735026918962576451
+    _LIE_TWO_INV_SQRT3 = 0x3FF279A74590331C;   # 2/sqrt(3) = 1.1547005383792515290
+}
+
 # ================================================================
 # U(1) -- Phase group
 # ================================================================
 # Representation: a single f64 theta stored on the heap (8 bytes).
 # e^{i theta} lives on the unit circle in the complex plane.
-
+# u1_new: the element of phase theta (radians, any f64, stored as given: no reduction
+# mod 2*pi). Returns the 8-byte handle, or the designed 0 when it cannot be allocated.
 public fn u1_new(theta) {
     var u = alloc(8);
     if (u == 0) { return 0; }
@@ -27,6 +36,7 @@ public fn u1_new(theta) {
 
 fn _u1_theta(u) { return load64(u); }
 
+# The U(1) identity, phase 0 (a fresh handle; 0 when it cannot be allocated).
 public fn u1_identity() { return u1_new(0); }
 
 # Group multiplication: e^{i a} * e^{i b} = e^{i(a+b)}
@@ -426,7 +436,17 @@ public fn su2_log(s) {
     # ⭐ An exact-zero test is what the note above says the guard is; a NaN now goes past
     # it to the non-finite test below. (A NaN w never gets here: see the first test in
     # this function.)
+    # ⛔ 3.4.1 — AND -1 CAME BACK AS THE ZERO VECTOR, the identity's logarithm: su2_exp of
+    # it is +1, not -1. -1 = su2_exp(omega) for every omega of length 2*pi, so a vector part
+    # of exactly zero beside a negative w is a turn of 2*pi about an axis the element does
+    # not name. The neighbours name it: (w = -1, x = 2^-1054) gives 2*pi * x-hat (the rescue
+    # below), and the same holds along y or z. (2*pi, 0, 0) is returned for the axis-free
+    # element; su2_exp of it is (-1, 1.2e-16, 0, 0), -1 to rounding. A w of +0 or -0 with a
+    # zero vector part is no unit element and keeps the zero vector it had. `se3_log` does
+    # not reach this exit for -1: it takes the principal log from -q = +1 (lie_ext.cyr).
+    # [measured: tests/abuse.tcyr "3.4.1: su2_log of -1"]
     if (f64_eq(sin_half, 0) == 1) {
+        if (f64_lt(w, 0) == 1) { return hvec3_new(F64_TAU, 0, 0); }
         return hvec3_new(0, 0, 0);
     }
     # ⛔ 3.3.3 — AN INFINITE VECTOR PART CAME BACK AS ZEROS. This is the pair of `so3_log`'s
@@ -464,9 +484,9 @@ public fn su2_log(s) {
     # depend on the common scale, and these are not rounded onto that grid. For a unit
     # element w/mx is below -2^1021 or -Inf, and the half-angle is pi from either
     # operand pair, so every unit element keeps the bits of the first form.
-    # ⚠ The answer is right for su2_log, a turn of up to 2*pi. `se3_log` refuses the ones
-    # past pi, every unit element among them: 3.3.2 refused them too, and the V it inverts
-    # is singular at 2*pi (lie_ext.cyr).
+    # ⚠ The answer is right for su2_log, a turn of up to 2*pi. `se3_log` never asks for
+    # one past pi since 3.4.1: it logs -q, the same rigid motion, whenever w < 0
+    # (lie_ext.cyr), and through 3.4.0 it refused these with NaN.
     if (f64_eq(sc, F64_POS_INF) == 1) {
         var mx = f64_max(f64_abs(x), f64_max(f64_abs(y), f64_abs(z)));
         var xs = f64_div(x, mx); var ys = f64_div(y, mx); var zs = f64_div(z, mx);
@@ -509,9 +529,11 @@ public fn su2_to_rotation_matrix(s) {
 # ================================================================
 # SU(3) -- Gell-Mann matrices
 # ================================================================
-# Returns 3x3 ComplexMatrix for Gell-Mann matrix lambda_idx (idx 0..7).
-# Corresponds to lambda_{idx+1} in physics convention.
-
+# gell_mann(idx): a fresh 3x3 ComplexMatrix holding the Gell-Mann matrix lambda_{idx+1}
+# for idx 0..7 (the physics numbering shifted to 0-based). Every entry is 0, +-1, +-i, or
+# for lambda_8 (idx 7) the correctly rounded 1/sqrt(3) and -2/sqrt(3) (3.4.1; one ulp
+# high through 3.4.0). An idx outside 0..7 returns the 3x3 zero matrix, not 0. Returns
+# the designed 0 only when an allocation is refused.
 public fn gell_mann(idx) {
     var one = cx_one();
     if (one == 0) { return 0; }
@@ -521,10 +543,10 @@ public fn gell_mann(idx) {
     if (i_pos == 0) { return 0; }
     var i_neg = cx_new(0, f64_neg(F64_ONE));
     if (i_neg == 0) { return 0; }
-    # 1/sqrt(3) and -2/sqrt(3) for lambda_8
-    var inv_sqrt3 = cx_new(f64_div(F64_ONE, f64_sqrt(f64_from(3))), 0);
+    # 1/sqrt(3) and -2/sqrt(3) for lambda_8, correctly rounded (_LieF64)
+    var inv_sqrt3 = cx_new(_LIE_INV_SQRT3, 0);
     if (inv_sqrt3 == 0) { return 0; }
-    var neg2_inv_sqrt3 = cx_new(f64_neg(f64_div(F64_TWO, f64_sqrt(f64_from(3)))), 0);
+    var neg2_inv_sqrt3 = cx_new(f64_neg(_LIE_TWO_INV_SQRT3), 0);
     if (neg2_inv_sqrt3 == 0) { return 0; }
 
     var m = cmat_new(3, 3);
@@ -613,6 +635,11 @@ fn _su3_canonical(a, b, c) {
     return 0;
 }
 
+# su3_structure_constant(a, b, c): the SU(3) structure constant f_{abc} as an f64, with
+# a, b, c 1-indexed (1..8, the physics numbering), totally antisymmetric. The nonzero
+# values are +-1, +-1/2 and +-sqrt(3)/2 (f64_sqrt(3) / 2: correctly rounded, the division
+# by 2 being exact). Any other index triple, an out-of-range index included, gives 0;
+# there is no failure value.
 public fn su3_structure_constant(a, b, c) {
     # Try all 6 permutations with antisymmetry signs
     # Even permutations: (a,b,c), (b,c,a), (c,a,b) -> +1
@@ -725,7 +752,21 @@ public fn lorentz_boost(dir, eta) {
 
     var ch = ganita_f64_cosh(eta);
     var sh = ganita_f64_sinh(eta);
-    var gm1 = f64_sub(ch, F64_ONE);  # cosh(eta) - 1
+    # cosh(eta) - 1. ⛔ Through 3.4.0 the plain subtraction, which keeps only cosh's own
+    # rounding where cosh is near 1: 1e8 ulp at small rapidity and exactly 0 below ~2^-26,
+    # so the spatial block lost its n n^T term (Lambda^1_2 = 0 at eta = 1.2e-8, exact
+    # 2.28e-17). ⭐ 3.4.1: below cosh = 1.5, where the subtraction is exact (Sterbenz) and
+    # carries cosh's own error amplified by cosh/(cosh - 1), the identity
+    # cosh - 1 = sinh^2 / (cosh + 1), which has no cancellation and needs no third
+    # transcendental (2 sinh^2(eta/2) is 3.1 ulp where this is 4.4, at the cost of a sinh
+    # call: +30% on lorentz_boost); from 1.5, where the errors cross, the subtraction,
+    # within 2.0 ulp there and unchanged bit for bit. (sinh^2 overflows from eta ~ 355,
+    # so the identity is not the form above the switch.)
+    # [measured: tests/abuse.tcyr "3.4.1: 1 - cos and cosh - 1"; 6,000-rapidity mpmath sweep, LIE lane 2026-10-31]
+    var gm1 = f64_sub(ch, F64_ONE);
+    if (f64_lt(ch, 0x3FF8000000000000) == 1) {   # 1.5
+        gm1 = f64_div(f64_mul(sh, sh), f64_add(ch, F64_ONE));
+    }
 
     var m = m4_new();
     if (m == 0) { return 0; }
@@ -777,13 +818,21 @@ public fn lorentz_rotate(axis, angle) {
 
     var c = f64_cos(angle);
     var s = f64_sin(angle);
-    var omc = f64_sub(F64_ONE, c);  # 1 - cos(angle)
+    # 1 - cos(angle), as sin^2 / (1 + cos) where cos > 3/4 (3.4.1; as so3_from_axis_angle
+    # says: the subtraction there keeps only cos's rounding, 6e15 ulp at small angles and 0
+    # below ~2^-26). Elsewhere unchanged.
+    var omc = f64_sub(F64_ONE, c);
+    if (f64_gt(c, 0x3FE8000000000000) == 1) {   # 0.75
+        omc = f64_div(f64_mul(s, s), f64_add(F64_ONE, c));
+    }
 
     var m = m4_new();
     if (m == 0) { return 0; }
     m4_set(m, 0, 0, F64_ONE);  # time unchanged
 
-    # Rodrigues: R_ij = c*delta_ij + (1-c)*n_i*n_j + s*epsilon_ijk*n_k
+    # Rodrigues: R_ij = c*delta_ij + (1-c)*n_i*n_j - s*epsilon_ijk*n_k, the rotation by
+    # `angle` about n (counter-clockwise looking down n). (Through 3.4.0 this comment had
+    # + s*epsilon; the code below has always had the minus: R_xy = (1-c) n_x n_y - s n_z.)
     # Row 1 (i=0, spatial x): col 1,2,3 -> j=0,1,2
     m4_set(m, 1, 1, f64_add(f64_mul(c, F64_ONE), f64_mul(omc, f64_mul(nx, nx))));
     m4_set(m, 2, 1, f64_sub(f64_mul(omc, f64_mul(nx, ny)), f64_mul(s, nz)));
@@ -855,58 +904,76 @@ public fn lorentz_transform_4vec(L, v) {
     return out;
 }
 
-# Validate Lorentz transformation: Lambda^T eta Lambda = eta
-# Returns 1 if valid within tolerance, 0 otherwise
+# Validate Lorentz transformation: Lambda^T eta Lambda = eta, eta = diag(+1, -1, -1, -1).
+# Returns 1 when every entry of Lambda^T eta Lambda is within 1e-12 of eta's, RELATIVE to
+# that entry's own sum of magnitudes S_mu_nu = sum_rho |Lambda^rho_mu| |Lambda^rho_nu|
+# (the scale its rounding error and the input's carry), and 0 otherwise. A matrix with any
+# NaN or infinite entry is 0. There is no failure value: a 0 handle is not checked.
 public fn lorentz_is_valid(L) {
-    # A stack table (3.4.0): this function answers 1 or 0 and has no value left for a
-    # refused allocation, and through 3.3.7 a 32-byte heap table it never freed was
-    # stored through unchecked.
-    var eta_buf: i64[4];
-    var eta_vals = &eta_buf;
-    store64(eta_vals, F64_ONE);
-    store64(eta_vals + 8, f64_neg(F64_ONE));
-    store64(eta_vals + 16, f64_neg(F64_ONE));
-    store64(eta_vals + 24, f64_neg(F64_ONE));
-
-    # RELATIVE, not absolute. Every entry of Lambda^T eta Lambda is a sum of
-    # products of two matrix entries, so its rounding error scales with the
-    # SQUARE of the largest entry -- which for a boost of rapidity eta is
-    # cosh^2(eta). Through 2.6.15 this compared against a fixed 1e-12, so a
-    # perfectly valid boost was rejected from rapidity ~5 upward (cosh^2(5) is
-    # 5507, and one ulp there is already 9e-13). Scaling by the matrix magnitude
-    # leaves ~4500-fold headroom over the true rounding bound while still rejecting a
-    # genuinely non-Lorentzian matrix, whose defect is O(scale^2), not O(1e-12).
-    var scale = 0;
-    var si = 0;
-    while (si < 4) {
-        var sj = 0;
-        while (sj < 4) {
-            var av = f64_abs(m4_get(L, si, sj));
-            if (f64_gt(av, scale) == 1) { scale = av; }
-            sj = sj + 1;
-        }
-        si = si + 1;
-    }
-    var tol = f64_mul(EPSILON_F64, f64_add(F64_ONE, f64_mul(scale, scale)));
+    # ⛔ 3.4.0 AND EARLIER — ONE TOLERANCE FOR ALL SIXTEEN ENTRIES, 1e-12 * (1 + max^2), AND A
+    # TEST THAT A NaN PASSES. (1) The largest entry of a boost of rapidity eta is cosh eta,
+    # so at high rapidity an entry whose own products are O(1) was held to 1e-12 * cosh^2:
+    # lorentz_boost_x(20) with Lambda^2_2 = 100, whose (Lambda^T eta Lambda)_22 is -10^4
+    # where -1 is required, was valid, and so was boost_x(10) with Lambda^2_2 off by 1e-5.
+    # The comment here said a non-Lorentzian defect is O(scale^2); that one is O(1). (2) The
+    # rejection test was `|sum - expected| > tol`, false for a NaN: the identity with a NaN at
+    # (0,0) was valid. (3) From entries of 2^512 the products overflow and the tolerance with
+    # them: (0,0) = +Inf, 1.1 * 2^512 or 1e300, and boost_x(800) with every entry +Inf, were
+    # all valid. [measured: tests/abuse.tcyr "3.4.1: lorentz_is_valid", baseline 3.4.0]
+    # ⭐ 3.4.1 — each entry against its own S_mu_nu: the rounding error of the sum, and the
+    # defect E^T eta Lambda + Lambda^T eta E a rounded input carries, are both a few ulp of
+    # S_mu_nu, entry by entry, so 1e-12 * S keeps the ~4,500-fold headroom the old bound
+    # meant to have without letting a large entry elsewhere excuse an O(1) defect here. The
+    # test is `<=`, which NaN fails. A non-finite entry is refused before anything is
+    # formed. Each column is first scaled by a power of two (exact) that brings its largest
+    # entry below 2, so a valid boost past rapidity 355 (entries above 2^512) is still
+    # decided, and the expected +-1 is scaled with it.
+    # Only nu >= mu is formed: entry (nu, mu) is the same four products summed in the same
+    # order, so it is entry (mu, nu) bit for bit.
+    var sc_buf: i64[4];
     var mu = 0;
     while (mu < 4) {
-        var nu = 0;
+        var mx = 0;
+        var rho = 0;
+        while (rho < 4) {
+            var av = f64_abs(m4_get(L, mu, rho));
+            if (f64_lt(av, F64_POS_INF) == 0) { return 0; }   # NaN or +-Inf
+            if (f64_gt(av, mx) == 1) { mx = av; }
+            rho = rho + 1;
+        }
+        # 2^-k for the column's largest entry in [2^k, 2^(k+1)), k >= 1; 1 otherwise.
+        var k = ((mx >> 52) & 0x7FF) - 1023;
+        var sc = F64_ONE;
+        if (k > 0) {
+            sc = (1023 - k) << 52;
+            if (k > 1022) { sc = 1 << (51 - (k - 1023)); }   # 2^-1023: subnormal, still exact
+        }
+        store64(&sc_buf + mu * 8, sc);
+        mu = mu + 1;
+    }
+    mu = 0;
+    while (mu < 4) {
+        var sm = load64(&sc_buf + mu * 8);
+        var nu = mu;
         while (nu < 4) {
-            # Compute (Lambda^T eta Lambda)^mu_nu = sum_rho Lambda^rho_mu * eta[rho] * Lambda^rho_nu
+            var sn = load64(&sc_buf + nu * 8);
+            # (Lambda^T eta Lambda)_mu_nu = sum_rho eta_rho Lambda^rho_mu Lambda^rho_nu, with
+            # Lambda^rho_mu = m4_get(L, mu, rho) (col-major), on the scaled columns.
             var sum = 0;
+            var mag = 0;
             var rho = 0;
             while (rho < 4) {
-                var eta_rho = load64(eta_vals + rho * 8);
-                # Lambda^rho_mu = m4_get(L, mu, rho)
-                # Lambda^rho_nu = m4_get(L, nu, rho)
-                sum = f64_add(sum, f64_mul(f64_mul(m4_get(L, mu, rho), eta_rho),
-                    m4_get(L, nu, rho)));
+                var p = f64_mul(f64_mul(m4_get(L, mu, rho), sm), f64_mul(m4_get(L, nu, rho), sn));
+                if (rho == 0) { sum = f64_add(sum, p); } else { sum = f64_sub(sum, p); }
+                mag = f64_add(mag, f64_abs(p));
                 rho = rho + 1;
             }
-            # Expected: eta[mu] if mu==nu, else 0
             var expected = 0;
-            if (mu == nu) { expected = load64(eta_vals + mu * 8); }
-            if (f64_gt(f64_abs(f64_sub(sum, expected)), tol) == 1) {
+            if (mu == nu) {
+                expected = f64_mul(f64_mul(F64_ONE, sm), sn);
+                if (mu > 0) { expected = f64_neg(expected); }
+            }
+            if (f64_le(f64_abs(f64_sub(sum, expected)), f64_mul(EPSILON_F64, mag)) == 0) {
                 return 0;
             }
             nu = nu + 1;
@@ -916,13 +983,306 @@ public fn lorentz_is_valid(L) {
     return 1;
 }
 
-# Minkowski interval: eta^{mu nu} v_mu v_nu = t^2 - x^2 - y^2 - z^2
-# v is a pointer to 4 f64 values (t, x, y, z)
+# ---- minkowski_interval: t^2 - x^2 - y^2 - z^2, the sign exact, within 2^-50 (3.4.1) ----
+enum _LieMink {
+    _LIE_MK_THREE = 0x4008000000000000;   # 3
+    _LIE_MK_KP    = 0x401BFFFFFFFFFE40;   # 7*(1 - 2^-44)
+    _LIE_MK_TP    = 0x0040000000000000;   # 2^-1019
+    _LIE_MK_R     = 0x3CD0000000000000;   # 2^-50
+    _LIE_MK_SKIP  = 0x3CB0000000000000;   # 2^-52
+    _LIE_MK_LO    = 0x21A0000000000000;   # 2^-485
+    _LIE_MK_HI    = 0x7FB0000000000000;   # 2^1020
+    _LIE_MK_SPLIT = 0x41A0000002000000;   # 2^27 + 1
+}
+
+# The cnt (at most 53) bits of the normalised limbs at acc from bit lo (>= 0) up, as an
+# integer; 0 when cnt <= 0. Reads at most three limbs from lo / 32.
+fn _lie_mk_bits(acc, lo, cnt) {
+    if (cnt <= 0) { return 0; }
+    var pj = acc + (lo >> 5) * 8;
+    var sh = lo & 31;
+    var v = (load64(pj) >> sh) | (load64(pj + 8) << (32 - sh));
+    if (sh > 0) { v = v | (load64(pj + 16) << (64 - sh)); }
+    return v & ((1 << cnt) - 1);
+}
+
+# The exact interval, rounded once. A finite slot is m 2^q (m < 2^53 an integer, q >= -1074),
+# so R 2^(-2 qmin) = sum of +-m^2 2^(2 (q - qmin)) is an integer of at most 4,198 bits (2 (971 +
+# 1074) + 108); it is summed in 32-bit limbs (limb k holds bits 32k .. 32k + 31, as a signed
+# i64 until the carries run), each m^2 as three pieces below 2^54 (m = m1 2^27 + m0). R is then
+# rounded to nearest, ties to even, onto the double grid -- the subnormal grid below 2^-1022,
+# +-Inf once the rounded magnitude reaches 2^1024 -- except that a nonzero R never rounds to 0:
+# below half the smallest subnormal it returns +-2^-1074. R = 0 returns +0. Finite slots only
+# (the caller sends NaN and infinities elsewhere).
+# [measured: derived from the double format, not a run; tests/modules_c.tcyr "3.4.1 LIE3" pins it]
+fn _lie_mk_exact(t, x, y, z) {
+    var sl: i64[4];
+    store64(&sl, t); store64(&sl + 8, x); store64(&sl + 16, y); store64(&sl + 24, z);
+    var qmin = 4096;
+    var qmax = 0 - 4096;
+    var i = 0;
+    while (i < 4) {
+        var ab = load64(&sl + i * 8) & 0x7FFFFFFFFFFFFFFF;
+        if (ab != 0) {
+            var q = (ab >> 52) - 1075;
+            if ((ab >> 52) == 0) { q = 0 - 1074; }
+            if (q < qmin) { qmin = q; }
+            if (q > qmax) { qmax = q; }
+        }
+        i = i + 1;
+    }
+    if (qmax < qmin) { return 0; }   # every slot +-0
+    # |R| 2^(-2 qmin) < 4 2^(2 (qmax - qmin) + 106): nl limbs hold it with its sign; the three
+    # above them are read by _lie_mk_bits and must be 0. nl + 3 <= 138.
+    var nl = (2 * (qmax - qmin) + 108) / 32 + 2;
+    var acc: i64[140];
+    var k = 0;
+    while (k < nl + 3) { store64(&acc + k * 8, 0); k = k + 1; }
+    i = 0;
+    while (i < 4) {
+        var ab2 = load64(&sl + i * 8) & 0x7FFFFFFFFFFFFFFF;
+        if (ab2 != 0) {
+            var m = ab2 & 0x000FFFFFFFFFFFFF;
+            var q2 = 0 - 1074;
+            if ((ab2 >> 52) != 0) { m = m | 0x0010000000000000; q2 = (ab2 >> 52) - 1075; }
+            var pos = 2 * (q2 - qmin);
+            var sg = 0 - 1;
+            if (i == 0) { sg = 1; }
+            var m1 = m >> 27;
+            var m0 = m & 0x7FFFFFF;
+            # m^2 = m1^2 2^54 + 2 m1 m0 2^27 + m0^2, each piece v < 2^54 added at bit ps as
+            # (v mod 2^32) 2^ps and (v >> 32) 2^(ps + 32), each spread over two limbs.
+            var pc = 0;
+            while (pc < 3) {
+                var pv = m0 * m0;
+                var ps = pos;
+                if (pc == 0) { pv = m1 * m1; ps = pos + 54; } elif (pc == 1) { pv = 2 * m1 * m0; ps = pos + 27; }
+                var pj = &acc + (ps >> 5) * 8;
+                var sh = ps & 31;
+                var w0 = (pv & 0xFFFFFFFF) << sh;
+                var w1 = (pv >> 32) << sh;
+                store64(pj, load64(pj) + sg * (w0 & 0xFFFFFFFF));
+                store64(pj + 8, load64(pj + 8) + sg * ((w0 >> 32) + (w1 & 0xFFFFFFFF)));
+                store64(pj + 16, load64(pj + 16) + sg * (w1 >> 32));
+                pc = pc + 1;
+            }
+        }
+        i = i + 1;
+    }
+    # Carries (each limb's sum is below 2^38 in magnitude); a final carry of -1 is a negative R.
+    var carry = 0;
+    k = 0;
+    while (k < nl) {
+        var w = load64(&acc + k * 8) + carry;
+        store64(&acc + k * 8, w & 0xFFFFFFFF);
+        carry = w >>> 32;
+        k = k + 1;
+    }
+    var sgn = 0;
+    if (carry < 0) {   # two's complement over the nl limbs: |R|
+        sgn = 0x8000000000000000;
+        var c2 = 1;
+        k = 0;
+        while (k < nl) {
+            var w2 = (load64(&acc + k * 8) ^ 0xFFFFFFFF) + c2;
+            store64(&acc + k * 8, w2 & 0xFFFFFFFF);
+            c2 = w2 >> 32;
+            k = k + 1;
+        }
+    }
+    k = nl - 1;
+    while (k > 0) {
+        if (load64(&acc + k * 8) != 0) { break; }
+        k = k - 1;
+    }
+    var top = load64(&acc + k * 8);
+    if (top == 0) { return 0; }   # R = 0 exactly: +0
+    var nb = 1;   # the bit length of top (< 2^32)
+    if ((top >> 16) != 0) { nb = nb + 16; top = top >> 16; }
+    if ((top >> 8) != 0) { nb = nb + 8; top = top >> 8; }
+    if ((top >> 4) != 0) { nb = nb + 4; top = top >> 4; }
+    if ((top >> 2) != 0) { nb = nb + 2; top = top >> 2; }
+    if ((top >> 1) != 0) { nb = nb + 1; }
+    var tb = 32 * k + nb - 1;     # the top bit: |R| in [2^e, 2^(e + 1))
+    var e = tb + 2 * qmin;
+    if (e >= 1024) { return sgn | 0x7FF0000000000000; }
+    var ue = e - 52;              # the exponent of the result's last place
+    if (e < 0 - 1022) { ue = 0 - 1074; }
+    var lb = ue - 2 * qmin;
+    var n = 0;
+    var rnd = 0;
+    var stk = 0;
+    if (lb <= 0) {
+        n = _lie_mk_bits(&acc, 0, tb + 1) << (0 - lb);   # exact on the grid
+    } else {
+        n = _lie_mk_bits(&acc, lb, tb - lb + 1);
+        var rb = lb - 1;
+        var lr = load64(&acc + (rb >> 5) * 8);
+        rnd = (lr >> (rb & 31)) & 1;
+        if ((lr & ((1 << (rb & 31)) - 1)) != 0) { stk = 1; }
+        var kk = 0;
+        while (kk < (rb >> 5)) {
+            if (load64(&acc + kk * 8) != 0) { stk = 1; }
+            kk = kk + 1;
+        }
+    }
+    if (rnd == 1 && (stk == 1 || (n & 1) == 1)) { n = n + 1; }
+    if (n == 0) { n = 1; }   # R != 0 here: never 0, the sign kept
+    # ((ue + 1074) << 52) + n: a normal n carries its implicit bit into the exponent field (and
+    # a carry to 2^53 into the next binade); a subnormal one has ue = -1074.
+    var bits = ((ue + 1074) << 52) + n;
+    if (bits >= 0x7FF0000000000000) { bits = 0x7FF0000000000000; }
+    return sgn | bits;
+}
+
+# The accurate path past level 1 (in minkowski_interval). a, b, c, d are the computed
+# squares, p = b + c, s = p + d and r = a - s, so with dr, ds, dp the TwoSum errors of r, s
+# and p, R = r + dr - ds - dp + (t^2 - a) - (x^2 - b) - (y^2 - c) - (z^2 - d) exactly. Every
+# nonzero slot in [2^-485, 2^510) (a + s < 2^1020): each square's low part exactly (Veltkamp's
+# split, whose h^2 cannot overflow there), then every term 0 is an exact zero, +0. Level 2
+# (|R| below about 2^-50 (a + s): photons a rounding off the cone) adds the seven small terms
+# to r through a TwoSum chain with every error kept (all errors 0 and a zero sum: an exact
+# zero, +0). Its error is at most u |o| + 42.01 u^2 (|r| + 2^-50.99 (a + s)), u = 2^-53, so o
+# is returned when |o| > 2^-50 (|r| + 2^-50 (a + s)), which makes it at most 2^-50 |R|.
+# Otherwise -- deeper cancellation, a slot outside that range -- the exact sum, _lie_mk_exact.
+fn _lie_mk_rare(t, x, y, z, a, b, c, d, p, s, r) {
+    var as = f64_add(a, s);
+    var at = t & 0x7FFFFFFFFFFFFFFF;
+    var ax = x & 0x7FFFFFFFFFFFFFFF;
+    var ay = y & 0x7FFFFFFFFFFFFFFF;
+    var az = z & 0x7FFFFFFFFFFFFFFF;
+    if (f64_lt(as, _LIE_MK_HI) == 0 || (at != 0 && at < _LIE_MK_LO) || (ax != 0 && ax < _LIE_MK_LO)
+      || (ay != 0 && ay < _LIE_MK_LO) || (az != 0 && az < _LIE_MK_LO)) {
+        # A NaN slot: NaN (r, the plain formula's, as 3.4.0). An infinite slot: the extended-real
+        # value -- +Inf for an infinite t against finite spatial slots, -Inf the other way round,
+        # NaN (r: Inf - Inf) for both -- whatever the finite slots' squares do in floating point.
+        if (at > 0x7FF0000000000000 || ax > 0x7FF0000000000000 || ay > 0x7FF0000000000000
+          || az > 0x7FF0000000000000) {
+            return r;
+        }
+        var sinf = 0;
+        if (ax == 0x7FF0000000000000 || ay == 0x7FF0000000000000 || az == 0x7FF0000000000000) { sinf = 1; }
+        if (at == 0x7FF0000000000000) {
+            if (sinf == 1) { return r; }
+            return 0x7FF0000000000000;
+        }
+        if (sinf == 1) { return 0xFFF0000000000000; }
+        return _lie_mk_exact(t, x, y, z);
+    }
+    var bb = f64_sub(p, b);
+    var dp = f64_add(f64_sub(b, f64_sub(p, bb)), f64_sub(c, bb));
+    bb = f64_sub(s, p);
+    var ds = f64_add(f64_sub(p, f64_sub(s, bb)), f64_sub(d, bb));
+    bb = f64_sub(r, a);
+    var dr = f64_sub(f64_sub(a, f64_sub(r, bb)), f64_add(s, bb));
+    var w = f64_mul(t, _LIE_MK_SPLIT); var h = f64_sub(w, f64_sub(w, t)); var l = f64_sub(t, h);
+    var et = f64_add(f64_add(f64_sub(f64_mul(h, h), a), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    w = f64_mul(x, _LIE_MK_SPLIT); h = f64_sub(w, f64_sub(w, x)); l = f64_sub(x, h);
+    var ex = f64_add(f64_add(f64_sub(f64_mul(h, h), b), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    w = f64_mul(y, _LIE_MK_SPLIT); h = f64_sub(w, f64_sub(w, y)); l = f64_sub(y, h);
+    var ey = f64_add(f64_add(f64_sub(f64_mul(h, h), c), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    w = f64_mul(z, _LIE_MK_SPLIT); h = f64_sub(w, f64_sub(w, z)); l = f64_sub(z, h);
+    var ez = f64_add(f64_add(f64_sub(f64_mul(h, h), d), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    if (((r | dr | ds | dp | et | ex | ey | ez) & 0x7FFFFFFFFFFFFFFF) == 0) { return 0; }
+    var sg = f64_add(r, dr); var bw = f64_sub(sg, r);
+    var fe = f64_add(f64_sub(r, f64_sub(sg, bw)), f64_sub(dr, bw));
+    var ac = fe; var nz = fe;
+    var sn = f64_sub(sg, ds); bw = f64_sub(sn, sg);
+    fe = f64_sub(f64_sub(sg, f64_sub(sn, bw)), f64_add(ds, bw)); ac = f64_add(ac, fe); nz = nz | fe; sg = sn;
+    sn = f64_sub(sg, dp); bw = f64_sub(sn, sg);
+    fe = f64_sub(f64_sub(sg, f64_sub(sn, bw)), f64_add(dp, bw)); ac = f64_add(ac, fe); nz = nz | fe; sg = sn;
+    sn = f64_add(sg, et); bw = f64_sub(sn, sg);
+    fe = f64_add(f64_sub(sg, f64_sub(sn, bw)), f64_sub(et, bw)); ac = f64_add(ac, fe); nz = nz | fe; sg = sn;
+    sn = f64_sub(sg, ex); bw = f64_sub(sn, sg);
+    fe = f64_sub(f64_sub(sg, f64_sub(sn, bw)), f64_add(ex, bw)); ac = f64_add(ac, fe); nz = nz | fe; sg = sn;
+    sn = f64_sub(sg, ey); bw = f64_sub(sn, sg);
+    fe = f64_sub(f64_sub(sg, f64_sub(sn, bw)), f64_add(ey, bw)); ac = f64_add(ac, fe); nz = nz | fe; sg = sn;
+    sn = f64_sub(sg, ez); bw = f64_sub(sn, sg);
+    fe = f64_sub(f64_sub(sg, f64_sub(sn, bw)), f64_add(ez, bw)); ac = f64_add(ac, fe); nz = nz | fe; sg = sn;
+    if ((nz & 0x7FFFFFFFFFFFFFFF) == 0 && f64_eq(sg, 0) == 1) { return 0; }
+    var o = f64_add(sg, ac);
+    if (f64_lt(f64_mul(f64_add(f64_abs(r), f64_mul(as, _LIE_MK_R)), _LIE_MK_R), f64_abs(o)) == 1) { return o; }
+    return _lie_mk_exact(t, x, y, z);
+}
+
+# Minkowski interval: eta^{mu nu} v_mu v_nu = t^2 - x^2 - y^2 - z^2.
+# v is a pointer to 4 f64 values (t, x, y, z). For every finite vector, R the exact interval:
+# - the SIGN IS EXACT: > 0 timelike, < 0 spacelike, +0 exactly when R = 0 (lightlike; a photon
+#   on the cone included). A nonzero R never returns +-0: |R| below half the smallest
+#   subnormal gives +-2^-1074.
+# - |R| >= 2^-1022: relative error at most 2^-50 (under 8 ulps), and +-Inf exactly when R
+#   rounded to nearest overflows. |R| < 2^-1022: less than one subnormal step (2^-1074) off.
+# Not correctly rounded in general: off the light cone it is 3.4.0's plain formula, bit for
+# bit, wherever that formula's own error bound certifies 2^-50.
+# A NaN slot gives NaN. An infinite slot gives the extended-real value: +Inf for an infinite t
+# with finite spatial slots, -Inf the other way round, NaN when both sides are infinite. No
+# failure value: a 0 pointer is not checked.
 public fn minkowski_interval(v) {
     var t = load64(v);
     var x = load64(v + 8);
     var y = load64(v + 16);
     var z = load64(v + 24);
-    return f64_sub(f64_mul(t, t),
-      f64_add(f64_add(f64_mul(x, x), f64_mul(y, y)), f64_mul(z, z)));
+    var a = f64_mul(t, t);
+    var b = f64_mul(x, x);
+    var c = f64_mul(y, y);
+    var d = f64_mul(z, z);
+    var p = f64_add(b, c);
+    var s = f64_add(p, d);
+    var r = f64_sub(a, s);
+    # ⛔ 3.4.0 AND EARLIER -- t^2 - (x^2 + y^2 + z^2), each square rounded first, for every
+    # vector: past 2^511 a square overflows although the interval need not ((2^520, 2^520 (1 -
+    # 2^-53), 0, 0) was NaN for 2^988; (5, 3, 4, 1) 2^510 NaN for -2^1020), and near the light
+    # cone only the squares' roundings were left: photons a rounding off the cone came back 0,
+    # "lightlike", and a cancellation factor (a + 3 s) / |r| of 13 left it 9.86 u off.
+    # [measured: tests/modules_c.tcyr "3.4.1 LIE3: minkowski_interval" and tests/abuse.tcyr, baseline 3.4.0]
+    # ⛔ 3.4.1's first two forms: lane LIE kept the formula off the cone by a factor-2 test and
+    # called both paths correctly rounded (neither was); lane LIE2 rounded correctly, which needs
+    # every square's exact low part on every vector -- 78-80 ns for an ordinary vector, 10x 3.4.0,
+    # and 125-128 ns, 16x, for a photon a rounding off the cone. Not adopted.
+    # [measured: LIE2 lane direct-loop timing against 3.4.0, same boot, 2026-10-31]
+    # ⭐ 3.4.1 (lane LIE3) -- the contract above, by four paths. Direct loop, same boot, 3.4.0
+    # 7.5-8.4 ns: an ordinary vector 13.7-14.8 ns (the plain formula and its test, 1.8x); level 1
+    # 56-59 ns (7.4x); a photon a rounding off the cone (level 2) 128-137 ns (16-17x); (5, 3, 4,
+    # 0) 75-81 ns; the exact sum (slots past 2^511 or below 2^-485, deeper cancellation) 250-440
+    # ns. Of Gaussian 4-vectors 19.6% leave the plain formula (uniform: 26.4%); a stream of them
+    # costs 22.2-23.8 ns a call against 7.7-8.5 (2.9x).
+    # [measured: LIE3 lane tm2.cyr direct loop and tests/hisab.bcyr b41l3 rows, same boot; orc.py 1,060,168 vectors]
+    # The plain formula (3.4.0's, bit for bit) where its own a-priori bound certifies it. Each
+    # operation's rounding is at most u times its result (u = 2^-53), plus 2^-1075 for a square
+    # that underflows, so |r - R| <= u (1 + 2.01 u)(|r| + a + 3 s) + 4 2^-1075 (b + c + d and p
+    # are at most s (1 + 2.01 u)). r is returned when a + 3 s + 2^-1019 < 7 (1 - 2^-44) |r| in
+    # floating point -- the cancellation factor (a + 3 s) / |r| below 7 -- which makes the
+    # error at most 2^-50 |R|. A NaN or an overflow fails the test (strict: Inf < Inf is
+    # false), as does |r| below about 2^-1022.
+    if (f64_lt(f64_add(f64_add(a, f64_mul(s, _LIE_MK_THREE)), _LIE_MK_TP), f64_mul(f64_abs(r), _LIE_MK_KP)) == 1) {
+        return r;
+    }
+    # Level 1. R = r + dr - ds - dp + (t^2 - a) - (x^2 - b) - (y^2 - c) - (z^2 - d) exactly (dr,
+    # ds, dp: TwoSum errors). Each square's low part from the split v = h + l, h = v's top 26
+    # bits: ((h h - a) + 2 h l) + l l, exact but for l l's rounding, so within 2^-102.6 of the
+    # square (+ 3 2^-1075 where products underflow); never overflowing while a and s are
+    # finite. The seven small terms sum to at most 4.01 u (a + s), so the tree sum's error is
+    # at most 12.01 u^2 (a + s) and |R - o| <= u |o| + 2^-101.4 (a + s) + 2^-1071.4; o is
+    # returned when (a + s) 2^-50 + 2^-1019 < |o|, which makes that at most 2^-50 |R|.
+    var as = f64_add(a, s);
+    # |r| <= 2^-52 (a + s): level 1 cannot certify (|o - r| <= 4.02 u (a + s)), so straight on.
+    if (f64_le(f64_abs(r), f64_mul(as, _LIE_MK_SKIP)) == 1) { return _lie_mk_rare(t, x, y, z, a, b, c, d, p, s, r); }
+    var h = t & 0xFFFFFFFFF8000000;
+    var l = f64_sub(t, h);
+    var et = f64_add(f64_add(f64_sub(f64_mul(h, h), a), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    h = x & 0xFFFFFFFFF8000000; l = f64_sub(x, h);
+    var ex = f64_add(f64_add(f64_sub(f64_mul(h, h), b), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    h = y & 0xFFFFFFFFF8000000; l = f64_sub(y, h);
+    var ey = f64_add(f64_add(f64_sub(f64_mul(h, h), c), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    h = z & 0xFFFFFFFFF8000000; l = f64_sub(z, h);
+    var ez = f64_add(f64_add(f64_sub(f64_mul(h, h), d), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    var bb = f64_sub(p, b);
+    var dp = f64_add(f64_sub(b, f64_sub(p, bb)), f64_sub(c, bb));
+    bb = f64_sub(s, p);
+    var ds = f64_add(f64_sub(p, f64_sub(s, bb)), f64_sub(d, bb));
+    bb = f64_sub(r, a);
+    var dr = f64_sub(f64_sub(a, f64_sub(r, bb)), f64_add(s, bb));
+    var o = f64_add(r, f64_add(f64_sub(f64_sub(dr, ds), dp), f64_sub(f64_sub(et, ex), f64_add(ey, ez))));
+    if (f64_lt(f64_add(f64_mul(as, _LIE_MK_R), _LIE_MK_TP), f64_abs(o)) == 1) { return o; }
+    return _lie_mk_rare(t, x, y, z, a, b, c, d, p, s, r);
 }

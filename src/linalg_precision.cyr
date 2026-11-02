@@ -1,6 +1,6 @@
 # linalg_precision.cyr -- precision linear algebra algorithms
 # Usage: shipped inside dist/hisab.cyr; in-tree, include "src/linalg_precision.cyr" after what it requires
-# Requires: src/complex.cyr, src/error.cyr, src/f64_util.cyr, src/linalg_ext.cyr (stdlib via [deps]);
+# Requires: src/complex.cyr, src/error.cyr, src/f64_util.cyr, src/linalg_ext.cyr, src/num.cyr (stdlib via [deps]);
 #           linalg_ext since 3.2.0: its `linalg_sort_desc` (so named since 3.3.0) orders S / eigenvalues
 #
 # Alternatives to ganita's SVD and symmetric eigendecomposition, which linalg_ext's
@@ -479,7 +479,8 @@ fn _lp_cmat_min_abs(A) {
 # burned this project repeatedly is here the one that makes the guard complete.
 # ⚠ Written as "not finite" rather than "is Inf or is NaN" deliberately: the
 # two-test form invites someone to drop the NaN arm, which is exactly the mistake
-# `_opt_armijo` documents and which made 2.17.0's SVD figure wrong.
+# the optimizers' line search guards against (`_opt_wolfe_search` in src/optimize.cyr; until
+# 3.4.1 `_opt_armijo` documented it) and which made 2.17.0's SVD figure wrong.
 # ⚠ Rejecting is the honest contract here, matching the m < n precedent in
 # `svd_golub_kahan`: a matrix with a non-finite entry has no SVD and no spectrum,
 # and the caller's out_S / out_vals have nowhere to put "undefined".
@@ -1861,7 +1862,8 @@ public fn svd_golub_kahan(A, out_U, out_S, out_Vt) {
 #
 # A:        stdlib matrix (n x n, must be symmetric).
 # n:        matrix dimension.
-# max_iter: maximum QR iterations.
+# max_iter: maximum QR sweeps per attempt (3.4.1: spent only on a sweep, so 0 answers a
+#           matrix that needs none; see eigen_qr).
 # out_vals: flat f64 array of length n (caller allocates, receives eigenvalues,
 #           SORTED BY DESCENDING |lambda| -- step 3 below).
 # out_vecs: stdlib matrix (n x n, caller allocates, receives eigenvectors as
@@ -2112,7 +2114,12 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
     var fl = f64_from(0);
     if (lift == 2) { fl = _lp_floor_of(diag, n, offdiag, 1, n); }
 
-    while (p_hi > 0 && iter < max_iter) {
+    # ⛔ 3.4.1 — THE BUDGET WAS TESTED BEFORE THE DEFLATION, so max_iter 0 refused a T that
+    # needs no sweep (eigen_qr(diag(2, 1), 2, 0) was NO_CONVERGENCE), and a T whose last
+    # allowed sweep had converged was refused without reading it. Deflation costs no sweep: the
+    # budget is now spent only when a sweep is about to run. A run that ended Ok is unchanged.
+    # [measured: LA probe rep1, 3.4.0 base and this tree, cycc 6.7.18, 2026-10-31]
+    while (p_hi > 0) {
         if (lift == 2) { _lp_floor_zero(offdiag, 1, p_hi + 1, fl); }
         # Deflation: check if offdiag[p_hi] is negligible
         if (_lp_negligible(load64(offdiag + p_hi * 8),
@@ -2120,6 +2127,7 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
             store64(offdiag + p_hi * 8, f64_from(0));
             p_hi = p_hi - 1;
         } else {
+            if (iter >= max_iter) { return Err(HSB_ERR_NO_CONVERGENCE); }
             # Find p_lo: the start of the unreduced block containing p_hi.
             #
             # Through 2.7.0 this was two loops. The first had a FAKE break -- a
@@ -2320,10 +2328,6 @@ fn _lp_tridiag_qr(diag, offdiag, n, Q, max_iter, lift) {
             iter = iter + 1;
         }
     }
-
-    if (iter >= max_iter && p_hi > 0) {
-        return Err(HSB_ERR_NO_CONVERGENCE);
-    }
     return Ok(0);
 }
 
@@ -2519,7 +2523,9 @@ fn _lp_eig_attempt(A, n, sc, diag, offdiag, out_vecs, max_iter, lift) {
 # Public: QR iteration for symmetric eigendecomposition
 # A:        stdlib matrix (n x n, must be symmetric -- SHAPE ENFORCED, see below).
 # n:        matrix dimension.
-# max_iter: maximum QR iterations.
+# max_iter: maximum QR sweeps per attempt. Since 3.4.1 a sweep is counted only when one is about
+#           to run, so a matrix whose tridiagonal form deflates without one (any diagonal one) is
+#           answered at max_iter 0 or below, which through 3.4.0 was NO_CONVERGENCE.
 # out_vals: flat f64 array of length n (caller allocates).
 # out_vecs: stdlib matrix (n x n, caller allocates, eigenvectors as columns).
 # Returns:  Ok(0) on success, Err(HSB_ERR_NO_CONVERGENCE) if the last attempt exceeds
@@ -2717,12 +2723,42 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
 
     # Sort by descending |eigenvalue|, eigenvector columns of out_vecs carried
     # along -- the shared selection sort in src/linalg_ext.cyr, the same body
-    # eigen_symmetric runs, so the two cannot disagree on order (they did once;
-    # see eigen_symmetric's ORDERING note). Tie order is pinned in
+    # eigen_symmetric runs, so the two order distinct moduli alike (they did not
+    # once; see eigen_symmetric's ORDERING note, which also says why a +-lambda
+    # pair can still come back in different orders). Tie order is pinned in
     # tests/hisab.tcyr ("tie order" block).
     var _srt = linalg_sort_desc(out_vals, n, 1, out_vecs, n, 0, 0)?;
 
     return Ok(0);
+}
+
+# One Householder update of column j of the row-major X (re Xr, im Xi, `cols` columns), rows
+# k .. k + len - 1, by the reflector v (len complex, interleaved): dot = sum conj(v_i) x_i (from 0,
+# in order), coeff = dot * t, x_i <- x_i - coeff v_i. Each product is cx_mul's (re = ar br - ai bi,
+# im = ar bi + ai br, with conj(v_i) as (vr, -vi)), each sum cx_add's or cx_sub's, the scale
+# cx_scale's, so it is cqr_decompose's 3.4.0 loop bit for bit, on flat f64 (3.4.1).
+fn _lp_house_col(v, len, Xr, Xi, cols, k, j, t) {
+    var dr = f64_from(0);
+    var di = f64_from(0);
+    for (var i = 0; i < len; i = i + 1) {
+        var ar = load64(v + i * 16);
+        var ai = f64_neg(load64(v + i * 16 + 8));
+        var o = ((k + i) * cols + j) * 8;
+        var br = load64(Xr + o);
+        var bi = load64(Xi + o);
+        dr = f64_add(dr, f64_sub(f64_mul(ar, br), f64_mul(ai, bi)));
+        di = f64_add(di, f64_add(f64_mul(ar, bi), f64_mul(ai, br)));
+    }
+    var cr = f64_mul(dr, t);
+    var cim = f64_mul(di, t);
+    for (var i2 = 0; i2 < len; i2 = i2 + 1) {
+        var vr = load64(v + i2 * 16);
+        var vi = load64(v + i2 * 16 + 8);
+        var o2 = ((k + i2) * cols + j) * 8;
+        store64(Xr + o2, f64_sub(load64(Xr + o2), f64_sub(f64_mul(cr, vr), f64_mul(cim, vi))));
+        store64(Xi + o2, f64_sub(load64(Xi + o2), f64_add(f64_mul(cr, vi), f64_mul(cim, vr))));
+    }
+    return 0;
 }
 
 # ================================================================
@@ -2736,7 +2772,10 @@ public fn eigen_qr(A, n, max_iter, out_vals, out_vecs) {
 # out_R: complex matrix (m x n, caller allocates) -- SHAPE ENFORCED.
 # Returns: Ok(0) on success, Err(HSB_ERR_INVALID_INPUT) on a null handle, an
 #          out_Q / out_R that is not sized exactly m x m / m x n, or (since
-#          3.3.3) a non-finite real or imaginary part anywhere in A.
+#          3.3.3) a non-finite real or imaginary part anywhere in A, and (since
+#          3.4.1) Err(HSB_ERR_ALLOC) when its flat working copies or an element
+#          temporary cannot be allocated (out_Q and out_R are then partly written;
+#          through 3.4.0 a refused temporary was read through).
 # A is balanced by a power of two chosen from both ends (since 3.3.3, as
 # svd_golub_kahan and eigen_qr are) and R is rescaled on the way out; Q is
 # invariant. A subnormal entry of R rounds to the 2^-1074 grid on the way out.
@@ -2799,7 +2838,32 @@ public fn cqr_decompose(A, out_Q, out_R) {
     # 4x4 +3.1% (19.78 -> 20.39 us median, every new run slower than every old one),
     # 16x16 +1.2% and 64x64 +0.1%, both inside their own spread.
     # [measured: scratch cqr harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
-    if (_lp_cmat_all_finite(A, m, n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    # ⛔ 3.4.1 — EVERY ELEMENT AND EVERY PRODUCT WAS A FRESH HComplex (cmat_get, cx_mul, cx_add,
+    # cx_sub, cx_scale: a heap temporary each, none checked, so a refused one was read through,
+    # and the adjoint's whole matrix too). A is now read ONCE into two flat arrays, each element's
+    # temporary checked, every later step runs on flat f64 with each product and sum in cx_mul's,
+    # cx_add's, cx_sub's and cx_scale's own expression and order (so every bit is 3.4.0's), and
+    # out_R and out_Q are written once at the end, each element's temporary checked:
+    # Err(HSB_ERR_ALLOC) on any refusal, with out_R and out_Q then partly written.
+    # [measured: LA probe cqrdiff (random, graded and wide complex matrices), 3.4.0 base and this tree, 2026-10-31]
+    if (m > (ALLOC_MAX / 8) / n || m > (ALLOC_MAX / 8) / m) { return Err(HSB_ERR_ALLOC); }
+    var Rr = alloc(m * n * 8);
+    var Ri = alloc(m * n * 8);
+    var Qr = alloc(m * m * 8);
+    var Qi = alloc(m * m * 8);
+    if (Rr == 0 || Ri == 0 || Qr == 0 || Qi == 0) { return Err(HSB_ERR_ALLOC); }
+    for (var ci = 0; ci < m; ci = ci + 1) {
+        for (var cj = 0; cj < n; cj = cj + 1) {
+            var z = cmat_get(A, ci, cj);
+            if (z == 0) { return Err(HSB_ERR_ALLOC); }
+            store64(Rr + (ci * n + cj) * 8, HComplex_re(z));
+            store64(Ri + (ci * n + cj) * 8, HComplex_im(z));
+        }
+    }
+    for (var fq = 0; fq < m * n; fq = fq + 1) {
+        if (f64_lt(f64_abs(load64(Rr + fq * 8)), F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        if (f64_lt(f64_abs(load64(Ri + fq * 8)), F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    }
 
     # Balance on the way into out_R; undo it on R at the end. Q is invariant under
     # a positive rescale of A. Unbalanced, ||v||^2 = Inf made cx_abs(x1) = Inf,
@@ -2852,33 +2916,39 @@ public fn cqr_decompose(A, out_Q, out_R) {
     # same bits as 16 m on all four and pass every suite. 8 m is covered by the 5.5 m
     # bound; 2 m and 4 m are not, and no fixture here tells them apart from it.
     # [measured: scratch builds, growth 2 / 4 / 8 / m / 2 m / 4 m / 8 m / 16 m, not reproducible in-tree, 2026-10-01]
-    var sc = _lp_balance_pick(_lp_cmat_max_abs(A), _lp_cmat_min_abs(A), f64_from(16 * m));
+    # the scans of `_lp_cmat_max_abs` and `_lp_cmat_min_abs`, on the flat copy
+    var bmx = f64_from(0);
+    var blo = F64_POS_INF;
+    for (var bq = 0; bq < m * n; bq = bq + 1) {
+        for (var bp = 0; bp < 2; bp = bp + 1) {
+            var ba = f64_abs(load64(Rr + bq * 8));
+            if (bp == 1) { ba = f64_abs(load64(Ri + bq * 8)); }
+            if (f64_gt(ba, bmx) == 1) { bmx = ba; }
+            if (f64_gt(ba, 0) == 1) {
+                if (f64_lt(ba, blo) == 1) { blo = ba; }
+            }
+        }
+    }
+    var sc = _lp_balance_pick(bmx, blo, f64_from(16 * m));
 
     # Copy A into out_R
     var i = 0;
-    while (i < m) {
-        var j = 0;
-        while (j < n) {
-            var aij = cmat_get(A, i, j);
-            cmat_set(out_R, i, j, cx_new(f64_div(HComplex_re(aij), sc),
-                f64_div(HComplex_im(aij), sc)));
-            j = j + 1;
-        }
+    while (i < m * n) {
+        store64(Rr + i * 8, f64_div(load64(Rr + i * 8), sc));
+        store64(Ri + i * 8, f64_div(load64(Ri + i * 8), sc));
         i = i + 1;
     }
 
     # Initialize out_Q to m x m identity
     i = 0;
+    while (i < m * m) {
+        store64(Qr + i * 8, f64_from(0));
+        store64(Qi + i * 8, f64_from(0));
+        i = i + 1;
+    }
+    i = 0;
     while (i < m) {
-        var j = 0;
-        while (j < m) {
-            if (i == j) {
-                cmat_set(out_Q, i, j, cx_one());
-            } else {
-                cmat_set(out_Q, i, j, cx_zero());
-            }
-            j = j + 1;
-        }
+        store64(Qr + (i * m + i) * 8, F64_ONE);
         i = i + 1;
     }
 
@@ -2907,9 +2977,8 @@ public fn cqr_decompose(A, out_Q, out_R) {
         var v = vbuf;
         i = 0;
         while (i < len) {
-            var elem = cmat_get(out_R, k + i, k);
-            store64(v + i * 16, HComplex_re(elem));
-            store64(v + i * 16 + 8, HComplex_im(elem));
+            store64(v + i * 16, load64(Rr + ((k + i) * n + k) * 8));
+            store64(v + i * 16 + 8, load64(Ri + ((k + i) * n + k) * 8));
             i = i + 1;
         }
 
@@ -2963,8 +3032,10 @@ public fn cqr_decompose(A, out_Q, out_R) {
         # `_lp_bidiagonalize`.
         if (f64_gt(norm, 0) == 1) {
             # Complex sign: sign(x1) = x1 / |x1| if x1 != 0, else 1
-            var x1 = cx_new(load64(v), load64(v + 8));
-            var phase = cx_one();
+            var x1r = load64(v);
+            var x1i = load64(v + 8);
+            var phr = F64_ONE;
+            var phi = f64_from(0);
             # ⛔ 2.22.0 — an absolute 1e-12 decided whether a PHASE was computed at
             # all, and the fallback was phase = 1, so a small-but-perfectly-good x1
             # got the WRONG phase rather than no phase.
@@ -2990,15 +3061,21 @@ public fn cqr_decompose(A, out_Q, out_R) {
             # representable. The direction has to be one whose modulus is off the
             # grid — the acceptance test uses (1,1).
             # [measured: 1075-row phase sweep, 3 trees + an isolating revert, 2026-09-11]
-            var px = f64_abs(HComplex_re(x1));
-            var py = f64_abs(HComplex_im(x1));
+            var px = f64_abs(x1r);
+            var py = f64_abs(x1i);
             var pmx = px;
             if (f64_gt(py, pmx) == 1) { pmx = py; }
             if (f64_gt(pmx, 0) == 1) {
-                var xs = cx_new(f64_div(HComplex_re(x1), pmx), f64_div(HComplex_im(x1), pmx));
+                var xs = cx_new(f64_div(x1r, pmx), f64_div(x1i, pmx));
+                if (xs == 0) { return Err(HSB_ERR_ALLOC); }
                 var abs_xs = cx_abs(xs);
                 if (f64_gt(abs_xs, 0) == 1) {
-                    phase = cx_div(xs, cx_real(abs_xs));
+                    var rabs = cx_real(abs_xs);
+                    if (rabs == 0) { return Err(HSB_ERR_ALLOC); }
+                    var phase = cx_div(xs, rabs);
+                    if (phase == 0) { return Err(HSB_ERR_ALLOC); }
+                    phr = HComplex_re(phase);
+                    phi = HComplex_im(phase);
                 }
             }
             # (Through 3.3.2 a dead `var abs_x1 = cx_abs(x1);` stood here: 2.23.0 moved
@@ -3008,10 +3085,9 @@ public fn cqr_decompose(A, out_Q, out_R) {
             # [measured: scratch Q/R bit hash, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
 
             # v[0] += phase * ||v||
-            var shift = cx_scale(phase, norm);
-            var new_v0 = cx_add(x1, shift);
-            store64(v, HComplex_re(new_v0));
-            store64(v + 8, HComplex_im(new_v0));
+            # x1 + phase * norm (cx_scale, then cx_add)
+            store64(v, f64_add(x1r, f64_mul(phr, norm)));
+            store64(v + 8, f64_add(x1i, f64_mul(phi, norm)));
 
             # ⛔ 2.23.0 — THE FOURTH REFLECTOR, AND 2.22.1 REPAIRED ONLY THREE.
             # That release normalised `v` in `_lp_bidiagonalize` (both sides) and
@@ -3069,24 +3145,7 @@ public fn cqr_decompose(A, out_Q, out_R) {
                 # Apply H to out_R: R[k:m, k:n] -= (2/vHv) * v * (v^H * R[k:m, k:n])
                 var j = k;
                 while (j < n) {
-                    # dot = v^H * R[:, j] (complex dot product with conjugate of v)
-                    var dot = cx_zero();
-                    i = 0;
-                    while (i < len) {
-                        var vi_conj = cx_conj(cx_new(load64(v + i * 16),
-                            load64(v + i * 16 + 8)));
-                        var rij = cmat_get(out_R, k + i, j);
-                        dot = cx_add(dot, cx_mul(vi_conj, rij));
-                        i = i + 1;
-                    }
-                    var coeff = cx_scale(dot, two_over_vhv);
-                    i = 0;
-                    while (i < len) {
-                        var vi = cx_new(load64(v + i * 16), load64(v + i * 16 + 8));
-                        var rij = cmat_get(out_R, k + i, j);
-                        cmat_set(out_R, k + i, j, cx_sub(rij, cx_mul(coeff, vi)));
-                        i = i + 1;
-                    }
+                    _lp_house_col(v, len, Rr, Ri, n, k, j, two_over_vhv);
                     j = j + 1;
                 }
 
@@ -3094,23 +3153,7 @@ public fn cqr_decompose(A, out_Q, out_R) {
                 # We accumulate Q^H, then transpose at the end.
                 j = 0;
                 while (j < m) {
-                    var dot = cx_zero();
-                    i = 0;
-                    while (i < len) {
-                        var vi_conj = cx_conj(cx_new(load64(v + i * 16),
-                            load64(v + i * 16 + 8)));
-                        var qij = cmat_get(out_Q, k + i, j);
-                        dot = cx_add(dot, cx_mul(vi_conj, qij));
-                        i = i + 1;
-                    }
-                    var coeff = cx_scale(dot, two_over_vhv);
-                    i = 0;
-                    while (i < len) {
-                        var vi = cx_new(load64(v + i * 16), load64(v + i * 16 + 8));
-                        var qij = cmat_get(out_Q, k + i, j);
-                        cmat_set(out_Q, k + i, j, cx_sub(qij, cx_mul(coeff, vi)));
-                        i = i + 1;
-                    }
+                    _lp_house_col(v, len, Qr, Qi, m, k, j, two_over_vhv);
                     j = j + 1;
                 }
             }
@@ -3124,7 +3167,8 @@ public fn cqr_decompose(A, out_Q, out_R) {
     while (i < m) {
         var j = 0;
         while (j < n) {
-            cmat_set(out_R, i, j, cx_scale(cmat_get(out_R, i, j), sc));
+            store64(Rr + (i * n + j) * 8, f64_mul(load64(Rr + (i * n + j) * 8), sc));
+            store64(Ri + (i * n + j) * 8, f64_mul(load64(Ri + (i * n + j) * 8), sc));
             j = j + 1;
         }
         i = i + 1;
@@ -3150,22 +3194,28 @@ public fn cqr_decompose(A, out_Q, out_R) {
     while (i < m) {
         var jz = 0;
         while (jz < n) {
-            if (jz < i) { cmat_set(out_R, i, jz, cx_zero()); }
+            if (jz < i) {
+                store64(Rr + (i * n + jz) * 8, f64_from(0));
+                store64(Ri + (i * n + jz) * 8, f64_from(0));
+            }
             jz = jz + 1;
         }
         i = i + 1;
     }
 
     # Q has accumulated H_k ... H_1. Take conjugate transpose to get Q where A = QR.
-    var Qt = cmat_adjoint(out_Q);
-    i = 0;
-    while (i < m) {
-        var j = 0;
-        while (j < m) {
-            cmat_set(out_Q, i, j, cmat_get(Qt, i, j));
-            j = j + 1;
+    # out_R as it stands, and out_Q = Q^H (cmat_adjoint's conj(Q_ji) at (i, j))
+    for (var wi = 0; wi < m; wi = wi + 1) {
+        for (var wj = 0; wj < n; wj = wj + 1) {
+            var zr = cx_new(load64(Rr + (wi * n + wj) * 8), load64(Ri + (wi * n + wj) * 8));
+            if (zr == 0) { return Err(HSB_ERR_ALLOC); }
+            cmat_set(out_R, wi, wj, zr);
         }
-        i = i + 1;
+        for (var wk = 0; wk < m; wk = wk + 1) {
+            var zq = cx_new(load64(Qr + (wk * m + wi) * 8), f64_neg(load64(Qi + (wk * m + wi) * 8)));
+            if (zq == 0) { return Err(HSB_ERR_ALLOC); }
+            cmat_set(out_Q, wi, wk, zq);
+        }
     }
 
     return Ok(0);

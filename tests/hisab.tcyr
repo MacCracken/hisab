@@ -23,9 +23,12 @@ include "src/linalg_precision.cyr"
 include "src/lie.cyr"
 include "src/diffgeo.cyr"
 include "src/symbolic.cyr"
+include "src/symbolic_ext.cyr"
 include "src/autodiff.cyr"
 include "src/interval.cyr"
 include "src/tensor.cyr"
+include "src/collision_core.cyr"
+include "src/collision_mesh.cyr"
 
 # ~1e-8 — for iterative / decomposition results where exact bit equality is not
 # achievable but 8 significant digits is.
@@ -538,9 +541,17 @@ var cga_sum = cga_mv_add(cga_project(cga_x, cga_e12), cga_reject(cga_x, cga_e12)
 assert_eq(cga_mv_get(cga_sum, 1), f64_from(1), "cga project+reject = X (e1 part)");
 assert_eq(cga_mv_get(cga_sum, 3), f64_from(1), "cga project+reject = X (e3 part)");
 
-# Null-blade guard: projecting onto a degenerate (zero) blade returns 0, no trap.
+# Null-blade guard: the zero blade has no inverse, so there is no projection onto
+# it. Through 3.4.0 this asserted the answer was the zero multivector, which is the
+# projection of a vector ORTHOGONAL to a blade; since 3.4.1 every coefficient is NaN
+# (AU2-G1-F1), and no trap.
 var cga_pnull = cga_project(cga_e1, cga_mv_zero());
-assert_f64_eq(cga_norm(cga_pnull), f64_from(0), "cga project onto null blade = 0");
+var cga_pnull_nan = 0;
+for (var cga_pni = 0; cga_pni < 32; cga_pni = cga_pni + 1) {
+    var cga_pnv = cga_mv_get(cga_pnull, cga_pni);
+    if (f64_eq(cga_pnv, cga_pnv) == 0) { cga_pnull_nan = cga_pnull_nan + 1; }
+}
+assert_eq(cga_pnull_nan, 32, "cga project onto the zero blade: NaN in all 32 slots (3.4.0: 0)");
 
 # ================================================================
 # Calc — integration, easing
@@ -1336,7 +1347,7 @@ fn _lmr_jac(x_ptr, out) {
 }
 var _lmr_x = alloc(16);
 var _rq64t, _rq64v = opt_levenberg_marquardt(&_lmr_res, &_lmr_jac, _or_x0, 2, 2, _ob_tol8, 200, _lmr_x);
-assert_eq(is_ok(_rq64t), 1, "opt_levenberg_marquardt: Rosenbrock LS converges in 200 iterations (needs 51)");
+assert_eq(is_ok(_rq64t), 1, "opt_levenberg_marquardt: Rosenbrock LS converges in 200 iterations (needs 36)");
 assert(f64_lt(f64_abs(f64_sub(load64(_lmr_x), F64_ONE)), opt_tol6) == 1, "opt_lm rosenbrock x -> 1");
 assert(f64_lt(f64_abs(f64_sub(load64(_lmr_x + 8), F64_ONE)), opt_tol6) == 1,
   "opt_lm rosenbrock y -> 1");
@@ -1367,14 +1378,17 @@ var _lmr_xf = alloc(16);
 _LMR_CALLS = 0;
 var _rq64ft, _rq64fv = opt_levenberg_marquardt(&_lmr_count, &_lmr_jac, _or_x0, 2, 2, _ob_tol8, 200, _lmr_xf);
 var _lmr_fresh_calls = _LMR_CALLS;
-assert_eq(_lmr_fresh_calls, 51, "opt_lm Rosenbrock, fresh buffers: 51 residual calls");
-assert_eq(load64(_lmr_xf), 0x3FEFFFFFFB71CE39, "opt_lm Rosenbrock, fresh buffers: x0 bits");
-assert_eq(load64(_lmr_xf + 8), 0x3FEFFFFFF6C038EF, "opt_lm Rosenbrock, fresh buffers: x1 bits");
+# 3.4.1: the damping is relative (mu max diag J^T J, see src/optimize.cyr), and the path moved:
+# 36 residual calls (3.4.0: 51), stopping at 1 - 1.6e-10 and 1 - 3.2e-10 (3.4.0: 1 - 8.5e-9 and
+# 1 - 1.7e-8), both met by ||r|| < 1e-8.
+assert_eq(_lmr_fresh_calls, 36, "opt_lm Rosenbrock, fresh buffers: 36 residual calls (3.4.0: 51)");
+assert_eq(load64(_lmr_xf), 0x3FEFFFFFFFEA425E, "opt_lm Rosenbrock, fresh buffers: x0 bits");
+assert_eq(load64(_lmr_xf + 8), 0x3FEFFFFFFFD45A69, "opt_lm Rosenbrock, fresh buffers: x1 bits");
 var _lmr_xr = alloc(16);
 _LMR_CALLS = 0;
 var _rq64rt, _rq64rv = opt_levenberg_marquardt(&_lmr_reuse, &_lmr_jac, _or_x0, 2, 2, _ob_tol8, 200, _lmr_xr);
 assert_eq(is_ok(_rq64rt), 1, "opt_lm Rosenbrock, one reused residual buffer: Ok");
-assert_eq(_LMR_CALLS, _lmr_fresh_calls, "opt_lm, one reused residual buffer: the fresh run's 51 calls (3.3.3: 144)");
+assert_eq(_LMR_CALLS, _lmr_fresh_calls, "opt_lm, one reused residual buffer: the fresh run's calls (3.3.3: 144)");
 assert_eq(load64(_lmr_xr), load64(_lmr_xf), "opt_lm, one reused residual buffer: x0 is the fresh run's, bit for bit");
 assert_eq(load64(_lmr_xr + 8), load64(_lmr_xf + 8),
   "opt_lm, one reused residual buffer: x1 is the fresh run's, bit for bit");
@@ -1485,7 +1499,8 @@ assert(f64_lt(f64_abs(f64_sub(load64(_mt180_x + 8), 0x3FF62BE2BE2BE2BE)), _lmf_t
 assert(f64_lt(f64_abs(f64_sub(load64(_mt180_x + 16), 0xBFB2492492492492)), _lmf_tol9) == 1,
   "opt_lm quadratic fit: c == -1/14 (exact normal-equation solution)");
 
-# (e) _opt_armijo's BACKTRACKING, shared by BFGS, L-BFGS and CG. The two
+# (e) the LINE SEARCH's step control (2.8.3: _opt_armijo's backtrack, shared by BFGS, L-BFGS
+# and CG; since 3.4.1 all three take _opt_wolfe_search, and _opt_armijo is gone). The two
 # problems above do not need it: disabling the halving (alpha pinned at 1) left
 # all 27 assertions green, because a unit step happens to be survivable on both.
 # f(x) = x^4 + x^2 is not survivable. From x0 = 3 the gradient is 4*27 + 6 = 114,
@@ -1611,59 +1626,43 @@ assert_eq(_cg7_run(0 - 600, 0), 1, "opt_conjugate_gradient: k = 2^-600 converges
 assert_eq(_cg7_scaled(0 - 600, _cg7_u0, _cg7_u1), 1,
   "opt_conjugate_gradient: k = 2^-600 -> 2^-600 times the k = 1 answer");
 # BFGS and L-BFGS reached (k, 2k) at 2^500 in 3.3.6 too, after the 40 halvings on their first
-# step: 52 and 50 evaluations of f. They now take the k = 1 path: 30 and 28.
+# step: 52 and 50 evaluations of f. 3.3.7 took the k = 1 path: 30 and 28.
 assert_eq(_cg7_run(500, 1), 1, "opt_bfgs: k = 2^500 converges");
-assert_eq(load64(_cg7_ox), (1023 + 500) << 52, "opt_bfgs: k = 2^500 -> x0 = k exactly");
-assert_eq(_CG7_NF, 30, "opt_bfgs: k = 2^500 evaluates f 30 times, as at k = 1 (3.3.6: 52)");
+assert_eq(load64(_cg7_ox), 0x5F30000000000000, "opt_bfgs: k = 2^500 -> x0 = k exactly");
 assert_eq(_cg7_run(500, 2), 1, "opt_lbfgs: k = 2^500 converges");
 assert_eq(load64(_cg7_ox + 8), (1023 + 501) << 52, "opt_lbfgs: k = 2^500 -> x1 = 2k exactly");
-# 3.4.0: opt_lbfgs's step is _opt_wolfe_search's (the unit step first; a trial that fails
-# Armijo where f measures it costs f alone): 9 values of f and 9 gradients at 2^500, where the
-# unit step's f overflows and the slopes decide; 16 and 10 at k = 1 (3.3.7: 28 and 6 at both;
-# 3.4.0's first form: 9 and 9 at both).
-# [measured: scratch probe (NU1-work/p/plb.cyr), 3.3.7, integ-snap5 and this tree, 2026-10-31]
-assert_eq(_CG7_NF, 9, "opt_lbfgs: k = 2^500 evaluates f 9 times (3.3.7: 28; 3.3.6: 50)");
+# 3.4.1 (second review): the power-of-two path invariance 3.3.7 had is back, and exact, for both.
+# Their first trial (_opt_qn_first) is a length read from x, f and g that a power of two scales
+# exactly, and H's first scale (eq. 6.20 / 7.20) is a ratio of the pair's, so the run at 2^e is
+# the k = 1 run times 2^e, bit for bit and evaluation for evaluation, at every e from -514 to
+# 495: 9 values of f and 8 gradients, x = (1, 2) k exactly. Outside that, trials past the minimum
+# overflow f (2^496 up: 11 values of f at 2^500, x0 = k exactly) or f(x0), which the first trial
+# reads, is subnormal (from 2^-515), and the path moves. (3.4.0: 30 at both 2^500 and 1 for BFGS;
+# L-BFGS 9 at 2^500 and 16 at 1; the first 3.4.1 forms: 9 and 5, 9 and 16, invariant at no scale.)
+# [measured: scratch scale probe (NUM3-work cg7inv.cyr), e = -1074..1023, this tree, 2026-11-01]
+assert_eq(_cg7_run(0, 1), 1, "opt_bfgs: k = 1 converges");
+assert_eq(load64(_cg7_ox), F64_ONE, "opt_bfgs: k = 1 -> x0 = 1 exactly");
+assert_eq(load64(_cg7_ox + 8), F64_TWO, "opt_bfgs: k = 1 -> x1 = 2 exactly");
+assert_eq(_CG7_NF, 9, "opt_bfgs: k = 1 evaluates f 9 times (3.4.0: 30)");
 assert_eq(_cg7_run(0, 2), 1, "opt_lbfgs: k = 1 converges");
-assert_eq(_CG7_NF, 16, "opt_lbfgs: k = 1 evaluates f 16 times (3.3.7: 28)");
-# _opt_armijo asked directly. (b) f = 2^12 x^2 at x = 2^500 along d = -g = -2^513: d.g = -2^1026
-# overflows; exact Armijo halves to alpha = 2^-13, where x + alpha d = 0, the minimiser, after 14
-# evaluations (alpha 2^-12 gives f(-2^500) = f(x), above the threshold). 3.3.6: no step
-# passed the -Inf threshold, and the fallback took 2^-40. (c) f = x at DBL_MAX along the
-# non-descent d = 2^1000: the threshold DBL_MAX + 1e-4 alpha 2^1000 rounds to +Inf, and 3.3.6
-# took alpha = 1 to f = +Inf; the first step that keeps f finite is alpha = 2^-31 (2^969 is
-# under half an ulp of DBL_MAX, 2^970 a tie that rounds up to +Inf), which then ties.
-fn _cg7_quad(x) {
-    _CG7_NF = _CG7_NF + 1;
-    var v = load64(x);
-    return f64_mul(0x40B0000000000000, f64_mul(v, v));                     # 2^12 x^2
+assert_eq(load64(_cg7_ox), F64_ONE, "opt_lbfgs: k = 1 -> x0 = 1 exactly");
+assert_eq(_CG7_NF, 9, "opt_lbfgs: k = 1 evaluates f 9 times (3.4.0: 16; 3.3.7: 28)");
+var _CG7_INV = 0;
+for (var _cg7_s = 1; _cg7_s <= 2; _cg7_s = _cg7_s + 1) {
+    for (var _cg7_ie = 0 - 514; _cg7_ie <= 495; _cg7_ie = _cg7_ie + 1) {
+        if (_cg7_run(_cg7_ie, _cg7_s) != 1) { _CG7_INV = _CG7_INV + 1; }
+        if (_CG7_NF != 9) { _CG7_INV = _CG7_INV + 1; }
+        if (_cg7_scaled(_cg7_ie, F64_ONE, F64_TWO) != 1) { _CG7_INV = _CG7_INV + 1; }
+    }
 }
-fn _cg7_lin(x) {
-    _CG7_NF = _CG7_NF + 1;
-    return load64(x);
-}
-var _cg7_ax = alloc(8);
-var _cg7_ad = alloc(8);
-var _cg7_ag = alloc(8);
-var _cg7_at = alloc(8);
-store64(_cg7_ax, 0x5F30000000000000);                                       # 2^500
-store64(_cg7_ag, 0x6000000000000000);                                       # 2^513
-store64(_cg7_ad, 0xE000000000000000);                                       # -2^513
-_CG7_NF = 0;
-assert_eq(_opt_armijo(&_cg7_quad, _cg7_ax, _cg7_ad, _cg7_ag, 1, 0x7F30000000000000, _cg7_at), 0x3F20000000000000,
-  "_opt_armijo: d.g = -2^1026 overflows -> alpha = 2^-13 (3.3.6: the 2^-40 fallback)");
-assert_eq(load64(_cg7_at), 0, "_opt_armijo: ... and x_trial is the minimiser 0 (3.3.6: 0x5F2FFFFFFC000000)");
-assert_eq(_CG7_NF, 14, "_opt_armijo: ... after 14 evaluations of f (3.3.6: 40)");
-store64(_cg7_ax, 0x7FEFFFFFFFFFFFFF);                                       # DBL_MAX
-store64(_cg7_ag, F64_ONE);
-store64(_cg7_ad, 0x7E70000000000000);                                       # 2^1000
-_CG7_NF = 0;
-assert_eq(_opt_armijo(&_cg7_lin, _cg7_ax, _cg7_ad, _cg7_ag, 1, 0x7FEFFFFFFFFFFFFF, _cg7_at), 0x3E00000000000000,
-  "_opt_armijo: a step from f = DBL_MAX to +Inf is refused -> alpha = 2^-31 (3.3.6: 1)");
-assert_eq(load64(_cg7_at), 0x7FEFFFFFFFFFFFFF, "_opt_armijo: ... x_trial stays DBL_MAX (3.3.6: +Inf)");
-# From a NaN f_old the threshold is NaN, and the 3.3.3 rule still takes the first step whose
-# f_new is not NaN, +Inf included.
-assert_eq(_opt_armijo(&_cg7_lin, _cg7_ax, _cg7_ad, _cg7_ag, 1, 0x7FF8000000000000, _cg7_at), F64_ONE,
-  "_opt_armijo: f_old NaN -> the step to +Inf is taken, alpha = 1, as before");
+assert_eq(_CG7_INV, 0,
+  "opt_bfgs / opt_lbfgs: k = 2^-514 .. 2^495 -> (k, 2k) exactly in the k = 1 run's 9 values of f (3.4.0: not at one)");
+assert_eq(_cg7_run(500, 1), 1, "opt_bfgs: k = 2^500 converges (again, for the count)");
+assert_eq(_CG7_NF, 11, "opt_bfgs: k = 2^500 evaluates f 11 times, where trials past the minimum overflow f");
+# 3.4.1: _opt_armijo is gone (opt_bfgs was its last caller; see src/optimize.cyr), and with it
+# the six assertions that asked it directly, about its 3.3.7 d.g and +Inf repairs; the same
+# fixtures through opt_bfgs are in tests/edge_cases.tcyr, group "3.4.1: opt_bfgs on the
+# strong-Wolfe search".
 _CG7_K = F64_ONE;
 
 # ================================================================
@@ -3031,8 +3030,10 @@ for (var _sk_e = 0; _sk_e < 250; _sk_e = _sk_e + 1) {
         _SK_BAD = _SK_BAD + 1;
     }
 }
-# ⚠ 250 and not more: denom is k^4, so past ~2^-255 it goes subnormal and the
-# limitation becomes f64's, not this function's.
+# ⚠ 250 here. Through 3.4.0 this said that past ~2^-255 denom = k^4 goes subnormal and
+# "the limitation becomes f64's" -- it was this function's: dividing u and v by their
+# largest components is exact, and since 3.4.1 sectional_curvature does, so K = 1 at
+# every pair of scales 2^-1074 .. 2^1023 (tests/abuse.tcyr "3.4.1: sectional_curvature").
 assert_eq(_SK_RUN, 250, "the sectional_curvature scale sweep actually ran 250 scales");
 assert_eq(_SK_BAD, 0,
   "sectional_curvature: K = 1 for the same plane at every spanning-vector scale");
@@ -3763,19 +3764,19 @@ fn _cq_run(e, R) {
 var _cq_R = cmat_new(3, 3);
 # The first scale the shipped tree got wrong. |R11| must be 5c EXACTLY: the first
 # column of the scaled block is (3c, 4c), norm 5c, and c is a power of two.
-assert_eq(_cq_run(515, _cq_R), HSB_ERR_NONE, "cqr 2^-515: reports success");
+assert_eq(is_ok(_cq_run(515, _cq_R)), 1, "cqr 2^-515: reports success");
 assert_eq(cx_abs(cmat_get(_cq_R, 1, 1)), f64_mul(f64_from(5), (1023 - 515) << 52),
   "cqr 2^-515: |R11| is EXACTLY 5c (2.22.1 returned 3c -- the reflector was skipped)");
 assert_eq(HComplex_re(cmat_get(_cq_R, 2, 1)), 0,
   "cqr 2^-515: R is upper triangular (2.22.1 left R21 = 4c, i.e. R == A)");
 # ⚠ And far deeper, so this cannot pass by a threshold moved one binade.
-assert_eq(_cq_run(1000, _cq_R), HSB_ERR_NONE, "cqr 2^-1000: reports success");
+assert_eq(is_ok(_cq_run(1000, _cq_R)), 1, "cqr 2^-1000: reports success");
 assert_eq(cx_abs(cmat_get(_cq_R, 1, 1)), f64_mul(f64_from(5), (1023 - 1000) << 52),
   "cqr 2^-1000: |R11| still exactly 5c, 485 binades below the old cliff");
 assert_eq(HComplex_re(cmat_get(_cq_R, 2, 1)), 0, "cqr 2^-1000: still upper triangular");
 # ⚠ CONTROL above the boundary, so the four above cannot pass on a routine that
 # has merely become uniformly different.
-assert_eq(_cq_run(100, _cq_R), HSB_ERR_NONE, "cqr 2^-100 (control): reports success");
+assert_eq(is_ok(_cq_run(100, _cq_R)), 1, "cqr 2^-100 (control): reports success");
 assert_eq(cx_abs(cmat_get(_cq_R, 1, 1)), f64_mul(f64_from(5), (1023 - 100) << 52),
   "cqr 2^-100 (control): exactly 5c, as it already was");
 
@@ -3813,10 +3814,10 @@ fn _cq_ph(sub, R) {
 
 # ⚠ `1 << k` is the SUBNORMAL form and is only that for k <= 51; above it the bit
 # pattern exceeds 2^52 and is an ordinary NORMAL double. 40 gives 2^-1034.
-assert_eq(_cq_ph(1 << 40, _cq_R), HSB_ERR_NONE, "cqr [1] (+) 2^-1034 block: reports success");
+assert_eq(is_ok(_cq_ph(1 << 40, _cq_R)), 1, "cqr [1] (+) 2^-1034 block: reports success");
 assert_eq(HComplex_re(cmat_get(_cq_R, 2, 1)), 0,
   "cqr [1] (+) 2^-1034 block: R21 is 0 (zeroed by contract since 2.23.0; 2.22.0 left A[2][1])");
-assert_eq(_cq_ph(1 << 4, _cq_R), HSB_ERR_NONE, "cqr [1] (+) 2^-1070 block: reports success");
+assert_eq(is_ok(_cq_ph(1 << 4, _cq_R)), 1, "cqr [1] (+) 2^-1070 block: reports success");
 assert_eq(HComplex_re(cmat_get(_cq_R, 2, 1)), 0,
   "cqr [1] (+) 2^-1070 block: R21 is 0 (zeroed by contract; the balance lifts x1, no phase test)");
 
@@ -4133,7 +4134,7 @@ fn _rr_run(which, S) {
 
 var _rr_S = alloc(32);
 # --- k = 0 call site
-assert_eq(_rr_run(0, _rr_S), HSB_ERR_NONE, "svd right-reflector k=0: reports success");
+assert_eq(is_ok(_rr_run(0, _rr_S)), 1, "svd right-reflector k=0: reports success");
 assert_eq(f64_gt(load64(_rr_S + 8), load64(_rr_S + 16)), 1,
   "svd right-reflector k=0: S1 > S2 (2.21.0 returned all three EQUAL)");
 assert_eq(f64_gt(load64(_rr_S + 16), load64(_rr_S + 24)), 1,
@@ -4144,12 +4145,12 @@ assert_eq(f64_approx_eq(f64_div(f64_div(f64_sub(load64(_rr_S + 8), load64(_rr_S 
   "svd right-reflector k=0: the relative spread is t/c = 2^-21, as the closed form says");
 
 # --- k = 1 call site, which a k=0 fixture does not reach
-assert_eq(_rr_run(1, _rr_S), HSB_ERR_NONE, "svd right-reflector k=1: reports success");
+assert_eq(is_ok(_rr_run(1, _rr_S)), 1, "svd right-reflector k=1: reports success");
 assert_eq(f64_gt(load64(_rr_S + 8), load64(_rr_S + 24)), 1,
   "svd right-reflector k=1: the spread survives at the OTHER call site too");
 
 # --- vtv_r subnormal: the band the gate repair alone cannot reach
-assert_eq(_rr_run(2, _rr_S), HSB_ERR_NONE, "svd right-reflector, vtv_r subnormal: success");
+assert_eq(is_ok(_rr_run(2, _rr_S)), 1, "svd right-reflector, vtv_r subnormal: success");
 assert_eq(f64_gt(load64(_rr_S + 8), load64(_rr_S + 24)), 1,
   "svd right-reflector: spread survives where vtv_r is SUBNORMAL (2.22.0 lost it too)");
 
@@ -4720,15 +4721,21 @@ ganita_mat_set(es6_N, 1, 1, 0xFFF0000000000000);
 var es6_r8t, es6_r8v = eigen_symmetric(es6_N, 2, es6_nv, ganita_mat_new(2, 2));
 assert_eq(es6_r8v, HSB_ERR_INVALID_INPUT, "eigen_symmetric diag(1, -Inf) -> INVALID_INPUT");
 
-# ganita's own allocation failure is ALLOC: with ALLOC_MAX at 47 its 48-byte working copy
-# of a 2 x 2 fails (-2 from ganita through 1.2.11, which is cyrius 6.6.14's; -1 from 1.2.12).
+# The working copy's allocation failure is ALLOC. Through 3.4.0 that copy was ganita's (48 bytes
+# for a 2 x 2, refused at ALLOC_MAX 47: -2 from ganita through 1.2.11, -1 from 1.2.12); since
+# 3.4.1 the Jacobi is hisab's own and its copies are n^2 words, 32 bytes here: ALLOC_MAX 31 refuses
+# them (through the derived bound n > (ALLOC_MAX / 8) / n, ahead of alloc) and 32 admits them.
 var es6_av = alloc(16);
 var es6_aV = ganita_mat_new(2, 2);
 var es6_keep = ALLOC_MAX;
-ALLOC_MAX = 47;
+ALLOC_MAX = 31;
 var es6_r9t, es6_r9v = eigen_symmetric(es6_A, 2, es6_av, es6_aV);
 ALLOC_MAX = es6_keep;
-assert_eq(es6_r9v, HSB_ERR_ALLOC, "eigen_symmetric: ganita's working copy refused -> ALLOC (3.3.5: NO_CONVERGENCE)");
+assert_eq(es6_r9v, HSB_ERR_ALLOC, "eigen_symmetric: the working copy refused -> ALLOC (3.3.5: NO_CONVERGENCE)");
+ALLOC_MAX = 32;
+var es6_r9bt, es6_r9bv = eigen_symmetric(es6_A, 2, es6_av, es6_aV);
+ALLOC_MAX = es6_keep;
+assert_eq(is_ok(es6_r9bt), 1, "eigen_symmetric: ALLOC_MAX 32 admits the 32-byte copies -> Ok");
 
 # Control: the same diag(1, 2) at its own n answers, sorted.
 var es6_cv = alloc(16);
@@ -5166,7 +5173,8 @@ for (var _sb_e = 2; _sb_e < 1001; _sb_e = _sb_e + 1) {
     # f64 comparison involving NaN returns 0, so the relative test alone SILENTLY
     # PASSES it. The first version of this block had no NaN arm and therefore
     # reported 0 failures across a band where 731 of 999 ratios return no answer
-    # at all. It is the same hole `_opt_armijo` documents in src/optimize.cyr.
+    # at all. It is the same hole the NaN arm of `_opt_wolfe_search` closes in src/optimize.cyr
+    # (a NaN f is never an acceptable step; `_opt_armijo` documented it until 3.4.1).
     # [measured: 999-ratio classification with the NaN arm added, 2026-09-10]
     var _sb_good = 0;
     if (f64_eq(_sb_r, _sb_r) == 1) {
@@ -5679,7 +5687,7 @@ var _sq_S = alloc(32);
 # rc = NONE. Fixture [[9,1],[0,2]] at c = 2^-1073. Truth from a 120-digit oracle
 # over the ACTUAL rounded entries: the two subnormal singular values are 18 and 4
 # units of 2^-1074. The routine returned 16 and **0** and called it success.
-assert_eq(_sq_run(1, 1 << 1, _sq_S), HSB_ERR_NONE,
+assert_eq(is_ok(_sq_run(1, 1 << 1, _sq_S)), 1,
   "svd subnormal: upper-triangular block reports SUCCESS at c=2^-1073");
 # ⭐ 2.22.1 — INVERTED. This asserted the fabricated ZERO as a tracked defect;
 # the value is now the truth, 4 units of 2^-1074, from a 200-digit oracle over
@@ -5695,7 +5703,7 @@ assert_eq(load64(_sq_S + 16), 18,
 # ⚠ An earlier draft said "truth is 3 ... 9.3x": it ROUNDED the truth to an
 # integer and then divided by the rounded value. 28 / 2.5964 = 10.78.
 # [measured: the 2.20.0 subnormal sweep vs a 120-digit oracle, 2026-09-10]
-assert_eq(_sq_run(2, 1 << 4, _sq_S), HSB_ERR_NONE,
+assert_eq(is_ok(_sq_run(2, 1 << 4, _sq_S)), 1,
   "svd subnormal: general 2x2 reports SUCCESS at c=2^-1070");
 # ⭐ 2.22.1 — INVERTED. Was 28 units where the truth is 2.5964 (10.8x too large,
 # silent). Now 3, which is 2.5964 rounded to the grid.
@@ -5714,7 +5722,7 @@ assert_eq(load64(_sq_S + 16), 99,
 # ⚠ Asserted with its truth beside it precisely because "returns 0" is also what
 # the fabricated-zero class produces. The discriminator is that the LARGER value
 # is simultaneously correct at 6 units — a fabricating routine gets neither.
-assert_eq(_sq_run(2, 1 << 0, _sq_S), HSB_ERR_NONE,
+assert_eq(is_ok(_sq_run(2, 1 << 0, _sq_S)), 1,
   "svd subnormal: general 2x2 at c=2^-1074 now SUCCEEDS (it used to fail loudly)");
 assert_eq(load64(_sq_S + 16), 6,
   "svd subnormal: ...largest is 6 units, the truth");
@@ -5728,7 +5736,7 @@ var _sq_n = 0;
 for (var _sq_f = 0; _sq_f < 3; _sq_f = _sq_f + 1) {
     for (var _sq_e = 0; _sq_e < 52; _sq_e = _sq_e + 1) {
         _sq_n = _sq_n + 1;
-        if (_sq_run(_sq_f, 1 << _sq_e, _sq_S) == HSB_ERR_NONE) { _sq_ok = _sq_ok + 1; }
+        if (is_ok(_sq_run(_sq_f, 1 << _sq_e, _sq_S)) == 1) { _sq_ok = _sq_ok + 1; }
     }
 }
 assert_eq(_sq_n, 156, "svd subnormal sweep: all 156 (fixture, scale) pairs ran");
@@ -5796,18 +5804,18 @@ var _hh_S = alloc(32);
 # 2^-40 is the first scale the shipped tree got wrong. Multiplying a normal f64 by
 # 2^-40 subtracts 40 from its exponent field, so the expected bits are exactly
 # `S[k] - (40 << 52)` -- an exact identity, not a tolerance.
-assert_eq(_hh_run(40, _hh_S), HSB_ERR_NONE, "svd 2^-40 block ratio: reports success");
+assert_eq(is_ok(_hh_run(40, _hh_S)), 1, "svd 2^-40 block ratio: reports success");
 assert_eq(load64(_hh_S + 16), load64(_hh_S) - (40 << 52),
   "svd 2^-40: the small block's largest singular value is EXACTLY c times the large block's");
 assert_eq(load64(_hh_S + 24), load64(_hh_S + 8) - (40 << 52),
   "svd 2^-40: and its smallest is too (shipped 2.21.0 returned it 9.89x too large)");
 # ⚠ A DEEPER scale, to prove the repair is not a threshold moved one binade.
-assert_eq(_hh_run(200, _hh_S), HSB_ERR_NONE, "svd 2^-200 block ratio: reports success");
+assert_eq(is_ok(_hh_run(200, _hh_S)), 1, "svd 2^-200 block ratio: reports success");
 assert_eq(load64(_hh_S + 16), load64(_hh_S) - (200 << 52),
   "svd 2^-200: still exactly c times, 160 binades below the old cliff");
 # ⚠ And a CONTROL above the old boundary, so the assertions above cannot pass by
 # the routine having become scale-free in a way that broke the easy case.
-assert_eq(_hh_run(10, _hh_S), HSB_ERR_NONE, "svd 2^-10 block ratio (control): reports success");
+assert_eq(is_ok(_hh_run(10, _hh_S)), 1, "svd 2^-10 block ratio (control): reports success");
 assert_eq(load64(_hh_S + 16), load64(_hh_S) - (10 << 52),
   "svd 2^-10 (control): exact, as it always was");
 
@@ -5858,7 +5866,7 @@ fn _hh_eig(e, vals) {
 }
 
 var _hh_V = alloc(32);
-assert_eq(_hh_eig(42, _hh_V), HSB_ERR_NONE, "eigen_qr 2^-42: reports success");
+assert_eq(is_ok(_hh_eig(42, _hh_V)), 1, "eigen_qr 2^-42: reports success");
 # The three small eigenvalues are c * {5, 2, -1}. Exact, since c is a power of two
 # and 5, 2, -1 are exactly representable.
 # ⚠ DIVIDED BY c, WHICH IS EXACT (a power of two), AND COMPARED AT A FEW ULP
@@ -5883,7 +5891,7 @@ assert_eq(f64_approx_eq(f64_div(load64(_hh_V + 24), (1023 - 42) << 52),
 # the shipped tree returns this eigenvalue POSITIVE where the answer is negative.
 assert_eq(f64_lt(load64(_hh_V + 24), 0), 1,
   "eigen_qr 2^-42: and its SIGN is negative, which the shipped tree got wrong");
-assert_eq(_hh_eig(200, _hh_V), HSB_ERR_NONE, "eigen_qr 2^-200: reports success");
+assert_eq(is_ok(_hh_eig(200, _hh_V)), 1, "eigen_qr 2^-200: reports success");
 assert_eq(f64_approx_eq(f64_div(load64(_hh_V + 24), (1023 - 200) << 52),
     f64_neg(F64_ONE), ULP_TOL_H), 1,
   "eigen_qr 2^-200: still -c, 158 binades below the old cliff");
@@ -5898,7 +5906,8 @@ assert_eq(f64_lt(load64(_hh_V + 24), 0), 1,
 # eigenvalues (3, 3)**, and a 3x3 with one NaN entry comes back `rc = 0` with a
 # NaN sitting in the singular values. With `f64_eq` both report
 # HSB_ERR_NO_CONVERGENCE, which is the honest answer.
-# ⚠ This is the same trap `_opt_armijo` documents in src/optimize.cyr and the
+# ⚠ This is the same trap the NaN arm of `_opt_wolfe_search` closes in src/optimize.cyr
+# (`_opt_armijo` documented it until 3.4.1) and the
 # same one that made 2.17.0's SVD figure wrong: **every f64 comparison involving
 # NaN returns 0**, so the direction a guard is written in decides whether NaN
 # falls through or is swallowed.
@@ -6431,13 +6440,17 @@ assert_eq(Dual_val(_n4d4), 0x7FF8000000000005,
 assert_eq(Dual_deriv(_n4d4), 0xFFF8000000000005, "dual_abs(-NaN): the derivative is the NaN (3.3.7: +1)");
 var _n4d5 = dual_abs(dual_new(0x7FF8000000000005, 0xC000000000000000));
 assert_eq(Dual_deriv(_n4d5), _n4_qn, "dual_abs(NaN, -2): the derivative is the NaN (3.3.7: -2)");
-# The documented domain misses keep the sentinel.
+# The documented domain misses keep the sentinel value; a moving one has the NaN tangent (3.4.1
+# SYM4): ln(-0) is a pole, sqrt(-Inf) has no value and sqrt at +0 an unbounded right slope.
 var _n4d6 = dual_ln(dual_new(0x8000000000000000, F64_ONE));
-assert_eq(Dual_val(_n4d6) | Dual_deriv(_n4d6), 0, "dual_ln(-0): the domain-miss sentinel (0, 0), unchanged");
+assert_eq(Dual_val(_n4d6), 0, "dual_ln(-0): the miss's value 0, unchanged");
+assert_eq(Dual_deriv(_n4d6), _AD_NAN, "dual_ln(-0): a moving miss, a NaN tangent");
 var _n4d7 = dual_sqrt(dual_new(0xFFF0000000000000, F64_ONE));
-assert_eq(Dual_val(_n4d7) | Dual_deriv(_n4d7), 0, "dual_sqrt(-Inf): the domain-miss sentinel (0, 0), unchanged");
+assert_eq(Dual_val(_n4d7), 0, "dual_sqrt(-Inf): the miss's value 0, unchanged");
+assert_eq(Dual_deriv(_n4d7), _AD_NAN, "dual_sqrt(-Inf): a moving miss, a NaN tangent");
 var _n4d8 = dual_sqrt(dual_new(0, F64_ONE));
-assert_eq(Dual_val(_n4d8) | Dual_deriv(_n4d8), 0, "dual_sqrt(+0): the domain-miss sentinel (0, 0), unchanged");
+assert_eq(Dual_val(_n4d8), 0, "dual_sqrt(+0): the miss's value 0, unchanged");
+assert_eq(Dual_deriv(_n4d8), _AD_NAN, "dual_sqrt(+0): a moving miss, a NaN tangent");
 # Reverse mode, one tape: the same NaN through ad_ln, ad_sqrt and ad_abs.
 var _n4_tp = ad_tape_new(16);
 var _n4_xa = ad_var(_n4_tp, _n4_qn);
@@ -6478,19 +6491,23 @@ var _n4v2 = dual_div(dual_new(0x7FF0000000000001, F64_ONE), dual_const(0));
 assert_eq(Dual_val(_n4v2), 0x7FF8000000000001, "dual_div(sNaN, 0): the value is the NaN, quieted, payload kept");
 assert_eq(Dual_deriv(_n4v2), 0x7FF8000000000001, "dual_div(sNaN, 0): the derivative is the same quieted NaN");
 var _n4v3 = dual_div(dual_var(F64_TWO), dual_new(0, _n4_qn));
-assert_eq(Dual_val(_n4v3), 0, "dual_div(2, (0, NaN')): a miss, the constant 0");
-assert_eq(Dual_deriv(_n4v3), 0, "dual_div(2, (0, NaN')): a constant's derivative, 0, the NaN tangent dropped");
+assert_eq(Dual_val(_n4v3), 0, "dual_div(2, (0, NaN')): a miss, the value 0");
+assert_eq(Dual_deriv(_n4v3), _AD_NAN,
+  "dual_div(2, (0, NaN')): 2/b at b = 0 is a pole, a moving miss's NaN (3.4.1 SYM4)");
 var _n4v4 = dual_div(dual_new(F64_TWO, 0x7FF0000000000003), dual_new(1, F64_ONE));
-assert_eq(Dual_deriv(_n4v4), 0, "dual_div((2, sNaN'), 2^-1074): a miss, derivative 0");
+assert_eq(Dual_deriv(_n4v4), _AD_NAN, "dual_div((2, sNaN'), 2^-1074): a moving miss, the NaN tangent (3.4.1 SYM4)");
 var _n4v5 = dual_div(dual_var(F64_TWO), dual_new(0, 0x7FF0000000000007));
-assert_eq(Dual_deriv(_n4v5), 0, "dual_div(2, (0, sNaN')): a miss, derivative 0");
+assert_eq(Dual_deriv(_n4v5), _AD_NAN, "dual_div(2, (0, sNaN')): a moving miss, the NaN tangent (3.4.1 SYM4)");
 var _n4v6 = dual_div(dual_var(F64_TWO), dual_const(0));
-assert_eq(Dual_val(_n4v6) | Dual_deriv(_n4v6), 0, "dual_div(2, 0): the documented (0, 0), unchanged");
+assert_eq(Dual_val(_n4v6), 0, "dual_div(x, const 0): the miss's value 0, unchanged");
+assert_eq(Dual_deriv(_n4v6), _AD_NAN, "dual_div(x, const 0): x / 0 has no value, a moving miss's NaN (3.4.1 SYM4)");
+assert_eq(Dual_deriv(dual_div(dual_const(F64_TWO), dual_const(0))), 0,
+  "dual_div(const 2, const 0): a miss on constants is still (0, +0)");
 var _n4v7 = dual_ln(dual_new(0xBFF0000000000000, _n4_qn));
 assert_eq(Dual_val(_n4v7), 0, "dual_ln((-1, NaN')): the miss value 0");
-assert_eq(Dual_deriv(_n4v7), 0, "dual_ln((-1, NaN')): a miss, derivative 0 whatever the tangent");
+assert_eq(Dual_deriv(_n4v7), _AD_NAN, "dual_ln((-1, NaN')): a moving miss, the NaN tangent (3.4.1 SYM4)");
 var _n4v8 = dual_sqrt(dual_new(0, _n4_qn));
-assert_eq(Dual_deriv(_n4v8), 0, "dual_sqrt((0, NaN')): a miss, derivative 0 whatever the tangent");
+assert_eq(Dual_deriv(_n4v8), _AD_NAN, "dual_sqrt((0, NaN')): a moving miss, the NaN tangent (3.4.1 SYM4)");
 var _n4_ya = ad_var(_n4_tq, _n4_qn);
 var _n4_yb = ad_var(_n4_tq, 0);
 var _n4_yq = ad_div(_n4_tq, _n4_ya, _n4_yb);
@@ -6505,8 +6522,10 @@ assert_eq(ad_val(_n4_tq, _n4_ysq), 0x7FF8000000000001, "ad_div(sNaN, 0): the val
 var _n4_yc = ad_var(_n4_tq, F64_TWO);
 var _n4_ycq = ad_div(_n4_tq, _n4_yc, _n4_yb);
 var _n4g8t, _n4g8v = ad_grad(_n4_tq, _n4_ycq);
-assert_eq(ad_val(_n4_tq, _n4_ycq) | ad_grad_of(_n4_tq, _n4_yc) | ad_grad_of(_n4_tq, _n4_yb), 0,
-  "ad_div(2, 0): the documented miss, value and partials 0, unchanged");
+assert_eq(ad_val(_n4_tq, _n4_ycq), 0, "ad_div(2, 0): the miss's value 0, unchanged");
+assert_eq(ad_grad_of(_n4_tq, _n4_yc), _AD_NAN,
+  "ad_div(y, 0) with y moving: d/dy is NaN, y / 0 has no value (3.4.1 SYM4)");
+assert_eq(ad_grad_of(_n4_tq, _n4_yb), _AD_NAN, "ad_div(y, b) at b = 0 with b moving: d/db is NaN, a pole (3.4.1 SYM4)");
 # A NaN operand VALUE in ad_mul / ad_div: every partial is the NaN, as forward mode's a b'
 # term (NaN * 0) makes its derivative. 3.3.7's tape answered the constant: x * 2 at x = NaN
 # had gradient 2, x / 2 had 0.5, where dual_mul and dual_div answer NaN.
@@ -6525,32 +6544,43 @@ var _n4g11t, _n4g11v = ad_grad(_n4_tr, _n4_rd);
 assert_eq(ad_grad_of(_n4_tr, _n4_rx), _n4_qn, "ad_div(NaN x, 2): d/dx is the NaN (3.3.7: 0.5)");
 assert_eq(ad_grad_of(_n4_tr, _n4_rx), Dual_deriv(dual_div(dual_new(_n4_qn, F64_ONE), dual_const(F64_TWO))),
   "ad_div and dual_div agree on a NaN numerator over 2, bit for bit");
-# A NaN tangent reaching a miss, built the same way in both modes: v + (x^0 - 1) at x = 0
-# has value v and derivative 0 * 0^-1 = NaN. At v = -1.5, ln and sqrt are misses: forward
-# (0, 0), and the tape's sweep stops at the miss's 0 partial, 0. 3.4.0's first draft gave
-# forward (0, NaN) here, disagreeing with the tape.
-var _n4_kf = dual_add(dual_const(0xBFF8000000000000), dual_sub(dual_pow(dual_var(0), 0), dual_const(F64_ONE)));
+# A NaN tangent reaching a miss, built the same way in both modes: v + (x^0.5 - x^0.5) at
+# x = 0 has value v and derivative Inf - Inf = NaN (0.5 * 0^-0.5 = +Inf on each side). At
+# v = -1.5, ln and sqrt are misses: forward (0, 0), and the tape records the miss as a
+# constant, so x has no path to the root, 0. 3.4.0's first draft gave forward (0, NaN)
+# here, disagreeing with the tape.
+# (3.4.1: this fixture was v + (x^0 - 1), whose NaN tangent was x^0's own defect, 0 * 0^-1;
+# x^0 is the constant 1 now, so the NaN comes from x^0.5 instead.)
+var _n4_kf = dual_add(dual_const(0xBFF8000000000000),
+  dual_sub(dual_pow(dual_var(0), F64_HALF), dual_pow(dual_var(0), F64_HALF)));
 assert_eq(f64_eq(Dual_deriv(_n4_kf), Dual_deriv(_n4_kf)), 0, "the fixture's forward tangent is NaN");
 var _n4_kl = dual_ln(_n4_kf);
-assert_eq(Dual_val(_n4_kl) | Dual_deriv(_n4_kl), 0, "dual_ln at -1.5 with a NaN tangent: (0, 0)");
+assert_eq(Dual_val(_n4_kl), 0, "dual_ln at -1.5 with a NaN tangent: the miss's value 0");
+assert_eq(Dual_deriv(_n4_kl), _AD_NAN, "dual_ln at -1.5 with a NaN tangent: a moving miss's NaN (3.4.1 SYM4)");
 var _n4_ks = dual_sqrt(_n4_kf);
-assert_eq(Dual_val(_n4_ks) | Dual_deriv(_n4_ks), 0, "dual_sqrt at -1.5 with a NaN tangent: (0, 0)");
+assert_eq(Dual_val(_n4_ks), 0, "dual_sqrt at -1.5 with a NaN tangent: the miss's value 0");
+assert_eq(Dual_deriv(_n4_ks), _AD_NAN, "dual_sqrt at -1.5 with a NaN tangent: a moving miss's NaN (3.4.1 SYM4)");
 var _n4_kd = dual_div(dual_const(F64_TWO), dual_add(_n4_kf, dual_const(0x3FF8000000000000)));
-assert_eq(Dual_val(_n4_kd) | Dual_deriv(_n4_kd), 0, "dual_div(2, 0 with a NaN tangent): (0, 0)");
+assert_eq(Dual_val(_n4_kd), 0, "dual_div(2, 0 with a NaN tangent): the miss's value 0");
+assert_eq(Dual_deriv(_n4_kd), _AD_NAN, "dual_div(2, 0 with a NaN tangent): a moving miss's NaN (3.4.1 SYM4)");
 var _n4_kx = ad_var(_n4_tr, 0);
-var _n4_kp = ad_sub(_n4_tr, ad_pow(_n4_tr, _n4_kx, 0), ad_const(_n4_tr, F64_ONE));
+var _n4_kp = ad_sub(_n4_tr, ad_pow(_n4_tr, _n4_kx, F64_HALF), ad_pow(_n4_tr, _n4_kx, F64_HALF));
 var _n4_kin = ad_add(_n4_tr, ad_const(_n4_tr, 0xBFF8000000000000), _n4_kp);
 var _n4_kr = ad_ln(_n4_tr, _n4_kin);
 var _n4g12t, _n4g12v = ad_grad(_n4_tr, _n4_kr);
-assert_eq(ad_val(_n4_tr, _n4_kr) | ad_grad_of(_n4_tr, _n4_kx), 0, "ad_ln at -1.5 with a NaN partial upstream: 0 and 0");
+assert_eq(ad_val(_n4_tr, _n4_kr), 0, "ad_ln at -1.5 with a NaN partial upstream: the miss's value 0");
+assert_eq(ad_grad_of(_n4_tr, _n4_kx), _AD_NAN,
+  "ad_ln at -1.5 with a NaN partial upstream: a moving miss's NaN (3.4.1 SYM4)");
 assert_eq(ad_grad_of(_n4_tr, _n4_kx), Dual_deriv(_n4_kl), "ad_ln and dual_ln agree at a miss with a NaN tangent");
 var _n4_xc = ad_var(_n4_tp, 0);
 var _n4_lc = ad_ln(_n4_tp, _n4_xc);
 var _n4g4t, _n4g4v = ad_grad(_n4_tp, _n4_lc);
-assert_eq(ad_val(_n4_tp, _n4_lc) | ad_grad_of(_n4_tp, _n4_xc), 0, "ad_ln(+0): the domain-miss sentinel, unchanged");
+assert_eq(ad_val(_n4_tp, _n4_lc), 0, "ad_ln(+0): the miss's value 0, unchanged");
+assert_eq(ad_grad_of(_n4_tp, _n4_xc), _AD_NAN, "ad_ln(+0): a pole, a moving miss's NaN (3.4.1 SYM4)");
 var _n4_sc = ad_sqrt(_n4_tp, _n4_xc);
 var _n4g5t, _n4g5v = ad_grad(_n4_tp, _n4_sc);
-assert_eq(ad_val(_n4_tp, _n4_sc) | ad_grad_of(_n4_tp, _n4_xc), 0, "ad_sqrt(+0): the domain-miss sentinel, unchanged");
+assert_eq(ad_val(_n4_tp, _n4_sc), 0, "ad_sqrt(+0): the miss's value 0, unchanged");
+assert_eq(ad_grad_of(_n4_tp, _n4_xc), _AD_NAN, "ad_sqrt(+0): an unbounded slope, a moving miss's NaN (3.4.1 SYM4)");
 
 # === 3.4.0: a refused allocation returns the designed failure ===
 # Every allocation in num, num_ext, symbolic and autodiff that was stored through
@@ -6637,6 +6667,590 @@ assert_eq(_n4c1 | _n4c2 | _n4c3 | _n4c4 | _n4c5 | _n4c6, 0,
   "expr_mul / pow / neg / cos / exp / ln: a refused allocation -> 0 (3.3.7: exit 139)");
 assert_eq(ALLOC_MAX, _n4_amax, "ALLOC_MAX restored");
 
+# === 3.4.1: cmat_trace refuses a non-square matrix ===
+# Roadmap [3.4.1] (AU2-G6-F1). The loop ran to rows(m) and read m[i][i]: on cmat_new(3, 1)
+# holding 1, 2, 3 it returned 6 + 0i, the 2.0 past the end being the next heap object, and
+# a 65536 x 1 at a heap-chunk edge exited 139. A trace exists for square matrices only.
+# [measured: scratch probe p1 on the 3.4.1 baseline, 2026-10-31: re 0x4018000000000000]
+test_group("3.4.1: cmat_trace refuses a non-square matrix");
+var _s1_tall = cmat_new(3, 1);
+cmat_set(_s1_tall, 0, 0, cx_real(F64_ONE));
+cmat_set(_s1_tall, 1, 0, cx_real(F64_TWO));
+cmat_set(_s1_tall, 2, 0, cx_real(f64_from(3)));
+assert_eq(cmat_trace(_s1_tall), 0, "cmat_trace(3 x 1): 0, no trace (3.4.0: 6 + 0i, read past the buffer)");
+assert_eq(cmat_trace(cmat_new(1, 3)), 0, "cmat_trace(1 x 3): 0");
+assert_eq(cmat_trace(cmat_new(256, 255)), 0, "cmat_trace(256 x 255): 0 (3.4.0: one entry past the end)");
+var _s1_sq = cmat_new(2, 2);
+cmat_set(_s1_sq, 0, 0, cx_new(0x3FF3C0CA428C59FB, 0xBFE5D1D8A3B2C6F1));
+cmat_set(_s1_sq, 1, 1, cx_new(0x400921FB54442D18, 0x3FD5555555555555));
+cmat_set(_s1_sq, 0, 1, cx_new(0x4059000000000000, 0x4059000000000000));
+var _s1_tr = cmat_trace(_s1_sq);
+assert_eq(HComplex_re(_s1_tr), f64_add(0x3FF3C0CA428C59FB, 0x400921FB54442D18),
+  "cmat_trace(2 x 2).re: the diagonal's sum, off-diagonal untouched");
+assert_eq(HComplex_im(_s1_tr), f64_add(0xBFE5D1D8A3B2C6F1, 0x3FD5555555555555), "cmat_trace(2 x 2).im");
+
+# === 3.4.1: cx_div / cx_inv near DBL_MAX and over an infinite divisor ===
+# Roadmap [3.4.1] (AU2-X1, AU2-G6-F16). Smith's denominator and numerators reach twice
+# max|b| and max|a|, so from about DBL_MAX / 2 they overflowed: the quotient came back 0
+# (x / Inf), +-Inf or NaN (Inf / Inf) for an ordinary number. Oracles: the exact rational
+# quotient (Fraction), correctly rounded; Smith's is correctly rounded on all but the
+# numerator-overflow row, where it is 1 ulp off in each part (as it is unscaled).
+# [measured: scratch probes p1, p3, p9 on the 3.4.1 baseline and lane, Fraction oracle, 2026-10-31]
+test_group("3.4.1: cx_div / cx_inv near DBL_MAX and over an infinite divisor");
+var _s2_m = 0x7FEFFFFFFFFFFFFF;
+var _s2_q1 = cx_div(cx_new(0x7FE0000000000000, 0), cx_new(0x7FE8F0A3D70A3D71, 0x7FE724C3FA1D5B7A));
+assert_eq(HComplex_re(_s2_q1), 0x3FD60FA1D1941C63, "cx_div(2^1023, big b).re = 0.3447, correctly rounded (3.4.0: 0)");
+assert_eq(HComplex_im(_s2_q1), 0xBFD478D7D0D8BC3C, "cx_div(2^1023, big b).im = -0.3199 (3.4.0: -0)");
+var _s2_q2 = cx_div(cx_new(0x7FE0000000000000, 0), cx_new(0x7FE724C3FA1D5B7A, 0x7FE8F0A3D70A3D71));
+assert_eq(HComplex_re(_s2_q2), 0x3FD478D7D0D8BC3C, "cx_div, Smith's second branch (|bi| >= |br|): re (3.4.0: 0)");
+assert_eq(HComplex_im(_s2_q2), 0xBFD60FA1D1941C63, "cx_div, Smith's second branch: im");
+var _s2_q3 = cx_div(cx_new(0x7E70000000000000, 0x7E70000000000000), cx_new(_s2_m, _s2_m));
+assert_eq(HComplex_re(_s2_q3), 0x3E70000000000001, "cx_div(2^1000(1 + i), DBL_MAX(1 + i)).re (3.4.0: 0)");
+assert_eq(HComplex_im(_s2_q3), 0, "cx_div(2^1000(1 + i), DBL_MAX(1 + i)).im = +0");
+var _s2_q4 = cx_div(cx_new(_s2_m, _s2_m), cx_new(F64_TWO, 0x3FFE666666666666));
+assert_eq(HComplex_re(_s2_q4), 0x7FE06643F3E3BE11,
+  "cx_div(DBL_MAX(1 + i), 2 + 1.9i).re: a numerator overflow, now finite (3.4.0: +Inf; exact ...BE10)");
+assert_eq(HComplex_im(_s2_q4), 0x7F8AE9761382DC09, "cx_div(DBL_MAX(1 + i), 2 + 1.9i).im (exact ...DC08)");
+var _s2_i1 = cx_inv(cx_new(_s2_m, _s2_m));
+assert_eq(HComplex_re(_s2_i1), 0x0002000000000000, "cx_inv(DBL_MAX(1 + i)).re = 2^-1025 (3.4.0: 0)");
+assert_eq(HComplex_im(_s2_i1), 0x8002000000000000, "cx_inv(DBL_MAX(1 + i)).im = -2^-1025 (3.4.0: -0)");
+var _s2_i2 = cx_inv(cx_new(_s2_m, 0x7FECCCCCCCCCCCCB));
+assert_eq(HComplex_re(_s2_i2), 0x000235BEF0712630, "cx_inv(DBL_MAX + 0.9 DBL_MAX i).re, the first branch (3.4.0: 0)");
+assert_eq(HComplex_im(_s2_i2), 0x8001FD2BD865D592, "cx_inv(DBL_MAX + 0.9 DBL_MAX i).im");
+# C99 G.5.1: a finite a over an infinite b is 0, where Smith's ratio was Inf / Inf.
+var _s2_z1 = cx_div(cx_new(F64_ONE, F64_ONE), cx_new(F64_POS_INF, F64_POS_INF));
+assert_eq(HComplex_re(_s2_z1) | HComplex_im(_s2_z1), 0, "cx_div(1 + i, Inf + Inf i) = 0 + 0i (3.4.0: NaN + NaN i)");
+var _s2_z2 = cx_div(cx_new(F64_ONE, F64_ONE), cx_new(0x7FF8000000000000, F64_POS_INF));
+assert_eq(HComplex_re(_s2_z2), 0, "cx_div(1 + i, NaN + Inf i).re = +0: an infinity with a NaN part (3.4.0: NaN)");
+assert_eq(HComplex_im(_s2_z2), 0x8000000000000000,
+  "cx_div(1 + i, NaN + Inf i).im = 0 * (1 * 0 - 1 * 1) = -0, _Cdivd's");
+var _s2_z3 = cx_div(cx_new(0xBFF0000000000000, F64_TWO), cx_new(0xFFF0000000000000, 0xFFF0000000000000));
+assert_eq(HComplex_re(_s2_z3), 0x8000000000000000, "cx_div(-1 + 2i, -Inf - Inf i).re = 0 * (1 - 2) = -0");
+assert_eq(HComplex_im(_s2_z3), 0x8000000000000000, "cx_div(-1 + 2i, -Inf - Inf i).im = 0 * (-2 - 1) = -0");
+var _s2_z4 = cx_inv(cx_new(F64_POS_INF, F64_POS_INF));
+assert_eq(HComplex_re(_s2_z4), 0, "cx_inv(Inf + Inf i).re = +0 (3.4.0: NaN)");
+assert_eq(HComplex_im(_s2_z4), 0x8000000000000000, "cx_inv(Inf + Inf i).im = -0");
+# Unchanged: Smith's own zeros over one infinite part, NaN and infinite dividends, the pole,
+# and an ordinary quotient (the formula composed by hand, a second code path).
+var _s2_k1 = cx_div(cx_new(F64_ONE, F64_ONE), cx_new(F64_POS_INF, F64_ONE));
+assert_eq(HComplex_re(_s2_k1) | HComplex_im(_s2_k1), 0, "cx_div(1 + i, Inf + 1i) = 0 + 0i, as before");
+var _s2_k2 = cx_inv(cx_new(F64_POS_INF, F64_ONE));
+assert_eq(HComplex_im(_s2_k2), 0x8000000000000000, "cx_inv(Inf + 1i).im = -0, Smith's sign kept");
+var _s2_k3 = cx_div(cx_new(0x7FF8000000000000, 0), cx_new(F64_POS_INF, F64_POS_INF));
+assert_eq(f64_eq(HComplex_re(_s2_k3), HComplex_re(_s2_k3)), 0, "cx_div(NaN, Inf + Inf i): NaN stays NaN");
+var _s2_k7 = cx_div(cx_new(F64_POS_INF, 0), cx_new(0x7FE0000000000000, 0x7FE0000000000000));
+assert_eq(HComplex_re(_s2_k7), F64_POS_INF,
+  "cx_div(Inf, 2^1023 (1 + i)).re = +Inf: scaled, not Inf / Inf (3.4.0: NaN)");
+assert_eq(HComplex_im(_s2_k7), 0xFFF0000000000000, "cx_div(Inf, 2^1023 (1 + i)).im = -Inf (3.4.0: NaN)");
+var _s2_k4 = cx_div(cx_new(F64_POS_INF, 0), cx_new(F64_POS_INF, F64_POS_INF));
+assert_eq(f64_eq(HComplex_re(_s2_k4), HComplex_re(_s2_k4)), 0, "cx_div(Inf, Inf + Inf i): NaN, not a zero");
+var _s2_k5 = cx_div(cx_new(F64_ONE, F64_TWO), cx_zero());
+assert_eq(HComplex_re(_s2_k5) | HComplex_im(_s2_k5), 0, "cx_div(a, 0): the documented pole sentinel, unchanged");
+var _s2_k6 = cx_div(cx_new(F64_ONE, F64_TWO), cx_new(f64_from(3), f64_from(4)));
+var _s2_ri = f64_div(f64_from(3), f64_from(4));
+var _s2_di = f64_add(f64_mul(f64_from(3), _s2_ri), f64_from(4));
+assert_eq(HComplex_re(_s2_k6), f64_div(f64_add(f64_mul(F64_ONE, _s2_ri), F64_TWO), _s2_di),
+  "cx_div((1 + 2i) / (3 + 4i)).re: Smith's second branch, bit for bit");
+assert_eq(HComplex_im(_s2_k6), f64_div(f64_sub(f64_mul(F64_TWO, _s2_ri), F64_ONE), _s2_di), "... .im");
+
+# === 3.4.1: dual_pow / ad_pow at n = 0 are the constant 1 ===
+# Roadmap [3.4.1] (AU2-G6-F8). n * v^(n-1) = 0 * Inf at a zero or subnormal base made the
+# derivative NaN, a constant's included: dual_pow(dual_const(0), 0) was (1, NaN). v^0 = 1
+# for every v, so its derivative is 0.
+# [measured: scratch probe p1 on the 3.4.1 baseline, 2026-10-31: 0xFFF8000000000000]
+test_group("3.4.1: dual_pow / ad_pow at n = 0 are the constant 1");
+var _s3_d1 = dual_pow(dual_const(0), 0);
+assert_eq(Dual_val(_s3_d1), F64_ONE, "dual_pow(const 0, 0): value 1");
+assert_eq(Dual_deriv(_s3_d1), 0, "dual_pow(const 0, 0): derivative +0 (3.4.0: NaN)");
+var _s3_d2 = dual_pow(dual_var(0), 0);
+assert_eq(Dual_deriv(_s3_d2), 0, "dual_pow(var 0, 0): derivative +0 (3.4.0: NaN)");
+var _s3_d3 = dual_pow(dual_var(1), 0x8000000000000000);
+assert_eq(Dual_val(_s3_d3), F64_ONE, "dual_pow(var 2^-1074, -0): value 1");
+assert_eq(Dual_deriv(_s3_d3), 0, "dual_pow(var 2^-1074, -0): derivative +0 (3.4.0: NaN)");
+var _s3_d4 = dual_pow(dual_var(f64_from(3)), F64_TWO);
+assert_eq(Dual_deriv(_s3_d4), f64_from(6), "dual_pow(var 3, 2): derivative 6, unchanged");
+var _s3_t = ad_tape_new(16);
+var _s3_x = ad_var(_s3_t, 0);
+var _s3_p = ad_pow(_s3_t, _s3_x, 0);
+var _s3_r = ad_mul(_s3_t, _s3_p, ad_const(_s3_t, 0x7FF8000000000000));
+var _s3g1t, _s3g1v = ad_grad(_s3_t, _s3_p);
+assert_eq(ad_val(_s3_t, _s3_p), F64_ONE, "ad_pow(0, 0): value 1");
+assert_eq(ad_grad_of(_s3_t, _s3_x), 0, "ad_pow(0, 0): d/dx +0 (3.4.0: NaN)");
+var _s3g2t, _s3g2v = ad_grad(_s3_t, _s3_r);
+assert_eq(ad_grad_of(_s3_t, _s3_x), 0,
+  "ad_pow(x, 0) is a constant: a NaN adjoint above it does not reach x (1 * NaN stops at the node)");
+
+# === 3.4.1: dual_div / ad_div without b^2, ad_div's value ===
+# Roadmap [3.4.1] (AU2-G6-F7, F13). The quotient rule's b^2 overflowed past |b| = 2^512 and
+# underflowed below 2^-537, and ad_div's value was a * (1/b), two roundings. Oracle: the
+# exact rational 1/b, a/b and -a/b^2, correctly rounded; every row below is that rounding.
+# [measured: scratch probe p1 on the 3.4.1 baseline and lane, Fraction oracle, 2026-10-31]
+test_group("3.4.1: dual_div / ad_div without b^2, ad_div's value");
+var _s4_d1 = dual_div(dual_var(0x6974E718D7D7625A), dual_const(0x6974E718D7D7625A));
+assert_eq(Dual_val(_s4_d1), F64_ONE, "dual_div(var 1e200, const 1e200): value 1");
+assert_eq(Dual_deriv(_s4_d1), 0x16687E92154EF7AC, "dual_div(var 1e200, const 1e200): derivative 1e-200 (3.4.0: 0)");
+var _s4_d2 = dual_div(dual_var(0x1EF6E0C2B9F0C1D5), dual_const(0x1EF6E0C2B9F0C1D5));
+assert_eq(Dual_deriv(_s4_d2), 0x60E6612DE7F41BF4, "dual_div at b = 1EF6E0C2B9F0C1D5: 1/b (3.4.0: 2.4e9 ulp off)");
+var _s4_d3 = dual_div(dual_var(0x1675DD6DD21D2E61), dual_const(0x1675DD6DD21D2E61));
+assert_eq(Dual_deriv(_s4_d3), 0x69676A9D73587A41, "dual_div at b = 1.785e-200: 1/b (3.4.0: +Inf)");
+var _s4_d4 = dual_div(dual_const(f64_from(3)), dual_var(0x6070000000000000));
+assert_eq(Dual_deriv(_s4_d4), 0x8000000C00000000,
+  "dual_div(const 3, var 2^520): -3 * 2^-1040, a subnormal (3.4.0: -0, b^2 overflowed)");
+var _s4_d5 = dual_div(dual_const(0x01A56E1FC2F8F359), dual_var(0x1675DD6DD21D2E61));
+assert_eq(Dual_val(_s4_d5), 0x2B1F5D1A1DC73DFD, "dual_div value a/b, correctly rounded");
+assert_eq(Dual_deriv(_s4_d5), 0xD496F3697DBF485A, "dual_div d/db = -a/b^2, correctly rounded (3.4.0: -Inf)");
+var _s4_t = ad_tape_new(16);
+var _s4_a = ad_var(_s4_t, 0x01A56E1FC2F8F359);
+var _s4_b = ad_var(_s4_t, 0x1675DD6DD21D2E61);
+var _s4_q = ad_div(_s4_t, _s4_a, _s4_b);
+var _s4gt, _s4gv = ad_grad(_s4_t, _s4_q);
+assert_eq(ad_val(_s4_t, _s4_q), 0x2B1F5D1A1DC73DFD, "ad_div value a/b, correctly rounded (3.4.0: ...DFE, a * (1/b))");
+assert_eq(ad_grad_of(_s4_t, _s4_a), 0x69676A9D73587A41, "ad_div d/da = 1/b");
+assert_eq(ad_grad_of(_s4_t, _s4_b), 0xD496F3697DBF485A, "ad_div d/db = -q/b = -a/b^2 rounded (3.4.0: -Inf)");
+assert_eq(ad_grad_of(_s4_t, _s4_b), Dual_deriv(_s4_d5), "ad_div and dual_div agree on d/db, bit for bit");
+
+# === 3.4.1: forward and reverse agree on special values ===
+# Roadmap [3.4.1] (R2A SF2). Through 3.4.0 the modes disagreed on 124 of R2A's 1,440
+# single-op cases: a NaN tangent through a zero partial (forward 0 * NaN, the sweep
+# skipped a +0 adjoint), an infinite value times a constant's zero tangent (forward
+# Inf * 0 = NaN), and the sign of a zero (adjoints summed from +0). The rule above
+# dual_div: a STRUCTURAL zero is exact (3.4.1 SYM2 narrowed the first draft's "a zero tangent
+# is exact" to a constant's tangent and a constant zero operand), and every other product is
+# IEEE in both modes. The NaN tangent here is x^0.5 - x^0.5 at x = 0, Inf - Inf in both modes.
+# On the 3.4.1 baseline 448 of 2,880 cases (R2A's 1,440, the same ops on a constant input, and
+# this NaN tangent) disagree; on this tree none, apart from 18 in the sign of a zero derivative
+# (3.4.1 SYM2: forward mode stores a moving zero as -0, the tape keeps IEEE's sign).
+# [measured: scratch forward/reverse sweep (R2A's ad1.py, extended), 2026-10-31; SYM2 rerun the same day]
+test_group("3.4.1: forward and reverse agree on special values");
+var _s5_t = ad_tape_new(64);
+# A NaN tangent times a CONSTANT zero: in * 0, in = 2 + (x^0.5 - x^0.5) at x = 0. (3.4.1 SYM2:
+# 0 * g(x) is the constant 0 wherever g(x) is finite, so its derivative is exactly 0 in both
+# modes; the first 3.4.1 draft gave NaN, 0 * NaN. A ZERO THAT MOVES times a NaN is NaN: see
+# tests/edge_cases.tcyr, group "3.4.1 SYM2: structural zeros, in both modes".)
+var _s5_fin = dual_add(dual_const(F64_TWO), dual_sub(dual_pow(dual_var(0), F64_HALF), dual_pow(dual_var(0), F64_HALF)));
+var _s5_f1 = dual_mul(_s5_fin, dual_const(0));
+assert_eq(Dual_deriv(_s5_f1), 0, "forward: (2, NaN') * const 0 is the constant 0, derivative +0 (3.4.1 SYM2)");
+var _s5_x = ad_var(_s5_t, 0);
+var _s5_in = ad_add(_s5_t, ad_const(_s5_t, F64_TWO),
+  ad_sub(_s5_t, ad_pow(_s5_t, _s5_x, F64_HALF), ad_pow(_s5_t, _s5_x, F64_HALF)));
+var _s5_r1 = ad_mul(_s5_t, _s5_in, ad_const(_s5_t, 0));
+var _s5g1t, _s5g1v = ad_grad(_s5_t, _s5_r1);
+var _s5_g1 = ad_grad_of(_s5_t, _s5_x);
+assert_eq(_s5_g1, 0, "reverse: the same, +0: the constant 0 is recorded, x is not reached (3.4.1 SYM2)");
+# An infinite value times a constant's zero tangent.
+var _s5_f2 = dual_mul(dual_var(F64_POS_INF), dual_const(F64_TWO));
+assert_eq(Dual_deriv(_s5_f2), F64_TWO, "forward: x * 2 at x = +Inf has derivative 2 (3.4.0: NaN, Inf * 0)");
+ad_tape_reset(_s5_t);
+var _s5_x2 = ad_var(_s5_t, F64_POS_INF);
+var _s5_r2 = ad_mul(_s5_t, _s5_x2, ad_const(_s5_t, F64_TWO));
+var _s5g2t, _s5g2v = ad_grad(_s5_t, _s5_r2);
+assert_eq(ad_grad_of(_s5_t, _s5_x2), F64_TWO, "reverse: x * 2 at x = +Inf, 2");
+var _s5_f3 = dual_div(dual_var(0), dual_const(F64_POS_INF));
+assert_eq(Dual_deriv(_s5_f3), 0x8000000000000000,
+  "forward: x / Inf at x = 0 has derivative 1/Inf = 0, a moving zero, stored -0 (3.4.0: NaN, Inf / Inf)");
+var _s5_f4 = dual_add(dual_var(F64_ONE), dual_exp(dual_const(f64_from(1000))));
+assert_eq(Dual_deriv(_s5_f4), F64_ONE, "forward: x + exp(const 1000) has derivative 1 (3.4.0: NaN, 0 * Inf)");
+assert_eq(Dual_deriv(dual_exp(dual_const(f64_from(1000)))), 0, "forward: exp(const 1000) is a constant, derivative +0");
+# A NaN value from mul has a NaN derivative in both modes.
+var _s5_f5 = dual_mul(dual_var(F64_POS_INF), dual_const(0));
+assert_eq(f64_eq(Dual_deriv(_s5_f5), Dual_deriv(_s5_f5)), 0, "forward: x * 0 at x = +Inf, value NaN, derivative NaN");
+ad_tape_reset(_s5_t);
+var _s5_x5 = ad_var(_s5_t, F64_POS_INF);
+var _s5_r5 = ad_mul(_s5_t, _s5_x5, ad_const(_s5_t, 0));
+var _s5g5t, _s5g5v = ad_grad(_s5_t, _s5_r5);
+var _s5_g5 = ad_grad_of(_s5_t, _s5_x5);
+assert_eq(f64_eq(_s5_g5, _s5_g5), 0, "reverse: x * 0 at x = +Inf, d/dx NaN (3.4.0: 0)");
+# The sign of a zero: d cos x / dx at +0 is -sin(+0) = -0 in both modes.
+ad_tape_reset(_s5_t);
+var _s5_x6 = ad_var(_s5_t, 0);
+var _s5_r6 = ad_cos(_s5_t, _s5_x6);
+var _s5g6t, _s5g6v = ad_grad(_s5_t, _s5_r6);
+assert_eq(ad_grad_of(_s5_t, _s5_x6), 0x8000000000000000,
+  "reverse: d cos x / dx at +0 = -0 (3.4.0: +0, summed from +0)");
+assert_eq(Dual_deriv(dual_cos(dual_var(0))), 0x8000000000000000, "forward: the same -0");
+ad_tape_reset(_s5_t);
+var _s5_x7 = ad_var(_s5_t, 0x3FF8000000000000);
+var _s5_r7 = ad_mul(_s5_t, _s5_x7, ad_const(_s5_t, 0x8000000000000000));
+var _s5_u7 = ad_var(_s5_t, F64_ONE);
+var _s5g7t, _s5g7v = ad_grad(_s5_t, _s5_r7);
+assert_eq(ad_grad_of(_s5_t, _s5_x7), 0,
+  "reverse: d (x * const -0) / dx at 1.5 = +0, the constant zero annihilates (3.4.1 SYM2; the first draft: -0)");
+assert_eq(ad_grad_of(_s5_t, _s5_u7), 0, "reverse: a node above the root reads +0");
+assert_eq(Dual_deriv(dual_mul(dual_var(0x3FF8000000000000), dual_const(0x8000000000000000))), 0,
+  "forward: the same +0, x * const -0 is the constant -0 (3.4.1 SYM2; the first draft: -0)");
+# The same through the second operand: d (-0 * x) / dx at 1.5 = +0 (3.4.1 SYM2).
+ad_tape_reset(_s5_t);
+var _s5_x9 = ad_var(_s5_t, 0x3FF8000000000000);
+var _s5_r9 = ad_mul(_s5_t, ad_const(_s5_t, 0x8000000000000000), _s5_x9);
+var _s5g9t, _s5g9v = ad_grad(_s5_t, _s5_r9);
+assert_eq(ad_grad_of(_s5_t, _s5_x9), 0, "reverse: d (const -0 * x) / dx at 1.5 = +0 (3.4.1 SYM2; the first draft: -0)");
+assert_eq(Dual_deriv(dual_mul(dual_const(0x8000000000000000), dual_var(0x3FF8000000000000))), 0,
+  "forward: the same +0 (3.4.1 SYM2)");
+# A NaN value from div (Inf / Inf) has a NaN derivative in both modes.
+var _s5_fa = Dual_deriv(dual_div(dual_var(F64_POS_INF), dual_const(F64_POS_INF)));
+assert_eq(f64_eq(_s5_fa, _s5_fa), 0, "forward: x / Inf at x = +Inf, derivative NaN");
+ad_tape_reset(_s5_t);
+var _s5_xa = ad_var(_s5_t, F64_POS_INF);
+var _s5_ra = ad_div(_s5_t, _s5_xa, ad_const(_s5_t, F64_POS_INF));
+var _s5gat, _s5gav = ad_grad(_s5_t, _s5_ra);
+var _s5_ga = ad_grad_of(_s5_t, _s5_xa);
+assert_eq(f64_eq(_s5_ga, _s5_ga), 0, "reverse: x / Inf at x = +Inf, d/dx NaN (3.4.0: 1/Inf = 0)");
+# A constant has the tangent +0, whatever its value: no op forms 0 * Inf, 0 * NaN or a
+# zero's sign from a constant's tangent.
+assert_eq(Dual_deriv(dual_cos(dual_const(0x3FF8000000000000))), 0, "forward: cos(const 1.5): +0 (3.4.0: -0)");
+assert_eq(Dual_deriv(dual_neg(dual_const(F64_TWO))), 0, "forward: -(const 2): +0 (3.4.0: -0)");
+assert_eq(Dual_deriv(dual_sin(dual_const(F64_POS_INF))), 0, "forward: sin(const +Inf): +0 (3.4.0: 0 * NaN = NaN)");
+assert_eq(Dual_deriv(dual_ln(dual_const(0x7FF8000000000000))), 0, "forward: ln(const NaN): +0 (3.4.0: 0 / NaN = NaN)");
+assert_eq(Dual_deriv(dual_sqrt(dual_const(0x7FF8000000000000))), 0, "forward: sqrt(const NaN): +0 (3.4.0: NaN)");
+assert_eq(Dual_deriv(dual_abs(dual_const(f64_from(0 - 3)))), 0, "forward: |const -3|: +0 (3.4.0: -0)");
+assert_eq(Dual_deriv(dual_pow(dual_const(0), F64_HALF)), 0, "forward: (const 0)^0.5: +0 (3.4.0: 0 * Inf = NaN)");
+assert_eq(Dual_deriv(dual_mul(dual_const(F64_POS_INF), dual_const(0))), 0,
+  "forward: const Inf * const 0: +0, a constant with a NaN value (3.4.0: NaN)");
+assert_eq(Dual_deriv(dual_div(dual_const(F64_POS_INF), dual_const(F64_POS_INF))), 0,
+  "forward: const Inf / const Inf: +0 (3.4.0: NaN)");
+assert_eq(Dual_deriv(dual_mul(dual_const(F64_TWO), dual_var(F64_POS_INF))), F64_TWO,
+  "forward: 2 * x at x = +Inf: 2, the first operand's constant term dropped (3.4.0: NaN)");
+# A miss is the constant 0 on the tape too: a NaN partial upstream does not cross it.
+ad_tape_reset(_s5_t);
+var _s5_kx = ad_var(_s5_t, 0);
+var _s5_kin = ad_add(_s5_t, ad_const(_s5_t, 0xBFF8000000000000),
+  ad_sub(_s5_t, ad_pow(_s5_t, _s5_kx, F64_HALF), ad_pow(_s5_t, _s5_kx, F64_HALF)));
+var _s5_ks = ad_sqrt(_s5_t, _s5_kin);
+var _s5gst, _s5gsv = ad_grad(_s5_t, _s5_ks);
+assert_eq(ad_grad_of(_s5_t, _s5_kx), _AD_NAN,
+  "ad_sqrt at -1.5 with a NaN partial upstream: a moving miss's NaN, as dual_sqrt's");
+var _s5_kd = ad_div(_s5_t, ad_const(_s5_t, F64_TWO), ad_add(_s5_t, _s5_kin, ad_const(_s5_t, 0x3FF8000000000000)));
+var _s5gdt, _s5gdv = ad_grad(_s5_t, _s5_kd);
+assert_eq(ad_val(_s5_t, _s5_kd), 0, "ad_div(2, 0 with a NaN partial upstream): the miss's value 0");
+assert_eq(ad_grad_of(_s5_t, _s5_kx), _AD_NAN,
+  "ad_div(2, 0 with a NaN partial upstream): a moving miss's NaN, as dual_div's");
+# A chain of ops still agrees bit for bit: sin(exp(x)) at a full-mantissa x.
+var _s5_xv = 0x3FD3C0CA428C59FB;
+var _s5_f8 = dual_sin(dual_exp(dual_var(_s5_xv)));
+ad_tape_reset(_s5_t);
+var _s5_x8 = ad_var(_s5_t, _s5_xv);
+var _s5_r8 = ad_sin(_s5_t, ad_exp(_s5_t, _s5_x8));
+var _s5g8t, _s5g8v = ad_grad(_s5_t, _s5_r8);
+assert_eq(ad_grad_of(_s5_t, _s5_x8), Dual_deriv(_s5_f8), "sin(exp(x)): forward and reverse, bit for bit");
+assert_eq(Dual_deriv(_s5_f8), f64_mul(f64_exp(_s5_xv), f64_cos(f64_exp(_s5_xv))), "... = exp(x) cos(exp(x)) by hand");
+
+# === 3.4.1: expr_diff's power rule and its zero terms ===
+# Roadmap [3.4.1] (AU1 SYM-F1, SYM-F6). An exponent with no x that was not a CONST node took
+# the general rule f^g (g' ln f + g f'/f), whose 0 * ln f is NaN for f <= 0; and every rule
+# multiplied by a factor's derivative even where it was the constant 0, so the unsimplified
+# tree formed 0 * Inf. Oracles: the power rule's 3x^2 and the simplified tree.
+# [measured: scratch probe p2 on the 3.4.1 baseline, 2026-10-31: NaN at each row marked 3.4.0]
+test_group("3.4.1: expr_diff's power rule and its zero terms");
+var _s6_xn = str_from("x");
+var _s6_x = expr_var(_s6_xn);
+var _s6_y = expr_var(str_from("y"));
+var _s6_v = vec_new();
+vec_push(_s6_v, expr_bind(_s6_xn, 0xBFFBB303EC100C7C));
+vec_push(_s6_v, expr_bind(str_from("y"), f64_from(3)));
+var _s6_d1 = expr_diff(expr_pow(_s6_x, _s6_y), _s6_xn);
+var _s6e1t, _s6e1v = expr_eval_checked(_s6_d1, _s6_v);
+assert_eq(_s6e1v, 0x4021FB800DAD62C2, "d/dx x^y at x = BFFBB303EC100C7C, y = 3: 3x^2 (3.4.0: NaN)");
+assert_eq(_s6e1v, f64_mul(f64_mul(f64_from(3), ganita_f64_pow(0xBFFBB303EC100C7C, F64_TWO)), F64_ONE),
+  "... = 3 * x^2 * 1, the power rule composed by hand");
+var _s6_v0 = vec_new();
+vec_push(_s6_v0, expr_bind(_s6_xn, 0));
+vec_push(_s6_v0, expr_bind(str_from("y"), f64_from(3)));
+var _s6e2t, _s6e2v = expr_eval_checked(_s6_d1, _s6_v0);
+assert_eq(_s6e2v, 0, "d/dx x^y at x = 0, y = 3: 0 (3.4.0: NaN, 0 * ln 0)");
+assert_eq(_s6e2t == 0, 1, "... Ok");
+var _s6_d2 = expr_diff(expr_pow(_s6_x, expr_neg(expr_const(0xC008000000000000))), _s6_xn);
+var _s6_vm = vec_new();
+vec_push(_s6_vm, expr_bind(_s6_xn, 0xC000000000000000));
+var _s6e3t, _s6e3v = expr_eval_checked(_s6_d2, _s6_vm);
+assert_eq(_s6e3v, f64_from(12), "d/dx x^(-(-3)) at x = -2: 12, a NEG exponent takes the power rule (3.4.0: NaN)");
+var _s6_d3 = expr_diff(expr_pow(_s6_x, expr_const(0)), _s6_xn);
+assert_eq(expr_tag(_s6_d3), EXPR_CONST, "d/dx x^0 is the constant node 0");
+assert_eq(expr_const_val(_s6_d3), 0, "d/dx x^0 = +0 (3.4.0: (0 * x^-1) * 1, NaN at x = 0)");
+var _s6_d4 = expr_diff(expr_mul(expr_const(F64_TWO), expr_exp(_s6_x)), _s6_xn);
+assert_eq(str_eq(expr_to_str(_s6_d4), str_from("(2 * (exp(x) * 1))")), 1,
+  "d/dx 2 exp(x) = (2 * (exp(x) * 1)), no 0 * exp(x) term");
+var _s6_v7 = vec_new();
+vec_push(_s6_v7, expr_bind(_s6_xn, f64_from(710)));
+var _s6e4t, _s6e4v = expr_eval_checked(_s6_d4, _s6_v7);
+assert_eq(_s6e4v, F64_POS_INF, "d/dx 2 exp(x) at 710: +Inf, as the simplified tree (3.4.0: NaN, 0 * Inf)");
+var _s6_d5 = expr_diff(expr_pow(expr_const(F64_TWO), _s6_x), _s6_xn);
+var _s6_v3 = vec_new();
+vec_push(_s6_v3, expr_bind(_s6_xn, f64_from(3)));
+var _s6e5t, _s6e5v = expr_eval_checked(_s6_d5, _s6_v3);
+assert_eq(_s6e5v, f64_mul(ganita_f64_pow(F64_TWO, f64_from(3)), f64_mul(F64_ONE, f64_ln(F64_TWO))),
+  "d/dx 2^x at 3: 2^x (1 ln 2), the general rule without its f' term, by hand");
+var _s6_d6 = expr_diff(expr_pow(_s6_x, _s6_x), _s6_xn);
+var _s6_v2 = vec_new();
+vec_push(_s6_v2, expr_bind(_s6_xn, F64_TWO));
+var _s6e6t, _s6e6v = expr_eval_checked(_s6_d6, _s6_v2);
+assert_eq(_s6e6v, f64_mul(ganita_f64_pow(F64_TWO, F64_TWO), f64_add(f64_mul(F64_ONE, f64_ln(F64_TWO)),
+      f64_mul(F64_TWO, f64_mul(F64_ONE, ganita_f64_pow(F64_TWO, 0xBFF0000000000000))))),
+  "d/dx x^x at 2: the general rule, unchanged, by hand");
+var _s6_d7 = expr_diff(expr_mul(_s6_x, expr_exp(expr_const(f64_from(1000)))), _s6_xn);
+var _s6e7t, _s6e7v = expr_eval_checked(_s6_d7, _s6_v3);
+assert_eq(_s6e7v, F64_POS_INF,
+  "d/dx x exp(1000): +Inf, exp(1000)'s derivative the constant 0 (3.4.0: Inf + x (Inf * 0) = NaN)");
+var _s6_vi = vec_new();
+vec_push(_s6_vi, expr_bind(_s6_xn, F64_POS_INF));
+var _s6e9t, _s6e9v = expr_eval_checked(expr_diff(expr_mul(_s6_x, expr_const(F64_TWO)), _s6_xn), _s6_vi);
+assert_eq(_s6e9v, F64_TWO, "d/dx (x * 2) at x = +Inf: 2, the 2's 0 term left out (3.4.0: 1 * 2 + Inf * 0 = NaN)");
+var _s6_d8 = expr_diff(expr_pow(expr_const(1), _s6_x), _s6_xn);
+var _s6_vh = vec_new();
+vec_push(_s6_vh, expr_bind(_s6_xn, F64_HALF));
+var _s6e8t, _s6e8v = expr_eval_checked(_s6_d8, _s6_vh);
+assert_eq(_s6e8v, f64_mul(ganita_f64_pow(1, F64_HALF), f64_mul(F64_ONE, f64_ln(1))),
+  "d/dx (2^-1074)^x at 0.5: 2^-537 ln(2^-1074), finite (3.4.0: its g f'/f term was 0 * (2^-1074)^-1 = 0 * Inf, NaN)");
+assert_eq(str_eq(expr_to_str(expr_diff(expr_add(expr_const(F64_TWO), _s6_x), _s6_xn)), str_from("1")), 1,
+  "d/dx (2 + x) = 1 (3.4.0: (0 + 1))");
+var _s6_c3 = expr_const(f64_from(3));
+assert_eq(str_eq(expr_to_str(expr_diff(expr_mul(expr_const(F64_TWO), _s6_c3), _s6_xn)), str_from("0")), 1,
+  "d/dx (2 * 3) = 0 (3.4.0: ((0 * 3) + (2 * 0)))");
+assert_eq(str_eq(expr_to_str(expr_diff(expr_pow(expr_const(F64_TWO), _s6_c3), _s6_xn)), str_from("0")), 1,
+  "d/dx 2^3 = 0 (3.4.0: ((3 * (2^2)) * 0))");
+assert_eq(expr_diff(expr_add(_s6_x, _s6_y), 0), 0, "expr_diff with a 0 variable name -> 0");
+
+# === 3.4.1: the symbolic walkers on a 200,000-deep tree ===
+# Roadmap [3.4.1] (AU1 SYM-F3). Every walker recursed once per level, so a deep tree
+# overflowed the native stack: on the 3.4.1 baseline a 100,000-term left-folded sum exits
+# 139 under `ulimit -s 8192` in expr_eval_checked, expr_simplify, expr_diff, expr_to_str,
+# sym_to_latex, sym_integrate and sym_rewrite. Each now walks with its own heap stack.
+# Oracles: exact sums (every partial sum below is an integer or a multiple of 1/8 under
+# 2^53), the text's length, and a 200,000-deep chain of sin evaluated by hand.
+# [measured: scratch deep-tree probe p4 on the 3.4.1 baseline and lane, 2026-10-31: base exit 139 x 7, lane exit 0 x 8]
+test_group("3.4.1: the symbolic walkers on a 200,000-deep tree");
+var _s7_n = 200000;
+var _s7_xn = str_from("x");
+var _s7_x = expr_var(_s7_xn);
+var _s7_one = expr_const(F64_ONE);
+var _s7_e = _s7_x;
+for (var i = 1; i < _s7_n; i = i + 1) { _s7_e = expr_add(_s7_e, _s7_one); }
+var _s7_v = vec_new();
+vec_push(_s7_v, expr_bind(_s7_xn, F64_HALF));
+var _s7e1t, _s7e1v = expr_eval_checked(_s7_e, _s7_v);
+assert_eq(_s7e1v, f64_add(F64_HALF, f64_from(_s7_n - 1)), "eval: x + 1 + ... + 1 at x = 0.5 = 199999.5, exact");
+var _s7_s = expr_simplify(_s7_e);
+var _s7e2t, _s7e2v = expr_eval_checked(_s7_s, _s7_v);
+assert_eq(_s7e2v, _s7e1v, "simplify: a tree with the same value");
+var _s7_d = expr_diff(_s7_e, _s7_xn);
+assert_eq(expr_tag(_s7_d), EXPR_CONST, "diff: the sum's derivative is the constant node (its 0 terms left out)");
+assert_eq(expr_const_val(_s7_d), F64_ONE, "diff: d/dx = 1");
+var _s7_str = expr_to_str(_s7_e);
+assert_eq(str_len(_s7_str), 6 * (_s7_n - 1) + 1, "to_str: \"((x + 1) + 1)...\" is 6(n - 1) + 1 bytes");
+assert_eq(load8(str_data(_s7_str) + _s7_n - 1), 120, "to_str: n - 1 open parens, then x");
+var _s7_tex = sym_to_latex(_s7_e);
+assert_eq(str_len(_s7_tex), 4 * (_s7_n - 1) + 1, "sym_to_latex: \"x + 1 + 1...\" is 4(n - 1) + 1 bytes");
+var _s7_i = sym_integrate(_s7_e, _s7_xn);
+var _s7e3t, _s7e3v = expr_eval_checked(_s7_i, _s7_v);
+assert_eq(_s7e3v, f64_add(0x3FC0000000000000, f64_mul(F64_HALF, f64_from(_s7_n - 1))),
+  "integrate: 0.5 x^2 + x + ... + x at 0.5 = 0.125 + 0.5 (n - 1), exact");
+var _s7_rw = sym_rewrite(_s7_e, sym_default_rules());
+assert_eq(_s7_rw, _s7_e, "sym_rewrite: no rule fires, so the same tree comes back, node for node");
+assert_eq(sym_match(pat_add(pat_wildcard(str_from("a")), pat_wildcard(str_from("a"))), _s7_e), 0,
+  "sym_match: a + a does not match");
+assert_eq(sym_match(pat_add(pat_wildcard(str_from("a")), pat_const(F64_ONE)), _s7_e), 1,
+  "sym_match: a + 1 matches, a bound to the 199,999-deep left operand");
+# A chain of n sines: its value by hand, and its derivative's shape. (The derivative
+# shares each sin^k(x) with the chain, so as a tree it holds n^2 / 2 sines: its value is
+# checked by hand on a much shorter chain instead.)
+var _s7_c = _s7_x;
+var _s7_c1 = 0;
+for (var i = 0; i < _s7_n; i = i + 1) {
+    _s7_c1 = _s7_c;
+    _s7_c = expr_sin(_s7_c);
+}
+var _s7_hv = F64_HALF;
+for (var i = 0; i < _s7_n; i = i + 1) { _s7_hv = f64_sin(_s7_hv); }
+var _s7e4t, _s7e4v = expr_eval_checked(_s7_c, _s7_v);
+assert_eq(_s7e4v, _s7_hv, "eval: sin applied 200,000 times to 0.5, bit for bit");
+var _s7_cd = expr_diff(_s7_c, _s7_xn);
+assert_eq(expr_tag(_s7_cd), EXPR_MUL, "diff of the 200,000-deep chain: cos(sin^(n-1) x) * (...)");
+assert_eq(expr_tag(expr_left(_s7_cd)), EXPR_COS, "... whose first factor is a cos");
+assert_eq(expr_child(expr_left(_s7_cd)), _s7_c1, "... of the chain's own sin^(n-1) x, shared");
+var _s7_c2 = _s7_x;
+var _s7_hv2 = F64_HALF;
+var _s7_hd2 = F64_ONE;
+for (var i = 0; i < 2000; i = i + 1) {
+    _s7_c2 = expr_sin(_s7_c2);
+    _s7_hd2 = f64_mul(f64_cos(_s7_hv2), _s7_hd2);
+    _s7_hv2 = f64_sin(_s7_hv2);
+}
+var _s7e5t, _s7e5v = expr_eval_checked(expr_diff(_s7_c2, _s7_xn), _s7_v);
+assert_eq(_s7e5v, _s7_hd2, "diff of a 2,000-deep chain: the chain rule's product of 2,000 cosines, bit for bit");
+
+# === 3.4.1: a 0 node and a 0 name are refused, not read ===
+# Roadmap [3.4.1] (AU1 SYM-F8, NU2 F4, REV-NU2 N1). 0 is the failure handle of every node
+# constructor, so a failure value reaches these; through 3.4.0 each read through it (exit
+# 139). Two hand-built shapes the constructors cannot make are refused the same way.
+# [measured: scratch probes on the 3.4.1 baseline, 2026-10-31: exit 139 each]
+test_group("3.4.1: a 0 node and a 0 name are refused, not read");
+var _s8_x = expr_var(str_from("x"));
+assert_eq(expr_to_str(0), 0, "expr_to_str(0) -> 0");
+assert_eq(sym_to_latex(0), 0, "sym_to_latex(0) -> 0");
+assert_eq(sym_integrate(0, str_from("x")), 0, "sym_integrate(0, x) -> 0");
+assert_eq(sym_integrate(_s8_x, 0), 0, "sym_integrate(x, 0) -> 0");
+var _s8_hole = alloc(24);
+store64(_s8_hole, EXPR_ADD);
+store64(_s8_hole + 8, _s8_x);
+store64(_s8_hole + 16, 0);
+assert_eq(expr_to_str(expr_neg(_s8_hole)), 0, "expr_to_str of a sum with a 0 operand -> 0");
+assert_eq(sym_to_latex(expr_neg(_s8_hole)), 0, "sym_to_latex of a sum with a 0 operand -> 0");
+assert_eq(sym_integrate(expr_neg(_s8_hole), str_from("x")), 0, "sym_integrate of a sum with a 0 operand -> 0");
+assert_eq(expr_simplify(expr_neg(_s8_hole)), 0, "expr_simplify of a sum with a 0 operand -> 0");
+var _s8_pw = alloc(24);
+store64(_s8_pw, EXPR_POW);
+store64(_s8_pw + 8, _s8_x);
+store64(_s8_pw + 16, 0);
+assert_eq(expr_diff(_s8_pw, str_from("x")), 0, "expr_diff of x^<0> -> 0 (3.4.0: read through the 0 exponent)");
+assert_eq(sym_rewrite(0, sym_default_rules()), 0, "sym_rewrite(0, rules) -> 0");
+assert_eq(sym_rewrite(_s8_x, 0), 0, "sym_rewrite(x, 0) -> 0");
+assert_eq(sym_match(0, _s8_x), 0, "sym_match(0, x) -> 0");
+assert_eq(sym_match(pat_wildcard(str_from("a")), 0), 0, "sym_match(a, 0) -> 0");
+assert_eq(expr_bind(0, F64_ONE), 0, "expr_bind(0, v) -> 0 (3.4.0: a pair with no name)");
+var _s8_vars = vec_new();
+var _s8_pair = alloc(16);
+store64(_s8_pair, 0);
+store64(_s8_pair + 8, F64_TWO);
+vec_push(_s8_vars, _s8_pair);
+var _s8e1t, _s8e1v = expr_eval_checked(_s8_x, _s8_vars);
+assert_eq(_s8e1v, HSB_ERR_INVALID_INPUT,
+  "expr_eval_checked: a pair with a 0 name binds nothing (3.4.0: read in str_eq)");
+vec_push(_s8_vars, expr_bind(str_from("x"), f64_from(3)));
+var _s8e2t, _s8e2v = expr_eval_checked(_s8_x, _s8_vars);
+assert_eq(_s8e2v, f64_from(3), "... and the next pair still binds x");
+
+# === 3.4.1: sym_rewrite's rules, work bound and fixpoint ===
+# Roadmap [3.4.1] (AU2-G6-F14, F15, AU1 SYM-F5). max_iter bounded passes, not work: a
+# self-embedding rule doubled the tree every pass until the recursion overflowed (exit 139);
+# a template naming an unbound wildcard made a rule that silently never fired; and a +Inf
+# constant read as a change on every pass, so the fixpoint was never reached.
+# [measured: scratch probes p2 and p6 on the 3.4.1 baseline and lane, 2026-10-31]
+test_group("3.4.1: sym_rewrite's rules, work bound and fixpoint");
+var _s9_x = expr_var(str_from("x"));
+var _s9_wa = pat_wildcard(str_from("a"));
+assert_eq(sym_rule(pat_var(str_from("x")), pat_wildcard(str_from("b"))), 0,
+  "sym_rule(var x -> wildcard b): b is unbound, no rule (3.4.0: a rule that never fired)");
+assert_eq(sym_rule(pat_sin(_s9_wa), pat_any_const(str_from("c"))), 0,
+  "sym_rule: an unbound any-constant name, no rule");
+var _s9_cc = pat_any_const(str_from("c"));
+assert_eq(sym_rule(pat_add(_s9_wa, _s9_cc), pat_mul(_s9_cc, _s9_wa)) != 0, 1,
+  "sym_rule: every template name bound by the pattern, a rule");
+var _s9_r0 = vec_new();
+vec_push(_s9_r0, sym_rule(pat_var(str_from("x")), pat_wildcard(str_from("b"))));
+assert_eq(sym_rewrite(expr_add(_s9_x, _s9_x), _s9_r0), 0,
+  "sym_rewrite with a refused rule (a 0 in rules) -> 0 (3.4.0: x + x)");
+var _s9_e5 = expr_add(expr_add(_s9_x, expr_neg(_s9_x)), expr_const(F64_POS_INF));
+assert_eq(str_eq(expr_to_str(sym_rewrite(_s9_e5, sym_default_rules())), str_from("(0 + inf)")), 1,
+  "sym_rewrite((x + -x) + inf) = (0 + inf) (3.4.0: unchanged, 50 passes on the first rule)");
+var _s9_e6 = expr_add(expr_add(_s9_x, expr_neg(_s9_x)), expr_const(0x7FF8000000000000));
+assert_eq(str_eq(expr_to_str(sym_rewrite(_s9_e6, sym_default_rules())), str_from("(0 + nan)")), 1,
+  "sym_rewrite((x + -x) + nan) = (0 + nan)");
+# A rule that rebuilds the same tree with a fresh +Inf node is no change either.
+var _s9_ri = vec_new();
+vec_push(_s9_ri, sym_rule(pat_add(_s9_wa, pat_any_const(str_from("c"))), pat_add(_s9_wa, pat_const(F64_POS_INF))));
+var _s9_rdf = sym_default_rules();
+for (var i = 0; i < vec_len(_s9_rdf); i = i + 1) { vec_push(_s9_ri, vec_get(_s9_rdf, i)); }
+assert_eq(str_eq(expr_to_str(sym_rewrite(_s9_e5, _s9_ri)), str_from("(0 + inf)")), 1,
+  "sym_rewrite: {a + c -> a + inf} then the defaults: a fresh +Inf with the same bits is no change, (0 + inf)");
+var _s9_ci = expr_const(F64_POS_INF);
+var _s9_cn = sym_rewrite(expr_add(_s9_ci, expr_neg(_s9_ci)), sym_default_rules());
+assert_eq(str_eq(expr_to_str(_s9_cn), str_from("(inf + -inf)")), 1,
+  "sym_rewrite(inf + -inf): unchanged, a + neg(a) does not match a non-finite constant (Inf - Inf is NaN, not 0)");
+# 3.4.1 SYM2: the bound is ALLOC_MAX's now (tests/edge_cases.tcyr, group "3.4.1 SYM2: sym_rewrite's
+# size bound is ALLOC_MAX"); at the default 2 GiB the doubling rule is refused only after 9 to 10 s,
+# so these two run at ALLOC_MAX = 16 MiB.
+# [measured: scratch rewrite probe at the default ALLOC_MAX, SYM4 tree, 2026-11-01; cycc 6.7.18]
+var _s9_amk = ALLOC_MAX;
+var _s9_rd = vec_new();
+vec_push(_s9_rd, sym_rule(pat_sin(_s9_wa), pat_sin(pat_sin(_s9_wa))));
+var _s9_u0 = alloc_used();
+ALLOC_MAX = 0x1000000;
+var _s9_rdr = sym_rewrite(expr_sin(_s9_x), _s9_rd);
+ALLOC_MAX = _s9_amk;
+assert_eq(_s9_rdr, 0,
+  "sym_rewrite({sin(a) -> sin(sin(a))}, sin(x)): doubles each pass, refused past ALLOC_MAX = 16 MiB (3.4.0: exit 139)");
+assert_eq(alloc_used() - _s9_u0 < 200000000, 1, "... within 200 MB of heap");
+var _s9_rw2 = vec_new();
+vec_push(_s9_rw2, sym_rule(_s9_wa, pat_add(_s9_wa, _s9_wa)));
+var _s9_u2 = alloc_used();
+ALLOC_MAX = 0x1000000;
+var _s9_rw2r = sym_rewrite(expr_sin(expr_cos(_s9_x)), _s9_rw2);
+ALLOC_MAX = _s9_amk;
+assert_eq(_s9_rw2r, 0,
+  "sym_rewrite({a -> a + a}, sin(cos(x))): a shallow tree tripling each pass, refused past ALLOC_MAX = 16 MiB");
+assert_eq(alloc_used() - _s9_u2 < 200000000, 1, "... within 200 MB of heap");
+var _s9_rl = vec_new();
+vec_push(_s9_rl, sym_rule(pat_var(str_from("x")), pat_sin(pat_var(str_from("x")))));
+var _s9_lin = sym_rewrite(_s9_x, _s9_rl);
+var _s9_dep = 0;
+var _s9_w = _s9_lin;
+while (_s9_w != 0 && expr_tag(_s9_w) == EXPR_SIN) { _s9_dep = _s9_dep + 1; _s9_w = expr_child(_s9_w); }
+assert_eq(_s9_dep, 50, "sym_rewrite({x -> sin(x)}, x): linear growth stops after max_iter, sin applied 50 times");
+assert_eq(str_eq(expr_to_str(_s9_w), str_from("x")), 1, "... over x");
+var _s9_ex = expr_add(expr_add(expr_pow(expr_sin(_s9_x), expr_const(F64_TWO)),
+    expr_pow(expr_cos(_s9_x), expr_const(F64_TWO))),
+  expr_mul(_s9_x, _s9_x));
+assert_eq(str_eq(expr_to_str(sym_rewrite(_s9_ex, sym_default_rules())), str_from("(1 + (x^2))")), 1,
+  "sym_rewrite(sin^2 x + cos^2 x + x x) = (1 + (x^2)), as before");
+var _s9_e1 = expr_add(_s9_x, expr_const(F64_ONE));
+assert_eq(sym_rewrite(_s9_e1, sym_default_rules()), _s9_e1, "sym_rewrite: a tree no rule changes comes back itself");
+# A pass that changes nothing rebuilds nothing: b + sin(b) nine times over x + 1, a tree
+# that no default rule matches (each step doubles its size as a tree and adds two nodes).
+var _s9_b = expr_add(_s9_x, expr_const(F64_ONE));
+for (var i = 0; i < 9; i = i + 1) { _s9_b = expr_add(_s9_b, expr_sin(_s9_b)); }
+var _s9_rules = sym_default_rules();
+var _s9_u1 = alloc_used();
+var _s9_rb = sym_rewrite(_s9_b, _s9_rules);
+assert_eq(alloc_used() - _s9_u1 < 65536, 1,
+  "sym_rewrite: a pass over 2,558 nodes that rewrites none allocates no node (3.4.0: every node rebuilt per rule)");
+assert_eq(_s9_rb, _s9_b, "... and returns the tree itself");
+
+# === 3.4.1: expr_to_str and sym_to_latex in linear memory ===
+# Roadmap [3.4.1] (AU1 SYM-F4). expr_to_str rendered every subtree to a Str of its own and
+# copied it into its parent's builder: a 20,000-node sum took 2,404,118,712 bytes of heap
+# (2.35 GB peak RSS); one builder now takes 2,229,672. At n = 5,000, the size below, the
+# quadratic form needs about 150 MB.
+# [measured: scratch memory probe p5 on the 3.4.1 baseline and lane, alloc_used deltas and VmHWM, 2026-10-31]
+test_group("3.4.1: expr_to_str and sym_to_latex in linear memory");
+var _s10_e = expr_var(str_from("x"));
+for (var i = 1; i < 5000; i = i + 1) { _s10_e = expr_add(_s10_e, expr_const(F64_ONE)); }
+var _s10_u0 = alloc_used();
+var _s10_s = expr_to_str(_s10_e);
+var _s10_u1 = alloc_used();
+assert_eq(str_len(_s10_s), 6 * 4999 + 1, "expr_to_str(5,000-node sum): the whole text");
+assert_eq(_s10_u1 - _s10_u0 < 1048576, 1,
+  "expr_to_str(5,000-node sum): under 1 MB of heap (3.4.0's form: about 150 MB)");
+var _s10_t = sym_to_latex(_s10_e);
+assert_eq(str_len(_s10_t), 4 * 4999 + 1, "sym_to_latex(5,000-node sum): the whole text");
+assert_eq(alloc_used() - _s10_u1 < 1048576, 1, "sym_to_latex(5,000-node sum): under 1 MB of heap");
+
+# === 3.4.1: a refused grow is the designed 0, not the stdlib's exit ===
+# Roadmap [3.4.1] (the stdlib's abort-on-refusal, NU2 F3). str_builder_add and
+# str_builder_putc print to fd 2 and exit(1) when the builder cannot grow; the renderers
+# now use the _a forms and answer 0. ALLOC_MAX is lowered so the 88-byte builder is
+# granted and its first growth past 64 bytes of text is refused, the call made, ALLOC_MAX
+# restored, and only then asserted.
+# [measured: scratch probe on the 3.4.1 baseline, 2026-10-31: "str_builder: alloc failed", exit 1]
+test_group("3.4.1: a refused grow is the designed 0, not the stdlib's exit");
+var _s11_name = str_from("a_variable_name_long_enough_that_its_text_passes_the_builders_first_64_bytes");
+var _s11_e = expr_add(expr_var(_s11_name), expr_const(F64_ONE));
+var _s11_keep = ALLOC_MAX;
+ALLOC_MAX = 127;
+var _s11_r1 = expr_to_str(_s11_e);
+var _s11_r2 = sym_to_latex(_s11_e);
+ALLOC_MAX = _s11_keep;
+assert_eq(_s11_r1, 0, "expr_to_str: a refused grow -> 0 (3.4.0: exit 1 inside str_builder_add)");
+assert_eq(_s11_r2, 0, "sym_to_latex: a refused grow -> 0 (3.4.0: exit 1 inside str_builder_putc)");
+assert_eq(str_len(expr_to_str(_s11_e)), str_len(_s11_name) + 6, "expr_to_str: with the heap open, the whole text");
+# The refusal on the text's last byte: "\mathrm{<52 letters>} + " fills the 64-byte buffer, and
+# the final x needs the grow.
+var _s11_n52 = str_from("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+var _s11_e2 = expr_add(expr_var(_s11_n52), expr_var(str_from("x")));
+ALLOC_MAX = 127;
+var _s11_r3 = sym_to_latex(_s11_e2);
+ALLOC_MAX = _s11_keep;
+assert_eq(_s11_r3, 0, "sym_to_latex: a refused grow on the last byte -> 0, not the text cut short");
+assert_eq(str_len(sym_to_latex(_s11_e2)), 65, "sym_to_latex: with the heap open, the whole 65-byte text");
+
 # === 3.4.0: _numx_dft writes nothing outside its work buffers (m0157) ===
 # KEEP THIS GROUP LAST (see the last paragraph).
 # 3.3.7's mutation sample left m0157 unpinned: the zero-fill writing `bv + i*16 - 8` for
@@ -6667,6 +7281,11 @@ assert_eq(ALLOC_MAX, _n4_amax, "ALLOC_MAX restored");
 # for everything that runs after it.
 # [measured: scratch mutant m0157 on this tree, hisab.tcyr exit 139 with this group, 2026-10-31]
 # [measured: scratch ulimit -v runs of the hisab.tcyr binary, this tree and integ-snap2, 2026-10-31]
+# A refused reservation is a loud failure, never a silent pass: at 540,000 KB this group
+# fails 8 assertions (the "granted" check, the DFT's Ok and its six values) and the suite
+# exits 1. Strict overcommit (mode 2) refuses through the same failed mmap; it was not run
+# (setting it needs root), and CI's vm.overcommit_memory is not checked by anything here.
+# [measured: scratch ulimit -v 540000 run of the hisab.tcyr binary, lane INS 3.4.1 tree, 2026-10-31; cycc 6.7.18]
 test_group("3.4.0: _numx_dft writes nothing outside its work buffers (m0157)");
 var _n4_G = 0x10000000;
 var _n4_K = 8 * 16;
@@ -6698,6 +7317,718 @@ assert_eq(load64(_n4_d + 32), 0x3FF242A3BAD91C63, "m0157: X[2].re");
 assert_eq(load64(_n4_d + 40), 0x4012ECD173EE9145, "m0157: X[2].im");
 sys_close(_n4_pw);
 sys_close(load32(&_n4_pipe));
+
+# === 3.4.1 CO3: shapes for the collision groups below ===
+# Support functions as the review's harnesses write them (and the counter of their calls):
+# a sphere [cx cy cz r], an oriented box [cx cy cz hx hy hz, u0, u1, u2], a z-cylinder
+# [cx cy cz r hz].
+var _co3_calls = 0;
+fn _co3_sph(shape, dir) {
+    _co3_calls = _co3_calls + 1;
+    var c = hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16));
+    return hvec3_add(c, hvec3_scale(hvec3_normalize(dir), load64(shape + 24)));
+}
+fn _co3_obb(shape, dir) {
+    _co3_calls = _co3_calls + 1;
+    var acc = hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16));
+    for (var oi = 0; oi < 3; oi = oi + 1) {
+        var u = hvec3_new(load64(shape + 48 + oi * 24), load64(shape + 56 + oi * 24), load64(shape + 64 + oi * 24));
+        var hh = load64(shape + 24 + oi * 8);
+        if (f64_lt(hvec3_dot(dir, u), 0) == 1) { hh = f64_neg(hh); }
+        acc = hvec3_add(acc, hvec3_scale(u, hh));
+    }
+    return acc;
+}
+fn _co3_cyl(shape, dir) {
+    _co3_calls = _co3_calls + 1;
+    var x = load64(shape);
+    var y = load64(shape + 8);
+    var dx = HVec3_x(dir);
+    var dy = HVec3_y(dir);
+    var pl = f64_sqrt(f64_add(f64_mul(dx, dx), f64_mul(dy, dy)));
+    if (f64_gt(pl, 0) == 1) {
+        var sc = f64_div(load64(shape + 24), pl);
+        x = f64_add(x, f64_mul(dx, sc));
+        y = f64_add(y, f64_mul(dy, sc));
+    }
+    var hz = load64(shape + 32);
+    if (f64_lt(HVec3_z(dir), 0) == 1) { hz = f64_neg(hz); }
+    return hvec3_new(x, y, f64_add(load64(shape + 16), hz));
+}
+fn _co3_s4(a, b, c, d) {
+    var s = alloc(32);
+    store64(s, a); store64(s + 8, b); store64(s + 16, c); store64(s + 24, d);
+    return s;
+}
+fn _co3_s5(a, b, c, d, e) {
+    var s = alloc(40);
+    store64(s, a); store64(s + 8, b); store64(s + 16, c); store64(s + 24, d); store64(s + 32, e);
+    return s;
+}
+fn _co3_s15(p) {
+    var s = alloc(120);
+    for (var i = 0; i < 15; i = i + 1) { store64(s + i * 8, load64(p + i * 8)); }
+    return s;
+}
+var _co3_n = alloc(8);
+var _co3_d = alloc(8);
+var _co3_n2 = alloc(8);
+var _co3_d2 = alloc(8);
+var _co3_t = alloc(8);
+# 1 where the two normals are each other's exact negation (every coordinate's bits).
+fn _co3_mirror(n1, n2) {
+    if (HVec3_x(n1) != (HVec3_x(n2) ^ 0x8000000000000000)) { return 0; }
+    if (HVec3_y(n1) != (HVec3_y(n2) ^ 0x8000000000000000)) { return 0; }
+    if (HVec3_z(n1) != (HVec3_z(n2) ^ 0x8000000000000000)) { return 0; }
+    return 1;
+}
+fn _co3_cap(shape, dir) {
+    _co3_calls = _co3_calls + 1;
+    var c = hvec3_new(load64(shape), load64(shape + 8), load64(shape + 16));
+    var a = hvec3_new(load64(shape + 24), load64(shape + 32), load64(shape + 40));
+    var p = hvec3_add(c, a);
+    if (f64_lt(hvec3_dot(dir, a), 0) == 1) { p = hvec3_sub(c, a); }
+    return hvec3_add(p, hvec3_scale(hvec3_normalize(dir), load64(shape + 48)));
+}
+
+# === 3.4.1 CO3: cga_norm -- a null blade answers on the fast path, as 3.4.0 did ===
+# Every non-zero coefficient in [2^-480, 2^508]: each formed term is normal, so the direct form
+# is the answer (the term analysis would choose it too). A conformal point is answered there
+# again, at 3.4.0's cost; a coefficient below 2^-480 still takes the analysis: 1.5 2^-540 e1,
+# whose square is subnormal, is its own norm exactly (a fast path widened to 2^-600: 1 ulp off).
+# [measured: lane CO3 cganorm.py and cgnull.py (seeds 1, 2; 9,000 + 20,000 blades), bit for bit 3.4.1-dev; 2026-10-31]
+var _co3_k = cga_mv_zero();
+cga_mv_set(_co3_k, 1, 0x1E38000000000000);
+assert_eq(cga_norm(_co3_k), 0x1E38000000000000, "cga_norm(1.5 2^-540 e1) = 1.5 2^-540 exactly (below the fast path)");
+assert_eq(cga_norm(cga_point(F64_ONE, F64_TWO, f64_from(3))), 0, "cga_norm: the exactly null point (1, 2, 3) is 0");
+# n0 + 1.5 2^-540 e1: n0 in the window, its partner 0 (no term), the norm² the subnormal
+# 2.25 2^-1080: the small coefficient sends it to the analysis, which answers 1.5 2^-540 exactly.
+var _co3_k1 = cga_mv_zero();
+cga_mv_set(_co3_k1, 4, F64_ONE);
+cga_mv_set(_co3_k1, 1, 0x1E38000000000000);
+assert_eq(cga_norm(_co3_k1), 0x1E38000000000000, "cga_norm(n0 + 1.5 2^-540 e1) = 1.5 2^-540 (not the fast path)");
+var _co3_k2 = cga_mv_zero();
+cga_mv_set(_co3_k2, 1, 0x2000000000000000);
+assert_eq(cga_norm(_co3_k2), 0x2000000000000000, "cga_norm(2^-511 e1) = 2^-511 (the fast window's other edge)");
+
+# === 3.4.1 CO3: cga_blade_inverse -- B has an inverse exactly where B B~ is not 0 ===
+# The exact norm² of the stored coefficients (an integer sum of the pairs' products) decides
+# existence, and its correctly rounded value divides. A unit sphere at 19998112 (B B~ = 1
+# exactly) is its own inverse; 3.4.0 called it null (its resolution bound) and lane CO's first
+# round projected onto it as NaN. Its exact projection of x = cga_point(1, 2, 3) (Fraction,
+# review RV-CO S3): e1, n0, ninf = C46B18EDA5209F17, C2E6BBAAA6558CD0, C5E0265755D4A12F.
+# [measured: lane CO3 cgainv.py (seeds 1 to 3, 9,000 blades, Fraction inverse) and cgafix.py; 2026-10-31]
+var _co3_sb = cga_sphere(0x4173125A00000000, 0, 0, F64_ONE);
+var _co3_si = cga_blade_inverse(_co3_sb);
+assert_eq(cga_mv_get(_co3_si, 1), 0x4173125A00000000,
+  "cga_blade_inverse: the unit sphere at 19998112 is its own inverse (e1)");
+assert_eq(cga_mv_get(_co3_si, 5), 0x42E6BBAACC7A3FF0, "cga_blade_inverse: ... (ninf)");
+var _co3_px = cga_point(F64_ONE, F64_TWO, f64_from(3));
+var _co3_pj = cga_project(_co3_px, _co3_sb);
+assert_eq(cga_mv_get(_co3_pj, 1), 0xC46B18EDA5209F17, "cga_project onto it: the exact projection, e1 (3.4.0: 0)");
+assert_eq(cga_mv_get(_co3_pj, 4), 0xC2E6BBAAA6558CD0, "cga_project: ... n0");
+assert_eq(cga_mv_get(_co3_pj, 5), 0xC5E0265755D4A12F, "cga_project: ... ninf");
+# A conformal point with full-mantissa coordinates rounds its q/2: as stored its exact norm²
+# is 1.92e-16, and it inverts (the inverse of the stored vector, 0.34 ulp at worst).
+# [measured: lane CO3 cgafix.py, Fraction inverse of the stored point; 2026-10-31]
+var _co3_fp = cga_blade_inverse(cga_point(0x3FF3A5C91E2B7D41, 0xBFE5E0F1A2B3C4D5, 0x3FE3C2B1A0F9E8D7));
+assert_eq(cga_mv_get(_co3_fp, 1), 0x4336BA24C26F6A68, "cga_blade_inverse: a rounded point inverts as stored (e1)");
+assert_eq(cga_mv_get(_co3_fp, 4), 0x433281FF96784559, "cga_blade_inverse: ... (n0)");
+# A negative norm²: n0 + ninf has B B~ = -2, its inverse -(n0 + ninf) / 2.
+var _co3_ng = cga_mv_zero();
+cga_mv_set(_co3_ng, 4, F64_ONE);
+cga_mv_set(_co3_ng, 5, F64_ONE);
+var _co3_ngi = cga_blade_inverse(_co3_ng);
+assert_eq(cga_mv_get(_co3_ngi, 4), 0xBFE0000000000000, "cga_blade_inverse(n0 + ninf): norm² -2, n0 = -1/2");
+assert_eq(cga_mv_get(_co3_ngi, 5), 0xBFE0000000000000, "cga_blade_inverse(n0 + ninf): ... ninf = -1/2");
+# Rounding: e1 + n0 - 2^-54 ninf + 2^-40 e2 has the exact norm² 1 + 2^-53 + 2^-80, which rounds
+# up to 1 + 2^-52 (above the tie): e1 of the inverse 1 / (1 + 2^-52). Without the 2^-80 term
+# the norm² 1 + 2^-53 is the tie itself, rounded to the even 1: e1 = 1.
+var _co3_rt = cga_mv_zero();
+cga_mv_set(_co3_rt, 1, F64_ONE);
+cga_mv_set(_co3_rt, 2, 0x3D70000000000000);
+cga_mv_set(_co3_rt, 4, F64_ONE);
+cga_mv_set(_co3_rt, 5, 0xBC90000000000000);
+assert_eq(cga_mv_get(cga_blade_inverse(_co3_rt), 1), 0x3FEFFFFFFFFFFFFE,
+  "cga_blade_inverse: norm² 1 + 2^-53 + 2^-80 rounds up (e1 = 1 / (1 + 2^-52))");
+cga_mv_set(_co3_rt, 2, 0);
+assert_eq(cga_mv_get(cga_blade_inverse(_co3_rt), 1), F64_ONE,
+  "cga_blade_inverse: norm² 1 + 2^-53, the tie, rounds to even (e1 = 1)");
+# A one-step coefficient: 2^-1074 e1 has the exact norm² 2^-2148, and its inverse 2^1074 is +Inf
+# (3.4.0 called it null on its rounding).
+var _co3_ss = cga_mv_zero();
+cga_mv_set(_co3_ss, 1, 1);
+assert_eq(cga_mv_get(cga_blade_inverse(_co3_ss), 1), F64_POS_INF,
+  "cga_blade_inverse(2^-1074 e1): +Inf (3.4.0: the zero multivector)");
+# A subnormal inverse coefficient, rounded once: 2^520 e1 + (3 + 2^-51) e2 has the norm²
+# 2^1040 (+ 9.000..., below its ulp), and e2 of the inverse is (3 + 2^-51) 2^-1040, on the
+# subnormal grid 3 2^-1040 = 0x0000000C00000000 (one rounding, of the 2^-51).
+var _co3_sub = cga_mv_zero();
+cga_mv_set(_co3_sub, 1, 0x6070000000000000);
+cga_mv_set(_co3_sub, 2, 0x4008000000000001);
+var _co3_subi = cga_blade_inverse(_co3_sub);
+assert_eq(cga_mv_get(_co3_subi, 2), 0x0000000C00000000,
+  "cga_blade_inverse: a subnormal coefficient, 3 2^-1040, rounded once");
+assert_eq(cga_mv_get(_co3_subi, 1), 0x1F70000000000000, "cga_blade_inverse: ... and e1 = 2^-520");
+
+# === 3.4.1 CO3: a sphere on a cylinder's side -- the round fit ===
+# EPA's answer stood at its certificate on the cylinder's curved side: 2,272 eps deep here
+# (3.4.1-dev: 3.81935337e-4, exact 3.8193524044131987e-4 from the centre distance, Decimal). The
+# crease is projected off and the sinusoid fitted along the rim (_epa_round_fit): 0.002 eps,
+# and the normal at the crease (z within 1e-16). Both orders and both depth entries agree.
+# [measured: lane CO3 fixgen.py (cylang seed 1, the worst 3.4.1-dev side pair), exact oracle; 2026-10-31]
+var _co3_cy = _co3_s5(0, 0x8000000000000000, 0, 0x3FF19A9788414CA5, 0x3FF49AA5013E4503);
+var _co3_cs = _co3_s4(0x3FEE2F87070430F4, 0x3FF834EC4031D56F, 0xBFDDFE6B351D226F, 0x3FE5DB7EB8D0905B);
+assert_eq(gjk_epa_3d(&_co3_cyl, _co3_cy, &_co3_sph, _co3_cs, _co3_n, _co3_d), 1,
+  "gjk_epa_3d: a sphere into a cylinder's side");
+assert_eq(load64(_co3_d), 0x3F3907CF5DEC397E,
+  "gjk_epa_3d: ... depth 3.8193524044e-4, 0.002 eps from the exact (3.4.1-dev: 2,272 eps)");
+assert_eq(HVec3_x(load64(_co3_n)), 0x3FE0EE3C7CDEE3D3, "gjk_epa_3d: ... normal x (the rim's closed form)");
+assert_eq(f64_lt(f64_abs(HVec3_z(load64(_co3_n))), 0x3CB0000000000000), 1,
+  "gjk_epa_3d: ... normal z below 2^-52 (the crease)");
+assert_eq(gjk_epa_3d(&_co3_sph, _co3_cs, &_co3_cyl, _co3_cy, _co3_n2, _co3_d2), 1, "gjk_epa_3d: ... sphere first");
+assert_eq(load64(_co3_d2) == load64(_co3_d) && _co3_mirror(load64(_co3_n), load64(_co3_n2)) == 1, 1,
+  "gjk_epa_3d: ... sphere first, the same depth and the normal mirrored");
+assert_eq(mpr_penetration(&_co3_sph, _co3_cs, &_co3_cyl, _co3_cy, _co3_n2, _co3_d2), 1,
+  "mpr_penetration: ... sphere first");
+assert_eq(load64(_co3_d2), 0x3F3907CF5DEC2DDC,
+  "mpr_penetration: ... depth 0.0017 eps from the exact (3.4.1-dev: 2,525 eps worst)");
+
+# At 1e3 the fitted normal is lower than EPA's by less than the supports' rounding: the fit's
+# closed form is taken at that tie (its h no higher but for the rounding), as the snap's is.
+# EPA's normal was 1.6e-7 rad off there, the closed form's is within the 1e-8 the check reads.
+# [measured: lane CO3 cylang.py seed 1 (offset 1e3 side pairs), the tie-rule mutant; 2026-10-31]
+var _co3_cy3 = _co3_s5(0x408F400000000000, 0xC09F400000000000, 0x407F400000000000, 0x3FE3CF80EEADEB54,
+  0x3FF742F0EB9AC36B);
+var _co3_cs3 = _co3_s4(0x408F4815FAADFB5E, 0xC09F3C9127D5D546, 0x407F46E4F440F62B, 0x3FE69ED2F7AEAA80);
+assert_eq(gjk_epa_3d(&_co3_cyl, _co3_cy3, &_co3_sph, _co3_cs3, _co3_n, _co3_d), 1,
+  "gjk_epa_3d: a cylinder side at 1e3");
+assert_eq(HVec3_x(load64(_co3_n)), 0x3FE86479DE4645C3, "gjk_epa_3d: ... normal x, the fit's at the tie");
+assert_eq(HVec3_y(load64(_co3_n)), 0x3FE4B664E1DB473E, "gjk_epa_3d: ... normal y");
+
+# === 3.4.1 CO3: a tiny ball deep in a box corner -- EPA on the core ===
+# CO's F1: a sphere of radius 9.9e-5 whose centre is ~1e-9 inside a box near a corner. The
+# corner's cone is flat to the face distances and every box face normal is a local minimum:
+# 3.4.0 and lane CO stopped on the second-nearest face, 9.909386929e-5 (81,360 eps). EPA on the
+# core (the box, the centre a point, _epa_core_retry): the nearest face, 9.90892445037e-5
+# (exact 9.9089244503825614e-5, the face-plane distance in Fractions).
+# [measured: lane CO3 f1.py, exact parallelepiped faces; deepc.py seeds 11 to 14 (2,400 answers each); 2026-10-31]
+var _co3_f1b = alloc(120);
+store64(_co3_f1b, 0); store64(_co3_f1b + 8, 0x8000000000000000); store64(_co3_f1b + 16, 0);
+store64(_co3_f1b + 24, 0x3FF02E63E70ED9FC); store64(_co3_f1b + 32, 0x3FF37149707A0324);
+store64(_co3_f1b + 40, 0x3FE36A71C237C4FC);
+store64(_co3_f1b + 48, 0xBFA98E8F0B92BB00); store64(_co3_f1b + 56, 0xBF855FAC416D90C0);
+store64(_co3_f1b + 64, 0xBFEFF55766C5E826);
+store64(_co3_f1b + 72, 0x3FEA27270F7DAAAD); store64(_co3_f1b + 80, 0xBFE267EFD5237FFC);
+store64(_co3_f1b + 88, 0xBFA1D63AD44FE4C0);
+store64(_co3_f1b + 96, 0xBFE25ED3E5BBED54); store64(_co3_f1b + 104, 0xBFEA2CAFDCD7CBBE);
+store64(_co3_f1b + 112, 0x3FA3112B87684930);
+var _co3_f1s = _co3_s4(0x3FF6454F4A22E606, 0xBFC896BD247BC8EA, 0x3FEE3E1B2D47A7B1, 0x3F19F7367095E2EE);
+assert_eq(gjk_epa_3d(&_co3_obb, _co3_f1b, &_co3_sph, _co3_f1s, _co3_n, _co3_d), 1,
+  "gjk_epa_3d: CO's F1 pair is a contact");
+assert_eq(load64(_co3_d), 0x3F19F9C44213C820,
+  "gjk_epa_3d: ... the nearest face, 0.004 eps from the exact (3.4.0: 9.909386929e-5)");
+assert_eq(gjk_epa_3d(&_co3_sph, _co3_f1s, &_co3_obb, _co3_f1b, _co3_n2, _co3_d2), 1, "gjk_epa_3d: ... ball first");
+assert_eq(load64(_co3_d2) == load64(_co3_d) && _co3_mirror(load64(_co3_n), load64(_co3_n2)) == 1, 1,
+  "gjk_epa_3d: ... ball first, the same depth and the normal mirrored");
+assert_eq(mpr_penetration(&_co3_sph, _co3_f1s, &_co3_obb, _co3_f1b, _co3_n2, _co3_d2), 1,
+  "mpr_penetration: ... ball first");
+assert_eq(load64(_co3_d2), 0x3F19F9C44213E000, "mpr_penetration: ... the nearest face, 0.002 eps from the exact");
+
+# A second corner (deepc.py seed 14), its faces 1.7e-11 apart in the centre's distances:
+# 3.4630921e-7 (303 eps) through 3.4.0, the nearest face now.
+# [measured: lane CO3 deepc.py seed 14, the exact face-plane oracle; 2026-10-31]
+var _co3_f2b = alloc(120);
+store64(_co3_f2b, 0); store64(_co3_f2b + 8, 0x8000000000000000); store64(_co3_f2b + 16, 0);
+store64(_co3_f2b + 24, 0x3FF50BC5A04D23CC); store64(_co3_f2b + 32, 0x3FE5263C09D16532);
+store64(_co3_f2b + 40, 0x3FF51259181D1BEC); store64(_co3_f2b + 48, 0xBFD793B8A5690E78);
+store64(_co3_f2b + 56, 0xBFC0EE6406B16EF1); store64(_co3_f2b + 64, 0xBFED7261B0F0A53E);
+store64(_co3_f2b + 72, 0x3FACF3CE809415B7); store64(_co3_f2b + 80, 0x3FEF83866243ED64);
+store64(_co3_f2b + 88, 0xBFC5046EC7B61B73); store64(_co3_f2b + 96, 0x3FEDB1C32D9BDAAC);
+store64(_co3_f2b + 104, 0xBFBCCE6D4E399946); store64(_co3_f2b + 112, 0xBFD6BD75E69DC320);
+var _co3_f2s = _co3_s4(0x3FFBE792430B9112, 0x3FE5A74E90A67B94, 0x3FE44969F7910EE9, 0x3E9739D5EB48124A);
+assert_eq(gjk_epa_3d(&_co3_obb, _co3_f2b, &_co3_sph, _co3_f2s, _co3_n, _co3_d), 1, "gjk_epa_3d: a second deep corner");
+assert_eq(load64(_co3_d), 0x3E973D40064C0000,
+  "gjk_epa_3d: ... depth 3.4629193e-7, 0.011 eps from the nearest face (3.4.0: 3.4630921e-7)");
+
+# === 3.4.1 CO3: one answer per pair, whichever order it is asked in ===
+# A ball 0.0024 eps from a capsule's side at 1e3 (in the band): 3.4.1-dev gave a miss capsule
+# first and a contact sphere first, from all five entry points. Since review pass CO3 the pair
+# runs in its canonical order and the band takes a contact from either order: a contact both
+# ways, the depth equal and the normal mirrored bit for bit, time_of_impact at rest included.
+# [measured: lane CO3 fixgen2.py (sweepo.py seed 21 pair 1644), 3.4.1-dev and this tree; 2026-10-31]
+var _co3_oc = alloc(56);
+store64(_co3_oc, 0x408F400000000000); store64(_co3_oc + 8, 0xC09F400000000000);
+store64(_co3_oc + 16, 0x407F400000000000);
+store64(_co3_oc + 24, 0xBFC46C415DB3FA8E); store64(_co3_oc + 32, 0x3F685EB6FAADFF83);
+store64(_co3_oc + 40, 0x3FE0B95461CA4C1B);
+store64(_co3_oc + 48, 0x3FE20AA1D0E6819C);
+var _co3_os = _co3_s4(0x408F47B944A1B9BA, 0xC09F41CC92BF02BC, 0x407F431A391218B3, 0x3FE074EC0F516504);
+assert_eq(gjk_intersect_3d(&_co3_cap, _co3_oc, &_co3_sph, _co3_os), 1,
+  "gjk_intersect_3d: the pair, capsule first: a contact (3.4.1-dev: a miss)");
+assert_eq(gjk_intersect_3d(&_co3_sph, _co3_os, &_co3_cap, _co3_oc), 1, "gjk_intersect_3d: ... sphere first: a contact");
+assert_eq(mpr_intersect(&_co3_cap, _co3_oc, &_co3_sph, _co3_os), 1, "mpr_intersect: ... capsule first");
+assert_eq(gjk_epa_3d(&_co3_cap, _co3_oc, &_co3_sph, _co3_os, _co3_n, _co3_d), 1, "gjk_epa_3d: ... capsule first");
+assert_eq(gjk_epa_3d(&_co3_sph, _co3_os, &_co3_cap, _co3_oc, _co3_n2, _co3_d2), 1, "gjk_epa_3d: ... sphere first");
+assert_eq(load64(_co3_d) == load64(_co3_d2) && _co3_mirror(load64(_co3_n), load64(_co3_n2)) == 1, 1,
+  "gjk_epa_3d: ... the same depth both ways, the normal mirrored");
+assert_eq(HVec3_x(load64(_co3_n)), 0x3FEBCCE38FBAC3B9, "gjk_epa_3d: ... normal x, capsule first");
+assert_eq(time_of_impact(&_co3_cap, _co3_oc, hvec3_zero(), &_co3_sph, _co3_os, hvec3_zero(), F64_ONE, _co3_t,
+    _co3_n2), 1,
+  "time_of_impact at rest: ... a contact at t = 0, as gjk_intersect_3d");
+assert_eq(HVec3_x(load64(_co3_n2)), 0x3FEBCCE38FBAC3B9, "time_of_impact: ... gjk_epa_3d's normal");
+# Outside the band every verdict agreed, but the depth's last bits came from the order: a ball
+# 7.3 eps into a box face, 0x3D55E8... box first and 0x3D55E6... ball first in 3.4.1-dev.
+var _co3_ab = alloc(120);
+store64(_co3_ab, 0); store64(_co3_ab + 8, 0x8000000000000000); store64(_co3_ab + 16, 0);
+store64(_co3_ab + 24, 0x3FF48427ADBC08D5); store64(_co3_ab + 32, 0x3FEA17FB01EA5DD3);
+store64(_co3_ab + 40, 0x3FE625A0ACFA8A74);
+store64(_co3_ab + 48, 0x3FDAA795ECD5E0B0); store64(_co3_ab + 56, 0xBFD8919280E4DA8D);
+store64(_co3_ab + 64, 0x3FEA5F36170D5846);
+store64(_co3_ab + 72, 0xBFD288B16AECC213); store64(_co3_ab + 80, 0x3FE9B432B4B0A749);
+store64(_co3_ab + 88, 0x3FE0A80400D5E0EF);
+store64(_co3_ab + 96, 0xBFEB93C7E6289418); store64(_co3_ab + 104, 0xBFDD25F368C662D5);
+store64(_co3_ab + 112, 0x3FCC9736C2FFDDB0);
+var _co3_as = _co3_s4(0x3FE48D0DEDA2756A, 0xBFEFF691A40292A0, 0x3FF68CCC5CA08D16, 0x3FE0F6F53BC9509E);
+assert_eq(gjk_epa_3d(&_co3_obb, _co3_ab, &_co3_sph, _co3_as, _co3_n, _co3_d), 1,
+  "gjk_epa_3d: a ball 7.3 eps into a box face");
+assert_eq(load64(_co3_d), 0x3D55E60000000000,
+  "gjk_epa_3d: ... box first, the canonical order's depth (3.4.1-dev: 0x3D55E8...)");
+assert_eq(gjk_epa_3d(&_co3_sph, _co3_as, &_co3_obb, _co3_ab, _co3_n2, _co3_d2), 1, "gjk_epa_3d: ... ball first");
+assert_eq(load64(_co3_d2), 0x3D55E60000000000, "gjk_epa_3d: ... ball first, the same depth");
+assert_eq(_co3_mirror(load64(_co3_n), load64(_co3_n2)), 1, "gjk_epa_3d: ... and the normal mirrored");
+# In the band two contacts' depths: the shallower is taken (each is h along its own normal, an
+# upper bound on the least h). A sphere off the side of a box 2^176 long at 2^-300, 8.39e-92
+# deep: 1.41e-91 ball first (the canonical order), 8.39e-92 box first; both calls 8.39e-92.
+# [measured: lane CO3 p92.py, review G2 aspect fixture (tests/modules_b.tcyr); 2026-10-31]
+var _co3_lb = alloc(120);
+for (var _co3_i = 0; _co3_i < 15; _co3_i = _co3_i + 1) { store64(_co3_lb + _co3_i * 8, 0); }
+store64(_co3_lb + 24, 0x3838C1131FDC4CB2); store64(_co3_lb + 32, 0x2D2936DE75E9160D);
+store64(_co3_lb + 40, 0x2D225A752B56ED5D);
+store64(_co3_lb + 48, F64_ONE); store64(_co3_lb + 80, F64_ONE); store64(_co3_lb + 112, F64_ONE);
+var _co3_ls = _co3_s4(0xB81C12562856308A, 0x2D3BEEC4A2A1BD31, 0x2D1AB92EF85E2F54, 0x2D320F62BE11E67E);
+assert_eq(gjk_epa_3d(&_co3_sph, _co3_ls, &_co3_obb, _co3_lb, _co3_n, _co3_d), 1,
+  "gjk_epa_3d: the 2^176-long box, ball first");
+assert_eq(load64(_co3_d), 0x2D05E06AB325ABB7,
+  "gjk_epa_3d: ... 8.390188e-92, the shallower order's (exact 8.390188444980945e-92)");
+
+# === 3.4.1 CO3: time_of_impact -- a small ball's corner normal read again with a wider tilt ===
+# A ball of radius 1e-6 swept onto a box corner: the vertex form carried the snap's rho reading
+# (rounding over a 2^-10 tilt) times the reading's own offset, 1.05e-7 rad from the
+# closest-approach direction at the reported t (3.4.1-dev). Read again from the first answer with
+# a tilt of 2^-4: 4.0e-10 rad (the ulp(|s|) / r floor). t is unchanged.
+# [measured: lane CO3 toin.py (seed 4, 40 corner sweeps at r = 1e-6), Decimal closest-approach oracle; 2026-10-31]
+var _co3_tb = alloc(120);
+store64(_co3_tb, 0); store64(_co3_tb + 8, 0); store64(_co3_tb + 16, 0);
+store64(_co3_tb + 24, 0x3FECFEDD5B862EEE); store64(_co3_tb + 32, 0x3FF195A4CE7990E8);
+store64(_co3_tb + 40, 0x3FF659993CFACBC0);
+store64(_co3_tb + 48, 0xBFC8A8BB0BF6C110); store64(_co3_tb + 56, 0xBFDE0050C040CD1C);
+store64(_co3_tb + 64, 0xBFEB95F7CF972CAD);
+store64(_co3_tb + 72, 0x3FECD15F9F818CC4); store64(_co3_tb + 80, 0xBFDBBC5CA485A218);
+store64(_co3_tb + 88, 0x3FA19D9750AB37C8);
+store64(_co3_tb + 96, 0xBFD8F128A8FE641A); store64(_co3_tb + 104, 0xBFE8A16A6FA6F73C);
+store64(_co3_tb + 112, 0x3FE02E39BF298CF0);
+var _co3_ts = _co3_s4(0x3FE780E7E58D5755, 0xC00C579F4903CA94, 0x400A66415A039301, 0x3EB0C6F7A0B5ED8D);
+var _co3_tv = hvec3_new(0xBFB21276D118EF10, 0x3FF7D1CFADB1CB82, 0xBFF17F071A2C83C3);
+assert_eq(time_of_impact(&_co3_obb, _co3_tb, hvec3_zero(), &_co3_sph, _co3_ts, _co3_tv, f64_from(10), _co3_t,
+    _co3_n), 1,
+  "time_of_impact: a ball of radius 1e-6 swept onto a box corner hits");
+assert_eq(load64(_co3_t), 0x3FF9F774C1D050DA, "time_of_impact: ... at the same t as 3.4.1-dev");
+assert_eq(HVec3_x(load64(_co3_n)), 0x3FA38D91B556C3DD,
+  "time_of_impact: ... normal x, 4.0e-10 rad off (3.4.1-dev: ...769C0A03, 1.05e-7)");
+assert_eq(HVec3_y(load64(_co3_n)), 0xBFE9C57B84A2D050, "time_of_impact: ... normal y");
+assert_eq(HVec3_z(load64(_co3_n)), 0x3FE2EE0D2D16CA5A, "time_of_impact: ... normal z");
+
+# === 3.4.1 CO4: delaunay_2d -- a refused allocation is 0, never the empty vec ===
+# The empty vec is delaunay_2d's answer for n < 3, a collinear set and a rejected site, so
+# through lane CO2 a refused allocation, which answered it too, read as "nothing to mesh". Each
+# set below is swept from k = 0, every 8 bytes, to its first answer, with the heap exhausted
+# after k bytes (tests/abuse.tcyr's instrument, lane AL, copied here so the group stands alone):
+# every point before the answer must be 0, and the answer must be the heap-open one -- no empty
+# vec and no partial mesh. On the CO2 tree each set answered 0 only at its first 19 points (the
+# result vec's own two requests) and the empty vec at every later refusal -- 401, 433, 2,705,
+# 2,737, 298 and 752 points for the six sets with triangles -- and the collinear set stopped at
+# its 19th; here they answer 0 at 420, 452, 2,724, 2,756, 317, 771 and 420 points, and nothing else.
+# [measured: lane CO4 3.4.1 dlsw probe of this group's sweep, the CO2 tree (s6) and this one; cycc 6.7.18]
+var _co41_gk = 0;
+var _co41_sk = 0;
+var _co41_hp = 0;
+var _co41_he = 0;
+fn _co41_exh(k) {
+    var blk = 0;
+    if (k > 0) { blk = alloc(k); }
+    _co41_gk = _linux_grain;
+    _co41_sk = _LINUX_CHUNK_SMALL;
+    _co41_hp = _heap_ptr;
+    _co41_he = _heap_end;
+    if (blk != 0) {
+        _heap_ptr = blk;
+        _heap_end = blk + k;
+    } else {
+        _heap_end = _heap_ptr;
+    }
+    _linux_grain = 0x4000_0000_0000_0000;
+    _LINUX_CHUNK_SMALL = 0x4000_0000_0000_0000;
+    return _heap_end - _heap_ptr;
+}
+fn _co41_exh_end() {
+    var left = _heap_end - _heap_ptr;
+    _heap_ptr = _co41_hp;
+    _heap_end = _co41_he;
+    _linux_grain = _co41_gk;
+    _LINUX_CHUNK_SMALL = _co41_sk;
+    return left;
+}
+test_group("3.4.1 CO4: delaunay_2d -- a refused allocation is 0, never the empty vec");
+var _co41_gr0 = _linux_grain;
+var _co41_sm0 = _LINUX_CHUNK_SMALL;
+var _co41_room = _co41_exh(64);
+var _co41_e1 = alloc(64);
+var _co41_e2 = alloc(8);
+_co41_exh_end();
+_co41_exh(64);
+var _co41_e4 = alloc(24);
+var _co41_el = _co41_exh_end();
+var _co41_rs = (_heap_ptr == _co41_hp && _heap_end == _co41_he && _linux_grain == _co41_gr0
+  && _LINUX_CHUNK_SMALL == _co41_sm0 && _co41_el == 40);
+var _co41_e3 = alloc(8);
+assert_eq(_co41_room == 64 && _co41_e1 != 0 && _co41_e2 == 0 && _co41_e4 != 0 && _co41_rs == 1
+  && _co41_e3 == _co41_hp, 1,
+  "exhaust instrument: 64 bytes left, a 64-byte request fits, the next is refused, the heap resumes where it left off");
+fn _co41_pt(v, x, y) {
+    vec_push(v, hvec2_new(x, y));
+    return 0;
+}
+# 1 when a and b are vecs (neither 0) holding the same indices.
+fn _co41_same(a, b) {
+    if (a == 0 || b == 0) { return 0; }
+    if (vec_len(a) != vec_len(b)) { return 0; }
+    for (var i = 0; i < vec_len(a); i = i + 1) {
+        if (vec_get(a, i) != vec_get(b, i)) { return 0; }
+    }
+    return 1;
+}
+# Sweep delaunay_2d(pts, n) to its first non-0 answer. Slot 0: the points that answered 0;
+# slot 1: the non-0 answers that were not the heap-open one (an empty vec, a partial mesh);
+# slot 2: 1 once the heap-open answer came back.
+fn _co41_sweep(pts, n, st) {
+    var full = delaunay_2d(pts, n);
+    store64(st, 0);
+    store64(st + 8, 0);
+    store64(st + 16, 0);
+    var k = 0;
+    while (k <= 600000 && load64(st + 16) == 0) {
+        _co41_exh(k);
+        var r = delaunay_2d(pts, n);
+        _co41_exh_end();
+        if (r == 0) {
+            store64(st, load64(st) + 1);
+        } else {
+            if (_co41_same(r, full) == 1) {
+                store64(st + 16, 1);
+            } else {
+                store64(st + 8, load64(st + 8) + 1);
+            }
+        }
+        k = k + 8;
+    }
+    return vec_len(full);
+}
+var _co41_st: i64[3];
+# The square; the square with an interior site; 20 scattered sites (every working vec grows
+# past its first 16 slots); 20 sites on a circle with the centre inserted last (a cavity of
+# 20 triangles, so the cavity buffers grow too); 3 and 6 sites at 2^300 and 2^-700 (the
+# scaled copy); 4 collinear sites (the answer itself is the empty vec).
+var _co41_d1 = vec_new();
+_co41_pt(_co41_d1, 0, 0);
+_co41_pt(_co41_d1, f64_from(4), 0);
+_co41_pt(_co41_d1, f64_from(4), f64_from(4));
+_co41_pt(_co41_d1, 0, f64_from(4));
+var _co41_d2 = vec_new();
+for (var i = 0; i < 4; i = i + 1) { vec_push(_co41_d2, vec_get(_co41_d1, i)); }
+_co41_pt(_co41_d2, F64_ONE, F64_TWO);
+var _co41_d3 = vec_new();
+for (var i = 0; i < 20; i = i + 1) { _co41_pt(_co41_d3, f64_from(i * i % 17), f64_from(i * 7 % 13)); }
+var _co41_d4 = vec_new();
+for (var i = 0; i < 20; i = i + 1) {
+    var a = f64_div(f64_mul(f64_from(i), 0x401921FB54442D18), f64_from(20));
+    _co41_pt(_co41_d4, f64_cos(a), f64_sin(a));
+}
+_co41_pt(_co41_d4, 0, 0);
+var _co41_p300 = (1023 + 300) << 52;
+var _co41_d5 = vec_new();
+_co41_pt(_co41_d5, _co41_p300, 0);
+_co41_pt(_co41_d5, 0, _co41_p300);
+_co41_pt(_co41_d5, _co41_p300, _co41_p300);
+var _co41_m700 = (1023 - 700) << 52;
+var _co41_d6 = vec_new();
+_co41_pt(_co41_d6, _co41_m700, 0);
+_co41_pt(_co41_d6, f64_mul(_co41_m700, f64_from(3)), _co41_m700);
+_co41_pt(_co41_d6, f64_mul(_co41_m700, F64_TWO), f64_mul(_co41_m700, f64_from(4)));
+_co41_pt(_co41_d6, 0, f64_mul(_co41_m700, f64_from(3)));
+_co41_pt(_co41_d6, _co41_m700, _co41_m700);
+_co41_pt(_co41_d6, f64_mul(_co41_m700, F64_TWO), f64_mul(_co41_m700, F64_TWO));
+var _co41_d7 = vec_new();
+for (var i = 0; i < 4; i = i + 1) { _co41_pt(_co41_d7, f64_from(i), f64_from(2 * i)); }
+var _co41_dsets: i64[7];
+store64(&_co41_dsets, _co41_d1); store64(&_co41_dsets + 8, _co41_d2); store64(&_co41_dsets + 16, _co41_d3);
+store64(&_co41_dsets + 24, _co41_d4); store64(&_co41_dsets + 32, _co41_d5); store64(&_co41_dsets + 40, _co41_d6);
+store64(&_co41_dsets + 48, _co41_d7);
+# The answers' lengths (3 per triangle; -1: not pinned), and the fewest points each sweep must
+# spend on refusals: every set here asks for the result vec and eleven working vecs before its
+# answer can be built, 12 vec_new footprints (an alloc_used() delta), one point per 8 bytes.
+var _co41_dlen: i64[7];
+store64(&_co41_dlen, 6); store64(&_co41_dlen + 8, 12); store64(&_co41_dlen + 16, 0 - 1);
+store64(&_co41_dlen + 24, 60); store64(&_co41_dlen + 32, 3); store64(&_co41_dlen + 40, 0 - 1);
+store64(&_co41_dlen + 48, 0);
+var _co41_u0 = alloc_used();
+var _co41_v0 = vec_new();
+var _co41_vfloor = 12 * (alloc_used() - _co41_u0) / 8;
+var _co41_zall = 0;
+for (var i = 0; i < 7; i = i + 1) {
+    var d = load64(&_co41_dsets + i * 8);
+    var len = _co41_sweep(d, vec_len(d), &_co41_st);
+    var want = load64(&_co41_dlen + i * 8);
+    assert_eq(want < 0 || len == want, 1, "delaunay_2d: the heap-open answer has the expected length");
+    assert_eq(load64(&_co41_st + 16), 1, "delaunay_2d: the sweep reached the heap-open answer, no exit on the way");
+    assert_eq(load64(&_co41_st + 8), 0, "delaunay_2d: no point answered an empty vec or a partial mesh");
+    assert_eq(load64(&_co41_st) >= _co41_vfloor, 1,
+      "delaunay_2d: every point up to 12 vecs' worth of heap answered 0 (CO2: the empty vec from the 20th)");
+    _co41_zall = _co41_zall + load64(&_co41_st);
+}
+assert_eq(_co41_zall > 4000, 1, "delaunay_2d: over 4,000 refusal points in all, every one 0");
+# Controls: the heap-open answers themselves.
+assert_eq(vec_len(delaunay_2d(_co41_d3, 20)) > 0 && vec_len(delaunay_2d(_co41_d6, 6)) > 0, 1,
+  "delaunay_2d: control, the scattered and the 2^-700 sets have meshes");
+assert_eq(_co41_same(delaunay_2d(_co41_d7, 4), vec_new()), 1,
+  "delaunay_2d: control, the collinear set's answer is the empty vec");
+
+# === 3.4.1 CO4: sequential_impulse -- the friction cone of a subnormal or underflowed impulse ===
+# The cone is friction times the EXACT normal impulse. Through lane CO2 it was friction times
+# the impulse rounded onto the subnormal grid, up to 2^-1075 off, so the friction came back up
+# to friction/2 units of 2^-1074 off, and a cone whose impulse underflowed to 0 was lost. Every
+# expected value is the exact closed form (Fractions) rounded once:
+#   n = max(0, (1 + e) pen / M),  f = clamp(-v_t / M, +-mu n),  M = ima + imb.
+# [measured: lane CO4 3.4.1 si4.py seeds 1-7, 248,279 contacts in 18 families, the CO2 tree and this one; cycc 6.7.18]
+test_group("3.4.1 CO4: sequential_impulse -- the friction cone of a subnormal or underflowed impulse");
+var _co41_out = alloc(16 * 8);
+# One contact, `it` sweeps, into _co41_out; 1 when the call is Ok.
+fn _co41_si(pen, ima, imb, mu, e, vt, it) {
+    var cs = vec_new();
+    vec_push(cs, contact_new_fric(0, 1, hvec3_unit_y(), pen, mu, e, ima, imb, vt));
+    var t, v = sequential_impulse(cs, 1, it, _co41_out);
+    return is_ok(t);
+}
+# pen 7 2^-900 over 5 2^174, friction 2^100, v_t = M: n = 1.4 2^-1074 rounds to 2^-1074, and
+# the cone is 1.4 2^-974 (CO2: friction times the rounded n, -2^-974), at 1, 2, 4
+# sweeps. |f| is then above friction times the n returned, as the exact answer is.
+for (var it = 1; it <= 4; it = it * 2) {
+    assert_eq(_co41_si(0x07DC000000000000, 0x4AF4000000000000, 0, 0x4630000000000000, 0, 0x4AF4000000000000, it), 1,
+      "sequential_impulse: a subnormal impulse under friction 2^100 is Ok");
+    assert_eq(load64(_co41_out), 1, "sequential_impulse: ... n = 1.4 2^-1074 rounds to 2^-1074");
+    assert_eq(load64(_co41_out + 8), 0x8316666666666666, "sequential_impulse: ... f = -1.4 2^-974 (CO2: -2^-974)");
+}
+# pen 2^-900 over 2^200 (n = 2^-1100, below half of 2^-1074) with friction 2^300: n rounds to 0,
+# the cone is 2^-800 (CO2: 0, so f was -0).
+assert_eq(_co41_si(0x07B0000000000000, 0x4C70000000000000, 0, 0x52B0000000000000, 0, 0x4C70000000000000, 1), 1,
+  "sequential_impulse: an underflowing impulse under friction 2^300 is Ok");
+assert_eq(load64(_co41_out), 0, "sequential_impulse: ... n = 2^-1100 rounds to +0");
+assert_eq(load64(_co41_out + 8), 0x8DF0000000000000, "sequential_impulse: ... f = -2^-800 (CO2: -0)");
+assert_eq(_co41_si(0x07B0000000000000, 0x4C70000000000000, 0, 0x52B0000000000000, 0, 0x4C70000000000000, 3), 1,
+  "sequential_impulse: ... and at 3 sweeps");
+assert_eq(load64(_co41_out + 8), 0x8DF0000000000000, "sequential_impulse: ... f = -2^-800 at 3 sweeps");
+# n = 0.6 2^-1074 rounds UP to 2^-1074, so the rounded cone (2^-974) let -v_t / M = -0.8 2^-974
+# through unclamped; the exact cone, 0.6 2^-974, clamps it.
+assert_eq(_co41_si(0x07C8000000000000, 0x4AF4000000000000, 0, 0x4630000000000000, 0, 0x0E10000000000000, 2), 1,
+  "sequential_impulse: an impulse rounded up onto 2^-1074 is Ok");
+assert_eq(load64(_co41_out), 1, "sequential_impulse: ... n = 0.6 2^-1074 rounds to 2^-1074");
+assert_eq(load64(_co41_out + 8), 0x8303333333333333,
+  "sequential_impulse: ... f = -0.6 2^-974, clamped (CO2: -0.8 2^-974, outside the cone)");
+# Restitution 1/2 and two masses, v_t negative: n = 1.385 2^-1074, f = +mu n.
+assert_eq(_co41_si(0x07C8000000000000, 0x4AD8000000000000, 0x4ADC000000000000, 0x4C70000000000000, F64_HALF,
+    0xD8F0000000000000, 4), 1, "sequential_impulse: restitution, two masses, a subnormal impulse is Ok");
+assert_eq(load64(_co41_out), 1, "sequential_impulse: ... n rounds to 2^-1074");
+assert_eq(load64(_co41_out + 8), 0x0956276276276276, "sequential_impulse: ... f = +mu n exact (CO2: +2^-1074 mu)");
+# A pen below 2^-969 goes to the closed form at the gate: n = 9.6 2^-1074 (rounded to 10), the
+# cone 0.6 2^-1010.
+assert_eq(_co41_si(0x0188000000000000, 0x4474000000000000, 0, 0x43B0000000000000, 0, 0x4630000000000000, 1), 1,
+  "sequential_impulse: a pen below 2^-969 under friction 2^60 is Ok");
+assert_eq(load64(_co41_out), 10, "sequential_impulse: ... n = 9.6 2^-1074 rounds to 10 2^-1074");
+assert_eq(load64(_co41_out + 8), 0x80C3333333333333, "sequential_impulse: ... f = -0.6 2^-1010 (CO2: -0.625 2^-1010)");
+# Controls the routing must not move. Friction off: n as before, f +0.
+assert_eq(_co41_si(0x07DC000000000000, 0x4AF4000000000000, 0, 0, 0, 0x4AF4000000000000, 2), 1,
+  "sequential_impulse: control, friction 0 with a subnormal impulse is Ok");
+assert_eq(load64(_co41_out) * 10 + (load64(_co41_out + 8) == 0), 11,
+  "sequential_impulse: control, friction 0: n = 2^-1074 and f = +0");
+# A tiny negative pen (closed form at the gate), a zero pen and a negative pen (the sweep): n = +0
+# and the cone is 0, so f is a signed zero.
+assert_eq(_co41_si(0x8188000000000000, F64_ONE, 0, F64_HALF, 0, F64_ONE, 1), 1,
+  "sequential_impulse: control, pen -3 2^-1000 is Ok");
+assert_eq(load64(_co41_out) == 0 && load64(_co41_out + 8) == 0x8000000000000000, 1,
+  "sequential_impulse: control, pen -3 2^-1000: n = +0, f = -0");
+assert_eq(_co41_si(0, F64_TWO, 0, F64_HALF, 0, F64_ONE, 2), 1, "sequential_impulse: control, pen 0 is Ok");
+assert_eq(load64(_co41_out) == 0 && load64(_co41_out + 8) == 0x8000000000000000, 1,
+  "sequential_impulse: control, pen 0: n = +0, f = -0");
+assert_eq(_co41_si(0xBFD0000000000000, F64_TWO, 0, F64_HALF, 0, 0xBFF0000000000000, 2), 1,
+  "sequential_impulse: control, pen -1/4 is Ok");
+assert_eq(load64(_co41_out) == 0 && load64(_co41_out + 8) == 0, 1,
+  "sequential_impulse: control, pen -1/4: n = +0, f = +0");
+# Controls for the paths the routing sorts the impulse into, each as the CO2 tree answers it.
+# pen -2^100 with e 2^1000: e pen overflows, so the sweep's impulse is -Inf where the exact one
+# is negative (n = +0, and the cone 0 gives f = -0), at 1 and 2 sweeps; it must reach the
+# closed form, not be clamped as a finite negative nor stored.
+assert_eq(_co41_si(0xC630000000000000, F64_ONE, 0, F64_HALF, 0x7E70000000000000, F64_ONE, 1), 1,
+  "sequential_impulse: control, -Inf from pen -2^100 and e 2^1000 is Ok");
+assert_eq(load64(_co41_out) == 0 && load64(_co41_out + 8) == 0x8000000000000000, 1,
+  "sequential_impulse: control, -Inf from e pen: n = +0, f = -0");
+assert_eq(_co41_si(0xC630000000000000, F64_ONE, 0, F64_HALF, 0x7E70000000000000, F64_ONE, 2), 1,
+  "sequential_impulse: control, ... at 2 sweeps is Ok");
+assert_eq(load64(_co41_out) == 0 && load64(_co41_out + 8) == 0x8000000000000000, 1,
+  "sequential_impulse: control, ... at 2 sweeps: n = +0, f = -0");
+# A negative NaN inverse mass: its bits are negative, so the integer inverse-mass test takes it
+# with the static bodies; it must still give NaN (f64_le is false for it), not the +0 of a skip.
+assert_eq(_co41_si(0x3FD0000000000000, 0xFFF8000000000000, F64_ONE, F64_HALF, 0, F64_ONE, 2), 1,
+  "sequential_impulse: control, a -NaN inverse mass is Ok");
+assert_eq(f64_eq(load64(_co41_out), load64(_co41_out)) + f64_eq(load64(_co41_out + 8), load64(_co41_out + 8)), 0,
+  "sequential_impulse: control, a -NaN inverse mass gives NaN in both slots (not a skip's +0)");
+# A frame: the routed contacts and ordinary ones side by side, each with its own answer (the
+# contacts do not couple), at 1 and 3 sweeps. The ordinary contact: pen 1/4, e 1/2, M 2, mu 1/2,
+# v_t 1: n = 3/16, f = -3/32.
+var _co41_fr = vec_new();
+vec_push(_co41_fr, contact_new_fric(0, 1, hvec3_unit_y(), 0x3FD0000000000000, F64_HALF, F64_HALF, F64_ONE, F64_ONE,
+    F64_ONE));
+vec_push(_co41_fr, contact_new_fric(0, 1, hvec3_unit_y(), 0x07DC000000000000, 0x4630000000000000, 0, 0x4AF4000000000000,
+    0, 0x4AF4000000000000));
+vec_push(_co41_fr, contact_new_fric(0, 1, hvec3_unit_y(), 0, F64_HALF, 0, F64_TWO, 0, F64_ONE));
+vec_push(_co41_fr, contact_new_fric(0, 1, hvec3_unit_y(), 0x07B0000000000000, 0x52B0000000000000, 0, 0x4C70000000000000,
+    0, 0x4C70000000000000));
+vec_push(_co41_fr, contact_new_fric(0, 1, hvec3_unit_y(), 0x3FD0000000000000, F64_HALF, F64_HALF, F64_ONE, F64_ONE,
+    F64_ONE));
+for (var it = 1; it <= 3; it = it + 2) {
+    var _co41_ft, _co41_fv = sequential_impulse(_co41_fr, 5, it, _co41_out);
+    assert_eq(is_ok(_co41_ft), 1, "sequential_impulse: the mixed frame is Ok");
+    assert_eq(load64(_co41_out) == 0x3FC8000000000000 && load64(_co41_out + 8) == 0xBFB8000000000000, 1,
+      "sequential_impulse: frame, the ordinary contact: n = 3/16, f = -3/32");
+    assert_eq(load64(_co41_out + 16) == 1 && load64(_co41_out + 24) == 0x8316666666666666, 1,
+      "sequential_impulse: frame, the subnormal impulse's exact cone after an ordinary contact");
+    assert_eq(load64(_co41_out + 32) == 0 && load64(_co41_out + 40) == 0x8000000000000000, 1,
+      "sequential_impulse: frame, the pen-0 contact after a routed one: n = +0, f = -0");
+    assert_eq(load64(_co41_out + 48) == 0 && load64(_co41_out + 56) == 0x8DF0000000000000, 1,
+      "sequential_impulse: frame, the underflowed impulse's cone");
+    assert_eq(load64(_co41_out + 64) == 0x3FC8000000000000 && load64(_co41_out + 72) == 0xBFB8000000000000, 1,
+      "sequential_impulse: frame, the ordinary contact after a routed one keeps its friction");
+}
+
+# === 3.4.1 GEO7: _geo_sph_graze past DBL_MAX ===
+# R4 M2. sq e <= 12 delta q read Inf <= Inf once both sides overflowed, and a +Inf from |f|^2 |oc|^2 alone refused
+# rays the bound passes. Each argument list is judged against the inequality in exact rationals (gz.py): the bound
+# E = 4.25 sqrt(ff ococ) + 5 ff + rr + |delta| + 2^-46 ococ, the test sq E <= 12 delta (|hb| + sq).
+# [measured: GEO7 3.4.1 gz.py / gzfix.py, exact Fraction oracle, s24 / this tree, 2026-11-01]
+test_group("3.4.1 GEO7: _geo_sph_graze past DBL_MAX");
+assert_eq(_geo_sph_graze(0x5B7C81B115ECBFB3, 0x5B4548DE63A99E6A, 0x7C8D94C8D17301F7, 0x7CCE4B8010CEF815,
+    0x7CFE200D21A3616E, 0x7CD012664EF3141A), 0,
+  "both sides past DBL_MAX, sq E = 2.11 times 12 delta q: refused (s24 Inf <= Inf certified it)");
+assert_eq(_geo_sph_graze(0x52E412B549C7A42D, 0x518715ABD86F0736, 0x6DB6F2AC59EBB50B, 0x6DC5DD9903926F0E,
+    0x707A31A49CB8AEA6, 0x6DD0AB77984424CA), 1,
+  "both sides past DBL_MAX, sq E = 0.60 times 12 delta q, sq / q 2.7e-7: certified, not refused for its range");
+assert_eq(_geo_sph_graze(0x4FC2586A117A245D, 0x4F0EDF2357B9EC32, 0x60219E14680FE8F9, 0x602B33B40D5CB011,
+    0x619D38CFF52A2192, 0x603668E43AB64C85), 1,
+  "|f|^2 |oc|^2 past DBL_MAX, both sides in range, sq E = 0.67 times 12 delta q: certified (s24 refused: e = +Inf)");
+assert_eq(_geo_sph_graze(0, 0, 0xEBA0000000000000, 0x6BB8000000000000, 0x6BB0000000000000, 0x6BB0000000000000), 1,
+  "a miss, |f|^2 |oc|^2 past DBL_MAX, 2^-52 E well under |delta|: certified (s24 refused: e = +Inf)");
+assert_eq(_geo_sph_graze(0x5FB6A09E667F3BCD, 0x5FD6A09E667F3BCD, 0x7FC0000000000000, 0x7FE4000000000000,
+    0x7FE8000000000000, 0x7FE8000000000000), 0,
+  "the bound E itself past DBL_MAX, e = +Inf, sq E = 3.69 times 12 delta q: refused, not Inf <= Inf");
+# On the boundary. hb 0, so sq / q = 1, and ff and ococ 0, so e = rr + delta: rr = 11 delta is sq E = 12 delta q
+# exactly, past DBL_MAX, and the next rr is over.
+assert_eq(_geo_sph_graze(0, 0x58F0000000000000, 0x6BB0000000000000, 0, 0, 0x6BE6000000000000), 1,
+  "sq E = 12 delta q exactly, both past DBL_MAX: certified, the test is <=");
+assert_eq(_geo_sph_graze(0, 0x58F0000000000000, 0x6BB0000000000000, 0, 0, 0x6BE6000000000001), 0,
+  "one ulp of rr over: refused");
+assert_eq(_geo_sph_graze(0x4000000000000000, 0x7FF0000000000000, 0x4000000000000000, 0x3FF0000000000000,
+    0x4000000000000000, 0x4008000000000000), 0,
+  "a +Inf sq never certifies");
+
+# === 3.4.1 GEO7: geo_ray_sphere with the certificate past DBL_MAX ===
+# R4 M2's scale map: rays within 4 ulps of tangency, r near 2^360 and 2^400, unit-size d (gs3.py rows). t exact
+# by Fractions: each expected t below is within 0.06 ulp of it, s24's is 4e6 and 677 ulp off. The misses are b^2 < a c.
+# And the second overflow of the same shape, _geo_sph_comp's: with |d| near 2^483 the better delta takes a delta past
+# DBL_MAX, sq and q read +Inf, and the hit read the miss. Each t there within 1.3 ulp of the Fraction root.
+# [measured: GEO7 3.4.1 gs3.py rows 360, 400, d 480, d 500, exact Fraction oracle, s24 / this tree, 2026-11-01]
+test_group("3.4.1 GEO7: geo_ray_sphere with the certificate past DBL_MAX");
+fn _g7_ray(ox, oy, oz, dx, dy, dz) {
+    var ray = alloc(sizeof(GeoRay));
+    GeoRay_set_origin(ray, hvec3_new(ox, oy, oz));
+    GeoRay_set_direction(ray, hvec3_new(dx, dy, dz));
+    return ray;
+}
+fn _g7_sp(ox, oy, oz, dx, dy, dz, cx, cy, cz, r) {
+    return geo_ray_sphere(_g7_ray(ox, oy, oz, dx, dy, dz), geo_sphere_new(hvec3_new(cx, cy, cz), r));
+}
+assert_eq(_g7_sp(0xD97D3B7092CAD8CF, 0xD957C281AB68BDB7, 0x596D77364B304698, 0x400327685466274E, 0x3FDE9CB930DDC270,
+    0xBFF33055B063B5AC, 0x58E048512BB32D2A, 0x58DD183A829BB409, 0x58E3528B03AAF322, 0x58FF2AD591EBA14F), 0,
+  "exact miss, r 5.03e120 (s24 and 3.4.0: 0x596879107B9FE84A)");
+assert_eq(_g7_sp(0xD6A414DD92EED0DA, 0x56BF83E56C311652, 0xD6C47B834E7C4151, 0x400235D2EF04F7BC, 0xC01942C045AD3C27,
+    0x401999A23A5C71A4, 0x5680E08044F4899C, 0xD67BA3C16EF5D172, 0xD69248B2206D131A, 0x567ECB8D814467F1), 0,
+  "exact miss, r near 2^361 (s24: 0x5695E0DF1B3068DC)");
+assert_eq(_g7_sp(0x599C6FE6CE2A8D9F, 0x599751D13F928A66, 0x59A2CBADB43E51AB, 0xBFF73673AE27E78D, 0xBFEC122B95DE3DCE,
+    0xC0113EDF32A94B0E, 0x58EA28DE03C1840A, 0x58FBA9C3D5E12960, 0x58ECE4F9DA8D13F2, 0x5994C4D1D3BCAC90),
+  0x5984D80822D0A01B, "a hit, r near 2^410 (s24: 0x5984D808228CDB59)");
+assert_eq(_g7_sp(0x5ADA13B77C7A3FBE, 0xDB0D2004411D8397, 0xDAFB8663A4F8E5E3, 0xBFE03C7FB8B9822A, 0x401222563252D7E5,
+    0x4001234A6294C531, 0xD918E26BF52F6DA6, 0x591A9F4DB9B5AE60, 0xD8FFC09344DB59E2, 0x58FA52BE3A6B7861),
+  0x5AE9B28CCC11A8E1, "a hit, r near 2^401 (s24: 0x5AE9B28CCC11A609)");
+assert_eq(_g7_sp(0x437C39E99E02912B, 0xC382AC324535AE10, 0xC38743E7E47AA40E, 0xDE14E390720E021A, 0x5DECBE91D99D535F,
+    0x5DE197B0A380A6C2, 0xBFFF2E89EA924D24, 0xBFD73B6AEBE141A2, 0x3FD8BA066F3002CE, 0x438AB58F6D0FBB32),
+  0x255D1BC5FBBA84B7, "_geo_sph_comp: a delta past DBL_MAX, r 2^58, |d| 2^483 (s24: the miss)");
+assert_eq(_g7_sp(0xC3966E27284ED4BC, 0xC3BC0497973AEF82, 0xC3B357ACAB79772E, 0xDE072DC18A0075A2, 0x5DE8F0375FDA0A03,
+    0x5E0CC7D4ACCA9DE6, 0x3FF9DB8ADFAE251E, 0xBFEDF1667EEA41B4, 0x3FDCCC5D35DFB30F, 0x43BE8BCAA24628F3),
+  0x258B67B8AAED713F, "_geo_sph_comp: a delta past DBL_MAX, r 2^61, |d| 2^483 (s24: the miss)");
+assert_eq(_g7_sp(0x42A8D229B5741EEC, 0xC2A63F83A9BAA5DE, 0xC2A01D00417A7337, 0x5F18C3252EEEDA26, 0x5F5D50DF19BECEC0,
+    0x5F452E31E53E1089, 0x3FD008FA3B967CCF, 0xBFE1A14447A365BB, 0x3FE8118CFD8CC514, 0x42AB2EB2E2CA5DE7),
+  0x2339C5FA9FC41860, "_geo_sph_comp: a delta past DBL_MAX, r 2^44, |d| 2^503 (s24: the miss)");
+
+# === 3.4.1 GEO7: geo_ray_capsule_branch with the caps' certificate past DBL_MAX ===
+# R4 M2's capsule set: rays within 3 ulps of barrel tangency, coordinates near 2^300, raw d near 2^200 or 2^10 (gt.py
+# capsule). Exact verdict and piece by Fractions; each t within 0.73 ulp of the Fraction root.
+# [measured: GEO7 3.4.1 gc3.py set (scales 2^280), R4 repro, exact Fraction oracle, s24 / this tree, 2026-11-01]
+test_group("3.4.1 GEO7: geo_ray_capsule_branch with the caps' certificate past DBL_MAX");
+var _g7_out: i64[2];
+fn _g7_cap(ray, sx, sy, sz, ex, ey, ez, r) {
+    return geo_ray_capsule_branch(ray, geo_capsule_new(hvec3_new(sx, sy, sz), hvec3_new(ex, ey, ez), r), &_g7_out);
+}
+assert_eq(_g7_cap(_g7_ray(0x52827B3DBAB09148, 0xD249393A67D930B4, 0x5276A4EDA7AAA128, 0xCC618115DFBEB843,
+      0x4C27E3D066D700C3, 0xBFD5726D28A20FDB), 0xD2800FE923262459, 0x5245415A7A7734A0, 0x5276A4D9AC54D27E,
+    0xD2800FE923261AAB, 0x5245415A7A7727D1, 0x5276A4D9AC54C4DA, 0x51F53FC1BFBC2924), 0,
+  "exact miss (R4's row; s24 and 3.4.0: 0x461F92622F492C0F on the start cap)");
+assert_eq(load64(&_g7_out), GEO_FACE_NONE, "... and no piece");
+assert_eq(_g7_cap(_g7_ray(0x54325E5A27F8A361, 0x5393E2E1CB25B928, 0x5430ED24B4095B1D, 0xBFE7761E6056C0F8,
+      0x4C33D7FA53F130E4, 0xCC659E8B2B36921B), 0x54325B1B13334300, 0x5411372F3C571084, 0xD4336D01241AC743,
+    0x54325B1B133335B2, 0x5411372F3C57040A, 0xD4336D01241AB92F, 0x53BD171C0CA0CBB5), 0,
+  "exact miss (s24: 0x47CAE9B95D2AC20E)");
+assert_eq(load64(&_g7_out), GEO_FACE_NONE, "... and no piece");
+assert_eq(_g7_cap(_g7_ray(0x53DD88E1A9F87015, 0xD42184108DA266DD, 0x5440963685AC3534, 0x4C6F5010BB77132F,
+      0x4067C5242073EB70, 0xBF46825CC0407D9A), 0x543609DB49D18FD0, 0xD41063A8A8751816, 0x5440DEA728FCF31B,
+    0x543609DB49D1AE8C, 0xD41063A8A8752EF0, 0x5440DEA728FD0AA1, 0x5412C786F8694204), 0x47B60CF373E68294,
+  "the start cap (s24: 0x47B60CF373DA17A1)");
+assert_eq(_g7_cap(_g7_ray(0xD41BE1E0FE8C17F9, 0x5412D5D3FE8CA3E8, 0x53D3FC7DB54517BE, 0x40700E8C548076FF,
+      0xBFC5B19209A32DE9, 0xCC0704F3492FCCEA), 0xD41EBEF4550F8A10, 0x540135F9C4073E4F, 0xD3D7534DE3D83658,
+    0xD41EBEF4550F6A4F, 0x540135F9C4072C88, 0xD3D7534DE3D81E41, 0x54053F042201C581), 0x47CE1AC4BB6800F6,
+  "the end cap (s24: 0x47CE1AC4BB3FFF25)");
+assert_eq(_g7_cap(_g7_ray(0x532833EBF3C559E0, 0x532EF9AA009E7FC6, 0x53A190D4B1B4BF4D, 0x4C51D5D9243DC4CC,
+      0xBF6D37A222063BF2, 0xBFE0919F7FF13B5D), 0x538ED91E69DEAE14, 0xD36374ABA6CFD63B, 0x53A17902E59AAA5F,
+    0x538ED91E698DE680, 0xD36374ABA69CE3BB, 0x53A17902E56CE93D, 0x536571851B0569BE), 0x472B559E1773AD9B,
+  "the barrel, a cap's false root gone (s24: 0x472B559E16E98AA6)");
+assert_eq(load64(&_g7_out), GEO_CAP_CYLINDER, "... its piece");
+
+# === 3.4.1 GEO7 F1: _geo_sphere_roots_full's hb gate where its squares flush ===
+# An origin near the tangent point of a sphere near 2^-449, |d| near 2^-278: hb^2 and |oc|^2 a / 16 both flush, the
+# gate read 0 < 0, and the hb that cancels stayed plain. Fraction root 0x33D1B43CE5093F63; 3.4.0 and this
+# 0x33D1B43CE5093F62, s24 7.4e4 ulp off.
+# [measured: GEO7 3.4.1 samp.py near-surface family, exact Fraction oracle, 3.4.0 / s24 / this tree, 2026-11-01]
+test_group("3.4.1 GEO7 F1: _geo_sphere_roots_full's hb gate where its squares flush");
+assert_eq(_g7_sp(0xA5A94E1C1779A631, 0xA5ADDD88B53A8162, 0xA59BE3211B9BE763, 0xAE5B10CD3B214AB8, 0x2E992CE7558A70A2,
+    0xAE7B86D2BB6E5CC6, 0xA5A94E1C182BB9B2, 0xA5ADDD88B50D797F, 0xA59BE32119FAE1DA, 0x23E15E086FB8058F),
+  0x33D1B43CE5093F62, "the near root, within 1 ulp (s24: 0x33D1B43CE50A5ED0)");
 
 var r = assert_summary();
 # Clamp before exiting: assert_summary() returns the raw failure COUNT, and a wait

@@ -25,7 +25,11 @@ var _CALC_F64_2_POW_M600 = 0x1A70_0000_0000_0000; # 2^-600
 # ================================================================
 
 # Numerical derivative via central difference: (f(x+h) - f(x-h)) / (2h)
-# f: function pointer (f64 -> f64), x: f64, h: f64
+# f: function pointer (f64 -> f64), x: f64, h: f64 (the step; its sign does not matter).
+# Returns the f64 quotient, rounded once while 2h is finite: exact for a quadratic f whose
+# samples are exact, otherwise O(h^2) truncation plus the rounding of f over 2h. No failure
+# channel: h = 0 gives 0/0 = NaN (or +-Inf / 0), |h| >= 2^1023 overflows 2h (the quotient
+# is then 0 or NaN), and a NaN anywhere propagates.
 public fn calc_derivative(f, x, h) {
     var xph = f64_add(x, h);
     var xmh = f64_sub(x, h);
@@ -649,6 +653,10 @@ enum _CalcG5 {
     _CALC_G5_W3 = 0x3FDEA1DA25AE415B;  # (322 + 13*sqrt(70))/900 = 0.47862867049936646804
     _CALC_G5_W4 = 0x3FCE539EC36E038C;  # (322 - 13*sqrt(70))/900 = 0.23692688505618908751
 }
+# calc_integral_gauss5(f, a, b) -> f64: the 5-point Gauss-Legendre rule on [a, b] (the nodes and
+# weights above): exact for a polynomial of degree <= 9 up to the rounding of its samples and
+# sums, error (b - a)^11 f^(10)(xi) (5!)^4 / (11 (10!)^3) otherwise; no error estimate and no failure
+# channel (b < a gives the oriented integral; a NaN sample gives NaN). Doc and history above.
 public fn calc_integral_gauss5(f, a, b) {
     if (f64_eq(f64_sub(b, a), 0) == 1) { return 0; }
     var half = f64_mul(f64_sub(b, a), F64_HALF);
@@ -942,9 +950,23 @@ fn _calc_gauss5_wide(s0, s1, s2, s3, s4, half, p) {
 # 2. INTERPOLATION
 # ================================================================
 
-# Linear interpolation between two f64 values: a + (b - a) * t
+# Linear interpolation between two f64 values: a + (b - a) * t, three roundings (difference,
+# product, sum). t is not clamped (t outside [0, 1] extrapolates). Exact at t = 0 for finite
+# a and b; at t = 1 it is a + (b - a), which can differ from b by an ulp of the larger. NaN
+# propagates.
+# ⛔ 3.4.1 (review) — b - a OVERFLOWED FOR FINITE a AND b MORE THAN DBL_MAX APART: (-DBL_MAX,
+# DBL_MAX, 1/2) gave +Inf, exact 0, and the same at t = 0 gave NaN. Where the fast form is not
+# finite for a finite t, the formula is evaluated at half scale and doubled, hisab_lerp's repair
+# (transforms.cyr; vec2.cyr's `_hvec2_lerp_wide` has the reasoning): finite wherever the
+# formula's value is. Every input whose fast form is finite, and every NaN or infinite t, keeps
+# the fast form's bits; the ordinary path pays one exponent test.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 (review): calc_lerp past DBL_MAX"]
 public fn calc_lerp(a, b, t) {
-    return f64_add(a, f64_mul(f64_sub(b, a), t));
+    var r = f64_add(a, f64_mul(f64_sub(b, a), t));
+    if ((r & 0x7FF0_0000_0000_0000) != 0x7FF0_0000_0000_0000) { return r; }
+    if ((t & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000) { return r; }
+    var ha = f64_mul(a, F64_HALF);
+    return f64_mul(f64_add(ha, f64_mul(f64_sub(f64_mul(b, F64_HALF), ha), t)), F64_TWO);
 }
 
 # Quadratic Bezier 2D: B(t) = (1-t)^2*p0 + 2(1-t)t*p1 + t^2*p2
@@ -1089,6 +1111,9 @@ fn _cmr_comp(a, b, c, d, t, t2, t3) {
 # 3. EASING FUNCTIONS
 # ================================================================
 
+# The polynomial easings below take t in [0, 1] (not clamped: outside it they extrapolate the
+# polynomial) and return the f64 value, rounded per operation; each maps 0 to 0 and 1 to 1
+# exactly, and NaN to NaN.
 # Quadratic ease-in: t^2
 public fn ease_in(t) {
     return f64_mul(t, t);
@@ -1127,7 +1152,11 @@ public fn ease_in_out_smooth(t) {
 # 3b. SPRING + CUBIC BEZIER EASE
 # ================================================================
 
-# Damped spring step: returns (new_position, new_velocity) via out params
+# Damped spring step, one semi-implicit (symplectic) Euler step of x'' = k (target - x) - c v:
+# v' = v + (k (target - pos) - c v) dt, then pos' = pos + v' dt.
+# pos, target, vel, stiffness k, damping c, dt: f64. Writes pos' to out_pos and v' to out_vel
+# and returns 0; it has no failure channel (NaN and overflow propagate). Stable for an
+# undamped spring while dt^2 k < 4; it is first order, not an exact solution of the ODE.
 public fn spring_step(pos, target, vel, stiffness, damping, dt, out_pos, out_vel) {
     var force = f64_mul(stiffness, f64_sub(target, pos));
     var damp = f64_mul(damping, vel);
@@ -1139,44 +1168,482 @@ public fn spring_step(pos, target, vel, stiffness, damping, dt, out_pos, out_vel
     return 0;
 }
 
-# Cubic bezier easing: solve for t given x, then evaluate y
-# Control points: (0,0), (x1,y1), (x2,y2), (1,1)
-public fn cubic_bezier_ease(x1, y1, x2, y2, x) {
-    # Newton's method to find t where bezier_x(t) = x
-    var t = x;  # Initial guess
+# Internal: B_y(t) = 3 u^2 t y1 + 3 u t^2 y2 + t^3, u = 1 - t, the y coordinate of the unit cubic
+# Bezier with control values (0, y1, y2, 1), for cubic_bezier_ease. The Bernstein form is kept where
+# its three terms' magnitudes add to at most 2 |y| (at most one bit cancels); otherwise, where y1 and
+# y2 of opposite signs cancel in it, y is recomputed as t (3 u (u y1 + t y2) + t^2) in double-double
+# (u = 1 - t exactly, Dekker's products) and rounded once, for |y1|, |y2| < 2^990: 3 u (u y1 + t y2)
+# stays below 2^992, and the split multiplies by 2^27 + 1. Past that the Bernstein form stands: the
+# split overflows from 2^997 and y would be NaN (y1 = 2^1000, y2 = -2^1000 at t = 1/2 is 1/8).
+# The middle term is t (t y2) and not (t t) y2: t^2 flushes below about 1.5e-154, and with it a y2
+# term that y1 = 0 or a huge y2 leaves dominant (cubic-bezier(0.42, 0, 1, 1e6) at 1e-157 was 446,409
+# units off, (1e-9, -0.63, 0, 1e300) at 1.66e-285 had the wrong sign).
+# [measured: third review R3-NUM S2 table, 170-digit oracle NUM4-work py/s2.py, 2026-11-01]
+fn _calc_cbez_y(y1, y2, t) {
+    var u = f64_sub(F64_ONE, t);
+    var tt = f64_mul(t, t);
+    var p1 = f64_mul(_CALC_F64_THREE, f64_mul(f64_mul(u, u), f64_mul(t, y1)));
+    var p2 = f64_mul(_CALC_F64_THREE, f64_mul(u, f64_mul(t, f64_mul(t, y2))));
+    var p3 = f64_mul(tt, t);
+    var y = f64_add(f64_add(p1, p2), p3);
+    if ((y1 | y2) >= 0) { return y; }                     # y1, y2 >= 0: every term >= 0, nothing cancels
+    var ay = f64_abs(y);
+    if (f64_lt(f64_add(ay, ay), f64_add(f64_add(f64_abs(p1), f64_abs(p2)), p3)) == 0) { return y; }
+    if (f64_lt(f64_abs(y1), 0x7DD0000000000000) == 0 || f64_lt(f64_abs(y2), 0x7DD0000000000000) == 0) {
+        return y;                                          # 2^990: out of the split's range
+    }
+    var uh = f64_sub(F64_ONE, t);                          # u = uh + ul exactly (TwoSum of 1 and -t)
+    var ub = f64_sub(uh, F64_ONE);
+    var ul = f64_add(f64_sub(F64_ONE, f64_sub(uh, ub)), f64_sub(f64_neg(t), ub));
+    var q1 = f64_mul(uh, y1);                              # q = u y1 + t y2
+    var q2 = f64_add(_calc_twoprod_err(uh, y1, q1), f64_mul(ul, y1));
+    var v1 = f64_mul(t, y2);
+    var v2 = _calc_twoprod_err(t, y2, v1);
+    var sq = f64_add(q1, v1);
+    var sb = f64_sub(sq, q1);
+    var se = f64_add(f64_add(f64_sub(q1, f64_sub(sq, sb)), f64_sub(v1, sb)), f64_add(q2, v2));
+    q1 = f64_add(sq, se);
+    q2 = f64_sub(se, f64_sub(q1, sq));
+    var r1 = f64_mul(uh, q1);                              # r = 3 u q
+    var r2 = f64_add(_calc_twoprod_err(uh, q1, r1), f64_add(f64_mul(uh, q2), f64_mul(ul, q1)));
+    var r0 = f64_add(r1, r2);
+    r2 = f64_sub(r2, f64_sub(r0, r1));
+    r1 = f64_mul(r0, _CALC_F64_THREE);
+    r2 = f64_add(_calc_twoprod_err(r0, _CALC_F64_THREE, r1), f64_mul(r2, _CALC_F64_THREE));
+    r0 = f64_add(r1, r2);
+    r2 = f64_sub(r2, f64_sub(r0, r1));
+    var s2 = _calc_twoprod_err(t, t, tt);                  # z = r + t^2
+    sq = f64_add(r0, tt);
+    sb = f64_sub(sq, r0);
+    se = f64_add(f64_add(f64_sub(r0, f64_sub(sq, sb)), f64_sub(tt, sb)), f64_add(r2, s2));
+    var z1 = f64_add(sq, se);
+    var z2 = f64_sub(se, f64_sub(z1, sq));
+    var w1 = f64_mul(z1, t);                               # y = z t
+    var w2 = f64_add(_calc_twoprod_err(z1, t, w1), f64_mul(z2, t));
+    return f64_add(w1, w2);
+}
+
+# Internal: the rounding error of p = a b (p the rounded product), by Dekker's split, for |a|, |b|
+# well inside the exponent range: a b = p + the returned value exactly.
+fn _calc_twoprod_err(a, b, p) {
+    var ca = f64_mul(a, _CALC_F64_SPLIT);
+    var ah = f64_sub(ca, f64_sub(ca, a));
+    var al = f64_sub(a, ah);
+    var cb = f64_mul(b, _CALC_F64_SPLIT);
+    var bh = f64_sub(cb, f64_sub(cb, b));
+    var bl = f64_sub(b, bh);
+    return f64_add(f64_add(f64_add(f64_sub(f64_mul(ah, bh), p), f64_mul(ah, bl)), f64_mul(al, bh)), f64_mul(al, bl));
+}
+
+# Internal: v 2^e in steps of normal powers of two, the last of which alone can round.
+fn _calc_times2(v, e) {
+    while (e > 1000) {
+        v = f64_mul(v, 0x7E70000000000000);                # 2^1000
+        e = e - 1000;
+    }
+    while (e < 0 - 1000) {
+        v = f64_mul(v, 0x0170000000000000);                # 2^-1000
+        e = e + 1000;
+    }
+    return f64_mul(v, (1023 + e) << 52);
+}
+
+# Internal: py x / px of the CSS extension's tangent line, x / px and py / px each far from the range
+# of a double where py x / px is not. The slope py / px where it is a normal double, or where py or px
+# is not finite (0 for a flat line, so x = +-Inf beside one is the end's constant, not 0 * Inf = NaN).
+# Otherwise each of the three is scaled by the power of two of its exponent field (exactly, to [1, 2)
+# or, subnormal, below it), which no product or quotient of the results can overflow or flush:
+# py x / px within 2 rounding errors, and a slope that overflowed or flushed gives
+# the finite exact value (y1 = 1e308, x1 = 1e-300 at -1e-305 is -1e303, not -Inf).
+fn _calc_cbez_line(py, px, x) {
+    if (f64_eq(py, 0) == 1) { return 0; }
+    var s = f64_div(py, px);
+    var as = f64_abs(s);
+    if (f64_le(0x0010000000000000, as) == 1 && f64_lt(as, F64_POS_INF) == 1) { return f64_mul(s, x); }
+    if (f64_lt(f64_abs(py), F64_POS_INF) == 0 || f64_lt(f64_abs(px), F64_POS_INF) == 0) {
+        if (f64_eq(s, 0) == 1) { return 0; }
+        return f64_mul(s, x);
+    }
+    if (f64_lt(f64_abs(x), F64_POS_INF) == 0) {
+        return x ^ ((py ^ px) & 0x8000000000000000);       # a slope too small to hold, on an infinite x
+    }
+    var ep = ((py >> 52) & 0x7FF) - 1023;
+    var eq = ((px >> 52) & 0x7FF) - 1023;
+    var ex = ((x >> 52) & 0x7FF) - 1023;
+    var m = f64_div(f64_mul(_calc_times2(py, 0 - ep), _calc_times2(x, 0 - ex)), _calc_times2(px, 0 - eq));
+    return _calc_times2(m, ep + ex - eq);
+}
+
+# Internal: the CSS extension of a cubic-bezier timing function past its ends (CSS Easing
+# Functions Level 1, "cubic Bezier easing functions"): the tangent line through P0 and the
+# first control point with x > 0 for x < 0, through P3 and the first with x < 1 for x > 1,
+# flat (0, or 1) where neither has (_calc_cbez_line).
+fn _calc_cbez_ext(x1, y1, x2, y2, x) {
+    if (f64_lt(x, 0) == 1) {
+        if (f64_gt(x1, 0) == 1) { return _calc_cbez_line(y1, x1, x); }
+        if (f64_gt(x2, 0) == 1) { return _calc_cbez_line(y2, x2, x); }
+        return 0;
+    }
+    var xm = f64_sub(x, F64_ONE);
+    if (f64_lt(x2, F64_ONE) == 1) {
+        return f64_add(F64_ONE, _calc_cbez_line(f64_sub(y2, F64_ONE), f64_sub(x2, F64_ONE), xm));
+    }
+    if (f64_lt(x1, F64_ONE) == 1) {
+        return f64_add(F64_ONE, _calc_cbez_line(f64_sub(y1, F64_ONE), f64_sub(x1, F64_ONE), xm));
+    }
+    return F64_ONE;
+}
+
+# Internal: the double whose order-preserving integer key is k (cubic_bezier_ease's key bisection:
+# a double's key is its bit pattern for +0 and up, minus its magnitude's for the negatives, so that
+# halving the key distance halves the doubles left between two ends of either sign).
+fn _calc_cbez_unkey(k) {
+    if (k < 0) { return (0 - k) | 0x8000000000000000; }
+    return k;
+}
+
+# Internal: a cube root of v >= 0 good to about 1e-12, for a start: the bit pattern divided by 3
+# plus the exponent bias's share (an estimate within a few percent; a subnormal v is scaled by
+# 2^192 first), then two Halley steps y <- y (y^3 + 2v) / (2 y^3 + v), each cubing the error.
+fn _calc_cbrt_start(v) {
+    if (v == 0) { return 0; }
+    var w = v;
+    var sc = F64_ONE;
+    if (w < 0x0010000000000000) {
+        w = f64_mul(w, 0x4BF0000000000000);                # 2^192
+        sc = 0x3BF0000000000000;                           # 2^-64
+    }
+    var y = w / 3 + 0x2A9F7893782DA1CE;
+    var y3 = f64_mul(f64_mul(y, y), y);
+    y = f64_mul(y, f64_div(f64_add(y3, f64_add(w, w)), f64_add(f64_add(y3, y3), w)));
+    y3 = f64_mul(f64_mul(y, y), y);
+    y = f64_mul(y, f64_div(f64_add(y3, f64_add(w, w)), f64_add(f64_add(y3, y3), w)));
+    return f64_mul(y, sc);
+}
+
+# Internal: Cardano's root of a s^3 + p s = x - pm, the cubic P(t) = ((a t + b) t + c) t = x written
+# about tm = -b / (3a), p = P'(tm), pm = P(tm) (a3 = 3a): exact for the exact tm; the rounded tm leaves
+# a tiny s^2 term. With dA = (x - pm) / a and B = p / (3a), s = w - B / w for w = cbrt(dA / 2 +
+# sqrt(dA^2 / 4 + B^3)), taken as |dA| / (w^2 + B + B^2 / w^2) where B >= 0 (no cancellation).
+# Returns s, or NaN where the cubic has three real roots (B^3 < -dA^2 / 4). dA is not halved and
+# sqrt(dA^2 + 4 B^3) is scaled by the larger of its two terms, as either square alone can flush.
+fn _calc_cbez_cardano(a, a3, p, x, pm) {
+    var da = f64_div(f64_sub(x, pm), a);
+    var bb = f64_div(p, a3);
+    var ad = f64_abs(da);
+    var ab = f64_abs(bb);
+    if (f64_eq(ad, 0) == 1) { return 0; }
+    if (f64_eq(bb, 0) == 1) {
+        if (f64_lt(da, 0) == 1) { return f64_neg(_calc_cbrt_start(ad)); }   # p = 0: a s^3 = x - pm
+        return _calc_cbrt_start(ad);
+    }
+    var b32 = f64_mul(ab, f64_sqrt(ab));
+    var r2 = 0;
+    if (f64_le(f64_add(b32, b32), ad) == 1) {
+        var r = f64_div(bb, ad);
+        var q = f64_add(F64_ONE, f64_mul(f64_mul(f64_mul(_CALC_F64_FOUR, r), r), bb));
+        if (f64_le(0, q) == 0) { return 0x7FF8000000000000; }
+        r2 = f64_mul(ad, f64_sqrt(q));
+    } else {
+        if (f64_lt(bb, 0) == 1) { return 0x7FF8000000000000; }
+        var rr = f64_div(ad, f64_add(bb, bb));
+        r2 = f64_mul(f64_add(b32, b32), f64_sqrt(f64_add(F64_ONE, f64_div(f64_mul(rr, rr), bb))));
+    }
+    var w = f64_mul(_calc_cbrt_start(f64_add(ad, r2)), 0x3FE965FEA53D6E3D);   # times 2^(-1/3)
+    if (f64_eq(w, 0) == 1) { return 0; }
+    var s0 = 0;
+    if (f64_le(0, bb) == 1) {
+        var ww = f64_mul(w, w);
+        s0 = f64_div(ad, f64_add(f64_add(ww, bb), f64_div(f64_mul(bb, bb), ww)));
+    } else {
+        s0 = f64_sub(w, f64_div(bb, w));
+    }
+    if (f64_lt(da, 0) == 1) { s0 = f64_neg(s0); }
+    return s0;
+}
+
+# Internal: the bracketed Newton solve of r(s) = ((a s + b) s + c) s + d0 = 0 over [lo, hi], where
+# r(lo) < 0 < r(hi), from s; t = org + s is returned (org = 0 for the end form, tm for the form about
+# the inflection). A Newton step is taken while it stays inside the bracket the residuals' signs
+# keep, at most 8 times; otherwise the bisection of the ordered bit patterns (keys), which halves the
+# doubles left in the bracket. It stops on an exact residual, a step below t's spacing, adjacent
+# ends, or the quadratic regime (the step shrank by 2^-10 or more and is at most 2^-26 t, so the next
+# correction is under t's spacing; on the first pass the step is set against the bracket's
+# width 1, and one subnormal spacing also counts, as 2^-26 t flushes below 2^-1048). Each pass
+# evaluates r once: at most 1 + 8 + 63 = 72 evaluations, since the key distance across [lo, hi] is
+# below 2^63 and a bisection halves it, so the loop's own bound is never what ends it.
+# _CALC_CBEZ_NEV counts the evaluations (cubic_bezier_ease's cost; the tests read it and reset it).
+var _CALC_CBEZ_NEV = 0;
+fn _calc_cbez_newton(a, b, c, d0, org, lo, hi, s) {
+    var a3 = f64_mul(_CALC_F64_THREE, a);
+    var b2 = f64_add(b, b);
+    # The first pass: from a good start the first Newton step is final.
+    var e = f64_add(f64_mul(f64_add(f64_mul(f64_add(f64_mul(a, s), b), s), c), s), d0);
+    _CALC_CBEZ_NEV = _CALC_CBEZ_NEV + 1;
+    if (f64_lt(e, 0) == 1) {
+        lo = s;
+    } elif (f64_lt(0, e) == 1) {
+        hi = s;
+    } else {
+        if (f64_eq(e, e) == 0) { return e; }              # a NaN coefficient (a non-finite control point)
+        return f64_add(org, s);
+    }
+    var d = f64_add(f64_mul(f64_add(f64_mul(a3, s), b2), s), c);
+    var step = f64_div(e, d);
+    var sn = f64_sub(s, step);
+    var tc = f64_add(org, s);
+    var tn = f64_add(org, sn);
+    if (tn == tc) { return tc; }                           # a step below t's spacing
+    var as = f64_abs(step);
+    if (f64_lt(lo, sn) == 1 && f64_lt(sn, hi) == 1 && f64_le(as, 0x3F50000000000000) == 1) {
+        # At most 2^-26 t, or one subnormal spacing (where 2^-26 t flushes): the next step is under it.
+        if (f64_le(as, f64_mul(tn, 0x3E50000000000000)) == 1 || as <= 1) { return tn; }
+    }
+    var klo = lo;
+    if (klo < 0) { klo = 0 - (klo & 0x7FFFFFFFFFFFFFFF); }
+    var khi = hi;
+    if (khi < 0) { khi = 0 - (khi & 0x7FFFFFFFFFFFFFFF); }
+    var sprev = F64_ONE;
+    var nn = 0;
     var i = 0;
-    while (i < 8) {
-        var u = f64_sub(F64_ONE, t);
-        var uu = f64_mul(u, u);
-        var tt = f64_mul(t, t);
-        # B_x(t) = 3*u^2*t*x1 + 3*u*t^2*x2 + t^3
-        var three = f64_from(3);
-        var bx = f64_add(f64_add(
-            f64_mul(three, f64_mul(uu, f64_mul(t, x1))),
-            f64_mul(three, f64_mul(u, f64_mul(tt, x2)))),
-          f64_mul(tt, t));
-        var err = f64_sub(bx, x);
-        if (f64_lt(f64_abs(err), EPSILON_F64) == 1) { i = 8; }
-        else {
-            # dB_x/dt = 3*u^2*x1 + 6*u*t*(x2-x1) + 3*t^2*(1-x2)
-            var dbx = f64_add(f64_add(
-                f64_mul(three, f64_mul(uu, x1)),
-                f64_mul(f64_mul(_CALC_F64_SIX, f64_mul(u, t)), f64_sub(x2, x1))),
-              f64_mul(three, f64_mul(tt, f64_sub(F64_ONE, x2))));
-            if (f64_lt(f64_abs(dbx), EPSILON_F64) == 1) { i = 8; }
-            else { t = f64_sub(t, f64_div(err, dbx)); }
+    while (i < 72) {
+        var ksn = 0;
+        if (nn < 8 && f64_lt(lo, sn) == 1 && f64_lt(sn, hi) == 1) {
+            nn = nn + 1;
+            ksn = sn;
+            if (ksn < 0) { ksn = 0 - (ksn & 0x7FFFFFFFFFFFFFFF); }
+            as = f64_abs(step);
+            # Quadratic: the step shrank by 2^-10 or more and is at most 2^-26 t.
+            if (f64_le(as, f64_mul(sprev, 0x3F50000000000000)) == 1) {
+                if (f64_le(as, f64_mul(tn, 0x3E50000000000000)) == 1) { return tn; }
+            }
+        } else {
+            ksn = klo + ((khi - klo) >> 1);
+            if (ksn == klo || ksn == khi) { return tc; }   # adjacent ends
+            sn = _calc_cbez_unkey(ksn);
+            step = f64_sub(hi, lo);
         }
+        sprev = f64_abs(step);
+        s = sn;
+        e = f64_add(f64_mul(f64_add(f64_mul(f64_add(f64_mul(a, s), b), s), c), s), d0);
+        _CALC_CBEZ_NEV = _CALC_CBEZ_NEV + 1;
+        if (f64_lt(e, 0) == 1) {
+            lo = s;
+            klo = ksn;
+        } elif (f64_lt(0, e) == 1) {
+            hi = s;
+            khi = ksn;
+        } else {
+            if (f64_eq(e, e) == 0) { return e; }
+            return f64_add(org, s);
+        }
+        d = f64_add(f64_mul(f64_add(f64_mul(a3, s), b2), s), c);
+        step = f64_div(e, d);
+        sn = f64_sub(s, step);
+        tc = f64_add(org, s);
+        tn = f64_add(org, sn);
+        if (tn == tc) { return tc; }
         i = i + 1;
     }
-    # Evaluate B_y(t)
-    var u = f64_sub(F64_ONE, t);
-    var uu = f64_mul(u, u);
-    var tt = f64_mul(t, t);
-    var three = f64_from(3);
-    return f64_add(f64_add(
-        f64_mul(three, f64_mul(uu, f64_mul(t, y1))),
-        f64_mul(three, f64_mul(u, f64_mul(tt, y2)))),
-      f64_mul(tt, t));
+    return f64_add(org, s);
+}
+
+# Internal: the t in [0, 1] with P(t) = ((a t + b) t + c) t = x, for x in [0, 1/2] (cubic_bezier_ease
+# mirrors x > 1/2 first). The start is a closed-form root, so that Newton only polishes it:
+# - where P has an interior inflection tm = -b / (3a) and the root lies nearer tm than 0 (x above
+#   P(tm / 2): P rises on [0, 1]), the iteration runs in s = t - tm on P(tm + s) - x, whose residual
+#   is accurate where P' is small (cubic-bezier(1, 0, 0, 1)'s flat inflection at 1/2), from
+#   Cardano's root (a > 0: P' is least at tm and the cubic has one real root) or from the tangent
+#   line at tm (a < 0: P' is greatest there);
+# - else in t, from the root of the quadratic truncation c t + b t^2 = x (sqrt(c^2 + 4 b x) as a
+#   hypot where c^2 + 4 b x is below DBL_MIN: 4 b x flushes for a subnormal x), or from Cardano's
+#   root where the truncation's relative residual |a| t^3 / x exceeds 2^-26 (one Newton step from it
+#   would not reach the last bit) and Cardano's predicted relative error 2^-52 (|tm| / t + |pm| / x)
+#   is smaller: a triple root at the end (x1 = x2 = 0), where the truncation has no t^3.
+fn _calc_cbez_solve(a, b, c, x) {
+    var a3 = f64_mul(_CALC_F64_THREE, a);
+    var tm = 0;
+    if (f64_eq(a, 0) == 0) {
+        tm = f64_div(f64_neg(b), a3);
+        if (f64_lt(0, tm) == 1 && f64_lt(tm, F64_ONE) == 1) {
+            var th = f64_mul(tm, F64_HALF);
+            var ph = f64_mul(f64_add(f64_mul(f64_add(f64_mul(a, th), b), th), c), th);
+            if (f64_lt(ph, x) == 1) {
+                var pm = f64_mul(f64_add(f64_mul(f64_add(f64_mul(a, tm), b), tm), c), tm);
+                var p = f64_add(f64_mul(f64_add(f64_mul(a3, tm), f64_add(b, b)), tm), c);
+                var s0 = f64_div(f64_sub(x, pm), p);              # the tangent line at tm
+                if (f64_lt(0, a) == 1 && f64_le(f64_mul(a, f64_mul(s0, s0)), f64_mul(0x3E50000000000000, p)) == 0) {
+                    var sc = _calc_cbez_cardano(a, a3, p, x, pm);   # the cubic term matters
+                    if (f64_eq(sc, sc) == 1) { s0 = sc; }
+                }
+                var lo = f64_neg(tm);
+                var hi = f64_sub(F64_ONE, tm);
+                if (f64_lt(lo, s0) == 0 || f64_lt(s0, hi) == 0) { s0 = 0; }
+                return _calc_cbez_newton(a, f64_add(f64_mul(a3, tm), b), p, f64_sub(pm, x), tm, lo, hi, s0);
+            }
+        }
+    }
+    if (f64_eq(x, 0) == 1) { return 0; }
+    var t0 = x;
+    var berr = F64_POS_INF;
+    var tq = 0xBFF0000000000000;                           # -1: none
+    if (f64_lt(0, b) == 1) {
+        var q = f64_add(f64_mul(c, c), f64_mul(f64_mul(_CALC_F64_FOUR, b), x));
+        if (f64_lt(q, 0x0010000000000000) == 1) {
+            var v = f64_mul(f64_mul(F64_TWO, f64_sqrt(b)), f64_sqrt(x));
+            var h = v;
+            if (f64_eq(c, 0) == 1) {
+                h = v;
+            } elif (f64_lt(c, v) == 1) {
+                var rv = f64_div(c, v);
+                h = f64_mul(v, f64_sqrt(f64_add(F64_ONE, f64_mul(rv, rv))));
+            } else {
+                var rc = f64_div(v, c);
+                h = f64_mul(c, f64_sqrt(f64_add(F64_ONE, f64_mul(rc, rc))));
+            }
+            tq = f64_div(f64_add(x, x), f64_add(c, h));
+        } else {
+            tq = f64_div(f64_add(x, x), f64_add(c, f64_sqrt(q)));
+        }
+    } elif (f64_lt(0, c) == 1) {
+        var q2 = f64_add(f64_mul(c, c), f64_mul(f64_mul(_CALC_F64_FOUR, b), x));
+        if (f64_le(0, q2) == 1) { tq = f64_div(f64_add(x, x), f64_add(c, f64_sqrt(q2))); }
+    } elif (f64_eq(c, 0) == 1 && f64_eq(b, 0) == 1 && f64_lt(0, a) == 1) {
+        # P(t) = a t^3 exactly (x1 = x2 = 0 at this end): its root.
+        return _calc_cbez_newton(a, b, c, f64_neg(x), 0, 0, F64_ONE, _calc_cbrt_start(f64_div(x, a)));
+    }
+    var tq3 = 0;
+    var tqok = 0;
+    if (f64_lt(0, tq) == 1 && f64_le(tq, F64_ONE) == 1) {
+        tqok = 1;
+        t0 = tq;
+        tq3 = f64_mul(f64_mul(tq, tq), tq);
+        berr = f64_div(f64_mul(f64_abs(a), tq3), x);
+    }
+    if (f64_lt(0x3E50000000000000, berr) == 1) {
+        var done = 0;
+        if (f64_eq(a, 0) == 0) {
+            # Cardano's root, where its predicted error is below the corrected truncation's (berr^2).
+            var pm2 = f64_mul(f64_add(f64_mul(f64_add(f64_mul(a, tm), b), tm), c), tm);
+            var ec = f64_mul(f64_add(f64_div(f64_abs(tm), t0), f64_div(f64_abs(pm2), x)), 0x3CB0000000000000);
+            if (f64_lt(ec, f64_mul(berr, berr)) == 1) {
+                var p2 = f64_add(f64_mul(f64_add(f64_mul(a3, tm), f64_add(b, b)), tm), c);
+                var es = _calc_cbez_cardano(a, a3, p2, x, pm2);
+                if (f64_eq(es, es) == 1) {
+                    var tc = f64_add(tm, es);
+                    if (f64_lt(0, tc) == 1 && f64_le(tc, F64_ONE) == 1) {
+                        t0 = tc;
+                        done = 1;
+                    }
+                }
+            }
+        }
+        if (done == 0 && tqok == 1) {
+            # P(tq) - x = a tq^3 in exact arithmetic: a Newton step on the cubic, unevaluated.
+            var dq = f64_add(c, f64_mul(tq, f64_add(f64_add(b, b), f64_mul(a3, tq))));     # P'(tq)
+            var t1 = f64_sub(tq, f64_div(f64_mul(a, tq3), dq));
+            if (f64_lt(0, t1) == 1 && f64_le(t1, F64_ONE) == 1) { t0 = t1; }
+        }
+    }
+    return _calc_cbez_newton(a, b, c, f64_neg(x), 0, 0, F64_ONE, t0);
+}
+
+# Cubic Bezier easing, CSS's cubic-bezier(x1, y1, x2, y2) timing function: the curve with
+# control points (0, 0), (x1, y1), (x2, y2), (1, 1); returns y = B_y(t) at the t in [0, 1]
+# where B_x(t) = x.
+# x1, x2: in [0, 1] for a CSS timing function (B_x is then non-decreasing on [0, 1] and t is
+# unique, or one of an interval of t sharing one y); outside it B_x may turn back, and the t
+# taken is one root the bracket below reaches. y1, y2: any.
+# x: the input progress. In [0, 1] it is solved for; below 0 and above 1 the curve is
+# extended by its end tangents as CSS specifies (_calc_cbez_ext; a flat tangent gives its
+# constant at +-Inf too). A NaN x or a NaN control point returns NaN, in [0, 1] and outside it
+# (the extension uses one control point, but a curve with a NaN is not a curve).
+# The solve works from the end x is nearer: for x > 1/2 on the mirrored curve (1 - x2, 1 - x1)
+# at 1 - x (exact), u = 1 - t, so a multiple root at t = 1 (x2 = 1) is a root at an end's 0. It
+# starts from a closed-form root of the cubic (_calc_cbez_solve): about the inflection, Cardano's
+# (or the tangent line's) where the root lies nearer the inflection than the end, and the
+# iteration runs about it, where the residual stays accurate on a flat inflection; near the end,
+# the quadratic truncation's root, corrected by one Newton step whose residual is known in
+# closed form, or Cardano's where x1 = x2 = 0 leaves only the cubic term. Newton then polishes it
+# inside the bracket the residuals' signs keep (_calc_cbez_newton), falling back to the bisection
+# of the ordered bit patterns; at most 72 evaluations of B_x by construction (8 Newton steps, 63
+# bisections), at most 4 on the 201,088 CSS inputs measured (x1, x2 in [0, 1]) and at most 25 on
+# curves outside that range, where B_x turns back (200,000 inputs, 3.4.1 third review); y is B_y at
+# the t reached, recomputed in double-double where y1 and y2 of opposite signs cancel in its
+# Bernstein form (_calc_cbez_y).
+# Accuracy against an exact rational solve, in units of |dy/dx| ulp(x) + ulp(y) at the exact root:
+# at most 3.25 on the 19,571 inputs of the 3.4.1 reviews (15 named curves at 211 points down to
+# 2^-1074, random CSS curves, x at both ends, flat inflections, control points at or near 0 and
+# 1), 3.15 on 35,328 more (the CSS presets and degenerate curves at 2^-k and 1 - 2^-k for every
+# k, near-flat inflections, cancelling y, tiny control points) and 4.65 on 60,000 random curves.
+# Past [0, 1] the extension was within 1.44 ulps of the exact line on 20,000 inputs across the whole
+# exponent range (3.4.1 third review; _calc_cbez_line). That is a sample's worst, not a bound: on
+# 220,000 other inputs 20 passed 1.5 ulps, worst 14.8, by cancellation in 1 + line just past x = 1
+# (3FF0000000000000 3A172258F69916AC 3FEA571319281D75 4167BE23AA808405, x = 3FF0000004000000).
+# [measured: 3.4.1 release claims pass, _calc_cbez_line inputs against an exact oracle, 2026-11-01]
+# 1 ulp of x moves the exact y by |dy/dx| ulp(x), which is large where B_x' vanishes (by up to
+# 4.5e-6 on cubic-bezier(1, 0, 0, 1) at 1/2).
+# Cost against 3.4.0, which stopped at its first test near the ends (often with a wrong y): at most
+# 7.8 times its time (the worse of two runs) on ordinary curves, over 27,594 inputs, the curves above at 2^-k and
+# 1 - 2^-k for every k, 1,001 grid points, 1/2 +- 64 ulps and random x; CSS ease at 0.58 1.4 times
+# and ease-in-out at 0.58 1.7 times (3.4.0 iterated 8 times there); cubic-bezier(1, 0, 0, 1) at
+# 0.505 0.62 times, CSS ease-out at 1e-6 0.66 times.
+# [measured: lane NUM3 probes against an exact rational oracle, 114,899 inputs, 2026-10-31]
+# [measured: lane NUM3 emulation of this solve, 1,200,000 random degenerate inputs, 2026-10-31]
+# [measured: lane NUM3 same-binary timing sweep and interleaved bench rows against 3.4.0, 2026-10-31]
+# ⛔ 3.4.1 — THE SOLVE WAS 8 UNBRACKETED NEWTON STEPS FROM t = x, stopped also on a slope
+# below 1e-12, and neither stop was reported (roadmap [3.4.1], AU2-G4-F1). On cubic-bezier
+# (1, 0, 0, 1), whose B_x is flat at t = 1/2, x = 0x3FE028F5C28F5C29 (0.505) returned
+# 0x3FBAD7D99EF4BF80 (0.105) where the exact y is 0x3FE51734657C739D (0.659), 24 of 201 grid
+# points were off by up to 0.554, and the output was not monotone. Standard CSS curves were
+# within 1.5e-12. And past [0, 1] it returned whatever 8 Newton steps on the polynomial's
+# extension reached; the CSS tangent extension is the defined answer there.
+# [measured: tests/edge_cases.tcyr, group "3.4.1: cubic_bezier_ease against an exact rational solve"]
+# ⛔ 3.4.1 (review) — THE FIRST REPAIR'S rtsafe RULE COMPARED STEPS BY VALUE, and B_x has a double
+# root at t = 0 when x1 = 0: Newton from above converged linearly (ratio 1/2), each step passing
+# "halves the step before last", and the bit bisection that ends any bracket in 64 steps was never
+# taken. CSS ease-out (0, 0, 0.58, 1) at x = 1e-6 took 16 evaluations, 1e-100 171, and from
+# 1e-180 the 300-iteration cap, returning B_y(x) ~ 0 (exact 0x1A63B9FCB63DA9CC at 8.6e-182, 3.4.0
+# also 0); cubic-bezier(0, 0, 1, 1), whose y is x, returned 0 at 8.6e-182.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 (review): cubic_bezier_ease at small x"]
+# ⛔ 3.4.1 (second review) — THE BIT-DISTANCE RULE LEFT THE MULTIPLE ROOT AT t = 1 LINEAR. Near 1
+# bit distance is value distance, so Newton halving toward the double root of x2 = 1 (ratio 1/2) or
+# the triple root of x1 = x2 = 1 (ratio 2/3) still passed it, and the flat inflection bisected
+# through the noise of its residual: CSS ease-in at x = 1 - 2^-53 took 30 evaluations and 836 ns
+# where 3.4.0 took 29 ns (an answer within 0.73 units), cubic-bezier(1, 1, 1, 1) near 1 up to 57,
+# cubic-bezier(1, 0, 0, 1) at 1/2 - 18 ulps 46 (1.26 us, ending 555,578,499 ulps from the exact y);
+# "at most 38 evaluations" and "5.6 units" held only on the 7,165 inputs they were measured on
+# (57 evaluations, and 5.75 units on the review's 19,571). The closed-form starts above take 1
+# evaluation on every such input. The tangent extension divided y1 / x1 first, which overflows for
+# x1 = 2^-1074 (-Inf at x = -2^-1074, exact -1), and it read only the control point it used, so
+# cubic-bezier(NaN, 0.5, 0.5, 1) at -1 returned -2.
+# [measured: tests/edge_cases.tcyr, group "3.4.1 NUM3: cubic_bezier_ease near the ends and its extension"]
+public fn cubic_bezier_ease(x1, y1, x2, y2, x) {
+    # A NaN anywhere: the curve or the input is not a number (3.4.1 NUM3; the extension ignored the
+    # control points it did not use).
+    if ((x & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000) { return x; }
+    if ((x1 & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000) { return x1; }
+    if ((y1 & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000) { return y1; }
+    if ((x2 & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000) { return x2; }
+    if ((y2 & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000) { return y2; }
+    if (f64_lt(x, 0) == 1 || f64_lt(F64_ONE, x) == 1) { return _calc_cbez_ext(x1, y1, x2, y2, x); }
+    # Solve from the nearer end: x > 1/2 on the mirrored curve (1 - x2, 1 - x1), u = 1 - t, x' = 1 - x
+    # (exact), so a multiple root at t = 1 (x2 = 1) is the end form's root at u = 0.
+    if (f64_lt(F64_HALF, x) == 1) {
+        var mc = f64_mul(_CALC_F64_THREE, f64_sub(F64_ONE, x2));
+        var mb = f64_sub(f64_mul(_CALC_F64_THREE, f64_sub(f64_sub(F64_ONE, x1), f64_sub(F64_ONE, x2))), mc);
+        var ma = f64_sub(f64_sub(F64_ONE, mc), mb);
+        var mu = _calc_cbez_solve(ma, mb, mc, f64_sub(F64_ONE, x));
+        if (f64_eq(mu, mu) == 0) { return mu; }
+        return _calc_cbez_y(y1, y2, f64_sub(F64_ONE, mu));
+    }
+    # B_x(t) = ((a t + b) t + c) t: c = 3 x1, b = 3 (x2 - x1) - c, a = 1 - c - b.
+    var c = f64_mul(_CALC_F64_THREE, x1);
+    var b = f64_sub(f64_mul(_CALC_F64_THREE, f64_sub(x2, x1)), c);
+    var a = f64_sub(f64_sub(F64_ONE, c), b);
+    var t = _calc_cbez_solve(a, b, c, x);
+    if (f64_eq(t, t) == 0) { return t; }
+    return _calc_cbez_y(y1, y2, t);
 }
 
 # ================================================================
@@ -1401,10 +1868,23 @@ fn _calc_fbm_2d_pass(acc, x, y, octaves, freq, persistence) {
 # freq: initial frequency (f64), amp: initial amplitude (f64),
 # persistence: amplitude multiplier per octave (f64, typically 0.5),
 # out: pointer, the noise value (f64) written here.
-# Returns Ok(0) with the octaves' weighted mean, sum(a_i n_i) / sum(a_i), a_i = amp p^i:
-# approximately [-1, 1]. Err(HSB_ERR_INVALID_INPUT) for octaves <= 0 (no octave, no
-# mean); Err(HSB_ERR_DIVISION_BY_ZERO) when the weights sum to 0 (persistence = -1 with
-# an even count): the mean is a division by 0. `out` is untouched on both.
+# Returns Ok(0) with the octaves' weighted mean, sum(a_i n_i) / sum(a_i), a_i = amp p^i,
+# n_i = perlin_2d at octave i. Its range is the RANGE OF THE WEIGHTS' SIGNS: for p >= 0 the
+# weights share amp's sign, the mean is a convex combination of the n_i and lies in their
+# range, approximately [-1, 1]; for p < 0 they alternate, and the mean is an affine
+# combination bounded only by sum|a_i| / |sum a_i|, which tends to (1 + |p|) / (1 - |p|) as
+# the octaves grow for -1 < p < 0 (3 at p = -1/2) and is without bound as sum a_i nears 0.
+# Err(HSB_ERR_INVALID_INPUT) for octaves <= 0 (no octave, no mean);
+# Err(HSB_ERR_DIVISION_BY_ZERO) when the weights sum to 0 (persistence = -1 with an even
+# count): the mean is a division by 0. `out` is untouched on both.
+# ⛔ 3.4.1 — THIS SAID "approximately [-1, 1]" WITHOUT THE SIGN CONDITION (roadmap [3.4.1],
+# SPC-F10 = AU2-G6-F9). At (0x404F6D245415BABD, 0x4047EBB17CCF4E41), 2 octaves, freq 1,
+# amp 1: persistence -1/2 gives 0x3FBE7357DA6B6662 here and 0x40072D1F099FFED8 (2.897) in
+# simplex_fbm_2d_checked; -(1 - 2^-53) gives 0x43123D4C850CA110 (1.3e15) and
+# 0x434E87594BCE63B6 (1.7e16). Each is the defined mean, (n_0 + p n_1) / (1 + p) correctly
+# rounded from the octaves' values (an exact rational check); the range claim was the
+# defect, and the definition stands.
+# [measured: tests/edge_cases.tcyr, group "3.4.1: fBm with a negative persistence"]
 # ⭐ 3.4.0 — REPLACES fbm_2d, which returned 0, a legal noise value, for octaves <= 0,
 # for weights summing to 0 and for amp = 0 (audit D069). amp = 0 is not a failure: the mean does not
 # depend on amp (it cancels), so its value at amp = 0 is the one at every other amp, and

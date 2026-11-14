@@ -2,6 +2,162 @@
 
 ## [Unreleased]
 
+## [3.4.2] - 2026-11-14 — the consumer filings: an allocation scope, caller storage, matrix-free CG
+
+This release repairs the five issues hisab's consumers filed between 2026-11-09 and 2026-11-11, from the impetus, pravash and ushma ports. Each one is closed in `docs/development/issues/archived/` with a paired run: the repro as filed against the 3.4.1 tree, and its 3.4.2 form against this tree. The two ganita filings stay open because nothing has moved upstream.
+
+It is a patch that adds:
+- 22 public declarations;
+- one observable change, the order in which `spatial_hash_query_radius` answers on two of its plans (**Changed**);
+- one manifest change: sakshi is a stdlib leaf now, not a `[deps.sakshi]` package.
+
+No public name changes meaning and no `HSB_ERR_*` code is added. The toolchain stays at cyrius 6.7.18 with ganita 1.2.15.
+
+**Numbers:**
+
+| Measure | 3.4.1 | 3.4.2 |
+|---|---|---|
+| Suite assertions | 14,152 | 14,303 |
+| Constant gate (skipped) | 324/324 (22) | 325/325 (23) |
+| Public declarations | 703 | 725 |
+| Public probes | 846 | 868 |
+| Non-public probes refused | 1,489 | 1,515 |
+| `#must_use` | 290 | 296 |
+| Benchmarks | 375 | 392 |
+| `[lib]` modules | 35 | 36 (`heap.cyr` added) |
+| Bundle | 70,654 lines, 3,660,265 B | 72,009 lines, 3,724,275 B |
+| `dist/hisab.deps` leaves | 7 | 9 (`fnptr`, `string` added) |
+
+**Pinned builds:**
+- cyrius 6.6.2 refuses the bundle with the known `#derive` error.
+- Under 6.6.3, 6.6.4, 6.6.5, 6.6.10, 6.6.13, 6.6.20, 6.7.9 and 6.7.18, a cross-module program builds with no warning and runs, both with the manifest's 17 leaves and with the sidecar's 9 plus `syscalls` and `io`. It calls the scope around `gjk_epa_3d`, the nine `_into` forms, the spatial hash into storage, a DST plan and `num_cg`.
+- The output is bit-identical on every pin but for three DST values on 6.6.3–6.6.5, in `num_dst` and `num_dst_into` alike: those pins' own sin and cos.
+- `check-miscompile.sh` passes on the bundle under 6.6.3 and 6.7.18.
+
+**Consumer manifests, read 2026-11-14:** all fifteen direct consumers pin hisab 3.4.1 and cyrius 6.7.18.
+
+### Added
+
+- **The allocation scope (`src/heap.cyr`, issue `2026-11-09-allocator-scoped-calls`, impetus H9 and pravash).** Through 3.4.1 every value hisab returned and every working set it built came from `alloc`, which has no free. A consumer that called hisab every step grew the heap without bound: 24 B for an `hvec3_add`, 105,920 B for a `gjk_epa_3d` on two spheres. impetus and pravash kept hisab off their step paths for that reason.
+  - `hisab_alloc_scope(al)` routes every allocation hisab's own code makes to the caller's `Allocator` (an arena, or any `allocator_new`) until the next call, and returns the scope it replaced so scopes nest. `hisab_alloc_scope(0)` routes them back to the global heap. A per-step consumer sets the scope, calls hisab, restores the scope and runs `reset_via(arena)`.
+  - **What it covers.** Every `alloc` site in `src/` now calls `hisab_alloc`. Every vec goes through `hisab_vec_new` / `vec_push_a(hisab_allocator(), …)`, and the symbolic modules' Strs take the scope's allocator too. Memory from a scope is zeroed, as `alloc`'s is.
+  - **What it does not cover.** Eight public functions reach ganita's matrix routines, which allocate inside ganita: `inertia_box`, `inertia_sphere`, `mat_new_guarded`, `svd_compute_checked`, `svd_truncated`, `eigen_qr`, `svd_golub_kahan` and `opt_levenberg_marquardt`. Of `tests/hisab.bcyr`'s 375 calls run under a scope, 364 take 0 B of global heap, 9 reach those eight, and 2 allocate in the benchmark itself.
+  - **The contract.** A reset invalidates every value hisab returned under the scope and every structure it grew there, so long-lived structures are built outside it. There is one scope per process.
+  - **New public names:** `hisab_alloc_scope`, `hisab_alloc_scope_current`, `hisab_alloc`, `hisab_allocator` and `hisab_vec_new`.
+- **`_into` value operations** (impetus H1): `hvec3_add_into`, `hvec3_sub_into`, `hvec3_scale_into`, `hvec3_cross_into`, `hquat_mul_into`, `hquat_rotate_vec3_into`, `m3_mul_vec3_into`, `m3_mul_into` and `m4_mul_into` write into the caller's storage and allocate nothing.
+  - Each gives its allocating form's bits, pinned on 2,000 random full-mantissa operand pairs and on the rotation's two rare paths. Each accepts an operand as `out`.
+  - The matrix forms use scalar arithmetic in the packed form's order, which is the same bits and keeps clear of the cycc 6.6.0–6.6.4 packed-destination defect.
+- **The spatial hash into caller storage** (issue `2026-11-11-spatial-hash-per-step-rebuild-allocates`, pravash P2): `spatial_hash_query_cell_into(sh, point, out, cap)` and `spatial_hash_query_radius_into(sh, point, radius, out, cap)`.
+  - Each writes the first `min(count, cap)` results in the allocating query's order, returns the count, and allocates nothing.
+  - A short `cap` takes the oldest entries of a cell. On the flat-scan plan it takes the first `cap` in the walk's order, through a heap kept in `out`.
+  - A step of 1,000 inserts and 27,000 cell queries took 4,104,000 B through 3.4.1 and takes 0 B now.
+- **DST-I with a plan, in caller scratch** (issue `2026-11-11-dst-allocates-per-call`, pravash L6): `num_dst_plan_words(n)`, `num_dst_scratch_words(n)`, `num_dst_plan(n, plan)`, `num_dst_into(data, n, plan, scratch)` and `num_idst_into(…)`.
+  - The plan holds what `num_dst` computes on every call that does not depend on the data: the direct path's n² sines, the FFT's twiddles, and Bluestein's chirp with its kernel's transform.
+  - The answers are `num_dst`'s and `num_idst`'s bit for bit at every n = 1..300 and at 511, 1023, 1500 and 2047, on all three paths.
+  - Each call takes 0 B, where `num_dst` took 112 B at n = 14, 10,208 B at n = 62 and 20,448 B at n = 126.
+- **`num_cg(apply, ctx, b, x, n, tol, max_iter, scratch)`** (issue `2026-11-11-no-matrix-free-linear-cg`, pravash P1, L5) is the matrix-free linear conjugate gradient that 1.4.0's `num::conjugate_gradient` had and 3.x lacked.
+  - **Interface.** `apply` is called as `fncall3(apply, ctx, v, out)`. `tol` is absolute, the scratch is 3n words, and the call returns `Ok(iterations)`.
+  - **Order.** It runs 1.4.0's iteration in 1.4.0's order, with dot products folded from −0 in index order, inside a frame scaled by a power of two set from max|b − A x0|. Its x and iteration count are therefore 1.4.0's bit for bit where 1.4.0's values stay normal and its guard does not fire, and `(2^i A, 2^j b, 2^j tol)` gives `2^(j−i)` x with the same count. That is pinned at j = −990, −500, 500 and 1000, and at i = ±500.
+  - **Where it differs from 1.4.0:**
+    - 1.4.0's absolute `|p·Ap| < 1e-12` guard returned an early iterate as `Ok`; on `2^-30 L x = 2^-30 c` it stopped short. `num_cg` takes only the exact breakdown, p·Ap not above 0 or not finite.
+    - `max_iter` and a breakdown return `Err(HSB_ERR_NO_CONVERGENCE)`, with x holding the last iterate.
+    - A tolerance stated as r·r < tol² no longer flushes or overflows outside 1e±154.
+- **Gate: the scope rule** in `scripts/check-heap-globals.sh`. No `src/` function outside `heap.cyr` may call a stdlib function that takes the global heap. An `_a` call must be given `hisab_allocator()`. `SCOPE_EXEMPT` names the four ganita calls, and its selftest plants each shape.
+  - The gate's alloc closure is seeded with `hisab_alloc` and `hisab_vec_new`, which reach `alloc` through a function pointer. Without that seed it fell from 912 functions to 240, under its floor, and stopped seeing four kept writes. The floor is what caught it.
+
+### Changed
+
+Each item is old → new.
+
+- **`spatial_hash_query_radius`**, on its flat-scan plan (taken where the block holds more cells than the hash holds entries) and for radius +Inf: insertion order → the cell walk's order.
+  - The cell walk's order is the block's cells in (x, y, z) order, x outermost, with each cell's entries in insertion order. The multiset is unchanged.
+  - Through 3.4.1 a sum over the result took different bits depending on the plan, and the plan depends on the radius and the hash's size. One order on every plan is pravash's condition for its drag and neighbour lists.
+  - `tests/abuse.tcyr`'s 3.4.1 pin of the insertion order is re-derived: 20 then 10 (was 10 then 20).
+  - Cost: a sort of the m matches on those two plans. Each match gets one integer key, its cell's index in the matched cells' box with its insertion index in the low bits, and keys are sorted by LSD radix from 64 matches up and by a heap below that. Inputs whose keys cannot fit, such as infinite coordinates or points 2^20 cells apart, take the comparator. **Performance** has the cost.
+- **`hquat_rotate_vec3`'s wide and scaled paths** (v near DBL_MAX, or |q|² outside [1/4, 16]): they allocated a scaled copy of q or v before the answer, so a heap with fewer than 56 bytes left refused them → they keep the copy in their frame and allocate only the 24-byte answer. Answers are unchanged bit for bit (every suite). `tests/foundation.tcyr`'s refusal sweep now asserts a refusal below 24 bytes and the open heap's bits at exactly 24.
+- **`geo_ray_obb`, `geo_ray_obb_face` and what reads them** (the OBB jets): the box's three axes were three allocated rotations, each one refusable → rotated in place on the stack by `hquat_rotate_vec3_into`, with the same bits.
+  - With the heap exhausted these now answer the open heap's t and face. 3.4.1 gave NaN with `out` unwritten.
+  - `geo_obb_axes` still returns heap axes, now heap copies of the stack ones (4 allocations, as before). A first form returned pointers into its own frame; a modules_c test now reads the axes after two more OBB calls.
+- **The manifest**: `[deps.sakshi]` (git, tag 2.5.10) → `"sakshi"` in `[deps] stdlib`.
+  - The vendored `lib/sakshi.cyr` is the same bytes (sha256 `8a819554…`). `cyrius.lock` drops the package's commit row (33 deps, none commit-pinned), and `deps --verify` passes 33/33.
+  - **Consumers:** the "refusing to overwrite stdlib leaf 'sakshi'" warning no longer reaches you (**Fixed**).
+- **`dist/hisab.deps`**: 7 → 9 leaves; the compile-verify adds `fnptr` and `string`. A consumer that declares its own leaves gets them from the sidecar as before.
+- **The module dependency table** (`docs/architecture/overview.md`) is re-derived by compiling each module against its listed set and against that set less each member. Every module but `error` and `f64_util` needs `heap`, and nothing else moved.
+
+### Fixed
+
+- **A per-step consumer could not contain what hisab allocated** (issue `2026-11-09-allocator-scoped-calls`; root cause: every allocation went to `alloc`, with no seam). The fix is the scope and the `_into` forms (**Added**).
+  - Paired run: the repro exits 1 on 3.4.1 (24, 24, 24, 48, 105,920, 10,936 and 20,792 B per call) and exits 1 on 3.4.2 as filed, because the unscoped calls are unchanged.
+  - Its 3.4.2 form, `…-repro-3.4.2.cyr`, runs each call as a scoped step with the arena reset and exits 0: 0 B per step after the first, for all seven calls.
+- **`spatial_hash_query_cell` leaked a vec per query** on an SPH step: 4,104,000 B per step for 1,000 particles. The fix is `spatial_hash_query_cell_into`; the repro exits 1 → its 3.4.2 form exits 0.
+- **`num_dst` / `num_idst` allocated on every call**, about 2.5 MB a step on a 64² grid. The fix is the plan form; the repro exits 1 → its 3.4.2 form exits 0.
+- **1.4.0's matrix-free CG had no 3.x counterpart.** The fix is `num_cg`.
+- **Every consumer that also used the sakshi leaf resolved with a warning** (issue `2026-11-11-deps-sakshi-package-warns-every-consumer`; root cause: hisab declared a `[deps.sakshi]` package and never called it). The fix is the manifest change above.
+  - Paired run: `…-repro-3.4.2.sh` against a tree exits 1 on the 3.4.1 tag's tree, with the warning, and 0 on this tree.
+  - The original repro (tag 3.4.1) exits 0 once its tag reads 3.4.2.
+
+### Tests
+
+**New groups in `tests/modules_c.tcyr` (2,055 → 2,203 assertions):**
+- **Spatial hash:**
+  - sequences against a brute force on both plans and at every cap;
+  - spans of 2^19 and 2^25 cells against an explicit sort, which exercises the key-overflow guards;
+  - the boundary of the key bound;
+  - one radix pass, and the radix temporary refused;
+  - the error returns, and 0 B per step.
+- **DST:** bits against `num_dst` and `num_idst` over n = 1..300 and four larger n, the plan's word counts, refusals with the data untouched, and 0 B per call.
+- **`num_cg`:** against a transcription of 1.4.0's loop (pravash's stand-in), homogeneity in A and b, 1.4.0's guard case, the exits, and 0 B over 50 solves.
+- **The allocation scope:** the issue's seven calls bit for bit and at 0 B a step, zeroed reuse of dirtied arena memory, a refusing scope, nesting, and an allocator that never refuses.
+- **The `_into` forms:** bits, aliasing and 0 B.
+
+`tests/foundation.tcyr` re-pins the rotation's refusal points (1,094 → 1,095). `tests/modules.tcyr` (3,002 → 3,003) and `tests/abuse.tcyr` (2,764 → 2,765) re-pin the OBB rays' refusals: with the heap exhausted they now answer the open heap's bits (**Changed**).
+
+**Mutation proofs:** 69 single-operator mutants of the new code, each confirmed installed, judged by the suites' failure counts after an unmutated control passed, and byte-checked on restore.
+- 65 are killed. Four of them only after a fixture was added: the two key-overflow guards, the radix's odd-pass copy-back and the scope's `ALLOC_MAX` check.
+- 1 exposed a redundant guard (`_numx_dst_words`'s `n > 16384`, which the general `ALLOC_MAX / 8` check already covers), so the line is removed.
+- 3 are equivalent:
+  - the radius query's plan choice, since both plans now answer the same sequence;
+  - `num_cg`'s fold from +0 instead of −0, which changes only the sign of a zero that no test of p·Ap or r·r reads;
+  - dropping `_hquat_rotate_wide`'s doubling of q (3.4.0 code), an exact power-of-two rescaling. 133,292 random wide-path inputs give the same bits without it. This one is on the roadmap.
+- A first run read all 52 as killed because the suite under them did not compile. CLAUDE.md now requires the control first.
+
+### Performance
+
+**Method.** One binary per tree, both built under cyrius 6.7.18 from the same `tests/hisab.bcyr`: the 3.4.1 tag in its own directory, and this tree. The two ran interleaved and pinned to one core, three rounds each, with one-minute load 1.7–2.2. Over all 375 shared rows the median is +1.5% and the geometric mean +1.6%: 38 rows are slower by more than 5% outside both spreads and 4 are faster. An earlier full round under load 2.3–3.0 read −1.2%, so ±2% across the whole bench is this machine, not a claim. Focused rows ran nine rounds each the same way.
+
+- **The new forms beside the allocating ones they replace on a step path** (3.4.2 rows, medians):
+  - `vec3_add_into_x64` 490 ns against `vec3_add_x64` 1,136 ns (2.3×).
+  - `quat_rotate_vec3_into_x64` 2,839 against `quat_rotate_vec3_x64` 3,585 ns (−21%).
+  - `m3_mul_vec3_into_x64` 1,176 ns, 18 ns a call against `m3_mul_vec3`'s 45.
+  - `num_dst_into` against `num_dst`, with the plan kept: n = 14, 569 ns against 9.80 µs (17×, the direct path's sines); n = 62, 37.0 against 163 µs (4.4×); n = 1023, 181 against 483 µs (2.7×).
+  - `spatial_hash_query_cell_into_2k` 302 against `spatial_hash_query_2k`'s 433 µs (−30%).
+  - `num_cg_poisson_16x16` (tol 1e-9) 358 µs.
+- **The OBB rays**, now rotating their axes in place: `ray_obb` 287 → 257 ns (−10%), `ray_obb_face_origin` 311 → 282 ns (−9%).
+
+### Costs
+
+Stated as plainly as the wins. Against the 3.4.1 tag, on the bench above.
+
+- **The scope's default path: about 1–2 ns per allocation.** `hisab_alloc` calls `alloc` through a function pointer that the scope swaps, inlined at each call site.
+  - The first form tested the scope and then called `alloc`, but `#inline` refuses a body with control flow, so it cost a frame per allocation: `vec3_add` 17 → 25 ns, and +2.1% at the median across the bench.
+  - The inlined form costs: `vec3_add` 18 → 19 ns (inside its spread), `vec3_lerp` 25 → 27, `m3_mul_vec3` 41 → 45 (two allocations), `m3_mul` 92 → 100, `t3d_compose` 174 → 188, `so3_log` 159 → 171, `se3_exp` 693 → 754 ns, `solve_bicgstab_64` 33.1 → 35.6 µs, `halfedge_2k_tris` 730 → 783 µs.
+- **`hquat_rotate_vec3`** 54 → 59 ns (+9%), with the fast path's arithmetic written out as in 3.4.1. A form that routed every call through the shared core read 57–62 ns.
+- **`m4_mul_into` is slower per call than `m4_mul`**: 188 against 135 ns, because the scalar form that matches the packed bits does not beat the packed one. It buys no allocation, not speed.
+- **The sorted radius plans.** `spatial_hash_query_radius`'s flat scan and its +Inf path now sort their matches:
+
+  | Matches | 3.4.1 | 3.4.2 |
+  |---|---|---|
+  | 40 | 1.45 µs | 3.34 µs |
+  | 200 | 7.1 µs | 16.8 µs |
+  | 2,000 | 64 µs | 159 µs |
+
+  - That is about 2.3× on those two plans; the cell walk is unchanged. Comparator sorting cost 34 and 545 µs at 200 and 2,000, and integer keys with a heap sort 17.5 and 269 µs.
+  - `spatial_hash_radius_into_scan_200` is 16.6 µs, the same as the allocating 16.6.
+- **A scoped call pays its allocator.** `vec3_add_x64_scoped` (64 adds, the scope set and restored, the arena reset) is 2,060 ns against 1,136 ns unscoped: about 14 ns more per allocation for the vtable and the zeroing. `gjk_epa_spheres_scoped` is 483 µs against 435 µs unscoped (+11%).
+- **Not attributed:** `eigen_power_2x2_wide` 775 → 1,064 ns in this round and 1,053 → 767 ns in the earlier one. It is bimodal on both trees and no code it runs changed beyond its allocations.
+
+[measured: scratch A/B of tests/hisab.bcyr, 3.4.1 tag and this tree, 3 interleaved pinned rounds; focused f2 and rad benches, 9 and 3 rounds; 2026-11-14]
+
 ## [3.4.1] - 2026-11-01 — toolchain 6.7.18 (ganita 1.2.15, sakshi 2.5.10), the 3.4.0 findings
 
 This release is the roadmap's **[3.4.1]** rows: the 118 findings 3.4.0 carried forward, covering memory safety, wrong answers on ordinary input, fabricated answers, range and accuracy, costs, tests and documents. It is a patch: all 703 public declarations keep their names, parameters and members, no `HSB_ERR_*` code is added, and `convex_hull_2d` and `triangulate_polygon` move file inside the bundle. `ad_mul` gains the `#must_use` the other tape ops have, so a discarded result now warns (a warning, not an error; built under 6.6.3 and 6.7.18). Answers change on purpose, so a consumer reads **Changed** first. The toolchain moves from cyrius 6.7.9 to 6.7.18 and sakshi from 2.5.8 to 2.5.10; ganita stays at 1.2.15, and nothing hisab calls on x86_64 or aarch64 changes behaviour (comment-stripped body diffs; before any source change all seven suites printed the same output under 6.7.18 as under 6.7.9, but for the compiler's unreachable-function note).

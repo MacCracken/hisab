@@ -3,6 +3,7 @@
 
 include "src/f64_util.cyr"
 include "src/error.cyr"
+include "src/heap.cyr"
 include "src/vec2.cyr"
 include "src/vec3.cyr"
 include "src/vec4.cyr"
@@ -3879,6 +3880,31 @@ fn main() {
     bench("co8_gjk_epa_ball_in_rim",        &bench_co8_ball_in_rim,                    500);
     bench("co8_gjk_epa_ball_past_rim",      &bench_co8_ball_past_rim,                  500);
 
+    # 3.4.2 -- REGISTERED LAST, after every row above: the allocation scope, the _into value
+    # operations, the DST plan, num_cg and the spatial hash into caller storage, each beside the
+    # allocating form it replaces on a per-step path; _b342_setup checks each path first.
+    if (_b342_setup() != 0) {
+        println("FATAL: a 3.4.2 row would measure a different path than its name -- see above");
+        return 1;
+    }
+    bench("vec3_add_x64",                   &bench_b342_add_x64,                    20000);
+    bench("vec3_add_x64_scoped",            &bench_b342_add_x64_scoped,             20000);
+    bench("vec3_add_into_x64",              &bench_b342_add_into_x64,               20000);
+    bench("quat_rotate_vec3_into_x64",      &bench_b342_rot_into_x64,               20000);
+    bench("quat_rotate_vec3_x64",           &bench_b342_rot_x64,                    20000);
+    bench("m3_mul_vec3_into_x64",           &bench_b342_m3v_into_x64,               20000);
+    bench("m4_mul_into_x16",                &bench_b342_m4_into_x16,                20000);
+    bench("gjk_epa_spheres_scoped",         &bench_b342_gjk_scoped,                  2000);
+    bench("num_dst_14",                     &bench_b342_dst14,                     100000);
+    bench("num_dst_into_14",                &bench_b342_dst14_into,                100000);
+    bench("num_dst_62",                     &bench_b342_dst62,                      20000);
+    bench("num_dst_into_62",                &bench_b342_dst62_into,                 20000);
+    bench("num_dst_into_1023",              &bench_b342_dst1023_into,                 200);
+    bench("num_cg_poisson_16x16",           &bench_b342_cg16,                        2000);
+    bench("spatial_hash_query_cell_into_2k", &bench_b342_sh_cell_into,                  5);
+    bench("spatial_hash_radius_scan_200",   &bench_b342_sh_scan,                     2000);
+    bench("spatial_hash_radius_into_scan_200", &bench_b342_sh_scan_into,             2000);
+
     println("=== done ===");
     return 0;
 }
@@ -4069,6 +4095,178 @@ fn _b41la_rows() {
     bench("cmat_inverse_6",                 &bench_cmat_inverse_6,               2000);
     bench("solve_pgs_frame3",               &bench_solve_pgs_frame3,            20000);
     return 0;
+}
+
+# ================================================================
+# 3.4.2 -- the allocation scope, _into, the DST plan, num_cg, the spatial hash into storage
+# ================================================================
+var _b342_al = 0;
+var _b342_out = 0;
+var _b342_m3 = 0;
+var _b342_sa = 0;
+var _b342_sb = 0;
+var _b342_n = 0;
+var _b342_d = 0;
+var _b342_d14 = 0;
+var _b342_d62 = 0;
+var _b342_d1023 = 0;
+var _b342_p14 = 0;
+var _b342_p62 = 0;
+var _b342_p1023 = 0;
+var _b342_s = 0;
+var _b342_cgc = 0;
+var _b342_cgb = 0;
+var _b342_cgx = 0;
+var _b342_cgs = 0;
+var _b342_buf = 0;
+var _b342_sh = 0;
+var _B342_FAIL = 0;
+fn bench_b342_add_x64() {
+    var r = 0;
+    for (var k = 0; k < 64; k = k + 1) { r = hvec3_add(_bv3a, _bv3b); }
+    return r;
+}
+# 64 adds under a scope over a growable arena, restored and reset: what a scoped step pays.
+fn bench_b342_add_x64_scoped() {
+    var p = hisab_alloc_scope(_b342_al);
+    var r = 0;
+    for (var k = 0; k < 64; k = k + 1) { r = hvec3_add(_bv3a, _bv3b); }
+    hisab_alloc_scope(p);
+    reset_via(_b342_al);
+    return r;
+}
+fn bench_b342_add_into_x64() {
+    for (var k = 0; k < 64; k = k + 1) { hvec3_add_into(_b342_out, _bv3a, _bv3b); }
+    return _b342_out;
+}
+fn bench_b342_rot_into_x64() {
+    for (var k = 0; k < 64; k = k + 1) { hquat_rotate_vec3_into(_b342_out, _bq1, _bv3a); }
+    return _b342_out;
+}
+fn bench_b342_rot_x64() {
+    var r = 0;
+    for (var k = 0; k < 64; k = k + 1) { r = hquat_rotate_vec3(_bq1, _bv3a); }
+    return r;
+}
+fn bench_b342_m3v_into_x64() {
+    for (var k = 0; k < 64; k = k + 1) { m3_mul_vec3_into(_b342_out, _b342_m3, _bv3a); }
+    return _b342_out;
+}
+fn bench_b342_m4_into_x16() {
+    for (var k = 0; k < 16; k = k + 1) { m4_mul_into(_b342_out, _bm4a, _bm4b); }
+    return _b342_out;
+}
+fn _b342_sup(shape, dir) {
+    var r = load64(shape + 8);
+    return hvec3_add(load64(shape), hvec3_scale(hvec3_normalize(dir), r));
+}
+fn bench_b342_gjk_scoped() {
+    var p = hisab_alloc_scope(_b342_al);
+    var h = gjk_epa_3d(&_b342_sup, _b342_sa, &_b342_sup, _b342_sb, _b342_n, _b342_d);
+    hisab_alloc_scope(p);
+    reset_via(_b342_al);
+    return h;
+}
+fn bench_b342_dst14() { var t, v = num_dst(_b342_d14, 14); return t; }
+fn bench_b342_dst14_into() { var t, v = num_dst_into(_b342_d14, 14, _b342_p14, _b342_s); return t; }
+fn bench_b342_dst62() { var t, v = num_dst(_b342_d62, 62); return t; }
+fn bench_b342_dst62_into() { var t, v = num_dst_into(_b342_d62, 62, _b342_p62, _b342_s); return t; }
+fn bench_b342_dst1023_into() { var t, v = num_dst_into(_b342_d1023, 1023, _b342_p1023, _b342_s); return t; }
+# The 5-point Poisson operator on a 16 x 16 interior, zero walls.
+fn _b342_poisson(ctx, v, out) {
+    for (var j = 0; j < 16; j = j + 1) {
+        for (var i = 0; i < 16; i = i + 1) {
+            var k = j * 16 + i;
+            var a = f64_mul(0x4010000000000000, load64(v + k * 8));
+            if (i > 0) { a = f64_sub(a, load64(v + (k - 1) * 8)); }
+            if (i < 15) { a = f64_sub(a, load64(v + (k + 1) * 8)); }
+            if (j > 0) { a = f64_sub(a, load64(v + (k - 16) * 8)); }
+            if (j < 15) { a = f64_sub(a, load64(v + (k + 16) * 8)); }
+            store64(out + k * 8, a);
+        }
+    }
+    return 0;
+}
+fn bench_b342_cg16() {
+    for (var i = 0; i < 256; i = i + 1) { store64(_b342_cgx + i * 8, 0); }
+    var t, it = num_cg(&_b342_poisson, 0, _b342_cgb, _b342_cgx, 256, 0x3E112E0BE826D695, 1000,
+      _b342_cgs);
+    return it;
+}
+fn bench_b342_sh_cell_into() {
+    var acc = 0;
+    for (var qi = 0; qi < 2000; qi = qi + 1) {
+        acc = acc + spatial_hash_query_cell_into(_b_sh, load64(_b_sh_q + qi * 8), _b342_buf, 4096);
+    }
+    return acc;
+}
+# 200 points in a 5^3 cube of unit cells, radius 4 about its centre: a block of 9^3 = 729 cells
+# against 200 entries, so the flat scan, which since 3.4.2 sorts its 200 matches into cell order.
+var _b342_c = 0;
+fn bench_b342_sh_scan() { return spatial_hash_query_radius(_b342_sh, _b342_c, 0x4010000000000000); }
+fn bench_b342_sh_scan_into() {
+    return spatial_hash_query_radius_into(_b342_sh, _b342_c, 0x4010000000000000, _b342_buf, 4096);
+}
+fn _b342_check(ok, name) {
+    if (ok == 1) { return 0; }
+    println(name);
+    _B342_FAIL = 1;
+    return 0;
+}
+fn _b342_setup() {
+    _b342_al = arena_allocator_growable(1 << 20);
+    _b342_out = alloc(128);
+    _b342_m3 = m3_from_quat(_bq1);
+    _b342_sa = alloc(16);
+    store64(_b342_sa, hvec3_zero());
+    store64(_b342_sa + 8, F64_ONE);
+    _b342_sb = alloc(16);
+    store64(_b342_sb, hvec3_new(0x3FF8000000000000, 0, 0));
+    store64(_b342_sb + 8, F64_ONE);
+    _b342_n = alloc(8);
+    _b342_d = alloc(8);
+    _b342_s = alloc(8192 * 8);
+    _b342_d14 = alloc(14 * 8);
+    _b342_d62 = alloc(62 * 8);
+    _b342_d1023 = alloc(1023 * 8);
+    for (var i = 0; i < 1023; i = i + 1) {
+        var v = f64_mul(f64_from((i * 37) % 101), 0x3F847AE147AE147B);
+        if (i < 14) { store64(_b342_d14 + i * 8, v); }
+        if (i < 62) { store64(_b342_d62 + i * 8, v); }
+        store64(_b342_d1023 + i * 8, v);
+    }
+    var t1, w14 = num_dst_plan_words(14);
+    var t2, w62 = num_dst_plan_words(62);
+    var t3, w1023 = num_dst_plan_words(1023);
+    _b342_p14 = alloc(w14 * 8); _b342_p62 = alloc(w62 * 8); _b342_p1023 = alloc(w1023 * 8);
+    var t4, z4 = num_dst_plan(14, _b342_p14);
+    var t5, z5 = num_dst_plan(62, _b342_p62);
+    var t6, z6 = num_dst_plan(1023, _b342_p1023);
+    _b342_check(t4 == 0 && t5 == 0 && t6 == 0 && _numx_dst_path(14) == _NUMX_DST_DIRECT
+      && _numx_dst_path(62) == _NUMX_DST_BLUE && _numx_dst_path(1023) == _NUMX_DST_POW2,
+      "num_dst plans: direct, Bluestein, pow2");
+    _b342_cgb = alloc(256 * 8);
+    _b342_cgx = alloc(256 * 8);
+    _b342_cgs = alloc(3 * 256 * 8);
+    for (var i = 0; i < 256; i = i + 1) { store64(_b342_cgb + i * 8, f64_from(((i * 13) % 7) - 3)); }
+    _b342_check(bench_b342_cg16() > 10, "num_cg_poisson_16x16 converges in its iterations");
+    _b342_buf = alloc(4096 * 8);
+    _b342_sh = spatial_hash_new(F64_ONE);
+    for (var i = 0; i < 200; i = i + 1) {
+        var px = f64_from((i * 7) % 5);
+        var py = f64_from((i * 3) % 5);
+        var pz = f64_from((i * 11) % 5);
+        spatial_hash_insert(_b342_sh, hvec3_new(px, py, pz), i);
+    }
+    _b342_c = hvec3_splat(0x4004000000000000);
+    _b342_check(vec_len(bench_b342_sh_scan()) == 200 && bench_b342_sh_scan_into() == 200,
+      "spatial_hash_radius_scan_200: 200 matches");
+    _b342_check(bench_b342_gjk_scoped() == 1, "gjk_epa_spheres_scoped: a contact");
+    var g0 = alloc_used();
+    bench_b342_add_x64_scoped();
+    bench_b342_gjk_scoped();
+    _b342_check(alloc_used() == g0, "the scoped rows take no global heap");
+    return _B342_FAIL;
 }
 
 var r = main();

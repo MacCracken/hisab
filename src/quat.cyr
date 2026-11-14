@@ -33,7 +33,7 @@ public struct HQuat { x; y; z; w; }
 # as given. Returns the designed 0 where the allocation is refused (3.4.0).
 #must_use
 public fn hquat_new(x, y, z, w) {
-    var q = alloc(sizeof(HQuat));
+    var q = hisab_alloc(sizeof(HQuat));
     if (q == 0) { return 0; }
     HQuat_set_x(q, x);
     HQuat_set_y(q, y);
@@ -112,6 +112,23 @@ public fn hquat_mul(q, r) {
       );
 }
 
+# hquat_mul into the caller's HQuat out: q r, the same bits, nothing allocated (3.4.2). out
+# may be q or r (every component is read first). Returns out; 0 for out = 0.
+public fn hquat_mul_into(out, q, r) {
+    if (out == 0) { return 0; }
+    var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
+    var rx = HQuat_x(r); var ry = HQuat_y(r); var rz = HQuat_z(r); var rw = HQuat_w(r);
+    var x = f64_add(f64_add(f64_mul(qw, rx), f64_mul(qx, rw)), f64_sub(f64_mul(qy, rz), f64_mul(qz, ry)));
+    var y = f64_add(f64_add(f64_mul(qw, ry), f64_mul(qy, rw)), f64_sub(f64_mul(qz, rx), f64_mul(qx, rz)));
+    var z = f64_add(f64_add(f64_mul(qw, rz), f64_mul(qz, rw)), f64_sub(f64_mul(qx, ry), f64_mul(qy, rx)));
+    var w = f64_sub(f64_mul(qw, rw), f64_add(f64_add(f64_mul(qx, rx), f64_mul(qy, ry)), f64_mul(qz, rz)));
+    HQuat_set_x(out, x);
+    HQuat_set_y(out, y);
+    HQuat_set_z(out, z);
+    HQuat_set_w(out, w);
+    return out;
+}
+
 # The conjugate (-x, -y, -z, w), exact (`f64_neg`; below cycc 6.6.8 it gave +0 for +0): the
 # inverse of a unit q, the reverse rotation. Returns the designed 0 where the allocation is
 # refused.
@@ -178,10 +195,10 @@ public fn hquat_length(q) {
 
 # q * s normalised, for an exact power of two s: `hquat_normalize`'s two ends (3.3.4).
 fn _hquat_scaled_unit(q, s) {
-    var t = alloc(sizeof(HQuat));
+    var t = hisab_alloc(sizeof(HQuat));
     if (t == 0) { return 0; }
     f64v_scale(t, q, s, 4);
-    var r = alloc(sizeof(HQuat));
+    var r = hisab_alloc(sizeof(HQuat));
     if (r == 0) { return 0; }
     f64v_scale(r, t, f64_div(F64_ONE, hquat_length(t)), 4);
     return r;
@@ -234,7 +251,7 @@ public fn hquat_normalize_checked(q) {
     var len = hquat_length(q);
     var inv = f64_div(F64_ONE, len);
     if (f64_ge(len, F64_TINY) == 1 && f64_ge(inv, F64_TINY) == 1) {
-        var r = alloc(sizeof(HQuat));
+        var r = hisab_alloc(sizeof(HQuat));
         if (r == 0) { return Err(HSB_ERR_ALLOC); }
         f64v_scale(r, q, inv, 4);
         return Ok(r);
@@ -376,7 +393,7 @@ public fn hquat_inverse_checked(q) {
     if (t == 0) { return Err(HSB_ERR_ALLOC); }
     f64v_scale(t, t, f1, 4);
     f64v_scale(t, t, f2, 4);
-    var r = alloc(sizeof(HQuat));
+    var r = hisab_alloc(sizeof(HQuat));
     if (r == 0) { return Err(HSB_ERR_ALLOC); }
     f64v_scale(r, t, f64_div(F64_ONE, hquat_length_sq(t)), 4);
     f64v_scale(r, r, f1, 4);
@@ -420,21 +437,27 @@ fn _hquat_ldexp(x, k) {
 # For n >= 1 that division only shrinks t, so the bounds below hold as written; a q with
 # n < 1 is doubled first (2q is the same rotation, and n becomes 4n >= 1), so they hold for it
 # too. A q with n = 1 runs exactly as through 3.3.7.
-fn _hquat_rotate_wide(q, v, rx, ry, rz) {
+fn _hquat_rotate_wide(out, q, v, rx, ry, rz) {
     var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
     var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
     if (f64_lt(f64_abs(qx), F64_POS_INF) == 0 || f64_lt(f64_abs(qy), F64_POS_INF) == 0
       || f64_lt(f64_abs(qz), F64_POS_INF) == 0 || f64_lt(f64_abs(qw), F64_POS_INF) == 0
       || f64_lt(f64_abs(vx), F64_POS_INF) == 0 || f64_lt(f64_abs(vy), F64_POS_INF) == 0
       || f64_lt(f64_abs(vz), F64_POS_INF) == 0) {
-        return hvec3_new(rx, ry, rz);
+        return _hquat_rot_store(out, rx, ry, rz);
     }
+    # The doubled q and the scaled copy of v live in this frame (3.4.2: they were allocated,
+    # so this path could refuse; it allocates nothing now).
+    var q2: i64[4];
     var nn = f64_add(f64_add(f64_mul(qx, qx), f64_mul(qy, qy)), f64_add(f64_mul(qz, qz), f64_mul(qw, qw)));
     if (f64_lt(nn, F64_ONE) == 1) {
         qx = f64_mul(qx, F64_TWO); qy = f64_mul(qy, F64_TWO);
         qz = f64_mul(qz, F64_TWO); qw = f64_mul(qw, F64_TWO);
-        q = hquat_new(qx, qy, qz, qw);
-        if (q == 0) { return 0; }
+        store64(&q2, qx);
+        store64(&q2 + 8, qy);
+        store64(&q2 + 16, qz);
+        store64(&q2 + 24, qw);
+        q = &q2;
     }
     var mv = f64_abs(vx);
     if (f64_abs(vy) > mv) { mv = f64_abs(vy); }
@@ -449,13 +472,15 @@ fn _hquat_rotate_wide(q, v, rx, ry, rz) {
     var wx = _hquat_ldexp(vx, 0 - k);
     var wy = _hquat_ldexp(vy, 0 - k);
     var wz = _hquat_ldexp(vz, 0 - k);
-    var wv = hvec3_new(wx, wy, wz);
-    if (wv == 0) { return 0; }
-    var s = hquat_rotate_vec3(q, wv);
-    if (s == 0) { return 0; }
-    var cx = _hquat_ldexp(HVec3_x(s), k);
-    var cy = _hquat_ldexp(HVec3_y(s), k);
-    var cz = _hquat_ldexp(HVec3_z(s), k);
+    var wv: i64[3];
+    store64(&wv, wx);
+    store64(&wv + 8, wy);
+    store64(&wv + 16, wz);
+    var s: i64[3];
+    _hquat_rot_into(&s, q, &wv);
+    var cx = _hquat_ldexp(load64(&s), k);
+    var cy = _hquat_ldexp(load64(&s + 8), k);
+    var cz = _hquat_ldexp(load64(&s + 16), k);
     # The copy is trusted only where what it lost cannot reach its answer: l = v - (v 2^-k) 2^k,
     # the bits of v the scaling dropped (exact), reaches at most 2^(e(max |l|) + 2 eq + 10)
     # through the formula, and the copy's own subnormal rounding 2^(k - 1074 + eq + 4); its
@@ -491,7 +516,7 @@ fn _hquat_rotate_wide(q, v, rx, ry, rz) {
     if (f64_lt(f64_abs(rx), F64_POS_INF) == 0) { if (take == 1 || f64_eq(rx, rx) == 0) { sx = cx; } }
     if (f64_lt(f64_abs(ry), F64_POS_INF) == 0) { if (take == 1 || f64_eq(ry, ry) == 0) { sy = cy; } }
     if (f64_lt(f64_abs(rz), F64_POS_INF) == 0) { if (take == 1 || f64_eq(rz, rz) == 0) { sz = cz; } }
-    return hvec3_new(sx, sy, sz);
+    return _hquat_rot_store(out, sx, sy, sz);
 }
 
 # ⛔ 3.3.5 — t = 2 q x v AND THE SUMS AFTER IT OVERFLOWED FOR |v| NEAR DBL_MAX. t is about
@@ -567,6 +592,57 @@ fn _hquat_rotate_wide(q, v, rx, ry, rz) {
 # [measured: scratch focus2.bcyr and rot_ident.py, merged tree vs 3.4.0 integration snapshot, 3 runs, 2026-10-31]
 #must_use
 public fn hquat_rotate_vec3(q, v) {
+    # ⚡ The fast path is _hquat_rot_into's, written out here (3.4.2): routing every call through
+    # the core cost 51 -> 57 ns a rotation, an extra frame. The two copies are the same
+    # arithmetic in the same order; tests/modules_c.tcyr "3.4.2: the _into value operations"
+    # holds them to the same bits. The rare paths are the core's.
+    # [measured: scratch focus.bcyr, 3.4.1 tag and the core-only form, 3 runs interleaved, 2026-11-14]
+    var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
+    var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
+    var n = f64_add(f64_add(f64_mul(qx, qx), f64_mul(qy, qy)), f64_add(f64_mul(qz, qz), f64_mul(qw, qw)));
+    if (n < _QUAT_N_LO || n > _QUAT_N_HI) {
+        var r0 = hisab_alloc(sizeof(HVec3));
+        if (r0 == 0) { return 0; }
+        _hquat_rot_into(r0, q, v);
+        return r0;
+    }
+    var tx = f64_mul(F64_TWO, f64_sub(f64_mul(qy, vz), f64_mul(qz, vy)));
+    var ty = f64_mul(F64_TWO, f64_sub(f64_mul(qz, vx), f64_mul(qx, vz)));
+    var tz = f64_mul(F64_TWO, f64_sub(f64_mul(qx, vy), f64_mul(qy, vx)));
+    if (n != 0x3FF0_0000_0000_0000) { tx = f64_div(tx, n); ty = f64_div(ty, n); tz = f64_div(tz, n); }
+    var rx = f64_add(f64_add(vx, f64_mul(qw, tx)), f64_sub(f64_mul(qy, tz), f64_mul(qz, ty)));
+    var ry = f64_add(f64_add(vy, f64_mul(qw, ty)), f64_sub(f64_mul(qz, tx), f64_mul(qx, tz)));
+    var rz = f64_add(f64_add(vz, f64_mul(qw, tz)), f64_sub(f64_mul(qx, ty), f64_mul(qy, tx)));
+    if ((f64_add(f64_add(rx, ry), rz) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) {
+        var r1 = hisab_alloc(sizeof(HVec3));
+        if (r1 == 0) { return 0; }
+        _hquat_rotate_wide(r1, q, v, rx, ry, rz);
+        return r1;
+    }
+    return hvec3_new(rx, ry, rz);
+}
+
+# hquat_rotate_vec3 into the caller's HVec3 out: the same answer, bit for bit, and nothing
+# allocated, so a rotation every step grows no heap (3.4.2; issue
+# 2026-11-09-allocator-scoped-calls). out may be v. Returns out; 0 for out = 0.
+public fn hquat_rotate_vec3_into(out, q, v) {
+    if (out == 0) { return 0; }
+    _hquat_rot_into(out, q, v);
+    return out;
+}
+
+# Store (x, y, z) into the HVec3 out; returns 0.
+fn _hquat_rot_store(out, x, y, z) {
+    HVec3_set_x(out, x);
+    HVec3_set_y(out, y);
+    HVec3_set_z(out, z);
+    return 0;
+}
+
+# The rotation (hquat_rotate_vec3's doc), written to out once every input is read, so out
+# may be v. Every path writes out; nothing is allocated (the wide and scaled paths keep
+# their copies in their frames).
+fn _hquat_rot_into(out, q, v) {
     var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
     var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
     var n = f64_add(f64_add(f64_mul(qx, qx), f64_mul(qy, qy)), f64_add(f64_mul(qz, qz), f64_mul(qw, qw)));
@@ -577,7 +653,7 @@ public fn hquat_rotate_vec3(q, v) {
         if ((qy & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qy & 0x7FFF_FFFF_FFFF_FFFF; }
         if ((qz & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qz & 0x7FFF_FFFF_FFFF_FFFF; }
         if ((qw & 0x7FFF_FFFF_FFFF_FFFF) > mq) { mq = qw & 0x7FFF_FFFF_FFFF_FFFF; }
-        if (mq != 0 && mq < 0x7FF0_0000_0000_0000) { return _hquat_rotate_qscaled(q, v, mq); }
+        if (mq != 0 && mq < 0x7FF0_0000_0000_0000) { return _hquat_rotate_qscaled(out, q, v, mq); }
         wide = 0;   # q = 0 or not finite: the formula's IEEE answer, as it stands
     }
     # t' = 2 * cross(q.xyz, v) / n; for n = 1.0 exactly the division is skipped, which is the
@@ -595,9 +671,12 @@ public fn hquat_rotate_vec3(q, v) {
     # them), in place of a test per component on the fast path; an integer test of the bits
     # (+-Inf and NaN are the patterns from 0x7FF0... up, sign cleared).
     if ((f64_add(f64_add(rx, ry), rz) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) {
-        if (wide == 1) { return _hquat_rotate_wide(q, v, rx, ry, rz); }
+        if (wide == 1) { return _hquat_rotate_wide(out, q, v, rx, ry, rz); }
     }
-    return hvec3_new(rx, ry, rz);
+    HVec3_set_x(out, rx);
+    HVec3_set_y(out, ry);
+    HVec3_set_z(out, rz);
+    return 0;
 }
 
 # `hquat_rotate_vec3` for a finite non-zero q with |q|^2 outside [1/4, 16]: q * 2^-e, e the
@@ -609,13 +688,15 @@ public fn hquat_rotate_vec3(q, v) {
 # give z = -v.z, about 2^-400, where the exact z is 1.62e-89, almost all of it w's term
 # (2^-1299 |v|; tests/modules_c.tcyr `_r3_qc` pins it as the normwise contract's answer).
 # [measured: scratch rot.py, exact Fraction rotation q v q* / |q|^2, 3.4.1 lane MAT4, 2026-11-01; cycc 6.7.18]
-fn _hquat_rotate_qscaled(q, v, mq) {
+fn _hquat_rotate_qscaled(out, q, v, mq) {
     var e = (mq >> 52) - 1023;
     if ((mq >> 52) == 0) { e = ((f64_mul(mq, 0x43F0_0000_0000_0000) >> 52) - 1023) - 64; }   # 2^64
-    var s = hquat_new(_hquat_ldexp(HQuat_x(q), 0 - e), _hquat_ldexp(HQuat_y(q), 0 - e),
-      _hquat_ldexp(HQuat_z(q), 0 - e), _hquat_ldexp(HQuat_w(q), 0 - e));
-    if (s == 0) { return 0; }
-    return hquat_rotate_vec3(s, v);
+    var s: i64[4];   # the scaled q, in this frame (3.4.2: allocated, a refusal point)
+    store64(&s, _hquat_ldexp(HQuat_x(q), 0 - e));
+    store64(&s + 8, _hquat_ldexp(HQuat_y(q), 0 - e));
+    store64(&s + 16, _hquat_ldexp(HQuat_z(q), 0 - e));
+    store64(&s + 24, _hquat_ldexp(HQuat_w(q), 0 - e));
+    return _hquat_rot_into(out, &s, v);
 }
 
 # ================================================================

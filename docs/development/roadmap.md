@@ -28,21 +28,23 @@ Hisab owns **typed mathematical operations**. It does NOT own:
 - **Physics simulation** -- impetus
 - **Game engine** -- kiran
 
-## Current — v3.4.1
+## Current — v3.4.2
 
 **Status**:
-- Suite **14152** across seven harnesses: hisab 1350, foundation 1094, modules 3002, modules_b 1843,
-  modules_c 2055, edge_cases 2044, abuse 2764.
-- Constant gate **324/324** (22 skipped), read exactly, hex enum members included (population
+- Suite **14303** across seven harnesses: hisab 1350, foundation 1095, modules 3003, modules_b 1843,
+  modules_c 2203, edge_cases 2044, abuse 2765.
+- Constant gate **325/325** (23 skipped), read exactly, hex enum members included (population
   floor 346).
-- Public surface **703** declarations (846 gate probes; all 1489 non-public probes refused),
+- Public surface **725** declarations (868 gate probes; all 1515 non-public probes refused),
   enforced since 3.3.0 by the bundle's `private` marker.
-- **375** benchmarks.
-- **35** math modules in `[lib]`, plus the `src/visibility.cyr` marker. Bundle `dist/hisab.cyr`
-  70,654 lines, 3,660,265 B; its sidecar names 7 leaves.
+- **392** benchmarks.
+- **36** modules in `[lib]` (35 math modules and `heap.cyr`, the allocation scope, since 3.4.2),
+  plus the `src/visibility.cyr` marker. Bundle `dist/hisab.cyr` 72,009 lines, 3,724,275 B; its
+  sidecar names 9 leaves.
 - Measurement provenance: **8** unmarked claim lines (detector false positives), the baseline; CI runs `--ratchet` on every push since 3.3.6.
-- Every public function has a comment block (653 of 653); `check-doc-blocks.sh --ratchet` fails on one without.
-- Toolchain **6.7.18**, sakshi **2.5.10**, ganita **1.2.15**.
+- Every public function has a comment block (675 of 675); `check-doc-blocks.sh --ratchet` fails on one without.
+- Toolchain **6.7.18**, ganita **1.2.15**, sakshi **2.5.10** (a stdlib leaf since 3.4.2, no longer a
+  `[deps.sakshi]` package).
 - All gates green. Per-release detail is in
   [`CHANGELOG.md`](../../CHANGELOG.md).
 
@@ -55,9 +57,16 @@ Three releases broke the API, and each has a consumer guide:
   the fabricated-answer class ([`../guides/migration-3.4.md`](../guides/migration-3.4.md)).
 
 ⚠ **hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3** (`public struct` + `#derive`). Measured again on the
-3.4.1 bundle from pinned dirs:
+3.4.2 bundle from pinned dirs (2026-11-14):
 - 6.6.2 refuses it with the known `#derive` error.
-- Under 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12, 6.6.13, 6.6.14, 6.6.20, 6.7.9 and 6.7.18 a cross-module
+- Under 6.6.3, 6.6.4, 6.6.5, 6.6.10, 6.6.13, 6.6.20, 6.7.9 and 6.7.18 a cross-module program that
+  calls every 3.4.2 entry point (the scope around `gjk_epa_3d`, the nine `_into` forms, the spatial
+  hash's queries into storage, a DST plan and `num_cg`) and older ones builds with no warning, with
+  the manifest's 17 leaves and with the sidecar's 9 plus `syscalls` and `io`, and runs. Its output is
+  bit-identical on every pin but for three DST values on 6.6.3–6.6.5, `num_dst`'s and `num_dst_into`'s
+  alike, which take those pins' sin / cos. `check-miscompile.sh` passes on the bundle under 6.6.3 and
+  6.7.18. [measured: scratch pins/probe.cyr, both leaf sets per pin, 2026-11-14]
+- 3.4.1's run: under 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12, 6.6.13, 6.6.14, 6.6.20, 6.7.9 and 6.7.18 a cross-module
   consumer program of 34 readings (a cross product, adaptive Simpson, bisection, `f64_fmod(1, 0)`,
   Pollard rho, `eigen_power`, SVD, `cx_powf`, FFT, an octree, `gjk_epa_3d`, a ray, `sdf_capsule`,
   `expr_diff`, `sym_rewrite`, BDF-2, BFGS, a dual) builds two ways, with the manifest's 16 stdlib
@@ -70,10 +79,10 @@ Three releases broke the API, and each has a consumer guide:
   repaired before release): the class *Decisions owed* #4 is about.
 - ⚠ On 6.6.3 a private fn is still reachable through `&name`. That is upstream, fixed in 6.6.4;
   see *Decisions owed*.
-- ⚠ **The sidecar names 7 leaves since 3.3.7** (`cyrius distlib` ≥ 6.6.18 writes a compile-verified
-  `# Requires` block and `dist/hisab.deps`: math, alloc, vec, ganita, result, str, fmt; the same seven
-  on the 3.4.1 bundle). A consumer that received `assert`, `bench`, `args`, `io`, `tagged`,
-  `fnptr`, `callback`, `syscalls` or `string` through hisab's sidecar must declare it.
+- ⚠ **The sidecar is compile-verified since 3.3.7** (`cyrius distlib` ≥ 6.6.18 writes the `# Requires`
+  block and `dist/hisab.deps`): 7 leaves through 3.4.1 (math, alloc, vec, ganita, result, str, fmt),
+  9 from 3.4.2 (`fnptr` and `string` added). A consumer that received `assert`, `bench`, `args`, `io`,
+  `tagged`, `callback` or `syscalls` through hisab's sidecar must declare it.
 
 ## How to read this file
 
@@ -591,6 +600,23 @@ Neither acceptance is the maintainer's: *Decisions owed* #16.
 - **`check-constants.sh` does not see a function-local constant** (`sc = 0x3BF0…;   # 2^-64`, or a local
   with no comment): 15 of 350 plants passed there (`calc.cyr:1314`, `geo_advanced.cyr:7472` among them). [low; R4-SYM N2]
 
+#### Carried from the 3.4.2 close
+
+Found by 3.4.2's mutation pass and not repaired: it is 3.4.0 code that 3.4.2 only moved. *(no API)*
+
+- **`_hquat_rotate_wide` doubles a q whose |q|² is below 1, and the doubling is an exact no-op.**
+  2q halves t' = 2 (2u × v) / (4n) and doubles w and u, all by powers of two, so the copy's answer
+  is the same bits without it.
+  - **Evidence:** 3.4.2's mutant I8 removed the doubling and survived all seven suites, and 133,292
+    random inputs on the wide path (|q|² in [1/4, 1), v with exponents 2^1015–2^1023) gave identical
+    bits.
+  - **Why the comment is wrong:** it keeps the doubling to hold an overflow bound stated as 16 Q² V
+    in Q = 2^(eq + 1). Cauchy–Schwarz bounds the same intermediates by |u| ≤ sqrt(n), which gives
+    about 7 |w| for n < 1 too.
+  - **To do:** remove the doubling and correct the bound in the comment, or find the input where it
+    moves a bit, and keep it with that input pinned.
+  - [measured: scratch i8/search.cyr, the tree and the mutant, 2026-11-14]
+
 ### **[3.6.0]** — SVD relative accuracy
 
 - **`eigen_qr`'s 1e-12 deflation** (`_lp_negligible`) is what puts 251 eps·|λ|max into its answer
@@ -788,7 +814,7 @@ Nothing in this section is scheduled until the maintainer decides it.
 - hisab keeps a record of its exposure in `issues/`, and closes it in `issues/archived/` with a
   paired measurement on the bump that fixes it. The upstream agents never edit hisab.
 
-**Pin: cyrius 6.7.9** (ganita 1.2.15, sakshi 2.5.8) since 3.4.0. Nothing has been filed since the
+**Pin: cyrius 6.7.18** (ganita 1.2.15, sakshi 2.5.10) since 3.4.1. Nothing has been filed since the
 ganita QR record below; the two candidates the 3.4.0 audits found are *Decisions owed* #11.
 
 🔴 **Open upstream (ganita), filed 2026-10-31**: `ganita_mat_eigen_sym` stops its Jacobi sweep at
@@ -825,6 +851,21 @@ it.
 ## 3.x.x — demand-gated (unversioned)
 
 Each row names its driver. A driver arriving gets the row a pinned version above.
+
+**Per-step consumers: the parts of 3.4.2's filings it did not take.** The driver is pravash, unless a row
+says otherwise. Each part was optional in its filing.
+- **A radius walk over occupied cells only** (pravash M6). `spatial_hash_query_radius` still probes
+  every cell of the block, bounded by the flat scan once the block passes the entry count. pravash's
+  stand-in sorts its cells and binary-searches the block: 19 µs on its 625-particle cloud, against
+  Rust 1.4.0's 27 µs.
+- **A chain cursor** (`spatial_hash_cell_first` / `spatial_hash_entry_next`), the issue's second form.
+  It was not needed once `spatial_hash_query_cell_into` shipped.
+- **`num_dst_direct` in 1.4.0's operation order**, so pravash's DST rows can convert with no parity
+  change. The issue calls it a nice-to-have.
+- **The scope over ganita's matrices.** Eight public functions still take global heap under a scope
+  (`src/heap.cyr`): `inertia_box`, `inertia_sphere`, `mat_new_guarded`, `svd_compute_checked`,
+  `svd_truncated`, `eigen_qr`, `svd_golub_kahan` and `opt_levenberg_marquardt`. The driver is a
+  per-step consumer that needs one of them on its step path.
 
 **Private flip and kernels.**
 - **Flip the `src/` modules `private` too, not only the bundle.**
@@ -934,47 +975,39 @@ because once the reason is gone, "deferred with a reason" and "forgotten" look t
 
 ## Consumers
 
-**Ten repos consume `dist/hisab.cyr` today, SHA-locked**, read from each `cyrius.cyml` on
-2026-11-01 (unchanged since 2026-09-30):
+**Fifteen repos consume `dist/hisab.cyr` today, SHA-locked**, read from each `cyrius.cyml` on
+2026-11-14. Every one is on hisab **3.4.1** and cyrius **6.7.18**; impetus, prakash and pravash take
+it as `scope = "test"`:
 
-| hisab tag | consumers |
-|---|---|
-| **3.2.1** | prakash |
-| **2.22.1** | svara, naad, goonj |
-| **2.11.2** | dhvani, attn11, ghurni, prani, garjan, nidhi |
+| hisab tag | cyrius pin | consumers |
+|---|---|---|
+| **3.4.1** | **6.7.18** | attn11, dhvani, garjan, ghurni, goonj, hoosh, impetus (test), kimiya, naad, nidhi, prakash (test), prani, pravash (test), svara, ushma |
 
-| cyrius pin | consumers |
-|---|---|
-| **6.6.2** | goonj, attn11 |
-| **6.6.3** | svara, naad, ghurni, prani, garjan, nidhi |
-| **6.6.6** | prakash |
-| **6.6.10** | dhvani |
+Since the 2026-11-01 reading every direct consumer moved to 3.4.1 and 6.7.18. hoosh, impetus, kimiya,
+pravash and ushma are new. svara's `calc_monotone_cubic` call is now `calc_monotone_cubic_checked`
+(`svara/src/prosody.cyr:129`), so no consumer's own source calls a name 3.4.0 retired.
 
-prakash moved to cyrius 6.6.6 on 2026-09-23. It was the first consumer past the `Result` break, on
-2026-09-15, calling `num_fft` through the `var rt, rv = …` idiom. `svara/src/spectral.cyr:246`
-calls `num_fft`.
+The 3.4.2 work is these consumers' filings (issues, archived 2026-11-14):
+- **impetus** (H9) and **pravash**: the allocation scope and the `_into` value operations;
+- **pravash**: the DST plan (L6), `num_cg` (P1, L5) and the spatial hash into caller storage (P2, L4);
+- **ushma** (M0 probe 10, and pravash's resolve): the sakshi package warning.
 
-⚠ **`svara/src/prosody.cyr:115` calls `calc_monotone_cubic`, which 3.4.0 retired**, and maps its
-0 to 1.0 (`if (r == 0) { return F64_ONE; }`). It migrates to `calc_monotone_cubic_checked`, mapping
-the Err instead, when it moves past 3.3.x
-([`../guides/migration-3.4.md`](../guides/migration-3.4.md)). It is the only call of a name 3.4.0
-retired in any consumer's own source (re-read 2026-10-31).
-
-**Four more repos carry a copy transitively.** `cyrius deps` vendors it through another dependency,
-and each compiles it under its own pin (read 2026-10-31 from each `lib/hisab.cyr` header, unchanged since 2026-09-30):
+**Three more repos carry a copy transitively.** `cyrius deps` vendors it through another dependency,
+and each compiles it under its own pin (read 2026-11-14 from each `lib/hisab.cyr` header):
 
 | repo | hisab | via | cyrius pin |
 |---|---|---|---|
 | jalwa | 2.11.2 | dhvani | 6.6.3 |
-| ranga | 2.11.2 | prakash | 6.6.9 |
-| shabda | 2.22.1 | svara | 6.6.3 |
-| shabdakosh | 2.22.1 | svara | 6.6.3 |
+| shabda | 3.4.1 | svara | 6.7.18 |
+| shabdakosh | 3.4.1 | svara | 6.7.18 |
 
-`ls ~/Repos/*/lib/hisab.cyr` lists all fourteen; the `[deps.hisab]` grep finds only the ten direct
+ranga no longer carries a copy. jalwa's is still the 2.11.2 that dhvani shipped before its move.
+`ls ~/Repos/*/lib/hisab.cyr` lists all eighteen; the `[deps.hisab]` grep finds only the fifteen direct
 ones.
 
-⛔ **goonj and attn11 cannot take ANY hisab ≥ 3.1.0 until they move their cyrius pin.** cycc 6.6.2
-refuses `public struct` + `#derive` (`#derive(...) applies to a struct or an enum`). Measured from a
+⛔ **No hisab ≥ 3.1.0 compiles under cyrius 6.6.2** (goonj and attn11 pinned it until they moved to
+6.7.18). cycc 6.6.2 refuses `public struct` + `#derive` (`#derive(...) applies to a struct or an enum`),
+and the 3.4.2 bundle is refused the same way (measured 2026-11-14). Measured from a
 dir pinned to 6.6.2: the 3.1.0, 3.2.1, 3.2.2 and 3.3.0 bundles are refused, while the 3.0.1 bundle
 compiles. Under 6.6.3, 6.6.6, 6.6.10 and 6.6.12 the 3.3.0 bundle compiles and a consumer-shaped
 program runs correctly. `D146`
@@ -982,6 +1015,8 @@ program runs correctly. `D146`
 ⚠ **The pin matters to every consumer for four more reasons**, because a consumer compiles the
 bundle under its OWN cycc:
 - `m3_mul_vec3` keeps its hoisted z tail, because the natural form is silently wrong below 6.6.5.
+  Every direct consumer pins 6.7.18 since 2026-11-14, but jalwa, transitive through dhvani, pins
+  6.6.3 and compiles whatever bundle dhvani carries: 3.4.1 at its next resolve.
   (`_cga_build_null_tbl`'s `if`-guard form went in 3.3.4: it guarded against a defect fixed in
   6.6.3, below every pin that can compile a 3.x bundle.)
 - A zero produced by negation is −0 from **6.6.8** and +0 below. (3.4.0's exact matrix tiers set

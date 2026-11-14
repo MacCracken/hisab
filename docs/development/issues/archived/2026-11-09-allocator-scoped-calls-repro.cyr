@@ -1,0 +1,105 @@
+# H9 repro: every hisab call that returns a value allocates on the global bump heap, which has no free,
+# so a consumer that calls hisab once per step leaks for the life of the process.
+#
+#   cyrius build docs/development/issues/archived/2026-11-09-allocator-scoped-calls-repro.cyr /tmp/h9
+#   /tmp/h9; echo "exit=$?"
+#
+# Exit 1 while any measured call grows the global heap; exit 0 once the calls can be scoped (S1 in cyrius, or
+# allocator-taking hisab variants) and this repro is switched to them. Still exit 1 on 3.4.2, as filed: the
+# unscoped calls take global heap as before. The switched form is beside it, *-repro-3.4.2.cyr (exit 0).
+include "dist/hisab.cyr"
+
+var leaking = 0;
+
+# A sphere for GJK: centre HVec3 at +0, radius f64 bits at +8.
+fn sphere_new(x, y, z, r): i64 {
+    var s = alloc(16);
+    store64(s, hvec3_new(x, y, z));
+    store64(s + 8, r);
+    return s;
+}
+
+# The support contract: the farthest point of the sphere along dir.
+fn sphere_support(shape, dir): i64 {
+    var r: f64 = load64(shape + 8);
+    return hvec3_add(load64(shape), hvec3_scale(hvec3_normalize(dir), r));
+}
+
+fn report(name, before, calls) {
+    var per = (alloc_used() - before) / calls;
+    if (per > 0) { leaking = leaking + 1; }
+    print(name, strlen(name));
+    print(": ", 2);
+    fmt_int(per);
+    println(" bytes of global heap per call, never returned");
+    return 0;
+}
+
+fn main() {
+    alloc_init();
+    var n = 1000;
+    var a = hvec3_new(1.0, 2.0, 3.0);
+    var b = hvec3_new(0.5, -1.0, 2.0);
+    var sink = 0;
+
+    var before = alloc_used();
+    for (var k = 0; k < n; k = k + 1) { sink = hvec3_add(a, b); }
+    report("hvec3_add", before, n);
+
+    before = alloc_used();
+    for (var k = 0; k < n; k = k + 1) { sink = hvec3_cross(a, b); }
+    report("hvec3_cross", before, n);
+
+    var q = hquat_from_rotation_z(0.3);
+    before = alloc_used();
+    for (var k = 0; k < n; k = k + 1) { sink = hquat_rotate_vec3(q, a); }
+    report("hquat_rotate_vec3", before, n);
+
+    var m = m3_from_quat(q);
+    before = alloc_used();
+    for (var k = 0; k < n; k = k + 1) { sink = m3_mul_vec3(m, a); }
+    report("m3_mul_vec3", before, n);
+
+    # GJK + EPA on two overlapping unit spheres (depth 0.5), as a 3D narrowphase would per pair.
+    var sa = sphere_new(0.0, 0.0, 0.0, 1.0);
+    var sb = sphere_new(1.5, 0.0, 0.0, 1.0);
+    var nrm[8];
+    var dep[8];
+    before = alloc_used();
+    for (var k = 0; k < 100; k = k + 1) {
+        sink = gjk_epa_3d(&sphere_support, sa, &sphere_support, sb, &nrm, &dep);
+    }
+    report("gjk_epa_3d (two spheres)", before, 100);
+
+    # Islands over 100 bodies joined in pairs by 50 contacts.
+    var contacts = vec_new();
+    var up = hvec3_new(0.0, 1.0, 0.0);
+    for (var k = 0; k < 50; k = k + 1) {
+        vec_push(contacts, contact_new(2 * k, 2 * k + 1, up, 0.01, 0.5, 0.0, 1.0, 1.0));
+    }
+    before = alloc_used();
+    for (var k = 0; k < 100; k = k + 1) { sink = detect_islands(contacts, 50, 100); }
+    report("detect_islands (100 bodies, 50 contacts)", before, 100);
+
+    # A BVH over 100 boxes, as a per-step broadphase rebuild would.
+    var boxes = alloc(100 * 8);
+    for (var k = 0; k < 100; k = k + 1) {
+        var lo = hvec3_new(f64_from(k), 0.0, 0.0);
+        var hi = hvec3_new(f64_from(k + 1), 1.0, 1.0);
+        store64(boxes + k * 8, geo_aabb_new(lo, hi));
+    }
+    before = alloc_used();
+    for (var k = 0; k < 100; k = k + 1) { sink = bvh_build(boxes, 100); }
+    report("bvh_build (100 boxes)", before, 100);
+
+    if (leaking > 0) {
+        fmt_int(leaking);
+        println(" of 7 calls leak");
+        return 1;
+    }
+    println("no call leaks");
+    return 0;
+}
+
+var r = main();
+sys_exit_group(r);

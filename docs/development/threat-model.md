@@ -113,13 +113,14 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
 ## Supply Chain
 
 - No third-party runtime dependencies — only the cyrius stdlib and first-party
-  **sakshi**. No FFI, no libc. Third-party-CVE attack surface is zero.
-- Integrity enforced by the SHA-locked `cyrius.lock`: 33 entries, 1 commit-pinned, and since
-  cyrius 6.6.4 a `cyrius\t<pin>` trailer; `cyrius deps --verify` → 33 verified / 0 failed;
-  `cyrius vet` → 2 deps, 0 untrusted, 0 missing (verified 2026-10-31 on the 6.7.9 pin).
-  All 32 vendored stdlib `lib/*.cyr` files byte-match the **cyrius git tag** for the pin
-  (`git -C ~/Repos/cyrius show "6.7.9:lib/<f>"` — quoted, or zsh reads `:l` as a modifier),
-  and `lib/sakshi.cyr` its 2.5.8 tag's `dist/` (the copy 6.7.9 folds). On 2026-09-30 the six installed slots the 6.6.12 bump used
+  **sakshi** (a stdlib leaf since 3.4.2, a git package before). No FFI, no libc. Third-party-CVE
+  attack surface is zero.
+- Integrity enforced by the SHA-locked `cyrius.lock`: 33 entries, none commit-pinned since 3.4.2
+  (sakshi's git row went with its package), and since cyrius 6.6.4 a `cyrius\t<pin>` trailer;
+  `cyrius deps --verify` → 33 verified / 0 failed; `cyrius vet` → 2 deps, 0 untrusted, 0 missing
+  (verified 2026-11-14 on the 6.7.18 pin). All 33 vendored `lib/*.cyr` files, `sakshi.cyr` among
+  them, byte-match the **cyrius git tag** for the pin (`git -C ~/Repos/cyrius show "6.7.18:lib/<f>"` —
+  quoted, or zsh reads `:l` as a modifier); `lib/sakshi.cyr` is also sakshi 2.5.10's `dist/`. On 2026-09-30 the six installed slots the 6.6.12 bump used
   (6.6.2, 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12) also byte-matched their tags (103–104 files each),
   so the 6.6.4 repairs below hold on this box;
   the rule below stays because the reference must be immutable, not merely currently right.
@@ -414,6 +415,25 @@ rejected `_` digit separators, so it skipped 35 of 145 declarations while printi
     non-public probes refused. 6.6.2 still refuses the bundle; 6.6.3, 6.6.6, 6.6.9, 6.6.10, 6.6.12,
     6.6.13, 6.6.14, 6.6.20 and 6.7.9 run a cross-module consumer program, bit-identical except
     `cx_powf(·, ±Inf)` on 6.6.3 / 6.6.6.
+- **2026-11-14**: v3.4.2, no toolchain move. It repairs the five consumer filings.
+  - **The allocation scope** (`src/heap.cyr`) is new attack surface of a narrow kind. A caller's
+    `Allocator` now receives hisab's allocations, so:
+    - a reset of it invalidates what hisab returned or grew under it, which is the caller's contract;
+    - memory from it is zeroed before hisab reads it, as `alloc`'s is, so a re-issued arena block
+      leaks no earlier contents into an answer;
+    - a size past `ALLOC_MAX` is refused before the allocator is asked, as `alloc` refuses it, so
+      hisab's derived bounds hold under any scope.
+  - `check-heap-globals.sh` gained the scope rule. Its closure had gone blind to the scope's
+    function-pointer call (912 → 240 fns), and its floor caught it.
+  - **Caller storage:**
+    - `spatial_hash_query_*_into`, `num_dst_into` and `num_cg` write only within the counts they
+      return or document. Canaries pin `out[cap ..]` untouched.
+    - A plan for another n, a buffer that is not a plan, a negative cap, and a null `out` with
+      `cap` above 0 are refused before anything is written.
+  - **Supply chain:** sakshi moves from a git package to a stdlib leaf, the same bytes. The lock
+    loses its only commit-pinned row.
+  - Suites **14303**, constants 325/325, public surface 725 declarations / 868 probes, 1515 of 1515
+    non-public probes refused. 6.6.2 refuses the bundle; 6.6.3 to 6.7.18 run a cross-module program.
 - **2026-11-01**: v3.4.1 — cyrius 6.7.9 → **6.7.18** (ganita 1.2.15, sakshi 2.5.8 → 2.5.10), the roadmap's
   [3.4.1] rows. No public name, signature or error code changes, and answers change on purpose.
   - **A refused allocation is a designed failure everywhere**: a sweep refusing every allocation of every

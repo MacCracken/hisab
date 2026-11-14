@@ -4,7 +4,7 @@
 
 Higher math for the AGNOS ecosystem — linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, and more. Written in [Cyrius](https://github.com/MacCracken/cyrius), ported from Rust.
 
-Used by **prakash** (tag 3.2.1 — the first consumer past the 3.0.0 `Result` break), **svara**, **naad**, **goonj** (tag 2.22.1), **dhvani**, **attn11**, **ghurni**, **prani**, **garjan** and **nidhi** (tag 2.11.2) — ten repos that pull `dist/hisab.cyr` SHA-locked — plus jalwa, ranga, shabda and shabdakosh, which carry a copy transitively through one of them (pins read from their manifests 2026-09-30). ⚠ goonj and attn11 pin cyrius 6.6.2 and cannot take a 3.1.0+ bundle until they move it (see *Minimum toolchain* below).
+Used by fifteen repos that pull `dist/hisab.cyr` SHA-locked, all on hisab 3.4.1 and cyrius 6.7.18: attn11, dhvani, garjan, ghurni, goonj, hoosh, kimiya, naad, nidhi, prani, svara and ushma, plus impetus, prakash and pravash as a test dependency. jalwa, shabda and shabdakosh carry a copy transitively through one of them. Manifests were read 2026-11-14. 3.4.2 is these consumers' filings: the allocation scope, the queries and transforms into caller storage, matrix-free CG, and sakshi as a stdlib leaf.
 
 ⚠ [impetus](https://github.com/MacCracken/impetus) (physics), [kiran](https://github.com/MacCracken/kiran) (engine), [joshua](https://github.com/MacCracken/joshua) (simulation), [aethersafha](https://github.com/MacCracken/aethersafha) (compositor), [hisab-mimamsa](https://github.com/MacCracken/hisab-mimamsa) (theoretical physics) and [kana](https://github.com/MacCracken/kana) (quantum science) are **planned** — Rust repos awaiting a Cyrius port, except aethersafha, which is ported but declares no hisab dependency yet.
 
@@ -17,7 +17,8 @@ singular `m3_inverse`, 0 from `hisab_inverse_lerp(a, a, v)`, the last iterate fr
 Krylov solve, NaN from an unreachable quadrature tolerance, …) are **retired, not redefined**: each
 has a `<name>_checked` replacement that returns a `Result` (27 names, plus `m3_normal_matrix` →
 `m3_normal_matrix_cof`). A consumer still calling an old name fails to compile rather than getting
-a different answer. svara's `calc_monotone_cubic` call is the one use in any consumer's source.
+a different answer. svara's `calc_monotone_cubic` call, the one use in any consumer's source, moved to
+`calc_monotone_cubic_checked` by 2026-11-14.
 Several names that kept their signature now answer correctly where they did not
 (`hquat_rotate_vec3` for non-unit q, `num_bisection`, `lyapunov_max`, `eigen_power`, the collision
 entry points under a written support contract). Read
@@ -51,11 +52,12 @@ those call sites quietly passing against the old function forever, which is the 
 removes. **2.24.0 is the supported 2.x line.**
 
 ⚠ **Minimum toolchain: hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3.** `public struct` + `#derive` is
-refused by cycc 6.6.2; measured again in 3.4.1 from dirs pinned to each version, the 3.4.1 bundle is
-refused under 6.6.2 and compiles and runs a cross-module program under 6.6.3, 6.6.6, 6.6.9, 6.6.10,
-6.6.12, 6.6.13, 6.6.14, 6.6.20, 6.7.9 and 6.7.18, with bit-identical output except SVD's singular
-values, at most 2 ulp from 6.6.16 with the pin's ganita (3.4.0 also found `cx_powf(·, ±Inf)` NaN on
-6.6.3 / 6.6.6). Bump `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1.
+refused by cycc 6.6.2; measured again in 3.4.2 from dirs pinned to each version, the 3.4.2 bundle is
+refused under 6.6.2 and compiles with no warning and runs a cross-module program (every 3.4.2 entry
+point among its readings) under 6.6.3, 6.6.4, 6.6.5, 6.6.10, 6.6.13, 6.6.20, 6.7.9 and 6.7.18, with the
+manifest's stdlib leaves and with the sidecar's. The output is bit-identical but for three DST values
+on 6.6.3–6.6.5, `num_dst`'s and `num_dst_into`'s alike: those pins' own sin / cos (3.4.1 measured SVD's
+singular values at most 2 ulp apart from 6.6.16, and 3.4.0 `cx_powf(·, ±Inf)` NaN on 6.6.3 / 6.6.6). Bump `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1.
 Some results follow your toolchain rather than hisab's:
 - A zero produced by negation is −0 from cyrius **6.6.8** (IEEE sign flip; +0 below).
 - `dual_pow` is within 1 ulp from **6.6.10** (ganita 1.2.8's `pow`).
@@ -80,13 +82,13 @@ centre or radius returns nothing (3.3.3 returned every entry for a NaN radius).
 
 | Module | Files | Description |
 |--------|-------|-------------|
-| **Core** | f64_util, error | f64 helpers the stdlib does not carry; the `HSB_ERR_*` codes every fallible entry point carries as the `E` of its `Result<T, E>` |
-| **Foundation** | vec2, vec3, vec4, quat, mat3, mat4 | Vector/matrix/quaternion types (f64, heap-allocated; SIMD `f64v_*` hot paths) |
+| **Core** | f64_util, error, heap | f64 helpers the stdlib does not carry; the `HSB_ERR_*` codes every fallible entry point carries as the `E` of its `Result<T, E>`; the allocation scope (3.4.2): `hisab_alloc_scope(al)` routes every allocation hisab makes to your `Allocator`, so a per-frame or per-step caller resets one arena and keeps nothing |
+| **Foundation** | vec2, vec3, vec4, quat, mat3, mat4 | Vector/matrix/quaternion types (f64, heap-allocated; SIMD `f64v_*` hot paths); `_into` forms of the per-step operations (add, sub, scale, cross, quaternion product and rotation, matrix products) that write your storage and allocate nothing |
 | **Transforms** | transforms, color | 2D/3D affine transforms, projections, slerp/lerp, Euler angles, sRGB/HSV/HSL/Oklab, Porter-Duff compositing (8 ops), tone mapping (Reinhard, ACES), SH L2, EV/exposure |
-| **Geometry** | geo, geo_advanced, geo_diff, spatial | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, MPR/XenoCollide narrowphase (in `geo_advanced` since 3.3.0), SDF+CSG, swept-AABB/TOI, conformal geometric algebra (5D CGA); spatial structures (BVH, k-d tree, octree, quadtree, spatial hash); differentiable ray/surface intersection for **all six** primitives — plane, sphere, triangle, aabb, obb and capsule jets returning the full gradient from one evaluation |
+| **Geometry** | geo, geo_advanced, geo_diff, spatial | 9 primitives, 6 ray tests, closest-point queries, GJK/EPA 3D, MPR/XenoCollide narrowphase (in `geo_advanced` since 3.3.0), SDF+CSG, swept-AABB/TOI, conformal geometric algebra (5D CGA); spatial structures (BVH, k-d tree, octree, quadtree, spatial hash, whose queries also write caller storage); differentiable ray/surface intersection for **all six** primitives — plane, sphere, triangle, aabb, obb and capsule jets returning the full gradient from one evaluation |
 | **Collision** | collision_core, collision_mesh | Sequential-impulse contact solver, convex hull 2D (monotone chain), polygon triangulation (ear clipping), Delaunay (Bowyer-Watson), half-edge mesh, island detection (union-find) |
 | **Calculus** | calc, calc_ext, noise_simplex | Differentiation, integration (Simpson, Gauss-Legendre, adaptive), Bezier/Catmull-Rom/B-spline/NURBS/Hermite TCB/monotone cubic, easing, Perlin 2D+3D, simplex noise, gradient/Jacobian/Hessian |
-| **Numerical** | num, ode, optimize, linalg_ext, linalg_precision, num_ext | Root finding, FFT/DST/DCT/2D-FFT, ODE (RK4, DOPRI45, BDF, symplectic, SDE), optimization (GD, CG, BFGS, L-BFGS, LM), sparse CSR, GMRES, PGS/LCP, SVD, eigendecomposition, compensated/high-precision linalg, number theory (primes, factorize, CRT, totient, Mobius), PCG32, Halton/Sobol, tridiagonal solver |
+| **Numerical** | num, ode, optimize, linalg_ext, linalg_precision, num_ext | Root finding, FFT/DST/DCT/2D-FFT (DST also through a plan you keep, into your scratch), matrix-free linear CG, ODE (RK4, DOPRI45, BDF, symplectic, SDE), optimization (GD, CG, BFGS, L-BFGS, LM), sparse CSR, GMRES, PGS/LCP, SVD, eigendecomposition, compensated/high-precision linalg, number theory (primes, factorize, CRT, totient, Mobius), PCG32, Halton/Sobol, tridiagonal solver |
 | **Complex** | complex | Complex numbers + matrices, Pauli/Dirac gamma matrices, matrix exponential |
 | **Lie groups** | lie, lie_ext | U(1), SU(2), SU(3) Gell-Mann, SO(3,1) Lorentz, SE(3)/SO(3), exponential/log maps, adjoint, BCH |
 | **Diff geometry** | diffgeo | Christoffel symbols, Riemann/Ricci/Einstein tensors, geodesic solver, Killing vectors, exterior algebra |
@@ -117,18 +119,18 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "r
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "3.3.3"
-modules = ["dist/hisab.cyr"]   # ~1.40 MB self-contained bundle (all 35 modules)
+tag     = "3.4.2"
+modules = ["dist/hisab.cyr"]   # ~3.7 MB self-contained bundle (all 36 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
-# pulls in hisab's own 16 stdlib leaves, so the `stdlib` list above only has to
-# name what *your* code uses.
+# pulls in the 9 stdlib leaves the bundle needs, so the `stdlib` list above only has
+# to name what *your* code uses.
 # Or pull individual files for a smaller compilation unit. The per-module include
 # sets are tabulated in docs/architecture/overview.md -- derived from the source
-# and verified by compiling each of the 35 modules against exactly its listed set.
+# and verified by compiling each of the 36 modules against exactly its listed set.
 # ⚠ Individual files carry no `private` marker: only the bundle enforces the public
 # surface (3.3.0), so an `_` name in a file you include is not refused -- and not API.
 # The example below needs vec2/vec4 even though it never names them:
-# modules = ["src/f64_util.cyr", "src/error.cyr", "src/vec2.cyr", "src/vec3.cyr", ...]
+# modules = ["src/f64_util.cyr", "src/error.cyr", "src/heap.cyr", "src/vec2.cyr", "src/vec3.cyr", ...]
 ```
 
 ```cyrius
@@ -202,15 +204,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.4.1 |
-| Library | 35 modules, ~70,600 lines of Cyrius |
-| Tests | 14152 assertions across 7 suites |
-| Benchmarks | 375 operations |
+| Version | 3.4.2 |
+| Library | 36 modules (35 math, plus the allocation scope), ~71,900 lines of Cyrius |
+| Tests | 14303 assertions across 7 suites |
+| Benchmarks | 392 operations |
 | Fuzz targets | 6 seeded generators with invariant checks (vec3, quat, ray, gcd, m4_inverse, einsum notation), plus the fixed self-test buffers |
 | CLI binary | ~307 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.7.18 |
-| Dependencies | 1 (sakshi 2.5.10); no third-party, no FFI/libc |
-| Security | No FFI, no libc, no third-party code — one first-party dependency. Every fallible entry point returns `Result<T, E>`; 290 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared (3.1.0) and enforced (3.3.0)**: every non-underscore top-level declaration carries `public`, the shipped bundle is `private` so a consumer naming anything else is refused at compile time (enum constants excepted: the language gives them no visibility, so a non-public enum's members are `_`-named), and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **Two open filings** in [docs/development/issues/](docs/development/issues/) (43 archived): ganita's symmetric eigensolver stops at an absolute 1e-12·max|a| (filed 2026-10-31; `eigen_symmetric` is exposed), and ganita's QR and least squares answer wrongly, with status 0, near DBL_MAX (filed 2026-10-31; still open on ganita 1.2.15, and hisab no longer calls either since 3.4.0). 3.3.7 closed the previous four with paired runs on cyrius 6.6.14 and 6.6.20 — two in cyrius (top-level `fncallN` on a capturing closure crashed; a closure's `return` of a `: stack` value was booked against the enclosing fn; both fixed in 6.6.16) and two in ganita (`ganita_mat_svd` refused rank-deficient and tiny-rotation matrices and accepted non-finite input; both fixed in ganita 1.2.12). ganita's `atan2` filing closed in 3.3.4 when ganita 1.2.11 repaired it. The 3.2.1 benchmark-statistic filing was repaired upstream in cyrius 6.6.9 and closed here in 3.2.2 with a paired measurement. The cycc wrong-code defect 3.2.0 found (the register picker dropping an `f64v_*` destination-slot store, wrong on 6.6.0–6.6.4) was repaired upstream in 6.6.5 and closed here in 3.2.1; `m3_mul_vec3` keeps its hoisted form because six of the ten live consumers pin cyrius 6.6.3, which compiles a 3.x bundle but sits below the fix (goonj and attn11, on 6.6.2, cannot compile 3.1.0 or later; pins read 2026-10-31). Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
+| Dependencies | the Cyrius stdlib only (sakshi 2.5.10 among its leaves since 3.4.2); no package, no third-party, no FFI/libc |
+| Security | No FFI, no libc, no third-party code — the Cyrius stdlib only. Every fallible entry point returns `Result<T, E>`; 296 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared (3.1.0) and enforced (3.3.0)**: every non-underscore top-level declaration carries `public`, the shipped bundle is `private` so a consumer naming anything else is refused at compile time (enum constants excepted: the language gives them no visibility, so a non-public enum's members are `_`-named), and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **Two open filings** in [docs/development/issues/](docs/development/issues/) (48 archived; 3.4.2 closed the five consumer issues filed 2026-11-09 to 11-11 with paired runs): ganita's symmetric eigensolver stops at an absolute 1e-12·max|a| (filed 2026-10-31; `eigen_symmetric` is exposed), and ganita's QR and least squares answer wrongly, with status 0, near DBL_MAX (filed 2026-10-31; still open on ganita 1.2.15, and hisab no longer calls either since 3.4.0). 3.3.7 closed the previous four with paired runs on cyrius 6.6.14 and 6.6.20 — two in cyrius (top-level `fncallN` on a capturing closure crashed; a closure's `return` of a `: stack` value was booked against the enclosing fn; both fixed in 6.6.16) and two in ganita (`ganita_mat_svd` refused rank-deficient and tiny-rotation matrices and accepted non-finite input; both fixed in ganita 1.2.12). ganita's `atan2` filing closed in 3.3.4 when ganita 1.2.11 repaired it. The 3.2.1 benchmark-statistic filing was repaired upstream in cyrius 6.6.9 and closed here in 3.2.2 with a paired measurement. The cycc wrong-code defect 3.2.0 found (the register picker dropping an `f64v_*` destination-slot store, wrong on 6.6.0–6.6.4) was repaired upstream in 6.6.5 and closed here in 3.2.1. `m3_mul_vec3` keeps its hoisted form: every direct consumer pins cyrius 6.7.18 (manifests read 2026-11-14), past the fix, but jalwa, which carries the bundle through dhvani, pins 6.6.3, below it, and 3.3.7 timed the hoist the fastest of three forms. Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
 
 ## License
 

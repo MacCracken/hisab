@@ -18,7 +18,7 @@ public enum Mat3Layout { MAT3_BYTES = 72 }
 # a matrix or vector.
 #must_use
 public fn m3_new() {
-    var m = alloc(MAT3_BYTES);
+    var m = hisab_alloc(MAT3_BYTES);
     if (m == 0) { return 0; }
     var i = 0;
     while (i < 9) { store64(m + i * 8, 0); i = i + 1; }
@@ -47,7 +47,7 @@ public fn m3_set(m, col, row, val) { store64(m + (col * 3 + row) * 8, val); retu
 # A new matrix with src's nine entries, bit for bit.
 #must_use
 public fn m3_copy(src) {
-    var dst = alloc(MAT3_BYTES);
+    var dst = hisab_alloc(MAT3_BYTES);
     if (dst == 0) { return 0; }
     var i = 0;
     while (i < MAT3_BYTES) { store64(dst + i, load64(src + i)); i = i + 8; }
@@ -57,7 +57,7 @@ public fn m3_copy(src) {
 # The matrix whose columns are the HVec3s c0, c1, c2 (bits copied).
 #must_use
 public fn m3_from_cols(c0, c1, c2) {
-    var m = alloc(MAT3_BYTES);
+    var m = hisab_alloc(MAT3_BYTES);
     if (m == 0) { return 0; }
     store64(m,      HVec3_x(c0)); store64(m + 8,  HVec3_y(c0)); store64(m + 16, HVec3_z(c0));
     store64(m + 24, HVec3_x(c1)); store64(m + 32, HVec3_y(c1)); store64(m + 40, HVec3_z(c1));
@@ -83,7 +83,7 @@ public fn m3_col(m, c) {
 public fn m3_mul(a, b) {
     var c = m3_new();
     if (c == 0) { return 0; }
-    var tmp = alloc(24);
+    var tmp = hisab_alloc(24);
     if (tmp == 0) { return 0; }
     var col = 0;
     while (col < 3) {
@@ -99,6 +99,29 @@ public fn m3_mul(a, b) {
         col = col + 1;
     }
     return c;
+}
+
+# m3_mul into the caller's 72-byte matrix out: a b, m3_mul's bits, nothing allocated (3.4.2;
+# issue 2026-11-09-allocator-scoped-calls). In scalar operations in the packed form's order,
+# entry (r, c) = ((a(r, 0) b(0, c) + a(r, 1) b(1, c)) + a(r, 2) b(2, c)): the n = 2 packed
+# scale and add are one IEEE operation per lane, so the bits are the same, and no frame slot
+# is a packed destination (the cycc 6.6.0-6.6.4 picker defect, below). All nine products are
+# formed before out is written, so out may be a or b. Returns out; 0 for out = 0.
+public fn m3_mul_into(out, a, b) {
+    if (out == 0) { return 0; }
+    var t: i64[9];
+    for (var col = 0; col < 3; col = col + 1) {
+        var bc = b + col * 24;
+        var b0 = load64(bc); var b1 = load64(bc + 8); var b2 = load64(bc + 16);
+        for (var row = 0; row < 3; row = row + 1) {
+            var e = f64_mul(load64(a + row * 8), b0);
+            e = f64_add(e, f64_mul(load64(a + 24 + row * 8), b1));
+            e = f64_add(e, f64_mul(load64(a + 48 + row * 8), b2));
+            store64(&t + (col * 3 + row) * 8, e);
+        }
+    }
+    for (var i = 0; i < 9; i = i + 1) { store64(out + i * 8, load64(&t + i * 8)); }
+    return out;
 }
 
 # SIMD: result = Σ_k v[k]·M_col_k (xy via n=2, z scalar tail).
@@ -121,13 +144,13 @@ public fn m3_mul(a, b) {
 # [measured: docs/development/issues/archived/2026-09-14-cyrius-simd-dst-slot-regalloc-picker.md, 2026-09-21]
 #
 # THE HOISTED FORM IS KEPT, for two stated reasons -- neither of them "it might
-# still be broken": (1) consumers compile `dist/hisab.cyr` under their OWN pins,
-# and six direct consumers (svara, naad, ghurni, prani, garjan, nidhi) plus three
-# that carry the bundle transitively (jalwa, shabda, shabdakosh) pin cycc 6.6.3,
-# below the 6.6.5 fix, where the natural form is SILENT wrong code. None of the nine
-# takes a 3.x bundle yet: they carry hisab 2.11.2 or 2.22.1, whose raw `store64` z
-# tail gives the right answer under 6.6.3 (a natural-form control in the same probe
-# does not), so the hoist protects the first that moves to 3.x without bumping cycc.
+# still be broken": (1) consumers compile `dist/hisab.cyr` under their OWN pins.
+# Every direct consumer pins cycc 6.7.18 (manifests read 2026-11-14), past the 6.6.5
+# fix, but jalwa, which carries the bundle through dhvani, pins 6.6.3, where the
+# natural form is SILENT wrong code, and dhvani now ships 3.4.1, so jalwa's next
+# resolve compiles a 3.x bundle there. Through 2026-10-31 nine consumers pinned 6.6.3
+# on hisab 2.11.2 or 2.22.1, whose raw `store64` z tail gives the right answer under
+# 6.6.3 (a natural-form control in the same probe does not).
 # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.3 and 6.6.12]
 # Read from their manifests 2026-09-30: prakash (6.6.6, the one consumer on 3.x,
 # at 3.2.1), dhvani (6.6.10) and ranga (6.6.9) are past the fix, and goonj and
@@ -148,9 +171,9 @@ public fn m3_mul(a, b) {
 # [measured: scratch pfb/focus.bcyr m3_mul_vec3, 3 builds interleaved x 7, 2026-10-31; cycc 6.6.20]
 #must_use
 public fn m3_mul_vec3(m, v) {
-    var r = alloc(sizeof(HVec3));
+    var r = hisab_alloc(sizeof(HVec3));
     if (r == 0) { return 0; }
-    var tmp = alloc(24);
+    var tmp = hisab_alloc(24);
     if (tmp == 0) { return 0; }
     var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
     f64v_scale(r, m, vx, 2);
@@ -161,6 +184,21 @@ public fn m3_mul_vec3(m, v) {
     rz = f64_add(rz, f64_mul(load64(m + 64), vz));
     HVec3_set_z(r, rz);
     return r;
+}
+
+# m3_mul_vec3 into the caller's HVec3 out: m v, m3_mul_vec3's bits (scalar, in its order:
+# component r = (m(r, 0) vx + m(r, 1) vy) + m(r, 2) vz), nothing allocated (3.4.2). v is read
+# first, so out may be v (not m). Returns out; 0 for out = 0.
+public fn m3_mul_vec3_into(out, m, v) {
+    if (out == 0) { return 0; }
+    var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
+    var x = f64_add(f64_add(f64_mul(load64(m), vx), f64_mul(load64(m + 24), vy)), f64_mul(load64(m + 48), vz));
+    var y = f64_add(f64_add(f64_mul(load64(m + 8), vx), f64_mul(load64(m + 32), vy)), f64_mul(load64(m + 56), vz));
+    var z = f64_add(f64_add(f64_mul(load64(m + 16), vx), f64_mul(load64(m + 40), vy)), f64_mul(load64(m + 64), vz));
+    HVec3_set_x(out, x);
+    HVec3_set_y(out, y);
+    HVec3_set_z(out, z);
+    return out;
 }
 
 # The transpose, a new matrix, exact.
@@ -697,7 +735,7 @@ public fn m3_inverse_checked(m) {
     }
     if (certified == 1) {
         var inv_det = f64_div(F64_ONE, det);
-        var r = alloc(MAT3_BYTES);
+        var r = hisab_alloc(MAT3_BYTES);
         if (r == 0) { return Err(HSB_ERR_ALLOC); }
         var r0 = f64_mul(inv_det, a0);
         var r1 = f64_mul(inv_det, f64_sub(p3, p2));
@@ -804,7 +842,7 @@ fn _m3_cof_signed(m, sg) {
     var m00 = load64(m);      var m01 = load64(m + 8);  var m02 = load64(m + 16);
     var m10 = load64(m + 24); var m11 = load64(m + 32); var m12 = load64(m + 40);
     var m20 = load64(m + 48); var m21 = load64(m + 56); var m22 = load64(m + 64);
-    var r = alloc(MAT3_BYTES);
+    var r = hisab_alloc(MAT3_BYTES);
     if (r == 0) { return 0; }
     # N[i][j] = C[i][j], the (i, j) cofactor; column-major, so N at (col j, row i).
     store64(r,      f64_sub(f64_mul(m11, m22), f64_mul(m21, m12)));
@@ -1408,7 +1446,7 @@ fn _m3_cof_exact(m, sg) {
     }
     var sh = 0;
     if (hi > 1023 || hi < 0 - 969) { sh = 0 - hi; }
-    var r = alloc(MAT3_BYTES);
+    var r = hisab_alloc(MAT3_BYTES);
     if (r == 0) { return 0; }
     i = 0;
     while (i < 9) {
@@ -1608,7 +1646,7 @@ public fn m3_normal_matrix_cof(m) {
     }
     if (me == 0) { return r; }
     var e = _m3_expo(me);
-    var t = alloc(MAT3_BYTES);
+    var t = hisab_alloc(MAT3_BYTES);
     if (t == 0) { return 0; }
     i = 0;
     while (i < 9) { store64(t + i * 8, _m3_ldexp(load64(m + i * 8), 0 - e)); i = i + 1; }

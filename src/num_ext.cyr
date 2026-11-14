@@ -386,12 +386,12 @@ public fn num_pollard_rho_checked(n) {
 # [measured: tests/edge_cases.tcyr, group "3.4.1: num_factorize below 2"]
 public fn num_factorize(n) {
     if (n <= 0) { return 0; }
-    var factors = vec_new();
+    var factors = hisab_vec_new();
     if (factors == 0) { return 0; }
     if (n == 1) { return factors; }
     var f: i64[64];
     var c = _numx_factors_into(n, &f);
-    var va = default_alloc();
+    var va = hisab_allocator();
     for (var i = 0; i < c; i = i + 1) {
         if (vec_push_a(va, factors, load64(&f + i * 8)) < 0) { return 0; }
     }
@@ -577,11 +577,11 @@ public fn num_crt(remainders, moduli, count, out_x, out_m) {
 # 2^63, which an i64 cannot carry, so they return the empty vec q = 0 returns.
 # [measured: tests/abuse.tcyr, group "3.3.3 W5: totient, mobius and sobol below their domain"]
 public fn num_continued_fraction_rational(p, q) {
-    var cf = vec_new();
+    var cf = hisab_vec_new();
     if (cf == 0) { return 0; }
     while (q != 0) {
-        if (q == 0 - 1 && p == 0x8000000000000000) { return vec_new(); }
-        if (vec_push_a(default_alloc(), cf, p / q) < 0) { return 0; }
+        if (q == 0 - 1 && p == 0x8000000000000000) { return hisab_vec_new(); }
+        if (vec_push_a(hisab_allocator(), cf, p / q) < 0) { return 0; }
         var r = p % q;
         p = q;
         q = r;
@@ -651,9 +651,9 @@ fn _numx_dft(data, n) {
     if (n > _NUMX_DFT_MAX) { return Err(HSB_ERR_INVALID_INPUT); }
 
     var m = _numx_next_pow2(2 * n - 1);
-    var av = alloc(m * 16);
+    var av = hisab_alloc(m * 16);
     if (av == 0) { return Err(HSB_ERR_ALLOC); }
-    var bv = alloc(m * 16);
+    var bv = hisab_alloc(m * 16);
     if (bv == 0) { return Err(HSB_ERR_ALLOC); }
 
     var i = 0;
@@ -942,7 +942,7 @@ public fn num_dst(data, n) {
     # Odd extension of length 2*(n+1): y[0] = y[n+1] = 0, y[j+1] = x[j],
     # y[2n+1-j] = -x[j]. Its DFT is purely imaginary and carries the DST-I
     # coefficients in bins 1..n.
-    var y = alloc(big_n * 16);
+    var y = hisab_alloc(big_n * 16);
     if (y == 0) { return Err(HSB_ERR_ALLOC); }
     var i = 0;
     while (i < big_n) {
@@ -973,7 +973,7 @@ public fn num_dst(data, n) {
 # path below the crossover (see _numx_use_fft).
 #must_use
 fn _numx_dst_direct(data, n) {
-    var out = alloc(n * 8);
+    var out = hisab_alloc(n * 8);
     if (out == 0) { return Err(HSB_ERR_ALLOC); }
     var np1 = f64_from(n + 1);
     var k = 0;
@@ -1024,6 +1024,376 @@ public fn num_idst(data, n) {
     return Ok(0);
 }
 
+# ----------------------------------------------------------------
+# DST-I with a caller-kept plan, in caller-provided scratch (3.4.2)
+# ----------------------------------------------------------------
+#
+# num_dst / num_idst allocate their working set on every call (the odd extension, and
+# Bluestein's buffers where the DFT length is not a power of two), and `alloc` has no
+# free: a grid solver that transforms every row and column every step grew the heap
+# about 2.5 MB a step at 64^2 (issue 2026-11-11-dst-allocates-per-call, pravash L6).
+# [measured: docs/development/issues/archived/2026-11-11-dst-allocates-per-call-repro.cyr, on 3.4.1]
+# These forms allocate nothing. The caller keeps two buffers:
+#   PLAN    num_dst_plan_words(n) words, filled once by num_dst_plan(n, plan) and
+#           reused for every transform of length n: what num_dst computes afresh on
+#           every call that does not depend on the data -- the direct path's n^2 sines,
+#           the FFT's twiddles, Bluestein's chirp and the transform of its kernel.
+#   SCRATCH num_dst_scratch_words(n) words, overwritten by every call.
+# ⭐ THE BITS ARE num_dst's / num_idst's, on every path, for every input: the plan takes
+# the same path num_dst takes (_numx_use_fft, _numx_bluestein_capped) and holds the
+# values num_dst computes, computed the same way, and the FFT below is num_fft's
+# butterflies with its twiddles read from the table.
+# [measured: tests/modules_c.tcyr, group "3.4.2: num_dst_into / num_idst_into"]
+#
+# Plan layout (words): [0] _NUMX_DST_PLAN_TAG, [1] n, [2] the path (_NumxDstPath), [3] L,
+# the DFT length 2(n + 1), [4] m, the FFT length (L on the power-of-two path, Bluestein's
+# next_pow2(2L - 1)), [5..7] 0; from word 8:
+#   direct     sin(PI (i + 1)(k + 1) / (n + 1)) at word 8 + k n + i, n^2 words
+#   pow2       L's twiddles (_numx_tw_fill), 2(L - 1) words
+#   bluestein  the chirp (cos, sin of _numx_chirp_angle(j, L), j < L), 2L words; the
+#              transform of the kernel, 2m words; m's twiddles, 2(m - 1) words
+var _NUMX_DST_PLAN_TAG = 0x4E414C505F545344;   # "DST_PLAN", little-endian bytes
+enum _NumxDstPath {
+    _NUMX_DST_ONE = 0;
+    _NUMX_DST_DIRECT = 1;
+    _NUMX_DST_POW2 = 2;
+    _NUMX_DST_BLUE = 3;
+}
+var _NUMX_F64_NEG_TWO_PI = 0xC01921FB54442D18;   # -2*pi, num_fft's angle
+enum _NumxFftReseed { _NUMX_FFT_RESEED = 64; }   # num_fft's _NUM_FFT_RESEED
+
+# The path num_dst takes for n >= 1.
+fn _numx_dst_path(n) {
+    if (n == 1) { return _NUMX_DST_ONE; }
+    var big_n = 2 * (n + 1);
+    if (_numx_use_fft(n, big_n, 0) == 0) { return _NUMX_DST_DIRECT; }
+    if (_numx_bluestein_capped(big_n) == 1) { return _NUMX_DST_DIRECT; }
+    if (num_is_pow2(big_n) == 1) { return _NUMX_DST_POW2; }
+    return _NUMX_DST_BLUE;
+}
+
+# Words of plan (which == 0) or of scratch (which == 1) for n (1 <= n <= ALLOC_MAX / 8), or
+# -1 where either would pass ALLOC_MAX bytes: the direct path's n^2 sines from n > 16,384,
+# which num_dst takes only past Bluestein's cap, n >= 524,288.
+# [measured: derived from ALLOC_MAX = 2^31 and _NUMX_DFT_MAX = 2^20, not a run; modules_c pins 600,000]
+fn _numx_dst_words(n, which) {
+    var path = _numx_dst_path(n);
+    var big_n = 2 * (n + 1);
+    var w = 0;
+    if (path == _NUMX_DST_ONE) {
+        if (which == 0) { w = 8; }
+    } elif (path == _NUMX_DST_DIRECT) {
+        if (which == 0) { w = 8 + n * n; } else { w = n; }   # n <= ALLOC_MAX / 8: n^2 fits
+    } elif (path == _NUMX_DST_POW2) {
+        if (which == 0) { w = 8 + 2 * (big_n - 1); } else { w = 2 * big_n; }
+    } else {
+        var m = _numx_next_pow2(2 * big_n - 1);
+        if (which == 0) { w = 8 + 2 * big_n + 2 * m + 2 * (m - 1); } else { w = 2 * big_n + 2 * m; }
+    }
+    if (w > ALLOC_MAX / 8) { return 0 - 1; }
+    return w;
+}
+
+# The words a plan for n-point DST-I takes: Ok(words), Err(HSB_ERR_INVALID_INPUT) for
+# n <= 0, and Err(HSB_ERR_ALLOC) where the plan would pass ALLOC_MAX bytes (n past
+# ALLOC_MAX / 8, as num_dst; and n > 16,384 on the direct path, which num_dst takes from
+# n = 524,288, past Bluestein's cap). A pure function of n.
+# [measured: derived from ALLOC_MAX = 2^31 and _NUMX_DFT_MAX = 2^20, not a run; modules_c pins 600,000]
+#must_use
+public fn num_dst_plan_words(n) {
+    if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }
+    var w = _numx_dst_words(n, 0);
+    if (w < 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(w);
+}
+
+# The words of scratch num_dst_into / num_idst_into take for n: Ok(words) (0 for n = 1),
+# with num_dst_plan_words's errors. A pure function of n.
+#must_use
+public fn num_dst_scratch_words(n) {
+    if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }
+    var w = _numx_dst_words(n, 1);
+    if (w < 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(w);
+}
+
+# num_fft's twiddles for an n-point FFT (n a power of two >= 2), recorded: stage `len`'s
+# k-th twiddle, k < half = len / 2, at complex slot (half - 1) + k of tw (2(n - 1) words
+# in all). num_fft forms them by the same recurrence, restarted at w = 1 for every block
+# of a stage, so each block uses this sequence.
+fn _numx_tw_fill(tw, n) {
+    var len = 2;
+    while (len <= n) {
+        var half = len >> 1;
+        var angle = f64_div(_NUMX_F64_NEG_TWO_PI, f64_from(len));
+        var wn_re = f64_cos(angle);
+        var wn_im = f64_sin(angle);
+        var w_re = _NUMX_F64_ONE;
+        var w_im = _NUMX_F64_ZERO;
+        var kr = _NUMX_FFT_RESEED;
+        var base = tw + (half - 1) * 16;
+        for (var k = 0; k < half; k = k + 1) {
+            if (k == kr) {
+                var ak = f64_mul(angle, f64_from(k));
+                w_re = f64_cos(ak);
+                w_im = f64_sin(ak);
+                kr = kr + _NUMX_FFT_RESEED;
+            }
+            store64(base + k * 16, w_re);
+            store64(base + k * 16 + 8, w_im);
+            var new_w_re = f64_sub(f64_mul(w_re, wn_re), f64_mul(w_im, wn_im));
+            var new_w_im = f64_add(f64_mul(w_re, wn_im), f64_mul(w_im, wn_re));
+            w_re = new_w_re;
+            w_im = new_w_im;
+        }
+        len = len << 1;
+    }
+    return 0;
+}
+
+# num_fft (n a power of two >= 2) with its twiddles read from tw (_numx_tw_fill): the
+# same permutation and butterflies, so the same bits.
+fn _numx_fft_tw(data, n, tw) {
+    var j = 0;
+    var i = 1;
+    while (i < n) {
+        var bit = n >> 1;
+        while ((j & bit) != 0) {
+            j = j ^ bit;
+            bit = bit >> 1;
+        }
+        j = j ^ bit;
+        if (i < j) {
+            var a = data + i * 16;
+            var b = data + j * 16;
+            var t0 = load64(a);
+            var t1 = load64(a + 8);
+            store64(a, load64(b));
+            store64(a + 8, load64(b + 8));
+            store64(b, t0);
+            store64(b + 8, t1);
+        }
+        i = i + 1;
+    }
+    var len = 2;
+    while (len <= n) {
+        var half = len >> 1;
+        var base = tw + (half - 1) * 16;
+        var start = 0;
+        while (start < n) {
+            for (var k = 0; k < half; k = k + 1) {
+                var w_re = load64(base + k * 16);
+                var w_im = load64(base + k * 16 + 8);
+                var pu = data + (start + k) * 16;
+                var pt = data + (start + k + half) * 16;
+                var u_re = load64(pu);
+                var u_im = load64(pu + 8);
+                var d_re = load64(pt);
+                var d_im = load64(pt + 8);
+                var t_re = f64_sub(f64_mul(w_re, d_re), f64_mul(w_im, d_im));
+                var t_im = f64_add(f64_mul(w_re, d_im), f64_mul(w_im, d_re));
+                store64(pu, f64_add(u_re, t_re));
+                store64(pu + 8, f64_add(u_im, t_im));
+                store64(pt, f64_sub(u_re, t_re));
+                store64(pt + 8, f64_sub(u_im, t_im));
+            }
+            start = start + len;
+        }
+        len = len << 1;
+    }
+    return 0;
+}
+
+# num_ifft through _numx_fft_tw: conjugate, transform, conjugate and scale by 1/n.
+fn _numx_ifft_tw(data, n, tw) {
+    for (var i = 0; i < n; i = i + 1) {
+        store64(data + i * 16 + 8, f64_neg(load64(data + i * 16 + 8)));
+    }
+    _numx_fft_tw(data, n, tw);
+    var scale = f64_div(_NUMX_F64_ONE, f64_from(n));
+    for (var j = 0; j < n; j = j + 1) {
+        var re = load64(data + j * 16);
+        var im = load64(data + j * 16 + 8);
+        store64(data + j * 16, f64_mul(re, scale));
+        store64(data + j * 16 + 8, f64_mul(f64_neg(im), scale));
+    }
+    return 0;
+}
+
+# Fill a plan for n-point DST-I into plan, which holds num_dst_plan_words(n) words:
+# Ok(0), Err(HSB_ERR_INVALID_INPUT) for n <= 0 or plan = 0, Err(HSB_ERR_ALLOC) where
+# num_dst_plan_words refuses n. Allocates nothing. Its cost is about one num_dst's: the
+# direct path's n^2 sines, or the twiddles, the chirp and one FFT of the kernel. A plan
+# is read, never written, by num_dst_into, so one plan serves any number of transforms
+# of length n, rows and columns alike.
+#must_use
+public fn num_dst_plan(n, plan) {
+    if (n <= 0 || plan == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }
+    if (_numx_dst_words(n, 0) < 0) { return Err(HSB_ERR_ALLOC); }
+    var path = _numx_dst_path(n);
+    var big_n = 2 * (n + 1);
+    var m = big_n;
+    if (path == _NUMX_DST_BLUE) { m = _numx_next_pow2(2 * big_n - 1); }
+    store64(plan, _NUMX_DST_PLAN_TAG);
+    store64(plan + 8, n);
+    store64(plan + 16, path);
+    store64(plan + 24, big_n);
+    store64(plan + 32, m);
+    store64(plan + 40, 0);
+    store64(plan + 48, 0);
+    store64(plan + 56, 0);
+    var body = plan + 64;
+    if (path == _NUMX_DST_DIRECT) {
+        # _numx_dst_direct's sines, computed as it computes them.
+        var np1 = f64_from(n + 1);
+        for (var k = 0; k < n; k = k + 1) {
+            for (var i = 0; i < n; i = i + 1) {
+                var angle = f64_div(
+                  f64_mul(F64_PI, f64_mul(f64_from(i + 1), f64_from(k + 1))),
+                  np1);
+                store64(body + (k * n + i) * 8, f64_sin(angle));
+            }
+        }
+    } elif (path == _NUMX_DST_POW2) {
+        _numx_tw_fill(body, big_n);
+    } elif (path == _NUMX_DST_BLUE) {
+        # _numx_dft's chirp, and its kernel b transformed as it transforms it.
+        var chirp = body;
+        var bvh = body + big_n * 16;
+        var tw = bvh + m * 16;
+        _numx_tw_fill(tw, m);
+        for (var i = 0; i < m; i = i + 1) {
+            store64(bvh + i * 16, _NUMX_F64_ZERO);
+            store64(bvh + i * 16 + 8, _NUMX_F64_ZERO);
+        }
+        for (var j = 0; j < big_n; j = j + 1) {
+            var th = _numx_chirp_angle(j, big_n);
+            var c = f64_cos(th);
+            var s = f64_sin(th);
+            store64(chirp + j * 16, c);
+            store64(chirp + j * 16 + 8, s);
+            store64(bvh + j * 16, c);
+            store64(bvh + j * 16 + 8, s);
+            if (j > 0) {
+                store64(bvh + (m - j) * 16, c);
+                store64(bvh + (m - j) * 16 + 8, s);
+            }
+        }
+        _numx_fft_tw(bvh, m, tw);
+    }
+    return Ok(0);
+}
+
+# 1 when plan is a filled DST-I plan for n.
+fn _numx_dst_plan_ok(plan, n) {
+    if (plan == 0) { return 0; }
+    if (load64(plan) != _NUMX_DST_PLAN_TAG) { return 0; }
+    if (load64(plan + 8) != n) { return 0; }
+    return 1;
+}
+
+# DST-I in place, as num_dst, through a plan and in caller scratch: the same transform,
+# bit for bit (num_dst's paths and arithmetic, the plan's values for the ones num_dst
+# computes per call), and nothing allocated, so a solver that transforms every step grows
+# no heap. data: n f64 values; plan: filled by num_dst_plan(n, plan) (read only); scratch:
+# num_dst_scratch_words(n) words (may be 0 when that is 0), overwritten.
+# Returns: Ok(0); Err(HSB_ERR_INVALID_INPUT), with data untouched, for n <= 0, data = 0,
+# a plan that is 0 or not a plan for n (its tag and length are checked; the values it
+# holds are not), and scratch = 0 where n needs scratch.
+#must_use
+public fn num_dst_into(data, n, plan, scratch) {
+    if (n <= 0 || data == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_numx_dst_plan_ok(plan, n) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var path = load64(plan + 16);
+    if (path == _NUMX_DST_ONE) { return Ok(0); }   # sin(PI/2) == 1 exactly
+    if (scratch == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var body = plan + 64;
+    if (path == _NUMX_DST_DIRECT) {
+        for (var k = 0; k < n; k = k + 1) {
+            var sum = _NUMX_F64_ZERO;
+            var row = body + k * n * 8;
+            for (var i = 0; i < n; i = i + 1) {
+                sum = f64_add(sum, f64_mul(load64(data + i * 8), load64(row + i * 8)));
+            }
+            store64(scratch + k * 8, sum);
+        }
+        for (var j = 0; j < n; j = j + 1) { store64(data + j * 8, load64(scratch + j * 8)); }
+        return Ok(0);
+    }
+    var big_n = load64(plan + 24);
+    var m = load64(plan + 32);
+    var y = scratch;
+    for (var i = 0; i < big_n; i = i + 1) {
+        store64(y + i * 16, _NUMX_F64_ZERO);
+        store64(y + i * 16 + 8, _NUMX_F64_ZERO);
+    }
+    for (var j = 0; j < n; j = j + 1) {
+        var x = load64(data + j * 8);
+        store64(y + (j + 1) * 16, x);
+        store64(y + (big_n - 1 - j) * 16, f64_neg(x));
+    }
+    if (path == _NUMX_DST_POW2) {
+        _numx_fft_tw(y, big_n, body);
+    } else {
+        # _numx_dft's Bluestein, with the chirp, the kernel's transform and the twiddles
+        # read from the plan.
+        var chirp = body;
+        var bvh = body + big_n * 16;
+        var tw = bvh + m * 16;
+        var av = scratch + big_n * 16;
+        for (var i = 0; i < m; i = i + 1) {
+            store64(av + i * 16, _NUMX_F64_ZERO);
+            store64(av + i * 16 + 8, _NUMX_F64_ZERO);
+        }
+        for (var j = 0; j < big_n; j = j + 1) {
+            var c = load64(chirp + j * 16);
+            var s = load64(chirp + j * 16 + 8);
+            var xr = load64(y + j * 16);
+            var xi = load64(y + j * 16 + 8);
+            store64(av + j * 16, f64_add(f64_mul(xr, c), f64_mul(xi, s)));
+            store64(av + j * 16 + 8, f64_sub(f64_mul(xi, c), f64_mul(xr, s)));
+        }
+        _numx_fft_tw(av, m, tw);
+        for (var k = 0; k < m; k = k + 1) {
+            var ar = load64(av + k * 16);
+            var ai = load64(av + k * 16 + 8);
+            var br = load64(bvh + k * 16);
+            var bi = load64(bvh + k * 16 + 8);
+            store64(av + k * 16, f64_sub(f64_mul(ar, br), f64_mul(ai, bi)));
+            store64(av + k * 16 + 8, f64_add(f64_mul(ar, bi), f64_mul(ai, br)));
+        }
+        _numx_ifft_tw(av, m, tw);
+        for (var q = 0; q < big_n; q = q + 1) {
+            var c2 = load64(chirp + q * 16);
+            var s2 = load64(chirp + q * 16 + 8);
+            var cr = load64(av + q * 16);
+            var ci = load64(av + q * 16 + 8);
+            store64(y + q * 16, f64_add(f64_mul(cr, c2), f64_mul(ci, s2)));
+            store64(y + q * 16 + 8, f64_sub(f64_mul(ci, c2), f64_mul(cr, s2)));
+        }
+    }
+    for (var k = 0; k < n; k = k + 1) {
+        # X[k] = -Im(Y[k+1]) / 2
+        store64(data + k * 8, f64_mul(f64_neg(load64(y + (k + 1) * 16 + 8)), _NUMX_F64_HALF));
+    }
+    return Ok(0);
+}
+
+# Inverse DST-I in place, as num_idst (num_dst_into, then the scale 2/(n + 1)), bit for
+# bit, through the same plan and scratch as num_dst_into, with its returns.
+#must_use
+public fn num_idst_into(data, n, plan, scratch) {
+    var err = num_dst_into(data, n, plan, scratch)?;
+    var scale = f64_div(_NUMX_F64_TWO, f64_from(n + 1));
+    for (var i = 0; i < n; i = i + 1) {
+        store64(data + i * 8, f64_mul(load64(data + i * 8), scale));
+    }
+    return Ok(0);
+}
+
 # Discrete Cosine Transform Type II, in-place.
 # X[k] = sum_{i=0}^{n-1} x[i] * cos(PI * (2i+1) * k / (2n))
 # data: pointer to n consecutive f64 values
@@ -1039,7 +1409,7 @@ public fn num_dct(data, n) {
     if (_numx_bluestein_capped(n) == 1) { return _numx_dct_direct(data, n); }
 
     # v = even-indexed samples in order, then odd-indexed samples reversed.
-    var v = alloc(n * 16);
+    var v = hisab_alloc(n * 16);
     if (v == 0) { return Err(HSB_ERR_ALLOC); }
     var i = 0;
     while (2 * i < n) {
@@ -1074,7 +1444,7 @@ public fn num_dct(data, n) {
 # Direct O(n^2) DCT-II -- the pre-2.8.3 body, kept as the sub-crossover path.
 #must_use
 fn _numx_dct_direct(data, n) {
-    var out = alloc(n * 8);
+    var out = hisab_alloc(n * 8);
     if (out == 0) { return Err(HSB_ERR_ALLOC); }
     var two_n = f64_from(2 * n);
     var k = 0;
@@ -1118,7 +1488,7 @@ public fn num_idct(data, n) {
     # Z[k] = (X[k] - i X[n-k]) * e^{+i PI k / (2n)}, with X[n] taken as 0.
     # The 1/n of the (2/n) scale is supplied by the inverse DFT; the 2 is
     # supplied by dropping the 1/2 the textbook half-spectrum form carries.
-    var z = alloc(n * 16);
+    var z = hisab_alloc(n * 16);
     if (z == 0) { return Err(HSB_ERR_ALLOC); }
     var two_n = f64_from(2 * n);
     var k = 0;
@@ -1155,7 +1525,7 @@ public fn num_idct(data, n) {
 # Direct O(n^2) DCT-III -- the pre-2.8.3 body, kept as the sub-crossover path.
 #must_use
 fn _numx_idct_direct(data, n) {
-    var out = alloc(n * 8);
+    var out = hisab_alloc(n * 8);
     if (out == 0) { return Err(HSB_ERR_ALLOC); }
     var two_n = f64_from(2 * n);
     var inv_n = f64_div(_NUMX_F64_ONE, f64_from(n));
@@ -1220,7 +1590,7 @@ public fn num_fft_2d(data, rows, cols) {
     # states the bound; the null check is what fires.
     # [measured: scratch mutant, abuse 971/971 with the line deleted, 2026-09-30]
     if (rows > ALLOC_MAX / 16) { return Err(HSB_ERR_ALLOC); }
-    var col_buf = alloc(rows * 16);
+    var col_buf = hisab_alloc(rows * 16);
     if (col_buf == 0) { return Err(HSB_ERR_ALLOC); }
 
     # FFT each row
@@ -1290,7 +1660,7 @@ public fn num_ifft_2d(data, rows, cols) {
     # states the bound; the null check is what fires.
     # [measured: scratch mutant, abuse 971/971 with the line deleted, 2026-09-30]
     if (rows > ALLOC_MAX / 16) { return Err(HSB_ERR_ALLOC); }
-    var col_buf = alloc(rows * 16);
+    var col_buf = hisab_alloc(rows * 16);
     if (col_buf == 0) { return Err(HSB_ERR_ALLOC); }
 
     # IFFT each row
@@ -1502,8 +1872,8 @@ public fn num_tridiag_solve(a, b, c, d, n, out) {
     # windows change; every larger n already returned Err(HSB_ERR_ALLOC).
     # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
     if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }
-    var cp = alloc(n * 8);    # c' (n-1 used, but allocate n for simplicity)
-    var dp = alloc(n * 8);    # d'
+    var cp = hisab_alloc(n * 8);    # c' (n-1 used, but allocate n for simplicity)
+    var dp = hisab_alloc(n * 8);    # d'
     if (cp == 0) { return Err(HSB_ERR_ALLOC); }
     if (dp == 0) { return Err(HSB_ERR_ALLOC); }
 
@@ -1565,4 +1935,127 @@ public fn num_tridiag_solve(a, b, c, d, n, out) {
     }
 
     return Ok(0);
+}
+
+# ================================================================
+# LINEAR CONJUGATE GRADIENT, MATRIX-FREE (3.4.2)
+# ================================================================
+#
+# hisab 1.4.0's num::conjugate_gradient(a_mul, b, x0, tol, max_iter) solved A x = b for a
+# symmetric positive definite A given as an operator, and 3.x had no counterpart: the
+# Krylov solvers take a CSR matrix or are not CG (issue 2026-11-11-no-matrix-free-linear-cg,
+# pravash P1, L5: a grid fluid solver's 5-point Poisson projection, every step).
+#
+# 1.4.0'S ITERATION, IN ITS ORDER: r = b - A x0, p = r; then alpha = (r.r) / (p.Ap), x and
+# r updated, the test on r'.r', beta = (r'.r') / (r.r), p = r' + beta p. Each dot product is
+# folded in index order from -0 (the identity of IEEE addition, as Rust's f64 sum folds),
+# and each update is one product and one sum, as 1.4.0 rounds them.
+#
+# IN A FRAME FIXED BY A POWER OF TWO. r and p are carried multiplied by s = 2^-e, e the
+# exponent of max|b - A x0| (so the frame's residual starts in [1, 2)), and the tolerance
+# with them: r.r never overflows or flushes for any scale of b, which 1.4.0's plain r.r did
+# above about 1e154 and below 1e-154. Multiplying by a power of two is exact wherever no
+# value leaves the normal range, and A (s p) = s A p for a linear operator, so every
+# quantity is 1.4.0's own times a power of two: x, alpha, beta, the tests and the iteration
+# count are 1.4.0's BIT FOR BIT wherever 1.4.0's values stay normal and its guard (below)
+# does not fire, and (2^i A, 2^j b, 2^(j - i) x0, 2^j tol) gives 2^(j - i) x with the same
+# count. [measured: tests/modules_c.tcyr, group "3.4.2: num_cg"]
+#
+# ⛔ 1.4.0 STOPPED WHEN |p.Ap| < 1e-12 AND RETURNED THE ITERATE AS ITS ANSWER, an absolute
+# threshold that a problem's scale decides: A = 2^-30 L, b = 2^-30 c (L a Poisson matrix)
+# stops at x0 = 0 with no report, where A = L, b = c converges. Here the only breakdown is
+# the exact one: p.Ap not above 0, or not finite, which for p != 0 says A is not positive
+# definite along p (or overflows). An exactly zero residual is the exact solution, and ends
+# the run whatever tol is. So num_cg and 1.4.0 differ where 1.4.0's guard fired: there
+# num_cg iterates on and reaches tol, or reports. And 1.4.0 returned the iterate as Ok after
+# max_iter and after a negative p.Ap (iterating on with alpha < 0); num_cg reports both.
+
+# sum v[i] w[i], i = 0 .. n - 1, folded in index order from -0.
+fn _numx_cg_dot(v, w, n) {
+    var s = 0x8000000000000000;
+    for (var i = 0; i < n; i = i + 1) {
+        s = f64_add(s, f64_mul(load64(v + i * 8), load64(w + i * 8)));
+    }
+    return s;
+}
+
+# Solves A x = b for a symmetric positive definite A given as an operator, by linear
+# conjugate gradient, in caller storage: nothing is allocated, so a solve every step grows
+# no heap.
+# apply: function pointer, called as fncall3(apply, ctx, v, out): it writes A v into out
+#        (n words). v and out are always hisab's scratch (x0 on the first call, then p) and
+#        never the same buffer. ⛔ It must not write into v.
+# ctx:   a word passed to apply unchanged (the operator's state; any value).
+# b:     n f64 values, read only.
+# x:     n f64 values: the initial guess in, the iterate out. It is written only by the
+#        iteration: a refused call leaves it as it was.
+# tol:   ABSOLUTE: the run stops when ||r||_2 < tol, r = b - A x the recurrence's residual
+#        (1.4.0's r.r < tol^2, in the frame above); a caller wanting a relative tolerance
+#        passes tol ||b||. 0 or more; +Inf accepts x0.
+# max_iter: 0 or more: the iterations allowed (one apply each, beyond the first apply).
+# scratch: 3 n words (r, p and A p), overwritten.
+# Returns: Ok(iterations): the count of x updates the run made (0 when x0 meets tol, or
+#          b - A x0 is exactly 0). Err(HSB_ERR_NO_CONVERGENCE) when max_iter iterations
+#          end above tol, at a breakdown (p.Ap not above 0 or not finite: A is not positive
+#          definite along p, or the operator overflows) and when r.r stops being finite;
+#          x holds the last iterate (after max_iter, 1.4.0's answer). Err(HSB_ERR_INVALID_INPUT),
+#          x untouched, for n <= 0, apply, b, x or scratch 0, tol NaN or below 0, max_iter
+#          below 0, n past ALLOC_MAX / 24, and a b - A x0 that is not finite.
+#must_use
+public fn num_cg(apply, ctx, b, x, n, tol, max_iter, scratch) {
+    if (n <= 0 || apply == 0 || b == 0 || x == 0 || scratch == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n > ALLOC_MAX / 24 || max_iter < 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_ge(tol, 0) == 0) { return Err(HSB_ERR_INVALID_INPUT); }   # NaN or below 0
+    var r = scratch;
+    var p = scratch + n * 8;
+    var ap = scratch + 2 * n * 8;
+    fncall3(apply, ctx, x, ap);
+    # r = b - A x0, and its largest |r_i|; a non-finite one refuses the call.
+    var mx = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        var ri = f64_sub(load64(b + i * 8), load64(ap + i * 8));
+        var ai = f64_abs(ri);
+        if (f64_lt(ai, F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+        if (f64_gt(ai, mx) == 1) { mx = ai; }
+        store64(r + i * 8, ri);
+    }
+    if (f64_eq(mx, 0) == 1) { return Ok(0); }   # b = A x0 exactly
+    # The frame: s = 2^-e and its inverse, e the exponent of mx, kept within [-1022, 1022]
+    # so both are normal; a subnormal mx takes s = 2^1022.
+    var e = ((mx >> 52) & 0x7FF) - 1023;
+    if (e < 0 - 1022) { e = 0 - 1022; }
+    if (e > 1022) { e = 1022; }
+    var s = (1023 - e) << 52;
+    var inv_s = (1023 + e) << 52;
+    for (var i = 0; i < n; i = i + 1) {
+        var rs0 = f64_mul(load64(r + i * 8), s);
+        store64(r + i * 8, rs0);
+        store64(p + i * 8, rs0);
+    }
+    var tol_s = f64_mul(tol, s);
+    var tol_sq = f64_mul(tol_s, tol_s);
+    var rs_old = _numx_cg_dot(r, r, n);
+    if (f64_lt(rs_old, tol_sq) == 1) { return Ok(0); }
+    for (var it = 0; it < max_iter; it = it + 1) {
+        fncall3(apply, ctx, p, ap);
+        var pap = _numx_cg_dot(p, ap, n);
+        # The breakdown: p.Ap not above 0 (NaN included) or not finite.
+        if (f64_gt(pap, 0) == 0 || f64_lt(pap, F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        var alpha = f64_div(rs_old, pap);
+        for (var j = 0; j < n; j = j + 1) {
+            var pj = f64_mul(load64(p + j * 8), inv_s);
+            store64(x + j * 8, f64_add(load64(x + j * 8), f64_mul(alpha, pj)));
+            store64(r + j * 8, f64_sub(load64(r + j * 8), f64_mul(alpha, load64(ap + j * 8))));
+        }
+        var rs_new = _numx_cg_dot(r, r, n);
+        if (f64_lt(rs_new, tol_sq) == 1) { return Ok(it + 1); }
+        if (f64_eq(rs_new, 0) == 1) { return Ok(it + 1); }   # the exact solution (tol 0)
+        if (f64_lt(rs_new, F64_POS_INF) == 0) { return Err(HSB_ERR_NO_CONVERGENCE); }
+        var beta = f64_div(rs_new, rs_old);
+        for (var q = 0; q < n; q = q + 1) {
+            store64(p + q * 8, f64_add(load64(r + q * 8), f64_mul(beta, load64(p + q * 8))));
+        }
+        rs_old = rs_new;
+    }
+    return Err(HSB_ERR_NO_CONVERGENCE);
 }

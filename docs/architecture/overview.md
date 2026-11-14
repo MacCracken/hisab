@@ -3,9 +3,9 @@
 > Equation reference: see [`math.md`](math.md) (CGA operators + a catalogue index
 > of the library's other formula families).
 >
-> hisab v3.4.1 — 35 math modules in `src/` plus the bundle's `visibility.cyr` marker, 70,576
-> lines of Cyrius (`lib/` is vendored stdlib + first-party deps only). Compiled by cycc 6.7.18; a
-> consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
+> hisab v3.4.2 — 35 math modules and the allocation scope (`heap.cyr`) in `src/`, plus the bundle's
+> `visibility.cyr` marker, 71,926 lines of Cyrius (`lib/` is vendored stdlib only). Compiled by cycc
+> 6.7.18; a consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map
 
@@ -16,6 +16,8 @@ first in `dist/hisab.cyr`, which makes the bundle refuse every name not marked `
 hisab (Cyrius)
 ├── Foundation types
 │   ├── error.cyr          — Error codes (HSB_ERR_*), epsilon constants
+│   ├── heap.cyr           — the allocation scope (3.4.2): hisab_alloc_scope routes every allocation
+│   │                        hisab makes to a caller's Allocator; hisab_alloc / hisab_vec_new
 │   ├── f64_util.cyr       — fmod/copysign/approx_eq (f64_tan retired in 3.3.4: ganita has it; f64_le/f64_ge are builtins from cyrius 6.6.13)
 │   ├── vec2.cyr           — HVec2: 2D f64 vector (heap-allocated)
 │   ├── vec3.cyr           — HVec3: 3D f64 vector with cross, reflect, min/max (SIMD f64v)
@@ -77,7 +79,7 @@ hisab (Cyrius)
 
 | Dependency | Source | Purpose |
 |-----------|--------|---------|
-| sakshi | External (git) | Structured logging |
+| sakshi | Cyrius stdlib leaf (a `[deps.sakshi]` package through 3.4.1) | Structured logging; nothing calls it |
 | alloc, string, fmt, vec, str | Cyrius stdlib | Core data structures |
 | math, ganita | Cyrius stdlib | `math`: inclusive cmp, clamp/lerp/min/max/sign, polyfills. `ganita` (6.2.x umbrella): transcendentals + dense matrix + decompositions (subsumes the former `matrix`/`linalg`) |
 | tagged, fnptr, callback | Cyrius stdlib | Option/Result types, function pointers, closure-like callback patterns |
@@ -95,14 +97,17 @@ This table is **derived and verified, not hand-maintained**. Each row was produc
 compiler as the oracle: compile the module alone, map every undefined name it reports to its
 defining module, add that module, and repeat until the build is clean. Then each row was checked
 twice: it builds with **0 undefined names** against exactly its listed set, and dropping any ONE
-listed module breaks the build. Both checks hold for all 35 rows (re-derived 2026-09-30 on 3.3.0;
+listed module breaks the build. Both checks hold for all 36 rows (re-derived 2026-09-30 on 3.3.0;
 re-checked by the same two checks 2026-10-31 on 3.3.7, which found five rows stale: `complex`, and
 through it `linalg_ext` and `linalg_precision`, need `f64_util` for `f64_copysign`, and `mat4` and
 `transforms` stopped needing it when 3.3.4 retired hisab's `f64_tan`; each module's own `# Requires`
 comment said the same and is corrected too; re-checked again 2026-10-31 on 3.4.0, which found
 `symbolic` needing `error` for `expr_eval_checked`'s codes, and `symbolic_ext` through it; re-derived
 2026-11-01 on 3.4.1, which found `collision_core` no longer needing `vec2` now that the hull and the
-ear clipping live in `collision_mesh`, and `linalg_ext`, and `linalg_precision` through it, needing `num`).
+ear clipping live in `collision_mesh`, and `linalg_ext`, and `linalg_precision` through it, needing `num`;
+re-derived 2026-11-14 on 3.4.2, which found every module but `error` and `f64_util` needing the new
+`heap`, whose `hisab_alloc` and `hisab_vec_new` every allocation now goes through, and nothing else moved).
+[measured: scratch derive.py, cyrius check --with-deps per row and per row minus each member, 2026-11-14]
 Undefined *functions* count even when nothing calls them. A function is only a warning until
 something reaches it, and a set that leaves one out is a trap for whoever calls it next.
 
@@ -131,51 +136,56 @@ ignoring until cyrius 6.5.10
 for the same reason this section exists: the sidecar was built by scanning bundled sources for
 literal `include "lib/X.cyr"` lines, and hisab's 35 `[lib]` modules have none, so it reported 2.
 6.5.10 unions in the declared `[deps] stdlib`, which is what takes it from 2 to 16.
-Since 3.3.7 (`cyrius distlib` ≥ 6.6.18) it is a **compile-verified fixpoint** instead: the 7 leaves
-the bundle actually needs (`math`, `alloc`, `vec`, `ganita`, `result`, `str`, `fmt`), also written as
-a `# Requires` block of `include "lib/<leaf>.cyr"` lines at the top of `dist/hisab.cyr`. A consumer
-that took any of the other nine through hisab's sidecar must now declare it.
+Since 3.3.7 (`cyrius distlib` ≥ 6.6.18) it is a **compile-verified fixpoint** instead: the leaves
+the bundle actually needs, also written as a `# Requires` block of `include "lib/<leaf>.cyr"` lines at
+the top of `dist/hisab.cyr`. Through 3.4.1 that was 7 (`math`, `alloc`, `vec`, `ganita`, `result`,
+`str`, `fmt`); since 3.4.2 it is 9 (`alloc`, `math`, `vec`, `ganita`, `result`, `fnptr`, `str`,
+`fmt`, `string`), the two added by the compile-verify once the allocation scope (`alloc_via`,
+`realloc_via` through a vtable) and `_sym_str_from_buf` (`memcpy`) were in the bundle. A consumer that
+took any of the others through hisab's sidecar must declare it.
 
 | Module | Also include |
 |---|---|
 | `error` | *(standalone)* |
 | `f64_util` | *(standalone)* |
-| `interval` | *(standalone)* |
-| `symbolic` | `error` |
-| `tensor` | *(standalone)* |
-| `autodiff` | `error` |
-| `complex` | `error` `f64_util` (`f64_copysign`) |
-| `diffgeo` | `error` |
-| `einsum` | `tensor` |
-| `num` | `error` |
-| `ode` | `error` |
-| `optimize` | `error` |
-| `symbolic_ext` | `error`, `symbolic` |
-| `vec2` | `error` |
-| `vec3` | `error` |
-| `collision_core` | `error` |
-| `linalg_ext` | `complex` `error` `f64_util` `linalg_precision` `num` (3.3.4: `svd_golub_kahan` is the SVD fallback) |
-| `num_ext` | `error` `num` |
-| `quat` | `error` `vec3` |
-| `vec4` | `error` `vec3` |
-| `calc` | `error` `vec2` `vec3` |
-| `collision_mesh` | `collision_core` `error` `vec2` |
-| `color` | `error` `vec3` `vec4` |
-| `geo` | `error` `quat` `vec3` |
-| `mat3` | `error` `quat` `vec3` |
-| `calc_ext` | `calc` `error` `vec2` `vec3` |
-| `geo_advanced` | `error` `geo` `quat` `vec3` |
-| `geo_diff` | `error` `geo` `quat` `vec3` |
-| `linalg_precision` | `complex` `error` `f64_util` `linalg_ext` `num` (`linalg_sort_desc` orders every S / eigenvalue vector) |
-| `noise_simplex` | `calc` `error` `vec2` `vec3` |
-| `spatial` | `error` `geo` `quat` `vec3` |
-| `mat4` | `error` `quat` `vec3` `vec4` |
-| `transforms` | `error` `mat4` `quat` `vec2` `vec3` `vec4` |
-| `lie` | `complex` `error` `f64_util` `mat3` (3.2.0: `MAT3_BYTES`) `mat4` `quat` `vec3` `vec4` |
-| `lie_ext` | `complex` `error` `f64_util` `lie` `mat3` `mat4` `quat` `vec3` `vec4` |
+| `heap` | *(standalone)* |
+| `interval` | `heap` |
+| `tensor` | `heap` |
+| `symbolic` | `error` `heap` |
+| `autodiff` | `error` `heap` |
+| `complex` | `error` `f64_util` (`f64_copysign`) `heap` |
+| `diffgeo` | `error` `heap` |
+| `einsum` | `heap` `tensor` |
+| `num` | `error` `heap` |
+| `ode` | `error` `heap` |
+| `optimize` | `error` `heap` |
+| `symbolic_ext` | `error` `heap` `symbolic` |
+| `vec2` | `error` `heap` |
+| `vec3` | `error` `heap` |
+| `collision_core` | `error` `heap` |
+| `linalg_ext` | `complex` `error` `f64_util` `heap` `linalg_precision` `num` (3.3.4: `svd_golub_kahan` is the SVD fallback) |
+| `num_ext` | `error` `heap` `num` |
+| `quat` | `error` `heap` `vec3` |
+| `vec4` | `error` `heap` `vec3` |
+| `calc` | `error` `heap` `vec2` `vec3` |
+| `collision_mesh` | `collision_core` `error` `heap` `vec2` |
+| `color` | `error` `heap` `vec3` `vec4` |
+| `geo` | `error` `heap` `quat` `vec3` |
+| `mat3` | `error` `heap` `quat` `vec3` |
+| `calc_ext` | `calc` `error` `heap` `vec2` `vec3` |
+| `geo_advanced` | `error` `geo` `heap` `quat` `vec3` |
+| `geo_diff` | `error` `geo` `heap` `quat` `vec3` |
+| `linalg_precision` | `complex` `error` `f64_util` `heap` `linalg_ext` `num` (`linalg_sort_desc` orders every S / eigenvalue vector) |
+| `noise_simplex` | `calc` `error` `heap` `vec2` `vec3` |
+| `spatial` | `error` `geo` `heap` `quat` `vec3` |
+| `mat4` | `error` `heap` `quat` `vec3` `vec4` |
+| `transforms` | `error` `heap` `mat4` `quat` `vec2` `vec3` `vec4` |
+| `lie` | `complex` `error` `f64_util` `heap` `mat3` (3.2.0: `MAT3_BYTES`) `mat4` `quat` `vec3` `vec4` |
+| `lie_ext` | `complex` `error` `f64_util` `heap` `lie` `mat3` `mat4` `quat` `vec3` `vec4` |
 
-**Shape of the graph.** Five modules are fully standalone (`error`, `f64_util`, `interval`,
-`symbolic`, `tensor`); the deepest is `lie_ext` at 9. Every edge but one runs from a derived module
+**Shape of the graph.** Three modules are fully standalone (`error`, `f64_util`, `heap`; through
+3.4.1 `interval`, `symbolic` and `tensor` were too, before `heap` took every allocation); the deepest
+is `lie_ext` at 10. Every edge but one runs from a derived module
 to its base, which is the layering the module *names* already declare. The exception, since 3.3.4,
 is `linalg_ext`→`linalg_precision` (`svd_golub_kahan`, the SVD fallback). With
 `linalg_precision`→`linalg_ext` (`linalg_sort_desc`) it makes the graph's **one cycle**, so the two

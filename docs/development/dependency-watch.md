@@ -18,7 +18,7 @@ token [measured: token-boundary probe on the 3.3.4 bundle, 2026-10-03; cycc 6.6.
 | expanded source | 25,165,824 B (24 MiB) | `src/frontend/lex/pp/pass.cyr:736` (`op > 25165824`; also `:1138`, `:1218`, and the read limits at `:643` and `:1083`) |
 | tokens | 4,194,304 | `src/frontend/lex/lex.cyr:287` (`tc >= 4194304`) |
 
-The bundle is 3,660,265 B at 3.4.1 (2,640,509 B at 3.4.0, 2,103,516 B at 3.3.7, 1,965,162 B at 3.3.6, 1,767,547 B at 3.3.5, 1,608,855 B at 3.3.4, 1,400,631 B at 3.3.3, 1,157,699 B at 3.3.2), 10.49% of the byte cap raw, so there is no size pressure. Before
+The bundle is 3,724,275 B at 3.4.2 (3,660,265 B at 3.4.1, 2,640,509 B at 3.4.0, 2,103,516 B at 3.3.7, 1,965,162 B at 3.3.6, 1,767,547 B at 3.3.5, 1,608,855 B at 3.3.4, 1,400,631 B at 3.3.3, 1,157,699 B at 3.3.2), 10.49% of the byte cap raw, so there is no size pressure. Before
 the [3.3.4] rows landed it expanded with its stdlib under `cyrius check --with-deps` to 2,048,462 B (8.14% of the byte cap) and 212,094
 tokens (5.06% of the token cap) [measured: boundary probes, 2026-10-03; cycc 6.6.14]. A third limit
 with the same value fires first for a top-level file: the raw read buffer `_SRC_CAP` (`src/main.cyr`'s
@@ -47,7 +47,15 @@ closed on the 6.6.14 bump.
 - 6.0.2: lockfile/vendoring fix — `cyrius deps` now hashes all `.cyr` under `lib/` and writes a real lock (the empty 0-byte `cyrius.lock` bug present since 5.11.8); vendored deps are regular file-copies, not the dangling symlinks that broke CI.
 - **6.0.14**: clean build/test (901/901 as of v2.4.6). Migration was manifest-only (pin bump + sakshi resolution); the 34 math modules moved `lib/`→`src/` so the committed `lib/` no longer shadows the toolchain's version-pinned stdlib snapshot.
 - **6.2.11** (v2.6.6): stdlib math reorg. The transcendentals (`f64_acos`/`f64_asin`/`f64_atan2`/`f64_pow`/`f64_sinh`/`f64_cosh`/`f64_tanh` + hyperbolic inverses) moved out of `math` into the new **`ganita`** module, which also subsumes `matrix`/`linalg` (re-exports their full API). `math` now ships NaN-correct `f64_le`/`f64_ge` (hisab dropped its local copies). `[deps] stdlib`: `+ganita`, `−matrix`, `−linalg`. Clean build, 957/957 tests, all gates green. Tracked-issue re-verify: **3 of 5 fixed** (modules-substring, 18-arg-fn scramble, lint rc-as-count → all archived); for-empty-clauses still open. Vendored `lib/` re-resolved via `cyrius deps` (30 files — **not** the full-snapshot `cyrius lib sync`, which over-vendors unused platform variants and breaks `deps --verify` on a spurious `process_agnos.cyr` entry); `cyrius.lock` 30 deps, verify 30/30.
-- **6.7.18** (current pin, v3.4.1; crossed 6.7.10–6.7.17): **the newest cyrius; it folds the newest
+- **v3.4.2, no pin move: sakshi is a stdlib leaf, not a package.** `[deps.sakshi]` (git, tag 2.5.10)
+  became `"sakshi"` in `[deps] stdlib`. Nothing in hisab calls it, and the package made every consumer
+  that also uses the leaf resolve with "refusing to overwrite stdlib leaf 'sakshi'" (ushma's filing). The
+  vendored `lib/sakshi.cyr` is the same bytes: sha256 `8a819554…`, the 6.7.18 tag's and sakshi 2.5.10's
+  `dist/`. All 33 `lib/` files byte-match the 6.7.18 tag. `cyrius deps --relock` kept the old commit row,
+  and regenerating the lock dropped it (33 deps, none commit-pinned). `deps --verify` passes 33/33.
+  `dist/hisab.deps` names 9 leaves (`fnptr` and `string` added).
+  [measured: cmp of every lib/*.cyr against the 6.7.18 tag, cyrius deps --verify, the issue's paired repro, 2026-11-14]
+- **6.7.18** (current pin since v3.4.1; crossed 6.7.10–6.7.17): **the newest cyrius; it folds the newest
   ganita (1.2.15, unchanged) and sakshi (2.5.10).**
   - **Stdlib.** `cyrius lib sync` copies 29 files (its first run refused to write while the lock
     recorded 6.7.9; the second synced and re-locked). 22 vendored files move (`alloc`, `alloc_cx`,

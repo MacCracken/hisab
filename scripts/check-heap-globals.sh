@@ -46,6 +46,15 @@
 # calls, module by module", calls every module's public entries after a reset over a filled heap,
 # and sets the collision queries' kept pointers to an address nothing maps between queries.
 #
+# THE SCOPE RULE (3.4.2). hisab_alloc_scope (src/heap.cyr) routes every allocation hisab makes
+# to the caller's Allocator, and it can only do that for allocations that go through
+# hisab_alloc / hisab_vec_new / hisab_allocator(). So outside src/heap.cyr no fn in src/ may call
+# a stdlib fn that takes the global heap: one in the alloc closure over lib/ (alloc, vec_new,
+# default_alloc, str_from, str_from_buf, ...). An allocator-taking stdlib fn (vec_push_a,
+# str_from_a, str_builder_new_a, ...: a name ending `_a`) is allowed when its first argument is
+# `hisab_allocator()` or a local assigned from it in the same fn. SCOPE_EXEMPT names the calls
+# the scope cannot reach and why (ganita's matrix routines allocate inside ganita).
+#
 # USAGE
 #   scripts/check-heap-globals.sh             check src/; exit 1 on anything unexplained
 #   scripts/check-heap-globals.sh --census    every global written at run time, with its verdict
@@ -187,6 +196,20 @@ ALLOW = {
     "_GA_TETRA_LMAX": {"why": _NUM + "a double, read back from the query's memo.", "sites": ["_epa_seed_portal"]},
     "_GA_TETRA_NAN": {"why": _NUM + "a flag, read back from the query's memo.", "sites": ["_epa_seed_portal"]},
     "_einsum_top": {"why": _NUM + "a byte count into the static _EINSUM_SCRATCH.", "sites": ["_einsum_take"]},
+    # 3.4.2, the allocation scope (src/heap.cyr). Kept across calls by design: it is the caller's
+    # Allocator, stored at the caller's request and never allocated by hisab.
+    "_hsb_al": {"why": "the caller's Allocator handle, the scope hisab_alloc_scope(al) was given: hisab never "
+                       "allocates it and never frees it. Its lifetime is the caller's, and the scope's contract "
+                       "(heap.cyr) is that al stays valid while it is the scope: a caller that alloc_reset()s "
+                       "or frees the memory holding al while it is in scope breaks that contract, as it would "
+                       "free any value it still uses. hisab_alloc_scope(0) clears it.",
+                "sites": ["hisab_alloc_scope"],
+                "readers": ["hisab_alloc_scope", "hisab_alloc_scope_current", "_hsb_scoped"]},
+    "_hsb_vt": {"why": "a static vtable: four code addresses and, in slot 4, the same caller's Allocator as "
+                       "_hsb_al, written together by hisab_alloc_scope; reached only through hisab_allocator() "
+                       "while _hsb_afp is _hsb_scope_vt, which hisab_alloc_scope sets with it and resets to "
+                       "default_alloc when the scope is 0.",
+                "sites": ["hisab_alloc_scope"]},
 }
 
 # The population floors: a scan that reaches little reports little. They sit under the 3.4.1
@@ -338,7 +361,11 @@ def analyse(src_files, lib_files):
                 s |= calls_of(d['body'])
     # alloc_via and realloc_via reach the allocator through its vtable, an indirect call: vec_new
     # and every str_* go that way, and a closure seeded on alloc alone misses them.
-    reach = {'alloc', 'alloc_via', 'realloc_via'}
+    # hisab_alloc and hisab_vec_new (src/heap.cyr, 3.4.2) reach alloc, or the scope's allocator,
+    # through a function pointer hisab_alloc_scope swaps (fncall1(_hsb_fp, n)): the same blind spot.
+    # Seeded on the first three alone the closure fell from 912 fns to 240, under the floor, and the
+    # writes of _CGA_NULL_TBL, _CGA_SC_I/J and _GA_EPA_PROVEN read as stale.
+    reach = {'alloc', 'alloc_via', 'realloc_via', 'hisab_alloc', 'hisab_vec_new'}
     grew = True
     while grew:
         grew = False
@@ -644,7 +671,70 @@ def check(ix, allow, floors=True, quiet=False):
               "%d allowlisted ===" % (len(ix['globs']), len(writes), nw, len(ix['reach']), len(allow)))
     return bad
 
+# The stdlib calls the allocation scope cannot route (src/heap.cyr names the eight public fns
+# that reach them). Each must still be called somewhere: a stale entry fails.
+SCOPE_EXEMPT = {
+    "ganita_mat_new": "ganita's matrix: ganita lays it out and allocates it, inside ganita",
+    "ganita_mat_copy": "a ganita matrix, allocated inside ganita",
+    "ganita_mat_svd": "ganita's SVD allocates its working set inside ganita",
+    "ganita_mat_lu_solve": "ganita's LU solve allocates its working set inside ganita",
+}
+
+def scope_check(ix, lib_names, exempt=SCOPE_EXEMPT, scope_file="heap.cyr"):
+    """The scope rule's verdict lines: a direct call of a global-heap stdlib fn outside heap.cyr."""
+    bad, seen = [], set()
+    deny = (set(ix['reach']) & lib_names) | {'default_alloc'}
+    for n, ds in ix['fns'].items():
+        for d in ds:
+            if os.path.basename(d['file']) == scope_file:
+                continue
+            body = d['body']
+            for m in CALL.finditer(body):
+                c = m.group(1)
+                if c not in deny or c in KEYWORDS:
+                    continue
+                line = d['first'] + body.count('\n', 0, m.start())
+                if c in exempt:
+                    seen.add(c)
+                    continue
+                if c.endswith('_a'):
+                    lp = m.end() - 1
+                    rp = closes(body, lp, '(', ')')
+                    args, dep, cur = [], 0, ''
+                    for ch in body[lp + 1:rp]:
+                        if ch in '([':
+                            dep += 1
+                        elif ch in ')]':
+                            dep -= 1
+                        if ch == ',' and dep == 0:
+                            args.append(cur.strip())
+                            cur = ''
+                        else:
+                            cur += ch
+                    args.append(cur.strip())
+                    a0 = args[0] if args else ''
+                    if re.fullmatch(r'hisab_allocator\(\s*\)', a0):
+                        continue
+                    if re.fullmatch(NAME, a0) and re.search(r'(?<![A-Za-z0-9_])' + a0 + r'\s*=\s*hisab_allocator\(\s*\)',
+                                                            body):
+                        continue
+                    bad.append("%s:%d  %s(%s, ...) in %s: an allocator-taking call not given hisab_allocator(), "
+                               "so the allocation scope cannot reach it" % (d['file'], line, c, a0[:30], n))
+                    continue
+                bad.append("%s:%d  %s(...) in %s: takes the global heap, which the allocation scope cannot "
+                           "reach; call hisab_alloc / hisab_vec_new / an _a form with hisab_allocator(), or "
+                           "name it in SCOPE_EXEMPT with why" % (d['file'], line, c, n))
+    for c in sorted(set(exempt) - seen):
+        bad.append("SCOPE_EXEMPT %s: no fn in src/ calls it now: a stale entry" % c)
+    return bad
+
 LIBS = sorted(glob.glob("lib/*.cyr"))
+
+def lib_fn_names(libs):
+    names = {}
+    for f in libs:
+        parse(f, names, {}, [])
+    return set(names)
 
 if mode == "--selftest":
     # Each planted global names its verdict: *_bad must be flagged, *_ok must not be.
@@ -900,6 +990,36 @@ public fn _attr_public() { y_bad = alloc(8); return 0; }
                   floors=False, quiet=True)
         if r:
             fails.append("a &fn handed to the guard is the guard's: %s" % r)
+        # The scope rule: each *_bad call is reported, each *_ok one is not, and a stale exemption is.
+        sp = os.path.join(d, "scope_plant.cyr")
+        with open(sp, "w") as fh:
+            fh.write('''
+fn sc_alloc_bad() { return alloc(8); }
+fn sc_vecnew_bad() { return vec_new(); }
+fn sc_default_bad() { var al = default_alloc(); return al; }
+fn sc_strfrom_bad() { return str_from("x"); }
+fn sc_push_bad(v) { return vec_push_a(default_alloc(), v, 1); }
+fn sc_pushloc_bad(v, al) { return vec_push_a(al, v, 1); }
+fn sc_ok(v) { return vec_push_a(hisab_allocator(), v, 1); }
+fn sc_okloc(v) { var al = hisab_allocator(); return vec_push_a(al, v, 1); }
+fn sc_oknew() { return hisab_alloc(8); }
+fn sc_okexempt() { return ganita_mat_new(2, 2); }
+fn sc_okcomment() { # alloc(8) in a comment
+    return "vec_new() in a string"; }
+''')
+        six = analyse([sp], LIBS)
+        r = scope_check(six, lib_fn_names(LIBS), exempt={"ganita_mat_new": "x", "ganita_mat_stale": "y"})
+        for nm in ("sc_alloc_bad", "sc_vecnew_bad", "sc_default_bad", "sc_strfrom_bad", "sc_push_bad",
+                   "sc_pushloc_bad"):
+            if not any((" in %s:" % nm) in x for x in r):
+                fails.append("scope rule: %s not reported" % nm)
+        for nm in ("sc_ok", "sc_okloc", "sc_oknew", "sc_okexempt", "sc_okcomment"):
+            if any((" in %s:" % nm) in x for x in r):
+                fails.append("scope rule: %s reported" % nm)
+        if not any("ganita_mat_stale" in x for x in r):
+            fails.append("scope rule: a stale exemption passed")
+        if any("ganita_mat_new" in x for x in r):
+            fails.append("scope rule: a live exemption was reported stale")
         # The floor: a scan that reaches nothing must not pass.
         empty = os.path.join(d, "empty.cyr")
         with open(empty, "w") as fh:
@@ -935,6 +1055,15 @@ if mode == "--census":
         print("%-22s %-22s %s" % (g, verdict, ", ".join(sorted(set(w[1] for w in ws)))[:100]))
     sys.exit(0)
 bad = check(ix, ALLOW)
+sbad = scope_check(ix, lib_fn_names(LIBS))
+print("=== the scope rule: %d calls exempt (%s) ===" % (len(SCOPE_EXEMPT), ", ".join(sorted(SCOPE_EXEMPT))))
+if sbad:
+    print()
+    print("!! %d allocation(s) outside the scope" % len(sbad))
+    for x in sbad:
+        print("  " + x)
+    print("Every allocation hisab makes goes through src/heap.cyr, so a caller's scope can contain it.")
+    sys.exit(1)
 if bad:
     print()
     print("!! %d problem(s)" % len(bad))

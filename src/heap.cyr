@@ -1,0 +1,155 @@
+# heap.cyr -- the allocation scope: where every allocation hisab makes goes (3.4.2)
+# Usage: shipped inside dist/hisab.cyr; in-tree, include "src/heap.cyr" after what it requires
+# Requires: no other hisab module (stdlib resolves via cyrius.cyml [deps])
+#
+# hisab returns fresh values (every HVec3, HQuat, matrix and vec result) and builds its working
+# sets on the heap. Through 3.4.1 all of it came from `alloc`, the stdlib's global bump heap,
+# which has no free, and a caller cannot reclaim it either: `alloc_reset()` frees the caller's
+# own live blocks too. So a consumer that calls hisab once per frame, step or request grew the
+# heap without bound: 24 B a `hvec3_add`, 105,920 B a `gjk_epa_3d` on two spheres, about 10 MB
+# a step for 100 touching pairs (issue 2026-11-09-allocator-scoped-calls, impetus H9, pravash).
+# [measured: docs/development/issues/archived/2026-11-09-allocator-scoped-calls-repro.cyr, on 3.4.1]
+#
+# ⭐ THE SCOPE. `hisab_alloc_scope(al)` routes every allocation hisab's own code makes, until
+# the next call, to the Allocator `al` (lib/alloc.cyr's vtable: `arena_allocator_growable(n)`,
+# `arena_allocator(n)`, or any `allocator_new`), and `hisab_alloc_scope(0)` routes them back to
+# the global heap. It returns the scope it replaced, so scopes nest. A per-step consumer:
+#
+#     var step = arena_allocator_growable(1 << 20);   # once
+#     ...
+#     var prev = hisab_alloc_scope(step);             # every step
+#     ... hisab calls ...
+#     hisab_alloc_scope(prev);
+#     ... copy out what the step keeps ...
+#     reset_via(step);                                # the step's hisab memory, all of it
+#
+# A growable arena keeps its chunks across `reset_via`, so after the first steps a step
+# allocates nothing new from the global heap (tests/modules_c.tcyr, group "3.4.2: the
+# allocation scope").
+#
+# WHAT IT COVERS: every `alloc` site in src/ (hisab_alloc), every vec hisab creates or grows
+# (hisab_vec_new, vec_push_a(hisab_allocator(), ...)), and every Str the symbolic modules
+# build. WHAT IT DOES NOT: memory ganita's own routines take (`ganita_mat_new`,
+# `ganita_mat_copy`, `ganita_mat_svd` and `ganita_mat_lu_solve` allocate with `alloc` inside
+# ganita, and ganita's matrix is ganita's to lay out). Eight public functions reach them and
+# still take global heap under a scope, and the ganita matrices they return live there:
+# `inertia_box`, `inertia_sphere`, `mat_new_guarded`, `svd_compute_checked`, `svd_truncated`
+# (linalg_ext), `eigen_qr`, `svd_golub_kahan` (linalg_precision) and
+# `opt_levenberg_marquardt` (optimize). Nothing else in hisab calls an allocating stdlib
+# function; scripts/check-heap-globals.sh refuses a new direct one. And memory a callback of
+# the caller's allocates (a GJK support function, an ODE right-hand side) is the caller's:
+# under a scope, its own `hvec3_*` calls are scoped, its own `alloc` calls are not.
+# Of tests/hisab.bcyr's 375 calls, each run under a scope, 364 took 0 B of global heap, 9 reached
+# the eight above and 2 allocate in the benchmark function itself.
+# [measured: scratch sweep, tests/hisab.bcyr with bench() replaced by a scope check, 2026-11-14]
+#
+# ⚠ WHAT A RESET INVALIDATES: every value hisab returned under the scope, and every structure
+# hisab GREW under it. A spatial hash, k-d tree, octree, BVH, tape or vec created outside the
+# scope and inserted into inside it keeps its new storage in the scope's allocator, so the
+# reset leaves it pointing at reused memory. Build and grow long-lived structures outside a
+# scope you reset (or in a scope of their own), and copy out the values a step keeps. The same
+# contract as `alloc_reset()`, narrowed to what hisab allocated while the scope was set.
+# ⚠ ONE SCOPE PER PROCESS, as hisab's module state is: a scope set on one thread is the scope
+# of every thread's hisab calls. Do not set or reset a scope from inside a callback hisab is
+# running (a support function, an operator): the call's earlier allocations came from the
+# scope it started with.
+#
+# EVERY ALLOCATION READS AS `alloc`'s DID: n > 0 bytes, zeroed (alloc hands out fresh or
+# reset-zeroed memory, and hisab code relies on it, so memory from the scope's allocator is
+# zeroed here, n bytes, as an arena does not zero what it re-issues); 0 for n <= 0, for
+# n > ALLOC_MAX, and when the allocator refuses, which every hisab function already answers
+# with its designed failure (3.4.1's refused-allocation work). The default path, no scope,
+# is `alloc` itself.
+
+var _hsb_al = 0;   # the caller's Allocator in scope, or 0: the global bump heap
+
+# ⚡ THE DEFAULT PATH IS A CALL OF `alloc` THROUGH A POINTER, inlined. `#inline` refuses a body with
+# control flow, so hisab_alloc cannot test the scope and stay inlined. The first form (a test, then
+# alloc) cost every allocating call an extra frame: vec3_add 17 -> 25 ns, quat_rotate_vec3 52 -> 62,
+# m3_mul_vec3 41 -> 46, over the 375 rows a median +2.1%. Instead hisab_alloc_scope swaps these two
+# pointers, and hisab_alloc / hisab_allocator are one indirect call each, at the caller.
+# [measured: scratch A/B, tests/hisab.bcyr, 3.4.1 tag and the first 3.4.2 form, 3 runs each interleaved, 2026-11-14]
+var _hsb_fp = &alloc;           # the allocation: alloc, or _hsb_scoped under a scope
+var _hsb_afp = &default_alloc;  # the Allocator getter: default_alloc, or _hsb_scope_vt under a scope
+
+# The scope's vtable for the stdlib's allocator-taking calls (vec_new_a, vec_push_a,
+# str_from_a, str_builder_*_a): the caller's allocator, its allocations zeroed. Static
+# storage, never the heap: alloc_reset() would scrub a vtable allocated there (the stdlib
+# keeps default_alloc()'s in static storage for the same reason). Slot 4, the state, is the
+# caller's allocator; the four functions read it from their state argument.
+var _hsb_vt: i64[5];
+
+# Zero n bytes at p: whole words, then the bytes left.
+fn _hsb_zero(p, n) {
+    var w = n / 8;
+    for (var i = 0; i < w; i = i + 1) { store64(p + i * 8, 0); }
+    for (var j = w * 8; j < n; j = j + 1) { store8(p + j, 0); }
+    return 0;
+}
+
+# The scope's alloc: n bytes of the caller's allocator al, zeroed; 0 as alloc gives it.
+fn _hsb_zalloc(al, n) {
+    if (n <= 0 || n > ALLOC_MAX) { return 0; }
+    var p = alloc_via(al, n);
+    if (p != 0) { _hsb_zero(p, n); }
+    return p;
+}
+
+# The scope's realloc: the caller's, the grown tail zeroed.
+fn _hsb_zrealloc(al, old_ptr, old_size, new_size) {
+    if (new_size <= 0 || new_size > ALLOC_MAX) { return 0; }
+    var p = realloc_via(al, old_ptr, old_size, new_size);
+    if (p != 0 && new_size > old_size) { _hsb_zero(p + old_size, new_size - old_size); }
+    return p;
+}
+
+# The scope's free and reset: the caller's own.
+fn _hsb_free(al, ptr) { return free_via(al, ptr); }
+fn _hsb_reset(al) { return reset_via(al); }
+
+# hisab_alloc's target under a scope, and hisab_allocator's.
+fn _hsb_scoped(n) { return _hsb_zalloc(_hsb_al, n); }
+fn _hsb_scope_vt() { return &_hsb_vt; }
+
+# Route every allocation hisab makes from now on to the Allocator al (lib/alloc.cyr's
+# vtable), or, for al = 0, to the global bump heap, as through 3.4.1. Returns the scope it
+# replaces (an Allocator, or 0), so a caller restores it: `var prev = hisab_alloc_scope(al);
+# ...; hisab_alloc_scope(prev);`. See the block above for what the scope covers and what a
+# reset of al invalidates. al is not called here, only stored; it must stay valid while it
+# is the scope.
+public fn hisab_alloc_scope(al) {
+    var prev = _hsb_al;
+    if (al != 0) {
+        var vt = &_hsb_vt;
+        store64(vt, &_hsb_zalloc);
+        store64(vt + 8, &_hsb_zrealloc);
+        store64(vt + 16, &_hsb_free);
+        store64(vt + 24, &_hsb_reset);
+        store64(vt + 32, al);
+        _hsb_fp = &_hsb_scoped;
+        _hsb_afp = &_hsb_scope_vt;
+    } else {
+        _hsb_fp = &alloc;
+        _hsb_afp = &default_alloc;
+    }
+    _hsb_al = al;
+    return prev;
+}
+
+# The Allocator in scope, or 0 when hisab allocates from the global bump heap.
+public fn hisab_alloc_scope_current() { return _hsb_al; }
+
+# n bytes for hisab: `alloc(n)` with no scope; with one, n bytes of the scope's allocator,
+# zeroed, as alloc's are. 0 for n <= 0, n > ALLOC_MAX and a refusal. Every allocation in
+# hisab's source goes through this.
+#inline
+public fn hisab_alloc(n) { return fncall1(_hsb_fp, n); }
+
+# The Allocator hisab hands the stdlib's allocator-taking calls: default_alloc(), the global
+# bump, with no scope; with one, the scope's (its allocations zeroed).
+#inline
+public fn hisab_allocator() { return fncall0(_hsb_afp); }
+
+# A new empty vec (vec_new's), its header and buffer from hisab_allocator(); 0 when refused.
+#inline
+public fn hisab_vec_new() { return vec_new_a(fncall0(_hsb_afp)); }

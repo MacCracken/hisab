@@ -9,6 +9,7 @@
 
 include "src/f64_util.cyr"
 include "src/error.cyr"
+include "src/heap.cyr"
 include "src/vec2.cyr"
 include "src/vec3.cyr"
 include "src/vec4.cyr"
@@ -11903,6 +11904,1031 @@ assert_eq((_i6_bits >> 4) & 1, 0, "alloc_reset: hull, triangulation and Delaunay
 assert_eq((_i6_bits >> 5) & 1, 0, "alloc_reset: the five collision entries right, the pattern intact");
 assert_eq((_i6_bits >> 6) & 1, 1, "alloc_reset: control, a pointer kept and read is caught by its answer");
 assert_eq((_i6_bits >> 7) & 1, 1, "alloc_reset: control, a pointer kept and written through is caught by the pattern");
+
+# ================================================================
+# 3.4.2: spatial hash queries into caller storage, and one radius order on every plan
+# ================================================================
+# Issue 2026-11-11-spatial-hash-per-step-rebuild-allocates (pravash P2, L4): a per-step
+# neighbour search leaked 152 B per spatial_hash_query_cell; the radius query's flat scan
+# answered in insertion order where the cell walk answers in cell order.
+test_group("3.4.2: spatial hash queries into caller storage, one radius order on every plan");
+var _s42_seed = 0x2545F4914F6CDD1D;
+fn _s42_rand(m) {
+    _s42_seed = _s42_seed * 6364136223846793005 + 1442695040888963407;
+    var r = (_s42_seed >> 33) % m;
+    return r;
+}
+# A coordinate in [0, 6) on a 0.001 grid (cell size 1: six cells per axis).
+fn _s42_coord() { return f64_mul(f64_from(_s42_rand(6000)), 0x3F50624DD2F1A9FC); }
+var _s42_np = 90;
+var _s42_pts = alloc(_s42_np * 8);
+var _s42_sh = spatial_hash_new(F64_ONE);
+for (var i = 0; i < _s42_np; i = i + 1) {
+    store64(_s42_pts + i * 8, hvec3_new(_s42_coord(), _s42_coord(), _s42_coord()));
+    spatial_hash_insert(_s42_sh, load64(_s42_pts + i * 8), 1000 + i);
+}
+# The cell walk's order by brute force: for each cell of the block, x outermost, every point
+# in insertion order whose cell it is. data = 1000 + insertion index.
+fn _s42_ref(pt, radius, out) {
+    var inv = _sh_inv_cell_size(_s42_sh);
+    var lox = _sh_cell_coord(f64_sub(HVec3_x(pt), radius), inv);
+    var hix = _sh_cell_coord(f64_add(HVec3_x(pt), radius), inv);
+    var loy = _sh_cell_coord(f64_sub(HVec3_y(pt), radius), inv);
+    var hiy = _sh_cell_coord(f64_add(HVec3_y(pt), radius), inv);
+    var loz = _sh_cell_coord(f64_sub(HVec3_z(pt), radius), inv);
+    var hiz = _sh_cell_coord(f64_add(HVec3_z(pt), radius), inv);
+    var n = 0;
+    for (var cx = lox; cx <= hix; cx = cx + 1) {
+        for (var cy = loy; cy <= hiy; cy = cy + 1) {
+            for (var cz = loz; cz <= hiz; cz = cz + 1) {
+                for (var i = 0; i < _s42_np; i = i + 1) {
+                    var q = load64(_s42_pts + i * 8);
+                    if (_sh_cell_coord(HVec3_x(q), inv) == cx && _sh_cell_coord(HVec3_y(q), inv) == cy
+                      && _sh_cell_coord(HVec3_z(q), inv) == cz) {
+                        store64(out + n * 8, 1000 + i);
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+    }
+    return n;
+}
+# 1 when vec v holds exactly ref[0 .. n), in order.
+fn _s42_same(v, ref, n) {
+    if (v == 0) { return 0; }
+    if (vec_len(v) != n) { return 0; }
+    for (var i = 0; i < n; i = i + 1) {
+        if (vec_get(v, i) != load64(ref + i * 8)) { return 0; }
+    }
+    return 1;
+}
+var _s42_ref_buf = alloc(_s42_np * 8);
+var _s42_out = alloc((_s42_np + 8) * 8);
+var _s42_c = hvec3_new(0x4006000000000000, 0x4004000000000000, 0x4008000000000000);   # (2.75, 2.5, 3)
+# radius 1: the block is 3 x 3 x 3 = 27 cells < 90 entries, the cell walk; radius 2.5: 6^3
+# = 216 > 90, the flat scan; radius 40: 81^3 (a flat scan over a block wider than the data).
+var _s42_n1 = _s42_ref(_s42_c, F64_ONE, _s42_ref_buf);
+assert_eq(_s42_same(spatial_hash_query_radius(_s42_sh, _s42_c, F64_ONE), _s42_ref_buf, _s42_n1), 1,
+  "3.4.2 radius order: the cell walk (27 cells, 90 entries) answers in cell order");
+assert_eq(_s42_n1 > 3, 1, "3.4.2 radius order: the walk's fixture holds candidates");
+var _s42_n2 = _s42_ref(_s42_c, 0x4004000000000000, _s42_ref_buf);
+assert_eq(_s42_same(spatial_hash_query_radius(_s42_sh, _s42_c, 0x4004000000000000), _s42_ref_buf, _s42_n2), 1,
+  "3.4.2 radius order: the flat scan (216 cells, 90 entries) answers in the walk's order (3.4.1: insertion order)");
+# The fixture discriminates: insertion order is not the cell order on this block.
+var _s42_ins = 1;
+for (var i = 1; i < _s42_n2; i = i + 1) {
+    if (load64(_s42_ref_buf + i * 8) < load64(_s42_ref_buf + (i - 1) * 8)) { _s42_ins = 0; }
+}
+assert_eq(_s42_ins, 0, "3.4.2 radius order: control, the scan's candidates are not in insertion order");
+var _s42_n3 = _s42_ref(_s42_c, 0x4044000000000000, _s42_ref_buf);
+assert_eq(_s42_n3, _s42_np, "3.4.2 radius order: radius 40 reaches every point");
+assert_eq(_s42_same(spatial_hash_query_radius(_s42_sh, _s42_c, 0x4044000000000000), _s42_ref_buf, _s42_n3), 1,
+  "3.4.2 radius order: a block wider than the data (81^3 cells) answers in cell order");
+assert_eq(_s42_same(spatial_hash_query_radius(_s42_sh, _s42_c, F64_POS_INF), _s42_ref_buf, _s42_n3), 1,
+  "3.4.2 radius order: radius +Inf answers every entry in cell order (3.4.1: insertion order)");
+
+# The _into forms: the allocating query's sequence, its first cap where cap is short, the
+# count either way, and nothing written at or past cap.
+fn _s42_into_ok(pt, radius) {
+    var v = spatial_hash_query_radius(_s42_sh, pt, radius);
+    var n = vec_len(v);
+    var caps: i64[5];
+    store64(&caps, 0);
+    store64(&caps + 8, 1);
+    store64(&caps + 16, n / 2);
+    store64(&caps + 24, n);
+    store64(&caps + 32, n + 3);
+    for (var k = 0; k < 5; k = k + 1) {
+        var cap = load64(&caps + k * 8);
+        for (var i = 0; i < _s42_np + 8; i = i + 1) { store64(_s42_out + i * 8, 0x5A5A); }
+        var got = spatial_hash_query_radius_into(_s42_sh, pt, radius, _s42_out, cap);
+        if (got != n) { return 0; }
+        var w = cap;
+        if (n < w) { w = n; }
+        for (var i = 0; i < w; i = i + 1) {
+            if (load64(_s42_out + i * 8) != vec_get(v, i)) { return 0; }
+        }
+        for (var i = w; i < _s42_np + 8; i = i + 1) {
+            if (load64(_s42_out + i * 8) != 0x5A5A) { return 0; }
+        }
+    }
+    return 1;
+}
+assert_eq(_s42_into_ok(_s42_c, F64_ONE), 1,
+  "3.4.2 radius_into: the cell walk's sequence, count and caps 0, 1, n/2, n, n+3");
+assert_eq(_s42_into_ok(_s42_c, 0x4004000000000000), 1, "3.4.2 radius_into: the flat scan's sequence at every cap");
+assert_eq(_s42_into_ok(_s42_c, 0x4044000000000000), 1, "3.4.2 radius_into: the wide block's sequence at every cap");
+assert_eq(_s42_into_ok(_s42_c, F64_POS_INF), 1, "3.4.2 radius_into: radius +Inf's sequence at every cap");
+var _s42_sweep = 0;
+for (var k = 0; k < 40; k = k + 1) {
+    var sp = hvec3_new(_s42_coord(), _s42_coord(), _s42_coord());
+    var rr = f64_mul(f64_from(_s42_rand(3000)), 0x3F50624DD2F1A9FC);   # [0, 3)
+    if (_s42_into_ok(sp, rr) == 0) { _s42_sweep = _s42_sweep + 1; }
+    var rn = _s42_ref(sp, rr, _s42_ref_buf);
+    if (_s42_same(spatial_hash_query_radius(_s42_sh, sp, rr), _s42_ref_buf, rn) == 0) { _s42_sweep = _s42_sweep + 1; }
+}
+assert_eq(_s42_sweep, 0,
+  "3.4.2 radius order: 40 random centres and radii in [0, 3), both forms against the brute force");
+
+# The integer keys' guards: matched cells spanning 2^19 cells on every axis with 130 entries
+# (box cells times entries passes 2^63) and spanning 2^25 (the box's cell count passes i64)
+# take the comparator, and both answer the (cell, insertion) order of an explicit sort.
+fn _s42_wide_ok(side) {
+    var sh = spatial_hash_new(F64_ONE);
+    var np = 130;
+    var cells = alloc(np * 4 * 8);
+    var inv = _sh_inv_cell_size(sh);
+    var third = f64_from(side / 2);
+    var top = f64_from(side - 1);
+    for (var i = 0; i < np; i = i + 1) {
+        var px = 0; var py = 0; var pz = 0;
+        if (i % 3 == 1) { px = third; } elif (i % 3 == 2) { px = top; }
+        if ((i / 3) % 3 == 1) { py = third; } elif ((i / 3) % 3 == 2) { py = top; }
+        if ((i / 9) % 3 == 1) { pz = third; } elif ((i / 9) % 3 == 2) { pz = top; }
+        spatial_hash_insert(sh, hvec3_new(px, py, pz), 500 + i);
+        store64(cells + i * 32, _sh_cell_coord(px, inv));
+        store64(cells + i * 32 + 8, _sh_cell_coord(py, inv));
+        store64(cells + i * 32 + 16, _sh_cell_coord(pz, inv));
+        store64(cells + i * 32 + 24, i);
+    }
+    # Selection sort of the (ix, iy, iz, i) records.
+    for (var a = 0; a < np; a = a + 1) {
+        var best = a;
+        for (var b = a + 1; b < np; b = b + 1) {
+            var less = 0;
+            var decided = 0;
+            for (var w = 0; w < 4; w = w + 1) {
+                if (decided == 0) {
+                    var x1 = load64(cells + b * 32 + w * 8);
+                    var x2 = load64(cells + best * 32 + w * 8);
+                    if (x1 < x2) { less = 1; decided = 1; }
+                    if (x1 > x2) { decided = 1; }
+                }
+            }
+            if (less == 1) { best = b; }
+        }
+        for (var w = 0; w < 4; w = w + 1) {
+            var t = load64(cells + a * 32 + w * 8);
+            store64(cells + a * 32 + w * 8, load64(cells + best * 32 + w * 8));
+            store64(cells + best * 32 + w * 8, t);
+        }
+    }
+    var c = hvec3_splat(third);
+    var rad = f64_from(side);
+    var v = spatial_hash_query_radius(sh, c, rad);
+    if (v == 0 || vec_len(v) != np) { return 0; }
+    var out = alloc((np + 2) * 8);
+    if (spatial_hash_query_radius_into(sh, c, rad, out, np) != np) { return 0; }
+    for (var i = 0; i < np; i = i + 1) {
+        var want = 500 + load64(cells + i * 32 + 24);
+        if (vec_get(v, i) != want || load64(out + i * 8) != want) { return 0; }
+    }
+    if (spatial_hash_query_radius_into(sh, c, rad, out, 7) != np) { return 0; }
+    for (var i = 0; i < 7; i = i + 1) {
+        if (load64(out + i * 8) != 500 + load64(cells + i * 32 + 24)) { return 0; }
+    }
+    return 1;
+}
+assert_eq(_s42_wide_ok(0x80000), 1,
+  "3.4.2 radius order: 130 entries over 2^19 cells an axis (keys would pass 2^63): the explicit sort's order");
+assert_eq(_s42_wide_ok(0x2000000), 1,
+  "3.4.2 radius order: 130 entries over 2^25 cells an axis (the box's cell count passes i64): the same");
+var _s42_kbox: i64[11];
+_sh_box_init(&_s42_kbox);
+store64(&_s42_kbox, 0); store64(&_s42_kbox + 8, 0); store64(&_s42_kbox + 16, 0);
+store64(&_s42_kbox + 24, 0x7FFFF); store64(&_s42_kbox + 32, 0x7FFFF); store64(&_s42_kbox + 40, 0x7FFFF);
+assert_eq(_sh_box_keyable(&_s42_kbox, 130), 0, "3.4.2 radius keys: 2^57 cells times 130 entries is not keyable");
+assert_eq(_sh_box_keyable(&_s42_kbox, 32), 1,
+  "3.4.2 radius keys: on the boundary, 2^57 cells times 32 entries (2^62) is keyable");
+assert_eq(_sh_box_keyable(&_s42_kbox, 33), 0, "3.4.2 radius keys: just past it, 2^57 cells times 33 entries is not");
+
+# The allocating flat scan's radix sort (64 matches and up) takes an n-word temporary; refused,
+# it heap-sorts the same keys in place. Under a scope that refuses after the result vec's
+# header, buffer and three growths (16 -> 128 slots), the 70 matches come back in the same
+# order as with the temporary.
+var _s42_rsh = spatial_hash_new(F64_ONE);
+for (var i = 0; i < 70; i = i + 1) {
+    spatial_hash_insert(_s42_rsh, hvec3_new(f64_from((i * 5) % 7), f64_from((i * 3) % 4), f64_from(i % 3)), 300 + i);
+}
+var _s42_rc = hvec3_new(f64_from(3), f64_from(2), F64_ONE);
+var _s42_rref = spatial_hash_query_radius(_s42_rsh, _s42_rc, 0x4024000000000000);   # 21^3 cells: the flat scan
+var _s42_ta = test_allocator();
+test_allocator_fail_after(_s42_ta, 5);
+var _s42_rp = hisab_alloc_scope(_s42_ta);
+var _s42_rgot = spatial_hash_query_radius(_s42_rsh, _s42_rc, 0x4024000000000000);
+hisab_alloc_scope(_s42_rp);
+var _s42_rsame = 1;
+if (_s42_rgot == 0 || vec_len(_s42_rgot) != 70 || vec_len(_s42_rref) != 70) { _s42_rsame = 0; }
+for (var i = 0; _s42_rsame == 1 && i < 70; i = i + 1) {
+    if (vec_get(_s42_rgot, i) != vec_get(_s42_rref, i)) { _s42_rsame = 0; }
+}
+assert_eq(_s42_rsame, 1, "3.4.2 radius order: the radix sort's temporary refused, the in-place sort gives the same 70");
+assert_eq(test_allocator_alloc_count(_s42_ta), 6,
+  "3.4.2 radius order: control, the sixth allocation (the temporary) was the refused one");
+var _s42_rins = 1;
+for (var i = 1; i < 70; i = i + 1) {
+    if (vec_get(_s42_rref, i) < vec_get(_s42_rref, i - 1)) { _s42_rins = 0; }
+}
+assert_eq(_s42_rins, 0, "3.4.2 radius order: control, the 70 are not in insertion order");
+
+# One radix pass (64 entries in 4 cells: 6 bits of insertion index, 2 of cell): the cells in
+# (x, y, z) order, each in insertion order, from the allocating query and from the _into form.
+var _s42_osh = spatial_hash_new(F64_ONE);
+for (var i = 0; i < 64; i = i + 1) {
+    spatial_hash_insert(_s42_osh, hvec3_new(f64_from(i % 2), f64_from((i / 2) % 2), 0), 700 + i);
+}
+var _s42_ov = spatial_hash_query_radius(_s42_osh, hvec3_zero(), 0x4024000000000000);
+var _s42_oo = alloc(64 * 8);
+var _s42_on = spatial_hash_query_radius_into(_s42_osh, hvec3_zero(), 0x4024000000000000, _s42_oo, 64);
+var _s42_obad = 0;
+for (var k = 0; k < 64; k = k + 1) {
+    # cell order (0,0), (0,1), (1,0), (1,1): i = 4j, 4j + 2, 4j + 1, 4j + 3
+    var cell = k / 16;
+    var j = k % 16;
+    var want = 4 * j;
+    if (cell == 1) { want = 4 * j + 2; } elif (cell == 2) { want = 4 * j + 1; } elif (cell == 3) { want = 4 * j + 3; }
+    if (vec_get(_s42_ov, k) != 700 + want || load64(_s42_oo + k * 8) != 700 + want) { _s42_obad = _s42_obad + 1; }
+}
+assert_eq(_s42_on == 64 && vec_len(_s42_ov) == 64 && _s42_obad == 0, 1,
+  "3.4.2 radius order: 64 entries in 4 cells (one radix pass), cell then insertion order, both forms");
+
+# query_cell_into: the cell's data in insertion order, the oldest first where cap is short.
+var _s42_csh = spatial_hash_new(F64_ONE);
+var _s42_cp = hvec3_new(0x3FE0000000000000, 0x3FE0000000000000, 0x3FE0000000000000);   # cell (0, 0, 0)
+for (var i = 0; i < 7; i = i + 1) {
+    spatial_hash_insert(_s42_csh, hvec3_new(0x3FD0000000000000, f64_from(i + 3), 0), 50 + i);   # other cells
+    spatial_hash_insert(_s42_csh, _s42_cp, 100 + i);
+}
+fn _s42_cell_ok(cap, want) {
+    for (var i = 0; i < 12; i = i + 1) { store64(_s42_out + i * 8, 0x5A5A); }
+    if (spatial_hash_query_cell_into(_s42_csh, _s42_cp, _s42_out, cap) != 7) { return 0; }
+    for (var i = 0; i < want; i = i + 1) {
+        if (load64(_s42_out + i * 8) != 100 + i) { return 0; }
+    }
+    for (var i = want; i < 12; i = i + 1) {
+        if (load64(_s42_out + i * 8) != 0x5A5A) { return 0; }
+    }
+    return 1;
+}
+assert_eq(_s42_cell_ok(10, 7), 1, "3.4.2 query_cell_into: count 7 and 100..106 in insertion order, nothing past them");
+assert_eq(_s42_cell_ok(7, 7), 1, "3.4.2 query_cell_into: cap = count");
+assert_eq(_s42_cell_ok(3, 3), 1, "3.4.2 query_cell_into: cap 3 of 7 takes the three oldest, 100..102");
+assert_eq(_s42_cell_ok(1, 1), 1, "3.4.2 query_cell_into: cap 1 takes the oldest");
+assert_eq(_s42_cell_ok(0, 0), 1, "3.4.2 query_cell_into: cap 0 counts and writes nothing");
+assert_eq(spatial_hash_query_cell_into(_s42_csh, _s42_cp, 0, 0), 7, "3.4.2 query_cell_into: out 0 with cap 0 counts");
+assert_eq(spatial_hash_query_cell_into(_s42_csh, hvec3_new(0x7FF8000000000000, 0, 0), _s42_out, 4), 0,
+  "3.4.2 query_cell_into: a NaN coordinate has no cell");
+assert_eq(spatial_hash_query_cell_into(0, _s42_cp, _s42_out, 4), HSB_ERR_INVALID_INPUT,
+  "3.4.2 query_cell_into: 0 handle");
+assert_eq(spatial_hash_query_cell_into(_s42_csh, 0, _s42_out, 4), HSB_ERR_INVALID_INPUT,
+  "3.4.2 query_cell_into: 0 point");
+assert_eq(spatial_hash_query_cell_into(_s42_csh, _s42_cp, _s42_out, 0 - 1), HSB_ERR_INVALID_INPUT,
+  "3.4.2 query_cell_into: cap below 0");
+assert_eq(spatial_hash_query_cell_into(_s42_csh, _s42_cp, 0, 2), HSB_ERR_INVALID_INPUT,
+  "3.4.2 query_cell_into: out 0 with cap above 0");
+assert_eq(spatial_hash_query_radius_into(0, _s42_cp, F64_ONE, _s42_out, 4), HSB_ERR_INVALID_INPUT,
+  "3.4.2 radius_into: 0 handle");
+assert_eq(spatial_hash_query_radius_into(_s42_csh, 0, F64_ONE, _s42_out, 4), HSB_ERR_INVALID_INPUT,
+  "3.4.2 radius_into: 0 point");
+assert_eq(spatial_hash_query_radius_into(_s42_csh, _s42_cp, F64_ONE, _s42_out, 0 - 1), HSB_ERR_INVALID_INPUT,
+  "3.4.2 radius_into: cap below 0");
+assert_eq(spatial_hash_query_radius_into(_s42_csh, _s42_cp, F64_ONE, 0, 2), HSB_ERR_INVALID_INPUT,
+  "3.4.2 radius_into: out 0 with cap above 0");
+assert_eq(spatial_hash_query_radius_into(_s42_csh, _s42_cp, 0x7FF8000000000000, _s42_out, 4), 0,
+  "3.4.2 radius_into: a NaN radius");
+assert_eq(spatial_hash_query_radius_into(_s42_csh, _s42_cp, 0xBFF0000000000000, _s42_out, 4), 0,
+  "3.4.2 radius_into: radius -1");
+assert_eq(spatial_hash_query_radius_into(_s42_csh, hvec3_new(0, 0x7FF8000000000000, 0), F64_ONE, _s42_out, 4), 0,
+  "3.4.2 radius_into: a NaN centre");
+# Every cell_into sequence on the random hash is query_cell's.
+var _s42_cbad = 0;
+for (var i = 0; i < _s42_np; i = i + 1) {
+    var v = spatial_hash_query_cell(_s42_sh, load64(_s42_pts + i * 8));
+    var got = spatial_hash_query_cell_into(_s42_sh, load64(_s42_pts + i * 8), _s42_out, _s42_np);
+    if (got != vec_len(v)) { _s42_cbad = _s42_cbad + 1; }
+    for (var k = 0; k < got; k = k + 1) {
+        if (load64(_s42_out + k * 8) != vec_get(v, k)) { _s42_cbad = _s42_cbad + 1; }
+    }
+}
+assert_eq(_s42_cbad, 0, "3.4.2 query_cell_into: query_cell's sequence at all 90 points");
+
+# The issue's repro, on the _into forms: an SPH-style step (clear, 1,000 inserts, 27 cell
+# queries and one radius query a particle) grows the global heap by 0 B after its first step.
+# [measured: docs/development/issues/archived/2026-11-11-spatial-hash-per-step-rebuild-allocates-repro.cyr, its step]
+var _s42_pp = 1000;
+var _s42_ppts = alloc(_s42_pp * 8);
+for (var i = 0; i < _s42_pp; i = i + 1) {
+    var px = f64_mul(f64_from(i % 10), 0x3FA999999999999A);
+    var py = f64_mul(f64_from((i / 10) % 10), 0x3FA999999999999A);
+    var pz = f64_mul(f64_from(i / 100), 0x3FA999999999999A);
+    store64(_s42_ppts + i * 8, hvec3_new(px, py, pz));
+}
+var _s42_psh = spatial_hash_new(0x3FA999999999999A);   # 0.05
+var _s42_pbuf = alloc(64 * 8);
+var _s42_grow = 0;
+var _s42_hits = 0;
+for (var s = 0; s < 4; s = s + 1) {
+    var a0 = alloc_used();
+    spatial_hash_clear(_s42_psh);
+    for (var i = 0; i < _s42_pp; i = i + 1) { spatial_hash_insert(_s42_psh, load64(_s42_ppts + i * 8), i); }
+    for (var i = 0; i < _s42_pp; i = i + 1) {
+        for (var c = 0; c < 27; c = c + 1) {
+            _s42_hits = _s42_hits + spatial_hash_query_cell_into(_s42_psh, load64(_s42_ppts + i * 8), _s42_pbuf, 64);
+        }
+        _s42_hits = _s42_hits + spatial_hash_query_radius_into(_s42_psh, load64(_s42_ppts + i * 8),
+          0x3FB999999999999A, _s42_pbuf, 64);
+    }
+    if (s > 0) { _s42_grow = _s42_grow + (alloc_used() - a0); }
+}
+assert_eq(_s42_grow, 0, "3.4.2 spatial hash: a step after the first grows the heap by 0 B (3.4.1: 4,104,000 B)");
+assert_eq(_s42_hits > 4 * 27000, 1, "3.4.2 spatial hash: control, the step's queries found their points");
+
+# ================================================================
+# 3.4.2: num_dst_into / num_idst_into: a caller-kept plan, caller scratch, num_dst's bits
+# ================================================================
+# Issue 2026-11-11-dst-allocates-per-call (pravash L6): num_dst / num_idst allocated
+# 112 B (n = 14), 10,208 B (n = 62) and 20,448 B (n = 126) a call, never returned.
+# [measured: docs/development/issues/archived/2026-11-11-dst-allocates-per-call-repro.cyr, on 3.4.1]
+test_group("3.4.2: num_dst_into / num_idst_into");
+var _d42_seed = 0x1D872B41A3F06C95;
+# A full-mantissa value in about (-1, 1).
+fn _d42_val() {
+    _d42_seed = _d42_seed * 6364136223846793005 + 1442695040888963407;
+    var bits = 0x3FF0000000000000 | ((_d42_seed >> 12) & 0xFFFFFFFFFFFFF);
+    var v = f64_sub(bits, 0x3FF8000000000000);   # [1, 2) - 1.5
+    return f64_mul(v, 0x4000000000000000);
+}
+var _d42_max = 2048;
+var _d42_a = alloc(_d42_max * 8);
+var _d42_b = alloc(_d42_max * 8);
+var _d42_pw = alloc(8);
+var _d42_sw = alloc(8);
+# Bits of num_dst (inv = 0) or num_idst (inv = 1) against the _into form on one random
+# vector of length n; 0 when every word agrees, else the count that differ (1 for a refusal).
+fn _d42_cmp(n, inv) {
+    var t1, pw = num_dst_plan_words(n);
+    var t2, sw = num_dst_scratch_words(n);
+    if (t1 != 0 || t2 != 0) { return 1; }
+    var plan = alloc(pw * 8);
+    var scratch = 0;
+    if (sw > 0) { scratch = alloc(sw * 8); }
+    var t3, z = num_dst_plan(n, plan);
+    if (t3 != 0) { return 1; }
+    for (var i = 0; i < n; i = i + 1) {
+        var v = _d42_val();
+        store64(_d42_a + i * 8, v);
+        store64(_d42_b + i * 8, v);
+    }
+    if (inv == 0) {
+        var ta, za = num_dst(_d42_a, n);
+        var tb, zb = num_dst_into(_d42_b, n, plan, scratch);
+        if (ta != 0 || tb != 0) { return 1; }
+    } else {
+        var tc, zc = num_idst(_d42_a, n);
+        var td, zd = num_idst_into(_d42_b, n, plan, scratch);
+        if (tc != 0 || td != 0) { return 1; }
+    }
+    var bad = 0;
+    for (var i = 0; i < n; i = i + 1) {
+        if (load64(_d42_a + i * 8) != load64(_d42_b + i * 8)) { bad = bad + 1; }
+    }
+    return bad;
+}
+var _d42_bad = 0;
+var _d42_paths: i64[4];
+for (var n = 1; n <= 300; n = n + 1) {
+    _d42_bad = _d42_bad + _d42_cmp(n, 0) + _d42_cmp(n, 1);
+    var pth = _numx_dst_path(n);
+    store64(&_d42_paths + pth * 8, load64(&_d42_paths + pth * 8) + 1);
+}
+assert_eq(_d42_bad, 0, "3.4.2 num_dst_into / num_idst_into: num_dst's / num_idst's bits at every n = 1..300");
+assert_eq(load64(&_d42_paths), 1, "3.4.2 num_dst_into: the sweep reaches n = 1");
+assert_eq(load64(&_d42_paths + 8) > 3, 1, "3.4.2 num_dst_into: the sweep reaches the direct path");
+assert_eq(load64(&_d42_paths + 16) > 3, 1, "3.4.2 num_dst_into: the sweep reaches the power-of-two FFT path");
+assert_eq(load64(&_d42_paths + 24) > 200, 1, "3.4.2 num_dst_into: the sweep reaches Bluestein");
+var _d42_big = 0;
+_d42_big = _d42_big + _d42_cmp(511, 0) + _d42_cmp(1023, 1) + _d42_cmp(1500, 0) + _d42_cmp(2047, 1);
+assert_eq(_d42_big, 0,
+  "3.4.2 num_dst_into: num_dst's bits at n = 511, 1023 (FFTs of 1024, 2048: reseeded twiddles), 1500, 2047");
+assert_eq(_numx_dst_path(1023), _NUMX_DST_POW2, "3.4.2 num_dst_into: n = 1023 is the power-of-two path (L = 2048)");
+
+# The words: a pure function of n, per path.
+var _d42_t, _d42_w = num_dst_plan_words(14);
+assert_eq(_d42_w, 8 + 14 * 14, "3.4.2 num_dst_plan_words(14): the direct path's 8 + n^2");
+var _d42_t2, _d42_w2 = num_dst_scratch_words(14);
+assert_eq(_d42_w2, 14, "3.4.2 num_dst_scratch_words(14): n");
+var _d42_t3, _d42_w3 = num_dst_plan_words(62);
+assert_eq(_d42_w3, 8 + 252 + 512 + 510, "3.4.2 num_dst_plan_words(62): Bluestein, L = 126, m = 256");
+var _d42_t4, _d42_w4 = num_dst_scratch_words(62);
+assert_eq(_d42_w4, 252 + 512, "3.4.2 num_dst_scratch_words(62): 2L + 2m");
+var _d42_t5, _d42_w5 = num_dst_plan_words(1023);
+assert_eq(_d42_w5, 8 + 2 * 2047, "3.4.2 num_dst_plan_words(1023): the power-of-two path's 8 + 2(L - 1)");
+var _d42_t6, _d42_w6 = num_dst_scratch_words(1);
+assert_eq(_d42_w6, 0, "3.4.2 num_dst_scratch_words(1): none");
+var _d42_t7, _d42_w7 = num_dst_plan_words(0);
+assert_eq(_d42_t7 != 0 && _d42_w7 == HSB_ERR_INVALID_INPUT, 1, "3.4.2 num_dst_plan_words(0): Err(INVALID_INPUT)");
+var _d42_t8, _d42_w8 = num_dst_scratch_words(0 - 3);
+assert_eq(_d42_t8 != 0 && _d42_w8 == HSB_ERR_INVALID_INPUT, 1, "3.4.2 num_dst_scratch_words(-3): Err(INVALID_INPUT)");
+var _d42_t9, _d42_w9 = num_dst_plan_words(600000);
+assert_eq(_d42_t9 != 0 && _d42_w9 == HSB_ERR_ALLOC, 1,
+  "3.4.2 num_dst_plan_words(600000): the direct path past Bluestein's cap would hold n^2 words, Err(ALLOC)");
+assert_eq(_numx_dst_path(600000), _NUMX_DST_DIRECT, "3.4.2 num_dst_plan_words: control, n = 600000 is the direct path");
+var _d42_t10, _d42_w10 = num_dst_plan_words(ALLOC_MAX / 8 + 1);
+assert_eq(_d42_t10 != 0 && _d42_w10 == HSB_ERR_ALLOC, 1,
+  "3.4.2 num_dst_plan_words(ALLOC_MAX / 8 + 1): Err(ALLOC), as num_dst");
+
+# Refusals leave data untouched.
+var _d42_plan = alloc(1282 * 8);
+var _d42_scr = alloc(764 * 8);
+var _d42_tp, _d42_zp = num_dst_plan(62, _d42_plan);
+assert_eq(_d42_tp, 0, "3.4.2 num_dst_plan(62): Ok");
+fn _d42_refused(data, n, plan, scratch) {
+    for (var i = 0; i < 62; i = i + 1) { store64(_d42_a + i * 8, 0x3FF0000000000000 + i); }
+    var t, z = num_dst_into(data, n, plan, scratch);
+    if (t == 0 || z != HSB_ERR_INVALID_INPUT) { return 0; }
+    for (var i = 0; i < 62; i = i + 1) {
+        if (load64(_d42_a + i * 8) != 0x3FF0000000000000 + i) { return 0; }
+    }
+    return 1;
+}
+assert_eq(_d42_refused(_d42_a, 0, _d42_plan, _d42_scr), 1, "3.4.2 num_dst_into: n = 0 refused");
+assert_eq(_d42_refused(0, 62, _d42_plan, _d42_scr), 1, "3.4.2 num_dst_into: data = 0 refused");
+assert_eq(_d42_refused(_d42_a, 62, 0, _d42_scr), 1, "3.4.2 num_dst_into: plan = 0 refused");
+assert_eq(_d42_refused(_d42_a, 61, _d42_plan, _d42_scr), 1,
+  "3.4.2 num_dst_into: a plan for 62 refused for n = 61, data untouched");
+assert_eq(_d42_refused(_d42_a, 62, _d42_scr, _d42_scr), 1, "3.4.2 num_dst_into: a buffer that is not a plan refused");
+assert_eq(_d42_refused(_d42_a, 62, _d42_plan, 0), 1, "3.4.2 num_dst_into: scratch = 0 refused where n needs it");
+var _d42_ti, _d42_zi = num_idst_into(_d42_a, 61, _d42_plan, _d42_scr);
+assert_eq(_d42_ti != 0 && _d42_zi == HSB_ERR_INVALID_INPUT, 1, "3.4.2 num_idst_into: a plan for another n refused");
+var _d42_tn, _d42_zn = num_dst_plan(0, _d42_plan);
+assert_eq(_d42_tn != 0 && _d42_zn == HSB_ERR_INVALID_INPUT, 1, "3.4.2 num_dst_plan(0, plan): Err(INVALID_INPUT)");
+var _d42_tz, _d42_zz = num_dst_plan(62, 0);
+assert_eq(_d42_tz != 0 && _d42_zz == HSB_ERR_INVALID_INPUT, 1, "3.4.2 num_dst_plan(62, 0): Err(INVALID_INPUT)");
+var _d42_p1 = alloc(8 * 8);
+var _d42_t1p, _d42_z1p = num_dst_plan(1, _d42_p1);
+store64(_d42_a, 0x400921FB54442D18);
+var _d42_t1, _d42_z1 = num_dst_into(_d42_a, 1, _d42_p1, 0);
+assert_eq(_d42_t1 == 0 && load64(_d42_a) == 0x400921FB54442D18, 1,
+  "3.4.2 num_dst_into(n = 1): Ok, x unchanged, no scratch needed");
+
+# The issue's repro on the _into forms: 0 B of heap per call at n = 14, 62 and 126.
+fn _d42_heap(n) {
+    var t1, pw = num_dst_plan_words(n);
+    var t2, sw = num_dst_scratch_words(n);
+    var plan = alloc(pw * 8);
+    var scratch = alloc(sw * 8);
+    var t3, z = num_dst_plan(n, plan);
+    for (var i = 0; i < n; i = i + 1) { store64(_d42_a + i * 8, _d42_val()); }
+    var before = alloc_used();
+    for (var k = 0; k < 200; k = k + 1) {
+        var ta, za = num_dst_into(_d42_a, n, plan, scratch);
+        var tb, zb = num_idst_into(_d42_a, n, plan, scratch);
+    }
+    return alloc_used() - before;
+}
+assert_eq(_d42_heap(14) + _d42_heap(62) + _d42_heap(126), 0,
+  "3.4.2 num_dst_into / num_idst_into: 0 B of heap per call at n = 14, 62, 126 (3.4.1 num_dst: 112, 10,208, 20,448 B)");
+
+# ================================================================
+# 3.4.2: num_cg, matrix-free linear CG (1.4.0's iteration, in a power-of-two frame)
+# ================================================================
+# Issue 2026-11-11-no-matrix-free-linear-cg (pravash P1, L5).
+test_group("3.4.2: num_cg");
+# The 5-point Poisson operator on an nx x ny interior grid with zero Dirichlet walls, times
+# a scale c: (A v)_ij = c (4 v_ij - v_i-1,j - v_i+1,j - v_i,j-1 - v_i,j+1). ctx: {nx, ny, c}.
+fn _g42_poisson(ctx, v, out) {
+    var nx = load64(ctx);
+    var ny = load64(ctx + 8);
+    var c = load64(ctx + 16);
+    for (var j = 0; j < ny; j = j + 1) {
+        for (var i = 0; i < nx; i = i + 1) {
+            var k = j * nx + i;
+            var a = f64_mul(0x4010000000000000, load64(v + k * 8));
+            if (i > 0) { a = f64_sub(a, load64(v + (k - 1) * 8)); }
+            if (i < nx - 1) { a = f64_sub(a, load64(v + (k + 1) * 8)); }
+            if (j > 0) { a = f64_sub(a, load64(v + (k - nx) * 8)); }
+            if (j < ny - 1) { a = f64_sub(a, load64(v + (k + nx) * 8)); }
+            store64(out + k * 8, f64_mul(a, c));
+        }
+    }
+    return 0;
+}
+# The identity times c. ctx: {_, _, c}.
+fn _g42_ident(ctx, v, out) {
+    var n = load64(ctx) * load64(ctx + 8);
+    for (var k = 0; k < n; k = k + 1) { store64(out + k * 8, f64_mul(load64(v + k * 8), load64(ctx + 16))); }
+    return 0;
+}
+fn _g42_ctx(nx, ny, c) {
+    var g = alloc(24);
+    store64(g, nx);
+    store64(g + 8, ny);
+    store64(g + 16, c);
+    return g;
+}
+# hisab 1.4.0's num::conjugate_gradient, transcribed (pravash's stand-in, grid_solve.cyr
+# _pv_cg): unscaled, |p.Ap| < 1e-12 stops it, every exit Ok. Returns its iteration count;
+# _g42_guard is 1 when the guard stopped it, _g42_conv 1 when tol did.
+var _g42_guard = 0;
+var _g42_conv = 0;
+fn _g42_dot(v, w, n) {
+    var s = 0x8000000000000000;
+    for (var i = 0; i < n; i = i + 1) { s = f64_add(s, f64_mul(load64(v + i * 8), load64(w + i * 8))); }
+    return s;
+}
+fn _g42_cg140(op, ctx, b, x, n, tol, max_iter, scr) {
+    var r = scr;
+    var p = scr + n * 8;
+    var ap = scr + 2 * n * 8;
+    _g42_guard = 0;
+    _g42_conv = 0;
+    fncall3(op, ctx, x, ap);
+    for (var i = 0; i < n; i = i + 1) {
+        var ri = f64_sub(load64(b + i * 8), load64(ap + i * 8));
+        store64(r + i * 8, ri);
+        store64(p + i * 8, ri);
+    }
+    var rs_old = _g42_dot(r, r, n);
+    var tol_sq = f64_mul(tol, tol);
+    if (f64_lt(rs_old, tol_sq) == 1) { _g42_conv = 1; return 0; }
+    for (var it = 0; it < max_iter; it = it + 1) {
+        fncall3(op, ctx, p, ap);
+        var pap = _g42_dot(p, ap, n);
+        if (f64_lt(f64_abs(pap), 0x3D719799812DEA11) == 1) { _g42_guard = 1; return it; }
+        var alpha = f64_div(rs_old, pap);
+        for (var j = 0; j < n; j = j + 1) {
+            store64(x + j * 8, f64_add(load64(x + j * 8), f64_mul(alpha, load64(p + j * 8))));
+            store64(r + j * 8, f64_sub(load64(r + j * 8), f64_mul(alpha, load64(ap + j * 8))));
+        }
+        var rs_new = _g42_dot(r, r, n);
+        if (f64_lt(rs_new, tol_sq) == 1) { _g42_conv = 1; return it + 1; }
+        var beta = f64_div(rs_new, rs_old);
+        for (var q = 0; q < n; q = q + 1) {
+            store64(p + q * 8, f64_add(load64(r + q * 8), f64_mul(beta, load64(p + q * 8))));
+        }
+        rs_old = rs_new;
+    }
+    return max_iter;
+}
+var _g42_seed = 0x6A09E667F3BCC909;
+fn _g42_val() {
+    _g42_seed = _g42_seed * 6364136223846793005 + 1442695040888963407;
+    var bits = 0x3FF0000000000000 | ((_g42_seed >> 12) & 0xFFFFFFFFFFFFF);
+    return f64_sub(bits, 0x3FF8000000000000);   # [-0.5, 0.5)
+}
+var _g42_n = 256;
+var _g42_b = alloc(_g42_n * 8);
+var _g42_x0 = alloc(_g42_n * 8);
+var _g42_xa = alloc(_g42_n * 8);
+var _g42_xb = alloc(_g42_n * 8);
+var _g42_scr = alloc(3 * _g42_n * 8);
+var _g42_scr2 = alloc(3 * _g42_n * 8);
+for (var i = 0; i < _g42_n; i = i + 1) {
+    store64(_g42_b + i * 8, _g42_val());
+    store64(_g42_x0 + i * 8, f64_mul(_g42_val(), 0x3FB999999999999A));   # a guess near 0
+}
+# Copy x0 (times 2^k, exact) into xa and xb.
+fn _g42_start(k, zero) {
+    var sc = (1023 + k) << 52;
+    for (var i = 0; i < _g42_n; i = i + 1) {
+        var v = f64_mul(load64(_g42_x0 + i * 8), sc);
+        if (zero == 1) { v = 0; }
+        store64(_g42_xa + i * 8, v);
+        store64(_g42_xb + i * 8, v);
+    }
+    return 0;
+}
+fn _g42_same(a, b, n) {
+    for (var i = 0; i < n; i = i + 1) {
+        if (load64(a + i * 8) != load64(b + i * 8)) { return 0; }
+    }
+    return 1;
+}
+# 1.4.0's bits: 16 x 16 Poisson, a random b and guess, tol 1e-5 (a regime where 1.4.0's
+# guard does not fire), and an 8 x 8 from x0 = 0 at tol 1e-6.
+var _g42_P16 = _g42_ctx(16, 16, F64_ONE);
+_g42_start(0, 0);
+var _g42_t, _g42_it = num_cg(&_g42_poisson, _g42_P16, _g42_b, _g42_xa, 256, 0x3EE4F8B588E368F1, 500, _g42_scr);
+var _g42_it140 = _g42_cg140(&_g42_poisson, _g42_P16, _g42_b, _g42_xb, 256, 0x3EE4F8B588E368F1, 500, _g42_scr2);
+assert_eq(_g42_t, 0, "3.4.2 num_cg: 16 x 16 Poisson converges, Ok");
+assert_eq(_g42_conv == 1 && _g42_guard == 0, 1, "3.4.2 num_cg: control, 1.4.0's run met tol without its guard");
+assert_eq(_g42_it, _g42_it140, "3.4.2 num_cg: 1.4.0's iteration count");
+assert_eq(_g42_it > 10, 1, "3.4.2 num_cg: control, the run takes iterations");
+assert_eq(_g42_same(_g42_xa, _g42_xb, 256), 1, "3.4.2 num_cg: 1.4.0's x, bit for bit (16 x 16, a random guess)");
+var _g42_P8 = _g42_ctx(8, 8, F64_ONE);
+_g42_start(0, 1);
+var _g42_t8, _g42_i8 = num_cg(&_g42_poisson, _g42_P8, _g42_b, _g42_xa, 64, 0x3EB0C6F7A0B5ED8D, 200, _g42_scr);
+var _g42_j8 = _g42_cg140(&_g42_poisson, _g42_P8, _g42_b, _g42_xb, 64, 0x3EB0C6F7A0B5ED8D, 200, _g42_scr2);
+assert_eq(_g42_t8 == 0 && _g42_i8 == _g42_j8 && _g42_guard == 0, 1, "3.4.2 num_cg: 8 x 8 from 0, 1.4.0's count");
+assert_eq(_g42_same(_g42_xa, _g42_xb, 64), 1, "3.4.2 num_cg: 8 x 8 from 0, 1.4.0's x bit for bit");
+# The true residual of the 16 x 16 answer: below tol plus its rounding.
+_g42_start(0, 0);
+var _g42_tr, _g42_ir = num_cg(&_g42_poisson, _g42_P16, _g42_b, _g42_xa, 256, 0x3E112E0BE826D695, 1000, _g42_scr);
+_g42_poisson(_g42_P16, _g42_xa, _g42_scr2);
+var _g42_res = 0;
+for (var i = 0; i < 256; i = i + 1) {
+    var d = f64_sub(load64(_g42_b + i * 8), load64(_g42_scr2 + i * 8));
+    _g42_res = f64_add(_g42_res, f64_mul(d, d));
+}
+assert_eq(_g42_tr, 0, "3.4.2 num_cg: tol 1e-9, Ok");
+assert_eq(f64_lt(f64_sqrt(_g42_res), 0x3E25798EE2308C3A), 1, "3.4.2 num_cg: tol 1e-9, the true residual below 2.5e-9");
+
+# Homogeneity: (A, 2^j b, 2^j x0, 2^j tol) gives 2^j x, and (2^i A, b, 0) gives 2^-i x, with
+# the same count, bit for bit, where 1.4.0's plain r.r would overflow or flush.
+_g42_start(0, 0);
+var _g42_tref, _g42_iref = num_cg(&_g42_poisson, _g42_P16, _g42_b, _g42_xa, 256, 0x3EE4F8B588E368F1, 500, _g42_scr);
+var _g42_xref = alloc(256 * 8);
+for (var i = 0; i < 256; i = i + 1) { store64(_g42_xref + i * 8, load64(_g42_xa + i * 8)); }
+var _g42_bs = alloc(256 * 8);
+fn _g42_homog_b(j) {
+    var sc = (1023 + j) << 52;
+    for (var i = 0; i < 256; i = i + 1) { store64(_g42_bs + i * 8, f64_mul(load64(_g42_b + i * 8), sc)); }
+    _g42_start(j, 0);
+    var t, it = num_cg(&_g42_poisson, _g42_P16, _g42_bs, _g42_xa, 256, f64_mul(0x3EE4F8B588E368F1, sc), 500, _g42_scr);
+    if (t != 0 || it != _g42_iref) { return 0; }
+    for (var i = 0; i < 256; i = i + 1) {
+        if (load64(_g42_xa + i * 8) != f64_mul(load64(_g42_xref + i * 8), sc)) { return 0; }
+    }
+    return 1;
+}
+assert_eq(_g42_homog_b(0 - 990), 1, "3.4.2 num_cg: b, x0 and tol times 2^-990 give x times 2^-990, bit for bit");
+assert_eq(_g42_homog_b(0 - 500), 1, "3.4.2 num_cg: times 2^-500");
+assert_eq(_g42_homog_b(500), 1, "3.4.2 num_cg: times 2^500 (1.4.0's r.r overflows: 2^1000 n)");
+assert_eq(_g42_homog_b(1000), 1, "3.4.2 num_cg: times 2^1000");
+fn _g42_homog_a(i2) {
+    var sa = (1023 + i2) << 52;
+    var g = _g42_ctx(16, 16, sa);
+    _g42_start(0, 1);
+    var t, it = num_cg(&_g42_poisson, g, _g42_b, _g42_xa, 256, 0x3EE4F8B588E368F1, 500, _g42_scr);
+    var t2, it2 = num_cg(&_g42_poisson, _g42_P16, _g42_b, _g42_xb, 256, 0x3EE4F8B588E368F1, 500, _g42_scr);
+    if (t != 0 || t2 != 0 || it != it2) { return 0; }
+    var inv = (1023 - i2) << 52;
+    for (var i = 0; i < 256; i = i + 1) {
+        if (load64(_g42_xa + i * 8) != f64_mul(load64(_g42_xb + i * 8), inv)) { return 0; }
+    }
+    return 1;
+}
+assert_eq(_g42_homog_a(0 - 500), 1, "3.4.2 num_cg: A times 2^-500 gives x times 2^500, bit for bit");
+assert_eq(_g42_homog_a(500), 1, "3.4.2 num_cg: A times 2^500 gives x times 2^-500");
+# 1.4.0's guard: A = 2^-30 L, b = 2^-30 c, tol 2^-30 1e-5 is the problem above in other
+# units. 1.4.0 stops early with Ok; num_cg answers the unscaled problem's x, bit for bit.
+var _g42_P16s = _g42_ctx(16, 16, 0x3E10000000000000);   # 2^-30
+fn _g42_guard_case() {
+    var sc = 0x3E10000000000000;
+    for (var i = 0; i < 256; i = i + 1) { store64(_g42_bs + i * 8, f64_mul(load64(_g42_b + i * 8), sc)); }
+    _g42_start(0, 1);
+    var t, it = num_cg(&_g42_poisson, _g42_P16s, _g42_bs, _g42_xa, 256, f64_mul(0x3EE4F8B588E368F1, sc), 500, _g42_scr);
+    var t2, it2 = num_cg(&_g42_poisson, _g42_P16, _g42_b, _g42_xb, 256, 0x3EE4F8B588E368F1, 500, _g42_scr2);
+    if (t != 0 || t2 != 0 || it != it2) { return 0; }
+    return _g42_same(_g42_xa, _g42_xb, 256);
+}
+assert_eq(_g42_guard_case(), 1, "3.4.2 num_cg: 2^-30 L x = 2^-30 c, the unscaled answer bit for bit");
+_g42_start(0, 1);
+var _g42_ig = _g42_cg140(&_g42_poisson, _g42_P16s, _g42_bs, _g42_xb, 256,
+  f64_mul(0x3EE4F8B588E368F1, 0x3E10000000000000), 500, _g42_scr2);
+assert_eq(_g42_guard, 1, "3.4.2 num_cg: control, 1.4.0's guard stops that problem");
+assert_eq(_g42_ig < _g42_iref, 1,
+  "3.4.2 num_cg: control, 1.4.0 stopped before tol (its Ok answer is an early iterate)");
+
+# Exits.
+var _g42_I = _g42_ctx(16, 16, F64_ONE);
+_g42_start(0, 1);
+var _g42_ti, _g42_ii = num_cg(&_g42_ident, _g42_I, _g42_b, _g42_xa, 256, 0, 10, _g42_scr);
+assert_eq(_g42_ti == 0 && _g42_ii == 1, 1, "3.4.2 num_cg: A = I, tol 0: the exact solution after 1 iteration, Ok(1)");
+assert_eq(_g42_same(_g42_xa, _g42_b, 256), 1, "3.4.2 num_cg: A = I: x = b bit for bit");
+var _g42_Ineg = _g42_ctx(16, 16, 0xBFF0000000000000);
+_g42_start(0, 1);
+var _g42_tn, _g42_in = num_cg(&_g42_poisson, _g42_Ineg, _g42_b, _g42_xa, 256, 0x3EE4F8B588E368F1, 500, _g42_scr);
+assert_eq(_g42_tn != 0 && _g42_in == HSB_ERR_NO_CONVERGENCE, 1,
+  "3.4.2 num_cg: a negative definite A, Err(NO_CONVERGENCE)");
+_g42_start(0, 0);
+var _g42_t3, _g42_i3 = num_cg(&_g42_poisson, _g42_P16, _g42_b, _g42_xa, 256, 0x3EE4F8B588E368F1, 3, _g42_scr);
+var _g42_j3 = _g42_cg140(&_g42_poisson, _g42_P16, _g42_b, _g42_xb, 256, 0x3EE4F8B588E368F1, 3, _g42_scr2);
+assert_eq(_g42_t3 != 0 && _g42_i3 == HSB_ERR_NO_CONVERGENCE, 1,
+  "3.4.2 num_cg: max_iter 3 ends above tol, Err(NO_CONVERGENCE)");
+assert_eq(_g42_same(_g42_xa, _g42_xb, 256), 1, "3.4.2 num_cg: max_iter 3: x is 1.4.0's third iterate");
+_g42_start(0, 0);
+var _g42_tinf, _g42_iinf = num_cg(&_g42_poisson, _g42_P16, _g42_b, _g42_xa, 256, F64_POS_INF, 5, _g42_scr);
+assert_eq(_g42_tinf == 0 && _g42_iinf == 0 && _g42_same(_g42_xa, _g42_xb, 0) == 1, 1, "3.4.2 num_cg: tol +Inf, Ok(0)");
+var _g42_zb = alloc(256 * 8);
+_g42_start(0, 1);
+var _g42_tz, _g42_iz = num_cg(&_g42_poisson, _g42_P16, _g42_zb, _g42_xa, 256, 0, 5, _g42_scr);
+assert_eq(_g42_tz == 0 && _g42_iz == 0, 1, "3.4.2 num_cg: b = A x0 = 0 exactly, Ok(0) at tol 0");
+_g42_start(0, 0);
+var _g42_t0, _g42_i0 = num_cg(&_g42_poisson, _g42_P16, _g42_b, _g42_xa, 256, 0x3EE4F8B588E368F1, 0, _g42_scr);
+assert_eq(_g42_t0 != 0 && _g42_i0 == HSB_ERR_NO_CONVERGENCE, 1,
+  "3.4.2 num_cg: max_iter 0 above tol, Err(NO_CONVERGENCE)");
+assert_eq(_g42_same(_g42_xa, _g42_xb, 256), 1, "3.4.2 num_cg: max_iter 0: x is x0");
+# Refusals, x untouched.
+fn _g42_refused(apply, b, x, n, tol, mi, scr) {
+    _g42_start(0, 0);
+    var t, e = num_cg(apply, _g42_P16, b, x, n, tol, mi, scr);
+    if (t == 0 || e != HSB_ERR_INVALID_INPUT) { return 0; }
+    return _g42_same(_g42_xa, _g42_xb, 256);
+}
+assert_eq(_g42_refused(&_g42_poisson, _g42_b, _g42_xa, 0, 0, 5, _g42_scr), 1, "3.4.2 num_cg: n = 0 refused");
+assert_eq(_g42_refused(0, _g42_b, _g42_xa, 256, 0, 5, _g42_scr), 1, "3.4.2 num_cg: apply = 0 refused");
+assert_eq(_g42_refused(&_g42_poisson, 0, _g42_xa, 256, 0, 5, _g42_scr), 1, "3.4.2 num_cg: b = 0 refused");
+assert_eq(_g42_refused(&_g42_poisson, _g42_b, 0, 256, 0, 5, _g42_scr), 1, "3.4.2 num_cg: x = 0 refused");
+assert_eq(_g42_refused(&_g42_poisson, _g42_b, _g42_xa, 256, 0, 5, 0), 1, "3.4.2 num_cg: scratch = 0 refused");
+assert_eq(_g42_refused(&_g42_poisson, _g42_b, _g42_xa, 256, 0x7FF8000000000000, 5, _g42_scr), 1,
+  "3.4.2 num_cg: tol NaN refused");
+assert_eq(_g42_refused(&_g42_poisson, _g42_b, _g42_xa, 256, 0xBFF0000000000000, 5, _g42_scr), 1,
+  "3.4.2 num_cg: tol -1 refused");
+assert_eq(_g42_refused(&_g42_poisson, _g42_b, _g42_xa, 256, 0, 0 - 1, _g42_scr), 1,
+  "3.4.2 num_cg: max_iter -1 refused");
+assert_eq(_g42_refused(&_g42_poisson, _g42_b, _g42_xa, ALLOC_MAX / 24 + 1, 0, 5, _g42_scr), 1,
+  "3.4.2 num_cg: n past ALLOC_MAX / 24 refused before apply");
+store64(_g42_bs + 7 * 8, F64_POS_INF);
+assert_eq(_g42_refused(&_g42_poisson, _g42_bs, _g42_xa, 256, 0, 5, _g42_scr), 1,
+  "3.4.2 num_cg: an infinite b_7 refused");
+# No heap: 50 solves grow it by 0 B.
+var _g42_h0 = alloc_used();
+for (var k = 0; k < 50; k = k + 1) {
+    _g42_start(0, 1);
+    var t, it = num_cg(&_g42_poisson, _g42_P8, _g42_b, _g42_xa, 64, 0x3EB0C6F7A0B5ED8D, 200, _g42_scr);
+}
+assert_eq(alloc_used() - _g42_h0, 0, "3.4.2 num_cg: 50 solves grow the heap by 0 B");
+
+# ================================================================
+# 3.4.2: the allocation scope (src/heap.cyr), and the _into value operations
+# ================================================================
+# Issue 2026-11-09-allocator-scoped-calls (impetus H1 / H9, pravash): every hisab call took
+# global heap that nothing returned.
+test_group("3.4.2: the allocation scope");
+var _a42_al = arena_allocator_growable(1 << 16);
+assert_eq(hisab_alloc_scope_current(), 0, "3.4.2 scope: none at the start");
+assert_eq(hisab_alloc_scope(_a42_al), 0, "3.4.2 scope: setting one returns the scope it replaced, none");
+assert_eq(hisab_alloc_scope_current(), _a42_al, "3.4.2 scope: the arena is the scope");
+var _a42_al2 = arena_allocator_growable(4096);
+assert_eq(hisab_alloc_scope(_a42_al2), _a42_al, "3.4.2 scope: a nested scope returns the outer one");
+assert_eq(hisab_alloc_scope(_a42_al), _a42_al2, "3.4.2 scope: restoring returns the inner one");
+assert_eq(hisab_alloc_scope(0), _a42_al, "3.4.2 scope: 0 restores the global heap");
+assert_eq(hisab_allocator(), default_alloc(), "3.4.2 scope: with none, hisab_allocator() is default_alloc()");
+
+# The issue's repro, scoped: fixtures outside, every call inside, the arena reset per step.
+fn _a42_sphere(x, r) {
+    var s = alloc(16);
+    store64(s, hvec3_new(x, 0, 0));
+    store64(s + 8, r);
+    return s;
+}
+fn _a42_sup(shape, dir) {
+    var r: f64 = load64(shape + 8);
+    return hvec3_add(load64(shape), hvec3_scale(hvec3_normalize(dir), r));
+}
+var _a42_a = hvec3_new(F64_ONE, f64_from(2), f64_from(3));
+var _a42_b = hvec3_new(F64_HALF, f64_neg(F64_ONE), f64_from(2));
+var _a42_q = hquat_from_rotation_z(0x3FD3333333333333);
+var _a42_m = m3_from_quat(_a42_q);
+var _a42_sa = _a42_sphere(0, F64_ONE);
+var _a42_sb = _a42_sphere(0x3FF8000000000000, F64_ONE);
+var _a42_nrm = alloc(8);
+var _a42_dep = alloc(8);
+var _a42_contacts = vec_new();
+var _a42_up = hvec3_new(0, F64_ONE, 0);
+for (var k = 0; k < 50; k = k + 1) {
+    vec_push(_a42_contacts, contact_new(2 * k, 2 * k + 1, _a42_up, 0x3F847AE147AE147B, F64_HALF, 0, F64_ONE, F64_ONE));
+}
+var _a42_boxes = alloc(100 * 8);
+for (var k = 0; k < 100; k = k + 1) {
+    var lo = hvec3_new(f64_from(k), 0, 0);
+    var hi = hvec3_new(f64_from(k + 1), F64_ONE, F64_ONE);
+    store64(_a42_boxes + k * 8, geo_aabb_new(lo, hi));
+}
+var _a42_qbox = geo_aabb_new(hvec3_new(0x4024000000000000, 0, 0), hvec3_new(0x4034000000000000, F64_ONE, F64_ONE));
+# One step's calls; the answers it read, as a checksum of bits.
+fn _a42_step() {
+    var sum = 0;
+    for (var k = 0; k < 10; k = k + 1) {
+        var u = hvec3_add(_a42_a, _a42_b);
+        var c = hvec3_cross(_a42_a, _a42_b);
+        var r = hquat_rotate_vec3(_a42_q, _a42_a);
+        var w = m3_mul_vec3(_a42_m, _a42_a);
+        sum = sum ^ load64(u) ^ load64(c + 8) ^ load64(r + 16) ^ load64(w + 8);
+    }
+    var hit = gjk_epa_3d(&_a42_sup, _a42_sa, &_a42_sup, _a42_sb, _a42_nrm, _a42_dep);
+    sum = sum ^ hit ^ load64(_a42_dep) ^ load64(load64(_a42_nrm));
+    var isl = detect_islands(_a42_contacts, 50, 100);
+    sum = sum ^ vec_len(isl) ^ vec_get(vec_get(isl, 7), 1);
+    var bvh = bvh_build(_a42_boxes, 100);
+    var found = bvh_query_aabb(bvh, _a42_qbox);
+    for (var k = 0; k < vec_len(found); k = k + 1) { sum = sum ^ (vec_get(found, k) << k); }
+    return sum;
+}
+var _a42_ref = _a42_step();
+assert_eq(_a42_ref != 0, 1, "3.4.2 scope: control, the step reads its answers");
+var _a42_grow = 0;
+var _a42_diff = 0;
+var _a42_used = 0;
+for (var s = 0; s < 5; s = s + 1) {
+    var g0 = alloc_used();
+    var prev = hisab_alloc_scope(_a42_al);
+    var sum = _a42_step();
+    hisab_alloc_scope(prev);
+    if (sum != _a42_ref) { _a42_diff = _a42_diff + 1; }
+    if (s == 0) { _a42_used = arena_capacity_total(allocator_state(_a42_al)); }
+    reset_via(_a42_al);
+    if (s > 1) { _a42_grow = _a42_grow + (alloc_used() - g0); }
+}
+assert_eq(_a42_diff, 0, "3.4.2 scope: the step's answers under the scope are the global heap's, bit for bit");
+assert_eq(_a42_grow, 0,
+  "3.4.2 scope: the issue's seven calls (add, cross, rotate, m3 v, gjk_epa_3d, islands, bvh): 0 B a step");
+assert_eq(_a42_used > 100000, 1,
+  "3.4.2 scope: control, the arena grew past 100,000 B for a step (gjk_epa_3d alone takes 105,920 B)");
+var _a42_g1 = alloc_used();
+var _a42_x = _a42_step();
+assert_eq(alloc_used() - _a42_g1 > 100000, 1, "3.4.2 scope: control, with no scope the same step takes global heap");
+
+# Memory from the scope is zeroed, as alloc's is, after the arena re-issues dirty memory.
+var _a42_z = arena_allocator(4096);
+var _a42_dirty = alloc_via(_a42_z, 4000);
+for (var i = 0; i < 500; i = i + 1) { store64(_a42_dirty + i * 8, 0xA5A5A5A5A5A5A5A5); }
+reset_via(_a42_z);
+var _a42_zp = hisab_alloc_scope(_a42_z);
+var _a42_blk = hisab_alloc(77);
+var _a42_vv = hisab_vec_new();
+var _a42_m4 = m4_new();
+hisab_alloc_scope(_a42_zp);
+var _a42_nz = 0;
+for (var i = 0; i < 77; i = i + 1) { if (load8(_a42_blk + i) != 0) { _a42_nz = _a42_nz + 1; } }
+for (var i = 0; i < 16; i = i + 1) { if (load64(_a42_m4 + i * 8) != 0) { _a42_nz = _a42_nz + 1; } }
+assert_eq(_a42_blk == _a42_dirty, 1, "3.4.2 scope: control, the block re-issues the dirtied memory");
+assert_eq(_a42_nz, 0, "3.4.2 scope: hisab_alloc(77) and m4_new() under the scope read zero, as alloc's do");
+assert_eq(_a42_vv != 0 && vec_len(_a42_vv) == 0, 1, "3.4.2 scope: hisab_vec_new under the scope, empty");
+assert_eq(hisab_alloc(0) == 0 && hisab_alloc(0 - 8) == 0, 1, "3.4.2 hisab_alloc: 0 for n <= 0, as alloc");
+var _a42_zp2 = hisab_alloc_scope(_a42_z);
+var _a42_bad = hisab_alloc(ALLOC_MAX + 8);
+hisab_alloc_scope(_a42_zp2);
+assert_eq(_a42_bad, 0, "3.4.2 hisab_alloc: 0 for n > ALLOC_MAX under a scope, as alloc");
+# An allocator that never refuses: hisab_alloc refuses n > ALLOC_MAX before calling it, as alloc
+# would, so hisab's derived bounds read the same under any scope.
+var _a42_calls = 0;
+var _a42_stat: i64[8];
+fn _a42_never(state, size) {
+    _a42_calls = _a42_calls + 1;
+    return &_a42_stat;
+}
+fn _a42_nofree(state, p) { return 0; }
+var _a42_nv = allocator_new(&_a42_never, 0, &_a42_nofree, &_a42_nofree, 0);
+var _a42_np = hisab_alloc_scope(_a42_nv);
+var _a42_big = hisab_alloc(ALLOC_MAX + 8);
+var _a42_one = hisab_alloc(8);
+hisab_alloc_scope(_a42_np);
+assert_eq(_a42_big == 0 && _a42_one == &_a42_stat && _a42_calls == 1, 1,
+  "3.4.2 hisab_alloc: n > ALLOC_MAX refused before a never-refusing allocator is asked");
+
+# A scope that refuses: the designed failures, no crash; the scope restored, the call answers.
+var _a42_tiny = arena_allocator(40);
+var _a42_tp = hisab_alloc_scope(_a42_tiny);
+var _a42_r1 = hvec3_add(_a42_a, _a42_b);
+var _a42_r2 = hvec3_add(_a42_a, _a42_b);
+var _a42_hit = gjk_epa_3d(&_a42_sup, _a42_sa, &_a42_sup, _a42_sb, _a42_nrm, _a42_dep);
+var _a42_isl = detect_islands(_a42_contacts, 50, 100);
+hisab_alloc_scope(_a42_tp);
+assert_eq(_a42_r1 != 0 && _a42_r2 == 0, 1,
+  "3.4.2 scope: a 40-byte arena takes one HVec3, then refuses: the designed 0");
+assert_eq(_a42_hit, 0, "3.4.2 scope: gjk_epa_3d under a refusing scope answers 0, the designed failure");
+assert_eq(_a42_isl == 0 || vec_len(_a42_isl) == 0, 1,
+  "3.4.2 scope: detect_islands under a refusing scope, its designed failure");
+assert_eq(_a42_step(), _a42_ref, "3.4.2 scope: restored, the step answers as before");
+
+# geo_obb_axes after the OBB rays' axes moved to the stack (3.4.2): its three axes are heap
+# copies, unchanged by later calls that reuse the stack, and hquat_rotate_vec3's bits.
+var _a42_q1 = hquat_new(0x3FC999999999999A, 0xBFD3333333333333, 0x3FE3333333333333, 0x3FEB333333333333);
+var _a42_q2 = hquat_new(0xBFE0000000000000, 0x3FD0000000000000, 0x3FC0000000000000, 0x3FE8000000000000);
+var _a42_o1 = geo_obb_new(hvec3_zero(), hvec3_one(), _a42_q1);
+var _a42_o2 = geo_obb_new(hvec3_one(), hvec3_splat(F64_TWO), _a42_q2);
+var _a42_ax = geo_obb_axes(_a42_o1);
+var _a42_ax2 = geo_obb_axes(_a42_o2);
+var _a42_ry = geo_ray_new(hvec3_new(f64_from(0 - 5), 0, 0), hvec3_unit_x());
+var _a42_hit = geo_ray_obb(_a42_ry, _a42_o2);
+var _a42_axbad = 0;
+for (var k = 0; k < 3; k = k + 1) {
+    var u = hvec3_zero();
+    store64(u + k * 8, F64_ONE);
+    var want = hquat_rotate_vec3(_a42_q1, u);
+    var got = load64(_a42_ax + k * 8);
+    for (var c = 0; c < 3; c = c + 1) {
+        if (load64(got + c * 8) != load64(want + c * 8)) { _a42_axbad = _a42_axbad + 1; }
+    }
+}
+assert_eq(_a42_ax != 0 && _a42_ax2 != 0 && _a42_axbad == 0, 1,
+  "3.4.2 geo_obb_axes: heap copies, hquat_rotate_vec3's bits, intact after two more OBB calls");
+
+# The _into forms: the allocating forms' bits on random full-mantissa operands, any operand
+# aliased, and no heap.
+test_group("3.4.2: the _into value operations");
+var _i42_seed = 0x3C6EF372FE94F82B;
+fn _i42_val() {
+    _i42_seed = _i42_seed * 6364136223846793005 + 1442695040888963407;
+    var e = 1023 + ((_i42_seed >> 20) % 40) - 20;
+    var bits = (e << 52) | ((_i42_seed >> 8) & 0xFFFFFFFFFFFFF);
+    if ((_i42_seed >> 63) != 0) { bits = bits | 0x8000000000000000; }
+    return bits;
+}
+fn _i42_fill(p, n) {
+    for (var i = 0; i < n; i = i + 1) { store64(p + i * 8, _i42_val()); }
+    return p;
+}
+fn _i42_eq(p, q, n) {
+    if (p == 0 || q == 0) { return 0; }
+    for (var i = 0; i < n; i = i + 1) { if (load64(p + i * 8) != load64(q + i * 8)) { return 0; } }
+    return 1;
+}
+fn _i42_cp(dst, src, n) {
+    for (var i = 0; i < n; i = i + 1) { store64(dst + i * 8, load64(src + i * 8)); }
+    return dst;
+}
+var _i42_A = alloc(16 * 8);
+var _i42_B = alloc(16 * 8);
+var _i42_O = alloc(16 * 8);
+var _i42_bad = alloc(10 * 8);
+# Count a mismatch in slot k of _i42_bad when ok is 0.
+fn _i42_tally(k, ok) {
+    if (ok == 0) { store64(_i42_bad + k * 8, load64(_i42_bad + k * 8) + 1); }
+    return 0;
+}
+for (var t = 0; t < 2000; t = t + 1) {
+    _i42_fill(_i42_A, 16);
+    _i42_fill(_i42_B, 16);
+    var sc = _i42_val();
+    _i42_tally(0, _i42_eq(hvec3_add_into(_i42_O, _i42_A, _i42_B),
+        hvec3_add(_i42_A, _i42_B), 3));
+    _i42_tally(1, _i42_eq(hvec3_sub_into(_i42_O, _i42_A, _i42_B),
+        hvec3_sub(_i42_A, _i42_B), 3));
+    _i42_tally(2, _i42_eq(hvec3_scale_into(_i42_O, _i42_A, sc),
+        hvec3_scale(_i42_A, sc), 3));
+    _i42_tally(3, _i42_eq(hvec3_cross_into(_i42_O, _i42_A, _i42_B),
+        hvec3_cross(_i42_A, _i42_B), 3));
+    _i42_tally(4, _i42_eq(hquat_mul_into(_i42_O, _i42_A, _i42_B),
+        hquat_mul(_i42_A, _i42_B), 4));
+    _i42_tally(5, _i42_eq(hquat_rotate_vec3_into(_i42_O, _i42_A, _i42_B),
+        hquat_rotate_vec3(_i42_A, _i42_B), 3));
+    _i42_tally(6, _i42_eq(m3_mul_vec3_into(_i42_O, _i42_A, _i42_B),
+        m3_mul_vec3(_i42_A, _i42_B), 3));
+    _i42_tally(7, _i42_eq(m3_mul_into(_i42_O, _i42_A, _i42_B),
+        m3_mul(_i42_A, _i42_B), 9));
+    _i42_tally(8, _i42_eq(m4_mul_into(_i42_O, _i42_A, _i42_B),
+        m4_mul(_i42_A, _i42_B), 16));
+    # Aliased: out is the first operand (and the second for the products), the same bits.
+    var ref = m4_mul(_i42_A, _i42_B);
+    var ac = _i42_cp(alloc(16 * 8), _i42_A, 16);
+    var r1 = m4_mul_into(ac, ac, _i42_B);
+    var rq = hquat_rotate_vec3(_i42_A, _i42_B);
+    var bc = _i42_cp(alloc(3 * 8), _i42_B, 3);
+    var r2 = hquat_rotate_vec3_into(bc, _i42_A, bc);
+    var cr = hvec3_cross(_i42_A, _i42_B);
+    var ac3 = _i42_cp(alloc(3 * 8), _i42_A, 3);
+    var r3 = hvec3_cross_into(ac3, ac3, _i42_B);
+    var m3r = m3_mul(_i42_A, _i42_B);
+    var bc9 = _i42_cp(alloc(9 * 8), _i42_B, 9);
+    var r4 = m3_mul_into(bc9, _i42_A, bc9);
+    var qm = hquat_mul(_i42_A, _i42_B);
+    var bq = _i42_cp(alloc(4 * 8), _i42_B, 4);
+    var r5 = hquat_mul_into(bq, _i42_A, bq);
+    if (_i42_eq(r1, ref, 16) == 0 || _i42_eq(r2, rq, 3) == 0 || _i42_eq(r3, cr, 3) == 0 || _i42_eq(r4, m3r, 9) == 0
+      || _i42_eq(r5, qm, 4) == 0) {
+        store64(_i42_bad + 72, load64(_i42_bad + 72) + 1);
+    }
+}
+assert_eq(load64(_i42_bad), 0, "3.4.2 hvec3_add_into: hvec3_add's bits on 2,000 operand pairs");
+assert_eq(load64(_i42_bad + 8), 0, "3.4.2 hvec3_sub_into: hvec3_sub's bits");
+assert_eq(load64(_i42_bad + 16), 0, "3.4.2 hvec3_scale_into: hvec3_scale's bits");
+assert_eq(load64(_i42_bad + 24), 0, "3.4.2 hvec3_cross_into: hvec3_cross's bits");
+assert_eq(load64(_i42_bad + 32), 0, "3.4.2 hquat_mul_into: hquat_mul's bits");
+assert_eq(load64(_i42_bad + 40), 0,
+  "3.4.2 hquat_rotate_vec3_into: hquat_rotate_vec3's bits (non-unit q: the divided path)");
+assert_eq(load64(_i42_bad + 48), 0, "3.4.2 m3_mul_vec3_into: m3_mul_vec3's bits");
+assert_eq(load64(_i42_bad + 56), 0, "3.4.2 m3_mul_into: m3_mul's bits");
+assert_eq(load64(_i42_bad + 64), 0, "3.4.2 m4_mul_into: m4_mul's bits");
+assert_eq(load64(_i42_bad + 72), 0,
+  "3.4.2 _into: out aliased to an operand, the same bits (m4, rotate into v, cross, m3, quat)");
+# The rotation's rare paths into out: a huge v (the wide path, q doubled) and a q far from
+# unit (the scaled path), each against the allocating form.
+var _i42_vb = hvec3_new(0x7FE0000000000000, 0x3FF0000000000001, 0);
+var _i42_qs = hquat_new(0, 0, 0x3FE3333333333333, 0);
+var _i42_qf = hquat_new(0x5FE0000000000001, 0x3FF8000000000000, 0, 0x5FD0000000000000);
+var _i42_vo = alloc(24);
+assert_eq(_i42_eq(hquat_rotate_vec3_into(_i42_vo, _i42_qs, _i42_vb), hquat_rotate_vec3(_i42_qs, _i42_vb), 3), 1,
+  "3.4.2 hquat_rotate_vec3_into: the wide path (v near DBL_MAX, |q|^2 < 1), the same bits");
+assert_eq(f64_lt(f64_abs(load64(_i42_vo)), F64_POS_INF), 1,
+  "3.4.2 hquat_rotate_vec3_into: control, the wide path's answer is finite");
+assert_eq(_i42_eq(hquat_rotate_vec3_into(_i42_vo, _i42_qf, _i42_A), hquat_rotate_vec3(_i42_qf, _i42_A), 3), 1,
+  "3.4.2 hquat_rotate_vec3_into: the scaled path (|q| near 2^511), the same bits");
+assert_eq(hvec3_add_into(0, _i42_A, _i42_B) == 0 && hquat_rotate_vec3_into(0, _i42_A, _i42_B) == 0
+  && m4_mul_into(0, _i42_A, _i42_B) == 0, 1, "3.4.2 _into: out = 0 answers 0");
+var _i42_h0 = alloc_used();
+for (var k = 0; k < 1000; k = k + 1) {
+    hvec3_add_into(_i42_O, _i42_A, _i42_B);
+    hvec3_cross_into(_i42_O, _i42_A, _i42_B);
+    hquat_rotate_vec3_into(_i42_O, _i42_A, _i42_B);
+    hquat_rotate_vec3_into(_i42_vo, _i42_qs, _i42_vb);
+    m3_mul_vec3_into(_i42_O, _i42_A, _i42_B);
+    m4_mul_into(_i42_O, _i42_A, _i42_B);
+}
+assert_eq(alloc_used() - _i42_h0, 0, "3.4.2 _into: 6,000 calls take 0 B of heap (the rotation's wide path included)");
 
 var r = assert_summary();
 # Clamp before exiting: assert_summary() returns the raw failure COUNT, and a wait

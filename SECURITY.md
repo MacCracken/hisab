@@ -20,7 +20,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 | Division by zero | NaN/Inf propagation through complex, autodiff, transforms — and a guard that returns a fabricated finite answer instead | Guards on cx_div, cx_inv, dual_div, dual_sqrt, dual_ln, f64_fmod, world_to_screen, linearize_depth_reverse_z. ⚠ **The presence of a guard is not the same as a correct one**: 2.11.0 found four autodiff guards fabricating answers (`dual_div` returned (0,0) for `1/1e-13`; `dual_ln` tested `f64_abs(v)`, not ln's domain, so `ln(-5)` came back as NaN beside a **confident** -0.2 derivative; `dual_sqrt` took the root before its guard), repaired on the rule *guard exactly what makes the division fail and nothing more*. 2.11.1's audit then found the class at ~24 more sites, including `cx_div` returning exactly zero below \|z\| = 1e-12 — **closed 2.14.0–2.15.0**: `cx_div` is Smith's algorithm (no threshold can be right: over 401 decades 1e-12 fails 241, DBL_MIN 93, no guard at all 89, Smith 0), and the census repaired 96 more. Every guard named here has since been mutation-tested against a sweep to the arithmetic floor, not merely bracketed |
 | Modular arithmetic | Overflow in multiplication for large moduli (CWE-190) | `num_mulmod` (public since 3.3.0, and what `num_pollard_rho` and `num_crt` call; `num_modpow` and `num_is_prime` call its unchecked core `_num_mulmod`) is exact for every modulus up to 2^63 − 1: the direct product up to m = 3037000500, the Russian-peasant doubling loop up to 2^62, and above that the same loop on an add-mod that never forms the sum. ⚠ Through 3.2.x the doubling loop ran at every modulus and wrapped once m > 2^62, so `num_is_prime` called the primes 2^63 − 25 and 2^62 + 135 composite — fixed in **3.3.0** with `num_crt`, `num_modinv` and `num_divisor_sigma` (threat model, CWE-190 row) |
 | Symbolic eval | Process abort on undefined variable or unknown tag | Returns 0 with a stderr warning (no longer aborts) |
-| Process-global state | Unsynchronised module globals that two threads calling into hisab can race on — not only Perlin's table | Single-threaded only; documented. The set: Perlin's permutation table and simplex noise's gradient table (static storage since 3.4.0, filled on first use and flagged ready only after the fill), einsum's static scratch (reset at every call), the Delaunay exact-path scratch behind `delaunay_2d` (cleared per call, shared, so a race can flip a sign), the collision entry points' per-call scale state (saved and restored around each call, so nesting is safe but threads are not) and, since 3.3.6, the enclosure-proof request, verdict and tetrahedron handed from one internal call to the next, `ivl_sin`'s cached fsin verdict, the CGA null-basis table (built on the first product; a race builds it twice) and EPA's polish counter (test instrumentation), since 3.3.7 the portal's separating-plane verdict and the CGA scalar-pair list (filled once from that table; a race fills it twice with the same values), since 3.4.0 the collision entry points' per-query support-scale cache and portal memo (saved and restored around each call, so nesting is safe but threads are not), and since 3.4.1 their refused-allocation flag and its static NaN stand-in, on the same terms. Detail in the threat model's *Process-global state* row. Thread safety is demand-gated until a threaded consumer exists (roadmap *3.x.x — demand-gated*, audit `K005`) |
+| Process-global state | Unsynchronised module globals that two threads calling into hisab can race on — not only Perlin's table | Single-threaded only; documented. The set: Perlin's permutation table and simplex noise's gradient table (static storage since 3.4.0, filled on first use and flagged ready only after the fill), einsum's static scratch (reset at every call), the Delaunay exact-path scratch behind `delaunay_2d` (cleared per call, shared, so a race can flip a sign), the collision entry points' per-call scale state (saved and restored around each call, so nesting is safe but threads are not) and, since 3.3.6, the enclosure-proof request, verdict and tetrahedron handed from one internal call to the next, `ivl_sin`'s cached fsin verdict, the CGA null-basis table (built on the first product; a race builds it twice) and EPA's polish counter (test instrumentation), since 3.3.7 the portal's separating-plane verdict and the CGA scalar-pair list (filled once from that table; a race fills it twice with the same values), since 3.4.0 the collision entry points' per-query support-scale cache and portal memo (saved and restored around each call, so nesting is safe but threads are not), and since 3.4.1 their refused-allocation flag and its static NaN stand-in, on the same terms, and since 3.4.2 the allocation scope: one per process, so a scope set on one thread is every thread's. Detail in the threat model's *Process-global state* row. Thread safety is demand-gated until a threaded consumer exists (roadmap *3.x.x — demand-gated*, audit `K005`) |
 | Capped constructors | A designed `0` (null) return from a dimension cap being **stored through** by the caller (CWE-476) | Closed in two passes: **2.6.14** for `cmat_new`'s four callers and the BFGS/L-BFGS working-memory allocations (`_OPT_MAX_DIM = 4096`, new `HSB_ERR_ALLOC`); **2.7.0** for `cmat_add`/`sub`/`adjoint`/`scale`/`trace`, which `cmat_commutator` feeds directly. Pre-fix mutants exit **139 (SIGSEGV)** |
 | Complex matrix multiply | Out-of-bounds read past `b`'s buffer when `cols(a) != rows(b)` (CWE-125) | Conformability check added 2.7.0 |
 | Unbounded / non-terminating loops | Work bounds that do not actually bound work | `cmat_exp`'s scaling loop hung forever on a non-finite norm (`+Inf * 0.5 == +Inf`) — capped 2.7.0. Adaptive Simpson capped recursion *depth* but permitted 2^50 integrand evaluations, which a NaN integrand reached exactly — bounded 2.6.14 |
@@ -54,7 +54,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 
 | Version | Supported |
 |---------|-----------|
-| hisab 3.x (current: 3.3.x) | Yes |
+| hisab 3.x (current: 3.4.x) | Yes |
 | hisab 2.24.x (supported 2.x line) | Yes |
 | hisab 2.0–2.23 | Best-effort |
 | Rust 1.x | Available via pre-2.0 git tags, unsupported |
@@ -71,9 +71,14 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
 - No `syscall(60, ...)` (process abort) in library code — errors travel as `Err(HSB_ERR_*)` in a `Result<T, E>` (3.0.0; integer return codes before that)
 - All public functions document their error conditions
 - Allocation sizes are guarded against overflow where inputs are user-controlled
-- Bump allocator (no free) — no use-after-free, no double-free
+- Bump allocator (no free) — no use-after-free, no double-free. Since 3.4.2 a caller may route
+  hisab's allocations to its own `Allocator` (`hisab_alloc_scope`, `src/heap.cyr`): a reset of that
+  allocator invalidates every value hisab returned under the scope and every structure it grew there,
+  which is the caller's contract, the same as `alloc_reset()`'s, narrowed to what hisab took. Memory from
+  a scope is zeroed before hisab reads it, as `alloc`'s is
 - No network I/O in core library
-- Single external dependency (sakshi for structured logging)
+- No package dependency: the Cyrius stdlib only, sakshi among its leaves (a `[deps.sakshi]` package
+  through 3.4.1)
 - P(-1) audit completed 2026-04-15 — see docs/audit/2026-04-15.md
 - Full sweep 2026-08-03 (70 findings, 2 critical) — the four P-tiers were repaired across
   2.6.12–2.6.15, but **six findings never appeared in a tier and so were never scheduled**; the
@@ -95,7 +100,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   deduplicated digest is exactly how the six unscheduled 2026-08-03 findings stayed invisible for
   four releases. Every dated report in docs/audit/ now records a disposition per finding
 - Public entry points are exercised under **abuse**, not only under use: `tests/abuse.tcyr` (added
-  2.9.0, **2764 assertions** at 3.4.1) drives negative indices, zero and huge dimensions, non-conformable
+  2.9.0, **2765 assertions** at 3.4.2) drives negative indices, zero and huge dimensions, non-conformable
   operands, the designed-`0` return, degenerate geometry and heap canaries. It surfaced **11 real
   defects on public entry points**, held in a known-defect register rather than deleted. The register
   is discharged: nine repaired into live assertions, the tenth re-measured and reclassified
@@ -111,7 +116,7 @@ Hisab is a pure mathematics library written in Cyrius providing linear algebra, 
   `scripts/check-constants.sh` (a CI gate since 2.6.12, after seven mis-transcribed tables shipped).
   The gate was itself audited: until 2.7.0 its regex rejected `_` digit separators and it silently
   skipped **35 of 145** declarations while printing "110/110 verified" — one of the skipped constants
-  encoded ~1e16 against a documented 1e15. **324/324 verified, 22 skipped** at 3.4.1 (258/258 at 3.4.0, 211/211 at 3.3.7, where every comment became an exact reading — a decimal must round to the encoded bits — and enum members joined the population; 209/209 at 3.3.6, 203/203 at 3.3.5, 177/177 at 3.3.4, 161/161 at 3.3.3, 155/155 at
+  encoded ~1e16 against a documented 1e15. **325/325 verified, 23 skipped** at 3.4.2 (324/324 at 3.4.1, 258/258 at 3.4.0, 211/211 at 3.3.7, where every comment became an exact reading — a decimal must round to the encoded bits — and enum members joined the population; 209/209 at 3.3.6, 203/203 at 3.3.5, 177/177 at 3.3.4, 161/161 at 3.3.3, 155/155 at
   3.3.2, which deleted eight dead hex constants; 163/163 at 3.3.0 and 3.3.1; the live count is in the roadmap's
   *Current* section), and since 2.20.0 the gate also catches a comment on the line above its
   declaration (a shape that had let a mis-transcribed `F64_1E_NEG30`

@@ -39,7 +39,7 @@ Hisab owns **typed mathematical operations**. It does NOT own:
   enforced since 3.3.0 by the bundle's `private` marker.
 - **392** benchmarks.
 - **36** modules in `[lib]` (35 math modules and `heap.cyr`, the allocation scope, since 3.4.2),
-  plus the `src/visibility.cyr` marker. Bundle `dist/hisab.cyr` 72,009 lines, 3,724,275 B; its
+  plus the `src/visibility.cyr` marker. Bundle `dist/hisab.cyr` 72,011 lines, 3,724,469 B; its
   sidecar names 9 leaves.
 - Measurement provenance: **8** unmarked claim lines (detector false positives), the baseline; CI runs `--ratchet` on every push since 3.3.6.
 - Every public function has a comment block (675 of 675); `check-doc-blocks.sh --ratchet` fails on one without.

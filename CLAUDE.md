@@ -396,6 +396,10 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   are calls, never `&name`. **No module may reach another's `_` name** — a cross-module helper is
   public API with a real name
 - **Result-migration gate**: `./scripts/check-result-migration.sh` (+ `--selftest`)
+- **Bare-fncall gate** (inline in `ci.yml`, no script): no line in `src/` may start with a `fncallN(`
+  statement. cycc 6.6.2–6.6.4 crash on a bare `fncallN` whose callee is a capturing closure, so bind
+  the result (`var r = fncall3(...)`). 3.4.2's `num_cg` shipped two bare calls to CI because this
+  gate has no script and was not run locally
 - **Doc-block gate**: `./scripts/check-doc-blocks.sh --ratchet` (+ `--selftest`): every public fn
   has a comment block directly above it. It reads presence, not accuracy
 - **Heap-pointer gate**: `./scripts/check-heap-globals.sh` (+ `--selftest`): a caller's `alloc_reset()`
@@ -422,6 +426,11 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
 - **Docs + security jobs**: README, CHANGELOG, VERSION, CONTRIBUTING, SECURITY, LICENSE and
   `cyrius.cyml` present, version consistency (above), and a scan for dangerous patterns in `src/`
 - **Concurrency**: CI uses `cancel-in-progress: true` keyed on workflow + ref
+- **Before calling CI green, run the workflow itself**: extract every `run:` block of
+  `.github/workflows/ci.yml` and run each with `bash --noprofile --norc -eo pipefail`, with
+  `RUNNER_TEMP` set to a scratch dir (the security scan writes there). A hand-picked list of the
+  scripts above misses the inline steps (3.4.2). The dist-drift step diffs against git, so before a
+  commit it reports the regenerated bundle as stale; that is expected
 
 ## DO NOT
 

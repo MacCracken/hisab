@@ -25,7 +25,7 @@ No public name changes meaning and no `HSB_ERR_*` code is added. The toolchain s
 | `#must_use` | 290 | 296 |
 | Benchmarks | 375 | 392 |
 | `[lib]` modules | 35 | 36 (`heap.cyr` added) |
-| Bundle | 70,654 lines, 3,660,265 B | 72,009 lines, 3,724,275 B |
+| Bundle | 70,654 lines, 3,660,265 B | 72,011 lines, 3,724,469 B |
 | `dist/hisab.deps` leaves | 7 | 9 (`fnptr`, `string` added) |
 
 **Pinned builds:**

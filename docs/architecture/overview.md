@@ -4,7 +4,7 @@
 > of the library's other formula families).
 >
 > hisab v3.4.2 — 35 math modules and the allocation scope (`heap.cyr`) in `src/`, plus the bundle's
-> `visibility.cyr` marker, 71,926 lines of Cyrius (`lib/` is vendored stdlib only). Compiled by cycc
+> `visibility.cyr` marker, 71,928 lines of Cyrius (`lib/` is vendored stdlib only). Compiled by cycc
 > 6.7.18; a consumer needs cycc ≥ 6.6.3 (`public struct` + `#derive`, since 3.1.0).
 
 ## Module Map

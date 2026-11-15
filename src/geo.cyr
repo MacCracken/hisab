@@ -12,9 +12,10 @@
 
 # ⭐ 3.3.7 — AN ENUM, NOT `var` GLOBALS. A `var` is a memory load and a relocation at every
 # reference; an enum member is an immediate (CLAUDE.md, "Enums for constants"). The two that
-# were aliases of error.cyr's public `F64_POS_INF` and `F64_TINY` hold the same literals: an
-# enum member cannot name a `var`, and those two stay `var` (public API). The constant gate
-# reads hex enum members as it reads `var` declarations (scripts/check-constants.sh).
+# were aliases of error.cyr's public `F64_POS_INF` and `F64_TINY` hold the same literals: those
+# were `var`s through 3.4.2, which an enum member cannot name, and are `HsbF64` members since
+# 3.5.0; the private copies stay. The constant gate reads hex enum members as it reads `var`
+# declarations (scripts/check-constants.sh).
 enum _GeoF64 {
     _GEO_F64_NEG_INF = 0xFFF0_0000_0000_0000;  # -Infinity
     _GEO_F64_POS_INF = 0x7FF0_0000_0000_0000;  # +Infinity
@@ -352,15 +353,41 @@ public fn geo_triangle_new(a, b, c) {
     return t;
 }
 
-# The unnormalised normal (v1 - v0) x (v2 - v0), |n| = twice the area, as a new HVec3. Plain
-# products of the edges: subnormal (fewer bits) below edges of about 2^-511, zero below 2^-537,
-# +Inf or NaN above about 2^512. geo_triangle_unit_normal forms the cross product exactly (finite
-# vertices): its direction holds at any scale.
+# The unnormalised normal (v1 - v0) x (v2 - v0), |n| = twice the area, as a new HVec3 (0 when its
+# allocation is refused). For finite vertices each component is the exact one rounded once at its own
+# magnitude (3.5.0): correctly rounded where it is normal, +-Inf only where it passes DBL_MAX, within
+# one subnormal ulp below DBL_MIN, and an exactly zero component +0 -- the components
+# geo_triangle_unit_normal is formed from (_geo_cross_fast, else _geo_cross_exact). A
+# NaN or infinite vertex keeps the plain products (NaN in, NaN out).
+# ⛔ 3.5.0 — THROUGH 3.4.2 THESE WERE PLAIN PRODUCTS OF THE ROUNDED EDGES (roadmap "geo_triangle_normal /
+# geo_triangle_area: plain products", GEO F4): the components flushed to zero below edges of about
+# 2^-537, were +Inf or NaN (Inf - Inf) above about 2^512 for a normal well inside the range, and a
+# component that cancels (an edge nearly parallel to an axis plane) kept the products' rounding
+# rather than its own. Cost: the certified path is Dekker products and a bound on every call, and a
+# near-colinear triangle or an edge component outside [2^-400, 2^401) pays the integer sums. On an
+# ordinary triangle (integer vertices) 223 ns where 3.4.2's plain products took 48, 4.6 times (the area
+# 219 against 46, 4.8 times), what geo_triangle_unit_normal pays since 3.4.1: medians of 9 interleaved
+# rounds (a 7-round run read the same).
+# [measured: scratch ab.cyr interleaved rounds, taskset, 3.4.2 base vs this tree, load 0.5-0.9, 2026-11-14]
+# The integer sums (an edge under 2^-400) about 500 ns (496 and 515 in two runs).
+# [measured: tests/hisab.bcyr b35L1_triangle_normal_exact, two runs, this tree, 2026-11-14]
 public fn geo_triangle_normal(tri) {
+    var v0 = GeoTriangle_v0(tri);
+    var v1 = GeoTriangle_v1(tri);
+    var v2 = GeoTriangle_v2(tri);
+    if ((_geo_hvec3_finite(v0) & _geo_hvec3_finite(v1) & _geo_hvec3_finite(v2)) == 1) {
+        var w: i64[3];
+        var xe: i64[1];
+        var c: i64[3];
+        var nz = _geo_cross_fast(v0, v1, v2, &w, &xe, &c);
+        if (nz < 0) { nz = _geo_cross_exact(v0, v1, v2, &w, &xe, &c); }
+        if (nz == 0) { return hvec3_new(0, 0, 0); }
+        return hvec3_new(load64(&c), load64(&c + 8), load64(&c + 16));
+    }
     var edge1: i64[3];
     var edge2: i64[3];
-    _geo_sub_to(&edge1, GeoTriangle_v1(tri), GeoTriangle_v0(tri));
-    _geo_sub_to(&edge2, GeoTriangle_v2(tri), GeoTriangle_v0(tri));
+    _geo_sub_to(&edge1, v1, v0);
+    _geo_sub_to(&edge2, v2, v0);
     return hvec3_cross(&edge1, &edge2);
 }
 
@@ -375,6 +402,10 @@ public fn geo_triangle_normal(tri) {
 # this function as of 2.17.0. See the block inside it for what replaced them and
 # why the exact-zero test was not enough on its own.
 # [measured: docs/development/issues/archived/2026-08-10-squared-epsilon-guards-in-geo-ray.md]
+# ⚠ A DEGENERATE TRIANGLE (exactly zero cross product) STILL ANSWERS (0, 1, 0), a unit vector no
+# caller can tell from a real normal: geo_triangle_unit_normal_checked (3.5.0) answers
+# Err(HSB_ERR_DEGENERATE) there and Err(HSB_ERR_INVALID_INPUT) for a non-finite vertex, with this
+# function's bits everywhere else. This name keeps its 3.4 answers until it is retired.
 public fn geo_triangle_unit_normal(tri) {
     var v0 = GeoTriangle_v0(tri);
     var v1 = GeoTriangle_v1(tri);
@@ -390,8 +421,8 @@ public fn geo_triangle_unit_normal(tri) {
     # [measured: GEO2 3.4.1 un2.py full-range families, Fraction oracle, 2026-10-31]
     # ⭐ 3.4.1 — THE ROUNDING IS CERTIFIED IN DOUBLES FIRST, AND THE INTEGER SUM RUNS ONLY WHERE IT
     # CANNOT BE (GEO2 G2-F3: the integer sum alone cost 730 ns against 3.4.0's 192). The fast path
-    # (_geo_unit_normal_fast: Dekker products, two_sum edges and a proven bound) writes the same
-    # doubles as the exact one (_geo_unit_normal_exact) wherever it answers, so the result is the
+    # (_geo_cross_fast: Dekker products, two_sum edges and a proven bound) writes the same
+    # doubles as the exact one (_geo_cross_exact) wherever it answers, so the result is the
     # same bits either way: 0 differences from the integer-only form, and 0 wrong, over GEO2's
     # 80,000 triangles in six families (4 seeds), and 0 differences between the two paths' doubles
     # over 400,000 triangles chosen to sit on its limits (near-colinear to 2^-52, exact ties,
@@ -402,9 +433,10 @@ public fn geo_triangle_unit_normal(tri) {
     # [2^-400, 2^401) goes straight to the integer sum, about 780 ns (800).
     # [measured: GEO3 3.4.1 un3.py, fstress.py, tb_un3.bcyr, Fraction oracle and exact path, 2026-10-31]
     var w: i64[3];
-    var nz = _geo_unit_normal_fast(v0, v1, v2, &w);
+    var xe: i64[1];
+    var nz = _geo_cross_fast(v0, v1, v2, &w, &xe, 0);
     if (nz < 0 && (_geo_hvec3_finite(v0) & _geo_hvec3_finite(v1) & _geo_hvec3_finite(v2)) == 1) {
-        nz = _geo_unit_normal_exact(v0, v1, v2, &w);
+        nz = _geo_cross_exact(v0, v1, v2, &w, &xe, 0);
     }
     if (nz >= 0) {
         if (nz == 0) { return hvec3_unit_y(); }
@@ -510,44 +542,16 @@ public fn geo_triangle_unit_normal(tri) {
     # within sin 0.17 of colinear, wrong by the cross product's cancellation, and
     # bit-identical to 3.3.3's answer for the same triangle at unit size.
     # [measured: georay unit-normal binade sweep, exact oracle, 3.3.3 geo.cyr vs repaired, 2026-10-03; cycc 6.6.14]
-    # ⛔ 3.3.6 — HALVED ONLY WHEN AN EDGE REACHES 2^1023, NOT WHEN A COORDINATE DOES.
-    # 3.3.4 halved every vertex whenever a coordinate was in the top binade, which drops
-    # a subnormal last bit, and where the big coordinates cancel that bit is the whole
-    # edge: (2^1023, 0, 0), (2^1023, 2^-1074, 0), (2^1023, 0, 2^-1074) got unit_y, not
-    # +x, where its 2^1022 copy was right. The edges are now formed first and halved
-    # only when one reaches 2^1023 (or overflows) from finite vertices. 80024 triangles
-    # (the repros, and 20000 each with top-binade coordinates shared so that they
-    # cancel, with vertices more than DBL_MAX apart, with random top-binade vertices,
-    # and with none in the top binade), against the exact unit normal of the exact
-    # edges within 4 * 2^-53: 572 wrong -> right, none right -> wrong. Only the
-    # cancelling family moved (575 right answers, within 1.00 * 2^-53 before and
-    # after), and the 14816 of it that translate exactly to an ordinary position give
-    # that position's answer bit for bit (3.3.5: 14024).
-    # [measured: C336 row-6 sweep, exact Fraction oracle, 3.3.5 vs this tree, not in-tree, 2026-10-11; cycc 6.6.14]
-    # ⚠ 2^1023, NOT OVERFLOW ALONE (geo_segment_direction's test). An edge in the top
-    # binade scales by 2^-1022 into [2, 4), one binade above every smaller triangle's
-    # [1, 2), so where a scaled component is subnormal it rounds differently; halving
-    # there keeps the answer the unit-size one through the top binade. Halving on
-    # overflow alone changed it for 2 of 42947 exactly scaled mixed-magnitude triangles
-    # and moved 610 right answers with vertices more than DBL_MAX apart or random
-    # top-binade vertices; this moves none of those from 3.3.5's bits.
-    # [measured: C336 row-6 covariance and variant sweeps, 3.3.5 vs this tree, not in-tree, 2026-10-11; cycc 6.6.14]
-    var m = _geo_absmax_bits(e1);
-    var m2 = _geo_absmax_bits(e2);
-    if (m2 > m) { m = m2; }
-    if ((m >> 52) >= 2046) {
-        if (_geo_top_binade(v0, v1, v2, v0) == 1) {
-            var h0: i64[3];
-            var h1: i64[3];
-            var h2: i64[3];
-            _geo_scale_to(&h0, v0, F64_HALF);
-            e1 = _geo_sub_to(&e1s, _geo_scale_to(&h1, v1, F64_HALF), &h0);
-            e2 = _geo_sub_to(&e2s, _geo_scale_to(&h2, v2, F64_HALF), &h0);
-            m = _geo_absmax_bits(e1);
-            m2 = _geo_absmax_bits(e2);
-            if (m2 > m) { m = m2; }
-        }
-    }
+    # ⛔ 3.5.0 — THE TOP-BINADE HALVING THAT STOOD HERE IS GONE: IT COULD NOT RUN (roadmap "Dead code in
+    # geo_triangle_unit_normal", INS5 F4). Since 3.4.1 every finite triangle answers above, so this
+    # path is reached only with a non-finite vertex: _geo_cross_fast returns -1 at the first
+    # edge component whose exponent field is 2047, and for finite vertices _geo_cross_exact
+    # returns 0 or 1. The halving ran when _geo_top_binade saw the largest |coordinate| in binade
+    # 2046, but a non-finite vertex puts it at 2047, so the test was 0 on every input that got here
+    # (3.3.6 added it for finite vertices, which no longer come this way). Its five mutants
+    # survived every suite for that reason. The unit_y fallback below cannot be returned on this
+    # path either: an infinite or NaN edge component makes two components of the cross product
+    # Inf or NaN (Inf x 0 is NaN), so the length is never 0.
     # ⛔ 3.4.1 — EACH EDGE HAS ITS OWN POWER OF TWO (AU2-G2-F5). One factor for both took the longer
     # edge into [1, 2) and flushed the shorter one: v1 = (4C73C0CA428C59FB, 0, 0), v2 = (0,
     # 017E06522C8B909A, 0176A09E667F3BCD) from 0 got the fallback (0, 1, 0) for (0,
@@ -564,12 +568,49 @@ public fn geo_triangle_unit_normal(tri) {
     return _geo_unit_or(&cr, hvec3_unit_y());
 }
 
+# The unit normal of the triangle, (v1 - v0) x (v2 - v0) / |...|, as Ok(a new HVec3); 3.5.0, the error
+# channel geo_triangle_unit_normal lacks (roadmap "Documented in their own comments, the same class").
+# A triangle whose cross product is exactly zero (colinear or coincident vertices, at any scale) has
+# no normal, and geo_triangle_unit_normal answers the unit vector (0, 1, 0) there, a legal normal
+# with nothing to say it was invented. Here:
+#   * Ok(n): every triangle with finite vertices and a non-zero exact cross product, with the bits
+#     geo_triangle_unit_normal gives it (the same certified or exact components, the same division);
+#   * Err(HSB_ERR_DEGENERATE): the exact cross product is zero;
+#   * Err(HSB_ERR_INVALID_INPUT): a NaN or infinite vertex coordinate, or a 0 handle for the triangle
+#     or a vertex (a point at infinity has no plane through it with the other two; the unchecked
+#     form answers NaN components there);
+#   * Err(HSB_ERR_ALLOC): the result's allocation was refused.
+#must_use
+public fn geo_triangle_unit_normal_checked(tri) {
+    if (tri == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var v0 = GeoTriangle_v0(tri);
+    var v1 = GeoTriangle_v1(tri);
+    var v2 = GeoTriangle_v2(tri);
+    if (v0 == 0 || v1 == 0 || v2 == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if ((_geo_hvec3_finite(v0) & _geo_hvec3_finite(v1) & _geo_hvec3_finite(v2)) == 0) {
+        return Err(HSB_ERR_INVALID_INPUT);
+    }
+    var w: i64[3];
+    var xe: i64[1];
+    var nz = _geo_cross_fast(v0, v1, v2, &w, &xe, 0);
+    if (nz < 0) { nz = _geo_cross_exact(v0, v1, v2, &w, &xe, 0); }
+    if (nz == 0) { return Err(HSB_ERR_DEGENERATE); }
+    var len = f64_sqrt(hvec3_dot(&w, &w));
+    var r = hvec3_new(f64_div(HVec3_x(&w), len), f64_div(HVec3_y(&w), len), f64_div(HVec3_z(&w), len));
+    if (r == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(r);
+}
+
 # The cross product of finite vertices for geo_triangle_unit_normal, exactly (3.4.1): component i of
 # (v1 - v0) x (v2 - v0) summed as an integer from the edges' two words (two_sum, so exact), or from
 # v1 x v2 + v2 x v0 + v0 x v1 where an edge overflows; each correctly rounded with its own power of
 # two, the three taken to the largest one's (the largest into [1, 2)) and written to w. Returns 1,
-# or 0 for an exactly zero cross product (w then unwritten).
-fn _geo_unit_normal_exact(v0, v1, v2, w) {
+# or 0 for an exactly zero cross product (w then unwritten). (3.5.0) xe receives the power of two
+# that takes w back to the cross product (component i is about w_i 2^xe), and raw, when not 0, the
+# three components each rounded once at its own magnitude (m_i 2^e_i through _geo_ldexp: correctly
+# rounded where normal, +-Inf past DBL_MAX, and below DBL_MIN within one subnormal ulp, the 53-bit
+# rounding being rounded again), an exactly zero one as +0: geo_triangle_normal's answer.
+fn _geo_cross_exact(v0, v1, v2, w, xe, raw) {
     var de1: i64[19];
     var de2: i64[19];
     _geo_xi_dvec(v1, v0, &de1);
@@ -627,15 +668,22 @@ fn _geo_unit_normal_exact(v0, v1, v2, w) {
         var x = _geo_ldexp(load64(&mg + m * 16), load64(&mg + m * 16 + 8) - em - 52);
         if (load64(&sg + m * 8) < 0) { x = f64_neg(x); }
         store64(w + m * 8, x);
+        if (raw != 0) {
+            # (a zero sum's record is (0, 0), so its y is +0)
+            var y = _geo_ldexp(load64(&mg + m * 16), load64(&mg + m * 16 + 8));
+            if (load64(&sg + m * 8) < 0) { y = f64_neg(y); }
+            store64(raw + m * 8, y);
+        }
     }
+    store64(xe, em + 52);
     return 1;
 }
 
 # geo_triangle_unit_normal's certified fast path (3.4.1, GEO3): each component of the exact cross
 # product (v1 - v0) x (v2 - v0) correctly rounded, from double arithmetic and a proven bound on its
 # error, or -1 where the bound cannot certify that rounding (the caller then takes
-# _geo_unit_normal_exact). On success w holds the three rounded components times the power of two
-# that takes the largest into [1, 2), the doubles _geo_unit_normal_exact writes (each a single
+# _geo_cross_exact). On success w holds the three rounded components times the power of two
+# that takes the largest into [1, 2), the doubles _geo_cross_exact writes (each a single
 # rounding of the same real number), so the unit normal is the exact path's bit for bit; the return
 # is 1, or 0 for an exactly zero cross product. Every non-zero edge component must lie in
 # [2^-400, 2^401) (else -1): nothing below overflows, and every product is normal. A non-finite
@@ -663,7 +711,7 @@ fn _geo_unit_normal_exact(v0, v1, v2, w) {
 #   * Both products zero: a zero factor in each (they cannot underflow), and A + a is 0 exactly
 #     when A is, so c = 0 exactly. When nothing was rounded (a, b, k, d, r, p, q all 0), c = s
 #     exactly, certified whatever the bound says (integer vertices, exact cancellations).
-fn _geo_unit_normal_fast(v0, v1, v2, w) {
+fn _geo_cross_fast(v0, v1, v2, w, xe, raw) {
     var p0x = load64(v0 + 0);
     var p0y = load64(v0 + 8);
     var p0z = load64(v0 + 16);
@@ -804,16 +852,50 @@ fn _geo_unit_normal_fast(v0, v1, v2, w) {
     store64(w, f64_mul(cx, sc));
     store64(w + 8, f64_mul(cy, sc));
     store64(w + 16, f64_mul(cz, sc));
+    store64(xe, (big >> 52) - 1023);   # (3.5.0: c = w 2^(E - 1023); see _geo_cross_exact)
+    if (raw != 0) {
+        # (3.5.0: the rounded components themselves, each normal or an exact zero here. A zero is +0
+        # already: a component starts at +0 and is written only for a non-zero product, where P - Q of
+        # equal products and its error sums are +0.)
+        store64(raw, cx);
+        store64(raw + 8, cy);
+        store64(raw + 16, cz);
+    }
     return 1;
 }
 
-# Half the length of geo_triangle_normal: the area, within its range (above).
+# _geo_cross_fast with its 3.4.1 arity, for the white-box rows in tests/modules.tcyr and
+# tests/hisab.bcyr: w and the return as there (3.5.0).
+fn _geo_unit_normal_fast(v0, v1, v2, w) {
+    var xe: i64[1];
+    return _geo_cross_fast(v0, v1, v2, w, &xe, 0);
+}
+
+# The area, half the length of (v1 - v0) x (v2 - v0). For finite vertices (3.5.0) the length is taken
+# from the exact cross product's components each rounded once and brought to a common power of two
+# with the largest in [1, 2) (geo_triangle_unit_normal's w), and that power taken back once
+# (_geo_ldexp): within a few ulps at every scale, +Inf only where the area itself passes DBL_MAX, 0
+# exactly for a degenerate triangle. Through 3.4.2 the plain cross product was +Inf or NaN for
+# triangles whose area is finite (edges past about 2^512) and 0 below edges of about 2^-537 (roadmap
+# "geo_triangle_normal / geo_triangle_area: plain products"). A NaN or infinite vertex keeps the
+# plain products (NaN in, NaN out).
 public fn geo_triangle_area(tri) {
+    var v0 = GeoTriangle_v0(tri);
+    var v1 = GeoTriangle_v1(tri);
+    var v2 = GeoTriangle_v2(tri);
+    if ((_geo_hvec3_finite(v0) & _geo_hvec3_finite(v1) & _geo_hvec3_finite(v2)) == 1) {
+        var w: i64[3];
+        var xe: i64[1];
+        var nz = _geo_cross_fast(v0, v1, v2, &w, &xe, 0);
+        if (nz < 0) { nz = _geo_cross_exact(v0, v1, v2, &w, &xe, 0); }
+        if (nz == 0) { return 0; }
+        return _geo_ldexp(f64_mul(f64_sqrt(hvec3_dot(&w, &w)), F64_HALF), load64(&xe));
+    }
     var edge1: i64[3];
     var edge2: i64[3];
     var n: i64[3];
-    _geo_sub_to(&edge1, GeoTriangle_v1(tri), GeoTriangle_v0(tri));
-    _geo_sub_to(&edge2, GeoTriangle_v2(tri), GeoTriangle_v0(tri));
+    _geo_sub_to(&edge1, v1, v0);
+    _geo_sub_to(&edge2, v2, v0);
     _geo_cross_into(&edge1, &edge2, &n);
     return f64_mul(hvec3_length(&n), F64_HALF);
 }
@@ -918,6 +1000,10 @@ public fn geo_segment_midpoint(seg) {
 
 # 2.10.2: squared length against an unsquared tolerance -- see
 # geo_triangle_unit_normal. A segment shorter than 1e-6 got a fabricated unit_x.
+# ⚠ A ZERO SEGMENT (start = end) STILL ANSWERS (1, 0, 0), a unit vector no caller can tell from a
+# real direction: geo_segment_direction_checked (3.5.0) answers Err(HSB_ERR_DEGENERATE) there and
+# Err(HSB_ERR_INVALID_INPUT) for a non-finite end, with this function's bits everywhere else. This
+# name keeps its 3.4 answers until it is retired.
 public fn geo_segment_direction(seg) {
     var p0 = GeoSegment_start(seg);
     var p1 = GeoSegment_end(seg);
@@ -980,6 +1066,39 @@ public fn geo_segment_direction(seg) {
     # length where 3.3.4 took the halved difference's).
     # [measured: G1 segment sweep, exact Fraction/Decimal oracle, 3.3.4 tree vs this one, 2026-10-11; cycc 6.6.14]
     return _geo_unit_or(d, hvec3_unit_x());
+}
+
+# The unit direction (end - start) / |end - start| as Ok(a new HVec3); 3.5.0, the error channel
+# geo_segment_direction lacks (roadmap "Documented in their own comments, the same class"). A
+# segment whose ends are equal has no direction, and geo_segment_direction answers the unit vector
+# (1, 0, 0) there, a legal direction with nothing to say it was invented. Here:
+#   * Ok(u): finite ends that differ, with the bits geo_segment_direction gives them (the same
+#     difference, halved where it overflows, and the same _geo_unit_or arithmetic);
+#   * Err(HSB_ERR_DEGENERATE): end - start is exactly zero, which for finite ends is exactly
+#     end = start (a difference that rounds to 0 is exact);
+#   * Err(HSB_ERR_INVALID_INPUT): a NaN or infinite coordinate, or a 0 handle for the segment or an
+#     end (the unchecked form answers NaN components there);
+#   * Err(HSB_ERR_ALLOC): the result's allocation was refused.
+# Finite ends whose difference overflows have a coordinate in the top binade (two doubles below
+# 2^1023 differ by at most DBL_MAX), so the halving is the unchecked form's in every such case.
+#must_use
+public fn geo_segment_direction_checked(seg) {
+    if (seg == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var p0 = GeoSegment_start(seg);
+    var p1 = GeoSegment_end(seg);
+    if (p0 == 0 || p1 == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if ((_geo_hvec3_finite(p0) & _geo_hvec3_finite(p1)) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var ds: i64[3];
+    var d = _geo_sub_to(&ds, p1, p0);
+    if ((_geo_absmax_bits(d) >> 52) == 2047) {
+        var h0: i64[3];
+        var h1: i64[3];
+        d = _geo_sub_to(&ds, _geo_scale_to(&h1, p1, F64_HALF), _geo_scale_to(&h0, p0, F64_HALF));
+    }
+    if (_geo_absmax_bits(d) == 0) { return Err(HSB_ERR_DEGENERATE); }
+    var u = _geo_unit_or(d, 0);
+    if (u == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(u);
 }
 
 # 2.10.2, and this one is LOAD-BEARING beyond itself: geo_segment_distance_to_point
@@ -1187,8 +1306,12 @@ public fn geo_segment_distance_to_point(seg, point) {
 #            Reported rather than resolved: picking a side would be a silent
 #            wrong answer, and the grazing-incidence convention in geo_diff.cyr
 #            is already to return the miss sentinel at a non-differentiable point.
-public var GEO_FACE_NONE      = -1;
-public var GEO_FACE_OUT_BYTES = 16;
+# ⛔ 3.5.0 (K003) — ENUM MEMBERS, NOT `public var`. Through 3.4.2 these and the GEO_CAP_* tags below
+# were `public var` globals, which a consumer could assign, and every read was a memory load and a
+# relocation. An enum member is an immediate the compiler folds, and an assignment to one is a
+# compile error. The names and values are unchanged, so every read compiles as before.
+public enum GeoFace { GEO_FACE_NONE = -1 }
+public enum GeoFaceLayout { GEO_FACE_OUT_BYTES = 16 }
 
 # THE CAPSULE reports a BRANCH, not a face: its surface is three pieces, and the
 # derivative differs per piece even though the surface itself is C1 where they
@@ -1196,10 +1319,13 @@ public var GEO_FACE_OUT_BYTES = 16;
 # to report. The cap/cylinder seam IS differentiable: hemisphere and cylinder are
 # tangent there, and the two branches' gradients agree in the limit, which the
 # suite asserts rather than assumes.
-public var GEO_CAP_CYLINDER  = 0;
-public var GEO_CAP_START_CAP = 1;
-public var GEO_CAP_END_CAP   = 2;
-public var GEO_CAP_SPHERE    = 3;    # degenerate capsule: start == end, a plain sphere
+# (3.5.0, K003: enum members, as GEO_FACE_NONE above.)
+public enum GeoCapBranch {
+    GEO_CAP_CYLINDER  = 0;
+    GEO_CAP_START_CAP = 1;
+    GEO_CAP_END_CAP   = 2;
+    GEO_CAP_SPHERE    = 3;    # degenerate capsule: start == end, a plain sphere
+}
 
 # 1 when x is +/-Infinity, 0 otherwise -- INCLUDING for NaN, which is the whole
 # point of writing it this way. 2.10.2: the slab routines return `0 on miss,
@@ -1207,6 +1333,8 @@ public var GEO_CAP_SPHERE    = 3;    # degenerate capsule: start == end, a plain
 # 20,000 configurations returning a non-finite t from entirely FINITE inputs,
 # where the true value simply overflowed the exponent range.
 # [measured: docs/development/issues/archived/2026-08-10-slab-parallel-test-is-scale-free.md]
+# (3.5.0: a hit past DBL_MAX from finite input is +Inf in the slab routines too, as in every other
+# ray routine, decided in the exact order; see the tail of geo_ray_aabb_face.)
 #
 # ⚠ NaN IS DELIBERATELY LEFT ALONE, and the first draft of this got it wrong.
 # A `f64_lt(f64_abs(x), POS_INF)` finiteness test rejects NaN too -- and that
@@ -1288,8 +1416,37 @@ public fn geo_face_is_max(face) {
 # it; it described the pre-2.7.0 code and was never updated. Audit 2026-08-04,
 # api-consistency (low). Pinned by tests/modules.tcyr, "geo_ray_plane: the doc's
 # return convention, pinned".
+# ACCURACY (3.5.0), for finite n, d, o and d0 (n need not be unit, GeoPlane_set_normal, nor d,
+# GeoRay_set_direction). The verdict is the exact one (parallel: n . d exactly 0; behind: t < 0; else
+# the hit), except that a hit whose exact t is below 2^-1075 rounds to +0 and so reads as the miss, as
+# a contact at t = 0 does. t is the plain quotient, within 2^-33 relative of the exact (d0 - n . o) /
+# (n . d) (ray_triangle's contract), where a bound certifies both sums and that quotient lies in
+# [2^-1021, 2^1023); anywhere else both sums are correctly rounded and their quotient rounded once more
+# (within 3u relative, u = 2^-53), and a subnormal t once more to the subnormal grid (within 2 of its
+# ulps). So +Inf comes only for an exact t past DBL_MAX or within 3u of it. -0 comes only for an origin
+# exactly on the plane with n . d < 0 (above); every other miss is +0.
+# NON-FINITE INPUT (3.5.0): a NaN anywhere is NaN, on every path (an exactly parallel ray's included:
+# through 3.4.2 that one answered the miss 0). With finite n and d and an infinite o or d0 (no NaN), an
+# exactly parallel ray is the miss; otherwise d0 - n . o is infinite or NaN (an infinite o_i against
+# n_i = 0, or infinities that cancel), and the answer is that NaN, or +Inf or the miss by its sign against
+# n . d's exact one (through 3.4.2 the plain n . d's, whose overflow made Inf / Inf a NaN). An infinite or
+# NaN n or d keeps 3.4.2's plain quotient (hvec3_dot's products), bit for bit.
 public fn geo_ray_plane(ray, plane) {
-    var denom = hvec3_dot(GeoPlane_normal(plane), GeoRay_direction(ray));
+    var n = GeoPlane_normal(plane);
+    var d = GeoRay_direction(ray);
+    var nx = load64(n);
+    var ny = load64(n + 8);
+    var nz = load64(n + 16);
+    # (3.5.0: n . d in hvec3_dot's order, (x x' + y y') + z z', with its products kept for the bound below.
+    # On this x86-64 build the sum has hvec3_dot's bits wherever it is not zero, NaN and Inf included; a zero
+    # sum can differ in sign (93 of 200,000 vector pairs, every difference). No answer reads that sign: the
+    # certified quotient needs a non-zero sum, the sums' path takes n . d's sign from its exact value, and a
+    # non-finite n or d takes hvec3_dot itself, below.)
+    # [measured: scratch drv5 hvec3_dot against the in-order sum, mixed finite and non-finite pairs, 2026-11-14]
+    var pdx = f64_mul(nx, load64(d));
+    var pdy = f64_mul(ny, load64(d + 8));
+    var pdz = f64_mul(nz, load64(d + 16));
+    var denom = f64_add(f64_add(pdx, pdy), pdz);
     # ⛔ `denom` = n·d carries the MAGNITUDE of the ray direction, so this absolute
     # 1e-12 made the answer depend on how long the caller's direction vector is.
     # Measured: plane z = 0, ray from (0,0,5) along (0,0,-2^-40) returns 0 — the
@@ -1303,19 +1460,79 @@ public fn geo_ray_plane(ray, plane) {
     if (f64_lt(f64_abs(denom), _GEO_F64_TINY) == 1) {
         # (A zero factor in each of the three products: exactly parallel, the miss, as 3.4.0 cheaply.)
         if ((denom & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
-            var pn = GeoPlane_normal(plane);
-            var pd = GeoRay_direction(ray);
-            if (((HVec3_x(pn) & 0x7FFF_FFFF_FFFF_FFFF) == 0 || (HVec3_x(pd) & 0x7FFF_FFFF_FFFF_FFFF) == 0)
-              && ((HVec3_y(pn) & 0x7FFF_FFFF_FFFF_FFFF) == 0 || (HVec3_y(pd) & 0x7FFF_FFFF_FFFF_FFFF) == 0)
-              && ((HVec3_z(pn) & 0x7FFF_FFFF_FFFF_FFFF) == 0 || (HVec3_z(pd) & 0x7FFF_FFFF_FFFF_FFFF) == 0)) {
-                return 0;
+            if (((nx & 0x7FFF_FFFF_FFFF_FFFF) == 0 || (HVec3_x(d) & 0x7FFF_FFFF_FFFF_FFFF) == 0)
+              && ((ny & 0x7FFF_FFFF_FFFF_FFFF) == 0 || (HVec3_y(d) & 0x7FFF_FFFF_FFFF_FFFF) == 0)
+              && ((nz & 0x7FFF_FFFF_FFFF_FFFF) == 0 || (HVec3_z(d) & 0x7FFF_FFFF_FFFF_FFFF) == 0)) {
+                return _geo_ray_plane_par(n, GeoRay_origin(ray), GeoPlane_distance(plane));
             }
         }
-        return _geo_ray_plane_small(ray, plane, denom);
+        return _geo_ray_plane_small(ray, plane);
     }
-    var t = f64_div(f64_sub(GeoPlane_distance(plane), hvec3_dot(GeoPlane_normal(plane), GeoRay_origin(ray))), denom);
-    if (f64_lt(t, 0) == 1) { return 0; }
-    return t;
+    var o = GeoRay_origin(ray);
+    var dist = GeoPlane_distance(plane);
+    var pox = f64_mul(nx, load64(o));
+    var poy = f64_mul(ny, load64(o + 8));
+    var poz = f64_mul(nz, load64(o + 16));
+    var num = f64_sub(dist, f64_add(f64_add(pox, poy), poz));   # (hvec3_dot's order, as n . d above)
+    # ⛔ 3.5.0 — n . d AND d0 - n . o ARE CERTIFIED BEFORE THEIR QUOTIENT IS TRUSTED (roadmap "geo_ray_plane
+    # where n . d cancels above DBL_MIN"; R2-GEO S8, RV-GEO N6, GEO F3). Through 3.4.2 only a |n . d|
+    # below DBL_MIN reached the exact sums, so a sum that cancelled above it kept its rounding: n =
+    # (1, 3, 7), d = (0.1, -0.2, 0.07142857142857142), o = (1, 2, 3), d0 0.5 gave t = 438B800000000000
+    # for 439B800000000000 (exact n . d = -5.55e-17, Fraction), a factor of 2; a cancelling family
+    # turned hits into misses and misses into hits. A subnormal numerator kept a few bits, and finite
+    # n and d set past 2^512 (GeoPlane_set_normal) made n . d Inf - Inf, NaN, for a finite t.
+    # Each sum of three rounded products (and d0) is within E <= gamma_3 S + 3 2^-1075 of its exact
+    # value, S its sum of |terms| (gamma_3 = 3u / (1 - 3u) < 2^-51.4, and the computed S is within
+    # gamma_3 of the exact one). Where |n . d| > 2^-16 S_d and |num| > 2^-16 S_n + 2^-1000, each is
+    # within 2^-35 of itself (with num's own rounding, and |n . d| >= DBL_MIN here), so both signs
+    # are exact (the verdict is) and the quotient is within 2^-33 of the exact t, ray_triangle's
+    # contract. Such a quotient is returned where it lies in [2^-1021, 2^1023), so that an exact t
+    # past DBL_MAX or below DBL_MIN, which it can be within 2^-33 of, is never answered from it:
+    # those, and every other finite input, take the correctly rounded sums of _geo_ray_plane_small.
+    # The 2^-16 is a cost threshold, not a correctness one: a smaller one sends more rays to the sums.
+    # On 70,369 finite rays in nine families (n . d cancelling, d0 - n . o cancelling, ordinary, mixed scales
+    # to 2^+-300, setter-built n and d past 2^512, subnormal numerators, t near DBL_MAX, t near DBL_MIN,
+    # exponents across the range) against the exact quotient, 3.4.2 read 1,996 hits as the miss and 92 misses
+    # as hits, gave NaN for 1,435 and +Inf for 435 finite t, put 6,423 normal t past 2^-33 and a subnormal one
+    # 66 ulps off, and answered 5,687 misses -0; this tree none of these. Its certified quotients were within
+    # 2^-37.5, the sums' t within 2.5 u, its subnormal t within 1.08 ulps; 4,169 hits whose t is below
+    # 2^-1075 read +0 (the range edge above). Of 60,000 inputs with an infinite or NaN coordinate every answer
+    # is the contract above; 2,649 differ from 3.4.2: 2,561 NaN (Inf / Inf, an infinite d0 - n . o over an
+    # overflowed n . d) now +Inf or the miss, 3 more exactly parallel, 26 parallel rays with a NaN origin or
+    # distance now NaN, and 59 that took the plain n . d's wrong sign now take its exact one.
+    # [measured: scratch plane_sweep.py seeds 21-22, nf_sweep.py 5-6, Fraction oracle, 3.4.2 vs this tree, 2026-11-14]
+    # Cost on an ordinary ray about 4 ns, 15%: medians 31 ns (30-33) against 3.4.2's 27 (26-28) over 9
+    # interleaved rounds, and the same over 7 (an earlier pass under load 4.7-5.7 read 33 against 30).
+    # geo_jet_plane's ordinary hit: 156 ns against 137, +14%, this and the jet's own bound (geo_diff.cyr).
+    # [measured: scratch ab.cyr interleaved rounds, taskset, 3.4.2 base vs this tree, load 0.5-0.9, 2026-11-14]
+    # The sums' path, n . d cancelling, about 500 ns (489 and 515 in two runs).
+    # [measured: tests/hisab.bcyr b35L1_ray_plane_cancel, two runs, this tree, 2026-11-14]
+    var sd = f64_add(f64_add(pdx & 0x7FFF_FFFF_FFFF_FFFF, pdy & 0x7FFF_FFFF_FFFF_FFFF), pdz & 0x7FFF_FFFF_FFFF_FFFF);
+    var sn = f64_add(f64_add(f64_add(pox & 0x7FFF_FFFF_FFFF_FFFF, poy & 0x7FFF_FFFF_FFFF_FFFF),
+        poz & 0x7FFF_FFFF_FFFF_FFFF), dist & 0x7FFF_FFFF_FFFF_FFFF);
+    if (f64_gt(f64_abs(denom), f64_mul(sd, 0x3EF0_0000_0000_0000)) == 1 &&
+      f64_gt(f64_abs(num), f64_add(f64_mul(sn, 0x3EF0_0000_0000_0000), 0x0170_0000_0000_0000)) == 1) {
+        # (2^-16 = 3EF0000000000000, 2^-1000 = 0170000000000000. Both sums are non-zero with their exact
+        # signs here, so opposite signs are a t below zero, the miss +0, even where the quotient would
+        # underflow to -0. Every input is finite here: an infinite or NaN one makes S_d or S_n infinite or NaN.)
+        if ((num ^ denom) < 0) { return 0; }
+        var t = f64_div(num, denom);
+        var tex = t >> 52;   # (t > 0: its exponent field)
+        if (tex >= 2 && tex <= 2045) { return t; }
+        return _geo_ray_plane_small(ray, plane);
+    }
+    if ((_geo_hvec3_finite(n) & _geo_hvec3_finite(d)) == 1) { return _geo_ray_plane_small(ray, plane); }
+    # An infinite or NaN n or d: 3.4.2's quotient, hvec3_dot's products and all. n . d is then infinite or
+    # NaN, so the quotient is +-0 or NaN, never below zero (3.4.2's `t < 0` test here could not fire).
+    return f64_div(f64_sub(dist, hvec3_dot(n, o)), hvec3_dot(n, d));
+}
+
+# geo_ray_plane's answer for an exactly parallel ray (n . d exactly 0, n and d finite): the miss 0,
+# or, for a NaN origin or distance, that input's NaN as the plain quotient carries it (3.5.0: through
+# 3.4.2 a NaN there answered the miss, the one path where NaN in was not NaN out).
+fn _geo_ray_plane_par(n, o, dist) {
+    if (_geo_hvec3_nan(o) == 0 && f64_eq(dist, dist) == 1) { return 0; }
+    return f64_sub(dist, hvec3_dot(n, o));
 }
 
 # c0 + a . b (neg 0) or c0 - a . b (neg 1) correctly rounded to 53 bits, from double arithmetic behind
@@ -1329,7 +1546,7 @@ public fn geo_ray_plane(ray, plane) {
 #     much smaller component falls below 2^-1022), c0 by 2^(ka + kb) through its exponent field (a
 #     subnormal c0, or the scaled exponent outside [61, 1985], declines).
 #   * Each product a_i b_i = P_i + p_i exactly (Dekker: both factors split into 26-bit halves at bit 27,
-#     as _geo_unit_normal_fast splits them); P_x + P_y + P_z (negated for neg) and c0 are summed by
+#     as _geo_cross_fast splits them); P_x + P_y + P_z (negated for neg) and c0 are summed by
 #     two_sum into s and their errors, so the scaled sum is s + T, T the two_sum errors plus or minus
 #     p_x + p_y + p_z, formed as T~ with |T - T~| <= 5.01 u (|p| + |two_sum errors|) <= 20.1 u^2 (sum
 #     |P_i| + |c0|) < 2^-101.6 (sum |P_i| + |c0|) (u = 2^-53), and up to 2^-1073 more for each product
@@ -1338,7 +1555,7 @@ public fn geo_ray_plane(ray, plane) {
 #   * y = RN(s + T~), z = T~ - (y - s) (Fast2Sum, exact when |T~| <= |s|): the sum lies within Eb of
 #     y + z, and when y + RN(z + Eb) and y + RN(z - Eb) both round to y, so does every point between
 #     (rounding is monotone; the spare third covers RN(z +- Eb)'s own rounding): the sum's rounding is
-#     y (_geo_unit_normal_fast's certificate). When |T~| > |s|, |y| <= 8.01 u (sum |P_i| + |c0|), so
+#     y (_geo_cross_fast's certificate). When |T~| > |s|, |y| <= 8.01 u (sum |P_i| + |c0|), so
 #     Eb > 3.9 ulp(y) and the test declines whatever z is. y must also lie in [2^-1000, 2^1000), where
 #     its rounding is the 53-bit one.
 fn _geo_plane_dot_fast(a, b, c0, neg, out) {
@@ -1423,7 +1640,7 @@ fn _geo_plane_dot_fast(a, b, c0, neg, out) {
         sm = f64_add(sm, f64_abs(cs));
     }
     if ((s2 & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 0 - 2; }   # the leading terms cancel exactly: the integer sum
-    # Dekker's product errors (the halves rounded at bit 27, as _geo_unit_normal_fast splits them).
+    # Dekker's product errors (the halves rounded at bit 27, as _geo_cross_fast splits them).
     var ha = (ax + 0x0400_0000) & 0xFFFF_FFFF_F800_0000;
     var la = f64_sub(ax, ha);
     var hc = (bx + 0x0400_0000) & 0xFFFF_FFFF_F800_0000;
@@ -1457,13 +1674,18 @@ fn _geo_plane_dot_fast(a, b, c0, neg, out) {
     return 1;
 }
 
-# geo_ray_plane where |n . d| is below DBL_MIN (3.4.1): n . d and d0 - n . o correctly rounded to 53
-# bits, as exact integer sums of their products (_geo_xi_add2), so no product is lost however far
-# below the others it lies (a cancellation of the large ones leaves it: see "Exact sums" below), and t
-# is their quotient with one more rounding back (_geo_ldexp); +Inf past DBL_MAX, as the plain quotient
-# gives it. n . d exactly 0 is a parallel ray, the miss. A non-finite origin or distance takes the
-# plain quotient (NaN in, NaN out). n and d are finite here: an infinite component of either makes
-# n . d infinite or NaN.
+# geo_ray_plane where |n . d| is below DBL_MIN (3.4.1), or (3.5.0) where n and d are finite and its plain
+# sums are not certified to 2^-35 or their quotient lies outside [2^-1021, 2^1023): n . d and d0 - n . o
+# correctly rounded to 53 bits, as exact integer sums of their products (_geo_xi_add2), so no product is
+# lost however far below the others it lies (a cancellation of the large ones leaves it: see "Exact
+# sums" below), and t is their quotient with one more rounding back (_geo_ldexp): within 3u of the exact
+# t where normal, 2 subnormal ulps below DBL_MIN, +Inf past DBL_MAX or within 3u of it. Opposite exact
+# signs are the miss +0 (3.5.0: through 3.4.2 a negative t that underflowed came back as -0); an exactly
+# zero numerator is 0 with n . d's sign (the origin on the plane, geo_ray_plane's doc). n . d exactly 0
+# is a parallel ray, the miss (a NaN origin or distance: NaN, _geo_ray_plane_par). A non-finite origin
+# or distance makes the plain numerator infinite or NaN: NaN in, NaN out, else +Inf or the miss by its
+# sign against n . d's exact one. n and d are finite here: an infinite component of either makes n . d
+# infinite or NaN.
 # ⭐ 3.4.1 — EACH SUM IS FIRST CERTIFIED IN DOUBLES (GEO5, GF3-3: the integer sums cost the row 12%,
 # 304-318 -> 346-347 ns). _geo_plane_dot_fast returns the integer sum's own rounding wherever its bound
 # certifies it, so every answer is the integer path's bit for bit: 0 differences from the integer-only
@@ -1475,7 +1697,7 @@ fn _geo_plane_dot_fast(a, b, c0, neg, out) {
 # products cancel exactly (ray_plane_small_cancel) pays the attempt, about 10 ns, before the integer
 # sums.
 # [measured: GEO5 3.4.1 psw5.py, 4 seeds, first 3.4.1 tree's bits, Fraction oracle; tb_arr.bcyr, 2026-11-01]
-fn _geo_ray_plane_small(ray, plane, denom) {
+fn _geo_ray_plane_small(ray, plane) {
     var n = GeoPlane_normal(plane);
     var o = GeoRay_origin(ray);
     var dist = GeoPlane_distance(plane);
@@ -1487,12 +1709,17 @@ fn _geo_ray_plane_small(ray, plane, denom) {
         _geo_xi_vec(GeoRay_direction(ray), &rr + 72);
         _geo_xi_init(&acc);
         for (var i = 0; i < 3; i = i + 1) { _geo_xi_add2(&acc, &rr + i * 24, &rr + 72 + i * 24, 0); }
-        if (_geo_xi_val(&acc, 0, &rd) == 0) { return 0; }
+        if (_geo_xi_val(&acc, 0, &rd) == 0) { return _geo_ray_plane_par(n, o, dist); }
     }
     if ((_geo_hvec3_finite(o) == 0) || (f64_lt(f64_abs(dist), _GEO_F64_POS_INF) == 0)) {
-        var tp = f64_div(f64_sub(dist, hvec3_dot(n, o)), denom);
-        if (f64_lt(tp, 0) == 1) { return 0; }
-        return tp;
+        # (3.5.0: the numerator is infinite or NaN here (an infinite o_i meets n_i = 0 as NaN, d0 = Inf
+        # meets an infinite n . o likewise), so the answer is NaN, +Inf, or the miss for an infinity of the
+        # other sign than n . d's exact one. Through 3.4.2 it divided by the plain n . d, whose sign is wrong
+        # where it cancels and which is Inf - Inf, or an Inf to make Inf / Inf, from finite n and d.)
+        var tp = f64_sub(dist, hvec3_dot(n, o));
+        if (f64_eq(tp, tp) == 0) { return tp; }
+        if ((tp ^ load64(&rd)) < 0) { return 0; }
+        return f64_abs(tp);
     }
     var rn: i64[2];
     if (_geo_plane_dot_fast(n, o, dist, 1, &rn) == 0 - 2) {
@@ -1513,9 +1740,8 @@ fn _geo_ray_plane_small(ray, plane, denom) {
         for (var j = 0; j < 3; j = j + 1) { _geo_xi_add2(&acc, &rr + j * 24, &rr + 72 + j * 24, 1); }
         _geo_xi_val(&acc, 0, &rn);
     }
-    var t = _geo_ldexp(f64_div(load64(&rn), load64(&rd)), load64(&rn + 8) - load64(&rd + 8));
-    if (f64_lt(t, 0) == 1) { return 0; }
-    return t;
+    if (f64_lt(f64_mul(load64(&rn), load64(&rd)), 0) == 1) { return 0; }   # (opposite exact signs: t < 0)
+    return _geo_ldexp(f64_div(load64(&rn), load64(&rd)), load64(&rn + 8) - load64(&rd + 8));
 }
 
 # x * 2^e with a single rounding (3.3.6), for a finite x and any integer e: the
@@ -1615,6 +1841,12 @@ fn _geo_quad_roots(hb, a, c, delta, sq, out) {
 # more than its radius. f and r are multiplied by the power of two that takes the
 # larger into [1, 2); p[0] is delta there (its sign is the verdict) and p[1] is
 # sqrt(a * delta) multiplied back, exactly, to the caller's scale.
+# ⛔ 3.5.0 — a delta PAST DBL_MAX FOR |d| FROM 2^511: delta is 1 to 4 at that scale, and a ray along a
+# direction 2^511.9 long at a sphere of radius 2^-569 read t = 0 for 2^-773, its root sqrt(a delta) +Inf.
+# The root is now taken at another scale where the product leaves the normal range (_geo_sqrt_ad). Rays along
+# directions 2^509 to 2^512 long at spheres under 2^-484: 182 of 6,000 wrong in the merged tree, 115 with
+# _geo_sph_xcert alone, none with this too.
+# [measured: scratch orc.py dbig_flush, seeds 2-3, exact Fraction oracle, merged / interim / this tree, 2026-11-14]
 fn _geo_delta_fine(fv, r, a, p) {
     var m = _geo_absmax_bits(fv);
     var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
@@ -1627,8 +1859,20 @@ fn _geo_delta_fine(fv, r, a, p) {
     var rs = f64_mul(r, sf);
     var df = f64_sub(f64_mul(rs, rs), hvec3_dot(&fs, &fs));
     store64(p, df);
-    store64(p + 8, _geo_ldexp(f64_sqrt(f64_mul(a, df)), 1023 - (sf >> 52)));
+    store64(p + 8, _geo_ldexp(_geo_sqrt_ad(a, df), 1023 - (sf >> 52)));
     return 0;
+}
+
+# sqrt(a x) for a of 2^-968 or more and a finite x under 2^128 (3.5.0): where the product falls under 2^-968
+# (x > 0, _geo_sqrt_tiny) or past DBL_MAX it is taken at another scale, by powers of two, so the bits are those
+# of sqrt(a x) wherever the product is normal. NaN for x < 0.
+fn _geo_sqrt_ad(a, x) {
+    var p = f64_mul(a, x);
+    if (p == 0x7FF0_0000_0000_0000) {   # +Inf: a past 2^896 here
+        return f64_mul(f64_sqrt(f64_mul(f64_mul(a, 0x37F0_0000_0000_0000), x)), 0x43F0_0000_0000_0000);   # 2^-128, 2^64
+    }
+    if (f64_gt(x, 0) == 1 && p < 0x0370_0000_0000_0000) { return _geo_sqrt_tiny(a, x); }   # 2^-968
+    return f64_sqrt(p);
 }
 
 # x^2 as an unevaluated sum p[0] + p[1], exactly (Dekker's split; no fused multiply),
@@ -2188,6 +2432,40 @@ fn _geo_dperp_fine(ray, capsule, ao, oh, u, usa, uh, uu, out) {
     return (sd >> 52) - 1023;
 }
 
+# d_perp with end - start's rounding carried, for a ray 1/8 to 1/4 of the way off the axis (3.5.0, roadmap "Rays
+# near a long capsule's axis"): d - (u + ul) k into out per component, the product u_i k exact (Dekker) and the
+# roundings of the subtraction and of u = end - start carried, k = d_par as rounded. Its part along u, about
+# 2^-52 |d| from k's rounding, is under 2^-49 of |d_perp| there and moves the barrel's a, hb and offset only to
+# second order, so the second projection _geo_dperp_fine takes (for rays nearer the axis, where that part is not
+# small) is not needed. The caller's tests bound the inputs: d's largest component within 2^+-900 and k under 2^900
+# (the splits cannot overflow), |d_perp|^2 at least 2^-968 and under |d|^2 / 16 (so |d| over 2^-482 and the angle
+# under 15 degrees), and |u|^2 under DBL_MAX (us = 0). So k = (d . u) / |u|^2 is over 0.96 * 2^-482 / 2^512, past
+# 2^-995: normal, its own rounding 2^-53 of it. A product u_i k under 2^-968 may lose its low word to underflow,
+# under 2^-1021 against a d_perp over 2^-484.
+fn _geo_dperp_q(d, st, en, u, k, out) {
+    var sy = f64_mul(k, 0x41A0_0000_0200_0000);   # 2^27 + 1
+    var yh = f64_sub(sy, f64_sub(sy, k));
+    var yl = f64_sub(k, yh);
+    for (var i = 0; i < 3; i = i + 1) {
+        var di = load64(d + i * 8);
+        var ui = load64(u + i * 8);
+        var ei = load64(en + i * 8);
+        var bb2 = f64_sub(ui, ei);
+        var ul = f64_add(f64_sub(ei, f64_sub(ui, bb2)), f64_sub(f64_neg(load64(st + i * 8)), bb2));
+        var sx = f64_mul(ui, 0x41A0_0000_0200_0000);   # 2^27 + 1
+        var xh = f64_sub(sx, f64_sub(sx, ui));
+        var xl = f64_sub(ui, xh);
+        var pr = f64_mul(ui, k);
+        var pe = f64_add(f64_add(f64_sub(f64_mul(xh, yh), pr), f64_mul(xh, yl)), f64_mul(xl, yh));
+        pe = f64_add(pe, f64_mul(xl, yl));   # u_i k = pr + pe exactly
+        var sv = f64_sub(di, pr);
+        var bb3 = f64_sub(sv, di);
+        var se = f64_add(f64_sub(di, f64_sub(sv, bb3)), f64_sub(f64_neg(pr), bb3));
+        store64(out + i * 8, f64_add(sv, f64_sub(se, f64_add(pe, f64_mul(ul, k)))));
+    }
+    return 0;
+}
+
 # The roundings of the barrel's copy at unit size (3.4.0): bx as for _geo_cap_axis_offset (ray,
 # capsule, ao, oh, u, usa, uh, e) and, at bx + 64, the power of two (log2) from d_perp to its copy.
 # ocs and dsc are the copy's o_perp and d_perp as the caller formed them; their exact values less
@@ -2657,7 +2935,7 @@ fn _geo_barrel_xact(ray, capsule, out) {
     # axis 2^-244 long) was refused at the verdict; both its roots are now within 3.2e-78 ulp. (Its
     # answer is still wrong: that capsule is far from the origin against its size, and the far copy
     # (_geo_capsule_far), which does not call this solver, reads a hit at t = 1 for the exact miss
-    # that 3.3.7 and integ-snap6 gave; nor could _geo_barrel_seam_x place the root, its N A^2 +
+    # that 3.3.7 and integ-snap6 gave; nor could _geo_barrel_seam_x (deleted in 3.5.0) place the root, its N A^2 +
     # 2 M A B + K B^2 flushing below 2^-1074 at unit size there.)
     # [measured: R2E aimed family (x_len.aimed, seed 1), exact Fractions, base, integ-snap6 and this tree, 2026-10-31]
     var lxd = f64_mul(f64_from(load64(&x + 168)), 0x4020_0000_0000_0000);   # 8 per input scaling
@@ -2747,7 +3025,7 @@ fn _geo_barrel_xact(ray, capsule, out) {
     return 1;
 }
 
-# The barrel's inputs at unit size, for _geo_barrel_xact, _geo_barrel_seam_x and _geo_barrel_csign
+# The barrel's inputs at unit size, for _geo_barrel_xact and _geo_barrel_csign
 # (3.4.0): w = o - start and u = end - start each as two words (its scaled rounding, then its scaled
 # value; one word where the rounding is 0) and d, each times the power of two that takes its largest
 # component into [1, 2). Into x (26 words): w at 0 (6 words), u at 48, d at 96 (3), the word counts
@@ -2910,235 +3188,6 @@ fn _geo_xup(x, y) {
     var e = (m >> 52) - 1023;
     if (e < 0 - 1022) { e = 0 - 1022; }   # a subnormal: 2^1022 takes it to [2^-52, 2)
     return 0 - e;
-}
-
-# Where the barrel's exact roots (out2[0] the near, out2[1] the far) lie against the segment's end
-# planes (3.4.0): -1 before the start plane, 2 past the end plane, 0 on the segment (its planes
-# included), or 3 when that cannot be decided exactly here (the caller then keeps its own test). For a root
-# _geo_barrel_xact solved whose segment test, formed from the root rounded, is within its rounding
-# of a plane: a ray grazing a thin barrel at its seam, where the barrel's two roots and the cap
-# sphere's can agree in every bit and only the exact place of the root says which surface is hit.
-# With the inputs at unit size and exact as there (w = o - start, u = end - start, d), the barrel is
-# f(tau) = N tau^2 + 2 M tau + K = 0 (N = |u x d|^2, M = (u x w) . (u x d), K = |u x w|^2 - r^2 |u|^2)
-# and a plane is crossed at tau_p = A / B, B = d . u, A = -(w . u) for the start and c |u|^2 - w . u
-# for the end (c the ratio of the two scalings). f(tau_p) B^2 = N A^2 + 2 M A B + K B^2 is negative
-# when tau_p lies between the roots, and (A N + M B) B has the sign of tau_p less the vertex -M / N;
-# both are exact expansions, so the root's side of each plane is exact. 3 when an input is not
-# finite, a counted rounding (_geo_xmul_l, _geo_xsc) could reach one of those signs, an expansion
-# would pass its bound, or the end plane is wanted with |u| more than 2^60 times |w|.
-fn _geo_barrel_seam_x(ray, capsule, out2) {
-    store64(out2, 3);
-    store64(out2 + 8, 3);
-    var x: i64[26];
-    if (_geo_xunit(ray, capsule, &x) == 0) { return 0; }
-    var wx = &x;
-    var ux = &x + 48;
-    var dx = &x + 96;
-    var wn = &x + 120;
-    var un = &x + 144;
-    var lostv: i64[2];
-    store64(&lostv, load64(&x + 168));
-    store64(&lostv + 8, f64_from(load64(&x + 168)));
-    var lost = &lostv;
-    var sw = load64(&x + 184);
-    var su = load64(&x + 192);
-    var r1: i64[1];
-    store64(&r1, load64(&x + 176));
-    # n = u x d, m = u x w; then N, M, K, |u|^2, w . u and B = d . u.
-    var nx: i64[288];
-    var mx: i64[288];
-    var nl: i64[3];
-    var ml: i64[3];
-    for (var k = 0; k < 3; k = k + 1) {
-        var j1 = (k + 1) % 3;
-        var j2 = (k + 2) % 3;
-        var a1 = ux + j1 * 16;
-        var a2 = ux + j2 * 16;
-        var n1 = load64(un + j1 * 8);
-        var n2 = load64(un + j2 * 8);
-        var lnk = _geo_xmul_l(&nx + k * 768, 0, a1, n1, dx + j2 * 8, 1, F64_ONE, lost);
-        lnk = _geo_xmul_l(&nx + k * 768, lnk, a2, n2, dx + j1 * 8, 1, f64_neg(F64_ONE), lost);
-        var lmk = _geo_xmul_l(&mx + k * 768, 0, a1, n1, wx + j2 * 16, load64(wn + j2 * 8), F64_ONE, lost);
-        lmk = _geo_xmul_l(&mx + k * 768, lmk, a2, n2, wx + j1 * 16, load64(wn + j1 * 8), f64_neg(F64_ONE), lost);
-        if (lnk < 0 || lmk < 0) { return 0; }
-        store64(&nl + k * 8, _geo_xcompress(&nx + k * 768, lnk));
-        store64(&ml + k * 8, _geo_xcompress(&mx + k * 768, lmk));
-    }
-    var q: i64[10];   # N, M, K, B with their lengths, and lost
-    var nn: i64[96];
-    var mn: i64[96];
-    var kk: i64[96];
-    var uu: i64[96];
-    var wu: i64[96];
-    var bb: i64[96];
-    var lnn = 0;
-    var lmn = 0;
-    var lkk = 0;
-    var luu = 0;
-    var lwu = 0;
-    var lbb = 0;
-    for (var c2 = 0; c2 < 3; c2 = c2 + 1) {
-        var pn = &nx + c2 * 768;
-        var pm = &mx + c2 * 768;
-        var ln = load64(&nl + c2 * 8);
-        var lm = load64(&ml + c2 * 8);
-        var pu = ux + c2 * 16;
-        var lu = load64(un + c2 * 8);
-        lnn = _geo_xmul_l(&nn, lnn, pn, ln, pn, ln, F64_ONE, lost);
-        lmn = _geo_xmul_l(&mn, lmn, pm, lm, pn, ln, F64_ONE, lost);
-        lkk = _geo_xmul_l(&kk, lkk, pm, lm, pm, lm, F64_ONE, lost);
-        luu = _geo_xmul_l(&uu, luu, pu, lu, pu, lu, F64_ONE, lost);
-        lwu = _geo_xmul_l(&wu, lwu, wx + c2 * 16, load64(wn + c2 * 8), pu, lu, F64_ONE, lost);
-        lbb = _geo_xmul_l(&bb, lbb, dx + c2 * 8, 1, pu, lu, F64_ONE, lost);
-    }
-    if (luu < 0) { return 0; }
-    luu = _geo_xcompress(&uu, luu);
-    var r2: i64[2];
-    var lr2 = _geo_xmul_l(&r2, 0, &r1, 1, &r1, 1, F64_ONE, lost);
-    lkk = _geo_xmul_l(&kk, lkk, &r2, lr2, &uu, luu, f64_neg(F64_ONE), lost);
-    if (lnn < 0 || lmn < 0 || lkk < 0 || lwu < 0 || lbb < 0) { return 0; }
-    lnn = _geo_xcompress(&nn, lnn);
-    lmn = _geo_xcompress(&mn, lmn);
-    lkk = _geo_xcompress(&kk, lkk);
-    lwu = _geo_xcompress(&wu, lwu);
-    lbb = _geo_xcompress(&bb, lbb);
-    if (_geo_xsign(&nn, lnn) <= 0) { return 0; }   # (parallel to the axis: not the barrel's)
-    var sb = _geo_xsign(&bb, lbb);
-    # A = -(w . u): the start plane.
-    var ax: i64[96];
-    for (var i2 = 0; i2 < lwu; i2 = i2 + 1) { store64(&ax + i2 * 8, f64_neg(load64(&wu + i2 * 8))); }
-    var lax = lwu;
-    var ce = ((sw >> 52) - 1023) - ((su >> 52) - 1023);   # log2 c
-    var ae: i64[96];
-    var lae = 0 - 1;
-    if (ce <= 60) {
-        # A = c |u|^2 - w . u: the end plane.
-        lae = 0;
-        for (var i3 = 0; i3 < luu; i3 = i3 + 1) {
-            var uw = load64(&uu + i3 * 8);
-            var cw = _geo_ldexp(uw, ce);
-            if ((cw & 0x7FFF_FFFF_FFFF_FFFF) < 0x0010_0000_0000_0000) {
-                store64(lost, load64(lost) + 1);
-                store64(lost + 8, f64_add(load64(lost + 8), F64_ONE));
-            }
-            lae = _geo_xgrow(&ae, lae, cw);
-        }
-        for (var i4 = 0; i4 < lax; i4 = i4 + 1) {
-            if (lae > 92) { lae = _geo_xcompress(&ae, lae); }
-            if (lae > 92) { return 0; }
-            lae = _geo_xgrow(&ae, lae, load64(&ax + i4 * 8));
-        }
-        lae = _geo_xcompress(&ae, lae);
-    }
-    if (sb == 0) {
-        # The ray runs parallel to the end planes: every point is at the axial place w . u.
-        var sp = 0;
-        if (_geo_xsign(&wu, lwu) < 0) { sp = 0 - 1; }
-        elif (lae < 0) { sp = 3; }
-        elif (_geo_xsign(&ae, lae) < 0) { sp = 2; }
-        store64(out2, sp);
-        store64(out2 + 8, sp);
-        return 0;
-    }
-    store64(&q, &nn);
-    store64(&q + 8, lnn);
-    store64(&q + 16, &mn);
-    store64(&q + 24, lmn);
-    store64(&q + 32, &kk);
-    store64(&q + 40, lkk);
-    store64(&q + 48, &bb);
-    store64(&q + 56, lbb);
-    store64(&q + 64, lost);
-    store64(&q + 72, sb);
-    # Each root on or past the start plane: (w + tau d) . u >= 0, tau on tau_s's side that B points
-    # to; then on or before the end plane. (Both roots at once: the planes' signs are shared.)
-    var vs: i64[2];
-    var ve: i64[2];
-    if (_geo_seam_cmp(&q, &ax, lax, &vs) == 3) { return 0; }
-    var ves = 3;
-    if (lae >= 0) { ves = _geo_seam_cmp(&q, &ae, lae, &ve); }
-    for (var ri = 0; ri < 2; ri = ri + 1) {
-        var an = 0;
-        if (load64(&vs + ri * 8) * sb < 0) { an = 0 - 1; }
-        elif (ves == 3) { an = 3; }
-        elif (load64(&ve + ri * 8) * sb > 0) { an = 2; }
-        store64(out2 + ri * 8, an);
-    }
-    return 0;
-}
-
-# For _geo_barrel_seam_x: the exact roots against tau_p = A / B (A at a, la words; N, M, K, B, B's
-# sign and the rounding count at q), each -1, 0 or 1 as the root is below, at or above it, into out2
-# (near, far); returns 3 when not decided, else 0. A rounding counted at q's lost moves N A^2 + 2 M A B + K B^2 by under
-# 2^(lb - 1048 + 2 eA + 2 eB + eK) and A N + M B by under 2^(lb - 1048 + eA + eB + eK), each e the
-# exponent (0 or more) of the largest of its kind (every word of N, M, K, B is under 2^8 at unit
-# size, and each rounding is 2^-1072 or less): a sign within that is not taken.
-fn _geo_seam_cmp(q, a, la, out2) {
-    var nn = load64(q);
-    var lnn = load64(q + 8);
-    var mn = load64(q + 16);
-    var lmn = load64(q + 24);
-    var kk = load64(q + 32);
-    var lkk = load64(q + 40);
-    var bb = load64(q + 48);
-    var lbb = load64(q + 56);
-    var lost = load64(q + 64);
-    var sb = load64(q + 72);
-    var a2: i64[96];
-    var ab: i64[96];
-    var b2: i64[96];
-    var la2 = _geo_xmul_l(&a2, 0, a, la, a, la, F64_ONE, lost);
-    var lab = _geo_xmul_l(&ab, 0, a, la, bb, lbb, F64_TWO, lost);
-    var lb2 = _geo_xmul_l(&b2, 0, bb, lbb, bb, lbb, F64_ONE, lost);
-    if (la2 < 0 || lab < 0 || lb2 < 0) { return 3; }
-    la2 = _geo_xcompress(&a2, la2);
-    lab = _geo_xcompress(&ab, lab);
-    lb2 = _geo_xcompress(&b2, lb2);
-    var f: i64[96];
-    var lf = _geo_xmul_l(&f, 0, nn, lnn, &a2, la2, F64_ONE, lost);
-    lf = _geo_xmul_l(&f, lf, mn, lmn, &ab, lab, F64_ONE, lost);
-    lf = _geo_xmul_l(&f, lf, kk, lkk, &b2, lb2, F64_ONE, lost);
-    var g: i64[96];
-    var lg = _geo_xmul_l(&g, 0, a, la, nn, lnn, F64_ONE, lost);
-    lg = _geo_xmul_l(&g, lg, mn, lmn, bb, lbb, F64_ONE, lost);
-    if (lf < 0 || lg < 0) { return 3; }
-    lf = _geo_xcompress(&f, lf);
-    lg = _geo_xcompress(&g, lg);
-    var lb = _geo_xbits(load64(lost));
-    if (lb > 0) {
-        var ea = _geo_xexp0(_geo_xval(a, la));
-        var eb = _geo_xexp0(_geo_xval(bb, lbb));
-        var ek = f64_add(f64_abs(_geo_xval(nn, lnn)), f64_abs(_geo_xval(mn, lmn)));
-        ek = _geo_xexp0(f64_add(ek, f64_abs(_geo_xval(kk, lkk))));
-        if (_geo_xabove(_geo_xval(&f, lf), lb - 1048 + 2 * ea + 2 * eb + ek) == 0) { return 3; }
-        if (_geo_xabove(_geo_xval(&g, lg), lb - 1048 + ea + eb + ek) == 0) { return 3; }
-    }
-    var sf = _geo_xsign(&f, lf);
-    var sv = _geo_xsign(&g, lg) * sb;   # the sign of tau_p less the vertex
-    var c0 = 0;
-    var c1 = 0;
-    if (sf < 0) {
-        c0 = 0 - 1;   # tau_p between the roots
-        c1 = 1;
-    } elif (sf > 0) {
-        if (sv == 0) { return 3; }
-        c0 = 0 - sv;   # tau_p below both roots (sv < 0): each root is above it
-        c1 = 0 - sv;
-    } elif (sv < 0) {   # tau_p is the near root
-        c1 = 1;
-    } elif (sv > 0) {   # tau_p is the far root
-        c0 = 0 - 1;
-    }
-    store64(out2, c0);   # (a double root at tau_p: both 0)
-    store64(out2 + 8, c1);
-    return 0;
-}
-
-# The exponent of |x| when it is 1 or more (finite), else 0.
-fn _geo_xexp0(x) {
-    var e = ((x & 0x7FFF_FFFF_FFFF_FFFF) >> 52) - 1023;
-    if (e < 0) { return 0; }
-    return e;
 }
 
 # _geo_barrel_far on the plain differences w = o - start and u = end - start (their roundings, 2^-53
@@ -3660,6 +3709,72 @@ fn _geo_disc_x(oc, lo, d, dlo, r, out) {
     return 1;
 }
 
+# c = |o_perp|^2 - r^2 for the exact o_perp, from the o_perp op the caller formed and its plain c = ococ - rr
+# (3.5.0, _geo_barrel_fast's band): cb holds the ray, the capsule, ao = o - start, u = end - start and k = o_par,
+# each as the caller rounded them (oh = 0, us = 0). Per component, (o - start) - (end - start) k is formed with
+# the roundings of both differences and of the product carried, less op: lo, o_perp's rounding (plus a part along
+# the axis from k's own rounding, which moves c only by 2 (k_true - k) (op . u): no ray of 4,000 band origins 2^38
+# to 2^47 radii along moved when it was projected out, so it is not). Then c is the exact |op|^2 - r^2, the squares'
+# low words and the sums' errors carried (ococ - rr itself is exact here, Sterbenz: |c| < ococ / 2 puts rr within
+# [ococ / 2, 2 ococ]), plus 2 op . lo. op and r within 2^+-100, the caller's range.
+# [measured: scratch W2 first pass, evalfam.py farband, the projection variant vs this tree, 2026-11-14]
+fn _geo_cap_band_c(cb, op, rb, rr, c) {
+    var o = GeoRay_origin(load64(cb));
+    var st = GeoCapsule_start(load64(cb + 8));
+    var en = GeoCapsule_end(load64(cb + 8));
+    var ao = load64(cb + 16);
+    var u = load64(cb + 24);
+    var k = load64(cb + 32);
+    var sy = f64_mul(k, 0x41A0_0000_0200_0000);   # 2^27 + 1
+    var yh = f64_sub(sy, f64_sub(sy, k));
+    var yl = f64_sub(k, yh);
+    var dl = 0;    # op . lo
+    var sq0 = 0;   # the running sum of the squares, as ococ was formed
+    var cl = 0;    # ococ's error: the squares' low words and the sums' errors
+    for (var i = 0; i < 3; i = i + 1) {
+        var oi = load64(o + i * 8);
+        var si = load64(st + i * 8);
+        var ai = load64(ao + i * 8);
+        var ui = load64(u + i * 8);
+        var ei = load64(en + i * 8);
+        var nb = f64_neg(si);
+        var bb = f64_sub(ai, oi);
+        var aol = f64_add(f64_sub(oi, f64_sub(ai, bb)), f64_sub(nb, bb));   # o - start = ai + aol
+        var bb2 = f64_sub(ui, ei);
+        var ul = f64_add(f64_sub(ei, f64_sub(ui, bb2)), f64_sub(nb, bb2));   # end - start = ui + ul
+        var sx = f64_mul(ui, 0x41A0_0000_0200_0000);   # 2^27 + 1
+        var xh = f64_sub(sx, f64_sub(sx, ui));
+        var xl = f64_sub(ui, xh);
+        var pr = f64_mul(ui, k);
+        var pe = f64_add(f64_add(f64_sub(f64_mul(xh, yh), pr), f64_mul(xh, yl)), f64_mul(xl, yh));
+        pe = f64_add(pe, f64_mul(xl, yl));   # u_i k = pr + pe exactly
+        var sv = f64_sub(ai, pr);
+        var bb3 = f64_sub(sv, ai);
+        var se = f64_add(f64_sub(ai, f64_sub(sv, bb3)), f64_sub(f64_neg(pr), bb3));   # ai - pr = sv + se
+        var pi = load64(op + i * 8);
+        var li = f64_add(f64_sub(sv, pi), f64_sub(f64_add(se, aol), f64_add(pe, f64_mul(ul, k))));
+        dl = f64_add(dl, f64_mul(pi, li));
+        var sp = f64_mul(pi, 0x41A0_0000_0200_0000);   # 2^27 + 1
+        var ph = f64_sub(sp, f64_sub(sp, pi));
+        var pl = f64_sub(pi, ph);
+        var p2 = f64_mul(pi, pi);
+        var pq = f64_add(f64_sub(f64_mul(ph, ph), p2), f64_mul(F64_TWO, f64_mul(ph, pl)));
+        cl = f64_add(cl, f64_add(pq, f64_mul(pl, pl)));   # pi^2 = p2 + that
+        if (i == 0) { sq0 = p2; }
+        else {
+            var s2 = f64_add(sq0, p2);
+            var b4 = f64_sub(s2, sq0);
+            cl = f64_add(cl, f64_add(f64_sub(sq0, f64_sub(s2, b4)), f64_sub(p2, b4)));
+            sq0 = s2;
+        }
+    }
+    var spr = f64_mul(rb, 0x41A0_0000_0200_0000);   # 2^27 + 1
+    var rh = f64_sub(spr, f64_sub(spr, rb));
+    var rl = f64_sub(rb, rh);
+    var rlo = f64_add(f64_add(f64_sub(f64_mul(rh, rh), rr), f64_mul(F64_TWO, f64_mul(rh, rl))), f64_mul(rl, rl));
+    return f64_add(c, f64_add(f64_sub(cl, rlo), f64_mul(F64_TWO, dl)));
+}
+
 # _geo_sph_solve for a barrel whose o_perp, r and d_perp have their largest components between
 # 2^-100 and 2^100, written out without the copies at unit size (3.3.7): its operations in its
 # order, and powers of two being exact, the bits of the scaled solve multiplied back. It runs only
@@ -3671,7 +3786,25 @@ fn _geo_disc_x(oc, lo, d, dlo, r, out) {
 # review's five capsule families, the lane's thirteen and 20,000 special-value rays. It saves the
 # copies' two scalings and multiplications back.
 # [measured: rt2 mutant M47 (always hand back) vs this tree, rt2e/evalcap.py and rtp families, 2026-10-31]
-fn _geo_barrel_fast(op, dp, rb, out) {
+# ⛔ 3.5.0 — c CANCELLED BY ONE BIT TOOK o_perp's ROUNDING WHOLE (roadmap "Ordinary capsules: t past 4 ulp", "Rays
+# near a long capsule's axis"). Where |c| is under |o_perp|^2 / 2 (an origin 1.15 to 1.41 radii off the axis, or
+# 0.82 to 0.89 inside), o_perp's rounding, an ulp or two of each component, is 4 to 8 ulps of c, and the near root c / q
+# (the hit from outside, the exit for half the origins inside) has it all. There, when cb is not 0 (the caller's block,
+# the inputs o_perp was formed from), c is formed again with o_perp's rounding carried (_geo_cap_band_c); cb = 0 keeps
+# the plain c (an axis or o - start the caller took at another scale). On 20,000 rays with origins 0.7 to 1.5 radii
+# off the axis, past 4 ulp went from 456 (at most 10.9) to 36 (at most 7.0), 2 the other way (to 4.35 and 4.05); on
+# 12,000 with half the origins 1 to 1.6 radii off, 233 (at most 14.9) to 36 (6.1), 1 the other way (5.9); on 60,000
+# ordinary rays, 60 (at most 8.2) to 38 (4.9), 1 the other way (4.23), with the rest of 3.5.0's capsule changes. Rebuilt
+# samples of the same families: 728 of 20,000 (12.6) to 22 (6.5), 6 the other way (to 5.2); 34 of 60,000 ordinary rays
+# (7.1) to 18 (5.3), none the other way. Cost, this tree against the base before it, the same changes included, in two
+# pinned sessions: +11.5% and +12.3% on the first family, +3.9% and +4.1% on ordinary rays (first measured as +2.4%).
+# (Moving the 2-bit threshold to 1, which sends the same rays to the scaled solve and its lows, gave about the same
+# answers at about 1 us more per ray that takes it: +31% on a half-banded family, +1.4 to 1.9% on ordinary rays.)
+# [measured: scratch W2 first pass, threshold-1 variant (evalfam.py, timeab.py), 2026-11-14]
+# [measured: scratch W2 ev.py band / mixed / ord seeds 2-3, exact Fraction oracle, base vs this tree, 2026-11-14]
+# [measured: scratch W2 tm.py, taskset-pinned interleaved, 9-11 rounds (load 3-6, noisy), base vs this tree, 2026-11-14]
+# [measured: scratch W2 review fix ev.py band1 / ord2-3, Fractions; tm.sh pinned interleaved, 11-15 rounds, 2026-11-14]
+fn _geo_barrel_fast(op, dp, rb, cb, out) {
     var mp = _geo_absmax_bits(op);
     var mr = rb & 0x7FFF_FFFF_FFFF_FFFF;
     if (mr > mp) { mp = mr; }
@@ -3689,6 +3822,9 @@ fn _geo_barrel_fast(op, dp, rb, out) {
     var ococ = f64_add(f64_add(f64_mul(ox, ox), f64_mul(oy, oy)), f64_mul(oz, oz));
     var c = f64_sub(ococ, rr);
     if ((c & 0x7FFF_FFFF_FFFF_FFFF) < (ococ & 0x7FFF_FFFF_FFFF_FFFF) - 0x0020_0000_0000_0000) { return 2; }
+    if (cb != 0 && (c & 0x7FFF_FFFF_FFFF_FFFF) < (ococ & 0x7FFF_FFFF_FFFF_FFFF) - 0x0010_0000_0000_0000) {
+        c = _geo_cap_band_c(cb, op, rb, rr, c);
+    }
     var k = f64_div(hb, a);
     var fx = f64_sub(ox, f64_mul(k, dx));
     var fy = f64_sub(oy, f64_mul(k, dy));
@@ -3735,9 +3871,10 @@ fn _geo_barrel_fast(op, dp, rb, out) {
 # overflows), d by the one that takes its largest component there, and the roots are
 # multiplied back by the ratio (_geo_ldexp). Powers of two are exact, so this is the
 # unit-size answer scaled. A radius far below |o - c| flushes in the copy, and so does
-# the offset f it is compared with; _geo_sph_solve compares the two at their own scale
+# the offset f it is compared with; _geo_sph_solve_s compares the two at their own scale
 # (_geo_delta_fine), where reading both as 0 had made a tangent hit of a ray missing a
-# unit sphere at 2^600 by one radius.
+# unit sphere at 2^600 by one radius, and near tangency or a miss hands them to
+# _geo_sph_xcert_s (3.5.0).
 fn _geo_sphere_roots_scaled(ray, sphere, out) {
     var o = GeoRay_origin(ray);
     var cen = GeoSphere_center(sphere);
@@ -3776,11 +3913,361 @@ fn _geo_sphere_roots_scaled(ray, sphere, out) {
     store64(&los, f64_mul(load64(&los), sp));
     store64(&los + 8, f64_mul(load64(&los + 8), sp));
     store64(&los + 16, f64_mul(load64(&los + 16), sp));
-    if (_geo_sph_solve(&ocs, &dsc, rs, &los, 0, out) == 0) { return 0; }
+    var hac: i64[3];
+    var g = _geo_sph_solve_s(&ocs, &dsc, rs, &los, &hac, out);
+    if (g == 3) {
+        # (r^2 and |f|^2 flush at this scale too: _geo_sph_xcert, and where it does not certify the ray the
+        # double-double coefficients or the exact roots. Not the compensated step, whose bound 2^-99 |o - c|^2 is
+        # past r^2 here.)
+        g = _geo_sph_xcert_s(o, cen, ohf, &ocs, &los, d, &dsc, r, rs, sp, load64(&hac), load64(&hac + 8),
+          load64(&hac + 16), out);
+        if (g < 0) {
+            if (h == 1) { return _geo_sph_xroots(ray, sphere, out); }
+            return _geo_sphere_acc(ray, sphere, out);
+        }
+    }
+    if (g == 2) {
+        # The near-tangent root the plain offset does not certify (_geo_sph_solve_s): the compensated
+        # offset at the copy's scale, as _geo_sphere_roots_full takes it at its own; then the double-double
+        # coefficients or the exact roots, from the inputs (o - c overflowed: the exact roots alone, since
+        # _geo_sphere_dd forms o - c).
+        g = _geo_sph_comp_v(&ocs, &los, HVec3_x(&dsc), HVec3_y(&dsc), HVec3_z(&dsc), rs, load64(&hac),
+          load64(&hac + 8), load64(&hac + 16), out);
+        if (g < 0) { return 0; }
+        if (g == 0) {
+            if (h == 1) { return _geo_sph_xroots(ray, sphere, out); }
+            return _geo_sphere_acc(ray, sphere, out);
+        }
+    }
+    if (g == 0) { return 0; }
     var e = (sd >> 52) - (sp >> 52) + h;
     store64(out, _geo_root_ldexp(load64(out), e));
     store64(out + 8, _geo_root_ldexp(load64(out + 8), e));
     return 1;
+}
+
+# _geo_sph_solve for the sphere's unit-size copy (bx = 0; lo, o - c's rounding, is never 0 here): its
+# operations in its order, so its bits, but for c's one-bit threshold below and the near-tangent
+# certificate the general routine applies at its own scale. Returns 0 for no root, 1 with the two roots
+# in out (sorted), 2 where the RTG root is not certified and 3 where r^2 and |f|^2 flush here and
+# _geo_sph_xcert is to decide: hb, a and c are then in hac for the caller.
+# ⛔ 3.5.0 — THE SCALED COPY HAD NO NEAR-TANGENT CERTIFICATE (roadmap "_geo_sphere_roots_scaled has no
+# near-tangent certificate", GEO6, R2-GEO N10). Past the limits geo_ray_sphere documents (r, |o - c| or |d|
+# from 2^510, |d| max(r, |o - c|) from 2^512) and on spheres under 2^-484 a grazing ray reaches this copy,
+# whose r^2 - |f|^2 was the plain offset's rounding. Where r^2 - |f|^2 is under 1.0625 |f|^2 the root now
+# stands only where _geo_sph_graze certifies it, as in _geo_sphere_roots_full; where r^2 and |f|^2 both flush
+# (r under 2^-484 of |o - c|) every miss and hit near tangency, and every ray whose r rounds here, goes back to
+# the caller for _geo_sph_xcert (3). Rays built within 8 ulps of tangency that reach this copy, read a wrong
+# verdict or a t past 4 ulps in the merged tree: past the limits 3,116 of 6,000, o - c past DBL_MAX 1,335 of
+# 6,000, |o - c| and r under 2^-484 1,147 of 6,000; none of any here, the largest 3.94 ulps. The body is copied,
+# not called: the barrel shares it.
+# [measured: scratch orc.py big_tan, ocov_tan, both_small, seeds 2-3, Fraction oracle, merged / this tree, 2026-11-14]
+fn _geo_sph_solve_s(ocs, dsc, rs, lo, hac, out) {
+    var a = hvec3_dot(dsc, dsc);
+    if (f64_eq(a, 0) == 1) { return 0; }
+    var hb = hvec3_dot(ocs, dsc);
+    var rr = f64_mul(rs, rs);
+    var ococ = hvec3_dot(ocs, ocs);
+    var c = f64_sub(ococ, rr);
+    # (c cancelled by one bit, as _geo_sphere_roots_full takes it since 3.4.0, where _geo_sph_solve keeps the
+    # barrel's two: between one and two the plain c's few ulps went whole into the near root c / q. Ordinary
+    # rays past the limits, at random scales: 2 of 3,000 past 4 ulps with two bits, at most 10.6; 0 with one.)
+    # [measured: scratch diff.py ordrand family, seeds 1-2, exact Fraction oracle, two bits vs one, 2026-11-14]
+    if ((c & 0x7FFF_FFFF_FFFF_FFFF) < (ococ & 0x7FFF_FFFF_FFFF_FFFF) - 0x0010_0000_0000_0000) {
+        var grz = f64_lt(f64_mul(hb, hb), f64_mul(f64_mul(ococ, a), 0x3FB0_0000_0000_0000));   # |cos| < 1/4
+        c = _geo_c_lo(_geo_sphere_c_exact(ocs, rs), ocs, lo);
+        if (f64_lt(f64_abs(c), f64_mul(ococ, 0x3CF0_0000_0000_0000)) == 1) { c = _geo_c_xact(ocs, lo, rs); }   # 2^-48
+        if (grz == 1) { hb = _geo_hb_lo(ocs, lo, 0, HVec3_x(dsc), HVec3_y(dsc), HVec3_z(dsc)); }
+    }
+    var k = f64_div(hb, a);
+    var fv: i64[3];
+    store64(&fv, f64_sub(HVec3_x(ocs), f64_mul(k, HVec3_x(dsc))));
+    store64(&fv + 8, f64_sub(HVec3_y(ocs), f64_mul(k, HVec3_y(dsc))));
+    store64(&fv + 16, f64_sub(HVec3_z(ocs), f64_mul(k, HVec3_z(dsc))));
+    var ff = hvec3_dot(&fv, &fv);
+    if (f64_lt(rr, f64_mul(ococ, 0x3DF0_0000_0000_0000)) == 1) {   # 2^-32
+        if (f64_lt(ff, f64_mul(ococ, 0x3AF0_0000_0000_0000)) == 1) {   # 2^-80
+            _geo_perp_part(ocs, dsc, &fv);
+            _geo_add_perp(&fv, lo, dsc);
+            ff = hvec3_dot(&fv, &fv);
+        }
+    }
+    var delta = f64_sub(rr, ff);
+    if (f64_lt(c, ff) == 1) {
+        var hh = f64_mul(hb, hb);
+        var dc = f64_sub(hh, f64_mul(a, c));
+        if (hh >= 0x0100_0000_0000_0000 && (dc & 0x7FFF_FFFF_FFFF_FFFF) < hh - 0x0020_0000_0000_0000) {
+            var dx4: i64[4];
+            _geo_disc_x(ocs, lo, dsc, 0, rs, &dx4);
+            hb = load64(&dx4);
+            a = load64(&dx4 + 8);
+            c = load64(&dx4 + 16);
+            dc = load64(&dx4 + 24);
+        }
+        if (f64_lt(f64_abs(dc), _GEO_F64_TINY) == 0) { return _geo_quad_roots(hb, a, c, dc, f64_sqrt(dc), out); }
+    }
+    # (a is under 1 for a subnormal direction, down to 2^-102, and a * delta can fall under DBL_MIN, where its
+    # root keeps a few bits or none: _geo_sqrt_ad, the same bits wherever the product is normal)
+    var sq = _geo_sqrt_ad(a, delta);
+    # (Where it is not certified, hb, a and c go back in hac with 2; 3 where the exact roots are to answer.)
+    if (f64_lt(rr, _GEO_DIR_LO) == 1 && f64_lt(ff, _GEO_DIR_LO) == 1) {
+        # (r^2 and |f|^2 flush at this scale too. Every miss and the hits near tangency go back with 3 for
+        # _geo_sph_xcert, and where r is subnormal here every ray: the copy's scale has rounded it, and the offset
+        # read beside it can have lost its bits as well; a radius 2^-1100 of |o - c| read 0 and a miss of 8 radii
+        # a tangent hit.)
+        if ((rs & 0x7FFF_FFFF_FFFF_FFFF) < 0x0010_0000_0000_0000 || _geo_sph_fine_near(&fv, rs) == 1) {
+            _geo_sph_hand_back(hac, hb, a, c);
+            return 3;
+        }
+    } elif (f64_lt(delta, f64_mul(ff, 0x3FF1_0000_0000_0000)) == 1) {   # 1.0625
+        if (_geo_sph_graze(hb, sq, delta, ff, ococ, rr) == 0) { return _geo_sph_hand_back(hac, hb, a, c); }
+    }
+    if (f64_lt(f64_abs(delta), _GEO_DIR_LO) == 1) {
+        var dq: i64[2];
+        _geo_delta_fine(&fv, rs, a, &dq);
+        delta = load64(&dq);
+        sq = load64(&dq + 8);
+    }
+    return _geo_quad_roots(hb, a, c, delta, sq, out);
+}
+
+# hb, a and c into hac for _geo_sphere_roots_scaled's next step; returns 2 (_geo_sph_solve_s, which returns 3
+# instead where that step is _geo_sph_xcert).
+fn _geo_sph_hand_back(hac, hb, a, c) {
+    store64(hac, hb);
+    store64(hac + 8, a);
+    store64(hac + 16, c);
+    return 2;
+}
+
+# 1 when r^2 - |f|^2 < 1.0625 |f|^2 for the offset f (a stack vector) and the radius r: every miss, and a
+# hit within 1.0625 of tangency, the rays _geo_sph_graze is asked about. Read at their own scale: both
+# multiplied by the power of two that takes the larger into [1, 2), as _geo_delta_fine forms its delta, so
+# that a sphere and offset whose squares flush are read (3.5.0). 0 for a NaN.
+fn _geo_sph_fine_near(fv, r) {
+    var m = _geo_absmax_bits(fv);
+    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
+    if (mr > m) { m = mr; }
+    var sf = _geo_scale_for(m >> 52);
+    var fx = f64_mul(HVec3_x(fv), sf);
+    var fy = f64_mul(HVec3_y(fv), sf);
+    var fz = f64_mul(HVec3_z(fv), sf);
+    var rs = f64_mul(r, sf);
+    var ff = f64_add(f64_add(f64_mul(fx, fx), f64_mul(fy, fy)), f64_mul(fz, fz));
+    return f64_lt(f64_sub(f64_mul(rs, rs), ff), f64_mul(ff, 0x3FF1_0000_0000_0000));   # 1.0625
+}
+
+# The verdict of a ray whose r^2 and |f|^2 both flush, and its roots where they are certified (3.5.0), from
+# X = w x (v + lo): |X|^2 / |w|^2 is the centre's squared distance from the line, so D = r^2 |w|^2 - |X|^2 has the
+# verdict's sign, and r^2 - |f|^2 = D / |w|^2. v is o - c as rounded and lo its rounding (stack vectors, |v| under
+# 2^994), w the direction with its largest component in [1, 2) ([2^-51, 2) for a subnormal one), r the radius and
+# a, hb, c the caller's quadratic, all at the caller's scale but for v, lo and r, which may be 2^-ek times it (sq is
+# then taken back by 2^ek). X is formed twice at most (_geo_xc_try): with plain products, and where that does not
+# settle the ray, with exact ones and every rounding's error taken (_geo_xc_dd). 1 with the roots in out, 0 for
+# the miss, -1 for neither: the caller then takes the exact roots.
+# ⛔ 3.5.0 — THE FLUSHED RAYS HAD NO CERTIFICATE, AND THE FIRST REPAIR'S ROUTE GAVE RIGHT ANSWERS WRONG (the
+# lane W1 review): r^2 and |f|^2 both under 2^-968 read their verdict from _geo_delta_fine on an offset whose
+# error nothing bounded, and the first repair sent those near tangency to the unit-size copy, where a radius
+# under 2^-1074 of |o - c| underflows: a ray missing a sphere of radius 1e-300 by 8 radii from 1e30 away, an
+# exact miss through 3.4.2, read a hit at 1e30. Axis-aligned misses with r 2^-1300 to 2^-1075 of |o - c|: 1,997 of
+# 6,000 wrong in the merged tree (each with |o - c| past 2^511, the copy's), 5,964 in the first repair, none here.
+# [measured: scratch orc.py rev_miss, seeds 2-3, Fraction oracle, merged / first repair / this tree, 2026-11-14]
+fn _geo_sph_xcert(v, lo, w, r, a, hb, c, ek, out) {
+    var g = _geo_xc_try(v, lo, w, r, a, hb, c, ek, out, 0);
+    if (g >= 0) { return g; }
+    return _geo_xc_try(v, lo, w, r, a, hb, c, ek, out, 1);
+}
+
+# One pass of _geo_sph_xcert; u = 2^-53. With ex = 0, X_i = w_j v_k - w_k v_j in plain products, off by at most
+# E_i = 2^-51 P_i, P_i the two products' magnitudes: their roundings take u P_i, the difference's u |X_i| (under
+# u P_i), and (w x lo)_i, left out, is at most u P_i too, lo being o - c's rounding. That is enough wherever the
+# products do not cancel, as for a ray along a coordinate axis, whose X is then good to 4 u of itself however
+# small the sphere is against its distance. With ex = 1 each difference, and (w x lo)_i's, is _geo_xc_dd's, whose
+# error is known exactly, so that a ray in a coordinate plane (or any ray whose X is exact) is not refused for
+# products that cancelled. Each E_i takes 2^-1066 more: for the roundings that fall below the normal range (a
+# few dozen at most, each under 2^-1075), for o - c and its lows rounded into the unit-size copy (2^-1074 at
+# most a component there, under 2^-1072 in X), and for r's rounding there (_geo_sph_xcert_s). D is formed at
+# the scale of X and r (the power of two that takes the largest into [1, 2), as in _geo_delta_fine) and is off
+# by at most sum(2 |X_i| E_i + E_i^2) + 2^-50 (r^2 |w|^2 + |X|^2): the squares, the sums and |w|^2 take 5 u of
+# r^2 |w|^2 and 3 u of |X|^2, D's own rounding u of |D|, which is under their sum, and a rounding under the
+# normal range there is far inside it (the largest of r and the |X_i| being 2^-51 or more, |w|^2 2^-102 or
+# more). The miss stands where that is under |D|; the roots where it moves them by 3 u at most,
+# (sq / q) err / (2 D) <= 3 u, as _geo_sph_comp_v takes them. (A certified hit has q past 2^-994, so that sq's
+# bits under DBL_MIN, where it has any, reach no root: it needs |X|^2 under (1 - 2^-50) r^2 |w|^2, and in
+# _geo_sphere_roots_full |d| is 2^-484 or more and |o - c|^2 2^-968 or more, past r^2; in the copy |o - c| is 1 or
+# more.)
+fn _geo_xc_try(v, lo, w, r, a, hb, c, ek, out, ex) {
+    var xs: i64[3];
+    var es: i64[3];
+    var tv: i64[2];
+    var m = r & 0x7FFF_FFFF_FFFF_FFFF;
+    for (var i = 0; i < 3; i = i + 1) {
+        var j = (i + 1) % 3;
+        var k = (i + 2) % 3;
+        var wj = load64(w + j * 8);
+        var wk = load64(w + k * 8);
+        var lj = load64(lo + j * 8);
+        var lk = load64(lo + k * 8);
+        var xi = 0;
+        var e = 0;
+        if (ex == 0) {
+            var p1 = f64_mul(wj, load64(v + k * 8));
+            var p2 = f64_mul(wk, load64(v + j * 8));
+            xi = f64_sub(p1, p2);
+            e = f64_mul(f64_add(f64_abs(p1), f64_abs(p2)), 0x3CC0_0000_0000_0000);   # 2^-51
+        } else {
+            _geo_xc_dd(wj, load64(v + k * 8), wk, load64(v + j * 8), &tv);
+            xi = load64(&tv);
+            e = load64(&tv + 8);
+            if (lj != 0 || lk != 0) {
+                _geo_xc_dd(wj, lk, wk, lj, &tv);
+                var xl = f64_add(xi, load64(&tv));
+                e = f64_add(f64_add(e, load64(&tv + 8)), f64_mul(f64_abs(xl), 0x3CB0_0000_0000_0000));   # 2^-52
+                xi = xl;
+            }
+        }
+        store64(&xs + i * 8, xi);
+        store64(&es + i * 8, f64_add(e, 0x100));   # 2^-1066
+        if ((xi & 0x7FFF_FFFF_FFFF_FFFF) > m) { m = xi & 0x7FFF_FFFF_FFFF_FFFF; }
+    }
+    var sf = _geo_scale_for(m >> 52);
+    var ww = hvec3_dot(w, w);
+    var rs = f64_abs(f64_mul(r, sf));
+    var rw = f64_mul(f64_mul(rs, rs), ww);
+    var ss = 0;
+    var ed = 0;
+    for (var n = 0; n < 3; n = n + 1) {
+        var x = f64_abs(f64_mul(load64(&xs + n * 8), sf));
+        var ez = f64_mul(load64(&es + n * 8), sf);
+        ss = f64_add(ss, f64_mul(x, x));
+        ed = f64_add(ed, f64_mul(ez, f64_add(f64_mul(F64_TWO, x), ez)));
+    }
+    var dd = f64_sub(rw, ss);
+    ed = f64_add(ed, f64_mul(f64_add(rw, ss), 0x3CD0_0000_0000_0000));   # 2^-50
+    if (f64_lt(dd, 0) == 1) {
+        if (f64_lt(ed, f64_abs(dd)) == 1) { return 0; }
+        return 0 - 1;
+    }
+    if (f64_lt(ed, dd) == 0) { return 0 - 1; }   # (and a NaN)
+    var dl = f64_div(dd, ww);
+    # (dl is under 2^110: dd under 48 and |w|^2 2^-102 or more)
+    var sq = _geo_ldexp(_geo_sqrt_ad(a, dl), 1023 - (sf >> 52) + ek);
+    var q = f64_add(f64_abs(hb), sq);
+    if (f64_le(f64_mul(sq, f64_div(ed, dd)), f64_mul(q, 0x3CC8_0000_0000_0000)) == 0) { return 0 - 1; }   # 6 2^-53
+    return _geo_quad_roots(hb, a, c, dl, sq, out);
+}
+
+# x y - z t into p[0], and into p[1] a bound on its error (3.5.0, _geo_xc_try): both products exact
+# (_geo_two_prod), then their high words' difference, their low words' and the two sums, each with its
+# rounding's error taken exactly (Knuth's two-sum): the value is the result plus those three errors, so their
+# magnitudes' sum, made 2^-50 larger for its own roundings, bounds it. Exact where the products are clear of
+# the subnormals (the 2^-1066 the caller adds covers their lows' roundings below that); |x|, |y|, |z|, |t|
+# under 2^995.
+fn _geo_xc_dd(x, y, z, t, p) {
+    var pp: i64[2];
+    var qq: i64[2];
+    _geo_two_prod(x, y, &pp);
+    _geo_two_prod(z, t, &qq);
+    var ph = load64(&pp);
+    var qh = load64(&qq);
+    var sm = f64_sub(ph, qh);
+    var er = _geo_diff_err(ph, qh, sm);
+    var pl = load64(&pp + 8);
+    var ql = load64(&qq + 8);
+    var y1 = f64_sub(pl, ql);
+    var e1 = _geo_diff_err(pl, ql, y1);
+    var y2 = f64_add(er, y1);
+    var e2 = _geo_diff_err(er, f64_neg(y1), y2);
+    var rs = f64_add(sm, y2);
+    var e3 = _geo_diff_err(sm, f64_neg(y2), rs);
+    store64(p, rs);
+    var eb = f64_add(f64_add(f64_abs(e1), f64_abs(e2)), f64_abs(e3));
+    store64(p + 8, f64_add(eb, f64_mul(eb, 0x3CD0_0000_0000_0000)));   # 2^-50
+    return 0;
+}
+
+# _geo_sph_xcert for _geo_sphere_roots_full, whose o - c is three scalars (ox, oy, oz) and whose direction
+# (dx, dy, dz) is the ray's, or that times sc where sc is not 0: the roots are multiplied back by sc, as there.
+# With kp 1 the plain products' pass alone (_geo_xc_try), the caller having the unit-size copy to go on to. Not
+# certified (-1) where the direction loses a bit taken into [1, 2) (_geo_dir_unit).
+fn _geo_sph_xcert_at(o, cen, ox, oy, oz, dx, dy, dz, r, a, hb, c, sc, kp, out) {
+    var v: i64[3];
+    var lo: i64[3];
+    var w: i64[3];
+    store64(&v, ox);
+    store64(&v + 8, oy);
+    store64(&v + 16, oz);
+    _geo_oc_lo(o, cen, F64_ONE, &v, &lo);
+    store64(&w, dx);
+    store64(&w + 8, dy);
+    store64(&w + 16, dz);
+    if (_geo_dir_unit(&w, &w) == 0) { return 0 - 1; }
+    var g = 0;
+    if (kp == 1) { g = _geo_xc_try(&v, &lo, &w, r, a, hb, c, 0, out, 0); }
+    else { g = _geo_sph_xcert(&v, &lo, &w, r, a, hb, c, 0, out); }
+    if (g == 1 && sc != 0) {
+        store64(out, f64_mul(load64(out), sc));
+        store64(out + 8, f64_mul(load64(out + 8), sc));
+    }
+    return g;
+}
+
+# _geo_sph_xcert for the unit-size copy (_geo_sphere_roots_scaled): its o - c (ocs), lows (los), direction (dsc)
+# and radius (rs, r times its scale sp, r halved already where o - c overflowed, ohf 1/2 then) where rs is normal,
+# hb, a and c its own. Where rs is subnormal the copy has lost r's bits, and the offset's beside it: there o - c,
+# its lows and r are formed again from o, c and r at 2^499 times the copy's scale, where they keep them down to
+# r 2^-1521 of |o - c|, and sq is taken back by 2^-499. That needs the direction exact at unit size: not
+# certified (-1) where it lost a bit there (_geo_dir_unit). Where o or c times that scale overflows, X is not
+# finite and _geo_xc_try refuses it (a comparison with a NaN is false, and +Inf is not under +Inf). Under
+# 2^-1521 of |o - c| r rounds there too, by 2^-1075 at most: that moves D by under 2 r |w|^2 2^-1075, inside the
+# spare part of the 2^-1066 each X_i takes wherever the verdict is in doubt (|X| at least r |w| / 8), and
+# elsewhere keeps D's sign and moves the roots by under 2^-1000 of themselves, sq / q being under 2^-1020 here.
+fn _geo_sph_xcert_s(o, cen, ohf, ocs, los, d, dsc, r, rs, sp, hb, a, c, out) {
+    if ((rs & 0x7FFF_FFFF_FFFF_FFFF) >= 0x0010_0000_0000_0000) {
+        return _geo_sph_xcert(ocs, los, dsc, rs, a, hb, c, 0, out);
+    }
+    var w: i64[3];
+    if (_geo_dir_unit(d, &w) == 0) { return 0 - 1; }
+    var g = f64_mul(sp, 0x5F20_0000_0000_0000);   # 2^499 (2^551 at most: r, if not 0, is 2^-1075 or more)
+    var v: i64[3];
+    var lo: i64[3];
+    for (var i = 0; i < 3; i = i + 1) {
+        var oi = f64_mul(f64_mul(load64(o + i * 8), ohf), g);
+        var ci = f64_mul(f64_mul(load64(cen + i * 8), ohf), g);
+        var x = f64_sub(oi, ci);
+        store64(&v + i * 8, x);
+        store64(&lo + i * 8, _geo_diff_err(oi, ci, x));
+    }
+    return _geo_sph_xcert(&v, &lo, &w, f64_mul(r, g), a, hb, c, 0 - 499, out);
+}
+
+# 1 when r is 2^-483 or more of the largest of r and |o - c|'s components (ox, oy, oz), by exponent fields: the
+# unit-size copy (_geo_sphere_roots_scaled) then keeps r exact and r^2 over 2^-968 (3.5.0).
+fn _geo_sph_copy_keeps(ox, oy, oz, r) {
+    var m = r & 0x7FFF_FFFF_FFFF_FFFF;
+    var x = ox & 0x7FFF_FFFF_FFFF_FFFF;
+    var y = oy & 0x7FFF_FFFF_FFFF_FFFF;
+    var z = oz & 0x7FFF_FFFF_FFFF_FFFF;
+    if (x > m) { m = x; }
+    if (y > m) { m = y; }
+    if (z > m) { m = z; }
+    if (((r & 0x7FFF_FFFF_FFFF_FFFF) >> 52) + 483 >= (m >> 52)) { return 1; }
+    return 0;
+}
+
+# d times the power of two that takes its largest component into [1, 2) ([2^-51, 2) for a subnormal one), into
+# w (which may be d): 1 when that is exact, 0 where a component lost a bit (one 2^1022 under the largest).
+fn _geo_dir_unit(d, w) {
+    var s2 = _geo_scale_for(_geo_absmax_bits(d) >> 52);
+    var bk = f64_div(F64_ONE, s2);
+    var ok = 1;
+    for (var i = 0; i < 3; i = i + 1) {
+        var di = load64(d + i * 8);
+        var wi = f64_mul(di, s2);
+        if (f64_mul(wi, bk) != di) { ok = 0; }
+        store64(w + i * 8, wi);
+    }
+    return ok;
 }
 
 # Ray-sphere intersection (quadratic, half-b form for normalized direction)
@@ -3918,6 +4405,23 @@ fn _geo_sph_graze(hb, sq, delta, ff, ococ, rr) {
 # a certified miss, 0 when neither (or a magnitude outside 2^-900 .. 2^900).
 # [measured: R2-GEO tg1.py family, seeds 1-3, exact Fraction oracle and Decimal, s19 / GEO6, 2026-11-01]
 fn _geo_sph_comp(o, cen, dx, dy, dz, r, hb, a, c, out) {
+    var xv: i64[3];
+    var lv: i64[3];
+    for (var i = 0; i < 3; i = i + 1) {
+        var oi = load64(o + i * 8);
+        var ci = load64(cen + i * 8);
+        var x = f64_sub(oi, ci);
+        store64(&xv + i * 8, x);
+        store64(&lv + i * 8, _geo_diff_err(oi, ci, x));
+    }
+    return _geo_sph_comp_v(&xv, &lv, dx, dy, dz, r, hb, a, c, out);
+}
+
+# _geo_sph_comp from o - c as rounded (xv) and its rounding (lv), so that the unit-size copy
+# (_geo_sphere_roots_scaled, 3.5.0) takes the same step at its own scale: there xv and lv are the
+# copy's ocs and its lows, d, r, hb, a and c the copy's. The same operations in the same order as
+# through 3.4.2, so _geo_sph_comp's bits are unchanged.
+fn _geo_sph_comp_v(xv, lv, dx, dy, dz, r, hb, a, c, out) {
     var k = f64_div(hb, a);
     var d: i64[3];
     store64(&d, dx);
@@ -3930,10 +4434,8 @@ fn _geo_sph_comp(o, cen, dx, dy, dz, r, hb, a, c, out) {
     var pp: i64[2];
     var qq: i64[2];
     for (var i = 0; i < 3; i = i + 1) {
-        var oi = load64(o + i * 8);
-        var ci = load64(cen + i * 8);
-        var x = f64_sub(oi, ci);
-        var lo = _geo_diff_err(oi, ci, x);
+        var x = load64(xv + i * 8);
+        var lo = load64(lv + i * 8);
         _geo_two_prod(k, load64(&d + i * 8), &pp);
         var hi = f64_sub(x, load64(&pp));
         var fl = f64_add(_geo_diff_err(x, load64(&pp), hi), f64_sub(lo, load64(&pp + 8)));
@@ -3955,12 +4457,43 @@ fn _geo_sph_comp(o, cen, dx, dy, dz, r, hb, a, c, out) {
     var rr = load64(&qq);
     var ff = sh;
     var ed = f64_mul(f64_add(rr, ff), 0x39B0_0000_0000_0000);   # 2^-100
-    ed = f64_add(ed, f64_mul(f64_sqrt(f64_mul(ff, ococ)), 0x39A0_0000_0000_0000));   # 2^-101
+    # ⛔ 3.5.0 — |f| |oc| PAST 2^512 WAS A REFUSAL (roadmap Rays, "_geo_sph_comp refuses every ray with r |oc|
+    # past 2^512", GEO7 F5): |f|^2 |oc|^2 overflowed, the bound read +Inf and every such grazing ray went on to
+    # _geo_sphere_acc. The two roots are taken apart there, as _geo_sph_graze does; elsewhere the product's root,
+    # the same bits as before. Such rays take this step's roots now (below): of 39,000 built within 8 ulps of
+    # tangency, r 2^0 .. 2^6 under |o - c| 2^256 .. 2^505, every t was within 1.87 ulps, _geo_sphere_acc's within
+    # 2.81 (from this step with the caller's plain hb and c, 7 went past 4 ulps, up to 6.62: the lane's second
+    # review). The bench row's ray, r 2^399 within 8 ulps of tangency: 829 ns through _geo_sphere_acc, 682 here.
+    # [measured: scratch ev4.py comp512in seeds 1-3, Fraction oracle, 3.4.2-like / merged / this tree, 2026-11-14]
+    # [measured: scratch timeab3.py r400 row, taskset -c 13, 7 interleaved rounds, 3.4.2-like / this tree, 2026-11-14]
+    var fo = f64_mul(ff, ococ);
+    if (fo == 0x7FF0_0000_0000_0000) { fo = f64_mul(f64_sqrt(ff), f64_sqrt(ococ)); }   # +Inf
+    else { fo = f64_sqrt(fo); }
+    ed = f64_add(ed, f64_mul(fo, 0x39A0_0000_0000_0000));   # 2^-101
     ed = f64_add(ed, f64_mul(ococ, 0x39C0_0000_0000_0000));   # 2^-99
     ed = f64_add(ed, f64_mul(f64_abs(delta), 0x3CA0_0000_0000_0000));   # 2^-53
     if (f64_gt(delta, 0) == 0) {
         if (f64_lt(ed, f64_abs(delta)) == 1) { return 0 - 1; }
         return 0;
+    }
+    # ⛔ 3.5.0 (lane W1, second review) — THE ROOTS TOOK THE CALLER'S PLAIN hb, a AND c WHOLE. The test below bounds
+    # what delta's error moves them, and nothing bounded the coefficients': hb and c plain are each off by up to a
+    # few ulps, which the near root c / q takes whole. hb, a and c are now double-doubles from exact products
+    # (_geo_sph_comp_coef), c the caller's where it is under 2^-44 |oc|^2 (fused or exact there), and the roots their
+    # quotients corrected once (_geo_sph_comp_roots); the test keeps the caller's hb, and the verdicts are as before.
+    # On 273,000 rays in 14 families built within 8 ulps of tangency or grazing (2^-5 .. 2^-50 of it), inside the
+    # limits and past them, every t was within 3.08 ulps (the merged tree: 13 past 4, up to 6.62); of the 25,136
+    # roots the change moved in 122,000 rays sampled for it, all moved nearer the exact root but 4, by 0.11 ulp at
+    # most. Its cost on the rays this step certifies: 352 -> 673 ns at unit size, 583 -> 892 through the unit-size
+    # copy past the limits (an ordinary ray, which never comes here: 55.9 -> 56.2).
+    # [measured: scratch ev4.py and moved.py, 14 families, seeds 1-3, Fraction oracle, merged / this tree, 2026-11-14]
+    # [measured: scratch timeab3.py, sets of 200 rays, taskset -c 13, 7 interleaved rounds, merged / this, 2026-11-14]
+    var cf: i64[6];
+    _geo_sph_comp_coef(xv, lv, &d, r, &cf);
+    a = load64(&cf + 16);
+    if ((c & 0x7FFF_FFFF_FFFF_FFFF) < (ococ & 0x7FFF_FFFF_FFFF_FFFF) - 0x02C0_0000_0000_0000) {
+        store64(&cf + 32, c);
+        store64(&cf + 40, 0);
     }
     var sq = f64_mul(a, delta);
     if (sq < 0x0370_0000_0000_0000) { sq = _geo_sqrt_tiny(a, delta); }   # 2^-968
@@ -3972,7 +4505,113 @@ fn _geo_sph_comp(o, cen, dx, dy, dz, r, hb, a, c, out) {
     if (q == 0x7FF0_0000_0000_0000) { return 0; }
     # ((sq / q) ed / (2 delta) <= 3 u, by the quotient: at a tiny sphere's scale the products flush)
     if (f64_le(f64_mul(sq, f64_div(ed, delta)), f64_mul(q, 0x3CC8_0000_0000_0000)) == 0) { return 0; }   # 6 2^-53
-    return _geo_quad_roots(hb, a, c, delta, sq, out);
+    return _geo_sph_comp_roots(&cf, sq, out);
+}
+
+# hb = (v + lo) . d, a = d . d and c = |v + lo|^2 - r^2 as double-doubles into out[0..5] (each value, then its low
+# word) for _geo_sph_comp_v's roots (3.5.0): each product exact (Dekker's), the leading words summed with their
+# errors carried, the lows' terms lo d and lo (2 v + lo) rounded. That leaves each within about 2^-103 of its
+# products' magnitudes (|v| |d|, |d|^2, |v|^2 + r^2). v is o - c as rounded and lo its rounding (stack vectors), d
+# the direction (a stack vector), each under 2^995 so that no split overflows.
+fn _geo_sph_comp_coef(xv, lv, d, r, out) {
+    var sp = 0x41A0_0000_0200_0000;   # 2^27 + 1
+    var hs = 0;
+    var he = 0;
+    var as2 = 0;
+    var ae = 0;
+    var cs = 0;
+    var ce = 0;
+    for (var i = 0; i < 3; i = i + 1) {
+        # (each split once and the products written out, as _geo_disc_dd does: the same bits as _geo_two_prod and
+        # _geo_two_sq, at half the cost of calling them)
+        var x = load64(xv + i * 8);
+        var lo = load64(lv + i * 8);
+        var y = load64(d + i * 8);
+        var u = f64_mul(x, sp);
+        var xh = f64_sub(u, f64_sub(u, x));
+        var xt = f64_sub(x, xh);
+        u = f64_mul(y, sp);
+        var yh = f64_sub(u, f64_sub(u, y));
+        var yt = f64_sub(y, yh);
+        var p = f64_mul(x, y);
+        var w = f64_add(f64_add(f64_sub(f64_mul(xh, yh), p), f64_mul(xh, yt)), f64_mul(xt, yh));
+        w = f64_add(w, f64_mul(xt, yt));
+        var s = f64_add(hs, p);
+        var v = f64_sub(s, hs);
+        he = f64_add(he, f64_add(f64_add(f64_sub(hs, f64_sub(s, v)), f64_sub(p, v)), f64_add(w, f64_mul(lo, y))));
+        hs = s;
+        p = f64_mul(y, y);
+        w = f64_add(f64_add(f64_sub(f64_mul(yh, yh), p), f64_mul(F64_TWO, f64_mul(yh, yt))), f64_mul(yt, yt));
+        s = f64_add(as2, p);
+        v = f64_sub(s, as2);
+        ae = f64_add(ae, f64_add(f64_add(f64_sub(as2, f64_sub(s, v)), f64_sub(p, v)), w));
+        as2 = s;
+        p = f64_mul(x, x);
+        w = f64_add(f64_add(f64_sub(f64_mul(xh, xh), p), f64_mul(F64_TWO, f64_mul(xh, xt))), f64_mul(xt, xt));
+        s = f64_add(cs, p);
+        v = f64_sub(s, cs);
+        var cl = f64_mul(lo, f64_add(f64_mul(F64_TWO, x), lo));
+        ce = f64_add(ce, f64_add(f64_add(f64_sub(cs, f64_sub(s, v)), f64_sub(p, v)), f64_add(w, cl)));
+        cs = s;
+    }
+    var pp: i64[2];
+    _geo_two_sq(r, &pp);
+    var s2 = f64_sub(cs, load64(&pp));
+    ce = f64_add(ce, f64_sub(_geo_diff_err(cs, load64(&pp), s2), load64(&pp + 8)));
+    _geo_dd_fin(hs, he, out);
+    _geo_dd_fin(as2, ae, out + 16);
+    _geo_dd_fin(s2, ce, out + 32);
+    return 0;
+}
+
+# The roots of a t^2 + 2 hb t + c = 0, sorted, into out, from hb, a and c as double-doubles (cf: each value, then
+# its low word) and sq = sqrt(a delta) > 0, for _geo_sph_comp_v (3.5.0): q = -(hb + sign(hb) sq) carried as a
+# double-double, and q / a and c / q each the quotient of the leading words corrected once by its residual, formed
+# from an exact product (_geo_sph_dd_quot). They are the coefficients' roots to well under an ulp but for sq's own
+# rounding, which moves each by (sq / |q|) u at most. c = 0 is the root +0 and a root that underflows below zero
+# -2^-1074, as in _geo_quad_roots. Returns 1.
+fn _geo_sph_comp_roots(cf, sq, out) {
+    var hh = load64(cf);
+    var qq: i64[2];
+    if (f64_lt(hh, 0) == 1) { _geo_dd_fin(sq, f64_neg(hh), &qq); }
+    else { _geo_dd_fin(f64_neg(hh), f64_neg(sq), &qq); }
+    _geo_dd_fin(load64(&qq), f64_sub(load64(&qq + 8), load64(cf + 8)), &qq);
+    var qh = load64(&qq);
+    var ql = load64(&qq + 8);
+    var t1 = _geo_sph_dd_quot(qh, ql, load64(cf + 16), load64(cf + 24));
+    if (t1 == 0x8000_0000_0000_0000) { t1 = 0x8000_0000_0000_0001; }
+    var t2 = 0;
+    if (f64_eq(load64(cf + 32), 0) == 0) {
+        t2 = _geo_sph_dd_quot(load64(cf + 32), load64(cf + 40), qh, ql);
+        if (t2 == 0x8000_0000_0000_0000) { t2 = 0x8000_0000_0000_0001; }
+    }
+    if (f64_gt(t1, t2) == 1) {
+        var tt = t1;
+        t1 = t2;
+        t2 = tt;
+    }
+    store64(out, t1);
+    store64(out + 8, t2);
+    return 1;
+}
+
+# (nh + nl) / (dh + dl) for _geo_sph_comp_roots: t = nh / dh, then t + ((nh - t dh) + nl - t dl) / dh with t dh
+# formed exactly (_geo_two_prod; nh - t dh is then exact, the two within an ulp or so of each other). Of 262,957
+# random arguments (either sign, exponents over the whole range) that took the correction, the 254,826 with t from
+# 2^-969 were each correctly rounded and the rest, whose correction is itself subnormal, within 0.75 ulp. t alone (up
+# to 1.9 ulps from the quotient on those arguments) where nh is under 2^-967 (a partial product flushes, and with it
+# the exact product: a subnormal nh read 2.7e8 ulps off) or the product's low word is not finite (a split past 2^995
+# overflows, as does t dh for an nh within ulps of DBL_MAX, and a t that is not finite).
+# [measured: scratch dq.py, dq5.py, the same operations in IEEE doubles against Fractions, 2026-11-14]
+fn _geo_sph_dd_quot(nh, nl, dh, dl) {
+    var t = f64_div(nh, dh);
+    if (((nh >> 52) & 0x7FF) < 56) { return t; }
+    var pp: i64[2];
+    _geo_two_prod(t, dh, &pp);
+    var pl = load64(&pp + 8);
+    if (f64_lt(f64_abs(pl), _GEO_F64_POS_INF) == 0) { return t; }
+    var res = f64_sub(f64_add(f64_sub(f64_sub(nh, load64(&pp)), pl), nl), f64_mul(t, dl));
+    return f64_add(t, f64_div(res, dh));
 }
 
 # The roots of a grazing ray the plain offset cannot certify (3.4.1 GEO4, _geo_sph_graze): from the
@@ -4242,6 +4881,16 @@ fn _geo_sphere_roots_full(ray, sphere, out) {
         ff = f64_add(f64_add(f64_mul(fx, fx), f64_mul(fy, fy)), f64_mul(fz, fz));
         delta = f64_sub(rr, ff);
         big_d = f64_mul(a, delta);
+        # ⛔ 3.5.0 — THE RE-FORMED a (r^2 - |f|^2) IS RETESTED, as the first one is above (roadmap
+        # "_geo_sphere_roots_full forms big_d again", GEO7 F3). Past the documented limits (|d| r near
+        # 2^512, |oc| / r past 2^41) this one could overflow where the first did not: sq read +Inf and the
+        # hit the miss, 24 of 6,000 on that family (GEO7's count). (0 c334ac4181898235 ... 4008a9a02004b682,
+        # exact t 2.68e-138, read 0.) It goes to the unit-size copy, as an overflowed first one does: on 12,000
+        # rays of that family 18 wrong -> right, 0 right -> wrong, every t within 3.5 ulps.
+        # [measured: GEO7 driver rows (roadmap [3.5.0] "Rays"); scratch sph_bigd.py seeds 1-2, Decimal, 2026-11-14]
+        if (f64_lt(f64_abs(big_d), _GEO_F64_POS_INF) == 0) {
+            if (_geo_sphere_finite(ray, sphere) == 1) { return _geo_sphere_roots_scaled(ray, sphere, out); }
+        }
     }
     # The discriminant's form (see the 3.3.6 note above): classic for an origin inside
     # or near (c < |f|^2) unless it is not finite or too small, the RTG form otherwise,
@@ -4272,24 +4921,51 @@ fn _geo_sphere_roots_full(ray, sphere, out) {
         # coefficients with their bounds (_geo_sphere_dd) or, where those cannot certify them, exactly
         # (_geo_sph_xroots). The fast path takes those steps on the same test, _geo_sph_refine.
         # (Not where r^2 and |f|^2 both flush: _geo_delta_fine below forms delta at their scale.)
-        if (f64_lt(delta, f64_mul(ff, 0x3FF1_0000_0000_0000)) == 1) {   # 1.0625
-            if (f64_lt(rr, _GEO_DIR_LO) == 0 || f64_lt(ff, _GEO_DIR_LO) == 0) {
-                # (sq's rounding is not the bound's to pass on: under DBL_MIN big_d keeps a few bits or none)
-                var sqg = sq;
-                if (f64_gt(delta, 0) == 1 && f64_lt(big_d, _GEO_F64_TINY) == 1) { sqg = _geo_sqrt_tiny(a, delta); }
-                if (_geo_sph_graze(half_b, sqg, delta, ff, ococ, rr) == 0) {
-                    # (at the direction as scaled above, its roots then multiplied back, as below)
-                    var cpv = _geo_sph_comp(o, cen, dx, dy, dz, r, half_b, a, c, out);
-                    if (cpv < 0) { return 0; }
-                    if (cpv == 1) {
-                        if (sc != 0) {
-                            store64(out, f64_mul(load64(out), sc));
-                            store64(out + 8, f64_mul(load64(out + 8), sc));
-                        }
-                        return 1;
-                    }
+        # ⛔ 3.5.0 — WHERE THEY BOTH FLUSH, A GRAZING RAY HAD NO CERTIFICATE AT ALL (roadmap
+        # "_geo_sphere_roots_scaled has no near-tangent certificate", its spheres under 2^-484): r of 2^-484 or
+        # less with |o - c| more (both under it go to the unit-size copy above). Every miss and the hits within
+        # 1.0625 of tangency, read at their own scale (_geo_sph_fine_near), take _geo_sph_xcert here, at this
+        # routine's scale, where r and the offset are what the caller gave. Where r^2 does not flush in the
+        # unit-size copy (r 2^-483 of |o - c| or more) its plain products only, and what they do not certify goes
+        # to that copy, whose compensated offset certifies nearer tangency; elsewhere the exact products too, then
+        # the double-double coefficients or the exact roots. The first repair sent every such ray to the copy,
+        # where under 2^-1022 of |o - c| a radius loses its bits. Its cost, against the merged tree, which read these
+        # rays without a certificate: axis-aligned clear misses 697 -> 898 ns (the first repair 3,088; the plain
+        # pass saves 195 of it), rays within 8 ulps of tangency 681 -> 2,290 (169 of 6,300 wrong before).
+        # [measured: scratch bench.cyr ax_miss_mid / ax_tan_mid sets, taskset, 9 interleaved runs, 2026-11-14]
+        # Those sets are axis-aligned. Generic directions pay more, against the tree before this repair: rays
+        # within 8 ulps of tangency 876 -> 3,905 ns, clear misses 892 -> 1,560, coordinate-plane rays near
+        # tangency 841 -> 2,693, and the widest exponent spread near tangency 825 -> 6,661 (45% wrong before).
+        # [measured: the 3.5.0 second review of this repair, scratch sets, taskset, 7 interleaved rounds, 2026-11-14]
+        if (f64_lt(rr, _GEO_DIR_LO) == 1 && f64_lt(ff, _GEO_DIR_LO) == 1) {
+            store64(&fv, fx);
+            store64(&fv + 8, fy);
+            store64(&fv + 16, fz);
+            if (_geo_sph_fine_near(&fv, r) == 1) {
+                if (_geo_sphere_finite(ray, sphere) == 1) {
+                    var kp = _geo_sph_copy_keeps(ox, oy, oz, r);
+                    var xc = _geo_sph_xcert_at(o, cen, ox, oy, oz, dx, dy, dz, r, a, half_b, c, sc, kp, out);
+                    if (xc >= 0) { return xc; }
+                    if (kp == 1) { return _geo_sphere_roots_scaled(ray, sphere, out); }
                     return _geo_sphere_acc(ray, sphere, out);
                 }
+            }
+        } elif (f64_lt(delta, f64_mul(ff, 0x3FF1_0000_0000_0000)) == 1) {   # 1.0625
+            # (sq's rounding is not the bound's to pass on: under DBL_MIN big_d keeps a few bits or none)
+            var sqg = sq;
+            if (f64_gt(delta, 0) == 1 && f64_lt(big_d, _GEO_F64_TINY) == 1) { sqg = _geo_sqrt_tiny(a, delta); }
+            if (_geo_sph_graze(half_b, sqg, delta, ff, ococ, rr) == 0) {
+                # (at the direction as scaled above, its roots then multiplied back, as below)
+                var cpv = _geo_sph_comp(o, cen, dx, dy, dz, r, half_b, a, c, out);
+                if (cpv < 0) { return 0; }
+                if (cpv == 1) {
+                    if (sc != 0) {
+                        store64(out, f64_mul(load64(out), sc));
+                        store64(out + 8, f64_mul(load64(out + 8), sc));
+                    }
+                    return 1;
+                }
+                return _geo_sphere_acc(ray, sphere, out);
             }
         }
         if (f64_lt(f64_abs(delta), _GEO_DIR_LO) == 1) {
@@ -4466,6 +5142,20 @@ fn _geo_sphere_roots(ray, sphere, out) {
 # 4 ulp on all but 3, those within 16 ulp. A smaller radius, or a ray past those limits, can read the wrong verdict or
 # t, as on 3.4.0.
 # [measured: GEO7 3.4.1 samp.py sphere samples, 480,000 rays, exact Fraction oracle, 3.4.0 / this tree, 2026-11-01]
+# 3.5.0, past those limits and on smaller spheres (_geo_sph_solve_s, _geo_sph_xcert): of 42,900 rays built within 8
+# ulps of tangency, r from 2^-1074 to 2^1014 and down to 2^-1300 of |o - c|, |o - c| past DBL_MAX, |d| from 2^-1074 to
+# 2^1000, every verdict was exact and every t within 4 ulps, 3.77 at most (the merged tree before: 8,924 wrong), and so
+# were 138,600 more of the same reach, misses, chords and hits among them, but for 2 at 4.10 and 4.13 ulps, as before
+# (that tree's run, before the compensated step's roots were repaired, below).
+# Beyond what those families sample such a ray can still read the wrong verdict or t. One class is known, inside the
+# limits too: a tangent ray from an origin under 2^-537 short of its tangent point, whose |o - c|^2 - r^2 underflows
+# and with it the root c / q, reads t = 0.
+# [measured: scratch orc.py, 30 families, 181,500 rays, seeds 1-3, Fraction oracle, merged / this tree, 2026-11-14]
+# 3.5.0, the compensated step's roots from double-double coefficients (_geo_sph_comp_v, the lane's second review): on
+# 201,000 rays in 10 families inside those limits, built within 8 ulps of tangency or grazing (2^-5 .. 2^-50 of it),
+# every verdict was exact and every t within 2.91 ulps (3.4.2: 1 past 4, at 4.01; the merged tree: 10, up to 6.62),
+# and on 72,000 past them within 3.08.
+# [measured: scratch ev4.py, 14 families, seeds 1-3, Fraction oracle, 3.4.2 / merged / this tree, 2026-11-14]
 public fn geo_ray_sphere(ray, sphere) {
     # STACK, not alloc: the bump allocator never frees, so a 16-byte alloc here
     # would leak per call in the module's hottest routine -- the same objection
@@ -4543,7 +5233,8 @@ public fn geo_ray_sphere(ray, sphere) {
 # from (1e-310, 1, 0) had its x slab skipped: a ray that leaves that slab at a finite
 # t answered a hit, and one that enters it a miss. The slabs now divide (b - o) / d_k,
 # which needs only d_k != 0, so the parallel test is an exact zero; a crossing past
-# DBL_MAX overflows to +-Inf (an entry there is the miss, as before), and each
+# DBL_MAX overflows to +-Inf (an entry there was the miss, as before; from 3.5.0
+# a hit there is +Inf with its face, decided in the exact order), and each
 # crossing is one correctly rounded quotient of the rounded b - o, not (b - o) *
 # RN(1/d). Over 90000 finite box-ray pairs (12159 with an inverted box) against an
 # exact rational oracle, 105 answers moved wrong -> right (21 with an inverted box)
@@ -4826,12 +5517,14 @@ fn _geo_slabs_exact(s, out) {
     if (rr > 0) { return 0; }
     if (rr == 0) { tie_near = 1; tie_far = 1; }
     if (load64(&te) >= 0) {
-        if (f64_eq(f64_abs(td_min), _GEO_F64_POS_INF) == 1) { return 0; }
+        # (3.5.0: an entry past DBL_MAX is the hit +Inf, its rounding, as every other ray routine answers it;
+        # through 3.4.2 it was the miss. te >= 0 here was set by a slab, so the face is real.)
         if (out != 0) { store64(out, face_near); store64(out + 8, tie_near); }
         return td_min;
     }
     if (load64(&tx) >= 0) {
-        if (f64_eq(f64_abs(td_max), _GEO_F64_POS_INF) == 1) { return 0; }
+        # (3.5.0: likewise an exit past DBL_MAX. The +Inf no slab crossed, every d_k = 0, never reaches
+        # here: both callers answer such a ray's miss first, at `slabs == 0`, and a crossed slab sets tx.)
         if (out != 0) { store64(out, face_far); store64(out + 8, tie_far); }
         return td_max;
     }
@@ -4990,8 +5683,9 @@ fn _geo_ray_aabb_exact(ray, aabb, out) {
 # Ray-box intersection with the face hit (the slab method): the entry t > 0, or the exit for an
 # origin inside, or 0 on a miss, with out (GEO_FACE_OUT_BYTES, when not 0) holding the face (2 *
 # axis + plane, GEO_FACE_NONE on a miss) and the edge/corner tie flag. An inverted (setter-built)
-# box is read sorted. NaN in, NaN out with GEO_FACE_NONE (FACE ENCODING above); a crossing past
-# DBL_MAX is the miss. The direction need not be unit.
+# box is read sorted. NaN in, NaN out with GEO_FACE_NONE (FACE ENCODING above); a hit past DBL_MAX
+# from finite input is +Inf with its face (3.5.0: through 3.4.2 the miss). The direction need not be
+# unit.
 public fn geo_ray_aabb_face(ray, aabb, out) {
     var ox = HVec3_x(GeoRay_origin(ray));
     var oy = HVec3_y(GeoRay_origin(ray));
@@ -5264,8 +5958,9 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
     # NaN inputs keep their bits, and of 8000 with an infinity 6 moved, each a -0 jet.
     # _geo_ray_aabb_exact run on every finite pair returns the same t, face and tie.
     # [measured: C336 slab sweep, seeds 11 and 12, exact Fraction oracle, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
-    # The contract admits 0 or a positive f64. An overflow in the slab arithmetic
-    # can make t infinite from entirely finite inputs, which is not a hit.
+    # The contract admits 0 or a positive f64, +Inf for a hit past DBL_MAX (3.5.0). An overflow in
+    # the slab arithmetic can read +Inf where the crossings' order is lost, so that reading is
+    # settled exactly below.
     # ⚠ Only +/-Inf. NaN is left to propagate, on purpose -- see the is_inf note by geo_face_axis.
     if (f64_lt(t_min, 0) != 1) {
         var tmn = t_min & 0x7FFF_FFFF_FFFF_FFFF;   # (its bit tests: zero or subnormal, +-Inf)
@@ -5278,8 +5973,17 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
         }
         # (An entry read +Inf whose numerator overflowed had its exit's overflow too -- the
         # exit's bound lies beyond the entry's -- and the slab diverted there; an entry whose
-        # quotient alone overflowed is a crossing past DBL_MAX, the miss either way.)
-        if (tmn == 0x7FF0_0000_0000_0000) { return 0; }
+        # quotient alone overflowed is a crossing past DBL_MAX: through 3.4.2 the miss either way.)
+        if (tmn == 0x7FF0_0000_0000_0000) {
+            # ⛔ 3.5.0 — AN ENTRY PAST DBL_MAX IS THE HIT +Inf, NOT THE MISS (roadmap "The family's overflow
+            # convention differs", GEO F5, RV-GEO N3): the true t is finite and above DBL_MAX, so +Inf is its
+            # rounding, as geo_ray_plane, _sphere, _triangle and _capsule answer it; through 3.4.2 the slabs alone
+            # answered 0. Two crossings that both overflowed are not ordered by their +Inf readings, so
+            # finite input takes the exact order (_geo_slabs_exact), which answers +Inf with the face or the miss.
+            # A non-finite input keeps 3.4's miss.
+            if (_geo_ray_aabb_finite(ray, aabb) == 1) { return _geo_ray_aabb_exact(ray, aabb, out); }
+            return 0;
+        }
         if (out != 0) { store64(out, face_near); store64(out + 8, tie_near); }
         return t_min;
     }
@@ -5293,7 +5997,10 @@ public fn geo_ray_aabb_face(ray, aabb, out) {
                 }
             }
         }
-        if (tmx == 0x7FF0_0000_0000_0000) { return 0; }
+        if (tmx == 0x7FF0_0000_0000_0000) {   # (3.5.0: an exit past DBL_MAX, as the entry above)
+            if (_geo_ray_aabb_finite(ray, aabb) == 1) { return _geo_ray_aabb_exact(ray, aabb, out); }
+            return 0;
+        }
         if (out != 0) { store64(out, face_far); store64(out + 8, tie_far); }
         return t_max;
     }
@@ -5308,8 +6015,9 @@ public fn geo_ray_aabb(ray, aabb) {
 # Ray-triangle intersection (Moller-Trumbore): the t > 0 at which the ray crosses the triangle,
 # both faces, or 0 on a miss (a parallel ray, a degenerate triangle, a hit behind the origin, or a
 # contact at t = 0); a hit beyond DBL_MAX is +Inf, its rounding, as geo_ray_plane and
-# geo_ray_sphere answer it. The direction need not be unit. NaN origin -> NaN; a NaN direction or
-# vertex -> the miss (its reciprocal guard).
+# geo_ray_sphere answer it. The direction need not be unit. A NaN in any input -> the first NaN among
+# the inputs (origin, direction, v0, v1, v2), as the slab routines answer it (3.5.0: through 3.4.2 a
+# NaN direction or vertex answered the miss 0, through its reciprocal guard).
 # ⛔ 3.4.1 — EVERY VERDICT IS CERTIFIED OR EXACT, AT EVERY SCALE (AU2-G2-F1; review RV-GEO M1, M3).
 # The verdict (u >= 0, v >= 0, 1 - u - v >= 0, t > 0; a boundary is a hit) is the float
 # arithmetic's only where a proven error bound separates each quantity it reads from its threshold;
@@ -5475,6 +6183,19 @@ fn _geo_ray_tri_slow(ray, tri) {
     }
     if ((_geo_hvec3_finite(o) & _geo_hvec3_finite(dir) & _geo_hvec3_finite(v0) & _geo_hvec3_finite(v1) &
         _geo_hvec3_finite(v2)) == 0) {
+        # ⛔ 3.5.0 — A NaN INPUT IS RETURNED, NOT TURNED INTO THE MISS (roadmap "Documented in their own
+        # comments, the same class"). Through 3.4.2 a NaN direction or vertex made a NaN, and
+        # _geo_ray_tri_plain's reciprocal guard answered the miss 0 for it, a legal "no hit"; a NaN
+        # origin came back as a NaN t. Every NaN input coordinate reaches here (a NaN a, u or t
+        # fails each of the fast path's certificates), and now the first NaN among the inputs, in
+        # the order origin, direction, v0, v1, v2, is the answer, as the slab routines return
+        # theirs (_geo_ray_aabb_nan_or_miss). An infinite input with no NaN keeps 3.4.0's arithmetic.
+        var nn = _geo_hvec3_nan(o);
+        if (nn == 0) { nn = _geo_hvec3_nan(dir); }
+        if (nn == 0) { nn = _geo_hvec3_nan(v0); }
+        if (nn == 0) { nn = _geo_hvec3_nan(v1); }
+        if (nn == 0) { nn = _geo_hvec3_nan(v2); }
+        if (nn != 0) { return nn; }
         return _geo_ray_tri_plain(dir, &e1, &e2, &sv);
     }
     # A zero edge, d = 0 or o = v0 (exactly: a difference that rounds to 0 is exact) is 3.4.0's
@@ -6092,6 +6813,9 @@ fn _geo_obb_face_num0(face, e0, he0, e1, he1, e2, he2) {
 # review's reading). A hit whose 1 / f_k overflows is the jet's miss, as for the AABB.
 # [measured: C336 OBB sweep, seeds 21 and 22, exact Fraction oracle, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
 # [measured: C336 run of the C1 review's OBB sweep, seed 311, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
+# (3.5.0) A hit past DBL_MAX from finite e, f and he is +Inf with its face, as in geo_ray_aabb_face;
+# through 3.4.2 it was the miss. ⚠ Finite input whose c - o overflows (so e or f is not finite) can still
+# answer 0 or NaN for such a hit, as through 3.4.2: not repaired here.
 public fn geo_ray_obb_face(ray, obb, out) {
     # (3.4.0: c - o on the stack, the same operations as hvec3_sub, so the same bits, and the axes
     # from _geo_obb_axes_into: NaN, not a dereferenced 0, when a rotation's allocation was refused.)
@@ -6316,11 +7040,13 @@ public fn geo_ray_obb_face(ray, obb, out) {
     # e - |he| cannot pass +DBL_MAX (it can pass -DBL_MAX, e = -1.5 * 2^1023 against
     # he = 1.5 * 2^1023, but an entry read -Inf is behind the origin as its true value
     # is, and only the exit is then returned). So an entry read +Inf is a crossing past
-    # DBL_MAX, the miss either way, and the per-axis miss tests need no exact order. An exit
+    # DBL_MAX (the miss through 3.4.2, +Inf in the exact order from 3.5.0), and the per-axis miss
+    # tests need no exact order. An exit
     # read +Inf whose numerator e -+ he overflowed diverts where it is read; a zero or
     # subnormal t_min or t_max only when a crossing underflowed (_geo_slab_uf).
 
-    # See geo_ray_aabb_face: 0 or a positive FINITE t, nothing else.
+    # See geo_ray_aabb_face: 0, a positive finite t, or +Inf for a hit past DBL_MAX (3.5.0; from finite
+    # e, f and he, see the doc above).
     if (f64_lt(t_min, 0) != 1) {
         var tmn = t_min & 0x7FFF_FFFF_FFFF_FFFF;
         if (tmn < 0x0010_0000_0000_0000) {
@@ -6337,7 +7063,12 @@ public fn geo_ray_obb_face(ray, obb, out) {
                 }
             }
         }
-        if (tmn == 0x7FF0_0000_0000_0000) { return 0; }
+        if (tmn == 0x7FF0_0000_0000_0000) {
+            # ⛔ 3.5.0 — AN ENTRY PAST DBL_MAX IS THE HIT +Inf, as in geo_ray_aabb_face (through 3.4.2 the miss),
+            # decided in the exact order where e, f and he are finite on every axis; otherwise 3.4's miss.
+            if (_geo_ray_obb_slabs(ray, obb, axes, &s) == 1) { return _geo_slabs_exact(&s, out); }
+            return 0;
+        }
         if (out != 0) { store64(out, face_near); store64(out + 8, tie_near); }
         return t_min;
     }
@@ -6358,7 +7089,10 @@ public fn geo_ray_obb_face(ray, obb, out) {
                 }
             }
         }
-        if (tmx == 0x7FF0_0000_0000_0000) { return 0; }
+        if (tmx == 0x7FF0_0000_0000_0000) {   # (3.5.0: as the entry above)
+            if (_geo_ray_obb_slabs(ray, obb, axes, &s) == 1) { return _geo_slabs_exact(&s, out); }
+            return 0;
+        }
         if (out != 0) { store64(out, face_far); store64(out + 8, tie_far); }
         return t_max;
     }
@@ -7203,61 +7937,6 @@ fn _geo_cap_far_accepts(ray, sph, u, o_dot, oce, is_end, root_i) {
     return _geo_cap_accepts(_geo_ldexp(t2, oce), o_dot, hvec3_dot(GeoRay_direction(r2), u), is_end);
 }
 
-# The cap's half-space test for root root_i of its sphere, from where that root lies rather
-# than from o_dot + t d_dot (3.3.7): with f the offset of the cap's centre from the ray's line
-# (_geo_perp_part on unit-size copies, o - cap's rounding carried), the root's point is
-# cap + f -+ h d / |d|, h = sqrt(r^2 - |f|^2), so its side is f . u -+ h (d . u) / |d|. For an
-# origin far from a small cap, o_dot and t d_dot agree in all their bits and their sum is
-# their rounding; f is formed to about 2^-104 of |o - cap| (exactly for a ray along a
-# coordinate axis). 1 or 0 as _geo_cap_accepts; -1 when an input is not finite.
-fn _geo_cap_side_exact(ray, cap_pt, r, u, root_i, is_end) {
-    var o = GeoRay_origin(ray);
-    var d = GeoRay_direction(ray);
-    var csx[16];
-    store64(&csx, cap_pt);
-    store64(&csx + 8, r);
-    if (_geo_sphere_finite(ray, &csx) == 0 || _geo_hvec3_nonfinite(u) == 1) { return 0 - 1; }
-    var oc[24];
-    store64(&oc, f64_sub(HVec3_x(o), HVec3_x(cap_pt)));
-    store64(&oc + 8, f64_sub(HVec3_y(o), HVec3_y(cap_pt)));
-    store64(&oc + 16, f64_sub(HVec3_z(o), HVec3_z(cap_pt)));
-    if (_geo_hvec3_nonfinite(&oc) == 1) { return 0 - 1; }
-    var lo[24];
-    _geo_oc_lo(o, cap_pt, F64_ONE, &oc, &lo);
-    var mp = _geo_absmax_bits(&oc);
-    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
-    if (mr > mp) { mp = mr; }
-    var sp = _geo_scale_for(mp >> 52);
-    var dst: i64[3];
-    var tv: i64[3];
-    var ds = _geo_scale_to(&dst, d, _geo_scale_for(_geo_absmax_bits(d) >> 52));
-    var f[24];
-    _geo_perp_part(_geo_scale_to(&tv, &oc, sp), ds, &f);
-    _geo_add_perp(&f, _geo_scale_to(&tv, &lo, sp), ds);
-    # f and r at their own scale (as _geo_delta_fine takes them): a cap far below |o - cap|
-    # flushes in the copy above. The side's sign does not depend on the power of two.
-    var rs = f64_mul(r, sp);
-    var mf = _geo_absmax_bits(&f);
-    var mr2 = rs & 0x7FFF_FFFF_FFFF_FFFF;
-    if (mr2 > mf) { mf = mr2; }
-    var s2 = _geo_scale_for(mf >> 52);
-    var fst: i64[3];
-    var fs = _geo_scale_to(&fst, &f, s2);
-    rs = f64_mul(rs, s2);
-    var hh = f64_sub(f64_mul(rs, rs), hvec3_dot(fs, fs));
-    if (f64_lt(hh, 0) == 1) { hh = 0; }
-    var h = f64_div(f64_sqrt(hh), hvec3_length(ds));
-    var du = f64_mul(h, hvec3_dot(ds, u));
-    if (root_i == 0) { du = f64_neg(du); }
-    var side = f64_add(hvec3_dot(fs, u), du);
-    if (is_end == 1) {
-        if (f64_lt(side, 0) == 1) { return 0; }
-        return 1;
-    }
-    if (f64_gt(side, 0) == 1) { return 0; }
-    return 1;
-}
-
 # Ray-capsule intersection
 # 1 when root `t` is a real hit on the cap whose plane term is (o_dot, d_dot).
 # A cap owns the half-space on its own side of the capsule's end plane: the START
@@ -7453,8 +8132,14 @@ fn _geo_capsule_far(ray, capsule, ao, ab, out) {
     var tc = geo_ray_capsule_branch(&cray, &ccap, &cbv);
     var cb = load64(&cbv);
     # the copy's answer stands where it is the certified piece and its root's error, dtc at the
-    # copy's scale, is under 2^-55 of t
-    if (f64_eq(tc, 0) == 1 || cb != load64(&cert)) { return _geo_cap_xsolve(ray, capsule, out); }
+    # copy's scale, is under 2^-55 of t. (3.5.0, roadmap "Simplifications": through 3.4.2 this also refused
+    # tc = 0, which only the miss gives here, whose piece GEO_FACE_NONE is never the certificate's: the copy's
+    # origin is K = 8 (|ab| + r) (largest components) back along the ray from where it passes the start, over
+    # 4.5 (|ab| + r) from the start against the capsule's 1.75 (|ab| + r) at most, so never on or in it, and its
+    # t is at least that distance over |ds| < 4, far from 0. Removing the term moved none of 20,000 far, aimed,
+    # spread, past-DBL_MAX and tiny-capsule rays.)
+    # [measured: scratch W2 first pass, evalfam.py farcap / farhit / spread2 / bigt / tinyfam, variant, 2026-11-14]
+    if (cb != load64(&cert)) { return _geo_cap_xsolve(ray, capsule, out); }
     var dtw = _geo_ldexp(load64(&cert + 8), ed - ((sc >> 52) - 1023));   # (the root's move, at the world's scale)
     if (f64_lt(dtw, f64_mul(t0, 0x3C80_0000_0000_0000)) == 0) {   # 2^-55
         return _geo_cap_xsolve(ray, capsule, out);
@@ -7539,21 +8224,6 @@ fn _geo_cap_xroute(ray, capsule, out) {
     if (f64_lt(r, 0) == 1 || f64_lt(r, _GEO_F64_POS_INF) == 0) { return 0x7FF8_0000_0000_0003; }
     if (_geo_absmax_bits(GeoRay_direction(ray)) == 0) { return 0x7FF8_0000_0000_0003; }
     return _geo_cap_xsolve(ray, capsule, out);
-}
-
-# 1 when a barrel entry root t1 (and the exit t2, the plain d_perp, d . d and r^2) is well conditioned
-# (3.4.1 GEO4): the half-chord (t2 - t1) |d_perp| / 2 at least r / 4 and d_perp at least 2^-10 of d,
-# so the root's error, and its segment coordinate's, is a few ulps of |o - start| over |u|, inside what
-# sends a root near an end plane to the exact solve (within 2^-20 of the plane, _geo_seam_doubt's w). Then the
-# caps cannot come first and need not be solved.
-fn _geo_barrel_entry_ok(t1, t2, dperp, ddd, rbb) {
-    var dpp = hvec3_dot(dperp, dperp);
-    if (f64_lt(dpp, f64_mul(ddd, 0x3EB0_0000_0000_0000)) == 1) { return 0; }   # 2^-20
-    var hw = f64_mul(f64_sub(t2, t1), F64_HALF);
-    var hh = f64_mul(f64_mul(hw, hw), dpp);
-    if (f64_lt(hh, f64_mul(rbb, 0x3FB0_0000_0000_0000)) == 1) { return 0; }   # 1/16
-    if (f64_lt(hh, _GEO_F64_POS_INF) == 0) { return 0; }
-    return 1;
 }
 
 # 1 when a barrel root's segment coordinate proj may be on the other side of an end plane than it reads
@@ -7718,90 +8388,6 @@ fn _geo_seam_window(ray, capsule, ab, w1, wab) {
     store64(w1, f64_mul(_geo_absmax_bits(d), 0x3CF0_0000_0000_0000));   # 2^-48
     store64(wab, _geo_absmax_bits(ab));
     return f64_mul(f64_add(_geo_absmax_bits(o), _geo_absmax_bits(st)), 0x3CF0_0000_0000_0000);
-}
-
-# The segment coordinate's stand-in for _geo_barrel_seam_x's answer (-1, 2, 0): -1, 2 or 1/2.
-fn _geo_seam_stand(sx) {
-    if (sx == 0 - 1) { return f64_neg(F64_ONE); }
-    if (sx == 2) { return F64_TWO; }
-    return F64_HALF;
-}
-
-# For a barrel root root_i whose segment coordinate proj (formed from p = o + t d) is within its
-# own rounding of 0 or 1 (the caller's window, _geo_seam_window), a stand-in that is right by
-# sign (3.3.7): -1 or 2 off the segment, 0.5 on it. p carries about 2^-53 (|o| + |t d|),
-# which is more than a thin barrel's own radius; the root's side of each end plane is taken
-# instead from where the root lies against the inputs: with w = o - end point, w_d its part
-# across d (_geo_perp_part, its rounding carried), h = sqrt(r^2 - f^2) for f the offset of the
-# ray's line from the axis (_geo_cap_axis_offset), and s = -1 for the near root, +1 for the far,
-#     (p - end point) . ab  has the sign of  (ab . w_d) |ab| (d . d) + s h (d . ab) |ab x d|.
-# Finite input whose ab and differences do not overflow only: otherwise proj is returned.
-fn _geo_cap_seam_proj(ray, capsule, ab, t, proj, root_i) {
-    var o = GeoRay_origin(ray);
-    var d = GeoRay_direction(ray);
-    var st = GeoCapsule_start(capsule);
-    var r = GeoCapsule_radius(capsule);
-    var en = GeoCapsule_end(capsule);
-    var nf = _geo_hvec3_nonfinite(o) + _geo_hvec3_nonfinite(d) + _geo_hvec3_nonfinite(st) + _geo_hvec3_nonfinite(en);
-    if (nf + _geo_hvec3_nonfinite(ab) != 0 || f64_lt(f64_abs(r), _GEO_F64_POS_INF) == 0) { return proj; }
-    var wat: i64[3];
-    var wbt: i64[3];
-    var dst: i64[3];
-    var abt: i64[3];
-    var tv: i64[3];
-    var tc: i64[3];
-    var wa = _geo_sub_to(&wat, o, st);
-    var wb = _geo_sub_to(&wbt, o, en);
-    if (_geo_hvec3_nonfinite(wa) + _geo_hvec3_nonfinite(wb) != 0) { return proj; }
-    var md = _geo_absmax_bits(d);
-    var mab = _geo_absmax_bits(ab);
-    if (md == 0 || mab == 0) { return proj; }
-    var mw = _geo_absmax_bits(wa);
-    var mb = _geo_absmax_bits(wb);
-    if (mb > mw) { mw = mb; }
-    var mr = r & 0x7FFF_FFFF_FFFF_FFFF;
-    if (mr > mw) { mw = mr; }
-    var s0 = _geo_scale_for(mw >> 52);
-    var ds = _geo_scale_to(&dst, d, _geo_scale_for(md >> 52));
-    var abs_ = _geo_scale_to(&abt, ab, _geo_scale_for(mab >> 52));
-    var bx[64];
-    store64(&bx, ray);
-    store64(&bx + 8, capsule);
-    store64(&bx + 16, wa);
-    store64(&bx + 24, 0);
-    store64(&bx + 32, ab);
-    store64(&bx + 40, F64_ONE);
-    store64(&bx + 48, 0);
-    store64(&bx + 56, (s0 >> 52) - 1023);
-    var fb[24];
-    if (_geo_cap_axis_offset(&bx, &fb) == 0) { return proj; }
-    var rs = f64_mul(r, s0);
-    var mf = _geo_absmax_bits(&fb);
-    var mr2 = rs & 0x7FFF_FFFF_FFFF_FFFF;
-    if (mr2 > mf) { mf = mr2; }
-    var s2 = _geo_scale_for(mf >> 52);
-    var fst: i64[3];
-    var fs = _geo_scale_to(&fst, &fb, s2);
-    var rs2 = f64_mul(rs, s2);
-    var hh = f64_sub(f64_mul(rs2, rs2), hvec3_dot(fs, fs));
-    if (f64_lt(hh, 0) == 1) { hh = 0; }
-    var h = f64_div(f64_sqrt(hh), s2);
-    _geo_cross_into(abs_, ds, &tc);
-    var nc = hvec3_length(&tc);
-    var t2 = f64_mul(f64_mul(h, hvec3_dot(ds, abs_)), nc);
-    if (root_i == 0) { t2 = f64_neg(t2); }
-    var k1 = f64_mul(hvec3_length(abs_), hvec3_dot(ds, ds));
-    var lo[24];
-    var wp[24];
-    _geo_oc_lo(o, st, F64_ONE, wa, &lo);
-    _geo_perp_part(_geo_scale_to(&tv, wa, s0), ds, &wp);
-    _geo_add_perp(&wp, _geo_scale_to(&tv, &lo, s0), ds);
-    if (f64_lt(f64_add(f64_mul(hvec3_dot(abs_, &wp), k1), t2), 0) == 1) { return f64_neg(F64_ONE); }
-    _geo_oc_lo(o, en, F64_ONE, wb, &lo);
-    _geo_perp_part(_geo_scale_to(&tv, wb, s0), ds, &wp);
-    _geo_add_perp(&wp, _geo_scale_to(&tv, &lo, s0), ds);
-    if (f64_gt(f64_add(f64_mul(hvec3_dot(abs_, &wp), k1), t2), 0) == 1) { return F64_TWO; }
-    return F64_HALF;
 }
 
 # ================================================================
@@ -8054,17 +8640,35 @@ fn _geo_capsule_ray_inf(ray, fp, k, sg, r, kind, fb, out) {
 # Accuracy (finite input, not every magnitude, largest components): the verdict and piece were exact on all but 3 of
 # 216,561 sampled rays, within 3 ulps of barrel tangency and in the ordinary, near-axis, seam, far thin, near-parallel
 # and surface-origin families, with r of 2^-484 or more, each coordinate, r and |d| under 2^510 and |d| times the
-# largest of them under 2^512; those 3 have t past DBL_MAX and read the miss. With coordinates and r all under 2^-484
+# largest of them under 2^512; those 3 have t past DBL_MAX and read the miss through 3.4.2 (3.5.0 sends a barrel root
+# past DBL_MAX to the exact solve, and the one of them in hand, GEO7 F2's, now reads +Inf on the barrel; the other two
+# were not kept). With coordinates and r all under 2^-484
 # they were exact on all 93,719 sampled. Past those limits, or with r under 2^-484 and coordinates above it, a ray
-# within ulps of tangency can read the wrong verdict or t, as on 3.4.0. t is within 4 ulp on all but about 1 ray in
-# 2,000 of ordinary capsules, at most 9.2 ulp (a barrel's near root with c one bit down). Coordinates spread across
-# the whole exponent range can read NaN or the wrong verdict, and an infinite end has no near-tangent repair.
-# Cost: an ordinary ray about 0.7 us, 1.1 us within 1/8 of the axis; a ray only the exact solve can answer
-# (_geo_cap_xsolve) 3 to 8 us at ordinary scale, up to 1.6 ms on coordinates spread over the exponent range. The
-# stack it needs is 64 to 72 KB.
+# within ulps of tangency can read the wrong verdict or t, as on 3.4.0. How often t is past 4 ulp depends on the rays
+# (exact roots, on samples, whose figures vary; 3.4.2 in parentheses): on ordinary capsules (ends in [-10, 10]^3, r 0.05
+# to 3, origins in [-30, 30]^3, an eighth inside, aimed near the capsule) 1 ray in 1,300 to 4,300, at most 5.3 ulp (1 in
+# 970 to 2,000, at most 8.2); with origins 0.7 to 1.5 radii off the axis 22 to 36 in 20,000, at most 7.0 (456 to 728, at
+# most 12.6); those ordinary rays at scales 2^+-110 .. 2^+-800, 9 in 12,000, at most 6.2 (159, at most 79); from inside
+# a long capsule, 1/8 to 1/4 of the way off its axis, 3 to 6 in 8,000, at most 6.2 (120 to 167, at most 13.2); with a
+# subnormal d (|d| 2^-1074 .. 2^-1045, coordinates 2^-470 .. 2^-400) 2^-3 .. 2^-80 off long axes, 37 in 24,000, at most
+# 8.8 (52), each from an origin 0.81 to 0.89 or 1.15 to 1.38 radii off the axis, the one-bit band, outside its repair's
+# 2^+-100. Rays 2^-49 .. 2^-100 off a long axis, the barrel crossed on the segment, were right on all of 22,000 (2,571
+# wrong, t up to 1.1e14 ulp off), and rays whose coordinates' exponents spread over the range (all of it, [-300, 300],
+# [900, 1023] or [-1074, -900]) on all of 45,000 but a hit whose t rounds to 0, the miss's (125 wrong, 13 of them the
+# miss for a hit, t up to 9e15 ulp off): since 3.5.0 a ray within 2^-48 of the axis that can cross the barrel on the
+# segment, a capsule longer than 2^511.5 and a projection past DBL_MAX are solved exactly. With an infinite end, on
+# 18,000 rays within 2^-20 .. 2^-52 of tangency the verdict and piece were exact and t within 4.6 ulp, 1 past 4 (3.4.2
+# the same).
+# Cost: an ordinary ray about 0.8 us, 1.4 us along an ordinary capsule's axis; a ray only the exact solve can answer
+# (_geo_cap_xsolve) 3 to 8 us at ordinary scale, up to 1.6 ms on coordinates spread over the exponent range (on 1,000
+# such rays 160 us a ray, 1.2 times 3.4.2's 134: 3.5.0 sends it more of them). The stack it needs is 64 to 72 KB.
 # [measured: GEO 3.4.1 AU2-G2-F11 repro, exact Fraction oracle, 3.4.0 vs this tree, not in-tree, 2026-10-31]
 # [measured: GEO6 3.4.1 families (fam.py, capb.py, capc.py, ext2.py, xt.py), exact Fraction oracle, 2026-11-01]
 # [measured: GEO7 3.4.1 csamp.py capsule samples (gt.py, gcap.py), exact Fraction oracle, 3.4.0 / this tree, 2026-11-01]
+# [measured: scratch W2 ev.py ord / band / ordsc / nq / lr / lro / spread, Fractions, 3.4.2 / base / tree, 2026-11-14]
+# [measured: scratch W2 evinf.py inftan 1-3, half-infinite limit oracle, Fractions, 3.4.2 / base / tree, 2026-11-14]
+# [measured: scratch W2 tm.py ord / axr, taskset-pinned interleaved (noisy); first pass timeab.py spread2, 2026-11-14]
+# [measured: scratch W2 review fix ev.py ord / band / nq / sa / lr, Fractions, 3.4.2 / pre / tree, 2026-11-14]
 public fn geo_ray_capsule_branch(ray, capsule, out) {
     var t = _geo_ray_capsule_branch0(ray, capsule, out);
     if (out != 0) {
@@ -8200,6 +8804,19 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                 uh = 1;
             }
             var sa = _geo_scale_for(_geo_absmax_bits(ah) >> 52);
+            # ⛔ 3.5.0 — A CAPSULE LONGER THAN 2^511.5 IS SOLVED EXACTLY (roadmap "The public capsule on spread
+            # exponents"). The scaled axis holds the projections, but the barrel's offsets keep 2^-52 of coordinates
+            # past 2^900 against a radius as large: of 10,000 capsule rays with every coordinate's exponent in
+            # [900, 1023], aimed at the capsule, 3.4.2 had 25 wrong (t to 5.3e4 ulp off), and of 15,000 with
+            # exponents over the whole range 35 more, every one with |ab|^2 past DBL_MAX. _geo_cap_xroute answers
+            # every finite input (0 of them wrong); this costs such a ray about 1.3 times (9.2 us against 6.9 a ray
+            # on the first family; on spread exponents 1.2 to 1.3 times 120 us).
+            # [measured: scratch W2 ev.py spread4 / spread2, call-site-instrumented copy, exact Fractions, 2026-11-14]
+            # [measured: scratch W2 first pass timeab.py, pinned interleaved (noisy), base vs this tree, 2026-11-14]
+            if (ab_len_sq == 0x7FF0_0000_0000_0000) {   # +Inf
+                var txu = _geo_cap_xroute(ray, capsule, out);
+                if (txu != 0x7FF8_0000_0000_0003) { return txu; }
+            }
             u = _geo_scale_to(&ust, ah, sa);
             uu = hvec3_dot(u, u);
             us = 1;
@@ -8264,6 +8881,22 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
     }
     var d_par = f64_div(hvec3_dot(GeoRay_direction(ray), u), uu);
     var o_par = f64_div(hvec3_dot(ao, u), uu);
+    # ⛔ 3.5.0 — A PROJECTION THAT OVERFLOWED IS SOLVED EXACTLY (roadmap "The public capsule on spread exponents").
+    # d . u or (o - start) . u past DBL_MAX (|d| or |o - start| times |end - start| past 2^1024, past the limits
+    # below) left d_par or o_par infinite, and the segment test after them read its own overflow: a capsule 2^-499
+    # of its radius long, met at 5 radii from 2^961 away, read a barrel hit 2.2e11 ulp before the exact start cap's
+    # (4 of 45,000 rays with spread exponents; 18 of 3,000 aimed rays with d . u past DBL_MAX, every product one sign,
+    # to 6.7 ulp). Such a ray goes to _geo_cap_xroute, which declines only a non-finite input (that goes on as before).
+    # [measured: scratch W2 ev.py spread / dinf, call-site-instrumented copy, exact Fraction oracle, 2026-11-14]
+    # (|x| past DBL_MAX, or NaN: the bits of |x| at +Inf's or above)
+    if ((d_par & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000
+      || (o_par & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) {
+        var txp = _geo_cap_xroute(ray, capsule, out);
+        if (txp != 0x7FF8_0000_0000_0003) {
+            if (tiny == 1) { txp = _geo_ldexp(txp, tiny_e); }
+            return txp;
+        }
+    }
 
     var dpv0[24];
     var opv0[24];
@@ -8368,7 +9001,8 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
     # tree (1,695 of 3,000 rays 2^-3 .. 2^-40 off the axis past 4 ulp, 13 now, the worst 7.3); near tangency the
     # same rounding read the wrong verdict (134 hit -> miss of 3,000) and on seams the wrong t by 2e15 ulp. A ray
     # within 1/8 of the axis (a < d . d / 64) takes d_perp with end - start's rounding carried, _geo_dperp_fine.
-    # (1/4 costs four times the rays, spared 2 or 3 of those 3,000, and took one ordinary ray from 3.2 ulp to 5.2.)
+    # (3.4.1 found 1/4 cost four times the rays for 2 or 3 of those 3,000; 3.5.0 takes 1/8 to 1/4 through a cheaper
+    # form, _geo_dperp_q, below.)
     # [measured: GEO6 3.4.1 nv / nv1 / pt / st families (capc.py), exact Fraction oracle, s22 / this tree, 2026-11-01]
     if (par == 0) {
         var sus = f64_lt(a, f64_mul(ddd, 0x3F90_0000_0000_0000));   # 1/64
@@ -8384,6 +9018,24 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                 } else {
                     de = _geo_perp_rescue(dir, u, &dpv);
                 }
+                dres = 1;
+            }
+        } elif (f64_lt(a, f64_mul(ddd, 0x3FB0_0000_0000_0000)) == 1   # 1/16
+          && us == 0 && f64_lt(a, _GEO_DIR_LO) == 0) {
+            # ⛔ 3.5.0 — FROM 1/4 OF THE AXIS (roadmap "Rays near a long capsule's axis"): past 1/8 the plain d_perp's
+            # rounding is up to 8 times 2^-53 of it, and from inside a long capsule (2^4 .. 2^20 radii) 140 of 8,000
+            # rays 1/8 to 1/4 off the axis read t past 4 ulp (at most 13.1), two seeds. d_perp is formed with end -
+            # start's rounding carried (_geo_dperp_q, three exact products: 4 and 6 of 8,000 remain, at most 6.2, 1 of
+            # each crossing 4 ulp the other way; +13% on that family with the band above; _geo_dperp_fine there cost 3
+            # times as much). dfn stays 0: the plain d_perp's error bound still holds it. A rebuilt pair of seeds: 167
+            # and 120 (13.2) to 6 and 3 (5.4), 3 and 2 the other way; the cost there, two pinned sessions, +16.5% and
+            # +19.7% (first measured as +13%).
+            # [measured: scratch W2 ev.py nq seeds 1-2, exact Fraction oracle, 3.4.2 / base vs this tree, 2026-11-14]
+            # [measured: scratch W2 tm.py nq, pinned interleaved (noisy); first pass's dperp_fine variant, 2026-11-14]
+            # [measured: scratch W2 review fix ev.py nq1-2, Fractions; tm.sh nq1 pinned interleaved (noisy), 2026-11-14]
+            var dqm = _geo_absmax_bits(dir) >> 52;
+            if (dqm > 123 && dqm < 1923 && ((d_par & 0x7FFF_FFFF_FFFF_FFFF) >> 52) < 1923) {
+                _geo_dperp_q(dir, GeoCapsule_start(capsule), GeoCapsule_end(capsule), u, d_par, &dpv);
                 dres = 1;
             }
         }
@@ -8492,6 +9144,67 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
             }
         }
     }
+    # ⛔ 3.5.0 — A RAY WITHIN 2^-48 OF THE AXIS THAT CAN CROSS THE BARREL ON THE SEGMENT IS SOLVED EXACTLY (roadmap "The
+    # public capsule on spread exponents"). The fine d_perp is good to an ulp of itself plus about 2^-104 |d| across the
+    # axis (_geo_perp_dd): under 2^-48 |d| that is past 2^-55 of it, and a barrel root, a distance across the axis over
+    # |d_perp|, takes it whole. Rays of a generic direction 2^-49 .. 2^-100 off a long axis (end = lam d as rounded,
+    # start that rounding plus an offset), from inside or outside, the barrel crossed on the segment: 3.4.2 and the base
+    # had 2,571 of 22,000 wrong, t up to 1.1e14 ulp off; with this route at 2^-52, 1 (4.00 ulp); at 2^-56, 12 (to 18.1);
+    # at 2^-60, 174 (to 144); at 2^-80, 487 of 6,000 (to 7.5e7); 0 here. Spread exponents failed the same way: of 45,000
+    # such rays, 61 that 3.4.2 had wrong (7 hits read as the miss, t up to 9.0e15 ulp off) were 2^-82 .. 2^-278 off axes
+    # 2^83 .. 2^280 radii long; 0 here. Such a ray (dqe, log2 |d_perp| / |d| by exponents, under -48 after the
+    # refinements above) goes to the exact solve, which answers every finite input; a non-finite one goes on.
+    # It does not go where the barrel cannot be crossed on the segment. Across the segment's slab |t| is under (|ao| +
+    # |ab|) / |d|, so the distance from the axis moves by under 2^-47.2 (|ao| + |ab|) for a d_perp, the formed or the
+    # true one, under 2^-48 sqrt(3) |d| + 2^-104 |d|; o_perp's own rounding is under 2^-47 |ao|. When | |o_perp| - r |
+    # is past four times the first plus the second, under 2^-43.8 of the largest components' sum, a barrel root (|t| at
+    # least | |o_perp| - r | / |d_perp|) lies past four times the slab, exact or formed from this d_perp, and the caps
+    # answer, as through 3.4.2. The test reads | |o_perp| - r | from |o_perp|^2 - r^2 over |o_perp| + r, which is under
+    # 2 max|o_perp_i| + r, against 2^-40 of max|ao_i| + max|ab_i| + r (u is ab, us = 0, and d normal, below; squares
+    # under 2^-968, or past DBL_MAX, are not read: the ray is routed). Without it the route took every ray along an
+    # ordinary capsule's axis, d = (end - start) / |end - start| as rounded, d_perp its rounding: 1.35 us to 4.25 a ray
+    # (+213%), and +104% on rays 2^-44 .. 2^-52 off capsules 2^4 .. 2^20 radii long, every one already right; with it
+    # they cost +3.7% and +3.4% (the band below, mostly), 0 of 18,000 wrong. On 18,000 rays 2^-48 .. 2^-100 off long
+    # axes, origins as near as 2^-62 of the axis's length to the barrel, the test's 2^-40 could be 2^-50 with no wrong
+    # answer (at 2^-56, 1 at 4.43 ulp; at 2^-62, 66, to 149 ulp).
+    # [measured: scratch W2 ev.py lr / lro seeds 1-3, spread, exact Fractions, 3.4.2 / base / mutants, 2026-11-14]
+    # [measured: scratch W2 ev.py axr / n48 / n60 / lgate / lr, Fractions; tm.py pinned interleaved (noisy), 2026-11-14]
+    # (For a subnormal d the exponent field reads 0 where log2 |d| + 1023 is negative, so dqe reads up to 51 low: such a
+    # ray is routed sooner, never later. Of 3,000 rays with a subnormal d (under 2^-1053) 2^-30 .. 2^-80 off a long
+    # axis, every one from 2^-44 off took the route, and some from 2^-33: 0 wrong here, 298 in the base. A d_perp that
+    # reads exactly 0 has exponent 0, so dqe is -1023 for the fine forms, whose de is 1023 less d's exponent, and under
+    # -123 for _geo_dperp_q's, de 0.)
+    # [measured: scratch W2 ev.py lrsub, call-site-instrumented copy of this tree, exact Fractions, 2026-11-14]
+    # (And so the gate is not read for a subnormal d, dme = 0. Its bound needs |d_perp| under 2^-48 sqrt(3) |d|, which
+    # dqe under -48 does not show there: a ray up to 1/8 off the axis, the fine d_perp's reach, can read under -48.
+    # Read, it kept rays that cross the barrel on the segment off the route: of 24,000 rays with a subnormal d (|d|
+    # 2^-1074 .. 2^-1045, coordinates 2^-470 .. 2^-400) 2^-3 .. 2^-80 off long axes, 15 of its skips, 2^-3.9 .. 2^-18.5
+    # off, read t 4.0 to 6.4 ulp off, 3.4.2's bits; routed, they are within 1.7 ulp, and no ray of the 24,000 moved the
+    # other way. Such a ray now pays for the exact solve wherever its origin is: on 5,000 of them, 2^-3 .. 2^-12 off,
+    # 1.95 us a ray to 3.87 (two pinned sessions, +99% and +98%). A normal d's bits and path are unchanged.)
+    # [measured: scratch W2 review fix ev.py sa1-3 / lr1, Fractions, instrumented merged tree / 3.4.2 / fix, 2026-11-14]
+    # [measured: scratch W2 review fix tm.sh sa1, taskset-pinned interleaved, 11 rounds, load 3-5 (noisy), 2026-11-14]
+    if (dres == 1) {
+        var dme = _geo_absmax_bits(dir) >> 52;
+        var dqe = ((_geo_absmax_bits(&dpv) >> 52) - de) - dme;
+        if (dqe < 0 - 48) {
+            var xcr = 1;   # 0 when the barrel cannot be crossed on the segment
+            var gq = f64_add(oo, rbb);
+            if (us == 0 && dme != 0 && f64_lt(gq, _GEO_F64_POS_INF) == 1 && f64_lt(gq, _GEO_DIR_LO) == 0) {
+                var gw = f64_add(f64_add(_geo_absmax_bits(ao), _geo_absmax_bits(u)), rb);
+                var gs = f64_add(f64_mul(_geo_absmax_bits(o_perp), F64_TWO), rb);
+                var gx2 = f64_mul(f64_mul(gw, 0x3D70_0000_0000_0000), gs);   # 2^-40
+                if (f64_gt(f64_abs(f64_sub(oo, rbb)), gx2) == 1) { xcr = 0; }
+            }
+            if (xcr == 1) {
+                var txq = _geo_cap_xroute(ray, capsule, out);
+                if (txq != 0x7FF8_0000_0000_0003) {
+                    if (tiny == 1) { txq = _geo_ldexp(txq, tiny_e); }
+                    return txq;
+                }
+            }
+        }
+    }
     # ⛔ 3.3.6 — THE BARREL AT LARGE SCALES, AND NEAR PARALLEL. Its quadratic overflowed for
     # a radius, an offset o_perp or a d_perp past 2^511 (NaN, or a barrel skipped), and an
     # `a` = |d_perp|^2 under DBL_MIN skipped the barrel whatever d_perp was: the capsule
@@ -8581,7 +9294,19 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
     if (bfin == 0) {
         # The common barrel, every magnitude within 2^+-100, in _geo_sph_solve's form written out
         # (_geo_barrel_fast, which hands back 2 where that routine would take another branch).
-        bhit = _geo_barrel_fast(o_perp, dp, rb, &broots);
+        # (3.5.0: where c cancelled by one bit it is formed again with o_perp's rounding, from the inputs o_perp was
+        # formed from, cb, when ao and u are o - start and end - start as rounded; else cb = 0, the plain c)
+        var bcb: i64[5];
+        var bcp = 0;
+        if (oh == 0 && us == 0) {
+            store64(&bcb, ray);
+            store64(&bcb + 8, capsule);
+            store64(&bcb + 16, ao);
+            store64(&bcb + 24, u);
+            store64(&bcb + 32, o_par);
+            bcp = &bcb;
+        }
+        bhit = _geo_barrel_fast(o_perp, dp, rb, bcp, &broots);
         if (bhit != 2) {
             bsc = 1;
             be = de + oh;
@@ -8679,13 +9404,21 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
     # of (0,0,0)-(0,0,-8), r = 5, moving along (-3, -4, 0), every release answered 2.
     # [measured: C336 review edge family, 3.3.5 vs this tree, 2026-10-11; cycc 6.6.14]
     var found = 0;
-    var bent = 0;   # 1 when best is the barrel's near root, its side decided exactly (the caps' tie below)
-    # 1 when the barrel's near root, ahead of the origin, is on the segment and well conditioned (3.4.1
-    # GEO4, _geo_barrel_entry_ok): it is where the line enters the cylinder, which holds the whole
-    # capsule, at a point of the capsule, so it is the capsule's entry and no cap root can come before
-    # it; the caps are not solved. (A root in doubt near an end plane went to the exact solve above.)
+    # 1 when the barrel's near root, ahead of the origin, is on the segment (3.4.1 GEO4): it is where the
+    # line enters the cylinder, which holds the whole capsule, at a point of the capsule, so it is the
+    # capsule's entry and no cap root can come before it; the caps are not solved. (A root in doubt near an
+    # end plane went to the exact solve above.) 3.5.0 (roadmap "Simplifications"): 3.4.1 asked the root to be
+    # well conditioned too (_geo_barrel_entry_ok: half-chord over r / 4, d_perp over 2^-10 of d). That kept the
+    # caps in play for near-axis rays, and on a capsule longer than about 2^45 radii the cap roots' seam test
+    # (2^-46 of the axis) sent them to the exact solve: for rays under about 2^-52 off the axis that was the only
+    # path that answered them right. The route above (2^-48) now takes those rays, and without the test none of
+    # 88,000 rays moved (long-axis, ordinary, band, axis, near-axis and spread families; nor 80,000 far, seam and
+    # grazing ones in the lane's first pass) but 20 of 3,000 rays 2^-44.6 .. 2^-48.6 off a long axis, each within 3.1
+    # ulp both ways (the float root for the exact solve's). With the route at 2^-60 instead, dropping the test made 13
+    # of 3,000 rays 2^-53 .. 2^-61 off a long axis wrong (to 52 ulp) that it kept right: lower the route and the test
+    # is needed again.
+    # [measured: scratch W2 ev.py lr / lro / lg / lgo / lx / ord / band / mixed / axr / n48 / spread, 2026-11-14]
     var bin = 0;
-    var bsx0 = 0;   # 1 when the near root's side of the end planes came from _geo_barrel_seam_x
 
     if (cyl_missed == 0) {
         var cyl_t1 = 0;
@@ -8699,14 +9432,12 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
         var cs1 = cyl_t1;   # the roots before they are multiplied back, by 2^ce
         var cs2 = cyl_t2;
         var ce = 0;
-        # The segment test's own rounding (_geo_cap_seam_proj), as a window around 0 and 1 in
+        # The segment test's own rounding, as a window around 0 and 1 in
         # proj |ab|: 2^-48 (|o| + |t| |d| + |start|), largest components; formed for the first
         # root that needs it (sw1 < 0 until then).
         var sw0 = 0;
         var sw1 = 0 - 1;
         var swab = 0;
-        var sxd = 0;   # 1 once _geo_barrel_seam_x has answered for both roots (sxa)
-        var sxa: i64[2];
         if (bsc == 1) {
             cs1 = load64(&broots);
             cs2 = load64(&broots + 8);
@@ -8721,6 +9452,34 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
             ce = (csc >> 52) - 1023;
             cyl_t1 = f64_mul(cyl_t1, csc);
             cyl_t2 = f64_mul(cyl_t2, csc);
+        }
+
+        # ⛔ 3.5.0 — A BARREL ROOT PAST DBL_MAX IS DECIDED EXACTLY (roadmap "A capsule hit with t past DBL_MAX
+        # can read the miss", GEO7 F2). The finite roots below meet the seam window and go to the exact solve
+        # near an end plane; a root past DBL_MAX had no window, so the rounding of _geo_cap_far_proj's two
+        # terms decided its side: an exit at segment coordinate 1 - 1.5e-16 read 1 + an ulp, the end cap
+        # refused it too, and the hit at 6.66e386 read the miss (3 of 216,561 seam rays, GEO7's count).
+        # [measured: GEO7 3.4.1 driver rows (roadmap [3.5.0] "Rays"); the repro re-run, scratch capor.py, 2026-11-14]
+        # On 8,000 far, seam and ordinary capsule rays (1,337 hits past DBL_MAX) the wrong count stays 3.4.2's
+        # 15 (other classes), 5 t move within their ulps, and the branch label is the oracle's on every hit,
+        # where 3.4.2 gave 228 hits another (a cap's label for a barrel hit past DBL_MAX, or the reverse).
+        # [measured: scratch cap_far.py seeds 2-3, exact Decimal oracle, 3.4.2 base vs this tree, 2026-11-14]
+        # Such a root comes only from extreme input, so every ray with one takes _geo_cap_xroute, which
+        # answers +Inf for a hit there (cyl_t1 <= cyl_t2, so cyl_t2 is +Inf whenever either is). A non-finite
+        # input, which it declines, keeps the far proj below.
+        # (The `tiny` line puts the copy's answer back at the capsule's scale, as every exit of this routine
+        # does. No input found reaches it: in the copy every length is under 2 and |d| is 1 or more, so a
+        # root past DBL_MAX needs |d_perp| under 2^-1020, whose square flushes: `par` skips the barrel unless
+        # the origin is within 2^-40 of its surface, and the 252 such rays tried (|d_perp| 2^-1074 ..
+        # 2^-1000, origins on the surface to 2^-53 .. 2^-41 inside, either side of the start) all left the
+        # solve uncertified (bdd) and took _geo_cap_xsolve above. Kept, not proven unreachable.)
+        # [measured: scratch cap_tiny.py grid, flag-instrumented copy of this tree, 2026-11-14]
+        if (cyl_t2 == 0x7FF0_0000_0000_0000) {
+            var txf = _geo_cap_xroute(ray, capsule, out);
+            if (txf != 0x7FF8_0000_0000_0003) {
+                if (tiny == 1) { txf = _geo_ldexp(txf, tiny_e); }
+                return txf;
+            }
         }
 
         # Check cylinder hit at cyl_t1
@@ -8745,7 +9504,7 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                         tx1 = _geo_cap_xroute(ray, capsule, out);
                     }
                 }
-                # (3.3.7: near an end plane, taken from where the root lies, _geo_cap_seam_proj.)
+                # (3.3.7: near an end plane, decided exactly since 3.4.1, _geo_cap_xroute.)
                 if (bsc == 1) {
                     if (sw1 < 0) {
                         sw0 = _geo_seam_window(ray, capsule, ab, &sw1, &swab);
@@ -8753,21 +9512,14 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                     var swm = f64_add(sw0, f64_mul(f64_abs(cyl_t1), sw1));
                     if (f64_lt(f64_mul(f64_abs(proj), swab), swm) == 1
                       || f64_lt(f64_mul(f64_abs(f64_sub(proj, F64_ONE)), swab), swm) == 1) {
+                        # ⛔ 3.5.0 — THE EXACT SOLVE ANSWERS EVERY ROOT HERE (roadmap "Four refusal mutants
+                        # unproven", INS5 F5). bsc = 1 needs finite d_perp, o_perp and r, so o, d, the ends and
+                        # r are finite and d is not 0, and _geo_cap_xroute declines none of them: the branches
+                        # that followed for its decline (_geo_barrel_seam_x, _geo_seam_stand, _geo_cap_seam_proj)
+                        # could not run: no input of the six suites, of 60,000 random rays (seam, far, zero d,
+                        # non-finite) or of 40,000 aimed at a rim reached them. They are deleted.
+                        # [measured: scratch cap_reach.py, cap_rim.py call counters, 2026-11-14; cycc 6.7.18]
                         if (tx1 == 0x7FF8_0000_0000_0003) { tx1 = _geo_cap_xroute(ray, capsule, out); }
-                        var sx0 = 3;
-                        if (tx1 != 0x7FF8_0000_0000_0003) { sx0 = 4; }   # (answered exactly; skip the float side)
-                        if (bxa == 1 && sx0 == 3) {
-                            if (sxd == 0) {
-                                _geo_barrel_seam_x(ray, capsule, &sxa);
-                                sxd = 1;
-                            }
-                            sx0 = load64(&sxa + 0);
-                        }
-                        if (sx0 == 3) { proj = _geo_cap_seam_proj(ray, capsule, ab, cyl_t1, proj, 0); }
-                        elif (sx0 != 4) {
-                            proj = _geo_seam_stand(sx0);
-                            bsx0 = 1;
-                        }
                     }
                 }
             }
@@ -8780,10 +9532,7 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                     best = cyl_t1;
                     branch = GEO_CAP_CYLINDER;
                     found = 1;
-                    bent = bsx0;
-                    if (f64_lt(cyl_t1, 0) == 0 && bsc == 1) {
-                        bin = _geo_barrel_entry_ok(cyl_t1, cyl_t2, d_perp, ddd, rbb);
-                    }
+                    if (f64_lt(cyl_t1, 0) == 0 && bsc == 1) { bin = 1; }
                 }
             }
         }
@@ -8817,18 +9566,7 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                     var swm = f64_add(sw0, f64_mul(f64_abs(cyl_t2), sw1));
                     if (f64_lt(f64_mul(f64_abs(proj), swab), swm) == 1
                       || f64_lt(f64_mul(f64_abs(f64_sub(proj, F64_ONE)), swab), swm) == 1) {
-                        if (tx2 == 0x7FF8_0000_0000_0003) { tx2 = _geo_cap_xroute(ray, capsule, out); }
-                        var sx1 = 3;
-                        if (tx2 != 0x7FF8_0000_0000_0003) { sx1 = 4; }   # (answered exactly; skip the float side)
-                        if (bxa == 1 && sx1 == 3) {
-                            if (sxd == 0) {
-                                _geo_barrel_seam_x(ray, capsule, &sxa);
-                                sxd = 1;
-                            }
-                            sx1 = load64(&sxa + 8);
-                        }
-                        if (sx1 == 3) { proj = _geo_cap_seam_proj(ray, capsule, ab, cyl_t2, proj, 1); }
-                        elif (sx1 != 4) { proj = _geo_seam_stand(sx1); }
+                        if (tx2 == 0x7FF8_0000_0000_0003) { tx2 = _geo_cap_xroute(ray, capsule, out); }   # (as above)
                     }
                 }
             }
@@ -8960,8 +9698,8 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                 if (acc == 0 - 1) {
                     acc = _geo_cap_accepts(tcs, o_dot_ab, d_dot_ab, cap_i);
                     # 3.3.7: a side term within its own rounding of 0, under 2^-48 of |o_dot| +
-                    # |t d_dot| (each formed from a rounded o - cap or d), is decided from where the
-                    # root lies (_geo_cap_side_exact). A negative, infinite or NaN t never is.
+                    # |t d_dot| (each formed from a rounded o - cap or d), is decided exactly (since
+                    # 3.4.1 through _geo_cap_xroute, below). A negative, infinite or NaN t never is.
                     if (oce == cape) {
                         var tdd = f64_mul(tcs, d_dot_ab);
                         var swm = f64_mul(f64_add(f64_abs(o_dot_ab), f64_abs(tdd)), 0x3CF0_0000_0000_0000);   # 2^-48
@@ -8976,10 +9714,10 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                                 return tx3;
                             }
                         }
-                        if (f64_lt(f64_abs(f64_add(o_dot_ab, tdd)), swm) == 1 && f64_lt(tcs, 0) == 0) {
-                            var acx = _geo_cap_side_exact(ray, cap_pt, r, u, root_i, cap_i);
-                            if (acx != 0 - 1) { acc = acx; }
-                        }
+                        # (3.5.0: the 2^-48 window inside that 2^-46 one took _geo_cap_side_exact where
+                        # _geo_cap_xroute declined, which it does only for a non-finite input, a NaN radius
+                        # or d = 0, and there the window's comparisons are false: it could not run, and is
+                        # deleted with the seam helpers above.)
                     }
                 }
                 if (acc == 1) {
@@ -8990,18 +9728,15 @@ fn _geo_ray_capsule_branch0(ray, capsule, out) {
                     } else {
                         # A cap root equal to the barrel's near root, as doubles, is the same point
                         # (the seam) or the cap's exit past it: a cap sphere lies inside the barrel's
-                        # cylinder, and a line meets a capsule's surface at two points at most. Its
-                        # label stays the barrel's (3.4.0) -- where the near root's side of the planes
-                        # was decided exactly (_geo_barrel_seam_x). Decided in floats it can be the
-                        # wrong side within its rounding while the cap's side is exact
-                        # (_geo_cap_side_exact), and the cap's label is taken, as before 3.4.0 (the
-                        # second review's N4: 11 of 2,000 seam rays at r ~ |u| went right -> wrong).
-                        # Equal to the barrel's far root it is the cap's entry or its exit before it,
-                        # and the cap's label is taken, as before.
+                        # cylinder, and a line meets a capsule's surface at two points at most. The
+                        # cap's label is taken, as before 3.4.0 (the second review's N4: 11 of 2,000
+                        # seam rays at r ~ |u| went right -> wrong where the barrel's was kept). Equal
+                        # to the barrel's far root it is the cap's entry or its exit before it, and the
+                        # cap's label is taken, as before. (3.4.0 kept the barrel's label where
+                        # _geo_barrel_seam_x had decided its side exactly; that function could not run,
+                        # see the barrel's roots above, and 3.5.0 deletes it.)
                         # [measured: rt340 span and dpal families (sweep.py), exact Fraction oracle, 2026-10-31]
-                        if (f64_lt(best, tc) != 1) {
-                            if (bent == 0 || f64_lt(tc, best) == 1) { branch = cap_br; }
-                        }
+                        if (f64_lt(best, tc) != 1) { branch = cap_br; }
                         best = f64_min(best, tc);
                     }
                 }
@@ -9186,8 +9921,12 @@ fn _geo_sphere_sphere_scaled(a, b, d, r_sum) {
 # Closest point queries
 # ================================================================
 
-# Closest point on a plane to a given point. Returns HVec3.
+# Closest point on a plane to a given point: point - (n . point - d) n, a new HVec3. 0, the designed
+# failure, for a 0 plane or point handle and for a refused allocation (3.5.0: a 0 plane, which
+# geo_plane_from_point_normal answers for a zero normal, faulted here; roadmap "A 0 handle passed in
+# still faults", INS5 F3).
 public fn geo_closest_point_on_plane(plane, point) {
+    if (plane == 0 || point == 0) { return 0; }
     var sd = geo_plane_signed_distance(plane, point);
     var ns: i64[3];
     return hvec3_sub(point, _geo_scale_to(&ns, GeoPlane_normal(plane), sd));

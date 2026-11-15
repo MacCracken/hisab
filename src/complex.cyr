@@ -61,6 +61,23 @@ enum _CxExt {
     _CX_TWOM1000 = 0x0170_0000_0000_0000;  # 2^-1000
 }
 
+# The edge values (3.5.0): the quiet NaN this module returns where no NaN operand reached
+# the part, the quiet bit a NaN operand gets when it is handed back, Dekker's splitter
+# (cx_ln's exact squares), 2043 ln 2 for a product with e^x past DBL_MAX (ganita's
+# _gn_exp_half takes the same power of two out of the exponential), and cx_ln's series
+# threshold and its 3.
+enum _CxEdge {
+    _CX_QNAN = 0x7FF8_0000_0000_0000;    # the quiet NaN
+    _CX_QUIET = 0x0008_0000_0000_0000;   # the quiet bit: a mask, not a value
+    _CX_SPLIT = 0x41A0_0000_0200_0000;   # 2^27 + 1
+    _CX_KLN2 = 0x4096_2066_151A_DD8B;    # 1416.0996898839683, the double nearest 2043·ln 2
+    _CX_LN_SERIES = 0x3EB0_0000_0000_0000;   # 2^-20, below which cx_ln sums log1p's series
+    _CX_THREE = 0x4008_0000_0000_0000;   # 3
+    _CX_LN_NS_LO = 0x3FD0_0000_0000_0000;   # 0.25, the least ns whose root is 1/2
+    _CX_LN_NS_HI = 0x4010_0000_0000_0001;   # 4 + 2^-50, the largest ns whose root is 2
+    _CX_LN_CERT = 0x3A10_0000_0000_0000;    # 2^-94, under which the series' D is renormalised
+}
+
 # ================================================================
 # Arithmetic
 # ================================================================
@@ -81,27 +98,83 @@ public fn cx_sub(a, b) {
 
 # a * b = (ar br - ai bi) + i (ar bi + ai br), the textbook form with no compensated or
 # fused products: each part is within a few ulp of |a| |b| (normwise), but a part whose two
-# products cancel can lose its relative accuracy, and a product that passes DBL_MAX makes
-# its part +-Inf or NaN (Inf - Inf) even where the exact part fits: (1e300 + 1e300 i) *
-# (1e10 - 1e10 i) is (+Inf, NaN) for (2e310, 0). 0 when not allocated.
+# products cancel can lose its relative accuracy. For finite a and b no part is +-Inf or NaN
+# unless it is past DBL_MAX itself (3.5.0): a part whose product overflows is evaluated again
+# with the exponent kept apart (_cx_mul_x), so (1e300 + 1e300 i) * (1e10 - 1e10 i) is
+# (+Inf, +0), its real part 2e310 past DBL_MAX and its imaginary part exactly 0 (3.4.2:
+# (+Inf, NaN)). A part the plain formula gives finite is that part, bit for bit, whatever the
+# other part does. An infinite or NaN part of a or b keeps the plain formula's parts. 0 when
+# not allocated.
+# [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_mul past DBL_MAX"]
 #must_use
 public fn cx_mul(a, b) {
     var ar = HComplex_re(a); var ai = HComplex_im(a);
     var br = HComplex_re(b); var bi = HComplex_im(b);
-    return cx_new(f64_sub(f64_mul(ar, br), f64_mul(ai, bi)),
-      f64_add(f64_mul(ar, bi), f64_mul(ai, br)));
+    var qr = f64_sub(f64_mul(ar, br), f64_mul(ai, bi));
+    var qi = f64_add(f64_mul(ar, bi), f64_mul(ai, br));
+    # ⛔ 3.4.2 AND EARLIER -- A PRODUCT PAST DBL_MAX MADE ITS PART +-Inf OR NaN WHERE THE EXACT
+    # PART IS FINITE OR 0 (SYM F4): Inf - Inf in either part. ⭐ 3.5.0: a non-finite part from
+    # four finite operands takes the formula again on _cx_div_x's extended numbers (_cx_mul_x).
+    # ⛔ 3.5.0 REVIEW -- ONLY THAT PART. The first form re-evaluated both parts when either was
+    # not finite, and a finite part made of one product in the subnormals (the other exactly 0)
+    # was then rounded twice, to 53 bits and again into the subnormals: cx_mul(0x7ef3138b5f5049cf
+    # + 0x80000000000000b4 i, 0xc2ada94de6f039c3 - 0i).im came back 0x000a6d856330744e, 0.555
+    # ulp off, for the correctly rounded ...4f. A finite part is now never touched.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_mul past DBL_MAX"; scratch mul_sweep.py, 26,002 pairs]
+    if (f64_lt(f64_abs(qr), F64_POS_INF) == 0 || f64_lt(f64_abs(qi), F64_POS_INF) == 0) {
+        # finite: an exponent field short of all ones (bits, so a NaN is not dropped as a max drops it)
+        if ((ar & _CX_EXP) != _CX_EXP && (ai & _CX_EXP) != _CX_EXP && (br & _CX_EXP) != _CX_EXP
+          && (bi & _CX_EXP) != _CX_EXP) {
+            # ar br - ai bi is ar br + ai (-bi) to the bit: IEEE subtraction is that addition
+            if (f64_lt(f64_abs(qr), F64_POS_INF) == 0) { qr = _cx_mul_x(ar, br, ai, bi ^ _CX_SIGN); }
+            if (f64_lt(f64_abs(qi), F64_POS_INF) == 0) { qi = _cx_mul_x(ar, bi, ai, br); }
+        }
+    }
+    return cx_new(qr, qi);
+}
+
+# Internal: p q + r s for finite p, q, r, s whose double evaluation overflowed: the same three
+# operations on _cx_div_x's extended numbers, each rounded to 53 bits as the double one is, and
+# none overflowing, then scaled into place exactly (_cx_xl), +-Inf past DBL_MAX. It is never
+# subnormal: a product or the sum reached 2^1024, so the sum is 0 or a multiple of 2^971, and
+# the only rounding is the 53-bit one each double operation makes.
+fn _cx_mul_x(p, q, r, s) {
+    var xp: i64[2];
+    var xq: i64[2];
+    var xr: i64[2];
+    var xs: i64[2];
+    _cx_xn(p, 0, &xp);
+    _cx_xn(q, 0, &xq);
+    _cx_xn(r, 0, &xr);
+    _cx_xn(s, 0, &xs);
+    _cx_xp(&xp, &xq, &xp);
+    _cx_xp(&xr, &xs, &xr);
+    _cx_xs(&xp, &xr, &xp);
+    return _cx_xl(load64(&xp), load64(&xp + 8));
 }
 
 # a / b. Smith's algorithm (below), so the quotient is scale-covariant over the whole
 # range: no |b|^2 is formed. Accuracy: a few ulp normwise; a component of the quotient
-# that cancels (|re| or |im| << |a / b|) carries the rounding of the larger one. The
-# pole b = 0 + 0i exactly (either zero's sign) answers cx_zero(), 0 + 0i, the sentinel
-# 2.6.14 documented (a [3.5.0] row); a NaN part anywhere gives NaN parts; a finite a
-# over a b with an infinite part is 0 (C99 G.5.1, its signs from the reference
-# _Cdivd). Returns 0 when the result cannot be allocated; an operand of 0 (a refused
-# cx_*) is the caller's unchecked failure and is not tested.
+# that cancels (|re| or |im| << |a / b|) carries the rounding of the larger one. Over
+# b = 0 + 0i exactly (either zero's sign) a nonzero a is an infinity and 0 / 0 has no
+# value, C99 G.5.1, with the parts the reference _Cdivd recovers: copysign(Inf, br) times
+# each part of a, a zero part giving NaN (Inf * 0) and a NaN part staying NaN (3.5.0;
+# _cx_div_pole). So (1 + 0i) / 0 = +Inf + i NaN, (3 + 4i) / 0 = +Inf + Inf i, 0 / 0 =
+# NaN + NaN i. A NaN part elsewhere gives NaN parts; a finite a over a b with an infinite
+# part is 0 (C99 G.5.1, its signs from the same _Cdivd). Returns 0 when the result cannot
+# be allocated; an operand of 0 (a refused cx_*) is the caller's unchecked failure and is
+# not tested.
 #must_use
 public fn cx_div(a, b) {
+    # ⛔ 3.4.2 AND EARLIER -- THE POLE ANSWERED cx_zero(), 0 + 0i, a value bit-identical to a
+    # real zero quotient (the sentinel 2.6.14 documented; AU2 §2b): cx_div(1 + 2i, 0) and
+    # cx_div(0, 0) were the same 0 + 0i, and so were NaN / 0 and Inf / 0. ⭐ 3.5.0: C99
+    # G.5.1's infinity for a nonzero a and NaN for 0 / 0, in _Cdivd's bits, the reference
+    # this function already follows for a finite a over an infinite b. The two tests of a
+    # zero denominator below Smith's ratio are gone: |br| > |bi| makes db = br + bi^2 / br,
+    # of br's sign and at least |br| > 0, and |bi| >= |br| with b not 0 makes di at least
+    # |bi| > 0, so neither could fire (a NaN fails both).
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_div / cx_inv at the pole"]
     # ⛔ THIS IS THE DEFECT `complex.cyr` HAS NAMED IN ITS OWN COMMENT SINCE 2.6.14
     # AND KEPT DOING. 2.6.14 fixed the EXPONENT — squared modulus against a squared
     # tolerance — and left the SCALE, so `cx_div` still flushed legitimate small
@@ -187,7 +260,6 @@ public fn cx_div(a, b) {
     if (f64_lt(f64_abs(bi), f64_abs(br)) == 1) {
         var rb = f64_div(bi, br);
         var db = f64_add(br, f64_mul(bi, rb));
-        if (f64_eq(db, 0) == 1) { return cx_zero(); }
         var nr = f64_add(ar, f64_mul(ai, rb));
         var ni = f64_sub(ai, f64_mul(ar, rb));
         if (f64_lt(f64_add(f64_add(f64_abs(ar), f64_abs(ai)), f64_abs(br)), _CX_DIV_SAFE) == 0) {
@@ -207,13 +279,12 @@ public fn cx_div(a, b) {
     # Reached when |bi| >= |br| OR when the comparison is unordered (a NaN). So
     # bi == 0 implies br == 0 only for a non-NaN br, and the pole test reads both.
     # ⛔ Through 3.3.1 it read bi alone: b = NaN+0i (or NaN-0i, any NaN payload) got
-    # the pole sentinel, a fabricated 0+0i, where NaN must propagate. Testing both
+    # the pole's answer, then a fabricated 0+0i, where NaN must propagate. Testing both
     # parts changes nothing else: for a non-NaN b, br == 0 already holds here.
     # [measured: scratch harness, not reproducible in-tree, 2026-10-01; cycc 6.6.12]
-    if (f64_eq(bi, 0) == 1 && f64_eq(br, 0) == 1) { return cx_zero(); }
+    if (f64_eq(bi, 0) == 1 && f64_eq(br, 0) == 1) { return _cx_div_pole(ar, ai, br); }
     var ri = f64_div(br, bi);
     var di = f64_add(f64_mul(br, ri), bi);
-    if (f64_eq(di, 0) == 1) { return cx_zero(); }
     var nr2 = f64_add(f64_mul(ar, ri), ai);
     var ni2 = f64_sub(f64_mul(ai, ri), ar);
     if (f64_lt(f64_add(f64_add(f64_abs(ar), f64_abs(ai)), f64_abs(bi)), _CX_DIV_SAFE) == 0) {
@@ -229,6 +300,21 @@ public fn cx_div(a, b) {
         }
     }
     return cx_new(f64_div(nr2, di), f64_div(ni2, di));
+}
+
+# Internal: a / b for b = (c, +-0) with c = +-0, C99 G.5.1 (3.5.0): each part of a times
+# copysign(Inf, c), as the reference _Cdivd recovers it, so the infinity carries a's direction
+# turned by c's sign, the IEEE quotient of a real a by a signed zero being its real part. A
+# zero part is Inf * 0, which has no value: the quiet NaN, the same bits on every target. A
+# NaN part is handed back quieted. Both parts zero or NaN is 0 / 0: NaN + NaN i.
+fn _cx_div_pole(ar, ai, c) {
+    return cx_new(_cx_pole_part(ar, c), _cx_pole_part(ai, c));
+}
+
+fn _cx_pole_part(p, c) {
+    if (f64_eq(p, p) == 0) { return p | _CX_QUIET; }
+    if (f64_eq(p, 0) == 1) { return _CX_QNAN; }
+    return ((p ^ c) & _CX_SIGN) | F64_POS_INF;
 }
 
 # Internal: 1 when the numerator n = p + m * ratio (either sign) may have lost bits below the
@@ -257,9 +343,10 @@ fn _cx_xm(x) {
 }
 
 # Internal: m * 2^e for a finite m and an integer e whose product is 2^-1022 or more in
-# magnitude, or +-Inf past DBL_MAX: exact, a power-of-two scaling of a normal result. Its two
-# callers never ask for less (_cx_xs scales by at most 2^-60, _cx_xd only quotients of
-# 2^-1022 or more).
+# magnitude, or +-Inf past DBL_MAX: exact, a power-of-two scaling of a normal result. Its
+# callers never ask for less: _cx_xs scales by at most 2^-60, _cx_xd only quotients of 2^-1022
+# or more, _cx_mul_x a sum that is 0 or 2^971 or more, and _cx_texp t e^x 2^-k, a factor of
+# 2^-1074 or more times one past 2^1023.
 fn _cx_xl(m, e) {
     if ((m << 1) == 0) { return m; }
     var k = _cx_xe(m) + e;
@@ -482,6 +569,8 @@ public fn cx_norm_sq(a) {
 # ⚠ A NaN never reaches the rescue — a NaN norm_sq satisfies neither guard and
 # falls through to `f64_sqrt`, so hisab's NaN-in/NaN-out contract is unchanged and
 # ganita's differing (Inf, NaN) rule is unreachable from here.
+# ⚠ So the infinity with no direction, +Inf + i NaN, which cx_inv(0), cx_div(1, 0) and
+# cx_powf(0, n < 0) return since 3.5.0, has modulus NaN here, not C99 cabs's +Inf.
 #must_use
 public fn cx_abs(a) {
     var ns = cx_norm_sq(a);
@@ -496,8 +585,9 @@ public fn cx_abs(a) {
 public fn cx_arg(a) { return ganita_f64_atan2(HComplex_im(a), HComplex_re(a)); }
 
 # 1 / a: cx_div(1 + 0i, a) specialised, the same Smith's form and the same answers at
-# the edges -- a = 0 + 0i exactly answers the cx_zero() sentinel, a NaN part NaN parts,
-# an infinite a 0 (C99 G.5.1), and parts near DBL_MAX are rescaled (3.4.1). Returns 0
+# the edges -- a = 0 + 0i exactly is C99's infinity, copysign(Inf, re a) + i NaN (3.5.0;
+# through 3.4.2 the cx_zero() sentinel), a NaN part NaN parts, an infinite a 0 (C99
+# G.5.1), and parts near DBL_MAX are rescaled (3.4.1). Returns 0
 # when the result cannot be allocated.
 #must_use
 public fn cx_inv(a) {
@@ -523,7 +613,6 @@ public fn cx_inv(a) {
     if (f64_lt(f64_abs(ai), f64_abs(ar)) == 1) {
         var rb = f64_div(ai, ar);
         var db = f64_add(ar, f64_mul(ai, rb));
-        if (f64_eq(db, 0) == 1) { return cx_zero(); }
         if (f64_lt(f64_abs(db), F64_POS_INF) == 0) {
             return _cx_div_wide(F64_ONE, 0, ar, ai, f64_div(F64_ONE, db), f64_div(rb, db) ^ _CX_SIGN);
         }
@@ -533,10 +622,9 @@ public fn cx_inv(a) {
         return cx_new(f64_div(F64_ONE, db), f64_div(rb, db) ^ _CX_SIGN);
     }
     # Both parts, as in cx_div: a NaN+0i argument returned 0+0i through 3.3.1.
-    if (f64_eq(ai, 0) == 1 && f64_eq(ar, 0) == 1) { return cx_zero(); }
+    if (f64_eq(ai, 0) == 1 && f64_eq(ar, 0) == 1) { return _cx_div_pole(F64_ONE, 0, ar); }
     var ri = f64_div(ar, ai);
     var di = f64_add(f64_mul(ar, ri), ai);
-    if (f64_eq(di, 0) == 1) { return cx_zero(); }
     if (f64_lt(f64_abs(di), F64_POS_INF) == 0) {
         return _cx_div_wide(F64_ONE, 0, ar, ai, f64_div(ri, di), f64_div(F64_ONE, di) ^ _CX_SIGN);
     }
@@ -572,35 +660,330 @@ fn _cx_inv_x(ar, ai) {
 }
 
 # r (cos theta + i sin theta), ganita's cos and sin times r. It cannot land on an axis
-# (cos(fl(pi / 2)) is about 6e-17, not 0), and an infinite r beside a zero sine or cosine
-# gives a NaN part: cx_from_polar(+Inf, 0) is (+Inf, NaN). 0 when not allocated.
+# (cos(fl(pi / 2)) is about 6e-17, not 0). An infinite r keeps an exactly zero cosine or
+# sine as an exact zero part (3.5.0), r cos theta and r sin theta being 0 along that ray at
+# every finite r: cx_from_polar(+Inf, 0) is (+Inf, +0) (3.4.2: (+Inf, NaN)). With no angle
+# (theta +-Inf or NaN) a zero r is the point 0, (r, r) with the zero's sign flipped by
+# theta's, and an infinite r is infinite in no known direction, (r, NaN): C99's cexp(-Inf +
+# i Inf) and cexp(+Inf + i Inf), and cx_powf's rows for the same angle. A NaN theta with a
+# zero r is the one NaN operand that does not reach the result: the point 0 has no direction
+# to lose, as C99's cexp(-Inf + i NaN) = +-0 +- i0 has it, where cx_abs's NaN-in/NaN-out
+# reading would give NaN. 0 when not allocated.
 #must_use
 public fn cx_from_polar(r, theta) {
-    return cx_new(f64_mul(r, f64_cos(theta)), f64_mul(r, f64_sin(theta)));
+    var c = f64_cos(theta);
+    var s = f64_sin(theta);
+    var qr = f64_mul(r, c);
+    var qi = f64_mul(r, s);
+    if (f64_lt(f64_abs(qr), F64_POS_INF) == 1 && f64_lt(f64_abs(qi), F64_POS_INF) == 1) {
+        return cx_new(qr, qi);
+    }
+    return _cx_polar_edge(r, theta, c, s, qr, qi);
+}
+
+# Internal: cx_from_polar where a part is not finite (r or theta not finite: |cos|, |sin| <= 1).
+fn _cx_polar_edge(r, theta, c, s, qr, qi) {
+    if (f64_eq(f64_abs(r), F64_POS_INF) == 1) {
+        if (f64_lt(f64_abs(theta), F64_POS_INF) == 1) {
+            return cx_new(_cx_zpart(c, r, qr), _cx_zpart(s, r, qi));
+        }
+        return cx_new(r, _CX_QNAN);
+    }
+    # reached with r = +-0 only for a theta that is not finite
+    if (f64_eq(r, 0) == 1) { return cx_new(r, r ^ (theta & _CX_SIGN)); }
+    return cx_new(qr, qi);
+}
+
+# Internal: the part t m of a magnitude m (infinite, or NaN) and a finite factor t: an exact
+# zero, with the IEEE product's sign, where t is exactly 0; q, the product as formed, otherwise.
+fn _cx_zpart(t, m, q) {
+    if (f64_eq(t, 0) == 1) { return (t ^ m) & _CX_SIGN; }
+    return q;
+}
+
+# Internal: t e^x 2^-k for a finite t and a finite x past exp's overflow threshold (x > 709.78
+# for cx_exp, |y| > 710.47 for cx_sin and cx_cos, where cosh and sinh are e^|y| / 2): e^x =
+# exp(x - c) 2^2043 with c = _CX_KLN2, x - c exact (Sterbenz: c/2 < x < 2c) and exp(x - c)
+# normal, the two significands multiplied (one rounding) and the exponent kept apart until the
+# one exact scaling (_cx_xl): finite wherever the product is below DBL_MAX, +-Inf past it.
+# c lies 2.84e-17 above 2043 ln 2 (ganita's figure for the same constant), a relative error of
+# that size. t = +-0 is that zero (e^x > 0). Past x - c = 709.78, about x = 2125.88, exp(x - c)
+# overflows and so does every product with a nonzero t (e^2125.88 2^-1074 is about e^1381).
+# Within 2.03 ulp of a 120-digit oracle on 3,684 finite parts past the threshold (cx_exp; cx_sin
+# and cx_cos alike), the trig factor's own error included.
+# [measured: python3 Decimal (the offset), scratch ovf2.py (the sweep), 2026-11-14; not reproducible in-tree]
+fn _cx_texp(t, x, k) {
+    if (f64_eq(t, 0) == 1) { return t; }
+    var e = f64_exp(f64_sub(x, _CX_KLN2));
+    if (f64_lt(e, F64_POS_INF) == 0) { return (t & _CX_SIGN) | F64_POS_INF; }
+    return _cx_xl(f64_mul(_cx_xm(t), _cx_xm(e)), _cx_xe(t) + _cx_xe(e) + 2043 - k);
 }
 
 # ================================================================
 # Elementary functions
 # ================================================================
 
-# e^a = e^re (cos im + i sin im). e^re overflows to +Inf above re = 709.78 even where the
-# product with a cosine or sine below 1 fits, and then a zero sine or cosine gives a NaN
-# part: cx_exp(710 + 0i) is (+Inf, NaN), where C99 cexp gives (+Inf, +0). 0 when not
-# allocated.
+# e^a = e^re (cos im + i sin im), C99 G.6.3.1 (3.5.0). Each part is e^re times ganita's cosine
+# or sine; where e^re passes DBL_MAX (re > 709.78) a part is formed with the exponent kept
+# apart (_cx_texp), so it is finite where the exact part is (cx_exp(710 + 1e-300 i).im is
+# about 2.2e8), +-Inf past DBL_MAX, and an exact zero for im = +-0: cx_exp(710 + 0i) is
+# (+Inf, +0) (3.4.2: (+Inf, NaN)). The non-finite rows are C99's: exp(+Inf + i y) is
+# +Inf cis y (y = +-0: +Inf +- i0), exp(-Inf + i y) is +0 cis y, exp(NaN +- i0) is
+# NaN +- i0, exp(+Inf + i Inf or i NaN) is +Inf + i NaN, exp(-Inf + i Inf or i NaN) is
+# +0 +- i0 (im's sign), and a finite re with an infinite or NaN im, or a NaN re with a
+# nonzero im, is NaN + i NaN. A NaN made from no NaN operand is the quiet 0x7FF8000000000000;
+# a NaN operand is handed back quieted. 0 when not allocated.
+# [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_exp past re = 709.78 and C99's rows"]
 #must_use
 public fn cx_exp(a) {
-    var r = f64_exp(HComplex_re(a));
-    return cx_new(f64_mul(r, f64_cos(HComplex_im(a))),
-      f64_mul(r, f64_sin(HComplex_im(a))));
+    var x = HComplex_re(a);
+    var y = HComplex_im(a);
+    var r = f64_exp(x);
+    var c = f64_cos(y);
+    var s = f64_sin(y);
+    var qr = f64_mul(r, c);
+    var qi = f64_mul(r, s);
+    # ⛔ 3.4.2 AND EARLIER -- e^re TIMES A ZERO SINE WAS Inf * 0 = NaN past re = 709.78, and
+    # every part past it +-Inf (SYM F2): cx_exp(710 + 0i) was (+Inf, NaN) and cx_exp(710 +
+    # 1e-300 i) (+Inf, +Inf), exact (+Inf, 2.2e8). ⭐ 3.5.0: every finite pair of parts is the
+    # product above, bit for bit; the rest go to _cx_exp_edge.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_exp past re = 709.78 and C99's rows"]
+    if (f64_lt(f64_abs(qr), F64_POS_INF) == 1 && f64_lt(f64_abs(qi), F64_POS_INF) == 1) {
+        return cx_new(qr, qi);
+    }
+    return _cx_exp_edge(x, y, c, s, qr, qi);
 }
 
-# ln a = ln|a| + i arg a, the principal branch, with cx_abs's rescaled modulus and ganita's
-# ln and atan2. ln 0 is (-Inf, arg 0). The real part is ln of a rounded modulus, so it
-# loses its relative accuracy as |a| nears 1: cx_ln(1 + 1e-10 i).re is 0, exact 5e-21.
-# 0 when not allocated.
+# Internal: cx_exp where a part is not finite: re past 709.78, or a part of a not finite.
+fn _cx_exp_edge(x, y, c, s, qr, qi) {
+    if (f64_eq(x, x) == 0) {
+        if (f64_eq(y, 0) == 1) { return cx_new(qr, y); }
+        return cx_new(qr, qi);
+    }
+    if (f64_lt(f64_abs(y), F64_POS_INF) == 0) {
+        if (f64_eq(x, F64_POS_INF) == 1) {
+            if (f64_eq(y, y) == 0) { return cx_new(F64_POS_INF, y | _CX_QUIET); }
+            return cx_new(F64_POS_INF, _CX_QNAN);
+        }
+        if (f64_eq(x, F64_POS_INF ^ _CX_SIGN) == 1) { return cx_new(0, y & _CX_SIGN); }
+        return cx_new(qr, qi);
+    }
+    if (f64_eq(x, F64_POS_INF) == 1) { return cx_new(_cx_zpart(c, x, qr), _cx_zpart(s, x, qi)); }
+    # x finite past 709.78 (x = -Inf makes e^x = 0 and both products finite)
+    return cx_new(_cx_texp(c, x, 0), _cx_texp(s, x, 0));
+}
+
+# ln a = ln|a| + i arg a, the principal branch, with ganita's atan2. Where |a| is in [1/2, 2]
+# (cx_abs's rounded modulus decides: its root of ns = fl(re^2 + im^2) is in [1/2, 2] exactly when
+# ns is in [1/4, 4 + 2^-50]) the real part is (1/2) ln(1 + D), D = re^2 + im^2 - 1, from the
+# squares' exact low parts (_cx_ln_near1), so it keeps its relative accuracy as |a| nears 1:
+# cx_ln(1 + 1e-10 i).re is 5e-21 (3.4.2: 0). Elsewhere it is ln of cx_abs, as before, bit for
+# bit: |ln|a|| > ln 2 there, so the modulus's rounding costs at most about 2 ulp of it (2.29
+# at |a| = 2.06 among the points below). ln 0 is (-Inf, arg 0). 0 when not allocated.
+# ACCURACY of the real part in the band, x86_64 (x87's ln), against a 120-digit Decimal oracle
+# of (1/2) ln(x^2 + y^2) from the exact x and y, 62,558 band points (|a| across [1/2, 2] at random
+# angles, the rounded unit circle, re within 2,000 ulp of 1 with every im, re^2 + im^2 - 1
+# cancelling to 2^-156, the band's and the series' edges, re = +-1 or nearly with im down to
+# 2^-1074): below 1 ulp at every one -- worst 0.988 on the 25,632 the ln path takes (mean 0.325),
+# 0.501 on the 35,964 the series takes with a normal result. The derived bound is about 1 ulp: x87's ln
+# rounding (1/2 ulp, 1 where ln u and the result straddle a power of two) and the last sum's
+# (1/2). aarch64's polyfill ln is within 1 ulp, so it can add about 1/2 ulp more there. A part
+# below 2^-1022 (re or im exactly +-1, the other below 2^-511) is rounded twice into the
+# subnormals, within 2^-1074 of the exact value (0.809 of it at worst over 962 such points).
+# 3.4.2's worst is larger in each of 23 bins of |a| (wave 1's 33,251 points), from 1.35 ulp in
+# [1.9, 2) to 87.8 in [1.01, 1.05) and 2.4e21 in [0.99, 1.01), where re^2 + im^2 - 1 cancels.
+# [measured: scratch lnpts.py, lnoracle.py, lnoracle3.py; wave 1's lnsweep.py, lnall.py, 2026-11-14; not in-tree]
+# ⛔ 3.5.0 WAVE 1 -- THE BAND COST 1.6 TO 2.5 TIMES 3.4.2: D was always summed from all five
+# terms by a 2Sum cascade (and, near |a| = 1, renormalised by sorting first), after cx_abs had
+# formed and rooted the same squares. ⭐ 3.5.0 wave 2: the band is decided on ns itself; the ln
+# path takes u = ns and its 2Sum error with the squares' low parts as e (1 + D = u + e, no -1
+# term to cancel against, so no cascade), u moved to its neighbour when |e| passes half its ulp;
+# the series path sums D's four parts by four 2Sums, certified to 2^-61 of D whenever |hi| >=
+# 2^-94, and only below that (D cancelling to 2^-94 of the squares) renormalises as before.
+# Against wave 1's form on the same points: the series' bits are the same at every one, 880 of
+# the ln path's 25,632 move by an ulp, about as many away from the oracle as toward it (465
+# nearer and 415 further here; an independent review's 3,000 band points moved 183, 83 nearer
+# and 100 further), every one within 1 ulp (mean 0.325 ulp against 0.326, worst 0.988 against
+# 0.992), and outside the band every bit is the same. COST, a noisy A/B pinned to one cpu (11
+# interleaved rounds, medians, load 4.7): the series (0.6 + 0.8i) 1.44 times 3.4.2 (110 -> 158
+# ns; wave 1 284), the ln path (0.9 + 0.3i) 1.20 times (132 -> 158 ns; wave 1 220), outside the
+# band 0.98 times (131 -> 128 ns).
+# [measured: scratch lnpts.py, lnoracle2c.py, lnstat3.py (Decimal), ab3.sh (cpu 11), the W7 review; 2026-11-14]
 #must_use
 public fn cx_ln(a) {
-    return cx_new(f64_ln(cx_abs(a)), cx_arg(a));
+    var x = HComplex_re(a);
+    var y = HComplex_im(a);
+    var xx = f64_mul(x, x);
+    var yy = f64_mul(y, y);
+    var ns = f64_add(xx, yy);
+    # ⛔ 3.4.2 AND EARLIER -- ln OF A ROUNDED MODULUS (SYM F3): near |a| = 1 the modulus keeps
+    # only its absolute rounding, about 2^-53, and ln passes it on, so the real part's relative
+    # error had no bound: cx_ln(1 + 1e-10 i).re was 0 for 5e-21.
+    # ⛔ 3.5.0 REVIEW -- AND THE FIRST REPAIR, atanh(d / (2 + d)) ON A ROUNDED d, WAS WORSE THAN
+    # ln|a| IN THE BAND'S OUTER PARTS: 3.37 ulp at |a| = 0.606, where 3.4.2 gave 0.37, and up to
+    # 3.05 ulp in a bin where 3.4.2's worst was 2.64. It rounded d, 2 + d and the quotient
+    # before atanh's own log1p, and ganita's atanh is 0.5 ln((1 + z) / (1 - z)) below cyrius
+    # 6.6.13 (3.3e7 ulp just above z = 2^-26, ganita's figure). Now 1 + D is kept as u + e (and
+    # D as hi + lo for the series) and goes to f64_ln alone: no ganita function is called, and
+    # this form built under 6.6.3, 6.6.7, 6.6.8, 6.6.12 and 6.7.18 gave the same bits at all
+    # 67,000 points of the sweep below.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_ln near |a| = 1"; scratch pin_<v>/lnp.cyr, 2026-11-14]
+    if (f64_ge(ns, _CX_LN_NS_LO) == 1 && f64_le(ns, _CX_LN_NS_HI) == 1) {
+        return cx_new(_cx_ln_near1(x, y, xx, yy, ns), cx_arg(a));
+    }
+    # cx_abs(a), which forms the same ns: its root where ns is normal and finite, else the rescue.
+    var m = 0;
+    if (f64_lt(ns, F64_TINY) == 1 || f64_eq(ns, F64_POS_INF) == 1) { m = cx_abs(a); } else { m = f64_sqrt(ns); }
+    return cx_new(f64_ln(m), cx_arg(a));
+}
+
+# Internal: (1/2) ln(x^2 + y^2) for finite x, y with u = fl(xx + yy) in [1/4, 4 + 2^-50], xx and
+# yy the rounded squares. xl and yl are the squares' exact low parts (Dekker), so x^2 + y^2 = u
+# + e exactly with e = (the 2Sum error of xx + yy) + xl + yl, rounded twice (within 2^-104).
+# Where |u - 1| >= 2^-20, u is first moved one ulp toward u + e when |e| is past half its ulp
+# (both steps exact, Sterbenz), so u is the double nearest x^2 + y^2 but where it is a power of
+# two, and ln(x^2 + y^2) = ln u + e / u to within (e / u)^2 / 2 < 2^-105: ln u's
+# rounding, about 1/2 ulp of the result (|ln u| exceeds |ln(1 + D)| by at most e / u, under
+# 2^-32 of it), and the sum's. Below it, D = x^2 + y^2 - 1 = (big - c) + (small - (1 - c)) + xl
+# + yl, big and small the larger and smaller square and c = 1, or 1/2 when big < 1/2 (both
+# differences exact, Sterbenz), is summed by four 2Sums into hi + lo, exact but for lo's two
+# roundings: |D - hi - lo| <= 4.02 u^2 |D| + 2^-155.1 (u = 2^-53; every partial sum is within
+# |D| + 1.5 2^-53), so hi + lo is within 2^-61 of D when |hi| >= 2^-94. Below that the five
+# terms are made exact and non-overlapping (_cx_renorm) and summed again (_cx_sum2), D to within
+# about 2^-102 of itself whatever cancels. Then log1p's series is summed: hi + (lo - hi^2 / 2 +
+# hi^3 / 3). Its next term, D^4 / 4, is below 2^-62 of D, the dropped hi lo below 2^-72, and the
+# small terms' own rounding smaller still, so the one rounding that matters is the last sum's.
+fn _cx_ln_near1(x, y, xx, yy, u) {
+    var w = f64_mul(x, _CX_SPLIT);
+    var h = f64_sub(w, f64_sub(w, x));
+    var l = f64_sub(x, h);
+    var xl = f64_add(f64_add(f64_sub(f64_mul(h, h), xx), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    w = f64_mul(y, _CX_SPLIT);
+    h = f64_sub(w, f64_sub(w, y));
+    l = f64_sub(y, h);
+    var yl = f64_add(f64_add(f64_sub(f64_mul(h, h), yy), f64_mul(f64_add(h, h), l)), f64_mul(l, l));
+    if (f64_lt(f64_abs(f64_sub(u, F64_ONE)), _CX_LN_SERIES) == 1) {
+        var t: i64[2];
+        # D = (xx - c) + (yy - (1 - c)) + xl + yl, c = 1 or 1/2 so that both differences are exact
+        var big = xx; var sml = yy;
+        if (f64_lt(xx, yy) == 1) { big = yy; sml = xx; }
+        var a1 = f64_sub(big, F64_ONE);
+        var a2 = sml;
+        if (f64_lt(big, F64_HALF) == 1) { a1 = f64_sub(big, F64_HALF); a2 = f64_sub(sml, F64_HALF); }
+        var h1 = f64_add(a1, a2);
+        var bb1 = f64_sub(h1, a1);
+        var e1 = f64_add(f64_sub(a1, f64_sub(h1, bb1)), f64_sub(a2, bb1));
+        var h2 = f64_add(xl, yl);
+        var bb2 = f64_sub(h2, xl);
+        var e2 = f64_add(f64_sub(xl, f64_sub(h2, bb2)), f64_sub(yl, bb2));
+        var h3 = f64_add(h1, h2);
+        var bb3 = f64_sub(h3, h1);
+        var e3 = f64_add(f64_sub(h1, f64_sub(h3, bb3)), f64_sub(h2, bb3));
+        var hi = f64_add(h3, e1);
+        var bb4 = f64_sub(hi, h3);
+        var e4 = f64_add(f64_sub(h3, f64_sub(hi, bb4)), f64_sub(e1, bb4));
+        var lo = f64_add(f64_add(e4, e3), e2);
+        if (f64_lt(f64_abs(hi), _CX_LN_CERT) == 1) {
+            var v: i64[5];
+            store64(&v, xl); store64(&v + 8, xx); store64(&v + 16, yl); store64(&v + 24, yy);
+            store64(&v + 32, F64_ONE ^ _CX_SIGN);
+            _cx_renorm(&v);
+            _cx_sum2(&v, &t);
+            hi = load64(&t);
+            lo = load64(&t + 8);
+        }
+        var h2s = f64_mul(hi, hi);
+        var corr = f64_add(lo, f64_mul(h2s, f64_sub(f64_div(hi, _CX_THREE), F64_HALF)));
+        return f64_mul(F64_HALF, f64_add(hi, corr));
+    }
+    var bb = f64_sub(u, xx);
+    var e = f64_add(f64_add(f64_add(f64_sub(xx, f64_sub(u, bb)), f64_sub(yy, bb)), xl), yl);
+    # u to the double nearest u + e: half an ulp of u is (u's exponent - 53) as a power of two
+    var hu = ((u >> 52) - 53) << 52;
+    if (f64_gt(e, hu) == 1) { var up = u + 1; e = f64_sub(e, f64_sub(up, u)); u = up; }
+    elif (f64_lt(e, f64_neg(hu)) == 1) { var dn = u - 1; e = f64_add(e, f64_sub(u, dn)); u = dn; }
+    return f64_mul(F64_HALF, f64_add(f64_ln(u), f64_div(e, u)));
+}
+
+# Internal: o = { hi, lo } for the five doubles v[0 .. 4], cascaded 2Sum (Ogita, Rump and
+# Oishi's Sum2) from v[4] down: hi is the cascade's rounded sum and lo the sum of its exact
+# errors, rounded (2Sum once more puts the two in hi + lo form). The only error is lo's own
+# rounding, at most 3 u of the errors' sum, itself at most 4 u of sum |v[k]| (u = 2^-53): 12
+# u^2 of sum |v[k]|, under 2^-100 for a sum of at most 5, as here, and about 2^-102 of D after
+# _cx_renorm, where the terms do not overlap.
+fn _cx_sum2(v, o) {
+    var s = load64(v + 32);
+    var c = 0;
+    var j = 3;
+    while (j >= 0) {
+        var b = load64(v + j * 8);
+        var sm = f64_add(s, b);
+        var bb = f64_sub(sm, s);
+        c = f64_add(c, f64_add(f64_sub(s, f64_sub(sm, bb)), f64_sub(b, bb)));
+        s = sm;
+        j = j - 1;
+    }
+    return _cx_2sum(s, c, o);
+}
+
+# Internal: glibc's __x2y2m1 renormalisation of v[0 .. 4] in place (finite values, at most one
+# of them +-1 and the rest the squares' parts): sorted by magnitude, then each adjacent pair
+# replaced by its rounded sum and that sum's exact error (Fast2Sum, the larger first), the rest
+# re-sorted after each step, so the sum is unchanged, exactly, and every term ends at most at
+# the last set bit of the next. A square below about 2^-1022 loses its low part to the split,
+# below every other term's last bit unless the rest of the sum is 0 (re^2 = 1), where the
+# answer is subnormal anyway.
+fn _cx_renorm(v) {
+    _cx_abs_sort(v, 0);
+    var i = 0;
+    while (i < 4) {
+        var hi = load64(v + (i + 1) * 8);
+        var lo = load64(v + i * 8);
+        var sm = f64_add(hi, lo);
+        store64(v + i * 8, f64_add(f64_sub(hi, sm), lo));
+        # v[i + 2 .. 4] is still sorted: move sm up past every term smaller than it
+        var sa = (sm << 1) >> 1;
+        var k = i + 1;
+        while (k < 4) {
+            var nx = load64(v + (k + 1) * 8);
+            if (((nx << 1) >> 1) >= sa) { break; }
+            store64(v + k * 8, nx);
+            k = k + 1;
+        }
+        store64(v + k * 8, sm);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Internal: o = { fl(a + b), a + b - fl(a + b) } for finite a, b: Knuth's 2Sum, exact in
+# either order of magnitude.
+fn _cx_2sum(a, b, o) {
+    var s = f64_add(a, b);
+    var bb = f64_sub(s, a);
+    store64(o, s);
+    store64(o + 8, f64_add(f64_sub(a, f64_sub(s, bb)), f64_sub(b, bb)));
+    return 0;
+}
+
+# Internal: v[from .. 4] sorted by magnitude, ascending (insertion; finite values, whose
+# magnitudes order as their bits with the sign cleared).
+fn _cx_abs_sort(v, from) {
+    var i = from + 1;
+    while (i < 5) {
+        var key = load64(v + i * 8);
+        var ka = (key << 1) >> 1;
+        var j = i - 1;
+        while (j >= from) {
+            var vj = load64(v + j * 8);
+            if (((vj << 1) >> 1) <= ka) { break; }
+            store64(v + (j + 1) * 8, vj);
+            j = j - 1;
+        }
+        store64(v + (j + 1) * 8, key);
+        i = i + 1;
+    }
+    return 0;
 }
 
 # cx_sqrt's rescaling. Every factor is a power of two, so scaling the input by 4^-k
@@ -790,8 +1173,13 @@ fn _cx_powf_axis(a, n, r) {
 # a^n for a real n: |a|^n cis(n arg a) through ganita_f64_pow, exact on the axes (see the
 # notes in the body: a point on the negative real or imaginary axis raised to a whole
 # number of quarter turns lands on an axis exactly), and C99's cexp rows for an angle with
-# no direction. a = 0 + 0i returns 0 + 0i for every n -- 0^0 and n < 0 included, a [3.5.0]
-# row (num_modpow and dual_pow give 1 for 0^0, C99 +Inf for n < 0). 0 when not allocated.
+# no direction. a = 0 + 0i exactly (either zero's sign in either part), 3.5.0: 0^n = 0 + 0i
+# for n > 0 (+Inf included); 0^0 = 1, the empty product, as pow, num_modpow and dual_pow have
+# it, with z^0's imaginary zero (+-0, arg a's sign times n's); 0^n for n < 0 (-Inf included)
+# is +Inf + i NaN, infinite in no known direction, since |0^n| = pow(0, n) = +Inf and 0 has no
+# argument (cx_inv(+0 + 0i) has these bits; cx_abs of it is NaN, under cx_abs's NaN-in/NaN-out
+# contract, where C99's cabs gives +Inf); a NaN n gives n quieted in both parts. (3.4.2
+# returned 0 + 0i for all of them.) 0 when not allocated.
 #must_use
 public fn cx_powf(a, n) {
     # ⛔ 2.17.0 — THIS GUARDED THE SQUARE. The 2.15.0 note it replaces argued a
@@ -810,8 +1198,21 @@ public fn cx_powf(a, n) {
     # assertion. Changing that is a decision about hisab's 0^0, not a free
     # sharpening, and is not folded in here.
     # [measured: scratch two-sided binade probe on the 2.16.0 tree, 2026-09-10]
+    # ⛔ 3.4.2 AND EARLIER -- AND SO EVERY n GOT 0 + 0i (D019, AU2-G6-F4): 0^0 and 0^-1 alike,
+    # though ganita_f64_pow(0, -1) is +Inf on every pin hisab supports, so the premise above
+    # ("pow needs a non-zero m") held for no n. ⭐ 3.5.0 decides 0^0 = 1: n = +-0 and a NaN n
+    # now take the lines below, where pow(0, +-0) = 1 and theta = arg * n is a signed zero
+    # (the zero-angle return gives 1 +- i0). A negative n is the infinity with no direction; a
+    # positive one keeps 0 + 0i. A NaN n is decided here, its NaN quieted in both parts, not
+    # left to pow(0, NaN): ganita's pow returns 0 there below cyrius 6.6.8 (its zero-base
+    # branch ran before its NaN test), which made cx_powf(0, NaN) 0 + 0i on those pins.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_powf with a zero base"; git show 6.6.3..6.6.8:lib/ganita.cyr]
     var m = cx_abs(a);
-    if (f64_eq(m, 0) == 1) { return cx_zero(); }
+    if (f64_eq(m, 0) == 1) {
+        if (f64_gt(n, 0) == 1) { return cx_zero(); }
+        if (f64_lt(n, 0) == 1) { return cx_new(F64_POS_INF, _CX_QNAN); }
+        if (f64_eq(n, n) == 0) { return cx_new(n | _CX_QUIET, n | _CX_QUIET); }
+    }
     var r = ganita_f64_pow(m, n);
     var arg = cx_arg(a);
     var theta = f64_mul(arg, n);
@@ -865,21 +1266,73 @@ public fn cx_powf(a, n) {
     return cx_from_polar(r, theta);
 }
 
-# sin a = sin re cosh im + i cos re sinh im, the textbook form with ganita's functions:
-# cosh and sinh overflow to +Inf above |im| = 710.5, and then a zero sine or cosine gives a
-# NaN part: cx_sin(0 + 800i) is (NaN, +Inf), exact (0, +Inf). 0 when not allocated.
+# sin a = sin re cosh im + i cos re sinh im, the textbook form with ganita's functions, and
+# C99's csin(a) = -i csinh(i a) at the edges (3.5.0). Where cosh or sinh passes DBL_MAX (|im|
+# above 710.47) a part is formed with the exponent kept apart (_cx_texp), so it is finite
+# where the exact part is and +-Inf past DBL_MAX, and a part whose sine or sinh is exactly
+# zero (re or im +-0) is that exact zero whatever the other factor: cx_sin(0 + 800i) is
+# (+0, +Inf) (3.4.2: (NaN, +Inf)). With re +-Inf or NaN and im +-Inf the cosine's part is
+# +-Inf and the sine's NaN, C99's csinh(+Inf + i Inf); every other row with a non-finite part
+# is the plain product's. 0 when not allocated.
+# [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_sin / cx_cos past |im| = 710.47 and C99's rows"]
 #must_use
 public fn cx_sin(a) {
-    return cx_new(f64_mul(f64_sin(HComplex_re(a)), ganita_f64_cosh(HComplex_im(a))),
-      f64_mul(f64_cos(HComplex_re(a)), ganita_f64_sinh(HComplex_im(a))));
+    var x = HComplex_re(a);
+    var y = HComplex_im(a);
+    var sx = f64_sin(x);
+    var co = f64_cos(x);
+    var qr = f64_mul(sx, ganita_f64_cosh(y));
+    var qi = f64_mul(co, ganita_f64_sinh(y));
+    # ⛔ 3.4.2 AND EARLIER -- 0 * Inf AND Inf * (a small sine) (SYM F2): past |im| = 710.47
+    # cx_sin(0 + 800i) was (NaN, +Inf), exact (0, +Inf), and cx_sin(1e-300 + 1000i) (+Inf,
+    # +Inf) for a real part of 9.85e133. ⭐ 3.5.0: every finite pair of parts is the product
+    # above, bit for bit; the rest go to _cx_trig_hyp, part by part.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: cx_sin / cx_cos past |im| = 710.47 and C99's rows"]
+    if (f64_lt(f64_abs(qr), F64_POS_INF) == 1 && f64_lt(f64_abs(qi), F64_POS_INF) == 1) {
+        return cx_new(qr, qi);
+    }
+    return cx_new(_cx_trig_hyp(sx, 0, y, 0, qr), _cx_trig_hyp(co, 1, y, 1, qi));
 }
 
-# cos a = cos re cosh im - i sin re sinh im, as cx_sin: cx_cos(0 + 800i) is (+Inf, NaN),
-# exact (+Inf, -0). 0 when not allocated.
+# cos a = cos re cosh im - i sin re sinh im, as cx_sin, C99's ccos(a) = ccosh(i a) at the
+# edges: cx_cos(0 + 800i) is (+Inf, -0) (3.4.2: (+Inf, NaN)); with re +-Inf or NaN and im
+# +-Inf, (+Inf, NaN). 0 when not allocated.
 #must_use
 public fn cx_cos(a) {
-    return cx_new(f64_mul(f64_cos(HComplex_re(a)), ganita_f64_cosh(HComplex_im(a))),
-      f64_mul(f64_sin(HComplex_re(a)), ganita_f64_sinh(HComplex_im(a))) ^ _CX_SIGN);
+    var x = HComplex_re(a);
+    var y = HComplex_im(a);
+    var sx = f64_sin(x);
+    var co = f64_cos(x);
+    var qr = f64_mul(co, ganita_f64_cosh(y));
+    var qi = f64_mul(sx, ganita_f64_sinh(y));
+    if (f64_lt(f64_abs(qr), F64_POS_INF) == 1 && f64_lt(f64_abs(qi), F64_POS_INF) == 1) {
+        return cx_new(qr, qi ^ _CX_SIGN);
+    }
+    return cx_new(_cx_trig_hyp(co, 1, y, 0, qr), _cx_trig_hyp(sx, 0, y, 1, qi) ^ _CX_SIGN);
+}
+
+# Internal: the part t H(y) of cx_sin / cx_cos where a part was not finite, t = sin re or
+# cos re (tcos 1) as computed, H = cosh (hsinh 0) or sinh (hsinh 1), q = t H(y) as formed:
+#   - t exactly 0 (re = +-0): an exact zero, the IEEE product's sign, whatever H is;
+#   - H = sinh(+-0): an exact zero with im's sign (reached only for a non-finite re, whose
+#     t is NaN: with a finite re both parts are finite), C99's +-0 there;
+#   - t NaN (re +-Inf or NaN): +-Inf for the cosine's part when im is +-Inf, C99's csinh /
+#     ccosh(+Inf + i Inf); q, a NaN, otherwise;
+#   - a finite t with H past DBL_MAX from a finite im: t e^|im| / 2 with H's sign (_cx_texp);
+#   - otherwise q.
+fn _cx_trig_hyp(t, tcos, y, hsinh, q) {
+    var hs = 0;
+    if (hsinh == 1) { hs = y & _CX_SIGN; }
+    if (f64_eq(t, 0) == 1) { return (t ^ hs) & _CX_SIGN; }
+    if (hsinh == 1 && f64_eq(y, 0) == 1) { return y; }
+    if (f64_eq(t, t) == 0) {
+        if (tcos == 1 && f64_eq(f64_abs(y), F64_POS_INF) == 1) { return hs | F64_POS_INF; }
+        return q;
+    }
+    if (f64_lt(f64_abs(y), F64_POS_INF) == 1 && f64_lt(f64_abs(q), F64_POS_INF) == 0) {
+        return _cx_texp(t ^ hs, f64_abs(y), 1);
+    }
+    return q;
 }
 
 # 1 when |a| < tol, comparing cx_abs (rescaled, so it neither overflows nor flushes) with
@@ -1419,11 +1872,12 @@ public fn gamma_0() {
 }
 
 # The Dirac matrix gamma^k = [[0, sigma_k], [-sigma_k, 0]] for idx = k - 1 (0: sigma_x,
-# 1: sigma_y, 2: sigma_z), Dirac representation. An idx outside 0..2 returns the 4 x 4 zero
-# matrix, a documented sentinel ([3.5.0]); 0 when a matrix cannot be allocated.
+# 1: sigma_y, 2: sigma_z), Dirac representation. 0, the designed failure every cmat_* passes
+# on, for an idx outside 0..2 (there is no such matrix; 3.4.2 returned the 4 x 4 zero matrix,
+# a legal matrix) or when a matrix cannot be allocated.
 public fn gamma_spatial(idx) {
     # gamma^i = [[0, sigma^i], [-sigma^i, 0]], idx: 0=gamma^1(sigmax), 1=gamma^2(sigmay), 2=gamma^3(sigmaz)
-    if (idx < 0 || idx > 2) { return cmat_new(4, 4); }  # Invalid -> zero matrix
+    if (idx < 0 || idx > 2) { return 0; }  # no gamma^(idx + 1) (3.5.0; was the zero matrix)
     var sigma = 0;
     if (idx == 0) { sigma = pauli_x(); }
     if (idx == 1) { sigma = pauli_y(); }

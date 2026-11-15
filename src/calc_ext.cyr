@@ -117,6 +117,17 @@ fn _calcx_diff_scratch(sbuf, n) {
     return _f64arr_alloc(n);
 }
 
+# Internal: the de Boor scratch of calc_bspline (parts = 3) and calc_nurbs (parts = 4), parts
+# arrays of dp1 doubles: `sbuf`, the caller's stack array of _CALCX_SPL_STACK doubles (declared
+# `var sbuf: i64[64]`), when parts * dp1 fit there -- degree up to 20 and 15 -- and the caller
+# lays the parts out in it; else the first part from _f64arr_alloc (0 when refused), and the
+# caller allocates the others as through 3.4.2 (3.5.0).
+enum _CalcxSpl { _CALCX_SPL_STACK = 64; }
+fn _calcx_spl_scratch(sbuf, dp1, parts) {
+    if (dp1 <= _CALCX_SPL_STACK / parts) { return sbuf; }
+    return _f64arr_alloc(dp1);
+}
+
 # Partial derivative of f:R^n -> R with respect to variable at index, by the central
 # difference (f(x + h e_i) - f(x - h e_i)) / (2h): exact for a quadratic in x_i, error
 # O(h^2) otherwise, plus the rounding of f over 2h.
@@ -1413,7 +1424,17 @@ fn _calcx_panel_wide(w6, fa, fm, fb) {
 # n_pts: number of control points, knots: flat f64 array, n_knots: knot count,
 # t: parameter value (f64).
 # Returns HVec3 pointer, or 0 if inputs are invalid / t out of range, or if the de Boor
-# scratch (3 * (degree + 1) doubles) cannot be allocated.
+# scratch (3 * (degree + 1) doubles, on the stack up to degree 20 and allocated above it) or
+# the result cannot be allocated.
+# ⛔ 3.5.0 -- EVERY CALL TOOK THREE SCRATCH ARRAYS FROM THE BUMP HEAP (roadmap [3.5.0], NUM F2), which
+# `alloc` never frees: 96 bytes a call at degree 3 besides the 24-byte result, the class of the
+# multivariate differences' scratch (_calcx_diff_scratch). Up to degree 20 the scratch is a stack
+# array now (_calcx_spl_scratch), so a call takes only its result; the operations and bits are
+# unchanged. Time: calc_bspline_cubic_8 501 -> 463 ns, calc_nurbs_cubic_8 699 -> 634 (medians of five
+# interleaved taskset-pinned rounds against 3.4.2, ranges 493-542 / 447-480 and 663-713 / 621-657;
+# a shared machine, noisy).
+# [measured: scratch A/B runner (scratch_L5 ab.bcyr), 3.4.2 and this tree, taskset -c 5, 2026-11-14]
+# [measured: tests/modules_d.tcyr, group "3.5.0 L5: calc_bspline / calc_nurbs take only their result from the heap"]
 public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
     if (n_pts < 1) { return 0; }
     # A B-spline of degree d needs at least d+1 control points. Through 2.6.13
@@ -1494,11 +1515,19 @@ public fn calc_bspline(degree, ctrl_pts, n_pts, knots, n_knots, t) {
     }
 
     # De Boor's algorithm: work with (degree+1) points
-    # Allocate temporary arrays for x, y, z components
+    # Scratch for the x, y, z components: the stack array while 3 (degree + 1) doubles fit (3.5.0)
     var dp1 = degree + 1;
-    var dx = _f64arr_alloc(dp1);
-    var dy = _f64arr_alloc(dp1);
-    var dz = _f64arr_alloc(dp1);
+    var sbuf: i64[64];
+    var dx = _calcx_spl_scratch(&sbuf, dp1, 3);
+    var dy = 0;
+    var dz = 0;
+    if (dx == &sbuf) {
+        dy = &sbuf + dp1 * 8;
+        dz = &sbuf + dp1 * 16;
+    } else {
+        dy = _f64arr_alloc(dp1);
+        dz = _f64arr_alloc(dp1);
+    }
     if (dx == 0 || dy == 0 || dz == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
 
     # Initialize with control points [k-degree .. k]
@@ -1750,7 +1779,8 @@ fn _calcx_nurbs_gauge(ctrl_pts, weights, k, degree) {
 # Domain: degree >= 0, n_pts >= degree + 1, n_knots = n_pts + degree + 1, t in
 # [knots[degree], knots[n_pts]]. Returns an HVec3 pointer, or the designed 0 for an input
 # outside that domain, a NaN t, a span whose weight blend sum N_j w_j computes to 0 (a pole),
-# or a refused allocation (the de Boor scratch, 4 (degree + 1) doubles, and the result).
+# or a refused allocation (the result, or the de Boor scratch of 4 (degree + 1) doubles, which is
+# on the stack up to degree 15 since 3.5.0 and allocated above it: calc_bspline's repair, on its pair).
 # The weights are a gauge, and the result does not depend on it: a span whose homogeneous
 # values (|w_j|, |P_j,c w_j|) all lie in [2^-511, 2^511) takes 3.4.0's operations; any other
 # has its weights multiplied by the power of two that centres those values on 1
@@ -1820,12 +1850,23 @@ public fn calc_nurbs(degree, ctrl_pts, weights, n_pts, knots, n_knots, t) {
         }
     }
 
-    # De Boor on homogeneous coordinates (wx, wy, wz, w)
+    # De Boor on homogeneous coordinates (wx, wy, wz, w): the stack array while 4 (degree + 1)
+    # doubles fit, as calc_bspline's (3.5.0)
     var dp1 = degree + 1;
-    var pw_x = _f64arr_alloc(dp1);
-    var pw_y = _f64arr_alloc(dp1);
-    var pw_z = _f64arr_alloc(dp1);
-    var pw_w = _f64arr_alloc(dp1);
+    var sbuf: i64[64];
+    var pw_x = _calcx_spl_scratch(&sbuf, dp1, 4);
+    var pw_y = 0;
+    var pw_z = 0;
+    var pw_w = 0;
+    if (pw_x == &sbuf) {
+        pw_y = &sbuf + dp1 * 8;
+        pw_z = &sbuf + dp1 * 16;
+        pw_w = &sbuf + dp1 * 24;
+    } else {
+        pw_y = _f64arr_alloc(dp1);
+        pw_z = _f64arr_alloc(dp1);
+        pw_w = _f64arr_alloc(dp1);
+    }
     if (pw_x == 0 || pw_y == 0 || pw_z == 0 || pw_w == 0) { return 0; }    # see _f64arr_alloc (3.3.7)
 
     # ⛔ 3.4.1 — A SUBNORMAL GAUGE WAS READ AS A POLE. The weights are a gauge: w and c w give

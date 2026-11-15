@@ -2,6 +2,457 @@
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-11-14 — constants and conventions: 23 constants to enums, 16 names retired, the fabricated-answer rows
+
+This release works the [3.5.0] roadmap section: the constants any consumer could write, the conventions the
+maintainer set (0⁰, the EV100 meter, the isolated half-edge vertex, exact constant folding), and the answers
+the 3.4.0 audits found standing in for "no answer". It breaks the API. The consumer guide is
+**[docs/guides/migration-3.5.md](docs/guides/migration-3.5.md)**:
+- 16 public functions are retired for replacements that refuse where the old name answered with a plausible
+  value;
+- `world_to_screen_checked` takes a fifth parameter, the NDC depth range;
+- 23 `public var` constants are enum members (same names and values; assigning one no longer compiles);
+- `spatial_hash_insert` and `spatial_hash_clear` are `#must_use`.
+
+Of the 15 repositories declaring `[deps.hisab]`, none calls a retired name or the old arity, and none assigns
+one of the 23 constants (grep, 2026-11-14). pravash's `scripts/probes/p1_memory.tcyr` discards the two
+spatial-hash results and now draws a `#must_use` warning.
+
+The toolchain stays at cyrius 6.7.18 with ganita 1.2.15.
+
+| | 3.4.2 | 3.5.0 |
+|---|---|---|
+| assertions | 14,303 in 7 suites | 16,483 in 8 (`modules_d` new, 2,188) |
+| constants verified | 325 (23 skipped) | 572 (41 skipped), function-local and expression sites read too |
+| public declarations | 725 (868 probes; 1,515 non-public refused) | 729 (887 probes; 1,692 refused) |
+| public fns with a doc block | 675 of 675 | 692 of 692 |
+| `#must_use` annotations | 296 | 337 |
+| benchmarks | 392 | 505 |
+| `dist/hisab.cyr` | 3,724,469 B | 4,236,092 B (16.8% of the byte cap) |
+
+**The bundle under consumer pins** (measured 2026-11-14 from dirs pinned to each version): a cross-module
+program of 32 readings over the release's new and changed entry points (the enum constants, sphere, capsule
+and tiny-sphere rays, a 0 handle, the `_checked` normalize, angle, look-at and screen forms, `cx_ln`, `cx_powf`,
+`dual_pow`, `ad_grad`, the lost-pivot condition number, `eigen_power`, `sectional_curvature`, a BDF-2 step,
+`gjk_epa_3d_checked`, `num_mobius_checked` and exact folding) builds with no warning under every installed pin
+from 6.6.3 to 6.7.18, 37 toolchains, with the manifest's 17 stdlib leaves and with the sidecar's 9 plus
+`syscalls` and `io`, and runs with byte-identical output on all 74 builds. 6.6.2 refuses the bundle with the
+known `#derive(...) applies to a struct or an enum` error. [measured: scratch pins/probe_main.cyr, both leaf
+sets per pin, 2026-11-14]
+
+**Consumer manifests, read 2026-11-14:** all 15 direct consumers (attn11, dhvani, garjan, ghurni, goonj, hoosh, impetus,
+kimiya, naad, nidhi, prakash, prani, pravash, svara, ushma) pin hisab 3.4.1 and cyrius 6.7.18; jalwa carries
+2.11.2 under 6.6.3 through dhvani, and shabda and shabdakosh 3.4.1 under 6.7.18 through svara.
+
+### Breaking — 16 public names retired
+
+Each is removed, not redefined, so a call to one does not build:
+
+| 3.4 name | 3.5 replacement |
+|---|---|
+| `t2d_apply` | `t2d_transform_point` (an HVec2; 3.4 returned the homogeneous HVec3, `D090`) |
+| `t2d_compose`, `t3d_compose` | `t2d_compose_checked`, `t3d_compose_checked`: `Err(INVALID_TRANSFORM)` for the shear a rotation then a non-uniform scale makes, which no TRS triple holds (`F-X2`: the composite was 4× off) |
+| `tensor_get`, `tensor_set`, `tensor_get2`, `tensor_set2` | the four `_checked` forms: `Err(OUT_OF_RANGE)` / `Err(INVALID_INPUT)`, nothing written on a refusal (`AU3-F12`: an out-of-range index wrote into the next tensor) |
+| `ev100_to_luminance`, `luminance_to_ev100` | `ev100_to_avg_luminance`, `avg_luminance_to_ev100`: L = 2^(EV − 3), Lagarde/Filament's K = 12.5, S = 100 (*Decisions owed* #12(c); the 12.5/π factor had no source) |
+| `m4_look_at_rh` | `m4_look_at_rh_checked` (a rank-deficient view for eye = target or up ∥ forward, `AU2-G7-F6`) |
+| `hquat_from_axis_angle` | `hquat_from_axis_angle_checked`: normalises the axis; `Err(DIVISION_BY_ZERO)` for a zero axis at a non-zero angle (`MAT F4`) |
+| `hvec3_angle` | `hvec3_angle_checked`: `Err(DIVISION_BY_ZERO)` for a zero vector, where 0 read "parallel"; every finite non-zero pair keeps its bits |
+| `sym_match`, `sym_match_bindings` | `sym_match_checked`, `sym_match_bindings_checked`: `Err(ALLOC)` / `Err(INVALID_INPUT)` where 0 read "no match" (`INS5 F1`) |
+| `sym_const_eq` | `f64_eq`: folding and matching are exact |
+| `num_mobius` | `num_mobius_checked`: `Err(INVALID_INPUT)` for n ≤ 0, where 0 is also μ of every squareful n |
+
+### Breaking — a signature and 23 constants
+
+- **`world_to_screen_checked(point, mvp, vw, vh, depth_range)`** takes an `NdcDepthRange`:
+  `NDC_Z_MINUS_ONE_TO_ONE` keeps 3.4's depth; `NDC_Z_ZERO_TO_ONE` returns nz exactly, for
+  `m4_perspective_reverse_z`, Direct3D and Vulkan (`F-X1`: through a reverse-Z projection a point 5 away read
+  back 0.196).
+- **23 public constants are enum members** (`K003`), names and values unchanged: `EPSILON_F64`, `F64_TINY`,
+  `F64_POS_INF` (`HsbF64`); `GEO_FACE_NONE` (`GeoFace`), `GEO_FACE_OUT_BYTES` (`GeoFaceLayout`), the four
+  `GEO_CAP_*` (`GeoCapBranch`), the seven `GEO_JET_*` (`GeoJetKind`); `GJK_MAX_ITER`, `EPA_MAX_ITER`
+  (`GaIterLimit`); `CGA_NUM_BLADES`, `CGA_MV_SIZE` (`CgaLayout`); `HALFEDGE_NONE` (`HalfEdgeIndex`);
+  `AD_NONE`, `AD_FULL` (`AdIndex`). Through 3.4.2 a consumer's `GJK_MAX_ITER = 0` stopped GJK library-wide,
+  and `GEO_JET_SPHERE = 9` made the jet accessors refuse sphere jets. Assigning one is now a compile error.
+  The private `_NUMX_DFT_MAX` is an enum member too, its tests lowering the cap through a seam.
+- **`#must_use` on `spatial_hash_insert` and `spatial_hash_clear`**, which can fail since 3.4.1.
+
+### Added
+
+- **Result forms beside names that stay**:
+  - `gjk_intersect_3d_checked`, `mpr_intersect_checked`, `gjk_epa_3d_checked`, `mpr_penetration_checked`,
+    `time_of_impact_checked`: `Err(ALLOC)` where the plain forms answer 0, "apart" (`INS5 F1`);
+  - `geo_triangle_unit_normal_checked`, `geo_segment_direction_checked`: `Err(DEGENERATE)` where the plain
+    forms answer (0, 1, 0) or (1, 0, 0);
+  - `geo_jet_sphere_dradius_checked`, `geo_jet_plane_ddistance_checked`, `geo_jet_capsule_dradius_checked`:
+    `Err(INVALID_INPUT)` on a kind mismatch or a miss jet, where the plain forms answer +0;
+  - `hvec2_normalize_checked`, `hvec3_normalize_checked`, `hvec4_normalize_checked`: `Err(DIVISION_BY_ZERO)`
+    for the zero vector (`FB F4`; `hvecN_normalize(0)` stays a documented sentinel);
+  - `matrix_condition_number_checked`: singular, invalid and refused inputs told apart (the plain form's -1
+    stood for all three);
+  - `cmat_inverse_checked`: `Err(INVALID_INPUT)`, `Err(SINGULAR_MATRIX)` (decided exactly),
+    `Err(OUT_OF_RANGE)` or `Err(ALLOC)` where `cmat_inverse` answers 0;
+  - `ad_val_checked`, `ad_grad_of_checked`: `Err(INVALID_INPUT)` for an index that is not a node.
+- **`m4_transform_point_frexp_checked(m, v, out_e)`**: a projected point as significands and a power of two,
+  for points past the double range; `screen_to_world_ray` uses it for a far point there.
+- **`NdcDepthRange`** (`NDC_Z_MINUS_ONE_TO_ONE`, `NDC_Z_ZERO_TO_ONE`), the enum above.
+- **`sym_integrate`** integrates ln(x), any integrand free of x (`sin(y)`, `ln(2)`, `y^2`), x^g with g in
+  another variable, and a^x, where it answered 0 "unsupported" (`D076`). A constant exponent or base written
+  as a tree takes the constant branch by its value.
+
+### Changed — answers that were stand-ins
+
+The roadmap's "documented in their own comments, the same class" row (AU2 §2b) and its neighbours: each answer
+below meant "no answer" while reading as one. They change in place, as the row planned ("their pins move with
+them"):
+- **complex**: `cx_div(a, 0)` and `cx_inv(0)` give C99 G.5.1's infinities in `_Cdivd`'s bits, `(1+0i)/0 =
+  +Inf + i NaN` (was 0 + 0i). `cx_powf(0, 0)` = 1 (`D019`, as `num_modpow` and `dual_pow` already answer);
+  `cx_powf(0, n < 0)` = +Inf + i NaN and `cx_powf(0, NaN)` the NaN, where all three were 0 (`AU2-G6-F4`).
+- **Lie groups**: a zero axis at a non-zero angle or rapidity gives NaN where the axis matters in
+  `su2_from_axis_angle`, `so3_from_axis_angle`, `lorentz_boost`, `lorentz_rotate` and `cga_rotor` (was the
+  identity at every angle); angle 0 keeps the identity. `su2_from_quat(0)` is NaN. `su3_structure_constant`
+  on an invalid index is NaN (was 0.0); `gamma_spatial` / `gell_mann` out of range return 0 (was a zero
+  matrix).
+- **differential geometry**: `ricci_scalar`, `sectional_curvature` and `killing_residual` answer NaN on
+  invalid input and for a degenerate plane (was 0.0, which also means "flat").
+- **meshes**: `halfedge_is_boundary` answers Ok(1) for an isolated vertex, as OpenMesh and CGAL do, and for
+  a vertex with a twinless half-edge on any of its fans (*Decisions owed* #12(b), `AU2-G5-F8`, `CO F4`).
+  `halfedge_from_triangles` records a twinless outgoing half-edge per vertex where one exists.
+- **symbolic**: constant folding is exact (*Decisions owed* #12(a)). 1e-20 · 1e30 folded to 0, k_B · x to 0,
+  and simplify(d/dx 1e-20 x²) to 0 at every x. Two constants fold as `expr_eval_checked` computes them:
+  0 · +Inf is NaN, −(+0) is −0. `expr_to_str` / `sym_to_latex` answer 0 for a tag no constructor writes
+  (was "?"). `expr_eval_checked` reports a refused allocation as `Err(ALLOC)` (was `INVALID_INPUT`, `INS7`).
+- **depth**: `linearize_depth_reverse_z(±0, near)` is +Inf, the far plane at infinity (was 0, the eye;
+  `D096`). `screen_to_world_ray` returns `DIVISION_BY_ZERO`, `INVALID_INPUT` or `OUT_OF_RANGE` where it
+  returned rc 0 with a NaN direction (`FB F3`), and a unit direction for an infinite far plane.
+- **geometry**: `geo_ray_aabb[_face]` and `geo_ray_obb[_face]` answer a hit past DBL_MAX from finite input as
+  +Inf with its face, as the plane, sphere, triangle and capsule already did (was the miss). AABB, 48,000
+  rays: 4,808 answers moved 0 → +Inf, each with the oracle's face, and nothing else moved.
+  `geo_ray_triangle` with a NaN direction or vertex returns that NaN (was the miss).
+- **numbers**: `num_halton(i, base < 2)` is NaN (was 0.0, the index-0 sample).
+- **a 0 handle passed in** (`INS5 F3`): 0 is the designed answer of every refused allocation, and 3.4.2's
+  vec2, vec3, vec4 and quat functions read address 0 for one (rc 139), so a chain such as
+  `hvec3_cross(hvec3_new(...), v)` crashed on an exhausted heap. In every function of those four modules that takes a handle the
+  answer now follows the type: a handle result is the designed 0, returned before anything is allocated; a double
+  (`_dot`, `_length_sq`, `_length`, `_distance`) is NaN, 0x7FF8000000000000; `hquat_normalize_checked`,
+  `hquat_inverse_checked` and `hvec3_angle_checked` are `Err(INVALID_INPUT)`; an `_into` form writes NaN
+  into every component of out and returns 0. `geo_closest_point_on_plane`, `lorentz_is_valid`, `se3_new`
+  and `ode_bdf_checked` likewise refuse a 0 handle. `ad_grad` refuses a hand-set tape it cannot read and
+  writes NaN to every adjoint (it wrote past `adj`, `R2-SYM N9`).
+- **autodiff** (`SYM4 F3`, `F4`): a non-integer power of a moving base at ±0 is a domain miss in
+  `dual_pow` and `ad_pow` alike, as `sqrt` at 0 is: the value stays pow's and the derivative is the miss's
+  NaN. 3.4.2 read (−|x|)^1.5 at 0 as −0 and x^0.5 at 0 as +Inf. ⚠ x^1.5 and (x²)^1.5 = |x|³ at 0, whose
+  derivatives are 0, now read NaN too, as x·sqrt(x) at 0 has since 3.4.1. A constant zero no longer
+  annihilates such a power, because an annihilator never cuts a miss: 0·x^0.5 and (x − x)·x^0.5 at 0 read
+  0 in 3.4.2 and the miss's NaN now, in both modes. x^0 of a moving base whose value is NaN has the
+  derivative NaN (3.4.2: 0). A NaN exponent is a NaN value, not a miss. Integer exponents, positive bases
+  and constant bases are unchanged.
+- **`cmat_inverse`** answers a pivot lost to rounding (cond past about 2^53) with a certified inverse
+  through the real form [[Re, −Im], [Im, Re]] in extended precision, where it answered 0, "singular":
+  [[1, 1+u], [1+u, 1+2u]] gives −2^104 [[1+2u, −(1+u)], [−(1+u), 1]]. On 169 complex lost-pivot matrices
+  every entry of at least 2^-10 ‖X‖ is correctly rounded. Only a singular matrix gives 0.
+
+### Fixed — wrong answers on ordinary input
+
+- **`geo_ray_plane`** (`R2-GEO S8`): n·d and d0 − n·o are certified before their quotient is used; the rest
+  take correctly rounded sums. On the roadmap ray t was 2× off (438B8… for 439B8…, the exact t). 70,369
+  finite rays in 9 families: 3.4.2 read 1,996 hits as misses and 92 misses as hits, gave NaN for 1,435 and
+  +Inf for 435 finite t; now none, certified t within 2^-37.5 of exact. `geo_jet_plane` takes 1/(n·d) from
+  the sum the primal decided with: on 57,977 rays no hit jet has a partial past 2^-30 (3.4.2: 2,695 past
+  2^-20, 88 hit jets for exact misses).
+- **`geo_triangle_normal` / `geo_triangle_area`** (`GEO F4`): the exact cross product rounded once per
+  component, and half its length. 3.4.2 flushed to 0 below edges of about 2^-537, overflowed above about
+  2^512, and on 9,750 triangles in four families had components not correctly rounded on up to 2,752; now 0,
+  area within 1.57 ulp.
+- **Implicit ODE steps** (`NUM3 F1`): `ode_backward_euler_checked`, `ode_bdf2_checked` and `ode_bdf_checked`
+  certify Newton's answer on the solution branch, as the continuation's answers already were. Robertson's y2
+  by backward Euler is +3.9077e-5, the branch root (3.4.2: −7.54e-5, a negative concentration); Van der Pol
+  μ = 100 is −1.3244 (3.4.2: +1.7954). On a 6,000-step set, 3.4.2 had 3,322 Oks on another root; now 0.
+  The certificate also requires g to rise into the answer along the step's path, read as secants of g
+  toward the start and away over 2^-26 max(|z|, |move|) (and toward it again over 2^-26 of the move where
+  the two disagree), so the second root of a close pair inside the samples' last gap is refused and
+  mirror-image steps get the same verdict; on the step's path the branch's root is not refused for a turn
+  of g past it. An answer equal to the step's start (the predictor already within tol), which 3.4.2
+  returned unread, is read along the branch's first move c·f(t, s). Against an exact oracle on 20,000
+  random triangle-wave steps at y offsets 0 and 1e6, wrong Oks fall 142 → 6 and 140 → 6 (all six at tol
+  0.1). ⚠ Right answers it refuses: at tol 0.1, about 11 per 20,000 inside the tol band where g falls on
+  both sides of the root; near equilibria, 29 of 15,894 where g' at the answer is not resolved from 0; and
+  steps whose f rounds far above an ulp of c·f (exp(y) − 1 near 0), where every slope reading is rounding.
+  Still passed: a pair narrower than 2^-26 of the move or wholly inside |g| < tol.
+- **`opt_conjugate_gradient`** (`NUM4 F1`, `NUM F1`) takes 3.4.1's quasi-Newton repairs: the flat tail
+  1e12 + 1 − exp(−x²) is Ok at the minimum (3.4.2: Ok at 193.9), objective-scaled quadratics are solved at
+  201 of 201 scales (3.4.2: 153) in 1,206 gradients (15,764), and a fixed point ends the run.
+- **`matrix_condition_number`** (`LA F2`, `LA F3`): an invertible matrix whose elimination loses a pivot
+  answered −1, "singular". Its ‖A⁻¹‖_F now comes from a certified extended-precision Gauss–Jordan (30-bit
+  limbs, accepted only under a rigorous bound of 2^-70 ‖X‖_F on the error), or exactly where the integers
+  are no wider, and is correctly rounded: [[1, 1+u], [1+u, 1+2u]] gives 2^106 (1 + 2^-51), and all 247 real
+  lost-pivot matrices of the test families match a Fraction oracle. A 1×1 [x ≠ 0] is exactly 1.
+- **`eigen_power`** (`R4-CERT N1` and its rounding half): the certificate read an underflow of its
+  squarings as nilpotence, so a 9×9 chain coupled at 2^1000 (ρ 2) came back Ok(1.9); the squarings now
+  carry an exponent per entry where an f64 frame would flush. And it did not bound its own rounding:
+  [[1, a, a, 0], [c, 0, 0, 0], [−c, 0, 0, 0], [0, 0, h, 3/4]] at e = 30..590 was Ok(3/4) with ρ = 1. The
+  certificate now carries an entrywise bound on the powers' rounding, and where that bound alone refuses,
+  the squarings are taken again in double-double. The squarings' subnormal floor goes only on entries
+  where some term can be non-zero, so a block-triangular chain's structural zeros do not close a false
+  cycle (all 556 chains coupled at 2^380 to 2^630 answer as before these repairs). On the cancellation
+  family all 200 short or non-eigenvalue Ok answers are NO_CONVERGENCE. ⚠ It also refuses right answers
+  it cannot certify: 20 of 897 on strongly non-normal matrices with a subdominant ratio of 0.9 to 0.995
+  (the double-double retry recovers 30 of the 50 the f64 bound lost), and 40 of 52 in the cancellation
+  family. Every answer it gives is 3.4.2's bit for bit.
+- **complex** (`SYM F2`–`F4`): `cx_exp`, `cx_sin`, `cx_cos`, `cx_from_polar` past overflow keep finite parts
+  finite and zeros zero (`cx_exp(710 + 0i)` = (+Inf, +0), was (+Inf, NaN)). `cx_mul` with finite operands no
+  longer makes Inf − Inf NaN parts. `cx_ln` in |a| ∈ [1/2, 2] forms (1/2) ln(1 + D) with D a double-double:
+  below 1 ulp on 33,251 points, where 3.4.2 was up to 2.4e21 ulp off and `cx_ln(1 + 1e-10 i).re` was 0.
+- **transforms**: `t2d_compose_checked` / `t3d_compose_checked` form scales near either end of the range
+  without overflow; `m4_look_at_rh_checked`'s translation is ±Inf exactly where the exact one passes DBL_MAX;
+  `linearize_depth(1, 1e-200, 1e200)` is the depth (was +Inf, `RV-LIE N7`). `hquat_slerp` of an identical
+  pair is `a` at every finite t (was NaN from t = 2^54, `MAT4`). The tone maps give their limits at ±Inf.
+- **zero signs on cycc 6.6.3–6.6.7** (`MAT F1`): the negations in vec, quat and mat4 flip the sign bit, so
+  −0 comes out under every consumer pin.
+- **`geo_ray_sphere` past its limits and at tiny spheres** (`GEO7 F3`, `F5`, the near-tangent
+  certificate rows): the re-formed offset past the documented limits is retested (18 of 12,000 wrong →
+  right); rays at spheres whose r² and |o − c|² flush get a certified verdict and roots at their own scale,
+  and the unit-size copy certifies near-tangent rays; `_geo_sph_comp` no longer refuses every ray with
+  r·|o − c| past 2^512; a direction past 2^511 at a sphere under 2^-484 no longer overflows sqrt(a·Δ) into
+  t = 0. Against an exact Fraction oracle on 181,500 rays in 30 families (r from 2^-1074 to 2^1014, down to
+  2^-1300 of |o − c|; |o − c| past DBL_MAX; |d| from 2^-1074 to 2^1000), the tree before these repairs had
+  18,792 wrong (a wrong verdict, or t past 4 ulp). The compensated step's roots are now formed from
+  double-double coefficients and corrected quotients, not the plain hb and c, whose error a near root took
+  whole (up to 6.62 ulp on rays the step newly certified past r·|o − c| = 2^512). On 273,000 rays in 14
+  further families built within 8 ulps of tangency, every t is within 3.08 ulp (inside the limits, 201,000
+  rays within 2.91; 3.4.2 had one at 4.01), and none moved from right to wrong against 3.4.2. ⚠ Known and
+  documented: a ray tangent from an origin under 2^-537 short of its tangent point reads t = 0, inside the
+  limits too. Pins move to the correctly rounded root, each settled by the oracle first: `modules.tcyr`'s
+  a·Δ and its capsule twin, seven in `modules_c.tcyr`, `hisab.tcyr`'s GEO7 F1. The 'y' pin in
+  `modules_c.tcyr` moves from the correctly rounded 0x3FEFFFFFFFFFFFFF to 0x3FF0000000000000 (0.895 ulp),
+  inside the 4-ulp contract.
+  ⚠ **Exposure on half-infinite capsules.** The sphere's answers are now right where `_geo_capsule_ray_inf`
+  relied on their being wrong: its 2^-48 (|o_k − F_k| + |t d_k|) acceptance window, unchanged since 3.4.2,
+  accepts a barrel root past the finite end, and it keeps the barrel's root on a tie with the cap's. On
+  half-infinite capsules with flushed caps, 21 and 15 of 3,000 rays (two seeds) that 3.4.2 answered right
+  now read a miss as a hit, and 63 and 153 of 3,000 the barrel for the end cap; overall such rays go from
+  1,444 and 1,415 wrong to 324 and 308. At ordinary scale the window is wrong on about 530 of 3,000
+  near-tangent rays on 3.4.2 and on this tree alike. Carried to [3.6.0].
+- **`geo_ray_capsule` / `geo_ray_capsule_branch`** (`GEO7 F2` and the capsule rows): a barrel root past
+  DBL_MAX is decided exactly (+Inf on the right branch, was the miss). A ray within 2^-48 of a long axis,
+  whose barrel root takes the fine d_perp's whole error, is solved exactly where the barrel can be crossed
+  on the segment: on 22,000 such rays 3.4.2 had 2,571 wrong (t to 1.1e14 ulp), now 0. The gate that keeps
+  rays which cannot cross the barrel on the float path is read only for a normal d: for a subnormal one
+  its bound does not hold (15 of 24,000 such rays crossed it 4.0–6.4 ulp off; now within 1.7). Capsules longer than
+  2^511.5 and projections past DBL_MAX are solved exactly: on 45,000 rays with spread exponents 3.4.2 had
+  125 wrong (13 hits read as the miss, t to 8.9e15 ulp), now 0; on 8,000 rays with t past DBL_MAX, 124 → 0.
+  The barrel's c cancelled by one bit is formed again with o_perp's rounding carried (past 4 ulp: 60 → 38
+  of 60,000 ordinary rays, max 8.2 → 4.9 ulp; 456 → 36 of 20,000 with origins 0.7–1.5 r off the axis), and
+  rays 1/8 to 1/4 off a long axis take d_perp with end − start's rounding carried (280 → 10 of 16,000).
+  Both repairs move a few rays the other way, past 4 ulp: up to 6 per 20,000 band rays (at most 5.9 ulp)
+  and 5 of 16,000 near a long axis. Inputs outside 2^±100 go to the scaled solve, which the band repair
+  does not reach: 37 of 24,000 subnormal-d rays with band origins stay past 4 ulp (at most 8.8; 3.4.2:
+  52). A ray along an ordinary capsule's axis keeps 3.4.2's bits. Two `modules_c.tcyr` pins move within the
+  contract (c17 3.10 → 0.10 ulp; ppar 1-7 0.56 → 1.44 ulp).
+- **collision**: a ball over a cylinder's cap within about 1e-6 of its rim, inside or past it, was a miss
+  from every entry in both orders (`F-CO7-2`, the roadmap's scene after 4,271 support calls). A rim ring
+  reads the rim's frame and proves the contact with a support tetrahedron, and its closed forms give the
+  depth. Answers missed past 4 eps, 3.4.2 → 3.5.0, of 6,000 per family: balls of r 1e-3 to 1, 831 → 0;
+  r 1e-6 to 1e-3, 903 → 75; r 1e-8 to 1e-6, 1,197 → 948; cones by the base rim, r 1e-8 to 1e-5,
+  1,086 → 381. Smaller balls by a rim still miss in part (carried). `gjk_epa_3d`'s deep snap takes the
+  face's closed form where it is lower than EPA's answer (`F-CO8-2`): a ball concentric with a
+  parallelepiped went from 29 ulp to 2 ulp above r + h_min, and the axis-aligned box is correctly rounded.
+  Two support values within h's rounding (2^-49 of the points' scale) give the same depth, and such a tie
+  goes to the closed form: the rim ring's candidate wins it, a polished reading does not displace another,
+  and the snap's face form is refused at a tie where the origin's foot lies off the face. Over eight
+  families of 2,000 balls by rims, normals that 3.4.2 had within 1e-9 rad and that a "lower at all" rule
+  put past 1e-7 (to 1.33e-4 rad): 126 → 0. ⚠ A support value bounds the depth only to the support's own
+  error, so an answer can sit up to that error from the exact one: 10,026 depths moved within the tie, by
+  at most 0.199 eps. `_epa_polish`'s refusal left both out-params unwritten and handed a 0 normal to the support
+  function (SIGSEGV under a refusing allocator, `INS5 F1`). `_ga_aspect_confirms` and `time_of_impact`'s
+  second distance query moved to stack slots. `_ga_inside_proven` clears `_GA_NEAR_V` on its exact-origin
+  exit (`INS6 F1`; no answer is known to move). The octree's and quadtree's centres no longer overflow for a box with both bounds near
+  DBL_MAX: 9 quadtree inserts there took 1,307,456 B (`LIE2 F3`). `sdf_smooth_union(Inf, Inf, k)` is +Inf
+  (was NaN), and `sdf_capsule` past DBL_MAX with an infinite radius is −radius (`RV-CO N4`, `R2-CO N8`).
+- **`ode_dopri45_trajectory`** refuses a NaN or infinite y0 before calling f (3.4.2 called f 3,234 times,
+  `NUM F4`). **`calc_bspline` / `calc_nurbs`** keep their de Boor scratch on the stack to degree 20 / 15,
+  bits unchanged (`NUM F2`).
+- **symbolic** (`RV-SYM N6`, `SYM F5`, `SYM4`, `SYM5`, `R4-SYM N1`): every walker but `sym_rewrite` walked a
+  shared node once per parent; past 2^20 operators a memo walk with the same answers takes over.
+  simplify(diff(chain 4,000)) 0.84 → 0.13 s; `sym_integrate` on a left-nested product is no longer O(n²)
+  (5.85 s → 51 ms at 20,000); a no-op rewrite reuses its stack blocks (39.8 → 7.2 MB on sin^17000).
+- **autodiff: the tape read NaN where forward mode cuts a zero's partner** (`SYM5`): from a root below
+  4,096, sqrt(y)·(sqrt(z) + x^−1), 0·(sqrt(y) + x^−1) and (sqrt(y) + x^−1)^0 at y = z = 0, x = 1e−200 read
+  NaN along x and now read +0, as forward mode does. After the sweep, one labelling pass and one more
+  compensated sweep with those edges cut answer for the variables along which every such edge is cut; a
+  NaN that no cut made stays NaN. Across three seeds of 200,000 random programs this changes 25, 28 and 32
+  answers, each a NaN to forward mode's number. The answer is the tape's own sweep with those edges cut,
+  not forward mode's, so the tape's range and rounding come back with it: sqrt(y)(sqrt(z) + x^−1) + 3x −
+  x/(3x) at (0, 0, 1e−300) reads −2^942 along x, the tape's answer for 3x − x/(3x), where forward mode
+  gives 3. ⚠ Not repaired: a root at 4,096 or above, mixed and nested cuts (8 of 2,399,922 inputs), more
+  than 63 such edges, an unmarked zero. A hand-set tape may carry i2 = −4, the new cut-node record: both
+  sweeps read it as one edge and no second (as 3.4.2 did), and it is cut only beside a ±0 partial.
+- **`sectional_curvature`** (`RV-LIE N11`, `LIE F3`): within 2^-46 relative of the exact K of its inputs for
+  every finite input (|K| ≥ 2^-1022), however much num or den cancels. 3.4.2's contraction was only
+  backward stable: up to 3,270 ulps on random indefinite dim-4 tensors, and a near-null plane of a
+  Lorentzian space form of curvature 0.712 read 0.75 at e = 25, 0.5 at e = 26 and 0, "flat", from e = 27,
+  where den rounded to 0 though the plane is not null. Three tiers: the 3.4.1 contraction, bit for bit,
+  where its own error bound (counting only nonzero terms) certifies it; num and den as double-doubles; an
+  exact integer sum rounded once. A plane whose den rounds to 0 but is not 0 gets its curvature (3.4.2: 0,
+  a plausible wrong answer). A flat R on a near-null plane with den < 0 gives −0 (3.4.2: +0).
+- **dead code** (`INS5 F4`, `F5`): the unreachable top-binade halving in `geo_triangle_unit_normal`, and six
+  capsule seam helpers unreachable since 3.4.1's exact route.
+
+### Performance — costs
+
+Measured as pinned, interleaved A/B runs on a shared machine, so each is noisy; medians. Against 3.4.2
+unless a line says otherwise (the release's second wave measured against its first).
+**3.4.2 against 3.5.0 on the 392 rows the two harnesses share.** Each tree's `tests/hisab.bcyr` was built under
+cycc 6.7.18, and the two binaries ran in five interleaved rounds, each pinned to one idle core (load
+1.9–2.7). A row counts as moved only where the two sides' ranges separate: 325 overlap, 54 are slower, 13
+faster, and the median row is 1.013×. The slower rows, by size:
+- `ode_backward_euler_step` 60.9 → 1,444 ns and `ode_bdf2_step` 233 → 5,422 ns (23×), the certificate
+  below;
+- `ray_sphere_graze_comp` 332 → 640 ns (1.93×), the compensated step's double-double roots;
+- `eigen_power_tri30_cert` / `tri60_cert` 0.243 → 0.401 ms and 0.945 → 1.54 ms (1.65×, 1.63×), and
+  `eigen_power_wide3` 160 → 227 µs (1.42×), the rounding bound;
+- `ray_capsule_far_axis` 1,695 → 2,427 ns (1.43×), a ray from 10⁴ away nearly along an ordinary capsule's
+  axis;
+- `t3d_compose` (now `t3d_compose_checked`) 188 → 265 ns (1.41×), `jet_plane` 72.7 → 94.5 ns (1.30×),
+  `opt_cg_quad3` 1,222 → 1,507 ns (1.23×);
+- the symbolic walks on ordinary trees, 1.07–1.13×: `sym_integrate` 358 → 406 ns, `expr_diff_simplify`
+  1,134 → 1,272, `sym_rewrite_default` 2,718 → 3,027, `expr_eval_deep1000` 27.1 → 29.4 µs, `expr_eval`
+  524 → 561 ns;
+- reverse-mode autodiff on tapes where nothing is cut, 1.05–1.11×: `jac_rev_pertape_256` 232 → 259 µs,
+  `ad_div_grad` 141 → 155 ns, `grad_rev_16` 5,659 → 5,936 ns;
+- `tonemap_reinhard` 23.0 → 26.1 ns (1.13×), `cx_mul` 24.9 → 27.6 ns (1.11×), `quat_dot` 6.5 → 7.2 ns
+  (1.12×), and the vec3 rows 1.06–1.07×;
+- 1.02–1.085× on `m3_normal_matrix_cof_wide` and its two neighbours, the octree insert, `cga_norm_sq_k5`,
+  `ray_aabb`, `m4_transform_point_w0`, ordinary capsules and their jets, and the collision entries
+  (`mpr_intersect_near_tangent` 1.07× down to `time_of_impact_box_edge` 1.02×).
+
+The faster: `b41l3_kdtree_nearest_2e600` 4,167 → 1,710 ns (0.41×), `b41_sectional_curvature_4d` 8,062 →
+4,899 ns (0.61×), `eigen_power_2x2_wide` 0.78×, `calc_nurbs` / `calc_bspline` 0.87–0.94× (the de Boor
+scratch on the stack), `cx_div` 0.93×, `se3_log` 0.96×. The 113 rows new in 3.5.0 have no 3.4.2
+counterpart; the lines below give the lanes' own A/Bs for them.
+[measured: scratch abrun/ab_run.sh and ab_parse.py, 5 interleaved rounds per side on cpu 11, 2026-11-14]
+- **Implicit ODE steps**: `ode_bdf2_step` 254 → 5,504 ns and backward Euler 68 → 1,439 ns: the branch
+  certificate reads up to 63 more evaluations of f on a converging step. Its slope test adds 2 more per
+  certified answer (against the first wave: backward Euler +5.2% / +6.1%, `ode_bdf2_step` +4.0% / +3.7%,
+  two runs; a refusal by the slope saves up to 62), and an answer equal to the predictor, which 3.4.2
+  returned unread, 2 to 4 more (a BDF-2 step whose predictor is the answer 38 → 180 ns).
+- **Triangles, planes, transforms**: `geo_triangle_normal` 48 → 223 ns (4.6×) and `geo_triangle_area` 46 →
+  219 ns (4.8×), what `geo_triangle_unit_normal` has paid since 3.4.1; `geo_ray_plane` 27 → 31 ns;
+  `geo_jet_plane` 137 → 156 ns; `m4_look_at_rh_checked` 616 → 2,014 ns (3.3×, once a frame);
+  `t2d_compose_checked` 208 → 290 ns; `t3d_compose_checked` 452 → 588 ns; `screen_to_world_ray` 594 → 736 ns.
+- **`geo_ray_sphere`** (against the first wave): the ordinary fast path unchanged (82.7 → 82.5 ns);
+  past-limit origins 1.16–1.40 radii out 351 → 439 ns (+25%). At flushed spheres, axis-aligned clear
+  misses 697 → 898 ns (+29%) and near-tangent rays 681 → 2,290 ns (the first wave was wrong on 2.7% of
+  them); generic directions pay more: clear misses 892 → 1,560 ns, near-tangent rays 876 → 3,905 ns, the
+  widest exponent spread 825 → 6,661 ns (45% wrong before). The compensated step's double-double roots:
+  near-tangent rays it certifies at unit size 352 → 673 ns (+91%); past r·|o − c| = 2^512, where the tree
+  before wave 2 answered through the slower accurate path as 3.4.2 does, 829 → 682 ns.
+- **`geo_ray_capsule`** (against the first wave, two sessions): ordinary rays +3.9% / +4.1% (669 → 697
+  ns); origins 0.7–1.5 r off the axis +11.5% / +12.3%; from inside long capsules 1/8 to 1/4 off the axis
+  +16.5% / +19.7%; along an ordinary axis +3.7% to +6.1%; a subnormal direction near a long axis about 2×
+  (1.95 → 3.87 µs), now routed to the exact solve; spread exponents about +20%, as more rays reach it.
+- **Collision**: the deep snap's dearest parallelepiped 165 → 190 µs (+15%), and its tie test +2.0% more
+  (204.3 → 208.4 µs on the wave-2 row); support calls +3.7% to +5.9% on deep families; the separated scene
+  that paid most +1.6%, inside its spread.
+- **`cx_ln`** in the band [1/2, 2]: 1.44× on the series path (0.6+0.8i 110 → 158 ns) and 1.20× on the ln
+  path (0.9+0.3i 132 → 158 ns); outside the band 0.98×.
+- **`matrix_condition_number`** on a lost pivot takes the certified extended tier, about n³ times the
+  condition's bits: 6.2 ms at n = 24 and 0.48 s at n = 96, where 3.4.2 answered the wrong −1; the 7×7
+  bench row 0.23 ms, the lost-pivot 2×2 5.6 µs. **`cmat_inverse`** on a complex lost pivot: 37 ms /
+  354 ms / 2.9 s at n = 16 / 32 / 64 (3.4.2: 0).
+- **`eigen_power`**: 1.4–2.1× where the f64 bound certifies (gap matrices at n = 10 to 64; non-normal
+  fixtures at n = 30 / 60 / 100: 0.32 / 1.96 / 7.5 → 0.64 / 3.66 / 16.0 ms). ⚠ Positive matrices scaled by
+  2^±300 take the wide squarings, which 3.4.2 did not have: 2.6–11× at n = 8, 18–26× at n = 16, 41–47× at
+  n = 40, 67–71× at n = 64 (5.6 → 393 ms). Where the double-double squarings take an answer back, 1.26×
+  on a 4×4 and 2.5–5.7× at n = 24 to 48; where they refuse it, 5.3–15× 3.4.2's certification (n = 64:
+  6.0 → 88 ms).
+- **`sectional_curvature`**: inputs its plain certificate accepts 0.50–0.61× (a dim-4 space form 8.7 → 5.4
+  µs); generic dense tensors also pay the double-double tier, 2.1× at dim 4 to 1.53× at dim 16;
+  cancellation past about 2^-49 of the terms at dim 4 (2^-50.7 at dim 3, 2^-41.2 at dim 16) reaches the
+  exact tier, 14× at dim 3 (44 µs) to 61× at dim 16 (114 ms) on dense tensors of moderate exponent; on
+  dense dim-16 operands whose entries span 2^-1074 to 1 that tier alone takes 0.28–0.29 s, about 150×.
+- **Symbolic**, a tree past 2^20 operators that shares nothing (2^19 terms 2·sin(x)): evaluate 42 → 108 ms,
+  simplify 78 → 171 ms, differentiate 127 → 262 ms, the memo walks' bookkeeping.
+- **`ad_grad`** where edges are cut: 400 terms sqrt(y)(sqrt(z) + x^−1) 77 → 251 µs; s·(s + 1) over 1,300
+  inputs 96 → 193 µs (a labelling pass that cuts nothing); a tape whose every node descends from a miss
+  +8% (the trigger test alone +5%). Against the first wave, tapes with no miss are unchanged; against
+  3.4.2 they pay 1.05–1.11× (above).
+- **vec / quat**, the 0-handle test (against the first wave): the dot family +7% (vec2) to +23% (vec4,
+  quat); `hvec3_length` +6%, `hquat_length` +9 to +11%; `hvec3_distance` +9%, `hvec3_add_into` +10%;
+  cross, mul, lerp, add and neg +1 to +6%.
+- Quadtree insert +3.4% (the centre's overflow test).
+- Wins: a kd-tree query around a NaN or infinite point returns at once (about 40 µs → 560 ns at 4,096
+  points); `m3_normal_matrix_cof` past 2^997 − 2^970 keeps the 13u certificate's answers (11.6 → 3.45 µs on
+  one near-rank-1 matrix); the rim scene of `F-CO7-2` 1,294 → 525 µs (`gjk_intersect_3d`); `se3_log`
+  allocates what a w > 0 element does at w < 0 too: a turn of 5 takes 776 → 648 B and 925 → 772 ns.
+
+### Tests and gates
+
+- **`tests/modules_d.tcyr`**, the fourth per-module suite: the release's 2,188 assertions in fifteen blocks,
+  seven for the roadmap's areas and eight for the rows the first wave left open, each block mutation-tested
+  when written and each wave-2 block again after an independent review of its repairs. The suites total
+  16,483 (3.4.2: 14,303). The vec/quat 0-handle cases each run in a child
+  process made non-dumpable first, so a fault is a counted failure and leaves no core file.
+- **Two refusal sweeps held 9.6 GB resident.** `modules_d`'s collision sweeps refuse each allocation of
+  each entry in turn (27,425 refusal points in one, two runs each), and their counting allocators served every granted request from
+  the global heap, which nothing reclaims. They now serve from an arena rewound at each refusal point; every
+  sweep counter is unchanged, and the suite's resident peak is 874 MB, under `modules_b`'s, so the
+  overcommit gate's figures stand. [measured: scratch vmpeak.py, a per-group VmRSS trace, 2026-11-14]
+- **CI runs `check-miscompile.sh`** on every build: the job installs the toolchains `--list-pins` names (the
+  consumer floor 6.6.3 and the selftest's 6.6.4 / 6.6.5 controls) through the verified installer, not
+  activated. 3.4.0's bundle fails it (the octree_insert crash); this tree passes. The installer path is first
+  exercised by the first CI run.
+- **`scripts/check-test-names.sh`** (`MAT4`, `INS4`): a top-level name in a harness means one thing — no fn
+  twice, no fn sharing a value's name, no repeat in the declaration zone, no fn reached after a later
+  redeclaration, no library name replaced or shadowed without its ALLOW entry. Shadowing after a harness's
+  first statement is the language's rule and passes (188 names). In the build job, with a selftest.
+- **`scripts/check-overcommit.sh`**: says which `vm.overcommit_memory` mode Test, Fuzz and Bench run under, and
+  in mode 2 fails where the commit room does not cover a step's measured peak (Test 2,621,960 KB, Bench
+  13,369,756 KB: 3.5.0's bench harness, 113 rows longer, fills ten more grain chunks than 3.4.2's, which
+  needed 10,748,308 KB; resident 12,968,428 KB against 10,326,272).
+- **`check-constants.sh`** (`R4-SYM N2`) reads function-local constants and one-value expression comments,
+  and fails a bare hex f64 with no comment. Floors: population 613, verified 572, enum members 156, globals
+  309 (the 23 constants and `_NUMX_DFT_MAX` left the column-0 `var`s, set difference checked; wave 2 added
+  `_ODE_F64_2_POW_M52`). It found
+  `geo_advanced.cyr`'s `rmin` literal (2^-44) under a 2^-41 comment. A sweep of 16,800 scenes against exact
+  depths settled it: the bits are the right floor (at 2^-41, 150 of 1,003 moved answers are past 16 eps, worst
+  3.5e9; at 2^-44 none, worst 8.85), so the comment and its derivation are corrected and
+  `tests/modules_c.tcyr` pins three scenes that fail at 2^-41 (6 assertions, mutation-proven).
+- **`check-measurements.sh`** (`RV-INS N2`) checks root-level files, every path in a marker and every
+  marker; **`bench-history.sh`** marks `einsum_matmul_2x2` only past its 16% layout band (`INS6 F2`); the b41
+  bench setup checks name their path (`RV-LIE N5`).
+- **Suites under old pins**: every suite compiles under cycc 6.6.3 again. `modules_b` needed a forwarder
+  for 19 forward `&_r5ga_sup_cap` uses, `abuse` load64/store64 in place of typed-array indexing (which parses
+  from 6.6.12), and five suites' exhaustion instruments now reach `lib/alloc.cyr`'s grain by address, not by
+  `_linux_grain`, a name that exists from 6.6.8. On the final tree the
+  suites fail 114 assertions under 6.6.3 and 59 under 6.6.10, and every one reads the pin's own arithmetic
+  or the instrument's: under 6.6.3, ganita 1.2.5's SVD 22, the pin's sin / cos / tan 30, `pow` 24,
+  `atan2`'s special cases 10, `sinh` / `cosh` 23, the INS5 exhaustion instrument 4 (its lock-hook
+  interposition binds only from 6.7), and one hisab row, `_geo_cross_exact`'s +0 (carried); under 6.6.10, SVD 22, `atan2` 10,
+  `sinh` / `cosh` 23, INS5 4. [measured: scratch oldpin/run_oldpin.sh, every suite per pin, 2026-11-14]
+- **`tests/hisab.tcyr`**: the CO4 delaunay group's sweep and controls no longer read a field of a refused
+  answer, so under a tight address-space budget the group reports its failures instead of crashing; the m0157
+  note's budgets are re-measured (passes at 610,000 KB, fails at 605,000).
+- The `mpr_penetration` arena bound in `modules.tcyr` had gone blind (baseline 19,304 B, a per-face leak
+  injection 22,984 B, under the 25,600 bound); it is re-derived to 21,000 (`CO7`).
+
+### Not reached
+
+The [3.5.0] rows this release did not close, or closed in part, are carried to the roadmap's [3.6.0] section
+("Carried from the 3.5.0 close") with their repros: 27 rows, and 37 findings the lanes and their reviewers made
+outside them. Among them:
+- half-infinite capsules' 2^-48 acceptance window (above), with a prototyped repair that needs its own
+  derivation;
+- `geo_ray_triangle`'s t, certified to 2^-33 relative: 10% of ordinary hits are past 4 ulps;
+- balls under about 1e-3 by a cylinder's or a cone's rim still miss in part, deep balls just outside a
+  cylinder's rim answer up to 538,765 eps too deep (on 3.4.2 too), and cone depths stay wrong past the rim;
+- `eigen_power`'s refused right answers, and the cheaper wide bound;
+- the implicit ODE certificate's blind spots: pairs narrower than 2^-26 of the move, and an f whose rounding
+  exceeds an ulp of c·f;
+- extended-exponent autodiff, and what the tape's cut pass leaves NaN.
+
+The costs above that the maintainer has not accepted are *Decisions owed* #19; the names kept beside a
+`_checked` form, and the answers changed under the same name, are #18.
+
 ## [3.4.2] - 2026-11-14 — the consumer filings: an allocation scope, caller storage, matrix-free CG
 
 This release repairs the five issues hisab's consumers filed between 2026-11-09 and 2026-11-11, from the impetus, pravash and ushma ports. Each one is closed in `docs/development/issues/archived/` with a paired run: the repro as filed against the 3.4.1 tree, and its 3.4.2 form against this tree. The two ganita filings stay open because nothing has moved upstream.

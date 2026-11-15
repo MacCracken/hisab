@@ -53,47 +53,192 @@ public fn t2d_scale_y(t) { return load64(t + 32); }
 
 # The HVec2 point mapped by t: (c sx px - s sy py + tx, s sx px + c sy py + ty) with c, s the
 # cosine and sine of t's rotation, each component a few roundings (within about 4u of the sum of
-# its terms' magnitudes, u = 2^-53, plus sin's and cos's own errors). ⚠ It returns an HVec3,
-# (x, y, 1), the homogeneous point, not an HVec2: its x and y read through the HVec2 accessors
-# too, since an HVec2 is an HVec3's first 16 bytes (the [3.5.0] roadmap row on this, D090).
+# its terms' magnitudes, u = 2^-53, plus sin's and cos's own errors), returned as a new HVec2.
 # Returns the designed 0 where the allocation is refused.
-public fn t2d_apply(t, point) {
+# ⛔ 3.5.0 — REPLACES `t2d_apply`, WHICH RETURNED AN HVec3 (x, y, 1), the homogeneous point,
+# for a 2-D point in (roadmap [3.5.0] D090; audit 2026-04-15 L4): undocumented until 3.4.1, and
+# read back through the HVec2 accessors only because an HVec2 is an HVec3's first 16 bytes. The
+# x and y are its bits, the same arithmetic in the same order; the answer is a point of the
+# plane the transform acts on. `t2d_apply` is retired, not redefined: a caller that read its z
+# would read past a 16-byte HVec2.
+#must_use
+public fn t2d_transform_point(t, point) {
     var s = f64_sin(t2d_rotation(t));
     var c = f64_cos(t2d_rotation(t));
     var sx = t2d_scale_x(t); var sy = t2d_scale_y(t);
     var px = HVec2_x(point); var py = HVec2_y(point);
-    return hvec3_new(
+    return hvec2_new(
       f64_add(f64_sub(f64_mul(c, f64_mul(sx, px)), f64_mul(s, f64_mul(sy, py))), t2d_pos_x(t)),
-      f64_add(f64_add(f64_mul(s, f64_mul(sx, px)), f64_mul(c, f64_mul(sy, py))), t2d_pos_y(t)),
-      F64_ONE
+      f64_add(f64_add(f64_mul(s, f64_mul(sx, px)), f64_mul(c, f64_mul(sy, py))), t2d_pos_y(t))
       );
 }
 
-# The transform "a, then b": position R_b (S_b pos_a) + pos_b, rotation rot_a + rot_b, scale
-# S_a S_b (componentwise). ⚠ PRECONDITION: that is a then b only when b's scale commutes with
-# a's rotation, so b's scale is uniform (sx = sy) or a's rotation is a multiple of pi. A rotation
-# followed by a non-uniform scale is a shear, which no position-rotation-scale triple holds, and
-# outside the precondition the composite is not the two applied in turn (a: pos (0.3, -0.2),
-# rotation 0.7; then b: pos (0.5, 0.1), scale (2, 0.5): (1, 0) goes to y = 0.32 in turn and
-# 1.29 through the composite; audit F-X2, refusing or a new representation is the [3.5.0]
-# row). Within it, the composite agrees with applying a then b to rounding. Returns the
-# designed 0 where the allocation is refused.
-# [measured: docs/audit/2026-10-31-v3.4.0-full.md, F-X2]
-public fn t2d_compose(a, b) {
-    var s = f64_sin(t2d_rotation(b));
-    var c = f64_cos(t2d_rotation(b));
+# The composition's constants: the shear a position-rotation-scale triple may absorb (a cosine
+# between two columns), and -1.
+enum _TrsCompose {
+    _TRS_SHEAR_TOL = 0x3CF0_0000_0000_0000;   # 2^-48
+    _TRS_NEG_ONE   = 0xBFF0_0000_0000_0000;   # -1.0
+    _TRS_SPLIT     = 0x41A0_0000_0200_0000;   # 2^27 + 1
+}
+
+# x * 2^k, rounded once, for any integer k (mat4.cyr's `_m4_ldexp`; a module cannot call another's
+# `_` fn).
+fn _trs_ldexp(x, k) {
+    while (k > 1023) { x = f64_mul(x, (1023 + 1023) << 52); k = k - 1023; }
+    if (k >= 0) { return f64_mul(x, (1023 + k) << 52); }
+    var m = (0 - k) / 1022;
+    x = f64_mul(x, (1023 - ((0 - k) - m * 1022)) << 52);
+    while (m > 0) { x = f64_mul(x, 0x0010_0000_0000_0000); m = m - 1; }   # 2^-1022
+    return x;
+}
+
+# a f 2^k for finite a and f, with a's binary exponent moved into k before the product. The
+# compositions' scales are a's scale times a column length f taken in units of 2^-k, and a f alone
+# overflows, or reaches the subnormals and loses bits, for an a near either end of the range where
+# the answer is a normal double: a scale of 1e308 times a length of 1.9 in units of 2^-34 is +Inf
+# before the 2^-34 and 1.1e298 after it. One rounding where the answer is normal (two where it is
+# subnormal), the bits RN(a f) 2^k has wherever a f is normal; +-0 for a = +-0.
+fn _trs_mul_pow2(a, f, k) {
+    var b = a & 0x7FFF_FFFF_FFFF_FFFF;
+    if (b == 0) { return f64_mul(a, f); }
+    if ((b >> 52) == 0) {
+        a = f64_mul(a, 0x4350_0000_0000_0000);   # 2^54, exact: a subnormal a made normal
+        k = k - 54;
+        b = a & 0x7FFF_FFFF_FFFF_FFFF;
+    }
+    var m = (a & 0x800F_FFFF_FFFF_FFFF) | 0x3FF0_0000_0000_0000;   # a's significand in [1, 2), a's sign
+    return _trs_ldexp(f64_mul(m, f), k + (b >> 52) - 1023);
+}
+
+# -1, 0 or 1: the sign of x (0 for +-0 and NaN).
+fn _trs_sgn(x) {
+    if (f64_gt(x, 0) == 1) { return 1; }
+    if (f64_lt(x, 0) == 1) { return 0 - 1; }
+    return 0;
+}
+
+# The transform "a, then b" as a position-rotation-scale triple, `Ok(t)`: applied to p it is
+# b applied to a applied to p, to within the rounding below. Its position is R_b (S_b pos_a) +
+# pos_b, as through 3.4.2. Its linear part R_b S_b R_a S_a is a rotation times a diagonal scale
+# exactly when M = S_b R_a S_a has orthogonal columns, and a shear otherwise, which no triple
+# holds: `Err(HSB_ERR_INVALID_TRANSFORM)` there, where the cosine between M's two columns (both
+# non-zero) exceeds 2^-48 -- compose the matrices instead. `Err(HSB_ERR_INVALID_INPUT)` for a 0
+# handle or a NaN or infinite field, `Err(HSB_ERR_ALLOC)` where the allocation is refused.
+#   - b's scale commutes with a's rotation (sx = sy, or rot_a = +-0, or a's scale is 0 on the
+#     axis that would mix): rotation rot_a + rot_b and scale S_a S_b, 3.4.2's formula and bits.
+#   - b's scale is a mirror (sy = -sx != 0): S_b R(t) = R(-t) S_b exactly, so rotation rot_b -
+#     rot_a and scale S_a S_b.
+#   - otherwise M's columns are within 2^-48 of orthogonal (a rotation near 0 or a multiple of
+#     pi / 2, or a zero scale in a): the rotation phi of M's first non-zero column, signed to lie
+#     nearest R_a's own axis, and each scale M's column length with its sign, so the triple is
+#     rot_b + phi with those scales.
+# Accuracy, against the composite of the stored fields at 60 digits (u = 2^-53), the largest errors
+# seen, not bounds: each column of the answer's linear part within 32.2 u of the composite's,
+# relative to that column, for angles within +-4 (a larger angle sum rounds on a coarser grid, as
+# rot_a + rot_b always did: 1,024 u at 1,100 radians); the position within 2.6 u of the sum of its
+# terms' magnitudes; every Err a true cosine above 2^-48 and every Ok one at most 2^-48. The 2^-48
+# of shear a triple may absorb is itself 32 u, and a column can carry all of it (the frame takes
+# one column's direction and sets the other square to it), so a column sits up to about 32 u plus
+# rounding off: an independent sample reached 32.55 u. 3.4.2's `t2d_compose` was more than 1,000 u
+# off on 648 of the same 2,082 pairs.
+# [measured: scratch t2gen.py / t2chk.py, Decimal sin / cos, 8,000 pairs, 2 seeds, 2026-11-14; cycc 6.7.18]
+# [measured: the 3.5.0 lane L6 review's independent sample, 2026-11-14; cycc 6.7.18]
+# Every scale is a's times a column length rescaled with a's exponent set aside (`_trs_mul_pow2`):
+# at the ends of the range (a's scales within a binade of 2^+-1021, or subnormal; b's parts within
+# 2^20 of each other) the 455 Ok pairs of a 2-D and 3-D sweep are all finite and within 26.6 u,
+# where through the first review 14 overflowed to +-Inf and 98 more were past 40 u, the worst
+# 4.4e14 u (a's scale 1e308 at a quarter turn, then b's 1.1e-10: +Inf for 1.1e298).
+# [measured: scratch ends_all.py (Decimal / Fraction oracles), first review tree and this one, 6 seeds, 2026-11-14]
+# Cost: a commuting pair 208 -> 290 ns (+39%) against 3.4.2's `t2d_compose` (the finiteness tests,
+# the commuting test, the Result); the general path about 300 ns.
+# [measured: scratch bench/ab.cyr, 3.4.2 and this tree interleaved x 6, taskset, 2026-11-14; noisy, 8 lanes]
+# ⛔ 3.5.0 — REPLACES `t2d_compose` (roadmap [3.5.0] F-X2), WHICH RETURNED (rot_a + rot_b, S_a S_b)
+# FOR EVERY PAIR: a rotation followed by a non-uniform scale is a shear, and through the composite
+# a: (pos (0.3, -0.2), rot 0.7), b: (pos (0.5, 0.1), scale (2, 0.5)) took (1, 0) to y =
+# 3FF49D6E694619B8 where a then b gives 3FD49D6E694619B8, four times too large; and a quarter
+# turn before (2, 0.5), which IS a triple, came back with its scales unswapped. Retired, not
+# redefined: the same pair now has an Err.
+#must_use
+public fn t2d_compose_checked(a, b) {
+    if (a == 0 || b == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_trs_all_finite(a, 5) + _trs_all_finite(b, 5) != 2) { return Err(HSB_ERR_INVALID_INPUT); }
+    var sn = f64_sin(t2d_rotation(b));
+    var cs = f64_cos(t2d_rotation(b));
     var bsx = t2d_scale_x(b); var bsy = t2d_scale_y(b);
     var ax = t2d_pos_x(a); var ay = t2d_pos_y(a);
-    var rx = f64_add(f64_sub(f64_mul(c, f64_mul(ax, bsx)), f64_mul(s, f64_mul(ay, bsy))), t2d_pos_x(b));
-    var ry = f64_add(f64_add(f64_mul(s, f64_mul(ax, bsx)), f64_mul(c, f64_mul(ay, bsy))), t2d_pos_y(b));
+    var rx = f64_add(f64_sub(f64_mul(cs, f64_mul(ax, bsx)), f64_mul(sn, f64_mul(ay, bsy))), t2d_pos_x(b));
+    var ry = f64_add(f64_add(f64_mul(sn, f64_mul(ax, bsx)), f64_mul(cs, f64_mul(ay, bsy))), t2d_pos_y(b));
+    var ta = t2d_rotation(a);
+    var asx = t2d_scale_x(a); var asy = t2d_scale_y(a);
+    var rot = 0;
+    var osx = 0;
+    var osy = 0;
+    var za = 0;
+    if (f64_eq(ta, 0) == 1) { za = 1; }
+    if ((f64_eq(bsx, bsy) == 1 || za == 1 || f64_eq(asy, 0) == 1)
+      && (f64_eq(bsx, bsy) == 1 || za == 1 || f64_eq(asx, 0) == 1)) {
+        rot = f64_add(ta, t2d_rotation(b));
+        osx = f64_mul(asx, bsx);
+        osy = f64_mul(asy, bsy);
+    } elif (f64_eq(bsy, f64_neg(bsx)) == 1) {
+        rot = f64_sub(t2d_rotation(b), ta);
+        osx = f64_mul(asx, bsx);
+        osy = f64_mul(asy, bsy);
+    } else {
+        # b's scale over a common power of two, its larger part in [1, 2) ([2^-51, 1) when it is
+        # subnormal): u0 = (s0 c, s1 s) and
+        # u1 = (-s0 s, s1 c) are M's columns without a's scales, in that scale.
+        var mb = bsx & 0x7FFF_FFFF_FFFF_FFFF;
+        if ((bsy & 0x7FFF_FFFF_FFFF_FFFF) > mb) { mb = bsy & 0x7FFF_FFFF_FFFF_FFFF; }
+        var p = 1023 - (mb >> 52);
+        var s0 = _trs_ldexp(bsx, p);
+        var s1 = _trs_ldexp(bsy, p);
+        var c = f64_cos(ta);
+        var s = f64_sin(ta);
+        var n0 = ganita_f64_hypot(f64_mul(s0, c), f64_mul(s1, s));
+        var n1 = ganita_f64_hypot(f64_mul(s0, s), f64_mul(s1, c));
+        if (f64_eq(asx, 0) == 0 && f64_eq(asy, 0) == 0 && f64_eq(n0, 0) == 0 && f64_eq(n1, 0) == 0) {
+            # u0 . u1 / (|u0| |u1|) = (s / |u0|) (c / |u1|) (s1 - s0) (s1 + s0), each factor relatively
+            # accurate and the product of the first two at most 1 (|u0| >= |s1 s|, |s0 c| and |u1| >=
+            # |s0 s|, |s1 c|), where s c alone, or |u0| |u1|, can flush
+            var dt = f64_mul(f64_mul(f64_div(s, n0), f64_div(c, n1)), f64_mul(f64_sub(s1, s0), f64_add(s1, s0)));
+            if (f64_le(f64_abs(dt), _TRS_SHEAR_TOL) == 0) {
+                return Err(HSB_ERR_INVALID_TRANSFORM);
+            }
+        }
+        if (f64_eq(asx, 0) == 0 && f64_eq(n0, 0) == 0) {
+            # R' e0 = g u0 / |u0|, g = +-1 the sign that keeps it on R_a's side: g (u0 . (c, s)) > 0
+            var g = _trs_sgn(f64_add(f64_mul(s0, f64_mul(c, c)), f64_mul(s1, f64_mul(s, s))));
+            if (g == 0) { g = 1; }
+            var gf = F64_ONE;
+            if (g < 0) { gf = _TRS_NEG_ONE; }
+            var ph0 = ganita_f64_atan2(f64_mul(gf, f64_mul(s1, s)), f64_mul(gf, f64_mul(s0, c)));
+            rot = f64_add(t2d_rotation(b), ph0);
+            osx = _trs_mul_pow2(asx, f64_mul(gf, n0), 0 - p);
+            # u1 . R' e1 = g det(u0, u1) / |u0| = g s0 s1 / |u0|: its sign is the second scale's
+            var h = g * _trs_sgn(f64_mul(s0, s1));
+            osy = _trs_mul_pow2(asy, n1, 0 - p);
+            if (h < 0) { osy = osy ^ 0x8000_0000_0000_0000; }   # the sign bit (f64_neg: +0 below cycc 6.6.8)
+        } else {
+            # the first column is zero: R' e1 = g u1 / |u1|, g (u1 . (-s, c)) > 0
+            var g1 = _trs_sgn(f64_add(f64_mul(s0, f64_mul(s, s)), f64_mul(s1, f64_mul(c, c))));
+            if (g1 == 0) { g1 = 1; }
+            var gf1 = F64_ONE;
+            if (g1 < 0) { gf1 = _TRS_NEG_ONE; }
+            var ph1 = ganita_f64_atan2(f64_mul(gf1, f64_mul(s0, s)), f64_mul(gf1, f64_mul(s1, c)));
+            rot = f64_add(t2d_rotation(b), ph1);
+            osy = _trs_mul_pow2(asy, f64_mul(gf1, n1), 0 - p);
+            osx = _trs_mul_pow2(asx, n0, 0 - p);
+        }
+    }
     var t = hisab_alloc(40);
-    if (t == 0) { return 0; }
+    if (t == 0) { return Err(HSB_ERR_ALLOC); }
     store64(t, rx);
     store64(t + 8, ry);
-    store64(t + 16, f64_add(t2d_rotation(a), t2d_rotation(b)));
-    store64(t + 24, f64_mul(t2d_scale_x(a), bsx));
-    store64(t + 32, f64_mul(t2d_scale_y(a), bsy));
-    return t;
+    store64(t + 16, rot);
+    store64(t + 24, osx);
+    store64(t + 32, osy);
+    return Ok(t);
 }
 
 # ================================================================
@@ -169,27 +314,428 @@ public fn t3d_inverse_matrix_checked(t) {
     return m4_inverse_checked(m);
 }
 
-# The transform "a, then b": position R_b (S_b pos_a) + pos_b, rotation q_b q_a (`hquat_mul`:
-# a's rotation first), scale S_b S_a (componentwise), new objects. ⚠ PRECONDITION: that is a
-# then b only when b's scale commutes with a's rotation: b's scale uniform, or a's rotation the
-# identity, a half turn about a coordinate axis, or a rotation about a coordinate axis along
-# which b's scale is the odd one out (about z with b's scale (s, s, t)). A rotation followed by
-# a non-uniform scale is a shear, which no position-rotation-scale triple holds: outside the
-# precondition the composite is not the two applied in turn (audit F-X2: 50 random pairs up to
-# 2.84 off, where uniform scales stayed within 3.6e-15; `m4_mul` of the two matrices is right
-# there; refusing or a new representation is the [3.5.0] row). Within it the composite agrees
-# with applying a then b to rounding. Returns the designed 0 where an allocation is refused.
-# [measured: docs/audit/2026-10-31-v3.4.0-full.md, F-X2]
-public fn t3d_compose(a, b) {
-    var scaled_pos = hvec3_mul(t3d_scale(b), t3d_pos(a));
-    if (scaled_pos == 0) { return 0; }
-    var rotated_pos = hquat_rotate_vec3(t3d_rot(b), scaled_pos);
-    if (rotated_pos == 0) { return 0; }
-    return _t3d_of(
-      hvec3_add(rotated_pos, t3d_pos(b)),
-      hquat_mul(t3d_rot(b), t3d_rot(a)),
-      hvec3_mul(t3d_scale(b), t3d_scale(a))
-      );
+# The error-free transformations `t3d_compose_checked` forms R_a's entries with (vec3.cyr's
+# `_hvec3_mul_err` and `_hvec3_add_err`: a module cannot call another's `_` fn). The e with
+# a * b = p + e exactly for p = RN(a * b) (Dekker, a 2^27 + 1 split, no FMA), while nothing
+# overflows or reaches the subnormals.
+fn _trs_mul_err(a, b, p) {
+    var t = f64_mul(a, _TRS_SPLIT);
+    var ah = f64_sub(t, f64_sub(t, a));
+    var al = f64_sub(a, ah);
+    var u = f64_mul(b, _TRS_SPLIT);
+    var bh = f64_sub(u, f64_sub(u, b));
+    var bl = f64_sub(b, bh);
+    return f64_add(f64_add(f64_add(f64_sub(f64_mul(ah, bh), p), f64_mul(ah, bl)), f64_mul(al, bh)),
+      f64_mul(al, bl));
+}
+
+# The e with a + b = s + e exactly for s = RN(a + b) (Knuth's two-sum).
+fn _trs_add_err(a, b, s) {
+    var bb = f64_sub(s, a);
+    return f64_add(f64_sub(a, f64_sub(s, bb)), f64_sub(b, bb));
+}
+
+# k1 a b + k2 c d + k3 e f + k4 g h for signs k = +-1 (the bits of ks, 1 for minus: bit 0 for the
+# first product), summed in double-double and rounded once more: within a few u of the exact
+# value, relative, wherever the products are exact as hi + lo (`_trs_mul_err`).
+fn _trs_dot4(w, ks) {
+    var hi = 0;
+    var lo = 0;
+    var i = 0;
+    while (i < 4) {
+        var a = load64(w + i * 16);
+        var b = load64(w + i * 16 + 8);
+        if (((ks >> i) & 1) == 1) { a = a ^ 0x8000_0000_0000_0000; }
+        var p = f64_mul(a, b);
+        var e = _trs_mul_err(a, b, p);
+        var s = f64_add(hi, p);
+        lo = f64_add(lo, f64_add(_trs_add_err(hi, p, s), e));
+        hi = s;
+        i = i + 1;
+    }
+    return f64_add(hi, lo);
+}
+
+# Store the four products' factors for `_trs_dot4` at w.
+fn _trs_put4(w, a, b, c, d, e, f, g, h) {
+    store64(w, a); store64(w + 8, b); store64(w + 16, c); store64(w + 24, d);
+    store64(w + 32, e); store64(w + 40, f); store64(w + 48, g); store64(w + 56, h);
+    return w;
+}
+
+# R(q)'s nine entries, row i column j at r[3 i + j], for a finite non-zero q scaled so its largest
+# component is in [1, 2) ([2^-51, 1) when it is subnormal): N(q) / |q|^2 with each entry of N, the
+# quaternion's quadratic forms, summed by `_trs_dot4`, so an entry that cancels (a near-axis
+# rotation) keeps its relative accuracy. Returns 0.
+fn _trs_rot_rel(q, r) {
+    var mq = 0;
+    var i = 0;
+    while (i < 4) {
+        var c = load64(q + i * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (c > mq) { mq = c; }
+        i = i + 1;
+    }
+    var p = 1023 - (mq >> 52);
+    var x = _trs_ldexp(HQuat_x(q), p); var y = _trs_ldexp(HQuat_y(q), p);
+    var z = _trs_ldexp(HQuat_z(q), p); var w = _trs_ldexp(HQuat_w(q), p);
+    var n = f64_add(f64_add(f64_mul(x, x), f64_mul(y, y)), f64_add(f64_mul(z, z), f64_mul(w, w)));
+    var t: i64[8];
+    var tn = f64_div(F64_TWO, n);
+    store64(r, f64_div(_trs_dot4(_trs_put4(&t, w, w, x, x, y, y, z, z), 12), n));
+    store64(r + 8, f64_mul(_trs_dot4(_trs_put4(&t, x, y, w, z, 0, 0, 0, 0), 2), tn));
+    store64(r + 16, f64_mul(_trs_dot4(_trs_put4(&t, x, z, w, y, 0, 0, 0, 0), 0), tn));
+    store64(r + 24, f64_mul(_trs_dot4(_trs_put4(&t, x, y, w, z, 0, 0, 0, 0), 0), tn));
+    store64(r + 32, f64_div(_trs_dot4(_trs_put4(&t, w, w, y, y, x, x, z, z), 12), n));
+    store64(r + 40, f64_mul(_trs_dot4(_trs_put4(&t, y, z, w, x, 0, 0, 0, 0), 2), tn));
+    store64(r + 48, f64_mul(_trs_dot4(_trs_put4(&t, x, z, w, y, 0, 0, 0, 0), 2), tn));
+    store64(r + 56, f64_mul(_trs_dot4(_trs_put4(&t, y, z, w, x, 0, 0, 0, 0), 0), tn));
+    store64(r + 64, f64_div(_trs_dot4(_trs_put4(&t, w, w, z, z, x, x, y, y), 12), n));
+    return 0;
+}
+
+# 1 when b's scale s commutes with R(q) on a's live columns, decided from zero factors alone: entry
+# (i, k) of R(q) is a difference or sum of two products of q's components, and both have a zero
+# factor (an axis rotation, the identity), so (s_i - s_k) R_ik a_k = 0 for every i != k. Never 1
+# where they do not commute; a commuting pair it misses (R_ik = 0 with every factor non-zero) takes
+# the general path, which answers it too.
+fn _trs_commutes(q, s, a) {
+    if (f64_eq(load64(s), load64(s + 8)) + f64_eq(load64(s + 8), load64(s + 16)) == 2) { return 1; }
+    var x = HQuat_x(q); var y = HQuat_y(q); var z = HQuat_z(q); var w = HQuat_w(q);
+    var z01 = 0;
+    var z02 = 0;
+    var z12 = 0;
+    if ((f64_eq(x, 0) == 1 || f64_eq(y, 0) == 1) && (f64_eq(w, 0) == 1 || f64_eq(z, 0) == 1)) { z01 = 1; }
+    if ((f64_eq(x, 0) == 1 || f64_eq(z, 0) == 1) && (f64_eq(w, 0) == 1 || f64_eq(y, 0) == 1)) { z02 = 1; }
+    if ((f64_eq(y, 0) == 1 || f64_eq(z, 0) == 1) && (f64_eq(w, 0) == 1 || f64_eq(x, 0) == 1)) { z12 = 1; }
+    var i = 0;
+    while (i < 3) {
+        var k = i + 1;
+        while (k < 3) {
+            var zz = z12;
+            if (i == 0 && k == 1) { zz = z01; }
+            if (i == 0 && k == 2) { zz = z02; }
+            if (f64_eq(load64(s + i * 8), load64(s + k * 8)) == 0 && zz == 0) {
+                if (f64_eq(load64(a + i * 8), 0) == 0 || f64_eq(load64(a + k * 8), 0) == 0) { return 0; }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# The unit quaternion of the rotation matrix whose row i, column j is r[3 i + j] (Shepperd's
+# method: the largest of 1 + trace and the 1 + 2 R_kk - trace forms under the root), written to o.
+fn _trs_quat_of(r, o) {
+    var r00 = load64(r); var r01 = load64(r + 8); var r02 = load64(r + 16);
+    var r10 = load64(r + 24); var r11 = load64(r + 32); var r12 = load64(r + 40);
+    var r20 = load64(r + 48); var r21 = load64(r + 56); var r22 = load64(r + 64);
+    var tr = f64_add(f64_add(r00, r11), r22);
+    var x = 0; var y = 0; var z = 0; var w = 0;
+    if (f64_ge(tr, r00) == 1 && f64_ge(tr, r11) == 1 && f64_ge(tr, r22) == 1) {
+        w = f64_mul(f64_sqrt(f64_add(F64_ONE, tr)), F64_HALF);
+        var f = f64_div(F64_HALF, f64_mul(F64_TWO, w));
+        x = f64_mul(f64_sub(r21, r12), f); y = f64_mul(f64_sub(r02, r20), f); z = f64_mul(f64_sub(r10, r01), f);
+    } elif (f64_ge(r00, r11) == 1 && f64_ge(r00, r22) == 1) {
+        x = f64_mul(f64_sqrt(f64_add(F64_ONE, f64_sub(f64_sub(r00, r11), r22))), F64_HALF);
+        var f1 = f64_div(F64_HALF, f64_mul(F64_TWO, x));
+        w = f64_mul(f64_sub(r21, r12), f1); y = f64_mul(f64_add(r01, r10), f1); z = f64_mul(f64_add(r02, r20), f1);
+    } elif (f64_ge(r11, r22) == 1) {
+        y = f64_mul(f64_sqrt(f64_add(F64_ONE, f64_sub(f64_sub(r11, r00), r22))), F64_HALF);
+        var f2 = f64_div(F64_HALF, f64_mul(F64_TWO, y));
+        w = f64_mul(f64_sub(r02, r20), f2); x = f64_mul(f64_add(r01, r10), f2); z = f64_mul(f64_add(r12, r21), f2);
+    } else {
+        z = f64_mul(f64_sqrt(f64_add(F64_ONE, f64_sub(f64_sub(r22, r00), r11))), F64_HALF);
+        var f3 = f64_div(F64_HALF, f64_mul(F64_TWO, z));
+        w = f64_mul(f64_sub(r10, r01), f3); x = f64_mul(f64_add(r02, r20), f3); y = f64_mul(f64_add(r12, r21), f3);
+    }
+    HQuat_set_x(o, x); HQuat_set_y(o, y); HQuat_set_z(o, z); HQuat_set_w(o, w);
+    return o;
+}
+
+# 1 when every component of the n doubles at p is finite (an exponent field short of all ones).
+fn _trs_all_finite(p, n) {
+    var i = 0;
+    while (i < n) {
+        if ((load64(p + i * 8) & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# R_a's column k dotted with the 3-vector at c (`_trs_compose_general`).
+fn _trs_coldot(r, k, c) {
+    var s = f64_add(f64_mul(load64(r + k * 8), load64(c)), f64_mul(load64(r + (3 + k) * 8), load64(c + 8)));
+    return f64_add(s, f64_mul(load64(r + (6 + k) * 8), load64(c + 16)));
+}
+
+# Column l of the column-major 3x3 at c becomes column i x column j; returns 0.
+fn _trs_cross_col(c, i, j, l) {
+    var a = c + i * 24;
+    var b = c + j * 24;
+    var x = f64_sub(f64_mul(load64(a + 8), load64(b + 16)), f64_mul(load64(a + 16), load64(b + 8)));
+    var y = f64_sub(f64_mul(load64(a + 16), load64(b)), f64_mul(load64(a), load64(b + 16)));
+    var z = f64_sub(f64_mul(load64(a), load64(b + 8)), f64_mul(load64(a + 8), load64(b)));
+    store64(c + l * 24, x);
+    store64(c + l * 24 + 8, y);
+    store64(c + l * 24 + 16, z);
+    return 0;
+}
+
+# det of the column-major 3x3 at c: column 0 dotted with column 1 x column 2.
+fn _trs_det3(c) {
+    var x = f64_sub(f64_mul(load64(c + 32), load64(c + 64)), f64_mul(load64(c + 40), load64(c + 56)));
+    var y = f64_sub(f64_mul(load64(c + 40), load64(c + 48)), f64_mul(load64(c + 24), load64(c + 64)));
+    var z = f64_sub(f64_mul(load64(c + 24), load64(c + 56)), f64_mul(load64(c + 32), load64(c + 48)));
+    return f64_add(f64_add(f64_mul(load64(c), x), f64_mul(load64(c + 8), y)), f64_mul(load64(c + 16), z));
+}
+
+# `t3d_compose_checked`'s general path: M = S_b R_a S_a's columns, without a's scales and with b's
+# over a power of two 2^e (its largest part in [1, 2), or [2^-51, 1) when subnormal),
+# u_k = (s_0 R_0k, s_1 R_1k, s_2 R_2k) / 2^e;
+# Err where two live columns (a_k != 0, u_k != 0) meet at a cosine past 2^-48, else the rotation R'
+# whose column k is g_k u_k / |u_k| (g_k = +-1, the sign that keeps it on R_a's side of the plane
+# normal to R_a e_k), completed from R_a's own columns where a column is dead, and the scales
+# a_k g_k |u_k| 2^e. Writes the rotation (a unit quaternion on qa's side) to oq and the scale to
+# os; returns 0 or the Err code.
+fn _trs_compose_general(qa, sb, sa, oq, os) {
+    var r: i64[9];
+    _trs_rot_rel(qa, &r);
+    var mb = 0;
+    var i = 0;
+    while (i < 3) {
+        var c = load64(sb + i * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (c > mb) { mb = c; }
+        i = i + 1;
+    }
+    var p = 1023 - (mb >> 52);
+    var sg: i64[3];
+    i = 0;
+    while (i < 3) { store64(&sg + i * 8, _trs_ldexp(load64(sb + i * 8), p)); i = i + 1; }
+    # u[3 k + i] = sg_i R_ik; nu[k] = |u_k|; live[k]
+    var u: i64[9];
+    var nu: i64[3];
+    var live: i64[3];
+    var k = 0;
+    while (k < 3) {
+        i = 0;
+        while (i < 3) {
+            store64(&u + (k * 3 + i) * 8, f64_mul(load64(&sg + i * 8), load64(&r + (i * 3 + k) * 8)));
+            i = i + 1;
+        }
+        store64(&nu + k * 8, hvec3_length(&u + k * 24));
+        store64(&live + k * 8, 0);
+        if (f64_eq(load64(sa + k * 8), 0) == 0 && f64_eq(load64(&nu + k * 8), 0) == 0) { store64(&live + k * 8, 1); }
+        k = k + 1;
+    }
+    # R' columns c[3 k + i] = g_k u_k / |u_k| for the live columns, g_k = +-1 (below)
+    var cc: i64[9];
+    var g: i64[3];
+    var al: i64[3];   # |u_k . R_a e_k| / |u_k|: how near R_a's own axis column k lies
+    k = 0;
+    while (k < 3) {
+        store64(&g + k * 8, F64_ONE);
+        store64(&al + k * 8, 0);
+        if (load64(&live + k * 8) == 1) {
+            i = 0;
+            while (i < 3) {
+                store64(&cc + (k * 3 + i) * 8, f64_div(load64(&u + (k * 3 + i) * 8), load64(&nu + k * 8)));
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    # the cosine between every two live columns, on the normalised ones (a dot product of the
+    # columns themselves can flush where both are small): within 2^-48 of 0, or no triple holds
+    # the map
+    var j = 0;
+    while (j < 3) {
+        k = j + 1;
+        while (k < 3) {
+            if (load64(&live + j * 8) + load64(&live + k * 8) == 2) {
+                var cs = f64_add(f64_add(f64_mul(load64(&cc + j * 24), load64(&cc + k * 24)),
+                    f64_mul(load64(&cc + j * 24 + 8), load64(&cc + k * 24 + 8))),
+                  f64_mul(load64(&cc + j * 24 + 16), load64(&cc + k * 24 + 16)));
+                if (f64_le(f64_abs(cs), _TRS_SHEAR_TOL) == 0) { return HSB_ERR_INVALID_TRANSFORM; }
+            }
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+    # g_k: the sign that keeps column k on R_a's side of the plane normal to R_a e_k
+    k = 0;
+    while (k < 3) {
+        if (load64(&live + k * 8) == 1) {
+            var ax = _trs_coldot(&r, k, &cc + k * 24);
+            if (f64_lt(ax, 0) == 1) {
+                store64(&g + k * 8, _TRS_NEG_ONE);
+                i = 0;
+                while (i < 3) {
+                    store64(&cc + (k * 3 + i) * 8, load64(&cc + (k * 3 + i) * 8) ^ 0x8000_0000_0000_0000);
+                    i = i + 1;
+                }
+            }
+            store64(&al + k * 8, f64_abs(ax));
+        }
+        k = k + 1;
+    }
+    # Dead columns (a_k = 0 or u_k = 0: scale 0, any direction serves). Two live columns: the
+    # third is their cross product, right-handed. One: of R_a's two other columns, the one less
+    # aligned with it (its squared cosine is at most 1/2, since the two are orthonormal), made
+    # orthogonal to it, then the cross product. None: R_a's columns.
+    var nl = load64(&live) + load64(&live + 8) + load64(&live + 16);
+    if (nl == 0) {
+        k = 0;
+        while (k < 3) {
+            i = 0;
+            while (i < 3) { store64(&cc + (k * 3 + i) * 8, load64(&r + (i * 3 + k) * 8)); i = i + 1; }
+            k = k + 1;
+        }
+    }
+    if (nl == 1) {
+        var lj = 0;
+        while (load64(&live + lj * 8) == 0) { lj = lj + 1; }
+        var k1 = (lj + 1) % 3;
+        var k2 = (lj + 2) % 3;
+        var p1 = _trs_coldot(&r, k1, &cc + lj * 24);
+        var p2 = _trs_coldot(&r, k2, &cc + lj * 24);
+        var km = k1;
+        var pm = p1;
+        if (f64_lt(f64_abs(p2), f64_abs(p1)) == 1) { km = k2; pm = p2; }
+        var v: i64[3];
+        i = 0;
+        while (i < 3) {
+            store64(&v + i * 8, f64_sub(load64(&r + (i * 3 + km) * 8), f64_mul(pm, load64(&cc + (lj * 3 + i) * 8))));
+            i = i + 1;
+        }
+        var vn = hvec3_length(&v);
+        i = 0;
+        while (i < 3) { store64(&cc + (km * 3 + i) * 8, f64_div(load64(&v + i * 8), vn)); i = i + 1; }
+        if (km == k1) { _trs_cross_col(&cc, lj, k1, k2); } else { _trs_cross_col(&cc, k2, lj, k1); }
+    }
+    if (nl == 2) {
+        var ld = 0;
+        while (load64(&live + ld * 8) == 1) { ld = ld + 1; }
+        _trs_cross_col(&cc, (ld + 1) % 3, (ld + 2) % 3, ld);
+    }
+    # three live columns: right-handed, or the one least tied to R_a's axis flips (its scale too)
+    if (nl == 3) {
+        var d0 = _trs_det3(&cc);
+        if (f64_lt(d0, 0) == 1) {
+            var kf = 0;
+            k = 1;
+            while (k < 3) {
+                if (f64_lt(load64(&al + k * 8), load64(&al + kf * 8)) == 1) { kf = k; }
+                k = k + 1;
+            }
+            store64(&g + kf * 8, load64(&g + kf * 8) ^ 0x8000_0000_0000_0000);
+            i = 0;
+            while (i < 3) {
+                store64(&cc + (kf * 3 + i) * 8, load64(&cc + (kf * 3 + i) * 8) ^ 0x8000_0000_0000_0000);
+                i = i + 1;
+            }
+        }
+    }
+    # the matrix R' (row i, column k) to a quaternion, signed to qa's side
+    var rm: i64[9];
+    i = 0;
+    while (i < 3) {
+        k = 0;
+        while (k < 3) { store64(&rm + (i * 3 + k) * 8, load64(&cc + (k * 3 + i) * 8)); k = k + 1; }
+        i = i + 1;
+    }
+    _trs_quat_of(&rm, oq);
+    var dq = f64_add(f64_add(f64_mul(HQuat_x(oq), HQuat_x(qa)), f64_mul(HQuat_y(oq), HQuat_y(qa))),
+      f64_add(f64_mul(HQuat_z(oq), HQuat_z(qa)), f64_mul(HQuat_w(oq), HQuat_w(qa))));
+    if (f64_lt(dq, 0) == 1) {
+        i = 0;
+        while (i < 4) { store64(oq + i * 8, load64(oq + i * 8) ^ 0x8000_0000_0000_0000); i = i + 1; }
+    }
+    k = 0;
+    while (k < 3) {
+        var sk = _trs_mul_pow2(load64(sa + k * 8), f64_mul(load64(&g + k * 8), load64(&nu + k * 8)), 0 - p);
+        store64(os + k * 8, sk);
+        k = k + 1;
+    }
+    return 0;
+}
+
+# The transform "a, then b" as a new position-rotation-scale triple, `Ok(t)` (three new objects
+# and the transform): applied to p it is b applied to a applied to p, to within the rounding
+# below. Its position is R_b (S_b pos_a) + pos_b, 3.4.2's bits. Its linear part R_b S_b R_a S_a is
+# a rotation times a diagonal scale exactly when M = S_b R_a S_a has orthogonal columns, and a
+# shear otherwise, which no triple holds: `Err(HSB_ERR_INVALID_TRANSFORM)` there, where the cosine
+# between two of M's non-zero columns exceeds 2^-48 -- compose the matrices instead,
+# `m4_mul(t3d_to_matrix(b), t3d_to_matrix(a))`. `Err(HSB_ERR_INVALID_INPUT)` for a 0 handle (the
+# transform or a part), a NaN or infinite component, or a zero quaternion (no rotation);
+# `Err(HSB_ERR_ALLOC)` where an allocation is refused.
+#   - b's scale commutes with R_a on a's non-zero scales, decided from q_a's zero components (b's
+#     scale uniform, a's rotation the identity or about a coordinate axis b's scale treats alike):
+#     rotation q_b q_a and scale S_b S_a, 3.4.2's formula and bits.
+#   - otherwise, where the columns are within 2^-48 of orthogonal (a quarter turn before a
+#     non-uniform scale, a mirror scale, a rotation within rounding of one of those, a zero scale
+#     in a): R_a's entries formed with each one relatively accurate (`_trs_rot_rel`), the rotation
+#     R' of M's normalised columns, each signed to lie on R_a's side, and the scales the columns'
+#     lengths with those signs; the rotation q_b q' with q' the quaternion of R' (Shepperd's
+#     method) on q_a's side.
+# Accuracy, against the exact rational composite R(q_b) S_b R(q_a) S_a (R(q) = N(q) / |q|^2 is
+# rational in q's components; u = 2^-53), the largest errors seen, not bounds: each column of the
+# answer's linear part within 22.9 u of the composite's, relative to that column; the position
+# within 8.2 u of its terms' magnitudes (`hquat_rotate_vec3`'s 22 u bound); every Err a true cosine
+# above 2^-48 and every Ok one at most 2^-48. The 2^-48 of shear a triple may absorb is itself
+# 32 u, so a column can sit about that far off plus rounding: an independent sample reached
+# 24.90 u. 3.4.2's `t3d_compose` was more than 1,000 u off on 1,601 of 3,000 such pairs.
+# ⚠ The columns are formed in doubles: where b's scale components span more than about 2^1000,
+# a column made only of the small ones can flush and the cosine is not certified. a's scales do
+# not count against that span: each enters its column's scale with its exponent set aside
+# (`_trs_mul_pow2`, the range-end sweep in `t2d_compose_checked`'s doc: 3-D within 6.0 u there).
+# [measured: scratch t3gen.py / t3chk.py, Fraction oracle, 12,000 pairs, 4 seeds, 2026-11-14; cycc 6.7.18]
+# [measured: the 3.5.0 lane L6 review's independent sample, 2026-11-14; cycc 6.7.18]
+# Cost: a uniform b 452 -> 588 ns (+30%) against 3.4.2's `t3d_compose`; the general path about
+# 2 us (tests/hisab.bcyr's rows).
+# [measured: scratch bench/ab.cyr, 3.4.2 and this tree interleaved x 6, taskset, 2026-11-14; noisy, 8 lanes]
+# ⛔ 3.5.0 — REPLACES `t3d_compose` (roadmap [3.5.0] F-X2), WHICH RETURNED (q_b q_a, S_b S_a) FOR
+# EVERY PAIR: 50 random pairs were up to 2.84 off where `m4_mul` of the matrices is right, and a
+# quarter turn before (2, 1/2, 1), which IS a triple, came back with its scales unswapped. Retired,
+# not redefined: a shear now has an Err.
+#must_use
+public fn t3d_compose_checked(a, b) {
+    if (a == 0 || b == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var pa = t3d_pos(a); var qa = t3d_rot(a); var sa = t3d_scale(a);
+    var pb = t3d_pos(b); var qb = t3d_rot(b); var sb = t3d_scale(b);
+    if (pa == 0 || qa == 0 || sa == 0 || pb == 0 || qb == 0 || sb == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_trs_all_finite(pa, 3) + _trs_all_finite(sa, 3) + _trs_all_finite(pb, 3) + _trs_all_finite(sb, 3)
+      + _trs_all_finite(qa, 4) + _trs_all_finite(qb, 4) != 6) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (((HQuat_x(qa) | HQuat_y(qa) | HQuat_z(qa) | HQuat_w(qa)) & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        return Err(HSB_ERR_INVALID_INPUT);
+    }
+    if (((HQuat_x(qb) | HQuat_y(qb) | HQuat_z(qb) | HQuat_w(qb)) & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        return Err(HSB_ERR_INVALID_INPUT);
+    }
+    var sp: i64[3];
+    store64(&sp, f64_mul(HVec3_x(sb), HVec3_x(pa)));
+    store64(&sp + 8, f64_mul(HVec3_y(sb), HVec3_y(pa)));
+    store64(&sp + 16, f64_mul(HVec3_z(sb), HVec3_z(pa)));
+    hquat_rotate_vec3_into(&sp, qb, &sp);
+    var pos = hvec3_add(&sp, pb);
+    if (pos == 0) { return Err(HSB_ERR_ALLOC); }
+    var rot = 0;
+    var sc = 0;
+    if (_trs_commutes(qa, sb, sa) == 1) {
+        rot = hquat_mul(qb, qa);
+        sc = hvec3_mul(sb, sa);
+    } else {
+        var q1: i64[4];
+        var s1: i64[3];
+        var rc = _trs_compose_general(qa, sb, sa, &q1, &s1);
+        if (rc != 0) { return Err(rc); }
+        rot = hquat_mul(qb, &q1);
+        sc = hvec3_new(load64(&s1), load64(&s1 + 8), load64(&s1 + 16));
+    }
+    if (rot == 0 || sc == 0) { return Err(HSB_ERR_ALLOC); }
+    var t = t3d_new(pos, rot, sc);
+    if (t == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(t);
 }
 
 # Interpolate between two 3D transforms: positions and scales by `hvec3_lerp` (finite wherever
@@ -318,17 +864,17 @@ public fn hquat_from_euler(x, y, z, order) {
 # ================================================================
 
 # m with its column 2 negated, m diag(1, 1, -1, 1): the same map with the input's z axis
-# reversed, which converts between right- and left-handed coordinates. Exact, a sign flip per
-# entry (`f64_neg`; below cycc 6.6.8 it gave +0 for +0). Returns the designed 0 where the
-# allocation is refused.
+# reversed, which converts between right- and left-handed coordinates. Exact, a flip of each
+# entry's sign bit, -0 for +0 on every pin (3.5.0: `f64_neg` gave +0 for +0 below cycc 6.6.8, which
+# the bundle's 6.6.3 floor admits). Returns the designed 0 where the allocation is refused.
 public fn m4_flip_handedness_z(m) {
     var r = m4_copy(m);
     if (r == 0) { return 0; }
     # Negate column 2
-    m4_set(r, 2, 0, f64_neg(m4_get(m, 2, 0)));
-    m4_set(r, 2, 1, f64_neg(m4_get(m, 2, 1)));
-    m4_set(r, 2, 2, f64_neg(m4_get(m, 2, 2)));
-    m4_set(r, 2, 3, f64_neg(m4_get(m, 2, 3)));
+    m4_set(r, 2, 0, m4_get(m, 2, 0) ^ 0x8000_0000_0000_0000);
+    m4_set(r, 2, 1, m4_get(m, 2, 1) ^ 0x8000_0000_0000_0000);
+    m4_set(r, 2, 2, m4_get(m, 2, 2) ^ 0x8000_0000_0000_0000);
+    m4_set(r, 2, 3, m4_get(m, 2, 3) ^ 0x8000_0000_0000_0000);
     return r;
 }
 
@@ -340,6 +886,8 @@ public fn m4_flip_handedness_z(m) {
 enum _T3dW {
     _T3D_W_LO   = 0x03F0_0000_0000_0000;   # 2^-960
     _T3D_W_CERT = 0x4130_0000_0000_0000;   # 2^20
+    _T3D_NDC_NEAR = 0xBFF0_0000_0000_0000;   # -1.0
+    _T3D_NDC_FAR_IN = 0x3FEF_FFFF_FF00_0000; # 1 - 2^-29
 }
 
 # clip * 2^s for `world_to_screen`'s finite non-zero w whose 1/w is not normal: mat4.cyr's
@@ -354,12 +902,18 @@ fn _t3d_clip_w_scaled(clip) {
     return r;
 }
 
+# The NDC z range of a projection, for `world_to_screen_checked`'s depth (3.5.0): GL's [-1, 1]
+# (`m4_perspective_rh`, `m4_ortho_rh`) or [0, 1] (Direct3D, Vulkan, `m4_perspective_reverse_z`).
+public enum NdcDepthRange { NDC_Z_MINUS_ONE_TO_ONE = 0; NDC_Z_ZERO_TO_ONE = 1; }
+
 # The screen position of `point` through `mvp` on a vw x vh viewport, (screen_x, screen_y,
-# depth), as `Ok(vec3)`; `Err(HSB_ERR_DIVISION_BY_ZERO)` where the clip w is 0 (the point maps
-# to infinity, the camera plane), `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite entry of
-# mvp or point. The normalised device coordinates are `m4_transform_point_checked(mvp, point)`
-# bit for bit: the same arithmetic is written out here, and the cases it cannot answer (w = +-0,
-# NaN or +-Inf, or a quotient that is not finite) are that function's.
+# depth), as `Ok(vec3)`, for an mvp whose NDC z range is `depth_range` (`NdcDepthRange`);
+# `Err(HSB_ERR_DIVISION_BY_ZERO)` where the clip w is 0 (the point maps to infinity, the camera
+# plane), `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite entry of mvp or point, or a
+# `depth_range` outside `NdcDepthRange`. The normalised device coordinates are
+# `m4_transform_point_checked(mvp, point)` bit for bit: the same arithmetic is written out here,
+# and the cases it cannot answer (w = +-0, NaN or +-Inf, or a quotient that is not finite) are
+# that function's.
 # ⛔ `cw` carries the MVP's own scale, so the absolute 1e-12 this tested through 2.14 refused
 # ordinary projections and returned `hvec3_zero()`.
 # ⛔ 3.3.5 — the reciprocal test that replaced it also fired for every subnormal |w| <= 2^-1024,
@@ -373,23 +927,26 @@ fn _t3d_clip_w_scaled(clip) {
 # from finite input did the same or gave +-Inf. It is retired, not redefined.
 #
 # THE SCREEN CONVENTION (stated 3.4.1; audit F-X1): screen_x = (nx / 2 + 1/2) vw and
-# screen_y = (1 - (ny / 2 + 1/2)) vh (y down, (0, 0) the top-left corner), and depth =
-# nz / 2 + 1/2: GL's window transform with glDepthRange(0, 1), for an mvp whose NDC z runs from
-# -1 (near) to +1 (far), as `m4_perspective_rh` and `m4_ortho_rh` make it. That depth is what
-# `linearize_depth(depth, near, far)` reads: through `m4_perspective_rh` it returns the eye
-# distance. ⚠ It is NOT the depth of a [0, 1] NDC-z projection (Direct3D, Vulkan, and this
-# library's own `m4_perspective_reverse_z`, near at 1 and the infinite far plane at 0), whose
-# depth-buffer value is nz itself: for those, take nz from `m4_transform_point_checked(mvp,
-# point)`, whose components are this function's NDC bit for bit, and give it to
-# `linearize_depth_reverse_z`. Through this function's depth a reverse-Z point 5 away (near
-# 0.1) reads back as 0.196, not 5. Nor is 2 depth - 1 a way back: the + 1/2 rounds depth to
-# within 2^-54, so 2 depth - 1 is off by up to 2^-53 absolute, 2^-13 relative at nz = 2^-40
-# and all of nz below 2^-54, where reverse-Z keeps its far depths. Changing the depth this
-# function returns would redefine a public name (a depth-range parameter is the [3.5.0] row),
-# so the convention is documented, not changed.
+# screen_y = (1 - (ny / 2 + 1/2)) vh (y down, (0, 0) the top-left corner); the depth is the
+# window depth in [0, 1] of the mvp's own NDC z range:
+#   - NDC_Z_MINUS_ONE_TO_ONE: nz from -1 (near) to +1 (far), GL's, as `m4_perspective_rh` and
+#     `m4_ortho_rh` make it: depth = nz / 2 + 1/2, glDepthRange(0, 1)'s window transform. That
+#     depth is what `linearize_depth(depth, near, far)` reads: through `m4_perspective_rh` it
+#     returns the eye distance. The + 1/2 rounds depth to within 2^-54.
+#   - NDC_Z_ZERO_TO_ONE: nz already in [0, 1], Direct3D's and Vulkan's, and this library's own
+#     `m4_perspective_reverse_z` (near at 1, the infinite far plane at 0): depth = nz, exactly,
+#     what `linearize_depth_reverse_z` reads (a reverse-Z point 5 away, near 0.1, reads back 5).
+# ⛔ 3.5.0 — THE DEPTH ASSUMED GL'S RANGE FOR EVERY mvp (roadmap [3.5.0] F-X1): through a reverse-Z
+# projection a point 5 away came back with depth 0.51, which `linearize_depth_reverse_z` read as
+# 0.196, and 2 depth - 1 is no way back (2^-53 absolute, all of nz below 2^-54, where reverse-Z
+# keeps its far depths). The range is now a parameter: a signature change, so every call site
+# fails to build until it names its range (cycc refuses a call with the wrong argument count).
 # [measured: tests/foundation.tcyr, group "3.4.1: world_to_screen_checked's depth convention"]
 #must_use
-public fn world_to_screen_checked(point, mvp, vw, vh) {
+public fn world_to_screen_checked(point, mvp, vw, vh, depth_range) {
+    if (depth_range != NDC_Z_MINUS_ONE_TO_ONE && depth_range != NDC_Z_ZERO_TO_ONE) {
+        return Err(HSB_ERR_INVALID_INPUT);
+    }
     var hp = hvec4_from_vec3(point, F64_ONE);
     if (hp == 0) { return Err(HSB_ERR_ALLOC); }
     var clip = m4_mul_vec4(mvp, hp);
@@ -433,24 +990,40 @@ public fn world_to_screen_checked(point, mvp, vw, vh) {
         ny = HVec3_y(ndc);
         nz = HVec3_z(ndc);
     }
+    var depth = nz;
+    if (depth_range == NDC_Z_MINUS_ONE_TO_ONE) { depth = f64_add(f64_mul(nz, F64_HALF), F64_HALF); }
     var sp = hvec3_new(
       f64_mul(f64_add(f64_mul(nx, F64_HALF), F64_HALF), vw),
       f64_mul(f64_sub(F64_ONE, f64_add(f64_mul(ny, F64_HALF), F64_HALF)), vh),
-      f64_add(f64_mul(nz, F64_HALF), F64_HALF)
+      depth
       );
     if (sp == 0) { return Err(HSB_ERR_ALLOC); }
     return Ok(sp);
 }
 
-# 1 when inv_w = 1 / w is not a normal double (it overflowed, or it is subnormal) while w
-# itself is finite and non-zero: the bands world_to_screen divides on a copy (3.3.7, for
-# screen_to_world_ray).
-fn _t3d_w_copy(p, inv_w) {
-    var ai = f64_abs(inv_w);
-    if (f64_lt(ai, F64_TINY) == 1 || f64_lt(ai, F64_POS_INF) == 0) {
-        var w = HVec4_w(p);
-        if (f64_eq(w, 0) == 0 && f64_lt(f64_abs(w), F64_POS_INF) == 1) { return 1; }
-    }
+# The world point inv_vp (nx, ny, z, 1) / w, as `m4_transform_point_checked` gives it: 0 and the
+# point at *out, or that function's Err code (HSB_ERR_DIVISION_BY_ZERO where the exact w is 0).
+fn _t3d_unproject(inv_vp, nx, ny, z, out) {
+    var v: i64[3];
+    store64(&v, nx);
+    store64(&v + 8, ny);
+    store64(&v + 16, z);
+    var t, p = m4_transform_point_checked(inv_vp, &v);
+    if (is_err_result(t) == 1) { return p; }
+    store64(out, p);
+    return 0;
+}
+
+# The same point as significands and a power of two (`m4_transform_point_frexp_checked`): 0 with
+# the HVec3 q at *out and e at *out_e (the point is q 2^e), or that function's Err code.
+fn _t3d_unproject_frexp(inv_vp, nx, ny, z, out, out_e) {
+    var v: i64[3];
+    store64(&v, nx);
+    store64(&v + 8, ny);
+    store64(&v + 16, z);
+    var t, p = m4_transform_point_frexp_checked(inv_vp, &v, out_e);
+    if (is_err_result(t) == 1) { return p; }
+    store64(out, p);
     return 0;
 }
 
@@ -458,61 +1031,103 @@ fn _t3d_w_copy(p, inv_w) {
 # inverse of a view-projection matrix whose NDC z runs from -1 (near) to +1 (far), GL's
 # convention: the pixel maps to NDC (2 sx / vw - 1, 1 - 2 sy / vh), and the ray runs from that
 # point on the near plane (z = -1) through the one on the far plane (z = +1), each unprojected
-# by inv_vp and divided by its w. Writes the origin (the near-plane point, an HVec3) to
-# *out_origin and the unit direction (`hvec3_normalize` of far - near) to *out_dir, and
-# returns 0. Returns HSB_ERR_ALLOC where an allocation is refused (3.4.0), and
-# HSB_ERR_DEGENERATE (3.4.1) where the two unprojected points come out equal, far - near
-# exactly zero, so no direction can be formed (inv_vp sends z = -1 and z = +1 to one point,
-# e.g. a projection with near = far); the out params are untouched on both. ⚠ Points that are
-# distinct but round to nearly the same values (a depth range far below the world's magnitude)
-# still give rc 0, with a direction made of their rounding. ⛔ Through 3.4.0 the equal case
-# returned 0 with the zero vector as the direction (`hvec3_normalize(0)`): inv_vp = I with
-# (2, 2) = 0 gave the origin (-0.75, 0.833, 0) and direction (0, 0, 0) for (100, 50) on
-# 800 x 600, a ray that goes nowhere, reported as success. ⚠ A w of 0 at either point still
-# gives rc 0 with a NaN direction (the [3.5.0] roadmap row).
+# by inv_vp and divided by its w (`m4_transform_point_checked`, which decides w = 0 on the exact
+# w). Writes the origin (the near-plane point, an HVec3) to *out_origin and the unit direction
+# (`hvec3_normalize` of far - near) to *out_dir, and returns 0. The out params are untouched on
+# every error:
+#   - HSB_ERR_ALLOC where an allocation is refused (3.4.0);
+#   - HSB_ERR_DEGENERATE (3.4.1) where the two unprojected points come out equal, far - near
+#     exactly zero, so no direction can be formed (a projection with near = far);
+#   - HSB_ERR_DIVISION_BY_ZERO (3.5.0) where the near point's exact w is 0: it is at infinity, and
+#     a ray has no origin there (inv_vp's w row zero, the roadmap's case);
+#   - HSB_ERR_INVALID_INPUT (3.5.0) where inv_vp or the NDC point is NaN or infinite (a 0 x 0
+#     viewport puts the pixel at 0 / 0);
+#   - HSB_ERR_OUT_OF_RANGE (3.5.0) where the near point lies past the double range (its w not 0
+#     but small against its coordinates): an origin no HVec3 holds.
+# ⭐ 3.5.0: a far point at infinity (exact w = 0 at z = +1: an infinite far plane) is a direction,
+# not an error. The ray then runs from the near point toward it: the point unprojected at z = 1 -
+# 2^-29 lies on that ray, 2^30 times as far along it as the near point is from the camera's side
+# of it (w is linear in z, so its w is the near w times 2^-30, of the same sign), and the
+# direction is the normalised difference of the two, as for a finite far point.
+# ⭐ 3.5.0 review: so is a far point past the double range (or that z = 1 - 2^-29 point, past it
+# for a near point beyond 2^994): it is taken as significands q and a power of two 2^e
+# (`m4_transform_point_frexp_checked`, e >= 1023 there), and far - near over 2^e is q - near 2^-e,
+# the near point scaled by a power of two (exact, or within 2^-1074 against q's largest component
+# in [1, 2)), normalised as before. Through the first review this answered rc 0 with a NaN
+# direction (Inf - x, then Inf / Inf), and with an infinite origin where the near point was past
+# the range too. Against the exact rays (Fraction unprojections) of 4,500 pixels over three seeds:
+# the 242 whose far point is past the range within 2.23 u of the unit direction, normwise, the 902
+# with a far point at infinity within 2.71, and the 900 whose near point is past it refused (the
+# first review tree: rc 0 with an infinite origin, and 378 NaN directions in all); every ray that
+# tree answered finitely keeps its bits. Cost there about 7.7 us (the far point's exact sums twice:
+# its unprojection, then its significands), against 0.36 us for an ordinary ray in the same run.
+# [measured: scratch ray.py (Fraction oracle), the first review tree and this one, seeds 1-3, 2026-11-14; cycc 6.7.18]
+# [measured: scratch merged.bcyr (tests/hisab.bcyr with tests/hisab.bcyr's rows), one run, 2026-11-14]
+# Cost: 594 -> 736 ns (+24%) on an ordinary inverse view-projection; an infinite far plane about
+# 2.2 us (the exact w, and a third unprojection).
+# [measured: scratch bench/ab.cyr, 3.4.2 and this tree interleaved x 6, taskset, 2026-11-14; noisy, 8 lanes]
+# ⚠ Points that are distinct but round to nearly the same values (a depth range far below the
+# world's magnitude) still give rc 0, with a direction made of their rounding. A far - near that
+# overflows for finite points is formed from halves.
+# ⛔ Through 3.4.0 the equal case returned 0 with the zero vector as the direction
+# (`hvec3_normalize(0)`): inv_vp = I with (2, 2) = 0 gave the origin (-0.75, 0.833, 0) and direction
+# (0, 0, 0) for (100, 50) on 800 x 600, a ray that goes nowhere, reported as success.
+# ⛔ 3.5.0 — AND A w OF 0 GAVE rc 0 WITH A NaN DIRECTION AND AN INFINITE ORIGIN (roadmap [3.5.0],
+# FB F3): 1 / 0 is +Inf, and a point at infinity times its coordinates. The 3.3.7 bands (a
+# subnormal or huge w) are `m4_transform_point_checked`'s since: the same bits wherever 1 / w is
+# normal, and its exact path where its certificate fails.
 public fn screen_to_world_ray(sx, sy, inv_vp, vw, vh, out_origin, out_dir) {
     var nx = f64_sub(f64_mul(f64_div(sx, vw), F64_TWO), F64_ONE);
     var ny = f64_sub(F64_ONE, f64_mul(f64_div(sy, vh), F64_TWO));
-    var hn = hvec4_new(nx, ny, f64_neg(F64_ONE), F64_ONE);
-    if (hn == 0) { return HSB_ERR_ALLOC; }
-    var near = m4_mul_vec4(inv_vp, hn);
-    if (near == 0) { return HSB_ERR_ALLOC; }
-    var hf = hvec4_new(nx, ny, F64_ONE, F64_ONE);
-    if (hf == 0) { return HSB_ERR_ALLOC; }
-    var far = m4_mul_vec4(inv_vp, hf);
-    if (far == 0) { return HSB_ERR_ALLOC; }
-    # ⛔ 3.3.7 — THE RECIPROCAL world_to_screen LOST IN 3.3.5, LOST HERE TOO. 1 / w overflows
-    # for every subnormal |w| <= 2^-1024 and is subnormal past 2^1022, so inv_vp = 2^-1074 I on
-    # 800 x 600 gave the centre's origin (NaN, NaN, -Inf) and a NaN direction, where the exact
-    # answer is the origin (nx, ny, -1) and the direction (0, 0, 1). Each point is divided on
-    # world_to_screen's power-of-two copy (_t3d_clip_w_scaled) where its 1 / w is not normal and
-    # w is finite and non-zero; w = +-0, NaN and +-Inf keep their arithmetic. Against the exact
-    # quotients of the clip vectors m4_mul_vec4 forms (3,445 points in the bands and around
-    # them), 2,399 answers went wrong -> right and none right -> wrong; the one still past 4 ulp
-    # is a direction normalised from a difference that cancels (4.6 ulp).
-    # [measured: rt337 band sweep (row6.py, seed 601), exact Fraction quotients, 3.3.6 vs this tree, 2026-10-31]
-    var nw = f64_div(F64_ONE, HVec4_w(near));
-    if (_t3d_w_copy(near, nw) == 1) {
-        near = _t3d_clip_w_scaled(near);
-        if (near == 0) { return HSB_ERR_ALLOC; }
-        nw = f64_div(F64_ONE, HVec4_w(near));
+    var npp: i64[1];
+    var rc = _t3d_unproject(inv_vp, nx, ny, _T3D_NDC_NEAR, &npp);
+    if (rc != 0) { return rc; }
+    var np = load64(&npp);
+    if (_t3d_any_inf(np) == 1) { return HSB_ERR_OUT_OF_RANGE; }
+    var fz = F64_ONE;
+    var fpp: i64[1];
+    rc = _t3d_unproject(inv_vp, nx, ny, fz, &fpp);
+    if (rc == HSB_ERR_DIVISION_BY_ZERO) {
+        fz = _T3D_NDC_FAR_IN;
+        rc = _t3d_unproject(inv_vp, nx, ny, fz, &fpp);
     }
-    var fw = f64_div(F64_ONE, HVec4_w(far));
-    if (_t3d_w_copy(far, fw) == 1) {
-        far = _t3d_clip_w_scaled(far);
-        if (far == 0) { return HSB_ERR_ALLOC; }
-        fw = f64_div(F64_ONE, HVec4_w(far));
+    if (rc != 0) { return rc; }
+    var fp = load64(&fpp);
+    var dv = 0;
+    if (_t3d_any_inf(fp) == 1) {
+        # past the double range: (far - near) 2^-e = q - near 2^-e
+        var qp: i64[1];
+        var fe: i64[1];
+        rc = _t3d_unproject_frexp(inv_vp, nx, ny, fz, &qp, &fe);
+        if (rc != 0) { return rc; }
+        var q = load64(&qp);
+        var k = 0 - load64(&fe);
+        dv = hvec3_new(f64_sub(HVec3_x(q), _trs_ldexp(HVec3_x(np), k)), f64_sub(HVec3_y(q), _trs_ldexp(HVec3_y(np), k)),
+          f64_sub(HVec3_z(q), _trs_ldexp(HVec3_z(np), k)));
+        if (dv == 0) { return HSB_ERR_ALLOC; }
+    } else {
+        dv = hvec3_sub(fp, np);
+        if (dv == 0) { return HSB_ERR_ALLOC; }
+        if (_t3d_any_inf(dv) == 1) {
+            store64(dv, f64_sub(f64_mul(HVec3_x(fp), F64_HALF), f64_mul(HVec3_x(np), F64_HALF)));
+            store64(dv + 8, f64_sub(f64_mul(HVec3_y(fp), F64_HALF), f64_mul(HVec3_y(np), F64_HALF)));
+            store64(dv + 16, f64_sub(f64_mul(HVec3_z(fp), F64_HALF), f64_mul(HVec3_z(np), F64_HALF)));
+        }
     }
-    var np = hvec3_new(f64_mul(HVec4_x(near), nw), f64_mul(HVec4_y(near), nw), f64_mul(HVec4_z(near), nw));
-    if (np == 0) { return HSB_ERR_ALLOC; }
-    var fp = hvec3_new(f64_mul(HVec4_x(far), fw), f64_mul(HVec4_y(far), fw), f64_mul(HVec4_z(far), fw));
-    if (fp == 0) { return HSB_ERR_ALLOC; }
-    var dv = hvec3_sub(fp, np);
-    if (dv == 0) { return HSB_ERR_ALLOC; }
     if (((HVec3_x(dv) | HVec3_y(dv) | HVec3_z(dv)) & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return HSB_ERR_DEGENERATE; }
     var dn = hvec3_normalize(dv);
     if (dn == 0) { return HSB_ERR_ALLOC; }
     store64(out_origin, np);
     store64(out_dir, dn);
+    return 0;
+}
+
+# 1 when a component of the HVec3 v is +-Inf.
+fn _t3d_any_inf(v) {
+    var i = 0;
+    while (i < 3) {
+        if ((load64(v + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { return 1; }
+        i = i + 1;
+    }
     return 0;
 }

@@ -7,6 +7,35 @@
 #derive(accessors)
 public struct HVec2 { x; y; }
 
+# ⛔ 3.5.0 — A 0 HANDLE PASSED IN FAULTED (roadmap [3.5.0] "A 0 handle passed in still faults", INS5
+# F3): every function below that takes an HVec2, but `hvec2_normalize_checked`, read address 0 for
+# one, rc 139, though 0 is the designed answer of every constructor here whose allocation was
+# refused, so a chain such as hvec2_add(hvec2_new(...), v) crashed on an exhausted heap.
+# [measured: tests/modules_d.tcyr's W8 group on the 3.5.0 wave-1 tree, 77 of its 90 cases SIGSEGV; cycc 6.7.18]
+# The answer now follows the function's type. One that returns an HVec2 returns the designed 0 for
+# a 0 operand, before it allocates. One that returns a double (`hvec2_dot`, `_length_sq`,
+# `_length`, `_distance`) returns NaN, the bits 0x7FF8000000000000 (`_HV2_NAN`): it has no failure
+# channel, and NaN is the one double that is no answer, where 0 would read as perpendicular or as
+# the zero vector's length. `hvec2_normalize` gives 0 through `hvec2_scale`, and
+# `hvec2_normalize_checked` Err(HSB_ERR_INVALID_INPUT). vec3, vec4 and quat keep the same rule.
+# ⚠ COST: one test per handle on every call. Against the tree before it, 16 interleaved runs a side
+# pinned to one core, medians per call: hvec2_dot 8.70 -> 9.31 ns (+7%), hvec3_dot 7.56 -> 8.43
+# (+12%), hvec4_dot 5.73 -> 6.95 (+21%), hquat_dot 6.07 -> 6.88 (+13%), hvec3_distance 21.3 -> 23.2
+# (+9%), hvec3_add_into 8.87 -> 9.71 (+10%); hvec3_cross, hquat_mul, hvec3_lerp, hvec4_add and
+# hvec3_neg +1 to +6%, hquat_rotate_vec3 and hquat_slerp within their noise (-4% and +1%).
+# [measured: scratch ab.bcyr, the 3.5.0 wave-1 tree and this one, 16 pinned interleaved pairs; cycc 6.7.18; noisy]
+# The lane's reviewer read hquat_dot at +23% and +22% (paired medians), with hvec4_dot, whose body it
+# now shares, at +20% and +19%; so the dot family's guard costs about +7% (vec2) to +23% (vec4,
+# quat). The length family pays it through dot: hvec3_length +6%, hquat_length +9 to +11%,
+# hvec4_length +0 to +3%.
+# [measured: scratch A/B of lane W8's review, two 12-pair pinned interleaved runs, cpu 10, load 7 to 11; noisy]
+# Each handle has its own `if`: cycc compiles `a == 0 || b == 0` to nearly twice the cost of two
+# tests (a dot body: no test 6.6 ns, two tests 7.3, `||` 7.9).
+# [measured: scratch gf.bcyr, the guard spellings side by side in one binary, 3 pinned runs; cycc 6.7.18]
+enum _HVec2F64 {
+    _HV2_NAN = 0x7FF8_0000_0000_0000;   # NaN, quiet: what a double-valued function answers for a null handle
+}
+
 # A new HVec2 (x, y): 16 bytes from the heap, the components stored as given (any doubles).
 # Returns the designed 0 where the allocation is refused (3.4.0); every constructor below too.
 #must_use
@@ -35,34 +64,43 @@ public fn hvec2_splat(s) { return hvec2_new(s, s); }
 
 # a + b, componentwise: each component one IEEE addition, correctly rounded (overflow to
 # +-Inf and NaN as IEEE gives them). Returns a new HVec2, or the designed 0 where the
-# allocation is refused; so do `hvec2_sub`, `_mul`, `_scale` and `_neg`.
+# allocation is refused, or for a 0 operand (3.5.0); so do `hvec2_sub`, `_mul`, `_scale` and `_neg`.
 #must_use
 public fn hvec2_add(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     return hvec2_new(f64_add(HVec2_x(a), HVec2_x(b)), f64_add(HVec2_y(a), HVec2_y(b)));
 }
 
 # a - b, componentwise, each component correctly rounded.
 #must_use
 public fn hvec2_sub(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     return hvec2_new(f64_sub(HVec2_x(a), HVec2_x(b)), f64_sub(HVec2_y(a), HVec2_y(b)));
 }
 
 # The componentwise (Hadamard) product (ax bx, ay by), each component correctly rounded.
 #must_use
 public fn hvec2_mul(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     return hvec2_new(f64_mul(HVec2_x(a), HVec2_x(b)), f64_mul(HVec2_y(a), HVec2_y(b)));
 }
 
 # v times the scalar s, each component correctly rounded.
 #must_use
 public fn hvec2_scale(v, s) {
+    if (v == 0) { return 0; }
     return hvec2_new(f64_mul(HVec2_x(v), s), f64_mul(HVec2_y(v), s));
 }
 
-# -v, each component's sign flipped (`f64_neg`; below cycc 6.6.8 it gave +0 for +0).
+# -v, each component's sign flipped, exact, -0 for +0 on every pin (3.5.0: a flip of the sign bit;
+# `f64_neg` gave +0 for +0 below cycc 6.6.8, which the bundle's 6.6.3 floor admits).
 #must_use
 public fn hvec2_neg(v) {
-    return hvec2_new(f64_neg(HVec2_x(v)), f64_neg(HVec2_y(v)));
+    if (v == 0) { return 0; }
+    return hvec2_new(HVec2_x(v) ^ 0x8000_0000_0000_0000, HVec2_y(v) ^ 0x8000_0000_0000_0000);
 }
 
 # ================================================================
@@ -71,15 +109,18 @@ public fn hvec2_neg(v) {
 
 # a . b = ax bx + ay by: two products and one sum, within 2u (|ax bx| + |ay by|) of the exact
 # value to first order (u = 2^-53); IEEE's zero sign (-0 exactly when both products are -0).
-# Overflow and NaN follow IEEE (a product past DBL_MAX is +-Inf).
+# Overflow and NaN follow IEEE (a product past DBL_MAX is +-Inf). NaN for a 0 operand (3.5.0).
 #must_use
 public fn hvec2_dot(a, b) {
+    if (a == 0) { return _HV2_NAN; }
+    if (b == 0) { return _HV2_NAN; }
     return f64_add(f64_mul(HVec2_x(a), HVec2_x(b)), f64_mul(HVec2_y(a), HVec2_y(b)));
 }
 
 # |v|^2 = x^2 + y^2 (`hvec2_dot(v, v)`): +Inf once a square passes DBL_MAX (|x| >= 2^512), and
 # subnormal, losing bits, once both |x| and |y| are below 2^-511 (0 below about 2^-537); use
 # `hvec2_length` for the magnitude across the whole range.
+# A 0 handle gives NaN (3.5.0), through `hvec2_dot`.
 #must_use
 public fn hvec2_length_sq(v) { return hvec2_dot(v, v); }
 
@@ -118,6 +159,7 @@ fn _hvec2_len_scaled(v) {
 # ⚠ And the `+Inf` short-circuit inside the helper is REQUIRED: without it
 # `Inf/Inf` is NaN and the documented infinity contract regresses.
 # [measured: 1106-scale two-sided sweep; naive wrong at 60, guarded at 0]
+# A 0 handle gives NaN (3.5.0), through `hvec2_dot`.
 #must_use
 public fn hvec2_length(v) {
     var ls = hvec2_length_sq(v);
@@ -131,6 +173,7 @@ public fn hvec2_length(v) {
 # maxima). The zero vector gives the zero vector (it has no direction: a sentinel, |v| = 0, not
 # a unit vector). A NaN component gives NaN components; an infinite one gives NaN in its own
 # slot and zeros in the finite ones. Returns the designed 0 where an allocation is refused.
+# A 0 handle gives the designed 0 (3.5.0), through `hvec2_scale`.
 #must_use
 public fn hvec2_normalize(v) {
     var len = hvec2_length(v);
@@ -173,13 +216,41 @@ public fn hvec2_normalize(v) {
     return hvec2_scale(v, inv);
 }
 
+# 1 when x is finite (not +-Inf or NaN): the bits below the sign, under +Inf's.
+fn _hv2_fin(x) {
+    if ((x & 0x7FFF_FFFF_FFFF_FFFF) < 0x7FF0_0000_0000_0000) { return 1; }
+    return 0;
+}
+
+# v / |v| as `Ok(unit)`: `hvec2_normalize`'s answer, bit for bit, for every finite non-zero v.
+# `Err(HSB_ERR_DIVISION_BY_ZERO)` for the zero vector (either zero sign in every component), which
+# has no direction; `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite component, or a 0 handle;
+# `Err(HSB_ERR_ALLOC)` where an allocation is refused.
+# ⭐ 3.5.0 (roadmap [3.5.0] FB F4): `hvec2_normalize` answers the zero vector with the zero
+# vector, a sentinel (|v| = 0, not a unit vector) that a caller must test for, and a NaN or
+# infinite component with NaN components; `m4_look_at_rh` took that zero for a basis vector. This
+# is the error channel, as `hquat_normalize_checked` is for quaternions. `hvec2_normalize`
+# stays, with that documented contract, for callers that test the length themselves.
+#must_use
+public fn hvec2_normalize_checked(v) {
+    if (v == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_hv2_fin(HVec2_x(v)) + _hv2_fin(HVec2_y(v)) != 2) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (((HVec2_x(v) | HVec2_y(v)) & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    var r = hvec2_normalize(v);
+    if (r == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(r);
+}
+
 # |a - b|: `hvec2_length` of the difference, formed as `hvec2_sub` forms it (on the stack), so
 # its error is the difference's rounding (u relative per component, u = 2^-53) and then the
 # length's; +Inf where |a - b| rounds past DBL_MAX (IEEE's rounding: (DBL_MAX, 2^500) from 0 is
 # DBL_MAX though its exact length exceeds it, and (DBL_MAX, DBL_MAX) from 0
 # is +Inf with no component of the difference overflowing), and where a component overflows.
+# NaN for a 0 operand (3.5.0).
 #must_use
 public fn hvec2_distance(a, b) {
+    if (a == 0) { return _HV2_NAN; }
+    if (b == 0) { return _HV2_NAN; }
     # The difference is a stack HVec2 (3.4.0): this returns a length, with no value
     # left for a refused allocation, and hvec2_sub's heap copy was read unchecked.
     var d: i64[2];
@@ -212,6 +283,8 @@ public fn hvec2_distance(a, b) {
 # [measured: scratch lerp sweep and fl2.bcyr, both trees, 3.4.0's form in each binary, 2026-10-31; cycc 6.7.18]
 #must_use
 public fn hvec2_lerp(a, b, t) {
+    if (a == 0) { return 0; }   # 3.5.0: before the allocation
+    if (b == 0) { return 0; }
     var r = hisab_alloc(sizeof(HVec2));
     if (r == 0) { return 0; }
     var ax = load64(a);                                              # x, at offset 0

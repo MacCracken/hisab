@@ -56,6 +56,33 @@ jobs:
           echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
           echo "CYRIUS_HOME=$HOME/.cyrius" >> "$GITHUB_ENV"
 
+      - name: Install the consumer floor toolchains beside the pin
+        # ⭐ ADDED 3.5.0. Consumers compile dist/hisab.cyr under their own pins, the lowest 6.6.3,
+        # and 3.4.0 shipped an octree_insert that cycc 6.6.3 and 6.6.4 miscompile (exit 139) while
+        # scripts/check-miscompile.sh, in the tree since 3.3.6, would have reported its 2 unwritten
+        # slots: this job had only the manifest's toolchain, so nothing ran it. The script names
+        # every toolchain it uses (`--list-pins`: the floor, its selftest's 6.6.4 / 6.6.5 control,
+        # then the manifest pin), so no version is written here. Each one other than the pin goes
+        # in through the same upstream installer, checksum- and signature-verified the same way
+        # (the pin's cyrsign is on PATH by now), with CYRIUS_NO_ACTIVATE=1 so ~/.cyrius/bin, lib and
+        # current stay on the pin: the next step asserts exactly that.
+        # [measured: scripts/check-miscompile.sh --bundle on 3.4.0's dist/hisab.cyr, lane L8, 2026-11-14]
+        run: |
+          set -e
+          PIN="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          PINS="$(./scripts/check-miscompile.sh --list-pins)"
+          [ -n "$PINS" ] || { echo "::error::check-miscompile.sh --list-pins printed nothing"; exit 1; }
+          for p in $PINS; do
+            [ "$p" = "$PIN" ] && continue
+            echo "Installing Cyrius $p beside $PIN (not activated)"
+            curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+              CYRIUS_VERSION="$p" CYRIUS_NO_ACTIVATE=1 sh
+            [ -x "$HOME/.cyrius/versions/$p/bin/cycc" ] || {
+              echo "::error::cycc $p is not at ~/.cyrius/versions/$p/bin after its install"; exit 1; }
+            [ -d "$HOME/.cyrius/versions/$p/lib" ] || {
+              echo "::error::the $p stdlib snapshot is not at ~/.cyrius/versions/$p/lib"; exit 1; }
+          done
+
       - name: Verify toolchain matches the pin
         # The install failure above surfaced two steps later, as a `cyrius deps`
         # error about a path. Assert it HERE, where it is diagnosable: the binary
@@ -256,6 +283,20 @@ jobs:
         # it alone and pretending every undefined symbol is expected.
         run: cyrius check --with-deps dist/hisab.cyr
 
+      - name: Miscompile audit of the bundle under the consumer floor pin
+        # ⭐ ADDED 3.5.0 (see "Install the consumer floor toolchains beside the pin"). Builds the
+        # committed bundle as a consumer does, from scratch projects pinned to 6.6.3 and to the
+        # manifest pin, and disassembles each for the one miscompile class hisab's suites have
+        # found twice: a frame slot code reads and nothing writes. It fails on 3.4.0's bundle
+        # (2 unwritten slots under 6.6.3, the octree_insert crash) and passes on this tree. The
+        # selftest must find the archived 3.2.0 repro's slot under 6.6.4 and none under 6.6.5,
+        # and a slot planted under the manifest pin; --require-controls fails it where the first
+        # arm would otherwise be skipped. A missing pin fails the step (no --allow-missing).
+        # [measured: scripts/check-miscompile.sh and --selftest --require-controls, lane L8, 2026-11-14]
+        run: |
+          ./scripts/check-miscompile.sh
+          ./scripts/check-miscompile.sh --selftest --require-controls
+
       - name: "Discarded #must_use results"
         # ⛔ THE LINT GATE ABOVE CANNOT SEE THIS AND THAT IS MEASURED, NOT ASSUMED.
         # `#must_use` is a COMPILER diagnostic, not a cyrlint one: a file whose
@@ -365,6 +406,27 @@ jobs:
             exit 1
           fi
 
+      - name: Test harnesses declare each top-level name once
+        # ⭐ ADDED 3.5.0 (roadmap MAT4, INS4). The step above reads the bundle; nothing read
+        # tests/, where a duplicate fn in tests/hisab.bcyr draws only a compiler warning no step
+        # fails on. What a repeated top-level name does depends on where it is, and the script's
+        # header gives each rule with its probe: a fn is global (the last body replaces the first
+        # for every call); a fn and a value may share a name silently, `&name` taking the value;
+        # in the declaration zone, before the first top-level statement (nearly all of
+        # tests/hisab.bcyr), a repeated `var` is ONE global whose constant redeclaration holds
+        # from program start; after it, a `var` starts a new variable for the code after it, the
+        # code before it keeping the old one. That last is lexical shadowing, the language's rule,
+        # and the suites reuse scratch names that way on purpose (188 names): a second `var _c41_s0`
+        # appended to modules_c changes nothing. It fails only where a fn bound to an earlier
+        # declaration is reached after a later one, and a name a library declares may be neither
+        # replaced nor shadowed unless ALLOW says why. Declarations after a statement on the same
+        # line are read too. The selftest plants every shape and compiles the eight language rules
+        # under the manifest pin, so it runs here, where the toolchain is.
+        # [measured: scripts/check-test-names.sh --selftest and 18 mutants of it, lane L8, 2026-11-14]
+        run: |
+          ./scripts/check-test-names.sh
+          ./scripts/check-test-names.sh --selftest
+
       - name: CGA null-basis derivation
         # ⭐ 2.21.0's basis change rests on three claims about the null-basis
         # product table — at most 2 terms per basis-blade product, all coefficients
@@ -440,6 +502,19 @@ jobs:
             exit 1
           fi
           echo "CLI prints: $OUT"
+
+      - name: Overcommit regime the suites run under
+        # ⭐ ADDED 3.5.0. The allocator's 256 MB grain chunks are MAP_NORESERVE: free under
+        # vm.overcommit_memory 0 or 1, charged in full under 2. With every mapping granted, the
+        # steps below take up to 2,623,204 KB at once (Test and the counts step: modules_b's 9
+        # chunks beside the cyrius CLI's own) and Bench 13,369,756 KB (tests/hisab.bcyr fills 50
+        # chunks and never frees them; 3.5.0's re-measure, in scripts/check-overcommit.sh). This step says which regime they run in, so a green run
+        # is not read as evidence about strict overcommit, and in mode 2 fails before them,
+        # naming each step the commit room would not cover.
+        # [measured: lane L8 commitpeak.py ptrace tracer, the CI step commands on this tree, cycc 6.7.18, 2026-11-14]
+        run: |
+          ./scripts/check-overcommit.sh
+          ./scripts/check-overcommit.sh --selftest
 
       - name: Test
         run: |

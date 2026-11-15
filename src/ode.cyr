@@ -30,6 +30,8 @@ var _ODE_F64_FIVE     = 0x4014000000000000;          # 5.0
 # state, and the margin below which the slope is not resolved from 0.
 var _ODE_F64_2_POW_M26 = 0x3E50000000000000;         # 2^-26
 var _ODE_F64_2_POW_M24 = 0x3E70000000000000;         # 2^-24
+# The certificate's slope (_ode_zslope): its finest step, at least 2^-52 |z|, the next double past z.
+var _ODE_F64_2_POW_M52 = 0x3CB0000000000000;         # 2^-52
 # The continuation of a failed implicit step (_ode_continue): a corrector's point is accepted
 # once its last update is a 1024th of the increment's move; the contraction the increments aim
 # for; the midpoint test's accuracy margin.
@@ -52,12 +54,14 @@ enum _OdeBdf { _ODE_BDF_NEWTON = 50; }
 # Chord updates per continuation increment (_ode_continue): past six an increment is too long.
 # Its final certificate (_ode_on_branch): the cells it cuts the whole move into, one sample in each
 # but the first; the multiplier that places a sample off its cell's edge, 2^16 / phi; and the
-# fixed-point unit of a sample's position.
+# fixed-point unit of a sample's position (2^-23; a product since 3.5.0, where it was a quotient by
+# 2^23: the same bits, and backward Euler on y' = -y at dt 0.1 1,458 -> 1,380 ns, three pinned rounds).
+# [measured: scratch A/B runner (scratch_L5 p/ab.bcyr), this tree with each form, taskset -c 5, 2026-11-14]
 enum _OdeCont {
     _ODE_CONT_KMAX = 6;
     _ODE_CONT_SCAN = 64;
     _ODE_CONT_GOLD = 40503;
-    _ODE_CONT_TAU = 0x4160000000000000;        # 2^23
+    _ODE_CONT_TAU = 0x3E80000000000000;        # 2^-23
 }
 
 # ================================================================
@@ -280,8 +284,9 @@ fn _ode_full(v) {
 #     initial point first, then every accepted step; on Ok the last time is tf exactly: the step
 #     that covers the remaining span is recorded at tf, 3.4.1 review; the y there is the
 #     integration to t + (tf - t), which can differ from tf by an ulp of it).
-# Returns: Ok(0) on reaching tf; Err(HSB_ERR_INVALID_INPUT) for tol < 0 or NaN, or a t0,
-# tf or dt0 that is NaN or infinite (t0 and tf) before anything is pushed or f is called;
+# Returns: Ok(0) on reaching tf; Err(HSB_ERR_INVALID_INPUT) for tol < 0 or NaN, a t0,
+# tf or dt0 that is NaN or infinite (t0 and tf), or a y0 that is NaN or infinite, before anything
+# is pushed or f is called;
 # Err(HSB_ERR_NO_CONVERGENCE) when the step can no longer move t (dt0 = 0 at the first
 # step, or a step shrunk below t's spacing) or after _ODE_MAX_STEPS steps; Err(HSB_ERR_ALLOC) when a
 # vec cannot grow. On the last two the vecs hold the points accepted so far.
@@ -299,6 +304,15 @@ fn _ode_full(v) {
 # steps before its NO_CONVERGENCE: dt0 is the initial step's size, and the direction is
 # tf's. For tf > t0, tol > 0 and dt0 > 0 every operation is 3.4.0's, bit for bit.
 # [measured: tests/edge_cases.tcyr, group "3.4.1: ode_dopri45_trajectory integrates or refuses"]
+# ⛔ 3.5.0 -- A NaN OR INFINITE y0 WAS NOT REFUSED UP FRONT (roadmap [3.5.0], NUM F4; the infinite half
+# from its review): the run pushed the one point, called f 3,234 times (y' = -10y from NaN, +Inf or -Inf,
+# dt0 0.1, tol 1e-8, tf 1), rejecting every NaN estimate down to a step that no longer moved t, and
+# answered NO_CONVERGENCE, which says the integration was tried. y' = 1 from +Inf was Ok on four points
+# of +Inf. A state that is not a real number has no solution to integrate, as an infinite t0 or tf has
+# none: it is INVALID_INPUT now, with nothing pushed and f never called. A finite y0 whose f overflows
+# is integrated and fails as before (y' = -10y from DBL_MAX: NO_CONVERGENCE after 3,234 calls).
+# [measured: scratch probe (scratch_L5 p/dp.cyr), 3.4.2 and this tree, 2026-11-14]
+# [measured: tests/modules_d.tcyr, group "3.5.0 L5: ode_dopri45_trajectory refuses a NaN or infinite y0"]
 #must_use
 public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
     if (f64_lt(tol, 0) == 1 || f64_eq(tol, tol) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
@@ -306,6 +320,7 @@ public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
         return Err(HSB_ERR_INVALID_INPUT);
     }
     if (f64_eq(dt0, dt0) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (f64_lt(f64_abs(y0), F64_POS_INF) == 0) { return Err(HSB_ERR_INVALID_INPUT); }   # no state (3.5.0)
     var t = t0;
     var y = y0;
     var back = f64_lt(tf, t0);              # 1: integrate backward in time
@@ -423,26 +438,60 @@ public fn ode_dopri45_trajectory(f, t0, y0, tf, dt0, tol, out_ts, out_ys) {
 # tol: Newton convergence tolerance (f64), on the residual |g(z)|
 # max_newton: max Newton updates (integer)
 # out: pointer, y_new (f64) written here on success
-# Returns: Ok(0) when an iterate's residual |g(z)| is below tol: first Newton's, 3.4.0's to
-# the bit (the forward-Euler predictor is tested first); where max_newton updates do not get
-# there, the step's own continuation (_ode_continue: the root of g reached from z = y as dt
-# grows from 0, with at most max_newton increments, none when max_newton is 0).
+# Returns: Ok(0) when an iterate's residual |g(z)| is below tol and the iterate carries the
+# certificate below: first Newton's, 3.4.0's bits (the forward-Euler predictor is tested first);
+# where max_newton updates do not get there, or reach a root the certificate refuses, the step's
+# own continuation (_ode_continue: the root of g reached from z = y as dt grows from 0, with at
+# most max_newton increments, none when max_newton is 0).
 # Err(HSB_ERR_NO_CONVERGENCE) or Err(HSB_ERR_SINGULAR_MATRIX) when both fail, with Newton's
 # code (SINGULAR_MATRIX: g'(z) was not resolved from 0 at an iterate, _ode_newton_gp);
 # `out` untouched on both; Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN (no residual meets
-# it) or max_newton < 0, before f is called. Every continuation answer carries a certificate, read at
-# 63 points between y and the answer (_ode_on_branch): sigma(z) = (z - y) / (dt f(t + dt, z)) rises
-# from 0 and stays below 1, which is what it is to lie on the branch through (dt = 0, y) with no fold
-# before the full dt, at every point that does not already meet |g| < tol as the answer does.
-# Without it the step fails, also where the root it found is the equation's only one. What it cannot
-# see: a fold or a pair of roots narrower than the gap between samples, at most 1/48 of the move, or
-# inside |g| < tol, which the step's own test does not tell apart; no finite sample of f is a proof.
-# Newton's answer is the root its iterates reach, which is not always that one (3.4.0, kept).
+# it) or max_newton < 0, before f is called. Every answer carries a certificate (Newton's since 3.5.0,
+# _ode_on_branch): g = z - y - dt f(t + dt, z) rises into the answer from y, read as secants of g toward y
+# (3.5.0, _ode_zslope), and at 63 points between y and the answer, each double once, sigma(z) = (z - y) /
+# (dt f(t + dt, z)) rises from 0 and stays below 1, which is what it is to lie on the branch through
+# (dt = 0, y) with no fold before the full dt, at every point that does not already meet |g| < tol as the
+# answer does. Without it the step fails, also where the root it found is the equation's only one. What it
+# cannot see: a fold narrower than the gap between samples, at most 1/48 of the move; a pair of roots there
+# whose second root is the answer, when the pair is narrower than 2^-26 of the move, or whose third root is,
+# where g rises again; roots inside |g| < tol where g rises, which the step's own test does not tell apart;
+# where the answer is y itself, a fold of the branch inside |g| < tol ahead of it (_ode_zslope's (6));
+# no finite sample of f is a proof.
+# ⛔ 3.5.0 -- NEWTON'S OWN Ok WAS NOT CERTIFIED (roadmap [3.5.0], NUM3 F1, NUM4 F4): its answer was the
+# root its iterates reached, and that is not always the branch's. Robertson's y2 by backward Euler at
+# max_newton 50 (the 3.4.1 NUM3 fixture) was Ok at -7.54e-5, a negative concentration, where the branch
+# root is +3.9077e-5; Van der Pol mu = 100 was Ok at +1.7954, across the cycle, where it is -1.3244.
+# Newton's answer now passes _ode_on_branch as the continuation's does, or the continuation runs: both
+# are Ok on the branch root (0x3F047CD14A347ACC, 0xBFF530BC9574CED8). An answer the certificate passes
+# keeps 3.4.2's bits. On 6,000 random steps of A sin(B y) + D (backward Euler at max_newton 50 and
+# BDF-2; tol 1e-5, 1e-8, 1e-12), against a branch oracle (a scan of sigma at 400,000 points, the root
+# refined in 70-digit Decimal): 3.4.2 was Ok on 5,968, 2,592 on the branch, 3,322 on another root and 54
+# past a fold; this tree is Ok on 5,916, all on the branch but 5 past folds narrower than the gap between
+# samples (the limit above), and none of 3.4.2's 2,592 is refused. Near an equilibrium, where Newton's
+# move is a few ulps, none of 3.4.2's right answers is refused either (the 3.5.0 review block of
+# _ode_on_branch: 0 of 27,723 over three sets, at tol down to 2^-60), but for one class the slope test
+# since refuses there: an answer at which g' is not resolved from 0 (_ode_zslope's (5)).
+#   THE COST IS ON EVERY STEP THAT MOVES. A step Newton solves evaluates f once more per double the
+# certificate's 63 samples land on: all 63 on a move of 78 ulps or more (y' = -y at dt 0.1 from 1: 4 -> 67
+# evaluations, 69 with the slope's two secants since 3.5.0), fewer on a shorter move, where adjacent samples
+# round onto one double (y' = 3/2 - y at dt 1 moving 63 ulps reads 56, 40 ulps 40), none where the answer is y
+# itself (since 3.5.0 the slope's, unless f(t + dt, y) = 0; _ode_on_branch). On the sin set above 163,502 ->
+# 691,111 evaluations. In time, about 20 times a converging step: the bench row ode_bdf2_step 254 ->
+# 5,504 ns, backward Euler on y' = -y at dt 0.1 68 -> 1,439 ns, and on y' = -(y - 1e5) from 1e5 - 40 ulps
+# (a move of 4 ulps) 30 -> 580 ns; medians of five interleaved rounds against 3.4.2, taskset-pinned, on a
+# machine at load 3.5 to 3.9.
+# [measured: scratch harness (scratch_L5 p/oh.cyr, gensin.py, sinorc.py), 3.4.2 and this tree, 2026-11-14]
+# [measured: scratch A/B runner (scratch_L5 p/ab.bcyr), 3.4.2 and this tree, taskset -c 5, 2026-11-14]
+# [measured: tests/modules_d.tcyr, group "3.5.0 L5: Newton's answer carries the branch certificate"]
+# [measured: scratch probe (w5p pr/ulps.body: y' = 3/2 - y, moves of 40 to 140 ulps), this tree, 2026-11-14]
 # A failing step evaluates f at most 16 + 11 max_newton times more than 3.4.0's did (the
-# continuation's bound), 62 on top where the certificate is what refuses it, and a step the
-# continuation solves 63 more for the certificate;
-# measured on 11,755 review steps: at most 22 more at max_newton 1 (3.4.0's failing step: 4), 37 at 3
-# (8), 349 at 50 (102).
+# continuation's bound), 62 on top where the certificate is what refuses it, 63 where it refuses
+# Newton's answer, and a step the continuation solves 63 more for the certificate (3.5.0: on each
+# certificate the slope's 2 more where its differences are finite, 3 where its secants disagree, 4 at z = y
+# where g falls ahead of y, at most 10;
+# a step pays at most two certificates, Newton's answer's and the continuation's). 3.4.1 measured, on 11,755
+# review steps before Newton's answer was certified, at most 22 more at max_newton 1 (3.4.0's failing step:
+# 4), 37 at 3 (8), 349 at 50 (102); those counts are not re-derived since.
 # [measured: R2-NUM review cases py/ode_in.txt, 3.4.0 and the NUM3 tree, 2026-10-31]
 # ⭐ 3.4.0 — REPLACES ode_backward_euler, WHICH DID NOT REPORT NON-CONVERGENCE (audit
 # D070). It returned the last Newton iterate z in both failures above, and never tested
@@ -475,6 +524,8 @@ public fn ode_backward_euler_checked(f, t, y, dt, tol, max_newton, out) {
         var fz = fncall2(f, t_next, z);
         var g = f64_sub(z, f64_add(y, f64_mul(dt, fz)));
         if (f64_lt(f64_abs(g), tol) == 1) {
+            # Newton's root must be the branch's too (3.5.0): otherwise the continuation looks for it.
+            if (_ode_on_branch(f, t_next, y, _ODE_F64_ONE, dt, z, fz, tol) == 0) { break; }
             store64(out, z);
             return Ok(0);
         }
@@ -504,20 +555,24 @@ public fn ode_backward_euler_checked(f, t, y, dt, tol, max_newton, out) {
 # dt: time step (f64)
 # tol: Newton convergence tolerance (f64), on the residual |g(z)|
 # out: pointer, y_{n+1} (f64) written here on success
-# Returns: Ok(0) when an iterate's residual is below tol: first Newton's from the predictor,
-# 3.4.0's to the bit, at most 50 updates; where they do not get there, the step's own
-# continuation (_ode_continue: the root of g reached from the predictor as dt grows from 0,
-# at most 50 increments). Err(HSB_ERR_NO_CONVERGENCE) or Err(HSB_ERR_SINGULAR_MATRIX) when both
-# fail, with Newton's code (SINGULAR_MATRIX: g'(z) was not resolved from 0, _ode_newton_gp);
+# Returns: Ok(0) when an iterate's residual is below tol and it carries the certificate below:
+# first Newton's from the predictor, 3.4.0's bits, at most 50 updates; where they do not get there,
+# or reach a root the certificate refuses, the step's own continuation (_ode_continue: the root of
+# g reached from the predictor as dt grows from 0, at most 50 increments).
+# Err(HSB_ERR_NO_CONVERGENCE) or Err(HSB_ERR_SINGULAR_MATRIX) when both fail, with Newton's code
+# (SINGULAR_MATRIX: g'(z) was not resolved from 0, _ode_newton_gp);
 # `out` untouched on both; Err(HSB_ERR_INVALID_INPUT) for tol <= 0 or NaN, before f is called.
-# Every continuation answer carries a certificate, as ode_backward_euler_checked's, with its limits:
-# at 63 points from the predictor to the answer sigma(z) rises from 0 and stays below 1, at every
-# point that does not already meet |g| < tol (_ode_on_branch), so that it lies on the branch
-# through (dt = 0, predictor) with no fold before the full dt; without it the step fails.
-# Newton's answer is the root its iterates reach, which is not always that one
-# (3.4.0, kept). A failing step evaluates f at most 565 times more than 3.4.0's 101, 62 on top where
-# the certificate is what refuses it, measured on 11,755 review steps at most 343 more; a step the
-# continuation solves, 63 more.
+# Every answer carries a certificate (Newton's since 3.5.0, at 65 evaluations of f on a step that moves 78
+# ulps or more, the samples' 63 and the slope's 2, fewer samples on a shorter move, where adjacent ones round
+# onto one double, and up to 73 where the slope's differences are not finite, its secants disagree or the answer
+# is the predictor: ode_backward_euler_checked's 3.5.0 block), as ode_backward_euler_checked's, with
+# its limits: g rises into the answer from the predictor (_ode_zslope), and at 63 points from the predictor
+# to the answer sigma(z) rises from 0 and stays below 1, at every point that does not already meet |g| < tol
+# (_ode_on_branch), so that it lies on the branch through (dt = 0, predictor) with no fold before the full
+# dt; without it the step fails. A failing step evaluates f at most 565 times more than 3.4.0's 101, 62 on
+# top where the certificate is what refuses it (3.4.1's bound, and on 11,755 review steps at most 343 more,
+# measured before Newton's answer was certified); since 3.5.0 up to 73 more where the certificate refuses
+# Newton's answer, and the slope's 2 to 10 on the continuation's. A step the continuation solves, up to 73 more.
 # [measured: R2-NUM review cases py/ode_in.txt, 3.4.0 and the NUM3 tree, 2026-10-31]
 # ⭐ 3.4.0 — REPLACES ode_bdf2, which returned the last iterate z on both failures
 # (audit D070) and never tested the residual of its 50th update.
@@ -596,8 +651,12 @@ fn _ode_newton_gp(f, t, z, fz, c, g) {
 # updates, the residual tested before each and after the last; the slope g'(z) = 1 - beta dt f_y
 # from _ode_newton_gp, SINGULAR_MATRIX where it is not resolved from 0, NO_CONVERGENCE where it is
 # not finite or the updates run out). Only where that fails does the step's own continuation run
-# (_ode_continue), answering with Newton's code where it fails too: every step the 3.4.0 Newton
-# solved keeps its value and its evaluations. Ok(0) with z in `out`, or Err with `out` untouched.
+# (_ode_continue), answering with Newton's code where it fails too. Since 3.5.0 Newton's answer must
+# also pass _ode_on_branch (the slope's 2 evaluations where its differences are finite, at most 10, and one
+# per double it reads, at most 63; for z = pred the slope alone, none where f(t, pred) = 0), or the
+# continuation runs with NO_CONVERGENCE as the code. An answer the certificate passes keeps 3.4.0's bits,
+# and on the sets ode_backward_euler_checked's 3.5.0 block measures no 3.4.2 answer on the branch is
+# refused. Ok(0) with z in `out`, or Err with `out` untouched.
 fn _ode_bdf_newton(f, t, pred, beta, dt, tol, out) {
     var z = pred;
     var rc = HSB_ERR_NO_CONVERGENCE;
@@ -609,6 +668,8 @@ fn _ode_bdf_newton(f, t, pred, beta, dt, tol, out) {
         # Residual: g = z - pred - beta * h * f(t, z)
         var g = f64_sub(z, f64_add(pred, f64_mul(beta, f64_mul(dt, fz))));
         if (f64_lt(f64_abs(g), tol) == 1) {
+            # Newton's root must be the branch's too (3.5.0): otherwise the continuation looks for it.
+            if (_ode_on_branch(f, t, pred, beta, dt, z, fz, tol) == 0) { break; }
             store64(out, z);
             return Ok(0);
         }
@@ -683,13 +744,124 @@ fn _ode_cfirst(f, t, s, fs, cf, ds) {
     return f64_le(f64_abs(f64_sub(fp, fs)), f64_mul(_ODE_F64_HALF, f64_abs(fs)));
 }
 
-# Internal: the certificate of a continuation's answer z. With c = beta dt, sigma(p) = (p - s) / (c f(t, p))
-# and g(p) = p - s - c f(t, p): 1 when each of the _ODE_CONT_SCAN - 1 samples p from s to z either continues
-# sigma's rise from 0, below 1, or already meets |g| < tol as z does, and no sample past the root, sigma >= 1
-# or < 0, is followed by one back below it; 0 otherwise, NaN included (a NaN or infinite f at a sample fails
-# both tests). Sample i lies at (i + xi) / _ODE_CONT_SCAN of the move,
-# xi = ((i _ODE_CONT_GOLD mod 2^16) - 2^15) / 2^17, so |xi| < 1/4 and the gaps are 0.78 to 1.31 cells: at
-# most 1/48 of the move. Exactly _ODE_CONT_SCAN - 1 evaluations of f on a pass, fewer where it stops early.
+# Internal: g' = 1 - c f_y(t, z) of an implicit step, read as the secant of g over [z, z + h], h of either
+# sign (_ode_fy, which reads it again over h 2^-26 and h 2^-52 where the difference is not finite): 1 when
+# it is positive and resolved (_ode_gpos's margin, the one _ode_newton_gp reads as singular) or +Inf (c f_y
+# is -Inf); 0 when it is read and is neither; 2 when f_y has no finite difference. One evaluation of f,
+# three at most.
+fn _ode_gsec(f, t, z, fz, c, h) {
+    var fy = _ode_fy(f, t, z, fz, h);
+    if (f64_lt(f64_abs(fy), F64_POS_INF) == 0) { return 2; }                # no slope read
+    var cd = f64_mul(c, fy);
+    if (f64_lt(cd, 0) == 1 && f64_lt(f64_abs(cd), F64_POS_INF) == 0) { return 1; }   # -Inf: g' = +Inf
+    return _ode_gpos(f64_sub(_ODE_F64_ONE, cd), cd);
+}
+
+# Internal: |h| with the sign of m (a bit operation, as f64_copysign).
+fn _ode_dir(h, m) {
+    return (h & 0x7FFFFFFFFFFFFFFF) | (m & 0x8000000000000000);
+}
+
+# Internal: the slope test of _ode_on_branch at its answer z of z = s + c f(t, z), with fz = f(t, z) and m the
+# way from z into the step's path, its length included: s - z (onp = 1), or where z = s, c f(t, s), the move the
+# branch starts with (onp = 0; 3.5.0, the close-pairs row). 1 when g rises into z as it does at the branch's
+# root r, 0 when not.
+#   WHY INTO THE PATH. On the branch through (0, s) with no fold, g keeps the sign it has at s from s up to r,
+# so the secant of g from any point of [s, r) to r is positive. At the second root of a pair past r, g comes
+# back to 0 from the other side, and the secant from a point between the two roots is negative: the samples
+# miss such a pair inside their last gap, and one secant into the path sees it. Read toward s, the secant
+# never refuses r while its reach stays on the path; read away from s it refuses r wherever g turns back
+# within its reach past r, which is what the first 3.5.0 form did on every move that rose (below).
+#   THE STEP. Each secant is read first over hc = 2^-26 max(|z|, |m|): the scale of z and of c f(t, z), which
+# is about |m| at an answer, so that rounding in z, and in f to an ulp of c f, moves the slope by about 2^-26
+# (_ode_newton_gp's margin). Through the second 3.5.0 wave-2 review hc was 2^-26 |z|, Newton's step, which at
+# an answer nearer 0 than the move is below f's own rounding: y' = 1 + y/2 from y = -1 + 4.0e-9 (one root,
+# g' = 1/2) was refused (below). hc does not scale with the move where |z| is the larger, and a pair narrower
+# than hc lies inside it, where a secant over hc reads the pair's far side. So the secant out of the path is
+# read too, over the same hc. Where the two agree, g has one sign of slope across z, and that is the verdict;
+# a secant into the path that is not positive refuses on its own while hc is at most the path's length |m|,
+# since its reach is then on the path. Where they disagree, g turns within hc of z, and the secant into the
+# path is read again over hf = 2^-26 |m|, held to at least 2^-52 |z| (the next double) and at most |m|: the
+# step that scales with the move. That reading decides. At the second root of a pair at least hf wide it is
+# negative, and at r it is positive. Where hf is not below hc (|m| >= |z|), the first secant into the path
+# decides.
+#   z = s. No path lies behind s, and c f(t, s) is the forward-Euler move, which overstates the distance to the
+# branch's root by the factor g': on a stiff step the first secant ahead over hc reaches past r, so it never
+# refuses on its own here. Both secants are read. Where they disagree because g falls within hc ahead of s, g
+# turns there, before r or past it, and s is right only in the second case: the reading over hf ahead must
+# rise, and Newton's step from s at that slope must bring g at least halfway to 0 from g(s) = -m, or past it
+# (the contraction _ode_continue's corrector asks of each update; _ode_sfirst). Through the second wave-2
+# review the first secant refused alone here, and so refused r where g turned within hc past it.
+#   COST. Two evaluations of f where the differences are finite (one where the first secant refuses), three
+# where the two secants disagree, four at z = s where g falls ahead of s; at most ten, three a reading where
+# differences are not finite (_ode_fy).
+#   WHAT IT CANNOT SEE. (1) A pair narrower than hf, 2^-26 of the move, and one narrower than hc whose second
+# root has a third root of g within hc past it, where the secant out of the path rises too. (2) Where the move
+# is shorter than hc, the two secants reach behind s and past z, where the branch says nothing of g: turns of g
+# within hc on both sides of r refuse r. At z = s the same holds of turns within hc on both sides of s. (3) f's
+# rounding beyond an ulp of c f: f = exp(y) - 1 near 0 rounds at 2^-53 of e^y while |c f| is about |y|, so every
+# reading near 0 is rounding, and z is refused or passed by it. (4) It refuses an answer inside |g| < tol of r
+# at which g falls, although that answer meets the step's own test. (5) It refuses an answer at which g' is not
+# resolved from 0, the margin at which Newton's slope calls the equation singular, though the answer can be
+# right: y' = sin(y - C) at dt 1, where c f' = 1 at the equilibrium, has one root, and g' = 1 - cos(z - C) at an
+# answer within 5e-10 of C is below 1.1e-19. (6) At z = s: a fold of the branch ahead of s beyond hc where both
+# secants rise; one in the last half of the way to 0 (|g| < |g(s)| / 2 there) or past Newton's point q; and a dip
+# of g past tol between s and r that q lies beyond. s is passed there, as 3.4.2 passed every z = s unread.
+fn _ode_zslope(f, t, z, fz, c, m, onp) {
+    var am = f64_abs(m);
+    var hc = f64_abs(z);
+    if (f64_lt(hc, am) == 1) { hc = am; }
+    hc = f64_mul(hc, _ODE_F64_2_POW_M26);                                    # 2^-26 max(|z|, |m|)
+    var tc = _ode_gsec(f, t, z, fz, c, _ode_dir(hc, m));                     # into the path
+    if (tc == 0 && onp == 1 && f64_le(hc, am) == 1) { return 0; }            # g falls into z, on the path
+    var ac = _ode_gsec(f, t, z, fz, c, _ode_dir(hc, f64_neg(m)));            # out of the path
+    if (tc != 0 && ac != 0) { return 1; }
+    if (tc == 0 && ac == 0) { return 0; }
+    # The two disagree: g turns within hc of z. Read into the path again over 2^-26 of the move.
+    var hf = f64_mul(am, _ODE_F64_2_POW_M26);
+    var hz = f64_mul(f64_abs(z), _ODE_F64_2_POW_M52);
+    if (f64_lt(hf, hz) == 1) { hf = hz; }
+    if (f64_lt(am, hf) == 1) { hf = am; }
+    if (f64_lt(hf, hc) == 0) { return tc != 0; }                             # no finer step: tc decides
+    if (onp == 1 || tc != 0) { return _ode_gsec(f, t, z, fz, c, _ode_dir(hf, m)) != 0; }
+    return _ode_sfirst(f, t, z, fz, c, m, hf);                               # z = s, g falls within hc ahead
+}
+
+# Internal: the verdict of _ode_zslope at z = s where g falls within its first reach hc ahead of s (along
+# m = c f(t, s)) and does not fall behind s: 1 when g rises at s over hf ahead (_ode_gsec's verdict: positive and
+# resolved, +Inf, or no finite difference, where nothing is read) and Newton's step from s at that slope, q =
+# s + m / g', brings g(q) at least halfway to 0 from g(s) = -m, or past 0, or rounds onto s; 0 otherwise, NaN
+# included. Two evaluations of f, four at most.
+fn _ode_sfirst(f, t, s, fs, c, m, hf) {
+    var fy = _ode_fy(f, t, s, fs, _ode_dir(hf, m));
+    if (f64_lt(f64_abs(fy), F64_POS_INF) == 0) { return 1; }               # no slope read: s stands
+    var cd = f64_mul(c, fy);
+    if (f64_lt(cd, 0) == 1 && f64_lt(f64_abs(cd), F64_POS_INF) == 0) { return 1; }   # g' = +Inf
+    var gp = f64_sub(_ODE_F64_ONE, cd);
+    if (_ode_gpos(gp, cd) == 0) { return 0; }
+    var q = f64_add(s, f64_div(m, gp));                                      # the root the slope predicts
+    if (f64_eq(q, s) == 1) { return 1; }                                     # it rounds onto s
+    var gq = f64_sub(q, f64_add(s, f64_mul(c, fncall2(f, t, q))));
+    if (f64_lt(0, m) == 1) { gq = f64_neg(gq); }                             # g(s) = -m, taken as positive
+    return f64_le(gq, f64_mul(_ODE_F64_HALF, f64_abs(m)));                   # halfway to 0 from g(s), or past it
+}
+
+# Internal: the certificate of an implicit step's answer z (the continuation's, and Newton's since 3.5.0).
+# With c = beta dt, sigma(p) = (p - s) / (c f(t, p)) and g(p) = p - s - c f(t, p): 1 when each of the
+# _ODE_CONT_SCAN - 1 samples p from s to z either continues sigma's rise from 0, below 1, or already meets
+# |g| < tol as z does, and no sample past the root, sigma >= 1 or < 0, is followed by one back below it; 0
+# otherwise, NaN included (a NaN or infinite f at a sample fails both tests). Sample i lies at
+# (i + xi) / _ODE_CONT_SCAN of the move, xi = ((i _ODE_CONT_GOLD mod 2^16) - 2^15) / 2^17, so |xi| < 1/4
+# and the gaps are 0.78 to 1.31 cells: at most 1/48 of the move. A sample is the double f is read at, with
+# its own offset from s and the step's own residual (p - (s + c f), in doubles, as the step tests it); one
+# that rounds onto the last double read is that double, read once. One that rounds onto s carries no
+# sigma, only the direction the branch leaves s in, c f(t, s), read once: the move must follow it, or s
+# must already meet |g| < tol (and is then a sample past the root). Before any sample, g must rise into z
+# along the path (_ode_zslope, 3.5.0: secants of g read toward s); for z = s that is the whole test, read
+# along c f(t, s) with no path behind s (where g falls within the first reach ahead of s, Newton's step from s
+# must also bring g halfway to 0: _ode_sfirst), and 1 at once where f(t, s) = 0. At most _ODE_CONT_SCAN - 1
+# evaluations of f for the samples, one per double read, fewer where it stops early, and the slope's 2 (1
+# where its first secant refuses, 3 where its two secants disagree, 4 at z = s where g falls ahead, at most 10).
 #
 # Below sigma = 1 with sigma rising is the sign of g being the one it has at s, with no fold: a sample past
 # the branch's root has sigma >= 1, or sigma < 0 once f has changed sign, and past a fold sigma falls. The
@@ -697,15 +869,109 @@ fn _ode_cfirst(f, t, s, fs, cf, ds) {
 # first is as good an answer as z. But a sample back on s's side after one past the root has crossed the
 # root twice, so that z is on another root inside tol.
 #
-# What this cannot see. (1) A fold, or a pair of roots, narrower than the gap between samples: on the
-# review's sets dips of sigma 1e-10 to 3e-10 deep (one real root each, so the value is right), and on a fresh
-# triangle-wave set of 12,116 Oks at tol 1e-1 to 1e-12, 8 on the next root of a close pair, 0.2 to 8% of
-# the move past the branch's, at tol 1e-3 and 0.1, where |g| passes tol only between samples. (2) Roots
-# inside |g| < tol, which the step's own test does not tell apart (10 more of those 12,116). A wrong
-# answer either way is one the tolerance or the sampling could not exclude: no finite sample of a
-# black-box f is a proof. (3) It can refuse a right answer: past a fold with one real root (below), or
-# where samples round onto the ends of a move of a few ulps of s (2 of 6,408 on a stress set).
+# What this cannot see. (1) A fold narrower than the gap between samples: on the review's sets dips of sigma
+# 1e-10 to 3e-10 deep (one real root each, so the value is right); a pair of roots there when the answer is
+# a third root past them, where g rises again; and a pair whose second root is the answer, narrower than
+# 2^-26 of the move (through 3.5.0's review, any such pair inside the samples' last gap, and through its
+# second wave-2 review also a wider one at an answer nearer 0 than the move: the slope test, _ode_zslope,
+# whose limits these are). (2) Roots inside |g| < tol where g rises, which the step's own test
+# does not tell apart. A wrong answer either way is one the tolerance or the sampling could not exclude: no
+# finite sample of a black-box f is a proof. (3) It can refuse a right answer past a fold with one real
+# root (below); through 3.4.2 also where samples round onto the ends of a move of a few ulps of s (2 of 6,408
+# on a stress set; the 3.5.0 review block below); since 3.5.0 an answer inside |g| < tol of the branch's
+# root where g falls, and, where the move is shorter than 2^-26 |z|, a root with turns of g within
+# 2^-26 |z| on both sides (the slope test; at z = s, turns within 2^-26 max(|s|, |c f(s)|) on both sides of
+# s). (4) At z = s, a fold ahead of s in the last half of the way to 0, and a dip of g past tol that Newton's
+# step from s crosses whole (_ode_zslope's (6)).
 # [measured: scratch harness (NUM5-work py/cls.py, py/gx.py, py/off.py), 2026-11-01]
+#
+# ⛔ 3.5.0 (wave 2) — THE SECOND ROOT OF A CLOSE PAIR PASSED, AND z = s WAS NEVER READ. Where g rises through
+# the branch's root and falls back through a second one within the last gap between samples, no sample lands
+# between them, every sample reads sigma rising, and the second root was certified; and an answer with no
+# move returned 1 unread, though |g(s)| < tol says nothing of which root s is near. On the branch g keeps
+# s's sign up to its root, so g must rise into the answer along the path: the slope test, before any sample
+# (_ode_zslope). Its first form read one secant 2^-26 |z| above z: away from s on a rising move, toward s on
+# a falling one, so mirror-image steps got opposite verdicts (the 3.5.0 wave-2 review). Away from s it refused
+# the branch's own root wherever g turned back within that reach past it: f = y - G(y) from 0 at dt 1, tol
+# 1e-10, G = (y - 10) / 2 turning down 1e-7 past 10, was NO_CONVERGENCE where the merged tree's Ok(10) is the
+# exact root. Toward s it passed a pair narrower than the reach, and the reach grew with |z|, not the move.
+# The second form read the secants into the path, over 2^-26 |z| and, where the two disagree, over 2^-26 of the
+# move; the second review's repair is below. "The merged tree" here is the tree before wave 2.
+#   SETS. y' = A tri(B (y - Y0)) + D, backward Euler at max_newton 50 and BDF-2, tol 1e-1, 1e-3, 1e-5, 1e-8 or
+# 1e-12, A and D in [-10, 10], B in [0.1, 10], y - Y0 in [-20, 20], y_prev - y in [-1/2, 1/2], dt = e^U(-4.5,
+# 0.7): 20,000 steps (Python random seed 101) at Y0 = 0, and the same at Y0 = 1e6. An exact oracle in Fractions
+# (f is piecewise linear) calls an answer right when it is nearer the branch's root than any other root and
+# |g| < tol all the way to it (tol held to 4 ulps of z times 1 + |c A B|, below which a double z cannot go).
+# At Y0 = 0 the merged tree's 16,872 Oks held 142 wrong ones (88 on another root, 21 cut off from the branch's root by
+# |g| >= tol, 33 past a fold), 6 of them at tol 1e-3 to 1e-12; the second form's 16,753 hold 6, at tol 0.1 (2 cut off, 4
+# past a fold), with the first form's verdict and answer on every step. Below tol 0.1 every change is a wrong Ok gone.
+# At 0.1, 11 right answers are refused, each inside |g| < tol of the branch's root with g falling on both sides of it
+# (1.0 to 6.7 tol / g'(root) from the root: _ode_zslope's (4)), and 6 move to another right answer. At Y0 = 1e6, where
+# the solver's own reads over 2^-26 |z| move many verdicts of every tree, the changes from the merged tree are the same:
+# below tol 0.1 6 wrong Oks gone and nothing else, at 0.1 the same 11 right answers refused, and 6 wrong Oks left, all
+# at 0.1. The first form there kept 4 wrong Oks at tol 1e-3 and 1e-5, all on falling moves (3 on another root, 1 past a
+# fold), and refused 8 right answers at tol 1e-3 to 1e-12, all on rising moves. On A sin(B (y - Y0)) + D (seed 202,
+# 20,000 steps at each Y0; the steps that differ classified by a float branch scan), the second and first forms agree
+# on every verdict and answer at Y0 = 0; at 1e6, below tol 0.1, the only change from the merged tree is one fold removed
+# at 1e-3, where the first form also refused a right answer. Near equilibria (15,894 steps: y' = -(y - C) on the
+# reviewer's grid, linear, quadratic, exp and sin f within 40 ulps to 2^30 ulps of C, and dt 2^-20 to 2^-63 from y = 1;
+# tol to 2^-60), every verdict and answer is the first form's: of the merged tree's 14,197 Oks, 189 past a fold are
+# refused (c f' > 1 at an unstable equilibrium) and 29 right ones where g' is not resolved from 0 (_ode_zslope's (5)),
+# and nothing else changes; a slope read only over 2^-26 of the move refuses 14 more right answers and moves 3, which is
+# why the first secants span 2^-26 |z|. Evaluations, merged tree -> first -> second form: 2,013,527 -> 1,999,288 ->
+# 2,018,331 and 2,598,495 -> 2,587,965 -> 2,602,139 on the two tri sets, 2,153,920 -> 2,146,625 -> 2,166,654 and
+# 2,793,042 -> 2,788,710 -> 2,806,990 on the sin sets, 654,481 -> 668,727 -> 682,871 near equilibria: an answer pays 2
+# more, a refusal by the slope up to 62 fewer.
+# [measured: scratch harness (scratch_W5 h/gen.py, gen_eq.py, odeset.cyr, orc.py, sinorc.py), 3 trees, 2026-11-14]
+# [measured: tests/modules_d.tcyr, group "3.5.0 W5: the slope is read into the path, at two scales"]
+#   THE SECOND REVIEW. (1) The second form's first reach, 2^-26 |z|, is below f's rounding at an answer nearer 0
+# than the move: y' = 1 + y/2 by backward Euler from -1 + 4.0e-9 + 37 k ulps, k < 3,000 (dt 1, tol 1e-12; one
+# root, g' = 1/2), was NO_CONVERGENCE on 530 steps and the continuation's bits on 1,183, where the merged tree and
+# 3.4.2 are Ok on all 3,000, inside tol of the root; BDF-2 (dt 1.5), 322 and 624. And over 6.2e-19 its secants
+# saw f unchanged at the second root of a pair 0.002 wide at 1e-12 (backward Euler from -1, tol 1e-10), cut off
+# from the branch's root -0.002 by |g| up to 2e7 tol, and passed it. The first reach is now 2^-26 max(|z|, |m|):
+# on the 6,000 steps every answer is the merged tree's, bit for bit, at 2 more evaluations, and the pair's step
+# is Ok at the branch's root, 6.3e-12 past it. (2) At z = s its first secant ahead refused alone, though c f(s)
+# overstates the way to the root by g': BDF-2 from 1 (c = 1, tol 1e-6) on f = 1e-7 - 99 (y - 1), turning to
+# slope 1000 at 1 + 1.35e-9 to 1 + 1.33e-8 (35 steps), past the root at 1 + 1e-9, was NO_CONVERGENCE (mirrored,
+# the continuation's answer), where 1 is right and 3.4.2 returns it. Now both secants are read at z = s, and where
+# g falls within the first reach ahead, Newton's step from s must come halfway to 0 (_ode_sfirst): Ok at s on all
+# 70, in 5 evaluations at the first (3.4.2: 1; the second form: 19 and 89). The reading over hf alone would pass a fold
+# inside |g| < tol ahead of s.
+#   ITS SETS. The tri sets regenerated (an LCG for Python's random: 20,000 steps at Y0 = 0 and 1e6, and a third
+# at Y0 = 0) give the second form's verdict and answer on all 60,000, at 37 to 48 more evaluations per 20,000;
+# the sin sets the same but for one step at tol 0.1 and Y0 = 1e6, where s is now passed, cut off from the
+# branch's root by |g| up to 0.143 (_ode_zslope's (6)). Three new sets of 20,000 under the exact oracle, half
+# mirrored, backward Euler and BDF-2: a linear f whose root lies 1e-12 to 1e-2 from 0 on a move up to 20, where the
+# second form refused 31 right answers and moved 34, and this tree gives the merged tree's answer on every step;
+# a pair whose second root lies within 1e-6 of 0 (widths 1e-12 to 0.1, tol 1e-14 to 1e-2): right answers 15,748
+# -> 15,913, wrong ones 1,389 -> 2,118, where the second form's 340 on pairs wider than 4 x 2^-26 of the move,
+# with g past tol between the roots, fall to 2 (both at |g| = tol, the oracle's own edge), and the rest lie in
+# the limits stated: 536 pairs narrower than 4 x 2^-26 of the move, 1,580 pairs wholly inside |g| < tol (the
+# second form's reads over 2^-26 |z| refused some of them, and some right answers, by f's rounding); and z = s
+# with one turn of g within reach (BDF-2, c = 1): right 12,415 -> 12,422, Ok past a fold 906 -> 332 (read over
+# hf alone: 1,089). Near equilibria (162,000 steps: -(y - C), y - C, sin, a quadratic and exp(y - C) - 1, five C,
+# 81 offsets, four dt, five tol) every verdict and answer is the second form's but for 42 steps of exp(y) - 1
+# near 0, where f rounds at 2^-53 of e^y and every reading is rounding (_ode_zslope's (3)): its Oks at dt 2.5,
+# where g' < 0 and every Ok is wrong, 392 -> 358 of 1,600 (the merged tree: 970).
+# [measured: scratch harness (w5p pr/gen.body, fam.body, neq.body, mfa1.body, mfb.body, orc.py), 4 trees, 2026-11-14]
+# [measured: tests/modules_d.tcyr, group "3.5.0 W5: the slope's first reach, and the answer at s"]
+#   NO CHEAPER CERTIFICATE KEEPS ITS GUARANTEE. Wave 1's certificate costs a converging step about 20 times
+# 3.4.2's, all of it f at 63 samples. The direction test at s is the first sample's own; g'(z) <= 0 is a
+# fast refusal, now in place, but it cannot accept, since an answer past a narrow fold with g' > 0 needs the
+# samples to see the fold; a sufficient test would need a bound on f_y between samples, which a black-box
+# f does not give; and fewer samples widen the gap the guarantee is stated in (the 3.4.1 third review's
+# even spacing: 32 samples left 2 of 194 wrong answers, 64 none). Merged tree -> second form -> this tree,
+# medians of eleven interleaved rounds pinned to one core, two runs (load 1.8 to 1.9; then 3.8 to 4.0, with
+# outliers, so noisy): backward Euler on y' = -y at dt 0.1, 1,360 -> 1,436 -> 1,430 ns and 1,381 -> 1,465 ->
+# 1,465 (+5.2% and +6.1%; in the first run 1,348-1,368 against 1,381-1,439; the second form's own +2.5% did
+# not hold); ode_bdf2_step's step 5,217 -> 5,402 -> 5,427 and 5,328 -> 5,515 -> 5,525 (+4.0%, +3.7%);
+# Robertson's step, where the slope refuses Newton's answer before the samples, 4,445 -> 4,049 -> 4,056 and
+# 4,540 -> 4,146 -> 4,140 (-8.8% both); a BDF-2 step whose predictor is the answer with g turning past the root
+# (the second review's z = s case), 38 -> 544 -> 180 and 39 -> 556 -> 183 (the second form refused it, 3.4.2
+# reads nothing); y' = 1 + y/2 from -1 + 4.0e-9, 2,087 -> 886 -> 2,101 and 2,146 -> 903 -> 2,144 (the second
+# form refused it early).
+# [measured: scratch A/B (w5p pr/ab.body, 3 trees x 11 rounds), taskset -c 13 and -c 6, 2026-11-14]
 #
 # ⛔ 3.4.1 (fourth review) — THE CERTIFICATE WAS SKIPPED, AND EVENLY SPACED SAMPLES ALIAS. A gate ran it only
 # where 8 times the update just taken was below 1/64 of the move, but by then the residual test had passed,
@@ -745,26 +1011,74 @@ fn _ode_cfirst(f, t, s, fs, cf, ds) {
 # review's 11,755 that Ok'd keeps its bits.
 # [measured: scratch harness (NUM4-work k/odeh3.cyr, py/gen_ode3.py, py/oo.py, py/ana_ode3.py), 2026-11-01]
 # [measured: scratch harness (NUM5-work p/odv.cyr, py/cls.py, py/tab.py, py/gx.py, py/ga.py), 2026-11-01]
-fn _ode_on_branch(f, t, s, beta, dt, z, tol) {
+#
+# ⛔ 3.5.0 (review) — A MOVE OF A FEW ULPS WAS REFUSED, AND NEWTON'S ANSWERS ARE OFTEN SUCH MOVES. Each
+# sample was read at its unrounded offset u: sigma as u / (c f(p)) and the residual as |u - c f(p)|, for a
+# p = s + u that f is read at after rounding, up to half an ulp of s away. Where the move is a few ulps,
+# as near an equilibrium, those are not the step's numbers: for z = s, |u - c f| is |c f(s)| at every
+# sample, above a tol under half an ulp of s, although the step's own residual is 0; and samples on one
+# double read a sigma that falls at the next one wherever |f| grows along the move. Once Newton's answers
+# were certified, backward Euler on y' = -(y - 1e5) from 1e5 - 40 ulps (dt 0.01, tol 1e-12), Ok at the
+# correctly rounded root on 3.4.2, was NO_CONVERGENCE. On the reviewer's grid (y' = -(y - C), C = 1, 1e5,
+# 1e6, y = C + j ulps for j = -40..40, dt 0.01, 0.1, 1, tol 1e-12, 1e-10, 1e-8, backward Euler and BDF-2:
+# 4,374 steps) 463 of 3.4.2's 4,089 Oks were refused, every one on the branch by an exact oracle; on
+# 16,908 steps near other equilibria (stable and unstable linear, affine, sin, exp and quadratic f, tol
+# down to 2^-60), 3,430 of 3.4.2's right answers; on 7,920 steps of dt 2^-20 to 2^-63 from y = 1, 727.
+# Read as above, none of 3.4.2's right answers on the three sets (27,723) is refused, and every answer
+# both trees give has the same bits; the 48 3.4.2 Oks refused on the second set all lie past a fold (an
+# unstable equilibrium with c f' > 1), refused by design (below). The direction read at s is what a move of
+# one ulp has instead of samples: y' = y^2 - 1e6 from 1000 - 1 ulp, dt 0.01, where c f(s) < 0 and Newton
+# reaches 1000, past the fold the branch meets going down. On 26,000 larger moves (two sin sets, tol 1e-1
+# to 1e-12) every verdict and answer is the first form's, at the same or fewer evaluations; the three
+# sets above take 93,990, 341,260 and 348,560 (3.4.2 78,761, 294,458 and 19,478; the first form 325,771,
+# 1,167,603 and 502,794).
+# [measured: scratch harness (scratch_L5 p/oh.cyr, gen1.py, orc.py), 3.4.2, the first form and this tree, 2026-11-14]
+# [measured: tests/modules_d.tcyr, group "3.5.0 L5: Newton's answer near an equilibrium keeps 3.4.2's bits"]
+fn _ode_on_branch(f, t, s, beta, dt, z, fz, tol) {
     var dz = f64_sub(z, s);
+    var c = f64_mul(beta, dt);
+    if (f64_eq(dz, 0) == 1) {
+        # z is s: no move to read. f(t, s) = 0 makes s the root at every sigma; otherwise s meets
+        # |g| < tol without being a root, and it must lie where g rises, as the branch's root does.
+        if (f64_eq(fz, 0) == 1) { return 1; }
+        return _ode_zslope(f, t, z, fz, c, f64_mul(c, fz), 0);          # into the branch's first move
+    }
+    if (_ode_zslope(f, t, z, fz, c, f64_neg(dz), 1) == 0) { return 0; } # g does not rise into z from s
     var sp = 0;
     var past = 0;
+    var pp = s;                                                         # the last double read
+    var hs = 0;                                                         # 1: the direction at s is read
     var i = 1;
     while (i < _ODE_CONT_SCAN) {
         var n = (i << 17) + ((i * _ODE_CONT_GOLD) & 65535) - 32768;     # (i + xi) 2^17, |xi| < 1/4
-        var u = f64_mul(dz, f64_div(f64_from(n), _ODE_CONT_TAU));
-        var cf = f64_mul(beta, f64_mul(dt, fncall2(f, t, f64_add(s, u))));
-        var si = f64_div(u, cf);
-        var near = f64_lt(si, _ODE_F64_ONE) & f64_le(0, si);            # g has its sign at s
-        if (near == 0) {
-            past = 1;
-        } elif (past == 1) {
-            return 0;
-        }
-        if (near == 1 && f64_lt(sp, si) == 1) {
-            sp = si;
-        } elif (f64_lt(f64_abs(f64_sub(u, cf)), tol) == 0) {
-            return 0;
+        var p = f64_add(s, f64_mul(dz, f64_mul(f64_from(n), _ODE_CONT_TAU)));   # n 2^-23 exactly
+        if (f64_eq(p, s) == 1) {
+            if (hs == 0) {
+                # Onto s: the branch leaves s along c f(t, s), which the move must follow, or s must
+                # already meet |g| < tol (then a sample back below sigma = 1 is one past the root).
+                hs = 1;
+                var cs = f64_mul(beta, f64_mul(dt, fncall2(f, t, s)));
+                if ((f64_lt(0, dz) & f64_lt(0, cs)) + (f64_lt(dz, 0) & f64_lt(cs, 0)) == 0) {
+                    if (f64_lt(f64_abs(f64_sub(s, f64_add(s, cs))), tol) == 0) { return 0; }
+                    past = 1;
+                }
+            }
+        } elif (p != pp) {
+            pp = p;
+            var u = f64_sub(p, s);                                      # the offset of the double read
+            var cf = f64_mul(beta, f64_mul(dt, fncall2(f, t, p)));
+            var si = f64_div(u, cf);
+            var near = f64_lt(si, _ODE_F64_ONE) & f64_le(0, si);        # g has its sign at s
+            if (near == 0) {
+                past = 1;
+            } elif (past == 1) {
+                return 0;
+            }
+            if (near == 1 && f64_lt(sp, si) == 1) {
+                sp = si;
+            } elif (f64_lt(f64_abs(f64_sub(p, f64_add(s, cf))), tol) == 0) {
+                return 0;
+            }
         }
         i = i + 1;
     }
@@ -804,7 +1118,7 @@ fn _ode_on_branch(f, t, s, beta, dt, z, tol) {
 # - Err(rc) when the increment underflows (sigma + d_sigma == sigma) or after maxit increments,
 #   accepted or rejected (none when maxit is 0): at most 16 + 11 maxit evaluations of f (the
 #   first increment 16: f(s), the bisection's 12, a slope's 3; an increment 11: the predictor, a
-#   slope's 3, six chord updates and the midpoint), and the certificate's 63.
+#   slope's 3, six chord updates and the midpoint), and the certificate's 73 (its slope's 10, 63 samples).
 fn _ode_continue(f, t, s, beta, dt, tol, maxit, rc, fs, out) {
     if (maxit <= 0) { return Err(rc); }
     var c = f64_mul(beta, dt);
@@ -903,7 +1217,7 @@ fn _ode_continue(f, t, s, beta, dt, tol, maxit, rc, fs, out) {
         } else {
             if (last == 1) {
                 # The certificate, on every answer.
-                if (_ode_on_branch(f, t, s, beta, dt, zc, tol) == 0) { return Err(rc); }
+                if (_ode_on_branch(f, t, s, beta, dt, zc, fc, tol) == 0) { return Err(rc); }
                 store64(out, zc);
                 return Ok(0);
             }
@@ -944,11 +1258,16 @@ fn _ode_continue(f, t, s, beta, dt, tol, maxit, rc, fs, out) {
 # tol: Newton convergence tolerance (f64)
 # out: pointer, y_{n+1} (f64) written here on success
 # Returns: Ok(0) when an iterate's residual is below tol, Newton's (50 updates, 3.4.0's to
-# the bit) or else the step's own continuation's (_ode_continue, 50 increments; as
-# ode_bdf2_checked: certified on the branch through dt = 0, _ode_on_branch); Err(HSB_ERR_NO_CONVERGENCE) or
+# the bit, where it carries the certificate) or else the step's own continuation's (_ode_continue,
+# 50 increments; as ode_bdf2_checked: certified on the branch through dt = 0, _ode_on_branch);
+# Err(HSB_ERR_NO_CONVERGENCE) or
 # Err(HSB_ERR_SINGULAR_MATRIX) when both fail, with Newton's code;
-# Err(HSB_ERR_INVALID_INPUT) for an order outside 2..5, a history shorter than the
-# order, or tol <= 0 or NaN, before f is called. `out` is untouched on every Err.
+# Err(HSB_ERR_INVALID_INPUT) for a 0 history handle, an order outside 2..5, a history shorter
+# than the order, or tol <= 0 or NaN, before f is called. `out` is untouched on every Err.
+# ⛔ 3.5.0 -- A 0 HISTORY FAULTED (roadmap [3.5.0], INS5 F3): ode_bdf_checked(f, 0, 0, 2, h, tol, out)
+# read vec_len(0), exit 139. A 0 handle is the designed failure of hisab_vec_new and of every vec-
+# returning call here, so it is an input, refused as the short history is.
+# [measured: tests/modules_d.tcyr, group "3.5.0 L5: ode_bdf_checked refuses a 0 history"]
 # ⭐ 3.4.0 — REPLACES ode_bdf (audit D069, D070). It returned 0, a legal y, for an
 # invalid order or a short history, and the last iterate z on both Newton failures. No
 # value is right for an order the method does not have or a history it cannot read.
@@ -964,6 +1283,7 @@ fn _ode_continue(f, t, s, beta, dt, tol, maxit, rc, fs, out) {
 # and still pass. See tests/hisab.tcyr "ode_bdf: the full order-condition set".
 #must_use
 public fn ode_bdf_checked(f, t, history, order, dt, tol, out) {
+    if (history == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var hlen = vec_len(history);
 
     if (hlen < order) { return Err(HSB_ERR_INVALID_INPUT); }

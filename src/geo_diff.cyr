@@ -73,14 +73,6 @@
 # moves. It carries geo.cyr's face encoding for the branchy primitives and
 # GEO_FACE_NONE for the smooth ones, which is also what a miss carries.
 
-public var GEO_JET_MISS     = 0;
-public var GEO_JET_PLANE    = 1;
-public var GEO_JET_SPHERE   = 2;
-public var GEO_JET_TRIANGLE = 3;
-public var GEO_JET_AABB     = 4;
-public var GEO_JET_OBB      = 5;
-public var GEO_JET_CAPSULE  = 6;
-
 # ⛔ 3.3.1 — A MANUAL LAYOUT, AND NO STRUCT, ON PURPOSE. Through 3.3.0 this was
 # `#derive(accessors) struct _GeoJet`, and 3.3.0 said a consumer could no longer
 # change a jet's kind, t, ss or face. That was false on every consumer pin from
@@ -174,8 +166,11 @@ fn _geo_jet_axis(k, val) {
 # geo_ray_sphere and geo_ray_capsule return +Inf when the radius squared
 # overflows, and where `den` is then infinite, `1 / den` = 0 passes the reciprocal
 # test. Every builder now answers its miss for a t that is not finite, the house
-# test `f64_lt(|t|, +Inf) == 0`: an infinite t is not a hit (the slab routines'
-# own tail says so) and a NaN t is not a contact. Every jet with a finite t is
+# test `f64_lt(|t|, +Inf) == 0`: a NaN t is not a contact, and an infinite t has no
+# finite partials to carry (dt/dd = t dt/do), so no jet can describe it. (3.3.3 also
+# said the slab routines' tails treated +Inf as the miss; from 3.5.0 every ray routine,
+# the slabs included, answers a hit past DBL_MAX as +Inf, and the jets still answer
+# their miss for it, as they have for the other primals since 3.3.3.) Every jet with a finite t is
 # unchanged by it in every slot (41788
 # hits in the R5geo sweep: one input scalar of each builder set to NaN, +-Inf,
 # +-DBL_MAX or 2^600, and whole scenes scaled up to 2^1019). Of the sweep's 102300
@@ -237,6 +232,24 @@ fn _geo_jet_miss() {
     _GeoJet_set_ss(j, 0);
     _GeoJet_set_face(j, GEO_FACE_NONE);
     return j;
+}
+
+# The jet's kind tag, here and not at the top so that the declaration after a public enum is public
+# (check-public-surface.sh, item 5: cycc 6.6.2 and 6.6.3 export that slot). ⛔ 3.5.0 (K003) — ENUM
+# MEMBERS, NOT `public var`: through 3.4.2 these were `public var` globals a consumer could assign, and
+# each read was a memory load and a relocation.
+# `GEO_JET_SPHERE = 9;` after a sphere jet was built made geo_jet_sphere_dcenter refuse that jet (0);
+# against this file the assignment is a compile error ("cannot assign to enum constant").
+# [measured: scratch k003_probe, 3.4.2 base exit 42, this tree compile error, 2026-11-14; cycc 6.7.18]
+# Names and values are unchanged, so every read compiles as before.
+public enum GeoJetKind {
+    GEO_JET_MISS     = 0;
+    GEO_JET_PLANE    = 1;
+    GEO_JET_SPHERE   = 2;
+    GEO_JET_TRIANGLE = 3;
+    GEO_JET_AABB     = 4;
+    GEO_JET_OBB      = 5;
+    GEO_JET_CAPSULE  = 6;
 }
 
 # The slots every jet carries, whatever the primitive: its kind (GEO_JET_*), the hit
@@ -413,8 +426,7 @@ public fn geo_jet_plane(ray, plane) {
 
     var d = GeoRay_direction(ray);
     var n = GeoPlane_normal(plane);
-    var den = hvec3_dot(n, d);
-    var inv = f64_div(F64_ONE, den);
+    var inv = _geo_jet_plane_inv(n, d);
     if (f64_lt(f64_abs(inv), F64_POS_INF) == 0) { return _geo_jet_miss(); }
     # (3.4.1: the hit point on the stack, geo_ray_at's operations, so the same bits and one allocation
     # fewer.)
@@ -423,12 +435,30 @@ public fn geo_jet_plane(ray, plane) {
     store64(&p, f64_add(HVec3_x(o), f64_mul(HVec3_x(d), t)));
     store64(&p + 8, f64_add(HVec3_y(o), f64_mul(HVec3_y(d), t)));
     store64(&p + 16, f64_add(HVec3_z(o), f64_mul(HVec3_z(d), t)));
-    var dt_do = hvec3_scale(n, f64_neg(inv));
-    if (dt_do == 0) { return 0; }
-    var dt_dd = hvec3_scale(dt_do, t);
-    if (dt_dd == 0) { return 0; }
-    var sv = hvec3_scale(&p, f64_neg(inv));
-    if (sv == 0) { return 0; }
+    var dt_do = 0;
+    var dt_dd = 0;
+    var sv = 0;
+    if ((inv & 0x7FF0_0000_0000_0000) != 0) {
+        dt_do = hvec3_scale(n, f64_neg(inv));
+        if (dt_do == 0) { return 0; }
+        dt_dd = hvec3_scale(dt_do, t);
+        if (dt_dd == 0) { return 0; }
+        sv = hvec3_scale(&p, f64_neg(inv));
+        if (sv == 0) { return 0; }
+    } else {
+        # |n . d| past 2^1022: 1 / (n . d) is subnormal or 0, and n and p times it keep few bits or
+        # none (_geo_jet_plane_far).
+        dt_do = hvec3_new(0, 0, 0);
+        if (dt_do == 0) { return 0; }
+        sv = hvec3_new(0, 0, 0);
+        if (sv == 0) { return 0; }
+        var ddf = _geo_jet_plane_far(n, d, &p, dt_do, sv);
+        # (a subnormal 1 / (n . d) is already its own one rounding, 3.4.2's bits; a 0 one takes the far form's,
+        # which carries the sign)
+        if ((inv & 0x7FFF_FFFF_FFFF_FFFF) == 0) { inv = ddf; }
+        dt_dd = hvec3_scale(dt_do, t);
+        if (dt_dd == 0) { return 0; }
+    }
     # ⛔ 3.4.1 — A PARTIAL PAST DBL_MAX IS THE MISS JET, as the sphere, capsule and triangle jets
     # answer it (AU2-G2-F10): o (0, 0, 1) along (1, 0, -2^-600) meets z = 0 at t = 2^600, right,
     # and dt/dd_z = dt/dn_x = 2^1200 came back as +Inf in a hit jet. inv is finite here, so dt/ddist
@@ -452,6 +482,108 @@ public fn geo_jet_plane(ray, plane) {
     _GeoJet_set_ss(j, inv);
     _GeoJet_set_face(j, GEO_FACE_NONE);
     return j;
+}
+
+# 1 / (n . d) for geo_jet_plane, where n and d are finite and the primal hit (3.5.0): every partial of
+# the plane jet is a multiple of it. ⛔ THROUGH THE FIRST 3.5.0 PASS THIS WAS 1 / hvec3_dot(n, d), WHILE
+# geo_ray_plane CERTIFIES n . d (review of lane L1): on a ray whose n . d cancels, the repaired primal
+# returns the hit and the jet took the plain sum's rounding, a wrong sign as often as not. n = (0.4612,
+# -0.5419, 0.0175), d0 9.42, o = (-0.795, 9.24, 0.294), d = (-0.427, -0.981, -19.05) (bits in
+# tests/modules_d.tcyr) has exact n . d = +1.09e-17 and a hit at 0x43B2D70F4677554F; the jet was a hit jet
+# with dt/d(distance) = -1.80e16, where 1 / (n . d) = +9.18e16 (3.4.2 answered the primal's miss, and so
+# the miss jet). It is now formed as the primal forms n . d:
+#   * where geo_ray_plane's bound certifies the plain sum (|n . d| > 2^-16 S, S the sum of |n_i d_i|, and
+#     |n . d| at least DBL_MIN), that sum is within 2^-35 of itself with its exact sign, and the answer
+#     is 1 over it (3.4.2's bits: on this build the sum is hvec3_dot's wherever it is not zero);
+#   * anywhere else, geo_ray_plane's own t for the origin 0 and the plane n . x = s, s = +-1 (the plain
+#     sum's sign first, the other where that plane is behind): s / (n . d) from n . d correctly rounded,
+#     with geo_ray_plane's exact verdict, so the sign is the one the primal's hit was decided with.
+# Where both of those read 0, |1 / (n . d)| is below 2^-1075 (|n| |d| past 2^1075), and the answer is 0:
+# the caller forms every partial at unit size there, as wherever this is subnormal (_geo_jet_plane_far).
+# On 57,977 rays in six families (seeds 77 and 78; ordinary, n . d cancelling, d0 - n . o cancelling, mixed
+# scales, setter-built n and d past 2^512, t near DBL_MAX), against the exact partials: 3.4.2 had 2,695
+# hit jets with dt/d(distance) and dt/do past 2^-20 relative, 88 hit jets for exact misses and 252 miss
+# jets for hits whose partials are finite; the repaired primal with the plain 1 / den (the first 3.5.0 pass)
+# 33 hit jets of the wrong sign, 3,660 past 2^-20 and 331 such miss jets. This form: none of these, with
+# dt/d(distance), dt/do and dt/dd within 2^-30 on every hit jet, and every miss jet for a hit has a partial
+# past DBL_MAX. dt/dn = -p / (n . d) still carries p = o + t d's rounding: 329 past 2^-20 relative, all
+# where p cancels (the mixed-scale family), as many as 3.4.2 has there.
+# Cost: an ordinary hit 3-6 ns more than the plain 1 / den (154 and 156 ns against 151 and 150 over a 7-
+# and a 9-round run; 3.4.2 138 and 137, the rest the primal's certificate). The roadmap's ray, which the
+# probe answers, 1,032 ns against 598 (3.4.2's 141 is its wrong answer): one more geo_ray_plane by the sums.
+# [measured: scratch jet_sweep.py seeds 77-78, ab.cyr interleaved rounds, 3.4.2 vs this tree, 2026-11-14]
+fn _geo_jet_plane_inv(n, d) {
+    var px = f64_mul(HVec3_x(n), HVec3_x(d));
+    var py = f64_mul(HVec3_y(n), HVec3_y(d));
+    var pz = f64_mul(HVec3_z(n), HVec3_z(d));
+    var den = f64_add(f64_add(px, py), pz);
+    var sd = f64_add(f64_add(px & 0x7FFF_FFFF_FFFF_FFFF, py & 0x7FFF_FFFF_FFFF_FFFF), pz & 0x7FFF_FFFF_FFFF_FFFF);
+    var ad = den & 0x7FFF_FFFF_FFFF_FFFF;
+    if (f64_gt(ad, f64_mul(sd, 0x3EF0_0000_0000_0000)) == 1 && ad >= 0x0010_0000_0000_0000) {   # 2^-16, DBL_MIN
+        return f64_div(F64_ONE, den);
+    }
+    var zo: i64[3];
+    store64(&zo, 0);
+    store64(&zo + 8, 0);
+    store64(&zo + 16, 0);
+    var pr: i64[2];
+    GeoRay_set_origin(&pr, &zo);
+    GeoRay_set_direction(&pr, d);
+    var pp: i64[2];
+    GeoPlane_set_normal(&pp, n);
+    var s = F64_ONE;
+    if (den < 0) { s = f64_neg(F64_ONE); }   # (the plain sum's sign first: one call where it is right)
+    GeoPlane_set_distance(&pp, s);
+    var ti = geo_ray_plane(&pr, &pp);
+    if (f64_eq(ti, 0) == 1) {
+        s = f64_neg(s);
+        GeoPlane_set_distance(&pp, s);
+        ti = geo_ray_plane(&pr, &pp);
+        if (f64_eq(ti, 0) == 1) { return 0; }
+    }
+    return f64_mul(ti, s);
+}
+
+# geo_jet_plane's partials where |n . d| is past 2^1022 (3.5.0), so that 1 / (n . d) is subnormal or 0 and
+# the products n / (n . d) and p / (n . d) the jet forms from it keep few bits or none: dt/do is -n /
+# (n . d), degree 0 in n and -1 in d, and nothing about it is small. Through 3.4.2 the primal answered NaN
+# for most such rays (its n . o or n . d overflowed); the 3.5.0 primal answers them, and
+# n = (2^600, 0, 0), d = (2^500, 0, 0) from o = (-2^500, 0, 0) to the plane x = 0 is t = 1 with dt/do.x = -2^-500, where
+# 1 / (n . d) = 2^-1100 flushed it to -0 in a hit jet. Here n, d and p (the hit point) are each taken to
+# unit size by a power of two (_geo_jet_pow2_for: the largest component into [1, 2), [2, 4) from the top
+# binade), 1 / (n_s . d_s) is formed as geo_jet_plane forms it (inv_s, between 1/48 and about 2^1022 here,
+# since n . d is past about 2^1022 and each scale is at least 2^-1022), and each quotient is n_s inv_s or
+# p_s inv_s rounded once and taken back by its power of two (_geo_jet_ldexp, once more where it is
+# subnormal). Writes dt/do into dto and dt/dn into svo; returns dt/d(distance) the same way: the caller
+# keeps its own subnormal 1 / (n . d), one rounding where this is two, and reads this one only where its
+# own is 0, for the sign of the flushed 1 / (n . d). (An infinite inv_s, which the bound above excludes,
+# would make dt/do infinite or NaN, and the caller's partial test would answer the miss jet.) On 20,000
+# rays with |n| |d| past 2^1022 (seed 41), 9,939 hits have finite partials: 3.4.2's primal answered none
+# of them (NaN or the miss), and the repaired primal with the plain reciprocal gave 6,781 miss jets and
+# 3,158 hit jets with dt/do past 2^-30 (mostly zeros). Here every one is a hit jet with dt/d(distance),
+# dt/do and dt/dd within 2^-30 of their largest component or on the subnormal grid. Only rays with |n . d|
+# past 2^1022 come here: 1,543 of 47,000 mixed inputs moved.
+# [measured: scratch far_sweep.py seed 41, eqcmp.py seed 31, Python Fraction oracle, 2026-11-14]
+fn _geo_jet_plane_far(n, d, p, dto, svo) {
+    var sn = _geo_jet_pow2_for(_geo_jet_absmax_bits(n));
+    var sd = _geo_jet_pow2_for(_geo_jet_absmax_bits(d));
+    var sp = _geo_jet_pow2_for(_geo_jet_absmax_bits(p));
+    var ns: i64[3];
+    var ds: i64[3];
+    for (var i = 0; i < 3; i = i + 1) {
+        store64(&ns + i * 8, f64_mul(load64(n + i * 8), sn));
+        store64(&ds + i * 8, f64_mul(load64(d + i * 8), sd));
+    }
+    # (inv_s / 2, so that n_s and p_s, under 4, times it stay under 2^1023; the 2 goes back in the exponent)
+    var hi = f64_mul(_geo_jet_plane_inv(&ns, &ds), F64_HALF);
+    var en = (sn >> 52) - 1023;   # n_s = n 2^en, d_s = d 2^ed, p_s = p 2^ep
+    var ed = (sd >> 52) - 1023;
+    var ep = (sp >> 52) - 1023;
+    for (var k = 0; k < 3; k = k + 1) {
+        store64(dto + k * 8, f64_neg(_geo_jet_ldexp(f64_mul(load64(&ns + k * 8), hi), 1 + ed)));
+        store64(svo + k * 8, f64_neg(_geo_jet_ldexp(f64_mul(f64_mul(load64(p + k * 8), sp), hi), 1 + en + ed - ep)));
+    }
+    return _geo_jet_ldexp(hi, 1 + en + ed);
 }
 
 # The largest |component| of v as the bits of a non-negative f64 (a NaN sorts above
@@ -1638,10 +1770,22 @@ public fn geo_jet_sphere_dcenter(j) {
 }
 
 # dt/d(radius) of a sphere jet, an f64; 0 for any other kind, a miss included.
+# ⚠ That 0 is +0.0, a legal derivative no caller can tell from a real one (roadmap "Documented in
+# their own comments, the same class"): geo_jet_sphere_dradius_checked (3.5.0) refuses instead.
 #must_use
 public fn geo_jet_sphere_dradius(j) {
     if (_GeoJet_kind(j) != GEO_JET_SPHERE) { return 0; }
     return _GeoJet_ss(j);
+}
+
+# dt/d(radius) of a sphere jet as Ok(the f64) (3.5.0); Err(HSB_ERR_INVALID_INPUT) for a jet of any
+# other kind, a miss jet included (it has no t to differentiate: test geo_jet_hit to tell the two
+# apart), and for a 0 handle. geo_jet_sphere_dradius answers +0.0 in those cases.
+#must_use
+public fn geo_jet_sphere_dradius_checked(j) {
+    if (j == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_GeoJet_kind(j) != GEO_JET_SPHERE) { return Err(HSB_ERR_INVALID_INPUT); }
+    return Ok(_GeoJet_ss(j));
 }
 
 # dt/d(normal) of a plane jet (an HVec3, by reference), the partial with respect to the stored
@@ -1653,10 +1797,21 @@ public fn geo_jet_plane_dnormal(j) {
 }
 
 # dt/d(distance) of a plane jet, an f64 (1 / (n . d)); 0 for any other kind, a miss included.
+# ⚠ That 0 is +0.0, a legal derivative no caller can tell from a real one: see
+# geo_jet_plane_ddistance_checked (3.5.0).
 #must_use
 public fn geo_jet_plane_ddistance(j) {
     if (_GeoJet_kind(j) != GEO_JET_PLANE) { return 0; }
     return _GeoJet_ss(j);
+}
+
+# dt/d(distance) of a plane jet as Ok(the f64) (3.5.0); Err(HSB_ERR_INVALID_INPUT) for a jet of any
+# other kind, a miss jet included, and for a 0 handle. geo_jet_plane_ddistance answers +0.0 there.
+#must_use
+public fn geo_jet_plane_ddistance_checked(j) {
+    if (j == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_GeoJet_kind(j) != GEO_JET_PLANE) { return Err(HSB_ERR_INVALID_INPUT); }
+    return Ok(_GeoJet_ss(j));
 }
 
 # dt/d(min corner) of an AABB jet (an HVec3, by reference): non-zero only on the axis of the
@@ -1706,10 +1861,21 @@ public fn geo_jet_capsule_dend(j) {
 }
 
 # dt/d(radius) of a capsule jet, an f64; 0 for any other kind, a miss included.
+# ⚠ That 0 is +0.0, a legal derivative no caller can tell from a real one: see
+# geo_jet_capsule_dradius_checked (3.5.0).
 #must_use
 public fn geo_jet_capsule_dradius(j) {
     if (_GeoJet_kind(j) != GEO_JET_CAPSULE) { return 0; }
     return _GeoJet_ss(j);
+}
+
+# dt/d(radius) of a capsule jet as Ok(the f64) (3.5.0); Err(HSB_ERR_INVALID_INPUT) for a jet of any
+# other kind, a miss jet included, and for a 0 handle. geo_jet_capsule_dradius answers +0.0 there.
+#must_use
+public fn geo_jet_capsule_dradius_checked(j) {
+    if (j == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_GeoJet_kind(j) != GEO_JET_CAPSULE) { return Err(HSB_ERR_INVALID_INPUT); }
+    return Ok(_GeoJet_ss(j));
 }
 
 # dt/d(rotation): the WORLD-FRAME ANGULAR gradient, three components. A step

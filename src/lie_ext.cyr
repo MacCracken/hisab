@@ -47,6 +47,12 @@ var _LIE_SERIES_CUT = 0x3FB9_9999_9999_999A;  # 0.1
 # [measured: scratch harness, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
 var _SO3_ORTHO_TOL = 0x3E112E0BE826D695;  # 1e-9
 
+# 3.5.0: the value of an entry with none -- so3_from_axis_angle's zero axis -- the quiet NaN
+# (lie.cyr's _LIE_QNAN is that module's own name).
+enum _LieExtNaN {
+    _LEX_QNAN = 0x7FF8000000000000;   # the quiet NaN
+}
+
 # ================================================================
 # Internal helpers
 # ================================================================
@@ -113,11 +119,16 @@ fn _m3_commutator(a, b) {
 # Uses Mat3 from mat3.cyr. Column-major, 72 bytes.
 
 # Rodrigues formula: R = I + sin(a) * K + (1 - cos(a)) * K^2
-# where K = skew-symmetric matrix of normalized axis
+# where K = skew-symmetric matrix of normalized axis (any nonzero length is normalised). A
+# zero axis names no direction (3.5.0): at sin(angle) exactly 0 (angle +-0) every axis gives
+# the identity, which is returned; otherwise every entry has no value, NaN, as a NaN axis
+# gives (through 3.4.2 the identity at every angle). 0 when it cannot be allocated.
 public fn so3_from_axis_angle(axis, angle) {
     var nx = HVec3_x(axis); var ny = HVec3_y(axis); var nz = HVec3_z(axis);
     # 2.17.0: scaled norm, shared with lie.cyr — see `lie_norm3` there.
     var norm = lie_norm3(nx, ny, nz);
+    var c = f64_cos(angle);
+    var s = f64_sin(angle);
     # ⛔ Through 2.14.0 `norm`, the length of the caller's axis in the caller's own units,
     # was tested against an absolute 1e-12 (`EPSILON_F64`), and the fallback here, the
     # identity rotation, is a structurally valid element returned with no rc, so a caller
@@ -134,8 +145,15 @@ public fn so3_from_axis_angle(axis, angle) {
     # ⭐ 3.3.4: both ends of `norm` now take an exact power-of-two copy of the axis, as in
     # `su2_from_axis_angle` (lie.cyr), which says why; a zero axis keeps the identity.
     # Since 3.3.5 the top copy starts where 1/norm goes subnormal, as there.
+    # ⛔ 3.4.2 AND EARLIER -- AND THE ZERO AXIS GAVE THE IDENTITY AT EVERY ANGLE (AU2 §2b). ⭐ 3.5.0:
+    # only at s = 0 (then c = 1), where every axis gives I; otherwise the axis is NaN, as in
+    # lie.cyr's three maps, and every entry comes out NaN below.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: a zero axis names no direction"]
     if (f64_lt(norm, F64_TINY) == 1) {
-        if (f64_eq(norm, 0) == 1) { return m3_identity(); }
+        if (f64_eq(norm, 0) == 1) {
+            if (f64_eq(s, 0) == 1) { return m3_identity(); }
+            nx = _LEX_QNAN; ny = _LEX_QNAN; nz = _LEX_QNAN;
+        }
         var up = (1023 + 1023) << 52;   # 2^1023
         nx = f64_mul(nx, up); ny = f64_mul(ny, up); nz = f64_mul(nz, up);
         norm = lie_norm3(nx, ny, nz);
@@ -148,8 +166,6 @@ public fn so3_from_axis_angle(axis, angle) {
     }
     nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
 
-    var c = f64_cos(angle);
-    var s = f64_sin(angle);
     # ⛔ 3.4.0 AND EARLIER — 1 - cos(angle) by subtraction, which is exact where cos > 1/2
     # (Sterbenz) and so keeps only cos's own rounding, amplified by cos / (1 - cos): up to
     # 6e15 ulp at small angles, and exactly 0 below ~2^-26, dropping the n n^T term: axis
@@ -274,8 +290,8 @@ public fn so3_exp(omega) {
 # symmetric part R + R^T past it (3.4.1). A rotation by exactly pi has two logarithms,
 # +-pi n; the one with its largest axis component positive is returned. For a rotation
 # rounded to doubles (each entry within half an ulp of a rotation's), omega past a quarter
-# turn is within 7 ulps of pi of the exact log of R's polar factor, the first-order bound
-# derived below; the worst of 2,400,000 such rotations is 2.35 ulps of pi.
+# turn is within 7 ulps of pi of the exact log of R's polar factor (26.5 u, u = 2^-53, to all
+# orders, derived below); the worst of 2,400,000 such rotations is 2.35 ulps of pi.
 # R is meant to be a rotation, and this is no test that it is. A matrix with no rotation axis
 # in its symmetric part, such as -I (det -1), returns NaN in every slot (3.4.0 returned (0, 0,
 # pi)), but its neighbours are not rotations either and return finite logs: -0.999 I and the
@@ -410,15 +426,35 @@ public fn so3_log(R) {
         # accurate: the worst of one sample 2.27 ulps of pi against 1.78 here, its RMS 13-16% higher.
         # [measured: LIE2 lane, 32,000 rotations past a quarter turn, 50-digit polar-factor log, 2026-10-31]
         #
-        # The doc block's bound, to first order, with u = 2^-53. R = Q (I + S): Q the polar factor,
-        # S symmetric, ||S||_F <= 3 2^-54. Along omega: theta read from R is off by (sin / 2)
-        # n^T S n (at most 1.1 u near pi, where |a| stops following the sine), the roundings of
-        # the trace, |a| and atan2 add 2.6 u at pi, and nn, s and the product 4.5 u of theta: 17.8 u
-        # at most. Across it: v = (1 - c) n_k n + (sym(QS) - dc I) e_k with n_k^2 >= 1/3, so the
-        # axis moves by (1.5 u + 0.82 |dc|) / ((1 - c) n_k), 3.1 u at pi, and the roundings of v,
-        # n0 and omega add 3 u of it: 19.2 u at most. Together 26.2 u, 6.6 ulps of pi, both largest
-        # at theta = pi, n_k^2 = 1/3. The worst rotations found reach 0.41 of it.
+        # The doc block's bound, with u = 2^-53. R = Q (I + S): Q the polar factor, S symmetric,
+        # ||S||_F <= 3 2^-54. Along omega: theta read from R is off by (sin / 2) n^T S n (at most
+        # 1.1 u near pi, where |a| stops following the sine); ganita_f64_atan2 is atan(y / x) +
+        # fl(pi) for x < 0, and fl(pi) is 1.10 u below pi, so with that sum's rounding (half an ulp
+        # of pi, 2 u) theta is up to 3.1 u off at pi, attained at theta = pi - 2 u (the trace's and
+        # |a|'s roundings reach theta only through atan2's partials, (x, -y) / (x^2 + y^2), which
+        # tend to (-1, 0) at (y, x) = (0, -1), and y is that small there); nn, s and the product add
+        # 4.5 u of theta: 18.3 u at most. Across it: v = (1 - c) n_k n + (sym(QS) - dc I) e_k with
+        # n_k^2 >= 1/3, so the axis moves by (1.5 u + 0.82 |dc|) / ((1 - c) n_k), 3.1 u at pi, and
+        # the roundings of v, n0 and omega add 3 u of it: 19.2 u at most. Together 26.5 u, 6.6
+        # ulps of pi, both largest at theta = pi, n_k^2 = 1/3.
         # [measured: LIE4 lane so3bound.py, so3chk.py on review R2-LIE's worst of 2,400,000 + 120,000 fresh]
+        # ⛔ 3.4.1 -- THAT SUM WAS FIRST ORDER, AND TOOK atan2 AS ONE ROUNDING OF theta (2.6 u with the
+        # trace's and |a|'s), leaving out fl(pi)'s 1.1 u: 17.8 u along, 26.2 u in all.
+        # ⭐ 3.5.0 wave 2 -- to all orders: every step on this path is a rational map, a root or atan2
+        # away from its singular points ((y, x) within 2^-50 of the unit circle, |v| >= 1/3, |n0|
+        # within 2^-50 of 1), so what the first-order sum leaves out is a second-order remainder of
+        # at most half each step's second derivative times its perturbation squared: atan2's below
+        # 1 / (x^2 + y^2) <= 1.01 with (y, x) moved by under 4 u, v / |v|'s below 3 / |v|^2 <= 27
+        # with v moved by under 2 u, |n0|'s and the products' below 4 with their arguments moved by
+        # under 5 u: under 400 u^2 in all, 2^-44 u. The bound is 26.5 u (1 + 2^-44), 6.6 ulps of pi.
+        # Per target: atan2 is that quotient's atan plus fl(pi) on both, the atan x87's fpatan on
+        # x86 and ganita's polyfill on aarch64, each within 1 ulp of atan(y / x). At pi, where the
+        # bound is reached, the quotient is 0 and its atan's error with it, so the bound holds on
+        # aarch64 there; away from pi the polyfill may add up to half an ulp of atan(y / x) more
+        # than x87 does, not bounded here at every angle and not run on aarch64 (no such machine
+        # here). The worst rotations found reach 0.36 of the bound; bringing it toward their 2.35
+        # ulps needs the terms' worst cases correlated, which this sum of independent maxima is not.
+        # [measured: derived, not a run; fl(pi) - pi from a 50-digit pi, scratch, 2026-11-14]
         var nx = f64_div(vx, vn); var ny = f64_div(vy, vn); var nz = f64_div(vz, vn);
         var nn = f64_sqrt(f64_add(f64_add(f64_mul(nx, nx), f64_mul(ny, ny)), f64_mul(nz, nz)));
         var s = f64_div(theta, nn);
@@ -455,11 +491,13 @@ fn _se3_trans(se) { return load64(se + 8); }
 # ⚠ The pose stores the two HANDLES it is given, not copies (3.4.1 states it; it has
 # always been so): a later write through `rotation` or `translation` moves the pose, and
 # two poses built from one handle share it. Every other SE(3) operation here returns
-# fresh parts and never writes through a pose's. Neither handle is checked: a 0 part is
-# stored as given, and reading it faults, so pass the designed 0 of a refused
-# constructor only after checking it. Returns the 16-byte pose, or 0 when it cannot be
-# allocated.
+# fresh parts and never writes through a pose's. Returns the 16-byte pose, or the designed
+# 0 when either part is 0 -- a refused constructor's own 0, which is no part (3.5.0: through
+# 3.4.2 it was stored, and the first read of the pose faulted) -- or when it cannot be
+# allocated. A nonzero handle is not checked further: it must be an SU(2) element and an
+# HVec3.
 public fn se3_new(rotation, translation) {
+    if (rotation == 0 || translation == 0) { return 0; }
     return _se3_alloc(rotation, translation);
 }
 
@@ -635,6 +673,18 @@ public fn se3_transform_point(se, v) {
 # SE(3) exp: R = exp([omega]_x), t = V * v
 # where V = I + (1-cos(theta))/theta^2 * K + (theta - sin(theta))/theta^3 * K^2
 # and K = skew(omega), theta = |omega|
+# ACCURACY FOR theta >> 1 (3.5.0, stated; no code change): theta is |omega| rounded to a
+# double (lie_norm3, a few roundings), and the rotation is su2_exp's cos and sin of theta / 2,
+# so R carries about u theta (u = 2^-53): a relative u in omega moves R by as much, which makes
+# this the backward-stable answer, and ganita's / x87's cos and sin of a large argument add
+# their own reduction error on top. The translation does not grow with theta: every coefficient
+# of V's theta-dependent terms is O(1/theta). Measured against a __float128 evaluation of the
+# exact exponential of the given twist, 200 twists a binade from theta = 2^2 to 2^41 (two
+# seeds, 15,600 twists): |t - t_exact| (the Euclidean norm) at most 2.77 eps |v|, eps = 2^-52,
+# median 0.44, with no trend in theta (the review's case, omega = (-20003.5, -1460.7, 11232.7),
+# v = (-6.22, -2.29, 6.22), theta = 2^14.5, is 2.61); R's largest quaternion-part error at
+# most 1.14 u theta, median 0.20.
+# [measured: scratch se3orc.c (quadmath oracle), se3sweep.py, seeds 1 and 2, 2026-11-14; not reproducible in-tree]
 public fn se3_exp(twist) {
     var omega = _twist_omega(twist);
     if (omega == 0) { return 0; }
@@ -777,18 +827,31 @@ public fn se3_log(se) {
     # ⭐ 3.4.1 — log -q when w < 0: the same rigid motion, a turn of at most pi, where V is
     # well-conditioned. -q is q times the exact -1 (su2_compose by (-1, 0, 0, 0) negates
     # every component exactly). The 3.3.3 refusal is gone with the turns it refused.
-    # ⚠ COST: su2_to_quat allocates an HQuat on every call (and w < 0 two SU(2) temporaries
-    # more): se3_log +1.7% and +5.3% at a w > 0 element in two A/Bs, each inside its spread.
+    # ⚠ COST (3.4.1): su2_to_quat allocated an HQuat on every call to read w (and w < 0 two
+    # SU(2) temporaries more): se3_log +1.7% and +5.3% at a w > 0 element in two A/Bs, each
+    # inside its spread.
     # [measured: tests/hisab.bcyr se3_log, LIE lane A/B 2026-10-31]
-    var q0 = su2_to_quat(rot);
-    if (q0 == 0) { return 0; }
-    if (f64_lt(HQuat_w(q0), 0) == 1) {
-        var mq = hquat_new(0, 0, 0, f64_neg(F64_ONE));
-        if (mq == 0) { return 0; }
-        var m1 = su2_from_quat(mq);
-        if (m1 == 0) { return 0; }
-        rot = su2_compose(rot, m1);
-        if (rot == 0) { return 0; }
+    # ⭐ 3.5.0: w is read in place, the SU(2) element's first word (lie.cyr's documented
+    # layout { w, x, y, z }, as linalg_ext reads cmat's), the same bits su2_to_quat copied:
+    # 32 B less per call, and a w >= 0 element allocates nothing beyond what the log needs.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: se3_log reads w in place"]
+    # ⭐ 3.5.0 wave 2: and -q is formed on the stack, su2_compose(q, (-1, 0, 0, 0))'s products and
+    # sums written out (the same bits, zero signs included), for su2_log to read: a w < 0
+    # element allocates no more than a w > 0 one (3.4.1 and 3.4.2: an HQuat and two SU(2)
+    # elements, 96 B, more). Against 3.4.2, with the in-place w above, a turn of 5 allocates
+    # 776 -> 648 B and runs 925 -> 772 ns (a noisy A/B pinned to one cpu, 9 interleaved rounds,
+    # medians, load about 4.5).
+    # [measured: tests/modules_d.tcyr group "3.5.0 W7: se3_log's -q on the stack"]
+    # [measured: scratch se3 probe built from 3.4.2 (b175825) and this tree (cpu 9), 2026-11-14; not in-tree]
+    var nq: i64[4];
+    if (f64_lt(load64(rot), 0) == 1) {
+        var qw = load64(rot); var qx = load64(rot + 8); var qy = load64(rot + 16); var qz = load64(rot + 24);
+        var m1 = f64_neg(F64_ONE);
+        store64(&nq, f64_sub(f64_mul(qw, m1), f64_add(f64_add(f64_mul(qx, 0), f64_mul(qy, 0)), f64_mul(qz, 0))));
+        store64(&nq + 8, f64_add(f64_add(f64_mul(qw, 0), f64_mul(qx, m1)), f64_sub(f64_mul(qy, 0), f64_mul(qz, 0))));
+        store64(&nq + 16, f64_add(f64_add(f64_mul(qw, 0), f64_mul(qy, m1)), f64_sub(f64_mul(qz, 0), f64_mul(qx, 0))));
+        store64(&nq + 24, f64_add(f64_add(f64_mul(qw, 0), f64_mul(qz, m1)), f64_sub(f64_mul(qx, 0), f64_mul(qy, 0))));
+        rot = &nq;
     }
 
     # Get omega from rotation

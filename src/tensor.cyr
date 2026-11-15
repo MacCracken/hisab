@@ -47,7 +47,8 @@ public fn tensor_new(rank, shape) {
     return t;
 }
 
-# Compute flat index from multi-index (row-major)
+# Compute flat index from multi-index (row-major). Unchecked: the callers below either built the
+# indices in range (`tensor_contract`) or checked them (`_tensor_flat_checked`).
 fn _tensor_flat_idx(t, indices) {
     var rank = HTensor_rank(t);
     var shape = HTensor_shape(t);
@@ -62,40 +63,83 @@ fn _tensor_flat_idx(t, indices) {
     return idx;
 }
 
-# The element at the multi-index `indices` (rank i64s, row-major), as f64 bits.
-# ⚠ UNCHECKED, by design of a raw accessor: neither t nor the indices are validated, and
-# an index outside its extent reads outside the tensor's data (a 0 t faults). The
-# bounds contract is a [3.5.0] question (an f64 return has no failure value).
-public fn tensor_get(t, indices) {
-    var flat = _tensor_flat_idx(t, indices);
-    return load64(HTensor_data(t) + flat * 8);
+# The flat index of the multi-index `indices` in t, or a negative HSB_ERR_* code:
+# HSB_ERR_INVALID_INPUT for t = 0 (or indices = 0 at a rank above 0), HSB_ERR_OUT_OF_RANGE for an
+# index outside [0, extent) on its axis.
+fn _tensor_flat_checked(t, indices) {
+    if (t == 0) { return HSB_ERR_INVALID_INPUT; }
+    var rank = HTensor_rank(t);
+    if (rank == 0) { return 0; }
+    if (indices == 0) { return HSB_ERR_INVALID_INPUT; }
+    var shape = HTensor_shape(t);
+    var i = 0;
+    while (i < rank) {
+        var k = load64(indices + i * 8);
+        if (k < 0 || k >= load64(shape + i * 8)) { return HSB_ERR_OUT_OF_RANGE; }
+        i = i + 1;
+    }
+    return _tensor_flat_idx(t, indices);
 }
 
-# Store the f64 bits `val` at the multi-index `indices`. Returns 0. ⚠ UNCHECKED, as
-# tensor_get: an out-of-range index writes outside the tensor's data.
-public fn tensor_set(t, indices, val) {
-    var flat = _tensor_flat_idx(t, indices);
+# ⛔ 3.5.0 — tensor_get, tensor_set, tensor_get2 AND tensor_set2 NEVER RANGE-CHECKED THEIR
+# INDICES (roadmap [3.5.0], AU3-F12 = AU2-G3-F11, rated high): on shape [2, 2], tensor_set(t, [2,
+# 0], 999.0) overwrote the next tensor's rank, and [-1, 0] t's own shape[0]; the 2-D pair read
+# the column count past a rank-1 shape array. An f64 has no failure value, so the readers could
+# not refuse in place: the four are retired for the `_checked` forms below, which return a Result
+# and touch nothing on a refusal. (Inside this file and einsum.cyr the multi-index is built in
+# range, and read unchecked.)
+
+# The element at the multi-index `indices` (rank i64s, row-major), as `Ok(bits)`;
+# `Err(HSB_ERR_OUT_OF_RANGE)` for an index outside [0, extent) on its axis,
+# `Err(HSB_ERR_INVALID_INPUT)` for t = 0 or indices = 0 (a rank-0 tensor reads its one element and
+# no index). `indices` must hold rank values: its length cannot be checked.
+#must_use
+public fn tensor_get_checked(t, indices) {
+    var flat = _tensor_flat_checked(t, indices);
+    if (flat < 0) { return Err(flat); }
+    return Ok(load64(HTensor_data(t) + flat * 8));
+}
+
+# Store the f64 bits `val` at the multi-index `indices`, `Ok(0)`, with `tensor_get_checked`'s
+# Errs, before anything is written.
+#must_use
+public fn tensor_set_checked(t, indices, val) {
+    var flat = _tensor_flat_checked(t, indices);
+    if (flat < 0) { return Err(flat); }
     store64(HTensor_data(t) + flat * 8, val);
-    return 0;
+    return Ok(0);
 }
 
 # ================================================================
 # 2D convenience (matrix-like access)
 # ================================================================
 
-# The element (i, j) of a rank-2 tensor (row i, column j), as f64 bits. ⚠ UNCHECKED, as
-# tensor_get, and the rank is not checked: below rank 2 the column count is read past
-# the shape array.
-public fn tensor_get2(t, i, j) {
+# Cost: 18 -> 36 ns against 3.4.2's unchecked `tensor_get2` (the bound tests and the Result).
+# [measured: scratch bench/ab.cyr, 3.4.2 and this tree interleaved x 6, taskset, 2026-11-14; noisy, 8 lanes]
+# The element (i, j) of a rank-2 tensor (row i, column j), as `Ok(bits)`;
+# `Err(HSB_ERR_OUT_OF_RANGE)` for i or j outside its extent, `Err(HSB_ERR_INVALID_INPUT)` for t = 0
+# or a rank other than 2.
+#must_use
+public fn tensor_get2_checked(t, i, j) {
+    if (t == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (HTensor_rank(t) != 2) { return Err(HSB_ERR_INVALID_INPUT); }
+    var rows = load64(HTensor_shape(t));
     var cols = load64(HTensor_shape(t) + 8);
-    return load64(HTensor_data(t) + (i * cols + j) * 8);
+    if (i < 0 || i >= rows || j < 0 || j >= cols) { return Err(HSB_ERR_OUT_OF_RANGE); }
+    return Ok(load64(HTensor_data(t) + (i * cols + j) * 8));
 }
 
-# Store `val` at (i, j) of a rank-2 tensor. Returns 0. ⚠ UNCHECKED, as tensor_get2.
-public fn tensor_set2(t, i, j, val) {
+# Store `val` at (i, j) of a rank-2 tensor, `Ok(0)`, with `tensor_get2_checked`'s Errs, before
+# anything is written.
+#must_use
+public fn tensor_set2_checked(t, i, j, val) {
+    if (t == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (HTensor_rank(t) != 2) { return Err(HSB_ERR_INVALID_INPUT); }
+    var rows = load64(HTensor_shape(t));
     var cols = load64(HTensor_shape(t) + 8);
+    if (i < 0 || i >= rows || j < 0 || j >= cols) { return Err(HSB_ERR_OUT_OF_RANGE); }
     store64(HTensor_data(t) + (i * cols + j) * 8, val);
-    return 0;
+    return Ok(0);
 }
 
 # ================================================================
@@ -223,7 +267,7 @@ public fn tensor_contract(t, idx_i, idx_j) {
             # Build full index with ii=k, jj=k, all others=0
             store64(full_idx + ii * 8, k);
             store64(full_idx + jj * 8, k);
-            sum = f64_add(sum, tensor_get(t, full_idx));
+            sum = f64_add(sum, load64(HTensor_data(t) + _tensor_flat_idx(t, full_idx) * 8));
             k = k + 1;
         }
         store64(HTensor_data(result), sum);
@@ -272,7 +316,7 @@ public fn tensor_contract(t, idx_i, idx_j) {
         while (k < dim) {
             store64(full_idx + ii * 8, k);
             store64(full_idx + jj * 8, k);
-            sum = f64_add(sum, tensor_get(t, full_idx));
+            sum = f64_add(sum, load64(HTensor_data(t) + _tensor_flat_idx(t, full_idx) * 8));
             k = k + 1;
         }
         store64(rd + out_idx * 8, sum);

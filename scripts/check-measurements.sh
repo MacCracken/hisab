@@ -581,6 +581,10 @@ MARKER_LOOSE = re.compile(r'\[\s*measured\b[^\]]*\]?', re.I)
 
 
 def shapes_in(comment):
+    # 3.5.0 L8: a marker is provenance, not a claim. Its own word `measured` read as the vocab
+    # shape, so every paragraph holding one held a "claim", and checking markers only in claim
+    # paragraphs looked complete while it rested on that accident (RV-INS N2).
+    comment = MARKER.sub(' MARKER ', comment)
     n = neutralise(comment)
     found = {k for k, rx in SHAPES if rx.search(n)}
     found |= {k for k, rx in RAW_SHAPES if rx.search(comment)}
@@ -681,14 +685,32 @@ def check_path(src, m):
             return False, f'{path} has {total} lines, marker cites line {ln}'
     if os.path.basename(path) == BENCH_CSV:
         rest = src[m.end():].strip()
+        # `bench-history.csv's 2.6.15 before-row` cites the file in prose: no row name follows.
+        if rest.startswith("'s ") or rest == "'s":
+            return True, f'resolves to {path}'
         if rest and rest.split()[0] not in bench_names():
             return False, f'no benchmark named {rest.split()[0]!r} in {BENCH_CSV}'
     return True, f'resolves to {path}'
 
+# ⛔ 3.5.0 L8 -- AND THE FILES AT THE TOP OF THE TREE WERE NOT IN IT. A path needed a slash to be
+# hisab's, so a free-text marker could cite `CHANGELOG.md:99999999` or `bench-history.csv
+# no_such_row` past its opening token and neither the line nor the row was checked (RV-INS N2).
+# A bare name that is a file at the repo root, compared without case so a mis-cased one reads as
+# the tree's and fails, is a tree path now: its line and its benchmark row must exist.
+_root_files = None
+def root_files():
+    global _root_files
+    if _root_files is None:
+        _root_files = {f.lower() for f in os.listdir('.') if os.path.isfile(f)}
+    return _root_files
+
 def in_tree(tok):
-    """Does this path token point into one of the repo's own directories? (`./` allowed)"""
+    """Does this path token point into one of the repo's own directories, or name a file at its
+    root? (`./` allowed)"""
     t = re.sub(r'^(?:\./)+', '', tok)
-    return '/' in t and t.split('/', 1)[0] in TREE_DIRS
+    if '/' not in t:
+        return t.lower() in root_files()
+    return t.split('/', 1)[0] in TREE_DIRS
 
 def other_repo(src, pos):
     """Is the token at pos owned by another repository (OTHER_REPOS)?"""
@@ -720,13 +742,22 @@ def check_marker(src):
     # a token, `./tests/x` is a tree path, and a path another repo owns by the possessive
     # or a colon (OTHER_REPOS) is not checked here.
     # MARKER_SELFTEST below pins each shape.
+    # ⛔ 3.5.0 L8 -- A MARKER THAT OPENED WITH A PATH HAD ONLY THAT PATH CHECKED: it returned there,
+    # so `tests/abuse.tcyr and tests/no_such.tcyr` resolved. The opening path is checked first,
+    # and then every other tree path in the marker, as in a free-text one.
     off = len(src) - len(src.lstrip('([{"\'`'))
     m = PATH_TOKEN.match(src, off)
-    if m and names_file(m.group(1)):
-        return check_path(src, m)
-    version_led = bool(m and VERSION_TOKEN.match(m.group(1))) or bool(VERSION_WORD.match(src, off))
-    start = m.end() if (m and VERSION_TOKEN.match(m.group(1))) else off
     named = None
+    if m and names_file(m.group(1)):
+        ok, note = check_path(src, m)
+        if not ok:
+            return ok, note
+        named = note
+        start = m.end()
+        version_led = False
+    else:
+        version_led = bool(m and VERSION_TOKEN.match(m.group(1))) or bool(VERSION_WORD.match(src, off))
+        start = m.end() if (m and VERSION_TOKEN.match(m.group(1))) else off
     for t in PATH_TOKEN.finditer(src, start):
         if t.start() > 0 and not TOKEN_START.match(src[t.start() - 1]):
             continue                 # inside a longer token
@@ -977,7 +1008,28 @@ MARKER_SELFTEST = [
     ('broken', "Ganita 1.2.15's src/no_such_r3a.cyr", 'does not exist: src/no_such_r3a.cyr'),
     ('broken', "CYRIUS:tests/no_such_r3b.tcyr", 'does not exist: tests/no_such_r3b.tcyr'),
     ('broken', "ganita\u2019s src/no_such_r3c.cyr", 'does not exist: src/no_such_r3c.cyr'),
+    # 3.5.0 L8 (RV-INS N2): a file at the top of the tree is the tree's wherever a marker names it,
+    # its case included; a marker that opens with a path has every other tree path checked too;
+    # the CSV cited in prose (`'s`) names no row.
+    ('broken', "lane L8 rerun, CHANGELOG.md:99999999", 'marker cites line 99999999'),
+    ('broken', "lane L8 rerun, bench-history.csv no_such_l8_row", "no benchmark named 'no_such_l8_row'"),
+    ('broken', "lane L8 rerun, changelog.md", 'does not exist: changelog.md'),
+    ('path',   "lane L8 rerun, CHANGELOG.md", ''),
+    ('free',   "lane L8 rerun, no_such_l8_scratch.md", ''),
+    ('broken', "tests/abuse.tcyr and tests/no_such_l8.tcyr", 'does not exist: tests/no_such_l8.tcyr'),
+    ('broken', "scripts/check-measurements.sh, CHANGELOG.md:99999999", 'marker cites line 99999999'),
+    ('path',   "tests/abuse.tcyr and scripts/check-measurements.sh", ''),
+    ('path',   "docs/audit/2026-08-03.md, a row; bench-history.csv's 2.6.15 before-row", ''),
 ]
+# 3.5.0 L8 (RV-INS N2): every FILE_EXT entry pinned, written out here rather than read from FILE_EXT
+# so that dropping one (`in` passed the selftest through 3.4.2) misclassifies its row; and an entry
+# added to FILE_EXT without one here fails the selftest too.
+_PINNED_EXT = ('cyr tcyr bcyr fcyr cyml toml sh md csv yml yaml txt py json lock patch diff tsv log html svg '
+               'png pdf gz tar zip bin c h cc cpp cxx hpp hh rs go java js mjs ts rb pl lua s asm am ac in mk '
+               'cmake ini cfg conf xml rst tex el zsh bash awk jl hs ml zig swift sql dat npy npz ipynb xz bz2 '
+               'zst tgz so elf').split()
+MARKER_SELFTEST += [('broken', f"no_such_l8_ext.{e} rerun", f"does not exist: no_such_l8_ext.{e}")
+                    for e in _PINNED_EXT]
 
 if mode == 'selftest':
     want_hit = [t for lab, t in SELFTEST if lab == '+']
@@ -1014,10 +1066,11 @@ if mode == 'selftest':
           f"marker(s) classified as labelled ===")
     for lab, src, note in mk_bad:
         print(f"  MISCLASSIFIED (want {lab}): [measured: {src}] -> {note}")
-    if missed or alarms or mk_bad:
-        sys.exit(1)
-    print("Every planted claim is flagged and no decoy is.")
-    sys.exit(0)
+    unpinned = sorted(FILE_EXT - set(_PINNED_EXT))
+    if unpinned:
+        print(f"  FILE_EXT entries with no pinned row in _PINNED_EXT: {', '.join(unpinned)}")
+    # The paragraph half runs once paragraphs() is defined, below (3.5.0 L8).
+    st_failed = bool(missed or alarms or mk_bad or unpinned)
 
 # ---------------------------------------------------------------------------
 # 4. PARAGRAPHS
@@ -1049,6 +1102,87 @@ def paragraphs(path):
             prev_no = no
     return out
 
+def bad_markers_of(p):
+    """Every marker in a paragraph that names something absent, as (path, line, source, note)."""
+    out = []
+    for mno, src in p.markers:
+        ok, note = check_marker(src)
+        if not ok:
+            # ⛔ 2.19.0 -- THIS RECORDED `p.lines[0][0]`, THE PARAGRAPH'S FIRST
+            # LINE, AND THAT MADE --diff MODE BLIND TO ITS OWN DOMINANT CASE.
+            # --diff keeps a finding only when its (path, line) is in the set of
+            # lines the branch ADDED. A marker naming a file that does not exist,
+            # appended to an EXISTING comment block, was therefore filed against a
+            # PRE-EXISTING line and intersected away -- while the malformed-marker
+            # arm forty lines below already recorded the marker's own line and was
+            # caught. Measured on this tree with one bad marker, two placements:
+            # appended to the paragraph at src/vec3.cyr:126, `--diff HEAD` exits 0
+            # and prints "Every measurement claim added on this branch names its
+            # source" (the full-tree scan exits 1 and counts it); the identical
+            # marker as its own new paragraph exits 1. ⚠ It was worse than silent:
+            # the fabricated marker SATISFIED the real claim beside it, so tree-wide
+            # unmarked fell by one and the gate got GREENER for the bad edit.
+            # CI runs --diff only, so this was the shape a PR could always land.
+            # [measured: scripts/check-measurements.sh two-placement probe, 2026-09-10]
+            out.append((p.path, mno, src, note))
+    return out
+
+def para_findings(p):
+    """(claim lines, broken markers) of one paragraph.
+    ⛔ 3.5.0 L8 -- A MARKER WAS CHECKED ONLY WHERE ITS PARAGRAPH HELD A CLAIM THE DETECTOR
+    RECOGNISED (RV-INS N2), so a marker beside a claim worded past the shapes could name a
+    deleted file. Every marker is checked now, whatever the paragraph says."""
+    hits = [(no, c, shapes_in(c)) for no, c in p.lines]
+    hits = [(no, c, k) for no, c, k in hits if k]
+    return hits, bad_markers_of(p)
+
+if mode == 'selftest':
+    # 3.5.0 L8: a marker is checked whatever its paragraph says. Two planted paragraphs, one
+    # holding a claim the detector reads and one worded past every shape, each with a marker
+    # naming a missing file: both must be reported, and a marker that resolves must not be.
+    import tempfile
+    planted = ("# A sweep of 4,000 rays took 12 ms.\n"
+               "# [measured: tests/no_such_l8_claim.tcyr]\n"
+               "var _l8_a = 0;\n"
+               "# The bound holds for every ray the generator draws.\n"
+               "# [measured: tests/no_such_l8_prose.tcyr]\n"
+               "var _l8_b = 0;\n"
+               "# The bound holds again.\n"
+               "# [measured: scripts/check-measurements.sh --selftest]\n")
+    with tempfile.NamedTemporaryFile('w', suffix='.cyr', delete=False) as fh:
+        fh.write(planted)
+    try:
+        found = [para_findings(pp) for pp in paragraphs(fh.name)]
+        got = sorted(src for _, bad in found for _, _, src, _ in bad)
+        claims = [bool(hits) for hits, _ in found]
+    finally:
+        os.unlink(fh.name)
+    want = ['tests/no_such_l8_claim.tcyr', 'tests/no_such_l8_prose.tcyr']
+    para_ok = got == want and claims == [True, False, False]
+    print(f"=== selftest: paragraph markers {'checked in claim and prose paragraphs' if para_ok else 'WRONG'}"
+          f" ({len(got)} of 2 planted broken markers reported) ===")
+    if not para_ok:
+        print(f"  reported {got}, want {want}; claim paragraphs {claims}, want [True, False, False]")
+    # And the scan itself, end to end: this script run on a tree holding only those paragraphs.
+    import shutil, subprocess
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(d + '/src'); os.makedirs(d + '/scripts')
+        shutil.copy('scripts/check-measurements.sh', d + '/scripts/check-measurements.sh')
+        shutil.copy('scripts/check-measurements.sh', d + '/scripts/check-measurements.sh.copy')
+        with open(d + '/src/zz.cyr', 'w') as fh:
+            fh.write(planted.replace('scripts/check-measurements.sh --selftest',
+                                     'scripts/check-measurements.sh.copy'))
+        r = subprocess.run(['bash', d + '/scripts/check-measurements.sh'], capture_output=True, text=True)
+        scan_got = sorted(set(re.findall(r'marker: (tests/no_such_l8_\w+\.tcyr)', r.stdout)))
+    scan_ok = r.returncode == 1 and scan_got == want and 'scripts/check-measurements.sh.copy' not in r.stdout
+    print(f"=== selftest: the scan, end to end: {'both planted markers reported' if scan_ok else 'WRONG'} ===")
+    if not scan_ok:
+        print(f"  rc {r.returncode}, reported {scan_got}, want {want}")
+    if st_failed or not para_ok or not scan_ok:
+        sys.exit(1)
+    print("Every planted claim is flagged and no decoy is.")
+    sys.exit(0)
+
 # ---------------------------------------------------------------------------
 # 6. SCAN
 flagged = []      # (path, lineno, kinds, text)   -- unmarked measurement lines
@@ -1062,35 +1196,13 @@ para_of = {}          # (path, lineno) -> paragraph id, so any subset of flagged
 
 for path in SCAN:
     for p in paragraphs(path):
-        hits = [(no, c, shapes_in(c)) for no, c in p.lines]
-        hits = [(no, c, k) for no, c, k in hits if k]
+        hits, bad = para_findings(p)
+        bad_marker.extend(bad)
         if not hits:
-            # No claim here, but a marker on a claimless paragraph is dead
-            # weight pointing nowhere -- not an error, just not counted.
             continue
         if p.markers:
             satisfied += len(hits)
             marked_paras += 1
-            for mno, src in p.markers:
-                ok, note = check_marker(src)
-                if not ok:
-                    # ⛔ 2.19.0 -- THIS RECORDED `p.lines[0][0]`, THE PARAGRAPH'S FIRST
-                    # LINE, AND THAT MADE --diff MODE BLIND TO ITS OWN DOMINANT CASE.
-                    # --diff keeps a finding only when its (path, line) is in the set of
-                    # lines the branch ADDED. A marker naming a file that does not exist,
-                    # appended to an EXISTING comment block, was therefore filed against a
-                    # PRE-EXISTING line and intersected away -- while the malformed-marker
-                    # arm forty lines below already recorded the marker's own line and was
-                    # caught. Measured on this tree with one bad marker, two placements:
-                    # appended to the paragraph at src/vec3.cyr:126, `--diff HEAD` exits 0
-                    # and prints "Every measurement claim added on this branch names its
-                    # source" (the full-tree scan exits 1 and counts it); the identical
-                    # marker as its own new paragraph exits 1. ⚠ It was worse than silent:
-                    # the fabricated marker SATISFIED the real claim beside it, so tree-wide
-                    # unmarked fell by one and the gate got GREENER for the bad edit.
-                    # CI runs --diff only, so this was the shape a PR could always land.
-                    # [measured: scripts/check-measurements.sh two-placement probe, 2026-09-10]
-                    bad_marker.append((p.path, mno, src, note))
         else:
             unmarked_paras += 1
             pid = (path, p.lines[0][0])

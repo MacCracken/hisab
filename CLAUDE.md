@@ -33,9 +33,9 @@ releases running. `grep -l '^\[deps\.hisab\]' ~/Repos/*/cyrius.cyml` finds the d
   compile the current bundle sits below the fix; their comments say why, not that they are required.
   A workaround for a defect fixed at or below the bundle's own floor protects no one: revert it, or
   keep it only for a reason its comment states (3.3.4 reverted `_cga_build_null_tbl`'s guard form).
-- impetus, kiran, joshua, hisab-mimamsa and kana are **not** consumers — Rust repos with no
-  `cyrius.cyml`. aethersafha is a Cyrius port now, but declares no `[deps.hisab]`. abaco calls hisab
-  a sibling, not a dependency.
+- kiran, joshua, hisab-mimamsa and kana are **not** consumers — Rust repos with no `cyrius.cyml`.
+  impetus is a Cyrius port now and declares `[deps.hisab]` (test-scoped). aethersafha is a Cyrius port
+  too, but declares no `[deps.hisab]`. abaco calls hisab a sibling, not a dependency.
 
 ## Quick Start
 
@@ -96,6 +96,7 @@ tests/
   modules_b.tcyr     — per-module coverage (second part; split from modules in 3.3.4
                        to stay under cyrlint/cyrfmt's 1028 KB input cap)
   modules_c.tcyr     — per-module coverage (third part; split from modules_b in 3.3.7)
+  modules_d.tcyr     — per-module coverage (fourth part: the 3.5.0 repairs, one block per area)
   edge_cases.tcyr    — degenerate inputs, boundary values
   abuse.tcyr         — negative indices, zero/huge dims, non-conformable
                        operands, the designed-0 return, canary checks
@@ -120,7 +121,14 @@ scripts/
   check-heap-globals.sh — no module global keeps a pointer into the heap across calls;
                        its ALLOW table says why each kept value is safe
   check-miscompile.sh — compiles the bundle under consumer pins and disassembles it for
-                       a frame slot read and never written (not in CI yet)
+                       a frame slot read and never written (in CI since 3.5.0;
+                       `--list-pins` names the toolchains it needs)
+  check-test-names.sh — a top-level name in a test harness means one thing: no fn twice,
+                       no fn sharing a value's name, no repeat in the declaration zone, no
+                       fn left reading a variable later code redeclared, no library name
+                       replaced or shadowed unless its ALLOW says why
+  check-overcommit.sh — reads vm.overcommit_memory before Test/Fuzz/Bench; in strict mode
+                       fails where the commit room does not cover their measured peaks
   mutation-test.sh   — single-operator mutants of src/ in scratch copies; reports
                        survivors (not in CI)
   derive-cga-null-table.sh — re-derives the CGA null-basis table and its FNV
@@ -383,7 +391,10 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   (the report goes to stdout); the file is not rewritten
 - **Vet gate**: `cyrius vet src/main.cyr`
 - **Constant gate**: `./scripts/check-constants.sh` (+ `--selftest`) decodes every hand-encoded hex
-  f64 declaration in `src/` and checks it against its own comment. Run it after touching ANY constant
+  f64 declaration in `src/` and checks it against its own comment. Run it after touching ANY constant.
+  Since 3.5.0 it also reads function-local constants, fails a bare hex f64 with no comment unless
+  `UNCOMMENTED_ALLOW` names it, and reads a hex f64 inside an expression whose trailing comment is,
+  whole, one value; `EXPR_KNOWN` lists the disagreements found there and not yet settled
 - **Public-surface gate**: `./scripts/check-public-surface.sh` flips all 36 modules `private` in a
   scratch copy and proves naming completeness (every non-`_` declaration `public`, no `_` one, and
   `_` names for the members of a non-public enum — enum constants carry no visibility in Cyrius),
@@ -415,6 +426,17 @@ The release in parentheses holds the evidence in `CHANGELOG.md`.
   diagnostic lint cannot see) or a `duplicate symbol` / `duplicate fn` warning (a duplicate fn was
   invisible to the gate until 3.3.4, when hisab's `f64_tan` silently replaced ganita 1.2.11's)
 - **CGA derivation gate**: `./scripts/derive-cga-null-table.sh`
+- **Miscompile gate** (3.5.0): `./scripts/check-miscompile.sh` (+ `--selftest --require-controls`)
+  builds the bundle as a consumer does under the floor pin 6.6.3 and the manifest pin and fails on a
+  frame slot read and never written (3.4.0 shipped one, the octree_insert crash). CI installs the
+  pins `--list-pins` prints beside the manifest pin, unactivated, through the same verified installer
+- **Test-names gate** (3.5.0): `./scripts/check-test-names.sh` (+ `--selftest`, which compiles the
+  language rules it rests on, so it runs in the build job). A var redeclared after a harness's first
+  statement is shadowing, the language's rule, and passes unless an earlier fn is reached after it
+- **Overcommit gate** (3.5.0): `./scripts/check-overcommit.sh` (+ `--selftest`) says which
+  `vm.overcommit_memory` mode the Test, Fuzz and Bench steps run under; in mode 2 it fails when
+  `CommitLimit - Committed_AS` does not cover each step's measured peak (the bench harness's is the
+  largest: it fills 50 grain chunks and never frees them; the figures are in `docs/guides/testing.md`)
 - **Measurement gates**: every push to `main` and every pull request fails on a broken
   `[measured: …]` marker; pull requests also run
   `./scripts/check-measurements.sh --diff origin/<base>` (every measurement-shaped claim a branch adds

@@ -5,7 +5,7 @@
 # Provides:
 #   - sym_integrate(expr, var_name)  -> Expr or 0 (null) if unsupported
 #   - sym_to_latex(expr)             -> Str (LaTeX rendering)
-#   - sym_match(pattern, expr)       -> 1 if matches, 0 if not
+#   - sym_match_checked(pattern, expr) -> Ok(1) if matches, Ok(0) if not, Err on a refusal
 #   - sym_rewrite(expr, rules)       -> Expr (apply rules bottom-up)
 #   - sym_default_rules()            -> vec of rewrite rules
 #
@@ -24,9 +24,24 @@
 # alone cost tests/hisab.bcyr's sym_integrate row +87%, sym_rewrite_default +40% and
 # sym_to_latex +29%), and the iterative form is what a deep one needs.
 # [measured: tests/hisab.bcyr, iterative-only lane SYM tree vs the 3.4.1 baseline, 2026-10-31]
-enum _SxWalk { _SX_REC_DEPTH = 256 }
+# _SX_BAD_NODE (3.5.0) is the matcher's answer for a 0 pattern or expression node, or a variable
+# whose name is 0, that it reaches, a comparison of a name's two bindings included, told apart from
+# -1, a refused allocation, so sym_match_checked can name each.
+enum _SxWalk { _SX_REC_DEPTH = 256; _SX_BAD_NODE = -3 }
 
-# The call block of sym_rewrite and sym_match (3.4.1 SYM3 to SYM5), i64[13] in the caller's frame,
+# The LaTeX writer's rendering tolerance (_latex_near), symbolic.cyr's _SYM_EPS under this module's
+# name (a module does not reach another's private names).
+enum _SxRender {
+    _SX_RENDER_EPS = 0x3CD2_03AF_9EE7_5616;   # 1e-15
+}
+
+# sym_integrate's evaluation of a power's exponent or base free of every variable (_sym_int_op): a
+# negation flips the sign bit with an XOR, as symbolic.cyr's evaluator does (its _SYM_SIGN).
+enum _SxBits {
+    _SX_SIGN = 0x8000_0000_0000_0000;   # the sign-bit mask
+}
+
+# The call block of sym_rewrite and sym_match_checked (3.4.1 SYM3 to SYM5), i64[17] in the caller's frame,
 # passed down as `bud` or `m`. Word 0 is the meter, the bytes the call may still allocate, so a walk
 # stack charges it through the same pointer. The rest serves the memo below: _SX_B_VISITS counts the
 # current walk's nodes, _SX_B_CMP the call's comparison pairs, _SX_B_PAIRS its match attempts' binary
@@ -35,6 +50,9 @@ enum _SxWalk { _SX_REC_DEPTH = 256 }
 # _SX_MEMO_FRAME entries in the same frame, _SX_B_ROOM the bytes the table may still take,
 # _SX_B_START where a pair count starts once the table is open (0 before), _SX_B_LOST the entries
 # overwritten, and _SX_B_DEEP is 1 once a walk or a tree measure has passed _SX_MEMO_WALK.
+# _SX_B_SBASE, _SX_B_SCAP and _SX_B_STOP are the call's scratch region (3.5.0, _sx_scr_take): its
+# base, its bytes and the bytes in use; _SX_B_M0 is the meter below which the plain walk in hand
+# gives up (3.5.0, _sym_rewrite_single).
 enum _SxCall {
     _SX_B_VISITS = 8;
     _SX_B_CMP = 16;
@@ -48,7 +66,12 @@ enum _SxCall {
     _SX_B_PAIRS = 80;
     _SX_B_LOST = 88;
     _SX_B_DEEP = 96;
+    _SX_B_SBASE = 104;
+    _SX_B_SCAP = 112;
+    _SX_B_STOP = 120;
+    _SX_B_M0 = 128;
     _SX_MEMO_FRAME = 256;
+    _SX_PLAIN_DIV = 32;             # a plain rewrite walk stores at most ALLOC_MAX / _SX_PLAIN_DIV
 }
 
 # The memo (3.4.1 SYM4, SYM5). A shared subtree is walked once per parent, so a walk's time is the
@@ -92,6 +115,11 @@ enum _SxMemo {
     _SX_KEY_TNAME = 6;              # and one the template names
     _SX_KEY_SEEN = 7;               # a pattern node walked
     _SX_KEY_TSEEN = 15;             # a template node walked
+    _SX_KEY_INT = 12;               # sym_integrate's memo walk: a node's integral (3.5.0)
+    _SX_KEY_CV = 13;                # and whether it holds the variable
+    _SX_KEY_VAL = 9;                # and an exponent's or base's value, free of every variable
+    _SX_KEY_VVAR = 10;              # or that it holds a variable (_sym_int_cval)
+    _SX_KEY_TINST = 14;             # a big rule's template node built, k2 (gen << 4) | 14 (3.5.0)
     _SX_BYTES_SAT = 0x4000_0000_0000_0000;  # a sentinel: _sym_tree_bytes_dag's ceiling, an integer
     _SX_ADDR = 0xFFFF_FFFF_FFF8;    # a mask: a stack word's node address, not its low state or its count
     _SX_HIT = 0x8000_0000_0000_0000;  # a mask: a stack word's top bit, a memo hit lies under this node
@@ -201,7 +229,7 @@ fn _sx_memo_put(m, k1, k2, v) {
 # _SX_MEMO_FRAME entries (3.4.1 SYM5).
 fn _sx_call_open(b, frame, meter) {
     store64(b, meter);
-    for (var i = 1; i < 13; i = i + 1) { store64(b + i * 8, 0); }
+    for (var i = 1; i < 17; i = i + 1) { store64(b + i * 8, 0); }
     store64(b + _SX_B_FRAME, frame);
     store64(b + _SX_B_ROOM, ALLOC_MAX);
     return 0;
@@ -224,22 +252,96 @@ fn _sx_stk_meter(st, m) {
     return 0;
 }
 
-# Push v: 0, or -1 when the stack is full and cannot double (cap past ALLOC_MAX / 16, the
-# new block's cap * 16 bytes more than its meter has left, or alloc refuses).
+# ⛔ 3.5.0 — A METERED WALK'S STACK BLOCKS WERE NEVER REUSED (SYM F5, SYM4): every comparison,
+# match and instantiation a rewrite makes at every node started a stack of its own, and each one
+# that grew took new heap that the bump allocator never gave back, so a rewrite that changed
+# nothing allocated for every walk it began: {a * a -> a^2} on d/dx sin^17000(x) took 39.8 MB,
+# 33.2 MB of it in 575 stack blocks. A metered stack (one whose growth a call block pays for) now
+# takes its blocks from the call's scratch region, and the walks hand them back where a walk has
+# returned and nothing it grew is live: a mark (_sx_scr_mark) and its restore (_sx_scr_restore)
+# around the match and the instantiation at each node (_sym_apply_rule), around each deep part of
+# a rewrite walk (_sym_rw_rec), and at each rule's turn of a pass (sym_rewrite). The same rewrite
+# takes 7.2 MB.
+# ⚠ THE COST: a region is twice the larger of the region before it and the block asked for, and a
+# block that does not end at the region's top moves to a new region, so a call whose walks hand
+# little back can need more meter than 3.4.2's blocks did, and between the two meters a call 3.4.2
+# answered is refused. {neg neg a -> a, a * 1 -> a, a + 0 -> a} on one chain of n mixed operators,
+# rewritten by one deep walk, needs 17.4 to 17.8% more at n = 2,400 to 2,800 and 4,400 to 5,300
+# (271,360 bytes for 230,400 at 2,400) and 6.1 to 6.5% more at the other depths from 1,600 to 8,000;
+# it needs less below 1,600 (14,080 for 28,416 at 600). 65 of the 78 depths from 300 to 8,000 need more.
+# [measured: scratch probe rw.cyr, the 3.4.2 tree and lane L4's, alloc_used, 2026-11-14]
+# [measured: scratch probe p_meter2.tcyr, least answering ALLOC_MAX bisected, 3.4.2 tree and lane L4's, 2026-11-14]
+# [measured: tests/modules_d.tcyr, group "3.5.0 L4: a no-op rewrite reuses its walks' stack blocks"]
+# Bytes for a metered stack's block from the call block m's scratch region: its next bytes, or a
+# new region of twice the larger of the old region and bytes, so the block can grow in place
+# (_sx_scr_grow), whose bytes the meter pays first; 0 when it cannot pay them, or alloc refuses.
+# The size does not depend on the meter, so a call's allocation is the same under any meter that
+# lets it answer. A region left behind keeps its blocks, so a mark taken in it stays valid.
+fn _sx_scr_take(m, bytes) {
+    var top = load64(m + _SX_B_STOP);
+    if (load64(m + _SX_B_SBASE) != 0 && top <= load64(m + _SX_B_SCAP) - bytes) {
+        store64(m + _SX_B_STOP, top + bytes);
+        return load64(m + _SX_B_SBASE) + top;
+    }
+    var sz = load64(m + _SX_B_SCAP);
+    if (sz < bytes) { sz = bytes; }
+    if (sz > ALLOC_MAX / 2) { sz = ALLOC_MAX; } else { sz = sz * 2; }
+    if (load64(m) < sz) { return 0; }
+    var b = hisab_alloc(sz);
+    if (b == 0) { return 0; }
+    store64(m, load64(m) - sz);
+    store64(m + _SX_B_SBASE, b);
+    store64(m + _SX_B_SCAP, sz);
+    store64(m + _SX_B_STOP, bytes);
+    return b;
+}
+
+# A metered stack's block ob of oldb bytes grown to newb: ob itself when it ends where the region's
+# bytes in use end and the region has room, the stack growing in place; else _sx_scr_take's.
+fn _sx_scr_grow(m, ob, oldb, newb) {
+    var base = load64(m + _SX_B_SBASE);
+    var top = load64(m + _SX_B_STOP);
+    if (base != 0 && ob + oldb == base + top && top - oldb <= load64(m + _SX_B_SCAP) - newb) {
+        store64(m + _SX_B_STOP, top - oldb + newb);
+        return ob;
+    }
+    return _sx_scr_take(m, newb);
+}
+
+# The call block m's scratch region as it stands, in mk (i64[2]: its base and the bytes in use).
+fn _sx_scr_mark(m, mk) {
+    store64(mk, load64(m + _SX_B_SBASE));
+    store64(mk + 8, load64(m + _SX_B_STOP));
+    return 0;
+}
+
+# Hand back every block taken since the mark mk, once nothing grown since is live: the bytes in
+# use go back to the mark's in the region it saw, and to 0 in a region allocated since, which
+# holds nothing older than the mark.
+fn _sx_scr_restore(m, mk) {
+    if (load64(m + _SX_B_SBASE) == load64(mk)) {
+        store64(m + _SX_B_STOP, load64(mk + 8));
+    } else {
+        store64(m + _SX_B_STOP, 0);
+    }
+    return 0;
+}
+
+# Push v: 0, or -1 when the stack is full and cannot double (cap past ALLOC_MAX / 16, or the new
+# block of cap * 16 bytes refused: by its meter's scratch region, _sx_scr_take, or by alloc).
 fn _sx_stk_push(st, v) {
     var n = load64(st + 8);
     var cap = load64(st + 16);
     if (n == cap) {
         if (cap > ALLOC_MAX / 16) { return 0 - 1; }
         var m = load64(st + 24);
-        if (m != 0) {
-            if (load64(m) < cap * 16) { return 0 - 1; }
-            store64(m, load64(m) - cap * 16);
-        }
-        var nb = hisab_alloc(cap * 16);
-        if (nb == 0) { return 0 - 1; }
         var ob = load64(st);
-        for (var i = 0; i < cap; i = i + 1) { store64(nb + i * 8, load64(ob + i * 8)); }
+        var nb = 0;
+        if (m != 0) { nb = _sx_scr_grow(m, ob, cap * 8, cap * 16); } else { nb = hisab_alloc(cap * 16); }
+        if (nb == 0) { return 0 - 1; }
+        if (nb != ob) {
+            for (var i = 0; i < cap; i = i + 1) { store64(nb + i * 8, load64(ob + i * 8)); }
+        }
         store64(st, nb);
         store64(st + 16, cap * 2);
     }
@@ -287,13 +389,31 @@ fn _sym_is_var(e, var_name) {
     return 0;
 }
 
-# Check if an expression contains the given variable: 1 or 0, and 1 for a tag no
-# constructor writes (conservatively). -1 when it cannot answer: a 0 node, a variable whose
-# name is 0, or a walk stack that cannot grow. Recursive to _SX_REC_DEPTH, iterative below.
-fn _sym_contains_var(e, var_name) { return _sym_contains_rec(e, var_name, 0); }
+# 1 when two constants are the same number, both finite: the matcher's and the rewriter's
+# equality of constants (3.5.0, symbolic.cyr's _sym_is_zero says why it is exact). +0 and -0
+# are one number. No NaN or infinity equals anything here, so a + neg(a) does not match
+# Inf + neg(Inf), which is NaN, not 0; sym_rewrite's change test adds same bits (same = 1).
+fn _sx_const_eq(a, b) {
+    if (f64_eq(a, b) == 1 && f64_lt(f64_abs(a), F64_POS_INF) == 1) { return 1; }
+    return 0;
+}
 
-fn _sym_contains_rec(e, var_name, depth) {
-    if (depth >= _SX_REC_DEPTH) { return _sym_contains_deep(e, var_name); }
+# Check if an expression contains the given variable: 1 or 0, and 1 for a tag no
+# constructor writes (conservatively): the first leaf in walk order (left before right) that
+# answers other than 0. -1 when it cannot answer: a 0 node, a variable whose name is 0, or a
+# walk stack that cannot grow, and in sym_integrate's plain walk once the call's operators pass
+# _SX_MEMO_WALK (3.5.0, below). m is sym_integrate's call block. Recursive to _SX_REC_DEPTH,
+# iterative below; once the call is a memo walk (_SX_B_DEEP), _sym_cv_memo answers.
+fn _sym_contains_var(e, var_name, m) {
+    if (load64(m + _SX_B_DEEP) != 0) { return _sym_cv_memo(e, var_name, m); }
+    return _sym_contains_rec(e, var_name, 0, m);
+}
+
+# sym_integrate's plain walk and its searches count each operator they visit in the call block's
+# _SX_B_VISITS, written out in place (3.5.0), and give up past _SX_MEMO_WALK.
+
+fn _sym_contains_rec(e, var_name, depth, m) {
+    if (depth >= _SX_REC_DEPTH) { return _sym_contains_deep(e, var_name, m); }
     if (e == 0) { return 0 - 1; }
     var t = load64(e);
     var r = 0;
@@ -302,18 +422,23 @@ fn _sym_contains_rec(e, var_name, depth) {
         if (load64(e + 8) == 0) { return 0 - 1; }
         return str_eq(load64(e + 8), var_name);
     }
-    if (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
-        r = _sym_contains_rec(load64(e + 8), var_name, depth + 1);
-        if (r != 0) { return r; }
-        return _sym_contains_rec(load64(e + 16), var_name, depth + 1);
+    if (t >= EXPR_ADD && t <= EXPR_LN) {
+        var sc = load64(m + _SX_B_VISITS) + 1;
+        store64(m + _SX_B_VISITS, sc);
+        if (sc > _SX_MEMO_WALK) { return 0 - 1; }
     }
-    if (t >= EXPR_NEG && t <= EXPR_LN) { return _sym_contains_rec(load64(e + 8), var_name, depth + 1); }
+    if (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
+        r = _sym_contains_rec(load64(e + 8), var_name, depth + 1, m);
+        if (r != 0) { return r; }
+        return _sym_contains_rec(load64(e + 16), var_name, depth + 1, m);
+    }
+    if (t >= EXPR_NEG && t <= EXPR_LN) { return _sym_contains_rec(load64(e + 8), var_name, depth + 1, m); }
     # Unknown -- conservatively assume yes
     return 1;
 }
 
 # Internal: _sym_contains_var's walk below _SX_REC_DEPTH.
-fn _sym_contains_deep(e, var_name) {
+fn _sym_contains_deep(e, var_name, m) {
     var sbuf: i64[64];
     var ss: i64[4];
     var n = 0;
@@ -324,6 +449,11 @@ fn _sym_contains_deep(e, var_name) {
         n = _sx_stk_pop(&ss);
         if (n == 0) { return 0 - 1; }
         t = expr_tag(n);
+        if (t >= EXPR_ADD && t <= EXPR_LN) {
+            var sc = load64(m + _SX_B_VISITS) + 1;
+            store64(m + _SX_B_VISITS, sc);
+            if (sc > _SX_MEMO_WALK) { return 0 - 1; }
+        }
         if (t == EXPR_VAR) {
             if (expr_var_name(n) == 0) { return 0 - 1; }
             if (str_eq(expr_var_name(n), var_name) == 1) { return 1; }
@@ -340,6 +470,87 @@ fn _sym_contains_deep(e, var_name) {
     return 0;
 }
 
+# Internal: _sym_contains_var in sym_integrate's memo walk (3.5.0, sym_integrate's ⛔ 3.5.0 note):
+# the same answer, the first leaf in walk order that answers other than 0, with each operator's
+# answer kept under (node, _SX_KEY_CV), so a node asked again, or met again under another parent,
+# is read. A word on the stack is n | state: 0 first visit, 1 the left (or only) operand
+# answered, 2 the right one, with "The memo"'s count and hit bit above the address: an answer is
+# kept by its rule. -1 as _sym_contains_var, and past _SX_MEMO_LOST lost entries.
+fn _sym_cv_memo(e, var_name, m) {
+    var sbuf: i64[64];
+    var rbuf: i64[64];
+    var fs: i64[4];
+    var rs: i64[4];
+    var w = 0;
+    var n = 0;
+    var st = 0;
+    var t = 0;
+    var r = 0;
+    var h = 0;
+    var k = 0;
+    var v = 0;
+    var u = 0;
+    _sx_stk_init(&fs, &sbuf);
+    _sx_stk_init(&rs, &rbuf);
+    if (_sx_stk_push(&fs, e) < 0) { return 0 - 1; }
+    while (load64(&fs + 8) > 0) {
+        w = _sx_stk_top(&fs);
+        n = w & _SX_ADDR;
+        st = w & 7;
+        v = (w >> 48) & 0x7FFF;
+        u = w & _SX_HIT;
+        k = 0;
+        if (n == 0) { return 0 - 1; }
+        t = expr_tag(n);
+        if (t == EXPR_CONST) {
+            r = 0;
+            v = 1;
+        } elif (t == EXPR_VAR) {
+            if (expr_var_name(n) == 0) { return 0 - 1; }
+            r = str_eq(expr_var_name(n), var_name);
+            v = 1;
+        } elif (t >= EXPR_ADD && t <= EXPR_LN) {
+            if (st == 0) {
+                h = _sx_memo_get(m, n, _SX_KEY_CV);
+                if (h != 0) {
+                    r = load64(h + 16);
+                    v = _SX_MEMO_MIN;
+                    u = _SX_HIT;
+                    k = 3;
+                } else {
+                    _sx_stk_retop(&fs, n | 1 | (1 << 48));
+                    if (_sx_stk_push(&fs, expr_left(n)) < 0) { return 0 - 1; }
+                    k = 1;
+                }
+            } elif (st == 1) {
+                r = _sx_stk_pop(&rs);
+                if (r == 0 && t <= EXPR_POW) {
+                    _sx_stk_retop(&fs, n | 2 | (v << 48) | u);
+                    if (_sx_stk_push(&fs, expr_right(n)) < 0) { return 0 - 1; }
+                    k = 1;
+                }
+            } else {
+                r = _sx_stk_pop(&rs);
+            }
+        } else {
+            # Unknown -- conservatively assume yes
+            r = 1;
+            v = 1;
+        }
+        if (k != 1) {
+            if (r < 0) { return 0 - 1; }
+            if (k == 0 && t >= EXPR_ADD && t <= EXPR_LN && v >= _SX_MEMO_MIN) {
+                if (_sx_memo_put(m, n, _SX_KEY_CV, r) < 0) { return 0 - 1; }
+                if (u == 0) { v = 1; } else { v = _SX_MEMO_MIN; }
+            }
+            _sx_stk_pop(&fs);
+            _sx_stk_tell(&fs, 1, v, u);
+            if (_sx_stk_push(&rs, r) < 0) { return 0 - 1; }
+        }
+    }
+    return _sx_stk_pop(&rs);
+}
+
 # ================================================================
 # Symbolic Integration
 # ================================================================
@@ -348,52 +559,98 @@ fn _sym_contains_deep(e, var_name) {
 # Returns a new expression tree (antiderivative) or 0 (null) if unsupported.
 # The constant of integration is omitted (indefinite integral).
 #
-# Supported forms:
+# Supported forms (c, g and a free of x):
 #   constant       -> c * x
 #   variable (x)   -> x^2 / 2
 #   variable (y)   -> y * x  (other var treated as constant)
-#   x^n            -> x^(n+1) / (n+1) for n != -1
-#   x^(-1)         -> ln(x)
+#   x^n            -> x^(n+1) / (n+1) for n != -1, a constant or a tree of constants (1 + 1)
+#   x^(-1)         -> ln(x), and so x^(neg(1)) and x^(1 + -2) (3.5.0)
+#   x^g            -> x^(g + 1) * (g + 1)^-1, g holding a variable other than x (3.5.0)
+#   a^x            -> a^x * ln(a)^-1; for an a free of every variable only where a > 0 and finite (3.5.0)
+#   ln(x)          -> x * ln(x) + -x (3.5.0)
 #   sin(x)         -> -cos(x)
 #   cos(x)         -> sin(x)
 #   exp(x)         -> exp(x)
+#   any other power or function free of x, sin(y), ln(2), y^2 -> itself * x (3.5.0)
 #   f + g          -> integral(f) + integral(g)
 #   c * f          -> c * integral(f)  (c constant w.r.t. var)
 #   -f             -> -integral(f)
+# ⛔ 3.5.0 — THE FORMS MARKED 3.5.0 ANSWERED 0, "UNSUPPORTED" (D076): sin(y), ln(2), y^2, x^y,
+# 2^x and ln(x), each of which has an antiderivative the node set holds. Every form already
+# supported answers the tree it did. Each new form differentiates back to its integrand
+# (x d/dx ln x + ln x - 1 = ln x; d/dx a^x / ln a = a^x; d/dx x^(g+1) / (g+1) = x^g).
+# ⚠ TWO ARE GENERIC IN A SYMBOL, as a CAS's are: x^g's answer has a pole at g = -1, where the
+# antiderivative is ln(x), and a^x's at a = 1, where it is x (and a^x is no real function for
+# a <= 0). The node set has no conditional to pick a branch by the symbol's value, so at those
+# values the tree evaluates to +-Inf or NaN, never to a finite wrong number. An n or a FREE OF EVERY
+# VARIABLE picks its branch here by its value, a constant node or a tree of constants alike, which
+# is evaluated as expr_eval_checked evaluates it (_sym_int_cval; 3.4.2 answered 0 for a tree): n =
+# -1 exactly is ln(x), so x^(neg(1)) is too, a = 1 is a^x * x, and a <= 0, NaN or +Inf answers 0,
+# which has no real antiderivative to give. Any other such n gives x^(n+1) / (n+1) with n's value.
+# [measured: tests/modules_d.tcyr, group "3.5.0 L4: sym_integrate's forms free of x, and ln(x)"]
 # 0 also when a node could not be allocated: every expr_* constructor answers 0 for a refused
 # node or a 0 child, so the refusal reaches this function's 0 without a read (3.4.0, checked
 # by an exhaustion sweep). 0 also for a 0 e or var_name, a 0 node in e and a walk stack
 # that cannot grow (3.4.1: e = 0 was a read through the null, and the walk recursed once
 # per level; below 256 levels it keeps its own stack now, see "Walk stacks").
-# ⚠ A product searches its left factor for var_name at every level, so a product nested n
-# deep on the left, ((x * 2) * 2) * ..., costs O(n^2): 0.57 s at n = 5,000, 2.2 s at
-# 10,000, 8.7 s at 20,000 (3.4.0's recursion took the same walks, and crashed past about
-# 47,500 levels).
-# [measured: scratch timing probe on the 3.4.1 lane tree, wall clock, 2026-10-31; cycc 6.7.18]
+# ⛔ 3.5.0 — A PRODUCT SEARCHED ITS LEFT FACTOR FOR var_name AT EVERY LEVEL, so a product nested
+# n deep on the left, ((x * 2) * 2) * ..., cost O(n^2) (SYM F5): 0.36 s at n = 5,000, 1.47 s at
+# 10,000, 5.85 s at 20,000 on 3.4.2; and a node shared by two parents was integrated, and
+# searched, once per parent, as every walker but sym_rewrite did (symbolic.cyr's "Sharing").
+# The walk counts the operators it and its searches visit, and past _SX_MEMO_WALK it is given
+# up and taken again by a memo walk (_sym_int_walk with _SX_B_DEEP set) that keeps each
+# operator's integral and each search's answer under its node, so the work is the nodes held:
+# 41 ms at 5,000, 51 ms at 20,000. The answer is the plain walk's, its shared nodes held once.
+# [measured: scratch probe ln_<n>.cyr, the 3.4.2 tree and lane L4's, taskset, wall clock, 2026-11-14; cycc 6.7.18]
+# [measured: tests/modules_d.tcyr, group "3.5.0 L4: the walkers read a shared node once"]
 public fn sym_integrate(e, var_name) {
     if (e == 0 || var_name == 0) { return 0; }
-    return _sym_int_rec(e, var_name, 0);
+    # The plain walk reads two words of its call block, the count and the memo flag.
+    var b: i64[17];
+    store64(&b + _SX_B_VISITS, 0);
+    store64(&b + _SX_B_DEEP, 0);
+    var r = _sym_int_rec(e, var_name, 0, &b);
+    if (load64(&b + _SX_B_VISITS) <= _SX_MEMO_WALK) { return r; }
+    # Past _SX_MEMO_WALK operators the plain walk gave up: the memo walk answers (3.5.0).
+    return _sym_int_memo(e, var_name);
 }
 
-# Internal: sym_integrate to _SX_REC_DEPTH levels by recursion, from there _sym_int_deep.
-fn _sym_int_rec(e, var_name, depth) {
-    if (depth >= _SX_REC_DEPTH) { return _sym_int_deep(e, var_name); }
+# Internal: sym_integrate's memo walk, in a call block of its own (3.5.0).
+fn _sym_int_memo(e, var_name) {
+    var b: i64[17];
+    var f: i64[768];
+    _sx_call_open(&b, &f, 0x7FFF_FFFF_FFFF_FFFF);
+    _sx_memo_open(&b);
+    store64(&b + _SX_B_DEEP, 1);
+    return _sym_int_walk(e, var_name, &b);
+}
+
+# Internal: sym_integrate to _SX_REC_DEPTH levels by recursion, from there _sym_int_walk; m is the
+# call block, whose _SX_B_VISITS counts the operators this walk and _sym_contains_var visit, and
+# 0 once they pass _SX_MEMO_WALK (3.5.0: sym_integrate then takes the memo walk).
+fn _sym_int_rec(e, var_name, depth, m) {
+    if (depth >= _SX_REC_DEPTH) { return _sym_int_walk(e, var_name, m); }
     if (e == 0) { return 0; }
     var t = load64(e);
     var ia = 0;
     var ib = 0;
     var ca = 0;
+    if (t >= EXPR_ADD && t <= EXPR_LN) {
+        var sc = load64(m + _SX_B_VISITS) + 1;
+        store64(m + _SX_B_VISITS, sc);
+        if (sc > _SX_MEMO_WALK) { return 0; }
+    }
     # Addition: integral (a + b) dx = integral(a) + integral(b)
     if (t == EXPR_ADD) {
-        ia = _sym_int_rec(load64(e + 8), var_name, depth + 1);
+        ia = _sym_int_rec(load64(e + 8), var_name, depth + 1, m);
         if (ia == 0) { return 0; }
-        ib = _sym_int_rec(load64(e + 16), var_name, depth + 1);
+        ib = _sym_int_rec(load64(e + 16), var_name, depth + 1, m);
         if (ib == 0) { return 0; }
         return expr_add(ia, ib);
     }
     # Negation: integral (-f) dx = -integral(f)
     if (t == EXPR_NEG) {
-        ia = _sym_int_rec(load64(e + 8), var_name, depth + 1);
+        ia = _sym_int_rec(load64(e + 8), var_name, depth + 1, m);
         if (ia == 0) { return 0; }
         return expr_neg(ia);
     }
@@ -402,29 +659,34 @@ fn _sym_int_rec(e, var_name, depth) {
         var a = load64(e + 8);
         var b = load64(e + 16);
         # If left side is constant w.r.t. var, integrate right
-        ca = _sym_contains_var(a, var_name);
+        ca = _sym_contains_var(a, var_name, m);
         if (ca < 0) { return 0; }
         if (ca == 0) {
-            ib = _sym_int_rec(b, var_name, depth + 1);
+            ib = _sym_int_rec(b, var_name, depth + 1, m);
             if (ib == 0) { return 0; }
             return expr_mul(a, ib);
         }
         # If right side is constant w.r.t. var, integrate left
-        ca = _sym_contains_var(b, var_name);
+        ca = _sym_contains_var(b, var_name, m);
         if (ca < 0) { return 0; }
         if (ca == 0) {
-            ia = _sym_int_rec(a, var_name, depth + 1);
+            ia = _sym_int_rec(a, var_name, depth + 1, m);
             if (ia == 0) { return 0; }
             return expr_mul(ia, b);
         }
         # Product of two var-dependent expressions -- unsupported
         return 0;
     }
-    return _sym_integrate_leaf(e, t, var_name);
+    return _sym_integrate_leaf(e, t, var_name, m);
 }
 
-# Internal: sym_integrate's walk below _SX_REC_DEPTH (see "Walk stacks").
-fn _sym_int_deep(e, var_name) {
+# Internal: sym_integrate's walk below _SX_REC_DEPTH (see "Walk stacks"), and its memo walk
+# (3.5.0) once the call block's _SX_B_DEEP is set: there an operator's integral is kept under
+# (node, _SX_KEY_INT) by "The memo"'s rule, its count and hit bit in the word above the address,
+# and a node met again under another parent is read, not integrated again;
+# the plain form counts operators as _sym_int_rec does. 0 as sym_integrate, and in the memo walk
+# past _SX_MEMO_LOST lost entries.
+fn _sym_int_walk(e, var_name, m) {
     var fbuf: i64[64];
     var rbuf: i64[64];
     var fs: i64[4];
@@ -439,17 +701,38 @@ fn _sym_int_deep(e, var_name) {
     var a = 0;
     var b = 0;
     var ca = 0;
+    var h = 0;
+    var v = 0;
+    var u = 0;
+    var keep = load64(m + _SX_B_DEEP);
     _sx_stk_init(&fs, &fbuf);
     _sx_stk_init(&rs, &rbuf);
     if (_sx_stk_push(&fs, e) < 0) { return 0; }
     while (load64(&fs + 8) > 0) {
         w = _sx_stk_top(&fs);
-        n = w & (0 - 8);
+        n = w & _SX_ADDR;
         st = w & 7;
+        v = (w >> 48) & 0x7FFF;
+        u = w & _SX_HIT;
         k = 0;
+        h = 0;
         if (n == 0) { return 0; }
         t = expr_tag(n);
-        if (t == EXPR_ADD) {
+        if (st == 0) { v = 1; }
+        if (st == 0 && t >= EXPR_ADD && t <= EXPR_LN) {
+            if (keep == 0) {
+                var sc = load64(m + _SX_B_VISITS) + 1;
+                store64(m + _SX_B_VISITS, sc);
+                if (sc > _SX_MEMO_WALK) { return 0; }
+            } else {
+                h = _sx_memo_get(m, n, _SX_KEY_INT);
+            }
+        }
+        if (h != 0) {
+            r = load64(h + 16);
+            v = _SX_MEMO_MIN;
+            u = _SX_HIT;
+        } elif (t == EXPR_ADD) {
             # Addition: integral (a + b) dx = integral(a) + integral(b)
             if (st == 0) {
                 c = expr_left(n);
@@ -475,13 +758,13 @@ fn _sym_int_deep(e, var_name) {
             a = expr_left(n);
             b = expr_right(n);
             if (st == 0) {
-                ca = _sym_contains_var(a, var_name);
+                ca = _sym_contains_var(a, var_name, m);
                 if (ca < 0) { return 0; }
                 if (ca == 0) {
                     c = b;
                     k = 1;
                 } else {
-                    ca = _sym_contains_var(b, var_name);
+                    ca = _sym_contains_var(b, var_name, m);
                     if (ca < 0) { return 0; }
                     # Product of two var-dependent expressions -- unsupported
                     if (ca == 1) { return 0; }
@@ -494,15 +777,21 @@ fn _sym_int_deep(e, var_name) {
                 r = expr_mul(_sx_stk_pop(&rs), b);
             }
         } else {
-            r = _sym_integrate_leaf(n, t, var_name);
+            r = _sym_integrate_leaf(n, t, var_name, m);
         }
         if (k == 0) {
             if (r == 0) { return 0; }
+            if (keep != 0 && h == 0 && t >= EXPR_ADD && t <= EXPR_LN && v >= _SX_MEMO_MIN) {
+                if (_sx_memo_put(m, n, _SX_KEY_INT, r) < 0) { return 0; }
+                if (u == 0) { v = 1; } else { v = _SX_MEMO_MIN; }
+            }
             _sx_stk_pop(&fs);
+            if (keep != 0) { _sx_stk_tell(&fs, 1, v, u); }
             if (_sx_stk_push(&rs, r) < 0) { return 0; }
         } else {
             # k = 1: the next state; k = 2: MUL's state 2, the left factor.
-            if (k == 2) { _sx_stk_retop(&fs, n | 2); } else { _sx_stk_retop(&fs, n | (st + 1)); }
+            if (k == 2) { st = 1; }
+            _sx_stk_retop(&fs, n | (st + 1) | (v << 48) | u);
             if (_sx_stk_push(&fs, c) < 0) { return 0; }
         }
     }
@@ -512,7 +801,7 @@ fn _sym_int_deep(e, var_name) {
 # Internal: sym_integrate's forms that integrate no subtree -- a constant, a variable, a
 # power and the functions of the variable itself -- or 0 when the node is none of them
 # (or a node cannot be allocated).
-fn _sym_integrate_leaf(e, t, var_name) {
+fn _sym_integrate_leaf(e, t, var_name, m) {
     # Constant: integral c dx = c * x
     if (t == EXPR_CONST) {
         return expr_mul(
@@ -535,29 +824,58 @@ fn _sym_integrate_leaf(e, t, var_name) {
         return expr_mul(e, expr_var(var_name));
     }
 
-    # Power: x^n
+    # Power: x^n, x^g, a^x, or a power free of x
     if (t == EXPR_POW) {
         var base = load64(e + 8);
         var exp = load64(e + 16);
+        var cv: i64[1];
+        var c = 1;
         if (exp == 0) { return 0; }
-        # Only handle base=var and exp=constant
         if (_sym_is_var(base, var_name) == 1) {
             if (load64(exp) == EXPR_CONST) {
-                var n = load64(exp + 8);
-                var np1 = f64_add(n, F64_ONE);
-                # Check if n == -1 (i.e. n+1 ~ 0)
-                if (sym_const_eq(np1, 0) == 1) {
-                    # integral x^(-1) dx = ln(x)
-                    return expr_ln(expr_var(var_name));
-                }
-                # integral x^n dx = x^(n+1) / (n+1) = (1/(n+1)) * x^(n+1)
-                return expr_mul(
-                  expr_const(f64_div(F64_ONE, np1)),
-                  expr_pow(expr_var(var_name), expr_const(np1))
-                  );
+                store64(&cv, load64(exp + 8));
+            } else {
+                # x^g, g free of x: g's value when g holds no variable at all (neg(1), 1 + -2), which
+                # takes a constant's branch; else x^(g + 1) * (g + 1)^-1 (3.5.0).
+                if (_sym_contains_var(exp, var_name, m) != 0) { return 0; }
+                c = _sym_int_cval(exp, m, &cv);
+                if (c < 0) { return 0; }
             }
+            if (c == 0) {
+                var g1 = expr_add(exp, expr_const(F64_ONE));
+                return expr_mul(expr_pow(expr_var(var_name), g1), expr_pow(g1, expr_const(f64_neg(F64_ONE))));
+            }
+            var np1 = f64_add(load64(&cv), F64_ONE);
+            # n == -1 exactly (3.5.0: within 1e-15 through 3.4.2; any other n has the power rule)
+            if (f64_eq(np1, 0) == 1) {
+                # integral x^(-1) dx = ln(x)
+                return expr_ln(expr_var(var_name));
+            }
+            # integral x^n dx = x^(n+1) / (n+1) = (1/(n+1)) * x^(n+1)
+            return expr_mul(
+              expr_const(f64_div(F64_ONE, np1)),
+              expr_pow(expr_var(var_name), expr_const(np1))
+              );
         }
-        return 0;
+        if (_sym_contains_var(base, var_name, m) != 0) { return 0; }
+        if (_sym_is_var(exp, var_name) == 1) {
+            # a^x, a free of x (3.5.0): a^x * ln(a)^-1. An a free of every variable takes its branch
+            # by its value: 1^x is 1, whose integral is x, and a <= 0, NaN or +Inf has no real
+            # antiderivative.
+            if (load64(base) == EXPR_CONST) {
+                store64(&cv, load64(base + 8));
+            } else {
+                c = _sym_int_cval(base, m, &cv);
+                if (c < 0) { return 0; }
+            }
+            if (c == 1) {
+                var av = load64(&cv);
+                if (f64_gt(av, 0) == 0 || f64_lt(av, F64_POS_INF) == 0) { return 0; }
+                if (f64_eq(av, F64_ONE) == 1) { return expr_mul(e, expr_var(var_name)); }
+            }
+            return expr_mul(e, expr_pow(expr_ln(base), expr_const(f64_neg(F64_ONE))));
+        }
+        return _sym_int_free(e, exp, var_name, m);
     }
 
     # sin(x): integral sin(x) dx = -cos(x)
@@ -565,7 +883,7 @@ fn _sym_integrate_leaf(e, t, var_name) {
         if (_sym_is_var(load64(e + 8), var_name) == 1) {
             return expr_neg(expr_cos(expr_var(var_name)));
         }
-        return 0;
+        return _sym_int_free(e, load64(e + 8), var_name, m);
     }
 
     # cos(x): integral cos(x) dx = sin(x)
@@ -573,7 +891,7 @@ fn _sym_integrate_leaf(e, t, var_name) {
         if (_sym_is_var(load64(e + 8), var_name) == 1) {
             return expr_sin(expr_var(var_name));
         }
-        return 0;
+        return _sym_int_free(e, load64(e + 8), var_name, m);
     }
 
     # exp(x): integral exp(x) dx = exp(x)
@@ -581,11 +899,157 @@ fn _sym_integrate_leaf(e, t, var_name) {
         if (_sym_is_var(load64(e + 8), var_name) == 1) {
             return expr_exp(expr_var(var_name));
         }
-        return 0;
+        return _sym_int_free(e, load64(e + 8), var_name, m);
     }
 
-    # ln(x): x*ln(x) - x is complex, unsupported; and an unknown tag
+    # ln(x): integral ln(x) dx = x * ln(x) + -x (3.5.0)
+    if (t == EXPR_LN) {
+        if (_sym_is_var(load64(e + 8), var_name) == 1) {
+            return expr_add(expr_mul(expr_var(var_name), expr_ln(expr_var(var_name))), expr_neg(expr_var(var_name)));
+        }
+        return _sym_int_free(e, load64(e + 8), var_name, m);
+    }
+
+    # An unknown tag
     return 0;
+}
+
+# Internal: the integral of the power or function e whose operand c (for a power, its exponent;
+# the base is free of x already) may hold x: e * x when c is free of x (3.5.0), else 0, as for a
+# walk that cannot answer.
+fn _sym_int_free(e, c, var_name, m) {
+    if (_sym_contains_var(c, var_name, m) != 0) { return 0; }
+    return expr_mul(e, expr_var(var_name));
+}
+
+# Internal: one operator of _sym_int_cval, applied as symbolic.cyr's evaluator applies it: the
+# same function for each tag, so a tree free of variables has expr_eval_checked's value, bit for
+# bit (tests/modules_d.tcyr compares the two at every tag).
+fn _sym_int_op(t, a, b) {
+    if (t == EXPR_ADD) { return f64_add(a, b); }
+    if (t == EXPR_MUL) { return f64_mul(a, b); }
+    if (t == EXPR_POW) { return ganita_f64_pow(a, b); }
+    if (t == EXPR_NEG) { return a ^ _SX_SIGN; }
+    if (t == EXPR_SIN) { return f64_sin(a); }
+    if (t == EXPR_COS) { return f64_cos(a); }
+    if (t == EXPR_EXP) { return f64_exp(a); }
+    return f64_ln(a);
+}
+
+# Internal: whether e, a power's exponent or base that the search found free of var_name, is free
+# of every variable, and then its value (3.5.0): 1 with the value's bits in *out, 0 when it holds a
+# variable, -1 when it cannot answer (a 0 node, a tag no constructor writes, a walk stack that
+# cannot grow, and in sym_integrate's plain walk the call's operators past _SX_MEMO_WALK, counted
+# in _SX_B_VISITS as the searches count). Left before right, as the evaluator; a left operand that
+# holds a variable answers for its parent. Its own walk rather than expr_eval_checked, whose
+# answers live for one call: a sum of x^g_k over exponents g_k = g_(k-1) + 1 would evaluate each g_k
+# whole, 2.2 s at 10,000 terms and 16.1 s at 30,000 for the evaluations alone. In the memo walk
+# (_SX_B_DEEP) each operator's answer is kept by "The memo"'s rule, under (node, _SX_KEY_VAL), its
+# value, or (node, _SX_KEY_VVAR), and that sum integrates in 93 ms at 10,000 terms and 110 ms at
+# 30,000, most of it the plain walk's _SX_MEMO_WALK operators before it gives up (with constant
+# exponents, 2 and 6 ms).
+# [measured: scratch probe p_chain.tcyr, expr_eval_checked of g_1 to g_n, lane L4 tree, 2026-11-14; cycc 6.7.18]
+# [measured: scratch probe p_chain2.tcyr, sym_integrate of the sum, taskset -c 5, load 1.8, 2026-11-14; cycc 6.7.18]
+fn _sym_int_cval(e, m, out) {
+    var fbuf: i64[64];
+    var rbuf: i64[64];
+    var fs: i64[4];
+    var rs: i64[4];
+    var keep = load64(m + _SX_B_DEEP);
+    var w = 0;
+    var n = 0;
+    var st = 0;
+    var t = 0;
+    var h = 0;
+    var k = 0;
+    var v = 0;
+    var u = 0;
+    var f = 0;
+    var r = 0;
+    var a = 0;
+    _sx_stk_init(&fs, &fbuf);
+    _sx_stk_init(&rs, &rbuf);
+    if (_sx_stk_push(&fs, e) < 0) { return 0 - 1; }
+    while (load64(&fs + 8) > 0) {
+        w = _sx_stk_top(&fs);
+        n = w & _SX_ADDR;
+        st = w & 7;
+        v = (w >> 48) & 0x7FFF;
+        u = w & _SX_HIT;
+        k = 0;
+        if (n == 0) { return 0 - 1; }
+        t = expr_tag(n);
+        if (t == EXPR_CONST) {
+            f = 0;
+            r = expr_const_val(n);
+            v = 1;
+        } elif (t == EXPR_VAR) {
+            f = 1;
+            r = 0;
+            v = 1;
+        } elif (t >= EXPR_ADD && t <= EXPR_LN) {
+            if (st == 0) {
+                h = 0;
+                if (keep == 0) {
+                    var sc = load64(m + _SX_B_VISITS) + 1;
+                    store64(m + _SX_B_VISITS, sc);
+                    if (sc > _SX_MEMO_WALK) { return 0 - 1; }
+                } else {
+                    h = _sx_memo_get(m, n, _SX_KEY_VAL);
+                    f = 0;
+                    if (h == 0) {
+                        h = _sx_memo_get(m, n, _SX_KEY_VVAR);
+                        f = 1;
+                    }
+                }
+                if (h != 0) {
+                    r = load64(h + 16);
+                    v = _SX_MEMO_MIN;
+                    u = _SX_HIT;
+                    k = 3;
+                } else {
+                    _sx_stk_retop(&fs, n | 1 | (1 << 48));
+                    if (_sx_stk_push(&fs, expr_left(n)) < 0) { return 0 - 1; }
+                    k = 1;
+                }
+            } elif (st == 1) {
+                f = _sx_stk_top(&rs);
+                if (f == 0 && t <= EXPR_POW) {
+                    _sx_stk_retop(&fs, n | 2 | (v << 48) | u);
+                    if (_sx_stk_push(&fs, expr_right(n)) < 0) { return 0 - 1; }
+                    k = 1;
+                } else {
+                    _sx_stk_pop(&rs);
+                    r = _sx_stk_pop(&rs);
+                    if (f == 0) { r = _sym_int_op(t, r, 0); }
+                }
+            } else {
+                f = _sx_stk_pop(&rs);
+                r = _sx_stk_pop(&rs);
+                _sx_stk_pop(&rs);
+                a = _sx_stk_pop(&rs);
+                if (f == 0) { r = _sym_int_op(t, a, r); }
+            }
+        } else {
+            return 0 - 1;
+        }
+        if (k != 1) {
+            if (keep != 0 && k == 0 && t >= EXPR_ADD && t <= EXPR_LN && v >= _SX_MEMO_MIN) {
+                if (f == 0) {
+                    if (_sx_memo_put(m, n, _SX_KEY_VAL, r) < 0) { return 0 - 1; }
+                } elif (_sx_memo_put(m, n, _SX_KEY_VVAR, 1) < 0) { return 0 - 1; }
+                if (u == 0) { v = 1; } else { v = _SX_MEMO_MIN; }
+            }
+            _sx_stk_pop(&fs);
+            if (keep != 0) { _sx_stk_tell(&fs, 1, v, u); }
+            if (_sx_stk_push(&rs, r) < 0) { return 0 - 1; }
+            if (_sx_stk_push(&rs, f) < 0) { return 0 - 1; }
+        }
+    }
+    f = _sx_stk_pop(&rs);
+    store64(out, _sx_stk_pop(&rs));
+    if (f != 0) { return 0; }
+    return 1;
 }
 
 # ================================================================
@@ -730,7 +1194,7 @@ fn _latex_needs_cdot(a, b) {
 }
 
 # Internal: how _latex_write writes the power `e`: 1 as \frac{1}{base} (the exponent
-# is a constant within 1e-15 of -1, sym_const_eq), 2 as \sqrt{base} (within 1e-15 of
+# is a constant within 1e-15 of -1, _latex_near), 2 as \sqrt{base} (within 1e-15 of
 # 1/2), 0 as base^{exponent}. The POW arm asks it about `e` and about a power base, so
 # whether a base ends in a superscript is decided by the same test that writes it.
 fn _latex_pow_form(e) {
@@ -738,9 +1202,20 @@ fn _latex_pow_form(e) {
     if (exp == 0) { return 0; }
     if (expr_tag(exp) == EXPR_CONST) {
         var nval = expr_const_val(exp);
-        if (sym_const_eq(nval, f64_neg(F64_ONE)) == 1) { return 1; }
-        if (sym_const_eq(nval, F64_HALF) == 1) { return 2; }
+        if (_latex_near(nval, f64_neg(F64_ONE)) == 1) { return 1; }
+        if (_latex_near(nval, F64_HALF) == 1) { return 2; }
     }
+    return 0;
+}
+
+# Internal: 1 when |a - b| < 1e-15. A RENDERING tolerance, not an equality: the text of a
+# constant within 1e-15 of an integer is that integer (sym_const_to_str), and a power whose
+# exponent reads as -1 or 0.5 is written \frac{1}{b} or \sqrt{b} by the same measure. Through
+# 3.4.2 this was sym_const_eq, which the simplifier and the matcher also used; since 3.5.0 they
+# compare exactly (symbolic.cyr's _sym_is_zero), and only the text keeps the tolerance, so
+# every rendering is byte for byte what it was.
+fn _latex_near(a, b) {
+    if (f64_lt(f64_abs(f64_sub(a, b)), _SX_RENDER_EPS) == 1) { return 1; }
     return 0;
 }
 
@@ -827,10 +1302,11 @@ fn _latex_piece(id) {
 #      minus is left bare, "-3 x" and "-x y", where it cannot be misread.
 # A power's base that itself ends in a superscript, a power or an exponential, is
 # not passed 1: the POW arm wraps it in \left( \right) and writes it at 0.
-# Returns 0, or -1 when a node is 0 (or a variable's name is) or the text or the walk's
-# stack cannot be allocated (3.4.1; through 3.4.0 both were the process's end, a read
-# through the null and str_builder_add's exit). This is the iterative form (3.4.1, see
-# "Walk stacks"), which _latex_rec hands a subtree below _SX_REC_DEPTH: a pending node
+# Returns 0, or -1 when a node is 0 (or a variable's name is), a node's tag is no
+# constructor's (3.5.0), or the text or the walk's stack cannot be allocated (3.4.1; through
+# 3.4.0 both were the process's end, a read through the null and str_builder_add's exit).
+# This is the iterative form (3.4.1, see "Walk stacks"), which _latex_rec hands a subtree
+# below _SX_REC_DEPTH: a pending node
 # waits on the stack with its paren, the pieces that close it pushed beneath it, so the
 # text comes out front to back exactly as the recursion writes it.
 # ⛔ 3.3.3 — A LEADING MINUS IN AN OPERAND POSITION WAS WRITTEN BARE, so the output
@@ -980,8 +1456,8 @@ fn _latex_write(sb, e, paren) {
                 if (_sx_stk_push(&ss, b) < 0) { return 0 - 1; }
                 if (_sx_stk_push(&ss, expr_child(n)) < 0) { return 0 - 1; }
             } else {
-                # Unknown
-                if (str_builder_add_cstr_a(al, sb, "\\text{?}") < 0) { return 0 - 1; }
+                # A tag no constructor writes has no LaTeX (3.5.0, sym_to_latex).
+                return 0 - 1;
             }
         }
     }
@@ -1091,14 +1567,17 @@ fn _latex_rec(sb, e, paren, depth) {
         if (t == EXPR_EXP) { return str_builder_add_cstr_a(al, sb, "}"); }
         return str_builder_add_cstr_a(al, sb, "\\right)");
     }
-    # Unknown
-    return str_builder_add_cstr_a(al, sb, "\\text{?}");
+    # A tag no constructor writes has no LaTeX (3.5.0, sym_to_latex).
+    return 0 - 1;
 }
 
 # Render an expression as a LaTeX string.
 # Returns a Str (fat pointer), or 0 when e is 0, a node in it is 0 (or a variable's name
-# is), or the text cannot be allocated (3.4.1: e = 0 was a read through the null, and a
-# refused grow of the text ended the process inside str_builder_add).
+# is), a node carries a tag no constructor writes, or the text cannot be allocated (3.4.1: e = 0
+# was a read through the null, and a refused grow of the text ended the process inside
+# str_builder_add). ⛔ 3.5.0 — SUCH A TAG WAS WRITTEN "\text{?}" (SYM F6), where expr_eval_checked
+# and expr_diff refuse the tree; it returns 0 now, as expr_to_str does.
+# [measured: tests/modules_d.tcyr, group "3.5.0 L4: the renderers refuse a tag no constructor writes"]
 public fn sym_to_latex(e) {
     var al = hisab_allocator();
     var sb = str_builder_new_a(al);
@@ -1295,16 +1774,15 @@ fn _bind_get(bindings, name) {
 # Set a binding. Returns 1 on success, 0 if name already bound to different expr, -1 when
 # the binding could not be allocated (3.4.0: the pair was stored through unchecked, and
 # vec_push ends the process on a refused growth, so the push is vec_push_a's) or the
-# comparison could not finish (3.4.1: its walk stack could not grow). m is sym_rewrite's
+# comparison could not finish (3.4.1: its walk stack could not grow), and _SX_BAD_NODE when the
+# comparison met a 0 node or a variable whose name is 0 (3.5.0). m is sym_rewrite's
 # allocation meter (3.4.1 SYM3), which pays for the pair and the comparison's stack first,
 # or 0.
 fn _bind_set(bindings, name, e, m) {
     var existing = _bind_get(bindings, name);
     if (existing != 0) {
         # Check structural equality
-        var eq = _sym_tree_equal(existing, e, 0, m);
-        if (eq < 0) { return 0 - 1; }
-        return eq;
+        return _sym_tree_equal(existing, e, 0, m);
     }
     if (m != 0) {
         if (load64(m) < 16) { return 0 - 1; }
@@ -1323,16 +1801,20 @@ fn _bind_set(bindings, name, e, m) {
 # ----------------------------------------------------------------
 
 # 1 when a and b are the same tree, 0 when they are not, -1 when the walk's stack could
-# not grow. Constants compare with sym_const_eq (|a - b| < 1e-15 absolute), so no NaN or
-# infinity is equal to anything; a tag no constructor writes is equal to nothing, and a 0
-# node to nothing. With same = 1 (sym_rewrite's "did this pass change anything") the same
-# node, and two constants with the same bits, are equal too: through 3.4.0 the rewrite's
-# copy of a +Inf constant compared unequal to the +Inf it copied, so the first rule read as
-# a change on every pass (AU1 SYM-F5, below sym_rewrite). With same = 0 (a wildcard bound
-# twice) they are not, so a + neg(a) does not match Inf + neg(Inf), which is NaN, not 0.
+# not grow. Constants compare with _sx_const_eq (equal and finite, 3.5.0: within 1e-15
+# absolute through 3.4.2), so no NaN or infinity is equal to anything; a tag no constructor
+# writes is equal to nothing. With same = 0 the first 0 node, or variable whose name is 0, that
+# the walk meets (left before right; it stops at the first difference) answers _SX_BAD_NODE
+# (3.5.0: 0, "not equal", through 3.4.2, so a name bound twice to trees holding one read as no
+# match). With same = 1 such a node is unequal, as through 3.4.2, so sym_rewrite's change test is
+# unchanged. With same = 1 (sym_rewrite's "did this pass change anything") the same node, and two
+# constants with the same bits, are equal too: through 3.4.0 the rewrite's copy of a +Inf constant
+# compared unequal to the +Inf it copied, so the first rule read as a change on every pass (AU1
+# SYM-F5, below sym_rewrite). With same = 0 (a wildcard bound twice) they are not, so a + neg(a) does not
+# match Inf + neg(Inf), which is NaN, not 0.
 # Any depth (3.4.1, see "Walk stacks"); m is a call block, to which the walk's stack is charged, or
 # 0. With a call block, a comparison past _SX_MEMO_WALK pairs is taken again by _sym_teq_memo
-# (3.4.1 SYM4, SYM5, see "The memo"): 1, 0 or -1 as ever.
+# (3.4.1 SYM4, SYM5, see "The memo"): 1, 0, -1 or _SX_BAD_NODE as ever.
 fn _sym_tree_equal(a, b, same, m) {
     if (m == 0) { return _sym_teq_rec(a, b, same, 0, 0); }
     if (load64(m + _SX_B_START) != 0) { store64(m + _SX_B_CMP, load64(m + _SX_B_START)); }
@@ -1340,6 +1822,13 @@ fn _sym_tree_equal(a, b, same, m) {
     if (r != 0 - 2) { return r; }
     _sx_memo_open(m);
     return _sym_teq_memo(a, b, same, m);
+}
+
+# Internal: a comparison's answer at a 0 node or a variable whose name is 0: _SX_BAD_NODE for the
+# matcher (same = 0), 0, "not equal", for sym_rewrite's change test (same = 1).
+fn _sym_teq_bad(same) {
+    if (same == 0) { return _SX_BAD_NODE; }
+    return 0;
 }
 
 # Internal: _sym_tree_equal to _SX_REC_DEPTH levels by recursion, from there iteratively. With a
@@ -1352,17 +1841,17 @@ fn _sym_teq_rec(x, y, same, depth, m) {
         if (c > _SX_MEMO_WALK) { return 0 - 2; }
     }
     if (same == 1 && x == y) { return 1; }
-    if (x == 0 || y == 0) { return 0; }
+    if (x == 0 || y == 0) { return _sym_teq_bad(same); }
     var t = load64(x);
     var r = 0;
     if (t != load64(y)) { return 0; }
     if (t == EXPR_CONST) {
-        if (sym_const_eq(load64(x + 8), load64(y + 8)) == 1) { return 1; }
+        if (_sx_const_eq(load64(x + 8), load64(y + 8)) == 1) { return 1; }
         if (same == 1 && load64(x + 8) == load64(y + 8)) { return 1; }
         return 0;
     }
     if (t == EXPR_VAR) {
-        if (load64(x + 8) == 0 || load64(y + 8) == 0) { return 0; }
+        if (load64(x + 8) == 0 || load64(y + 8) == 0) { return _sym_teq_bad(same); }
         return str_eq(load64(x + 8), load64(y + 8));
     }
     if (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
@@ -1395,16 +1884,16 @@ fn _sym_teq_deep(a, b, same, m) {
                 store64(m + _SX_B_CMP, c);
                 if (c > _SX_MEMO_WALK) { return 0 - 2; }
             }
-            if (x == 0 || y == 0) { return 0; }
+            if (x == 0 || y == 0) { return _sym_teq_bad(same); }
             t = expr_tag(x);
             if (t != expr_tag(y)) { return 0; }
             if (t == EXPR_CONST) {
-                if (sym_const_eq(expr_const_val(x), expr_const_val(y)) == 0) {
+                if (_sx_const_eq(expr_const_val(x), expr_const_val(y)) == 0) {
                     if (same == 0) { return 0; }
                     if (expr_const_val(x) != expr_const_val(y)) { return 0; }
                 }
             } elif (t == EXPR_VAR) {
-                if (expr_var_name(x) == 0 || expr_var_name(y) == 0) { return 0; }
+                if (expr_var_name(x) == 0 || expr_var_name(y) == 0) { return _sym_teq_bad(same); }
                 if (str_eq(expr_var_name(x), expr_var_name(y)) == 0) { return 0; }
             } elif (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
                 if (_sx_stk_push(&ss, expr_right(x)) < 0) { return 0 - 1; }
@@ -1466,18 +1955,22 @@ fn _sym_teq_memo(a, b, same, m) {
             v = 1;
             if (same == 0 || x != y) {
                 if (x == 0 || y == 0) {
+                    # Not a difference, so no pair above is kept as one (_sym_teq_differ).
+                    if (same == 0) { return _SX_BAD_NODE; }
                     k = 0 - 1;
                 } elif (expr_tag(x) != expr_tag(y)) {
                     k = 0 - 1;
                 } else {
                     t = expr_tag(x);
                     if (t == EXPR_CONST) {
-                        if (sym_const_eq(expr_const_val(x), expr_const_val(y)) == 0) {
+                        if (_sx_const_eq(expr_const_val(x), expr_const_val(y)) == 0) {
                             if (same == 0 || expr_const_val(x) != expr_const_val(y)) { k = 0 - 1; }
                         }
                     } elif (t == EXPR_VAR) {
-                        if (expr_var_name(x) == 0 || expr_var_name(y) == 0) { k = 0 - 1; }
-                        elif (str_eq(expr_var_name(x), expr_var_name(y)) == 0) { k = 0 - 1; }
+                        if (expr_var_name(x) == 0 || expr_var_name(y) == 0) {
+                            if (same == 0) { return _SX_BAD_NODE; }
+                            k = 0 - 1;
+                        } elif (str_eq(expr_var_name(x), expr_var_name(y)) == 0) { k = 0 - 1; }
                     } elif (t >= EXPR_ADD && t <= EXPR_LN) {
                         h = _sx_memo_get(m, x, y + 1 + same);
                         if (h == 0) { k = 1; }
@@ -1527,8 +2020,10 @@ fn _sym_expr_equal(a, b) { return _sym_tree_equal(a, b, 0, 0); }
 # ----------------------------------------------------------------
 
 # Internal match. Returns 1 if pattern matches expr, 0 otherwise, -1 when a binding could
-# not be allocated, the walk's stack could not grow, or a pattern or expression node is 0
-# (3.4.1: a read through the null before). Populates bindings vec with { name, expr }
+# not be allocated or the walk's stack could not grow, _SX_BAD_NODE when a pattern or
+# expression node it reaches is 0 or a variable's name is (3.4.1: a read through the null before; -1
+# through 3.4.2, 3.5.0 tells them apart), the comparison of a name bound twice included (3.5.0:
+# 0 there through 3.4.2, "no match"). Populates bindings vec with { name, expr }
 # pairs. Any depth (3.4.1, see "Walk stacks"): pattern and expression nodes are matched in
 # pairs, left before right, and the first pair that does not match answers. m is a call block,
 # whose meter pays for every binding and stack block, or 0. ⛔ 3.4.1 SYM5 — THE WALK IS THE PATTERN'S
@@ -1559,7 +2054,7 @@ fn _pat_match_count(m) {
 # iteratively; the same order of bindings either way. -2 past _SX_MEMO_WALK binary pairs.
 fn _pat_match_rec(p, x, bindings, depth, m) {
     if (depth >= _SX_REC_DEPTH) { return _pat_match_deep(p, x, bindings, m); }
-    if (p == 0 || x == 0) { return 0 - 1; }
+    if (p == 0 || x == 0) { return _SX_BAD_NODE; }
     var pt = load64(p);
     var r = 0;
     # Wildcard: match anything, bind by name
@@ -1572,12 +2067,12 @@ fn _pat_match_rec(p, x, bindings, depth, m) {
     # Exact constant
     if (pt == PAT_CONST) {
         if (load64(x) != EXPR_CONST) { return 0; }
-        return sym_const_eq(load64(p + 8), load64(x + 8));
+        return _sx_const_eq(load64(p + 8), load64(x + 8));
     }
     # Exact variable
     if (pt == PAT_VAR) {
         if (load64(x) != EXPR_VAR) { return 0; }
-        if (load64(x + 8) == 0) { return 0 - 1; }
+        if (load64(x + 8) == 0) { return _SX_BAD_NODE; }
         return str_eq(load64(p + 8), load64(x + 8));
     }
     # Binary patterns: ADD, MUL, POW (PAT_ADD - 101 is EXPR_ADD, and so on)
@@ -1611,7 +2106,7 @@ fn _pat_match_deep(pat, e, bindings, m) {
     while (load64(&ss + 8) > 0) {
         p = _sx_stk_pop(&ss);
         x = _sx_stk_pop(&ss);
-        if (p == 0 || x == 0) { return 0 - 1; }
+        if (p == 0 || x == 0) { return _SX_BAD_NODE; }
         pt = pat_tag(p);
         if (pt == PAT_WILDCARD) {
             # Wildcard: match anything, bind by name
@@ -1625,11 +2120,11 @@ fn _pat_match_deep(pat, e, bindings, m) {
         } elif (pt == PAT_CONST) {
             # Exact constant
             if (expr_tag(x) != EXPR_CONST) { return 0; }
-            if (sym_const_eq(pat_val(p), expr_const_val(x)) != 1) { return 0; }
+            if (_sx_const_eq(pat_val(p), expr_const_val(x)) != 1) { return 0; }
         } elif (pt == PAT_VAR) {
             # Exact variable
             if (expr_tag(x) != EXPR_VAR) { return 0; }
-            if (expr_var_name(x) == 0) { return 0 - 1; }
+            if (expr_var_name(x) == 0) { return _SX_BAD_NODE; }
             if (str_eq(pat_name(p), expr_var_name(x)) != 1) { return 0; }
         } elif (pt >= PAT_ADD && pt <= PAT_POW) {
             # Binary patterns: ADD, MUL, POW (PAT_ADD - 101 is EXPR_ADD, and so on)
@@ -1657,10 +2152,14 @@ fn _pat_match_deep(pat, e, bindings, m) {
 # an exact constant or variable, a tag, and a name bound before the pair was reached all answer as they
 # did. One thing does: a name the pair BOUND is compared with itself the second time, and with
 # same = 0 a tree holding a NaN or an infinity is not equal to itself, so x + x matches a node once
-# and (x + x) + (x + x) must not match it twice. So each new binding is compared with itself here,
-# `bad` records under which pairs that failed, and a kept pair holds it: met again, a bad pair
-# answers 0, as the plain walk's comparison would, and any other is skipped. A kept pair is
-# good for one attempt: its value is the attempt's number and bad, and a stale one is rewritten.
+# and (x + x) + (x + x) must not match it twice; nor is a tree holding a 0 node or a variable whose
+# name is 0, which the comparison answers _SX_BAD_NODE for (3.5.0). So each new binding is compared
+# with itself here, `bad` records under which pairs that failed, and a kept pair holds it: met again,
+# a good pair is skipped, and a bad one is walked again (3.5.0: it answered 0), so that its first
+# failing comparison answers as in the plain walk, 0 for a NaN or an infinity and _SX_BAD_NODE for a
+# 0 node or a nameless variable, whichever the walk meets first; it fails, so it is walked again at
+# most once. A kept pair is good for one attempt: its value is the attempt's number and bad, and a
+# stale one is rewritten.
 fn _pat_match_memo(pat, e, bindings, m) {
     var sbuf: i64[64];
     var ss: i64[4];
@@ -1691,7 +2190,7 @@ fn _pat_match_memo(pat, e, bindings, m) {
         u = w & _SX_HIT;
         k = 0;
         if (st == 0) {
-            if (p == 0 || x == 0) { return 0 - 1; }
+            if (p == 0 || x == 0) { return _SX_BAD_NODE; }
             v = 1;
             bad = 0;
             pt = pat_tag(p);
@@ -1702,25 +2201,26 @@ fn _pat_match_memo(pat, e, bindings, m) {
                 if (r != 1) { return r; }
                 if (vec_len(bindings) != k) {
                     r = _sym_tree_equal(x, x, 0, m);
-                    if (r < 0) { return 0 - 1; }
-                    if (r == 0) { bad = 1; }
+                    if (r == 0 || r == _SX_BAD_NODE) { bad = 1; }
+                    elif (r < 0) { return 0 - 1; }
                 }
                 k = 0;
             } elif (pt == PAT_CONST) {
                 if (expr_tag(x) != EXPR_CONST) { return 0; }
-                if (sym_const_eq(pat_val(p), expr_const_val(x)) != 1) { return 0; }
+                if (_sx_const_eq(pat_val(p), expr_const_val(x)) != 1) { return 0; }
             } elif (pt == PAT_VAR) {
                 if (expr_tag(x) != EXPR_VAR) { return 0; }
-                if (expr_var_name(x) == 0) { return 0 - 1; }
+                if (expr_var_name(x) == 0) { return _SX_BAD_NODE; }
                 if (str_eq(pat_name(p), expr_var_name(x)) != 1) { return 0; }
             } elif (pt >= PAT_ADD && pt <= PAT_LN) {
                 if (expr_tag(x) != pt - 101) { return 0; }
                 h = _sx_memo_get(m, p, x + 3);
-                if (h != 0 && (load64(h + 16) >> 1) == g) {
-                    if ((load64(h + 16) & 1) == 1) { return 0; }
+                if (h != 0 && load64(h + 16) == (g << 1)) {
                     v = _SX_MEMO_MIN;
                     u = _SX_HIT;
                 } else {
+                    # Not kept, stale, or bad: a bad pair is walked again, and the comparison under
+                    # it that failed fails again, with the plain walk's answer, 0 or _SX_BAD_NODE.
                     k = 1;
                 }
             } else {
@@ -1752,38 +2252,57 @@ fn _pat_match_memo(pat, e, bindings, m) {
     return 1;
 }
 
-# Public: match a pattern against an expression.
-# Returns 1 if matches, 0 if not.
-# ⚠ 3.4.0 -- 0 ALSO WHEN A BINDING COULD NOT BE ALLOCATED. Through 3.3.7 a refused binding
-# vec or pair was read (exit 139). This function answers 1 or 0 and has no value left for a
-# refusal, so the 0 of "no match" carries it; a Result form (sym_match_checked) needs its
-# callers in tests/modules.tcyr and modules_b.tcyr moved and is left to the release.
-# 3.4.1: 0 also for a 0 pattern or expression, or a 0 node in either.
-# [measured: scratch exhaustion probes on the 3.4.0 base (ALLOC_MAX 127), 2026-10-31; cycc 6.7.9]
-public fn sym_match(pat, e) {
-    var b: i64[13];
-    var f: i64[768];
-    _sx_call_open(&b, &f, 0x7FFF_FFFF_FFFF_FFFF);
-    var bindings = _bind_new();
-    if (bindings == 0) { return 0; }
-    var mt = _pat_match(pat, e, bindings, &b);
-    if (mt < 0) { return 0; }
+# Internal: _pat_match's answer as sym_match_checked's code: the match (1 or 0), or a negative
+# HSB_ERR_*: INVALID_INPUT for _SX_BAD_NODE, ALLOC for any other refusal.
+fn _sx_match_code(mt) {
+    if (mt == _SX_BAD_NODE) { return HSB_ERR_INVALID_INPUT; }
+    if (mt < 0) { return HSB_ERR_ALLOC; }
     return mt;
 }
 
-# Match with bindings: returns the bindings vec (or 0 if no match).
-# Each element is a 16-byte pair { name: Str, expr: ptr }.
-# ⚠ 3.4.0 -- 0 also when a binding could not be allocated (see sym_match).
-public fn sym_match_bindings(pat, e) {
-    var b: i64[13];
+# Match a pattern against an expression: Ok(1) when it matches, Ok(0) when it does not;
+# Err(HSB_ERR_INVALID_INPUT) for a 0 pattern or expression, and where the match reaches a 0 node
+# or a variable whose name is 0: in the pattern, in the expression where the pattern walks it, or
+# in the two trees a name bound twice is compared across (left before right, to their first
+# difference). A wildcard binds its subtree without reading it, which keeps a match's work the
+# pattern's and not the expression's, so a 0 node under a name bound once is not reached: that
+# match answers Ok(1), and a walker that reads the binding, expr_eval_checked among them, refuses
+# it there. Err(HSB_ERR_ALLOC) when a binding or the walk's stack cannot be allocated,
+# or the call's memo has lost _SX_MEMO_LOST entries ("The memo": a table that cannot grow).
+# ⛔ 3.5.0 — RETIRES sym_match, WHICH ANSWERED 0, "NO MATCH", FOR A REFUSED ALLOCATION AND FOR A
+# 0 NODE (roadmap [3.5.0], AL; INS5 F1's sixth entry): it returned 1 or 0, with no value left
+# for a refusal, so a caller read a refused call as a pattern that does not fit. Every match
+# answers what sym_match answered; a refusal is an Err.
+# [measured: tests/modules_d.tcyr, group "3.5.0 L4: sym_match_checked refuses with a code"]
+#must_use
+public fn sym_match_checked(pat, e) {
+    if (pat == 0 || e == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var b: i64[17];
     var f: i64[768];
     _sx_call_open(&b, &f, 0x7FFF_FFFF_FFFF_FFFF);
     var bindings = _bind_new();
-    if (bindings == 0) { return 0; }
-    if (_pat_match(pat, e, bindings, &b) == 1) {
-        return bindings;
-    }
-    return 0;
+    if (bindings == 0) { return Err(HSB_ERR_ALLOC); }
+    var r = _sx_match_code(_pat_match(pat, e, bindings, &b));
+    if (r < 0) { return Err(r); }
+    return Ok(r);
+}
+
+# Match with bindings: Ok(bindings vec) when the pattern matches (each element a 16-byte pair
+# { name: Str, expr: ptr }, one per name bound, possibly none), Ok(0) when it does not, and
+# sym_match_checked's Err codes.
+# ⛔ 3.5.0 — RETIRES sym_match_bindings, which answered 0, "no match", for the same refusals.
+#must_use
+public fn sym_match_bindings_checked(pat, e) {
+    if (pat == 0 || e == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var b: i64[17];
+    var f: i64[768];
+    _sx_call_open(&b, &f, 0x7FFF_FFFF_FFFF_FFFF);
+    var bindings = _bind_new();
+    if (bindings == 0) { return Err(HSB_ERR_ALLOC); }
+    var r = _sx_match_code(_pat_match(pat, e, bindings, &b));
+    if (r < 0) { return Err(r); }
+    if (r == 1) { return Ok(bindings); }
+    return Ok(0);
 }
 
 # ----------------------------------------------------------------
@@ -1804,7 +2323,14 @@ fn _sym_built(e) {
 # or stack block would pass sym_rewrite's allocation meter *bud (3.4.1 SYM2, SYM3: its
 # bytes are taken from the meter before it is allocated).
 # Iterative (3.4.1): a template node waits until its children are built.
-fn _pat_instantiate(tmpl, bindings, bud) {
+# ⛔ 3.5.0 — A SHARED TEMPLATE WAS BUILT AS A TREE (SYM5): a rule whose template is a constant
+# doubled 40 times, 41 pattern nodes, built 2^41 nodes at every firing until the meter refused,
+# 0 after about 2 GiB. With keep (the rule's big flag, set when sym_rule had to scan it as a DAG)
+# each template operator's node is built once per instantiation and kept under (pattern node,
+# (gen << 4) | _SX_KEY_TINST), gen this instantiation's number, so the result shares as the
+# template does, and the rule answers.
+# [measured: tests/modules_d.tcyr, group "3.5.0 L4: a shared template is built once"]
+fn _pat_instantiate(tmpl, bindings, bud, keep) {
     var fbuf: i64[64];
     var rbuf: i64[64];
     var fs: i64[4];
@@ -1817,6 +2343,13 @@ fn _pat_instantiate(tmpl, bindings, bud) {
     var c = 0;
     var k = 0;
     var b = 0;
+    var h = 0;
+    var k2 = 0;
+    if (keep != 0) {
+        k2 = load64(bud + _SX_B_GEN) + 1;
+        store64(bud + _SX_B_GEN, k2);
+        k2 = (k2 << 4) | _SX_KEY_TINST;
+    }
     _sx_stk_init(&fs, &fbuf);
     _sx_stk_init(&rs, &rbuf);
     _sx_stk_meter(&fs, bud);
@@ -1827,9 +2360,13 @@ fn _pat_instantiate(tmpl, bindings, bud) {
         p = w & (0 - 8);
         st = w & 7;
         k = 0;
+        h = 0;
         if (p == 0) { return 0 - 1; }
         pt = pat_tag(p);
-        if (pt == PAT_WILDCARD || pt == PAT_ANY_CONST) {
+        if (keep != 0 && st == 0 && pt >= PAT_ADD && pt <= PAT_LN) { h = _sx_memo_get(bud, p, k2); }
+        if (h != 0) {
+            r = load64(h + 16);
+        } elif (pt == PAT_WILDCARD || pt == PAT_ANY_CONST) {
             r = _bind_get(bindings, pat_name(p));
             if (r == 0) { return 0; }
         } elif (pt == PAT_CONST) {
@@ -1878,6 +2415,9 @@ fn _pat_instantiate(tmpl, bindings, bud) {
             if (_sx_stk_push(&fs, c) < 0) { return 0 - 1; }
         } else {
             if (r < 0) { return r; }
+            if (keep != 0 && h == 0 && pt >= PAT_ADD && pt <= PAT_LN) {
+                if (_sx_memo_put(bud, p, k2, r) < 0) { return 0 - 1; }
+            }
             _sx_stk_pop(&fs);
             if (_sx_stk_push(&rs, r) < 0) { return 0 - 1; }
         }
@@ -1889,10 +2429,12 @@ fn _pat_instantiate(tmpl, bindings, bud) {
 # Rewrite rule structure
 # ----------------------------------------------------------------
 
-# A rewrite rule: { pattern: ptr, template: ptr, shares }, or 0 when pattern or template is
+# A rewrite rule: { pattern: ptr, template: ptr, shares, big }, or 0 when pattern or template is
 # 0, the rule cannot be allocated, or the template names a wildcard (or any-constant) the
 # pattern does not bind. shares (3.4.1 SYM2) is 1 when the template names one wildcard twice
-# (sym_rewrite's size bound reads it), worked out here once rather than on every rewrite.
+# (sym_rewrite's size bound reads it), worked out here once rather than on every rewrite. big
+# (3.5.0) is 1 when the rule took _sym_rule_scan, past _SX_RULE_WALK visits, so that its template
+# is instantiated by a memo walk (_pat_instantiate).
 # ⛔ 3.4.1 — A TEMPLATE NAMING AN UNBOUND WILDCARD MADE A RULE THAT NEVER FIRED, SILENTLY
 # (AU2-G6-F15). Instantiating it found no binding and answered "no match", so
 # sym_rewrite(x + x, {var x -> wildcard b}) returned x + x as if no rule applied. Such a
@@ -1910,17 +2452,20 @@ public fn sym_rule(pattern, template) {
     var c = 0;
     var bd = _sym_rule_bound(pattern, template, &c);
     var sh = 0;
+    var big = 0;
     if (bd == 1) { sh = _sym_tmpl_shares(template, &c); }
     if (bd == 0 - 2 || sh == 0 - 2) {
         sh = _sym_rule_scan(pattern, template);
         bd = 1;
+        big = 1;
     }
     if (bd != 1 || sh < 0) { return 0; }
-    var r = hisab_alloc(24);
+    var r = hisab_alloc(32);
     if (r == 0) { return 0; }
     store64(r, pattern);
     store64(r + 8, template);
     store64(r + 16, sh);
+    store64(r + 24, big);
     return r;
 }
 
@@ -2182,7 +2727,7 @@ fn _sym_scan_tmpl(tmpl, m) {
 # memo's kind in this frame. Here the table is the answer and not a speed-up, so a lost entry
 # refuses the rule.
 fn _sym_rule_scan(pat, tmpl) {
-    var b: i64[13];
+    var b: i64[17];
     var f: i64[768];
     _sx_call_open(&b, &f, 0x7FFF_FFFF_FFFF_FFFF);
     _sx_memo_open(&b);
@@ -2195,6 +2740,7 @@ fn _sym_rule_scan(pat, tmpl) {
 fn _rule_pattern(r)  { return load64(r); }
 fn _rule_template(r) { return load64(r + 8); }
 fn _rule_shares(r)   { return load64(r + 16); }
+fn _rule_big(r)      { return load64(r + 24); }
 
 # Apply a single rule at the root of an expression, binding into `bindings` (emptied
 # first; the caller's, reused node to node and pass to pass).
@@ -2208,10 +2754,18 @@ fn _sym_apply_rule(rule, e, bindings, bud) {
         if (load64(e) != pt - 101) { return 0; }
     }
     vec_truncate(bindings, 0);
+    # The match's and the instantiation's stack blocks are free again once each returns (3.5.0;
+    # _sx_scr_mark and _sx_scr_restore, written out in place: a rule is tried at every node).
+    var mb = load64(bud + _SX_B_SBASE);
+    var mt0 = load64(bud + _SX_B_STOP);
     var mt = _pat_match(p, e, bindings, bud);
+    if (load64(bud + _SX_B_SBASE) == mb) { store64(bud + _SX_B_STOP, mt0); } else { store64(bud + _SX_B_STOP, 0); }
     if (mt < 0) { return 0 - 1; }
     if (mt == 1) {
-        return _pat_instantiate(_rule_template(rule), bindings, bud);   # an Expr, 0 or -1
+        if (_rule_big(rule) != 0) { _sx_memo_open(bud); }
+        var r = _pat_instantiate(_rule_template(rule), bindings, bud, _rule_big(rule));   # an Expr, 0 or -1
+        if (load64(bud + _SX_B_SBASE) == mb) { store64(bud + _SX_B_STOP, mt0); } else { store64(bud + _SX_B_STOP, 0); }
+        return r;
     }
     return 0;
 }
@@ -2223,8 +2777,20 @@ fn _sym_apply_rule(rule, e, bindings, bud) {
 # Rewrite an expression bottom-up using a single rule.
 # Returns the rewritten expression, or -1 when an allocation was refused (3.4.0: a refused
 # node went on into the matcher, which read it) or the meter could not pay for one. Visiting a
-# node costs nothing on the meter (3.4.1 SYM4). A walk past _SX_MEMO_WALK nodes is given up and
-# taken again by _sym_rw_memo, and every later walk of the call starts there.
+# node costs nothing on the meter (3.4.1 SYM4). A walk past _SX_MEMO_WALK nodes, or one that
+# has stored more than ALLOC_MAX / _SX_PLAIN_DIV bytes or _SX_MEMO_WALK binary nodes' 24 bytes,
+# whichever is more (3.5.0), is given up and taken again by _sym_rw_memo, and every later walk
+# of the call starts there.
+# ⛔ 3.5.0 — THE PLAIN WALK'S STORAGE COULD REFUSE A CALL THE MEMO WALK ANSWERS (R4-SYM N1, SYM5):
+# {y -> sin^L(z)} on y doubled 60 builds L + 1 nodes at every visit of y, and at L = 300 the plain
+# walk's first 2^20 visits passed the meter, 2 GiB, before the memo walk could start, so the call
+# answered 0 where the memo walk builds sin^300(z) a few times. The plain walk now also stops once
+# it has stored ALLOC_MAX / _SX_PLAIN_DIV bytes (64 MiB at the default), leaving the rest of the
+# meter to the memo walk, or 24 MiB, what its visit bound already let it rebuild, when that is
+# more (so a meter of under 24 MiB is spent as through 3.4.2). The cost: a rewrite with nothing
+# shared that stores more than that in a pass is walked again by the memo walk, and one that needs
+# more than the meter's remaining 31/32 is refused where 3.4.2 answered it.
+# [measured: tests/modules_d.tcyr, group "3.5.0 L4: a shared input's first walk leaves the memo room"]
 # Each node's children are rewritten, then the rule is tried on it. A node whose children
 # came back unchanged is kept as it is (3.4.1; through 3.4.0 every node was rebuilt), so a
 # pass that rewrites nothing allocates no node and returns e itself. One bindings vec, the
@@ -2232,6 +2798,11 @@ fn _sym_apply_rule(rule, e, bindings, bud) {
 fn _sym_rewrite_single(rule, e, bud, bindings) {
     if (load64(bud + _SX_B_DEEP) == 0) {
         store64(bud + _SX_B_VISITS, 0);
+        # The meter below which the plain walk gives up: what it may store is a 32nd of ALLOC_MAX,
+        # or what its visit bound lets it rebuild, a binary node a visit, whichever is more.
+        var pc = ALLOC_MAX / _SX_PLAIN_DIV;
+        if (pc < _SX_MEMO_WALK * 24) { pc = _SX_MEMO_WALK * 24; }
+        store64(bud + _SX_B_M0, load64(bud) - pc);
         var r = _sym_rw_rec(rule, e, bud, bindings, 0);
         if (r != 0 - 2) { return r; }
         store64(bud + _SX_B_DEEP, 1);
@@ -2243,12 +2814,19 @@ fn _sym_rewrite_single(rule, e, bud, bindings) {
 
 # Internal: _sym_rewrite_single to _SX_REC_DEPTH levels by recursion, from there iteratively.
 fn _sym_rw_rec(rule, e, bud, bindings, depth) {
-    if (depth >= _SX_REC_DEPTH) { return _sym_rw_deep(rule, e, bud, bindings); }
+    if (depth >= _SX_REC_DEPTH) {
+        var mk: i64[2];
+        _sx_scr_mark(bud, &mk);
+        var dr = _sym_rw_deep(rule, e, bud, bindings);
+        _sx_scr_restore(bud, &mk);
+        return dr;
+    }
     if (e == 0) { return 0 - 1; }
     var t = load64(e);
     var n = load64(bud + _SX_B_VISITS) + 1;
     store64(bud + _SX_B_VISITS, n);
     if (n > _SX_MEMO_WALK) { return 0 - 2; }
+    if (load64(bud) < load64(bud + _SX_B_M0)) { return 0 - 2; }
     n = e;
     var l = 0;
     var r = 0;
@@ -2317,6 +2895,7 @@ fn _sym_rw_deep(rule, e, bud, bindings) {
             r = load64(bud + _SX_B_VISITS) + 1;
             store64(bud + _SX_B_VISITS, r);
             if (r > _SX_MEMO_WALK) { return 0 - 2; }
+            if (load64(bud) < load64(bud + _SX_B_M0)) { return 0 - 2; }
         }
         if (t == EXPR_ADD || t == EXPR_MUL || t == EXPR_POW) {
             if (st == 0) {
@@ -2670,7 +3249,8 @@ fn _sym_tree_bytes(e, cap, m) {
 # a unary chain was walked once per parent: 500 products sharing a doubled node took 524,320,503
 # pair visits on 3,030 nodes held, and take 34,741 now; two chains of 10,000 adds over 10,000 sines
 # took 101,068,580, and take 30,113. x doubled 60 times answers its input in 39 ms, 152 bytes; the
-# derivative of sin^17000(x) in 103 ms, 39.8 MB (3.4.0: 15.3 s, 24.3 GB). Below those counts nothing
+# derivative of sin^17000(x) in 103 ms, 39.8 MB (3.4.0: 15.3 s, 24.3 GB; 3.5.0: 7.2 MB, the walks
+# handing their stack blocks back, _sx_scr_take). Below those counts nothing
 # changes. Past them a tree with nothing to share pays for the memo: distribution on
 # (x + 1)...(x + 17), 5 million nodes, 7.2 s -> 17 s; but (x + 1)...(x + 19) now answers, in 34 s,
 # where the bound refused it. The answer is the same tree either way, its shared nodes held once
@@ -2700,7 +3280,8 @@ fn _sym_tree_bytes(e, cap, m) {
 # or NaN equals anything, so a pass that changed nothing still read as a change, and
 # (x + neg(x)) + const(+Inf) spent all 50 passes on the first rule and came back unchanged
 # where the default rules give 0 + inf. The comparison is now "the same node, or the same
-# tree with constants of the same bits or within 1e-15" (_sym_tree_equal's same = 1).
+# tree with constants of the same bits or equal and finite" (_sym_tree_equal's same = 1; within
+# 1e-15 rather than equal through 3.4.2).
 # [measured: tests/hisab.tcyr, group "3.4.1: sym_rewrite's rules, work bound and fixpoint"]
 # [measured: tests/edge_cases.tcyr, group "3.4.1 SYM2: sym_rewrite's size bound is ALLOC_MAX"]
 public fn sym_rewrite(e, rules) {
@@ -2719,7 +3300,7 @@ public fn sym_rewrite(e, rules) {
         if (_rule_shares(vec_get(rules, ri)) == 1) { shares = 1; }
         ri = ri + 1;
     }
-    var bud: i64[13];
+    var bud: i64[17];
     var mbuf: i64[768];
     _sx_call_open(&bud, &mbuf, lim);
     var bindings = _bind_new();
@@ -2729,10 +3310,15 @@ public fn sym_rewrite(e, rules) {
     var current = e;
     var iter = 0;
     var eq = 0;
+    # Every walk of the last rule's turn has returned when the next turn begins, so its stack
+    # blocks are handed back there (3.5.0, _sx_scr_take).
+    var mk: i64[2];
+    _sx_scr_mark(&bud, &mk);
     while (iter < max_iter) {
         var changed = 0;
         ri = 0;
         while (ri < rlen) {
+            _sx_scr_restore(&bud, &mk);
             var rule = vec_get(rules, ri);
             var next = _sym_rewrite_single(rule, current, &bud, bindings);
             if (next < 0) { return 0; }

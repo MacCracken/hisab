@@ -168,12 +168,22 @@ public fn composite_plus(sr, sg, sb, sa, dr, dg, db, da) {
 # ================================================================
 
 # Reinhard: x / (1 + x) per channel, as a fresh HVec3 (0 when it cannot be allocated).
-# Meant for x >= 0; x = -1 is the formula's pole (a signed infinity), NaN propagates,
-# +Inf gives NaN (Inf / Inf).
+# Meant for x >= 0; x = -1 is the formula's pole (a signed infinity), NaN propagates, and +Inf
+# (or -Inf) gives 1, the limit.
+# ⛔ 3.5.0 — +Inf GAVE NaN (Inf / Inf), where the map tends to 1 (roadmap [3.5.0], with
+# `tonemap_reinhard_extended`'s +Inf; LIE2 F2): a channel past DBL_MAX is the brightest one.
+# Each channel is x / (1 + x), two roundings; +-Inf is 1 (one integer test of its bits, written out
+# per channel: a helper call per channel measured 28 -> 37 ns a call against 3.4.2, and this form
+# 61 -> 67 ns, +10%, in a second, slower run of the same A/B).
+# [measured: scratch bench/ab.cyr, 3.4.2 and this tree interleaved x 6, taskset, 2026-11-14; noisy, 8 lanes]
 public fn tonemap_reinhard(r, g, b) {
-    return hvec3_new(f64_div(r, f64_add(F64_ONE, r)),
-      f64_div(g, f64_add(F64_ONE, g)),
-      f64_div(b, f64_add(F64_ONE, b)));
+    var qr = f64_div(r, f64_add(F64_ONE, r));
+    var qg = f64_div(g, f64_add(F64_ONE, g));
+    var qb = f64_div(b, f64_add(F64_ONE, b));
+    if ((r & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { qr = F64_ONE; }
+    if ((g & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { qg = F64_ONE; }
+    if ((b & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { qb = F64_ONE; }
+    return hvec3_new(qr, qg, qb);
 }
 
 # x (1 + x / white^2) / (1 + x), formed as t + (x / white) (t / white) with t = x / (1 + x).
@@ -209,7 +219,16 @@ public fn tonemap_reinhard(r, g, b) {
 # ⚠ COST: 8.25-8.29 ns a channel to 8.70-8.76 (+5.7%) with the sum's compare first; f64_eq(m, 0)
 # on the term cost +20%.
 # [measured: LIE4 lane rht.cyr direct loop, same boot, interleaved against 3.4.1's second form, 2026-11-01]
+# ⛔ 3.5.0 — x = +-Inf GAVE NaN (t = Inf / Inf), where the map has a limit (roadmap [3.5.0],
+# LIE2 F2): x (1 + x / w^2) / (1 + x) is x / w^2 to first order, so +-Inf for a finite white,
+# 0 included (x / w^2 is then +-Inf itself); 1, Reinhard's limit, for white = +-Inf; NaN for a
+# NaN white. One integer test of the bits on the finite path.
 fn _reinhard_ext(x, white) {
+    if ((x & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) {
+        if ((white & 0x7FFF_FFFF_FFFF_FFFF) > 0x7FF0_0000_0000_0000) { return white; }
+        if ((white & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { return F64_ONE; }
+        return x;
+    }
     var t = f64_div(x, f64_add(F64_ONE, x));
     var r = f64_add(t, f64_mul(f64_div(x, white), f64_div(t, white)));
     if (r != 0) { return r; }
@@ -224,8 +243,9 @@ fn _reinhard_ext(x, white) {
 # Only white^2 matters, so -white gives the same answer. A zero x keeps its sign: -0 gives -0
 # for every white but 0 and NaN. white = 0 (either sign): x > 0
 # gives +Inf, the limit as white -> 0; x = 0 gives NaN (0 / 0: the limit at (0, 0)
-# depends on the path). white = +-Inf gives x / (1 + x), Reinhard's map. x = +Inf gives
-# NaN (Inf / Inf, as tonemap_reinhard), x = -1 is the pole, NaN propagates.
+# depends on the path). white = +-Inf gives x / (1 + x), Reinhard's map. x = +-Inf gives
+# +-Inf, the limit (1 for white = +-Inf, NaN for a NaN white; 3.5.0: NaN, Inf / Inf), x = -1 is
+# the pole, NaN propagates.
 # [measured: tests/modules_c.tcyr "3.4.1 LIE2: tonemap_reinhard_extended"; LIE2 Fraction sweep, 2026-10-31]
 public fn tonemap_reinhard_extended(r, g, b, white) {
     return hvec3_new(_reinhard_ext(r, white), _reinhard_ext(g, white), _reinhard_ext(b, white));
@@ -244,8 +264,11 @@ fn _aces_map(x) {
     # was Inf / Inf = NaN, where the map's value is 2.51 / 2.43 > 1, clamped to 1. ⭐ 3.4.1:
     # above 2^500 the same quotient divided through by x^2, (a + b/x) / (c + (d + e/x)/x).
     # [measured: tests/abuse.tcyr "3.4.1: tone maps", baseline 3.4.0]
+    # ⛔ 3.5.0 — and +-Inf still took the quadratics (Inf / Inf, NaN), where the same divided
+    # form gives a / c (b / x, d / x and e / x are zeros), clamped to 1: the map's limit at both
+    # ends (roadmap [3.5.0], the class of tonemap_reinhard's +Inf).
     var ax = f64_abs(x);
-    if (f64_gt(ax, (1023 + 500) << 52) == 1 && f64_lt(ax, F64_POS_INF) == 1) {
+    if (f64_gt(ax, (1023 + 500) << 52) == 1) {
         num = f64_add(a, f64_div(b, x));
         den = f64_add(c, f64_div(f64_add(d, f64_div(e, x)), x));
     }
@@ -253,8 +276,9 @@ fn _aces_map(x) {
 }
 
 # The Narkowicz ACES filmic fit x (2.51 x + 0.03) / (x (2.43 x + 0.59) + 0.14) per channel,
-# clamped to [0, 1], as a fresh HVec3 (0 when it cannot be allocated). Finite input of any
-# size is answered; +Inf gives NaN (Inf / Inf, then the clamp passes it), as does NaN.
+# clamped to [0, 1], as a fresh HVec3 (0 when it cannot be allocated). Input of any size is
+# answered, +-Inf included (1, the limit 2.51 / 2.43 clamped; 3.5.0: NaN, Inf / Inf); NaN
+# propagates (the clamp passes it).
 public fn tonemap_aces(r, g, b) {
     return hvec3_new(_aces_map(r), _aces_map(g), _aces_map(b));
 }
@@ -263,27 +287,81 @@ public fn tonemap_aces(r, g, b) {
 # Depth linearization
 # ================================================================
 
+# `linearize_depth`'s scale for a far / near below the normal range.
+enum _ColorDepth {
+    _COL_DEPTH_2P1000 = 0x7E70_0000_0000_0000;   # 2^1000
+}
+
 # Linear (view-space) depth from a [0, 1] depth-buffer value for a projection with planes
 # near and far: near far / (far - ndc (far - near)), so ndc = 0 gives near and 1 gives far.
 # Formed as near / ((1 - ndc) + ndc (near / far)) (3.4.1), the same function for every
-# far != 0. far = +Inf (an infinite far plane) gives near / (1 - ndc); near = far = 0 gives
-# NaN (0/0). No failure value. For ndc in [0, 1] and near, far > 0 (near / far normal) its
-# relative error is at most 4 * 2^-53, so under 4 ulps: both terms of the denominator are
-# positive and within 2 * 2^-53, their sum and the quotient round once each. Measured: at
-# most 2.08 ulps over 300,000 inputs (a third within 1e-3 of the far plane).
+# far != 0. far = +Inf (an infinite far plane) gives near / (1 - ndc), and far at ndc = 1;
+# near = far = 0 gives NaN (0/0), as does near = 0 at ndc = 1. No failure value. For ndc in
+# [0, 1] and finite near, far > 0, its relative error is at most 4 * 2^-53 where near / far is
+# finite: 1 - ndc and ndc (near / far) are positive and within 2^-53 and 2 * 2^-53, and their sum
+# and the quotient round once each (a subnormal near / far is off by under 2^-1021 of the sum,
+# which 1 - ndc >= 2^-53 bounds, and at ndc = 1 the exit below returns far exactly). Where
+# near / far overflows it is at most 5 * 2^-53, one rounding more (1 - ndc times the ratio, in the
+# branch below). Both to first order, plus half a subnormal step where the depth is subnormal.
+# Measured: at most 2.08 ulps over 300,000 inputs (a third within 1e-3 of the far plane).
 # [measured: tests/abuse.tcyr "3.4.1: linearize_depth"; LIE2 lane Fraction sweep, 2026-10-31]
 # ⛔ 3.4.0 AND EARLIER — near * far formed first: +Inf for (0.5, 1e200, 1.002e201) where
 # the depth is 1.8e200, and NaN (Inf / (Inf - Inf)) for an infinite far plane, where it is
 # 2 near at ndc 0.5; and far - ndc (far - near) cancels to near at ndc = 1, keeping
 # far's rounding. [measured: tests/abuse.tcyr "3.4.1: linearize_depth", baseline 3.4.0]
+# ⛔ 3.5.0 — near / far ITSELF LEFT THE DOUBLES (roadmap [3.5.0], RV-LIE N7): (1, 1e-200, 1e200)
+# flushed it to 0 and returned near / 0 = +Inf, exact 1e200, and near past far by more than
+# DBL_MAX (1e200 against 1e-200) overflowed it, so 0 for every ndc > 0 (exact about far / ndc)
+# and NaN at ndc = 0 (1 + 0 * Inf). Each is now told by the quantity that failed, so every input
+# 3.4.2 answered with a normal denominator keeps its bits:
+#   - near / far overflowed (or is NaN): the same function as far / ((1 - ndc) (far / near) + ndc),
+#     whose ratio is then below 2^-1024, on the subnormal grid. For |far| < 1 (which the overflow
+#     implies for a finite near) and |ndc| <= 2, both are taken times 2^1000, exactly:
+#     (far 2^1000) / ((1 - ndc) ((far 2^1000) / near) + ndc 2^1000), every part normal or past
+#     2^-1000 of the sum. ndc = 0 gives near exactly (the ratio alone could flush);
+#   - the denominator is below DBL_MIN: only ndc = 1 can make it so ((1 - ndc) is 0 or at least
+#     2^-53), where it is near / far alone, flushed or rounded on the subnormal grid: far exactly.
+# A cancelling sum cannot reach either branch on [0, 1]; outside it (ndc past 1, a negative
+# plane) the formula's own value stands.
+# ⛔ 3.5.0 REVIEW — THE FIRST FORM OF THE OVERFLOW BRANCH TOOK (1 - ndc) (far / near) + ndc
+# UNSCALED, far / near rounded on the subnormal grid, and with a subnormal ndc beside it the sum
+# kept that rounding: (3.8e-321, 9.48e181, 2.54e-145) came back 3.4e9 ulp off its 6.686423e175,
+# and 25 of 500 such inputs were past 4 ulp. Scaled, 8,630 inputs (three seeds, a sixth subnormal
+# ndc with near / far past DBL_MAX) are within 2.26 ulp, where the first form was past 4 on 110
+# and 3.4.2 on 1,338; only inputs whose near / far overflows moved bits (133).
+# [measured: scratch ld.py (Fraction oracle), 3.4.2, the first review tree and this one, seeds 1-3, 2026-11-14]
+# Cost: two integer tests of bits, 21 -> 22 ns (+7%) on an ordinary depth.
+# [measured: scratch bench/ab.cyr, 3.4.2 and this tree interleaved x 6, taskset, 2026-11-14; noisy, 8 lanes]
 public fn linearize_depth(ndc, near, far) {
-    var den = f64_add(f64_sub(F64_ONE, ndc), f64_mul(ndc, f64_div(near, far)));
-    return f64_div(near, den);
+    var r = f64_div(near, far);
+    if ((r & 0x7FFF_FFFF_FFFF_FFFF) < 0x7FF0_0000_0000_0000) {
+        var den = f64_add(f64_sub(F64_ONE, ndc), f64_mul(ndc, r));
+        if ((den & 0x7FFF_FFFF_FFFF_FFFF) < 0x0010_0000_0000_0000) {
+            if (f64_eq(ndc, F64_ONE) == 1 && f64_eq(near, 0) == 0) { return far; }
+        }
+        return f64_div(near, den);
+    }
+    if (f64_eq(ndc, 0) == 1 && f64_eq(far, 0) == 0) { return f64_add(near, f64_mul(far, 0)); }
+    if (f64_le(f64_abs(ndc), F64_TWO) == 1 && f64_lt(f64_abs(far), F64_ONE) == 1) {
+        # far / near is below 2^-1024 here, on the subnormal grid, and so is ndc at its low end:
+        # the quotient's numerator and denominator times 2^1000 (exact), (far 2^1000) / near normal
+        # unless the whole term is past 2^-1000 of ndc 2^1000's part
+        var f2 = f64_mul(far, _COL_DEPTH_2P1000);
+        var d2 = f64_add(f64_mul(f64_sub(F64_ONE, ndc), f64_div(f2, near)), f64_mul(ndc, _COL_DEPTH_2P1000));
+        return f64_div(f2, d2);
+    }
+    var den2 = f64_add(f64_mul(f64_sub(F64_ONE, ndc), f64_div(far, near)), ndc);
+    return f64_div(far, den2);
 }
 
-# Linear depth for a reverse-Z projection with an infinite far plane: near / ndc. ndc = 0
-# exactly (the far plane at infinity) returns 0 by design; every other ndc, subnormal
-# included, is divided.
+# Linear depth for a reverse-Z projection with an infinite far plane (`m4_perspective_reverse_z`):
+# near / ndc, one rounding, for ndc in (0, 1], subnormal ndc included. ndc = +-0, the far plane at
+# infinity, gives +Inf for near > 0: the depth there, and the limit from inside the depth range,
+# which IEEE's near / +0 is (-0 is the same real 0, so it is read as +0: a depth-buffer value has
+# no sign). near = 0 with ndc = 0 is NaN (0 / 0); a NaN propagates. No failure value.
+# ⛔ 3.5.0 — ndc = 0 RETURNED 0 (roadmap [3.5.0] D096), which is linear depth AT THE EYE, for the
+# plane at infinity: the subnormal neighbour 2^-1074 already gave near * 2^1074 (+Inf for near =
+# 1). The three suites' pins of that 0 now read +Inf.
 public fn linearize_depth_reverse_z(ndc, near) {
     # ⛔ TWO DEFECTS ON ONE LINE. (1) `ndc` was tested against an absolute 1e-12
     # and the fallback fabricated 0.0. ⚠ Not F64_TINY either, and that is measured
@@ -294,7 +372,9 @@ public fn linearize_depth_reverse_z(ndc, near) {
     # the meaning INVERTED: this is a reverse-Z projection, so ndc = 0 is the
     # infinite FAR plane and linear depth 0 is AT THE EYE.
     # [measured: docs/audit/2026-09-09-epsilon-open.json]
-    if (f64_eq(ndc, 0) == 1) { return 0; }  # ndc = 0 is the infinite far plane
+    # (3) And the exact-zero exit itself returned 0, the eye, for the far plane (3.5.0, above):
+    # the division is the answer there too, once -0 is read as the real 0 it is.
+    if ((ndc & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return f64_div(near, 0); }
     return f64_div(near, ndc);
 }
 
@@ -302,21 +382,70 @@ public fn linearize_depth_reverse_z(ndc, near) {
 # EV / Exposure
 # ================================================================
 
-# Scene luminance (cd/m^2) for an EV100 exposure value: 2^(ev - 3) * 12.5 / pi, the
-# reflected-light meter form with K = 12.5 and the 1/pi factor (the convention is a
-# [3.5.0] question: SPC-F5). +Inf EV gives +Inf, -Inf gives +0, NaN propagates.
-public fn ev100_to_luminance(ev) {
-    var three = f64_from(3);
-    var twelve_five = f64_div(f64_from(125), f64_from(10));
-    return f64_div(f64_mul(ganita_f64_pow(F64_TWO, f64_sub(ev, three)), twelve_five), F64_PI);
+# THE CONVENTION (3.5.0, roadmap [3.5.0] SPC-F5, *Decisions owed* #12(c)): the reflected-light
+# meter equation EV100 = log2(L S / K) with the meter constant K = 12.5 cd s / m^2 and S = 100 ISO,
+# so L = 2^(EV100 - 3) cd/m^2, the average scene luminance a meter reads: Lagarde and de Rousiers,
+# "Moving Frostbite to Physically Based Rendering" (2014), and Filament's exposure model, the
+# source `ev100_to_exposure` below already follows (its 1.2 = 78 / (0.65 * 100)). EV 0 is 1/8
+# exactly.
+# ⛔ 3.5.0 — `ev100_to_luminance` RETURNED 2^(ev - 3) * 12.5 / pi (0.4974 at EV 0), the meter
+# equation times a stray 12.5 / pi, and `luminance_to_ev100` inverted that: no source gives the
+# factor, and against Frostbite's own exposure (the sibling below) every luminance was 3.98 times
+# too high. Both are retired, not redefined: the same signature with a different answer for
+# every input. `ev100_to_avg_luminance` and `avg_luminance_to_ev100` are the meter equation.
+# [measured: docs/audit/2026-10-31-v3.4.0-full.md, SPC-F5 (0x3FDFD4BBAB8B494C at EV 0)]
+
+# The EV100 constants: the bounds of the range where 2^ev * 2^-3 rounds once, and the scales.
+enum _ColorEv {
+    _COL_EV_LO    = 0xC08F_D800_0000_0000;   # -1019.0
+    _COL_EV_HI    = 0x4090_0000_0000_0000;   # 1024.0
+    _COL_EV_EIGHTH = 0x3FC0_0000_0000_0000;  # 0.125
+    _COL_EV_THREE = 0x4008_0000_0000_0000;   # 3.0
+    _COL_EV_EIGHT = 0x4020_0000_0000_0000;   # 8.0
+    _COL_EV_L_HI  = 0x7FC0_0000_0000_0000;   # 2^1021
+    _COL_EV_SIXTY_FOUR = 0x4050_0000_0000_0000;   # 64.0
+    _COL_EV_TWO_M67 = 0x3BC0_0000_0000_0000;      # 2^-67
 }
 
-# The inverse of ev100_to_luminance: log2(luminance * pi / 12.5) + 3. Luminance 0 gives
-# -Inf, a negative one NaN.
-public fn luminance_to_ev100(luminance) {
-    var twelve_five = f64_div(f64_from(125), f64_from(10));
-    var three = f64_from(3);
-    return f64_add(f64_div(f64_ln(f64_div(f64_mul(luminance, F64_PI), twelve_five)), F64_LN2), three);
+# The average scene luminance, cd/m^2, of an EV100 exposure value: 2^(ev - 3) (the convention
+# above), within 1 ulp: `ganita_f64_pow`'s 2^x on an exponent x formed exactly, and one exact or
+# once-rounded power-of-two scaling. For ev in [-1019, 1024) it is 2^ev * 2^-3 (exact scaling);
+# below, where the answer is subnormal, 2^(ev + 64) * 2^-67 (ev + 64 is exact there, and the
+# product rounds once onto the subnormal grid); from 1024, where 2^ev overflows, 2^(ev - 3) (exact
+# there). ev - 3 itself is not always exact: from -1024 to -1021 it crosses into the binade whose
+# ulp is twice ev's, and the first form of this function lost up to 86 ulps of a subnormal answer
+# that way. Exact for every integer ev from -1071 to 1026. +Inf EV gives +Inf, -Inf gives +0, NaN
+# propagates; the answer overflows to +Inf from ev = 1027.
+# [measured: scratch evgen.py / evchk.py, Decimal 80-digit oracle, 13,000 ev, at most 1 ulp, 2026-11-14; cycc 6.7.18]
+# On [-1022, -1019), where 2^ev is still normal and the answer already subnormal, the two forms
+# give the same bits (2^(ev + 64) is 2^ev 2^64 there), so -1019, where the answer leaves the
+# normals, is a choice no suite can see (the review's mutant MU18, equivalent).
+# [measured: scratch ev.tcyr, both forms side by side, 2,000,000 ev on [-1022, -1019), 2026-11-14; cycc 6.7.18]
+# ⚠ The 1 ulp is `ganita_f64_pow`'s from cycc 6.6.8, whose exp / ln are the fdlibm ports: this source
+# compiled by 6.6.7 measured up to 695 ulp on the same 8,000 ev (integer ev still exact), as
+# 3.4.2's `ev100_to_luminance` did through the same pow. The inverse's `f64_log2` held 1 ulp there.
+# [measured: scratch h667 evgen.py / evchk.py, cycc 6.6.7 on the 6.7.18 stdlib, 8,000 ev, 2026-11-14]
+#must_use
+public fn ev100_to_avg_luminance(ev) {
+    if (f64_ge(ev, _COL_EV_LO) == 1 && f64_lt(ev, _COL_EV_HI) == 1) {
+        return f64_mul(ganita_f64_pow(F64_TWO, ev), _COL_EV_EIGHTH);
+    }
+    if (f64_lt(ev, _COL_EV_LO) == 1) {
+        return f64_mul(ganita_f64_pow(F64_TWO, f64_add(ev, _COL_EV_SIXTY_FOUR)), _COL_EV_TWO_M67);
+    }
+    return ganita_f64_pow(F64_TWO, f64_sub(ev, _COL_EV_THREE));
+}
+
+# The EV100 of an average scene luminance L (cd/m^2): log2(L) + 3, the inverse of
+# `ev100_to_avg_luminance`. Formed as log2(8 L) where 8 L is exact (L below 2^1021), so one
+# `f64_log2` (within 1 ulp; exactly k for L = 2^(k - 3)), and as log2(L) + 3 above it (within 1
+# ulp: the sum's rounding is at twice log2's ulp there). L = 0 gives -Inf, a negative L NaN,
+# +Inf gives +Inf, NaN propagates.
+# [measured: scratch evgen.py / evchk.py, Decimal 80-digit oracle, 13,000 L, at most 1 ulp, 2026-11-14; cycc 6.7.18]
+#must_use
+public fn avg_luminance_to_ev100(lum) {
+    if (f64_lt(lum, _COL_EV_L_HI) == 1) { return f64_log2(f64_mul(lum, _COL_EV_EIGHT)); }
+    return f64_add(f64_log2(lum), _COL_EV_THREE);
 }
 
 # The exposure multiplier for an EV100 value: 1 / (1.2 * 2^ev) (the saturation-based

@@ -19,6 +19,14 @@
 
 var _DG_F64_SIX = 0x4018_0000_0000_0000;  # 6.0
 
+# 3.5.0: what the three entry points that return an f64 -- ricci_scalar, sectional_curvature,
+# killing_residual -- answer where there is no value (an invalid argument; a degenerate
+# plane): the quiet NaN. Their designed 0 through 3.4.2 was a legal answer each time (R = 0
+# is flat, K = 0 is flat, a residual of 0 is a Killing field).
+enum _DgNaN {
+    _DG_QNAN = 0x7FF8_0000_0000_0000;   # the quiet NaN
+}
+
 # Shared dimension cap for every tensor entry point in this module.
 # christoffel_symbols and riemann_tensor have capped at 16 and returned 0 above it
 # since they were written; the downstream contractions did neither, so they both
@@ -30,7 +38,8 @@ var _DG_F64_SIX = 0x4018_0000_0000_0000;  # 6.0
 # riemann_tensor hard-coded the 16 and read null inputs, and hodge_star_2form_4d,
 # wedge_2_1 and wedge_3_1 read null inputs: each null case exited 139, and so did
 # sectional_curvature at dim = 1e5. Invalid input now returns the module's
-# designed 0, as every other entry point here already did.
+# designed 0, as every other entry point here already did (3.5.0: the three that return an
+# f64 answer NaN instead, since 0.0 is a value for each; the pointer returns keep 0).
 # [measured: scratch harness, not reproducible in-tree, 2026-09-30; cycc 6.6.12]
 var _DG_MAX_DIM = 16;
 
@@ -240,11 +249,12 @@ public fn ricci_get(ricci, dim, mu, nu) {
 # 4. RICCI SCALAR  R = g^{mu nu} R_{mu nu}
 # ================================================================
 # ricci: R_{mu nu} (flat dim^2); metric_inv: g^{mu nu} (flat dim^2). Returns the scalar
-# as f64, summed in index order; the designed 0 for a null pointer or a dim outside 1..16.
+# as f64, summed in index order; the quiet NaN for a null pointer or a dim outside 1..16
+# (3.5.0: through 3.4.2 the designed 0, which reads as a flat space).
 
 public fn ricci_scalar(ricci, metric_inv, dim) {
-    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
-    if (ricci == 0 || metric_inv == 0) { return 0; }
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return _DG_QNAN; }
+    if (ricci == 0 || metric_inv == 0) { return _DG_QNAN; }
     var scalar = 0;  # f64 0.0
     var mu = 0;
     while (mu < dim) {
@@ -342,9 +352,13 @@ fn _dg_unit_shift(p, n) {
     return 0 - _dg_exp2(mx);
 }
 
-# u^a v^s - u^s v^a with both products exact (Dekker's two-product, |entries| < 2^995) and
-# their difference carried: within an ulp or two of the exact determinant.
-fn _dg_det2(a, b, c, d) {
+# u^a v^s - u^s v^a with both products exact (Dekker's two-product, |entries| < 2^995, the
+# products' low parts normal) and their difference carried: within an ulp or two of the exact
+# determinant. o[0] gets |pe - qe| as rounded, the low parts' difference, which
+# sectional_curvature's certificate carries as a conservative extra term (3.5.0): fl(pe - qe) is
+# inexact only where p and q straddle a binade, and there |B| is at least 2^53 units of pe's
+# last place, so its rounding is under 2^-54 |B| and inside 2.01 u |B| already.
+fn _dg_det2(a, b, c, d, o) {
     var sa = f64_mul(a, 0x41A0_0000_0200_0000);   # 2^27 + 1
     var ah = f64_sub(sa, f64_sub(sa, a)); var al = f64_sub(a, ah);
     var sb = f64_mul(b, 0x41A0_0000_0200_0000);
@@ -359,7 +373,753 @@ fn _dg_det2(a, b, c, d) {
     var q = f64_mul(c, d);
     var qe = f64_add(f64_add(f64_add(f64_sub(f64_mul(ch, dh), q), f64_mul(ch, dl)), f64_mul(cl, dh)),
       f64_mul(cl, dl));
-    return f64_add(f64_sub(p, q), f64_sub(pe, qe));
+    var d2 = f64_sub(pe, qe);
+    store64(o, f64_abs(d2));
+    return f64_add(f64_sub(p, q), d2);
+}
+
+# ---- sectional_curvature's certificate and its two accurate tiers (3.5.0) ----
+# _DG_TH is the bound each of num and den must meet, relative, for K to be within 2^-46:
+# (1 + u)(1 + TH) / (1 - TH) - 1 < 2^-46 with u = 2^-53. _DG_UP and _DG_U2P are u and u^2
+# with a 2^-8 margin for the rounding of the bounds themselves; _DG_EABS bounds what every
+# underflowed product, scaled entry and two-product low part can add, in the scaled units
+# (2^-1047 by count, at dim 16).
+enum _DgSect {
+    _DG_TH = 0x3CFF_8000_0000_0000;      # 63/64*2^-47
+    _DG_UP = 0x3CA0_1000_0000_0000;      # 2^-53 + 2^-61
+    _DG_U2P = 0x3950_1000_0000_0000;     # 2^-106 + 2^-114
+    _DG_ONEP = 0x3FF0_1000_0000_0000;    # 1 + 2^-8
+    _DG_EABS = 0x0000_1000_0000_0000;    # 2^-1030
+    _DG_EUV = 0x0000_0000_0000_0020;     # 2^-1069
+    _DG_SPLIT = 0x41A0_0000_0200_0000;   # 2^27 + 1
+    _DG_LIMB = 0x3E40_0000_0000_0000;    # 2^-27
+}
+
+# The magnitude bits under which an entry scaled by 2^s is below 2^-200 (0 when none is): the
+# point under which a product of the scaled operands can leave the normal range. A nonzero
+# entry's bits with the sign cleared order as its magnitude, so `0 < |x| bits < thr` is the
+# test; NaN and infinite entries never pass it (they answer for themselves).
+fn _dg_thr(s) {
+    var e = 0 - 200 - s;
+    if (e >= 0 - 1022) { return (e + 1023) << 52; }
+    if (e >= 0 - 1074) { return 1 << (e + 1074); }
+    return 0;
+}
+
+# 2^k as a double when |k| <= 1000, where _dg_ldexp(x, k) is the one product x * 2^k; else 0.
+fn _dg_p2(k) {
+    if (k > 1000 || k < 0 - 1000) { return 0; }
+    return (1023 + k) << 52;
+}
+
+# x * 2^k as _dg_ldexp gives it, with p = _dg_p2(k) precomputed.
+fn _dg_scale(x, p, k) {
+    if (p != 0) { return f64_mul(x, p); }
+    return _dg_ldexp(x, k);
+}
+
+# st = { S, c }: one step of a compensated sum of products (Ogita, Rump and Oishi's Dot2), adding
+# (xh + xl)(yh + yl): S + c gets xh yh's two-product (Dekker's: xh and yh split, the four partial
+# products) and the sum's 2Sum error, carried in c with xh yl + xl yh; xl yl is dropped (below u^2
+# of the term). _dg_sect_dd writes the same step out inline where it is hot, with xl = 0 for a
+# double x and the splits made once.
+fn _dg_cacc2(st, xh, xl, yh, yl) {
+    var p = f64_mul(xh, yh);
+    var sx = f64_mul(xh, _DG_SPLIT); var ah = f64_sub(sx, f64_sub(sx, xh)); var al = f64_sub(xh, ah);
+    var sy = f64_mul(yh, _DG_SPLIT); var hh = f64_sub(sy, f64_sub(sy, yh)); var hl = f64_sub(yh, hh);
+    var pe = f64_add(f64_add(f64_add(f64_sub(f64_mul(ah, hh), p), f64_mul(ah, hl)), f64_mul(al, hh)),
+      f64_mul(al, hl));
+    var s0 = load64(st);
+    var s = f64_add(s0, p);
+    var bb = f64_sub(s, s0);
+    var sg = f64_add(f64_sub(s0, f64_sub(s, bb)), f64_sub(p, bb));
+    store64(st, s);
+    var w = f64_add(f64_mul(xh, yl), f64_mul(xl, yh));
+    store64(st + 8, f64_add(f64_add(f64_add(load64(st + 8), sg), pe), w));
+    return 0;
+}
+
+# o = { fl(a b), a b - fl(a b) } (Dekker's two-product: exact while a b and its low part are
+# normal and |a|, |b| < 2^995).
+fn _dg_2prod(a, b, o) {
+    var p = f64_mul(a, b);
+    var sx = f64_mul(a, _DG_SPLIT); var ah = f64_sub(sx, f64_sub(sx, a)); var al = f64_sub(a, ah);
+    var sy = f64_mul(b, _DG_SPLIT); var bh = f64_sub(sy, f64_sub(sy, b)); var bl = f64_sub(b, bh);
+    store64(o, p);
+    store64(o + 8, f64_add(f64_add(f64_add(f64_sub(f64_mul(ah, bh), p), f64_mul(ah, bl)), f64_mul(al, bh)),
+        f64_mul(al, bl)));
+    return 0;
+}
+
+# o = { hi, lo }, a + b exactly (Knuth's 2Sum).
+fn _dg_2sum(a, b, o) {
+    var s = f64_add(a, b);
+    var bb = f64_sub(s, a);
+    store64(o, s);
+    store64(o + 8, f64_add(f64_sub(a, f64_sub(s, bb)), f64_sub(b, bb)));
+    return 0;
+}
+
+# (nh + nl) / (dh + dl) for a nonzero dh, rounded once: q1 + r / dh with r the residual,
+# within about 6 u^2 of the quotient before that rounding. q1 = nh / dh is split, so |q1| must
+# stay below about 2^995 (past it q1 (2^27 + 1) overflows and the residual is NaN): _dg_kq
+# brings both to [1, 2) first.
+fn _dg_dd_div(nh, nl, dh, dl) {
+    var q1 = f64_div(nh, dh);
+    var p = f64_mul(q1, dh);
+    var sx = f64_mul(q1, _DG_SPLIT); var qh = f64_sub(sx, f64_sub(sx, q1)); var ql = f64_sub(q1, qh);
+    var sy = f64_mul(dh, _DG_SPLIT); var dhh = f64_sub(sy, f64_sub(sy, dh)); var dhl = f64_sub(dh, dhh);
+    var pe = f64_add(f64_add(f64_add(f64_sub(f64_mul(qh, dhh), p), f64_mul(qh, dhl)), f64_mul(ql, dhh)),
+      f64_mul(ql, dhl));
+    var r = f64_sub(f64_add(f64_sub(f64_sub(nh, p), pe), nl), f64_mul(q1, dl));
+    return f64_add(q1, f64_div(r, dh));
+}
+
+# K = (nh + nl) / (2 (dh + dl)) 2^k for nonzero nh and dh, each pair first scaled by the power of
+# two that puts its high part in [1, 2) (exact), so the quotient _dg_dd_div splits is within
+# (1/2, 2) whatever num / den is. The double-double tier certifies num and den down to about
+# 2^-983 in its scaled units, so num / den reaches about 2^1006 there (dim 16, a tiny den beside a
+# large num): divided directly, its split overflows and K comes back NaN.
+# [measured: tests/modules_d.tcyr group "3.5.0 W7: sectional_curvature's three tiers", the dim-16 fixture]
+fn _dg_kq(nh, nl, dh, dl, k) {
+    var en = _dg_exp2(nh);
+    var ed = _dg_exp2(dh);
+    var q = _dg_dd_div(_dg_ldexp(nh, 0 - en), _dg_ldexp(nl, 0 - en), _dg_ldexp(dh, 0 - ed), _dg_ldexp(dl, 0 - ed));
+    return _dg_ldexp(f64_mul(q, F64_HALF), k + en - ed);
+}
+
+# o1[i] + o2[i] = x[i], Dekker's split (the high part 26 bits), for the n f64s at x.
+fn _dg_splits(x, n, o1, o2) {
+    var i = 0;
+    while (i < n) {
+        var y = load64(x + i * 8);
+        var sy = f64_mul(y, _DG_SPLIT);
+        var yh = f64_sub(sy, f64_sub(sy, y));
+        store64(o1 + i * 8, yh);
+        store64(o2 + i * 8, f64_sub(y, yh));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# 3N^2 + 9N + 8: the u^2 constant of one compensated sum of N terms (see _dg_sect_dd).
+fn _dg_cn(n) { return 3 * n * n + 9 * n + 8; }
+
+# The double-double tier: num and den as hi + lo, from u^a v^s exactly and compensated sums
+# (Dot2) at every contraction, on the fast path's scaled operands (gs is g 2^sg). Its bound, u = 2^-53:
+# one sum of N terms (xh + xl)(yh + yl), |xl| <= u |xh| and |yl| <= u |yh|, errs by at most
+# (3N^2 + 9N + 8) u^2 P, P = sum |fl(xh yh)|: by step k the carried part c is within (k + 3) u P
+# (the 2Sum errors are within u of partial sums at most P, the two-products' low parts u |p|,
+# xh yl + xl yh 2 u |p|), so its 3N roundings come to 3 u^2 P sum (k + 3) = (1.5 N^2 + 10.5 N) u^2 P,
+# and the dropped xl yl and the rounding of xh yl + xl yh add 5 u^2 P. Each input's own error
+# carries through, and B is within 3 u^2 of u ∧ v (Joldes, Muller and Popescu's accurate pair
+# sum). T sums p pairs, L and GB d terms, C d, num and den 2 p: so |num - num_dd| <= (cn(2p) +
+# cn(d) + cn(p) + 7) u^2 NA and |den - den_dd| <= (cn(2p) + 2 cn(d) + 7) u^2 DA, NA and DA the
+# absolute contractions, plus _DG_EABS for anything that left the normal range, plus eu (see
+# _dg_sect: what an underflow in forming u ∧ v leaves in each B entry, 0 when none can) carried as
+# the plain path carries it, through sum (LA_as + LA_sa) and 17 p d^2 (d - 1) for num and sum
+# (CA_as + CA_sa) and 17 p d (d - 1) for den. K is returned (1) when both are within _DG_TH of
+# their value, else 0 (num or den cancels to below about 2^-49 of its terms at dim 4, is 0, or is
+# below about 2^-980 in the scaled units).
+fn _dg_sect_dd(riemann, gs, uh, vh, dim, sb, sg, sr, eu, out) {
+    var nb = dim * dim;
+    var np = dim * (dim - 1) / 2;
+    var bh: i64[256];
+    var bl: i64[256];
+    var t2: i64[4];
+    var t3: i64[4];
+    var st: i64[4];
+    var a = 0;
+    while (a < dim) {
+        store64(&bh + _dg_idx2(a, a, dim), 0);
+        store64(&bl + _dg_idx2(a, a, dim), 0);
+        var s = a + 1;
+        while (s < dim) {
+            # (p + pe) - (q + qe), the accurate pair sum: within 3 u^2 of u^a v^s - u^s v^a.
+            _dg_2prod(load64(uh + a * 8), load64(vh + s * 8), &st);
+            var p = load64(&st); var pe = load64(&st + 8);
+            _dg_2prod(load64(uh + s * 8), load64(vh + a * 8), &st);
+            var q = load64(&st); var qe = load64(&st + 8);
+            _dg_2sum(p, f64_neg(q), &t2);
+            _dg_2sum(pe, f64_neg(qe), &t3);
+            var c = f64_add(load64(&t2 + 8), load64(&t3));
+            var vh2 = f64_add(load64(&t2), c);
+            var vl = f64_sub(c, f64_sub(vh2, load64(&t2)));
+            var w = f64_add(load64(&t3 + 8), vl);
+            var zh = f64_add(vh2, w);
+            var zl = f64_sub(w, f64_sub(zh, vh2));
+            zh = _dg_ldexp(zh, sb);
+            zl = _dg_ldexp(zl, sb);
+            store64(&bh + _dg_idx2(a, s, dim), zh); store64(&bl + _dg_idx2(a, s, dim), zl);
+            store64(&bh + _dg_idx2(s, a, dim), f64_neg(zh)); store64(&bl + _dg_idx2(s, a, dim), f64_neg(zl));
+            s = s + 1;
+        }
+        a = a + 1;
+    }
+    # T = R B, then L = g T and GB = g B, each entry a compensated sum. T pairs (m, n) with (n, m):
+    # R^rho_{smn} B^{mn} + R^rho_{snm} B^{nm} = (Rh_mn - Rh_nm) B^{mn}, the difference exact as rh + rl
+    # (2Sum), so each pair is one term x (y + e) of the sum with x = rh + rl, the step _dg_cacc2
+    # takes. These steps, and the L, GB and C sums' below (a double x, xl = 0), are written out with
+    # the splits of B, g, T and GB made once.
+    var th: i64[256];
+    var tl: i64[256];
+    var ta: i64[256];
+    var bs1: i64[256];
+    var bs2: i64[256];
+    var gs1: i64[256];
+    var gs2: i64[256];
+    _dg_splits(&bh, nb, &bs1, &bs2);
+    _dg_splits(gs, nb, &gs1, &gs2);
+    var pr2 = _dg_p2(sr);
+    var rho = 0;
+    while (rho < dim) {
+        var s2 = 0;
+        while (s2 < dim) {
+            var rbase = riemann + (rho * dim + s2) * nb * 8;
+            var ss = 0;
+            var cc = 0;
+            var pp = 0;
+            var m = 0;
+            while (m < dim) {
+                var n = m + 1;
+                while (n < dim) {
+                    var ix = (m * dim + n) * 8;
+                    var r1 = load64(rbase + ix);
+                    var r2 = load64(rbase + (n * dim + m) * 8);
+                    if (pr2 != 0) {
+                        r1 = f64_mul(r1, pr2);
+                        r2 = f64_mul(r2, pr2);
+                    } else {
+                        r1 = _dg_ldexp(r1, sr);
+                        r2 = _dg_ldexp(r2, sr);
+                    }
+                    var rh = f64_sub(r1, r2);
+                    var z = f64_sub(rh, r1);
+                    var rl = f64_sub(f64_sub(r1, f64_sub(rh, z)), f64_add(r2, z));
+                    var yh = load64(&bh + ix);
+                    var p = f64_mul(rh, yh);
+                    var sx = f64_mul(rh, _DG_SPLIT);
+                    var xh = f64_sub(sx, f64_sub(sx, rh));
+                    var xl = f64_sub(rh, xh);
+                    var hh = load64(&bs1 + ix);
+                    var hl = load64(&bs2 + ix);
+                    var pe = f64_add(f64_add(f64_add(f64_sub(f64_mul(xh, hh), p), f64_mul(xh, hl)), f64_mul(xl, hh)),
+                      f64_mul(xl, hl));
+                    var s0 = ss;
+                    ss = f64_add(s0, p);
+                    var bb = f64_sub(ss, s0);
+                    var sgm = f64_add(f64_sub(s0, f64_sub(ss, bb)), f64_sub(p, bb));
+                    var w = f64_add(f64_mul(rh, load64(&bl + ix)), f64_mul(rl, yh));
+                    cc = f64_add(f64_add(f64_add(cc, sgm), pe), w);
+                    pp = f64_add(pp, f64_abs(p));
+                    n = n + 1;
+                }
+                m = m + 1;
+            }
+            _dg_2sum(ss, cc, &t2);
+            store64(&th + _dg_idx2(rho, s2, dim), load64(&t2));
+            store64(&tl + _dg_idx2(rho, s2, dim), load64(&t2 + 8));
+            store64(&ta + _dg_idx2(rho, s2, dim), pp);
+            s2 = s2 + 1;
+        }
+        rho = rho + 1;
+    }
+    var lh: i64[256];
+    var ll: i64[256];
+    var la: i64[256];
+    var gh: i64[256];
+    var gl: i64[256];
+    var ga: i64[256];
+    var ts1: i64[256];
+    var ts2: i64[256];
+    _dg_splits(&th, nb, &ts1, &ts2);
+    a = 0;
+    while (a < dim) {
+        var c2 = 0;
+        while (c2 < dim) {
+            var ls = 0;
+            var lc = 0;
+            var gss = 0;
+            var gc = 0;
+            var lacc = 0;
+            var gacc = 0;
+            var k = 0;
+            while (k < dim) {
+                var ak0 = (a * dim + k) * 8;
+                var gak = load64(gs + ak0);
+                var xh = load64(&gs1 + ak0);
+                var xl = load64(&gs2 + ak0);
+                var kc = (k * dim + c2) * 8;
+                # L += gak (th + tl)
+                var yh = load64(&th + kc);
+                var p = f64_mul(gak, yh);
+                var hh = load64(&ts1 + kc);
+                var hl = load64(&ts2 + kc);
+                var pe = f64_add(f64_add(f64_add(f64_sub(f64_mul(xh, hh), p), f64_mul(xh, hl)), f64_mul(xl, hh)),
+                  f64_mul(xl, hl));
+                var s0 = ls;
+                ls = f64_add(s0, p);
+                var bb = f64_sub(ls, s0);
+                var sgm = f64_add(f64_sub(s0, f64_sub(ls, bb)), f64_sub(p, bb));
+                lc = f64_add(f64_add(f64_add(lc, sgm), pe), f64_mul(gak, load64(&tl + kc)));
+                # GB += gak (bh + bl)
+                var yb = load64(&bh + kc);
+                var pb = f64_mul(gak, yb);
+                var bh1 = load64(&bs1 + kc);
+                var bh2 = load64(&bs2 + kc);
+                var peb = f64_add(f64_add(f64_add(f64_sub(f64_mul(xh, bh1), pb), f64_mul(xh, bh2)), f64_mul(xl, bh1)),
+                  f64_mul(xl, bh2));
+                var s1 = gss;
+                gss = f64_add(s1, pb);
+                var bb1 = f64_sub(gss, s1);
+                var sgb = f64_add(f64_sub(s1, f64_sub(gss, bb1)), f64_sub(pb, bb1));
+                gc = f64_add(f64_add(f64_add(gc, sgb), peb), f64_mul(gak, load64(&bl + kc)));
+                lacc = f64_add(lacc, f64_mul(f64_abs(gak), load64(&ta + kc)));
+                gacc = f64_add(gacc, f64_mul(f64_abs(gak), f64_abs(yb)));
+                k = k + 1;
+            }
+            var ac = _dg_idx2(a, c2, dim);
+            _dg_2sum(ls, lc, &t2);
+            store64(&lh + ac, load64(&t2)); store64(&ll + ac, load64(&t2 + 8));
+            _dg_2sum(gss, gc, &t2);
+            store64(&gh + ac, load64(&t2)); store64(&gl + ac, load64(&t2 + 8));
+            store64(&la + ac, lacc);
+            store64(&ga + ac, gacc);
+            c2 = c2 + 1;
+        }
+        a = a + 1;
+    }
+    var hs1: i64[256];
+    var hs2: i64[256];
+    _dg_splits(&gh, nb, &hs1, &hs2);
+    # num = sum_{a<s} B^{as} (L_as - L_sa), den = sum_{a<s} B^{as} (C_as - C_sa), C = (g B) g^T.
+    var sn: i64[4];
+    var sd: i64[4];
+    store64(&sn, 0); store64(&sn + 8, 0);
+    store64(&sd, 0); store64(&sd + 8, 0);
+    var na = 0;
+    var da = 0;
+    var lsa = 0;
+    var csa = 0;
+    a = 0;
+    while (a < dim) {
+        var s3 = a + 1;
+        while (s3 < dim) {
+            var cs1 = 0;
+            var cc1 = 0;
+            var cs2 = 0;
+            var cc2 = 0;
+            var ca1 = 0;
+            var ca2 = 0;
+            var k2 = 0;
+            while (k2 < dim) {
+                var ak = (a * dim + k2) * 8;
+                var sk = (s3 * dim + k2) * 8;
+                var gsk = load64(gs + sk);
+                var gak2 = load64(gs + ak);
+                # C_as += gsk (GB_ak), C_sa += gak2 (GB_sk)
+                var y1 = load64(&gh + ak);
+                var p1 = f64_mul(gsk, y1);
+                var pe1 = f64_add(f64_add(f64_add(f64_sub(f64_mul(load64(&gs1 + sk), load64(&hs1 + ak)), p1),
+                      f64_mul(load64(&gs1 + sk), load64(&hs2 + ak))), f64_mul(load64(&gs2 + sk), load64(&hs1 + ak))),
+                  f64_mul(load64(&gs2 + sk), load64(&hs2 + ak)));
+                var o1 = cs1;
+                cs1 = f64_add(o1, p1);
+                var q1 = f64_sub(cs1, o1);
+                var e1 = f64_add(f64_sub(o1, f64_sub(cs1, q1)), f64_sub(p1, q1));
+                cc1 = f64_add(f64_add(f64_add(cc1, e1), pe1), f64_mul(gsk, load64(&gl + ak)));
+                var y2 = load64(&gh + sk);
+                var p2 = f64_mul(gak2, y2);
+                var pe2 = f64_add(f64_add(f64_add(f64_sub(f64_mul(load64(&gs1 + ak), load64(&hs1 + sk)), p2),
+                      f64_mul(load64(&gs1 + ak), load64(&hs2 + sk))), f64_mul(load64(&gs2 + ak), load64(&hs1 + sk))),
+                  f64_mul(load64(&gs2 + ak), load64(&hs2 + sk)));
+                var o2 = cs2;
+                cs2 = f64_add(o2, p2);
+                var q2 = f64_sub(cs2, o2);
+                var e2 = f64_add(f64_sub(o2, f64_sub(cs2, q2)), f64_sub(p2, q2));
+                cc2 = f64_add(f64_add(f64_add(cc2, e2), pe2), f64_mul(gak2, load64(&gl + sk)));
+                ca1 = f64_add(ca1, f64_mul(load64(&ga + ak), f64_abs(gsk)));
+                ca2 = f64_add(ca2, f64_mul(load64(&ga + sk), f64_abs(gak2)));
+                k2 = k2 + 1;
+            }
+            var as2 = _dg_idx2(a, s3, dim);
+            var sa2 = _dg_idx2(s3, a, dim);
+            var bah = load64(&bh + as2);
+            var bal = load64(&bl + as2);
+            _dg_cacc2(&sn, bah, bal, load64(&lh + as2), load64(&ll + as2));
+            _dg_cacc2(&sn, bah, bal, f64_neg(load64(&lh + sa2)), f64_neg(load64(&ll + sa2)));
+            _dg_2sum(cs1, cc1, &t2);
+            _dg_2sum(cs2, cc2, &t3);
+            _dg_cacc2(&sd, bah, bal, load64(&t2), load64(&t2 + 8));
+            _dg_cacc2(&sd, bah, bal, f64_neg(load64(&t3)), f64_neg(load64(&t3 + 8)));
+            var lsum = f64_add(load64(&la + as2), load64(&la + sa2));
+            var csum = f64_add(ca1, ca2);
+            na = f64_add(na, f64_mul(f64_abs(bah), lsum));
+            da = f64_add(da, f64_mul(f64_abs(bah), csum));
+            lsa = f64_add(lsa, lsum);
+            csa = f64_add(csa, csum);
+            s3 = s3 + 1;
+        }
+        a = a + 1;
+    }
+    _dg_2sum(load64(&sn), load64(&sn + 8), &t2);
+    _dg_2sum(load64(&sd), load64(&sd + 8), &t3);
+    var nh = load64(&t2); var nl = load64(&t2 + 8);
+    var dh = load64(&t3); var dl = load64(&t3 + 8);
+    var cnn = _dg_cn(2 * np) + _dg_cn(dim) + _dg_cn(np) + 7;
+    var cnd = _dg_cn(2 * np) + 2 * _dg_cn(dim) + 7;
+    var en = f64_add(f64_mul(f64_mul(f64_from(cnn), _DG_U2P), na), _DG_EABS);
+    var ed = f64_add(f64_mul(f64_mul(f64_from(cnd), _DG_U2P), da), _DG_EABS);
+    en = f64_add(en, f64_mul(f64_mul(eu, f64_add(lsa, f64_from(17 * np * dim * dim * (dim - 1)))), _DG_ONEP));
+    ed = f64_add(ed, f64_mul(f64_mul(eu, f64_add(csa, f64_from(17 * np * dim * (dim - 1)))), _DG_ONEP));
+    if (f64_le(en, f64_mul(_DG_TH, f64_abs(nh))) == 0 || f64_le(ed, f64_mul(_DG_TH, f64_abs(dh))) == 0) {
+        return 0;
+    }
+    store64(out, _dg_kq(nh, nl, dh, dl, sg - sr));
+    return 1;
+}
+
+# ---- the exact tier: num and den as integers, every monomial of six doubles summed exactly ----
+# A finite nonzero double is m 2^q, m < 2^53 an integer and q >= -1074 the exponent of its last
+# place: _dg_xm and _dg_xq read them. Integers are held in limbs of 27 bits (base 2^27), least
+# significant first, each in an i64 slot.
+
+fn _dg_xm(x) {
+    var a = x & 0x7FFFFFFFFFFFFFFF;
+    if ((a >> 52) == 0) { return a; }
+    return (a & 0x000FFFFFFFFFFFFF) | 0x0010000000000000;
+}
+
+fn _dg_xq(x) {
+    var e = (x >> 52) & 0x7FF;
+    if (e == 0) { return 0 - 1074; }
+    return e - 1075;
+}
+
+# o[0 .. 3] = m1 m2 (two mantissas, 106 bits at most).
+fn _dg_xmm(m1, m2, o) {
+    var a0 = m1 & 0x7FFFFFF; var a1 = m1 >> 27;
+    var b0 = m2 & 0x7FFFFFF; var b1 = m2 >> 27;
+    var c = a0 * b0;
+    store64(o, c & 0x7FFFFFF);
+    c = (c >> 27) + a0 * b1 + a1 * b0;
+    store64(o + 8, c & 0x7FFFFFF);
+    c = (c >> 27) + a1 * b1;
+    store64(o + 16, c & 0x7FFFFFF);
+    store64(o + 24, c >> 27);
+    return 0;
+}
+
+# o[0 .. na + nb - 1] = a b, for normalised limbs and min(na, nb) <= 8 (each column below 2^58).
+fn _dg_xmul(a, na, b, nb, o) {
+    var c = 0;
+    var k = 0;
+    while (k < na + nb - 1) {
+        var i = 0;
+        if (k >= nb) { i = k - nb + 1; }
+        var t = c;
+        while (i < na && i <= k) {
+            t = t + load64(a + i * 8) * load64(b + (k - i) * 8);
+            i = i + 1;
+        }
+        store64(o + k * 8, t & 0x7FFFFFF);
+        c = t >> 27;
+        k = k + 1;
+    }
+    store64(o + k * 8, c);
+    return 0;
+}
+
+# acc += (or -= when neg) the n limbs at m times 2^off, off >= 0. The slots take signed sums
+# without carrying: each add moves a slot by less than 2^27, and at most 2^22 are made.
+fn _dg_xadd(acc, m, n, off, neg) {
+    var li = off / 27;
+    var sh = off - li * 27;
+    var k = 0;
+    while (k < n) {
+        var w = load64(m + k * 8) << sh;
+        var p = acc + (li + k) * 8;
+        if (neg == 0) {
+            store64(p, load64(p) + (w & 0x7FFFFFF));
+            store64(p + 8, load64(p + 8) + (w >> 27));
+        } else {
+            store64(p, load64(p) - (w & 0x7FFFFFF));
+            store64(p + 8, load64(p + 8) - (w >> 27));
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+# The n signed slots at acc carried into limbs, leaving |sum| there: returns 1, or -1 for a
+# negative sum. |sum| < 2^(27 n) (the caller sizes n).
+fn _dg_xcarry(acc, n) {
+    var carry = 0;
+    var k = 0;
+    while (k < n) {
+        var w = load64(acc + k * 8) + carry;
+        store64(acc + k * 8, w & 0x7FFFFFF);
+        carry = w >>> 27;
+        k = k + 1;
+    }
+    var sg = 1;
+    if (carry < 0) {   # the complement over n limbs: |sum|
+        sg = 0 - 1;
+        var c2 = 1;
+        k = 0;
+        while (k < n) {
+            var w2 = (load64(acc + k * 8) ^ 0x7FFFFFF) + c2;
+            store64(acc + k * 8, w2 & 0x7FFFFFF);
+            c2 = w2 >> 27;
+            k = k + 1;
+        }
+    }
+    return sg;
+}
+
+# The n slots at acc carried into limbs: returns the sum's sign (0 for zero), o = { hi, lo } its
+# magnitude's top five limbs as a pair of doubles scaled so the top limb is the units (within
+# 2^-104 of the magnitude over 2^(27 t)), and o[2] = t. |sum| < 2^(27 n) (the caller sizes n).
+fn _dg_xfin(acc, n, o) {
+    var sg = _dg_xcarry(acc, n);
+    var k = n - 1;
+    while (k >= 0) {
+        if (load64(acc + k * 8) != 0) { break; }
+        k = k - 1;
+    }
+    if (k < 0) { return 0; }
+    var t2: i64[2];
+    var hi = f64_from(load64(acc + k * 8));
+    var lo = 0;
+    var sc = F64_ONE;
+    var j = 1;
+    while (j <= 4 && k - j >= 0) {
+        sc = f64_mul(sc, _DG_LIMB);
+        _dg_2sum(hi, f64_mul(f64_from(load64(acc + (k - j) * 8)), sc), &t2);
+        hi = load64(&t2);
+        lo = f64_add(lo, load64(&t2 + 8));
+        j = j + 1;
+    }
+    _dg_2sum(hi, lo, &t2);
+    store64(o, load64(&t2));
+    store64(o + 8, load64(&t2 + 8));
+    store64(o + 16, k);
+    return sg;
+}
+
+# o = { the least, the largest } q of the nonzero finite entries among n at p (stride 8), or
+# { 1, 0 } when there is none.
+fn _dg_xrange(p, n, o) {
+    var lo = 1;
+    var hi = 0;
+    var i = 0;
+    while (i < n) {
+        var x = load64(p + i * 8);
+        var a = x & 0x7FFFFFFFFFFFFFFF;
+        if (a != 0 && a < 0x7FF0000000000000) {   # nonzero and finite: below +Inf's bits
+            var q = _dg_xq(x);
+            if (hi < lo) { lo = q; hi = q; }
+            if (q < lo) { lo = q; }
+            if (q > hi) { hi = q; }
+        }
+        i = i + 1;
+    }
+    store64(o, lo);
+    store64(o + 8, hi);
+    return 0;
+}
+
+# o[0 .. 3] = the exact product x y of two doubles (its limbs), o[4] its q and o[5] its sign:
+# 0 for a zero product, else 1 or -1.
+fn _dg_xpair(x, y, o) {
+    if ((x & 0x7FFFFFFFFFFFFFFF) == 0 || (y & 0x7FFFFFFFFFFFFFFF) == 0) {
+        store64(o + 40, 0);
+        return 0;
+    }
+    _dg_xmm(_dg_xm(x), _dg_xm(y), o);
+    store64(o + 32, _dg_xq(x) + _dg_xq(y));
+    if (((x ^ y) & 0x8000000000000000) != 0) { store64(o + 40, 0 - 1); } else { store64(o + 40, 1); }
+    return 0;
+}
+
+# acc += (e_as - e_sa) (e_mn - e_nm) F: the four monomials e e' F, each pair as _dg_xpair writes
+# it and F the nf signed slots at fa (in units 2^q0f; carried here, so fa is consumed), placed at
+# their q less q0 + q0f (dq = q0 - q0f).
+fn _dg_xbb(acc, dq, e_as, e_sa, e_mn, e_nm, fa, nf) {
+    var sf = _dg_xcarry(fa, nf);
+    var k1 = nf - 1;
+    while (k1 >= 0) {
+        if (load64(fa + k1 * 8) != 0) { break; }
+        k1 = k1 - 1;
+    }
+    if (k1 < 0) { return 0; }
+    var k0 = 0;
+    while (load64(fa + k0 * 8) == 0) { k0 = k0 + 1; }
+    var t8: i64[8];
+    var pm: i64[176];
+    var j = 0;
+    while (j < 4) {
+        var e1 = e_as; var e2 = e_mn; var sgn = sf;
+        if (j == 1 || j == 3) { e2 = e_nm; sgn = 0 - sgn; }
+        if (j >= 2) { e1 = e_sa; sgn = 0 - sgn; }
+        var s = sgn * load64(e1 + 40) * load64(e2 + 40);
+        if (s != 0) {
+            _dg_xmul(e1, 4, e2, 4, &t8);
+            _dg_xmul(fa + k0 * 8, k1 - k0 + 1, &t8, 8, &pm);
+            var neg = 0;
+            if (s < 0) { neg = 1; }
+            _dg_xadd(acc, &pm, k1 - k0 + 9, load64(e1 + 32) + load64(e2 + 32) + 27 * k0 - dq, neg);
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+# The exact tier: K of the given (unscaled, finite) inputs, num and den summed exactly as integers,
+# then rounded once from 104 bits of each: within half an ulp and 2^-100 of K (where |K| >= 2^-1022).
+# den = 0 is a degenerate plane: NaN. num = 0 is K = 0, signed as +0 / den is. Over the pairs a < s
+# and m < n, with B^{as} = e_as - e_sa (e_ij = u^i v^j exactly):
+#   num = sum B^{as} B^{mn} F,  F = sum_rho (g_{a rho} R^rho_{s m n} - g_{s rho} R^rho_{a m n})
+#                                       - (g_{a rho} R^rho_{s n m} - g_{s rho} R^rho_{a n m})
+#   den = sum B^{as} B^{mn} F', F' = 2 (g_am g_sn - g_sm g_an)
+# (the sums over m != n with B^{nm} = -B^{mn}, exactly). F is summed exactly first (4 d products of
+# two doubles), then B^{as} B^{mn} F is four monomials of two pairs and F. Its cost: p^2 such
+# (as, mn) at most, p = d (d - 1) / 2: 36 at dim 4, 14,400 at dim 16, each 4 d + 2 products of two
+# doubles and up to 8 of eight limbs by F's. Summing every monomial of six doubles as its own
+# product instead (8 p d^2 (d - 1) + 8 p d (d - 1) of them, 3.9 million at dim 16) gives the same
+# integers, so the same K, at about 11 times the cost on dense dim-16 operands (1.38 s against
+# 0.124 s per call in a pinned A/B of the two forms; sectional_curvature's COST note gives the
+# factored form's 114 ms from another run).
+# [measured: counted from the loops below; scratch ab3.sh (cpu 4, 5 rounds), 2026-11-14]
+fn _dg_sect_exact(riemann, metric, u, v, dim) {
+    var nb = dim * dim;
+    var rq: i64[8];
+    _dg_xrange(u, dim, &rq);
+    _dg_xrange(v, dim, &rq + 16);
+    _dg_xrange(metric, nb, &rq + 32);
+    _dg_xrange(riemann, nb * nb, &rq + 48);
+    # q0f / q0g: the least q a g R / g g product can have (F's and F''s units); nf / ng their slots.
+    var q0f = load64(&rq + 32) + load64(&rq + 48);
+    var q0g = 2 * load64(&rq + 32);
+    var nf = 0;
+    if (load64(&rq + 40) + load64(&rq + 56) >= q0f) { nf = (load64(&rq + 40) + load64(&rq + 56) - q0f) / 27 + 8; }
+    var ng = 0;
+    if (2 * load64(&rq + 40) >= q0g) { ng = (2 * load64(&rq + 40) - q0g) / 27 + 8; }
+    var q0n = 2 * load64(&rq) + 2 * load64(&rq + 16) + q0f;
+    var q1n = 2 * load64(&rq + 8) + 2 * load64(&rq + 24) + load64(&rq + 40) + load64(&rq + 56);
+    var q0d = 2 * load64(&rq) + 2 * load64(&rq + 16) + q0g;
+    var q1d = 2 * load64(&rq + 8) + 2 * load64(&rq + 24) + 2 * load64(&rq + 40);
+    var nn = 0;
+    if (q1n >= q0n) { nn = (q1n - q0n) / 27 + 16; }
+    var nd = 0;
+    if (q1d >= q0d) { nd = (q1d - q0d) / 27 + 16; }
+    var accn: i64[480];
+    var accd: i64[480];
+    var k = 0;
+    while (k < nn) { store64(&accn + k * 8, 0); k = k + 1; }
+    k = 0;
+    while (k < nd) { store64(&accd + k * 8, 0); k = k + 1; }
+    # uv[(i dim + j) * 6 ..]: u^i v^j exactly, for every ordered pair.
+    var uv: i64[1536];
+    var i = 0;
+    while (i < dim) {
+        var j = 0;
+        while (j < dim) {
+            _dg_xpair(load64(u + i * 8), load64(v + j * 8), &uv + (i * dim + j) * 48);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    var f: i64[6];
+    var fa: i64[168];
+    var fg: i64[168];
+    var a = 0;
+    while (a < dim) {
+        var s = a + 1;
+        while (s < dim) {
+            var e_as = &uv + (a * dim + s) * 48;
+            var e_sa = &uv + (s * dim + a) * 48;
+            if (load64(e_as + 40) != 0 || load64(e_sa + 40) != 0) {
+                var m = 0;
+                while (m < dim) {
+                    var n = m + 1;
+                    while (n < dim) {
+                        var e_mn = &uv + (m * dim + n) * 48;
+                        var e_nm = &uv + (n * dim + m) * 48;
+                        if (load64(e_mn + 40) != 0 || load64(e_nm + 40) != 0) {
+                            k = 0;
+                            while (k < nf) { store64(&fa + k * 8, 0); k = k + 1; }
+                            var any = 0;
+                            var rho = 0;
+                            while (rho < dim) {
+                                var side = 0;
+                                while (side < 4) {
+                                    # (x, y, m', n') and its sign: (a, s, m, n) +, (s, a, m, n) -,
+                                    # (a, s, n, m) -, (s, a, n, m) +
+                                    var x = a; var y = s; var mm = m; var nn2 = n; var neg = 0;
+                                    if (side == 1 || side == 3) { x = s; y = a; }
+                                    if (side >= 2) { mm = n; nn2 = m; }
+                                    if (side == 1 || side == 2) { neg = 1; }
+                                    _dg_xpair(load64(metric + (x * dim + rho) * 8),
+                                      load64(riemann + (((rho * dim + y) * dim + mm) * dim + nn2) * 8), &f);
+                                    var fs = load64(&f + 40);
+                                    if (fs != 0) {
+                                        if (fs < 0) { neg = 1 - neg; }
+                                        _dg_xadd(&fa, &f, 4, load64(&f + 32) - q0f, neg);
+                                        any = 1;
+                                    }
+                                    side = side + 1;
+                                }
+                                rho = rho + 1;
+                            }
+                            if (any == 1) { _dg_xbb(&accn, q0n - q0f, e_as, e_sa, e_mn, e_nm, &fa, nf); }
+                            # den: F' = 2 (g_am g_sn - g_sm g_an)
+                            k = 0;
+                            while (k < ng) { store64(&fg + k * 8, 0); k = k + 1; }
+                            var anyg = 0;
+                            var side2 = 0;
+                            while (side2 < 2) {
+                                var neg2 = 0;
+                                if (side2 == 0) {
+                                    _dg_xpair(load64(metric + (a * dim + m) * 8), load64(metric + (s * dim + n) * 8),
+                                      &f);
+                                } else {
+                                    neg2 = 1;
+                                    _dg_xpair(load64(metric + (s * dim + m) * 8), load64(metric + (a * dim + n) * 8),
+                                      &f);
+                                }
+                                var gs = load64(&f + 40);
+                                if (gs != 0) {
+                                    if (gs < 0) { neg2 = 1 - neg2; }
+                                    _dg_xadd(&fg, &f, 4, load64(&f + 32) - q0g + 1, neg2);
+                                    anyg = 1;
+                                }
+                                side2 = side2 + 1;
+                            }
+                            if (anyg == 1) { _dg_xbb(&accd, q0d - q0g, e_as, e_sa, e_mn, e_nm, &fg, ng); }
+                        }
+                        n = n + 1;
+                    }
+                    m = m + 1;
+                }
+            }
+            s = s + 1;
+        }
+        a = a + 1;
+    }
+    var on: i64[3];
+    var od: i64[3];
+    var sn = _dg_xfin(&accn, nn, &on);
+    var sd = _dg_xfin(&accd, nd, &od);
+    if (sd == 0) { return _DG_QNAN; }   # u ∥ v, or a null plane
+    if (sn == 0) {
+        if (sd > 0) { return 0; }
+        return 0x8000000000000000;   # -0, as +0 / den is for den < 0
+    }
+    var q = _dg_dd_div(load64(&on), load64(&on + 8), load64(&od), load64(&od + 8));
+    var kk = _dg_ldexp(f64_mul(q, F64_HALF), 27 * (load64(&on + 16) - load64(&od + 16)) + q0n - q0d);
+    if (sn != sd) { kk = kk ^ 0x8000000000000000; }
+    return kk;
 }
 
 # ================================================================
@@ -373,17 +1133,60 @@ fn _dg_det2(a, b, c, d) {
 # riemann: (1,3) tensor R^ρ_{σμν} (flat dim⁴, from riemann_tensor)
 # metric:  covariant g_{ij} (flat dim², for the index lowering + inner products)
 # u, v:    contravariant vectors (flat dim)
-# Returns: the sectional curvature, a function of the plane u∧v alone; 0 for a
-#   degenerate plane: u ∥ v exactly (u∧v = 0, the zero vector included), or a plane the
-#   metric is null on (|u∧v|² = 0, possible only in indefinite signature). NaN in an input
-#   it reads propagates. The designed 0 also answers a null pointer or a dim outside 1..16.
-# Accuracy (3.4.1): u∧v is formed componentwise to an ulp or two, so planes any angle
-#   apart are answered; the result is backward stable (the rounding of R's and g's
-#   contractions, a few ulp of their terms), and range-free in every input: u, v, u∧v, g
-#   and R are each scaled by a power of two before anything is squared.
+# Returns: the sectional curvature, a function of the plane u∧v alone. A degenerate plane
+#   -- u ∥ v exactly (u∧v = 0, the zero vector included), or a plane the metric is null on
+#   (|u∧v|² = 0, possible only in indefinite signature) -- has none: the quiet NaN (3.5.0;
+#   through 3.4.2 0, "flat"), as do a null pointer and a dim outside 1..16 (through 3.4.2
+#   the designed 0). NaN in an input it reads propagates.
+# ACCURACY (3.5.0): for finite inputs, within 2^-46 of the exact K of the given doubles,
+#   relative, whatever cancels (|K| >= 2^-1022; below it K is rounded twice, onto the
+#   subnormal grid last). Three tiers: the plain contraction (3.4.1's, bit for bit) where its own
+#   error bound, read off the absolute contractions it now carries and the count of nonzero terms
+#   each sum adds, certifies that; past it, num and den as double-doubles (bound about 2^-96 of
+#   their terms at dim 4) where that certifies it; past that (num or den cancelling below about
+#   2^-49 of their terms at dim 4, a null plane among them), num and den summed exactly as
+#   integers and K rounded once: correctly rounded but for a tie within 2^-100. A plane whose den
+#   rounds to 0 but is not 0 has a curvature and gets it (3.4.2: 0, "flat"). Against a Fractions
+#   oracle on 1,907 cases (random tensors at dim 2 to 6, definite and indefinite metrics,
+#   coordinate, sparse and near-parallel planes, operands scaled by up to 2^+-700 and down to
+#   subnormals; tensors cancelled against a space form to 2^-5 .. 2^-60 of their terms; near-null
+#   planes; 60 with a subnormal in u ∧ v; dims 7 to 16): no answer outside the bound. The largest
+#   errors on that sample: the plain path 4.35 u (u = 2^-53; it is certified to 2^-46, not to
+#   that), the double-double 0.99 u, the exact 0.99 u; every plain answer 3.4.2's bits.
+#   [measured: scratch sweep.py (seeds 51 to 58, and 1 for the subnormal family), 2026-11-14; not reproducible in-tree]
+#   u, v, u∧v, g and R are each scaled by a power of two (exact) before anything is squared,
+#   so no input's scale overflows a step.
+# COST (3.5.0), a noisy A/B pinned to one cpu (11 interleaved rounds, medians, load about 5)
+#   against 3.4.2's plain contraction on the same inputs. Where the plain certificate is met
+#   (no cancellation the bound cannot see past; nonzero terms counted, so a coordinate plane of
+#   the unit sphere or of a space form on a definite diagonal metric at any dim, and a generic
+#   plane of either up to dim 10: B's p nonzero entries make num's depth p + 9, past the bound's
+#   63 from dim 11, where they take the double-double tier): 0.50 to 0.61 times (b41's dim-4
+#   space form 8.7 -> 5.4 us; the unit sphere at dim 16 on (e0, e1) 1.84 -> 0.93 ms), its loops
+#   indexing directly and scaling g once. A generic dense tensor and plane does not meet it (its
+#   num cancels a few times over among d (d - 1) p terms, and from dim 7 the bound cannot be met
+#   with every term nonzero) and pays the double-double tier too: 2.1 times at dim 4 (8.7 -> 18.6
+#   us), 1.85 at dim 6, 1.71 at dim 8, 1.53 at dim 16 (1.84 -> 2.83 ms). The exact tier, for
+#   cancellation past about 2^-49 of the terms at dim 4 (2^-50.7 at dim 3, 2^-41.2 at dim 16: the
+#   double-double bound's constant grows as 15 p^2): 14 times on a dense dim-3 tensor (44 us), 20
+#   at dim 4 (0.17 ms), 28 at dim 6 (1.15 ms), 61 at dim 16 (114 ms), on entries of moderate
+#   exponent; on dense dim-16 operands whose entries span 2^-1074 to 1 its integers are wider and
+#   the exact tier alone takes 0.28 to 0.29 s, about 150 times 3.4.2's 1.8 to 1.9 ms; 2.1 times
+#   (3.9 ms) for a dim-16 space form on a near-null plane, whose zero terms it skips.
+#   [measured: scratch tm2.cyr, tm3.cyr, abf.sh (cpu 4), bcases.py, 2026-11-14; not in-tree]
+#   [measured: scratch tiers and tm probes, _dg_sect_exact timed alone (cpu 9, 3 rounds), 2026-11-14; not in-tree]
 public fn sectional_curvature(riemann, metric, u, v, dim) {
-    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
-    if (riemann == 0 || metric == 0 || u == 0 || v == 0) { return 0; }
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return _DG_QNAN; }
+    if (riemann == 0 || metric == 0 || u == 0 || v == 0) { return _DG_QNAN; }
+    var k: i64[1];
+    var tier = _dg_sect(riemann, metric, u, v, dim, &k);
+    return load64(&k);
+}
+
+# sectional_curvature's body, for a dim in 1..16 and non-null pointers: K into o[0], and the tier
+# that answered returned (the suites read it): 1 the plain contraction, its certificate met; 2 the
+# double-double; 3 the exact; 0 a non-finite operand (the plain answer, no claim made).
+fn _dg_sect(riemann, metric, u, v, dim, o) {
     # ⛔ 3.4.0 AND EARLIER — THE PLANE'S AREA WAS FORMED AS <u,u><v,v> - <u,v>^2, and
     # the numerator as the four-fold sum over u^a v^s u^m v^n, both of which cancel to
     # sin^2(angle) of their terms: planes 1e-6 rad apart read sin^2 < 1e-12, which the
@@ -400,30 +1203,64 @@ public fn sectional_curvature(riemann, metric, u, v, dim) {
     # the antisymmetric part, which is the part a plane can see). u, v, B, g and R are each
     # scaled by a power of two (exact) to put their largest entry in [1, 2): K does not see
     # the scale of u, v or B, and R's and g's come back as one power of two at the end.
-    # u∧v = 0 exactly gives |B|^2 = 0, the degenerate plane, as does a null plane; both
-    # return 0 at the one test below.
     # Contracting R with B first is O(dim^4), where the old loop was O(dim^5).
+    # ⛔ 3.4.2 AND EARLIER -- AND THE CONTRACTION WAS ONLY BACKWARD STABLE: on an indefinite
+    # metric, where num and den cancel, the forward error had no bound (RV-LIE N11): 110 ulps in
+    # dim 3 and 3,270 in dim 4 among 150 random tensors each; on diag(-1, 1, 1)'s space form of
+    # curvature 0.712, v = (0.3, 0.3 + 2^-e, 1) beside the null u = (1, 1, 0) read 0.75 at e = 25,
+    # 0.5 at e = 26 and 0, "flat", from e = 27, where den (2^-54 of its terms there, and not 0)
+    # rounded to 0 -- a plausible answer, not a visible failure.
+    # [measured: scratch sect.py (wave 1), the ulps; a probe of 3.4.2 (b175825), den = 0 flagged, 2026-11-14]
+    # [measured: tests/modules_d.tcyr group "3.5.0 W7: sectional_curvature's three tiers"]
+    # ⭐ 3.5.0 -- the path below computes what it did, the same products and sums in the same
+    # order (each R entry read once, g scaled once), and carries the absolute contractions NA and DA
+    # beside num and den, from which its error bound follows: the roundings a term passes through,
+    # at most cT + cL + 1 + cN for num and 2 cL + 1 + cN for den, plus B's 2.01 u twice, where cN
+    # counts B's nonzero entries (a < s), cL the most nonzero entries in a row of g, and cT the
+    # most nonzero R^rho_{s m n} (m != n) in one (rho, s), at most 2 cN (a zero term adds exactly,
+    # so only nonzero ones deepen a sum; with none zero these are p, d and d (d - 1), and the bound
+    # can never be met from dim 7 on, the unit sphere's included). When num and den are each within
+    # _DG_TH of their value it is returned, else the double-double tier's, else the exact one's.
+    # [measured: tests/modules_d.tcyr group "3.5.0 W7: sectional_curvature's three tiers"]
     var nb = dim * dim;
+    var np = dim * (dim - 1) / 2;
     var uh: i64[16];
     var vh: i64[16];
     var su = _dg_unit_shift(u, dim);
     var sv = _dg_unit_shift(v, dim);
+    # luv: some entry of u or v below 2^-200 of its vector's largest (_dg_thr), the only way a
+    # product in forming u ∧ v can leave the normal range; lo: that, or any other operand so
+    # (below), where a product of scaled operands can, and the bound needs _DG_EABS.
+    var luv = 0;
+    var tu = _dg_thr(su);
+    var tv = _dg_thr(sv);
     var i = 0;
     while (i < dim) {
-        store64(&uh + i * 8, _dg_ldexp(load64(u + i * 8), su));
-        store64(&vh + i * 8, _dg_ldexp(load64(v + i * 8), sv));
+        var ui = load64(u + i * 8);
+        var vi = load64(v + i * 8);
+        var aui = ui & 0x7FFFFFFFFFFFFFFF;
+        var avi = vi & 0x7FFFFFFFFFFFFFFF;
+        if ((aui != 0 && aui < tu) || (avi != 0 && avi < tv)) { luv = 1; }
+        store64(&uh + i * 8, _dg_ldexp(ui, su));
+        store64(&vh + i * 8, _dg_ldexp(vi, sv));
         i = i + 1;
     }
-    # B, full and antisymmetric, row-major dim x dim.
+    var lo = luv;
+    # B, full and antisymmetric, row-major dim x dim; eb the low parts' rounded difference; cn its
+    # nonzero entries above the diagonal.
     var bf: i64[256];
+    var eb: i64[256];
+    var cn = 0;
     var a = 0;
     while (a < dim) {
-        store64(&bf + _dg_idx2(a, a, dim), 0);
+        store64(&bf + (a * dim + a) * 8, 0);
         var s = a + 1;
         while (s < dim) {
-            var bv = _dg_det2(load64(&uh + a * 8), load64(&vh + s * 8), load64(&uh + s * 8), load64(&vh + a * 8));
-            store64(&bf + _dg_idx2(a, s, dim), bv);
-            store64(&bf + _dg_idx2(s, a, dim), f64_neg(bv));
+            var bv = _dg_det2(load64(&uh + a * 8), load64(&vh + s * 8), load64(&uh + s * 8), load64(&vh + a * 8),
+              &eb + (a * dim + s) * 8);
+            if ((bv & 0x7FFFFFFFFFFFFFFF) != 0) { cn = cn + 1; }
+            store64(&bf + (a * dim + s) * 8, bv);
+            store64(&bf + (s * dim + a) * 8, f64_neg(bv));
             s = s + 1;
         }
         a = a + 1;
@@ -431,49 +1268,125 @@ public fn sectional_curvature(riemann, metric, u, v, dim) {
     var sb = _dg_unit_shift(&bf, nb);
     var sg = _dg_unit_shift(metric, nb);
     var sr = _dg_unit_shift(riemann, nb * nb);
-    i = 0;
-    while (i < nb) { store64(&bf + i * 8, _dg_ldexp(load64(&bf + i * 8), sb)); i = i + 1; }
-    # T^rho_s = sum_mn Rh^rho_{s m n} B^{mn}, then L_as = sum_rho gh_{a rho} T^rho_s.
+    # Bh, and gh = g 2^sg once (the same products _dg_ldexp gives at every use), with cl the most
+    # nonzero entries in a row of g.
+    var tb = _dg_thr(sb);
+    var tg = _dg_thr(sg);
+    var gh: i64[256];
+    var cl = 0;
+    a = 0;
+    while (a < dim) {
+        var cg = 0;
+        var c0 = 0;
+        while (c0 < dim) {
+            var ix = (a * dim + c0) * 8;
+            var bi = load64(&bf + ix);
+            var gi = load64(metric + ix);
+            var abi = bi & 0x7FFFFFFFFFFFFFFF;
+            var agi = gi & 0x7FFFFFFFFFFFFFFF;
+            if ((abi != 0 && abi < tb) || (agi != 0 && agi < tg)) { lo = 1; }
+            if (agi != 0) { cg = cg + 1; }
+            store64(&bf + ix, _dg_ldexp(bi, sb));
+            store64(&gh + ix, _dg_ldexp(gi, sg));
+            c0 = c0 + 1;
+        }
+        if (cg > cl) { cl = cg; }
+        a = a + 1;
+    }
+    # B's error, per entry above the diagonal, scaled as B is: B is within 2.01 u |B_as| + eB_as of
+    # u ∧ v, eB_as = u |pe - qe| (1 + 2^-8) + eu. The first part is conservative: fl(pe - qe) is
+    # inexact only where p and q straddle a binade, and there its rounding is under 2^-54 |B|, inside
+    # 2.01 u |B| already. eu is what an underflow in forming u ∧ v can leave, 2^-1069 in u and v's
+    # scaled units (an underflowing two-product is within 5 2^-1074 of a b (Ogita, Rump and Oishi),
+    # two per entry, and the scaled u and v within 2^-1075 each), times 2^sb, the factor B's scaling
+    # magnifies it by: 0 unless luv. _DG_EABS (2^-1030) alone does not cover it: u = (1.3, 1.7, 0),
+    # v = (1.3, 1.7 + 2^-52, 2^-1049), B^{01} 2^-51 and B^{02} 1.3 2^-1049 (to 2^-1074), so sb = 52
+    # makes B^{02}'s rounding 2^-1023 in the scaled units, and a certificate without eu passes a K
+    # 6,617 ulps off (3.4.2, with no certificate, returns the same 6,617-ulp K).
+    # [measured: tests/modules_d.tcyr group "3.5.0 W7: sectional_curvature's three tiers", the subnormal-B fixture]
+    var eu = 0;
+    if (luv == 1) { eu = _dg_ldexp(_DG_EUV, sb); }
+    var ebmax = 0;
+    a = 0;
+    while (a < dim) {
+        var s1 = a + 1;
+        while (s1 < dim) {
+            var e1 = f64_add(f64_mul(_dg_ldexp(load64(&eb + (a * dim + s1) * 8), sb), _DG_UP), eu);
+            store64(&eb + (a * dim + s1) * 8, e1);
+            if (f64_gt(e1, ebmax) == 1) { ebmax = e1; }
+            s1 = s1 + 1;
+        }
+        a = a + 1;
+    }
+    # T^rho_s = sum_mn Rh^rho_{s m n} B^{mn}, then L_as = sum_rho gh_{a rho} T^rho_s; TA, LA, GBA
+    # the same contractions of the absolute values.
     var tt: i64[256];
+    var ta: i64[256];
+    var pr2 = _dg_p2(sr);
+    var tr = _dg_thr(sr);
+    var ct = 0;
     var rho = 0;
     while (rho < dim) {
         var s2 = 0;
         while (s2 < dim) {
+            var rbase = riemann + (rho * dim + s2) * nb * 8;
             var acc = 0;
+            var aacc = 0;
+            var cr = 0;
             var m = 0;
             while (m < dim) {
                 var n = 0;
                 while (n < dim) {
                     if (m != n) {
-                        var rv = _dg_ldexp(riemann_get(riemann, dim, rho, s2, m, n), sr);
-                        acc = f64_add(acc, f64_mul(rv, load64(&bf + _dg_idx2(m, n, dim))));
+                        var rr = load64(rbase + (m * dim + n) * 8);
+                        var arr = rr & 0x7FFFFFFFFFFFFFFF;
+                        if (arr != 0) {
+                            cr = cr + 1;
+                            if (arr < tr) { lo = 1; }
+                        }
+                        var pr = f64_mul(_dg_scale(rr, pr2, sr), load64(&bf + (m * dim + n) * 8));
+                        acc = f64_add(acc, pr);
+                        aacc = f64_add(aacc, f64_abs(pr));
                     }
                     n = n + 1;
                 }
                 m = m + 1;
             }
-            store64(&tt + _dg_idx2(rho, s2, dim), acc);
+            if (cr > ct) { ct = cr; }
+            store64(&tt + (rho * dim + s2) * 8, acc);
+            store64(&ta + (rho * dim + s2) * 8, aacc);
             s2 = s2 + 1;
         }
         rho = rho + 1;
     }
+    if (2 * cn < ct) { ct = 2 * cn; }
     var ll: i64[256];
     var gb: i64[256];
+    var la: i64[256];
+    var gba: i64[256];
     a = 0;
     while (a < dim) {
         var c = 0;
         while (c < dim) {
             var lacc = 0;
             var gacc = 0;
+            var laa = 0;
+            var gaa = 0;
             var k = 0;
             while (k < dim) {
-                var gak = _dg_ldexp(load64(metric + _dg_idx2(a, k, dim)), sg);
-                lacc = f64_add(lacc, f64_mul(gak, load64(&tt + _dg_idx2(k, c, dim))));
-                gacc = f64_add(gacc, f64_mul(gak, load64(&bf + _dg_idx2(k, c, dim))));
+                var gak = load64(&gh + (a * dim + k) * 8);
+                var kc = (k * dim + c) * 8;
+                var bkc = load64(&bf + kc);
+                lacc = f64_add(lacc, f64_mul(gak, load64(&tt + kc)));
+                gacc = f64_add(gacc, f64_mul(gak, bkc));
+                laa = f64_add(laa, f64_mul(f64_abs(gak), load64(&ta + kc)));
+                gaa = f64_add(gaa, f64_mul(f64_abs(gak), f64_abs(bkc)));
                 k = k + 1;
             }
-            store64(&ll + _dg_idx2(a, c, dim), lacc);
-            store64(&gb + _dg_idx2(a, c, dim), gacc);
+            store64(&ll + (a * dim + c) * 8, lacc);
+            store64(&gb + (a * dim + c) * 8, gacc);
+            store64(&la + (a * dim + c) * 8, laa);
+            store64(&gba + (a * dim + c) * 8, gaa);
             c = c + 1;
         }
         a = a + 1;
@@ -482,32 +1395,74 @@ public fn sectional_curvature(riemann, metric, u, v, dim) {
     # C = (g B) g^T. K = (num / 2) / den: 1/4 and 1/2 of the full sums above.
     var num = 0;
     var den = 0;
+    var nab = 0;
+    var dab = 0;
+    var ebl = 0;
+    var ebd = 0;
     a = 0;
     while (a < dim) {
         var s3 = a + 1;
         while (s3 < dim) {
-            var bas = load64(&bf + _dg_idx2(a, s3, dim));
+            var as3 = (a * dim + s3) * 8;
+            var sa3 = (s3 * dim + a) * 8;
+            var bas = load64(&bf + as3);
             var cas = 0;
             var csa = 0;
+            var ca1 = 0;
+            var ca2 = 0;
             var k2 = 0;
             while (k2 < dim) {
-                cas = f64_add(cas, f64_mul(load64(&gb + _dg_idx2(a, k2, dim)),
-                    _dg_ldexp(load64(metric + _dg_idx2(s3, k2, dim)), sg)));
-                csa = f64_add(csa, f64_mul(load64(&gb + _dg_idx2(s3, k2, dim)),
-                    _dg_ldexp(load64(metric + _dg_idx2(a, k2, dim)), sg)));
+                var gsk = load64(&gh + (s3 * dim + k2) * 8);
+                var gak2 = load64(&gh + (a * dim + k2) * 8);
+                cas = f64_add(cas, f64_mul(load64(&gb + (a * dim + k2) * 8), gsk));
+                csa = f64_add(csa, f64_mul(load64(&gb + (s3 * dim + k2) * 8), gak2));
+                ca1 = f64_add(ca1, f64_mul(load64(&gba + (a * dim + k2) * 8), f64_abs(gsk)));
+                ca2 = f64_add(ca2, f64_mul(load64(&gba + (s3 * dim + k2) * 8), f64_abs(gak2)));
                 k2 = k2 + 1;
             }
-            num = f64_add(num, f64_mul(bas, f64_sub(load64(&ll + _dg_idx2(a, s3, dim)),
-                  load64(&ll + _dg_idx2(s3, a, dim)))));
+            num = f64_add(num, f64_mul(bas, f64_sub(load64(&ll + as3), load64(&ll + sa3))));
             den = f64_add(den, f64_mul(bas, f64_sub(cas, csa)));
+            var lsum = f64_add(load64(&la + as3), load64(&la + sa3));
+            var csum = f64_add(ca1, ca2);
+            var eas = load64(&eb + as3);
+            nab = f64_add(nab, f64_mul(f64_abs(bas), lsum));
+            dab = f64_add(dab, f64_mul(f64_abs(bas), csum));
+            ebl = f64_add(ebl, f64_mul(eas, lsum));
+            ebd = f64_add(ebd, f64_mul(eas, csum));
             s3 = s3 + 1;
         }
         a = a + 1;
     }
-    if (f64_eq(den, 0) == 1) { return 0; }   # u ∥ v, or a null plane
-    # K = Kh * 2^(sg - sr): Rh = R 2^sr and gh = g 2^sg make num scale as 2^(sg + sr) and
-    # den as 2^(2 sg).
-    return _dg_ldexp(f64_div(f64_mul(num, F64_HALF), den), sg - sr);
+    # The bound: |num - num^| <= (cT + cL + 1 + cN + 4.1) u NA + EBL + 16.1 p d^2 (d - 1) eBmax (B's
+    # error through |c_{as,mn}| <= 8 d), and den's the same with 2 cL + 1 + cN, 16.1 p d (d - 1);
+    # here with whole margins and (1 + 2^-8) for the bounds' own roundings.
+    var eabs = 0;
+    if (lo == 1) { eabs = _DG_EABS; }
+    var en = f64_add(f64_add(f64_mul(f64_mul(f64_from(ct + cl + 1 + cn + 5), _DG_UP), nab),
+        f64_mul(f64_add(ebl, f64_mul(f64_from(17 * np * dim * dim * (dim - 1)), ebmax)), _DG_ONEP)), eabs);
+    var ed = f64_add(f64_add(f64_mul(f64_mul(f64_from(2 * cl + 1 + cn + 5), _DG_UP), dab),
+        f64_mul(f64_add(ebd, f64_mul(f64_from(17 * np * dim * (dim - 1)), ebmax)), _DG_ONEP)), eabs);
+    # A non-finite operand: the plain answer, as before (NaN propagates; no claim is made). NA and DA
+    # run beside num and den through the same operands, so a NaN or an infinity in either reaches
+    # them too (and the exact tier, which reads raw bits, never sees one).
+    if (f64_lt(en, F64_POS_INF) == 0 || f64_lt(ed, F64_POS_INF) == 0) {
+        if (f64_eq(den, 0) == 1) { store64(o, _DG_QNAN); return 0; }
+        store64(o, _dg_ldexp(f64_div(f64_mul(num, F64_HALF), den), sg - sr));
+        return 0;
+    }
+    if (f64_le(en, f64_mul(_DG_TH, f64_abs(num))) == 1 && f64_le(ed, f64_mul(_DG_TH, f64_abs(den))) == 1) {
+        # ⛔ 3.4.2 AND EARLIER -- 0, "flat", for a plane that has no curvature (RV-LIE N11). ⭐ 3.5.0:
+        # NaN, the value K = R(B, B) / |B|^2 has at |B|^2 = 0.
+        # [measured: tests/modules_d.tcyr group "3.5.0 L7: diffgeo's f64 answers with no value"]
+        if (f64_eq(den, 0) == 1) { store64(o, _DG_QNAN); return 1; }   # certified 0: u ∥ v, or a null plane
+        # K = Kh * 2^(sg - sr): Rh = R 2^sr and gh = g 2^sg make num scale as 2^(sg + sr) and
+        # den as 2^(2 sg).
+        store64(o, _dg_ldexp(f64_div(f64_mul(num, F64_HALF), den), sg - sr));
+        return 1;
+    }
+    if (_dg_sect_dd(riemann, &gh, &uh, &vh, dim, sb, sg, sr, eu, o) == 1) { return 2; }
+    store64(o, _dg_sect_exact(riemann, metric, u, v, dim));
+    return 3;
 }
 
 # ================================================================
@@ -951,12 +1906,12 @@ public fn parallel_transport(v0, curve_vel, christoffel, dim, dt, steps) {
 #
 # Returns: f64 -- maximum absolute residual of nabla_mu xi_nu + nabla_nu xi_mu, over
 #   mu <= nu; 0 means the field satisfies Killing's equation to the last bit. A NaN
-#   residual returns NaN (3.4.1). The designed 0 also answers a null pointer or a dim
-#   outside 1..16, as everywhere in this module.
+#   residual returns NaN (3.4.1), and so do a null pointer and a dim outside 1..16 (3.5.0:
+#   through 3.4.2 the designed 0, which says "a Killing field").
 
 public fn killing_residual(field, metric, christoffel, dim) {
-    if (dim <= 0 || dim > _DG_MAX_DIM) { return 0; }
-    if (field == 0 || metric == 0 || christoffel == 0) { return 0; }
+    if (dim <= 0 || dim > _DG_MAX_DIM) { return _DG_QNAN; }
+    if (field == 0 || metric == 0 || christoffel == 0) { return _DG_QNAN; }
     # Extract xi pointer and dxi pointer from field layout
     var xi = field;
     var dxi = field + dim * 8;

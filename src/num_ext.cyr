@@ -3,7 +3,7 @@
 # Requires: src/error.cyr, src/num.cyr (stdlib resolves via cyrius.cyml [deps])
 #
 # Provides:
-#   Number theory:   num_extended_gcd, num_euler_totient, num_mobius,
+#   Number theory:   num_extended_gcd, num_euler_totient, num_mobius_checked,
 #                    num_divisor_sigma, num_pollard_rho_checked, num_factorize,
 #                    num_crt, num_continued_fraction_rational, num_modinv
 #   DST/DCT:         num_dst, num_idst, num_dct, num_idct
@@ -171,25 +171,29 @@ public fn num_euler_totient(n) {
     return result;
 }
 
-# Mobius function mu(n).
-# Returns 1 if n is squarefree with even number of prime factors,
-# -1 if squarefree with odd number of prime factors,
-# 0 if n has a squared prime factor.
-# n: positive integer (n <= 0 returns the designed 0, as n == 0 already did)
+# Mobius function mu(n), n >= 1.
+# Returns: Ok(1) if n is squarefree with an even number of prime factors (n = 1 included),
+#   Ok(-1) if squarefree with an odd number, Ok(0) if n has a squared prime factor;
+#   Err(HSB_ERR_INVALID_INPUT) for n <= 0, where mu is not defined. Infallible otherwise: nothing
+#   here allocates (_numx_factors_into).
+# ⛔ 3.5.0 -- REPLACES num_mobius, WHOSE REFUSAL WAS AN ANSWER. num_mobius(n <= 0) returned 0, which
+# is also mu of every n >= 1 with a squared factor (mu(4) = 0), so a caller could not tell the
+# refusal from the value (roadmap [3.5.0], "Documented in their own comments, the same class"; AU2
+# section 2b). mu's three values leave no integer for a refusal, so it is a Result now, and every
+# n >= 1 gets num_mobius's value.
+# [measured: tests/modules_d.tcyr, group "3.5.0 L5: num_mobius_checked refuses n <= 0"]
 # ⛔ 3.3.3 — EVERY NEGATIVE n RETURNED 1. Only n == 0 was refused, and num_factorize
 # returned an empty vec for every n <= 1 (until 3.4.1), so for n < 0 the repeated-factor scan saw
 # nothing and the empty count is even: mu(-6) = mu(-4) = mu(-1) = mu(-2) = 1, and
 # mu(i64 min) = 1, though -4 and i64 min carry a squared factor and -2 an odd count.
-# mu is not defined below 1; n <= 0 now returns the designed 0 that n == 0 returned.
-# ⚠ 0 is also mu of every n >= 1 with a squared factor, so that refusal is not
-# distinguishable from that answer -- the n == 0 contract this extends was already so.
 # ⛔ 3.4.1 (lane INS5) -- AND A REFUSED ALLOCATION READ AS "A SQUARED FACTOR": mu(6) = 0. Three
 # values, all of them answers, leave no room for a refusal, so the factors are on the stack and
 # nothing here allocates (_numx_factors_into).
 # [measured: tests/abuse.tcyr, group "3.3.3 W5: totient, mobius and sobol below their domain"]
-public fn num_mobius(n) {
-    if (n <= 0) { return 0; }
-    if (n == 1) { return 1; }
+#must_use
+public fn num_mobius_checked(n) {
+    if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (n == 1) { return Ok(1); }
 
     var factors: i64[64];
     var flen = _numx_factors_into(n, &factors);
@@ -198,15 +202,15 @@ public fn num_mobius(n) {
     var i = 0;
     while (i < flen - 1) {
         if (load64(&factors + i * 8) == load64(&factors + (i + 1) * 8)) {
-            return 0;
+            return Ok(0);
         }
         i = i + 1;
     }
 
     if ((flen % 2) == 0) {
-        return 1;
+        return Ok(1);
     }
-    return 0 - 1;
+    return Ok(0 - 1);
 }
 
 # Divisor sigma function sigma_k(n) = sum of d^k for all divisors d of n.
@@ -378,7 +382,7 @@ public fn num_pollard_rho_checked(n) {
 # ⛔ 3.4.1 — n <= 0 RETURNED THE EMPTY VEC, WHICH IS 1's FACTORISATION. num_factorize(0) and
 # num_factorize(-12) both came back with length 0, a product of 1 (roadmap [3.4.1], NU2 F1).
 # n <= 0 is outside the domain the doc always stated (n > 0), and the designed 0 is this
-# function's refusal, as num_euler_totient, num_mobius and num_divisor_sigma refuse n <= 0.
+# function's refusal, as num_euler_totient and num_divisor_sigma refuse n <= 0 (num_mobius_checked: Err).
 # (A sign convention, -12 as [-1, 2, 2, 3], would give a vec of "prime factors" a new meaning,
 # which a patch does not.) ⚠ A caller must test for 0 before vec_len, as it already had to.
 # ⛔ 3.4.1 — A REFUSED GROW ENDED THE PROCESS. vec_push prints "vec: alloc failed" and exits
@@ -399,7 +403,7 @@ public fn num_factorize(n) {
 }
 
 # The prime factors of n > 1 with multiplicity, ascending, into f (64 words), and
-# their count. On the stack (3.4.1), so that num_mobius, num_euler_totient and num_divisor_sigma,
+# their count. On the stack (3.4.1), so that num_mobius_checked, num_euler_totient and num_divisor_sigma,
 # which answer an integer, have no allocation to lose: an n below 2^63 has at most 62 prime
 # factors, and the work list takes each cofactor once, a split adding two: under twice that.
 fn _numx_factors_into(n, f) {
@@ -623,7 +627,13 @@ public fn num_continued_fraction_rational(p, q) {
 
 # Largest DFT length Bluestein will accept. m stays <= 2^21, so the three
 # work buffers are <= 2^21 * 16 B (32 MB) each, and j*j <= 1e12 cannot overflow i64.
-var _NUMX_DFT_MAX = 0x100000;   # 1048576 = 2^20
+# An enum member since 3.5.0 (K003), per CLAUDE.md's "enums for constants": a member is an
+# immediate, where the `var` it was cost a load and a relocation at each of its references. The var
+# was private, so a consumer of the bundle could neither read nor write it (`'_NUMX_DFT_MAX' is
+# private to its file`); only the white-box suites assigned it, to lower the cap for the routing
+# tests, and those now pass a smaller cap through the seam (_numx_capped_at, _numx_dct_at,
+# _numx_idct_at, _numx_dst_at) instead.
+enum _NumxDft { _NUMX_DFT_MAX = 1048576; }   # 2^20 points
 
 fn _numx_next_pow2(n) {
     var m = 1;
@@ -915,8 +925,14 @@ fn _numx_use_fft(n, len, post) {
 # ceiling sits between 80 MiB and the allocator's is a memory policy, not a patch.
 # [measured: scratch alloc_used probe (pmem.cyr), num_dct / num_dst at 1,000 to 100,000 points, 2026-10-31; cycc 6.6.20]
 fn _numx_bluestein_capped(len) {
+    return _numx_capped_at(len, _NUMX_DFT_MAX);
+}
+
+# _numx_bluestein_capped against the cap `cap` (3.5.0, K003): the seam through which the routing
+# tests lower the cap without writing _NUMX_DFT_MAX.
+fn _numx_capped_at(len, cap) {
     if (num_is_pow2(len) == 1) { return 0; }
-    if (len > _NUMX_DFT_MAX) { return 1; }
+    if (len > cap) { return 1; }
     return 0;
 }
 
@@ -931,13 +947,20 @@ fn _numx_bluestein_capped(len) {
 #          work buffer could not be allocated
 #must_use
 public fn num_dst(data, n) {
+    return _numx_dst_at(data, n, _NUMX_DFT_MAX);
+}
+
+# num_dst with the Bluestein cap `cap` in place of _NUMX_DFT_MAX (3.5.0, K003): the seam the routing
+# tests take, num_dst's own body at cap = _NUMX_DFT_MAX.
+#must_use
+fn _numx_dst_at(data, n, cap) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }   # see _numx_bluestein_capped
     if (n == 1) { return Ok(0); }   # sin(PI/2) == 1 exactly
     var big_n = 2 * (n + 1);
     # post = 0: DST-I's post-pass is a negate and a halve, not a twiddle.
     if (_numx_use_fft(n, big_n, 0) == 0) { return _numx_dst_direct(data, n); }
-    if (_numx_bluestein_capped(big_n) == 1) { return _numx_dst_direct(data, n); }
+    if (_numx_capped_at(big_n, cap) == 1) { return _numx_dst_direct(data, n); }
 
     # Odd extension of length 2*(n+1): y[0] = y[n+1] = 0, y[j+1] = x[j],
     # y[2n+1-j] = -x[j]. Its DFT is purely imaginary and carries the DST-I
@@ -1402,11 +1425,17 @@ public fn num_idst_into(data, n, plan, scratch) {
 #          work buffer could not be allocated
 #must_use
 public fn num_dct(data, n) {
+    return _numx_dct_at(data, n, _NUMX_DFT_MAX);
+}
+
+# num_dct with the Bluestein cap `cap` (3.5.0, K003; see _numx_dst_at).
+#must_use
+fn _numx_dct_at(data, n, cap) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }   # see _numx_bluestein_capped
     if (n == 1) { return Ok(0); }   # X[0] = x[0] * cos(0)
     if (_numx_use_fft(n, n, 2) == 0) { return _numx_dct_direct(data, n); }
-    if (_numx_bluestein_capped(n) == 1) { return _numx_dct_direct(data, n); }
+    if (_numx_capped_at(n, cap) == 1) { return _numx_dct_direct(data, n); }
 
     # v = even-indexed samples in order, then odd-indexed samples reversed.
     var v = hisab_alloc(n * 16);
@@ -1479,11 +1508,17 @@ fn _numx_dct_direct(data, n) {
 #          work buffer could not be allocated
 #must_use
 public fn num_idct(data, n) {
+    return _numx_idct_at(data, n, _NUMX_DFT_MAX);
+}
+
+# num_idct with the Bluestein cap `cap` (3.5.0, K003; see _numx_dst_at).
+#must_use
+fn _numx_idct_at(data, n, cap) {
     if (n <= 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (n > ALLOC_MAX / 8) { return Err(HSB_ERR_ALLOC); }   # see _numx_bluestein_capped
     if (n == 1) { return Ok(0); }   # x[0] = X[0] / 1
     if (_numx_use_fft(n, n, 2) == 0) { return _numx_idct_direct(data, n); }
-    if (_numx_bluestein_capped(n) == 1) { return _numx_idct_direct(data, n); }
+    if (_numx_capped_at(n, cap) == 1) { return _numx_idct_direct(data, n); }
 
     # Z[k] = (X[k] - i X[n-k]) * e^{+i PI k / (2n)}, with X[n] taken as 0.
     # The 1/n of the (2/n) scale is supplied by the inverse DFT; the 2 is
@@ -1705,21 +1740,25 @@ public fn num_ifft_2d(data, rows, cols) {
 # ================================================================
 
 # Halton sequence value for a given index and base.
-# Returns f64 bit pattern in [0, 1], or a quiet NaN for a negative index. The digits
+# Returns f64 bit pattern in [0, 1], or a quiet NaN for a negative index or a base below 2,
+# which have no radical inverse. The digits
 # are summed in f64, each step rounded, and a long enough run of top digits rounds
 # up to exactly 1.0: num_halton(2^54 - 1, 2) is 1.0, as it was in 3.3.2.
 # [measured: tests/abuse.tcyr, group "3.3.3 R5num: num_halton's range and guard order"]
 # index: non-negative integer (1-based for non-zero result; index 0 is 0.0)
 # base: prime number >= 2 (2, 3, 5, 7, ...)
-# A base below 2 has no radical-inverse expansion; 0.0 is returned for a
-# non-negative index, which is inside the documented range and is already what
-# index 0 yields.
+#
+# ⛔ 3.5.0 -- A BASE BELOW 2 RETURNED 0.0, WHICH IS A SAMPLE: index 0's, in every base (roadmap
+# [3.5.0], "Documented in their own comments, the same class"; AU2 section 2b). It returns the
+# quiet NaN the negative index has returned since 3.3.3, so every input with no radical inverse
+# gets the one refusal no sample equals; index >= 0 with base >= 2 keeps its bits.
+# [measured: tests/modules_d.tcyr, group "3.5.0 L5: num_halton refuses a base below 2 with NaN"]
 #
 # ⛔ 3.3.3 — A NEGATIVE INDEX RETURNED 0.0, WHICH IS A SAMPLE: the one at index 0.
 # `while (i > 0)` never ran, so num_halton(-5, 2) was 0.0 and a caller could not
 # tell it from num_halton(0, 2). The radical inverse has no negative index, so it
 # now returns a quiet NaN, which no sample equals, whatever the base: the index is
-# tested first, so num_halton(-5, 0) is NaN too, not the base refusal's 0.0.
+# tested first, so num_halton(-5, 0) is NaN too (the base refusal was 0.0 until 3.5.0).
 # [measured: tests/abuse.tcyr, group "3.3.3 R4num: num_sobol and num_halton refuse an out-of-domain index"]
 # Against 3.3.2 over 102748 (index, base) pairs, bases -3 to 13: the 101635 with a
 # non-negative index return 3.3.2's bits, and the 1113 negative ones a quiet NaN
@@ -1733,7 +1772,7 @@ public fn num_halton(index, base) {
     # forever while `f` underflows to zero. base < 0 terminates but leaves the
     # documented range. Reject all three at the door.
     # [measured: tests/modules_b.tcyr, group "2.8.3: num_halton rejects bases below 2"]
-    if (base < 2) { return _NUMX_F64_ZERO; }
+    if (base < 2) { return 0x7FF8000000000000; }   # quiet NaN, as a negative index (3.5.0; was 0.0)
     var result = _NUMX_F64_ZERO;
     var f = f64_div(_NUMX_F64_ONE, f64_from(base));
     var i = index;

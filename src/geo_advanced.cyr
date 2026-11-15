@@ -101,14 +101,13 @@ var _GA_TOI_REFUTE      = 0x3FD0000000000000;     # 0.25
 var _GA_TOI_SPREAD_T0   = 0x4010000000000000;     # 4.0
 var _GA_TOI_SPREAD_SWEPT = 0x4040000000000000;    # 32.0
 
-# GJK/EPA iteration limits
-public var GJK_MAX_ITER = 64;
+# GJK/EPA iteration limits: GJK_MAX_ITER and EPA_MAX_ITER, the enum GaIterLimit above
+# gjk_intersect_3d (an enum since 3.5.0; see there).
 # Conservative-advancement step budget for time_of_impact. Distinct from
 # GJK_MAX_ITER: that bounds GJK's simplex refinement, this bounds how many
 # advancement steps span [0, max_t]. Conflating them capped the search horizon
 # at 0.64 units regardless of max_t (see time_of_impact).
 var _GA_TOI_MAX_STEPS = 256;
-public var EPA_MAX_ITER = 64;
 
 # -v for a vector, each component's sign bit flipped (3.4.1, review pass CO6): hvec3_neg's
 # value on every pin (its f64_neg gave +0 for +0 below cyrius 6.6.8), so a normal or a point
@@ -296,8 +295,13 @@ var _GA_SUP_NONFINITE = 0;
 # exits since 3.3.5: 0, with the unit_x / depth-0 placeholders from gjk_epa_3d and mpr_penetration
 # (the normal's slot 0 where that placeholder is refused too) and neither out-param written from
 # time_of_impact.
-# ⚠ So a refusal reads as "apart", as a NaN shape does: these five have no other channel, and a
-# second code is an API change.
+# ⚠ So from the five plain entries a refusal reads as "apart", as a NaN shape does, and they keep
+# that answer: a second code from the same name is an API change.
+# ⭐ 3.5.0 (INS5 F1) -- THE CHANNEL: since 3.5.0 the run behind each entry answers the refusal
+# with HSB_ERR_ALLOC (_gjk_intersect_3d_e, _mpr_intersect_e, _ga_order_pen, _toi_e), the plain
+# entry reads it as its 0, and each has a _checked form that returns it as Err(HSB_ERR_ALLOC):
+# gjk_intersect_3d_checked, mpr_intersect_checked, gjk_epa_3d_checked, mpr_penetration_checked
+# and time_of_impact_checked (see gjk_intersect_3d_checked).
 # Like the flags around it the state is per query: each entry keeps what it found, so a support
 # function may ask a query.
 var _GA_REFUSED = 0;
@@ -678,7 +682,7 @@ fn _ga_order_near(r, depth) {
 # A depth query (fp: _gjk_epa_3d_o or _mpr_penetration_o) on the pair: the canonical order's
 # answer, and where it is in the band the other order's too, the shallower one taken (a
 # contact over a miss; the canonical answer at a tie); the normal turned back to the caller's
-# order.
+# order. HSB_ERR_ALLOC for a refused allocation (3.5.0), with the miss's placeholders.
 fn _ga_order_pen(fp, sup_a, shape_a, sup_b, shape_b, out_normal, out_depth) {
     var kr = _GA_REFUSED;
     _GA_REFUSED = 0;
@@ -708,11 +712,12 @@ fn _ga_order_pen(fp, sup_a, shape_a, sup_b, shape_b, out_normal, out_depth) {
         }
     }
     if (r == 1 && flip == 1) { store64(out_normal, _ga_neg3(load64(out_normal))); }
-    # Last, since the turn above is an allocation too: no answer, and a miss's placeholders.
+    # Last, since the turn above is an allocation too: no answer, and a miss's placeholders;
+    # HSB_ERR_ALLOC, which the plain entries read as their 0 (3.5.0).
     if (_GA_REFUSED != 0) {
         store64(out_normal, hvec3_unit_x());
         store64(out_depth, 0);
-        r = 0;
+        r = HSB_ERR_ALLOC;
     }
     _GA_REFUSED = kr;
     return r;
@@ -845,8 +850,12 @@ fn _ga_mink_scale(pa, pb, r, fin) {
 fn _ga_aspect_confirms(sup_a, shape_a, sup_b, shape_b) {
     var s = _GA_MINK_S;
     if (s == 0 || s == F64_ONE) { return 1; }
-    var wd = _ga_alloc(24);
-    if (wd == 0) { return 0; }
+    # A stack triple since 3.5.0. The 24-byte heap slot it replaces was the only checked allocation here: a
+    # scaled call (_GA_MINK_S != 1) that came here under a refusing allocator met its refusal, which
+    # went to the failure channel as designed, but with its check deleted every suite still passed.
+    # Three slots on the stack cannot be refused.
+    var wdv: i64[3];
+    var wd = &wdv;
     var wmax = 0;
     for (var i = 0; i < 3; i = i + 1) {
         var e = _ga_unit_x();
@@ -2174,7 +2183,47 @@ fn _gjk_intersect_3d_o(support_a, shape_a, support_b, shape_b) {
 # ordered run is _gjk_intersect_3d_o, documented above). The pair is run in its canonical
 # order (_ga_canon), and a miss that no separating plane puts beyond the band is asked of the
 # other order too: a contact if either is one (_ga_order_near). Through 3.4.0 the order decided some in-band pairs.
+# (The enum GaIterLimit sits here, directly above this public fn: cycc 6.6.2 / 6.6.3 hand a
+# public enum's export to the next top-level declaration, so that one must be public too.)
+#
+# The GJK and EPA iteration limits: GJK_MAX_ITER bounds GJK's simplex refinement, the portal's
+# discovery and refinement and the distance query's loop; EPA_MAX_ITER bounds EPA's expansion
+# and sizes its buffers.
+# ⛔ 3.5.0 (K003) -- THROUGH 3.4.2 BOTH WERE `public var`, so any consumer could write them, and
+# the write took effect: GJK_MAX_ITER = 0 from a consumer made every GJK loop run no round,
+# and EPA_MAX_ITER sized EPA's buffers, which is why 3.3.6 had to check its value where it did
+# (-1 to -3 had written past a 1- to 3-slot vertex buffer). An enum member is a constant folded
+# at compile time; reading the names is unchanged. EPA's buffer guard stays on the seam that
+# takes the cap as an argument (_epa_refine), the one way a test reaches another value.
+public enum GaIterLimit {
+    GJK_MAX_ITER = 64;
+    EPA_MAX_ITER = 64;
+}
+# 1 when the two shapes touch or overlap, 0 when they are apart; 0 also for a refused allocation
+# (the designed failure since 3.3.5, ONE CONTRACT above). gjk_intersect_3d_checked tells the two
+# 0s apart.
 public fn gjk_intersect_3d(support_a, shape_a, support_b, shape_b) {
+    var r = _gjk_intersect_3d_e(support_a, shape_a, support_b, shape_b);
+    if (r < 0) { return 0; }
+    return r;
+}
+
+# ⭐ 3.5.0 (INS5 F1) -- THE FIVE COLLISION ENTRIES' FAILURE CHANNEL. gjk_intersect_3d,
+# mpr_intersect, gjk_epa_3d, mpr_penetration and time_of_impact answer a refused allocation
+# with their miss, 0, which is also a legal answer: "apart" on no evidence. Each keeps that
+# answer (a caller compiled against it reads the same values), and each has a _checked form
+# that answers the refusal apart: Ok(1) a contact, Ok(0) apart, Err(HSB_ERR_ALLOC) a refused
+# allocation, where nothing the run computed is used. The _checked form's out-params are
+# written as the plain form writes them.
+#must_use
+public fn gjk_intersect_3d_checked(support_a, shape_a, support_b, shape_b) {
+    var r = _gjk_intersect_3d_e(support_a, shape_a, support_b, shape_b);
+    if (r < 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(r);
+}
+
+# gjk_intersect_3d's run, HSB_ERR_ALLOC for a refused allocation (3.5.0).
+fn _gjk_intersect_3d_e(support_a, shape_a, support_b, shape_b) {
     var kr = _GA_REFUSED;
     _GA_REFUSED = 0;
     var x = support_a;
@@ -2193,7 +2242,7 @@ public fn gjk_intersect_3d(support_a, shape_a, support_b, shape_b) {
         _GA_KC_F = 0;
         r = _gjk_intersect_3d_o(y, ys, x, xs);
     }
-    if (_GA_REFUSED != 0) { r = 0; }
+    if (_GA_REFUSED != 0) { r = HSB_ERR_ALLOC; }
     _GA_REFUSED = kr;
     return r;
 }
@@ -2228,7 +2277,8 @@ fn _gjk_intersect_core(support_a, shape_a, support_b, shape_b) {
     # ⭐ 3.3.6 — and a portal whose depth is below that is a contact when its EPA polytope
     # proves the origin enclosed (_gjk_portal_deep returns 2; see _epa_encloses).
     var pd = 0;
-    var pnd = _ga_alloc(24);
+    # nd's fourth slot, the kind of its candidate (_ga_cycle_proof), is read by gjk_epa_3d's band only.
+    var pnd = _ga_alloc(32);
     if (pnd == 0) { return 0; }
     store64(pnd, 0);
     store64(pnd + 16, 0);
@@ -2252,9 +2302,8 @@ fn _gjk_intersect_core(support_a, shape_a, support_b, shape_b) {
     # exhausted its iterations without producing one (two coincident zero-size
     # shapes never produce one -- every support value is exactly 0). Settle it
     # with the same exact touch certificate gjk_epa_3d uses.
-    var touch_n = _ga_alloc(8);
-    if (touch_n == 0) { return 0; }
-    if (_epa_touch_probe(support_a, shape_a, support_b, shape_b, touch_n) == 1) { return 1; }
+    var touch_n: i64[1];
+    if (_epa_touch_probe(support_a, shape_a, support_b, shape_b, &touch_n) == 1) { return 1; }
     # ⭐ 3.3.6 — a portal that proved nothing leaves the distance query's tetrahedron
     # (_ga_inside_proven), the second certificate of an enclosure. ⭐ 3.3.7 — and a ring
     # round the contact normal (_ga_cycle_proof), also where no portal was built, unless
@@ -2275,9 +2324,8 @@ fn _gjk_intersect_core(support_a, shape_a, support_b, shape_b) {
         var rn = load64(pnd);
         if (_ga_plane_parts(support_a, shape_a, support_b, shape_b, rn) == 1) { return 0; }
     }
-    var pin = _ga_alloc(32);
-    if (pin == 0) { return 0; }
-    var cp = _ga_cycle_proof(support_a, shape_a, support_b, shape_b, pnd, pin);
+    var pin: i64[4];
+    var cp = _ga_cycle_proof(support_a, shape_a, support_b, shape_b, pnd, &pin);
     if (cp == 1) { return 1; }
     # ⭐ 3.4.0 — THE BAND. A pair whose overlap or gap is below what the proofs' margin
     # resolves is a contact where a tetrahedron or polytope of its support points contains
@@ -2335,7 +2383,9 @@ fn _ga_plane_parts(sup_a, shape_a, sup_b, shape_b, n) {
 # both orders, all four entry points) no verdict changed.
 # [measured: lane-CO co-probe t_ovl.py and t_sepd.py, base tree and this tree, 2026-10-31; cycc 6.6.20]
 # Returns 1 when an enclosure is proved: nd's first slot is then 0 when the query's
-# tetrahedron proved it (seed holds it, for EPA), else (n, d), a depth found on the way.
+# tetrahedron proved it (seed holds it, for EPA), else (n, d), a depth found on the way, and
+# since 3.5.0 its fourth slot 1 where (n, d) is the rim ring's closed form (_ga_cf_ties), else
+# as it came (0 from the callers).
 # Since 3.4.0, 2 when no proof holds but support points hold the origin for certain (the
 # query's tetrahedron, or one of the ring's): the band's certificate (_ga_band_apart decides),
 # with nd and seed as for 1; else 0.
@@ -2352,16 +2402,24 @@ fn _ga_cycle_proof(sup_a, shape_a, sup_b, shape_b, nd, seed) {
         # contains it for certain (_toi_tetra_closest), so ip 2 is that certificate, with
         # seed holding it for EPA and nd's first slot 0.
         if (f64_gt(_ga_tetra_upper(sup_a, shape_a, sup_b, shape_b, seed), dl) == 0) { return 2; }
-        var s2 = _ga_alloc(32);
-        var ns = _ga_alloc(8);
-        var ds = _ga_alloc(8);
-        if (s2 == 0 || ns == 0 || ds == 0) { return 0; }
-        for (var i = 0; i < 4; i = i + 1) { store64(s2 + i * 8, load64(seed + i * 8)); }
-        if (_epa_refine(sup_a, shape_a, sup_b, shape_b, s2, ns, ds) != 1) { return 0; }
-        store64(nd, load64(ns));
-        store64(nd + 8, load64(ds));
+        var s2: i64[4];
+        var ns: i64[1];
+        var ds: i64[1];
+        for (var i = 0; i < 4; i = i + 1) { store64(&s2 + i * 8, load64(seed + i * 8)); }
+        if (_epa_refine(sup_a, shape_a, sup_b, shape_b, &s2, &ns, &ds, EPA_MAX_ITER) != 1) { return 0; }
+        store64(nd, load64(&ns));
+        store64(nd + 8, load64(&ds));
     }
     var rp = _ga_ring_proves(sup_a, shape_a, sup_b, shape_b, load64(nd), load64(nd + 8), dl, 0);
+    if (rp == 0) {
+        var rc: i64[2];
+        rp = _ga_rim_ring(sup_a, shape_a, sup_b, shape_b, load64(nd), load64(nd + 8), dl, 0, &rc);
+        if (rp == 1 && _ga_cf_ties(sup_a, shape_a, sup_b, shape_b, &rc, load64(nd + 8)) == 1) {
+            store64(nd, load64(&rc));
+            store64(nd + 8, load64(&rc + 8));
+            store64(nd + 24, 1);
+        }
+    }
     if (rp == 0 && ip == 2) { rp = 2; }
     return rp;
 }
@@ -2370,6 +2428,188 @@ fn _ga_cycle_proof(sup_a, shape_a, sup_b, shape_b, nd, seed) {
 # report the origin inside (0 otherwise): written straight after the query's last support
 # call and read straight after by _ga_cycle_proof.
 var _GA_NEAR_V = 0;
+
+# ⭐ 3.5.0 (F-CO7-2) -- A BALL OVER A FLAT FACE BY ITS CURVED RIM. Where a ball meets a cylinder's
+# cap with its centre within 1e-6 of the rim (inside it or past it), A (-) B there is the cap's disk
+# dilated by the ball, and the origin lies under the disk's edge: every support along a direction
+# near the cap's normal is a point of the rim, so a tetrahedron that holds the origin needs two rim
+# points within about sqrt(2 g / R) rad of the origin's azimuth (g its distance inside the rim's
+# circle, R the circle's radius), which neither ring above reaches. Through 3.4.2 the pair was
+# apart from all five entry points, both orders: over 4,000 such scenes (any orientation, ball radii
+# 1e-3 to 1, depths 20 to 4,000 eps, 1 - rho/R from 1e-12 to 1e-6) 121 misses; with the centre past
+# the rim by as much, 90 of 3,000.
+# [measured: scratch W3 fam1.py seeds 2 and 4, the base tree; 2026-11-14]
+# So, from the normal (n, d) a ring failed on, the rim's own frame is read: three supports tilted by
+# b = 2^-8 about the normal at 120-degree steps lie on the rim's circle, dilated by the ball, and
+# their plane's normal nf replaces n (three times: each reading divides n's error by about R / (r b),
+# r the ball's radius); h(nf) is the depth below the face. Two opposite tilts give the circle's
+# centre (their midpoint, the ball's parts cancelling), so the origin's azimuth w0 and its distance
+# from the centre; tilts b and b / 2 give the ball's radius kr from their heights, and so the
+# circle's radius R. A rim support tilted by t sits kr t further out and kr t^2 / 2 lower: t between
+# the tilt that brings the circle out past the origin and the one that lowers it to the origin keeps
+# both margins, and two rim points at azimuths +-delta from w0 (sin^2 delta = gr / R, gr the radial
+# margin, so the chord between them sags R (1 - cos delta), about half of gr) with the one opposite
+# and s(-nf) hold the origin. _ga_tetra_proves decides, so nothing here is taken on a reading
+# alone: a ring that does not prove the contact answers 0 and nothing changes.
+# The frame also gives the depth's closed forms for nd (cand: the face's, and past the circle the
+# ball's on the nearest rim point), which the callers and _ga_band_depth take at a tie (_ga_cf_ties).
+# Those 121 and 90 misses -> 0. Over 23,000 more scenes of balls by cylinders (any axis, near a
+# coordinate axis, on one), cones, boxes and capsules, overlapping and apart: wrong verdicts 10, 16,
+# 10 and 19 (cylinders) -> 1, 0, 0, 1; cones 14 -> 2; deep and mixed sets 4 and 7 -> 0; boxes and
+# capsules unchanged; no new contact on any separated pair. Support calls: gjk_epa_3d -7.8% and
+# gjk_intersect_3d -13% on the first family (a miss ran every proof first), time_of_impact +5.3%
+# (a contact's normal is read), separated pairs +0.08%. 19 calls, only where a ring has failed.
+# [measured: scratch W3 py/fam1.py, cmp1.py (seeds 2 to 5), cmp2.py (seeds 7, 13, 14, 21, 31 to 36); 2026-11-14]
+# Wider, on seven families of 3,000 (ball radii 1e-4 to 2, 1 - rho/R from 1e-14 to 1e-5 on either
+# side of the rim, depths 1 to 5,000 eps; unit scale and 2^+-500), the scenes missed with a depth
+# past 4 eps: past the rim 280, 283, 268 and 298 -> 2, 1, 0 and 1 (worst 18 eps), inside it 286,
+# 296 and 289 -> 0; the remaining misses are inside the 4-eps band. The depths past 4 eps are
+# before's, a few fewer (219, 222, 183, 201 -> 210, 216, 171, 192 of 9,000 answers past the rim,
+# worst 2,504 eps either way; none inside it). Of the answers that moved away from the exact (312
+# to 492 a family), none ends past 0.25 eps; the farthest went 0.004 -> 0.247 eps below it, the
+# deep snap taking a support value the test's cylinder support returns short (see _epa_snap_deep).
+# [measured: scratch W3 py/gen.py families fo1 to fo4 and fi1 to fi3, py/ana.py and py/m4.py; 2026-11-14]
+# In time (medians of 11 interleaved pinned runs, a loaded host): the roadmap's scene 1,294 -> 525 us
+# (gjk_intersect_3d) and 1,289 -> 495 us (gjk_epa_3d); the separated scene that paid most, 1,080 ->
+# 1,098 us, +1.6%, inside both sides' spread.
+# [measured: scratch W3 ab/ab.cyr on tests/hisab.bcyr's bw2W3_rim_cap_* rows, base and this tree; 2026-11-14]
+# ⭐ 3.5.0 (wave-2 review) -- A TIE IS NOT DECIDED BY ROUNDING. Two support values within h's rounding
+# (2^-49 of the points' scale, the snap's own tie, _ga_snap) give the depth equally well, and which is
+# lower is noise; their normals can be far apart where h is flat (a ball by a rim: along the rim's
+# meridian). Taking the lower at all, as the first wave-2 form did here and in _ga_band_depth, swapped
+# good normals for bad ones by that noise: a ball over a cap 8.7e-13 R inside its rim answered a
+# polished normal 1.19e-5 rad off the cap's axis (3.4.2: the axis to 1.5e-16), lower by 0.003 eps.
+# So, as the snap rules: at a tie the closed form is the minimiser, and a reading never displaces
+# another. The rim ring's candidate (the face's h(nf) or the rim point's form, both closed forms in
+# the rim's frame) replaces the polished or EPA depth in nd unless it is above it by more than h's
+# rounding, and nd records that it is one (its fourth slot), for _ga_band_depth.
+# [measured: scratch W3 fix probe/rep.txt case 2, py/chk.py (80-digit Decimal), 3.4.2 and both trees; 2026-11-14]
+fn _ga_tie_tol(sup_a, shape_a, sup_b, shape_b, n) {
+    return f64_mul(_ga_sup_scale(sup_a, shape_a, sup_b, shape_b, n), 0x3CE0000000000000);  # 2^-49
+}
+
+# 1 where the closed form c (normal, depth) is no higher than the depth d but for h's rounding.
+fn _ga_cf_ties(sup_a, shape_a, sup_b, shape_b, c, d) {
+    return f64_lt(load64(c + 8), f64_add(d, _ga_tie_tol(sup_a, shape_a, sup_b, shape_b, load64(c))));
+}
+
+fn _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, n, w, t) {
+    return _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, _epa_unit(_ga_add(n, _ga_scale(w, t))));
+}
+
+fn _ga_rim_ring(sup_a, shape_a, sup_b, shape_b, n, d, dl, out4, cand) {
+    store64(cand, 0);
+    if (f64_gt(d, dl) == 0) { return 0; }
+    var b = 0x3F70000000000000;  # 2^-8
+    var c3 = 0x3FEBB67AE8584CAA;  # sqrt(3) / 2
+    var nf = n;
+    for (var it = 0; it < 3; it = it + 1) {
+        var u = _epa_perp(nf);
+        if (f64_gt(hvec3_length_sq(u), 0) == 0) { return 0; }
+        var v = _ga_cross(nf, u);
+        var p0 = _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, u, b);
+        var w1 = _ga_add(_ga_scale(u, F64_HALF ^ _GA_SIGN), _ga_scale(v, c3));
+        var w2 = _ga_sub(_ga_scale(u, F64_HALF ^ _GA_SIGN), _ga_scale(v, c3));
+        var p1 = _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, w1, b);
+        var p2 = _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, w2, b);
+        var m = _epa_unit(_ga_cross(_ga_sub(p1, p0), _ga_sub(p2, p0)));
+        if (f64_gt(hvec3_length_sq(m), 0) == 0) { return 0; }
+        if (f64_lt(hvec3_dot(m, nf), 0) == 1) { m = _ga_neg3(m); }
+        nf = m;
+    }
+    # The face's height over the origin along nf: the support value there.
+    var dn = hvec3_dot(_gjk_mink_support(sup_a, shape_a, sup_b, shape_b, nf), nf);
+    if (f64_gt(dn, dl) == 0) { return 0; }
+    var u2 = _epa_perp(nf);
+    if (f64_gt(hvec3_length_sq(u2), 0) == 0) { return 0; }
+    var pu = _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, u2, b);
+    var pm = _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, _ga_neg3(u2), b);
+    var cc = _ga_scale(_ga_add(pu, pm), F64_HALF);
+    var ct = _ga_sub(cc, _ga_scale(nf, hvec3_dot(cc, nf)));
+    var lc = hvec3_length(ct);
+    var w0 = _epa_unit(_ga_neg3(ct));
+    if (f64_gt(hvec3_length_sq(w0), 0) == 0) { w0 = u2; }
+    var hf = _ga_sub(pu, pm);
+    var rr = f64_mul(hvec3_length(_ga_sub(hf, _ga_scale(nf, hvec3_dot(hf, nf)))), F64_HALF);
+    var pb = _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, w0, b);
+    var ph = _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, w0, f64_mul(b, F64_HALF));
+    # A rim support tilted by t is kr / sqrt(1 + t^2) above the rim, kr t / sqrt(1 + t^2) out.
+    var cb = f64_div(F64_ONE, f64_sqrt(f64_add(F64_ONE, f64_mul(b, b))));
+    var ch = f64_div(F64_ONE, f64_sqrt(f64_add(F64_ONE, f64_mul(f64_mul(b, b), _GA_F64_QUARTER))));
+    var kr = f64_div(hvec3_dot(_ga_sub(ph, pb), nf), f64_sub(ch, cb));
+    if (f64_gt(kr, 0) == 0) { kr = 0; }
+    var rr0 = f64_sub(rr, f64_mul(f64_mul(kr, b), cb));
+    if (f64_gt(rr0, 0) == 0) { return 0; }
+    var g0 = f64_sub(rr0, lc);
+    var tmin = 0;
+    var tmax = b;
+    if (f64_gt(kr, 0) == 1) {
+        tmax = f64_sqrt(f64_div(f64_mul(dn, F64_TWO), kr));
+        if (f64_lt(g0, 0) == 1) { tmin = f64_div(g0 ^ _GA_SIGN, kr); }
+    } elif (f64_gt(g0, 0) == 0) {
+        return 0;
+    }
+    if (f64_lt(tmin, tmax) == 0) { return 0; }
+    var t = f64_mul(f64_add(tmin, tmax), F64_HALF);
+    # At most b, the tilt the frame was read at: kr t and kr t^2 / 2 are a rim support's reach and
+    # drop only for a small t (its reach is kr sin(atan t)), and at t = 5 the chord they budget
+    # passes inside the origin, where the ring at t = b proves the contact (a ball 0.01 in from a
+    # tall cylinder's side, 0.5 below its cap: tests/modules_d.tcyr, the W3 rim-ring group). Over
+    # four families of 3,000 balls past the rim it fires in 29 to 49 rings each; without it 5 to
+    # 10 scenes a family take up to 16 more support calls, the ring failing, and no answer moves.
+    # [measured: scratch W3 py/gen.py families fo1 to fo4, a copy without it; 2026-11-14]
+    if (f64_gt(t, b) == 1) { t = b; }
+    var gr = f64_add(g0, f64_mul(kr, t));
+    if (f64_gt(gr, 0) == 0) { return 0; }
+    # dlt is sin(delta). At gr >= R it has no cosine (a NaN direction to the support functions,
+    # and the ring refused: a ball of radius 0.5 over the cap's centre), and a smaller delta keeps
+    # the chord's sag inside the margin, so it is capped at 1/4.
+    var dlt = f64_sqrt(f64_div(gr, rr0));
+    if (f64_gt(dlt, _GA_F64_QUARTER) == 1) { dlt = _GA_F64_QUARTER; }
+    var cs = f64_sqrt(f64_sub(F64_ONE, f64_mul(dlt, dlt)));
+    var wa = _ga_scale(w0, cs);
+    var wb = _ga_scale(_ga_cross(nf, w0), dlt);
+    var w4: i64[4];
+    store64(&w4, _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, _ga_neg3(nf)));
+    store64(&w4 + 8, _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, _ga_add(wa, wb), t));
+    store64(&w4 + 16, _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, _ga_sub(wa, wb), t));
+    store64(&w4 + 24, _ga_rim_sup(sup_a, shape_a, sup_b, shape_b, nf, _ga_neg3(w0), t));
+    if (_ga_tetra_proves(&w4, dl) == 0) { return 0; }
+    if (out4 != 0) { _ga_copy4(out4, &w4); }
+    # The depth's closed forms: the face's, h(nf); and past the circle with the origin above the
+    # core's face, the ball's on the core's rim point nearest the origin, P = C + R w0 (C the
+    # core's centre, cc less the ball's part along nf): -P / |P|, where h is kr - |P|. That one
+    # is the minimiser of h there (the face's exceeds it by about g0^2 / (2 (kr - dn)) in exact
+    # arithmetic), so where the origin is past the circle a face value below it is the supports'
+    # error, and the two are not compared (g0, which says so, is a reading: below).
+    # Taking the lower of the two moved depths away from the exact more often than towards it: over
+    # four families of 3,000 balls past the rim (r 1e-4 to 2) the rim form alone moved 1,623 depths,
+    # 1,359 nearer (by up to 0.173 eps) and 264 farther (by at most 0.010); inside the rim (three
+    # families) 66, 42 nearer and 24 farther (0.009).
+    # [measured: scratch W3 py/gen.py families fo1 to fo4 and fi1 to fi3, py/ana.py, py/nrm.py; 2026-11-14]
+    # Its cost in normals was more than that pass's count of it (at most 7.2e-7 rad either way, on r
+    # 1e-4 and up): a ball of r 1.3e-6 past a rim answered 2.05e-5 rad off through the first wave-2
+    # ties, which _ga_cf_ties now settles at 3.2e-9 rad (0.147 eps above the exact depth). With the ties
+    # settled, over eight families of 2,000 balls by a rim (five on cylinders' caps, r 1e-8 to 1,
+    # 1 - rho/R 1e-15 to 1e-4 either side; three on cones' bases; depths 1 to 100 eps; gjk_epa_3d,
+    # mpr_penetration and the reverse order) putting the comparison back (hr < dn) takes 222 normals
+    # from within 1e-9 rad to past 1e-7 and 9 the other way (worst 8.5e-5 rad, a cone's, where 3.4.2
+    # answers the same). Inside the rim, where g0 reads the origin past the circle (a ball 1.9e-14 R
+    # inside), the rim form answers 1.85e-5 rad off, as 3.4.2 does; compared, 1.7e-16.
+    # [measured: scratch W3 fix probe/sf.txt and py/flipr.py on families C1 to C5 and K1 to K3; 2026-11-14]
+    store64(cand, nf);
+    store64(cand + 8, dn);
+    if (f64_lt(g0, 0) == 1 && f64_lt(dn, kr) == 1) {
+        var pc = _ga_add(_ga_sub(cc, _ga_scale(nf, f64_mul(kr, cb))), _ga_scale(w0, rr0));
+        var mr = _epa_unit(_ga_neg3(pc));
+        if (f64_gt(hvec3_length_sq(mr), 0) == 1) {
+            var hr = hvec3_dot(_gjk_mink_support(sup_a, shape_a, sup_b, shape_b, mr), mr);
+            store64(cand, mr);
+            store64(cand + 8, hr);
+        }
+    }
+    return 1;
+}
 
 # ⭐ 3.4.0 (lane CO4) — WHERE NO CERTIFICATE GAVE A NORMAL, THE DISTANCE QUERY'S LINE DOES.
 # A small ball on a cylinder's rim: A (-) B there is a tube of the ball's radius round a
@@ -2404,9 +2644,20 @@ fn _ga_near_ring(sup_a, shape_a, sup_b, shape_b, nd, seed, dl) {
     n = load64(pn);
     var d = load64(pd);
     var rp = _ga_ring_aniso(sup_a, shape_a, sup_b, shape_b, n, d, dl, seed);
+    var cf = 0;
+    if (rp == 0) {
+        var rc: i64[2];
+        rp = _ga_rim_ring(sup_a, shape_a, sup_b, shape_b, n, d, dl, seed, &rc);
+        if (rp == 1 && _ga_cf_ties(sup_a, shape_a, sup_b, shape_b, &rc, d) == 1) {
+            n = load64(&rc);
+            d = load64(&rc + 8);
+            cf = 1;
+        }
+    }
     if (rp != 0) {
         store64(nd, n);
         store64(nd + 8, d);
+        store64(nd + 24, cf);
     }
     return rp;
 }
@@ -2686,7 +2937,7 @@ fn _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed, nd) {
     var kv = _GA_EPA_VERDICT;
     _GA_EPA_PROVE = 1 - nudged;
     _GA_EPA_VERDICT = 1 + ct;
-    var rr = _epa_refine(support_a, shape_a, support_b, shape_b, s2, ns, ds);
+    var rr = _epa_refine(support_a, shape_a, support_b, shape_b, s2, ns, ds, EPA_MAX_ITER);
     # Put back as found: a run that ends before it takes the request (a refused buffer) must
     # not leave it to the next _epa_refine, which would be a depth's run.
     _GA_EPA_PROVE = kp;
@@ -3107,7 +3358,7 @@ fn _epa_seed_portal(sup_a, shape_a, sup_b, shape_b, out4) {
         _GA_TETRA_NAN = load64(m + 56);
         return load64(m + 16);
     }
-    var r = _epa_seed_portal_x(sup_a, shape_a, sup_b, shape_b, out4);
+    var r = _epa_seed_portal_x(sup_a, shape_a, sup_b, shape_b, out4, GJK_MAX_ITER);
     _GA_PORTAL_APART = 0;
     if (r == 5) {
         _GA_PORTAL_APART = 1;
@@ -3140,7 +3391,10 @@ fn _epa_seed_portal(sup_a, shape_a, sup_b, shape_b, out4) {
 var _GA_PM = 0;
 var _GA_PM_ON = 0;
 
-fn _epa_seed_portal_x(sup_a, shape_a, sup_b, shape_b, out4) {
+# The portal's discovery rounds are an argument (3.5.0, K003's seam): `cap` rounds to find the
+# portal, GJK_MAX_ITER to push it out. hisab passes GJK_MAX_ITER, a constant; a test passes 0 or
+# 1 to reach the exit for a portal no round found.
+fn _epa_seed_portal_x(sup_a, shape_a, sup_b, shape_b, out4, cap) {
     var px = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, _ga_unit_x());
     var nx = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, _ga_neg3(_ga_unit_x()));
     # Midpoint of the difference's x-extent: the midpoint of two of its own
@@ -3190,7 +3444,7 @@ fn _epa_seed_portal_x(sup_a, shape_a, sup_b, shape_b, out4) {
 
     var v3 = _ga_zero();
     var found = 0;
-    for (var it = 0; it < GJK_MAX_ITER; it = it + 1) {
+    for (var it = 0; it < cap; it = it + 1) {
         dir = _epa_unit(dir);
         if (f64_gt(hvec3_length_sq(dir), 0) == 0) { return 0; }
         v3 = _gjk_mink_support(sup_a, shape_a, sup_b, shape_b, dir);
@@ -3345,7 +3599,16 @@ fn _epa_polish(sup_a, shape_a, sup_b, shape_b, n0, d0, out_normal, out_depth, pr
     var d = d0;
     var pn = 0;
     var pk = _ga_alloc(64);
-    if (pk == 0) { return 0; }
+    if (pk == 0) {
+        # ⛔ 3.5.0 (INS5 F1) -- a refusal here left both out-params unwritten, and _epa_refine
+        # answered with them: the cycling path's portal run handed _ga_plane_parts a normal of
+        # 0, which reached the support function and faulted (a ball past a cylinder's rim, the
+        # 13th working slot refused, SIGSEGV). The answer is the one given, as at d0 = 0.
+        # [measured: tests/modules_d.tcyr's W3 refusal sweep (INS5 F1), case 1, before and after the fix; 2026-11-14]
+        store64(out_normal, n0);
+        store64(out_depth, d0);
+        return 0;
+    }
     var step = step0;
     # fl: the step the search halves down to; wfl: the walk's floor.
     var fl = EPSILON_F64;
@@ -4118,9 +4381,22 @@ fn _epa_snap_after(sup_a, shape_a, sup_b, shape_b, out_normal, out_depth) {
 #     the closed form is the minimiser, as _ga_snap takes it). Two balls: the centre difference.
 #   * otherwise the snap from EPA's answer at a tilt of 2^-10 and again at 2^-16 from its
 #     answer (_epa_snap_deep): the face (a corner of h), the edge or the vertex closed form,
-#     taken only where lower than EPA's answer by more than h's rounding.
-# Every candidate is an upper bound on the depth, so no answer moves away from the exact one:
-# on the deep sweeps (16,000 answers) 976 moved, none deeper by more than 0.25 eps nor a normal
+#     taken where lower than EPA's answer (through 3.4.2 only by more than h's rounding; since
+#     the 3.5.0 review, where lower only by that, only where it is a minimiser of h, _epa_off_min).
+# Every candidate is a support value, so an upper bound on the depth only to the supports' own
+# error: h's rounding, and however far a support function's point falls short of its shape's
+# support, which the support contract allows up to eps a coordinate. The lower of two can be the
+# one below the exact depth, and since 3.5.0 the snap's is taken where lower at all (a minimiser:
+# _epa_snap_deep), so an answer can move away from the exact one by that error. Of 3,000 balls
+# deep in rotated parallelepipeds, 206 of gjk_epa_3d's answers moved farther, by at most 0.015 eps
+# (h's rounding); on the review's families (2,000 scenes each, gjk_epa_3d and mpr_penetration)
+# 145 answers in parallelepipeds and 157 in cylinders moved farther, by at most 0.026 and 0.036
+# eps; and a ball by a cylinder's rim 0.004 -> 0.247 eps below, its support short (see
+# _epa_snap_deep). Every one is within 4 eps.
+# [measured: scratch W3 py/fam2.py seeds 41 to 45, and the W3 wave-2 review's deep families; 2026-11-14]
+# [measured: scratch W3 py/gen.py family fi1 scene 818, py/fpsup.py, base and this tree; 2026-11-14]
+# In 3.4.1, a candidate taken only where lower by more than h's rounding, on the deep sweeps
+# (16,000 answers) 976 moved, none deeper by more than 0.25 eps nor a normal
 # more than twice as far off, and every family is within 4 eps (worst 0.61 eps on the caps,
 # 0.12 elsewhere); sphere pairs' normals at unit scale 7.0e-7 -> 8.0e-15 rad (at 1e3 and 1e6
 # already at the supports' rounding, unchanged). Shallow contacts, cylinder sides and polytope
@@ -4193,11 +4469,69 @@ fn _epa_deep_close(sup_a, shape_a, sup_b, shape_b, out_normal, out_depth, rf, q4
     }
     return _epa_snap_deep(sup_a, shape_a, sup_b, shape_b, out_normal, out_depth);
 }
-# The snap at depth (see above): from the answer (n, d), _ga_snap at a tilt of 2^-10, kept only
-# where lower than d by more than 2^-49 of the points' scale, then once more at 2^-16 from it,
-# the lower of the two. The first reading's rho rounds with n's own tilt from the minimiser, and
-# the second, from the closed form, reads it again: a cap 0.088 deep, 0.73 -> 0.34 eps.
+# The snap at depth (see above): from the answer (n, d), _ga_snap at a tilt of 2^-10, kept
+# where lower than d, then once more at 2^-16 from it, the lower of the two. The first reading's
+# rho rounds with n's own tilt from the minimiser, and the second, from the closed form, reads it
+# again: a cap 0.088 deep, 0.73 -> 0.34 eps.
 # [measured: lane CO5 capone.py (deepcap seed 3, case 14); 2026-11-01]
+# ⛔ 3.5.0 (F-CO8-2) -- THROUGH 3.4.2 A FACE FORM HAD TO BEAT d BY 2^-49 OF THE POINTS' SCALE, h's
+# rounding as _ga_sup_scale bounds it, about 30 ulp of the depth on unit-scale shapes, where h's
+# own rounding is a few: a ball concentric with a parallelepiped (tests/modules.tcyr) kept EPA's
+# answer 29 ulp above the exact r + h_min, its normal 8.4e-14 rad off, with the face's closed form
+# in hand 27 ulp lower. Both are support values, upper bounds on the depth to h's rounding, so
+# the lower one is the nearer, and the face form's normal is the face's. Taken where lower at all:
+# over 3,000 balls inside rotated parallelepipeds (a fifth concentric) the worst depth 0.226 ->
+# 0.106 eps (gjk_epa_3d) and 0.227 -> 0.101 (mpr_penetration), the worst normal 4.6e-13 -> 2.3e-14
+# rad and 4.8e-13 -> 1.9e-14; 789 and 821 depths move, 206 and 188 of them farther from the exact by
+# at most 0.015 eps (h's rounding); deep boxes 0.176 -> 0.056 eps, deep cylinders 0.161 -> 0.095,
+# capsules and spheres unchanged; shallow mixes of every kind: at most 16 of about 400 answers per
+# kind move, none by more than 0.031 eps. Cost: support calls +4.3% (parallelepipeds), +5.9% (deep
+# boxes), +3.7% (deep cylinders), +0.1% (capsules), the second reading now running where the first
+# was taken; on the dearest of the 3,000 parallelepipeds (193 -> 291 calls, now correctly rounded,
+# 13 ulp above before) 165 -> 190 us, +15% (medians of 11 interleaved pinned runs on a loaded host).
+# ⚠ A support short of its shape's support is read the same way. tests/modules.tcyr's cylinder
+# support (review pass CO8's) returns its cap's centre for a direction within 2^-48 rad of its
+# axis: R from the support point there (the rim's, at that azimuth), outside the support
+# contract's point-wise bound, though its support value is within R 2^-48: a ball over a
+# cap 1.5e-8 R inside its rim took the snap's face form at a normal 3.5e-15 rad off the axis, read
+# off that centre 0.247 eps below the exact (3.4.2's threshold kept EPA's, 0.004 eps below).
+# [measured: scratch W3 py/gen.py family fi1 scene 818, py/fpsup.py, base and this tree; 2026-11-14]
+# [measured: scratch W3 py/cmp5.py, cmp5n.py and fam2.py seeds 41 to 45, this tree with and without it; 2026-11-14]
+# [measured: scratch W3 ab/ab.cyr on tests/hisab.bcyr's bw2W3_par_deep_snap row, base and this tree; 2026-11-14]
+# 1 where the face form m is no minimiser of h: h falls from it by more than tol. A face's normal is
+# a corner of h, and its minimiser only where the origin's foot on the face lies on the face. The
+# supports at m tilted by +-tau along u land on the face's rim, and their midpoint (the ball's parts
+# cancelling) on the face (its centre, on a disk); h's slope from m towards the foot from there, w,
+# is the face's extent along w beyond the foot: 2 s(m + tau w / 2) . w - s(m + tau w) . w, the
+# ball's part r tau cancelled (to 3 r tau^3 / 8). Four supports. (A smooth closed form's support
+# point lies on its line: a test for that ahead of this one fired in no tie of 78,000 answers, nor
+# did one for a midpoint exactly at the foot, where w is 0 and the slope reads 0 anyway; without
+# them every answer and support call is the same.)
+fn _epa_off_min(sup_a, shape_a, sup_b, shape_b, z, m, tol) {
+    var tau = 0x3EB0000000000000;  # 2^-20
+    var u = _epa_perp(m);
+    var pa = _toi_msup(sup_a, shape_a, sup_b, shape_b, z, _epa_unit(_ga_add(m, _ga_scale(u, tau))));
+    var pb = _toi_msup(sup_a, shape_a, sup_b, shape_b, z, _epa_unit(_ga_sub(m, _ga_scale(u, tau))));
+    var c = _ga_scale(_ga_add(pa, pb), F64_HALF);
+    var w = _epa_unit(_ga_neg3(_ga_sub(c, _ga_scale(m, hvec3_dot(c, m)))));
+    var q1 = hvec3_dot(_toi_msup(sup_a, shape_a, sup_b, shape_b, z, _epa_unit(_ga_add(m, _ga_scale(w, tau)))), w);
+    var mh = _epa_unit(_ga_add(m, _ga_scale(w, f64_mul(tau, F64_HALF))));
+    var q2 = hvec3_dot(_toi_msup(sup_a, shape_a, sup_b, shape_b, z, mh), w);
+    return f64_lt(f64_sub(f64_mul(q2, F64_TWO), q1), f64_neg(tol));
+}
+
+# ⭐ 3.5.0 (wave-2 review) -- BUT NOT A FACE THE ORIGIN IS NOT OVER, AT A TIE. A face form lower only by
+# h's rounding (2^-49 of the points' scale) is taken where it is a minimiser of h, as the snap's tie
+# rule has it, and refused where it is not (_epa_off_min): a ball 4.0e-12 past a cone's base rim
+# and 3.0e-8 below it took the base's normal, 1.334e-4 rad off the exact one (h is flat there:
+# 0.006 eps above the depth), from gjk_epa_3d in both orders and mpr_penetration, where 3.4.2
+# answered 2.85e-8 rad (the section's other end, _epa_round_core); refused, it answers 3.4.2's bits
+# again. On balls deep in parallelepipeds (two families of 2,000), cylinders and cones (2,000 each)
+# no depth or normal moves; support calls +2.0% and +1.9%, +1.5% and +0.2% (the test's four supports,
+# at most, where a face form ties EPA's answer). The dearest bench row, par_deep_snap: 291 -> 307 calls,
+# 204.3 -> 208.4 us (+2.0%, medians of 15 interleaved runs pinned to an idle cpu, the ranges overlapping).
+# [measured: scratch W3 fix probe/rep.txt case 1 (80-digit Decimal), py/genpar.py, gendeep.py; 2026-11-14]
+# [measured: scratch W3 fix bench/bwc.tcyr, bw3.tcyr on tests/hisab.bcyr's bw2W3_* rows; 2026-11-14]
 fn _epa_snap_deep(sup_a, shape_a, sup_b, shape_b, out_normal, out_depth) {
     var d = load64(out_depth);
     if (f64_gt(d, 0) == 0) { return 0; }
@@ -4207,8 +4541,11 @@ fn _epa_snap_deep(sup_a, shape_a, sup_b, shape_b, out_normal, out_depth) {
     var t = 0x3F50000000000000;  # 2^-10
     if (_ga_snap(sup_a, shape_a, sup_b, shape_b, z, load64(out_normal), 0, t, sn) == 0) { return 0; }
     var h1 = load64(sn + 8);
+    if (f64_lt(h1, d) == 0) { return 0; }
     var tolh = f64_mul(load64(sn + 24), 0x3CE0000000000000);  # 2^-49
-    if (f64_lt(h1, f64_sub(d, tolh)) == 0) { return 0; }
+    if (f64_lt(h1, f64_sub(d, tolh)) == 0) {
+        if (_epa_off_min(sup_a, shape_a, sup_b, shape_b, z, load64(sn), tolh) == 1) { return 0; }
+    }
     var k = sn;
     if (_ga_snap(sup_a, shape_a, sup_b, shape_b, z, load64(sn), load64(sn + 16), f64_mul(t, 0x3F90000000000000),
         sn + 32) == 1) {
@@ -4534,7 +4871,13 @@ fn _ga_inside_proven(sup_a, shape_a, sup_b, shape_b, out4, dl) {
         }
     }
     var w = _GA_NEAR_TETRA;
-    if (w == 0) { return 0; }
+    # ⛔ 3.5.0 (INS6 F1) -- the exact-origin exit of _toi_near_point (1 with no tetrahedron) came
+    # here with _GA_NEAR_V as the last query run inside a support function left it, cleared on
+    # entry but not since, and _ga_cycle_proof's ring then read that query's point.
+    if (w == 0) {
+        _GA_NEAR_V = 0;
+        return 0;
+    }
     for (var i = 0; i < 4; i = i + 1) { store64(out4 + i * 8, load64(w + i * 8)); }
     if (_ga_tetra_proves(out4, dl) == 0) { return 2; }
     return 1;
@@ -4826,9 +5169,9 @@ fn _epa_rf_face(sup_a, shape_a, sup_b, shape_b, n, g1, g2, e, out_normal, out_de
 # the ring that reads n itself, the rest the fit and the closed forms the snap's flag now asks).
 # [measured: lane CO7 gen7.py seeds 1 to 5, capedge.py seeds 1 to 4, zcmp2.py, 3.4.1-dev and this tree; 2026-11-01]
 # ⚠ WHAT IS LEFT is in the block above _epa_tan_eig (review pass CO8), which took a ball's centre by the rim
-# and at the core's surface, and tiny balls, from this list. It keeps: a ball 200 to 505 eps deep over a cap
+# and at the core's surface, and tiny balls, from this list. It kept: a ball 200 to 505 eps deep over a cap
 # with 1 - rho'/R below 2e-9, answered as a MISS by all five entries: 8 of 10,000 answers (two scenes), as
-# in 3.4.0.
+# in 3.4.0. 3.5.0 proves those contacts on the rim's own frame (_ga_rim_ring, whose block has the sweeps).
 # [measured: lane CO7 gen7.py cap seed 11, this tree and 3.4.0; 2026-11-01]
 # The fit's two chords at a tilt of 2^-10, the first ring's yardstick.
 var _GA_RF_L1 = 0;
@@ -5198,8 +5541,13 @@ fn _epa_round_core(sup_a, shape_a, sup_b, shape_b, nr, nq, q4, g, gl, gf, out_no
     }
     var tol = f64_mul(sm, 0x3CF0000000000000);  # 2^-48
     var e = 0x3FB0000000000000;  # 2^-4
-    # A ball's motion over a pair's 2^-5 of tilt must pass 2^-46 of the points' scale to be read.
-    var rmin = f64_mul(sm, 0x3D30000000000000);  # 2^-41
+    # A ball's motion over a pair's 2^-5 of tilt must pass the rounding of the pair's two supports,
+    # 2^-49 of the points' scale (2^-50 each, _ga_sup_scale), to be read: from 2^-44 of it. 3.4.1
+    # shipped these bits under a comment that said 2^-41; at 2^-41, of 1,003 swept answers that move,
+    # 150 are past 16 eps (worst 3.5e9) and none at 2^-44 (worst 8.85), so the bits are the right
+    # floor. tests/modules_c.tcyr, group "3.5.0 collision: the round core's least ball", pins it.
+    # [measured: rmin probe gen.py and score.py seeds 2 to 9, 16,800 scenes, 2^-44 and 2^-41; 2026-11-14]
+    var rmin = f64_mul(sm, 0x3D30000000000000);  # 2^-44
     # On a crease the tilt along its axis is the meridian, and the cap's normal is the axis itself:
     # three supports where the crease holds, and the depth within the ball. A chord that grows
     # with the tilt, past twice its length at 2^-10, was no jump but a rim's motion, and the
@@ -5328,9 +5676,9 @@ fn _epa_core_retry(sup_a, shape_a, sup_b, shape_b, out_normal, out_depth) {
     var r = 0;
     var sg = _epa_seed_gjk(sup_a, shape_a, sup_b, shape_b, seed);
     if (sg != 1 && sg != 7) {
-        if (_epa_seed_portal_x(sup_a, shape_a, sup_b, shape_b, seed) == 1) { sg = 1; }
+        if (_epa_seed_portal_x(sup_a, shape_a, sup_b, shape_b, seed, GJK_MAX_ITER) == 1) { sg = 1; }
     }
-    if (sg == 1) { r = _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, n2, d2); }
+    if (sg == 1) { r = _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, n2, d2, EPA_MAX_ITER); }
     _GA_CORE_RHO = 0;
     _GA_PM = kpm;
     _GA_PM_ON = kpo;
@@ -5359,16 +5707,18 @@ fn _epa_core_retry(sup_a, shape_a, sup_b, shape_b, out_normal, out_depth) {
 # Expand `seed` (4 HVec3 pointers, a tetrahedron containing the origin) until the
 # closest supporting plane of the Minkowski difference is pinned. Writes the unit
 # outward normal and the depth. Returns 1 on success, 0 if the seed is unusable.
-fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
-    # EPA_MAX_ITER is a public var, so its value is checked here, where it sizes the
-    # buffers: -1 to -3 sized the vertex buffer at 1 to 3 slots, which alloc grants, and the
-    # four seed vertices were written past it; near 2^61 the byte counts wrap to small ones
-    # (2^61 - 3 asks for 8 bytes of vertices). A value of 0 or less runs no iteration and
-    # answers 0, as 0 always did, and so does one whose face and edge buffers, each
-    # (2 EPA_MAX_ITER + 16) records of 48 bytes, would exceed ALLOC_MAX: alloc refuses those
-    # sizes anyway where they do not wrap.
-    if (EPA_MAX_ITER <= 0 || EPA_MAX_ITER > (ALLOC_MAX / _EPA_FACE_SIZE - 16) / 2) { return 0; }
-    var vmax = 4 + EPA_MAX_ITER;
+# `cap` (3.5.0, the seam K003 asked for): the iteration cap, `cap` rounds, buffers sized from
+# it. Every caller in hisab passes EPA_MAX_ITER, a constant; tests pass others. The cap is
+# checked where it sizes the buffers, as EPA_MAX_ITER's value was while it was a writable var
+# (3.3.6): -1 to -3 sized the vertex buffer at 1 to 3 slots, which alloc
+# grants, and the four seed vertices were written past it; near 2^61 the byte counts wrap to
+# small ones (2^61 - 3 asks for 8 bytes of vertices). A cap of 0 or less runs no iteration
+# and answers 0, and so does one whose face and edge buffers, each (2 cap + 16) records of
+# 48 bytes, would exceed ALLOC_MAX: alloc refuses those sizes anyway where they do not wrap.
+# Nothing is written on that refusal.
+fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth, cap) {
+    if (cap <= 0 || cap > (ALLOC_MAX / _EPA_FACE_SIZE - 16) / 2) { return 0; }
+    var vmax = 4 + cap;
     var fmax = 2 * vmax + 8;
     var verts = _ga_alloc(vmax * 8);
     var fbuf = _ga_alloc(fmax * _EPA_FACE_SIZE);
@@ -5408,7 +5758,7 @@ fn _epa_refine(sup_a, shape_a, sup_b, shape_b, seed, out_normal, out_depth) {
     var pstep = _GA_F64_QUARTER;
     var gapr = 0;
 
-    for (var it = 0; it < EPA_MAX_ITER; it = it + 1) {
+    for (var it = 0; it < cap; it = it + 1) {
         # Closest live face -- full scan over every face, deliberately not a
         # heap; see the note at the top of this section.
         # `lo` is the LOWER bound and must range over every live face, exhausted
@@ -6045,8 +6395,8 @@ fn _epa_touch_probe(sup_a, shape_a, sup_b, shape_b, out_n) {
     # that case. The enclosing-simplex path never reaches here: it is a hull of
     # genuine members of the difference and does not depend on a probe direction.
     if (touch == 0 && best_made == 1) {
-        var axes = _ga_alloc(48);
-        if (axes == 0) { return 0; }
+        var axv: i64[6];
+        var axes = &axv;
         store64(axes,      _ga_unit_x());
         store64(axes + 8,  _ga_neg3(_ga_unit_x()));
         store64(axes + 16, _ga_unit_y());
@@ -6131,16 +6481,58 @@ fn _gjk_epa_3d_o(support_a, shape_a, support_b, shape_b, out_normal, out_depth) 
 # _gjk_epa_3d_o, documented above). The pair runs in its canonical
 # order (_ga_canon); where that answer is in the band (_ga_order_near) the other order runs
 # too: a contact if either is one, the shallower answer, the canonical one at a tie.
+# 0 also for a refused allocation, with the miss's placeholders: gjk_epa_3d_checked tells it apart.
 public fn gjk_epa_3d(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
-    return _ga_order_pen(&_gjk_epa_3d_o, support_a, shape_a, support_b, shape_b, out_normal, out_depth);
+    var r = _ga_order_pen(&_gjk_epa_3d_o, support_a, shape_a, support_b, shape_b, out_normal, out_depth);
+    if (r < 0) { return 0; }
+    return r;
+}
+
+# gjk_epa_3d with the failure channel (3.5.0; see gjk_intersect_3d_checked): Ok(1) a contact
+# with its normal and depth, Ok(0) apart, Err(HSB_ERR_ALLOC) a refused allocation; on either of
+# the last two the out-params hold gjk_epa_3d's placeholders (unit_x, or 0 where that one is
+# refused too, and depth 0).
+#must_use
+public fn gjk_epa_3d_checked(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    var r = _ga_order_pen(&_gjk_epa_3d_o, support_a, shape_a, support_b, shape_b, out_normal, out_depth);
+    if (r < 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(r);
 }
 
 # The depth of a contact the cycling path settled: EPA's from the tetrahedron in seed (the
 # portal, or the distance query's), refined in full; where that run fails, the (normal, depth)
 # in nd that EPA found on the way, if any. Since the lane review the portal's run is a
 # verdict's (_GA_EPA_VERDICT), so nd's depth is not the answer's.
+# ⭐ 3.5.0 (F-CO7-2) -- and nd's where it is lower than EPA's: both are support values, upper bounds
+# on the depth to the supports' own error (THE CLOSED FORMS AT DEPTH, above _epa_rf_corner). A rim
+# ring's tetrahedron (_ga_rim_ring) is a sliver, and EPA from it stopped 25 eps
+# above the polished normal nd held (0.024 eps), on a ball whose other order had answered right.
+# [measured: scratch W3 py/cmp2.py seed 7 scene 1691, this tree with and without it; 2026-11-14]
+# ⭐ 3.5.0 (wave-2 review) -- lower beyond h's rounding (2^-49 of the points' scale), or within it
+# either way where nd is the rim ring's closed form (its fourth slot, _ga_cf_ties): at a tie EPA's
+# refined answer stands against a reading, and the closed form against EPA's. Taken where lower at
+# all, a polished normal 1.19e-5 rad off a cap's axis displaced EPA's (the axis), 0.003 eps lower.
+# Over eight families of 2,000 balls by a rim (gjk_epa_3d, mpr_penetration and the reverse order;
+# _ga_rim_ring's block), normals within 1e-9 rad on 3.4.2 and past 1e-7 here: 126 under that form, 0
+# under this one (1,836 the other way); against that form, 15 and 1,560, the worst of the 15 (6.9e-5
+# rad) 3.4.2's own answer. Verdicts, depths past 4 eps and support calls are that form's (72,676,416
+# calls against 72,676,536); 10,026 depths moved, 6,999 nearer the exact (by up to 0.120 eps) and
+# 3,027 farther (by up to 0.199: a normal 3.0e-6 -> 1.9e-8 rad, its depth 0.005 eps below the exact ->
+# 0.204 above).
+# [measured: scratch W3 fix py/gen.py families C1 to C5 and K1 to K3, py/flipr.py and py/depmv.py; 2026-11-14]
 fn _ga_band_depth(support_a, shape_a, support_b, shape_b, nd, seed, out_normal, out_depth) {
-    if (_epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth) == 1) { return 1; }
+    if (_epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth, EPA_MAX_ITER) == 1) {
+        if (load64(nd) != 0) {
+            var tol = _ga_tie_tol(support_a, shape_a, support_b, shape_b, load64(nd));
+            var lim = f64_sub(load64(out_depth), tol);
+            if (load64(nd + 24) == 1) { lim = f64_add(load64(out_depth), tol); }
+            if (f64_lt(load64(nd + 8), lim) == 1) {
+                store64(out_normal, load64(nd));
+                store64(out_depth, load64(nd + 8));
+            }
+        }
+        return 1;
+    }
     if (load64(nd) == 0) { return 0; }
     store64(out_normal, load64(nd));
     store64(out_depth, load64(nd + 8));
@@ -6172,10 +6564,11 @@ fn _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth) 
     var s = _epa_seed_gjk(support_a, shape_a, support_b, shape_b, seed);
     var pd = 0;
     var cyc = 0;
-    var pnd = _ga_alloc(24);
+    var pnd = _ga_alloc(32);
     if (pnd == 0) { return 0; }
     store64(pnd, 0);
     store64(pnd + 16, 0);
+    store64(pnd + 24, 0);
     # The portal's plane parts the pair: no touch follows (as gjk_intersect_3d, and pd 4 below).
     if (s == 7) { return 0; }
     if (s == 3) {
@@ -6184,7 +6577,7 @@ fn _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth) 
         # deep or with its enclosure proved (pd 1 or 2), and its depth is EPA's from it.
         pd = _gjk_portal_deep(support_a, shape_a, support_b, shape_b, seed, pnd);
         if (pd == 1 || pd == 2) {
-            return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
+            return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth, EPA_MAX_ITER);
         }
         # A support value below zero parts the pair: no touch follows (as gjk_intersect_3d).
         if (pd == 4) { return 0; }
@@ -6258,7 +6651,9 @@ fn _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth) 
         }
         if (_epa_seed_portal(support_a, shape_a, support_b, shape_b, seed) == 0) {
             if (gs != 0) {
-                if (_epa_refine(support_a, shape_a, support_b, shape_b, gs, out_normal, out_depth) == 1) { return 1; }
+                if (_epa_refine(support_a, shape_a, support_b, shape_b, gs, out_normal, out_depth, EPA_MAX_ITER) == 1) {
+                    return 1;
+                }
             }
             # No portal either: the Minkowski difference has no volume, yet GJK
             # placed the origin inside it (s == 2 means the simplex enclosed the
@@ -6293,7 +6688,7 @@ fn _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth) 
             }
         }
     }
-    return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
+    return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth, EPA_MAX_ITER);
 }
 
 # ================================================================
@@ -6413,8 +6808,24 @@ fn _mpr_intersect_o(support_a, shape_a, support_b, shape_b) {
 # ⭐ 3.4.1 (review pass CO3) — ONE ANSWER PER UNORDERED PAIR: mpr_intersect(A, B) is
 # mpr_intersect(B, A), and gjk_intersect_3d's, for every pair the order key tells apart
 # (_ga_canon says which; the ordered run is _mpr_intersect_o, documented above; the order rule
-# is gjk_intersect_3d's).
+# is gjk_intersect_3d's). 0 also for a refused allocation; mpr_intersect_checked tells it apart.
 public fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
+    var r = _mpr_intersect_e(support_a, shape_a, support_b, shape_b);
+    if (r < 0) { return 0; }
+    return r;
+}
+
+# mpr_intersect with the failure channel (3.5.0; see gjk_intersect_3d_checked): Ok(1) a
+# contact, Ok(0) apart, Err(HSB_ERR_ALLOC) a refused allocation.
+#must_use
+public fn mpr_intersect_checked(support_a, shape_a, support_b, shape_b) {
+    var r = _mpr_intersect_e(support_a, shape_a, support_b, shape_b);
+    if (r < 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(r);
+}
+
+# mpr_intersect's run, HSB_ERR_ALLOC for a refused allocation (3.5.0).
+fn _mpr_intersect_e(support_a, shape_a, support_b, shape_b) {
     var kr = _GA_REFUSED;
     _GA_REFUSED = 0;
     var x = support_a;
@@ -6433,7 +6844,7 @@ public fn mpr_intersect(support_a, shape_a, support_b, shape_b) {
         _GA_KC_F = 0;
         r = _mpr_intersect_o(y, ys, x, xs);
     }
-    if (_GA_REFUSED != 0) { r = 0; }
+    if (_GA_REFUSED != 0) { r = HSB_ERR_ALLOC; }
     _GA_REFUSED = kr;
     return r;
 }
@@ -6541,10 +6952,12 @@ var _GA_MPR_SEP_REL = 0x3D10000000000000;  # 2^-46
 # 1 when the distance query seeded along d proves a plane that separates A (-) B from
 # the origin by more than dm.
 fn _mpr_near_apart(support_a, shape_a, support_b, shape_b, d, dm) {
-    var vs = _ga_alloc(8);
-    var lbs = _ga_alloc(8);
-    var lvs = _ga_alloc(8);
-    if (vs == 0 || lbs == 0 || lvs == 0) { return 0; }
+    var vsv: i64[1];
+    var lbv: i64[1];
+    var lvv: i64[1];
+    var vs = &vsv;
+    var lbs = &lbv;
+    var lvs = &lvv;
     if (_toi_near_point(support_a, shape_a, support_b, shape_b, _ga_zero(), d, vs, lbs, lvs) == 1) { return 0; }
     if (f64_gt(load64(lbs), dm) == 1) {
         _ga_far_sep(load64(lbs));
@@ -6558,8 +6971,8 @@ fn _mpr_near_apart(support_a, shape_a, support_b, shape_b, d, dm) {
     # it reads separates. The snap's is the cylinder's own normal, whose h is minus the gap.
     var m = _epa_unit(_ga_neg3(load64(vs)));
     if (f64_gt(hvec3_length_sq(m), 0) == 0) { return 0; }
-    var sn = _ga_alloc(32);
-    if (sn == 0) { return 0; }
+    var snv: i64[4];
+    var sn = &snv;
     _ga_snap(support_a, shape_a, support_b, shape_b, _ga_zero(), m, 0, 0x3F50000000000000, sn);  # 2^-10
     if (f64_lt(load64(sn + 8), dm ^ _GA_SIGN) == 0) { return 0; }
     _ga_far_sep(load64(sn + 8) ^ _GA_SIGN);
@@ -6660,8 +7073,22 @@ fn _mpr_penetration_o(support_a, shape_a, support_b, shape_b, out_normal, out_de
 # mpr_penetration(B, A) give the same verdict and depth, bit for bit, and normals of
 # opposite sign, for every pair the order key tells apart (_ga_canon says which; the ordered
 # run is _mpr_penetration_o, documented above; the order rule is gjk_epa_3d's).
+# 0 also for a refused allocation, with the miss's placeholders: mpr_penetration_checked tells it
+# apart.
 public fn mpr_penetration(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
-    return _ga_order_pen(&_mpr_penetration_o, support_a, shape_a, support_b, shape_b, out_normal, out_depth);
+    var r = _ga_order_pen(&_mpr_penetration_o, support_a, shape_a, support_b, shape_b, out_normal, out_depth);
+    if (r < 0) { return 0; }
+    return r;
+}
+
+# mpr_penetration with the failure channel (3.5.0; see gjk_intersect_3d_checked): Ok(1) a contact
+# with its normal and depth, Ok(0) apart, Err(HSB_ERR_ALLOC) a refused allocation; on either of
+# the last two the out-params hold mpr_penetration's placeholders.
+#must_use
+public fn mpr_penetration_checked(support_a, shape_a, support_b, shape_b, out_normal, out_depth) {
+    var r = _ga_order_pen(&_mpr_penetration_o, support_a, shape_a, support_b, shape_b, out_normal, out_depth);
+    if (r < 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(r);
 }
 
 # mpr_penetration without the non-finite contract around it.
@@ -6686,7 +7113,7 @@ fn _mpr_penetration_core(support_a, shape_a, support_b, shape_b, out_normal, out
         # was a copy of that path, and a shallow portal was kept unless refuted).
         return _gjk_epa_core(support_a, shape_a, support_b, shape_b, out_normal, out_depth);
     }
-    return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth);
+    return _epa_refine(support_a, shape_a, support_b, shape_b, seed, out_normal, out_depth, EPA_MAX_ITER);
 }
 
 # ================================================================
@@ -7668,7 +8095,9 @@ public fn sdf_capsule(point, a, b, radius) {
     if (mpb > mb) { mb = mpb; }
     if (mb >= 0x7FF0_0000_0000_0000) {
         # A difference overflowed (a scene spanning more than DBL_MAX), or an input is not
-        # finite. Halving is exact wherever a difference can overflow (both terms >= 2^1022).
+        # finite. The overflowing difference's two terms are then normal (one past 2^1022, the
+        # other at least 2^970, half an ulp of DBL_MAX), so each halves exactly, and `a` is one
+        # of them: a third term halved inexactly (a subnormal) sits under half an ulp of a/2.
         _ga_scale_to(&h0, a, F64_HALF);
         ab = _ga_sub_to(&abt, _ga_scale_to(&h1, b, F64_HALF), &h0);
         ap = _ga_sub_to(&apt, _ga_scale_to(&h1, point, F64_HALF), &h0);
@@ -8060,6 +8489,11 @@ fn _sdc_accurate(point, a, b, radius, hf) {
         _sdc_dist(point, a, b, hh, &d);
     }
     var m = load64(&d + 8);
+    # ⛔ 3.5.0 -- AN INFINITE RADIUS PAST A DISTANCE PAST DBL_MAX WAS NaN: d m below overflowed to
+    # +Inf, and +Inf - +Inf has no value, where the distance itself is finite (every input is
+    # here): p = (DBL_MAX, 0, 0), a = b = -p, radius +Inf answered NaN for -Inf. A finite d less
+    # an infinite radius is the radius's opposite, whatever d m reads.
+    if ((radius & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { return radius ^ _GA_SIGN; }
     var rr = f64_div(radius, m);
     if (hh == 1) { rr = f64_mul(rr, F64_HALF); }
     if (f64_lt(f64_abs(rr), _GA_F64_POS_INF) == 0) {
@@ -8099,10 +8533,23 @@ public fn sdf_subtraction(d1, d2) {
 # maximum instead). NaN in, NaN out.
 # ⛔ 3.4.1 -- k = 0 divided by zero: (1, 1, 0) -> NaN, (1, 2, 0) -> min, and k = -0 the
 # MAXIMUM in either order (-Inf flips the clamp). Both zeros now answer sdf_union.
+# ⛔ 3.5.0 -- AN INFINITE DISTANCE WAS NaN: (+Inf, +Inf, 1) took d2 - d1 = Inf - Inf, and
+# (+Inf, 2, 1) or (+Inf, -Inf, 1) a clamped h = 0 times the infinite d1, Inf * 0. Where h clamps
+# to 0 or 1 the blend is d2 or d1 exactly (min(d1, d2), the |d1 - d2| >= k case above), so it
+# is returned as it stands; and two equal infinities are that infinity for every finite k, the
+# smooth union lying in [min - k/4, min]. An infinite k with them stays NaN (Inf - Inf).
 public fn sdf_smooth_union(d1, d2, k) {
     if (f64_eq(k, 0) == 1) { return sdf_union(d1, d2); }
     var h = f64_clamp(f64_add(F64_HALF, f64_mul(F64_HALF, f64_div(f64_sub(d2, d1), k))),
       0, F64_ONE);
+    if (f64_gt(h, 0) == 1) {
+        if (h == F64_ONE) { return d1; }
+    } elif (f64_eq(h, 0) == 1) {   # (+0 only: 1/2 + x is never -0)
+        return d2;
+    } elif (d1 == d2 && (d1 & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000
+      && f64_lt(f64_abs(k), _GA_F64_POS_INF) == 1) {
+        return d1;   # h NaN: two equal infinities
+    }
     # d2*(1-h) + d1*h - k*h*(1-h). (Through 3.3.1 a dead `blend` local also
     # computed a different, wrong formula first and was never read.)
     var one_minus_h = f64_sub(F64_ONE, h);
@@ -9071,8 +9518,26 @@ fn _toi_o(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, ou
 # opposite sign, for every pair the order key tells apart (_ga_canon says which; the ordered
 # run is _toi_o, documented above). The pair runs in its
 # canonical order (_ga_canon), velocities with their shapes; its overlap test at t = 0 takes
-# the band's verdict as gjk_intersect_3d does (_toi_core).
+# the band's verdict as gjk_intersect_3d does (_toi_core). 0 also for a refused allocation, no
+# out-param written: time_of_impact_checked tells it apart.
 public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, out_normal) {
+    var r = _toi_e(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, out_normal);
+    if (r < 0) { return 0; }
+    return r;
+}
+
+# time_of_impact with the failure channel (3.5.0; see gjk_intersect_3d_checked): Ok(1) an impact
+# within max_t, out_t and out_normal written; Ok(0) none; Err(HSB_ERR_ALLOC) a refused
+# allocation. Neither out-param is written on the last two.
+#must_use
+public fn time_of_impact_checked(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, out_normal) {
+    var r = _toi_e(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, out_normal);
+    if (r < 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(r);
+}
+
+# time_of_impact's run, HSB_ERR_ALLOC for a refused allocation (3.5.0).
+fn _toi_e(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t, out_normal) {
     var kr = _GA_REFUSED;
     _GA_REFUSED = 0;
     # (Stack slots: a refusal at the last allocation, the turned normal, must write neither.)
@@ -9086,7 +9551,7 @@ public fn time_of_impact(support_a, shape_a, vel_a, support_b, shape_b, vel_b, m
         if (r == 1) { store64(&on, _ga_neg3(load64(&on))); }
     }
     if (_GA_REFUSED != 0) {
-        r = 0;
+        r = HSB_ERR_ALLOC;
     } elif (r == 1) {
         store64(out_t, load64(&ot));
         store64(out_normal, load64(&on));
@@ -9276,10 +9741,14 @@ fn _toi_core(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t,
             var rs = n_prev;
             if (rq == 1) { rs = _ga_neg3(rel_vel); }
             if (inside == 0 && f64_gt(dist, tol) == 1 && f64_gt(load64(lb_slot), 0) == 0 && n_prev != 0) {
-                var v2_slot = _ga_alloc(8);
-                var lb2_slot = _ga_alloc(8);
-                var lbv2_slot = _ga_alloc(8);
-                if (v2_slot == 0 || lb2_slot == 0 || lbv2_slot == 0) { return 0; }
+                # Stack slots: _toi_near_point writes all three on every path (both bounds are
+                # zeroed on entry, before its loop, so its inside exit leaves them 0).
+                var v2v: i64[1];
+                var lb2v: i64[1];
+                var lbv2v: i64[1];
+                var v2_slot = &v2v;
+                var lb2_slot = &lb2v;
+                var lbv2_slot = &lbv2v;
                 var in2 = _toi_near_point(support_a, shape_a, support_b, shape_b, offset, rs,
                   v2_slot, lb2_slot, lbv2_slot);
                 var d2 = hvec3_length(load64(v2_slot));
@@ -9449,8 +9918,7 @@ fn _toi_core(support_a, shape_a, vel_a, support_b, shape_b, vel_b, max_t, out_t,
 #
 # Access: load64(mv + idx * 8), store64(mv + idx * 8, val)
 
-public var CGA_NUM_BLADES = 32;
-public var CGA_MV_SIZE = 256;  # 32 * 8 bytes
+# CGA_NUM_BLADES and CGA_MV_SIZE: the enum CgaLayout, directly above cga_mv_zero (3.5.0).
 
 # Blade-to-bitmask table (e1=bit0, e2=bit1, e3=bit2, n0=bit3, ninf=bit4).
 # ⚠ This is the NULL bitmask space. `_cga_geo_bits` works in the ORTHONORMAL
@@ -9981,6 +10449,15 @@ fn _cga_geo_blades(a, b, packed) {
     return 0;
 }
 
+# The multivector's layout: CGA_NUM_BLADES = 2^5 blades, CGA_MV_SIZE = 32 * 8 bytes.
+# ⛔ 3.5.0 (K003) -- `public var` through 3.4.2, so a consumer could write the size every
+# multivector is allocated with. An enum member is a constant; reading them is unchanged. (It
+# sits directly above a public fn: cycc 6.6.2 / 6.6.3 export the declaration after a public
+# enum.)
+public enum CgaLayout {
+    CGA_NUM_BLADES = 32;
+    CGA_MV_SIZE = 256;
+}
 # Allocate a zero multivector
 public fn cga_mv_zero() {
     var mv = hisab_alloc(CGA_MV_SIZE);
@@ -11672,7 +12149,14 @@ public fn cga_translator(tx, ty, tz) {
 }
 
 # Rotor: R = cos(theta/2) - sin(theta/2) * (nz*e12 - ny*e13 + nx*e23)
-# Axis (ax, ay, az) is normalized internally.
+# Axis (ax, ay, az) is normalized internally. A NaN axis gives NaN in e12, e13 and e23; the
+# scalar part, cos(angle / 2), does not depend on the axis and stays as computed.
+# An exactly zero axis names no direction (3.5.0): where sin(angle / 2) is exactly 0 every axis
+# gives the scalar cos(angle / 2) alone, which is returned (the identity rotor for an angle of
+# +-0); otherwise the axis is taken as NaN and the answer is a NaN axis's, NaN in the bivector
+# beside cos(angle / 2) (su2_from_axis_angle's convention, the same row). A NaN angle has sin
+# NaN, so it reaches the NaN-axis lines and every slot the rotor writes is NaN.
+# 0 (no handle) for a refused allocation.
 public fn cga_rotor(ax, ay, az, angle) {
     # ⛔ 2.17.0 — THE 2.14.0 NOTE BELOW DESCRIBES A DEFECT THAT WAS STILL LIVE.
     # It reads "an absolute 1e-12 turned a real rotation into the identity rotor
@@ -11694,22 +12178,30 @@ public fn cga_rotor(ax, ay, az, angle) {
     # folded a NaN normal to the zero multivector, and this note called the
     # difference deliberate; 3.3.3 moved `cga_plane` to this test, so the two
     # siblings now share one NaN contract.
+    var half = f64_mul(angle, F64_HALF);
+    var c = f64_cos(half);
+    var s = f64_sin(half);
+    # ⛔ 3.5.0 -- A ZERO AXIS ANSWERED THE IDENTITY ROTOR AT EVERY ANGLE (AU2 2b): cga_rotor(0, 0,
+    # 0, pi/2) read as "no rotation", a plausible versor for a rotation that has no axis. Only
+    # sin(angle / 2) = 0 leaves the axis out of R, and then R = cos(angle / 2); otherwise the
+    # axis has no value, and the lines below run on a quiet NaN one, as for a NaN axis.
     if (f64_eq(norm, 0) == 1) {
-        # Degenerate axis: return identity
-        var mv = cga_mv_zero();
-        if (mv == 0) { return 0; }
-        cga_mv_set(mv, 0, F64_ONE);
-        return mv;
+        if (f64_eq(s, 0) == 1) {
+            var mv0 = cga_mv_zero();
+            if (mv0 == 0) { return 0; }
+            cga_mv_set(mv0, 0, c);
+            return mv0;
+        }
+        ax = 0x7FF8000000000000;    # a quiet NaN: the axis has no value
+        ay = 0x7FF8000000000000;    # a quiet NaN
+        az = 0x7FF8000000000000;    # a quiet NaN
+        norm = 0x7FF8000000000000;  # a quiet NaN
     }
     # ⚠ Divide, never multiply by `1 / norm` — a subnormal norm is reachable now
     # and its reciprocal is +Inf.
     var nx = f64_div(ax, norm);
     var ny = f64_div(ay, norm);
     var nz = f64_div(az, norm);
-
-    var half = f64_mul(angle, F64_HALF);
-    var c = f64_cos(half);
-    var s = f64_sin(half);
 
     var mv = cga_mv_zero();
     if (mv == 0) { return 0; }

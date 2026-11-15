@@ -11,13 +11,8 @@
 # compiling each module against exactly its listed set -- docs/architecture/overview.md,
 # "Module dependency manifest".)
 #
-# The half-edge mesh's "no such index" value: the `twin` of a boundary half-edge,
-# the `vertex_edge` of an isolated vertex, an empty slot in the twin-matching table
-# and an unassigned island index all read HALFEDGE_NONE. Public because callers of
-# `halfedge_from_triangles` read `twin` and `vertex_edge` through the public
-# `HalfEdge` / `HalfEdgeMesh` accessors and compare against it. (It was `_COL_SENTINEL` in collision_core,
-# which never used it, through 3.2.x.)
-public var HALFEDGE_NONE = 0x7FFF_FFFF_FFFF_FFFF;   # usize::MAX sentinel
+# The half-edge mesh's "no such index" value, HALFEDGE_NONE: the enum HalfEdgeIndex, above
+# `HalfEdge` in section 6 (an enum since 3.5.0; see there).
 
 # ================================================================
 # 2. Convex Hull 2D -- Andrew's Monotone Chain
@@ -2754,6 +2749,19 @@ fn _col_delaunay_2d(points, n) {
 #
 # Mesh handle: { half_edges (vec), vertex_edge (vec), face_edge (vec) } = 24 bytes
 
+# The half-edge mesh's "no such index" value: the `twin` of a boundary half-edge,
+# the `vertex_edge` of an isolated vertex, an empty slot in the twin-matching table
+# and an unassigned island index all read HALFEDGE_NONE. Public because callers of
+# `halfedge_from_triangles` read `twin` and `vertex_edge` through the public
+# `HalfEdge` / `HalfEdgeMesh` accessors and compare against it. (It was `_COL_SENTINEL` in collision_core,
+# which never used it, through 3.2.x.)
+# ⛔ 3.5.0 (K003) -- `public var` through 3.4.2: a consumer could write it, and every sentinel
+# test in the builder and the walks read the written value. An enum member is a constant. (It
+# sits directly above a public struct: cycc 6.6.2 / 6.6.3 export the declaration after a public
+# enum.)
+public enum HalfEdgeIndex {
+    HALFEDGE_NONE = 0x7FFF_FFFF_FFFF_FFFF;   # usize::MAX sentinel
+}
 #derive(accessors)
 public struct HalfEdge { vertex; face; next; twin; }
 
@@ -2943,6 +2951,21 @@ public fn halfedge_from_triangles(triangles, n_tris, n_verts) {
         }
     }
 
+    # ⭐ 3.5.0 -- EACH VERTEX RECORDS AN OUTGOING HALF-EDGE WITH NO TWIN WHERE IT HAS ONE
+    # (OpenMesh keeps its outgoing half-edge on the boundary for the same reason), so that
+    # halfedge_is_boundary answers for every fan of the vertex, not only the first one built.
+    # Through 3.4.2 the first outgoing half-edge was kept, and a non-manifold vertex (two fans
+    # meeting at it, a bowtie) whose first fan was closed read "interior" while its other fan
+    # was open. Every open fan has one: its outgoing half-edges h follow h -> twin(next(next(h)))
+    # (one-to-one, see halfedge_is_boundary), so a fan that is not a cycle is a chain, and its
+    # first half-edge is no step's image, which is to say it has no twin. Half-edge i runs from
+    # triangles[i].
+    for (var i3 = 0; i3 < n_he; i3 = i3 + 1) {
+        if (HalfEdge_twin(vec_get(half_edges, i3)) == HALFEDGE_NONE) {
+            vec_set(vertex_edge, vec_get(triangles, i3), i3);
+        }
+    }
+
     # Build mesh handle
     var mesh = hisab_alloc(sizeof(HalfEdgeMesh));
     if (mesh == 0) { return 0; }
@@ -2998,8 +3021,23 @@ public fn halfedge_adjacent_faces(mesh, face) {
 #          Err(HSB_ERR_INVALID_INPUT) if mesh is null, or if its twin links are not
 #            symmetric (a mesh edited after halfedge_from_triangles built it; see the walk),
 #          Err(HSB_ERR_OUT_OF_RANGE) if vertex is outside [0, n_verts)
-# "Boundary" is read on the fan the vertex's first outgoing half-edge lies in: a half-edge
-# of that fan, in or out, with no twin. A vertex no triangle uses answers Ok(0).
+# "Boundary" (3.5.0): a half-edge into or out of the vertex has no twin, on ANY of its fans, or
+# no triangle uses the vertex at all. Interior: every half-edge in and out of it has a twin.
+# The builder twins (a -> b) with one (b -> a) and at most one such pair per edge, so a
+# half-edge is twinless where its edge lies in one triangle only, where the edge's two
+# triangles run it the same way (an inconsistently oriented pair: every edge of an octahedron
+# with one face flipped lies in two triangles, and the flipped face's vertices answer Ok(1)),
+# or where three or more triangles share the edge. A non-manifold vertex whose fans are all
+# closed and consistently oriented (two cones meeting at their apex) has no twinless
+# half-edge, and answers Ok(0).
+# ⛔ 3.5.0 -- AN ISOLATED VERTEX WAS Ok(0), "interior" (AU2-G5-F8): one triangle (0, 1, 2) with
+# n_verts 4 answered vertex 3 as a caller cannot tell from a vertex inside a closed surface. A
+# vertex no face surrounds is not inside the surface, and OpenMesh's is_boundary(VertexHandle)
+# and CGAL's Surface_mesh::is_border(v) both answer true: Ok(1). AND a bowtie vertex was read
+# on its first fan only (CO F4): a closed fan first and an open one after read Ok(0). The
+# builder now records an outgoing half-edge with no twin where the vertex has one (see
+# halfedge_from_triangles), so the fan read below is an open one whenever any is. On a mesh
+# whose links were edited after the build the walk still reads the recorded fan only.
 #
 # Same unbounded index as halfedge_adjacent_faces above. Measured before this
 # guard on a 2-triangle / 4-vertex mesh:
@@ -3035,7 +3073,7 @@ public fn halfedge_is_boundary(mesh, vertex) {
     if (vertex >= vec_len(vertex_edge_vec)) { return Err(HSB_ERR_OUT_OF_RANGE); }
     var start = vec_get(vertex_edge_vec, vertex);
 
-    if (start == HALFEDGE_NONE) { return Ok(0); }
+    if (start == HALFEDGE_NONE) { return Ok(1); }   # no triangle uses it (3.5.0: Ok(0))
 
     # ⛔ 3.4.1 -- THE WALK WAS CAPPED AT 1000 STEPS AND ANSWERED Ok(0), "interior", WHEN IT
     # RAN OUT: an open fan around vertex 0 -- triangles (0,2,3), (0,1,2), then (0,k,k+1) for

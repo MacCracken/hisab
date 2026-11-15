@@ -245,20 +245,36 @@ fn _m4_w_scaled(p) {
 # relative, plus half a subnormal step where it is subnormal, and +-Inf where it overflows. An
 # exactly zero coordinate gives the zero 0 / w gives, signed as w is.
 fn _m4_point_exact(m, v) {
+    var q: i64[6];
+    var rc = _m4_point_parts(m, v, &q);
+    if (rc != 0) { return Err(rc); }
+    var res = hvec3_new(_m4_ldexp(load64(&q), load64(&q + 8)), _m4_ldexp(load64(&q + 16), load64(&q + 24)),
+      _m4_ldexp(load64(&q + 32), load64(&q + 40)));
+    if (res == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(res);
+}
+
+# `_m4_point_exact`'s quotients before their scaling (3.5.0, shared with
+# `m4_transform_point_frexp_checked`): component r of M (v, 1) / w is q[2 r] 2^q[2 r + 1], q[2 r]
+# the signed quotient of the two rounded sums (each in [1, 2^62], so the quotient is a normal
+# double), or the zero 0 / w gives (its power 0).
+# Returns 0, or HSB_ERR_INVALID_INPUT (a NaN or infinite entry) or HSB_ERR_DIVISION_BY_ZERO (w = 0
+# exactly).
+fn _m4_point_parts(m, v, q) {
     var dc: i64[80];
     var i = 0;
     while (i < 16) {
-        if ((load64(m + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { return Err(HSB_ERR_INVALID_INPUT); }
+        if ((load64(m + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { return HSB_ERR_INVALID_INPUT; }
         i = i + 1;
     }
     i = 0;
     while (i < 3) {
-        if ((load64(v + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { return Err(HSB_ERR_INVALID_INPUT); }
+        if ((load64(v + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) { return HSB_ERR_INVALID_INPUT; }
         i = i + 1;
     }
     # Row 3 zero: w = 0 for every point, refused without the sums.
     if (((load64(m + 24) | load64(m + 56) | load64(m + 88) | load64(m + 120)) & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
-        return Err(HSB_ERR_DIVISION_BY_ZERO);
+        return HSB_ERR_DIVISION_BY_ZERO;
     }
     i = 0;
     while (i < 16) { _m4_xdec(load64(m + i * 8), &dc + i * 32); i = i + 1; }
@@ -271,24 +287,24 @@ fn _m4_point_exact(m, v) {
     var tl: i64[12];
     var od: i64[2];
     var sw = _m4_xsum(&dc, &er, _m4_row_terms(&tl, 3), 4, 2, &od);
-    if (sw == 0) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
-    var q: i64[3];
+    if (sw == 0) { return HSB_ERR_DIVISION_BY_ZERO; }
     var oc: i64[2];
     var r = 0;
     while (r < 3) {
         var sc = _m4_xsum(&dc, &er, _m4_row_terms(&tl, r), 4, 2, &oc);
         var c = 0;
+        var k = 0;
         if (sw < 0) { c = 0x8000_0000_0000_0000; }   # an exact 0 over w: IEEE's 0 / w
         if (sc != 0) {
-            c = _m4_ldexp(f64_div(load64(&oc), load64(&od)), load64(&oc + 8) - load64(&od + 8));
+            c = f64_div(load64(&oc), load64(&od));
+            k = load64(&oc + 8) - load64(&od + 8);
             if (sc != sw) { c = c ^ 0x8000000000000000; }   # the sign bit: f64_neg gave +0 for +0 below cycc 6.6.8
         }
-        store64(&q + r * 8, c);
+        store64(q + r * 16, c);
+        store64(q + r * 16 + 8, k);
         r = r + 1;
     }
-    var res = hvec3_new(load64(&q), load64(&q + 8), load64(&q + 16));
-    if (res == 0) { return Err(HSB_ERR_ALLOC); }
-    return Ok(res);
+    return 0;
 }
 
 # The four terms m(r, c) v_c of row r of M (v, 1) into tl (`_m4_point_exact`); returns tl.
@@ -391,6 +407,42 @@ public fn m4_transform_point_checked(m, v) {
     }
     var res = hvec3_new(rx, ry, rz);
     if (res == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(res);
+}
+
+# Mat4 * Vec3 as a point, M (v, 1) divided by its w, as a significand vector and a power of two
+# (3.5.0): `Ok(q)`, with the point q 2^e and e written to *out_e, the largest |q_i| in [1, 2) (q
+# the zero vector, signed as 0 / w is, and e = 0 when every coordinate is 0). For a point whose
+# coordinates lie past the double range -- w not 0 but small against them -- which
+# `m4_transform_point_checked` can give only as +-Inf: its direction and every ratio stay in hand.
+# Every coordinate is summed exactly and divided as that function's exact path does: each q_i
+# within (3u + 3u^2) of the exact quotient times 2^-e, relative, plus 2^-1074 where |q_i| is below
+# 2^-1022 (never the largest). `Err(HSB_ERR_DIVISION_BY_ZERO)` exactly where w = 0,
+# `Err(HSB_ERR_INVALID_INPUT)` for a 0 handle (m, v or out_e) or a NaN or infinite entry of M or
+# v, `Err(HSB_ERR_ALLOC)` where the allocation is refused. Cost: always the exact path's sums.
+#must_use
+public fn m4_transform_point_frexp_checked(m, v, out_e) {
+    if (m == 0 || v == 0 || out_e == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var q: i64[6];
+    var rc = _m4_point_parts(m, v, &q);
+    if (rc != 0) { return Err(rc); }
+    # the largest component's binary exponent: each nonzero quotient is a normal double
+    var e = 0;
+    var any = 0;
+    var r = 0;
+    while (r < 3) {
+        var c = load64(&q + r * 16);
+        if ((c & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            var ec = ((c >> 52) & 0x7FF) - 1023 + load64(&q + r * 16 + 8);
+            if (any == 0 || ec > e) { e = ec; }
+            any = 1;
+        }
+        r = r + 1;
+    }
+    var res = hvec3_new(_m4_ldexp(load64(&q), load64(&q + 8) - e), _m4_ldexp(load64(&q + 16), load64(&q + 24) - e),
+      _m4_ldexp(load64(&q + 32), load64(&q + 40) - e));
+    if (res == 0) { return Err(HSB_ERR_ALLOC); }
+    store64(out_e, e);
     return Ok(res);
 }
 
@@ -1194,7 +1246,10 @@ public fn m4_from_srt(scale, rotation, translation) {
     return m;
 }
 
-# Orthographic projection (right-handed, OpenGL)
+# Orthographic projection (right-handed, OpenGL): (2 / (r - l), 2 / (t - b), -2 / (f - n)) on the
+# diagonal and the translation -((r + l) / (r - l), (t + b) / (t - b), (f + n) / (f - n)), each
+# negation a flip of the sign bit, so a symmetric frustum's zero translation is -0 on every pin
+# (3.5.0: `f64_neg` gave +0 for +0 below cycc 6.6.8, which the bundle's 6.6.3 floor admits).
 #must_use
 public fn m4_ortho_rh(left, right, bottom, top, near, far) {
     var m = m4_new();
@@ -1204,20 +1259,20 @@ public fn m4_ortho_rh(left, right, bottom, top, near, far) {
     var fn_ = f64_sub(far, near);
     m4_set(m, 0, 0, f64_div(F64_TWO, rl));
     m4_set(m, 1, 1, f64_div(F64_TWO, tb));
-    m4_set(m, 2, 2, f64_neg(f64_div(F64_TWO, fn_)));
-    m4_set(m, 3, 0, f64_neg(f64_div(f64_add(right, left), rl)));
-    m4_set(m, 3, 1, f64_neg(f64_div(f64_add(top, bottom), tb)));
-    m4_set(m, 3, 2, f64_neg(f64_div(f64_add(far, near), fn_)));
+    m4_set(m, 2, 2, f64_div(F64_TWO, fn_) ^ 0x8000_0000_0000_0000);
+    m4_set(m, 3, 0, f64_div(f64_add(right, left), rl) ^ 0x8000_0000_0000_0000);
+    m4_set(m, 3, 1, f64_div(f64_add(top, bottom), tb) ^ 0x8000_0000_0000_0000);
+    m4_set(m, 3, 2, f64_div(f64_add(far, near), fn_) ^ 0x8000_0000_0000_0000);
     m4_set(m, 3, 3, F64_ONE);
     return m;
 }
 
 # Perspective projection (right-handed, OpenGL): f = 1 / tan(fov_y / 2) (fov_y in radians), so
 # (f / aspect, f, (far + near) / (near - far), -1 into w, 2 far near / (near - far)), which maps
-# eye-space z = -near to NDC z = -1 and z = -far to +1: GL's [-1, 1] NDC depth, the convention
-# `world_to_screen_checked`'s depth and `linearize_depth` read. Unchecked: near = far divides by
-# zero (+-Inf entries), and near or far of 0 or a negative value give a matrix that is not a
-# perspective.
+# eye-space z = -near to NDC z = -1 and z = -far to +1: GL's [-1, 1] NDC depth, the range
+# `world_to_screen_checked` takes as `NDC_Z_MINUS_ONE_TO_ONE`, whose window depth `linearize_depth`
+# reads. Unchecked: near = far divides by zero (+-Inf entries), and near or far of 0 or a negative
+# value give a matrix that is not a perspective.
 # The tangent is the sin/cos quotient hisab's `f64_tan` computed until 3.3.4 (see
 # f64_util.cyr for why that fn is gone and why this is not `ganita_f64_tan` yet).
 #must_use
@@ -1238,8 +1293,9 @@ public fn m4_perspective_rh(fov_y, aspect, near, far) {
 # Reverse-Z infinite far-plane perspective: f = 1 / tan(fov_y / 2), (f / aspect, f, 0, -1 into
 # w, near into z): eye-space z = -d maps to NDC z = near / d, so the near plane is 1 and the
 # infinite far plane 0, a [0, 1] NDC depth (Direct3D / Vulkan's range), which
-# `linearize_depth_reverse_z` reads. Not GL's [-1, 1]: `world_to_screen_checked`'s depth assumes
-# that one (its doc says how to read reverse-Z depth).
+# `linearize_depth_reverse_z` reads. Not GL's [-1, 1]: give `world_to_screen_checked` the range
+# `NDC_Z_ZERO_TO_ONE` for this projection, and its depth is nz itself (3.5.0; through 3.4.2 that
+# function assumed GL's range for every projection).
 #must_use
 public fn m4_perspective_reverse_z(fov_y, aspect, near) {
     var half_fov = f64_mul(fov_y, F64_HALF);
@@ -1253,27 +1309,155 @@ public fn m4_perspective_reverse_z(fov_y, aspect, near) {
     return m;
 }
 
-# Look-at (right-handed)
+# The three components of (target - eye) x up, each summed exactly (`_m4_xsum`, four products of
+# two entries) and rounded once, written to c over a common power of two (each at most 2^62);
+# returns 1, or 0 where all three are exactly zero (up parallel to target - eye, or
+# zero). Every entry must be finite.
+fn _m4_look_side(eye, target, up, c) {
+    var dc: i64[36];
+    var i = 0;
+    while (i < 3) {
+        _m4_xdec(load64(target + i * 8), &dc + i * 32);
+        _m4_xdec(load64(eye + i * 8), &dc + (3 + i) * 32);
+        _m4_xdec(load64(up + i * 8), &dc + (6 + i) * 32);
+        i = i + 1;
+    }
+    var er: i64[2];
+    _m4_xrange(&dc, 9, &er);
+    # component k: t_j u_l - t_l u_j - e_j u_l + e_l u_j for (j, l) = (k + 1, k + 2) mod 3
+    var tl: i64[12];
+    var ox: i64[6];
+    var sg: i64[3];
+    var k = 0;
+    while (k < 3) {
+        var j = (k + 1) % 3;
+        var l = (k + 2) % 3;
+        store64(&tl, j); store64(&tl + 8, 6 + l); store64(&tl + 16, 0);
+        store64(&tl + 24, l); store64(&tl + 32, 6 + j); store64(&tl + 40, 1);
+        store64(&tl + 48, 3 + j); store64(&tl + 56, 6 + l); store64(&tl + 64, 1);
+        store64(&tl + 72, 3 + l); store64(&tl + 80, 6 + j); store64(&tl + 88, 0);
+        store64(&sg + k * 8, _m4_xsum(&dc, &er, &tl, 4, 2, &ox + k * 16));
+        k = k + 1;
+    }
+    if ((load64(&sg) | load64(&sg + 8) | load64(&sg + 16)) == 0) { return 0; }
+    # out[0] is a double holding the rounded significand, in [1, 2^62], and out[1] its scale: over
+    # the largest scale every component is at most 2^62 and the one that sets it at least 1
+    var top = 0 - 100000;
+    k = 0;
+    while (k < 3) {
+        if (load64(&sg + k * 8) != 0 && load64(&ox + k * 16 + 8) > top) { top = load64(&ox + k * 16 + 8); }
+        k = k + 1;
+    }
+    k = 0;
+    while (k < 3) {
+        var v = 0;
+        if (load64(&sg + k * 8) != 0) {
+            v = _m4_ldexp(load64(&ox + k * 16), load64(&ox + k * 16 + 8) - top);
+            if (load64(&sg + k * 8) < 0) { v = v ^ 0x8000_0000_0000_0000; }
+        }
+        store64(c + k * 8, v);
+        k = k + 1;
+    }
+    return 1;
+}
+
+# The right-handed view matrix of a camera at `eye` looking at `target` with `up` the upward
+# direction, as `Ok(m)`: rows s, u and -f of its rotation and the translation (-s . eye, -u . eye,
+# f . eye), with f = (target - eye) / |target - eye| (forward), s = ((target - eye) x up) / |...|
+# (right) and u = s x f, so eye maps to the origin and target onto the -z axis. Each component
+# of target - eye is rounded once (a difference that overflows is formed from halves, exactly
+# enough to keep its direction), and each component of (target - eye) x up is summed exactly from
+# its four products and rounded once, so s is the normalised exact side vector however nearly
+# parallel up is (3.4.2 crossed up with the rounded f: its s carried u / sin(angle) of relative
+# error). `Err(HSB_ERR_DEGENERATE)` where no view basis exists: eye = target (no forward), or up
+# parallel to target - eye or zero (no side), decided exactly. `Err(HSB_ERR_INVALID_INPUT)` for a
+# NaN or infinite component or a 0 handle; `Err(HSB_ERR_ALLOC)` where an allocation is refused.
+# Measured against the exact basis (Fraction differences and cross products, 60-digit roots; u =
+# 2^-53), the largest errors seen, not bounds: every rotation entry within 3.5 u on 4,200 cameras
+# (random, up within 1e-6 of parallel, coordinates scaled by 2^-1000 to 2^1000, differences past
+# DBL_MAX; an independent sample of random cameras reached 4.09 u), each translation component
+# within 5.3 u |eye| of the exact one wherever that one is finite, and every Err exactly where the
+# exact basis is undefined. On the same cameras 3.4.2 answered all 398 undefined bases with a
+# matrix, was non-finite for all 300 overflowing differences, and up to 70 u off with up nearly
+# parallel.
+# [measured: scratch lagen.py / lachk.py, both trees, seeds 3 and 4, 2026-11-14; cycc 6.7.18]
+# [measured: the 3.5.0 lane L6 review's random cameras, 2026-11-14; cycc 6.7.18]
+# A translation component is +-Inf exactly where the exact one is past DBL_MAX: a dot product whose
+# partial sum overflows is taken again with eye halved (`_m4_dot_eye`). Through the first review it
+# was not, and on 900 cameras with eye and target near +-1.7e308, 33 finite translations came back
+# +-Inf; now none, within 3.3 u |eye|, and every one the first form answered finitely keeps its bits.
+# [measured: scratch la.py (Fraction oracle), the first review tree and this one, seeds 1-3, 2026-11-14; cycc 6.7.18]
+# Cost: three exact sums and two normalisations, 616 -> 2,014 ns (3.3x) against 3.4.2's
+# `m4_look_at_rh`, a matrix a camera builds once a frame.
+# [measured: scratch bench/ab.cyr, 3.4.2 and this tree interleaved x 6, taskset, 2026-11-14; noisy, 8 lanes]
+# ⛔ 3.5.0 — REPLACES `m4_look_at_rh` (roadmap [3.5.0] AU2-G7-F6), WHICH RETURNED A RANK-DEFICIENT
+# MATRIX for both: eye = target = (1, 2, 3) gave a rotation block of zeros, and eye 0, target (0,
+# 5, 0), up (0, 1, 0) zero rows s and u (`hvec3_normalize(0)` is the zero vector). No matrix is
+# the view of an undefined basis. Retired, not redefined.
 #must_use
-public fn m4_look_at_rh(eye, target, up) {
-    var d = hvec3_sub(target, eye);
-    if (d == 0) { return 0; }
-    var f = hvec3_normalize(d);
-    if (f == 0) { return 0; }
-    var sc = hvec3_cross(f, up);
-    if (sc == 0) { return 0; }
-    var s = hvec3_normalize(sc);
-    if (s == 0) { return 0; }
-    var u = hvec3_cross(s, f);
-    if (u == 0) { return 0; }
+public fn m4_look_at_rh_checked(eye, target, up) {
+    if (eye == 0 || target == 0 || up == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var i = 0;
+    while (i < 3) {
+        if ((load64(eye + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000
+          || (load64(target + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000
+          || (load64(up + i * 8) & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) {
+            return Err(HSB_ERR_INVALID_INPUT);
+        }
+        i = i + 1;
+    }
+    var d: i64[3];
+    var big = 0;
+    i = 0;
+    while (i < 3) {
+        var di = f64_sub(load64(target + i * 8), load64(eye + i * 8));
+        if ((di & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { big = 1; }
+        store64(&d + i * 8, di);
+        i = i + 1;
+    }
+    if (big == 1) {
+        i = 0;
+        while (i < 3) {
+            var hd = f64_sub(f64_mul(load64(target + i * 8), F64_HALF), f64_mul(load64(eye + i * 8), F64_HALF));
+            store64(&d + i * 8, hd);
+            i = i + 1;
+        }
+    }
+    # eye = target makes every product of the exact side vector cancel too: one test refuses both
+    var c: i64[3];
+    if (_m4_look_side(eye, target, up, &c) == 0) { return Err(HSB_ERR_DEGENERATE); }
+    var f = hvec3_normalize(&d);
+    if (f == 0) { return Err(HSB_ERR_ALLOC); }
+    var s = hvec3_normalize(&c);
+    if (s == 0) { return Err(HSB_ERR_ALLOC); }
+    var u: i64[3];
+    hvec3_cross_into(&u, s, f);
     var m = m4_new();
-    if (m == 0) { return 0; }
+    if (m == 0) { return Err(HSB_ERR_ALLOC); }
     m4_set(m, 0, 0, HVec3_x(s)); m4_set(m, 1, 0, HVec3_y(s)); m4_set(m, 2, 0, HVec3_z(s));
-    m4_set(m, 0, 1, HVec3_x(u)); m4_set(m, 1, 1, HVec3_y(u)); m4_set(m, 2, 1, HVec3_z(u));
-    m4_set(m, 0, 2, f64_neg(HVec3_x(f))); m4_set(m, 1, 2, f64_neg(HVec3_y(f))); m4_set(m, 2, 2, f64_neg(HVec3_z(f)));
-    m4_set(m, 3, 0, f64_neg(hvec3_dot(s, eye)));
-    m4_set(m, 3, 1, f64_neg(hvec3_dot(u, eye)));
-    m4_set(m, 3, 2, hvec3_dot(f, eye));
+    m4_set(m, 0, 1, HVec3_x(&u)); m4_set(m, 1, 1, HVec3_y(&u)); m4_set(m, 2, 1, HVec3_z(&u));
+    m4_set(m, 0, 2, HVec3_x(f) ^ 0x8000_0000_0000_0000);   # the sign bit: f64_neg gave +0 for +0 below cycc 6.6.8
+    m4_set(m, 1, 2, HVec3_y(f) ^ 0x8000_0000_0000_0000);
+    m4_set(m, 2, 2, HVec3_z(f) ^ 0x8000_0000_0000_0000);
+    m4_set(m, 3, 0, _m4_dot_eye(s, eye) ^ 0x8000_0000_0000_0000);
+    m4_set(m, 3, 1, _m4_dot_eye(&u, eye) ^ 0x8000_0000_0000_0000);
+    m4_set(m, 3, 2, _m4_dot_eye(f, eye));
     m4_set(m, 3, 3, F64_ONE);
-    return m;
+    return Ok(m);
+}
+
+# a . eye for a unit a and a finite eye (`m4_look_at_rh_checked`'s translation): `hvec3_dot`, or,
+# where a partial sum overflowed though the dot need not (|a . eye| <= |eye|, which can sit below
+# DBL_MAX with two products' sum above it), twice the dot with eye halved. Halved, no partial sum
+# passes 0.87 DBL_MAX, and the dot is the same bits over 2 (a component of eye below 2^-1021 aside,
+# which loses at most 2^-1075 beside a sum near DBL_MAX); doubled, +-Inf only where the exact dot
+# itself is past the range.
+fn _m4_dot_eye(a, eye) {
+    var r = hvec3_dot(a, eye);
+    if ((r & 0x7FFF_FFFF_FFFF_FFFF) < 0x7FF0_0000_0000_0000) { return r; }
+    var h: i64[3];
+    store64(&h, f64_mul(HVec3_x(eye), F64_HALF));
+    store64(&h + 8, f64_mul(HVec3_y(eye), F64_HALF));
+    store64(&h + 16, f64_mul(HVec3_z(eye), F64_HALF));
+    return f64_mul(hvec3_dot(a, &h), F64_TWO);
 }

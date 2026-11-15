@@ -88,12 +88,34 @@ SHAPES = [
     ('a number past the head',    'enum _ZA {\n    _ZA_X = %s;   # the mask for the scale 2.0\n}\n', 1, 0),
     ('var, the word mask',        'var _ZA_X = %s;   # 2.0, the scale the mask leaves\n', 1, 1),
     ('var, the word hash',        'var _ZA_X = %s;   # 2.0 (the hash seed)\n', 1, 1),
+    # 3.5.0 L8: function-local constants, and a bare hex f64 with no comment anywhere.
+    ('local var',                 'fn _zf() {\n    var x = %s;   # 2.0\n    return x;\n}\n', 1, 1),
+    ('local assignment',          'fn _zf() {\n    var x = 0;\n    x = %s;   # 2.0\n    return x;\n}\n', 1, 1),
+    ('assignment, comment above', 'fn _zf() {\n    var x = 0;\n    # 2.0\n    x = %s;\n    return x;\n}\n', 1, 1),
+    ('assignment in an if',       'fn _zf(w) {\n    var x = 0;\n    if (w < 1) {\n        x = %s;   # 2.0\n    }\n'
+                                  '    return x;\n}\n', 1, 1),
+    ('local var, no comment',     'fn _zf() {\n    var x = %s;\n    return x;\n}\n', 1, 0),
+    ('assignment, no comment',    'fn _zf() {\n    var x = 0;\n    x = %s;\n    return x;\n}\n', 1, 0),
+    ('global var, no comment',    'var _ZA_X = %s;\n', 1, 0),
+    # 3.5.0 L8 (review): a hex f64 inside an expression, its comment one whole value.
+    ('in an expression',          'fn _zf(w) {\n    return f64_mul(w, %s);   # 2.0\n}\n', 1, 1),
+    ('in an assignment\'s call',  'fn _zf(w) {\n    w = f64_mul(w, %s);   # 2^1\n    return w;\n}\n', 1, 1),
+    ('in a comparison',           'fn _zf(w) {\n    if (w < %s) { return 1; }   # 2.0\n    return 0;\n}\n', 1, 1),
+    ('in an expression, a fraction', 'fn _zf(w) {\n    return f64_mul(w, %s);   # 4/2\n}\n', 1, 1),
+    # Not read, and said so: an expression line whose comment says more than one value, or whose
+    # code holds two payloads (the comment cannot say which it means).
+    ('in an expression, prose',   'fn _zf(w) {\n    return f64_mul(w, %s);   # twice w\n}\n', 0, 1),
+    ('in an expression, two values', 'fn _zf(w) {\n    return f64_mul(w, %s);   # 2.0; 2^-1062\n}\n', 0, 1),
+    ('in an expression, a product', 'fn _zf(w) {\n    return f64_mul(w, %s);   # 4 2^-1\n}\n', 0, 1),
+    ('two payloads in one line',  'fn _zf(w) {\n    return f64_add(f64_mul(w, %s), 0x3FF0000000000000);   # 2.0\n}\n',
+                                  0, 1),
 ]
 # Prose: bits, not a value, in a comment with no value: skipped, whatever the bits.
 PROSE = [
     ('a mask',            'enum _ZA {\n    _ZA_X = %s;   # the sign-bit mask\n}\n'),
     ('an integer',        'enum _ZA {\n    _ZA_X = %s;   # an integer sentinel\n}\n'),
     ('a NaN, with `_m3`', 'enum _ZA {\n    _ZA_X = %s;   # a NaN\'s bits, never a result of `_m3_wscale`\n}\n'),
+    ('a local mask',      'fn _zf() {\n    var x = 0;\n    x = %s;   # the sign-bit mask\n    return x;\n}\n'),
 ]
 def gate_rc(src):
     with tempfile.TemporaryDirectory() as d:
@@ -132,6 +154,62 @@ n += 1
 if rc != 0:
     print('  selftest: an `enum` in a comment or string fired')
     bad += 1
+# 3.5.0 L8: UNCOMMENTED_ALLOW holds only on the real tree, so it is tested on a copy of it, floors
+# on: the copy passes; one more bare hex f64 with no comment fails; a listed site removed (its
+# entry then stale) fails.
+import glob, re, shutil
+root = os.path.dirname(os.path.dirname(os.path.abspath(gate)))
+def tree_rc(edit):
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copytree(root + '/src', d + '/src')
+        os.mkdir(d + '/scripts')
+        shutil.copy(gate, d + '/scripts/check-constants.sh')
+        edit(d)
+        return subprocess.run(['bash', d + '/scripts/check-constants.sh'], capture_output=True, text=True).returncode
+def add_bare(d):
+    with open(d + '/src/f64_util.cyr', 'a') as f:
+        f.write('\nfn _zz_bare() {\n    var q = 0x3FF0_0000_0000_0001;\n    return q;\n}\n')
+def drop_listed(d):
+    p = d + '/src/ode.cyr'
+    t = open(p).read()
+    t2 = re.sub(r'(?m)^(\s*)var dfdy = 0x7FF8000000000000;\s*$', r'\1var dfdy = 0x7FF8000000000000;   # a NaN',
+                t, count=1)
+    if t2 == t: raise SystemExit('  selftest: the listed ode.cyr site to drop is gone; update this arm')
+    open(p, 'w').write(t2)
+def drop_one_of_two(d):
+    p = d + '/src/geo.cyr'
+    t = open(p).read()
+    t2 = re.sub(r'(?m)^(\s*)m = 0x0010_0000_0000_0000;\s*$', r'\1m = 0x0010_0000_0000_0000;   # 2^-1022', t, count=1)
+    if t2 == t: raise SystemExit('  selftest: the listed geo.cyr pair is gone; update this arm')
+    open(p, 'w').write(t2)
+def calc_plant(d):
+    p = d + '/src/calc.cyr'
+    t = open(p).read()
+    t2 = t.replace('w = f64_mul(w, 0x4BF0000000000000);', 'w = f64_mul(w, 0x4BF0000000000001);', 1)
+    if t2 == t: raise SystemExit('  selftest: the calc.cyr 2^192 site is gone; update this arm')
+    open(p, 'w').write(t2)
+def expr_comments_dropped(d):
+    # Every expression line's trailing comment gone: no site is wrong, but EXPR reads none, so only
+    # its floor can see that the arm went blind.
+    lone = re.compile(r'^\s*(?:public\s+)?(?:var\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*0[xX][0-9A-Fa-f_]+\s*[;,]?\s*(#|$)')
+    for p in glob.glob(d + '/src/*.cyr'):
+        out = []
+        for line in open(p).read().split('\n'):
+            code, sep, _ = line.partition('#')
+            if sep and '(' in code and not lone.match(line) and re.search(r'0[xX][0-9A-Fa-f_]{14,}', code):
+                line = code.rstrip()
+            out.append(line)
+        open(p, 'w').write('\n'.join(out))
+for name, edit, want in (('the tree as it stands', lambda d: None, 0), ('a new bare hex f64', add_bare, 1),
+                         ('every expression comment dropped (the floors)', expr_comments_dropped, 1),
+                         ('a listed site commented (stale entry)', drop_listed, 1),
+                         ('one of a listed pair commented (count below its entry)', drop_one_of_two, 1),
+                         ("the review's plant, calc.cyr's 2^192 one bit off", calc_plant, 1)):
+    rc = tree_rc(edit)
+    n += 1
+    if (rc != 0) != bool(want):
+        print('  selftest: tree copy, %s: rc %d' % (name, rc))
+        bad += 1
 print('  selftest: %d verdicts, %d wrong: %s' % (n, bad, 'PASS' if bad == 0 else 'FAIL'))
 sys.exit(1 if bad else 0)
 SELFEOF
@@ -164,6 +242,52 @@ DECL = re.compile(r'^\s*(?:public\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX
 # no trailing comment AND the immediately preceding line is a comment.
 DECL_NC = re.compile(r'^\s*(?:public\s+)?var\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*$')
 COMMENT_ONLY = re.compile(r'^\s*#\s*(.*?)\s*$')
+# ⛔ 3.5.0 L8 -- A FUNCTION-LOCAL CONSTANT WAS INVISIBLE TWO WAYS. DECL wants `var`, so an
+# ASSIGNMENT in a function body (`sc = 0x3BF0000000000000;   # 2^-64` in calc.cyr's
+# _calc_cbrt_start) was never read, and a declaration with no comment, on its line or the one
+# above, matched neither DECL nor the fallback and was not even counted: 15 of 350 wrong
+# constants planted by review R4-SYM passed there. ASSIGN reads the assignment exactly as DECL
+# reads the declaration (outside an enum body, where the same shape is a member, read by
+# scan_enums), and a bare hex f64 with no comment at all now FAILS unless UNCOMMENTED_ALLOW
+# names it: a comment is the only statement of what the bits mean.
+# [measured: ./scripts/check-constants.sh --selftest and the L8 plant sweep, scratch copies, 2026-11-14]
+ASSIGN = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*#\s*(.*?)\s*$')
+ASSIGN_NC = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0[xX][0-9A-Fa-f_]{1,25})\s*;\s*$')
+# Bare hex f64 payloads with no comment that the tree holds today, by (file, name, literal), with
+# their count: each holds bits, not a value (a mask, +Inf, a NaN, an FNV offset basis), and a
+# one-line comment saying so would let its entry go. A site not listed, or a count that differs
+# from the tree's, fails the gate, so the list cannot go stale. Not applied under --root.
+UNCOMMENTED_ALLOW = {
+    ('src/calc_ext.cyr', 'pmn', '0x7FF0_0000_0000_0000'): 1,
+    ('src/geo.cyr', 'm', '0x0010_0000_0000_0000'): 2,
+    ('src/geo_advanced.cyr', 'mant', '0x0010_0000_0000_0000'): 1,
+    ('src/geo_advanced.cyr', 'mnb', '0x7FF0_0000_0000_0000'): 1,
+    ('src/lie.cyr', 'sgn', '0x8000000000000000'): 1,
+    ('src/linalg_ext.cyr', 'hi', '0x7FF0_0000_0000_0000'): 1,
+    ('src/num_ext.cyr', 's', '0x8000000000000000'): 1,
+    ('src/ode.cyr', 'dfdy', '0x7FF8000000000000'): 1,
+    ('src/symbolic_ext.cyr', 'h', '0xCBF2_9CE4_8422_2325'): 1,
+}
+# ⛔ 3.5.0 L8 (review of lane L8) -- AND A HEX f64 INSIDE AN EXPRESSION WAS NOT READ AT ALL:
+# `w = f64_mul(w, 0x4BF0000000000001);   # 2^192`, one line above the assignment the roadmap row
+# names in calc.cyr, passed with its last bit wrong. EXPR reads such a line when its code holds
+# exactly ONE hex f64 payload and its trailing comment is, whole, one value (`# 2^192`, `# 31/32`):
+# a comment on an expression line describes the line, so one that is anything more (`# 6 2^-53`,
+# `# 2^-48 = 16 eps; 2^-1062`, `# (1 - 2^-40) 2^1024`, prose) is not taken for the literal's value,
+# and a line with two payloads is not read; both are counted. On the 3.5.0 L8 tree it read 179
+# sites: 178 agreed and one did not, geo_advanced.cyr's rmin, listed in EXPR_KNOWN until 3.5.0 settled
+# it (the bits, 2^-44, were the right floor; the comment was corrected).
+# [measured: ./scripts/check-constants.sh -v on the 3.5.0 L8 tree, 2026-11-14]
+EXPR = re.compile(r'^(\s*[^#\s][^#]*?)\s*#\s*(.*?)\s*$')
+HEXLIT = re.compile(r'0[xX][0-9A-Fa-f_]{1,25}')
+# Expression sites whose bits disagree with their comment, found by EXPR and not repaired with it,
+# by (file, literal, comment) with their count: each is a defect reported for its owner to settle.
+# It is printed on every run; the gate fails when one is repaired (its entry then stale) or when
+# any other site disagrees. Not applied under --root.
+# Empty since 3.5.0: its one entry, 3.4.1's collision `rmin` (bits 2^-44 under a `# 2^-41` comment),
+# was settled by a sweep against exact depths (tests/modules_c.tcyr, group "3.5.0 collision: the round
+# core's least ball"): the bits were right and the comment is corrected.
+EXPR_KNOWN = {}
 # ⭐ 3.3.7 -- AND THE HEX MEMBERS OF A MULTI-LINE ENUM. An enum member is an immediate where
 # a `var` is a load (CLAUDE.md, "Enums for constants"), and 3.3.7 moved geo.cyr's `_GEO_*`
 # constants and calc_integral_gauss5's nodes and weights into enums. A member is read only
@@ -670,6 +794,11 @@ def scan_enums(path, lines):
         check_one(path, last, name, mm.group(2), cmt, True)
     return covered
 
+# 3.5.0 L8: function-local constants read (a `var` in a function body, or an assignment), and the
+# bare hex payloads with no comment, by (file, name, literal).
+local_seen = 0
+uncommented = {}
+expr_read, expr_multi, expr_prose, expr_known = 0, 0, 0, {}
 for path in sorted(glob.glob('src/*.cyr')):
     prev_comment = None
     lines = open(path, encoding='utf-8', errors='replace').readlines()
@@ -678,14 +807,38 @@ for path in sorted(glob.glob('src/*.cyr')):
         if lineno in in_enum:
             prev_comment = None
             continue
-        m = DECL.match(line)
+        m = DECL.match(line) or ASSIGN.match(line)
+        if not m and not DECL_NC.match(line) and not ASSIGN_NC.match(line):
+            mx = EXPR.match(line)
+            hx = [h for h in HEXLIT.findall(mx.group(1)) if hex_payload(h)] if mx else []
+            if hx:
+                cm = mx.group(2)
+                whole = cm.lower().lstrip('+-') in ('inf', 'infinity') or (
+                    '=' not in cm and '...' not in cm and '\u2026' not in cm and eval_exact(cm) is not None)
+                if not whole:
+                    expr_prose += 1
+                elif len(hx) > 1:
+                    expr_multi += 1
+                else:
+                    expr_read += 1
+                    n_err = len(errors)
+                    check_one(path, lineno, '<expr>', hx[0], cm, False)
+                    key = (path, hx[0], cm)
+                    if len(errors) > n_err and floors and key in EXPR_KNOWN:
+                        errors.pop()
+                        results.pop()
+                        expr_known.setdefault(key, []).append(lineno)
+                prev_comment = None
+                continue
         if not m:
             # Fallback: a declaration documented on the line ABOVE. See DECL_NC.
-            mn = DECL_NC.match(line)
+            mn = DECL_NC.match(line) or ASSIGN_NC.match(line)
             if mn and prev_comment:
                 name, hexlit, comment = mn.group(1), mn.group(2), prev_comment
                 m = None
             else:
+                if mn and hex_payload(mn.group(2)):
+                    uncommented.setdefault((path, mn.group(1), mn.group(2)), []).append(lineno)
                 c = COMMENT_ONLY.match(line)
                 prev_comment = c.group(1) if c else None
                 continue
@@ -694,7 +847,23 @@ for path in sorted(glob.glob('src/*.cyr')):
         prev_comment = None
         if not hex_payload(hexlit):   # short masks/flags, not f64 payloads
             continue
+        if line[:1].isspace() or not re.match(r'\s*(?:public\s+)?var\b', line):
+            local_seen += 1
         check_one(path, lineno, name, hexlit, comment, False)
+
+# A bare hex f64 with no comment fails unless UNCOMMENTED_ALLOW names it, at its exact count; under
+# --root (the selftest's planted trees) nothing is allowed and nothing can be stale.
+uncommented_errors = []
+for key, sites in sorted(uncommented.items()):
+    want = UNCOMMENTED_ALLOW.get(key, 0) if floors else 0
+    if len(sites) != want:
+        uncommented_errors.append((key, sites, want))
+if floors:
+    for key, want in sorted(UNCOMMENTED_ALLOW.items()):
+        if key not in uncommented:
+            uncommented_errors.append((key, [], want))
+known_errors = [(k, expr_known.get(k, []), w) for k, w in sorted(EXPR_KNOWN.items())
+                if floors and len(expr_known.get(k, [])) != w]
 
 # ---------------------------------------------------------------------------
 # DUPLICATE GLOBALS. Cyrius has ONE flat namespace and last-definition-wins, so
@@ -728,7 +897,7 @@ for path in sorted(glob.glob('src/*.cyr')):
 # emptied by a mechanical edit while still printing "no duplicates" is the defect
 # this block just had. Raise it when globals are added; lower it only with a
 # reason in the commit (3.3.2 deletes the dead `_COL_*` globals and will).
-GLOBAL_FLOOR = 327   # column-0 globals in src/; 221 -> 211 in 3.3.2: D063 deleted 10 dead _COL_* globals
+GLOBAL_FLOOR = 309   # column-0 globals in src/; 221 -> 211 in 3.3.2: D063 deleted 10 dead _COL_* globals
                      # 211 -> 218 in 3.3.3: _IVL_F64_MAX/_IVL_F64_NEG_MAX (D021), four _GA_TOI_* (the
                      # time_of_impact normal), _NUMX_F64_INV_2P64 (num_sobol's 64-bit domain)
                      # 218 -> 321 in 3.4.1 SYM4: the floor had not followed the population, this
@@ -737,6 +906,14 @@ GLOBAL_FLOOR = 327   # column-0 globals in src/; 221 -> 211 in 3.3.2: D063 delet
                      # _einsum_arena for _einsum_top (an array has no `=`, so _EINSUM_SCRATCH is not counted)
                      # 320 -> 327 at the 3.4.1 close: the last passes' new globals (_GA_REFUSED and the
                      # ball-by-the-rim reading), this script's own count on the merged tree [measured: 2026-11-01]
+                     # 327 -> 308 in 3.5.0 (K003): the 3.4.2 tree counts 332; the 23 public constants that
+                     # became enum members (GEO_FACE_*, GEO_CAP_* x4, GEO_JET_* x7, GJK_/EPA_MAX_ITER,
+                     # CGA_NUM_BLADES, CGA_MV_SIZE, HALFEDGE_NONE, EPSILON_F64, F64_TINY, F64_POS_INF,
+                     # AD_NONE, AD_FULL) and _NUMX_DFT_MAX have no column-0 `var`; no global was added and
+                     # nothing else stopped matching (set difference of the GLOBAL_DECL matches, 3.4.2 vs
+                     # the merged 3.5.0 tree) [measured: 2026-11-14]
+                     # 308 -> 309 at the 3.5.0 close: wave 2's _ODE_F64_2_POW_M52 (ode.cyr), the only
+                     # difference from the merged wave-1 tree [measured: this script's own count, 2026-11-14]
 global_population = sum(len(v) for v in seen_globals.values())
 if floors and global_population < GLOBAL_FLOOR:
     print(f"\n!! DUPLICATE-GLOBAL SCAN SHRANK: {global_population} declarations seen, floor is {GLOBAL_FLOOR}.")
@@ -768,7 +945,28 @@ if dup_errors:
 total = len(results)
 bad = len(errors)
 print(f"=== constant check: {total - bad}/{total} verified, {len(skipped)} skipped "
-      f"({enum_seen} hex enum members read, {len(undecodable)} unreadable) ===")
+      f"({enum_seen} hex enum members read, {len(undecodable)} unreadable; {local_seen} function-local, "
+      f"{sum(len(s) for s in uncommented.values())} with no comment; {expr_read} in expressions, "
+      f"{sum(len(s) for s in expr_known.values())} of them known to disagree; not read: {expr_prose} expression "
+      f"lines whose comment is more than a value, {expr_multi} with two payloads) ===")
+
+for (p, h, c), sites in sorted(expr_known.items()):
+    print(f"  KNOWN, not repaired here: {', '.join(f'{p}:{l}' for l in sites)} {h} disagrees with its comment "
+          f"`# {c}` (EXPR_KNOWN)")
+if known_errors:
+    print(f"\n!! {len(known_errors)} EXPR_KNOWN ENTR(Y/IES) NO LONGER MATCH THE TREE\n")
+    for (p, h, c), sites, want in known_errors:
+        print(f"  {p} {h} `# {c}`: {len(sites)} disagreeing in the tree, {want} listed")
+    print("\nA listed disagreement that was repaired leaves a stale entry: delete it from EXPR_KNOWN.")
+
+if uncommented_errors:
+    print(f"\n!! {len(uncommented_errors)} BARE HEX f64 SITE(S) WITH NO COMMENT DISAGREE WITH UNCOMMENTED_ALLOW\n")
+    for (p, n, h), sites, want in uncommented_errors:
+        where = ', '.join(f"{p}:{l}" for l in sites) or p
+        print(f"  {where} {n} = {h}: {len(sites)} in the tree, {want} allowed")
+    print("\nA hex f64 with no comment states nothing the gate can check (3.5.0 L8): give it a comment")
+    print("on its line or the line above -- its value, or, for bits, what they are (a mask, a NaN) --")
+    print("or, when a site the list names has gone, delete its entry in UNCOMMENTED_ALLOW.")
 
 if undecodable:
     print(f"\n!! {len(undecodable)} ENUM MEMBER(S) HOLD A HEX f64 THIS GATE CANNOT CHECK\n")
@@ -800,7 +998,7 @@ if errors:
     print("A constant that disagrees with its own comment is a defect: the comment states")
     print("the intent and the bit pattern is what ships. Re-encode from the exact value.")
     sys.exit(1)
-if undecodable:
+if undecodable or uncommented_errors or known_errors:
     sys.exit(1)
 
 # ⛔ POPULATION FLOOR (3.1.0). This gate has now been caught TWICE reporting a
@@ -826,9 +1024,19 @@ POPULATION_FLOOR = 214   # 161 verified + 1 skipped; 164 -> 156 in 3.3.2: 8 of D
 # 305 -> 340, 294 -> 321, 80 -> 105 in 3.4.1 SYM4: the floors had fallen 10 enum members behind the
 # tree, room for the 7 a plant hid, so each is the count again. [measured: this script's own count
 # on the merged 3.4.1 tree, 321 verified + 19 skipped, 105 hex enum members, 2026-11-01]
-POPULATION_FLOOR = 346
-VERIFIED_FLOOR = 324
-ENUM_MEMBER_FLOOR = 108
+# 346 -> 528, 324 -> 505 in 3.5.0 L8: the floors now count the function-local constants (29) and
+# the expression sites (178 verified, one in EXPR_KNOWN) the two new arms read, so either arm going
+# blind drops the totals below them (the selftest's "every expression comment dropped" arm).
+# [measured: this script's own count on the 3.5.0 L8 tree, 505 verified + 23 skipped, 108 hex enum
+# members, 29 function-local, 179 in expressions, 2026-11-14]
+# 528 -> 613, 505 -> 572, 108 -> 156 at the 3.5.0 close: the merged tree after both repair waves and
+# their reviews, the floors the count again. The lanes' new hex constants and enum members
+# (EPSILON_F64, F64_TINY and F64_POS_INF, now members of HsbF64, among them) raise all three.
+# [measured: this script's own count on the final 3.5.0 tree, 572 verified + 41 skipped, 156 hex
+# enum members, 39 function-local, 208 in expressions, 2026-11-14]
+POPULATION_FLOOR = 613
+VERIFIED_FLOOR = 572
+ENUM_MEMBER_FLOOR = 156
 population = total + len(skipped)
 if not floors:
     sys.exit(0)

@@ -1220,7 +1220,12 @@ fn _lext_kresid(ax, bs, n, rt) {
 #          once for b = 0, the exact solution. ⚠ As GMRES's: the true residual is formed
 #          in f64 (at tol 1e-15 on 30 random 12 x 12, seed 2, 8 of 29 Ok answers sit over
 #          tol ||b|| by its rounding, worst 2.61 times; at 1e-14, 1 at 1.34; the recurrence
-#          alone gave 15 of 30 at up to 1780 times, and 6 at up to 178).
+#          alone gave 15 of 30 at up to 1780 times, and 6 at up to 178). 3.5.0: that excess is
+#          A_fn's own rounding, not the confirmation's: on 3,000 Ok answers (12 x 12, A = U(-1, 1) +
+#          4 I, tol 1e-14 and 1e-15) 20 have ||b - A x|| over tol ||b|| with A exact (worst 1.08
+#          times), and none has b - fl(A x) over it, A_fn's own product taken exactly. No check
+#          that sees only A_fn's output can see past its rounding.
+#          [measured: scratch_L3 bicg.tcyr (seed 424242) + bicgchk.py, Fraction residuals, 2026-11-14]
 #          Err(HSB_ERR_NO_CONVERGENCE) on every other exit: max_iter spent; a breakdown
 #          (r_hat . r, r_hat . A p or omega exactly zero, or a t = A s orthogonal to s:
 #          since 3.4.1 a t . s within the rigorous bound of an accurately formed dot product,
@@ -2977,8 +2982,11 @@ fn _lext_sym_cert(T, W, n, la) {
 # The Collatz-Wielandt bound on rho(|T|), so on rho(T), for the n x n row-major T (3.4.1): z (n
 # words, positive, kept between calls as a warm start) takes five steps z <- |T| z / max(|T| z)
 # with each entry floored at 2^-52, and the bound is max_i (|T| z)_i / z_i of the last, which holds
-# for ANY positive z. w: n words of scratch. +Inf when a sum is not finite (no bound).
-fn _lext_cw(T, n, z, w) {
+# for ANY positive z. 3.5.0 W4: R (n x n, non-negative) is added to |T| where it is not 0, so the
+# bound is on rho(|T| + R), which bounds rho(T') for every T' with |T' - T| <= R entrywise. The
+# value is as rounded (a caller that needs it rigorous allows for its sums' roundings). w: n words
+# of scratch. +Inf when a sum is not finite (no bound).
+fn _lext_cw(T, R, n, z, w) {
     var b = F64_POS_INF;
     for (var it = 0; it < 5; it = it + 1) {
         var zm = f64_from(0);
@@ -2987,9 +2995,15 @@ fn _lext_cw(T, n, z, w) {
             var pt = T + r * n * 8;
             var pe = pt + n * 8;
             var pz = z;
+            var pr = R + r * n * 8;
             var a = f64_from(0);
             while (pt < pe) {
-                a = f64_add(a, f64_mul(f64_abs(load64(pt)), load64(pz)));
+                var tv = f64_abs(load64(pt));
+                if (R != 0) {
+                    tv = f64_add(tv, load64(pr));
+                    pr = pr + 8;
+                }
+                a = f64_add(a, f64_mul(tv, load64(pz)));
                 pt = pt + 8;
                 pz = pz + 8;
             }
@@ -3020,8 +3034,15 @@ fn _lext_cw(T, n, z, w) {
 # two, far below 1. The result is similar to B, so Gelfand's bound on it bounds rho(B) as any
 # similarity does, whatever x is; for a right answer the dominant eigenvalue's direction is now
 # e_p in both its right and left vectors, and the squarings no longer wait out its condition.
-# Returns 1 (done), 0 (left as it was: v has a NaN, or a part at 2^900 past the frame).
-fn _lext_deflate(M, n, v, mv, d, y) {
+# Returns 1 (done), 0 (left as it was: v has a NaN, or a part at 2^900 past the frame, or (3.5.0) a
+# product M_rc x_c (any r and c), x_r M_pc (r, c != p) or x_r y_p (r != p) could fall below DBL_MIN).
+# 3.5.0 W4: R (n x n, or 0 for none) bounds |M - M*| entrywise for the matrix M* the certificate is
+# about; on 1 it bounds the deflated M against S^-1 M* S (scaled as M is): M* moves through the
+# similarity as (I + |x'| e_p^T) R (I + |x'| e_p^T) (x' = x - e_p, S = I + x' e_p^T), and each
+# rounding here adds its own term: 2^-51 (|M_rc| + |x_r M_pc|) off column p, (n + 2) 2^-51 (|M| |x|)
+# for each product M x (y), 2^-51 (|y_r| + |x_r y_p|) down column p; every sum taken 1 + (2 n + 8)
+# 2^-52 times over, and an entry the final power of two takes below DBL_MIN one subnormal unit up.
+fn _lext_deflate(M, n, v, mv, d, y, R) {
     var p = 0;
     var vp = f64_from(0);
     for (var i = 0; i < n; i = i + 1) {
@@ -3041,6 +3062,27 @@ fn _lext_deflate(M, n, v, mv, d, y) {
         store64(x + i1 * 8, xi);
     }
     store64(x + p * 8, F64_ONE);
+    # 3.5.0: declined (M untouched) where a product M_rc x_c (any r and c), x_r M_pc (r, c != p) or
+    # x_r y_p (r != p) could fall below DBL_MIN and lose its bits against the frame's scale
+    var xlo = 1 << 40;   # the least exponent of a non-zero x_r, r != p
+    var plo = 1 << 40;   # and of a non-zero M_pc, c != p
+    for (var c0 = 0; c0 < n; c0 = c0 + 1) {
+        var xc = load64(x + c0 * 8);
+        if ((xc & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            var cl = 1 << 40;
+            for (var r0 = 0; r0 < n; r0 = r0 + 1) {
+                var lr = _lext_lowest(M + (r0 * n + c0) * 8, 1);
+                if (lr < cl) { cl = lr; }
+            }
+            if (cl + _lext_xtop(xc) < 0 - 1022) { return 0; }
+            if (c0 != p && _lext_xtop(xc) < xlo) { xlo = _lext_xtop(xc); }
+        }
+        if (c0 != p) {
+            var lp = _lext_lowest(M + (p * n + c0) * 8, 1);
+            if (lp < plo) { plo = lp; }
+        }
+    }
+    if (xlo + plo < 0 - 1022) { return 0; }
     for (var r = 0; r < n; r = r + 1) {
         var acc = f64_from(0);
         for (var c = 0; c < n; c = c + 1) {
@@ -3049,9 +3091,44 @@ fn _lext_deflate(M, n, v, mv, d, y) {
         store64(y + r * 8, acc);
     }
     var yp = load64(y + p * 8);
+    if (_lext_lowest(y + p * 8, 1) + xlo < 0 - 1022) { return 0; }
+    var g2 = 0x3CC0000000000000;   # 2^-51
+    var gn = f64_mul(f64_from(n + 2), 0x3CC0000000000000);   # (n + 2) 2^-51
+    var gs = f64_add(F64_ONE, f64_mul(f64_from(2 * n + 8), 0x3CB0000000000000));   # 1 + (2 n + 8) 2^-52
+    var axp = f64_from(0);   # (|M| |x|)_p
+    if (R != 0) {
+        for (var c7 = 0; c7 < n; c7 = c7 + 1) {
+            axp = f64_add(axp, f64_mul(f64_abs(load64(M + (p * n + c7) * 8)), f64_abs(load64(x + c7 * 8))));
+        }
+    }
     for (var r2 = 0; r2 < n; r2 = r2 + 1) {
         if (r2 != p) {
             var xr = load64(x + r2 * 8);
+            if (R != 0) {
+                # row r2 of R, from M's row r2 as it is before the update below
+                var ar = f64_abs(xr);
+                var axr = f64_from(0);
+                var cs = f64_from(0);
+                for (var c8 = 0; c8 < n; c8 = c8 + 1) {
+                    var o8 = (r2 * n + c8) * 8;
+                    var m8 = f64_abs(load64(M + o8));
+                    axr = f64_add(axr, f64_mul(m8, f64_abs(load64(x + c8 * 8))));
+                    if (c8 != p) {
+                        var t8 = f64_mul(ar, f64_abs(load64(M + (p * n + c8) * 8)));
+                        var rv = f64_add(f64_add(load64(R + o8), f64_mul(ar, load64(R + (p * n + c8) * 8))),
+                          f64_mul(g2, f64_add(m8, t8)));
+                        rv = f64_mul(rv, gs);
+                        store64(R + o8, rv);
+                        cs = f64_add(cs, f64_mul(rv, f64_abs(load64(x + c8 * 8))));
+                    }
+                }
+                var o9 = (r2 * n + p) * 8;
+                var rp9 = f64_add(load64(R + o9), f64_mul(ar, load64(R + (p * n + p) * 8)));
+                rp9 = f64_add(rp9, cs);
+                rp9 = f64_add(rp9, f64_mul(gn, f64_add(axr, f64_mul(ar, axp))));
+                rp9 = f64_add(rp9, f64_mul(g2, f64_add(f64_abs(load64(y + r2 * 8)), f64_mul(ar, f64_abs(yp)))));
+                store64(R + o9, f64_mul(rp9, gs));
+            }
             for (var c2 = 0; c2 < n; c2 = c2 + 1) {
                 if (c2 != p) {
                     var o = (r2 * n + c2) * 8;
@@ -3062,11 +3139,22 @@ fn _lext_deflate(M, n, v, mv, d, y) {
         }
     }
     store64(M + (p * n + p) * 8, yp);
+    if (R != 0) {
+        var spp = f64_add(load64(R + (p * n + p) * 8), f64_mul(gn, axp));
+        for (var l9 = 0; l9 < n; l9 = l9 + 1) {
+            if (l9 != p) { spp = f64_add(spp, f64_mul(load64(R + (p * n + l9) * 8), f64_abs(load64(x + l9 * 8)))); }
+        }
+        store64(R + (p * n + p) * 8, f64_mul(spp, gs));
+    }
     var bs = f64_from(0);
     var rm = f64_from(0);
+    var blo = 1 << 40;
     for (var j = 0; j < n; j = j + 1) {
         if (j != p) {
-            bs = f64_add(bs, f64_abs(load64(M + (p * n + j) * 8)));
+            var pj = load64(M + (p * n + j) * 8);
+            bs = f64_add(bs, f64_abs(pj));
+            var lj = _lext_lowest(M + (p * n + j) * 8, 1);
+            if (lj < blo) { blo = lj; }
             var ra = f64_abs(load64(M + (j * n + p) * 8));
             if (f64_gt(ra, rm) == 1) { rm = ra; }
         }
@@ -3079,20 +3167,34 @@ fn _lext_deflate(M, n, v, mv, d, y) {
         k = (_lext_xexp(rm) - _lext_xexp(bs)) / 2;
     }
     if (k < 0 - 900) { k = 0 - 900; }
+    # 3.5.0: and never so far that a non-zero entry of row p falls below DBL_MIN
+    if (k < 0 - 1022 - blo) { k = 0 - 1022 - blo; }
     if (k > 0) { k = 0; }
     if (k != 0) {
         for (var j2 = 0; j2 < n; j2 = j2 + 1) {
             if (j2 != p) {
                 store64(M + (p * n + j2) * 8, _lext_pow2mul(load64(M + (p * n + j2) * 8), k));
                 store64(M + (j2 * n + p) * 8, _lext_pow2mul(load64(M + (j2 * n + p) * 8), 0 - k));
+                if (R != 0) {
+                    store64(R + (p * n + j2) * 8, _lext_up2(load64(R + (p * n + j2) * 8), k));
+                    store64(R + (j2 * n + p) * 8, _lext_up2(load64(R + (j2 * n + p) * 8), 0 - k));
+                }
             }
         }
     }
     return 1;
 }
+
+# x 2^e for a non-negative bound x (3.5.0 W4): `_lext_pow2mul`, then one subnormal unit more where the
+# result lands below DBL_MIN (where it rounded, perhaps down), so it is never under x 2^e.
+fn _lext_up2(x, e) {
+    var y = _lext_pow2mul(x, e);
+    if ((x & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (y & 0x7FF0_0000_0000_0000) == 0) { y = f64_add(y, 1); }
+    return y;
+}
 # Gelfand's frame (3.4.0, `_lext_gelfand`): B' = D^-1 (A / |lam|) D times 2^-e0 into M (e0 to
 # eo[0]) and A into T, with the two m = 1 bounds taken in the same pass. Returns 1 when they
-# certify (or A = 0), 0 otherwise.
+# certify (or A = 0), 0 otherwise; on 0, eo[1] is 1 when the frame lost an entry (3.5.0).
 fn _lext_gf_form(A, n, la, d, di, M, T, eo) {
     var thr = 0x3F57A013FACA6C6B;   # ln(1.001)/ln(2) = 0.00144197417390648...
     # B' into M with both m = 1 bounds in the same pass. With |lam| in [2^-900, 2^900] each factor
@@ -3126,9 +3228,13 @@ fn _lext_gf_form(A, n, la, d, di, M, T, eo) {
         }
         if (f64_lt(rs1, F64_POS_INF) == 1) {
             if ((bm & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }   # A = 0: rho(A) = 0
-            if (f64_le(_lext_log2abs(rs1), thr) == 1) { return 1; }
+            # 3.5.0 W4: each entry of B' is four roundings and D^-1's own from exact (2^-49 relative,
+            # `_lext_gelfand`), and the sums n and n^2 more: both bounds are allowed for them
+            var g1 = f64_add(F64_ONE, f64_mul(f64_from(n + 16), 0x3CB0000000000000));   # 1 + (n + 16) 2^-52
+            var g2 = f64_add(F64_ONE, f64_mul(f64_from(n * n + 16), 0x3CB0000000000000));   # 1 + (n^2 + 16) 2^-52
+            if (f64_le(_lext_log2abs(f64_mul(rs1, g1)), thr) == 1) { return 1; }
             if (f64_gt(ss1, 0) == 1 && f64_lt(ss1, F64_POS_INF) == 1) {
-                if (f64_le(f64_mul(F64_HALF, _lext_log2abs(ss1)), thr) == 1) { return 1; }
+                if (f64_le(f64_mul(F64_HALF, _lext_log2abs(f64_mul(ss1, g2))), thr) == 1) { return 1; }
             }
             e0 = _lext_xexp(bm);
             if (e0 >= 0 - 1022 && e0 <= 1022) {
@@ -3174,25 +3280,81 @@ fn _lext_gf_form(A, n, la, d, di, M, T, eo) {
         e0 = emax;
     }
     store64(eo, e0);
+    # 3.5.0: eo[1] = 1 where an entry of A is non-zero and its frame entry is zero or below DBL_MIN
+    # (its bits lost, or the next square's), so the caller forms the frame wide instead
+    store64(eo + 8, 0);
+    for (var q8 = 0; q8 < n * n; q8 = q8 + 1) {
+        if ((load64(T + q8 * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (load64(M + q8 * 8) & 0x7FF0_0000_0000_0000) == 0) {
+            store64(eo + 8, 1);
+        }
+    }
     return 0;
 }
 
 # Gelfand's squarings (3.4.0, `_lext_gelfand`) on M = B' 2^-e0, at most kmax of them: 1 when
 # min(||T||_inf, ||D T D^-1||_F, cw(T))^(1/m) 2^(...) certifies (d = 0: the Frobenius norm of T
-# itself), 0 otherwise. T: n^2 words of scratch; z: n words, cw's warm start; zs: n words of scratch.
-fn _lext_gf_loop(M, T, n, d, di, z, zs, e0, thr, kmax) {
+# itself), 0 otherwise, 2 when its scratch is refused, and (3.5.0 W4, review) 3 when the bound on
+# |T| + U below does not certify where the same bound on the computed T alone (3.4.2's) does: the
+# rounding bound, not the powers, refuses the answer, and `_lext_gelfand` then takes the squarings
+# again in double-double (`_lext_gfd`). Once T alone certifies, the bound on |T| + U is followed while U
+# stays under |T| (an answer near the line), then 3 (past that U's share of the bound only grows), and
+# 3 too where the squarings run out or would go wide. T: n^2 words of scratch; z: n words, cw's warm
+# start; zs: n words of scratch.
+# ⛔ 3.5.0 W4 — THE POWERS' ROUNDING WAS NOT BOUNDED, so the bound held for the computed powers, not for
+# B''s: an f64 sum absorbs a term below 2^-53 of it, and if the rest then cancels the term is gone from
+# every later power. A = [[1, a, a, 0], [c, 0, 0, 0], [-c, 0, 0, 0], [0, 0, h, 3/4]] (a = 1.3 2^e, c =
+# 1.7 2^e, h = 1.1 2^e, rho 1) squared its (0, 0) entry to 1 + ac - ac = 0, and eigen_power answered
+# Ok(3/4) for every e from 30 to 590. R (n^2 words; 0: M is exact, R then zeros of this call's own; the
+# call also allocates U and |M|, 2 n^2 words, T's own cw warm start, n, and the floor's patterns, n
+# ceil(n / 64)) now bounds
+# |M - X| entrywise for the exact X = B'^m 2^-e_int the bound is about, and every bound is formed on
+# |T| + U, U the bound for T: |X^2 - fl(M M)| <= |M| (g |M| + R) + R (|M| + R), g = (n + 2) 2^-51
+# (gamma_n for the products, twice over), U formed so in doubles, times 1 + (2 n + 4) 2^-52 for its own
+# sums, plus n 2^-1071 wherever its factors' exponents let a product fall below DBL_MIN (where it can
+# round in the subnormals); the bounds' sums are allowed for alike. (Second review) That floor goes only on
+# an entry some term X_rl X_lc of which can be non-zero (`_lext_gf_prow`): an entry each of whose terms has
+# a zero factor is 0 in X^2, in M M and in U alike, with no product to round. On every entry it closed a
+# false cycle through a block-triangular A's zero block, which outgrew the true blocks (⚠ above
+# `_lext_gf_risk`).
+# A power read as 0 is nilpotence only when its bound is 0 too.
+fn _lext_gf_loop(M, R, T, n, d, di, z, zs, e0, thr, kmax) {
     # T_r += m_rl M_l a row at a time: f64v_scale into zs (cw's scratch, free until cw runs) then
     # f64v_add, a separately rounded multiply and add on every target, so the sums are the scalar
     # loop's bit for bit, and with `_lext_log2abs` a bound at the edge decides alike everywhere (3.4.1
     # LA3, LA4; f64v_axpy is fused on aarch64, f64v_fmadd too). Both step in pairs, so an odd n's last
-    # entry is added alone.
+    # entry is added alone. U is formed the same way.
+    var nw = 2;
+    if (R == 0) { nw = 3; }
+    var nb = (n + 63) / 64;   # (second review) words of one row's pattern, a bit an entry
+    if (n > (ALLOC_MAX / 8) / (nw * n + 1 + nb)) { return 2; }
+    var U = hisab_alloc((nw * n * n + n + n * nb) * 8);
+    if (U == 0) { return 2; }
+    var AM = U + n * n * 8;
+    var tz = AM + n * n * 8;   # (review) the computed powers' own cw warm start, n words
+    if (R == 0) {
+        R = tz;   # (zeroed: M exact)
+        tz = R + n * n * 8;
+    }
+    var BP = tz + n * 8;   # (second review) the patterns of |M| + R, nb words a row (`_lext_gf_pat`)
+    for (var q0 = 0; q0 < n; q0 = q0 + 1) { store64(tz + q0 * 8, load64(z + q0 * 8)); }
+    var g = f64_mul(f64_from(n + 2), 0x3CC0000000000000);   # (n + 2) 2^-51
+    var gu = f64_add(F64_ONE, f64_mul(f64_from(2 * n + 4), 0x3CB0000000000000));   # 1 + (2 n + 4) 2^-52
+    var gr = f64_add(F64_ONE, f64_mul(f64_from(n + 4), 0x3CB0000000000000));   # 1 + (n + 4) 2^-52
+    var gf = f64_add(F64_ONE, f64_mul(f64_from(n * n + 8), 0x3CB0000000000000));   # 1 + (n^2 + 8) 2^-52
+    var fl = f64_mul(f64_from(n), 0x0000000000000008);   # n 2^-1071
     var ne = n - (n & 1);
     var e_int = e0;
     var m = 1;
+    var ru = 1;   # (review) 0 once the rounding bound is past DBL_MAX
+    var tg = 0;   # (review) 1 once T alone has certified
     for (var k = 1; k <= kmax; k = k + 1) {
-        # T = M M, row by row; the largest row sum of |T|, and the sum of squares of D T D^-1
-        var rs = f64_from(0);
-        var ss = f64_from(0);
+        # 3.5.0: a square that could lose a product to underflow is taken wide from here on
+        if (_lext_gf_risk(M, n) == 1) {
+            if (tg == 1) { return 3; }
+            if (ru == 0) { return 0; }   # (review) no bound left to carry into the wide form
+            return _lext_gfw_from(M, R, n, 0, d, di, e_int, m, thr, kmax - k + 1);
+        }
+        # T = M M, row by row
         for (var r5 = 0; r5 < n; r5 = r5 + 1) {
             var tr = T + r5 * n * 8;
             var mr = M + r5 * n * 8;
@@ -3208,35 +3370,158 @@ fn _lext_gf_loop(M, T, n, d, di, z, zs, e0, thr, kmax) {
                     }
                 }
             }
-            var s5 = f64_from(0);
-            var dr = F64_ONE;
-            if (d != 0) { dr = load64(d + r5 * 8); }
-            for (var c6 = 0; c6 < n; c6 = c6 + 1) {
-                var sum = load64(tr + c6 * 8);
-                s5 = f64_add(s5, f64_abs(sum));
-                var u5 = sum;
-                if (d != 0) { u5 = f64_mul(sum, f64_mul(dr, load64(di + c6 * 8))); }
-                ss = f64_add(ss, f64_mul(u5, u5));
+        }
+        # 3.5.0 W4: U = |M| (g |M| + R) + R (|M| + R), row by row: U_r += (g a + b) |M_l| + (a + b) R_l.
+        # Where every factor's exponent keeps every product at or above DBL_MIN no product rounds in
+        # the subnormals and the floor is 0, so an exactly zero power with an exact source stays 0.
+        # (review) Once the bound is past DBL_MAX it is not formed again (ru = 0): only T's own bound,
+        # the gate below, is still read.
+        if (ru == 1) {
+            for (var q1 = 0; q1 < n * n; q1 = q1 + 1) { store64(AM + q1 * 8, f64_abs(load64(M + q1 * 8))); }
+            var mlo = _lext_lowest(AM, n * n);
+            var rlo = _lext_lowest(R, n * n);
+            if (rlo < mlo) { mlo = rlo; }
+            var fu = f64_from(0);
+            if (mlo + mlo + _lext_xtop(g) < 0 - 1021) {
+                fu = fl;
+                _lext_gf_pat(AM, R, n, nb, BP);
             }
-            if (f64_gt(s5, rs) == 1 || f64_eq(s5, s5) == 0) { rs = s5; }
+            for (var r6 = 0; r6 < n; r6 = r6 + 1) {
+                var ur = U + r6 * n * 8;
+                for (var c5 = 0; c5 < n; c5 = c5 + 1) { store64(ur + c5 * 8, f64_from(0)); }
+                for (var l2 = 0; l2 < n; l2 = l2 + 1) {
+                    var a2 = load64(AM + (r6 * n + l2) * 8);
+                    var b2 = load64(R + (r6 * n + l2) * 8);
+                    var s1 = f64_add(f64_mul(g, a2), b2);
+                    var s2 = f64_add(a2, b2);
+                    # (review) g a can underflow to 0 with a R_l still to add: s1 and s2 are taken apart
+                    var ue = ur + ne * 8;
+                    if ((s1 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                        var al = AM + l2 * n * 8;
+                        f64v_scale(zs, al, s1, ne);
+                        f64v_add(ur, ur, zs, ne);
+                        if (ne < n) { store64(ue, f64_add(load64(ue), f64_mul(s1, load64(al + ne * 8)))); }
+                    }
+                    if ((s2 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                        var bl = R + l2 * n * 8;
+                        f64v_scale(zs, bl, s2, ne);
+                        f64v_add(ur, ur, zs, ne);
+                        if (ne < n) { store64(ue, f64_add(load64(ue), f64_mul(s2, load64(bl + ne * 8)))); }
+                    }
+                }
+                if ((fu & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+                    for (var c7 = 0; c7 < n; c7 = c7 + 1) { store64(ur + c7 * 8, f64_mul(load64(ur + c7 * 8), gu)); }
+                } else {
+                    # (second review) the floor only where some term X_rl X_lc can be non-zero (zs: row r's
+                    # pattern of X^2, free once the row's products are summed)
+                    _lext_gf_prow(AM, R, n, nb, BP, r6, zs);
+                    for (var c8 = 0; c8 < n; c8 = c8 + 1) {
+                        var u8 = f64_mul(load64(ur + c8 * 8), gu);
+                        if (((load64(zs + (c8 / 64) * 8) >> (c8 % 64)) & 1) == 1) { u8 = f64_add(u8, fu); }
+                        store64(ur + c8 * 8, u8);
+                    }
+                }
+            }
         }
-        if ((rs & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }   # B'^m = 0 here: rho(B) = 0
-        if (f64_lt(rs, F64_POS_INF) == 0) { return 0; }   # not finite: no bound
+        # the largest row sum of |T| + U, and the sum of squares of D (|T| + U) D^-1; (review) and U's own
+        # largest row sum, ru_s
+        var rs = F64_POS_INF;
+        var ss = f64_from(0);
+        var ru_s = f64_from(0);
+        if (ru == 1) {
+            rs = f64_from(0);
+            for (var r7 = 0; r7 < n; r7 = r7 + 1) {
+                var s5 = f64_from(0);
+                var s9 = f64_from(0);
+                var dr = F64_ONE;
+                if (d != 0) { dr = load64(d + r7 * 8); }
+                for (var c6 = 0; c6 < n; c6 = c6 + 1) {
+                    var u0 = load64(U + (r7 * n + c6) * 8);
+                    var u5 = f64_add(f64_abs(load64(T + (r7 * n + c6) * 8)), u0);
+                    s5 = f64_add(s5, u5);
+                    s9 = f64_add(s9, u0);
+                    if (d != 0) { u5 = f64_mul(u5, f64_mul(dr, load64(di + c6 * 8))); }
+                    ss = f64_add(ss, f64_mul(u5, u5));
+                }
+                if (f64_gt(s5, rs) == 1 || f64_eq(s5, s5) == 0) { rs = s5; }
+                if (f64_gt(s9, ru_s) == 1) { ru_s = s9; }
+            }
+            # B'^m with T = 0 and U = 0: X^2 = 0 exactly, so rho(B) = 0. (3.4.2 took any T read as 0 for
+            # this, which a term absorbed and then cancelled reaches with X^2 far from 0.)
+            if ((rs & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }
+            if (f64_lt(rs, F64_POS_INF) == 0) { ru = 0; }   # past DBL_MAX (or NaN): not formed again
+        }
         m = 2 * m;
-        # log2 of the bound: (log2 min(||T||_inf, ||D T D^-1||_F, cw(T)) + 2 e_int) / m
-        var ln = _lext_log2abs(rs);
-        if (f64_gt(ss, 0) == 1 && f64_lt(ss, F64_POS_INF) == 1) {
-            var lf = f64_mul(F64_HALF, _lext_log2abs(ss));
-            if (f64_lt(lf, ln) == 1) { ln = lf; }
+        if (ru == 1) {
+            # log2 of the bound: (log2 min(||T||_inf, ||D T D^-1||_F, cw(T)) + 2 e_int) / m, on |T| + U
+            var ln = _lext_log2abs(f64_mul(rs, gr));
+            if (f64_gt(ss, 0) == 1 && f64_lt(ss, F64_POS_INF) == 1) {
+                var lf = f64_mul(F64_HALF, _lext_log2abs(f64_mul(ss, gf)));
+                if (f64_lt(lf, ln) == 1) { ln = lf; }
+            }
+            var cwm = _lext_cw(T, U, n, z, zs);
+            if (f64_gt(cwm, 0) == 1 && f64_lt(cwm, F64_POS_INF) == 1) {
+                var lc = _lext_log2abs(f64_mul(cwm, gf));
+                if (f64_lt(lc, ln) == 1) { ln = lc; }
+            }
+            var lb = f64_div(f64_add(ln, f64_from(2 * e_int)), f64_from(m));
+            if (f64_le(lb, thr) == 1) { return 1; }
         }
-        var cwm = _lext_cw(T, n, z, zs);
-        if (f64_gt(cwm, 0) == 1 && f64_lt(cwm, F64_POS_INF) == 1) {
-            var lc = _lext_log2abs(cwm);
-            if (f64_lt(lc, ln) == 1) { ln = lc; }
-        }
-        var lb = f64_div(f64_add(ln, f64_from(2 * e_int)), f64_from(m));
-        if (f64_le(lb, thr) == 1) { return 1; }
+        # (review) the bound 3.4.2 formed, from the computed T alone (a T read as 0 included, which it took
+        # for nilpotence): where it certifies and the one on |T| + U does not, the rounding bound is what
+        # refuses the answer, and the caller takes the squarings again in double-double (`_lext_gfd`). It
+        # is formed only where U's largest row sum passes 2^-21 of the bound's (below that the two row-sum
+        # bounds differ by under 2^-20 / m in lb, and its own pass over T is not paid), where the bound is
+        # gone (ru = 0), and once T alone has certified.
         var ex = _lext_xexp(rs);
+        if (ru == 0 || tg == 1 || f64_gt(ru_s, f64_mul(rs, 0x3EA0000000000000)) == 1) {   # 2^-21
+            var rt = f64_from(0);
+            var st = f64_from(0);
+            for (var r8 = 0; r8 < n; r8 = r8 + 1) {
+                var s8 = f64_from(0);
+                var d8 = F64_ONE;
+                if (d != 0) { d8 = load64(d + r8 * 8); }
+                for (var c9 = 0; c9 < n; c9 = c9 + 1) {
+                    var t9 = load64(T + (r8 * n + c9) * 8);
+                    s8 = f64_add(s8, f64_abs(t9));
+                    if (d != 0) { t9 = f64_mul(t9, f64_mul(d8, load64(di + c9 * 8))); }
+                    st = f64_add(st, f64_mul(t9, t9));
+                }
+                if (f64_gt(s8, rt) == 1 || f64_eq(s8, s8) == 0) { rt = s8; }
+            }
+            if (f64_lt(rt, F64_POS_INF) == 0) { return 0; }   # T not finite: no bound
+            var udom = 0;   # U past |T| in the row sums: its share of lb only grows from here
+            if (ru == 0 || f64_gt(rs, f64_add(rt, rt)) == 1) { udom = 1; }
+            # once T alone has certified, the bound on |T| + U is followed only while U stays under |T|
+            if (tg == 1 && udom == 1) { return 3; }
+            if ((rt & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 3; }
+            if (tg == 0) {
+                var lt = _lext_log2abs(rt);
+                if (f64_gt(st, 0) == 1 && f64_lt(st, F64_POS_INF) == 1) {
+                    var ltf = f64_mul(F64_HALF, _lext_log2abs(st));
+                    if (f64_lt(ltf, lt) == 1) { lt = ltf; }
+                }
+                var cwt = _lext_cw(T, 0, n, tz, zs);
+                if (f64_gt(cwt, 0) == 1 && f64_lt(cwt, F64_POS_INF) == 1) {
+                    var ltc = _lext_log2abs(cwt);
+                    if (f64_lt(ltc, lt) == 1) { lt = ltc; }
+                }
+                # T alone certifies: while U is under |T| the bound on |T| + U is within 1 / m of it and
+                # may still follow (as on an answer near the line)
+                if (f64_le(f64_div(f64_add(lt, f64_from(2 * e_int)), f64_from(m)), thr) == 1) {
+                    if (udom == 1) { return 3; }
+                    tg = 1;
+                }
+            }
+            # renormalised by T's own row sum, as 3.4.2 did, once U outgrows T (so T stays near 1)
+            if (udom == 1) { ex = _lext_xexp(rt); }
+        }
+        # 3.5.0: a renormalisation that would carry an entry of T below DBL_MIN goes wide instead
+        if (ex > 0 && _lext_lowest(T, n * n) - ex < 0 - 1022) {
+            if (tg == 1) { return 3; }
+            if (ru == 0) { return 0; }   # (review) no bound left to carry into the wide form
+            return _lext_gfw_from(T, U, n, ex, d, di, 2 * e_int + ex, m, thr, kmax - k);
+        }
         if (ex >= 0 - 1022 && ex <= 1022) {
             var p6 = (1023 - ex) << 52;
             for (var q6 = 0; q6 < n * n; q6 = q6 + 1) { store64(M + q6 * 8, f64_mul(load64(T + q6 * 8), p6)); }
@@ -3245,9 +3530,822 @@ fn _lext_gf_loop(M, T, n, d, di, z, zs, e0, thr, kmax) {
                 store64(M + q7 * 8, _lext_pow2mul(load64(T + q7 * 8), 0 - ex));
             }
         }
+        for (var q8 = 0; q8 < n * n; q8 = q8 + 1) { store64(R + q8 * 8, _lext_up2(load64(U + q8 * 8), 0 - ex)); }
+        e_int = 2 * e_int + ex;
+    }
+    if (tg == 1) { return 3; }
+    return 0;
+}
+
+# ---- 3.5.0: Gelfand's squarings with an exponent for every entry ----
+# ⛔ 3.5.0 — UNDERFLOW READ AS NILPOTENCE (roadmap [3.5.0], R4-CERT N1). The f64 frame keeps B'^m
+# with its largest row sum near 1, so a product of two of its entries below 2^-1022 loses its bits
+# against that scale, not against its own entry's other terms. A block upper-bidiagonal A (n = 9,
+# diagonal blocks l/4 [[2,1,1],[1,2,1],[1,1,2]] for l = 1.9, 1.5, 2.0, super-diagonal blocks all
+# 2^1000, rho(A) = 2) has its diagonal blocks, which carry rho, at 2^-2000 of the coupling in B'^2:
+# they flushed, the next square was exactly 0, `_lext_gf_loop` read that as rho(B) = 0, and the
+# iteration's 1.9000000000059638 (3FFE66666666CF51) came back Ok. A frame entry formed below DBL_MIN
+# loses its bits the same way (`_lext_gf_form`). The wide form holds each entry as m 2^e (0.5 <= |m|
+# < 1, or m = 0; e an i64) and sums each entry of a product in f64 at its own largest term's
+# exponent, so no term is lost to underflow. The certificate switches to it wherever the f64 frame
+# could lose one that way: `_lext_gf_risk` before a square, `_lext_lowest` before a renormalisation,
+# `_lext_gf_form`'s own flag on the frame (then formed wide from A), and `_lext_deflate` declines
+# where its products could.
+# [measured: scratch_L3 r8.tcyr (the 9 x 9), base and this tree, cycc 6.7.18, 2026-11-14]
+# ⛔ 3.5.0 W4 — THE SQUARINGS' ROUNDING WAS NOT BOUNDED, so Gelfand's bound held for the computed
+# powers, not for A's. Underflow was one way to lose a term; rounding is the other, with nothing near
+# DBL_MIN: an f64 sum absorbs a term below 2^-53 of the running sum, and if the rest then cancels
+# exactly the term is gone from every later power. A = [[1, a, a, 0], [c, 0, 0, 0], [-c, 0, 0, 0],
+# [0, 0, h, 3/4]] (a = 1.3 2^e, c = 1.7 2^e, h = 1.1 2^e; characteristic polynomial l^2 (l - 1)
+# (l - 3/4), so rho(A) = 1) squared its (0, 0) entry to 1 + ac - ac = 0, and eigen_power answered
+# Ok(3/4) for every e from 30 to 590 (the iteration converges to 3/4, its matvec losing the same term;
+# the certificate passed on its bound in the wide loop); `_lext_gelfand` certified lam = 1/2 on the
+# 3 x 3 [[1, a, a], [c, 0, 0], [-c, 0, 0]] (eigenvalues 0, 0, 1) through a power read as 0. A normwise
+# bound (wave 1) refused right answers too, since 2 ||M|| eps overstates how an error moves through a
+# non-normal power. The bound is now kept entry by entry: R bounds |M - X| for the exact power X,
+# formed from the frame's own roundings (2^-49 |M|), moved through the deflation as a similarity moves
+# it (`_lext_deflate`), and squared as |X^2 - fl(M M)| <= |M| (g |M| + R) + R (|M| + R) (`_lext_gf_loop`,
+# `_lext_gfw_err`); every bound is formed on |T| + R, and a power is 0 only when its bound is.
+# On 1,800 generated matrices (dense, rank-one dominant, triangular non-normal to 2^30, block chains
+# coupled at 2^10 to 2^1000, and the family above with e to 600, permuted; n = 3 to 9) the first form of
+# this repair answered every one of 3.4.2's 185 wrong Ok answers (rho past 1.001 |lambda|, by the exact
+# characteristic polynomial's Schur-Cohn test) NO_CONVERGENCE.
+# [measured: scratch_W4 epgen.py (seeds 101-103) + eporc.py, merged tree and the first form, 2026-11-14]
+# ⚠ THE BOUND REFUSES RIGHT ANSWERS TOO, wherever a power's signs cancel in M M: |M| |M| is then near
+# kappa |M M|, and the bound grows about 2 kappa a square against the power. Through a slowly decaying
+# subdominant eigenvalue's transient on a signed non-normal A it outgrows the power before the power
+# certifies. On the review's families (A = Q diag(1, r, d_3 r, ...) Q^-1, r in [0.9, 0.995], d_i in
+# (-0.8, 0.8), n = 6 to 20, Q = 2 I + N(0, 1) or I + 2 N(0, 1), or a complex pair r e^(+-it) in place of
+# r; 900 matrices) the f64 bound refused 50 of the 897 right answers 3.4.2 certified. Where the bound
+# 3.4.2 formed from the computed powers alone certifies, `_lext_gf_loop` returns 3 and the squarings
+# are taken again in double-double (`_lext_gfd`, below), which certifies 30 of the 50 again; the other
+# 20 (Q's eigenvector condition near 1e4) stay NO_CONVERGENCE, their bound outgrowing double-doubles
+# too. The family above keeps its loss: of its 52 right answers (e = 1 to 63, each also permuted
+# three ways; 252 matrices) the 40 at e >= 4, bounded only through 1 + ac - ac with ac past 2^8, are
+# NO_CONVERGENCE, as are the 167 short and 33 non-eigenvalue Ok answers 3.4.2 gave there. Dense N(0, 1)
+# (300) and positive matrices scaled by 2^+-100 and 2^+-300 (300) lose none; every answer given, 1,339
+# in all, is 3.4.2's bit for bit.
+# [measured: scratch_W4 fam.sh, cls.py (seeds 2-6, 8, 9, 21), base, first form, this tree, 2026-11-14]
+# Block-triangular chains lose none either (second review). The subnormal floor first went on every entry
+# of U, and where a chain's diagonal blocks sit about 2^500 below the coupling it closed a false cycle
+# through the zero block that outgrew the true blocks: 58 of the 150 right answers 3.4.2 gave on 2- to
+# 4-block chains coupled at 2^380 to 2^630 (all 58 at 2^420 to 2^560), and 88 of 290 on random chains (2
+# to 5 blocks, coupled at 2^30 to 2^1015, permuted or transposed), were NO_CONVERGENCE. With the floor only
+# where a term can be non-zero (`_lext_gf_loop`) every one is answered, and all 556 chains are answered
+# as the pre-wave-2 tree answers them, bit for bit; on 1,269 more matrices (the family above, sparse signed
+# and non-negative D P D^-1 with D's exponents up to +-500, triangular ones) no answer moved, and none given
+# is short of rho by more than 0.1% (the exact characteristic polynomial's Schur-Cohn test).
+# [measured: scratch_W4 r2 gen.py, fam.py (seeds 11, 21, 31-33), cmp.py; 3.4.2, pre-wave-2, this tree, 2026-11-14]
+# COST. The f64 squares cost three n^3 products where they cost one, and the wide squares' bound 4 n terms
+# an entry. Against 3.4.2, medians of 3 interleaved rounds on one cpu at load 4.6 to 6.3 (noisy where a
+# spread is wide): 1.4 to 2.1 times where the f64 bound certifies (the gap family at n = 10 to 64, the
+# non-normal fixtures at n = 30 / 60 / 100); on positive matrices scaled by 2^+-300, which take the wide
+# squarings (3.4.2 had none), 2.6 and 11 times at n = 8, 18 to 26 at n = 16, 41 to 47 at n = 40 and 67 to
+# 71 at n = 64, or 2.2 to 3.5 times the pre-wave-2 tree; 1.26 times on the 4 x 4 below and 2.5 to 5.7
+# times at n = 24 to 48 where the double-double squarings take an answer back; and 5.3 to 15 times 3.4.2's
+# certification where they refuse it (n = 24, 64).
+# [measured: scratch_W4 r2 costgen.py, timeit.sh (33 matrices); 3.4.2, pre-wave-2, this tree; cpu 13, 2026-11-14]
+# 1 when the square of the n x n row-major M could form a product of two non-zero entries below
+# 2^-1022: some l whose column's least exponent (floor(lg |x|); -1074 for a subnormal, at or below
+# it) plus its row's is below -1022. O(n^2), against the square's n^3.
+fn _lext_gf_risk(M, n) {
+    var big = 1 << 40;
+    for (var l = 0; l < n; l = l + 1) {
+        var cm = big;
+        var rm = big;
+        for (var r = 0; r < n; r = r + 1) {
+            var bx = load64(M + (r * n + l) * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+            if (bx != 0) {
+                var ex = 0 - 1074;
+                if ((bx >> 52) != 0) { ex = (bx >> 52) - 1023; }
+                if (ex < cm) { cm = ex; }
+            }
+            var by = load64(M + (l * n + r) * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+            if (by != 0) {
+                var ey = 0 - 1074;
+                if ((by >> 52) != 0) { ey = (by >> 52) - 1023; }
+                if (ey < rm) { rm = ey; }
+            }
+        }
+        if (cm != big && rm != big && cm + rm < 0 - 1022) { return 1; }
+    }
+    return 0;
+}
+
+# The least floor(lg |x|) over the non-zero doubles v[0 .. cnt) (-1074 for a subnormal, at or below
+# it); 2^40 when every one is zero.
+fn _lext_lowest(v, cnt) {
+    var lo = 1 << 40;
+    for (var q = 0; q < cnt; q = q + 1) {
+        var bx = load64(v + q * 8) & 0x7FFF_FFFF_FFFF_FFFF;
+        if (bx != 0) {
+            var ex = 0 - 1074;
+            if ((bx >> 52) != 0) { ex = (bx >> 52) - 1023; }
+            if (ex < lo) { lo = ex; }
+        }
+    }
+    return lo;
+}
+
+# 3.5.0 W4 (second review): where the squarings' subnormal floor goes. Bit c of row l of BP (nb = ceil(n /
+# 64) words a row) is set where AM_lc (|M_lc|, or a bound on it) or R_lc is not 0: where the exact X_lc,
+# |X - M| <= R, can be non-zero.
+fn _lext_gf_pat(AM, R, n, nb, BP) {
+    for (var l = 0; l < n; l = l + 1) {
+        var bl = BP + l * nb * 8;
+        for (var w = 0; w < nb; w = w + 1) { store64(bl + w * 8, 0); }
+        for (var c = 0; c < n; c = c + 1) {
+            var o = (l * n + c) * 8;
+            if (((load64(AM + o) | load64(R + o)) & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                var pw = bl + (c / 64) * 8;
+                store64(pw, load64(pw) | (1 << (c % 64)));
+            }
+        }
+    }
+    return 0;
+}
+
+# Row r of X^2's pattern into out (nb words): the OR of the rows l of BP (`_lext_gf_pat`) whose X_rl can be
+# non-zero. A bit left clear is an entry each of whose terms X_rl X_lc, M_rl M_lc and the bound's has a
+# zero factor: computed, exact and bounded alike it is 0, with no product to round in the subnormals.
+fn _lext_gf_prow(AM, R, n, nb, BP, r, out) {
+    for (var w = 0; w < nb; w = w + 1) { store64(out + w * 8, 0); }
+    for (var l = 0; l < n; l = l + 1) {
+        var o = (r * n + l) * 8;
+        if (((load64(AM + o) | load64(R + o)) & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            var bl = BP + l * nb * 8;
+            for (var w2 = 0; w2 < nb; w2 = w2 + 1) {
+                store64(out + w2 * 8, load64(out + w2 * 8) | load64(bl + w2 * 8));
+            }
+        }
+    }
+    return 0;
+}
+
+# Entry q of a wide matrix (mantissas Wm, exponents We) <- s 2^e for a double s: m = 0, e = 0 for 0.
+fn _lext_gfw_put(Wm, We, q, s, e) {
+    if ((s & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        store64(Wm + q * 8, f64_from(0));
+        store64(We + q * 8, 0);
+        return 0;
+    }
+    store64(Wm + q * 8, _lext_xman(s));
+    store64(We + q * 8, _lext_xexp(s) + e);
+    return 0;
+}
+
+# T = M M for wide n x n row-major matrices (mantissas Mm, Tm; exponents Me, Te). Each entry is
+# summed in f64 over l in order at its largest term's exponent, so no term is lost to UNDERFLOW; the
+# sum still rounds as any f64 dot product does (a term below 2^-53 of the running sum is absorbed),
+# and `_lext_gfw_err` bounds that (3.5.0 W4, ⛔ above `_lext_gf_risk`). A term whose shift to the
+# largest passes -1100 is left out (`_lext_pow2mul` would flush it).
+fn _lext_gfw_sq(Mm, Me, Tm, Te, n) {
+    var none = 0 - (1 << 60);
+    for (var r = 0; r < n; r = r + 1) {
+        for (var c = 0; c < n; c = c + 1) {
+            var emx = none;
+            for (var l = 0; l < n; l = l + 1) {
+                var a = load64(Mm + (r * n + l) * 8);
+                var b = load64(Mm + (l * n + c) * 8);
+                if ((a & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (b & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    var e = load64(Me + (r * n + l) * 8) + load64(Me + (l * n + c) * 8);
+                    if (e > emx) { emx = e; }
+                }
+            }
+            var s = f64_from(0);
+            if (emx != none) {
+                for (var l2 = 0; l2 < n; l2 = l2 + 1) {
+                    var a2 = load64(Mm + (r * n + l2) * 8);
+                    var b2 = load64(Mm + (l2 * n + c) * 8);
+                    if ((a2 & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (b2 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                        var k = load64(Me + (r * n + l2) * 8) + load64(Me + (l2 * n + c) * 8) - emx;
+                        # (review) k in [-1000, 0]: `_lext_pow2mul`'s one multiply, inline
+                        if (k >= 0 - 1000) {
+                            s = f64_add(s, f64_mul(f64_mul(a2, b2), (1023 + k) << 52));
+                        } else {
+                            if (k >= 0 - 1100) { s = f64_add(s, _lext_pow2mul(f64_mul(a2, b2), k)); }
+                        }
+                    }
+                }
+            }
+            _lext_gfw_put(Tm, Te, r * n + c, s, emx);
+        }
+    }
+    return 0;
+}
+
+# `_lext_gf_loop`'s two norm bounds on a wide T: out[0], out[1] the largest row sum of |T| as m 2^e,
+# out[2], out[3] the sum of squares of D T D^-1 (d = 0: of T) as m 2^e (m = 0 for 0), each sum at
+# its largest term's exponent.
+fn _lext_gfw_norms(Tm, Te, n, d, di, out) {
+    var none = 0 - (1 << 60);
+    var rsm = f64_from(0);
+    var rse = 0;
+    var fe = none;
+    for (var r = 0; r < n; r = r + 1) {
+        var er = none;
+        var dr = F64_ONE;
+        if (d != 0) { dr = load64(d + r * 8); }
+        for (var c = 0; c < n; c = c + 1) {
+            var t = load64(Tm + (r * n + c) * 8);
+            if ((t & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                var te = load64(Te + (r * n + c) * 8);
+                if (te > er) { er = te; }
+                var u = t;
+                if (d != 0) { u = f64_mul(t, f64_mul(dr, load64(di + c * 8))); }
+                var eu = 2 * (_lext_xexp(u) + te);
+                if (eu > fe) { fe = eu; }
+            }
+        }
+        if (er != none) {
+            var s = f64_from(0);
+            for (var c2 = 0; c2 < n; c2 = c2 + 1) {
+                var t2 = load64(Tm + (r * n + c2) * 8);
+                if ((t2 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    var k = load64(Te + (r * n + c2) * 8) - er;
+                    if (k >= 0 - 1100) { s = f64_add(s, _lext_pow2mul(f64_abs(t2), k)); }
+                }
+            }
+            var sm = _lext_xman(s);
+            var se = _lext_xexp(s) + er;
+            if ((rsm & 0x7FFF_FFFF_FFFF_FFFF) == 0 || se > rse || (se == rse && f64_gt(sm, rsm) == 1)) {
+                rsm = sm;
+                rse = se;
+            }
+        }
+    }
+    store64(out, rsm);
+    store64(out + 8, rse);
+    store64(out + 16, f64_from(0));
+    store64(out + 24, 0);
+    if (fe == none) { return 0; }
+    var ss = f64_from(0);
+    for (var r2 = 0; r2 < n; r2 = r2 + 1) {
+        var dr2 = F64_ONE;
+        if (d != 0) { dr2 = load64(d + r2 * 8); }
+        for (var c3 = 0; c3 < n; c3 = c3 + 1) {
+            var t3 = load64(Tm + (r2 * n + c3) * 8);
+            if ((t3 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                var u3 = t3;
+                if (d != 0) { u3 = f64_mul(t3, f64_mul(dr2, load64(di + c3 * 8))); }
+                var mu = _lext_xman(u3);
+                var k3 = 2 * (_lext_xexp(u3) + load64(Te + (r2 * n + c3) * 8)) - fe;
+                if (k3 >= 0 - 1100) { ss = f64_add(ss, _lext_pow2mul(f64_mul(mu, mu), k3)); }
+            }
+        }
+    }
+    store64(out + 16, _lext_xman(ss));
+    store64(out + 24, _lext_xexp(ss) + fe);
+    return 0;
+}
+
+# 3.5.0 W4: the wide squarings' error bound, U = |M| (g |M| + R) + R (|M| + R) for wide n x n M (Mm,
+# Me) and its bound R (Rm, Re), into Um, Ue: each entry summed over its 4 n terms at their largest
+# exponent (a term past 2^-1100 of it left out), then times gu (1 + (2 n + 4) 2^-52, its sums'
+# roundings and those left out) once. The wide form has no subnormals, so no floor. Ex: n^2 words of
+# scratch. (Review: the largest exponent is found from Ex in one add a term, and each term's shift is
+# `_lext_pow2mul`'s one multiply inline: on positive matrices scaled by 2^+-300, eigen_power through the
+# wide squarings went from 1.8 - 5.6 times the pre-wave-2 tree to 2.0 - 3.3 times it, the same bits.)
+# [measured: scratch_W4 ab.sh (scaled seed 8, 20 matrices), base, first form, this tree, 2026-11-14]
+# (Second review) That is 2.2 to 3.5 times the pre-wave-2 tree again, and against 3.4.2, which had no wide
+# squarings, 2.6 to 71 times: 18 to 26 at n = 16, 67 to 71 at n = 64 (⚠ above `_lext_gf_risk`).
+# [measured: scratch_W4 r2 costgen.py, timeit.sh (pos seed 8); 3.4.2, pre-wave-2, this tree, 2026-11-14]
+fn _lext_gfw_err(Mm, Me, Rm, Re, Um, Ue, n, g, gu, Ex) {
+    var none = 0 - (1 << 60);
+    # (review) Ex[q]: the larger exponent of M_q and R_q where not 0 (none where both are), so the
+    # largest exponent of an entry's 4 n terms is max_l Ex_rl + Ex_lc, one add a term where it was four
+    for (var q = 0; q < n * n; q = q + 1) {
+        var eq = none;
+        if ((load64(Mm + q * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0) { eq = load64(Me + q * 8); }
+        if ((load64(Rm + q * 8) & 0x7FFF_FFFF_FFFF_FFFF) != 0 && load64(Re + q * 8) > eq) { eq = load64(Re + q * 8); }
+        store64(Ex + q * 8, eq);
+    }
+    for (var r = 0; r < n; r = r + 1) {
+        for (var c = 0; c < n; c = c + 1) {
+            var emx = none;
+            for (var l0 = 0; l0 < n; l0 = l0 + 1) {
+                var x1 = load64(Ex + (r * n + l0) * 8);
+                var x2 = load64(Ex + (l0 * n + c) * 8);
+                if (x1 != none && x2 != none && x1 + x2 > emx) { emx = x1 + x2; }
+            }
+            if (emx == none) {
+                _lext_gfw_put(Um, Ue, r * n + c, f64_from(0), 0);
+            } else {
+                var s = f64_from(0);
+                for (var l = 0; l < n; l = l + 1) {
+                    var orl = (r * n + l) * 8;
+                    var olc = (l * n + c) * 8;
+                    var a1 = f64_abs(load64(Mm + orl));
+                    var b1 = load64(Rm + orl);
+                    var a2 = f64_abs(load64(Mm + olc));
+                    var b2 = load64(Rm + olc);
+                    var ea1 = load64(Me + orl);
+                    var eb1 = load64(Re + orl);
+                    var ea2 = load64(Me + olc);
+                    var eb2 = load64(Re + olc);
+                    # the four terms g |M_rl| |M_lc|, R_rl |M_lc|, |M_rl| R_lc, R_rl R_lc, in that order
+                    for (var t = 0; t < 4; t = t + 1) {
+                        var f1 = a1;
+                        var e1 = ea1;
+                        var f2 = a2;
+                        var e2 = ea2;
+                        if (t == 1 || t == 3) {
+                            f1 = b1;
+                            e1 = eb1;
+                        }
+                        if (t >= 2) {
+                            f2 = b2;
+                            e2 = eb2;
+                        }
+                        if ((f1 & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (f2 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                            var fp = f64_mul(f1, f2);
+                            if (t == 0) { fp = f64_mul(fp, g); }
+                            var k = e1 + e2 - emx;
+                            # k in [-1000, 0]: `_lext_pow2mul`'s one multiply, inline
+                            if (k >= 0 - 1000) {
+                                s = f64_add(s, f64_mul(fp, (1023 + k) << 52));
+                            } else {
+                                if (k >= 0 - 1100) { s = f64_add(s, _lext_pow2mul(fp, k)); }
+                            }
+                        }
+                    }
+                }
+                _lext_gfw_put(Um, Ue, r * n + c, f64_mul(s, gu), emx);
+            }
+        }
+    }
+    return 0;
+}
+
+# Gelfand's squarings (`_lext_gf_loop`) on the wide B'^m 2^-e_int held in W (10 n^2 words: Mm, Me,
+# T's Tm, Te, then (3.5.0 W4) the bound R's Rm, Re, U's Um, Ue and V = |T| + U's Vm, Ve), at most kmax
+# more. R bounds |M - X| entrywise for the exact X (as in `_lext_gf_loop`), U the same for T
+# (`_lext_gfw_err`), and the bound after each square is the smaller of V's largest row sum and the
+# Frobenius norm of D V D^-1 (d = 0: of V), both formed wide and allowed for their sums' roundings; no
+# Collatz-Wielandt bound (its z floors at 2^-52 of its largest entry, and could not follow these
+# exponents). 1 when certified (or V = 0: an exact zero power), 0 otherwise.
+fn _lext_gfw_loop(W, n, d, di, e0, m0, thr, kmax) {
+    var nn = n * n;
+    var Mm = W;
+    var Me = W + nn * 8;
+    var Tm = W + 2 * nn * 8;
+    var Te = W + 3 * nn * 8;
+    var Rm = W + 4 * nn * 8;
+    var Re = W + 5 * nn * 8;
+    var Um = W + 6 * nn * 8;
+    var Ue = W + 7 * nn * 8;
+    var Vm = W + 8 * nn * 8;
+    var Ve = W + 9 * nn * 8;
+    var g = f64_mul(f64_from(n + 2), 0x3CC0000000000000);   # (n + 2) 2^-51
+    var gu = f64_add(F64_ONE, f64_mul(f64_from(2 * n + 4), 0x3CB0000000000000));   # 1 + (2 n + 4) 2^-52
+    var gr = f64_add(F64_ONE, f64_mul(f64_from(n + 4), 0x3CB0000000000000));   # 1 + (n + 4) 2^-52
+    var gf = f64_add(F64_ONE, f64_mul(f64_from(n * n + 8), 0x3CB0000000000000));   # 1 + (n^2 + 8) 2^-52
+    var e_int = e0;
+    var m = m0;
+    var nb: i64[4];
+    for (var k = 1; k <= kmax; k = k + 1) {
+        _lext_gfw_sq(Mm, Me, Tm, Te, n);
+        _lext_gfw_err(Mm, Me, Rm, Re, Um, Ue, n, g, gu, Vm);   # (Vm: its exponent scratch, V formed after)
+        # V = |T| + U, each entry at the larger exponent
+        for (var q0 = 0; q0 < nn; q0 = q0 + 1) {
+            var tm = f64_abs(load64(Tm + q0 * 8));
+            var um = load64(Um + q0 * 8);
+            var te = load64(Te + q0 * 8);
+            var ue = load64(Ue + q0 * 8);
+            if ((tm & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+                _lext_gfw_put(Vm, Ve, q0, um, ue);
+            } else {
+                if ((um & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+                    _lext_gfw_put(Vm, Ve, q0, tm, te);
+                } else {
+                    if (te >= ue) {
+                        _lext_gfw_put(Vm, Ve, q0, f64_add(tm, _lext_pow2mul(um, ue - te)), te);
+                    } else {
+                        _lext_gfw_put(Vm, Ve, q0, f64_add(um, _lext_pow2mul(tm, te - ue)), ue);
+                    }
+                }
+            }
+        }
+        _lext_gfw_norms(Vm, Ve, n, d, di, &nb);
+        var rsm = load64(&nb);
+        # V = 0: T = 0 and its bound 0, an exact zero power (3.4.2 took any T read as 0, ⛔ above)
+        if ((rsm & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }
+        m = 2 * m;
+        var ex = load64(&nb + 8);
+        var ln = f64_add(_lext_log2abs(f64_mul(rsm, gr)), f64_from(ex));
+        var ssm = load64(&nb + 16);
+        if ((ssm & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            var lf = f64_mul(F64_HALF, f64_add(_lext_log2abs(f64_mul(ssm, gf)), f64_from(load64(&nb + 24))));
+            if (f64_lt(lf, ln) == 1) { ln = lf; }
+        }
+        var lb = f64_div(f64_add(ln, f64_from(2 * e_int)), f64_from(m));
+        if (f64_le(lb, thr) == 1) { return 1; }
+        for (var q = 0; q < nn; q = q + 1) {
+            var tq = load64(Tm + q * 8);
+            store64(Mm + q * 8, tq);
+            if ((tq & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+                store64(Me + q * 8, 0);
+            } else {
+                store64(Me + q * 8, load64(Te + q * 8) - ex);
+            }
+            var uq = load64(Um + q * 8);
+            store64(Rm + q * 8, uq);
+            if ((uq & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+                store64(Re + q * 8, 0);
+            } else {
+                store64(Re + q * 8, load64(Ue + q * 8) - ex);
+            }
+        }
         e_int = 2 * e_int + ex;
     }
     return 0;
+}
+
+# The wide loop from an f64 frame X (n x n row-major, no term of it lost) holding B'^m 2^-e_int
+# times 2^sh, with RX its entrywise bound (3.5.0 W4; 0: X exact): 1 certified, 0 not, 2 its 10 n^2
+# words refused.
+fn _lext_gfw_from(X, RX, n, sh, d, di, e_int, m, thr, kmax) {
+    if (n > (ALLOC_MAX / 8) / (10 * n)) { return 2; }
+    var W = hisab_alloc(10 * n * n * 8);
+    if (W == 0) { return 2; }
+    var We = W + n * n * 8;
+    var Wr = W + 4 * n * n * 8;
+    var Wre = W + 5 * n * n * 8;
+    for (var q = 0; q < n * n; q = q + 1) {
+        _lext_gfw_put(W, We, q, load64(X + q * 8), 0 - sh);
+        if (RX != 0) { _lext_gfw_put(Wr, Wre, q, load64(RX + q * 8), 0 - sh); }
+    }
+    return _lext_gfw_loop(W, n, d, di, e_int, m, thr, kmax);
+}
+
+# The wide loop on B' = D^-1 (A / |lam|) D itself (la = |lam|), each entry formed from A as
+# `_lext_gf_form`'s far-range branch forms it but kept at its own exponent: m = 1, e_int = 0; its
+# bound R (3.5.0 W4) 2^-49 |B'|, for the four roundings of each entry and D^-1's own.
+fn _lext_gfw_froma(A, n, la, d, di, thr, kmax) {
+    if (n > (ALLOC_MAX / 8) / (10 * n)) { return 2; }
+    var W = hisab_alloc(10 * n * n * 8);
+    if (W == 0) { return 2; }
+    var We = W + n * n * 8;
+    var Wr = W + 4 * n * n * 8;
+    var Wre = W + 5 * n * n * 8;
+    var ml = _lext_xman(la);
+    var el = _lext_xexp(la);
+    for (var r = 0; r < n; r = r + 1) {
+        for (var c = 0; c < n; c = c + 1) {
+            var a = ganita_mat_get(A, r, c);
+            var w = f64_from(0);
+            if ((a & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                w = f64_mul(f64_div(_lext_xman(a), ml), f64_mul(load64(d + c * 8), load64(di + r * 8)));
+            }
+            _lext_gfw_put(W, We, r * n + c, w, _lext_xexp(a) - el);
+            _lext_gfw_put(Wr, Wre, r * n + c, f64_abs(w), _lext_xexp(a) - el - 49);
+        }
+    }
+    return _lext_gfw_loop(W, n, d, di, 0, 1, thr, kmax);
+}
+
+# ---- 3.5.0 W4 (review): Gelfand's squarings in double-double ----
+# ⛔ 3.5.0 W4 — THE f64 ROUNDING BOUND REFUSED RIGHT ANSWERS. An entrywise bound on the squarings'
+# rounding (⛔ above `_lext_gf_risk`) grows by about 2 kappa a square once a power's signs cancel in
+# M M (|M| |M| near kappa |M M|): through a slowly decaying subdominant eigenvalue's transient on a
+# non-normal A it outgrows the power itself before the bound can certify. The review's 4 x 4 (rows
+# C019431E31E31E32 3FADEA78411DAB74 C004461AC812E795 C015F10EF755DBC4 / 40122AAAAAAAAAAB
+# 3FE13A06D3A06D3A 4002333333333333 400B333333333333 / 400E867F9B2CE602 3FD277BAAEDE2115
+# 3FFC934C67F9B2CE 4006DD319FE6CB3A / 401B41B4E81B4E82 BFCDA740DA740DA7 4005428F5C28F5C3
+# 40187147AE147AE1; eigenvalues 0.9999999999999988, 0.995, 0.24875000000000053, -0.12437499999999967 by exact
+# bisection on its characteristic polynomial, so the answer is 1.25e-12 above rho) was Ok(3FF00000000015E4)
+# before the bound and NO_CONVERGENCE with it: in the f64 frame the bound's sum passed the power's 1.25
+# times over at the tenth square and 62 times at the eleventh, while the power alone certifies at the
+# twelfth (the deflated squares' at the tenth); the double-double squares certify at their twelfth. So
+# where the bound 3.4.2 formed from the computed powers alone certifies and the rounding bound does not
+# (`_lext_gf_loop` returns 3), the squarings are taken again here, with every power a double-double: the
+# bound then starts near 2^-100 instead of 2^-49 and grows the same way, some 11 more squares at 2 kappa
+# = 25. An answer this certifies is rigorously certified as the f64 squarings' are; one it does not is
+# NO_CONVERGENCE as before (⚠ above `_lext_gf_risk` for both counts).
+# [measured: scratch_W4 p1.tcyr, the first form and this tree instrumented, 2026-11-14]
+#
+# The squarings run on F = D2^-1 A D2 2^-e0, D2 the frame's d rounded down to powers of two (any
+# positive D bounds rho, so F is A's entries times powers of two: exact, where one lands below
+# DBL_MIN one subnormal unit of bound instead), and each power M = F^m 2^-e_int is Mh + Ml, |Ml| <=
+# 2^-53 |Mh|, with R bounding |M - X| for the exact X. T = M M: each Mh_rl Mh_lc is split exactly
+# (Dekker, on Veltkamp's split), the high parts summed by TwoSum into S and every error, with the
+# cross terms Mh Ml + Ml Mh, into E, then T = Th + Tl = S + E exactly (TwoSum). E is 4 n rounded
+# terms: the TwoSum errors (each below 2^-53 of a partial sum, so n 2^-53 sum |Mh| |Mh| together),
+# the product errors and the cross terms (2^-53 each), so with Ml Ml left out |T - M M| <= (gamma_4n
+# 2^-53 (n + 4) + 2^-106) |Mh| |Mh| <= g2 |Mh| |Mh|, g2 = (4 n^2 + 20 n + 8) 2^-106, plus (16 n + 16)
+# 2^-1074 an entry (second review: an entry with a term that can be non-zero, as in `_lext_gf_loop`)
+# where a product could fall below 2^-959 (Dekker's split is exact above about 2^-969) or a low part is
+# below DBL_MIN. The bound then moves as in `_lext_gf_loop`: U = Am (g2 Am + R) + R (Am + R) with Am =
+# (|Mh| + |Ml|)(1 + 2^-51) >= |M|, times 1 + (2 n + 4) 2^-52 for its sums, n 2^-1071 more where its own
+# products could round in the subnormals (both floors only on the entries with a term that can be non-
+# zero); every bound is taken on |Th| + (|Tl| + U)(1 + 2^-51), and the test is against |lam| itself:
+# (log2 bound + 2 e_int) / m - log2 |lam| at most thr - 2^-30 (the margin for the log2s' and the sum's
+# rounding, each a few units in the last place of numbers up to 1100 in magnitude). Once the bound is
+# past twice |Th|'s row sum and no lower than the last square's, it is the bound that grows, square by
+# square, and the squarings stop (0).
+# The workspace's n x n blocks (n^2 + 2 words each, so a row read in pairs past the last entry stays
+# inside), then seven row temporaries of n + 2 words (S, E, P, Q, Y, V1, V2), z and zs (n + 2 each),
+# and D2, D2^-1 (n each): `_lext_gfd_blk` gives block i, `_lext_gfd_row` row temporary j (z: 7, zs: 8).
+# Between a square and the next, H holds the floor's patterns and P one row of them (`_lext_gf_pat`).
+enum _LextGfd {
+    _LGFD_MH = 0;
+    _LGFD_ML = 1;
+    _LGFD_TH = 2;
+    _LGFD_TL = 3;
+    _LGFD_R = 4;
+    _LGFD_U = 5;
+    _LGFD_AM = 6;
+    _LGFD_H = 7;
+    _LGFD_L = 8;
+    _LGFD_NBLK = 9;
+}
+fn _lext_gfd_blk(W, n, i) { return W + i * (n * n + 2) * 8; }
+fn _lext_gfd_row(W, n, j) { return W + (_LGFD_NBLK * (n * n + 2) + j * (n + 2)) * 8; }
+# The workspace for `_lext_gfd_loop`, zeroed (D2 = D2^-1 = I): 9 n^2 + 13 n + 38 words, or 0 when refused
+fn _lext_gfd_ws(n) {
+    if (n > 16 && n > (ALLOC_MAX / 8) / (10 * n)) { return 0; }
+    var W = hisab_alloc((9 * n * n + 13 * n + 38) * 8);
+    if (W == 0) { return 0; }
+    var d2 = _lext_gfd_row(W, n, 9);
+    for (var i = 0; i < n; i = i + 1) {
+        store64(d2 + i * 8, F64_ONE);
+        store64(d2 + (n + i) * 8, F64_ONE);
+    }
+    return W;
+}
+
+# T = M M for the workspace's double-double M = Mh + Ml, into Th + Tl exactly as S + E (see above): each
+# Mh_rl Mh_lc split by Dekker on Veltkamp's halves (H, L), its rounded part summed into S by TwoSum, and
+# the product's error, TwoSum's error and the cross terms Mh_rl Ml_lc + Ml_rl Mh_lc into E. Each row is
+# formed in pairs over n + (n & 1) entries (a pair past an odd row reads the next row's first entry, or a
+# pad, and its write is overwritten by the next row, or lands in a pad that is zeroed after).
+fn _lext_gfd_sq(W, n) {
+    var nn = n * n;
+    var Mh = _lext_gfd_blk(W, n, _LGFD_MH);
+    var Ml = _lext_gfd_blk(W, n, _LGFD_ML);
+    var Th = _lext_gfd_blk(W, n, _LGFD_TH);
+    var Tl = _lext_gfd_blk(W, n, _LGFD_TL);
+    var H = _lext_gfd_blk(W, n, _LGFD_H);
+    var L = _lext_gfd_blk(W, n, _LGFD_L);
+    var S = _lext_gfd_row(W, n, 0);
+    var E = _lext_gfd_row(W, n, 1);
+    var P = _lext_gfd_row(W, n, 2);
+    var Q = _lext_gfd_row(W, n, 3);
+    var Y = _lext_gfd_row(W, n, 4);
+    var V1 = _lext_gfd_row(W, n, 5);
+    var V2 = _lext_gfd_row(W, n, 6);
+    var ne = n + (n & 1);
+    var nq = nn + (nn & 1);
+    # Veltkamp's split of every Mh: H = c Mh - (c Mh - Mh), L = Mh - H, c = 2^27 + 1 (Th: scratch)
+    f64v_scale(Th, Mh, 0x41A0000002000000, nq);   # 2^27 + 1
+    f64v_sub(H, Th, Mh, nq);
+    f64v_sub(H, Th, H, nq);
+    f64v_sub(L, Mh, H, nq);
+    for (var r5 = 0; r5 < n; r5 = r5 + 1) {
+        for (var c5 = 0; c5 < ne; c5 = c5 + 1) {
+            store64(S + c5 * 8, f64_from(0));
+            store64(E + c5 * 8, f64_from(0));
+        }
+        for (var l = 0; l < n; l = l + 1) {
+            var orl = (r5 * n + l) * 8;
+            var av = load64(Mh + orl);
+            if ((av & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                var ah = load64(H + orl);
+                var aL = load64(L + orl);
+                var alo = load64(Ml + orl);
+                var bM = Mh + l * n * 8;
+                var bH = H + l * n * 8;
+                var bL = L + l * n * 8;
+                var bm = Ml + l * n * 8;
+                f64v_scale(P, bM, av, ne);   # p = a b, rounded
+                f64v_scale(Q, bH, ah, ne);   # Dekker: ((ah bh - p) + ah bl + al bh) + al bl = a b - p
+                f64v_sub(Q, Q, P, ne);
+                f64v_scale(Y, bL, ah, ne);
+                f64v_add(Q, Q, Y, ne);
+                f64v_scale(Y, bH, aL, ne);
+                f64v_add(Q, Q, Y, ne);
+                f64v_scale(Y, bL, aL, ne);
+                f64v_add(Q, Q, Y, ne);
+                f64v_add(Y, S, P, ne);   # TwoSum: s = S + p, err = (S - (s - bb)) + (p - bb), bb = s - S
+                f64v_sub(V1, Y, S, ne);
+                f64v_sub(V2, Y, V1, ne);
+                f64v_sub(V2, S, V2, ne);
+                f64v_sub(V1, P, V1, ne);
+                f64v_add(V2, V2, V1, ne);
+                var sw = S;
+                S = Y;
+                Y = sw;
+                f64v_add(E, E, V2, ne);
+                f64v_add(E, E, Q, ne);
+                f64v_scale(V1, bm, av, ne);   # the cross terms Mh Ml + Ml Mh
+                f64v_add(E, E, V1, ne);
+                if ((alo & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    f64v_scale(V1, bM, alo, ne);
+                    f64v_add(E, E, V1, ne);
+                }
+            }
+        }
+        # Th + Tl = S + E exactly (TwoSum)
+        var th = Th + r5 * n * 8;
+        var tl = Tl + r5 * n * 8;
+        f64v_add(th, S, E, ne);
+        f64v_sub(V1, th, S, ne);
+        f64v_sub(V2, th, V1, ne);
+        f64v_sub(V2, S, V2, ne);
+        f64v_sub(V1, E, V1, ne);
+        f64v_add(tl, V2, V1, ne);
+    }
+    store64(Th + nn * 8, f64_from(0));
+    store64(Tl + nn * 8, f64_from(0));
+    return 0;
+}
+
+# The squarings on the workspace W's M = Mh + Ml = F^m 2^-e_int (m = 1, e_int = e0 on entry) with R its
+# bound and D2, D2^-1 its diagonal scalings, lgl = log2 |lam|, at most kmax: 1 certified, 0 not.
+fn _lext_gfd_loop(W, n, lgl, e0, thr, kmax) {
+    var nn = n * n;
+    var Mh = _lext_gfd_blk(W, n, _LGFD_MH);
+    var Ml = _lext_gfd_blk(W, n, _LGFD_ML);
+    var Th = _lext_gfd_blk(W, n, _LGFD_TH);
+    var Tl = _lext_gfd_blk(W, n, _LGFD_TL);
+    var R = _lext_gfd_blk(W, n, _LGFD_R);
+    var U = _lext_gfd_blk(W, n, _LGFD_U);
+    var AM = _lext_gfd_blk(W, n, _LGFD_AM);
+    var Y = _lext_gfd_row(W, n, 4);
+    var V1 = _lext_gfd_row(W, n, 5);
+    var z = _lext_gfd_row(W, n, 7);
+    var zs = _lext_gfd_row(W, n, 8);
+    var d2 = _lext_gfd_row(W, n, 9);
+    var di2 = d2 + n * 8;
+    for (var i = 0; i < n; i = i + 1) { store64(z + i * 8, F64_ONE); }
+    var g2 = f64_mul(f64_from(4 * nn + 20 * n + 8), 0x3950000000000000);   # 2^-106
+    var gu = f64_add(F64_ONE, f64_mul(f64_from(2 * n + 4), 0x3CB0000000000000));   # 1 + (2 n + 4) 2^-52
+    var gr = f64_add(F64_ONE, f64_mul(f64_from(n + 6), 0x3CB0000000000000));   # 1 + (n + 6) 2^-52
+    var gf = f64_add(F64_ONE, f64_mul(f64_from(nn + 12), 0x3CB0000000000000));   # 1 + (n^2 + 12) 2^-52
+    var up1 = 0x3FF0000000000002;   # 1 + 2^-51
+    var fl = f64_mul(f64_from(n), 0x0000000000000008);   # n 2^-1071
+    var fd = f64_mul(f64_from(16 * n + 16), 0x0000000000000001);   # (16 n + 16) 2^-1074
+    var thl = f64_sub(thr, 0x3E10000000000000);   # 2^-30
+    var ne = n + (n & 1);
+    var e_int = e0;
+    var m = 1;
+    var lbp = f64_from(0);   # the last square's lb
+    for (var k = 1; k <= kmax; k = k + 1) {
+        var fp = f64_from(0);
+        var mlo = _lext_lowest(Mh, nn);
+        if (mlo + mlo < 0 - 959 || _lext_lowest(Ml, nn) < 0 - 1022) { fp = fd; }
+        _lext_gfd_sq(W, n);
+        # U = Am (g2 Am + R) + R (Am + R), as `_lext_gf_loop` forms it
+        for (var q1 = 0; q1 < nn; q1 = q1 + 1) {
+            store64(AM + q1 * 8, f64_mul(f64_add(f64_abs(load64(Mh + q1 * 8)), f64_abs(load64(Ml + q1 * 8))), up1));
+        }
+        var ulo = _lext_lowest(AM, nn);
+        var rlo = _lext_lowest(R, nn);
+        if (rlo < ulo) { ulo = rlo; }
+        var fu = f64_from(0);
+        if (ulo + ulo + _lext_xtop(g2) < 0 - 1021) { fu = fl; }
+        fu = f64_add(fu, fp);
+        # (second review) the floor only where some term can be non-zero (`_lext_gf_prow`): the patterns in
+        # H, row r's in P (both free until the next square)
+        var nb = (n + 63) / 64;
+        var BP = _lext_gfd_blk(W, n, _LGFD_H);
+        var PR = _lext_gfd_row(W, n, 2);
+        if ((fu & 0x7FFF_FFFF_FFFF_FFFF) != 0) { _lext_gf_pat(AM, R, n, nb, BP); }
+        for (var r6 = 0; r6 < n; r6 = r6 + 1) {
+            var ur = U + r6 * n * 8;
+            for (var c6 = 0; c6 < ne; c6 = c6 + 1) { store64(Y + c6 * 8, f64_from(0)); }
+            for (var l2 = 0; l2 < n; l2 = l2 + 1) {
+                var a2 = load64(AM + (r6 * n + l2) * 8);
+                var b2 = load64(R + (r6 * n + l2) * 8);
+                var s1 = f64_add(f64_mul(g2, a2), b2);
+                var s2 = f64_add(a2, b2);
+                # g2 Am_rl can underflow to 0 with Am_rl R_l still to add: s1 and s2 are taken apart
+                if ((s1 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    f64v_scale(V1, AM + l2 * n * 8, s1, ne);
+                    f64v_add(Y, Y, V1, ne);
+                }
+                if ((s2 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                    f64v_scale(V1, R + l2 * n * 8, s2, ne);
+                    f64v_add(Y, Y, V1, ne);
+                }
+            }
+            if ((fu & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+                for (var c7 = 0; c7 < n; c7 = c7 + 1) { store64(ur + c7 * 8, f64_mul(load64(Y + c7 * 8), gu)); }
+            } else {
+                _lext_gf_prow(AM, R, n, nb, BP, r6, PR);
+                for (var c9 = 0; c9 < n; c9 = c9 + 1) {
+                    var u9 = f64_mul(load64(Y + c9 * 8), gu);
+                    if (((load64(PR + (c9 / 64) * 8) >> (c9 % 64)) & 1) == 1) { u9 = f64_add(u9, fu); }
+                    store64(ur + c9 * 8, u9);
+                }
+            }
+        }
+        # the bound on |X|: |Th| + V, V = (|Tl| + U)(1 + 2^-51) into AM; its largest row sum, the sum of
+        # squares of D2 (|Th| + V) D2^-1 (exact scalings), and cw(Th, V)
+        var rs = f64_from(0);
+        var ss = f64_from(0);
+        var rh = f64_from(0);   # |Th|'s largest row sum
+        for (var r7 = 0; r7 < n; r7 = r7 + 1) {
+            var s7 = f64_from(0);
+            var h7 = f64_from(0);
+            var dr = load64(d2 + r7 * 8);
+            for (var c8 = 0; c8 < n; c8 = c8 + 1) {
+                var o8 = (r7 * n + c8) * 8;
+                var v8 = f64_mul(f64_add(f64_abs(load64(Tl + o8)), load64(U + o8)), up1);
+                store64(AM + o8, v8);
+                var u8 = f64_add(f64_abs(load64(Th + o8)), v8);
+                s7 = f64_add(s7, u8);
+                h7 = f64_add(h7, f64_abs(load64(Th + o8)));
+                u8 = f64_mul(u8, f64_mul(dr, load64(di2 + c8 * 8)));
+                ss = f64_add(ss, f64_mul(u8, u8));
+            }
+            if (f64_gt(s7, rs) == 1 || f64_eq(s7, s7) == 0) { rs = s7; }
+            if (f64_gt(h7, rh) == 1) { rh = h7; }
+        }
+        if ((rs & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return 1; }   # X^2 = 0 exactly: rho = 0
+        if (f64_lt(rs, F64_POS_INF) == 0) { return 0; }   # not finite: no bound
+        m = 2 * m;
+        var ln = _lext_log2abs(f64_mul(rs, gr));
+        if (f64_gt(ss, 0) == 1 && f64_lt(ss, F64_POS_INF) == 1) {
+            var lf = f64_mul(F64_HALF, _lext_log2abs(f64_mul(ss, gf)));
+            if (f64_lt(lf, ln) == 1) { ln = lf; }
+        }
+        var cwm = _lext_cw(Th, AM, n, z, zs);
+        if (f64_gt(cwm, 0) == 1 && f64_lt(cwm, F64_POS_INF) == 1) {
+            var lc = _lext_log2abs(f64_mul(cwm, gf));
+            if (f64_lt(lc, ln) == 1) { ln = lc; }
+        }
+        var lb = f64_sub(f64_div(f64_add(ln, f64_from(2 * e_int)), f64_from(m)), lgl);
+        if (f64_le(lb, thl) == 1) { return 1; }
+        # the bound mostly U (past twice |Th|'s row sum) and no lower than the last square's: the bound,
+        # not the power, now grows square by square, and no later square certifies
+        if (k > 1 && f64_ge(lb, lbp) == 1 && f64_gt(rs, f64_add(rh, rh)) == 1) { return 0; }
+        lbp = lb;
+        # M = T 2^-ex: exact, but where a part lands below DBL_MIN (one subnormal unit each, into R)
+        var ex = _lext_xexp(rs);
+        for (var q2 = 0; q2 < nn; q2 = q2 + 1) {
+            var o2 = q2 * 8;
+            var hv = load64(Th + o2);
+            var lv = load64(Tl + o2);
+            var hs = _lext_pow2mul(hv, 0 - ex);
+            var ls = _lext_pow2mul(lv, 0 - ex);
+            store64(Mh + o2, hs);
+            store64(Ml + o2, ls);
+            var rv = _lext_up2(load64(U + o2), 0 - ex);
+            var lost = 0;
+            if ((hv & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (hs & 0x7FF0_0000_0000_0000) == 0) { lost = 1; }
+            if ((lv & 0x7FFF_FFFF_FFFF_FFFF) != 0 && (ls & 0x7FF0_0000_0000_0000) == 0) { lost = 1; }
+            # two subnormal units, rounded up past rv's own last place (a large rv absorbs an add alone)
+            if (lost == 1) { rv = f64_mul(f64_add(rv, 2), up1); }
+            store64(R + o2, rv);
+        }
+        e_int = 2 * e_int + ex;
+    }
+    return 0;
+}
+
+# The squarings in double-double for A, lam (la = |lam|) and the frame's d: F 2^-e0 formed into a fresh
+# workspace (above), then `_lext_gfd_loop`. 1 certified, 0 not, 2 the workspace refused.
+fn _lext_gfd(A, n, la, d, thr, kmax) {
+    var W = _lext_gfd_ws(n);
+    if (W == 0) { return 2; }
+    var Mh = _lext_gfd_blk(W, n, _LGFD_MH);
+    var R = _lext_gfd_blk(W, n, _LGFD_R);
+    var d2 = _lext_gfd_row(W, n, 9);
+    var di2 = d2 + n * 8;
+    var sd = _lext_gfd_row(W, n, 0);   # D2's exponents, in a row temporary the squarings overwrite later
+    var none = 0 - (1 << 60);
+    for (var i = 0; i < n; i = i + 1) {
+        var si = _lext_xtop(load64(d + i * 8));   # d_i in [2^-60, 1]: a normal double
+        store64(sd + i * 8, si);
+        store64(d2 + i * 8, (1023 + si) << 52);
+        store64(di2 + i * 8, (1023 - si) << 52);
+    }
+    # F 2^-e0 into Mh, e0 the largest exponent of an entry of F, so every |entry| is below 2
+    var e0 = none;
+    for (var r = 0; r < n; r = r + 1) {
+        for (var c = 0; c < n; c = c + 1) {
+            var a = ganita_mat_get(A, r, c);
+            if ((a & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                var ea = _lext_xtop(a) + load64(sd + c * 8) - load64(sd + r * 8);
+                if (ea > e0) { e0 = ea; }
+            }
+        }
+    }
+    if (e0 == none) { return 1; }   # A = 0: rho(A) = 0
+    for (var r1 = 0; r1 < n; r1 = r1 + 1) {
+        for (var c1 = 0; c1 < n; c1 = c1 + 1) {
+            var a1 = ganita_mat_get(A, r1, c1);
+            var o1 = (r1 * n + c1) * 8;
+            if ((a1 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                var ex1 = _lext_xexp(a1) + load64(sd + c1 * 8) - load64(sd + r1 * 8) - e0;
+                store64(Mh + o1, _lext_xld(_lext_xman(a1), ex1));
+                # below DBL_MIN the entry rounded (or flushed): one subnormal unit bounds it
+                if (ex1 < 0 - 1021) { store64(R + o1, 1); }
+            }
+        }
+    }
+    return _lext_gfd_loop(W, n, _lext_log2abs(la), e0, thr, kmax);
 }
 
 # Gelfand's bound, on every answer of eigen_power's iteration (3.4.0 review: through the first
@@ -3269,8 +4367,12 @@ fn _lext_gf_loop(M, T, n, d, di, z, zs, e0, thr, kmax) {
 # bound is (1 + sum_i>1 (lambda_i / lam)^(2m))^(1/2m), so a few squarings; for a non-normal A,
 # C is the dominant eigenvalue's condition (||x y^T|| for its right and left eigenvectors) and
 # the squarings needed grow like log2(log2 C / 0.00144). An answer short of rho never falls below
-# rho(B). Each squaring is n^3 multiply-adds. lam = 0 (or not finite) is never certified: no
-# finite bound shows rho(A) <= 0.
+# rho(B), the powers' rounding bounded entry by entry (3.5.0 W4: ⛔ above `_lext_gf_risk`). Each
+# squaring is three n^3 products (the power and its bound). Where that rounding bound alone refuses
+# (the powers' own bound certifies; `_lext_gf_loop` returns 3, from the deflated squarings or the
+# frame's), the squarings are taken once more in double-double on the frame (`_lext_gfd`, 3.5.0 W4
+# review), whose verdict is returned. lam = 0 (or
+# not finite) is never certified: no finite bound shows rho(A) <= 0.
 # ⭐ 3.4.1 — a non-symmetric A is first deflated by the answer's own vector (`_lext_deflate`, a
 # similarity, so the bounds stay valid whatever the vector is), which takes the C factor above
 # out of the squarings, and every power is bounded by its Collatz-Wielandt ratio too (`_lext_cw`)
@@ -3322,9 +4424,10 @@ fn _lext_gelfand(A, n, lam, v, T, z, zs) {
         store64(di + i1 * 8, f64_div(F64_ONE, dv));
     }
     var thr = 0x3F57A013FACA6C6B;   # ln(1.001)/ln(2) = 0.00144197417390648...
-    var eo: i64[1];
+    var eo: i64[2];
     if (_lext_gf_form(A, n, la, d, di, M, T, &eo) == 1) { return 1; }
     var e0 = load64(&eo);
+    var lossy = load64(&eo + 8);
     # An exactly symmetric A (T holds it, from the pass above) is certified by its inertia: two
     # Cholesky factorizations, n^3 / 3 multiply-adds in all, where the squarings cost n^3 each.
     var sym = 1;
@@ -3338,6 +4441,9 @@ fn _lext_gelfand(A, n, lam, v, T, z, zs) {
         var scr = _lext_sym_cert(T, M, n, la);
         if (scr >= 0) { return scr; }
     }
+    # 3.5.0: a frame that lost an entry of A is formed again from A with an exponent for every
+    # entry, and squared that way (no deflation: it works on the frame)
+    if (lossy == 1) { return _lext_gfw_froma(A, n, la, d, di, thr, 24); }
     # ⭐ 3.4.1 — A NON-SYMMETRIC A IS DEFLATED FIRST, AND EVERY POWER IS ALSO BOUNDED BY ITS
     # COLLATZ-WIELANDT RATIO. Through 3.4.0 the squarings had to wait out two things: the dominant
     # eigenvalue's own condition (||D^-1 B^m D||_inf tends to |y|^T |x| / |y^T x| times |lam|^m, so
@@ -3349,20 +4455,40 @@ fn _lext_gelfand(A, n, lam, v, T, z, zs) {
     # summed over l in order from +0, by f64v_scale and f64v_add since 3.4.1 LA3: a multiply
     # then an add, rounded separately on every target, so the inf and Frobenius bounds are 3.4.0's
     # bit for bit; see above).
+    # 3.5.0 W4: R bounds |M - B' 2^-e0| entrywise, B' the exact D^-1 (A / |lam|) D (each entry of M
+    # four roundings from it, and D^-1's own: 2^-49 relative), carried through the deflation and the
+    # squarings so that every bound is on the exact powers (⛔ above `_lext_gf_loop`)
+    var R = hisab_alloc(n * n * 8);
+    if (R == 0) { return 2; }
+    var ddr = 0;   # (review) 1 once a run of the squarings returns 3 (`_lext_gfd` below)
+    for (var q11 = 0; q11 < n * n; q11 = q11 + 1) {
+        store64(R + q11 * 8, _lext_up2(f64_abs(load64(M + q11 * 8)), 0 - 49));
+    }
     for (var q9 = 0; q9 < n; q9 = q9 + 1) { store64(z + q9 * 8, F64_ONE); }
     if (usev == 1) {
-        if (_lext_deflate(M, n, v, mv, d, T) == 1) {
-            var cw1 = _lext_cw(M, n, z, zs);
+        if (_lext_deflate(M, n, v, mv, d, T, R) == 1) {
+            var cw1 = _lext_cw(M, R, n, z, zs);
+            var gc = f64_add(F64_ONE, f64_mul(f64_from(n + 8), 0x3CB0000000000000));   # 1 + (n + 8) 2^-52
             if (f64_lt(cw1, F64_POS_INF) == 1) {
-                if (f64_le(f64_add(_lext_log2abs(cw1), f64_from(e0)), thr) == 1) { return 1; }
+                if (f64_le(f64_add(_lext_log2abs(f64_mul(cw1, gc)), f64_from(e0)), thr) == 1) { return 1; }
             }
-            if (_lext_gf_loop(M, T, n, 0, 0, z, zs, e0, thr, 12) == 1) { return 1; }
+            var g12 = _lext_gf_loop(M, R, T, n, 0, 0, z, zs, e0, thr, 12);
+            if (g12 == 1 || g12 == 2) { return g12; }   # certified (1), or the wide form's scratch refused (2)
+            if (g12 == 3) { ddr = 1; }
             # undecided: 3.4.0's frame again, with cw beside its two norms
             if (_lext_gf_form(A, n, la, d, di, M, T, &eo) == 1) { return 1; }
+            for (var q12 = 0; q12 < n * n; q12 = q12 + 1) {
+                store64(R + q12 * 8, _lext_up2(f64_abs(load64(M + q12 * 8)), 0 - 49));
+            }
             for (var q10 = 0; q10 < n; q10 = q10 + 1) { store64(z + q10 * 8, F64_ONE); }
         }
     }
-    return _lext_gf_loop(M, T, n, d, di, z, zs, e0, thr, 24);
+    var g24 = _lext_gf_loop(M, R, T, n, d, di, z, zs, e0, thr, 24);
+    if (g24 == 1 || g24 == 2) { return g24; }
+    if (g24 == 3) { ddr = 1; }
+    # (review) refused on the rounding bound alone: the squarings again in double-double
+    if (ddr == 1) { return _lext_gfd(A, n, la, d, thr, 24); }
+    return 0;
 }
 
 # w = A u for eigen_power's iteration (3.4.1), from Af, a row-major copy of A: each w_i summed
@@ -4934,7 +6060,8 @@ fn _lext_w_set(w, h, l, e) {
 #           ⭐ EVERY ANSWER OF THE ITERATION IS CERTIFIED (3.4.0): it is returned only when a
 #           Gelfand bound shows no eigenvalue larger than 1.001 |lambda| in modulus
 #           (`_lext_gelfand`), otherwise NO_CONVERGENCE. That catches an answer short of
-#           rho(A) by more than 0.1% whatever the cause, including a dominant LEFT eigenvector
+#           rho(A) by more than 0.1% whatever the cause (3.5.0 W4: the powers' rounding included,
+#           ⛔ below), including a dominant LEFT eigenvector
 #           orthogonal to the fixed seed, which no number of passes reaches. It does not see
 #           an answer above rho(A). Where the first pass over A does not certify the answer, an
 #           exactly symmetric A costs two Cholesky factorizations (n^3 / 3 multiply-adds in
@@ -4944,6 +6071,60 @@ fn _lext_w_set(w, h, l, e) {
 #           1.2 / 2.0 times 3.4.0's uncertified run (3.4.0: 2.5 / 3.5 / 6.3 times); an answer the
 #           deflated squarings leave undecided after 12 is put through 3.4.0's 24 as well, so a
 #           refused one costs up to 36 (see the loop for the measured costs).
+#           ⛔ 3.5.0 — UNDERFLOW WAS READ AS NILPOTENCE. The certificate's f64 frame lost every product
+#           of two entries below DBL_MIN against the frame's scale, so a chain of 3 x 3 blocks coupled at
+#           2^1000, whose diagonal blocks carry rho, squared to exactly 0 and 1.9 was certified for rho 2.
+#           On 600 chains (2 to 5 blocks, couplings 2^100 to 2^1020) 3.4.2 answered 12 wrong: the 6 below
+#           rho are NO_CONVERGENCE now, and the 6 above it (up to 0.66% over) stay, as Gelfand cannot see
+#           them. The squarings run with an exponent for every entry wherever the frame could lose one
+#           (`_lext_gfw_loop`): 455 of the 523 right answers are certified there, at 7 to 22 squarings,
+#           and none is refused; 6,000 ordinary matrices (dense, non-negative, symmetric, triangular-
+#           dominant, entries across 2^+-512, sparse) answer bit for bit as 3.4.2. A right answer
+#           certified wide costs 535 -> 799 us on a 9 x 9 chain, a refused one 63 -> 385 us (3.4.2
+#           certified it wrongly), and an ordinary non-normal 12 x 12 64.3 -> 66.6 us (noisy).
+#           [measured: scratch_L3 chains.py (seed 1, 600; flush seed 2, 300) and drv_gen (seeds 11, 12), 2026-11-14]
+#           [measured: scratch_L3 ab.bcyr / ct.bcyr, base and this tree, taskset, 5-6 runs each, 2026-11-14]
+#           ⛔ 3.5.0 W4 — THE POWERS' ROUNDING WAS NOT BOUNDED, so a term absorbed and then cancelled
+#           exactly still certified a short answer, with nothing near underflow: [[1, a, a, 0], [c, 0,
+#           0, 0], [-c, 0, 0, 0], [0, 0, h, 3/4]], a = 1.3 2^e, c = 1.7 2^e, h = 1.1 2^e (rho 1),
+#           answered Ok(3/4) for e = 30 to 590. The squarings now carry an entrywise bound on their
+#           rounding (⛔ above `_lext_gf_risk`), and every short or non-eigenvalue Ok answer 3.4.2 gave
+#           on that family (200 of 252) is NO_CONVERGENCE.
+#           ⚠ RIGHT ANSWERS THE BOUND REFUSES. The bound grows about 2 kappa a square where a power's
+#           signs cancel (|M| |M| near kappa |M M|), so on a signed non-normal A whose subdominant
+#           eigenvalue decays slowly it can outgrow the power before the power certifies: the review's
+#           [[-6.3155, 0.0584, -2.5342, -5.4854], [4.5417, 0.5383, 2.2750, 3.4000], [3.8157, 0.2886,
+#           1.7860, 2.8580], [6.8142, -0.2317, 2.6575, 6.1106]] (rounded, exact entries in the tests;
+#           eigenvalues 0.9999999999999988, 0.995, 0.24875000000000053, -0.12437499999999967) was refused.
+#           Where the bound 3.4.2 formed from the computed powers alone certifies, the squarings are taken
+#           again with every power a double-double (`_lext_gfd`), whose bound starts near 2^-100 instead
+#           of 2^-49: that matrix is answered again, Ok(3FF00000000015E4) as 3.4.2 gave it (1.25e-12 above
+#           rho). On the review's families with a subdominant ratio of 0.9 to 0.995 (900 matrices, n = 6
+#           to 20) 20 of the 897 right answers 3.4.2 certified stay NO_CONVERGENCE (50 without the
+#           double-doubles), their eigenvector condition near 1e4; on the family above, the 40 right
+#           answers at e >= 4 (1 + ac - ac with ac past 2^8). Dense N(0, 1) and positive matrices scaled
+#           by 2^+-100 and 2^+-300 lose none, and every answer given is 3.4.2's bit for bit (1,339 Ok
+#           answers across these families).
+#           [measured: scratch_W4 fam.sh, cls.py (seeds 2-6, 8, 9, 21), base, first form, this tree, 2026-11-14]
+#           Block-triangular chains lose none (second review): the squarings' subnormal floor, first put
+#           on every entry, closed a false cycle through a chain's zero block where its diagonal blocks
+#           sit about 2^500 below the coupling, and refused 58 of 150 right answers on chains coupled at
+#           2^380 to 2^630 (all at 2^420 to 2^560); with the floor only where a term can be non-zero, all
+#           556 chains tried are answered as the pre-wave-2 tree answers them, bit for bit.
+#           [measured: scratch_W4 r2 gen.py (sweep; rand seed 11), cmp.py; 3.4.2, pre-wave-2, this tree, 2026-11-14]
+#           COST, against 3.4.2 (medians of 3 interleaved rounds on one cpu, load 4.6 to 6.3; noisy):
+#           1.4 to 2.1 times where the f64 squarings certify (gap matrices at n = 10 to 64, 31 us -> 45
+#           us at n = 10; the non-normal fixtures at n = 30 / 60 / 100: 0.32 / 1.96 / 7.5 -> 0.64 / 3.66 /
+#           16.0 ms, the last with a 1.6 spread). Positive matrices scaled by 2^+-300 take the wide
+#           squarings, which 3.4.2 did not have: 2.6 and 11 times at n = 8, 18 to 26 at n = 16, 41 to 47
+#           at n = 40, 67 to 71 at n = 64 (5.6 -> 393 ms), 2.2 to 3.5 times the pre-wave-2 tree. Where the
+#           double-doubles take an answer back: 1.26 times on the 4 x 4 above (483 -> 608 us), 2.5 to 5.7
+#           times at n = 24 to 48; where they refuse it, 5.3 to 15 times 3.4.2's certification (n = 24,
+#           64; 6.0 -> 88 ms). The family above at e = 30 takes 84 us, 3.4.2 8.2 us (wrongly), and the
+#           chain coupled at 2^500 0.47 ms, 3.4.2 25 us. A call past the first pass allocates the bound's
+#           n^2 words more, each run of the f64 squarings 2 n^2 + n + n ceil(n / 64) (10 n^2 wide, where it
+#           was 4 n^2), and the double-double squarings 9 n^2 + 13 n + 38.
+#           [measured: scratch_W4 r2 costgen.py, timeit.sh (33 matrices); 3.4.2, pre-wave-2, this tree, 2026-11-14]
 #           ⚠ GROWTH BELOW tol (3.3.5). A pass that meets both tests is not taken at
 #           once if some component grew more than twofold since the pass before: one more
 #           pass is run (one matvec, not counted against max_iter), and if that component
@@ -7812,13 +8993,877 @@ fn _lext_frob_wide(X, n, cs, out, ws) {
     return 0;
 }
 
+# ---- 3.5.0: ||A^-1||_F past cond(A) = 1/u, exactly ----
+# |v| >> (30 z + b) for the magnitude limbs src[0 .. L) (base 2^30), 0 <= b < 30, into dst; returns
+# its limb count (the top one non-zero).
+fn _lext_bn_shr(src, L, z, b, dst) {
+    var nl = L - z;
+    for (var i = 0; i < nl; i = i + 1) {
+        var v = load64(src + (i + z) * 8) >> b;
+        if (b > 0 && i + z + 1 < L) { v = v | ((load64(src + (i + z + 1) * 8) << (30 - b)) & 0x3FFF_FFFF); }
+        store64(dst + i * 8, v);
+    }
+    while (nl > 0 && load64(dst + (nl - 1) * 8) == 0) { nl = nl - 1; }
+    return nl;
+}
+
+# out <- x / y for exact integers (`_lext_bn_set`'s form), y non-zero and dividing x exactly: both
+# shifted right past y's trailing zero bits, then each limb of the quotient, least first, is the
+# remainder's low limb times the odd divisor's inverse modulo 2^30, and q_i y 2^(30 i) is taken off
+# the remainder (Jebelean's exact division). w: scratch of x's L + y's L + 4 words; out is neither
+# x nor y.
+fn _lext_bn_divx(x, y, out, w) {
+    var lx = load64(x + 8);
+    store64(out, 0);
+    store64(out + 8, 0);
+    if (lx == 0) { return 0; }
+    var ly = load64(y + 8);
+    var z = 0;
+    while (load64(y + 16 + z * 8) == 0) { z = z + 1; }
+    var y0 = load64(y + 16 + z * 8);
+    var b = 0;
+    while (((y0 >> b) & 1) == 0) { b = b + 1; }
+    var u = w;
+    var v = w + (lx + 2) * 8;
+    var nu = _lext_bn_shr(x + 16, lx, z, b, u);
+    var nv = _lext_bn_shr(y + 16, ly, z, b, v);
+    var v0 = load64(v);
+    var inv = v0;   # v0 is odd, so v0 v0 = 1 (mod 8); each Newton step doubles the bits that hold
+    for (var it = 0; it < 4; it = it + 1) { inv = (inv * ((2 - v0 * inv) & 0x3FFF_FFFF)) & 0x3FFF_FFFF; }
+    var nq = nu - nv + 1;
+    if (nq <= 0) { return 0; }
+    for (var i = 0; i < nq; i = i + 1) {
+        var qi = (load64(u + i * 8) * inv) & 0x3FFF_FFFF;
+        store64(out + 16 + i * 8, qi);
+        if (qi != 0) {
+            var br = 0;
+            for (var j = 0; j < nv; j = j + 1) {
+                var t = load64(u + (i + j) * 8) - qi * load64(v + j * 8) - br;
+                var lo = t & 0x3FFF_FFFF;
+                br = (lo - t) >> 30;
+                store64(u + (i + j) * 8, lo);
+            }
+            var k = i + nv;
+            while (br != 0 && k < nu) {
+                var t2 = load64(u + k * 8) - br;
+                var lo2 = t2 & 0x3FFF_FFFF;
+                br = (lo2 - t2) >> 30;
+                store64(u + k * 8, lo2);
+                k = k + 1;
+            }
+        }
+    }
+    while (nq > 0 && load64(out + 16 + (nq - 1) * 8) == 0) { nq = nq - 1; }
+    store64(out + 8, nq);
+    if (nq > 0) { store64(out, load64(x) * load64(y)); }
+    return 0;
+}
+
+# The scaling the exact tier works in, for the n x n A (row-major doubles, every one finite, no zero
+# row or column): rs[r] = row r's least exponent of a set bit, then cs[c] = column c's least remaining
+# one, so A = D_r M D_c with M integral and some odd entry in every row and column. Returns hb, a bound
+# in bits on every minor of [M | I] (Hadamard: a row of M has norm under 2^(bits + lg n / 2), and at
+# least 1).
+fn _lext_inv_hb(A, n, rs, cs) {
+    var big = 1 << 40;
+    for (var r = 0; r < n; r = r + 1) {
+        var lo = big;
+        for (var c = 0; c < n; c = c + 1) {
+            var l1 = _lext_xlow(load64(A + (r * n + c) * 8));
+            if (l1 < lo) { lo = l1; }
+        }
+        store64(rs + r * 8, lo);
+    }
+    for (var c1 = 0; c1 < n; c1 = c1 + 1) {
+        var lo1 = big;
+        for (var r1 = 0; r1 < n; r1 = r1 + 1) {
+            var x1 = load64(A + (r1 * n + c1) * 8);
+            if ((x1 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                var l2 = _lext_xlow(x1) - load64(rs + r1 * 8);
+                if (l2 < lo1) { lo1 = l2; }
+            }
+        }
+        store64(cs + c1 * 8, lo1);
+    }
+    # Hadamard: ||M_r||_2 <= sqrt(n) max_c |M_rc| < 2^(bits_r + lg n / 2); hb bounds lg of every
+    # minor of [M | I] (each row of M has norm at least 1)
+    var lgn = 0;
+    while ((1 << lgn) < n) { lgn = lgn + 1; }
+    var hb = 0;
+    for (var r2 = 0; r2 < n; r2 = r2 + 1) {
+        var tb = 0;
+        for (var c2 = 0; c2 < n; c2 = c2 + 1) {
+            var x2 = load64(A + (r2 * n + c2) * 8);
+            if ((x2 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                var b2 = _lext_xtop(x2) - load64(rs + r2 * 8) - load64(cs + c2 * 8) + 1;
+                if (b2 > tb) { tb = b2; }
+            }
+        }
+        hb = hb + tb + lgn / 2 + 1;
+    }
+    return hb;
+}
+
+# A^-1 for an invertible n x n A (A: its row-major doubles, every one finite), exactly up to the
+# final roundings: A = D_r M D_c (`_lext_inv_hb`), [M | I] taken to [d I | d M^-1] by fraction-free
+# Gauss-Jordan (every update a_ij <- (p a_ij - a_ik a_kj) / p', p the pivot and p' the one before,
+# an exact division: each entry is then a minor of [M | I], so within Hadamard's bound on M). Each
+# (A^-1)_ij = (d M^-1)_ij 2^(-c_i - r_j) / d is then formed as a wide double-double from the two
+# integers' top five limbs (`_lext_bn_wide`: about 2^-104 relative after the division); w2 (3 words,
+# `_lext_w2_add`'s form) gets ||A^-1||_F^2 summed in that form, and with XO != 0 each entry rounded to
+# a double goes to XO (row-major n x n; +-Inf past DBL_MAX). 3.5.0 wave 2: the sum was f64 over each
+# entry's leading 53 bits, which left cond 1 to 4 ulps off on 120 of the 247 lost-pivot matrices in
+# matrix_condition_number's note.
+# [measured: scratch_W4 gen.py, genblk.py, cmp.py (seeds 11, 21-23, 31), Fraction oracle, 2026-11-14]
+# Returns 0, or -1 when its storage would pass ALLOC_MAX or is refused.
+fn _lext_inv_exact(A, n, w2, XO) {
+    var ex: i64[2];
+    var rs = hisab_alloc(2 * n * 8);   # each row's least exponent, then each column's
+    if (rs == 0) { return 0 - 1; }
+    var cs = rs + n * 8;
+    var hb = _lext_inv_hb(A, n, rs, cs);
+    # words an entry holds: sign, limb count and hb / 30 + 1 limbs (a minor has at most hb bits); a
+    # product before its division, 2 E - 2 limbs, holds the 2 hb + 1 bits of p a_ij - a_ik a_kj
+    var E = hb / 30 + 3;
+    var nn2 = 2 * n * n;
+    if (E > (ALLOC_MAX / 8) / (nn2 + 16)) { return 0 - 1; }
+    var S = hisab_alloc(nn2 * E * 8);
+    var rp = hisab_alloc(n * 8);
+    var p1 = hisab_alloc(2 * E * 8);
+    var p2 = hisab_alloc(2 * E * 8);
+    var pv = hisab_alloc(E * 8);
+    var w = hisab_alloc(3 * E * 8 + 32);
+    if (S == 0 || rp == 0 || p1 == 0 || p2 == 0 || pv == 0 || w == 0) { return 0 - 1; }
+    var n2 = 2 * n;
+    for (var r3 = 0; r3 < n; r3 = r3 + 1) {
+        var row = S + r3 * n2 * E * 8;
+        store64(rp + r3 * 8, row);
+        for (var c3 = 0; c3 < n; c3 = c3 + 1) {
+            var x3 = load64(A + (r3 * n + c3) * 8);
+            _lext_xint(x3, &ex);
+            var m3 = load64(&ex);
+            var sh = 0;
+            if (m3 != 0) {
+                var t3 = _lext_xlow(x3) - load64(&ex + 8);   # m3's trailing zero bits
+                if (m3 < 0) { m3 = 0 - ((0 - m3) >> t3); } else { m3 = m3 >> t3; }
+                sh = _lext_xlow(x3) - load64(rs + r3 * 8) - load64(cs + c3 * 8);
+            }
+            _lext_bn_set(row + c3 * E * 8, m3, sh);
+            _lext_bn_set(row + (n + c3) * E * 8, 0, 0);
+        }
+        _lext_bn_set(row + (n + r3) * E * 8, 1, 0);
+    }
+    _lext_bn_set(pv, 1, 0);
+    for (var k = 0; k < n; k = k + 1) {
+        var pr = k;
+        while (pr < n && load64(load64(rp + pr * 8) + k * E * 8 + 8) == 0) { pr = pr + 1; }
+        if (pr == n) { return 0 - 1; }   # (A was proved invertible: not reached)
+        var tk = load64(rp + k * 8);
+        store64(rp + k * 8, load64(rp + pr * 8));
+        store64(rp + pr * 8, tk);
+        var rk = load64(rp + k * 8);
+        var piv = rk + k * E * 8;
+        for (var i = 0; i < n; i = i + 1) {
+            if (i != k) {
+                var ri = load64(rp + i * 8);
+                var f = ri + k * E * 8;
+                var fz = 0;
+                if (load64(f + 8) == 0) { fz = 1; }
+                for (var j = 0; j < n2; j = j + 1) {
+                    if (j != k) {
+                        var aij = ri + j * E * 8;
+                        var akj = rk + j * E * 8;
+                        if (load64(aij + 8) != 0 || (fz == 0 && load64(akj + 8) != 0)) {
+                            _lext_bn_mul(piv, aij, p1);
+                            if (fz == 0) {
+                                _lext_bn_mul(f, akj, p2);
+                                _lext_bn_add(p1, p2, 1, p1);
+                            }
+                            _lext_bn_divx(p1, pv, aij, w);
+                        }
+                    }
+                }
+                _lext_bn_set(f, 0, 0);
+            }
+        }
+        var lp = load64(piv + 8);
+        for (var q = 0; q < lp + 2; q = q + 1) { store64(pv + q * 8, load64(piv + q * 8)); }
+    }
+    # d = the last pivot; X_ij = (d M^-1)_ij, so (A^-1)_ij = X_ij 2^(-c_i - r_j) / d
+    var dw: i64[3];
+    var xw: i64[3];
+    var qw: i64[3];
+    var sq: i64[3];
+    var sa: i64[3];
+    _lext_bn_wide(pv, 0, &dw);
+    _lext_w_set(w2, f64_from(0), f64_from(0), 0);
+    for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+        var ri2 = load64(rp + i2 * 8);
+        for (var j2 = 0; j2 < n; j2 = j2 + 1) {
+            var xb = ri2 + (n + j2) * E * 8;
+            var xv = f64_from(0);
+            if (load64(xb + 8) != 0) {
+                _lext_bn_wide(xb, 0 - load64(cs + i2 * 8) - load64(rs + j2 * 8), &xw);
+                _lext_w2_div(&xw, &dw, &qw);
+                xv = _lext_xld(load64(&qw), load64(&qw + 16));
+                _lext_w2_mul(&qw, &qw, &sq);
+                _lext_w2_add(w2, &sq, &sa);
+                _lext_w_set(w2, load64(&sa), load64(&sa + 8), load64(&sa + 16));
+            }
+            if (XO != 0) { store64(XO + (i2 * n + j2) * 8, xv); }
+        }
+    }
+    return 0;
+}
+
+# ||A^-1||_F as m 2^e (`_lext_frob_wide`'s out) for an invertible A: the square root of
+# `_lext_inv_exact`'s sum (`_lext_w_sqrt`). Returns 0, or -1 as `_lext_inv_exact` does.
+fn _lext_inv_frob_exact(A, n, out) {
+    var w2: i64[3];
+    if (_lext_inv_exact(A, n, &w2, 0) != 0) { return 0 - 1; }
+    _lext_w_sqrt(&w2, out);
+    return 0;
+}
+
+# The square root of the wide double-double w (`_lext_w2_add`'s form, w >= 0) as m 2^e into out
+# (0.5 <= m < 1, or m = 0): the root of the high part with one Newton correction on Dekker's exact
+# s^2, so m is the correctly rounded root of the pair except within about 2^-100 of a tie.
+fn _lext_w_sqrt(w, out) {
+    var h = load64(w);
+    var l = load64(w + 8);
+    var e = load64(w + 16);
+    if ((h & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        store64(out, f64_from(0));
+        store64(out + 8, 0);
+        return 0;
+    }
+    if ((e & 1) != 0) {
+        h = f64_add(h, h);
+        l = f64_add(l, l);
+        e = e - 1;
+    }
+    var s = f64_sqrt(h);
+    var t2: i64[2];
+    _lext_two_prod(s, s, &t2);
+    var r = f64_add(f64_sub(f64_sub(h, load64(&t2)), load64(&t2 + 8)), l);
+    var v = f64_add(s, f64_div(r, f64_add(s, s)));
+    store64(out, _lext_xman(v));
+    store64(out + 8, _lext_xexp(v) + e / 2);
+    return 0;
+}
+
+# cond_F(A) = sqrt(||A||_F^2 ||A^-1||_F^2) for the n x n A (row-major doubles) from w2 = ||A^-1||_F^2
+# (wide, `_lext_w2_add`'s form): ||A||_F^2 summed as wide double-doubles (each square exact), the
+# product and its root formed once (`_lext_w_sqrt`), so the answer is cond_F correctly rounded except
+# within w2's relative error (plus about 2^-100) of a tie; +Inf past DBL_MAX.
+fn _lext_cond_fin(A, n, w2) {
+    var aw: i64[3];
+    var xw: i64[3];
+    var sq: i64[3];
+    var sa: i64[3];
+    _lext_w_set(&aw, f64_from(0), f64_from(0), 0);
+    for (var q = 0; q < n * n; q = q + 1) {
+        var x = load64(A + q * 8);
+        if ((x & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            _lext_w_from(&xw, x);
+            _lext_w2_mul(&xw, &xw, &sq);
+            _lext_w2_add(&aw, &sq, &sa);
+            _lext_w_set(&aw, load64(&sa), load64(&sa + 8), load64(&sa + 16));
+        }
+    }
+    _lext_w2_mul(&aw, w2, &sq);
+    var r: i64[2];
+    _lext_w_sqrt(&sq, &r);
+    return _lext_xld(load64(&r), load64(&r + 8));
+}
+
+# ---- 3.5.0 (wave 2): A^-1 past cond(A) = 1/u in extended precision, with a certificate ----
+# The exact tier above holds integers as wide as Hadamard's bound, about n times a row's width in bits
+# (53 for full mantissas), so its cost grows as n^5 whatever A's condition: 150 s at n = 96 on a dense
+# block beside a lost-pivot 2 x 2. This tier works at the precision A's condition needs instead.
+# [measured: scratch_W4 ab96.sh, merged tree, taskset -c 12, 3 runs, load 4 to 8 (noisy), 2026-11-14]
+# AN "hf" VALUE: w[0] = e, then `_lext_bn_set`'s integer at w + 8 (sign, limb count nl, limbs least
+# first, base 2^30); its value is that integer times 2^(30 e). A matrix's entries keep their top P
+# limbs (P + 3 words each); the arithmetic truncates, and nothing rests on its accuracy: the inverse it
+# yields is accepted only through `_lext_hf_cert`'s bound.
+
+# b <- x 2^sh exactly (x a finite double, sh any i64): x's integer moved onto a limb boundary (3 limbs
+# at most).
+fn _lext_hf_f64(b, x, sh) {
+    var ex: i64[2];
+    _lext_xint(x, &ex);
+    var m = load64(&ex);
+    store64(b, 0);
+    if (m == 0) {
+        store64(b + 8, 0);
+        store64(b + 16, 0);
+        return 0;
+    }
+    var e = load64(&ex + 8) + sh;
+    var q = e / 30;
+    if (q * 30 > e) { q = q - 1; }
+    _lext_bn_set(b + 8, m, e - q * 30);
+    store64(b, q);
+    return 0;
+}
+
+# d <- s's top P limbs (the rest dropped, so |d| <= |s|); d may be s.
+fn _lext_hf_cut(s, d, P) {
+    var nl = load64(s + 16);
+    var k = nl - P;
+    if (k < 0) { k = 0; }
+    for (var i = 0; i < nl - k; i = i + 1) { store64(d + 24 + i * 8, load64(s + 24 + (i + k) * 8)); }
+    store64(d, load64(s) + k);
+    store64(d + 8, load64(s + 8));
+    store64(d + 16, nl - k);
+    return 0;
+}
+
+# x <- x + t (sub = 0) or x - t (sub = 1), kept to its top P limbs (dropped toward 0). The sum is
+# formed exactly in w (2 P + 4 words) over the 2 P + 3 limb positions below the larger operand's top,
+# so only a much smaller operand's low limbs are dropped; t may hold up to 2 P limbs (a product).
+fn _lext_hf_acc(x, t, sub, P, w) {
+    var st = load64(t + 8);
+    if (sub == 1) { st = 0 - st; }
+    if (st == 0) { return 0; }
+    var nt = load64(t + 16);
+    var et = load64(t);
+    var sx = load64(x + 8);
+    if (sx == 0) {
+        _lext_hf_cut(t, x, P);
+        store64(x + 8, st);
+        return 0;
+    }
+    var nx = load64(x + 16);
+    var ex = load64(x);
+    var top = ex + nx;
+    if (et + nt > top) { top = et + nt; }
+    top = top + 1;
+    var lo = ex;
+    if (et < lo) { lo = et; }
+    if (lo < top - 2 * P - 3) { lo = top - 2 * P - 3; }
+    var W = top - lo;
+    for (var i = 0; i < W; i = i + 1) { store64(w + i * 8, 0); }
+    for (var i1 = 0; i1 < nx; i1 = i1 + 1) {
+        var p1 = ex + i1 - lo;
+        if (p1 >= 0) { store64(w + p1 * 8, load64(w + p1 * 8) + sx * load64(x + 24 + i1 * 8)); }
+    }
+    for (var i2 = 0; i2 < nt; i2 = i2 + 1) {
+        var p2 = et + i2 - lo;
+        if (p2 >= 0) { store64(w + p2 * 8, load64(w + p2 * 8) + st * load64(t + 24 + i2 * 8)); }
+    }
+    # signed limbs to base 2^30, the carry by an exact division (`>>` is logical); a final carry of -1
+    # is a negative sum, taken to its magnitude by the two's complement
+    var c = 0;
+    for (var i3 = 0; i3 < W; i3 = i3 + 1) {
+        var v = load64(w + i3 * 8) + c;
+        var lb = v & 0x3FFF_FFFF;
+        c = (v - lb) / 0x4000_0000;
+        store64(w + i3 * 8, lb);
+    }
+    var sg = 1;
+    if (c < 0) {
+        sg = 0 - 1;
+        var cy = 1;
+        for (var i4 = 0; i4 < W; i4 = i4 + 1) {
+            var v4 = 0x3FFF_FFFF - load64(w + i4 * 8) + cy;
+            store64(w + i4 * 8, v4 & 0x3FFF_FFFF);
+            cy = v4 >> 30;
+        }
+    }
+    var h = W - 1;
+    while (h >= 0 && load64(w + h * 8) == 0) { h = h - 1; }
+    if (h < 0) {
+        store64(x, 0);
+        store64(x + 8, 0);
+        store64(x + 16, 0);
+        return 0;
+    }
+    var k = h + 1 - P;
+    if (k < 0) { k = 0; }
+    for (var i5 = k; i5 <= h; i5 = i5 + 1) { store64(x + 24 + (i5 - k) * 8, load64(w + i5 * 8)); }
+    store64(x, lo + k);
+    store64(x + 8, sg);
+    store64(x + 16, h + 1 - k);
+    return 0;
+}
+
+# r <- about 1/p to 30 P bits (p non-zero): the double 1/v of p's top three limbs v, then Newton's
+# r <- r + r (1 - p r), each step doubling the bits that hold. ws: 5 P + 15 words.
+fn _lext_hf_recip(p, r, P, ws) {
+    var nl = load64(p + 16);
+    var k = nl - 3;
+    if (k < 0) { k = 0; }
+    var v = f64_from(0);
+    var i = nl - 1;
+    while (i >= k) {
+        v = f64_add(f64_mul(v, 0x41D0000000000000), f64_from(load64(p + 24 + i * 8)));   # 2^30
+        i = i - 1;
+    }
+    var iv = f64_div(F64_ONE, v);
+    if (load64(p + 8) < 0) { iv = f64_neg(iv); }
+    _lext_hf_f64(r, iv, 0 - 30 * (load64(p) + k));
+    var t1 = ws;
+    var d = ws + (2 * P + 4) * 8;
+    var w = d + (P + 5) * 8;
+    var bits = 48;
+    while (bits < 30 * P) {
+        _lext_bn_mul(p + 8, r + 8, t1 + 8);
+        store64(t1, load64(p) + load64(r));
+        _lext_hf_f64(d, F64_ONE, 0);
+        _lext_hf_acc(d, t1, 1, P + 1, w);      # d = 1 - p r
+        _lext_bn_mul(r + 8, d + 8, t1 + 8);
+        store64(t1, load64(r) + load64(d));
+        _lext_hf_acc(r, t1, 0, P, w);          # r <- r + r d
+        bits = 2 * bits;
+    }
+    return 0;
+}
+
+# Gauss-Jordan with partial pivoting on [M | I] in hf at P limbs, M = S A with S = diag(2^sc[r]) (each
+# row's largest |entry| in [1/2, 1)), A the n x n row-major doubles. G: 2 n^2 (P + 3) words, the rows
+# [M | I] (rp: n words, row r's start, swapped with the rows); on return the right half of the row at
+# rp[i] is row i of Y, about M^-1. ws: 10 P + 29 words. Returns 0, or 1 when every candidate pivot of a
+# column is 0 at this precision. P must be at least 3: `_lext_hf_f64` writes up to three limbs into each
+# entry's P + 3 words (P = 2 overruns them; the callers start at 6).
+fn _lext_hf_gj(A, n, P, sc, G, rp, ws) {
+    var S = (P + 3) * 8;
+    var n2 = 2 * n;
+    for (var r = 0; r < n; r = r + 1) {
+        var row = G + r * n2 * S;
+        store64(rp + r * 8, row);
+        for (var c = 0; c < n; c = c + 1) {
+            _lext_hf_f64(row + c * S, load64(A + (r * n + c) * 8), load64(sc + r * 8));
+            _lext_hf_f64(row + (n + c) * S, f64_from(0), 0);
+        }
+        _lext_hf_f64(row + (n + r) * S, F64_ONE, 0);
+    }
+    var rv = ws;
+    var t = ws + (P + 4) * 8;
+    var w = t + (2 * P + 4) * 8;
+    var ww = w + (2 * P + 6) * 8;
+    for (var k = 0; k < n; k = k + 1) {
+        # the pivot: the largest |entry| of column k from row k down, by its top limb's position, then
+        # that limb (a near tie may pick either; the certificate judges the result, not the choice)
+        var pr = 0 - 1;
+        var b1 = 0;
+        var b2 = 0;
+        for (var i = k; i < n; i = i + 1) {
+            var a = load64(rp + i * 8) + k * S;
+            var na = load64(a + 16);
+            if (na != 0) {
+                var k1 = load64(a) + na;
+                var k2 = load64(a + 24 + (na - 1) * 8);
+                if (pr < 0 || k1 > b1 || (k1 == b1 && k2 > b2)) {
+                    pr = i;
+                    b1 = k1;
+                    b2 = k2;
+                }
+            }
+        }
+        if (pr < 0) { return 1; }
+        var tk = load64(rp + k * 8);
+        store64(rp + k * 8, load64(rp + pr * 8));
+        store64(rp + pr * 8, tk);
+        var rk = load64(rp + k * 8);
+        _lext_hf_recip(rk + k * S, rv, P, ww);
+        for (var j = k + 1; j < n2; j = j + 1) {
+            var akj = rk + j * S;
+            if (load64(akj + 16) != 0) {
+                _lext_bn_mul(akj + 8, rv + 8, t + 8);
+                store64(t, load64(akj) + load64(rv));
+                _lext_hf_cut(t, akj, P);
+            }
+        }
+        for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+            if (i2 != k) {
+                var ri = load64(rp + i2 * 8);
+                var f = ri + k * S;
+                if (load64(f + 16) != 0) {
+                    for (var j2 = k + 1; j2 < n2; j2 = j2 + 1) {
+                        var bkj = rk + j2 * S;
+                        if (load64(bkj + 16) != 0) {
+                            _lext_bn_mul(f + 8, bkj + 8, t + 8);
+                            store64(t, load64(f) + load64(bkj));
+                            _lext_hf_acc(ri + j2 * S, t, 1, P, w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# An upper bound on |b| 2^-sc as a double (b an hf value, the bound at most 1 + 2^-47 when |b| < 2^sc):
+# b's top three limbs (at least 2^60 when there are more) times 1 + 2^-48, which covers the four
+# roundings of the double (2^-51) and every limb below them (under 2^-60 of it), and one subnormal unit
+# more when the scaled value falls below DBL_MIN.
+fn _lext_hf_up(b, sc) {
+    var nl = load64(b + 16);
+    if (nl == 0) { return f64_from(0); }
+    var k = nl - 3;
+    if (k < 0) { k = 0; }
+    var v = f64_from(0);
+    var i = nl - 1;
+    while (i >= k) {
+        v = f64_add(f64_mul(v, 0x41D0000000000000), f64_from(load64(b + 24 + i * 8)));   # 2^30
+        i = i - 1;
+    }
+    v = f64_mul(v, 0x3FF0000000000010);   # 1 + 2^-48
+    var y = _lext_pow2mul(v, 30 * (load64(b) + k) - sc);
+    # (below DBL_MIN: one subnormal unit up, the double whose bits are 1)
+    if ((y & 0x7FF0_0000_0000_0000) == 0) { y = f64_add(y, 1); }
+    return y;
+}
+
+# floor(a / b) for b > 0 (an i64 division truncates toward 0).
+fn _lext_fdiv(a, b) {
+    var q = a / b;
+    if (q * b > a) { q = q - 1; }
+    return q;
+}
+
+# THE CERTIFICATE. Y (the right halves of the rows at rp, column offset n, stride S) approximates
+# M^-1, M = S_d A (S_d = diag(2^sc[r])), so X = Y S_d approximates A^-1; xn2 holds ||X||_F^2 (wide,
+# within 2^-100 relative). With R = I - M Y, E = Y - M^-1 = -Y R (I - R)^-1 whenever ||R||_inf < 1
+# (M^-1 R = M^-1 - Y, then M^-1 = Y - E), and X - A^-1 = E S_d. Entrywise |R (I - R)^-1| <= |R| +
+# rho / (1 - rho) 1 r^T, rho = || |R| ||_inf and r_j column j's largest |R_lj| (column j of
+# sum_{k >= 2} |R|^k is |R|^(k - 1) applied to column j of |R|, each application at most rho times its
+# max), so
+#     ||X - A^-1||_F <= || |Y| |R| S_d ||_F + rho / (1 - rho) || |Y| 1 ||_2 || S_d r ||_2.
+# R is formed exactly but for the terms' parts below 2^(30 lo), at most tau = n 2^(30 (lo + 1)) an
+# entry, and |R| is bounded by |R~| + tau; every other quantity is an upper bound in doubles (each
+# |Y_ik| from `_lext_hf_up`, the sums of non-negative terms within (n^2 + 2n) u relative, taken twice
+# over, and n 2^-1073 added to each entry of |Y| |R| for products below the subnormals). The bound is
+# compared with ||X||_F: 1 when it is at most 2^-70 ||X||_F (so ||A^-1||_F, and A^-1 normwise, are
+# within 2^-69.9 relative), else 0, with lossp = the bits the elimination lost (30 P + lg of the bound's
+# ratio), or -1 where rho is not below 1/4. Since cond_F(M) and the bound's ratio are both unchanged by
+# scaling A's columns, and Y's error grows with A's row scales exactly as |Y| |R| S_d does, the bits it
+# needs are those M's condition costs. -2: scratch refused.
+fn _lext_hf_cert(A, n, P, sc, rp, xn2, lossp) {
+    var S = (P + 3) * 8;
+    store64(lossp, 0 - 1);
+    if (n > (ALLOC_MAX / 8) / (12 * n)) { return 0 - 2; }
+    var Mh = hisab_alloc(6 * n * n * 8);   # M in hf: 6 words an entry (3 limbs)
+    var Yu = hisab_alloc(n * n * 8);
+    var Ru = hisab_alloc(n * n * 8);
+    var Re = hisab_alloc(n * n * 8);
+    var T = hisab_alloc(n * n * 8);
+    var vw = hisab_alloc(4 * n * 8);
+    if (Mh == 0 || Yu == 0 || Ru == 0 || Re == 0 || T == 0 || vw == 0) { return 0 - 2; }
+    var lgn = 0;
+    while ((1 << lgn) < n) { lgn = lgn + 1; }
+    var mtop = 0 - (1 << 40);
+    for (var i = 0; i < n; i = i + 1) {
+        for (var k = 0; k < n; k = k + 1) {
+            var mb = Mh + (i * n + k) * 48;
+            _lext_hf_f64(mb, load64(A + (i * n + k) * 8), load64(sc + i * 8));
+            if (load64(mb + 16) != 0 && load64(mb) + load64(mb + 16) > mtop) { mtop = load64(mb) + load64(mb + 16); }
+        }
+    }
+    var ytop = 0 - (1 << 40);
+    var smax = 0 - (1 << 40);
+    for (var i1 = 0; i1 < n; i1 = i1 + 1) {
+        if (load64(sc + i1 * 8) > smax) { smax = load64(sc + i1 * 8); }
+        for (var j1 = 0; j1 < n; j1 = j1 + 1) {
+            var y1 = load64(rp + i1 * 8) + (n + j1) * S;
+            if (load64(y1 + 16) != 0 && load64(y1) + load64(y1 + 16) > ytop) { ytop = load64(y1) + load64(y1 + 16); }
+        }
+    }
+    # ||X||_F >= 2^lx: xn2 = (h + l) 2^e with h in [1/2, 1) and l within 2^-100 of it
+    var lx = _lext_fdiv(load64(xn2 + 16) - 2, 2);
+    # the grid: tau || |Y| 1 ||_2 || S_d 1 ||_2 <= 2^(lx - 76), with || |Y| 1 ||_2 < 2^(30 ytop + 3 lgn / 2)
+    # and || S_d 1 ||_2 <= 2^(smax + lgn / 2)
+    var lo = _lext_fdiv(lx - 76 - 30 * ytop - smax - 3 * lgn - 2, 30) - 2;
+    var hi = mtop + ytop + 2;
+    if (hi < 1) { hi = 1; }
+    var W = hi - lo;
+    if (W > (ALLOC_MAX / 8) / 4) { return 0 - 2; }
+    var acc = hisab_alloc((W + 2) * 8);
+    if (acc == 0) { return 0 - 2; }
+    var rmx = 0 - (1 << 40);
+    for (var i2 = 0; i2 < n; i2 = i2 + 1) {
+        for (var j2 = 0; j2 < n; j2 = j2 + 1) {
+            for (var q = 0; q < W; q = q + 1) { store64(acc + q * 8, 0); }
+            # acc <- sum_k M_ik Y_kj on the grid (each partial product split into its two 30-bit
+            # halves, so no slot passes 6 n 2^30), then - delta_ij: acc = -R_ij
+            for (var k2 = 0; k2 < n; k2 = k2 + 1) {
+                var m = Mh + (i2 * n + k2) * 48;
+                var y = load64(rp + k2 * 8) + (n + j2) * S;
+                var nm = load64(m + 16);
+                var ny = load64(y + 16);
+                if (nm != 0 && ny != 0) {
+                    var sg = load64(m + 8) * load64(y + 8);
+                    var base = load64(m) + load64(y) - lo;
+                    for (var a = 0; a < nm; a = a + 1) {
+                        var ma = load64(m + 24 + a * 8);
+                        for (var b = 0; b < ny; b = b + 1) {
+                            var pp = ma * load64(y + 24 + b * 8);
+                            var pos = base + a + b;
+                            var ap = acc + pos * 8;
+                            if (pos >= 0) { store64(ap, load64(ap) + sg * (pp & 0x3FFF_FFFF)); }
+                            if (pos + 1 >= 0) { store64(ap + 8, load64(ap + 8) + sg * (pp >> 30)); }
+                        }
+                    }
+                }
+            }
+            if (i2 == j2) { store64(acc + (0 - lo) * 8, load64(acc + (0 - lo) * 8) - 1); }
+            var c = 0;
+            for (var q2 = 0; q2 < W; q2 = q2 + 1) {
+                var v = load64(acc + q2 * 8) + c;
+                var lb = v & 0x3FFF_FFFF;
+                c = (v - lb) / 0x4000_0000;
+                store64(acc + q2 * 8, lb);
+            }
+            if (c < 0) {
+                var cy = 1;
+                for (var q3 = 0; q3 < W; q3 = q3 + 1) {
+                    var v3 = 0x3FFF_FFFF - load64(acc + q3 * 8) + cy;
+                    store64(acc + q3 * 8, v3 & 0x3FFF_FFFF);
+                    cy = v3 >> 30;
+                }
+            }
+            var h = W - 1;
+            while (h >= 0 && load64(acc + h * 8) == 0) { h = h - 1; }
+            var o = (i2 * n + j2) * 8;
+            store64(Ru + o, f64_from(0));
+            store64(Re + o, 0);
+            if (h >= 0) {
+                # |R~_ij| <= u 2^(30 (k3 + lo)): its top three limbs times 1 + 2^-48 (`_lext_hf_up`'s)
+                var k3 = h - 2;
+                if (k3 < 0) { k3 = 0; }
+                var u = f64_from(0);
+                var i3 = h;
+                while (i3 >= k3) {
+                    u = f64_add(f64_mul(u, 0x41D0000000000000), f64_from(load64(acc + i3 * 8)));   # 2^30
+                    i3 = i3 - 1;
+                }
+                u = f64_mul(u, 0x3FF0000000000010);   # 1 + 2^-48
+                store64(Ru + o, u);
+                store64(Re + o, 30 * (k3 + lo));
+                var ut = 30 * (k3 + lo) + _lext_xtop(u) + 1;
+                if (ut > rmx) { rmx = ut; }
+            }
+        }
+    }
+    # every |R_kj| <= Rh_kj 2^rsc, Rh = |R~| 2^-rsc + tau 2^-rsc, each at most 2
+    var lt = 30 * (lo + 1) + lgn;   # tau <= 2^lt
+    var rsc = rmx;
+    if (lt + 1 > rsc) { rsc = lt + 1; }
+    var taus = _lext_pow2mul(F64_ONE, lt - rsc);
+    if ((taus & 0x7FF0_0000_0000_0000) == 0) { taus = f64_add(taus, 1); }   # (one subnormal unit up)
+    for (var q4 = 0; q4 < n * n; q4 = q4 + 1) {
+        var u4 = load64(Ru + q4 * 8);
+        var rh = f64_from(0);
+        if ((u4 & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            rh = _lext_pow2mul(u4, load64(Re + q4 * 8) - rsc);
+            if ((rh & 0x7FF0_0000_0000_0000) == 0) { rh = f64_add(rh, 1); }   # (one subnormal unit up)
+        }
+        store64(Ru + q4 * 8, f64_add(rh, taus));
+    }
+    # rho <= rhs 2^rsc; r_j <= cmx_j 2^rsc (vw[n + j]); || |Y| 1 ||_2 <= sqrt(sum_i rys_i^2) 2^ysc
+    var ysc = 30 * ytop;
+    var rhs = f64_from(0);
+    for (var i5 = 0; i5 < n; i5 = i5 + 1) {
+        var rsum = f64_from(0);
+        for (var j5 = 0; j5 < n; j5 = j5 + 1) { rsum = f64_add(rsum, load64(Ru + (i5 * n + j5) * 8)); }
+        if (f64_gt(rsum, rhs) == 1) { rhs = rsum; }
+    }
+    # rho must stay below 1/4 (so rho / (1 - rho) < 2 rho), with the sum's rounding taken twice over
+    if (rsc + _lext_xtop(rhs) + 2 > 0 - 3) { return 0; }
+    for (var j6 = 0; j6 < n; j6 = j6 + 1) {
+        var cm = f64_from(0);
+        for (var i6 = 0; i6 < n; i6 = i6 + 1) {
+            var r6 = load64(Ru + (i6 * n + j6) * 8);
+            if (f64_gt(r6, cm) == 1) { cm = r6; }
+        }
+        store64(vw + (n + j6) * 8, cm);
+    }
+    var ry = f64_from(0);
+    for (var i7 = 0; i7 < n; i7 = i7 + 1) {
+        var ys = f64_from(0);
+        for (var k7 = 0; k7 < n; k7 = k7 + 1) {
+            var yu = _lext_hf_up(load64(rp + i7 * 8) + (n + k7) * S, ysc);
+            store64(Yu + (i7 * n + k7) * 8, yu);
+            ys = f64_add(ys, yu);
+        }
+        ry = f64_add(ry, f64_mul(ys, ys));
+    }
+    ry = f64_sqrt(ry);
+    # T = |Y~| Rh (each entry plus n 2^-1073 for products lost below the subnormals)
+    var fl = f64_mul(f64_from(n), 2);   # n 2^-1073
+    for (var i8 = 0; i8 < n; i8 = i8 + 1) {
+        for (var j8 = 0; j8 < n; j8 = j8 + 1) { store64(T + (i8 * n + j8) * 8, fl); }
+        for (var k8 = 0; k8 < n; k8 = k8 + 1) {
+            var yk = load64(Yu + (i8 * n + k8) * 8);
+            if ((yk & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+                for (var j9 = 0; j9 < n; j9 = j9 + 1) {
+                    var o9 = (i8 * n + j9) * 8;
+                    store64(T + o9, f64_add(load64(T + o9), f64_mul(yk, load64(Ru + (k8 * n + j9) * 8))));
+                }
+            }
+        }
+    }
+    # term 1: || T S_d ||_F 2^(ysc + rsc) < 2^e1
+    var tn: i64[2];
+    _lext_frob_wide(T, n, sc, &tn, vw + 2 * n * 8);
+    var e1 = 0 - (1 << 40);
+    if ((load64(&tn) & 0x7FFF_FFFF_FFFF_FFFF) != 0) { e1 = load64(&tn + 8) + ysc + rsc; }
+    # term 2: 2 rho || |Y| 1 ||_2 || S_d r ||_2 < 2^e2
+    var emx = 0 - (1 << 40);
+    for (var j10 = 0; j10 < n; j10 = j10 + 1) {
+        var cj = load64(vw + (n + j10) * 8);
+        if ((cj & 0x7FFF_FFFF_FFFF_FFFF) != 0) {
+            var ej = _lext_xtop(cj) + 1 + load64(sc + j10 * 8);
+            if (ej > emx) { emx = ej; }
+        }
+    }
+    var e2 = 0 - (1 << 40);
+    if (emx > 0 - (1 << 40)) {
+        var ss = f64_from(0);
+        for (var j11 = 0; j11 < n; j11 = j11 + 1) {
+            var c11 = _lext_pow2mul(load64(vw + (n + j11) * 8), load64(sc + j11 * 8) - emx);
+            ss = f64_add(ss, f64_mul(c11, c11));
+        }
+        # (ss >= 1/4, its largest term's, so the squares that flush are below n 2^-1072 of it)
+        e2 = 1 + rsc + _lext_xtop(rhs) + 1 + ysc + _lext_xtop(ry) + 1 + rsc + emx + _lext_xtop(f64_sqrt(ss)) + 1;
+    }
+    var eb = e1;
+    if (e2 > eb) { eb = e2; }
+    eb = eb + 2;   # the two terms' sum, then every double's rounding above taken twice over
+    store64(lossp, 30 * P + eb - lx);
+    if (eb <= lx - 70) { return 1; }
+    return 0;
+}
+
+# One attempt at P limbs: Gauss-Jordan in hf on A's rows scaled by powers of two (`_lext_hf_gj`), then
+# ||X||_F^2 summed as wide double-doubles from each entry's top five limbs into xn2 (3 words) and, with
+# XO != 0, each entry rounded to a double into XO; then `_lext_hf_cert`. Returns 1 (certified), 0 (not:
+# lossp as the certificate sets it, -1 when the elimination found no pivot), or -1 (scratch refused).
+# P >= 3, as `_lext_hf_gj` needs.
+fn _lext_hf_try(A, n, P, xn2, XO, lossp) {
+    store64(lossp, 0 - 1);
+    var S = (P + 3) * 8;
+    var n2 = 2 * n;
+    if (P + 3 > (ALLOC_MAX / 8) / (n2 * n)) { return 0 - 1; }
+    var G = hisab_alloc(n2 * n * S);
+    var rp = hisab_alloc(n * 8);
+    var sc = hisab_alloc(n * 8);
+    var ws = hisab_alloc((10 * P + 29) * 8);
+    if (G == 0 || rp == 0 || sc == 0 || ws == 0) { return 0 - 1; }
+    for (var r = 0; r < n; r = r + 1) {
+        var mx = f64_from(0);
+        for (var c = 0; c < n; c = c + 1) {
+            var ar = f64_abs(load64(A + (r * n + c) * 8));
+            if (f64_gt(ar, mx) == 1) { mx = ar; }
+        }
+        store64(sc + r * 8, 0 - _lext_xexp(mx));
+    }
+    if (_lext_hf_gj(A, n, P, sc, G, rp, ws) != 0) { return 0; }
+    var xw: i64[3];
+    var sq: i64[3];
+    var sa: i64[3];
+    _lext_w_set(xn2, f64_from(0), f64_from(0), 0);
+    for (var i = 0; i < n; i = i + 1) {
+        var ri = load64(rp + i * 8);
+        for (var j = 0; j < n; j = j + 1) {
+            var y = ri + (n + j) * S;
+            var xv = f64_from(0);
+            if (load64(y + 16) != 0) {
+                _lext_bn_wide(y + 8, 30 * load64(y) + load64(sc + j * 8), &xw);
+                xv = _lext_xld(load64(&xw), load64(&xw + 16));
+                _lext_w2_mul(&xw, &xw, &sq);
+                _lext_w2_add(xn2, &sq, &sa);
+                _lext_w_set(xn2, load64(&sa), load64(&sa + 8), load64(&sa + 16));
+            }
+            if (XO != 0) { store64(XO + (i * n + j) * 8, xv); }
+        }
+    }
+    var ct = _lext_hf_cert(A, n, P, sc, rp, xn2, lossp);
+    if (ct == 0 - 2) { return 0 - 1; }
+    return ct;
+}
+
+# A^-1 for an invertible n x n A (row-major doubles, every one finite) on which Gauss-Jordan in doubles
+# lost a pivot: w2 gets ||A^-1||_F^2 (wide, `_lext_w2_add`'s form) within 2^-68 relative, and with
+# XO != 0 XO gets A^-1's entries (row-major, each rounded to a double, +-Inf past DBL_MAX) within
+# 2^-69 ||A^-1||_F of the exact ones. Extended precision first, at P = 6 limbs (180 bits), accepted only
+# under `_lext_hf_cert`'s bound; a refusal reports the bits the elimination lost, and the next attempt
+# takes enough limbs for them and 70 bits more and two limbs of slack (so at least two limbs more; from
+# the third attempt on at least 2 P, and 2 P when the loss is unknown). Wherever the exact tier's
+# integers (`_lext_inv_exact`) would be no wider than the next attempt's entries it is cheaper, and it answers
+# instead: a small n, or a condition near Hadamard's bound. Returns 0, or -1 when scratch is refused
+# or would pass ALLOC_MAX. st (2 words, or 0) gets the call's path, so the tests can see it: st[0] the
+# limbs of the certified attempt (0: the exact tier answered), st[1] the extended attempts.
+fn _lext_inv_hp(A, n, w2, XO, st) {
+    if (st != 0) {
+        store64(st, 0);
+        store64(st + 8, 0);
+    }
+    var rs = hisab_alloc(2 * n * 8);
+    if (rs == 0) { return 0 - 1; }
+    var E = _lext_inv_hb(A, n, rs, rs + n * 8) / 30 + 3;
+    var lp: i64[1];
+    var P = 6;
+    var tries = 0;
+    while (P + 2 < E) {
+        var t = _lext_hf_try(A, n, P, w2, XO, &lp);
+        if (st != 0) { store64(st + 8, tries + 1); }
+        if (t == 1) {
+            if (st != 0) { store64(st, P); }
+            return 0;
+        }
+        if (t < 0) { return 0 - 1; }
+        tries = tries + 1;
+        # (a refusal that reports its loss L has L > 30 P - 70, so np >= P + 2: no attempt repeats)
+        var np = 2 * P;
+        var loss = load64(&lp);
+        if (loss >= 0) {
+            np = (loss + 70) / 30 + 2;
+            if (tries >= 2 && np < 2 * P) { np = 2 * P; }
+        }
+        P = np;
+    }
+    return _lext_inv_exact(A, n, w2, XO);
+}
+
 # Condition number of a square matrix in the Frobenius norm: cond(A) = ||A||_F ||A^-1||_F.
 # Returns it as an f64 (+Inf when it is past DBL_MAX), or -1 for a null A, a non-square A, a NaN
-# or infinite entry, or a singular A (3.4.1: decided exactly), and -1 too when the elimination loses
-# a pivot of an invertible A to rounding (cond(A) past about 1/u = 2^53; see `_lext_gj_inv`).
+# or infinite entry, a singular A (3.4.1: decided exactly) or scratch that is refused;
+# `matrix_condition_number_checked` tells those apart (3.5.0).
 # The inverse is Gauss-Jordan with partial pivoting on A with its rows scaled by powers of two, so
 # the result is accurate to about n cond(A) u relative (u = 2^-53): to 1e-3 or better while
 # cond(A) < 1e12, its magnitude only near 1/u. The answer is the same for A and 2^k A.
+# ⛔ 3.5.0 — AN INVERTIBLE A WHOSE ELIMINATION LOST A PIVOT ANSWERED -1, as singular: [[1, 1 + u],
+# [1 + u, 1 + 2u]] (u = 2^-52, det -2^-104). ||A^-1||_F^2 is then formed in certified extended
+# precision (`_lext_inv_hp`: Gauss-Jordan at 30 P bits, accepted only under `_lext_hf_cert`'s proved
+# bound of 2^-70 on its relative error, P raised by the bits a refused attempt lost), or exactly where
+# the exact tier's integers are no wider (`_lext_inv_exact`), and cond_F rounded once from it
+# (`_lext_cond_fin`): within one ulp, and correctly rounded but within 2^-68 of a tie. On 247 such
+# matrices (n = 2 to 24: rows a rounded combination of others, scaled 2^+-300 by rows, columns or
+# both, entries spread 2^+-60 or 2^+-400, unimodular L U, near-singular 2 x 2s, and dense blocks
+# coupled to lost-pivot 2 x 2s, permuted) every answer is correctly rounded; 3.4.2 answered -1 on all
+# of them, and 3.5.0's first form (an exact tier alone, its sums in doubles) was correctly rounded on
+# 127, 1 ulp off on 104, 2 on 15 and 4 on one. Every one of the 1,436 matrices of the same families
+# whose elimination completes, and the 37 singular ones, are answered as before, bit for bit.
+# [measured: scratch_W4 gen.py, genblk.py, cmp.py (seeds 11, 21-23, 31), Fraction oracle, 2026-11-14]
+# ⚠ COST, AND WHY THE FIRST FORM WAS REPLACED. That exact tier's integers are minors of A's, as wide
+# as Hadamard's bound (about n times a row's width in bits whatever A's condition), so it grew as n^5:
+# block-diag(B, that 2 x 2), B dense with entries in +-[1/2, 1) plus 4 I, took 117 ms / 3.9 s / 150 s
+# at n = 24 / 48 / 96. The extended tier needs the bits A's condition costs, not Hadamard's, so it
+# grows as n^3 times the square of those bits: 6.2 ms / 55 ms / 0.48 s, and with B's entries
+# integers in [-9, 9] plus 40 I 2.1 s -> 0.46 s at n = 96; a 7 x 7 with entries across 2^+-400 16 ms
+# -> 0.30 ms. The 2 x 2 alone takes the exact tier in both, and 4.4 -> 5.6 us here: its sum of squares
+# is now formed in double-doubles and its root given a Newton correction (single bench runs, minima).
+# 3.4.2's elimination, which answered -1 on every one, took 0.42 / 2.5 / 19 ms: the certified answer
+# costs 15 to 25 times that.
+# [measured: scratch_W4 ab.sh, ab96.sh, ab342.sh, three trees, taskset, interleaved, load 4-8 (noisy), 2026-11-14]
+# [measured: tests/hisab.bcyr b35L3_cond_lost_pivot_2x2, merged tree and this tree, one run each, 2026-11-14]
+# 3.5.0: a 1 x 1 [x != 0] is 1 exactly (3.4.2: |x| fl(1/|x|), 3FEFFFFFFFFFFFFF for 2147483629), and
+# an answer the roundings put under n is n (cond_F >= n for every A; a rotation is exactly 2, and
+# 3.4.2 answered 3FFFFFFFFFFFFFFE on 62 of 2,000 angles).
+# [measured: scratch_L3 rot.tcyr (angles 0.001 k, k = 1..2000), base and this tree, 2026-11-14]
 # ⛔ 3.4.1 — "SINGULAR" WAS GANITA'S LU PIVOT TEST (relative 1e-12), and the norms were taken in the
 # caller's units: diag(1e-13, 1) gave -1 (exact 1e13), Hilbert 11 and 12 gave -1 (5.33e14 and
 # 1.72e16), and [[3FF3C0CA4587E6B7, BFE5F1A2B3C4D5E7], [3FE9D8C7B6A59483, 4001234567890ABD]] 2^-1030
@@ -7861,7 +9906,12 @@ fn _lext_frob_wide(X, n, cs, out, ws) {
 # MEMORY (3.4.1 LA3). A call allocates n^2 + n + 2 words for a singular A (`_lext_dz_run`'s H and MD)
 # and 2 n^2 + n + 2 for an invertible one (H then holds the copy of A the inverse is formed on, MD the
 # row scales, and X the inverse): 3.4.0's n^2 + n + 2 and 2 n^2 + 3 n + 4 or less at every n, with a
-# 64 KB stack buffer beside them. Nothing is kept between calls.
+# 64 KB stack buffer beside them. Nothing is kept between calls. (3.5.0: a lost pivot adds, for each
+# extended attempt at P limbs, 2 n^2 (P + 3) + 10 n^2 + 6 n + 10 P + W + 31 words, W the residual's grid
+# (about twice the inverse's width in limbs), refused where the first two would pass ALLOC_MAX, and 2 n
+# words once for the attempts' row scales; or the
+# exact tier's 2 n^2 E + 8 E + 3 n + 4, E = h / 30 + 3 with h its bound in bits on every minor of A's
+# integers, refused where (2 n^2 + 16) E words would; a 1 x 1 allocates nothing.)
 # [measured: LA3 probe hd (alloc_used() around each call, n = 3, 10, 30, 100), 3.4.0 and this tree, 2026-11-01]
 # ⛔ 3.4.1 (first form) — the singular case took det modulo enough primes to pass Hadamard's bound,
 # n^3 / 3 reductions each: a singular 100 x 100 took 1.0 s, 34 s with two columns scaled 2^+-1000.
@@ -7870,41 +9920,76 @@ fn _lext_frob_wide(X, n, cs, out, ws) {
 # D102 audit, AU2-G3-F2).
 # [measured: D102 audit AU2 G3-F2 repro, re-run on 3.3.7 base (LA probe pd_1), cycc 6.7.9, 2026-10-31]
 public fn matrix_condition_number(A) {
-    var neg1 = f64_neg(F64_ONE);
-    if (A == 0) { return neg1; }
+    var v: i64[1];
+    if (_lext_cond(A, &v, 0) != 0) { return f64_neg(F64_ONE); }
+    return load64(&v);
+}
+
+# matrix_condition_number's body (3.5.0): 0 with cond_F(A) at out, or the failure's code; st (2 words,
+# or 0) gets a lost pivot's path (`_lext_inv_hp`).
+fn _lext_cond(A, out, st) {
+    if (A == 0) { return HSB_ERR_INVALID_INPUT; }
     var n = ganita_mat_rows(A);
-    if (n <= 0 || ganita_mat_cols(A) != n) { return neg1; }
-    if (_lext_mat_all_finite(A, n, n) == 0) { return neg1; }
-    if (n > (ALLOC_MAX / 8) / n) { return neg1; }
+    if (n <= 0 || ganita_mat_cols(A) != n) { return HSB_ERR_INVALID_INPUT; }
+    if (_lext_mat_all_finite(A, n, n) == 0) { return HSB_ERR_INVALID_INPUT; }
+    if (n > (ALLOC_MAX / 8) / n) { return HSB_ERR_ALLOC; }
+    # 3.5.0: a 1 x 1 [x] is |x| |1 / x| = 1 exactly (3.4.2 formed p fl(1/p): 3FEFFFFFFFFFFFFF for
+    # p = 2147483629), and 0 for x = 0, singular
+    if (n == 1) {
+        if ((load64(A + 16) & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return HSB_ERR_SINGULAR_MATRIX; }
+        store64(out, F64_ONE);
+        return 0;
+    }
     # 3.4.1 LA3: one n^2 block (H) and n + 2 words (MD), this call's own; the exact test reads A's
     # entries in place (its row-major data, as `_lp_mat_max_abs` reads them)
     var H = hisab_alloc(n * n * 8);
     var MD = hisab_alloc(n * 8 + 16);
-    if (H == 0 || MD == 0) { return neg1; }
+    if (H == 0 || MD == 0) { return HSB_ERR_ALLOC; }
     var dz = _lext_dz_run(A + 16, 0, n, H, MD, _LEXT_DZ_KEEP);
-    if (dz != 0) { return neg1; }   # singular (1), or its scratch refused (-1)
+    if (dz == 1) { return HSB_ERR_SINGULAR_MATRIX; }
+    if (dz != 0) { return HSB_ERR_ALLOC; }
     # invertible: H becomes R, a copy of A the elimination works on, X the inverse, MD the row scales
     var R = H;
     for (var q = 0; q < n * n; q = q + 1) { store64(R + q * 8, load64(A + 16 + q * 8)); }
     var X = hisab_alloc(n * n * 8);
-    if (X == 0) { return neg1; }
+    if (X == 0) { return HSB_ERR_ALLOC; }
     var sc = MD;
-    var w1: i64[2];   # the norms' 2 n words of scratch for n = 1 (X and R otherwise)
-    var ws1 = X;
-    var ws2 = R;
-    if (n < 2) {
-        ws1 = &w1;
-        ws2 = &w1;
-    }
     var na: i64[2];
-    _lext_frob_wide(R, n, 0, &na, ws1);   # (X as scratch: it is written below)
+    _lext_frob_wide(R, n, 0, &na, X);   # (X as scratch: it is written below)
     # A^-1 is left in the row-scaled frame and its norm formed wide, so no entry of it past
     # DBL_MAX can overflow a condition number that is not
-    if (_lext_gj_inv(R, 0, n, X, 0, sc, 0) != 0) { return neg1; }
     var ni: i64[2];
-    _lext_frob_wide(X, n, sc, &ni, ws2);   # (R as scratch: the elimination has spent it)
-    var pm = f64_mul(load64(&na), load64(&ni));
-    return _lext_xld(_lext_xman(pm), _lext_xexp(pm) + load64(&na + 8) + load64(&ni + 8));
+    var cn = f64_from(0);
+    if (_lext_gj_inv(R, 0, n, X, 0, sc, 0) == 0) {
+        _lext_frob_wide(X, n, sc, &ni, R);   # (R as scratch: the elimination has spent it)
+        var pm = f64_mul(load64(&na), load64(&ni));
+        cn = _lext_xld(_lext_xman(pm), _lext_xexp(pm) + load64(&na + 8) + load64(&ni + 8));
+    } else {
+        # 3.5.0: the elimination lost a pivot of an invertible A to rounding (cond(A) past about
+        # 1/u): ||A^-1||_F^2 is formed in certified extended precision, or exactly where that is
+        # cheaper (`_lext_inv_hp`), and cond_F rounded once from it (`_lext_cond_fin`)
+        var w2: i64[3];
+        if (_lext_inv_hp(A + 16, n, &w2, 0, st) != 0) { return HSB_ERR_ALLOC; }
+        cn = _lext_cond_fin(A + 16, n, &w2);
+    }
+    # 3.5.0: cond_F(A) >= n for every A (Cauchy-Schwarz on the singular values: (sum s_i^2)(sum
+    # s_i^-2) >= n^2), which the rounded product can fall under (an orthogonal Q is exactly n)
+    if (f64_lt(cn, f64_from(n)) == 1) { cn = f64_from(n); }
+    store64(out, cn);
+    return 0;
+}
+
+# cond_F(A) = ||A||_F ||A^-1||_F as matrix_condition_number forms it, with its failures told apart
+# (3.5.0): Ok(cond) (+Inf past DBL_MAX), Err(HSB_ERR_INVALID_INPUT) for a null or non-square A or a
+# NaN or infinite entry, Err(HSB_ERR_SINGULAR_MATRIX) for a singular A (decided exactly), and
+# Err(HSB_ERR_ALLOC) where its scratch is refused or would pass ALLOC_MAX. matrix_condition_number
+# answers -1 for every one of those.
+#must_use
+public fn matrix_condition_number_checked(A) {
+    var v: i64[1];
+    var rc = _lext_cond(A, &v, 0);
+    if (rc != 0) { return Err(rc); }
+    return Ok(load64(&v));
 }
 
 # ================================================================
@@ -7916,9 +10001,25 @@ public fn matrix_condition_number(A) {
 # n cond(m) u normwise, u = 2^-53, and carrying no correct digit once cond(m) passes about 1/(n u)).
 # Returns 0 for a null or non-square m, a NaN or infinite part (3.4.1: diag(+Inf, 1) answered
 # diag(0, 1)), a singular m (decided exactly, `_lext_det_zero`), an inverse with an entry past
-# DBL_MAX, an elimination that loses a pivot of an invertible m to rounding (cond(m) past about
-# 1/u), or a temporary that cannot be allocated (cmat_new's cap on the 3.4.0 augmented [m | I]
-# kept: n above 181).
+# DBL_MAX, or a temporary that cannot be allocated (cmat_new's cap on the 3.4.0 augmented [m | I]
+# kept: n above 181); `cmat_inverse_checked` tells those apart (3.5.0).
+# ⛔ 3.5.0 — AN INVERTIBLE m WHOSE ELIMINATION LOST A PIVOT TO ROUNDING ANSWERED 0, as singular:
+# [[1, 1 + u], [1 + u, 1 + 2u]] (u = 2^-52, det -2^-104, its inverse's entries 2^104 in size). The
+# real form [[Re m, -Im m], [Im m, Re m]] (2n x 2n, its inverse [[Re X, -Im X], [Im X, Re X]]) is now
+# inverted in certified extended precision, or exactly where that is cheaper (`_lext_inv_hp`), so the
+# answer is within 2^-69 ||m^-1||_F of m^-1 before each entry's rounding: within one rounding normwise.
+# On 169 such matrices (2 x 2s times a complex scalar, rows a rounded complex combination of others,
+# scaled by rows, and complex blocks coupled to a lost-pivot 2 x 2; n = 2 to 10) the merged tree answered
+# 0 on all; every entry of at least 2^-10 ||m^-1||_F is now correctly rounded and the worst normwise
+# error is 0.84 u (an entry far below the norm, an exact 0 among them, comes back as small as about
+# 2^-300 ||m^-1||_F, the normwise contract). Every matrix whose elimination completes (331) is answered
+# as before, bit for bit.
+# [measured: scratch_W4 genc.py (seeds 41, 42) + cmpc.py, Fraction oracle, merged tree and this tree, 2026-11-14]
+# ⚠ COST. The real form is 2n x 2n, so a lost pivot costs about eight real eliminations of size n in
+# extended precision: a complex block coupled to the 2 x 2 at n = 16 / 32 / 64 took 37 ms / 354 ms /
+# 2.9 s (the merged tree's 0 took 0.19 / 0.88 / 6.3 ms), single runs at load 7 beside a mutation run
+# (noisy); the cost grows as n^3, so n = 181, the cap, would be about a minute.
+# [measured: scratch_W4 cbig.bin (seed 5), merged tree and this tree, taskset -c 14, 1 run each, 2026-11-14]
 # ⛔ 3.4.1 — "SINGULAR" WAS A PIVOT BELOW 1e-12 OF THE ACTIVE BLOCK'S LARGEST ENTRY, or below
 # DBL_MIN: diag(1e-13, 1) came back 0 (exact diag(1e13, 1)), and so did [000C000000000000] (exact
 # 7FD5555555555555), while complex Hilbert 11 and 12 (cond 5e14, 1.7e16) were answered. Every
@@ -7940,13 +10041,40 @@ public fn matrix_condition_number(A) {
 # [measured: LA3 probe cost3.py (R2-LA's C0 / C1 / C2), 3.4.0 base and this tree, medians of 3, load 3, 2026-11-01]
 # [measured: LA4 probe ck.py (R3-LA's), 3.4.0, 3.4.1-dev, this tree interleaved x2, 2 instances, load 5, 2026-11-01]
 public fn cmat_inverse(m) {
-    if (m == 0) { return 0; }
+    var v: i64[1];
+    if (_lext_cinv(m, &v, 0) != 0) { return 0; }
+    return load64(&v);
+}
+
+# m^-1 as cmat_inverse forms it, with its failures told apart (3.5.0): Ok(a fresh n x n cmat),
+# Err(HSB_ERR_INVALID_INPUT) for a null or non-square m or a NaN or infinite part,
+# Err(HSB_ERR_SINGULAR_MATRIX) for a singular m (decided exactly), Err(HSB_ERR_OUT_OF_RANGE) for an
+# inverse with an entry past DBL_MAX, and Err(HSB_ERR_ALLOC) where scratch or the result is refused,
+# or n passes the cap cmat_inverse keeps (181). cmat_inverse answers 0 for every one of those.
+# ⚠ OUT_OF_RANGE is decided from the entries as formed. On a lost pivot they are the certified
+# extended-precision ones, so it means an exact entry is past DBL_MAX; where the f64 elimination
+# completes it means a COMPUTED entry overflowed, and past cond(m) of about 1 / (n u) those carry no
+# correct digit (cmat_inverse's accuracy, above), so there an exactly finite inverse can be refused and
+# an Ok entry can be far from the exact one.
+#must_use
+public fn cmat_inverse_checked(m) {
+    var v: i64[1];
+    var rc = _lext_cinv(m, &v, 0);
+    if (rc != 0) { return Err(rc); }
+    return Ok(load64(&v));
+}
+
+# cmat_inverse's body (3.5.0): 0 with the inverse at out, or the failure's code; st (2 words, or 0) gets
+# a lost pivot's path (`_lext_inv_hp`).
+fn _lext_cinv(m, out, st) {
+    store64(out, 0);
+    if (m == 0) { return HSB_ERR_INVALID_INPUT; }
     var n = cmat_rows(m);
-    if (n <= 0 || n != cmat_cols(m)) { return 0; }
+    if (n <= 0 || n != cmat_cols(m)) { return HSB_ERR_INVALID_INPUT; }
     # [measured: CHANGELOG.md 2.6.14, the capped-constructor entry (cmat_inverse, 250x500 augmented over the cap)]
     # 2.6.14 refused an n whose augmented [m | I] passed cmat_new's cap; that bound is kept, so
     # no n inverts here that did not before.
-    if (n > 65536 / (2 * n)) { return 0; }
+    if (n > 65536 / (2 * n)) { return HSB_ERR_ALLOC; }
     # this call's own scratch (3.4.1 LA3: nothing kept between calls), and m's elements read in place
     # through cmat's documented layout ({ rows, cols, data }, each element (re, im): complex.cyr),
     # not through cmat_get, which allocates an HComplex for every read
@@ -7955,23 +10083,60 @@ public fn cmat_inverse(m) {
     var XR = hisab_alloc(n * n * 8);
     var XI = hisab_alloc(n * n * 8);
     var sc = hisab_alloc(n * 8);
-    if (R == 0 || I == 0 || XR == 0 || XI == 0 || sc == 0) { return 0; }
+    if (R == 0 || I == 0 || XR == 0 || XI == 0 || sc == 0) { return HSB_ERR_ALLOC; }
     var md = load64(m + 16);
     for (var q = 0; q < n * n; q = q + 1) {
         var zr = load64(md + q * 16);
         var zi = load64(md + q * 16 + 8);
-        if (f64_lt(f64_abs(zr), F64_POS_INF) == 0 || f64_lt(f64_abs(zi), F64_POS_INF) == 0) { return 0; }
+        if (f64_lt(f64_abs(zr), F64_POS_INF) == 0 || f64_lt(f64_abs(zi), F64_POS_INF) == 0) {
+            return HSB_ERR_INVALID_INPUT;
+        }
         store64(R + q * 8, zr);
         store64(I + q * 8, zi);
     }
-    if (_lext_det_zero(R, I, n) != 0) { return 0; }
-    if (_lext_gj_inv(R, I, n, XR, XI, sc, 1) != 0) { return 0; }
+    var dz = _lext_det_zero(R, I, n);
+    if (dz == 1) { return HSB_ERR_SINGULAR_MATRIX; }
+    if (dz != 0) { return HSB_ERR_ALLOC; }
+    var g = _lext_gj_inv(R, I, n, XR, XI, sc, 1);
+    if (g == 2) { return HSB_ERR_OUT_OF_RANGE; }
+    if (g == 1) {
+        # 3.5.0: a pivot lost to rounding (cond(m) past about 1/u): the real form, inverted in
+        # extended precision (`_lext_inv_hp`), read back from its left half
+        var n2 = 2 * n;
+        var AE = hisab_alloc(n2 * n2 * 8);
+        var XE = hisab_alloc(n2 * n2 * 8);
+        if (AE == 0 || XE == 0) { return HSB_ERR_ALLOC; }
+        for (var i = 0; i < n; i = i + 1) {
+            for (var j = 0; j < n; j = j + 1) {
+                var er = load64(md + (i * n + j) * 16);
+                var ei = load64(md + (i * n + j) * 16 + 8);
+                store64(AE + (i * n2 + j) * 8, er);
+                store64(AE + (i * n2 + n + j) * 8, f64_neg(ei));
+                store64(AE + ((n + i) * n2 + j) * 8, ei);
+                store64(AE + ((n + i) * n2 + n + j) * 8, er);
+            }
+        }
+        var w2: i64[3];
+        if (_lext_inv_hp(AE, n2, &w2, XE, st) != 0) { return HSB_ERR_ALLOC; }
+        for (var i1 = 0; i1 < n; i1 = i1 + 1) {
+            for (var j1 = 0; j1 < n; j1 = j1 + 1) {
+                var xr = load64(XE + (i1 * n2 + j1) * 8);
+                var xi = load64(XE + ((n + i1) * n2 + j1) * 8);
+                if (f64_lt(f64_abs(xr), F64_POS_INF) == 0 || f64_lt(f64_abs(xi), F64_POS_INF) == 0) {
+                    return HSB_ERR_OUT_OF_RANGE;
+                }
+                store64(XR + (i1 * n + j1) * 8, xr);
+                store64(XI + (i1 * n + j1) * 8, xi);
+            }
+        }
+    }
     var result = cmat_new(n, n);
-    if (result == 0) { return 0; }
+    if (result == 0) { return HSB_ERR_ALLOC; }
     var rd = load64(result + 16);   # (the same layout: written in place, no HComplex per element)
     for (var q2 = 0; q2 < n * n; q2 = q2 + 1) {
         store64(rd + q2 * 16, load64(XR + q2 * 8));
         store64(rd + q2 * 16 + 8, load64(XI + q2 * 8));
     }
-    return result;
+    store64(out, result);
+    return 0;
 }

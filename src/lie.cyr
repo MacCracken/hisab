@@ -20,6 +20,13 @@ enum _LieF64 {
     _LIE_TWO_INV_SQRT3 = 0x3FF279A74590331C;   # 2/sqrt(3) = 1.1547005383792515290
 }
 
+# 3.5.0: what a part with no value holds -- an axis-angle or boost whose zero axis names no
+# direction, the zero quaternion's normalisation, an f_abc with no abc -- the quiet NaN, the
+# same bits on every target (an arithmetic NaN is 0xFFF8... on x86).
+enum _LieNaN {
+    _LIE_QNAN = 0x7FF8000000000000;   # the quiet NaN
+}
+
 # ================================================================
 # U(1) -- Phase group
 # ================================================================
@@ -158,7 +165,10 @@ fn _lie_norm4(w, x, y, z) {
     return f64_add(f64_add(f64_abs(w), f64_abs(x)), f64_add(f64_abs(y), f64_abs(z)));
 }
 
-# Construct from raw quaternion components (w, x, y, z). Normalizes.
+# Construct from raw quaternion components (w, x, y, z), normalised: q / |q|, with the
+# scaled norm at both ends of the range. The zero quaternion has no direction, so no unit
+# element: NaN in every slot (3.5.0; through 3.4.2 the identity, a valid element a caller
+# could not tell from an answer), as a NaN component gives. 0 when it cannot be allocated.
 public fn su2_from_quat(q) {
     var qx = HQuat_x(q); var qy = HQuat_y(q);
     var qz = HQuat_z(q); var qw = HQuat_w(q);
@@ -183,8 +193,11 @@ public fn su2_from_quat(q) {
     # (2^-k, 0, 0, 0), k = 1023 .. 1074; on 10,912 sweep quaternions 210 answers moved,
     # each to the bits of its scaled copy, none further from the Decimal oracle.
     # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+    # ⛔ 3.4.2 AND EARLIER -- norm == 0 RETURNED THE IDENTITY (AU2 §2b), a structurally valid
+    # element for an input that names none. ⭐ 3.5.0: NaN in every slot.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: a zero axis names no direction"]
     if (f64_lt(norm, F64_TINY) == 1) {
-        if (f64_eq(norm, 0) == 1) { return _su2_alloc(F64_ONE, 0, 0, 0); }
+        if (f64_eq(norm, 0) == 1) { return _su2_alloc(_LIE_QNAN, _LIE_QNAN, _LIE_QNAN, _LIE_QNAN); }
         var up = (1023 + 1023) << 52;   # 2^1023
         qw = f64_mul(qw, up); qx = f64_mul(qx, up);
         qy = f64_mul(qy, up); qz = f64_mul(qz, up);
@@ -232,7 +245,11 @@ public fn su2_to_quat(s) {
     return hquat_new(_su2_x(s), _su2_y(s), _su2_z(s), _su2_w(s));
 }
 
-# Construct from axis-angle: axis is Vec3, angle is f64
+# Construct from axis-angle: (cos(angle/2), sin(angle/2) axis / |axis|), axis an HVec3 (any
+# length), angle an f64. A zero axis names no direction (3.5.0): where sin(angle/2) is exactly
+# 0 every axis gives (cos(angle/2), 0, 0, 0), which is returned (the identity for angle +-0);
+# otherwise the vector part has no value, NaN in its three slots beside cos(angle/2), as a NaN
+# axis gives (through 3.4.2 the identity for every angle). 0 when it cannot be allocated.
 public fn su2_from_axis_angle(axis, angle) {
     var half = f64_mul(angle, F64_HALF);
     var s_half = f64_sin(half);
@@ -263,8 +280,16 @@ public fn su2_from_axis_angle(axis, angle) {
     # answers bit for bit (3,000 of 3,000 each). The answers that were within 1 ulp and are
     # now not (291 here; 186, 87 and 147) carry their axis's unit-length error instead.
     # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+    # ⛔ 3.4.2 AND EARLIER -- A ZERO AXIS GAVE THE IDENTITY AT EVERY ANGLE (AU2 §2b), the rotation
+    # by 0, for a rotation by `angle` about no axis. ⭐ 3.5.0: only where sin(angle/2) is exactly
+    # 0, where every axis gives (cos(angle/2), 0, 0, 0); otherwise the axis is NaN, as a NaN axis
+    # is, and the vector part comes out NaN through the lines below.
+    # [measured: tests/modules_d.tcyr group "3.5.0 L7: a zero axis names no direction"]
     if (f64_lt(len, F64_TINY) == 1) {
-        if (f64_eq(len, 0) == 1) { return _su2_alloc(F64_ONE, 0, 0, 0); }
+        if (f64_eq(len, 0) == 1) {
+            if (f64_eq(s_half, 0) == 1) { return _su2_alloc(c_half, 0, 0, 0); }
+            ax = _LIE_QNAN; ay = _LIE_QNAN; az = _LIE_QNAN;
+        }
         var up = (1023 + 1023) << 52;   # 2^1023
         ax = f64_mul(ax, up); ay = f64_mul(ay, up); az = f64_mul(az, up);
         len = lie_norm3(ax, ay, az);
@@ -344,6 +369,11 @@ fn _lie_sub_half(x) {
 #
 # The invariant this restores, and which tests now pin:
 #   su2_to_rotation_matrix(su2_exp(w)) == so3_exp(w)   (the SU(2) -> SO(3) cover)
+# For |omega| >> 1 the element carries about u |omega|, u = 2^-53 (|omega| is rounded to a
+# double before its half-angle's cos and sin are taken): the backward-stable answer, measured
+# through se3_exp (lie_ext.cyr) as the largest quaternion-part error, 0.20 u |omega| median and
+# 1.14 at most, from |omega| = 2^2 to 2^41 (15,600 elements, a __float128 oracle).
+# [measured: scratch se3orc.c, se3sweep.py, 2026-11-14; not reproducible in-tree]
 public fn su2_exp(v) {
     var ox = HVec3_x(v); var oy = HVec3_y(v); var oz = HVec3_z(v);
     var norm = lie_norm3(ox, oy, oz);
@@ -532,9 +562,11 @@ public fn su2_to_rotation_matrix(s) {
 # gell_mann(idx): a fresh 3x3 ComplexMatrix holding the Gell-Mann matrix lambda_{idx+1}
 # for idx 0..7 (the physics numbering shifted to 0-based). Every entry is 0, +-1, +-i, or
 # for lambda_8 (idx 7) the correctly rounded 1/sqrt(3) and -2/sqrt(3) (3.4.1; one ulp
-# high through 3.4.0). An idx outside 0..7 returns the 3x3 zero matrix, not 0. Returns
-# the designed 0 only when an allocation is refused.
+# high through 3.4.0). Returns the designed 0, which every cmat_* passes on, for an idx
+# outside 0..7 (there is no such matrix: 3.4.2 returned the 3x3 zero matrix, a legal
+# matrix) or when an allocation is refused.
 public fn gell_mann(idx) {
+    if (idx < 0 || idx > 7) { return 0; }   # no lambda_(idx + 1) (3.5.0)
     var one = cx_one();
     if (one == 0) { return 0; }
     var neg_one = cx_new(f64_neg(F64_ONE), 0);
@@ -594,14 +626,10 @@ public fn gell_mann(idx) {
         cmat_set(m, 2, 1, i_pos);
         return m;
     }
-    # lambda_8: diagonal (1, 1, -2)/sqrt(3)
-    if (idx == 7) {
-        cmat_set(m, 0, 0, inv_sqrt3);
-        cmat_set(m, 1, 1, inv_sqrt3);
-        cmat_set(m, 2, 2, neg2_inv_sqrt3);
-        return m;
-    }
-    # Invalid index: return zero matrix
+    # lambda_8: diagonal (1, 1, -2)/sqrt(3), idx 7, the one left
+    cmat_set(m, 0, 0, inv_sqrt3);
+    cmat_set(m, 1, 1, inv_sqrt3);
+    cmat_set(m, 2, 2, neg2_inv_sqrt3);
     return m;
 }
 
@@ -638,9 +666,11 @@ fn _su3_canonical(a, b, c) {
 # su3_structure_constant(a, b, c): the SU(3) structure constant f_{abc} as an f64, with
 # a, b, c 1-indexed (1..8, the physics numbering), totally antisymmetric. The nonzero
 # values are +-1, +-1/2 and +-sqrt(3)/2 (f64_sqrt(3) / 2: correctly rounded, the division
-# by 2 being exact). Any other index triple, an out-of-range index included, gives 0;
-# there is no failure value.
+# by 2 being exact); every other triple of indices in 1..8 gives 0, its value. An index
+# outside 1..8 names no f_abc: the quiet NaN (3.5.0; through 3.4.2 the 0 a valid triple
+# gives).
 public fn su3_structure_constant(a, b, c) {
+    if (a < 1 || a > 8 || b < 1 || b > 8 || c < 1 || c > 8) { return _LIE_QNAN; }
     # Try all 6 permutations with antisymmetry signs
     # Even permutations: (a,b,c), (b,c,a), (c,a,b) -> +1
     # Odd permutations:  (b,a,c), (a,c,b), (c,b,a) -> -1
@@ -729,15 +759,24 @@ public fn lorentz_boost_z(eta) {
     return m;
 }
 
-# Boost along arbitrary unit direction with rapidity eta.
-# dir is a Vec3 (will be normalized).
+# Boost along a direction with rapidity eta: dir is an HVec3 of any length, normalised here.
+# A zero dir names no direction (3.5.0): at sinh(eta) exactly 0 (eta +-0) every direction gives
+# the identity, which is returned; otherwise every entry but Lambda^0_0 = cosh(eta) has no
+# value, NaN, as a NaN dir gives (through 3.4.2 the identity at every rapidity). 0 when it
+# cannot be allocated.
 public fn lorentz_boost(dir, eta) {
     var nx = HVec3_x(dir); var ny = HVec3_y(dir); var nz = HVec3_z(dir);
     var norm = lie_norm3(nx, ny, nz);
+    var ch = ganita_f64_cosh(eta);
+    var sh = ganita_f64_sinh(eta);
     # 3.3.4: both ends of `norm`, repaired as in `su2_from_axis_angle` (audit D086); since
-    # 3.3.5 the top copy starts where 1/norm goes subnormal, as there.
+    # 3.3.5 the top copy starts where 1/norm goes subnormal, as there. 3.5.0: a zero dir is
+    # the identity only at sh = 0, as there; otherwise a NaN direction.
     if (f64_lt(norm, F64_TINY) == 1) {
-        if (f64_eq(norm, 0) == 1) { return lorentz_identity(); }
+        if (f64_eq(norm, 0) == 1) {
+            if (f64_eq(sh, 0) == 1) { return lorentz_identity(); }
+            nx = _LIE_QNAN; ny = _LIE_QNAN; nz = _LIE_QNAN;
+        }
         var up = (1023 + 1023) << 52;   # 2^1023
         nx = f64_mul(nx, up); ny = f64_mul(ny, up); nz = f64_mul(nz, up);
         norm = lie_norm3(nx, ny, nz);
@@ -750,8 +789,6 @@ public fn lorentz_boost(dir, eta) {
     }
     nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
 
-    var ch = ganita_f64_cosh(eta);
-    var sh = ganita_f64_sinh(eta);
     # cosh(eta) - 1. ⛔ Through 3.4.0 the plain subtraction, which keeps only cosh's own
     # rounding where cosh is near 1: 1e8 ulp at small rapidity and exactly 0 below ~2^-26,
     # so the spatial block lost its n n^T term (Lambda^1_2 = 0 at eta = 1.2e-8, exact
@@ -794,16 +831,25 @@ public fn lorentz_boost(dir, eta) {
     return m;
 }
 
-# Spatial rotation embedded in Lorentz group.
-# axis is Vec3 (normalized internally), angle is f64.
-# Time component unchanged; spatial block uses Rodrigues' formula.
+# Spatial rotation embedded in the Lorentz group: axis an HVec3 of any length (normalised
+# here), angle an f64. The time component is unchanged; the spatial block is Rodrigues'
+# formula. A zero axis names no direction (3.5.0): at sin(angle) exactly 0 (angle +-0) every
+# axis gives the identity, which is returned; otherwise the spatial block has no value, NaN,
+# as a NaN axis gives (through 3.4.2 the identity at every angle). 0 when it cannot be
+# allocated.
 public fn lorentz_rotate(axis, angle) {
     var nx = HVec3_x(axis); var ny = HVec3_y(axis); var nz = HVec3_z(axis);
     var norm = lie_norm3(nx, ny, nz);
+    var c = f64_cos(angle);
+    var s = f64_sin(angle);
     # 3.3.4: both ends of `norm`, repaired as in `su2_from_axis_angle` (audit D086); since
-    # 3.3.5 the top copy starts where 1/norm goes subnormal, as there.
+    # 3.3.5 the top copy starts where 1/norm goes subnormal, as there. 3.5.0: a zero axis is
+    # the identity only at s = 0 (then c = 1); otherwise a NaN axis.
     if (f64_lt(norm, F64_TINY) == 1) {
-        if (f64_eq(norm, 0) == 1) { return lorentz_identity(); }
+        if (f64_eq(norm, 0) == 1) {
+            if (f64_eq(s, 0) == 1) { return lorentz_identity(); }
+            nx = _LIE_QNAN; ny = _LIE_QNAN; nz = _LIE_QNAN;
+        }
         var up = (1023 + 1023) << 52;   # 2^1023
         nx = f64_mul(nx, up); ny = f64_mul(ny, up); nz = f64_mul(nz, up);
         norm = lie_norm3(nx, ny, nz);
@@ -816,8 +862,6 @@ public fn lorentz_rotate(axis, angle) {
     }
     nx = f64_mul(nx, inv); ny = f64_mul(ny, inv); nz = f64_mul(nz, inv);
 
-    var c = f64_cos(angle);
-    var s = f64_sin(angle);
     # 1 - cos(angle), as sin^2 / (1 + cos) where cos > 3/4 (3.4.1; as so3_from_axis_angle
     # says: the subtraction there keeps only cos's rounding, 6e15 ulp at small angles and 0
     # below ~2^-26). Elsewhere unchanged.
@@ -908,8 +952,10 @@ public fn lorentz_transform_4vec(L, v) {
 # Returns 1 when every entry of Lambda^T eta Lambda is within 1e-12 of eta's, RELATIVE to
 # that entry's own sum of magnitudes S_mu_nu = sum_rho |Lambda^rho_mu| |Lambda^rho_nu|
 # (the scale its rounding error and the input's carry), and 0 otherwise. A matrix with any
-# NaN or infinite entry is 0. There is no failure value: a 0 handle is not checked.
+# NaN or infinite entry is 0, and so is a 0 handle (3.5.0: through 3.4.2 it was read, a
+# null dereference), which is no transformation. There is no failure value.
 public fn lorentz_is_valid(L) {
+    if (L == 0) { return 0; }
     # ⛔ 3.4.0 AND EARLIER — ONE TOLERANCE FOR ALL SIXTEEN ENTRIES, 1e-12 * (1 + max^2), AND A
     # TEST THAT A NaN PASSES. (1) The largest entry of a boost of rapidity eta is cosh eta,
     # so at high rapidity an entry whose own products are O(1) was held to 1e-12 * cosh^2:

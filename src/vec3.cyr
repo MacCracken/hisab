@@ -14,6 +14,17 @@
 #derive(accessors)
 public struct HVec3 { x; y; z; }
 
+# 3.5.0 (roadmap [3.5.0] "A 0 handle passed in still faults", INS5 F3): a 0 handle passed in, the
+# designed answer of a refused allocation, read address 0 in every function below that takes an
+# HVec3 but `hvec3_add`, `_sub`, `_mul`, `_scale` (repaired first) and the two `_checked` forms, which
+# refuse it. vec2.cyr's header has the rule now kept here: an HVec3 result is the designed 0 for a
+# 0 operand, before anything is allocated, and a double result is NaN (`_HV3_NAN`). The `_into`
+# forms write NaN into every component of out for a 0 operand and return 0, so a caller that does
+# not read the return finds no plausible value in out.
+enum _HVec3F64 {
+    _HV3_NAN = 0x7FF8_0000_0000_0000;   # NaN, quiet: what a double-valued function answers for a null handle
+}
+
 # A new HVec3 (x, y, z): 24 bytes from the heap, the components stored as given (any doubles).
 # Returns the designed 0 where the allocation is refused (3.4.0); so does every function in
 # this file that returns an HVec3.
@@ -54,8 +65,19 @@ public fn hvec3_unit_z() { return hvec3_new(0, 0, F64_ONE); }
 # SIMD: xy pair via packed n=2, z scalar tail (over-read-safe).
 # a + b, componentwise, each component one IEEE addition, correctly rounded (overflow and NaN
 # as IEEE gives them), the same bits on x86 and aarch64 (one operation per lane).
+# ⛔ 3.5.0 — A 0 HANDLE FAULTED (roadmap [3.5.0], INS5 F3): hvec3_add(0, v) read address 0, rc 139,
+# where 0 is the designed answer of every constructor here whose allocation was refused, so a
+# chain such as hvec3_add(hvec3_new(...), v) crashed on an exhausted heap. A 0 operand now gives
+# the designed 0, before anything is allocated; so do `hvec3_sub`, `_mul` and `_scale`. Cost: 54 ->
+# 58 ns (+7%) in one run of the A/B, 31 -> 27 in another: within its noise.
+# [measured: scratch bench/ab.cyr, 3.4.2 and this tree interleaved x 6, taskset, 2026-11-14; noisy, 8 lanes]
+# That was `if (a == 0 || b == 0)`; the two tests that replaced it (vec2.cyr's header says why) read
+# 24.79 -> 24.85 ns against it, a median of 16 pinned interleaved pairs.
+# [measured: scratch ab.bcyr, the 3.5.0 wave-1 tree and this one, 16 pinned interleaved pairs; cycc 6.7.18; noisy]
 #must_use
 public fn hvec3_add(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     var r = hisab_alloc(sizeof(HVec3));
     if (r == 0) { return 0; }
     f64v_add(r, a, b, 2);
@@ -63,9 +85,12 @@ public fn hvec3_add(a, b) {
     return r;
 }
 
-# a - b, componentwise, each component correctly rounded (the `hvec3_add` layout).
+# a - b, componentwise, each component correctly rounded (the `hvec3_add` layout); a 0 operand
+# gives the designed 0 (3.5.0, as `hvec3_add`).
 #must_use
 public fn hvec3_sub(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     var r = hisab_alloc(sizeof(HVec3));
     if (r == 0) { return 0; }
     f64v_sub(r, a, b, 2);
@@ -73,9 +98,12 @@ public fn hvec3_sub(a, b) {
     return r;
 }
 
-# The componentwise (Hadamard) product (ax bx, ay by, az bz), each correctly rounded.
+# The componentwise (Hadamard) product (ax bx, ay by, az bz), each correctly rounded; a 0 operand
+# gives the designed 0 (3.5.0, as `hvec3_add`).
 #must_use
 public fn hvec3_mul(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     var r = hisab_alloc(sizeof(HVec3));
     if (r == 0) { return 0; }
     f64v_mul(r, a, b, 2);
@@ -83,9 +111,11 @@ public fn hvec3_mul(a, b) {
     return r;
 }
 
-# v times the scalar s, each component correctly rounded.
+# v times the scalar s, each component correctly rounded; v = 0 gives the designed 0 (3.5.0, as
+# `hvec3_add`).
 #must_use
 public fn hvec3_scale(v, s) {
+    if (v == 0) { return 0; }
     var r = hisab_alloc(sizeof(HVec3));
     if (r == 0) { return 0; }
     f64v_scale(r, v, s, 2);
@@ -100,14 +130,25 @@ public fn hvec3_scale(v, s) {
 # that calls them every step grows the heap every step (issue 2026-11-09-allocator-scoped-calls,
 # impetus H1 / H9). These write the same bits into the caller's HVec3 `out` and allocate
 # nothing. out may be an operand: every operand component is read before out's is written.
-# Each returns out, and 0 for out = 0. (hquat_rotate_vec3_into, hquat_mul_into,
+# Each returns out, and 0 for out = 0; for a 0 operand it writes NaN into out and returns 0 (3.5.0).
+# (hquat_rotate_vec3_into, hquat_mul_into,
 # m3_mul_vec3_into, m3_mul_into and m4_mul_into are beside their allocating forms; the
 # allocation scope in src/heap.cyr contains every other call.)
 # [measured: tests/modules_c.tcyr, group "3.4.2: the _into value operations"]
 
+# NaN into every component of the HVec3 out (a 0 operand's answer, 3.5.0); returns 0.
+fn _hvec3_nan_into(out) {
+    HVec3_set_x(out, _HV3_NAN);
+    HVec3_set_y(out, _HV3_NAN);
+    HVec3_set_z(out, _HV3_NAN);
+    return 0;
+}
+
 # a + b into out, hvec3_add's bits (the same packed xy pair and scalar z).
 public fn hvec3_add_into(out, a, b) {
     if (out == 0) { return 0; }
+    if (a == 0) { return _hvec3_nan_into(out); }
+    if (b == 0) { return _hvec3_nan_into(out); }
     var z = f64_add(HVec3_z(a), HVec3_z(b));
     f64v_add(out, a, b, 2);
     HVec3_set_z(out, z);
@@ -117,6 +158,8 @@ public fn hvec3_add_into(out, a, b) {
 # a - b into out, hvec3_sub's bits.
 public fn hvec3_sub_into(out, a, b) {
     if (out == 0) { return 0; }
+    if (a == 0) { return _hvec3_nan_into(out); }
+    if (b == 0) { return _hvec3_nan_into(out); }
     var z = f64_sub(HVec3_z(a), HVec3_z(b));
     f64v_sub(out, a, b, 2);
     HVec3_set_z(out, z);
@@ -126,18 +169,21 @@ public fn hvec3_sub_into(out, a, b) {
 # v times the scalar s into out, hvec3_scale's bits.
 public fn hvec3_scale_into(out, v, s) {
     if (out == 0) { return 0; }
+    if (v == 0) { return _hvec3_nan_into(out); }
     var z = f64_mul(HVec3_z(v), s);
     f64v_scale(out, v, s, 2);
     HVec3_set_z(out, z);
     return out;
 }
 
-# -v, each component's sign flipped (`f64_neg`; below cycc 6.6.8 it gave +0 for +0).
+# -v, each component's sign flipped, exact, -0 for +0 on every pin (3.5.0: a flip of the sign bit;
+# `f64_neg` gave +0 for +0 below cycc 6.6.8, which the bundle's 6.6.3 floor admits).
 #must_use
 public fn hvec3_neg(v) {
-    return hvec3_new(f64_neg(HVec3_x(v)),
-      f64_neg(HVec3_y(v)),
-      f64_neg(HVec3_z(v)));
+    if (v == 0) { return 0; }
+    return hvec3_new(HVec3_x(v) ^ 0x8000_0000_0000_0000,
+      HVec3_y(v) ^ 0x8000_0000_0000_0000,
+      HVec3_z(v) ^ 0x8000_0000_0000_0000);
 }
 
 # ================================================================
@@ -160,10 +206,12 @@ public fn hvec3_neg(v) {
 # rows, on the library's most-called primitive, for a sign no hisab caller reads: the two
 # divisions by a dot in geo_diff refuse a non-finite reciprocal, and a zero t from a ray routine
 # is the miss either way. So the convention is documented, not changed; `hvec4_dot` and
-# `hquat_dot` share it.
+# `hquat_dot` share it. NaN for a 0 operand (3.5.0).
 # [measured: scratch flerp.bcyr and tests/hisab.bcyr, 3.4.0 and the fixed form, 2026-10-31; cycc 6.7.18]
 #must_use
 public fn hvec3_dot(a, b) {
+    if (a == 0) { return _HV3_NAN; }
+    if (b == 0) { return _HV3_NAN; }
     return f64_add(f64v_dot(a, b, 2), f64_mul(HVec3_z(a), HVec3_z(b)));
 }
 
@@ -173,6 +221,8 @@ public fn hvec3_dot(a, b) {
 # that absolute error, not a relative one. Overflow and NaN follow IEEE.
 #must_use
 public fn hvec3_cross(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     return hvec3_new(
       f64_sub(f64_mul(HVec3_y(a), HVec3_z(b)), f64_mul(HVec3_z(a), HVec3_y(b))),
       f64_sub(f64_mul(HVec3_z(a), HVec3_x(b)), f64_mul(HVec3_x(a), HVec3_z(b))),
@@ -181,9 +231,11 @@ public fn hvec3_cross(a, b) {
 }
 
 # a x b into out, hvec3_cross's bits (each component formed before any is stored, so out
-# may be a or b). Returns out; 0 for out = 0 (3.4.2).
+# may be a or b). Returns out; 0 for out = 0 (3.4.2), and NaN into out and 0 for a 0 operand (3.5.0).
 public fn hvec3_cross_into(out, a, b) {
     if (out == 0) { return 0; }
+    if (a == 0) { return _hvec3_nan_into(out); }
+    if (b == 0) { return _hvec3_nan_into(out); }
     var x = f64_sub(f64_mul(HVec3_y(a), HVec3_z(b)), f64_mul(HVec3_z(a), HVec3_y(b)));
     var y = f64_sub(f64_mul(HVec3_z(a), HVec3_x(b)), f64_mul(HVec3_x(a), HVec3_z(b)));
     var z = f64_sub(f64_mul(HVec3_x(a), HVec3_y(b)), f64_mul(HVec3_y(a), HVec3_x(b)));
@@ -196,6 +248,7 @@ public fn hvec3_cross_into(out, a, b) {
 # |v|^2 (`hvec3_dot(v, v)`): +Inf once a square passes DBL_MAX (|component| >= 2^512), and
 # subnormal, losing bits, once every component is below 2^-511; use `hvec3_length` for the
 # magnitude across the whole range.
+# A 0 handle gives NaN (3.5.0), through `hvec3_dot`.
 #must_use
 public fn hvec3_length_sq(v) { return hvec3_dot(v, v); }
 
@@ -239,6 +292,7 @@ fn _hvec3_len_scaled(v) {
 # ⚠ And the `+Inf` short-circuit inside the helper is REQUIRED: without it
 # `Inf/Inf` is NaN and the documented infinity contract regresses.
 # [measured: 1106-scale two-sided sweep; naive wrong at 60, guarded at 0]
+# A 0 handle gives NaN (3.5.0), through `hvec3_dot`.
 #must_use
 public fn hvec3_length(v) {
     var ls = hvec3_length_sq(v);
@@ -252,6 +306,7 @@ public fn hvec3_length(v) {
 # zero vector gives the zero vector, a sentinel with |v| = 0, not a unit vector (it has no
 # direction). A NaN component gives NaN components; an infinite one gives NaN in its own slot
 # and zeros in the finite ones. Returns the designed 0 where an allocation is refused.
+# A 0 handle gives the designed 0 (3.5.0).
 #must_use
 public fn hvec3_normalize(v) {
     var len = hvec3_length(v);
@@ -311,13 +366,35 @@ public fn hvec3_normalize(v) {
     return hvec3_scale(v, inv);
 }
 
+# v / |v| as `Ok(unit)`: `hvec3_normalize`'s answer, bit for bit, for every finite non-zero v.
+# `Err(HSB_ERR_DIVISION_BY_ZERO)` for the zero vector (either zero sign in every component), which
+# has no direction; `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite component, or a 0 handle;
+# `Err(HSB_ERR_ALLOC)` where an allocation is refused.
+# ⭐ 3.5.0 (roadmap [3.5.0] FB F4): `hvec3_normalize` answers the zero vector with the zero
+# vector, a sentinel (|v| = 0, not a unit vector) that a caller must test for, and a NaN or
+# infinite component with NaN components; `m4_look_at_rh` took that zero for a basis vector. This
+# is the error channel, as `hquat_normalize_checked` is for quaternions. `hvec3_normalize`
+# stays, with that documented contract, for callers that test the length themselves.
+#must_use
+public fn hvec3_normalize_checked(v) {
+    if (v == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_hvec3_finite(v) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (((HVec3_x(v) | HVec3_y(v) | HVec3_z(v)) & 0x7FFF_FFFF_FFFF_FFFF) == 0) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    var r = hvec3_normalize(v);
+    if (r == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(r);
+}
+
 # |a - b|: `hvec3_length` of the difference, formed as `hvec3_sub` forms it (on the stack), so
 # its error is the difference's rounding (u relative per component, u = 2^-53) and then the
 # length's; +Inf where |a - b| rounds past DBL_MAX (IEEE's rounding: (DBL_MAX, 2^500) from 0 is
 # DBL_MAX though its exact length exceeds it, and (DBL_MAX, DBL_MAX) from 0
 # is +Inf with no component of the difference overflowing), and where a component overflows.
+# NaN for a 0 operand (3.5.0).
 #must_use
 public fn hvec3_distance(a, b) {
+    if (a == 0) { return _HV3_NAN; }
+    if (b == 0) { return _HV3_NAN; }
     # The difference is a stack HVec3 (3.4.0), formed exactly as hvec3_sub forms it: this
     # returns a length, with no value left for a refused allocation.
     var d: i64[3];
@@ -340,6 +417,8 @@ public fn hvec3_distance(a, b) {
 # f64v_fmadd: those fuse on aarch64 (`fmla`), which rounds once where this rounds twice.
 #must_use
 public fn hvec3_lerp(a, b, t) {
+    if (a == 0) { return 0; }   # 3.5.0: before the allocation
+    if (b == 0) { return 0; }
     var r = hisab_alloc(sizeof(HVec3));
     if (r == 0) { return 0; }
     var ax = load64(a);                                              # x, at offset 0
@@ -422,6 +501,8 @@ fn _hvec3_max1(a, b) {
 # NaN, -0 below +0).
 #must_use
 public fn hvec3_min(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     return hvec3_new(_hvec3_min1(HVec3_x(a), HVec3_x(b)),
       _hvec3_min1(HVec3_y(a), HVec3_y(b)),
       _hvec3_min1(HVec3_z(a), HVec3_z(b)));
@@ -431,6 +512,8 @@ public fn hvec3_min(a, b) {
 # +0 above -0).
 #must_use
 public fn hvec3_max(a, b) {
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
     return hvec3_new(_hvec3_max1(HVec3_x(a), HVec3_x(b)),
       _hvec3_max1(HVec3_y(a), HVec3_y(b)),
       _hvec3_max1(HVec3_z(a), HVec3_z(b)));
@@ -439,25 +522,31 @@ public fn hvec3_max(a, b) {
 # (|x|, |y|, |z|), exact (the sign bits cleared; a NaN stays NaN).
 #must_use
 public fn hvec3_abs(v) {
+    if (v == 0) { return 0; }
     return hvec3_new(f64_abs(HVec3_x(v)), f64_abs(HVec3_y(v)), f64_abs(HVec3_z(v)));
 }
 
-# Reflect v about normal n (assumes n is normalized)
+# Reflect v about normal n (assumes n is normalized). 0 for a 0 operand (3.5.0): v = 0 is refused
+# before the scaled normal is allocated; n = 0 is `hvec3_scale`'s.
 #must_use
 public fn hvec3_reflect(v, n) {
+    if (v == 0) { return 0; }
     var d2 = f64_mul(F64_TWO, hvec3_dot(v, n));
     var nd = hvec3_scale(n, d2);
     if (nd == 0) { return 0; }
     return hvec3_sub(v, nd);
 }
 
-# Project v onto direction d (assumes d is normalized)
+# Project v onto direction d (assumes d is normalized). 0 for a 0 operand (3.5.0): v = 0 made the dot
+# NaN and the answer a NaN vector; d = 0 is `hvec3_scale`'s.
 #must_use
 public fn hvec3_project(v, d) {
+    if (v == 0) { return 0; }
     return hvec3_scale(d, hvec3_dot(v, d));
 }
 
-# Reject v from direction d (component perpendicular to d)
+# Reject v from direction d (component perpendicular to d). 0 for a 0 operand, through
+# `hvec3_project` (3.5.0).
 #must_use
 public fn hvec3_reject(v, d) {
     var pr = hvec3_project(v, d);
@@ -489,9 +578,9 @@ var _HV3_TWO52 = 0x4330000000000000;      # 2^52
 
 # The e with a * b = p + e exactly, for p = RN(a * b): Dekker's product, split at
 # 2^27 + 1 (no FMA). Exact while nothing overflows or reaches the subnormals.
-# `hvec3_angle`'s scaled copies (|component| < 2) rule out the overflow; a product below
+# `hvec3_angle_checked`'s scaled copies (|component| < 2) rule out the overflow; a product below
 # about 2^-969 has a subnormal error term that loses its low bits, which matters only for
-# angles near DBL_MIN (see `hvec3_angle`).
+# angles near DBL_MIN (see `hvec3_angle_checked`'s history).
 fn _hvec3_mul_err(a, b, p) {
     var t = f64_mul(a, _HV3_SPLIT);
     var ah = f64_sub(t, f64_sub(t, a));
@@ -651,81 +740,89 @@ fn _hvec3_finite(v) {
     return 1;
 }
 
-# Angle between two vectors in radians
+# The history of `hvec3_angle`'s method, which `hvec3_angle_checked` (below) keeps:
+# ⛔ THIS GUARD READ `denom < EPSILON_F64` AND CALLED PERPENDICULAR VECTORS
+# PARALLEL. `denom` is |a|·|b| — a length SQUARED, so it scales as the square
+# of the caller's units — and it was compared against an absolute 1e-12.
+# Measured: two EXACTLY perpendicular vectors return pi/2 at lengths 1, 1e-3
+# and 1e-6, and **0 rad at 1e-18**. Same geometry, different units, different
+# answer — and 0 is the value that means "parallel", so the function reports
+# the opposite of the truth rather than reporting failure.
+# [measured: probe over 4 scales on the 2.13.0 tree, 2026-09-09]
+#
+# ⭐ GUARD WHAT ACTUALLY FAILS. The only operation at risk is the division
+# `d / denom`, and by Cauchy-Schwarz |d| <= denom always, so the quotient is
+# in [-1, 1] and cannot overflow for ANY denom above zero. The division fails
+# only at a zero or subnormal denominator, which is exactly `F64_TINY`. There
+# is no scale to choose here, which is the point: a threshold that needs one
+# is the defect.
+# ⚠ The `return 0` stays — for a genuinely zero-length vector the angle is
+# undefined and this function has no error channel — but it is now
+# unreachable except for that genuinely degenerate input.
+# [measured: tests/foundation.tcyr scale-covariance sweep, 154 decades]
+#
+# ⛔ 3.3.4 — THE PARAGRAPH ABOVE WAS WRONG ABOUT WHAT FAILS. Below DBL_MIN the division
+# does not degenerate, its operands do: `d` and `denom` flush, and the `return 0` it
+# kept called EXACTLY PERPENDICULAR vectors parallel on 511 of the 1022 binades below
+# 1, and answered 0 for every pair below 2^-511 whatever the angle. tests/foundation.tcyr
+# pinned two of those zeros as "genuinely degenerate" (audit D089). A subnormal |a|
+# beside a normal |b| failed first: |a| is rounded onto the subnormal grid, so for
+# (2^-1074, 2^-1074, 0) against (2^1000, 0, 0) |a| = sqrt(2) * 2^-1074 became 2^-1074,
+# d/denom came out exactly 1, and the answer 0 for pi/4. Past DBL_MAX, (2^512, 0, 0) with itself was NaN, and
+# (2^1000, 0, 0) against (2^23, 2^24, 0), atan(2), was pi/2: a.b finite over denom +Inf.
+# [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
+# 3.3.4 sent exactly those inputs to atan2(|a' x b'|, a'.b') on power-of-two copies and
+# kept the acos line for the rest.
+#
+# ⛔ 3.3.5 — AND THE ACOS LINE WAS THE LARGER ERROR. acos is ill-conditioned near 0 and
+# pi: (1, 1, 0) with itself came back 2.1e-8 rad at every scale, nearly parallel pairs
+# were up to 1.1e26 ulp off, nearly opposed ones up to 6.7e7 ulp, and (1, 1, 0)
+# against (1, 0, 0) was one ulp above pi/4 on 64,094 of a 90,000-pair grid of scales.
+# Of 173,721 inputs, 30,918 were more than 1 ulp from the oracle. The plain atan2 line on
+# every input is no cure (its cross product cancels near 0; 3.3.4 measured it moving 188
+# of 38,406 answers past 1 ulp), and neither is Kahan's 2 atan2(|lb a - la b|, |lb a +
+# la b|), which is accurate only absolutely: 1.4e18 ulp on nearly parallel pairs and
+# 1,711 of 10,000 exact 45-degree pairs past 1 ulp.
+# [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+# ⭐ Every finite input now takes atan2(|a x b|, a.b) with both operands carried as
+# double-doubles (Dekker products, two-sums, a Newton-corrected square root) on copies
+# scaled by powers of two, so nothing overflows and the cross product keeps its last bits
+# for nearly parallel pairs. The atan is taken of a renormalised quotient, corrected to
+# first order, with pi and pi/2 as double-doubles (`_hvec3_angle_dd` says which quotient
+# where). What remains is atan's own rounding and one more: on the same 173,721 inputs
+# the largest error is 0.99 ulp, none is past 1 ulp, and 3,133 are not correctly rounded
+# where 113,188 were not. 816 that the acos line happened to round correctly are now
+# within 1 ulp instead, since one rounded atan cannot be correctly rounded everywhere.
+# Parallel, perpendicular and opposed stay 0, pi/2 and pi bit-exact at every scale: their
+# cross or dot product is exactly 0, double-double or not.
+# [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+# ⚠ Not past 1 ulp for an angle near DBL_MIN. When the copies' components span more than
+# about 2^1000, an angle that small is made of products that are themselves subnormal,
+# and the Dekker error terms lose their low bits. On 40,002 pairs sharing all but one or
+# two tiny components, 172 results were past 1 ulp (up to 2.66), every one below 2^-1020;
+# the 33,993 results at or above 2^-1020 were all within 0.96. (3.3.4 answered every one
+# of those pairs 0, 1.5e-8 or 2.1e-8.)
+# [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
+# ⚠ COST: several times the acos line's arithmetic, not timed here (3.3.5). Through 3.4.2 a
+# zero-length vector returned 0 and a NaN or infinite component ran an acos line; 3.5.0 refuses
+# both (`hvec3_angle_checked`).
+#
+# The angle between a and b, radians in [0, pi], as `Ok(angle)`: atan2(|a x b|, a . b) on
+# power-of-two copies, both operands carried as double-doubles (the history above has the method
+# and its accuracy). Parallel, perpendicular and opposed
+# are 0, pi/2 and pi bit-exact at every scale. `Err(HSB_ERR_DIVISION_BY_ZERO)` where a or b is the
+# zero vector (either zero sign in every component), which has no direction, so no angle;
+# `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite component, or a 0 handle.
+# ⛔ 3.5.0 — REPLACES `hvec3_angle` (roadmap [3.5.0], AU2 §2b), WHICH RETURNED 0 FOR A ZERO
+# VECTOR, the answer that means "parallel", and NaN through an acos line for a non-finite
+# component. Every finite non-zero pair keeps `hvec3_angle`'s bits. Retired, not redefined.
 #must_use
-public fn hvec3_angle(a, b) {
-    # ⛔ THIS GUARD READ `denom < EPSILON_F64` AND CALLED PERPENDICULAR VECTORS
-    # PARALLEL. `denom` is |a|·|b| — a length SQUARED, so it scales as the square
-    # of the caller's units — and it was compared against an absolute 1e-12.
-    # Measured: two EXACTLY perpendicular vectors return pi/2 at lengths 1, 1e-3
-    # and 1e-6, and **0 rad at 1e-18**. Same geometry, different units, different
-    # answer — and 0 is the value that means "parallel", so the function reports
-    # the opposite of the truth rather than reporting failure.
-    # [measured: probe over 4 scales on the 2.13.0 tree, 2026-09-09]
-    #
-    # ⭐ GUARD WHAT ACTUALLY FAILS. The only operation at risk is the division
-    # `d / denom`, and by Cauchy-Schwarz |d| <= denom always, so the quotient is
-    # in [-1, 1] and cannot overflow for ANY denom above zero. The division fails
-    # only at a zero or subnormal denominator, which is exactly `F64_TINY`. There
-    # is no scale to choose here, which is the point: a threshold that needs one
-    # is the defect.
-    # ⚠ The `return 0` stays — for a genuinely zero-length vector the angle is
-    # undefined and this function has no error channel — but it is now
-    # unreachable except for that genuinely degenerate input.
-    # [measured: tests/foundation.tcyr scale-covariance sweep, 154 decades]
-    #
-    # ⛔ 3.3.4 — THE PARAGRAPH ABOVE WAS WRONG ABOUT WHAT FAILS. Below DBL_MIN the division
-    # does not degenerate, its operands do: `d` and `denom` flush, and the `return 0` it
-    # kept called EXACTLY PERPENDICULAR vectors parallel on 511 of the 1022 binades below
-    # 1, and answered 0 for every pair below 2^-511 whatever the angle. tests/foundation.tcyr
-    # pinned two of those zeros as "genuinely degenerate" (audit D089). A subnormal |a|
-    # beside a normal |b| failed first: |a| is rounded onto the subnormal grid, so for
-    # (2^-1074, 2^-1074, 0) against (2^1000, 0, 0) |a| = sqrt(2) * 2^-1074 became 2^-1074,
-    # d/denom came out exactly 1, and the answer 0 for pi/4. Past DBL_MAX, (2^512, 0, 0) with itself was NaN, and
-    # (2^1000, 0, 0) against (2^23, 2^24, 0), atan(2), was pi/2: a.b finite over denom +Inf.
-    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-03; cycc 6.6.14]
-    # 3.3.4 sent exactly those inputs to atan2(|a' x b'|, a'.b') on power-of-two copies and
-    # kept the acos line for the rest.
-    #
-    # ⛔ 3.3.5 — AND THE ACOS LINE WAS THE LARGER ERROR. acos is ill-conditioned near 0 and
-    # pi: (1, 1, 0) with itself came back 2.1e-8 rad at every scale, nearly parallel pairs
-    # were up to 1.1e26 ulp off, nearly opposed ones up to 6.7e7 ulp, and (1, 1, 0)
-    # against (1, 0, 0) was one ulp above pi/4 on 64,094 of a 90,000-pair grid of scales.
-    # Of 173,721 inputs, 30,918 were more than 1 ulp from the oracle. The plain atan2 line on
-    # every input is no cure (its cross product cancels near 0; 3.3.4 measured it moving 188
-    # of 38,406 answers past 1 ulp), and neither is Kahan's 2 atan2(|lb a - la b|, |lb a +
-    # la b|), which is accurate only absolutely: 1.4e18 ulp on nearly parallel pairs and
-    # 1,711 of 10,000 exact 45-degree pairs past 1 ulp.
-    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
-    # ⭐ Every finite input now takes atan2(|a x b|, a.b) with both operands carried as
-    # double-doubles (Dekker products, two-sums, a Newton-corrected square root) on copies
-    # scaled by powers of two, so nothing overflows and the cross product keeps its last bits
-    # for nearly parallel pairs. The atan is taken of a renormalised quotient, corrected to
-    # first order, with pi and pi/2 as double-doubles (`_hvec3_angle_dd` says which quotient
-    # where). What remains is atan's own rounding and one more: on the same 173,721 inputs
-    # the largest error is 0.99 ulp, none is past 1 ulp, and 3,133 are not correctly rounded
-    # where 113,188 were not. 816 that the acos line happened to round correctly are now
-    # within 1 ulp instead, since one rounded atan cannot be correctly rounded everywhere.
-    # Parallel, perpendicular and opposed stay 0, pi/2 and pi bit-exact at every scale: their
-    # cross or dot product is exactly 0, double-double or not.
-    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
-    # ⚠ Not past 1 ulp for an angle near DBL_MIN. When the copies' components span more than
-    # about 2^1000, an angle that small is made of products that are themselves subnormal,
-    # and the Dekker error terms lose their low bits. On 40,002 pairs sharing all but one or
-    # two tiny components, 172 results were past 1 ulp (up to 2.66), every one below 2^-1020;
-    # the 33,993 results at or above 2^-1020 were all within 0.96. (3.3.4 answered every one
-    # of those pairs 0, 1.5e-8 or 2.1e-8.)
-    # [measured: scratch harness and Decimal oracle, not reproducible in-tree, 2026-10-11; cycc 6.6.14]
-    # ⚠ COST: several times the acos line's arithmetic, not timed here; no tests/hisab.bcyr
-    # row calls this function. A zero-length vector still returns 0, and a NaN or infinite
-    # component still runs the acos line, unchanged (the finite test is on the components).
-    if (_hvec3_finite(a) + _hvec3_finite(b) == 2) {
-        var w[144];
-        if (f64_eq(_hvec3_pow2_copy(a, &w), 0) == 1) { return 0; }
-        if (f64_eq(_hvec3_pow2_copy(b, &w + 24), 0) == 1) { return 0; }
-        return _hvec3_angle_dd(&w);
-    }
-    var d = hvec3_dot(a, b);
-    var denom = f64_mul(hvec3_length(a), hvec3_length(b));
-    return ganita_f64_acos(f64_clamp(f64_div(d, denom), f64_neg(F64_ONE), F64_ONE));
+public fn hvec3_angle_checked(a, b) {
+    if (a == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (b == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    if (_hvec3_finite(a) + _hvec3_finite(b) != 2) { return Err(HSB_ERR_INVALID_INPUT); }
+    var w: i64[18];
+    if (f64_eq(_hvec3_pow2_copy(a, &w), 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    if (f64_eq(_hvec3_pow2_copy(b, &w + 24), 0) == 1) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    return Ok(_hvec3_angle_dd(&w));
 }

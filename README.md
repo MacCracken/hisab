@@ -4,11 +4,23 @@
 
 Higher math for the AGNOS ecosystem — linear algebra, geometry, calculus, numerical methods, automatic differentiation, symbolic algebra, and more. Written in [Cyrius](https://github.com/MacCracken/cyrius), ported from Rust.
 
-Used by fifteen repos that pull `dist/hisab.cyr` SHA-locked, all on hisab 3.4.1 and cyrius 6.7.18: attn11, dhvani, garjan, ghurni, goonj, hoosh, kimiya, naad, nidhi, prani, svara and ushma, plus impetus, prakash and pravash as a test dependency. jalwa, shabda and shabdakosh carry a copy transitively through one of them. Manifests were read 2026-11-14. 3.4.2 is these consumers' filings: the allocation scope, the queries and transforms into caller storage, matrix-free CG, and sakshi as a stdlib leaf.
+Used by fifteen repos that pull `dist/hisab.cyr` SHA-locked, all on hisab 3.4.1 and cyrius 6.7.18: attn11, dhvani, garjan, ghurni, goonj, hoosh, kimiya, naad, nidhi, prani, svara and ushma, plus impetus, prakash and pravash as a test dependency. jalwa, shabda and shabdakosh carry a copy transitively through one of them. Manifests were read 2026-11-14. 3.4.2 is these consumers' filings: the allocation scope, the queries and transforms into caller storage, matrix-free CG, and sakshi as a stdlib leaf. 3.5.0 breaks the API again (below); none of the fifteen calls a retired name.
 
 ⚠ [impetus](https://github.com/MacCracken/impetus) (physics), [kiran](https://github.com/MacCracken/kiran) (engine), [joshua](https://github.com/MacCracken/joshua) (simulation), [aethersafha](https://github.com/MacCracken/aethersafha) (compositor), [hisab-mimamsa](https://github.com/MacCracken/hisab-mimamsa) (theoretical physics) and [kana](https://github.com/MacCracken/kana) (quantum science) are **planned** — Rust repos awaiting a Cyrius port, except aethersafha, which is ported but declares no hisab dependency yet.
 
 For expression evaluation and unit conversion, see [abaco](https://github.com/MacCracken/abaco).
+
+## ⛔ 3.5.0 retires 16 names and makes 23 constants enum members
+
+Answers that stood in for "no answer" change, and where a name's meaning changed it is **retired, not
+redefined**: 16 public functions (`t2d_apply`, `t2d_compose`, `t3d_compose`, the four `tensor_get` /
+`tensor_set` accessors, `ev100_to_luminance`, `luminance_to_ev100`, `m4_look_at_rh`,
+`hquat_from_axis_angle`, `hvec3_angle`, `sym_match`, `sym_match_bindings`, `sym_const_eq`, `num_mobius`)
+each have a replacement that refuses where the old name answered with a plausible value.
+`world_to_screen_checked` takes a fifth parameter, the NDC depth range. The 23 `public var` constants a
+consumer could write (`GJK_MAX_ITER`, `F64_POS_INF`, the `GEO_*` tags, `AD_NONE`, …) are enum members
+with the same names and values, so assigning one no longer compiles. `spatial_hash_insert` and
+`spatial_hash_clear` are `#must_use`. Read **[docs/guides/migration-3.5.md](docs/guides/migration-3.5.md)**.
 
 ## ⛔ 3.4.0 retires 27 names for error channels
 
@@ -33,7 +45,7 @@ reached through `&name` (an upstream defect fixed in 6.6.4). The names that were
 `F64_*` constants in calc/calc_ext/diffgeo, `EPSILON_F32`, `AdPowLimit`, `RenderLayout`, the
 raw `GeoJet_*` accessors), and seven internal helpers have real public names (`num_mulmod`,
 `num_is_pow2`, `noise_perm`, `lie_norm3`, `linalg_sort_desc`, `sym_const_to_str`,
-`sym_const_eq`). No live consumer references a removed or hidden name — checked across all 14
+`sym_const_eq`, retired in 3.5.0). No live consumer references a removed or hidden name — checked across all 14
 repos carrying a bundle. Read **[docs/guides/migration-3.3.md](docs/guides/migration-3.3.md)**.
 
 ## ⛔ 3.0.0 is breaking
@@ -52,14 +64,16 @@ those call sites quietly passing against the old function forever, which is the 
 removes. **2.24.0 is the supported 2.x line.**
 
 ⚠ **Minimum toolchain: hisab ≥ 3.1.0 requires cyrius ≥ 6.6.3.** `public struct` + `#derive` is
-refused by cycc 6.6.2; measured again in 3.4.2 from dirs pinned to each version, the 3.4.2 bundle is
-refused under 6.6.2 and compiles with no warning and runs a cross-module program (every 3.4.2 entry
-point among its readings) under 6.6.3, 6.6.4, 6.6.5, 6.6.10, 6.6.13, 6.6.20, 6.7.9 and 6.7.18, with the
-manifest's stdlib leaves and with the sidecar's. The output is bit-identical but for three DST values
-on 6.6.3–6.6.5, `num_dst`'s and `num_dst_into`'s alike: those pins' own sin / cos (3.4.1 measured SVD's
-singular values at most 2 ulp apart from 6.6.16, and 3.4.0 `cx_powf(·, ±Inf)` NaN on 6.6.3 / 6.6.6). Bump `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1.
+refused by cycc 6.6.2; measured again in 3.5.0 from dirs pinned to each version, the 3.5.0 bundle is
+refused under 6.6.2 and compiles with no warning and runs a cross-module program (the release's new and
+changed entry points among its 32 readings) under every pin from 6.6.3 to 6.7.18, 37 toolchains, with the
+manifest's stdlib leaves and with the sidecar's, its output byte-identical on all of them. Results that take
+a pin's own transcendentals can still differ: 3.4.2 measured three DST values on 6.6.3–6.6.5 (those pins'
+sin / cos), 3.4.1 SVD's singular values at most 2 ulp apart from 6.6.16, and 3.4.0 `cx_powf(·, ±Inf)` NaN
+on 6.6.3 / 6.6.6. Bump `cyrius` in your manifest before moving `[deps.hisab] tag` past 3.0.1.
 Some results follow your toolchain rather than hisab's:
-- A zero produced by negation is −0 from cyrius **6.6.8** (IEEE sign flip; +0 below).
+- A zero produced by negation is −0 from cyrius **6.6.8** (IEEE sign flip; +0 below). Since 3.5.0 the
+  vec, quat and mat4 negations flip the sign bit themselves, so they give −0 under every pin.
 - `dual_pow` is within 1 ulp from **6.6.10** (ganita 1.2.8's `pow`).
 - From **6.6.13** (ganita 1.2.11): `cx_arg` and the functions on it take the C99 side of the
   branch cut for a −0 imaginary part, and `atan2` of a NaN is NaN; `sinh`/`cosh` are re-derived,
@@ -119,8 +133,8 @@ stdlib = ["string", "fmt", "alloc", "vec", "str", "math", "ganita", "tagged", "r
 
 [deps.hisab]
 git     = "https://github.com/MacCracken/hisab.git"
-tag     = "3.4.2"
-modules = ["dist/hisab.cyr"]   # ~3.7 MB self-contained bundle (all 36 modules)
+tag     = "3.5.0"
+modules = ["dist/hisab.cyr"]   # ~4.2 MB self-contained bundle (all 36 modules)
 # `dist/hisab.deps` is tracked as of 2.9.2 -- `cyrius deps` reads that sidecar and
 # pulls in the 9 stdlib leaves the bundle needs, so the `stdlib` list above only has
 # to name what *your* code uses.
@@ -185,14 +199,15 @@ compiles, and the callee silently receives the **tag**. See
 ```sh
 cyrius build src/main.cyr build/hisab
 cyrius test tests/hisab.tcyr        # 1350 cross-module integration assertions
-cyrius test tests/foundation.tcyr   # 1094 vec/quat/mat foundation assertions
-cyrius test tests/modules.tcyr      # 3002 per-module assertions (first third)
-cyrius test tests/modules_b.tcyr    # 1843 per-module assertions (second third)
-cyrius test tests/modules_c.tcyr    # 2055 per-module assertions (last third)
+cyrius test tests/foundation.tcyr   # 1095 vec/quat/mat foundation assertions
+cyrius test tests/modules.tcyr      # 2996 per-module assertions (first part)
+cyrius test tests/modules_b.tcyr    # 1842 per-module assertions (second part)
+cyrius test tests/modules_c.tcyr    # 2209 per-module assertions (third part)
+cyrius test tests/modules_d.tcyr    # 2188 per-module assertions (the 3.5.0 repairs)
 cyrius test tests/edge_cases.tcyr   # 2044 degenerate-input assertions
-cyrius test tests/abuse.tcyr        # 2764 hostile-input assertions (negative indices,
+cyrius test tests/abuse.tcyr        # 2759 hostile-input assertions (negative indices,
                                     #   zero/huge dimensions, non-conformable operands, canaries)
-cyrius bench tests/hisab.bcyr       # 375 benchmarks
+cyrius bench tests/hisab.bcyr       # 505 benchmarks
 cyrius fuzz                         # 5 fuzz targets with invariant checks
 ```
 
@@ -204,15 +219,15 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the full 
 
 | Metric | Value |
 |--------|-------|
-| Version | 3.4.2 |
-| Library | 36 modules (35 math, plus the allocation scope), ~71,900 lines of Cyrius |
-| Tests | 14303 assertions across 7 suites |
-| Benchmarks | 392 operations |
+| Version | 3.5.0 |
+| Library | 36 modules (35 math, plus the allocation scope), ~80,500 lines of Cyrius |
+| Tests | 16483 assertions across 8 suites |
+| Benchmarks | 505 operations |
 | Fuzz targets | 6 seeded generators with invariant checks (vec3, quat, ray, gcd, m4_inverse, einsum notation), plus the fixed self-test buffers |
 | CLI binary | ~307 KB static ELF (`build/hisab` — version smoke test only) |
 | Toolchain | Cyrius 6.7.18 |
 | Dependencies | the Cyrius stdlib only (sakshi 2.5.10 among its leaves since 3.4.2); no package, no third-party, no FFI/libc |
-| Security | No FFI, no libc, no third-party code — the Cyrius stdlib only. Every fallible entry point returns `Result<T, E>`; 296 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared (3.1.0) and enforced (3.3.0)**: every non-underscore top-level declaration carries `public`, the shipped bundle is `private` so a consumer naming anything else is refused at compile time (enum constants excepted: the language gives them no visibility, so a non-public enum's members are `_`-named), and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **Two open filings** in [docs/development/issues/](docs/development/issues/) (48 archived; 3.4.2 closed the five consumer issues filed 2026-11-09 to 11-11 with paired runs): ganita's symmetric eigensolver stops at an absolute 1e-12·max|a| (filed 2026-10-31; `eigen_symmetric` is exposed), and ganita's QR and least squares answer wrongly, with status 0, near DBL_MAX (filed 2026-10-31; still open on ganita 1.2.15, and hisab no longer calls either since 3.4.0). 3.3.7 closed the previous four with paired runs on cyrius 6.6.14 and 6.6.20 — two in cyrius (top-level `fncallN` on a capturing closure crashed; a closure's `return` of a `: stack` value was booked against the enclosing fn; both fixed in 6.6.16) and two in ganita (`ganita_mat_svd` refused rank-deficient and tiny-rotation matrices and accepted non-finite input; both fixed in ganita 1.2.12). ganita's `atan2` filing closed in 3.3.4 when ganita 1.2.11 repaired it. The 3.2.1 benchmark-statistic filing was repaired upstream in cyrius 6.6.9 and closed here in 3.2.2 with a paired measurement. The cycc wrong-code defect 3.2.0 found (the register picker dropping an `f64v_*` destination-slot store, wrong on 6.6.0–6.6.4) was repaired upstream in 6.6.5 and closed here in 3.2.1. `m3_mul_vec3` keeps its hoisted form: every direct consumer pins cyrius 6.7.18 (manifests read 2026-11-14), past the fix, but jalwa, which carries the bundle through dhvani, pins 6.6.3, below it, and 3.3.7 timed the hoist the fastest of three forms. Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
+| Security | No FFI, no libc, no third-party code — the Cyrius stdlib only. Every fallible entry point returns `Result<T, E>`; 337 `#must_use` annotations in `src/`, gated in CI because it is a *compiler* diagnostic a lint grep cannot see. The allocation and abort surfaces were swept in 2.12.0 and the guards are derived, not chosen. **The public API is declared (3.1.0) and enforced (3.3.0)**: every non-underscore top-level declaration carries `public`, the shipped bundle is `private` so a consumer naming anything else is refused at compile time (enum constants excepted: the language gives them no visibility, so a non-public enum's members are `_`-named), and `scripts/check-public-surface.sh` flips every module `private` in a scratch copy on each CI run to prove the surface complete and exact — with calls, never `&name` (a private fn was reachable through address-of on cycc 6.6.2/6.6.3; fixed in 6.6.4, and the gate keeps call probes because consumers build under their own pins). **Two open filings** in [docs/development/issues/](docs/development/issues/) (48 archived; 3.4.2 closed the five consumer issues filed 2026-11-09 to 11-11 with paired runs): ganita's symmetric eigensolver stops at an absolute 1e-12·max|a| (filed 2026-10-31; `eigen_symmetric` is exposed), and ganita's QR and least squares answer wrongly, with status 0, near DBL_MAX (filed 2026-10-31; still open on ganita 1.2.15, and hisab no longer calls either since 3.4.0). 3.3.7 closed the previous four with paired runs on cyrius 6.6.14 and 6.6.20 — two in cyrius (top-level `fncallN` on a capturing closure crashed; a closure's `return` of a `: stack` value was booked against the enclosing fn; both fixed in 6.6.16) and two in ganita (`ganita_mat_svd` refused rank-deficient and tiny-rotation matrices and accepted non-finite input; both fixed in ganita 1.2.12). ganita's `atan2` filing closed in 3.3.4 when ganita 1.2.11 repaired it. The 3.2.1 benchmark-statistic filing was repaired upstream in cyrius 6.6.9 and closed here in 3.2.2 with a paired measurement. The cycc wrong-code defect 3.2.0 found (the register picker dropping an `f64v_*` destination-slot store, wrong on 6.6.0–6.6.4) was repaired upstream in 6.6.5 and closed here in 3.2.1. `m3_mul_vec3` keeps its hoisted form: every direct consumer pins cyrius 6.7.18 (manifests read 2026-11-14), past the fix, but jalwa, which carries the bundle through dhvani, pins 6.6.3, below it, and 3.3.7 timed the hoist the fastest of three forms. Since 3.2.0 every public struct is pinned to its exact measured `sizeof` — the layout contract's previous 32 assertions could not fail. Dated reports in [docs/audit/](docs/audit/) — the largest is the 2026-08-11 P(-1) sweep (52 reproduced, 21 confirmed, 2 refuted, **28 reproduced but never verified and recorded as such**). |
 
 ## License
 

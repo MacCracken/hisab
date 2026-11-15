@@ -6,11 +6,12 @@
 # All test suites
 cyrius test tests/hisab.tcyr        # 1350 smoke/integration tests
 cyrius test tests/foundation.tcyr   # 1095 exhaustive foundation type tests
-cyrius test tests/modules.tcyr      # 3003 per-module tests (first part)
-cyrius test tests/modules_b.tcyr    # 1843 per-module tests (second part, split in 3.3.4)
-cyrius test tests/modules_c.tcyr    # 2203 per-module tests (third part, split in 3.3.7)
+cyrius test tests/modules.tcyr      # 2996 per-module tests (first part)
+cyrius test tests/modules_b.tcyr    # 1842 per-module tests (second part, split in 3.3.4)
+cyrius test tests/modules_c.tcyr    # 2209 per-module tests (third part, split in 3.3.7)
+cyrius test tests/modules_d.tcyr    # 2188 per-module tests (fourth part: the 3.5.0 repairs)
 cyrius test tests/edge_cases.tcyr   # 2044 edge case + boundary tests
-cyrius test tests/abuse.tcyr        # 2765 hostile-input tests
+cyrius test tests/abuse.tcyr        # 2759 hostile-input tests
 
 # Benchmarks (392 operations)
 cyrius bench tests/hisab.bcyr
@@ -23,18 +24,40 @@ cyrius fuzz
 cyrius build tests/hisab.fcyr build/hisab_fuzz && build/hisab_fuzz
 ```
 
+### Memory the harnesses take (3.5.0)
+
+The allocator reserves its heap in 256 MB grain chunks, mapped `MAP_NORESERVE`. Under
+`vm.overcommit_memory` 0 or 1 an untouched chunk costs nothing; under 2 (strict) every private
+writable mapping is charged in full against `CommitLimit`. With every mapping granted, the peak
+charge of each run, the `cyrius` CLI's own chunk included, is:
+
+| Run | Peak charge | Resident peak |
+|-----|-------------|---------------|
+| `cyrius test tests/modules_b.tcyr` (the largest suite) | 2,621,960 KB | |
+| `cyrius test` of the others | 2,114,056 KB (the compile: cycc 1,851,692 beside the CLI) | |
+| `cyrius bench tests/hisab.bcyr` | 13,369,756 KB | 12,968,428 KB |
+
+⚠ **The benchmark harness fills 50 grain chunks and never frees them** (40 through 3.4.2), so it needs about 13 GB of
+memory in any mode, not only of commit under mode 2: run it on a machine with that much free.
+CI's `scripts/check-overcommit.sh` step says which mode the Test, Fuzz and Bench steps run under,
+and in mode 2 fails before them, naming each step the commit room would not cover. With less
+room than a run's peak, a refused chunk drops the allocator to its 16 MB grain: `hisab.tcyr`
+still passes down to 610,000 KB and fails loudly below it.
+[measured: lane L8 commitpeak.py ptrace tracer and getrusage maxrss, this tree, cycc 6.7.18, 2026-11-14]
+
 ## Test Suites
 
 | Suite | Assertions | Covers |
 |-------|-----------|--------|
 | `foundation.tcyr` | 1095 | Vec2/3/4, Quat, Mat4 — construction, arithmetic, products, norms, interpolation, rotation, inverse, determinant, SRT, projections |
-| `modules.tcyr` | 3003 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff (forward-mode duals AND the 2.11.0 reverse-mode tape), interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1, the OBB rotation partial in 2.10.2) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse); since 3.3.0, number theory above 2^62 (the three `mulmod` tiers and their boundaries) and the helpers 3.3.0 made public, called as API |
-| `modules_b.tcyr` | 1843 | The second part of the per-module suite, split from `modules.tcyr` in 3.3.4 because the single file (1.15 MB) passed `cyrius lint` / `cyrius fmt`'s 1028 KB input cap, so CI could not lint or format-check it. Same includes, tolerances and helpers; it runs every group from "2.7.3 coverage" up to "3.3.5: perlin_2d / perlin_3d past 2^63" — Delaunay, GJK/EPA/MPR, time-of-impact, spatial hash and BVH arenas among them |
-| `modules_c.tcyr` | 2203 | The third part, split from `modules_b.tcyr` in 3.3.7 at the "3.3.5: perlin_2d / perlin_3d past 2^63" group (908 KB against the same cap; each half about 450 KB at the split). Same includes and helpers; perlin and simplex noise, `calc_ext` (adaptive Simpson, monotone cubic), the 2.14.0–2.17.0 scale-covariance groups (collision, optimizers, solvers, Lie, complex, rays), the optimizer and `eigen_power` wide-range groups, and the 3.2.0 / 3.3.5 coverage groups; since 3.4.2 the release's own groups: the allocation scope, the `_into` value operations, the spatial hash's queries into caller storage and its one radius order, `num_dst_into` against `num_dst` bit for bit, and `num_cg` against a transcription of 1.4.0's loop |
+| `modules.tcyr` | 2996 | Per-module — geo, calc, num, complex, Lie, diffgeo, symbolic, autodiff (forward-mode duals AND the 2.11.0 reverse-mode tape), interval, tensor, einsum, mat3, noise, color, arena, spatial (BVH, kd-tree, spatial hash), differentiable geometry (`geo_diff` — ray/surface jets for all six primitives; plane/sphere/triangle in 2.10.0, aabb/obb/capsule in 2.10.1, the OBB rotation partial in 2.10.2) and collision (convex hull, triangulation, Delaunay, half-edge, GJK/EPA, MPR, time-of-impact, island detection, sequential-impulse); since 3.3.0, number theory above 2^62 (the three `mulmod` tiers and their boundaries) and the helpers 3.3.0 made public, called as API |
+| `modules_b.tcyr` | 1842 | The second part of the per-module suite, split from `modules.tcyr` in 3.3.4 because the single file (1.15 MB) passed `cyrius lint` / `cyrius fmt`'s 1028 KB input cap, so CI could not lint or format-check it. Same includes, tolerances and helpers; it runs every group from "2.7.3 coverage" up to "3.3.5: perlin_2d / perlin_3d past 2^63" — Delaunay, GJK/EPA/MPR, time-of-impact, spatial hash and BVH arenas among them |
+| `modules_c.tcyr` | 2209 | The third part, split from `modules_b.tcyr` in 3.3.7 at the "3.3.5: perlin_2d / perlin_3d past 2^63" group (908 KB against the same cap; each half about 450 KB at the split). Same includes and helpers; perlin and simplex noise, `calc_ext` (adaptive Simpson, monotone cubic), the 2.14.0–2.17.0 scale-covariance groups (collision, optimizers, solvers, Lie, complex, rays), the optimizer and `eigen_power` wide-range groups, and the 3.2.0 / 3.3.5 coverage groups; since 3.4.2 the release's own groups: the allocation scope, the `_into` value operations, the spatial hash's queries into caller storage and its one radius order, `num_dst_into` against `num_dst` bit for bit, and `num_cg` against a transcription of 1.4.0's loop |
+| `modules_d.tcyr` | 2188 | The fourth part, new in 3.5.0 (632 KB against the same 1028 KB cap): the release's own groups, one block per area of its roadmap — rays, planes, triangles and jets; collision entries, CGA, half-edge boundaries, the octree and quadtree centres, kd-tree range, SDFs; the condition number's exact tier and `eigen_power`'s certificate; exact symbolic folding, sharing, the matcher's channel and hand-set tapes; certified implicit ODE steps, conjugate gradients, splines and `num_mobius_checked`; the retired foundation names' replacements, look-at, the screen ray, normalize, slerp and the tensor accessors; complex special values, `cx_ln` near the unit circle and the Lie/diffgeo refusals. Then eight blocks for the rows those left open: sphere certificates past the limits and at flushed radii; capsules on spread exponents and near a long axis; the rim ring, the deep snap and the collision refusal sweep; the certified extended inverse, `cmat_inverse` and `eigen_power`'s rounding bound; the ODE certificate's slope; autodiff misses, cut edges and the memo walks; `sectional_curvature`'s three tiers, `se3_log` and `cx_ln`'s band; and a 0 handle passed to the vec/quat foundations (each case in a child process). Same includes and tolerances as `modules_c.tcyr`; each block's names carry its `_v35L<n>_` or `_w2W<n>_` prefix |
 | `hisab.tcyr` | 1350 | Cross-module integration — ODE, optimization, sparse, PGS/LCP, ray-sphere, Newton, Euler identity, CGA (contraction/dual/projection), mat_new_guarded, diffgeo (sectional/Weyl/transport/Jacobi/forms), decomposition (SVD, QR, eigen), Krylov (GMRES) |
 | `edge_cases.tcyr` | 2044 | Degenerate inputs (zero-length normalize, singular inverse, parallel ray, division by zero, undefined variables) plus pinned invariants (bit-math/overflow/determinism, allocation-overflow guards — including the **upstream stdlib `mat_new`** CWE-190 contract, added 2.6.11), and `noise_perm` building its table on first use — this is the one suite with no other noise call |
-| `abuse.tcyr` | 2765 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Its known-defect register holds 11 entries: 10 crash-class defects in ten public functions, all repaired in 2.9.0 and asserted in the file, and `cmat_get` / `cmat_set`, a raw-accessor precondition kept unguarded by design. They are recorded rather than deleted |
-| **Total** | **14303** | |
+| `abuse.tcyr` | 2759 | Hostile input, added 2.9.0 — negative indices and counts, zero/one/overflow-prone dimensions, non-conformable operands, the designed-0 return of every capped constructor, degenerate geometry (zero extents/radii, coincident points, NaN/±Inf coordinates), bounded-work guarantees, and **canary checks** (a guard block allocated immediately after each out-buffer, asserted untouched — the only way a write-past-the-end shows up as a failure rather than as luck). Its known-defect register holds 11 entries: 10 crash-class defects in ten public functions, all repaired in 2.9.0 and asserted in the file, and `cmat_get` / `cmat_set`, a raw-accessor precondition kept unguarded by design. They are recorded rather than deleted |
+| **Total** | **16483** | |
 
 ⛔ **2.21.0 — THREE OF THOSE FIVE ROWS HAD BEEN STALE FOR RELEASES AND THE TABLE
 COULD NOT ANNOUNCE IT.** They summed to **3574** against a published total of

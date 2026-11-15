@@ -54,10 +54,21 @@
 #
 # Usage:
 #   scripts/check-miscompile.sh [--pin V]... [--bundle PATH] [--suites] [--allow-missing] [--keep]
-#   scripts/check-miscompile.sh --selftest
-# A requested pin that is not installed under ~/.cyrius/versions fails the run unless
-# --allow-missing. Not wired into CI: CI installs one toolchain. Run it by hand at a
-# release and at every pin bump.
+#   scripts/check-miscompile.sh --selftest [--require-controls]
+#   scripts/check-miscompile.sh --list-pins
+# A requested pin that is not installed under $CYRIUS_HOME/versions (default ~/.cyrius) fails
+# the run unless --allow-missing. --require-controls fails the selftest where arm (a) would be
+# skipped. --list-pins prints every toolchain the default run and the selftest use, one per
+# line, the manifest pin last: CI installs the others beside the pin from that list, so no
+# version is written in the YAML.
+# ⭐ 3.5.0 -- WIRED INTO CI. 3.4.0 shipped a miscompiled octree_insert under cycc 6.6.3 and 6.6.4
+# (exit 139 for a 6.6.3-pinned program inserting 40 points) while this script, in the tree since
+# 3.3.6, would have reported its 2 unwritten slots: CI ran only the manifest's toolchain and
+# nobody ran this one. The build job now installs the consumer floor pin (6.6.3) and the
+# selftest's 6.6.4 and 6.6.5 without activating them, and runs the bundle check and
+# `--selftest --require-controls`. The wider consumer-pin matrix is a maintainer decision
+# (roadmap, Decisions owed #4). Run it by hand too at a release and at every pin bump.
+# [measured: scripts/check-miscompile.sh --bundle on 3.4.0's dist/hisab.cyr, lane L8, 2026-11-14]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -69,6 +80,8 @@ SUITES=0
 SELFTEST=0
 ALLOW_MISSING=0
 KEEP=0
+REQUIRE_CONTROLS=0
+LIST_PINS=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --pin) PINS+=("$2"); shift 2 ;;
@@ -77,12 +90,22 @@ while [ $# -gt 0 ]; do
         --selftest) SELFTEST=1; shift ;;
         --allow-missing) ALLOW_MISSING=1; shift ;;
         --keep) KEEP=1; shift ;;
-        -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
+        --require-controls) REQUIRE_CONTROLS=1; shift ;;
+        --list-pins) LIST_PINS=1; shift ;;
+        -h|--help) sed -n '2,72p' "$0"; exit 0 ;;
         *) echo "check-miscompile: unknown argument $1" >&2; exit 2 ;;
     esac
 done
-[ ${#PINS[@]} -gt 0 ] || PINS=(6.6.3 "$MANIFEST_PIN")
-VERSIONS="${HOME}/.cyrius/versions"
+# The consumer floor: the lowest pin that compiles a 3.x bundle and the lowest live consumer pin.
+FLOOR_PIN=6.6.3
+# The selftest's real-toolchain control: the last picker release with the defect, the first without.
+CONTROL_PINS=(6.6.4 6.6.5)
+[ ${#PINS[@]} -gt 0 ] || PINS=("$FLOOR_PIN" "$MANIFEST_PIN")
+if [ "$LIST_PINS" = 1 ]; then
+    printf '%s\n' "$FLOOR_PIN" "${CONTROL_PINS[@]}" "$MANIFEST_PIN" | awk '!seen[$0]++'
+    exit 0
+fi
+VERSIONS="${CYRIUS_HOME:-$HOME/.cyrius}/versions"
 REPRO="docs/development/issues/archived/2026-09-14-simd-dst-slot-regalloc-picker-repro.cyr"
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/hisab-mc.XXXXXX")"
@@ -319,17 +342,20 @@ build() {
 }
 
 if [ "$SELFTEST" = 1 ]; then
-    echo "selftest (a): the archived 3.2.0 repro under 6.6.4 and 6.6.5"
-    if [ -d "$VERSIONS/6.6.4" ] && [ -d "$VERSIONS/6.6.5" ]; then
-        for p in 6.6.4 6.6.5; do
+    echo "selftest (a): the archived 3.2.0 repro under ${CONTROL_PINS[0]} and ${CONTROL_PINS[1]}"
+    if [ -d "$VERSIONS/${CONTROL_PINS[0]}" ] && [ -d "$VERSIONS/${CONTROL_PINS[1]}" ]; then
+        for p in "${CONTROL_PINS[@]}"; do
             mkpin "$p" "$T/st-$p"
             cp "$REPRO" "$T/st-$p/repro.cyr"
             build "$T/st-$p" repro.cyr "$T/repro-$p" "$p" || FAIL=1
         done
         python3 -I "$T/audit.py" expect "$T/repro-6.6.4" "repro, cycc 6.6.4" 1 -0xe8 || { echo "  FAIL: 6.6.4 must show exactly the -0xe8 slot"; FAIL=1; }
         python3 -I "$T/audit.py" expect "$T/repro-6.6.5" "repro, cycc 6.6.5" 0 none || { echo "  FAIL: 6.6.5 must show none"; FAIL=1; }
+    elif [ "$REQUIRE_CONTROLS" = 1 ]; then
+        echo "  FAIL: cycc ${CONTROL_PINS[*]} are not both installed under $VERSIONS (--require-controls)"
+        FAIL=1
     else
-        echo "  SKIPPED: cycc 6.6.4 and 6.6.5 are not both installed under $VERSIONS"
+        echo "  SKIPPED: cycc ${CONTROL_PINS[*]} are not both installed under $VERSIONS"
     fi
     echo "selftest (b): a planted unwritten slot, cycc $MANIFEST_PIN"
     mkpin "$MANIFEST_PIN" "$T/st-m"

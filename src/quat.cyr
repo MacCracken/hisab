@@ -16,7 +16,7 @@
 # the identity), and for a NaN or infinite component.
 
 enum _QuatF64 {
-    _QUAT_NAN  = 0x7FF8_0000_0000_0000;   # NaN: `hquat_slerp` where its interpolant has no direction
+    _QUAT_NAN  = 0x7FF8_0000_0000_0000;   # NaN: `hquat_slerp` with no direction, and the answer for a null handle
     _QUAT_N_LO = 0x3FD0_0000_0000_0000;   # 0.25
     _QUAT_N_HI = 0x4030_0000_0000_0000;   # 16.0
     _QUAT_D_HI = 0x3FEF_FBE7_6C8B_4396;   # 0.9995
@@ -27,7 +27,13 @@ public struct HQuat { x; y; z; w; }
 
 # 3.4.0 (the [3.3.8] allocation row): every function here that allocates returns the designed 0
 # when the allocation is refused (an exhausted heap), and every Result returns Err(HSB_ERR_ALLOC);
-# none stores through a 0 handle. A 0 handle passed IN is the caller's.
+# none stores through a 0 handle.
+# ⛔ 3.5.0 — A 0 HANDLE PASSED IN FAULTED (roadmap [3.5.0] "A 0 handle passed in still faults", INS5
+# F3): through 3.4.2 the comment here said such a handle was the caller's, and every function below
+# that takes a handle but `hquat_from_axis_angle_checked` read address 0 for it, though 0 is the designed answer of a
+# refused allocation. vec2.cyr's header has the rule now kept here: an HQuat or HVec3 result is the
+# designed 0 for a 0 operand, before anything is allocated; a double result is NaN (`_QUAT_NAN`); a
+# Result is Err(HSB_ERR_INVALID_INPUT); and an `_into` form writes NaN into out and returns 0.
 
 # A new HQuat (x, y, z, w), w the scalar part: 32 bytes from the heap, the components stored
 # as given. Returns the designed 0 where the allocation is refused (3.4.0).
@@ -46,21 +52,44 @@ public fn hquat_new(x, y, z, w) {
 #must_use
 public fn hquat_identity() { return hquat_new(0, 0, 0, F64_ONE); }
 
-# The quaternion (axis sin(angle / 2), cos(angle / 2)) of the right-handed rotation by `angle`
-# radians about `axis` (counterclockwise seen from the axis tip), angle / 2 exact (a halving)
-# and its sine and cosine as `f64_sin` / `f64_cos` round them, each product rounded once.
-# `axis` must be a unit vector for q to be the rotation by `angle`: otherwise q is not unit, and
-# the rotation it represents (q / |q|, as `hquat_rotate_vec3` applies it) is about axis's
-# direction by 2 atan2(|axis| sin(angle / 2), cos(angle / 2)), not by `angle`; a zero axis gives
-# (0, 0, 0, cos(angle / 2)). Returns the designed 0 where the allocation is refused.
+# The unit quaternion (n sin(angle / 2), cos(angle / 2)) of the right-handed rotation by `angle`
+# radians about the direction n of `axis` (counterclockwise seen from the axis tip), as `Ok(q)`,
+# for any finite axis but the zero vector: n = `hvec3_normalize(axis)`, within a few ulp of the
+# unit vector for every finite non-zero axis, and axis itself, bit for bit, where |axis|^2 rounds to
+# 1 (its length is then exactly 1, so 3.4.2's arithmetic and bits for a unit axis). angle / 2 is
+# exact (a halving) and its sine and cosine are `f64_sin` / `f64_cos`'s, each product rounded once.
+# A zero axis has no direction: `Err(HSB_ERR_DIVISION_BY_ZERO)`, except at angle = +-0, where every
+# axis gives the identity, (+-0, +-0, +-0, 1). `Err(HSB_ERR_INVALID_INPUT)` for a NaN or infinite
+# axis component or angle, or a 0 handle; `Err(HSB_ERR_ALLOC)` where an
+# allocation is refused.
+# ⛔ 3.5.0 — REPLACES `hquat_from_axis_angle` (roadmap [3.5.0], MAT F4), WHICH MULTIPLIED THE AXIS
+# AS GIVEN: a non-unit axis made a q whose rotation, q / |q|, is by 2 atan2(|axis| sin(angle / 2),
+# cos(angle / 2)), not by `angle` ((2, 0, 0) and pi/2 rotated by 2.21 rad), and a zero axis gave
+# (0, 0, 0, cos(angle / 2)), the identity, for every angle. Retired, not redefined.
 #must_use
-public fn hquat_from_axis_angle(axis, angle) {
+public fn hquat_from_axis_angle_checked(axis, angle) {
+    if (axis == 0) { return Err(HSB_ERR_INVALID_INPUT); }
+    var ax = HVec3_x(axis); var ay = HVec3_y(axis); var az = HVec3_z(axis);
+    if ((ax & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000 || (ay & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000
+      || (az & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000
+      || (angle & 0x7FFF_FFFF_FFFF_FFFF) >= 0x7FF0_0000_0000_0000) {
+        return Err(HSB_ERR_INVALID_INPUT);
+    }
     var half = f64_mul(angle, F64_HALF);
     var s = f64_sin(half);
     var c = f64_cos(half);
-    return hquat_new(f64_mul(HVec3_x(axis), s),
-      f64_mul(HVec3_y(axis), s),
-      f64_mul(HVec3_z(axis), s), c);
+    if (((ax | ay | az) & 0x7FFF_FFFF_FFFF_FFFF) == 0) {
+        if ((s & 0x7FFF_FFFF_FFFF_FFFF) != 0) { return Err(HSB_ERR_DIVISION_BY_ZERO); }
+    } elif (hvec3_length_sq(axis) != 0x3FF0_0000_0000_0000) {
+        # |axis|^2 = 1.0 needs no copy: `hvec3_normalize` would return axis's own bits (its length is
+        # sqrt(1) = 1 exactly), so this skips an allocation and a square root and moves no bit.
+        var n = hvec3_normalize(axis);
+        if (n == 0) { return Err(HSB_ERR_ALLOC); }
+        ax = HVec3_x(n); ay = HVec3_y(n); az = HVec3_z(n);
+    }
+    var q = hquat_new(f64_mul(ax, s), f64_mul(ay, s), f64_mul(az, s), c);
+    if (q == 0) { return Err(HSB_ERR_ALLOC); }
+    return Ok(q);
 }
 
 # The unit quaternion (sin(angle / 2), 0, 0, cos(angle / 2)) of the right-handed rotation by
@@ -98,6 +127,8 @@ public fn hquat_from_rotation_z(angle) {
 # IEEE. Returns the designed 0 where the allocation is refused.
 #must_use
 public fn hquat_mul(q, r) {
+    if (q == 0) { return 0; }
+    if (r == 0) { return 0; }
     var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
     var rx = HQuat_x(r); var ry = HQuat_y(r); var rz = HQuat_z(r); var rw = HQuat_w(r);
     return hquat_new(
@@ -112,10 +143,22 @@ public fn hquat_mul(q, r) {
       );
 }
 
+# NaN into every component of the HQuat out (a 0 operand's answer, 3.5.0); returns 0.
+fn _hquat_nan_into(out) {
+    HQuat_set_x(out, _QUAT_NAN);
+    HQuat_set_y(out, _QUAT_NAN);
+    HQuat_set_z(out, _QUAT_NAN);
+    HQuat_set_w(out, _QUAT_NAN);
+    return 0;
+}
+
 # hquat_mul into the caller's HQuat out: q r, the same bits, nothing allocated (3.4.2). out
-# may be q or r (every component is read first). Returns out; 0 for out = 0.
+# may be q or r (every component is read first). Returns out; 0 for out = 0, and NaN into out and 0
+# for a 0 operand (3.5.0).
 public fn hquat_mul_into(out, q, r) {
     if (out == 0) { return 0; }
+    if (q == 0) { return _hquat_nan_into(out); }
+    if (r == 0) { return _hquat_nan_into(out); }
     var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
     var rx = HQuat_x(r); var ry = HQuat_y(r); var rz = HQuat_z(r); var rw = HQuat_w(r);
     var x = f64_add(f64_add(f64_mul(qw, rx), f64_mul(qx, rw)), f64_sub(f64_mul(qy, rz), f64_mul(qz, ry)));
@@ -129,13 +172,14 @@ public fn hquat_mul_into(out, q, r) {
     return out;
 }
 
-# The conjugate (-x, -y, -z, w), exact (`f64_neg`; below cycc 6.6.8 it gave +0 for +0): the
-# inverse of a unit q, the reverse rotation. Returns the designed 0 where the allocation is
-# refused.
+# The conjugate (-x, -y, -z, w), exact, -0 for +0 on every pin (3.5.0: a flip of the sign bit;
+# `f64_neg` gave +0 for +0 below cycc 6.6.8, which the bundle's 6.6.3 floor admits): the inverse of
+# a unit q, the reverse rotation. Returns the designed 0 where the allocation is refused.
 #must_use
 public fn hquat_conjugate(q) {
-    return hquat_new(f64_neg(HQuat_x(q)), f64_neg(HQuat_y(q)),
-      f64_neg(HQuat_z(q)), HQuat_w(q));
+    if (q == 0) { return 0; }
+    return hquat_new(HQuat_x(q) ^ 0x8000_0000_0000_0000, HQuat_y(q) ^ 0x8000_0000_0000_0000,
+      HQuat_z(q) ^ 0x8000_0000_0000_0000, HQuat_w(q));
 }
 
 # SIMD: quat is 4 contiguous f64 (32 bytes), packed dot at n=4 (no over-read).
@@ -146,15 +190,18 @@ public fn hquat_conjugate(q) {
 # ⚠ NOT BIT-IDENTICAL ACROSS TARGETS (vec4.cyr's `hvec4_dot` says why: aarch64 fuses each
 # lane's second product), and through it `hquat_length_sq`, `hquat_length`,
 # `hquat_normalize_checked`, `hquat_inverse_checked` and `hquat_slerp` may differ in their
-# last bits between x86 and aarch64.
+# last bits between x86 and aarch64. NaN for a 0 operand (3.5.0).
 #must_use
 public fn hquat_dot(a, b) {
+    if (a == 0) { return _QUAT_NAN; }
+    if (b == 0) { return _QUAT_NAN; }
     return f64v_dot(a, b, 4);
 }
 
 # |q|^2 (`hquat_dot(q, q)`, its summation order and its aarch64 caveat): +Inf once a square
 # passes DBL_MAX (|component| >= 2^512), subnormal and losing bits once every component is
 # below 2^-511; `hquat_length` holds the whole range.
+# A 0 handle gives NaN (3.5.0), through `hquat_dot`.
 #must_use
 public fn hquat_length_sq(q) { return hquat_dot(q, q); }
 #must_use
@@ -186,6 +233,7 @@ fn _hquat_len_scaled(q) {
 # identity this file has now claimed to have fixed twice. A comment asserting a
 # call graph is a claim like any other and this one was never checked.
 # [measured: 2041-binade two-sided sweep on q*q^-1, 2026-09-10]
+# A 0 handle gives NaN (3.5.0), through `hquat_dot`.
 public fn hquat_length(q) {
     var ls = hquat_length_sq(q);
     if (f64_lt(ls, F64_TINY) == 1) { return _hquat_len_scaled(q); }
@@ -256,6 +304,8 @@ public fn hquat_normalize_checked(q) {
         f64v_scale(r, q, inv, 4);
         return Ok(r);
     }
+    # 3.5.0: a 0 handle reaches here (its length is `hquat_dot`'s NaN), off the fast path.
+    if (q == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (_hquat_finite(q) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var su = 0;
     if (f64_lt(len, F64_TINY) == 1) {
@@ -374,13 +424,17 @@ public fn hquat_inverse_checked(q) {
     var ls = hquat_length_sq(q);
     var inv = f64_div(F64_ONE, ls);
     if (f64_ge(ls, F64_TINY) == 1 && f64_ge(inv, F64_TINY) == 1) {
-        var qi = hquat_new(f64_mul(f64_neg(HQuat_x(q)), inv),
-          f64_mul(f64_neg(HQuat_y(q)), inv),
-          f64_mul(f64_neg(HQuat_z(q)), inv),
+        # 3.5.0: the conjugate's signs are bit flips, -0 for +0 on every pin (`f64_neg` gave +0 for
+        # +0 below cycc 6.6.8)
+        var qi = hquat_new(f64_mul(HQuat_x(q) ^ 0x8000_0000_0000_0000, inv),
+          f64_mul(HQuat_y(q) ^ 0x8000_0000_0000_0000, inv),
+          f64_mul(HQuat_z(q) ^ 0x8000_0000_0000_0000, inv),
           f64_mul(HQuat_w(q), inv));
         if (qi == 0) { return Err(HSB_ERR_ALLOC); }
         return Ok(qi);
     }
+    # 3.5.0: a 0 handle reaches here (|q|^2 is `hquat_dot`'s NaN), off the fast path.
+    if (q == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     if (_hquat_finite(q) == 0) { return Err(HSB_ERR_INVALID_INPUT); }
     var mx = f64_max(f64_max(f64_abs(HQuat_x(q)), f64_abs(HQuat_y(q))),
       f64_max(f64_abs(HQuat_z(q)), f64_abs(HQuat_w(q))));
@@ -389,7 +443,8 @@ public fn hquat_inverse_checked(q) {
     var h = p / 2;
     var f1 = (1023 + h) << 52;
     var f2 = (1023 + p - h) << 52;
-    var t = hquat_new(f64_neg(HQuat_x(q)), f64_neg(HQuat_y(q)), f64_neg(HQuat_z(q)), HQuat_w(q));
+    var t = hquat_new(HQuat_x(q) ^ 0x8000_0000_0000_0000, HQuat_y(q) ^ 0x8000_0000_0000_0000,
+      HQuat_z(q) ^ 0x8000_0000_0000_0000, HQuat_w(q));
     if (t == 0) { return Err(HSB_ERR_ALLOC); }
     f64v_scale(t, t, f1, 4);
     f64v_scale(t, t, f2, 4);
@@ -437,6 +492,20 @@ fn _hquat_ldexp(x, k) {
 # For n >= 1 that division only shrinks t, so the bounds below hold as written; a q with
 # n < 1 is doubled first (2q is the same rotation, and n becomes 4n >= 1), so they hold for it
 # too. A q with n = 1 runs exactly as through 3.3.7.
+# 3.5.0 (the [3.4.2] carried row): the doubling is not what keeps n < 1 from overflowing. By
+# Cauchy-Schwarz |u x v| <= |u| |v| and |u|, |w| <= sqrt(n), so t' = 2 (u x v) / n, w t' and
+# u x t' are each at most 2 |v| / sqrt(n) <= 4 sqrt(3) V, 2 |v| and 2 |v| (n >= 1/4, every |v_i|
+# below V), and each component's sum at most V (1 + 4 sqrt(3)) = 7.93 V: below 2^1024 for the
+# copy's V < 2^1021 that eq = -2 gives, with no doubling. Nor is it an exact no-op, as the row
+# that carried it supposed: it moves the copy's scale k down two binades, and a component the
+# copy supplies on the subnormal scale of |v| (one whose exact value is below about 2^(k - 1022))
+# rounds differently: 299 of 137,381 wide-path inputs on a family with q's components in
+# [1/8, 1) or tiny and v's anywhere, one huge, neither form the closer on every one (the
+# undoubled closer on 265, the doubled on 29, 8 ties, against the exact rotation; two more seeds:
+# 293 of 137,047 and 299 of 137,215), all within the 22 u |v| contract below either way. It
+# stays: the trust test's subnormal-rounding bound below is derived for n >= 1, and
+# tests/modules_d.tcyr pins an input whose bits it moves.
+# [measured: scratch rw.cyr / rwchk.py, both forms side by side, Fraction rotation, 3 seeds, 2026-11-14; cycc 6.7.18]
 fn _hquat_rotate_wide(out, q, v, rx, ry, rz) {
     var qx = HQuat_x(q); var qy = HQuat_y(q); var qz = HQuat_z(q); var qw = HQuat_w(q);
     var vx = HVec3_x(v); var vy = HVec3_y(v); var vz = HVec3_z(v);
@@ -588,10 +657,13 @@ fn _hquat_rotate_wide(out, q, v, rx, ry, rz) {
 # ⚠ Cost: |q|^2 and three divisions. A q with |q|^2 = 1.0 exactly skips the divisions (the
 # same bits on 60,000 inputs, 18,542 of them such q): per call 43 -> 47 ns there, 43 -> 53 ns
 # for the others (hisab.bcyr's q has |q|^2 = 1 - 2^-53), and 44 -> 51 ns over a set where half
-# have |q|^2 = 1. It reaches every rotation through this function (t3d_compose, the OBB rays).
+# have |q|^2 = 1. It reaches every rotation through this function (`t3d_apply`, the OBB rays;
+# `t3d_compose_checked` through `hquat_rotate_vec3_into`, the same arithmetic).
 # [measured: scratch focus2.bcyr and rot_ident.py, merged tree vs 3.4.0 integration snapshot, 3 runs, 2026-10-31]
 #must_use
 public fn hquat_rotate_vec3(q, v) {
+    if (q == 0) { return 0; }   # 3.5.0
+    if (v == 0) { return 0; }
     # ⚡ The fast path is _hquat_rot_into's, written out here (3.4.2): routing every call through
     # the core cost 51 -> 57 ns a rotation, an extra frame. The two copies are the same
     # arithmetic in the same order; tests/modules_c.tcyr "3.4.2: the _into value operations"
@@ -624,9 +696,12 @@ public fn hquat_rotate_vec3(q, v) {
 
 # hquat_rotate_vec3 into the caller's HVec3 out: the same answer, bit for bit, and nothing
 # allocated, so a rotation every step grows no heap (3.4.2; issue
-# 2026-11-09-allocator-scoped-calls). out may be v. Returns out; 0 for out = 0.
+# 2026-11-09-allocator-scoped-calls). out may be v. Returns out; 0 for out = 0, and NaN into out and 0
+# for a 0 operand (3.5.0).
 public fn hquat_rotate_vec3_into(out, q, v) {
     if (out == 0) { return 0; }
+    if (q == 0) { return _hquat_rot_store(out, _QUAT_NAN, _QUAT_NAN, _QUAT_NAN); }
+    if (v == 0) { return _hquat_rot_store(out, _QUAT_NAN, _QUAT_NAN, _QUAT_NAN); }
     _hquat_rot_into(out, q, v);
     return out;
 }
@@ -709,10 +784,16 @@ fn _hquat_rotate_qscaled(out, q, v, mq) {
 # (outside [0, 1] it extrapolates along the same great circle). theta is acos(d) for d <= 0.9995
 # and 2 atan2(|a - b'|, |a + b'|) above, which keeps its relative accuracy at any small angle;
 # where d >= 1 (theta below about 2^-26) or |a - b'| is 0 (or below 2^-537, where its squares
-# flush) the answer is the normalised lerp of a and b', whose angle error, at most about
-# theta^3 / 62 for t in [0, 1], is far below rounding there. a and b must be unit quaternions:
-# for others the answer is the formula's, neither unit nor an interpolation of their rotations
-# (a non-unit pair with d >= 1 takes the normalised lerp, as through 3.4.0). A zero quaternion,
+# flush), the answer is the normalised lerp of a and b', whose angle error, at most about
+# theta^3 / 62 for t in [0, 1], is far below rounding there -- except an identical pair, b' = a
+# component for component, which is a, a copy of its bits, for every finite t (3.5.0). Every unit
+# pair reaches that exit when it is identical (d = |a|^2 rounds to within a few ulp of 1). a and b
+# must be unit quaternions: for others the answer is the formula's, neither unit nor an
+# interpolation of their rotations. A non-unit pair with d >= 1 takes the normalised lerp, as
+# through 3.4.0, but an identical one is a itself since 3.5.0, not a / |a| ((2, 0, 0, 0) with
+# itself at t = 1/2 gave (1, 0, 0, 0) through 3.4.2 and gives (2, 0, 0, 0)); an identical pair
+# with d <= 0.9995 (|a|^2 that far below 1) takes the acos form like any other, so (1/2, 0, 0, 0)
+# with itself at t = 1/2 is (0.633, 0, 0, 0), not a. A zero quaternion,
 # a or b, gives NaN (it represents no rotation, `_QUAT_NAN`), as does a NaN or infinite
 # component; the designed 0 where an allocation is refused. ⚠ Through `hquat_dot` the last
 # bits can differ on aarch64.
@@ -725,8 +806,10 @@ fn _hquat_rotate_qscaled(out, q, v, mq) {
 # 0.0316) and [0.0316, pi/2] once more through `t3d_lerp`): for t in [0, 1], 3.73 ulp for theta
 # below 0.0316 (the atan2 form) and 4.0 above (acos); for t in [-1.5, 2.5], 9.33 below and 18.13
 # above, the acos form's own extrapolation error, unchanged since 3.4.0; for identical or
-# antipodal pairs, 4 ulp of a for t in [0, 1], -1 and 2, and 8.5 at t = 10 and -9. The error
-# grows with |t| outside [0, 1]. Those pairs were normalised by a division; pairs built as cos
+# antipodal pairs, 4 ulp of a for t in [0, 1], -1 and 2, and 8.5 at t = 10 and -9 through 3.4.2,
+# and since 3.5.0 a's own bits for every finite t (b' = a component for component: the exit in
+# the body, which every identical unit pair reaches). The error grows with |t| outside [0, 1].
+# Those pairs were normalised by a division; pairs built as cos
 # theta a + sin theta w with b not renormalised (|b|^2 - 1 up to 54 2^-53) reach 25.15 ulp in the
 # acos band (theta = 0.396, t = -1.18) and 9.58 below the switch.
 # [measured: scratch slgen.c / slorc.c (binary128) / mpval.py, 25,000,000 pairs, 2026-10-31; cycc 6.7.18]
@@ -747,12 +830,15 @@ fn _hquat_rotate_qscaled(out, q, v, mq) {
 # [measured: scratch fm4.bcyr, the first repair and this tree interleaved x 6, 2026-10-31; cycc 6.7.18]
 #must_use
 public fn hquat_slerp(a, b, t) {
+    if (a == 0) { return 0; }   # 3.5.0
+    if (b == 0) { return 0; }
     var d = hquat_dot(a, b);
     var bx = HQuat_x(b); var by = HQuat_y(b); var bz = HQuat_z(b); var bw = HQuat_w(b);
     # Shortest path: negate b if dot < 0
     if (f64_lt(d, 0) == 1) {
-        bx = f64_neg(bx); by = f64_neg(by);
-        bz = f64_neg(bz); bw = f64_neg(bw);
+        # 3.5.0: sign-bit flips, -0 for a +0 component on every pin (`f64_neg` gave +0 below 6.6.8)
+        bx = bx ^ 0x8000_0000_0000_0000; by = by ^ 0x8000_0000_0000_0000;
+        bz = bz ^ 0x8000_0000_0000_0000; bw = bw ^ 0x8000_0000_0000_0000;
         d = f64_neg(d);
     }
     # A zero quaternion represents no rotation and has no direction to interpolate from or to:
@@ -775,14 +861,23 @@ public fn hquat_slerp(a, b, t) {
         var nm = f64_sqrt(f64_add(f64_add(f64_mul(ux, ux), f64_mul(uy, uy)),
             f64_add(f64_mul(uz, uz), f64_mul(uw, uw))));
         if (f64_lt(d, F64_ONE) == 0 || f64_eq(nm, 0) == 1) {
+            # ⛔ 3.5.0 — AN IDENTICAL PAIR (b' = a, component for component) IS a FOR EVERY REAL t
+            # (roadmap [3.5.0], MAT4 / R2-MAT N6): (1 - t) a + t a = a exactly, and so is the slerp
+            # formula's limit, but the lerp below cancels once |t| passes 2^53: a = b = (0.6, 0.8, 0,
+            # 0) at t = 2^53 gave (0.7071, 0.7071, 0, 0), a unit quaternion that is not a, and at
+            # 2^54 and 2^55 NaN. a's own bits are the answer (the lerp's normalised copy carried a's
+            # rounding, a few ulp, for t in [0, 1] too); a non-finite t keeps the lerp's NaN.
+            if (f64_eq(HQuat_x(a), bx) + f64_eq(HQuat_y(a), by) + f64_eq(HQuat_z(a), bz) + f64_eq(HQuat_w(a), bw) == 4
+              && (t & 0x7FF0_0000_0000_0000) != 0x7FF0_0000_0000_0000) {
+                return hquat_new(HQuat_x(a), HQuat_y(a), HQuat_z(a), HQuat_w(a));
+            }
             var omt = f64_sub(F64_ONE, t);
             # ⛔ 3.4.0 — `hquat_normalize` gave the IDENTITY for a zero interpolant. For unit a
             # and b it cannot be zero in exact arithmetic: |(1 - t) a + t b|^2 = 1 - 2 t (1 - t)
             # (1 - d) >= 1 - (1 - d) / 2 for every real t, and d >= 1 or a = b' here. A non-unit
             # pair can reach it (b = 2a at t = -1), and a NaN or infinite component cannot be
-            # normalised: neither has a direction, and the answer is NaN, not a rotation. In
-            # floating point an identical pair past |t| = 2^53 cancels too: t = 2^54 gives NaN
-            # and t = 2^53 what the last bits left, where the answer is a.
+            # normalised: neither has a direction, and the answer is NaN, not a rotation. (An
+            # identical pair past |t| = 2^53 cancelled too, until the exit above, 3.5.0.)
             var lq = hquat_new(
               f64_add(f64_mul(HQuat_x(a), omt), f64_mul(bx, t)),
               f64_add(f64_mul(HQuat_y(a), omt), f64_mul(by, t)),

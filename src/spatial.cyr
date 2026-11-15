@@ -599,9 +599,15 @@ fn _kd_nearer(points, c, b, q) {
 # 1 when the splitting plane (query axis value qv, plane sv) is certainly no nearer than the
 # best point b: then nothing behind it can be strictly nearer. For a best whose float distance
 # is not trusted (hi NaN, see _kd_nearest_rec); 0 when it cannot tell. |qv - sv| is taken
-# from qv/2 - sv/2 when it overflows (both then at least 2^1022, the halving exact). The factor
-# 1 - 2^-50 below is not load-bearing: _kd_scmp's margin of 2^-47 (64 u) already covers the
-# rounding of d and both squares (about 8 u), so removing it moves no answer.
+# from qv/2 - sv/2 when it overflows (then qv and sv differ in sign, one is past 2^1022 and the
+# other at least 2^970, half an ulp of DBL_MAX: both normal, each halving exact). The
+# certificate: d = fl(qv - sv) is within u/2 of the exact |qv - sv| relative, its scaled square
+# within u/2 more, so the square is within (1 + u)^2 (1 + u/2) of d_exact^2; the best's scaled
+# distance is within 5.1 u (_kd_sdist), and _kd_scmp answers +1 only past a 2^-47 (64 u) margin,
+# with its own product's u/2: d_exact^2 > D_best (1 + 2^-47 - 9 u) > D_best.
+# ⭐ 3.5.0 -- through 3.4.2 |d| was first multiplied by 1 - 2^-50 (0x3FEFFFFFFFFFFFF8), a factor
+# the bound above does not need (LIE4 F1, R2-LIE N2). Without it the test answers 1 in a band
+# 2^-49 wide where it answered 0 and the far side was walked for nothing; no query's answer moves.
 fn _kd_plane_past(points, b, q, qv, sv) {
     var d = f64_sub(qv, sv);
     if (f64_eq(d, d) == 0) { return 1; }
@@ -616,7 +622,7 @@ fn _kd_plane_past(points, b, q, qv, sv) {
     var db = _kd_sdist(load64(points + b * 8), q, &kk);
     if (f64_eq(db, db) == 0 || db == 0x7FF0000000000000) { return 0; }
     if (pinf == 1) { return 1; }   # only infinite points lie past it, and the best is finite
-    var ad = f64_mul(f64_abs(d), 0x3FEFFFFFFFFFFFF8);   # (1 - 2^-50): below |d_exact| / 2^sig
+    var ad = f64_abs(d);
     if (ad == 0) { return 0; }
     var e = _kd_expo(ad);
     var sd = _kd_scale(ad, e);
@@ -643,8 +649,20 @@ fn _kd_within(p, q, r) {
 }
 
 # --- Nearest neighbor search ---
-# best_out: pointer to a 32-byte block { best_idx (i64), its float distance, lo, hi }: a leaf's
+# best_out: pointer to a 40-byte block { best_idx (i64), its float distance, lo, hi, sk }: a leaf's
 # float distance below lo is certainly nearer, at or above hi certainly no nearer (see the leaf).
+# ⭐ 3.5.0 -- THE FLOAT DISTANCES ARE TAKEN ON THE BEST'S SCALE (sk): every difference p - q is
+# multiplied by 2^-sk before it is squared, sk = 0 (no scaling) until a best's own float
+# distance falls outside [2^-1000, 2^1000], and then the exponent of that best's largest
+# |difference|, so its scaled distance lies in [1, 12). Through 3.4.2 such a best (any query
+# far outside [2^-500, 2^500]: the points and the query near 2^600) left hi NaN, and every later
+# leaf paid _kd_nearer's scaled comparison: 512 points at 2^600 cost 3.3x the same points at 1.
+# [measured: tests/hisab.bcyr b41l3_kdtree_nearest_2e600 and kdtree_nearest_4k, bench-history.csv's 3.4.2 rows]
+# A power of two is exact but where a scaled difference goes subnormal, at most 2^-1075 there,
+# under 2^-500 of the distance it is part of wherever that distance is in the window, so the
+# bounds below hold as stated. A difference that overflows (|p_i - q_i| past DBL_MAX) is
+# certainly farther than a best whose difference did not, but not on a scale above 1: there
+# (sk > 0) such a leaf, and such a plane, take the exact tests (_kd_nearer, _kd_plane_past).
 
 fn _kd_nearest_rec(node, points, query, best_out) {
     if (node == 0) { return 0; }
@@ -666,24 +684,7 @@ fn _kd_nearest_rec(node, points, query, best_out) {
         if (f64_lt(dist_sq, load64(best_out + 16)) == 0) {
             if (_kd_nearer(points, pidx, load64(best_out), query) == 0) { return 0; }
         }
-        store64(best_out, pidx);
-        store64(best_out + 8, dist_sq);
-        # The bounds a later float distance (a leaf's, or a plane's squared) is certified
-        # against: dist_sq is within 5.02 u of the exact distance when it lies in [2^-1000,
-        # 2^1000] (the underflow terms are then under 2^-73 of it), and 64 ulps either side is
-        # more than 2^-48 of it. Elsewhere: lo -Inf, hi NaN, so every later comparison is
-        # _kd_nearer's -- except an exact 0 (the query is this point), which nothing beats.
-        if (dist_sq >= _KD_TRUST_LO && dist_sq <= _KD_TRUST) {   # bit patterns of doubles >= 0
-            store64(best_out + 16, dist_sq - 64);
-            store64(best_out + 24, dist_sq + 64);
-        } elif (dist_sq == 0 && ((HVec3_x(&diff) | HVec3_y(&diff) | HVec3_z(&diff)) & 0x7FFFFFFFFFFFFFFF) == 0) {
-            store64(best_out + 16, 0xFFF0000000000000);
-            store64(best_out + 24, 0);
-        } else {
-            store64(best_out + 16, 0xFFF0000000000000);
-            store64(best_out + 24, 0x7FF8000000000000);
-        }
-        return 0;
+        return _kd_best(pidx, dist_sq, &diff, best_out);
     }
 
     # Split node
@@ -705,6 +706,10 @@ fn _kd_nearest_rec(node, points, query, best_out) {
 
     _kd_nearest_rec(near, points, query, best_out);
 
+    # A best the near side found outside the window put the query on its scale: the far side
+    # is the scaled walk's from here (_kd_far).
+    if (load64(best_out + 32) != 0) { return _kd_far(far, d, points, query, query_val, split_val, best_out); }
+
     # Visit the far side unless the splitting plane is certainly no nearer than the best: by
     # the float bound (hi), or, for a best that bound does not cover (hi NaN), by _kd_plane_past.
     var d_sq = f64_mul(d, d);
@@ -716,6 +721,127 @@ fn _kd_nearest_rec(node, points, query, best_out) {
         }
     }
 
+    return 0;
+}
+
+# The new best pidx, its float distance dist_sq (on the current scale) and its unscaled
+# difference v: the bounds a later float distance (a leaf's, or a plane's squared) is
+# certified against. dist_sq is within 5.02 u of the exact distance when it lies in [2^-1000,
+# 2^1000] (the underflow terms are then under 2^-73 of it), and 64 ulps either side is more
+# than 2^-48 of it. An exact 0 (the query is this point): lo -Inf, hi 0, which nothing beats.
+# Elsewhere the scale moves to this best's (_kd_rescale), and where it cannot (a difference
+# that overflowed): lo -Inf, hi NaN, so every later comparison is _kd_nearer's.
+fn _kd_best(pidx, dist_sq, v, best_out) {
+    store64(best_out, pidx);
+    if (dist_sq >= _KD_TRUST_LO && dist_sq <= _KD_TRUST) {   # bit patterns of doubles >= 0
+        store64(best_out + 8, dist_sq);
+        store64(best_out + 16, dist_sq - 64);
+        store64(best_out + 24, dist_sq + 64);
+    } elif (((HVec3_x(v) | HVec3_y(v) | HVec3_z(v)) & 0x7FFFFFFFFFFFFFFF) == 0) {
+        store64(best_out + 8, 0);
+        store64(best_out + 16, 0xFFF0000000000000);
+        store64(best_out + 24, 0);
+    } else {
+        _kd_rescale(v, best_out);
+    }
+    return 0;
+}
+
+# _kd_nearest_rec on the best's scale (sk != 0): the same walk, each difference and each plane
+# distance multiplied by 2^-sk before it is squared (_kd_sdot). A plane whose d overflowed on a
+# scale above 1 is not certified by the float bound: _kd_plane_past decides it.
+fn _kd_nearest_srec(node, points, query, best_out) {
+    if (node == 0) { return 0; }
+
+    var pidx = _kd_node_point_idx(node);
+
+    if (pidx >= 0) {
+        var pt = load64(points + pidx * 8);
+        var diff: i64[3];
+        f64v_sub(&diff, pt, query, 2);
+        HVec3_set_z(&diff, f64_sub(HVec3_z(pt), HVec3_z(query)));
+        var dist_sq = _kd_sdot(&diff, load64(best_out + 32));
+        if (f64_ge(dist_sq, load64(best_out + 24)) == 1) { return 0; }
+        if (f64_lt(dist_sq, load64(best_out + 16)) == 0) {
+            if (_kd_nearer(points, pidx, load64(best_out), query) == 0) { return 0; }
+        }
+        return _kd_best(pidx, dist_sq, &diff, best_out);
+    }
+
+    var axis = _kd_node_split_axis(node);
+    var split_val = _kd_node_split_val(node);
+    var query_val = _kd_axis_val(query, axis);
+    var d = f64_sub(query_val, split_val);
+    var near = 0;
+    var far = 0;
+    if (f64_lt(d, 0) == 1) {
+        near = _kd_node_left(node);
+        far = _kd_node_right(node);
+    } else {
+        near = _kd_node_right(node);
+        far = _kd_node_left(node);
+    }
+    _kd_nearest_srec(near, points, query, best_out);
+    return _kd_far(far, d, points, query, query_val, split_val, best_out);
+}
+
+# The far side of a split on the best's scale (see _kd_nearest_srec): walked unless the plane
+# at d is certainly no nearer than the best.
+fn _kd_far(far, d, points, query, query_val, split_val, best_out) {
+    var sk = load64(best_out + 32);
+    var hi = load64(best_out + 24);
+    if (sk > 0 && (d & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000) { hi = 0x7FF8000000000000; }
+    var ds = _kd_scale(d, sk);
+    if (f64_lt(f64_mul(ds, ds), hi) == 1) {
+        return _kd_nearest_srec(far, points, query, best_out);
+    }
+    if (hi == 0x7FF8000000000000) {
+        if (load64(best_out) < 0 || _kd_plane_past(points, load64(best_out), query, query_val, split_val) == 0) {
+            return _kd_nearest_srec(far, points, query, best_out);
+        }
+    }
+    return 0;
+}
+
+# |v|^2 of the difference v scaled by 2^-sk (sk != 0), as hvec3_dot forms it: NaN where sk > 0
+# and v overflowed (an infinite component), which sends that leaf to _kd_nearer (see above).
+fn _kd_sdot(v, sk) {
+    var x = HVec3_x(v);
+    var y = HVec3_y(v);
+    var z = HVec3_z(v);
+    if (sk > 0 && ((x | y | z) & 0x7FF0000000000000) == 0x7FF0000000000000) {
+        if ((x & 0x7FFFFFFFFFFFFFFF) >= 0x7FF0000000000000 || (y & 0x7FFFFFFFFFFFFFFF) >= 0x7FF0000000000000
+          || (z & 0x7FFFFFFFFFFFFFFF) >= 0x7FF0000000000000) {
+            return 0x7FF8000000000000;
+        }
+    }
+    var sv: i64[3];
+    HVec3_set_x(&sv, _kd_scale(x, sk));
+    HVec3_set_y(&sv, _kd_scale(y, sk));
+    HVec3_set_z(&sv, _kd_scale(z, sk));
+    return hvec3_dot(&sv, &sv);
+}
+
+# A new best whose float distance on the current scale is outside [2^-1000, 2^1000]: the scale
+# moves to the exponent sk of its largest |difference| (v, unscaled, not all zero), its scaled
+# distance, in [1, 12), the best's, and lo / hi 64 ulps either side, as above. A difference
+# that overflowed has no such scale: lo -Inf, hi NaN, the scale left as it is.
+fn _kd_rescale(v, best_out) {
+    var m = HVec3_x(v) & 0x7FFFFFFFFFFFFFFF;
+    if ((HVec3_y(v) & 0x7FFFFFFFFFFFFFFF) > m) { m = HVec3_y(v) & 0x7FFFFFFFFFFFFFFF; }
+    if ((HVec3_z(v) & 0x7FFFFFFFFFFFFFFF) > m) { m = HVec3_z(v) & 0x7FFFFFFFFFFFFFFF; }
+    if (m >= 0x7FF0000000000000) {
+        store64(best_out + 8, 0x7FF0000000000000);
+        store64(best_out + 16, 0xFFF0000000000000);
+        store64(best_out + 24, 0x7FF8000000000000);
+        return 0;
+    }
+    var sk = _kd_expo(m);
+    var ds = _kd_sdot(v, sk);
+    store64(best_out + 32, sk);
+    store64(best_out + 8, ds);
+    store64(best_out + 16, ds - 64);
+    store64(best_out + 24, ds + 64);
     return 0;
 }
 
@@ -740,12 +866,13 @@ public fn kdtree_nearest(root, points, query) {
     if ((HVec3_x(query) & 0x7FF0000000000000) == 0x7FF0000000000000) { return 0 - 1; }
     if ((HVec3_y(query) & 0x7FF0000000000000) == 0x7FF0000000000000) { return 0 - 1; }
     if ((HVec3_z(query) & 0x7FF0000000000000) == 0x7FF0000000000000) { return 0 - 1; }
-    var best_buf: i64[4];
+    var best_buf: i64[5];
     var best_out = &best_buf;
     store64(best_out, 0 - 1);                     # best_idx: none yet
     store64(best_out + 8, _SP_F64_POS_INF);       # its float distance
     store64(best_out + 16, _SP_F64_POS_INF);      # lo: any finite distance is nearer than none
     store64(best_out + 24, 0x7FF8000000000000);   # hi: NaN, nothing is certainly no nearer
+    store64(best_out + 32, 0);                    # sk: unscaled (3.5.0)
 
     _kd_nearest_rec(root, points, query, best_out);
 
@@ -754,7 +881,7 @@ public fn kdtree_nearest(root, points, query) {
 
 # --- Radius search ---
 
-# rb: { lo, hi, rp, r } from kdtree_within_radius -- a leaf's float distance at most lo is
+# rb: { lo, hi, rp, r, sk } from kdtree_within_radius -- a leaf's float distance at most lo is
 # certainly inside, above hi certainly outside, otherwise _kd_within decides; a plane with
 # |d| > rp is certainly beyond r, and every other plane is crossed. That includes a NaN d: at
 # r = +Inf the query can sit on the plane's own infinity, with finite points behind it.
@@ -805,6 +932,42 @@ fn _kd_radius_rec(node, points, query, rb, results) {
     return 0;
 }
 
+# _kd_radius_rec on r's scale (3.5.0; rb's sk != 0, see kdtree_within_radius): each leaf's
+# difference times 2^-sk before it is squared (_kd_sdot), against lo / hi on that scale. A
+# difference that overflowed is past DBL_MAX, beyond any finite r: its NaN from _kd_sdot (on a
+# scale above 1) reaches _kd_within, which answers it exactly. The planes are as above.
+fn _kd_radius_srec(node, points, query, rb, results) {
+    if (node == 0) { return 0; }
+    var pidx = _kd_node_point_idx(node);
+    if (pidx >= 0) {
+        var pt = load64(points + pidx * 8);
+        var diff: i64[3];
+        f64v_sub(&diff, pt, query, 2);
+        HVec3_set_z(&diff, f64_sub(HVec3_z(pt), HVec3_z(query)));
+        var dist_sq = _kd_sdot(&diff, load64(rb + 32));
+        if (f64_gt(dist_sq, load64(rb + 8)) == 1) { return 0; }
+        if (f64_le(dist_sq, load64(rb)) == 1) { return _sp_push(results, pidx); }
+        if (_kd_within(pt, query, load64(rb + 24)) == 1) { return _sp_push(results, pidx); }
+        return 0;
+    }
+    var axis = _kd_node_split_axis(node);
+    var d = f64_sub(_kd_axis_val(query, axis), _kd_node_split_val(node));
+    var near = 0;
+    var far = 0;
+    if (f64_lt(d, 0) == 1) {
+        near = _kd_node_left(node);
+        far = _kd_node_right(node);
+    } else {
+        near = _kd_node_right(node);
+        far = _kd_node_left(node);
+    }
+    if (_kd_radius_srec(near, points, query, rb, results) < 0) { return 0 - 1; }
+    if (f64_gt(f64_abs(d), load64(rb + 16)) == 0) {
+        return _kd_radius_srec(far, points, query, rb, results);
+    }
+    return 0;
+}
+
 # Find all points within radius of query.
 # Returns vec of point indices (an empty vec for an empty tree, root 0, whatever the
 # other arguments, and for a radius below 0, which encloses nothing): exactly the points
@@ -830,11 +993,22 @@ public fn kdtree_within_radius(root, points, query, radius) {
     if (f64_lt(radius, 0) == 1) { return results; }
 
     if (f64_eq(radius, radius) == 0) { return results; }   # a NaN radius encloses nothing
+    # ⛔ 3.5.0 -- A QUERY WITH NO DISTANCE TO ANY FINITE POINT WALKED THE WHOLE TREE: a NaN
+    # coordinate (no distance to anything, at any radius) or an infinite one with a finite
+    # radius encloses nothing, as stated above, and each leaf reached _kd_within to learn it
+    # (LIE4 F2: 13.5 to 20.6 us at 4,096 points). Both answer the empty vec here.
+    # [measured: roadmap 3.5.0 (LIE4 F2); scratch ab/abbench.cyr kd_radius_nan_4k 7.6 us -> 59 ns, 2026-11-14]
+    var qbits = HVec3_x(query) | HVec3_y(query) | HVec3_z(query);
+    if ((qbits & 0x7FF0000000000000) == 0x7FF0000000000000) {
+        if (_kd_point_has_nan(query) == 1) { return results; }
+        if (_kd_has_inf(query) == 1 && radius != 0x7FF0000000000000) { return results; }
+    }
 
     var r2 = f64_mul(radius, radius);
-    var rb: i64[4];
+    var rb: i64[5];
     store64(&rb + 16, f64_mul(radius, _KD_R_K));   # r (1 + 2^-50): |d| above it is beyond r
     store64(&rb + 24, radius);
+    store64(&rb + 32, 0);                          # sk: unscaled
     # ⛔ 3.4.0 AND EARLIER -- r^2 overflowing to +Inf let the leaf's Inf <= Inf through, so every
     # r >= 2^512 around an infinite query took every point, each +Inf away. 3.4.1's first form
     # kept that leaf test for such a query beside a plane test in r, and answered an arbitrary
@@ -850,9 +1024,23 @@ public fn kdtree_within_radius(root, points, query, radius) {
         # r^2 in [2^-1000, 2^1000]: within u of r^2, so 64 ulps either side certify (as nearest's)
         store64(&rb, r2 - 64);
         store64(&rb + 8, r2 + 64);
-    } else {
-        store64(&rb, 0xFFF0000000000000);   # r^2 outside it: every leaf to _kd_within
+    } elif (f64_eq(radius, 0) == 1) {
+        store64(&rb, 0xFFF0000000000000);   # r = 0: every leaf to _kd_within
         store64(&rb + 8, 0x7FF8000000000000);
+    } else {
+        # ⭐ 3.5.0 -- r^2 outside the window, r finite and not 0: the leaves' distances are taken
+        # on r's scale, r 2^-sk in [1, 2), and certified against its square as above. Through
+        # 3.4.2 every leaf went to _kd_within (LIE3 F2, the radius half of the 2^600 row).
+        var sk = _kd_expo(radius);
+        var rs = _kd_scale(radius, sk);
+        var rs2 = f64_mul(rs, rs);
+        store64(&rb, rs2 - 64);
+        store64(&rb + 8, rs2 + 64);
+        store64(&rb + 32, sk);
+    }
+    if (load64(&rb + 32) != 0) {
+        if (_kd_radius_srec(root, points, query, &rb, results) < 0) { return 0; }
+        return results;
     }
     if (_kd_radius_rec(root, points, query, &rb, results) < 0) { return 0; }
 
@@ -893,8 +1081,28 @@ fn _qt_bounds_ymin(b) { return load64(b + 8); }
 fn _qt_bounds_xmax(b) { return load64(b + 16); }
 fn _qt_bounds_ymax(b) { return load64(b + 24); }
 
-fn _qt_bounds_cx(b) { return f64_mul(f64_add(load64(b), load64(b + 16)), F64_HALF); }
-fn _qt_bounds_cy(b) { return f64_mul(f64_add(load64(b + 8), load64(b + 24)), F64_HALF); }
+# The centre of a quadtree box, the midpoint of each axis (_ot_mid1's, as the octree's).
+# ⛔ 3.5.0 -- (min + max) * 0.5 OVERFLOWED for two bounds near DBL_MAX of one sign, the octree's
+# defect on the quadtree's side of the pair: [7FE8000000000000, 7FEC000000000000]^2 had the
+# centre (+Inf, +Inf), every point routed to SW, and each split kept them all together down to
+# max_depth: nine inserts at depth 1075 took 1,307,456 B of arena, against 1,216 B for the same
+# layout on [1.5, 1.75]^2. An infinite sum now takes _ot_mid1 (min/2 + max/2 where it
+# overflowed); everywhere else the bits are (min + max) * 0.5's.
+# [measured: 3.5.0 lane L2 review probe and tests/modules_d.tcyr "the quadtree's centre", 2026-11-14]
+# ⚠ The sum is tested here, not by calling _ot_mid1 on every route: a call per axis per level
+# cost an insert of b41l2_quadtree_insert's shape 328 -> 387 ns (+18%); the test here costs
+# 328 -> 342 ns (+4%), means of 5 interleaved rounds, the same run.
+# [measured: 3.5.0 lane L2 scratch A/B, 3.4.2 base and both forms, taskset-pinned, load 5-8, 2026-11-14]
+fn _qt_bounds_cx(b) {
+    var s = f64_add(load64(b), load64(b + 16));
+    if ((s & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { return _ot_mid1(load64(b), load64(b + 16)); }
+    return f64_mul(s, F64_HALF);
+}
+fn _qt_bounds_cy(b) {
+    var s = f64_add(load64(b + 8), load64(b + 24));
+    if ((s & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) { return _ot_mid1(load64(b + 8), load64(b + 24)); }
+    return f64_mul(s, F64_HALF);
+}
 
 # ⛔ 3.3.4 — A NaN POINT WAS INSIDE. The tests read "x < xmin or x > xmax is outside",
 # and every ordered comparison against NaN is false, so quadtree_insert stored a NaN
@@ -1282,13 +1490,43 @@ fn _ot_octant(point, center) {
 # multiply each packed lane performed, so the centre is bit-identical (all 100,000+ boxes
 # compared, signed zeros, subnormals, DBL_MAX and NaN/Inf included).
 # [measured: tests/modules_c.tcyr "3.4.1 LIE2: _ot_center_into"; LIE2 lane comparison, cycc 6.7.18]
+# ⛔ 3.5.0 -- (min + max) * 0.5 OVERFLOWED for two corners near DBL_MAX of one sign: min
+# 7FE8000000000000, max 7FEC000000000000 gave a centre of +Inf for 7FEA000000000000, every point
+# routed to the lower octant, and each split kept them all together down to max_depth. An
+# overflowing sum now takes min/2 + max/2 (_ot_mid1, geo_aabb_center's arithmetic): the
+# correctly rounded midpoint there, and the same bits as before everywhere else.
 fn _ot_center_into(aabb, out) {
     var mn = GeoAabb_min(aabb);
     var mx = GeoAabb_max(aabb);
-    HVec3_set_x(out, f64_mul(f64_add(HVec3_x(mn), HVec3_x(mx)), F64_HALF));
-    HVec3_set_y(out, f64_mul(f64_add(HVec3_y(mn), HVec3_y(mx)), F64_HALF));
-    HVec3_set_z(out, f64_mul(f64_add(HVec3_z(mn), HVec3_z(mx)), F64_HALF));
+    var sx = f64_add(HVec3_x(mn), HVec3_x(mx));
+    var sy = f64_add(HVec3_y(mn), HVec3_y(mx));
+    var sz = f64_add(HVec3_z(mn), HVec3_z(mx));
+    # One test for the three sums (an overflow, or a non-finite corner) before the per-axis form.
+    if (((sx | sy | sz) & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000) {
+        HVec3_set_x(out, _ot_mid1(HVec3_x(mn), HVec3_x(mx)));
+        HVec3_set_y(out, _ot_mid1(HVec3_y(mn), HVec3_y(mx)));
+        HVec3_set_z(out, _ot_mid1(HVec3_z(mn), HVec3_z(mx)));
+        return 0;
+    }
+    HVec3_set_x(out, f64_mul(sx, F64_HALF));
+    HVec3_set_y(out, f64_mul(sy, F64_HALF));
+    HVec3_set_z(out, f64_mul(sz, F64_HALF));
     return 0;
+}
+
+# (a + b) / 2, correctly rounded at every magnitude, for the octree's and the quadtree's centres:
+# (a + b) * 0.5 (exact halving of a rounded sum, or of an exact subnormal one), and a / 2 + b / 2
+# where the sum is infinite: two finite values that overflow, or an infinite operand, where both
+# forms give that infinity. Two finite values overflow only with one sign and |a + b| at least
+# 2^1024 - 2^970 (DBL_MAX plus half its ulp: DBL_MAX + 2^970 rounds to even, +Inf), so the
+# larger is past 2^1022 and the smaller at least 2^970: both normal, each halving exact, and the
+# one rounding is the sum's. NaN in, NaN out; Inf + -Inf is NaN.
+fn _ot_mid1(a, b) {
+    var s = f64_add(a, b);
+    if ((s & 0x7FFF_FFFF_FFFF_FFFF) == 0x7FF0_0000_0000_0000) {
+        return f64_add(f64_mul(a, F64_HALF), f64_mul(b, F64_HALF));
+    }
+    return f64_mul(s, F64_HALF);
 }
 
 fn _ot_child_bounds(parent_aabb, octant) {
@@ -1750,6 +1988,8 @@ fn _sh_grow(sh) {
 #          exactly as it was. Through 3.4.0 this returned 0 or did not return; a caller
 #          that stores points it must find again checks for a negative return.
 #          [measured: tests/abuse.tcyr "3.4.1: null handles in the spatial structures", baseline 3.4.0]
+#          3.5.0: #must_use -- a discarded code is a point the caller believes stored.
+#must_use
 public fn spatial_hash_insert(sh, point, data) {
     if (sh == 0 || point == 0) { return HSB_ERR_INVALID_INPUT; }
     var inv = _sh_inv_cell_size(sh);
@@ -2478,6 +2718,8 @@ public fn spatial_hash_query_radius_into(sh, point, radius, out, cap) {
 # HSB_ERR_INVALID_INPUT (-10) for a 0 handle (3.4.1: it was dereferenced, exit 139;
 # through 3.4.0 the return was always 0).
 # [measured: tests/abuse.tcyr "3.4.1: null handles in the spatial structures", baseline 3.4.0]
+# 3.5.0: #must_use, as spatial_hash_insert.
+#must_use
 public fn spatial_hash_clear(sh) {
     if (sh == 0) { return HSB_ERR_INVALID_INPUT; }
     var buckets = _sh_buckets(sh);
